@@ -511,6 +511,23 @@ the central address-space table and maps the runtime's sparse shared backing
 store. Multiple virtual mappings of one physical range are coherent. Releasing
 a physical reservation while one of its mappings remains live returns `EBUSY`.
 
+Two behaviours here follow from how titles actually use the API rather than from
+what the calls appear to mean in isolation.
+
+A fixed mapping into a range the title reserved earlier **commits inside the
+reservation** instead of releasing it first. A title reserves a window once and
+fills it in pieces, so releasing would give up its claim on everything not yet
+mapped. It is also the only way that works: the host placeholder covering a
+reservation has to be split for the sub-range, and releasing part of it tries to
+coalesce with neighbouring free space that belongs to a different placeholder.
+
+Physical memory is **released in whatever shape the title asks for**, not only
+in the shape it was allocated. Titles routinely allocate in one arrangement and
+hand memory back in another, so a release can cover part of a reservation, carve
+a hole out of its middle, or span several. What the release does not cover stays
+reserved. A range covering nothing reserved is still an error: it means the
+title believes it owns memory it does not.
+
 Flexible memory uses the same address-space table without inventing a second
 allocator. The runtime exposes the platform-default 4 GiB budget, derives the
 available amount from live `.flexible` mappings, and searches the
