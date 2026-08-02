@@ -47,9 +47,12 @@ pub const Error = error{
 
 pub const EntryKind = enum {
     process_entry,
+    module_initializer,
     pthread_entry,
     guest_callback,
 };
+
+pub const maximum_arguments: usize = 6;
 
 /// Complete machine state required by an execution bridge for one guest call.
 ///
@@ -59,12 +62,15 @@ pub const ExecuteRequest = struct {
     kind: EntryKind,
     entry_point: u64,
     thread_handle: u64,
-    arguments: [2]u64 = .{ 0, 0 },
+    arguments: [maximum_arguments]u64 = [_]u64{0} ** maximum_arguments,
     argument_count: u8 = 0,
     context: threading.ThreadContext,
     stack_address: u64,
     stack_size: u64,
     guard_size: u64,
+    /// Stack pointer immediately before the bridge's CALL instruction. When
+    /// omitted, the bridge uses the aligned top of the mapped thread stack.
+    stack_pointer: ?u64 = null,
 };
 
 /// Platform/native machine bridge used by `Dispatcher`.
@@ -117,6 +123,7 @@ const NativeCallFrame = extern struct {
     // Dispatcher metadata is never accessed by assembly.
     owner: ?*NativeBridge = null,
     thread_handle: u64 = 0,
+    guest_arguments: [maximum_arguments]u64 = [_]u64{0} ** maximum_arguments,
 };
 
 comptime {
@@ -130,6 +137,7 @@ comptime {
     std.debug.assert(@offsetOf(NativeCallFrame, "host_x87_control") == 104);
     std.debug.assert(@offsetOf(NativeCallFrame, "host_xmm_nonvolatile") == 112);
     std.debug.assert(@offsetOf(NativeCallFrame, "owner") == 272);
+    std.debug.assert(@offsetOf(NativeCallFrame, "guest_arguments") == 288);
 }
 
 threadlocal var active_native_frame: ?*NativeCallFrame = null;
@@ -196,7 +204,7 @@ pub const NativeBridge = struct {
 
     fn execute(self: *NativeBridge, request: ExecuteRequest) ExecutionError!u64 {
         if (!self.initialized) return error.Unsupported;
-        if (request.entry_point == 0 or request.argument_count > 2) {
+        if (request.entry_point == 0 or request.argument_count > maximum_arguments) {
             return error.ExecutionFailed;
         }
 
@@ -220,13 +228,14 @@ pub const NativeBridge = struct {
         const stack_pointer = if (nested)
             0
         else
-            alignedStackTop(request.stack_address, request.stack_size) orelse
+            resolveStackPointer(request) orelse
                 return error.ExecutionFailed;
 
         var frame: NativeCallFrame align(16) = .{
             .guest_fs_base = request.context.fs_base,
             .owner = self,
             .thread_handle = request.thread_handle,
+            .guest_arguments = request.arguments,
         };
         try self.registerFrame(&frame);
         defer self.unregisterFrame(&frame);
@@ -237,8 +246,6 @@ pub const NativeBridge = struct {
             &frame,
             request.entry_point,
             stack_pointer,
-            request.arguments[0],
-            request.arguments[1],
         );
         if (@atomicLoad(u32, &frame.interrupted, .acquire) != 0) {
             return error.Interrupted;
@@ -325,11 +332,18 @@ pub const NativeBridge = struct {
     }
 };
 
-fn alignedStackTop(address: u64, size: u64) ?u64 {
+fn resolveStackPointer(request: ExecuteRequest) ?u64 {
+    const address = request.stack_address;
+    const size = request.stack_size;
     const end = std.math.add(u64, address, size) catch return null;
     const minimum_top = std.math.add(u64, address, 256) catch return null;
-    const top = std.mem.alignBackward(u64, end, 16);
-    return if (top >= minimum_top) top else null;
+    const stack_pointer = request.stack_pointer orelse
+        std.mem.alignBackward(u64, end, 16);
+    if (!std.mem.isAligned(stack_pointer, 16)) return null;
+    return if (stack_pointer >= minimum_top and stack_pointer <= end)
+        stack_pointer
+    else
+        null;
 }
 
 const NativeMachine = if (can_use_native_bridge) WindowsX64Machine else UnsupportedMachine;
@@ -339,7 +353,7 @@ const UnsupportedMachine = struct {
         return false;
     }
 
-    fn call(_: *NativeCallFrame, _: u64, _: u64, _: u64, _: u64) u64 {
+    fn call(_: *NativeCallFrame, _: u64, _: u64) u64 {
         unreachable;
     }
 
@@ -361,15 +375,11 @@ const WindowsX64Machine = struct {
         frame: *NativeCallFrame,
         entry_point: u64,
         stack_pointer: u64,
-        argument_0: u64,
-        argument_1: u64,
     ) u64 {
         return ps5NativeCallWindowsX64(
             frame,
             entry_point,
             stack_pointer,
-            argument_0,
-            argument_1,
         );
     }
 
@@ -388,8 +398,6 @@ extern fn ps5NativeCallWindowsX64(
     frame: *NativeCallFrame,
     entry_point: u64,
     stack_pointer: u64,
-    argument_0: u64,
-    argument_1: u64,
 ) callconv(.winapi) u64;
 
 extern fn ps5NativeEscapeWindowsX64(frame: *NativeCallFrame) callconv(.winapi) noreturn;
@@ -423,8 +431,6 @@ comptime {
         \\  movdqu %xmm13, 224(%rcx)
         \\  movdqu %xmm14, 240(%rcx)
         \\  movdqu %xmm15, 256(%rcx)
-        \\  movq 40(%rsp), %rsi
-        \\  movq %r9, %rdi
         \\  movq %rdx, %r11
         \\  movq %rcx, %r15
         \\  movq 80(%r15), %r10
@@ -434,6 +440,12 @@ comptime {
         \\  movq %r8, %rsp
         \\1:
         \\  andq $-16, %rsp
+        \\  movq 288(%r15), %rdi
+        \\  movq 296(%r15), %rsi
+        \\  movq 304(%r15), %rdx
+        \\  movq 312(%r15), %rcx
+        \\  movq 320(%r15), %r8
+        \\  movq 328(%r15), %r9
         \\  xorl %eax, %eax
         \\  callq *%r11
         \\  movq %rax, 88(%r15)
@@ -642,8 +654,63 @@ pub const Dispatcher = struct {
         entry_point: u64,
         arguments: []const u64,
     ) Error!u64 {
+        return self.dispatchPrepared(
+            prepared,
+            .process_entry,
+            entry_point,
+            arguments,
+            null,
+            true,
+        );
+    }
+
+    /// Executes the process entry with a caller-built initial stack frame.
+    pub fn dispatchInitialAtStack(
+        self: *Dispatcher,
+        prepared: threading.PreparedThread,
+        entry_point: u64,
+        arguments: []const u64,
+        stack_pointer: u64,
+    ) Error!u64 {
+        return self.dispatchPrepared(
+            prepared,
+            .process_entry,
+            entry_point,
+            arguments,
+            stack_pointer,
+            true,
+        );
+    }
+
+    /// Runs a module initializer on the prepared initial thread without
+    /// finalizing that thread's POSIX TLS-key values after the call returns.
+    pub fn dispatchInitializer(
+        self: *Dispatcher,
+        prepared: threading.PreparedThread,
+        entry_point: u64,
+        arguments: []const u64,
+    ) Error!u64 {
+        return self.dispatchPrepared(
+            prepared,
+            .module_initializer,
+            entry_point,
+            arguments,
+            null,
+            false,
+        );
+    }
+
+    fn dispatchPrepared(
+        self: *Dispatcher,
+        prepared: threading.PreparedThread,
+        kind: EntryKind,
+        entry_point: u64,
+        arguments: []const u64,
+        stack_pointer: ?u64,
+        finalize_thread: bool,
+    ) Error!u64 {
         if (!self.initialized) return error.NotInitialized;
-        if (entry_point == 0 or arguments.len > 2 or active_execution != null) {
+        if (entry_point == 0 or arguments.len > maximum_arguments or active_execution != null) {
             return error.InvalidArgument;
         }
 
@@ -660,7 +727,7 @@ pub const Dispatcher = struct {
         defer active_execution = null;
 
         var request = ExecuteRequest{
-            .kind = .process_entry,
+            .kind = kind,
             .entry_point = entry_point,
             .thread_handle = active_execution.?.thread_handle,
             .context = prepared.context,
@@ -668,16 +735,20 @@ pub const Dispatcher = struct {
             .stack_size = prepared.stack_size,
             .guard_size = prepared.guard_size,
             .argument_count = @intCast(arguments.len),
+            .stack_pointer = stack_pointer,
         };
         @memcpy(request.arguments[0..arguments.len], arguments);
         const returned = self.bridge.execute(request) catch |err| {
             if (err == error.Interrupted and active_execution.?.exit_requested) {
-                return active_execution.?.exit_result;
+                if (finalize_thread) return active_execution.?.exit_result;
             }
             return err;
         };
-        if (active_execution.?.exit_requested) return active_execution.?.exit_result;
-        try self.manager.runSpecificDestructors();
+        if (active_execution.?.exit_requested) {
+            if (finalize_thread) return active_execution.?.exit_result;
+            return error.Interrupted;
+        }
+        if (finalize_thread) try self.manager.runSpecificDestructors();
         return returned;
     }
 
@@ -828,17 +899,17 @@ pub const Dispatcher = struct {
         if (active.dispatcher != self or active.thread_handle != guest_call.thread_handle) {
             return error.CallFailed;
         }
-        const request = ExecuteRequest{
+        var request = ExecuteRequest{
             .kind = .guest_callback,
             .entry_point = guest_call.entry_point,
             .thread_handle = guest_call.thread_handle,
-            .arguments = guest_call.arguments,
             .argument_count = guest_call.argument_count,
             .context = active.context,
             .stack_address = active.stack_address,
             .stack_size = active.stack_size,
             .guard_size = active.guard_size,
         };
+        @memcpy(request.arguments[0..guest_call.argument_count], guest_call.arguments[0..guest_call.argument_count]);
         _ = self.bridge.execute(request) catch |err| {
             if (err == error.Unsupported) return error.Unsupported;
             if (err == error.Interrupted and active_execution.?.exit_requested) return;
@@ -878,7 +949,7 @@ pub const Dispatcher = struct {
                 .kind = .pthread_entry,
                 .entry_point = worker.request.entry_point,
                 .thread_handle = worker.request.thread_handle,
-                .arguments = .{ worker.request.argument, 0 },
+                .arguments = .{ worker.request.argument, 0, 0, 0, 0, 0 },
                 .argument_count = 1,
                 .context = worker.request.context,
                 .stack_address = worker.request.stack_address,
@@ -1262,10 +1333,12 @@ test "native bridge installs FS, SysV arguments, and the guest stack" {
     );
     try address_space.writeInt(u64, tls_address, tls_address);
 
-    // mov rax, qword ptr fs:[0]; add rax, rdi; add rax, rsi; ret
+    // Read FS:[0] and add all six System V integer argument registers.
     const fs_program = [_]u8{
         0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00,
-        0x48, 0x01, 0xf8, 0x48, 0x01, 0xf0, 0xc3,
+        0x48, 0x01, 0xf8, 0x48, 0x01, 0xf0, 0x48, 0x01, 0xd0,
+        0x48, 0x01, 0xc8, 0x4c, 0x01, 0xc0, 0x4c, 0x01, 0xc8,
+        0xc3,
     };
     // mov rax, rsp; ret
     const stack_program = [_]u8{ 0x48, 0x89, 0xe0, 0xc3 };
@@ -1289,16 +1362,17 @@ test "native bridge installs FS, SysV arguments, and the guest stack" {
         .kind = .process_entry,
         .entry_point = code_address,
         .thread_handle = 1,
-        .arguments = .{ 40, 2 },
-        .argument_count = 2,
+        .arguments = .{ 1, 2, 3, 4, 5, 6 },
+        .argument_count = 6,
         .context = context,
         .stack_address = stack_address,
         .stack_size = memory.page_size,
         .guard_size = 0,
     });
-    try testing.expectEqual(tls_address + 42, result);
+    try testing.expectEqual(tls_address + 21, result);
     try testing.expectEqual(host_fs_before, NativeMachine.readFsBase());
 
+    const requested_stack_pointer = stack_address + memory.page_size - 0x100;
     const observed_rsp = try machine.execute(.{
         .kind = .process_entry,
         .entry_point = code_address + 0x20,
@@ -1307,9 +1381,9 @@ test "native bridge installs FS, SysV arguments, and the guest stack" {
         .stack_address = stack_address,
         .stack_size = memory.page_size,
         .guard_size = 0,
+        .stack_pointer = requested_stack_pointer,
     });
-    try testing.expect(observed_rsp >= stack_address);
-    try testing.expect(observed_rsp < stack_address + memory.page_size);
+    try testing.expectEqual(requested_stack_pointer - 8, observed_rsp);
     try testing.expectEqual(@as(u64, 8), observed_rsp & 0xf);
 }
 

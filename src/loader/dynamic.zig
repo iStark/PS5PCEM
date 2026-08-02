@@ -45,6 +45,8 @@ pub const Tag = enum(i64) {
     init_arraysz = 27,
     fini_arraysz = 28,
     flags = 30,
+    preinit_array = 32,
+    preinit_arraysz = 33,
 
     /// Identity of this module.
     sce_module_info = 0x6100_000d,
@@ -215,6 +217,18 @@ pub const DynamicInfo = struct {
     rela_offset: ?u64 = null,
     rela_size: ?u64 = null,
 
+    /// Guest virtual addresses and byte sizes used during process/module
+    /// startup. Unlike the vendor table offsets above, these standard dynamic
+    /// tags refer to mapped image addresses and receive the image load bias.
+    init_virtual_address: ?u64 = null,
+    fini_virtual_address: ?u64 = null,
+    preinit_array_virtual_address: ?u64 = null,
+    preinit_array_size: ?u64 = null,
+    init_array_virtual_address: ?u64 = null,
+    init_array_size: ?u64 = null,
+    fini_array_virtual_address: ?u64 = null,
+    fini_array_size: ?u64 = null,
+
     pub fn deinit(self: *DynamicInfo, gpa: std.mem.Allocator) void {
         self.needed_modules.deinit(gpa);
         self.import_libraries.deinit(gpa);
@@ -304,6 +318,14 @@ pub fn parse(gpa: std.mem.Allocator, image: elf.Image) (Error || std.mem.Allocat
             .sce_pltrelsz => info.jmprel_size = e.value,
             .sce_rela => info.rela_offset = e.value,
             .sce_relasz => info.rela_size = e.value,
+            .init => info.init_virtual_address = e.value,
+            .fini => info.fini_virtual_address = e.value,
+            .preinit_array => info.preinit_array_virtual_address = e.value,
+            .preinit_arraysz => info.preinit_array_size = e.value,
+            .init_array => info.init_array_virtual_address = e.value,
+            .init_arraysz => info.init_array_size = e.value,
+            .fini_array => info.fini_array_virtual_address = e.value,
+            .fini_arraysz => info.fini_array_size = e.value,
             else => {},
         }
     }
@@ -336,6 +358,34 @@ test "malformed symbol names are rejected rather than guessed at" {
     try testing.expectError(ids.DecodeError.BadCharacter, parseSymbolName("id#*#A"));
     // A code too long to be one.
     try testing.expectError(ids.DecodeError.BadLength, parseSymbolName("id#ABCD#A"));
+}
+
+test "startup dynamic tags retain mapped virtual addresses and sizes" {
+    const entries = [_]Entry{
+        .{ .tag = @intFromEnum(Tag.init), .value = 0x1200 },
+        .{ .tag = @intFromEnum(Tag.preinit_array), .value = 0x2000 },
+        .{ .tag = @intFromEnum(Tag.preinit_arraysz), .value = 8 },
+        .{ .tag = @intFromEnum(Tag.init_array), .value = 0x2100 },
+        .{ .tag = @intFromEnum(Tag.init_arraysz), .value = 16 },
+        .{ .tag = @intFromEnum(Tag.fini), .value = 0x1300 },
+        .{ .tag = @intFromEnum(Tag.fini_array), .value = 0x2200 },
+        .{ .tag = @intFromEnum(Tag.fini_arraysz), .value = 24 },
+        .{ .tag = @intFromEnum(Tag.null), .value = 0 },
+    };
+    var fixture = try buildFixture(testing.allocator, &entries, &.{});
+    defer fixture.deinit(testing.allocator);
+    const image = try elf.parse(fixture.image.bytes());
+    var info = try parse(testing.allocator, image);
+    defer info.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(?u64, 0x1200), info.init_virtual_address);
+    try testing.expectEqual(@as(?u64, 0x2000), info.preinit_array_virtual_address);
+    try testing.expectEqual(@as(?u64, 8), info.preinit_array_size);
+    try testing.expectEqual(@as(?u64, 0x2100), info.init_array_virtual_address);
+    try testing.expectEqual(@as(?u64, 16), info.init_array_size);
+    try testing.expectEqual(@as(?u64, 0x1300), info.fini_virtual_address);
+    try testing.expectEqual(@as(?u64, 0x2200), info.fini_array_virtual_address);
+    try testing.expectEqual(@as(?u64, 24), info.fini_array_size);
 }
 
 /// Assembles a dynamic-data segment and a `PT_DYNAMIC` segment for tests.

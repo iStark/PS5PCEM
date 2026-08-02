@@ -13,13 +13,21 @@ const memory = @import("memory");
 const loader = @import("loader");
 const hle = @import("hle");
 const cpu = @import("cpu");
+pub const process = @import("process.zig");
 
 pub const Error = error{
     AlreadyInitialized,
     NotInitialized,
 } || memory.Error || hle.symbols.Error || loader.elf.Error || loader.dynamic.Error ||
     loader.image_loader.Error || hle.libs.kernel_threading.Error ||
-    hle.libs.kernel_sync.Error || cpu.Error || std.mem.Allocator.Error;
+    hle.libs.kernel_sync.Error || cpu.Error || process.Error || std.mem.Allocator.Error;
+
+pub const ProcessOptions = struct {
+    entry: process.Options = .{},
+    exit_handler: u64 = 0,
+    /// Shared modules in dependency-first initialization order.
+    modules: []const *loader.MappedImage = &.{},
+};
 
 pub const Runtime = struct {
     allocator: ?std.mem.Allocator = null,
@@ -197,6 +205,50 @@ pub const Runtime = struct {
         return self.cpu_dispatcher.dispatchInitial(prepared, entry_point, arguments);
     }
 
+    /// Runs executable preinitializers, dependency-ordered module
+    /// initializers, and executable initializers before building the fixed PS5
+    /// entry parameter block and dispatching the process entry point.
+    pub fn dispatchProcess(
+        self: *Runtime,
+        prepared: hle.libs.kernel_threading.PreparedThread,
+        executable: *loader.MappedImage,
+        options: ProcessOptions,
+    ) Error!u64 {
+        if (!self.initialized) return Error.NotInitialized;
+        if (!self.cpu_dispatcher.isInitialized()) return error.NotInitialized;
+        if (!self.ownsImage(executable)) return error.InvalidArgument;
+        for (options.modules) |module| {
+            if (!self.ownsImage(module)) return error.InvalidArgument;
+        }
+
+        if (!executable.preinitializers_ran) {
+            try self.runInitializerList(prepared, executable.preinit_functions.items);
+            executable.preinitializers_ran = true;
+        }
+        for (options.modules) |module| {
+            if (module.initializers_ran) continue;
+            try self.runInitializerList(prepared, module.init_functions.items);
+            module.initializers_ran = true;
+        }
+        if (!executable.initializers_ran) {
+            try self.runInitializerList(prepared, executable.init_functions.items);
+            executable.initializers_ran = true;
+        }
+
+        const layout = try process.buildEntryLayout(
+            &self.address_space.?,
+            prepared.stack_address,
+            prepared.stack_size,
+            options.entry,
+        );
+        return self.cpu_dispatcher.dispatchInitialAtStack(
+            prepared,
+            executable.entry_point,
+            &.{ layout.params_address, options.exit_handler },
+            layout.stack_pointer,
+        );
+    }
+
     /// Reports a child result after the backend has left its guest FS context.
     pub fn completeGuestThread(
         self: *Runtime,
@@ -205,6 +257,24 @@ pub const Runtime = struct {
     ) Error!void {
         if (!self.initialized) return Error.NotInitialized;
         return self.thread_manager.complete(handle, result);
+    }
+
+    fn ownsImage(self: *Runtime, image: *const loader.MappedImage) bool {
+        return image.address_space == &self.address_space.?;
+    }
+
+    fn runInitializerList(
+        self: *Runtime,
+        prepared: hle.libs.kernel_threading.PreparedThread,
+        functions: []const u64,
+    ) Error!void {
+        for (functions) |entry_point| {
+            _ = try self.cpu_dispatcher.dispatchInitializer(
+                prepared,
+                entry_point,
+                &.{ 0, 0, 0 },
+            );
+        }
     }
 
     /// Parses and loads one module through the complete runtime path.
@@ -293,6 +363,33 @@ fn toHleSymbolType(symbol_type: loader.symbols.Type) hle.SymbolType {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+const ProcessTestBridge = struct {
+    entries: [16]u64 = [_]u64{0} ** 16,
+    kinds: [16]cpu.EntryKind = [_]cpu.EntryKind{.process_entry} ** 16,
+    count: usize = 0,
+    final_arguments: [cpu.maximum_arguments]u64 = [_]u64{0} ** cpu.maximum_arguments,
+    final_argument_count: u8 = 0,
+    final_stack_pointer: ?u64 = null,
+
+    fn execute(raw: ?*anyopaque, request: cpu.ExecuteRequest) cpu.ExecutionError!u64 {
+        const self: *ProcessTestBridge = @ptrCast(@alignCast(raw.?));
+        if (self.count >= self.entries.len) return error.ExecutionFailed;
+        self.entries[self.count] = request.entry_point;
+        self.kinds[self.count] = request.kind;
+        self.count += 1;
+        if (request.kind == .process_entry) {
+            self.final_arguments = request.arguments;
+            self.final_argument_count = request.argument_count;
+            self.final_stack_pointer = request.stack_pointer;
+        }
+        return request.entry_point;
+    }
+
+    fn bridge(self: *ProcessTestBridge) cpu.Bridge {
+        return .{ .context = self, .execute_fn = &execute };
+    }
+};
 
 test "runtime owns one address space and loads a fixed module" {
     const payload = "runtime image";
@@ -418,4 +515,144 @@ test "runtime owns the optional native CPU bridge lifecycle" {
     runtime.disableCpuDispatcher();
     try testing.expect(!runtime.cpu_dispatcher.isInitialized());
     try testing.expect(!runtime.native_cpu_bridge.isInitialized());
+}
+
+test "process dispatch orders initializers and builds the PS5 entry parameters" {
+    var runtime = Runtime{};
+    try runtime.init(testing.allocator);
+    defer runtime.deinit();
+    var bridge = ProcessTestBridge{};
+    try runtime.enableCpuDispatcher(testing.io, bridge.bridge());
+
+    var module = loader.MappedImage{
+        .address_space = &runtime.address_space.?,
+        .allocator = testing.allocator,
+        .load_bias = 0,
+        .entry_point = 0x200,
+        .relocation_stats = .{},
+    };
+    defer module.deinit();
+    try module.init_functions.append(testing.allocator, 0x201);
+
+    var executable = loader.MappedImage{
+        .address_space = &runtime.address_space.?,
+        .allocator = testing.allocator,
+        .load_bias = 0,
+        .entry_point = 0x400,
+        .relocation_stats = .{},
+    };
+    defer executable.deinit();
+    try executable.preinit_functions.append(testing.allocator, 0x101);
+    try executable.preinit_functions.append(testing.allocator, 0x102);
+    try executable.init_functions.append(testing.allocator, 0x301);
+    try executable.init_functions.append(testing.allocator, 0x302);
+
+    const prepared = try runtime.prepareInitialThread("process-main");
+    defer runtime.releaseInitialThread(prepared.handle) catch {};
+    const result = try runtime.dispatchProcess(
+        prepared,
+        &executable,
+        .{
+            .entry = .{
+                .image_name = "eboot.bin",
+                .arguments = &.{ "-safe", "profile=1" },
+            },
+            .exit_handler = 0x55,
+            .modules = &.{&module},
+        },
+    );
+
+    try testing.expectEqual(@as(u64, 0x400), result);
+    try testing.expectEqualSlices(
+        u64,
+        &.{ 0x101, 0x102, 0x201, 0x301, 0x302, 0x400 },
+        bridge.entries[0..bridge.count],
+    );
+    for (bridge.kinds[0..5]) |kind| {
+        try testing.expectEqual(cpu.EntryKind.module_initializer, kind);
+    }
+    try testing.expectEqual(cpu.EntryKind.process_entry, bridge.kinds[5]);
+    try testing.expectEqual(@as(u8, 2), bridge.final_argument_count);
+    try testing.expectEqual(@as(u64, 0x55), bridge.final_arguments[1]);
+    try testing.expectEqual(bridge.final_arguments[0], bridge.final_stack_pointer.?);
+    try testing.expect(executable.preinitializers_ran);
+    try testing.expect(executable.initializers_ran);
+    try testing.expect(module.initializers_ran);
+
+    var encoded: [@sizeOf(process.EntryParams)]u8 = undefined;
+    try runtime.address_space.?.read(bridge.final_arguments[0], &encoded);
+    const params = std.mem.bytesToValue(process.EntryParams, &encoded);
+    try testing.expectEqual(@as(u32, 3), params.argc);
+    try expectRuntimeGuestString(&runtime.address_space.?, params.argv[0], "eboot.bin");
+    try expectRuntimeGuestString(&runtime.address_space.?, params.argv[1], "-safe");
+    try expectRuntimeGuestString(&runtime.address_space.?, params.argv[2], "profile=1");
+
+    bridge.count = 0;
+    _ = try runtime.dispatchProcess(prepared, &executable, .{ .modules = &.{&module} });
+    try testing.expectEqual(@as(usize, 1), bridge.count);
+    try testing.expectEqual(@as(u64, 0x400), bridge.entries[0]);
+}
+
+test "native process entry reads argc from the generated parameter block" {
+    if (!cpu.NativeBridge.isSupported()) return error.SkipZigTest;
+
+    var runtime = Runtime{};
+    try runtime.init(testing.allocator);
+    defer runtime.deinit();
+    try runtime.enableNativeCpuDispatcher(testing.io);
+
+    const code_address = memory.system_managed.start;
+    try runtime.address_space.?.mapFixed(
+        code_address,
+        memory.page_size,
+        .read_write,
+        .module,
+        null,
+    );
+    // mov eax, dword ptr [rdi]; add rax, rsi; ret
+    try runtime.address_space.?.write(
+        code_address,
+        &.{ 0x8b, 0x07, 0x48, 0x01, 0xf0, 0xc3 },
+    );
+    try runtime.address_space.?.protect(
+        code_address,
+        memory.page_size,
+        .read_execute,
+    );
+
+    var executable = loader.MappedImage{
+        .address_space = &runtime.address_space.?,
+        .allocator = testing.allocator,
+        .load_bias = code_address,
+        .entry_point = code_address,
+        .relocation_stats = .{},
+    };
+    try executable.ranges.append(testing.allocator, .{
+        .start = code_address,
+        .end = code_address + memory.page_size,
+    });
+    defer executable.deinit();
+
+    const prepared = try runtime.prepareInitialThread("native-process");
+    defer runtime.releaseInitialThread(prepared.handle) catch {};
+    const result = try runtime.dispatchProcess(
+        prepared,
+        &executable,
+        .{
+            .entry = .{ .arguments = &.{"--test"} },
+            .exit_handler = 0x40,
+        },
+    );
+    try testing.expectEqual(@as(u64, 0x42), result);
+}
+
+fn expectRuntimeGuestString(
+    address_space: *memory.AddressSpace,
+    address: u64,
+    expected: []const u8,
+) !void {
+    var bytes: [32]u8 = [_]u8{0} ** 32;
+    try address_space.read(address, bytes[0 .. expected.len + 1]);
+    try testing.expectEqualStrings(expected, bytes[0..expected.len]);
+    try testing.expectEqual(@as(u8, 0), bytes[expected.len]);
 }

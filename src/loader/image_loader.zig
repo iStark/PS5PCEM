@@ -19,6 +19,8 @@ pub const Error = error{
     InvalidLoadSegment,
     AddressOverflow,
     EntryPointUnmapped,
+    InvalidInitializerTable,
+    InitializerUnmapped,
 } || elf.Error || linker.Error || tls.Error || memory.Error || std.mem.Allocator.Error;
 
 pub const Options = struct {
@@ -40,6 +42,11 @@ pub const MappedImage = struct {
     tls_registry: ?*tls.Registry = null,
     tls_module: ?tls.Module = null,
     ranges: std.ArrayList(memory.Range) = .empty,
+    process_param_range: ?memory.Range = null,
+    preinit_functions: std.ArrayList(u64) = .empty,
+    init_functions: std.ArrayList(u64) = .empty,
+    preinitializers_ran: bool = false,
+    initializers_ran: bool = false,
 
     /// Releases every committed range while retaining the process-wide outer
     /// address-space reservation.
@@ -52,6 +59,7 @@ pub const MappedImage = struct {
         }
         self.ranges.deinit(self.allocator);
         self.ranges = .empty;
+        self.clearStartupMetadata();
         self.unregisterTls();
     }
 
@@ -66,7 +74,18 @@ pub const MappedImage = struct {
         }
         self.ranges.deinit(self.allocator);
         self.ranges = .empty;
+        self.clearStartupMetadata();
         self.unregisterTls();
+    }
+
+    fn clearStartupMetadata(self: *MappedImage) void {
+        self.preinit_functions.deinit(self.allocator);
+        self.preinit_functions = .empty;
+        self.init_functions.deinit(self.allocator);
+        self.init_functions = .empty;
+        self.process_param_range = null;
+        self.preinitializers_ran = false;
+        self.initializers_ran = false;
     }
 
     fn unregisterTls(self: *MappedImage) void {
@@ -176,6 +195,16 @@ pub fn load(
     };
     errdefer mapped.deinit();
 
+    if (image.findSegment(.sce_procparam)) |header| {
+        if (header.memsz != 0) {
+            const address = std.math.add(u64, options.load_bias, header.vaddr) catch
+                return Error.AddressOverflow;
+            const end = std.math.add(u64, address, header.memsz) catch
+                return Error.AddressOverflow;
+            mapped.process_param_range = .{ .start = address, .end = end };
+        }
+    }
+
     // Adjacent protection runs are one staging allocation. This also handles
     // ELF segments that share their boundary page.
     var run_index: usize = 0;
@@ -228,7 +257,85 @@ pub fn load(
     }
 
     if (!address_space.isMapped(entry_point, 1)) return Error.EntryPointUnmapped;
+    if (mapped.process_param_range) |range| {
+        if (!address_space.isMapped(range.start, range.len())) {
+            return Error.InvalidLoadSegment;
+        }
+    }
+    try collectStartupFunctions(&mapped, info, image.objectType());
     return mapped;
+}
+
+fn collectStartupFunctions(
+    mapped: *MappedImage,
+    info: *const dynamic.DynamicInfo,
+    object_type: elf.ObjectType,
+) Error!void {
+    if (object_type.isExecutable()) {
+        try appendInitializerArray(
+            mapped,
+            &mapped.preinit_functions,
+            info.preinit_array_virtual_address,
+            info.preinit_array_size,
+        );
+    }
+
+    // Some current images advertise DT_INIT inside a non-executable header.
+    // Treat that direct tag as absent unless it resolves to executable memory;
+    // array entries remain strict because each is explicitly callable data.
+    if (info.init_virtual_address) |virtual_address| {
+        if (resolveExecutableAddress(mapped, virtual_address)) |address| {
+            try mapped.init_functions.append(mapped.allocator, address);
+        }
+    }
+    try appendInitializerArray(
+        mapped,
+        &mapped.init_functions,
+        info.init_array_virtual_address,
+        info.init_array_size,
+    );
+}
+
+fn appendInitializerArray(
+    mapped: *MappedImage,
+    destination: *std.ArrayList(u64),
+    virtual_address: ?u64,
+    byte_size: ?u64,
+) Error!void {
+    const raw_address = virtual_address orelse return;
+    const size = byte_size orelse return Error.InvalidInitializerTable;
+    if (size == 0) return;
+    if (size % @sizeOf(u64) != 0 or size > std.math.maxInt(usize)) {
+        return Error.InvalidInitializerTable;
+    }
+    const address = std.math.add(u64, mapped.load_bias, raw_address) catch
+        return Error.AddressOverflow;
+    const entry_count: usize = @intCast(size / @sizeOf(u64));
+    var bytes: [@sizeOf(u64)]u8 = undefined;
+    for (0..entry_count) |index| {
+        const offset = std.math.mul(u64, @intCast(index), @sizeOf(u64)) catch
+            return Error.InvalidInitializerTable;
+        const entry_address = std.math.add(u64, address, offset) catch
+            return Error.AddressOverflow;
+        mapped.address_space.read(entry_address, &bytes) catch
+            return Error.InvalidInitializerTable;
+        const raw_entry = std.mem.readInt(u64, &bytes, .little);
+        if (raw_entry == 0 or raw_entry == std.math.maxInt(u64)) continue;
+        const function = resolveExecutableAddress(mapped, raw_entry) orelse
+            return Error.InitializerUnmapped;
+        try destination.append(mapped.allocator, function);
+    }
+}
+
+fn resolveExecutableAddress(mapped: *MappedImage, raw_address: u64) ?u64 {
+    if (isExecutable(mapped.address_space, raw_address)) return raw_address;
+    const biased = std.math.add(u64, mapped.load_bias, raw_address) catch return null;
+    return if (isExecutable(mapped.address_space, biased)) biased else null;
+}
+
+fn isExecutable(address_space: *memory.AddressSpace, address: u64) bool {
+    const mapping = address_space.query(address, false) orelse return false;
+    return mapping.kind != .reserved and mapping.protection.execute;
 }
 
 fn fromSegmentFlags(flags: elf.SegmentFlags) memory.Protection {
@@ -303,5 +410,128 @@ test "a load segment is copied at its exact guest address and finalized read-onl
     try testing.expectError(
         memory.Error.ProtectionDenied,
         address_space.write(memory.system_managed.start, "x"),
+    );
+}
+
+test "startup functions resolve direct and array entries in ABI order" {
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    const image_base = memory.system_managed.start;
+    const array_address = image_base + memory.page_size;
+    try address_space.mapFixed(
+        image_base,
+        memory.page_size,
+        .read_write,
+        .module,
+        null,
+    );
+    try address_space.mapFixed(
+        array_address,
+        memory.page_size,
+        .read_write,
+        .module,
+        null,
+    );
+
+    try address_space.writeInt(u64, array_address + 0x00, image_base + 0x100);
+    try address_space.writeInt(u64, array_address + 0x08, std.math.maxInt(u64));
+    try address_space.writeInt(u64, array_address + 0x10, 0x200);
+    try address_space.writeInt(u64, array_address + 0x18, 0);
+    try address_space.protect(image_base, memory.page_size, .read_execute);
+    try address_space.protect(array_address, memory.page_size, .read_only);
+
+    var mapped = MappedImage{
+        .address_space = &address_space,
+        .allocator = testing.allocator,
+        .load_bias = image_base,
+        .entry_point = image_base,
+        .relocation_stats = .{},
+    };
+    defer mapped.deinit();
+    const info = dynamic.DynamicInfo{
+        .init_virtual_address = 0x180,
+        .preinit_array_virtual_address = memory.page_size,
+        .preinit_array_size = 16,
+        .init_array_virtual_address = memory.page_size + 0x10,
+        .init_array_size = 16,
+    };
+    try collectStartupFunctions(&mapped, &info, .sce_dynexec);
+
+    try testing.expectEqualSlices(
+        u64,
+        &.{image_base + 0x100},
+        mapped.preinit_functions.items,
+    );
+    try testing.expectEqualSlices(
+        u64,
+        &.{ image_base + 0x180, image_base + 0x200 },
+        mapped.init_functions.items,
+    );
+}
+
+test "load publishes process parameters and relocated startup functions" {
+    const image_base = memory.system_managed.start;
+    const payload_size: usize = @intCast(memory.page_size * 2);
+    const payload = try testing.allocator.alloc(u8, payload_size);
+    defer testing.allocator.free(payload);
+    @memset(payload, 0);
+    std.mem.writeInt(u64, payload[@intCast(memory.page_size)..][0..8], 0x200, .little);
+
+    const offset = elf.TestImage.payloadOffset(2);
+    const segments = [_]elf.ProgramHeader{
+        .{
+            .type = @intFromEnum(elf.SegmentType.load),
+            .flags = 0x7,
+            .offset = offset,
+            .vaddr = 0,
+            .paddr = 0,
+            .filesz = payload.len,
+            .memsz = payload.len,
+            .@"align" = memory.page_size,
+        },
+        .{
+            .type = @intFromEnum(elf.SegmentType.sce_procparam),
+            .flags = 0x4,
+            .offset = offset + 0x300,
+            .vaddr = 0x300,
+            .paddr = 0,
+            .filesz = 0x20,
+            .memsz = 0x20,
+            .@"align" = 8,
+        },
+    };
+    var fixture = try elf.TestImage.build(
+        testing.allocator,
+        .sce_dynexec,
+        &segments,
+        payload,
+    );
+    defer fixture.deinit(testing.allocator);
+    const image = try elf.parse(fixture.bytes());
+    const info = dynamic.DynamicInfo{
+        .init_virtual_address = 0x100,
+        .init_array_virtual_address = memory.page_size,
+        .init_array_size = 8,
+    };
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    var mapped = try load(
+        testing.allocator,
+        &address_space,
+        image,
+        &info,
+        null,
+        .{ .load_bias = image_base },
+    );
+    defer mapped.deinit();
+
+    try testing.expectEqual(
+        memory.Range{ .start = image_base + 0x300, .end = image_base + 0x320 },
+        mapped.process_param_range.?,
+    );
+    try testing.expectEqualSlices(
+        u64,
+        &.{ image_base + 0x100, image_base + 0x200 },
+        mapped.init_functions.items,
     );
 }

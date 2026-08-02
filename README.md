@@ -394,6 +394,14 @@ handle at `FS:0x10`, and the stack canary used by guest runtimes. The DTV record
 the registry generation, maximum module ID, and the address of every static
 block.
 
+Startup metadata is retained after relocation instead of being discarded with
+the parsed dynamic table. `MappedImage` publishes the mapped `PT_SCE_PROCPARAM`
+range plus ordered `DT_PREINIT_ARRAY`, `DT_INIT`, and `DT_INIT_ARRAY` functions.
+Array entries are read only after relocations and final page protections are in
+place, and every non-sentinel target must resolve to executable guest memory.
+Preinitializers are accepted only from an executable; `DT_INIT` precedes its
+`DT_INIT_ARRAY` entries for the same image.
+
 ---
 
 # `hle` — firmware emulation
@@ -583,11 +591,11 @@ ever saturated, the dispatcher deliberately over-wakes and lets HLE recheck the
 object instead of risking a dropped wake and process deadlock.
 
 Machine execution is represented by `cpu.Bridge`. Its request includes the
-entry point, System V AMD64 arguments, thread identity, guest stack, and complete
-TLS context. This boundary is intentionally strict: POSIX hosts commonly use FS
-for their own TLS, while Windows x86-64 keeps the TEB under GS and leaves FS
-available to guest code. Kyty and SharpEmu make the same separation, although
-their patch/trampoline machinery differs.
+entry point, six System V AMD64 integer arguments, thread identity, guest stack,
+optional pre-call RSP, and complete TLS context. This boundary is intentionally
+strict: POSIX hosts commonly use FS for their own TLS, while Windows x86-64
+keeps the TEB under GS and leaves FS available to guest code. Kyty and SharpEmu
+make the same separation, although their patch/trampoline machinery differs.
 
 `cpu.NativeBridge` implements the first direct backend for Windows x86-64. It
 checks the operating system's `PF_RDWRFSGSBASE_AVAILABLE` capability before use,
@@ -602,19 +610,19 @@ the dispatcher observes `error.Interrupted`.
 The bridge intentionally does not force a context change in another host
 thread. Shutdown marks such an execution interrupted and observes it when guest
 code returns; suspending a worker inside HLE could abandon host locks. Windows
-fault recovery/SEH metadata, unsupported-instruction compatibility, process
-startup data, and module initializers are still missing, so arbitrary
-`eboot.bin` execution is not safe yet. Linux and macOS need a different
-FS/HLE-transition strategy because their host TLS rules differ. GPU submission
-and audio callbacks consequently remain beyond the current title bootstrap.
+fault recovery/SEH metadata and unsupported-instruction compatibility are still
+missing, so arbitrary `eboot.bin` execution is not safe yet. Linux and macOS
+need a different FS/HLE-transition strategy because their host TLS rules differ.
+GPU submission and audio callbacks consequently remain beyond the current
+title bootstrap.
 
 ## Roadmap
 
-1. Build the process-entry stack and run module initializers before `eboot.bin`.
-2. Add Windows trap/fault recovery, unwind metadata, and compatibility handling
+1. Add Windows trap/fault recovery, unwind metadata, and compatibility handling
    for unsupported x86-64 instructions.
-3. Introduce import transition stubs where host-stack recovery, diagnostics, or
+2. Introduce import transition stubs where host-stack recovery, diagnostics, or
    platform TLS restoration are required.
+3. Add a POSIX native bridge with explicit host-TLS restoration around HLE.
 
 ---
 
@@ -628,8 +636,9 @@ all HLE exports, owns the process TLS registry, and adapts both registries to
 identifier-only HLE lookup remains the documented fallback for incomplete
 module metadata. It also owns the pthread and synchronization managers plus an
 opt-in CPU dispatcher and native bridge, exposes initial-thread preparation and
-dispatch, and keeps natural-return TLS destructor handling inside the execution
-lifecycle. A mapped image unregisters its TLS template when it unloads.
+process dispatch, and keeps natural-return TLS destructor handling inside the
+execution lifecycle. A mapped image unregisters its TLS template when it
+unloads.
 
 ```zig
 const runtime = @import("runtime");
@@ -643,13 +652,27 @@ defer module.deinit();
 
 try emu.enableNativeCpuDispatcher(io);
 
-std.debug.print("entry = 0x{x}\n", .{module.entry_point});
+const initial = try emu.prepareInitialThread("main");
+defer emu.releaseInitialThread(initial.handle) catch {};
+
+const result = try emu.dispatchProcess(initial, &module, .{
+    .entry = .{
+        .image_name = "eboot.bin",
+        .arguments = &.{"--safe"},
+    },
+});
+std.debug.print("process returned 0x{x}\n", .{result});
 ```
 
 `enableNativeCpuDispatcher` currently succeeds only on Windows x86-64 with
-user-mode FS-base instructions enabled. Call `prepareInitialThread` and
-`dispatchGuestEntry` only after constructing the guest process-entry stack;
-that bootstrap layout is the next runtime milestone.
+user-mode FS-base instructions enabled. `dispatchProcess` follows the startup
+order executable preinit → dependency-first module init → executable init, with
+per-image guards preventing a second initializer run. It then uses
+[src/runtime/process.zig](src/runtime/process.zig) to place the PS5 0x20-byte
+entry parameter structure and up to three inline `argv` pointers at the top of
+the prepared guest stack. The structure address is passed in RDI, the optional
+exit handler in RSI, and the native bridge enters with the corresponding AMD64
+stack alignment.
 
 `Runtime.init` is intentionally in-place. Libkernel retains a pointer to the
 address space, so returning a Runtime value from an initializer could move it
