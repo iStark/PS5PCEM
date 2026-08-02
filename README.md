@@ -7,7 +7,7 @@ the independent subsystems and their end-to-end composition:
 |---|---|
 | **`memory`** | Reserves and manages the fixed, identity-mapped guest address space |
 | **`rdna2`** | Decodes and disassembles RDNA2 shader machine code |
-| **`loader`** | Reads, maps, and relocates guest ELF64 module images |
+| **`loader`** | Reads, maps, and relocates bare ELF64 and decrypted PS5 SELF module images |
 | **`hle`** | High-level emulation of the guest firmware: symbol resolution and firmware libraries |
 | **`cpu`** | Dispatches guest execution and provides the Windows x86-64 native machine bridge |
 | **`runtime`** | Composes memory, loader, HLE, and the optional CPU execution path |
@@ -21,7 +21,7 @@ Two command-line tools come with them:
 
 ```sh
 zig build run         -- shader.bin    # disassemble a shader
-zig build module-info -- module.elf    # inspect a guest module
+zig build module-info -- eboot.bin     # inspect a bare ELF or decrypted PS5 SELF
 ```
 
 `module-info` is where the pieces meet. It reads a module, works out every
@@ -29,6 +29,7 @@ symbol the module imports, and checks each one against the firmware registry:
 
 ```
 sample_module.elf
+  container     bare_elf
   type          sce_dynexec
   entry         0x1000
   module        sample_app v1.0
@@ -277,22 +278,31 @@ before dereferencing the identity-mapped pointer.
 
 Guest executables are ELF64 for x86-64, but with vendor extensions that make a
 stock ELF reader useless: the object types sit outside the standard range and
-are rejected outright, and the dynamic linking tables are not where a normal
-loader looks for them.
+are rejected outright, and dynamic linking tables use two SDK-dependent
+layouts. Titles normally wrap those ELF structures in a PS5 SELF container.
 
 Parsing remains read-only and non-owning: an `Image` borrows the caller's file
-buffer. `loadImage` is the action boundary. It places `PT_LOAD` pages in a
+buffer. Bare ELF and decrypted/fake-signed PS5 SELF inputs share the same public
+API. `loadImage` is the action boundary. It places `PT_LOAD` pages in a
 `memory.AddressSpace`, copies file bytes, applies relocations through a supplied
 symbol resolver, and installs final ELF page protections.
 
 ## Why the format needs its own reader
 
-**The dynamic tables are not mapped.** In a conventional ELF, the string table
-and symbol table live inside loaded segments and the dynamic entries point at
-them by virtual address. Here they sit in a separate `PT_SCE_DYNLIBDATA`
-segment, and the pointer-valued entries are offsets into *that* segment. Tags
-that would carry an address get vendor replacements in the `0x6100_00xx` range
-for exactly this reason.
+**SELF offsets are not ELF offsets.** The ELF header and program-header table
+sit near the start of a SELF, while each program payload has a separate physical
+container offset. The loader resolves every logical `p_offset` through the SELF
+segment table. Newer images can also append `PT_SCE_DYNLIBDATA` directly after
+the final stored payload while omitting logical NOTE and alignment bytes.
+Encrypted or compressed segments are rejected explicitly; this component does
+not contain keys or a decompressor.
+
+**Two dynamic-table layouts coexist.** Older modules keep strings, symbols, and
+relocations in an unmapped `PT_SCE_DYNLIBDATA` segment and use `DT_SCE_*` offsets
+within it. Newer PS5 modules use standard `DT_STRTAB`, `DT_SYMTAB`, `DT_RELA`,
+and `DT_JMPREL` virtual addresses inside mapped load segments. `DynamicInfo`
+records which addressing mode was found and exposes one checked table-access API
+to import discovery, relocation, and TLS export collection.
 
 **Imports do not name what they need.** A symbol name looks like:
 
@@ -316,6 +326,7 @@ bits, version below it, and a string table offset in the low 32.
 
 | | |
 |---|---|
+| [src/loader/self.zig](src/loader/self.zig) | PS5 SELF header, segment table, and decrypted-payload validation |
 | [src/loader/elf.zig](src/loader/elf.zig) | Header and program headers, validation, segment lookup |
 | [src/loader/dynamic.zig](src/loader/dynamic.zig) | Dynamic entries, module and library declarations, symbol names |
 | [src/loader/ids.zig](src/loader/ids.zig) | Library and module code encoding |
