@@ -1,0 +1,140 @@
+//! Whole-shader parsing: family dispatch and end-of-program detection.
+
+const std = @import("std");
+const isa = @import("isa.zig");
+const instruction = @import("instruction.zig");
+const scalar_alu = @import("scalar_alu.zig");
+
+const Instruction = instruction.Instruction;
+const Program = instruction.Program;
+pub const Error = instruction.Error;
+
+/// Parsing a program also accumulates instructions and branch targets, so it can
+/// additionally fail on allocation.
+pub const ProgramError = Error || std.mem.Allocator.Error;
+
+/// Decodes a single instruction from its first word.
+///
+/// Only the scalar families are implemented so far; everything else is rejected
+/// with `UnknownInstructionFamily` rather than skipped silently — guessing an
+/// instruction length would desynchronize the rest of the parse.
+pub fn decodeInstruction(pc: u32, code: []const u32, word_index: u32) Error!Instruction {
+    const word = code[word_index];
+
+    // Top bit clear -> VOP2 (not implemented yet).
+    if (word & 0x8000_0000 == 0) {
+        return Error.UnknownInstructionFamily;
+    }
+
+    // Leading 0b10 -> the scalar families.
+    if (word & 0xc000_0000 == 0x8000_0000) {
+        const opcode = (word >> 23) & 0x7f;
+        return switch (opcode) {
+            0x7d => scalar_alu.decodeSop1(pc, code, word_index),
+            0x7e => scalar_alu.decodeSopc(pc, code, word_index),
+            0x7f => scalar_alu.decodeSopp(pc, code, word_index),
+            else => if (opcode >= 0x60)
+                scalar_alu.decodeSopk(pc, code, word_index)
+            else
+                scalar_alu.decodeSop2(pc, code, word_index),
+        };
+    }
+
+    // The rest are the vector and memory families, not ported yet.
+    return Error.UnknownInstructionFamily;
+}
+
+/// Parses a shader up to `s_endpgm`.
+///
+/// The program is considered finished at an `s_endpgm` that no branch in the
+/// already-parsed code targets: in shaders with control flow, `s_endpgm` can
+/// appear in the middle.
+///
+/// The caller owns the result and must call `Program.deinit`.
+pub fn decodeProgram(allocator: std.mem.Allocator, code: []const u32) ProgramError!Program {
+    if (code.len == 0) return Error.EmptyProgram;
+
+    var instructions: std.ArrayList(Instruction) = .empty;
+    errdefer instructions.deinit(allocator);
+
+    var branch_targets: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer branch_targets.deinit(allocator);
+
+    var word_index: u32 = 0;
+    while (word_index < code.len) {
+        const pc = word_index * 4;
+        const inst = try decodeInstruction(pc, code, word_index);
+
+        try instructions.append(allocator, inst);
+        word_index += inst.word_count;
+
+        if (inst.opcode.isBranch()) {
+            try branch_targets.put(allocator, inst.branch_target, {});
+        }
+
+        if (inst.opcode == .s_endpgm) {
+            const at_end = word_index >= code.len;
+            if (at_end or !branch_targets.contains(word_index * 4)) {
+                return .{ .code = code, .instructions = instructions };
+            }
+        }
+    }
+
+    return Error.MissingEndProgram;
+}
+
+test "a two-instruction program" {
+    const code = [_]u32{
+        0xbe80_0301, // s_mov_b32 s0, s1
+        0xbf81_0000, // s_endpgm
+    };
+
+    var program = try decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), program.instructions.items.len);
+    try std.testing.expectEqual(isa.Opcode.s_mov_b32, program.instructions.items[0].opcode);
+    try std.testing.expectEqual(isa.Opcode.s_endpgm, program.instructions.items[1].opcode);
+    try std.testing.expectEqual(@as(u32, 4), program.instructions.items[1].pc);
+}
+
+test "a literal shifts the pc of the next instruction" {
+    const code = [_]u32{
+        0xbe80_03ff, // s_mov_b32 s0, literal
+        0x0000_002a,
+        0xbf81_0000, // s_endpgm
+    };
+
+    var program = try decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), program.instructions.items.len);
+    try std.testing.expectEqual(@as(u32, 42), program.instructions.items[0].src0.value);
+    // The second instruction must start after the literal: word 2 -> pc 8.
+    try std.testing.expectEqual(@as(u32, 8), program.instructions.items[1].pc);
+}
+
+test "empty input is rejected" {
+    const code = [_]u32{};
+    try std.testing.expectError(Error.EmptyProgram, decodeProgram(std.testing.allocator, &code));
+}
+
+test "code without s_endpgm is rejected" {
+    const code = [_]u32{0xbe80_0301}; // s_mov_b32 and nothing after it
+    try std.testing.expectError(Error.MissingEndProgram, decodeProgram(std.testing.allocator, &code));
+}
+
+test "a branched-over s_endpgm does not end the parse" {
+    // s_cbranch_scc0 jumps past the s_endpgm to the instruction after it, so
+    // word 2 is a branch target and parsing has to continue.
+    const code = [_]u32{
+        0xbf84_0001, // s_cbranch_scc0 +1 -> target pc=8
+        0xbf81_0000, // s_endpgm (word 2 is a branch target)
+        0xbf81_0000, // s_endpgm (the real end)
+    };
+
+    var program = try decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), program.instructions.items.len);
+}
