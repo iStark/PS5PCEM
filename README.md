@@ -794,23 +794,27 @@ fixed ring: a title makes millions, and the last few dozen are what explain a
 failure.
 
 ```
-  last 32 firmware calls (of 11273)
-     11184 sceKernelGetProcessTimeCounterFrequency() = 0x3b9aca00
-     11185 scePthreadCondInit(0x238e620, 0x0, 0x7000127f20) = 0xffffffff80020010  <- failure
-     11219 sceKernelGetModuleInfoForUnwind(0x801732175, ...) = 0xffffffff8002004e  <- failure
-     11265 _write(0x2, 0x8018942d0, 0x65, ...) = 0xffffffffffffffff  <- failure
+  last 32 firmware calls (of 11412)
+     11400 sceKernelAllocateMainDirectMemory(0x400000, 0x0, 0xc, ...) = 0x0
+     11401 sceKernelMapDirectMemory(..., 0x400000, 0xf2, 0x10, 0x12500000, 0x0) = 0xffffffff8002000c  <- failure
+     11412 sceKernelVirtualQuery(0x202500000, 0x0, ..., 0x48) = 0xffffffff8002000d  <- failure
 ```
 
 Both failure conventions are marked: the `0x8002_00xx` kernel scheme and the
 POSIX `-1`. Zero is deliberately not marked, since too many entry points return
 zero for success.
 
+This is what the tooling is for. The trace above says a title reserved a range,
+allocated physical memory for it, failed to map the two together, and then wrote
+to the range anyway — which is a far more useful statement than the address the
+process eventually died at.
+
 ## Guest diagnostics
 
 A runtime about to give up almost always explains itself first, through a write
-to its own standard error. The trace still holds that buffer's address and
-length after the fact, so the message can be recovered even when the write
-itself failed:
+to its own standard error. Guest writes to the standard streams now reach the
+host directly, but the trace also retains the buffer address and length, so the
+message survives even when the write itself fails:
 
 ```
   guest diagnostics
@@ -819,6 +823,10 @@ itself failed:
 ```
 
 In the title's own words, which no amount of address attribution can supply.
+That one line identified three separate defects at once: a synchronization
+primitive that refused re-initialization, missing unwind tables that turned
+every recoverable exception into a terminate, and the silenced write that hid
+all of it.
 
 ---
 
