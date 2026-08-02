@@ -383,10 +383,14 @@ TLS Variant II. The layout preserves both module alignment and the ELF
 not renumber modules or repack surviving offsets, because relocation results
 already written into memory must remain valid.
 
-The registry exposes the saved initialization image for thread creation, but it
-does not allocate per-thread blocks yet. Thread bootstrap will zero each module's
-full memory size, overlay `tdata`, build the dynamic thread vector, and install
-the guest FS base.
+Thread creation snapshots the registry under one lock, then allocates an
+identity-mapped per-thread region in the guest user window. At least 128 KiB of
+prefix space below the thread pointer holds the static Variant II blocks,
+zero-filling each module's complete `memsz` before overlaying its `tdata`. The
+TCB contains the self pointer at `FS:0`, the DTV pointer at `FS:8`, the pthread
+handle at `FS:0x10`, and the stack canary used by guest runtimes. The DTV records
+the registry generation, maximum module ID, and the address of every static
+block.
 
 ---
 
@@ -494,6 +498,33 @@ mapping metadata where required.
 | `sceKernelSetVirtualRangeName` | Implemented |
 | `sceKernelReserveVirtualRange` | Implemented for fixed and searched reservations |
 
+**`libkernel` — pthread bootstrap and TLS** ([src/hle/libs/kernel_threading.zig](src/hle/libs/kernel_threading.zig))
+
+Guest pthread and attribute handles are stable opaque pointers, matching the
+firmware ABI used by both reference emulators. The manager owns their lifecycle,
+copies attributes at creation, creates one TLS/TCB/DTV mapping per thread, and
+reclaims it after join or detached completion. The initial process thread uses
+the same path through `Runtime.prepareInitialThread`, so it does not receive a
+special TLS layout.
+
+The implemented lifecycle surface includes `create`, `join`, `detach`, `self`,
+`equal`, `exit`, `yield`, `once`, and `sceKernelUsleep`, with both
+`scePthread*` and POSIX spellings where the firmware exports both. Attributes
+cover copy/get, stack address and size, guard size, detach state, affinity,
+inherit-sched, scheduling parameters and policy, and solo scheduling. POSIX
+wrappers return plain positive errno values; sce entry points return kernel
+statuses.
+
+Thread execution is connected through an explicit backend adapter. Every start
+request contains the entry point, argument, pthread identity, scheduling hints,
+and a ready `ThreadContext` containing the guest `fs_base`. This separation is a
+correctness requirement on Windows, where FS belongs to the host TEB: the CPU
+backend must install guest FS only across guest instruction execution, or patch
+FS-relative instructions as Kyty and SharpEmu do. HLE code never replaces the
+host FS register while Zig or Win32 code is active. Until a CPU backend is
+attached, creation, positive-duration sleep, and guest callbacks from `once`
+report `ENOSYS` rather than entering code with an invalid TLS base.
+
 ## Error codes
 
 Two numbering schemes coexist in the guest ABI, and mixing them up is a common
@@ -508,8 +539,9 @@ from leaking into host code where nothing would check it.
 
 ## Roadmap
 
-1. Thread bootstrap: seed static TLS/DTV state, install the guest FS base, then
-   implement the `pthread_*` and `scePthread*` families.
+1. Connect the CPU dispatcher to the pthread backend and its supplied guest FS
+   context, then add mutex, condition-variable, rwlock, key, and destructor
+   families on top of the completed thread lifecycle.
 2. Event queues, on which most firmware asynchrony is built.
 
 ---
@@ -522,7 +554,9 @@ with the sparse direct-memory backing store, connects it to libkernel, registers
 all HLE exports, owns the process TLS registry, and adapts both registries to
 `loader.Resolver`. Exact library/module/version metadata is used first; the
 identifier-only HLE lookup remains the documented fallback for incomplete
-module metadata. A mapped image unregisters its TLS template when it unloads.
+module metadata. It also owns the pthread manager and exposes the execution
+backend boundary plus initial-thread preparation. A mapped image unregisters
+its TLS template when it unloads.
 
 ```zig
 const runtime = @import("runtime");

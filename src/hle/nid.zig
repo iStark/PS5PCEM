@@ -104,6 +104,11 @@ pub fn matches(name: []const u8, text: []const u8) bool {
 /// pin the algorithm: a change that breaks any of these breaks symbol
 /// resolution for every guest module.
 const known_pairs = [_]struct { []const u8, []const u8 }{
+    .{ "scePthreadCreate", "6UgtwV+0zb4" },
+    .{ "pthread_create", "OxhIB8LB-PQ" },
+    .{ "scePthreadJoin", "onNY9Byn-W8" },
+    .{ "pthread_join", "h9CcP3J0oVM" },
+    .{ "scePthreadDetach", "4qGrR6eoP9Y" },
     .{ "pthread_mutex_lock", "7H0iTOciTLo" },
     .{ "pthread_mutex_unlock", "2Z+PpY6CaJg" },
     .{ "pthread_detach", "+U1R4WtXvoc" },
@@ -115,6 +120,11 @@ const known_pairs = [_]struct { []const u8, []const u8 }{
     .{ "pthread_rwlock_destroy", "1471ajPzxh0" },
     .{ "pthread_attr_setstacksize", "2Q0z6rnBrTE" },
     .{ "pthread_attr_getstacksize", "0qOtCR-ZHck" },
+    .{ "scePthreadSelf", "aI+OeCz8xrQ" },
+    .{ "pthread_self", "EotR8a3ASf4" },
+    .{ "scePthreadExit", "3kg7rT0NQIs" },
+    .{ "pthread_exit", "FJrT5LuUBAU" },
+    .{ "pthread_once", "Z4QosVuAsA0" },
     .{ "sem_getvalue", "Bq+LRV-N6Hk" },
     .{ "stat", "E6ao34wPw+U" },
     .{ "getpagesize", "k+AXqu2-eBc" },
@@ -136,6 +146,7 @@ const known_pairs = [_]struct { []const u8, []const u8 }{
     .{ "sceKernelMprotect", "vSMAm3cxYTY" },
     .{ "sceKernelSetVirtualRangeName", "DGMG3JshrZU" },
     .{ "sceKernelReserveVirtualRange", "7oxv3PPCumo" },
+    .{ "sceKernelUsleep", "1jfXLRVzisc" },
     // Firmware exports both POSIX and camel-case spellings of the same
     // operation, and they are distinct symbols with distinct identifiers.
     .{ "scePthreadOnce", "14bOACANTBo" },

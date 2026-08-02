@@ -24,17 +24,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Firmware emulation: identifier derivation, the symbol registry, and the
-    // guest-facing libraries. Independent of the shader decoder.
-    const hle = b.addModule("hle", .{
-        .root_source_file = b.path("src/hle/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "memory", .module = memory },
-        },
-    });
-
     // Guest module images: ELF64 parsing and the dynamic linking tables.
     const loader = b.addModule("loader", .{
         .root_source_file = b.path("src/loader/root.zig"),
@@ -42,6 +31,19 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "memory", .module = memory },
+        },
+    });
+
+    // Firmware emulation: identifier derivation, the symbol registry, and the
+    // guest-facing libraries. Thread bootstrap consumes immutable TLS
+    // templates from the loader without introducing a dependency back into it.
+    const hle = b.addModule("hle", .{
+        .root_source_file = b.path("src/hle/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "memory", .module = memory },
+            .{ .name = "loader", .module = loader },
         },
     });
 

@@ -68,6 +68,29 @@ pub const Template = struct {
     exports: []const Export = &.{},
 };
 
+/// Immutable copy of one registered template used while constructing a
+/// thread's TLS block. The registry lock is held while the complete snapshot is
+/// cloned, so module metadata and initialized bytes always describe the same
+/// process generation.
+pub const SnapshotModule = struct {
+    info: Module,
+    initial_image: []u8,
+};
+
+pub const Snapshot = struct {
+    generation: u64,
+    static_size: u64,
+    maximum_alignment: u64,
+    maximum_module_id: u64,
+    modules: []SnapshotModule,
+
+    pub fn deinit(self: *Snapshot, gpa: std.mem.Allocator) void {
+        for (self.modules) |module| gpa.free(module.initial_image);
+        gpa.free(self.modules);
+        self.* = undefined;
+    }
+};
+
 const OwnedExport = struct {
     id: []u8,
     library: []u8,
@@ -113,6 +136,7 @@ pub const Registry = struct {
     modules: std.ArrayList(RegisteredModule) = .empty,
     next_id: u64 = 1,
     static_size: u64 = 0,
+    generation: u64 = 1,
     lock: Lock = .{},
 
     pub fn deinit(self: *Registry, gpa: std.mem.Allocator) void {
@@ -123,6 +147,7 @@ pub const Registry = struct {
         self.modules = .empty;
         self.next_id = 1;
         self.static_size = 0;
+        self.generation = 1;
     }
 
     /// Registers an immutable TLS template and assigns the next module ID.
@@ -169,6 +194,7 @@ pub const Registry = struct {
 
         self.static_size = static_offset;
         self.next_id = if (module.id == std.math.maxInt(u64)) 0 else module.id + 1;
+        self.advanceGeneration();
         return module;
     }
 
@@ -207,6 +233,7 @@ pub const Registry = struct {
             if (module.info.id != id) continue;
             var removed = self.modules.orderedRemove(index);
             removed.deinit(gpa);
+            self.advanceGeneration();
             return;
         }
     }
@@ -230,6 +257,41 @@ pub const Registry = struct {
         self.lock.lock();
         defer self.lock.unlock();
         return self.static_size;
+    }
+
+    /// Clones the complete process TLS layout for one thread bootstrap.
+    /// Loading or unloading a module after this call affects future threads,
+    /// never a partially initialized block already being constructed.
+    pub fn snapshot(self: *Registry, gpa: std.mem.Allocator) Error!Snapshot {
+        self.lock.lock();
+        defer self.lock.unlock();
+
+        const cloned = try gpa.alloc(SnapshotModule, self.modules.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (cloned[0..initialized]) |module| gpa.free(module.initial_image);
+            gpa.free(cloned);
+        }
+
+        var maximum_alignment: u64 = 1;
+        var maximum_module_id: u64 = 0;
+        for (self.modules.items, cloned) |source, *destination| {
+            destination.* = .{
+                .info = source.info,
+                .initial_image = try gpa.dupe(u8, source.initial_image),
+            };
+            initialized += 1;
+            maximum_alignment = @max(maximum_alignment, source.info.alignment);
+            maximum_module_id = @max(maximum_module_id, source.info.id);
+        }
+
+        return .{
+            .generation = self.generation,
+            .static_size = self.static_size,
+            .maximum_alignment = maximum_alignment,
+            .maximum_module_id = maximum_module_id,
+            .modules = cloned,
+        };
     }
 
     /// Copies the initialized `tdata` bytes for a future per-thread block.
@@ -276,6 +338,11 @@ pub const Registry = struct {
             }
         }
         return null;
+    }
+
+    fn advanceGeneration(self: *Registry) void {
+        self.generation +%= 1;
+        if (self.generation == 0) self.generation = 1;
     }
 };
 
@@ -372,6 +439,33 @@ test "Variant II layout preserves size and PT_TLS alignment bias" {
         try registry.copyInitialImage(first.id, &initial_image),
     );
     try testing.expectEqualSlices(u8, &.{ 0x11, 0x22 }, &initial_image);
+}
+
+test "snapshot owns one coherent TLS registry generation" {
+    var registry = Registry{};
+    defer registry.deinit(testing.allocator);
+
+    const first = try registry.register(testing.allocator, .{
+        .initial_image = &.{ 0x31, 0x32 },
+        .memory_size = 0x20,
+        .alignment = 0x10,
+    });
+    var snapshot = try registry.snapshot(testing.allocator);
+    defer snapshot.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), snapshot.modules.len);
+    try testing.expectEqual(first, snapshot.modules[0].info);
+    try testing.expectEqualSlices(u8, &.{ 0x31, 0x32 }, snapshot.modules[0].initial_image);
+    try testing.expectEqual(first.static_offset, snapshot.static_size);
+    try testing.expectEqual(@as(u64, 0x10), snapshot.maximum_alignment);
+    try testing.expectEqual(first.id, snapshot.maximum_module_id);
+
+    _ = try registry.register(testing.allocator, .{
+        .initial_image = &.{0x44},
+        .memory_size = 0x10,
+        .alignment = 8,
+    });
+    try testing.expectEqual(@as(usize, 1), snapshot.modules.len);
 }
 
 test "TLS exports resolve with exact library and module metadata" {
