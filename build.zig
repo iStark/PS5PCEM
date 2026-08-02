@@ -47,8 +47,21 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // End-to-end composition: one address space, the ELF loader, and the HLE
-    // export database wired together by a symbol resolver.
+    // Guest CPU dispatch: host worker lifecycle and scheduler semantics stay
+    // separate from the platform-specific machine execution bridge.
+    const cpu = b.addModule("cpu", .{
+        .root_source_file = b.path("src/cpu/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "memory", .module = memory },
+            .{ .name = "loader", .module = loader },
+            .{ .name = "hle", .module = hle },
+        },
+    });
+
+    // End-to-end composition: address space, ELF loader, HLE export database,
+    // and optional CPU dispatch wired together by one process runtime.
     const runtime = b.addModule("runtime", .{
         .root_source_file = b.path("src/runtime/root.zig"),
         .target = target,
@@ -57,6 +70,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "memory", .module = memory },
             .{ .name = "loader", .module = loader },
             .{ .name = "hle", .module = hle },
+            .{ .name = "cpu", .module = cpu },
         },
     });
 
@@ -109,6 +123,7 @@ pub fn build(b: *std.Build) void {
         memory,
         mod,
         hle,
+        cpu,
         loader,
         runtime,
         exe.root_module,

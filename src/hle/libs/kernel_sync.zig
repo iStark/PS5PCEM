@@ -487,7 +487,7 @@ fn kernelStatus(err: anyerror) i32 {
         error.TimedOut => KernelError.etimedout.raw(),
         error.ResourceLimit => KernelError.eagain.raw(),
         error.NotAttached, error.ExecutorUnavailable, error.Unsupported => KernelError.enosys.raw(),
-        error.JoinFailed, error.WaitFailed => KernelError.eio.raw(),
+        error.JoinFailed, error.WaitFailed, error.CallFailed => KernelError.eio.raw(),
         else => KernelError.einval.raw(),
     };
 }

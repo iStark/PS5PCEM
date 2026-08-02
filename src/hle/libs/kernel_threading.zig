@@ -57,6 +57,7 @@ pub const BackendError = error{
     WouldDeadlock,
     JoinFailed,
     WaitFailed,
+    CallFailed,
 };
 
 pub const WaitResult = enum {
@@ -249,6 +250,8 @@ const ThreadBlock = struct {
 
 const ThreadRecord = struct {
     block: ?ThreadBlock = null,
+    stack_mapping_address: u64 = 0,
+    stack_mapping_size: u64 = 0,
     attributes: Attr,
     entry_point: u64,
     argument: u64,
@@ -263,6 +266,9 @@ const ThreadRecord = struct {
 pub const PreparedThread = struct {
     handle: ThreadHandle,
     context: ThreadContext,
+    stack_address: u64,
+    stack_size: u64,
+    guard_size: u64,
 };
 
 const KeyRecord = struct {
@@ -310,6 +316,7 @@ pub const Manager = struct {
         if (!self.initialized) return;
         self.lock.lock();
         for (self.threads.items) |record| {
+            self.releaseGuestStack(record);
             if (record.block) |*block| block.deinit();
             self.allocator.destroy(record);
         }
@@ -326,6 +333,12 @@ pub const Manager = struct {
         self.backend = backend;
     }
 
+    pub fn hasBackend(self: *Manager) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.backend != null;
+    }
+
     /// Creates TLS for a process-entry thread already owned by the executor.
     /// The executor must call `enter` before dispatch and `leave` afterwards.
     pub fn prepareInitialThread(self: *Manager, name: []const u8) Error!PreparedThread {
@@ -334,6 +347,9 @@ pub const Manager = struct {
         return .{
             .handle = @ptrCast(record),
             .context = record.block.?.context,
+            .stack_address = record.attributes.stack_address,
+            .stack_size = record.attributes.stack_size,
+            .guard_size = record.attributes.guard_size,
         };
     }
 
@@ -394,9 +410,9 @@ pub const Manager = struct {
             .entry_point = entry_point,
             .argument = argument,
             .context = record.block.?.context,
-            .stack_address = attributes.stack_address,
-            .stack_size = attributes.stack_size,
-            .guard_size = attributes.guard_size,
+            .stack_address = record.attributes.stack_address,
+            .stack_size = record.attributes.stack_size,
+            .guard_size = record.attributes.guard_size,
             .priority = attributes.priority,
             .affinity_mask = attributes.affinity_mask,
             .detached = attributes.detached,
@@ -679,8 +695,63 @@ pub const Manager = struct {
             @intFromPtr(record),
         );
         errdefer record.block.?.deinit();
+        try self.allocateGuestStack(record);
+        errdefer self.releaseGuestStack(record);
         try self.appendRecord(record);
         return record;
+    }
+
+    fn allocateGuestStack(self: *Manager, record: *ThreadRecord) Error!void {
+        // A caller-provided stack is guest-owned. The manager neither remaps
+        // nor releases it, but validates that its complete range exists.
+        if (record.attributes.stack_address != 0) {
+            if (!isWritableGuestRange(
+                self.address_space,
+                record.attributes.stack_address,
+                record.attributes.stack_size,
+            )) return error.InvalidArgument;
+            return;
+        }
+
+        const mapped_stack_size = try alignForward(record.attributes.stack_size, memory.page_size);
+        const mapped_guard_size = if (record.attributes.guard_size == 0)
+            0
+        else
+            try alignForward(record.attributes.guard_size, memory.page_size);
+        const mapping_size = std.math.add(u64, mapped_guard_size, mapped_stack_size) catch
+            return error.AddressOverflow;
+        const mapping_address = try self.address_space.map(
+            .user,
+            0,
+            mapping_size,
+            memory.page_size,
+            .none,
+            .private,
+            null,
+        );
+        errdefer self.address_space.unmap(mapping_address, mapping_size) catch {};
+        try self.address_space.protect(
+            mapping_address + mapped_guard_size,
+            mapped_stack_size,
+            .read_write,
+        );
+
+        record.stack_mapping_address = mapping_address;
+        record.stack_mapping_size = mapping_size;
+        record.attributes.stack_address = mapping_address + mapped_guard_size;
+        // Report the effective guard because the native address space can only
+        // protect complete guest pages.
+        record.attributes.guard_size = mapped_guard_size;
+    }
+
+    fn releaseGuestStack(self: *Manager, record: *ThreadRecord) void {
+        if (record.stack_mapping_size == 0) return;
+        self.address_space.unmap(
+            record.stack_mapping_address,
+            record.stack_mapping_size,
+        ) catch {};
+        record.stack_mapping_address = 0;
+        record.stack_mapping_size = 0;
     }
 
     fn appendRecord(self: *Manager, record: *ThreadRecord) std.mem.Allocator.Error!void {
@@ -710,6 +781,7 @@ pub const Manager = struct {
     }
 
     fn destroyRecord(self: *Manager, record: *ThreadRecord) void {
+        self.releaseGuestStack(record);
         if (record.block) |*block| block.deinit();
         self.allocator.destroy(record);
     }
@@ -815,6 +887,17 @@ fn alignForward(value: u64, alignment: u64) Error!u64 {
     return upper & ~mask;
 }
 
+fn isWritableGuestRange(address_space: *memory.AddressSpace, address: u64, size: u64) bool {
+    const end = std.math.add(u64, address, size) catch return false;
+    var cursor = address;
+    while (cursor < end) {
+        const mapping = address_space.query(cursor, false) orelse return false;
+        if (mapping.address > cursor or !mapping.protection.write) return false;
+        cursor = @min(end, mapping.end());
+    }
+    return true;
+}
+
 fn handleAddress(handle: ThreadHandle) ?u64 {
     const pointer = handle orelse return null;
     return @intFromPtr(pointer);
@@ -839,7 +922,7 @@ fn kernelStatus(err: anyerror) i32 {
         error.WouldDeadlock => KernelError.edeadlk.raw(),
         error.ExecutorUnavailable, error.Unsupported => KernelError.enosys.raw(),
         error.StartFailed, error.KeyUnavailable => KernelError.eagain.raw(),
-        error.JoinFailed, error.WaitFailed => KernelError.eio.raw(),
+        error.JoinFailed, error.WaitFailed, error.CallFailed => KernelError.eio.raw(),
         else => KernelError.einval.raw(),
     };
 }

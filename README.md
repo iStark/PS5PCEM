@@ -1,6 +1,6 @@
 # PS5 emulation components
 
-Building blocks for PlayStation 5 emulation, written in Zig. Five modules cover
+Building blocks for PlayStation 5 emulation, written in Zig. Six modules cover
 the independent subsystems and their end-to-end composition:
 
 | Module | What it does |
@@ -9,7 +9,8 @@ the independent subsystems and their end-to-end composition:
 | **`rdna2`** | Decodes and disassembles RDNA2 shader machine code |
 | **`loader`** | Reads, maps, and relocates guest ELF64 module images |
 | **`hle`** | High-level emulation of the guest firmware: symbol resolution and firmware libraries |
-| **`runtime`** | Wires memory, loader, and HLE into one loadable process runtime |
+| **`cpu`** | Dispatches guest execution across host workers and implements pthread scheduling |
+| **`runtime`** | Composes memory, loader, HLE, and the optional CPU dispatcher |
 
 None of them depends on anything beyond the Zig standard library. The tooling
 cross-compiles to Windows, Linux, and macOS; native guest execution itself is an
@@ -518,16 +519,13 @@ points return kernel statuses.
 
 Thread execution is connected through an explicit backend adapter. Every start
 request contains the entry point, argument, pthread identity, scheduling hints,
-and a ready `ThreadContext` containing the guest `fs_base`. This separation is a
-correctness requirement on Windows, where FS belongs to the host TEB: the CPU
-backend must install guest FS only across guest instruction execution, or patch
-FS-relative instructions as Kyty and SharpEmu do. HLE code never replaces the
-host FS register while Zig or Win32 code is active. Until a CPU backend is
-attached, creation, positive-duration sleep, and guest callbacks from `once`
-report `ENOSYS` rather than entering code with an invalid TLS base. A dispatcher
-must call `Runtime.runCurrentThreadDestructors` after a guest entry point returns
-but before leaving its FS context. `scePthreadExit` runs destructors itself and,
-because its ABI returns `void`, continues thread exit if a callback fails.
+a mapped guest stack with a no-access guard, and a ready `ThreadContext`
+containing the guest `fs_base`. HLE code never replaces a host segment register.
+The `cpu` dispatcher consumes this contract and calls its machine bridge only
+across guest instruction execution. Until a dispatcher is attached, creation,
+positive-duration sleep, and guest callbacks from `once` report `ENOSYS`.
+`scePthreadExit` runs key destructors itself and, because its ABI returns `void`,
+continues thread exit if a destructor callback fails.
 
 **`libkernel` — pthread synchronization** ([src/hle/libs/kernel_sync.zig](src/hle/libs/kernel_sync.zig))
 
@@ -544,9 +542,9 @@ the backend receives the number observed before parking and can therefore avoid
 a lost wakeup when a signal races with the unlock-to-wait transition. Wake
 requests carry the same object key, the new sequence, and either one or all as
 the waiter limit. Timed waits accept relative microseconds for sce entry points
-and clock-tagged absolute nanosecond deadlines for POSIX entry points. The host
-fallback only yields, which is sufficient for unit tests; a real CPU dispatcher
-must provide `Backend.wait_fn` and `Backend.wake_fn` for actual guest scheduling.
+and clock-tagged absolute nanosecond deadlines for POSIX entry points. The CPU
+dispatcher provides the production wait/wake path; the HLE-only fallback yields
+solely so isolated unit tests can exercise state transitions.
 
 ## Error codes
 
@@ -562,9 +560,49 @@ from leaking into host code where nothing would check it.
 
 ## Roadmap
 
-1. Add the native x86-64 CPU dispatcher and connect it to the pthread backend's
-   FS context, wait/wake scheduler contract, and guest callback contract.
-2. Event queues, on which most firmware asynchrony is built.
+1. Event queues, on which most firmware asynchrony is built.
+2. Semaphores and address-based waits on the same dispatcher contract.
+
+---
+
+# `cpu` — guest dispatcher
+
+[src/cpu/root.zig](src/cpu/root.zig) is the scheduling half of CPU execution. It
+spawns one host worker per guest pthread, associates it with the HLE pthread
+identity, carries the ready FS/TCB/DTV context and guest stack into each entry,
+and completes the HLE thread only after guest execution has left that context.
+Join, detach, yield, sleep, nested guest callbacks, natural-return TLS
+destructors, and `scePthreadExit` propagation all use this path.
+
+Waits use the Zig I/O futex abstraction. Wake events retain their object
+sequence and cardinality, so a signal that lands between an HLE unlock and the
+worker actually parking is consumed exactly once. Broadcasts remain visible to
+every waiter that observed an older sequence. If the fixed key/event history is
+ever saturated, the dispatcher deliberately over-wakes and lets HLE recheck the
+object instead of risking a dropped wake and process deadlock.
+
+Machine execution is represented by `cpu.Bridge`. Its request includes the
+entry point, System V AMD64 arguments, thread identity, guest stack, and complete
+TLS context. This boundary is intentionally strict: Windows reserves a segment
+base for host runtime state, and POSIX hosts may use FS for their own TLS. A
+bridge must therefore translate guest FS-relative instructions or restore host
+state around every HLE transition. Setting FS in ordinary Zig code is not a
+valid implementation. Kyty and SharpEmu make the same separation, although
+their patch/trampoline machinery differs.
+
+The dispatcher and deterministic bridge contract are implemented and tested.
+The platform x86-64 machine bridge, import trampolines, fault recovery, and
+unsupported-instruction handling are still required before an `eboot.bin` entry
+can execute safely. Consequently GPU command submission and audio callbacks are
+not yet reachable from a title even though memory, loading, linking, TLS, and
+pthread scheduling are in place.
+
+## Roadmap
+
+1. Implement the x86-64 machine bridge and host-safe FS/HLE transitions.
+2. Build the process-entry stack and run module initializers before `eboot.bin`.
+3. Add trap/fault recovery and compatibility handling for unsupported x86-64
+   instructions.
 
 ---
 
@@ -576,10 +614,10 @@ with the sparse direct-memory backing store, connects it to libkernel, registers
 all HLE exports, owns the process TLS registry, and adapts both registries to
 `loader.Resolver`. Exact library/module/version metadata is used first; the
 identifier-only HLE lookup remains the documented fallback for incomplete
-module metadata. It also owns the pthread and synchronization managers, exposes
-the execution backend boundary, initial-thread preparation, and natural-return
-TLS destructor hook. A mapped image unregisters its TLS template when it
-unloads.
+module metadata. It also owns the pthread and synchronization managers plus an
+opt-in CPU dispatcher, exposes initial-thread preparation and dispatch, and
+keeps natural-return TLS destructor handling inside the execution lifecycle. A
+mapped image unregisters its TLS template when it unloads.
 
 ```zig
 const runtime = @import("runtime");

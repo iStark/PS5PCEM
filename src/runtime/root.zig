@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Artur Strazewicz
 
-//! Runtime composition for the memory, loader, and HLE modules.
+//! Runtime composition for the memory, loader, HLE, and CPU modules.
 //!
 //! The lower layers remain independently useful. `Runtime` is the place where
 //! they deliberately meet: it owns the one process-wide guest address space,
@@ -12,13 +12,14 @@ const std = @import("std");
 const memory = @import("memory");
 const loader = @import("loader");
 const hle = @import("hle");
+const cpu = @import("cpu");
 
 pub const Error = error{
     AlreadyInitialized,
     NotInitialized,
 } || memory.Error || hle.symbols.Error || loader.elf.Error || loader.dynamic.Error ||
     loader.image_loader.Error || hle.libs.kernel_threading.Error ||
-    hle.libs.kernel_sync.Error || std.mem.Allocator.Error;
+    hle.libs.kernel_sync.Error || cpu.Error || std.mem.Allocator.Error;
 
 pub const Runtime = struct {
     allocator: ?std.mem.Allocator = null,
@@ -27,6 +28,7 @@ pub const Runtime = struct {
     tls_registry: loader.TlsRegistry = .{},
     thread_manager: hle.libs.kernel_threading.Manager = .{},
     sync_manager: hle.libs.kernel_sync.Manager = .{},
+    cpu_dispatcher: cpu.Dispatcher = .{},
     initialized: bool = false,
 
     /// Initializes a stable, caller-owned Runtime value.
@@ -76,6 +78,7 @@ pub const Runtime = struct {
         if (!self.initialized) return;
         const allocator = self.allocator.?;
 
+        self.cpu_dispatcher.deinit();
         hle.libs.kernel_sync.attachManager(null);
         self.sync_manager.deinit();
         hle.libs.kernel_threading.attachManager(null);
@@ -98,7 +101,29 @@ pub const Runtime = struct {
         backend: ?hle.libs.kernel_threading.Backend,
     ) Error!void {
         if (!self.initialized) return Error.NotInitialized;
+        if (self.cpu_dispatcher.isInitialized()) return error.DispatcherBusy;
         self.thread_manager.setBackend(backend);
+    }
+
+    /// Attaches the process CPU dispatcher to libkernel pthreads. The bridge is
+    /// responsible only for machine entry/exit and guest FS translation; host
+    /// workers, waits, callbacks, joins, and exits are owned by the dispatcher.
+    pub fn enableCpuDispatcher(
+        self: *Runtime,
+        io: std.Io,
+        bridge: cpu.Bridge,
+    ) Error!void {
+        if (!self.initialized) return Error.NotInitialized;
+        return self.cpu_dispatcher.init(
+            self.allocator.?,
+            io,
+            &self.thread_manager,
+            bridge,
+        );
+    }
+
+    pub fn disableCpuDispatcher(self: *Runtime) void {
+        self.cpu_dispatcher.deinit();
     }
 
     /// Prepares TCB/DTV state for the initial guest execution context.
@@ -139,6 +164,17 @@ pub const Runtime = struct {
     pub fn runCurrentThreadDestructors(self: *Runtime) Error!void {
         if (!self.initialized) return Error.NotInitialized;
         return self.thread_manager.runSpecificDestructors();
+    }
+
+    /// Enters a prepared initial guest thread through the active dispatcher.
+    pub fn dispatchGuestEntry(
+        self: *Runtime,
+        prepared: hle.libs.kernel_threading.PreparedThread,
+        entry_point: u64,
+        arguments: []const u64,
+    ) Error!u64 {
+        if (!self.initialized) return Error.NotInitialized;
+        return self.cpu_dispatcher.dispatchInitial(prepared, entry_point, arguments);
     }
 
     /// Reports a child result after the backend has left its guest FS context.
