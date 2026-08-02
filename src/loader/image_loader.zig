@@ -13,6 +13,7 @@ const elf = @import("elf.zig");
 const dynamic = @import("dynamic.zig");
 const linker = @import("linker.zig");
 const tls = @import("tls.zig");
+const exports = @import("exports.zig");
 
 pub const Error = error{
     NoLoadSegments,
@@ -21,7 +22,8 @@ pub const Error = error{
     EntryPointUnmapped,
     InvalidInitializerTable,
     InitializerUnmapped,
-} || elf.Error || linker.Error || tls.Error || memory.Error || std.mem.Allocator.Error;
+} || elf.Error || linker.Error || tls.Error || exports.Error || memory.Error ||
+    std.mem.Allocator.Error;
 
 pub const Options = struct {
     /// Added to every segment virtual address, relocation target, and entry
@@ -31,6 +33,8 @@ pub const Options = struct {
     /// Process-wide TLS registry. Without one, ordinary images still load, but
     /// a TLS relocation reports that no module identity is available.
     tls_registry: ?*tls.Registry = null,
+    /// Process-wide exports from mapped guest PRX modules.
+    guest_export_registry: ?*exports.Registry = null,
 };
 
 pub const MappedImage = struct {
@@ -41,6 +45,8 @@ pub const MappedImage = struct {
     relocation_stats: linker.Stats,
     tls_registry: ?*tls.Registry = null,
     tls_module: ?tls.Module = null,
+    guest_export_registry: ?*exports.Registry = null,
+    guest_export_module: ?exports.Module = null,
     ranges: std.ArrayList(memory.Range) = .empty,
     process_param_range: ?memory.Range = null,
     preinit_functions: std.ArrayList(u64) = .empty,
@@ -51,6 +57,7 @@ pub const MappedImage = struct {
     /// Releases every committed range while retaining the process-wide outer
     /// address-space reservation.
     pub fn unload(self: *MappedImage) memory.Error!void {
+        self.unregisterGuestExports();
         var i = self.ranges.items.len;
         while (i > 0) {
             i -= 1;
@@ -66,6 +73,7 @@ pub const MappedImage = struct {
     /// Best-effort teardown for defer paths. Use `unload` when an error must be
     /// reported to the caller.
     pub fn deinit(self: *MappedImage) void {
+        self.unregisterGuestExports();
         var i = self.ranges.items.len;
         while (i > 0) {
             i -= 1;
@@ -95,6 +103,16 @@ pub const MappedImage = struct {
         self.tls_registry = null;
         self.tls_module = null;
     }
+
+    fn unregisterGuestExports(self: *MappedImage) void {
+        if (self.guest_export_registry) |registry| {
+            if (self.guest_export_module) |module| {
+                registry.unregister(self.allocator, module.id);
+            }
+        }
+        self.guest_export_registry = null;
+        self.guest_export_module = null;
+    }
 };
 
 const SegmentPlan = struct {
@@ -109,6 +127,19 @@ const ProtectionRun = struct {
     protection: memory.Protection,
 };
 
+/// A mapped image whose exports are visible but whose relocations and final
+/// page protections have not yet been installed. Mapping every node in a PRX
+/// graph before linking permits mutual guest-to-guest imports.
+pub const PreparedImage = struct {
+    mapped: MappedImage,
+    final_runs: std.ArrayList(ProtectionRun),
+
+    pub fn deinit(self: *PreparedImage) void {
+        self.final_runs.deinit(self.mapped.allocator);
+        self.mapped.deinit();
+    }
+};
+
 /// Maps, copies, relocates, and protects one parsed image.
 pub fn load(
     allocator: std.mem.Allocator,
@@ -118,6 +149,20 @@ pub fn load(
     resolver: ?linker.Resolver,
     options: Options,
 ) Error!MappedImage {
+    var prepared = try prepare(allocator, address_space, image, info, options);
+    errdefer prepared.deinit();
+    return link(&prepared, image, info, resolver);
+}
+
+/// Maps image bytes and publishes TLS plus ordinary guest exports without
+/// applying any relocation that may depend on another graph node.
+pub fn prepare(
+    allocator: std.mem.Allocator,
+    address_space: *memory.AddressSpace,
+    image: elf.Image,
+    info: *const dynamic.DynamicInfo,
+    options: Options,
+) Error!PreparedImage {
     var plans: std.ArrayList(SegmentPlan) = .empty;
     defer plans.deinit(allocator);
     var boundaries: std.ArrayList(u64) = .empty;
@@ -154,7 +199,7 @@ pub fn load(
     std.mem.sort(u64, boundaries.items, {}, std.sort.asc(u64));
 
     var final_runs: std.ArrayList(ProtectionRun) = .empty;
-    defer final_runs.deinit(allocator);
+    errdefer final_runs.deinit(allocator);
     var boundary_index: usize = 0;
     while (boundary_index + 1 < boundaries.items.len) : (boundary_index += 1) {
         const start = boundaries.items[boundary_index];
@@ -239,31 +284,57 @@ pub fn load(
         mapped.tls_module = try registry.registerImage(allocator, image, info);
     }
 
+    if (options.guest_export_registry) |registry| {
+        mapped.guest_export_registry = registry;
+        mapped.guest_export_module = try registry.registerImage(
+            allocator,
+            image,
+            info,
+            options.load_bias,
+        );
+    }
+
+    return .{ .mapped = mapped, .final_runs = final_runs };
+}
+
+/// Relocates and protects an image previously returned by `prepare`.
+pub fn link(
+    prepared: *PreparedImage,
+    image: elf.Image,
+    info: *const dynamic.DynamicInfo,
+    resolver: ?linker.Resolver,
+) Error!MappedImage {
+    const mapped = &prepared.mapped;
+
     mapped.relocation_stats = try linker.apply(
-        allocator,
-        address_space,
+        mapped.allocator,
+        mapped.address_space,
         image,
         info,
-        options.load_bias,
+        mapped.load_bias,
         resolver,
         mapped.tls_module,
     );
 
-    for (final_runs.items) |run| {
-        try address_space.protect(run.range.start, run.range.len(), run.protection);
+    for (prepared.final_runs.items) |run| {
+        try mapped.address_space.protect(run.range.start, run.range.len(), run.protection);
         if (run.protection.execute) {
-            address_space.flushInstructionCache(run.range.start, run.range.len());
+            mapped.address_space.flushInstructionCache(run.range.start, run.range.len());
         }
     }
 
-    if (!address_space.isMapped(entry_point, 1)) return Error.EntryPointUnmapped;
+    if (!mapped.address_space.isMapped(mapped.entry_point, 1)) return Error.EntryPointUnmapped;
     if (mapped.process_param_range) |range| {
-        if (!address_space.isMapped(range.start, range.len())) {
+        if (!mapped.address_space.isMapped(range.start, range.len())) {
             return Error.InvalidLoadSegment;
         }
     }
-    try collectStartupFunctions(&mapped, info, image.objectType());
-    return mapped;
+    try collectStartupFunctions(mapped, info, image.objectType());
+
+    prepared.final_runs.deinit(mapped.allocator);
+    const result = mapped.*;
+    prepared.* = undefined;
+    return result;
 }
 
 fn collectStartupFunctions(

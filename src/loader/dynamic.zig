@@ -214,9 +214,13 @@ fn readString(strings: []const u8, offset: u32) Error![]const u8 {
 pub const DynamicInfo = struct {
     /// This module's own identity, if declared.
     module_info: ?ModuleDecl = null,
+    /// Conventional ELF dependency filenames from `DT_NEEDED`, when present.
+    needed_files: std.ArrayList([]const u8) = .empty,
     needed_modules: std.ArrayList(ModuleDecl) = .empty,
     import_libraries: std.ArrayList(LibraryDecl) = .empty,
     export_libraries: std.ArrayList(LibraryDecl) = .empty,
+    soname: ?[]const u8 = null,
+    original_filename: ?[]const u8 = null,
 
     /// How the table locations below are interpreted.
     table_addressing: TableAddressing = .dynlib_offset,
@@ -244,6 +248,7 @@ pub const DynamicInfo = struct {
     fini_array_size: ?u64 = null,
 
     pub fn deinit(self: *DynamicInfo, gpa: std.mem.Allocator) void {
+        self.needed_files.deinit(gpa);
         self.needed_modules.deinit(gpa);
         self.import_libraries.deinit(gpa);
         self.export_libraries.deinit(gpa);
@@ -380,6 +385,9 @@ pub fn parse(gpa: std.mem.Allocator, image: elf.Image) (Error || std.mem.Allocat
         } else if (tag.isExportLib()) {
             try info.export_libraries.append(gpa, try LibraryDecl.parse(e.value, strings));
         } else switch (tag) {
+            .needed => try info.needed_files.append(gpa, try readString(strings, @truncate(e.value))),
+            .soname => info.soname = try readString(strings, @truncate(e.value)),
+            .sce_original_filename, .sce_original_filename_1 => info.original_filename = try readString(strings, @truncate(e.value)),
             .sce_strtab => if (info.table_addressing == .dynlib_offset) {
                 info.strtab_offset = e.value;
             },
@@ -594,6 +602,28 @@ test "declarations are unpacked with names resolved" {
     try testing.expectEqualStrings("libkernel", needed.name);
     try testing.expectEqual(@as(u8, 3), needed.version_major);
     try testing.expectEqual(@as(u8, 4), needed.version_minor);
+}
+
+test "standard dependency filenames and module filenames are retained" {
+    const strings = "\x00libc.prx\x00self.prx\x00original.prx\x00";
+    const entries = [_]Entry{
+        .{ .tag = @intFromEnum(Tag.sce_strtab), .value = 0 },
+        .{ .tag = @intFromEnum(Tag.sce_strsz), .value = strings.len },
+        .{ .tag = @intFromEnum(Tag.needed), .value = 1 },
+        .{ .tag = @intFromEnum(Tag.soname), .value = 10 },
+        .{ .tag = @intFromEnum(Tag.sce_original_filename), .value = 19 },
+        .{ .tag = @intFromEnum(Tag.null), .value = 0 },
+    };
+    var fixture = try buildFixture(testing.allocator, &entries, strings);
+    defer fixture.deinit(testing.allocator);
+    const image = try elf.parse(fixture.image.bytes());
+    var info = try parse(testing.allocator, image);
+    defer info.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), info.needed_files.items.len);
+    try testing.expectEqualStrings("libc.prx", info.needed_files.items[0]);
+    try testing.expectEqualStrings("self.prx", info.soname.?);
+    try testing.expectEqualStrings("original.prx", info.original_filename.?);
 }
 
 test "standard PS5 dynamic addresses resolve through a mapped load segment" {

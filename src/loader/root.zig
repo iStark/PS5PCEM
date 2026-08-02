@@ -18,6 +18,7 @@ pub const imports = @import("imports.zig");
 pub const linker = @import("linker.zig");
 pub const image_loader = @import("image_loader.zig");
 pub const tls = @import("tls.zig");
+pub const exports = @import("exports.zig");
 
 pub const Image = elf.Image;
 pub const ObjectType = elf.ObjectType;
@@ -34,15 +35,22 @@ pub const RelocationStats = linker.Stats;
 pub const TlsRegistry = tls.Registry;
 pub const TlsModule = tls.Module;
 pub const TlsResolvedSymbol = tls.ResolvedSymbol;
+pub const GuestExportRegistry = exports.Registry;
+pub const GuestExportModule = exports.Module;
+pub const GuestExport = exports.Export;
 pub const LoadOptions = image_loader.Options;
 pub const MappedImage = image_loader.MappedImage;
+pub const PreparedImage = image_loader.PreparedImage;
 
 pub const parseImage = elf.parse;
 pub const parseDynamic = dynamic.parse;
 pub const parseSymbolName = dynamic.parseSymbolName;
 pub const collectImports = imports.collect;
+pub const collectGuestExports = exports.collect;
 pub const applyRelocations = linker.apply;
 pub const loadImage = image_loader.load;
+pub const prepareImage = image_loader.prepare;
+pub const linkImage = image_loader.link;
 
 test {
     _ = elf;
@@ -55,4 +63,5 @@ test {
     _ = linker;
     _ = image_loader;
     _ = tls;
+    _ = exports;
 }

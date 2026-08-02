@@ -14,6 +14,9 @@ const loader = @import("loader");
 const hle = @import("hle");
 const cpu = @import("cpu");
 pub const process = @import("process.zig");
+pub const module_graph = @import("module_graph.zig");
+pub const ModuleGraph = module_graph.ModuleGraph;
+pub const ModuleGraphOptions = module_graph.Options;
 
 pub const Error = error{
     AlreadyInitialized,
@@ -34,6 +37,7 @@ pub const Runtime = struct {
     address_space: ?memory.AddressSpace = null,
     database: hle.Database = .{},
     tls_registry: loader.TlsRegistry = .{},
+    guest_exports: loader.GuestExportRegistry = .{},
     thread_manager: hle.libs.kernel_threading.Manager = .{},
     sync_manager: hle.libs.kernel_sync.Manager = .{},
     cpu_dispatcher: cpu.Dispatcher = .{},
@@ -97,6 +101,7 @@ pub const Runtime = struct {
         hle.libs.kernel_memory.deinit();
         self.database.deinit(allocator);
         self.database = .{};
+        self.guest_exports.deinit(allocator);
         self.tls_registry.deinit(allocator);
         if (self.address_space) |*space| space.deinit();
         self.address_space = null;
@@ -299,6 +304,7 @@ pub const Runtime = struct {
         var resolver_context = ResolverContext{
             .database = &self.database,
             .tls_registry = &self.tls_registry,
+            .guest_exports = &self.guest_exports,
         };
         const resolver = loader.Resolver{
             .context = &resolver_context,
@@ -307,6 +313,7 @@ pub const Runtime = struct {
         };
         var load_options = options;
         load_options.tls_registry = &self.tls_registry;
+        load_options.guest_export_registry = &self.guest_exports;
         return loader.loadImage(
             allocator,
             &self.address_space.?,
@@ -316,17 +323,57 @@ pub const Runtime = struct {
             load_options,
         );
     }
+
+    /// Discovers adjacent PRX/SRPX files, maps the complete reachable graph,
+    /// publishes every guest export, then relocates in dependency-first order.
+    pub fn loadModuleGraph(
+        self: *Runtime,
+        io: std.Io,
+        executable_path: []const u8,
+        options: ModuleGraphOptions,
+    ) !ModuleGraph {
+        if (!self.initialized) return Error.NotInitialized;
+        const directory_name = std.fs.path.dirname(executable_path) orelse ".";
+        const executable_name = std.fs.path.basename(executable_path);
+        var directory = try std.Io.Dir.cwd().openDir(io, directory_name, .{ .iterate = true });
+        defer directory.close(io);
+
+        var resolver_context = ResolverContext{
+            .database = &self.database,
+            .tls_registry = &self.tls_registry,
+            .guest_exports = &self.guest_exports,
+        };
+        const resolver = loader.Resolver{
+            .context = &resolver_context,
+            .resolve_fn = resolveImport,
+            .resolve_tls_fn = resolveTlsImport,
+        };
+        return module_graph.loadFromDir(
+            self.allocator.?,
+            io,
+            directory,
+            executable_name,
+            &self.address_space.?,
+            &self.tls_registry,
+            &self.guest_exports,
+            resolver,
+            options,
+        );
+    }
 };
 
 const ResolverContext = struct {
     database: *const hle.Database,
     tls_registry: *loader.TlsRegistry,
+    guest_exports: *loader.GuestExportRegistry,
 };
 
 fn resolveImport(raw_context: ?*anyopaque, import: *const loader.Import) ?u64 {
     const raw = raw_context orelse return null;
     const context: *ResolverContext = @ptrCast(@alignCast(raw));
     const symbol_type = toHleSymbolType(import.symbol_type);
+
+    if (context.guest_exports.resolveExact(import)) |address| return address;
 
     if (import.id.len == hle.nid.encoded_len and
         import.library != null and import.library_version != null and import.module != null)
@@ -345,6 +392,7 @@ fn resolveImport(raw_context: ?*anyopaque, import: *const loader.Import) ?u64 {
         if (context.database.find(key)) |symbol| return symbol.address;
     }
 
+    if (context.guest_exports.resolveById(import)) |address| return address;
     const symbol = context.database.findById(import.id, symbol_type) orelse return null;
     return symbol.address;
 }
@@ -489,6 +537,42 @@ test "runtime registers PT_TLS and unregisters it with the mapped image" {
 
     try mapped.unload();
     try testing.expectEqual(@as(usize, 0), runtime.tls_registry.count());
+}
+
+test "runtime resolves ordinary imports to mapped guest exports before HLE" {
+    var runtime = Runtime{};
+    try runtime.init(testing.allocator);
+    defer runtime.deinit();
+    _ = try runtime.guest_exports.register(testing.allocator, &.{.{
+        .id = "guest-libc",
+        .library = "libc",
+        .library_version = 1,
+        .module = "libc",
+        .symbol_type = .func,
+        .address = 0x08_1234_5000,
+    }});
+    var context = ResolverContext{
+        .database = &runtime.database,
+        .tls_registry = &runtime.tls_registry,
+        .guest_exports = &runtime.guest_exports,
+    };
+    const import = loader.Import{
+        .id = "guest-libc",
+        .library = "libc",
+        .library_version = 1,
+        .module = "libc",
+        .library_code = "A",
+        .module_code = "A",
+        .symbol_type = .func,
+        .relocation_type = .jump_slot,
+        .table = .plt,
+        .target_offset = 0,
+        .addend = 0,
+    };
+    try testing.expectEqual(
+        @as(?u64, 0x08_1234_5000),
+        resolveImport(&context, &import),
+    );
 }
 
 test "runtime prepares and identifies the initial guest thread" {
@@ -684,4 +768,8 @@ fn expectRuntimeGuestString(
     try address_space.read(address, bytes[0 .. expected.len + 1]);
     try testing.expectEqualStrings(expected, bytes[0..expected.len]);
     try testing.expectEqual(@as(u8, 0), bytes[expected.len]);
+}
+
+test {
+    _ = module_graph;
 }

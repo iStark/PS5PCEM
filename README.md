@@ -22,10 +22,12 @@ Two command-line tools come with them:
 ```sh
 zig build run         -- shader.bin    # disassemble a shader
 zig build module-info -- eboot.bin     # inspect a bare ELF or decrypted PS5 SELF
+zig build module-info -- eboot.bin sce_module/libc.prx # include a guest provider
 ```
 
 `module-info` is where the pieces meet. It reads a module, works out every
-symbol the module imports, and checks each one against the firmware registry:
+symbol the module imports, and checks each one against the firmware registry
+plus any guest PRX providers passed after it:
 
 ```
 sample_module.elf
@@ -43,6 +45,8 @@ needed modules
 
 imported libraries
   [A] libkernel v1
+
+exports (0)
 
 imports (4)
   ok   rTXw65xmLIA  libkernel  jump_slot
@@ -333,6 +337,7 @@ bits, version below it, and a string table offset in the low 32.
 | [src/loader/symbols.zig](src/loader/symbols.zig) | The dynamic symbol table |
 | [src/loader/relocations.zig](src/loader/relocations.zig) | Relocation entries and their types |
 | [src/loader/imports.zig](src/loader/imports.zig) | Walks all of the above into a list of imports |
+| [src/loader/exports.zig](src/loader/exports.zig) | Owns the process-wide registry of mapped guest exports |
 | [src/loader/linker.zig](src/loader/linker.zig) | Resolves symbols and writes RELA results |
 | [src/loader/tls.zig](src/loader/tls.zig) | Owns `PT_TLS` templates, module IDs, and static Variant II layout |
 | [src/loader/image_loader.zig](src/loader/image_loader.zig) | Maps segments, copies bytes, links, and finalizes protections |
@@ -366,10 +371,13 @@ Some distinctions the walk preserves, because they change what a caller must do:
 `loadImage` normalizes every load segment to 16 KiB pages. Overlapping boundary
 pages are merged, all pages are staged read/write, and `filesz` bytes are copied
 to the exact `load_bias + p_vaddr` address. Anonymous committed pages supply the
-required zero-filled `memsz - filesz` tail. Relocations are applied before the
-staging permissions are replaced with the union of the ELF flags for each page;
-this permits writes into a future read-only GOT without leaving executable code
-writable at run time.
+required zero-filled `memsz - filesz` tail. Its `prepareImage` and `linkImage`
+halves expose the same operation in two phases: a process can map every PRX and
+publish all ordinary and TLS exports before applying any cross-module
+relocation. This supports mutual dependencies without load-order guesses.
+Relocations are applied before staging permissions are replaced with the union
+of the ELF flags for each page, so a future read-only GOT remains writable only
+during linking.
 
 The following x86-64 RELA forms are applied:
 
@@ -387,6 +395,11 @@ Defined symbols resolve inside the mapped module. Undefined symbols go through
 the caller's `loader.Resolver`; unresolved strong symbols abort the load, while
 unresolved weak symbols become zero. TLS imports use a separate resolver path:
 an ordinary function address is never accepted as a TLS offset.
+
+The ordinary guest registry copies each global/weak export's NID, library,
+version, module, type, and relocated address. Resolution prefers the complete
+key and retains an identifier-only fallback for incomplete metadata. Unloading
+an image removes all of its exports before its pages disappear.
 
 Every image with a non-empty `PT_TLS` segment receives a stable, non-zero module
 ID. The process registry copies its initialized `tdata`, records the zero-filled
@@ -661,14 +674,14 @@ and audio callbacks consequently remain beyond the current title bootstrap.
 [src/runtime/root.zig](src/runtime/root.zig) owns the dependency direction that
 does not belong in any lower-level module. It creates one `memory.AddressSpace`
 with the sparse direct-memory backing store, connects it to libkernel, registers
-all HLE exports, owns the process TLS registry, and adapts both registries to
-`loader.Resolver`. Exact library/module/version metadata is used first; the
-identifier-only HLE lookup remains the documented fallback for incomplete
-module metadata. It also owns the pthread and synchronization managers plus an
-opt-in CPU dispatcher and native bridge, exposes initial-thread preparation and
-process dispatch, and keeps natural-return TLS destructor handling inside the
-execution lifecycle. A mapped image unregisters its TLS template when it
-unloads.
+all HLE exports, owns the process TLS and guest-export registries, and adapts all
+three sources to `loader.Resolver`. Exact library/module/version metadata is used
+first; identifier-only lookup remains the documented fallback for incomplete
+module metadata. [src/runtime/module_graph.zig](src/runtime/module_graph.zig)
+recursively indexes adjacent `.prx`/`.sprx` files, follows both `DT_NEEDED` and
+PS5 needed-module declarations, maps the complete reachable graph, and only then
+relocates it. Missing files remain firmware/HLE dependencies. The resulting
+module list is already in dependency-first initializer order.
 
 ```zig
 const runtime = @import("runtime");
@@ -677,15 +690,16 @@ var emu = runtime.Runtime{};
 try emu.init(allocator);
 defer emu.deinit();
 
-var module = try emu.loadModule(eboot_bytes, .{ .load_bias = 0 });
-defer module.deinit();
+var graph = try emu.loadModuleGraph(io, "game/eboot.bin", .{});
+defer graph.deinit();
 
 try emu.enableNativeCpuDispatcher(io);
 
 const initial = try emu.prepareInitialThread("main");
 defer emu.releaseInitialThread(initial.handle) catch {};
 
-const result = try emu.dispatchProcess(initial, &module, .{
+const result = try emu.dispatchProcess(initial, graph.executable(), .{
+    .modules = graph.modules(),
     .entry = .{
         .image_name = "eboot.bin",
         .arguments = &.{"--safe"},
@@ -706,9 +720,10 @@ stack alignment.
 
 `Runtime.init` is intentionally in-place. Libkernel retains a pointer to the
 address space, so returning a Runtime value from an initializer could move it
-and leave that pointer dangling. Loaded modules must be destroyed before the
-runtime; their `deinit` method decommits module pages but leaves the outer guest
-windows owned until runtime teardown.
+and leave that pointer dangling. Loaded modules or graphs must be destroyed
+before the runtime; their `deinit` methods unregister guest/TLS exports and
+decommit module pages while leaving the outer guest windows owned until runtime
+teardown.
 
 ---
 
