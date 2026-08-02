@@ -137,6 +137,29 @@ pub fn build(b: *std.Build) void {
     const graph_info_step = b.step("graph-info", "Map and relocate a guest module graph");
     graph_info_step.dependOn(&graph_info_cmd.step);
 
+    // Loads the title graph and enters the process through the native Windows
+    // x86-64 guest bridge.
+    const game_run = b.addExecutable(.{
+        .name = "game-run",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/game_run.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "runtime", .module = runtime },
+                .{ .name = "loader", .module = loader },
+            },
+        }),
+    });
+    b.installArtifact(game_run);
+
+    const game_run_cmd = b.addRunArtifact(game_run);
+    game_run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| game_run_cmd.addArgs(args);
+
+    const game_run_step = b.step("game-run", "Load and execute a decrypted PS5 title");
+    game_run_step.dependOn(&game_run_cmd.step);
+
     const test_step = b.step("test", "Run the test suite");
     const check_step = b.step("check", "Compile every module without running tests");
     for ([_]*std.Build.Module{
@@ -149,6 +172,7 @@ pub fn build(b: *std.Build) void {
         exe.root_module,
         module_info.root_module,
         graph_info.root_module,
+        game_run.root_module,
     }) |m| {
         const tests = b.addTest(.{ .root_module = m });
         check_step.dependOn(&tests.step);
