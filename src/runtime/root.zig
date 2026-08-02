@@ -13,6 +13,7 @@ const memory = @import("memory");
 const loader = @import("loader");
 const hle = @import("hle");
 const cpu = @import("cpu");
+const diag = @import("diag");
 pub const process = @import("process.zig");
 pub const module_graph = @import("module_graph.zig");
 pub const ModuleGraph = module_graph.ModuleGraph;
@@ -194,6 +195,30 @@ pub const Runtime = struct {
     /// available after a contained guest fault for launcher diagnostics.
     pub fn lastDispatchedEntry(self: *const Runtime) u64 {
         return self.last_dispatch_entry;
+    }
+
+    /// Writes a readable report for the most recent contained guest fault.
+    ///
+    /// Returns false when no fault has been contained, so a caller can print
+    /// this unconditionally after a failed dispatch without first checking.
+    ///
+    /// The address space is passed to the analysis so that a call through a
+    /// null pointer can recover its caller from the stack; that is the single
+    /// most useful line in the report, and it is unavailable without reading
+    /// guest memory.
+    pub fn writeLastFault(
+        self: *Runtime,
+        map: *const diag.SymbolMap,
+        w: *std.Io.Writer,
+    ) std.Io.Writer.Error!bool {
+        const record = self.lastNativeFault() orelse return false;
+
+        const report = diag.analyzeFault(record.info, &self.address_space);
+        try diag.writeFault(report, map, w);
+        try w.print("  entry       ", .{});
+        try map.write(self.last_dispatch_entry, w);
+        try w.writeAll("\n");
+        return true;
     }
 
     /// Prepares TCB/DTV state for the initial guest execution context.

@@ -60,6 +60,20 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Failure attribution: guest addresses back to modules and exports, and
+    // captured faults into readable reports. Depends on cpu only for the fault
+    // record layout, so nothing in the execution path depends on diagnostics.
+    const diag = b.addModule("diag", .{
+        .root_source_file = b.path("src/diag/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "memory", .module = memory },
+            .{ .name = "loader", .module = loader },
+            .{ .name = "cpu", .module = cpu },
+        },
+    });
+
     // End-to-end composition: address space, ELF loader, HLE export database,
     // and optional CPU dispatch wired together by one process runtime.
     const runtime = b.addModule("runtime", .{
@@ -71,6 +85,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "loader", .module = loader },
             .{ .name = "hle", .module = hle },
             .{ .name = "cpu", .module = cpu },
+            .{ .name = "diag", .module = diag },
         },
     });
 
@@ -168,6 +183,7 @@ pub fn build(b: *std.Build) void {
         hle,
         cpu,
         loader,
+        diag,
         runtime,
         exe.root_module,
         module_info.root_module,

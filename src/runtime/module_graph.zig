@@ -6,6 +6,7 @@
 const std = @import("std");
 const memory = @import("memory");
 const loader = @import("loader");
+const diag = @import("diag");
 
 pub const Options = struct {
     /// The executable is relocatable in practice even though titles commonly
@@ -107,6 +108,54 @@ pub const ModuleGraph = struct {
 
     pub fn moduleCount(self: *const ModuleGraph) usize {
         return self.nodes.items.len - 1;
+    }
+
+    /// Builds an address-to-symbol map covering every mapped module.
+    ///
+    /// Exports are re-collected rather than read back from the shared registry:
+    /// the registry is keyed for resolution, not for reverse lookup, and it
+    /// deliberately loses which image an entry came from once several modules
+    /// export the same identifier.
+    ///
+    /// The returned map borrows module paths and export names from this graph,
+    /// so it must not outlive it.
+    pub fn buildSymbolMap(
+        self: *ModuleGraph,
+        gpa: std.mem.Allocator,
+    ) !diag.SymbolMap {
+        var map = diag.SymbolMap{};
+        errdefer map.deinit(gpa);
+
+        var module_exports: std.ArrayList(loader.GuestExport) = .empty;
+        defer module_exports.deinit(gpa);
+
+        for (self.nodes.items) |*node| {
+            const mapped = if (node.mapped) |*m| m else continue;
+
+            module_exports.clearRetainingCapacity();
+            // A module that exports nothing is still worth registering: module
+            // and offset alone already locate code in a dump of the file.
+            loader.collectGuestExports(
+                gpa,
+                &module_exports,
+                node.image,
+                &node.dynamic_info,
+                mapped.load_bias,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => module_exports.clearRetainingCapacity(),
+            };
+
+            try map.addModule(
+                gpa,
+                std.fs.path.basename(node.path),
+                mapped.load_bias,
+                mapped.ranges.items,
+                module_exports.items,
+            );
+        }
+
+        return map;
     }
 };
 
@@ -455,6 +504,55 @@ test "a needed module is discovered recursively and initialized before the execu
     try testing.expectEqualStrings("leaf.prx", graph.nodes.items[2].path);
     try testing.expect(graph.modules()[0] == &graph.nodes.items[2].mapped.?);
     try testing.expect(graph.modules()[1] == &graph.nodes.items[1].mapped.?);
+}
+
+test "the symbol map covers every mapped module" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var dependency = try minimalImage(testing.allocator, .sce_dynamic, null);
+    defer dependency.deinit(testing.allocator);
+    var executable = try minimalImage(testing.allocator, .sce_dynexec, "dependency");
+    defer executable.deinit(testing.allocator);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "eboot.bin", .data = executable.bytes() });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "dependency.prx", .data = dependency.bytes() });
+
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    var tls_registry = loader.TlsRegistry{};
+    defer tls_registry.deinit(testing.allocator);
+    var guest_exports = loader.GuestExportRegistry{};
+    defer guest_exports.deinit(testing.allocator);
+
+    var graph = try loadFromDir(
+        testing.allocator,
+        testing.io,
+        tmp.dir,
+        "eboot.bin",
+        &address_space,
+        &tls_registry,
+        &guest_exports,
+        null,
+        .{},
+    );
+    defer graph.deinit();
+
+    var map = try graph.buildSymbolMap(testing.allocator);
+    defer map.deinit(testing.allocator);
+
+    // Every module's own load bias must attribute back to that module, which is
+    // what makes a faulting address readable.
+    const executable_bias = graph.executable().load_bias;
+    const executable_location = map.locate(executable_bias);
+    try testing.expectEqualStrings("eboot.bin", executable_location.module.?);
+    try testing.expectEqual(@as(u64, 0), executable_location.module_offset);
+
+    const dependency_bias = graph.nodes.items[1].mapped.?.load_bias;
+    try testing.expectEqualStrings("dependency.prx", map.locate(dependency_bias).module.?);
+
+    // Address zero belongs to nobody, which is precisely the signal that a call
+    // went through a null pointer.
+    try testing.expect(!map.locate(0).isKnown());
 }
 
 fn minimalImage(
