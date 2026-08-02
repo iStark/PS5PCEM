@@ -35,6 +35,7 @@ const Lock = struct {
 pub const ExecutionError = error{
     Unsupported,
     ExecutionFailed,
+    GuestFault,
     Interrupted,
 };
 
@@ -43,6 +44,7 @@ pub const Error = error{
     NotInitialized,
     InvalidArgument,
     DispatcherBusy,
+    FaultHandlerUnavailable,
 } || std.mem.Allocator.Error || threading.Error || ExecutionError;
 
 pub const EntryKind = enum {
@@ -53,6 +55,58 @@ pub const EntryKind = enum {
 };
 
 pub const maximum_arguments: usize = 6;
+
+pub const FaultKind = enum(u32) {
+    none,
+    access_violation,
+    illegal_instruction,
+};
+
+pub const FaultAccess = enum(u32) {
+    unknown,
+    read,
+    write,
+    execute,
+};
+
+/// Register state captured by the Windows vectored exception handler before
+/// the native bridge leaves guest execution.
+pub const GuestRegisters = extern struct {
+    rax: u64 = 0,
+    rbx: u64 = 0,
+    rcx: u64 = 0,
+    rdx: u64 = 0,
+    rsi: u64 = 0,
+    rdi: u64 = 0,
+    rbp: u64 = 0,
+    rsp: u64 = 0,
+    r8: u64 = 0,
+    r9: u64 = 0,
+    r10: u64 = 0,
+    r11: u64 = 0,
+    r12: u64 = 0,
+    r13: u64 = 0,
+    r14: u64 = 0,
+    r15: u64 = 0,
+    rip: u64 = 0,
+    rflags: u64 = 0,
+};
+
+/// Platform-neutral diagnostic record for a contained guest CPU fault.
+pub const FaultInfo = extern struct {
+    kind: FaultKind = .none,
+    access: FaultAccess = .unknown,
+    exception_code: u32 = 0,
+    padding: u32 = 0,
+    instruction_address: u64 = 0,
+    memory_address: u64 = 0,
+    registers: GuestRegisters = .{},
+};
+
+pub const FaultRecord = struct {
+    thread_handle: u64,
+    info: FaultInfo,
+};
 
 /// Complete machine state required by an execution bridge for one guest call.
 ///
@@ -124,6 +178,7 @@ const NativeCallFrame = extern struct {
     owner: ?*NativeBridge = null,
     thread_handle: u64 = 0,
     guest_arguments: [maximum_arguments]u64 = [_]u64{0} ** maximum_arguments,
+    fault: FaultInfo = .{},
 };
 
 comptime {
@@ -138,9 +193,11 @@ comptime {
     std.debug.assert(@offsetOf(NativeCallFrame, "host_xmm_nonvolatile") == 112);
     std.debug.assert(@offsetOf(NativeCallFrame, "owner") == 272);
     std.debug.assert(@offsetOf(NativeCallFrame, "guest_arguments") == 288);
+    std.debug.assert(@offsetOf(NativeCallFrame, "fault") == 336);
 }
 
 threadlocal var active_native_frame: ?*NativeCallFrame = null;
+threadlocal var handling_native_fault = false;
 
 /// Direct System V AMD64 execution on a Windows x86-64 host.
 ///
@@ -154,6 +211,8 @@ pub const NativeBridge = struct {
     allocator: std.mem.Allocator = undefined,
     address_space: *memory.AddressSpace = undefined,
     active_frames: std.ArrayList(*NativeCallFrame) = .empty,
+    fault_handler_handle: ?*anyopaque = null,
+    last_fault: ?FaultRecord = null,
     lock: Lock = .{},
     initialized: bool = false,
 
@@ -164,9 +223,12 @@ pub const NativeBridge = struct {
     ) Error!void {
         if (self.initialized) return error.AlreadyInitialized;
         if (!NativeMachine.isSupported()) return error.Unsupported;
+        const fault_handler_handle = NativeMachine.installFaultHandler() orelse
+            return error.FaultHandlerUnavailable;
         self.* = .{
             .allocator = allocator,
             .address_space = address_space,
+            .fault_handler_handle = fault_handler_handle,
             .initialized = true,
         };
     }
@@ -177,6 +239,9 @@ pub const NativeBridge = struct {
         std.debug.assert(self.active_frames.items.len == 0);
         self.active_frames.deinit(self.allocator);
         self.lock.unlock();
+        if (self.fault_handler_handle) |handle| {
+            NativeMachine.removeFaultHandler(handle);
+        }
         self.* = .{};
     }
 
@@ -194,6 +259,15 @@ pub const NativeBridge = struct {
             .execute_fn = &executeThunk,
             .interrupt_fn = &interruptThunk,
         };
+    }
+
+    /// Returns the most recently contained fault. The thread handle identifies
+    /// the execution which produced it; a later guest fault replaces it.
+    pub fn lastFault(self: *NativeBridge) ?FaultRecord {
+        if (!self.initialized) return null;
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.last_fault;
     }
 
     fn executeThunk(raw: ?*anyopaque, request: ExecuteRequest) ExecutionError!u64 {
@@ -224,6 +298,7 @@ pub const NativeBridge = struct {
         if (!self.isExecutableAddress(request.entry_point)) {
             return error.ExecutionFailed;
         }
+        self.clearFault(request.thread_handle);
 
         const stack_pointer = if (nested)
             0
@@ -247,6 +322,13 @@ pub const NativeBridge = struct {
             request.entry_point,
             stack_pointer,
         );
+        if (frame.fault.kind != .none) {
+            self.recordFault(.{
+                .thread_handle = request.thread_handle,
+                .info = frame.fault,
+            });
+            return error.GuestFault;
+        }
         if (@atomicLoad(u32, &frame.interrupted, .acquire) != 0) {
             return error.Interrupted;
         }
@@ -305,6 +387,20 @@ pub const NativeBridge = struct {
         unreachable;
     }
 
+    fn clearFault(self: *NativeBridge, thread_handle: u64) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (self.last_fault) |record| {
+            if (record.thread_handle == thread_handle) self.last_fault = null;
+        }
+    }
+
+    fn recordFault(self: *NativeBridge, record: FaultRecord) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.last_fault = record;
+    }
+
     fn validateInitialRequest(self: *NativeBridge, request: ExecuteRequest) bool {
         if (request.context.fs_base == 0 or request.stack_address == 0 or
             request.stack_size < 256)
@@ -353,6 +449,14 @@ const UnsupportedMachine = struct {
         return false;
     }
 
+    fn installFaultHandler() ?*anyopaque {
+        return null;
+    }
+
+    fn removeFaultHandler(_: *anyopaque) void {
+        unreachable;
+    }
+
     fn call(_: *NativeCallFrame, _: u64, _: u64) u64 {
         unreachable;
     }
@@ -367,8 +471,22 @@ const UnsupportedMachine = struct {
 };
 
 const WindowsX64Machine = struct {
+    const exception_continue_execution: c_long = -1;
+    const exception_noncontinuable: u32 = 0x1;
+
     fn isSupported() bool {
         return std.os.windows.IsProcessorFeaturePresent(.RDWRFSGBASE_AVAILABLE);
+    }
+
+    fn installFaultHandler() ?*anyopaque {
+        return std.os.windows.ntdll.RtlAddVectoredExceptionHandler(
+            1,
+            &handleGuestException,
+        );
+    }
+
+    fn removeFaultHandler(handle: *anyopaque) void {
+        _ = std.os.windows.ntdll.RtlRemoveVectoredExceptionHandler(handle);
     }
 
     fn call(
@@ -392,7 +510,82 @@ const WindowsX64Machine = struct {
             : [base] "=r" (-> u64),
         );
     }
+
+    fn handleGuestException(
+        exception: *std.os.windows.EXCEPTION_POINTERS,
+    ) callconv(.winapi) c_long {
+        const frame = active_native_frame orelse
+            return std.os.windows.EXCEPTION_CONTINUE_SEARCH;
+        if (handling_native_fault) return std.os.windows.EXCEPTION_CONTINUE_SEARCH;
+
+        const record = exception.ExceptionRecord;
+        const context = exception.ContextRecord;
+        if (record.ExceptionFlags & exception_noncontinuable != 0 or
+            !isGuestAddress(context.Rip))
+        {
+            return std.os.windows.EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        const kind: FaultKind = switch (record.ExceptionCode) {
+            std.os.windows.EXCEPTION_ACCESS_VIOLATION => .access_violation,
+            std.os.windows.EXCEPTION_ILLEGAL_INSTRUCTION => .illegal_instruction,
+            else => return std.os.windows.EXCEPTION_CONTINUE_SEARCH,
+        };
+
+        handling_native_fault = true;
+        defer handling_native_fault = false;
+
+        var fault = FaultInfo{
+            .kind = kind,
+            .exception_code = record.ExceptionCode,
+            .instruction_address = context.Rip,
+            .registers = .{
+                .rax = context.Rax,
+                .rbx = context.Rbx,
+                .rcx = context.Rcx,
+                .rdx = context.Rdx,
+                .rsi = context.Rsi,
+                .rdi = context.Rdi,
+                .rbp = context.Rbp,
+                .rsp = context.Rsp,
+                .r8 = context.R8,
+                .r9 = context.R9,
+                .r10 = context.R10,
+                .r11 = context.R11,
+                .r12 = context.R12,
+                .r13 = context.R13,
+                .r14 = context.R14,
+                .r15 = context.R15,
+                .rip = context.Rip,
+                .rflags = context.EFlags,
+            },
+        };
+        if (kind == .access_violation and record.NumberParameters >= 2) {
+            fault.access = switch (record.ExceptionInformation[0]) {
+                0 => .read,
+                1 => .write,
+                8 => .execute,
+                else => .unknown,
+            };
+            fault.memory_address = record.ExceptionInformation[1];
+        }
+        frame.fault = fault;
+
+        // Returning CONTINUE_EXECUTION makes Windows restore this edited
+        // context. The assembly escape does not touch the potentially damaged
+        // guest stack: it restores the saved host RSP and FS base first.
+        context.Rcx = @intFromPtr(frame);
+        context.Rip = @intFromPtr(&ps5NativeEscapeWindowsX64);
+        return exception_continue_execution;
+    }
 };
+
+fn isGuestAddress(address: u64) bool {
+    inline for (memory.guest_ranges) |range| {
+        if (range.contains(address, 1)) return true;
+    }
+    return false;
+}
 
 extern fn ps5NativeCallWindowsX64(
     frame: *NativeCallFrame,
@@ -1385,6 +1578,106 @@ test "native bridge installs FS, SysV arguments, and the guest stack" {
     });
     try testing.expectEqual(requested_stack_pointer - 8, observed_rsp);
     try testing.expectEqual(@as(u64, 8), observed_rsp & 0xf);
+}
+
+test "native bridge contains guest access and illegal instruction faults" {
+    if (!NativeBridge.isSupported()) return error.SkipZigTest;
+
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+
+    const code_address = memory.system_managed.start;
+    const tls_address = code_address + memory.page_size;
+    const stack_address = tls_address + memory.page_size;
+    try address_space.mapFixed(
+        code_address,
+        memory.page_size,
+        .read_write,
+        .module,
+        null,
+    );
+    try address_space.mapFixed(
+        tls_address,
+        memory.page_size,
+        .read_write,
+        .private,
+        null,
+    );
+    try address_space.mapFixed(
+        stack_address,
+        memory.page_size,
+        .read_write,
+        .private,
+        null,
+    );
+
+    // mov rax, qword ptr [0]; ret
+    try address_space.write(
+        code_address,
+        &.{ 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, 0xc3 },
+    );
+    // ud2; ret
+    try address_space.write(code_address + 0x20, &.{ 0x0f, 0x0b, 0xc3 });
+    // mov eax, 42; ret
+    try address_space.write(
+        code_address + 0x40,
+        &.{ 0xb8, 42, 0, 0, 0, 0xc3 },
+    );
+    try address_space.protect(code_address, memory.page_size, .read_execute);
+
+    var native = NativeBridge{};
+    try native.init(testing.allocator, &address_space);
+    defer native.deinit();
+    const machine = native.bridge();
+    const thread_handle = 0x1234;
+    const context = threading.ThreadContext{
+        .tls_mapping_address = tls_address,
+        .tls_mapping_size = memory.page_size,
+        .fs_base = tls_address,
+        .dtv_address = tls_address + 0x100,
+        .tls_generation = 1,
+    };
+    const base_request = ExecuteRequest{
+        .kind = .process_entry,
+        .entry_point = code_address,
+        .thread_handle = thread_handle,
+        .context = context,
+        .stack_address = stack_address,
+        .stack_size = memory.page_size,
+        .guard_size = 0,
+    };
+    const host_fs_before = NativeMachine.readFsBase();
+
+    try testing.expectError(error.GuestFault, machine.execute(base_request));
+    const access_fault = native.lastFault().?;
+    try testing.expectEqual(thread_handle, access_fault.thread_handle);
+    try testing.expectEqual(FaultKind.access_violation, access_fault.info.kind);
+    try testing.expectEqual(FaultAccess.read, access_fault.info.access);
+    try testing.expectEqual(
+        @as(u32, std.os.windows.EXCEPTION_ACCESS_VIOLATION),
+        access_fault.info.exception_code,
+    );
+    try testing.expectEqual(code_address, access_fault.info.instruction_address);
+    try testing.expectEqual(@as(u64, 0), access_fault.info.memory_address);
+    try testing.expect(access_fault.info.registers.rsp >= stack_address);
+    try testing.expect(
+        access_fault.info.registers.rsp < stack_address + memory.page_size,
+    );
+    try testing.expectEqual(host_fs_before, NativeMachine.readFsBase());
+
+    var illegal_request = base_request;
+    illegal_request.entry_point = code_address + 0x20;
+    try testing.expectError(error.GuestFault, machine.execute(illegal_request));
+    const illegal_fault = native.lastFault().?;
+    try testing.expectEqual(FaultKind.illegal_instruction, illegal_fault.info.kind);
+    try testing.expectEqual(FaultAccess.unknown, illegal_fault.info.access);
+    try testing.expectEqual(code_address + 0x20, illegal_fault.info.registers.rip);
+    try testing.expectEqual(host_fs_before, NativeMachine.readFsBase());
+
+    var valid_request = base_request;
+    valid_request.entry_point = code_address + 0x40;
+    try testing.expectEqual(@as(u64, 42), try machine.execute(valid_request));
+    try testing.expect(native.lastFault() == null);
 }
 
 test "native bridge executes a pthread on its dispatcher worker" {

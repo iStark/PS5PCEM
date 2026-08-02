@@ -154,6 +154,13 @@ pub const Runtime = struct {
         self.native_cpu_bridge.deinit();
     }
 
+    /// Returns the latest guest fault contained by the runtime-owned native
+    /// bridge. Custom CPU bridges keep their own diagnostic channel.
+    pub fn lastNativeFault(self: *Runtime) ?cpu.FaultRecord {
+        if (!self.initialized or !self.native_cpu_bridge.isInitialized()) return null;
+        return self.native_cpu_bridge.lastFault();
+    }
+
     /// Prepares TCB/DTV state for the initial guest execution context.
     pub fn prepareInitialThread(
         self: *Runtime,
@@ -620,6 +627,11 @@ test "native process entry reads argc from the generated parameter block" {
         code_address,
         &.{ 0x8b, 0x07, 0x48, 0x01, 0xf0, 0xc3 },
     );
+    // mov rax, qword ptr [0]; ret
+    try runtime.address_space.?.write(
+        code_address + 0x20,
+        &.{ 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, 0xc3 },
+    );
     try runtime.address_space.?.protect(
         code_address,
         memory.page_size,
@@ -650,6 +662,17 @@ test "native process entry reads argc from the generated parameter block" {
         },
     );
     try testing.expectEqual(@as(u64, 0x42), result);
+
+    executable.entry_point = code_address + 0x20;
+    try testing.expectError(
+        error.GuestFault,
+        runtime.dispatchProcess(prepared, &executable, .{}),
+    );
+    const fault = runtime.lastNativeFault().?;
+    try testing.expectEqual(cpu.FaultKind.access_violation, fault.info.kind);
+    try testing.expectEqual(cpu.FaultAccess.read, fault.info.access);
+    try testing.expectEqual(code_address + 0x20, fault.info.registers.rip);
+    try testing.expectEqual(@as(u64, 0), fault.info.memory_address);
 }
 
 fn expectRuntimeGuestString(

@@ -607,21 +607,32 @@ guest stack below the HLE frames. A synchronous `scePthreadExit` takes a native
 escape path which discards those guest frames and restores host FS/state before
 the dispatcher observes `error.Interrupted`.
 
+The Windows backend also owns a first-priority vectored exception handler for
+active guest execution. It claims access violations and illegal instructions
+only when the faulting RIP lies inside one of the fixed guest windows; host and
+HLE faults continue through the normal Windows search. A claimed fault snapshots
+all general-purpose registers, access type and target address, redirects the
+saved Windows context to the assembly escape path, restores host FS/register
+state, and returns `error.GuestFault`. `NativeBridge.lastFault` and
+`Runtime.lastNativeFault` expose that diagnostic record without reading guest
+memory from inside the exception handler.
+
 The bridge intentionally does not force a context change in another host
 thread. Shutdown marks such an execution interrupted and observes it when guest
 code returns; suspending a worker inside HLE could abandon host locks. Windows
-fault recovery/SEH metadata and unsupported-instruction compatibility are still
-missing, so arbitrary `eboot.bin` execution is not safe yet. Linux and macOS
-need a different FS/HLE-transition strategy because their host TLS rules differ.
-GPU submission and audio callbacks consequently remain beyond the current
-title bootstrap.
+fault containment is now present, but illegal instructions are reported rather
+than emulated and mixed guest/HLE frames do not yet have an unwind-safe import
+transition. Arbitrary `eboot.bin` execution is therefore not safe yet. Linux and
+macOS need a different FS/HLE-transition strategy because their host TLS rules
+differ. GPU submission and audio callbacks consequently remain beyond the
+current title bootstrap.
 
 ## Roadmap
 
-1. Add Windows trap/fault recovery, unwind metadata, and compatibility handling
-   for unsupported x86-64 instructions.
-2. Introduce import transition stubs where host-stack recovery, diagnostics, or
-   platform TLS restoration are required.
+1. Add resumable compatibility handlers for AMD-specific instructions such as
+   SSE4a and `MONITORX`/`MWAITX` on hosts which do not implement them.
+2. Introduce import transition stubs with Windows unwind metadata, host-stack
+   recovery, diagnostics, and platform TLS restoration.
 3. Add a POSIX native bridge with explicit host-TLS restoration around HLE.
 
 ---
