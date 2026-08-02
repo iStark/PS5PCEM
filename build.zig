@@ -4,10 +4,18 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // The decoder library. Kept separate from the CLI so it can be consumed as
+    // The shader decoder. Kept separate from the CLI so it can be consumed as
     // a module, or later built as a static library with a C ABI.
     const mod = b.addModule("rdna2", .{
-        .root_source_file = b.path("src/root.zig"),
+        .root_source_file = b.path("src/rdna2/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Firmware emulation: identifier derivation, the symbol registry, and the
+    // guest-facing libraries. Independent of the shader decoder.
+    const hle = b.addModule("hle", .{
+        .root_source_file = b.path("src/hle/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -32,13 +40,9 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the disassembler");
     run_step.dependOn(&run_cmd.step);
 
-    const mod_tests = b.addTest(.{ .root_module = mod });
-    const run_mod_tests = b.addRunArtifact(mod_tests);
-
-    const exe_tests = b.addTest(.{ .root_module = exe.root_module });
-    const run_exe_tests = b.addRunArtifact(exe_tests);
-
     const test_step = b.step("test", "Run the test suite");
-    test_step.dependOn(&run_mod_tests.step);
-    test_step.dependOn(&run_exe_tests.step);
+    for ([_]*std.Build.Module{ mod, hle, exe.root_module }) |m| {
+        const tests = b.addTest(.{ .root_module = m });
+        test_step.dependOn(&b.addRunArtifact(tests).step);
+    }
 }
