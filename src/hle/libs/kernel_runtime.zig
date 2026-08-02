@@ -84,6 +84,12 @@ fn setErrno(value: i32) void {
     errnoAddress().* = value;
 }
 
+/// Lets sibling POSIX compatibility libraries report failure through the same
+/// guest-thread errno cell as libc and libkernel.
+pub fn setPosixErrno(value: i32) void {
+    setErrno(value);
+}
+
 fn compatSuccess(
     _: u64,
     _: u64,

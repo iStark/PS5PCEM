@@ -42,6 +42,7 @@ pub const Runtime = struct {
     sync_manager: hle.libs.kernel_sync.Manager = .{},
     cpu_dispatcher: cpu.Dispatcher = .{},
     native_cpu_bridge: cpu.NativeBridge = .{},
+    last_dispatch_entry: u64 = 0,
     initialized: bool = false,
 
     /// Initializes a stable, caller-owned Runtime value.
@@ -84,7 +85,11 @@ pub const Runtime = struct {
             self.database = .{};
         }
         try hle.registerAll(&self.database, allocator);
+        hle.libs.audio.reset();
+        hle.libs.bootstrap_services.reset();
+        hle.libs.dialogs.reset();
         hle.libs.kernel_event_queue.reset();
+        hle.libs.network.reset();
         hle.libs.system_service.reset();
         hle.libs.user_service.reset();
         hle.libs.pad.reset();
@@ -105,7 +110,11 @@ pub const Runtime = struct {
         self.thread_manager.deinit();
         hle.libs.kernel_memory.attachAddressSpace(null);
         hle.libs.kernel_memory.deinit();
+        hle.libs.audio.reset();
+        hle.libs.bootstrap_services.reset();
+        hle.libs.dialogs.reset();
         hle.libs.kernel_event_queue.reset();
+        hle.libs.network.reset();
         hle.libs.system_service.reset();
         hle.libs.user_service.reset();
         hle.libs.pad.reset();
@@ -118,6 +127,7 @@ pub const Runtime = struct {
         if (self.address_space) |*space| space.deinit();
         self.address_space = null;
         self.allocator = null;
+        self.last_dispatch_entry = 0;
         self.initialized = false;
     }
 
@@ -180,6 +190,12 @@ pub const Runtime = struct {
         return self.native_cpu_bridge.lastFault();
     }
 
+    /// Entry point most recently handed to the CPU dispatcher. This remains
+    /// available after a contained guest fault for launcher diagnostics.
+    pub fn lastDispatchedEntry(self: *const Runtime) u64 {
+        return self.last_dispatch_entry;
+    }
+
     /// Prepares TCB/DTV state for the initial guest execution context.
     pub fn prepareInitialThread(
         self: *Runtime,
@@ -228,6 +244,7 @@ pub const Runtime = struct {
         arguments: []const u64,
     ) Error!u64 {
         if (!self.initialized) return Error.NotInitialized;
+        self.last_dispatch_entry = entry_point;
         return self.cpu_dispatcher.dispatchInitial(prepared, entry_point, arguments);
     }
 
@@ -267,6 +284,7 @@ pub const Runtime = struct {
             prepared.stack_size,
             options.entry,
         );
+        self.last_dispatch_entry = executable.entry_point;
         return self.cpu_dispatcher.dispatchInitialAtStack(
             prepared,
             executable.entry_point,
@@ -295,6 +313,7 @@ pub const Runtime = struct {
         functions: []const u64,
     ) Error!void {
         for (functions) |entry_point| {
+            self.last_dispatch_entry = entry_point;
             _ = try self.cpu_dispatcher.dispatchInitializer(
                 prepared,
                 entry_point,

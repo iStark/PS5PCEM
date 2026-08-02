@@ -15,6 +15,9 @@ pub const errno = @import("errno.zig");
 pub const symbols = @import("symbols.zig");
 
 pub const libs = struct {
+    pub const audio = @import("libs/audio.zig");
+    pub const bootstrap_services = @import("libs/bootstrap_services.zig");
+    pub const dialogs = @import("libs/dialogs.zig");
     pub const kernel_event_queue = @import("libs/kernel_event_queue.zig");
     pub const kernel_files = @import("libs/kernel_files.zig");
     pub const kernel_memory = @import("libs/kernel_memory.zig");
@@ -22,6 +25,7 @@ pub const libs = struct {
     pub const kernel_sync = @import("libs/kernel_sync.zig");
     pub const kernel_threading = @import("libs/kernel_threading.zig");
     pub const libc_internal = @import("libs/libc_internal.zig");
+    pub const network = @import("libs/network.zig");
     pub const platform_services = @import("libs/platform_services.zig");
     pub const pad = @import("libs/pad.zig");
     pub const sysmodule = @import("libs/sysmodule.zig");
@@ -41,6 +45,9 @@ pub const KernelError = errno.KernelError;
 /// Registration is explicit rather than automatic: the list is what the guest
 /// can see, so it should be readable in one place.
 pub fn registerAll(db: *Database, gpa: @import("std").mem.Allocator) symbols.Error!void {
+    try libs.audio.register(db, gpa);
+    try libs.bootstrap_services.register(db, gpa);
+    try libs.dialogs.register(db, gpa);
     try libs.kernel_event_queue.register(db, gpa);
     try libs.kernel_files.register(db, gpa);
     try libs.kernel_memory.register(db, gpa);
@@ -48,6 +55,7 @@ pub fn registerAll(db: *Database, gpa: @import("std").mem.Allocator) symbols.Err
     try libs.kernel_sync.register(db, gpa);
     try libs.kernel_threading.register(db, gpa);
     try libs.libc_internal.register(db, gpa);
+    try libs.network.register(db, gpa);
     try libs.platform_services.register(db, gpa);
     try libs.pad.register(db, gpa);
     try libs.sysmodule.register(db, gpa);
@@ -56,6 +64,9 @@ pub fn registerAll(db: *Database, gpa: @import("std").mem.Allocator) symbols.Err
 }
 
 test {
+    _ = libs.audio;
+    _ = libs.bootstrap_services;
+    _ = libs.dialogs;
     _ = nid;
     _ = abi;
     _ = errno;
@@ -67,6 +78,7 @@ test {
     _ = libs.kernel_sync;
     _ = libs.kernel_threading;
     _ = libs.libc_internal;
+    _ = libs.network;
     _ = libs.platform_services;
     _ = libs.pad;
     _ = libs.sysmodule;

@@ -10,6 +10,8 @@ const symbols = @import("../symbols.zig");
 const kernel_runtime = @import("kernel_runtime.zig");
 
 const rtc_unix_epoch_microseconds: i96 = 62_135_596_800 * std.time.us_per_s;
+const net_ctl_error_invalid_address: i32 = @bitCast(@as(u32, 0x8041_2107));
+const net_ctl_error_not_connected: i32 = @bitCast(@as(u32, 0x8041_2108));
 
 fn appContentInitialize(_: ?*const anyopaque, boot_param: ?*[40]u8) callconv(abi.guest) i32 {
     if (boot_param) |output| @memset(output, 0);
@@ -27,15 +29,57 @@ fn temporaryDataMount2(
     return errno.KernelError.enosys.raw();
 }
 
-fn netCtlGetInfo(
-    _: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-    _: u64,
+fn netCtlInit() callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
+fn netCtlTerm() callconv(abi.guest) void {}
+
+fn netCtlGetNatInfo(output: ?*[16]u8) callconv(abi.guest) i32 {
+    const info = output orelse return net_ctl_error_invalid_address;
+    // Preserve the caller-supplied size field and report no mapped address.
+    const size = info[0..4].*;
+    @memset(info, 0);
+    info[0..4].* = size;
+    return errno.ok;
+}
+
+fn netCtlCheckCallback() callconv(abi.guest) i32 {
+    // Guest callbacks are deliberately not invoked from an arbitrary HLE frame.
+    // GetState/GetInfo expose the same disconnected state synchronously.
+    return errno.ok;
+}
+
+fn netCtlGetState(output: ?*i32) callconv(abi.guest) i32 {
+    const state = output orelse return net_ctl_error_invalid_address;
+    state.* = 0; // SCE_NET_CTL_STATE_DISCONNECTED
+    return errno.ok;
+}
+
+fn netCtlRegisterCallback(
+    callback: ?*const anyopaque,
+    _: ?*anyopaque,
+    output: ?*i32,
 ) callconv(abi.guest) i32 {
-    return errno.KernelError.enosys.raw();
+    if (callback == null or output == null) return net_ctl_error_invalid_address;
+    output.?.* = 0;
+    return errno.ok;
+}
+
+fn netCtlUnregisterCallback(_: i32) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
+fn netCtlGetResult(_: i32, output: ?*i32) callconv(abi.guest) i32 {
+    const result = output orelse return net_ctl_error_invalid_address;
+    result.* = errno.ok;
+    return errno.ok;
+}
+
+fn netCtlGetInfo(_: i32, output: ?*[256]u8) callconv(abi.guest) i32 {
+    const info = output orelse return net_ctl_error_invalid_address;
+    @memset(info, 0);
+    return net_ctl_error_not_connected;
 }
 
 fn rtcGetCurrentTick(output: ?*u64) callconv(abi.guest) i32 {
@@ -53,11 +97,18 @@ const app_content_exports = [_]symbols.Export{
     .{ .name = "sceAppContentTemporaryDataMount2", .function = abi.erase(&temporaryDataMount2), .expect_id = "buYbeLOGWmA" },
 };
 
-const net_ctl_exports = [_]symbols.Export{.{
-    .name = "sceNetCtlGetInfo",
-    .function = abi.erase(&netCtlGetInfo),
-    .expect_id = "obuxdTiwkF8",
-}};
+const net_ctl_exports = [_]symbols.Export{
+    .{ .name = "sceNetCtlInit", .function = abi.erase(&netCtlInit), .expect_id = "gky0+oaNM4k" },
+    .{ .name = "sceNetCtlTerm", .function = abi.erase(&netCtlTerm), .expect_id = "Z4wwCFiBELQ" },
+    .{ .name = "sceNetCtlGetNatInfo", .function = abi.erase(&netCtlGetNatInfo), .expect_id = "JO4yuTuMoKI" },
+    .{ .name = "sceNetCtlCheckCallback", .function = abi.erase(&netCtlCheckCallback), .expect_id = "iQw3iQPhvUQ" },
+    .{ .name = "sceNetCtlGetState", .function = abi.erase(&netCtlGetState), .expect_id = "uBPlr0lbuiI" },
+    .{ .name = "sceNetCtlGetStateV6", .function = abi.erase(&netCtlGetState), .expect_id = "+lxqIKeU9UY" },
+    .{ .name = "sceNetCtlRegisterCallback", .function = abi.erase(&netCtlRegisterCallback), .expect_id = "UJ+Z7Q+4ck0" },
+    .{ .name = "sceNetCtlUnregisterCallback", .function = abi.erase(&netCtlUnregisterCallback), .expect_id = "Rqm2OnZMCz0" },
+    .{ .name = "sceNetCtlGetResult", .function = abi.erase(&netCtlGetResult), .expect_id = "0cBgduPRR+M" },
+    .{ .name = "sceNetCtlGetInfo", .function = abi.erase(&netCtlGetInfo), .expect_id = "obuxdTiwkF8" },
+};
 
 const rtc_exports = [_]symbols.Export{.{
     .name = "sceRtcGetCurrentTick",
@@ -92,4 +143,13 @@ test "Unity bootstrap platform services register" {
     try register(&db, std.testing.allocator);
     try std.testing.expect(db.findByName("sceAppContentInitialize", .function) != null);
     try std.testing.expect(db.findByName("sceRtcGetCurrentTick", .function) != null);
+}
+
+test "network control reports a coherent disconnected console" {
+    var state: i32 = -1;
+    try std.testing.expectEqual(errno.ok, netCtlGetState(&state));
+    try std.testing.expectEqual(@as(i32, 0), state);
+    var info: [256]u8 = [_]u8{0xff} ** 256;
+    try std.testing.expectEqual(net_ctl_error_not_connected, netCtlGetInfo(14, &info));
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 256), &info);
 }
