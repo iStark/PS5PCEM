@@ -604,6 +604,23 @@ RTC, system-parameter, app-content, and network-control bootstrap surface they
 need to relocate. This is linkage coverage, not a claim that filesystems,
 networking, event flags, or semaphores are complete.
 
+**Title bootstrap services** ([src/hle/libs/system_service.zig](src/hle/libs/system_service.zig),
+[src/hle/libs/user_service.zig](src/hle/libs/user_service.zig),
+[src/hle/libs/pad.zig](src/hle/libs/pad.zig))
+
+The runtime exposes one stable signed-in user and one neutral connected local
+controller. User login is delivered once through the service event API; later
+polls report `NO_EVENT`. System preferences, safe-area and HDR defaults, the
+notice-screen flag, and music-player suppression retain coherent state. System
+UI actions that cannot exist without a shell return `UNAVAILABLE`.
+
+Kernel user-edge event queues retain registrations and pending event payloads,
+and their waits use the same sequence-aware dispatcher contract as pthread
+synchronization. Main direct-memory allocation, named direct mappings, stack
+queries, and live pthread scheduling metadata are also exposed. File and APR
+entry points are linkable but return `ENOSYS` until the runtime owns a guest VFS
+and accelerator backend; they never fabricate successful I/O.
+
 ## Error codes
 
 Two numbering schemes coexist in the guest ABI, and mixing them up is a common
@@ -618,8 +635,8 @@ from leaking into host code where nothing would check it.
 
 ## Roadmap
 
-1. Event queues, on which most firmware asynchrony is built.
-2. Semaphores and address-based waits on the same dispatcher contract.
+1. Kernel event flags and semaphores on the existing dispatcher contract.
+2. Guest VFS path translation and descriptor ownership.
 
 ---
 

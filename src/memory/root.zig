@@ -167,6 +167,7 @@ pub const Protection = packed struct(u3) {
 pub const MappingKind = enum {
     module,
     private,
+    stack,
     direct_memory,
     flexible,
     reserved,

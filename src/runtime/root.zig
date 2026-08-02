@@ -84,6 +84,10 @@ pub const Runtime = struct {
             self.database = .{};
         }
         try hle.registerAll(&self.database, allocator);
+        hle.libs.kernel_event_queue.reset();
+        hle.libs.system_service.reset();
+        hle.libs.user_service.reset();
+        hle.libs.pad.reset();
         hle.libs.kernel_runtime.attachIo(null);
         hle.libs.kernel_runtime.attachProcessParam(0);
         self.initialized = true;
@@ -101,6 +105,10 @@ pub const Runtime = struct {
         self.thread_manager.deinit();
         hle.libs.kernel_memory.attachAddressSpace(null);
         hle.libs.kernel_memory.deinit();
+        hle.libs.kernel_event_queue.reset();
+        hle.libs.system_service.reset();
+        hle.libs.user_service.reset();
+        hle.libs.pad.reset();
         hle.libs.kernel_runtime.attachProcessParam(0);
         hle.libs.kernel_runtime.attachIo(null);
         self.database.deinit(allocator);

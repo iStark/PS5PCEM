@@ -154,6 +154,12 @@ pub const SchedParam = extern struct {
     sched_priority: i32,
 };
 
+pub const Scheduling = struct {
+    policy: i32,
+    priority: i32,
+    affinity_mask: u64,
+};
+
 pub const ThreadHandle = ?*anyopaque;
 pub const AttrHandle = ?*Attr;
 
@@ -423,6 +429,51 @@ pub const Manager = struct {
     pub fn currentErrnoAddress(self: *Manager) ?u64 {
         const context = self.currentContext() orelse return null;
         return std.math.add(u64, context.fs_base, errno_tcb_offset) catch null;
+    }
+
+    pub fn readScheduling(self: *Manager, handle: ThreadHandle) ?Scheduling {
+        const address = handleAddress(handle) orelse return null;
+        self.lock.lock();
+        defer self.lock.unlock();
+        const record = self.findRecordLocked(address) orelse return null;
+        return .{
+            .policy = record.attributes.policy,
+            .priority = record.attributes.priority,
+            .affinity_mask = record.attributes.affinity_mask,
+        };
+    }
+
+    pub fn setAffinity(self: *Manager, handle: ThreadHandle, mask: u64) bool {
+        const address = handleAddress(handle) orelse return false;
+        self.lock.lock();
+        defer self.lock.unlock();
+        const record = self.findRecordLocked(address) orelse return false;
+        record.attributes.affinity_mask = mask;
+        return true;
+    }
+
+    pub fn setPriority(self: *Manager, handle: ThreadHandle, priority: i32) bool {
+        const address = handleAddress(handle) orelse return false;
+        self.lock.lock();
+        defer self.lock.unlock();
+        const record = self.findRecordLocked(address) orelse return false;
+        record.attributes.priority = priority;
+        return true;
+    }
+
+    pub fn setScheduling(
+        self: *Manager,
+        handle: ThreadHandle,
+        policy: i32,
+        priority: i32,
+    ) bool {
+        const address = handleAddress(handle) orelse return false;
+        self.lock.lock();
+        defer self.lock.unlock();
+        const record = self.findRecordLocked(address) orelse return false;
+        record.attributes.policy = policy;
+        record.attributes.priority = priority;
+        return true;
     }
 
     pub fn create(
@@ -762,7 +813,7 @@ pub const Manager = struct {
             mapping_size,
             memory.page_size,
             .none,
-            .private,
+            .stack,
             null,
         );
         errdefer self.address_space.unmap(mapping_address, mapping_size) catch {};
@@ -1084,6 +1135,43 @@ pub fn sceKernelUsleep(microseconds: u32) callconv(abi.guest) i32 {
     const active_manager = activeManager() orelse return KernelError.enosys.raw();
     active_manager.sleep(microseconds) catch |err| return kernelStatus(err);
     return errno.ok;
+}
+
+pub fn scePthreadSetaffinity(handle: ThreadHandle, mask: u64) callconv(abi.guest) i32 {
+    const manager = activeManager() orelse return KernelError.enosys.raw();
+    return if (manager.setAffinity(handle, mask)) errno.ok else KernelError.esrch.raw();
+}
+
+pub fn scePthreadSetprio(handle: ThreadHandle, priority: i32) callconv(abi.guest) i32 {
+    const manager = activeManager() orelse return KernelError.enosys.raw();
+    return if (manager.setPriority(handle, priority)) errno.ok else KernelError.esrch.raw();
+}
+
+pub fn scePthreadGetschedparam(
+    handle: ThreadHandle,
+    out_policy: ?*i32,
+    out_parameter: ?*SchedParam,
+) callconv(abi.guest) i32 {
+    const policy = out_policy orelse return KernelError.einval.raw();
+    const parameter = out_parameter orelse return KernelError.einval.raw();
+    const manager = activeManager() orelse return KernelError.enosys.raw();
+    const scheduling = manager.readScheduling(handle) orelse return KernelError.esrch.raw();
+    policy.* = scheduling.policy;
+    parameter.* = .{ .sched_priority = scheduling.priority };
+    return errno.ok;
+}
+
+pub fn scePthreadSetschedparam(
+    handle: ThreadHandle,
+    policy: i32,
+    parameter: ?*const SchedParam,
+) callconv(abi.guest) i32 {
+    const requested = parameter orelse return KernelError.einval.raw();
+    const manager = activeManager() orelse return KernelError.enosys.raw();
+    return if (manager.setScheduling(handle, policy, requested.sched_priority))
+        errno.ok
+    else
+        KernelError.esrch.raw();
 }
 
 pub fn scePthreadAttrInit(out_attr: ?*AttrHandle) callconv(abi.guest) i32 {
@@ -1438,6 +1526,10 @@ pub const exports = [_]symbols.Export{
     .{ .name = "pthread_exit", .function = abi.erase(&pthread_exit), .expect_id = "FJrT5LuUBAU" },
     .{ .name = "scePthreadYield", .function = abi.erase(&scePthreadYield), .expect_id = "T72hz6ffq08" },
     .{ .name = "pthread_yield", .function = abi.erase(&pthread_yield), .expect_id = "B5GmVDKwpn0" },
+    .{ .name = "scePthreadSetaffinity", .function = abi.erase(&scePthreadSetaffinity), .expect_id = "bt3CTBKmGyI" },
+    .{ .name = "scePthreadSetprio", .function = abi.erase(&scePthreadSetprio), .expect_id = "W0Hpm2X0uPE" },
+    .{ .name = "scePthreadGetschedparam", .function = abi.erase(&scePthreadGetschedparam), .expect_id = "P41kTWUS3EI" },
+    .{ .name = "scePthreadSetschedparam", .function = abi.erase(&scePthreadSetschedparam), .expect_id = "oIRFTjoILbg" },
     .{ .name = "sceKernelUsleep", .function = abi.erase(&sceKernelUsleep), .expect_id = "1jfXLRVzisc" },
     .{ .name = "scePthreadAttrInit", .function = abi.erase(&scePthreadAttrInit), .expect_id = "nsYoNRywwNg" },
     .{ .name = "pthread_attr_init", .function = abi.erase(&pthread_attr_init), .expect_id = "wtkt-teR1so" },
@@ -1638,6 +1730,31 @@ test "attributes and once expose POSIX-compatible state" {
     try testing.expectEqual(@as(usize, 1), backend.once_calls);
     try testing.expectEqual(errno.ok, pthread_attr_destroy(&attr));
     try testing.expect(attr == null);
+}
+
+test "live thread scheduling metadata can be queried and updated" {
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    var registry = loader.TlsRegistry{};
+    defer registry.deinit(testing.allocator);
+    var thread_manager = testManager(&address_space, &registry);
+    defer thread_manager.deinit();
+    attachManager(&thread_manager);
+    defer attachManager(null);
+
+    const prepared = try thread_manager.prepareInitialThread("MainThread");
+    defer thread_manager.releaseInitialThread(prepared.handle) catch {};
+    try testing.expectEqual(errno.ok, scePthreadSetaffinity(prepared.handle, 0x3));
+    try testing.expectEqual(errno.ok, scePthreadSetprio(prepared.handle, 512));
+    const requested = SchedParam{ .sched_priority = 600 };
+    try testing.expectEqual(errno.ok, scePthreadSetschedparam(prepared.handle, 2, &requested));
+
+    var policy: i32 = 0;
+    var current = SchedParam{ .sched_priority = 0 };
+    try testing.expectEqual(errno.ok, scePthreadGetschedparam(prepared.handle, &policy, &current));
+    try testing.expectEqual(@as(i32, 2), policy);
+    try testing.expectEqual(@as(i32, 600), current.sched_priority);
+    try testing.expectEqual(@as(u64, 0x3), thread_manager.readScheduling(prepared.handle).?.affinity_mask);
 }
 
 test "TLS keys are per-thread and run guest destructors" {

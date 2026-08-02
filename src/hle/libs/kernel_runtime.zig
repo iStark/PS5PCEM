@@ -57,6 +57,7 @@ var thread_dtors: std.atomic.Value(u64) = .init(0);
 var thread_atexit_count: std.atomic.Value(u64) = .init(0);
 var thread_atexit_report: std.atomic.Value(u64) = .init(0);
 var uuid_counter: std.atomic.Value(u64) = .init(1);
+var gpo_state: std.atomic.Value(u32) = .init(0);
 
 pub fn attachIo(io: ?std.Io) void {
     const was_detached = active_io == null;
@@ -332,6 +333,14 @@ fn schedYield() callconv(abi.guest) i32 {
     return errno.ok;
 }
 
+fn isTrinityMode() callconv(abi.guest) i32 {
+    return 0;
+}
+
+fn setGpo(bits: u32) callconv(abi.guest) void {
+    gpo_state.store(bits, .release);
+}
+
 fn convertLocaltimeToUtc(
     local_time: i64,
     _: i64,
@@ -448,6 +457,13 @@ pub const exports = [_]symbols.Export{
     .{ .name = "unknown_libkernel_PZQhiiLXRFs", .function = abi.erase(&kernelUnsupported), .id_override = "PZQhiiLXRFs" },
     .{ .name = "sceKernelSyncOnAddressWake", .function = abi.erase(&kernelUnsupported), .expect_id = "q2y-wDIVWZA" },
     .{ .name = "sceKernelSyncOnAddressWait", .function = abi.erase(&kernelUnsupported), .expect_id = "Hc4CaR6JBL0" },
+    .{ .name = "sceKernelIsTrinityMode", .function = abi.erase(&isTrinityMode), .expect_id = "tU5e3f9gSiU" },
+    .{ .name = "sceKernelSetGPO", .function = abi.erase(&setGpo), .expect_id = "ca7v6Cxulzs" },
+    .{ .name = "sceKernelCancelEventFlag", .function = abi.erase(&kernelUnsupported), .expect_id = "PZku4ZrXJqg" },
+    .{ .name = "sceKernelDeleteSema", .function = abi.erase(&kernelUnsupported), .expect_id = "R1Jvn8bSCW8" },
+    .{ .name = "sceKernelAprResolveFilepathsToIdsAndFileSizes", .function = abi.erase(&kernelUnsupported), .expect_id = "gEpBkcwxUjw" },
+    .{ .name = "sceKernelAprSubmitCommandBufferAndGetResult", .function = abi.erase(&kernelUnsupported), .expect_id = "ASoW5WE-UPo" },
+    .{ .name = "sceKernelAprWaitCommandBuffer", .function = abi.erase(&kernelUnsupported), .expect_id = "rqwFKI4PAiM" },
 };
 
 pub const unity_exports = [_]symbols.Export{

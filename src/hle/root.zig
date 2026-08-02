@@ -15,13 +15,18 @@ pub const errno = @import("errno.zig");
 pub const symbols = @import("symbols.zig");
 
 pub const libs = struct {
+    pub const kernel_event_queue = @import("libs/kernel_event_queue.zig");
+    pub const kernel_files = @import("libs/kernel_files.zig");
     pub const kernel_memory = @import("libs/kernel_memory.zig");
     pub const kernel_runtime = @import("libs/kernel_runtime.zig");
     pub const kernel_sync = @import("libs/kernel_sync.zig");
     pub const kernel_threading = @import("libs/kernel_threading.zig");
     pub const libc_internal = @import("libs/libc_internal.zig");
     pub const platform_services = @import("libs/platform_services.zig");
+    pub const pad = @import("libs/pad.zig");
     pub const sysmodule = @import("libs/sysmodule.zig");
+    pub const system_service = @import("libs/system_service.zig");
+    pub const user_service = @import("libs/user_service.zig");
 };
 
 pub const Database = symbols.Database;
@@ -36,13 +41,18 @@ pub const KernelError = errno.KernelError;
 /// Registration is explicit rather than automatic: the list is what the guest
 /// can see, so it should be readable in one place.
 pub fn registerAll(db: *Database, gpa: @import("std").mem.Allocator) symbols.Error!void {
+    try libs.kernel_event_queue.register(db, gpa);
+    try libs.kernel_files.register(db, gpa);
     try libs.kernel_memory.register(db, gpa);
     try libs.kernel_runtime.register(db, gpa);
     try libs.kernel_sync.register(db, gpa);
     try libs.kernel_threading.register(db, gpa);
     try libs.libc_internal.register(db, gpa);
     try libs.platform_services.register(db, gpa);
+    try libs.pad.register(db, gpa);
     try libs.sysmodule.register(db, gpa);
+    try libs.system_service.register(db, gpa);
+    try libs.user_service.register(db, gpa);
 }
 
 test {
@@ -50,11 +60,16 @@ test {
     _ = abi;
     _ = errno;
     _ = symbols;
+    _ = libs.kernel_event_queue;
+    _ = libs.kernel_files;
     _ = libs.kernel_memory;
     _ = libs.kernel_runtime;
     _ = libs.kernel_sync;
     _ = libs.kernel_threading;
     _ = libs.libc_internal;
     _ = libs.platform_services;
+    _ = libs.pad;
     _ = libs.sysmodule;
+    _ = libs.system_service;
+    _ = libs.user_service;
 }

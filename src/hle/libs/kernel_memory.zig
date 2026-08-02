@@ -83,8 +83,18 @@ pub const VirtualQueryInfo = extern struct {
     padding: [2]u8 = .{ 0, 0 },
 };
 
+pub const DirectMemoryQueryInfo = extern struct {
+    start: i64 = 0,
+    end: i64 = 0,
+    memory_type: i32 = 0,
+    padding: i32 = 0,
+};
+
 comptime {
     if (@sizeOf(VirtualQueryInfo) != 72) @compileError("VirtualQueryInfo ABI size must be 72 bytes");
+    if (@sizeOf(DirectMemoryQueryInfo) != 24) {
+        @compileError("DirectMemoryQueryInfo ABI size must be 24 bytes");
+    }
 }
 
 /// Memory types a title can ask for. The distinction drives caching behaviour on
@@ -311,6 +321,26 @@ fn sceKernelGetDirectMemorySize() callconv(abi.guest) u64 {
     return pool.size;
 }
 
+fn sceKernelAllocateMainDirectMemory(
+    len: u64,
+    alignment: u64,
+    memory_type: i32,
+    out_start: ?*u64,
+) callconv(abi.guest) i32 {
+    return sceKernelAllocateDirectMemory(
+        0,
+        direct_memory_size,
+        len,
+        alignment,
+        memory_type,
+        out_start,
+    );
+}
+
+fn sceKernelCheckedReleaseDirectMemory(start: u64, len: u64) callconv(abi.guest) i32 {
+    return sceKernelReleaseDirectMemory(start, len);
+}
+
 const map_fixed: i32 = 0x10;
 const map_no_overwrite: u32 = 0x80;
 const map_dmem_compat: u32 = 0x400;
@@ -390,6 +420,88 @@ fn sceKernelMapDirectMemory(
         return mapAddressSpaceError(err);
     };
     output.* = mapped_address;
+    return errno.ok;
+}
+
+fn sceKernelMapNamedDirectMemory(
+    out_address: ?*u64,
+    len: u64,
+    protection_bits: i32,
+    flags: i32,
+    physical_address: u64,
+    alignment: u64,
+    name_pointer: ?[*:0]const u8,
+) callconv(abi.guest) i32 {
+    const output = out_address orelse return KernelError.efault.raw();
+    const pointer = name_pointer orelse return KernelError.efault.raw();
+    const name = std.mem.span(pointer);
+    if (name.len >= maximum_name_length) return KernelError.enametoolong.raw();
+    const status = sceKernelMapDirectMemory(
+        output,
+        len,
+        protection_bits,
+        flags,
+        physical_address,
+        alignment,
+    );
+    if (status != errno.ok) return status;
+
+    pool_lock.lock();
+    defer pool_lock.unlock();
+    const address_space = guest_address_space orelse return KernelError.enosys.raw();
+    address_space.setMetadata(output.*, len, .{ .name = name }) catch |err| {
+        address_space.unmap(output.*, len) catch {};
+        return mapAddressSpaceError(err);
+    };
+    return errno.ok;
+}
+
+fn sceKernelDirectMemoryQuery(
+    offset: i64,
+    flags: i32,
+    out_info: ?*DirectMemoryQueryInfo,
+    info_size: u64,
+) callconv(abi.guest) i32 {
+    const info = out_info orelse return KernelError.einval.raw();
+    if (offset < 0 or (flags != 0 and flags != 1) or info_size != @sizeOf(DirectMemoryQueryInfo)) {
+        return KernelError.einval.raw();
+    }
+
+    pool_lock.lock();
+    defer pool_lock.unlock();
+    const query_offset: u64 = @intCast(offset);
+    var reservation = pool.findContaining(query_offset);
+    if (reservation == null and flags == 1) {
+        for (pool.reservations.items) |*candidate| {
+            if (candidate.start < query_offset) continue;
+            if (reservation == null or candidate.start < reservation.?.start) {
+                reservation = candidate;
+            }
+        }
+    }
+    const found = reservation orelse {
+        if (flags == 1 and query_offset < pool.size) {
+            info.* = .{ .start = @intCast(pool.size), .end = @intCast(pool.size) };
+            return errno.ok;
+        }
+        return KernelError.eacces.raw();
+    };
+    info.* = .{
+        .start = @intCast(found.start),
+        .end = @intCast(found.end()),
+        .memory_type = @intFromEnum(found.memory_type),
+    };
+    return errno.ok;
+}
+
+fn sceKernelIsStack(address: u64, out_start: ?*u64, out_end: ?*u64) callconv(abi.guest) i32 {
+    pool_lock.lock();
+    defer pool_lock.unlock();
+    const address_space = guest_address_space orelse return KernelError.enosys.raw();
+    const mapping = address_space.query(address, false) orelse return KernelError.eacces.raw();
+    const is_stack = mapping.kind == .stack;
+    if (out_start) |output| output.* = if (is_stack) mapping.address else 0;
+    if (out_end) |output| output.* = if (is_stack) mapping.end() else 0;
     return errno.ok;
 }
 
@@ -725,9 +837,34 @@ pub const exports = [_]symbols.Export{
         .expect_id = "pO96TwzOm5E",
     },
     .{
+        .name = "sceKernelAllocateMainDirectMemory",
+        .function = abi.erase(&sceKernelAllocateMainDirectMemory),
+        .expect_id = "B+vc2AO2Zrc",
+    },
+    .{
+        .name = "sceKernelCheckedReleaseDirectMemory",
+        .function = abi.erase(&sceKernelCheckedReleaseDirectMemory),
+        .expect_id = "hwVSPCmp5tM",
+    },
+    .{
         .name = "sceKernelMapDirectMemory",
         .function = abi.erase(&sceKernelMapDirectMemory),
         .expect_id = "L-Q3LEjIbgA",
+    },
+    .{
+        .name = "sceKernelMapNamedDirectMemory",
+        .function = abi.erase(&sceKernelMapNamedDirectMemory),
+        .expect_id = "NcaWUxfMNIQ",
+    },
+    .{
+        .name = "sceKernelDirectMemoryQuery",
+        .function = abi.erase(&sceKernelDirectMemoryQuery),
+        .expect_id = "BHouLQzh0X0",
+    },
+    .{
+        .name = "sceKernelIsStack",
+        .function = abi.erase(&sceKernelIsStack),
+        .expect_id = "yDBwVAolDgg",
     },
     .{
         .name = "sceKernelMapNamedFlexibleMemory",
@@ -908,6 +1045,26 @@ test "allocate and release round-trip through the entry points" {
         KernelError.einval.raw(),
         sceKernelReleaseDirectMemory(start, 2 * page_size),
     );
+}
+
+test "main direct-memory wrappers preserve reservation metadata" {
+    init(testing.allocator);
+    defer deinit();
+
+    var start: u64 = 0;
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelAllocateMainDirectMemory(2 * page_size, page_size, 3, &start),
+    );
+    var info = DirectMemoryQueryInfo{};
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelDirectMemoryQuery(@intCast(start), 0, &info, @sizeOf(DirectMemoryQueryInfo)),
+    );
+    try testing.expectEqual(@as(i64, @intCast(start)), info.start);
+    try testing.expectEqual(@as(i64, @intCast(start + 2 * page_size)), info.end);
+    try testing.expectEqual(@as(i32, 3), info.memory_type);
+    try testing.expectEqual(errno.ok, sceKernelCheckedReleaseDirectMemory(start, 2 * page_size));
 }
 
 test "direct memory maps at an exact guest address" {

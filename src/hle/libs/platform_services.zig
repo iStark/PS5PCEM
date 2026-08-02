@@ -38,19 +38,6 @@ fn netCtlGetInfo(
     return errno.KernelError.enosys.raw();
 }
 
-fn systemServiceParamGetInt(param_id: i32, output: ?*i32) callconv(abi.guest) i32 {
-    const value = output orelse return errno.KernelError.einval.raw();
-    value.* = switch (param_id) {
-        1 => 1, // English (US)
-        2 => 1, // DD/MM/YYYY
-        3 => 1, // 24-hour clock
-        4 => 0, // UTC timezone, in minutes
-        5 => 0, // daylight saving disabled
-        else => 0,
-    };
-    return errno.ok;
-}
-
 fn rtcGetCurrentTick(output: ?*u64) callconv(abi.guest) i32 {
     const value = output orelse return errno.KernelError.einval.raw();
     const unix_microseconds = @divTrunc(
@@ -72,12 +59,6 @@ const net_ctl_exports = [_]symbols.Export{.{
     .expect_id = "obuxdTiwkF8",
 }};
 
-const system_service_exports = [_]symbols.Export{.{
-    .name = "sceSystemServiceParamGetInt",
-    .function = abi.erase(&systemServiceParamGetInt),
-    .expect_id = "fZo48un7LK4",
-}};
-
 const rtc_exports = [_]symbols.Export{.{
     .name = "sceRtcGetCurrentTick",
     .function = abi.erase(&rtcGetCurrentTick),
@@ -96,12 +77,6 @@ pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!voi
         .{ .name = "libSceNetCtl", .version = 1 },
         .{ .name = "libSceNetCtl", .version_major = 1, .version_minor = 1 },
         &net_ctl_exports,
-    );
-    try db.addLibrary(
-        gpa,
-        .{ .name = "libSceSystemService", .version = 1 },
-        .{ .name = "libSceSystemService", .version_major = 1, .version_minor = 1 },
-        &system_service_exports,
     );
     try db.addLibrary(
         gpa,
