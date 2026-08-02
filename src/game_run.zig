@@ -118,6 +118,14 @@ fn run(init: std.process.Init) !bool {
         allocator.free(unwind_modules);
     }
 
+    // Titles load some of their own modules by path once running; everything is
+    // already mapped, so the request has to resolve to what exists.
+    const loaded_modules = try graph.publishModules(allocator);
+    defer {
+        runtime.firmware.modules.detach();
+        allocator.free(loaded_modules);
+    }
+
     try emu.enableNativeCpuDispatcher(io);
     const prepared = try emu.prepareInitialThread("eboot-main");
     defer emu.releaseInitialThread(prepared.handle) catch {};

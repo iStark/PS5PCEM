@@ -180,6 +180,58 @@ pub const ModuleGraph = struct {
         return published;
     }
 
+    /// Publishes the loaded modules so a title can ask for them by path.
+    ///
+    /// Titles load some of their own modules explicitly instead of through the
+    /// dynamic tables. Everything adjacent to the executable is already mapped
+    /// and relocated by then, so the request resolves to what exists rather
+    /// than loading a second copy with its own relocations and duplicate state.
+    ///
+    /// The returned list backs the published registry and must outlive the
+    /// process; the caller owns it.
+    pub fn publishModules(
+        self: *ModuleGraph,
+        gpa: std.mem.Allocator,
+    ) std.mem.Allocator.Error![]hle.modules.Module {
+        var list: std.ArrayList(hle.modules.Module) = .empty;
+        errdefer list.deinit(gpa);
+
+        var next_handle: i32 = hle.modules.executable_handle + 1;
+        for (self.nodes.items, 0..) |*node, index| {
+            const mapped = if (node.mapped) |*m| m else continue;
+
+            var start: u64 = std.math.maxInt(u64);
+            var end: u64 = 0;
+            for (mapped.ranges.items) |range| {
+                start = @min(start, range.start);
+                end = @max(end, range.end);
+            }
+            if (end == 0) continue;
+
+            // The executable keeps the handle titles treat as the process
+            // image; libraries are numbered after it.
+            const handle = if (index == self.root_index)
+                hle.modules.executable_handle
+            else handle: {
+                const value = next_handle;
+                next_handle += 1;
+                break :handle value;
+            };
+
+            try list.append(gpa, .{
+                .handle = handle,
+                .path = node.path,
+                .load_bias = mapped.load_bias,
+                .start = start,
+                .end = end,
+            });
+        }
+
+        const published = try list.toOwnedSlice(gpa);
+        hle.modules.attach(published);
+        return published;
+    }
+
     /// Builds an address-to-symbol map covering every mapped module.
     ///
     /// Exports are re-collected rather than read back from the shared registry:

@@ -15,6 +15,7 @@ const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const unwind = @import("../unwind.zig");
+const modules = @import("../modules.zig");
 const memory_api = @import("kernel_memory.zig");
 const threading = @import("kernel_threading.zig");
 
@@ -124,6 +125,51 @@ fn posixUnsupported(
 ) callconv(abi.guest) i64 {
     setErrno(errno.Posix.enosys);
     return -1;
+}
+
+/// Returns the handle of a module the title asks for by path.
+///
+/// Titles load some of their own modules explicitly rather than through the
+/// dynamic tables, then use the returned handle to resolve symbols. Every
+/// module adjacent to the executable is already mapped and relocated by the
+/// time guest code runs, so this names what exists instead of loading anything:
+/// loading again would produce a second copy with its own relocations and
+/// duplicate state the title expects to be shared.
+///
+/// `result` receives what the module's entry point returned. Reporting success
+/// there is accurate — initializers ran during loading — and titles check it.
+fn loadStartModule(
+    path: ?[*:0]const u8,
+    _: u64,
+    _: u64,
+    _: u32,
+    _: u64,
+    result: ?*i32,
+) callconv(abi.guest) i32 {
+    const name = path orelse return KernelError.efault.raw();
+    const loaded = modules.findByPath(std.mem.span(name)) orelse
+        return KernelError.enoent.raw();
+
+    if (result) |out| out.* = errno.ok;
+    return loaded.handle;
+}
+
+/// Accepts a request to stop and unload a module.
+///
+/// Nothing is unloaded: modules stay mapped for the life of the process, and a
+/// title that unloads one is usually shutting down. Reporting failure here
+/// would make an orderly teardown look like an error.
+fn stopUnloadModule(
+    handle: i32,
+    _: u64,
+    _: u64,
+    _: u32,
+    _: u64,
+    result: ?*i32,
+) callconv(abi.guest) i32 {
+    if (modules.findByHandle(handle) == null) return KernelError.esrch.raw();
+    if (result) |out| out.* = errno.ok;
+    return errno.ok;
 }
 
 /// Reports which module owns an address and where its unwind tables are.
@@ -524,8 +570,8 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceKernelWaitSema", .function = trace.wrap("sceKernelWaitSema", &kernelUnsupported), .expect_id = "Zxa0VhQVTsk" },
     .{ .name = "sceKernelClearEventFlag", .function = trace.wrap("sceKernelClearEventFlag", &kernelUnsupported), .expect_id = "7uhBFWRAS60" },
     .{ .name = "sceKernelDlsym", .function = trace.wrap("sceKernelDlsym", &kernelUnsupported), .expect_id = "LwG8g3niqwA" },
-    .{ .name = "sceKernelLoadStartModule", .function = trace.wrap("sceKernelLoadStartModule", &kernelUnsupported), .expect_id = "wzvqT4UqKX8" },
-    .{ .name = "sceKernelStopUnloadModule", .function = trace.wrap("sceKernelStopUnloadModule", &kernelUnsupported), .expect_id = "QKd0qM58Qes" },
+    .{ .name = "sceKernelLoadStartModule", .function = trace.wrap("sceKernelLoadStartModule", &loadStartModule), .expect_id = "wzvqT4UqKX8" },
+    .{ .name = "sceKernelStopUnloadModule", .function = trace.wrap("sceKernelStopUnloadModule", &stopUnloadModule), .expect_id = "QKd0qM58Qes" },
     .{ .name = "sceKernelGetProcessTimeCounter", .function = trace.wrap("sceKernelGetProcessTimeCounter", &getProcessTimeCounter), .expect_id = "fgxnMeTNUtY" },
     .{ .name = "sceKernelGetProcessTimeCounterFrequency", .function = trace.wrap("sceKernelGetProcessTimeCounterFrequency", &getProcessTimeCounterFrequency), .expect_id = "BNowx2l588E" },
     .{ .name = "unknown_libkernel_B2n8aDorSH4", .function = trace.wrap("unknown_libkernel_B2n8aDorSH4", &kernelUnsupported), .id_override = "B2n8aDorSH4" },
