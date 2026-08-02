@@ -12,19 +12,23 @@ const memory = @import("memory");
 const elf = @import("elf.zig");
 const dynamic = @import("dynamic.zig");
 const linker = @import("linker.zig");
+const tls = @import("tls.zig");
 
 pub const Error = error{
     NoLoadSegments,
     InvalidLoadSegment,
     AddressOverflow,
     EntryPointUnmapped,
-} || elf.Error || linker.Error || memory.Error || std.mem.Allocator.Error;
+} || elf.Error || linker.Error || tls.Error || memory.Error || std.mem.Allocator.Error;
 
 pub const Options = struct {
     /// Added to every segment virtual address, relocation target, and entry
     /// point. Fixed executables normally use zero; shared modules receive a
     /// caller-selected base.
     load_bias: u64 = 0,
+    /// Process-wide TLS registry. Without one, ordinary images still load, but
+    /// a TLS relocation reports that no module identity is available.
+    tls_registry: ?*tls.Registry = null,
 };
 
 pub const MappedImage = struct {
@@ -33,6 +37,8 @@ pub const MappedImage = struct {
     load_bias: u64,
     entry_point: u64,
     relocation_stats: linker.Stats,
+    tls_registry: ?*tls.Registry = null,
+    tls_module: ?tls.Module = null,
     ranges: std.ArrayList(memory.Range) = .empty,
 
     /// Releases every committed range while retaining the process-wide outer
@@ -46,6 +52,7 @@ pub const MappedImage = struct {
         }
         self.ranges.deinit(self.allocator);
         self.ranges = .empty;
+        self.unregisterTls();
     }
 
     /// Best-effort teardown for defer paths. Use `unload` when an error must be
@@ -59,6 +66,15 @@ pub const MappedImage = struct {
         }
         self.ranges.deinit(self.allocator);
         self.ranges = .empty;
+        self.unregisterTls();
+    }
+
+    fn unregisterTls(self: *MappedImage) void {
+        if (self.tls_registry) |registry| {
+            if (self.tls_module) |module| registry.unregister(self.allocator, module.id);
+        }
+        self.tls_registry = null;
+        self.tls_module = null;
     }
 };
 
@@ -189,6 +205,11 @@ pub fn load(
         if (file_bytes.len != 0) try address_space.write(plan.address, file_bytes);
     }
 
+    if (options.tls_registry) |registry| {
+        mapped.tls_registry = registry;
+        mapped.tls_module = try registry.registerImage(allocator, image, info);
+    }
+
     mapped.relocation_stats = try linker.apply(
         allocator,
         address_space,
@@ -196,6 +217,7 @@ pub fn load(
         info,
         options.load_bias,
         resolver,
+        mapped.tls_module,
     );
 
     for (final_runs.items) |run| {

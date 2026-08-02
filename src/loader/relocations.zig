@@ -54,7 +54,7 @@ pub const Type = enum(u32) {
     /// addend field is present but not part of the result.
     pub fn usesAddend(self: Type) bool {
         return switch (self) {
-            .glob_dat, .jump_slot => false,
+            .glob_dat, .jump_slot, .dtpmod64 => false,
             else => true,
         };
     }
@@ -127,6 +127,7 @@ test "relative relocations reference no symbol" {
 test "GOT and PLT slots ignore the addend" {
     try testing.expect(!Type.glob_dat.usesAddend());
     try testing.expect(!Type.jump_slot.usesAddend());
+    try testing.expect(!Type.dtpmod64.usesAddend());
     try testing.expect(Type.direct_64.usesAddend());
     try testing.expect(Type.relative.usesAddend());
 }

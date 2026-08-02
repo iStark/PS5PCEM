@@ -15,6 +15,7 @@ const dynamic = @import("dynamic.zig");
 const symbols = @import("symbols.zig");
 const relocations = @import("relocations.zig");
 const imports = @import("imports.zig");
+const tls = @import("tls.zig");
 
 pub const Error = error{
     MalformedTable,
@@ -22,6 +23,9 @@ pub const Error = error{
     UnsupportedRelocation,
     UnresolvedImport,
     RelocationTargetUnavailable,
+    TlsModuleUnavailable,
+    InvalidTlsSymbol,
+    InvalidTlsOffset,
 } || elf.Error || symbols.Error || relocations.Error || imports.Error || memory.Error ||
     std.mem.Allocator.Error;
 
@@ -30,9 +34,18 @@ pub const Error = error{
 pub const Resolver = struct {
     context: ?*anyopaque = null,
     resolve_fn: *const fn (context: ?*anyopaque, import: *const imports.Import) ?u64,
+    resolve_tls_fn: ?*const fn (
+        context: ?*anyopaque,
+        import: *const imports.Import,
+    ) ?tls.ResolvedSymbol = null,
 
     pub fn resolve(self: Resolver, import: *const imports.Import) ?u64 {
         return self.resolve_fn(self.context, import);
+    }
+
+    pub fn resolveTls(self: Resolver, import: *const imports.Import) ?tls.ResolvedSymbol {
+        const resolve_fn = self.resolve_tls_fn orelse return null;
+        return resolve_fn(self.context, import);
     }
 };
 
@@ -41,6 +54,7 @@ pub const Stats = struct {
     relative: usize = 0,
     local_symbols: usize = 0,
     imported_symbols: usize = 0,
+    tls: usize = 0,
     ignored: usize = 0,
 };
 
@@ -52,6 +66,7 @@ pub fn apply(
     info: *const dynamic.DynamicInfo,
     load_bias: u64,
     resolver: ?Resolver,
+    tls_module: ?tls.Module,
 ) Error!Stats {
     const dynlib_data = (try image.dynlibData()) orelse return .{};
     const symbol_bytes = try tableSlice(dynlib_data, info.symtab_offset, info.symtab_size);
@@ -70,6 +85,7 @@ pub fn apply(
             &module_imports,
             load_bias,
             resolver,
+            tls_module,
             &stats,
         );
     }
@@ -83,6 +99,7 @@ pub fn apply(
             &module_imports,
             load_bias,
             resolver,
+            tls_module,
             &stats,
         );
     }
@@ -104,6 +121,7 @@ fn applyTable(
     module_imports: *const imports.Imports,
     load_bias: u64,
     resolver: ?Resolver,
+    tls_module: ?tls.Module,
     stats: *Stats,
 ) Error!void {
     for (table.entries) |rela| {
@@ -144,10 +162,52 @@ fn applyTable(
                 else
                     symbol_address;
             },
-            // TLS records need a per-thread module registry rather than a plain
-            // symbol address. Reject them until that registry exists; writing an
-            // ordinary pointer here would create a much harder-to-debug fault.
-            .dtpmod64, .dtpoff64, .tpoff64 => return Error.UnsupportedRelocation,
+            .dtpmod64, .dtpoff64, .tpoff64 => blk: {
+                const symbol = try symbol_table.at(rela.symbolIndex());
+                if (rela.symbolIndex() != 0 and symbol.symbolType() != .tls) {
+                    return Error.InvalidTlsSymbol;
+                }
+                const resolved = if (rela.symbolIndex() == 0 or symbol.isDefined()) local: {
+                    const module = tls_module orelse return Error.TlsModuleUnavailable;
+                    stats.local_symbols += 1;
+                    break :local tls.ResolvedSymbol{
+                        .module = module,
+                        .offset = symbol.value,
+                    };
+                } else external: {
+                    const import = findImport(module_imports, rela.offset, table.kind) orelse {
+                        if (symbol.binding() == .weak) break :blk 0;
+                        return Error.UnresolvedImport;
+                    };
+                    const resolution = if (resolver) |r| r.resolveTls(import) orelse {
+                        if (symbol.binding() == .weak) break :blk 0;
+                        return Error.UnresolvedImport;
+                    } else {
+                        if (symbol.binding() == .weak) break :blk 0;
+                        return Error.UnresolvedImport;
+                    };
+                    stats.imported_symbols += 1;
+                    break :external resolution;
+                };
+
+                if (resolved.offset >= resolved.module.memory_size) {
+                    return Error.InvalidTlsOffset;
+                }
+                if (resolved.module.static_offset < resolved.module.memory_size) {
+                    return Error.InvalidTlsOffset;
+                }
+                stats.tls += 1;
+                if (relocation_type == .dtpmod64) break :blk resolved.module.id;
+
+                const module_offset = try addSigned(resolved.offset, rela.addend);
+                if (module_offset >= resolved.module.memory_size) {
+                    return Error.InvalidTlsOffset;
+                }
+                break :blk if (relocation_type == .tpoff64)
+                    module_offset -% resolved.module.static_offset
+                else
+                    module_offset;
+            },
             _ => return Error.UnsupportedRelocation,
         };
 
@@ -251,6 +311,7 @@ test "relative, local, and imported relocations write mapped guest memory" {
         &module_imports,
         load_bias,
         .{ .resolve_fn = testResolve },
+        null,
         &stats,
     );
 
@@ -266,4 +327,115 @@ test "relative, local, and imported relocations write mapped guest memory" {
     try testing.expectEqual(@as(usize, 1), stats.relative);
     try testing.expectEqual(@as(usize, 1), stats.local_symbols);
     try testing.expectEqual(@as(usize, 1), stats.imported_symbols);
+}
+
+fn testResolveTls(_: ?*anyopaque, import: *const imports.Import) ?tls.ResolvedSymbol {
+    if (!std.mem.eql(u8, import.id, "external-tls")) return null;
+    return .{
+        .module = .{
+            .id = 9,
+            .memory_size = 0x80,
+            .alignment = 0x10,
+            .alignment_bias = 0,
+            .static_offset = 0x100,
+        },
+        .offset = 0x28,
+    };
+}
+
+test "TLS relocations encode local and imported Variant II values" {
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    const load_bias = memory.system_managed.start;
+    try address_space.mapFixed(load_bias, memory.page_size, .read_write, .module, null);
+
+    const symbol_entries = [_]symbols.Sym{
+        .{ .name = 0, .info = 0, .other = 0, .shndx = 0, .value = 0, .size = 0 },
+        .{ .name = 0, .info = 0x06, .other = 0, .shndx = 1, .value = 0x20, .size = 8 },
+        .{ .name = 0, .info = 0x16, .other = 0, .shndx = 0, .value = 0, .size = 8 },
+    };
+    const relocation_entries = [_]relocations.Rela{
+        .{
+            .offset = 0,
+            .info = (@as(u64, 1) << 32) | @intFromEnum(relocations.Type.dtpmod64),
+            .addend = 0,
+        },
+        .{
+            .offset = 8,
+            .info = (@as(u64, 1) << 32) | @intFromEnum(relocations.Type.dtpoff64),
+            .addend = 8,
+        },
+        .{
+            .offset = 16,
+            .info = (@as(u64, 1) << 32) | @intFromEnum(relocations.Type.tpoff64),
+            .addend = 8,
+        },
+        .{
+            .offset = 24,
+            .info = (@as(u64, 2) << 32) | @intFromEnum(relocations.Type.dtpmod64),
+            .addend = 0,
+        },
+        .{
+            .offset = 32,
+            .info = (@as(u64, 2) << 32) | @intFromEnum(relocations.Type.tpoff64),
+            .addend = 8,
+        },
+    };
+
+    var module_imports = imports.Imports{};
+    defer module_imports.deinit(testing.allocator);
+    for ([_]struct { u64, relocations.Type }{
+        .{ 24, .dtpmod64 },
+        .{ 32, .tpoff64 },
+    }) |entry| {
+        try module_imports.items.append(testing.allocator, .{
+            .id = "external-tls",
+            .library = "libtls",
+            .library_version = 1,
+            .module = "tlsmod",
+            .library_code = "A",
+            .module_code = "A",
+            .symbol_type = .tls,
+            .relocation_type = entry[1],
+            .table = .general,
+            .target_offset = entry[0],
+            .addend = 0,
+        });
+    }
+
+    const local_module = tls.Module{
+        .id = 3,
+        .memory_size = 0x80,
+        .alignment = 0x10,
+        .alignment_bias = 0,
+        .static_offset = 0x80,
+    };
+    var stats = Stats{};
+    try applyTable(
+        &address_space,
+        .{ .entries = &relocation_entries, .kind = .general },
+        .{ .entries = &symbol_entries },
+        &module_imports,
+        load_bias,
+        .{ .resolve_fn = testResolve, .resolve_tls_fn = testResolveTls },
+        local_module,
+        &stats,
+    );
+
+    var output: [40]u8 = undefined;
+    try address_space.read(load_bias, &output);
+    try testing.expectEqual(@as(u64, 3), std.mem.readInt(u64, output[0..8], .little));
+    try testing.expectEqual(@as(u64, 0x28), std.mem.readInt(u64, output[8..16], .little));
+    try testing.expectEqual(
+        0 -% @as(u64, 0x58),
+        std.mem.readInt(u64, output[16..24], .little),
+    );
+    try testing.expectEqual(@as(u64, 9), std.mem.readInt(u64, output[24..32], .little));
+    try testing.expectEqual(
+        0 -% @as(u64, 0xd0),
+        std.mem.readInt(u64, output[32..40], .little),
+    );
+    try testing.expectEqual(@as(usize, 5), stats.tls);
+    try testing.expectEqual(@as(usize, 3), stats.local_symbols);
+    try testing.expectEqual(@as(usize, 2), stats.imported_symbols);
 }

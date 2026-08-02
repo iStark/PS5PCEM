@@ -321,6 +321,7 @@ bits, version below it, and a string table offset in the low 32.
 | [src/loader/relocations.zig](src/loader/relocations.zig) | Relocation entries and their types |
 | [src/loader/imports.zig](src/loader/imports.zig) | Walks all of the above into a list of imports |
 | [src/loader/linker.zig](src/loader/linker.zig) | Resolves symbols and writes RELA results |
+| [src/loader/tls.zig](src/loader/tls.zig) | Owns `PT_TLS` templates, module IDs, and static Variant II layout |
 | [src/loader/image_loader.zig](src/loader/image_loader.zig) | Maps segments, copies bytes, links, and finalizes protections |
 
 Validation is deliberately strict — a module that fails these checks is not
@@ -365,13 +366,27 @@ The following x86-64 RELA forms are applied:
 | `R_X86_64_64` | resolved symbol address plus addend |
 | `R_X86_64_GLOB_DAT` | resolved symbol address |
 | `R_X86_64_JUMP_SLOT` | resolved callable address |
+| `R_X86_64_DTPMOD64` | TLS ID of the module defining the symbol |
+| `R_X86_64_DTPOFF64` | module-relative TLS symbol offset plus addend |
+| `R_X86_64_TPOFF64` | module-relative offset minus its static thread-pointer offset |
 
 Defined symbols resolve inside the mapped module. Undefined symbols go through
 the caller's `loader.Resolver`; unresolved strong symbols abort the load, while
-unresolved weak symbols become zero. TLS relocations are rejected explicitly
-until the runtime has a per-thread TLS module registry. Treating an ordinary
-function address as a TLS offset would appear to load successfully and fail much
-later, so it is not used as a fallback.
+unresolved weak symbols become zero. TLS imports use a separate resolver path:
+an ordinary function address is never accepted as a TLS offset.
+
+Every image with a non-empty `PT_TLS` segment receives a stable, non-zero module
+ID. The process registry copies its initialized `tdata`, records the zero-filled
+`tbss` extent, and lays modules out below the thread pointer according to AMD64
+TLS Variant II. The layout preserves both module alignment and the ELF
+`p_vaddr` alignment bias. Unloading removes the template and exports but does
+not renumber modules or repack surviving offsets, because relocation results
+already written into memory must remain valid.
+
+The registry exposes the saved initialization image for thread creation, but it
+does not allocate per-thread blocks yet. Thread bootstrap will zero each module's
+full memory size, overlay `tdata`, build the dynamic thread vector, and install
+the guest FS base.
 
 ---
 
@@ -493,9 +508,9 @@ from leaking into host code where nothing would check it.
 
 ## Roadmap
 
-1. A TLS module registry for `DTPMOD64`, `DTPOFF64`, and `TPOFF64` relocations.
-2. Threading: the `pthread_*` and `scePthread*` families.
-3. Event queues, on which most firmware asynchrony is built.
+1. Thread bootstrap: seed static TLS/DTV state, install the guest FS base, then
+   implement the `pthread_*` and `scePthread*` families.
+2. Event queues, on which most firmware asynchrony is built.
 
 ---
 
@@ -504,9 +519,10 @@ from leaking into host code where nothing would check it.
 [src/runtime/root.zig](src/runtime/root.zig) owns the dependency direction that
 does not belong in any lower-level module. It creates one `memory.AddressSpace`
 with the sparse direct-memory backing store, connects it to libkernel, registers
-all HLE exports, and adapts `hle.Database` to `loader.Resolver`. Exact
-library/module/version metadata is used first; the identifier-only lookup
-remains the documented fallback for incomplete module metadata.
+all HLE exports, owns the process TLS registry, and adapts both registries to
+`loader.Resolver`. Exact library/module/version metadata is used first; the
+identifier-only HLE lookup remains the documented fallback for incomplete
+module metadata. A mapped image unregisters its TLS template when it unloads.
 
 ```zig
 const runtime = @import("runtime");
