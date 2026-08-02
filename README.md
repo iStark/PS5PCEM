@@ -17,13 +17,14 @@ cross-compiles to Windows, Linux, and macOS. Direct guest execution currently
 requires Windows x86-64; the other targets still build the inspection and HLE
 layers but report the native bridge as unsupported.
 
-Three command-line tools come with them:
+Four command-line tools come with them:
 
 ```sh
 zig build run         -- shader.bin    # disassemble a shader
 zig build module-info -- eboot.bin     # inspect a bare ELF or decrypted PS5 SELF
 zig build module-info -- eboot.bin sce_module/libc.prx # include a guest provider
 zig build graph-info  -- eboot.bin     # map and relocate the reachable PRX graph
+zig build game-run    -- eboot.bin     # load, initialize, and enter the title
 ```
 
 `module-info` is where the pieces meet. It reads a module, works out every
@@ -621,6 +622,26 @@ queries, and live pthread scheduling metadata are also exposed. File and APR
 entry points are linkable but return `ENOSYS` until the runtime owns a guest VFS
 and accelerator backend; they never fabricate successful I/O.
 
+**Offline network, dialogs, and headless audio**
+([src/hle/libs/network.zig](src/hle/libs/network.zig),
+[src/hle/libs/dialogs.zig](src/hle/libs/dialogs.zig),
+[src/hle/libs/audio.zig](src/hle/libs/audio.zig))
+
+Net, SSL, HTTP/HTTP2, and NP Web API preserve their normal context and request
+lifecycles without opening host sockets. Local URI parsing remains available,
+while DNS and peer traffic return deterministic offline errors. NetCtl reports
+a disconnected interface. Common, message, web-browser, and IME dialogs finish
+immediately with coherent headless results instead of blocking on unavailable
+UI.
+
+AudioOut, AudioIn, and AudioOut2 expose paced silent ports and queues. AJM
+accepts the title's batch lifecycle and emits zeroed PCM so audio setup cannot
+deadlock the process. It is a compatibility decoder, not ATRAC9/MP3 decoding,
+and there is no host sound-device output yet. The additional early-bootstrap
+surface in [src/hle/libs/bootstrap_services.zig](src/hle/libs/bootstrap_services.zig)
+provides headless VideoOut/AvPlayer state and conservative platform/GPU command
+stubs solely to reach native title initialization; it does not render frames.
+
 ## Error codes
 
 Two numbering schemes coexist in the guest ABI, and mixing them up is a common
@@ -699,7 +720,7 @@ but mixed guest/HLE frames do not yet have an unwind-safe import transition and
 unrecognized illegal instructions still stop execution. Arbitrary `eboot.bin`
 execution is therefore not safe yet. Linux and macOS need a different
 FS/HLE-transition strategy because their host TLS rules differ. GPU submission
-and audio callbacks consequently remain beyond the current title bootstrap.
+and host audio output consequently remain beyond the current title bootstrap.
 
 ## Roadmap
 
@@ -726,6 +747,13 @@ relocates it. Missing files remain firmware/HLE dependencies. The resulting
 module list is already in dependency-first initializer order. Optional graph
 diagnostics report every unresolved strong import in the node that stops
 linking; the `graph-info` tool enables them by default.
+
+`game-run` continues from that verified graph, initializes the native CPU
+bridge and enters the title while reporting contained guest faults with the
+active initializer, registers, stack words, and relocation context. Position-
+dependent executables which access the PS5 null/low-address window still need
+address translation or instruction fixups on Windows, where those pages cannot
+be identity-mapped.
 
 ```zig
 const runtime = @import("runtime");
