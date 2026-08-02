@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const abi = @import("../abi.zig");
+const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 
@@ -141,20 +142,20 @@ fn getAccessibilityZoomFollowFocus(user_id: i32, output: ?*i32) callconv(abi.gue
 }
 
 pub const exports = [_]symbols.Export{
-    .{ .name = "sceUserServiceInitialize", .function = abi.erase(&initialize), .expect_id = "j3YMu1MVNNo" },
-    .{ .name = "sceUserServiceTerminate", .function = abi.erase(&terminate), .expect_id = "bwFjS+bX9mA" },
-    .{ .name = "sceUserServiceGetInitialUser", .function = abi.erase(&getInitialUser), .expect_id = "CdWp0oHWGr0" },
-    .{ .name = "sceUserServiceGetEvent", .function = abi.erase(&getEvent), .expect_id = "yH17Q6NWtVg" },
-    .{ .name = "sceUserServiceGetLoginUserIdList", .function = abi.erase(&getLoginUserIdList), .expect_id = "fPhymKNvK-A" },
-    .{ .name = "sceUserServiceGetUserName", .function = abi.erase(&getUserName), .expect_id = "1xxcMiGu2fo" },
-    .{ .name = "sceUserServiceGetGamePresets", .function = abi.erase(&getGamePresets), .expect_id = "-sD02mFDBh4" },
-    .{ .name = "sceUserServiceGetAgeLevel", .function = abi.erase(&getAgeLevel), .expect_id = "woNpu+45RLk" },
-    .{ .name = "sceUserServiceGetAccessibilityChatTranscription", .function = abi.erase(&getGameAccessibilityChatTranscription), .expect_id = "rnEhHqG-4xo" },
-    .{ .name = "sceUserServiceGetAccessibilityPressAndHoldDelay", .function = abi.erase(&getAccessibilityPressAndHoldDelay), .expect_id = "ZKJtxdgvzwg" },
-    .{ .name = "sceUserServiceGetAccessibilityVibration", .function = abi.erase(&getAccessibilityVibration), .expect_id = "qWYHOFwqCxY" },
-    .{ .name = "sceUserServiceGetAccessibilityTriggerEffect", .function = abi.erase(&getAccessibilityTriggerEffect), .expect_id = "-3Y5GO+-i78" },
-    .{ .name = "sceUserServiceGetAccessibilityZoomEnabled", .function = abi.erase(&getAccessibilityZoomEnabled), .expect_id = "hD-H81EN9Vg" },
-    .{ .name = "sceUserServiceGetAccessibilityZoomFollowFocus", .function = abi.erase(&getAccessibilityZoomFollowFocus), .expect_id = "O6IW1-Dwm-w" },
+    .{ .name = "sceUserServiceInitialize", .function = trace.wrap("sceUserServiceInitialize", &initialize), .expect_id = "j3YMu1MVNNo" },
+    .{ .name = "sceUserServiceTerminate", .function = trace.wrap("sceUserServiceTerminate", &terminate), .expect_id = "bwFjS+bX9mA" },
+    .{ .name = "sceUserServiceGetInitialUser", .function = trace.wrap("sceUserServiceGetInitialUser", &getInitialUser), .expect_id = "CdWp0oHWGr0" },
+    .{ .name = "sceUserServiceGetEvent", .function = trace.wrap("sceUserServiceGetEvent", &getEvent), .expect_id = "yH17Q6NWtVg" },
+    .{ .name = "sceUserServiceGetLoginUserIdList", .function = trace.wrap("sceUserServiceGetLoginUserIdList", &getLoginUserIdList), .expect_id = "fPhymKNvK-A" },
+    .{ .name = "sceUserServiceGetUserName", .function = trace.wrap("sceUserServiceGetUserName", &getUserName), .expect_id = "1xxcMiGu2fo" },
+    .{ .name = "sceUserServiceGetGamePresets", .function = trace.wrap("sceUserServiceGetGamePresets", &getGamePresets), .expect_id = "-sD02mFDBh4" },
+    .{ .name = "sceUserServiceGetAgeLevel", .function = trace.wrap("sceUserServiceGetAgeLevel", &getAgeLevel), .expect_id = "woNpu+45RLk" },
+    .{ .name = "sceUserServiceGetAccessibilityChatTranscription", .function = trace.wrap("sceUserServiceGetAccessibilityChatTranscription", &getGameAccessibilityChatTranscription), .expect_id = "rnEhHqG-4xo" },
+    .{ .name = "sceUserServiceGetAccessibilityPressAndHoldDelay", .function = trace.wrap("sceUserServiceGetAccessibilityPressAndHoldDelay", &getAccessibilityPressAndHoldDelay), .expect_id = "ZKJtxdgvzwg" },
+    .{ .name = "sceUserServiceGetAccessibilityVibration", .function = trace.wrap("sceUserServiceGetAccessibilityVibration", &getAccessibilityVibration), .expect_id = "qWYHOFwqCxY" },
+    .{ .name = "sceUserServiceGetAccessibilityTriggerEffect", .function = trace.wrap("sceUserServiceGetAccessibilityTriggerEffect", &getAccessibilityTriggerEffect), .expect_id = "-3Y5GO+-i78" },
+    .{ .name = "sceUserServiceGetAccessibilityZoomEnabled", .function = trace.wrap("sceUserServiceGetAccessibilityZoomEnabled", &getAccessibilityZoomEnabled), .expect_id = "hD-H81EN9Vg" },
+    .{ .name = "sceUserServiceGetAccessibilityZoomFollowFocus", .function = trace.wrap("sceUserServiceGetAccessibilityZoomFollowFocus", &getAccessibilityZoomFollowFocus), .expect_id = "O6IW1-Dwm-w" },
 };
 
 pub const library = symbols.Library{ .name = "libSceUserService", .version = 1 };

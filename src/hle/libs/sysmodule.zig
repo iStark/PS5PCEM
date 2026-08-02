@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const abi = @import("../abi.zig");
+const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 
@@ -27,11 +28,11 @@ fn loadModule(_: u32) callconv(abi.guest) i32 {
 
 pub const exports = [_]symbols.Export{ .{
     .name = "sceSysmoduleGetModuleInfoForUnwind",
-    .function = abi.erase(&getModuleInfoForUnwind),
+    .function = trace.wrap("sceSysmoduleGetModuleInfoForUnwind", &getModuleInfoForUnwind),
     .expect_id = "4fU5yvOkVG4",
 }, .{
     .name = "sceSysmoduleLoadModule",
-    .function = abi.erase(&loadModule),
+    .function = trace.wrap("sceSysmoduleLoadModule", &loadModule),
     .expect_id = "g8cM39EUZ6o",
 } };
 

@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const abi = @import("../abi.zig");
+const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 
@@ -142,26 +143,26 @@ fn unavailable(
 }
 
 pub const exports = [_]symbols.Export{
-    .{ .name = "sceSystemServiceParamGetInt", .function = abi.erase(&paramGetInt), .expect_id = "fZo48un7LK4" },
-    .{ .name = "sceSystemServiceParamGetString", .function = abi.erase(&paramGetString), .expect_id = "SsC-m-S9JTA" },
-    .{ .name = "sceSystemServiceReceiveEvent", .function = abi.erase(&receiveEvent), .expect_id = "656LMQSrg6U" },
-    .{ .name = "sceSystemServiceGetStatus", .function = abi.erase(&getStatus), .expect_id = "rPo6tV8D9bM" },
-    .{ .name = "sceSystemServiceGetDisplaySafeAreaInfo", .function = abi.erase(&getDisplaySafeAreaInfo), .expect_id = "1n37q1Bvc5Y" },
-    .{ .name = "sceSystemServiceGetHdrToneMapLuminance", .function = abi.erase(&getHdrToneMapLuminance), .expect_id = "mPpPxv5CZt4" },
-    .{ .name = "sceSystemServiceGetNoticeScreenSkipFlag", .function = abi.erase(&getNoticeScreenSkipFlag), .expect_id = "3RQ5aQfnstU" },
-    .{ .name = "sceSystemServiceSetNoticeScreenSkipFlag", .function = abi.erase(&setNoticeScreenSkipFlag), .expect_id = "Q3utJvma4Mo" },
-    .{ .name = "sceSystemServiceDisableNoticeScreenSkipFlagAutoSet", .function = abi.erase(&disableNoticeScreenSkipFlagAutoSet), .expect_id = "8Lo6Zv94aho" },
-    .{ .name = "sceSystemServiceHideSplashScreen", .function = abi.erase(&hideSplashScreen), .expect_id = "Vo5V8KAwCmk" },
-    .{ .name = "sceSystemServicePowerTick", .function = abi.erase(&powerTick), .expect_id = "XbbJC3E+L5M" },
-    .{ .name = "sceSystemServiceReportAbnormalTermination", .function = abi.erase(&reportAbnormalTermination), .expect_id = "3s8cHiCBKBE" },
-    .{ .name = "sceSystemServiceDisableMusicPlayer", .function = abi.erase(&disableMusicPlayer), .expect_id = "x1UB9bwDSOw" },
-    .{ .name = "sceSystemServiceReenableMusicPlayer", .function = abi.erase(&reenableMusicPlayer), .expect_id = "9kPCz7Or+1Y" },
-    .{ .name = "sceSystemServiceLoadExec", .function = abi.erase(&unavailable), .expect_id = "JoBqSQt1yyA" },
-    .{ .name = "sceSystemServiceShowControllerSettings", .function = abi.erase(&unavailable), .expect_id = "w9wlKcHrmm8" },
-    .{ .name = "sceSystemServiceInitializePlayerDialogParam", .function = abi.erase(&unavailable), .expect_id = "m5CYKX20wfg" },
-    .{ .name = "sceSystemServiceLaunchPlayerDialog", .function = abi.erase(&unavailable), .expect_id = "uaieF+glFPs" },
-    .{ .name = "sceSystemServiceOpenChallengeActivity", .function = abi.erase(&unavailable), .expect_id = "sPuK5ic3GD4" },
-    .{ .name = "sceSystemServiceOpenTournamentOccurrence", .function = abi.erase(&unavailable), .expect_id = "gELp9ue2ccQ" },
+    .{ .name = "sceSystemServiceParamGetInt", .function = trace.wrap("sceSystemServiceParamGetInt", &paramGetInt), .expect_id = "fZo48un7LK4" },
+    .{ .name = "sceSystemServiceParamGetString", .function = trace.wrap("sceSystemServiceParamGetString", &paramGetString), .expect_id = "SsC-m-S9JTA" },
+    .{ .name = "sceSystemServiceReceiveEvent", .function = trace.wrap("sceSystemServiceReceiveEvent", &receiveEvent), .expect_id = "656LMQSrg6U" },
+    .{ .name = "sceSystemServiceGetStatus", .function = trace.wrap("sceSystemServiceGetStatus", &getStatus), .expect_id = "rPo6tV8D9bM" },
+    .{ .name = "sceSystemServiceGetDisplaySafeAreaInfo", .function = trace.wrap("sceSystemServiceGetDisplaySafeAreaInfo", &getDisplaySafeAreaInfo), .expect_id = "1n37q1Bvc5Y" },
+    .{ .name = "sceSystemServiceGetHdrToneMapLuminance", .function = trace.wrap("sceSystemServiceGetHdrToneMapLuminance", &getHdrToneMapLuminance), .expect_id = "mPpPxv5CZt4" },
+    .{ .name = "sceSystemServiceGetNoticeScreenSkipFlag", .function = trace.wrap("sceSystemServiceGetNoticeScreenSkipFlag", &getNoticeScreenSkipFlag), .expect_id = "3RQ5aQfnstU" },
+    .{ .name = "sceSystemServiceSetNoticeScreenSkipFlag", .function = trace.wrap("sceSystemServiceSetNoticeScreenSkipFlag", &setNoticeScreenSkipFlag), .expect_id = "Q3utJvma4Mo" },
+    .{ .name = "sceSystemServiceDisableNoticeScreenSkipFlagAutoSet", .function = trace.wrap("sceSystemServiceDisableNoticeScreenSkipFlagAutoSet", &disableNoticeScreenSkipFlagAutoSet), .expect_id = "8Lo6Zv94aho" },
+    .{ .name = "sceSystemServiceHideSplashScreen", .function = trace.wrap("sceSystemServiceHideSplashScreen", &hideSplashScreen), .expect_id = "Vo5V8KAwCmk" },
+    .{ .name = "sceSystemServicePowerTick", .function = trace.wrap("sceSystemServicePowerTick", &powerTick), .expect_id = "XbbJC3E+L5M" },
+    .{ .name = "sceSystemServiceReportAbnormalTermination", .function = trace.wrap("sceSystemServiceReportAbnormalTermination", &reportAbnormalTermination), .expect_id = "3s8cHiCBKBE" },
+    .{ .name = "sceSystemServiceDisableMusicPlayer", .function = trace.wrap("sceSystemServiceDisableMusicPlayer", &disableMusicPlayer), .expect_id = "x1UB9bwDSOw" },
+    .{ .name = "sceSystemServiceReenableMusicPlayer", .function = trace.wrap("sceSystemServiceReenableMusicPlayer", &reenableMusicPlayer), .expect_id = "9kPCz7Or+1Y" },
+    .{ .name = "sceSystemServiceLoadExec", .function = trace.wrap("sceSystemServiceLoadExec", &unavailable), .expect_id = "JoBqSQt1yyA" },
+    .{ .name = "sceSystemServiceShowControllerSettings", .function = trace.wrap("sceSystemServiceShowControllerSettings", &unavailable), .expect_id = "w9wlKcHrmm8" },
+    .{ .name = "sceSystemServiceInitializePlayerDialogParam", .function = trace.wrap("sceSystemServiceInitializePlayerDialogParam", &unavailable), .expect_id = "m5CYKX20wfg" },
+    .{ .name = "sceSystemServiceLaunchPlayerDialog", .function = trace.wrap("sceSystemServiceLaunchPlayerDialog", &unavailable), .expect_id = "uaieF+glFPs" },
+    .{ .name = "sceSystemServiceOpenChallengeActivity", .function = trace.wrap("sceSystemServiceOpenChallengeActivity", &unavailable), .expect_id = "sPuK5ic3GD4" },
+    .{ .name = "sceSystemServiceOpenTournamentOccurrence", .function = trace.wrap("sceSystemServiceOpenTournamentOccurrence", &unavailable), .expect_id = "gELp9ue2ccQ" },
 };
 
 pub const library = symbols.Library{ .name = "libSceSystemService", .version = 1 };

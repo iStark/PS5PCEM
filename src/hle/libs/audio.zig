@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const abi = @import("../abi.zig");
+const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const kernel_threading = @import("kernel_threading.zig");
@@ -159,13 +160,13 @@ fn audioOutGetPortState(handle: i32, state: ?*AudioOutPortState) callconv(abi.gu
 }
 
 const audio_out_exports = [_]symbols.Export{
-    .{ .name = "sceAudioOutInit", .function = abi.erase(&audioOutInit), .expect_id = "JfEPXVxhFqA" },
-    .{ .name = "sceAudioOutOpen", .function = abi.erase(&audioOutOpen), .expect_id = "ekNvsT22rsY" },
-    .{ .name = "sceAudioOutSetVolume", .function = abi.erase(&audioOutSetVolume), .expect_id = "b+uAV89IlxE" },
-    .{ .name = "sceAudioOutSetMixLevelPadSpk", .function = abi.erase(&audioOutSetMixLevelPadSpeaker), .expect_id = "wVwPU50pS1c" },
-    .{ .name = "sceAudioOutOutput", .function = abi.erase(&audioOutOutput), .expect_id = "QOQtbeDqsT4" },
-    .{ .name = "sceAudioOutClose", .function = abi.erase(&audioOutClose), .expect_id = "s1--uE9mBFw" },
-    .{ .name = "sceAudioOutGetPortState", .function = abi.erase(&audioOutGetPortState), .expect_id = "GrQ9s4IrNaQ" },
+    .{ .name = "sceAudioOutInit", .function = trace.wrap("sceAudioOutInit", &audioOutInit), .expect_id = "JfEPXVxhFqA" },
+    .{ .name = "sceAudioOutOpen", .function = trace.wrap("sceAudioOutOpen", &audioOutOpen), .expect_id = "ekNvsT22rsY" },
+    .{ .name = "sceAudioOutSetVolume", .function = trace.wrap("sceAudioOutSetVolume", &audioOutSetVolume), .expect_id = "b+uAV89IlxE" },
+    .{ .name = "sceAudioOutSetMixLevelPadSpk", .function = trace.wrap("sceAudioOutSetMixLevelPadSpk", &audioOutSetMixLevelPadSpeaker), .expect_id = "wVwPU50pS1c" },
+    .{ .name = "sceAudioOutOutput", .function = trace.wrap("sceAudioOutOutput", &audioOutOutput), .expect_id = "QOQtbeDqsT4" },
+    .{ .name = "sceAudioOutClose", .function = trace.wrap("sceAudioOutClose", &audioOutClose), .expect_id = "s1--uE9mBFw" },
+    .{ .name = "sceAudioOutGetPortState", .function = trace.wrap("sceAudioOutGetPortState", &audioOutGetPortState), .expect_id = "GrQ9s4IrNaQ" },
 };
 
 fn audioInOpen(_: i32, _: u32, _: u32, frames: u32, frequency: u32, parameter: u32) callconv(abi.guest) i32 {
@@ -196,10 +197,10 @@ fn audioInGetSilentState(handle: i32) callconv(abi.guest) i32 {
 }
 
 const audio_in_exports = [_]symbols.Export{
-    .{ .name = "sceAudioInOpen", .function = abi.erase(&audioInOpen), .expect_id = "5NE8Sjc7VC8" },
-    .{ .name = "sceAudioInInput", .function = abi.erase(&audioInInput), .expect_id = "LozEOU8+anM" },
-    .{ .name = "sceAudioInClose", .function = abi.erase(&audioInClose), .expect_id = "Jh6WbHhnI68" },
-    .{ .name = "sceAudioInGetSilentState", .function = abi.erase(&audioInGetSilentState), .expect_id = "BohEAQ7DlUE" },
+    .{ .name = "sceAudioInOpen", .function = trace.wrap("sceAudioInOpen", &audioInOpen), .expect_id = "5NE8Sjc7VC8" },
+    .{ .name = "sceAudioInInput", .function = trace.wrap("sceAudioInInput", &audioInInput), .expect_id = "LozEOU8+anM" },
+    .{ .name = "sceAudioInClose", .function = trace.wrap("sceAudioInClose", &audioInClose), .expect_id = "Jh6WbHhnI68" },
+    .{ .name = "sceAudioInGetSilentState", .function = trace.wrap("sceAudioInGetSilentState", &audioInGetSilentState), .expect_id = "BohEAQ7DlUE" },
 };
 
 // libSceAudioOut2 ----------------------------------------------------------
@@ -356,19 +357,19 @@ fn audioOut2UserDestroy(user: usize) callconv(abi.guest) i32 {
 }
 
 const audio_out2_exports = [_]symbols.Export{
-    .{ .name = "sceAudioOut2Initialize", .function = abi.erase(&audioOut2Initialize), .expect_id = "g2tViFIohHE" },
-    .{ .name = "sceAudioOut2ContextResetParam", .function = abi.erase(&audioOut2ContextResetParam), .expect_id = "t5YrizufpQc" },
-    .{ .name = "sceAudioOut2ContextQueryMemory", .function = abi.erase(&audioOut2ContextQueryMemory), .expect_id = "pDmme7Bgm6E" },
-    .{ .name = "sceAudioOut2ContextCreate", .function = abi.erase(&audioOut2ContextCreate), .expect_id = "0x6o1VVAYSY" },
-    .{ .name = "sceAudioOut2ContextDestroy", .function = abi.erase(&audioOut2ContextDestroy), .expect_id = "on6ZH7Abo10" },
-    .{ .name = "sceAudioOut2ContextAdvance", .function = abi.erase(&audioOut2ContextAdvance), .expect_id = "PE2zHMqLSHs" },
-    .{ .name = "sceAudioOut2ContextPush", .function = abi.erase(&audioOut2ContextPush), .expect_id = "aII9h5nli9U" },
-    .{ .name = "sceAudioOut2ContextGetQueueLevel", .function = abi.erase(&audioOut2ContextGetQueueLevel), .expect_id = "R7d0F1g2qsU" },
-    .{ .name = "sceAudioOut2PortCreate", .function = abi.erase(&audioOut2PortCreate), .expect_id = "JK2wamZPzwM" },
-    .{ .name = "sceAudioOut2PortDestroy", .function = abi.erase(&audioOut2PortDestroy), .expect_id = "cd+Rtw+D1x8" },
-    .{ .name = "sceAudioOut2PortSetAttributes", .function = abi.erase(&audioOut2PortSetAttributes), .expect_id = "8XTArSPyWHk" },
-    .{ .name = "sceAudioOut2UserCreate", .function = abi.erase(&audioOut2UserCreate), .expect_id = "xywYcRB7nbQ" },
-    .{ .name = "sceAudioOut2UserDestroy", .function = abi.erase(&audioOut2UserDestroy), .expect_id = "IaZXJ9M79uo" },
+    .{ .name = "sceAudioOut2Initialize", .function = trace.wrap("sceAudioOut2Initialize", &audioOut2Initialize), .expect_id = "g2tViFIohHE" },
+    .{ .name = "sceAudioOut2ContextResetParam", .function = trace.wrap("sceAudioOut2ContextResetParam", &audioOut2ContextResetParam), .expect_id = "t5YrizufpQc" },
+    .{ .name = "sceAudioOut2ContextQueryMemory", .function = trace.wrap("sceAudioOut2ContextQueryMemory", &audioOut2ContextQueryMemory), .expect_id = "pDmme7Bgm6E" },
+    .{ .name = "sceAudioOut2ContextCreate", .function = trace.wrap("sceAudioOut2ContextCreate", &audioOut2ContextCreate), .expect_id = "0x6o1VVAYSY" },
+    .{ .name = "sceAudioOut2ContextDestroy", .function = trace.wrap("sceAudioOut2ContextDestroy", &audioOut2ContextDestroy), .expect_id = "on6ZH7Abo10" },
+    .{ .name = "sceAudioOut2ContextAdvance", .function = trace.wrap("sceAudioOut2ContextAdvance", &audioOut2ContextAdvance), .expect_id = "PE2zHMqLSHs" },
+    .{ .name = "sceAudioOut2ContextPush", .function = trace.wrap("sceAudioOut2ContextPush", &audioOut2ContextPush), .expect_id = "aII9h5nli9U" },
+    .{ .name = "sceAudioOut2ContextGetQueueLevel", .function = trace.wrap("sceAudioOut2ContextGetQueueLevel", &audioOut2ContextGetQueueLevel), .expect_id = "R7d0F1g2qsU" },
+    .{ .name = "sceAudioOut2PortCreate", .function = trace.wrap("sceAudioOut2PortCreate", &audioOut2PortCreate), .expect_id = "JK2wamZPzwM" },
+    .{ .name = "sceAudioOut2PortDestroy", .function = trace.wrap("sceAudioOut2PortDestroy", &audioOut2PortDestroy), .expect_id = "cd+Rtw+D1x8" },
+    .{ .name = "sceAudioOut2PortSetAttributes", .function = trace.wrap("sceAudioOut2PortSetAttributes", &audioOut2PortSetAttributes), .expect_id = "8XTArSPyWHk" },
+    .{ .name = "sceAudioOut2UserCreate", .function = trace.wrap("sceAudioOut2UserCreate", &audioOut2UserCreate), .expect_id = "xywYcRB7nbQ" },
+    .{ .name = "sceAudioOut2UserDestroy", .function = trace.wrap("sceAudioOut2UserDestroy", &audioOut2UserDestroy), .expect_id = "IaZXJ9M79uo" },
 };
 
 // libSceAjm ---------------------------------------------------------------
@@ -601,21 +602,21 @@ fn ajmBatchJobDecode(
 }
 
 const ajm_exports = [_]symbols.Export{
-    .{ .name = "sceAjmInitialize", .function = abi.erase(&ajmInitialize), .expect_id = "dl+4eHSzUu4" },
-    .{ .name = "sceAjmFinalize", .function = abi.erase(&ajmFinalize), .expect_id = "MHur6qCsUus" },
-    .{ .name = "sceAjmModuleRegister", .function = abi.erase(&ajmModuleRegister), .expect_id = "Q3dyFuwGn64" },
-    .{ .name = "sceAjmModuleUnregister", .function = abi.erase(&ajmModuleUnregister), .expect_id = "Wi7DtlLV+KI" },
-    .{ .name = "sceAjmInstanceCreate", .function = abi.erase(&ajmInstanceCreate), .expect_id = "AxoDrINp4J8" },
-    .{ .name = "sceAjmInstanceDestroy", .function = abi.erase(&ajmInstanceDestroy), .expect_id = "RbLbuKv8zho" },
-    .{ .name = "sceAjmBatchInitialize", .function = abi.erase(&ajmBatchInitialize), .expect_id = "MmpF1XsQiHw" },
-    .{ .name = "sceAjmBatchStart", .function = abi.erase(&ajmBatchStart), .expect_id = "5tOfnaClcqM" },
-    .{ .name = "sceAjmBatchWait", .function = abi.erase(&ajmBatchWait), .expect_id = "-qLsfDAywIY" },
-    .{ .name = "sceAjmBatchCancel", .function = abi.erase(&ajmBatchCancel), .expect_id = "NVDXiUesSbA" },
-    .{ .name = "sceAjmBatchErrorDump", .function = abi.erase(&ajmBatchErrorDump), .expect_id = "WfAiBW8Wcek" },
-    .{ .name = "sceAjmBatchJobInitialize", .function = abi.erase(&ajmBatchJobInitialize), .expect_id = "ezM2OhNxzck" },
-    .{ .name = "sceAjmBatchJobGetCodecInfo", .function = abi.erase(&ajmBatchJobGetCodecInfo), .expect_id = "uSrXaxT+oPQ" },
-    .{ .name = "sceAjmBatchJobSetGaplessDecode", .function = abi.erase(&ajmBatchJobSetGaplessDecode), .expect_id = "SkEwpiu3tZg" },
-    .{ .name = "sceAjmBatchJobDecode", .function = abi.erase(&ajmBatchJobDecode), .expect_id = "39WxhR-ePew" },
+    .{ .name = "sceAjmInitialize", .function = trace.wrap("sceAjmInitialize", &ajmInitialize), .expect_id = "dl+4eHSzUu4" },
+    .{ .name = "sceAjmFinalize", .function = trace.wrap("sceAjmFinalize", &ajmFinalize), .expect_id = "MHur6qCsUus" },
+    .{ .name = "sceAjmModuleRegister", .function = trace.wrap("sceAjmModuleRegister", &ajmModuleRegister), .expect_id = "Q3dyFuwGn64" },
+    .{ .name = "sceAjmModuleUnregister", .function = trace.wrap("sceAjmModuleUnregister", &ajmModuleUnregister), .expect_id = "Wi7DtlLV+KI" },
+    .{ .name = "sceAjmInstanceCreate", .function = trace.wrap("sceAjmInstanceCreate", &ajmInstanceCreate), .expect_id = "AxoDrINp4J8" },
+    .{ .name = "sceAjmInstanceDestroy", .function = trace.wrap("sceAjmInstanceDestroy", &ajmInstanceDestroy), .expect_id = "RbLbuKv8zho" },
+    .{ .name = "sceAjmBatchInitialize", .function = trace.wrap("sceAjmBatchInitialize", &ajmBatchInitialize), .expect_id = "MmpF1XsQiHw" },
+    .{ .name = "sceAjmBatchStart", .function = trace.wrap("sceAjmBatchStart", &ajmBatchStart), .expect_id = "5tOfnaClcqM" },
+    .{ .name = "sceAjmBatchWait", .function = trace.wrap("sceAjmBatchWait", &ajmBatchWait), .expect_id = "-qLsfDAywIY" },
+    .{ .name = "sceAjmBatchCancel", .function = trace.wrap("sceAjmBatchCancel", &ajmBatchCancel), .expect_id = "NVDXiUesSbA" },
+    .{ .name = "sceAjmBatchErrorDump", .function = trace.wrap("sceAjmBatchErrorDump", &ajmBatchErrorDump), .expect_id = "WfAiBW8Wcek" },
+    .{ .name = "sceAjmBatchJobInitialize", .function = trace.wrap("sceAjmBatchJobInitialize", &ajmBatchJobInitialize), .expect_id = "ezM2OhNxzck" },
+    .{ .name = "sceAjmBatchJobGetCodecInfo", .function = trace.wrap("sceAjmBatchJobGetCodecInfo", &ajmBatchJobGetCodecInfo), .expect_id = "uSrXaxT+oPQ" },
+    .{ .name = "sceAjmBatchJobSetGaplessDecode", .function = trace.wrap("sceAjmBatchJobSetGaplessDecode", &ajmBatchJobSetGaplessDecode), .expect_id = "SkEwpiu3tZg" },
+    .{ .name = "sceAjmBatchJobDecode", .function = trace.wrap("sceAjmBatchJobDecode", &ajmBatchJobDecode), .expect_id = "39WxhR-ePew" },
 };
 
 pub fn reset() void {

@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const abi = @import("../abi.zig");
+const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const kernel_runtime = @import("kernel_runtime.zig");
@@ -93,26 +94,26 @@ fn rtcGetCurrentTick(output: ?*u64) callconv(abi.guest) i32 {
 }
 
 const app_content_exports = [_]symbols.Export{
-    .{ .name = "sceAppContentInitialize", .function = abi.erase(&appContentInitialize), .expect_id = "R9lA82OraNs" },
-    .{ .name = "sceAppContentTemporaryDataMount2", .function = abi.erase(&temporaryDataMount2), .expect_id = "buYbeLOGWmA" },
+    .{ .name = "sceAppContentInitialize", .function = trace.wrap("sceAppContentInitialize", &appContentInitialize), .expect_id = "R9lA82OraNs" },
+    .{ .name = "sceAppContentTemporaryDataMount2", .function = trace.wrap("sceAppContentTemporaryDataMount2", &temporaryDataMount2), .expect_id = "buYbeLOGWmA" },
 };
 
 const net_ctl_exports = [_]symbols.Export{
-    .{ .name = "sceNetCtlInit", .function = abi.erase(&netCtlInit), .expect_id = "gky0+oaNM4k" },
-    .{ .name = "sceNetCtlTerm", .function = abi.erase(&netCtlTerm), .expect_id = "Z4wwCFiBELQ" },
-    .{ .name = "sceNetCtlGetNatInfo", .function = abi.erase(&netCtlGetNatInfo), .expect_id = "JO4yuTuMoKI" },
-    .{ .name = "sceNetCtlCheckCallback", .function = abi.erase(&netCtlCheckCallback), .expect_id = "iQw3iQPhvUQ" },
-    .{ .name = "sceNetCtlGetState", .function = abi.erase(&netCtlGetState), .expect_id = "uBPlr0lbuiI" },
-    .{ .name = "sceNetCtlGetStateV6", .function = abi.erase(&netCtlGetState), .expect_id = "+lxqIKeU9UY" },
-    .{ .name = "sceNetCtlRegisterCallback", .function = abi.erase(&netCtlRegisterCallback), .expect_id = "UJ+Z7Q+4ck0" },
-    .{ .name = "sceNetCtlUnregisterCallback", .function = abi.erase(&netCtlUnregisterCallback), .expect_id = "Rqm2OnZMCz0" },
-    .{ .name = "sceNetCtlGetResult", .function = abi.erase(&netCtlGetResult), .expect_id = "0cBgduPRR+M" },
-    .{ .name = "sceNetCtlGetInfo", .function = abi.erase(&netCtlGetInfo), .expect_id = "obuxdTiwkF8" },
+    .{ .name = "sceNetCtlInit", .function = trace.wrap("sceNetCtlInit", &netCtlInit), .expect_id = "gky0+oaNM4k" },
+    .{ .name = "sceNetCtlTerm", .function = trace.wrap("sceNetCtlTerm", &netCtlTerm), .expect_id = "Z4wwCFiBELQ" },
+    .{ .name = "sceNetCtlGetNatInfo", .function = trace.wrap("sceNetCtlGetNatInfo", &netCtlGetNatInfo), .expect_id = "JO4yuTuMoKI" },
+    .{ .name = "sceNetCtlCheckCallback", .function = trace.wrap("sceNetCtlCheckCallback", &netCtlCheckCallback), .expect_id = "iQw3iQPhvUQ" },
+    .{ .name = "sceNetCtlGetState", .function = trace.wrap("sceNetCtlGetState", &netCtlGetState), .expect_id = "uBPlr0lbuiI" },
+    .{ .name = "sceNetCtlGetStateV6", .function = trace.wrap("sceNetCtlGetStateV6", &netCtlGetState), .expect_id = "+lxqIKeU9UY" },
+    .{ .name = "sceNetCtlRegisterCallback", .function = trace.wrap("sceNetCtlRegisterCallback", &netCtlRegisterCallback), .expect_id = "UJ+Z7Q+4ck0" },
+    .{ .name = "sceNetCtlUnregisterCallback", .function = trace.wrap("sceNetCtlUnregisterCallback", &netCtlUnregisterCallback), .expect_id = "Rqm2OnZMCz0" },
+    .{ .name = "sceNetCtlGetResult", .function = trace.wrap("sceNetCtlGetResult", &netCtlGetResult), .expect_id = "0cBgduPRR+M" },
+    .{ .name = "sceNetCtlGetInfo", .function = trace.wrap("sceNetCtlGetInfo", &netCtlGetInfo), .expect_id = "obuxdTiwkF8" },
 };
 
 const rtc_exports = [_]symbols.Export{.{
     .name = "sceRtcGetCurrentTick",
-    .function = abi.erase(&rtcGetCurrentTick),
+    .function = trace.wrap("sceRtcGetCurrentTick", &rtcGetCurrentTick),
     .expect_id = "18B2NS1y9UU",
 }};
 

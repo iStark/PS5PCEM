@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const abi = @import("../abi.zig");
+const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 
@@ -46,15 +47,15 @@ fn unsupportedStatus(
 }
 
 pub const exports = [_]symbols.Export{
-    .{ .name = "sceKernelRead", .function = abi.erase(&read), .expect_id = "Cg4srZ6TKbU" },
-    .{ .name = "sceKernelWrite", .function = abi.erase(&write), .expect_id = "4wSze92BhLI" },
-    .{ .name = "sceKernelPread", .function = abi.erase(&pread), .expect_id = "+r3rMFwItV4" },
-    .{ .name = "sceKernelPwrite", .function = abi.erase(&pwrite), .expect_id = "nKWi-N2HBV4" },
-    .{ .name = "sceKernelLseek", .function = abi.erase(&lseek), .expect_id = "oib76F-12fk" },
-    .{ .name = "sceKernelFsync", .function = abi.erase(&unsupportedStatus), .expect_id = "fTx66l5iWIA" },
-    .{ .name = "sceKernelFchmod", .function = abi.erase(&unsupportedStatus), .expect_id = "UtszJWHrDcA" },
-    .{ .name = "sceKernelFtruncate", .function = abi.erase(&unsupportedStatus), .expect_id = "VW3TVZiM4-E" },
-    .{ .name = "sceKernelRmdir", .function = abi.erase(&unsupportedStatus), .expect_id = "naInUjYt3so" },
+    .{ .name = "sceKernelRead", .function = trace.wrap("sceKernelRead", &read), .expect_id = "Cg4srZ6TKbU" },
+    .{ .name = "sceKernelWrite", .function = trace.wrap("sceKernelWrite", &write), .expect_id = "4wSze92BhLI" },
+    .{ .name = "sceKernelPread", .function = trace.wrap("sceKernelPread", &pread), .expect_id = "+r3rMFwItV4" },
+    .{ .name = "sceKernelPwrite", .function = trace.wrap("sceKernelPwrite", &pwrite), .expect_id = "nKWi-N2HBV4" },
+    .{ .name = "sceKernelLseek", .function = trace.wrap("sceKernelLseek", &lseek), .expect_id = "oib76F-12fk" },
+    .{ .name = "sceKernelFsync", .function = trace.wrap("sceKernelFsync", &unsupportedStatus), .expect_id = "fTx66l5iWIA" },
+    .{ .name = "sceKernelFchmod", .function = trace.wrap("sceKernelFchmod", &unsupportedStatus), .expect_id = "UtszJWHrDcA" },
+    .{ .name = "sceKernelFtruncate", .function = trace.wrap("sceKernelFtruncate", &unsupportedStatus), .expect_id = "VW3TVZiM4-E" },
+    .{ .name = "sceKernelRmdir", .function = trace.wrap("sceKernelRmdir", &unsupportedStatus), .expect_id = "naInUjYt3so" },
 };
 
 pub const library = symbols.Library{ .name = "libkernel", .version = 1 };

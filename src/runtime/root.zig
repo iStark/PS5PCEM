@@ -197,6 +197,49 @@ pub const Runtime = struct {
         return self.last_dispatch_entry;
     }
 
+    /// Prints text the title wrote to its own standard output or error.
+    ///
+    /// A runtime that is about to give up almost always explains itself first.
+    /// That message is written through a firmware call, so the trace still holds
+    /// the buffer address and length after the fact — and it says in the title's
+    /// own words what went wrong, which no amount of address attribution can.
+    fn writeGuestDiagnostics(
+        address_space: *memory.AddressSpace,
+        w: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        var records: [hle.trace.capacity]hle.trace.Record = undefined;
+        const recent = hle.trace.recent(&records);
+
+        var text: [1024]u8 = undefined;
+        var printed = false;
+        for (recent) |record| {
+            if (!isWriteCall(record.name) or record.argument_count < 3) continue;
+            // Only the standard streams; an arbitrary descriptor is a file the
+            // title is writing normally, not a complaint.
+            const descriptor = record.arguments[0];
+            if (descriptor != 1 and descriptor != 2) continue;
+
+            const message = diag.readGuestText(
+                address_space,
+                record.arguments[1],
+                record.arguments[2],
+                &text,
+            ) orelse continue;
+
+            if (!printed) {
+                try w.writeAll("  guest diagnostics\n");
+                printed = true;
+            }
+            const stream = if (descriptor == 2) "stderr" else "stdout";
+            const trimmed = std.mem.trimEnd(u8, message, "\r\n");
+            try w.print("    [{s}] {s}\n", .{ stream, trimmed });
+        }
+    }
+
+    fn isWriteCall(name: []const u8) bool {
+        return std.mem.eql(u8, name, "write") or std.mem.eql(u8, name, "_write");
+    }
+
     /// Writes a readable report for the most recent contained guest fault.
     ///
     /// Returns false when no fault has been contained, so a caller can print
@@ -222,6 +265,11 @@ pub const Runtime = struct {
         try map.write(self.last_dispatch_entry, w);
         try w.writeAll("\n");
         if (space) |value| try diag.writeStackTrace(report, map, value, w);
+        // The firmware calls leading up to the fault are usually a better
+        // explanation than the fault itself: a title's own runtime reacts to a
+        // failed call long before anything crashes.
+        if (space) |value| try writeGuestDiagnostics(value, w);
+        try hle.trace.write(w, 32);
         return true;
     }
 

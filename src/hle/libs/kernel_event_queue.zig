@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const abi = @import("../abi.zig");
+const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const threading = @import("kernel_threading.zig");
@@ -228,14 +229,14 @@ fn getEventFilter(event: ?*const Event) callconv(abi.guest) i32 {
 }
 
 pub const exports = [_]symbols.Export{
-    .{ .name = "sceKernelCreateEqueue", .function = abi.erase(&createEqueue), .expect_id = "D0OdFMjp46I" },
-    .{ .name = "sceKernelDeleteEqueue", .function = abi.erase(&deleteEqueue), .expect_id = "jpFjmgAC5AE" },
-    .{ .name = "sceKernelWaitEqueue", .function = abi.erase(&waitEqueue), .expect_id = "fzyMKs9kim0" },
-    .{ .name = "sceKernelGetEventId", .function = abi.erase(&getEventId), .expect_id = "mJ7aghmgvfc" },
-    .{ .name = "sceKernelGetEventFilter", .function = abi.erase(&getEventFilter), .expect_id = "23CPPI1tyBY" },
-    .{ .name = "sceKernelAddUserEventEdge", .function = abi.erase(&addUserEventEdge), .expect_id = "WDszmSbWuDk" },
-    .{ .name = "sceKernelTriggerUserEvent", .function = abi.erase(&triggerUserEvent), .expect_id = "F6e0kwo4cnk" },
-    .{ .name = "sceKernelDeleteUserEvent", .function = abi.erase(&deleteUserEvent), .expect_id = "LJDwdSNTnDg" },
+    .{ .name = "sceKernelCreateEqueue", .function = trace.wrap("sceKernelCreateEqueue", &createEqueue), .expect_id = "D0OdFMjp46I" },
+    .{ .name = "sceKernelDeleteEqueue", .function = trace.wrap("sceKernelDeleteEqueue", &deleteEqueue), .expect_id = "jpFjmgAC5AE" },
+    .{ .name = "sceKernelWaitEqueue", .function = trace.wrap("sceKernelWaitEqueue", &waitEqueue), .expect_id = "fzyMKs9kim0" },
+    .{ .name = "sceKernelGetEventId", .function = trace.wrap("sceKernelGetEventId", &getEventId), .expect_id = "mJ7aghmgvfc" },
+    .{ .name = "sceKernelGetEventFilter", .function = trace.wrap("sceKernelGetEventFilter", &getEventFilter), .expect_id = "23CPPI1tyBY" },
+    .{ .name = "sceKernelAddUserEventEdge", .function = trace.wrap("sceKernelAddUserEventEdge", &addUserEventEdge), .expect_id = "WDszmSbWuDk" },
+    .{ .name = "sceKernelTriggerUserEvent", .function = trace.wrap("sceKernelTriggerUserEvent", &triggerUserEvent), .expect_id = "F6e0kwo4cnk" },
+    .{ .name = "sceKernelDeleteUserEvent", .function = trace.wrap("sceKernelDeleteUserEvent", &deleteUserEvent), .expect_id = "LJDwdSNTnDg" },
 };
 
 pub const library = symbols.Library{ .name = "libkernel", .version = 1 };

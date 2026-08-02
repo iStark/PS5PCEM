@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const abi = @import("../abi.zig");
+const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 
@@ -105,21 +106,21 @@ fn messageProgress(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.
 }
 
 const common_dialog_exports = [_]symbols.Export{
-    .{ .name = "sceCommonDialogInitialize", .function = abi.erase(&commonDialogInitialize), .expect_id = "uoUpLGNkygk" },
-    .{ .name = "sceCommonDialogIsUsed", .function = abi.erase(&commonDialogIsUsed), .expect_id = "BQ3tey0JmQM" },
+    .{ .name = "sceCommonDialogInitialize", .function = trace.wrap("sceCommonDialogInitialize", &commonDialogInitialize), .expect_id = "uoUpLGNkygk" },
+    .{ .name = "sceCommonDialogIsUsed", .function = trace.wrap("sceCommonDialogIsUsed", &commonDialogIsUsed), .expect_id = "BQ3tey0JmQM" },
 };
 
 const message_dialog_exports = [_]symbols.Export{
-    .{ .name = "sceMsgDialogInitialize", .function = abi.erase(&messageInitialize), .expect_id = "lDqxaY1UbEo" },
-    .{ .name = "sceMsgDialogTerminate", .function = abi.erase(&messageTerminate), .expect_id = "ePw-kqZmelo" },
-    .{ .name = "sceMsgDialogOpen", .function = abi.erase(&messageOpen), .expect_id = "b06Hh0DPEaE" },
-    .{ .name = "sceMsgDialogUpdateStatus", .function = abi.erase(&messageUpdateStatus), .expect_id = "6fIC3XKt2k0" },
-    .{ .name = "sceMsgDialogGetStatus", .function = abi.erase(&messageGetStatus), .expect_id = "CWVW78Qc3fI" },
-    .{ .name = "sceMsgDialogGetResult", .function = abi.erase(&messageGetResult), .expect_id = "Lr8ovHH9l6A" },
-    .{ .name = "sceMsgDialogClose", .function = abi.erase(&messageClose), .expect_id = "HTrcDKlFKuM" },
-    .{ .name = "sceMsgDialogProgressBarSetValue", .function = abi.erase(&messageProgress), .expect_id = "wTpfglkmv34" },
-    .{ .name = "sceMsgDialogProgressBarInc", .function = abi.erase(&messageProgress), .expect_id = "Gc5k1qcK4fs" },
-    .{ .name = "sceMsgDialogProgressBarSetMsg", .function = abi.erase(&messageProgress), .expect_id = "6H-71OdrpXM" },
+    .{ .name = "sceMsgDialogInitialize", .function = trace.wrap("sceMsgDialogInitialize", &messageInitialize), .expect_id = "lDqxaY1UbEo" },
+    .{ .name = "sceMsgDialogTerminate", .function = trace.wrap("sceMsgDialogTerminate", &messageTerminate), .expect_id = "ePw-kqZmelo" },
+    .{ .name = "sceMsgDialogOpen", .function = trace.wrap("sceMsgDialogOpen", &messageOpen), .expect_id = "b06Hh0DPEaE" },
+    .{ .name = "sceMsgDialogUpdateStatus", .function = trace.wrap("sceMsgDialogUpdateStatus", &messageUpdateStatus), .expect_id = "6fIC3XKt2k0" },
+    .{ .name = "sceMsgDialogGetStatus", .function = trace.wrap("sceMsgDialogGetStatus", &messageGetStatus), .expect_id = "CWVW78Qc3fI" },
+    .{ .name = "sceMsgDialogGetResult", .function = trace.wrap("sceMsgDialogGetResult", &messageGetResult), .expect_id = "Lr8ovHH9l6A" },
+    .{ .name = "sceMsgDialogClose", .function = trace.wrap("sceMsgDialogClose", &messageClose), .expect_id = "HTrcDKlFKuM" },
+    .{ .name = "sceMsgDialogProgressBarSetValue", .function = trace.wrap("sceMsgDialogProgressBarSetValue", &messageProgress), .expect_id = "wTpfglkmv34" },
+    .{ .name = "sceMsgDialogProgressBarInc", .function = trace.wrap("sceMsgDialogProgressBarInc", &messageProgress), .expect_id = "Gc5k1qcK4fs" },
+    .{ .name = "sceMsgDialogProgressBarSetMsg", .function = trace.wrap("sceMsgDialogProgressBarSetMsg", &messageProgress), .expect_id = "6H-71OdrpXM" },
 };
 
 // Web-browser dialog --------------------------------------------------------
@@ -146,10 +147,10 @@ fn browserTerminate() callconv(abi.guest) i32 {
 }
 
 const browser_dialog_exports = [_]symbols.Export{
-    .{ .name = "sceWebBrowserDialogInitialize", .function = abi.erase(&browserInitialize), .expect_id = "jqb7HntFQFc" },
-    .{ .name = "sceWebBrowserDialogOpen", .function = abi.erase(&browserOpen), .expect_id = "FraP7debcdg" },
-    .{ .name = "sceWebBrowserDialogUpdateStatus", .function = abi.erase(&browserUpdateStatus), .expect_id = "h1dR-t5ISgg" },
-    .{ .name = "sceWebBrowserDialogTerminate", .function = abi.erase(&browserTerminate), .expect_id = "ocHtyBwHfys" },
+    .{ .name = "sceWebBrowserDialogInitialize", .function = trace.wrap("sceWebBrowserDialogInitialize", &browserInitialize), .expect_id = "jqb7HntFQFc" },
+    .{ .name = "sceWebBrowserDialogOpen", .function = trace.wrap("sceWebBrowserDialogOpen", &browserOpen), .expect_id = "FraP7debcdg" },
+    .{ .name = "sceWebBrowserDialogUpdateStatus", .function = trace.wrap("sceWebBrowserDialogUpdateStatus", &browserUpdateStatus), .expect_id = "h1dR-t5ISgg" },
+    .{ .name = "sceWebBrowserDialogTerminate", .function = trace.wrap("sceWebBrowserDialogTerminate", &browserTerminate), .expect_id = "ocHtyBwHfys" },
 };
 
 // IME dialog and optional physical keyboard --------------------------------
@@ -206,19 +207,19 @@ fn imeUpdate(_: ?*anyopaque) callconv(abi.guest) i32 {
 }
 
 const ime_dialog_exports = [_]symbols.Export{
-    .{ .name = "sceImeDialogInit", .function = abi.erase(&imeDialogInit), .expect_id = "NUeBrN7hzf0" },
-    .{ .name = "sceImeDialogAbort", .function = abi.erase(&imeDialogAbort), .expect_id = "oBmw4xrmfKs" },
-    .{ .name = "sceImeDialogGetStatus", .function = abi.erase(&imeDialogGetStatus), .expect_id = "IADmD4tScBY" },
-    .{ .name = "sceImeDialogGetResult", .function = abi.erase(&imeDialogGetResult), .expect_id = "x01jxu+vxlc" },
-    .{ .name = "sceImeDialogTerm", .function = abi.erase(&imeDialogTerm), .expect_id = "gyTyVn+bXMw" },
+    .{ .name = "sceImeDialogInit", .function = trace.wrap("sceImeDialogInit", &imeDialogInit), .expect_id = "NUeBrN7hzf0" },
+    .{ .name = "sceImeDialogAbort", .function = trace.wrap("sceImeDialogAbort", &imeDialogAbort), .expect_id = "oBmw4xrmfKs" },
+    .{ .name = "sceImeDialogGetStatus", .function = trace.wrap("sceImeDialogGetStatus", &imeDialogGetStatus), .expect_id = "IADmD4tScBY" },
+    .{ .name = "sceImeDialogGetResult", .function = trace.wrap("sceImeDialogGetResult", &imeDialogGetResult), .expect_id = "x01jxu+vxlc" },
+    .{ .name = "sceImeDialogTerm", .function = trace.wrap("sceImeDialogTerm", &imeDialogTerm), .expect_id = "gyTyVn+bXMw" },
 };
 
 const ime_exports = [_]symbols.Export{
-    .{ .name = "sceImeKeyboardOpen", .function = abi.erase(&keyboardOpenFn), .expect_id = "eaFXjfJv3xs" },
-    .{ .name = "sceImeKeyboardClose", .function = abi.erase(&keyboardClose), .expect_id = "PMVehSlfZ94" },
-    .{ .name = "sceImeKeyboardGetResourceId", .function = abi.erase(&keyboardGetResourceId), .expect_id = "dKadqZFgKKQ" },
-    .{ .name = "sceImeKeyboardGetInfo", .function = abi.erase(&keyboardGetInfo), .expect_id = "VkqLPArfFdc" },
-    .{ .name = "sceImeUpdate", .function = abi.erase(&imeUpdate), .expect_id = "-4GCfYdNF1s" },
+    .{ .name = "sceImeKeyboardOpen", .function = trace.wrap("sceImeKeyboardOpen", &keyboardOpenFn), .expect_id = "eaFXjfJv3xs" },
+    .{ .name = "sceImeKeyboardClose", .function = trace.wrap("sceImeKeyboardClose", &keyboardClose), .expect_id = "PMVehSlfZ94" },
+    .{ .name = "sceImeKeyboardGetResourceId", .function = trace.wrap("sceImeKeyboardGetResourceId", &keyboardGetResourceId), .expect_id = "dKadqZFgKKQ" },
+    .{ .name = "sceImeKeyboardGetInfo", .function = trace.wrap("sceImeKeyboardGetInfo", &keyboardGetInfo), .expect_id = "VkqLPArfFdc" },
+    .{ .name = "sceImeUpdate", .function = trace.wrap("sceImeUpdate", &imeUpdate), .expect_id = "-4GCfYdNF1s" },
 };
 
 pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {

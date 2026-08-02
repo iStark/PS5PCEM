@@ -16,6 +16,7 @@
 const std = @import("std");
 const memory = @import("memory");
 const abi = @import("../abi.zig");
+const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 
@@ -832,97 +833,97 @@ fn mapAddressSpaceError(err: memory.Error) i32 {
 pub const exports = [_]symbols.Export{
     .{
         .name = "sceKernelAllocateDirectMemory",
-        .function = abi.erase(&sceKernelAllocateDirectMemory),
+        .function = trace.wrap("sceKernelAllocateDirectMemory", &sceKernelAllocateDirectMemory),
         .expect_id = "rTXw65xmLIA",
     },
     .{
         .name = "sceKernelReleaseDirectMemory",
-        .function = abi.erase(&sceKernelReleaseDirectMemory),
+        .function = trace.wrap("sceKernelReleaseDirectMemory", &sceKernelReleaseDirectMemory),
         .expect_id = "MBuItvba6z8",
     },
     .{
         .name = "sceKernelGetDirectMemorySize",
-        .function = abi.erase(&sceKernelGetDirectMemorySize),
+        .function = trace.wrap("sceKernelGetDirectMemorySize", &sceKernelGetDirectMemorySize),
         .expect_id = "pO96TwzOm5E",
     },
     .{
         .name = "sceKernelAllocateMainDirectMemory",
-        .function = abi.erase(&sceKernelAllocateMainDirectMemory),
+        .function = trace.wrap("sceKernelAllocateMainDirectMemory", &sceKernelAllocateMainDirectMemory),
         .expect_id = "B+vc2AO2Zrc",
     },
     .{
         .name = "sceKernelCheckedReleaseDirectMemory",
-        .function = abi.erase(&sceKernelCheckedReleaseDirectMemory),
+        .function = trace.wrap("sceKernelCheckedReleaseDirectMemory", &sceKernelCheckedReleaseDirectMemory),
         .expect_id = "hwVSPCmp5tM",
     },
     .{
         .name = "sceKernelMapDirectMemory",
-        .function = abi.erase(&sceKernelMapDirectMemory),
+        .function = trace.wrap("sceKernelMapDirectMemory", &sceKernelMapDirectMemory),
         .expect_id = "L-Q3LEjIbgA",
     },
     .{
         .name = "sceKernelMapNamedDirectMemory",
-        .function = abi.erase(&sceKernelMapNamedDirectMemory),
+        .function = trace.wrap("sceKernelMapNamedDirectMemory", &sceKernelMapNamedDirectMemory),
         .expect_id = "NcaWUxfMNIQ",
     },
     .{
         .name = "sceKernelDirectMemoryQuery",
-        .function = abi.erase(&sceKernelDirectMemoryQuery),
+        .function = trace.wrap("sceKernelDirectMemoryQuery", &sceKernelDirectMemoryQuery),
         .expect_id = "BHouLQzh0X0",
     },
     .{
         .name = "sceKernelIsStack",
-        .function = abi.erase(&sceKernelIsStack),
+        .function = trace.wrap("sceKernelIsStack", &sceKernelIsStack),
         .expect_id = "yDBwVAolDgg",
     },
     .{
         .name = "sceKernelMapNamedFlexibleMemory",
-        .function = abi.erase(&sceKernelMapNamedFlexibleMemory),
+        .function = trace.wrap("sceKernelMapNamedFlexibleMemory", &sceKernelMapNamedFlexibleMemory),
         .expect_id = "mL8NDH86iQI",
     },
     .{
         .name = "sceKernelMapFlexibleMemory",
-        .function = abi.erase(&sceKernelMapFlexibleMemory),
+        .function = trace.wrap("sceKernelMapFlexibleMemory", &sceKernelMapFlexibleMemory),
         .expect_id = "IWIBBdTHit4",
     },
     .{
         .name = "sceKernelMunmap",
-        .function = abi.erase(&sceKernelMunmap),
+        .function = trace.wrap("sceKernelMunmap", &sceKernelMunmap),
         .expect_id = "cQke9UuBQOk",
     },
     .{
         .name = "sceKernelVirtualQuery",
-        .function = abi.erase(&sceKernelVirtualQuery),
+        .function = trace.wrap("sceKernelVirtualQuery", &sceKernelVirtualQuery),
         .expect_id = "rVjRvHJ0X6c",
     },
     .{
         .name = "sceKernelQueryMemoryProtection",
-        .function = abi.erase(&sceKernelQueryMemoryProtection),
+        .function = trace.wrap("sceKernelQueryMemoryProtection", &sceKernelQueryMemoryProtection),
         .expect_id = "WFcfL2lzido",
     },
     .{
         .name = "sceKernelAvailableFlexibleMemorySize",
-        .function = abi.erase(&sceKernelAvailableFlexibleMemorySize),
+        .function = trace.wrap("sceKernelAvailableFlexibleMemorySize", &sceKernelAvailableFlexibleMemorySize),
         .expect_id = "aNz11fnnzi4",
     },
     .{
         .name = "sceKernelConfiguredFlexibleMemorySize",
-        .function = abi.erase(&sceKernelConfiguredFlexibleMemorySize),
+        .function = trace.wrap("sceKernelConfiguredFlexibleMemorySize", &sceKernelConfiguredFlexibleMemorySize),
         .expect_id = "n1-v6FgU7MQ",
     },
     .{
         .name = "sceKernelMprotect",
-        .function = abi.erase(&sceKernelMprotect),
+        .function = trace.wrap("sceKernelMprotect", &sceKernelMprotect),
         .expect_id = "vSMAm3cxYTY",
     },
     .{
         .name = "sceKernelSetVirtualRangeName",
-        .function = abi.erase(&sceKernelSetVirtualRangeName),
+        .function = trace.wrap("sceKernelSetVirtualRangeName", &sceKernelSetVirtualRangeName),
         .expect_id = "DGMG3JshrZU",
     },
     .{
         .name = "sceKernelReserveVirtualRange",
-        .function = abi.erase(&sceKernelReserveVirtualRange),
+        .function = trace.wrap("sceKernelReserveVirtualRange", &sceKernelReserveVirtualRange),
         .expect_id = "7oxv3PPCumo",
     },
 };

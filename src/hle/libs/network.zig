@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const abi = @import("../abi.zig");
+const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 
@@ -308,34 +309,34 @@ fn netInetPton(family: i32, text: ?[*:0]const u8, output: ?[*]u8) callconv(abi.g
 }
 
 const net_exports = [_]symbols.Export{
-    .{ .name = "sceNetInit", .function = abi.erase(&netInit), .expect_id = "Nlev7Lg8k3A" },
-    .{ .name = "sceNetTerm", .function = abi.erase(&netTerm), .expect_id = "cTGkc6-TBlI" },
-    .{ .name = "sceNetErrnoLoc", .function = abi.erase(&netErrnoLoc), .expect_id = "HQOwnfMGipQ" },
-    .{ .name = "sceNetPoolCreate", .function = abi.erase(&netPoolCreate), .expect_id = "dgJBaeJnGpo" },
-    .{ .name = "sceNetPoolDestroy", .function = abi.erase(&netPoolDestroy), .expect_id = "K7RlrTkI-mw" },
-    .{ .name = "sceNetResolverCreate", .function = abi.erase(&netResolverCreate), .expect_id = "C4UgDHHPvdw" },
-    .{ .name = "sceNetResolverDestroy", .function = abi.erase(&netResolverDestroy), .expect_id = "kJlYH5uMAWI" },
-    .{ .name = "sceNetResolverStartNtoa", .function = abi.erase(&netResolverStartNtoa), .expect_id = "Nd91WaWmG2w" },
-    .{ .name = "sceNetResolverGetError", .function = abi.erase(&netResolverGetError), .expect_id = "J5i3hiLJMPk" },
-    .{ .name = "sceNetSocket", .function = abi.erase(&netSocket), .expect_id = "Q4qBuN-c0ZM" },
-    .{ .name = "sceNetSocketClose", .function = abi.erase(&netSocketClose), .expect_id = "45ggEzakPJQ" },
-    .{ .name = "sceNetSetsockopt", .function = abi.erase(&netSocketAcceptsLocalState), .expect_id = "2mKX2Spso7I" },
-    .{ .name = "sceNetBind", .function = abi.erase(&netSocketAcceptsLocalState), .expect_id = "bErx49PgxyY" },
-    .{ .name = "sceNetListen", .function = abi.erase(&netSocketAcceptsLocalState), .expect_id = "kOj1HiAGE54" },
-    .{ .name = "sceNetConnect", .function = abi.erase(&netSocketNeedsPeer), .expect_id = "OXXX4mUk3uk" },
-    .{ .name = "sceNetAccept", .function = abi.erase(&netSocketNeedsPeer), .expect_id = "PIWqhn9oSxc" },
-    .{ .name = "sceNetSend", .function = abi.erase(&netSocketNeedsPeer), .expect_id = "beRjXBn-z+o" },
-    .{ .name = "sceNetSendto", .function = abi.erase(&netSocketNeedsPeer), .expect_id = "gvD1greCu0A" },
-    .{ .name = "sceNetRecv", .function = abi.erase(&netSocketNeedsPeer), .expect_id = "9wO9XrMsNhc" },
-    .{ .name = "sceNetRecvfrom", .function = abi.erase(&netSocketNeedsPeer), .expect_id = "304ooNZxWDY" },
-    .{ .name = "sceNetGetsockname", .function = abi.erase(&netGetSockName), .expect_id = "hoOAofhhRvE" },
-    .{ .name = "sceNetGetsockopt", .function = abi.erase(&netGetSockOpt), .expect_id = "xphrZusl78E" },
-    .{ .name = "sceNetEpollCreate", .function = abi.erase(&netEpollCreate), .expect_id = "SF47kB2MNTo" },
-    .{ .name = "sceNetEpollControl", .function = abi.erase(&netEpollControl), .expect_id = "ZVw46bsasAk" },
-    .{ .name = "sceNetEpollWait", .function = abi.erase(&netEpollWait), .expect_id = "drjIbDbA7UQ" },
-    .{ .name = "sceNetEpollDestroy", .function = abi.erase(&netEpollDestroy), .expect_id = "Inp1lfL+Jdw" },
-    .{ .name = "sceNetHtons", .function = abi.erase(&netHtons), .expect_id = "iWQWrwiSt8A" },
-    .{ .name = "sceNetInetPton", .function = abi.erase(&netInetPton), .expect_id = "8Kcp5d-q1Uo" },
+    .{ .name = "sceNetInit", .function = trace.wrap("sceNetInit", &netInit), .expect_id = "Nlev7Lg8k3A" },
+    .{ .name = "sceNetTerm", .function = trace.wrap("sceNetTerm", &netTerm), .expect_id = "cTGkc6-TBlI" },
+    .{ .name = "sceNetErrnoLoc", .function = trace.wrap("sceNetErrnoLoc", &netErrnoLoc), .expect_id = "HQOwnfMGipQ" },
+    .{ .name = "sceNetPoolCreate", .function = trace.wrap("sceNetPoolCreate", &netPoolCreate), .expect_id = "dgJBaeJnGpo" },
+    .{ .name = "sceNetPoolDestroy", .function = trace.wrap("sceNetPoolDestroy", &netPoolDestroy), .expect_id = "K7RlrTkI-mw" },
+    .{ .name = "sceNetResolverCreate", .function = trace.wrap("sceNetResolverCreate", &netResolverCreate), .expect_id = "C4UgDHHPvdw" },
+    .{ .name = "sceNetResolverDestroy", .function = trace.wrap("sceNetResolverDestroy", &netResolverDestroy), .expect_id = "kJlYH5uMAWI" },
+    .{ .name = "sceNetResolverStartNtoa", .function = trace.wrap("sceNetResolverStartNtoa", &netResolverStartNtoa), .expect_id = "Nd91WaWmG2w" },
+    .{ .name = "sceNetResolverGetError", .function = trace.wrap("sceNetResolverGetError", &netResolverGetError), .expect_id = "J5i3hiLJMPk" },
+    .{ .name = "sceNetSocket", .function = trace.wrap("sceNetSocket", &netSocket), .expect_id = "Q4qBuN-c0ZM" },
+    .{ .name = "sceNetSocketClose", .function = trace.wrap("sceNetSocketClose", &netSocketClose), .expect_id = "45ggEzakPJQ" },
+    .{ .name = "sceNetSetsockopt", .function = trace.wrap("sceNetSetsockopt", &netSocketAcceptsLocalState), .expect_id = "2mKX2Spso7I" },
+    .{ .name = "sceNetBind", .function = trace.wrap("sceNetBind", &netSocketAcceptsLocalState), .expect_id = "bErx49PgxyY" },
+    .{ .name = "sceNetListen", .function = trace.wrap("sceNetListen", &netSocketAcceptsLocalState), .expect_id = "kOj1HiAGE54" },
+    .{ .name = "sceNetConnect", .function = trace.wrap("sceNetConnect", &netSocketNeedsPeer), .expect_id = "OXXX4mUk3uk" },
+    .{ .name = "sceNetAccept", .function = trace.wrap("sceNetAccept", &netSocketNeedsPeer), .expect_id = "PIWqhn9oSxc" },
+    .{ .name = "sceNetSend", .function = trace.wrap("sceNetSend", &netSocketNeedsPeer), .expect_id = "beRjXBn-z+o" },
+    .{ .name = "sceNetSendto", .function = trace.wrap("sceNetSendto", &netSocketNeedsPeer), .expect_id = "gvD1greCu0A" },
+    .{ .name = "sceNetRecv", .function = trace.wrap("sceNetRecv", &netSocketNeedsPeer), .expect_id = "9wO9XrMsNhc" },
+    .{ .name = "sceNetRecvfrom", .function = trace.wrap("sceNetRecvfrom", &netSocketNeedsPeer), .expect_id = "304ooNZxWDY" },
+    .{ .name = "sceNetGetsockname", .function = trace.wrap("sceNetGetsockname", &netGetSockName), .expect_id = "hoOAofhhRvE" },
+    .{ .name = "sceNetGetsockopt", .function = trace.wrap("sceNetGetsockopt", &netGetSockOpt), .expect_id = "xphrZusl78E" },
+    .{ .name = "sceNetEpollCreate", .function = trace.wrap("sceNetEpollCreate", &netEpollCreate), .expect_id = "SF47kB2MNTo" },
+    .{ .name = "sceNetEpollControl", .function = trace.wrap("sceNetEpollControl", &netEpollControl), .expect_id = "ZVw46bsasAk" },
+    .{ .name = "sceNetEpollWait", .function = trace.wrap("sceNetEpollWait", &netEpollWait), .expect_id = "drjIbDbA7UQ" },
+    .{ .name = "sceNetEpollDestroy", .function = trace.wrap("sceNetEpollDestroy", &netEpollDestroy), .expect_id = "Inp1lfL+Jdw" },
+    .{ .name = "sceNetHtons", .function = trace.wrap("sceNetHtons", &netHtons), .expect_id = "iWQWrwiSt8A" },
+    .{ .name = "sceNetInetPton", .function = trace.wrap("sceNetInetPton", &netInetPton), .expect_id = "8Kcp5d-q1Uo" },
 };
 
 // libSceSsl -----------------------------------------------------------------
@@ -373,18 +374,18 @@ fn sslUnavailable(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.g
 }
 
 const ssl_exports = [_]symbols.Export{
-    .{ .name = "sceSslInit", .function = abi.erase(&sslInit), .expect_id = "hdpVEUDFW3s" },
-    .{ .name = "sceSslTerm", .function = abi.erase(&sslTerm), .expect_id = "0K1yQ6Lv-Yc" },
-    .{ .name = "sceSslGetCaCerts", .function = abi.erase(&sslGetCaCerts), .expect_id = "TDfQqO-gMbY" },
-    .{ .name = "sceSslFreeCaCerts", .function = abi.erase(&sslFreeCaCerts), .expect_id = "qIvLs0gYxi0" },
-    .{ .name = "sceSslGetMemoryPoolStats", .function = abi.erase(&sslUnavailable), .expect_id = "-PoIzr3PEk0" },
-    .{ .name = "sceSslGetNameEntryCount", .function = abi.erase(&sslUnavailable), .expect_id = "R1ePzopYPYM" },
-    .{ .name = "sceSslGetNameEntryInfo", .function = abi.erase(&sslUnavailable), .expect_id = "7RBSTKGrmDA" },
-    .{ .name = "sceSslFreeSslCertName", .function = abi.erase(&sslUnavailable), .expect_id = "RwXD8grHZHM" },
-    .{ .name = "sceSslGetIssuerName", .function = abi.erase(&sslUnavailable), .expect_id = "7whYpYfHP74" },
-    .{ .name = "sceSslGetSubjectName", .function = abi.erase(&sslUnavailable), .expect_id = "dQReuBX9sD8" },
-    .{ .name = "sceSslGetSerialNumber", .function = abi.erase(&sslUnavailable), .expect_id = "DOwXL+FQMEY" },
-    .{ .name = "sceSslGetPem", .function = abi.erase(&sslUnavailable), .expect_id = "kLB5aGoUJXg" },
+    .{ .name = "sceSslInit", .function = trace.wrap("sceSslInit", &sslInit), .expect_id = "hdpVEUDFW3s" },
+    .{ .name = "sceSslTerm", .function = trace.wrap("sceSslTerm", &sslTerm), .expect_id = "0K1yQ6Lv-Yc" },
+    .{ .name = "sceSslGetCaCerts", .function = trace.wrap("sceSslGetCaCerts", &sslGetCaCerts), .expect_id = "TDfQqO-gMbY" },
+    .{ .name = "sceSslFreeCaCerts", .function = trace.wrap("sceSslFreeCaCerts", &sslFreeCaCerts), .expect_id = "qIvLs0gYxi0" },
+    .{ .name = "sceSslGetMemoryPoolStats", .function = trace.wrap("sceSslGetMemoryPoolStats", &sslUnavailable), .expect_id = "-PoIzr3PEk0" },
+    .{ .name = "sceSslGetNameEntryCount", .function = trace.wrap("sceSslGetNameEntryCount", &sslUnavailable), .expect_id = "R1ePzopYPYM" },
+    .{ .name = "sceSslGetNameEntryInfo", .function = trace.wrap("sceSslGetNameEntryInfo", &sslUnavailable), .expect_id = "7RBSTKGrmDA" },
+    .{ .name = "sceSslFreeSslCertName", .function = trace.wrap("sceSslFreeSslCertName", &sslUnavailable), .expect_id = "RwXD8grHZHM" },
+    .{ .name = "sceSslGetIssuerName", .function = trace.wrap("sceSslGetIssuerName", &sslUnavailable), .expect_id = "7whYpYfHP74" },
+    .{ .name = "sceSslGetSubjectName", .function = trace.wrap("sceSslGetSubjectName", &sslUnavailable), .expect_id = "dQReuBX9sD8" },
+    .{ .name = "sceSslGetSerialNumber", .function = trace.wrap("sceSslGetSerialNumber", &sslUnavailable), .expect_id = "DOwXL+FQMEY" },
+    .{ .name = "sceSslGetPem", .function = trace.wrap("sceSslGetPem", &sslUnavailable), .expect_id = "kLB5aGoUJXg" },
 };
 
 // libSceHttp URI parsing and lifecycle -------------------------------------
@@ -549,9 +550,9 @@ fn httpUriParse(
 }
 
 const http_exports = [_]symbols.Export{
-    .{ .name = "sceHttpInit", .function = abi.erase(&httpInit), .expect_id = "A9cVMUtEp4Y" },
-    .{ .name = "sceHttpTerm", .function = abi.erase(&httpTerm), .expect_id = "Ik-KpLTlf7Q" },
-    .{ .name = "sceHttpUriParse", .function = abi.erase(&httpUriParse), .expect_id = "IWalAn-guFs" },
+    .{ .name = "sceHttpInit", .function = trace.wrap("sceHttpInit", &httpInit), .expect_id = "A9cVMUtEp4Y" },
+    .{ .name = "sceHttpTerm", .function = trace.wrap("sceHttpTerm", &httpTerm), .expect_id = "Ik-KpLTlf7Q" },
+    .{ .name = "sceHttpUriParse", .function = trace.wrap("sceHttpUriParse", &httpUriParse), .expect_id = "IWalAn-guFs" },
 };
 
 // libSceHttp2 ---------------------------------------------------------------
@@ -650,32 +651,32 @@ fn http2DeleteRequest(id: i32) callconv(abi.guest) i32 {
 }
 
 const http2_exports = [_]symbols.Export{
-    .{ .name = "sceHttp2Init", .function = abi.erase(&http2Init), .expect_id = "3JCe3lCbQ8A" },
-    .{ .name = "sceHttp2Term", .function = abi.erase(&http2Term), .expect_id = "YiBUtz-pGkc" },
-    .{ .name = "sceHttp2CreateTemplate", .function = abi.erase(&http2CreateTemplate), .expect_id = "+wCt7fCijgk" },
-    .{ .name = "sceHttp2DeleteTemplate", .function = abi.erase(&http2DeleteTemplate), .expect_id = "pDom5-078DA" },
-    .{ .name = "sceHttp2CreateCookieBox", .function = abi.erase(&http2CreateCookieBox), .expect_id = "N4UfjvWJsMw" },
-    .{ .name = "sceHttp2SetCookieBox", .function = abi.erase(&http2SetCookieBox), .expect_id = "jrVHsKCXA0g" },
-    .{ .name = "sceHttp2CookieFlush", .function = abi.erase(&http2CookieFlush), .expect_id = "5VlQSzXW-SQ" },
-    .{ .name = "sceHttp2CreateRequestWithURL", .function = abi.erase(&http2CreateRequestWithUrl), .expect_id = "mmyOCxQMVYQ" },
-    .{ .name = "sceHttp2AbortRequest", .function = abi.erase(&http2AbortRequest), .expect_id = "IZ-qjhRqvjk" },
-    .{ .name = "sceHttp2DeleteRequest", .function = abi.erase(&http2DeleteRequest), .expect_id = "c8D9qIjo8EY" },
-    .{ .name = "sceHttp2AddRequestHeader", .function = abi.erase(&http2RequestOnlyOption), .expect_id = "nrPfOE8TQu0" },
-    .{ .name = "sceHttp2SetRequestContentLength", .function = abi.erase(&http2RequestOnlyOption), .expect_id = "FSAFOzi0FpM" },
-    .{ .name = "sceHttp2SetRequestNoContentLength", .function = abi.erase(&http2RequestOnlyOption), .expect_id = "bEegosRhgM0" },
-    .{ .name = "sceHttp2SetAuthEnabled", .function = abi.erase(&http2RequestOption), .expect_id = "jjFahkBPCYs" },
-    .{ .name = "sceHttp2SslDisableOption", .function = abi.erase(&http2RequestOption), .expect_id = "B37SruheQ5Y" },
-    .{ .name = "sceHttp2SslEnableOption", .function = abi.erase(&http2RequestOption), .expect_id = "EWcwMpbr5F8" },
-    .{ .name = "sceHttp2SetRedirectCallback", .function = abi.erase(&http2RequestOption), .expect_id = "BJgi0CH7al4" },
-    .{ .name = "sceHttp2SetRecvTimeOut", .function = abi.erase(&http2RequestOption), .expect_id = "izvHhqgDt44" },
-    .{ .name = "sceHttp2SetSendTimeOut", .function = abi.erase(&http2RequestOption), .expect_id = "XPtW45xiLHk" },
-    .{ .name = "sceHttp2SetConnectTimeOut", .function = abi.erase(&http2RequestOption), .expect_id = "-HIO4VT87v8" },
-    .{ .name = "sceHttp2SetSslCallback", .function = abi.erase(&http2RequestOption), .expect_id = "YrWX+DhPHQY" },
-    .{ .name = "sceHttp2SendRequest", .function = abi.erase(&http2SendRequest), .expect_id = "rbqZig38AT8" },
-    .{ .name = "sceHttp2GetResponseContentLength", .function = abi.erase(&http2GetContentLength), .expect_id = "o0DBQpFE13o" },
-    .{ .name = "sceHttp2GetStatusCode", .function = abi.erase(&http2GetStatusCode), .expect_id = "9XYJwCf3lEA" },
-    .{ .name = "sceHttp2GetAllResponseHeaders", .function = abi.erase(&http2GetAllHeaders), .expect_id = "-rdXUi2XW90" },
-    .{ .name = "sceHttp2ReadData", .function = abi.erase(&http2ReadData), .expect_id = "QygCNNmbGss" },
+    .{ .name = "sceHttp2Init", .function = trace.wrap("sceHttp2Init", &http2Init), .expect_id = "3JCe3lCbQ8A" },
+    .{ .name = "sceHttp2Term", .function = trace.wrap("sceHttp2Term", &http2Term), .expect_id = "YiBUtz-pGkc" },
+    .{ .name = "sceHttp2CreateTemplate", .function = trace.wrap("sceHttp2CreateTemplate", &http2CreateTemplate), .expect_id = "+wCt7fCijgk" },
+    .{ .name = "sceHttp2DeleteTemplate", .function = trace.wrap("sceHttp2DeleteTemplate", &http2DeleteTemplate), .expect_id = "pDom5-078DA" },
+    .{ .name = "sceHttp2CreateCookieBox", .function = trace.wrap("sceHttp2CreateCookieBox", &http2CreateCookieBox), .expect_id = "N4UfjvWJsMw" },
+    .{ .name = "sceHttp2SetCookieBox", .function = trace.wrap("sceHttp2SetCookieBox", &http2SetCookieBox), .expect_id = "jrVHsKCXA0g" },
+    .{ .name = "sceHttp2CookieFlush", .function = trace.wrap("sceHttp2CookieFlush", &http2CookieFlush), .expect_id = "5VlQSzXW-SQ" },
+    .{ .name = "sceHttp2CreateRequestWithURL", .function = trace.wrap("sceHttp2CreateRequestWithURL", &http2CreateRequestWithUrl), .expect_id = "mmyOCxQMVYQ" },
+    .{ .name = "sceHttp2AbortRequest", .function = trace.wrap("sceHttp2AbortRequest", &http2AbortRequest), .expect_id = "IZ-qjhRqvjk" },
+    .{ .name = "sceHttp2DeleteRequest", .function = trace.wrap("sceHttp2DeleteRequest", &http2DeleteRequest), .expect_id = "c8D9qIjo8EY" },
+    .{ .name = "sceHttp2AddRequestHeader", .function = trace.wrap("sceHttp2AddRequestHeader", &http2RequestOnlyOption), .expect_id = "nrPfOE8TQu0" },
+    .{ .name = "sceHttp2SetRequestContentLength", .function = trace.wrap("sceHttp2SetRequestContentLength", &http2RequestOnlyOption), .expect_id = "FSAFOzi0FpM" },
+    .{ .name = "sceHttp2SetRequestNoContentLength", .function = trace.wrap("sceHttp2SetRequestNoContentLength", &http2RequestOnlyOption), .expect_id = "bEegosRhgM0" },
+    .{ .name = "sceHttp2SetAuthEnabled", .function = trace.wrap("sceHttp2SetAuthEnabled", &http2RequestOption), .expect_id = "jjFahkBPCYs" },
+    .{ .name = "sceHttp2SslDisableOption", .function = trace.wrap("sceHttp2SslDisableOption", &http2RequestOption), .expect_id = "B37SruheQ5Y" },
+    .{ .name = "sceHttp2SslEnableOption", .function = trace.wrap("sceHttp2SslEnableOption", &http2RequestOption), .expect_id = "EWcwMpbr5F8" },
+    .{ .name = "sceHttp2SetRedirectCallback", .function = trace.wrap("sceHttp2SetRedirectCallback", &http2RequestOption), .expect_id = "BJgi0CH7al4" },
+    .{ .name = "sceHttp2SetRecvTimeOut", .function = trace.wrap("sceHttp2SetRecvTimeOut", &http2RequestOption), .expect_id = "izvHhqgDt44" },
+    .{ .name = "sceHttp2SetSendTimeOut", .function = trace.wrap("sceHttp2SetSendTimeOut", &http2RequestOption), .expect_id = "XPtW45xiLHk" },
+    .{ .name = "sceHttp2SetConnectTimeOut", .function = trace.wrap("sceHttp2SetConnectTimeOut", &http2RequestOption), .expect_id = "-HIO4VT87v8" },
+    .{ .name = "sceHttp2SetSslCallback", .function = trace.wrap("sceHttp2SetSslCallback", &http2RequestOption), .expect_id = "YrWX+DhPHQY" },
+    .{ .name = "sceHttp2SendRequest", .function = trace.wrap("sceHttp2SendRequest", &http2SendRequest), .expect_id = "rbqZig38AT8" },
+    .{ .name = "sceHttp2GetResponseContentLength", .function = trace.wrap("sceHttp2GetResponseContentLength", &http2GetContentLength), .expect_id = "o0DBQpFE13o" },
+    .{ .name = "sceHttp2GetStatusCode", .function = trace.wrap("sceHttp2GetStatusCode", &http2GetStatusCode), .expect_id = "9XYJwCf3lEA" },
+    .{ .name = "sceHttp2GetAllResponseHeaders", .function = trace.wrap("sceHttp2GetAllResponseHeaders", &http2GetAllHeaders), .expect_id = "-rdXUi2XW90" },
+    .{ .name = "sceHttp2ReadData", .function = trace.wrap("sceHttp2ReadData", &http2ReadData), .expect_id = "QygCNNmbGss" },
 };
 
 // libSceNpWebApi2 -----------------------------------------------------------
@@ -772,17 +773,17 @@ fn webApiHeaderValue(id: i64, field: ?[*:0]const u8, value: ?[*]u8, size: usize)
 }
 
 const web_api_exports = [_]symbols.Export{
-    .{ .name = "sceNpWebApi2Initialize", .function = abi.erase(&webApiInitialize), .expect_id = "+o9816YQhqQ" },
-    .{ .name = "sceNpWebApi2Terminate", .function = abi.erase(&webApiTerminate), .expect_id = "bEvXpcEk200" },
-    .{ .name = "sceNpWebApi2CreateUserContext", .function = abi.erase(&webApiCreateUser), .expect_id = "sk54bi6FtYM" },
-    .{ .name = "sceNpWebApi2DeleteUserContext", .function = abi.erase(&webApiDeleteUser), .expect_id = "9X9+cneTGUU" },
-    .{ .name = "sceNpWebApi2CreateRequest", .function = abi.erase(&webApiCreateRequest), .expect_id = "3EI-OSJ65Xc" },
-    .{ .name = "sceNpWebApi2AddHttpRequestHeader", .function = abi.erase(&webApiRequestOption), .expect_id = "egOOvrnF6mI" },
-    .{ .name = "sceNpWebApi2SendRequest", .function = abi.erase(&webApiSendRequest), .expect_id = "lQOCF84lvzw" },
-    .{ .name = "sceNpWebApi2ReadData", .function = abi.erase(&webApiReadData), .expect_id = "OOY9+ObfKec" },
-    .{ .name = "sceNpWebApi2DeleteRequest", .function = abi.erase(&webApiDeleteRequest), .expect_id = "vvzWO-DvG1s" },
-    .{ .name = "sceNpWebApi2GetHttpResponseHeaderValueLength", .function = abi.erase(&webApiHeaderLength), .expect_id = "HwP3aM+c85c" },
-    .{ .name = "sceNpWebApi2GetHttpResponseHeaderValue", .function = abi.erase(&webApiHeaderValue), .expect_id = "hksbskNToEA" },
+    .{ .name = "sceNpWebApi2Initialize", .function = trace.wrap("sceNpWebApi2Initialize", &webApiInitialize), .expect_id = "+o9816YQhqQ" },
+    .{ .name = "sceNpWebApi2Terminate", .function = trace.wrap("sceNpWebApi2Terminate", &webApiTerminate), .expect_id = "bEvXpcEk200" },
+    .{ .name = "sceNpWebApi2CreateUserContext", .function = trace.wrap("sceNpWebApi2CreateUserContext", &webApiCreateUser), .expect_id = "sk54bi6FtYM" },
+    .{ .name = "sceNpWebApi2DeleteUserContext", .function = trace.wrap("sceNpWebApi2DeleteUserContext", &webApiDeleteUser), .expect_id = "9X9+cneTGUU" },
+    .{ .name = "sceNpWebApi2CreateRequest", .function = trace.wrap("sceNpWebApi2CreateRequest", &webApiCreateRequest), .expect_id = "3EI-OSJ65Xc" },
+    .{ .name = "sceNpWebApi2AddHttpRequestHeader", .function = trace.wrap("sceNpWebApi2AddHttpRequestHeader", &webApiRequestOption), .expect_id = "egOOvrnF6mI" },
+    .{ .name = "sceNpWebApi2SendRequest", .function = trace.wrap("sceNpWebApi2SendRequest", &webApiSendRequest), .expect_id = "lQOCF84lvzw" },
+    .{ .name = "sceNpWebApi2ReadData", .function = trace.wrap("sceNpWebApi2ReadData", &webApiReadData), .expect_id = "OOY9+ObfKec" },
+    .{ .name = "sceNpWebApi2DeleteRequest", .function = trace.wrap("sceNpWebApi2DeleteRequest", &webApiDeleteRequest), .expect_id = "vvzWO-DvG1s" },
+    .{ .name = "sceNpWebApi2GetHttpResponseHeaderValueLength", .function = trace.wrap("sceNpWebApi2GetHttpResponseHeaderValueLength", &webApiHeaderLength), .expect_id = "HwP3aM+c85c" },
+    .{ .name = "sceNpWebApi2GetHttpResponseHeaderValue", .function = trace.wrap("sceNpWebApi2GetHttpResponseHeaderValue", &webApiHeaderValue), .expect_id = "hksbskNToEA" },
 };
 
 pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {

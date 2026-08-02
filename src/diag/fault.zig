@@ -60,6 +60,26 @@ fn readGuestWord(address_space: *memory.AddressSpace, address: u64) ?u64 {
     return std.mem.readInt(u64, bytes[0..8], .little);
 }
 
+/// Copies a run of guest bytes, or null if the range is not fully mapped.
+///
+/// Used to recover text a title wrote for its own diagnostics. Bounded by the
+/// caller's buffer and guarded by a mapping check, since reading unmapped
+/// memory while reporting a failure would lose the report.
+pub fn readGuestText(
+    address_space: *memory.AddressSpace,
+    address: u64,
+    length: u64,
+    buffer: []u8,
+) ?[]const u8 {
+    if (address == 0 or length == 0) return null;
+    const wanted: usize = @intCast(@min(length, buffer.len));
+    if (!address_space.isMapped(address, wanted)) return null;
+
+    const bytes: [*]const u8 = @ptrFromInt(address);
+    @memcpy(buffer[0..wanted], bytes[0..wanted]);
+    return buffer[0..wanted];
+}
+
 fn classify(info: cpu.FaultInfo) Diagnosis {
     if (info.kind == .illegal_instruction) return .illegal_instruction;
     if (info.kind != .access_violation) return .unknown;

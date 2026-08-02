@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const abi = @import("../abi.zig");
+const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 
@@ -49,9 +50,9 @@ fn heapErrorReportForGame(
 }
 
 pub const exports = [_]symbols.Export{
-    .{ .name = "sceLibcInternalBacktraceForGame", .function = abi.erase(&backtraceForGame), .expect_id = "EHsF2i9FXPM" },
-    .{ .name = "sceLibcHeapGetTraceInfo", .function = abi.erase(&heapGetTraceInfo), .expect_id = "NWtTN10cJzE" },
-    .{ .name = "sceLibcInternalHeapErrorReportForGame", .function = abi.erase(&heapErrorReportForGame), .expect_id = "al3JzFI9MQ0" },
+    .{ .name = "sceLibcInternalBacktraceForGame", .function = trace.wrap("sceLibcInternalBacktraceForGame", &backtraceForGame), .expect_id = "EHsF2i9FXPM" },
+    .{ .name = "sceLibcHeapGetTraceInfo", .function = trace.wrap("sceLibcHeapGetTraceInfo", &heapGetTraceInfo), .expect_id = "NWtTN10cJzE" },
+    .{ .name = "sceLibcInternalHeapErrorReportForGame", .function = trace.wrap("sceLibcInternalHeapErrorReportForGame", &heapErrorReportForGame), .expect_id = "al3JzFI9MQ0" },
 };
 
 pub const library = symbols.Library{ .name = "libSceLibcInternalExt", .version = 1 };

@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const abi = @import("../abi.zig");
+const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const kernel_runtime = @import("kernel_runtime.zig");
@@ -183,24 +184,24 @@ fn isRemoteController(_: i32) callconv(abi.guest) i32 {
 }
 
 pub const exports = [_]symbols.Export{
-    .{ .name = "scePadInit", .function = abi.erase(&padInit), .expect_id = "hv1luiJrqQM" },
-    .{ .name = "scePadOpen", .function = abi.erase(&padOpen), .expect_id = "xk0AcarP3V4" },
-    .{ .name = "scePadClose", .function = abi.erase(&padClose), .expect_id = "6ncge5+l5Qs" },
-    .{ .name = "scePadRead", .function = abi.erase(&padRead), .expect_id = "q1cHNfGycLI" },
-    .{ .name = "scePadGetControllerInformation", .function = abi.erase(&getControllerInformation), .expect_id = "gjP9-KQzoUk" },
-    .{ .name = "scePadDeviceClassGetExtendedInformation", .function = abi.erase(&deviceClassGetExtendedInformation), .expect_id = "AcslpN1jHR8" },
-    .{ .name = "scePadDeviceClassParseData", .function = abi.erase(&deviceClassParseData), .expect_id = "IHPqcbc0zCA" },
-    .{ .name = "scePadSetMotionSensorState", .function = abi.erase(&setMotionSensorState), .expect_id = "clVvL4ZDntw" },
-    .{ .name = "scePadSetAngularVelocityDeadbandState", .function = abi.erase(&acceptHandleState), .expect_id = "r44mAxdSG+U" },
-    .{ .name = "scePadSetTiltCorrectionState", .function = abi.erase(&acceptHandleState), .expect_id = "vDLMoJLde8I" },
-    .{ .name = "scePadResetOrientation", .function = abi.erase(&resetOrientation), .expect_id = "rIZnR6eSpvk" },
-    .{ .name = "scePadSetTriggerEffect", .function = abi.erase(&acceptPointerState), .expect_id = "2JgFB2n9oUM" },
-    .{ .name = "scePadSetVibration", .function = abi.erase(&acceptPointerState), .expect_id = "yFVnOdGxvZY" },
-    .{ .name = "scePadSetLightBar", .function = abi.erase(&acceptPointerState), .expect_id = "RR4novUEENY" },
-    .{ .name = "scePadResetLightBar", .function = abi.erase(&resetOrientation), .expect_id = "DscD1i9HX1w" },
-    .{ .name = "scePadSetVibrationMode", .function = abi.erase(&setVibrationMode), .expect_id = "W2G-yoyMF5U" },
-    .{ .name = "scePadGetTriggerEffectState", .function = abi.erase(&getTriggerEffectState), .expect_id = "znaWI0gpuo8" },
-    .{ .name = "scePadIsRemoteController", .function = abi.erase(&isRemoteController), .expect_id = "fCWdlnmB1Ks" },
+    .{ .name = "scePadInit", .function = trace.wrap("scePadInit", &padInit), .expect_id = "hv1luiJrqQM" },
+    .{ .name = "scePadOpen", .function = trace.wrap("scePadOpen", &padOpen), .expect_id = "xk0AcarP3V4" },
+    .{ .name = "scePadClose", .function = trace.wrap("scePadClose", &padClose), .expect_id = "6ncge5+l5Qs" },
+    .{ .name = "scePadRead", .function = trace.wrap("scePadRead", &padRead), .expect_id = "q1cHNfGycLI" },
+    .{ .name = "scePadGetControllerInformation", .function = trace.wrap("scePadGetControllerInformation", &getControllerInformation), .expect_id = "gjP9-KQzoUk" },
+    .{ .name = "scePadDeviceClassGetExtendedInformation", .function = trace.wrap("scePadDeviceClassGetExtendedInformation", &deviceClassGetExtendedInformation), .expect_id = "AcslpN1jHR8" },
+    .{ .name = "scePadDeviceClassParseData", .function = trace.wrap("scePadDeviceClassParseData", &deviceClassParseData), .expect_id = "IHPqcbc0zCA" },
+    .{ .name = "scePadSetMotionSensorState", .function = trace.wrap("scePadSetMotionSensorState", &setMotionSensorState), .expect_id = "clVvL4ZDntw" },
+    .{ .name = "scePadSetAngularVelocityDeadbandState", .function = trace.wrap("scePadSetAngularVelocityDeadbandState", &acceptHandleState), .expect_id = "r44mAxdSG+U" },
+    .{ .name = "scePadSetTiltCorrectionState", .function = trace.wrap("scePadSetTiltCorrectionState", &acceptHandleState), .expect_id = "vDLMoJLde8I" },
+    .{ .name = "scePadResetOrientation", .function = trace.wrap("scePadResetOrientation", &resetOrientation), .expect_id = "rIZnR6eSpvk" },
+    .{ .name = "scePadSetTriggerEffect", .function = trace.wrap("scePadSetTriggerEffect", &acceptPointerState), .expect_id = "2JgFB2n9oUM" },
+    .{ .name = "scePadSetVibration", .function = trace.wrap("scePadSetVibration", &acceptPointerState), .expect_id = "yFVnOdGxvZY" },
+    .{ .name = "scePadSetLightBar", .function = trace.wrap("scePadSetLightBar", &acceptPointerState), .expect_id = "RR4novUEENY" },
+    .{ .name = "scePadResetLightBar", .function = trace.wrap("scePadResetLightBar", &resetOrientation), .expect_id = "DscD1i9HX1w" },
+    .{ .name = "scePadSetVibrationMode", .function = trace.wrap("scePadSetVibrationMode", &setVibrationMode), .expect_id = "W2G-yoyMF5U" },
+    .{ .name = "scePadGetTriggerEffectState", .function = trace.wrap("scePadGetTriggerEffectState", &getTriggerEffectState), .expect_id = "znaWI0gpuo8" },
+    .{ .name = "scePadIsRemoteController", .function = trace.wrap("scePadIsRemoteController", &isRemoteController), .expect_id = "fCWdlnmB1Ks" },
 };
 
 pub const library = symbols.Library{ .name = "libScePad", .version = 1 };
