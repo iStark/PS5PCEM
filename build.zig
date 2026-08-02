@@ -20,6 +20,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Guest module images: ELF64 parsing and the dynamic linking tables.
+    const loader = b.addModule("loader", .{
+        .root_source_file = b.path("src/loader/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe = b.addExecutable(.{
         .name = "rdna2-disasm",
         .root_module = b.createModule(.{
@@ -41,7 +48,7 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     const test_step = b.step("test", "Run the test suite");
-    for ([_]*std.Build.Module{ mod, hle, exe.root_module }) |m| {
+    for ([_]*std.Build.Module{ mod, hle, loader, exe.root_module }) |m| {
         const tests = b.addTest(.{ .root_module = m });
         test_step.dependOn(&b.addRunArtifact(tests).step);
     }
