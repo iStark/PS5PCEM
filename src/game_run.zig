@@ -109,6 +109,15 @@ fn run(init: std.process.Init) !bool {
     };
     defer graph.deinit();
 
+    // Must precede any guest execution: a throwing title asks the kernel which
+    // module owns each return address, and without an answer its runtime finds
+    // no handler and terminates instead of recovering.
+    const unwind_modules = try graph.publishUnwindModules(allocator);
+    defer {
+        runtime.firmware.unwind.detach();
+        allocator.free(unwind_modules);
+    }
+
     try emu.enableNativeCpuDispatcher(io);
     const prepared = try emu.prepareInitialThread("eboot-main");
     defer emu.releaseInitialThread(prepared.handle) catch {};

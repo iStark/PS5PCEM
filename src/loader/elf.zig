@@ -87,6 +87,10 @@ pub const SegmentType = enum(u32) {
     sce_procparam = 0x6100_0001,
     /// Region made read-only after relocation.
     sce_relro = 0x6100_0010,
+    /// Exception-handling frame index. A C++ runtime locates this to find the
+    /// unwind tables for a module, so a title that throws cannot recover
+    /// without it.
+    gnu_eh_frame = 0x6474_e550,
     /// Build provenance stored by newer PS5 toolchains.
     sce_comment_ps5 = 0x6fff_ff00,
     /// Dynamic linking data stored by newer PS5 toolchains.

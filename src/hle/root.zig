@@ -12,6 +12,7 @@
 pub const nid = @import("nid.zig");
 pub const abi = @import("abi.zig");
 pub const trace = @import("trace.zig");
+pub const unwind = @import("unwind.zig");
 pub const errno = @import("errno.zig");
 pub const symbols = @import("symbols.zig");
 
@@ -71,6 +72,7 @@ test {
     _ = nid;
     _ = abi;
     _ = trace;
+    _ = unwind;
     _ = errno;
     _ = symbols;
     _ = libs.kernel_event_queue;

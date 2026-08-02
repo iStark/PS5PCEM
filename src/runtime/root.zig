@@ -14,6 +14,9 @@ const loader = @import("loader");
 const hle = @import("hle");
 const cpu = @import("cpu");
 const diag = @import("diag");
+/// Re-exported so callers composing a process do not need a separate dependency
+/// on the firmware layer just to publish or tear down what the runtime wires.
+pub const firmware = hle;
 pub const process = @import("process.zig");
 pub const module_graph = @import("module_graph.zig");
 pub const ModuleGraph = module_graph.ModuleGraph;

@@ -7,6 +7,7 @@ const std = @import("std");
 const memory = @import("memory");
 const loader = @import("loader");
 const diag = @import("diag");
+const hle = @import("hle");
 
 pub const Options = struct {
     /// The executable is relocatable in practice even though titles commonly
@@ -50,6 +51,16 @@ pub const Module = struct {
         gpa.free(self.path);
     }
 };
+
+/// Reads already-mapped guest bytes. The address space is identity mapped, so
+/// this is a host load; it is only ever called on addresses taken from a
+/// module's own program headers, which are mapped by construction.
+fn readMappedBytes(address: u64, out: []u8) bool {
+    if (address == 0) return false;
+    const bytes: [*]const u8 = @ptrFromInt(address);
+    @memcpy(out, bytes[0..out.len]);
+    return true;
+}
 
 const Candidate = struct {
     path: []u8,
@@ -108,6 +119,65 @@ pub const ModuleGraph = struct {
 
     pub fn moduleCount(self: *const ModuleGraph) usize {
         return self.nodes.items.len - 1;
+    }
+
+    /// Publishes each mapped module's extent and unwind tables to the firmware.
+    ///
+    /// A throwing title asks the kernel, for every return address on its stack,
+    /// which module owns it and where that module's unwind index lives. Without
+    /// this the C++ runtime finds no handler and every exception terminates the
+    /// process, so this has to be in place before guest code runs.
+    ///
+    /// The returned list backs the published registry and must outlive the
+    /// process; the caller owns it.
+    pub fn publishUnwindModules(
+        self: *ModuleGraph,
+        gpa: std.mem.Allocator,
+    ) std.mem.Allocator.Error![]hle.unwind.Module {
+        var list: std.ArrayList(hle.unwind.Module) = .empty;
+        errdefer list.deinit(gpa);
+
+        for (self.nodes.items) |*node| {
+            const mapped = if (node.mapped) |*m| m else continue;
+
+            var start: u64 = std.math.maxInt(u64);
+            var end: u64 = 0;
+            for (mapped.ranges.items) |range| {
+                start = @min(start, range.start);
+                end = @max(end, range.end);
+            }
+            if (end == 0) continue;
+
+            var entry = hle.unwind.Module{
+                .name = std.fs.path.basename(node.path),
+                .start = start,
+                .end = end,
+            };
+
+            if (node.image.findSegment(.gnu_eh_frame)) |header| {
+                entry.eh_frame_header = mapped.load_bias + header.vaddr;
+                entry.eh_frame_header_size = header.memsz;
+                if (hle.unwind.decodeEhFrame(
+                    entry.eh_frame_header,
+                    entry.eh_frame_header_size,
+                    &readMappedBytes,
+                )) |address| {
+                    entry.eh_frame = address;
+                    // The index sits immediately after the records in every
+                    // layout seen so far; when it does not, leaving the size
+                    // unset is safer than inventing an extent.
+                    if (address < entry.eh_frame_header) {
+                        entry.eh_frame_size = entry.eh_frame_header - address;
+                    }
+                }
+            }
+
+            try list.append(gpa, entry);
+        }
+
+        const published = try list.toOwnedSlice(gpa);
+        hle.unwind.attach(published);
+        return published;
     }
 
     /// Builds an address-to-symbol map covering every mapped module.
