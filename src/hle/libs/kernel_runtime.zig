@@ -14,6 +14,7 @@ const abi = @import("../abi.zig");
 const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
+const unwind = @import("../unwind.zig");
 const memory_api = @import("kernel_memory.zig");
 const threading = @import("kernel_threading.zig");
 
@@ -123,6 +124,73 @@ fn posixUnsupported(
 ) callconv(abi.guest) i64 {
     setErrno(errno.Posix.enosys);
     return -1;
+}
+
+/// Reports which module owns an address and where its unwind tables are.
+///
+/// A throwing title asks this for every return address on the stack. Answering
+/// with "unimplemented" leaves its runtime unable to find any handler, so a
+/// caught exception becomes a call to `terminate` — the failure looks like a
+/// crash in unrelated code long after the throw.
+///
+/// `flags` selects the record variant; only the two documented forms exist, and
+/// anything above them is rejected after clearing the record so a guest cannot
+/// read stale stack contents as a result.
+fn getModuleInfoForUnwind(
+    address: u64,
+    flags: i32,
+    info: ?*unwind.Info,
+) callconv(abi.guest) i32 {
+    if (flags >= 3) {
+        if (info) |out| out.* = .{};
+        return KernelError.einval.raw();
+    }
+    const out = info orelse return KernelError.efault.raw();
+    // The guest declares which layout it understands by pre-filling the size.
+    // Filling a record it believes to be smaller would write past its buffer.
+    if (out.size < @sizeOf(unwind.Info)) return KernelError.einval.raw();
+
+    const owner = unwind.find(address) orelse return KernelError.esrch.raw();
+    unwind.describe(owner, out);
+    return errno.ok;
+}
+
+/// Writes guest output to the host's standard streams.
+///
+/// Only the standard descriptors are handled. A title's own diagnostics are the
+/// clearest statement of what went wrong, and refusing this call silences them:
+/// the guest runtime then fails without ever explaining itself, which is far
+/// more expensive to debug than the write is to support.
+///
+/// Any other descriptor still reports that files are unimplemented, rather than
+/// pretending a write succeeded and letting the guest believe data was stored.
+fn guestWrite(descriptor: i32, buffer: ?[*]const u8, length: u64) callconv(abi.guest) i64 {
+    if (descriptor != 1 and descriptor != 2) {
+        setErrno(errno.Posix.ebadf);
+        return -1;
+    }
+    const bytes = buffer orelse {
+        setErrno(errno.Posix.efault);
+        return -1;
+    };
+    if (length == 0) return 0;
+
+    const io = active_io orelse {
+        setErrno(errno.Posix.eio);
+        return -1;
+    };
+
+    const file = if (descriptor == 2) std.Io.File.stderr() else std.Io.File.stdout();
+    // Unbuffered: guest output is interleaved with host diagnostics, and a
+    // title writing its last words before terminating must not lose them to a
+    // buffer that never gets flushed.
+    var writer = file.writerStreaming(io, &.{});
+    writer.interface.writeAll(bytes[0..@intCast(length)]) catch {
+        setErrno(errno.Posix.eio);
+        return -1;
+    };
+    writer.interface.flush() catch {};
+    return @intCast(length);
 }
 
 fn setThreadDtors(callback: u64) callconv(abi.guest) i32 {
@@ -406,7 +474,7 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceKernelMlock", .function = trace.wrap("sceKernelMlock", &compatSuccess), .expect_id = "3k6kx-zOOSQ" },
     .{ .name = "sceKernelIsAddressSanitizerEnabled", .function = trace.wrap("sceKernelIsAddressSanitizerEnabled", &compatSuccess), .expect_id = "jh+8XiK4LeE" },
     .{ .name = "_read", .function = trace.wrap("_read", &posixUnsupported), .expect_id = "DRuBt2pvICk" },
-    .{ .name = "_write", .function = trace.wrap("_write", &posixUnsupported), .expect_id = "FxVZqBAA7ks" },
+    .{ .name = "_write", .function = trace.wrap("_write", &guestWrite), .expect_id = "FxVZqBAA7ks" },
     .{ .name = "_open", .function = trace.wrap("_open", &posixUnsupported), .expect_id = "6c3rCVE-fTU" },
     .{ .name = "_close", .function = trace.wrap("_close", &posixUnsupported), .expect_id = "NNtFaKJbPt0" },
     .{ .name = "lseek", .function = trace.wrap("lseek", &posixUnsupported), .expect_id = "Oy6IpwgtYOk" },
@@ -419,7 +487,7 @@ pub const exports = [_]symbols.Export{
     .{ .name = "_sceKernelRtldThreadAtexitDecrement", .function = trace.wrap("_sceKernelRtldThreadAtexitDecrement", &rtldThreadAtexitDecrement), .expect_id = "8OnWXlgQlvo" },
     .{ .name = "sceKernelGetModuleInfoFromAddr", .function = trace.wrap("sceKernelGetModuleInfoFromAddr", &kernelUnsupported), .expect_id = "f7KBOafysXo" },
     .{ .name = "scePthreadGetname", .function = trace.wrap("scePthreadGetname", &pthreadGetname), .expect_id = "How7B8Oet6k" },
-    .{ .name = "sceKernelGetModuleInfoForUnwind", .function = trace.wrap("sceKernelGetModuleInfoForUnwind", &kernelUnsupported), .expect_id = "RpQJJVKTiFM" },
+    .{ .name = "sceKernelGetModuleInfoForUnwind", .function = trace.wrap("sceKernelGetModuleInfoForUnwind", &getModuleInfoForUnwind), .expect_id = "RpQJJVKTiFM" },
     .{ .name = "_is_signal_return", .function = trace.wrap("_is_signal_return", &compatSuccess), .expect_id = "crb5j7mkk1c" },
     .{ .name = "__elf_phdr_match_addr", .function = trace.wrap("__elf_phdr_match_addr", &elfPhdrMatchAddr), .expect_id = "Fjc4-n1+y2g" },
     .{ .name = "__pthread_cxa_finalize", .function = trace.wrap("__pthread_cxa_finalize", &compatSuccess), .expect_id = "kbw4UHHSYy0" },
@@ -486,7 +554,7 @@ pub const posix_exports = [_]symbols.Export{
     .{ .name = "fstat", .function = trace.wrap("fstat", &posixUnsupported), .expect_id = "mqQMh1zPPT8" },
     .{ .name = "fchmod", .function = trace.wrap("fchmod", &posixUnsupported), .expect_id = "n01yNbQO5W4" },
     .{ .name = "read", .function = trace.wrap("read", &posixUnsupported), .expect_id = "AqBioC2vF3I" },
-    .{ .name = "write", .function = trace.wrap("write", &posixUnsupported), .expect_id = "FN4gaPmuFV8" },
+    .{ .name = "write", .function = trace.wrap("write", &guestWrite), .expect_id = "FN4gaPmuFV8" },
     .{ .name = "futimes", .function = trace.wrap("futimes", &posixUnsupported), .expect_id = "+0EDo7YzcoU" },
     .{ .name = "open", .function = trace.wrap("open", &posixUnsupported), .expect_id = "wuCroIGjt2g" },
     .{ .name = "close", .function = trace.wrap("close", &posixUnsupported), .expect_id = "bY-PO6JhzhQ" },
