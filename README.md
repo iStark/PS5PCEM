@@ -1,15 +1,24 @@
-# rdna2-disasm
+# PS5 emulation components
 
-A disassembler for RDNA2 scalar shader instructions, written in Zig.
+Building blocks for PlayStation 5 emulation, written in Zig. Two independent
+modules, each usable on its own:
+
+| Module | What it does |
+|---|---|
+| **`rdna2`** | Decodes and disassembles RDNA2 shader machine code |
+| **`hle`** | High-level emulation of the guest firmware: symbol resolution and firmware libraries |
+
+Neither depends on anything beyond the Zig standard library, and both
+cross-compile to Windows, Linux, and macOS from any of them.
+
+---
+
+# `rdna2` — shader decoder
 
 RDNA2 is the GPU architecture behind the PlayStation 5. Its shaders ship as raw
 GPU machine code rather than as a portable intermediate representation, so any
 tool that inspects, recompiles, or validates them has to start by decoding that
-machine code. This project is that decoding layer, isolated into a small
-standalone library and a command-line tool.
-
-It has no dependencies beyond the Zig standard library, and cross-compiles to
-Windows, Linux, and macOS from any of them.
+machine code.
 
 ## Status
 
@@ -115,21 +124,18 @@ yourself; `formatInstruction` and `formatProgram` write text to any
 
 | File | Contents |
 |---|---|
-| [src/isa.zig](src/isa.zig) | Families, opcodes, operand kinds |
-| [src/operand.zig](src/operand.zig) | Operand and inline-constant decoding |
-| [src/instruction.zig](src/instruction.zig) | Instruction representation, literal fetching |
-| [src/scalar_alu.zig](src/scalar_alu.zig) | SOP family decoders, comptime opcode tables |
-| [src/decoder.zig](src/decoder.zig) | Dispatch, parsing a program to `s_endpgm` |
-| [src/disasm.zig](src/disasm.zig) | Textual output |
+| [src/rdna2/isa.zig](src/rdna2/isa.zig) | Families, opcodes, operand kinds |
+| [src/rdna2/operand.zig](src/rdna2/operand.zig) | Operand and inline-constant decoding |
+| [src/rdna2/instruction.zig](src/rdna2/instruction.zig) | Instruction representation, literal fetching |
+| [src/rdna2/scalar_alu.zig](src/rdna2/scalar_alu.zig) | SOP family decoders, comptime opcode tables |
+| [src/rdna2/decoder.zig](src/rdna2/decoder.zig) | Dispatch, parsing a program to `s_endpgm` |
+| [src/rdna2/disasm.zig](src/rdna2/disasm.zig) | Textual output |
 | [src/main.zig](src/main.zig) | Command-line front end |
-
-Roughly 1200 lines including tests. Every module carries its own tests next to
-the code they cover; `zig build test` runs all of them.
 
 ## Design notes
 
 **Opcode tables are expanded at compile time.** `buildTable` in
-[src/scalar_alu.zig](src/scalar_alu.zig) turns a declarative list of
+[src/rdna2/scalar_alu.zig](src/rdna2/scalar_alu.zig) turns a declarative list of
 `{encoding, opcode}` pairs into a direct-index array, so a lookup is one indexed
 load. The same pass rejects duplicate encodings and out-of-range entries as
 compile errors, which means a mistake in a table cannot reach a test — it stops
@@ -158,3 +164,95 @@ set.
 3. `SMEM` and `MUBUF`/`MTBUF` — descriptor and buffer access.
 4. Basic-block reconstruction from the branch targets the decoder already
    collects.
+
+---
+
+# `hle` — firmware emulation
+
+Guest binaries do not ship the firmware they call into. Every import is a numeric
+identifier, and the runtime is expected to supply an implementation. This module
+provides that machinery and the firmware libraries built on top of it.
+
+## Symbol identifiers
+
+An import is an 11-character identifier derived from the export name: SHA-1 over
+the name plus a fixed salt, with the first eight bytes of the digest re-encoded
+in a base64 variant. [src/hle/nid.zig](src/hle/nid.zig) computes it.
+
+Computing identifiers rather than hard-coding them is what makes the rest safe.
+An implementation is registered under a readable name and can assert the
+identifier it is expected to produce:
+
+```zig
+.{
+    .name = "sceKernelAllocateDirectMemory",
+    .function = abi.erase(&sceKernelAllocateDirectMemory),
+    .expect_id = "rTXw65xmLIA",
+}
+```
+
+A misspelled name now fails at registration. With opaque string constants it
+would instead surface much later, as an import the guest cannot resolve, with
+nothing to point at the cause.
+
+The implementation is pinned by tests against published name/identifier pairs;
+breaking it would break symbol resolution for every guest module.
+
+## Symbol registry
+
+[src/hle/symbols.zig](src/hle/symbols.zig) is what the dynamic linker resolves
+against. A lookup is keyed on the identifier *together with* the library and
+module it was requested from, plus their versions — the same identifier can be
+exported by more than one library. A fallback lookup by identifier alone exists
+for imports that carry no usable metadata; it is ambiguous by construction and
+documented as a last resort.
+
+## Calling convention
+
+Guest code is compiled for the System V AMD64 ABI. On Linux and macOS that is
+also the host convention; on Windows the host uses Microsoft x64, which passes
+different registers and reserves shadow space.
+
+Every guest-callable function is therefore declared `callconv(abi.guest)`.
+Omitting it on Windows still compiles — it just reads arguments from the wrong
+registers, surfacing later as nonsensical parameter values. Routing the decision
+through [src/hle/abi.zig](src/hle/abi.zig) keeps it in one place.
+
+## Implemented libraries
+
+**`libkernel` — direct memory** ([src/hle/libs/kernel_memory.zig](src/hle/libs/kernel_memory.zig))
+
+"Direct memory" is the guest's name for physical video memory. A title reserves
+a physical range, then maps it into its address space; the two steps are
+separate. The reservation bookkeeping is implemented — placement, alignment,
+overlap rejection, exhaustion, release. Mapping needs the guest address space,
+which does not exist yet, so `sceKernelMapDirectMemory` validates the
+reservation and then reports that the operation is unimplemented rather than
+pretending to succeed.
+
+| Export | State |
+|---|---|
+| `sceKernelAllocateDirectMemory` | Implemented |
+| `sceKernelReleaseDirectMemory` | Implemented |
+| `sceKernelGetDirectMemorySize` | Implemented |
+| `sceKernelMapDirectMemory` | Validates, then reports unimplemented |
+
+## Error codes
+
+Two numbering schemes coexist in the guest ABI, and mixing them up is a common
+source of confusion. Kernel entry points return `0` or a negative status of the
+form `0x8002_00xx`, where the low byte is a POSIX error number. POSIX entry
+points follow C library conventions instead. [src/hle/errno.zig](src/hle/errno.zig)
+models both and converts between them.
+
+Note that internal APIs use Zig error sets, and translation to guest status
+codes happens at the entry point. Keeping them apart stops a raw guest status
+from leaking into host code where nothing would check it.
+
+## Roadmap
+
+1. An ELF/PRX loader, so imports can be resolved against this registry for real.
+2. Virtual memory: `sceKernelMapDirectMemory` and the flexible-memory calls,
+   which need a guest address space.
+3. Threading: the `pthread_*` and `scePthread*` families.
+4. Event queues, on which most firmware asynchrony is built.
