@@ -380,6 +380,7 @@ fn sceKernelMapDirectMemory(
     if (physical_address % page_size != 0) return KernelError.einval.raw();
     const effective_alignment = @max(alignment, page_size);
     if (!std.math.isPowerOfTwo(effective_alignment)) return KernelError.einval.raw();
+    const map_flags: u32 = @bitCast(flags);
 
     pool_lock.lock();
     defer pool_lock.unlock();
@@ -391,9 +392,15 @@ fn sceKernelMapDirectMemory(
     const protection = decodeProtection(protection_bits) orelse return KernelError.einval.raw();
 
     const requested_address = output.*;
-    const mapped_address = if (flags & map_fixed != 0) fixed: {
-        if (requested_address == 0 or requested_address % page_size != 0) {
+    output.* = 0;
+    const mapped_address = if (map_flags & @as(u32, @intCast(map_fixed)) != 0) fixed: {
+        if (requested_address == 0 or requested_address % effective_alignment != 0) {
             return KernelError.einval.raw();
+        }
+        if (address_space.isMapped(requested_address, len)) {
+            if (map_flags & map_no_overwrite != 0) return KernelError.enomem.raw();
+            address_space.unmap(requested_address, len) catch |err|
+                return mapAddressSpaceError(err);
         }
         address_space.mapFixed(
             requested_address,
@@ -1104,6 +1111,30 @@ test "direct memory maps at an exact guest address" {
             0,
         ),
     );
+
+    try address_space.reserveFixed(virtual_address, page_size);
+    try testing.expectEqual(
+        memory.MappingKind.reserved,
+        address_space.query(virtual_address, false).?.kind,
+    );
+    const reserved_address = virtual_address;
+    try testing.expectEqual(
+        KernelError.enomem.raw(),
+        sceKernelMapDirectMemory(
+            &virtual_address,
+            page_size,
+            title_protection,
+            @bitCast(@as(u32, @intCast(map_fixed)) | map_no_overwrite),
+            start,
+            0,
+        ),
+    );
+    try testing.expectEqual(@as(u64, 0), virtual_address);
+    try testing.expectEqual(
+        memory.MappingKind.reserved,
+        address_space.query(reserved_address, false).?.kind,
+    );
+    virtual_address = reserved_address;
 
     try testing.expectEqual(
         errno.ok,
