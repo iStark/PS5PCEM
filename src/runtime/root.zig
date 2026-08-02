@@ -213,11 +213,15 @@ pub const Runtime = struct {
     ) std.Io.Writer.Error!bool {
         const record = self.lastNativeFault() orelse return false;
 
-        const report = diag.analyzeFault(record.info, &self.address_space);
+        // Optional by value, so the pointer has to be taken through the payload
+        // rather than from the field itself.
+        const space: ?*memory.AddressSpace = if (self.address_space) |*value| value else null;
+        const report = diag.analyzeFault(record.info, space);
         try diag.writeFault(report, map, w);
         try w.print("  entry       ", .{});
         try map.write(self.last_dispatch_entry, w);
         try w.writeAll("\n");
+        if (space) |value| try diag.writeStackTrace(report, map, value, w);
         return true;
     }
 

@@ -98,6 +98,45 @@ pub fn analyze(info: cpu.FaultInfo, address_space: ?*memory.AddressSpace) Report
     return report;
 }
 
+/// How far up the stack to look for return addresses.
+///
+/// Guest code is compiled with frame pointers omitted in places, so a reliable
+/// unwind is not available. Scanning a bounded window and keeping the words
+/// that land inside a loaded module recovers the call chain in practice, at the
+/// cost of occasional stale entries — which is why the output is labelled a
+/// scan rather than a backtrace.
+const stack_scan_words: usize = 48;
+
+/// Writes stack words that point into loaded code.
+pub fn writeStackTrace(
+    report: Report,
+    map: *const SymbolMap,
+    address_space: *memory.AddressSpace,
+    w: *std.Io.Writer,
+) std.Io.Writer.Error!void {
+    var rsp = report.info.registers.rsp;
+    if (rsp == 0) return;
+
+    var printed: usize = 0;
+    for (0..stack_scan_words) |_| {
+        const word = readGuestWord(address_space, rsp) orelse break;
+        rsp += @sizeOf(u64);
+
+        // A return address points after its call instruction; stepping back
+        // keeps the lookup on the calling instruction.
+        const location = map.locate(word -| 1);
+        if (!location.isKnown()) continue;
+
+        if (printed == 0) try w.writeAll("  stack scan\n");
+        try w.writeAll("    ");
+        try map.write(word -| 1, w);
+        try w.writeAll("\n");
+
+        printed += 1;
+        if (printed >= 8) break;
+    }
+}
+
 fn describe(diagnosis: Diagnosis) []const u8 {
     return switch (diagnosis) {
         .null_call => "call through a null pointer",

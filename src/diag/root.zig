@@ -20,6 +20,7 @@ pub const FaultReport = fault.Report;
 
 pub const analyzeFault = fault.analyze;
 pub const writeFault = fault.write;
+pub const writeStackTrace = fault.writeStackTrace;
 
 test {
     _ = symbolize;

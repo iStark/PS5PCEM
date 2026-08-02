@@ -138,6 +138,15 @@ fn run(init: std.process.Init) !bool {
             .modules = graph.modules(),
         },
     ) catch |err| {
+        // Symbol-attributed report first: it names the module and, for a call
+        // through a null pointer, the caller recovered from the stack. The raw
+        // dumps below stay as supporting detail for cases it cannot classify.
+        if (graph.buildSymbolMap(allocator)) |built| {
+            var map = built;
+            defer map.deinit(allocator);
+            _ = emu.writeLastFault(&map, stderr) catch {};
+        } else |_| {}
+
         if (emu.lastNativeFault()) |fault| {
             try stderr.print(
                 "guest fault: {s}/{s}, code=0x{x}, dispatch=0x{x}, rip=0x{x}, address=0x{x}, rsp=0x{x}\n",

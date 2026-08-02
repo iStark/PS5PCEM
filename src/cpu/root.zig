@@ -521,9 +521,14 @@ const WindowsX64Machine = struct {
 
         const record = exception.ExceptionRecord;
         const context = exception.ContextRecord;
-        if (record.ExceptionFlags & exception_noncontinuable != 0 or
-            !isGuestAddress(context.Rip))
-        {
+        // A call through a function pointer that was never filled in leaves
+        // Rip at or near zero, which belongs to neither guest nor host. That is
+        // exactly the fault worth containing: declining it kills the process at
+        // the one moment the guest registers still explain why. Reaching a null
+        // address requires a control transfer, and `active_native_frame` has
+        // already established that this thread is inside a guest call.
+        const from_guest = isGuestAddress(context.Rip) or isNullControlTransfer(context.Rip);
+        if (record.ExceptionFlags & exception_noncontinuable != 0 or !from_guest) {
             return std.os.windows.EXCEPTION_CONTINUE_SEARCH;
         }
 
@@ -635,6 +640,27 @@ fn isGuestAddress(address: u64) bool {
         if (range.contains(address, 1)) return true;
     }
     return false;
+}
+
+/// Whether an instruction pointer looks like a jump through a null pointer.
+///
+/// The whole first page counts, not just zero: a null vtable slot or a callback
+/// reached through a struct field lands a little above it. No guest mapping
+/// exists there, so nothing legitimate is misclassified.
+fn isNullControlTransfer(address: u64) bool {
+    return address < memory.page_size;
+}
+
+test "a null instruction pointer is treated as guest control flow" {
+    // The fault a title hits when it calls a callback that was never
+    // registered. Declining to contain it loses every register that explains
+    // the failure.
+    try std.testing.expect(isNullControlTransfer(0));
+    try std.testing.expect(isNullControlTransfer(0x10));
+    try std.testing.expect(!isNullControlTransfer(memory.page_size));
+    // Real guest code stays out of the first page.
+    try std.testing.expect(!isGuestAddress(0));
+    try std.testing.expect(isGuestAddress(memory.system_managed.start));
 }
 
 extern fn ps5NativeCallWindowsX64(
