@@ -8,13 +8,13 @@
 //! steps are separate: the reservation is a claim on a physical range, and the
 //! mapping decides where and with what protection it becomes visible.
 //!
-//! What is modelled here is the allocator's bookkeeping — which physical ranges
-//! are taken, and with what alignment and memory type. Establishing the actual
-//! host mapping needs the guest address space, which does not exist yet, so
-//! `sceKernelMapDirectMemory` currently reports the reservation state without
-//! mapping anything.
+//! Physical reservations are kept here, while virtual placement is delegated to
+//! the process-wide `memory.AddressSpace`. Keeping one owner for virtual ranges
+//! is essential: ELF segments, relocations, and kernel mappings must agree on
+//! which exact host addresses are already occupied.
 
 const std = @import("std");
+const memory = @import("memory");
 const abi = @import("../abi.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
@@ -115,6 +115,15 @@ pub const Pool = struct {
         return null;
     }
 
+    pub fn findContainingRange(self: *const Pool, start: u64, len: u64) ?*const Reservation {
+        if (len == 0) return null;
+        const end = std.math.add(u64, start, len) catch return null;
+        for (self.reservations.items) |*r| {
+            if (start >= r.start and end <= r.end()) return r;
+        }
+        return null;
+    }
+
     fn isFree(self: *const Pool, start: u64, len: u64) bool {
         for (self.reservations.items) |r| {
             if (r.overlaps(start, len)) return false;
@@ -178,6 +187,7 @@ pub const Pool = struct {
 var pool: Pool = .{};
 var pool_gpa: ?std.mem.Allocator = null;
 var pool_lock: Lock = .{};
+var guest_address_space: ?*memory.AddressSpace = null;
 
 /// Installs the allocator the pool uses for its bookkeeping.
 pub fn init(gpa: std.mem.Allocator) void {
@@ -186,12 +196,21 @@ pub fn init(gpa: std.mem.Allocator) void {
     pool_gpa = gpa;
 }
 
+/// Connects libkernel memory exports to the process-wide guest address space.
+/// Passing null detaches it during runtime teardown.
+pub fn attachAddressSpace(address_space: ?*memory.AddressSpace) void {
+    pool_lock.lock();
+    defer pool_lock.unlock();
+    guest_address_space = address_space;
+}
+
 pub fn deinit() void {
     pool_lock.lock();
     defer pool_lock.unlock();
     if (pool_gpa) |gpa| pool.deinit(gpa);
     pool = .{};
     pool_gpa = null;
+    guest_address_space = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -255,26 +274,80 @@ fn sceKernelGetDirectMemorySize() callconv(abi.guest) u64 {
     return pool.size;
 }
 
-/// Maps a reserved range into the guest address space.
-///
-/// Not implemented: establishing the mapping needs the guest address space.
-/// The reservation is still validated, so a title that maps an address it never
-/// reserved gets the same rejection it would on hardware.
+const map_fixed: i32 = 0x10;
+const prot_cpu_read: i32 = 0x01;
+const prot_cpu_write: i32 = 0x02;
+const prot_cpu_execute: i32 = 0x04;
+const prot_gpu_read: i32 = 0x10;
+const prot_gpu_write: i32 = 0x20;
+
+/// Maps a reserved physical range into the identity-mapped guest address space.
 fn sceKernelMapDirectMemory(
-    _: ?*u64,
+    out_address: ?*u64,
     len: u64,
-    _: i32,
-    _: i32,
+    protection_bits: i32,
+    flags: i32,
     physical_address: u64,
-    _: u64,
+    alignment: u64,
 ) callconv(abi.guest) i32 {
-    if (len == 0) return KernelError.einval.raw();
+    if (len == 0 or len % page_size != 0) return KernelError.einval.raw();
+    if (physical_address % page_size != 0) return KernelError.einval.raw();
+    const effective_alignment = @max(alignment, page_size);
+    if (!std.math.isPowerOfTwo(effective_alignment)) return KernelError.einval.raw();
 
     pool_lock.lock();
     defer pool_lock.unlock();
 
-    if (pool.findContaining(physical_address) == null) return KernelError.einval.raw();
-    return KernelError.enosys.raw();
+    if (pool.findContainingRange(physical_address, len) == null) return KernelError.einval.raw();
+    const output = out_address orelse return KernelError.efault.raw();
+    const address_space = guest_address_space orelse return KernelError.enosys.raw();
+    const protection = memory.Protection{
+        .read = protection_bits & (prot_cpu_read | prot_gpu_read) != 0,
+        .write = protection_bits & (prot_cpu_write | prot_gpu_write) != 0,
+        .execute = protection_bits & prot_cpu_execute != 0,
+    };
+
+    const requested_address = output.*;
+    const mapped_address = if (flags & map_fixed != 0) fixed: {
+        if (requested_address == 0 or requested_address % page_size != 0) {
+            return KernelError.einval.raw();
+        }
+        address_space.mapFixed(
+            requested_address,
+            len,
+            protection,
+            .direct_memory,
+            physical_address,
+        ) catch |err| return mapAddressSpaceError(err);
+        break :fixed requested_address;
+    } else address_space.map(
+        .user,
+        requested_address,
+        len,
+        effective_alignment,
+        protection,
+        .direct_memory,
+        physical_address,
+    ) catch |err| return mapAddressSpaceError(err);
+
+    output.* = mapped_address;
+    return errno.ok;
+}
+
+fn mapAddressSpaceError(err: memory.Error) i32 {
+    return switch (err) {
+        error.InvalidAddress, error.InvalidSize, error.InvalidAlignment => KernelError.einval.raw(),
+        error.UnsupportedHost => KernelError.enosys.raw(),
+        error.AddressSpaceUnavailable,
+        error.AddressUnavailable,
+        error.HostCommitFailed,
+        error.OutOfMemory,
+        => KernelError.enomem.raw(),
+        error.RangeNotMapped,
+        error.ProtectionDenied,
+        error.HostDecommitFailed,
+        => KernelError.eacces.raw(),
+    };
 }
 
 /// Exports of this library, paired with the identifiers the guest imports them
@@ -427,23 +500,49 @@ test "allocate and release round-trip through the entry points" {
     );
 }
 
-test "mapping an unreserved address is rejected" {
+test "direct memory maps at an exact guest address" {
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+
     init(testing.allocator);
     defer deinit();
+    attachAddressSpace(&address_space);
 
     var start: u64 = 0;
     _ = sceKernelAllocateDirectMemory(0, direct_memory_size, page_size, page_size, 0, &start);
+    var virtual_address = memory.user.start;
 
     // Far outside anything reserved.
     try testing.expectEqual(
         KernelError.einval.raw(),
-        sceKernelMapDirectMemory(null, page_size, 0, 0, direct_memory_size - page_size, 0),
+        sceKernelMapDirectMemory(
+            &virtual_address,
+            page_size,
+            prot_cpu_read | prot_cpu_write,
+            map_fixed,
+            direct_memory_size - page_size,
+            0,
+        ),
     );
-    // A reserved address gets as far as the unimplemented mapping step.
+
     try testing.expectEqual(
-        KernelError.enosys.raw(),
-        sceKernelMapDirectMemory(null, page_size, 0, 0, start, 0),
+        errno.ok,
+        sceKernelMapDirectMemory(
+            &virtual_address,
+            page_size,
+            prot_cpu_read | prot_cpu_write,
+            map_fixed,
+            start,
+            0,
+        ),
     );
+    try testing.expectEqual(memory.user.start, virtual_address);
+    try testing.expect(address_space.isMappedAs(virtual_address, page_size, .direct_memory));
+
+    try address_space.write(virtual_address, "direct");
+    var bytes: [6]u8 = undefined;
+    try address_space.read(virtual_address, &bytes);
+    try testing.expectEqualStrings("direct", &bytes);
 }
 
 test "the library registers under the expected identifiers" {

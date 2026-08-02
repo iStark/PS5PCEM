@@ -5,11 +5,8 @@
 //!
 //! Parses the ELF64 objects a title ships and the dynamic linking tables inside
 //! them, producing a description of what a module provides and what it needs.
-//!
-//! Nothing here maps or executes anything: this layer answers what is in the
-//! file, not where it goes in memory. Placing segments needs a guest address
-//! space, and resolving imports needs the firmware registry — both belong to
-//! callers of this module.
+//! Parsed images can then be placed at exact guest addresses and relocated
+//! through a caller-supplied symbol resolver.
 
 pub const elf = @import("elf.zig");
 pub const dynamic = @import("dynamic.zig");
@@ -17,6 +14,8 @@ pub const ids = @import("ids.zig");
 pub const symbols = @import("symbols.zig");
 pub const relocations = @import("relocations.zig");
 pub const imports = @import("imports.zig");
+pub const linker = @import("linker.zig");
+pub const image_loader = @import("image_loader.zig");
 
 pub const Image = elf.Image;
 pub const ObjectType = elf.ObjectType;
@@ -28,11 +27,17 @@ pub const ModuleDecl = dynamic.ModuleDecl;
 pub const SymbolName = dynamic.SymbolName;
 pub const Import = imports.Import;
 pub const Imports = imports.Imports;
+pub const Resolver = linker.Resolver;
+pub const RelocationStats = linker.Stats;
+pub const LoadOptions = image_loader.Options;
+pub const MappedImage = image_loader.MappedImage;
 
 pub const parseImage = elf.parse;
 pub const parseDynamic = dynamic.parse;
 pub const parseSymbolName = dynamic.parseSymbolName;
 pub const collectImports = imports.collect;
+pub const applyRelocations = linker.apply;
+pub const loadImage = image_loader.load;
 
 test {
     _ = elf;
@@ -41,4 +46,6 @@ test {
     _ = symbols;
     _ = relocations;
     _ = imports;
+    _ = linker;
+    _ = image_loader;
 }

@@ -7,6 +7,15 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Fixed-address guest virtual memory. Kept below loader and HLE so both can
+    // use the same identity-mapped address space without depending on each
+    // other.
+    const memory = b.addModule("memory", .{
+        .root_source_file = b.path("src/memory/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // The shader decoder. Kept separate from the CLI so it can be consumed as
     // a module, or later built as a static library with a C ABI.
     const mod = b.addModule("rdna2", .{
@@ -21,6 +30,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/hle/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "memory", .module = memory },
+        },
     });
 
     // Guest module images: ELF64 parsing and the dynamic linking tables.
@@ -28,6 +40,22 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/loader/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "memory", .module = memory },
+        },
+    });
+
+    // End-to-end composition: one address space, the ELF loader, and the HLE
+    // export database wired together by a symbol resolver.
+    const runtime = b.addModule("runtime", .{
+        .root_source_file = b.path("src/runtime/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "memory", .module = memory },
+            .{ .name = "loader", .module = loader },
+            .{ .name = "hle", .module = hle },
+        },
     });
 
     const exe = b.addExecutable(.{
@@ -74,8 +102,18 @@ pub fn build(b: *std.Build) void {
     module_info_step.dependOn(&module_info_cmd.step);
 
     const test_step = b.step("test", "Run the test suite");
-    for ([_]*std.Build.Module{ mod, hle, loader, exe.root_module, module_info.root_module }) |m| {
+    const check_step = b.step("check", "Compile every module without running tests");
+    for ([_]*std.Build.Module{
+        memory,
+        mod,
+        hle,
+        loader,
+        runtime,
+        exe.root_module,
+        module_info.root_module,
+    }) |m| {
         const tests = b.addTest(.{ .root_module = m });
+        check_step.dependOn(&tests.step);
         test_step.dependOn(&b.addRunArtifact(tests).step);
     }
 }

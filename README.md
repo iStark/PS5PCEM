@@ -1,16 +1,19 @@
 # PS5 emulation components
 
-Building blocks for PlayStation 5 emulation, written in Zig. Three independent
-modules, each usable on its own:
+Building blocks for PlayStation 5 emulation, written in Zig. Five modules cover
+the independent subsystems and their end-to-end composition:
 
 | Module | What it does |
 |---|---|
+| **`memory`** | Reserves and manages the fixed, identity-mapped guest address space |
 | **`rdna2`** | Decodes and disassembles RDNA2 shader machine code |
-| **`loader`** | Reads guest module images: ELF64 and the dynamic linking tables |
+| **`loader`** | Reads, maps, and relocates guest ELF64 module images |
 | **`hle`** | High-level emulation of the guest firmware: symbol resolution and firmware libraries |
+| **`runtime`** | Wires memory, loader, and HLE into one loadable process runtime |
 
-None of them depends on anything beyond the Zig standard library, and all
-cross-compile to Windows, Linux, and macOS from any of them.
+None of them depends on anything beyond the Zig standard library. The tooling
+cross-compiles to Windows, Linux, and macOS; native guest execution itself is an
+x86-64 feature because guest machine code is executed directly.
 
 Two command-line tools come with them:
 
@@ -93,6 +96,7 @@ Requires Zig 0.16.
 
 ```sh
 zig build test                 # run the test suite
+zig build check                # compile every module without running tests
 zig build                      # build zig-out/bin/rdna2-disasm
 zig build run -- shader.bin    # build and run
 ```
@@ -210,6 +214,43 @@ set.
 
 ---
 
+# `memory` — guest address space
+
+Guest x86-64 code executes natively and contains absolute addresses. Relocating
+the whole process to an arbitrary host allocation is therefore not an option: a
+guest address must be the same numeric address in the host process.
+
+[src/memory/root.zig](src/memory/root.zig) reserves the native layout before a
+module is loaded. The documented inclusive ranges correspond to these half-open
+intervals in the implementation:
+
+| Area | Guest range | Size |
+|---|---:|---:|
+| System managed | `0x00_0004_0000 .. 0x07_FFFF_C000` | just under 32 GiB |
+| System reserved | `0x08_0000_0000 .. 0x0F_C000_0000` | 31 GiB |
+| User | `0x70_0000_0000 .. 0xFC_0000_0000` | 560 GiB |
+
+These are reservations, not allocations of physical RAM. Pages are committed
+in 16 KiB units only when `mapFixed` or `map` creates a guest mapping. `unmap`
+decommits those pages while retaining the outer reservation, so the same guest
+address cannot be taken by an unrelated host allocation between uses.
+
+Windows has permanent low-address mappings, notably `KUSER_SHARED_DATA`, inside
+the system-managed window. A single `VirtualAlloc` reservation would therefore
+fail even though almost the whole window is free. Initialization scans with
+`VirtualQuery` and reserves every free extent at its exact address. A requested
+mapping that lands in a host-owned hole fails explicitly. Linux uses
+`MAP_FIXED_NOREPLACE`; macOS uses a non-destructive fixed hint and rejects a
+result returned at any other address. No path uses a `MAP_FIXED` operation that
+could overwrite an unrelated host mapping.
+
+The address-space API also owns the sorted mapping table. Loader segments,
+private allocations, and direct-memory mappings all go through it, so overlap
+checks and page protections cannot disagree between subsystems. Reads and writes
+validate the complete range before dereferencing the identity-mapped pointer.
+
+---
+
 # `loader` — guest module images
 
 Guest executables are ELF64 for x86-64, but with vendor extensions that make a
@@ -217,9 +258,10 @@ stock ELF reader useless: the object types sit outside the standard range and
 are rejected outright, and the dynamic linking tables are not where a normal
 loader looks for them.
 
-Everything here is read-only and non-owning. Parsing answers what is *in* the
-file; placing segments needs a guest address space and resolving imports needs
-the firmware registry, so neither happens at this layer.
+Parsing remains read-only and non-owning: an `Image` borrows the caller's file
+buffer. `loadImage` is the action boundary. It places `PT_LOAD` pages in a
+`memory.AddressSpace`, copies file bytes, applies relocations through a supplied
+symbol resolver, and installs final ELF page protections.
 
 ## Why the format needs its own reader
 
@@ -258,6 +300,8 @@ bits, version below it, and a string table offset in the low 32.
 | [src/loader/symbols.zig](src/loader/symbols.zig) | The dynamic symbol table |
 | [src/loader/relocations.zig](src/loader/relocations.zig) | Relocation entries and their types |
 | [src/loader/imports.zig](src/loader/imports.zig) | Walks all of the above into a list of imports |
+| [src/loader/linker.zig](src/loader/linker.zig) | Resolves symbols and writes RELA results |
+| [src/loader/image_loader.zig](src/loader/image_loader.zig) | Maps segments, copies bytes, links, and finalizes protections |
 
 Validation is deliberately strict — a module that fails these checks is not
 something to load with best effort, since proceeding means interpreting whatever
@@ -283,10 +327,31 @@ Some distinctions the walk preserves, because they change what a caller must do:
 - **Malformed symbol names** — counted and stepped over. One bad entry should
   not make the rest of a module unreadable.
 
-## Not yet implemented
+## Mapping and relocation
 
-Nothing is written back. Applying a relocation means storing an address into the
-mapped image, which needs a guest address space that does not exist yet.
+`loadImage` normalizes every load segment to 16 KiB pages. Overlapping boundary
+pages are merged, all pages are staged read/write, and `filesz` bytes are copied
+to the exact `load_bias + p_vaddr` address. Anonymous committed pages supply the
+required zero-filled `memsz - filesz` tail. Relocations are applied before the
+staging permissions are replaced with the union of the ELF flags for each page;
+this permits writes into a future read-only GOT without leaving executable code
+writable at run time.
+
+The following x86-64 RELA forms are applied:
+
+| Type | Computation |
+|---|---|
+| `R_X86_64_RELATIVE` | `load_bias + addend` |
+| `R_X86_64_64` | resolved symbol address plus addend |
+| `R_X86_64_GLOB_DAT` | resolved symbol address |
+| `R_X86_64_JUMP_SLOT` | resolved callable address |
+
+Defined symbols resolve inside the mapped module. Undefined symbols go through
+the caller's `loader.Resolver`; unresolved strong symbols abort the load, while
+unresolved weak symbols become zero. TLS relocations are rejected explicitly
+until the runtime has a per-thread TLS module registry. Treating an ordinary
+function address as a TLS offset would appear to load successfully and fail much
+later, so it is not used as a fallback.
 
 ---
 
@@ -353,18 +418,26 @@ callable from a guest.
 
 "Direct memory" is the guest's name for physical video memory. A title reserves
 a physical range, then maps it into its address space; the two steps are
-separate. The reservation bookkeeping is implemented — placement, alignment,
-overlap rejection, exhaustion, release. Mapping needs the guest address space,
-which does not exist yet, so `sceKernelMapDirectMemory` validates the
-reservation and then reports that the operation is unimplemented rather than
-pretending to succeed.
+separate. Reservation bookkeeping covers placement, alignment, overlap
+rejection, exhaustion, and release. `sceKernelMapDirectMemory` validates that
+the complete physical range was reserved, translates CPU/GPU protection bits,
+and either commits the exact `MAP_FIXED` address or performs an aligned first-fit
+search in the user window. The resulting mapping carries its physical offset in
+the central address-space table.
 
 | Export | State |
 |---|---|
 | `sceKernelAllocateDirectMemory` | Implemented |
 | `sceKernelReleaseDirectMemory` | Implemented |
 | `sceKernelGetDirectMemorySize` | Implemented |
-| `sceKernelMapDirectMemory` | Validates, then reports unimplemented |
+| `sceKernelMapDirectMemory` | Implemented for fixed and searched mappings |
+
+The current direct-memory mapping is anonymous host memory tagged with its
+physical offset. The common one-reservation/one-mapping startup path is usable;
+mapping the same physical pages at several virtual addresses does not yet create
+coherent aliases. That next step requires a shared section backing store
+(`MapViewOfFile3` on Windows and `memfd`/`mmap` on Linux), without changing the
+guest address-space API.
 
 ## Error codes
 
@@ -380,11 +453,41 @@ from leaking into host code where nothing would check it.
 
 ## Roadmap
 
-1. A guest address space, so segments can be placed and relocations applied.
-   Everything below is blocked on it.
-2. Virtual memory: `sceKernelMapDirectMemory` and the flexible-memory calls.
-3. Threading: the `pthread_*` and `scePthread*` families.
-4. Event queues, on which most firmware asynchrony is built.
+1. Shared-section backing for coherent direct-memory aliases.
+2. Flexible-memory allocation, `mmap`/`munmap`, and memory-query exports.
+3. A TLS module registry for `DTPMOD64`, `DTPOFF64`, and `TPOFF64` relocations.
+4. Threading: the `pthread_*` and `scePthread*` families.
+5. Event queues, on which most firmware asynchrony is built.
+
+---
+
+# `runtime` — end-to-end composition
+
+[src/runtime/root.zig](src/runtime/root.zig) owns the dependency direction that
+does not belong in any lower-level module. It creates one `memory.AddressSpace`,
+connects it to libkernel, registers all HLE exports, and adapts `hle.Database` to
+`loader.Resolver`. Exact library/module/version metadata is used first; the
+identifier-only lookup remains the documented fallback for incomplete module
+metadata.
+
+```zig
+const runtime = @import("runtime");
+
+var emu = runtime.Runtime{};
+try emu.init(allocator);
+defer emu.deinit();
+
+var module = try emu.loadModule(eboot_bytes, .{ .load_bias = 0 });
+defer module.deinit();
+
+std.debug.print("entry = 0x{x}\n", .{module.entry_point});
+```
+
+`Runtime.init` is intentionally in-place. Libkernel retains a pointer to the
+address space, so returning a Runtime value from an initializer could move it
+and leave that pointer dangling. Loaded modules must be destroyed before the
+runtime; their `deinit` method decommits module pages but leaves the outer guest
+windows owned until runtime teardown.
 
 ---
 
