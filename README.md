@@ -6,9 +6,10 @@ modules, each usable on its own:
 | Module | What it does |
 |---|---|
 | **`rdna2`** | Decodes and disassembles RDNA2 shader machine code |
+| **`loader`** | Reads guest module images: ELF64 and the dynamic linking tables |
 | **`hle`** | High-level emulation of the guest firmware: symbol resolution and firmware libraries |
 
-Neither depends on anything beyond the Zig standard library, and both
+None of them depends on anything beyond the Zig standard library, and all
 cross-compile to Windows, Linux, and macOS from any of them.
 
 ---
@@ -167,6 +168,66 @@ set.
 
 ---
 
+# `loader` — guest module images
+
+Guest executables are ELF64 for x86-64, but with vendor extensions that make a
+stock ELF reader useless: the object types sit outside the standard range and
+are rejected outright, and the dynamic linking tables are not where a normal
+loader looks for them.
+
+Everything here is read-only and non-owning. Parsing answers what is *in* the
+file; placing segments needs a guest address space and resolving imports needs
+the firmware registry, so neither happens at this layer.
+
+## Why the format needs its own reader
+
+**The dynamic tables are not mapped.** In a conventional ELF, the string table
+and symbol table live inside loaded segments and the dynamic entries point at
+them by virtual address. Here they sit in a separate `PT_SCE_DYNLIBDATA`
+segment, and the pointer-valued entries are offsets into *that* segment. Tags
+that would carry an address get vendor replacements in the `0x6100_00xx` range
+for exactly this reason.
+
+**Imports do not name what they need.** A symbol name looks like:
+
+```
+rTXw65xmLIA#A#A
+└─────────┘ │ │
+ identifier │ └── module code
+            └──── library code
+```
+
+The two short codes are meaningless on their own. They refer to library and
+module declarations carried in the same module's dynamic tables, so resolving
+one import means reading three things together. [src/loader/ids.zig](src/loader/ids.zig)
+decodes the codes — a variable-length encoding, one to three characters by
+magnitude, sharing the alphabet used by symbol identifiers.
+
+Declarations are packed into a single 64-bit word: identifier in the top 16
+bits, version below it, and a string table offset in the low 32.
+
+## What is parsed
+
+| | |
+|---|---|
+| [src/loader/elf.zig](src/loader/elf.zig) | Header and program headers, validation, segment lookup |
+| [src/loader/dynamic.zig](src/loader/dynamic.zig) | Dynamic entries, module and library declarations, symbol names |
+| [src/loader/ids.zig](src/loader/ids.zig) | Library and module code encoding |
+
+Validation is deliberately strict — a module that fails these checks is not
+something to load with best effort, since proceeding means interpreting whatever
+follows as code. Malformed names are rejected rather than guessed at: a bare
+identifier with no library code would otherwise resolve against an arbitrary
+library.
+
+## Not yet implemented
+
+Relocations and the symbol table itself are located but not walked, so nothing
+is resolved yet. That is the next step, and it is what connects this module to
+the firmware registry below.
+
+---
+
 # `hle` — firmware emulation
 
 Guest binaries do not ship the firmware they call into. Every import is a numeric
@@ -251,7 +312,8 @@ from leaking into host code where nothing would check it.
 
 ## Roadmap
 
-1. An ELF/PRX loader, so imports can be resolved against this registry for real.
+1. Walk the symbol and relocation tables the loader locates, and resolve real
+   imports against this registry.
 2. Virtual memory: `sceKernelMapDirectMemory` and the flexible-memory calls,
    which need a guest address space.
 3. Threading: the `pthread_*` and `scePthread*` families.
