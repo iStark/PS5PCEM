@@ -353,8 +353,10 @@ const prot_cpu_write: i32 = 0x02;
 const prot_cpu_execute: i32 = 0x04;
 const prot_gpu_read: i32 = 0x10;
 const prot_gpu_write: i32 = 0x20;
+const prot_ampr_read: i32 = 0x40;
+const prot_ampr_write: i32 = 0x80;
 const supported_protection_bits: i32 = prot_cpu_read | prot_cpu_write | prot_cpu_execute |
-    prot_gpu_read | prot_gpu_write;
+    prot_gpu_read | prot_gpu_write | prot_ampr_read | prot_ampr_write;
 
 fn decodeProtection(bits: i32) ?memory.Protection {
     if (bits & ~supported_protection_bits != 0) return null;
@@ -935,6 +937,12 @@ test "guest GPU protection does not grant native CPU access" {
     try testing.expectEqual(memory.Protection.none, protection);
 }
 
+test "guest AMPR protection is accepted without granting native CPU access" {
+    const protection = decodeProtection(prot_ampr_read | prot_ampr_write).?;
+    try testing.expectEqual(memory.Protection.none, protection);
+    try testing.expect(decodeProtection(0x100) == null);
+}
+
 test "reservations are aligned and do not overlap" {
     var p = Pool{ .size = 64 * page_size };
     defer p.deinit(testing.allocator);
@@ -1081,6 +1089,8 @@ test "direct memory maps at an exact guest address" {
     var start: u64 = 0;
     _ = sceKernelAllocateDirectMemory(0, direct_memory_size, page_size, page_size, 0, &start);
     var virtual_address = memory.user.start;
+    const title_protection = prot_cpu_read | prot_cpu_write | prot_gpu_read | prot_gpu_write |
+        prot_ampr_read | prot_ampr_write;
 
     // Far outside anything reserved.
     try testing.expectEqual(
@@ -1100,7 +1110,7 @@ test "direct memory maps at an exact guest address" {
         sceKernelMapDirectMemory(
             &virtual_address,
             page_size,
-            prot_cpu_read | prot_cpu_write,
+            title_protection,
             map_fixed,
             start,
             0,
@@ -1118,7 +1128,7 @@ test "direct memory maps at an exact guest address" {
         sceKernelMapDirectMemory(
             &alias,
             page_size,
-            prot_cpu_read | prot_cpu_write,
+            title_protection,
             map_fixed,
             start,
             0,
@@ -1139,6 +1149,7 @@ test "direct memory maps at an exact guest address" {
     try testing.expectEqual(@as(u32, 0x12), direct_info.state);
     try testing.expectEqual(start, direct_info.offset);
     try testing.expectEqual(@as(i32, 0), direct_info.memory_type);
+    try testing.expectEqual(title_protection, direct_info.protection);
 
     try testing.expectEqual(errno.ok, sceKernelMunmap(virtual_address, page_size));
     try testing.expectEqual(errno.ok, sceKernelMunmap(alias, page_size));
