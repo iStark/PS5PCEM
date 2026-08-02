@@ -35,6 +35,8 @@ const tcb_size: u64 = 0x100;
 const dtv_header_slots: u64 = 2;
 const stack_canary: u64 = 0xc0de_c0de_cafe_ba00;
 const attr_magic: u64 = 0x5054_4852_4154_5452;
+const maximum_keys: usize = 256;
+const destructor_iterations: usize = 4;
 
 const Lock = struct {
     inner: std.atomic.Mutex = .unlocked,
@@ -54,6 +56,32 @@ pub const BackendError = error{
     ThreadNotFound,
     WouldDeadlock,
     JoinFailed,
+    WaitFailed,
+};
+
+pub const WaitResult = enum {
+    awoken,
+    timed_out,
+};
+
+/// One scheduler-visible wait. Sequence numbers make wakeups race-free when a
+/// signal happens after an HLE object is unlocked but before the backend parks
+/// its current guest thread.
+pub const WaitRequest = struct {
+    key: u64,
+    observed_sequence: u64,
+    timeout_microseconds: ?u64 = null,
+    absolute_deadline_ns: ?u64 = null,
+    /// Guest clock ID used to interpret an absolute deadline. Relative sce
+    /// timeouts leave this at `CLOCK_REALTIME` because the field is irrelevant.
+    clock_id: i32 = 0,
+};
+
+pub const GuestCall = struct {
+    entry_point: u64,
+    thread_handle: u64,
+    arguments: [2]u64 = .{ 0, 0 },
+    argument_count: u8 = 0,
 };
 
 /// Guest register state that a CPU backend must install before entering a
@@ -97,7 +125,9 @@ pub const Backend = struct {
     detach_fn: ?*const fn (?*anyopaque, u64) BackendError!void = null,
     yield_fn: ?*const fn (?*anyopaque) void = null,
     sleep_fn: ?*const fn (?*anyopaque, u64) BackendError!void = null,
-    call_fn: ?*const fn (?*anyopaque, u64, u64) BackendError!void = null,
+    wait_fn: ?*const fn (?*anyopaque, WaitRequest) BackendError!WaitResult = null,
+    wake_fn: ?*const fn (?*anyopaque, u64, u64, usize) void = null,
+    call_fn: ?*const fn (?*anyopaque, GuestCall) BackendError!void = null,
     request_exit_fn: ?*const fn (?*anyopaque, u64, u64) void = null,
 
     fn start(self: Backend, request: StartRequest) BackendError!void {
@@ -225,6 +255,7 @@ const ThreadRecord = struct {
     name: [32]u8,
     external: bool,
     joining: bool = false,
+    specific_values: [maximum_keys]u64 = [_]u64{0} ** maximum_keys,
     state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(ThreadState.prepared)),
     result: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
@@ -232,6 +263,11 @@ const ThreadRecord = struct {
 pub const PreparedThread = struct {
     handle: ThreadHandle,
     context: ThreadContext,
+};
+
+const KeyRecord = struct {
+    allocated: bool = false,
+    destructor: u64 = 0,
 };
 
 pub const Error = error{
@@ -242,6 +278,7 @@ pub const Error = error{
     ThreadNotFound,
     ThreadDetached,
     WouldDeadlock,
+    KeyUnavailable,
 } || memory.Error || loader.tls.Error || std.mem.Allocator.Error || BackendError;
 
 pub const Manager = struct {
@@ -251,6 +288,7 @@ pub const Manager = struct {
     backend: ?Backend = null,
     threads: std.ArrayList(*ThreadRecord) = .empty,
     attributes: std.ArrayList(*Attr) = .empty,
+    keys: [maximum_keys]KeyRecord = [_]KeyRecord{.{}} ** maximum_keys,
     lock: Lock = .{},
     initialized: bool = false,
 
@@ -499,13 +537,122 @@ pub const Manager = struct {
         return error.ExecutorUnavailable;
     }
 
-    pub fn callGuest(self: *Manager, entry_point: u64) Error!void {
+    /// Parks or yields the current guest thread until the object sequence
+    /// changes. A CPU scheduler supplies a real wait; the fallback yields one
+    /// host quantum so native concurrency tests can make progress.
+    pub fn wait(self: *Manager, request: WaitRequest) Error!WaitResult {
+        self.lock.lock();
+        const backend = self.backend;
+        self.lock.unlock();
+        if (backend) |active_backend| {
+            if (active_backend.wait_fn) |wait_fn| {
+                return wait_fn(active_backend.context, request);
+            }
+        }
+        if (request.timeout_microseconds != null or request.absolute_deadline_ns != null) {
+            return .timed_out;
+        }
+        self.yield();
+        return .awoken;
+    }
+
+    /// Publishes a new object sequence and wakes up to `maximum_waiters`
+    /// scheduler-owned guest contexts waiting on the same key.
+    pub fn wake(self: *Manager, key: u64, sequence: u64, maximum_waiters: usize) void {
+        self.lock.lock();
+        const backend = self.backend;
+        self.lock.unlock();
+        if (backend) |active_backend| {
+            if (active_backend.wake_fn) |wake_fn| {
+                wake_fn(active_backend.context, key, sequence, maximum_waiters);
+            }
+        }
+    }
+
+    pub fn callGuest(self: *Manager, entry_point: u64, arguments: []const u64) Error!void {
+        if (arguments.len > 2) return error.InvalidArgument;
         self.lock.lock();
         const backend = self.backend;
         self.lock.unlock();
         const active_backend = backend orelse return error.ExecutorUnavailable;
         const call_fn = active_backend.call_fn orelse return error.ExecutorUnavailable;
-        return call_fn(active_backend.context, entry_point, current_guest_thread);
+        var request = GuestCall{
+            .entry_point = entry_point,
+            .thread_handle = current_guest_thread,
+            .argument_count = @intCast(arguments.len),
+        };
+        @memcpy(request.arguments[0..arguments.len], arguments);
+        return call_fn(active_backend.context, request);
+    }
+
+    pub fn keyCreate(self: *Manager, out_key: *u32, destructor: u64) Error!void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (&self.keys, 0..) |*key, index| {
+            if (key.allocated) continue;
+            key.* = .{ .allocated = true, .destructor = destructor };
+            out_key.* = @intCast(index);
+            return;
+        }
+        return error.KeyUnavailable;
+    }
+
+    pub fn keyDelete(self: *Manager, key: u32) Error!void {
+        if (key >= maximum_keys) return error.InvalidArgument;
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (!self.keys[key].allocated) return error.InvalidArgument;
+        self.keys[key] = .{};
+        for (self.threads.items) |record| record.specific_values[key] = 0;
+    }
+
+    pub fn setSpecific(self: *Manager, key: u32, value: u64) Error!void {
+        if (key >= maximum_keys or current_guest_thread == 0) return error.InvalidArgument;
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (!self.keys[key].allocated) return error.InvalidArgument;
+        const record = self.findRecordLocked(current_guest_thread) orelse
+            return error.ThreadNotFound;
+        record.specific_values[key] = value;
+    }
+
+    pub fn getSpecific(self: *Manager, key: u32) u64 {
+        if (key >= maximum_keys or current_guest_thread == 0) return 0;
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (!self.keys[key].allocated) return 0;
+        const record = self.findRecordLocked(current_guest_thread) orelse return 0;
+        return record.specific_values[key];
+    }
+
+    /// Runs POSIX TLS-key destructors in the still-live guest execution
+    /// context. Values are cleared before each callback so a destructor may set
+    /// them again for the next of four standard passes.
+    pub fn runSpecificDestructors(self: *Manager) Error!void {
+        if (current_guest_thread == 0) return;
+        var callbacks: [maximum_keys]struct { entry: u64, value: u64 } = undefined;
+
+        for (0..destructor_iterations) |_| {
+            var callback_count: usize = 0;
+            self.lock.lock();
+            const record = self.findRecordLocked(current_guest_thread) orelse {
+                self.lock.unlock();
+                return error.ThreadNotFound;
+            };
+            for (self.keys, 0..) |key, index| {
+                const value = record.specific_values[index];
+                if (!key.allocated or key.destructor == 0 or value == 0) continue;
+                record.specific_values[index] = 0;
+                callbacks[callback_count] = .{ .entry = key.destructor, .value = value };
+                callback_count += 1;
+            }
+            self.lock.unlock();
+
+            if (callback_count == 0) return;
+            for (callbacks[0..callback_count]) |callback| {
+                try self.callGuest(callback.entry, &.{callback.value});
+            }
+        }
     }
 
     fn allocateRecord(
@@ -647,6 +794,21 @@ fn activeManager() ?*Manager {
     return attached_manager;
 }
 
+/// Guest pthread identity used by synchronization objects for ownership.
+pub fn currentThreadId() u64 {
+    return current_guest_thread;
+}
+
+pub fn waitCurrent(request: WaitRequest) Error!WaitResult {
+    const active_manager = activeManager() orelse return error.NotAttached;
+    return active_manager.wait(request);
+}
+
+pub fn wakeWaiters(key: u64, sequence: u64, maximum_waiters: usize) void {
+    const active_manager = activeManager() orelse return;
+    active_manager.wake(key, sequence, maximum_waiters);
+}
+
 fn alignForward(value: u64, alignment: u64) Error!u64 {
     const mask = alignment - 1;
     const upper = std.math.add(u64, value, mask) catch return error.AddressOverflow;
@@ -676,7 +838,8 @@ fn kernelStatus(err: anyerror) i32 {
         error.ThreadNotFound => KernelError.esrch.raw(),
         error.WouldDeadlock => KernelError.edeadlk.raw(),
         error.ExecutorUnavailable, error.Unsupported => KernelError.enosys.raw(),
-        error.StartFailed => KernelError.eagain.raw(),
+        error.StartFailed, error.KeyUnavailable => KernelError.eagain.raw(),
+        error.JoinFailed, error.WaitFailed => KernelError.eio.raw(),
         else => KernelError.einval.raw(),
     };
 }
@@ -771,6 +934,7 @@ pub fn pthread_equal(first: ThreadHandle, second: ThreadHandle) callconv(abi.gue
 
 pub fn scePthreadExit(result: ThreadHandle) callconv(abi.guest) void {
     const active_manager = activeManager() orelse return;
+    active_manager.runSpecificDestructors() catch {};
     active_manager.requestExit(handleAddress(result) orelse 0);
 }
 
@@ -1039,6 +1203,49 @@ pub fn pthread_attr_setschedpolicy(attr: ?*AttrHandle, policy: i32) callconv(abi
     return posixStatus(scePthreadAttrSetschedpolicy(attr, policy));
 }
 
+pub fn scePthreadKeyCreate(out_key: ?*u32, destructor: ?*const anyopaque) callconv(abi.guest) i32 {
+    const output = out_key orelse return KernelError.einval.raw();
+    const destructor_address = if (destructor) |pointer| @intFromPtr(pointer) else 0;
+    const active_manager = activeManager() orelse return KernelError.enosys.raw();
+    active_manager.keyCreate(output, destructor_address) catch |err| return kernelStatus(err);
+    return errno.ok;
+}
+
+pub fn pthread_key_create(out_key: ?*u32, destructor: ?*const anyopaque) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadKeyCreate(out_key, destructor));
+}
+
+pub fn scePthreadKeyDelete(key: u32) callconv(abi.guest) i32 {
+    const active_manager = activeManager() orelse return KernelError.enosys.raw();
+    active_manager.keyDelete(key) catch |err| return kernelStatus(err);
+    return errno.ok;
+}
+
+pub fn pthread_key_delete(key: u32) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadKeyDelete(key));
+}
+
+pub fn scePthreadSetspecific(key: u32, value: ThreadHandle) callconv(abi.guest) i32 {
+    const active_manager = activeManager() orelse return KernelError.enosys.raw();
+    active_manager.setSpecific(key, handleAddress(value) orelse 0) catch |err|
+        return kernelStatus(err);
+    return errno.ok;
+}
+
+pub fn pthread_setspecific(key: u32, value: ThreadHandle) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadSetspecific(key, value));
+}
+
+pub fn scePthreadGetspecific(key: u32) callconv(abi.guest) ThreadHandle {
+    const active_manager = activeManager() orelse return null;
+    const value = active_manager.getSpecific(key);
+    return if (value == 0) null else @ptrFromInt(value);
+}
+
+pub fn pthread_getspecific(key: u32) callconv(abi.guest) ThreadHandle {
+    return scePthreadGetspecific(key);
+}
+
 pub fn scePthreadAttrGetsolosched(attr: ?*const AttrHandle, output: ?*i32) callconv(abi.guest) i32 {
     const value = getAttr(attr) orelse return KernelError.einval.raw();
     const solo_output = output orelse return KernelError.einval.raw();
@@ -1065,7 +1272,7 @@ pub fn pthread_once(once_control: ?*u32, init_routine: ?*const anyopaque) callco
                     @atomicStore(u32, once, 0, .release);
                     return Posix.enosys;
                 };
-                active_manager.callGuest(entry) catch |err| {
+                active_manager.callGuest(entry, &.{}) catch |err| {
                     @atomicStore(u32, once, 0, .release);
                     return posixStatus(kernelStatus(err));
                 };
@@ -1140,6 +1347,14 @@ pub const exports = [_]symbols.Export{
     .{ .name = "pthread_attr_setschedpolicy", .function = abi.erase(&pthread_attr_setschedpolicy), .expect_id = "JarMIy8kKEY" },
     .{ .name = "scePthreadAttrGetsolosched", .function = abi.erase(&scePthreadAttrGetsolosched), .expect_id = "9RnL-m0+diQ" },
     .{ .name = "scePthreadAttrSetsolosched", .function = abi.erase(&scePthreadAttrSetsolosched), .expect_id = "Dk6FC-TI+7Q" },
+    .{ .name = "scePthreadKeyCreate", .function = abi.erase(&scePthreadKeyCreate), .expect_id = "geDaqgH9lTg" },
+    .{ .name = "pthread_key_create", .function = abi.erase(&pthread_key_create), .expect_id = "mqULNdimTn0" },
+    .{ .name = "scePthreadKeyDelete", .function = abi.erase(&scePthreadKeyDelete), .expect_id = "PrdHuuDekhY" },
+    .{ .name = "pthread_key_delete", .function = abi.erase(&pthread_key_delete), .expect_id = "6BpEZuDT7YI" },
+    .{ .name = "scePthreadSetspecific", .function = abi.erase(&scePthreadSetspecific), .expect_id = "+BzXYkqYeLE" },
+    .{ .name = "pthread_setspecific", .function = abi.erase(&pthread_setspecific), .expect_id = "WrOLvHU0yQM" },
+    .{ .name = "scePthreadGetspecific", .function = abi.erase(&scePthreadGetspecific), .expect_id = "eoht7mQOCmo" },
+    .{ .name = "pthread_getspecific", .function = abi.erase(&pthread_getspecific), .expect_id = "0-KXaS70xy4" },
     .{ .name = "scePthreadOnce", .function = abi.erase(&scePthreadOnce), .expect_id = "14bOACANTBo" },
     .{ .name = "pthread_once", .function = abi.erase(&pthread_once), .expect_id = "Z4QosVuAsA0" },
 };
@@ -1159,6 +1374,7 @@ const TestBackend = struct {
     manager: *Manager,
     last_request: ?StartRequest = null,
     once_calls: usize = 0,
+    last_call: ?GuestCall = null,
 
     fn start(raw: ?*anyopaque, request: StartRequest) BackendError!void {
         const self: *TestBackend = @ptrCast(@alignCast(raw.?));
@@ -1175,9 +1391,10 @@ const TestBackend = struct {
         return record.result.load(.acquire);
     }
 
-    fn call(raw: ?*anyopaque, _: u64, _: u64) BackendError!void {
+    fn call(raw: ?*anyopaque, request: GuestCall) BackendError!void {
         const self: *TestBackend = @ptrCast(@alignCast(raw.?));
         self.once_calls += 1;
+        self.last_call = request;
     }
 
     fn value(self: *TestBackend) Backend {
@@ -1292,6 +1509,36 @@ test "attributes and once expose POSIX-compatible state" {
     try testing.expectEqual(@as(usize, 1), backend.once_calls);
     try testing.expectEqual(errno.ok, pthread_attr_destroy(&attr));
     try testing.expect(attr == null);
+}
+
+test "TLS keys are per-thread and run guest destructors" {
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    var registry = loader.TlsRegistry{};
+    defer registry.deinit(testing.allocator);
+    var thread_manager = testManager(&address_space, &registry);
+    defer thread_manager.deinit();
+    var backend = TestBackend{ .manager = &thread_manager };
+    thread_manager.setBackend(backend.value());
+    attachManager(&thread_manager);
+    defer attachManager(null);
+
+    const prepared = try thread_manager.prepareInitialThread("MainThread");
+    defer thread_manager.releaseInitialThread(prepared.handle) catch {};
+    try thread_manager.enter(prepared.handle);
+    defer thread_manager.leave();
+
+    var key: u32 = undefined;
+    try testing.expectEqual(errno.ok, pthread_key_create(&key, @ptrFromInt(0x1234)));
+    try testing.expectEqual(errno.ok, pthread_setspecific(key, @ptrFromInt(0xbeef)));
+    try testing.expectEqual(@as(usize, 0xbeef), @intFromPtr(pthread_getspecific(key).?));
+    try thread_manager.runSpecificDestructors();
+    const call = backend.last_call orelse return error.TestExpectedGuestCall;
+    try testing.expectEqual(@as(u64, 0x1234), call.entry_point);
+    try testing.expectEqual(@as(u8, 1), call.argument_count);
+    try testing.expectEqual(@as(u64, 0xbeef), call.arguments[0]);
+    try testing.expect(pthread_getspecific(key) == null);
+    try testing.expectEqual(errno.ok, pthread_key_delete(key));
 }
 
 test "threading library registers the sample executable imports" {

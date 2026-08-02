@@ -1,0 +1,1519 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+
+//! Guest pthread synchronization objects.
+//!
+//! Guest mutexes, condition variables, and reader/writer locks are opaque
+//! pointer handles. Object state stays in host-owned records, while blocking
+//! goes through `kernel_threading.Backend.wait_fn`. The sequence supplied with
+//! each wait closes the unlock-to-park race: a backend can observe that a wake
+//! already advanced the sequence and avoid parking the guest continuation.
+
+const std = @import("std");
+const abi = @import("../abi.zig");
+const errno = @import("../errno.zig");
+const symbols = @import("../symbols.zig");
+const threading = @import("kernel_threading.zig");
+
+const KernelError = errno.KernelError;
+const Posix = errno.Posix;
+
+const mutex_magic: u64 = 0x5054_4d55_5445_5801;
+const mutex_attr_magic: u64 = 0x5054_4d41_5454_5201;
+const cond_magic: u64 = 0x5054_434f_4e44_0001;
+const cond_attr_magic: u64 = 0x5054_4341_5454_5201;
+const rwlock_magic: u64 = 0x5054_5257_4c4f_434b;
+const rwlock_attr_magic: u64 = 0x5054_5257_4154_5452;
+
+const wake_all = std.math.maxInt(usize);
+
+const Lock = struct {
+    inner: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *Lock) void {
+        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(self: *Lock) void {
+        self.inner.unlock();
+    }
+};
+
+pub const Timespec = extern struct {
+    tv_sec: i64,
+    tv_nsec: i64,
+};
+
+pub const MutexHandle = ?*Mutex;
+pub const MutexAttrHandle = ?*MutexAttr;
+pub const CondHandle = ?*Cond;
+pub const CondAttrHandle = ?*CondAttr;
+pub const RwlockHandle = ?*Rwlock;
+pub const RwlockAttrHandle = ?*RwlockAttr;
+
+const Mutex = struct {
+    magic: u64 = mutex_magic,
+    state_lock: Lock = .{},
+    owner: u64 = 0,
+    recursion: u32 = 0,
+    kind: i32 = 1,
+    protocol: i32 = 0,
+    waiters: usize = 0,
+    sequence: u64 = 1,
+};
+
+const MutexAttr = struct {
+    magic: u64 = mutex_attr_magic,
+    kind: i32 = 1,
+    protocol: i32 = 0,
+};
+
+const Cond = struct {
+    magic: u64 = cond_magic,
+    state_lock: Lock = .{},
+    waiters: usize = 0,
+    sequence: u64 = 1,
+    clock_id: i32 = 0,
+};
+
+const CondAttr = struct {
+    magic: u64 = cond_attr_magic,
+    clock_id: i32 = 0,
+};
+
+const ReaderOwner = struct {
+    thread_id: u64,
+    count: u32,
+};
+
+const Rwlock = struct {
+    magic: u64 = rwlock_magic,
+    allocator: std.mem.Allocator,
+    state_lock: Lock = .{},
+    writer: u64 = 0,
+    readers: std.ArrayList(ReaderOwner) = .empty,
+    reader_count: u32 = 0,
+    waiting_readers: usize = 0,
+    waiting_writers: usize = 0,
+    sequence: u64 = 1,
+    kind: i32 = 1,
+
+    fn deinit(self: *Rwlock) void {
+        self.readers.deinit(self.allocator);
+    }
+};
+
+const RwlockAttr = struct {
+    magic: u64 = rwlock_attr_magic,
+    kind: i32 = 1,
+};
+
+pub const Error = error{
+    NotAttached,
+    InvalidArgument,
+    Busy,
+    PermissionDenied,
+    WouldDeadlock,
+    TimedOut,
+    ResourceLimit,
+} || std.mem.Allocator.Error || threading.Error;
+
+pub const Manager = struct {
+    allocator: std.mem.Allocator = undefined,
+    mutexes: std.ArrayList(*Mutex) = .empty,
+    mutex_attrs: std.ArrayList(*MutexAttr) = .empty,
+    conditions: std.ArrayList(*Cond) = .empty,
+    cond_attrs: std.ArrayList(*CondAttr) = .empty,
+    rwlocks: std.ArrayList(*Rwlock) = .empty,
+    rwlock_attrs: std.ArrayList(*RwlockAttr) = .empty,
+    lock: Lock = .{},
+    initialized: bool = false,
+
+    pub fn init(self: *Manager, allocator: std.mem.Allocator) void {
+        self.* = .{ .allocator = allocator, .initialized = true };
+    }
+
+    pub fn deinit(self: *Manager) void {
+        if (!self.initialized) return;
+        self.lock.lock();
+        for (self.mutexes.items) |object| self.allocator.destroy(object);
+        for (self.mutex_attrs.items) |attr| self.allocator.destroy(attr);
+        for (self.conditions.items) |object| self.allocator.destroy(object);
+        for (self.cond_attrs.items) |attr| self.allocator.destroy(attr);
+        for (self.rwlocks.items) |object| {
+            object.deinit();
+            self.allocator.destroy(object);
+        }
+        for (self.rwlock_attrs.items) |attr| self.allocator.destroy(attr);
+        self.mutexes.deinit(self.allocator);
+        self.mutex_attrs.deinit(self.allocator);
+        self.conditions.deinit(self.allocator);
+        self.cond_attrs.deinit(self.allocator);
+        self.rwlocks.deinit(self.allocator);
+        self.rwlock_attrs.deinit(self.allocator);
+        self.lock.unlock();
+        self.* = .{};
+    }
+
+    fn createMutex(self: *Manager, out: *MutexHandle, attr: ?MutexAttr) Error!void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (findPointer(Mutex, self.mutexes.items, out.*) != null) return error.Busy;
+        const object = try self.allocator.create(Mutex);
+        object.* = .{};
+        if (attr) |value| {
+            object.kind = value.kind;
+            object.protocol = value.protocol;
+        }
+        errdefer self.allocator.destroy(object);
+        try self.mutexes.append(self.allocator, object);
+        out.* = object;
+    }
+
+    /// Returns a state-locked mutex, lazily materializing static initializers.
+    fn lockMutex(self: *Manager, out: *MutexHandle) Error!*Mutex {
+        self.lock.lock();
+        if (findPointer(Mutex, self.mutexes.items, out.*)) |object| {
+            object.state_lock.lock();
+            self.lock.unlock();
+            return object;
+        }
+        if (out.* != null) {
+            self.lock.unlock();
+            return error.InvalidArgument;
+        }
+        const object = self.allocator.create(Mutex) catch |err| {
+            self.lock.unlock();
+            return err;
+        };
+        object.* = .{};
+        self.mutexes.append(self.allocator, object) catch |err| {
+            self.allocator.destroy(object);
+            self.lock.unlock();
+            return err;
+        };
+        out.* = object;
+        object.state_lock.lock();
+        self.lock.unlock();
+        return object;
+    }
+
+    fn destroyMutex(self: *Manager, out: *MutexHandle) Error!void {
+        self.lock.lock();
+        const index = findIndex(Mutex, self.mutexes.items, out.*) orelse {
+            if (out.* == null) {
+                self.lock.unlock();
+                return;
+            }
+            self.lock.unlock();
+            return error.InvalidArgument;
+        };
+        const object = self.mutexes.items[index];
+        object.state_lock.lock();
+        if (object.owner != 0 or object.waiters != 0) {
+            object.state_lock.unlock();
+            self.lock.unlock();
+            return error.Busy;
+        }
+        _ = self.mutexes.orderedRemove(index);
+        object.magic = 0;
+        out.* = null;
+        object.state_lock.unlock();
+        self.lock.unlock();
+        self.allocator.destroy(object);
+    }
+
+    fn createCond(self: *Manager, out: *CondHandle, attr: ?CondAttr) Error!void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (findPointer(Cond, self.conditions.items, out.*) != null) return error.Busy;
+        const object = try self.allocator.create(Cond);
+        object.* = .{};
+        if (attr) |value| object.clock_id = value.clock_id;
+        errdefer self.allocator.destroy(object);
+        try self.conditions.append(self.allocator, object);
+        out.* = object;
+    }
+
+    fn lockCond(self: *Manager, out: *CondHandle) Error!*Cond {
+        self.lock.lock();
+        if (findPointer(Cond, self.conditions.items, out.*)) |object| {
+            object.state_lock.lock();
+            self.lock.unlock();
+            return object;
+        }
+        if (out.* != null) {
+            self.lock.unlock();
+            return error.InvalidArgument;
+        }
+        const object = self.allocator.create(Cond) catch |err| {
+            self.lock.unlock();
+            return err;
+        };
+        object.* = .{};
+        self.conditions.append(self.allocator, object) catch |err| {
+            self.allocator.destroy(object);
+            self.lock.unlock();
+            return err;
+        };
+        out.* = object;
+        object.state_lock.lock();
+        self.lock.unlock();
+        return object;
+    }
+
+    fn lockCondAndMutex(
+        self: *Manager,
+        cond_out: *CondHandle,
+        mutex_out: *MutexHandle,
+    ) Error!struct { cond: *Cond, mutex: *Mutex } {
+        self.lock.lock();
+
+        var cond = findPointer(Cond, self.conditions.items, cond_out.*);
+        var mutex = findPointer(Mutex, self.mutexes.items, mutex_out.*);
+        if ((cond == null and cond_out.* != null) or
+            (mutex == null and mutex_out.* != null))
+        {
+            self.lock.unlock();
+            return error.InvalidArgument;
+        }
+        if (cond == null) {
+            const created = self.allocator.create(Cond) catch |err| {
+                self.lock.unlock();
+                return err;
+            };
+            created.* = .{};
+            self.conditions.append(self.allocator, created) catch |err| {
+                self.allocator.destroy(created);
+                self.lock.unlock();
+                return err;
+            };
+            cond_out.* = created;
+            cond = created;
+        }
+
+        if (mutex == null) {
+            const created = self.allocator.create(Mutex) catch |err| {
+                self.lock.unlock();
+                return err;
+            };
+            created.* = .{};
+            self.mutexes.append(self.allocator, created) catch |err| {
+                self.allocator.destroy(created);
+                self.lock.unlock();
+                return err;
+            };
+            mutex_out.* = created;
+            mutex = created;
+        }
+
+        cond.?.state_lock.lock();
+        mutex.?.state_lock.lock();
+        self.lock.unlock();
+        return .{ .cond = cond.?, .mutex = mutex.? };
+    }
+
+    fn destroyCond(self: *Manager, out: *CondHandle) Error!void {
+        self.lock.lock();
+        const index = findIndex(Cond, self.conditions.items, out.*) orelse {
+            if (out.* == null) {
+                self.lock.unlock();
+                return;
+            }
+            self.lock.unlock();
+            return error.InvalidArgument;
+        };
+        const object = self.conditions.items[index];
+        object.state_lock.lock();
+        if (object.waiters != 0) {
+            object.state_lock.unlock();
+            self.lock.unlock();
+            return error.Busy;
+        }
+        _ = self.conditions.orderedRemove(index);
+        object.magic = 0;
+        out.* = null;
+        object.state_lock.unlock();
+        self.lock.unlock();
+        self.allocator.destroy(object);
+    }
+
+    fn createRwlock(self: *Manager, out: *RwlockHandle, attr: ?RwlockAttr) Error!void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (findPointer(Rwlock, self.rwlocks.items, out.*) != null) return error.Busy;
+        const object = try self.allocator.create(Rwlock);
+        object.* = .{ .allocator = self.allocator };
+        if (attr) |value| object.kind = value.kind;
+        errdefer self.allocator.destroy(object);
+        try self.rwlocks.append(self.allocator, object);
+        out.* = object;
+    }
+
+    fn lockRwlock(self: *Manager, out: *RwlockHandle) Error!*Rwlock {
+        self.lock.lock();
+        if (findPointer(Rwlock, self.rwlocks.items, out.*)) |object| {
+            object.state_lock.lock();
+            self.lock.unlock();
+            return object;
+        }
+        if (out.* != null) {
+            self.lock.unlock();
+            return error.InvalidArgument;
+        }
+        const object = self.allocator.create(Rwlock) catch |err| {
+            self.lock.unlock();
+            return err;
+        };
+        object.* = .{ .allocator = self.allocator };
+        self.rwlocks.append(self.allocator, object) catch |err| {
+            self.allocator.destroy(object);
+            self.lock.unlock();
+            return err;
+        };
+        out.* = object;
+        object.state_lock.lock();
+        self.lock.unlock();
+        return object;
+    }
+
+    fn destroyRwlock(self: *Manager, out: *RwlockHandle) Error!void {
+        self.lock.lock();
+        const index = findIndex(Rwlock, self.rwlocks.items, out.*) orelse {
+            if (out.* == null) {
+                self.lock.unlock();
+                return;
+            }
+            self.lock.unlock();
+            return error.InvalidArgument;
+        };
+        const object = self.rwlocks.items[index];
+        object.state_lock.lock();
+        if (object.writer != 0 or object.reader_count != 0 or
+            object.waiting_readers != 0 or object.waiting_writers != 0)
+        {
+            object.state_lock.unlock();
+            self.lock.unlock();
+            return error.Busy;
+        }
+        _ = self.rwlocks.orderedRemove(index);
+        object.magic = 0;
+        out.* = null;
+        object.state_lock.unlock();
+        self.lock.unlock();
+        object.deinit();
+        self.allocator.destroy(object);
+    }
+};
+
+var attached_manager: ?*Manager = null;
+var attach_lock: Lock = .{};
+
+pub fn attachManager(new_manager: ?*Manager) void {
+    attach_lock.lock();
+    defer attach_lock.unlock();
+    attached_manager = new_manager;
+}
+
+fn activeManager() ?*Manager {
+    attach_lock.lock();
+    defer attach_lock.unlock();
+    return attached_manager;
+}
+
+fn findPointer(comptime T: type, objects: []const *T, handle: ?*T) ?*T {
+    const pointer = handle orelse return null;
+    for (objects) |object| {
+        if (object == pointer) return object;
+    }
+    return null;
+}
+
+fn findIndex(comptime T: type, objects: []const *T, handle: ?*T) ?usize {
+    const pointer = handle orelse return null;
+    for (objects, 0..) |object, index| {
+        if (object == pointer) return index;
+    }
+    return null;
+}
+
+fn advanceSequence(sequence: *u64) u64 {
+    sequence.* +%= 1;
+    if (sequence.* == 0) sequence.* = 1;
+    return sequence.*;
+}
+
+fn absoluteDeadline(value: ?*const Timespec) Error!?u64 {
+    const timespec = value orelse return null;
+    if (timespec.tv_sec < 0 or timespec.tv_nsec < 0 or timespec.tv_nsec >= std.time.ns_per_s) {
+        return error.InvalidArgument;
+    }
+    const seconds: u64 = @intCast(timespec.tv_sec);
+    const second_ns = std.math.mul(u64, seconds, std.time.ns_per_s) catch
+        return error.InvalidArgument;
+    return std.math.add(u64, second_ns, @intCast(timespec.tv_nsec)) catch
+        return error.InvalidArgument;
+}
+
+fn supportedCondClock(clock_id: i32) bool {
+    return switch (clock_id) {
+        // Realtime, realtime precise/fast, and the one-second clock.
+        0,
+        9,
+        10,
+        13,
+        // Monotonic, uptime variants, monotonic variants, and network clocks.
+        4,
+        5,
+        7,
+        8,
+        11,
+        12,
+        16,
+        17,
+        18,
+        19,
+        => true,
+        else => false,
+    };
+}
+
+fn kernelStatus(err: anyerror) i32 {
+    return switch (err) {
+        error.OutOfMemory => KernelError.enomem.raw(),
+        error.Busy => KernelError.ebusy.raw(),
+        error.PermissionDenied => KernelError.eperm.raw(),
+        error.WouldDeadlock => KernelError.edeadlk.raw(),
+        error.TimedOut => KernelError.etimedout.raw(),
+        error.ResourceLimit => KernelError.eagain.raw(),
+        error.NotAttached, error.ExecutorUnavailable, error.Unsupported => KernelError.enosys.raw(),
+        error.JoinFailed, error.WaitFailed => KernelError.eio.raw(),
+        else => KernelError.einval.raw(),
+    };
+}
+
+fn posixStatus(status: i32) i32 {
+    return if (status == errno.ok) errno.ok else errno.kernelToPosix(status);
+}
+
+fn currentThread() Error!u64 {
+    const thread_id = threading.currentThreadId();
+    return if (thread_id == 0) error.InvalidArgument else thread_id;
+}
+
+fn readMutexAttr(raw: ?*const MutexAttrHandle) ?MutexAttr {
+    const outer = raw orelse return null;
+    const manager = activeManager() orelse return null;
+    manager.lock.lock();
+    defer manager.lock.unlock();
+    const attr = findPointer(MutexAttr, manager.mutex_attrs.items, outer.*) orelse return null;
+    return attr.*;
+}
+
+fn mutexLockCore(
+    outer: ?*MutexHandle,
+    try_only: bool,
+    timeout_microseconds: ?u64,
+    absolute_deadline_ns: ?u64,
+) Error!void {
+    const handle = outer orelse return error.InvalidArgument;
+    const manager = activeManager() orelse return error.NotAttached;
+    const thread_id = try currentThread();
+    const object = try manager.lockMutex(handle);
+    var state_locked = true;
+    defer if (state_locked) object.state_lock.unlock();
+    var registered_waiter = false;
+
+    while (true) {
+        if (object.owner == 0) {
+            object.owner = thread_id;
+            object.recursion = 1;
+            if (registered_waiter) object.waiters -= 1;
+            return;
+        }
+        if (object.owner == thread_id) {
+            if (object.kind == 2) {
+                if (object.recursion == std.math.maxInt(u32)) return error.ResourceLimit;
+                object.recursion += 1;
+                if (registered_waiter) object.waiters -= 1;
+                return;
+            }
+            if (registered_waiter) object.waiters -= 1;
+            return if (try_only) error.Busy else error.WouldDeadlock;
+        }
+        if (try_only) {
+            if (registered_waiter) object.waiters -= 1;
+            return error.Busy;
+        }
+        if (!registered_waiter) {
+            object.waiters += 1;
+            registered_waiter = true;
+        }
+        const sequence = object.sequence;
+        object.state_lock.unlock();
+        state_locked = false;
+        const wait_result = threading.waitCurrent(.{
+            .key = @intFromPtr(object),
+            .observed_sequence = sequence,
+            .timeout_microseconds = timeout_microseconds,
+            .absolute_deadline_ns = absolute_deadline_ns,
+        }) catch |err| {
+            object.state_lock.lock();
+            state_locked = true;
+            // A concurrent unlock won the race even though the scheduler
+            // reported a failure. Recheck ownership before surfacing it.
+            if (object.sequence != sequence) continue;
+            object.waiters -= 1;
+            return err;
+        };
+        object.state_lock.lock();
+        state_locked = true;
+        if (wait_result == .timed_out and object.sequence == sequence) {
+            object.waiters -= 1;
+            return error.TimedOut;
+        }
+    }
+}
+
+fn mutexUnlockCore(outer: ?*MutexHandle) Error!void {
+    const handle = outer orelse return error.InvalidArgument;
+    const manager = activeManager() orelse return error.NotAttached;
+    const thread_id = try currentThread();
+    const object = try manager.lockMutex(handle);
+    if (object.owner != thread_id) {
+        object.state_lock.unlock();
+        return error.PermissionDenied;
+    }
+    if (object.kind == 2 and object.recursion > 1) {
+        object.recursion -= 1;
+        object.state_lock.unlock();
+        return;
+    }
+    object.owner = 0;
+    object.recursion = 0;
+    const sequence = advanceSequence(&object.sequence);
+    const wake = object.waiters != 0;
+    object.state_lock.unlock();
+    if (wake) threading.wakeWaiters(@intFromPtr(object), sequence, 1);
+}
+
+pub fn scePthreadMutexInit(
+    mutex: ?*MutexHandle,
+    attr: ?*const MutexAttrHandle,
+    _: ?[*:0]const u8,
+) callconv(abi.guest) i32 {
+    const output = mutex orelse return KernelError.einval.raw();
+    const manager = activeManager() orelse return KernelError.enosys.raw();
+    manager.createMutex(output, if (attr == null) null else readMutexAttr(attr)) catch |err|
+        return kernelStatus(err);
+    return errno.ok;
+}
+
+pub fn pthread_mutex_init(
+    mutex: ?*MutexHandle,
+    attr: ?*const MutexAttrHandle,
+) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadMutexInit(mutex, attr, null));
+}
+
+pub fn scePthreadMutexDestroy(mutex: ?*MutexHandle) callconv(abi.guest) i32 {
+    const output = mutex orelse return KernelError.einval.raw();
+    const manager = activeManager() orelse return KernelError.enosys.raw();
+    manager.destroyMutex(output) catch |err| return kernelStatus(err);
+    return errno.ok;
+}
+
+pub fn pthread_mutex_destroy(mutex: ?*MutexHandle) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadMutexDestroy(mutex));
+}
+
+pub fn scePthreadMutexLock(mutex: ?*MutexHandle) callconv(abi.guest) i32 {
+    mutexLockCore(mutex, false, null, null) catch |err| return kernelStatus(err);
+    return errno.ok;
+}
+
+pub fn pthread_mutex_lock(mutex: ?*MutexHandle) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadMutexLock(mutex));
+}
+
+pub fn scePthreadMutexTrylock(mutex: ?*MutexHandle) callconv(abi.guest) i32 {
+    mutexLockCore(mutex, true, null, null) catch |err| return kernelStatus(err);
+    return errno.ok;
+}
+
+pub fn pthread_mutex_trylock(mutex: ?*MutexHandle) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadMutexTrylock(mutex));
+}
+
+pub fn scePthreadMutexTimedlock(mutex: ?*MutexHandle, microseconds: u32) callconv(abi.guest) i32 {
+    mutexLockCore(mutex, false, microseconds, null) catch |err| return kernelStatus(err);
+    return errno.ok;
+}
+
+pub fn pthread_mutex_timedlock(
+    mutex: ?*MutexHandle,
+    deadline: ?*const Timespec,
+) callconv(abi.guest) i32 {
+    const deadline_ns = absoluteDeadline(deadline) catch return Posix.einval;
+    mutexLockCore(mutex, false, null, deadline_ns) catch |err|
+        return posixStatus(kernelStatus(err));
+    return errno.ok;
+}
+
+pub fn scePthreadMutexUnlock(mutex: ?*MutexHandle) callconv(abi.guest) i32 {
+    mutexUnlockCore(mutex) catch |err| return kernelStatus(err);
+    return errno.ok;
+}
+
+pub fn pthread_mutex_unlock(mutex: ?*MutexHandle) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadMutexUnlock(mutex));
+}
+
+pub fn scePthreadMutexattrInit(out_attr: ?*MutexAttrHandle) callconv(abi.guest) i32 {
+    const output = out_attr orelse return KernelError.einval.raw();
+    const manager = activeManager() orelse return KernelError.enosys.raw();
+    manager.lock.lock();
+    defer manager.lock.unlock();
+    const attr = manager.allocator.create(MutexAttr) catch return KernelError.enomem.raw();
+    attr.* = .{};
+    manager.mutex_attrs.append(manager.allocator, attr) catch {
+        manager.allocator.destroy(attr);
+        return KernelError.enomem.raw();
+    };
+    output.* = attr;
+    return errno.ok;
+}
+
+pub fn pthread_mutexattr_init(out_attr: ?*MutexAttrHandle) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadMutexattrInit(out_attr));
+}
+
+pub fn scePthreadMutexattrDestroy(out_attr: ?*MutexAttrHandle) callconv(abi.guest) i32 {
+    const output = out_attr orelse return KernelError.einval.raw();
+    const manager = activeManager() orelse return KernelError.enosys.raw();
+    manager.lock.lock();
+    const index = findIndex(MutexAttr, manager.mutex_attrs.items, output.*) orelse {
+        manager.lock.unlock();
+        return KernelError.einval.raw();
+    };
+    const attr = manager.mutex_attrs.orderedRemove(index);
+    output.* = null;
+    manager.lock.unlock();
+    manager.allocator.destroy(attr);
+    return errno.ok;
+}
+
+pub fn pthread_mutexattr_destroy(out_attr: ?*MutexAttrHandle) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadMutexattrDestroy(out_attr));
+}
+
+fn updateMutexAttr(raw: ?*MutexAttrHandle, value: i32, protocol: bool) i32 {
+    const outer = raw orelse return KernelError.einval.raw();
+    const manager = activeManager() orelse return KernelError.enosys.raw();
+    manager.lock.lock();
+    defer manager.lock.unlock();
+    const attr = findPointer(MutexAttr, manager.mutex_attrs.items, outer.*) orelse
+        return KernelError.einval.raw();
+    if (protocol) attr.protocol = value else attr.kind = value;
+    return errno.ok;
+}
+
+pub fn scePthreadMutexattrSettype(attr: ?*MutexAttrHandle, kind: i32) callconv(abi.guest) i32 {
+    // Guest values: error-checking, recursive, normal, and adaptive.
+    if (kind < 1 or kind > 4) return KernelError.einval.raw();
+    return updateMutexAttr(attr, kind, false);
+}
+
+pub fn pthread_mutexattr_settype(attr: ?*MutexAttrHandle, kind: i32) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadMutexattrSettype(attr, kind));
+}
+
+pub fn scePthreadMutexattrSetprotocol(attr: ?*MutexAttrHandle, protocol: i32) callconv(abi.guest) i32 {
+    if (protocol < 0 or protocol > 2) return KernelError.einval.raw();
+    return updateMutexAttr(attr, protocol, true);
+}
+
+pub fn pthread_mutexattr_setprotocol(attr: ?*MutexAttrHandle, protocol: i32) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadMutexattrSetprotocol(attr, protocol));
+}
+
+fn readCondAttr(raw: ?*const CondAttrHandle) ?CondAttr {
+    const outer = raw orelse return null;
+    const manager = activeManager() orelse return null;
+    manager.lock.lock();
+    defer manager.lock.unlock();
+    const attr = findPointer(CondAttr, manager.cond_attrs.items, outer.*) orelse return null;
+    return attr.*;
+}
+
+fn reacquireMutexAfterCond(object: *Mutex, thread_id: u64, recursion: u32) Error!void {
+    while (true) {
+        object.state_lock.lock();
+        if (object.owner == 0) {
+            object.owner = thread_id;
+            object.recursion = recursion;
+            object.waiters -= 1;
+            object.state_lock.unlock();
+            return;
+        }
+        const sequence = object.sequence;
+        object.state_lock.unlock();
+        _ = threading.waitCurrent(.{
+            .key = @intFromPtr(object),
+            .observed_sequence = sequence,
+        }) catch |err| {
+            object.state_lock.lock();
+            if (object.sequence != sequence) {
+                object.state_lock.unlock();
+                continue;
+            }
+            object.waiters -= 1;
+            object.state_lock.unlock();
+            return err;
+        };
+    }
+}
+
+fn condWaitCore(
+    cond_outer: ?*CondHandle,
+    mutex_outer: ?*MutexHandle,
+    timeout_microseconds: ?u64,
+    absolute_deadline_ns: ?u64,
+) Error!void {
+    const cond_handle = cond_outer orelse return error.InvalidArgument;
+    const mutex_handle = mutex_outer orelse return error.InvalidArgument;
+    const manager = activeManager() orelse return error.NotAttached;
+    const thread_id = try currentThread();
+    const pair = try manager.lockCondAndMutex(cond_handle, mutex_handle);
+    const cond = pair.cond;
+    const mutex = pair.mutex;
+
+    if (mutex.owner != thread_id) {
+        mutex.state_lock.unlock();
+        cond.state_lock.unlock();
+        return error.PermissionDenied;
+    }
+
+    const saved_recursion = mutex.recursion;
+    const observed_sequence = cond.sequence;
+    const clock_id = cond.clock_id;
+    cond.waiters += 1;
+    // This reservation prevents mutex destruction while the condition waiter
+    // is between the atomic unlock and mandatory reacquisition.
+    mutex.waiters += 1;
+    mutex.owner = 0;
+    mutex.recursion = 0;
+    const mutex_sequence = advanceSequence(&mutex.sequence);
+    const wake_mutex = mutex.waiters > 1;
+    mutex.state_lock.unlock();
+    cond.state_lock.unlock();
+    if (wake_mutex) threading.wakeWaiters(@intFromPtr(mutex), mutex_sequence, 1);
+
+    var timed_out = false;
+    var wait_failure: ?threading.Error = null;
+    while (true) {
+        const wait_result = threading.waitCurrent(.{
+            .key = @intFromPtr(cond),
+            .observed_sequence = observed_sequence,
+            .timeout_microseconds = timeout_microseconds,
+            .absolute_deadline_ns = absolute_deadline_ns,
+            .clock_id = clock_id,
+        }) catch |err| {
+            cond.state_lock.lock();
+            const signalled = cond.sequence != observed_sequence;
+            cond.waiters -= 1;
+            cond.state_lock.unlock();
+            if (!signalled) wait_failure = err;
+            break;
+        };
+        cond.state_lock.lock();
+        const signalled = cond.sequence != observed_sequence;
+        if (signalled or wait_result == .timed_out) {
+            cond.waiters -= 1;
+            timed_out = !signalled and wait_result == .timed_out;
+            cond.state_lock.unlock();
+            break;
+        }
+        cond.state_lock.unlock();
+    }
+
+    try reacquireMutexAfterCond(mutex, thread_id, saved_recursion);
+    if (wait_failure) |failure| return failure;
+    if (timed_out) return error.TimedOut;
+}
+
+fn condSignalCore(cond_outer: ?*CondHandle, broadcast: bool) Error!void {
+    const handle = cond_outer orelse return error.InvalidArgument;
+    const manager = activeManager() orelse return error.NotAttached;
+    const object = try manager.lockCond(handle);
+    const sequence = advanceSequence(&object.sequence);
+    const waiters = object.waiters;
+    object.state_lock.unlock();
+    if (waiters != 0) {
+        threading.wakeWaiters(
+            @intFromPtr(object),
+            sequence,
+            if (broadcast) wake_all else 1,
+        );
+    }
+}
+
+pub fn scePthreadCondInit(
+    cond: ?*CondHandle,
+    attr: ?*const CondAttrHandle,
+    _: ?[*:0]const u8,
+) callconv(abi.guest) i32 {
+    const output = cond orelse return KernelError.einval.raw();
+    const manager = activeManager() orelse return KernelError.enosys.raw();
+    manager.createCond(output, if (attr == null) null else readCondAttr(attr)) catch |err|
+        return kernelStatus(err);
+    return errno.ok;
+}
+
+pub fn pthread_cond_init(cond: ?*CondHandle, attr: ?*const CondAttrHandle) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadCondInit(cond, attr, null));
+}
+
+pub fn scePthreadCondDestroy(cond: ?*CondHandle) callconv(abi.guest) i32 {
+    const output = cond orelse return KernelError.einval.raw();
+    const manager = activeManager() orelse return KernelError.enosys.raw();
+    manager.destroyCond(output) catch |err| return kernelStatus(err);
+    return errno.ok;
+}
+
+pub fn pthread_cond_destroy(cond: ?*CondHandle) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadCondDestroy(cond));
+}
+
+pub fn scePthreadCondWait(cond: ?*CondHandle, mutex: ?*MutexHandle) callconv(abi.guest) i32 {
+    condWaitCore(cond, mutex, null, null) catch |err| return kernelStatus(err);
+    return errno.ok;
+}
+
+pub fn pthread_cond_wait(cond: ?*CondHandle, mutex: ?*MutexHandle) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadCondWait(cond, mutex));
+}
+
+pub fn scePthreadCondTimedwait(
+    cond: ?*CondHandle,
+    mutex: ?*MutexHandle,
+    microseconds: u32,
+) callconv(abi.guest) i32 {
+    condWaitCore(cond, mutex, microseconds, null) catch |err| return kernelStatus(err);
+    return errno.ok;
+}
+
+pub fn pthread_cond_timedwait(
+    cond: ?*CondHandle,
+    mutex: ?*MutexHandle,
+    deadline: ?*const Timespec,
+) callconv(abi.guest) i32 {
+    const deadline_ns = absoluteDeadline(deadline) catch return Posix.einval;
+    condWaitCore(cond, mutex, null, deadline_ns) catch |err|
+        return posixStatus(kernelStatus(err));
+    return errno.ok;
+}
+
+pub fn scePthreadCondSignal(cond: ?*CondHandle) callconv(abi.guest) i32 {
+    condSignalCore(cond, false) catch |err| return kernelStatus(err);
+    return errno.ok;
+}
+
+pub fn pthread_cond_signal(cond: ?*CondHandle) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadCondSignal(cond));
+}
+
+pub fn scePthreadCondBroadcast(cond: ?*CondHandle) callconv(abi.guest) i32 {
+    condSignalCore(cond, true) catch |err| return kernelStatus(err);
+    return errno.ok;
+}
+
+pub fn pthread_cond_broadcast(cond: ?*CondHandle) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadCondBroadcast(cond));
+}
+
+pub fn scePthreadCondattrInit(out_attr: ?*CondAttrHandle) callconv(abi.guest) i32 {
+    const output = out_attr orelse return KernelError.einval.raw();
+    const manager = activeManager() orelse return KernelError.enosys.raw();
+    manager.lock.lock();
+    defer manager.lock.unlock();
+    const attr = manager.allocator.create(CondAttr) catch return KernelError.enomem.raw();
+    attr.* = .{};
+    manager.cond_attrs.append(manager.allocator, attr) catch {
+        manager.allocator.destroy(attr);
+        return KernelError.enomem.raw();
+    };
+    output.* = attr;
+    return errno.ok;
+}
+
+pub fn pthread_condattr_init(out_attr: ?*CondAttrHandle) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadCondattrInit(out_attr));
+}
+
+pub fn scePthreadCondattrDestroy(out_attr: ?*CondAttrHandle) callconv(abi.guest) i32 {
+    const output = out_attr orelse return KernelError.einval.raw();
+    const manager = activeManager() orelse return KernelError.enosys.raw();
+    manager.lock.lock();
+    const index = findIndex(CondAttr, manager.cond_attrs.items, output.*) orelse {
+        manager.lock.unlock();
+        return KernelError.einval.raw();
+    };
+    const attr = manager.cond_attrs.orderedRemove(index);
+    output.* = null;
+    manager.lock.unlock();
+    manager.allocator.destroy(attr);
+    return errno.ok;
+}
+
+pub fn pthread_condattr_destroy(out_attr: ?*CondAttrHandle) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadCondattrDestroy(out_attr));
+}
+
+pub fn scePthreadCondattrSetclock(attr_raw: ?*CondAttrHandle, clock_id: i32) callconv(abi.guest) i32 {
+    if (!supportedCondClock(clock_id)) return KernelError.einval.raw();
+    const outer = attr_raw orelse return KernelError.einval.raw();
+    const manager = activeManager() orelse return KernelError.enosys.raw();
+    manager.lock.lock();
+    defer manager.lock.unlock();
+    const attr = findPointer(CondAttr, manager.cond_attrs.items, outer.*) orelse
+        return KernelError.einval.raw();
+    attr.clock_id = clock_id;
+    return errno.ok;
+}
+
+pub fn pthread_condattr_setclock(attr: ?*CondAttrHandle, clock_id: i32) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadCondattrSetclock(attr, clock_id));
+}
+
+fn readRwlockAttr(raw: ?*const RwlockAttrHandle) ?RwlockAttr {
+    const outer = raw orelse return null;
+    const manager = activeManager() orelse return null;
+    manager.lock.lock();
+    defer manager.lock.unlock();
+    const attr = findPointer(RwlockAttr, manager.rwlock_attrs.items, outer.*) orelse return null;
+    return attr.*;
+}
+
+fn readerIndex(object: *Rwlock, thread_id: u64) ?usize {
+    for (object.readers.items, 0..) |reader, index| {
+        if (reader.thread_id == thread_id) return index;
+    }
+    return null;
+}
+
+fn rwlockLockCore(
+    outer: ?*RwlockHandle,
+    write: bool,
+    try_only: bool,
+    timeout_microseconds: ?u64,
+    absolute_deadline_ns: ?u64,
+) Error!void {
+    const handle = outer orelse return error.InvalidArgument;
+    const manager = activeManager() orelse return error.NotAttached;
+    const thread_id = try currentThread();
+    const object = try manager.lockRwlock(handle);
+    var state_locked = true;
+    defer if (state_locked) object.state_lock.unlock();
+    var registered_waiter = false;
+
+    while (true) {
+        const existing_reader = readerIndex(object, thread_id);
+        if (write) {
+            if (object.writer == thread_id or existing_reader != null) {
+                if (registered_waiter) object.waiting_writers -= 1;
+                return if (try_only) error.Busy else error.WouldDeadlock;
+            }
+            if (object.writer == 0 and object.reader_count == 0) {
+                object.writer = thread_id;
+                if (registered_waiter) object.waiting_writers -= 1;
+                return;
+            }
+        } else {
+            if (object.writer == thread_id) {
+                if (registered_waiter) object.waiting_readers -= 1;
+                return if (try_only) error.Busy else error.WouldDeadlock;
+            }
+            if (object.writer == 0 and (object.waiting_writers == 0 or existing_reader != null)) {
+                if (object.reader_count == std.math.maxInt(u32)) {
+                    if (registered_waiter) object.waiting_readers -= 1;
+                    return error.ResourceLimit;
+                }
+                if (existing_reader) |index| {
+                    if (object.readers.items[index].count == std.math.maxInt(u32)) {
+                        if (registered_waiter) object.waiting_readers -= 1;
+                        return error.ResourceLimit;
+                    }
+                    object.readers.items[index].count += 1;
+                } else {
+                    object.readers.append(object.allocator, .{
+                        .thread_id = thread_id,
+                        .count = 1,
+                    }) catch |err| {
+                        if (registered_waiter) object.waiting_readers -= 1;
+                        return err;
+                    };
+                }
+                object.reader_count += 1;
+                if (registered_waiter) object.waiting_readers -= 1;
+                return;
+            }
+        }
+
+        if (try_only) {
+            if (registered_waiter) {
+                if (write) object.waiting_writers -= 1 else object.waiting_readers -= 1;
+            }
+            return error.Busy;
+        }
+        if (!registered_waiter) {
+            if (write) object.waiting_writers += 1 else object.waiting_readers += 1;
+            registered_waiter = true;
+        }
+        const sequence = object.sequence;
+        object.state_lock.unlock();
+        state_locked = false;
+        const wait_result = threading.waitCurrent(.{
+            .key = @intFromPtr(object),
+            .observed_sequence = sequence,
+            .timeout_microseconds = timeout_microseconds,
+            .absolute_deadline_ns = absolute_deadline_ns,
+        }) catch |err| {
+            object.state_lock.lock();
+            state_locked = true;
+            if (object.sequence != sequence) continue;
+            if (write) object.waiting_writers -= 1 else object.waiting_readers -= 1;
+            return err;
+        };
+        object.state_lock.lock();
+        state_locked = true;
+        if (wait_result == .timed_out and object.sequence == sequence) {
+            if (write) object.waiting_writers -= 1 else object.waiting_readers -= 1;
+            return error.TimedOut;
+        }
+    }
+}
+
+fn rwlockUnlockCore(outer: ?*RwlockHandle) Error!void {
+    const handle = outer orelse return error.InvalidArgument;
+    const manager = activeManager() orelse return error.NotAttached;
+    const thread_id = try currentThread();
+    const object = try manager.lockRwlock(handle);
+
+    if (object.writer == thread_id) {
+        object.writer = 0;
+    } else if (readerIndex(object, thread_id)) |index| {
+        object.readers.items[index].count -= 1;
+        object.reader_count -= 1;
+        if (object.readers.items[index].count == 0) _ = object.readers.orderedRemove(index);
+    } else {
+        object.state_lock.unlock();
+        return error.PermissionDenied;
+    }
+
+    const sequence = advanceSequence(&object.sequence);
+    const waiters = object.waiting_readers + object.waiting_writers;
+    object.state_lock.unlock();
+    if (waiters != 0) threading.wakeWaiters(@intFromPtr(object), sequence, wake_all);
+}
+
+pub fn scePthreadRwlockInit(
+    rwlock: ?*RwlockHandle,
+    attr: ?*const RwlockAttrHandle,
+    _: ?[*:0]const u8,
+) callconv(abi.guest) i32 {
+    const output = rwlock orelse return KernelError.einval.raw();
+    const manager = activeManager() orelse return KernelError.enosys.raw();
+    manager.createRwlock(output, if (attr == null) null else readRwlockAttr(attr)) catch |err|
+        return kernelStatus(err);
+    return errno.ok;
+}
+
+pub fn pthread_rwlock_init(
+    rwlock: ?*RwlockHandle,
+    attr: ?*const RwlockAttrHandle,
+) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadRwlockInit(rwlock, attr, null));
+}
+
+pub fn scePthreadRwlockDestroy(rwlock: ?*RwlockHandle) callconv(abi.guest) i32 {
+    const output = rwlock orelse return KernelError.einval.raw();
+    const manager = activeManager() orelse return KernelError.enosys.raw();
+    manager.destroyRwlock(output) catch |err| return kernelStatus(err);
+    return errno.ok;
+}
+
+pub fn pthread_rwlock_destroy(rwlock: ?*RwlockHandle) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadRwlockDestroy(rwlock));
+}
+
+pub fn scePthreadRwlockRdlock(rwlock: ?*RwlockHandle) callconv(abi.guest) i32 {
+    rwlockLockCore(rwlock, false, false, null, null) catch |err| return kernelStatus(err);
+    return errno.ok;
+}
+
+pub fn pthread_rwlock_rdlock(rwlock: ?*RwlockHandle) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadRwlockRdlock(rwlock));
+}
+
+pub fn scePthreadRwlockWrlock(rwlock: ?*RwlockHandle) callconv(abi.guest) i32 {
+    rwlockLockCore(rwlock, true, false, null, null) catch |err| return kernelStatus(err);
+    return errno.ok;
+}
+
+pub fn pthread_rwlock_wrlock(rwlock: ?*RwlockHandle) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadRwlockWrlock(rwlock));
+}
+
+pub fn scePthreadRwlockTryrdlock(rwlock: ?*RwlockHandle) callconv(abi.guest) i32 {
+    rwlockLockCore(rwlock, false, true, null, null) catch |err| return kernelStatus(err);
+    return errno.ok;
+}
+
+pub fn pthread_rwlock_tryrdlock(rwlock: ?*RwlockHandle) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadRwlockTryrdlock(rwlock));
+}
+
+pub fn scePthreadRwlockTrywrlock(rwlock: ?*RwlockHandle) callconv(abi.guest) i32 {
+    rwlockLockCore(rwlock, true, true, null, null) catch |err| return kernelStatus(err);
+    return errno.ok;
+}
+
+pub fn pthread_rwlock_trywrlock(rwlock: ?*RwlockHandle) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadRwlockTrywrlock(rwlock));
+}
+
+pub fn scePthreadRwlockTimedrdlock(
+    rwlock: ?*RwlockHandle,
+    microseconds: u32,
+) callconv(abi.guest) i32 {
+    rwlockLockCore(rwlock, false, false, microseconds, null) catch |err| return kernelStatus(err);
+    return errno.ok;
+}
+
+pub fn scePthreadRwlockTimedwrlock(
+    rwlock: ?*RwlockHandle,
+    microseconds: u32,
+) callconv(abi.guest) i32 {
+    rwlockLockCore(rwlock, true, false, microseconds, null) catch |err| return kernelStatus(err);
+    return errno.ok;
+}
+
+pub fn pthread_rwlock_timedrdlock(
+    rwlock: ?*RwlockHandle,
+    deadline: ?*const Timespec,
+) callconv(abi.guest) i32 {
+    const deadline_ns = absoluteDeadline(deadline) catch return Posix.einval;
+    rwlockLockCore(rwlock, false, false, null, deadline_ns) catch |err|
+        return posixStatus(kernelStatus(err));
+    return errno.ok;
+}
+
+pub fn pthread_rwlock_timedwrlock(
+    rwlock: ?*RwlockHandle,
+    deadline: ?*const Timespec,
+) callconv(abi.guest) i32 {
+    const deadline_ns = absoluteDeadline(deadline) catch return Posix.einval;
+    rwlockLockCore(rwlock, true, false, null, deadline_ns) catch |err|
+        return posixStatus(kernelStatus(err));
+    return errno.ok;
+}
+
+pub fn scePthreadRwlockUnlock(rwlock: ?*RwlockHandle) callconv(abi.guest) i32 {
+    rwlockUnlockCore(rwlock) catch |err| return kernelStatus(err);
+    return errno.ok;
+}
+
+pub fn pthread_rwlock_unlock(rwlock: ?*RwlockHandle) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadRwlockUnlock(rwlock));
+}
+
+pub fn scePthreadRwlockattrInit(out_attr: ?*RwlockAttrHandle) callconv(abi.guest) i32 {
+    const output = out_attr orelse return KernelError.einval.raw();
+    const manager = activeManager() orelse return KernelError.enosys.raw();
+    manager.lock.lock();
+    defer manager.lock.unlock();
+    const attr = manager.allocator.create(RwlockAttr) catch return KernelError.enomem.raw();
+    attr.* = .{};
+    manager.rwlock_attrs.append(manager.allocator, attr) catch {
+        manager.allocator.destroy(attr);
+        return KernelError.enomem.raw();
+    };
+    output.* = attr;
+    return errno.ok;
+}
+
+pub fn pthread_rwlockattr_init(out_attr: ?*RwlockAttrHandle) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadRwlockattrInit(out_attr));
+}
+
+pub fn scePthreadRwlockattrDestroy(out_attr: ?*RwlockAttrHandle) callconv(abi.guest) i32 {
+    const output = out_attr orelse return KernelError.einval.raw();
+    const manager = activeManager() orelse return KernelError.enosys.raw();
+    manager.lock.lock();
+    const index = findIndex(RwlockAttr, manager.rwlock_attrs.items, output.*) orelse {
+        manager.lock.unlock();
+        return KernelError.einval.raw();
+    };
+    const attr = manager.rwlock_attrs.orderedRemove(index);
+    output.* = null;
+    manager.lock.unlock();
+    manager.allocator.destroy(attr);
+    return errno.ok;
+}
+
+pub fn pthread_rwlockattr_destroy(out_attr: ?*RwlockAttrHandle) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadRwlockattrDestroy(out_attr));
+}
+
+pub fn scePthreadRwlockattrGettype(
+    attr_raw: ?*const RwlockAttrHandle,
+    output: ?*i32,
+) callconv(abi.guest) i32 {
+    const value = readRwlockAttr(attr_raw) orelse return KernelError.einval.raw();
+    const type_output = output orelse return KernelError.einval.raw();
+    type_output.* = value.kind;
+    return errno.ok;
+}
+
+pub fn scePthreadRwlockattrSettype(attr_raw: ?*RwlockAttrHandle, kind: i32) callconv(abi.guest) i32 {
+    const outer = attr_raw orelse return KernelError.einval.raw();
+    const manager = activeManager() orelse return KernelError.enosys.raw();
+    manager.lock.lock();
+    defer manager.lock.unlock();
+    const attr = findPointer(RwlockAttr, manager.rwlock_attrs.items, outer.*) orelse
+        return KernelError.einval.raw();
+    attr.kind = kind;
+    return errno.ok;
+}
+
+pub const exports = [_]symbols.Export{
+    .{ .name = "scePthreadMutexInit", .function = abi.erase(&scePthreadMutexInit), .expect_id = "cmo1RIYva9o" },
+    .{ .name = "pthread_mutex_init", .function = abi.erase(&pthread_mutex_init), .expect_id = "ttHNfU+qDBU" },
+    .{ .name = "scePthreadMutexDestroy", .function = abi.erase(&scePthreadMutexDestroy), .expect_id = "2Of0f+3mhhE" },
+    .{ .name = "pthread_mutex_destroy", .function = abi.erase(&pthread_mutex_destroy), .expect_id = "ltCfaGr2JGE" },
+    .{ .name = "scePthreadMutexLock", .function = abi.erase(&scePthreadMutexLock), .expect_id = "9UK1vLZQft4" },
+    .{ .name = "pthread_mutex_lock", .function = abi.erase(&pthread_mutex_lock), .expect_id = "7H0iTOciTLo" },
+    .{ .name = "scePthreadMutexTrylock", .function = abi.erase(&scePthreadMutexTrylock), .expect_id = "upoVrzMHFeE" },
+    .{ .name = "pthread_mutex_trylock", .function = abi.erase(&pthread_mutex_trylock), .expect_id = "K-jXhbt2gn4" },
+    .{ .name = "scePthreadMutexTimedlock", .function = abi.erase(&scePthreadMutexTimedlock), .expect_id = "IafI2PxcPnQ" },
+    .{ .name = "pthread_mutex_timedlock", .function = abi.erase(&pthread_mutex_timedlock), .expect_id = "Io9+nTKXZtA" },
+    .{ .name = "scePthreadMutexUnlock", .function = abi.erase(&scePthreadMutexUnlock), .expect_id = "tn3VlD0hG60" },
+    .{ .name = "pthread_mutex_unlock", .function = abi.erase(&pthread_mutex_unlock), .expect_id = "2Z+PpY6CaJg" },
+    .{ .name = "scePthreadMutexattrInit", .function = abi.erase(&scePthreadMutexattrInit), .expect_id = "F8bUHwAG284" },
+    .{ .name = "pthread_mutexattr_init", .function = abi.erase(&pthread_mutexattr_init), .expect_id = "dQHWEsJtoE4" },
+    .{ .name = "scePthreadMutexattrDestroy", .function = abi.erase(&scePthreadMutexattrDestroy), .expect_id = "smWEktiyyG0" },
+    .{ .name = "pthread_mutexattr_destroy", .function = abi.erase(&pthread_mutexattr_destroy), .expect_id = "HF7lK46xzjY" },
+    .{ .name = "scePthreadMutexattrSettype", .function = abi.erase(&scePthreadMutexattrSettype), .expect_id = "iMp8QpE+XO4" },
+    .{ .name = "pthread_mutexattr_settype", .function = abi.erase(&pthread_mutexattr_settype), .expect_id = "mDmgMOGVUqg" },
+    .{ .name = "scePthreadMutexattrSetprotocol", .function = abi.erase(&scePthreadMutexattrSetprotocol), .expect_id = "1FGvU0i9saQ" },
+    .{ .name = "pthread_mutexattr_setprotocol", .function = abi.erase(&pthread_mutexattr_setprotocol), .expect_id = "5txKfcMUAok" },
+
+    .{ .name = "scePthreadCondInit", .function = abi.erase(&scePthreadCondInit), .expect_id = "2Tb92quprl0" },
+    .{ .name = "pthread_cond_init", .function = abi.erase(&pthread_cond_init), .expect_id = "0TyVk4MSLt0" },
+    .{ .name = "scePthreadCondDestroy", .function = abi.erase(&scePthreadCondDestroy), .expect_id = "g+PZd2hiacg" },
+    .{ .name = "pthread_cond_destroy", .function = abi.erase(&pthread_cond_destroy), .expect_id = "RXXqi4CtF8w" },
+    .{ .name = "scePthreadCondWait", .function = abi.erase(&scePthreadCondWait), .expect_id = "WKAXJ4XBPQ4" },
+    .{ .name = "pthread_cond_wait", .function = abi.erase(&pthread_cond_wait), .expect_id = "Op8TBGY5KHg" },
+    .{ .name = "scePthreadCondTimedwait", .function = abi.erase(&scePthreadCondTimedwait), .expect_id = "BmMjYxmew1w" },
+    .{ .name = "pthread_cond_timedwait", .function = abi.erase(&pthread_cond_timedwait), .expect_id = "27bAgiJmOh0" },
+    .{ .name = "scePthreadCondSignal", .function = abi.erase(&scePthreadCondSignal), .expect_id = "kDh-NfxgMtE" },
+    .{ .name = "pthread_cond_signal", .function = abi.erase(&pthread_cond_signal), .expect_id = "2MOy+rUfuhQ" },
+    .{ .name = "scePthreadCondBroadcast", .function = abi.erase(&scePthreadCondBroadcast), .expect_id = "JGgj7Uvrl+A" },
+    .{ .name = "pthread_cond_broadcast", .function = abi.erase(&pthread_cond_broadcast), .expect_id = "mkx2fVhNMsg" },
+    .{ .name = "scePthreadCondattrInit", .function = abi.erase(&scePthreadCondattrInit), .expect_id = "m5-2bsNfv7s" },
+    .{ .name = "pthread_condattr_init", .function = abi.erase(&pthread_condattr_init), .expect_id = "mKoTx03HRWA" },
+    .{ .name = "scePthreadCondattrDestroy", .function = abi.erase(&scePthreadCondattrDestroy), .expect_id = "waPcxYiR3WA" },
+    .{ .name = "pthread_condattr_destroy", .function = abi.erase(&pthread_condattr_destroy), .expect_id = "dJcuQVn6-Iw" },
+    .{ .name = "scePthreadCondattrSetclock", .function = abi.erase(&scePthreadCondattrSetclock) },
+    .{ .name = "pthread_condattr_setclock", .function = abi.erase(&pthread_condattr_setclock), .expect_id = "EjllaAqAPZo" },
+
+    .{ .name = "scePthreadRwlockInit", .function = abi.erase(&scePthreadRwlockInit), .expect_id = "6ULAa0fq4jA" },
+    .{ .name = "pthread_rwlock_init", .function = abi.erase(&pthread_rwlock_init), .expect_id = "ytQULN-nhL4" },
+    .{ .name = "scePthreadRwlockDestroy", .function = abi.erase(&scePthreadRwlockDestroy), .expect_id = "BB+kb08Tl9A" },
+    .{ .name = "pthread_rwlock_destroy", .function = abi.erase(&pthread_rwlock_destroy), .expect_id = "1471ajPzxh0" },
+    .{ .name = "scePthreadRwlockRdlock", .function = abi.erase(&scePthreadRwlockRdlock), .expect_id = "Ox9i0c7L5w0" },
+    .{ .name = "pthread_rwlock_rdlock", .function = abi.erase(&pthread_rwlock_rdlock), .expect_id = "iGjsr1WAtI0" },
+    .{ .name = "scePthreadRwlockWrlock", .function = abi.erase(&scePthreadRwlockWrlock), .expect_id = "mqdNorrB+gI" },
+    .{ .name = "pthread_rwlock_wrlock", .function = abi.erase(&pthread_rwlock_wrlock), .expect_id = "sIlRvQqsN2Y" },
+    .{ .name = "scePthreadRwlockTryrdlock", .function = abi.erase(&scePthreadRwlockTryrdlock) },
+    .{ .name = "pthread_rwlock_tryrdlock", .function = abi.erase(&pthread_rwlock_tryrdlock), .expect_id = "SFxTMOfuCkE" },
+    .{ .name = "scePthreadRwlockTrywrlock", .function = abi.erase(&scePthreadRwlockTrywrlock), .expect_id = "bIHoZCTomsI" },
+    .{ .name = "pthread_rwlock_trywrlock", .function = abi.erase(&pthread_rwlock_trywrlock), .expect_id = "XhWHn6P5R7U" },
+    .{ .name = "scePthreadRwlockTimedrdlock", .function = abi.erase(&scePthreadRwlockTimedrdlock) },
+    .{ .name = "scePthreadRwlockTimedwrlock", .function = abi.erase(&scePthreadRwlockTimedwrlock) },
+    .{ .name = "pthread_rwlock_timedrdlock", .function = abi.erase(&pthread_rwlock_timedrdlock) },
+    .{ .name = "pthread_rwlock_timedwrlock", .function = abi.erase(&pthread_rwlock_timedwrlock) },
+    .{ .name = "scePthreadRwlockUnlock", .function = abi.erase(&scePthreadRwlockUnlock), .expect_id = "+L98PIbGttk" },
+    .{ .name = "pthread_rwlock_unlock", .function = abi.erase(&pthread_rwlock_unlock), .expect_id = "EgmLo6EWgso" },
+    .{ .name = "scePthreadRwlockattrInit", .function = abi.erase(&scePthreadRwlockattrInit), .expect_id = "yOfGg-I1ZII" },
+    .{ .name = "pthread_rwlockattr_init", .function = abi.erase(&pthread_rwlockattr_init), .expect_id = "xFebsA4YsFI" },
+    .{ .name = "scePthreadRwlockattrDestroy", .function = abi.erase(&scePthreadRwlockattrDestroy), .expect_id = "i2ifZ3fS2fo" },
+    .{ .name = "pthread_rwlockattr_destroy", .function = abi.erase(&pthread_rwlockattr_destroy), .expect_id = "qsdmgXjqSgk" },
+    .{ .name = "scePthreadRwlockattrGettype", .function = abi.erase(&scePthreadRwlockattrGettype) },
+    .{ .name = "scePthreadRwlockattrSettype", .function = abi.erase(&scePthreadRwlockattrSettype), .expect_id = "h-OifiouBd8" },
+};
+
+pub const library = symbols.Library{ .name = "libkernel", .version = 1 };
+pub const module = symbols.Module{ .name = "libkernel", .version_major = 1, .version_minor = 1 };
+
+pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {
+    try db.addLibrary(gpa, library, module, &exports);
+}
+
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+const memory = @import("memory");
+const loader = @import("loader");
+
+const TestContext = struct {
+    address_space: memory.AddressSpace = undefined,
+    tls_registry: loader.TlsRegistry = .{},
+    thread_manager: threading.Manager = .{},
+    sync_manager: Manager = .{},
+
+    fn init(self: *TestContext) !void {
+        self.* = .{};
+        self.address_space = try memory.AddressSpace.init(testing.allocator);
+        self.thread_manager.init(testing.allocator, &self.address_space, &self.tls_registry);
+        self.sync_manager.init(testing.allocator);
+        threading.attachManager(&self.thread_manager);
+        attachManager(&self.sync_manager);
+    }
+
+    fn deinit(self: *TestContext) void {
+        attachManager(null);
+        threading.attachManager(null);
+        self.sync_manager.deinit();
+        self.thread_manager.deinit();
+        self.tls_registry.deinit(testing.allocator);
+        self.address_space.deinit();
+    }
+};
+
+const TestWaitBackend = struct {
+    fail_wait: bool = false,
+    last_request: ?threading.WaitRequest = null,
+
+    fn start(_: ?*anyopaque, _: threading.StartRequest) threading.BackendError!void {
+        return error.Unsupported;
+    }
+
+    fn wait(raw: ?*anyopaque, request: threading.WaitRequest) threading.BackendError!threading.WaitResult {
+        const self: *TestWaitBackend = @ptrCast(@alignCast(raw.?));
+        self.last_request = request;
+        if (self.fail_wait) return error.WaitFailed;
+        return .timed_out;
+    }
+
+    fn value(self: *TestWaitBackend) threading.Backend {
+        return .{
+            .context = self,
+            .start_fn = &start,
+            .wait_fn = &wait,
+        };
+    }
+};
+
+test "recursive mutexes preserve ownership and reject busy destruction" {
+    var context = TestContext{};
+    try context.init();
+    defer context.deinit();
+    const thread = try context.thread_manager.prepareInitialThread("mutex-owner");
+    defer context.thread_manager.releaseInitialThread(thread.handle) catch {};
+    try context.thread_manager.enter(thread.handle);
+    defer context.thread_manager.leave();
+
+    var attr: MutexAttrHandle = null;
+    try testing.expectEqual(errno.ok, pthread_mutexattr_init(&attr));
+    try testing.expectEqual(errno.ok, pthread_mutexattr_settype(&attr, 2));
+    var mutex: MutexHandle = null;
+    try testing.expectEqual(errno.ok, pthread_mutex_init(&mutex, &attr));
+    try testing.expectEqual(errno.ok, pthread_mutex_lock(&mutex));
+    try testing.expectEqual(errno.ok, pthread_mutex_lock(&mutex));
+    try testing.expectEqual(Posix.ebusy, pthread_mutex_destroy(&mutex));
+    try testing.expectEqual(errno.ok, pthread_mutex_unlock(&mutex));
+    try testing.expectEqual(errno.ok, pthread_mutex_unlock(&mutex));
+    try testing.expectEqual(errno.ok, pthread_mutex_destroy(&mutex));
+    try testing.expectEqual(errno.ok, pthread_mutexattr_destroy(&attr));
+}
+
+test "timed condition wait reacquires its mutex" {
+    var context = TestContext{};
+    try context.init();
+    defer context.deinit();
+    const thread = try context.thread_manager.prepareInitialThread("cond-owner");
+    defer context.thread_manager.releaseInitialThread(thread.handle) catch {};
+    try context.thread_manager.enter(thread.handle);
+    defer context.thread_manager.leave();
+    var backend = TestWaitBackend{};
+    context.thread_manager.setBackend(backend.value());
+
+    var mutex: MutexHandle = null;
+    var attr: CondAttrHandle = null;
+    var cond: CondHandle = null;
+    try testing.expectEqual(errno.ok, pthread_condattr_init(&attr));
+    try testing.expectEqual(errno.ok, pthread_condattr_setclock(&attr, 4));
+    try testing.expectEqual(errno.ok, pthread_cond_init(&cond, &attr));
+    try testing.expectEqual(errno.ok, pthread_mutex_lock(&mutex));
+    const deadline = Timespec{ .tv_sec = 1, .tv_nsec = 0 };
+    try testing.expectEqual(Posix.etimedout, pthread_cond_timedwait(&cond, &mutex, &deadline));
+    try testing.expectEqual(@as(i32, 4), backend.last_request.?.clock_id);
+    // Unlock succeeds only if timedwait restored ownership before returning.
+    try testing.expectEqual(errno.ok, pthread_mutex_unlock(&mutex));
+    try testing.expectEqual(errno.ok, pthread_cond_destroy(&cond));
+    try testing.expectEqual(errno.ok, pthread_condattr_destroy(&attr));
+    try testing.expectEqual(errno.ok, pthread_mutex_destroy(&mutex));
+}
+
+test "condition wait failure restores ownership and waiter counts" {
+    var context = TestContext{};
+    try context.init();
+    defer context.deinit();
+    const thread = try context.thread_manager.prepareInitialThread("cond-failure");
+    defer context.thread_manager.releaseInitialThread(thread.handle) catch {};
+    try context.thread_manager.enter(thread.handle);
+    defer context.thread_manager.leave();
+    var backend = TestWaitBackend{ .fail_wait = true };
+    context.thread_manager.setBackend(backend.value());
+
+    var mutex: MutexHandle = null;
+    var cond: CondHandle = null;
+    try testing.expectEqual(errno.ok, pthread_mutex_lock(&mutex));
+    try testing.expectEqual(Posix.eio, pthread_cond_wait(&cond, &mutex));
+    // Both operations prove that the error path restored ownership and removed
+    // the condition waiter's lifecycle reservation.
+    try testing.expectEqual(errno.ok, pthread_mutex_unlock(&mutex));
+    try testing.expectEqual(errno.ok, pthread_cond_destroy(&cond));
+    try testing.expectEqual(errno.ok, pthread_mutex_destroy(&mutex));
+}
+
+test "rwlock tracks reader and writer ownership" {
+    var context = TestContext{};
+    try context.init();
+    defer context.deinit();
+    const thread = try context.thread_manager.prepareInitialThread("rw-owner");
+    defer context.thread_manager.releaseInitialThread(thread.handle) catch {};
+    try context.thread_manager.enter(thread.handle);
+    defer context.thread_manager.leave();
+
+    var rwlock: RwlockHandle = null;
+    try testing.expectEqual(errno.ok, pthread_rwlock_rdlock(&rwlock));
+    try testing.expectEqual(Posix.ebusy, pthread_rwlock_trywrlock(&rwlock));
+    try testing.expectEqual(errno.ok, pthread_rwlock_unlock(&rwlock));
+    try testing.expectEqual(errno.ok, pthread_rwlock_wrlock(&rwlock));
+    try testing.expectEqual(Posix.ebusy, pthread_rwlock_tryrdlock(&rwlock));
+    try testing.expectEqual(errno.ok, pthread_rwlock_unlock(&rwlock));
+    try testing.expectEqual(errno.ok, pthread_rwlock_destroy(&rwlock));
+}
+
+test "synchronization exports register under published identifiers" {
+    var db = symbols.Database{};
+    defer db.deinit(testing.allocator);
+    try register(&db, testing.allocator);
+    try testing.expectEqual(exports.len, db.count());
+    try testing.expect(db.findById("7H0iTOciTLo", .function) != null);
+    try testing.expect(db.findById("27bAgiJmOh0", .function) != null);
+    try testing.expect(db.findById("1471ajPzxh0", .function) != null);
+}

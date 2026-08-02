@@ -511,9 +511,10 @@ The implemented lifecycle surface includes `create`, `join`, `detach`, `self`,
 `equal`, `exit`, `yield`, `once`, and `sceKernelUsleep`, with both
 `scePthread*` and POSIX spellings where the firmware exports both. Attributes
 cover copy/get, stack address and size, guard size, detach state, affinity,
-inherit-sched, scheduling parameters and policy, and solo scheduling. POSIX
-wrappers return plain positive errno values; sce entry points return kernel
-statuses.
+inherit-sched, scheduling parameters and policy, and solo scheduling. POSIX TLS
+keys store values per guest thread and run guest destructors for up to the four
+standard passes. POSIX wrappers return plain positive errno values; sce entry
+points return kernel statuses.
 
 Thread execution is connected through an explicit backend adapter. Every start
 request contains the entry point, argument, pthread identity, scheduling hints,
@@ -523,7 +524,29 @@ backend must install guest FS only across guest instruction execution, or patch
 FS-relative instructions as Kyty and SharpEmu do. HLE code never replaces the
 host FS register while Zig or Win32 code is active. Until a CPU backend is
 attached, creation, positive-duration sleep, and guest callbacks from `once`
-report `ENOSYS` rather than entering code with an invalid TLS base.
+report `ENOSYS` rather than entering code with an invalid TLS base. A dispatcher
+must call `Runtime.runCurrentThreadDestructors` after a guest entry point returns
+but before leaving its FS context. `scePthreadExit` runs destructors itself and,
+because its ABI returns `void`, continues thread exit if a callback fails.
+
+**`libkernel` — pthread synchronization** ([src/hle/libs/kernel_sync.zig](src/hle/libs/kernel_sync.zig))
+
+Mutexes, condition variables, and reader/writer locks use stable opaque guest
+handles backed by host-owned records. Null static initializers are materialized
+lazily. Mutexes track ownership, recursive depth, type, protocol metadata, and
+timed/try operations. Condition waits atomically publish themselves and release
+the associated mutex, then always reacquire it before returning, including after
+a timeout. Reader/writer locks retain per-thread reader ownership and prefer a
+queued writer over new readers so writers cannot be starved indefinitely.
+
+Blocking is scheduler-neutral. Every object has a monotonic sequence number;
+the backend receives the number observed before parking and can therefore avoid
+a lost wakeup when a signal races with the unlock-to-wait transition. Wake
+requests carry the same object key, the new sequence, and either one or all as
+the waiter limit. Timed waits accept relative microseconds for sce entry points
+and clock-tagged absolute nanosecond deadlines for POSIX entry points. The host
+fallback only yields, which is sufficient for unit tests; a real CPU dispatcher
+must provide `Backend.wait_fn` and `Backend.wake_fn` for actual guest scheduling.
 
 ## Error codes
 
@@ -539,9 +562,8 @@ from leaking into host code where nothing would check it.
 
 ## Roadmap
 
-1. Connect the CPU dispatcher to the pthread backend and its supplied guest FS
-   context, then add mutex, condition-variable, rwlock, key, and destructor
-   families on top of the completed thread lifecycle.
+1. Add the native x86-64 CPU dispatcher and connect it to the pthread backend's
+   FS context, wait/wake scheduler contract, and guest callback contract.
 2. Event queues, on which most firmware asynchrony is built.
 
 ---
@@ -554,9 +576,10 @@ with the sparse direct-memory backing store, connects it to libkernel, registers
 all HLE exports, owns the process TLS registry, and adapts both registries to
 `loader.Resolver`. Exact library/module/version metadata is used first; the
 identifier-only HLE lookup remains the documented fallback for incomplete
-module metadata. It also owns the pthread manager and exposes the execution
-backend boundary plus initial-thread preparation. A mapped image unregisters
-its TLS template when it unloads.
+module metadata. It also owns the pthread and synchronization managers, exposes
+the execution backend boundary, initial-thread preparation, and natural-return
+TLS destructor hook. A mapped image unregisters its TLS template when it
+unloads.
 
 ```zig
 const runtime = @import("runtime");

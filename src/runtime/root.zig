@@ -17,7 +17,8 @@ pub const Error = error{
     AlreadyInitialized,
     NotInitialized,
 } || memory.Error || hle.symbols.Error || loader.elf.Error || loader.dynamic.Error ||
-    loader.image_loader.Error || hle.libs.kernel_threading.Error || std.mem.Allocator.Error;
+    loader.image_loader.Error || hle.libs.kernel_threading.Error ||
+    hle.libs.kernel_sync.Error || std.mem.Allocator.Error;
 
 pub const Runtime = struct {
     allocator: ?std.mem.Allocator = null,
@@ -25,6 +26,7 @@ pub const Runtime = struct {
     database: hle.Database = .{},
     tls_registry: loader.TlsRegistry = .{},
     thread_manager: hle.libs.kernel_threading.Manager = .{},
+    sync_manager: hle.libs.kernel_sync.Manager = .{},
     initialized: bool = false,
 
     /// Initializes a stable, caller-owned Runtime value.
@@ -57,6 +59,15 @@ pub const Runtime = struct {
         hle.libs.kernel_threading.attachManager(&self.thread_manager);
         errdefer hle.libs.kernel_threading.attachManager(null);
 
+        self.sync_manager.init(allocator);
+        errdefer self.sync_manager.deinit();
+        hle.libs.kernel_sync.attachManager(&self.sync_manager);
+        errdefer hle.libs.kernel_sync.attachManager(null);
+
+        errdefer {
+            self.database.deinit(allocator);
+            self.database = .{};
+        }
         try hle.registerAll(&self.database, allocator);
         self.initialized = true;
     }
@@ -65,6 +76,8 @@ pub const Runtime = struct {
         if (!self.initialized) return;
         const allocator = self.allocator.?;
 
+        hle.libs.kernel_sync.attachManager(null);
+        self.sync_manager.deinit();
         hle.libs.kernel_threading.attachManager(null);
         self.thread_manager.deinit();
         hle.libs.kernel_memory.attachAddressSpace(null);
@@ -119,6 +132,13 @@ pub const Runtime = struct {
     pub fn leaveGuestThread(self: *Runtime) void {
         if (!self.initialized) return;
         self.thread_manager.leave();
+    }
+
+    /// Runs POSIX TLS-key destructors before a naturally returning guest entry
+    /// point leaves its FS context. `scePthreadExit` performs this step itself.
+    pub fn runCurrentThreadDestructors(self: *Runtime) Error!void {
+        if (!self.initialized) return Error.NotInitialized;
+        return self.thread_manager.runSpecificDestructors();
     }
 
     /// Reports a child result after the backend has left its guest FS context.
