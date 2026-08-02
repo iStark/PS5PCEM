@@ -647,6 +647,89 @@ pub const AddressSpace = struct {
         });
     }
 
+    /// Commits a mapping inside a range the guest has already reserved.
+    ///
+    /// Mapping into a reservation is the whole point of reserving, and titles
+    /// routinely map less than they reserved, in several pieces. Releasing the
+    /// reservation and mapping afterwards only works when the two match
+    /// exactly: the host placeholder covering the reservation has to be split
+    /// for the sub-range, whereas releasing tries to coalesce it with
+    /// neighbouring free space that is not part of the same placeholder.
+    ///
+    /// Returns `RangeNotMapped` when the range is not wholly inside one
+    /// reservation, so the caller can fall back to ordinary fixed mapping.
+    pub fn mapInReservation(
+        self: *AddressSpace,
+        address: u64,
+        size: u64,
+        protection: Protection,
+        kind: MappingKind,
+        backing_offset: ?u64,
+    ) Error!void {
+        try validateMappedRange(address, size);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const end = address + size;
+        const reservation = for (self.mappings.items) |mapping| {
+            if (mapping.kind != .reserved) continue;
+            if (mapping.address <= address and end <= mapping.end()) break mapping;
+        } else return Error.RangeNotMapped;
+
+        var replacement: std.ArrayList(Mapping) = .empty;
+        errdefer replacement.deinit(self.allocator);
+        try replacement.ensureTotalCapacity(self.allocator, self.mappings.items.len + 2);
+        // Drop the reserved cover for this sub-range; anything of the
+        // reservation on either side stays reserved and still belongs to the
+        // guest.
+        try appendTransformed(
+            self.allocator,
+            &replacement,
+            self.mappings.items,
+            address,
+            size,
+            .none,
+            0,
+            true,
+        );
+
+        // The placeholder to re-split is the reservation's own extent, not the
+        // surrounding free space.
+        const placeholder = Range{ .start = reservation.address, .end = reservation.end() };
+        try hostSplitWithinPlaceholder(placeholder, address, size);
+        errdefer hostCoalescePlaceholder(placeholder) catch {};
+
+        if (kind == .direct_memory) {
+            const offset = backing_offset orelse return Error.BackingOffsetInvalid;
+            const backing = if (self.direct_backing) |*value| value else return Error.BackingStoreUnavailable;
+            const backing_end = std.math.add(u64, offset, size) catch
+                return Error.BackingOffsetInvalid;
+            if (!isAligned(offset, page_size) or backing_end > backing.size) {
+                return Error.BackingOffsetInvalid;
+            }
+            try hostMapBacking(backing, address, size, offset, protection);
+            errdefer hostUnmapBacking(address, size) catch {};
+        } else {
+            if (backing_offset != null) return Error.BackingOffsetInvalid;
+            try hostCommit(address, size, protection);
+            errdefer hostDecommit(address, size) catch {};
+        }
+
+        const index = insertionIndexIn(replacement.items, address);
+        try replacement.insert(self.allocator, index, .{
+            .address = address,
+            .size = size,
+            .protection = protection,
+            .kind = kind,
+            .protection_bits = 0,
+            .name = namedMapping("anon"),
+        });
+
+        self.mappings.deinit(self.allocator);
+        self.mappings = replacement;
+    }
+
     fn reserveFixedLocked(self: *AddressSpace, address: u64, size: u64) Error!void {
         if (!self.ownsLocked(address, size)) return Error.AddressUnavailable;
         if (self.overlapsLocked(address, size)) return Error.AddressUnavailable;
@@ -702,17 +785,7 @@ pub const AddressSpace = struct {
     }
 
     fn insertionIndex(self: *const AddressSpace, address: u64) usize {
-        var low: usize = 0;
-        var high = self.mappings.items.len;
-        while (low < high) {
-            const middle = low + (high - low) / 2;
-            if (self.mappings.items[middle].address < address) {
-                low = middle + 1;
-            } else {
-                high = middle;
-            }
-        }
-        return low;
+        return insertionIndexIn(self.mappings.items, address);
     }
 
     fn overlapsLocked(self: *const AddressSpace, address: u64, size: u64) bool {
@@ -1007,6 +1080,21 @@ fn namedMapping(name: []const u8) [maximum_name_length]u8 {
 
 /// Returns the complete free interval around a requested range. The mapping
 /// slice may be the current table or a prospective table built for `unmap`.
+/// Where `address` belongs in an address-ordered mapping list.
+fn insertionIndexIn(mappings: []const Mapping, address: u64) usize {
+    var low: usize = 0;
+    var high = mappings.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        if (mappings[middle].address < address) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    return low;
+}
+
 fn freeRangeInMappings(
     reservations: []const Range,
     mappings: []const Mapping,
@@ -1221,6 +1309,32 @@ fn hostPreparePlaceholderRange(free: Range, address: u64, size: u64) Error!void 
     try hostCoalescePlaceholder(free);
     if (address > free.start) try hostSplitPlaceholder(free.start, address - free.start);
     if (address + size < free.end) try hostSplitPlaceholder(address, size);
+}
+
+/// Carves per-page placeholders for `address`/`size` out of an existing one.
+///
+/// Two differences from `hostPreparePagePlaceholders`. It does not coalesce
+/// first: a guest reservation is already a single placeholder, and coalescing
+/// needs at least two adjacent ones to merge, so asking for it fails outright.
+/// And the pages have to be split individually, because a backing view is
+/// mapped a page at a time and replacing a placeholder requires the target to
+/// be a placeholder of exactly that size.
+fn hostSplitWithinPlaceholder(placeholder: Range, address: u64, size: u64) Error!void {
+    if (builtin.os.tag != .windows) return;
+
+    if (address > placeholder.start) {
+        try hostSplitPlaceholder(placeholder.start, address - placeholder.start);
+    }
+
+    var cursor = address;
+    const end = address + size;
+    while (cursor < end) : (cursor += page_size) {
+        // The final page needs no split when it already ends the placeholder;
+        // splitting a placeholder at its own end is rejected.
+        if (cursor + page_size < placeholder.end) {
+            try hostSplitPlaceholder(cursor, page_size);
+        }
+    }
 }
 
 fn hostSplitPlaceholder(address: u64, size: u64) Error!void {

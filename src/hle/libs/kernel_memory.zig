@@ -206,19 +206,57 @@ pub const Pool = struct {
         return error.OutOfDirectMemory;
     }
 
-    /// Releases a previously reserved range.
+    /// Releases part or all of a previously reserved range.
     ///
-    /// Only exact ranges are accepted. Hardware permits releasing a sub-range,
-    /// which would split the reservation; that is not implemented, and saying so
-    /// through an error is better than silently freeing more than asked.
-    pub fn release(self: *Pool, start: u64, len: u64) PoolError!void {
-        for (self.reservations.items, 0..) |r, i| {
-            if (r.start == start and r.len == len) {
-                _ = self.reservations.orderedRemove(i);
-                return;
+    /// Titles allocate physical memory in pieces and hand it back in different
+    /// pieces, so a release routinely covers only part of one reservation, or
+    /// spans several. Anything inside the requested range that is reserved is
+    /// released; whatever is left of a partially covered reservation stays.
+    ///
+    /// A range covering nothing reserved is still an error: it means the title
+    /// believes it owns memory it does not, and reporting that is more useful
+    /// than silently succeeding.
+    pub fn release(self: *Pool, gpa: std.mem.Allocator, start: u64, len: u64) PoolError!void {
+        const end = std.math.add(u64, start, len) catch return PoolError.NotReserved;
+        var released = false;
+
+        var index: usize = 0;
+        while (index < self.reservations.items.len) {
+            const reservation = self.reservations.items[index];
+            const overlap_start = @max(start, reservation.start);
+            const overlap_end = @min(end, reservation.end());
+            if (overlap_start >= overlap_end) {
+                index += 1;
+                continue;
+            }
+
+            released = true;
+            _ = self.reservations.orderedRemove(index);
+
+            // Reinsert whatever the release did not cover. Growing the list
+            // while iterating is safe because the replacements are placed at
+            // the current position and re-examined; they no longer overlap.
+            if (reservation.start < overlap_start) {
+                try self.reservations.insert(gpa, index, .{
+                    .start = reservation.start,
+                    .len = overlap_start - reservation.start,
+                    .alignment = reservation.alignment,
+                    .memory_type = reservation.memory_type,
+                });
+                index += 1;
+            }
+            if (overlap_end < reservation.end()) {
+                try self.reservations.insert(gpa, index, .{
+                    .start = overlap_end,
+                    .len = reservation.end() - overlap_end,
+                    .alignment = reservation.alignment,
+                    .memory_type = reservation.memory_type,
+                });
+                index += 1;
             }
         }
-        return PoolError.NotReserved;
+
+        if (!released) return PoolError.NotReserved;
     }
 };
 
@@ -308,7 +346,8 @@ fn sceKernelReleaseDirectMemory(start: u64, len: u64) callconv(abi.guest) i32 {
             return KernelError.ebusy.raw();
         }
     }
-    pool.release(start, len) catch |err| return switch (err) {
+    const gpa = pool_gpa orelse return KernelError.enomem.raw();
+    pool.release(gpa, start, len) catch |err| return switch (err) {
         error.NotReserved => KernelError.einval.raw(),
         else => KernelError.enomem.raw(),
     };
@@ -398,8 +437,32 @@ fn sceKernelMapDirectMemory(
         if (requested_address == 0 or requested_address % effective_alignment != 0) {
             return KernelError.einval.raw();
         }
-        if (address_space.isMapped(requested_address, len)) {
-            if (map_flags & map_no_overwrite != 0) return KernelError.enomem.raw();
+        const occupied = address_space.isMapped(requested_address, len);
+        if (occupied and map_flags & map_no_overwrite != 0) {
+            return KernelError.enomem.raw();
+        }
+
+        // Mapping into a range the title reserved earlier is the common case
+        // and has to commit inside the reservation rather than release it. A
+        // title reserves a window once and fills it in pieces, so releasing
+        // would give up its claim on everything not yet mapped — and releasing
+        // part of a reservation cannot restore the host placeholder correctly
+        // anyway.
+        if (occupied) {
+            if (address_space.mapInReservation(
+                requested_address,
+                len,
+                protection,
+                .direct_memory,
+                physical_address,
+            )) |_| {
+                break :fixed requested_address;
+            } else |err| switch (err) {
+                // Not a reservation: fall through to replacing what is there.
+                error.RangeNotMapped => {},
+                else => return mapAddressSpaceError(err),
+            }
+
             address_space.unmap(requested_address, len) catch |err|
                 return mapAddressSpaceError(err);
         }
@@ -988,19 +1051,60 @@ test "the pool reports exhaustion rather than overcommitting" {
     );
 }
 
-test "release accepts an exact range and rejects anything else" {
+test "release frees part of a reservation and keeps the rest" {
     var p = Pool{ .size = 64 * page_size };
     defer p.deinit(testing.allocator);
 
     const start = try p.reserve(testing.allocator, 0, p.size, 4 * page_size, page_size, .wb_onion);
 
-    // A partial release would have to split the reservation, which is not
-    // supported; it must not silently free the whole range.
-    try testing.expectError(PoolError.NotReserved, p.release(start, 2 * page_size));
-    try testing.expectEqual(@as(u64, 4 * page_size), p.used());
+    // Titles allocate in one shape and hand memory back in another, so a
+    // release routinely covers only part of a reservation.
+    try p.release(testing.allocator, start, 2 * page_size);
+    try testing.expectEqual(@as(u64, 2 * page_size), p.used());
+    // The freed half becomes available; the retained half does not.
+    try testing.expect(p.findContaining(start) == null);
+    try testing.expect(p.findContaining(start + 2 * page_size) != null);
 
-    try p.release(start, 4 * page_size);
+    try p.release(testing.allocator, start + 2 * page_size, 2 * page_size);
     try testing.expectEqual(@as(u64, 0), p.used());
+}
+
+test "release can carve a hole out of the middle" {
+    var p = Pool{ .size = 64 * page_size };
+    defer p.deinit(testing.allocator);
+
+    const start = try p.reserve(testing.allocator, 0, p.size, 8 * page_size, page_size, .wb_onion);
+    try p.release(testing.allocator, start + 2 * page_size, 4 * page_size);
+
+    try testing.expectEqual(@as(u64, 4 * page_size), p.used());
+    try testing.expect(p.findContaining(start) != null);
+    try testing.expect(p.findContaining(start + 3 * page_size) == null);
+    try testing.expect(p.findContaining(start + 6 * page_size) != null);
+}
+
+test "release spanning several reservations frees them all" {
+    var p = Pool{ .size = 64 * page_size };
+    defer p.deinit(testing.allocator);
+
+    const first = try p.reserve(testing.allocator, 0, p.size, 2 * page_size, page_size, .wb_onion);
+    const second = try p.reserve(testing.allocator, 0, p.size, 2 * page_size, page_size, .wb_onion);
+    try testing.expectEqual(first + 2 * page_size, second);
+
+    try p.release(testing.allocator, first, 4 * page_size);
+    try testing.expectEqual(@as(u64, 0), p.used());
+}
+
+test "releasing memory that was never reserved is an error" {
+    var p = Pool{ .size = 64 * page_size };
+    defer p.deinit(testing.allocator);
+
+    const start = try p.reserve(testing.allocator, 0, p.size, 2 * page_size, page_size, .wb_onion);
+    // Claiming memory it does not own is worth reporting rather than ignoring.
+    try testing.expectError(
+        PoolError.NotReserved,
+        p.release(testing.allocator, start + 8 * page_size, page_size),
+    );
+    try testing.expectEqual(@as(u64, 2 * page_size), p.used());
 }
 
 test "released ranges become available again" {
@@ -1008,7 +1112,7 @@ test "released ranges become available again" {
     defer p.deinit(testing.allocator);
 
     const start = try p.reserve(testing.allocator, 0, p.size, 4 * page_size, page_size, .wb_onion);
-    try p.release(start, 4 * page_size);
+    try p.release(testing.allocator, start, 4 * page_size);
 
     const again = try p.reserve(testing.allocator, 0, p.size, 4 * page_size, page_size, .wb_onion);
     try testing.expectEqual(start, again);
@@ -1186,6 +1290,69 @@ test "direct memory maps at an exact guest address" {
     try testing.expectEqual(errno.ok, sceKernelMunmap(virtual_address, page_size));
     try testing.expectEqual(errno.ok, sceKernelMunmap(alias, page_size));
     try testing.expectEqual(errno.ok, sceKernelReleaseDirectMemory(start, page_size));
+}
+
+test "direct memory maps into part of a larger reservation" {
+    var address_space = try memory.AddressSpace.initWithDirectMemory(
+        testing.allocator,
+        direct_memory_size,
+    );
+    defer address_space.deinit();
+
+    init(testing.allocator);
+    defer deinit();
+    attachAddressSpace(&address_space);
+
+    // The sequence a title actually performs: reserve a window, allocate
+    // physical memory, then map the memory into part of that window. Mapping
+    // into a reservation is what reserving is for, and the mapped length is
+    // routinely smaller than the reservation.
+    const reservation_size: u64 = 0x80_0000;
+    const map_size: u64 = 0x40_0000;
+    const alignment: u64 = 0x4_0000;
+
+    var reserved: u64 = 0;
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelReserveVirtualRange(&reserved, reservation_size, 0, alignment),
+    );
+    try testing.expect(reserved != 0);
+
+    var physical: u64 = 0;
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelAllocateMainDirectMemory(map_size, alignment, 0, &physical),
+    );
+
+    const title_protection = prot_cpu_read | prot_cpu_write | prot_gpu_read | prot_gpu_write;
+    var mapped = reserved;
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelMapDirectMemory(&mapped, map_size, title_protection, map_fixed, physical, 0),
+    );
+    try testing.expectEqual(reserved, mapped);
+    try testing.expect(address_space.isMappedAs(mapped, map_size, .direct_memory));
+
+    // The rest of the reservation must survive: the title still owns it and
+    // fills it in later.
+    const tail = reserved + map_size;
+    try testing.expectEqual(
+        memory.MappingKind.reserved,
+        address_space.query(tail, false).?.kind,
+    );
+
+    var second: u64 = 0;
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelAllocateMainDirectMemory(map_size, alignment, 0, &second),
+    );
+    var tail_mapped = tail;
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelMapDirectMemory(&tail_mapped, map_size, title_protection, map_fixed, second, 0),
+    );
+    try testing.expectEqual(tail, tail_mapped);
+    try testing.expect(address_space.isMappedAs(tail_mapped, map_size, .direct_memory));
 }
 
 test "flexible memory maps, queries, protects, unmaps, and reuses ranges" {
