@@ -74,6 +74,11 @@ pub const Export = struct {
     name: []const u8,
     /// Implementation. Must be declared `callconv(abi.guest)`.
     function: abi.RawEntryPoint,
+    /// Explicit firmware identifier for private exports whose public name is
+    /// not known. Normal exports leave this null and derive the identifier
+    /// from `name`; keeping the escape hatch explicit prevents a descriptive
+    /// placeholder from silently hashing to the wrong symbol.
+    id_override: ?[]const u8 = null,
     /// Optional assertion that `name` hashes to this identifier. Supplying it
     /// turns a typo into a registration failure.
     expect_id: ?[]const u8 = null,
@@ -95,16 +100,40 @@ pub const Database = struct {
         module: Module,
         e: Export,
     ) Error!void {
-        const id = nid.fromName(e.name);
+        const computed_id = nid.fromName(e.name);
+        const id = try exportId(computed_id, e.id_override);
 
         if (e.expect_id) |expected| {
-            if (!std.mem.eql(u8, &id, expected)) return Error.IdentifierMismatch;
+            if (!std.mem.eql(u8, &computed_id, expected)) return Error.IdentifierMismatch;
         }
 
         try self.symbols.append(gpa, .{
             .key = .{ .id = id, .library = library, .module = module, .type = e.type },
             .name = e.name,
             .address = @intFromPtr(e.function),
+        });
+    }
+
+    /// Registers a data object. Object relocations need the address of the
+    /// storage itself, not a callable trampoline, so they deliberately use a
+    /// separate API from function exports.
+    pub fn addObject(
+        self: *Database,
+        gpa: std.mem.Allocator,
+        library: Library,
+        module: Module,
+        name: []const u8,
+        address: u64,
+        expect_id: ?[]const u8,
+    ) Error!void {
+        const id = nid.fromName(name);
+        if (expect_id) |expected| {
+            if (!std.mem.eql(u8, &id, expected)) return Error.IdentifierMismatch;
+        }
+        try self.symbols.append(gpa, .{
+            .key = .{ .id = id, .library = library, .module = module, .type = .object },
+            .name = name,
+            .address = address,
         });
     }
 
@@ -153,6 +182,14 @@ pub const Database = struct {
         return self.symbols.items.len;
     }
 };
+
+fn exportId(computed: nid.Encoded, override: ?[]const u8) Error!nid.Encoded {
+    const text = override orelse return computed;
+    _ = nid.decode(text) catch return Error.IdentifierMismatch;
+    var id: nid.Encoded = undefined;
+    @memcpy(&id, text);
+    return id;
+}
 
 const testing = std.testing;
 
@@ -257,4 +294,46 @@ test "a library registers as one declaration" {
     try testing.expectEqual(@as(usize, 3), db.count());
     try testing.expect(db.findByName("sceKernelReleaseDirectMemory", .function) != null);
     try testing.expect(db.findByName("sceKernelGetDirectMemorySize", .function) == null);
+}
+
+test "private exports can use an explicit identifier" {
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+
+    try db.add(testing.allocator, test_library, test_module, .{
+        .name = "private firmware entry",
+        .function = abi.erase(&stubA),
+        .id_override = "VADc3MNQ3cM",
+    });
+
+    try testing.expect(db.findById("VADc3MNQ3cM", .function) != null);
+    try testing.expectError(Error.IdentifierMismatch, db.add(
+        testing.allocator,
+        test_library,
+        test_module,
+        .{
+            .name = "bad private entry",
+            .function = abi.erase(&stubA),
+            .id_override = "not-a-nid",
+        },
+    ));
+}
+
+test "object exports preserve the storage address" {
+    var db = Database{};
+    defer db.deinit(testing.allocator);
+    var guard: u64 = 0x1234;
+
+    try db.addObject(
+        testing.allocator,
+        test_library,
+        test_module,
+        "__stack_chk_guard",
+        @intFromPtr(&guard),
+        "f7uOxY9mM1U",
+    );
+
+    const found = db.findByName("__stack_chk_guard", .object) orelse
+        return error.TestExpectedSymbol;
+    try testing.expectEqual(@intFromPtr(&guard), found.address);
 }

@@ -37,6 +37,7 @@ pub const Import = struct {
     library_code: []const u8,
     module_code: []const u8,
 
+    binding: symbols.Binding = .global,
     symbol_type: symbols.Type,
     relocation_type: relocations.Type,
     table: relocations.TableKind,
@@ -124,6 +125,7 @@ fn collectFrom(
             .module = if (mod) |m| m.name else null,
             .library_code = parsed.library,
             .module_code = parsed.module,
+            .binding = sym.binding(),
             .symbol_type = sym.symbolType(),
             .relocation_type = reloc_type,
             .table = table.kind,
@@ -334,6 +336,7 @@ test "an import is described with its library and module resolved" {
     try testing.expectEqualStrings("libkernel", imp.library.?);
     try testing.expectEqual(@as(u16, 1), imp.library_version.?);
     try testing.expectEqualStrings("libkernel", imp.module.?);
+    try testing.expectEqual(symbols.Binding.global, imp.binding);
     try testing.expectEqual(relocations.Type.jump_slot, imp.relocation_type);
     try testing.expectEqual(relocations.TableKind.plt, imp.table);
     try testing.expectEqual(@as(u64, 0x3000), imp.target_offset);

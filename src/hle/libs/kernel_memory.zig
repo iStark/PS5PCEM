@@ -495,7 +495,7 @@ fn mapFlexibleMemory(
     return errno.ok;
 }
 
-fn sceKernelMapNamedFlexibleMemory(
+pub fn sceKernelMapNamedFlexibleMemory(
     out_address: ?*u64,
     len: u64,
     protection_bits: i32,

@@ -33,6 +33,7 @@ pub const default_inherit_sched: i32 = 4;
 const minimum_tls_prefix: u64 = 0x20_000;
 const tcb_size: u64 = 0x100;
 const dtv_header_slots: u64 = 2;
+const errno_tcb_offset: u64 = 0x80;
 const stack_canary: u64 = 0xc0de_c0de_cafe_ba00;
 const attr_magic: u64 = 0x5054_4852_4154_5452;
 const maximum_keys: usize = 256;
@@ -211,6 +212,7 @@ const ThreadBlock = struct {
         try address_space.writeInt(u64, fs_base + 0x10, thread_handle);
         try address_space.writeInt(u64, fs_base + 0x28, stack_canary);
         try address_space.writeInt(u64, fs_base + 0x60, fs_base);
+        try address_space.writeInt(i32, fs_base + errno_tcb_offset, 0);
         try address_space.writeInt(u64, dtv_address + 0x00, snapshot.generation);
         try address_space.writeInt(u64, dtv_address + 0x08, snapshot.maximum_module_id);
 
@@ -387,6 +389,40 @@ pub const Manager = struct {
 
     pub fn current(_: *Manager) ThreadHandle {
         return if (current_guest_thread == 0) null else @ptrFromInt(current_guest_thread);
+    }
+
+    /// Returns the immutable execution context for the current host worker's
+    /// guest thread. The record remains owned by the manager; callers receive
+    /// a value copy so no manager lock crosses an HLE call boundary.
+    pub fn currentContext(self: *Manager) ?ThreadContext {
+        if (current_guest_thread == 0) return null;
+        self.lock.lock();
+        defer self.lock.unlock();
+        const record = self.findRecordLocked(current_guest_thread) orelse return null;
+        const block = record.block orelse return null;
+        return block.context;
+    }
+
+    /// Resolves the `{module, offset}` pair consumed by `__tls_get_addr`
+    /// against the DTV constructed for the active guest thread.
+    pub fn resolveCurrentTls(self: *Manager, module_id: u64, offset: u64) ?u64 {
+        if (module_id == 0) return null;
+        const module_info = self.tls_registry.findModule(module_id) orelse return null;
+        if (offset >= module_info.memory_size) return null;
+        const context = self.currentContext() orelse return null;
+        const slot_index = std.math.add(u64, dtv_header_slots, module_id - 1) catch return null;
+        const slot_offset = std.math.mul(u64, slot_index, @sizeOf(u64)) catch return null;
+        const slot_address = std.math.add(u64, context.dtv_address, slot_offset) catch return null;
+        var encoded: [@sizeOf(u64)]u8 = undefined;
+        self.address_space.read(slot_address, &encoded) catch return null;
+        const module_address = std.mem.readInt(u64, &encoded, .little);
+        if (module_address == 0) return null;
+        return std.math.add(u64, module_address, offset) catch null;
+    }
+
+    pub fn currentErrnoAddress(self: *Manager) ?u64 {
+        const context = self.currentContext() orelse return null;
+        return std.math.add(u64, context.fs_base, errno_tcb_offset) catch null;
     }
 
     pub fn create(
@@ -869,6 +905,16 @@ fn activeManager() ?*Manager {
 /// Guest pthread identity used by synchronization objects for ownership.
 pub fn currentThreadId() u64 {
     return current_guest_thread;
+}
+
+pub fn resolveCurrentTls(module_id: u64, offset: u64) ?u64 {
+    const active_manager = activeManager() orelse return null;
+    return active_manager.resolveCurrentTls(module_id, offset);
+}
+
+pub fn currentErrnoAddress() ?u64 {
+    const active_manager = activeManager() orelse return null;
+    return active_manager.currentErrnoAddress();
 }
 
 pub fn waitCurrent(request: WaitRequest) Error!WaitResult {

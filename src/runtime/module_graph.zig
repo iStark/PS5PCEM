@@ -15,6 +15,21 @@ pub const Options = struct {
     /// Shared PRX images are packed into the guest system-software window.
     module_load_start: u64 = memory.system_reserved.start,
     maximum_file_size: usize = 512 * 1024 * 1024,
+    diagnostics: ?Diagnostics = null,
+};
+
+pub const Diagnostics = struct {
+    context: ?*anyopaque = null,
+    unresolved_fn: *const fn (?*anyopaque, UnresolvedImport) void,
+
+    fn unresolved(self: Diagnostics, diagnostic: UnresolvedImport) void {
+        self.unresolved_fn(self.context, diagnostic);
+    }
+};
+
+pub const UnresolvedImport = struct {
+    path: []const u8,
+    import: loader.Import,
 };
 
 pub const Module = struct {
@@ -169,7 +184,7 @@ pub fn loadFromDir(
         guest_exports,
         options,
     );
-    try linkAll(&graph, resolver);
+    try linkAll(&graph, resolver, options.diagnostics);
 
     try graph.module_images.ensureTotalCapacity(gpa, graph.initialization_order.items.len);
     for (graph.initialization_order.items) |index| {
@@ -338,13 +353,25 @@ fn prepareAll(
     }
 }
 
-fn linkAll(graph: *ModuleGraph, resolver: ?loader.Resolver) !void {
-    for (graph.initialization_order.items) |index| try linkNode(graph, index, resolver);
-    try linkNode(graph, graph.root_index, resolver);
+fn linkAll(
+    graph: *ModuleGraph,
+    resolver: ?loader.Resolver,
+    diagnostics: ?Diagnostics,
+) !void {
+    for (graph.initialization_order.items) |index| {
+        try linkNode(graph, index, resolver, diagnostics);
+    }
+    try linkNode(graph, graph.root_index, resolver, diagnostics);
 }
 
-fn linkNode(graph: *ModuleGraph, index: usize, resolver: ?loader.Resolver) !void {
+fn linkNode(
+    graph: *ModuleGraph,
+    index: usize,
+    resolver: ?loader.Resolver,
+    diagnostics: ?Diagnostics,
+) !void {
     const node = &graph.nodes.items[index];
+    if (diagnostics) |sink| try reportUnresolved(graph.allocator, node, resolver, sink);
     node.mapped = try loader.linkImage(
         &node.prepared.?,
         node.image,
@@ -352,6 +379,24 @@ fn linkNode(graph: *ModuleGraph, index: usize, resolver: ?loader.Resolver) !void
         resolver,
     );
     node.prepared = null;
+}
+
+fn reportUnresolved(
+    gpa: std.mem.Allocator,
+    node: *const Module,
+    resolver: ?loader.Resolver,
+    diagnostics: Diagnostics,
+) !void {
+    var module_imports = try loader.collectImports(gpa, node.image, &node.dynamic_info);
+    defer module_imports.deinit(gpa);
+
+    for (module_imports.items.items) |import| {
+        if (import.binding == .weak) continue;
+        const resolved = if (import.symbol_type == .tls)
+            if (resolver) |active| active.resolveTls(&import) != null else false
+        else if (resolver) |active| active.resolve(&import) != null else false;
+        if (!resolved) diagnostics.unresolved(.{ .path = node.path, .import = import });
+    }
 }
 
 fn alignDown(value: u64, alignment: u64) u64 {

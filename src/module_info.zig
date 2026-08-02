@@ -207,10 +207,11 @@ pub fn main(init: std.process.Init) !void {
     for (module_imports.items.items) |imp| {
         const status = resolve(&db, &guest_exports, imp);
         if (status != .not_found) resolved += 1;
-        try out.print("  {s} {s}  {s}  {s}\n", .{
+        try out.print("  {s} {s}  {s}  {s}  {s}\n", .{
             status.mark(),
             imp.id,
             imp.library orelse imp.library_code,
+            @tagName(imp.symbol_type),
             @tagName(imp.relocation_type),
         });
     }

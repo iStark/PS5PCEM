@@ -17,12 +17,13 @@ cross-compiles to Windows, Linux, and macOS. Direct guest execution currently
 requires Windows x86-64; the other targets still build the inspection and HLE
 layers but report the native bridge as unsupported.
 
-Two command-line tools come with them:
+Three command-line tools come with them:
 
 ```sh
 zig build run         -- shader.bin    # disassemble a shader
 zig build module-info -- eboot.bin     # inspect a bare ELF or decrypted PS5 SELF
 zig build module-info -- eboot.bin sce_module/libc.prx # include a guest provider
+zig build graph-info  -- eboot.bin     # map and relocate the reachable PRX graph
 ```
 
 `module-info` is where the pieces meet. It reads a module, works out every
@@ -49,10 +50,10 @@ imported libraries
 exports (0)
 
 imports (4)
-  ok   rTXw65xmLIA  libkernel  jump_slot
-  ok   pO96TwzOm5E  libkernel  jump_slot
-  MISS 1jfXLRVzisc  libkernel  jump_slot
-  MISS 6UgtwV+0zb4  libkernel  jump_slot
+  ok   rTXw65xmLIA  libkernel  func  jump_slot
+  ok   pO96TwzOm5E  libkernel  func  jump_slot
+  MISS 1jfXLRVzisc  libkernel  func  jump_slot
+  MISS 6UgtwV+0zb4  libkernel  func  jump_slot
 
 2/4 imports provided
 1 relocations reference no symbol
@@ -63,6 +64,13 @@ before it can run — a more honest measure than any aggregate progress figure.
 A `~` instead of `ok` means the symbol matched on identifier alone, because the
 module named a library the registry does not know; it may well be the wrong
 implementation.
+
+`graph-info` performs the stricter check: it uses the runtime's real fixed
+address space, recursively discovers adjacent PRX files, publishes their guest
+exports, and applies every relocation without executing guest code. If a strong
+import stops a module, the diagnostic includes the module path, NID, library,
+and symbol type. This separates a linkage gap from a later initializer or CPU
+fault.
 
 ---
 
@@ -414,9 +422,10 @@ identity-mapped per-thread region in the guest user window. At least 128 KiB of
 prefix space below the thread pointer holds the static Variant II blocks,
 zero-filling each module's complete `memsz` before overlaying its `tdata`. The
 TCB contains the self pointer at `FS:0`, the DTV pointer at `FS:8`, the pthread
-handle at `FS:0x10`, and the stack canary used by guest runtimes. The DTV records
-the registry generation, maximum module ID, and the address of every static
-block.
+handle at `FS:0x10`, the stack canary used by guest runtimes, and libc's errno
+slot at `FS:0x80`. The DTV records the registry generation, maximum module ID,
+and the address of every static block. `__tls_get_addr` resolves its module and
+offset pair through that same per-thread DTV.
 
 Startup metadata is retained after relocation instead of being discarded with
 the parsed dynamic table. `MappedImage` publishes the mapped `PT_SCE_PROCPARAM`
@@ -579,6 +588,22 @@ and clock-tagged absolute nanosecond deadlines for POSIX entry points. The CPU
 dispatcher provides the production wait/wake path; the HLE-only fallback yields
 solely so isolated unit tests can exercise state transitions.
 
+**System-libc bootstrap ABI** ([src/hle/libs/kernel_runtime.zig](src/hle/libs/kernel_runtime.zig))
+
+The genuine `libc.prx` is now the provider for its 2,922 exports instead of a
+parallel HLE libc. Its 120 lower-level imports resolve through a focused
+libkernel bridge plus `libSceLibcInternalExt` and `libSceSysmodule`. Data imports
+such as `__stack_chk_guard` and `__progname` are registered as storage addresses,
+not function stubs. Runtime hooks provide per-thread errno/TLS, clocks, sleep,
+process parameters, sanitizer opt-out records, and rtld callbacks. Operations
+whose backing subsystem is not implemented yet return `ENOSYS` or `ENOENT`
+instead of reporting false success.
+
+The Unity support PRXs also receive the small `libkernel_unity`, `libScePosix`,
+RTC, system-parameter, app-content, and network-control bootstrap surface they
+need to relocate. This is linkage coverage, not a claim that filesystems,
+networking, event flags, or semaphores are complete.
+
 ## Error codes
 
 Two numbering schemes coexist in the guest ABI, and mixing them up is a common
@@ -681,7 +706,9 @@ module metadata. [src/runtime/module_graph.zig](src/runtime/module_graph.zig)
 recursively indexes adjacent `.prx`/`.sprx` files, follows both `DT_NEEDED` and
 PS5 needed-module declarations, maps the complete reachable graph, and only then
 relocates it. Missing files remain firmware/HLE dependencies. The resulting
-module list is already in dependency-first initializer order.
+module list is already in dependency-first initializer order. Optional graph
+diagnostics report every unresolved strong import in the node that stops
+linking; the `graph-info` tool enables them by default.
 
 ```zig
 const runtime = @import("runtime");

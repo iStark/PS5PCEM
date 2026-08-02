@@ -84,6 +84,8 @@ pub const Runtime = struct {
             self.database = .{};
         }
         try hle.registerAll(&self.database, allocator);
+        hle.libs.kernel_runtime.attachIo(null);
+        hle.libs.kernel_runtime.attachProcessParam(0);
         self.initialized = true;
     }
 
@@ -99,6 +101,8 @@ pub const Runtime = struct {
         self.thread_manager.deinit();
         hle.libs.kernel_memory.attachAddressSpace(null);
         hle.libs.kernel_memory.deinit();
+        hle.libs.kernel_runtime.attachProcessParam(0);
+        hle.libs.kernel_runtime.attachIo(null);
         self.database.deinit(allocator);
         self.database = .{};
         self.guest_exports.deinit(allocator);
@@ -130,6 +134,7 @@ pub const Runtime = struct {
     ) Error!void {
         if (!self.initialized) return Error.NotInitialized;
         if (self.native_cpu_bridge.isInitialized()) return error.DispatcherBusy;
+        hle.libs.kernel_runtime.attachIo(io);
         return self.cpu_dispatcher.init(
             self.allocator.?,
             io,
@@ -144,6 +149,7 @@ pub const Runtime = struct {
     /// complete Win64 nonvolatile state before returning to Zig.
     pub fn enableNativeCpuDispatcher(self: *Runtime, io: std.Io) Error!void {
         if (!self.initialized) return Error.NotInitialized;
+        hle.libs.kernel_runtime.attachIo(io);
         try self.native_cpu_bridge.init(self.allocator.?, &self.address_space.?);
         errdefer self.native_cpu_bridge.deinit();
         try self.cpu_dispatcher.init(
@@ -314,7 +320,7 @@ pub const Runtime = struct {
         var load_options = options;
         load_options.tls_registry = &self.tls_registry;
         load_options.guest_export_registry = &self.guest_exports;
-        return loader.loadImage(
+        const mapped = try loader.loadImage(
             allocator,
             &self.address_space.?,
             image,
@@ -322,6 +328,10 @@ pub const Runtime = struct {
             resolver,
             load_options,
         );
+        if (mapped.process_param_range) |range| {
+            hle.libs.kernel_runtime.attachProcessParam(range.start);
+        }
+        return mapped;
     }
 
     /// Discovers adjacent PRX/SRPX files, maps the complete reachable graph,
@@ -348,7 +358,8 @@ pub const Runtime = struct {
             .resolve_fn = resolveImport,
             .resolve_tls_fn = resolveTlsImport,
         };
-        return module_graph.loadFromDir(
+        hle.libs.kernel_runtime.attachIo(io);
+        var graph = try module_graph.loadFromDir(
             self.allocator.?,
             io,
             directory,
@@ -359,6 +370,10 @@ pub const Runtime = struct {
             resolver,
             options,
         );
+        if (graph.executable().process_param_range) |range| {
+            hle.libs.kernel_runtime.attachProcessParam(range.start);
+        }
+        return graph;
     }
 };
 
