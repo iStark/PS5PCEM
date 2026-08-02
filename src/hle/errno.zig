@@ -55,6 +55,7 @@ pub const Posix = struct {
     pub const enosys: i32 = 78;
     pub const eagain: i32 = 35;
     pub const etimedout: i32 = 60;
+    pub const enametoolong: i32 = 63;
 
     /// Substituted when a kernel status has no POSIX counterpart.
     pub const eother: i32 = 1062;
@@ -89,6 +90,7 @@ pub const KernelError = enum(i32) {
     eagain = @bitCast(kernel_error_base | 35),
     erange = @bitCast(kernel_error_base | 34),
     etimedout = @bitCast(kernel_error_base | 60),
+    enametoolong = @bitCast(kernel_error_base | 63),
     enosys = @bitCast(kernel_error_base | 78),
 
     /// The status as the guest observes it.

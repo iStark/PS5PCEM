@@ -152,6 +152,14 @@ pub const Protection = packed struct(u3) {
             .execute = self.execute,
         };
     }
+
+    /// CPU protection bits used by the guest kernel ABI. GPU access bits are
+    /// retained separately in Mapping.protection_bits when HLE supplies them.
+    pub fn guestBits(self: Protection) i32 {
+        return (@as(i32, @intFromBool(self.read)) * 0x01) |
+            (@as(i32, @intFromBool(self.write)) * 0x02) |
+            (@as(i32, @intFromBool(self.execute)) * 0x04);
+    }
 };
 
 /// Why a range is present. This is metadata; every mapping remains an identity
@@ -160,7 +168,11 @@ pub const MappingKind = enum {
     module,
     private,
     direct_memory,
+    flexible,
+    reserved,
 };
+
+pub const maximum_name_length: usize = 32;
 
 pub const Mapping = struct {
     address: u64,
@@ -169,10 +181,21 @@ pub const Mapping = struct {
     kind: MappingKind,
     /// Physical direct-memory offset, when `kind == .direct_memory`.
     backing_offset: ?u64 = null,
+    /// Original guest ABI protection mask, including GPU access bits.
+    protection_bits: i32 = 0,
+    memory_type: i32 = 0,
+    name: [maximum_name_length]u8 = [_]u8{0} ** maximum_name_length,
 
     pub fn end(self: Mapping) u64 {
         return self.address + self.size;
     }
+};
+
+/// Optional guest-visible attributes applied to an already mapped range.
+pub const MappingMetadata = struct {
+    protection_bits: ?i32 = null,
+    memory_type: ?i32 = null,
+    name: ?[]const u8 = null,
 };
 
 pub const Error = error{
@@ -309,6 +332,39 @@ pub const AddressSpace = struct {
         return address;
     }
 
+    /// Marks an exact guest range as reserved without committing physical
+    /// pages. A later fixed mapping may consume this metadata reservation.
+    pub fn reserveFixed(self: *AddressSpace, address: u64, size: u64) Error!void {
+        try validateMappedRange(address, size);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.reserveFixedLocked(address, size);
+    }
+
+    /// Finds and records a virtual reservation in one guest address window.
+    pub fn reserve(
+        self: *AddressSpace,
+        area: Area,
+        hint: u64,
+        size: u64,
+        alignment: u64,
+    ) Error!u64 {
+        if (size == 0 or !isAligned(size, page_size)) return Error.InvalidSize;
+        const effective_alignment = @max(alignment, page_size);
+        if (!std.math.isPowerOfTwo(effective_alignment)) return Error.InvalidAlignment;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const window = area.range();
+        const search_start = if (hint == 0) window.start else @max(hint, window.start);
+        const address = self.findFreeLocked(window, search_start, size, effective_alignment) orelse
+            return Error.AddressUnavailable;
+        try self.reserveFixedLocked(address, size);
+        return address;
+    }
+
     /// Changes permissions over a fully mapped range. Mapping metadata is split
     /// where necessary so later queries retain page-accurate protection.
     pub fn protect(
@@ -317,12 +373,24 @@ pub const AddressSpace = struct {
         size: u64,
         protection: Protection,
     ) Error!void {
+        return self.protectGuest(address, size, protection, protection.guestBits());
+    }
+
+    /// Changes host permissions and the original guest ABI protection mask as
+    /// one mapping-table transaction. HLE uses this to retain GPU access bits.
+    pub fn protectGuest(
+        self: *AddressSpace,
+        address: u64,
+        size: u64,
+        protection: Protection,
+        protection_bits: i32,
+    ) Error!void {
         try validateMappedRange(address, size);
 
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        if (!self.coversLocked(address, size, null)) return Error.RangeNotMapped;
+        if (!self.coversCommittedLocked(address, size)) return Error.RangeNotMapped;
 
         var replacement: std.ArrayList(Mapping) = .empty;
         errdefer replacement.deinit(self.allocator);
@@ -334,6 +402,7 @@ pub const AddressSpace = struct {
             address,
             size,
             protection,
+            protection_bits,
             false,
         );
 
@@ -362,6 +431,7 @@ pub const AddressSpace = struct {
             address,
             size,
             .none,
+            0,
             true,
         );
 
@@ -394,6 +464,71 @@ pub const AddressSpace = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.coversLocked(address, size, kind);
+    }
+
+    /// Returns the mapping containing `address`, or the first mapping after it
+    /// when `find_next` is set. This mirrors the firmware's VirtualQuery walk.
+    pub fn query(self: *AddressSpace, address: u64, find_next: bool) ?Mapping {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const index = self.insertionIndex(address);
+        if (index > 0) {
+            const previous = self.mappings.items[index - 1];
+            if (address < previous.end()) return previous;
+        }
+        if (index < self.mappings.items.len and
+            self.mappings.items[index].address == address)
+        {
+            return self.mappings.items[index];
+        }
+        return if (find_next and index < self.mappings.items.len)
+            self.mappings.items[index]
+        else
+            null;
+    }
+
+    pub fn mappedBytes(self: *AddressSpace, kind: MappingKind) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var total: u64 = 0;
+        for (self.mappings.items) |mapping| {
+            if (mapping.kind == kind) total += mapping.size;
+        }
+        return total;
+    }
+
+    /// Updates guest-visible metadata while preserving host mappings. The
+    /// interval table is split at the requested boundaries so later queries
+    /// report attributes for precisely the range the kernel call changed.
+    pub fn setMetadata(
+        self: *AddressSpace,
+        address: u64,
+        size: u64,
+        metadata: MappingMetadata,
+    ) Error!void {
+        try validateMappedRange(address, size);
+        if (metadata.name) |name| {
+            if (name.len >= maximum_name_length) return Error.InvalidSize;
+        }
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.coversLocked(address, size, null)) return Error.RangeNotMapped;
+
+        var replacement: std.ArrayList(Mapping) = .empty;
+        errdefer replacement.deinit(self.allocator);
+        try replacement.ensureTotalCapacity(self.allocator, self.mappings.items.len + 2);
+        try appendMetadataTransformed(
+            self.allocator,
+            &replacement,
+            self.mappings.items,
+            address,
+            size,
+            metadata,
+        );
+        self.mappings.deinit(self.allocator);
+        self.mappings = replacement;
     }
 
     /// Reports whether a physical direct-memory range is visible through any
@@ -507,6 +642,28 @@ pub const AddressSpace = struct {
             .protection = protection,
             .kind = kind,
             .backing_offset = backing_offset,
+            .protection_bits = protection.guestBits(),
+        });
+    }
+
+    fn reserveFixedLocked(self: *AddressSpace, address: u64, size: u64) Error!void {
+        if (!self.ownsLocked(address, size)) return Error.AddressUnavailable;
+        if (self.overlapsLocked(address, size)) return Error.AddressUnavailable;
+        try self.mappings.ensureUnusedCapacity(self.allocator, 1);
+
+        const free_range = self.freeRangeLocked(address, size) orelse
+            return Error.AddressUnavailable;
+        try hostPreparePlaceholderRange(free_range, address, size);
+        errdefer hostCoalescePlaceholder(free_range) catch {};
+
+        const index = self.insertionIndex(address);
+        self.mappings.insertAssumeCapacity(index, .{
+            .address = address,
+            .size = size,
+            .protection = .none,
+            .kind = .reserved,
+            .protection_bits = 0,
+            .name = namedMapping("anon"),
         });
     }
 
@@ -523,7 +680,7 @@ pub const AddressSpace = struct {
 
             if (mapping.kind == .direct_memory) {
                 try hostUnmapBacking(part_start, part_end - part_start);
-            } else {
+            } else if (mapping.kind != .reserved) {
                 try hostDecommit(part_start, part_end - part_start);
             }
         }
@@ -533,7 +690,7 @@ pub const AddressSpace = struct {
         for (self.mappings.items) |mapping| {
             if (mapping.kind == .direct_memory) {
                 hostUnmapBacking(mapping.address, mapping.size) catch {};
-            } else {
+            } else if (mapping.kind != .reserved) {
                 hostDecommit(mapping.address, mapping.size) catch {};
             }
         }
@@ -630,6 +787,20 @@ pub const AddressSpace = struct {
             if (expected_kind) |kind| {
                 if (mapping.kind != kind) return false;
             }
+            cursor = @min(end, mapping.end());
+            if (cursor == end) return true;
+        }
+        return false;
+    }
+
+    fn coversCommittedLocked(self: *const AddressSpace, address: u64, size: u64) bool {
+        if (size == 0) return false;
+        const end = std.math.add(u64, address, size) catch return false;
+        var cursor = address;
+
+        for (self.mappings.items) |mapping| {
+            if (mapping.end() <= cursor) continue;
+            if (mapping.address > cursor or mapping.kind == .reserved) return false;
             cursor = @min(end, mapping.end());
             if (cursor == end) return true;
         }
@@ -752,6 +923,7 @@ fn appendTransformed(
     address: u64,
     size: u64,
     protection: Protection,
+    protection_bits: i32,
     remove_middle: bool,
 ) std.mem.Allocator.Error!void {
     const end = address + size;
@@ -773,6 +945,7 @@ fn appendTransformed(
         if (!remove_middle) {
             var middle = offsetMapping(mapping, middle_start, middle_end - middle_start);
             middle.protection = protection;
+            middle.protection_bits = protection_bits;
             try out.append(allocator, middle);
         }
         if (middle_end < mapping_end) {
@@ -782,6 +955,53 @@ fn appendTransformed(
             );
         }
     }
+}
+
+fn appendMetadataTransformed(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(Mapping),
+    mappings: []const Mapping,
+    address: u64,
+    size: u64,
+    metadata: MappingMetadata,
+) std.mem.Allocator.Error!void {
+    const end = address + size;
+    for (mappings) |mapping| {
+        const mapping_end = mapping.end();
+        if (mapping_end <= address or mapping.address >= end) {
+            try out.append(allocator, mapping);
+            continue;
+        }
+
+        const middle_start = @max(mapping.address, address);
+        const middle_end = @min(mapping_end, end);
+        if (mapping.address < middle_start) {
+            try out.append(
+                allocator,
+                offsetMapping(mapping, mapping.address, middle_start - mapping.address),
+            );
+        }
+
+        var middle = offsetMapping(mapping, middle_start, middle_end - middle_start);
+        if (metadata.protection_bits) |bits| middle.protection_bits = bits;
+        if (metadata.memory_type) |memory_type| middle.memory_type = memory_type;
+        if (metadata.name) |name| middle.name = namedMapping(name);
+        try out.append(allocator, middle);
+
+        if (middle_end < mapping_end) {
+            try out.append(
+                allocator,
+                offsetMapping(mapping, middle_end, mapping_end - middle_end),
+            );
+        }
+    }
+}
+
+fn namedMapping(name: []const u8) [maximum_name_length]u8 {
+    var result = [_]u8{0} ** maximum_name_length;
+    const copy_len = @min(name.len, maximum_name_length - 1);
+    @memcpy(result[0..copy_len], name[0..copy_len]);
+    return result;
 }
 
 /// Returns the complete free interval around a requested range. The mapping
@@ -990,6 +1210,16 @@ fn hostPreparePagePlaceholders(free: Range, address: u64, size: u64) Error!void 
             try hostSplitPlaceholder(cursor, page_size);
         }
     }
+}
+
+/// Isolates an uncommitted guest reservation without splitting every page.
+/// Only its two boundaries matter until a real mapping consumes the range.
+fn hostPreparePlaceholderRange(free: Range, address: u64, size: u64) Error!void {
+    if (builtin.os.tag != .windows) return;
+
+    try hostCoalescePlaceholder(free);
+    if (address > free.start) try hostSplitPlaceholder(free.start, address - free.start);
+    if (address + size < free.end) try hostSplitPlaceholder(address, size);
 }
 
 fn hostSplitPlaceholder(address: u64, size: u64) Error!void {
@@ -1206,4 +1436,43 @@ test "direct-memory aliases share one sparse backing store" {
     try testing.expect(space.isMappedAs(first + page_size, page_size, .direct_memory));
     try space.read(second, &output);
     try testing.expectEqualStrings("coherent", &output);
+}
+
+test "virtual reservations and mapping queries retain guest metadata" {
+    var space = try AddressSpace.init(testing.allocator);
+    defer space.deinit();
+
+    const reserved_address = system_managed.start + 8 * page_size;
+    try space.reserveFixed(reserved_address, 2 * page_size);
+    const reservation = space.query(reserved_address + page_size, false).?;
+    try testing.expectEqual(MappingKind.reserved, reservation.kind);
+    try testing.expectEqual(@as(i32, 0), reservation.protection_bits);
+
+    try space.unmap(reserved_address, 2 * page_size);
+    try space.mapFixed(
+        reserved_address,
+        2 * page_size,
+        .read_write,
+        .flexible,
+        null,
+    );
+    try space.setMetadata(reserved_address, 2 * page_size, .{
+        .protection_bits = 0x23,
+        .memory_type = 7,
+        .name = "flex-test",
+    });
+
+    const mapping = space.query(reserved_address, false).?;
+    try testing.expectEqual(MappingKind.flexible, mapping.kind);
+    try testing.expectEqual(@as(i32, 0x23), mapping.protection_bits);
+    try testing.expectEqual(@as(i32, 7), mapping.memory_type);
+    try testing.expectEqualStrings("flex-test", std.mem.sliceTo(&mapping.name, 0));
+
+    try space.unmap(reserved_address, page_size);
+    try testing.expect(space.query(reserved_address, false) == null);
+    try testing.expectEqual(
+        reserved_address + page_size,
+        space.query(reserved_address, true).?.address,
+    );
+    try testing.expectEqual(@as(u64, page_size), space.mappedBytes(.flexible));
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Artur Strazewicz
 
-//! Direct memory management from `libkernel`.
+//! Virtual and direct memory management from `libkernel`.
 //!
 //! "Direct memory" is the guest's name for physical video memory. A title
 //! reserves a range of it, then maps that range into its address space. The two
@@ -62,6 +62,30 @@ pub const page_size: u64 = 16 * 1024;
 /// own allocators from the answer, so it has to be stable and plausible before
 /// any real memory backend exists.
 pub const direct_memory_size: u64 = 12 * 1024 * 1024 * 1024;
+
+/// Default flexible-memory budget used until system-content configuration is
+/// parsed. This matches the reference emulator's PS5 default.
+pub const flexible_memory_size: u64 = 4 * 1024 * 1024 * 1024;
+
+pub const maximum_name_length: usize = memory.maximum_name_length;
+
+/// Guest ABI layout filled by sceKernelVirtualQuery.
+pub const VirtualQueryInfo = extern struct {
+    start: u64 = 0,
+    end: u64 = 0,
+    offset: u64 = 0,
+    protection: i32 = 0,
+    memory_type: i32 = 0,
+    state: u32 = 0,
+    name: [maximum_name_length]u8 = [_]u8{0} ** maximum_name_length,
+    gpu_mask_id: u8 = 0,
+    reserved: u8 = 0,
+    padding: [2]u8 = .{ 0, 0 },
+};
+
+comptime {
+    if (@sizeOf(VirtualQueryInfo) != 72) @compileError("VirtualQueryInfo ABI size must be 72 bytes");
+}
 
 /// Memory types a title can ask for. The distinction drives caching behaviour on
 /// hardware; here it is recorded but not yet acted upon.
@@ -288,11 +312,28 @@ fn sceKernelGetDirectMemorySize() callconv(abi.guest) u64 {
 }
 
 const map_fixed: i32 = 0x10;
+const map_no_overwrite: u32 = 0x80;
+const map_dmem_compat: u32 = 0x400;
+const map_unknown_8000: u32 = 0x8000;
+const map_no_coalesce: u32 = 0x40_0000;
+const map_alignment_mask: u32 = 0xff00_0000;
+const default_map_search_base: u64 = 0x02_0000_0000;
 const prot_cpu_read: i32 = 0x01;
 const prot_cpu_write: i32 = 0x02;
 const prot_cpu_execute: i32 = 0x04;
 const prot_gpu_read: i32 = 0x10;
 const prot_gpu_write: i32 = 0x20;
+const supported_protection_bits: i32 = prot_cpu_read | prot_cpu_write | prot_cpu_execute |
+    prot_gpu_read | prot_gpu_write;
+
+fn decodeProtection(bits: i32) ?memory.Protection {
+    if (bits & ~supported_protection_bits != 0) return null;
+    return .{
+        .read = bits & prot_cpu_read != 0,
+        .write = bits & prot_cpu_write != 0,
+        .execute = bits & prot_cpu_execute != 0,
+    };
+}
 
 /// Maps a reserved physical range into the identity-mapped guest address space.
 fn sceKernelMapDirectMemory(
@@ -311,14 +352,11 @@ fn sceKernelMapDirectMemory(
     pool_lock.lock();
     defer pool_lock.unlock();
 
-    if (pool.findContainingRange(physical_address, len) == null) return KernelError.einval.raw();
+    const reservation = pool.findContainingRange(physical_address, len) orelse
+        return KernelError.einval.raw();
     const output = out_address orelse return KernelError.efault.raw();
     const address_space = guest_address_space orelse return KernelError.enosys.raw();
-    const protection = memory.Protection{
-        .read = protection_bits & (prot_cpu_read | prot_gpu_read) != 0,
-        .write = protection_bits & (prot_cpu_write | prot_gpu_write) != 0,
-        .execute = protection_bits & prot_cpu_execute != 0,
-    };
+    const protection = decodeProtection(protection_bits) orelse return KernelError.einval.raw();
 
     const requested_address = output.*;
     const mapped_address = if (flags & map_fixed != 0) fixed: {
@@ -343,7 +381,309 @@ fn sceKernelMapDirectMemory(
         physical_address,
     ) catch |err| return mapAddressSpaceError(err);
 
+    address_space.setMetadata(mapped_address, len, .{
+        .protection_bits = protection_bits,
+        .memory_type = @intFromEnum(reservation.memory_type),
+        .name = "direct",
+    }) catch |err| {
+        address_space.unmap(mapped_address, len) catch {};
+        return mapAddressSpaceError(err);
+    };
     output.* = mapped_address;
+    return errno.ok;
+}
+
+fn mapFlexibleMemory(
+    out_address: ?*u64,
+    len: u64,
+    protection_bits: i32,
+    flags: i32,
+    name: []const u8,
+) i32 {
+    const output = out_address orelse return KernelError.efault.raw();
+    if (len == 0 or len % page_size != 0) return KernelError.einval.raw();
+    if (name.len >= maximum_name_length) return KernelError.enametoolong.raw();
+    const protection = decodeProtection(protection_bits) orelse return KernelError.einval.raw();
+
+    const map_flags: u32 = @bitCast(flags);
+    const supported_flags = @as(u32, @intCast(map_fixed)) | map_no_overwrite |
+        map_dmem_compat | map_unknown_8000 | map_no_coalesce | map_alignment_mask;
+    const alignment_shift: u8 = @intCast((map_flags & map_alignment_mask) >> 24);
+    if (map_flags & ~supported_flags != 0 or
+        (alignment_shift != 0 and (alignment_shift < 14 or alignment_shift > 31)))
+    {
+        return KernelError.einval.raw();
+    }
+    const alignment = if (alignment_shift == 0)
+        page_size
+    else
+        @as(u64, 1) << @intCast(alignment_shift);
+
+    pool_lock.lock();
+    defer pool_lock.unlock();
+
+    const address_space = guest_address_space orelse return KernelError.enosys.raw();
+    const used = address_space.mappedBytes(.flexible);
+    if (used > flexible_memory_size or len > flexible_memory_size - used) {
+        return KernelError.enomem.raw();
+    }
+
+    const requested_address = output.*;
+    output.* = 0;
+    const mapped_address = if (map_flags & @as(u32, @intCast(map_fixed)) != 0) fixed: {
+        if (requested_address == 0 or requested_address % alignment != 0) {
+            return KernelError.einval.raw();
+        }
+
+        if (address_space.isMapped(requested_address, len)) {
+            if (map_flags & map_no_overwrite != 0) return KernelError.enomem.raw();
+            address_space.unmap(requested_address, len) catch |err|
+                return mapAddressSpaceError(err);
+        }
+        address_space.mapFixed(
+            requested_address,
+            len,
+            protection,
+            .flexible,
+            null,
+        ) catch |err| return mapAddressSpaceError(err);
+        break :fixed requested_address;
+    } else first_fit: {
+        const hint = if (requested_address == 0) default_map_search_base else requested_address;
+        if (hint >= memory.user.start) {
+            break :first_fit address_space.map(
+                .user,
+                hint,
+                len,
+                alignment,
+                protection,
+                .flexible,
+                null,
+            ) catch |err| return mapAddressSpaceError(err);
+        }
+
+        break :first_fit address_space.map(
+            .system_managed,
+            hint,
+            len,
+            alignment,
+            protection,
+            .flexible,
+            null,
+        ) catch |err| switch (err) {
+            error.AddressUnavailable => address_space.map(
+                .user,
+                0,
+                len,
+                alignment,
+                protection,
+                .flexible,
+                null,
+            ) catch |fallback_err| return mapAddressSpaceError(fallback_err),
+            else => return mapAddressSpaceError(err),
+        };
+    };
+
+    address_space.setMetadata(mapped_address, len, .{
+        .protection_bits = protection_bits,
+        .name = name,
+    }) catch |err| {
+        address_space.unmap(mapped_address, len) catch {};
+        return mapAddressSpaceError(err);
+    };
+    output.* = mapped_address;
+    return errno.ok;
+}
+
+fn sceKernelMapNamedFlexibleMemory(
+    out_address: ?*u64,
+    len: u64,
+    protection_bits: i32,
+    flags: i32,
+    name_pointer: ?[*:0]const u8,
+) callconv(abi.guest) i32 {
+    const pointer = name_pointer orelse return KernelError.efault.raw();
+    return mapFlexibleMemory(out_address, len, protection_bits, flags, std.mem.span(pointer));
+}
+
+fn sceKernelMapFlexibleMemory(
+    out_address: ?*u64,
+    len: u64,
+    protection_bits: i32,
+    flags: i32,
+) callconv(abi.guest) i32 {
+    return mapFlexibleMemory(out_address, len, protection_bits, flags, "");
+}
+
+/// Removes any fully covered combination of direct, flexible, or reserved
+/// mappings. AddressSpace preserves the process-wide outer reservations.
+fn sceKernelMunmap(address: u64, len: u64) callconv(abi.guest) i32 {
+    if (address == 0 or len == 0 or address % page_size != 0 or len % page_size != 0) {
+        return KernelError.einval.raw();
+    }
+    _ = std.math.add(u64, address, len) catch return KernelError.einval.raw();
+
+    pool_lock.lock();
+    defer pool_lock.unlock();
+    const address_space = guest_address_space orelse return KernelError.enosys.raw();
+    address_space.unmap(address, len) catch |err| return mapAddressSpaceError(err);
+    return errno.ok;
+}
+
+fn sceKernelAvailableFlexibleMemorySize(out_size: ?*u64) callconv(abi.guest) i32 {
+    const output = out_size orelse return KernelError.einval.raw();
+    pool_lock.lock();
+    defer pool_lock.unlock();
+    const address_space = guest_address_space orelse return KernelError.enosys.raw();
+    const used = address_space.mappedBytes(.flexible);
+    output.* = flexible_memory_size -| used;
+    return errno.ok;
+}
+
+fn sceKernelConfiguredFlexibleMemorySize(out_size: ?*u64) callconv(abi.guest) i32 {
+    const output = out_size orelse return KernelError.einval.raw();
+    output.* = flexible_memory_size;
+    return errno.ok;
+}
+
+fn sceKernelVirtualQuery(
+    address: u64,
+    flags: i32,
+    out_info: ?*VirtualQueryInfo,
+    info_size: u64,
+) callconv(abi.guest) i32 {
+    const info = out_info orelse return KernelError.einval.raw();
+    if (info_size != @sizeOf(VirtualQueryInfo) or (flags != 0 and flags != 1)) {
+        return KernelError.einval.raw();
+    }
+
+    pool_lock.lock();
+    defer pool_lock.unlock();
+    const address_space = guest_address_space orelse return KernelError.enosys.raw();
+    const mapping = address_space.query(address, flags == 1) orelse
+        return KernelError.eacces.raw();
+
+    info.* = .{};
+    info.start = mapping.address;
+    info.end = mapping.end();
+    info.offset = mapping.backing_offset orelse 0;
+    info.protection = mapping.protection_bits;
+    info.memory_type = mapping.memory_type;
+    info.state = switch (mapping.kind) {
+        .flexible => 0x01 | 0x10,
+        .direct_memory => 0x02 | 0x10,
+        .reserved => 0,
+        else => 0x10,
+    };
+    info.name = mapping.name;
+    return errno.ok;
+}
+
+fn sceKernelQueryMemoryProtection(
+    address: u64,
+    out_start: ?*u64,
+    out_end: ?*u64,
+    out_protection: ?*i32,
+) callconv(abi.guest) i32 {
+    if (address == 0) return KernelError.einval.raw();
+    pool_lock.lock();
+    defer pool_lock.unlock();
+    const address_space = guest_address_space orelse return KernelError.enosys.raw();
+    const mapping = address_space.query(address, false) orelse return KernelError.eacces.raw();
+    if (out_start) |output| output.* = mapping.address;
+    if (out_end) |output| output.* = mapping.end();
+    if (out_protection) |output| output.* = mapping.protection_bits;
+    return errno.ok;
+}
+
+fn sceKernelMprotect(
+    address: u64,
+    len: u64,
+    protection_bits: i32,
+) callconv(abi.guest) i32 {
+    const protection = decodeProtection(protection_bits) orelse return KernelError.einval.raw();
+    if (address == 0 or len == 0) return KernelError.einval.raw();
+    const page_offset = address & (page_size - 1);
+    const aligned_address = address - page_offset;
+    const covered_size = std.math.add(u64, len, page_offset) catch
+        return KernelError.einval.raw();
+    const rounded_size = std.math.add(u64, covered_size, page_size - 1) catch
+        return KernelError.einval.raw();
+    const aligned_len = rounded_size & ~(page_size - 1);
+
+    pool_lock.lock();
+    defer pool_lock.unlock();
+    const address_space = guest_address_space orelse return KernelError.enosys.raw();
+    address_space.protectGuest(
+        aligned_address,
+        aligned_len,
+        protection,
+        protection_bits,
+    ) catch |err| return mapAddressSpaceError(err);
+    return errno.ok;
+}
+
+fn sceKernelSetVirtualRangeName(
+    address: u64,
+    len: u64,
+    name_pointer: ?[*:0]const u8,
+) callconv(abi.guest) i32 {
+    const pointer = name_pointer orelse return KernelError.efault.raw();
+    const name = std.mem.span(pointer);
+    if (name.len >= maximum_name_length) return KernelError.enametoolong.raw();
+
+    pool_lock.lock();
+    defer pool_lock.unlock();
+    const address_space = guest_address_space orelse return KernelError.enosys.raw();
+    address_space.setMetadata(address, len, .{ .name = name }) catch |err|
+        return mapAddressSpaceError(err);
+    return errno.ok;
+}
+
+fn sceKernelReserveVirtualRange(
+    out_address: ?*u64,
+    len: u64,
+    flags: i32,
+    alignment: u64,
+) callconv(abi.guest) i32 {
+    const output = out_address orelse return KernelError.efault.raw();
+    if (len == 0 or len % page_size != 0) return KernelError.einval.raw();
+    const effective_alignment = @max(alignment, page_size);
+    if (!std.math.isPowerOfTwo(effective_alignment)) return KernelError.einval.raw();
+    const map_flags: u32 = @bitCast(flags);
+    const supported_flags = @as(u32, @intCast(map_fixed)) | map_no_overwrite;
+    if (map_flags & ~supported_flags != 0) return KernelError.einval.raw();
+
+    pool_lock.lock();
+    defer pool_lock.unlock();
+    const address_space = guest_address_space orelse return KernelError.enosys.raw();
+    const requested_address = output.*;
+    output.* = 0;
+
+    const reserved_address = if (map_flags & @as(u32, @intCast(map_fixed)) != 0) fixed: {
+        if (requested_address == 0 or requested_address % effective_alignment != 0) {
+            return KernelError.einval.raw();
+        }
+        if (address_space.isMapped(requested_address, len)) {
+            if (map_flags & map_no_overwrite != 0) return KernelError.enomem.raw();
+            address_space.unmap(requested_address, len) catch |err|
+                return mapAddressSpaceError(err);
+        }
+        address_space.reserveFixed(requested_address, len) catch |err|
+            return mapAddressSpaceError(err);
+        break :fixed requested_address;
+    } else first_fit: {
+        const hint = if (requested_address == 0) default_map_search_base else requested_address;
+        const area: memory.Area = if (hint >= memory.user.start) .user else .system_managed;
+        break :first_fit address_space.reserve(
+            area,
+            hint,
+            len,
+            effective_alignment,
+        ) catch |err| return mapAddressSpaceError(err);
+    };
+
+    output.* = reserved_address;
     return errno.ok;
 }
 
@@ -389,6 +729,56 @@ pub const exports = [_]symbols.Export{
         .function = abi.erase(&sceKernelMapDirectMemory),
         .expect_id = "L-Q3LEjIbgA",
     },
+    .{
+        .name = "sceKernelMapNamedFlexibleMemory",
+        .function = abi.erase(&sceKernelMapNamedFlexibleMemory),
+        .expect_id = "mL8NDH86iQI",
+    },
+    .{
+        .name = "sceKernelMapFlexibleMemory",
+        .function = abi.erase(&sceKernelMapFlexibleMemory),
+        .expect_id = "IWIBBdTHit4",
+    },
+    .{
+        .name = "sceKernelMunmap",
+        .function = abi.erase(&sceKernelMunmap),
+        .expect_id = "cQke9UuBQOk",
+    },
+    .{
+        .name = "sceKernelVirtualQuery",
+        .function = abi.erase(&sceKernelVirtualQuery),
+        .expect_id = "rVjRvHJ0X6c",
+    },
+    .{
+        .name = "sceKernelQueryMemoryProtection",
+        .function = abi.erase(&sceKernelQueryMemoryProtection),
+        .expect_id = "WFcfL2lzido",
+    },
+    .{
+        .name = "sceKernelAvailableFlexibleMemorySize",
+        .function = abi.erase(&sceKernelAvailableFlexibleMemorySize),
+        .expect_id = "aNz11fnnzi4",
+    },
+    .{
+        .name = "sceKernelConfiguredFlexibleMemorySize",
+        .function = abi.erase(&sceKernelConfiguredFlexibleMemorySize),
+        .expect_id = "n1-v6FgU7MQ",
+    },
+    .{
+        .name = "sceKernelMprotect",
+        .function = abi.erase(&sceKernelMprotect),
+        .expect_id = "vSMAm3cxYTY",
+    },
+    .{
+        .name = "sceKernelSetVirtualRangeName",
+        .function = abi.erase(&sceKernelSetVirtualRangeName),
+        .expect_id = "DGMG3JshrZU",
+    },
+    .{
+        .name = "sceKernelReserveVirtualRange",
+        .function = abi.erase(&sceKernelReserveVirtualRange),
+        .expect_id = "7oxv3PPCumo",
+    },
 };
 
 pub const library = symbols.Library{ .name = "libkernel", .version = 1 };
@@ -402,6 +792,11 @@ pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!voi
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "guest GPU protection does not grant native CPU access" {
+    const protection = decodeProtection(prot_gpu_read | prot_gpu_write).?;
+    try testing.expectEqual(memory.Protection.none, protection);
+}
 
 test "reservations are aligned and do not overlap" {
     var p = Pool{ .size = 64 * page_size };
@@ -578,6 +973,150 @@ test "direct memory maps at an exact guest address" {
         KernelError.ebusy.raw(),
         sceKernelReleaseDirectMemory(start, page_size),
     );
+
+    var direct_info = VirtualQueryInfo{};
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelVirtualQuery(alias, 0, &direct_info, @sizeOf(VirtualQueryInfo)),
+    );
+    try testing.expectEqual(@as(u32, 0x12), direct_info.state);
+    try testing.expectEqual(start, direct_info.offset);
+    try testing.expectEqual(@as(i32, 0), direct_info.memory_type);
+
+    try testing.expectEqual(errno.ok, sceKernelMunmap(virtual_address, page_size));
+    try testing.expectEqual(errno.ok, sceKernelMunmap(alias, page_size));
+    try testing.expectEqual(errno.ok, sceKernelReleaseDirectMemory(start, page_size));
+}
+
+test "flexible memory maps, queries, protects, unmaps, and reuses ranges" {
+    try testing.expectEqual(@as(usize, 72), @sizeOf(VirtualQueryInfo));
+
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    init(testing.allocator);
+    defer deinit();
+    attachAddressSpace(&address_space);
+
+    var configured: u64 = 0;
+    var available: u64 = 0;
+    try testing.expectEqual(errno.ok, sceKernelConfiguredFlexibleMemorySize(&configured));
+    try testing.expectEqual(flexible_memory_size, configured);
+    try testing.expectEqual(errno.ok, sceKernelAvailableFlexibleMemorySize(&available));
+    try testing.expectEqual(flexible_memory_size, available);
+
+    const original_protection = prot_cpu_read | prot_cpu_write | prot_gpu_write;
+    var mapped: u64 = 0;
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelMapNamedFlexibleMemory(
+            &mapped,
+            2 * page_size,
+            original_protection,
+            @bitCast(@as(u32, 16 << 24)),
+            "flex-test",
+        ),
+    );
+    try testing.expectEqual(@as(u64, 0), mapped % (64 * 1024));
+    try testing.expectEqual(errno.ok, sceKernelAvailableFlexibleMemorySize(&available));
+    try testing.expectEqual(flexible_memory_size - 2 * page_size, available);
+
+    var initial: [16]u8 = undefined;
+    try address_space.read(mapped, &initial);
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** initial.len), &initial);
+    try address_space.write(mapped, "flexible");
+
+    var info = VirtualQueryInfo{};
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelVirtualQuery(mapped + page_size, 0, &info, @sizeOf(VirtualQueryInfo)),
+    );
+    try testing.expectEqual(mapped, info.start);
+    try testing.expectEqual(mapped + 2 * page_size, info.end);
+    try testing.expectEqual(original_protection, info.protection);
+    try testing.expectEqual(@as(u32, 0x11), info.state);
+    try testing.expectEqualStrings("flex-test", std.mem.sliceTo(&info.name, 0));
+
+    var range_start: u64 = 0;
+    var range_end: u64 = 0;
+    var queried_protection: i32 = 0;
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelQueryMemoryProtection(
+            mapped + page_size,
+            &range_start,
+            &range_end,
+            &queried_protection,
+        ),
+    );
+    try testing.expectEqual(mapped, range_start);
+    try testing.expectEqual(mapped + 2 * page_size, range_end);
+    try testing.expectEqual(original_protection, queried_protection);
+
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelMprotect(mapped + page_size + 1, page_size - 1, prot_cpu_read),
+    );
+    try testing.expectError(
+        memory.Error.ProtectionDenied,
+        address_space.write(mapped + page_size, "x"),
+    );
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelSetVirtualRangeName(mapped + page_size, page_size, "read-only-tail"),
+    );
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelVirtualQuery(mapped + page_size, 0, &info, @sizeOf(VirtualQueryInfo)),
+    );
+    try testing.expectEqual(prot_cpu_read, info.protection);
+    try testing.expectEqualStrings("read-only-tail", std.mem.sliceTo(&info.name, 0));
+
+    try testing.expectEqual(errno.ok, sceKernelMunmap(mapped + page_size, page_size));
+    try testing.expectEqual(errno.ok, sceKernelAvailableFlexibleMemorySize(&available));
+    try testing.expectEqual(flexible_memory_size - page_size, available);
+    try testing.expectEqual(errno.ok, sceKernelMunmap(mapped, page_size));
+    try testing.expectEqual(errno.ok, sceKernelAvailableFlexibleMemorySize(&available));
+    try testing.expectEqual(flexible_memory_size, available);
+
+    var reserved = mapped;
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelReserveVirtualRange(&reserved, page_size, map_fixed, page_size),
+    );
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelVirtualQuery(reserved, 0, &info, @sizeOf(VirtualQueryInfo)),
+    );
+    try testing.expectEqual(@as(u32, 0), info.state);
+
+    var reused = reserved;
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelMapFlexibleMemory(
+            &reused,
+            page_size,
+            prot_cpu_read | prot_cpu_write,
+            map_fixed,
+        ),
+    );
+    try testing.expectEqual(reserved, reused);
+    var reused_bytes: [8]u8 = undefined;
+    try address_space.read(reused, &reused_bytes);
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** reused_bytes.len), &reused_bytes);
+
+    var collision = reused;
+    try testing.expectEqual(
+        KernelError.enomem.raw(),
+        sceKernelMapFlexibleMemory(
+            &collision,
+            page_size,
+            prot_cpu_read,
+            @bitCast(@as(u32, @intCast(map_fixed)) | map_no_overwrite),
+        ),
+    );
+    try testing.expectEqual(errno.ok, sceKernelMunmap(reused, page_size));
+    try testing.expectEqual(errno.ok, sceKernelAvailableFlexibleMemorySize(&available));
+    try testing.expectEqual(flexible_memory_size, available);
 }
 
 test "the library registers under the expected identifiers" {

@@ -126,6 +126,16 @@ const known_pairs = [_]struct { []const u8, []const u8 }{
     .{ "sceKernelCheckedReleaseDirectMemory", "hwVSPCmp5tM" },
     .{ "sceKernelMapDirectMemory", "L-Q3LEjIbgA" },
     .{ "sceKernelGetDirectMemorySize", "pO96TwzOm5E" },
+    .{ "sceKernelMapNamedFlexibleMemory", "mL8NDH86iQI" },
+    .{ "sceKernelMapFlexibleMemory", "IWIBBdTHit4" },
+    .{ "sceKernelMunmap", "cQke9UuBQOk" },
+    .{ "sceKernelVirtualQuery", "rVjRvHJ0X6c" },
+    .{ "sceKernelQueryMemoryProtection", "WFcfL2lzido" },
+    .{ "sceKernelAvailableFlexibleMemorySize", "aNz11fnnzi4" },
+    .{ "sceKernelConfiguredFlexibleMemorySize", "n1-v6FgU7MQ" },
+    .{ "sceKernelMprotect", "vSMAm3cxYTY" },
+    .{ "sceKernelSetVirtualRangeName", "DGMG3JshrZU" },
+    .{ "sceKernelReserveVirtualRange", "7oxv3PPCumo" },
     // Firmware exports both POSIX and camel-case spellings of the same
     // operation, and they are distinct symbols with distinct identifiers.
     .{ "scePthreadOnce", "14bOACANTBo" },

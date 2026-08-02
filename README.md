@@ -262,9 +262,12 @@ the address space. Teardown restores the reservation before closing the backing
 object.
 
 The address-space API also owns the sorted mapping table. Loader segments,
-private allocations, and direct-memory mappings all go through it, so overlap
-checks and page protections cannot disagree between subsystems. Reads and writes
-validate the complete range before dereferencing the identity-mapped pointer.
+private allocations, direct-memory mappings, flexible-memory mappings, and
+metadata-only virtual reservations all go through it, so overlap checks, page
+protections, names, and memory queries cannot disagree between subsystems.
+Partial protection, metadata, and unmap operations split table entries at exact
+16 KiB boundaries. Reads and writes validate the complete committed range
+before dereferencing the identity-mapped pointer.
 
 ---
 
@@ -431,7 +434,7 @@ callable from a guest.
 
 ## Implemented libraries
 
-**`libkernel` — direct memory** ([src/hle/libs/kernel_memory.zig](src/hle/libs/kernel_memory.zig))
+**`libkernel` — virtual and direct memory** ([src/hle/libs/kernel_memory.zig](src/hle/libs/kernel_memory.zig))
 
 "Direct memory" is the guest's name for physical video memory. A title reserves
 a physical range, then maps it into its address space; the two steps are
@@ -444,12 +447,37 @@ the central address-space table and maps the runtime's sparse shared backing
 store. Multiple virtual mappings of one physical range are coherent. Releasing
 a physical reservation while one of its mappings remains live returns `EBUSY`.
 
+Flexible memory uses the same address-space table without inventing a second
+allocator. The runtime exposes the platform-default 4 GiB budget, derives the
+available amount from live `.flexible` mappings, and searches the
+system-managed window from `0x02_0000_0000` before falling back to the user
+window. Fixed mappings, no-overwrite mappings, encoded alignment requests,
+partial unmaps, and zero-filled reuse are covered by the same lifecycle rules.
+
+Virtual reservations occupy guest addresses without committing host pages.
+`sceKernelReserveVirtualRange` can create either a fixed or first-fit
+reservation, and a later fixed flexible mapping consumes it. Memory queries use
+the guest's 72-byte `VirtualQueryInfo` ABI, report half-open ranges, preserve
+the original guest protection bits, and support both containing and next-range
+lookups. Protection changes and names are applied to exact subranges, splitting
+mapping metadata where required.
+
 | Export | State |
 |---|---|
 | `sceKernelAllocateDirectMemory` | Implemented |
 | `sceKernelReleaseDirectMemory` | Implemented |
 | `sceKernelGetDirectMemorySize` | Implemented |
 | `sceKernelMapDirectMemory` | Implemented for fixed and searched mappings |
+| `sceKernelMapFlexibleMemory` | Implemented for fixed and searched mappings |
+| `sceKernelMapNamedFlexibleMemory` | Implemented, including alignment and names |
+| `sceKernelMunmap` | Implemented, including partial mappings |
+| `sceKernelVirtualQuery` | Implemented for containing and next-range queries |
+| `sceKernelQueryMemoryProtection` | Implemented |
+| `sceKernelAvailableFlexibleMemorySize` | Implemented |
+| `sceKernelConfiguredFlexibleMemorySize` | Implemented |
+| `sceKernelMprotect` | Implemented |
+| `sceKernelSetVirtualRangeName` | Implemented |
+| `sceKernelReserveVirtualRange` | Implemented for fixed and searched reservations |
 
 ## Error codes
 
@@ -465,10 +493,9 @@ from leaking into host code where nothing would check it.
 
 ## Roadmap
 
-1. Flexible-memory allocation, `mmap`/`munmap`, and memory-query exports.
-2. A TLS module registry for `DTPMOD64`, `DTPOFF64`, and `TPOFF64` relocations.
-3. Threading: the `pthread_*` and `scePthread*` families.
-4. Event queues, on which most firmware asynchrony is built.
+1. A TLS module registry for `DTPMOD64`, `DTPOFF64`, and `TPOFF64` relocations.
+2. Threading: the `pthread_*` and `scePthread*` families.
+3. Event queues, on which most firmware asynchrony is built.
 
 ---
 
