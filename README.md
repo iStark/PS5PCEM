@@ -1,6 +1,6 @@
 # PS5 emulation components
 
-Building blocks for PlayStation 5 emulation, written in Zig. Six modules cover
+Building blocks for PlayStation 5 emulation, written in Zig. Seven modules cover
 the independent subsystems and their end-to-end composition:
 
 | Module | What it does |
@@ -10,6 +10,7 @@ the independent subsystems and their end-to-end composition:
 | **`loader`** | Reads, maps, and relocates bare ELF64 and decrypted PS5 SELF module images |
 | **`hle`** | High-level emulation of the guest firmware: symbol resolution and firmware libraries |
 | **`cpu`** | Dispatches guest execution and provides the Windows x86-64 native machine bridge |
+| **`diag`** | Attributes guest addresses to modules and explains contained faults |
 | **`runtime`** | Composes memory, loader, HLE, and the optional CPU execution path |
 
 None of them depends on anything beyond the Zig standard library. The tooling
@@ -729,6 +730,95 @@ and host audio output consequently remain beyond the current title bootstrap.
 2. Extend resumable instruction compatibility to SHA-NI and other missing Zen 2
    features when title traces demonstrate a host capability gap.
 3. Add a POSIX native bridge with explicit host-TLS restoration around HLE.
+
+---
+
+# `diag` — explaining failures
+
+Bringing a title up produces addresses, and an address explains nothing on its
+own: it depends on where modules happened to land, so the same failure reads
+differently between runs. Worse, the most informative failures are exactly the
+ones whose faulting address belongs to no module at all.
+
+## Address attribution
+
+[src/diag/symbolize.zig](src/diag/symbolize.zig) maps an address to the owning
+module, the offset within it, and the nearest export at or below:
+
+```
+0x0000000801731565 libc.prx+0x35565 (Zb+hMspRR-o+0x25)
+```
+
+Titles ship no debug information, so an export is an anchor rather than an exact
+function name — the real function may begin after it. Data exports are excluded
+from anchoring, since a variable never appears in a call stack and would drag
+attribution away from the code.
+
+## Fault reports
+
+[src/diag/fault.zig](src/diag/fault.zig) classifies a contained fault instead of
+printing the raw exception. The case worth separating is a call through a
+function pointer that was never filled in: its faulting address belongs to no
+module and is therefore useless, but the return address the `call` just pushed
+identifies the caller exactly.
+
+```
+guest fault: call through a null pointer
+  kind        access_violation (execute)  code 0xc0000005
+  rip         0x0000000000000000 <unmapped>
+  called from 0x0000000801731565 libc.prx+0x35565 (Zb+hMspRR-o+0x25)
+  stack scan
+    0x0000000801714daa libc.prx+0x18daa (__cxa_throw+0x2aa)
+    0x0000000801711e72 libc.prx+0x15e72 (_Throw_C_error+0xe2)
+```
+
+Reading guest memory during a fault report is guarded by a mapping check, so
+reporting a failure cannot fault again and lose the report.
+
+The stack listing is labelled a scan rather than a backtrace on purpose. Guest
+code omits frame pointers in places, so a reliable unwind is unavailable;
+keeping the stack words that land inside a loaded module recovers the call chain
+in practice, at the cost of occasional stale entries.
+
+## Firmware call trace
+
+The failure a title reports is usually not where it went wrong. A firmware entry
+point returns a plausible-looking error, the title's own runtime reacts to it,
+and the process dies several frames later.
+
+Guest code calls firmware directly through relocated jump slots, so there is no
+single place to instrument. Instead [src/hle/trace.zig](src/hle/trace.zig)
+generates a thunk per entry point at compile time, with the same signature, that
+records the call and forwards it. Only the most recent calls are kept, in a
+fixed ring: a title makes millions, and the last few dozen are what explain a
+failure.
+
+```
+  last 32 firmware calls (of 11273)
+     11184 sceKernelGetProcessTimeCounterFrequency() = 0x3b9aca00
+     11185 scePthreadCondInit(0x238e620, 0x0, 0x7000127f20) = 0xffffffff80020010  <- failure
+     11219 sceKernelGetModuleInfoForUnwind(0x801732175, ...) = 0xffffffff8002004e  <- failure
+     11265 _write(0x2, 0x8018942d0, 0x65, ...) = 0xffffffffffffffff  <- failure
+```
+
+Both failure conventions are marked: the `0x8002_00xx` kernel scheme and the
+POSIX `-1`. Zero is deliberately not marked, since too many entry points return
+zero for success.
+
+## Guest diagnostics
+
+A runtime about to give up almost always explains itself first, through a write
+to its own standard error. The trace still holds that buffer's address and
+length after the fact, so the message can be recovered even when the write
+itself failed:
+
+```
+  guest diagnostics
+    [stderr] Terminating due to uncaught exception 'invalid argument: invalid
+             argument' of type std::system_error
+```
+
+In the title's own words, which no amount of address attribution can supply.
 
 ---
 
