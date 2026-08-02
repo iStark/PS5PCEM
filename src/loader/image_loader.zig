@@ -284,8 +284,10 @@ fn collectStartupFunctions(
     // Treat that direct tag as absent unless it resolves to executable memory;
     // array entries remain strict because each is explicitly callable data.
     if (info.init_virtual_address) |virtual_address| {
-        if (resolveExecutableAddress(mapped, virtual_address)) |address| {
-            try mapped.init_functions.append(mapped.allocator, address);
+        if (virtual_address != 0 and virtual_address != std.math.maxInt(u64)) {
+            if (resolveExecutableAddress(mapped, virtual_address)) |address| {
+                try mapped.init_functions.append(mapped.allocator, address);
+            }
         }
     }
     try appendInitializerArray(
@@ -302,7 +304,8 @@ fn appendInitializerArray(
     virtual_address: ?u64,
     byte_size: ?u64,
 ) Error!void {
-    const raw_address = virtual_address orelse return;
+    if (virtual_address == null and byte_size == null) return;
+    const raw_address = virtual_address orelse return Error.InvalidInitializerTable;
     const size = byte_size orelse return Error.InvalidInitializerTable;
     if (size == 0) return;
     if (size % @sizeOf(u64) != 0 or size > std.math.maxInt(usize)) {
@@ -466,6 +469,50 @@ test "startup functions resolve direct and array entries in ABI order" {
         u64,
         &.{ image_base + 0x180, image_base + 0x200 },
         mapped.init_functions.items,
+    );
+}
+
+test "startup metadata ignores a null direct initializer and rejects incomplete arrays" {
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    const image_base = memory.system_managed.start;
+    try address_space.mapFixed(
+        image_base,
+        memory.page_size,
+        .read_execute,
+        .module,
+        null,
+    );
+    var mapped = MappedImage{
+        .address_space = &address_space,
+        .allocator = testing.allocator,
+        .load_bias = image_base,
+        .entry_point = image_base,
+        .relocation_stats = .{},
+    };
+    defer mapped.deinit();
+
+    try collectStartupFunctions(
+        &mapped,
+        &.{ .init_virtual_address = 0 },
+        .sce_dynexec,
+    );
+    try testing.expectEqual(@as(usize, 0), mapped.init_functions.items.len);
+    try testing.expectError(
+        error.InvalidInitializerTable,
+        collectStartupFunctions(
+            &mapped,
+            &.{ .init_array_virtual_address = 0 },
+            .sce_dynexec,
+        ),
+    );
+    try testing.expectError(
+        error.InvalidInitializerTable,
+        collectStartupFunctions(
+            &mapped,
+            &.{ .init_array_size = @sizeOf(u64) },
+            .sce_dynexec,
+        ),
     );
 }
 

@@ -56,7 +56,7 @@ pub fn buildEntryLayout(
     {
         return error.InvalidArgument;
     }
-    if (options.arguments.len + 1 > maximum_arguments) {
+    if (options.arguments.len > maximum_arguments - 1) {
         return error.TooManyArguments;
     }
     for (options.arguments) |argument| {

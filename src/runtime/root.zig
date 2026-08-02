@@ -378,6 +378,12 @@ const ProcessTestBridge = struct {
         self.entries[self.count] = request.entry_point;
         self.kinds[self.count] = request.kind;
         self.count += 1;
+        if (request.kind == .module_initializer and
+            (request.argument_count != 3 or request.arguments[0] != 0 or
+                request.arguments[1] != 0 or request.arguments[2] != 0))
+        {
+            return error.ExecutionFailed;
+        }
         if (request.kind == .process_entry) {
             self.final_arguments = request.arguments;
             self.final_argument_count = request.argument_count;
