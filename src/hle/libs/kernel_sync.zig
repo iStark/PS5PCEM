@@ -159,7 +159,21 @@ pub const Manager = struct {
     fn createMutex(self: *Manager, out: *MutexHandle, attr: ?MutexAttr) Error!void {
         self.lock.lock();
         defer self.lock.unlock();
-        if (findPointer(Mutex, self.mutexes.items, out.*) != null) return error.Busy;
+        // Re-initializing a live object is undefined per POSIX, but titles do
+        // it and firmware accepts it, so reuse the object rather than refusing.
+        // Refusing loses: the guest's runtime turns the failure into an
+        // exception it has no handler for. Ownership and waiter state are
+        // cleared, which is what a fresh initialization means; the embedded
+        // host lock is left alone because another thread may hold it.
+        if (findPointer(Mutex, self.mutexes.items, out.*)) |existing| {
+            existing.owner = 0;
+            existing.recursion = 0;
+            existing.waiters = 0;
+            existing.sequence +%= 1;
+            existing.kind = if (attr) |value| value.kind else 1;
+            existing.protocol = if (attr) |value| value.protocol else 0;
+            return;
+        }
         const object = try self.allocator.create(Mutex);
         object.* = .{};
         if (attr) |value| {
@@ -227,7 +241,13 @@ pub const Manager = struct {
     fn createCond(self: *Manager, out: *CondHandle, attr: ?CondAttr) Error!void {
         self.lock.lock();
         defer self.lock.unlock();
-        if (findPointer(Cond, self.conditions.items, out.*) != null) return error.Busy;
+        // See createMutex: re-initialization reuses the existing object.
+        if (findPointer(Cond, self.conditions.items, out.*)) |existing| {
+            existing.waiters = 0;
+            existing.sequence +%= 1;
+            existing.clock_id = if (attr) |value| value.clock_id else 0;
+            return;
+        }
         const object = try self.allocator.create(Cond);
         object.* = .{};
         if (attr) |value| object.clock_id = value.clock_id;
@@ -342,7 +362,17 @@ pub const Manager = struct {
     fn createRwlock(self: *Manager, out: *RwlockHandle, attr: ?RwlockAttr) Error!void {
         self.lock.lock();
         defer self.lock.unlock();
-        if (findPointer(Rwlock, self.rwlocks.items, out.*) != null) return error.Busy;
+        // See createMutex: re-initialization reuses the existing object.
+        if (findPointer(Rwlock, self.rwlocks.items, out.*)) |existing| {
+            existing.writer = 0;
+            existing.readers.clearRetainingCapacity();
+            existing.reader_count = 0;
+            existing.waiting_readers = 0;
+            existing.waiting_writers = 0;
+            existing.sequence +%= 1;
+            existing.kind = if (attr) |value| value.kind else 1;
+            return;
+        }
         const object = try self.allocator.create(Rwlock);
         object.* = .{ .allocator = self.allocator };
         if (attr) |value| object.kind = value.kind;
@@ -1438,6 +1468,45 @@ test "recursive mutexes preserve ownership and reject busy destruction" {
     try testing.expectEqual(errno.ok, pthread_mutex_unlock(&mutex));
     try testing.expectEqual(errno.ok, pthread_mutex_destroy(&mutex));
     try testing.expectEqual(errno.ok, pthread_mutexattr_destroy(&attr));
+}
+
+test "re-initializing a live object succeeds and resets its state" {
+    var context = TestContext{};
+    try context.init();
+    defer context.deinit();
+    const thread = try context.thread_manager.prepareInitialThread("reinit");
+    defer context.thread_manager.releaseInitialThread(thread.handle) catch {};
+    try context.thread_manager.enter(thread.handle);
+    defer context.thread_manager.leave();
+
+    // Titles re-initialize condition variables and mutexes that are already
+    // live. Refusing turns into an uncaught exception in the guest's own
+    // runtime, so initialization has to succeed.
+    var cond: CondHandle = null;
+    try testing.expectEqual(errno.ok, scePthreadCondInit(&cond, null, null));
+    const first = cond;
+    try testing.expectEqual(errno.ok, scePthreadCondInit(&cond, null, null));
+    // The same object is reused rather than leaked and replaced.
+    try testing.expectEqual(first, cond);
+    try testing.expectEqual(errno.ok, scePthreadCondDestroy(&cond));
+
+    var mutex: MutexHandle = null;
+    try testing.expectEqual(errno.ok, pthread_mutex_init(&mutex, null));
+    const first_mutex = mutex;
+    try testing.expectEqual(errno.ok, pthread_mutex_lock(&mutex));
+    // Re-initialization clears ownership, so the mutex is free afterwards.
+    try testing.expectEqual(errno.ok, pthread_mutex_init(&mutex, null));
+    try testing.expectEqual(first_mutex, mutex);
+    try testing.expectEqual(errno.ok, pthread_mutex_lock(&mutex));
+    try testing.expectEqual(errno.ok, pthread_mutex_unlock(&mutex));
+    try testing.expectEqual(errno.ok, pthread_mutex_destroy(&mutex));
+
+    var rwlock: RwlockHandle = null;
+    try testing.expectEqual(errno.ok, pthread_rwlock_init(&rwlock, null));
+    const first_rwlock = rwlock;
+    try testing.expectEqual(errno.ok, pthread_rwlock_init(&rwlock, null));
+    try testing.expectEqual(first_rwlock, rwlock);
+    try testing.expectEqual(errno.ok, pthread_rwlock_destroy(&rwlock));
 }
 
 test "timed condition wait reacquires its mutex" {
