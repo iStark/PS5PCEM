@@ -29,6 +29,7 @@ pub const Runtime = struct {
     thread_manager: hle.libs.kernel_threading.Manager = .{},
     sync_manager: hle.libs.kernel_sync.Manager = .{},
     cpu_dispatcher: cpu.Dispatcher = .{},
+    native_cpu_bridge: cpu.NativeBridge = .{},
     initialized: bool = false,
 
     /// Initializes a stable, caller-owned Runtime value.
@@ -79,6 +80,7 @@ pub const Runtime = struct {
         const allocator = self.allocator.?;
 
         self.cpu_dispatcher.deinit();
+        self.native_cpu_bridge.deinit();
         hle.libs.kernel_sync.attachManager(null);
         self.sync_manager.deinit();
         hle.libs.kernel_threading.attachManager(null);
@@ -114,6 +116,7 @@ pub const Runtime = struct {
         bridge: cpu.Bridge,
     ) Error!void {
         if (!self.initialized) return Error.NotInitialized;
+        if (self.native_cpu_bridge.isInitialized()) return error.DispatcherBusy;
         return self.cpu_dispatcher.init(
             self.allocator.?,
             io,
@@ -122,8 +125,25 @@ pub const Runtime = struct {
         );
     }
 
+    /// Enables direct Windows x86-64 execution using the runtime-owned guest
+    /// address space. The native bridge validates executable entries and guest
+    /// stacks, installs FS only inside the assembly boundary, and restores the
+    /// complete Win64 nonvolatile state before returning to Zig.
+    pub fn enableNativeCpuDispatcher(self: *Runtime, io: std.Io) Error!void {
+        if (!self.initialized) return Error.NotInitialized;
+        try self.native_cpu_bridge.init(self.allocator.?, &self.address_space.?);
+        errdefer self.native_cpu_bridge.deinit();
+        try self.cpu_dispatcher.init(
+            self.allocator.?,
+            io,
+            &self.thread_manager,
+            self.native_cpu_bridge.bridge(),
+        );
+    }
+
     pub fn disableCpuDispatcher(self: *Runtime) void {
         self.cpu_dispatcher.deinit();
+        self.native_cpu_bridge.deinit();
     }
 
     /// Prepares TCB/DTV state for the initial guest execution context.
@@ -382,4 +402,20 @@ test "runtime prepares and identifies the initial guest thread" {
         prepared.handle,
         hle.libs.kernel_threading.scePthreadSelf(),
     );
+}
+
+test "runtime owns the optional native CPU bridge lifecycle" {
+    if (!cpu.NativeBridge.isSupported()) return error.SkipZigTest;
+
+    var runtime = Runtime{};
+    try runtime.init(testing.allocator);
+    defer runtime.deinit();
+
+    try runtime.enableNativeCpuDispatcher(testing.io);
+    try testing.expect(runtime.cpu_dispatcher.isInitialized());
+    try testing.expect(runtime.native_cpu_bridge.isInitialized());
+
+    runtime.disableCpuDispatcher();
+    try testing.expect(!runtime.cpu_dispatcher.isInitialized());
+    try testing.expect(!runtime.native_cpu_bridge.isInitialized());
 }

@@ -9,12 +9,13 @@ the independent subsystems and their end-to-end composition:
 | **`rdna2`** | Decodes and disassembles RDNA2 shader machine code |
 | **`loader`** | Reads, maps, and relocates guest ELF64 module images |
 | **`hle`** | High-level emulation of the guest firmware: symbol resolution and firmware libraries |
-| **`cpu`** | Dispatches guest execution across host workers and implements pthread scheduling |
-| **`runtime`** | Composes memory, loader, HLE, and the optional CPU dispatcher |
+| **`cpu`** | Dispatches guest execution and provides the Windows x86-64 native machine bridge |
+| **`runtime`** | Composes memory, loader, HLE, and the optional CPU execution path |
 
 None of them depends on anything beyond the Zig standard library. The tooling
-cross-compiles to Windows, Linux, and macOS; native guest execution itself is an
-x86-64 feature because guest machine code is executed directly.
+cross-compiles to Windows, Linux, and macOS. Direct guest execution currently
+requires Windows x86-64; the other targets still build the inspection and HLE
+layers but report the native bridge as unsupported.
 
 Two command-line tools come with them:
 
@@ -583,26 +584,37 @@ object instead of risking a dropped wake and process deadlock.
 
 Machine execution is represented by `cpu.Bridge`. Its request includes the
 entry point, System V AMD64 arguments, thread identity, guest stack, and complete
-TLS context. This boundary is intentionally strict: Windows reserves a segment
-base for host runtime state, and POSIX hosts may use FS for their own TLS. A
-bridge must therefore translate guest FS-relative instructions or restore host
-state around every HLE transition. Setting FS in ordinary Zig code is not a
-valid implementation. Kyty and SharpEmu make the same separation, although
+TLS context. This boundary is intentionally strict: POSIX hosts commonly use FS
+for their own TLS, while Windows x86-64 keeps the TEB under GS and leaves FS
+available to guest code. Kyty and SharpEmu make the same separation, although
 their patch/trampoline machinery differs.
 
-The dispatcher and deterministic bridge contract are implemented and tested.
-The platform x86-64 machine bridge, import trampolines, fault recovery, and
-unsupported-instruction handling are still required before an `eboot.bin` entry
-can execute safely. Consequently GPU command submission and audio callbacks are
-not yet reachable from a title even though memory, loading, linking, TLS, and
-pthread scheduling are in place.
+`cpu.NativeBridge` implements the first direct backend for Windows x86-64. It
+checks the operating system's `PF_RDWRFSGSBASE_AVAILABLE` capability before use,
+validates that entry points are executable and stacks/TLS are mapped, preserves
+the Win64 nonvolatile GPR and XMM registers plus MXCSR and x87 control state,
+switches to the mapped guest stack, installs the guest FS base, and calls the
+entry with the System V AMD64 convention. Nested guest callbacks reuse the active
+guest stack below the HLE frames. A synchronous `scePthreadExit` takes a native
+escape path which discards those guest frames and restores host FS/state before
+the dispatcher observes `error.Interrupted`.
+
+The bridge intentionally does not force a context change in another host
+thread. Shutdown marks such an execution interrupted and observes it when guest
+code returns; suspending a worker inside HLE could abandon host locks. Windows
+fault recovery/SEH metadata, unsupported-instruction compatibility, process
+startup data, and module initializers are still missing, so arbitrary
+`eboot.bin` execution is not safe yet. Linux and macOS need a different
+FS/HLE-transition strategy because their host TLS rules differ. GPU submission
+and audio callbacks consequently remain beyond the current title bootstrap.
 
 ## Roadmap
 
-1. Implement the x86-64 machine bridge and host-safe FS/HLE transitions.
-2. Build the process-entry stack and run module initializers before `eboot.bin`.
-3. Add trap/fault recovery and compatibility handling for unsupported x86-64
-   instructions.
+1. Build the process-entry stack and run module initializers before `eboot.bin`.
+2. Add Windows trap/fault recovery, unwind metadata, and compatibility handling
+   for unsupported x86-64 instructions.
+3. Introduce import transition stubs where host-stack recovery, diagnostics, or
+   platform TLS restoration are required.
 
 ---
 
@@ -615,9 +627,9 @@ all HLE exports, owns the process TLS registry, and adapts both registries to
 `loader.Resolver`. Exact library/module/version metadata is used first; the
 identifier-only HLE lookup remains the documented fallback for incomplete
 module metadata. It also owns the pthread and synchronization managers plus an
-opt-in CPU dispatcher, exposes initial-thread preparation and dispatch, and
-keeps natural-return TLS destructor handling inside the execution lifecycle. A
-mapped image unregisters its TLS template when it unloads.
+opt-in CPU dispatcher and native bridge, exposes initial-thread preparation and
+dispatch, and keeps natural-return TLS destructor handling inside the execution
+lifecycle. A mapped image unregisters its TLS template when it unloads.
 
 ```zig
 const runtime = @import("runtime");
@@ -629,8 +641,15 @@ defer emu.deinit();
 var module = try emu.loadModule(eboot_bytes, .{ .load_bias = 0 });
 defer module.deinit();
 
+try emu.enableNativeCpuDispatcher(io);
+
 std.debug.print("entry = 0x{x}\n", .{module.entry_point});
 ```
+
+`enableNativeCpuDispatcher` currently succeeds only on Windows x86-64 with
+user-mode FS-base instructions enabled. Call `prepareInitialThread` and
+`dispatchGuestEntry` only after constructing the guest process-entry stack;
+that bootstrap layout is the next runtime milestone.
 
 `Runtime.init` is intentionally in-place. Libkernel retains a pointer to the
 address space, so returning a Runtime value from an initializer could move it

@@ -6,10 +6,13 @@
 //! The dispatcher owns host workers and implements the complete libkernel
 //! threading backend. Machine execution is deliberately behind `Bridge`: the
 //! bridge is the only layer allowed to install or translate the guest FS base.
-//! This matters on Windows, where FS addresses the host TEB and cannot remain
-//! guest-owned while Zig or Win32 code runs.
+//! This matters on POSIX hosts, where FS commonly addresses host TLS. Windows
+//! x86-64 keeps its TEB under GS, which permits the direct backend below to use
+//! FS for the guest while Zig and Win32 code run on the same worker.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const memory = @import("memory");
 const hle = @import("hle");
 const threading = hle.libs.kernel_threading;
 
@@ -84,6 +87,414 @@ pub const Bridge = struct {
         if (self.interrupt_fn) |interrupt_fn| interrupt_fn(self.context, thread_handle);
     }
 };
+
+/// Whether this build can contain the direct Windows x86-64 execution path.
+/// Runtime availability additionally depends on the operating system exposing
+/// user-mode RDFSBASE/WRFSBASE support.
+pub const can_use_native_bridge = builtin.cpu.arch == .x86_64 and
+    builtin.os.tag == .windows;
+
+const NativeCallFrame = extern struct {
+    // The first 272 bytes are shared with the hand-written assembly below.
+    host_rsp: u64 = 0,
+    host_fs_base: u64 = 0,
+    host_rbx: u64 = 0,
+    host_rbp: u64 = 0,
+    host_rsi: u64 = 0,
+    host_rdi: u64 = 0,
+    host_r12: u64 = 0,
+    host_r13: u64 = 0,
+    host_r14: u64 = 0,
+    host_r15: u64 = 0,
+    guest_fs_base: u64 = 0,
+    result: u64 = 0,
+    interrupted: u32 = 0,
+    host_mxcsr: u32 = 0,
+    host_x87_control: u16 = 0,
+    padding: [6]u8 = [_]u8{0} ** 6,
+    host_xmm_nonvolatile: [10][16]u8 = [_][16]u8{[_]u8{0} ** 16} ** 10,
+
+    // Dispatcher metadata is never accessed by assembly.
+    owner: ?*NativeBridge = null,
+    thread_handle: u64 = 0,
+};
+
+comptime {
+    // Keep these checks beside the assembly so a layout edit fails loudly.
+    std.debug.assert(@offsetOf(NativeCallFrame, "host_rsp") == 0);
+    std.debug.assert(@offsetOf(NativeCallFrame, "host_fs_base") == 8);
+    std.debug.assert(@offsetOf(NativeCallFrame, "guest_fs_base") == 80);
+    std.debug.assert(@offsetOf(NativeCallFrame, "result") == 88);
+    std.debug.assert(@offsetOf(NativeCallFrame, "interrupted") == 96);
+    std.debug.assert(@offsetOf(NativeCallFrame, "host_mxcsr") == 100);
+    std.debug.assert(@offsetOf(NativeCallFrame, "host_x87_control") == 104);
+    std.debug.assert(@offsetOf(NativeCallFrame, "host_xmm_nonvolatile") == 112);
+    std.debug.assert(@offsetOf(NativeCallFrame, "owner") == 272);
+}
+
+threadlocal var active_native_frame: ?*NativeCallFrame = null;
+
+/// Direct System V AMD64 execution on a Windows x86-64 host.
+///
+/// Windows x64 uses GS rather than FS for its TEB, so Zig and Win32 remain able
+/// to run while the guest FS base is installed. The assembly boundary still
+/// restores FS before it returns to ordinary Zig code and preserves every
+/// register which Win64 requires a callee to retain, including XMM6-XMM15.
+/// Other hosts intentionally report `error.Unsupported`: POSIX runtimes use FS
+/// for host TLS and need import trampolines that restore it before entering HLE.
+pub const NativeBridge = struct {
+    allocator: std.mem.Allocator = undefined,
+    address_space: *memory.AddressSpace = undefined,
+    active_frames: std.ArrayList(*NativeCallFrame) = .empty,
+    lock: Lock = .{},
+    initialized: bool = false,
+
+    pub fn init(
+        self: *NativeBridge,
+        allocator: std.mem.Allocator,
+        address_space: *memory.AddressSpace,
+    ) Error!void {
+        if (self.initialized) return error.AlreadyInitialized;
+        if (!NativeMachine.isSupported()) return error.Unsupported;
+        self.* = .{
+            .allocator = allocator,
+            .address_space = address_space,
+            .initialized = true,
+        };
+    }
+
+    pub fn deinit(self: *NativeBridge) void {
+        if (!self.initialized) return;
+        self.lock.lock();
+        std.debug.assert(self.active_frames.items.len == 0);
+        self.active_frames.deinit(self.allocator);
+        self.lock.unlock();
+        self.* = .{};
+    }
+
+    pub fn isInitialized(self: *const NativeBridge) bool {
+        return self.initialized;
+    }
+
+    pub fn isSupported() bool {
+        return NativeMachine.isSupported();
+    }
+
+    pub fn bridge(self: *NativeBridge) Bridge {
+        return .{
+            .context = self,
+            .execute_fn = &executeThunk,
+            .interrupt_fn = &interruptThunk,
+        };
+    }
+
+    fn executeThunk(raw: ?*anyopaque, request: ExecuteRequest) ExecutionError!u64 {
+        const pointer = raw orelse return error.ExecutionFailed;
+        const self: *NativeBridge = @ptrCast(@alignCast(pointer));
+        return self.execute(request);
+    }
+
+    fn execute(self: *NativeBridge, request: ExecuteRequest) ExecutionError!u64 {
+        if (!self.initialized) return error.Unsupported;
+        if (request.entry_point == 0 or request.argument_count > 2) {
+            return error.ExecutionFailed;
+        }
+
+        const previous = active_native_frame;
+        const nested = previous != null;
+        if (previous) |parent| {
+            if (parent.owner != self or parent.thread_handle != request.thread_handle or
+                parent.guest_fs_base != request.context.fs_base or
+                request.kind != .guest_callback)
+            {
+                return error.ExecutionFailed;
+            }
+        } else if (!self.validateInitialRequest(request)) {
+            return error.ExecutionFailed;
+        }
+
+        if (!self.isExecutableAddress(request.entry_point)) {
+            return error.ExecutionFailed;
+        }
+
+        const stack_pointer = if (nested)
+            0
+        else
+            alignedStackTop(request.stack_address, request.stack_size) orelse
+                return error.ExecutionFailed;
+
+        var frame: NativeCallFrame align(16) = .{
+            .guest_fs_base = request.context.fs_base,
+            .owner = self,
+            .thread_handle = request.thread_handle,
+        };
+        try self.registerFrame(&frame);
+        defer self.unregisterFrame(&frame);
+        active_native_frame = &frame;
+        defer active_native_frame = previous;
+
+        const result = NativeMachine.call(
+            &frame,
+            request.entry_point,
+            stack_pointer,
+            request.arguments[0],
+            request.arguments[1],
+        );
+        if (@atomicLoad(u32, &frame.interrupted, .acquire) != 0) {
+            return error.Interrupted;
+        }
+        return result;
+    }
+
+    fn interruptThunk(raw: ?*anyopaque, thread_handle: u64) void {
+        const pointer = raw orelse return;
+        const self: *NativeBridge = @ptrCast(@alignCast(pointer));
+        self.interrupt(thread_handle);
+    }
+
+    fn interrupt(self: *NativeBridge, thread_handle: u64) void {
+        if (!self.initialized) return;
+
+        // pthread_exit reaches this path synchronously on the executing host
+        // worker. The assembly escape discards the guest/HLE frames and returns
+        // from NativeMachine.call with the host FS and ABI state restored.
+        if (active_native_frame) |frame| {
+            if (frame.owner == self and frame.thread_handle == thread_handle) {
+                @atomicStore(u32, &frame.interrupted, 1, .release);
+                NativeMachine.escape(frame);
+            }
+        }
+
+        // Shutdown may request interruption from another host thread. Marking
+        // the frame is race-safe and makes a returning guest report Interrupted.
+        // Forced cross-thread context transfer belongs with the fault backend;
+        // suspending a worker while it owns an HLE lock would corrupt state.
+        self.lock.lock();
+        for (self.active_frames.items) |frame| {
+            if (frame.thread_handle != thread_handle) continue;
+            @atomicStore(u32, &frame.interrupted, 1, .release);
+        }
+        self.lock.unlock();
+    }
+
+    fn registerFrame(
+        self: *NativeBridge,
+        frame: *NativeCallFrame,
+    ) ExecutionError!void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        self.active_frames.append(self.allocator, frame) catch
+            return error.ExecutionFailed;
+    }
+
+    fn unregisterFrame(self: *NativeBridge, frame: *NativeCallFrame) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (self.active_frames.items, 0..) |known, index| {
+            if (known != frame) continue;
+            _ = self.active_frames.swapRemove(index);
+            return;
+        }
+        unreachable;
+    }
+
+    fn validateInitialRequest(self: *NativeBridge, request: ExecuteRequest) bool {
+        if (request.context.fs_base == 0 or request.stack_address == 0 or
+            request.stack_size < 256)
+        {
+            return false;
+        }
+        const stack_end = std.math.add(
+            u64,
+            request.stack_address,
+            request.stack_size,
+        ) catch return false;
+        const stack = self.address_space.query(request.stack_address, false) orelse
+            return false;
+        if (!stack.protection.write or stack.kind == .reserved or stack.end() < stack_end) {
+            return false;
+        }
+        const tls = self.address_space.query(request.context.fs_base, false) orelse
+            return false;
+        return tls.kind != .reserved and tls.protection.read and tls.protection.write;
+    }
+
+    fn isExecutableAddress(self: *NativeBridge, address: u64) bool {
+        const mapping = self.address_space.query(address, false) orelse return false;
+        return mapping.kind != .reserved and mapping.protection.execute;
+    }
+};
+
+fn alignedStackTop(address: u64, size: u64) ?u64 {
+    const end = std.math.add(u64, address, size) catch return null;
+    const minimum_top = std.math.add(u64, address, 256) catch return null;
+    const top = std.mem.alignBackward(u64, end, 16);
+    return if (top >= minimum_top) top else null;
+}
+
+const NativeMachine = if (can_use_native_bridge) WindowsX64Machine else UnsupportedMachine;
+
+const UnsupportedMachine = struct {
+    fn isSupported() bool {
+        return false;
+    }
+
+    fn call(_: *NativeCallFrame, _: u64, _: u64, _: u64, _: u64) u64 {
+        unreachable;
+    }
+
+    fn escape(_: *NativeCallFrame) noreturn {
+        unreachable;
+    }
+
+    fn readFsBase() u64 {
+        return 0;
+    }
+};
+
+const WindowsX64Machine = struct {
+    fn isSupported() bool {
+        return std.os.windows.IsProcessorFeaturePresent(.RDWRFSGBASE_AVAILABLE);
+    }
+
+    fn call(
+        frame: *NativeCallFrame,
+        entry_point: u64,
+        stack_pointer: u64,
+        argument_0: u64,
+        argument_1: u64,
+    ) u64 {
+        return ps5NativeCallWindowsX64(
+            frame,
+            entry_point,
+            stack_pointer,
+            argument_0,
+            argument_1,
+        );
+    }
+
+    fn escape(frame: *NativeCallFrame) noreturn {
+        ps5NativeEscapeWindowsX64(frame);
+    }
+
+    fn readFsBase() u64 {
+        return asm volatile ("rdfsbase %[base]"
+            : [base] "=r" (-> u64),
+        );
+    }
+};
+
+extern fn ps5NativeCallWindowsX64(
+    frame: *NativeCallFrame,
+    entry_point: u64,
+    stack_pointer: u64,
+    argument_0: u64,
+    argument_1: u64,
+) callconv(.winapi) u64;
+
+extern fn ps5NativeEscapeWindowsX64(frame: *NativeCallFrame) callconv(.winapi) noreturn;
+
+comptime {
+    if (can_use_native_bridge) asm (
+        \\.text
+        \\.p2align 4
+        \\.globl ps5NativeCallWindowsX64
+        \\ps5NativeCallWindowsX64:
+        \\  movq %rsp, 0(%rcx)
+        \\  rdfsbase %rax
+        \\  movq %rax, 8(%rcx)
+        \\  movq %rbx, 16(%rcx)
+        \\  movq %rbp, 24(%rcx)
+        \\  movq %rsi, 32(%rcx)
+        \\  movq %rdi, 40(%rcx)
+        \\  movq %r12, 48(%rcx)
+        \\  movq %r13, 56(%rcx)
+        \\  movq %r14, 64(%rcx)
+        \\  movq %r15, 72(%rcx)
+        \\  stmxcsr 100(%rcx)
+        \\  fnstcw 104(%rcx)
+        \\  movdqu %xmm6, 112(%rcx)
+        \\  movdqu %xmm7, 128(%rcx)
+        \\  movdqu %xmm8, 144(%rcx)
+        \\  movdqu %xmm9, 160(%rcx)
+        \\  movdqu %xmm10, 176(%rcx)
+        \\  movdqu %xmm11, 192(%rcx)
+        \\  movdqu %xmm12, 208(%rcx)
+        \\  movdqu %xmm13, 224(%rcx)
+        \\  movdqu %xmm14, 240(%rcx)
+        \\  movdqu %xmm15, 256(%rcx)
+        \\  movq 40(%rsp), %rsi
+        \\  movq %r9, %rdi
+        \\  movq %rdx, %r11
+        \\  movq %rcx, %r15
+        \\  movq 80(%r15), %r10
+        \\  wrfsbase %r10
+        \\  testq %r8, %r8
+        \\  jz 1f
+        \\  movq %r8, %rsp
+        \\1:
+        \\  andq $-16, %rsp
+        \\  xorl %eax, %eax
+        \\  callq *%r11
+        \\  movq %rax, 88(%r15)
+        \\  movq 8(%r15), %r10
+        \\  wrfsbase %r10
+        \\  movq %r15, %r10
+        \\  movq 0(%r10), %rsp
+        \\  ldmxcsr 100(%r10)
+        \\  fldcw 104(%r10)
+        \\  movdqu 112(%r10), %xmm6
+        \\  movdqu 128(%r10), %xmm7
+        \\  movdqu 144(%r10), %xmm8
+        \\  movdqu 160(%r10), %xmm9
+        \\  movdqu 176(%r10), %xmm10
+        \\  movdqu 192(%r10), %xmm11
+        \\  movdqu 208(%r10), %xmm12
+        \\  movdqu 224(%r10), %xmm13
+        \\  movdqu 240(%r10), %xmm14
+        \\  movdqu 256(%r10), %xmm15
+        \\  movq 88(%r10), %rax
+        \\  movq 16(%r10), %rbx
+        \\  movq 24(%r10), %rbp
+        \\  movq 32(%r10), %rsi
+        \\  movq 40(%r10), %rdi
+        \\  movq 48(%r10), %r12
+        \\  movq 56(%r10), %r13
+        \\  movq 64(%r10), %r14
+        \\  movq 72(%r10), %r15
+        \\  retq
+        \\.p2align 4
+        \\.globl ps5NativeEscapeWindowsX64
+        \\ps5NativeEscapeWindowsX64:
+        \\  movq $0, 88(%rcx)
+        \\  movq 8(%rcx), %r10
+        \\  wrfsbase %r10
+        \\  movq %rcx, %r10
+        \\  movq 0(%r10), %rsp
+        \\  ldmxcsr 100(%r10)
+        \\  fldcw 104(%r10)
+        \\  movdqu 112(%r10), %xmm6
+        \\  movdqu 128(%r10), %xmm7
+        \\  movdqu 144(%r10), %xmm8
+        \\  movdqu 160(%r10), %xmm9
+        \\  movdqu 176(%r10), %xmm10
+        \\  movdqu 192(%r10), %xmm11
+        \\  movdqu 208(%r10), %xmm12
+        \\  movdqu 224(%r10), %xmm13
+        \\  movdqu 240(%r10), %xmm14
+        \\  movdqu 256(%r10), %xmm15
+        \\  xorl %eax, %eax
+        \\  movq 16(%r10), %rbx
+        \\  movq 24(%r10), %rbp
+        \\  movq 32(%r10), %rsi
+        \\  movq 40(%r10), %rdi
+        \\  movq 48(%r10), %r12
+        \\  movq 56(%r10), %r13
+        \\  movq 64(%r10), %r14
+        \\  movq 72(%r10), %r15
+        \\  retq
+    );
+}
 
 const WakeEvent = struct {
     sequence: u64 = 0,
@@ -656,7 +1067,6 @@ fn makeTimeout(io: std.Io, request: threading.WaitRequest) std.Io.Timeout {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
-const memory = @import("memory");
 const loader = @import("loader");
 
 const TestBridge = struct {
@@ -817,6 +1227,185 @@ test "new waiters do not consume stale signal tokens" {
             .observed_sequence = 3,
             .timeout_microseconds = 0,
         }),
+    );
+}
+
+test "native bridge installs FS, SysV arguments, and the guest stack" {
+    if (!NativeBridge.isSupported()) return error.SkipZigTest;
+
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+
+    const code_address = memory.system_managed.start;
+    const tls_address = code_address + memory.page_size;
+    const stack_address = tls_address + memory.page_size;
+    try address_space.mapFixed(
+        code_address,
+        memory.page_size,
+        .read_write,
+        .module,
+        null,
+    );
+    try address_space.mapFixed(
+        tls_address,
+        memory.page_size,
+        .read_write,
+        .private,
+        null,
+    );
+    try address_space.mapFixed(
+        stack_address,
+        memory.page_size,
+        .read_write,
+        .private,
+        null,
+    );
+    try address_space.writeInt(u64, tls_address, tls_address);
+
+    // mov rax, qword ptr fs:[0]; add rax, rdi; add rax, rsi; ret
+    const fs_program = [_]u8{
+        0x64, 0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00,
+        0x48, 0x01, 0xf8, 0x48, 0x01, 0xf0, 0xc3,
+    };
+    // mov rax, rsp; ret
+    const stack_program = [_]u8{ 0x48, 0x89, 0xe0, 0xc3 };
+    try address_space.write(code_address, &fs_program);
+    try address_space.write(code_address + 0x20, &stack_program);
+    try address_space.protect(code_address, memory.page_size, .read_execute);
+
+    var native = NativeBridge{};
+    try native.init(testing.allocator, &address_space);
+    defer native.deinit();
+    const machine = native.bridge();
+    const context = threading.ThreadContext{
+        .tls_mapping_address = tls_address,
+        .tls_mapping_size = memory.page_size,
+        .fs_base = tls_address,
+        .dtv_address = tls_address + 0x100,
+        .tls_generation = 1,
+    };
+    const host_fs_before = NativeMachine.readFsBase();
+    const result = try machine.execute(.{
+        .kind = .process_entry,
+        .entry_point = code_address,
+        .thread_handle = 1,
+        .arguments = .{ 40, 2 },
+        .argument_count = 2,
+        .context = context,
+        .stack_address = stack_address,
+        .stack_size = memory.page_size,
+        .guard_size = 0,
+    });
+    try testing.expectEqual(tls_address + 42, result);
+    try testing.expectEqual(host_fs_before, NativeMachine.readFsBase());
+
+    const observed_rsp = try machine.execute(.{
+        .kind = .process_entry,
+        .entry_point = code_address + 0x20,
+        .thread_handle = 1,
+        .context = context,
+        .stack_address = stack_address,
+        .stack_size = memory.page_size,
+        .guard_size = 0,
+    });
+    try testing.expect(observed_rsp >= stack_address);
+    try testing.expect(observed_rsp < stack_address + memory.page_size);
+    try testing.expectEqual(@as(u64, 8), observed_rsp & 0xf);
+}
+
+test "native bridge executes a pthread on its dispatcher worker" {
+    if (!NativeBridge.isSupported()) return error.SkipZigTest;
+
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    const code_address = memory.system_managed.start;
+    try address_space.mapFixed(
+        code_address,
+        memory.page_size,
+        .read_write,
+        .module,
+        null,
+    );
+    // lea rax, [rdi + 1]; ret
+    try address_space.write(code_address, &.{ 0x48, 0x8d, 0x47, 0x01, 0xc3 });
+    try address_space.protect(code_address, memory.page_size, .read_execute);
+
+    var tls_registry: loader.TlsRegistry = .{};
+    defer tls_registry.deinit(testing.allocator);
+    var manager = threading.Manager{};
+    manager.init(testing.allocator, &address_space, &tls_registry);
+    defer manager.deinit();
+    var native = NativeBridge{};
+    try native.init(testing.allocator, &address_space);
+    defer native.deinit();
+    var dispatcher = Dispatcher{};
+    try dispatcher.init(
+        testing.allocator,
+        testing.io,
+        &manager,
+        native.bridge(),
+    );
+    defer dispatcher.deinit();
+
+    var handle: threading.ThreadHandle = null;
+    try manager.create(&handle, .{}, code_address, 41, "native-worker");
+    try testing.expectEqual(@as(u64, 42), try manager.join(handle));
+}
+
+test "native bridge unwinds scePthreadExit to the dispatcher" {
+    if (!NativeBridge.isSupported()) return error.SkipZigTest;
+
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    const code_address = memory.system_managed.start;
+    try address_space.mapFixed(
+        code_address,
+        memory.page_size,
+        .read_write,
+        .module,
+        null,
+    );
+
+    // mov rdi, 0x55; mov rax, scePthreadExit; call rax; ud2
+    var program = [_]u8{
+        0x48, 0xbf, 0,    0,    0, 0, 0, 0, 0, 0,
+        0x48, 0xb8, 0,    0,    0, 0, 0, 0, 0, 0,
+        0xff, 0xd0, 0x0f, 0x0b,
+    };
+    std.mem.writeInt(u64, program[2..10], 0x55, .little);
+    std.mem.writeInt(
+        u64,
+        program[12..20],
+        @intFromPtr(&threading.scePthreadExit),
+        .little,
+    );
+    try address_space.write(code_address, &program);
+    try address_space.protect(code_address, memory.page_size, .read_execute);
+
+    var tls_registry: loader.TlsRegistry = .{};
+    defer tls_registry.deinit(testing.allocator);
+    var manager = threading.Manager{};
+    manager.init(testing.allocator, &address_space, &tls_registry);
+    defer manager.deinit();
+    var native = NativeBridge{};
+    try native.init(testing.allocator, &address_space);
+    defer native.deinit();
+    var dispatcher = Dispatcher{};
+    try dispatcher.init(
+        testing.allocator,
+        testing.io,
+        &manager,
+        native.bridge(),
+    );
+    defer dispatcher.deinit();
+    threading.attachManager(&manager);
+    defer threading.attachManager(null);
+
+    const prepared = try manager.prepareInitialThread("native-exit");
+    defer manager.releaseInitialThread(prepared.handle) catch {};
+    try testing.expectEqual(
+        @as(u64, 0x55),
+        try dispatcher.dispatchInitial(prepared, code_address, &.{}),
     );
 }
 
