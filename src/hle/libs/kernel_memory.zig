@@ -124,6 +124,13 @@ pub const Pool = struct {
         return null;
     }
 
+    pub fn hasExactReservation(self: *const Pool, start: u64, len: u64) bool {
+        for (self.reservations.items) |reservation| {
+            if (reservation.start == start and reservation.len == len) return true;
+        }
+        return false;
+    }
+
     fn isFree(self: *const Pool, start: u64, len: u64) bool {
         for (self.reservations.items) |r| {
             if (r.overlaps(start, len)) return false;
@@ -260,6 +267,12 @@ fn sceKernelReleaseDirectMemory(start: u64, len: u64) callconv(abi.guest) i32 {
     pool_lock.lock();
     defer pool_lock.unlock();
 
+    if (!pool.hasExactReservation(start, len)) return KernelError.einval.raw();
+    if (guest_address_space) |address_space| {
+        if (address_space.hasDirectMemoryMappings(start, len)) {
+            return KernelError.ebusy.raw();
+        }
+    }
     pool.release(start, len) catch |err| return switch (err) {
         error.NotReserved => KernelError.einval.raw(),
         else => KernelError.enomem.raw(),
@@ -341,8 +354,10 @@ fn mapAddressSpaceError(err: memory.Error) i32 {
         error.AddressSpaceUnavailable,
         error.AddressUnavailable,
         error.HostCommitFailed,
+        error.BackingStoreUnavailable,
         error.OutOfMemory,
         => KernelError.enomem.raw(),
+        error.BackingOffsetInvalid => KernelError.einval.raw(),
         error.RangeNotMapped,
         error.ProtectionDenied,
         error.HostDecommitFailed,
@@ -501,7 +516,10 @@ test "allocate and release round-trip through the entry points" {
 }
 
 test "direct memory maps at an exact guest address" {
-    var address_space = try memory.AddressSpace.init(testing.allocator);
+    var address_space = try memory.AddressSpace.initWithDirectMemory(
+        testing.allocator,
+        direct_memory_size,
+    );
     defer address_space.deinit();
 
     init(testing.allocator);
@@ -541,8 +559,25 @@ test "direct memory maps at an exact guest address" {
 
     try address_space.write(virtual_address, "direct");
     var bytes: [6]u8 = undefined;
-    try address_space.read(virtual_address, &bytes);
+    const alias_address = virtual_address + page_size;
+    var alias = alias_address;
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelMapDirectMemory(
+            &alias,
+            page_size,
+            prot_cpu_read | prot_cpu_write,
+            map_fixed,
+            start,
+            0,
+        ),
+    );
+    try address_space.read(alias, &bytes);
     try testing.expectEqualStrings("direct", &bytes);
+    try testing.expectEqual(
+        KernelError.ebusy.raw(),
+        sceKernelReleaseDirectMemory(start, page_size),
+    );
 }
 
 test "the library registers under the expected identifiers" {

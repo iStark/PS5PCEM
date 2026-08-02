@@ -235,14 +235,31 @@ in 16 KiB units only when `mapFixed` or `map` creates a guest mapping. `unmap`
 decommits those pages while retaining the outer reservation, so the same guest
 address cannot be taken by an unrelated host allocation between uses.
 
+Direct memory is different from a private mapping: its physical offset has a
+stable identity. [src/memory/backing_store.zig](src/memory/backing_store.zig)
+provides one sparse shared object for the pool, and mappings of the same offset
+are coherent aliases. Writing through one guest virtual address is immediately
+visible through every other address mapped to those physical pages. The 12 GiB
+capacity remains virtual; mapped pages consume backing/commit resources, and
+physical working-set pages are faulted on first touch.
+
 Windows has permanent low-address mappings, notably `KUSER_SHARED_DATA`, inside
 the system-managed window. A single `VirtualAlloc` reservation would therefore
 fail even though almost the whole window is free. Initialization scans with
-`VirtualQuery` and reserves every free extent at its exact address. A requested
-mapping that lands in a host-owned hole fails explicitly. Linux uses
+`VirtualQuery` and reserves every free extent as a placeholder at its exact
+address. Placeholders are split into 16 KiB units before use, replaced by
+private pages or section views, and restored and coalesced on unmap. This keeps
+partial protection and unmap operations page-accurate. A requested mapping that
+lands in a host-owned hole fails explicitly. Linux uses
 `MAP_FIXED_NOREPLACE`; macOS uses a non-destructive fixed hint and rejects a
 result returned at any other address. No path uses a `MAP_FIXED` operation that
 could overwrite an unrelated host mapping.
+
+The shared direct-memory backend is a page-file section with `SEC_RESERVE` on
+Windows, a sparse `memfd` on Linux, and an immediately unlinked POSIX shared
+memory object on macOS. Section/file views replace only ranges already owned by
+the address space. Teardown restores the reservation before closing the backing
+object.
 
 The address-space API also owns the sorted mapping table. Loader segments,
 private allocations, and direct-memory mappings all go through it, so overlap
@@ -423,7 +440,9 @@ rejection, exhaustion, and release. `sceKernelMapDirectMemory` validates that
 the complete physical range was reserved, translates CPU/GPU protection bits,
 and either commits the exact `MAP_FIXED` address or performs an aligned first-fit
 search in the user window. The resulting mapping carries its physical offset in
-the central address-space table.
+the central address-space table and maps the runtime's sparse shared backing
+store. Multiple virtual mappings of one physical range are coherent. Releasing
+a physical reservation while one of its mappings remains live returns `EBUSY`.
 
 | Export | State |
 |---|---|
@@ -431,13 +450,6 @@ the central address-space table.
 | `sceKernelReleaseDirectMemory` | Implemented |
 | `sceKernelGetDirectMemorySize` | Implemented |
 | `sceKernelMapDirectMemory` | Implemented for fixed and searched mappings |
-
-The current direct-memory mapping is anonymous host memory tagged with its
-physical offset. The common one-reservation/one-mapping startup path is usable;
-mapping the same physical pages at several virtual addresses does not yet create
-coherent aliases. That next step requires a shared section backing store
-(`MapViewOfFile3` on Windows and `memfd`/`mmap` on Linux), without changing the
-guest address-space API.
 
 ## Error codes
 
@@ -453,22 +465,21 @@ from leaking into host code where nothing would check it.
 
 ## Roadmap
 
-1. Shared-section backing for coherent direct-memory aliases.
-2. Flexible-memory allocation, `mmap`/`munmap`, and memory-query exports.
-3. A TLS module registry for `DTPMOD64`, `DTPOFF64`, and `TPOFF64` relocations.
-4. Threading: the `pthread_*` and `scePthread*` families.
-5. Event queues, on which most firmware asynchrony is built.
+1. Flexible-memory allocation, `mmap`/`munmap`, and memory-query exports.
+2. A TLS module registry for `DTPMOD64`, `DTPOFF64`, and `TPOFF64` relocations.
+3. Threading: the `pthread_*` and `scePthread*` families.
+4. Event queues, on which most firmware asynchrony is built.
 
 ---
 
 # `runtime` — end-to-end composition
 
 [src/runtime/root.zig](src/runtime/root.zig) owns the dependency direction that
-does not belong in any lower-level module. It creates one `memory.AddressSpace`,
-connects it to libkernel, registers all HLE exports, and adapts `hle.Database` to
-`loader.Resolver`. Exact library/module/version metadata is used first; the
-identifier-only lookup remains the documented fallback for incomplete module
-metadata.
+does not belong in any lower-level module. It creates one `memory.AddressSpace`
+with the sparse direct-memory backing store, connects it to libkernel, registers
+all HLE exports, and adapts `hle.Database` to `loader.Resolver`. Exact
+library/module/version metadata is used first; the identifier-only lookup
+remains the documented fallback for incomplete module metadata.
 
 ```zig
 const runtime = @import("runtime");

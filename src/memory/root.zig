@@ -17,6 +17,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+pub const SharedBacking = @import("backing_store.zig").SharedBacking;
+
 const windows_mem_free: u32 = 0x0001_0000;
 const windows_allocation_granularity: u64 = 0x1_0000;
 
@@ -41,6 +43,28 @@ const WindowsApi = if (builtin.os.tag == .windows) struct {
         info: *WindowsMemoryInfo,
         length: usize,
     ) callconv(.winapi) usize;
+
+    extern "ntdll" fn NtAllocateVirtualMemoryEx(
+        process: std.os.windows.HANDLE,
+        base_address: *std.os.windows.PVOID,
+        region_size: *std.os.windows.SIZE_T,
+        allocation_type: std.os.windows.MEM.ALLOCATE,
+        page_protection: std.os.windows.PAGE,
+        extended_parameters: ?*std.os.windows.MEM.EXTENDED_PARAMETER,
+        parameter_count: std.os.windows.ULONG,
+    ) callconv(.winapi) std.os.windows.NTSTATUS;
+
+    extern "ntdll" fn NtMapViewOfSectionEx(
+        section: std.os.windows.HANDLE,
+        process: std.os.windows.HANDLE,
+        base_address: *std.os.windows.PVOID,
+        section_offset: ?*std.os.windows.LARGE_INTEGER,
+        view_size: *std.os.windows.SIZE_T,
+        allocation_type: std.os.windows.MEM.MAP,
+        page_protection: std.os.windows.PAGE,
+        extended_parameters: ?*std.os.windows.MEM.EXTENDED_PARAMETER,
+        parameter_count: std.os.windows.ULONG,
+    ) callconv(.winapi) std.os.windows.NTSTATUS;
 } else struct {};
 
 fn windowsVirtualQuery(address: u64, info: *WindowsMemoryInfo) usize {
@@ -162,6 +186,8 @@ pub const Error = error{
     ProtectionDenied,
     HostCommitFailed,
     HostDecommitFailed,
+    BackingStoreUnavailable,
+    BackingOffsetInvalid,
 } || std.mem.Allocator.Error;
 
 /// A small lock for the address-space interval table.
@@ -192,6 +218,7 @@ pub const AddressSpace = struct {
     /// mappings such as KUSER_SHARED_DATA inside the low window, so ownership
     /// is intentionally a list of free extents rather than three booleans.
     reservations: std.ArrayList(Range) = .empty,
+    direct_backing: ?SharedBacking = null,
     mutex: Lock = .{},
 
     pub fn init(allocator: std.mem.Allocator) Error!AddressSpace {
@@ -207,11 +234,28 @@ pub const AddressSpace = struct {
         return self;
     }
 
+    /// Creates the address space and its sparse physical direct-memory store.
+    /// Ordinary loader tests can use `init`; a complete runtime uses this form
+    /// so mappings of the same physical offset become coherent aliases.
+    pub fn initWithDirectMemory(
+        allocator: std.mem.Allocator,
+        backing_size: u64,
+    ) Error!AddressSpace {
+        var self = try init(allocator);
+        errdefer self.deinit();
+        self.direct_backing = SharedBacking.init(backing_size) catch
+            return Error.BackingStoreUnavailable;
+        return self;
+    }
+
     pub fn deinit(self: *AddressSpace) void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        self.discardMappingsLocked();
         self.releaseReservations();
+        if (self.direct_backing) |*backing| backing.deinit();
+        self.direct_backing = null;
         self.reservations.deinit(self.allocator);
         self.reservations = .empty;
         self.mappings.deinit(self.allocator);
@@ -321,7 +365,15 @@ pub const AddressSpace = struct {
             true,
         );
 
-        try hostDecommit(address, size);
+        const free_range = freeRangeInMappings(
+            self.reservations.items,
+            replacement.items,
+            address,
+            size,
+        ) orelse return Error.HostDecommitFailed;
+
+        try self.hostUnmapLocked(address, size);
+        try hostCoalescePlaceholder(free_range);
 
         self.mappings.deinit(self.allocator);
         self.mappings = replacement;
@@ -342,6 +394,25 @@ pub const AddressSpace = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.coversLocked(address, size, kind);
+    }
+
+    /// Reports whether a physical direct-memory range is visible through any
+    /// guest mapping. Releasing such a reservation would let the pool hand the
+    /// same offsets to another allocation while stale aliases still access it.
+    pub fn hasDirectMemoryMappings(self: *AddressSpace, offset: u64, size: u64) bool {
+        if (size == 0) return false;
+        const end = std.math.add(u64, offset, size) catch return true;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.mappings.items) |mapping| {
+            if (mapping.kind != .direct_memory) continue;
+            const mapping_offset = mapping.backing_offset orelse continue;
+            const mapping_end = std.math.add(u64, mapping_offset, mapping.size) catch
+                return true;
+            if (mapping_offset < end and offset < mapping_end) return true;
+        }
+        return false;
     }
 
     /// Copies into guest memory only when the entire destination is mapped and
@@ -408,8 +479,26 @@ pub const AddressSpace = struct {
         if (self.overlapsLocked(address, size)) return Error.AddressUnavailable;
         try self.mappings.ensureUnusedCapacity(self.allocator, 1);
 
-        try hostCommit(address, size, protection);
-        errdefer hostDecommit(address, size) catch {};
+        const free_range = self.freeRangeLocked(address, size) orelse
+            return Error.AddressUnavailable;
+        try hostPreparePagePlaceholders(free_range, address, size);
+        errdefer hostCoalescePlaceholder(free_range) catch {};
+
+        if (kind == .direct_memory) {
+            const offset = backing_offset orelse return Error.BackingOffsetInvalid;
+            const backing = if (self.direct_backing) |*value| value else return Error.BackingStoreUnavailable;
+            const backing_end = std.math.add(u64, offset, size) catch
+                return Error.BackingOffsetInvalid;
+            if (!isAligned(offset, page_size) or backing_end > backing.size) {
+                return Error.BackingOffsetInvalid;
+            }
+            try hostMapBacking(backing, address, size, offset, protection);
+            errdefer hostUnmapBacking(address, size) catch {};
+        } else {
+            if (backing_offset != null) return Error.BackingOffsetInvalid;
+            try hostCommit(address, size, protection);
+            errdefer hostDecommit(address, size) catch {};
+        }
 
         const index = self.insertionIndex(address);
         self.mappings.insertAssumeCapacity(index, .{
@@ -419,6 +508,39 @@ pub const AddressSpace = struct {
             .kind = kind,
             .backing_offset = backing_offset,
         });
+    }
+
+    fn freeRangeLocked(self: *const AddressSpace, address: u64, size: u64) ?Range {
+        return freeRangeInMappings(self.reservations.items, self.mappings.items, address, size);
+    }
+
+    fn hostUnmapLocked(self: *AddressSpace, address: u64, size: u64) Error!void {
+        const end = address + size;
+        for (self.mappings.items) |mapping| {
+            const part_start = @max(address, mapping.address);
+            const part_end = @min(end, mapping.end());
+            if (part_start >= part_end) continue;
+
+            if (mapping.kind == .direct_memory) {
+                try hostUnmapBacking(part_start, part_end - part_start);
+            } else {
+                try hostDecommit(part_start, part_end - part_start);
+            }
+        }
+    }
+
+    fn discardMappingsLocked(self: *AddressSpace) void {
+        for (self.mappings.items) |mapping| {
+            if (mapping.kind == .direct_memory) {
+                hostUnmapBacking(mapping.address, mapping.size) catch {};
+            } else {
+                hostDecommit(mapping.address, mapping.size) catch {};
+            }
+        }
+        self.mappings.clearRetainingCapacity();
+        for (self.reservations.items) |reservation| {
+            hostCoalescePlaceholder(reservation) catch {};
+        }
     }
 
     fn insertionIndex(self: *const AddressSpace, address: u64) usize {
@@ -662,19 +784,52 @@ fn appendTransformed(
     }
 }
 
+/// Returns the complete free interval around a requested range. The mapping
+/// slice may be the current table or a prospective table built for `unmap`.
+fn freeRangeInMappings(
+    reservations: []const Range,
+    mappings: []const Mapping,
+    address: u64,
+    size: u64,
+) ?Range {
+    const requested_end = std.math.add(u64, address, size) catch return null;
+    for (reservations) |reservation| {
+        if (!reservation.contains(address, size)) continue;
+
+        var free_start = reservation.start;
+        var free_end = reservation.end;
+        for (mappings) |mapping| {
+            if (mapping.end() <= address) {
+                free_start = @max(free_start, mapping.end());
+                continue;
+            }
+            if (mapping.address >= requested_end) {
+                free_end = @min(free_end, mapping.address);
+                break;
+            }
+            return null;
+        }
+        if (free_start <= address and requested_end <= free_end) {
+            return .{ .start = free_start, .end = free_end };
+        }
+    }
+    return null;
+}
+
 fn hostReserve(range: Range) Error!void {
     switch (builtin.os.tag) {
         .windows => {
             const windows = std.os.windows;
             var base: ?*anyopaque = @ptrFromInt(range.start);
             var size: windows.SIZE_T = @intCast(range.len());
-            const status = windows.ntdll.NtAllocateVirtualMemory(
+            const status = WindowsApi.NtAllocateVirtualMemoryEx(
                 windows.GetCurrentProcess(),
                 @ptrCast(&base),
-                0,
                 &size,
-                .{ .RESERVE = true },
+                .{ .RESERVE = true, .RESERVE_PLACEHOLDER = true },
                 .{ .NOACCESS = true },
+                null,
+                0,
             );
             if (status != .SUCCESS or @intFromPtr(base) != range.start) {
                 if (status == .SUCCESS) {
@@ -741,19 +896,30 @@ fn hostCommit(address: u64, size: u64, protection: Protection) Error!void {
     switch (builtin.os.tag) {
         .windows => {
             const windows = std.os.windows;
-            var base: ?*anyopaque = @ptrFromInt(address);
-            var host_size: windows.SIZE_T = @intCast(size);
             const page = windows.PAGE.fromProtection(protection.host()) orelse
                 return Error.ProtectionDenied;
-            const status = windows.ntdll.NtAllocateVirtualMemory(
-                windows.GetCurrentProcess(),
-                @ptrCast(&base),
-                0,
-                &host_size,
-                .{ .COMMIT = true },
-                page,
-            );
-            if (status != .SUCCESS or @intFromPtr(base) != address) return Error.HostCommitFailed;
+            var cursor = address;
+            while (cursor < address + size) : (cursor += page_size) {
+                var base: ?*anyopaque = @ptrFromInt(cursor);
+                var host_size: windows.SIZE_T = @intCast(page_size);
+                const status = WindowsApi.NtAllocateVirtualMemoryEx(
+                    windows.GetCurrentProcess(),
+                    @ptrCast(&base),
+                    &host_size,
+                    .{
+                        .COMMIT = true,
+                        .RESERVE = true,
+                        .REPLACE_PLACEHOLDER = true,
+                    },
+                    page,
+                    null,
+                    0,
+                );
+                if (status != .SUCCESS or @intFromPtr(base) != cursor) {
+                    if (cursor > address) hostDecommit(address, cursor - address) catch {};
+                    return Error.HostCommitFailed;
+                }
+            }
         },
         .linux, .macos => hostProtect(address, size, protection) catch
             return Error.HostCommitFailed,
@@ -762,29 +928,213 @@ fn hostCommit(address: u64, size: u64, protection: Protection) Error!void {
 }
 
 fn hostProtect(address: u64, size: u64, protection: Protection) Error!void {
-    const pointer: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(address);
-    std.process.protectMemory(pointer[0..@intCast(size)], protection.host()) catch
-        return Error.ProtectionDenied;
+    switch (builtin.os.tag) {
+        .windows => {
+            var cursor = address;
+            while (cursor < address + size) : (cursor += page_size) {
+                const pointer: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(cursor);
+                std.process.protectMemory(
+                    pointer[0..@intCast(page_size)],
+                    protection.host(),
+                ) catch return Error.ProtectionDenied;
+            }
+        },
+        .linux, .macos => {
+            const pointer: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(address);
+            std.process.protectMemory(pointer[0..@intCast(size)], protection.host()) catch
+                return Error.ProtectionDenied;
+        },
+        else => return Error.UnsupportedHost,
+    }
 }
 
 fn hostDecommit(address: u64, size: u64) Error!void {
     switch (builtin.os.tag) {
         .windows => {
             const windows = std.os.windows;
-            var base: ?*anyopaque = @ptrFromInt(address);
-            var host_size: windows.SIZE_T = @intCast(size);
-            const status = windows.ntdll.NtFreeVirtualMemory(
-                windows.GetCurrentProcess(),
-                @ptrCast(&base),
-                &host_size,
-                .{ .DECOMMIT = true },
-            );
-            if (status != .SUCCESS) return Error.HostDecommitFailed;
+            var cursor = address;
+            while (cursor < address + size) : (cursor += page_size) {
+                var base: ?*anyopaque = @ptrFromInt(cursor);
+                var host_size: windows.SIZE_T = @intCast(page_size);
+                const status = windows.ntdll.NtFreeVirtualMemory(
+                    windows.GetCurrentProcess(),
+                    @ptrCast(&base),
+                    &host_size,
+                    .{ .RELEASE = true, .PRESERVE_PLACEHOLDER = true },
+                );
+                if (status != .SUCCESS) return Error.HostDecommitFailed;
+            }
         },
         .linux, .macos => {
             hostProtect(address, size, .none) catch return Error.HostDecommitFailed;
             const pointer: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(address);
             std.posix.madvise(pointer, @intCast(size), std.posix.MADV.DONTNEED) catch {};
+        },
+        else => return Error.UnsupportedHost,
+    }
+}
+
+/// Splits one Windows placeholder into 16 KiB pieces for a mapping. Keeping the
+/// host allocation boundaries equal to guest pages makes partial unmaps and
+/// permission changes safe even for section views.
+fn hostPreparePagePlaceholders(free: Range, address: u64, size: u64) Error!void {
+    if (builtin.os.tag != .windows) return;
+
+    try hostCoalescePlaceholder(free);
+    if (address > free.start) try hostSplitPlaceholder(free.start, address - free.start);
+
+    var cursor = address;
+    const end = address + size;
+    while (cursor < end) : (cursor += page_size) {
+        if (cursor + page_size < free.end) {
+            try hostSplitPlaceholder(cursor, page_size);
+        }
+    }
+}
+
+fn hostSplitPlaceholder(address: u64, size: u64) Error!void {
+    if (builtin.os.tag != .windows) return;
+    var base: ?*anyopaque = @ptrFromInt(address);
+    var host_size: std.os.windows.SIZE_T = @intCast(size);
+    const status = std.os.windows.ntdll.NtFreeVirtualMemory(
+        std.os.windows.GetCurrentProcess(),
+        @ptrCast(&base),
+        &host_size,
+        .{ .RELEASE = true, .PRESERVE_PLACEHOLDER = true },
+    );
+    if (status != .SUCCESS) return Error.HostCommitFailed;
+}
+
+/// Joins adjacent Windows placeholders after pages are unmapped. VirtualQuery
+/// avoids issuing MEM_COALESCE_PLACEHOLDERS when the range is already one
+/// placeholder, which Windows reports as an invalid request.
+fn hostCoalescePlaceholder(range: Range) Error!void {
+    if (builtin.os.tag != .windows or range.len() == 0) return;
+
+    var info: WindowsMemoryInfo = undefined;
+    if (windowsVirtualQuery(range.start, &info) == 0) return Error.HostDecommitFailed;
+    const allocation_start = @intFromPtr(info.allocation_base);
+    if (allocation_start == range.start and info.region_size >= range.len()) return;
+
+    var base: ?*anyopaque = @ptrFromInt(range.start);
+    var size: std.os.windows.SIZE_T = @intCast(range.len());
+    const status = std.os.windows.ntdll.NtFreeVirtualMemory(
+        std.os.windows.GetCurrentProcess(),
+        @ptrCast(&base),
+        &size,
+        .{ .RELEASE = true, .COALESCE_PLACEHOLDERS = true },
+    );
+    if (status != .SUCCESS) return Error.HostDecommitFailed;
+}
+
+fn hostMapBacking(
+    backing: *const SharedBacking,
+    address: u64,
+    size: u64,
+    offset: u64,
+    protection: Protection,
+) Error!void {
+    switch (builtin.os.tag) {
+        .windows => {
+            const windows = std.os.windows;
+            const page = windows.PAGE.fromProtection(protection.host()) orelse
+                return Error.ProtectionDenied;
+            var cursor = address;
+            while (cursor < address + size) : (cursor += page_size) {
+                const page_offset = offset + (cursor - address);
+                var base: ?*anyopaque = @ptrFromInt(cursor);
+                var section_offset: windows.LARGE_INTEGER = @intCast(page_offset);
+                var view_size: windows.SIZE_T = @intCast(page_size);
+                const status = WindowsApi.NtMapViewOfSectionEx(
+                    backing.handle,
+                    windows.GetCurrentProcess(),
+                    @ptrCast(&base),
+                    &section_offset,
+                    &view_size,
+                    .{ .REPLACE_PLACEHOLDER = true },
+                    page,
+                    null,
+                    0,
+                );
+                if (status != .SUCCESS or @intFromPtr(base) != cursor) {
+                    if (cursor > address) hostUnmapBacking(address, cursor - address) catch {};
+                    return Error.HostCommitFailed;
+                }
+
+                var commit_base = base;
+                var commit_size: windows.SIZE_T = @intCast(page_size);
+                const commit_status = WindowsApi.NtAllocateVirtualMemoryEx(
+                    windows.GetCurrentProcess(),
+                    @ptrCast(&commit_base),
+                    &commit_size,
+                    .{ .COMMIT = true },
+                    page,
+                    null,
+                    0,
+                );
+                if (commit_status != .SUCCESS or @intFromPtr(commit_base) != cursor) {
+                    _ = windows.ntdll.NtUnmapViewOfSectionEx(
+                        windows.GetCurrentProcess(),
+                        base.?,
+                        .{ .PRESERVE_PLACEHOLDER = true },
+                    );
+                    if (cursor > address) hostUnmapBacking(address, cursor - address) catch {};
+                    return Error.HostCommitFailed;
+                }
+            }
+        },
+        .linux, .macos => {
+            const pointer: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(address);
+            const mapped = std.posix.mmap(
+                pointer,
+                @intCast(size),
+                .{
+                    .READ = protection.read or protection.write,
+                    .WRITE = protection.write,
+                    .EXEC = protection.execute,
+                },
+                .{ .TYPE = .SHARED, .FIXED = true },
+                backing.handle,
+                @intCast(offset),
+            ) catch return Error.HostCommitFailed;
+            if (@intFromPtr(mapped.ptr) != address) {
+                std.posix.munmap(mapped);
+                return Error.HostCommitFailed;
+            }
+        },
+        else => return Error.UnsupportedHost,
+    }
+}
+
+fn hostUnmapBacking(address: u64, size: u64) Error!void {
+    switch (builtin.os.tag) {
+        .windows => {
+            var cursor = address;
+            while (cursor < address + size) : (cursor += page_size) {
+                const status = std.os.windows.ntdll.NtUnmapViewOfSectionEx(
+                    std.os.windows.GetCurrentProcess(),
+                    @ptrFromInt(cursor),
+                    .{ .PRESERVE_PLACEHOLDER = true },
+                );
+                if (status != .SUCCESS) return Error.HostDecommitFailed;
+            }
+        },
+        .linux, .macos => {
+            const pointer: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(address);
+            const mapped = std.posix.mmap(
+                pointer,
+                @intCast(size),
+                .{},
+                .{
+                    .TYPE = .PRIVATE,
+                    .ANONYMOUS = true,
+                    .NORESERVE = true,
+                    .FIXED = true,
+                },
+                -1,
+                0,
+            ) catch return Error.HostDecommitFailed;
+            if (@intFromPtr(mapped.ptr) != address) return Error.HostDecommitFailed;
         },
         else => return Error.UnsupportedHost,
     }
@@ -833,4 +1183,27 @@ test "automatic mappings use aligned first fit in the requested area" {
     try testing.expectEqual(@as(u64, 0), first % alignment);
     try testing.expectEqual(@as(u64, 0), second % alignment);
     try testing.expect(second >= first + alignment);
+}
+
+test "direct-memory aliases share one sparse backing store" {
+    var space = try AddressSpace.initWithDirectMemory(testing.allocator, 4 * page_size);
+    defer space.deinit();
+
+    const first = user.start;
+    const second = user.start + 2 * page_size;
+    try space.mapFixed(first, 2 * page_size, .read_write, .direct_memory, 0);
+    try space.mapFixed(second, page_size, .read_write, .direct_memory, 0);
+
+    try space.write(first, "coherent");
+    var output: [8]u8 = undefined;
+    try space.read(second, &output);
+    try testing.expectEqualStrings("coherent", &output);
+
+    // Removing one view must neither discard the physical page nor disturb a
+    // second alias that still refers to it.
+    try space.unmap(first, page_size);
+    try testing.expect(!space.isMapped(first, page_size));
+    try testing.expect(space.isMappedAs(first + page_size, page_size, .direct_memory));
+    try space.read(second, &output);
+    try testing.expectEqualStrings("coherent", &output);
 }

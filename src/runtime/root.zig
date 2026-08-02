@@ -33,7 +33,10 @@ pub const Runtime = struct {
     pub fn init(self: *Runtime, allocator: std.mem.Allocator) Error!void {
         if (self.initialized or self.address_space != null) return Error.AlreadyInitialized;
         self.allocator = allocator;
-        self.address_space = try memory.AddressSpace.init(allocator);
+        self.address_space = try memory.AddressSpace.initWithDirectMemory(
+            allocator,
+            hle.libs.kernel_memory.direct_memory_size,
+        );
         errdefer {
             if (self.address_space) |*space| space.deinit();
             self.address_space = null;
