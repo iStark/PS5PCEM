@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+
 //! The dynamic linking tables of a guest module.
 //!
 //! Two things make these different from a conventional ELF and are the reason

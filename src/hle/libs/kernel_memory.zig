@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+
 //! Direct memory management from `libkernel`.
 //!
 //! "Direct memory" is the guest's name for physical video memory. A title

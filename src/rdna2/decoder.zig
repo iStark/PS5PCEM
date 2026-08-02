@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+
 //! Whole-shader parsing: family dispatch and end-of-program detection.
 
 const std = @import("std");

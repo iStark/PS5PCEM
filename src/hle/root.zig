@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+
 //! hle — high-level emulation of the guest firmware.
 //!
 //! Guest binaries do not carry the firmware they call into; they import it by

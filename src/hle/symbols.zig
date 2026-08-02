@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+
 //! The registry the dynamic linker resolves guest imports against.
 //!
 //! A guest import is not just an identifier. The same identifier can be exported

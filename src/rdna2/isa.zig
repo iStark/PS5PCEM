@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+
 //! RDNA2 instruction set, limited to what the scalar (SOP*) families need.
 //!
 //! `Opcode` variant names match assembler mnemonics, so `@tagName` replaces the

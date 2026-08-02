@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+
 //! ELF64 parsing for guest modules.
 //!
 //! Guest executables are ELF64 for x86-64 with vendor extensions: object types

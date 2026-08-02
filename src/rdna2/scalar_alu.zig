@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+
 //! Decoding of the RDNA2 scalar families: SOP1, SOP2, SOPK, SOPC, SOPP.
 //!
 //! The opcode-to-mnemonic tables are expanded into direct-index arrays at

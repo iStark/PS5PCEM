@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+
 //! rdna2 — a disassembler for RDNA2 scalar instructions.
 //!
 //! Implements the SOP1/SOP2/SOPK/SOPC/SOPP families; the vector and memory

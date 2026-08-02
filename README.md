@@ -1,6 +1,6 @@
 # PS5 emulation components
 
-Building blocks for PlayStation 5 emulation, written in Zig. Two independent
+Building blocks for PlayStation 5 emulation, written in Zig. Three independent
 modules, each usable on its own:
 
 | Module | What it does |
@@ -11,6 +11,48 @@ modules, each usable on its own:
 
 None of them depends on anything beyond the Zig standard library, and all
 cross-compile to Windows, Linux, and macOS from any of them.
+
+Two command-line tools come with them:
+
+```sh
+zig build run         -- shader.bin    # disassemble a shader
+zig build module-info -- module.elf    # inspect a guest module
+```
+
+`module-info` is where the pieces meet. It reads a module, works out every
+symbol the module imports, and checks each one against the firmware registry:
+
+```
+sample_module.elf
+  type          sce_dynexec
+  entry         0x1000
+  module        sample_app v1.0
+
+segments (2 loadable)
+  0x000000001000 size 0x2000     r-x
+  0x000000003000 size 0x1000     rw-
+
+needed modules
+  [B] libkernel v1.1
+
+imported libraries
+  [A] libkernel v1
+
+imports (4)
+  ok   rTXw65xmLIA  libkernel  jump_slot
+  ok   pO96TwzOm5E  libkernel  jump_slot
+  MISS 1jfXLRVzisc  libkernel  jump_slot
+  MISS 6UgtwV+0zb4  libkernel  jump_slot
+
+2/4 imports provided
+1 relocations reference no symbol
+```
+
+The gap between what a module asks for and what exists is the work remaining
+before it can run — a more honest measure than any aggregate progress figure.
+A `~` instead of `ok` means the symbol matched on identifier alone, because the
+module named a library the registry does not know; it may well be the wrong
+implementation.
 
 ---
 
@@ -213,6 +255,9 @@ bits, version below it, and a string table offset in the low 32.
 | [src/loader/elf.zig](src/loader/elf.zig) | Header and program headers, validation, segment lookup |
 | [src/loader/dynamic.zig](src/loader/dynamic.zig) | Dynamic entries, module and library declarations, symbol names |
 | [src/loader/ids.zig](src/loader/ids.zig) | Library and module code encoding |
+| [src/loader/symbols.zig](src/loader/symbols.zig) | The dynamic symbol table |
+| [src/loader/relocations.zig](src/loader/relocations.zig) | Relocation entries and their types |
+| [src/loader/imports.zig](src/loader/imports.zig) | Walks all of the above into a list of imports |
 
 Validation is deliberately strict — a module that fails these checks is not
 something to load with best effort, since proceeding means interpreting whatever
@@ -220,11 +265,28 @@ follows as code. Malformed names are rejected rather than guessed at: a bare
 identifier with no library code would otherwise resolve against an arbitrary
 library.
 
+## Collecting imports
+
+`imports.collect` is where the tables come together. A relocation names a symbol
+index; the symbol names a string; the string carries an identifier plus the two
+codes; and the codes only mean anything against the module's own declarations.
+Four structures have to be read to learn one fact.
+
+Some distinctions the walk preserves, because they change what a caller must do:
+
+- **Relocations without a symbol** — a `RELATIVE` entry adjusts an address by
+  the load bias and imports nothing. Counted, not listed.
+- **Symbols the module defines itself** — skipped; only undefined ones have to
+  come from outside.
+- **Imports whose codes match no declaration** — still reported, with the raw
+  codes retained. Dropping them would hide why a module fails to load.
+- **Malformed symbol names** — counted and stepped over. One bad entry should
+  not make the rest of a module unreadable.
+
 ## Not yet implemented
 
-Relocations and the symbol table itself are located but not walked, so nothing
-is resolved yet. That is the next step, and it is what connects this module to
-the firmware registry below.
+Nothing is written back. Applying a relocation means storing an address into the
+mapped image, which needs a guest address space that does not exist yet.
 
 ---
 
@@ -279,6 +341,12 @@ Omitting it on Windows still compiles — it just reads arguments from the wrong
 registers, surfacing later as nonsensical parameter values. Routing the decision
 through [src/hle/abi.zig](src/hle/abi.zig) keeps it in one place.
 
+Off x86-64 that convention is not expressible at all, and guest code could not
+run there anyway: guest binaries are x86-64 machine code executed natively, not
+interpreted. Such builds fall back to the host default so the tooling still
+compiles, and `abi.can_run_guest_code` records that nothing there is actually
+callable from a guest.
+
 ## Implemented libraries
 
 **`libkernel` — direct memory** ([src/hle/libs/kernel_memory.zig](src/hle/libs/kernel_memory.zig))
@@ -312,9 +380,40 @@ from leaking into host code where nothing would check it.
 
 ## Roadmap
 
-1. Walk the symbol and relocation tables the loader locates, and resolve real
-   imports against this registry.
-2. Virtual memory: `sceKernelMapDirectMemory` and the flexible-memory calls,
-   which need a guest address space.
+1. A guest address space, so segments can be placed and relocations applied.
+   Everything below is blocked on it.
+2. Virtual memory: `sceKernelMapDirectMemory` and the flexible-memory calls.
 3. Threading: the `pthread_*` and `scePthread*` families.
 4. Event queues, on which most firmware asynchrony is built.
+
+---
+
+# License
+
+Copyright (C) 2026 Artur Strazewicz
+
+Licensed under the **GNU General Public License, version 3 or later**. The full
+text is in [LICENSE](LICENSE).
+
+What this means in practice, for anyone building on this:
+
+- **Attribution is required.** Copyright notices and license headers must be
+  preserved. Every source file carries an `SPDX-License-Identifier` line and a
+  copyright line; those stay.
+- **Derived work stays open.** If you distribute a modified version, or anything
+  that incorporates this code, you must release its complete source under the
+  same license. Shipping a binary built from modified sources without publishing
+  those sources is not permitted.
+- Changes must be marked as yours, so users can tell modified versions from the
+  original.
+
+There is no warranty; see sections 15 and 16 of the license.
+
+## Legal note
+
+This project emulates firmware interfaces. It ships no console firmware, no
+system libraries, and no copyrighted material belonging to the hardware vendor,
+and it neither circumvents nor assists in circumventing any protection measure.
+It is intended for interoperability research and education. Supplying the
+software a module needs in order to run is your responsibility, and whether you
+may lawfully do so depends on where you are.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+
 //! Library and module identifiers used inside a guest module.
 //!
 //! A module's dynamic tables declare the libraries and modules it imports from,

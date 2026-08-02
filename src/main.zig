@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+
 //! CLI disassembler: reads a binary RDNA2 shader and prints the decoded code.
 
 const std = @import("std");

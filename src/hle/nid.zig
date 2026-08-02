@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+
 //! Numeric IDs (NIDs) that identify exported firmware symbols.
 //!
 //! Guest modules do not import functions by name. Each import is an 11-character

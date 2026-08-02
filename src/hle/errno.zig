@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+
 //! Error codes returned by firmware entry points.
 //!
 //! Two numbering schemes coexist in the guest ABI and a lot of confusion comes
