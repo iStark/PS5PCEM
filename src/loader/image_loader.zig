@@ -131,7 +131,7 @@ pub fn load(
         }
 
         // Validate the file range before committing any host pages.
-        _ = try header.fileRange(image.bytes);
+        _ = try image.fileRange(header);
 
         const address = std.math.add(u64, options.load_bias, header.vaddr) catch
             return Error.AddressOverflow;
@@ -230,7 +230,7 @@ pub fn load(
     // Anonymous committed pages start at zero, so copying filesz bytes also
     // gives every memsz-filesz tail the ELF-required zero fill.
     for (plans.items) |plan| {
-        const file_bytes = try plan.header.fileRange(image.bytes);
+        const file_bytes = try image.fileRange(plan.header);
         if (file_bytes.len != 0) try address_space.write(plan.address, file_bytes);
     }
 

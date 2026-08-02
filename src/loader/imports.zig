@@ -78,15 +78,6 @@ pub const Imports = struct {
     }
 };
 
-/// Slices a table out of the dynamic-data segment, given an offset and size.
-fn slice(data: []const u8, offset: ?u64, size: ?u64) Error![]const u8 {
-    const start = offset orelse return &.{};
-    const len = size orelse return &.{};
-    const end = std.math.add(u64, start, len) catch return Error.MalformedTable;
-    if (end > data.len) return Error.MalformedTable;
-    return data[@intCast(start)..@intCast(end)];
-}
-
 /// Reads a NUL-terminated string from the string table.
 fn readString(strings: []const u8, offset: u32) Error![]const u8 {
     if (offset >= strings.len) return dynamic.Error.BadStringOffset;
@@ -151,16 +142,14 @@ pub fn collect(
     image: elf.Image,
     info: *const dynamic.DynamicInfo,
 ) (Error || std.mem.Allocator.Error)!Imports {
-    const data = (try image.dynlibData()) orelse return .{};
-
-    const strings = try slice(data, info.strtab_offset, info.strtab_size);
-    const symtab_bytes = try slice(data, info.symtab_offset, info.symtab_size);
+    const strings = try info.tableData(image, info.strtab_offset, info.strtab_size);
+    const symtab_bytes = try info.tableData(image, info.symtab_offset, info.symtab_size);
     const symtab = try symbols.Table.init(symtab_bytes);
 
     var out = Imports{};
     errdefer out.deinit(gpa);
 
-    const general = try slice(data, info.rela_offset, info.rela_size);
+    const general = try info.tableData(image, info.rela_offset, info.rela_size);
     if (general.len != 0) {
         try collectFrom(
             gpa,
@@ -172,7 +161,7 @@ pub fn collect(
         );
     }
 
-    const plt = try slice(data, info.jmprel_offset, info.jmprel_size);
+    const plt = try info.tableData(image, info.jmprel_offset, info.jmprel_size);
     if (plt.len != 0) {
         try collectFrom(
             gpa,

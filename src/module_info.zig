@@ -14,10 +14,10 @@ const loader = @import("loader");
 const hle = @import("hle");
 
 const usage =
-    \\module-info <module.elf>
+    \\module-info <module>
     \\
-    \\Prints a guest module's identity, its dependencies, and every symbol it
-    \\imports, marking which ones the firmware emulation provides.
+    \\Prints a bare ELF or decrypted PS5 SELF module's identity, dependencies,
+    \\and imports, marking which ones the firmware emulation provides.
     \\
 ;
 
@@ -110,6 +110,7 @@ pub fn main(init: std.process.Init) !void {
     const out = &stdout_writer.interface;
 
     try out.print("{s}\n", .{path});
+    try out.print("  container     {s}\n", .{if (image.isSelf()) "ps5_self" else "bare_elf"});
     try out.print("  type          {s}\n", .{@tagName(image.objectType())});
     try out.print("  entry         0x{x}\n", .{image.entryPoint()});
     if (info.module_info) |own| {

@@ -210,7 +210,7 @@ pub const Registry = struct {
         if (header.filesz > header.memsz) return Error.InvalidSegment;
         const alignment = if (header.@"align" == 0) 1 else header.@"align";
         if (!std.math.isPowerOfTwo(alignment)) return Error.InvalidSegment;
-        const initial_image = try header.fileRange(image.bytes);
+        const initial_image = try image.fileRange(header);
 
         var exports: std.ArrayList(Export) = .empty;
         defer exports.deinit(gpa);
@@ -353,11 +353,10 @@ fn collectExports(
     info: *const dynamic.DynamicInfo,
     tls_size: u64,
 ) Error!void {
-    const dynlib_data = (try image.dynlibData()) orelse return;
     if (info.symtab_offset == null and info.symtab_size == null) return;
-    const symbol_bytes = try tableSlice(dynlib_data, info.symtab_offset, info.symtab_size);
+    const symbol_bytes = try info.tableData(image, info.symtab_offset, info.symtab_size);
     const symbol_table = try symbols.Table.init(symbol_bytes);
-    const strings = try tableSlice(dynlib_data, info.strtab_offset, info.strtab_size);
+    const strings = try info.tableData(image, info.strtab_offset, info.strtab_size);
 
     for (symbol_table.entries) |symbol| {
         if (!symbol.isDefined() or symbol.symbolType() != .tls or symbol.name == 0) continue;
@@ -375,14 +374,6 @@ fn collectExports(
             .offset = symbol.value,
         });
     }
-}
-
-fn tableSlice(data: []const u8, offset: ?u64, size: ?u64) Error![]const u8 {
-    const start = offset orelse return Error.MalformedTable;
-    const len = size orelse return Error.MalformedTable;
-    const end = std.math.add(u64, start, len) catch return Error.MalformedTable;
-    if (end > data.len) return Error.MalformedTable;
-    return data[@intCast(start)..@intCast(end)];
 }
 
 fn readString(strings: []const u8, offset: u32) Error![]const u8 {

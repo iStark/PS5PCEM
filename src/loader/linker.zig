@@ -68,15 +68,14 @@ pub fn apply(
     resolver: ?Resolver,
     tls_module: ?tls.Module,
 ) Error!Stats {
-    const dynlib_data = (try image.dynlibData()) orelse return .{};
-    const symbol_bytes = try tableSlice(dynlib_data, info.symtab_offset, info.symtab_size);
+    const symbol_bytes = try info.tableData(image, info.symtab_offset, info.symtab_size);
     const symbol_table = try symbols.Table.init(symbol_bytes);
 
     var module_imports = try imports.collect(allocator, image, info);
     defer module_imports.deinit(allocator);
 
     var stats = Stats{};
-    const general_bytes = try tableSlice(dynlib_data, info.rela_offset, info.rela_size);
+    const general_bytes = try info.tableData(image, info.rela_offset, info.rela_size);
     if (general_bytes.len != 0) {
         try applyTable(
             address_space,
@@ -90,7 +89,7 @@ pub fn apply(
         );
     }
 
-    const plt_bytes = try tableSlice(dynlib_data, info.jmprel_offset, info.jmprel_size);
+    const plt_bytes = try info.tableData(image, info.jmprel_offset, info.jmprel_size);
     if (plt_bytes.len != 0) {
         try applyTable(
             address_space,
@@ -104,14 +103,6 @@ pub fn apply(
         );
     }
     return stats;
-}
-
-fn tableSlice(data: []const u8, offset: ?u64, size: ?u64) Error![]const u8 {
-    const start = offset orelse return &.{};
-    const len = size orelse return &.{};
-    const end = std.math.add(u64, start, len) catch return Error.MalformedTable;
-    if (end > data.len) return Error.MalformedTable;
-    return data[@intCast(start)..@intCast(end)];
 }
 
 fn applyTable(

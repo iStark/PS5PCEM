@@ -12,6 +12,7 @@
 //! buffer. Nothing here maps or executes anything.
 
 const std = @import("std");
+const self_container = @import("self.zig");
 
 pub const Error = error{
     /// Too short to contain the structure being read.
@@ -26,7 +27,7 @@ pub const Error = error{
     UnsupportedObjectType,
     /// A header field describes a range outside the file.
     MalformedHeader,
-};
+} || self_container.Error;
 
 pub const magic = [4]u8{ 0x7f, 'E', 'L', 'F' };
 
@@ -86,6 +87,10 @@ pub const SegmentType = enum(u32) {
     sce_procparam = 0x6100_0001,
     /// Region made read-only after relocation.
     sce_relro = 0x6100_0010,
+    /// Build provenance stored by newer PS5 toolchains.
+    sce_comment_ps5 = 0x6fff_ff00,
+    /// Dynamic linking data stored by newer PS5 toolchains.
+    sce_dynlibdata_ps5 = 0x6fff_ff01,
     _,
 };
 
@@ -154,9 +159,11 @@ comptime {
 
 /// A parsed module image. Borrows the buffer it was parsed from.
 pub const Image = struct {
+    /// Complete input file. For SELF images this includes the container header.
     bytes: []const u8,
     header: Header,
     program_headers: []align(1) const ProgramHeader,
+    self_layout: ?self_container.Layout = null,
 
     pub fn objectType(self: Image) ObjectType {
         return @enumFromInt(self.header.type);
@@ -164,6 +171,10 @@ pub const Image = struct {
 
     pub fn entryPoint(self: Image) u64 {
         return self.header.entry;
+    }
+
+    pub fn isSelf(self: Image) bool {
+        return self.self_layout != null;
     }
 
     /// First segment of the given type, or null.
@@ -176,14 +187,109 @@ pub const Image = struct {
 
     /// Contents of the segment holding the dynamic linking tables.
     pub fn dynlibData(self: Image) Error!?[]const u8 {
-        const ph = self.findSegment(.sce_dynlibdata) orelse return null;
-        return try ph.fileRange(self.bytes);
+        for (self.program_headers) |ph| {
+            const segment_type = ph.segmentType();
+            if (segment_type == .sce_dynlibdata or segment_type == .sce_dynlibdata_ps5) {
+                return try self.fileRange(ph);
+            }
+        }
+        return null;
     }
 
     /// Contents of the `PT_DYNAMIC` segment: the array of dynamic entries.
     pub fn dynamicData(self: Image) Error!?[]const u8 {
         const ph = self.findSegment(.dynamic) orelse return null;
-        return try ph.fileRange(self.bytes);
+        return try self.fileRange(ph);
+    }
+
+    /// Resolves one program header's logical file range to its stored bytes.
+    ///
+    /// Bare ELF images use `p_offset` directly. SELF images translate through
+    /// the container segment whose program-header id covers the requested
+    /// logical range.
+    pub fn fileRange(self: Image, ph: ProgramHeader) Error![]const u8 {
+        if (self.self_layout == null) return ph.fileRange(self.bytes);
+        return self.logicalFileRange(ph.offset, ph.filesz);
+    }
+
+    /// Resolves a file-backed guest virtual-address range.
+    pub fn virtualRange(self: Image, address: u64, size: u64) Error![]const u8 {
+        const requested_end = std.math.add(u64, address, size) catch
+            return Error.MalformedHeader;
+
+        for (self.program_headers) |ph| {
+            if (ph.segmentType() != .load) continue;
+            const segment_end = std.math.add(u64, ph.vaddr, ph.filesz) catch
+                return Error.MalformedHeader;
+            if (address < ph.vaddr or requested_end > segment_end) continue;
+
+            const delta = address - ph.vaddr;
+            const logical_offset = std.math.add(u64, ph.offset, delta) catch
+                return Error.MalformedHeader;
+            return self.logicalFileRange(logical_offset, size);
+        }
+        return Error.MalformedHeader;
+    }
+
+    fn logicalFileRange(self: Image, offset: u64, size: u64) Error![]const u8 {
+        const requested_end = std.math.add(u64, offset, size) catch
+            return Error.MalformedHeader;
+        if (size == 0) return self.bytes[0..0];
+
+        const layout = self.self_layout orelse {
+            if (requested_end > self.bytes.len) return Error.MalformedHeader;
+            return self.bytes[@intCast(offset)..@intCast(requested_end)];
+        };
+
+        // Ordinary SELF-backed ranges, including PT_DYNAMIC and PT_TLS views
+        // nested inside a mapped PT_LOAD segment.
+        for (layout.segments) |segment| {
+            if (!segment.isBlocked()) continue;
+            const ph = self.program_headers[segment.programHeaderIndex()];
+            const ph_end = std.math.add(u64, ph.offset, ph.filesz) catch
+                return Error.MalformedSelf;
+            if (offset < ph.offset or requested_end > ph_end) continue;
+
+            const delta = offset - ph.offset;
+            const physical = std.math.add(u64, segment.offset, delta) catch
+                return Error.MalformedSelf;
+            return self.physicalRange(physical, size);
+        }
+
+        // Some decrypted PS5 images append PT_SCE_DYNLIBDATA directly after
+        // the last blocked payload without giving it a SELF entry. Logical
+        // NOTE segments and alignment gaps between them are not stored, so the
+        // ELF offset delta must deliberately not be carried into this mapping.
+        var is_unlisted_dynlib = false;
+        for (self.program_headers) |ph| {
+            if (ph.segmentType() == .sce_dynlibdata_ps5 and
+                ph.offset == offset and ph.filesz == size)
+            {
+                is_unlisted_dynlib = true;
+                break;
+            }
+        }
+        if (!is_unlisted_dynlib) return Error.MalformedSelf;
+
+        var last_physical_end: u64 = 0;
+        var have_tail = false;
+        for (layout.segments) |segment| {
+            if (!segment.isBlocked()) continue;
+            const physical = std.math.add(u64, segment.offset, segment.decompressed_size) catch
+                return Error.MalformedSelf;
+            if (!have_tail or physical > last_physical_end) {
+                last_physical_end = physical;
+                have_tail = true;
+            }
+        }
+        if (!have_tail) return Error.MalformedSelf;
+        return self.physicalRange(last_physical_end, size);
+    }
+
+    fn physicalRange(self: Image, offset: u64, size: u64) Error![]const u8 {
+        const end = std.math.add(u64, offset, size) catch return Error.MalformedSelf;
+        if (end > self.bytes.len) return Error.TruncatedSelf;
+        return self.bytes[@intCast(offset)..@intCast(end)];
     }
 
     /// Segments that occupy address space at load time.
@@ -217,7 +323,9 @@ fn readAt(comptime T: type, bytes: []const u8, offset: usize) Error!T {
 /// not something to load with best effort — proceeding would mean interpreting
 /// whatever follows as code.
 pub fn parse(bytes: []const u8) Error!Image {
-    const header = try readAt(Header, bytes, 0);
+    const self_layout = try self_container.parse(bytes);
+    const elf_bytes = if (self_layout) |layout| bytes[layout.elf_offset..] else bytes;
+    const header = try readAt(Header, elf_bytes, 0);
 
     if (!std.mem.eql(u8, header.ident[0..4], &magic)) return Error.NotElf;
     if (header.ident[ei_class] != elfclass64) return Error.UnsupportedFormat;
@@ -234,18 +342,30 @@ pub fn parse(bytes: []const u8) Error!Image {
         return Error.MalformedHeader;
     const table_end = std.math.add(u64, header.phoff, table_size) catch
         return Error.MalformedHeader;
-    if (table_end > bytes.len) return Error.MalformedHeader;
+    if (table_end > elf_bytes.len) return Error.MalformedHeader;
 
     const start: usize = @intCast(header.phoff);
     const program_headers = std.mem.bytesAsSlice(
         ProgramHeader,
-        bytes[start..@intCast(table_end)],
+        elf_bytes[start..@intCast(table_end)],
     );
+
+    if (self_layout) |layout| {
+        for (layout.segments) |segment| {
+            if (!segment.isBlocked()) continue;
+            const index = segment.programHeaderIndex();
+            if (index >= program_headers.len) return Error.MalformedSelf;
+            if (segment.decompressed_size != program_headers[index].filesz) {
+                return Error.MalformedSelf;
+            }
+        }
+    }
 
     return .{
         .bytes = bytes,
         .header = header,
         .program_headers = program_headers,
+        .self_layout = self_layout,
     };
 }
 
@@ -446,5 +566,137 @@ test "load segments are collected and flags decoded" {
     try testing.expect(data.readable and data.writable and !data.executable);
     // The zero-filled tail is not backed by file content.
     try testing.expect(loads[1].memsz > loads[1].filesz);
-    try testing.expectEqual(@as(usize, 4), (try loads[1].fileRange(parsed.bytes)).len);
+    try testing.expectEqual(@as(usize, 4), (try parsed.fileRange(loads[1])).len);
+}
+
+test "decrypted SELF maps logical program offsets to physical segments" {
+    const payload = "guest code";
+    const logical_offset: u64 = 0x4000;
+    const physical_offset: usize = 0x200;
+
+    const ph = ProgramHeader{
+        .type = @intFromEnum(SegmentType.load),
+        .flags = 0x5,
+        .offset = logical_offset,
+        .vaddr = 0x1000,
+        .paddr = 0,
+        .filesz = payload.len,
+        .memsz = payload.len,
+        .@"align" = 0x4000,
+    };
+
+    var elf_header = std.mem.zeroes(Header);
+    @memcpy(elf_header.ident[0..4], &magic);
+    elf_header.ident[ei_class] = elfclass64;
+    elf_header.ident[ei_data] = elfdata2lsb;
+    elf_header.ident[ei_version] = ev_current;
+    elf_header.type = @intFromEnum(ObjectType.sce_dynexec);
+    elf_header.machine = em_x86_64;
+    elf_header.version = ev_current;
+    elf_header.entry = 0x1000;
+    elf_header.ehsize = @sizeOf(Header);
+    elf_header.phoff = @sizeOf(Header);
+    elf_header.phentsize = @sizeOf(ProgramHeader);
+    elf_header.phnum = 1;
+
+    var self_header = std.mem.zeroes(self_container.Header);
+    @memcpy(self_header.ident[0..4], &self_container.magic);
+    self_header.ident[5] = 1;
+    self_header.ident[6] = 1;
+    self_header.ident[7] = 0x12;
+    self_header.segment_count = 1;
+    const self_segment = self_container.Segment{
+        .type = 0x800,
+        .offset = physical_offset,
+        .compressed_size = payload.len,
+        .decompressed_size = payload.len,
+    };
+
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(testing.allocator);
+    try bytes.appendSlice(testing.allocator, std.mem.asBytes(&self_header));
+    try bytes.appendSlice(testing.allocator, std.mem.asBytes(&self_segment));
+    try bytes.appendSlice(testing.allocator, std.mem.asBytes(&elf_header));
+    try bytes.appendSlice(testing.allocator, std.mem.asBytes(&ph));
+    try bytes.appendNTimes(testing.allocator, 0, physical_offset - bytes.items.len);
+    try bytes.appendSlice(testing.allocator, payload);
+
+    const image = try parse(bytes.items);
+    try testing.expect(image.isSelf());
+    try testing.expectEqualStrings(payload, try image.fileRange(image.program_headers[0]));
+    try testing.expectEqualStrings(payload, try image.virtualRange(0x1000, payload.len));
+
+    var bad_id = try testing.allocator.dupe(u8, bytes.items);
+    defer testing.allocator.free(bad_id);
+    std.mem.writeInt(u64, bad_id[32..40], 0x800 | (@as(u64, 1) << 20), .little);
+    try testing.expectError(Error.MalformedSelf, parse(bad_id));
+}
+
+test "SELF resolves an unlisted dynlib-data tail after logical padding" {
+    const comment = "PATH";
+    const dynlib = "TABLE";
+    const padding = 3;
+    const physical_offset: usize = 0x200;
+    const logical_offset: u64 = 0x8000;
+    const segments = [_]ProgramHeader{
+        .{
+            .type = @intFromEnum(SegmentType.sce_comment_ps5),
+            .flags = 0,
+            .offset = logical_offset,
+            .vaddr = 0,
+            .paddr = 0,
+            .filesz = comment.len,
+            .memsz = 0,
+            .@"align" = 1,
+        },
+        .{
+            .type = @intFromEnum(SegmentType.sce_dynlibdata_ps5),
+            .flags = 0,
+            .offset = logical_offset + comment.len + padding,
+            .vaddr = 0,
+            .paddr = 0,
+            .filesz = dynlib.len,
+            .memsz = dynlib.len,
+            .@"align" = 1,
+        },
+    };
+
+    var elf_header = std.mem.zeroes(Header);
+    @memcpy(elf_header.ident[0..4], &magic);
+    elf_header.ident[ei_class] = elfclass64;
+    elf_header.ident[ei_data] = elfdata2lsb;
+    elf_header.ident[ei_version] = ev_current;
+    elf_header.type = @intFromEnum(ObjectType.sce_dynexec);
+    elf_header.machine = em_x86_64;
+    elf_header.version = ev_current;
+    elf_header.ehsize = @sizeOf(Header);
+    elf_header.phoff = @sizeOf(Header);
+    elf_header.phentsize = @sizeOf(ProgramHeader);
+    elf_header.phnum = segments.len;
+
+    var self_header = std.mem.zeroes(self_container.Header);
+    @memcpy(self_header.ident[0..4], &self_container.magic);
+    self_header.ident[5] = 1;
+    self_header.ident[6] = 1;
+    self_header.ident[7] = 0x12;
+    self_header.segment_count = 1;
+    const self_segment = self_container.Segment{
+        .type = 0x800,
+        .offset = physical_offset,
+        .compressed_size = comment.len,
+        .decompressed_size = comment.len,
+    };
+
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(testing.allocator);
+    try bytes.appendSlice(testing.allocator, std.mem.asBytes(&self_header));
+    try bytes.appendSlice(testing.allocator, std.mem.asBytes(&self_segment));
+    try bytes.appendSlice(testing.allocator, std.mem.asBytes(&elf_header));
+    for (segments) |segment| try bytes.appendSlice(testing.allocator, std.mem.asBytes(&segment));
+    try bytes.appendNTimes(testing.allocator, 0, physical_offset - bytes.items.len);
+    try bytes.appendSlice(testing.allocator, comment);
+    try bytes.appendSlice(testing.allocator, dynlib);
+
+    const image = try parse(bytes.items);
+    try testing.expectEqualStrings(dynlib, (try image.dynlibData()).?);
 }

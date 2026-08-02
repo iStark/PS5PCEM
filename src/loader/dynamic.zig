@@ -30,16 +30,27 @@ pub const Error = error{
 
 /// Dynamic entry tags.
 ///
-/// Standard tags keep their usual values; the vendor tags in the `0x6100_00xx`
-/// range replace the standard ones for everything that would otherwise be a
-/// virtual address, because these tables are not mapped.
+/// Standard tags keep their usual values. Older modules replace address-bearing
+/// tags with vendor tags in the `0x6100_00xx` range because their tables are not
+/// mapped; newer PS5 modules retain standard virtual-address tags.
 pub const Tag = enum(i64) {
     null = 0,
     needed = 1,
+    pltrelsz = 2,
+    pltgot = 3,
+    hash = 4,
+    strtab = 5,
+    symtab = 6,
+    rela = 7,
+    relasz = 8,
+    relaent = 9,
+    strsz = 10,
+    syment = 11,
     init = 12,
     fini = 13,
     soname = 14,
     debug = 21,
+    jmprel = 23,
     init_array = 25,
     fini_array = 26,
     init_arraysz = 27,
@@ -207,7 +218,10 @@ pub const DynamicInfo = struct {
     import_libraries: std.ArrayList(LibraryDecl) = .empty,
     export_libraries: std.ArrayList(LibraryDecl) = .empty,
 
-    /// Offsets within the dynamic-data segment, not virtual addresses.
+    /// How the table locations below are interpreted.
+    table_addressing: TableAddressing = .dynlib_offset,
+    /// Offsets within PT_SCE_DYNLIBDATA, or guest virtual addresses when
+    /// `table_addressing` is `virtual_address`.
     strtab_offset: ?u64 = null,
     strtab_size: ?u64 = null,
     symtab_offset: ?u64 = null,
@@ -259,29 +273,84 @@ pub const DynamicInfo = struct {
         }
         return null;
     }
+
+    /// Resolves one dynamic table using the layout selected while parsing.
+    pub fn tableData(
+        self: *const DynamicInfo,
+        image: elf.Image,
+        location: ?u64,
+        size: ?u64,
+    ) (error{MalformedTable} || elf.Error)![]const u8 {
+        const start = location orelse return &.{};
+        const len = size orelse return &.{};
+
+        return switch (self.table_addressing) {
+            .dynlib_offset => blk: {
+                const data = (try image.dynlibData()) orelse return &.{};
+                const end = std.math.add(u64, start, len) catch return error.MalformedTable;
+                if (end > data.len) return error.MalformedTable;
+                break :blk data[@intCast(start)..@intCast(end)];
+            },
+            .virtual_address => image.virtualRange(start, len) catch |err| switch (err) {
+                error.MalformedHeader => error.MalformedTable,
+                else => err,
+            },
+        };
+    }
 };
 
-/// Locates the string table inside the dynamic-data segment.
+pub const TableAddressing = enum {
+    /// Legacy modules store tables in an unmapped PT_SCE_DYNLIBDATA segment.
+    dynlib_offset,
+    /// Newer PS5 modules use standard dynamic tags containing mapped addresses.
+    virtual_address,
+};
+
+/// Locates either an offset-based or a mapped-address string table.
 ///
 /// Done in a first pass because library and module declarations resolve their
 /// names through it, and the entries that declare them can appear before the
 /// entry that locates the table.
-fn findStringTable(entries: []align(1) const Entry, dynlib_data: []const u8) Error![]const u8 {
-    var offset: ?u64 = null;
+const StringTable = struct {
+    bytes: []const u8,
+    addressing: TableAddressing,
+};
+
+fn findStringTable(
+    entries: []align(1) const Entry,
+    image: elf.Image,
+    dynlib_data: []const u8,
+) (Error || elf.Error)!StringTable {
+    var vendor_offset: ?u64 = null;
+    var virtual_address: ?u64 = null;
     var size: ?u64 = null;
     for (entries) |e| {
         switch (e.dynamicTag()) {
-            .sce_strtab => offset = e.value,
-            .sce_strsz => size = e.value,
+            .sce_strtab => vendor_offset = e.value,
+            .strtab => virtual_address = e.value,
+            .sce_strsz, .strsz => size = e.value,
             else => {},
         }
     }
 
-    const start = offset orelse return &.{};
-    const len = size orelse return Error.MalformedTable;
-    const end = std.math.add(u64, start, len) catch return Error.MalformedTable;
-    if (end > dynlib_data.len) return Error.MalformedTable;
-    return dynlib_data[@intCast(start)..@intCast(end)];
+    if (vendor_offset) |start| {
+        const len = size orelse return Error.MalformedTable;
+        const end = std.math.add(u64, start, len) catch return Error.MalformedTable;
+        if (end > dynlib_data.len) return Error.MalformedTable;
+        return .{
+            .bytes = dynlib_data[@intCast(start)..@intCast(end)],
+            .addressing = .dynlib_offset,
+        };
+    }
+    if (virtual_address) |address| {
+        const len = size orelse return Error.MalformedTable;
+        const bytes = image.virtualRange(address, len) catch |err| switch (err) {
+            error.MalformedHeader => return Error.MalformedTable,
+            else => return err,
+        };
+        return .{ .bytes = bytes, .addressing = .virtual_address };
+    }
+    return .{ .bytes = &.{}, .addressing = .dynlib_offset };
 }
 
 /// Parses the dynamic tables of an image.
@@ -292,9 +361,10 @@ pub fn parse(gpa: std.mem.Allocator, image: elf.Image) (Error || std.mem.Allocat
     if (dynamic_bytes.len % @sizeOf(Entry) != 0) return Error.MalformedTable;
     const entries = std.mem.bytesAsSlice(Entry, dynamic_bytes);
 
-    const strings = try findStringTable(entries, dynlib_data);
+    const string_table = try findStringTable(entries, image, dynlib_data);
+    const strings = string_table.bytes;
 
-    var info = DynamicInfo{};
+    var info = DynamicInfo{ .table_addressing = string_table.addressing };
     errdefer info.deinit(gpa);
 
     for (entries) |e| {
@@ -310,14 +380,34 @@ pub fn parse(gpa: std.mem.Allocator, image: elf.Image) (Error || std.mem.Allocat
         } else if (tag.isExportLib()) {
             try info.export_libraries.append(gpa, try LibraryDecl.parse(e.value, strings));
         } else switch (tag) {
-            .sce_strtab => info.strtab_offset = e.value,
-            .sce_strsz => info.strtab_size = e.value,
-            .sce_symtab => info.symtab_offset = e.value,
+            .sce_strtab => if (info.table_addressing == .dynlib_offset) {
+                info.strtab_offset = e.value;
+            },
+            .strtab => if (info.table_addressing == .virtual_address) {
+                info.strtab_offset = e.value;
+            },
+            .sce_strsz, .strsz => info.strtab_size = e.value,
+            .sce_symtab => if (info.table_addressing == .dynlib_offset) {
+                info.symtab_offset = e.value;
+            },
+            .symtab => if (info.table_addressing == .virtual_address) {
+                info.symtab_offset = e.value;
+            },
             .sce_symtabsz => info.symtab_size = e.value,
-            .sce_jmprel => info.jmprel_offset = e.value,
-            .sce_pltrelsz => info.jmprel_size = e.value,
-            .sce_rela => info.rela_offset = e.value,
-            .sce_relasz => info.rela_size = e.value,
+            .sce_jmprel => if (info.table_addressing == .dynlib_offset) {
+                info.jmprel_offset = e.value;
+            },
+            .jmprel => if (info.table_addressing == .virtual_address) {
+                info.jmprel_offset = e.value;
+            },
+            .sce_pltrelsz, .pltrelsz => info.jmprel_size = e.value,
+            .sce_rela => if (info.table_addressing == .dynlib_offset) {
+                info.rela_offset = e.value;
+            },
+            .rela => if (info.table_addressing == .virtual_address) {
+                info.rela_offset = e.value;
+            },
+            .sce_relasz, .relasz => info.rela_size = e.value,
             .init => info.init_virtual_address = e.value,
             .fini => info.fini_virtual_address = e.value,
             .preinit_array => info.preinit_array_virtual_address = e.value,
@@ -504,6 +594,73 @@ test "declarations are unpacked with names resolved" {
     try testing.expectEqualStrings("libkernel", needed.name);
     try testing.expectEqual(@as(u8, 3), needed.version_major);
     try testing.expectEqual(@as(u8, 4), needed.version_minor);
+}
+
+test "standard PS5 dynamic addresses resolve through a mapped load segment" {
+    const strings = "\x00app\x00libkernel\x00";
+    const image_vaddr: u64 = 0x20_0000;
+    const entries = [_]Entry{
+        .{ .tag = @intFromEnum(Tag.strtab), .value = image_vaddr },
+        .{ .tag = @intFromEnum(Tag.strsz), .value = strings.len },
+        .{ .tag = @intFromEnum(Tag.symtab), .value = image_vaddr },
+        .{ .tag = @intFromEnum(Tag.sce_symtabsz), .value = strings.len },
+        .{ .tag = @intFromEnum(Tag.rela), .value = image_vaddr },
+        .{ .tag = @intFromEnum(Tag.relasz), .value = 0 },
+        .{ .tag = @intFromEnum(Tag.jmprel), .value = image_vaddr },
+        .{ .tag = @intFromEnum(Tag.pltrelsz), .value = 0 },
+        .{ .tag = @intFromEnum(Tag.sce_module_info_1), .value = packModule(0, 1, 0, 1) },
+        .{ .tag = @intFromEnum(Tag.sce_import_lib_1), .value = packLibrary(0, 1, 5) },
+        .{ .tag = @intFromEnum(Tag.null), .value = 0 },
+    };
+
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(testing.allocator);
+    try payload.appendSlice(testing.allocator, strings);
+    const dynamic_offset = payload.items.len;
+    for (entries) |entry| {
+        try payload.appendSlice(testing.allocator, std.mem.asBytes(&entry));
+    }
+
+    const file_offset = elf.TestImage.payloadOffset(2);
+    const segments = [_]elf.ProgramHeader{
+        .{
+            .type = @intFromEnum(elf.SegmentType.load),
+            .flags = 0x4,
+            .offset = file_offset,
+            .vaddr = image_vaddr,
+            .paddr = 0,
+            .filesz = payload.items.len,
+            .memsz = payload.items.len,
+            .@"align" = 0x4000,
+        },
+        .{
+            .type = @intFromEnum(elf.SegmentType.dynamic),
+            .flags = 0x4,
+            .offset = file_offset + dynamic_offset,
+            .vaddr = image_vaddr + dynamic_offset,
+            .paddr = 0,
+            .filesz = payload.items.len - dynamic_offset,
+            .memsz = payload.items.len - dynamic_offset,
+            .@"align" = 8,
+        },
+    };
+
+    var fixture = try elf.TestImage.build(testing.allocator, .sce_dynexec, &segments, payload.items);
+    defer fixture.deinit(testing.allocator);
+    const image = try elf.parse(fixture.bytes());
+    var info = try parse(testing.allocator, image);
+    defer info.deinit(testing.allocator);
+
+    try testing.expectEqual(TableAddressing.virtual_address, info.table_addressing);
+    try testing.expectEqual(@as(?u64, image_vaddr), info.symtab_offset);
+    try testing.expectEqual(@as(?u64, image_vaddr), info.rela_offset);
+    try testing.expectEqual(@as(?u64, image_vaddr), info.jmprel_offset);
+    try testing.expectEqualStrings("app", info.module_info.?.name);
+    try testing.expectEqualStrings("libkernel", info.import_libraries.items[0].name);
+    try testing.expectEqualStrings(
+        strings,
+        try info.tableData(image, info.strtab_offset, info.strtab_size),
+    );
 }
 
 test "an import resolves to a named library through its code" {
