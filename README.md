@@ -535,6 +535,21 @@ system-managed window from `0x02_0000_0000` before falling back to the user
 window. Fixed mappings, no-overwrite mappings, encoded alignment requests,
 partial unmaps, and zero-filled reuse are covered by the same lifecycle rules.
 
+**`libkernel` — module loading** ([src/hle/modules.zig](src/hle/modules.zig))
+
+A title does not reach all of its own code through the dynamic tables. Some
+modules it loads itself, by path, at the point it needs them. Everything
+adjacent to the executable is already mapped and relocated before guest code
+runs, so `sceKernelLoadStartModule` resolves the request to what exists and
+returns its handle. Loading again would produce a second copy with its own
+relocations and duplicate the state the title expects to be shared.
+
+Path matching ignores separator style and case. The case part is not
+defensiveness: this title asks for `Il2CppUserAssemblies.prx` while shipping
+`Il2cppUserAssemblies.prx`, so an exact match would refuse a module the title
+installed itself. The relative path is tried before the bare file name, so two
+modules sharing a name stay distinguishable.
+
 Virtual reservations occupy guest addresses without committing host pages.
 `sceKernelReserveVirtualRange` can create either a fixed or first-fit
 reservation, and a later fixed flexible mapping consumes it. Memory queries use
