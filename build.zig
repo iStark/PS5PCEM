@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
@@ -47,8 +50,31 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the disassembler");
     run_step.dependOn(&run_cmd.step);
 
+    // Inspects a guest module and reports which of its imports the firmware
+    // emulation can supply.
+    const module_info = b.addExecutable(.{
+        .name = "module-info",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/module_info.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "loader", .module = loader },
+                .{ .name = "hle", .module = hle },
+            },
+        }),
+    });
+    b.installArtifact(module_info);
+
+    const module_info_cmd = b.addRunArtifact(module_info);
+    module_info_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| module_info_cmd.addArgs(args);
+
+    const module_info_step = b.step("module-info", "Inspect a guest module");
+    module_info_step.dependOn(&module_info_cmd.step);
+
     const test_step = b.step("test", "Run the test suite");
-    for ([_]*std.Build.Module{ mod, hle, loader, exe.root_module }) |m| {
+    for ([_]*std.Build.Module{ mod, hle, loader, exe.root_module, module_info.root_module }) |m| {
         const tests = b.addTest(.{ .root_module = m });
         test_step.dependOn(&b.addRunArtifact(tests).step);
     }

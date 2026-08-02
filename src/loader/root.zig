@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+
 //! loader — reading guest module images.
 //!
 //! Parses the ELF64 objects a title ships and the dynamic linking tables inside
@@ -11,6 +14,9 @@
 pub const elf = @import("elf.zig");
 pub const dynamic = @import("dynamic.zig");
 pub const ids = @import("ids.zig");
+pub const symbols = @import("symbols.zig");
+pub const relocations = @import("relocations.zig");
+pub const imports = @import("imports.zig");
 
 pub const Image = elf.Image;
 pub const ObjectType = elf.ObjectType;
@@ -20,13 +26,19 @@ pub const DynamicInfo = dynamic.DynamicInfo;
 pub const LibraryDecl = dynamic.LibraryDecl;
 pub const ModuleDecl = dynamic.ModuleDecl;
 pub const SymbolName = dynamic.SymbolName;
+pub const Import = imports.Import;
+pub const Imports = imports.Imports;
 
 pub const parseImage = elf.parse;
 pub const parseDynamic = dynamic.parse;
 pub const parseSymbolName = dynamic.parseSymbolName;
+pub const collectImports = imports.collect;
 
 test {
     _ = elf;
     _ = dynamic;
     _ = ids;
+    _ = symbols;
+    _ = relocations;
+    _ = imports;
 }
