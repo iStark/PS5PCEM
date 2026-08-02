@@ -617,22 +617,30 @@ state, and returns `error.GuestFault`. `NativeBridge.lastFault` and
 `Runtime.lastNativeFault` expose that diagnostic record without reading guest
 memory from inside the exception handler.
 
+Before an illegal instruction becomes a fault record, an allocation-free
+compatibility decoder tries the AMD instructions emitted for the PS5's Zen 2
+CPU. `MONITORX` and `MWAITX` advance as completed wait operations, while the
+immediate register forms of SSE4a `EXTRQ` and `INSERTQ` update the saved XMM
+state according to AMD's six-bit length/index rules. Returning from VEH then
+resumes at the following guest instruction. Unknown opcodes retain the normal
+`error.GuestFault` path.
+
 The bridge intentionally does not force a context change in another host
 thread. Shutdown marks such an execution interrupted and observes it when guest
 code returns; suspending a worker inside HLE could abandon host locks. Windows
-fault containment is now present, but illegal instructions are reported rather
-than emulated and mixed guest/HLE frames do not yet have an unwind-safe import
-transition. Arbitrary `eboot.bin` execution is therefore not safe yet. Linux and
-macOS need a different FS/HLE-transition strategy because their host TLS rules
-differ. GPU submission and audio callbacks consequently remain beyond the
-current title bootstrap.
+fault containment and the first AMD compatibility handlers are now present,
+but mixed guest/HLE frames do not yet have an unwind-safe import transition and
+unrecognized illegal instructions still stop execution. Arbitrary `eboot.bin`
+execution is therefore not safe yet. Linux and macOS need a different
+FS/HLE-transition strategy because their host TLS rules differ. GPU submission
+and audio callbacks consequently remain beyond the current title bootstrap.
 
 ## Roadmap
 
-1. Add resumable compatibility handlers for AMD-specific instructions such as
-   SSE4a and `MONITORX`/`MWAITX` on hosts which do not implement them.
-2. Introduce import transition stubs with Windows unwind metadata, host-stack
+1. Introduce import transition stubs with Windows unwind metadata, host-stack
    recovery, diagnostics, and platform TLS restoration.
+2. Extend resumable instruction compatibility to SHA-NI and other missing Zen 2
+   features when title traces demonstrate a host capability gap.
 3. Add a POSIX native bridge with explicit host-TLS restoration around HLE.
 
 ---

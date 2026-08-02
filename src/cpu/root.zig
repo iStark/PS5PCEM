@@ -14,6 +14,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const memory = @import("memory");
 const hle = @import("hle");
+const x86_64_compat = @import("x86_64_compat.zig");
 const threading = hle.libs.kernel_threading;
 
 const key_state_capacity: usize = 256;
@@ -535,6 +536,10 @@ const WindowsX64Machine = struct {
         handling_native_fault = true;
         defer handling_native_fault = false;
 
+        if (kind == .illegal_instruction and tryEmulateIllegalInstruction(context)) {
+            return exception_continue_execution;
+        }
+
         var fault = FaultInfo{
             .kind = kind,
             .exception_code = record.ExceptionCode,
@@ -577,6 +582,51 @@ const WindowsX64Machine = struct {
         context.Rcx = @intFromPtr(frame);
         context.Rip = @intFromPtr(&ps5NativeEscapeWindowsX64);
         return exception_continue_execution;
+    }
+
+    fn tryEmulateIllegalInstruction(context: *std.os.windows.CONTEXT) bool {
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const instruction = x86_64_compat.decode(code) orelse return false;
+        switch (instruction.kind) {
+            .monitorx, .mwaitx => {},
+            .extrq => {
+                const destination = contextXmm(context, instruction.destination);
+                const result = x86_64_compat.extractBitField(
+                    destination.Low,
+                    instruction.field_length,
+                    instruction.field_index,
+                ) orelse return false;
+                destination.Low = result;
+                destination.High = 0;
+            },
+            .insertq => {
+                const destination = contextXmm(context, instruction.destination);
+                const source = contextXmm(context, instruction.source);
+                const result = x86_64_compat.insertBitField(
+                    destination.Low,
+                    source.Low,
+                    instruction.field_length,
+                    instruction.field_index,
+                ) orelse return false;
+                destination.Low = result;
+                destination.High = 0;
+            },
+        }
+        // MONITORX arms a cache-line monitor and MWAITX waits for a write or
+        // timeout. The compatibility path treats both as completed operations,
+        // preserving forward progress without blocking inside the VEH.
+        context.Rip += instruction.length;
+        return true;
+    }
+
+    fn contextXmm(
+        context: *std.os.windows.CONTEXT,
+        index: u8,
+    ) *std.os.windows.M128A {
+        std.debug.assert(index < 16);
+        const first = &context.DUMMYUNIONNAME.DUMMYSTRUCTNAME.Xmm0;
+        const registers: [*]std.os.windows.M128A = @ptrCast(first);
+        return &registers[index];
     }
 };
 
@@ -1580,6 +1630,29 @@ test "native bridge installs FS, SysV arguments, and the guest stack" {
     try testing.expectEqual(@as(u64, 8), observed_rsp & 0xf);
 }
 
+test "Windows context compatibility advances AMD wait instructions" {
+    if (can_use_native_bridge) {
+        const monitorx = [_]u8{ 0x0f, 0x01, 0xfa };
+        const mwaitx = [_]u8{ 0x0f, 0x01, 0xfb };
+        const unknown = [_]u8{ 0x0f, 0x0b };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+
+        context.Rip = @intFromPtr(&monitorx);
+        try testing.expect(WindowsX64Machine.tryEmulateIllegalInstruction(&context));
+        try testing.expectEqual(@intFromPtr(&monitorx) + monitorx.len, context.Rip);
+
+        context.Rip = @intFromPtr(&mwaitx);
+        try testing.expect(WindowsX64Machine.tryEmulateIllegalInstruction(&context));
+        try testing.expectEqual(@intFromPtr(&mwaitx) + mwaitx.len, context.Rip);
+
+        context.Rip = @intFromPtr(&unknown);
+        try testing.expect(!WindowsX64Machine.tryEmulateIllegalInstruction(&context));
+        try testing.expectEqual(@intFromPtr(&unknown), context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "native bridge contains guest access and illegal instruction faults" {
     if (!NativeBridge.isSupported()) return error.SkipZigTest;
 
@@ -1623,6 +1696,28 @@ test "native bridge contains guest access and illegal instruction faults" {
         code_address + 0x40,
         &.{ 0xb8, 42, 0, 0, 0, 0xc3 },
     );
+    // mov rax, value; movq xmm1, rax; extrq xmm1, 8, 8;
+    // movq rax, xmm1; ret
+    var extrq_program = [_]u8{
+        0x48, 0xb8, 0,    0,    0,    0,    0,    0,    0,    0,
+        0x66, 0x48, 0x0f, 0x6e, 0xc8, 0x66, 0x0f, 0x78, 0xc1, 0x08,
+        0x08, 0x66, 0x48, 0x0f, 0x7e, 0xc8, 0xc3,
+    };
+    std.mem.writeInt(u64, extrq_program[2..10], 0x0123_4567_89ab_cdef, .little);
+    try address_space.write(code_address + 0x80, &extrq_program);
+
+    // movq xmm1, destination; movq xmm2, source;
+    // insertq xmm1, xmm2, 8, 16; movq rax, xmm1; ret
+    var insertq_program = [_]u8{
+        0x48, 0xb8, 0,    0,    0,    0,    0,    0,    0,    0,
+        0x66, 0x48, 0x0f, 0x6e, 0xc8, 0x48, 0xb8, 0,    0,    0,
+        0,    0,    0,    0,    0,    0x66, 0x48, 0x0f, 0x6e, 0xd0,
+        0xf2, 0x0f, 0x78, 0xca, 0x08, 0x10, 0x66, 0x48, 0x0f, 0x7e,
+        0xc8, 0xc3,
+    };
+    std.mem.writeInt(u64, insertq_program[2..10], 0xaaaa_bbbb_ccdd_eeee, .little);
+    std.mem.writeInt(u64, insertq_program[17..25], 0x1234, .little);
+    try address_space.write(code_address + 0xc0, &insertq_program);
     try address_space.protect(code_address, memory.page_size, .read_execute);
 
     var native = NativeBridge{};
@@ -1677,6 +1772,19 @@ test "native bridge contains guest access and illegal instruction faults" {
     var valid_request = base_request;
     valid_request.entry_point = code_address + 0x40;
     try testing.expectEqual(@as(u64, 42), try machine.execute(valid_request));
+    try testing.expect(native.lastFault() == null);
+
+    var extract_request = base_request;
+    extract_request.entry_point = code_address + 0x80;
+    try testing.expectEqual(@as(u64, 0xcd), try machine.execute(extract_request));
+    try testing.expect(native.lastFault() == null);
+
+    var insert_request = base_request;
+    insert_request.entry_point = code_address + 0xc0;
+    try testing.expectEqual(
+        @as(u64, 0xaaaa_bbbb_cc34_eeee),
+        try machine.execute(insert_request),
+    );
     try testing.expect(native.lastFault() == null);
 }
 
