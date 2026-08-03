@@ -15,6 +15,7 @@ pub const trace = @import("trace.zig");
 pub const unwind = @import("unwind.zig");
 pub const modules = @import("modules.zig");
 pub const filesystem = @import("filesystem.zig");
+pub const host_stack = @import("host_stack.zig");
 pub const errno = @import("errno.zig");
 pub const symbols = @import("symbols.zig");
 
@@ -77,6 +78,7 @@ test {
     _ = unwind;
     _ = modules;
     _ = filesystem;
+    _ = host_stack;
     _ = errno;
     _ = symbols;
     _ = libs.kernel_event_queue;

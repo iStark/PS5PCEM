@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const abi = @import("abi.zig");
+const host_stack = @import("host_stack.zig");
 
 /// How many calls are retained. Two hundred and fifty six covers the run-up to
 /// a failure comfortably while keeping the buffer small enough to stay resident.
@@ -158,35 +159,35 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
             fn call() callconv(abi.guest) Result {
                 const args = [_]u64{};
                 enter(name, &args);
-                return finish(name, func(), &args);
+                return finish(name, host_stack.call(Result, func, .{}), &args);
             }
         },
         1 => struct {
             fn call(a0: P.t(0)) callconv(abi.guest) Result {
                 const args = [_]u64{word(a0)};
                 enter(name, &args);
-                return finish(name, func(a0), &args);
+                return finish(name, host_stack.call(Result, func, .{ a0 }), &args);
             }
         },
         2 => struct {
             fn call(a0: P.t(0), a1: P.t(1)) callconv(abi.guest) Result {
                 const args = [_]u64{ word(a0), word(a1) };
                 enter(name, &args);
-                return finish(name, func(a0, a1), &args);
+                return finish(name, host_stack.call(Result, func, .{ a0, a1 }), &args);
             }
         },
         3 => struct {
             fn call(a0: P.t(0), a1: P.t(1), a2: P.t(2)) callconv(abi.guest) Result {
                 const args = [_]u64{ word(a0), word(a1), word(a2) };
                 enter(name, &args);
-                return finish(name, func(a0, a1, a2), &args);
+                return finish(name, host_stack.call(Result, func, .{ a0, a1, a2 }), &args);
             }
         },
         4 => struct {
             fn call(a0: P.t(0), a1: P.t(1), a2: P.t(2), a3: P.t(3)) callconv(abi.guest) Result {
                 return finish(
                     name,
-                    func(a0, a1, a2, a3),
+                    host_stack.call(Result, func, .{ a0, a1, a2, a3 }),
                     &.{ word(a0), word(a1), word(a2), word(a3) },
                 );
             }
@@ -201,7 +202,7 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
             ) callconv(abi.guest) Result {
                 return finish(
                     name,
-                    func(a0, a1, a2, a3, a4),
+                    host_stack.call(Result, func, .{ a0, a1, a2, a3, a4 }),
                     &.{ word(a0), word(a1), word(a2), word(a3), word(a4) },
                 );
             }
@@ -217,7 +218,7 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
             ) callconv(abi.guest) Result {
                 return finish(
                     name,
-                    func(a0, a1, a2, a3, a4, a5),
+                    host_stack.call(Result, func, .{ a0, a1, a2, a3, a4, a5 }),
                     &.{ word(a0), word(a1), word(a2), word(a3), word(a4), word(a5) },
                 );
             }
@@ -237,7 +238,7 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
                 // parameters live.
                 return finish(
                     name,
-                    func(a0, a1, a2, a3, a4, a5, a6),
+                    host_stack.call(Result, func, .{ a0, a1, a2, a3, a4, a5, a6 }),
                     &.{ word(a0), word(a1), word(a2), word(a3), word(a4), word(a5) },
                 );
             }
@@ -255,7 +256,7 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
             ) callconv(abi.guest) Result {
                 return finish(
                     name,
-                    func(a0, a1, a2, a3, a4, a5, a6, a7),
+                    host_stack.call(Result, func, .{ a0, a1, a2, a3, a4, a5, a6, a7 }),
                     &.{ word(a0), word(a1), word(a2), word(a3), word(a4), word(a5) },
                 );
             }
@@ -274,7 +275,7 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
             ) callconv(abi.guest) Result {
                 return finish(
                     name,
-                    func(a0, a1, a2, a3, a4, a5, a6, a7, a8),
+                    host_stack.call(Result, func, .{ a0, a1, a2, a3, a4, a5, a6, a7, a8 }),
                     &.{ word(a0), word(a1), word(a2), word(a3), word(a4), word(a5) },
                 );
             }
@@ -294,7 +295,7 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
             ) callconv(abi.guest) Result {
                 return finish(
                     name,
-                    func(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9),
+                    host_stack.call(Result, func, .{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9 }),
                     &.{ word(a0), word(a1), word(a2), word(a3), word(a4), word(a5) },
                 );
             }
