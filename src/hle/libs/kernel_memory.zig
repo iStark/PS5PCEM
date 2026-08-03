@@ -57,17 +57,24 @@ const Lock = struct {
 /// Physical memory is handed out in 16 KiB units.
 pub const page_size: u64 = 16 * 1024;
 
+/// All the memory a title may have, of either kind.
+///
+/// A little under 13.5 GiB, which is what the console leaves to a title after
+/// the system takes its share.
+pub const total_memory_size: u64 = 13824 * 1024 * 1024;
+
+/// Flexible-memory budget, until system-content configuration says otherwise.
+pub const flexible_memory_size: u64 = 4 * 1024 * 1024 * 1024;
+
 /// Size of the direct memory pool reported to the guest.
 ///
-/// Real hardware exposes a little under 13 GiB to titles. The figure is
-/// deliberately a constant here: a title queries it during startup and sizes its
-/// own allocators from the answer, so it has to be stable and plausible before
-/// any real memory backend exists.
-pub const direct_memory_size: u64 = 12 * 1024 * 1024 * 1024;
-
-/// Default flexible-memory budget used until system-content configuration is
-/// parsed. This matches the reference emulator's PS5 default.
-pub const flexible_memory_size: u64 = 4 * 1024 * 1024 * 1024;
+/// The two kinds of memory are not separate supplies: they are cut from the one
+/// the machine has, so what a title can hold directly is what is left after the
+/// flexible budget. Reporting the two independently promises more memory than
+/// the console has, and a title that sizes its allocators from both answers --
+/// which is exactly what titles do with these figures during startup -- budgets
+/// for memory that was never going to exist.
+pub const direct_memory_size: u64 = total_memory_size - flexible_memory_size;
 
 pub const maximum_name_length: usize = memory.maximum_name_length;
 
@@ -1481,6 +1488,15 @@ test "main direct-memory wrappers preserve reservation metadata" {
     try testing.expectEqual(@as(i64, @intCast(start + 2 * page_size)), info.end);
     try testing.expectEqual(@as(i32, 3), info.memory_type);
     try testing.expectEqual(errno.ok, sceKernelCheckedReleaseDirectMemory(start, 2 * page_size));
+}
+
+test "the two kinds of memory are cut from one supply" {
+    // Reporting them independently promises more than the console has, and a
+    // title sizes its allocators from both answers during startup.
+    try testing.expectEqual(total_memory_size, direct_memory_size + flexible_memory_size);
+    try testing.expect(direct_memory_size < total_memory_size);
+    try testing.expect(flexible_memory_size < total_memory_size);
+    try testing.expectEqual(direct_memory_size, pool.size);
 }
 
 test "walking physical memory ends rather than inventing a last region" {

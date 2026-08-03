@@ -308,9 +308,16 @@ Direct memory is different from a private mapping: its physical offset has a
 stable identity. [src/memory/backing_store.zig](src/memory/backing_store.zig)
 provides one sparse shared object for the pool, and mappings of the same offset
 are coherent aliases. Writing through one guest virtual address is immediately
-visible through every other address mapped to those physical pages. The 12 GiB
+visible through every other address mapped to those physical pages. The pool's
 capacity remains virtual; mapped pages consume backing/commit resources, and
 physical working-set pages are faulted on first touch.
+
+Direct and flexible memory are cut from one supply of a little under 13.5 GiB,
+which is what the console leaves a title after the system takes its share, so
+the direct pool is what remains once the flexible budget is set aside. Reporting
+the two independently would promise more memory than the console has, and a
+title sizes its allocators from both answers during startup — which is exactly
+when it would budget for memory that was never going to exist.
 
 Windows has permanent low-address mappings, notably `KUSER_SHARED_DATA`, inside
 the system-managed window. A single `VirtualAlloc` reservation would therefore
