@@ -1,12 +1,13 @@
 # PS5 emulation components
 
-Building blocks for PlayStation 5 emulation, written in Zig. Seven modules cover
+Building blocks for PlayStation 5 emulation, written in Zig. Eight modules cover
 the independent subsystems and their end-to-end composition:
 
 | Module | What it does |
 |---|---|
 | **`memory`** | Reserves and manages the fixed, identity-mapped guest address space |
 | **`rdna2`** | Decodes and disassembles RDNA2 shader machine code |
+| **`gpu`** | Decodes the command stream a title submits to the graphics hardware |
 | **`loader`** | Reads, maps, and relocates bare ELF64 and decrypted PS5 SELF module images |
 | **`hle`** | High-level emulation of the guest firmware: symbol resolution and firmware libraries |
 | **`cpu`** | Dispatches guest execution and provides the Windows x86-64 native machine bridge |
@@ -18,12 +19,13 @@ cross-compiles to Windows, Linux, and macOS. Direct guest execution currently
 requires Windows x86-64; the other targets still build the inspection and HLE
 layers but report the native bridge as unsupported.
 
-Four command-line tools come with them:
+Five command-line tools come with them:
 
 ```sh
 zig build run         -- shader.bin    # disassemble a shader
 zig build module-info -- eboot.bin     # inspect a bare ELF or decrypted PS5 SELF
 zig build module-info -- eboot.bin sce_module/libc.prx # include a guest provider
+zig build pm4-dump    -- capture.bin   # decode a captured GPU command stream
 zig build graph-info  -- eboot.bin     # map and relocate the reachable PRX graph
 zig build game-run    -- eboot.bin     # load, initialize, and enter the title
 ```
@@ -228,6 +230,56 @@ set.
 3. `SMEM` and `MUBUF`/`MTBUF` — descriptor and buffer access.
 4. Basic-block reconstruction from the branch targets the decoder already
    collects.
+
+---
+
+# `gpu` — command streams
+
+[src/gpu/pm4.zig](src/gpu/pm4.zig) decodes what a title actually sends to the
+graphics hardware. A PS5 title does not ask a graphics API to draw: it builds
+packets in its own memory — state changes, register writes, draws, dispatches,
+fences — and submits the buffer. Everything the GPU ever does arrives that way,
+so this stream is the real interface to emulate, and it is the same stream
+whichever layer hands it over. Replacing the graphics library and emulating the
+kernel device both end up holding one of these buffers, so the decoder depends
+on neither choice and on nothing else in the tree.
+
+Nothing is executed. What the decoder provides is legibility: a buffer of opaque
+words becomes a sequence of named commands with their bodies delimited, which is
+the specification an implementation has to satisfy and can be checked against a
+real capture long before anything renders.
+
+Three decisions are worth stating. Body length is stored biased by one, so there
+is no way to encode an empty body and a decoder that assumed otherwise would
+misplace every following packet. Bounds are enforced on every step, because a
+stream is read out of guest memory where a title's bug — or an address this
+emulator resolved wrongly — can claim more than the buffer holds; a body that
+does not fit is reported, not clipped. And only opcodes with a documented
+meaning are named: an invented name in a trace is worse than a number, since a
+number invites you to look it up and a wrong name does not.
+
+Register commands carry an offset within a bank rather than an absolute index,
+so the bank is recovered from the opcode before the offset means anything — two
+different banks have a register at offset zero. `pm4-dump` prints a capture one
+packet per line with its word offset, and counts the draws and dispatches:
+
+```
+00000: CLEAR_STATE 1 dwords
+00002: SET_CONTEXT_REG context[0xa206] x2
+00006: SET_SH_REG shader[0x2c0c] x1
+00009: NUM_INSTANCES 1 dwords
+00011: DRAW_INDEX_AUTO 2 dwords
+00014: RELEASE_MEM 6 dwords
+00021: PAD
+00022: WAIT_REG_MEM 5 dwords predicated
+```
+
+## Roadmap
+
+1. Register naming for the banks a draw actually sets up, so a capture reads as
+   render state rather than as numbered slots.
+2. Following `INDIRECT_BUFFER` into the stream it chains to.
+3. A first translation target, once real captures are flowing.
 
 ---
 

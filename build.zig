@@ -24,6 +24,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // The GPU command stream. Depends on nothing: a stream is self-describing,
+    // and keeping it that way means it can be decoded from a capture, from a
+    // library call, or from a device submission without changing.
+    const gpu = b.addModule("gpu", .{
+        .root_source_file = b.path("src/gpu/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Guest module images: ELF64 parsing and the dynamic linking tables.
     const loader = b.addModule("loader", .{
         .root_source_file = b.path("src/loader/root.zig"),
@@ -132,6 +141,25 @@ pub fn build(b: *std.Build) void {
     const module_info_step = b.step("module-info", "Inspect a guest module");
     module_info_step.dependOn(&module_info_cmd.step);
 
+    // Decodes a captured GPU command stream.
+    const pm4_dump = b.addExecutable(.{
+        .name = "pm4-dump",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/pm4_dump.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "gpu", .module = gpu }},
+        }),
+    });
+    b.installArtifact(pm4_dump);
+
+    const pm4_dump_cmd = b.addRunArtifact(pm4_dump);
+    pm4_dump_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| pm4_dump_cmd.addArgs(args);
+
+    const pm4_dump_step = b.step("pm4-dump", "Decode a captured GPU command stream");
+    pm4_dump_step.dependOn(&pm4_dump_cmd.step);
+
     // Verifies that a real executable/PRX dependency graph can be mapped and
     // relocated without entering guest code.
     const graph_info = b.addExecutable(.{
@@ -180,6 +208,7 @@ pub fn build(b: *std.Build) void {
     for ([_]*std.Build.Module{
         memory,
         mod,
+        gpu,
         hle,
         cpu,
         loader,
@@ -187,6 +216,7 @@ pub fn build(b: *std.Build) void {
         runtime,
         exe.root_module,
         module_info.root_module,
+        pm4_dump.root_module,
         graph_info.root_module,
         game_run.root_module,
     }) |m| {
