@@ -48,6 +48,8 @@ pub const Posix = struct {
     pub const ebusy: i32 = 16;
     pub const eexist: i32 = 17;
     pub const einval: i32 = 22;
+    /// The device does not implement the requested control operation.
+    pub const enotty: i32 = 25;
     pub const enfile: i32 = 23;
     pub const emfile: i32 = 24;
     pub const enospc: i32 = 28;

@@ -88,6 +88,14 @@ pub fn setLive(value: bool) void {
     live.store(value, .release);
 }
 
+/// Whether calls are being announced as they happen.
+///
+/// Entry points that can say something the generic record cannot check this
+/// before doing the extra work of saying it.
+pub fn isLive() bool {
+    return live.load(.acquire);
+}
+
 fn store(record: Record) void {
     if (!isEnabled()) return;
     const sequence = next_sequence.fetchAdd(1, .monotonic);
