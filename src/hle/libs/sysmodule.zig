@@ -26,7 +26,25 @@ fn loadModule(_: u32) callconv(abi.guest) i32 {
     return errno.ok;
 }
 
+/// Loads a module the system provides rather than one the title ships.
+///
+/// Nothing is loaded: every built-in system module is represented by the
+/// firmware exports already registered, so there is no image to map. Reporting
+/// success is accurate about the outcome the caller cares about — the module is
+/// available — even though no work was done to make it so.
+fn loadModuleInternal(_: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
 pub const exports = [_]symbols.Export{ .{
+    .name = "sceSysmoduleLoadModuleInternal",
+    .function = trace.wrap("sceSysmoduleLoadModuleInternal", &loadModuleInternal),
+    .expect_id = "39iV5E1HoCk",
+}, .{
+    .name = "sceSysmoduleLoadModuleByNameInternal",
+    .function = trace.wrap("sceSysmoduleLoadModuleByNameInternal", &loadModuleInternal),
+    .expect_id = "CU8m+Qs+HN4",
+}, .{
     .name = "sceSysmoduleGetModuleInfoForUnwind",
     .function = trace.wrap("sceSysmoduleGetModuleInfoForUnwind", &getModuleInfoForUnwind),
     .expect_id = "4fU5yvOkVG4",

@@ -136,9 +136,24 @@ fn ioctl(descriptor: i32, request_code: u64, _: u64) callconv(abi.guest) i64 {
     return -1;
 }
 
+/// A private kernel entry point the graphics driver calls.
+///
+/// Its published name has not been recovered, so it is registered by the
+/// identifier the driver imports rather than by a name — a descriptive
+/// placeholder would hash to something else entirely and resolve nothing.
+/// Reported as unimplemented, which is at least true.
+fn unnamedGraphicsKernelCall() callconv(abi.guest) i32 {
+    return errno.KernelError.enosys.raw();
+}
+
 pub const exports = [_]symbols.Export{
     .{ .name = "ioctl", .function = trace.wrap("ioctl", &ioctl), .expect_id = "PfccT7qURYE" },
     .{ .name = "_ioctl", .function = trace.wrap("_ioctl", &ioctl), .expect_id = "wW+k21cmbwQ" },
+    .{
+        .name = "libkernel:LzoM-wVLJDE",
+        .function = trace.wrap("libkernel:LzoM-wVLJDE", &unnamedGraphicsKernelCall),
+        .id_override = "LzoM-wVLJDE",
+    },
 };
 
 pub const library = symbols.Library{ .name = "libkernel", .version = 1 };

@@ -15,6 +15,7 @@ const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const threading = @import("kernel_threading.zig");
+const runtime_api = @import("kernel_runtime.zig");
 
 const KernelError = errno.KernelError;
 const Posix = errno.Posix;
@@ -1318,7 +1319,20 @@ pub fn scePthreadRwlockattrSettype(attr_raw: ?*RwlockAttrHandle, kind: i32) call
     return errno.ok;
 }
 
+/// The kernel primitive a libc builds its own locks on.
+///
+/// Reported as unimplemented. Every lock a title actually takes goes through
+/// the pthread entry points above, which are backed by the manager here;
+/// answering this one would put a second, unrelated set of wait queues beside
+/// them, and a thread blocked in one would be invisible to the other. A module
+/// links against it, which is why it is registered at all.
+fn umtxOp() callconv(abi.guest) i64 {
+    runtime_api.setPosixErrno(errno.Posix.enosys);
+    return -1;
+}
+
 pub const exports = [_]symbols.Export{
+    .{ .name = "_umtx_op", .function = trace.wrap("_umtx_op", &umtxOp), .expect_id = "04AjkP0jO9U" },
     .{ .name = "scePthreadMutexInit", .function = trace.wrap("scePthreadMutexInit", &scePthreadMutexInit), .expect_id = "cmo1RIYva9o" },
     .{ .name = "pthread_mutex_init", .function = trace.wrap("pthread_mutex_init", &pthread_mutex_init), .expect_id = "ttHNfU+qDBU" },
     .{ .name = "scePthreadMutexDestroy", .function = trace.wrap("scePthreadMutexDestroy", &scePthreadMutexDestroy), .expect_id = "2Of0f+3mhhE" },

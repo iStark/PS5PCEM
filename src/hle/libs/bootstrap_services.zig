@@ -204,6 +204,50 @@ fn videoOutIsFlipPending(handle: i32) callconv(abi.guest) i32 {
     return if (validVideoHandle(handle)) 0 else video_out_error_invalid_handle;
 }
 
+/// A flip submitted to complete when the GPU finishes the frame.
+///
+/// The difference from an ordinary flip is only *when* it takes effect: the
+/// caller does not wait, because the pipeline signals it. Nothing here runs a
+/// pipeline, so it takes effect at once — and unlike the ordinary flip it does
+/// not pace itself, since a caller that expected to be paced would have used
+/// the other call.
+fn videoOutSubmitEopFlip(
+    handle: i32,
+    index: i32,
+    _: u32,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    if (!validVideoHandle(handle)) return video_out_error_invalid_handle;
+    video_current_buffer.store(index, .release);
+    _ = video_flip_count.fetchAdd(1, .monotonic);
+    return errno.ok;
+}
+
+/// Which display bus the output is attached to. There is only one.
+fn videoOutSysGetBus(handle: i32) callconv(abi.guest) i32 {
+    return if (validVideoHandle(handle)) 0 else video_out_error_invalid_handle;
+}
+
+/// Where the hardware writes the labels that say a buffer is free again.
+///
+/// Refused. A driver reads these to know when it may reuse a buffer, so
+/// handing back an address whose contents nothing ever updates would leave it
+/// waiting on a value that never changes — a stall with nothing to point at,
+/// rather than an error naming the facility that is missing.
+fn videoOutGetBufferLabelAddress(_: i32, _: u64) callconv(abi.guest) i32 {
+    return video_out_error_invalid_address;
+}
+
+/// How far the display pipeline has progressed.
+///
+/// Refused: the answer is a record whose layout is not established here, and
+/// writing a guessed one into the caller's buffer would corrupt whatever it
+/// keeps alongside.
+fn videoOutGetPipelineStatus(_: i32, _: u64) callconv(abi.guest) i32 {
+    return video_out_error_invalid_address;
+}
+
 const video_out_exports = [_]symbols.Export{
     .{ .name = "sceVideoOutOpen", .function = trace.wrap("sceVideoOutOpen", &videoOutOpen), .expect_id = "Up36PTk687E" },
     .{ .name = "sceVideoOutSetBufferAttribute2", .function = trace.wrap("sceVideoOutSetBufferAttribute2", &videoOutSetBufferAttribute2), .expect_id = "PjS5uASwcV8" },
@@ -223,6 +267,11 @@ const video_out_exports = [_]symbols.Export{
     .{ .name = "sceVideoOutSetWindowModeMargins", .function = trace.wrap("sceVideoOutSetWindowModeMargins", &videoHandleOption), .expect_id = "MTxxrOCeSig" },
     .{ .name = "sceVideoOutVrrPegToFixedRate", .function = trace.wrap("sceVideoOutVrrPegToFixedRate", &videoHandleOption), .expect_id = "5tRaBjtdTzY" },
     .{ .name = "sceVideoOutVrrUnpegFromFixedRate", .function = trace.wrap("sceVideoOutVrrUnpegFromFixedRate", &videoHandleOption), .expect_id = "T4ucGB8CsnM" },
+    .{ .name = "sceVideoOutSubmitEopFlip", .function = trace.wrap("sceVideoOutSubmitEopFlip", &videoOutSubmitEopFlip), .expect_id = "j8xl+92A0q4" },
+    .{ .name = "sceVideoOutSysGetBus", .function = trace.wrap("sceVideoOutSysGetBus", &videoOutSysGetBus), .expect_id = "7VSZJxxcTL8" },
+    .{ .name = "sceVideoOutSysAddSetModeEvent2", .function = trace.wrap("sceVideoOutSysAddSetModeEvent2", &videoHandleOption), .expect_id = "fYWVVDKZOCk" },
+    .{ .name = "sceVideoOutGetBufferLabelAddress", .function = trace.wrap("sceVideoOutGetBufferLabelAddress", &videoOutGetBufferLabelAddress), .expect_id = "OcQybQejHEY" },
+    .{ .name = "sceVideoOutGetPipelineStatus", .function = trace.wrap("sceVideoOutGetPipelineStatus", &videoOutGetPipelineStatus), .expect_id = "Ygv0S+Hi+hA" },
 };
 
 // Headless AV player ------------------------------------------------------

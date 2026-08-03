@@ -62,8 +62,23 @@ pub const module = symbols.Module{
     .version_minor = 1,
 };
 
+/// The marker a module imports to state that it needs this library.
+///
+/// Nothing reads its value; the import exists so that the dynamic linker pulls
+/// the library in. It resolves to a byte of our own rather than to nothing,
+/// because a relocation against it still writes an address somewhere.
+var need_marker: u8 = 0;
+
 pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {
     try db.addLibrary(gpa, library, module, &exports);
+    try db.addObject(
+        gpa,
+        .{ .name = "libSceLibcInternal", .version = 1 },
+        module,
+        "Need_sceLibcInternal",
+        @intFromPtr(&need_marker),
+        "ZT4ODD2Ts9o",
+    );
 }
 
 test "libc internal extension exports register with exact metadata" {
