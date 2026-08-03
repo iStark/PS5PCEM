@@ -284,6 +284,31 @@ pub fn attachAddressSpace(address_space: ?*memory.AddressSpace) void {
     guest_address_space = address_space;
 }
 
+/// Whether a guest buffer is safe for firmware to touch.
+///
+/// A guest hands firmware raw addresses and lengths. Trusting them means a
+/// title's own bug becomes a crash in the emulator, on a host thread where the
+/// guest fault handler declines to help — so the failure arrives with none of
+/// the state that would explain it. Checking here turns that into the `EFAULT`
+/// the title would get on hardware.
+///
+/// A zero length is accepted regardless of the pointer, matching the calls that
+/// treat it as a no-op.
+///
+/// With no address space attached there is no guest, so any pointer belongs to
+/// the host and is accepted. The runtime attaches one before guest code runs,
+/// so this only relaxes the check where there is nothing to protect against.
+pub fn isGuestRangeAccessible(address: u64, length: u64) bool {
+    if (length == 0) return true;
+    if (address == 0) return false;
+    _ = std.math.add(u64, address, length) catch return false;
+
+    pool_lock.lock();
+    defer pool_lock.unlock();
+    const address_space = guest_address_space orelse return true;
+    return address_space.isMapped(address, length);
+}
+
 pub fn deinit() void {
     pool_lock.lock();
     defer pool_lock.unlock();
