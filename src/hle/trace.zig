@@ -75,12 +75,42 @@ pub fn count() u64 {
     return next_sequence.load(.acquire);
 }
 
+var live = std.atomic.Value(bool).init(false);
+
+/// Also writes every call to standard error as it happens.
+///
+/// The ring is enough when a failure is contained, because the report prints it
+/// afterwards. It is useless when the process dies outright — the buffer goes
+/// with it — so this exists for the failures that leave nothing behind. It is
+/// far too noisy to leave on.
+pub fn setLive(value: bool) void {
+    live.store(value, .release);
+}
+
 fn store(record: Record) void {
     if (!isEnabled()) return;
     const sequence = next_sequence.fetchAdd(1, .monotonic);
     var stored = record;
     stored.sequence = sequence;
     ring[sequence % capacity] = stored;
+
+    if (live.load(.acquire)) emit(stored);
+}
+
+/// Writes one record immediately. Uses the debug printer because it locks and
+/// needs no buffer, so it survives being called from any guest thread.
+fn emit(record: Record) void {
+    std.debug.print("[trace] {d} {s}(", .{ record.sequence, record.name });
+    for (record.arguments[0..record.argument_count], 0..) |value, index| {
+        if (index != 0) std.debug.print(", ", .{});
+        std.debug.print("0x{x}", .{value});
+    }
+    std.debug.print(")", .{});
+    if (record.returns_value) {
+        std.debug.print(" = 0x{x}", .{record.result});
+        if (looksLikeFailure(record.result)) std.debug.print("  <- failure", .{});
+    }
+    std.debug.print("\n", .{});
 }
 
 /// Widens any argument type to a word for recording.
@@ -126,22 +156,30 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
     const Thunk = switch (info.params.len) {
         0 => struct {
             fn call() callconv(abi.guest) Result {
-                return finish(name, func(), &.{});
+                const args = [_]u64{};
+                enter(name, &args);
+                return finish(name, func(), &args);
             }
         },
         1 => struct {
             fn call(a0: P.t(0)) callconv(abi.guest) Result {
-                return finish(name, func(a0), &.{word(a0)});
+                const args = [_]u64{word(a0)};
+                enter(name, &args);
+                return finish(name, func(a0), &args);
             }
         },
         2 => struct {
             fn call(a0: P.t(0), a1: P.t(1)) callconv(abi.guest) Result {
-                return finish(name, func(a0, a1), &.{ word(a0), word(a1) });
+                const args = [_]u64{ word(a0), word(a1) };
+                enter(name, &args);
+                return finish(name, func(a0, a1), &args);
             }
         },
         3 => struct {
             fn call(a0: P.t(0), a1: P.t(1), a2: P.t(2)) callconv(abi.guest) Result {
-                return finish(name, func(a0, a1, a2), &.{ word(a0), word(a1), word(a2) });
+                const args = [_]u64{ word(a0), word(a1), word(a2) };
+                enter(name, &args);
+                return finish(name, func(a0, a1, a2), &args);
             }
         },
         4 => struct {
@@ -268,6 +306,21 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
     };
 
     return abi.erase(&Thunk.call);
+}
+
+/// Announces a call before it runs, when live tracing is on.
+///
+/// The ring records completed calls only, which is the right default but hides
+/// the one case that matters most: a call that never returns because it faulted
+/// inside. Live mode therefore prints on entry as well.
+fn enter(comptime name: []const u8, arguments: []const u64) void {
+    if (!live.load(.acquire) or !isEnabled()) return;
+    std.debug.print("[call ] {s}(", .{name});
+    for (arguments, 0..) |value, index| {
+        if (index != 0) std.debug.print(", ", .{});
+        std.debug.print("0x{x}", .{value});
+    }
+    std.debug.print(")\n", .{});
 }
 
 /// Records a completed call and passes its result through.

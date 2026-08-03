@@ -126,6 +126,24 @@ fn run(init: std.process.Init) !bool {
         allocator.free(loaded_modules);
     }
 
+    // The directory holding the executable is what a title sees as /app0.
+    const title_root = std.fs.path.dirname(args[1]) orelse ".";
+    var content = std.Io.Dir.cwd().openDir(io, title_root, .{}) catch |err| {
+        try stderr.print("cannot open {s}: {s}\n", .{ title_root, @errorName(err) });
+        try stderr.flush();
+        return false;
+    };
+    defer content.close(io);
+    runtime.firmware.filesystem.attach(io, content);
+    defer runtime.firmware.filesystem.detach();
+
+    // A contained fault prints the retained calls afterwards, but a process
+    // that dies outright takes the buffer with it. This is the escape hatch for
+    // those, and it is far too noisy for anything else.
+    if (init.minimal.environ.containsUnempty(allocator, "PS5_TRACE") catch false) {
+        runtime.firmware.trace.setLive(true);
+    }
+
     try emu.enableNativeCpuDispatcher(io);
     const prepared = try emu.prepareInitialThread("eboot-main");
     defer emu.releaseInitialThread(prepared.handle) catch {};
