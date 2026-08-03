@@ -14,6 +14,8 @@ const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const kernel_threading = @import("kernel_threading.zig");
+const kernel_memory = @import("kernel_memory.zig");
+const audio_device = @import("../audio_device.zig");
 
 const audio_out_error_invalid_port: i32 = @bitCast(@as(u32, 0x8026_0003));
 const audio_out_error_invalid_pointer: i32 = @bitCast(@as(u32, 0x8026_0004));
@@ -67,25 +69,89 @@ fn pace(frames: u32, frequency: u32) void {
     _ = kernel_threading.sceKernelUsleep(@max(microseconds, 1));
 }
 
+/// Whether a format carries integer or floating-point samples.
+///
+/// The low byte selects both channel count and representation, and the two are
+/// not separable: the same number names a different layout depending on which
+/// half of the table it falls in.
+fn formatSamples(format: u32) ?audio_device.SampleFormat {
+    return switch (format & 0xff) {
+        0, 1, 2 => .signed16,
+        3, 4, 5, 6, 7 => .float32,
+        else => null,
+    };
+}
+
 const PortKind = enum(u8) { none, output, input };
 const LegacyPort = struct {
     kind: PortKind = .none,
     frames: u32 = 0,
     frequency: u32 = 0,
     channels: u8 = 0,
+    samples: audio_device.SampleFormat = .signed16,
+    /// Whether this port is the one reaching the speakers.
+    audible: bool = false,
 };
+
+/// The single sound output, and the port that holds it.
+///
+/// One port is audible because there is one pair of speakers. A title opens a
+/// main output port and, often, further ports for other purposes; letting each
+/// claim the device would interleave unrelated streams into one another. The
+/// rest keep the silent path, which is what they had before and costs a title
+/// nothing.
+var device: audio_device.Device = .{};
+var device_owner: i32 = -1;
+
+/// Tries to make a port audible, and says whether it worked.
+///
+/// Failure is not reported to the title. A title must not stall or behave
+/// differently because the host has no sound card, denies access to it, or will
+/// not take the format it asked for — those are facts about this machine, not
+/// about the title.
+fn claimDevice(handle: i32, port: LegacyPort) bool {
+    if (device_owner != -1) return false;
+    device.open(.{
+        .frequency = port.frequency,
+        .channels = port.channels,
+        .format = port.samples,
+        .frames = port.frames,
+    }) catch return false;
+    device_owner = handle;
+    return true;
+}
+
+fn releaseDevice(handle: i32) void {
+    if (device_owner != handle) return;
+    device.close();
+    device_owner = -1;
+}
 
 const maximum_legacy_ports = 64;
 var port_mutex: Lock = .{};
 var legacy_ports: [maximum_legacy_ports]LegacyPort = [_]LegacyPort{.{}} ** maximum_legacy_ports;
 
-fn allocateLegacyPort(kind: PortKind, frames: u32, frequency: u32, channels: u8) ?i32 {
+fn allocateLegacyPort(
+    kind: PortKind,
+    frames: u32,
+    frequency: u32,
+    channels: u8,
+    samples: audio_device.SampleFormat,
+) ?i32 {
     port_mutex.lock();
     defer port_mutex.unlock();
     for (&legacy_ports, 0..) |*port, index| {
         if (port.kind != .none) continue;
-        port.* = .{ .kind = kind, .frames = frames, .frequency = frequency, .channels = channels };
-        return @intCast(index + 1);
+        port.* = .{
+            .kind = kind,
+            .frames = frames,
+            .frequency = frequency,
+            .channels = channels,
+            .samples = samples,
+        };
+        const handle: i32 = @intCast(index + 1);
+        if (kind == .output) port.audible = claimDevice(handle, port.*);
+        return handle;
     }
     return null;
 }
@@ -104,6 +170,7 @@ fn releaseLegacyPort(handle: i32, kind: PortKind) bool {
     defer port_mutex.unlock();
     const port = &legacy_ports[@intCast(handle - 1)];
     if (port.kind != kind) return false;
+    if (port.audible) releaseDevice(handle);
     port.* = .{};
     return true;
 }
@@ -128,7 +195,9 @@ fn audioOutOpen(_: i32, port_type: i32, index: i32, frames: u32, frequency: u32,
     if (frames == 0) return audio_out_error_invalid_size;
     if (frequency == 0) return audio_out_error_invalid_frequency;
     const channels = formatChannels(format) orelse return audio_out_error_invalid_format;
-    return allocateLegacyPort(.output, frames, frequency, channels) orelse audio_out_error_port_full;
+    const samples = formatSamples(format) orelse return audio_out_error_invalid_format;
+    return allocateLegacyPort(.output, frames, frequency, channels, samples) orelse
+        audio_out_error_port_full;
 }
 
 fn audioOutSetVolume(handle: i32, _: u32, volumes: ?[*]const i32) callconv(abi.guest) i32 {
@@ -141,9 +210,29 @@ fn audioOutSetMixLevelPadSpeaker(handle: i32, _: f32) callconv(abi.guest) i32 {
     return if (legacyPort(handle, .output) != null) errno.ok else audio_out_error_invalid_port;
 }
 
+/// Hands one buffer of samples over, and takes about as long as it will sound.
+///
+/// The wait is what a title keeps time with, so it happens either way: the
+/// device provides it by making room for the next buffer, and where there is no
+/// device it is a sleep, exactly as before. A title cannot tell which, and must
+/// not be able to.
 fn audioOutOutput(handle: i32, data: ?*const anyopaque) callconv(abi.guest) i32 {
     const port = legacyPort(handle, .output) orelse return audio_out_error_invalid_port;
-    if (data == null) return audio_out_error_invalid_pointer;
+    const samples = data orelse return audio_out_error_invalid_pointer;
+
+    if (port.audible) {
+        const length = port.frames * @as(u32, port.channels) * port.samples.bytes();
+        if (kernel_memory.isGuestRangeAccessible(@intFromPtr(samples), length)) {
+            const bytes: [*]const u8 = @ptrCast(samples);
+            // A device that stopped working mid-run falls back to pacing rather
+            // than failing the call, because losing sound is not a reason to
+            // stop a title.
+            if (device.play(bytes[0..length])) |_| {
+                return errno.ok;
+            } else |_| {}
+        }
+    }
+
     pace(port.frames, port.frequency);
     return errno.ok;
 }
@@ -177,7 +266,8 @@ fn audioInOpen(_: i32, _: u32, _: u32, frames: u32, frequency: u32, parameter: u
         1 => 2,
         else => return audio_in_error_invalid_parameter,
     };
-    return allocateLegacyPort(.input, frames, frequency, channels) orelse audio_in_error_port_full;
+    return allocateLegacyPort(.input, frames, frequency, channels, .signed16) orelse
+        audio_in_error_port_full;
 }
 
 fn audioInInput(handle: i32, destination: ?[*]u8) callconv(abi.guest) i32 {

@@ -743,13 +743,35 @@ a disconnected interface. Common, message, web-browser, and IME dialogs finish
 immediately with coherent headless results instead of blocking on unavailable
 UI.
 
-AudioOut, AudioIn, and AudioOut2 expose paced silent ports and queues. AJM
-accepts the title's batch lifecycle and emits zeroed PCM so audio setup cannot
-deadlock the process. It is a compatibility decoder, not ATRAC9/MP3 decoding,
-and there is no host sound-device output yet. The additional early-bootstrap
+AudioOut, AudioIn, and AudioOut2 expose paced ports and queues. AJM accepts the
+title's batch lifecycle and emits zeroed PCM so audio setup cannot deadlock the
+process. It is a compatibility decoder, not ATRAC9/MP3 decoding. The additional
+early-bootstrap
 surface in [src/hle/libs/bootstrap_services.zig](src/hle/libs/bootstrap_services.zig)
 provides headless VideoOut/AvPlayer state and conservative platform/GPU command
 stubs solely to reach native title initialization; it does not render frames.
+
+**Sound output** ([src/hle/audio_device.zig](src/hle/audio_device.zig))
+
+A title hands over one buffer of samples at a time and expects the call to take
+about as long as the sound lasts, because that is how it keeps time with audio.
+That wait now comes from a host device making room for the next buffer rather
+than from a sleep, so the clock is the real one and the samples are heard
+instead of discarded. Three buffers stay in flight: one is not enough, because
+the device runs dry between finishing a buffer and the title handing over the
+next, which is audible as a click every buffer.
+
+One port is audible, because there is one pair of speakers. A title opens a main
+output port and often others besides; letting each claim the device would
+interleave unrelated streams. The rest keep the silent path, which is what they
+had before.
+
+Failure to open a device is never reported to the title. Having no sound card,
+being denied access to one, or being refused a format are facts about the host,
+not about the title, so the caller falls back to sleeping and behaves exactly as
+it did before. The same applies to a device that stops working mid-run: losing
+sound is not a reason to stop a title. Output is Windows-only for now; elsewhere
+the ports are silent and correctly paced.
 
 **Title content and devices** ([src/hle/filesystem.zig](src/hle/filesystem.zig),
 [src/hle/libs/kernel_files.zig](src/hle/libs/kernel_files.zig),
