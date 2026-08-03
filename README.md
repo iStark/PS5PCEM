@@ -861,6 +861,32 @@ to a bound. Graphics requests are refused with `ENOTTY`. That is deliberate:
 would leave a title waiting on a fence that is never signalled — a hang with
 nothing to explain it, rather than an error naming the request not handled.
 
+**Services this machine does not have** ([src/hle/libs/services.zig](src/hle/libs/services.zig))
+
+A large title links against a great deal it will run without: an online account
+system, a headset, a store, a voice channel, an accelerator. A missing import
+stops a module linking at all, so until each is answered the title cannot start
+far enough to reach the parts that do work.
+
+Every answer here says the facility is unavailable rather than that the call
+succeeded, and that distinction is the point. A title told its request succeeded
+goes looking for a result nothing produced — a session to join, a headset pose,
+a file the accelerator was to have fetched — and fails somewhere with nothing
+pointing back. A title told the facility is absent takes the path it already has
+for a console with no network, no peripheral and no entitlement: a path its own
+authors wrote and tested.
+
+The refusal is the kernel's own "not implemented", which sits outside every
+service library's numbering. Each library numbers its errors in a space of its
+own, and a code invented inside one of those could be mistaken for a documented
+outcome and acted upon; this one cannot be.
+
+Library and module names are recorded separately, because they routinely differ
+— a library whose name ends in a version digit usually lives in a module without
+one. Binding under the wrong module leaves an import that matches on identifier
+alone, which the loader rightly refuses: a bare identifier is no evidence that
+this is the implementation the caller meant.
+
 **Graphics command construction** ([src/hle/libs/agc.zig](src/hle/libs/agc.zig))
 
 A title does not ask the graphics library to draw. It asks it to *write*: each

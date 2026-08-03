@@ -278,9 +278,15 @@ pub fn main(init: std.process.Init) !void {
     for (module_imports.items.items) |imp| {
         const status = resolve(&db, &guest_exports, imp);
         if (status != .not_found) resolved += 1;
-        try out.print("  {s} {s}  {s}  {s}  {s}", .{
+        // Both names, because resolution needs both: a library says which set
+        // of entry points, and the module says which image publishes that set.
+        // The two are routinely spelled differently — a library ending in a
+        // version digit usually lives in a module without it — and a report
+        // showing only one leaves that difference invisible.
+        try out.print("  {s} {s}  {s}/{s}  {s}  {s}", .{
             status.mark(),
             imp.id,
+            imp.module orelse imp.module_code,
             imp.library orelse imp.library_code,
             @tagName(imp.symbol_type),
             @tagName(imp.relocation_type),
