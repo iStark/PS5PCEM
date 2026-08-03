@@ -267,6 +267,9 @@ pub const Runtime = struct {
         try w.print("  entry       ", .{});
         try map.write(self.last_dispatch_entry, w);
         try w.writeAll("\n");
+        // Before the stack, because a message the title was carrying at the
+        // moment it failed usually explains more than the addresses do.
+        if (space) |value| try diag.writeMessageArguments(report, value, w);
         if (space) |value| try diag.writeStackTrace(report, map, value, w);
         // The firmware calls leading up to the fault are usually a better
         // explanation than the fault itself: a title's own runtime reacts to a

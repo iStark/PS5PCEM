@@ -27,6 +27,9 @@ const SymbolMap = symbolize.SymbolMap;
 /// lands here, and no title maps the first page.
 const null_pointer_limit: u64 = memory.page_size;
 
+/// What the host puts in the faulting-address field when there is no address.
+const no_faulting_address: u64 = std.math.maxInt(u64);
+
 /// What the fault appears to be, beyond the raw exception code.
 pub const Diagnosis = enum {
     /// Control was transferred to a null pointer. The caller is recoverable
@@ -39,6 +42,10 @@ pub const Diagnosis = enum {
     /// A legitimate address the guest lacked permission for.
     protection,
     illegal_instruction,
+    /// The guest ran an instruction the processor would not let it run — a
+    /// software interrupt, most often, which is how a title's own assertions
+    /// stop it. Not a memory failure at all, despite how it arrives.
+    trap,
     unknown,
 };
 
@@ -86,6 +93,13 @@ fn classify(info: cpu.FaultInfo) Diagnosis {
 
     // An execute fault at a null address means control reached there, which
     // only happens through a call or jump.
+    // A general-protection fault has no faulting address, and the host reports
+    // that absence as an all-ones one. Reading it as an address sends the reader
+    // hunting for a wild pointer when the guest in fact executed a software
+    // interrupt on purpose — which is how a title's own assertions stop it, and
+    // means the explanation is in the title's message rather than in memory.
+    if (info.memory_address == no_faulting_address) return .trap;
+
     if (info.instruction_address < null_pointer_limit) return .null_call;
     if (info.access == .execute and info.memory_address < null_pointer_limit) return .null_call;
     if (info.memory_address < null_pointer_limit) return .null_access;
@@ -157,6 +171,99 @@ pub fn writeStackTrace(
     }
 }
 
+/// The longest message recovered from a register.
+///
+/// Generous on purpose. A title's diagnostic is often several lines — what it
+/// wanted, how much, and where it asked from — and the last of those is usually
+/// the part that names the subsystem to look at.
+const message_limit: usize = 320;
+
+/// Whether a run of guest bytes reads as a message rather than as data.
+///
+/// Deliberately strict. A pointer into mapped memory nearly always has *some*
+/// printable bytes at it, and a report that offers noise as though it were the
+/// title's own words is worse than one that offers nothing: it sends the reader
+/// after a meaning that was never there.
+fn looksLikeMessage(bytes: []const u8) ?[]const u8 {
+    var length: usize = 0;
+    while (length < bytes.len) : (length += 1) {
+        const byte = bytes[length];
+        if (byte == '\t' or byte == '\n') continue;
+        if (byte < 0x20 or byte >= 0x7f) break;
+    }
+    if (length < 8) return null;
+
+    // What follows the printable run decides whether it was text. A terminator
+    // means it was a string; running to the end of the window means it is a
+    // string longer than the window, which is worth showing cut short. Anything
+    // else is bytes that merely began like text.
+    if (length < bytes.len and bytes[length] != 0) return null;
+
+    const text = bytes[0..length];
+    // A run with no letters at all is a table, a key, or a coincidence.
+    for (text) |byte| {
+        if (std.ascii.isAlphabetic(byte)) return text;
+    }
+    return null;
+}
+
+/// Writes any text the argument registers point at.
+///
+/// A title about to fail usually says why first, and it says it by passing a
+/// message to something. The System V argument registers are where that message
+/// is at the moment of the fault, so recovering it turns a register dump into
+/// the title's own account of what went wrong — which is worth more than every
+/// other line of the report put together when it is there.
+pub fn writeMessageArguments(
+    report: Report,
+    address_space: *memory.AddressSpace,
+    w: *std.Io.Writer,
+) std.Io.Writer.Error!void {
+    const registers = report.info.registers;
+    const candidates = [_]struct { []const u8, u64 }{
+        .{ "rdi", registers.rdi },
+        .{ "rsi", registers.rsi },
+        .{ "rdx", registers.rdx },
+        .{ "rcx", registers.rcx },
+        .{ "r8", registers.r8 },
+        .{ "r9", registers.r9 },
+        .{ "rax", registers.rax },
+        .{ "rbx", registers.rbx },
+        .{ "r12", registers.r12 },
+        .{ "r13", registers.r13 },
+        .{ "r14", registers.r14 },
+        .{ "r15", registers.r15 },
+    };
+
+    var buffer: [message_limit]u8 = undefined;
+    var printed: usize = 0;
+    for (candidates) |candidate| {
+        const name = candidate[0];
+        const value = candidate[1];
+
+        if (textAt(address_space, value, &buffer)) |text| {
+            if (printed == 0) try w.writeAll("  text in registers\n");
+            try w.print("    {s}  \"{s}\"\n", .{ name, text });
+            printed += 1;
+            continue;
+        }
+
+        // One indirection, because a message is as often passed by reference as
+        // by value: a string object holds a pointer to its characters, and at
+        // the moment of a fault the register holds the object, not the text.
+        const indirect = readGuestWord(address_space, value) orelse continue;
+        const text = textAt(address_space, indirect, &buffer) orelse continue;
+        if (printed == 0) try w.writeAll("  text in registers\n");
+        try w.print("    [{s}] \"{s}\"\n", .{ name, text });
+        printed += 1;
+    }
+}
+
+fn textAt(address_space: *memory.AddressSpace, address: u64, buffer: []u8) ?[]const u8 {
+    const bytes = readGuestText(address_space, address, buffer.len, buffer) orelse return null;
+    return looksLikeMessage(bytes);
+}
+
 fn describe(diagnosis: Diagnosis) []const u8 {
     return switch (diagnosis) {
         .null_call => "call through a null pointer",
@@ -164,6 +271,7 @@ fn describe(diagnosis: Diagnosis) []const u8 {
         .unmapped_access => "access to unmapped memory",
         .protection => "access violated page protection",
         .illegal_instruction => "illegal instruction",
+        .trap => "the guest trapped on purpose, or ran what it may not",
         .unknown => "unclassified fault",
     };
 }
@@ -235,6 +343,42 @@ test "a small non-zero target is still a null pointer" {
     // A null vtable slot or a null callback reached through a field offset.
     const info = accessViolation(0x10, 0x10, .execute);
     try testing.expectEqual(Diagnosis.null_call, analyze(info, null).diagnosis);
+}
+
+test "a deliberate trap is not read as a wild pointer" {
+    // A general-protection fault has no faulting address, and the host reports
+    // that absence as an all-ones one. Calling it an access to 0xffff...ffff
+    // sends the reader hunting through memory for something that was never a
+    // memory problem: the guest executed a software interrupt on purpose.
+    const info = accessViolation(0x17954a3, std.math.maxInt(u64), .read);
+    try testing.expectEqual(Diagnosis.trap, analyze(info, null).diagnosis);
+
+    // One below is an ordinary address and stays an ordinary fault.
+    const near = accessViolation(0x17954a3, std.math.maxInt(u64) - 1, .read);
+    try testing.expect(analyze(near, null).diagnosis != .trap);
+}
+
+test "text is recognised, and near-text is not offered as text" {
+    try testing.expectEqualStrings(
+        "Could not allocate memory",
+        looksLikeMessage("Could not allocate memory\x00rest").?,
+    );
+
+    // Too short to be anything but a coincidence: a pointer into mapped memory
+    // nearly always has a few printable bytes at it.
+    try testing.expect(looksLikeMessage("%s\x00") == null);
+    try testing.expect(looksLikeMessage("abc\x00") == null);
+    // A message longer than the window is still a message, shown cut short.
+    try testing.expectEqualStrings(
+        "Could not allocate memory: System",
+        looksLikeMessage("Could not allocate memory: System").?,
+    );
+    // Binary that happens to start with letters.
+    try testing.expect(looksLikeMessage("abcdefgh\x01\x02\x00") == null);
+    // Digits and punctuation alone are a key or a table, not a message.
+    try testing.expect(looksLikeMessage("1234-5678-90\x00") == null);
+    // Tabs and newlines belong in a message and do not disqualify one.
+    try testing.expect(looksLikeMessage("line one\n\tindented\x00") != null);
 }
 
 test "a null dereference is distinguished from a null call" {

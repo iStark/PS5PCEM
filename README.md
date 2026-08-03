@@ -999,6 +999,36 @@ code omits frame pointers in places, so a reliable unwind is unavailable;
 keeping the stack words that land inside a loaded module recovers the call chain
 in practice, at the cost of occasional stale entries.
 
+## The title's own account
+
+A title about to fail usually says why first, and it says it by passing a message
+to something. The System V argument registers are where that message is at the
+moment of the fault, so the report recovers text from the registers — following
+one indirection, because a message is as often passed by reference as by value
+and the register then holds the string object rather than its characters.
+
+The filter is deliberately strict: a pointer into mapped memory nearly always
+has a few printable bytes at it, and a report that offers noise as though it
+were the title's words is worse than one that offers nothing. A run must be at
+least eight characters, contain a letter, and end at a terminator or fill the
+window — anything else merely began like text. A message longer than the window
+is shown cut short, since the first lines are the ones that name the problem.
+
+This turns a register dump into the title's explanation of what went wrong:
+
+```
+guest fault: the guest trapped on purpose, or ran what it may not
+  text in registers
+    [rax] "Could not allocate memory: System out of memory!
+Trying to allocate: 8589934592B with 16 alignment. MemoryLabel: TempOverflow"
+```
+
+A general-protection fault is classified as a trap rather than as a memory
+failure. It has no faulting address, and the host reports that absence as an
+all-ones one; reading it as an address sends the reader hunting for a wild
+pointer when the guest in fact executed a software interrupt on purpose, which
+is how a title's own assertions stop it.
+
 ## Firmware call trace
 
 The failure a title reports is usually not where it went wrong. A firmware entry
