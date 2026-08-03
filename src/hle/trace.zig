@@ -341,7 +341,11 @@ var capture_name_length: usize = 0;
 var capture_occurrence: u64 = 0;
 var capture_seen = std.atomic.Value(u64).init(0);
 var capture_stack: [stack_capture_depth]u64 = @splat(0);
+var capture_length: usize = 0;
 var capture_taken_at: u64 = 0;
+
+/// The guest's page size, which is what bounds a snapshot.
+const guest_page_size: usize = 16 * 1024;
 
 pub const StackCapture = struct {
     /// The entry point that was being called.
@@ -371,6 +375,7 @@ pub fn captureStackAt(name: []const u8, occurrence: u64) void {
     capture_occurrence = occurrence;
     capture_seen.store(0, .release);
     capture_taken.store(false, .release);
+    capture_length = 0;
     capture_armed.store(true, .release);
 }
 
@@ -388,7 +393,7 @@ pub fn capturedStack() ?StackCapture {
     return .{
         .name = capture_name_storage[0..capture_name_length],
         .occurrence = capture_taken_at,
-        .words = &capture_stack,
+        .words = capture_stack[0..capture_length],
     };
 }
 
@@ -412,8 +417,20 @@ fn takeStackSnapshot(comptime name: []const u8) void {
     // stack at all. The address of something living on the stack is.
     var anchor: u64 = 0;
     const base = std.mem.alignForward(usize, @intFromPtr(&anchor), @alignOf(u64));
+
+    // Stop at the end of the page the frame sits in. Higher addresses are the
+    // caller's frames, but only up to where the stack ends -- and a call made
+    // from a shallow frame sits close to that end. Reading past it faults, and
+    // faulting inside a diagnostic kills the process it was meant to explain.
+    // The frame's own page is mapped because the frame is in it, so this bound
+    // needs nothing else to be known.
+    const page_end = std.mem.alignForward(usize, base + 1, guest_page_size);
+    const available = (page_end - base) / @sizeOf(u64);
+    const readable = @min(available, stack_capture_depth);
+
     const words: [*]const u64 = @ptrFromInt(base);
-    for (&capture_stack, 0..) |*slot, index| slot.* = words[index];
+    for (capture_stack[0..readable], 0..) |*slot, index| slot.* = words[index];
+    capture_length = readable;
     capture_taken_at = seen;
 }
 
@@ -574,7 +591,27 @@ test "every arity announces its entry, not just the short ones" {
     const capture = capturedStack() orelse return error.EntryHookDidNotRun;
     try testing.expectEqualStrings("takesFour", capture.name);
     try testing.expectEqual(@as(u64, 1), capture.occurrence);
-    try testing.expectEqual(stack_capture_depth, capture.words.len);
+    try testing.expect(capture.words.len > 0);
+}
+
+test "a snapshot stops at the end of the page it started in" {
+    // Higher addresses are the caller's frames, but only as far as the stack
+    // goes, and a call made from a shallow frame sits close to that end.
+    // Reading past it faults -- and a diagnostic that kills the process it was
+    // meant to explain is worse than no diagnostic.
+    reset();
+    setEnabled(true);
+    captureStackAt("takesFour", 1);
+    defer disarmCapture();
+
+    const traced = wrap("takesFour", &takesFour);
+    const typed: *const fn (u64, u64, u64, u64) callconv(abi.guest) u64 = @ptrCast(traced);
+    _ = typed(1, 2, 3, 4);
+
+    const capture = capturedStack() orelse return error.EntryHookDidNotRun;
+    try testing.expect(capture.words.len <= stack_capture_depth);
+    // Whatever the frame's position, the words read never cross out of its page.
+    try testing.expect(capture.words.len <= guest_page_size / @sizeOf(u64));
 }
 
 test "a snapshot is taken at the requested call and only once" {
