@@ -24,6 +24,7 @@ pub const libs = struct {
     pub const bootstrap_services = @import("libs/bootstrap_services.zig");
     pub const dialogs = @import("libs/dialogs.zig");
     pub const kernel_event_queue = @import("libs/kernel_event_queue.zig");
+    pub const kernel_info = @import("libs/kernel_info.zig");
     pub const kernel_files = @import("libs/kernel_files.zig");
     pub const kernel_memory = @import("libs/kernel_memory.zig");
     pub const kernel_runtime = @import("libs/kernel_runtime.zig");
@@ -55,6 +56,7 @@ pub fn registerAll(db: *Database, gpa: @import("std").mem.Allocator) symbols.Err
     try libs.dialogs.register(db, gpa);
     try libs.kernel_event_queue.register(db, gpa);
     try libs.kernel_files.register(db, gpa);
+    try libs.kernel_info.register(db, gpa);
     try libs.kernel_memory.register(db, gpa);
     try libs.kernel_runtime.register(db, gpa);
     try libs.kernel_sync.register(db, gpa);
@@ -82,6 +84,7 @@ test {
     _ = errno;
     _ = symbols;
     _ = libs.kernel_event_queue;
+    _ = libs.kernel_info;
     _ = libs.kernel_files;
     _ = libs.kernel_memory;
     _ = libs.kernel_runtime;

@@ -74,6 +74,15 @@ pub fn attachIo(io: ?std.Io) void {
     }
 }
 
+/// The clock source firmware libraries share.
+///
+/// Exposed so sibling libraries measure time against the same source rather
+/// than each reaching for one of their own, which would let their answers
+/// disagree.
+pub fn activeIo() ?std.Io {
+    return active_io;
+}
+
 pub fn attachProcessParam(address: u64) void {
     process_param_address.store(address, .release);
 }
