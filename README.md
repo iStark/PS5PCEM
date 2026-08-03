@@ -479,6 +479,30 @@ exported by more than one library. A fallback lookup by identifier alone exists
 for imports that carry no usable metadata; it is ambiguous by construction and
 documented as a last resort.
 
+## Firmware runs on a host stack
+
+A guest calls firmware directly, so firmware executes on the calling guest
+thread's stack — one megabyte, typically, because that is what the title asked
+for. Host code needs far more: opening a file reserves a path buffer of tens of
+kilobytes, and a compiler allocates a function's whole frame on entry, before
+any branch can return early. A firmware call can therefore overrun the guest
+stack *without ever reaching the code that needed the room*.
+
+That was not a theory. Replacing one entry point's body with `return -1` left
+the title running; restoring a single call into a function that merely *contains*
+a path to `openFile` killed it, and raising the guest stack to eight megabytes
+made the same code work again.
+
+The overrun also lands outside every guest mapping, so the guest fault handler
+declines it and the process dies with nothing to explain why.
+
+[src/hle/host_stack.zig](src/hle/host_stack.zig) therefore switches to a
+per-thread host stack for the duration of every call. Arguments travel through
+memory rather than registers, which keeps the assembly to a single function that
+knows nothing about any signature — it takes a context pointer and a target and
+returns nothing, so floating-point and aggregate returns need no special
+handling. Nested firmware calls stay on the stack the outer one established.
+
 ## Calling convention
 
 Guest code is compiled for the System V AMD64 ABI. On Linux and macOS that is
