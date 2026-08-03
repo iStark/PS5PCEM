@@ -243,6 +243,34 @@ pub const Runtime = struct {
         return std.mem.eql(u8, name, "write") or std.mem.eql(u8, name, "_write");
     }
 
+    /// Writes the guest stack captured at a chosen firmware call.
+    ///
+    /// Prints nothing unless a capture was armed, which is the normal case. The
+    /// call trace answers which firmware calls a title made; this answers which
+    /// of the title's own code made one of them, which is the only question left
+    /// when a title repeats a call thousands of times.
+    fn writeCapturedStack(map: *const diag.SymbolMap, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const capture = hle.trace.capturedStack() orelse return;
+        try w.print(
+            "  guest stack at {s} call {d}\n",
+            .{ capture.name, capture.occurrence },
+        );
+
+        var printed: usize = 0;
+        for (capture.words) |value| {
+            // A return address points after its call, so stepping back keeps
+            // the lookup on the calling instruction.
+            const location = map.locate(value -| 1);
+            if (!location.isKnown()) continue;
+            try w.writeAll("    ");
+            try map.write(value -| 1, w);
+            try w.writeAll("\n");
+            printed += 1;
+            if (printed >= 12) break;
+        }
+        if (printed == 0) try w.writeAll("    nothing on it resolves to loaded code\n");
+    }
+
     /// Writes a readable report for the most recent contained guest fault.
     ///
     /// Returns false when no fault has been contained, so a caller can print
@@ -275,6 +303,7 @@ pub const Runtime = struct {
         // explanation than the fault itself: a title's own runtime reacts to a
         // failed call long before anything crashes.
         if (space) |value| try writeGuestDiagnostics(value, w);
+        try writeCapturedStack(map, w);
         try hle.trace.write(w, 32);
         return true;
     }

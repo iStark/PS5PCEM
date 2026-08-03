@@ -144,6 +144,30 @@ fn run(init: std.process.Init) !bool {
         runtime.firmware.trace.setLive(true);
     }
 
+    // Arms a one-shot snapshot of the guest stack at one firmware call, named by
+    // its number in the trace. The trace says which calls a title made; this
+    // says which of the title's own code made one of them, which is the only
+    // question left once a call is seen to repeat thousands of times.
+    if (init.minimal.environ.getAlloc(allocator, "PS5_STACK_AT")) |text| {
+        defer allocator.free(text);
+        const request = std.mem.trim(u8, text, " \t\r\n");
+        const separator = std.mem.lastIndexOfScalar(u8, request, ':');
+        const name = if (separator) |at| request[0..at] else request;
+        const occurrence = if (separator) |at|
+            std.fmt.parseInt(u64, request[at + 1 ..], 10) catch 0
+        else
+            1;
+        if (occurrence == 0 or name.len == 0) {
+            try stderr.print(
+                "PS5_STACK_AT wants <entry point>[:<call number>], not {s}\n",
+                .{request},
+            );
+            try stderr.flush();
+        } else {
+            runtime.firmware.trace.captureStackAt(name, occurrence);
+        }
+    } else |_| {}
+
     try emu.enableNativeCpuDispatcher(io);
     const prepared = try emu.prepareInitialThread("eboot-main");
     defer emu.releaseInitialThread(prepared.handle) catch {};

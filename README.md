@@ -1029,6 +1029,26 @@ all-ones one; reading it as an address sends the reader hunting for a wild
 pointer when the guest in fact executed a software interrupt on purpose, which
 is how a title's own assertions stop it.
 
+## Which of the title's code made a call
+
+The call trace says which firmware calls a title made. It does not say which of
+the title's own code made them, and once a call is seen to repeat thousands of
+times that is the only question left. `PS5_STACK_AT=<entry point>[:<call
+number>]` arms a one-shot snapshot of the guest stack at one call, printed with
+the fault report and resolved against the loaded modules.
+
+The snapshot is taken in the trace's entry hook, before firmware moves onto a
+stack of its own — by the time an entry point's body runs, the guest stack is no
+longer the one underfoot, and the caller is out of reach. It is anchored on a
+local rather than on the frame address, because the frame pointer is omitted in
+optimized builds and what it reports then is not the stack at all.
+
+A call is named by entry point and occurrence rather than by position in the
+trace, because a title runs on several threads: a call's position is decided
+when it finishes, by which time other threads have taken numbers of their own,
+so a position noted in one run does not name the same call in the next. How many
+times a title has called one entry point is not subject to that.
+
 ## Firmware call trace
 
 The failure a title reports is usually not where it went wrong. A firmware entry

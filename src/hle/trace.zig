@@ -193,11 +193,9 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
         },
         4 => struct {
             fn call(a0: P.t(0), a1: P.t(1), a2: P.t(2), a3: P.t(3)) callconv(abi.guest) Result {
-                return finish(
-                    name,
-                    host_stack.call(Result, func, .{ a0, a1, a2, a3 }),
-                    &.{ word(a0), word(a1), word(a2), word(a3) },
-                );
+                const args = [_]u64{ word(a0), word(a1), word(a2), word(a3) };
+                enter(name, &args);
+                return finish(name, host_stack.call(Result, func, .{ a0, a1, a2, a3 }), &args);
             }
         },
         5 => struct {
@@ -208,11 +206,9 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
                 a3: P.t(3),
                 a4: P.t(4),
             ) callconv(abi.guest) Result {
-                return finish(
-                    name,
-                    host_stack.call(Result, func, .{ a0, a1, a2, a3, a4 }),
-                    &.{ word(a0), word(a1), word(a2), word(a3), word(a4) },
-                );
+                const args = [_]u64{ word(a0), word(a1), word(a2), word(a3), word(a4) };
+                enter(name, &args);
+                return finish(name, host_stack.call(Result, func, .{ a0, a1, a2, a3, a4 }), &args);
             }
         },
         6 => struct {
@@ -224,10 +220,12 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
                 a4: P.t(4),
                 a5: P.t(5),
             ) callconv(abi.guest) Result {
+                const args = [_]u64{ word(a0), word(a1), word(a2), word(a3), word(a4), word(a5) };
+                enter(name, &args);
                 return finish(
                     name,
                     host_stack.call(Result, func, .{ a0, a1, a2, a3, a4, a5 }),
-                    &.{ word(a0), word(a1), word(a2), word(a3), word(a4), word(a5) },
+                    &args,
                 );
             }
         },
@@ -244,10 +242,12 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
                 // Beyond six the arguments arrive on the stack; only the
                 // register ones are recorded, which is where the identifying
                 // parameters live.
+                const args = [_]u64{ word(a0), word(a1), word(a2), word(a3), word(a4), word(a5) };
+                enter(name, &args);
                 return finish(
                     name,
                     host_stack.call(Result, func, .{ a0, a1, a2, a3, a4, a5, a6 }),
-                    &.{ word(a0), word(a1), word(a2), word(a3), word(a4), word(a5) },
+                    &args,
                 );
             }
         },
@@ -262,10 +262,12 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
                 a6: P.t(6),
                 a7: P.t(7),
             ) callconv(abi.guest) Result {
+                const args = [_]u64{ word(a0), word(a1), word(a2), word(a3), word(a4), word(a5) };
+                enter(name, &args);
                 return finish(
                     name,
                     host_stack.call(Result, func, .{ a0, a1, a2, a3, a4, a5, a6, a7 }),
-                    &.{ word(a0), word(a1), word(a2), word(a3), word(a4), word(a5) },
+                    &args,
                 );
             }
         },
@@ -281,10 +283,12 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
                 a7: P.t(7),
                 a8: P.t(8),
             ) callconv(abi.guest) Result {
+                const args = [_]u64{ word(a0), word(a1), word(a2), word(a3), word(a4), word(a5) };
+                enter(name, &args);
                 return finish(
                     name,
                     host_stack.call(Result, func, .{ a0, a1, a2, a3, a4, a5, a6, a7, a8 }),
-                    &.{ word(a0), word(a1), word(a2), word(a3), word(a4), word(a5) },
+                    &args,
                 );
             }
         },
@@ -301,10 +305,12 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
                 a8: P.t(8),
                 a9: P.t(9),
             ) callconv(abi.guest) Result {
+                const args = [_]u64{ word(a0), word(a1), word(a2), word(a3), word(a4), word(a5) };
+                enter(name, &args);
                 return finish(
                     name,
                     host_stack.call(Result, func, .{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9 }),
-                    &.{ word(a0), word(a1), word(a2), word(a3), word(a4), word(a5) },
+                    &args,
                 );
             }
         },
@@ -317,12 +323,110 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
     return abi.erase(&Thunk.call);
 }
 
-/// Announces a call before it runs, when live tracing is on.
+/// How many words of guest stack a snapshot keeps.
+///
+/// Enough to reach past a handful of frames without reading far into memory the
+/// guest has not written. What comes back is a scan, not a backtrace: guest code
+/// omits frame pointers in places, so the useful entries have to be picked out
+/// of it by whoever knows the modules.
+pub const stack_capture_depth: usize = 512;
+
+/// The longest entry-point name a capture can be armed for.
+const capture_name_limit: usize = 64;
+
+var capture_armed = std.atomic.Value(bool).init(false);
+var capture_taken = std.atomic.Value(bool).init(false);
+var capture_name_storage: [capture_name_limit]u8 = undefined;
+var capture_name_length: usize = 0;
+var capture_occurrence: u64 = 0;
+var capture_seen = std.atomic.Value(u64).init(0);
+var capture_stack: [stack_capture_depth]u64 = @splat(0);
+var capture_taken_at: u64 = 0;
+
+pub const StackCapture = struct {
+    /// The entry point that was being called.
+    name: []const u8,
+    /// Which call of that entry point this was, counting from one.
+    occurrence: u64,
+    words: []const u64,
+};
+
+/// Arms a one-shot snapshot of the guest stack at one call of one entry point.
+///
+/// The call trace says which firmware calls a title made; it does not say which
+/// of the title's own code made them. When a title repeats a call thousands of
+/// times, that is the only question worth answering, and the answer is on its
+/// stack at the moment of the call.
+///
+/// Named by entry point and occurrence rather than by position in the trace,
+/// because a title runs on several threads: the position a call ends up with is
+/// decided when it finishes, by which time other threads have taken numbers of
+/// their own, so a position chosen from one run does not name the same call in
+/// the next. How many times a title has called one entry point is not subject to
+/// that.
+pub fn captureStackAt(name: []const u8, occurrence: u64) void {
+    if (name.len == 0 or name.len > capture_name_limit or occurrence == 0) return;
+    @memcpy(capture_name_storage[0..name.len], name);
+    capture_name_length = name.len;
+    capture_occurrence = occurrence;
+    capture_seen.store(0, .release);
+    capture_taken.store(false, .release);
+    capture_armed.store(true, .release);
+}
+
+/// Forgets any armed or taken snapshot.
+pub fn disarmCapture() void {
+    capture_armed.store(false, .release);
+    capture_taken.store(false, .release);
+    capture_name_length = 0;
+    capture_occurrence = 0;
+    capture_seen.store(0, .release);
+}
+
+pub fn capturedStack() ?StackCapture {
+    if (!capture_taken.load(.acquire)) return null;
+    return .{
+        .name = capture_name_storage[0..capture_name_length],
+        .occurrence = capture_taken_at,
+        .words = &capture_stack,
+    };
+}
+
+/// Copies words off the guest's own stack.
+///
+/// Taken here rather than inside the entry point because firmware runs on a host
+/// stack of its own: by the time the entry point body executes, the guest stack
+/// is no longer the one underfoot. This runs before that switch.
+///
+/// Reading upward from the current frame reaches the caller's frames, which the
+/// guest has already written and which lie inside its mapped stack, so the read
+/// stays within memory that exists.
+fn takeStackSnapshot(comptime name: []const u8) void {
+    if (!std.mem.eql(u8, name, capture_name_storage[0..capture_name_length])) return;
+    const seen = capture_seen.fetchAdd(1, .monotonic) + 1;
+    if (seen != capture_occurrence) return;
+    if (capture_taken.swap(true, .acq_rel)) return;
+
+    // Anchored on a local rather than on the frame address, because the frame
+    // pointer is omitted in optimized builds and what it reports then is not the
+    // stack at all. The address of something living on the stack is.
+    var anchor: u64 = 0;
+    const base = std.mem.alignForward(usize, @intFromPtr(&anchor), @alignOf(u64));
+    const words: [*]const u64 = @ptrFromInt(base);
+    for (&capture_stack, 0..) |*slot, index| slot.* = words[index];
+    capture_taken_at = seen;
+}
+
+/// Announces a call before it runs, and takes a stack snapshot if one is armed.
 ///
 /// The ring records completed calls only, which is the right default but hides
 /// the one case that matters most: a call that never returns because it faulted
 /// inside. Live mode therefore prints on entry as well.
+///
+/// This runs on the guest's own stack, before firmware moves to a stack of its
+/// own, which is what makes a snapshot of the caller possible at all.
 fn enter(comptime name: []const u8, arguments: []const u64) void {
+    if (capture_armed.load(.acquire)) takeStackSnapshot(name);
     if (!live.load(.acquire) or !isEnabled()) return;
     std.debug.print("[call ] {s}(", .{name});
     for (arguments, 0..) |value, index| {
@@ -446,6 +550,63 @@ test "a wrapped call is recorded with its arguments and result" {
     try testing.expectEqual(@as(u64, 4), records[0].arguments[1]);
     try testing.expectEqual(@as(u64, 7), records[0].result);
     try testing.expect(records[0].returns_value);
+}
+
+fn takesFour(a: u64, b: u64, c: u64, d: u64) callconv(abi.guest) u64 {
+    return a + b + c + d;
+}
+
+test "every arity announces its entry, not just the short ones" {
+    // Entry announcement used to stop at three arguments, so a title's calls to
+    // anything wider were invisible until they returned -- and a call that
+    // faults inside never returns. The memory entry points a title leans on
+    // hardest are four wide.
+    reset();
+    setEnabled(true);
+    captureStackAt("takesFour", 1);
+    defer disarmCapture();
+
+    const traced = wrap("takesFour", &takesFour);
+    const typed: *const fn (u64, u64, u64, u64) callconv(abi.guest) u64 = @ptrCast(traced);
+    try testing.expectEqual(@as(u64, 10), typed(1, 2, 3, 4));
+
+    // The snapshot is proof the entry hook ran: it can only be taken there.
+    const capture = capturedStack() orelse return error.EntryHookDidNotRun;
+    try testing.expectEqualStrings("takesFour", capture.name);
+    try testing.expectEqual(@as(u64, 1), capture.occurrence);
+    try testing.expectEqual(stack_capture_depth, capture.words.len);
+}
+
+test "a snapshot is taken at the requested call and only once" {
+    reset();
+    setEnabled(true);
+    captureStackAt("takesFour", 3);
+    defer disarmCapture();
+
+    const traced = wrap("takesFour", &takesFour);
+    const typed: *const fn (u64, u64, u64, u64) callconv(abi.guest) u64 = @ptrCast(traced);
+
+    _ = typed(1, 1, 1, 1);
+    try testing.expect(capturedStack() == null);
+    _ = typed(2, 2, 2, 2);
+    try testing.expect(capturedStack() == null);
+    _ = typed(3, 3, 3, 3);
+    try testing.expectEqual(@as(u64, 3), capturedStack().?.occurrence);
+
+    // Later calls leave the snapshot alone: it names one call, not the newest.
+    _ = typed(4, 4, 4, 4);
+    try testing.expectEqual(@as(u64, 3), capturedStack().?.occurrence);
+}
+
+test "a snapshot request that names nothing is refused" {
+    reset();
+    disarmCapture();
+    captureStackAt("", 1);
+    captureStackAt("takesFour", 0);
+    const traced = wrap("takesFour", &takesFour);
+    const typed: *const fn (u64, u64, u64, u64) callconv(abi.guest) u64 = @ptrCast(traced);
+    _ = typed(1, 1, 1, 1);
+    try testing.expect(capturedStack() == null);
 }
 
 test "a call returning nothing is recorded without a result" {
