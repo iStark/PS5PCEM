@@ -200,6 +200,13 @@ comptime {
 threadlocal var active_native_frame: ?*NativeCallFrame = null;
 threadlocal var handling_native_fault = false;
 
+/// How many times the host dropped a guest thread pointer and it was put back.
+///
+/// Worth counting rather than repairing silently: the number says how often the
+/// host is losing state the guest depends on, and a run where it stays at zero
+/// means something else is keeping threads on the processor.
+pub var fs_base_restorations: std.atomic.Value(usize) = .init(0);
+
 /// Direct System V AMD64 execution on a Windows x86-64 host.
 ///
 /// Windows x64 uses GS rather than FS for its TEB, so Zig and Win32 remain able
@@ -506,9 +513,47 @@ const WindowsX64Machine = struct {
         ps5NativeEscapeWindowsX64(frame);
     }
 
+    /// An access this close to zero is a segment-relative one whose base was
+    /// lost. The first page is never mapped, and thread-local offsets are small,
+    /// so a lost base always lands inside it.
+    const lost_base_window: u64 = 0x1000;
+
+    /// Whether a fault is a dropped thread pointer rather than a guest mistake.
+    ///
+    /// Windows does not keep a user-written FS base across a context switch.
+    /// After a guest thread sleeps or blocks, `rdfsbase` reads zero again —
+    /// measured here, a one-millisecond sleep loses it every single time, and a
+    /// blocking call loses it occasionally. Guest code follows the System V
+    /// convention and keeps its thread-local storage in FS, so the first
+    /// FS-relative access after the thread is rescheduled reads a near-zero
+    /// address and faults. Nothing in the guest is wrong; the host dropped a
+    /// register the guest is entitled to rely on.
+    ///
+    /// Restoring the base and retrying the instruction is what makes native
+    /// execution survivable at all. Before this, a title died at whatever
+    /// thread-local access happened to follow its first sleep, which is why the
+    /// crash moved around between runs.
+    ///
+    /// A genuine null dereference is not swallowed by this. Restoring the base
+    /// does not make that instruction succeed: it faults again, this sees a base
+    /// that is no longer zero, declines, and the fault is reported normally. The
+    /// cost of being wrong is one extra trip through the handler.
+    fn shouldRestoreFsBase(address: u64, intended: u64, current: u64) bool {
+        if (intended == 0) return false;
+        if (current != 0) return false;
+        return address < lost_base_window;
+    }
+
     fn readFsBase() u64 {
         return asm volatile ("rdfsbase %[base]"
             : [base] "=r" (-> u64),
+        );
+    }
+
+    fn writeFsBase(value: u64) void {
+        asm volatile ("wrfsbase %[base]"
+            :
+            : [base] "r" (value),
         );
     }
 
@@ -517,10 +562,23 @@ const WindowsX64Machine = struct {
     ) callconv(.winapi) c_long {
         const frame = active_native_frame orelse
             return std.os.windows.EXCEPTION_CONTINUE_SEARCH;
-        if (handling_native_fault) return std.os.windows.EXCEPTION_CONTINUE_SEARCH;
 
         const record = exception.ExceptionRecord;
         const context = exception.ContextRecord;
+
+        // Checked before anything else, including the reentrancy guard: a lost
+        // thread pointer is not a fault to report but a host condition to
+        // repair, and it can strike while a report is already being built.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            shouldRestoreFsBase(record.ExceptionInformation[1], frame.guest_fs_base, readFsBase()))
+        {
+            writeFsBase(frame.guest_fs_base);
+            _ = fs_base_restorations.fetchAdd(1, .monotonic);
+            return exception_continue_execution;
+        }
+
+        if (handling_native_fault) return std.os.windows.EXCEPTION_CONTINUE_SEARCH;
         // A call through a function pointer that was never filled in leaves
         // Rip at or near zero, which belongs to neither guest nor host. That is
         // exactly the fault worth containing: declining it kills the process at
@@ -661,6 +719,27 @@ test "a null instruction pointer is treated as guest control flow" {
     // Real guest code stays out of the first page.
     try std.testing.expect(!isGuestAddress(0));
     try std.testing.expect(isGuestAddress(memory.system_managed.start));
+}
+
+test "a dropped thread pointer is repaired, a null dereference is not" {
+    const shouldRestore = WindowsX64Machine.shouldRestoreFsBase;
+
+    // Windows loses a user-written FS base across a context switch, so the next
+    // thread-local access lands near zero through no fault of the guest.
+    try std.testing.expect(shouldRestore(0, 0x8000_0000, 0));
+    try std.testing.expect(shouldRestore(0x28, 0x8000_0000, 0));
+
+    // With the base intact, an access near zero is the guest's own mistake and
+    // has to be reported. This is also what stops the repair from looping: the
+    // retried instruction faults again with a base that is no longer zero.
+    try std.testing.expect(!shouldRestore(0x28, 0x8000_0000, 0x8000_0000));
+
+    // Outside the first page the base cannot be what went wrong: thread-local
+    // offsets are small and nothing maps that page.
+    try std.testing.expect(!shouldRestore(memory.page_size, 0x8000_0000, 0));
+
+    // A thread with no guest thread pointer has none to lose.
+    try std.testing.expect(!shouldRestore(0x28, 0, 0));
 }
 
 extern fn ps5NativeCallWindowsX64(

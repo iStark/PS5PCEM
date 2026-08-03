@@ -795,6 +795,25 @@ to a bound. Graphics requests are refused with `ENOTTY`. That is deliberate:
 would leave a title waiting on a fence that is never signalled — a hang with
 nothing to explain it, rather than an error naming the request not handled.
 
+**GPU submission** ([src/hle/libs/agc_submit.zig](src/hle/libs/agc_submit.zig))
+
+The submission entry points are where a title hands its GPU work over, and by
+the time a call arrives every draw, state change and fence of a frame is already
+sitting in the buffer. Intercepting it therefore yields a complete description
+of a frame without modelling any of the calls that built it. Each submitted
+range is checked against the guest address space and then decoded through
+[`gpu.pm4`](src/gpu/pm4.zig), so a trace shows what was asked for rather than an
+address and a length. In a batch, a null entry is skipped rather than ending the
+batch, since the arrays are indexed in parallel and stopping early would drop
+every buffer after a hole the title left deliberately.
+
+Submissions are accepted rather than refused, which is the opposite of the
+choice made for the graphics device, and the difference is what a caller does
+with the answer. A refused device request is one whose reply the driver stores
+and dereferences, so false success crashes it. A submission returns only a
+status and the title is not blocked on it, so reporting failure would abort a
+frame the title had already fully described — and lose the description with it.
+
 ## Error codes
 
 Two numbering schemes coexist in the guest ABI, and mixing them up is a common
@@ -847,6 +866,31 @@ entry with the System V AMD64 convention. Nested guest callbacks reuse the activ
 guest stack below the HLE frames. A synchronous `scePthreadExit` takes a native
 escape path which discards those guest frames and restores host FS/state before
 the dispatcher observes `error.Interrupted`.
+
+## Windows does not keep a guest thread pointer
+
+Installing the FS base is not enough, because Windows does not preserve a
+user-written one across a context switch. After a guest thread sleeps or blocks,
+`rdfsbase` reads zero again — measured on Windows 11, a one-millisecond sleep
+loses it *every single time*, and a blocking call loses it occasionally. Guest
+code follows the System V convention and keeps its thread-local storage in FS, so
+the first FS-relative access after the thread is rescheduled reads a near-zero
+address and faults. Nothing in the guest is wrong: the host dropped a register
+the guest is entitled to rely on.
+
+This is not a condition that can be prevented, since being descheduled is
+asynchronous, so it is repaired instead. The vectored handler recognises a fault
+in the first page on a thread whose FS base has gone to zero, puts the base back,
+and retries the instruction. Before this, a title died at whichever thread-local
+access happened to follow its first sleep, which is why its crash address moved
+between runs.
+
+A genuine null dereference is not swallowed by the repair. Restoring the base
+does not make that instruction succeed: it faults again, the handler sees a base
+that is no longer zero, declines, and the fault is reported normally. The cost of
+being wrong is one extra trip through the handler. `cpu.fs_base_restorations`
+counts the repairs, because how often the host is losing state the guest depends
+on is worth knowing rather than hiding.
 
 The Windows backend also owns a first-priority vectored exception handler for
 active guest execution. It claims access violations and illegal instructions
