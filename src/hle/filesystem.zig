@@ -32,7 +32,43 @@ pub const Error = error{
     IsDirectory,
     InvalidArgument,
     IoFailed,
+    /// The descriptor names a device, which is not driven by reading and
+    /// writing it.
+    NotSupported,
 };
+
+/// Devices a title can open by name.
+///
+/// A device node is not a file: nothing is stored behind it, and the only
+/// meaningful operations are control requests. They live in the same namespace
+/// as files because that is how a title reaches them, but they are answered
+/// from here rather than from the host filesystem — the host has no such
+/// devices, and resolving these paths against it would find nothing or, worse,
+/// something unrelated.
+pub const Device = enum {
+    /// The graphics core. A display driver opens this and then submits all of
+    /// its work through control requests on the descriptor.
+    graphics,
+    /// Mode switches a system library reads during startup.
+    dip_switches,
+
+    pub fn name(self: Device) []const u8 {
+        return switch (self) {
+            .graphics => "/dev/gc",
+            .dip_switches => "/dev/dipsw",
+        };
+    }
+};
+
+const device_nodes = [_]Device{ .graphics, .dip_switches };
+
+/// Recognises a path as one of the devices served here.
+pub fn deviceForPath(path: []const u8) ?Device {
+    for (device_nodes) |device| {
+        if (std.ascii.eqlIgnoreCase(path, device.name())) return device;
+    }
+    return null;
+}
 
 /// Open flags, in the guest's numbering.
 ///
@@ -59,7 +95,9 @@ pub const Seek = struct {
 
 const mode_ifreg: u16 = 0o100000;
 const mode_ifdir: u16 = 0o040000;
+const mode_ifchr: u16 = 0o020000;
 const mode_read_only: u16 = 0o444;
+const mode_read_write: u16 = 0o666;
 
 pub const Timespec = extern struct {
     seconds: i64 = 0,
@@ -117,7 +155,9 @@ pub fn stripMount(path: []const u8) ?[]const u8 {
 }
 
 const OpenFile = struct {
-    file: std.Io.File,
+    /// Null for a device node, which has no host file behind it.
+    file: ?std.Io.File = null,
+    device: ?Device = null,
     /// Read position. Kept here and used with positional reads so that two
     /// descriptors on one file cannot disturb each other.
     offset: u64 = 0,
@@ -166,7 +206,9 @@ pub fn detach() void {
     defer table_lock.unlock();
     if (active_io) |io| {
         for (&open_files) |*slot| {
-            if (slot.*) |entry| entry.file.close(io);
+            if (slot.*) |entry| {
+                if (entry.file) |file| file.close(io);
+            }
             slot.* = null;
         }
     } else {
@@ -203,6 +245,12 @@ fn slotOf(descriptor: i32) ?*?OpenFile {
 /// Anything that would modify the filesystem is refused rather than ignored, so
 /// a title cannot proceed believing its data was stored.
 pub fn open(path: []const u8, flags: i32) Error!i32 {
+    // Creation flags are refused everywhere, devices included: a title asking
+    // to create `/dev/gc` has misunderstood something, and answering it would
+    // hide that.
+    if (flags & (O.creat | O.trunc | O.excl) != 0) return Error.ReadOnly;
+    if (deviceForPath(path)) |device| return openDevice(device, path);
+
     const io = active_io orelse return Error.NotAttached;
     const directory = root orelse return Error.NotAttached;
 
@@ -240,22 +288,56 @@ pub fn open(path: []const u8, flags: i32) Error!i32 {
     return Error.TooManyOpenFiles;
 }
 
-pub fn close(descriptor: i32) Error!void {
-    const io = active_io orelse return Error.NotAttached;
+/// Hands out a descriptor onto a device.
+///
+/// Two things differ from opening a file. The access mode is not examined: a
+/// control request carries data both ways whatever the descriptor was opened
+/// for, so a driver opening its device for writing is asking for control, not
+/// for stores into a file. And no mount is required — a device is not reached
+/// through the title's filesystem, and refusing it because no game directory
+/// happens to be attached would tie together two unrelated things.
+fn openDevice(device: Device, path: []const u8) Error!i32 {
+    table_lock.lock();
+    defer table_lock.unlock();
 
+    for (&open_files, 0..) |*slot, index| {
+        if (slot.* != null) continue;
+        var entry = OpenFile{ .device = device };
+        entry.path_length = @min(path.len, maximum_path);
+        @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
+        slot.* = entry;
+        return first_descriptor + @as(i32, @intCast(index));
+    }
+    return Error.TooManyOpenFiles;
+}
+
+/// The device a descriptor names, if it names one.
+///
+/// Control requests arrive with nothing but a descriptor number, so this is how
+/// the layer answering them learns which device is being addressed.
+pub fn deviceOf(descriptor: i32) ?Device {
+    table_lock.lock();
+    defer table_lock.unlock();
+    const slot = slotOf(descriptor) orelse return null;
+    const entry = slot.* orelse return null;
+    return entry.device;
+}
+
+pub fn close(descriptor: i32) Error!void {
     table_lock.lock();
     defer table_lock.unlock();
 
     const slot = slotOf(descriptor) orelse return Error.BadDescriptor;
     const entry = slot.* orelse return Error.BadDescriptor;
-    entry.file.close(io);
+    if (entry.file) |file| {
+        const io = active_io orelse return Error.NotAttached;
+        file.close(io);
+    }
     slot.* = null;
 }
 
 /// Reads from the descriptor's own position and advances it.
 pub fn read(descriptor: i32, buffer: []u8) Error!usize {
-    const io = active_io orelse return Error.NotAttached;
-
     table_lock.lock();
     const slot = slotOf(descriptor) orelse {
         table_lock.unlock();
@@ -266,9 +348,16 @@ pub fn read(descriptor: i32, buffer: []u8) Error!usize {
         return Error.BadDescriptor;
     }
     const offset = slot.*.?.offset;
-    const file = slot.*.?.file;
+    const file = slot.*.?.file orelse {
+        table_lock.unlock();
+        return Error.NotSupported;
+    };
     table_lock.unlock();
 
+    // Looked up only once the descriptor is known to be a file: what a
+    // descriptor *is* does not depend on whether a mount happens to be
+    // attached, and diagnosing it by the mount would mislabel a device.
+    const io = active_io orelse return Error.NotAttached;
     const count = file.readPositionalAll(io, buffer, offset) catch return Error.IoFailed;
 
     table_lock.lock();
@@ -276,15 +365,15 @@ pub fn read(descriptor: i32, buffer: []u8) Error!usize {
     // The descriptor may have been closed while the read ran; advancing a
     // reused slot would corrupt an unrelated file's position.
     if (slot.*) |*entry| {
-        if (entry.file.handle == file.handle) entry.offset = offset + count;
+        if (entry.file) |current| {
+            if (current.handle == file.handle) entry.offset = offset + count;
+        }
     }
     return count;
 }
 
 /// Reads from an explicit offset without disturbing the descriptor's position.
 pub fn pread(descriptor: i32, buffer: []u8, offset: u64) Error!usize {
-    const io = active_io orelse return Error.NotAttached;
-
     table_lock.lock();
     const slot = slotOf(descriptor) orelse {
         table_lock.unlock();
@@ -296,7 +385,9 @@ pub fn pread(descriptor: i32, buffer: []u8, offset: u64) Error!usize {
     };
     table_lock.unlock();
 
-    return entry.file.readPositionalAll(io, buffer, offset) catch Error.IoFailed;
+    const file = entry.file orelse return Error.NotSupported;
+    const io = active_io orelse return Error.NotAttached;
+    return file.readPositionalAll(io, buffer, offset) catch Error.IoFailed;
 }
 
 pub fn seek(descriptor: i32, offset: i64, whence: i32) Error!i64 {
@@ -305,6 +396,8 @@ pub fn seek(descriptor: i32, offset: i64, whence: i32) Error!i64 {
 
     const slot = slotOf(descriptor) orelse return Error.BadDescriptor;
     const entry = if (slot.*) |*value| value else return Error.BadDescriptor;
+    // A device has no contents to hold a position in.
+    if (entry.device != null) return Error.NotSupported;
 
     const base: i64 = switch (whence) {
         Seek.set => 0,
@@ -329,7 +422,22 @@ fn fillStat(out: *Stat, size: u64, is_directory: bool) void {
     out.blocks = @intCast((size + 511) / 512);
 }
 
+/// Describes a device as what it is: a character device of no length.
+///
+/// A caller that checks before opening is deciding whether the device exists,
+/// and a size of zero is the truthful answer for something that holds nothing.
+fn fillDeviceStat(out: *Stat) void {
+    out.* = .{};
+    out.mode = mode_ifchr | mode_read_write;
+    out.blksize = 512;
+}
+
 pub fn stat(path: []const u8, out: *Stat) Error!void {
+    if (deviceForPath(path) != null) {
+        fillDeviceStat(out);
+        return;
+    }
+
     const io = active_io orelse return Error.NotAttached;
     const directory = root orelse return Error.NotAttached;
 
@@ -348,6 +456,10 @@ pub fn fstat(descriptor: i32, out: *Stat) Error!void {
 
     const slot = slotOf(descriptor) orelse return Error.BadDescriptor;
     const entry = slot.* orelse return Error.BadDescriptor;
+    if (entry.device != null) {
+        fillDeviceStat(out);
+        return;
+    }
     fillStat(out, entry.size, false);
 }
 
@@ -390,6 +502,62 @@ test "unattached filesystem reports so rather than failing obscurely" {
     try testing.expect(!isAttached());
     try testing.expectError(Error.NotAttached, open("/app0/x", O.rdonly));
     try testing.expectError(Error.BadDescriptor, seek(3, 0, Seek.set));
+}
+
+test "device paths are recognised however they are spelled" {
+    try testing.expectEqual(Device.graphics, deviceForPath("/dev/gc").?);
+    try testing.expectEqual(Device.dip_switches, deviceForPath("/dev/dipsw").?);
+    try testing.expectEqual(Device.graphics, deviceForPath("/DEV/GC").?);
+
+    // Nothing else is a device, including paths that merely start alike.
+    try testing.expect(deviceForPath("/dev/gcx") == null);
+    try testing.expect(deviceForPath("/dev/") == null);
+    try testing.expect(deviceForPath("/app0/dev/gc") == null);
+}
+
+test "a device opens without a mount and is not a file" {
+    // A device is not reached through the title's filesystem, so whether a game
+    // directory happens to be attached has nothing to do with it.
+    detach();
+    const fd = try open("/dev/gc", O.rdonly);
+    defer close(fd) catch {};
+
+    try testing.expectEqual(Device.graphics, deviceOf(fd).?);
+    try testing.expectEqualStrings("/dev/gc", pathOf(fd).?);
+
+    // Reading and seeking a device is not how one is driven, and saying so is
+    // better than reporting an empty file.
+    var buffer: [8]u8 = undefined;
+    try testing.expectError(Error.NotSupported, read(fd, &buffer));
+    try testing.expectError(Error.NotSupported, pread(fd, &buffer, 0));
+    try testing.expectError(Error.NotSupported, seek(fd, 0, Seek.end));
+}
+
+test "a device is described as a device" {
+    var info: Stat = undefined;
+    try stat("/dev/gc", &info);
+    try testing.expect(info.mode & mode_ifchr != 0);
+    try testing.expect(info.mode & mode_ifreg == 0);
+    try testing.expectEqual(@as(i64, 0), info.size);
+
+    detach();
+    const fd = try open("/dev/dipsw", O.rdonly);
+    defer close(fd) catch {};
+    try fstat(fd, &info);
+    try testing.expect(info.mode & mode_ifchr != 0);
+}
+
+test "creating a device is refused rather than answered" {
+    detach();
+    try testing.expectError(Error.ReadOnly, open("/dev/gc", O.rdonly | O.creat));
+}
+
+test "a closed device descriptor stops naming a device" {
+    detach();
+    const fd = try open("/dev/gc", O.rdonly);
+    try close(fd);
+    try testing.expect(deviceOf(fd) == null);
+    try testing.expectError(Error.BadDescriptor, close(fd));
 }
 
 const Fixture = struct {

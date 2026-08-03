@@ -21,6 +21,8 @@ const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const runtime_api = @import("kernel_runtime.zig");
+const filesystem = @import("../filesystem.zig");
+const memory = @import("kernel_memory.zig");
 
 /// Which way the payload travels, from the caller's point of view.
 pub const Direction = enum {
@@ -96,8 +98,21 @@ pub fn decode(raw: u64) Request {
 }
 
 /// Writes a request in the form a driver author would recognise.
-pub fn write(request: Request, descriptor: i32, w: *std.Io.Writer) std.Io.Writer.Error!void {
-    try w.print("fd={d} ", .{descriptor});
+///
+/// The device is named when the descriptor is known to be one, because a
+/// request means something different depending on what it was addressed to,
+/// and a bare descriptor number does not say.
+pub fn write(
+    request: Request,
+    descriptor: i32,
+    device: ?filesystem.Device,
+    w: *std.Io.Writer,
+) std.Io.Writer.Error!void {
+    if (device) |named| {
+        try w.print("{s} ", .{named.name()});
+    } else {
+        try w.print("fd={d} ", .{descriptor});
+    }
     if (request.groupIsPrintable()) {
         try w.print("'{c}'", .{request.group});
     } else {
@@ -113,24 +128,55 @@ pub fn write(request: Request, descriptor: i32, w: *std.Io.Writer) std.Io.Writer
 ///
 /// The generic call trace already records the raw arguments; this adds the only
 /// part that is not reconstructable from them at a glance.
-fn announce(descriptor: i32, request: Request) void {
+fn announce(descriptor: i32, device: ?filesystem.Device, request: Request) void {
     if (!trace.isLive()) return;
     var buffer: [128]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
-    write(request, descriptor, &writer) catch return;
+    write(request, descriptor, device, &writer) catch return;
     std.debug.print("[ioctl] {s}\n", .{writer.buffered()});
+}
+
+/// The largest payload answered here, which is every switch read seen so far.
+///
+/// A bound is needed because the answer is written through a guest pointer, and
+/// the size comes from the request rather than from anything verified.
+const maximum_answered_payload: u16 = 8;
+
+/// Answers a read of the console's mode switches.
+///
+/// The switches are development flags, and on a retail console every one of
+/// them is clear. Reporting them clear is therefore not an invented value: it
+/// is the state of the hardware a shipped title is built to run on, and the one
+/// its libraries take as ordinary. The payload size is not guessed either — the
+/// request code declares it, and exactly that many bytes are written.
+fn answerDipSwitch(request: Request, payload: u64) bool {
+    switch (request.direction) {
+        .read, .read_write => {},
+        else => return false,
+    }
+    if (request.length == 0 or request.length > maximum_answered_payload) return false;
+    if (!memory.isGuestRangeAccessible(payload, request.length)) return false;
+
+    const destination: [*]u8 = @ptrFromInt(payload);
+    @memset(destination[0..request.length], 0);
+    return true;
 }
 
 /// Carries out a device control request.
 ///
-/// Every request is refused, with the error a device gives for a command it
-/// does not implement. That is deliberate: this is where a graphics driver
-/// submits work, and pretending a submission succeeded would leave a title
-/// waiting on a fence that will never be signalled — a hang with nothing to
-/// explain it, rather than an error naming the request that was not handled.
-fn ioctl(descriptor: i32, request_code: u64, _: u64) callconv(abi.guest) i64 {
+/// Requests are refused unless answering one is grounded in something better
+/// than a guess, with the error a device gives for a command it does not
+/// implement. That is deliberate for the graphics device in particular: it is
+/// where a driver submits work, and pretending a submission succeeded would
+/// leave a title waiting on a fence that will never be signalled — a hang with
+/// nothing to explain it, rather than an error naming the request that was not
+/// handled.
+fn ioctl(descriptor: i32, request_code: u64, payload: u64) callconv(abi.guest) i64 {
+    const device = filesystem.deviceOf(descriptor);
     const request = decode(request_code);
-    announce(descriptor, request);
+    announce(descriptor, device, request);
+
+    if (device == .dip_switches and answerDipSwitch(request, payload)) return 0;
 
     runtime_api.setPosixErrno(errno.Posix.enotty);
     return -1;
@@ -203,15 +249,24 @@ test "the length field is bounded by its encoding" {
 test "a request is written the way a driver author reads it" {
     var buffer: [128]u8 = undefined;
     var w = std.Io.Writer.fixed(&buffer);
-    try write(decode(encode(direction_in | direction_out, 'G', 7, 64)), 5, &w);
+    try write(decode(encode(direction_in | direction_out, 'G', 7, 64)), 5, null, &w);
     const text = w.buffered();
     try testing.expect(std.mem.startsWith(u8, text, "fd=5 'G' #7 inout 64 bytes"));
+}
+
+test "a request names the device it was addressed to" {
+    // The same request code means different things on different devices, and a
+    // descriptor number does not say which one was meant.
+    var buffer: [128]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buffer);
+    try write(decode(encode(direction_in, 'G', 1, 8)), 5, .graphics, &w);
+    try testing.expect(std.mem.startsWith(u8, w.buffered(), "/dev/gc 'G' #1 in 8 bytes"));
 }
 
 test "an unprintable group is written as a number" {
     var buffer: [128]u8 = undefined;
     var w = std.Io.Writer.fixed(&buffer);
-    try write(decode(encode(direction_void, 0x01, 3, 0)), 9, &w);
+    try write(decode(encode(direction_void, 0x01, 3, 0)), 9, null, &w);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "0x01") != null);
 }
 
@@ -219,6 +274,55 @@ test "a request is refused rather than silently accepted" {
     // Claiming a submission succeeded would leave a title waiting on a fence
     // that will never be signalled.
     try testing.expectEqual(@as(i64, -1), ioctl(3, encode(direction_in, 'G', 1, 8), 0));
+}
+
+test "a mode switch reads as clear, which is the retail state" {
+    filesystem.detach();
+    const fd = try filesystem.open("/dev/dipsw", filesystem.O.rdonly);
+    defer filesystem.close(fd) catch {};
+
+    var value: u32 = 0xdead_beef;
+    const request = encode(direction_out, 0x88, 6, @sizeOf(u32));
+    try testing.expectEqual(@as(i64, 0), ioctl(fd, request, @intFromPtr(&value)));
+    try testing.expectEqual(@as(u32, 0), value);
+}
+
+test "only what the request itself declares is written" {
+    filesystem.detach();
+    const fd = try filesystem.open("/dev/dipsw", filesystem.O.rdonly);
+    defer filesystem.close(fd) catch {};
+
+    // The declared length is the only bound there is, so a request larger than
+    // anything observed is refused rather than trusted to be honest.
+    var guard: [16]u8 = @splat(0xaa);
+    const oversized = encode(direction_out, 0x88, 6, maximum_answered_payload + 1);
+    try testing.expectEqual(@as(i64, -1), ioctl(fd, oversized, @intFromPtr(&guard)));
+    try testing.expectEqual(@as(u8, 0xaa), guard[0]);
+
+    // Four declared bytes touch four bytes and no more.
+    try testing.expectEqual(@as(i64, 0), ioctl(fd, encode(direction_out, 0x88, 6, 4), @intFromPtr(&guard)));
+    try testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0 }, guard[0..4]);
+    try testing.expectEqual(@as(u8, 0xaa), guard[4]);
+}
+
+test "a null payload is refused rather than written through" {
+    filesystem.detach();
+    const fd = try filesystem.open("/dev/dipsw", filesystem.O.rdonly);
+    defer filesystem.close(fd) catch {};
+    try testing.expectEqual(@as(i64, -1), ioctl(fd, encode(direction_out, 0x88, 6, 4), 0));
+}
+
+test "the graphics device is not answered by the switch reply" {
+    // The two devices share an entry point but nothing else; a submission must
+    // not be absorbed by the reply meant for switches.
+    filesystem.detach();
+    const fd = try filesystem.open("/dev/gc", filesystem.O.rdonly);
+    defer filesystem.close(fd) catch {};
+
+    var value: u32 = 0xdead_beef;
+    const request = encode(direction_in | direction_out, 0x81, 46, @sizeOf(u32));
+    try testing.expectEqual(@as(i64, -1), ioctl(fd, request, @intFromPtr(&value)));
+    try testing.expectEqual(@as(u32, 0xdead_beef), value);
 }
 
 test "device control exports register under published identifiers" {

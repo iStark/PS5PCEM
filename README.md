@@ -675,9 +675,9 @@ UI actions that cannot exist without a shell return `UNAVAILABLE`.
 Kernel user-edge event queues retain registrations and pending event payloads,
 and their waits use the same sequence-aware dispatcher contract as pthread
 synchronization. Main direct-memory allocation, named direct mappings, stack
-queries, and live pthread scheduling metadata are also exposed. File and APR
-entry points are linkable but return `ENOSYS` until the runtime owns a guest VFS
-and accelerator backend; they never fabricate successful I/O.
+queries, and live pthread scheduling metadata are also exposed. APR entry points
+are linkable but return `ENOSYS` until the runtime owns an accelerator backend;
+they never fabricate successful I/O.
 
 **Offline network, dialogs, and headless audio**
 ([src/hle/libs/network.zig](src/hle/libs/network.zig),
@@ -699,6 +699,41 @@ surface in [src/hle/libs/bootstrap_services.zig](src/hle/libs/bootstrap_services
 provides headless VideoOut/AvPlayer state and conservative platform/GPU command
 stubs solely to reach native title initialization; it does not render frames.
 
+**Title content and devices** ([src/hle/filesystem.zig](src/hle/filesystem.zig),
+[src/hle/libs/kernel_files.zig](src/hle/libs/kernel_files.zig),
+[src/hle/libs/kernel_ioctl.zig](src/hle/libs/kernel_ioctl.zig))
+
+A title sees the directory holding its executable as `/app0`, and nothing above
+it: a path that escapes the mount is refused rather than resolved against the
+host, because on hardware a title cannot reach there either. The mount is
+read-only, and anything that would modify it is refused rather than ignored, so
+a title never proceeds believing its data was stored. Each descriptor carries
+its own position and reads positionally, so two descriptors on one file cannot
+disturb each other, and a descriptor closed during a read cannot have a reused
+slot's position corrupted afterwards.
+
+Device nodes share that namespace because that is how a title reaches them, but
+they are answered here rather than from the host, which has no such devices.
+`/dev/gc` is the graphics core and `/dev/dipsw` the console's mode switches.
+A device is not a file: it needs no mount, since whether a game directory
+happens to be attached has nothing to do with whether hardware exists; reading
+or seeking one reports `ENODEV` rather than an empty file; and `stat` describes
+it as the character device it is.
+
+Control requests are decoded rather than passed through as opaque numbers. A
+request code is a packed record — direction, payload length, device group and
+command number — so a trace reads as `/dev/gc 0x81 #46 inout 4 bytes` instead of
+`0xc004812e`. That decoding is the specification any future implementation has
+to satisfy, and it is what a real driver's requests are now recorded as.
+
+Mode-switch reads are answered as clear, which is the state of a retail console
+and not an invented value; only the byte count the request itself declares is
+written, through a pointer checked against the guest address space, and only up
+to a bound. Graphics requests are refused with `ENOTTY`. That is deliberate:
+`/dev/gc` is where a driver submits work, and claiming a submission succeeded
+would leave a title waiting on a fence that is never signalled — a hang with
+nothing to explain it, rather than an error naming the request not handled.
+
 ## Error codes
 
 Two numbering schemes coexist in the guest ABI, and mixing them up is a common
@@ -714,7 +749,8 @@ from leaking into host code where nothing would check it.
 ## Roadmap
 
 1. Kernel event flags and semaphores on the existing dispatcher contract.
-2. Guest VFS path translation and descriptor ownership.
+2. The `/dev/gc` submission protocol, which is what a shipped graphics driver
+   needs before it will initialize.
 
 ---
 

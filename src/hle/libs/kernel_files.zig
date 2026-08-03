@@ -35,6 +35,7 @@ fn kernelStatus(err: Error) i32 {
         Error.IsDirectory => KernelError.eacces.raw(),
         Error.InvalidArgument => KernelError.einval.raw(),
         Error.IoFailed => KernelError.eio.raw(),
+        Error.NotSupported => KernelError.enodev.raw(),
     };
 }
 
@@ -49,6 +50,7 @@ fn posixNumber(err: Error) i32 {
         Error.IsDirectory => errno.Posix.eacces,
         Error.InvalidArgument => errno.Posix.einval,
         Error.IoFailed => errno.Posix.eio,
+        Error.NotSupported => errno.Posix.enodev,
     };
 }
 
