@@ -615,13 +615,14 @@ fn sceKernelDirectMemoryQuery(
             }
         }
     }
-    const found = reservation orelse {
-        if (flags == 1 and query_offset < pool.size) {
-            info.* = .{ .start = @intCast(pool.size), .end = @intCast(pool.size) };
-            return errno.ok;
-        }
-        return KernelError.eacces.raw();
-    };
+    // Nothing at or after the offset means the walk is over, and saying so is
+    // the whole answer. Reporting success with an empty region at the end of
+    // the pool — as this used to — describes a region that does not exist, and
+    // a title walking physical memory to learn what it owns is told it owns
+    // something it does not. The virtual-address walk ends with an error in
+    // exactly this situation and titles handle it, so there is no reason for
+    // the physical one to invent a final entry.
+    const found = reservation orelse return KernelError.eacces.raw();
     info.* = .{
         .start = @intCast(found.start),
         .end = @intCast(found.end()),
@@ -1480,6 +1481,35 @@ test "main direct-memory wrappers preserve reservation metadata" {
     try testing.expectEqual(@as(i64, @intCast(start + 2 * page_size)), info.end);
     try testing.expectEqual(@as(i32, 3), info.memory_type);
     try testing.expectEqual(errno.ok, sceKernelCheckedReleaseDirectMemory(start, 2 * page_size));
+}
+
+test "walking physical memory ends rather than inventing a last region" {
+    // A title walks its physical reservations to learn what it owns. Answering
+    // the step past the end with success and an empty region at the top of the
+    // pool describes a region that does not exist, and the title records it.
+    // The virtual-address walk ends with an error in exactly this situation and
+    // titles handle it.
+    init(testing.allocator);
+    defer deinit();
+
+    var start: u64 = 0;
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelAllocateDirectMemory(0, direct_memory_size, 2 * page_size, page_size, 0, &start),
+    );
+
+    var info = DirectMemoryQueryInfo{};
+    const size = @sizeOf(DirectMemoryQueryInfo);
+    try testing.expectEqual(errno.ok, sceKernelDirectMemoryQuery(0, 1, &info, size));
+    try testing.expectEqual(@as(i64, @intCast(start)), info.start);
+
+    // One past the only reservation, with plenty of pool left above it.
+    const past: i64 = @intCast(start + 2 * page_size);
+    try testing.expect(@as(u64, @intCast(past)) < direct_memory_size);
+    try testing.expectEqual(
+        KernelError.eacces.raw(),
+        sceKernelDirectMemoryQuery(past, 1, &info, size),
+    );
 }
 
 test "direct memory maps at an exact guest address" {
