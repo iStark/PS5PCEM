@@ -70,6 +70,18 @@ pub const flexible_memory_size: u64 = 4 * 1024 * 1024 * 1024;
 
 pub const maximum_name_length: usize = memory.maximum_name_length;
 
+/// Flags packed into `VirtualQueryInfo.state`.
+///
+/// The guest declares this field as a bitfield rather than an enumeration, so
+/// several flags describe one range at once: a mapping is of some type *and*
+/// committed. Naming them keeps the distinction visible.
+pub const state_flexible: u32 = 1 << 0;
+pub const state_direct: u32 = 1 << 1;
+pub const state_stack: u32 = 1 << 2;
+pub const state_pooled: u32 = 1 << 3;
+pub const state_committed: u32 = 1 << 4;
+pub const state_gpu_prt: u32 = 1 << 5;
+
 /// Guest ABI layout filled by sceKernelVirtualQuery.
 pub const VirtualQueryInfo = extern struct {
     start: u64 = 0,
@@ -780,10 +792,13 @@ fn sceKernelVirtualQuery(
     info.protection = mapping.protection_bits;
     info.memory_type = mapping.memory_type;
     info.state = switch (mapping.kind) {
-        .flexible => 0x01 | 0x10,
-        .direct_memory => 0x02 | 0x10,
+        .flexible => state_flexible | state_committed,
+        .direct_memory => state_direct | state_committed,
+        .stack => state_stack | state_committed,
+        // A reservation is a claim on addresses and nothing more: no type, and
+        // nothing committed behind it.
         .reserved => 0,
-        else => 0x10,
+        else => state_committed,
     };
     info.name = mapping.name;
     return errno.ok;
@@ -1378,6 +1393,44 @@ test "direct memory maps into part of a larger reservation" {
     );
     try testing.expectEqual(tail, tail_mapped);
     try testing.expect(address_space.isMappedAs(tail_mapped, map_size, .direct_memory));
+}
+
+test "a query reports what a range is and whether it is committed" {
+    var address_space = try memory.AddressSpace.initWithDirectMemory(
+        testing.allocator,
+        direct_memory_size,
+    );
+    defer address_space.deinit();
+
+    init(testing.allocator);
+    defer deinit();
+    attachAddressSpace(&address_space);
+
+    // The guest reads this field as a bitfield, so a range is of some type and
+    // committed at the same time; reporting only one of the two misleads a
+    // runtime that checks either.
+    const base = memory.system_managed.start;
+    try address_space.mapFixed(base, page_size, memory.Protection.read_write, .stack, null);
+
+    var info = VirtualQueryInfo{};
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelVirtualQuery(base, 0, &info, @sizeOf(VirtualQueryInfo)),
+    );
+    try testing.expect(info.state & state_stack != 0);
+    try testing.expect(info.state & state_committed != 0);
+    try testing.expect(info.state & state_direct == 0);
+
+    // A reservation claims addresses and nothing else: no type, not committed.
+    const reserved_base = base + 0x10_0000;
+    try address_space.reserveFixed(reserved_base, page_size);
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelVirtualQuery(reserved_base, 0, &info, @sizeOf(VirtualQueryInfo)),
+    );
+    try testing.expectEqual(@as(u32, 0), info.state);
+    try testing.expectEqual(reserved_base, info.start);
+    try testing.expectEqual(reserved_base + page_size, info.end);
 }
 
 test "flexible memory maps, queries, protects, unmaps, and reuses ranges" {
