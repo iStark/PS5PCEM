@@ -141,6 +141,20 @@ pub fn analyze(info: cpu.FaultInfo, address_space: ?*memory.AddressSpace) Report
 /// scan rather than a backtrace.
 const stack_scan_words: usize = 48;
 
+/// Whether a stack word can be a return address at all.
+///
+/// A return address points into code that has been executed, so the page it
+/// names must be executable. Without this test a scan keeps every word that
+/// merely falls inside a module's address range — sizes, counts, flags — and
+/// those crowd out the frames that explain the failure. Requiring the page to
+/// be executable removes almost all of them at no cost, and cannot discard a
+/// real return address, because the code it points at had to be runnable.
+pub fn isReturnAddress(address_space: *memory.AddressSpace, address: u64) bool {
+    if (address == 0) return false;
+    const mapping = address_space.query(address -| 1, false) orelse return false;
+    return mapping.protection.execute;
+}
+
 /// Writes stack words that point into loaded code.
 pub fn writeStackTrace(
     report: Report,
@@ -160,6 +174,7 @@ pub fn writeStackTrace(
         // keeps the lookup on the calling instruction.
         const location = map.locate(word -| 1);
         if (!location.isKnown()) continue;
+        if (!isReturnAddress(address_space, word)) continue;
 
         if (printed == 0) try w.writeAll("  stack scan\n");
         try w.writeAll("    ");
@@ -396,6 +411,28 @@ test "without an address space a null call has no caller" {
     const report = analyze(accessViolation(0, 0, .execute), null);
     try testing.expectEqual(Diagnosis.null_call, report.diagnosis);
     try testing.expect(report.return_address == null);
+}
+
+test "a stack word is only a return address if it points at runnable code" {
+    // A scan that keeps every word falling inside a module keeps sizes, counts
+    // and flags too, and those crowd out the frames that explain the failure.
+    var space = try memory.AddressSpace.init(testing.allocator);
+    defer space.deinit();
+
+    const code = memory.user.start;
+    const data = memory.user.start + memory.page_size;
+    try space.mapFixed(code, memory.page_size, memory.Protection.read_execute, .module, null);
+    try space.mapFixed(data, memory.page_size, memory.Protection.read_write, .private, null);
+
+    // A return address points after its call, so a word one past the end of an
+    // executable page still belongs to it.
+    try testing.expect(isReturnAddress(&space, code + 0x40));
+    try testing.expect(isReturnAddress(&space, code + memory.page_size));
+
+    // A value that merely lands in mapped memory is not one.
+    try testing.expect(!isReturnAddress(&space, data + 0x40));
+    try testing.expect(!isReturnAddress(&space, 0));
+    try testing.expect(!isReturnAddress(&space, memory.user.start - memory.page_size));
 }
 
 test "the report names the module and anchors the address" {

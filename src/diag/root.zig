@@ -22,6 +22,7 @@ pub const analyzeFault = fault.analyze;
 pub const writeFault = fault.write;
 pub const writeStackTrace = fault.writeStackTrace;
 pub const writeMessageArguments = fault.writeMessageArguments;
+pub const isReturnAddress = fault.isReturnAddress;
 pub const readGuestText = fault.readGuestText;
 
 test {

@@ -249,7 +249,11 @@ pub const Runtime = struct {
     /// call trace answers which firmware calls a title made; this answers which
     /// of the title's own code made one of them, which is the only question left
     /// when a title repeats a call thousands of times.
-    fn writeCapturedStack(map: *const diag.SymbolMap, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    fn writeCapturedStack(
+        map: *const diag.SymbolMap,
+        address_space: *memory.AddressSpace,
+        w: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
         const capture = hle.trace.capturedStack() orelse return;
         try w.print(
             "  guest stack at {s} call {d}\n",
@@ -257,16 +261,23 @@ pub const Runtime = struct {
         );
 
         var printed: usize = 0;
+        var previous: u64 = 0;
         for (capture.words) |value| {
             // A return address points after its call, so stepping back keeps
             // the lookup on the calling instruction.
             const location = map.locate(value -| 1);
             if (!location.isKnown()) continue;
+            if (!diag.isReturnAddress(address_space, value)) continue;
+            // One value repeated down the stack is a saved register, not a
+            // chain of calls, and printing it several times buries the rest.
+            if (value == previous) continue;
+            previous = value;
+
             try w.writeAll("    ");
             try map.write(value -| 1, w);
             try w.writeAll("\n");
             printed += 1;
-            if (printed >= 12) break;
+            if (printed >= 24) break;
         }
         if (printed == 0) try w.writeAll("    nothing on it resolves to loaded code\n");
     }
@@ -303,7 +314,7 @@ pub const Runtime = struct {
         // explanation than the fault itself: a title's own runtime reacts to a
         // failed call long before anything crashes.
         if (space) |value| try writeGuestDiagnostics(value, w);
-        try writeCapturedStack(map, w);
+        if (space) |value| try writeCapturedStack(map, value, w);
         try hle.trace.write(w, 32);
         return true;
     }
