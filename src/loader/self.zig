@@ -21,6 +21,20 @@ pub const Error = error{
 /// Raw PS5 SELF signature as it appears in the file.
 pub const magic = [4]u8{ 0x54, 0x14, 0xf5, 0xee };
 
+/// Signature of the older container the same tooling emits.
+///
+/// Titles re-wrapped to run on earlier firmware carry this instead. Everything
+/// after the signature is laid out identically — the same header fields, the
+/// same segment table — so the two are one format under two names, and
+/// rejecting the second would refuse a file we can already read.
+pub const legacy_magic = [4]u8{ 0x4f, 0x15, 0x3d, 0x1d };
+
+fn hasSelfSignature(bytes: []const u8) bool {
+    if (bytes.len < magic.len) return false;
+    const head = bytes[0..magic.len];
+    return std.mem.eql(u8, head, &magic) or std.mem.eql(u8, head, &legacy_magic);
+}
+
 const segment_blocked: u64 = 0x800;
 const segment_encrypted: u64 = 0x2;
 const segment_compressed: u64 = 0x8;
@@ -82,9 +96,7 @@ fn readAt(comptime T: type, bytes: []const u8, offset: usize) Error!T {
 
 /// Returns null for a bare ELF and a validated layout for a PS5 SELF.
 pub fn parse(bytes: []const u8) Error!?Layout {
-    if (bytes.len < magic.len or !std.mem.eql(u8, bytes[0..magic.len], &magic)) {
-        return null;
-    }
+    if (!hasSelfSignature(bytes)) return null;
 
     const header = try readAt(Header, bytes, 0);
     // Signing fields vary, but these bytes identify the fixed SELF layout used
@@ -162,6 +174,39 @@ test "decrypted PS5 SELF layout is parsed without copying" {
     try testing.expectEqual(@as(usize, 1), layout.segments.len);
     try testing.expect(layout.segments[0].isBlocked());
     try testing.expectEqual(@as(usize, 0), layout.segments[0].programHeaderIndex());
+}
+
+test "the older container signature is accepted on the same layout" {
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(testing.allocator);
+
+    // A title re-wrapped for earlier firmware carries a different signature and
+    // nothing else different. Refusing it would turn a readable file away.
+    var header = std.mem.zeroes(Header);
+    @memcpy(header.ident[0..4], &legacy_magic);
+    header.ident[5] = 1;
+    header.ident[6] = 1;
+    header.ident[7] = 0x12;
+    header.segment_count = 1;
+
+    try appendValue(&bytes, header);
+    try appendValue(&bytes, Segment{
+        .type = segment_blocked,
+        .offset = 0x80,
+        .compressed_size = 4,
+        .decompressed_size = 4,
+    });
+    try bytes.appendNTimes(testing.allocator, 0, 0x80 - bytes.items.len);
+    try bytes.appendSlice(testing.allocator, "SELF");
+
+    const layout = (try parse(bytes.items)) orelse return error.TestExpectedSelf;
+    try testing.expectEqual(@as(usize, 1), layout.segments.len);
+
+    // A file carrying neither signature is still not a container.
+    var bare = bytes.items[0..8].*;
+    bare[0] = 0x7f;
+    bare[1] = 'E';
+    try testing.expect((try parse(&bare)) == null);
 }
 
 test "truncated SELF tables and payload ranges are rejected" {
