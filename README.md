@@ -861,6 +861,32 @@ to a bound. Graphics requests are refused with `ENOTTY`. That is deliberate:
 would leave a title waiting on a fence that is never signalled — a hang with
 nothing to explain it, rather than an error naming the request not handled.
 
+**Graphics command construction** ([src/hle/libs/agc.zig](src/hle/libs/agc.zig))
+
+A title does not ask the graphics library to draw. It asks it to *write*: each
+entry point appends one command to a buffer the title owns, and the buffer is
+handed over later in a single submission. What these have to get right is
+therefore not rendering but bookkeeping — how much room a command takes, and
+that the buffer stays a walkable sequence of commands afterwards.
+
+Each command is written as a correctly formed no-operation of the size the real
+command would have taken, which is not the same as filling the space with
+zeroes. Zeroes decode as a register write of one word, so a buffer of them is
+not merely inert: it is a different, shorter stream that nothing can walk. A
+no-operation states what is true — a command occupied this much room and did
+nothing — and everything after it still parses, including through
+[`gpu.pm4`](src/gpu/pm4.zig). The size a title is told to reserve and the size a
+write consumes are the same number, because a title that asks first and writes
+second will otherwise overrun its buffer or leave a hole nothing accounts for.
+
+Patch entry points are accepted and change nothing: they edit a field of a
+command already written, usually an address unknown when it was built, and
+editing a no-operation is harmless. Frame capture, submission validation and
+shader debugging report themselves off, which is the retail answer and the one
+that stops a title waiting for a capture nobody will take. Resource
+registration is refused, because it hands back names and addresses a title
+keeps and later follows.
+
 **GPU submission** ([src/hle/libs/agc_submit.zig](src/hle/libs/agc_submit.zig))
 
 The submission entry points are where a title hands its GPU work over, and by
