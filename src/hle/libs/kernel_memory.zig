@@ -19,6 +19,7 @@ const abi = @import("../abi.zig");
 const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
+const runtime_api = @import("kernel_runtime.zig");
 
 const KernelError = errno.KernelError;
 
@@ -737,6 +738,119 @@ fn sceKernelMapFlexibleMemory(
     return mapFlexibleMemory(out_address, len, protection_bits, flags, "");
 }
 
+/// System flexible memory, which differs only in whose budget it comes from.
+///
+/// System libraries use this for their own working memory instead of the
+/// title's. Nothing here tracks the two budgets separately yet, so it maps the
+/// same way; the distinction costs a title nothing until a budget is enforced.
+fn sceKernelMapNamedSystemFlexibleMemory(
+    out_address: ?*u64,
+    len: u64,
+    protection_bits: i32,
+    flags: i32,
+    name_pointer: ?[*:0]const u8,
+) callconv(abi.guest) i32 {
+    return sceKernelMapNamedFlexibleMemory(out_address, len, protection_bits, flags, name_pointer);
+}
+
+const posix_map_anonymous: i32 = 0x1000;
+const posix_map_fixed: i32 = 0x0010;
+const posix_prot_read: i32 = 0x1;
+const posix_prot_write: i32 = 0x2;
+const posix_prot_exec: i32 = 0x4;
+
+/// The POSIX mapping call, for the anonymous memory it is usually asked for.
+///
+/// Anonymous requests are flexible memory under another name, so they are
+/// answered that way. A file-backed mapping is refused instead of quietly
+/// producing zeroed pages: a caller expecting file contents and finding zeros
+/// fails much later and for reasons that point nowhere near here.
+///
+/// The protection bits are the POSIX ones, which do not match the guest's own
+/// numbering, so they are translated rather than passed through.
+fn mmap(
+    address: u64,
+    len: u64,
+    protection_bits: i32,
+    flags: i32,
+    descriptor: i32,
+    _: i64,
+) callconv(abi.guest) i64 {
+    if (flags & posix_map_anonymous == 0 or descriptor >= 0) {
+        runtime_api.setPosixErrno(errno.Posix.enosys);
+        return -1;
+    }
+    if (len == 0) {
+        runtime_api.setPosixErrno(errno.Posix.einval);
+        return -1;
+    }
+
+    var guest_protection: i32 = 0;
+    if (protection_bits & posix_prot_read != 0) guest_protection |= prot_cpu_read;
+    if (protection_bits & posix_prot_write != 0) guest_protection |= prot_cpu_write;
+    if (protection_bits & posix_prot_exec != 0) guest_protection |= prot_cpu_execute;
+
+    var mapped: u64 = if (flags & posix_map_fixed != 0) address else 0;
+    const rounded = std.mem.alignForward(u64, len, page_size);
+    const status = mapFlexibleMemory(
+        &mapped,
+        rounded,
+        guest_protection,
+        if (flags & posix_map_fixed != 0) map_fixed else 0,
+        "mmap",
+    );
+    if (status != errno.ok) {
+        runtime_api.setPosixErrno(errno.kernelToPosix(status));
+        return -1;
+    }
+    return @bitCast(mapped);
+}
+
+/// Memory reserved for development hardware.
+///
+/// A retail console has none, and reporting otherwise would let a title
+/// allocate from a region that does not exist. Every entry point in the family
+/// therefore agrees that the pool is empty rather than each guessing.
+const tool_memory_size: u64 = 0;
+
+fn availableToolMemorySize() callconv(abi.guest) u64 {
+    return tool_memory_size;
+}
+
+fn allocateToolMemory() callconv(abi.guest) i32 {
+    return KernelError.enomem.raw();
+}
+
+fn mapToolMemory() callconv(abi.guest) i32 {
+    return KernelError.enomem.raw();
+}
+
+fn releaseToolMemory() callconv(abi.guest) i32 {
+    return KernelError.einval.raw();
+}
+
+fn getToolMemoryRange() callconv(abi.guest) i32 {
+    return KernelError.enosys.raw();
+}
+
+/// Statistics about the process page tables.
+///
+/// Refused rather than filled: the record's layout is not established, and a
+/// guessed one would be written straight into the caller's buffer.
+fn getPageTableStats() callconv(abi.guest) i32 {
+    return KernelError.enosys.raw();
+}
+
+/// Applies several mappings in one call.
+///
+/// Refused for now. The entry describes each operation through a record whose
+/// layout is not established, and misreading it would map the wrong physical
+/// memory at the wrong address — a failure that surfaces as corruption rather
+/// than as an error.
+fn batchMap2() callconv(abi.guest) i32 {
+    return KernelError.enosys.raw();
+}
+
 /// Removes any fully covered combination of direct, flexible, or reserved
 /// mappings. AddressSpace preserves the process-wide outer reservations.
 fn sceKernelMunmap(address: u64, len: u64) callconv(abi.guest) i32 {
@@ -990,6 +1104,42 @@ pub const exports = [_]symbols.Export{
         .expect_id = "IWIBBdTHit4",
     },
     .{
+        .name = "sceKernelMapNamedSystemFlexibleMemory",
+        .function = trace.wrap("sceKernelMapNamedSystemFlexibleMemory", &sceKernelMapNamedSystemFlexibleMemory),
+        .expect_id = "kc+LEEIYakc",
+    }, .{
+        .name = "mmap",
+        .function = trace.wrap("mmap", &mmap),
+        .expect_id = "BPE9s9vQQXo",
+    }, .{
+        .name = "sceKernelAvailableToolMemorySize",
+        .function = trace.wrap("sceKernelAvailableToolMemorySize", &availableToolMemorySize),
+        .expect_id = "YkwlupG-S4E",
+    }, .{
+        .name = "sceKernelAllocateToolMemory",
+        .function = trace.wrap("sceKernelAllocateToolMemory", &allocateToolMemory),
+        .expect_id = "45Yurf7lZmU",
+    }, .{
+        .name = "sceKernelMapToolMemory",
+        .function = trace.wrap("sceKernelMapToolMemory", &mapToolMemory),
+        .expect_id = "d0vezuPZxtg",
+    }, .{
+        .name = "sceKernelReleaseToolMemory",
+        .function = trace.wrap("sceKernelReleaseToolMemory", &releaseToolMemory),
+        .expect_id = "gO98NioN5FM",
+    }, .{
+        .name = "sceKernelGetToolMemoryRange",
+        .function = trace.wrap("sceKernelGetToolMemoryRange", &getToolMemoryRange),
+        .expect_id = "dkBx0YqFQ+Y",
+    }, .{
+        .name = "sceKernelGetPageTableStats",
+        .function = trace.wrap("sceKernelGetPageTableStats", &getPageTableStats),
+        .expect_id = "tZ2yplY8MBY",
+    }, .{
+        .name = "sceKernelBatchMap2",
+        .function = trace.wrap("sceKernelBatchMap2", &batchMap2),
+        .expect_id = "kBJzF8x4SyE",
+    }, .{
         .name = "sceKernelMunmap",
         .function = trace.wrap("sceKernelMunmap", &sceKernelMunmap),
         .expect_id = "cQke9UuBQOk",
