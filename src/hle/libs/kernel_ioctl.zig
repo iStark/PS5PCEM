@@ -14,6 +14,29 @@
 //! payload travels and how large it is. Decoding it turns a trace of bare
 //! integers into a description of what the driver wanted, which is the
 //! specification any future implementation has to satisfy.
+//!
+//! ## What a shipped driver asks for
+//!
+//! Observed by running a title's own `libSceAgcDriver` against this layer and
+//! reading its diagnostics. Neither reference emulator records any of it: both
+//! reimplement the graphics API instead and never reach a device node. Recorded
+//! here because it is the specification, and it took a working driver to
+//! obtain.
+//!
+//! - `/dev/gc` `#46`, in/out, 4 bytes. Asked first, with the buffer zeroed.
+//!   Answering non-zero satisfies the driver's GPU presence check: its
+//!   "Cannot initialize the Gpu" diagnostic stops, and it proceeds to `#59`.
+//! - `/dev/gc` `#59`, in/out, 16 bytes. The wrapper fills the buffer with
+//!   `0xff` *before* calling, so the all-ones payload is an unset-output
+//!   sentinel and not a request. It tests only whether the call returned zero,
+//!   then copies all 16 bytes to its caller. What the fields mean is still
+//!   unknown: supplying plausible base/size pairs did not satisfy the library
+//!   above it, so the acceptance test lives elsewhere.
+//! - `/dev/dipsw` `#6`, out, 4 bytes. Answered here; see below.
+//!
+//! Past that, the driver's global device context is still null and it
+//! dereferences it unchecked. Reaching a first frame therefore means finding
+//! which request populates that context, not adding more replies at random.
 
 const std = @import("std");
 const abi = @import("../abi.zig");
@@ -124,15 +147,41 @@ pub fn write(
     );
 }
 
+/// The most payload bytes shown in one trace line.
+const maximum_traced_payload: u16 = 32;
+
+/// Appends the bytes the caller sent, when it sent any.
+///
+/// The shape of a request says what kind of thing was asked; the payload is the
+/// question itself. Without it a submission and a query look alike. Only what
+/// genuinely travels inward is shown — a caller filling a read-only buffer has
+/// told us nothing, and printing its uninitialized contents would invent a
+/// pattern where there is none.
+fn writePayload(request: Request, payload: u64, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    switch (request.direction) {
+        .write, .read_write => {},
+        else => return,
+    }
+    if (request.length == 0) return;
+    const shown = @min(request.length, maximum_traced_payload);
+    if (!memory.isGuestRangeAccessible(payload, shown)) return;
+
+    const bytes: [*]const u8 = @ptrFromInt(payload);
+    try w.writeAll(" in:");
+    for (bytes[0..shown]) |byte| try w.print(" {x:0>2}", .{byte});
+    if (shown < request.length) try w.writeAll(" ...");
+}
+
 /// Announces a request when live tracing is on.
 ///
 /// The generic call trace already records the raw arguments; this adds the only
-/// part that is not reconstructable from them at a glance.
-fn announce(descriptor: i32, device: ?filesystem.Device, request: Request) void {
+/// parts that are not reconstructable from them at a glance.
+fn announce(descriptor: i32, device: ?filesystem.Device, request: Request, payload: u64) void {
     if (!trace.isLive()) return;
-    var buffer: [128]u8 = undefined;
+    var buffer: [256]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
     write(request, descriptor, device, &writer) catch return;
+    writePayload(request, payload, &writer) catch {};
     std.debug.print("[ioctl] {s}\n", .{writer.buffered()});
 }
 
@@ -174,7 +223,7 @@ fn answerDipSwitch(request: Request, payload: u64) bool {
 fn ioctl(descriptor: i32, request_code: u64, payload: u64) callconv(abi.guest) i64 {
     const device = filesystem.deviceOf(descriptor);
     const request = decode(request_code);
-    announce(descriptor, device, request);
+    announce(descriptor, device, request, payload);
 
     if (device == .dip_switches and answerDipSwitch(request, payload)) return 0;
 

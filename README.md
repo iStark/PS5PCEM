@@ -723,8 +723,17 @@ it as the character device it is.
 Control requests are decoded rather than passed through as opaque numbers. A
 request code is a packed record — direction, payload length, device group and
 command number — so a trace reads as `/dev/gc 0x81 #46 inout 4 bytes` instead of
-`0xc004812e`. That decoding is the specification any future implementation has
-to satisfy, and it is what a real driver's requests are now recorded as.
+`0xc004812e`, followed by the bytes that actually travelled inward. That
+decoding is the specification any future implementation has to satisfy, and it
+is what a real driver's requests are now recorded as.
+
+What a shipped `libSceAgcDriver` asks for is documented in
+[src/hle/libs/kernel_ioctl.zig](src/hle/libs/kernel_ioctl.zig): which request
+comes first, what answering it unlocks, and — for the one whose payload looks
+like a request but is not — why. It was obtained by running the driver against
+this layer and reading its own diagnostics, then confirming each reading against
+its machine code. Neither reference emulator records any of it, because both
+reimplement the graphics API and never reach a device node.
 
 Mode-switch reads are answered as clear, which is the state of a retail console
 and not an invented value; only the byte count the request itself declares is
