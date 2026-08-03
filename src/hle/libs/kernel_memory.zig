@@ -172,9 +172,13 @@ pub const Pool = struct {
         return null;
     }
 
-    pub fn hasExactReservation(self: *const Pool, start: u64, len: u64) bool {
-        for (self.reservations.items) |reservation| {
-            if (reservation.start == start and reservation.len == len) return true;
+    /// Whether any part of a range is reserved.
+    ///
+    /// Asked before a release does anything, so that a range owning nothing is
+    /// refused without having torn down mappings on the way to refusing it.
+    pub fn hasAnyReservation(self: *const Pool, start: u64, len: u64) bool {
+        for (self.reservations.items) |r| {
+            if (r.overlaps(start, len)) return true;
         }
         return false;
     }
@@ -374,15 +378,36 @@ fn sceKernelAllocateDirectMemory(
 }
 
 /// Releases a range reserved by `sceKernelAllocateDirectMemory`.
+///
+/// The range need not match a reservation. Physical memory is owned by offset,
+/// not by the call that acquired it: a title routinely takes a large region once
+/// and then hands parts of it back as it finishes with them, and it may hand
+/// back a span that crosses two acquisitions. The pool models that; requiring an
+/// exact match here would refuse every one of those releases, and a title whose
+/// releases all fail exhausts the pool and then dereferences the failure.
+///
+/// What is still refused is a range covering nothing reserved, which means the
+/// title believes it owns memory it does not.
+///
+/// Any mapping that views the released memory is taken down as part of the
+/// release, rather than the release being refused because one exists. A window
+/// onto physical memory cannot outlive the memory, and a title is not required
+/// to close its windows first — firmware does that for it.
 fn sceKernelReleaseDirectMemory(start: u64, len: u64) callconv(abi.guest) i32 {
     pool_lock.lock();
     defer pool_lock.unlock();
 
-    if (!pool.hasExactReservation(start, len)) return KernelError.einval.raw();
+    if (len == 0 or
+        !std.mem.isAligned(start, page_size) or
+        !std.mem.isAligned(len, page_size))
+    {
+        return KernelError.einval.raw();
+    }
+    // Ordered before the unmapping so that a range owning nothing is refused
+    // without having taken anything down on the way to saying so.
+    if (!pool.hasAnyReservation(start, len)) return KernelError.einval.raw();
     if (guest_address_space) |address_space| {
-        if (address_space.hasDirectMemoryMappings(start, len)) {
-            return KernelError.ebusy.raw();
-        }
+        _ = address_space.unmapDirectMemoryBacking(start, len);
     }
     const gpa = pool_gpa orelse return KernelError.enomem.raw();
     pool.release(gpa, start, len) catch |err| return switch (err) {
@@ -1357,6 +1382,86 @@ test "allocate and release round-trip through the entry points" {
     );
 }
 
+test "physical memory is handed back in whatever pieces the title chooses" {
+    // A title takes a large region once and returns parts of it as it finishes
+    // with them. Refusing a release that is not exactly an acquisition leaves
+    // every one of those failing, and a title whose releases all fail exhausts
+    // the pool and then dereferences the failure.
+    init(testing.allocator);
+    defer deinit();
+
+    var start: u64 = 0;
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelAllocateDirectMemory(0, direct_memory_size, 8 * page_size, page_size, 0, &start),
+    );
+    try testing.expectEqual(@as(u64, 8 * page_size), pool.used());
+
+    // The front of it.
+    try testing.expectEqual(errno.ok, sceKernelReleaseDirectMemory(start, 2 * page_size));
+    try testing.expectEqual(@as(u64, 6 * page_size), pool.used());
+
+    // A piece out of the middle, leaving a hole.
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelReleaseDirectMemory(start + 4 * page_size, page_size),
+    );
+    try testing.expectEqual(@as(u64, 5 * page_size), pool.used());
+
+    // And the rest, in one span that covers what is left on both sides of the
+    // hole as well as ground already released.
+    try testing.expectEqual(errno.ok, sceKernelReleaseDirectMemory(start, 8 * page_size));
+    try testing.expectEqual(@as(u64, 0), pool.used());
+}
+
+test "a release still has to name memory the title owns" {
+    init(testing.allocator);
+    defer deinit();
+
+    var start: u64 = 0;
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelAllocateDirectMemory(0, direct_memory_size, 4 * page_size, page_size, 0, &start),
+    );
+
+    // Past everything reserved: the title believes it owns memory it does not.
+    try testing.expectEqual(
+        KernelError.einval.raw(),
+        sceKernelReleaseDirectMemory(start + 64 * page_size, page_size),
+    );
+
+    // Sizes and offsets that no allocation could have produced.
+    try testing.expectEqual(KernelError.einval.raw(), sceKernelReleaseDirectMemory(start, 0));
+    try testing.expectEqual(
+        KernelError.einval.raw(),
+        sceKernelReleaseDirectMemory(start + 1, page_size),
+    );
+    try testing.expectEqual(
+        KernelError.einval.raw(),
+        sceKernelReleaseDirectMemory(start, page_size + 1),
+    );
+    try testing.expectEqual(@as(u64, 4 * page_size), pool.used());
+}
+
+test "the exhaustion a leaked release causes does not return" {
+    // The shape of the failure that motivated this: a title probes how much
+    // memory it can get by taking a region, handing it back, and asking for
+    // twice as much. If the hand-back does not take, the probe runs out.
+    init(testing.allocator);
+    defer deinit();
+
+    var size: u64 = page_size;
+    while (size <= direct_memory_size / 2) : (size *= 2) {
+        var start: u64 = 0;
+        try testing.expectEqual(
+            errno.ok,
+            sceKernelAllocateDirectMemory(0, direct_memory_size, size, page_size, 0, &start),
+        );
+        try testing.expectEqual(errno.ok, sceKernelReleaseDirectMemory(start, size));
+        try testing.expectEqual(@as(u64, 0), pool.used());
+    }
+}
+
 test "main direct-memory wrappers preserve reservation metadata" {
     init(testing.allocator);
     defer deinit();
@@ -1462,10 +1567,6 @@ test "direct memory maps at an exact guest address" {
     );
     try address_space.read(alias, &bytes);
     try testing.expectEqualStrings("direct", &bytes);
-    try testing.expectEqual(
-        KernelError.ebusy.raw(),
-        sceKernelReleaseDirectMemory(start, page_size),
-    );
 
     var direct_info = VirtualQueryInfo{};
     try testing.expectEqual(
@@ -1480,6 +1581,69 @@ test "direct memory maps at an exact guest address" {
     try testing.expectEqual(errno.ok, sceKernelMunmap(virtual_address, page_size));
     try testing.expectEqual(errno.ok, sceKernelMunmap(alias, page_size));
     try testing.expectEqual(errno.ok, sceKernelReleaseDirectMemory(start, page_size));
+}
+
+test "a window onto physical memory does not outlive it" {
+    // A title hands physical memory back without closing its windows first, and
+    // firmware takes them down for it. Refusing the release while a mapping
+    // exists fails every hand-back a title makes; leaving the mapping behind
+    // would let the pool reissue those offsets while a stale alias still
+    // reaches them, which is how an address space corrupts a title invisibly.
+    var address_space = try memory.AddressSpace.initWithDirectMemory(
+        testing.allocator,
+        direct_memory_size,
+    );
+    defer address_space.deinit();
+
+    init(testing.allocator);
+    defer deinit();
+    attachAddressSpace(&address_space);
+
+    const title_protection = prot_cpu_read | prot_cpu_write;
+
+    var start: u64 = 0;
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelAllocateDirectMemory(0, direct_memory_size, 2 * page_size, page_size, 0, &start),
+    );
+
+    var first = memory.user.start;
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelMapDirectMemory(&first, page_size, title_protection, map_fixed, start, 0),
+    );
+    var second = memory.user.start + page_size;
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelMapDirectMemory(&second, page_size, title_protection, map_fixed, start, 0),
+    );
+    try testing.expect(address_space.isMappedAs(first, page_size, .direct_memory));
+    try testing.expect(address_space.isMappedAs(second, page_size, .direct_memory));
+
+    try testing.expectEqual(errno.ok, sceKernelReleaseDirectMemory(start, 2 * page_size));
+
+    // Both windows are gone, and so is the reservation behind them.
+    try testing.expect(address_space.query(first, false) == null);
+    try testing.expect(address_space.query(second, false) == null);
+    try testing.expectEqual(@as(u64, 0), pool.used());
+
+    // Releasing memory the title does not own still fails, and takes nothing
+    // down on its way to saying so.
+    var other: u64 = 0;
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelAllocateDirectMemory(0, direct_memory_size, page_size, page_size, 0, &other),
+    );
+    var kept = memory.user.start;
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelMapDirectMemory(&kept, page_size, title_protection, map_fixed, other, 0),
+    );
+    try testing.expectEqual(
+        KernelError.einval.raw(),
+        sceKernelReleaseDirectMemory(other + 32 * page_size, page_size),
+    );
+    try testing.expect(address_space.isMappedAs(kept, page_size, .direct_memory));
 }
 
 test "direct memory maps into part of a larger reservation" {

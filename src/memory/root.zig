@@ -532,9 +532,48 @@ pub const AddressSpace = struct {
         self.mappings = replacement;
     }
 
+    /// Removes every mapping that views a physical direct-memory range.
+    ///
+    /// Physical memory is owned by offset, and a mapping is a window onto it. A
+    /// title that hands the memory back has given up what those windows look at,
+    /// so they cannot outlive it: leaving them would let the pool hand the same
+    /// offsets to another allocation while stale aliases still reach them, which
+    /// is the one way an emulated address space can corrupt a title invisibly.
+    ///
+    /// A title is not required to take the windows down first. Real firmware
+    /// does this for it, and refusing the release until it does would fail every
+    /// hand-back a title makes.
+    ///
+    /// Returns how many mappings were removed.
+    pub fn unmapDirectMemoryBacking(self: *AddressSpace, offset: u64, size: u64) usize {
+        if (size == 0) return 0;
+        const end = std.math.add(u64, offset, size) catch return 0;
+
+        var removed: usize = 0;
+        while (true) {
+            const victim = self.findDirectMemoryAlias(offset, end) orelse return removed;
+            // Dropped outside the lock the search took, because unmapping takes
+            // it again. Re-searching from the start each time is fine: the list
+            // shrinks by one every round.
+            self.unmap(victim.address, victim.size) catch return removed;
+            removed += 1;
+        }
+    }
+
+    fn findDirectMemoryAlias(self: *AddressSpace, offset: u64, end: u64) ?Mapping {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.mappings.items) |mapping| {
+            if (mapping.kind != .direct_memory) continue;
+            const mapping_offset = mapping.backing_offset orelse continue;
+            const mapping_end = std.math.add(u64, mapping_offset, mapping.size) catch continue;
+            if (mapping_offset < end and offset < mapping_end) return mapping;
+        }
+        return null;
+    }
+
     /// Reports whether a physical direct-memory range is visible through any
-    /// guest mapping. Releasing such a reservation would let the pool hand the
-    /// same offsets to another allocation while stale aliases still access it.
+    /// guest mapping.
     pub fn hasDirectMemoryMappings(self: *AddressSpace, offset: u64, size: u64) bool {
         if (size == 0) return false;
         const end = std.math.add(u64, offset, size) catch return true;
@@ -722,6 +761,12 @@ pub const AddressSpace = struct {
             .size = size,
             .protection = protection,
             .kind = kind,
+            // Carried through, not dropped. This mapping is a window onto
+            // physical memory, and the offset is the only record of which
+            // physical memory: without it a title asking what backs the address
+            // is told zero, and everything it does with that answer — releasing
+            // the memory, in particular — names the wrong region.
+            .backing_offset = backing_offset,
             .protection_bits = 0,
             .name = namedMapping("anon"),
         });
