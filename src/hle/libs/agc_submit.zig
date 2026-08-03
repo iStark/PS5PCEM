@@ -1,0 +1,277 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+
+//! Where a title hands its GPU work over.
+//!
+//! A title builds a command buffer in its own memory and then calls one of a
+//! few submission entry points. That call is the whole interface: every draw,
+//! every state change, every fence a frame contains is already sitting in the
+//! buffer by the time it arrives here. Intercepting it therefore yields the
+//! complete description of a frame, without having to model any of the calls
+//! that produced it.
+//!
+//! Nothing is rendered. What happens here is that a submission is *read*: the
+//! buffer is decoded into named commands and summarised, so the trace shows
+//! what the title asked the hardware to do. That is worth having before any
+//! rendering exists — it is how one learns what a real frame is made of, and it
+//! is checkable against the title's own behaviour.
+//!
+//! Submissions are accepted rather than refused, which is the opposite of the
+//! choice made for the graphics device. The distinction is what a caller does
+//! with the answer: the device request that is refused is one whose reply the
+//! driver stores and dereferences, so a false success crashes it. A submission
+//! returns only a status, and a title that submits work is not blocked on this
+//! call returning — reporting failure here would abort a frame the title had
+//! already fully described, and lose the description with it.
+
+const std = @import("std");
+const gpu = @import("gpu");
+const abi = @import("../abi.zig");
+const trace = @import("../trace.zig");
+const errno = @import("../errno.zig");
+const symbols = @import("../symbols.zig");
+const memory = @import("kernel_memory.zig");
+
+/// A submission descriptor: where the buffer is and how long it is.
+///
+/// Length is in words rather than bytes because the command stream is a
+/// sequence of words and every size in this interface is counted that way.
+pub const Submission = extern struct {
+    address: ?[*]const u32,
+    word_count: u32,
+    reserved: u32,
+};
+
+/// How many packets are listed before a submission is summarised instead.
+///
+/// A frame's buffer runs to tens of thousands of packets. Printing all of them
+/// buries the shape of the frame in its own detail, and the first commands are
+/// where the shape is: the set-up that a draw depends on comes before the draw.
+const listed_packet_limit: usize = 64;
+
+/// What one submitted buffer contained.
+pub const Summary = struct {
+    packets: usize = 0,
+    draws: usize = 0,
+    dispatches: usize = 0,
+    /// Words the walk covered before stopping, which is the whole buffer unless
+    /// something in it did not decode.
+    words_read: usize = 0,
+    /// Set when decoding stopped early. A stream is read out of guest memory,
+    /// so this is a real possibility and not a formality.
+    stopped: ?gpu.pm4.Error = null,
+};
+
+/// Reads a submitted buffer without executing any of it.
+pub fn summarize(stream: []const u32) Summary {
+    var result = Summary{};
+    var walker = gpu.pm4.Walker.init(stream);
+    while (true) {
+        const packet = walker.next() catch |err| {
+            result.stopped = err;
+            return result;
+        } orelse break;
+        result.packets += 1;
+        result.words_read = walker.index;
+        if (packet.kind == .command) {
+            if (gpu.pm4.isDraw(packet.opcode)) result.draws += 1;
+            if (gpu.pm4.isDispatch(packet.opcode)) result.dispatches += 1;
+        }
+    }
+    return result;
+}
+
+/// Prints a submitted buffer when live tracing is on.
+fn announce(label: []const u8, stream: []const u32) void {
+    if (!trace.isLive()) return;
+
+    std.debug.print(
+        "[{s}] 0x{x} {d} dwords\n",
+        .{ label, @intFromPtr(stream.ptr), stream.len },
+    );
+
+    var line: [160]u8 = undefined;
+    var walker = gpu.pm4.Walker.init(stream);
+    var shown: usize = 0;
+    while (shown < listed_packet_limit) : (shown += 1) {
+        const offset = walker.index;
+        const packet = walker.next() catch |err| {
+            std.debug.print("  {d:0>5}: <{s} at this word>\n", .{ offset, @errorName(err) });
+            break;
+        } orelse break;
+
+        var writer = std.Io.Writer.fixed(&line);
+        gpu.pm4.write(packet, &writer) catch continue;
+        std.debug.print("  {d:0>5}: {s}\n", .{ offset, writer.buffered() });
+    }
+
+    const summary = summarize(stream);
+    if (summary.packets > shown) {
+        std.debug.print("  ... {d} more packets\n", .{summary.packets - shown});
+    }
+    std.debug.print(
+        "  packets {d}, draws {d}, dispatches {d}\n",
+        .{ summary.packets, summary.draws, summary.dispatches },
+    );
+}
+
+/// Turns a submitted address and length into a readable buffer, or null.
+///
+/// The range is checked against the guest address space first. A submission
+/// names memory the title owns, but a title with a bug — or a length this
+/// emulator mapped wrongly — can name memory it does not, and reading it would
+/// fault inside the emulator rather than inside the guest, where the fault
+/// handler could attribute it.
+fn streamOf(address: ?[*]const u32, word_count: u32) ?[]const u32 {
+    const base = address orelse return null;
+    if (word_count == 0) return null;
+    const bytes = @as(u64, word_count) * @sizeOf(u32);
+    if (!memory.isGuestRangeAccessible(@intFromPtr(base), bytes)) return null;
+    return base[0..word_count];
+}
+
+/// Reads one submission descriptor and reports it.
+fn submitOne(label: []const u8, descriptor: ?*const Submission) void {
+    const submission = descriptor orelse return;
+    const stream = streamOf(submission.address, submission.word_count) orelse return;
+    announce(label, stream);
+}
+
+/// Graphics work, described by one descriptor.
+fn submitDcb(descriptor: ?*const Submission) callconv(abi.guest) i32 {
+    submitOne("dcb", descriptor);
+    return errno.ok;
+}
+
+/// Compute work on a named queue.
+fn submitAcb(_: u32, descriptor: ?*const Submission) callconv(abi.guest) i32 {
+    submitOne("acb", descriptor);
+    return errno.ok;
+}
+
+/// Several graphics buffers at once, as two parallel arrays.
+///
+/// A null entry is skipped rather than ending the batch: the arrays are indexed
+/// in parallel, so stopping early would silently drop every buffer after a hole
+/// the title deliberately left.
+fn submitMultiDcbs(
+    addresses: ?[*]const ?[*]const u32,
+    word_counts: ?[*]const u32,
+    count: u32,
+) callconv(abi.guest) i32 {
+    if (count == 0) return errno.ok;
+    const buffers = addresses orelse return errno.KernelError.einval.raw();
+    const sizes = word_counts orelse return errno.KernelError.einval.raw();
+
+    for (0..count) |index| {
+        const stream = streamOf(buffers[index], sizes[index]) orelse continue;
+        announce("dcb", stream);
+    }
+    return errno.ok;
+}
+
+/// One buffer submitted directly, without a descriptor around it.
+fn submitCommandBuffer(_: u32, address: ?[*]const u32, word_count: u32) callconv(abi.guest) i32 {
+    const stream = streamOf(address, word_count) orelse return errno.ok;
+    announce("dcb", stream);
+    return errno.ok;
+}
+
+pub const exports = [_]symbols.Export{
+    .{ .name = "sceAgcDriverSubmitDcb", .function = trace.wrap("sceAgcDriverSubmitDcb", &submitDcb), .expect_id = "UglJIZjGssM" },
+    .{ .name = "sceAgcDriverAgrSubmitDcb", .function = trace.wrap("sceAgcDriverAgrSubmitDcb", &submitDcb), .expect_id = "AhGvpITrf4M" },
+    .{ .name = "sceAgcDriverSubmitAcb", .function = trace.wrap("sceAgcDriverSubmitAcb", &submitAcb), .expect_id = "gSRnr79F8tQ" },
+    .{ .name = "sceAgcDriverSubmitMultiDcbs", .function = trace.wrap("sceAgcDriverSubmitMultiDcbs", &submitMultiDcbs), .expect_id = "6UzEidRZwkg" },
+    .{ .name = "sceAgcDriverAgrSubmitMultiDcbs", .function = trace.wrap("sceAgcDriverAgrSubmitMultiDcbs", &submitMultiDcbs), .expect_id = "+T8Xo6LtFJI" },
+    .{ .name = "sceAgcDriverSubmitCommandBuffer", .function = trace.wrap("sceAgcDriverSubmitCommandBuffer", &submitCommandBuffer), .expect_id = "b4fpgH5ZXxQ" },
+};
+
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+fn command(opcode: u8, body_words: u14) u32 {
+    return (@as(u32, 3) << 30) | (@as(u32, body_words - 1) << 16) | (@as(u32, opcode) << 8);
+}
+
+test "a submitted buffer is counted by what it contains" {
+    const stream = [_]u32{
+        command(gpu.pm4.clear_state, 1),     0,
+        command(gpu.pm4.num_instances, 1),   1,
+        command(gpu.pm4.draw_index_auto, 2), 3,
+        0,
+        command(gpu.pm4.dispatch_direct, 3), 1,
+        1,                                   1,
+        command(gpu.pm4.draw_index_2, 4),    0,
+        0,                                   0,
+        0,
+    };
+    const summary = summarize(&stream);
+    try testing.expectEqual(@as(usize, 5), summary.packets);
+    try testing.expectEqual(@as(usize, 2), summary.draws);
+    try testing.expectEqual(@as(usize, 1), summary.dispatches);
+    try testing.expectEqual(stream.len, summary.words_read);
+    try testing.expect(summary.stopped == null);
+}
+
+test "a buffer that stops decoding reports where and why" {
+    // The words already read are still a description of what the title asked
+    // for, so they are reported rather than discarded with the error.
+    const stream = [_]u32{
+        command(gpu.pm4.clear_state, 1), 0,
+        command(gpu.pm4.write_data, 9),  1,
+    };
+    const summary = summarize(&stream);
+    try testing.expectEqual(@as(usize, 1), summary.packets);
+    try testing.expectEqual(@as(usize, 2), summary.words_read);
+    try testing.expectEqual(gpu.pm4.Error.Truncated, summary.stopped.?);
+}
+
+test "an empty submission is not a failure" {
+    const summary = summarize(&[_]u32{});
+    try testing.expectEqual(@as(usize, 0), summary.packets);
+    try testing.expect(summary.stopped == null);
+}
+
+test "a submission naming no buffer is ignored, not read" {
+    try testing.expect(streamOf(null, 16) == null);
+    try testing.expect(streamOf(@ptrFromInt(0x1000), 0) == null);
+
+    var stream = [_]u32{ command(gpu.pm4.nop, 1), 0 };
+    try testing.expectEqual(@as(usize, 2), streamOf(&stream, 2).?.len);
+}
+
+test "submission entry points accept what they cannot yet carry out" {
+    // A title that submits work is not waiting on this call to return; failing
+    // it would abort a frame the title had already fully described.
+    try testing.expectEqual(errno.ok, submitDcb(null));
+    try testing.expectEqual(errno.ok, submitAcb(0, null));
+    try testing.expectEqual(errno.ok, submitMultiDcbs(null, null, 0));
+    try testing.expectEqual(errno.ok, submitCommandBuffer(0, null, 0));
+
+    // Naming a count but no arrays is a caller error, and saying so costs
+    // nothing because there is no frame described anywhere to lose.
+    try testing.expectEqual(errno.KernelError.einval.raw(), submitMultiDcbs(null, null, 2));
+}
+
+test "a hole in a batch does not drop the buffers after it" {
+    var first = [_]u32{ command(gpu.pm4.clear_state, 1), 0 };
+    var last = [_]u32{ command(gpu.pm4.draw_index_auto, 2), 3, 0 };
+
+    const buffers = [_]?[*]const u32{ &first, null, &last };
+    const sizes = [_]u32{ first.len, 0, last.len };
+    try testing.expectEqual(errno.ok, submitMultiDcbs(&buffers, &sizes, buffers.len));
+}
+
+test "submission exports register under published identifiers" {
+    var db = symbols.Database{};
+    defer db.deinit(testing.allocator);
+    try db.addLibrary(
+        testing.allocator,
+        .{ .name = "libSceAgcDriver", .version = 1 },
+        .{ .name = "libSceAgcDriver", .version_major = 1, .version_minor = 1 },
+        &exports,
+    );
+    try testing.expectEqual(exports.len, db.count());
+    try testing.expect(db.findByName("sceAgcDriverSubmitDcb", .function) != null);
+}

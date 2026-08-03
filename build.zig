@@ -53,6 +53,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "memory", .module = memory },
             .{ .name = "loader", .module = loader },
+            .{ .name = "gpu", .module = gpu },
         },
     });
 

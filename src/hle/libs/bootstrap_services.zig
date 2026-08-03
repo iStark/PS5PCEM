@@ -12,6 +12,7 @@ const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const kernel_runtime = @import("kernel_runtime.zig");
 const kernel_threading = @import("kernel_threading.zig");
+const agc_submit = @import("agc_submit.zig");
 
 const invalid_argument = errno.KernelError.einval.raw();
 
@@ -518,9 +519,6 @@ const agc_exports = [_]symbols.Export{
 const agc_driver_exports = [_]symbols.Export{
     .{ .name = "sceAgcDriverRegisterOwner", .function = trace.wrap("sceAgcDriverRegisterOwner", &success), .expect_id = "X-Nm5KLREeg" },
     .{ .name = "sceAgcDriverSetHsOffchipParam", .function = trace.wrap("sceAgcDriverSetHsOffchipParam", &success), .expect_id = "MM4IZSEYytQ" },
-    .{ .name = "sceAgcDriverSubmitDcb", .function = trace.wrap("sceAgcDriverSubmitDcb", &success), .expect_id = "UglJIZjGssM" },
-    .{ .name = "sceAgcDriverAgrSubmitDcb", .function = trace.wrap("sceAgcDriverAgrSubmitDcb", &success), .expect_id = "AhGvpITrf4M" },
-    .{ .name = "sceAgcDriverSubmitAcb", .function = trace.wrap("sceAgcDriverSubmitAcb", &success), .expect_id = "gSRnr79F8tQ" },
     .{ .name = "sceAgcDriverRegisterResource", .function = trace.wrap("sceAgcDriverRegisterResource", &success), .expect_id = "W5z4eZrjEas" },
     .{ .name = "sceAgcDriverAddEqEvent", .function = trace.wrap("sceAgcDriverAddEqEvent", &success), .expect_id = "w2rJhmD+dsE" },
     .{ .name = "sceAgcDriverGetEqContextId", .function = trace.wrap("sceAgcDriverGetEqContextId", &success), .expect_id = "Zw7uUVPulbw" },
@@ -555,6 +553,10 @@ pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!voi
     try db.addLibrary(gpa, .{ .name = "libSceSysmodule" }, .{ .name = "libSceSysmodule" }, &sysmodule_bootstrap_exports);
     try db.addLibrary(gpa, .{ .name = "libSceAgc" }, .{ .name = "libSceAgc" }, &agc_exports);
     try db.addLibrary(gpa, .{ .name = "libSceAgcDriver" }, .{ .name = "libSceAgcDriver" }, &agc_driver_exports);
+    // The submission entry points live apart from these, because unlike the
+    // rest of this surface they read what the title passes rather than only
+    // acknowledging it.
+    try db.addLibrary(gpa, .{ .name = "libSceAgcDriver" }, .{ .name = "libSceAgcDriver" }, &agc_submit.exports);
     try db.addLibrary(gpa, .{ .name = "libSceAmpr" }, .{ .name = "libSceAmpr" }, &ampr_exports);
 }
 
