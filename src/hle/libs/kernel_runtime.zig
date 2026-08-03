@@ -590,6 +590,28 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceKernelAprResolveFilepathsToIdsAndFileSizes", .function = trace.wrap("sceKernelAprResolveFilepathsToIdsAndFileSizes", &kernelUnsupported), .expect_id = "gEpBkcwxUjw" },
     .{ .name = "sceKernelAprSubmitCommandBufferAndGetResult", .function = trace.wrap("sceKernelAprSubmitCommandBufferAndGetResult", &kernelUnsupported), .expect_id = "ASoW5WE-UPo" },
     .{ .name = "sceKernelAprWaitCommandBuffer", .function = trace.wrap("sceKernelAprWaitCommandBuffer", &kernelUnsupported), .expect_id = "rqwFKI4PAiM" },
+
+    // The rest of the accelerator's path-resolution and submission surface,
+    // reported unimplemented like the entries above it. These turn a list of
+    // file paths into identifiers the accelerator then reads by, and answering
+    // them without an accelerator behind it would hand a title identifiers that
+    // name nothing, which it would carry until a read failed for no visible
+    // reason.
+    .{ .name = "sceKernelAprGetFileStat", .function = trace.wrap("sceKernelAprGetFileStat", &kernelUnsupported), .expect_id = "ApkYaHb8Sek" },
+    .{ .name = "sceKernelAprGetFileSize", .function = trace.wrap("sceKernelAprGetFileSize", &kernelUnsupported), .expect_id = "WvEu7yl3Ivg" },
+    .{ .name = "sceKernelAprResolveFilepathsToIds", .function = trace.wrap("sceKernelAprResolveFilepathsToIds", &kernelUnsupported), .expect_id = "WT-5NKy42fw" },
+    .{ .name = "sceKernelAprResolveFilepathsToIdsForEach", .function = trace.wrap("sceKernelAprResolveFilepathsToIdsForEach", &kernelUnsupported), .expect_id = "eYAh2vlCY-U" },
+    .{ .name = "sceKernelAprResolveFilepathsToIdsAndFileSizesForEach", .function = trace.wrap("sceKernelAprResolveFilepathsToIdsAndFileSizesForEach", &kernelUnsupported), .expect_id = "QzB4O+bJQyA" },
+    .{ .name = "sceKernelAprResolveFilepathsWithPrefixToIds", .function = trace.wrap("sceKernelAprResolveFilepathsWithPrefixToIds", &kernelUnsupported), .expect_id = "i3HWvW35jao" },
+    .{ .name = "sceKernelAprResolveFilepathsWithPrefixToIdsForEach", .function = trace.wrap("sceKernelAprResolveFilepathsWithPrefixToIdsForEach", &kernelUnsupported), .expect_id = "VB-BtuIW8Xc" },
+    .{ .name = "sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes", .function = trace.wrap("sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizes", &kernelUnsupported), .expect_id = "w5fcCG+t31g" },
+    .{ .name = "sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizesForEach", .function = trace.wrap("sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizesForEach", &kernelUnsupported), .expect_id = "C+Khtbbx2g8" },
+    .{ .name = "sceKernelAprSubmitCommandBuffer", .function = trace.wrap("sceKernelAprSubmitCommandBuffer", &kernelUnsupported), .expect_id = "eE4Szl8sil8" },
+    .{ .name = "sceKernelAprSubmitCommandBufferAndGetId", .function = trace.wrap("sceKernelAprSubmitCommandBufferAndGetId", &kernelUnsupported), .expect_id = "qvMUCyyaCSI" },
+
+    // An accelerator event on a queue that will never carry one. Registering
+    // the event would leave a title waiting on something nothing signals.
+    .{ .name = "sceKernelAddAmprEvent", .function = trace.wrap("sceKernelAddAmprEvent", &kernelUnsupported), .expect_id = "bBfz7kMF2Ho" },
 };
 
 pub const unity_exports = [_]symbols.Export{
@@ -608,6 +630,26 @@ pub const posix_exports = [_]symbols.Export{
     .{ .name = "sched_yield", .function = trace.wrap("sched_yield", &schedYield), .expect_id = "6XG4B33N09g" },
     .{ .name = "inet_pton", .function = trace.wrap("inet_pton", &posixUnsupported), .expect_id = "4n51s0zEf0c" },
     .{ .name = "send", .function = trace.wrap("send", &posixUnsupported), .expect_id = "fZOeZIOEmLw" },
+
+    // The rest of the socket surface, refused like `send` above it. The
+    // networking model here is deliberately offline — no host socket is ever
+    // opened — and a title told that a socket bound, listened, or accepted
+    // would then wait for a peer that cannot arrive. An error it can see is
+    // the better answer, and it is the one it would get from a console with no
+    // connection.
+    .{ .name = "bind", .function = trace.wrap("bind", &posixUnsupported), .expect_id = "KuOmgKoqCdY" },
+    .{ .name = "listen", .function = trace.wrap("listen", &posixUnsupported), .expect_id = "pxnCmagrtao" },
+    .{ .name = "accept", .function = trace.wrap("accept", &posixUnsupported), .expect_id = "3e+4Iv7IJ8U" },
+    .{ .name = "sendto", .function = trace.wrap("sendto", &posixUnsupported), .expect_id = "oBr313PppNE" },
+    .{ .name = "recvfrom", .function = trace.wrap("recvfrom", &posixUnsupported), .expect_id = "lUk6wrGXyMw" },
+    .{ .name = "getsockname", .function = trace.wrap("getsockname", &posixUnsupported), .expect_id = "RenI1lL1WFk" },
+    .{ .name = "getpeername", .function = trace.wrap("getpeername", &posixUnsupported), .expect_id = "TXFFFiNldU8" },
+    .{ .name = "getsockopt", .function = trace.wrap("getsockopt", &posixUnsupported), .expect_id = "6O8EwYOgH9Y" },
+
+    // Descriptor flags. Refused rather than answered, because the flag a title
+    // most often sets here is non-blocking, and claiming that took effect on a
+    // descriptor that ignores it invites the title to spin.
+    .{ .name = "fcntl", .function = trace.wrap("fcntl", &posixUnsupported), .expect_id = "8nY19bKoiZk" },
 };
 
 pub const library = symbols.Library{ .name = "libkernel", .version = 1 };

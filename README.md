@@ -796,6 +796,27 @@ it did before. The same applies to a device that stops working mid-run: losing
 sound is not a reason to stop a title. Output is Windows-only for now; elsewhere
 the ports are silent and correctly paced.
 
+**Asynchronous file reads** ([src/hle/libs/kernel_aio.zig](src/hle/libs/kernel_aio.zig))
+
+A title hands over a batch of read requests and receives an identifier; later it
+asks whether that batch is done and collects the results. Engines that stream
+assets do all of their loading this way, so a title built on one cannot read a
+single file without it.
+
+The reads happen where the batch is submitted, so a batch is always finished by
+the time anyone asks. That is a legal outcome of the interface rather than a
+shortcut around it — a caller has to cope with a request that completed at once,
+because a fast device does exactly that — and the alternative, a thread pool of
+our own, would invent an ordering between requests that a title could come to
+depend on before there is any real device to justify it.
+
+Writes are accepted as batches and then reported, request by request, as having
+failed, with the same refusal the filesystem gives a direct write. A title told
+its save was written when it was not carries on and loses it somewhere further
+along, where nothing points back here. A batch naming nowhere to put an outcome
+is refused before any of it runs, since finding out halfway would leave some
+requests done and the caller unable to learn which.
+
 **Title content and devices** ([src/hle/filesystem.zig](src/hle/filesystem.zig),
 [src/hle/libs/kernel_files.zig](src/hle/libs/kernel_files.zig),
 [src/hle/libs/kernel_ioctl.zig](src/hle/libs/kernel_ioctl.zig))

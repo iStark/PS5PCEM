@@ -884,6 +884,33 @@ fn batchMap2() callconv(abi.guest) i32 {
     return KernelError.enosys.raw();
 }
 
+/// Maps direct memory, naming the type it should be treated as.
+///
+/// The type is what the extra parameter adds over the plain call, and it is not
+/// something this layer acts on: nothing here distinguishes one kind of
+/// physical memory from another. Ignoring it is safe because it changes how the
+/// hardware caches a mapping, not where the mapping is or what it contains —
+/// so a title gets the memory it asked for at the address it asked for, which
+/// is what it will check.
+fn sceKernelMapDirectMemory2(
+    out_address: ?*u64,
+    len: u64,
+    _: i32,
+    protection_bits: i32,
+    flags: i32,
+    physical_address: u64,
+    alignment: u64,
+) callconv(abi.guest) i32 {
+    return sceKernelMapDirectMemory(
+        out_address,
+        len,
+        protection_bits,
+        flags,
+        physical_address,
+        alignment,
+    );
+}
+
 /// Removes any fully covered combination of direct, flexible, or reserved
 /// mappings. AddressSpace preserves the process-wide outer reservations.
 fn sceKernelMunmap(address: u64, len: u64) callconv(abi.guest) i32 {
@@ -1169,6 +1196,20 @@ pub const exports = [_]symbols.Export{
         .function = trace.wrap("sceKernelGetPageTableStats", &getPageTableStats),
         .expect_id = "tZ2yplY8MBY",
     }, .{
+        .name = "sceKernelMapDirectMemory2",
+        .function = trace.wrap("sceKernelMapDirectMemory2", &sceKernelMapDirectMemory2),
+        .expect_id = "BQQniolj9tQ",
+    },
+    .{
+        // The single-operation form of the batch entry below, and refused for
+        // the same reason: the record describing each operation has a layout
+        // that is not established, and misreading it maps the wrong physical
+        // memory at the wrong address — corruption rather than an error.
+        .name = "sceKernelBatchMap",
+        .function = trace.wrap("sceKernelBatchMap", &batchMap2),
+        .expect_id = "2SKEx6bSq-4",
+    },
+    .{
         .name = "sceKernelBatchMap2",
         .function = trace.wrap("sceKernelBatchMap2", &batchMap2),
         .expect_id = "kBJzF8x4SyE",

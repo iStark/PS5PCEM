@@ -453,6 +453,31 @@ pub const Manager = struct {
         return true;
     }
 
+    pub fn readAffinity(self: *Manager, handle: ThreadHandle) ?u64 {
+        const address = handleAddress(handle) orelse return null;
+        self.lock.lock();
+        defer self.lock.unlock();
+        const record = self.findRecordLocked(address) orelse return null;
+        return record.attributes.affinity_mask;
+    }
+
+    /// Renames a live thread.
+    ///
+    /// The name is a label a title attaches for its own diagnostics, and it
+    /// asks for it back through the same interface, so it is stored rather than
+    /// discarded. Longer names are truncated to the field the record keeps,
+    /// which is what the interface itself does.
+    pub fn setName(self: *Manager, handle: ThreadHandle, name: []const u8) bool {
+        const address = handleAddress(handle) orelse return false;
+        self.lock.lock();
+        defer self.lock.unlock();
+        const record = self.findRecordLocked(address) orelse return false;
+        record.name = @splat(0);
+        const kept = @min(name.len, record.name.len - 1);
+        @memcpy(record.name[0..kept], name[0..kept]);
+        return true;
+    }
+
     pub fn setPriority(self: *Manager, handle: ThreadHandle, priority: i32) bool {
         const address = handleAddress(handle) orelse return false;
         self.lock.lock();
@@ -1175,6 +1200,85 @@ pub fn scePthreadSetschedparam(
         KernelError.esrch.raw();
 }
 
+pub fn pthread_getschedparam(
+    handle: ThreadHandle,
+    out_policy: ?*i32,
+    out_parameter: ?*SchedParam,
+) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadGetschedparam(handle, out_policy, out_parameter));
+}
+
+pub fn pthread_setschedparam(
+    handle: ThreadHandle,
+    policy: i32,
+    parameter: ?*const SchedParam,
+) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadSetschedparam(handle, policy, parameter));
+}
+
+pub fn scePthreadRename(handle: ThreadHandle, name: ?[*:0]const u8) callconv(abi.guest) i32 {
+    const text = name orelse return KernelError.einval.raw();
+    const manager = activeManager() orelse return KernelError.enosys.raw();
+    return if (manager.setName(handle, std.mem.span(text)))
+        errno.ok
+    else
+        KernelError.esrch.raw();
+}
+
+pub fn pthread_rename_np(handle: ThreadHandle, name: ?[*:0]const u8) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadRename(handle, name));
+}
+
+/// The identifier the operating system knows a thread by.
+///
+/// Distinct from the pthread handle: a title uses this where it wants a number
+/// to print or compare, not something to call the thread through. Truncated to
+/// the width the entry point returns, which is what a caller reads.
+pub fn scePthreadGetthreadid() callconv(abi.guest) i32 {
+    return @truncate(@as(i64, @bitCast(currentThreadId())));
+}
+
+/// Reads a thread's processor affinity.
+pub fn scePthreadGetaffinity(handle: ThreadHandle, output: ?*u64) callconv(abi.guest) i32 {
+    const out = output orelse return KernelError.einval.raw();
+    const manager = activeManager() orelse return KernelError.enosys.raw();
+    const mask = manager.readAffinity(handle) orelse return KernelError.esrch.raw();
+    out.* = mask;
+    return errno.ok;
+}
+
+pub fn pthread_attr_setsolosched_np(attr: ?*AttrHandle, solo_sched: i32) callconv(abi.guest) i32 {
+    return posixStatus(scePthreadAttrSetsolosched(attr, solo_sched));
+}
+
+/// Cancellation, refused rather than answered.
+///
+/// Cancelling a thread means unwinding it at a point it did not choose, and
+/// nothing here can do that: the thread is a host thread running guest code,
+/// and stopping it between two instructions would leave whatever it held
+/// locked. Reporting that it cannot be done is better than reporting success
+/// and leaving the thread running, which is what a title would then assume had
+/// stopped.
+pub fn pthread_cancel(_: ThreadHandle) callconv(abi.guest) i32 {
+    return errno.Posix.enosys;
+}
+
+/// The console's thread priority range, in which a smaller number is higher.
+///
+/// Reported so that a title asking the range and then choosing inside it picks
+/// something this layer accepts; nothing here refuses a priority, so the range
+/// only has to be the one the platform documents.
+pub const highest_priority: i32 = 256;
+pub const lowest_priority: i32 = 767;
+
+pub fn sched_get_priority_max(_: i32) callconv(abi.guest) i32 {
+    return highest_priority;
+}
+
+pub fn sched_get_priority_min(_: i32) callconv(abi.guest) i32 {
+    return lowest_priority;
+}
+
 pub fn scePthreadAttrInit(out_attr: ?*AttrHandle) callconv(abi.guest) i32 {
     const output = out_attr orelse return KernelError.einval.raw();
     const active_manager = activeManager() orelse return KernelError.enosys.raw();
@@ -1531,6 +1635,16 @@ pub const exports = [_]symbols.Export{
     .{ .name = "scePthreadSetprio", .function = trace.wrap("scePthreadSetprio", &scePthreadSetprio), .expect_id = "W0Hpm2X0uPE" },
     .{ .name = "scePthreadGetschedparam", .function = trace.wrap("scePthreadGetschedparam", &scePthreadGetschedparam), .expect_id = "P41kTWUS3EI" },
     .{ .name = "scePthreadSetschedparam", .function = trace.wrap("scePthreadSetschedparam", &scePthreadSetschedparam), .expect_id = "oIRFTjoILbg" },
+    .{ .name = "pthread_getschedparam", .function = trace.wrap("pthread_getschedparam", &pthread_getschedparam), .expect_id = "FIs3-UQT9sg" },
+    .{ .name = "pthread_setschedparam", .function = trace.wrap("pthread_setschedparam", &pthread_setschedparam), .expect_id = "Xs9hdiD7sAA" },
+    .{ .name = "scePthreadGetaffinity", .function = trace.wrap("scePthreadGetaffinity", &scePthreadGetaffinity), .expect_id = "rcrVFJsQWRY" },
+    .{ .name = "scePthreadGetthreadid", .function = trace.wrap("scePthreadGetthreadid", &scePthreadGetthreadid), .expect_id = "EI-5-jlq2dE" },
+    .{ .name = "scePthreadRename", .function = trace.wrap("scePthreadRename", &scePthreadRename), .expect_id = "GBUY7ywdULE" },
+    .{ .name = "pthread_rename_np", .function = trace.wrap("pthread_rename_np", &pthread_rename_np), .expect_id = "9vyP6Z7bqzc" },
+    .{ .name = "pthread_attr_setsolosched_np", .function = trace.wrap("pthread_attr_setsolosched_np", &pthread_attr_setsolosched_np), .expect_id = "2+pVfgiEd7A" },
+    .{ .name = "pthread_cancel", .function = trace.wrap("pthread_cancel", &pthread_cancel), .expect_id = "0D4-FVvEikw" },
+    .{ .name = "sched_get_priority_max", .function = trace.wrap("sched_get_priority_max", &sched_get_priority_max), .expect_id = "CBNtXOoef-E" },
+    .{ .name = "sched_get_priority_min", .function = trace.wrap("sched_get_priority_min", &sched_get_priority_min), .expect_id = "m0iS6jNsXds" },
     .{ .name = "sceKernelUsleep", .function = trace.wrap("sceKernelUsleep", &sceKernelUsleep), .expect_id = "1jfXLRVzisc" },
     .{ .name = "scePthreadAttrInit", .function = trace.wrap("scePthreadAttrInit", &scePthreadAttrInit), .expect_id = "nsYoNRywwNg" },
     .{ .name = "pthread_attr_init", .function = trace.wrap("pthread_attr_init", &pthread_attr_init), .expect_id = "wtkt-teR1so" },
