@@ -14,15 +14,47 @@ const loader = @import("loader");
 const hle = @import("hle");
 
 const usage =
-    \\module-info <module> [provider.prx ...]
+    \\module-info <module> [provider.prx ...] [--names <list>]
     \\
     \\Prints a bare ELF or decrypted PS5 SELF module's identity, dependencies,
     \\and imports, marking which ones the firmware emulation or optional guest
     \\provider modules supply.
     \\
+    \\--names takes a file of candidate symbol names, one per line, and recovers
+    \\the published name of every import whose identifier one of them hashes to.
+    \\
 ;
 
 const max_module_bytes: usize = 512 * 1024 * 1024;
+const max_name_list_bytes: usize = 64 * 1024 * 1024;
+
+/// Published names, keyed by the identifier they hash to.
+const NameTable = std.StringHashMapUnmanaged([]const u8);
+
+/// Builds the identifier-to-name table from a list of candidate names.
+///
+/// An identifier is a hash, so it cannot be turned back into a name — but a
+/// list of candidates can be hashed and matched against it. That is worth doing
+/// because an import a title needs is only actionable once it has a name: a
+/// report saying `sceKernelAioSubmitReadCommands` is a piece of work, and one
+/// saying `HgX7+AORI58` is a puzzle.
+///
+/// The list is supplied rather than built in. Which names exist is not
+/// something this project knows, and a name that hashes correctly is evidence
+/// on its own — a wrong guess simply never matches.
+fn buildNameTable(gpa: std.mem.Allocator, text: []const u8) !NameTable {
+    var table = NameTable{};
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const name = std.mem.trim(u8, raw, " \t\r");
+        if (name.len == 0) continue;
+        const id = try gpa.dupe(u8, &hle.nid.fromName(name));
+        // First match wins: two names hashing alike is a collision, and the
+        // later one is no more likely to be right than the earlier.
+        _ = try table.getOrPutValue(gpa, id, name);
+    }
+    return table;
+}
 
 /// How an import matched the registry.
 const Resolution = enum {
@@ -95,6 +127,42 @@ pub fn main(init: std.process.Init) !void {
     }
     const path = args[1];
 
+    // Separated from the provider paths so a name list can be given anywhere
+    // after the module, which is where a reader naturally puts it.
+    var providers: std.ArrayList([]const u8) = .empty;
+    defer providers.deinit(arena);
+    var names_path: ?[]const u8 = null;
+    var index: usize = 2;
+    while (index < args.len) : (index += 1) {
+        if (std.mem.eql(u8, args[index], "--names")) {
+            if (index + 1 >= args.len) {
+                try stderr.writeAll(usage);
+                try stderr.flush();
+                return error.InvalidUsage;
+            }
+            names_path = args[index + 1];
+            index += 1;
+        } else {
+            try providers.append(arena, args[index]);
+        }
+    }
+
+    var names = NameTable{};
+    defer names.deinit(arena);
+    if (names_path) |list_path| {
+        const list = std.Io.Dir.cwd().readFileAlloc(
+            io,
+            list_path,
+            arena,
+            .limited(max_name_list_bytes),
+        ) catch |err| {
+            try stderr.print("cannot read {s}: {s}\n", .{ list_path, @errorName(err) });
+            try stderr.flush();
+            return err;
+        };
+        names = try buildNameTable(arena, list);
+    }
+
     const bytes = std.Io.Dir.cwd().readFileAlloc(
         io,
         path,
@@ -127,7 +195,7 @@ pub fn main(init: std.process.Init) !void {
 
     var guest_exports = loader.GuestExportRegistry{};
     defer guest_exports.deinit(arena);
-    for (args[2..], 0..) |provider_path, provider_index| {
+    for (providers.items, 0..) |provider_path, provider_index| {
         const provider_bytes = try std.Io.Dir.cwd().readFileAlloc(
             io,
             provider_path,
@@ -153,11 +221,14 @@ pub fn main(init: std.process.Init) !void {
     try out.print("  container     {s}\n", .{if (image.isSelf()) "ps5_self" else "bare_elf"});
     try out.print("  type          {s}\n", .{@tagName(image.objectType())});
     try out.print("  entry         0x{x}\n", .{image.entryPoint()});
-    if (args.len > 2) {
+    if (providers.items.len != 0) {
         try out.print("  providers     {d} modules, {d} guest exports\n", .{
-            args.len - 2,
+            providers.items.len,
             guest_exports.symbolCount(),
         });
+    }
+    if (names_path != null) {
+        try out.print("  names         {d} candidates\n", .{names.count()});
     }
     if (info.module_info) |own| {
         try out.print("  module        {s} v{d}.{d}\n", .{
@@ -207,13 +278,15 @@ pub fn main(init: std.process.Init) !void {
     for (module_imports.items.items) |imp| {
         const status = resolve(&db, &guest_exports, imp);
         if (status != .not_found) resolved += 1;
-        try out.print("  {s} {s}  {s}  {s}  {s}\n", .{
+        try out.print("  {s} {s}  {s}  {s}  {s}", .{
             status.mark(),
             imp.id,
             imp.library orelse imp.library_code,
             @tagName(imp.symbol_type),
             @tagName(imp.relocation_type),
         });
+        if (names.get(imp.id)) |name| try out.print("  {s}", .{name});
+        try out.writeByte('\n');
     }
 
     try out.print("\n{d}/{d} imports provided\n", .{ resolved, module_imports.items.items.len });
@@ -225,4 +298,33 @@ pub fn main(init: std.process.Init) !void {
     }
 
     try out.flush();
+}
+
+const testing = std.testing;
+
+test "a candidate name is recovered through the identifier it hashes to" {
+    // An identifier is a hash and cannot be inverted; a candidate that hashes
+    // to it is the evidence. A wrong guess simply never matches, which is why
+    // feeding a large list of names costs nothing in confidence.
+    var table = try buildNameTable(testing.allocator,
+        \\sceKernelAioSubmitReadCommands
+        \\scePthreadGetthreadid
+        \\
+        \\  sceKernelBatchMap
+        \\
+    );
+    defer {
+        var keys = table.keyIterator();
+        while (keys.next()) |key| testing.allocator.free(key.*);
+        table.deinit(testing.allocator);
+    }
+
+    try testing.expectEqual(@as(u32, 3), table.count());
+    try testing.expectEqualStrings(
+        "sceKernelAioSubmitReadCommands",
+        table.get("HgX7+AORI58").?,
+    );
+    // Surrounding blanks belong to the file, not to the name.
+    try testing.expectEqualStrings("sceKernelBatchMap", table.get("2SKEx6bSq-4").?);
+    try testing.expect(table.get("AAAAAAAAAAA") == null);
 }

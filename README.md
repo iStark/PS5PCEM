@@ -25,6 +25,7 @@ Five command-line tools come with them:
 zig build run         -- shader.bin    # disassemble a shader
 zig build module-info -- eboot.bin     # inspect a bare ELF or decrypted PS5 SELF
 zig build module-info -- eboot.bin sce_module/libc.prx # include a guest provider
+zig build module-info -- eboot.bin --names names.txt   # recover published names
 zig build pm4-dump    -- capture.bin   # decode a captured GPU command stream
 zig build graph-info  -- eboot.bin     # map and relocate the reachable PRX graph
 zig build game-run    -- eboot.bin     # load, initialize, and enter the title
@@ -68,6 +69,21 @@ before it can run — a more honest measure than any aggregate progress figure.
 A `~` instead of `ok` means the symbol matched on identifier alone, because the
 module named a library the registry does not know; it may well be the wrong
 implementation.
+
+A missing import is only actionable once it has a name, and an identifier is a
+hash that cannot be turned back into one. `--names <list>` takes a file of
+candidate names, one per line, hashes each, and prints the name of every import
+one of them accounts for:
+
+```
+  MISS HgX7+AORI58  libkernel  func  jump_slot  sceKernelAioSubmitReadCommands
+  MISS 2SKEx6bSq-4  libkernel  func  jump_slot  sceKernelBatchMap
+```
+
+The list is supplied rather than built in: which names exist is not something
+this project knows. Feeding a large one costs nothing in confidence, because a
+name that hashes correctly is evidence on its own and a wrong guess never
+matches.
 
 `graph-info` performs the stricter check: it uses the runtime's real fixed
 address space, recursively discovers adjacent PRX files, publishes their guest
