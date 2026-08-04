@@ -31,7 +31,7 @@ zig build pm4-dump    -- capture.bin   # decode a captured GPU command stream
 zig build graph-info  -- eboot.bin     # map and relocate the reachable PRX graph
 zig build game-run    -- eboot.bin     # load, initialize, and enter the title
 zig build game-run    -- --app0 full/game patched/eboot.bin # use full content with a patched executable
-zig build vulkan-smoke                 # run the headless compute/staging probe
+zig build vulkan-smoke                 # run the headless compute/graphics probe
 ```
 
 `module-info` is where the pieces meet. It reads a module, works out every
@@ -443,9 +443,8 @@ The remaining stages are:
 
 1. Finish the DPP/VOP3 operations needed by captures, structured loops and
    VCC/EXEC divergence.
-2. Reach the first-pixels milestone: lower minimal vertex/fragment interfaces,
-   position/color exports and a color target, record a real draw, and verify an
-   offscreen triangle through readback.
+2. Replace the proven diagnostic draw shaders with guest vertex/fragment
+   lowering, position/color exports and decoded PS5 color-target binding.
 3. Add sampled/storage image and sampler descriptor arrays, image
    creation/layout transitions and image operations for textured game draws.
 4. Add surface/swapchain presentation through `SetFlip` and map PM4 acquire,
@@ -453,10 +452,11 @@ The remaining stages are:
 5. Validate packet/state/shader results against captures before optimizing
    asynchronous submission, descriptor caches and pipeline compilation.
 
-The first-pixels milestone deliberately does not wait for the complete image
-stack: a synthetic untextured triangle can validate the graphics pipeline and
-color-target path first. A recognizable game frame still depends on the image,
-sampler, render-target and synchronization work in the following stages.
+The host first-pixels milestone is complete: an opt-in DCB probe rasterizes an
+untextured triangle into an offscreen RGBA8 attachment and verifies it through
+GPU readback. It deliberately does not masquerade as a guest draw. The first
+emulated game frame still requires guest vertex/pixel exports, PS5 color-target
+binding, images, samplers and the synchronization work in the following stages.
 
 ---
 
@@ -472,7 +472,8 @@ compute. Validation is requested for debug builds when
 
 The renderer owns instance/device lifetime, the selected queue, a transient
 command pool, host/device memory-type selection, one storage descriptor layout
-and pool, and both Vulkan-driver and exact-SPIR-V software pipeline caches.
+and pool, image/view/render-pass/framebuffer creation, and both Vulkan-driver
+and exact-SPIR-V software pipeline caches.
 `stageGuestStorageBuffer` caches up to 256 exact ranges (each at most the Vulkan
 1.2 minimum 128 MiB storage-buffer range). It never treats guest bytes as
 immutable: a cache hit reuses allocations but uploads the current guest range
@@ -489,8 +490,13 @@ the command processor. A direct compute packet resolves `COMPUTE_PGM`, reads
 supported shader to SPIR-V 1.5, creates or reuses its compute pipeline, binds the
 active storage set and dispatches the packet's XYZ group counts. Errors remain
 explicit: a missing program, unsupported shader semantic or indirect dispatch
-rejects that backend callback and records the exact error. Draw callbacks still
-only count work. Compute dispatch captures scalar user data, optionally resolves
+rejects that backend callback and records the exact error. Draw callbacks count
+work by default. `enable_graphics_probe` opts into a bounded diagnostic path in
+which `DRAW_INDEX_AUTO` with three vertices records a real Vulkan graphics draw,
+transitions an offscreen RGBA8 color image for transfer and reads the complete
+frame back. Its fixed SPIR-V shaders are intentionally isolated from normal
+emulation until guest vertex/pixel exports are lowered. Compute dispatch captures
+scalar user data, optionally resolves
 the AGC header through the embedding callback, maps every declared
 constant-buffer table entry, and associates each executable MUBUF resource SGPR
 with the matching descriptor-array element. Before translation,
@@ -523,7 +529,9 @@ through another add-thread-id descriptor. A third program checks swizzled load
 and store addresses, including an indexed dword at physical byte 36 and a
 logical short whose two bytes land at physical bytes 3 and 32. All programs run
 twice, checking guest-visible writeback plus allocation and pipeline miss/hit
-paths:
+paths. Finally, an opt-in DCB `DRAW_INDEX_AUTO` creates a render pass and
+graphics pipeline, rasterizes a triangle into a 64×64 RGBA8 image, performs the
+color-write/transfer/host barriers and validates the readback pixels:
 
 ```sh
 zig build vulkan-smoke
@@ -534,6 +542,7 @@ Vulkan 1.4.321: NVIDIA GeForce RTX 3070 Ti
 device API 1.4.329, queue family 0, validation off
 headless smoke passed: 1 compute dispatch, 64 staging bytes copied and verified
 translated RDNA2 passed: 6 dispatches, pipelines 3/3 miss/hit, buffers 6/6 miss/hit
+graphics DCB probe passed: 1 draw, 1352 colored pixels in 64x64 RGBA8 frame
 ```
 
 ---

@@ -44,7 +44,7 @@ fn command(opcode: u8, body_words: u14) u32 {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
 
-    var renderer = try vulkan.Renderer.init(allocator, .{});
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_graphics_probe = true });
     defer renderer.deinit();
     var guest = GuestMemory{};
     const backend = renderer.dcbBackend(guest.interface());
@@ -290,6 +290,19 @@ pub fn main(init: std.process.Init) !void {
         return error.SwizzleStagedBufferMismatch;
     }
 
+    const draw_stream = [_]u32{
+        command(gpu.pm4.draw_index_auto, 2),
+        3,
+        0,
+    };
+    const draw_result = try executor.execute(&draw_stream);
+    if (draw_result.draws != 1 or renderer.draw_callbacks != 1 or renderer.translated_draws != 1) {
+        return error.InvalidGraphicsProbeDrawResult;
+    }
+    if (renderer.graphics_probe_colored_pixels == 0 or renderer.last_draw_error != null) {
+        return error.InvalidGraphicsProbeFrame;
+    }
+
     var output_buffer: [1024]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &output_buffer);
     const writer = &output.interface;
@@ -297,7 +310,8 @@ pub fn main(init: std.process.Init) !void {
         "Vulkan {d}.{d}.{d}: {s}\n" ++
             "device API {d}.{d}.{d}, queue family {d}, validation {s}\n" ++
             "headless smoke passed: {d} compute dispatch, {d} staging bytes copied and verified\n" ++
-            "translated RDNA2 passed: {d} dispatches, pipelines {d}/{d} miss/hit, buffers {d}/{d} miss/hit\n",
+            "translated RDNA2 passed: {d} dispatches, pipelines {d}/{d} miss/hit, buffers {d}/{d} miss/hit\n" ++
+            "graphics DCB probe passed: {d} draw, {d} colored pixels in {d}x{d} RGBA8 frame\n",
         .{
             vulkan.api.apiMajor(renderer.loader_api_version),
             vulkan.api.apiMinor(renderer.loader_api_version),
@@ -315,6 +329,10 @@ pub fn main(init: std.process.Init) !void {
             renderer.pipeline_cache_hits,
             renderer.buffer_cache_misses,
             renderer.buffer_cache_hits,
+            renderer.translated_draws,
+            renderer.graphics_probe_colored_pixels,
+            vulkan.graphics_probe_width,
+            vulkan.graphics_probe_height,
         },
     );
     try writer.flush();

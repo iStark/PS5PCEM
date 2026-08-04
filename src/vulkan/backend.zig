@@ -6,9 +6,10 @@
 //! This owns the host instance, device, queue and command pool while exposing
 //! the existing API-neutral DCB callback boundary. Supported direct compute
 //! work crosses RDNA2 decode, ShaderBindings capture, storage-buffer lowering
-//! and SPIR-V pipeline caching; image resources and draw lowering remain
-//! separate. The smoke path proves queue submission, descriptor arrays,
-//! staging, device-local memory and guest-visible readback.
+//! and SPIR-V pipeline caching. An opt-in diagnostic graphics probe crosses the
+//! real DCB draw callback, render pass, rasterization and image readback path;
+//! guest vertex/pixel lowering remains separate. The smoke path proves queue
+//! submission, descriptor arrays, staging, device-local memory and readback.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -37,6 +38,11 @@ pub const Error = error{
     PipelineCacheCreationFailed,
     PipelineLayoutCreationFailed,
     ComputePipelineCreationFailed,
+    GraphicsPipelineCreationFailed,
+    ImageCreationFailed,
+    ImageViewCreationFailed,
+    RenderPassCreationFailed,
+    FramebufferCreationFailed,
     DescriptorSetLayoutCreationFailed,
     DescriptorPoolCreationFailed,
     DescriptorSetAllocationFailed,
@@ -57,11 +63,20 @@ pub const Error = error{
     MissingComputeProgram,
     InvalidDispatchPacket,
     UnsupportedIndirectDispatch,
+    UnsupportedDrawPacket,
+    GraphicsProbeReadbackMismatch,
 };
 
 pub const Options = struct {
     enable_validation: bool = builtin.mode == .Debug,
+    /// Diagnostic-only fixed shaders used to prove the DCB graphics submission
+    /// and color-target path before guest vertex/pixel lowering is connected.
+    enable_graphics_probe: bool = false,
 };
+
+pub const graphics_probe_width: u32 = 64;
+pub const graphics_probe_height: u32 = 64;
+pub const graphics_probe_bytes: usize = graphics_probe_width * graphics_probe_height * 4;
 
 pub const DeviceInfo = struct {
     name_bytes: [256]u8 = [_]u8{0} ** 256,
@@ -206,6 +221,12 @@ const DeviceFunctions = struct {
     allocate_memory: vk.PfnAllocateMemory,
     free_memory: vk.PfnFreeMemory,
     bind_buffer_memory: vk.PfnBindBufferMemory,
+    create_image: vk.PfnCreateImage,
+    destroy_image: vk.PfnDestroyImage,
+    get_image_memory_requirements: vk.PfnGetImageMemoryRequirements,
+    bind_image_memory: vk.PfnBindImageMemory,
+    create_image_view: vk.PfnCreateImageView,
+    destroy_image_view: vk.PfnDestroyImageView,
     map_memory: vk.PfnMapMemory,
     unmap_memory: vk.PfnUnmapMemory,
     create_shader_module: vk.PfnCreateShaderModule,
@@ -221,11 +242,20 @@ const DeviceFunctions = struct {
     create_pipeline_layout: vk.PfnCreatePipelineLayout,
     destroy_pipeline_layout: vk.PfnDestroyPipelineLayout,
     create_compute_pipelines: vk.PfnCreateComputePipelines,
+    create_graphics_pipelines: vk.PfnCreateGraphicsPipelines,
+    create_render_pass: vk.PfnCreateRenderPass,
+    destroy_render_pass: vk.PfnDestroyRenderPass,
+    create_framebuffer: vk.PfnCreateFramebuffer,
+    destroy_framebuffer: vk.PfnDestroyFramebuffer,
     destroy_pipeline: vk.PfnDestroyPipeline,
     cmd_bind_pipeline: vk.PfnCmdBindPipeline,
     cmd_bind_descriptor_sets: vk.PfnCmdBindDescriptorSets,
     cmd_dispatch: vk.PfnCmdDispatch,
+    cmd_begin_render_pass: vk.PfnCmdBeginRenderPass,
+    cmd_end_render_pass: vk.PfnCmdEndRenderPass,
+    cmd_draw: vk.PfnCmdDraw,
     cmd_copy_buffer: vk.PfnCmdCopyBuffer,
+    cmd_copy_image_to_buffer: vk.PfnCmdCopyImageToBuffer,
     cmd_pipeline_barrier: vk.PfnCmdPipelineBarrier,
 
     fn load(get_proc: vk.PfnGetDeviceProcAddr, device: vk.Device) Error!DeviceFunctions {
@@ -249,6 +279,12 @@ const DeviceFunctions = struct {
             .allocate_memory = try deviceProc(get_proc, device, vk.PfnAllocateMemory, "vkAllocateMemory"),
             .free_memory = try deviceProc(get_proc, device, vk.PfnFreeMemory, "vkFreeMemory"),
             .bind_buffer_memory = try deviceProc(get_proc, device, vk.PfnBindBufferMemory, "vkBindBufferMemory"),
+            .create_image = try deviceProc(get_proc, device, vk.PfnCreateImage, "vkCreateImage"),
+            .destroy_image = try deviceProc(get_proc, device, vk.PfnDestroyImage, "vkDestroyImage"),
+            .get_image_memory_requirements = try deviceProc(get_proc, device, vk.PfnGetImageMemoryRequirements, "vkGetImageMemoryRequirements"),
+            .bind_image_memory = try deviceProc(get_proc, device, vk.PfnBindImageMemory, "vkBindImageMemory"),
+            .create_image_view = try deviceProc(get_proc, device, vk.PfnCreateImageView, "vkCreateImageView"),
+            .destroy_image_view = try deviceProc(get_proc, device, vk.PfnDestroyImageView, "vkDestroyImageView"),
             .map_memory = try deviceProc(get_proc, device, vk.PfnMapMemory, "vkMapMemory"),
             .unmap_memory = try deviceProc(get_proc, device, vk.PfnUnmapMemory, "vkUnmapMemory"),
             .create_shader_module = try deviceProc(get_proc, device, vk.PfnCreateShaderModule, "vkCreateShaderModule"),
@@ -264,11 +300,20 @@ const DeviceFunctions = struct {
             .create_pipeline_layout = try deviceProc(get_proc, device, vk.PfnCreatePipelineLayout, "vkCreatePipelineLayout"),
             .destroy_pipeline_layout = try deviceProc(get_proc, device, vk.PfnDestroyPipelineLayout, "vkDestroyPipelineLayout"),
             .create_compute_pipelines = try deviceProc(get_proc, device, vk.PfnCreateComputePipelines, "vkCreateComputePipelines"),
+            .create_graphics_pipelines = try deviceProc(get_proc, device, vk.PfnCreateGraphicsPipelines, "vkCreateGraphicsPipelines"),
+            .create_render_pass = try deviceProc(get_proc, device, vk.PfnCreateRenderPass, "vkCreateRenderPass"),
+            .destroy_render_pass = try deviceProc(get_proc, device, vk.PfnDestroyRenderPass, "vkDestroyRenderPass"),
+            .create_framebuffer = try deviceProc(get_proc, device, vk.PfnCreateFramebuffer, "vkCreateFramebuffer"),
+            .destroy_framebuffer = try deviceProc(get_proc, device, vk.PfnDestroyFramebuffer, "vkDestroyFramebuffer"),
             .destroy_pipeline = try deviceProc(get_proc, device, vk.PfnDestroyPipeline, "vkDestroyPipeline"),
             .cmd_bind_pipeline = try deviceProc(get_proc, device, vk.PfnCmdBindPipeline, "vkCmdBindPipeline"),
             .cmd_bind_descriptor_sets = try deviceProc(get_proc, device, vk.PfnCmdBindDescriptorSets, "vkCmdBindDescriptorSets"),
             .cmd_dispatch = try deviceProc(get_proc, device, vk.PfnCmdDispatch, "vkCmdDispatch"),
+            .cmd_begin_render_pass = try deviceProc(get_proc, device, vk.PfnCmdBeginRenderPass, "vkCmdBeginRenderPass"),
+            .cmd_end_render_pass = try deviceProc(get_proc, device, vk.PfnCmdEndRenderPass, "vkCmdEndRenderPass"),
+            .cmd_draw = try deviceProc(get_proc, device, vk.PfnCmdDraw, "vkCmdDraw"),
             .cmd_copy_buffer = try deviceProc(get_proc, device, vk.PfnCmdCopyBuffer, "vkCmdCopyBuffer"),
+            .cmd_copy_image_to_buffer = try deviceProc(get_proc, device, vk.PfnCmdCopyImageToBuffer, "vkCmdCopyImageToBuffer"),
             .cmd_pipeline_barrier = try deviceProc(get_proc, device, vk.PfnCmdPipelineBarrier, "vkCmdPipelineBarrier"),
         };
     }
@@ -290,6 +335,11 @@ const OwnedBuffer = struct {
     handle: vk.Buffer,
     memory: vk.DeviceMemory,
     size: vk.DeviceSize,
+};
+
+const OwnedImage = struct {
+    handle: vk.Image,
+    memory: vk.DeviceMemory,
 };
 
 const maximum_guest_buffers = 256;
@@ -369,11 +419,15 @@ pub const Renderer = struct {
     loader_api_version: u32,
     device_info: DeviceInfo,
     validation_enabled: bool,
+    graphics_probe_enabled: bool,
     guest_memory: ?GuestMemory = null,
     guest_buffers: std.ArrayList(GuestBufferEntry) = .empty,
     compute_pipelines: std.ArrayList(ComputePipelineEntry) = .empty,
     active_descriptor_set: ?vk.DescriptorSet = null,
     draw_callbacks: u64 = 0,
+    translated_draws: u64 = 0,
+    graphics_probe_colored_pixels: u32 = 0,
+    graphics_probe_frame: [graphics_probe_bytes]u8 = @splat(0),
     dispatch_callbacks: u64 = 0,
     translated_dispatches: u64 = 0,
     buffer_cache_hits: u64 = 0,
@@ -382,6 +436,7 @@ pub const Renderer = struct {
     pipeline_cache_hits: u64 = 0,
     pipeline_cache_misses: u64 = 0,
     last_dispatch_error: ?anyerror = null,
+    last_draw_error: ?anyerror = null,
 
     pub fn init(allocator: std.mem.Allocator, options: Options) (Error || std.mem.Allocator.Error)!Renderer {
         var loader = try Loader.init();
@@ -533,6 +588,7 @@ pub const Renderer = struct {
             .loader_api_version = loader_api_version,
             .device_info = candidate.info,
             .validation_enabled = validation_enabled,
+            .graphics_probe_enabled = options.enable_graphics_probe,
         };
     }
 
@@ -561,8 +617,9 @@ pub const Renderer = struct {
     }
 
     /// Attaches the renderer to the existing DCB executor boundary. PM4 remains
-    /// API-neutral; supported direct compute work is translated and submitted,
-    /// while draw callbacks stay observable until graphics lowering exists.
+    /// API-neutral; supported direct compute work is translated and submitted.
+    /// Draws remain observable by default, while the opt-in fixed-shader probe
+    /// exercises graphics submission without pretending to translate a guest.
     pub fn dcbBackend(self: *Renderer, memory: GuestMemory) gpu.DcbBackend {
         self.guest_memory = memory;
         return .{ .context = self, .vtable = &dcb_vtable };
@@ -1135,6 +1192,238 @@ pub const Renderer = struct {
         };
     }
 
+    fn createGraphicsProbeRenderPass(self: *Renderer) Error!vk.RenderPass {
+        const attachment = vk.AttachmentDescription{
+            .format = vk.format_r8g8b8a8_unorm,
+            .load_operation = vk.attachment_load_op_clear,
+            .store_operation = vk.attachment_store_op_store,
+            .initial_layout = vk.image_layout_undefined,
+            .final_layout = vk.image_layout_color_attachment_optimal,
+        };
+        const reference = vk.AttachmentReference{
+            .attachment = 0,
+            .layout = vk.image_layout_color_attachment_optimal,
+        };
+        const subpass = vk.SubpassDescription{
+            .color_attachment_count = 1,
+            .color_attachments = @ptrCast(&reference),
+        };
+        const info = vk.RenderPassCreateInfo{
+            .attachment_count = 1,
+            .attachments = @ptrCast(&attachment),
+            .subpass_count = 1,
+            .subpasses = @ptrCast(&subpass),
+        };
+        var render_pass: vk.RenderPass = 0;
+        if (self.device_functions.create_render_pass(self.device, &info, null, &render_pass) != vk.success) {
+            return Error.RenderPassCreationFailed;
+        }
+        return render_pass;
+    }
+
+    fn createGraphicsProbePipeline(self: *Renderer, render_pass: vk.RenderPass) Error!vk.Pipeline {
+        const vertex = try self.createShader(&graphics_probe_vertex_spirv);
+        defer self.device_functions.destroy_shader_module(self.device, vertex, null);
+        const fragment = try self.createShader(&graphics_probe_fragment_spirv);
+        defer self.device_functions.destroy_shader_module(self.device, fragment, null);
+        const stages = [_]vk.PipelineShaderStageCreateInfo{
+            .{ .stage = vk.shader_stage_vertex_bit, .module = vertex, .name = "main" },
+            .{ .stage = vk.shader_stage_fragment_bit, .module = fragment, .name = "main" },
+        };
+        const vertex_input = vk.PipelineVertexInputStateCreateInfo{};
+        const input_assembly = vk.PipelineInputAssemblyStateCreateInfo{};
+        const viewport = vk.Viewport{
+            .x = 0,
+            .y = 0,
+            .width = @floatFromInt(graphics_probe_width),
+            .height = @floatFromInt(graphics_probe_height),
+            .min_depth = 0,
+            .max_depth = 1,
+        };
+        const scissor = vk.Rect2D{
+            .offset = .{ .x = 0, .y = 0 },
+            .extent = .{ .width = graphics_probe_width, .height = graphics_probe_height },
+        };
+        const viewport_state = vk.PipelineViewportStateCreateInfo{
+            .viewport_count = 1,
+            .viewports = @ptrCast(&viewport),
+            .scissor_count = 1,
+            .scissors = @ptrCast(&scissor),
+        };
+        const rasterization = vk.PipelineRasterizationStateCreateInfo{};
+        const multisample = vk.PipelineMultisampleStateCreateInfo{};
+        const blend_attachment = vk.PipelineColorBlendAttachmentState{};
+        const color_blend = vk.PipelineColorBlendStateCreateInfo{
+            .attachment_count = 1,
+            .attachments = @ptrCast(&blend_attachment),
+        };
+        const info = vk.GraphicsPipelineCreateInfo{
+            .stage_count = stages.len,
+            .stages = &stages,
+            .vertex_input_state = &vertex_input,
+            .input_assembly_state = &input_assembly,
+            .viewport_state = &viewport_state,
+            .rasterization_state = &rasterization,
+            .multisample_state = &multisample,
+            .color_blend_state = &color_blend,
+            .layout = self.compute_pipeline_layout,
+            .render_pass = render_pass,
+        };
+        var pipeline: vk.Pipeline = 0;
+        if (self.device_functions.create_graphics_pipelines(
+            self.device,
+            self.driver_pipeline_cache,
+            1,
+            @ptrCast(&info),
+            null,
+            @ptrCast(&pipeline),
+        ) != vk.success) {
+            return Error.GraphicsPipelineCreationFailed;
+        }
+        return pipeline;
+    }
+
+    fn drawGraphicsProbe(self: *Renderer) Error!void {
+        const color = try self.createImage(
+            graphics_probe_width,
+            graphics_probe_height,
+            vk.format_r8g8b8a8_unorm,
+            vk.image_usage_color_attachment_bit | vk.image_usage_transfer_src_bit,
+        );
+        defer self.destroyImage(color);
+
+        const view_info = vk.ImageViewCreateInfo{
+            .image = color.handle,
+            .format = vk.format_r8g8b8a8_unorm,
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        var view: vk.ImageView = 0;
+        if (self.device_functions.create_image_view(self.device, &view_info, null, &view) != vk.success) {
+            return Error.ImageViewCreationFailed;
+        }
+        defer self.device_functions.destroy_image_view(self.device, view, null);
+
+        const render_pass = try self.createGraphicsProbeRenderPass();
+        defer self.device_functions.destroy_render_pass(self.device, render_pass, null);
+        const framebuffer_info = vk.FramebufferCreateInfo{
+            .render_pass = render_pass,
+            .attachment_count = 1,
+            .attachments = @ptrCast(&view),
+            .width = graphics_probe_width,
+            .height = graphics_probe_height,
+        };
+        var framebuffer: vk.Framebuffer = 0;
+        if (self.device_functions.create_framebuffer(self.device, &framebuffer_info, null, &framebuffer) != vk.success) {
+            return Error.FramebufferCreationFailed;
+        }
+        defer self.device_functions.destroy_framebuffer(self.device, framebuffer, null);
+
+        const pipeline = try self.createGraphicsProbePipeline(render_pass);
+        defer self.device_functions.destroy_pipeline(self.device, pipeline, null);
+        const readback = try self.createBuffer(
+            graphics_probe_bytes,
+            vk.buffer_usage_transfer_dst_bit,
+            vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+        );
+        defer self.destroyBuffer(readback);
+
+        const command_buffer = try self.beginOneShot();
+        defer self.device_functions.free_command_buffers(self.device, self.command_pool, 1, @ptrCast(&command_buffer));
+        const clear = vk.ClearValue{ .color = .{ .float32 = .{ 0, 0, 0, 1 } } };
+        const begin_info = vk.RenderPassBeginInfo{
+            .render_pass = render_pass,
+            .framebuffer = framebuffer,
+            .render_area = .{
+                .offset = .{ .x = 0, .y = 0 },
+                .extent = .{ .width = graphics_probe_width, .height = graphics_probe_height },
+            },
+            .clear_value_count = 1,
+            .clear_values = @ptrCast(&clear),
+        };
+        self.device_functions.cmd_begin_render_pass(command_buffer, &begin_info, vk.subpass_contents_inline);
+        self.device_functions.cmd_bind_pipeline(command_buffer, vk.pipeline_bind_point_graphics, pipeline);
+        self.device_functions.cmd_draw(command_buffer, 3, 1, 0, 0);
+        self.device_functions.cmd_end_render_pass(command_buffer);
+
+        const image_barrier = vk.ImageMemoryBarrier{
+            .source_access_mask = vk.access_color_attachment_write_bit,
+            .destination_access_mask = vk.access_transfer_read_bit,
+            .old_layout = vk.image_layout_color_attachment_optimal,
+            .new_layout = vk.image_layout_transfer_src_optimal,
+            .image = color.handle,
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_color_attachment_output_bit,
+            vk.pipeline_stage_transfer_bit,
+            0,
+            0,
+            null,
+            0,
+            null,
+            1,
+            @ptrCast(&image_barrier),
+        );
+        const copy = vk.BufferImageCopy{
+            .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+            .image_extent = .{ .width = graphics_probe_width, .height = graphics_probe_height, .depth = 1 },
+        };
+        self.device_functions.cmd_copy_image_to_buffer(
+            command_buffer,
+            color.handle,
+            vk.image_layout_transfer_src_optimal,
+            readback.handle,
+            1,
+            @ptrCast(&copy),
+        );
+        const host_barrier = vk.BufferMemoryBarrier{
+            .source_access_mask = vk.access_transfer_write_bit,
+            .destination_access_mask = vk.access_host_read_bit,
+            .buffer = readback.handle,
+            .offset = 0,
+            .size = readback.size,
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_transfer_bit,
+            vk.pipeline_stage_host_bit,
+            0,
+            0,
+            null,
+            1,
+            @ptrCast(&host_barrier),
+            0,
+            null,
+        );
+        try self.submitOneShot(command_buffer);
+        try self.readMapped(readback, &self.graphics_probe_frame);
+
+        const center = (@as(usize, graphics_probe_height / 2) * graphics_probe_width + graphics_probe_width / 2) * 4;
+        const corner = self.graphics_probe_frame[0..4];
+        const center_pixel = self.graphics_probe_frame[center..][0..4];
+        if (!std.mem.eql(u8, corner, &.{ 0, 0, 0, 255 }) or
+            center_pixel[0] < 200 or center_pixel[1] < 40 or center_pixel[1] > 100 or
+            center_pixel[2] > 80 or center_pixel[3] != 255)
+        {
+            return Error.GraphicsProbeReadbackMismatch;
+        }
+        var colored: u32 = 0;
+        var pixel: usize = 0;
+        while (pixel < self.graphics_probe_frame.len) : (pixel += 4) {
+            if (self.graphics_probe_frame[pixel] != 0 or
+                self.graphics_probe_frame[pixel + 1] != 0 or
+                self.graphics_probe_frame[pixel + 2] != 0)
+            {
+                colored += 1;
+            }
+        }
+        if (colored == 0 or colored >= graphics_probe_width * graphics_probe_height) {
+            return Error.GraphicsProbeReadbackMismatch;
+        }
+        self.graphics_probe_colored_pixels = colored;
+    }
+
     fn createBuffer(self: *Renderer, size: vk.DeviceSize, usage: vk.Flags, properties: vk.Flags) Error!OwnedBuffer {
         const create_info = vk.BufferCreateInfo{ .size = size, .usage = usage };
         var handle: vk.Buffer = 0;
@@ -1161,6 +1450,37 @@ pub const Renderer = struct {
             return Error.MemoryBindingFailed;
         }
         return .{ .handle = handle, .memory = memory, .size = size };
+    }
+
+    fn createImage(self: *Renderer, width: u32, height: u32, format: u32, usage: vk.Flags) Error!OwnedImage {
+        const create_info = vk.ImageCreateInfo{
+            .format = format,
+            .extent = .{ .width = width, .height = height, .depth = 1 },
+            .usage = usage,
+        };
+        var handle: vk.Image = 0;
+        if (self.device_functions.create_image(self.device, &create_info, null, &handle) != vk.success) {
+            return Error.ImageCreationFailed;
+        }
+        errdefer self.device_functions.destroy_image(self.device, handle, null);
+        var requirements: vk.MemoryRequirements = undefined;
+        self.device_functions.get_image_memory_requirements(self.device, handle, &requirements);
+        const memory_type_index = self.findMemoryType(requirements.memory_type_bits, vk.memory_property_device_local_bit) orelse {
+            return Error.NoCompatibleMemoryType;
+        };
+        const allocation_info = vk.MemoryAllocateInfo{
+            .allocation_size = requirements.size,
+            .memory_type_index = memory_type_index,
+        };
+        var memory: vk.DeviceMemory = 0;
+        if (self.device_functions.allocate_memory(self.device, &allocation_info, null, &memory) != vk.success) {
+            return Error.MemoryAllocationFailed;
+        }
+        errdefer self.device_functions.free_memory(self.device, memory, null);
+        if (self.device_functions.bind_image_memory(self.device, handle, memory, 0) != vk.success) {
+            return Error.MemoryBindingFailed;
+        }
+        return .{ .handle = handle, .memory = memory };
     }
 
     fn updateStorageDescriptor(self: *Renderer, descriptor_index: u32, buffer: OwnedBuffer) void {
@@ -1221,6 +1541,11 @@ pub const Renderer = struct {
     fn destroyBuffer(self: *Renderer, buffer: OwnedBuffer) void {
         self.device_functions.destroy_buffer(self.device, buffer.handle, null);
         self.device_functions.free_memory(self.device, buffer.memory, null);
+    }
+
+    fn destroyImage(self: *Renderer, image: OwnedImage) void {
+        self.device_functions.destroy_image(self.device, image.handle, null);
+        self.device_functions.free_memory(self.device, image.memory, null);
     }
 
     fn findMemoryType(self: *const Renderer, supported_bits: u32, required: vk.Flags) ?u32 {
@@ -1300,8 +1625,20 @@ pub const Renderer = struct {
         return memory.write(memory.context, address, bytes);
     }
 
-    fn dcbDraw(context: ?*anyopaque, _: *const gpu.State, _: gpu.pm4.Packet) bool {
-        fromContext(context).draw_callbacks += 1;
+    fn dcbDraw(context: ?*anyopaque, _: *const gpu.State, packet: gpu.pm4.Packet) bool {
+        const self = fromContext(context);
+        self.draw_callbacks += 1;
+        if (!self.graphics_probe_enabled) return true;
+        if (packet.opcode != gpu.pm4.draw_index_auto or packet.body.len < 1 or packet.body[0] != 3) {
+            self.last_draw_error = Error.UnsupportedDrawPacket;
+            return false;
+        }
+        self.drawGraphicsProbe() catch |err| {
+            self.last_draw_error = err;
+            return false;
+        };
+        self.translated_draws += 1;
+        self.last_draw_error = null;
         return true;
     }
 
@@ -1454,6 +1791,59 @@ fn choosePhysicalDevice(
     return best orelse Error.NoCompatiblePhysicalDevice;
 }
 
+// Diagnostic vertex shader: three positions selected from VertexIndex and
+// written to BuiltIn Position without vertex-buffer dependencies.
+const graphics_probe_vertex_spirv = [_]u32{
+    0x0723_0203, 0x0001_0500, 0x0050_4300, 28,          0,
+    0x0002_0011, 1,           0x0003_000e, 0,           1,
+    0x0007_000f, 0,           18,          0x6e69_616d, 0,
+    9,           10,          0x0004_0047, 9,           11,
+    42,          0x0004_0047, 10,          11,          0,
+    0x0002_0013, 1,           0x0003_0021, 2,           1,
+    0x0002_0014, 3,           0x0004_0015, 4,           32,
+    1,           0x0003_0016, 5,           32,          0x0004_0017,
+    6,           5,           4,           0x0004_0020, 7,
+    1,           4,           0x0004_0020, 8,           3,
+    6,           0x0004_002b, 4,           11,          0,
+    0x0004_002b, 4,           12,          1,           0x0004_002b,
+    4,           13,          2,           0x0004_002b, 5,
+    14,          0xbf4c_cccd, 0x0004_002b, 5,           15,
+    0x3f4c_cccd, 0x0004_002b, 5,           16,          0,
+    0x0004_002b, 5,           17,          0x3f80_0000, 0x0004_003b,
+    7,           9,           1,           0x0004_003b, 8,
+    10,          3,           0x0005_0036, 1,           18,
+    0,           2,           0x0002_00f8, 19,          0x0004_003d,
+    4,           20,          9,           0x0005_00aa, 3,
+    21,          20,          11,          0x0005_00aa, 3,
+    22,          20,          12,          0x0005_00aa, 3,
+    23,          20,          13,          0x0006_00a9, 5,
+    24,          22,          15,          16,          0x0006_00a9,
+    5,           25,          21,          14,          24,
+    0x0006_00a9, 5,           26,          23,          15,
+    14,          0x0007_0050, 6,           27,          25,
+    26,          16,          17,          0x0003_003e, 10,
+    27,          0x0001_00fd, 0x0001_0038,
+};
+
+// Diagnostic fragment shader: one opaque orange-red color at location zero.
+const graphics_probe_fragment_spirv = [_]u32{
+    0x0723_0203, 0x0001_0500, 0x0050_4300, 14,          0,
+    0x0002_0011, 1,           0x0003_000e, 0,           1,
+    0x0006_000f, 4,           11,          0x6e69_616d, 0,
+    6,           0x0003_0010, 11,          7,           0x0004_0047,
+    6,           30,          0,           0x0002_0013, 1,
+    0x0003_0021, 2,           1,           0x0003_0016, 3,
+    32,          0x0004_0017, 4,           3,           4,
+    0x0004_0020, 5,           3,           4,           0x0004_002b,
+    3,           7,           0x3f80_0000, 0x0004_002b, 3,
+    8,           0x3e80_0000, 0x0004_002b, 3,           9,
+    0x3dcc_cccd, 0x0004_003b, 5,           6,           3,
+    0x0005_0036, 1,           11,          0,           2,
+    0x0002_00f8, 12,          0x0007_0050, 4,           13,
+    7,           8,           9,           7,           0x0003_003e,
+    6,           13,          0x0001_00fd, 0x0001_0038,
+};
+
 // SPIR-V 1.0: `void main()` with LocalSize(1, 1, 1). The staging copy is
 // deliberately separate so the probe validates both compute-pipeline creation
 // and transfer/readback synchronization without depending on descriptor code.
@@ -1481,4 +1871,13 @@ test "Vulkan version packing matches the registry layout" {
     try std.testing.expectEqual(@as(u32, 1), vk.apiMajor(version));
     try std.testing.expectEqual(@as(u32, 4), vk.apiMinor(version));
     try std.testing.expectEqual(@as(u32, 321), vk.apiPatch(version));
+}
+
+test "graphics probe is opt-in and carries standalone shader modules" {
+    try std.testing.expect(!(Options{}).enable_graphics_probe);
+    try std.testing.expectEqual(@as(u32, 0x0723_0203), graphics_probe_vertex_spirv[0]);
+    try std.testing.expectEqual(@as(u32, 0x0723_0203), graphics_probe_fragment_spirv[0]);
+    try std.testing.expect(graphics_probe_vertex_spirv.len > 32);
+    try std.testing.expect(graphics_probe_fragment_spirv.len > 24);
+    try std.testing.expectEqual(@as(usize, 64 * 64 * 4), graphics_probe_bytes);
 }

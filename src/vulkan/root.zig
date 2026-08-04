@@ -14,6 +14,8 @@ pub const StagedBuffer = backend.StagedBuffer;
 pub const DispatchReport = backend.DispatchReport;
 pub const GuestMemory = backend.GuestMemory;
 pub const Renderer = backend.Renderer;
+pub const graphics_probe_width = backend.graphics_probe_width;
+pub const graphics_probe_height = backend.graphics_probe_height;
 
 test {
     _ = api;
