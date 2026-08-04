@@ -60,7 +60,9 @@ pub const Error = error{
     InvalidStorageDescriptor,
     MissingStorageDescriptor,
     ComputePipelineCacheFull,
+    GraphicsPipelineCacheFull,
     MissingComputeProgram,
+    MissingGraphicsProgram,
     InvalidDispatchPacket,
     UnsupportedIndirectDispatch,
     UnsupportedDrawPacket,
@@ -345,6 +347,7 @@ const OwnedImage = struct {
 const maximum_guest_buffers = 256;
 pub const maximum_storage_descriptors = 64;
 const maximum_compute_pipelines = 256;
+const maximum_graphics_pipelines = 256;
 const maximum_staged_buffer_bytes = 128 * 1024 * 1024;
 
 const GuestBufferEntry = struct {
@@ -358,6 +361,13 @@ const ComputePipelineEntry = struct {
     hash: u64,
     words: []u32,
     shader: vk.ShaderModule,
+    pipeline: vk.Pipeline,
+};
+
+const GraphicsPipelineEntry = struct {
+    hash: u64,
+    vertex_words: []u32,
+    fragment_words: []u32,
     pipeline: vk.Pipeline,
 };
 
@@ -423,9 +433,11 @@ pub const Renderer = struct {
     guest_memory: ?GuestMemory = null,
     guest_buffers: std.ArrayList(GuestBufferEntry) = .empty,
     compute_pipelines: std.ArrayList(ComputePipelineEntry) = .empty,
+    graphics_pipelines: std.ArrayList(GraphicsPipelineEntry) = .empty,
     active_descriptor_set: ?vk.DescriptorSet = null,
     draw_callbacks: u64 = 0,
     translated_draws: u64 = 0,
+    guest_graphics_draws: u64 = 0,
     graphics_probe_colored_pixels: u32 = 0,
     graphics_probe_frame: [graphics_probe_bytes]u8 = @splat(0),
     dispatch_callbacks: u64 = 0,
@@ -435,6 +447,8 @@ pub const Renderer = struct {
     buffer_uploads: u64 = 0,
     pipeline_cache_hits: u64 = 0,
     pipeline_cache_misses: u64 = 0,
+    graphics_pipeline_cache_hits: u64 = 0,
+    graphics_pipeline_cache_misses: u64 = 0,
     last_dispatch_error: ?anyerror = null,
     last_draw_error: ?anyerror = null,
 
@@ -600,6 +614,12 @@ pub const Renderer = struct {
             self.allocator.free(entry.words);
         }
         self.compute_pipelines.deinit(self.allocator);
+        for (self.graphics_pipelines.items) |entry| {
+            self.device_functions.destroy_pipeline(self.device, entry.pipeline, null);
+            self.allocator.free(entry.vertex_words);
+            self.allocator.free(entry.fragment_words);
+        }
+        self.graphics_pipelines.deinit(self.allocator);
         for (self.guest_buffers.items) |entry| {
             self.destroyBuffer(entry.device_local);
             self.destroyBuffer(entry.upload);
@@ -618,8 +638,9 @@ pub const Renderer = struct {
 
     /// Attaches the renderer to the existing DCB executor boundary. PM4 remains
     /// API-neutral; supported direct compute work is translated and submitted.
-    /// Draws remain observable by default, while the opt-in fixed-shader probe
-    /// exercises graphics submission without pretending to translate a guest.
+    /// Draws remain observable by default. Complete vertex/pixel programs are
+    /// translated and submitted; the opt-in fixed-shader probe is only used
+    /// when a draw has no guest graphics programs.
     pub fn dcbBackend(self: *Renderer, memory: GuestMemory) gpu.DcbBackend {
         self.guest_memory = memory;
         return .{ .context = self, .vtable = &dcb_vtable };
@@ -1221,10 +1242,15 @@ pub const Renderer = struct {
         return render_pass;
     }
 
-    fn createGraphicsProbePipeline(self: *Renderer, render_pass: vk.RenderPass) Error!vk.Pipeline {
-        const vertex = try self.createShader(&graphics_probe_vertex_spirv);
+    fn createGraphicsPipeline(
+        self: *Renderer,
+        render_pass: vk.RenderPass,
+        vertex_words: []const u32,
+        fragment_words: []const u32,
+    ) Error!vk.Pipeline {
+        const vertex = try self.createShader(vertex_words);
         defer self.device_functions.destroy_shader_module(self.device, vertex, null);
-        const fragment = try self.createShader(&graphics_probe_fragment_spirv);
+        const fragment = try self.createShader(fragment_words);
         defer self.device_functions.destroy_shader_module(self.device, fragment, null);
         const stages = [_]vk.PipelineShaderStageCreateInfo{
             .{ .stage = vk.shader_stage_vertex_bit, .module = vertex, .name = "main" },
@@ -1283,7 +1309,48 @@ pub const Renderer = struct {
         return pipeline;
     }
 
-    fn drawGraphicsProbe(self: *Renderer) Error!void {
+    fn getGraphicsPipeline(
+        self: *Renderer,
+        render_pass: vk.RenderPass,
+        vertex_words: []const u32,
+        fragment_words: []const u32,
+    ) (Error || std.mem.Allocator.Error)!vk.Pipeline {
+        const vertex_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(vertex_words));
+        const hash = std.hash.Wyhash.hash(vertex_hash, std.mem.sliceAsBytes(fragment_words));
+        for (self.graphics_pipelines.items) |entry| {
+            if (entry.hash == hash and
+                std.mem.eql(u32, entry.vertex_words, vertex_words) and
+                std.mem.eql(u32, entry.fragment_words, fragment_words))
+            {
+                self.graphics_pipeline_cache_hits += 1;
+                return entry.pipeline;
+            }
+        }
+        if (self.graphics_pipelines.items.len >= maximum_graphics_pipelines) {
+            return Error.GraphicsPipelineCacheFull;
+        }
+        const owned_vertex = try self.allocator.dupe(u32, vertex_words);
+        errdefer self.allocator.free(owned_vertex);
+        const owned_fragment = try self.allocator.dupe(u32, fragment_words);
+        errdefer self.allocator.free(owned_fragment);
+        const pipeline = try self.createGraphicsPipeline(render_pass, vertex_words, fragment_words);
+        errdefer self.device_functions.destroy_pipeline(self.device, pipeline, null);
+        try self.graphics_pipelines.append(self.allocator, .{
+            .hash = hash,
+            .vertex_words = owned_vertex,
+            .fragment_words = owned_fragment,
+            .pipeline = pipeline,
+        });
+        self.graphics_pipeline_cache_misses += 1;
+        return pipeline;
+    }
+
+    fn drawGraphicsShaders(
+        self: *Renderer,
+        vertex_words: []const u32,
+        fragment_words: []const u32,
+        validate_diagnostic_color: bool,
+    ) (Error || std.mem.Allocator.Error)!void {
         const color = try self.createImage(
             graphics_probe_width,
             graphics_probe_height,
@@ -1318,8 +1385,7 @@ pub const Renderer = struct {
         }
         defer self.device_functions.destroy_framebuffer(self.device, framebuffer, null);
 
-        const pipeline = try self.createGraphicsProbePipeline(render_pass);
-        defer self.device_functions.destroy_pipeline(self.device, pipeline, null);
+        const pipeline = try self.getGraphicsPipeline(render_pass, vertex_words, fragment_words);
         const readback = try self.createBuffer(
             graphics_probe_bytes,
             vk.buffer_usage_transfer_dst_bit,
@@ -1402,9 +1468,10 @@ pub const Renderer = struct {
         const center = (@as(usize, graphics_probe_height / 2) * graphics_probe_width + graphics_probe_width / 2) * 4;
         const corner = self.graphics_probe_frame[0..4];
         const center_pixel = self.graphics_probe_frame[center..][0..4];
-        if (!std.mem.eql(u8, corner, &.{ 0, 0, 0, 255 }) or
-            center_pixel[0] < 200 or center_pixel[1] < 40 or center_pixel[1] > 100 or
-            center_pixel[2] > 80 or center_pixel[3] != 255)
+        if (validate_diagnostic_color and
+            (!std.mem.eql(u8, corner, &.{ 0, 0, 0, 255 }) or
+                center_pixel[0] < 200 or center_pixel[1] < 40 or center_pixel[1] > 100 or
+                center_pixel[2] > 80 or center_pixel[3] != 255))
         {
             return Error.GraphicsProbeReadbackMismatch;
         }
@@ -1418,10 +1485,43 @@ pub const Renderer = struct {
                 colored += 1;
             }
         }
-        if (colored == 0 or colored >= graphics_probe_width * graphics_probe_height) {
+        if (validate_diagnostic_color and
+            (colored == 0 or colored >= graphics_probe_width * graphics_probe_height))
+        {
             return Error.GraphicsProbeReadbackMismatch;
         }
         self.graphics_probe_colored_pixels = colored;
+    }
+
+    fn drawGraphicsProbe(self: *Renderer) (Error || std.mem.Allocator.Error)!void {
+        return self.drawGraphicsShaders(
+            &graphics_probe_vertex_spirv,
+            &graphics_probe_fragment_spirv,
+            true,
+        );
+    }
+
+    fn drawGuestGraphics(self: *Renderer, state: *const gpu.State) anyerror!void {
+        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        const vertex_address = gpu.resources.ShaderStage.vertex.programAddress(state) orelse {
+            return Error.MissingGraphicsProgram;
+        };
+        const fragment_address = gpu.resources.ShaderStage.pixel.programAddress(state) orelse {
+            return Error.MissingGraphicsProgram;
+        };
+        const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
+        var vertex_analysis = try gpu.shader_analysis.decode(self.allocator, reader, vertex_address, 4096);
+        defer vertex_analysis.deinit(self.allocator);
+        var fragment_analysis = try gpu.shader_analysis.decode(self.allocator, reader, fragment_address, 4096);
+        defer fragment_analysis.deinit(self.allocator);
+        var vertex_module = try vertex_analysis.translateSpirv(self.allocator, .{
+            .stage = .vertex,
+            .vertex_index_vgpr = 0,
+        });
+        defer vertex_module.deinit(self.allocator);
+        var fragment_module = try fragment_analysis.translateSpirv(self.allocator, .{ .stage = .fragment });
+        defer fragment_module.deinit(self.allocator);
+        try self.drawGraphicsShaders(vertex_module.words, fragment_module.words, false);
     }
 
     fn createBuffer(self: *Renderer, size: vk.DeviceSize, usage: vk.Flags, properties: vk.Flags) Error!OwnedBuffer {
@@ -1625,18 +1725,31 @@ pub const Renderer = struct {
         return memory.write(memory.context, address, bytes);
     }
 
-    fn dcbDraw(context: ?*anyopaque, _: *const gpu.State, packet: gpu.pm4.Packet) bool {
+    fn dcbDraw(context: ?*anyopaque, state: *const gpu.State, packet: gpu.pm4.Packet) bool {
         const self = fromContext(context);
         self.draw_callbacks += 1;
-        if (!self.graphics_probe_enabled) return true;
+        const has_vertex = gpu.resources.ShaderStage.vertex.programAddress(state) != null;
+        const has_fragment = gpu.resources.ShaderStage.pixel.programAddress(state) != null;
+        if (!has_vertex and !has_fragment and !self.graphics_probe_enabled) return true;
         if (packet.opcode != gpu.pm4.draw_index_auto or packet.body.len < 1 or packet.body[0] != 3) {
             self.last_draw_error = Error.UnsupportedDrawPacket;
             return false;
         }
-        self.drawGraphicsProbe() catch |err| {
-            self.last_draw_error = err;
+        if (has_vertex != has_fragment) {
+            self.last_draw_error = Error.MissingGraphicsProgram;
             return false;
-        };
+        }
+        if (has_vertex)
+            self.drawGuestGraphics(state) catch |err| {
+                self.last_draw_error = err;
+                return false;
+            }
+        else
+            self.drawGraphicsProbe() catch |err| {
+                self.last_draw_error = err;
+                return false;
+            };
+        if (has_vertex) self.guest_graphics_draws += 1;
         self.translated_draws += 1;
         self.last_draw_error = null;
         return true;

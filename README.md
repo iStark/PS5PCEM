@@ -134,7 +134,12 @@ VCC/EXEC predicates return a precise unsupported error until their structured
 lowering exists, rather than producing a placeholder shader. Executable MUBUF
 lowering covers byte/short/dword scalar and vector transfers plus the ten common
 32-bit buffer atomics; `glc` atomics preserve their returned old value in the
-guest VGPR.
+guest VGPR. Graphics modules now declare Vulkan stage interfaces: vertex
+`VertexIndex` can seed an explicit guest VGPR, integer-to-float conversions feed
+position math, `EXP POS0` stores `BuiltIn Position`, and fragment `EXP MRT0`
+stores a four-component color at location zero. Compressed and masked exports,
+additional position/parameter/MRT targets and the remaining graphics system
+VGPRs still fail explicitly.
 
 ## Building
 
@@ -270,8 +275,8 @@ set.
    DPP subgroup lowering, VOP3 modifiers plus the remaining opcode tables.
 2. Structure back edges with loop merges and lower VCC/EXEC lane-mask changes
    through the divergence-aware SSA boundary.
-3. Lower buffer/image/LDS/interpolation/export operations against the captured
-   shader-resource and stage-interface metadata.
+3. Lower images, LDS, interpolation, masked/multiple exports and the remaining
+   system VGPRs against captured shader-resource and stage-interface metadata.
 
 ---
 
@@ -443,8 +448,8 @@ The remaining stages are:
 
 1. Finish the DPP/VOP3 operations needed by captures, structured loops and
    VCC/EXEC divergence.
-2. Replace the proven diagnostic draw shaders with guest vertex/fragment
-   lowering, position/color exports and decoded PS5 color-target binding.
+2. Bind decoded PS5 color/depth targets, blend/raster state and viewport/scissor
+   state to the now-executable guest vertex/fragment pipeline.
 3. Add sampled/storage image and sampler descriptor arrays, image
    creation/layout transitions and image operations for textured game draws.
 4. Add surface/swapchain presentation through `SetFlip` and map PM4 acquire,
@@ -452,11 +457,15 @@ The remaining stages are:
 5. Validate packet/state/shader results against captures before optimizing
    asynchronous submission, descriptor caches and pipeline compilation.
 
-The host first-pixels milestone is complete: an opt-in DCB probe rasterizes an
-untextured triangle into an offscreen RGBA8 attachment and verifies it through
-GPU readback. It deliberately does not masquerade as a guest draw. The first
-emulated game frame still requires guest vertex/pixel exports, PS5 color-target
-binding, images, samplers and the synchronization work in the following stages.
+The guest-shader first-pixels milestone is complete. A bounded
+`DRAW_INDEX_AUTO` path incrementally reads vertex and pixel machine code from
+guest memory, lowers `VertexIndex`, `v_cvt_f32_u32`, position/MRT0 `EXP`, builds
+an exact-SPIR-V graphics pipeline and rasterizes the result into the proven
+offscreen RGBA8 attachment. This is a real guest RDNA2 shader draw, but not yet
+a game frame: it uses the current three-vertex/v0-VertexIndex convention and a
+host-owned target. A continuous game video stream still needs decoded PS5
+render targets and state, image/sampler resources, synchronization, and
+`SetFlip` presentation from the following stages.
 
 ---
 
@@ -491,12 +500,14 @@ supported shader to SPIR-V 1.5, creates or reuses its compute pipeline, binds th
 active storage set and dispatches the packet's XYZ group counts. Errors remain
 explicit: a missing program, unsupported shader semantic or indirect dispatch
 rejects that backend callback and records the exact error. Draw callbacks count
-work by default. `enable_graphics_probe` opts into a bounded diagnostic path in
-which `DRAW_INDEX_AUTO` with three vertices records a real Vulkan graphics draw,
-transitions an offscreen RGBA8 color image for transfer and reads the complete
-frame back. Its fixed SPIR-V shaders are intentionally isolated from normal
-emulation until guest vertex/pixel exports are lowered. Compute dispatch captures
-scalar user data, optionally resolves
+work by default. When both vertex and pixel program registers are present, a
+three-vertex `DRAW_INDEX_AUTO` decodes both guest programs, lowers their stage
+interfaces and exports, creates or reuses the exact graphics pipeline, records a
+real Vulkan draw, transitions the offscreen RGBA8 image for transfer and reads
+the complete frame back. A half-bound graphics program fails explicitly.
+`enable_graphics_probe` retains the fixed-shader diagnostic only for draws with
+no guest graphics programs. Compute dispatch captures scalar user data,
+optionally resolves
 the AGC header through the embedding callback, maps every declared
 constant-buffer table entry, and associates each executable MUBUF resource SGPR
 with the matching descriptor-array element. Before translation,
@@ -529,9 +540,12 @@ through another add-thread-id descriptor. A third program checks swizzled load
 and store addresses, including an indexed dword at physical byte 36 and a
 logical short whose two bytes land at physical bytes 3 and 32. All programs run
 twice, checking guest-visible writeback plus allocation and pipeline miss/hit
-paths. Finally, an opt-in DCB `DRAW_INDEX_AUTO` creates a render pass and
-graphics pipeline, rasterizes a triangle into a 64×64 RGBA8 image, performs the
-color-write/transfer/host barriers and validates the readback pixels:
+paths. Finally, the fixed diagnostic draw first proves the render-target path.
+Synthetic vertex and fragment RDNA2 programs are then written into guest memory:
+the vertex shader converts the DCB-provided vertex index, calculates three
+positions and exports `POS0`; the fragment shader exports an MRT0 color. Both
+guest draws pass through the real decoder/translator and exact graphics-pipeline
+cache, rasterize into a 64×64 RGBA8 image and validate the readback pixels:
 
 ```sh
 zig build vulkan-smoke
@@ -542,7 +556,8 @@ Vulkan 1.4.321: NVIDIA GeForce RTX 3070 Ti
 device API 1.4.329, queue family 0, validation off
 headless smoke passed: 1 compute dispatch, 64 staging bytes copied and verified
 translated RDNA2 passed: 6 dispatches, pipelines 3/3 miss/hit, buffers 6/6 miss/hit
-graphics DCB probe passed: 1 draw, 1352 colored pixels in 64x64 RGBA8 frame
+graphics DCB probe passed: 1 diagnostic + 2 guest draws, pipelines 2/1 miss/hit
+guest RDNA2 frame passed: 1152 colored pixels in 64x64 RGBA8 frame
 ```
 
 ---

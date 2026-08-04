@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Artur Strazewicz
 
-//! Deterministic SPIR-V 1.5 writer for executable RDNA2 compute shaders.
+//! Deterministic SPIR-V 1.5 writer for executable RDNA2 graphics and compute shaders.
 
 const std = @import("std");
 const isa = @import("isa.zig");
@@ -37,6 +37,10 @@ pub const ScalarRegister = struct {
 pub const Options = struct {
     stage: Stage,
     local_size: [3]u32 = .{ 1, 1, 1 },
+    /// VGPR populated from Vulkan's VertexIndex system value before a vertex
+    /// shader starts. Other graphics system values remain explicit future
+    /// stage-interface work rather than silently receiving zero.
+    vertex_index_vgpr: ?u8 = null,
     storage_buffers: []const StorageBufferBinding = &.{},
     scalar_registers: []const ScalarRegister = &.{},
     descriptor_array_length: u32 = 64,
@@ -52,6 +56,7 @@ pub const Error = std.mem.Allocator.Error || control_flow.Error || error{
     UndefinedRegister,
     InvalidStorageBinding,
     UnsupportedBufferAddressing,
+    InvalidStageInterface,
 };
 
 pub const Module = struct {
@@ -91,8 +96,14 @@ const Builder = struct {
     signed_type: u32,
     float_type: u32,
     bool_type: u32,
+    vector4_type: u32 = 0,
     main_function: u32,
     label: u32,
+    stage: Stage,
+    vertex_index_vgpr: ?u8,
+    vertex_index_input: u32 = 0,
+    position_output: u32 = 0,
+    color_output: u32 = 0,
     storage_bindings: []const StorageBufferBinding,
     storage_array: u32 = 0,
     storage_word_pointer_type: u32 = 0,
@@ -112,6 +123,8 @@ const Builder = struct {
             .bool_type = 0,
             .main_function = 0,
             .label = 0,
+            .stage = options.stage,
+            .vertex_index_vgpr = options.vertex_index_vgpr,
             .storage_bindings = options.storage_buffers,
             .specialized_scalar_prefix_end = options.specialized_scalar_prefix_end,
         };
@@ -130,6 +143,39 @@ const Builder = struct {
         try self.emit(&self.declarations, 21, &.{ self.signed_type, 32, 1 }); // OpTypeInt
         try self.emit(&self.declarations, 22, &.{ self.float_type, 32 }); // OpTypeFloat
         try self.emit(&self.declarations, 20, &.{self.bool_type}); // OpTypeBool
+
+        if (options.vertex_index_vgpr != null and options.stage != .vertex) {
+            return Error.InvalidStageInterface;
+        }
+        switch (options.stage) {
+            .vertex => {
+                self.vector4_type = self.id();
+                const output_pointer = self.id();
+                self.position_output = self.id();
+                try self.emit(&self.annotations, 71, &.{ self.position_output, 11, 0 }); // BuiltIn Position
+                try self.emit(&self.declarations, 23, &.{ self.vector4_type, self.float_type, 4 }); // OpTypeVector
+                try self.emit(&self.declarations, 32, &.{ output_pointer, 3, self.vector4_type }); // ptr Output
+                try self.emit(&self.declarations, 59, &.{ output_pointer, self.position_output, 3 }); // OpVariable
+
+                if (options.vertex_index_vgpr != null) {
+                    const input_pointer = self.id();
+                    self.vertex_index_input = self.id();
+                    try self.emit(&self.annotations, 71, &.{ self.vertex_index_input, 11, 42 }); // BuiltIn VertexIndex
+                    try self.emit(&self.declarations, 32, &.{ input_pointer, 1, self.signed_type }); // ptr Input
+                    try self.emit(&self.declarations, 59, &.{ input_pointer, self.vertex_index_input, 1 }); // OpVariable
+                }
+            },
+            .fragment => {
+                self.vector4_type = self.id();
+                const output_pointer = self.id();
+                self.color_output = self.id();
+                try self.emit(&self.annotations, 71, &.{ self.color_output, 30, 0 }); // Location 0
+                try self.emit(&self.declarations, 23, &.{ self.vector4_type, self.float_type, 4 }); // OpTypeVector
+                try self.emit(&self.declarations, 32, &.{ output_pointer, 3, self.vector4_type }); // ptr Output
+                try self.emit(&self.declarations, 59, &.{ output_pointer, self.color_output, 3 }); // OpVariable
+            },
+            .compute => {},
+        }
 
         for (options.scalar_registers) |scalar| {
             if (scalar.register >= 128) return Error.InvalidStorageBinding;
@@ -330,6 +376,41 @@ const Builder = struct {
         const result = self.id();
         try self.emit(&self.body, opcode, &.{ self.bool_type, result, a, b });
         self.scc = result;
+    }
+
+    fn initializeStageInputs(self: *Builder) Error!void {
+        if (self.vertex_index_input == 0) return;
+        const result = self.id();
+        try self.emit(&self.body, 61, &.{ self.signed_type, result, self.vertex_index_input }); // OpLoad
+        const vgpr = self.vertex_index_vgpr orelse return Error.InvalidStageInterface;
+        self.registers[128 + @as(usize, vgpr)] = .{ .id = result, .value_type = .sint32 };
+    }
+
+    fn integerToFloat(self: *Builder, inst: instruction.Instruction, signed: bool) Error!void {
+        const source_type: ValueType = if (signed) .sint32 else .bits32;
+        const source_id = try self.source(inst.src0, source_type);
+        const result = self.id();
+        try self.emit(&self.body, if (signed) 111 else 112, &.{ self.float_type, result, source_id });
+        try self.destination(inst.dst, .{ .id = result, .value_type = .float32 });
+    }
+
+    fn exportValue(self: *Builder, inst: instruction.Instruction) Error!void {
+        if (inst.export_compressed or inst.export_enable != 0xf or self.vector4_type == 0) {
+            return Error.UnsupportedOpcode;
+        }
+        const output = switch (self.stage) {
+            .vertex => if (inst.export_target == 12) self.position_output else 0,
+            .fragment => if (inst.export_target == 0) self.color_output else 0,
+            .compute => 0,
+        };
+        if (output == 0) return Error.UnsupportedOpcode;
+        const x = try self.source(inst.src0, .float32);
+        const y = try self.source(inst.src1, .float32);
+        const z = try self.source(inst.src2, .float32);
+        const w = try self.source(inst.src3, .float32);
+        const vector = self.id();
+        try self.emit(&self.body, 80, &.{ self.vector4_type, vector, x, y, z, w }); // OpCompositeConstruct
+        try self.emit(&self.body, 62, &.{ output, vector }); // OpStore
     }
 
     fn storageBinding(self: *const Builder, resource_sgpr: u32) ?StorageBufferBinding {
@@ -574,6 +655,8 @@ const Builder = struct {
             .s_nop, .s_waitcnt, .s_barrier, .v_nop, .s_endpgm => {},
             .s_branch, .s_cbranch_scc0, .s_cbranch_scc1, .s_cbranch_vccz, .s_cbranch_vccnz, .s_cbranch_execz, .s_cbranch_execnz => return Error.UnsupportedControlFlow,
             .s_mov_b32, .v_mov_b32 => try self.unary(inst, 83, .bits32), // OpCopyObject
+            .v_cvt_f32_i32 => try self.integerToFloat(inst, true),
+            .v_cvt_f32_u32 => try self.integerToFloat(inst, false),
             .s_add_u32, .s_add_i32, .v_add_nc_u32 => try self.binary(inst, 128, .bits32, false), // OpIAdd
             .s_sub_u32, .s_sub_i32, .v_sub_nc_u32 => try self.binary(inst, 130, .bits32, false), // OpISub
             .v_subrev_nc_u32 => try self.binary(inst, 130, .bits32, true),
@@ -618,6 +701,7 @@ const Builder = struct {
             .buffer_atomic_and => try self.bufferAtomic(inst, 240), // OpAtomicAnd
             .buffer_atomic_or => try self.bufferAtomic(inst, 241), // OpAtomicOr
             .buffer_atomic_xor => try self.bufferAtomic(inst, 242), // OpAtomicXor
+            .exp => try self.exportValue(inst),
             else => return Error.UnsupportedOpcode,
         }
     }
@@ -727,6 +811,7 @@ fn translateStructured(builder: *Builder, program: *const instruction.Program, g
         try builder.emit(&builder.body, 248, &.{labels[block.index]}); // OpLabel
         const incoming = try mergeState(builder, graph, states, labels, block.index);
         builder.restore(incoming);
+        if (block.index == 0) try builder.initializeStageInputs();
 
         const first: usize = block.first_instruction;
         const end: usize = first + block.instruction_count;
@@ -782,6 +867,9 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     try entry_point.appendSlice(allocator, &.{ @intFromEnum(options.stage), builder.main_function, 0x6e69_616d, 0 });
     if (builder.storage_array != 0) try entry_point.append(allocator, builder.storage_array);
     if (builder.local_invocation_index != 0) try entry_point.append(allocator, builder.local_invocation_index);
+    if (builder.vertex_index_input != 0) try entry_point.append(allocator, builder.vertex_index_input);
+    if (builder.position_output != 0) try entry_point.append(allocator, builder.position_output);
+    if (builder.color_output != 0) try entry_point.append(allocator, builder.color_output);
     try appendInstruction(allocator, &words, 15, entry_point.items);
     switch (options.stage) {
         .fragment => try appendInstruction(allocator, &words, 16, &.{ builder.main_function, 7 }),
@@ -806,6 +894,7 @@ pub fn translate(allocator: std.mem.Allocator, program: *const instruction.Progr
     defer graph.deinit(allocator);
     if (graph.blocks.items.len == 1) {
         try builder.emit(&builder.body, 248, &.{builder.label});
+        try builder.initializeStageInputs();
         for (program.instructions.items) |inst| try builder.lower(inst);
         try builder.emit(&builder.body, 253, &.{});
     } else {
@@ -870,6 +959,59 @@ test "straight-line vector ALU translates to a SPIR-V function" {
     try std.testing.expectEqual(@as(u32, 0x0001_0500), module.words[1]);
     try std.testing.expect(containsOpcode(module.words, 129)); // OpFAdd
     try std.testing.expect(containsOpcode(module.words, 253)); // OpReturn
+}
+
+test "vertex system value and position export lower to a stage interface" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        (@as(u32, 0x3f) << 25) | (@as(u32, 1) << 17) | (@as(u32, 0x06) << 9) | 256, // v_cvt_f32_u32 v1, v0
+        (@as(u32, 0x3f) << 25) | (@as(u32, 2) << 17) | (@as(u32, 0x01) << 9) | 255,
+        0,
+        (@as(u32, 0x3f) << 25) | (@as(u32, 3) << 17) | (@as(u32, 0x01) << 9) | 255,
+        0,
+        (@as(u32, 0x3f) << 25) | (@as(u32, 4) << 17) | (@as(u32, 0x01) << 9) | 255,
+        0x3f80_0000,
+        0xf800_08cf, // exp pos0, v1, v2, v3, v4 done
+        0x0403_0201,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .vertex,
+        .vertex_index_vgpr = 0,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expect(containsOpcode(module.words, 61)); // OpLoad VertexIndex
+    try std.testing.expect(containsOpcode(module.words, 112)); // OpConvertUToF
+    try std.testing.expect(containsOpcode(module.words, 80)); // OpCompositeConstruct
+    try std.testing.expect(containsOpcode(module.words, 62)); // OpStore Position
+}
+
+test "fragment MRT0 export lowers to location zero" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        (@as(u32, 0x3f) << 25) | (@as(u32, 0) << 17) | (@as(u32, 0x01) << 9) | 255,
+        0x3f80_0000,
+        (@as(u32, 0x3f) << 25) | (@as(u32, 1) << 17) | (@as(u32, 0x01) << 9) | 255,
+        0,
+        (@as(u32, 0x3f) << 25) | (@as(u32, 2) << 17) | (@as(u32, 0x01) << 9) | 255,
+        0,
+        (@as(u32, 0x3f) << 25) | (@as(u32, 3) << 17) | (@as(u32, 0x01) << 9) | 255,
+        0x3f80_0000,
+        0xf800_080f, // exp mrt0, v0, v1, v2, v3 done
+        0x0302_0100,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expect(containsOpcode(module.words, 80)); // OpCompositeConstruct
+    try std.testing.expect(containsOpcode(module.words, 62)); // OpStore MRT0
+    try std.testing.expectEqual(@as(u32, 4), @intFromEnum(Stage.fragment));
 }
 
 test "MUBUF dword load and store lower through a descriptor array" {

@@ -41,6 +41,20 @@ fn command(opcode: u8, body_words: u14) u32 {
         (@as(u32, opcode) << 8);
 }
 
+fn vop1(opcode: u8, destination: u8, source: u9) u32 {
+    return (@as(u32, 0x3f) << 25) |
+        (@as(u32, destination) << 17) |
+        (@as(u32, opcode) << 9) |
+        source;
+}
+
+fn vop2(opcode: u8, destination: u8, source0: u8, source1: u8) u32 {
+    return (@as(u32, opcode) << 25) |
+        (@as(u32, destination) << 17) |
+        (@as(u32, source1) << 9) |
+        (256 + @as(u32, source0));
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
 
@@ -303,6 +317,70 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidGraphicsProbeFrame;
     }
 
+    const vertex_program_address = 0x700;
+    var vertex_pc: usize = vertex_program_address;
+    guest.word(vertex_pc, vop1(0x06, 1, 256)); // v_cvt_f32_u32 v1, v0 (VertexIndex)
+    vertex_pc += 4;
+    guest.word(vertex_pc, vop1(0x01, 2, 255)); // v_mov_b32 v2, 1.0
+    guest.word(vertex_pc + 4, 0x3f80_0000);
+    vertex_pc += 8;
+    guest.word(vertex_pc, vop2(0x04, 3, 1, 2)); // v_sub_f32 v3, v1, v2
+    vertex_pc += 4;
+    guest.word(vertex_pc, vop1(0x01, 4, 255)); // v_mov_b32 v4, 0.75
+    guest.word(vertex_pc + 4, 0x3f40_0000);
+    vertex_pc += 8;
+    guest.word(vertex_pc, vop2(0x08, 5, 3, 4)); // x = (index - 1) * 0.75
+    vertex_pc += 4;
+    guest.word(vertex_pc, vop2(0x08, 6, 3, 3)); // square(index - 1)
+    vertex_pc += 4;
+    guest.word(vertex_pc, vop1(0x01, 7, 255)); // v_mov_b32 v7, -1.5
+    guest.word(vertex_pc + 4, 0xbfc0_0000);
+    vertex_pc += 8;
+    guest.word(vertex_pc, vop2(0x08, 6, 6, 7));
+    vertex_pc += 4;
+    guest.word(vertex_pc, vop1(0x01, 8, 255)); // v_mov_b32 v8, 0.75
+    guest.word(vertex_pc + 4, 0x3f40_0000);
+    vertex_pc += 8;
+    guest.word(vertex_pc, vop2(0x03, 6, 6, 8)); // y = 0.75 - 1.5 * square
+    vertex_pc += 4;
+    guest.word(vertex_pc, vop1(0x01, 7, 255)); // v_mov_b32 v7, 0.0
+    guest.word(vertex_pc + 4, 0);
+    vertex_pc += 8;
+    guest.word(vertex_pc, vop1(0x01, 8, 255)); // v_mov_b32 v8, 1.0
+    guest.word(vertex_pc + 4, 0x3f80_0000);
+    vertex_pc += 8;
+    guest.word(vertex_pc, 0xf800_08cf); // exp pos0, v5, v6, v7, v8 done
+    guest.word(vertex_pc + 4, 0x0807_0605);
+    guest.word(vertex_pc + 8, 0xbf81_0000); // s_endpgm
+
+    const fragment_program_address = 0x900;
+    const fragment_colors = [_]u32{ 0x3f80_0000, 0x3e80_0000, 0x3dcc_cccd, 0x3f80_0000 };
+    var fragment_pc: usize = fragment_program_address;
+    for (fragment_colors, 0..) |color, register| {
+        guest.word(fragment_pc, vop1(0x01, @intCast(register), 255));
+        guest.word(fragment_pc + 4, color);
+        fragment_pc += 8;
+    }
+    guest.word(fragment_pc, 0xf800_080f); // exp mrt0, v0, v1, v2, v3 done
+    guest.word(fragment_pc + 4, 0x0302_0100);
+    guest.word(fragment_pc + 8, 0xbf81_0000);
+
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.vertex.programRegisterBase(), vertex_program_address >> 8);
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.vertex.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.programRegisterBase(), fragment_program_address >> 8);
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.programRegisterBase() + 1, 0);
+    _ = try executor.execute(&draw_stream);
+    _ = try executor.execute(&draw_stream);
+    if (renderer.draw_callbacks != 3 or renderer.translated_draws != 3 or renderer.guest_graphics_draws != 2) {
+        return error.InvalidGuestGraphicsDrawResult;
+    }
+    if (renderer.graphics_pipeline_cache_misses != 2 or renderer.graphics_pipeline_cache_hits != 1) {
+        return error.InvalidGraphicsPipelineCacheResult;
+    }
+    if (renderer.graphics_probe_colored_pixels == 0 or renderer.last_draw_error != null) {
+        return error.InvalidGuestGraphicsFrame;
+    }
+
     var output_buffer: [1024]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &output_buffer);
     const writer = &output.interface;
@@ -311,7 +389,8 @@ pub fn main(init: std.process.Init) !void {
             "device API {d}.{d}.{d}, queue family {d}, validation {s}\n" ++
             "headless smoke passed: {d} compute dispatch, {d} staging bytes copied and verified\n" ++
             "translated RDNA2 passed: {d} dispatches, pipelines {d}/{d} miss/hit, buffers {d}/{d} miss/hit\n" ++
-            "graphics DCB probe passed: {d} draw, {d} colored pixels in {d}x{d} RGBA8 frame\n",
+            "graphics DCB probe passed: 1 diagnostic + {d} guest draws, pipelines {d}/{d} miss/hit\n" ++
+            "guest RDNA2 frame passed: {d} colored pixels in {d}x{d} RGBA8 frame\n",
         .{
             vulkan.api.apiMajor(renderer.loader_api_version),
             vulkan.api.apiMinor(renderer.loader_api_version),
@@ -329,7 +408,9 @@ pub fn main(init: std.process.Init) !void {
             renderer.pipeline_cache_hits,
             renderer.buffer_cache_misses,
             renderer.buffer_cache_hits,
-            renderer.translated_draws,
+            renderer.guest_graphics_draws,
+            renderer.graphics_pipeline_cache_misses,
+            renderer.graphics_pipeline_cache_hits,
             renderer.graphics_probe_colored_pixels,
             vulkan.graphics_probe_width,
             vulkan.graphics_probe_height,
