@@ -287,6 +287,16 @@ awaited label, the scheduler rechecks guest memory and resumes the exact nested
 stream position before draining the rest of the FIFO. It never fabricates a
 fence value to break a wait.
 
+[`gpu.resources`](src/gpu/resources.zig) turns that lossless register state into
+typed GFX10 resources at the draw/dispatch boundary. It decodes 128-bit buffer
+and sampler descriptors, 256-bit image descriptors, stage-relative inline
+user-SGPR data, all eight color targets and the depth/stencil target. The result
+retains 48-bit addresses, unified formats, views and mip ranges, component
+selection, PS5 swizzle modes, MSAA state and CMASK/FMASK/DCC/HTILE metadata.
+Snapshots allocate nothing and do not duplicate mutable GPU state: partial PM4
+writes remain in the register banks and are interpreted only when work consumes
+them.
+
 The executor is deliberately independent of Vulkan and guest-memory ownership.
 Its backend interface supplies checked reads/writes and optional callbacks for
 barriers, releases, waits, events, flips, draws and dispatches. Tests use an
@@ -320,14 +330,16 @@ packet per line with its word offset, and counts the draws and dispatches:
 
 ## Roadmap
 
-1. Decode resource descriptors, render/depth targets and PS5 tiling metadata
-   from the tracked registers.
-2. Complete the RDNA2 vector and memory ISA, build control flow and translate
+1. Recover shader SRT/descriptor-table roots and resolve buffer, image and
+   sampler descriptors from guest memory as well as inline user-SGPR data.
+2. Implement PS5 swizzle address transforms and staging layouts for linear,
+   256-byte, 4 KiB, 64 KiB, depth and render-target tile modes.
+3. Complete the RDNA2 vector and memory ISA, build control flow and translate
    guest shaders to SPIR-V.
-3. Implement the Vulkan backend: device/queue selection, guest-memory staging,
+4. Implement the Vulkan backend: device/queue selection, guest-memory staging,
    image layout transitions and barriers, pipeline/cache creation, draw and
    dispatch recording, then swapchain presentation through `SetFlip`.
-4. Validate packet/state/shader results against captures before optimizing
+5. Validate packet/state/shader results against captures before optimizing
    asynchronous submission, descriptor caches and pipeline compilation.
 
 ---
@@ -938,12 +950,14 @@ that the buffer stays a walkable sequence of commands afterwards.
 Unimplemented constructors write a correctly formed no-operation of the size
 the real command would have taken, which is not the same as filling the space
 with zeroes. Zeroes decode as a register write of one word and desynchronise the
-rest of the stream. `Dispatch`, `DrawIndex`, and `SetNumInstances` now write
-their real PM4 packets, with a valid no-operation filling the unused part of
-each fixed 16-word AGC slot. Shader constructors validate their AGC headers,
-relocate internal pointers and program addresses, and apply the recovered
-program-register pairs. Everything after them remains walkable through
-[`gpu.pm4`](src/gpu/pm4.zig), while measured and consumed sizes stay identical.
+rest of the stream. `Dispatch`, `DrawIndex`, and `SetNumInstances` write their
+real PM4 packets. `SetCx/Sh/UcRegistersIndirect` now emits the native Gen5
+`0x9f`/`0x63`/`0x64` packets, and `SetShRegisterRangeDirect` emits an exact-size
+`SET_SH_REG` packet with a matching size query, including the title's 16-word
+user-data ranges. Fixed-slot commands keep a valid no-operation in their unused
+tail. Shader constructors validate their AGC headers, relocate internal
+pointers and program addresses, and apply the recovered program-register pairs.
+Everything remains walkable through [`gpu.pm4`](src/gpu/pm4.zig).
 
 Patch entry points are accepted and change nothing: they edit a field of a
 command already written, usually an address unknown when it was built, and
@@ -982,9 +996,12 @@ and dereferences, so false success crashes it. A submission returns only a
 status and the title is not blocked on it, so reporting failure would abort a
 frame the title had already fully described — and lose the description with it.
 
-The current title reaches two submissions of 480 and 544 dwords. The decoder
-walks 35 and 39 packets respectively and observes one draw plus three dispatches
-in each, which is the first stable execution boundary for the GPU state tracker.
+The current title reaches two submissions of 466 and 530 dwords. With its real
+register constructors restored, the decoder walks 38 and 42 packets respectively
+and observes one draw plus three dispatches in each. The early bootstrap draws
+do not bind a color or depth target, but their context, shader and user-config
+lists now reach the persistent tracker and the typed draw-state callback without
+an invalid packet or a stopped queue.
 
 ## Error codes
 

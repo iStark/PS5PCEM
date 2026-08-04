@@ -64,6 +64,7 @@ const ExecutionLock = struct {
 /// commonly sets a shader or render target in one DCB and consumes it in the
 /// next one, so both queues are kept behind one serialized scheduler.
 var execution_lock = ExecutionLock{};
+var traced_draw_states: u32 = 0;
 
 fn backendRead(_: ?*anyopaque, address: u64, bytes: []u8) bool {
     if (!memory.isGuestRangeAccessible(address, bytes.len)) return false;
@@ -79,9 +80,53 @@ fn backendWrite(_: ?*anyopaque, address: u64, bytes: []const u8) bool {
     return true;
 }
 
+fn backendDraw(_: ?*anyopaque, state: *const gpu.State, _: gpu.pm4.Packet) bool {
+    if (!trace.isLive() or traced_draw_states >= 16) return true;
+    traced_draw_states += 1;
+
+    const render = gpu.resources.decodeRenderState(state);
+    std.debug.print(
+        "[gpu draw state #{d}] color {d}/{d} mask=0x{x}",
+        .{ traced_draw_states, render.active_color_count, render.color_count, render.target_mask },
+    );
+    if (render.depth_target) |depth| {
+        std.debug.print(
+            ", depth=0x{x} {d}x{d} fmt={d} sw={d} ro={d}\n",
+            .{
+                if (depth.write_address != 0) depth.write_address else depth.read_address,
+                depth.width,
+                depth.height,
+                depth.format,
+                @intFromEnum(depth.tile_mode),
+                @intFromBool(depth.depth_read_only),
+            },
+        );
+    } else {
+        std.debug.print(", depth=none\n", .{});
+    }
+    for (render.color_targets) |maybe_target| {
+        const target = maybe_target orelse continue;
+        std.debug.print(
+            "  rt{d}=0x{x} {d}x{d} fmt={d}/{d} sw={d} write=0x{x}\n",
+            .{
+                target.slot,
+                target.address,
+                target.width,
+                target.height,
+                target.format,
+                target.number_type,
+                @intFromEnum(target.tile_mode),
+                target.write_mask,
+            },
+        );
+    }
+    return true;
+}
+
 const executor_backend_vtable = gpu.DcbBackend.VTable{
     .read = backendRead,
     .write = backendWrite,
+    .draw = backendDraw,
 };
 
 const executor_backend = gpu.DcbBackend{
