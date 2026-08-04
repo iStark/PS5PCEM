@@ -420,15 +420,20 @@ translates supported RDNA2
 through the existing decoder/IR/SPIR-V path, caches the exact resulting module
 and host pipeline, binds the active descriptor array and submits it through a
 fence. Inline V# descriptors and AGC constant-buffer tables are captured at the
-dispatch boundary; `buffer_load_dword`/`buffer_store_dword` lower to SPIR-V
-storage-buffer access, and written device-local ranges are copied back into
-guest memory. All major shader families are length-safe, and decoded programs
-have a validated CFG, typed IR (including memory addressing), SSA selection
-merges and an executable SPIR-V ALU/SDWA/MUBUF path. The remaining stages are:
+dispatch boundary. The bounded scalar evaluator now specializes a straight
+SMEM prolog against checked guest memory, so V# descriptors loaded from an SRT
+become explicit dispatch constants instead of unsupported GPU-side pointer
+loads. MUBUF byte/short/dword and dword x2/x3/x4 loads/stores lower to SPIR-V,
+including signed extension, subword read/modify/write and combined
+`idxen`/`offen` stride addressing; written device-local ranges are copied back
+into guest memory. All major shader families are length-safe, and decoded
+programs have a validated CFG, typed IR (including memory addressing), SSA
+selection merges and an executable SPIR-V ALU/SDWA/SMEM-specialized/MUBUF path.
+The remaining stages are:
 
 1. Finish DPP/VOP3/opcode semantics, structured loops and VCC/EXEC divergence,
-   then extend MUBUF to byte/short/vector and indexed addressing and execute
-   scalar-memory descriptor loads.
+   then add MUBUF atomics, swizzled descriptors, `add_tid` and cross-dword
+   unaligned subword accesses.
 2. Add sampled/storage image and sampler descriptor arrays, image
    creation/layout transitions, and image operations; then lower graphics stage
    interfaces, interpolation and exports and record real draw work.
@@ -472,9 +477,13 @@ rejects that backend callback and records the exact error. Draw callbacks still
 only count work. Compute dispatch captures scalar user data, optionally resolves
 the AGC header through the embedding callback, maps every declared
 constant-buffer table entry, and associates each executable MUBUF resource SGPR
-with the matching descriptor-array element. The first memory subset is aligned
-32-bit MUBUF load/store without `idxen`; V# descriptors loaded dynamically by
-SMEM, vector-width accesses, atomics and images remain explicit unsupported
+with the matching descriptor-array element. Before translation,
+`scalar_provenance` executes the straight scalar prefix and checked SMEM reads;
+resolved SGPRs specialize that prefix out of SPIR-V while unresolved values
+still fail explicitly. The executable memory subset covers signed/unsigned
+byte and short, dword x1/x2/x3/x4, and V# stride-based `idxen` plus `offen`.
+Atomics, swizzled/add-thread-id descriptors, dynamically unresolved SMEM,
+cross-dword unaligned short accesses and images remain explicit unsupported
 semantics. Ranges touched by a store are synchronously read back and written
 through the checked guest-memory interface.
 
@@ -484,10 +493,12 @@ probe creates a valid compute shader module and pipeline, dispatches it, copies
 known words from coherent host staging through a device-local storage buffer
 into coherent readback memory, inserts the required host/transfer barriers,
 waits on a fence and compares every byte. It then submits a synthetic RDNA2
-program twice through the real DCB executor: `buffer_load_dword` reads through
-`s0:s3`, `buffer_store_dword` writes through `s4:s7`, and two descriptor-array
-elements carry the value between distinct device-local/guest ranges. The probe
-checks the guest-visible write plus both allocation and pipeline miss/hit paths:
+program twice through the real DCB executor. Its `s_load_dwordx8` fetches two
+V# descriptors from a guest table, `buffer_load/store_dwordx4` copies four
+dwords between descriptor-array elements, subword operations verify unsigned
+and signed extension plus byte/short RMW, and a non-zero `idxen+offen` access
+uses the decoded V# stride. The probe checks every guest-visible result plus
+both allocation and pipeline miss/hit paths:
 
 ```sh
 zig build vulkan-smoke

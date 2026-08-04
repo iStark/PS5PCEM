@@ -51,39 +51,74 @@ pub fn main(init: std.process.Init) !void {
     const report = try renderer.smokeTest();
 
     const program_address = 0x100;
-    guest.word(program_address, 0xe030_0000); // buffer_load_dword v0, v0, s0:s3, 0
-    guest.word(program_address + 4, 0x8000_0000);
-    guest.word(program_address + 8, 0xe070_0000); // buffer_store_dword v0, v0, s4:s7, 0
-    guest.word(program_address + 12, 0x8001_0000);
-    guest.word(program_address + 16, 0xbf81_0000); // s_endpgm
+    guest.word(program_address, 0xf40c_0200); // s_load_dwordx8 s8:s15, s0:s1, 0
+    guest.word(program_address + 4, 125 << 25);
+    guest.word(program_address + 8, 0xe038_0000); // buffer_load_dwordx4 v0:v3, v0, s8:s11, 0
+    guest.word(program_address + 12, 0x8002_0000);
+    guest.word(program_address + 16, 0xe078_0000); // buffer_store_dwordx4 v0:v3, v0, s12:s15, 0
+    guest.word(program_address + 20, 0x8003_0000);
+    guest.word(program_address + 24, (@as(u32, 0x3f) << 25) | (@as(u32, 4) << 17) | (@as(u32, 1) << 9) | 255);
+    guest.word(program_address + 28, 0x0000_00a5); // v_mov_b32 v4, 0xa5
+    guest.word(program_address + 32, 0xe060_0010); // buffer_store_byte v4, offset:16
+    guest.word(program_address + 36, 0x8003_0400);
+    guest.word(program_address + 40, 0xe020_0010); // buffer_load_ubyte v5, offset:16
+    guest.word(program_address + 44, 0x8003_0500);
+    guest.word(program_address + 48, 0xe070_0014); // buffer_store_dword v5, offset:20
+    guest.word(program_address + 52, 0x8003_0500);
+    guest.word(program_address + 56, (@as(u32, 0x3f) << 25) | (@as(u32, 6) << 17) | (@as(u32, 1) << 9) | 255);
+    guest.word(program_address + 60, 0xffff_ff80); // v_mov_b32 v6, -128
+    guest.word(program_address + 64, 0xe060_0011); // buffer_store_byte v6, offset:17
+    guest.word(program_address + 68, 0x8003_0600);
+    guest.word(program_address + 72, 0xe024_0011); // buffer_load_sbyte v7, offset:17
+    guest.word(program_address + 76, 0x8003_0700);
+    guest.word(program_address + 80, 0xe070_0018); // buffer_store_dword v7, offset:24
+    guest.word(program_address + 84, 0x8003_0700);
+    guest.word(program_address + 88, (@as(u32, 0x3f) << 25) | (@as(u32, 8) << 17) | (@as(u32, 1) << 9) | 255);
+    guest.word(program_address + 92, 0xffff_8001); // v_mov_b32 v8, -32767
+    guest.word(program_address + 96, 0xe068_0012); // buffer_store_short v8, offset:18
+    guest.word(program_address + 100, 0x8003_0800);
+    guest.word(program_address + 104, 0xe02c_0012); // buffer_load_sshort v9, offset:18
+    guest.word(program_address + 108, 0x8003_0900);
+    guest.word(program_address + 112, 0xe070_001c); // buffer_store_dword v9, offset:28
+    guest.word(program_address + 116, 0x8003_0900);
+    guest.word(program_address + 120, (@as(u32, 0x3f) << 25) | (@as(u32, 10) << 17) | (@as(u32, 1) << 9) | 255);
+    guest.word(program_address + 124, 2); // v_mov_b32 v10, index=2
+    guest.word(program_address + 128, (@as(u32, 0x3f) << 25) | (@as(u32, 11) << 17) | (@as(u32, 1) << 9) | 255);
+    guest.word(program_address + 132, 4); // v_mov_b32 v11, offset=4
+    guest.word(program_address + 136, 0xe030_3000); // buffer_load_dword idxen offen v12, v[10:11], s8:s11
+    guest.word(program_address + 140, 0x8002_0c0a);
+    guest.word(program_address + 144, 0xe070_0020); // buffer_store_dword v12, offset:32
+    guest.word(program_address + 148, 0x8003_0c00);
+    guest.word(program_address + 152, 0xbf81_0000); // s_endpgm
 
     const first_storage_address = 0x1000;
     const second_storage_address = 0x1100;
     const storage_size = 64;
     @memset(guest.bytes[first_storage_address .. first_storage_address + storage_size], 0);
     @memset(guest.bytes[second_storage_address .. second_storage_address + storage_size], 0);
-    guest.word(first_storage_address, 0xdead_beef);
+    const input_words = [_]u32{ 0x1122_3344, 0x5566_7788, 0x99aa_bbcc, 0xddee_ff00 };
+    for (input_words, 0..) |word, index| guest.word(first_storage_address + index * 4, word);
+
+    const descriptor_table = 0x300;
+    const descriptors = [_][4]u32{
+        .{ @intCast(first_storage_address), 4 << 16, storage_size / 4, 0 },
+        .{ @intCast(second_storage_address), 4 << 16, storage_size / 4, 0 },
+    };
+    for (descriptors, 0..) |descriptor, descriptor_index| {
+        for (descriptor, 0..) |word, word_index| {
+            guest.word(descriptor_table + descriptor_index * 16 + word_index * 4, word);
+        }
+    }
 
     var state = gpu.State{};
     try state.writeRegister(.shader, gpu.resources.ShaderStage.compute.programRegisterBase(), program_address >> 8);
     try state.writeRegister(.shader, gpu.resources.ShaderStage.compute.programRegisterBase() + 1, 0);
-    try state.writeRegister(.shader, 0x213, 8 << 1);
+    try state.writeRegister(.shader, 0x213, 2 << 1);
     try state.writeRegister(.shader, 0x207, 1);
     try state.writeRegister(.shader, 0x208, 1);
     try state.writeRegister(.shader, 0x209, 1);
-    const descriptors = [_][4]u32{
-        .{ @intCast(first_storage_address), 0, storage_size, 0 },
-        .{ @intCast(second_storage_address), 0, storage_size, 0 },
-    };
-    for (descriptors, 0..) |descriptor, descriptor_index| {
-        for (descriptor, 0..) |word, word_index| {
-            try state.writeRegister(
-                .shader,
-                gpu.resources.ShaderStage.compute.userDataBase() + @as(u32, @intCast(descriptor_index * 4 + word_index)),
-                word,
-            );
-        }
-    }
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.compute.userDataBase(), descriptor_table);
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.compute.userDataBase() + 1, 0);
     const stream = [_]u32{
         command(gpu.pm4.dispatch_direct, 4),
         1,
@@ -98,10 +133,23 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidPipelineCacheResult;
     }
 
-    if (std.mem.readInt(u32, guest.bytes[first_storage_address..][0..4], .little) != 0xdead_beef or
-        std.mem.readInt(u32, guest.bytes[second_storage_address..][0..4], .little) != 0xdead_beef)
-    {
-        return error.TranslatedStorageWriteMismatch;
+    for (input_words, 0..) |expected, index| {
+        if (std.mem.readInt(u32, guest.bytes[second_storage_address + index * 4 ..][0..4], .little) != expected) {
+            return error.TranslatedVectorWriteMismatch;
+        }
+    }
+    const subword_results = [_]struct { offset: usize, expected: u32 }{
+        .{ .offset = 20, .expected = 0x0000_00a5 },
+        .{ .offset = 24, .expected = 0xffff_ff80 },
+        .{ .offset = 28, .expected = 0xffff_8001 },
+    };
+    for (subword_results) |result| {
+        if (std.mem.readInt(u32, guest.bytes[second_storage_address + result.offset ..][0..4], .little) != result.expected) {
+            return error.TranslatedSubwordWriteMismatch;
+        }
+    }
+    if (std.mem.readInt(u32, guest.bytes[second_storage_address + 32 ..][0..4], .little) != input_words[3]) {
+        return error.TranslatedIndexedAddressMismatch;
     }
     var first_readback: [storage_size]u8 = undefined;
     var second_readback: [storage_size]u8 = undefined;

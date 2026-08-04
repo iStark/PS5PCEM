@@ -48,6 +48,7 @@ pub const ScalarLoad = struct {
 };
 
 pub const StopReason = enum {
+    prefix_complete,
     end_program,
     branch,
     unknown_family,
@@ -77,6 +78,21 @@ pub const Evaluation = struct {
 };
 
 pub fn evaluatePrefix(reader: shaders.MemoryReader, bindings: *const shaders.StageBindings) Evaluation {
+    return evaluate(reader, bindings, null);
+}
+
+/// Evaluates only the straight scalar region ending before `end_pc`. This is
+/// the dispatch-specialization entry point: later scalar writes must not alter
+/// descriptors captured for the first vector-memory instruction.
+pub fn evaluatePrefixUntil(
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    end_pc: u32,
+) Evaluation {
+    return evaluate(reader, bindings, end_pc);
+}
+
+fn evaluate(reader: shaders.MemoryReader, bindings: *const shaders.StageBindings, end_pc: ?u32) Evaluation {
     var result = Evaluation{};
     const scalar_base: usize = bindings.scalar_user_data_base;
     const available = @min(
@@ -95,6 +111,12 @@ pub fn evaluatePrefix(reader: shaders.MemoryReader, bindings: *const shaders.Sta
     var pc: u32 = 0;
     while (result.instruction_count < maximum_instructions) {
         result.stop_pc = pc;
+        if (end_pc) |end| {
+            if (pc >= end) {
+                result.stop_reason = .prefix_complete;
+                return result;
+            }
+        }
         var words = [_]u32{ 0, 0 };
         words[0] = reader.readU32(addProgramAddress(bindings.program_address, pc) orelse {
             result.stop_reason = .invalid_address;
@@ -606,4 +628,17 @@ test "NGG scalar user data starts at s8" {
     const result = evaluatePrefix(memory.reader(), &bindings);
     try std.testing.expect(result.register(0) == null);
     try std.testing.expectEqual(@as(u32, 0x1234), result.register(8).?.value);
+}
+
+test "bounded scalar prefix does not observe later shader writes" {
+    var storage = [_]u8{0} ** 0x40;
+    var memory = TestMemory{ .base = 0x3000, .bytes = &storage };
+    memory.write(0x3000, 0xbe82_0381); // s_mov_b32 s2, 1
+    memory.write(0x3004, 0xbe82_0382); // would overwrite s2 after the boundary
+    memory.write(0x3008, 0xbf81_0000);
+    const bindings = testBindings(0x3000, 0x1234);
+    const result = evaluatePrefixUntil(memory.reader(), &bindings, 4);
+    try std.testing.expectEqual(StopReason.prefix_complete, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 1), result.register(2).?.value);
+    try std.testing.expectEqual(@as(u32, 4), result.stop_pc);
 }

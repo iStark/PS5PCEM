@@ -325,6 +325,7 @@ const ComputeResources = struct {
     sizes: [maximum_storage_descriptors]usize = @splat(0),
     occupied: [maximum_storage_descriptors]bool = @splat(false),
     writable: [maximum_storage_descriptors]bool = @splat(false),
+    specialized_scalar_prefix_end: u32 = 0,
 
     fn descriptorForRange(self: *const ComputeResources, address: u64, size: usize) ?u32 {
         for (self.occupied, 0..) |used, index| {
@@ -811,13 +812,22 @@ pub const Renderer = struct {
         const bindings = try gpu.ShaderBindings.capture(state, .compute, header_address, reader);
         var analysis = try gpu.shader_analysis.decode(self.allocator, reader, program_address, 4096);
         defer analysis.deinit(self.allocator);
-        var resources = try self.prepareComputeResources(&bindings, reader, &analysis);
+        const specialized_scalar_prefix_end = scalarPrefixEnd(&analysis);
+        const scalar = gpu.scalar_provenance.evaluatePrefixUntil(reader, &bindings, specialized_scalar_prefix_end);
+        var resources = try self.prepareComputeResources(
+            &bindings,
+            reader,
+            &analysis,
+            &scalar,
+            specialized_scalar_prefix_end,
+        );
         var module = try analysis.translateSpirv(self.allocator, .{
             .stage = .compute,
             .local_size = local_size,
             .storage_buffers = resources.mappings[0..resources.mapping_count],
             .scalar_registers = resources.scalar_registers[0..resources.scalar_count],
             .descriptor_array_length = maximum_storage_descriptors,
+            .specialized_scalar_prefix_end = resources.specialized_scalar_prefix_end,
         });
         defer module.deinit(self.allocator);
         const report = try self.dispatchSpirv(module.words, group_count);
@@ -830,12 +840,14 @@ pub const Renderer = struct {
         bindings: *const gpu.ShaderBindings,
         reader: gpu.ShaderMemoryReader,
         analysis: *const gpu.ShaderAnalysis,
+        scalar: *const gpu.ScalarEvaluation,
+        specialized_scalar_prefix_end: u32,
     ) anyerror!ComputeResources {
         var result = ComputeResources{};
-        for (bindings.user_data[0..bindings.user_data_count], 0..) |value, index| {
-            const physical = @as(u32, bindings.scalar_user_data_base) + @as(u32, @intCast(index));
-            if (physical >= 128) break;
-            result.scalar_registers[result.scalar_count] = .{ .register = physical, .value = value };
+        result.specialized_scalar_prefix_end = specialized_scalar_prefix_end;
+        for (scalar.registers, 0..) |value, index| {
+            if (!value.known) continue;
+            result.scalar_registers[result.scalar_count] = .{ .register = @intCast(index), .value = value.value };
             result.scalar_count += 1;
         }
 
@@ -858,9 +870,25 @@ pub const Renderer = struct {
         }
 
         for (analysis.program.instructions.items) |inst| {
-            const is_load = inst.opcode == .buffer_load_dword;
-            const is_store = inst.opcode == .buffer_store_dword;
-            if (!is_load and !is_store) continue;
+            const is_store = switch (inst.opcode) {
+                .buffer_load_ubyte,
+                .buffer_load_sbyte,
+                .buffer_load_ushort,
+                .buffer_load_sshort,
+                .buffer_load_dword,
+                .buffer_load_dwordx2,
+                .buffer_load_dwordx3,
+                .buffer_load_dwordx4,
+                => false,
+                .buffer_store_byte,
+                .buffer_store_short,
+                .buffer_store_dword,
+                .buffer_store_dwordx2,
+                .buffer_store_dwordx3,
+                .buffer_store_dwordx4,
+                => true,
+                else => continue,
+            };
             if (inst.src1.kind != .sgpr) return Error.MissingStorageDescriptor;
             const resource_sgpr = inst.src1.reg;
             if (result.mappingForSgpr(resource_sgpr)) |descriptor_index| {
@@ -868,7 +896,7 @@ pub const Renderer = struct {
                 continue;
             }
 
-            const descriptor = (try bindings.inlineBufferDescriptor(resource_sgpr)) orelse {
+            const descriptor = (try scalarBufferDescriptor(scalar, resource_sgpr)) orelse {
                 return Error.MissingStorageDescriptor;
             };
             if (descriptor.isNull() or descriptor.size_bytes == 0) return Error.MissingStorageDescriptor;
@@ -884,6 +912,9 @@ pub const Renderer = struct {
             result.mappings[result.mapping_count] = .{
                 .resource_sgpr = resource_sgpr,
                 .descriptor_index = descriptor_index,
+                .stride = descriptor.stride,
+                .swizzled = descriptor.swizzle_enabled,
+                .add_thread_id = descriptor.add_thread_id,
             };
             result.mapping_count += 1;
             if (is_store) result.writable[descriptor_index] = true;
@@ -1300,6 +1331,38 @@ pub const Renderer = struct {
 fn computeLocalSize(state: *const gpu.State, register: u32) u32 {
     const encoded = state.readRegister(.shader, register) orelse return 1;
     return @max(encoded, 1);
+}
+
+fn scalarPrefixEnd(analysis: *const gpu.ShaderAnalysis) u32 {
+    var end: u32 = 0;
+    for (analysis.program.instructions.items) |inst| {
+        if (inst.opcode.isBranch() or inst.opcode == .s_setpc_b64) break;
+        switch (inst.family) {
+            .sop1, .sop2, .sopk, .smem => end = inst.pc + inst.word_count * 4,
+            .sopp => switch (inst.opcode) {
+                .s_nop, .s_waitcnt, .s_barrier, .s_sleep, .s_sendmsg, .s_ttrace_data, .s_inst_prefetch => {
+                    end = inst.pc + inst.word_count * 4;
+                },
+                else => break,
+            },
+            else => break,
+        }
+    }
+    return end;
+}
+
+fn scalarBufferDescriptor(
+    scalar: *const gpu.ScalarEvaluation,
+    resource_sgpr: u32,
+) gpu.resources.Error!?gpu.BufferDescriptor {
+    if (resource_sgpr + 4 > gpu.scalar_provenance.maximum_scalar_registers) return null;
+    var words: [4]u32 = undefined;
+    for (&words, 0..) |*word, index| {
+        const value = scalar.registers[resource_sgpr + index];
+        if (!value.known) return null;
+        word.* = value.value;
+    }
+    return try gpu.resources.decodeBufferDescriptor(&words);
 }
 
 fn layerAvailable(enumerate: vk.PfnEnumerateInstanceLayerProperties, wanted: []const u8) bool {

@@ -21,6 +21,9 @@ pub const Stage = enum(u32) {
 pub const StorageBufferBinding = struct {
     resource_sgpr: u32,
     descriptor_index: u32,
+    stride: u32 = 0,
+    swizzled: bool = false,
+    add_thread_id: bool = false,
 };
 
 /// Scalar user data is captured by the API-neutral GPU state tracker. Supplying
@@ -36,6 +39,9 @@ pub const Options = struct {
     storage_buffers: []const StorageBufferBinding = &.{},
     scalar_registers: []const ScalarRegister = &.{},
     descriptor_array_length: u32 = 64,
+    /// Exclusive PC ending a straight scalar prolog evaluated against the
+    /// captured dispatch state and checked guest memory.
+    specialized_scalar_prefix_end: u32 = 0,
 };
 
 pub const Error = std.mem.Allocator.Error || control_flow.Error || error{
@@ -65,6 +71,11 @@ const State = struct {
     valid: bool = false,
 };
 
+const BufferAddress = struct {
+    binding: StorageBufferBinding,
+    byte_offset: u32,
+};
+
 const Builder = struct {
     allocator: std.mem.Allocator,
     annotations: std.ArrayList(u32) = .empty,
@@ -84,6 +95,8 @@ const Builder = struct {
     storage_bindings: []const StorageBufferBinding,
     storage_array: u32 = 0,
     storage_word_pointer_type: u32 = 0,
+    specialized_scalar_registers: [128]bool = @splat(false),
+    specialized_scalar_prefix_end: u32,
     scc: u32 = 0,
 
     fn init(allocator: std.mem.Allocator, options: Options) Error!Builder {
@@ -98,6 +111,7 @@ const Builder = struct {
             .main_function = 0,
             .label = 0,
             .storage_bindings = options.storage_buffers,
+            .specialized_scalar_prefix_end = options.specialized_scalar_prefix_end,
         };
         errdefer self.deinit();
         self.void_type = self.id();
@@ -121,6 +135,7 @@ const Builder = struct {
                 .id = try self.constant(.bits32, scalar.value),
                 .value_type = .bits32,
             };
+            self.specialized_scalar_registers[scalar.register] = true;
         }
 
         if (options.storage_buffers.len != 0) {
@@ -134,11 +149,7 @@ const Builder = struct {
                     return Error.InvalidStorageBinding;
                 }
                 for (options.storage_buffers[0..index]) |previous| {
-                    if (previous.resource_sgpr == binding.resource_sgpr and
-                        previous.descriptor_index != binding.descriptor_index)
-                    {
-                        return Error.InvalidStorageBinding;
-                    }
+                    if (previous.resource_sgpr == binding.resource_sgpr) return Error.InvalidStorageBinding;
                 }
             }
 
@@ -306,58 +317,161 @@ const Builder = struct {
         self.scc = result;
     }
 
-    fn storageDescriptorIndex(self: *const Builder, resource_sgpr: u32) ?u32 {
+    fn storageBinding(self: *const Builder, resource_sgpr: u32) ?StorageBufferBinding {
         for (self.storage_bindings) |binding| {
-            if (binding.resource_sgpr == resource_sgpr) return binding.descriptor_index;
+            if (binding.resource_sgpr == resource_sgpr) return binding;
         }
         return null;
     }
 
-    fn bufferWordPointer(self: *Builder, inst: instruction.Instruction) Error!u32 {
-        if (self.storage_array == 0 or inst.src1.kind != .sgpr or inst.index_enable) {
+    fn addBits(self: *Builder, a: u32, b: u32) Error!u32 {
+        const result = self.id();
+        try self.emit(&self.body, 128, &.{ self.bits_type, result, a, b }); // OpIAdd
+        return result;
+    }
+
+    fn consecutiveRegister(op: operand.Operand, delta: u32) Error!operand.Operand {
+        if (op.kind != .vgpr or op.reg + delta >= 256) return Error.UnsupportedBufferAddressing;
+        var result = op;
+        result.reg += delta;
+        return result;
+    }
+
+    fn bufferAddress(self: *Builder, inst: instruction.Instruction) Error!BufferAddress {
+        if (self.storage_array == 0 or inst.src1.kind != .sgpr) {
             return Error.UnsupportedBufferAddressing;
         }
-        if (inst.memory_offset < 0 or @mod(inst.memory_offset, 4) != 0) {
-            return Error.UnsupportedBufferAddressing;
-        }
-        const descriptor_index = self.storageDescriptorIndex(inst.src1.reg) orelse {
+        if (inst.memory_offset < 0) return Error.UnsupportedBufferAddressing;
+        const binding = self.storageBinding(inst.src1.reg) orelse {
             return Error.InvalidStorageBinding;
         };
+        if (binding.swizzled or binding.add_thread_id) return Error.UnsupportedBufferAddressing;
 
         var byte_offset = try self.constant(.bits32, @intCast(inst.memory_offset));
-        if (inst.offset_enable) {
-            const address = try self.source(inst.src0, .bits32);
-            const sum = self.id();
-            try self.emit(&self.body, 128, &.{ self.bits_type, sum, byte_offset, address }); // OpIAdd
-            byte_offset = sum;
+        if (inst.index_enable) {
+            const index = try self.source(inst.src0, .bits32);
+            const scaled = self.id();
+            try self.emit(&self.body, 132, &.{ self.bits_type, scaled, index, try self.constant(.bits32, binding.stride) }); // OpIMul
+            byte_offset = try self.addBits(byte_offset, scaled);
         }
-        const scalar_offset = try self.source(inst.src2, .bits32);
-        const combined = self.id();
-        try self.emit(&self.body, 128, &.{ self.bits_type, combined, byte_offset, scalar_offset });
+        if (inst.offset_enable) {
+            const offset_operand = if (inst.index_enable) try consecutiveRegister(inst.src0, 1) else inst.src0;
+            byte_offset = try self.addBits(byte_offset, try self.source(offset_operand, .bits32));
+        }
+        byte_offset = try self.addBits(byte_offset, try self.source(inst.src2, .bits32));
+        return .{ .binding = binding, .byte_offset = byte_offset };
+    }
+
+    fn bufferWordPointer(self: *Builder, address: BufferAddress, delta: u32) Error!u32 {
         const word_index = self.id();
-        try self.emit(&self.body, 194, &.{ self.bits_type, word_index, combined, try self.constant(.bits32, 2) }); // OpShiftRightLogical
+        try self.emit(&self.body, 194, &.{ self.bits_type, word_index, address.byte_offset, try self.constant(.bits32, 2) }); // OpShiftRightLogical
+        const indexed_word = if (delta == 0) word_index else try self.addBits(word_index, try self.constant(.bits32, delta));
 
         const pointer = self.id();
         try self.emit(&self.body, 65, &.{
             self.storage_word_pointer_type,
             pointer,
             self.storage_array,
-            try self.constant(.bits32, descriptor_index),
+            try self.constant(.bits32, address.binding.descriptor_index),
             try self.constant(.bits32, 0),
-            word_index,
+            indexed_word,
         }); // OpAccessChain descriptor, block member, dword
         return pointer;
     }
 
-    fn bufferLoadDword(self: *Builder, inst: instruction.Instruction) Error!void {
+    fn loadBufferWord(self: *Builder, address: BufferAddress, delta: u32) Error!u32 {
         const result = self.id();
-        try self.emit(&self.body, 61, &.{ self.bits_type, result, try self.bufferWordPointer(inst) }); // OpLoad
+        try self.emit(&self.body, 61, &.{ self.bits_type, result, try self.bufferWordPointer(address, delta) }); // OpLoad
+        return result;
+    }
+
+    fn bufferLoadWords(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
+        const address = try self.bufferAddress(inst);
+        for (0..count) |index| {
+            const result = try self.loadBufferWord(address, @intCast(index));
+            try self.destination(try consecutiveRegister(inst.dst, @intCast(index)), .{ .id = result, .value_type = .bits32 });
+        }
+    }
+
+    fn bufferStoreWords(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
+        const address = try self.bufferAddress(inst);
+        for (0..count) |index| {
+            const value = try self.source(try consecutiveRegister(inst.dst, @intCast(index)), .bits32);
+            try self.emit(&self.body, 62, &.{ try self.bufferWordPointer(address, @intCast(index)), value }); // OpStore
+        }
+    }
+
+    fn subwordShift(self: *Builder, byte_offset: u32) Error!u32 {
+        const byte = self.id();
+        try self.emit(&self.body, 199, &.{ self.bits_type, byte, byte_offset, try self.constant(.bits32, 3) }); // OpBitwiseAnd
+        const shift = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, shift, byte, try self.constant(.bits32, 3) }); // OpShiftLeftLogical
+        return shift;
+    }
+
+    fn shortAddressIsGuaranteedAligned(self: *const Builder, inst: instruction.Instruction) bool {
+        if (@mod(inst.memory_offset, 2) != 0 or inst.offset_enable) return false;
+        const binding = self.storageBinding(inst.src1.reg) orelse return false;
+        if (inst.index_enable and @mod(binding.stride, 2) != 0) return false;
+        return switch (inst.src2.kind) {
+            .null => true,
+            .integer_inline_constant, .literal_constant => inst.src2.value & 1 == 0,
+            else => false,
+        };
+    }
+
+    fn bufferLoadSubword(self: *Builder, inst: instruction.Instruction, width: u8, signed: bool) Error!void {
+        if (width == 16 and !self.shortAddressIsGuaranteedAligned(inst)) return Error.UnsupportedBufferAddressing;
+        const address = try self.bufferAddress(inst);
+        const word = try self.loadBufferWord(address, 0);
+        const shifted = self.id();
+        try self.emit(&self.body, 194, &.{ self.bits_type, shifted, word, try self.subwordShift(address.byte_offset) });
+        const mask: u32 = if (width == 8) 0xff else 0xffff;
+        const extracted = self.id();
+        try self.emit(&self.body, 199, &.{ self.bits_type, extracted, shifted, try self.constant(.bits32, mask) });
+        var result = extracted;
+        if (signed) {
+            const amount: u32 = 32 - width;
+            const left = self.id();
+            try self.emit(&self.body, 196, &.{ self.bits_type, left, extracted, try self.constant(.bits32, amount) });
+            const as_signed = try self.convert(.{ .id = left, .value_type = .bits32 }, .sint32);
+            const extended = self.id();
+            try self.emit(&self.body, 195, &.{ self.signed_type, extended, as_signed, try self.constant(.sint32, amount) });
+            result = try self.convert(.{ .id = extended, .value_type = .sint32 }, .bits32);
+        }
         try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
     }
 
-    fn bufferStoreDword(self: *Builder, inst: instruction.Instruction) Error!void {
-        const value = try self.source(inst.dst, .bits32);
-        try self.emit(&self.body, 62, &.{ try self.bufferWordPointer(inst), value }); // OpStore
+    fn bufferStoreSubword(self: *Builder, inst: instruction.Instruction, width: u8) Error!void {
+        if (width == 16 and !self.shortAddressIsGuaranteedAligned(inst)) return Error.UnsupportedBufferAddressing;
+        const address = try self.bufferAddress(inst);
+        const pointer = try self.bufferWordPointer(address, 0);
+        const current = self.id();
+        try self.emit(&self.body, 61, &.{ self.bits_type, current, pointer });
+        const shift = try self.subwordShift(address.byte_offset);
+        const base_mask: u32 = if (width == 8) 0xff else 0xffff;
+        const shifted_mask = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, shifted_mask, try self.constant(.bits32, base_mask), shift });
+        const inverse_mask = self.id();
+        try self.emit(&self.body, 200, &.{ self.bits_type, inverse_mask, shifted_mask }); // OpNot
+        const preserved = self.id();
+        try self.emit(&self.body, 199, &.{ self.bits_type, preserved, current, inverse_mask });
+        const masked_value = self.id();
+        try self.emit(&self.body, 199, &.{ self.bits_type, masked_value, try self.source(inst.dst, .bits32), try self.constant(.bits32, base_mask) });
+        const inserted = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, inserted, masked_value, shift });
+        const combined = self.id();
+        try self.emit(&self.body, 197, &.{ self.bits_type, combined, preserved, inserted }); // OpBitwiseOr
+        try self.emit(&self.body, 62, &.{ pointer, combined });
+    }
+
+    fn specializedScalarDestination(self: *const Builder, inst: instruction.Instruction) bool {
+        if (inst.pc >= self.specialized_scalar_prefix_end or inst.dst.kind != .sgpr or inst.dst.reg >= 128) return false;
+        if (!self.specialized_scalar_registers[inst.dst.reg]) return false;
+        return switch (inst.family) {
+            .sop1, .sop2, .sopk, .smem => true,
+            else => false,
+        };
     }
 
     fn snapshot(self: *const Builder) State {
@@ -371,6 +485,7 @@ const Builder = struct {
 
     fn lower(self: *Builder, inst: instruction.Instruction) Error!void {
         if (inst.dst.clamp or inst.dst.omod != 0) return Error.UnsupportedOpcode;
+        if (self.specializedScalarDestination(inst)) return;
         switch (inst.opcode) {
             .s_nop, .s_waitcnt, .s_barrier, .v_nop, .s_endpgm => {},
             .s_branch, .s_cbranch_scc0, .s_cbranch_scc1, .s_cbranch_vccz, .s_cbranch_vccnz, .s_cbranch_execz, .s_cbranch_execnz => return Error.UnsupportedControlFlow,
@@ -395,8 +510,20 @@ const Builder = struct {
             .s_cmp_ge_u32 => try self.comparison(inst, 174, .bits32),
             .s_cmp_lt_u32 => try self.comparison(inst, 176, .bits32),
             .s_cmp_le_u32 => try self.comparison(inst, 178, .bits32),
-            .buffer_load_dword => try self.bufferLoadDword(inst),
-            .buffer_store_dword => try self.bufferStoreDword(inst),
+            .buffer_load_ubyte => try self.bufferLoadSubword(inst, 8, false),
+            .buffer_load_sbyte => try self.bufferLoadSubword(inst, 8, true),
+            .buffer_load_ushort => try self.bufferLoadSubword(inst, 16, false),
+            .buffer_load_sshort => try self.bufferLoadSubword(inst, 16, true),
+            .buffer_load_dword => try self.bufferLoadWords(inst, 1),
+            .buffer_load_dwordx2 => try self.bufferLoadWords(inst, 2),
+            .buffer_load_dwordx3 => try self.bufferLoadWords(inst, 3),
+            .buffer_load_dwordx4 => try self.bufferLoadWords(inst, 4),
+            .buffer_store_byte => try self.bufferStoreSubword(inst, 8),
+            .buffer_store_short => try self.bufferStoreSubword(inst, 16),
+            .buffer_store_dword => try self.bufferStoreWords(inst, 1),
+            .buffer_store_dwordx2 => try self.bufferStoreWords(inst, 2),
+            .buffer_store_dwordx3 => try self.bufferStoreWords(inst, 3),
+            .buffer_store_dwordx4 => try self.bufferStoreWords(inst, 4),
             else => return Error.UnsupportedOpcode,
         }
     }
@@ -646,6 +773,77 @@ test "MUBUF dword load and store lower through a descriptor array" {
     try std.testing.expect(containsOpcode(module.words, 65)); // OpAccessChain
     try std.testing.expect(containsOpcode(module.words, 61)); // OpLoad
     try std.testing.expect(containsOpcode(module.words, 62)); // OpStore
+}
+
+test "resolved SMEM descriptor prolog specializes before MUBUF" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xf408_0200, // s_load_dwordx4 s8:s11, s0:s1, 0
+        125 << 25,
+        (@as(u32, 0x3f) << 25) | (@as(u32, 1) << 9) | 255,
+        0x1122_3344,
+        0xe070_0000, // buffer_store_dword v0, v0, s8:s11, 0
+        0x8002_0000,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    const storage = [_]StorageBufferBinding{.{ .resource_sgpr = 8, .descriptor_index = 0 }};
+    const scalars = [_]ScalarRegister{
+        .{ .register = 8, .value = 0x1000 },
+        .{ .register = 9, .value = 0 },
+        .{ .register = 10, .value = 64 },
+        .{ .register = 11, .value = 0 },
+    };
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .storage_buffers = &storage,
+        .scalar_registers = &scalars,
+        .specialized_scalar_prefix_end = 8,
+    });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 62)); // OpStore
+}
+
+test "vector and subword MUBUF operations lower explicitly" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xe038_0000, // buffer_load_dwordx4 v0:v3, v0, s4:s7, 0
+        0x8001_0000,
+        0xe078_0010, // buffer_store_dwordx4 v0:v3, v0, s4:s7, offset:16
+        0x8001_0000,
+        0xe024_0001, // buffer_load_sbyte v4, v0, s4:s7, offset:1
+        0x8001_0400,
+        0xe068_0002, // buffer_store_short v4, v0, s4:s7, offset:2
+        0x8001_0400,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    const storage = [_]StorageBufferBinding{.{ .resource_sgpr = 4, .descriptor_index = 2 }};
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .storage_buffers = &storage,
+    });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 200)); // OpNot for subword RMW
+    try std.testing.expect(containsOpcode(module.words, 195)); // signed extraction
+}
+
+test "cross-dword short access stays explicit" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xe02c_0003, // buffer_load_sshort at byte 3 crosses a dword
+        0x8001_0000,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    const storage = [_]StorageBufferBinding{.{ .resource_sgpr = 4, .descriptor_index = 0 }};
+    try std.testing.expectError(
+        Error.UnsupportedBufferAddressing,
+        translate(std.testing.allocator, &program, .{ .stage = .compute, .storage_buffers = &storage }),
+    );
 }
 
 test "unsupported shader semantics never produce placeholder SPIR-V" {
