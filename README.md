@@ -279,6 +279,14 @@ unaligned/null targets, active cycles and nesting beyond sixteen stream frames
 are rejected. A blocked child returns a fixed root-to-leaf continuation, so
 resuming it does not replay draws, events or memory writes before the wait.
 
+[`gpu.scheduler`](src/gpu/scheduler.zig) owns separate graphics and compute FIFO
+queues. It copies each root DCB when it is submitted, retains the complete
+continuation of a blocked queue head, and keeps later work on that queue behind
+it. Work on the other queue can still run: once a real `RELEASE_MEM` writes the
+awaited label, the scheduler rechecks guest memory and resumes the exact nested
+stream position before draining the rest of the FIFO. It never fabricates a
+fence value to break a wait.
+
 The executor is deliberately independent of Vulkan and guest-memory ownership.
 Its backend interface supplies checked reads/writes and optional callbacks for
 barriers, releases, waits, events, flips, draws and dispatches. Tests use an
@@ -312,16 +320,14 @@ packet per line with its word offset, and counts the draws and dispatches:
 
 ## Roadmap
 
-1. Add graphics/compute queue scheduling so a blocked DCB is resumed when a
-   real `RELEASE_MEM` producer publishes its label.
-2. Decode resource descriptors, render/depth targets and PS5 tiling metadata
+1. Decode resource descriptors, render/depth targets and PS5 tiling metadata
    from the tracked registers.
-3. Complete the RDNA2 vector and memory ISA, build control flow and translate
+2. Complete the RDNA2 vector and memory ISA, build control flow and translate
    guest shaders to SPIR-V.
-4. Implement the Vulkan backend: device/queue selection, guest-memory staging,
+3. Implement the Vulkan backend: device/queue selection, guest-memory staging,
    image layout transitions and barriers, pipeline/cache creation, draw and
    dispatch recording, then swapchain presentation through `SetFlip`.
-5. Validate packet/state/shader results against captures before optimizing
+4. Validate packet/state/shader results against captures before optimizing
    asynchronous submission, descriptor caches and pipeline compilation.
 
 ---
@@ -959,16 +965,15 @@ address and a length. In a batch, a null entry is skipped rather than ending the
 batch, since the arrays are indexed in parallel and stopping early would drop
 every buffer after a hole the title left deliberately.
 
-The same submission is applied to persistent graphics/compute
-[`gpu.State`](src/gpu/state.zig) instances through
-[`gpu.DcbExecutor`](src/gpu/executor.zig). Register state therefore
-survives between buffers; label writes reach checked guest memory; acquire,
-release, wait, event and flip packets become typed state. A blocked wait is
-reported with its complete root/indirect resume path. Indirect chains and
-conditional branches are executed through the same checked guest-memory
-backend. Cross-queue storage and wake-up are the next scheduler step; the
-executor already exposes the continuation needed for that without forcing a
-label to a satisfying value.
+The same submission enters persistent graphics/compute queues through
+[`gpu.scheduler`](src/gpu/scheduler.zig) and
+[`gpu.DcbExecutor`](src/gpu/executor.zig). Register state therefore survives
+between buffers; label writes reach checked guest memory; acquire, release,
+wait, event and flip packets become typed state. A blocked head retains its own
+root DCB copy and complete root/indirect resume path while later submissions on
+that queue remain FIFO-ordered. The other queue continues, and a real release
+label makes the scheduler recheck and resume the blocked stream without
+replaying earlier side effects or forcing memory to a satisfying value.
 
 Submissions are accepted rather than refused, which is the opposite of the
 choice made for the graphics device, and the difference is what a caller does
@@ -998,8 +1003,6 @@ from leaking into host code where nothing would check it.
 1. Implement APR/AMPR file resolution and reads for titles whose patched
    executable reaches streaming before graphics submission.
 2. Recover `/dev/gc` queue-registration outputs for the shipped driver path.
-3. Connect the DCB continuation to graphics/compute queue wake-up after a real
-   release-label write.
 
 ---
 

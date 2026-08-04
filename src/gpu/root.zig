@@ -14,15 +14,19 @@ const std = @import("std");
 pub const pm4 = @import("pm4.zig");
 pub const state = @import("state.zig");
 pub const executor = @import("executor.zig");
+pub const scheduler = @import("scheduler.zig");
 
 pub const State = state.State;
 pub const DcbExecutor = executor.DcbExecutor;
 pub const DcbBackend = executor.Backend;
 pub const DcbContinuation = executor.Continuation;
+pub const QueueScheduler = scheduler.Scheduler;
+pub const QueueKind = scheduler.QueueKind;
 
 test {
     std.testing.refAllDecls(@This());
     _ = pm4;
     _ = state;
     _ = executor;
+    _ = scheduler;
 }

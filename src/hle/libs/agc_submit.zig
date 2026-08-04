@@ -60,12 +60,10 @@ const ExecutionLock = struct {
     }
 };
 
-/// Command-processor state survives a submission. A title commonly sets a
-/// shader or render target in one DCB and consumes it in the next one, so a
-/// per-call temporary would make otherwise valid draws incomplete.
+/// Command-processor state and blocked work survive a submission. A title
+/// commonly sets a shader or render target in one DCB and consumes it in the
+/// next one, so both queues are kept behind one serialized scheduler.
 var execution_lock = ExecutionLock{};
-var submitted_graphics_state = gpu.State{};
-var submitted_compute_state = gpu.State{};
 
 fn backendRead(_: ?*anyopaque, address: u64, bytes: []u8) bool {
     if (!memory.isGuestRangeAccessible(address, bytes.len)) return false;
@@ -90,6 +88,8 @@ const executor_backend = gpu.DcbBackend{
     .context = null,
     .vtable = &executor_backend_vtable,
 };
+
+var submission_scheduler = gpu.QueueScheduler.init(std.heap.page_allocator, executor_backend);
 
 /// What one submitted buffer contained.
 pub const Summary = struct {
@@ -157,33 +157,47 @@ fn announce(label: []const u8, stream: []const u32) void {
     );
 }
 
-/// Applies one submitted buffer to the persistent command-processor state.
-/// A blocked wait is intentionally left at its own packet; the executor's
-/// resume word is the interface a queue scheduler will use when its producer
-/// publishes the awaited label.
+/// Queues one submitted buffer and advances both command processors. A blocked
+/// head retains its exact root/indirect continuation; a real release-label
+/// write from the other queue makes the following pump resume it in place.
 fn executeSubmitted(label: []const u8, stream: []const u32) void {
     execution_lock.lock();
     defer execution_lock.unlock();
 
-    const submitted_state = if (std.mem.eql(u8, label, "acb"))
-        &submitted_compute_state
+    const kind: gpu.QueueKind = if (std.mem.eql(u8, label, "acb"))
+        .compute
     else
-        &submitted_graphics_state;
-    var executor = gpu.DcbExecutor{
-        .state = submitted_state,
-        .backend = executor_backend,
-    };
-    const result = executor.execute(stream) catch |err| {
+        .graphics;
+    const report = submission_scheduler.submit(kind, stream) catch |err| {
         if (trace.isLive()) {
-            std.debug.print("[{s}] executor stopped: {s}\n", .{ label, @errorName(err) });
+            std.debug.print("[{s}] queue stopped: {s}\n", .{ label, @errorName(err) });
         }
         return;
     };
-    if (trace.isLive() and result.status == .blocked) {
+    if (!trace.isLive()) return;
+
+    if (submission_scheduler.isBlocked(kind)) {
+        const submitted_state = submission_scheduler.state(kind);
         const wait = submitted_state.blocked_wait.?;
+        const continuation = submission_scheduler.continuation(kind).?;
+        const resume_word = continuation.frames[0].resume_word;
         std.debug.print(
-            "[{s}] blocked at word {d}: WAIT_REG_MEM 0x{x} mask=0x{x} ref=0x{x}\n",
-            .{ label, result.resume_word, wait.address, wait.mask, wait.reference },
+            "[{s}] blocked at root word {d} (depth {d}): WAIT_REG_MEM 0x{x} mask=0x{x} ref=0x{x}; {d} queued\n",
+            .{
+                label,
+                resume_word,
+                continuation.frame_count,
+                wait.address,
+                wait.mask,
+                wait.reference,
+                submission_scheduler.pendingCount(kind),
+            },
+        );
+    }
+    if (report.completed_submissions > 1) {
+        std.debug.print(
+            "[gpu queues] completed {d} submissions after cross-queue progress\n",
+            .{report.completed_submissions},
         );
     }
 }
