@@ -105,6 +105,16 @@ fn classify(inst: instruction.Instruction) struct { Operation, ValueType } {
         .buffer_store_dwordx2,
         .buffer_store_dwordx3,
         .buffer_store_dwordx4,
+        .buffer_atomic_swap,
+        .buffer_atomic_add,
+        .buffer_atomic_sub,
+        .buffer_atomic_smin,
+        .buffer_atomic_umin,
+        .buffer_atomic_smax,
+        .buffer_atomic_umax,
+        .buffer_atomic_and,
+        .buffer_atomic_or,
+        .buffer_atomic_xor,
         .tbuffer_load_format_x,
         .tbuffer_load_format_xy,
         .tbuffer_load_format_xyz,
@@ -218,6 +228,23 @@ test "buffer memory nodes retain descriptor and byte addressing" {
     try std.testing.expect(access.offset_enabled);
     try std.testing.expectEqual(@as(u32, 8), access.resource.reg);
     try std.testing.expectEqual(@as(u32, 3), access.vector_address.reg);
+}
+
+test "buffer atomics remain memory nodes with coherence metadata" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xe0c8_4000, // buffer_atomic_add glc v0, v0, s8:s11, 0
+        0x8002_0000,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var module = try lower(std.testing.allocator, &program);
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(Operation.memory, module.nodes.items[0].operation);
+    try std.testing.expectEqual(isa.Opcode.buffer_atomic_add, module.nodes.items[0].opcode);
+    try std.testing.expect(module.nodes.items[0].memory_access.?.globally_coherent);
 }
 
 test "vector arithmetic lowers to typed API-neutral nodes" {

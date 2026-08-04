@@ -131,7 +131,10 @@ integer/bitwise/floating-point ALU and SDWA source extraction. Forward scalar
 selections become structured `OpSelectionMerge`/`OpBranchConditional` regions;
 register values crossing a merge use `OpPhi`. Back edges, DPP lane shuffles and
 VCC/EXEC predicates return a precise unsupported error until their structured
-lowering exists, rather than producing a placeholder shader.
+lowering exists, rather than producing a placeholder shader. Executable MUBUF
+lowering covers byte/short/dword scalar and vector transfers plus the ten common
+32-bit buffer atomics; `glc` atomics preserve their returned old value in the
+guest VGPR.
 
 ## Building
 
@@ -426,14 +429,17 @@ become explicit dispatch constants instead of unsupported GPU-side pointer
 loads. MUBUF byte/short/dword and dword x2/x3/x4 loads/stores lower to SPIR-V,
 including signed extension, subword read/modify/write and combined
 `idxen`/`offen` stride addressing; written device-local ranges are copied back
-into guest memory. All major shader families are length-safe, and decoded
+into guest memory. The ten 32-bit MUBUF exchange/arithmetic/min-max/bitwise
+atomics now map to SPIR-V storage-buffer atomics with explicit device memory
+ordering and `glc` return-value writeback. V# `add_tid` descriptors use the
+compute invocation's wave-relative lane when forming the descriptor index. All
+major shader families are length-safe, and decoded
 programs have a validated CFG, typed IR (including memory addressing), SSA
 selection merges and an executable SPIR-V ALU/SDWA/SMEM-specialized/MUBUF path.
 The remaining stages are:
 
 1. Finish DPP/VOP3/opcode semantics, structured loops and VCC/EXEC divergence,
-   then add MUBUF atomics, swizzled descriptors, `add_tid` and cross-dword
-   unaligned subword accesses.
+   then add swizzled descriptors and cross-dword unaligned subword accesses.
 2. Add sampled/storage image and sampler descriptor arrays, image
    creation/layout transitions, and image operations; then lower graphics stage
    interfaces, interpolation and exports and record real draw work.
@@ -482,23 +488,28 @@ with the matching descriptor-array element. Before translation,
 resolved SGPRs specialize that prefix out of SPIR-V while unresolved values
 still fail explicitly. The executable memory subset covers signed/unsigned
 byte and short, dword x1/x2/x3/x4, and V# stride-based `idxen` plus `offen`.
-Atomics, swizzled/add-thread-id descriptors, dynamically unresolved SMEM,
+It also covers V# `add_tid` addressing and 32-bit MUBUF exchange, add/subtract,
+signed/unsigned min/max and bitwise atomics. A `glc` atomic writes the old value
+back to its source VGPR, and atomic target ranges participate in the same DCB
+readback as stores. Swizzled descriptors, dynamically unresolved SMEM,
 cross-dword unaligned short accesses and images remain explicit unsupported
-semantics. Ranges touched by a store are synchronously read back and written
-through the checked guest-memory interface.
+semantics.
 
 `vulkan-smoke` is an explicit hardware test rather than part of `zig build test`,
 so machines without a Vulkan runtime can still build and test every module. The
 probe creates a valid compute shader module and pipeline, dispatches it, copies
 known words from coherent host staging through a device-local storage buffer
 into coherent readback memory, inserts the required host/transfer barriers,
-waits on a fence and compares every byte. It then submits a synthetic RDNA2
-program twice through the real DCB executor. Its `s_load_dwordx8` fetches two
-V# descriptors from a guest table, `buffer_load/store_dwordx4` copies four
-dwords between descriptor-array elements, subword operations verify unsigned
-and signed extension plus byte/short RMW, and a non-zero `idxen+offen` access
-uses the decoded V# stride. The probe checks every guest-visible result plus
-both allocation and pipeline miss/hit paths:
+waits on a fence and compares every byte. It then submits synthetic RDNA2
+programs through the real DCB executor. The first program's `s_load_dwordx8`
+fetches two V# descriptors from a guest table, `buffer_load/store_dwordx4`
+copies four dwords between descriptor-array elements, subword operations verify
+unsigned and signed extension plus byte/short RMW, and a non-zero
+`idxen+offen` access uses the decoded V# stride. A second four-invocation
+program uses `add_tid` to select one dword per lane, runs all ten supported
+`buffer_atomic_* glc` operations, and stores the final returned old value
+through another add-thread-id descriptor. Both programs run twice, checking
+guest-visible writeback plus allocation and pipeline miss/hit paths:
 
 ```sh
 zig build vulkan-smoke
@@ -508,7 +519,7 @@ zig build vulkan-smoke
 Vulkan 1.4.321: NVIDIA GeForce RTX 3070 Ti
 device API 1.4.329, queue family 0, validation off
 headless smoke passed: 1 compute dispatch, 64 staging bytes copied and verified
-translated RDNA2 passed: 2 dispatches, pipelines 1/1 miss/hit, buffers 1/1 miss/hit
+translated RDNA2 passed: 4 dispatches, pipelines 2/2 miss/hit, buffers 4/4 miss/hit
 ```
 
 ---

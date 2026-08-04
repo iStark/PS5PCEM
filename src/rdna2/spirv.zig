@@ -95,6 +95,7 @@ const Builder = struct {
     storage_bindings: []const StorageBufferBinding,
     storage_array: u32 = 0,
     storage_word_pointer_type: u32 = 0,
+    local_invocation_index: u32 = 0,
     specialized_scalar_registers: [128]bool = @splat(false),
     specialized_scalar_prefix_end: u32,
     scc: u32 = 0,
@@ -172,6 +173,18 @@ const Builder = struct {
             try self.emit(&self.declarations, 32, &.{ storage_array_pointer, 12, descriptor_array }); // ptr StorageBuffer
             try self.emit(&self.declarations, 32, &.{ self.storage_word_pointer_type, 12, self.bits_type });
             try self.emit(&self.declarations, 59, &.{ storage_array_pointer, self.storage_array, 12 }); // OpVariable
+
+            var needs_thread_id = false;
+            for (options.storage_buffers) |binding| {
+                needs_thread_id = needs_thread_id or binding.add_thread_id;
+            }
+            if (needs_thread_id) {
+                const input_uint_pointer = self.id();
+                self.local_invocation_index = self.id();
+                try self.emit(&self.annotations, 71, &.{ self.local_invocation_index, 11, 29 }); // BuiltIn LocalInvocationIndex
+                try self.emit(&self.declarations, 32, &.{ input_uint_pointer, 1, self.bits_type }); // ptr Input
+                try self.emit(&self.declarations, 59, &.{ input_uint_pointer, self.local_invocation_index, 1 }); // OpVariable
+            }
         }
         return self;
     }
@@ -345,11 +358,22 @@ const Builder = struct {
         const binding = self.storageBinding(inst.src1.reg) orelse {
             return Error.InvalidStorageBinding;
         };
-        if (binding.swizzled or binding.add_thread_id) return Error.UnsupportedBufferAddressing;
+        if (binding.swizzled) return Error.UnsupportedBufferAddressing;
 
         var byte_offset = try self.constant(.bits32, @intCast(inst.memory_offset));
-        if (inst.index_enable) {
-            const index = try self.source(inst.src0, .bits32);
+        if (inst.index_enable or binding.add_thread_id) {
+            var index = if (inst.index_enable)
+                try self.source(inst.src0, .bits32)
+            else
+                try self.constant(.bits32, 0);
+            if (binding.add_thread_id) {
+                if (self.local_invocation_index == 0) return Error.UnsupportedBufferAddressing;
+                const invocation = self.id();
+                try self.emit(&self.body, 61, &.{ self.bits_type, invocation, self.local_invocation_index }); // OpLoad
+                const lane = self.id();
+                try self.emit(&self.body, 199, &.{ self.bits_type, lane, invocation, try self.constant(.bits32, 63) }); // OpBitwiseAnd
+                index = try self.addBits(index, lane);
+            }
             const scaled = self.id();
             try self.emit(&self.body, 132, &.{ self.bits_type, scaled, index, try self.constant(.bits32, binding.stride) }); // OpIMul
             byte_offset = try self.addBits(byte_offset, scaled);
@@ -399,6 +423,27 @@ const Builder = struct {
             const value = try self.source(try consecutiveRegister(inst.dst, @intCast(index)), .bits32);
             try self.emit(&self.body, 62, &.{ try self.bufferWordPointer(address, @intCast(index)), value }); // OpStore
         }
+    }
+
+    fn bufferAtomic(self: *Builder, inst: instruction.Instruction, opcode: u16) Error!void {
+        const value = try self.source(inst.dst, .bits32);
+        const address = try self.bufferAddress(inst);
+        const result = self.id();
+        try self.emit(&self.body, opcode, &.{
+            self.bits_type,
+            result,
+            try self.bufferWordPointer(address, 0),
+            try self.constant(.bits32, 1), // ScopeDevice
+            try self.constant(.bits32, 0), // MemorySemanticsNone
+            value,
+        });
+        if (inst.globally_coherent) {
+            try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+        }
+        try self.emit(&self.body, 225, &.{
+            try self.constant(.bits32, 1),
+            try self.constant(.bits32, 0x48), // AcquireRelease | UniformMemory
+        }); // OpMemoryBarrier
     }
 
     fn subwordShift(self: *Builder, byte_offset: u32) Error!u32 {
@@ -524,6 +569,16 @@ const Builder = struct {
             .buffer_store_dwordx2 => try self.bufferStoreWords(inst, 2),
             .buffer_store_dwordx3 => try self.bufferStoreWords(inst, 3),
             .buffer_store_dwordx4 => try self.bufferStoreWords(inst, 4),
+            .buffer_atomic_swap => try self.bufferAtomic(inst, 229), // OpAtomicExchange
+            .buffer_atomic_add => try self.bufferAtomic(inst, 234), // OpAtomicIAdd
+            .buffer_atomic_sub => try self.bufferAtomic(inst, 235), // OpAtomicISub
+            .buffer_atomic_smin => try self.bufferAtomic(inst, 236), // OpAtomicSMin
+            .buffer_atomic_umin => try self.bufferAtomic(inst, 237), // OpAtomicUMin
+            .buffer_atomic_smax => try self.bufferAtomic(inst, 238), // OpAtomicSMax
+            .buffer_atomic_umax => try self.bufferAtomic(inst, 239), // OpAtomicUMax
+            .buffer_atomic_and => try self.bufferAtomic(inst, 240), // OpAtomicAnd
+            .buffer_atomic_or => try self.bufferAtomic(inst, 241), // OpAtomicOr
+            .buffer_atomic_xor => try self.bufferAtomic(inst, 242), // OpAtomicXor
             else => return Error.UnsupportedOpcode,
         }
     }
@@ -687,6 +742,7 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     defer entry_point.deinit(allocator);
     try entry_point.appendSlice(allocator, &.{ @intFromEnum(options.stage), builder.main_function, 0x6e69_616d, 0 });
     if (builder.storage_array != 0) try entry_point.append(allocator, builder.storage_array);
+    if (builder.local_invocation_index != 0) try entry_point.append(allocator, builder.local_invocation_index);
     try appendInstruction(allocator, &words, 15, entry_point.items);
     switch (options.stage) {
         .fragment => try appendInstruction(allocator, &words, 16, &.{ builder.main_function, 7 }),
@@ -729,6 +785,20 @@ fn containsOpcode(words: []const u32, wanted: u16) bool {
         index += count;
     }
     return false;
+}
+
+fn firstInstructionOperand(words: []const u32, wanted: u16, operand_index: usize) ?u32 {
+    var index: usize = 5;
+    while (index < words.len) {
+        const first = words[index];
+        const count: usize = @intCast(first >> 16);
+        if (@as(u16, @truncate(first)) == wanted and operand_index + 1 < count) {
+            return words[index + operand_index + 1];
+        }
+        if (count == 0) return null;
+        index += count;
+    }
+    return null;
 }
 
 test "straight-line vector ALU translates to a SPIR-V function" {
@@ -828,6 +898,87 @@ test "vector and subword MUBUF operations lower explicitly" {
     defer module.deinit(std.testing.allocator);
     try std.testing.expect(containsOpcode(module.words, 200)); // OpNot for subword RMW
     try std.testing.expect(containsOpcode(module.words, 195)); // signed extraction
+}
+
+test "MUBUF atomics and add_tid lower to explicit SPIR-V operations" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        (@as(u32, 0x3f) << 25) | (@as(u32, 1) << 9) | 255, // v_mov_b32 v0, literal
+        5,
+        0xe0c0_0000, 0x8001_0000, // buffer_atomic_swap
+        0xe0c8_0000, 0x8001_0000, // buffer_atomic_add
+        0xe0cc_0000, 0x8001_0000, // buffer_atomic_sub
+        0xe0d4_0000, 0x8001_0000, // buffer_atomic_smin
+        0xe0d8_0000, 0x8001_0000, // buffer_atomic_umin
+        0xe0dc_0000, 0x8001_0000, // buffer_atomic_smax
+        0xe0e0_0000, 0x8001_0000, // buffer_atomic_umax
+        0xe0e4_0000, 0x8001_0000, // buffer_atomic_and
+        0xe0e8_0000, 0x8001_0000, // buffer_atomic_or
+        0xe0ec_0000, 0x8001_0000, // buffer_atomic_xor
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    const storage = [_]StorageBufferBinding{.{
+        .resource_sgpr = 4,
+        .descriptor_index = 0,
+        .stride = 4,
+        .add_thread_id = true,
+    }};
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .local_size = .{ 4, 1, 1 },
+        .storage_buffers = &storage,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expect(containsOpcode(module.words, 229)); // OpAtomicExchange
+    inline for (234..243) |opcode| {
+        try std.testing.expect(containsOpcode(module.words, opcode));
+    }
+    try std.testing.expect(containsOpcode(module.words, 225)); // OpMemoryBarrier
+    try std.testing.expect(containsOpcode(module.words, 132)); // lane * descriptor stride
+}
+
+test "MUBUF glc controls atomic return-value writeback" {
+    const decoder = @import("decoder.zig");
+    const common_tail = [_]u32{
+        0x8001_0000,
+        0xe070_0000, // buffer_store_dword v0, v0, s8:s11, 0
+        0x8002_0000,
+        0xbf81_0000,
+    };
+    const storage = [_]StorageBufferBinding{
+        .{ .resource_sgpr = 4, .descriptor_index = 0 },
+        .{ .resource_sgpr = 8, .descriptor_index = 1 },
+    };
+
+    for ([_]bool{ false, true }) |glc| {
+        const code = [_]u32{
+            (@as(u32, 0x3f) << 25) | (@as(u32, 1) << 9) | 255,
+            5,
+            0xe0c8_0000 | if (glc) @as(u32, 1 << 14) else 0,
+            common_tail[0],
+            common_tail[1],
+            common_tail[2],
+            common_tail[3],
+        };
+        var program = try decoder.decodeProgram(std.testing.allocator, &code);
+        defer program.deinit(std.testing.allocator);
+        var module = try translate(std.testing.allocator, &program, .{
+            .stage = .compute,
+            .storage_buffers = &storage,
+        });
+        defer module.deinit(std.testing.allocator);
+
+        const atomic_result = firstInstructionOperand(module.words, 234, 1).?;
+        const stored_value = firstInstructionOperand(module.words, 62, 1).?;
+        if (glc) {
+            try std.testing.expectEqual(atomic_result, stored_value);
+        } else {
+            try std.testing.expect(atomic_result != stored_value);
+        }
+    }
 }
 
 test "cross-dword short access stays explicit" {

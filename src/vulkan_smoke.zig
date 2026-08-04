@@ -161,6 +161,76 @@ pub fn main(init: std.process.Init) !void {
         return error.StagedBufferMismatch;
     }
 
+    const atomic_program_address = 0x200;
+    guest.word(atomic_program_address, 0xf40c_0200); // s_load_dwordx8 s8:s15, s0:s1, 0
+    guest.word(atomic_program_address + 4, 125 << 25);
+    const atomic_steps = [_]struct { opcode: u32, value: u32 }{
+        .{ .opcode = 0xe0c0_4000, .value = 5 }, // swap
+        .{ .opcode = 0xe0c8_4000, .value = 2 }, // add -> 7
+        .{ .opcode = 0xe0cc_4000, .value = 1 }, // sub -> 6
+        .{ .opcode = 0xe0d4_4000, .value = 0xffff_fffd }, // smin -> -3
+        .{ .opcode = 0xe0d8_4000, .value = 2 }, // umin -> 2
+        .{ .opcode = 0xe0dc_4000, .value = 0xffff_fffc }, // smax -> 2
+        .{ .opcode = 0xe0e0_4000, .value = 6 }, // umax -> 6
+        .{ .opcode = 0xe0e4_4000, .value = 3 }, // and -> 2
+        .{ .opcode = 0xe0e8_4000, .value = 8 }, // or -> 10
+        .{ .opcode = 0xe0ec_4000, .value = 3 }, // xor -> 9, returns 10
+    };
+    var atomic_pc: usize = atomic_program_address + 8;
+    for (atomic_steps) |step| {
+        guest.word(atomic_pc, (@as(u32, 0x3f) << 25) | (@as(u32, 1) << 9) | 255); // v_mov_b32 v0, literal
+        guest.word(atomic_pc + 4, step.value);
+        guest.word(atomic_pc + 8, step.opcode);
+        guest.word(atomic_pc + 12, 0x8002_0000);
+        atomic_pc += 16;
+    }
+    guest.word(atomic_pc, 0xe070_0000); // buffer_store_dword v0, s12:s15
+    guest.word(atomic_pc + 4, 0x8003_0000);
+    guest.word(atomic_pc + 8, 0xbf81_0000);
+
+    const atomic_storage_address = 0x1200;
+    const atomic_return_address = 0x1300;
+    const atomic_storage_size = 16;
+    const atomic_initial = [_]u32{ 10, 20, 30, 40 };
+    for (atomic_initial, 0..) |word, index| guest.word(atomic_storage_address + index * 4, word);
+    @memset(guest.bytes[atomic_return_address .. atomic_return_address + atomic_storage_size], 0);
+
+    const atomic_descriptor_table = 0x400;
+    const add_thread_id: u32 = 1 << 23;
+    const atomic_descriptors = [_][4]u32{
+        .{ @intCast(atomic_storage_address), 4 << 16, atomic_storage_size / 4, add_thread_id },
+        .{ @intCast(atomic_return_address), 4 << 16, atomic_storage_size / 4, add_thread_id },
+    };
+    for (atomic_descriptors, 0..) |descriptor, descriptor_index| {
+        for (descriptor, 0..) |word, word_index| {
+            guest.word(atomic_descriptor_table + descriptor_index * 16 + word_index * 4, word);
+        }
+    }
+
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.compute.programRegisterBase(), atomic_program_address >> 8);
+    try state.writeRegister(.shader, 0x207, 4);
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.compute.userDataBase(), atomic_descriptor_table);
+    _ = try executor.execute(&stream);
+    _ = try executor.execute(&stream);
+    if (renderer.translated_dispatches != 4 or renderer.pipeline_cache_misses != 2 or renderer.pipeline_cache_hits != 2) {
+        return error.InvalidAtomicPipelineCacheResult;
+    }
+    for (atomic_initial, 0..) |_, index| {
+        const atomic_value = std.mem.readInt(u32, guest.bytes[atomic_storage_address + index * 4 ..][0..4], .little);
+        const returned_value = std.mem.readInt(u32, guest.bytes[atomic_return_address + index * 4 ..][0..4], .little);
+        if (atomic_value != 9) return error.TranslatedAtomicWriteMismatch;
+        if (returned_value != 10) return error.TranslatedAtomicReturnMismatch;
+    }
+    var atomic_readback: [atomic_storage_size]u8 = undefined;
+    var return_readback: [atomic_storage_size]u8 = undefined;
+    try renderer.readbackGuestStorageBuffer(atomic_storage_address, &atomic_readback);
+    try renderer.readbackGuestStorageBuffer(atomic_return_address, &return_readback);
+    if (!std.mem.eql(u8, guest.bytes[atomic_storage_address .. atomic_storage_address + atomic_storage_size], &atomic_readback) or
+        !std.mem.eql(u8, guest.bytes[atomic_return_address .. atomic_return_address + atomic_storage_size], &return_readback))
+    {
+        return error.AtomicStagedBufferMismatch;
+    }
+
     var output_buffer: [1024]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &output_buffer);
     const writer = &output.interface;
