@@ -12,7 +12,9 @@ const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const kernel_runtime = @import("kernel_runtime.zig");
 const kernel_threading = @import("kernel_threading.zig");
+const kernel_memory = @import("kernel_memory.zig");
 const agc_submit = @import("agc_submit.zig");
+const gpu = @import("gpu");
 
 const invalid_argument = errno.KernelError.einval.raw();
 
@@ -410,7 +412,7 @@ const AgcCommandBuffer = extern struct {
     reserved_dwords: u32,
 };
 
-fn agcCommand(buffer: ?*AgcCommandBuffer, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) ?[*]u32 {
+fn reserveAgcCommand(buffer: ?*AgcCommandBuffer) ?[*]u32 {
     const state = buffer orelse return null;
     const cursor = state.cursor_up orelse state.bottom orelse return null;
     const top = state.top orelse return null;
@@ -418,9 +420,84 @@ fn agcCommand(buffer: ?*AgcCommandBuffer, _: u64, _: u64, _: u64, _: u64, _: u64
     const top_address = @intFromPtr(top);
     const byte_count = 16 * @sizeOf(u32);
     if (cursor_address > top_address or top_address - cursor_address < byte_count) return null;
-    @memset(cursor[0..16], 0);
     state.cursor_up = cursor + 16;
     return cursor;
+}
+
+fn pm4Header(opcode: u8, body_words: usize) u32 {
+    std.debug.assert(body_words > 0 and body_words <= 0x4000);
+    return (@as(u32, 3) << 30) |
+        (@as(u32, @intCast(body_words - 1)) << 16) |
+        (@as(u32, opcode) << 8);
+}
+
+fn writeAgcPacket(buffer: ?*AgcCommandBuffer, opcode: u8, body: []const u32) ?[*]u32 {
+    const cursor = reserveAgcCommand(buffer) orelse return null;
+    cursor[0] = pm4Header(opcode, body.len);
+    @memcpy(cursor[1 .. 1 + body.len], body);
+
+    const used = 1 + body.len;
+    const remaining = 16 - used;
+    if (remaining != 0) {
+        // Specialised writers keep the old fixed footprint until all matching
+        // GetSize entry points have their exact retail widths.
+        std.debug.assert(remaining >= 2);
+        cursor[used] = pm4Header(gpu.pm4.nop, remaining - 1);
+        @memset(cursor[used + 1 .. 16], 0);
+    }
+    return cursor;
+}
+
+fn agcCommand(buffer: ?*AgcCommandBuffer, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) ?[*]u32 {
+    const body = [_]u32{0} ** 15;
+    return writeAgcPacket(buffer, gpu.pm4.nop, &body);
+}
+
+fn agcDispatch(
+    buffer: ?*AgcCommandBuffer,
+    group_x: u32,
+    group_y: u32,
+    group_z: u32,
+    modifier: u32,
+    _: u64,
+) callconv(abi.guest) ?[*]u32 {
+    const body = [_]u32{ group_x, group_y, group_z, (modifier & 0xa038) | 0x41 };
+    return writeAgcPacket(buffer, gpu.pm4.dispatch_direct, &body);
+}
+
+fn agcDrawIndex(
+    buffer: ?*AgcCommandBuffer,
+    index_count: u32,
+    index_address: u64,
+    modifier: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) ?[*]u32 {
+    if (index_address == 0 or index_address & 1 != 0) return null;
+    const initiator: u32 = if (modifier & (@as(u64, 1) << 32) != 0)
+        0
+    else
+        @as(u32, @truncate(modifier >> 3)) & 0x20;
+    const body = [_]u32{
+        if (index_count == 0) 1 else index_count,
+        @truncate(index_address),
+        @truncate(index_address >> 32),
+        index_count,
+        initiator,
+    };
+    return writeAgcPacket(buffer, gpu.pm4.draw_index_2, &body);
+}
+
+fn agcSetNumInstances(
+    buffer: ?*AgcCommandBuffer,
+    instance_count: u32,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) ?[*]u32 {
+    const body = [_]u32{instance_count};
+    return writeAgcPacket(buffer, gpu.pm4.num_instances, &body);
 }
 
 fn agcPatch(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
@@ -437,8 +514,140 @@ fn agcGetRegisterDefaults(_: u32) callconv(abi.guest) *anyopaque {
     return &register_defaults;
 }
 
-fn agcCreateShader(output: ?*?*anyopaque, header: ?*anyopaque, _: ?*const volatile anyopaque) callconv(abi.guest) i32 {
-    if (output) |value| value.* = header;
+const shader_file_header: u32 = 0x3433_3231;
+const shader_version: u32 = 0x18;
+const shader_structure_size: usize = 0x60;
+const shader_user_data_offset: usize = 0x08;
+const shader_code_offset: usize = 0x10;
+const shader_cx_registers_offset: usize = 0x18;
+const shader_sh_registers_offset: usize = 0x20;
+const shader_specials_offset: usize = 0x28;
+const shader_input_semantics_offset: usize = 0x30;
+const shader_output_semantics_offset: usize = 0x38;
+const shader_type_offset: usize = 0x5a;
+const shader_sh_register_count_offset: usize = 0x5c;
+
+const ShaderRegister = extern struct {
+    offset: u32,
+    value: u32,
+};
+
+fn accessible(address: u64, length: usize) bool {
+    return kernel_memory.isGuestRangeAccessible(address, length);
+}
+
+fn relocateShaderPointer(field_address: u64) bool {
+    if (!accessible(field_address, @sizeOf(u64))) return false;
+    const field: *u64 = @ptrFromInt(field_address);
+    if (field.* != 0) field.* +%= field_address;
+    return true;
+}
+
+fn shaderProgramRegisters(shader_type: u8) ?struct { low: u32, high: u32 } {
+    return switch (shader_type) {
+        0 => .{ .low = 0x20c, .high = 0x20d }, // compute
+        1 => .{ .low = 0x008, .high = 0x009 }, // pixel
+        2 => .{ .low = 0x0c8, .high = 0x0c9 }, // geometry
+        3 => .{ .low = 0x148, .high = 0x149 }, // hull
+        6 => .{ .low = 0x088, .high = 0x089 }, // geometry back half
+        7 => .{ .low = 0x108, .high = 0x109 }, // hull back half
+        else => null,
+    };
+}
+
+fn patchShaderProgram(header_address: u64, code_address: u64) bool {
+    if (!accessible(header_address, shader_structure_size)) return false;
+    const bytes: [*]u8 = @ptrFromInt(header_address);
+    const shader_type = bytes[shader_type_offset];
+    // Front halves publish their program address when they are fused with the
+    // back half. Fetch shaders likewise have no SH program pair in this table.
+    const wanted = shaderProgramRegisters(shader_type) orelse return shader_type == 4 or shader_type == 5 or shader_type == 8;
+    const count = bytes[shader_sh_register_count_offset];
+    const registers_address = @as(*const u64, @ptrFromInt(header_address + shader_sh_registers_offset)).*;
+    if (registers_address == 0 or !accessible(registers_address, @as(usize, count) * @sizeOf(ShaderRegister))) {
+        return false;
+    }
+
+    const registers: [*]ShaderRegister = @ptrFromInt(registers_address);
+    var low: ?*ShaderRegister = null;
+    var high: ?*ShaderRegister = null;
+    for (registers[0..count]) |*entry| {
+        if (entry.offset == wanted.low) low = entry;
+        if (entry.offset == wanted.high) high = entry;
+    }
+    if (low == null or high == null) return false;
+
+    const shader_offset = (@as(u64, low.?.value) << 8) | (@as(u64, high.?.value & 0xff) << 40);
+    const program_address = code_address +% shader_offset;
+    low.?.value = @truncate(program_address >> 8);
+    high.?.value = (high.?.value & 0xffff_ff00) | @as(u32, @truncate(program_address >> 40));
+    return true;
+}
+
+fn agcCreateShader(
+    output: ?*?*anyopaque,
+    header: ?*anyopaque,
+    code: ?*const volatile anyopaque,
+) callconv(abi.guest) i32 {
+    const header_pointer = header orelse return invalid_argument;
+    const code_pointer = code orelse return invalid_argument;
+    const header_address = @intFromPtr(header_pointer);
+    const code_address = @intFromPtr(code_pointer);
+    if (!accessible(header_address, shader_structure_size)) return errno.KernelError.efault.raw();
+
+    const header_words: *const [2]u32 = @ptrFromInt(header_address);
+    if (header_words[0] != shader_file_header or header_words[1] != shader_version) {
+        return invalid_argument;
+    }
+    const pointer_fields = [_]usize{
+        shader_cx_registers_offset,
+        shader_sh_registers_offset,
+        shader_user_data_offset,
+        shader_specials_offset,
+        shader_input_semantics_offset,
+        shader_output_semantics_offset,
+    };
+    for (pointer_fields) |offset| {
+        if (!relocateShaderPointer(header_address + offset)) return errno.KernelError.efault.raw();
+    }
+    @as(*u64, @ptrFromInt(header_address + shader_code_offset)).* = code_address;
+
+    const user_data_address = @as(*const u64, @ptrFromInt(header_address + shader_user_data_offset)).*;
+    if (user_data_address != 0) {
+        for ([_]usize{ 0, 8, 16, 24, 32 }) |offset| {
+            if (!relocateShaderPointer(user_data_address + offset)) return errno.KernelError.efault.raw();
+        }
+    }
+    if (!patchShaderProgram(header_address, code_address)) return invalid_argument;
+    if (output) |destination| destination.* = header_pointer;
+    return errno.ok;
+}
+
+fn agcCreatePrimState(
+    cx_registers: ?[*]ShaderRegister,
+    uc_registers: ?[*]ShaderRegister,
+    _: ?*const anyopaque,
+    geometry_shader: ?*const anyopaque,
+    primitive_type: u32,
+    _: u64,
+) callconv(abi.guest) i32 {
+    if (cx_registers == null and uc_registers == null) return errno.ok;
+    const shader = geometry_shader orelse return invalid_argument;
+    const shader_address = @intFromPtr(shader);
+    if (!accessible(shader_address, shader_structure_size)) return errno.KernelError.efault.raw();
+    const specials_address = @as(*const u64, @ptrFromInt(shader_address + shader_specials_offset)).*;
+    if (specials_address == 0 or !accessible(specials_address, 0x30)) return invalid_argument;
+    const specials: [*]const ShaderRegister = @ptrFromInt(specials_address);
+
+    if (cx_registers) |cx| {
+        cx[0] = specials[1]; // VGT_SHADER_STAGES_EN at +0x08
+        cx[1] = specials[4]; // VGT_GS_OUT_PRIM_TYPE at +0x20
+    }
+    if (uc_registers) |uc| {
+        uc[0] = specials[0]; // GE_CNTL at +0x00
+        uc[1] = specials[5]; // GE_USER_VGPR_EN at +0x28
+        uc[2] = .{ .offset = 0x242, .value = primitive_type };
+    }
     return errno.ok;
 }
 
@@ -455,7 +664,7 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcSetCxRegIndirectPatchAddRegisters", .function = trace.wrap("sceAgcSetCxRegIndirectPatchAddRegisters", &agcPatch), .expect_id = "d-6uF9sZDIU" },
     .{ .name = "sceAgcSetShRegIndirectPatchAddRegisters", .function = trace.wrap("sceAgcSetShRegIndirectPatchAddRegisters", &agcPatch), .expect_id = "z2duB-hHQSM" },
     .{ .name = "sceAgcSetUcRegIndirectPatchAddRegisters", .function = trace.wrap("sceAgcSetUcRegIndirectPatchAddRegisters", &agcPatch), .expect_id = "vRoArM9zaIk" },
-    .{ .name = "sceAgcCreatePrimState", .function = trace.wrap("sceAgcCreatePrimState", &agcPatch), .expect_id = "D9sr1xGUriE" },
+    .{ .name = "sceAgcCreatePrimState", .function = trace.wrap("sceAgcCreatePrimState", &agcCreatePrimState), .expect_id = "D9sr1xGUriE" },
     .{ .name = "sceAgcWriteDataPatchSetAddressOrOffset", .function = trace.wrap("sceAgcWriteDataPatchSetAddressOrOffset", &agcPatch), .expect_id = "fPSCdQxgpSw" },
     .{ .name = "sceAgcQueueEndOfPipeActionPatchAddress", .function = trace.wrap("sceAgcQueueEndOfPipeActionPatchAddress", &agcPatch), .expect_id = "0fWWK5uG9rQ" },
     .{ .name = "sceAgcWaitRegMemPatchAddress", .function = trace.wrap("sceAgcWaitRegMemPatchAddress", &agcPatch), .expect_id = "3KDcnM3lrcU" },
@@ -470,7 +679,7 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcGetDataPacketPayloadAddress", .function = trace.wrap("sceAgcGetDataPacketPayloadAddress", &agcPatch), .id_override = "V++UgBtQhn0" },
 
     .{ .name = "sceAgcCbNop", .function = trace.wrap("sceAgcCbNop", &agcCommand), .expect_id = "LtTouSCZjHM" },
-    .{ .name = "sceAgcCbDispatch", .function = trace.wrap("sceAgcCbDispatch", &agcCommand), .expect_id = "k3GhuSNmBLU" },
+    .{ .name = "sceAgcCbDispatch", .function = trace.wrap("sceAgcCbDispatch", &agcDispatch), .expect_id = "k3GhuSNmBLU" },
     .{ .name = "sceAgcCbSetShRegisterRangeDirect", .function = trace.wrap("sceAgcCbSetShRegisterRangeDirect", &agcCommand), .expect_id = "n2fD4A+pb+g" },
     .{ .name = "sceAgcCbSetShRegistersDirect", .function = trace.wrap("sceAgcCbSetShRegistersDirect", &agcCommand), .expect_id = "UZbQjYAwwXM" },
     .{ .name = "sceAgcCbSetUcRegistersDirect", .function = trace.wrap("sceAgcCbSetUcRegistersDirect", &agcCommand), .expect_id = "03RZmELWWzw" },
@@ -493,12 +702,12 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcDcbWaitUntilSafeForRendering", .function = trace.wrap("sceAgcDcbWaitUntilSafeForRendering", &agcCommand), .expect_id = "MWiElSNE8j8" },
     .{ .name = "sceAgcDcbSetIndexBuffer", .function = trace.wrap("sceAgcDcbSetIndexBuffer", &agcCommand), .expect_id = "l4fM9K-Lyks" },
     .{ .name = "sceAgcDcbSetIndexCount", .function = trace.wrap("sceAgcDcbSetIndexCount", &agcCommand), .expect_id = "8N2tmT3jmC8" },
-    .{ .name = "sceAgcDcbDrawIndex", .function = trace.wrap("sceAgcDcbDrawIndex", &agcCommand), .expect_id = "q88lQ+GP5Yk" },
+    .{ .name = "sceAgcDcbDrawIndex", .function = trace.wrap("sceAgcDcbDrawIndex", &agcDrawIndex), .expect_id = "q88lQ+GP5Yk" },
     .{ .name = "sceAgcDcbDrawIndexAuto", .function = trace.wrap("sceAgcDcbDrawIndexAuto", &agcCommand), .expect_id = "Yw0jKSqop+E" },
     .{ .name = "sceAgcDcbDrawIndexIndirect", .function = trace.wrap("sceAgcDcbDrawIndexIndirect", &agcCommand), .expect_id = "t1vNu082-jM" },
     .{ .name = "sceAgcDcbDrawIndirect", .function = trace.wrap("sceAgcDcbDrawIndirect", &agcCommand), .expect_id = "1q1titRBL6o" },
     .{ .name = "sceAgcDcbDispatchIndirect", .function = trace.wrap("sceAgcDcbDispatchIndirect", &agcCommand), .expect_id = "CtB+A9-VxO0" },
-    .{ .name = "sceAgcDcbSetNumInstances", .function = trace.wrap("sceAgcDcbSetNumInstances", &agcCommand), .expect_id = "tSBxhAPyytQ" },
+    .{ .name = "sceAgcDcbSetNumInstances", .function = trace.wrap("sceAgcDcbSetNumInstances", &agcSetNumInstances), .expect_id = "tSBxhAPyytQ" },
     .{ .name = "sceAgcDcbStallCommandBufferParser", .function = trace.wrap("sceAgcDcbStallCommandBufferParser", &agcCommand), .expect_id = "u2T2DiA5hRI" },
     .{ .name = "sceAgcDcbSetBaseIndirectArgs", .function = trace.wrap("sceAgcDcbSetBaseIndirectArgs", &agcCommand), .expect_id = "RmaJwLtc8rY" },
     .{ .name = "sceAgcDcbSetShRegistersIndirect", .function = trace.wrap("sceAgcDcbSetShRegistersIndirect", &agcCommand), .expect_id = "-HOOCn0JY48" },
@@ -558,6 +767,133 @@ pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!voi
     // acknowledging it.
     try db.addLibrary(gpa, .{ .name = "libSceAgcDriver" }, .{ .name = "libSceAgcDriver" }, &agc_submit.exports);
     try db.addLibrary(gpa, .{ .name = "libSceAmpr" }, .{ .name = "libSceAmpr" }, &ampr_exports);
+}
+
+test "bootstrap AGC commands are one walkable PM4 NOP" {
+    var words: [32]u32 = @splat(0xdead_beef);
+    var command_buffer = AgcCommandBuffer{
+        .bottom = words[0..].ptr,
+        .top = words[0..].ptr + words.len,
+        .cursor_up = words[0..].ptr,
+        .cursor_down = null,
+        .callback = null,
+        .user_data = null,
+        .reserved_dwords = 0,
+    };
+    try std.testing.expect(agcCommand(&command_buffer, 0, 0, 0, 0, 0) != null);
+    try std.testing.expectEqual(words[0..].ptr + 16, command_buffer.cursor_up.?);
+
+    var walker = gpu.pm4.Walker.init(words[0..16]);
+    const packet = (try walker.next()).?;
+    try std.testing.expectEqual(gpu.pm4.nop, packet.opcode);
+    try std.testing.expectEqual(@as(usize, 16), packet.wordCount());
+    try std.testing.expect((try walker.next()) == null);
+}
+
+test "bootstrap AGC emits dispatch draw and instance packets in fixed slots" {
+    var words: [48]u32 = @splat(0xdead_beef);
+    var command_buffer = AgcCommandBuffer{
+        .bottom = words[0..].ptr,
+        .top = words[0..].ptr + words.len,
+        .cursor_up = words[0..].ptr,
+        .cursor_down = null,
+        .callback = null,
+        .user_data = null,
+        .reserved_dwords = 0,
+    };
+    try std.testing.expect(agcDispatch(&command_buffer, 3, 5, 7, 0, 0) != null);
+    try std.testing.expect(agcDrawIndex(&command_buffer, 6, 0x1234_5600, 0x4000_0000, 0, 0) != null);
+    try std.testing.expect(agcSetNumInstances(&command_buffer, 2, 0, 0, 0, 0) != null);
+    try std.testing.expectEqual(words[0..].ptr + words.len, command_buffer.cursor_up.?);
+
+    var walker = gpu.pm4.Walker.init(&words);
+    const dispatch = (try walker.next()).?;
+    try std.testing.expectEqual(gpu.pm4.dispatch_direct, dispatch.opcode);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 5, 7, 0x41 }, dispatch.body);
+    try std.testing.expectEqual(gpu.pm4.nop, (try walker.next()).?.opcode);
+
+    const draw = (try walker.next()).?;
+    try std.testing.expectEqual(gpu.pm4.draw_index_2, draw.opcode);
+    try std.testing.expectEqualSlices(u32, &.{ 6, 0x1234_5600, 0, 6, 0 }, draw.body);
+    try std.testing.expectEqual(gpu.pm4.nop, (try walker.next()).?.opcode);
+
+    const instances = (try walker.next()).?;
+    try std.testing.expectEqual(gpu.pm4.num_instances, instances.opcode);
+    try std.testing.expectEqualSlices(u32, &.{2}, instances.body);
+    try std.testing.expectEqual(gpu.pm4.nop, (try walker.next()).?.opcode);
+    try std.testing.expect((try walker.next()) == null);
+}
+
+test "shader creation relocates its header and builds primitive state" {
+    var header: [shader_structure_size]u8 align(8) = @splat(0);
+    var registers = [_]ShaderRegister{
+        .{ .offset = 0x0c8, .value = 0x100 },
+        .{ .offset = 0x0c9, .value = 0xabcd_ef00 },
+    };
+    var specials = [_]ShaderRegister{
+        .{ .offset = 0x100, .value = 1 },
+        .{ .offset = 0x101, .value = 2 },
+        .{ .offset = 0x102, .value = 3 },
+        .{ .offset = 0x103, .value = 4 },
+        .{ .offset = 0x104, .value = 5 },
+        .{ .offset = 0x105, .value = 6 },
+    };
+    var code: [16]u8 align(256) = @splat(0);
+
+    std.mem.writeInt(u32, header[0..4], shader_file_header, .little);
+    std.mem.writeInt(u32, header[4..8], shader_version, .little);
+    header[shader_type_offset] = 2;
+    header[shader_sh_register_count_offset] = registers.len;
+
+    const header_address = @intFromPtr(&header);
+    const register_field = header_address + shader_sh_registers_offset;
+    const specials_field = header_address + shader_specials_offset;
+    @as(*u64, @ptrFromInt(register_field)).* = @intFromPtr(&registers) -% register_field;
+    @as(*u64, @ptrFromInt(specials_field)).* = @intFromPtr(&specials) -% specials_field;
+
+    var shader: ?*anyopaque = null;
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        agcCreateShader(&shader, &header, @ptrCast(&code)),
+    );
+    try std.testing.expectEqual(@intFromPtr(&header), @intFromPtr(shader.?));
+    try std.testing.expectEqual(@intFromPtr(&registers), @as(*const u64, @ptrFromInt(register_field)).*);
+    try std.testing.expectEqual(@intFromPtr(&specials), @as(*const u64, @ptrFromInt(specials_field)).*);
+    try std.testing.expectEqual(@intFromPtr(&code), @as(*const u64, @ptrFromInt(header_address + shader_code_offset)).*);
+    const expected_program_address = @intFromPtr(&code) + 0x1_0000;
+    try std.testing.expectEqual(@as(u32, @truncate(expected_program_address >> 8)), registers[0].value);
+    try std.testing.expectEqual(
+        @as(u32, 0xabcd_ef00) | @as(u32, @truncate(expected_program_address >> 40)),
+        registers[1].value,
+    );
+
+    var cx: [2]ShaderRegister = undefined;
+    var uc: [3]ShaderRegister = undefined;
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        agcCreatePrimState(&cx, &uc, null, @ptrCast(&header), 4, 0),
+    );
+    try std.testing.expectEqual(specials[1], cx[0]);
+    try std.testing.expectEqual(specials[4], cx[1]);
+    try std.testing.expectEqual(specials[0], uc[0]);
+    try std.testing.expectEqual(specials[5], uc[1]);
+    try std.testing.expectEqual(@as(u32, 0x242), uc[2].offset);
+    try std.testing.expectEqual(@as(u32, 4), uc[2].value);
+}
+
+test "shader creation accepts a fused front half without program registers" {
+    var header: [shader_structure_size]u8 align(8) = @splat(0);
+    var code: [16]u8 align(256) = @splat(0);
+    std.mem.writeInt(u32, header[0..4], shader_file_header, .little);
+    std.mem.writeInt(u32, header[4..8], shader_version, .little);
+    header[shader_type_offset] = 4;
+
+    var shader: ?*anyopaque = null;
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        agcCreateShader(&shader, &header, @ptrCast(&code)),
+    );
+    try std.testing.expectEqual(@intFromPtr(&header), @intFromPtr(shader.?));
 }
 
 test "bootstrap service libraries register the title link surface" {

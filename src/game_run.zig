@@ -9,10 +9,11 @@ const runtime = @import("runtime");
 const loader = @import("loader");
 
 const usage =
-    \\game-run <eboot.bin>
+    \\game-run [--app0 <content-directory>] <eboot.bin>
     \\
     \\Loads and relocates the adjacent PRX graph, runs its initializers, then
-    \\enters the title process. Direct execution requires Windows x86-64.
+    \\enters the title process. --app0 supplies full game content when eboot.bin
+    \\comes from a sparse patch directory. Direct execution requires Windows x86-64.
     \\
 ;
 
@@ -92,18 +93,24 @@ fn run(init: std.process.Init) !bool {
     const out = &stdout_writer.interface;
 
     const args = try init.minimal.args.toSlice(allocator);
-    if (args.len != 2) {
+    const has_app0_override = args.len == 4 and std.mem.eql(u8, args[1], "--app0");
+    if (args.len != 2 and !has_app0_override) {
         try stderr.writeAll(usage);
         try stderr.flush();
         return false;
     }
+    const executable_path = if (has_app0_override) args[3] else args[1];
+    const title_root = if (has_app0_override)
+        args[2]
+    else
+        std.fs.path.dirname(executable_path) orelse ".";
 
     var emu = runtime.Runtime{};
     try emu.init(allocator);
     defer emu.deinit();
 
-    var graph = emu.loadModuleGraph(io, args[1], .{}) catch |err| {
-        try stderr.print("cannot link {s}: {s}\n", .{ args[1], @errorName(err) });
+    var graph = emu.loadModuleGraph(io, executable_path, .{}) catch |err| {
+        try stderr.print("cannot link {s}: {s}\n", .{ executable_path, @errorName(err) });
         try stderr.flush();
         return false;
     };
@@ -127,7 +134,6 @@ fn run(init: std.process.Init) !bool {
     }
 
     // The directory holding the executable is what a title sees as /app0.
-    const title_root = std.fs.path.dirname(args[1]) orelse ".";
     var content = std.Io.Dir.cwd().openDir(io, title_root, .{}) catch |err| {
         try stderr.print("cannot open {s}: {s}\n", .{ title_root, @errorName(err) });
         try stderr.flush();
@@ -172,7 +178,7 @@ fn run(init: std.process.Init) !bool {
     const prepared = try emu.prepareInitialThread("eboot-main");
     defer emu.releaseInitialThread(prepared.handle) catch {};
 
-    try out.print("loaded {s}\n", .{args[1]});
+    try out.print("loaded {s}\n", .{executable_path});
     try out.print("  modules {d}\n", .{graph.moduleCount()});
     try out.print("  entry   0x{x}\n", .{graph.executable().entry_point});
     for (graph.nodes.items) |*node| {
@@ -193,7 +199,7 @@ fn run(init: std.process.Init) !bool {
         prepared,
         graph.executable(),
         .{
-            .entry = .{ .image_name = std.fs.path.basename(args[1]) },
+            .entry = .{ .image_name = std.fs.path.basename(executable_path) },
             .modules = graph.modules(),
         },
     ) catch |err| {

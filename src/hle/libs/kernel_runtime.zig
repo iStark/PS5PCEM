@@ -51,6 +51,7 @@ var stack_check_guard: u64 align(16) = 0xc0de_c0de_cafe_ba00;
 var program_name: usize = 0;
 threadlocal var fallback_errno: i32 = 0;
 threadlocal var rtld_atexit_count: u32 = 0;
+threadlocal var undelivered_exception_waits: u8 = 0;
 
 var active_io: ?std.Io = null;
 var process_start_nanoseconds: i96 = 0;
@@ -62,6 +63,146 @@ var thread_atexit_report: std.atomic.Value(u64) = .init(0);
 var uuid_counter: std.atomic.Value(u64) = .init(1);
 var gpo_state: std.atomic.Value(u32) = .init(0);
 
+/// One futex-style address and the last wake generation published for it.
+///
+/// The table is fixed-size because this is a firmware hot path: allocating
+/// while a title is trying to park an allocator or job-system worker can recurse
+/// into the very subsystem that is waiting. Open addressing keeps the common
+/// lookup bounded without turning every wait into a linear scan.
+const sync_address_capacity: usize = 1024;
+const sync_address_mask: usize = sync_address_capacity - 1;
+const sync_address_self_heal_us: u64 = 100 * std.time.us_per_ms;
+
+comptime {
+    std.debug.assert(std.math.isPowerOfTwo(sync_address_capacity));
+}
+
+const SyncAddress = struct {
+    address: u64 = 0,
+    generation: u64 = 1,
+};
+
+const SyncAddressLock = struct {
+    inner: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *SyncAddressLock) void {
+        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(self: *SyncAddressLock) void {
+        self.inner.unlock();
+    }
+};
+
+var sync_address_lock = SyncAddressLock{};
+var sync_addresses: [sync_address_capacity]SyncAddress =
+    [_]SyncAddress{.{}} ** sync_address_capacity;
+var sync_fallback_generation: u64 = 1;
+
+/// Kernel event flags and semaphores used by the graphics runtime.
+///
+/// These objects stay in fixed tables for the same reason as the address-wait
+/// generations above: creation can happen while Unity's allocators and worker
+/// pool are live, so a firmware synchronization primitive must not allocate
+/// through them. Handles are never reused during one process, which also keeps
+/// a waiter on a deleted object from attaching to a newly created one.
+const maximum_event_flags: usize = 64;
+const maximum_semaphores: usize = 64;
+const event_flag_key_prefix: u64 = 0x4556_0000_0000_0000;
+const semaphore_key_prefix: u64 = 0x5345_0000_0000_0000;
+
+const EventFlag = struct {
+    handle: u64 = 0,
+    bits: u64 = 0,
+    sequence: u64 = 1,
+    waiters: u32 = 0,
+};
+
+const Semaphore = struct {
+    handle: u32 = 0,
+    count: i32 = 0,
+    initial_count: i32 = 0,
+    maximum_count: i32 = 0,
+    sequence: u64 = 1,
+    waiters: u32 = 0,
+};
+
+var kernel_object_lock = SyncAddressLock{};
+var event_flags: [maximum_event_flags]EventFlag = [_]EventFlag{.{}} ** maximum_event_flags;
+var semaphores: [maximum_semaphores]Semaphore = [_]Semaphore{.{}} ** maximum_semaphores;
+var next_event_flag_handle: u64 = 1;
+var next_semaphore_handle: u32 = 1;
+var exception_handlers: [128]u64 = [_]u64{0} ** 128;
+
+fn findEventFlag(handle: u64) ?*EventFlag {
+    for (&event_flags) |*object| if (object.handle == handle) return object;
+    return null;
+}
+
+fn findSemaphore(handle: u32) ?*Semaphore {
+    for (&semaphores) |*object| if (object.handle == handle) return object;
+    return null;
+}
+
+fn advanceObjectSequence(sequence: *u64) u64 {
+    sequence.* +%= 1;
+    if (sequence.* == 0) sequence.* = 1;
+    return sequence.*;
+}
+
+fn resetKernelObjects() void {
+    kernel_object_lock.lock();
+    defer kernel_object_lock.unlock();
+    @memset(&event_flags, .{});
+    @memset(&semaphores, .{});
+    @memset(&exception_handlers, 0);
+    next_event_flag_handle = 1;
+    next_semaphore_handle = 1;
+    undelivered_exception_waits = 0;
+}
+
+fn syncAddressIndex(address: u64) usize {
+    var mixed = address ^ (address >> 33);
+    mixed *%= 0xff51_afd7_ed55_8ccd;
+    mixed ^= mixed >> 33;
+    return @intCast(mixed & @as(u64, sync_address_mask));
+}
+
+fn syncAddressGeneration(address: u64, advance: bool) u64 {
+    sync_address_lock.lock();
+    defer sync_address_lock.unlock();
+
+    const first = syncAddressIndex(address);
+    for (0..sync_address_capacity) |offset| {
+        const index = (first + offset) & sync_address_mask;
+        const entry = &sync_addresses[index];
+        if (entry.address == 0) entry.* = .{ .address = address };
+        if (entry.address != address) continue;
+        if (advance) {
+            entry.generation +%= 1;
+            if (entry.generation == 0) entry.generation = 1;
+        }
+        return entry.generation;
+    }
+
+    // Saturation degrades to a shared generation but remains race-safe: the
+    // scheduler key is still the guest address, so a wake cannot release a
+    // waiter on a different address. The bounded wait below prevents a missed
+    // wake from becoming permanent.
+    if (advance) {
+        sync_fallback_generation +%= 1;
+        if (sync_fallback_generation == 0) sync_fallback_generation = 1;
+    }
+    return sync_fallback_generation;
+}
+
+fn resetSyncAddresses() void {
+    sync_address_lock.lock();
+    defer sync_address_lock.unlock();
+    @memset(&sync_addresses, .{});
+    sync_fallback_generation = 1;
+}
+
 pub fn attachIo(io: ?std.Io) void {
     const was_detached = active_io == null;
     active_io = io;
@@ -71,6 +212,8 @@ pub fn attachIo(io: ?std.Io) void {
         }
     } else {
         process_start_nanoseconds = 0;
+        resetSyncAddresses();
+        resetKernelObjects();
     }
 }
 
@@ -122,6 +265,564 @@ fn kernelUnsupported(
     _: u64,
 ) callconv(abi.guest) i32 {
     return KernelError.enosys.raw();
+}
+
+/// Parks a guest worker on an address until a matching wake is published.
+///
+/// Unity uses this as a futex-style primitive in its job system. Returning an
+/// error makes every worker retry immediately and produces millions of firmware
+/// calls without allowing the producer thread to run. A bounded deadline is a
+/// safety net for a genuinely missed wake; callers already re-check their own
+/// condition after every successful or spurious wakeup.
+fn syncOnAddressWait(
+    address: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    if (address == 0) return KernelError.einval.raw();
+    const generation = syncAddressGeneration(address, false);
+    _ = threading.waitCurrent(.{
+        .key = address,
+        .observed_sequence = generation,
+        .timeout_microseconds = sync_address_self_heal_us,
+    }) catch return KernelError.enosys.raw();
+    return 0;
+}
+
+/// Releases workers parked by `syncOnAddressWait` on the same address.
+fn syncOnAddressWake(
+    address: u64,
+    requested_waiters: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    if (address == 0) return KernelError.einval.raw();
+    const generation = syncAddressGeneration(address, true);
+    const maximum_waiters: usize = if (requested_waiters == 0 or
+        requested_waiters >= std.math.maxInt(u32))
+        std.math.maxInt(usize)
+    else
+        @intCast(requested_waiters);
+    threading.wakeWaiters(address, generation, maximum_waiters);
+    return 0;
+}
+
+fn supportedExceptionSignal(signal: i32) bool {
+    return switch (signal) {
+        1, 4, 8, 10, 11, 30 => true,
+        else => false,
+    };
+}
+
+fn installExceptionHandler(
+    signal: i32,
+    handler: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    if (!supportedExceptionSignal(signal)) return KernelError.einval.raw();
+    kernel_object_lock.lock();
+    defer kernel_object_lock.unlock();
+    const slot = &exception_handlers[@intCast(signal)];
+    if (slot.* != 0) return KernelError.eexist.raw();
+    slot.* = handler;
+    return 0;
+}
+
+fn removeExceptionHandler(
+    signal: i32,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    if (!supportedExceptionSignal(signal)) return KernelError.einval.raw();
+    kernel_object_lock.lock();
+    defer kernel_object_lock.unlock();
+    exception_handlers[@intCast(signal)] = 0;
+    return 0;
+}
+
+/// Records a process exception request that the direct native bridge cannot
+/// yet deliver to a different guest pthread.
+///
+/// A real kernel interrupts the target, runs the installed handler there, and
+/// resumes its register context. The current bridge deliberately cannot fake
+/// that by calling on the raiser's stack: Unity's stop-the-world callback would
+/// publish roots for the wrong thread. Marking this one handshake lets the
+/// raiser's following semaphore wait report ENOSYS, which is the title's
+/// existing fallback path, while unrelated semaphores retain real semantics.
+fn raiseException(
+    target_thread: u64,
+    signal: i32,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    if (target_thread == 0 or signal < 0 or signal >= exception_handlers.len) {
+        return KernelError.einval.raw();
+    }
+    kernel_object_lock.lock();
+    const installed = exception_handlers[@intCast(signal)] != 0;
+    kernel_object_lock.unlock();
+    if (installed and target_thread != threading.currentThreadId()) {
+        // Unity's stop/resume handshake uses the pair of zero-count
+        // semaphores created beside its exception handler. Neither side can be
+        // completed without running that handler on the target pthread.
+        undelivered_exception_waits = 2;
+    }
+    return 0;
+}
+
+const event_wait_and: u32 = 0x01;
+const event_wait_or: u32 = 0x02;
+const event_clear_all: u32 = 0x10;
+const event_clear_pattern: u32 = 0x20;
+
+fn validEventAttributes(attributes: u32) bool {
+    const queue_mode = attributes & 0x0f;
+    const thread_mode = attributes & 0xf0;
+    return (queue_mode == 0 or queue_mode == 1 or queue_mode == 2) and
+        (thread_mode == 0 or thread_mode == 0x10 or thread_mode == 0x20) and
+        attributes & ~@as(u32, 0x33) == 0;
+}
+
+fn validEventWaitMode(mode: u32) bool {
+    const condition = mode & 0x0f;
+    const clear_mode = mode & 0xf0;
+    return (condition == event_wait_and or condition == event_wait_or) and
+        (clear_mode == 0 or clear_mode == event_clear_all or clear_mode == event_clear_pattern) and
+        mode & ~@as(u32, 0x33) == 0;
+}
+
+fn eventSatisfied(bits: u64, pattern: u64, mode: u32) bool {
+    return if (mode & 0x0f == event_wait_and)
+        bits & pattern == pattern
+    else
+        bits & pattern != 0;
+}
+
+fn createEventFlag(
+    output: ?*u64,
+    name: ?[*:0]const u8,
+    attributes: u32,
+    initial_pattern: u64,
+    option: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    const destination = output orelse return KernelError.einval.raw();
+    if (name == null or option != 0 or !validEventAttributes(attributes)) {
+        return KernelError.einval.raw();
+    }
+    if (!memory_api.isGuestRangeAccessible(@intFromPtr(destination), @sizeOf(u64))) {
+        return KernelError.efault.raw();
+    }
+
+    kernel_object_lock.lock();
+    defer kernel_object_lock.unlock();
+    for (&event_flags) |*object| {
+        if (object.handle != 0) continue;
+        const handle = next_event_flag_handle;
+        next_event_flag_handle +%= 1;
+        if (next_event_flag_handle == 0) next_event_flag_handle = 1;
+        object.* = .{ .handle = handle, .bits = initial_pattern };
+        destination.* = handle;
+        return 0;
+    }
+    return KernelError.enfile.raw();
+}
+
+fn deleteEventFlag(
+    handle: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    kernel_object_lock.lock();
+    const object = findEventFlag(handle) orelse {
+        kernel_object_lock.unlock();
+        return KernelError.enoent.raw();
+    };
+    const sequence = advanceObjectSequence(&object.sequence);
+    object.handle = 0;
+    kernel_object_lock.unlock();
+    threading.wakeWaiters(event_flag_key_prefix | handle, sequence, std.math.maxInt(usize));
+    return 0;
+}
+
+fn setEventFlag(
+    handle: u64,
+    pattern: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    kernel_object_lock.lock();
+    const object = findEventFlag(handle) orelse {
+        kernel_object_lock.unlock();
+        return KernelError.enoent.raw();
+    };
+    object.bits |= pattern;
+    const sequence = advanceObjectSequence(&object.sequence);
+    kernel_object_lock.unlock();
+    threading.wakeWaiters(event_flag_key_prefix | handle, sequence, std.math.maxInt(usize));
+    return 0;
+}
+
+fn clearEventFlag(
+    handle: u64,
+    mask: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    kernel_object_lock.lock();
+    defer kernel_object_lock.unlock();
+    const object = findEventFlag(handle) orelse return KernelError.enoent.raw();
+    // The PS5 ABI supplies the bits to retain, not the bits to remove.
+    object.bits &= mask;
+    return 0;
+}
+
+fn pollEventFlag(
+    handle: u64,
+    pattern: u64,
+    mode: u32,
+    result_pattern: ?*u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    if (pattern == 0 or !validEventWaitMode(mode)) return KernelError.einval.raw();
+    if (result_pattern) |output| {
+        if (!memory_api.isGuestRangeAccessible(@intFromPtr(output), @sizeOf(u64))) {
+            return KernelError.efault.raw();
+        }
+    }
+
+    kernel_object_lock.lock();
+    defer kernel_object_lock.unlock();
+    const object = findEventFlag(handle) orelse return KernelError.enoent.raw();
+    if (result_pattern) |output| output.* = object.bits;
+    if (!eventSatisfied(object.bits, pattern, mode)) return KernelError.ebusy.raw();
+    switch (mode & 0xf0) {
+        event_clear_all => object.bits = 0,
+        event_clear_pattern => object.bits &= ~pattern,
+        else => {},
+    }
+    return 0;
+}
+
+fn waitEventFlag(
+    handle: u64,
+    pattern: u64,
+    mode: u32,
+    result_pattern: ?*u64,
+    timeout: ?*u32,
+    _: u64,
+) callconv(abi.guest) i32 {
+    if (pattern == 0 or !validEventWaitMode(mode)) return KernelError.einval.raw();
+    if (result_pattern) |output| {
+        if (!memory_api.isGuestRangeAccessible(@intFromPtr(output), @sizeOf(u64))) {
+            return KernelError.efault.raw();
+        }
+    }
+    const requested_timeout: ?u64 = if (timeout) |value| blk: {
+        if (!memory_api.isGuestRangeAccessible(@intFromPtr(value), @sizeOf(u32))) {
+            return KernelError.efault.raw();
+        }
+        break :blk value.*;
+    } else null;
+
+    var registered_waiter = false;
+    while (true) {
+        kernel_object_lock.lock();
+        const object = findEventFlag(handle) orelse {
+            kernel_object_lock.unlock();
+            return KernelError.enoent.raw();
+        };
+        if (eventSatisfied(object.bits, pattern, mode)) {
+            if (registered_waiter) object.waiters -= 1;
+            if (result_pattern) |output| output.* = object.bits;
+            switch (mode & 0xf0) {
+                event_clear_all => object.bits = 0,
+                event_clear_pattern => object.bits &= ~pattern,
+                else => {},
+            }
+            kernel_object_lock.unlock();
+            return 0;
+        }
+        if (!registered_waiter) {
+            object.waiters += 1;
+            registered_waiter = true;
+        }
+        const observed = object.sequence;
+        kernel_object_lock.unlock();
+
+        const wait_result = threading.waitCurrent(.{
+            .key = event_flag_key_prefix | handle,
+            .observed_sequence = observed,
+            .timeout_microseconds = requested_timeout,
+        }) catch {
+            kernel_object_lock.lock();
+            if (findEventFlag(handle)) |current| current.waiters -= 1;
+            kernel_object_lock.unlock();
+            return KernelError.enosys.raw();
+        };
+        if (wait_result != .timed_out) continue;
+
+        kernel_object_lock.lock();
+        const current = findEventFlag(handle) orelse {
+            kernel_object_lock.unlock();
+            return KernelError.enoent.raw();
+        };
+        if (current.sequence != observed) {
+            kernel_object_lock.unlock();
+            continue;
+        }
+        current.waiters -= 1;
+        if (result_pattern) |output| output.* = current.bits;
+        kernel_object_lock.unlock();
+        if (timeout) |value| value.* = 0;
+        return KernelError.etimedout.raw();
+    }
+}
+
+fn cancelEventFlag(
+    handle: u64,
+    set_pattern: u64,
+    waiter_count: ?*u32,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    if (waiter_count) |output| {
+        if (!memory_api.isGuestRangeAccessible(@intFromPtr(output), @sizeOf(u32))) {
+            return KernelError.efault.raw();
+        }
+    }
+    kernel_object_lock.lock();
+    const object = findEventFlag(handle) orelse {
+        kernel_object_lock.unlock();
+        return KernelError.enoent.raw();
+    };
+    if (waiter_count) |output| output.* = object.waiters;
+    object.bits = set_pattern;
+    const sequence = advanceObjectSequence(&object.sequence);
+    kernel_object_lock.unlock();
+    threading.wakeWaiters(event_flag_key_prefix | handle, sequence, std.math.maxInt(usize));
+    return 0;
+}
+
+fn createSemaphore(
+    output: ?*u32,
+    name: ?[*:0]const u8,
+    attributes: u32,
+    initial_count: i32,
+    maximum_count: i32,
+    option: u64,
+) callconv(abi.guest) i32 {
+    const destination = output orelse return KernelError.einval.raw();
+    if (name == null or attributes > 2 or initial_count < 0 or maximum_count <= 0 or
+        initial_count > maximum_count or option != 0)
+    {
+        return KernelError.einval.raw();
+    }
+    if (!memory_api.isGuestRangeAccessible(@intFromPtr(destination), @sizeOf(u32))) {
+        return KernelError.efault.raw();
+    }
+
+    kernel_object_lock.lock();
+    defer kernel_object_lock.unlock();
+    for (&semaphores) |*object| {
+        if (object.handle != 0) continue;
+        const handle = next_semaphore_handle;
+        next_semaphore_handle +%= 1;
+        if (next_semaphore_handle == 0) next_semaphore_handle = 1;
+        object.* = .{
+            .handle = handle,
+            .count = initial_count,
+            .initial_count = initial_count,
+            .maximum_count = maximum_count,
+        };
+        destination.* = handle;
+        return 0;
+    }
+    return KernelError.enfile.raw();
+}
+
+fn waitSemaphore(
+    handle: u32,
+    needed_count: i32,
+    timeout: ?*u32,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    if (undelivered_exception_waits != 0) {
+        undelivered_exception_waits -= 1;
+        return KernelError.enosys.raw();
+    }
+    const requested_timeout: ?u64 = if (timeout) |value| blk: {
+        if (!memory_api.isGuestRangeAccessible(@intFromPtr(value), @sizeOf(u32))) {
+            return KernelError.efault.raw();
+        }
+        break :blk value.*;
+    } else null;
+
+    var registered_waiter = false;
+    while (true) {
+        kernel_object_lock.lock();
+        const object = findSemaphore(handle) orelse {
+            kernel_object_lock.unlock();
+            return KernelError.enoent.raw();
+        };
+        if (needed_count < 1 or needed_count > object.maximum_count) {
+            kernel_object_lock.unlock();
+            return KernelError.einval.raw();
+        }
+        if (object.count >= needed_count) {
+            object.count -= needed_count;
+            if (registered_waiter) object.waiters -= 1;
+            kernel_object_lock.unlock();
+            return 0;
+        }
+        if (!registered_waiter) {
+            object.waiters += 1;
+            registered_waiter = true;
+        }
+        const observed = object.sequence;
+        kernel_object_lock.unlock();
+
+        const wait_result = threading.waitCurrent(.{
+            .key = semaphore_key_prefix | handle,
+            .observed_sequence = observed,
+            .timeout_microseconds = requested_timeout,
+        }) catch {
+            kernel_object_lock.lock();
+            if (findSemaphore(handle)) |current| current.waiters -= 1;
+            kernel_object_lock.unlock();
+            return KernelError.enosys.raw();
+        };
+        if (wait_result != .timed_out) continue;
+
+        kernel_object_lock.lock();
+        const current = findSemaphore(handle) orelse {
+            kernel_object_lock.unlock();
+            return KernelError.enoent.raw();
+        };
+        if (current.sequence != observed) {
+            kernel_object_lock.unlock();
+            continue;
+        }
+        current.waiters -= 1;
+        kernel_object_lock.unlock();
+        if (timeout) |value| value.* = 0;
+        return KernelError.etimedout.raw();
+    }
+}
+
+fn pollSemaphore(
+    handle: u32,
+    needed_count: i32,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    kernel_object_lock.lock();
+    defer kernel_object_lock.unlock();
+    const object = findSemaphore(handle) orelse return KernelError.enoent.raw();
+    if (needed_count < 1 or needed_count > object.maximum_count) return KernelError.einval.raw();
+    if (object.count < needed_count) return KernelError.ebusy.raw();
+    object.count -= needed_count;
+    return 0;
+}
+
+fn signalSemaphore(
+    handle: u32,
+    signal_count: i32,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    kernel_object_lock.lock();
+    const object = findSemaphore(handle) orelse {
+        kernel_object_lock.unlock();
+        return KernelError.enoent.raw();
+    };
+    if (signal_count <= 0 or object.count > object.maximum_count - signal_count) {
+        kernel_object_lock.unlock();
+        return KernelError.einval.raw();
+    }
+    object.count += signal_count;
+    const sequence = advanceObjectSequence(&object.sequence);
+    kernel_object_lock.unlock();
+    threading.wakeWaiters(semaphore_key_prefix | handle, sequence, @intCast(signal_count));
+    return 0;
+}
+
+fn cancelSemaphore(
+    handle: u32,
+    set_count: i32,
+    waiter_count: ?*u32,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    if (waiter_count) |output| {
+        if (!memory_api.isGuestRangeAccessible(@intFromPtr(output), @sizeOf(u32))) {
+            return KernelError.efault.raw();
+        }
+    }
+    kernel_object_lock.lock();
+    const object = findSemaphore(handle) orelse {
+        kernel_object_lock.unlock();
+        return KernelError.enoent.raw();
+    };
+    if (set_count > object.maximum_count) {
+        kernel_object_lock.unlock();
+        return KernelError.einval.raw();
+    }
+    if (waiter_count) |output| output.* = object.waiters;
+    object.count = if (set_count < 0) object.initial_count else set_count;
+    const sequence = advanceObjectSequence(&object.sequence);
+    kernel_object_lock.unlock();
+    threading.wakeWaiters(semaphore_key_prefix | handle, sequence, std.math.maxInt(usize));
+    return 0;
+}
+
+fn deleteSemaphore(
+    handle: u32,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    kernel_object_lock.lock();
+    const object = findSemaphore(handle) orelse {
+        kernel_object_lock.unlock();
+        return KernelError.enoent.raw();
+    };
+    const sequence = advanceObjectSequence(&object.sequence);
+    object.handle = 0;
+    kernel_object_lock.unlock();
+    threading.wakeWaiters(semaphore_key_prefix | handle, sequence, std.math.maxInt(usize));
+    return 0;
 }
 
 fn posixUnsupported(
@@ -567,13 +1268,17 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceKernelUuidCreate", .function = trace.wrap("sceKernelUuidCreate", &uuidCreate), .expect_id = "Xjoosiw+XPI" },
     .{ .name = "sceKernelFstat", .function = trace.wrap("sceKernelFstat", &kernelUnsupported), .expect_id = "kBwCPsYX-m4" },
     .{ .name = "scePthreadRename", .function = trace.wrap("scePthreadRename", &compatSuccess), .expect_id = "GBUY7ywdULE" },
-    .{ .name = "sceKernelCreateEventFlag", .function = trace.wrap("sceKernelCreateEventFlag", &kernelUnsupported), .expect_id = "BpFoboUJoZU" },
-    .{ .name = "sceKernelCreateSema", .function = trace.wrap("sceKernelCreateSema", &kernelUnsupported), .expect_id = "188x57JYp0g" },
-    .{ .name = "sceKernelSignalSema", .function = trace.wrap("sceKernelSignalSema", &kernelUnsupported), .expect_id = "4czppHBiriw" },
-    .{ .name = "sceKernelWaitEventFlag", .function = trace.wrap("sceKernelWaitEventFlag", &kernelUnsupported), .expect_id = "JTvBflhYazQ" },
-    .{ .name = "sceKernelSetEventFlag", .function = trace.wrap("sceKernelSetEventFlag", &kernelUnsupported), .expect_id = "IOnSvHzqu6A" },
-    .{ .name = "sceKernelWaitSema", .function = trace.wrap("sceKernelWaitSema", &kernelUnsupported), .expect_id = "Zxa0VhQVTsk" },
-    .{ .name = "sceKernelClearEventFlag", .function = trace.wrap("sceKernelClearEventFlag", &kernelUnsupported), .expect_id = "7uhBFWRAS60" },
+    .{ .name = "sceKernelCreateEventFlag", .function = trace.wrap("sceKernelCreateEventFlag", &createEventFlag), .expect_id = "BpFoboUJoZU" },
+    .{ .name = "sceKernelDeleteEventFlag", .function = trace.wrap("sceKernelDeleteEventFlag", &deleteEventFlag), .expect_id = "8mql9OcQnd4" },
+    .{ .name = "sceKernelPollEventFlag", .function = trace.wrap("sceKernelPollEventFlag", &pollEventFlag), .expect_id = "9lvj5DjHZiA" },
+    .{ .name = "sceKernelWaitEventFlag", .function = trace.wrap("sceKernelWaitEventFlag", &waitEventFlag), .expect_id = "JTvBflhYazQ" },
+    .{ .name = "sceKernelSetEventFlag", .function = trace.wrap("sceKernelSetEventFlag", &setEventFlag), .expect_id = "IOnSvHzqu6A" },
+    .{ .name = "sceKernelClearEventFlag", .function = trace.wrap("sceKernelClearEventFlag", &clearEventFlag), .expect_id = "7uhBFWRAS60" },
+    .{ .name = "sceKernelCreateSema", .function = trace.wrap("sceKernelCreateSema", &createSemaphore), .expect_id = "188x57JYp0g" },
+    .{ .name = "sceKernelPollSema", .function = trace.wrap("sceKernelPollSema", &pollSemaphore), .expect_id = "12wOHk8ywb0" },
+    .{ .name = "sceKernelWaitSema", .function = trace.wrap("sceKernelWaitSema", &waitSemaphore), .expect_id = "Zxa0VhQVTsk" },
+    .{ .name = "sceKernelSignalSema", .function = trace.wrap("sceKernelSignalSema", &signalSemaphore), .expect_id = "4czppHBiriw" },
+    .{ .name = "sceKernelCancelSema", .function = trace.wrap("sceKernelCancelSema", &cancelSemaphore), .expect_id = "4DM06U2BNEY" },
     .{ .name = "sceKernelDlsym", .function = trace.wrap("sceKernelDlsym", &kernelUnsupported), .expect_id = "LwG8g3niqwA" },
     .{ .name = "sceKernelLoadStartModule", .function = trace.wrap("sceKernelLoadStartModule", &loadStartModule), .expect_id = "wzvqT4UqKX8" },
     .{ .name = "sceKernelStopUnloadModule", .function = trace.wrap("sceKernelStopUnloadModule", &stopUnloadModule), .expect_id = "QKd0qM58Qes" },
@@ -581,12 +1286,12 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceKernelGetProcessTimeCounterFrequency", .function = trace.wrap("sceKernelGetProcessTimeCounterFrequency", &getProcessTimeCounterFrequency), .expect_id = "BNowx2l588E" },
     .{ .name = "unknown_libkernel_B2n8aDorSH4", .function = trace.wrap("unknown_libkernel_B2n8aDorSH4", &kernelUnsupported), .id_override = "B2n8aDorSH4" },
     .{ .name = "unknown_libkernel_PZQhiiLXRFs", .function = trace.wrap("unknown_libkernel_PZQhiiLXRFs", &kernelUnsupported), .id_override = "PZQhiiLXRFs" },
-    .{ .name = "sceKernelSyncOnAddressWake", .function = trace.wrap("sceKernelSyncOnAddressWake", &kernelUnsupported), .expect_id = "q2y-wDIVWZA" },
-    .{ .name = "sceKernelSyncOnAddressWait", .function = trace.wrap("sceKernelSyncOnAddressWait", &kernelUnsupported), .expect_id = "Hc4CaR6JBL0" },
+    .{ .name = "sceKernelSyncOnAddressWake", .function = trace.wrap("sceKernelSyncOnAddressWake", &syncOnAddressWake), .expect_id = "q2y-wDIVWZA" },
+    .{ .name = "sceKernelSyncOnAddressWait", .function = trace.wrap("sceKernelSyncOnAddressWait", &syncOnAddressWait), .expect_id = "Hc4CaR6JBL0" },
     .{ .name = "sceKernelIsTrinityMode", .function = trace.wrap("sceKernelIsTrinityMode", &isTrinityMode), .expect_id = "tU5e3f9gSiU" },
     .{ .name = "sceKernelSetGPO", .function = trace.wrap("sceKernelSetGPO", &setGpo), .expect_id = "ca7v6Cxulzs" },
-    .{ .name = "sceKernelCancelEventFlag", .function = trace.wrap("sceKernelCancelEventFlag", &kernelUnsupported), .expect_id = "PZku4ZrXJqg" },
-    .{ .name = "sceKernelDeleteSema", .function = trace.wrap("sceKernelDeleteSema", &kernelUnsupported), .expect_id = "R1Jvn8bSCW8" },
+    .{ .name = "sceKernelCancelEventFlag", .function = trace.wrap("sceKernelCancelEventFlag", &cancelEventFlag), .expect_id = "PZku4ZrXJqg" },
+    .{ .name = "sceKernelDeleteSema", .function = trace.wrap("sceKernelDeleteSema", &deleteSemaphore), .expect_id = "R1Jvn8bSCW8" },
     .{ .name = "sceKernelAprResolveFilepathsToIdsAndFileSizes", .function = trace.wrap("sceKernelAprResolveFilepathsToIdsAndFileSizes", &kernelUnsupported), .expect_id = "gEpBkcwxUjw" },
     .{ .name = "sceKernelAprSubmitCommandBufferAndGetResult", .function = trace.wrap("sceKernelAprSubmitCommandBufferAndGetResult", &kernelUnsupported), .expect_id = "ASoW5WE-UPo" },
     .{ .name = "sceKernelAprWaitCommandBuffer", .function = trace.wrap("sceKernelAprWaitCommandBuffer", &kernelUnsupported), .expect_id = "rqwFKI4PAiM" },
@@ -615,8 +1320,9 @@ pub const exports = [_]symbols.Export{
 };
 
 pub const unity_exports = [_]symbols.Export{
-    .{ .name = "sceKernelInstallExceptionHandler", .function = trace.wrap("sceKernelInstallExceptionHandler", &compatSuccess), .expect_id = "WkwEd3N7w0Y" },
-    .{ .name = "sceKernelRaiseException", .function = trace.wrap("sceKernelRaiseException", &compatSuccess), .expect_id = "il03nluKfMk" },
+    .{ .name = "sceKernelInstallExceptionHandler", .function = trace.wrap("sceKernelInstallExceptionHandler", &installExceptionHandler), .expect_id = "WkwEd3N7w0Y" },
+    .{ .name = "sceKernelRemoveExceptionHandler", .function = trace.wrap("sceKernelRemoveExceptionHandler", &removeExceptionHandler), .expect_id = "Qhv5ARAoOEc" },
+    .{ .name = "sceKernelRaiseException", .function = trace.wrap("sceKernelRaiseException", &raiseException), .expect_id = "il03nluKfMk" },
 };
 
 pub const posix_exports = [_]symbols.Export{
@@ -688,4 +1394,136 @@ test "runtime compatibility exports include libc bootstrap data and private NIDs
     try std.testing.expect(db.findByName("__progname", .object) != null);
     try std.testing.expect(db.findByName("__tls_get_addr", .function) != null);
     try std.testing.expect(db.findById("B2n8aDorSH4", .function) != null);
+    try std.testing.expect(db.findByName("sceKernelSyncOnAddressWait", .function) != null);
+    try std.testing.expect(db.findByName("sceKernelSyncOnAddressWake", .function) != null);
+}
+
+const SyncAddressTestBackend = struct {
+    wait_request: ?threading.WaitRequest = null,
+    wake_key: u64 = 0,
+    wake_sequence: u64 = 0,
+    wake_count: usize = 0,
+
+    fn start(_: ?*anyopaque, _: threading.StartRequest) threading.BackendError!void {
+        return error.Unsupported;
+    }
+
+    fn wait(
+        raw: ?*anyopaque,
+        request: threading.WaitRequest,
+    ) threading.BackendError!threading.WaitResult {
+        const self: *SyncAddressTestBackend = @ptrCast(@alignCast(raw.?));
+        self.wait_request = request;
+        return .timed_out;
+    }
+
+    fn wake(
+        raw: ?*anyopaque,
+        key: u64,
+        sequence: u64,
+        maximum_waiters: usize,
+    ) void {
+        const self: *SyncAddressTestBackend = @ptrCast(@alignCast(raw.?));
+        self.wake_key = key;
+        self.wake_sequence = sequence;
+        self.wake_count = maximum_waiters;
+    }
+
+    fn backend(self: *SyncAddressTestBackend) threading.Backend {
+        return .{
+            .context = self,
+            .start_fn = &start,
+            .wait_fn = &wait,
+            .wake_fn = &wake,
+        };
+    }
+};
+
+test "address waits park by generation and matching wakes advance it" {
+    const testing = std.testing;
+    const memory = @import("memory");
+    const loader = @import("loader");
+
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    var tls_registry = loader.TlsRegistry{};
+    defer tls_registry.deinit(testing.allocator);
+    var thread_manager = threading.Manager{};
+    thread_manager.init(testing.allocator, &address_space, &tls_registry);
+    defer thread_manager.deinit();
+    var backend = SyncAddressTestBackend{};
+    thread_manager.setBackend(backend.backend());
+    threading.attachManager(&thread_manager);
+    defer threading.attachManager(null);
+    resetSyncAddresses();
+
+    const address: u64 = 0x1234_0000;
+    try testing.expectEqual(KernelError.einval.raw(), syncOnAddressWait(0, 0, 0, 0, 0, 0));
+    try testing.expectEqual(@as(i32, 0), syncOnAddressWait(address, 0, 0, 0, 0, 0));
+    try testing.expectEqual(address, backend.wait_request.?.key);
+    try testing.expectEqual(@as(u64, 1), backend.wait_request.?.observed_sequence);
+    try testing.expectEqual(sync_address_self_heal_us, backend.wait_request.?.timeout_microseconds.?);
+
+    try testing.expectEqual(@as(i32, 0), syncOnAddressWake(address, 1, 0, 0, 0, 0));
+    try testing.expectEqual(address, backend.wake_key);
+    try testing.expectEqual(@as(u64, 2), backend.wake_sequence);
+    try testing.expectEqual(@as(usize, 1), backend.wake_count);
+
+    try testing.expectEqual(@as(i32, 0), syncOnAddressWait(address, 0, 0, 0, 0, 0));
+    try testing.expectEqual(@as(u64, 2), backend.wait_request.?.observed_sequence);
+    try testing.expectEqual(@as(i32, 0), syncOnAddressWake(address, 0, 0, 0, 0, 0));
+    try testing.expectEqual(std.math.maxInt(usize), backend.wake_count);
+}
+
+test "kernel event flags and semaphores retain and consume their state" {
+    const testing = std.testing;
+    resetKernelObjects();
+
+    const event_name: [:0]const u8 = "render-stop";
+    var event_handle: u64 = 0;
+    try testing.expectEqual(
+        @as(i32, 0),
+        createEventFlag(&event_handle, event_name.ptr, 0x21, 0x2, 0, 0),
+    );
+    try testing.expect(event_handle != 0);
+    try testing.expectEqual(@as(i32, 0), setEventFlag(event_handle, 0x4, 0, 0, 0, 0));
+
+    var observed: u64 = 0;
+    try testing.expectEqual(
+        @as(i32, 0),
+        pollEventFlag(event_handle, 0x4, event_wait_or | event_clear_pattern, &observed, 0, 0),
+    );
+    try testing.expectEqual(@as(u64, 0x6), observed);
+    try testing.expectEqual(
+        KernelError.ebusy.raw(),
+        pollEventFlag(event_handle, 0x4, event_wait_or, &observed, 0, 0),
+    );
+    try testing.expectEqual(@as(i32, 0), clearEventFlag(event_handle, 0, 0, 0, 0, 0));
+    try testing.expectEqual(@as(i32, 0), deleteEventFlag(event_handle, 0, 0, 0, 0, 0));
+
+    const semaphore_name: [:0]const u8 = "render-jobs";
+    var semaphore_handle: u32 = 0;
+    try testing.expectEqual(
+        @as(i32, 0),
+        createSemaphore(&semaphore_handle, semaphore_name.ptr, 0, 2, 3, 0),
+    );
+    try testing.expectEqual(@as(i32, 0), installExceptionHandler(30, 0x1234, 0, 0, 0, 0));
+    try testing.expectEqual(@as(i32, 0), raiseException(0x5678, 30, 0, 0, 0, 0));
+    try testing.expectEqual(
+        KernelError.enosys.raw(),
+        waitSemaphore(semaphore_handle, 1, null, 0, 0, 0),
+    );
+    try testing.expectEqual(
+        KernelError.enosys.raw(),
+        waitSemaphore(semaphore_handle, 1, null, 0, 0, 0),
+    );
+    try testing.expectEqual(@as(i32, 0), pollSemaphore(semaphore_handle, 1, 0, 0, 0, 0));
+    try testing.expectEqual(@as(i32, 0), waitSemaphore(semaphore_handle, 1, null, 0, 0, 0));
+    try testing.expectEqual(
+        KernelError.ebusy.raw(),
+        pollSemaphore(semaphore_handle, 1, 0, 0, 0, 0),
+    );
+    try testing.expectEqual(@as(i32, 0), signalSemaphore(semaphore_handle, 2, 0, 0, 0, 0));
+    try testing.expectEqual(@as(i32, 0), pollSemaphore(semaphore_handle, 2, 0, 0, 0, 0));
+    try testing.expectEqual(@as(i32, 0), deleteSemaphore(semaphore_handle, 0, 0, 0, 0, 0));
 }

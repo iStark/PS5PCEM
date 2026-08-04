@@ -5,7 +5,7 @@
 //!
 //! Guest x86-64 code carries absolute virtual addresses and executes natively,
 //! so a guest address must be the same numeric address in the host process.
-//! `AddressSpace` reserves the console's three usable windows before any image
+//! `AddressSpace` reserves the console's usable windows before any image
 //! is loaded, then commits, protects, and releases 16 KiB page ranges inside
 //! those reservations.
 //!
@@ -103,13 +103,20 @@ pub const system_reserved = Range{
     .end = 0x0f_c000_0000,
 };
 
+/// Fixed device apertures exposed by the guest kernel. The AGC firmware table
+/// and graphics MMIO compatibility mapping both live in this window.
+pub const device = Range{
+    .start = 0x0f_e000_0000,
+    .end = 0x0f_f000_0000,
+};
+
 /// Addresses exposed to title-controlled mappings.
 pub const user = Range{
     .start = 0x70_0000_0000,
     .end = 0xfc_0000_0000,
 };
 
-pub const guest_ranges = [_]Range{ system_managed, system_reserved, user };
+pub const guest_ranges = [_]Range{ system_managed, system_reserved, device, user };
 
 /// The window searched by an address chosen by the emulator.
 pub const Area = enum {
@@ -238,7 +245,7 @@ const Lock = struct {
 pub const AddressSpace = struct {
     allocator: std.mem.Allocator,
     mappings: std.ArrayList(Mapping) = .empty,
-    /// Host-owned pieces of the three guest windows. Windows has permanent
+    /// Host-owned pieces of the guest windows. Windows has permanent
     /// mappings such as KUSER_SHARED_DATA inside the low window, so ownership
     /// is intentionally a list of free extents rather than three booleans.
     reservations: std.ArrayList(Range) = .empty,
@@ -1539,6 +1546,8 @@ test "guest windows match the native layout" {
     try testing.expectEqual(@as(u64, 0x07_ffff_c000), system_managed.end);
     try testing.expectEqual(@as(u64, 0x08_0000_0000), system_reserved.start);
     try testing.expectEqual(@as(u64, 0x0f_c000_0000), system_reserved.end);
+    try testing.expectEqual(@as(u64, 0x0f_e000_0000), device.start);
+    try testing.expectEqual(@as(u64, 0x0f_f000_0000), device.end);
     try testing.expectEqual(@as(u64, 0x70_0000_0000), user.start);
     try testing.expectEqual(@as(u64, 0xfc_0000_0000), user.end);
 }

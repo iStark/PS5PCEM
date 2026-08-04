@@ -29,6 +29,7 @@ zig build module-info -- eboot.bin --names names.txt   # recover published names
 zig build pm4-dump    -- capture.bin   # decode a captured GPU command stream
 zig build graph-info  -- eboot.bin     # map and relocate the reachable PRX graph
 zig build game-run    -- eboot.bin     # load, initialize, and enter the title
+zig build game-run    -- --app0 full/game patched/eboot.bin # use full content with a patched executable
 ```
 
 `module-info` is where the pieces meet. It reads a module, works out every
@@ -292,10 +293,11 @@ packet per line with its word offset, and counts the draws and dispatches:
 
 ## Roadmap
 
-1. Register naming for the banks a draw actually sets up, so a capture reads as
-   render state rather than as numbered slots.
-2. Following `INDIRECT_BUFFER` into the stream it chains to.
-3. A first translation target, once real captures are flowing.
+1. Apply context, shader and user-config register writes to persistent GPU state.
+2. Execute the synchronization, memory-write and flip packets already present
+   in the first captured title DCB.
+3. Follow `INDIRECT_BUFFER` into the stream it chains to.
+4. Feed the resulting state and draw/dispatch events into a Vulkan executor.
 
 ---
 
@@ -313,6 +315,7 @@ intervals in the implementation:
 |---|---:|---:|
 | System managed | `0x00_0004_0000 .. 0x07_FFFF_C000` | just under 32 GiB |
 | System reserved | `0x08_0000_0000 .. 0x0F_C000_0000` | 31 GiB |
+| Device | `0x0F_E000_0000 .. 0x0F_F000_0000` | 256 MiB |
 | User | `0x70_0000_0000 .. 0xFC_0000_0000` | 560 GiB |
 
 These are reservations, not allocations of physical RAM. Pages are committed
@@ -856,10 +859,16 @@ reimplement the graphics API and never reach a device node.
 Mode-switch reads are answered as clear, which is the state of a retail console
 and not an invented value; only the byte count the request itself declares is
 written, through a pointer checked against the guest address space, and only up
-to a bound. Graphics requests are refused with `ENOTTY`. That is deliberate:
-`/dev/gc` is where a driver submits work, and claiming a submission succeeded
-would leave a title waiting on a fence that is never signalled — a hang with
-nothing to explain it, rather than an error naming the request not handled.
+to a bound. The two recovered graphics discovery requests are answered exactly.
+Other graphics requests are refused with `ENOTTY`: queue registration hands
+back handles and addresses the driver will later dereference, so false success
+would replace an actionable error with delayed corruption.
+
+The shipped driver also relies on addresses that look like hints but are part
+of its ABI. Its 2 MiB direct-memory pool remains at `0xfe0000000`, the small
+`/dev/gc` aperture remains at `0xfe0200000`, and the AGC firmware-services table
+therefore lands at the required `0xfe0040000`. Relocating either range makes the
+backported library stop with its own fatal FS-table diagnostic.
 
 **Services this machine does not have** ([src/hle/libs/services.zig](src/hle/libs/services.zig))
 
@@ -895,15 +904,15 @@ handed over later in a single submission. What these have to get right is
 therefore not rendering but bookkeeping — how much room a command takes, and
 that the buffer stays a walkable sequence of commands afterwards.
 
-Each command is written as a correctly formed no-operation of the size the real
-command would have taken, which is not the same as filling the space with
-zeroes. Zeroes decode as a register write of one word, so a buffer of them is
-not merely inert: it is a different, shorter stream that nothing can walk. A
-no-operation states what is true — a command occupied this much room and did
-nothing — and everything after it still parses, including through
-[`gpu.pm4`](src/gpu/pm4.zig). The size a title is told to reserve and the size a
-write consumes are the same number, because a title that asks first and writes
-second will otherwise overrun its buffer or leave a hole nothing accounts for.
+Unimplemented constructors write a correctly formed no-operation of the size
+the real command would have taken, which is not the same as filling the space
+with zeroes. Zeroes decode as a register write of one word and desynchronise the
+rest of the stream. `Dispatch`, `DrawIndex`, and `SetNumInstances` now write
+their real PM4 packets, with a valid no-operation filling the unused part of
+each fixed 16-word AGC slot. Shader constructors validate their AGC headers,
+relocate internal pointers and program addresses, and apply the recovered
+program-register pairs. Everything after them remains walkable through
+[`gpu.pm4`](src/gpu/pm4.zig), while measured and consumed sizes stay identical.
 
 Patch entry points are accepted and change nothing: they edit a field of a
 command already written, usually an address unknown when it was built, and
@@ -932,6 +941,10 @@ and dereferences, so false success crashes it. A submission returns only a
 status and the title is not blocked on it, so reporting failure would abort a
 frame the title had already fully described — and lose the description with it.
 
+The current title reaches two submissions of 480 and 544 dwords. The decoder
+walks 35 and 39 packets respectively and observes one draw plus three dispatches
+in each, which is the first stable execution boundary for the GPU state tracker.
+
 ## Error codes
 
 Two numbering schemes coexist in the guest ABI, and mixing them up is a common
@@ -946,9 +959,11 @@ from leaking into host code where nothing would check it.
 
 ## Roadmap
 
-1. Kernel event flags and semaphores on the existing dispatcher contract.
-2. The `/dev/gc` submission protocol, which is what a shipped graphics driver
-   needs before it will initialize.
+1. Apply the submitted PM4 register and synchronization packets to internal GPU
+   state through an executor interface.
+2. Implement APR/AMPR file resolution and reads for titles whose patched
+   executable reaches streaming before graphics submission.
+3. Recover `/dev/gc` queue-registration outputs for the shipped driver path.
 
 ---
 
@@ -1213,10 +1228,11 @@ linking; the `graph-info` tool enables them by default.
 
 `game-run` continues from that verified graph, initializes the native CPU
 bridge and enters the title while reporting contained guest faults with the
-active initializer, registers, stack words, and relocation context. Position-
-dependent executables which access the PS5 null/low-address window still need
-address translation or instruction fixups on Windows, where those pages cannot
-be identity-mapped.
+active initializer, registers, stack words, and relocation context. Its
+`--app0 <directory>` option lets a sparse patched executable use the complete
+content tree from another directory. Position-dependent executables which
+access the PS5 null/low-address window still need address translation or
+instruction fixups on Windows, where those pages cannot be identity-mapped.
 
 ```zig
 const runtime = @import("runtime");

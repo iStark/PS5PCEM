@@ -277,7 +277,11 @@ pub const Runtime = struct {
             try map.write(value -| 1, w);
             try w.writeAll("\n");
             printed += 1;
-            if (printed >= 24) break;
+            // Captures taken in allocators contain sizes and alignment masks
+            // that can coincidentally point into executable pages and pass the
+            // return-address check. Keep enough candidates to see past those
+            // false positives to the title frame that requested the allocation.
+            if (printed >= 64) break;
         }
         if (printed == 0) try w.writeAll("    nothing on it resolves to loaded code\n");
     }
@@ -371,9 +375,15 @@ pub const Runtime = struct {
         return self.cpu_dispatcher.dispatchInitial(prepared, entry_point, arguments);
     }
 
-    /// Runs executable preinitializers, dependency-ordered module
-    /// initializers, and executable initializers before building the fixed PS5
-    /// entry parameter block and dispatching the process entry point.
+    /// Runs executable preinitializers and dependency-ordered module
+    /// initializers before building the fixed PS5 entry parameter block and
+    /// dispatching the process entry point.
+    ///
+    /// The executable's PS5 CRT entry calls its own `DT_INIT` routine. Calling
+    /// that routine here as well runs global constructors twice; intrusive
+    /// registration lists then contain the same node twice and can become
+    /// cyclic. Shared modules have no process entry to do this work, so their
+    /// initializers remain the runtime's responsibility.
     pub fn dispatchProcess(
         self: *Runtime,
         prepared: hle.libs.kernel_threading.PreparedThread,
@@ -396,11 +406,6 @@ pub const Runtime = struct {
             try self.runInitializerList(prepared, module.init_functions.items);
             module.initializers_ran = true;
         }
-        if (!executable.initializers_ran) {
-            try self.runInitializerList(prepared, executable.init_functions.items);
-            executable.initializers_ran = true;
-        }
-
         const layout = try process.buildEntryLayout(
             &self.address_space.?,
             prepared.stack_address,
@@ -779,7 +784,7 @@ test "runtime owns the optional native CPU bridge lifecycle" {
     try testing.expect(!runtime.native_cpu_bridge.isInitialized());
 }
 
-test "process dispatch orders initializers and builds the PS5 entry parameters" {
+test "process dispatch leaves executable initialization to its CRT entry" {
     var runtime = Runtime{};
     try runtime.init(testing.allocator);
     defer runtime.deinit();
@@ -827,18 +832,18 @@ test "process dispatch orders initializers and builds the PS5 entry parameters" 
     try testing.expectEqual(@as(u64, 0x400), result);
     try testing.expectEqualSlices(
         u64,
-        &.{ 0x101, 0x102, 0x201, 0x301, 0x302, 0x400 },
+        &.{ 0x101, 0x102, 0x201, 0x400 },
         bridge.entries[0..bridge.count],
     );
-    for (bridge.kinds[0..5]) |kind| {
+    for (bridge.kinds[0..3]) |kind| {
         try testing.expectEqual(cpu.EntryKind.module_initializer, kind);
     }
-    try testing.expectEqual(cpu.EntryKind.process_entry, bridge.kinds[5]);
+    try testing.expectEqual(cpu.EntryKind.process_entry, bridge.kinds[3]);
     try testing.expectEqual(@as(u8, 2), bridge.final_argument_count);
     try testing.expectEqual(@as(u64, 0x55), bridge.final_arguments[1]);
     try testing.expectEqual(bridge.final_arguments[0], bridge.final_stack_pointer.?);
     try testing.expect(executable.preinitializers_ran);
-    try testing.expect(executable.initializers_ran);
+    try testing.expect(!executable.initializers_ran);
     try testing.expect(module.initializers_ran);
 
     var encoded: [@sizeOf(process.EntryParams)]u8 = undefined;

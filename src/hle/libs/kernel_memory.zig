@@ -20,6 +20,7 @@ const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const runtime_api = @import("kernel_runtime.zig");
+const filesystem = @import("../filesystem.zig");
 
 const KernelError = errno.KernelError;
 
@@ -503,12 +504,17 @@ fn sceKernelMapDirectMemory(
 
     const requested_address = output.*;
     output.* = 0;
-    const mapped_address = if (map_flags & @as(u32, @intCast(map_fixed)) != 0) fixed: {
+    // Shipped graphics drivers map a direct-memory pool at the hardware
+    // device VA without setting MAP_FIXED. Inside the dedicated device window
+    // the address is nevertheless part of the ABI, not a best-effort hint.
+    const explicit_fixed = map_flags & @as(u32, @intCast(map_fixed)) != 0;
+    const device_request = requested_address != 0 and memory.device.contains(requested_address, len);
+    const mapped_address = if (explicit_fixed or device_request) fixed: {
         if (requested_address == 0 or requested_address % effective_alignment != 0) {
             return KernelError.einval.raw();
         }
         const occupied = address_space.isMapped(requested_address, len);
-        if (occupied and map_flags & map_no_overwrite != 0) {
+        if (occupied and (!explicit_fixed or map_flags & map_no_overwrite != 0)) {
             return KernelError.enomem.raw();
         }
 
@@ -788,6 +794,7 @@ fn sceKernelMapNamedSystemFlexibleMemory(
 
 const posix_map_anonymous: i32 = 0x1000;
 const posix_map_fixed: i32 = 0x0010;
+const posix_map_shared: i32 = 0x0001;
 const posix_prot_read: i32 = 0x1;
 const posix_prot_write: i32 = 0x2;
 const posix_prot_exec: i32 = 0x4;
@@ -807,8 +814,40 @@ fn mmap(
     protection_bits: i32,
     flags: i32,
     descriptor: i32,
-    _: i64,
+    offset: i64,
 ) callconv(abi.guest) i64 {
+    // The graphics driver maps one shared device aperture before its higher
+    // level context exists. It is MMIO on the console; here it is an
+    // identity-mapped, zero-filled compatibility page. The exact device,
+    // offset, and flags make this distinct from pretending that arbitrary
+    // file-backed mappings contain useful data. This is a device virtual
+    // address, so it must remain fixed rather than being relocated into an
+    // ordinary flexible-memory window.
+    if (filesystem.deviceOf(descriptor) == .graphics) {
+        if (address == 0 or len == 0 or offset != 0 or flags != posix_map_shared) {
+            runtime_api.setPosixErrno(errno.Posix.einval);
+            return -1;
+        }
+
+        const rounded = std.mem.alignForward(u64, len, page_size);
+        var mapped = address;
+        const fixed_without_overwrite: i32 = @bitCast(
+            @as(u32, @intCast(map_fixed)) | map_no_overwrite,
+        );
+        const status = mapFlexibleMemory(
+            &mapped,
+            rounded,
+            protection_bits & supported_protection_bits,
+            fixed_without_overwrite,
+            "/dev/gc",
+        );
+        if (status != errno.ok) {
+            runtime_api.setPosixErrno(errno.kernelToPosix(status));
+            return -1;
+        }
+        return @bitCast(mapped);
+    }
+
     if (flags & posix_map_anonymous == 0 or descriptor >= 0) {
         runtime_api.setPosixErrno(errno.Posix.enosys);
         return -1;
@@ -1167,35 +1206,43 @@ pub const exports = [_]symbols.Export{
         .name = "sceKernelMapNamedSystemFlexibleMemory",
         .function = trace.wrap("sceKernelMapNamedSystemFlexibleMemory", &sceKernelMapNamedSystemFlexibleMemory),
         .expect_id = "kc+LEEIYakc",
-    }, .{
+    },
+    .{
         .name = "mmap",
         .function = trace.wrap("mmap", &mmap),
         .expect_id = "BPE9s9vQQXo",
-    }, .{
+    },
+    .{
         .name = "sceKernelAvailableToolMemorySize",
         .function = trace.wrap("sceKernelAvailableToolMemorySize", &availableToolMemorySize),
         .expect_id = "YkwlupG-S4E",
-    }, .{
+    },
+    .{
         .name = "sceKernelAllocateToolMemory",
         .function = trace.wrap("sceKernelAllocateToolMemory", &allocateToolMemory),
         .expect_id = "45Yurf7lZmU",
-    }, .{
+    },
+    .{
         .name = "sceKernelMapToolMemory",
         .function = trace.wrap("sceKernelMapToolMemory", &mapToolMemory),
         .expect_id = "d0vezuPZxtg",
-    }, .{
+    },
+    .{
         .name = "sceKernelReleaseToolMemory",
         .function = trace.wrap("sceKernelReleaseToolMemory", &releaseToolMemory),
         .expect_id = "gO98NioN5FM",
-    }, .{
+    },
+    .{
         .name = "sceKernelGetToolMemoryRange",
         .function = trace.wrap("sceKernelGetToolMemoryRange", &getToolMemoryRange),
         .expect_id = "dkBx0YqFQ+Y",
-    }, .{
+    },
+    .{
         .name = "sceKernelGetPageTableStats",
         .function = trace.wrap("sceKernelGetPageTableStats", &getPageTableStats),
         .expect_id = "tZ2yplY8MBY",
-    }, .{
+    },
+    .{
         .name = "sceKernelMapDirectMemory2",
         .function = trace.wrap("sceKernelMapDirectMemory2", &sceKernelMapDirectMemory2),
         .expect_id = "BQQniolj9tQ",
@@ -1213,7 +1260,8 @@ pub const exports = [_]symbols.Export{
         .name = "sceKernelBatchMap2",
         .function = trace.wrap("sceKernelBatchMap2", &batchMap2),
         .expect_id = "kBJzF8x4SyE",
-    }, .{
+    },
+    .{
         .name = "sceKernelMunmap",
         .function = trace.wrap("sceKernelMunmap", &sceKernelMunmap),
         .expect_id = "cQke9UuBQOk",
@@ -1670,6 +1718,48 @@ test "direct memory maps at an exact guest address" {
     try testing.expectEqual(errno.ok, sceKernelReleaseDirectMemory(start, page_size));
 }
 
+test "direct memory preserves a graphics device-window address without MAP_FIXED" {
+    var address_space = try memory.AddressSpace.initWithDirectMemory(
+        testing.allocator,
+        direct_memory_size,
+    );
+    defer address_space.deinit();
+
+    init(testing.allocator);
+    defer deinit();
+    attachAddressSpace(&address_space);
+
+    const graphics_pool_size: u64 = 0x20_0000;
+    var physical: u64 = 0;
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelAllocateDirectMemory(
+            0,
+            direct_memory_size,
+            graphics_pool_size,
+            graphics_pool_size,
+            0,
+            &physical,
+        ),
+    );
+
+    var mapped = memory.device.start;
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelMapDirectMemory(
+            &mapped,
+            graphics_pool_size,
+            prot_cpu_read | prot_cpu_write | prot_gpu_read | prot_gpu_write,
+            0,
+            physical,
+            graphics_pool_size,
+        ),
+    );
+    try testing.expectEqual(memory.device.start, mapped);
+    try testing.expect(address_space.isMappedAs(mapped, graphics_pool_size, .direct_memory));
+    try testing.expect(address_space.isMapped(mapped + 0x40_000, page_size));
+}
+
 test "a window onto physical memory does not outlive it" {
     // A title hands physical memory back without closing its windows first, and
     // firmware takes them down for it. Refusing the release while a mapping
@@ -1963,6 +2053,44 @@ test "flexible memory maps, queries, protects, unmaps, and reuses ranges" {
     try testing.expectEqual(errno.ok, sceKernelMunmap(reused, page_size));
     try testing.expectEqual(errno.ok, sceKernelAvailableFlexibleMemorySize(&available));
     try testing.expectEqual(flexible_memory_size, available);
+}
+
+test "the graphics device exposes its shared compatibility aperture" {
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    init(testing.allocator);
+    defer deinit();
+    attachAddressSpace(&address_space);
+
+    filesystem.detach();
+    const descriptor = try filesystem.open("/dev/gc", filesystem.O.rdwr);
+    defer filesystem.close(descriptor) catch {};
+
+    const requested: u64 = 0xfe02_00000;
+    const result = mmap(
+        requested,
+        page_size,
+        prot_cpu_write | prot_gpu_write,
+        posix_map_shared,
+        descriptor,
+        0,
+    );
+    try testing.expect(result != -1);
+    const mapped: u64 = @bitCast(result);
+    try testing.expectEqual(requested, mapped);
+    try testing.expect(address_space.isMappedAs(mapped, page_size, .flexible));
+
+    var info = VirtualQueryInfo{};
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelVirtualQuery(mapped, 0, &info, @sizeOf(VirtualQueryInfo)),
+    );
+    try testing.expectEqualStrings("/dev/gc", std.mem.sliceTo(&info.name, 0));
+
+    try testing.expectEqual(
+        @as(i64, -1),
+        mmap(requested, page_size, prot_cpu_write, posix_map_shared, descriptor, 1),
+    );
 }
 
 test "the library registers under the expected identifiers" {

@@ -8,12 +8,13 @@
 //! hardware through exactly one door: a control request on a device descriptor.
 //! Everything a GPU is asked to do arrives here.
 //!
-//! Nothing is carried out yet. What matters for now is that the requests are
-//! *legible*: a request code is not an opaque number but a packed record of
-//! which device group is being addressed, which command it is, which way the
-//! payload travels and how large it is. Decoding it turns a trace of bare
-//! integers into a description of what the driver wanted, which is the
-//! specification any future implementation has to satisfy.
+//! Only the small discovery requests described below are carried out. What
+//! matters for the rest is that every request remains *legible*: a request code
+//! is not an opaque number but a packed record of which device group is being
+//! addressed, which command it is, which way the payload travels and how large
+//! it is. Decoding it turns a trace of bare integers into a description of what
+//! the driver wanted, which is the specification each implementation has to
+//! satisfy.
 //!
 //! ## What a shipped driver asks for
 //!
@@ -24,19 +25,26 @@
 //! obtain.
 //!
 //! - `/dev/gc` `#46`, in/out, 4 bytes. Asked first, with the buffer zeroed.
-//!   Answering non-zero satisfies the driver's GPU presence check: its
-//!   "Cannot initialize the Gpu" diagnostic stops, and it proceeds to `#59`.
+//!   A successful zero reply selects the retail compatibility path, which maps
+//!   the small `/dev/gc` aperture and builds the driver's context. A non-zero
+//!   reply skips that setup and leaves the context null.
+//! - `/dev/gc` `#35`, input, 136 bytes. Installs the trap-handler resources.
+//! - `/dev/gc` `#33`, in/out, 64 bytes. Repeated for the driver's hardware
+//!   queues; the observed payload enumerates queue families and queue indices.
+//! - `/dev/gc` `#52` and `#38`, input, 4 bytes each. Their fields have not yet
+//!   been identified.
 //! - `/dev/gc` `#59`, in/out, 16 bytes. The wrapper fills the buffer with
-//!   `0xff` *before* calling, so the all-ones payload is an unset-output
-//!   sentinel and not a request. It tests only whether the call returned zero,
-//!   then copies all 16 bytes to its caller. What the fields mean is still
-//!   unknown: supplying plausible base/size pairs did not satisfy the library
-//!   above it, so the acceptance test lives elsewhere.
+//!   `0xff` *before* calling and stores the reply in the final 16 bytes of the
+//!   driver's private device pool. Its individual fields are not yet consumed
+//!   by this layer, so the compatibility response clears them.
 //! - `/dev/dipsw` `#6`, out, 4 bytes. Answered here; see below.
 //!
-//! Past that, the driver's global device context is still null and it
-//! dereferences it unchecked. Reaching a first frame therefore means finding
-//! which request populates that context, not adding more replies at random.
+//! The discovery reply is only part of the contract. The driver's 2 MiB direct
+//! pool must remain at `0xfe0000000`, while its small aperture remains at
+//! `0xfe0200000`; `libSceAgc` derives its required FS table address as pool base
+//! plus `0x40000` and fatally rejects a relocated pool. Queue registration is
+//! still refused until its output fields have been recovered rather than being
+//! acknowledged with invented handles.
 
 const std = @import("std");
 const abi = @import("../abi.zig");
@@ -191,6 +199,32 @@ fn announce(descriptor: i32, device: ?filesystem.Device, request: Request, paylo
 /// the size comes from the request rather than from anything verified.
 const maximum_answered_payload: u16 = 8;
 
+/// Request used by the shipped AGC driver to choose its initialization path.
+/// A successful zero reply selects the retail compatibility path and its
+/// `/dev/gc` aperture mapping. Keep the match exact so no later graphics
+/// request is accidentally acknowledged as completed work.
+fn answerGraphicsPresence(request: Request, payload: u64) bool {
+    if (request.group != 0x81 or request.number != 46) return false;
+    if (request.direction != .read_write or request.length != @sizeOf(u32)) return false;
+    if (!memory.isGuestRangeAccessible(payload, request.length)) return false;
+
+    const destination: *[4]u8 = @ptrFromInt(payload);
+    std.mem.writeInt(u32, destination, 0, .little);
+    return true;
+}
+
+/// Clears the driver's small service reply. The firmware table address is not
+/// encoded here: the shipped driver derives it from its fixed device pool.
+fn answerGraphicsServiceQuery(request: Request, payload: u64) bool {
+    if (request.group != 0x81 or request.number != 59) return false;
+    if (request.direction != .read_write or request.length != 16) return false;
+    if (!memory.isGuestRangeAccessible(payload, request.length)) return false;
+
+    const destination: *[16]u8 = @ptrFromInt(payload);
+    @memset(destination, 0);
+    return true;
+}
+
 /// Answers a read of the console's mode switches.
 ///
 /// The switches are development flags, and on a retail console every one of
@@ -225,20 +259,24 @@ fn ioctl(descriptor: i32, request_code: u64, payload: u64) callconv(abi.guest) i
     const request = decode(request_code);
     announce(descriptor, device, request, payload);
 
+    if (device == .graphics and answerGraphicsPresence(request, payload)) return 0;
+    if (device == .graphics and answerGraphicsServiceQuery(request, payload)) return 0;
     if (device == .dip_switches and answerDipSwitch(request, payload)) return 0;
 
     runtime_api.setPosixErrno(errno.Posix.enotty);
     return -1;
 }
 
-/// A private kernel entry point the graphics driver calls.
+/// A private graphics-related capability query used by the shipped driver.
 ///
-/// Its published name has not been recovered, so it is registered by the
-/// identifier the driver imports rather than by a name — a descriptive
-/// placeholder would hash to something else entirely and resolve nothing.
-/// Reported as unimplemented, which is at least true.
-fn unnamedGraphicsKernelCall() callconv(abi.guest) i32 {
-    return errno.KernelError.enosys.raw();
+/// Its published name has not been recovered, so it remains registered by the
+/// identifier the driver imports. Every call site takes no arguments and uses
+/// the result as a boolean to select a hardware-specific memory layout. The
+/// retail profile does not expose that optional layout. Returning false also
+/// keeps the selected sizes on the PS5's 16 KiB page boundary; returning a
+/// kernel error is incorrect because any non-zero value enables the mode.
+fn graphicsMemoryModeEnabled() callconv(abi.guest) i32 {
+    return 0;
 }
 
 pub const exports = [_]symbols.Export{
@@ -246,7 +284,7 @@ pub const exports = [_]symbols.Export{
     .{ .name = "_ioctl", .function = trace.wrap("_ioctl", &ioctl), .expect_id = "wW+k21cmbwQ" },
     .{
         .name = "libkernel:LzoM-wVLJDE",
-        .function = trace.wrap("libkernel:LzoM-wVLJDE", &unnamedGraphicsKernelCall),
+        .function = trace.wrap("libkernel:LzoM-wVLJDE", &graphicsMemoryModeEnabled),
         .id_override = "LzoM-wVLJDE",
     },
 };
@@ -361,17 +399,43 @@ test "a null payload is refused rather than written through" {
     try testing.expectEqual(@as(i64, -1), ioctl(fd, encode(direction_out, 0x88, 6, 4), 0));
 }
 
-test "the graphics device is not answered by the switch reply" {
-    // The two devices share an entry point but nothing else; a submission must
-    // not be absorbed by the reply meant for switches.
+test "the graphics initialization query selects the retail path" {
+    filesystem.detach();
+    const fd = try filesystem.open("/dev/gc", filesystem.O.rdonly);
+    defer filesystem.close(fd) catch {};
+
+    var value: u32 = 0;
+    const request = encode(direction_in | direction_out, 0x81, 46, @sizeOf(u32));
+    try testing.expectEqual(@as(i64, 0), ioctl(fd, request, @intFromPtr(&value)));
+    try testing.expectEqual(@as(u32, 0), value);
+}
+
+test "the graphics service query returns a neutral reply" {
+    filesystem.detach();
+    const fd = try filesystem.open("/dev/gc", filesystem.O.rdonly);
+    defer filesystem.close(fd) catch {};
+
+    var reply = [_]u8{0xff} ** 16;
+    const request = encode(direction_in | direction_out, 0x81, 59, reply.len);
+    try testing.expectEqual(@as(i64, 0), ioctl(fd, request, @intFromPtr(&reply)));
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** 16), &reply);
+}
+
+test "other graphics requests remain refused" {
+    // Presence discovery is not a GPU submission. Only its exact shape may be
+    // answered until the command behind another request is implemented.
     filesystem.detach();
     const fd = try filesystem.open("/dev/gc", filesystem.O.rdonly);
     defer filesystem.close(fd) catch {};
 
     var value: u32 = 0xdead_beef;
-    const request = encode(direction_in | direction_out, 0x81, 46, @sizeOf(u32));
-    try testing.expectEqual(@as(i64, -1), ioctl(fd, request, @intFromPtr(&value)));
+    const other_request = encode(direction_in | direction_out, 0x81, 47, @sizeOf(u32));
+    try testing.expectEqual(@as(i64, -1), ioctl(fd, other_request, @intFromPtr(&value)));
     try testing.expectEqual(@as(u32, 0xdead_beef), value);
+}
+
+test "the private graphics memory mode is disabled for retail" {
+    try testing.expectEqual(@as(i32, 0), graphicsMemoryModeEnabled());
 }
 
 test "device control exports register under published identifiers" {
