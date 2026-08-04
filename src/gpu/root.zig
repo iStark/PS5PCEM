@@ -18,6 +18,7 @@ pub const executor = @import("executor.zig");
 pub const State = state.State;
 pub const DcbExecutor = executor.DcbExecutor;
 pub const DcbBackend = executor.Backend;
+pub const DcbContinuation = executor.Continuation;
 
 test {
     std.testing.refAllDecls(@This());

@@ -124,6 +124,7 @@ pub const State = struct {
     write_data_count: u64 = 0,
     event_count: u64 = 0,
     flip_count: u64 = 0,
+    indirect_buffer_count: u64 = 0,
     draw_count: u64 = 0,
     dispatch_count: u64 = 0,
     instance_count: u32 = 1,

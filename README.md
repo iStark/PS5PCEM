@@ -267,10 +267,17 @@ named commands with their bodies delimited. The next layer is now executable.
 registers across submissions, including zero-valued writes, plus the latest
 synchronization, event and flip state. [`gpu.executor`](src/gpu/executor.zig)
 applies direct, native Gen5 and legacy AGC indirect register lists,
-`ACQUIRE_MEM`, `RELEASE_MEM`,
-32/64-bit `WAIT_REG_MEM`, standard and AGC `WRITE_DATA`, `EVENT_WRITE` and
-`SetFlip`. An unmet wait returns `blocked` and its exact resume word; it never
-changes guest memory to manufacture progress.
+`ACQUIRE_MEM`, `RELEASE_MEM`, 32/64-bit `WAIT_REG_MEM`, standard and AGC
+`WRITE_DATA`, `EVENT_WRITE` and `SetFlip`. An unmet wait returns `blocked` and
+its exact resume word; it never changes guest memory to manufacture progress.
+
+`INDIRECT_BUFFER` is followed recursively in both its ordinary 4-dword and
+conditional 14-dword forms. Chain packets end their parent stream, conditional
+packets retain the branch selected before a wait, and ordinary packets return
+to the next parent command. Guest ranges are read only through the backend;
+unaligned/null targets, active cycles and nesting beyond sixteen stream frames
+are rejected. A blocked child returns a fixed root-to-leaf continuation, so
+resuming it does not replay draws, events or memory writes before the wait.
 
 The executor is deliberately independent of Vulkan and guest-memory ownership.
 Its backend interface supplies checked reads/writes and optional callbacks for
@@ -305,17 +312,16 @@ packet per line with its word offset, and counts the draws and dispatches:
 
 ## Roadmap
 
-1. Follow `INDIRECT_BUFFER` recursively with cycle, depth and range checks.
-2. Add graphics/compute queue scheduling so a blocked DCB is resumed when a
+1. Add graphics/compute queue scheduling so a blocked DCB is resumed when a
    real `RELEASE_MEM` producer publishes its label.
-3. Decode resource descriptors, render/depth targets and PS5 tiling metadata
+2. Decode resource descriptors, render/depth targets and PS5 tiling metadata
    from the tracked registers.
-4. Complete the RDNA2 vector and memory ISA, build control flow and translate
+3. Complete the RDNA2 vector and memory ISA, build control flow and translate
    guest shaders to SPIR-V.
-5. Implement the Vulkan backend: device/queue selection, guest-memory staging,
+4. Implement the Vulkan backend: device/queue selection, guest-memory staging,
    image layout transitions and barriers, pipeline/cache creation, draw and
    dispatch recording, then swapchain presentation through `SetFlip`.
-6. Validate packet/state/shader results against captures before optimizing
+5. Validate packet/state/shader results against captures before optimizing
    asynchronous submission, descriptor caches and pipeline compilation.
 
 ---
@@ -958,9 +964,11 @@ The same submission is applied to persistent graphics/compute
 [`gpu.DcbExecutor`](src/gpu/executor.zig). Register state therefore
 survives between buffers; label writes reach checked guest memory; acquire,
 release, wait, event and flip packets become typed state. A blocked wait is
-reported with its resume word. Cross-queue storage and wake-up are the next
-scheduler step; the executor already exposes the continuation needed for that
-without forcing a label to a satisfying value.
+reported with its complete root/indirect resume path. Indirect chains and
+conditional branches are executed through the same checked guest-memory
+backend. Cross-queue storage and wake-up are the next scheduler step; the
+executor already exposes the continuation needed for that without forcing a
+label to a satisfying value.
 
 Submissions are accepted rather than refused, which is the opposite of the
 choice made for the graphics device, and the difference is what a caller does
