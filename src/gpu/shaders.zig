@@ -305,6 +305,17 @@ pub const StageBindings = struct {
         return @as(?u32, try reader.readU32(try addAddress(address, @as(u64, index) * 4)));
     }
 
+    /// Resolves a V# already resident in scalar user data. This is the direct
+    /// path used by MUBUF instructions before scalar-memory descriptor loads
+    /// are executable: the instruction names the first physical SGPR and the
+    /// dispatch snapshot supplies its four descriptor words.
+    pub fn inlineBufferDescriptor(self: *const StageBindings, resource_sgpr: u32) Error!?resources.BufferDescriptor {
+        if (resource_sgpr < self.scalar_user_data_base) return null;
+        const first: usize = resource_sgpr - self.scalar_user_data_base;
+        if (first + 4 > self.user_data_count) return null;
+        return try resources.decodeBufferDescriptor(self.user_data[first..][0..4]);
+    }
+
     pub fn resolve(
         self: *const StageBindings,
         reader: MemoryReader,
@@ -596,6 +607,25 @@ test "AGC metadata resolves the declared SRT register and descriptors" {
     const buffer = (try bindings.resolve(memory.reader(), .constant_buffer, 0)).?;
     try testing.expectEqual(@as(u64, 0x1234_5000), buffer.descriptor.constant_buffer.address);
     try testing.expectEqual(@as(u64, 64), buffer.descriptor.constant_buffer.size_bytes);
+}
+
+test "compute bindings decode an inline V# by physical SGPR" {
+    var storage = [_]u8{0} ** 0x100;
+    var memory = TestMemory{ .base = 0x3000, .bytes = &storage };
+    var state = gpu_state.State{};
+    try state.writeRegister(.shader, resources.ShaderStage.compute.programRegisterBase(), 0x40);
+    try state.writeRegister(.shader, resources.ShaderStage.compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 8 << 1);
+    const words = [_]u32{ 0x1234_5000, 16 << 16, 4, 0 };
+    for (words, 0..) |word, index| {
+        try state.writeRegister(.shader, resources.ShaderStage.compute.userDataBase() + 4 + @as(u32, @intCast(index)), word);
+    }
+
+    const bindings = try StageBindings.capture(&state, .compute, null, memory.reader());
+    const descriptor = (try bindings.inlineBufferDescriptor(4)).?;
+    try testing.expectEqual(@as(u64, 0x1234_5000), descriptor.address);
+    try testing.expectEqual(@as(u64, 64), descriptor.size_bytes);
+    try testing.expect((try bindings.inlineBufferDescriptor(8)) == null);
 }
 
 test "resource mappings cannot read beyond the declared SRT" {

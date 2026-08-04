@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Artur Strazewicz
 
-//! Deterministic SPIR-V 1.5 writer for the first executable RDNA2 ALU subset.
+//! Deterministic SPIR-V 1.5 writer for executable RDNA2 compute shaders.
 
 const std = @import("std");
 const isa = @import("isa.zig");
@@ -15,9 +15,27 @@ pub const Stage = enum(u32) {
     compute = 5,
 };
 
+/// Static association recovered at a dispatch boundary. GFX10 names a V#
+/// descriptor by its first SGPR; Vulkan names the same resource by an element
+/// in the storage-buffer descriptor array.
+pub const StorageBufferBinding = struct {
+    resource_sgpr: u32,
+    descriptor_index: u32,
+};
+
+/// Scalar user data is captured by the API-neutral GPU state tracker. Supplying
+/// it here lets address operands use the same values that the guest shader saw.
+pub const ScalarRegister = struct {
+    register: u32,
+    value: u32,
+};
+
 pub const Options = struct {
     stage: Stage,
     local_size: [3]u32 = .{ 1, 1, 1 },
+    storage_buffers: []const StorageBufferBinding = &.{},
+    scalar_registers: []const ScalarRegister = &.{},
+    descriptor_array_length: u32 = 64,
 };
 
 pub const Error = std.mem.Allocator.Error || control_flow.Error || error{
@@ -25,6 +43,8 @@ pub const Error = std.mem.Allocator.Error || control_flow.Error || error{
     UnsupportedControlFlow,
     UnsupportedDestination,
     UndefinedRegister,
+    InvalidStorageBinding,
+    UnsupportedBufferAddressing,
 };
 
 pub const Module = struct {
@@ -47,6 +67,7 @@ const State = struct {
 
 const Builder = struct {
     allocator: std.mem.Allocator,
+    annotations: std.ArrayList(u32) = .empty,
     declarations: std.ArrayList(u32) = .empty,
     body: std.ArrayList(u32) = .empty,
     constants: std.ArrayList(Constant) = .empty,
@@ -60,9 +81,12 @@ const Builder = struct {
     bool_type: u32,
     main_function: u32,
     label: u32,
+    storage_bindings: []const StorageBufferBinding,
+    storage_array: u32 = 0,
+    storage_word_pointer_type: u32 = 0,
     scc: u32 = 0,
 
-    fn init(allocator: std.mem.Allocator) Error!Builder {
+    fn init(allocator: std.mem.Allocator, options: Options) Error!Builder {
         var self = Builder{
             .allocator = allocator,
             .void_type = 0,
@@ -73,6 +97,7 @@ const Builder = struct {
             .bool_type = 0,
             .main_function = 0,
             .label = 0,
+            .storage_bindings = options.storage_buffers,
         };
         errdefer self.deinit();
         self.void_type = self.id();
@@ -89,10 +114,59 @@ const Builder = struct {
         try self.emit(&self.declarations, 21, &.{ self.signed_type, 32, 1 }); // OpTypeInt
         try self.emit(&self.declarations, 22, &.{ self.float_type, 32 }); // OpTypeFloat
         try self.emit(&self.declarations, 20, &.{self.bool_type}); // OpTypeBool
+
+        for (options.scalar_registers) |scalar| {
+            if (scalar.register >= 128) return Error.InvalidStorageBinding;
+            self.registers[scalar.register] = .{
+                .id = try self.constant(.bits32, scalar.value),
+                .value_type = .bits32,
+            };
+        }
+
+        if (options.storage_buffers.len != 0) {
+            if (options.stage != .compute or options.descriptor_array_length == 0) {
+                return Error.InvalidStorageBinding;
+            }
+            for (options.storage_buffers, 0..) |binding, index| {
+                if (binding.resource_sgpr >= 128 or
+                    binding.descriptor_index >= options.descriptor_array_length)
+                {
+                    return Error.InvalidStorageBinding;
+                }
+                for (options.storage_buffers[0..index]) |previous| {
+                    if (previous.resource_sgpr == binding.resource_sgpr and
+                        previous.descriptor_index != binding.descriptor_index)
+                    {
+                        return Error.InvalidStorageBinding;
+                    }
+                }
+            }
+
+            const runtime_words = self.id();
+            const storage_block = self.id();
+            const descriptor_count = try self.constant(.bits32, options.descriptor_array_length);
+            const descriptor_array = self.id();
+            const storage_array_pointer = self.id();
+            self.storage_word_pointer_type = self.id();
+            self.storage_array = self.id();
+
+            try self.emit(&self.annotations, 71, &.{ runtime_words, 6, 4 }); // ArrayStride 4
+            try self.emit(&self.annotations, 72, &.{ storage_block, 0, 35, 0 }); // member Offset 0
+            try self.emit(&self.annotations, 71, &.{ storage_block, 2 }); // Block
+            try self.emit(&self.annotations, 71, &.{ self.storage_array, 34, 0 }); // DescriptorSet 0
+            try self.emit(&self.annotations, 71, &.{ self.storage_array, 33, 0 }); // Binding 0
+            try self.emit(&self.declarations, 29, &.{ runtime_words, self.bits_type }); // OpTypeRuntimeArray
+            try self.emit(&self.declarations, 30, &.{ storage_block, runtime_words }); // OpTypeStruct
+            try self.emit(&self.declarations, 28, &.{ descriptor_array, storage_block, descriptor_count }); // OpTypeArray
+            try self.emit(&self.declarations, 32, &.{ storage_array_pointer, 12, descriptor_array }); // ptr StorageBuffer
+            try self.emit(&self.declarations, 32, &.{ self.storage_word_pointer_type, 12, self.bits_type });
+            try self.emit(&self.declarations, 59, &.{ storage_array_pointer, self.storage_array, 12 }); // OpVariable
+        }
         return self;
     }
 
     fn deinit(self: *Builder) void {
+        self.annotations.deinit(self.allocator);
         self.declarations.deinit(self.allocator);
         self.body.deinit(self.allocator);
         self.constants.deinit(self.allocator);
@@ -232,6 +306,60 @@ const Builder = struct {
         self.scc = result;
     }
 
+    fn storageDescriptorIndex(self: *const Builder, resource_sgpr: u32) ?u32 {
+        for (self.storage_bindings) |binding| {
+            if (binding.resource_sgpr == resource_sgpr) return binding.descriptor_index;
+        }
+        return null;
+    }
+
+    fn bufferWordPointer(self: *Builder, inst: instruction.Instruction) Error!u32 {
+        if (self.storage_array == 0 or inst.src1.kind != .sgpr or inst.index_enable) {
+            return Error.UnsupportedBufferAddressing;
+        }
+        if (inst.memory_offset < 0 or @mod(inst.memory_offset, 4) != 0) {
+            return Error.UnsupportedBufferAddressing;
+        }
+        const descriptor_index = self.storageDescriptorIndex(inst.src1.reg) orelse {
+            return Error.InvalidStorageBinding;
+        };
+
+        var byte_offset = try self.constant(.bits32, @intCast(inst.memory_offset));
+        if (inst.offset_enable) {
+            const address = try self.source(inst.src0, .bits32);
+            const sum = self.id();
+            try self.emit(&self.body, 128, &.{ self.bits_type, sum, byte_offset, address }); // OpIAdd
+            byte_offset = sum;
+        }
+        const scalar_offset = try self.source(inst.src2, .bits32);
+        const combined = self.id();
+        try self.emit(&self.body, 128, &.{ self.bits_type, combined, byte_offset, scalar_offset });
+        const word_index = self.id();
+        try self.emit(&self.body, 194, &.{ self.bits_type, word_index, combined, try self.constant(.bits32, 2) }); // OpShiftRightLogical
+
+        const pointer = self.id();
+        try self.emit(&self.body, 65, &.{
+            self.storage_word_pointer_type,
+            pointer,
+            self.storage_array,
+            try self.constant(.bits32, descriptor_index),
+            try self.constant(.bits32, 0),
+            word_index,
+        }); // OpAccessChain descriptor, block member, dword
+        return pointer;
+    }
+
+    fn bufferLoadDword(self: *Builder, inst: instruction.Instruction) Error!void {
+        const result = self.id();
+        try self.emit(&self.body, 61, &.{ self.bits_type, result, try self.bufferWordPointer(inst) }); // OpLoad
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
+    fn bufferStoreDword(self: *Builder, inst: instruction.Instruction) Error!void {
+        const value = try self.source(inst.dst, .bits32);
+        try self.emit(&self.body, 62, &.{ try self.bufferWordPointer(inst), value }); // OpStore
+    }
+
     fn snapshot(self: *const Builder) State {
         return .{ .registers = self.registers, .scc = self.scc, .valid = true };
     }
@@ -267,6 +395,8 @@ const Builder = struct {
             .s_cmp_ge_u32 => try self.comparison(inst, 174, .bits32),
             .s_cmp_lt_u32 => try self.comparison(inst, 176, .bits32),
             .s_cmp_le_u32 => try self.comparison(inst, 178, .bits32),
+            .buffer_load_dword => try self.bufferLoadDword(inst),
+            .buffer_store_dword => try self.bufferStoreDword(inst),
             else => return Error.UnsupportedOpcode,
         }
     }
@@ -426,12 +556,17 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     });
     try appendInstruction(allocator, &words, 17, &.{1});
     try appendInstruction(allocator, &words, 14, &.{ 0, 1 });
-    try appendInstruction(allocator, &words, 15, &.{ @intFromEnum(options.stage), builder.main_function, 0x6e69_616d, 0 });
+    var entry_point: std.ArrayList(u32) = .empty;
+    defer entry_point.deinit(allocator);
+    try entry_point.appendSlice(allocator, &.{ @intFromEnum(options.stage), builder.main_function, 0x6e69_616d, 0 });
+    if (builder.storage_array != 0) try entry_point.append(allocator, builder.storage_array);
+    try appendInstruction(allocator, &words, 15, entry_point.items);
     switch (options.stage) {
         .fragment => try appendInstruction(allocator, &words, 16, &.{ builder.main_function, 7 }),
         .compute => try appendInstruction(allocator, &words, 16, &.{ builder.main_function, 17, options.local_size[0], options.local_size[1], options.local_size[2] }),
         .vertex => {},
     }
+    try words.appendSlice(allocator, builder.annotations.items);
     try words.appendSlice(allocator, builder.declarations.items);
     try appendInstruction(allocator, &words, 54, &.{ builder.void_type, builder.main_function, 0, builder.function_type });
     try words.appendSlice(allocator, builder.body.items);
@@ -443,7 +578,7 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
 /// The writer fails explicitly for operations or control-flow shapes whose
 /// semantics are not implemented; it never emits a placeholder guest shader.
 pub fn translate(allocator: std.mem.Allocator, program: *const instruction.Program, options: Options) Error!Module {
-    var builder = try Builder.init(allocator);
+    var builder = try Builder.init(allocator, options);
     defer builder.deinit();
     var graph = try control_flow.build(allocator, program);
     defer graph.deinit(allocator);
@@ -486,6 +621,31 @@ test "straight-line vector ALU translates to a SPIR-V function" {
     try std.testing.expectEqual(@as(u32, 0x0001_0500), module.words[1]);
     try std.testing.expect(containsOpcode(module.words, 129)); // OpFAdd
     try std.testing.expect(containsOpcode(module.words, 253)); // OpReturn
+}
+
+test "MUBUF dword load and store lower through a descriptor array" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xe030_0000, // buffer_load_dword v0, v0, s4:s7, 0
+        0x8001_0000,
+        0xe070_0004, // buffer_store_dword v0, v0, s4:s7, 0 offset:4
+        0x8001_0000,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    const storage = [_]StorageBufferBinding{.{ .resource_sgpr = 4, .descriptor_index = 7 }};
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .storage_buffers = &storage,
+        .descriptor_array_length = 8,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expect(containsOpcode(module.words, 29)); // OpTypeRuntimeArray
+    try std.testing.expect(containsOpcode(module.words, 65)); // OpAccessChain
+    try std.testing.expect(containsOpcode(module.words, 61)); // OpLoad
+    try std.testing.expect(containsOpcode(module.words, 62)); // OpStore
 }
 
 test "unsupported shader semantics never produce placeholder SPIR-V" {

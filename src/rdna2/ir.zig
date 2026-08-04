@@ -32,6 +32,22 @@ pub const Operation = enum {
     opaque_instruction,
 };
 
+/// Addressing information retained at the API-neutral boundary. Backends can
+/// now reason about guest memory operations without reopening the encoded
+/// instruction words.
+pub const MemoryAccess = struct {
+    byte_offset: i32,
+    data_words: u8,
+    data_bits: u8,
+    resource: operand.Operand,
+    vector_address: operand.Operand,
+    scalar_offset: operand.Operand,
+    index_enabled: bool,
+    offset_enabled: bool,
+    globally_coherent: bool,
+    system_coherent: bool,
+};
+
 pub const Node = struct {
     pc: u32,
     operation: Operation,
@@ -41,6 +57,7 @@ pub const Node = struct {
     dst2: operand.Operand,
     sources: instruction.Sources,
     branch_target: u32,
+    memory_access: ?MemoryAccess,
 };
 
 pub const Module = struct {
@@ -167,9 +184,40 @@ pub fn lower(allocator: std.mem.Allocator, program: *const instruction.Program) 
             .dst2 = inst.dst2,
             .sources = inst.sources(),
             .branch_target = inst.branch_target,
+            .memory_access = if (kind[0] == .memory) .{
+                .byte_offset = inst.memory_offset,
+                .data_words = inst.data_words,
+                .data_bits = inst.data_bits,
+                .resource = inst.src1,
+                .vector_address = inst.src0,
+                .scalar_offset = inst.src2,
+                .index_enabled = inst.index_enable,
+                .offset_enabled = inst.offset_enable,
+                .globally_coherent = inst.globally_coherent,
+                .system_coherent = inst.system_coherent,
+            } else null,
         });
     }
     return module;
+}
+
+test "buffer memory nodes retain descriptor and byte addressing" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xe030_5020, // buffer_load_dword offen offset=0x20
+        0x8002_0103, // v1, v3, s8:s11, soffset=0
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var module = try lower(std.testing.allocator, &program);
+    defer module.deinit(std.testing.allocator);
+
+    const access = module.nodes.items[0].memory_access.?;
+    try std.testing.expectEqual(@as(i32, 0x20), access.byte_offset);
+    try std.testing.expect(access.offset_enabled);
+    try std.testing.expectEqual(@as(u32, 8), access.resource.reg);
+    try std.testing.expectEqual(@as(u32, 3), access.vector_address.reg);
 }
 
 test "vector arithmetic lowers to typed API-neutral nodes" {

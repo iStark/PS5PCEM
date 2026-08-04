@@ -413,22 +413,25 @@ Oberon RB+ MSAA addressing and compute-detile constants. The Vulkan foundation
 now owns a Vulkan 1.2 instance, selects a device with one graphics/compute queue,
 creates the logical device, transient command pool, storage descriptor pool and
 driver pipeline cache, and exposes the existing DCB backend interface. Exact
-guest buffer ranges reuse host-upload/device-local allocations and descriptor
-sets while refreshing their bytes for every submission. `DISPATCH_DIRECT` now
-reads the compute program and thread-group state, translates supported RDNA2
+guest buffer ranges reuse host-upload/device-local allocations while one
+64-element storage descriptor array is rebound from the captured shader state.
+`DISPATCH_DIRECT` now reads the compute program and thread-group state,
+translates supported RDNA2
 through the existing decoder/IR/SPIR-V path, caches the exact resulting module
-and host pipeline, binds the active storage descriptor and submits it through a
-fence. All major shader families are length-safe, and decoded programs have a
-validated CFG, typed IR, SSA selection merges and an executable SPIR-V ALU/SDWA
-path. The remaining stages are:
+and host pipeline, binds the active descriptor array and submits it through a
+fence. Inline V# descriptors and AGC constant-buffer tables are captured at the
+dispatch boundary; `buffer_load_dword`/`buffer_store_dword` lower to SPIR-V
+storage-buffer access, and written device-local ranges are copied back into
+guest memory. All major shader families are length-safe, and decoded programs
+have a validated CFG, typed IR (including memory addressing), SSA selection
+merges and an executable SPIR-V ALU/SDWA/MUBUF path. The remaining stages are:
 
 1. Finish DPP/VOP3/opcode semantics, structured loops and VCC/EXEC divergence,
-   then lower stage interfaces, descriptors, memory, image, interpolation and
-   export operations to SPIR-V.
-2. Map complete `ShaderBindings` resource tables onto descriptor arrays, add
-   image creation/layout transitions and lower buffer/image operations so a
-   translated dispatch has guest-visible effects; then build graphics pipeline
-   state and record real draw work.
+   then extend MUBUF to byte/short/vector and indexed addressing and execute
+   scalar-memory descriptor loads.
+2. Add sampled/storage image and sampler descriptor arrays, image
+   creation/layout transitions, and image operations; then lower graphics stage
+   interfaces, interpolation and exports and record real draw work.
 3. Add surface/swapchain presentation through `SetFlip` and map PM4 acquire,
    release and event scopes onto Vulkan barriers and host-visible labels.
 4. Validate packet/state/shader results against captures before optimizing
@@ -451,9 +454,12 @@ command pool, host/device memory-type selection, one storage descriptor layout
 and pool, and both Vulkan-driver and exact-SPIR-V software pipeline caches.
 `stageGuestStorageBuffer` caches up to 256 exact ranges (each at most the Vulkan
 1.2 minimum 128 MiB storage-buffer range). It never treats guest bytes as
-immutable: a cache hit reuses allocations and its descriptor set but uploads the
-current guest range again. Host-write/transfer/compute/readback barriers keep the
-synchronous path explicit, and readback can verify the device-local contents.
+immutable: a cache hit reuses allocations but uploads the current guest range
+again. `stageGuestStorageBufferAt` independently publishes any cached allocation
+at one of 64 elements in set 0/binding 0; descriptor-set allocation therefore
+does not grow with the buffer cache. Host-write/transfer/compute/readback
+barriers keep the synchronous path explicit, and readback can verify the
+device-local contents.
 
 `dcbBackend` adapts checked guest reads and writes plus draw/dispatch callbacks
 to [`gpu.executor`](src/gpu/executor.zig) without adding a Vulkan dependency to
@@ -463,17 +469,25 @@ supported shader to SPIR-V 1.5, creates or reuses its compute pipeline, binds th
 active storage set and dispatches the packet's XYZ group counts. Errors remain
 explicit: a missing program, unsupported shader semantic or indirect dispatch
 rejects that backend callback and records the exact error. Draw callbacks still
-only count work, and translated ALU shaders do not yet access the bound storage
-descriptor until buffer/image lowering is implemented.
+only count work. Compute dispatch captures scalar user data, optionally resolves
+the AGC header through the embedding callback, maps every declared
+constant-buffer table entry, and associates each executable MUBUF resource SGPR
+with the matching descriptor-array element. The first memory subset is aligned
+32-bit MUBUF load/store without `idxen`; V# descriptors loaded dynamically by
+SMEM, vector-width accesses, atomics and images remain explicit unsupported
+semantics. Ranges touched by a store are synchronously read back and written
+through the checked guest-memory interface.
 
 `vulkan-smoke` is an explicit hardware test rather than part of `zig build test`,
 so machines without a Vulkan runtime can still build and test every module. The
 probe creates a valid compute shader module and pipeline, dispatches it, copies
 known words from coherent host staging through a device-local storage buffer
 into coherent readback memory, inserts the required host/transfer barriers,
-waits on a fence and compares every byte. It then submits a synthetic RDNA2 ALU
-program twice through the real DCB executor, proving the translation and both
-allocation/pipeline cache-hit paths before reading the staged buffer back:
+waits on a fence and compares every byte. It then submits a synthetic RDNA2
+program twice through the real DCB executor: `buffer_load_dword` reads through
+`s0:s3`, `buffer_store_dword` writes through `s4:s7`, and two descriptor-array
+elements carry the value between distinct device-local/guest ranges. The probe
+checks the guest-visible write plus both allocation and pipeline miss/hit paths:
 
 ```sh
 zig build vulkan-smoke

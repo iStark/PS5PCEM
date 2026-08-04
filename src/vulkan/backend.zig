@@ -5,9 +5,10 @@
 //!
 //! This owns the host instance, device, queue and command pool while exposing
 //! the existing API-neutral DCB callback boundary. Supported direct compute
-//! work already crosses RDNA2 decode and SPIR-V pipeline caching; guest resource
-//! operations and draw lowering remain separate. The smoke path proves queue
-//! submission, descriptors, staging, device-local memory and readback.
+//! work crosses RDNA2 decode, ShaderBindings capture, storage-buffer lowering
+//! and SPIR-V pipeline caching; image resources and draw lowering remain
+//! separate. The smoke path proves queue submission, descriptor arrays,
+//! staging, device-local memory and guest-visible readback.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -46,9 +47,12 @@ pub const Error = error{
     ReadbackMismatch,
     GuestMemoryUnavailable,
     GuestMemoryReadFailed,
+    GuestMemoryWriteFailed,
     GuestBufferTooLarge,
     GuestBufferCacheFull,
     GuestBufferNotStaged,
+    InvalidStorageDescriptor,
+    MissingStorageDescriptor,
     ComputePipelineCacheFull,
     MissingComputeProgram,
     InvalidDispatchPacket,
@@ -81,6 +85,7 @@ pub const SmokeReport = struct {
 pub const StagedBuffer = struct {
     buffer: vk.Buffer,
     descriptor_set: vk.DescriptorSet,
+    descriptor_index: u32,
     size: vk.DeviceSize,
     allocation_cache_hit: bool,
 };
@@ -95,6 +100,9 @@ pub const GuestMemory = struct {
     context: ?*anyopaque,
     read: *const fn (?*anyopaque, u64, []u8) bool,
     write: *const fn (?*anyopaque, u64, []const u8) bool,
+    /// Optional AGC registry lookup. A renderer embedding can expose relocated
+    /// shader headers without coupling the API-neutral GPU module back to HLE.
+    shader_header: ?*const fn (?*anyopaque, u64) ?u64 = null,
 };
 
 const WindowsLibrary = struct {
@@ -285,6 +293,7 @@ const OwnedBuffer = struct {
 };
 
 const maximum_guest_buffers = 256;
+pub const maximum_storage_descriptors = 64;
 const maximum_compute_pipelines = 256;
 const maximum_staged_buffer_bytes = 128 * 1024 * 1024;
 
@@ -293,7 +302,6 @@ const GuestBufferEntry = struct {
     size: vk.DeviceSize,
     upload: OwnedBuffer,
     device_local: OwnedBuffer,
-    descriptor_set: vk.DescriptorSet,
 };
 
 const ComputePipelineEntry = struct {
@@ -306,6 +314,38 @@ const ComputePipelineEntry = struct {
 const PipelineLookup = struct {
     pipeline: vk.Pipeline,
     cache_hit: bool,
+};
+
+const ComputeResources = struct {
+    mappings: [maximum_storage_descriptors]gpu.ShaderSpirvStorageBufferBinding = undefined,
+    mapping_count: usize = 0,
+    scalar_registers: [gpu.resources.maximum_user_data_words]gpu.ShaderSpirvScalarRegister = undefined,
+    scalar_count: usize = 0,
+    addresses: [maximum_storage_descriptors]u64 = @splat(0),
+    sizes: [maximum_storage_descriptors]usize = @splat(0),
+    occupied: [maximum_storage_descriptors]bool = @splat(false),
+    writable: [maximum_storage_descriptors]bool = @splat(false),
+
+    fn descriptorForRange(self: *const ComputeResources, address: u64, size: usize) ?u32 {
+        for (self.occupied, 0..) |used, index| {
+            if (used and self.addresses[index] == address and self.sizes[index] == size) return @intCast(index);
+        }
+        return null;
+    }
+
+    fn freeDescriptor(self: *const ComputeResources) ?u32 {
+        for (self.occupied, 0..) |used, index| {
+            if (!used) return @intCast(index);
+        }
+        return null;
+    }
+
+    fn mappingForSgpr(self: *const ComputeResources, resource_sgpr: u32) ?u32 {
+        for (self.mappings[0..self.mapping_count]) |mapping| {
+            if (mapping.resource_sgpr == resource_sgpr) return mapping.descriptor_index;
+        }
+        return null;
+    }
 };
 
 pub const Renderer = struct {
@@ -321,6 +361,7 @@ pub const Renderer = struct {
     command_pool: vk.CommandPool,
     descriptor_set_layout: vk.DescriptorSetLayout,
     descriptor_pool: vk.DescriptorPool,
+    descriptor_set: vk.DescriptorSet,
     compute_pipeline_layout: vk.PipelineLayout,
     driver_pipeline_cache: vk.PipelineCache,
     memory_properties: vk.PhysicalDeviceMemoryProperties,
@@ -413,7 +454,7 @@ pub const Renderer = struct {
         const storage_binding = vk.DescriptorSetLayoutBinding{
             .binding = 0,
             .descriptor_type = vk.descriptor_type_storage_buffer,
-            .descriptor_count = 1,
+            .descriptor_count = maximum_storage_descriptors,
             .stage_flags = vk.shader_stage_compute_bit,
         };
         const descriptor_layout_info = vk.DescriptorSetLayoutCreateInfo{
@@ -428,10 +469,10 @@ pub const Renderer = struct {
 
         const pool_size = vk.DescriptorPoolSize{
             .descriptor_type = vk.descriptor_type_storage_buffer,
-            .descriptor_count = maximum_guest_buffers,
+            .descriptor_count = maximum_storage_descriptors,
         };
         const descriptor_pool_info = vk.DescriptorPoolCreateInfo{
-            .max_sets = maximum_guest_buffers,
+            .max_sets = 1,
             .pool_size_count = 1,
             .pool_sizes = @ptrCast(&pool_size),
         };
@@ -440,6 +481,16 @@ pub const Renderer = struct {
             return Error.DescriptorPoolCreationFailed;
         }
         errdefer device_functions.destroy_descriptor_pool(device, descriptor_pool, null);
+
+        const descriptor_allocate_info = vk.DescriptorSetAllocateInfo{
+            .descriptor_pool = descriptor_pool,
+            .descriptor_set_count = 1,
+            .set_layouts = @ptrCast(&descriptor_set_layout),
+        };
+        var descriptor_set: vk.DescriptorSet = 0;
+        if (device_functions.allocate_descriptor_sets(device, &descriptor_allocate_info, @ptrCast(&descriptor_set)) != vk.success) {
+            return Error.DescriptorSetAllocationFailed;
+        }
 
         const pipeline_layout_info = vk.PipelineLayoutCreateInfo{
             .set_layout_count = 1,
@@ -474,6 +525,7 @@ pub const Renderer = struct {
             .command_pool = command_pool,
             .descriptor_set_layout = descriptor_set_layout,
             .descriptor_pool = descriptor_pool,
+            .descriptor_set = descriptor_set,
             .compute_pipeline_layout = compute_pipeline_layout,
             .driver_pipeline_cache = driver_pipeline_cache,
             .memory_properties = memory_properties,
@@ -519,6 +571,19 @@ pub const Renderer = struct {
     /// current guest bytes on every call. Allocation identity is cached; guest
     /// memory is never assumed immutable between submissions.
     pub fn stageGuestStorageBuffer(self: *Renderer, guest_address: u64, size: usize) (Error || std.mem.Allocator.Error)!StagedBuffer {
+        return self.stageGuestStorageBufferAt(0, guest_address, size);
+    }
+
+    /// Uploads one exact guest range and publishes it at a stable element of
+    /// set 0 / binding 0. Descriptor-array identity is independent from the
+    /// allocation cache, so slots can be rebound between dispatches.
+    pub fn stageGuestStorageBufferAt(
+        self: *Renderer,
+        descriptor_index: u32,
+        guest_address: u64,
+        size: usize,
+    ) (Error || std.mem.Allocator.Error)!StagedBuffer {
+        if (descriptor_index >= maximum_storage_descriptors) return Error.InvalidStorageDescriptor;
         if (size == 0) return Error.GuestMemoryReadFailed;
         if (size > maximum_staged_buffer_bytes) return Error.GuestBufferTooLarge;
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
@@ -546,13 +611,11 @@ pub const Renderer = struct {
                 0x0000_0001,
             );
             errdefer self.destroyBuffer(device_local);
-            const descriptor_set = try self.allocateStorageDescriptor(device_local);
             self.guest_buffers.appendAssumeCapacity(.{
                 .guest_address = guest_address,
                 .size = size,
                 .upload = upload,
                 .device_local = device_local,
-                .descriptor_set = descriptor_set,
             });
             entry_index = self.guest_buffers.items.len - 1;
             self.buffer_cache_misses += 1;
@@ -616,11 +679,13 @@ pub const Renderer = struct {
             null,
         );
         try self.submitOneShot(command_buffer);
-        self.active_descriptor_set = entry.descriptor_set;
+        self.updateStorageDescriptor(descriptor_index, entry.device_local);
+        self.active_descriptor_set = self.descriptor_set;
         self.buffer_uploads += 1;
         return .{
             .buffer = entry.device_local.handle,
-            .descriptor_set = entry.descriptor_set,
+            .descriptor_set = self.descriptor_set,
+            .descriptor_index = descriptor_index,
             .size = entry.size,
             .allocation_cache_hit = cache_hit,
         };
@@ -722,6 +787,118 @@ pub const Renderer = struct {
         var module = try analysis.translateSpirv(self.allocator, .{ .stage = .compute, .local_size = local_size });
         defer module.deinit(self.allocator);
         return self.dispatchSpirv(module.words, group_count);
+    }
+
+    /// Captures compute user data and AGC resource metadata at the DCB boundary,
+    /// stages every declared buffer table entry into the fixed Vulkan array,
+    /// maps each executable MUBUF V# to its array element, then writes modified
+    /// storage ranges back to guest memory after the synchronous submission.
+    pub fn dispatchRdna2State(
+        self: *Renderer,
+        state: *const gpu.State,
+        local_size: [3]u32,
+        group_count: [3]u32,
+    ) anyerror!DispatchReport {
+        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
+        const program_address = gpu.resources.ShaderStage.compute.programAddress(state) orelse {
+            return Error.MissingComputeProgram;
+        };
+        const header_address = if (memory.shader_header) |resolve|
+            resolve(memory.context, program_address)
+        else
+            null;
+        const bindings = try gpu.ShaderBindings.capture(state, .compute, header_address, reader);
+        var analysis = try gpu.shader_analysis.decode(self.allocator, reader, program_address, 4096);
+        defer analysis.deinit(self.allocator);
+        var resources = try self.prepareComputeResources(&bindings, reader, &analysis);
+        var module = try analysis.translateSpirv(self.allocator, .{
+            .stage = .compute,
+            .local_size = local_size,
+            .storage_buffers = resources.mappings[0..resources.mapping_count],
+            .scalar_registers = resources.scalar_registers[0..resources.scalar_count],
+            .descriptor_array_length = maximum_storage_descriptors,
+        });
+        defer module.deinit(self.allocator);
+        const report = try self.dispatchSpirv(module.words, group_count);
+        try self.commitComputeWrites(memory, &resources);
+        return report;
+    }
+
+    fn prepareComputeResources(
+        self: *Renderer,
+        bindings: *const gpu.ShaderBindings,
+        reader: gpu.ShaderMemoryReader,
+        analysis: *const gpu.ShaderAnalysis,
+    ) anyerror!ComputeResources {
+        var result = ComputeResources{};
+        for (bindings.user_data[0..bindings.user_data_count], 0..) |value, index| {
+            const physical = @as(u32, bindings.scalar_user_data_base) + @as(u32, @intCast(index));
+            if (physical >= 128) break;
+            result.scalar_registers[result.scalar_count] = .{ .register = physical, .value = value };
+            result.scalar_count += 1;
+        }
+
+        // Preserve the AGC slot number whenever possible. This makes the host
+        // descriptor table stable across shaders that share one SRT layout.
+        var iterator = bindings.iterator(reader, .constant_buffer);
+        while (try iterator.next()) |binding| {
+            const descriptor = binding.descriptor.constant_buffer;
+            if (descriptor.isNull() or descriptor.size_bytes == 0) continue;
+            const size = std.math.cast(usize, descriptor.size_bytes) orelse return Error.GuestBufferTooLarge;
+            const descriptor_index: u32 = if (binding.mapping.slot < maximum_storage_descriptors and
+                !result.occupied[binding.mapping.slot])
+                binding.mapping.slot
+            else
+                result.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
+            _ = try self.stageGuestStorageBufferAt(descriptor_index, descriptor.address, size);
+            result.occupied[descriptor_index] = true;
+            result.addresses[descriptor_index] = descriptor.address;
+            result.sizes[descriptor_index] = size;
+        }
+
+        for (analysis.program.instructions.items) |inst| {
+            const is_load = inst.opcode == .buffer_load_dword;
+            const is_store = inst.opcode == .buffer_store_dword;
+            if (!is_load and !is_store) continue;
+            if (inst.src1.kind != .sgpr) return Error.MissingStorageDescriptor;
+            const resource_sgpr = inst.src1.reg;
+            if (result.mappingForSgpr(resource_sgpr)) |descriptor_index| {
+                if (is_store) result.writable[descriptor_index] = true;
+                continue;
+            }
+
+            const descriptor = (try bindings.inlineBufferDescriptor(resource_sgpr)) orelse {
+                return Error.MissingStorageDescriptor;
+            };
+            if (descriptor.isNull() or descriptor.size_bytes == 0) return Error.MissingStorageDescriptor;
+            const size = std.math.cast(usize, descriptor.size_bytes) orelse return Error.GuestBufferTooLarge;
+            const descriptor_index = result.descriptorForRange(descriptor.address, size) orelse blk: {
+                const free = result.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
+                _ = try self.stageGuestStorageBufferAt(free, descriptor.address, size);
+                result.occupied[free] = true;
+                result.addresses[free] = descriptor.address;
+                result.sizes[free] = size;
+                break :blk free;
+            };
+            result.mappings[result.mapping_count] = .{
+                .resource_sgpr = resource_sgpr,
+                .descriptor_index = descriptor_index,
+            };
+            result.mapping_count += 1;
+            if (is_store) result.writable[descriptor_index] = true;
+        }
+        return result;
+    }
+
+    fn commitComputeWrites(self: *Renderer, memory: GuestMemory, resources: *const ComputeResources) anyerror!void {
+        for (resources.writable, 0..) |writable, index| {
+            if (!writable) continue;
+            const bytes = try self.allocator.alloc(u8, resources.sizes[index]);
+            defer self.allocator.free(bytes);
+            try self.readbackGuestStorageBuffer(resources.addresses[index], bytes);
+            if (!memory.write(memory.context, resources.addresses[index], bytes)) return Error.GuestMemoryWriteFailed;
+        }
     }
 
     fn getComputePipeline(self: *Renderer, words: []const u32) (Error || std.mem.Allocator.Error)!PipelineLookup {
@@ -944,31 +1121,21 @@ pub const Renderer = struct {
         return .{ .handle = handle, .memory = memory, .size = size };
     }
 
-    fn allocateStorageDescriptor(self: *Renderer, buffer: OwnedBuffer) Error!vk.DescriptorSet {
-        const allocate_info = vk.DescriptorSetAllocateInfo{
-            .descriptor_pool = self.descriptor_pool,
-            .descriptor_set_count = 1,
-            .set_layouts = @ptrCast(&self.descriptor_set_layout),
-        };
-        var descriptor_set: vk.DescriptorSet = 0;
-        if (self.device_functions.allocate_descriptor_sets(self.device, &allocate_info, @ptrCast(&descriptor_set)) != vk.success) {
-            return Error.DescriptorSetAllocationFailed;
-        }
+    fn updateStorageDescriptor(self: *Renderer, descriptor_index: u32, buffer: OwnedBuffer) void {
         const buffer_info = vk.DescriptorBufferInfo{
             .buffer = buffer.handle,
             .offset = 0,
             .range = buffer.size,
         };
         const write = vk.WriteDescriptorSet{
-            .destination_set = descriptor_set,
+            .destination_set = self.descriptor_set,
             .destination_binding = 0,
-            .destination_array_element = 0,
+            .destination_array_element = descriptor_index,
             .descriptor_count = 1,
             .descriptor_type = vk.descriptor_type_storage_buffer,
             .buffer_info = @ptrCast(&buffer_info),
         };
         self.device_functions.update_descriptor_sets(self.device, 1, @ptrCast(&write), 0, null);
-        return descriptor_set;
     }
 
     fn beginOneShot(self: *Renderer) Error!vk.CommandBuffer {
@@ -1107,17 +1274,17 @@ pub const Renderer = struct {
             self.last_dispatch_error = Error.InvalidDispatchPacket;
             return false;
         }
-        const program_address = gpu.resources.ShaderStage.compute.programAddress(state) orelse {
+        if (gpu.resources.ShaderStage.compute.programAddress(state) == null) {
             self.last_dispatch_error = Error.MissingComputeProgram;
             return false;
-        };
+        }
         const local_size = [3]u32{
             computeLocalSize(state, 0x207),
             computeLocalSize(state, 0x208),
             computeLocalSize(state, 0x209),
         };
-        _ = self.dispatchRdna2Address(
-            program_address,
+        _ = self.dispatchRdna2State(
+            state,
             local_size,
             .{ packet.body[0], packet.body[1], packet.body[2] },
         ) catch |err| {
