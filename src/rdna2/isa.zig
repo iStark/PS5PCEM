@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Artur Strazewicz
 
-//! RDNA2 instruction set, limited to what the scalar (SOP*) families need.
+//! RDNA2 instruction set, limited to scalar ALU and scalar-memory families.
 //!
 //! `Opcode` variant names match assembler mnemonics, so `@tagName` replaces the
 //! opcode-to-string lookup table that a hand-written decoder normally carries as
@@ -15,6 +15,7 @@ pub const Family = enum {
     sopk,
     sopc,
     sopp,
+    smem,
 
     pub fn name(self: Family) []const u8 {
         return switch (self) {
@@ -50,9 +51,8 @@ pub const OperandKind = enum {
     exec_z,
     scc,
     m0,
-    /// `null` is a Zig keyword, so the variant name is escaped.
-    /// `@tagName` still yields "null".
-    @"null",
+    /// Discarded destination / zero-valued source selector.
+    null,
     pops_exiting_wave_id,
 };
 
@@ -170,6 +170,18 @@ pub const Opcode = enum {
     s_ttrace_data,
     s_inst_prefetch,
 
+    // SMEM
+    s_load_dword,
+    s_load_dwordx2,
+    s_load_dwordx4,
+    s_load_dwordx8,
+    s_load_dwordx16,
+    s_buffer_load_dword,
+    s_buffer_load_dwordx2,
+    s_buffer_load_dwordx4,
+    s_buffer_load_dwordx8,
+    s_buffer_load_dwordx16,
+
     /// Assembler mnemonic. Identical to the variant name, so no table is needed.
     pub fn mnemonic(self: Opcode) []const u8 {
         return @tagName(self);
@@ -202,6 +214,7 @@ test "family names print upper case" {
     const std = @import("std");
     try std.testing.expectEqualStrings("SOP1", Family.sop1.name());
     try std.testing.expectEqualStrings("SOPP", Family.sopp.name());
+    try std.testing.expectEqualStrings("SMEM", Family.smem.name());
     try std.testing.expectEqualStrings("unknown", Family.unknown.name());
 }
 

@@ -14,6 +14,7 @@ pub const max_raw_words = 5;
 
 pub const Error = operand.DecodeError || error{
     MissingLiteralConstant,
+    TruncatedInstruction,
     UnknownInstructionFamily,
     EmptyProgram,
     MissingEndProgram,
@@ -57,6 +58,12 @@ pub const Instruction = struct {
 
     branch_offset: i32 = 0,
     branch_target: u32 = 0,
+
+    /// Signed byte offset encoded by scalar-memory instructions.
+    memory_offset: i32 = 0,
+    /// Number of consecutive destination dwords loaded by SMEM.
+    data_words: u8 = 0,
+    globally_coherent: bool = false,
 
     unsupported_reason: []const u8 = "",
 

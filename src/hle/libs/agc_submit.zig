@@ -142,6 +142,62 @@ fn traceShaderBinding(state: *const gpu.State, stage: gpu.resources.ShaderStage)
         },
     );
     if (bindings.srt_address) |address| std.debug.print("  srt_address=0x{x}\n", .{address});
+    if (bindings.direct_pointers.fetch_shader) |address| {
+        std.debug.print("  fetch_shader=0x{x}\n", .{address});
+    }
+    if (bindings.direct_pointers.extended_user_data) |address| {
+        std.debug.print(
+            "  extended_user_data=0x{x} words={d}\n",
+            .{ address, metadata.extended_user_data_size_words },
+        );
+    }
+
+    const scalar = gpu.scalar_provenance.evaluatePrefix(shader_memory_reader, &bindings);
+    std.debug.print(
+        "  scalar_prefix instructions={d} stop={s}@0x{x} loads={d}\n",
+        .{ scalar.instruction_count, @tagName(scalar.stop_reason), scalar.stop_pc, scalar.load_count },
+    );
+    for (scalar.loadSlice()[0..@min(scalar.load_count, 8)]) |load| {
+        std.debug.print(
+            "    smem pc=0x{x} address=0x{x} s{d}..+{d} srt={d} roots=0x{x}/0x{x}\n",
+            .{
+                load.pc,
+                load.address,
+                load.destination,
+                load.word_count,
+                @intFromBool(load.from_srt),
+                @as(u8, @bitCast(load.base_sources)),
+                @as(u8, @bitCast(load.offset_sources)),
+            },
+        );
+    }
+
+    if (gpu.VertexShaderBindings.capture(&bindings, shader_memory_reader)) |maybe_vertex| {
+        if (maybe_vertex) |vertex| {
+            std.debug.print(
+                "  vertex_tables buffers=0x{x} attributes=0x{x} inputs={d}\n",
+                .{ vertex.buffer_table_address, vertex.attribute_table_address, vertex.attribute_count },
+            );
+            for (vertex.slice()) |attribute| {
+                std.debug.print(
+                    "    input[{d}] semantic={d} hw={d} vb={d} base=0x{x} stride={d} offset={d} format={d} instance={d}\n",
+                    .{
+                        attribute.location,
+                        attribute.semantic.semantic,
+                        attribute.semantic.hardware_mapping,
+                        attribute.buffer_index,
+                        attribute.buffer.address,
+                        attribute.buffer.stride,
+                        attribute.offset_bytes,
+                        attribute.attribute_format,
+                        @intFromBool(attribute.per_instance),
+                    },
+                );
+            }
+        }
+    } else |err| {
+        std.debug.print("  vertex_tables error={s}\n", .{@errorName(err)});
+    }
     for ([_]gpu.shaders.ResourceKind{
         gpu.shaders.ResourceKind.read_only_texture,
         gpu.shaders.ResourceKind.read_write_texture,

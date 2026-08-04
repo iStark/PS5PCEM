@@ -7,6 +7,7 @@ const std = @import("std");
 const isa = @import("isa.zig");
 const instruction = @import("instruction.zig");
 const scalar_alu = @import("scalar_alu.zig");
+const scalar_memory = @import("scalar_memory.zig");
 
 const Instruction = instruction.Instruction;
 const Program = instruction.Program;
@@ -18,7 +19,7 @@ pub const ProgramError = Error || std.mem.Allocator.Error;
 
 /// Decodes a single instruction from its first word.
 ///
-/// Only the scalar families are implemented so far; everything else is rejected
+/// Only scalar ALU and scalar-memory families are implemented so far; everything else is rejected
 /// with `UnknownInstructionFamily` rather than skipped silently — guessing an
 /// instruction length would desynchronize the rest of the parse.
 pub fn decodeInstruction(pc: u32, code: []const u32, word_index: u32) Error!Instruction {
@@ -41,6 +42,12 @@ pub fn decodeInstruction(pc: u32, code: []const u32, word_index: u32) Error!Inst
             else
                 scalar_alu.decodeSop2(pc, code, word_index),
         };
+    }
+
+    // GFX10 SMEM has the fixed leading pattern 0b110011 and always occupies
+    // two words. It must be selected before the remaining vector/memory space.
+    if (word >> 26 == 0x33) {
+        return scalar_memory.decodeSmem(pc, code, word_index);
     }
 
     // The rest are the vector and memory families, not ported yet.
@@ -140,4 +147,19 @@ test "a branched-over s_endpgm does not end the parse" {
     defer program.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 3), program.instructions.items.len);
+}
+
+test "a program may start with scalar memory" {
+    const code = [_]u32{
+        0xcc04_0201, // s_load_dwordx2 s8:s9, s2:s3, offset
+        0x0000_0010,
+        0xbf81_0000,
+    };
+
+    var program = try decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), program.instructions.items.len);
+    try std.testing.expectEqual(isa.Opcode.s_load_dwordx2, program.instructions.items[0].opcode);
+    try std.testing.expectEqual(@as(u32, 8), program.instructions.items[1].pc);
 }

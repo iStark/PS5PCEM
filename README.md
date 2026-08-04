@@ -106,12 +106,14 @@ machine code.
 
 Early, and deliberately narrow in scope.
 
-**Implemented:** the scalar families — `SOP1`, `SOP2`, `SOPK`, `SOPC`, `SOPP`.
-That covers scalar ALU operations, comparisons, immediate forms, and the whole
-of control flow (branches, `s_endpgm`, `s_waitcnt`, barriers).
+**Implemented:** the scalar families — `SOP1`, `SOP2`, `SOPK`, `SOPC`, `SOPP`
+— plus GFX10 `SMEM` scalar and scalar-buffer loads from one through sixteen
+dwords. That covers scalar ALU operations, comparisons, immediate forms,
+control flow (branches, `s_endpgm`, `s_waitcnt`, barriers), and the descriptor
+loads used by shader resource prologs.
 
-**Not implemented:** the vector and memory families — `VOP1`, `VOP2`, `VOP3`,
-`VOP3P`, `VOPC`, `VINTRP`, `SMEM`, `MUBUF`, `MTBUF`, `FLAT`, `DS`, `MIMG`,
+**Not implemented:** the vector and remaining memory families — `VOP1`, `VOP2`,
+`VOP3`, `VOP3P`, `VOPC`, `VINTRP`, `MUBUF`, `MTBUF`, `FLAT`, `DS`, `MIMG`,
 `EXP`. These are rejected with `error.UnknownInstructionFamily`.
 
 Rejecting them is a deliberate choice rather than an oversight. RDNA2
@@ -211,6 +213,7 @@ yourself; `formatInstruction` and `formatProgram` write text to any
 | [src/rdna2/operand.zig](src/rdna2/operand.zig) | Operand and inline-constant decoding |
 | [src/rdna2/instruction.zig](src/rdna2/instruction.zig) | Instruction representation, literal fetching |
 | [src/rdna2/scalar_alu.zig](src/rdna2/scalar_alu.zig) | SOP family decoders, comptime opcode tables |
+| [src/rdna2/scalar_memory.zig](src/rdna2/scalar_memory.zig) | GFX10 SMEM load decoding and offsets |
 | [src/rdna2/decoder.zig](src/rdna2/decoder.zig) | Dispatch, parsing a program to `s_endpgm` |
 | [src/rdna2/disasm.zig](src/rdna2/disasm.zig) | Textual output |
 | [src/main.zig](src/main.zig) | Command-line front end |
@@ -244,7 +247,8 @@ set.
 1. Validate the decoder against a reference corpus of shader binaries and
    compare output line by line.
 2. `VOP1`/`VOP2`/`VOP3` — the vector ALU, the bulk of any real shader.
-3. `SMEM` and `MUBUF`/`MTBUF` — descriptor and buffer access.
+3. `MUBUF`/`MTBUF`, `FLAT`, `DS`, `MIMG` and `EXP` — remaining memory and
+   export operations.
 4. Basic-block reconstruction from the branch targets the decoder already
    collects.
 
@@ -308,6 +312,25 @@ checked guest-memory reader; offsets beyond `srt_size_dw` are rejected before a
 read. A renderer can iterate resolved read-only/read-write images, samplers and
 constant buffers through the same typed descriptors used by inline resources.
 
+The same snapshot resolves the direct fetch-shader and extended-user-data
+pointers and captures embedded vertex-buffer/vertex-attribute tables as one
+checked unit. Up to 32 input semantics retain their semantic index, hardware
+VGPR mapping, element flags, raw AGC attribute format, byte offset, instance
+rate and decoded 128-bit V# descriptor. Attribute lookup uses the semantic byte,
+not the hardware-mapping byte; incomplete table pairs and indices outside the
+supported domain are rejected before any guest read.
+
+[`gpu.scalar_provenance`](src/gpu/scalar_provenance.zig) initializes physical
+SGPRs from that immutable user-data snapshot (at `s8` for an NGG export
+program), evaluates a bounded scalar shader prefix and performs checked SMEM
+loads. Each known value carries its user-data, immediate, program-counter and
+memory roots; each load records its exact guest address, destination range and
+whether it stays inside the declared SRT. Unknown instruction lengths,
+unresolved branches, inaccessible memory and invalid 48-bit addresses stop the
+walk explicitly instead of inventing state. Draw/dispatch diagnostics expose
+this load plan together with the direct and vertex tables, ready for the shader
+translator to consume.
+
 The executor is deliberately independent of Vulkan and guest-memory ownership.
 Its backend interface supplies checked reads/writes and optional callbacks for
 barriers, releases, waits, events, flips, draws and dispatches. Tests use an
@@ -341,17 +364,14 @@ packet per line with its word offset, and counts the draws and dispatches:
 
 ## Roadmap
 
-1. Add scalar provenance for dynamically derived SRT loads and resolve the
-   direct vertex-buffer, vertex-attribute, fetch-shader and extended-user-data
-   tables needed by translated vertex shaders.
-2. Implement PS5 swizzle address transforms and staging layouts for linear,
+1. Implement PS5 swizzle address transforms and staging layouts for linear,
    256-byte, 4 KiB, 64 KiB, depth and render-target tile modes.
-3. Complete the RDNA2 vector and memory ISA, build control flow and translate
+2. Complete the RDNA2 vector and memory ISA, build control flow and translate
    guest shaders to SPIR-V.
-4. Implement the Vulkan backend: device/queue selection, guest-memory staging,
+3. Implement the Vulkan backend: device/queue selection, guest-memory staging,
    image layout transitions and barriers, pipeline/cache creation, draw and
    dispatch recording, then swapchain presentation through `SetFlip`.
-5. Validate packet/state/shader results against captures before optimizing
+4. Validate packet/state/shader results against captures before optimizing
    asynchronous submission, descriptor caches and pipeline compilation.
 
 ---
@@ -1006,8 +1026,9 @@ published GPU program address and its relocated AGC header. At draw/dispatch
 time the backend can therefore capture the active stage's metadata, hardware
 user-data window and exact SRT root, then resolve guest descriptors through the
 same checked memory interface as indirect DCBs. Live tracing reports each
-unique shader once, including its selected NGG user-data bank, four resource
-counts and the first resolved descriptor of each class.
+unique shader once, including its selected NGG user-data bank, scalar-prefix
+stop reason and SMEM provenance, direct fetch/EUD pointers, embedded vertex
+layout, four resource counts and the first resolved descriptor of each class.
 
 Submissions are accepted rather than refused, which is the opposite of the
 choice made for the graphics device, and the difference is what a caller does

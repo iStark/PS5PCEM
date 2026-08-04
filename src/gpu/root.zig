@@ -15,6 +15,7 @@ pub const pm4 = @import("pm4.zig");
 pub const state = @import("state.zig");
 pub const resources = @import("resources.zig");
 pub const shaders = @import("shaders.zig");
+pub const scalar_provenance = @import("scalar_provenance.zig");
 pub const executor = @import("executor.zig");
 pub const scheduler = @import("scheduler.zig");
 
@@ -24,7 +25,9 @@ pub const BufferDescriptor = resources.BufferDescriptor;
 pub const ImageDescriptor = resources.ImageDescriptor;
 pub const SamplerDescriptor = resources.SamplerDescriptor;
 pub const ShaderBindings = shaders.StageBindings;
+pub const VertexShaderBindings = shaders.VertexBindings;
 pub const ShaderMemoryReader = shaders.MemoryReader;
+pub const ScalarEvaluation = scalar_provenance.Evaluation;
 pub const DcbExecutor = executor.DcbExecutor;
 pub const DcbBackend = executor.Backend;
 pub const DcbContinuation = executor.Continuation;
@@ -37,6 +40,7 @@ test {
     _ = state;
     _ = resources;
     _ = shaders;
+    _ = scalar_provenance;
     _ = executor;
     _ = scheduler;
 }

@@ -24,13 +24,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // The GPU command stream. Depends on nothing: a stream is self-describing,
-    // and keeping it that way means it can be decoded from a capture, from a
-    // library call, or from a device submission without changing.
+    // The GPU command stream and draw-boundary shader state. Shader scalar
+    // provenance reuses the standalone RDNA2 decoder without coupling it to HLE.
     const gpu = b.addModule("gpu", .{
         .root_source_file = b.path("src/gpu/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "rdna2", .module = mod },
+        },
     });
 
     // Guest module images: ELF64 parsing and the dynamic linking tables.

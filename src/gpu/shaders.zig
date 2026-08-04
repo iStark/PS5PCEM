@@ -14,6 +14,7 @@ const gpu_state = @import("state.zig");
 const resources = @import("resources.zig");
 
 pub const maximum_metadata_entries: u16 = 4096;
+pub const maximum_vertex_semantics: u8 = 32;
 pub const illegal_direct_offset: u16 = 0xffff;
 pub const illegal_resource_offset: u16 = 0x7fff;
 const address_mask: u64 = 0x0000_ffff_ffff_ffff;
@@ -26,6 +27,9 @@ pub const Error = resources.Error || error{
     UserDataOutOfRange,
     ResourceOutsideSrt,
     AddressOverflow,
+    IncompleteVertexTables,
+    InvalidVertexSemanticCount,
+    VertexTableIndexOutOfRange,
 };
 
 /// Checked guest-memory access supplied by a capture, the live HLE or a future
@@ -38,19 +42,25 @@ pub const MemoryReader = struct {
         if (!self.read_fn(self.context, address, bytes)) return Error.MemoryReadFailed;
     }
 
-    fn readU16(self: MemoryReader, address: u64) Error!u16 {
+    pub fn readU16(self: MemoryReader, address: u64) Error!u16 {
         var bytes: [2]u8 = undefined;
         try self.read(address, &bytes);
         return std.mem.readInt(u16, &bytes, .little);
     }
 
-    fn readU64(self: MemoryReader, address: u64) Error!u64 {
+    pub fn readU32(self: MemoryReader, address: u64) Error!u32 {
+        var bytes: [4]u8 = undefined;
+        try self.read(address, &bytes);
+        return std.mem.readInt(u32, &bytes, .little);
+    }
+
+    pub fn readU64(self: MemoryReader, address: u64) Error!u64 {
         var bytes: [8]u8 = undefined;
         try self.read(address, &bytes);
         return std.mem.readInt(u64, &bytes, .little);
     }
 
-    fn readWords(self: MemoryReader, address: u64, words: []u32) Error!void {
+    pub fn readWords(self: MemoryReader, address: u64, words: []u32) Error!void {
         var bytes: [8 * @sizeOf(u32)]u8 = undefined;
         const wanted = words.len * @sizeOf(u32);
         std.debug.assert(wanted <= bytes.len);
@@ -107,6 +117,8 @@ pub const Metadata = struct {
     shader_resource_table_size_words: u16,
     direct_resource_count: u16,
     resource_counts: [4]u16,
+    input_semantics_address: u64,
+    input_semantics_count: u32,
 
     pub fn read(reader: MemoryReader, header_address: u64) Error!Metadata {
         const user_data_address = try reader.readU64(try addAddress(header_address, 0x08));
@@ -137,6 +149,9 @@ pub const Metadata = struct {
             }
         }
 
+        const input_semantics_address = try reader.readU64(try addAddress(header_address, 0x30));
+        const input_semantics_count = try reader.readU32(try addAddress(header_address, 0x50));
+
         return .{
             .header_address = header_address,
             .user_data_address = user_data_address,
@@ -146,6 +161,8 @@ pub const Metadata = struct {
             .shader_resource_table_size_words = srt_size,
             .direct_resource_count = direct_count,
             .resource_counts = resource_counts,
+            .input_semantics_address = input_semantics_address,
+            .input_semantics_count = input_semantics_count,
         };
     }
 
@@ -195,6 +212,11 @@ pub const Binding = struct {
     descriptor: Descriptor,
 };
 
+pub const DirectPointers = struct {
+    fetch_shader: ?u64 = null,
+    extended_user_data: ?u64 = null,
+};
+
 /// Immutable binding inputs captured exactly when a draw or dispatch crosses
 /// the DCB backend interface.
 pub const StageBindings = struct {
@@ -202,9 +224,13 @@ pub const StageBindings = struct {
     user_data_stage: resources.ShaderStage,
     program_address: u64,
     user_data_count: u8,
+    /// Physical SGPR index at which USER_DATA[0] enters the scalar program.
+    /// NGG export programs reserve s0:s7 for system inputs.
+    scalar_user_data_base: u8,
     user_data: [resources.maximum_user_data_words]u32,
     metadata: ?Metadata,
     srt_address: ?u64,
+    direct_pointers: DirectPointers,
 
     pub fn capture(
         state: *const gpu_state.State,
@@ -228,15 +254,55 @@ pub const StageBindings = struct {
             try findSrtAddress(value, reader, &user_data, user_data_count)
         else
             null;
+        const direct_pointers = if (metadata) |value| DirectPointers{
+            .fetch_shader = try findDirectPointer(
+                value,
+                reader,
+                &user_data,
+                user_data_count,
+                .sub_pointer_fetch_shader,
+            ),
+            .extended_user_data = try findDirectPointer(
+                value,
+                reader,
+                &user_data,
+                user_data_count,
+                .pointer_extended_user_data,
+            ),
+        } else DirectPointers{};
         return .{
             .stage = stage,
             .user_data_stage = user_data_stage,
             .program_address = program_address,
             .user_data_count = user_data_count,
+            .scalar_user_data_base = if (stage == .export_shader) 8 else 0,
             .user_data = user_data,
             .metadata = metadata,
             .srt_address = srt_address,
+            .direct_pointers = direct_pointers,
         };
+    }
+
+    pub fn directPointer(
+        self: *const StageBindings,
+        reader: MemoryReader,
+        resource_type: DirectResourceType,
+    ) Error!?u64 {
+        const metadata = self.metadata orelse return null;
+        return findDirectPointer(
+            metadata,
+            reader,
+            &self.user_data,
+            self.user_data_count,
+            resource_type,
+        );
+    }
+
+    pub fn extendedUserDataWord(self: *const StageBindings, reader: MemoryReader, index: u16) Error!?u32 {
+        const metadata = self.metadata orelse return null;
+        if (index >= metadata.extended_user_data_size_words) return null;
+        const address = self.direct_pointers.extended_user_data orelse return null;
+        return @as(?u32, try reader.readU32(try addAddress(address, @as(u64, index) * 4)));
     }
 
     pub fn resolve(
@@ -306,6 +372,97 @@ pub const ResourceIterator = struct {
     }
 };
 
+pub const VertexSemantic = packed struct(u32) {
+    semantic: u8,
+    hardware_mapping: u8,
+    size_in_elements: u4,
+    is_f16: u2,
+    is_flat_shaded: bool,
+    is_linear: bool,
+    is_custom: bool,
+    static_vertex_buffer_index: bool,
+    static_attribute: bool,
+    reserved: bool,
+    default_value: u2,
+    default_value_high: u2,
+};
+
+pub const VertexAttribute = struct {
+    location: u8,
+    semantic: VertexSemantic,
+    buffer_index: u8,
+    attribute_format: u16,
+    offset_bytes: u16,
+    per_instance: bool,
+    descriptor_address: u64,
+    buffer: resources.BufferDescriptor,
+
+    pub fn vertexAddress(self: VertexAttribute) Error!u64 {
+        return addAddress(self.buffer.address, self.offset_bytes);
+    }
+};
+
+/// Allocation-free, fully checked view of the AGC vertex semantics, attribute
+/// table and V# table captured at one draw boundary.
+pub const VertexBindings = struct {
+    attribute_table_address: u64,
+    buffer_table_address: u64,
+    attributes: [maximum_vertex_semantics]VertexAttribute = undefined,
+    attribute_count: u8 = 0,
+
+    pub fn capture(bindings: *const StageBindings, reader: MemoryReader) Error!?VertexBindings {
+        const metadata = bindings.metadata orelse return null;
+        const attribute_table = try bindings.directPointer(reader, .pointer_vertex_attribute_table);
+        const buffer_table = try bindings.directPointer(reader, .pointer_vertex_buffer_table);
+        if (attribute_table == null and buffer_table == null) return null;
+        if (attribute_table == null or buffer_table == null) return Error.IncompleteVertexTables;
+        if (metadata.input_semantics_count == 0 or
+            metadata.input_semantics_count > maximum_vertex_semantics or
+            metadata.input_semantics_address == 0)
+        {
+            return Error.InvalidVertexSemanticCount;
+        }
+
+        var result = VertexBindings{
+            .attribute_table_address = attribute_table.?,
+            .buffer_table_address = buffer_table.?,
+        };
+        for (0..metadata.input_semantics_count) |location| {
+            const semantic_word = try reader.readU32(try addAddress(
+                metadata.input_semantics_address,
+                location * 4,
+            ));
+            const semantic: VertexSemantic = @bitCast(semantic_word);
+            if (semantic.semantic >= maximum_vertex_semantics) return Error.VertexTableIndexOutOfRange;
+            const attribute_word = try reader.readU32(try addAddress(
+                attribute_table.?,
+                @as(u64, semantic.semantic) * 4,
+            ));
+            const buffer_index: u8 = @truncate(attribute_word & 0x1f);
+            if (buffer_index >= maximum_vertex_semantics) return Error.VertexTableIndexOutOfRange;
+            const descriptor_address = try addAddress(buffer_table.?, @as(u64, buffer_index) * 16);
+            var descriptor_words: [4]u32 = undefined;
+            try reader.readWords(descriptor_address, &descriptor_words);
+            result.attributes[location] = .{
+                .location = @intCast(location),
+                .semantic = semantic,
+                .buffer_index = buffer_index,
+                .attribute_format = @truncate((attribute_word >> 5) & 0x1ff),
+                .offset_bytes = @truncate((attribute_word >> 14) & 0xfff),
+                .per_instance = attribute_word & (1 << 26) != 0,
+                .descriptor_address = descriptor_address,
+                .buffer = try resources.decodeBufferDescriptor(&descriptor_words),
+            };
+            result.attribute_count += 1;
+        }
+        return result;
+    }
+
+    pub fn slice(self: *const VertexBindings) []const VertexAttribute {
+        return self.attributes[0..self.attribute_count];
+    }
+};
+
 fn findSrtAddress(
     metadata: Metadata,
     reader: MemoryReader,
@@ -314,6 +471,23 @@ fn findSrtAddress(
 ) Error!?u64 {
     if (metadata.shader_resource_table_size_words == 0) return null;
     const first = try metadata.directResourceOffset(reader, .shader_resource_table) orelse return null;
+    if (@as(u32, first) + 1 >= user_data_count) return Error.UserDataOutOfRange;
+    const high = user_data[first + 1];
+    if (high & 0xffff_0000 != 0) return Error.AddressOverflow;
+    const address = @as(u64, user_data[first]) | (@as(u64, high) << 32);
+    if (address == 0) return null;
+    if (address & ~address_mask != 0) return Error.AddressOverflow;
+    return address;
+}
+
+fn findDirectPointer(
+    metadata: Metadata,
+    reader: MemoryReader,
+    user_data: *const [resources.maximum_user_data_words]u32,
+    user_data_count: u8,
+    resource_type: DirectResourceType,
+) Error!?u64 {
+    const first = try metadata.directResourceOffset(reader, resource_type) orelse return null;
     if (@as(u32, first) + 1 >= user_data_count) return Error.UserDataOutOfRange;
     const high = user_data[first + 1];
     if (high & 0xffff_0000 != 0) return Error.AddressOverflow;
@@ -477,5 +651,84 @@ test "NGG export programs select the GS user-data bank" {
     const bindings = try StageBindings.capture(&state, .export_shader, null, memory.reader());
     try testing.expectEqual(resources.ShaderStage.geometry, bindings.user_data_stage);
     try testing.expectEqual(@as(u8, 4), bindings.user_data_count);
+    try testing.expectEqual(@as(u8, 8), bindings.scalar_user_data_base);
     try testing.expectEqual(@as(u32, 0x1122_3344), bindings.user_data[0]);
+}
+
+test "AGC direct vertex fetch and extended-user-data tables are snapshotted" {
+    var storage = [_]u8{0} ** 0x900;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    const header: u64 = 0x4000;
+    const user_metadata: u64 = 0x4100;
+    const direct: u64 = 0x4180;
+    const semantics: u64 = 0x41c0;
+    const attributes: u64 = 0x4200;
+    const buffers: u64 = 0x4300;
+    const extended: u64 = 0x4400;
+    const fetch: u64 = 0x4500;
+    const program: u64 = 0x4600;
+    const vertex_data: u64 = 0x1234_5678_9000;
+
+    memory.writeInt(u64, header + 0x08, user_metadata);
+    memory.writeInt(u64, header + 0x30, semantics);
+    memory.writeInt(u32, header + 0x50, 1);
+    memory.writeInt(u64, user_metadata, direct);
+    for (0..4) |index| memory.writeInt(u64, user_metadata + 0x08 + index * 8, 0);
+    memory.writeInt(u16, user_metadata + 0x28, 2);
+    memory.writeInt(u16, user_metadata + 0x2a, 0);
+    memory.writeInt(u16, user_metadata + 0x2c, 11);
+    for (0..4) |index| memory.writeInt(u16, user_metadata + 0x2e + index * 2, 0);
+    for (0..11) |index| memory.writeInt(u16, direct + index * 2, illegal_direct_offset);
+    memory.writeInt(u16, direct + @as(u16, @intFromEnum(DirectResourceType.sub_pointer_fetch_shader)) * 2, 2);
+    memory.writeInt(u16, direct + @as(u16, @intFromEnum(DirectResourceType.pointer_extended_user_data)) * 2, 4);
+    memory.writeInt(u16, direct + @as(u16, @intFromEnum(DirectResourceType.pointer_vertex_buffer_table)) * 2, 6);
+    memory.writeInt(u16, direct + @as(u16, @intFromEnum(DirectResourceType.pointer_vertex_attribute_table)) * 2, 8);
+
+    // semantic=1, hardware_mapping=4, two elements, f16=1, linear=1.
+    memory.writeInt(u32, semantics, 1 | (4 << 8) | (2 << 16) | (1 << 20) | (1 << 23));
+    // attrib[1]: buffer=3, format=29, offset=8, instance fetch.
+    memory.writeInt(u32, attributes + 4, 3 | (29 << 5) | (8 << 14) | (1 << 26));
+    const descriptor = buffers + 3 * 16;
+    memory.writeInt(u32, descriptor, @truncate(vertex_data));
+    memory.writeInt(u32, descriptor + 4, @as(u32, @truncate(vertex_data >> 32)) | (16 << 16));
+    memory.writeInt(u32, descriptor + 8, 10);
+    memory.writeInt(u32, descriptor + 12, 0);
+    memory.writeInt(u32, extended, 0xfeed_beef);
+    memory.writeInt(u32, extended + 4, 0xcafe_babe);
+
+    var state = gpu_state.State{};
+    try state.writeRegister(.shader, resources.ShaderStage.vertex.programRegisterBase(), @truncate(program >> 8));
+    try state.writeRegister(.shader, resources.ShaderStage.vertex.programRegisterBase() + 1, @truncate(program >> 40));
+    try state.writeRegister(.shader, resources.ShaderStage.vertex.userDataBase() - 1, 10 << 1);
+    const pointers = [_]u64{ fetch, extended, buffers, attributes };
+    const offsets = [_]u8{ 2, 4, 6, 8 };
+    for (pointers, offsets) |pointer, offset| {
+        try state.writeRegister(.shader, resources.ShaderStage.vertex.userDataBase() + offset, @truncate(pointer));
+        try state.writeRegister(.shader, resources.ShaderStage.vertex.userDataBase() + offset + 1, @truncate(pointer >> 32));
+    }
+
+    const bindings = try StageBindings.capture(&state, .vertex, header, memory.reader());
+    try testing.expectEqual(@as(?u64, fetch), bindings.direct_pointers.fetch_shader);
+    try testing.expectEqual(@as(?u64, extended), bindings.direct_pointers.extended_user_data);
+    try testing.expectEqual(@as(?u32, 0xfeed_beef), try bindings.extendedUserDataWord(memory.reader(), 0));
+    try testing.expect((try bindings.extendedUserDataWord(memory.reader(), 2)) == null);
+
+    const vertex = (try VertexBindings.capture(&bindings, memory.reader())).?;
+    try testing.expectEqual(@as(u8, 1), vertex.attribute_count);
+    const attribute = vertex.slice()[0];
+    try testing.expectEqual(@as(u8, 1), attribute.semantic.semantic);
+    try testing.expectEqual(@as(u8, 4), attribute.semantic.hardware_mapping);
+    try testing.expectEqual(@as(u16, 29), attribute.attribute_format);
+    try testing.expectEqual(@as(u16, 8), attribute.offset_bytes);
+    try testing.expect(attribute.per_instance);
+    try testing.expectEqual(vertex_data, attribute.buffer.address);
+    try testing.expectEqual(@as(u16, 16), attribute.buffer.stride);
+    try testing.expectEqual(vertex_data + 8, try attribute.vertexAddress());
+
+    // A partially supplied embedded layout must fail as one unit.
+    memory.writeInt(u16, direct + @as(u16, @intFromEnum(DirectResourceType.pointer_vertex_attribute_table)) * 2, illegal_direct_offset);
+    try testing.expectError(
+        Error.IncompleteVertexTables,
+        VertexBindings.capture(&bindings, memory.reader()),
+    );
 }

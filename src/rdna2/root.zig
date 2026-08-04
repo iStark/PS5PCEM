@@ -3,13 +3,14 @@
 
 //! rdna2 — a disassembler for RDNA2 scalar instructions.
 //!
-//! Implements the SOP1/SOP2/SOPK/SOPC/SOPP families; the vector and memory
-//! families are rejected with an explicit error for now.
+//! Implements SOP1/SOP2/SOPK/SOPC/SOPP and GFX10 SMEM; vector and remaining
+//! memory families are rejected with an explicit error for now.
 
 pub const isa = @import("isa.zig");
 pub const operand = @import("operand.zig");
 pub const instruction = @import("instruction.zig");
 pub const scalar_alu = @import("scalar_alu.zig");
+pub const scalar_memory = @import("scalar_memory.zig");
 pub const decoder = @import("decoder.zig");
 pub const disasm = @import("disasm.zig");
 
@@ -33,6 +34,7 @@ test {
     _ = operand;
     _ = instruction;
     _ = scalar_alu;
+    _ = scalar_memory;
     _ = decoder;
     _ = disasm;
 }

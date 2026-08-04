@@ -28,7 +28,7 @@ pub fn formatOperand(op: Operand, w: *Writer) Writer.Error!void {
         .scc => try w.writeAll("scc"),
         .m0 => try w.writeAll("m0"),
         .pops_exiting_wave_id => try w.writeAll("pops_exiting_wave_id"),
-        .@"null" => try w.writeAll("null"),
+        .null => try w.writeAll("null"),
         .unknown => try w.writeAll("unknown"),
     }
 }
@@ -74,6 +74,11 @@ pub fn formatInstruction(inst: Instruction, w: *Writer) Writer.Error!void {
         try formatOperand(src, w);
         need_comma = true;
     }
+
+    if (inst.family == .smem) {
+        try w.print(" offset:{d}", .{inst.memory_offset});
+        if (inst.globally_coherent) try w.writeAll(" glc");
+    }
 }
 
 /// Prints a whole decoded program, one instruction per line.
@@ -92,6 +97,7 @@ pub fn bufPrintInstruction(buf: []u8, inst: Instruction) ![]const u8 {
 }
 
 const scalar_alu = @import("scalar_alu.zig");
+const scalar_memory = @import("scalar_memory.zig");
 
 test "printing s_mov_b32" {
     const code = [_]u32{0xbe80_0301};
@@ -144,6 +150,17 @@ test "printing an unimplemented instruction" {
     var buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings(
         "0x00000000: unsupported family=SOP1 opcode=0x02 raw=[0xbe800200] reason=SOP1 opcode is not implemented",
+        try bufPrintInstruction(&buf, inst),
+    );
+}
+
+test "printing scalar memory includes its byte offset" {
+    const code = [_]u32{ 0xcc04_0201, 0x0000_0010 };
+    const inst = try scalar_memory.decodeSmem(0, &code, 0);
+
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "0x00000000: s_load_dwordx2 s8, s2, s0 offset:16",
         try bufPrintInstruction(&buf, inst),
     );
 }
