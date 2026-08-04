@@ -16,9 +16,6 @@ pub const DecodeError = error{
 
 /// A single instruction operand.
 ///
-/// Modifiers (SDWA/DPP/op_sel) belong to the vector families and are not
-/// populated yet; the fields are reserved so the struct does not change shape
-/// once VOP* lands.
 pub const Operand = struct {
     kind: OperandKind = .unknown,
     /// Bit pattern of the value, for constants and literals.
@@ -28,6 +25,25 @@ pub const Operand = struct {
     float_val: f32 = 0.0,
     /// Register index for `sgpr`/`vgpr`.
     reg: u32 = 0,
+
+    // Per-operand vector modifiers. Keeping them beside the operand makes the
+    // decoded instruction independent of the source encoding (VOP3/SDWA/DPP).
+    sdwa_sel: u3 = 6,
+    sdwa_dst_unused: u2 = 0,
+    omod: u2 = 0,
+    dpp_ctrl: u9 = 0,
+    dpp_row_mask: u4 = 0xf,
+    dpp_bank_mask: u4 = 0xf,
+    sdwa_sext: bool = false,
+    dpp_fetch_inactive: bool = false,
+    dpp_bound_ctrl: bool = false,
+    op_sel: bool = false,
+    op_sel_hi: bool = false,
+    negate: bool = false,
+    negate_hi: bool = false,
+    absolute: bool = false,
+    clamp: bool = false,
+    dpp: bool = false,
 
     /// Whether this operand refers to a literal stored in the following word.
     pub fn isLiteral(self: Operand) bool {
@@ -78,7 +94,7 @@ pub fn decodeScalarSource(code: u32) DecodeError!Operand {
         106 => .{ .kind = .vcc_lo },
         107 => .{ .kind = .vcc_hi },
         124 => .{ .kind = .m0 },
-        125 => .{ .kind = .@"null" },
+        125 => .{ .kind = .null },
         126 => .{ .kind = .exec_lo },
         127 => .{ .kind = .exec_hi },
         239 => .{ .kind = .pops_exiting_wave_id },
@@ -107,7 +123,7 @@ pub fn decodeScalarDestination(code: u32) DecodeError!Operand {
         106 => .{ .kind = .vcc_lo },
         107 => .{ .kind = .vcc_hi },
         124 => .{ .kind = .m0 },
-        125 => .{ .kind = .@"null" },
+        125 => .{ .kind = .null },
         126 => .{ .kind = .exec_lo },
         127 => .{ .kind = .exec_hi },
         else => DecodeError.UnsupportedScalarDestination,

@@ -13,6 +13,8 @@ const Operand = operand.Operand;
 const Writer = std.Io.Writer;
 
 pub fn formatOperand(op: Operand, w: *Writer) Writer.Error!void {
+    if (op.negate) try w.writeAll("-");
+    if (op.absolute) try w.writeAll("abs(");
     switch (op.kind) {
         .literal_constant => try w.print("0x{x:0>8}", .{op.value}),
         .integer_inline_constant => try w.print("{d}", .{op.signed_val}),
@@ -31,6 +33,7 @@ pub fn formatOperand(op: Operand, w: *Writer) Writer.Error!void {
         .null => try w.writeAll("null"),
         .unknown => try w.writeAll("unknown"),
     }
+    if (op.absolute) try w.writeAll(")");
 }
 
 fn formatRawWords(inst: Instruction, w: *Writer) Writer.Error!void {
@@ -78,6 +81,21 @@ pub fn formatInstruction(inst: Instruction, w: *Writer) Writer.Error!void {
     if (inst.family == .smem) {
         try w.print(" offset:{d}", .{inst.memory_offset});
         if (inst.globally_coherent) try w.writeAll(" glc");
+    } else switch (inst.family) {
+        .mubuf, .mtbuf, .flat, .ds => {
+            try w.print(" offset:{d}", .{inst.memory_offset});
+            if (inst.index_enable) try w.writeAll(" idxen");
+            if (inst.offset_enable) try w.writeAll(" offen");
+            if (inst.globally_coherent) try w.writeAll(" glc");
+            if (inst.system_coherent) try w.writeAll(" slc");
+        },
+        .mimg => try w.print(" dmask:0x{x} dim:{s}", .{ inst.data_mask, @tagName(inst.image_dimension) }),
+        .exp => try w.print(" target:{d} en:0x{x}{s}", .{
+            inst.export_target,
+            inst.export_enable,
+            if (inst.export_done) " done" else "",
+        }),
+        else => {},
     }
 }
 
@@ -155,7 +173,7 @@ test "printing an unimplemented instruction" {
 }
 
 test "printing scalar memory includes its byte offset" {
-    const code = [_]u32{ 0xcc04_0201, 0x0000_0010 };
+    const code = [_]u32{ 0xf404_0201, 0x0000_0010 };
     const inst = try scalar_memory.decodeSmem(0, &code, 0);
 
     var buf: [128]u8 = undefined;

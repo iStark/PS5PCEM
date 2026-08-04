@@ -8,6 +8,8 @@ const isa = @import("isa.zig");
 const instruction = @import("instruction.zig");
 const scalar_alu = @import("scalar_alu.zig");
 const scalar_memory = @import("scalar_memory.zig");
+const vector_alu = @import("vector_alu.zig");
+const vector_memory = @import("vector_memory.zig");
 
 const Instruction = instruction.Instruction;
 const Program = instruction.Program;
@@ -19,15 +21,16 @@ pub const ProgramError = Error || std.mem.Allocator.Error;
 
 /// Decodes a single instruction from its first word.
 ///
-/// Only scalar ALU and scalar-memory families are implemented so far; everything else is rejected
-/// with `UnknownInstructionFamily` rather than skipped silently — guessing an
-/// instruction length would desynchronize the rest of the parse.
+/// Every GFX10 family used by PS5 shaders is dispatched with its architectural
+/// minimum length. Unknown opcodes inside a known family are returned as
+/// `.unsupported`, which preserves synchronization and useful diagnostics.
 pub fn decodeInstruction(pc: u32, code: []const u32, word_index: u32) Error!Instruction {
     const word = code[word_index];
 
-    // Top bit clear -> VOP2 (not implemented yet).
+    // Top bit clear is the compact VOP2 space; opcodes 0x3e/0x3f select
+    // compact VOPC/VOP1 respectively.
     if (word & 0x8000_0000 == 0) {
-        return Error.UnknownInstructionFamily;
+        return vector_alu.decodeVop2(pc, code, word_index);
     }
 
     // Leading 0b10 -> the scalar families.
@@ -44,14 +47,19 @@ pub fn decodeInstruction(pc: u32, code: []const u32, word_index: u32) Error!Inst
         };
     }
 
-    // GFX10 SMEM has the fixed leading pattern 0b110011 and always occupies
-    // two words. It must be selected before the remaining vector/memory space.
-    if (word >> 26 == 0x33) {
-        return scalar_memory.decodeSmem(pc, code, word_index);
-    }
-
-    // The rest are the vector and memory families, not ported yet.
-    return Error.UnknownInstructionFamily;
+    return switch (word >> 26) {
+        0x32 => vector_alu.decodeVintrp(pc, code, word_index),
+        0x33, 0x3f => vector_alu.decodeVop3p(pc, code, word_index),
+        0x34, 0x35 => vector_alu.decodeVop3(pc, code, word_index),
+        0x36 => vector_memory.decodeDs(pc, code, word_index),
+        0x37 => vector_memory.decodeFlat(pc, code, word_index),
+        0x38 => vector_memory.decodeMubuf(pc, code, word_index),
+        0x3a => vector_memory.decodeMtbuf(pc, code, word_index),
+        0x3c => vector_memory.decodeMimg(pc, code, word_index),
+        0x3d => scalar_memory.decodeSmem(pc, code, word_index),
+        0x3e => vector_memory.decodeExp(pc, code, word_index),
+        else => Error.UnknownInstructionFamily,
+    };
 }
 
 /// Parses a shader up to `s_endpgm`.
@@ -151,7 +159,7 @@ test "a branched-over s_endpgm does not end the parse" {
 
 test "a program may start with scalar memory" {
     const code = [_]u32{
-        0xcc04_0201, // s_load_dwordx2 s8:s9, s2:s3, offset
+        0xf404_0201, // s_load_dwordx2 s8:s9, s2:s3, offset
         0x0000_0010,
         0xbf81_0000,
     };
@@ -162,4 +170,36 @@ test "a program may start with scalar memory" {
     try std.testing.expectEqual(@as(usize, 2), program.instructions.items.len);
     try std.testing.expectEqual(isa.Opcode.s_load_dwordx2, program.instructions.items[0].opcode);
     try std.testing.expectEqual(@as(u32, 8), program.instructions.items[1].pc);
+}
+
+test "all GFX10 major families dispatch with architectural lengths" {
+    const Fixture = struct {
+        words: [5]u32,
+        family: isa.Family,
+        count: u32,
+    };
+    const fixtures = [_]Fixture{
+        .{ .words = .{ 0, 0, 0, 0, 0 }, .family = .vop2, .count = 1 },
+        .{ .words = .{ 0xc800_0000, 0, 0, 0, 0 }, .family = .vintrp, .count = 1 },
+        .{ .words = .{ 0xcc00_0000, 0, 0, 0, 0 }, .family = .vop3p, .count = 2 },
+        .{ .words = .{ 0xd000_0000, 0, 0, 0, 0 }, .family = .vop3, .count = 2 },
+        .{ .words = .{ 0xd800_0000, 0, 0, 0, 0 }, .family = .ds, .count = 2 },
+        .{ .words = .{ 0xdc00_0000, 0, 0, 0, 0 }, .family = .flat, .count = 2 },
+        .{ .words = .{ 0xe000_0000, 0, 0, 0, 0 }, .family = .mubuf, .count = 2 },
+        .{ .words = .{ 0xe800_0000, 0, 0, 0, 0 }, .family = .mtbuf, .count = 2 },
+        .{ .words = .{ 0xf000_0000, 0, 0, 0, 0 }, .family = .mimg, .count = 2 },
+        .{ .words = .{ 0xf400_0000, 0, 0, 0, 0 }, .family = .smem, .count = 2 },
+        .{ .words = .{ 0xf800_0000, 0, 0, 0, 0 }, .family = .exp, .count = 2 },
+        .{ .words = .{ 0xfc00_0000, 0, 0, 0, 0 }, .family = .vop3p, .count = 2 },
+    };
+    for (fixtures) |fixture| {
+        const inst = try decodeInstruction(0, &fixture.words, 0);
+        try std.testing.expectEqual(fixture.family, inst.family);
+        try std.testing.expectEqual(fixture.count, inst.word_count);
+    }
+}
+
+test "unknown major family still fails instead of guessing a length" {
+    const code = [_]u32{0xe400_0000};
+    try std.testing.expectError(Error.UnknownInstructionFamily, decodeInstruction(0, &code, 0));
 }

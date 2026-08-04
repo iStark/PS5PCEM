@@ -197,6 +197,45 @@ fn traceShaderBinding(state: *const gpu.State, stage: gpu.resources.ShaderStage)
         );
     }
 
+    var analysis = gpu.shader_analysis.decode(
+        std.heap.page_allocator,
+        shader_memory_reader,
+        program_address,
+        4096,
+    ) catch |err| {
+        std.debug.print("  shader_frontend error={s}\n", .{@errorName(err)});
+        return;
+    };
+    defer analysis.deinit(std.heap.page_allocator);
+    std.debug.print(
+        "  shader_frontend words={d} instructions={d} blocks={d} edges={d} opaque={d}\n",
+        .{
+            analysis.code.items.len,
+            analysis.program.instructions.items.len,
+            analysis.graph.blocks.items.len,
+            analysis.graph.edges.items.len,
+            analysis.opaqueInstructionCount(),
+        },
+    );
+    const spirv_stage: ?gpu.ShaderSpirvStage = switch (stage) {
+        .pixel => .fragment,
+        .compute => .compute,
+        .vertex, .export_shader => .vertex,
+        else => null,
+    };
+    if (spirv_stage) |host_stage| {
+        if (analysis.translateSpirv(
+            std.heap.page_allocator,
+            .{ .stage = host_stage },
+        )) |module| {
+            var spirv = module;
+            defer spirv.deinit(std.heap.page_allocator);
+            std.debug.print("  spirv status=ready words={d}\n", .{spirv.words.len});
+        } else |err| {
+            std.debug.print("  spirv status=blocked reason={s}\n", .{@errorName(err)});
+        }
+    }
+
     if (gpu.VertexShaderBindings.capture(&bindings, shader_memory_reader)) |maybe_vertex| {
         if (maybe_vertex) |vertex| {
             std.debug.print(

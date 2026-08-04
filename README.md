@@ -104,29 +104,29 @@ machine code.
 
 ## Status
 
-Early, and deliberately narrow in scope.
+The frontend now recognizes every major GFX10 shader family used by the PS5:
+the scalar `SOP1`, `SOP2`, `SOPK`, `SOPC`, `SOPP` and `SMEM` encodings, vector
+`VOP1`, `VOP2`, `VOP3`, `VOP3P`, `VOPC` and `VINTRP`, buffer/typed-buffer
+`MUBUF` and `MTBUF`, `FLAT`, `DS`, image `MIMG`, and `EXP`. Their architectural
+one/two-word bodies, optional literals and MIMG NSA address words are retained,
+so a real shader stream stays synchronized even when an individual opcode has
+not been lowered yet.
 
-**Implemented:** the scalar families — `SOP1`, `SOP2`, `SOPK`, `SOPC`, `SOPP`
-— plus GFX10 `SMEM` scalar and scalar-buffer loads from one through sixteen
-dwords. That covers scalar ALU operations, comparisons, immediate forms,
-control flow (branches, `s_endpgm`, `s_waitcnt`, barriers), and the descriptor
-loads used by shader resource prologs.
+Known scalar ALU/load operations and the common vector ALU, compare, buffer,
+flat, LDS, image/sample and export opcodes have named operands and transfer
+metadata. An unrecognized opcode inside a known family yields an `unsupported`
+instruction with its family, numeric opcode, exact raw words and reason. SDWA
+and DPP extension words are length-safe but their modifier semantics are still
+reported as unsupported.
 
-**Not implemented:** the vector and remaining memory families — `VOP1`, `VOP2`,
-`VOP3`, `VOP3P`, `VOPC`, `VINTRP`, `MUBUF`, `MTBUF`, `FLAT`, `DS`, `MIMG`,
-`EXP`. These are rejected with `error.UnknownInstructionFamily`.
-
-Rejecting them is a deliberate choice rather than an oversight. RDNA2
-instructions are variable length, and the length of an instruction is only known
-once its family is decoded. Skipping an unrecognized instruction would mean
-guessing how many words to advance, and a single wrong guess silently
-desynchronizes the parse of everything that follows. Failing loudly at the first
-unknown family keeps every result the decoder does produce trustworthy.
-
-Within an implemented family the tradeoff is reversed: an unrecognized opcode
-yields an `unsupported` instruction with a diagnostic instead of an error,
-because the encoding still tells us the length unambiguously, so the parse can
-safely continue.
+`control_flow.zig` splits decoded programs at direct branch targets and
+terminators, validates that every direct target begins an instruction and emits
+typed branch/fallthrough edges. `ir.zig` supplies the API-neutral typed boundary
+for ALU, memory, image, interpolation and export work. The initial SPIR-V 1.5
+writer translates straight-line 32-bit move, integer/bitwise and floating-point
+ALU operations, including register bitcasts, into a real entry-point function.
+It returns a precise error for unsupported control flow or semantics instead of
+emitting a placeholder shader.
 
 ## Building
 
@@ -194,6 +194,15 @@ const rdna2 = @import("rdna2");
 var program = try rdna2.decodeProgram(allocator, code);
 defer program.deinit(allocator);
 
+var cfg = try rdna2.buildControlFlow(allocator, &program);
+defer cfg.deinit(allocator);
+
+var shader = try rdna2.translateSpirv(allocator, &program, .{
+    .stage = .compute,
+    .local_size = .{ 8, 8, 1 },
+});
+defer shader.deinit(allocator);
+
 for (program.instructions.items) |inst| {
     if (inst.opcode.isBranch()) {
         std.debug.print("branch at 0x{x} -> 0x{x}\n", .{ inst.pc, inst.branch_target });
@@ -214,7 +223,12 @@ yourself; `formatInstruction` and `formatProgram` write text to any
 | [src/rdna2/instruction.zig](src/rdna2/instruction.zig) | Instruction representation, literal fetching |
 | [src/rdna2/scalar_alu.zig](src/rdna2/scalar_alu.zig) | SOP family decoders, comptime opcode tables |
 | [src/rdna2/scalar_memory.zig](src/rdna2/scalar_memory.zig) | GFX10 SMEM load decoding and offsets |
+| [src/rdna2/vector_alu.zig](src/rdna2/vector_alu.zig) | VOP1/2/3/3P/C and interpolation decoding |
+| [src/rdna2/vector_memory.zig](src/rdna2/vector_memory.zig) | Buffer, typed, flat, LDS, image and export decoding |
 | [src/rdna2/decoder.zig](src/rdna2/decoder.zig) | Dispatch, parsing a program to `s_endpgm` |
+| [src/rdna2/control_flow.zig](src/rdna2/control_flow.zig) | Basic blocks and validated CFG edges |
+| [src/rdna2/ir.zig](src/rdna2/ir.zig) | Typed API-neutral shader IR boundary |
+| [src/rdna2/spirv.zig](src/rdna2/spirv.zig) | Deterministic SPIR-V 1.5 module writer |
 | [src/rdna2/disasm.zig](src/rdna2/disasm.zig) | Textual output |
 | [src/main.zig](src/main.zig) | Command-line front end |
 
@@ -244,13 +258,12 @@ set.
 
 ## Roadmap
 
-1. Validate the decoder against a reference corpus of shader binaries and
-   compare output line by line.
-2. `VOP1`/`VOP2`/`VOP3` — the vector ALU, the bulk of any real shader.
-3. `MUBUF`/`MTBUF`, `FLAT`, `DS`, `MIMG` and `EXP` — remaining memory and
-   export operations.
-4. Basic-block reconstruction from the branch targets the decoder already
-   collects.
+1. Validate family/opcode fields against a captured shader corpus and finish
+   SDWA, DPP, VOP3 modifiers plus the remaining opcode tables.
+2. Convert the validated CFG to divergence-aware SSA and lower direct branches,
+   comparisons and lane-mask changes to structured SPIR-V control flow.
+3. Lower buffer/image/LDS/interpolation/export operations against the captured
+   shader-resource and stage-interface metadata.
 
 ---
 
@@ -331,6 +344,13 @@ walk explicitly instead of inventing state. Draw/dispatch diagnostics expose
 this load plan together with the direct and vertex tables, ready for the shader
 translator to consume.
 
+[`gpu.shader_analysis`](src/gpu/shader_analysis.zig) incrementally reads only
+the guest words required by the RDNA2 decoder, including literals and MIMG NSA
+words. It owns the decoded program, validated CFG and typed IR as one diagnostic
+snapshot. Live submission tracing reports words, instructions, blocks, edges
+and opaque IR nodes, then attempts SPIR-V lowering for vertex, pixel and compute
+stages and records either the module size or the exact blocking semantic.
+
 [`gpu.tiling`](src/gpu/tiling.zig) is the API-neutral bridge from those guest
 resources to host staging memory. It implements the exact GFX10 address XORs
 for linear, Standard 256 B/4 KiB/64 KiB, partially-resident 64 KiB, depth Z_X
@@ -384,11 +404,13 @@ packet per line with its word offset, and counts the draws and dispatches:
 ## Roadmap
 
 The shared GFX10 staging contract is complete for mip tails, thick 3D blocks,
-Oberon RB+ MSAA addressing and compute-detile constants. The remaining stages
-are:
+Oberon RB+ MSAA addressing and compute-detile constants. All major shader
+families are now length-safe, and decoded programs have a validated CFG, typed
+IR and an executable straight-line SPIR-V ALU path. The remaining stages are:
 
-1. Complete the RDNA2 vector and memory ISA, build control flow and translate
-   guest shaders to SPIR-V.
+1. Finish vector modifier/opcode semantics, divergence-aware SSA and structured
+   control flow, then lower stage interfaces, descriptors, memory, image,
+   interpolation and export operations to SPIR-V.
 2. Implement the Vulkan backend: device/queue selection, guest-memory staging,
    image layout transitions and barriers, pipeline/cache creation, draw and
    dispatch recording, then swapchain presentation through `SetFlip`.

@@ -579,7 +579,7 @@ test "scalar provenance follows an SRT pointer through ALU and SMEM" {
     // s4 = s0 + 16; s5 = s1 + carry; load s8:s9 from s4:s5 + 8.
     memory.write(program + 0, 0x8004_9000);
     memory.write(program + 4, 0x8205_8001);
-    memory.write(program + 8, 0xcc04_0202);
+    memory.write(program + 8, 0xf404_0202);
     memory.write(program + 12, (125 << 25) | 8);
     memory.write(program + 16, 0xbf81_0000);
     memory.write(srt + 24, 0x1122_3344);

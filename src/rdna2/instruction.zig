@@ -49,6 +49,7 @@ pub const Instruction = struct {
     opcode: isa.Opcode = .unknown,
 
     dst: Operand = .{},
+    dst2: Operand = .{},
     src0: Operand = .{},
     src1: Operand = .{},
     src2: Operand = .{},
@@ -59,11 +60,35 @@ pub const Instruction = struct {
     branch_offset: i32 = 0,
     branch_target: u32 = 0,
 
-    /// Signed byte offset encoded by scalar-memory instructions.
+    /// Primary and secondary byte offsets encoded by memory instructions.
     memory_offset: i32 = 0,
-    /// Number of consecutive destination dwords loaded by SMEM.
+    secondary_memory_offset: i32 = 0,
+    /// Number and shape of dwords transferred by memory instructions.
     data_words: u8 = 0,
+    data_bits: u8 = 32,
+    data_format: u4 = 0,
+    number_format: u3 = 0,
+    data_mask: u4 = 0,
+    image_address_components: u8 = 0,
+    image_nsa_words: u2 = 0,
+    image_nsa_address: [12]u8 = [_]u8{0} ** 12,
+    image_dimension: isa.ImageDimension = .dim_2d,
+    image_sample_flags: isa.ImageSampleFlags = .{},
+    memory_segment: u2 = 0,
+    data_signed: bool = false,
+    typed: bool = false,
+    formatted: bool = false,
+    gds: bool = false,
     globally_coherent: bool = false,
+    system_coherent: bool = false,
+    index_enable: bool = false,
+    offset_enable: bool = false,
+
+    export_target: u6 = 0,
+    export_enable: u4 = 0,
+    export_done: bool = false,
+    export_compressed: bool = false,
+    export_valid_mask: bool = false,
 
     unsupported_reason: []const u8 = "",
 

@@ -172,7 +172,7 @@ pub fn decodeSop1(pc: u32, code: []const u32, word_index: u32) Error!Instruction
         // s_setpc_b64 is the mirror image: a source but no destination.
         .s_setpc_b64 => {
             inst.src_count = 1;
-            inst.dst = .{ .kind = .@"null" };
+            inst.dst = .{ .kind = .null };
             inst.src0 = try operand.decodeScalarSource(ssrc0);
             try inst.readLiteralOperands(code, word_index);
             return inst;
@@ -247,14 +247,14 @@ pub fn decodeSopk(pc: u32, code: []const u32, word_index: u32) Error!Instruction
         // For s_waitcnt the 16-bit field is a set of counters, not a signed value.
         .s_waitcnt => {
             const waitcnt = word & 0xffff;
-            inst.dst = .{ .kind = .@"null" };
+            inst.dst = .{ .kind = .null };
             inst.src0.signed_val = @intCast(waitcnt);
             inst.src0.value = waitcnt;
             inst.src_count = 1;
             return inst;
         },
         .s_setreg_b32 => {
-            inst.dst = .{ .kind = .@"null" };
+            inst.dst = .{ .kind = .null };
             inst.src1 = .{
                 .kind = .literal_constant,
                 .value = word & 0xffff,

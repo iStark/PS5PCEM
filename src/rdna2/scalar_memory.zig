@@ -71,7 +71,7 @@ pub fn decodeSmem(pc: u32, code: []const u32, word_index: u32) Error!Instruction
 test "decodes GFX10 scalar loads" {
     // opcode=2, sdst=20, sbase=3 -> s6, soffset=s4, offset=-16, glc=1.
     const code = [_]u32{
-        0xcc00_0000 | (2 << 18) | (1 << 16) | (20 << 6) | 3,
+        0xf400_0000 | (2 << 18) | (1 << 16) | (20 << 6) | 3,
         (4 << 25) | 0x1f_fff0,
     };
     const inst = try decodeSmem(0x40, &code, 0);
@@ -87,7 +87,7 @@ test "decodes GFX10 scalar loads" {
 }
 
 test "unsupported SMEM opcodes stay synchronized" {
-    const code = [_]u32{ 0xcc00_0000 | (0x7f << 18), 0 };
+    const code = [_]u32{ 0xf400_0000 | (0x7f << 18), 0 };
     const inst = try decodeSmem(0, &code, 0);
     try std.testing.expectEqual(isa.Opcode.unsupported, inst.opcode);
     try std.testing.expectEqual(isa.OperandKind.sgpr, inst.src1.kind);
@@ -95,6 +95,6 @@ test "unsupported SMEM opcodes stay synchronized" {
 }
 
 test "truncated SMEM is rejected" {
-    const code = [_]u32{0xcc00_0000};
+    const code = [_]u32{0xf400_0000};
     try std.testing.expectError(Error.TruncatedInstruction, decodeSmem(0, &code, 0));
 }
