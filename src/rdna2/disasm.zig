@@ -34,6 +34,22 @@ pub fn formatOperand(op: Operand, w: *Writer) Writer.Error!void {
         .unknown => try w.writeAll("unknown"),
     }
     if (op.absolute) try w.writeAll(")");
+    if (op.sdwa_sel != 6) {
+        const selectors = [_][]const u8{ "b0", "b1", "b2", "b3", "w0", "w1", "invalid", "invalid" };
+        try w.print(".{s}", .{selectors[op.sdwa_sel]});
+        if (op.sdwa_sext) try w.writeAll(":sext");
+    }
+    if (op.sdwa_dst_unused != 0) try w.print(":dst_u{d}", .{op.sdwa_dst_unused});
+    if (op.dpp) {
+        try w.print(":dpp(0x{x},row=0x{x},bank=0x{x}", .{
+            op.dpp_ctrl,
+            op.dpp_row_mask,
+            op.dpp_bank_mask,
+        });
+        if (op.dpp_fetch_inactive) try w.writeAll(",fi");
+        if (op.dpp_bound_ctrl) try w.writeAll(",bc");
+        try w.writeAll(")");
+    }
 }
 
 fn formatRawWords(inst: Instruction, w: *Writer) Writer.Error!void {

@@ -116,17 +116,20 @@ Known scalar ALU/load operations and the common vector ALU, compare, buffer,
 flat, LDS, image/sample and export opcodes have named operands and transfer
 metadata. An unrecognized opcode inside a known family yields an `unsupported`
 instruction with its family, numeric opcode, exact raw words and reason. SDWA
-and DPP extension words are length-safe but their modifier semantics are still
-reported as unsupported.
+and DPP extension words now retain scalar-bank selection, byte/word selectors,
+sign extension, source/output modifiers, DPP lane control and row/bank masks.
 
 `control_flow.zig` splits decoded programs at direct branch targets and
 terminators, validates that every direct target begins an instruction and emits
-typed branch/fallthrough edges. `ir.zig` supplies the API-neutral typed boundary
-for ALU, memory, image, interpolation and export work. The initial SPIR-V 1.5
-writer translates straight-line 32-bit move, integer/bitwise and floating-point
-ALU operations, including register bitcasts, into a real entry-point function.
-It returns a precise error for unsupported control flow or semantics instead of
-emitting a placeholder shader.
+typed branch/fallthrough edges with SCC/VCC/EXEC predicate domains. It discovers
+forward selection merges and records backward edges separately. `ir.zig`
+supplies the API-neutral typed boundary for ALU, memory, image, interpolation
+and export work. The SPIR-V 1.5 writer translates 32-bit move,
+integer/bitwise/floating-point ALU and SDWA source extraction. Forward scalar
+selections become structured `OpSelectionMerge`/`OpBranchConditional` regions;
+register values crossing a merge use `OpPhi`. Back edges, DPP lane shuffles and
+VCC/EXEC predicates return a precise unsupported error until their structured
+lowering exists, rather than producing a placeholder shader.
 
 ## Building
 
@@ -259,9 +262,9 @@ set.
 ## Roadmap
 
 1. Validate family/opcode fields against a captured shader corpus and finish
-   SDWA, DPP, VOP3 modifiers plus the remaining opcode tables.
-2. Convert the validated CFG to divergence-aware SSA and lower direct branches,
-   comparisons and lane-mask changes to structured SPIR-V control flow.
+   DPP subgroup lowering, VOP3 modifiers plus the remaining opcode tables.
+2. Structure back edges with loop merges and lower VCC/EXEC lane-mask changes
+   through the divergence-aware SSA boundary.
 3. Lower buffer/image/LDS/interpolation/export operations against the captured
    shader-resource and stage-interface metadata.
 
@@ -406,11 +409,12 @@ packet per line with its word offset, and counts the draws and dispatches:
 The shared GFX10 staging contract is complete for mip tails, thick 3D blocks,
 Oberon RB+ MSAA addressing and compute-detile constants. All major shader
 families are now length-safe, and decoded programs have a validated CFG, typed
-IR and an executable straight-line SPIR-V ALU path. The remaining stages are:
+IR, SSA selection merges and an executable SPIR-V ALU/SDWA path. The remaining
+stages are:
 
-1. Finish vector modifier/opcode semantics, divergence-aware SSA and structured
-   control flow, then lower stage interfaces, descriptors, memory, image,
-   interpolation and export operations to SPIR-V.
+1. Finish DPP/VOP3/opcode semantics, structured loops and VCC/EXEC divergence,
+   then lower stage interfaces, descriptors, memory, image, interpolation and
+   export operations to SPIR-V.
 2. Implement the Vulkan backend: device/queue selection, guest-memory staging,
    image layout transitions and barriers, pipeline/cache creation, draw and
    dispatch recording, then swapchain presentation through `SetFlip`.

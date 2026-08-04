@@ -208,12 +208,14 @@ fn traceShaderBinding(state: *const gpu.State, stage: gpu.resources.ShaderStage)
     };
     defer analysis.deinit(std.heap.page_allocator);
     std.debug.print(
-        "  shader_frontend words={d} instructions={d} blocks={d} edges={d} opaque={d}\n",
+        "  shader_frontend words={d} instructions={d} blocks={d} edges={d} selections={d} back_edges={d} opaque={d}\n",
         .{
             analysis.code.items.len,
             analysis.program.instructions.items.len,
             analysis.graph.blocks.items.len,
             analysis.graph.edges.items.len,
+            analysis.graph.selections.items.len,
+            analysis.graph.back_edge_count,
             analysis.opaqueInstructionCount(),
         },
     );
