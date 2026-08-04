@@ -297,6 +297,17 @@ Snapshots allocate nothing and do not duplicate mutable GPU state: partial PM4
 writes remain in the register banks and are interpreted only when work consumes
 them.
 
+[`gpu.shaders`](src/gpu/shaders.zig) joins those values with relocated AGC
+shader metadata. It decodes the direct-resource map, EUD/SRT sizes and all four
+resource-class maps without allocating, then obtains the SRT root from the
+metadata-declared `ShaderResourceTable` user-SGPR pair. It does not assume
+`s0:s1`. The stage snapshot supports the complete 64-word GFX10 user-data
+window and keeps an NGG export program separate from the GS bank that supplies
+its user data. Every metadata and descriptor-table access goes through a
+checked guest-memory reader; offsets beyond `srt_size_dw` are rejected before a
+read. A renderer can iterate resolved read-only/read-write images, samplers and
+constant buffers through the same typed descriptors used by inline resources.
+
 The executor is deliberately independent of Vulkan and guest-memory ownership.
 Its backend interface supplies checked reads/writes and optional callbacks for
 barriers, releases, waits, events, flips, draws and dispatches. Tests use an
@@ -330,8 +341,9 @@ packet per line with its word offset, and counts the draws and dispatches:
 
 ## Roadmap
 
-1. Recover shader SRT/descriptor-table roots and resolve buffer, image and
-   sampler descriptors from guest memory as well as inline user-SGPR data.
+1. Add scalar provenance for dynamically derived SRT loads and resolve the
+   direct vertex-buffer, vertex-attribute, fetch-shader and extended-user-data
+   tables needed by translated vertex shaders.
 2. Implement PS5 swizzle address transforms and staging layouts for linear,
    256-byte, 4 KiB, 64 KiB, depth and render-target tile modes.
 3. Complete the RDNA2 vector and memory ISA, build control flow and translate
@@ -988,6 +1000,14 @@ root DCB copy and complete root/indirect resume path while later submissions on
 that queue remain FIFO-ordered. The other queue continues, and a real release
 label makes the scheduler recheck and resume the blocked stream without
 replaying earlier side effects or forcing memory to a satisfying value.
+
+Successful `sceAgcCreateShader` calls also retain the association between each
+published GPU program address and its relocated AGC header. At draw/dispatch
+time the backend can therefore capture the active stage's metadata, hardware
+user-data window and exact SRT root, then resolve guest descriptors through the
+same checked memory interface as indirect DCBs. Live tracing reports each
+unique shader once, including its selected NGG user-data bank, four resource
+counts and the first resolved descriptor of each class.
 
 Submissions are accepted rather than refused, which is the opposite of the
 choice made for the graphics device, and the difference is what a caller does

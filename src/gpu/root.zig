@@ -14,6 +14,7 @@ const std = @import("std");
 pub const pm4 = @import("pm4.zig");
 pub const state = @import("state.zig");
 pub const resources = @import("resources.zig");
+pub const shaders = @import("shaders.zig");
 pub const executor = @import("executor.zig");
 pub const scheduler = @import("scheduler.zig");
 
@@ -22,6 +23,8 @@ pub const RenderState = resources.RenderState;
 pub const BufferDescriptor = resources.BufferDescriptor;
 pub const ImageDescriptor = resources.ImageDescriptor;
 pub const SamplerDescriptor = resources.SamplerDescriptor;
+pub const ShaderBindings = shaders.StageBindings;
+pub const ShaderMemoryReader = shaders.MemoryReader;
 pub const DcbExecutor = executor.DcbExecutor;
 pub const DcbBackend = executor.Backend;
 pub const DcbContinuation = executor.Continuation;
@@ -33,6 +36,7 @@ test {
     _ = pm4;
     _ = state;
     _ = resources;
+    _ = shaders;
     _ = executor;
     _ = scheduler;
 }

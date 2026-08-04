@@ -19,7 +19,10 @@ pub const Error = error{
 };
 
 pub const color_target_count: usize = 8;
-pub const maximum_user_data_words: u8 = 32;
+/// GFX10 exposes up to 64 hardware user SGPRs for one shader stage. The
+/// ordinary USER_DATA register range covers the first half; AGC indirect lists
+/// may also populate the accumulator-backed upper half.
+pub const maximum_user_data_words: u8 = 64;
 
 pub const TileMode = enum(u5) {
     linear = 0x00,
@@ -74,7 +77,50 @@ pub const ShaderStage = enum {
     }
 
     pub fn userDataCount(self: ShaderStage) u8 {
-        return if (self == .compute) 16 else maximum_user_data_words;
+        _ = self;
+        return maximum_user_data_words;
+    }
+
+    pub fn programRegisterBase(self: ShaderStage) u32 {
+        return switch (self) {
+            .pixel => 0x008,
+            .vertex => 0x048,
+            .geometry => 0x088,
+            .export_shader => 0x0c8,
+            .hull => 0x108,
+            .compute => 0x20c,
+        };
+    }
+
+    pub fn programAddress(self: ShaderStage, state: *const gpu_state.State) ?u64 {
+        const base = self.programRegisterBase();
+        const low = state.readRegister(.shader, base) orelse return null;
+        const high = state.readRegister(.shader, base + 1) orelse return null;
+        const address = (@as(u64, low) << 8) | (@as(u64, high & 0xff) << 40);
+        return if (address == 0) null else address;
+    }
+
+    /// Decodes SPI_SHADER_PGM_RSRC2.USER_SGPR, including the sixth GFX10 bit
+    /// where the register layout provides it. Some AGC default lists leave
+    /// RSRC2 zero while still writing a contiguous user-data window, so the
+    /// graphics stages retain that observable fallback.
+    pub fn activeUserDataCount(self: ShaderStage, state: *const gpu_state.State) u8 {
+        const rsrc2_offset = if (self == .compute) @as(u32, 0x213) else self.userDataBase() - 1;
+        const rsrc2 = state.readRegister(.shader, rsrc2_offset) orelse return self.probedUserDataCount(state);
+        var count: u8 = @truncate((rsrc2 >> 1) & 0x1f);
+        if (self == .pixel or self == .vertex or self == .geometry) {
+            if (rsrc2 & (1 << 27) != 0) count |= 0x20;
+        }
+        if (count == 0 and self != .compute) return self.probedUserDataCount(state);
+        return @min(count, maximum_user_data_words);
+    }
+
+    fn probedUserDataCount(self: ShaderStage, state: *const gpu_state.State) u8 {
+        var count: u8 = 0;
+        while (count < maximum_user_data_words and
+            state.readRegister(.shader, self.userDataBase() + count) != null) : (count += 1)
+        {}
+        return count;
     }
 };
 
@@ -670,7 +716,7 @@ test "inline user-data decoding is stage-relative and complete" {
     try testing.expectEqual(@as(u64, 64), descriptor.size_bytes);
     try testing.expectError(
         Error.UserDataOutOfRange,
-        imageDescriptorFromUserData(&state, .compute, 12),
+        imageDescriptorFromUserData(&state, .compute, 60),
     );
     try testing.expectError(
         Error.IncompleteDescriptor,

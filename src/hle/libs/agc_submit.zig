@@ -30,6 +30,7 @@ const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const memory = @import("kernel_memory.zig");
+const shader_registry = @import("agc_shader_registry.zig");
 
 /// A submission descriptor: where the buffer is and how long it is.
 ///
@@ -65,6 +66,8 @@ const ExecutionLock = struct {
 /// next one, so both queues are kept behind one serialized scheduler.
 var execution_lock = ExecutionLock{};
 var traced_draw_states: u32 = 0;
+var traced_shader_program_count: usize = 0;
+var traced_shader_programs: [32]u64 = [_]u64{0} ** 32;
 
 fn backendRead(_: ?*anyopaque, address: u64, bytes: []u8) bool {
     if (!memory.isGuestRangeAccessible(address, bytes.len)) return false;
@@ -80,7 +83,103 @@ fn backendWrite(_: ?*anyopaque, address: u64, bytes: []const u8) bool {
     return true;
 }
 
+const shader_memory_reader = gpu.ShaderMemoryReader{
+    .context = null,
+    .read_fn = backendRead,
+};
+
+fn traceShaderBinding(state: *const gpu.State, stage: gpu.resources.ShaderStage) void {
+    if (!trace.isLive()) return;
+    const program_address = stage.programAddress(state) orelse return;
+    for (traced_shader_programs[0..traced_shader_program_count]) |known| {
+        if (known == program_address) return;
+    }
+    if (traced_shader_program_count >= traced_shader_programs.len) return;
+    traced_shader_programs[traced_shader_program_count] = program_address;
+    traced_shader_program_count += 1;
+
+    const header_address = shader_registry.find(program_address);
+    const bindings = gpu.ShaderBindings.capture(
+        state,
+        stage,
+        header_address,
+        shader_memory_reader,
+    ) catch |err| {
+        std.debug.print(
+            "[gpu shader {s}] program=0x{x} header={s} error={s}\n",
+            .{
+                @tagName(stage),
+                program_address,
+                if (header_address != null) "mapped" else "missing",
+                @errorName(err),
+            },
+        );
+        return;
+    };
+
+    const metadata = bindings.metadata orelse {
+        std.debug.print(
+            "[gpu shader {s}] program=0x{x} header=missing ud={d}\n",
+            .{ @tagName(stage), program_address, bindings.user_data_count },
+        );
+        return;
+    };
+    std.debug.print(
+        "[gpu shader {s}] program=0x{x} header=0x{x} ud={d}@{s} eud={d} srt={d}@{s} resources={d}/{d}/{d}/{d}\n",
+        .{
+            @tagName(stage),
+            program_address,
+            metadata.header_address,
+            bindings.user_data_count,
+            @tagName(bindings.user_data_stage),
+            metadata.extended_user_data_size_words,
+            metadata.shader_resource_table_size_words,
+            if (bindings.srt_address != null) "bound" else "none",
+            metadata.resource_counts[0],
+            metadata.resource_counts[1],
+            metadata.resource_counts[2],
+            metadata.resource_counts[3],
+        },
+    );
+    if (bindings.srt_address) |address| std.debug.print("  srt_address=0x{x}\n", .{address});
+    for ([_]gpu.shaders.ResourceKind{
+        gpu.shaders.ResourceKind.read_only_texture,
+        gpu.shaders.ResourceKind.read_write_texture,
+        gpu.shaders.ResourceKind.sampler,
+        gpu.shaders.ResourceKind.constant_buffer,
+    }) |kind| {
+        var iterator = bindings.iterator(shader_memory_reader, kind);
+        const first = iterator.next() catch |err| {
+            std.debug.print("  {s}: error={s}\n", .{ @tagName(kind), @errorName(err) });
+            continue;
+        } orelse continue;
+        switch (first.descriptor) {
+            .read_only_texture => |image| std.debug.print(
+                "  {s}[{d}] table=0x{x} image=0x{x} {d}x{d} fmt={d}\n",
+                .{ @tagName(kind), first.mapping.slot, first.descriptor_address, image.address, image.width, image.height, image.unified_format },
+            ),
+            .read_write_texture => |image| std.debug.print(
+                "  {s}[{d}] table=0x{x} image=0x{x} {d}x{d} fmt={d}\n",
+                .{ @tagName(kind), first.mapping.slot, first.descriptor_address, image.address, image.width, image.height, image.unified_format },
+            ),
+            .sampler => |sampler| std.debug.print(
+                "  {s}[{d}] table=0x{x} lod={d:.2}..{d:.2}\n",
+                .{ @tagName(kind), first.mapping.slot, first.descriptor_address, sampler.minimum_lod, sampler.maximum_lod },
+            ),
+            .constant_buffer => |buffer| std.debug.print(
+                "  {s}[{d}] table=0x{x} buffer=0x{x} bytes={d}\n",
+                .{ @tagName(kind), first.mapping.slot, first.descriptor_address, buffer.address, buffer.size_bytes },
+            ),
+        }
+    }
+}
+
 fn backendDraw(_: ?*anyopaque, state: *const gpu.State, _: gpu.pm4.Packet) bool {
+    traceShaderBinding(state, .export_shader);
+    traceShaderBinding(state, .geometry);
+    traceShaderBinding(state, .vertex);
+    traceShaderBinding(state, .hull);
+    traceShaderBinding(state, .pixel);
     if (!trace.isLive() or traced_draw_states >= 16) return true;
     traced_draw_states += 1;
 
@@ -123,10 +222,16 @@ fn backendDraw(_: ?*anyopaque, state: *const gpu.State, _: gpu.pm4.Packet) bool 
     return true;
 }
 
+fn backendDispatch(_: ?*anyopaque, state: *const gpu.State, _: gpu.pm4.Packet) bool {
+    traceShaderBinding(state, .compute);
+    return true;
+}
+
 const executor_backend_vtable = gpu.DcbBackend.VTable{
     .read = backendRead,
     .write = backendWrite,
     .draw = backendDraw,
+    .dispatch = backendDispatch,
 };
 
 const executor_backend = gpu.DcbBackend{

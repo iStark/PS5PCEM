@@ -14,6 +14,7 @@ const kernel_runtime = @import("kernel_runtime.zig");
 const kernel_threading = @import("kernel_threading.zig");
 const kernel_memory = @import("kernel_memory.zig");
 const agc_submit = @import("agc_submit.zig");
+const agc_shader_registry = @import("agc_shader_registry.zig");
 const gpu = @import("gpu");
 
 const invalid_argument = errno.KernelError.einval.raw();
@@ -639,17 +640,18 @@ fn shaderProgramRegisters(shader_type: u8) ?struct { low: u32, high: u32 } {
     };
 }
 
-fn patchShaderProgram(header_address: u64, code_address: u64) bool {
-    if (!accessible(header_address, shader_structure_size)) return false;
+fn patchShaderProgram(header_address: u64, code_address: u64) ?u64 {
+    if (!accessible(header_address, shader_structure_size)) return null;
     const bytes: [*]u8 = @ptrFromInt(header_address);
     const shader_type = bytes[shader_type_offset];
     // Front halves publish their program address when they are fused with the
     // back half. Fetch shaders likewise have no SH program pair in this table.
-    const wanted = shaderProgramRegisters(shader_type) orelse return shader_type == 4 or shader_type == 5 or shader_type == 8;
+    const wanted = shaderProgramRegisters(shader_type) orelse
+        return if (shader_type == 4 or shader_type == 5 or shader_type == 8) code_address else null;
     const count = bytes[shader_sh_register_count_offset];
     const registers_address = @as(*const u64, @ptrFromInt(header_address + shader_sh_registers_offset)).*;
     if (registers_address == 0 or !accessible(registers_address, @as(usize, count) * @sizeOf(ShaderRegister))) {
-        return false;
+        return null;
     }
 
     const registers: [*]ShaderRegister = @ptrFromInt(registers_address);
@@ -659,13 +661,13 @@ fn patchShaderProgram(header_address: u64, code_address: u64) bool {
         if (entry.offset == wanted.low) low = entry;
         if (entry.offset == wanted.high) high = entry;
     }
-    if (low == null or high == null) return false;
+    if (low == null or high == null) return null;
 
     const shader_offset = (@as(u64, low.?.value) << 8) | (@as(u64, high.?.value & 0xff) << 40);
     const program_address = code_address +% shader_offset;
     low.?.value = @truncate(program_address >> 8);
     high.?.value = (high.?.value & 0xffff_ff00) | @as(u32, @truncate(program_address >> 40));
-    return true;
+    return program_address;
 }
 
 fn agcCreateShader(
@@ -702,7 +704,9 @@ fn agcCreateShader(
             if (!relocateShaderPointer(user_data_address + offset)) return errno.KernelError.efault.raw();
         }
     }
-    if (!patchShaderProgram(header_address, code_address)) return invalid_argument;
+    const program_address = patchShaderProgram(header_address, code_address) orelse return invalid_argument;
+    _ = agc_shader_registry.record(code_address, header_address);
+    if (program_address != code_address) _ = agc_shader_registry.record(program_address, header_address);
     if (output) |destination| destination.* = header_pointer;
     return errno.ok;
 }
@@ -827,6 +831,7 @@ const ampr_exports = [_]symbols.Export{
 };
 
 pub fn reset() void {
+    agc_shader_registry.reset();
     random_state.store(0x9e37_79b9_7f4a_7c15, .monotonic);
     video_open.store(false, .release);
     video_flip_count.store(0, .monotonic);
@@ -1016,6 +1021,8 @@ test "shader creation relocates its header and builds primitive state" {
         @as(u32, 0xabcd_ef00) | @as(u32, @truncate(expected_program_address >> 40)),
         registers[1].value,
     );
+    try std.testing.expectEqual(@as(?u64, header_address), agc_shader_registry.find(@intFromPtr(&code)));
+    try std.testing.expectEqual(@as(?u64, header_address), agc_shader_registry.find(expected_program_address));
 
     var cx: [2]ShaderRegister = undefined;
     var uc: [3]ShaderRegister = undefined;
@@ -1044,6 +1051,10 @@ test "shader creation accepts a fused front half without program registers" {
         agcCreateShader(&shader, &header, @ptrCast(&code)),
     );
     try std.testing.expectEqual(@intFromPtr(&header), @intFromPtr(shader.?));
+    try std.testing.expectEqual(
+        @as(?u64, @intFromPtr(&header)),
+        agc_shader_registry.find(@intFromPtr(&code)),
+    );
 }
 
 test "bootstrap service libraries register the title link surface" {
