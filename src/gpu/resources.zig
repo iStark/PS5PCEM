@@ -284,6 +284,61 @@ pub const DepthTarget = struct {
     htile_enabled: bool,
 };
 
+pub const ViewportTransform = struct {
+    x_scale: f32,
+    x_offset: f32,
+    y_scale: f32,
+    y_offset: f32,
+    z_scale: f32,
+    z_offset: f32,
+};
+
+pub const Scissor = struct {
+    left: u16,
+    top: u16,
+    right: u16,
+    bottom: u16,
+
+    pub fn intersect(a: Scissor, b: Scissor) Scissor {
+        const left = @max(a.left, b.left);
+        const top = @max(a.top, b.top);
+        return .{
+            .left = left,
+            .top = top,
+            .right = @max(left, @min(a.right, b.right)),
+            .bottom = @max(top, @min(a.bottom, b.bottom)),
+        };
+    }
+};
+
+pub const RasterState = struct {
+    cull_front: bool = false,
+    cull_back: bool = false,
+    clockwise_front_face: bool = false,
+    polygon_mode: u2 = 0,
+    polygon_type_front: u3 = 0,
+    polygon_type_back: u3 = 0,
+    depth_bias_front: bool = false,
+    depth_bias_back: bool = false,
+    rasterizer_discard: bool = false,
+};
+
+pub const BlendControl = struct {
+    enabled: bool = false,
+    color_source: u5 = 0,
+    color_operation: u3 = 0,
+    color_destination: u5 = 0,
+    separate_alpha: bool = false,
+    alpha_source: u5 = 0,
+    alpha_operation: u3 = 0,
+    alpha_destination: u5 = 0,
+};
+
+pub const ColorControl = struct {
+    mode: u3 = 0,
+    logic_operation: u8 = 0xcc,
+};
+
 pub const RenderState = struct {
     color_targets: [color_target_count]?ColorTarget = [_]?ColorTarget{null} ** color_target_count,
     color_count: u8 = 0,
@@ -291,6 +346,11 @@ pub const RenderState = struct {
     target_mask: u32 = std.math.maxInt(u32),
     depth_control: DepthControl,
     depth_target: ?DepthTarget,
+    viewport: ?ViewportTransform,
+    scissor: ?Scissor,
+    raster: RasterState,
+    blends: [color_target_count]BlendControl,
+    color_control: ColorControl,
 };
 
 pub fn decodeBufferDescriptor(words: []const u32) Error!BufferDescriptor {
@@ -435,6 +495,11 @@ pub fn decodeRenderState(state: *const gpu_state.State) RenderState {
         .target_mask = target_mask,
         .depth_control = decodeDepthControl(state),
         .depth_target = decodeDepthTarget(state),
+        .viewport = decodeViewport(state, 0),
+        .scissor = decodeScissor(state, 0),
+        .raster = decodeRasterState(state),
+        .blends = decodeBlendControls(state),
+        .color_control = decodeColorControl(state),
     };
     for (0..color_target_count) |slot| {
         const target = decodeColorTarget(state, @intCast(slot), target_mask) orelse continue;
@@ -443,6 +508,91 @@ pub fn decodeRenderState(state: *const gpu_state.State) RenderState {
         if (target.isActive()) result.active_color_count += 1;
     }
     return result;
+}
+
+pub fn decodeViewport(state: *const gpu_state.State, index: u8) ?ViewportTransform {
+    if (index >= 16) return null;
+    const base = 0x10f + @as(u32, index) * 6;
+    const x_scale = context(state, base) orelse return null;
+    const x_offset = context(state, base + 1) orelse return null;
+    const y_scale = context(state, base + 2) orelse return null;
+    const y_offset = context(state, base + 3) orelse return null;
+    const z_scale = context(state, base + 4) orelse return null;
+    const z_offset = context(state, base + 5) orelse return null;
+    return .{
+        .x_scale = @bitCast(x_scale),
+        .x_offset = @bitCast(x_offset),
+        .y_scale = @bitCast(y_scale),
+        .y_offset = @bitCast(y_offset),
+        .z_scale = @bitCast(z_scale),
+        .z_offset = @bitCast(z_offset),
+    };
+}
+
+pub fn decodeScissor(state: *const gpu_state.State, index: u8) ?Scissor {
+    if (index >= 16) return null;
+    const viewport_base = 0x094 + @as(u32, index) * 2;
+    const viewport_tl = context(state, viewport_base);
+    const viewport_br = context(state, viewport_base + 1);
+    const screen_tl = context(state, 0x00c);
+    const screen_br = context(state, 0x00d);
+    const viewport = decodeScissorWords(viewport_tl, viewport_br, 0x7fff);
+    const screen = decodeScissorWords(screen_tl, screen_br, 0xffff);
+    if (viewport) |value| return if (screen) |screen_value| value.intersect(screen_value) else value;
+    return screen;
+}
+
+fn decodeScissorWords(tl: ?u32, br: ?u32, mask: u32) ?Scissor {
+    const top_left = tl orelse return null;
+    const bottom_right = br orelse return null;
+    return .{
+        .left = @truncate(top_left & mask),
+        .top = @truncate((top_left >> 16) & mask),
+        .right = @truncate(bottom_right & mask),
+        .bottom = @truncate((bottom_right >> 16) & mask),
+    };
+}
+
+pub fn decodeRasterState(state: *const gpu_state.State) RasterState {
+    const mode = context(state, 0x205) orelse 0;
+    const clip = context(state, 0x204) orelse 0;
+    return .{
+        .cull_front = mode & 1 != 0,
+        .cull_back = mode & 2 != 0,
+        .clockwise_front_face = mode & 4 != 0,
+        .polygon_mode = @truncate((mode >> 3) & 0x3),
+        .polygon_type_front = @truncate((mode >> 5) & 0x7),
+        .polygon_type_back = @truncate((mode >> 8) & 0x7),
+        .depth_bias_front = mode & (1 << 11) != 0,
+        .depth_bias_back = mode & (1 << 12) != 0,
+        .rasterizer_discard = clip & (1 << 22) != 0,
+    };
+}
+
+pub fn decodeBlendControls(state: *const gpu_state.State) [color_target_count]BlendControl {
+    var result = [_]BlendControl{.{}} ** color_target_count;
+    for (&result, 0..) |*blend, index| {
+        const raw = context(state, 0x1e0 + @as(u32, @intCast(index))) orelse continue;
+        blend.* = .{
+            .enabled = raw & (1 << 30) != 0,
+            .color_source = @truncate(raw & 0x1f),
+            .color_operation = @truncate((raw >> 5) & 0x7),
+            .color_destination = @truncate((raw >> 8) & 0x1f),
+            .separate_alpha = raw & (1 << 29) != 0,
+            .alpha_source = @truncate((raw >> 16) & 0x1f),
+            .alpha_operation = @truncate((raw >> 21) & 0x7),
+            .alpha_destination = @truncate((raw >> 24) & 0x1f),
+        };
+    }
+    return result;
+}
+
+pub fn decodeColorControl(state: *const gpu_state.State) ColorControl {
+    const raw = context(state, 0x202) orelse return .{};
+    return .{
+        .mode = @truncate((raw >> 4) & 0x7),
+        .logic_operation = @truncate(raw >> 16),
+    };
 }
 
 pub fn decodeColorTarget(state: *const gpu_state.State, slot: u8, target_mask: u32) ?ColorTarget {
@@ -681,6 +831,18 @@ test "render state decodes PS5 color and depth target extensions" {
     try state.writeRegister(.context, 0x3b0, (1919 << 14) | 1079 | (4 << 28));
     try state.writeRegister(.context, 0x3b8, 5 | (0x1b << 14) | (1 << 24));
     try state.writeRegister(.context, 0x08e, 0x0000_000f);
+    try state.writeRegister(.context, 0x00c, 0);
+    try state.writeRegister(.context, 0x00d, 1920 | (1080 << 16));
+    try state.writeRegister(.context, 0x094, 10 | (20 << 16) | (1 << 31));
+    try state.writeRegister(.context, 0x095, 1900 | (1060 << 16));
+    const viewport_words = [_]f32{ 960, 960, 540, 540, 0.5, 0.5 };
+    for (viewport_words, 0..) |value, index| {
+        try state.writeRegister(.context, 0x10f + @as(u32, @intCast(index)), @bitCast(value));
+    }
+    try state.writeRegister(.context, 0x1e0, 4 | (5 << 8) | (1 << 30));
+    try state.writeRegister(.context, 0x202, (1 << 4) | (0xcc << 16));
+    try state.writeRegister(.context, 0x204, 0);
+    try state.writeRegister(.context, 0x205, 2 | 4);
 
     const depth_address: u64 = 0x0012_3456_7800;
     try state.writeRegister(.context, 0x000, 1);
@@ -714,6 +876,17 @@ test "render state decodes PS5 color and depth target extensions" {
     try testing.expectEqual(@as(f32, 0.5), depth.clear_depth);
     try testing.expect(render.depth_control.test_enabled);
     try testing.expect(render.depth_control.write_enabled);
+    try testing.expectEqual(@as(f32, 960), render.viewport.?.x_scale);
+    try testing.expectEqual(@as(f32, 540), render.viewport.?.y_offset);
+    try testing.expectEqual(@as(u16, 10), render.scissor.?.left);
+    try testing.expectEqual(@as(u16, 1060), render.scissor.?.bottom);
+    try testing.expect(render.raster.cull_back);
+    try testing.expect(render.raster.clockwise_front_face);
+    try testing.expect(render.blends[0].enabled);
+    try testing.expectEqual(@as(u5, 4), render.blends[0].color_source);
+    try testing.expectEqual(@as(u5, 5), render.blends[0].color_destination);
+    try testing.expectEqual(@as(u3, 1), render.color_control.mode);
+    try testing.expectEqual(@as(u8, 0xcc), render.color_control.logic_operation);
 }
 
 test "inline user-data decoding is stage-relative and complete" {

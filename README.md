@@ -137,9 +137,12 @@ lowering covers byte/short/dword scalar and vector transfers plus the ten common
 guest VGPR. Graphics modules now declare Vulkan stage interfaces: vertex
 `VertexIndex` can seed an explicit guest VGPR, integer-to-float conversions feed
 position math, `EXP POS0` stores `BuiltIn Position`, and fragment `EXP MRT0`
-stores a four-component color at location zero. Compressed and masked exports,
-additional position/parameter/MRT targets and the remaining graphics system
-VGPRs still fail explicitly.
+stores a four-component color at location zero. The first executable MIMG path
+lowers a 2D `image_sample` with inline image/sampler SGPR descriptors into a
+combined sampled-image descriptor array and `OpImageSampleImplicitLod`.
+Compressed and masked exports, additional position/parameter/MRT targets,
+non-trivial image operands and the remaining graphics system VGPRs still fail
+explicitly.
 
 ## Building
 
@@ -323,6 +326,9 @@ and sampler descriptors, 256-bit image descriptors, stage-relative inline
 user-SGPR data, all eight color targets and the depth/stencil target. The result
 retains 48-bit addresses, unified formats, views and mip ranges, component
 selection, PS5 swizzle modes, MSAA state and CMASK/FMASK/DCC/HTILE metadata.
+The same snapshot now decodes viewport transforms, viewport/screen scissor
+intersection, cull/front-face/polygon state, per-target blend controls and color
+control, so a renderer does not need to interpret raw context-register offsets.
 Snapshots allocate nothing and do not duplicate mutable GPU state: partial PM4
 writes remain in the register banks and are interpreted only when work consumes
 them.
@@ -417,55 +423,38 @@ packet per line with its word offset, and counts the draws and dispatches:
 ## Roadmap
 
 The shared GFX10 staging contract is complete for mip tails, thick 3D blocks,
-Oberon RB+ MSAA addressing and compute-detile constants. The Vulkan foundation
-now owns a Vulkan 1.2 instance, selects a device with one graphics/compute queue,
-creates the logical device, transient command pool, storage descriptor pool and
-driver pipeline cache, and exposes the existing DCB backend interface. Exact
-guest buffer ranges reuse host-upload/device-local allocations while one
-64-element storage descriptor array is rebound from the captured shader state.
-`DISPATCH_DIRECT` now reads the compute program and thread-group state,
-translates supported RDNA2
-through the existing decoder/IR/SPIR-V path, caches the exact resulting module
-and host pipeline, binds the active descriptor array and submits it through a
-fence. Inline V# descriptors and AGC constant-buffer tables are captured at the
-dispatch boundary. The bounded scalar evaluator now specializes a straight
-SMEM prolog against checked guest memory, so V# descriptors loaded from an SRT
-become explicit dispatch constants instead of unsupported GPU-side pointer
-loads. MUBUF byte/short/dword and dword x2/x3/x4 loads/stores lower to SPIR-V,
-including signed extension, subword read/modify/write and combined
-`idxen`/`offen` stride addressing; written device-local ranges are copied back
-into guest memory. The ten 32-bit MUBUF exchange/arithmetic/min-max/bitwise
-atomics now map to SPIR-V storage-buffer atomics with explicit device memory
-ordering and `glc` return-value writeback. V# `add_tid` descriptors use the
-compute invocation's wave-relative lane when forming the descriptor index.
-Swizzled V# resources apply the decoded 8/16/32/64-record `index_stride`
-permutation to every transferred dword, and byte-wise short lowering handles
-both ordinary and swizzle-separated cross-dword accesses. All major shader
-families are length-safe, and decoded
-programs have a validated CFG, typed IR (including memory addressing), SSA
-selection merges and an executable SPIR-V ALU/SDWA/SMEM-specialized/MUBUF path.
+Oberon RB+ MSAA addressing and compute-detile constants. Compute submissions
+already translate the supported RDNA2 ALU/SMEM/MUBUF path, specialize bounded
+scalar prologs, bind staged guest buffers and copy device writes back to guest
+memory. The first graphics frame path now also consumes a decoded PS5 RGBA8
+color target, detiles its existing contents, applies viewport/scissor,
+cull/front-face, write-mask and blend state, executes guest vertex/fragment
+SPIR-V, and tiles the result back into the same guest allocation. A supported
+inline 2D texture and sampler can feed fragment `image_sample` through binding
+1. `ACQUIRE_MEM`, `RELEASE_MEM`, `WAIT_REG_MEM`, `WRITE_DATA` and `EVENT_WRITE`
+preserve ordering through the current synchronous Vulkan queue and checked
+guest labels. `SetFlip` publishes the most recent completed guest frame through
+an API-neutral presentation sink.
+
 The remaining stages are:
 
 1. Finish the DPP/VOP3 operations needed by captures, structured loops and
-   VCC/EXEC divergence.
-2. Bind decoded PS5 color/depth targets, blend/raster state and viewport/scissor
-   state to the now-executable guest vertex/fragment pipeline.
-3. Add sampled/storage image and sampler descriptor arrays, image
-   creation/layout transitions and image operations for textured game draws.
-4. Add surface/swapchain presentation through `SetFlip` and map PM4 acquire,
-   release and event scopes onto Vulkan barriers and host-visible labels.
+   VCC/EXEC divergence, then widen vertex input and export conventions.
+2. Add depth/stencil, multiple render targets, MSAA and compressed
+   DCC/CMASK/FMASK/HTILE render surfaces.
+3. Resolve sampled/storage images through AGC SRT provenance and add the formats,
+   mip/layer views, explicit-LOD operands and image operations seen in captures.
+4. Install the Vulkan DCB backend in live AGC submission, associate registered
+   VideoOut buffers with flips, and attach a window/surface/swapchain consumer to
+   the presentation sink.
 5. Validate packet/state/shader results against captures before optimizing
-   asynchronous submission, descriptor caches and pipeline compilation.
+   asynchronous queues, image/descriptor caches and pipeline compilation.
 
-The guest-shader first-pixels milestone is complete. A bounded
-`DRAW_INDEX_AUTO` path incrementally reads vertex and pixel machine code from
-guest memory, lowers `VertexIndex`, `v_cvt_f32_u32`, position/MRT0 `EXP`, builds
-an exact-SPIR-V graphics pipeline and rasterizes the result into the proven
-offscreen RGBA8 attachment. This is a real guest RDNA2 shader draw, but not yet
-a game frame: it uses the current three-vertex/v0-VertexIndex convention and a
-host-owned target. A continuous game video stream still needs decoded PS5
-render targets and state, image/sampler resources, synchronization, and
-`SetFlip` presentation from the following stages.
+This means the emulator can now produce and hand off an ordered sequence of
+completed guest render-target frames in the hardware smoke path. It is the
+foundation of the game's video output, but not yet a live game window: the HLE
+AGC scheduler and VideoOut registration still need the integration described in
+stage 4 above.
 
 ---
 
@@ -480,9 +469,10 @@ compute. Validation is requested for debug builds when
 `VK_LAYER_KHRONOS_validation` is installed and otherwise disabled cleanly.
 
 The renderer owns instance/device lifetime, the selected queue, a transient
-command pool, host/device memory-type selection, one storage descriptor layout
-and pool, image/view/render-pass/framebuffer creation, and both Vulkan-driver
-and exact-SPIR-V software pipeline caches.
+command pool, host/device memory-type selection, one descriptor layout with
+64 storage buffers plus 64 combined sampled images, its pool, image/view/sampler/
+render-pass/framebuffer creation, and both Vulkan-driver and exact-SPIR-V
+software pipeline caches.
 `stageGuestStorageBuffer` caches up to 256 exact ranges (each at most the Vulkan
 1.2 minimum 128 MiB storage-buffer range). It never treats guest bytes as
 immutable: a cache hit reuses allocations but uploads the current guest range
@@ -492,9 +482,10 @@ does not grow with the buffer cache. Host-write/transfer/compute/readback
 barriers keep the synchronous path explicit, and readback can verify the
 device-local contents.
 
-`dcbBackend` adapts checked guest reads and writes plus draw/dispatch callbacks
-to [`gpu.executor`](src/gpu/executor.zig) without adding a Vulkan dependency to
-the command processor. A direct compute packet resolves `COMPUTE_PGM`, reads
+`dcbBackend` adapts checked guest reads and writes plus synchronization,
+draw/dispatch and flip callbacks to [`gpu.executor`](src/gpu/executor.zig)
+without adding a Vulkan dependency to the command processor. A direct compute
+packet resolves `COMPUTE_PGM`, reads
 `COMPUTE_NUM_THREAD_X/Y/Z`, incrementally decodes guest code, translates the
 supported shader to SPIR-V 1.5, creates or reuses its compute pipeline, binds the
 active storage set and dispatches the packet's XYZ group counts. Errors remain
@@ -502,9 +493,11 @@ explicit: a missing program, unsupported shader semantic or indirect dispatch
 rejects that backend callback and records the exact error. Draw callbacks count
 work by default. When both vertex and pixel program registers are present, a
 three-vertex `DRAW_INDEX_AUTO` decodes both guest programs, lowers their stage
-interfaces and exports, creates or reuses the exact graphics pipeline, records a
-real Vulkan draw, transitions the offscreen RGBA8 image for transfer and reads
-the complete frame back. A half-bound graphics program fails explicitly.
+interfaces and exports, creates or reuses a pipeline keyed by exact SPIR-V and
+decoded graphics state, and records a real Vulkan draw into the active guest
+RGBA8 color target. Existing target bytes are detiled and uploaded before the
+render pass; the completed image is read back and tiled into guest memory. A
+half-bound graphics program fails explicitly.
 `enable_graphics_probe` retains the fixed-shader diagnostic only for draws with
 no guest graphics programs. Compute dispatch captures scalar user data,
 optionally resolves
@@ -522,6 +515,20 @@ readback as stores. Swizzled descriptors use V# `index_stride` to permute each
 dword address, while short loads/stores are split into byte operations so they
 remain correct across both linear and swizzle-separated dword boundaries.
 Dynamically unresolved SMEM and images remain explicit unsupported semantics.
+For the supported fragment subset, inline 2D RGBA8 image and sampler descriptors
+are decoded from user SGPRs, detiled into a sampled Vulkan image, transitioned
+to shader-read layout and bound through set 0/binding 1. The first MIMG lowering
+supports normalized two-coordinate `image_sample`; other formats, dimensions,
+mips and sampling operands fail explicitly.
+
+The PM4 synchronization callbacks currently choose correctness over overlap:
+acquire, release, write-data and event operations wait for the queue to become
+idle before publishing guest-visible labels or data. The executor remains
+responsible for deciding whether `WAIT_REG_MEM` is satisfied and preserving its
+continuation. `SetFlip` waits for completion and sends an immutable view of the
+latest linear frame, its dimensions, guest address and flip metadata to an
+optional `PresentationSink`. This is deliberately independent of a particular
+window system; a swapchain consumer is the next live-runtime integration step.
 
 `vulkan-smoke` is an explicit hardware test rather than part of `zig build test`,
 so machines without a Vulkan runtime can still build and test every module. The
@@ -543,9 +550,11 @@ twice, checking guest-visible writeback plus allocation and pipeline miss/hit
 paths. Finally, the fixed diagnostic draw first proves the render-target path.
 Synthetic vertex and fragment RDNA2 programs are then written into guest memory:
 the vertex shader converts the DCB-provided vertex index, calculates three
-positions and exports `POS0`; the fragment shader exports an MRT0 color. Both
-guest draws pass through the real decoder/translator and exact graphics-pipeline
-cache, rasterize into a 64×64 RGBA8 image and validate the readback pixels:
+positions and exports `POS0`; fragment variants export an MRT0 color or sample a
+4×4 guest texture. Three guest draws pass through the real decoder/translator,
+decoded graphics state and exact pipeline cache, render into a 64×64 guest RGBA8
+target, validate its tiled writeback, execute the PM4 synchronization packets and
+verify that `SetFlip` delivers the completed frame to a presentation sink:
 
 ```sh
 zig build vulkan-smoke
@@ -556,8 +565,10 @@ Vulkan 1.4.321: NVIDIA GeForce RTX 3070 Ti
 device API 1.4.329, queue family 0, validation off
 headless smoke passed: 1 compute dispatch, 64 staging bytes copied and verified
 translated RDNA2 passed: 6 dispatches, pipelines 3/3 miss/hit, buffers 6/6 miss/hit
-graphics DCB probe passed: 1 diagnostic + 2 guest draws, pipelines 2/1 miss/hit
-guest RDNA2 frame passed: 1152 colored pixels in 64x64 RGBA8 frame
+graphics DCB probe passed: 1 diagnostic + 3 guest draws, pipelines 3/1 miss/hit
+guest RDNA2 frame passed: 1152 colored pixels in 64x64 RGBA8 target
+sampled image passed: 1 guest texture upload
+PM4 synchronization + SetFlip passed: 1 presented frame
 ```
 
 ---

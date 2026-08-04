@@ -316,6 +316,20 @@ pub const StageBindings = struct {
         return try resources.decodeBufferDescriptor(self.user_data[first..][0..4]);
     }
 
+    pub fn inlineImageDescriptor(self: *const StageBindings, resource_sgpr: u32) Error!?resources.ImageDescriptor {
+        if (resource_sgpr < self.scalar_user_data_base) return null;
+        const first: usize = resource_sgpr - self.scalar_user_data_base;
+        if (first + 8 > self.user_data_count) return null;
+        return try resources.decodeImageDescriptor(self.user_data[first..][0..8]);
+    }
+
+    pub fn inlineSamplerDescriptor(self: *const StageBindings, sampler_sgpr: u32) Error!?resources.SamplerDescriptor {
+        if (sampler_sgpr < self.scalar_user_data_base) return null;
+        const first: usize = sampler_sgpr - self.scalar_user_data_base;
+        if (first + 4 > self.user_data_count) return null;
+        return try resources.decodeSamplerDescriptor(self.user_data[first..][0..4]);
+    }
+
     pub fn resolve(
         self: *const StageBindings,
         reader: MemoryReader,

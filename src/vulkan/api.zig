@@ -64,6 +64,7 @@ pub const Image = u64;
 pub const ImageView = u64;
 pub const RenderPass = u64;
 pub const Framebuffer = u64;
+pub const Sampler = u64;
 
 pub const structure_type_application_info: u32 = 0;
 pub const structure_type_instance_create_info: u32 = 1;
@@ -88,6 +89,7 @@ pub const structure_type_pipeline_color_blend_state_create_info: u32 = 26;
 pub const structure_type_graphics_pipeline_create_info: u32 = 28;
 pub const structure_type_compute_pipeline_create_info: u32 = 29;
 pub const structure_type_pipeline_layout_create_info: u32 = 30;
+pub const structure_type_sampler_create_info: u32 = 31;
 pub const structure_type_descriptor_set_layout_create_info: u32 = 32;
 pub const structure_type_descriptor_pool_create_info: u32 = 33;
 pub const structure_type_descriptor_set_allocate_info: u32 = 34;
@@ -114,7 +116,9 @@ pub const buffer_usage_transfer_dst_bit: Flags = 0x0000_0002;
 pub const buffer_usage_transfer_src_bit: Flags = 0x0000_0001;
 pub const buffer_usage_storage_buffer_bit: Flags = 0x0000_0020;
 pub const image_usage_transfer_src_bit: Flags = 0x0000_0001;
+pub const image_usage_transfer_dst_bit: Flags = 0x0000_0002;
 pub const image_usage_color_attachment_bit: Flags = 0x0000_0010;
+pub const image_usage_sampled_bit: Flags = 0x0000_0004;
 pub const sharing_mode_exclusive: u32 = 0;
 
 pub const memory_property_host_visible_bit: Flags = 0x0000_0002;
@@ -127,7 +131,9 @@ pub const shader_stage_vertex_bit: Flags = 0x0000_0001;
 pub const shader_stage_fragment_bit: Flags = 0x0000_0010;
 pub const shader_stage_compute_bit: Flags = 0x0000_0020;
 pub const pipeline_stage_transfer_bit: Flags = 0x0000_1000;
+pub const pipeline_stage_top_of_pipe_bit: Flags = 0x0000_0001;
 pub const pipeline_stage_compute_shader_bit: Flags = 0x0000_0800;
+pub const pipeline_stage_fragment_shader_bit: Flags = 0x0000_0080;
 pub const pipeline_stage_color_attachment_output_bit: Flags = 0x0000_0400;
 pub const pipeline_stage_host_bit: Flags = 0x0000_4000;
 pub const access_shader_read_bit: Flags = 0x0000_0020;
@@ -135,6 +141,7 @@ pub const access_shader_write_bit: Flags = 0x0000_0040;
 pub const access_transfer_read_bit: Flags = 0x0000_0800;
 pub const access_transfer_write_bit: Flags = 0x0000_1000;
 pub const access_color_attachment_write_bit: Flags = 0x0000_0100;
+pub const access_color_attachment_read_bit: Flags = 0x0000_0080;
 pub const access_host_read_bit: Flags = 0x0000_2000;
 pub const access_host_write_bit: Flags = 0x0000_4000;
 
@@ -143,6 +150,7 @@ pub const physical_device_type_integrated_gpu: u32 = 1;
 pub const physical_device_type_discrete_gpu: u32 = 2;
 
 pub const descriptor_type_storage_buffer: u32 = 7;
+pub const descriptor_type_combined_image_sampler: u32 = 1;
 
 pub const format_r8g8b8a8_unorm: u32 = 37;
 pub const image_type_2d: u32 = 1;
@@ -151,9 +159,12 @@ pub const image_tiling_optimal: u32 = 0;
 pub const sample_count_1_bit: Flags = 1;
 pub const image_layout_undefined: u32 = 0;
 pub const image_layout_color_attachment_optimal: u32 = 2;
+pub const image_layout_shader_read_only_optimal: u32 = 5;
 pub const image_layout_transfer_src_optimal: u32 = 6;
+pub const image_layout_transfer_dst_optimal: u32 = 7;
 pub const image_aspect_color_bit: Flags = 1;
 pub const attachment_load_op_clear: u32 = 1;
+pub const attachment_load_op_load: u32 = 0;
 pub const attachment_store_op_store: u32 = 0;
 pub const attachment_load_op_dont_care: u32 = 2;
 pub const attachment_store_op_dont_care: u32 = 1;
@@ -411,6 +422,12 @@ pub const DescriptorBufferInfo = extern struct {
     range: DeviceSize,
 };
 
+pub const DescriptorImageInfo = extern struct {
+    sampler: Sampler,
+    image_view: ImageView,
+    image_layout: u32,
+};
+
 pub const WriteDescriptorSet = extern struct {
     s_type: u32 = structure_type_write_descriptor_set,
     p_next: ?*const anyopaque = null,
@@ -422,6 +439,27 @@ pub const WriteDescriptorSet = extern struct {
     image_info: ?*const anyopaque = null,
     buffer_info: ?[*]const DescriptorBufferInfo,
     texel_buffer_view: ?[*]const u64 = null,
+};
+
+pub const SamplerCreateInfo = extern struct {
+    s_type: u32 = structure_type_sampler_create_info,
+    p_next: ?*const anyopaque = null,
+    flags: Flags = 0,
+    magnification_filter: u32,
+    minification_filter: u32,
+    mipmap_mode: u32,
+    address_mode_u: u32,
+    address_mode_v: u32,
+    address_mode_w: u32,
+    mip_lod_bias: f32,
+    anisotropy_enable: Bool32 = 0,
+    maximum_anisotropy: f32 = 1,
+    compare_enable: Bool32 = 0,
+    compare_operation: u32 = 7,
+    minimum_lod: f32,
+    maximum_lod: f32,
+    border_color: u32 = 0,
+    unnormalized_coordinates: Bool32 = 0,
 };
 
 pub const PipelineLayoutCreateInfo = extern struct {
@@ -726,6 +764,8 @@ pub const PfnGetImageMemoryRequirements = *const fn (Device, Image, *MemoryRequi
 pub const PfnBindImageMemory = *const fn (Device, Image, DeviceMemory, DeviceSize) callconv(call) Result;
 pub const PfnCreateImageView = *const fn (Device, *const ImageViewCreateInfo, ?*const anyopaque, *ImageView) callconv(call) Result;
 pub const PfnDestroyImageView = *const fn (Device, ImageView, ?*const anyopaque) callconv(call) void;
+pub const PfnCreateSampler = *const fn (Device, *const SamplerCreateInfo, ?*const anyopaque, *Sampler) callconv(call) Result;
+pub const PfnDestroySampler = *const fn (Device, Sampler, ?*const anyopaque) callconv(call) void;
 pub const PfnMapMemory = *const fn (Device, DeviceMemory, DeviceSize, DeviceSize, Flags, *?*anyopaque) callconv(call) Result;
 pub const PfnUnmapMemory = *const fn (Device, DeviceMemory) callconv(call) void;
 pub const PfnCreateShaderModule = *const fn (Device, *const ShaderModuleCreateInfo, ?*const anyopaque, *ShaderModule) callconv(call) Result;
@@ -756,6 +796,7 @@ pub const PfnCmdDraw = *const fn (CommandBuffer, u32, u32, u32, u32) callconv(ca
 pub const PfnCmdFillBuffer = *const fn (CommandBuffer, Buffer, DeviceSize, DeviceSize, u32) callconv(call) void;
 pub const PfnCmdCopyBuffer = *const fn (CommandBuffer, Buffer, Buffer, u32, [*]const BufferCopy) callconv(call) void;
 pub const PfnCmdCopyImageToBuffer = *const fn (CommandBuffer, Image, u32, Buffer, u32, [*]const BufferImageCopy) callconv(call) void;
+pub const PfnCmdCopyBufferToImage = *const fn (CommandBuffer, Buffer, Image, u32, u32, [*]const BufferImageCopy) callconv(call) void;
 pub const PfnCmdPipelineBarrier = *const fn (CommandBuffer, Flags, Flags, Flags, u32, ?*const anyopaque, u32, ?[*]const BufferMemoryBarrier, u32, ?*const anyopaque) callconv(call) void;
 
 comptime {

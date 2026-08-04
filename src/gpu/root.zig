@@ -33,6 +33,7 @@ pub const ScalarEvaluation = scalar_provenance.Evaluation;
 pub const ShaderAnalysis = shader_analysis.Analysis;
 pub const ShaderSpirvStage = shader_analysis.SpirvStage;
 pub const ShaderSpirvStorageBufferBinding = shader_analysis.SpirvStorageBufferBinding;
+pub const ShaderSpirvSampledImageBinding = shader_analysis.SpirvSampledImageBinding;
 pub const ShaderSpirvScalarRegister = shader_analysis.SpirvScalarRegister;
 pub const SurfaceLayout = tiling.Layout;
 pub const TextureLayout = tiling.TextureLayout;

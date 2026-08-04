@@ -10,6 +10,7 @@ const shaders = @import("shaders.zig");
 pub const SpirvStage = rdna2.spirv.Stage;
 pub const SpirvOptions = rdna2.spirv.Options;
 pub const SpirvStorageBufferBinding = rdna2.spirv.StorageBufferBinding;
+pub const SpirvSampledImageBinding = rdna2.spirv.SampledImageBinding;
 pub const SpirvScalarRegister = rdna2.spirv.ScalarRegister;
 
 pub const Error = shaders.Error || rdna2.Error || rdna2.control_flow.Error || std.mem.Allocator.Error || error{

@@ -8,7 +8,7 @@ const vulkan = @import("vulkan");
 const gpu = @import("gpu");
 
 const GuestMemory = struct {
-    bytes: [8192]u8 = @splat(0),
+    bytes: [65536]u8 = @splat(0),
 
     fn read(context: ?*anyopaque, address: u64, destination: []u8) bool {
         const self: *GuestMemory = @ptrCast(@alignCast(context.?));
@@ -40,6 +40,30 @@ fn command(opcode: u8, body_words: u14) u32 {
         (@as(u32, body_words - 1) << 16) |
         (@as(u32, opcode) << 8);
 }
+
+fn customCommand(code: u6, body_words: u14) u32 {
+    return command(gpu.pm4.nop, body_words) | (@as(u32, code) << 2);
+}
+
+const PresentProbe = struct {
+    calls: u32 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    center: [4]u8 = @splat(0),
+    argument: i64 = 0,
+
+    fn present(context: ?*anyopaque, frame: vulkan.PresentedFrame) bool {
+        const self: *PresentProbe = @ptrCast(@alignCast(context.?));
+        if (frame.pixels.len != @as(usize, frame.width) * frame.height * 4) return false;
+        const center = (@as(usize, frame.height / 2) * frame.width + frame.width / 2) * 4;
+        self.calls += 1;
+        self.width = frame.width;
+        self.height = frame.height;
+        @memcpy(&self.center, frame.pixels[center..][0..4]);
+        self.argument = frame.flip.argument;
+        return true;
+    }
+};
 
 fn vop1(opcode: u8, destination: u8, source: u9) u32 {
     return (@as(u32, 0x3f) << 25) |
@@ -369,6 +393,30 @@ pub fn main(init: std.process.Init) !void {
     try state.writeRegister(.shader, gpu.resources.ShaderStage.vertex.programRegisterBase() + 1, 0);
     try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.programRegisterBase(), fragment_program_address >> 8);
     try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.programRegisterBase() + 1, 0);
+    const color_target_address = 0x2000;
+    @memset(guest.bytes[color_target_address .. color_target_address + vulkan.graphics_probe_width * vulkan.graphics_probe_height * 4], 0);
+    try state.writeRegister(.context, 0x318, color_target_address >> 8);
+    try state.writeRegister(.context, 0x319, vulkan.graphics_probe_width / 8 - 1);
+    try state.writeRegister(.context, 0x31b, 0);
+    try state.writeRegister(.context, 0x31c, 10 << 2); // COLOR_8_8_8_8, unorm, no compression
+    try state.writeRegister(.context, 0x31d, 0);
+    try state.writeRegister(.context, 0x390, 0);
+    try state.writeRegister(.context, 0x3b0, ((vulkan.graphics_probe_width - 1) << 14) | (vulkan.graphics_probe_height - 1));
+    try state.writeRegister(.context, 0x3b8, 1 << 24); // one layer, linear tile mode
+    try state.writeRegister(.context, 0x08e, 0xf);
+    try state.writeRegister(.context, 0x00c, 0);
+    try state.writeRegister(.context, 0x00d, vulkan.graphics_probe_width | (vulkan.graphics_probe_height << 16));
+    try state.writeRegister(.context, 0x094, 1 << 31);
+    try state.writeRegister(.context, 0x095, vulkan.graphics_probe_width | (vulkan.graphics_probe_height << 16));
+    const viewport = [_]f32{ 32, 32, 32, 32, 1, 0 };
+    for (viewport, 0..) |value, index| {
+        try state.writeRegister(.context, 0x10f + @as(u32, @intCast(index)), @bitCast(value));
+    }
+    try state.writeRegister(.context, 0x1e0, 0);
+    try state.writeRegister(.context, 0x200, 0);
+    try state.writeRegister(.context, 0x202, 0xcc << 16);
+    try state.writeRegister(.context, 0x204, 0);
+    try state.writeRegister(.context, 0x205, 0);
     _ = try executor.execute(&draw_stream);
     _ = try executor.execute(&draw_stream);
     if (renderer.draw_callbacks != 3 or renderer.translated_draws != 3 or renderer.guest_graphics_draws != 2) {
@@ -380,6 +428,128 @@ pub fn main(init: std.process.Init) !void {
     if (renderer.graphics_probe_colored_pixels == 0 or renderer.last_draw_error != null) {
         return error.InvalidGuestGraphicsFrame;
     }
+    const target_center = color_target_address +
+        (vulkan.graphics_probe_height / 2 * vulkan.graphics_probe_width + vulkan.graphics_probe_width / 2) * 4;
+    const target_pixel = guest.bytes[target_center..][0..4];
+    if (target_pixel[0] < 200 or target_pixel[1] < 40 or target_pixel[1] > 100 or
+        target_pixel[2] > 80 or target_pixel[3] != 255)
+    {
+        return error.InvalidGuestColorTargetWriteback;
+    }
+
+    const texture_address = 0x9000;
+    const texture_width = 4;
+    const texture_height = 4;
+    const texture_pitch = 64;
+    const texture_color = [4]u8{ 16, 220, 40, 255 };
+    @memset(guest.bytes[texture_address .. texture_address + texture_pitch * texture_height * 4], 0);
+    for (0..texture_height) |y| {
+        for (0..texture_width) |x| {
+            const offset = texture_address + (y * texture_pitch + x) * 4;
+            @memcpy(guest.bytes[offset..][0..4], &texture_color);
+        }
+    }
+    const encoded_texture_address = texture_address >> 8;
+    const image_descriptor = [_]u32{
+        encoded_texture_address,
+        (56 << 20) | ((texture_width - 1) << 30),
+        (texture_height - 1) << 14,
+        0x9000_0fac, // 2D, linear, RGBA destination select
+        texture_pitch - 1,
+        0,
+        0,
+        0,
+    };
+    for (image_descriptor, 0..) |word, index| {
+        try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.userDataBase() + @as(u32, @intCast(index)), word);
+    }
+    for (0..4) |index| {
+        try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.userDataBase() + 8 + @as(u32, @intCast(index)), 0);
+    }
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.userDataBase() - 1, 12 << 1);
+    fragment_pc = fragment_program_address;
+    guest.word(fragment_pc, vop1(0x01, 0, 255)); // u = 0.5
+    guest.word(fragment_pc + 4, 0x3f00_0000);
+    fragment_pc += 8;
+    guest.word(fragment_pc, vop1(0x01, 1, 255)); // v = 0.5
+    guest.word(fragment_pc + 4, 0x3f00_0000);
+    fragment_pc += 8;
+    guest.word(fragment_pc, 0xf080_0f08); // image_sample dim:2d dmask:xyzw
+    guest.word(fragment_pc + 4, 0x0040_0200); // v2:v5, v0:v1, s0:s7, s8:s11
+    fragment_pc += 8;
+    guest.word(fragment_pc, 0xf800_080f); // exp mrt0, v2, v3, v4, v5 done
+    guest.word(fragment_pc + 4, 0x0504_0302);
+    guest.word(fragment_pc + 8, 0xbf81_0000);
+    _ = try executor.execute(&draw_stream);
+    if (renderer.guest_graphics_draws != 3 or renderer.translated_draws != 4 or
+        renderer.graphics_pipeline_cache_misses != 3 or renderer.guest_color_target_writes != 3 or
+        renderer.sampled_image_uploads != 1)
+    {
+        return error.InvalidTexturedGraphicsDrawResult;
+    }
+    if (!std.mem.eql(u8, target_pixel, &texture_color)) return error.InvalidSampledTextureColor;
+
+    var present_probe = PresentProbe{};
+    renderer.setPresentationSink(.{ .context = &present_probe, .present = PresentProbe.present });
+    const label_address = 0x7000;
+    const sync_and_flip = [_]u32{
+        customCommand(gpu.pm4.custom.acquire_mem, 7),
+        0x8000_0001,
+        0x20,
+        0,
+        0x10,
+        0,
+        3,
+        0x388,
+        customCommand(gpu.pm4.custom.write_data, 4),
+        5,
+        label_address,
+        0,
+        0x1122_3344,
+        customCommand(gpu.pm4.custom.wait_mem_32, 6),
+        label_address,
+        0,
+        0xffff_ffff,
+        0x1122_3344,
+        0x13,
+        1,
+        customCommand(gpu.pm4.custom.release_mem, 7),
+        0x28 | (5 << 8),
+        1 << 29,
+        label_address + 0x10,
+        0,
+        0xaabb_ccdd,
+        0,
+        0,
+        command(gpu.pm4.event_write, 1),
+        0x20,
+        customCommand(gpu.pm4.custom.flip, 5),
+        1,
+        0,
+        1,
+        0x89ab_cdef,
+        0x0123_4567,
+    };
+    const sync_result = try executor.execute(&sync_and_flip);
+    if (sync_result.status != .complete or renderer.acquire_callbacks != 1 or
+        renderer.write_data_callbacks != 1 or renderer.wait_callbacks != 1 or
+        renderer.release_callbacks != 1 or renderer.event_callbacks != 1 or
+        renderer.flip_callbacks != 1 or renderer.presented_frames != 1)
+    {
+        return error.InvalidVulkanSynchronizationCallbacks;
+    }
+    if (std.mem.readInt(u32, guest.bytes[label_address..][0..4], .little) != 0x1122_3344 or
+        std.mem.readInt(u32, guest.bytes[label_address + 0x10 ..][0..4], .little) != 0xaabb_ccdd)
+    {
+        return error.InvalidVulkanLabelWrite;
+    }
+    if (present_probe.calls != 1 or present_probe.width != vulkan.graphics_probe_width or
+        present_probe.height != vulkan.graphics_probe_height or
+        present_probe.argument != 0x0123_4567_89ab_cdef or
+        !std.mem.eql(u8, &present_probe.center, target_pixel))
+    {
+        return error.InvalidPresentedFrame;
+    }
 
     var output_buffer: [1024]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &output_buffer);
@@ -390,7 +560,9 @@ pub fn main(init: std.process.Init) !void {
             "headless smoke passed: {d} compute dispatch, {d} staging bytes copied and verified\n" ++
             "translated RDNA2 passed: {d} dispatches, pipelines {d}/{d} miss/hit, buffers {d}/{d} miss/hit\n" ++
             "graphics DCB probe passed: 1 diagnostic + {d} guest draws, pipelines {d}/{d} miss/hit\n" ++
-            "guest RDNA2 frame passed: {d} colored pixels in {d}x{d} RGBA8 frame\n",
+            "guest RDNA2 frame passed: {d} colored pixels in {d}x{d} RGBA8 target\n" ++
+            "sampled image passed: {d} guest texture upload\n" ++
+            "PM4 synchronization + SetFlip passed: {d} presented frame\n",
         .{
             vulkan.api.apiMajor(renderer.loader_api_version),
             vulkan.api.apiMinor(renderer.loader_api_version),
@@ -414,6 +586,8 @@ pub fn main(init: std.process.Init) !void {
             renderer.graphics_probe_colored_pixels,
             vulkan.graphics_probe_width,
             vulkan.graphics_probe_height,
+            renderer.sampled_image_uploads,
+            renderer.presented_frames,
         },
     );
     try writer.flush();

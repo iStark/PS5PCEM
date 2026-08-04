@@ -67,6 +67,13 @@ pub const Error = error{
     UnsupportedIndirectDispatch,
     UnsupportedDrawPacket,
     GraphicsProbeReadbackMismatch,
+    MissingColorTarget,
+    UnsupportedColorTarget,
+    UnsupportedGraphicsState,
+    MissingPresentedFrame,
+    PresentationRejected,
+    UnsupportedSampledImage,
+    SamplerCreationFailed,
 };
 
 pub const Options = struct {
@@ -97,6 +104,20 @@ pub const SmokeReport = struct {
     bytes_copied: usize,
     compute_dispatches: u32,
     queue_family_index: u32,
+};
+
+pub const PresentedFrame = struct {
+    pixels: []const u8,
+    width: u32,
+    height: u32,
+    row_pitch_bytes: u32,
+    guest_address: u64,
+    flip: gpu.state.Flip,
+};
+
+pub const PresentationSink = struct {
+    context: ?*anyopaque,
+    present: *const fn (?*anyopaque, PresentedFrame) bool,
 };
 
 pub const StagedBuffer = struct {
@@ -229,6 +250,8 @@ const DeviceFunctions = struct {
     bind_image_memory: vk.PfnBindImageMemory,
     create_image_view: vk.PfnCreateImageView,
     destroy_image_view: vk.PfnDestroyImageView,
+    create_sampler: vk.PfnCreateSampler,
+    destroy_sampler: vk.PfnDestroySampler,
     map_memory: vk.PfnMapMemory,
     unmap_memory: vk.PfnUnmapMemory,
     create_shader_module: vk.PfnCreateShaderModule,
@@ -258,6 +281,7 @@ const DeviceFunctions = struct {
     cmd_draw: vk.PfnCmdDraw,
     cmd_copy_buffer: vk.PfnCmdCopyBuffer,
     cmd_copy_image_to_buffer: vk.PfnCmdCopyImageToBuffer,
+    cmd_copy_buffer_to_image: vk.PfnCmdCopyBufferToImage,
     cmd_pipeline_barrier: vk.PfnCmdPipelineBarrier,
 
     fn load(get_proc: vk.PfnGetDeviceProcAddr, device: vk.Device) Error!DeviceFunctions {
@@ -287,6 +311,8 @@ const DeviceFunctions = struct {
             .bind_image_memory = try deviceProc(get_proc, device, vk.PfnBindImageMemory, "vkBindImageMemory"),
             .create_image_view = try deviceProc(get_proc, device, vk.PfnCreateImageView, "vkCreateImageView"),
             .destroy_image_view = try deviceProc(get_proc, device, vk.PfnDestroyImageView, "vkDestroyImageView"),
+            .create_sampler = try deviceProc(get_proc, device, vk.PfnCreateSampler, "vkCreateSampler"),
+            .destroy_sampler = try deviceProc(get_proc, device, vk.PfnDestroySampler, "vkDestroySampler"),
             .map_memory = try deviceProc(get_proc, device, vk.PfnMapMemory, "vkMapMemory"),
             .unmap_memory = try deviceProc(get_proc, device, vk.PfnUnmapMemory, "vkUnmapMemory"),
             .create_shader_module = try deviceProc(get_proc, device, vk.PfnCreateShaderModule, "vkCreateShaderModule"),
@@ -316,6 +342,7 @@ const DeviceFunctions = struct {
             .cmd_draw = try deviceProc(get_proc, device, vk.PfnCmdDraw, "vkCmdDraw"),
             .cmd_copy_buffer = try deviceProc(get_proc, device, vk.PfnCmdCopyBuffer, "vkCmdCopyBuffer"),
             .cmd_copy_image_to_buffer = try deviceProc(get_proc, device, vk.PfnCmdCopyImageToBuffer, "vkCmdCopyImageToBuffer"),
+            .cmd_copy_buffer_to_image = try deviceProc(get_proc, device, vk.PfnCmdCopyBufferToImage, "vkCmdCopyBufferToImage"),
             .cmd_pipeline_barrier = try deviceProc(get_proc, device, vk.PfnCmdPipelineBarrier, "vkCmdPipelineBarrier"),
         };
     }
@@ -349,6 +376,7 @@ pub const maximum_storage_descriptors = 64;
 const maximum_compute_pipelines = 256;
 const maximum_graphics_pipelines = 256;
 const maximum_staged_buffer_bytes = 128 * 1024 * 1024;
+const maximum_frame_bytes = 128 * 1024 * 1024;
 
 const GuestBufferEntry = struct {
     guest_address: u64,
@@ -366,9 +394,91 @@ const ComputePipelineEntry = struct {
 
 const GraphicsPipelineEntry = struct {
     hash: u64,
+    state: GraphicsPipelineState,
     vertex_words: []u32,
     fragment_words: []u32,
     pipeline: vk.Pipeline,
+};
+
+const GraphicsPipelineState = extern struct {
+    width: u32,
+    height: u32,
+    viewport_x_bits: u32,
+    viewport_y_bits: u32,
+    viewport_width_bits: u32,
+    viewport_height_bits: u32,
+    viewport_min_depth_bits: u32,
+    viewport_max_depth_bits: u32,
+    scissor_x: i32,
+    scissor_y: i32,
+    scissor_width: u32,
+    scissor_height: u32,
+    cull_mode: u32,
+    front_face: u32,
+    rasterizer_discard: u32,
+    color_write_mask: u32,
+    blend_enable: u32,
+    source_color_blend_factor: u32,
+    destination_color_blend_factor: u32,
+    color_blend_operation: u32,
+    source_alpha_blend_factor: u32,
+    destination_alpha_blend_factor: u32,
+    alpha_blend_operation: u32,
+
+    fn default(width: u32, height: u32) GraphicsPipelineState {
+        return .{
+            .width = width,
+            .height = height,
+            .viewport_x_bits = @bitCast(@as(f32, 0)),
+            .viewport_y_bits = @bitCast(@as(f32, 0)),
+            .viewport_width_bits = @bitCast(@as(f32, @floatFromInt(width))),
+            .viewport_height_bits = @bitCast(@as(f32, @floatFromInt(height))),
+            .viewport_min_depth_bits = @bitCast(@as(f32, 0)),
+            .viewport_max_depth_bits = @bitCast(@as(f32, 1)),
+            .scissor_x = 0,
+            .scissor_y = 0,
+            .scissor_width = width,
+            .scissor_height = height,
+            .cull_mode = 0,
+            .front_face = 1,
+            .rasterizer_discard = 0,
+            .color_write_mask = vk.color_component_rgba_bits,
+            .blend_enable = 0,
+            .source_color_blend_factor = 0,
+            .destination_color_blend_factor = 0,
+            .color_blend_operation = 0,
+            .source_alpha_blend_factor = 0,
+            .destination_alpha_blend_factor = 0,
+            .alpha_blend_operation = 0,
+        };
+    }
+};
+
+const GuestColorTarget = struct {
+    descriptor: gpu.resources.ColorTarget,
+    layout: gpu.SurfaceLayout,
+};
+
+const PreparedSampledImage = struct {
+    image: OwnedImage,
+    view: vk.ImageView,
+    sampler: vk.Sampler,
+};
+
+const GraphicsResources = struct {
+    images: [maximum_storage_descriptors]PreparedSampledImage = undefined,
+    image_count: usize = 0,
+    mappings: [maximum_storage_descriptors]gpu.ShaderSpirvSampledImageBinding = undefined,
+    mapping_count: usize = 0,
+
+    fn deinit(self: *GraphicsResources, renderer: *Renderer) void {
+        for (self.images[0..self.image_count]) |image| {
+            renderer.device_functions.destroy_sampler(renderer.device, image.sampler, null);
+            renderer.device_functions.destroy_image_view(renderer.device, image.view, null);
+            renderer.destroyImage(image.image);
+        }
+        self.* = undefined;
+    }
 };
 
 const PipelineLookup = struct {
@@ -440,6 +550,20 @@ pub const Renderer = struct {
     guest_graphics_draws: u64 = 0,
     graphics_probe_colored_pixels: u32 = 0,
     graphics_probe_frame: [graphics_probe_bytes]u8 = @splat(0),
+    latest_frame: std.ArrayList(u8) = .empty,
+    latest_frame_width: u32 = 0,
+    latest_frame_height: u32 = 0,
+    latest_frame_address: u64 = 0,
+    presentation_sink: ?PresentationSink = null,
+    presented_frames: u64 = 0,
+    guest_color_target_writes: u64 = 0,
+    sampled_image_uploads: u64 = 0,
+    acquire_callbacks: u64 = 0,
+    release_callbacks: u64 = 0,
+    wait_callbacks: u64 = 0,
+    write_data_callbacks: u64 = 0,
+    event_callbacks: u64 = 0,
+    flip_callbacks: u64 = 0,
     dispatch_callbacks: u64 = 0,
     translated_dispatches: u64 = 0,
     buffer_cache_hits: u64 = 0,
@@ -451,6 +575,8 @@ pub const Renderer = struct {
     graphics_pipeline_cache_misses: u64 = 0,
     last_dispatch_error: ?anyerror = null,
     last_draw_error: ?anyerror = null,
+    last_sync_error: ?anyerror = null,
+    last_flip_error: ?anyerror = null,
 
     pub fn init(allocator: std.mem.Allocator, options: Options) (Error || std.mem.Allocator.Error)!Renderer {
         var loader = try Loader.init();
@@ -527,9 +653,16 @@ pub const Renderer = struct {
             .descriptor_count = maximum_storage_descriptors,
             .stage_flags = vk.shader_stage_compute_bit,
         };
+        const sampled_image_binding = vk.DescriptorSetLayoutBinding{
+            .binding = 1,
+            .descriptor_type = vk.descriptor_type_combined_image_sampler,
+            .descriptor_count = maximum_storage_descriptors,
+            .stage_flags = vk.shader_stage_fragment_bit,
+        };
+        const descriptor_bindings = [_]vk.DescriptorSetLayoutBinding{ storage_binding, sampled_image_binding };
         const descriptor_layout_info = vk.DescriptorSetLayoutCreateInfo{
-            .binding_count = 1,
-            .bindings = @ptrCast(&storage_binding),
+            .binding_count = descriptor_bindings.len,
+            .bindings = &descriptor_bindings,
         };
         var descriptor_set_layout: vk.DescriptorSetLayout = 0;
         if (device_functions.create_descriptor_set_layout(device, &descriptor_layout_info, null, &descriptor_set_layout) != vk.success) {
@@ -541,10 +674,15 @@ pub const Renderer = struct {
             .descriptor_type = vk.descriptor_type_storage_buffer,
             .descriptor_count = maximum_storage_descriptors,
         };
+        const image_pool_size = vk.DescriptorPoolSize{
+            .descriptor_type = vk.descriptor_type_combined_image_sampler,
+            .descriptor_count = maximum_storage_descriptors,
+        };
+        const pool_sizes = [_]vk.DescriptorPoolSize{ pool_size, image_pool_size };
         const descriptor_pool_info = vk.DescriptorPoolCreateInfo{
             .max_sets = 1,
-            .pool_size_count = 1,
-            .pool_sizes = @ptrCast(&pool_size),
+            .pool_size_count = pool_sizes.len,
+            .pool_sizes = &pool_sizes,
         };
         var descriptor_pool: vk.DescriptorPool = 0;
         if (device_functions.create_descriptor_pool(device, &descriptor_pool_info, null, &descriptor_pool) != vk.success) {
@@ -620,6 +758,7 @@ pub const Renderer = struct {
             self.allocator.free(entry.fragment_words);
         }
         self.graphics_pipelines.deinit(self.allocator);
+        self.latest_frame.deinit(self.allocator);
         for (self.guest_buffers.items) |entry| {
             self.destroyBuffer(entry.device_local);
             self.destroyBuffer(entry.upload);
@@ -644,6 +783,14 @@ pub const Renderer = struct {
     pub fn dcbBackend(self: *Renderer, memory: GuestMemory) gpu.DcbBackend {
         self.guest_memory = memory;
         return .{ .context = self, .vtable = &dcb_vtable };
+    }
+
+    /// Installs the host consumer for completed `SetFlip` frames. The sink is
+    /// invoked synchronously after all prior Vulkan work and guest target
+    /// writeback have completed, so callers may copy or display `pixels`
+    /// without owning Vulkan resources.
+    pub fn setPresentationSink(self: *Renderer, sink: ?PresentationSink) void {
+        self.presentation_sink = sink;
     }
 
     /// Reuses host/device allocations for an exact guest range while uploading
@@ -1213,12 +1360,12 @@ pub const Renderer = struct {
         };
     }
 
-    fn createGraphicsProbeRenderPass(self: *Renderer) Error!vk.RenderPass {
+    fn createGraphicsRenderPass(self: *Renderer, preserve_color: bool) Error!vk.RenderPass {
         const attachment = vk.AttachmentDescription{
             .format = vk.format_r8g8b8a8_unorm,
-            .load_operation = vk.attachment_load_op_clear,
+            .load_operation = if (preserve_color) vk.attachment_load_op_load else vk.attachment_load_op_clear,
             .store_operation = vk.attachment_store_op_store,
-            .initial_layout = vk.image_layout_undefined,
+            .initial_layout = if (preserve_color) vk.image_layout_color_attachment_optimal else vk.image_layout_undefined,
             .final_layout = vk.image_layout_color_attachment_optimal,
         };
         const reference = vk.AttachmentReference{
@@ -1242,9 +1389,108 @@ pub const Renderer = struct {
         return render_pass;
     }
 
+    fn guestGraphicsState(render: *const gpu.RenderState, target: gpu.resources.ColorTarget) Error!GraphicsPipelineState {
+        var result = GraphicsPipelineState.default(target.width, target.height);
+        if (render.viewport) |viewport| {
+            const x = viewport.x_offset - viewport.x_scale;
+            const y = viewport.y_offset - viewport.y_scale;
+            const width = viewport.x_scale * 2.0;
+            const height = viewport.y_scale * 2.0;
+            const min_depth = viewport.z_offset;
+            const max_depth = viewport.z_offset + viewport.z_scale;
+            if (!std.math.isFinite(x) or !std.math.isFinite(y) or
+                !std.math.isFinite(width) or !std.math.isFinite(height) or
+                !std.math.isFinite(min_depth) or !std.math.isFinite(max_depth) or
+                width == 0 or height == 0)
+            {
+                return Error.UnsupportedGraphicsState;
+            }
+            result.viewport_x_bits = @bitCast(x);
+            result.viewport_y_bits = @bitCast(y);
+            result.viewport_width_bits = @bitCast(width);
+            result.viewport_height_bits = @bitCast(height);
+            result.viewport_min_depth_bits = @bitCast(std.math.clamp(min_depth, 0, 1));
+            result.viewport_max_depth_bits = @bitCast(std.math.clamp(max_depth, 0, 1));
+        }
+        if (render.scissor) |scissor| {
+            const left: u32 = @min(scissor.left, target.width);
+            const top: u32 = @min(scissor.top, target.height);
+            const right: u32 = @min(@max(scissor.right, left), target.width);
+            const bottom: u32 = @min(@max(scissor.bottom, top), target.height);
+            result.scissor_x = @intCast(left);
+            result.scissor_y = @intCast(top);
+            result.scissor_width = right - left;
+            result.scissor_height = bottom - top;
+        }
+        if (render.raster.polygon_mode != 0 or
+            render.raster.depth_bias_front or render.raster.depth_bias_back)
+        {
+            return Error.UnsupportedGraphicsState;
+        }
+        result.cull_mode = @as(u32, @intFromBool(render.raster.cull_front)) |
+            (@as(u32, @intFromBool(render.raster.cull_back)) << 1);
+        result.front_face = if (render.raster.clockwise_front_face) 0 else 1;
+        result.rasterizer_discard = @intFromBool(render.raster.rasterizer_discard);
+        result.color_write_mask = target.write_mask;
+
+        const blend = render.blends[target.slot];
+        result.blend_enable = @intFromBool(blend.enabled);
+        if (blend.enabled) {
+            result.source_color_blend_factor = try vulkanBlendFactor(blend.color_source);
+            result.destination_color_blend_factor = try vulkanBlendFactor(blend.color_destination);
+            result.color_blend_operation = try vulkanBlendOperation(blend.color_operation);
+            result.source_alpha_blend_factor = if (blend.separate_alpha)
+                try vulkanBlendFactor(blend.alpha_source)
+            else
+                result.source_color_blend_factor;
+            result.destination_alpha_blend_factor = if (blend.separate_alpha)
+                try vulkanBlendFactor(blend.alpha_destination)
+            else
+                result.destination_color_blend_factor;
+            result.alpha_blend_operation = if (blend.separate_alpha)
+                try vulkanBlendOperation(blend.alpha_operation)
+            else
+                result.color_blend_operation;
+        }
+        return result;
+    }
+
+    fn vulkanBlendFactor(factor: u5) Error!u32 {
+        return switch (factor) {
+            0...3 => factor,
+            4 => 6,
+            5 => 7,
+            6 => 8,
+            7 => 9,
+            8 => 4,
+            9 => 5,
+            10 => 14,
+            13 => 10,
+            14 => 11,
+            15 => 15,
+            16 => 16,
+            17 => 17,
+            18 => 18,
+            19 => 12,
+            20 => 13,
+            else => Error.UnsupportedGraphicsState,
+        };
+    }
+
+    fn vulkanBlendOperation(operation: u3) Error!u32 {
+        return switch (operation) {
+            0, 1 => operation,
+            2 => 3,
+            3 => 4,
+            4 => 2,
+            else => Error.UnsupportedGraphicsState,
+        };
+    }
+
     fn createGraphicsPipeline(
         self: *Renderer,
         render_pass: vk.RenderPass,
+        pipeline_state: GraphicsPipelineState,
         vertex_words: []const u32,
         fragment_words: []const u32,
     ) Error!vk.Pipeline {
@@ -1259,16 +1505,16 @@ pub const Renderer = struct {
         const vertex_input = vk.PipelineVertexInputStateCreateInfo{};
         const input_assembly = vk.PipelineInputAssemblyStateCreateInfo{};
         const viewport = vk.Viewport{
-            .x = 0,
-            .y = 0,
-            .width = @floatFromInt(graphics_probe_width),
-            .height = @floatFromInt(graphics_probe_height),
-            .min_depth = 0,
-            .max_depth = 1,
+            .x = @bitCast(pipeline_state.viewport_x_bits),
+            .y = @bitCast(pipeline_state.viewport_y_bits),
+            .width = @bitCast(pipeline_state.viewport_width_bits),
+            .height = @bitCast(pipeline_state.viewport_height_bits),
+            .min_depth = @bitCast(pipeline_state.viewport_min_depth_bits),
+            .max_depth = @bitCast(pipeline_state.viewport_max_depth_bits),
         };
         const scissor = vk.Rect2D{
-            .offset = .{ .x = 0, .y = 0 },
-            .extent = .{ .width = graphics_probe_width, .height = graphics_probe_height },
+            .offset = .{ .x = pipeline_state.scissor_x, .y = pipeline_state.scissor_y },
+            .extent = .{ .width = pipeline_state.scissor_width, .height = pipeline_state.scissor_height },
         };
         const viewport_state = vk.PipelineViewportStateCreateInfo{
             .viewport_count = 1,
@@ -1276,9 +1522,22 @@ pub const Renderer = struct {
             .scissor_count = 1,
             .scissors = @ptrCast(&scissor),
         };
-        const rasterization = vk.PipelineRasterizationStateCreateInfo{};
+        const rasterization = vk.PipelineRasterizationStateCreateInfo{
+            .rasterizer_discard_enable = pipeline_state.rasterizer_discard,
+            .cull_mode = pipeline_state.cull_mode,
+            .front_face = pipeline_state.front_face,
+        };
         const multisample = vk.PipelineMultisampleStateCreateInfo{};
-        const blend_attachment = vk.PipelineColorBlendAttachmentState{};
+        const blend_attachment = vk.PipelineColorBlendAttachmentState{
+            .blend_enable = pipeline_state.blend_enable,
+            .source_color_blend_factor = pipeline_state.source_color_blend_factor,
+            .destination_color_blend_factor = pipeline_state.destination_color_blend_factor,
+            .color_blend_operation = pipeline_state.color_blend_operation,
+            .source_alpha_blend_factor = pipeline_state.source_alpha_blend_factor,
+            .destination_alpha_blend_factor = pipeline_state.destination_alpha_blend_factor,
+            .alpha_blend_operation = pipeline_state.alpha_blend_operation,
+            .color_write_mask = pipeline_state.color_write_mask,
+        };
         const color_blend = vk.PipelineColorBlendStateCreateInfo{
             .attachment_count = 1,
             .attachments = @ptrCast(&blend_attachment),
@@ -1312,13 +1571,16 @@ pub const Renderer = struct {
     fn getGraphicsPipeline(
         self: *Renderer,
         render_pass: vk.RenderPass,
+        pipeline_state: GraphicsPipelineState,
         vertex_words: []const u32,
         fragment_words: []const u32,
     ) (Error || std.mem.Allocator.Error)!vk.Pipeline {
-        const vertex_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(vertex_words));
+        const state_hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&pipeline_state));
+        const vertex_hash = std.hash.Wyhash.hash(state_hash, std.mem.sliceAsBytes(vertex_words));
         const hash = std.hash.Wyhash.hash(vertex_hash, std.mem.sliceAsBytes(fragment_words));
         for (self.graphics_pipelines.items) |entry| {
             if (entry.hash == hash and
+                std.mem.eql(u8, std.mem.asBytes(&entry.state), std.mem.asBytes(&pipeline_state)) and
                 std.mem.eql(u32, entry.vertex_words, vertex_words) and
                 std.mem.eql(u32, entry.fragment_words, fragment_words))
             {
@@ -1333,10 +1595,11 @@ pub const Renderer = struct {
         errdefer self.allocator.free(owned_vertex);
         const owned_fragment = try self.allocator.dupe(u32, fragment_words);
         errdefer self.allocator.free(owned_fragment);
-        const pipeline = try self.createGraphicsPipeline(render_pass, vertex_words, fragment_words);
+        const pipeline = try self.createGraphicsPipeline(render_pass, pipeline_state, vertex_words, fragment_words);
         errdefer self.device_functions.destroy_pipeline(self.device, pipeline, null);
         try self.graphics_pipelines.append(self.allocator, .{
             .hash = hash,
+            .state = pipeline_state,
             .vertex_words = owned_vertex,
             .fragment_words = owned_fragment,
             .pipeline = pipeline,
@@ -1349,13 +1612,40 @@ pub const Renderer = struct {
         self: *Renderer,
         vertex_words: []const u32,
         fragment_words: []const u32,
+        pipeline_state: GraphicsPipelineState,
+        guest_target: ?GuestColorTarget,
+        bind_graphics_descriptors: bool,
         validate_diagnostic_color: bool,
-    ) (Error || std.mem.Allocator.Error)!void {
+    ) anyerror!void {
+        const width = pipeline_state.width;
+        const height = pipeline_state.height;
+        const frame_pixels = std.math.mul(usize, @as(usize, width), @as(usize, height)) catch {
+            return Error.UnsupportedColorTarget;
+        };
+        const frame_bytes = std.math.mul(usize, frame_pixels, 4) catch return Error.UnsupportedColorTarget;
+        if (frame_bytes == 0 or frame_bytes > maximum_frame_bytes) return Error.UnsupportedColorTarget;
+        var frame = try self.allocator.alloc(u8, frame_bytes);
+        defer self.allocator.free(frame);
+        var upload: ?OwnedBuffer = null;
+        defer if (upload) |buffer| self.destroyBuffer(buffer);
+        if (guest_target) |target| {
+            if (target.layout.staging_bytes != frame_bytes) return Error.UnsupportedColorTarget;
+            const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+            const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
+            try target.layout.stage(reader, target.descriptor.address, frame);
+            upload = try self.createBuffer(
+                frame_bytes,
+                vk.buffer_usage_transfer_src_bit,
+                vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+            );
+            try self.writeMapped(upload.?, frame);
+        }
         const color = try self.createImage(
-            graphics_probe_width,
-            graphics_probe_height,
+            width,
+            height,
             vk.format_r8g8b8a8_unorm,
-            vk.image_usage_color_attachment_bit | vk.image_usage_transfer_src_bit,
+            vk.image_usage_color_attachment_bit | vk.image_usage_transfer_src_bit |
+                (if (guest_target != null) vk.image_usage_transfer_dst_bit else 0),
         );
         defer self.destroyImage(color);
 
@@ -1370,14 +1660,14 @@ pub const Renderer = struct {
         }
         defer self.device_functions.destroy_image_view(self.device, view, null);
 
-        const render_pass = try self.createGraphicsProbeRenderPass();
+        const render_pass = try self.createGraphicsRenderPass(guest_target != null);
         defer self.device_functions.destroy_render_pass(self.device, render_pass, null);
         const framebuffer_info = vk.FramebufferCreateInfo{
             .render_pass = render_pass,
             .attachment_count = 1,
             .attachments = @ptrCast(&view),
-            .width = graphics_probe_width,
-            .height = graphics_probe_height,
+            .width = width,
+            .height = height,
         };
         var framebuffer: vk.Framebuffer = 0;
         if (self.device_functions.create_framebuffer(self.device, &framebuffer_info, null, &framebuffer) != vk.success) {
@@ -1385,9 +1675,9 @@ pub const Renderer = struct {
         }
         defer self.device_functions.destroy_framebuffer(self.device, framebuffer, null);
 
-        const pipeline = try self.getGraphicsPipeline(render_pass, vertex_words, fragment_words);
+        const pipeline = try self.getGraphicsPipeline(render_pass, pipeline_state, vertex_words, fragment_words);
         const readback = try self.createBuffer(
-            graphics_probe_bytes,
+            frame_bytes,
             vk.buffer_usage_transfer_dst_bit,
             vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
         );
@@ -1395,19 +1685,85 @@ pub const Renderer = struct {
 
         const command_buffer = try self.beginOneShot();
         defer self.device_functions.free_command_buffers(self.device, self.command_pool, 1, @ptrCast(&command_buffer));
+        if (upload) |upload_buffer| {
+            const transfer_barrier = vk.ImageMemoryBarrier{
+                .source_access_mask = 0,
+                .destination_access_mask = vk.access_transfer_write_bit,
+                .old_layout = vk.image_layout_undefined,
+                .new_layout = vk.image_layout_transfer_dst_optimal,
+                .image = color.handle,
+                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+            };
+            self.device_functions.cmd_pipeline_barrier(
+                command_buffer,
+                vk.pipeline_stage_top_of_pipe_bit,
+                vk.pipeline_stage_transfer_bit,
+                0,
+                0,
+                null,
+                0,
+                null,
+                1,
+                @ptrCast(&transfer_barrier),
+            );
+            const upload_copy = vk.BufferImageCopy{
+                .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+                .image_extent = .{ .width = width, .height = height, .depth = 1 },
+            };
+            self.device_functions.cmd_copy_buffer_to_image(
+                command_buffer,
+                upload_buffer.handle,
+                color.handle,
+                vk.image_layout_transfer_dst_optimal,
+                1,
+                @ptrCast(&upload_copy),
+            );
+            const attachment_barrier = vk.ImageMemoryBarrier{
+                .source_access_mask = vk.access_transfer_write_bit,
+                .destination_access_mask = vk.access_color_attachment_read_bit | vk.access_color_attachment_write_bit,
+                .old_layout = vk.image_layout_transfer_dst_optimal,
+                .new_layout = vk.image_layout_color_attachment_optimal,
+                .image = color.handle,
+                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+            };
+            self.device_functions.cmd_pipeline_barrier(
+                command_buffer,
+                vk.pipeline_stage_transfer_bit,
+                vk.pipeline_stage_color_attachment_output_bit,
+                0,
+                0,
+                null,
+                0,
+                null,
+                1,
+                @ptrCast(&attachment_barrier),
+            );
+        }
         const clear = vk.ClearValue{ .color = .{ .float32 = .{ 0, 0, 0, 1 } } };
         const begin_info = vk.RenderPassBeginInfo{
             .render_pass = render_pass,
             .framebuffer = framebuffer,
             .render_area = .{
                 .offset = .{ .x = 0, .y = 0 },
-                .extent = .{ .width = graphics_probe_width, .height = graphics_probe_height },
+                .extent = .{ .width = width, .height = height },
             },
-            .clear_value_count = 1,
+            .clear_value_count = if (guest_target == null) 1 else 0,
             .clear_values = @ptrCast(&clear),
         };
         self.device_functions.cmd_begin_render_pass(command_buffer, &begin_info, vk.subpass_contents_inline);
         self.device_functions.cmd_bind_pipeline(command_buffer, vk.pipeline_bind_point_graphics, pipeline);
+        if (bind_graphics_descriptors) {
+            self.device_functions.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk.pipeline_bind_point_graphics,
+                self.compute_pipeline_layout,
+                0,
+                1,
+                @ptrCast(&self.descriptor_set),
+                0,
+                null,
+            );
+        }
         self.device_functions.cmd_draw(command_buffer, 3, 1, 0, 0);
         self.device_functions.cmd_end_render_pass(command_buffer);
 
@@ -1433,7 +1789,7 @@ pub const Renderer = struct {
         );
         const copy = vk.BufferImageCopy{
             .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
-            .image_extent = .{ .width = graphics_probe_width, .height = graphics_probe_height, .depth = 1 },
+            .image_extent = .{ .width = width, .height = height, .depth = 1 },
         };
         self.device_functions.cmd_copy_image_to_buffer(
             command_buffer,
@@ -1463,11 +1819,13 @@ pub const Renderer = struct {
             null,
         );
         try self.submitOneShot(command_buffer);
-        try self.readMapped(readback, &self.graphics_probe_frame);
+        try self.readMapped(readback, frame);
+        if (guest_target) |target| try self.commitGuestColorTarget(target, frame);
+        if (frame.len == self.graphics_probe_frame.len) @memcpy(&self.graphics_probe_frame, frame);
 
-        const center = (@as(usize, graphics_probe_height / 2) * graphics_probe_width + graphics_probe_width / 2) * 4;
-        const corner = self.graphics_probe_frame[0..4];
-        const center_pixel = self.graphics_probe_frame[center..][0..4];
+        const center = (@as(usize, height / 2) * width + width / 2) * 4;
+        const corner = frame[0..4];
+        const center_pixel = frame[center..][0..4];
         if (validate_diagnostic_color and
             (!std.mem.eql(u8, corner, &.{ 0, 0, 0, 255 }) or
                 center_pixel[0] < 200 or center_pixel[1] < 40 or center_pixel[1] > 100 or
@@ -1477,32 +1835,75 @@ pub const Renderer = struct {
         }
         var colored: u32 = 0;
         var pixel: usize = 0;
-        while (pixel < self.graphics_probe_frame.len) : (pixel += 4) {
-            if (self.graphics_probe_frame[pixel] != 0 or
-                self.graphics_probe_frame[pixel + 1] != 0 or
-                self.graphics_probe_frame[pixel + 2] != 0)
-            {
+        while (pixel < frame.len) : (pixel += 4) {
+            if (frame[pixel] != 0 or frame[pixel + 1] != 0 or frame[pixel + 2] != 0) {
                 colored += 1;
             }
         }
         if (validate_diagnostic_color and
-            (colored == 0 or colored >= graphics_probe_width * graphics_probe_height))
+            (colored == 0 or colored >= width * height))
         {
             return Error.GraphicsProbeReadbackMismatch;
         }
         self.graphics_probe_colored_pixels = colored;
     }
 
-    fn drawGraphicsProbe(self: *Renderer) (Error || std.mem.Allocator.Error)!void {
+    fn commitGuestColorTarget(self: *Renderer, target: GuestColorTarget, frame: []const u8) anyerror!void {
+        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        const allocation_bytes = std.math.cast(usize, target.layout.required_source_bytes) orelse {
+            return Error.UnsupportedColorTarget;
+        };
+        if (allocation_bytes > maximum_frame_bytes) return Error.UnsupportedColorTarget;
+        const tiled = try self.allocator.alloc(u8, allocation_bytes);
+        defer self.allocator.free(tiled);
+        if (!memory.read(memory.context, target.descriptor.address, tiled)) return Error.GuestMemoryReadFailed;
+        try target.layout.tile(frame, tiled);
+        if (!memory.write(memory.context, target.descriptor.address, tiled)) return Error.GuestMemoryWriteFailed;
+        self.latest_frame.clearRetainingCapacity();
+        try self.latest_frame.appendSlice(self.allocator, frame);
+        self.latest_frame_width = target.descriptor.width;
+        self.latest_frame_height = target.descriptor.height;
+        self.latest_frame_address = target.descriptor.address;
+        self.guest_color_target_writes += 1;
+    }
+
+    fn drawGraphicsProbe(self: *Renderer) anyerror!void {
         return self.drawGraphicsShaders(
             &graphics_probe_vertex_spirv,
             &graphics_probe_fragment_spirv,
+            GraphicsPipelineState.default(graphics_probe_width, graphics_probe_height),
+            null,
+            false,
             true,
         );
     }
 
     fn drawGuestGraphics(self: *Renderer, state: *const gpu.State) anyerror!void {
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        const render_state = gpu.resources.decodeRenderState(state);
+        if (render_state.active_color_count == 0) return Error.MissingColorTarget;
+        if (render_state.active_color_count != 1 or render_state.depth_control.test_enabled or
+            render_state.depth_control.write_enabled)
+        {
+            return Error.UnsupportedGraphicsState;
+        }
+        var target_descriptor: ?gpu.resources.ColorTarget = null;
+        for (render_state.color_targets) |candidate| {
+            const target = candidate orelse continue;
+            if (!target.isActive()) continue;
+            target_descriptor = target;
+            break;
+        }
+        const descriptor = target_descriptor orelse return Error.MissingColorTarget;
+        if (descriptor.format != 10 or descriptor.samples_log2 != 0 or descriptor.fragments_log2 != 0 or
+            descriptor.dcc_enabled or descriptor.cmask_fast_clear or descriptor.fmask_compression)
+        {
+            return Error.UnsupportedColorTarget;
+        }
+        const layout = try gpu.SurfaceLayout.fromColorTarget(descriptor);
+        if (layout.layers != 1 or layout.block.bytes_per_element != 4) return Error.UnsupportedColorTarget;
+        const pipeline_state = try guestGraphicsState(&render_state, descriptor);
+        const target = GuestColorTarget{ .descriptor = descriptor, .layout = layout };
         const vertex_address = gpu.resources.ShaderStage.vertex.programAddress(state) orelse {
             return Error.MissingGraphicsProgram;
         };
@@ -1514,14 +1915,71 @@ pub const Renderer = struct {
         defer vertex_analysis.deinit(self.allocator);
         var fragment_analysis = try gpu.shader_analysis.decode(self.allocator, reader, fragment_address, 4096);
         defer fragment_analysis.deinit(self.allocator);
+        const fragment_header = if (memory.shader_header) |resolve|
+            resolve(memory.context, fragment_address)
+        else
+            null;
+        const fragment_bindings = try gpu.ShaderBindings.capture(state, .pixel, fragment_header, reader);
+        var graphics_resources = try self.prepareGraphicsResources(&fragment_bindings, &fragment_analysis);
+        defer graphics_resources.deinit(self);
         var vertex_module = try vertex_analysis.translateSpirv(self.allocator, .{
             .stage = .vertex,
             .vertex_index_vgpr = 0,
         });
         defer vertex_module.deinit(self.allocator);
-        var fragment_module = try fragment_analysis.translateSpirv(self.allocator, .{ .stage = .fragment });
+        var fragment_module = try fragment_analysis.translateSpirv(self.allocator, .{
+            .stage = .fragment,
+            .sampled_images = graphics_resources.mappings[0..graphics_resources.mapping_count],
+            .descriptor_array_length = maximum_storage_descriptors,
+        });
         defer fragment_module.deinit(self.allocator);
-        try self.drawGraphicsShaders(vertex_module.words, fragment_module.words, false);
+        try self.drawGraphicsShaders(
+            vertex_module.words,
+            fragment_module.words,
+            pipeline_state,
+            target,
+            graphics_resources.mapping_count != 0,
+            false,
+        );
+    }
+
+    fn prepareGraphicsResources(
+        self: *Renderer,
+        bindings: *const gpu.ShaderBindings,
+        analysis: *const gpu.ShaderAnalysis,
+    ) anyerror!GraphicsResources {
+        var result = GraphicsResources{};
+        errdefer result.deinit(self);
+        for (analysis.program.instructions.items) |inst| {
+            if (inst.opcode != .image_sample) continue;
+            if (inst.src1.kind != .sgpr or inst.src2.kind != .sgpr) return Error.UnsupportedSampledImage;
+            var existing = false;
+            for (result.mappings[0..result.mapping_count]) |mapping| {
+                if (mapping.resource_sgpr == inst.src1.reg and mapping.sampler_sgpr == inst.src2.reg) {
+                    existing = true;
+                    break;
+                }
+            }
+            if (existing) continue;
+            if (result.mapping_count >= maximum_storage_descriptors) return Error.UnsupportedSampledImage;
+            const image_descriptor = (try bindings.inlineImageDescriptor(inst.src1.reg)) orelse {
+                return Error.UnsupportedSampledImage;
+            };
+            const sampler_descriptor = (try bindings.inlineSamplerDescriptor(inst.src2.reg)) orelse {
+                return Error.UnsupportedSampledImage;
+            };
+            const descriptor_index: u32 = @intCast(result.mapping_count);
+            const image = try self.stageSampledImage(image_descriptor, sampler_descriptor, descriptor_index);
+            result.images[result.image_count] = image;
+            result.image_count += 1;
+            result.mappings[result.mapping_count] = .{
+                .resource_sgpr = inst.src1.reg,
+                .sampler_sgpr = inst.src2.reg,
+                .descriptor_index = descriptor_index,
+            };
+            result.mapping_count += 1;
+        }
+        return result;
     }
 
     fn createBuffer(self: *Renderer, size: vk.DeviceSize, usage: vk.Flags, properties: vk.Flags) Error!OwnedBuffer {
@@ -1598,6 +2056,176 @@ pub const Renderer = struct {
             .buffer_info = @ptrCast(&buffer_info),
         };
         self.device_functions.update_descriptor_sets(self.device, 1, @ptrCast(&write), 0, null);
+    }
+
+    fn updateSampledImageDescriptor(
+        self: *Renderer,
+        descriptor_index: u32,
+        view: vk.ImageView,
+        sampler: vk.Sampler,
+    ) void {
+        const image_info = vk.DescriptorImageInfo{
+            .sampler = sampler,
+            .image_view = view,
+            .image_layout = vk.image_layout_shader_read_only_optimal,
+        };
+        const write = vk.WriteDescriptorSet{
+            .destination_set = self.descriptor_set,
+            .destination_binding = 1,
+            .destination_array_element = descriptor_index,
+            .descriptor_count = 1,
+            .descriptor_type = vk.descriptor_type_combined_image_sampler,
+            .image_info = @ptrCast(&image_info),
+            .buffer_info = null,
+        };
+        self.device_functions.update_descriptor_sets(self.device, 1, @ptrCast(&write), 0, null);
+    }
+
+    fn stageSampledImage(
+        self: *Renderer,
+        descriptor: gpu.resources.ImageDescriptor,
+        sampler_descriptor: gpu.resources.SamplerDescriptor,
+        descriptor_index: u32,
+    ) anyerror!PreparedSampledImage {
+        if (descriptor.unified_format != 56 or descriptor.image_type != .color_2d or
+            descriptor.metadata_address != 0)
+        {
+            return Error.UnsupportedSampledImage;
+        }
+        const layout = try gpu.SurfaceLayout.fromImage(descriptor);
+        if (layout.layers != 1 or layout.block.bytes_per_element != 4 or
+            layout.staging_bytes == 0 or layout.staging_bytes > maximum_frame_bytes)
+        {
+            return Error.UnsupportedSampledImage;
+        }
+        const byte_count = std.math.cast(usize, layout.staging_bytes) orelse return Error.UnsupportedSampledImage;
+        const linear = try self.allocator.alloc(u8, byte_count);
+        defer self.allocator.free(linear);
+        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
+        try layout.stage(reader, descriptor.address, linear);
+        const upload = try self.createBuffer(
+            byte_count,
+            vk.buffer_usage_transfer_src_bit,
+            vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+        );
+        defer self.destroyBuffer(upload);
+        try self.writeMapped(upload, linear);
+        const image = try self.createImage(
+            descriptor.width,
+            descriptor.height,
+            vk.format_r8g8b8a8_unorm,
+            vk.image_usage_transfer_dst_bit | vk.image_usage_sampled_bit,
+        );
+        errdefer self.destroyImage(image);
+
+        const command_buffer = try self.beginOneShot();
+        defer self.device_functions.free_command_buffers(self.device, self.command_pool, 1, @ptrCast(&command_buffer));
+        const upload_barrier = vk.ImageMemoryBarrier{
+            .source_access_mask = 0,
+            .destination_access_mask = vk.access_transfer_write_bit,
+            .old_layout = vk.image_layout_undefined,
+            .new_layout = vk.image_layout_transfer_dst_optimal,
+            .image = image.handle,
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_top_of_pipe_bit,
+            vk.pipeline_stage_transfer_bit,
+            0,
+            0,
+            null,
+            0,
+            null,
+            1,
+            @ptrCast(&upload_barrier),
+        );
+        const copy = vk.BufferImageCopy{
+            .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+            .image_extent = .{ .width = descriptor.width, .height = descriptor.height, .depth = 1 },
+        };
+        self.device_functions.cmd_copy_buffer_to_image(
+            command_buffer,
+            upload.handle,
+            image.handle,
+            vk.image_layout_transfer_dst_optimal,
+            1,
+            @ptrCast(&copy),
+        );
+        const shader_barrier = vk.ImageMemoryBarrier{
+            .source_access_mask = vk.access_transfer_write_bit,
+            .destination_access_mask = vk.access_shader_read_bit,
+            .old_layout = vk.image_layout_transfer_dst_optimal,
+            .new_layout = vk.image_layout_shader_read_only_optimal,
+            .image = image.handle,
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_transfer_bit,
+            vk.pipeline_stage_fragment_shader_bit,
+            0,
+            0,
+            null,
+            0,
+            null,
+            1,
+            @ptrCast(&shader_barrier),
+        );
+        try self.submitOneShot(command_buffer);
+
+        const view_info = vk.ImageViewCreateInfo{
+            .image = image.handle,
+            .format = vk.format_r8g8b8a8_unorm,
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        var view: vk.ImageView = 0;
+        if (self.device_functions.create_image_view(self.device, &view_info, null, &view) != vk.success) {
+            return Error.ImageViewCreationFailed;
+        }
+        errdefer self.device_functions.destroy_image_view(self.device, view, null);
+        const sampler = try self.createGuestSampler(sampler_descriptor);
+        errdefer self.device_functions.destroy_sampler(self.device, sampler, null);
+        self.updateSampledImageDescriptor(descriptor_index, view, sampler);
+        self.sampled_image_uploads += 1;
+        return .{ .image = image, .view = view, .sampler = sampler };
+    }
+
+    fn createGuestSampler(self: *Renderer, descriptor: gpu.resources.SamplerDescriptor) Error!vk.Sampler {
+        if (descriptor.magnification_filter > 1 or descriptor.minification_filter > 1 or
+            descriptor.mip_filter > 1 or descriptor.unnormalized_coordinates)
+        {
+            return Error.UnsupportedSampledImage;
+        }
+        const info = vk.SamplerCreateInfo{
+            .magnification_filter = descriptor.magnification_filter,
+            .minification_filter = descriptor.minification_filter,
+            .mipmap_mode = descriptor.mip_filter,
+            .address_mode_u = try vulkanAddressMode(descriptor.clamp_x),
+            .address_mode_v = try vulkanAddressMode(descriptor.clamp_y),
+            .address_mode_w = try vulkanAddressMode(descriptor.clamp_z),
+            .mip_lod_bias = descriptor.lod_bias,
+            .minimum_lod = descriptor.minimum_lod,
+            .maximum_lod = descriptor.maximum_lod,
+        };
+        var sampler: vk.Sampler = 0;
+        if (self.device_functions.create_sampler(self.device, &info, null, &sampler) != vk.success) {
+            return Error.SamplerCreationFailed;
+        }
+        return sampler;
+    }
+
+    fn vulkanAddressMode(mode: u8) Error!u32 {
+        return switch (mode) {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            3 => 4,
+            4 => 3,
+            5 => 4,
+            else => Error.UnsupportedSampledImage,
+        };
     }
 
     fn beginOneShot(self: *Renderer) Error!vk.CommandBuffer {
@@ -1707,6 +2335,12 @@ pub const Renderer = struct {
     const dcb_vtable = gpu.DcbBackend.VTable{
         .read = dcbRead,
         .write = dcbWrite,
+        .acquire = dcbAcquire,
+        .release = dcbRelease,
+        .wait = dcbWait,
+        .write_data = dcbWriteData,
+        .event = dcbEvent,
+        .flip = dcbFlip,
         .draw = dcbDraw,
         .dispatch = dcbDispatch,
     };
@@ -1723,6 +2357,104 @@ pub const Renderer = struct {
     fn dcbWrite(context: ?*anyopaque, address: u64, bytes: []const u8) bool {
         const memory = fromContext(context).guest_memory orelse return false;
         return memory.write(memory.context, address, bytes);
+    }
+
+    fn waitForDevice(self: *Renderer) bool {
+        if (self.device_functions.device_wait_idle(self.device) != vk.success) {
+            self.last_sync_error = Error.DeviceWaitFailed;
+            return false;
+        }
+        self.last_sync_error = null;
+        return true;
+    }
+
+    fn dcbAcquire(context: ?*anyopaque, _: gpu.state.AcquireMem) bool {
+        const self = fromContext(context);
+        self.acquire_callbacks += 1;
+        return self.waitForDevice();
+    }
+
+    fn dcbRelease(context: ?*anyopaque, release: gpu.state.ReleaseMem) bool {
+        const self = fromContext(context);
+        self.release_callbacks += 1;
+        if (!self.waitForDevice()) return false;
+        if ((release.destination != 0 and release.destination != 1) or release.address == 0) return true;
+        var bytes: [8]u8 = undefined;
+        return switch (release.data_selection) {
+            0 => true,
+            1 => blk: {
+                std.mem.writeInt(u32, bytes[0..4], @truncate(release.data), .little);
+                break :blk dcbWrite(context, release.address, bytes[0..4]);
+            },
+            2 => blk: {
+                std.mem.writeInt(u64, &bytes, release.data, .little);
+                break :blk dcbWrite(context, release.address, &bytes);
+            },
+            else => false,
+        };
+    }
+
+    fn dcbWait(context: ?*anyopaque, _: gpu.state.WaitRegMem, _: bool) bool {
+        const self = fromContext(context);
+        self.wait_callbacks += 1;
+        // The command processor has already performed the checked label read.
+        // A false result blocks the DCB; accepting the callback preserves that
+        // continuation rather than turning a normal wait into a backend error.
+        self.last_sync_error = null;
+        return true;
+    }
+
+    fn dcbWriteData(context: ?*anyopaque, info: gpu.state.WriteData, values: []const u32) bool {
+        const self = fromContext(context);
+        self.write_data_callbacks += 1;
+        if (!self.waitForDevice()) return false;
+        if (info.destination != 1 and info.destination != 2 and
+            info.destination != 4 and info.destination != 5)
+        {
+            return true;
+        }
+        var bytes: [4]u8 = undefined;
+        for (values, 0..) |value, index| {
+            std.mem.writeInt(u32, &bytes, value, .little);
+            const address = info.address + if (info.increment_address) @as(u64, index) * 4 else 0;
+            if (!dcbWrite(context, address, &bytes)) return false;
+        }
+        return true;
+    }
+
+    fn dcbEvent(context: ?*anyopaque, _: gpu.state.EventWrite) bool {
+        const self = fromContext(context);
+        self.event_callbacks += 1;
+        return self.waitForDevice();
+    }
+
+    fn dcbFlip(context: ?*anyopaque, flip: gpu.state.Flip) bool {
+        const self = fromContext(context);
+        self.flip_callbacks += 1;
+        if (!self.waitForDevice()) {
+            self.last_flip_error = self.last_sync_error;
+            return false;
+        }
+        if (self.latest_frame.items.len == 0) {
+            self.last_flip_error = Error.MissingPresentedFrame;
+            return false;
+        }
+        if (self.presentation_sink) |sink| {
+            if (!sink.present(sink.context, .{
+                .pixels = self.latest_frame.items,
+                .width = self.latest_frame_width,
+                .height = self.latest_frame_height,
+                .row_pitch_bytes = self.latest_frame_width * 4,
+                .guest_address = self.latest_frame_address,
+                .flip = flip,
+            })) {
+                self.last_flip_error = Error.PresentationRejected;
+                return false;
+            }
+        }
+        self.presented_frames += 1;
+        self.last_flip_error = null;
+        return true;
     }
 
     fn dcbDraw(context: ?*anyopaque, state: *const gpu.State, packet: gpu.pm4.Packet) bool {

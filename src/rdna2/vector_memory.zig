@@ -284,6 +284,23 @@ pub fn decodeMimg(pc: u32, code: []const u32, word_index: u32) Error!Instruction
     inst.globally_coherent = (word0 >> 13) & 1 != 0;
     inst.system_coherent = (word0 >> 25) & 1 != 0;
     inst.image_sample_flags.a16 = (word1 >> 30) & 1 != 0;
+    if (op == .image_sample) {
+        switch (id) {
+            0x20 => {},
+            0x24 => inst.image_sample_flags.lod = true,
+            0x25 => inst.image_sample_flags.bias = true,
+            0x27 => inst.image_sample_flags.level_zero = true,
+            else => {},
+        }
+    }
+    inst.image_address_components = switch (inst.image_dimension) {
+        .dim_1d => 1,
+        .dim_2d => 2,
+        .dim_3d, .dim_2d_array, .dim_2d_array_alt => 3,
+        .dim_1d_array => 2,
+        .dim_2d_msaa => 3,
+        .dim_2d_msaa_array => 4,
+    };
     for (0..@as(usize, nsa) * 4) |i| {
         inst.image_nsa_address[i] = @truncate(code[word_index + 2 + i / 4] >> @intCast((i % 4) * 8));
     }
