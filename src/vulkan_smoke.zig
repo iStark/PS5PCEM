@@ -231,6 +231,65 @@ pub fn main(init: std.process.Init) !void {
         return error.AtomicStagedBufferMismatch;
     }
 
+    const swizzle_program_address = 0x500;
+    guest.word(swizzle_program_address, 0xf40c_0200); // s_load_dwordx8 s8:s15, s0:s1, 0
+    guest.word(swizzle_program_address + 4, 125 << 25);
+    guest.word(swizzle_program_address + 8, (@as(u32, 0x3f) << 25) | (@as(u32, 1) << 9) | 255);
+    guest.word(swizzle_program_address + 12, 1); // v_mov_b32 v0, index 1
+    guest.word(swizzle_program_address + 16, 0xe030_2004); // buffer_load_dword idxen v1, offset:4
+    guest.word(swizzle_program_address + 20, 0x8002_0100);
+    guest.word(swizzle_program_address + 24, 0xe070_2004); // buffer_store_dword idxen v1, offset:4
+    guest.word(swizzle_program_address + 28, 0x8003_0100);
+    guest.word(swizzle_program_address + 32, 0xe02c_0003); // buffer_load_sshort v2, offset:3
+    guest.word(swizzle_program_address + 36, 0x8002_0200);
+    guest.word(swizzle_program_address + 40, 0xe068_0003); // buffer_store_short v2, offset:3
+    guest.word(swizzle_program_address + 44, 0x8003_0200);
+    guest.word(swizzle_program_address + 48, 0xbf81_0000);
+
+    const swizzle_input_address = 0x1400;
+    const swizzle_output_address = 0x1500;
+    const swizzle_storage_size = 64;
+    const swizzle_marker: u32 = 0x1234_abcd;
+    @memset(guest.bytes[swizzle_input_address .. swizzle_input_address + swizzle_storage_size], 0);
+    @memset(guest.bytes[swizzle_output_address .. swizzle_output_address + swizzle_storage_size], 0);
+    guest.bytes[swizzle_input_address + 3] = 0x80;
+    guest.bytes[swizzle_input_address + 32] = 0xff;
+    guest.word(swizzle_input_address + 36, swizzle_marker);
+
+    const swizzle_descriptor_table = 0x600;
+    const swizzled_stride_16: u32 = 0x8000_0000 | (16 << 16);
+    const swizzle_descriptors = [_][4]u32{
+        .{ @intCast(swizzle_input_address), swizzled_stride_16, swizzle_storage_size / 16, 0 },
+        .{ @intCast(swizzle_output_address), swizzled_stride_16, swizzle_storage_size / 16, 0 },
+    };
+    for (swizzle_descriptors, 0..) |descriptor, descriptor_index| {
+        for (descriptor, 0..) |word, word_index| {
+            guest.word(swizzle_descriptor_table + descriptor_index * 16 + word_index * 4, word);
+        }
+    }
+
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.compute.programRegisterBase(), swizzle_program_address >> 8);
+    try state.writeRegister(.shader, 0x207, 1);
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.compute.userDataBase(), swizzle_descriptor_table);
+    _ = try executor.execute(&stream);
+    _ = try executor.execute(&stream);
+    if (renderer.translated_dispatches != 6 or renderer.pipeline_cache_misses != 3 or renderer.pipeline_cache_hits != 3) {
+        return error.InvalidSwizzlePipelineCacheResult;
+    }
+    if (guest.bytes[swizzle_output_address + 3] != 0x80 or
+        guest.bytes[swizzle_output_address + 32] != 0xff)
+    {
+        return error.TranslatedCrossDwordShortMismatch;
+    }
+    if (std.mem.readInt(u32, guest.bytes[swizzle_output_address + 36 ..][0..4], .little) != swizzle_marker) {
+        return error.TranslatedSwizzleAddressMismatch;
+    }
+    var swizzle_readback: [swizzle_storage_size]u8 = undefined;
+    try renderer.readbackGuestStorageBuffer(swizzle_output_address, &swizzle_readback);
+    if (!std.mem.eql(u8, guest.bytes[swizzle_output_address .. swizzle_output_address + swizzle_storage_size], &swizzle_readback)) {
+        return error.SwizzleStagedBufferMismatch;
+    }
+
     var output_buffer: [1024]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &output_buffer);
     const writer = &output.interface;

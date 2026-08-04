@@ -432,21 +432,31 @@ including signed extension, subword read/modify/write and combined
 into guest memory. The ten 32-bit MUBUF exchange/arithmetic/min-max/bitwise
 atomics now map to SPIR-V storage-buffer atomics with explicit device memory
 ordering and `glc` return-value writeback. V# `add_tid` descriptors use the
-compute invocation's wave-relative lane when forming the descriptor index. All
-major shader families are length-safe, and decoded
+compute invocation's wave-relative lane when forming the descriptor index.
+Swizzled V# resources apply the decoded 8/16/32/64-record `index_stride`
+permutation to every transferred dword, and byte-wise short lowering handles
+both ordinary and swizzle-separated cross-dword accesses. All major shader
+families are length-safe, and decoded
 programs have a validated CFG, typed IR (including memory addressing), SSA
 selection merges and an executable SPIR-V ALU/SDWA/SMEM-specialized/MUBUF path.
 The remaining stages are:
 
-1. Finish DPP/VOP3/opcode semantics, structured loops and VCC/EXEC divergence,
-   then add swizzled descriptors and cross-dword unaligned subword accesses.
-2. Add sampled/storage image and sampler descriptor arrays, image
-   creation/layout transitions, and image operations; then lower graphics stage
-   interfaces, interpolation and exports and record real draw work.
-3. Add surface/swapchain presentation through `SetFlip` and map PM4 acquire,
+1. Finish the DPP/VOP3 operations needed by captures, structured loops and
+   VCC/EXEC divergence.
+2. Reach the first-pixels milestone: lower minimal vertex/fragment interfaces,
+   position/color exports and a color target, record a real draw, and verify an
+   offscreen triangle through readback.
+3. Add sampled/storage image and sampler descriptor arrays, image
+   creation/layout transitions and image operations for textured game draws.
+4. Add surface/swapchain presentation through `SetFlip` and map PM4 acquire,
    release and event scopes onto Vulkan barriers and host-visible labels.
-4. Validate packet/state/shader results against captures before optimizing
+5. Validate packet/state/shader results against captures before optimizing
    asynchronous submission, descriptor caches and pipeline compilation.
+
+The first-pixels milestone deliberately does not wait for the complete image
+stack: a synthetic untextured triangle can validate the graphics pipeline and
+color-target path first. A recognizable game frame still depends on the image,
+sampler, render-target and synchronization work in the following stages.
 
 ---
 
@@ -491,9 +501,10 @@ byte and short, dword x1/x2/x3/x4, and V# stride-based `idxen` plus `offen`.
 It also covers V# `add_tid` addressing and 32-bit MUBUF exchange, add/subtract,
 signed/unsigned min/max and bitwise atomics. A `glc` atomic writes the old value
 back to its source VGPR, and atomic target ranges participate in the same DCB
-readback as stores. Swizzled descriptors, dynamically unresolved SMEM,
-cross-dword unaligned short accesses and images remain explicit unsupported
-semantics.
+readback as stores. Swizzled descriptors use V# `index_stride` to permute each
+dword address, while short loads/stores are split into byte operations so they
+remain correct across both linear and swizzle-separated dword boundaries.
+Dynamically unresolved SMEM and images remain explicit unsupported semantics.
 
 `vulkan-smoke` is an explicit hardware test rather than part of `zig build test`,
 so machines without a Vulkan runtime can still build and test every module. The
@@ -508,8 +519,11 @@ unsigned and signed extension plus byte/short RMW, and a non-zero
 `idxen+offen` access uses the decoded V# stride. A second four-invocation
 program uses `add_tid` to select one dword per lane, runs all ten supported
 `buffer_atomic_* glc` operations, and stores the final returned old value
-through another add-thread-id descriptor. Both programs run twice, checking
-guest-visible writeback plus allocation and pipeline miss/hit paths:
+through another add-thread-id descriptor. A third program checks swizzled load
+and store addresses, including an indexed dword at physical byte 36 and a
+logical short whose two bytes land at physical bytes 3 and 32. All programs run
+twice, checking guest-visible writeback plus allocation and pipeline miss/hit
+paths:
 
 ```sh
 zig build vulkan-smoke
@@ -519,7 +533,7 @@ zig build vulkan-smoke
 Vulkan 1.4.321: NVIDIA GeForce RTX 3070 Ti
 device API 1.4.329, queue family 0, validation off
 headless smoke passed: 1 compute dispatch, 64 staging bytes copied and verified
-translated RDNA2 passed: 4 dispatches, pipelines 2/2 miss/hit, buffers 4/4 miss/hit
+translated RDNA2 passed: 6 dispatches, pipelines 3/3 miss/hit, buffers 6/6 miss/hit
 ```
 
 ---

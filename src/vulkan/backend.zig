@@ -924,6 +924,7 @@ pub const Renderer = struct {
                 .descriptor_index = descriptor_index,
                 .stride = descriptor.stride,
                 .swizzled = descriptor.swizzle_enabled,
+                .index_stride = descriptor.index_stride,
                 .add_thread_id = descriptor.add_thread_id,
             };
             result.mapping_count += 1;
