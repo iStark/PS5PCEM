@@ -4,9 +4,10 @@
 //! Headless Vulkan renderer foundation.
 //!
 //! This owns the host instance, device, queue and command pool while exposing
-//! the existing API-neutral DCB callback boundary. Guest draw/dispatch lowering
-//! remains deliberately separate; the smoke path proves that queue submission,
-//! a compute pipeline, staging, device-local memory and readback all work.
+//! the existing API-neutral DCB callback boundary. Supported direct compute
+//! work already crosses RDNA2 decode and SPIR-V pipeline caching; guest resource
+//! operations and draw lowering remain separate. The smoke path proves queue
+//! submission, descriptors, staging, device-local memory and readback.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -32,13 +33,26 @@ pub const Error = error{
     MemoryBindingFailed,
     MemoryMapFailed,
     ShaderModuleCreationFailed,
+    PipelineCacheCreationFailed,
     PipelineLayoutCreationFailed,
     ComputePipelineCreationFailed,
+    DescriptorSetLayoutCreationFailed,
+    DescriptorPoolCreationFailed,
+    DescriptorSetAllocationFailed,
     FenceCreationFailed,
     QueueSubmissionFailed,
     FenceWaitFailed,
     DeviceWaitFailed,
     ReadbackMismatch,
+    GuestMemoryUnavailable,
+    GuestMemoryReadFailed,
+    GuestBufferTooLarge,
+    GuestBufferCacheFull,
+    GuestBufferNotStaged,
+    ComputePipelineCacheFull,
+    MissingComputeProgram,
+    InvalidDispatchPacket,
+    UnsupportedIndirectDispatch,
 };
 
 pub const Options = struct {
@@ -62,6 +76,19 @@ pub const SmokeReport = struct {
     bytes_copied: usize,
     compute_dispatches: u32,
     queue_family_index: u32,
+};
+
+pub const StagedBuffer = struct {
+    buffer: vk.Buffer,
+    descriptor_set: vk.DescriptorSet,
+    size: vk.DeviceSize,
+    allocation_cache_hit: bool,
+};
+
+pub const DispatchReport = struct {
+    pipeline_cache_hit: bool,
+    group_count: [3]u32,
+    spirv_words: usize,
 };
 
 pub const GuestMemory = struct {
@@ -175,11 +202,20 @@ const DeviceFunctions = struct {
     unmap_memory: vk.PfnUnmapMemory,
     create_shader_module: vk.PfnCreateShaderModule,
     destroy_shader_module: vk.PfnDestroyShaderModule,
+    create_pipeline_cache: vk.PfnCreatePipelineCache,
+    destroy_pipeline_cache: vk.PfnDestroyPipelineCache,
+    create_descriptor_set_layout: vk.PfnCreateDescriptorSetLayout,
+    destroy_descriptor_set_layout: vk.PfnDestroyDescriptorSetLayout,
+    create_descriptor_pool: vk.PfnCreateDescriptorPool,
+    destroy_descriptor_pool: vk.PfnDestroyDescriptorPool,
+    allocate_descriptor_sets: vk.PfnAllocateDescriptorSets,
+    update_descriptor_sets: vk.PfnUpdateDescriptorSets,
     create_pipeline_layout: vk.PfnCreatePipelineLayout,
     destroy_pipeline_layout: vk.PfnDestroyPipelineLayout,
     create_compute_pipelines: vk.PfnCreateComputePipelines,
     destroy_pipeline: vk.PfnDestroyPipeline,
     cmd_bind_pipeline: vk.PfnCmdBindPipeline,
+    cmd_bind_descriptor_sets: vk.PfnCmdBindDescriptorSets,
     cmd_dispatch: vk.PfnCmdDispatch,
     cmd_copy_buffer: vk.PfnCmdCopyBuffer,
     cmd_pipeline_barrier: vk.PfnCmdPipelineBarrier,
@@ -209,11 +245,20 @@ const DeviceFunctions = struct {
             .unmap_memory = try deviceProc(get_proc, device, vk.PfnUnmapMemory, "vkUnmapMemory"),
             .create_shader_module = try deviceProc(get_proc, device, vk.PfnCreateShaderModule, "vkCreateShaderModule"),
             .destroy_shader_module = try deviceProc(get_proc, device, vk.PfnDestroyShaderModule, "vkDestroyShaderModule"),
+            .create_pipeline_cache = try deviceProc(get_proc, device, vk.PfnCreatePipelineCache, "vkCreatePipelineCache"),
+            .destroy_pipeline_cache = try deviceProc(get_proc, device, vk.PfnDestroyPipelineCache, "vkDestroyPipelineCache"),
+            .create_descriptor_set_layout = try deviceProc(get_proc, device, vk.PfnCreateDescriptorSetLayout, "vkCreateDescriptorSetLayout"),
+            .destroy_descriptor_set_layout = try deviceProc(get_proc, device, vk.PfnDestroyDescriptorSetLayout, "vkDestroyDescriptorSetLayout"),
+            .create_descriptor_pool = try deviceProc(get_proc, device, vk.PfnCreateDescriptorPool, "vkCreateDescriptorPool"),
+            .destroy_descriptor_pool = try deviceProc(get_proc, device, vk.PfnDestroyDescriptorPool, "vkDestroyDescriptorPool"),
+            .allocate_descriptor_sets = try deviceProc(get_proc, device, vk.PfnAllocateDescriptorSets, "vkAllocateDescriptorSets"),
+            .update_descriptor_sets = try deviceProc(get_proc, device, vk.PfnUpdateDescriptorSets, "vkUpdateDescriptorSets"),
             .create_pipeline_layout = try deviceProc(get_proc, device, vk.PfnCreatePipelineLayout, "vkCreatePipelineLayout"),
             .destroy_pipeline_layout = try deviceProc(get_proc, device, vk.PfnDestroyPipelineLayout, "vkDestroyPipelineLayout"),
             .create_compute_pipelines = try deviceProc(get_proc, device, vk.PfnCreateComputePipelines, "vkCreateComputePipelines"),
             .destroy_pipeline = try deviceProc(get_proc, device, vk.PfnDestroyPipeline, "vkDestroyPipeline"),
             .cmd_bind_pipeline = try deviceProc(get_proc, device, vk.PfnCmdBindPipeline, "vkCmdBindPipeline"),
+            .cmd_bind_descriptor_sets = try deviceProc(get_proc, device, vk.PfnCmdBindDescriptorSets, "vkCmdBindDescriptorSets"),
             .cmd_dispatch = try deviceProc(get_proc, device, vk.PfnCmdDispatch, "vkCmdDispatch"),
             .cmd_copy_buffer = try deviceProc(get_proc, device, vk.PfnCmdCopyBuffer, "vkCmdCopyBuffer"),
             .cmd_pipeline_barrier = try deviceProc(get_proc, device, vk.PfnCmdPipelineBarrier, "vkCmdPipelineBarrier"),
@@ -239,6 +284,30 @@ const OwnedBuffer = struct {
     size: vk.DeviceSize,
 };
 
+const maximum_guest_buffers = 256;
+const maximum_compute_pipelines = 256;
+const maximum_staged_buffer_bytes = 128 * 1024 * 1024;
+
+const GuestBufferEntry = struct {
+    guest_address: u64,
+    size: vk.DeviceSize,
+    upload: OwnedBuffer,
+    device_local: OwnedBuffer,
+    descriptor_set: vk.DescriptorSet,
+};
+
+const ComputePipelineEntry = struct {
+    hash: u64,
+    words: []u32,
+    shader: vk.ShaderModule,
+    pipeline: vk.Pipeline,
+};
+
+const PipelineLookup = struct {
+    pipeline: vk.Pipeline,
+    cache_hit: bool,
+};
+
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
     loader: Loader,
@@ -250,13 +319,27 @@ pub const Renderer = struct {
     queue: vk.Queue,
     queue_family_index: u32,
     command_pool: vk.CommandPool,
+    descriptor_set_layout: vk.DescriptorSetLayout,
+    descriptor_pool: vk.DescriptorPool,
+    compute_pipeline_layout: vk.PipelineLayout,
+    driver_pipeline_cache: vk.PipelineCache,
     memory_properties: vk.PhysicalDeviceMemoryProperties,
     loader_api_version: u32,
     device_info: DeviceInfo,
     validation_enabled: bool,
     guest_memory: ?GuestMemory = null,
+    guest_buffers: std.ArrayList(GuestBufferEntry) = .empty,
+    compute_pipelines: std.ArrayList(ComputePipelineEntry) = .empty,
+    active_descriptor_set: ?vk.DescriptorSet = null,
     draw_callbacks: u64 = 0,
     dispatch_callbacks: u64 = 0,
+    translated_dispatches: u64 = 0,
+    buffer_cache_hits: u64 = 0,
+    buffer_cache_misses: u64 = 0,
+    buffer_uploads: u64 = 0,
+    pipeline_cache_hits: u64 = 0,
+    pipeline_cache_misses: u64 = 0,
+    last_dispatch_error: ?anyerror = null,
 
     pub fn init(allocator: std.mem.Allocator, options: Options) (Error || std.mem.Allocator.Error)!Renderer {
         var loader = try Loader.init();
@@ -327,6 +410,54 @@ pub const Renderer = struct {
         }
         errdefer device_functions.destroy_command_pool(device, command_pool, null);
 
+        const storage_binding = vk.DescriptorSetLayoutBinding{
+            .binding = 0,
+            .descriptor_type = vk.descriptor_type_storage_buffer,
+            .descriptor_count = 1,
+            .stage_flags = vk.shader_stage_compute_bit,
+        };
+        const descriptor_layout_info = vk.DescriptorSetLayoutCreateInfo{
+            .binding_count = 1,
+            .bindings = @ptrCast(&storage_binding),
+        };
+        var descriptor_set_layout: vk.DescriptorSetLayout = 0;
+        if (device_functions.create_descriptor_set_layout(device, &descriptor_layout_info, null, &descriptor_set_layout) != vk.success) {
+            return Error.DescriptorSetLayoutCreationFailed;
+        }
+        errdefer device_functions.destroy_descriptor_set_layout(device, descriptor_set_layout, null);
+
+        const pool_size = vk.DescriptorPoolSize{
+            .descriptor_type = vk.descriptor_type_storage_buffer,
+            .descriptor_count = maximum_guest_buffers,
+        };
+        const descriptor_pool_info = vk.DescriptorPoolCreateInfo{
+            .max_sets = maximum_guest_buffers,
+            .pool_size_count = 1,
+            .pool_sizes = @ptrCast(&pool_size),
+        };
+        var descriptor_pool: vk.DescriptorPool = 0;
+        if (device_functions.create_descriptor_pool(device, &descriptor_pool_info, null, &descriptor_pool) != vk.success) {
+            return Error.DescriptorPoolCreationFailed;
+        }
+        errdefer device_functions.destroy_descriptor_pool(device, descriptor_pool, null);
+
+        const pipeline_layout_info = vk.PipelineLayoutCreateInfo{
+            .set_layout_count = 1,
+            .set_layouts = @ptrCast(&descriptor_set_layout),
+        };
+        var compute_pipeline_layout: vk.PipelineLayout = 0;
+        if (device_functions.create_pipeline_layout(device, &pipeline_layout_info, null, &compute_pipeline_layout) != vk.success) {
+            return Error.PipelineLayoutCreationFailed;
+        }
+        errdefer device_functions.destroy_pipeline_layout(device, compute_pipeline_layout, null);
+
+        const pipeline_cache_info = vk.PipelineCacheCreateInfo{};
+        var driver_pipeline_cache: vk.PipelineCache = 0;
+        if (device_functions.create_pipeline_cache(device, &pipeline_cache_info, null, &driver_pipeline_cache) != vk.success) {
+            return Error.PipelineCacheCreationFailed;
+        }
+        errdefer device_functions.destroy_pipeline_cache(device, driver_pipeline_cache, null);
+
         var memory_properties: vk.PhysicalDeviceMemoryProperties = undefined;
         instance_functions.get_memory_properties(candidate.physical_device, &memory_properties);
 
@@ -341,6 +472,10 @@ pub const Renderer = struct {
             .queue = queue,
             .queue_family_index = candidate.queue_family_index,
             .command_pool = command_pool,
+            .descriptor_set_layout = descriptor_set_layout,
+            .descriptor_pool = descriptor_pool,
+            .compute_pipeline_layout = compute_pipeline_layout,
+            .driver_pipeline_cache = driver_pipeline_cache,
             .memory_properties = memory_properties,
             .loader_api_version = loader_api_version,
             .device_info = candidate.info,
@@ -350,6 +485,21 @@ pub const Renderer = struct {
 
     pub fn deinit(self: *Renderer) void {
         _ = self.device_functions.device_wait_idle(self.device);
+        for (self.compute_pipelines.items) |entry| {
+            self.device_functions.destroy_pipeline(self.device, entry.pipeline, null);
+            self.device_functions.destroy_shader_module(self.device, entry.shader, null);
+            self.allocator.free(entry.words);
+        }
+        self.compute_pipelines.deinit(self.allocator);
+        for (self.guest_buffers.items) |entry| {
+            self.destroyBuffer(entry.device_local);
+            self.destroyBuffer(entry.upload);
+        }
+        self.guest_buffers.deinit(self.allocator);
+        self.device_functions.destroy_pipeline_cache(self.device, self.driver_pipeline_cache, null);
+        self.device_functions.destroy_pipeline_layout(self.device, self.compute_pipeline_layout, null);
+        self.device_functions.destroy_descriptor_pool(self.device, self.descriptor_pool, null);
+        self.device_functions.destroy_descriptor_set_layout(self.device, self.descriptor_set_layout, null);
         self.device_functions.destroy_command_pool(self.device, self.command_pool, null);
         self.device_functions.destroy_device(self.device, null);
         self.instance_functions.destroy_instance(self.instance_handle, null);
@@ -358,11 +508,263 @@ pub const Renderer = struct {
     }
 
     /// Attaches the renderer to the existing DCB executor boundary. PM4 remains
-    /// API-neutral; callbacks are counted until guest shader/resource lowering
-    /// can turn them into real host command recording.
+    /// API-neutral; supported direct compute work is translated and submitted,
+    /// while draw callbacks stay observable until graphics lowering exists.
     pub fn dcbBackend(self: *Renderer, memory: GuestMemory) gpu.DcbBackend {
         self.guest_memory = memory;
         return .{ .context = self, .vtable = &dcb_vtable };
+    }
+
+    /// Reuses host/device allocations for an exact guest range while uploading
+    /// current guest bytes on every call. Allocation identity is cached; guest
+    /// memory is never assumed immutable between submissions.
+    pub fn stageGuestStorageBuffer(self: *Renderer, guest_address: u64, size: usize) (Error || std.mem.Allocator.Error)!StagedBuffer {
+        if (size == 0) return Error.GuestMemoryReadFailed;
+        if (size > maximum_staged_buffer_bytes) return Error.GuestBufferTooLarge;
+        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+
+        var entry_index: ?usize = null;
+        for (self.guest_buffers.items, 0..) |entry, index| {
+            if (entry.guest_address == guest_address and entry.size == size) {
+                entry_index = index;
+                break;
+            }
+        }
+        const cache_hit = entry_index != null;
+        if (entry_index == null) {
+            if (self.guest_buffers.items.len >= maximum_guest_buffers) return Error.GuestBufferCacheFull;
+            try self.guest_buffers.ensureUnusedCapacity(self.allocator, 1);
+            const upload = try self.createBuffer(
+                size,
+                vk.buffer_usage_transfer_src_bit,
+                vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+            );
+            errdefer self.destroyBuffer(upload);
+            const device_local = try self.createBuffer(
+                size,
+                vk.buffer_usage_transfer_src_bit | vk.buffer_usage_transfer_dst_bit | vk.buffer_usage_storage_buffer_bit,
+                0x0000_0001,
+            );
+            errdefer self.destroyBuffer(device_local);
+            const descriptor_set = try self.allocateStorageDescriptor(device_local);
+            self.guest_buffers.appendAssumeCapacity(.{
+                .guest_address = guest_address,
+                .size = size,
+                .upload = upload,
+                .device_local = device_local,
+                .descriptor_set = descriptor_set,
+            });
+            entry_index = self.guest_buffers.items.len - 1;
+            self.buffer_cache_misses += 1;
+        } else {
+            self.buffer_cache_hits += 1;
+        }
+
+        const entry = &self.guest_buffers.items[entry_index.?];
+        var mapped: ?*anyopaque = null;
+        if (self.device_functions.map_memory(self.device, entry.upload.memory, 0, size, 0, &mapped) != vk.success) {
+            return Error.MemoryMapFailed;
+        }
+        const destination: [*]u8 = @ptrCast(mapped orelse {
+            self.device_functions.unmap_memory(self.device, entry.upload.memory);
+            return Error.MemoryMapFailed;
+        });
+        const read_ok = memory.read(memory.context, guest_address, destination[0..size]);
+        self.device_functions.unmap_memory(self.device, entry.upload.memory);
+        if (!read_ok) return Error.GuestMemoryReadFailed;
+
+        const command_buffer = try self.beginOneShot();
+        defer self.device_functions.free_command_buffers(self.device, self.command_pool, 1, @ptrCast(&command_buffer));
+        const host_barrier = vk.BufferMemoryBarrier{
+            .source_access_mask = vk.access_host_write_bit,
+            .destination_access_mask = vk.access_transfer_read_bit,
+            .buffer = entry.upload.handle,
+            .offset = 0,
+            .size = entry.size,
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_host_bit,
+            vk.pipeline_stage_transfer_bit,
+            0,
+            0,
+            null,
+            1,
+            @ptrCast(&host_barrier),
+            0,
+            null,
+        );
+        const copy = vk.BufferCopy{ .source_offset = 0, .destination_offset = 0, .size = entry.size };
+        self.device_functions.cmd_copy_buffer(command_buffer, entry.upload.handle, entry.device_local.handle, 1, @ptrCast(&copy));
+        const shader_barrier = vk.BufferMemoryBarrier{
+            .source_access_mask = vk.access_transfer_write_bit,
+            .destination_access_mask = vk.access_shader_read_bit | vk.access_shader_write_bit,
+            .buffer = entry.device_local.handle,
+            .offset = 0,
+            .size = entry.size,
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_transfer_bit,
+            vk.pipeline_stage_compute_shader_bit,
+            0,
+            0,
+            null,
+            1,
+            @ptrCast(&shader_barrier),
+            0,
+            null,
+        );
+        try self.submitOneShot(command_buffer);
+        self.active_descriptor_set = entry.descriptor_set;
+        self.buffer_uploads += 1;
+        return .{
+            .buffer = entry.device_local.handle,
+            .descriptor_set = entry.descriptor_set,
+            .size = entry.size,
+            .allocation_cache_hit = cache_hit,
+        };
+    }
+
+    pub fn readbackGuestStorageBuffer(self: *Renderer, guest_address: u64, destination: []u8) Error!void {
+        const entry = for (self.guest_buffers.items) |*candidate| {
+            if (candidate.guest_address == guest_address and candidate.size == destination.len) break candidate;
+        } else return Error.GuestBufferNotStaged;
+        const readback = try self.createBuffer(
+            destination.len,
+            vk.buffer_usage_transfer_dst_bit,
+            vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+        );
+        defer self.destroyBuffer(readback);
+
+        const command_buffer = try self.beginOneShot();
+        defer self.device_functions.free_command_buffers(self.device, self.command_pool, 1, @ptrCast(&command_buffer));
+        const transfer_barrier = vk.BufferMemoryBarrier{
+            .source_access_mask = vk.access_shader_write_bit | vk.access_transfer_write_bit,
+            .destination_access_mask = vk.access_transfer_read_bit,
+            .buffer = entry.device_local.handle,
+            .offset = 0,
+            .size = entry.size,
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_compute_shader_bit | vk.pipeline_stage_transfer_bit,
+            vk.pipeline_stage_transfer_bit,
+            0,
+            0,
+            null,
+            1,
+            @ptrCast(&transfer_barrier),
+            0,
+            null,
+        );
+        const copy = vk.BufferCopy{ .source_offset = 0, .destination_offset = 0, .size = entry.size };
+        self.device_functions.cmd_copy_buffer(command_buffer, entry.device_local.handle, readback.handle, 1, @ptrCast(&copy));
+        const host_barrier = vk.BufferMemoryBarrier{
+            .source_access_mask = vk.access_transfer_write_bit,
+            .destination_access_mask = vk.access_host_read_bit,
+            .buffer = readback.handle,
+            .offset = 0,
+            .size = readback.size,
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_transfer_bit,
+            vk.pipeline_stage_host_bit,
+            0,
+            0,
+            null,
+            1,
+            @ptrCast(&host_barrier),
+            0,
+            null,
+        );
+        try self.submitOneShot(command_buffer);
+        try self.readMapped(readback, destination);
+    }
+
+    pub fn dispatchSpirv(self: *Renderer, words: []const u32, group_count: [3]u32) (Error || std.mem.Allocator.Error)!DispatchReport {
+        const lookup = try self.getComputePipeline(words);
+        const command_buffer = try self.beginOneShot();
+        defer self.device_functions.free_command_buffers(self.device, self.command_pool, 1, @ptrCast(&command_buffer));
+        self.device_functions.cmd_bind_pipeline(command_buffer, vk.pipeline_bind_point_compute, lookup.pipeline);
+        if (self.active_descriptor_set) |descriptor_set| {
+            self.device_functions.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk.pipeline_bind_point_compute,
+                self.compute_pipeline_layout,
+                0,
+                1,
+                @ptrCast(&descriptor_set),
+                0,
+                null,
+            );
+        }
+        self.device_functions.cmd_dispatch(command_buffer, group_count[0], group_count[1], group_count[2]);
+        try self.submitOneShot(command_buffer);
+        return .{
+            .pipeline_cache_hit = lookup.cache_hit,
+            .group_count = group_count,
+            .spirv_words = words.len,
+        };
+    }
+
+    pub fn dispatchRdna2Address(
+        self: *Renderer,
+        program_address: u64,
+        local_size: [3]u32,
+        group_count: [3]u32,
+    ) anyerror!DispatchReport {
+        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
+        var analysis = try gpu.shader_analysis.decode(self.allocator, reader, program_address, 4096);
+        defer analysis.deinit(self.allocator);
+        var module = try analysis.translateSpirv(self.allocator, .{ .stage = .compute, .local_size = local_size });
+        defer module.deinit(self.allocator);
+        return self.dispatchSpirv(module.words, group_count);
+    }
+
+    fn getComputePipeline(self: *Renderer, words: []const u32) (Error || std.mem.Allocator.Error)!PipelineLookup {
+        const hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(words));
+        for (self.compute_pipelines.items) |entry| {
+            if (entry.hash == hash and std.mem.eql(u32, entry.words, words)) {
+                self.pipeline_cache_hits += 1;
+                return .{ .pipeline = entry.pipeline, .cache_hit = true };
+            }
+        }
+        if (self.compute_pipelines.items.len >= maximum_compute_pipelines) return Error.ComputePipelineCacheFull;
+
+        const owned_words = try self.allocator.dupe(u32, words);
+        errdefer self.allocator.free(owned_words);
+        const shader = try self.createShader(words);
+        errdefer self.device_functions.destroy_shader_module(self.device, shader, null);
+        const stage = vk.PipelineShaderStageCreateInfo{
+            .stage = vk.shader_stage_compute_bit,
+            .module = shader,
+            .name = "main",
+        };
+        const pipeline_info = vk.ComputePipelineCreateInfo{
+            .stage = stage,
+            .layout = self.compute_pipeline_layout,
+        };
+        var pipeline: vk.Pipeline = 0;
+        if (self.device_functions.create_compute_pipelines(
+            self.device,
+            self.driver_pipeline_cache,
+            1,
+            @ptrCast(&pipeline_info),
+            null,
+            @ptrCast(&pipeline),
+        ) != vk.success) return Error.ComputePipelineCreationFailed;
+        errdefer self.device_functions.destroy_pipeline(self.device, pipeline, null);
+        try self.compute_pipelines.append(self.allocator, .{
+            .hash = hash,
+            .words = owned_words,
+            .shader = shader,
+            .pipeline = pipeline,
+        });
+        self.pipeline_cache_misses += 1;
+        return .{ .pipeline = pipeline, .cache_hit = false };
     }
 
     pub fn smokeTest(self: *Renderer) Error!SmokeReport {
@@ -394,21 +796,15 @@ pub const Renderer = struct {
 
         const shader = try self.createSmokeShader();
         defer self.device_functions.destroy_shader_module(self.device, shader, null);
-        const layout_info = vk.PipelineLayoutCreateInfo{};
-        var layout: vk.PipelineLayout = 0;
-        if (self.device_functions.create_pipeline_layout(self.device, &layout_info, null, &layout) != vk.success) {
-            return Error.PipelineLayoutCreationFailed;
-        }
-        defer self.device_functions.destroy_pipeline_layout(self.device, layout, null);
 
         const stage = vk.PipelineShaderStageCreateInfo{
             .stage = vk.shader_stage_compute_bit,
             .module = shader,
             .name = "main",
         };
-        const pipeline_info = vk.ComputePipelineCreateInfo{ .stage = stage, .layout = layout };
+        const pipeline_info = vk.ComputePipelineCreateInfo{ .stage = stage, .layout = self.compute_pipeline_layout };
         var pipeline: vk.Pipeline = 0;
-        if (self.device_functions.create_compute_pipelines(self.device, 0, 1, @ptrCast(&pipeline_info), null, @ptrCast(&pipeline)) != vk.success) {
+        if (self.device_functions.create_compute_pipelines(self.device, self.driver_pipeline_cache, 1, @ptrCast(&pipeline_info), null, @ptrCast(&pipeline)) != vk.success) {
             return Error.ComputePipelineCreationFailed;
         }
         defer self.device_functions.destroy_pipeline(self.device, pipeline, null);
@@ -548,6 +944,71 @@ pub const Renderer = struct {
         return .{ .handle = handle, .memory = memory, .size = size };
     }
 
+    fn allocateStorageDescriptor(self: *Renderer, buffer: OwnedBuffer) Error!vk.DescriptorSet {
+        const allocate_info = vk.DescriptorSetAllocateInfo{
+            .descriptor_pool = self.descriptor_pool,
+            .descriptor_set_count = 1,
+            .set_layouts = @ptrCast(&self.descriptor_set_layout),
+        };
+        var descriptor_set: vk.DescriptorSet = 0;
+        if (self.device_functions.allocate_descriptor_sets(self.device, &allocate_info, @ptrCast(&descriptor_set)) != vk.success) {
+            return Error.DescriptorSetAllocationFailed;
+        }
+        const buffer_info = vk.DescriptorBufferInfo{
+            .buffer = buffer.handle,
+            .offset = 0,
+            .range = buffer.size,
+        };
+        const write = vk.WriteDescriptorSet{
+            .destination_set = descriptor_set,
+            .destination_binding = 0,
+            .destination_array_element = 0,
+            .descriptor_count = 1,
+            .descriptor_type = vk.descriptor_type_storage_buffer,
+            .buffer_info = @ptrCast(&buffer_info),
+        };
+        self.device_functions.update_descriptor_sets(self.device, 1, @ptrCast(&write), 0, null);
+        return descriptor_set;
+    }
+
+    fn beginOneShot(self: *Renderer) Error!vk.CommandBuffer {
+        const allocate_info = vk.CommandBufferAllocateInfo{
+            .command_pool = self.command_pool,
+            .level = vk.command_buffer_level_primary,
+            .command_buffer_count = 1,
+        };
+        var command_buffer: vk.CommandBuffer = undefined;
+        if (self.device_functions.allocate_command_buffers(self.device, &allocate_info, @ptrCast(&command_buffer)) != vk.success) {
+            return Error.CommandBufferAllocationFailed;
+        }
+        errdefer self.device_functions.free_command_buffers(self.device, self.command_pool, 1, @ptrCast(&command_buffer));
+        const begin_info = vk.CommandBufferBeginInfo{ .flags = vk.command_buffer_usage_one_time_submit_bit };
+        if (self.device_functions.begin_command_buffer(command_buffer, &begin_info) != vk.success) {
+            return Error.CommandBufferBeginFailed;
+        }
+        return command_buffer;
+    }
+
+    fn submitOneShot(self: *Renderer, command_buffer: vk.CommandBuffer) Error!void {
+        if (self.device_functions.end_command_buffer(command_buffer) != vk.success) return Error.CommandBufferEndFailed;
+        const fence_info = vk.FenceCreateInfo{};
+        var fence: vk.Fence = 0;
+        if (self.device_functions.create_fence(self.device, &fence_info, null, &fence) != vk.success) {
+            return Error.FenceCreationFailed;
+        }
+        defer self.device_functions.destroy_fence(self.device, fence, null);
+        const submit_info = vk.SubmitInfo{
+            .command_buffer_count = 1,
+            .command_buffers = @ptrCast(&command_buffer),
+        };
+        if (self.device_functions.queue_submit(self.queue, 1, @ptrCast(&submit_info), fence) != vk.success) {
+            return Error.QueueSubmissionFailed;
+        }
+        if (self.device_functions.wait_for_fences(self.device, 1, @ptrCast(&fence), vk.true_value, ~@as(u64, 0)) != vk.success) {
+            return Error.FenceWaitFailed;
+        }
+    }
+
     fn destroyBuffer(self: *Renderer, buffer: OwnedBuffer) void {
         self.device_functions.destroy_buffer(self.device, buffer.handle, null);
         self.device_functions.free_memory(self.device, buffer.memory, null);
@@ -583,10 +1044,24 @@ pub const Renderer = struct {
         if (!std.mem.eql(u8, actual[0..expected.len], expected)) return Error.ReadbackMismatch;
     }
 
+    fn readMapped(self: *Renderer, buffer: OwnedBuffer, destination: []u8) Error!void {
+        var mapped: ?*anyopaque = null;
+        if (self.device_functions.map_memory(self.device, buffer.memory, 0, destination.len, 0, &mapped) != vk.success) {
+            return Error.MemoryMapFailed;
+        }
+        defer self.device_functions.unmap_memory(self.device, buffer.memory);
+        const source: [*]const u8 = @ptrCast(mapped orelse return Error.MemoryMapFailed);
+        @memcpy(destination, source[0..destination.len]);
+    }
+
     fn createSmokeShader(self: *Renderer) Error!vk.ShaderModule {
+        return self.createShader(&smoke_compute_spirv);
+    }
+
+    fn createShader(self: *Renderer, words: []const u32) Error!vk.ShaderModule {
         const create_info = vk.ShaderModuleCreateInfo{
-            .code_size = smoke_compute_spirv.len * @sizeOf(u32),
-            .code = &smoke_compute_spirv,
+            .code_size = words.len * @sizeOf(u32),
+            .code = words.ptr,
         };
         var shader: vk.ShaderModule = 0;
         if (self.device_functions.create_shader_module(self.device, &create_info, null, &shader) != vk.success) {
@@ -621,11 +1096,44 @@ pub const Renderer = struct {
         return true;
     }
 
-    fn dcbDispatch(context: ?*anyopaque, _: *const gpu.State, _: gpu.pm4.Packet) bool {
-        fromContext(context).dispatch_callbacks += 1;
+    fn dcbDispatch(context: ?*anyopaque, state: *const gpu.State, packet: gpu.pm4.Packet) bool {
+        const self = fromContext(context);
+        self.dispatch_callbacks += 1;
+        if (packet.opcode != gpu.pm4.dispatch_direct) {
+            self.last_dispatch_error = Error.UnsupportedIndirectDispatch;
+            return false;
+        }
+        if (packet.body.len < 3) {
+            self.last_dispatch_error = Error.InvalidDispatchPacket;
+            return false;
+        }
+        const program_address = gpu.resources.ShaderStage.compute.programAddress(state) orelse {
+            self.last_dispatch_error = Error.MissingComputeProgram;
+            return false;
+        };
+        const local_size = [3]u32{
+            computeLocalSize(state, 0x207),
+            computeLocalSize(state, 0x208),
+            computeLocalSize(state, 0x209),
+        };
+        _ = self.dispatchRdna2Address(
+            program_address,
+            local_size,
+            .{ packet.body[0], packet.body[1], packet.body[2] },
+        ) catch |err| {
+            self.last_dispatch_error = err;
+            return false;
+        };
+        self.translated_dispatches += 1;
+        self.last_dispatch_error = null;
         return true;
     }
 };
+
+fn computeLocalSize(state: *const gpu.State, register: u32) u32 {
+    const encoded = state.readRegister(.shader, register) orelse return 1;
+    return @max(encoded, 1);
+}
 
 fn layerAvailable(enumerate: vk.PfnEnumerateInstanceLayerProperties, wanted: []const u8) bool {
     var count: u32 = 0;
@@ -717,6 +1225,15 @@ const smoke_compute_spirv = [_]u32{
     0x0000_0001, 0x0005_0036, 0x0000_0001, 0x0000_0003, 0x0000_0000,
     0x0000_0002, 0x0002_00f8, 0x0000_0004, 0x0001_00fd, 0x0001_0038,
 };
+
+test "compute local size defaults to one and preserves the programmed count" {
+    var state = gpu.State{};
+    try std.testing.expectEqual(@as(u32, 1), computeLocalSize(&state, 0x207));
+    try state.writeRegister(.shader, 0x207, 0);
+    try state.writeRegister(.shader, 0x208, 32);
+    try std.testing.expectEqual(@as(u32, 1), computeLocalSize(&state, 0x207));
+    try std.testing.expectEqual(@as(u32, 32), computeLocalSize(&state, 0x208));
+}
 
 test "Vulkan version packing matches the registry layout" {
     const version = vk.makeApiVersion(0, 1, 4, 321);

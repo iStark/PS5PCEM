@@ -223,7 +223,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/vulkan_smoke.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "vulkan", .module = vulkan }},
+            .imports = &.{
+                .{ .name = "vulkan", .module = vulkan },
+                .{ .name = "gpu", .module = gpu },
+            },
         }),
     });
     b.installArtifact(vulkan_smoke);

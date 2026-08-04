@@ -10,6 +10,8 @@ pub const Error = backend.Error;
 pub const Options = backend.Options;
 pub const DeviceInfo = backend.DeviceInfo;
 pub const SmokeReport = backend.SmokeReport;
+pub const StagedBuffer = backend.StagedBuffer;
+pub const DispatchReport = backend.DispatchReport;
 pub const GuestMemory = backend.GuestMemory;
 pub const Renderer = backend.Renderer;
 

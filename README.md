@@ -411,19 +411,24 @@ packet per line with its word offset, and counts the draws and dispatches:
 The shared GFX10 staging contract is complete for mip tails, thick 3D blocks,
 Oberon RB+ MSAA addressing and compute-detile constants. The Vulkan foundation
 now owns a Vulkan 1.2 instance, selects a device with one graphics/compute queue,
-creates the logical device and transient command pool, and exposes the existing
-DCB backend interface. Its headless smoke path creates a compute pipeline,
-submits through a fence and verifies a host-staging to device-local to host-
-readback transfer. All major shader families are length-safe, and decoded
-programs have a validated CFG, typed IR, SSA selection merges and an executable
-SPIR-V ALU/SDWA path. The remaining stages are:
+creates the logical device, transient command pool, storage descriptor pool and
+driver pipeline cache, and exposes the existing DCB backend interface. Exact
+guest buffer ranges reuse host-upload/device-local allocations and descriptor
+sets while refreshing their bytes for every submission. `DISPATCH_DIRECT` now
+reads the compute program and thread-group state, translates supported RDNA2
+through the existing decoder/IR/SPIR-V path, caches the exact resulting module
+and host pipeline, binds the active storage descriptor and submits it through a
+fence. All major shader families are length-safe, and decoded programs have a
+validated CFG, typed IR, SSA selection merges and an executable SPIR-V ALU/SDWA
+path. The remaining stages are:
 
 1. Finish DPP/VOP3/opcode semantics, structured loops and VCC/EXEC divergence,
    then lower stage interfaces, descriptors, memory, image, interpolation and
    export operations to SPIR-V.
-2. Extend the Vulkan foundation with persistent guest-memory staging, descriptor
-   layouts and caches, image creation/layout transitions, translated shader and
-   graphics/compute pipeline caches, then record real draw and dispatch work.
+2. Map complete `ShaderBindings` resource tables onto descriptor arrays, add
+   image creation/layout transitions and lower buffer/image operations so a
+   translated dispatch has guest-visible effects; then build graphics pipeline
+   state and record real draw work.
 3. Add surface/swapchain presentation through `SetFlip` and map PM4 acquire,
    release and event scopes onto Vulkan barriers and host-visible labels.
 4. Validate packet/state/shader results against captures before optimizing
@@ -441,20 +446,34 @@ prefers a discrete device with one queue family supporting both graphics and
 compute. Validation is requested for debug builds when
 `VK_LAYER_KHRONOS_validation` is installed and otherwise disabled cleanly.
 
-The renderer already owns instance/device lifetime, the selected queue, a
-transient command pool and host/device memory-type selection. `dcbBackend`
-adapts checked guest reads and writes plus draw/dispatch callbacks to
-[`gpu.executor`](src/gpu/executor.zig) without adding a Vulkan dependency to the
-command processor. Those callbacks are the boundary for the next stage; until
-guest descriptors and complete shader interfaces are lowered, they count work
-but do not claim that a guest draw has been rendered.
+The renderer owns instance/device lifetime, the selected queue, a transient
+command pool, host/device memory-type selection, one storage descriptor layout
+and pool, and both Vulkan-driver and exact-SPIR-V software pipeline caches.
+`stageGuestStorageBuffer` caches up to 256 exact ranges (each at most the Vulkan
+1.2 minimum 128 MiB storage-buffer range). It never treats guest bytes as
+immutable: a cache hit reuses allocations and its descriptor set but uploads the
+current guest range again. Host-write/transfer/compute/readback barriers keep the
+synchronous path explicit, and readback can verify the device-local contents.
+
+`dcbBackend` adapts checked guest reads and writes plus draw/dispatch callbacks
+to [`gpu.executor`](src/gpu/executor.zig) without adding a Vulkan dependency to
+the command processor. A direct compute packet resolves `COMPUTE_PGM`, reads
+`COMPUTE_NUM_THREAD_X/Y/Z`, incrementally decodes guest code, translates the
+supported shader to SPIR-V 1.5, creates or reuses its compute pipeline, binds the
+active storage set and dispatches the packet's XYZ group counts. Errors remain
+explicit: a missing program, unsupported shader semantic or indirect dispatch
+rejects that backend callback and records the exact error. Draw callbacks still
+only count work, and translated ALU shaders do not yet access the bound storage
+descriptor until buffer/image lowering is implemented.
 
 `vulkan-smoke` is an explicit hardware test rather than part of `zig build test`,
 so machines without a Vulkan runtime can still build and test every module. The
 probe creates a valid compute shader module and pipeline, dispatches it, copies
 known words from coherent host staging through a device-local storage buffer
 into coherent readback memory, inserts the required host/transfer barriers,
-waits on a fence and compares every byte:
+waits on a fence and compares every byte. It then submits a synthetic RDNA2 ALU
+program twice through the real DCB executor, proving the translation and both
+allocation/pipeline cache-hit paths before reading the staged buffer back:
 
 ```sh
 zig build vulkan-smoke
@@ -464,6 +483,7 @@ zig build vulkan-smoke
 Vulkan 1.4.321: NVIDIA GeForce RTX 3070 Ti
 device API 1.4.329, queue family 0, validation off
 headless smoke passed: 1 compute dispatch, 64 staging bytes copied and verified
+translated RDNA2 passed: 2 dispatches, pipelines 1/1 miss/hit, buffers 1/1 miss/hit
 ```
 
 ---

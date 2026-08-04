@@ -57,6 +57,9 @@ pub const ShaderModule = u64;
 pub const PipelineLayout = u64;
 pub const Pipeline = u64;
 pub const PipelineCache = u64;
+pub const DescriptorSetLayout = u64;
+pub const DescriptorPool = u64;
+pub const DescriptorSet = u64;
 
 pub const structure_type_application_info: u32 = 0;
 pub const structure_type_instance_create_info: u32 = 1;
@@ -68,9 +71,14 @@ pub const structure_type_mapped_memory_range: u32 = 6;
 pub const structure_type_fence_create_info: u32 = 8;
 pub const structure_type_buffer_create_info: u32 = 12;
 pub const structure_type_shader_module_create_info: u32 = 16;
+pub const structure_type_pipeline_cache_create_info: u32 = 17;
 pub const structure_type_pipeline_shader_stage_create_info: u32 = 18;
 pub const structure_type_compute_pipeline_create_info: u32 = 29;
 pub const structure_type_pipeline_layout_create_info: u32 = 30;
+pub const structure_type_descriptor_set_layout_create_info: u32 = 32;
+pub const structure_type_descriptor_pool_create_info: u32 = 33;
+pub const structure_type_descriptor_set_allocate_info: u32 = 34;
+pub const structure_type_write_descriptor_set: u32 = 35;
 pub const structure_type_command_pool_create_info: u32 = 39;
 pub const structure_type_command_buffer_allocate_info: u32 = 40;
 pub const structure_type_command_buffer_begin_info: u32 = 42;
@@ -96,7 +104,10 @@ pub const memory_property_host_coherent_bit: Flags = 0x0000_0004;
 pub const pipeline_bind_point_compute: u32 = 1;
 pub const shader_stage_compute_bit: Flags = 0x0000_0020;
 pub const pipeline_stage_transfer_bit: Flags = 0x0000_1000;
+pub const pipeline_stage_compute_shader_bit: Flags = 0x0000_0800;
 pub const pipeline_stage_host_bit: Flags = 0x0000_4000;
+pub const access_shader_read_bit: Flags = 0x0000_0020;
+pub const access_shader_write_bit: Flags = 0x0000_0040;
 pub const access_transfer_read_bit: Flags = 0x0000_0800;
 pub const access_transfer_write_bit: Flags = 0x0000_1000;
 pub const access_host_read_bit: Flags = 0x0000_2000;
@@ -105,6 +116,8 @@ pub const access_host_write_bit: Flags = 0x0000_4000;
 pub const physical_device_type_other: u32 = 0;
 pub const physical_device_type_integrated_gpu: u32 = 1;
 pub const physical_device_type_discrete_gpu: u32 = 2;
+
+pub const descriptor_type_storage_buffer: u32 = 7;
 
 pub const ApplicationInfo = extern struct {
     s_type: u32 = structure_type_application_info,
@@ -258,6 +271,71 @@ pub const ShaderModuleCreateInfo = extern struct {
     code: [*]const u32,
 };
 
+pub const PipelineCacheCreateInfo = extern struct {
+    s_type: u32 = structure_type_pipeline_cache_create_info,
+    p_next: ?*const anyopaque = null,
+    flags: Flags = 0,
+    initial_data_size: usize = 0,
+    initial_data: ?*const anyopaque = null,
+};
+
+pub const DescriptorSetLayoutBinding = extern struct {
+    binding: u32,
+    descriptor_type: u32,
+    descriptor_count: u32,
+    stage_flags: Flags,
+    immutable_samplers: ?[*]const u64 = null,
+};
+
+pub const DescriptorSetLayoutCreateInfo = extern struct {
+    s_type: u32 = structure_type_descriptor_set_layout_create_info,
+    p_next: ?*const anyopaque = null,
+    flags: Flags = 0,
+    binding_count: u32,
+    bindings: [*]const DescriptorSetLayoutBinding,
+};
+
+pub const DescriptorPoolSize = extern struct {
+    descriptor_type: u32,
+    descriptor_count: u32,
+};
+
+pub const DescriptorPoolCreateInfo = extern struct {
+    s_type: u32 = structure_type_descriptor_pool_create_info,
+    p_next: ?*const anyopaque = null,
+    flags: Flags = 0,
+    max_sets: u32,
+    pool_size_count: u32,
+    pool_sizes: [*]const DescriptorPoolSize,
+};
+
+pub const DescriptorSetAllocateInfo = extern struct {
+    s_type: u32 = structure_type_descriptor_set_allocate_info,
+    p_next: ?*const anyopaque = null,
+    descriptor_pool: DescriptorPool,
+    descriptor_set_count: u32,
+    set_layouts: [*]const DescriptorSetLayout,
+};
+
+pub const DescriptorBufferInfo = extern struct {
+    buffer: Buffer,
+    offset: DeviceSize,
+    range: DeviceSize,
+};
+
+pub const WriteDescriptorSet = extern struct {
+    s_type: u32 = structure_type_write_descriptor_set,
+    p_next: ?*const anyopaque = null,
+    destination_set: DescriptorSet,
+    destination_binding: u32,
+    destination_array_element: u32,
+    descriptor_count: u32,
+    descriptor_type: u32,
+    image_info: ?*const anyopaque = null,
+    buffer_info: ?[*]const DescriptorBufferInfo,
+    texel_buffer_view: ?[*]const u64 = null,
+};
+
 pub const PipelineLayoutCreateInfo = extern struct {
     s_type: u32 = structure_type_pipeline_layout_create_info,
     p_next: ?*const anyopaque = null,
@@ -344,11 +422,20 @@ pub const PfnMapMemory = *const fn (Device, DeviceMemory, DeviceSize, DeviceSize
 pub const PfnUnmapMemory = *const fn (Device, DeviceMemory) callconv(call) void;
 pub const PfnCreateShaderModule = *const fn (Device, *const ShaderModuleCreateInfo, ?*const anyopaque, *ShaderModule) callconv(call) Result;
 pub const PfnDestroyShaderModule = *const fn (Device, ShaderModule, ?*const anyopaque) callconv(call) void;
+pub const PfnCreatePipelineCache = *const fn (Device, *const PipelineCacheCreateInfo, ?*const anyopaque, *PipelineCache) callconv(call) Result;
+pub const PfnDestroyPipelineCache = *const fn (Device, PipelineCache, ?*const anyopaque) callconv(call) void;
+pub const PfnCreateDescriptorSetLayout = *const fn (Device, *const DescriptorSetLayoutCreateInfo, ?*const anyopaque, *DescriptorSetLayout) callconv(call) Result;
+pub const PfnDestroyDescriptorSetLayout = *const fn (Device, DescriptorSetLayout, ?*const anyopaque) callconv(call) void;
+pub const PfnCreateDescriptorPool = *const fn (Device, *const DescriptorPoolCreateInfo, ?*const anyopaque, *DescriptorPool) callconv(call) Result;
+pub const PfnDestroyDescriptorPool = *const fn (Device, DescriptorPool, ?*const anyopaque) callconv(call) void;
+pub const PfnAllocateDescriptorSets = *const fn (Device, *const DescriptorSetAllocateInfo, [*]DescriptorSet) callconv(call) Result;
+pub const PfnUpdateDescriptorSets = *const fn (Device, u32, [*]const WriteDescriptorSet, u32, ?*const anyopaque) callconv(call) void;
 pub const PfnCreatePipelineLayout = *const fn (Device, *const PipelineLayoutCreateInfo, ?*const anyopaque, *PipelineLayout) callconv(call) Result;
 pub const PfnDestroyPipelineLayout = *const fn (Device, PipelineLayout, ?*const anyopaque) callconv(call) void;
 pub const PfnCreateComputePipelines = *const fn (Device, PipelineCache, u32, [*]const ComputePipelineCreateInfo, ?*const anyopaque, [*]Pipeline) callconv(call) Result;
 pub const PfnDestroyPipeline = *const fn (Device, Pipeline, ?*const anyopaque) callconv(call) void;
 pub const PfnCmdBindPipeline = *const fn (CommandBuffer, u32, Pipeline) callconv(call) void;
+pub const PfnCmdBindDescriptorSets = *const fn (CommandBuffer, u32, PipelineLayout, u32, u32, [*]const DescriptorSet, u32, ?[*]const u32) callconv(call) void;
 pub const PfnCmdDispatch = *const fn (CommandBuffer, u32, u32, u32) callconv(call) void;
 pub const PfnCmdFillBuffer = *const fn (CommandBuffer, Buffer, DeviceSize, DeviceSize, u32) callconv(call) void;
 pub const PfnCmdCopyBuffer = *const fn (CommandBuffer, Buffer, Buffer, u32, [*]const BufferCopy) callconv(call) void;
