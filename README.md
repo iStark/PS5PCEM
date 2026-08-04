@@ -7,7 +7,7 @@ the independent subsystems and their end-to-end composition:
 |---|---|
 | **`memory`** | Reserves and manages the fixed, identity-mapped guest address space |
 | **`rdna2`** | Decodes and disassembles RDNA2 shader machine code |
-| **`gpu`** | Decodes the command stream a title submits to the graphics hardware |
+| **`gpu`** | Decodes and executes the stateful part of submitted GPU command streams |
 | **`loader`** | Reads, maps, and relocates bare ELF64 and decrypted PS5 SELF module images |
 | **`hle`** | High-level emulation of the guest firmware: symbol resolution and firmware libraries |
 | **`cpu`** | Dispatches guest execution and provides the Windows x86-64 native machine bridge |
@@ -261,10 +261,22 @@ whichever layer hands it over. Replacing the graphics library and emulating the
 kernel device both end up holding one of these buffers, so the decoder depends
 on neither choice and on nothing else in the tree.
 
-Nothing is executed. What the decoder provides is legibility: a buffer of opaque
-words becomes a sequence of named commands with their bodies delimited, which is
-the specification an implementation has to satisfy and can be checked against a
-real capture long before anything renders.
+The decoder provides legibility: a buffer of opaque words becomes a sequence of
+named commands with their bodies delimited. The next layer is now executable.
+[`gpu.state`](src/gpu/state.zig) retains context, shader, user-config and config
+registers across submissions, including zero-valued writes, plus the latest
+synchronization, event and flip state. [`gpu.executor`](src/gpu/executor.zig)
+applies direct, native Gen5 and legacy AGC indirect register lists,
+`ACQUIRE_MEM`, `RELEASE_MEM`,
+32/64-bit `WAIT_REG_MEM`, standard and AGC `WRITE_DATA`, `EVENT_WRITE` and
+`SetFlip`. An unmet wait returns `blocked` and its exact resume word; it never
+changes guest memory to manufacture progress.
+
+The executor is deliberately independent of Vulkan and guest-memory ownership.
+Its backend interface supplies checked reads/writes and optional callbacks for
+barriers, releases, waits, events, flips, draws and dispatches. Tests use an
+in-memory backend, live AGC submission uses the identity-mapped guest address
+space, and the Vulkan renderer will implement the same draw/dispatch boundary.
 
 Three decisions are worth stating. Body length is stored biased by one, so there
 is no way to encode an empty body and a decoder that assumed otherwise would
@@ -286,18 +298,25 @@ packet per line with its word offset, and counts the draws and dispatches:
 00006: SET_SH_REG shader[0x2c0c] x1
 00009: NUM_INSTANCES 1 dwords
 00011: DRAW_INDEX_AUTO 2 dwords
-00014: RELEASE_MEM 6 dwords
+00014: R_RELEASE_MEM 7 dwords
 00021: PAD
 00022: WAIT_REG_MEM 5 dwords predicated
 ```
 
 ## Roadmap
 
-1. Apply context, shader and user-config register writes to persistent GPU state.
-2. Execute the synchronization, memory-write and flip packets already present
-   in the first captured title DCB.
-3. Follow `INDIRECT_BUFFER` into the stream it chains to.
-4. Feed the resulting state and draw/dispatch events into a Vulkan executor.
+1. Follow `INDIRECT_BUFFER` recursively with cycle, depth and range checks.
+2. Add graphics/compute queue scheduling so a blocked DCB is resumed when a
+   real `RELEASE_MEM` producer publishes its label.
+3. Decode resource descriptors, render/depth targets and PS5 tiling metadata
+   from the tracked registers.
+4. Complete the RDNA2 vector and memory ISA, build control flow and translate
+   guest shaders to SPIR-V.
+5. Implement the Vulkan backend: device/queue selection, guest-memory staging,
+   image layout transitions and barriers, pipeline/cache creation, draw and
+   dispatch recording, then swapchain presentation through `SetFlip`.
+6. Validate packet/state/shader results against captures before optimizing
+   asynchronous submission, descriptor caches and pipeline compilation.
 
 ---
 
@@ -934,6 +953,15 @@ address and a length. In a batch, a null entry is skipped rather than ending the
 batch, since the arrays are indexed in parallel and stopping early would drop
 every buffer after a hole the title left deliberately.
 
+The same submission is applied to persistent graphics/compute
+[`gpu.State`](src/gpu/state.zig) instances through
+[`gpu.DcbExecutor`](src/gpu/executor.zig). Register state therefore
+survives between buffers; label writes reach checked guest memory; acquire,
+release, wait, event and flip packets become typed state. A blocked wait is
+reported with its resume word. Cross-queue storage and wake-up are the next
+scheduler step; the executor already exposes the continuation needed for that
+without forcing a label to a satisfying value.
+
 Submissions are accepted rather than refused, which is the opposite of the
 choice made for the graphics device, and the difference is what a caller does
 with the answer. A refused device request is one whose reply the driver stores
@@ -959,11 +987,11 @@ from leaking into host code where nothing would check it.
 
 ## Roadmap
 
-1. Apply the submitted PM4 register and synchronization packets to internal GPU
-   state through an executor interface.
-2. Implement APR/AMPR file resolution and reads for titles whose patched
+1. Implement APR/AMPR file resolution and reads for titles whose patched
    executable reaches streaming before graphics submission.
-3. Recover `/dev/gc` queue-registration outputs for the shipped driver path.
+2. Recover `/dev/gc` queue-registration outputs for the shipped driver path.
+3. Connect the DCB continuation to graphics/compute queue wake-up after a real
+   release-label write.
 
 ---
 

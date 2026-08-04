@@ -10,11 +10,10 @@
 //! complete description of a frame, without having to model any of the calls
 //! that produced it.
 //!
-//! Nothing is rendered. What happens here is that a submission is *read*: the
-//! buffer is decoded into named commands and summarised, so the trace shows
-//! what the title asked the hardware to do. That is worth having before any
-//! rendering exists — it is how one learns what a real frame is made of, and it
-//! is checkable against the title's own behaviour.
+//! Nothing is rendered yet. A submission is decoded into named commands for
+//! tracing and applied to persistent command-processor state. Register writes,
+//! labels, waits, events and flips therefore have their real ordering before a
+//! rendering backend exists, and draw/dispatch callbacks form its boundary.
 //!
 //! Submissions are accepted rather than refused, which is the opposite of the
 //! choice made for the graphics device. The distinction is what a caller does
@@ -48,6 +47,49 @@ pub const Submission = extern struct {
 /// buries the shape of the frame in its own detail, and the first commands are
 /// where the shape is: the set-up that a draw depends on comes before the draw.
 const listed_packet_limit: usize = 64;
+
+const ExecutionLock = struct {
+    inner: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *ExecutionLock) void {
+        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(self: *ExecutionLock) void {
+        self.inner.unlock();
+    }
+};
+
+/// Command-processor state survives a submission. A title commonly sets a
+/// shader or render target in one DCB and consumes it in the next one, so a
+/// per-call temporary would make otherwise valid draws incomplete.
+var execution_lock = ExecutionLock{};
+var submitted_graphics_state = gpu.State{};
+var submitted_compute_state = gpu.State{};
+
+fn backendRead(_: ?*anyopaque, address: u64, bytes: []u8) bool {
+    if (!memory.isGuestRangeAccessible(address, bytes.len)) return false;
+    const source: [*]const u8 = @ptrFromInt(address);
+    @memcpy(bytes, source[0..bytes.len]);
+    return true;
+}
+
+fn backendWrite(_: ?*anyopaque, address: u64, bytes: []const u8) bool {
+    if (!memory.isGuestRangeAccessible(address, bytes.len)) return false;
+    const destination: [*]u8 = @ptrFromInt(address);
+    @memcpy(destination[0..bytes.len], bytes);
+    return true;
+}
+
+const executor_backend_vtable = gpu.DcbBackend.VTable{
+    .read = backendRead,
+    .write = backendWrite,
+};
+
+const executor_backend = gpu.DcbBackend{
+    .context = null,
+    .vtable = &executor_backend_vtable,
+};
 
 /// What one submitted buffer contained.
 pub const Summary = struct {
@@ -115,6 +157,42 @@ fn announce(label: []const u8, stream: []const u32) void {
     );
 }
 
+/// Applies one submitted buffer to the persistent command-processor state.
+/// A blocked wait is intentionally left at its own packet; the executor's
+/// resume word is the interface a queue scheduler will use when its producer
+/// publishes the awaited label.
+fn executeSubmitted(label: []const u8, stream: []const u32) void {
+    execution_lock.lock();
+    defer execution_lock.unlock();
+
+    const submitted_state = if (std.mem.eql(u8, label, "acb"))
+        &submitted_compute_state
+    else
+        &submitted_graphics_state;
+    var executor = gpu.DcbExecutor{
+        .state = submitted_state,
+        .backend = executor_backend,
+    };
+    const result = executor.execute(stream) catch |err| {
+        if (trace.isLive()) {
+            std.debug.print("[{s}] executor stopped: {s}\n", .{ label, @errorName(err) });
+        }
+        return;
+    };
+    if (trace.isLive() and result.status == .blocked) {
+        const wait = submitted_state.blocked_wait.?;
+        std.debug.print(
+            "[{s}] blocked at word {d}: WAIT_REG_MEM 0x{x} mask=0x{x} ref=0x{x}\n",
+            .{ label, result.resume_word, wait.address, wait.mask, wait.reference },
+        );
+    }
+}
+
+fn acceptSubmitted(label: []const u8, stream: []const u32) void {
+    announce(label, stream);
+    executeSubmitted(label, stream);
+}
+
 /// Turns a submitted address and length into a readable buffer, or null.
 ///
 /// The range is checked against the guest address space first. A submission
@@ -134,7 +212,7 @@ fn streamOf(address: ?[*]const u32, word_count: u32) ?[]const u32 {
 fn submitOne(label: []const u8, descriptor: ?*const Submission) void {
     const submission = descriptor orelse return;
     const stream = streamOf(submission.address, submission.word_count) orelse return;
-    announce(label, stream);
+    acceptSubmitted(label, stream);
 }
 
 /// Graphics work, described by one descriptor.
@@ -165,7 +243,7 @@ fn submitMultiDcbs(
 
     for (0..count) |index| {
         const stream = streamOf(buffers[index], sizes[index]) orelse continue;
-        announce("dcb", stream);
+        acceptSubmitted("dcb", stream);
     }
     return errno.ok;
 }
@@ -173,7 +251,7 @@ fn submitMultiDcbs(
 /// One buffer submitted directly, without a descriptor around it.
 fn submitCommandBuffer(_: u32, address: ?[*]const u32, word_count: u32) callconv(abi.guest) i32 {
     const stream = streamOf(address, word_count) orelse return errno.ok;
-    announce("dcb", stream);
+    acceptSubmitted("dcb", stream);
     return errno.ok;
 }
 
@@ -199,12 +277,11 @@ test "a submitted buffer is counted by what it contains" {
         command(gpu.pm4.clear_state, 1),     0,
         command(gpu.pm4.num_instances, 1),   1,
         command(gpu.pm4.draw_index_auto, 2), 3,
-        0,
-        command(gpu.pm4.dispatch_direct, 3), 1,
+        0,                                   command(gpu.pm4.dispatch_direct, 3),
         1,                                   1,
-        command(gpu.pm4.draw_index_2, 4),    0,
+        1,                                   command(gpu.pm4.draw_index_2, 4),
         0,                                   0,
-        0,
+        0,                                   0,
     };
     const summary = summarize(&stream);
     try testing.expectEqual(@as(usize, 5), summary.packets);

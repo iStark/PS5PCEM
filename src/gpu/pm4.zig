@@ -72,6 +72,9 @@ pub const Packet = struct {
     /// The name of this command, when it has a documented one.
     pub fn name(self: Packet) ?[]const u8 {
         if (self.kind != .command) return null;
+        if (customCode(self)) |code| {
+            if (customName(code)) |named| return named;
+        }
         return opcodeName(self.opcode);
     }
 };
@@ -191,6 +194,8 @@ pub const load_uconfig_reg: u8 = 0x5e;
 pub const load_sh_reg: u8 = 0x5f;
 pub const load_config_reg: u8 = 0x60;
 pub const load_context_reg: u8 = 0x61;
+pub const set_sh_reg_indirect: u8 = 0x63;
+pub const set_uconfig_reg_indirect: u8 = 0x64;
 pub const set_config_reg: u8 = 0x68;
 pub const set_context_reg: u8 = 0x69;
 pub const set_context_reg_index: u8 = 0x6a;
@@ -205,7 +210,56 @@ pub const increment_ce_counter: u8 = 0x84;
 pub const increment_de_counter: u8 = 0x85;
 pub const wait_on_ce_counter: u8 = 0x86;
 pub const set_sh_reg_index: u8 = 0x9b;
-pub const load_context_reg_index: u8 = 0x9f;
+pub const set_context_reg_indirect: u8 = 0x9f;
+
+/// Gen5 extensions carried in the otherwise ordinary `NOP` packet. The code
+/// occupies header bits 2..7; bits 0 and 1 retain predicate/pipe meaning.
+pub const custom = struct {
+    pub const zero: u6 = 0x00;
+    pub const draw_reset: u6 = 0x05;
+    pub const wait_flip_done: u6 = 0x06;
+    pub const dispatch_reset: u6 = 0x09;
+    pub const wait_mem_32: u6 = 0x0a;
+    pub const push_marker: u6 = 0x0b;
+    pub const pop_marker: u6 = 0x0c;
+    pub const sh_regs_indirect: u6 = 0x11;
+    pub const context_regs_indirect: u6 = 0x12;
+    pub const uconfig_regs_indirect: u6 = 0x13;
+    pub const acquire_mem: u6 = 0x14;
+    pub const write_data: u6 = 0x15;
+    pub const wait_mem_64: u6 = 0x16;
+    pub const flip: u6 = 0x17;
+    pub const release_mem: u6 = 0x18;
+    pub const dma_data: u6 = 0x19;
+};
+
+/// Returns the Gen5 extension selector of a custom NOP packet.
+pub fn customCode(packet: Packet) ?u6 {
+    if (packet.kind != .command or packet.opcode != nop) return null;
+    return @truncate(packet.header >> 2);
+}
+
+pub fn customName(code: u6) ?[]const u8 {
+    return switch (code) {
+        custom.zero => null,
+        custom.draw_reset => "R_DRAW_RESET",
+        custom.wait_flip_done => "R_WAIT_FLIP_DONE",
+        custom.dispatch_reset => "R_DISPATCH_RESET",
+        custom.wait_mem_32 => "R_WAIT_MEM_32",
+        custom.push_marker => "R_PUSH_MARKER",
+        custom.pop_marker => "R_POP_MARKER",
+        custom.sh_regs_indirect => "R_SH_REGS_INDIRECT",
+        custom.context_regs_indirect => "R_CONTEXT_REGS_INDIRECT",
+        custom.uconfig_regs_indirect => "R_UCONFIG_REGS_INDIRECT",
+        custom.acquire_mem => "R_ACQUIRE_MEM",
+        custom.write_data => "R_WRITE_DATA",
+        custom.wait_mem_64 => "R_WAIT_MEM_64",
+        custom.flip => "R_FLIP",
+        custom.release_mem => "R_RELEASE_MEM",
+        custom.dma_data => "R_DMA_DATA",
+        else => null,
+    };
+}
 
 pub fn opcodeName(opcode: u8) ?[]const u8 {
     return switch (opcode) {
@@ -260,6 +314,8 @@ pub fn opcodeName(opcode: u8) ?[]const u8 {
         load_sh_reg => "LOAD_SH_REG",
         load_config_reg => "LOAD_CONFIG_REG",
         load_context_reg => "LOAD_CONTEXT_REG",
+        set_sh_reg_indirect => "SET_SH_REG_INDIRECT",
+        set_uconfig_reg_indirect => "SET_UCONFIG_REG_INDIRECT",
         set_config_reg => "SET_CONFIG_REG",
         set_context_reg => "SET_CONTEXT_REG",
         set_context_reg_index => "SET_CONTEXT_REG_INDEX",
@@ -274,7 +330,7 @@ pub fn opcodeName(opcode: u8) ?[]const u8 {
         increment_de_counter => "INCREMENT_DE_COUNTER",
         wait_on_ce_counter => "WAIT_ON_CE_COUNTER",
         set_sh_reg_index => "SET_SH_REG_INDEX",
-        load_context_reg_index => "LOAD_CONTEXT_REG_INDEX",
+        set_context_reg_indirect => "SET_CONTEXT_REG_INDIRECT",
         else => null,
     };
 }
@@ -333,10 +389,20 @@ pub const RegisterSpace = enum {
 /// The bank a register command writes to, if it is one.
 pub fn registerSpaceOf(opcode: u8) ?RegisterSpace {
     return switch (opcode) {
-        set_config_reg, load_config_reg => .config,
-        set_context_reg, set_context_reg_index, load_context_reg, load_context_reg_index, context_reg_rmw => .context,
-        set_sh_reg, set_sh_reg_index, set_sh_reg_offset, load_sh_reg => .shader,
-        set_uconfig_reg, set_uconfig_reg_index, load_uconfig_reg => .uconfig,
+        set_config_reg => .config,
+        set_context_reg, set_context_reg_index => .context,
+        set_sh_reg, set_sh_reg_index, set_sh_reg_offset => .shader,
+        set_uconfig_reg, set_uconfig_reg_index => .uconfig,
+        else => null,
+    };
+}
+
+/// Register bank selected by a Gen5 indirect register-list packet.
+pub fn indirectRegisterSpaceOf(opcode: u8) ?RegisterSpace {
+    return switch (opcode) {
+        set_context_reg_indirect => .context,
+        set_sh_reg_indirect => .shader,
+        set_uconfig_reg_indirect => .uconfig,
         else => null,
     };
 }
@@ -349,7 +415,7 @@ pub fn firstRegister(packet: Packet) ?u32 {
     if (packet.kind != .command) return null;
     const space = registerSpaceOf(packet.opcode) orelse return null;
     if (packet.body.len == 0) return null;
-    return space.base() + packet.body[0];
+    return space.base() + (packet.body[0] & 0xffff);
 }
 
 /// How many registers a `SET_*_REG` packet writes.
@@ -381,7 +447,15 @@ pub fn write(packet: Packet, w: *std.Io.Writer) std.Io.Writer.Error!void {
         .command => {},
     }
 
-    if (packet.name()) |named| {
+    if (customCode(packet)) |code| {
+        if (customName(code)) |named| {
+            try w.writeAll(named);
+        } else if (code == custom.zero) {
+            try w.writeAll("NOP");
+        } else {
+            try w.print("NOP custom=0x{x:0>2}", .{code});
+        }
+    } else if (packet.name()) |named| {
         try w.writeAll(named);
     } else {
         try w.print("op=0x{x:0>2}", .{packet.opcode});
@@ -498,9 +572,8 @@ test "an empty stream ends immediately" {
 
 test "consecutive packets are delimited by their own headers" {
     const stream = [_]u32{
-        command(set_context_reg, 3), 0x0206, 0x1111, 0x2222,
-        command(num_instances, 1),   1,
-        command(draw_index_auto, 2), 6,
+        command(set_context_reg, 3), 0x0206, 0x1111,                      0x2222,
+        command(num_instances, 1),   1,      command(draw_index_auto, 2), 6,
         0,
     };
     var walker = Walker.init(&stream);
@@ -578,6 +651,35 @@ test "a packet is written the way a capture is read" {
     try testing.expectEqualStrings("DRAW_INDEX_AUTO 2 dwords compute", draw_writer.buffered());
 }
 
+test "Gen5 indirect registers and custom NOP commands keep their real names" {
+    try testing.expectEqual(
+        RegisterSpace.context,
+        indirectRegisterSpaceOf(set_context_reg_indirect).?,
+    );
+    try testing.expectEqual(RegisterSpace.shader, indirectRegisterSpaceOf(set_sh_reg_indirect).?);
+    try testing.expect(registerSpaceOf(set_context_reg_indirect) == null);
+
+    const stream = [_]u32{
+        command(nop, 7) | (@as(u32, custom.release_mem) << 2),
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    };
+    var walker = Walker.init(&stream);
+    const packet = (try walker.next()).?;
+    try testing.expectEqual(custom.release_mem, customCode(packet).?);
+    try testing.expectEqualStrings("R_RELEASE_MEM", packet.name().?);
+
+    var buffer: [64]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try write(packet, &writer);
+    try testing.expectEqualStrings("R_RELEASE_MEM 7 dwords", writer.buffered());
+}
+
 test "a dumped stream names where it stopped making sense" {
     const stream = [_]u32{
         command(clear_state, 1), 0,
@@ -599,6 +701,8 @@ test "every named opcode round-trips through its own constant" {
     try testing.expectEqualStrings("SET_CONTEXT_REG", opcodeName(0x69).?);
     try testing.expectEqualStrings("SET_SH_REG", opcodeName(0x76).?);
     try testing.expectEqualStrings("SET_UCONFIG_REG", opcodeName(0x79).?);
+    try testing.expectEqualStrings("SET_SH_REG_INDIRECT", opcodeName(0x63).?);
+    try testing.expectEqualStrings("SET_CONTEXT_REG_INDIRECT", opcodeName(0x9f).?);
     try testing.expectEqualStrings("RELEASE_MEM", opcodeName(0x49).?);
     try testing.expectEqualStrings("INDIRECT_BUFFER", opcodeName(0x3f).?);
     try testing.expect(opcodeName(0x14) == null);

@@ -12,8 +12,16 @@
 const std = @import("std");
 
 pub const pm4 = @import("pm4.zig");
+pub const state = @import("state.zig");
+pub const executor = @import("executor.zig");
+
+pub const State = state.State;
+pub const DcbExecutor = executor.DcbExecutor;
+pub const DcbBackend = executor.Backend;
 
 test {
     std.testing.refAllDecls(@This());
     _ = pm4;
+    _ = state;
+    _ = executor;
 }
