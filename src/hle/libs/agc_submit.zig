@@ -88,6 +88,28 @@ const shader_memory_reader = gpu.ShaderMemoryReader{
     .read_fn = backendRead,
 };
 
+fn traceSurfaceLayout(layout: gpu.SurfaceLayout) void {
+    std.debug.print(
+        "    layout block={d}x{d}/{d} pitch={d} source={d} staging={d}\n",
+        .{
+            layout.block.width,
+            layout.block.height,
+            layout.block.bytes,
+            layout.row_pitch_elements,
+            layout.required_source_bytes,
+            layout.staging_bytes,
+        },
+    );
+}
+
+fn traceImageLayout(image: gpu.ImageDescriptor) void {
+    const layout = gpu.SurfaceLayout.fromImage(image) catch |err| {
+        std.debug.print("    layout unavailable={s}\n", .{@errorName(err)});
+        return;
+    };
+    traceSurfaceLayout(layout);
+}
+
 fn traceShaderBinding(state: *const gpu.State, stage: gpu.resources.ShaderStage) void {
     if (!trace.isLive()) return;
     const program_address = stage.programAddress(state) orelse return;
@@ -210,14 +232,20 @@ fn traceShaderBinding(state: *const gpu.State, stage: gpu.resources.ShaderStage)
             continue;
         } orelse continue;
         switch (first.descriptor) {
-            .read_only_texture => |image| std.debug.print(
-                "  {s}[{d}] table=0x{x} image=0x{x} {d}x{d} fmt={d}\n",
-                .{ @tagName(kind), first.mapping.slot, first.descriptor_address, image.address, image.width, image.height, image.unified_format },
-            ),
-            .read_write_texture => |image| std.debug.print(
-                "  {s}[{d}] table=0x{x} image=0x{x} {d}x{d} fmt={d}\n",
-                .{ @tagName(kind), first.mapping.slot, first.descriptor_address, image.address, image.width, image.height, image.unified_format },
-            ),
+            .read_only_texture => |image| {
+                std.debug.print(
+                    "  {s}[{d}] table=0x{x} image=0x{x} {d}x{d} fmt={d} sw={d}\n",
+                    .{ @tagName(kind), first.mapping.slot, first.descriptor_address, image.address, image.width, image.height, image.unified_format, @intFromEnum(image.tile_mode) },
+                );
+                traceImageLayout(image);
+            },
+            .read_write_texture => |image| {
+                std.debug.print(
+                    "  {s}[{d}] table=0x{x} image=0x{x} {d}x{d} fmt={d} sw={d}\n",
+                    .{ @tagName(kind), first.mapping.slot, first.descriptor_address, image.address, image.width, image.height, image.unified_format, @intFromEnum(image.tile_mode) },
+                );
+                traceImageLayout(image);
+            },
             .sampler => |sampler| std.debug.print(
                 "  {s}[{d}] table=0x{x} lod={d:.2}..{d:.2}\n",
                 .{ @tagName(kind), first.mapping.slot, first.descriptor_address, sampler.minimum_lod, sampler.maximum_lod },
@@ -256,6 +284,11 @@ fn backendDraw(_: ?*anyopaque, state: *const gpu.State, _: gpu.pm4.Packet) bool 
                 @intFromBool(depth.depth_read_only),
             },
         );
+        if (gpu.SurfaceLayout.fromDepthTarget(depth)) |layout| {
+            traceSurfaceLayout(layout);
+        } else |err| {
+            std.debug.print("    layout unavailable={s}\n", .{@errorName(err)});
+        }
     } else {
         std.debug.print(", depth=none\n", .{});
     }
@@ -274,6 +307,11 @@ fn backendDraw(_: ?*anyopaque, state: *const gpu.State, _: gpu.pm4.Packet) bool 
                 target.write_mask,
             },
         );
+        if (gpu.SurfaceLayout.fromColorTarget(target)) |layout| {
+            traceSurfaceLayout(layout);
+        } else |err| {
+            std.debug.print("    layout unavailable={s}\n", .{@errorName(err)});
+        }
     }
     return true;
 }

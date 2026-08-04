@@ -331,6 +331,19 @@ walk explicitly instead of inventing state. Draw/dispatch diagnostics expose
 this load plan together with the direct and vertex tables, ready for the shader
 translator to consume.
 
+[`gpu.tiling`](src/gpu/tiling.zig) is the API-neutral bridge from those guest
+resources to host staging memory. It implements the exact GFX10 address XORs
+for linear, Standard 256 B/4 KiB/64 KiB, partially-resident 64 KiB, depth Z_X
+and render-target R_X layouts, including RB+ macro-block and array-slice XOR.
+One checked `Layout` owns block dimensions, padded guest pitch, physical slice
+stride and tightly packed staging size; both CPU tile/detile and direct
+`MemoryReader` staging consume its `sourceByteOffset`, so a later Vulkan compute
+path can use the same address contract. Buffer, image, BC-block, color-target
+and depth-target adapters allocate nothing, reject overflow and short ranges,
+and report unsupported MSAA, 3D or mip-tail cases instead of treating tiled
+bytes as linear. Live draw diagnostics now show block, pitch, guest range and
+staging size for every layout they can resolve.
+
 The executor is deliberately independent of Vulkan and guest-memory ownership.
 Its backend interface supplies checked reads/writes and optional callbacks for
 barriers, releases, waits, events, flips, draws and dispatches. Tests use an
@@ -364,8 +377,9 @@ packet per line with its word offset, and counts the draws and dispatches:
 
 ## Roadmap
 
-1. Implement PS5 swizzle address transforms and staging layouts for linear,
-   256-byte, 4 KiB, 64 KiB, depth and render-target tile modes.
+1. Extend the shared staging contract with GFX10 mip-chain/tail placement,
+   thick 3D blocks and MSAA sample addressing, then package it as compute-detile
+   constants without changing the CPU reference path.
 2. Complete the RDNA2 vector and memory ISA, build control flow and translate
    guest shaders to SPIR-V.
 3. Implement the Vulkan backend: device/queue selection, guest-memory staging,
