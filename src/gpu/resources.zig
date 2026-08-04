@@ -168,6 +168,7 @@ pub const ImageDescriptor = struct {
     }
 
     pub fn resourceMipLevels(self: ImageDescriptor) u8 {
+        if (self.image_type == .color_2d_msaa or self.image_type == .color_2d_msaa_array) return 1;
         var largest = @max(self.width, self.height);
         if (self.image_type == .color_3d) largest = @max(largest, self.depth_or_layers);
         var maximum: u8 = 1;
@@ -177,13 +178,23 @@ pub const ImageDescriptor = struct {
     }
 
     pub fn viewBaseLevel(self: ImageDescriptor) u8 {
+        if (self.image_type == .color_2d_msaa or self.image_type == .color_2d_msaa_array) return 0;
         return @min(self.base_level, self.resourceMipLevels() - 1);
     }
 
     pub fn viewMipLevels(self: ImageDescriptor) u8 {
+        if (self.image_type == .color_2d_msaa or self.image_type == .color_2d_msaa_array) return 1;
         const base = self.viewBaseLevel();
         const described = if (self.last_level >= base) self.last_level - base + 1 else 1;
         return @min(described, self.resourceMipLevels() - base);
+    }
+
+    /// MSAA descriptors repurpose LAST_LEVEL as log2(sample count).
+    pub fn samplesLog2(self: ImageDescriptor) u8 {
+        return if (self.image_type == .color_2d_msaa or self.image_type == .color_2d_msaa_array)
+            @min(self.last_level, 3)
+        else
+            0;
     }
 };
 

@@ -100,8 +100,8 @@ pub const BlockLayout = struct {
             .standard_4kb => standard4kOffset(x, y, self.bytes_per_element),
             .standard_64kb => standard64kOffset(x, y, self.bytes_per_element),
             .partially_resident => prt64kOffset(x, y, self.bytes_per_element),
-            .depth => depth64kOffset(x, y, self.bytes_per_element),
-            .render_target => render64kOffset(x, y, self.bytes_per_element),
+            .depth => rbPlus64kOffset(.depth, x, y, 0, 0, self.bytes_per_element, 0),
+            .render_target => rbPlus64kOffset(.render_target, x, y, 0, 0, self.bytes_per_element, 0),
             _ => return Error.UnsupportedTileMode,
         };
         std.debug.assert(offset < self.bytes);
@@ -112,24 +112,154 @@ pub const BlockLayout = struct {
     /// RB+ render/depth layouts XOR macro-block coordinates and the array
     /// slice into the address inside a 64 KiB block.
     pub fn blockXor(self: BlockLayout, block_x: u32, block_y: u32, block_z: u32) Error!u32 {
-        var offset: u32 = switch (self.tile_mode) {
-            .render_target => render64kOffset(
+        const offset: u32 = switch (self.tile_mode) {
+            .render_target => rbPlus64kOffset(
+                .render_target,
                 try multiplyU32(block_x, self.width),
                 try multiplyU32(block_y, self.height),
+                block_z,
+                0,
                 self.bytes_per_element,
+                0,
             ),
-            .depth => if (self.bytes_per_element == 8) depth64kOffset(
+            .depth => rbPlus64kOffset(
+                .depth,
                 try multiplyU32(block_x, self.width),
                 try multiplyU32(block_y, self.height),
-                8,
-            ) else 0,
+                block_z,
+                0,
+                self.bytes_per_element,
+                0,
+            ),
             .linear, .standard_256b, .standard_4kb, .standard_64kb, .partially_resident => 0,
             _ => return Error.UnsupportedTileMode,
         };
-        if (self.tile_mode == .render_target or self.tile_mode == .depth) {
-            offset ^= ((block_z & 8) << 5) ^ ((block_z & 4) << 7) ^
-                ((block_z & 2) << 9) ^ ((block_z & 1) << 11);
+        std.debug.assert(offset < self.bytes);
+        std.debug.assert(offset % self.bytes_per_element == 0);
+        return offset;
+    }
+};
+
+pub const BlockFamily = enum(u8) {
+    linear,
+    standard_256b,
+    standard_4kb,
+    standard_4kb_3d,
+    standard_64kb,
+    standard_64kb_3d,
+    partially_resident,
+    partially_resident_3d,
+    depth_64kb,
+    render_target_64kb,
+};
+
+/// Complete GFX10 swizzle block description. Unlike `BlockLayout`, this also
+/// carries thick-volume depth and the number of interleaved MSAA fragments.
+pub const SwizzleBlock = struct {
+    family: BlockFamily,
+    bytes_per_element: u8,
+    samples_log2: u8,
+    bytes: u32,
+    width: u32,
+    height: u32,
+    depth: u32,
+
+    pub fn init(
+        tile_mode: resources.TileMode,
+        bytes_per_element: u8,
+        volume: bool,
+        samples_log2: u8,
+    ) Error!SwizzleBlock {
+        if (!isSupportedElementSize(bytes_per_element)) return Error.UnsupportedElementSize;
+        if (samples_log2 > 3) return Error.UnsupportedMultisample;
+        if (volume and samples_log2 != 0) return Error.UnsupportedMultisample;
+        if (samples_log2 != 0 and tile_mode != .depth and tile_mode != .render_target) {
+            return Error.UnsupportedMultisample;
         }
+        if (tile_mode == .depth and bytes_per_element > 8) return Error.UnsupportedElementSize;
+
+        if (volume) {
+            const family: BlockFamily = switch (tile_mode) {
+                .standard_4kb => .standard_4kb_3d,
+                .standard_64kb => .standard_64kb_3d,
+                .partially_resident => .partially_resident_3d,
+                .depth => .depth_64kb,
+                .render_target => .render_target_64kb,
+                else => return Error.UnsupportedTileMode,
+            };
+            const dimensions = try thickBlockDimensions(family, bytes_per_element);
+            return .{
+                .family = family,
+                .bytes_per_element = bytes_per_element,
+                .samples_log2 = 0,
+                .bytes = if (family == .standard_4kb_3d) 4096 else 65536,
+                .width = dimensions[0],
+                .height = dimensions[1],
+                .depth = dimensions[2],
+            };
+        }
+
+        if (samples_log2 != 0) {
+            const dimensions = msaa64kBlockDimensions(bytes_per_element, samples_log2);
+            return .{
+                .family = if (tile_mode == .depth) .depth_64kb else .render_target_64kb,
+                .bytes_per_element = bytes_per_element,
+                .samples_log2 = samples_log2,
+                .bytes = 65536,
+                .width = dimensions[0],
+                .height = dimensions[1],
+                .depth = 1,
+            };
+        }
+
+        const thin = try BlockLayout.init(tile_mode, bytes_per_element);
+        return .{
+            .family = switch (tile_mode) {
+                .linear => .linear,
+                .standard_256b => .standard_256b,
+                .standard_4kb => .standard_4kb,
+                .standard_64kb => .standard_64kb,
+                .partially_resident => .partially_resident,
+                .depth => .depth_64kb,
+                .render_target => .render_target_64kb,
+                _ => return Error.UnsupportedTileMode,
+            },
+            .bytes_per_element = bytes_per_element,
+            .samples_log2 = 0,
+            .bytes = thin.bytes,
+            .width = thin.width,
+            .height = thin.height,
+            .depth = 1,
+        };
+    }
+
+    pub fn byteOffset(
+        self: SwizzleBlock,
+        x: u32,
+        y: u32,
+        z: u32,
+        sample: u32,
+    ) Error!u32 {
+        if (sample >= (@as(u32, 1) << @intCast(self.samples_log2))) {
+            return Error.CoordinateOutOfRange;
+        }
+        if (self.family != .depth_64kb and self.family != .render_target_64kb and
+            (x >= self.width or y >= self.height or z >= self.depth))
+        {
+            return Error.CoordinateOutOfRange;
+        }
+        const offset = switch (self.family) {
+            .linear => 0,
+            .standard_256b => standard4kOffset(x, y, self.bytes_per_element) & 0xff,
+            .standard_4kb => standard4kOffset(x, y, self.bytes_per_element),
+            .standard_4kb_3d => standard4k3dOffset(x, y, z, self.bytes_per_element),
+            .standard_64kb => standard64kOffset(x, y, self.bytes_per_element),
+            .standard_64kb_3d => standard64k3dOffset(x, y, z, self.bytes_per_element),
+            .partially_resident => prt64kOffset(x, y, self.bytes_per_element),
+            .partially_resident_3d => prt64k3dOffset(x, y, z, self.bytes_per_element),
+            .depth_64kb => rbPlus64kOffset(.depth, x, y, z, sample, self.bytes_per_element, self.samples_log2),
+            .render_target_64kb => rbPlus64kOffset(.render_target, x, y, z, sample, self.bytes_per_element, self.samples_log2),
+        };
         std.debug.assert(offset < self.bytes);
         std.debug.assert(offset % self.bytes_per_element == 0);
         return offset;
@@ -390,6 +520,673 @@ pub const Layout = struct {
     }
 };
 
+pub const maximum_mip_levels: u8 = 16;
+
+pub const TextureKind = enum(u8) {
+    array_2d,
+    volume_3d,
+};
+
+/// Allocation description in element coordinates. For BC formats one element
+/// is one compressed 4x4 block, just like the legacy `Layout` contract.
+pub const Texture = struct {
+    tile_mode: resources.TileMode,
+    kind: TextureKind = .array_2d,
+    width: u32,
+    height: u32,
+    depth_or_layers: u32 = 1,
+    first_slice: u32 = 0,
+    mip_levels: u8 = 1,
+    samples_log2: u8 = 0,
+    /// Used only by a one-level 2D allocation. Zero selects the logical width.
+    row_pitch_elements: u32 = 0,
+};
+
+pub const MipLevel = struct {
+    width: u32 = 0,
+    height: u32 = 0,
+    depth: u32 = 0,
+    padded_width: u32 = 0,
+    padded_height: u32 = 0,
+    offset: u64 = 0,
+    storage_bytes: u64 = 0,
+    tail_x: u32 = 0,
+    tail_y: u32 = 0,
+    in_tail: bool = false,
+};
+
+/// Allocation-free placement for all mips and slices of one guest texture.
+/// Small mips share one swizzle block at the start of each array slice (or
+/// volume block-slice), matching GFX10's smallest-mip-first convention.
+pub const TextureLayout = struct {
+    block: SwizzleBlock,
+    kind: TextureKind,
+    mip_levels: u8,
+    first_tail_level: u8,
+    layers: u32,
+    first_slice: u32,
+    source_layer_bytes: u64,
+    block_slice_bytes: u64,
+    required_source_bytes: u64,
+    levels: [maximum_mip_levels]MipLevel,
+
+    pub fn init(texture: Texture, bytes_per_element: u8) Error!TextureLayout {
+        if (texture.width == 0 or texture.height == 0 or texture.depth_or_layers == 0 or
+            texture.mip_levels == 0 or texture.mip_levels > maximum_mip_levels)
+        {
+            return Error.InvalidExtent;
+        }
+        if (texture.kind == .volume_3d and texture.first_slice != 0) return Error.UnsupportedVolume;
+        if (texture.samples_log2 != 0 and texture.mip_levels != 1) {
+            return Error.UnsupportedMipChain;
+        }
+        const volume = texture.kind == .volume_3d;
+        const block = try SwizzleBlock.init(
+            texture.tile_mode,
+            bytes_per_element,
+            volume,
+            texture.samples_log2,
+        );
+        var out = TextureLayout{
+            .block = block,
+            .kind = texture.kind,
+            .mip_levels = texture.mip_levels,
+            .first_tail_level = texture.mip_levels,
+            .layers = if (volume) 1 else texture.depth_or_layers,
+            .first_slice = texture.first_slice,
+            .source_layer_bytes = 0,
+            .block_slice_bytes = 0,
+            .required_source_bytes = 0,
+            .levels = [_]MipLevel{.{}} ** maximum_mip_levels,
+        };
+        if (volume) {
+            try out.placeVolume(texture);
+        } else {
+            try out.placeArray(texture);
+        }
+        return out;
+    }
+
+    pub fn fromImage(image: resources.ImageDescriptor) Error!TextureLayout {
+        const element = elementLayoutForUnifiedFormat(image.unified_format) orelse
+            return Error.UnsupportedFormat;
+        const width = try texelsToElements(image.width, element.texels_wide);
+        const height = try texelsToElements(image.height, element.texels_high);
+        const volume = image.image_type == .color_3d;
+        const arrayed = image.image_type.isArray();
+        const first_slice: u32 = if (arrayed) image.base_array else 0;
+        const layers_or_depth: u32 = if (volume)
+            image.depth_or_layers
+        else if (arrayed and image.depth_or_layers > first_slice)
+            image.depth_or_layers - first_slice
+        else
+            1;
+        return init(.{
+            .tile_mode = image.tile_mode,
+            .kind = if (volume) .volume_3d else .array_2d,
+            .width = width,
+            .height = height,
+            .depth_or_layers = layers_or_depth,
+            .first_slice = first_slice,
+            .mip_levels = image.resourceMipLevels(),
+            .samples_log2 = image.samplesLog2(),
+            .row_pitch_elements = if (image.resourceMipLevels() == 1)
+                try texelsToElements(@max(image.pitch, image.width), element.texels_wide)
+            else
+                0,
+        }, element.bytes);
+    }
+
+    pub fn fromColorTarget(target: resources.ColorTarget) Error!TextureLayout {
+        const bytes = colorBytesPerElement(target.format) orelse return Error.UnsupportedFormat;
+        if (target.samples_log2 > 3 or target.fragments_log2 > target.samples_log2) {
+            return Error.UnsupportedMultisample;
+        }
+        const layers: u32 = if (target.last_array_slice >= target.base_array_slice)
+            @as(u32, target.last_array_slice) - target.base_array_slice + 1
+        else
+            1;
+        return init(.{
+            .tile_mode = target.tile_mode,
+            .width = target.width,
+            .height = target.height,
+            .depth_or_layers = layers,
+            .first_slice = target.base_array_slice,
+            .mip_levels = @max(target.maximum_mip + 1, 1),
+            .samples_log2 = target.fragments_log2,
+            .row_pitch_elements = if (target.maximum_mip == 0) target.pitch else 0,
+        }, bytes);
+    }
+
+    pub fn fromDepthTarget(target: resources.DepthTarget) Error!TextureLayout {
+        const bytes: u8 = switch (target.format) {
+            1 => 2,
+            3 => 4,
+            else => return Error.UnsupportedFormat,
+        };
+        const layers: u32 = if (target.last_array_slice >= target.base_array_slice)
+            @as(u32, target.last_array_slice) - target.base_array_slice + 1
+        else
+            1;
+        return init(.{
+            .tile_mode = target.tile_mode,
+            .width = target.width,
+            .height = target.height,
+            .depth_or_layers = layers,
+            .first_slice = target.base_array_slice,
+            .mip_levels = @max(target.maximum_mip + 1, 1),
+            .samples_log2 = target.samples_log2,
+        }, bytes);
+    }
+
+    pub fn subresource(
+        self: TextureLayout,
+        level: u8,
+        first_layer: u32,
+        layer_count: u32,
+    ) Error!SubresourceLayout {
+        if (level >= self.mip_levels or layer_count == 0) return Error.CoordinateOutOfRange;
+        if (self.kind == .volume_3d) {
+            if (first_layer != 0 or layer_count != 1) return Error.CoordinateOutOfRange;
+        } else if (first_layer >= self.layers or layer_count > self.layers - first_layer) {
+            return Error.CoordinateOutOfRange;
+        }
+        const mip = self.levels[level];
+        return .{
+            .block = self.block,
+            .kind = self.kind,
+            .width = mip.width,
+            .height = mip.height,
+            .depth_or_layers = if (self.kind == .volume_3d) mip.depth else layer_count,
+            .first_slice = if (self.kind == .array_2d)
+                try addU32(self.first_slice, first_layer)
+            else
+                0,
+            .padded_width = mip.padded_width,
+            .padded_height = mip.padded_height,
+            .level_offset = mip.offset,
+            .source_layer_bytes = self.source_layer_bytes,
+            .block_slice_bytes = self.block_slice_bytes,
+            .required_source_bytes = self.required_source_bytes,
+            .tail_x = mip.tail_x,
+            .tail_y = mip.tail_y,
+            .in_tail = mip.in_tail,
+        };
+    }
+
+    pub fn base(self: TextureLayout) Error!SubresourceLayout {
+        return self.subresource(0, 0, self.layers);
+    }
+
+    fn placeArray(self: *TextureLayout, texture: Texture) Error!void {
+        const levels: u8 = texture.mip_levels;
+        if (self.block.family == .linear) {
+            for (0..levels) |index| {
+                const level: u8 = @intCast(index);
+                const width = shiftCeil(texture.width, level);
+                const height = shiftCeil(texture.height, level);
+                var pitch = try alignForward(width, @max(@as(u32, 1), 256 / @as(u32, self.block.bytes_per_element)));
+                if (level == 0 and texture.row_pitch_elements != 0) {
+                    if (texture.row_pitch_elements < width) return Error.InvalidPitch;
+                    pitch = try alignForward(texture.row_pitch_elements, @max(@as(u32, 1), 256 / @as(u32, self.block.bytes_per_element)));
+                }
+                self.levels[level] = .{
+                    .width = width,
+                    .height = height,
+                    .depth = 1,
+                    .padded_width = pitch,
+                    .padded_height = height,
+                    .storage_bytes = try multiply3(pitch, height, self.block.bytes_per_element),
+                };
+            }
+            try self.placeSmallestFirst(0);
+            self.source_layer_bytes = try alignForward64(self.source_layer_bytes, 256);
+        } else if (self.block.family == .standard_256b or levels == 1 or self.block.samples_log2 != 0) {
+            for (0..levels) |index| {
+                const level: u8 = @intCast(index);
+                const width = shiftCeil(texture.width, level);
+                const height = shiftCeil(texture.height, level);
+                var storage_width = width;
+                if (level == 0 and texture.row_pitch_elements != 0) {
+                    if (texture.row_pitch_elements < width) return Error.InvalidPitch;
+                    storage_width = texture.row_pitch_elements;
+                }
+                const padded_width = try alignForward(storage_width, self.block.width);
+                const padded_height = try alignForward(height, self.block.height);
+                self.levels[level] = .{
+                    .width = width,
+                    .height = height,
+                    .depth = 1,
+                    .padded_width = padded_width,
+                    .padded_height = padded_height,
+                    .storage_bytes = try multiply3(
+                        try multiply(padded_width, padded_height),
+                        self.block.bytes_per_element,
+                        @as(u32, 1) << @intCast(self.block.samples_log2),
+                    ),
+                };
+            }
+            try self.placeSmallestFirst(0);
+        } else {
+            const max_tail: u8 = if (self.block.bytes == 4096) 8 else 12;
+            var tail_width = self.block.width / 2;
+            var tail_height = self.block.height;
+            if (self.block.family == .depth_64kb and self.block.bytes_per_element < 4) {
+                tail_width = 64;
+                tail_height = 128;
+            }
+            self.first_tail_level = findFirstTail(
+                texture.width,
+                texture.height,
+                levels,
+                tail_width,
+                tail_height,
+                max_tail,
+            );
+            for (0..levels) |index| {
+                const level: u8 = @intCast(index);
+                const width = shiftCeil(texture.width, level);
+                const height = shiftCeil(texture.height, level);
+                if (level >= self.first_tail_level) {
+                    const location = tailLocation(self.block, level - self.first_tail_level);
+                    self.levels[level] = .{
+                        .width = width,
+                        .height = height,
+                        .depth = 1,
+                        .padded_width = self.block.width,
+                        .padded_height = self.block.height,
+                        .storage_bytes = self.block.bytes,
+                        .tail_x = location[0],
+                        .tail_y = location[1],
+                        .in_tail = true,
+                    };
+                } else {
+                    const padded_width = try alignForward(width, self.block.width);
+                    const padded_height = try alignForward(height, self.block.height);
+                    self.levels[level] = .{
+                        .width = width,
+                        .height = height,
+                        .depth = 1,
+                        .padded_width = padded_width,
+                        .padded_height = padded_height,
+                        .storage_bytes = try multiply3(padded_width, padded_height, self.block.bytes_per_element),
+                    };
+                }
+            }
+            try self.placeSmallestFirst(if (self.first_tail_level < levels) self.block.bytes else 0);
+        }
+        self.block_slice_bytes = self.source_layer_bytes;
+        const physical_layers = try addU32(self.first_slice, self.layers);
+        self.required_source_bytes = try multiply(self.source_layer_bytes, physical_layers);
+    }
+
+    fn placeVolume(self: *TextureLayout, texture: Texture) Error!void {
+        const thick4 = self.block.family == .standard_4kb_3d;
+        const thick64 = self.block.family == .standard_64kb_3d or
+            self.block.family == .partially_resident_3d;
+        const max_tail: u8 = if (thick4) 5 else if (thick64) 10 else 12;
+        var tail_width = if (thick4) self.block.width else self.block.width / 2;
+        var tail_height = if (thick4) self.block.height / 2 else self.block.height;
+        if (self.block.family == .depth_64kb and self.block.bytes_per_element < 4) {
+            tail_width = 64;
+            tail_height = 128;
+        }
+        self.first_tail_level = findFirstTail(
+            texture.width,
+            texture.height,
+            texture.mip_levels,
+            tail_width,
+            tail_height,
+            max_tail,
+        );
+        var block_slice_bytes: u64 = if (self.first_tail_level < texture.mip_levels)
+            self.block.bytes
+        else
+            0;
+        for (0..texture.mip_levels) |index| {
+            const level: u8 = @intCast(index);
+            const width = shiftCeil(texture.width, level);
+            const height = shiftCeil(texture.height, level);
+            const depth = shiftCeil(texture.depth_or_layers, level);
+            if (level >= self.first_tail_level) {
+                const location = tailLocation(self.block, level - self.first_tail_level);
+                self.levels[level] = .{
+                    .width = width,
+                    .height = height,
+                    .depth = depth,
+                    .padded_width = self.block.width,
+                    .padded_height = self.block.height,
+                    .storage_bytes = self.block.bytes,
+                    .tail_x = location[0],
+                    .tail_y = location[1],
+                    .in_tail = true,
+                };
+            } else {
+                const padded_width = try alignForward(width, self.block.width);
+                const padded_height = try alignForward(height, self.block.height);
+                const size = try multiply3(
+                    try multiply(self.block.depth, padded_width),
+                    padded_height,
+                    self.block.bytes_per_element,
+                );
+                self.levels[level] = .{
+                    .width = width,
+                    .height = height,
+                    .depth = depth,
+                    .padded_width = padded_width,
+                    .padded_height = padded_height,
+                    .storage_bytes = size,
+                };
+                block_slice_bytes = try add(block_slice_bytes, size);
+            }
+        }
+        self.block_slice_bytes = block_slice_bytes;
+        self.source_layer_bytes = block_slice_bytes;
+        var offset: u64 = if (self.first_tail_level < texture.mip_levels) self.block.bytes else 0;
+        var reverse: u8 = self.first_tail_level;
+        while (reverse != 0) {
+            reverse -= 1;
+            self.levels[reverse].offset = offset;
+            offset = try add(offset, self.levels[reverse].storage_bytes);
+        }
+        const block_slices = try divideRoundUp(texture.depth_or_layers, self.block.depth);
+        self.required_source_bytes = try multiply(block_slice_bytes, block_slices);
+    }
+
+    fn placeSmallestFirst(self: *TextureLayout, initial_offset: u64) Error!void {
+        var offset = initial_offset;
+        var reverse = self.first_tail_level;
+        if (self.first_tail_level == self.mip_levels) reverse = self.mip_levels;
+        while (reverse != 0) {
+            reverse -= 1;
+            self.levels[reverse].offset = offset;
+            offset = try add(offset, self.levels[reverse].storage_bytes);
+        }
+        self.source_layer_bytes = offset;
+    }
+};
+
+/// One mip/view copied to tightly packed `[slice][y][x][sample]` staging data.
+pub const SubresourceLayout = struct {
+    block: SwizzleBlock,
+    kind: TextureKind,
+    width: u32,
+    height: u32,
+    depth_or_layers: u32,
+    first_slice: u32,
+    padded_width: u32,
+    padded_height: u32,
+    level_offset: u64,
+    source_layer_bytes: u64,
+    block_slice_bytes: u64,
+    required_source_bytes: u64,
+    tail_x: u32,
+    tail_y: u32,
+    in_tail: bool,
+
+    pub fn samples(self: SubresourceLayout) u32 {
+        return @as(u32, 1) << @intCast(self.block.samples_log2);
+    }
+
+    pub fn stagingBytes(self: SubresourceLayout) Error!u64 {
+        return multiply3(
+            try multiply3(self.width, self.height, self.depth_or_layers),
+            self.samples(),
+            self.block.bytes_per_element,
+        );
+    }
+
+    pub fn sourceByteOffset(
+        self: SubresourceLayout,
+        x: u32,
+        y: u32,
+        slice_or_z: u32,
+        sample: u32,
+    ) Error!u64 {
+        if (x >= self.width or y >= self.height or slice_or_z >= self.depth_or_layers or
+            sample >= self.samples()) return Error.CoordinateOutOfRange;
+
+        if (self.block.family == .linear) {
+            const slice_base = try multiply(self.source_layer_bytes, try addU32(self.first_slice, slice_or_z));
+            const row = try multiply3(y, self.padded_width, self.block.bytes_per_element);
+            return add(try add(try add(slice_base, self.level_offset), row), try multiply(x, self.block.bytes_per_element));
+        }
+
+        const swizzle_x = try addU32(x, self.tail_x);
+        const swizzle_y = try addU32(y, self.tail_y);
+        const block_x = swizzle_x / self.block.width;
+        const block_y = swizzle_y / self.block.height;
+        const blocks_per_row = self.padded_width / self.block.width;
+        const blocks_per_slice = try multiply(
+            blocks_per_row,
+            self.padded_height / self.block.height,
+        );
+        const block_index = try add(try multiply(block_y, blocks_per_row), block_x);
+        var allocation_base = self.level_offset;
+        var swizzle_z: u32 = 0;
+        var local_z: u32 = 0;
+        if (self.kind == .array_2d) {
+            const physical_slice = try addU32(self.first_slice, slice_or_z);
+            allocation_base = try add(try multiply(self.source_layer_bytes, physical_slice), self.level_offset);
+            if (self.block.family == .depth_64kb or self.block.family == .render_target_64kb) {
+                swizzle_z = physical_slice;
+            }
+        } else {
+            const block_z = slice_or_z / self.block.depth;
+            local_z = slice_or_z % self.block.depth;
+            allocation_base = try add(try multiply(self.block_slice_bytes, block_z), self.level_offset);
+            if (self.block.depth == 1) swizzle_z = slice_or_z else swizzle_z = local_z;
+        }
+        const local = try self.block.byteOffset(
+            if (self.block.family == .depth_64kb or self.block.family == .render_target_64kb)
+                swizzle_x
+            else
+                swizzle_x % self.block.width,
+            if (self.block.family == .depth_64kb or self.block.family == .render_target_64kb)
+                swizzle_y
+            else
+                swizzle_y % self.block.height,
+            swizzle_z,
+            sample,
+        );
+        _ = blocks_per_slice;
+        return add(try add(allocation_base, try multiply(block_index, self.block.bytes)), local);
+    }
+
+    pub fn stagingByteOffset(
+        self: SubresourceLayout,
+        x: u32,
+        y: u32,
+        slice_or_z: u32,
+        sample: u32,
+    ) Error!u64 {
+        if (x >= self.width or y >= self.height or slice_or_z >= self.depth_or_layers or
+            sample >= self.samples()) return Error.CoordinateOutOfRange;
+        const texel = try add(
+            try multiply(try add(try multiply(slice_or_z, self.height), y), self.width),
+            x,
+        );
+        return multiply(try add(try multiply(texel, self.samples()), sample), self.block.bytes_per_element);
+    }
+
+    pub fn sourceRange(self: SubresourceLayout, address: u64) Error!ByteRange {
+        return .{
+            .address = address,
+            .size = self.required_source_bytes,
+            .end = try add(address, self.required_source_bytes),
+        };
+    }
+
+    pub fn stage(
+        self: SubresourceLayout,
+        reader: shaders.MemoryReader,
+        address: u64,
+        destination: []u8,
+    ) StageError!void {
+        if (@as(u64, destination.len) < try self.stagingBytes()) return Error.DestinationTooSmall;
+        _ = try self.sourceRange(address);
+        const bytes = self.block.bytes_per_element;
+        for (0..self.depth_or_layers) |slice_index| {
+            const slice: u32 = @intCast(slice_index);
+            for (0..self.height) |y_index| {
+                const y: u32 = @intCast(y_index);
+                for (0..self.width) |x_index| {
+                    const x: u32 = @intCast(x_index);
+                    for (0..self.samples()) |sample_index| {
+                        const sample: u32 = @intCast(sample_index);
+                        const src = try add(address, try self.sourceByteOffset(x, y, slice, sample));
+                        const dst: usize = @intCast(try self.stagingByteOffset(x, y, slice, sample));
+                        try reader.read(src, destination[dst..][0..bytes]);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn detile(self: SubresourceLayout, source: []const u8, destination: []u8) Error!void {
+        if (@as(u64, source.len) < self.required_source_bytes) return Error.SourceTooSmall;
+        if (@as(u64, destination.len) < try self.stagingBytes()) return Error.DestinationTooSmall;
+        const bytes = self.block.bytes_per_element;
+        for (0..self.depth_or_layers) |slice_index| {
+            const slice: u32 = @intCast(slice_index);
+            for (0..self.height) |y_index| {
+                const y: u32 = @intCast(y_index);
+                for (0..self.width) |x_index| {
+                    const x: u32 = @intCast(x_index);
+                    for (0..self.samples()) |sample_index| {
+                        const sample: u32 = @intCast(sample_index);
+                        const src: usize = @intCast(try self.sourceByteOffset(x, y, slice, sample));
+                        const dst: usize = @intCast(try self.stagingByteOffset(x, y, slice, sample));
+                        @memcpy(destination[dst..][0..bytes], source[src..][0..bytes]);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn tile(self: SubresourceLayout, source: []const u8, destination: []u8) Error!void {
+        if (@as(u64, source.len) < try self.stagingBytes()) return Error.SourceTooSmall;
+        if (@as(u64, destination.len) < self.required_source_bytes) return Error.DestinationTooSmall;
+        const bytes = self.block.bytes_per_element;
+        for (0..self.depth_or_layers) |slice_index| {
+            const slice: u32 = @intCast(slice_index);
+            for (0..self.height) |y_index| {
+                const y: u32 = @intCast(y_index);
+                for (0..self.width) |x_index| {
+                    const x: u32 = @intCast(x_index);
+                    for (0..self.samples()) |sample_index| {
+                        const sample: u32 = @intCast(sample_index);
+                        const src: usize = @intCast(try self.stagingByteOffset(x, y, slice, sample));
+                        const dst: usize = @intCast(try self.sourceByteOffset(x, y, slice, sample));
+                        @memcpy(destination[dst..][0..bytes], source[src..][0..bytes]);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn computePlan(
+        self: SubresourceLayout,
+        source_offset: u64,
+        destination_offset: u64,
+    ) Error!ComputeDetilePlan {
+        const source_base = if (self.kind == .array_2d)
+            try add(source_offset, try add(
+                try multiply(self.source_layer_bytes, self.first_slice),
+                self.level_offset,
+            ))
+        else
+            try add(source_offset, self.level_offset);
+        const blocks_per_row = self.padded_width / self.block.width;
+        const blocks_per_slice = try multiply(
+            blocks_per_row,
+            self.padded_height / self.block.height,
+        );
+        return .{
+            .key = .{
+                .family = self.block.family,
+                .bytes_per_element_log2 = std.math.log2_int(u8, self.block.bytes_per_element),
+                .samples_log2 = self.block.samples_log2,
+            },
+            .params = .{
+                .source_offset_lo = @truncate(source_base),
+                .source_offset_hi = @truncate(source_base >> 32),
+                .destination_offset_lo = @truncate(destination_offset),
+                .destination_offset_hi = @truncate(destination_offset >> 32),
+                .width = self.width,
+                .height = self.height,
+                .depth = self.depth_or_layers,
+                .samples = self.samples(),
+                .row_pitch_bytes = try u32FromU64(try multiply3(
+                    self.width,
+                    self.samples(),
+                    self.block.bytes_per_element,
+                )),
+                .linear_slice_bytes = try u32FromU64(try multiply3(
+                    try multiply(self.width, self.height),
+                    self.samples(),
+                    self.block.bytes_per_element,
+                )),
+                .block_width = self.block.width,
+                .block_height = self.block.height,
+                .block_depth = self.block.depth,
+                .block_bytes = self.block.bytes,
+                .blocks_per_row = blocks_per_row,
+                .blocks_per_slice = try u32FromU64(blocks_per_slice),
+                .source_slice_bytes = try u32FromU64(if (self.kind == .array_2d)
+                    self.source_layer_bytes
+                else
+                    self.block_slice_bytes),
+                .surface_z = self.first_slice,
+                .tail_x = self.tail_x,
+                .tail_y = self.tail_y,
+                .flags = (@as(u32, @intFromEnum(self.kind)) << 24) |
+                    (@as(u32, @intFromBool(self.in_tail)) << 16),
+            },
+        };
+    }
+};
+
+/// Shader specialization key. Runtime dimensions stay in `ComputeDetileParams`.
+pub const ComputeDetileKey = extern struct {
+    family: BlockFamily,
+    bytes_per_element_log2: u8,
+    samples_log2: u8,
+    reserved: u8 = 0,
+};
+
+/// API-neutral, pointer-free constants consumed by the future Vulkan compute
+/// detiler. All fields are 32-bit so the struct has the same byte layout in
+/// Zig, scalar-layout SPIR-V, and capture/replay diagnostics.
+pub const ComputeDetileParams = extern struct {
+    source_offset_lo: u32,
+    source_offset_hi: u32,
+    destination_offset_lo: u32,
+    destination_offset_hi: u32,
+    width: u32,
+    height: u32,
+    depth: u32,
+    samples: u32,
+    row_pitch_bytes: u32,
+    linear_slice_bytes: u32,
+    block_width: u32,
+    block_height: u32,
+    block_depth: u32,
+    block_bytes: u32,
+    blocks_per_row: u32,
+    blocks_per_slice: u32,
+    source_slice_bytes: u32,
+    surface_z: u32,
+    tail_x: u32,
+    tail_y: u32,
+    flags: u32,
+};
+
+pub const ComputeDetilePlan = struct {
+    key: ComputeDetileKey,
+    params: ComputeDetileParams,
+};
+
 pub const BufferLayout = struct {
     size_bytes: u64,
 
@@ -435,6 +1232,129 @@ pub fn colorBytesPerElement(format: u8) ?u8 {
 
 fn isSupportedElementSize(bytes: u8) bool {
     return bytes == 1 or bytes == 2 or bytes == 4 or bytes == 8 or bytes == 16;
+}
+
+fn thickBlockDimensions(family: BlockFamily, bytes: u8) Error![3]u32 {
+    const index = std.math.log2_int(u8, bytes);
+    return switch (family) {
+        .standard_4kb_3d => ([_][3]u32{
+            .{ 16, 16, 16 }, .{ 8, 16, 16 }, .{ 8, 16, 8 },
+            .{ 8, 8, 8 },    .{ 4, 8, 8 },
+        })[index],
+        .standard_64kb_3d, .partially_resident_3d => ([_][3]u32{
+            .{ 64, 32, 32 }, .{ 32, 32, 32 }, .{ 32, 32, 16 },
+            .{ 32, 16, 16 }, .{ 16, 16, 16 },
+        })[index],
+        .depth_64kb, .render_target_64kb => blk: {
+            const thin = try BlockLayout.init(
+                if (family == .depth_64kb) .depth else .render_target,
+                bytes,
+            );
+            break :blk .{ thin.width, thin.height, 1 };
+        },
+        else => return Error.UnsupportedVolume,
+    };
+}
+
+fn msaa64kBlockDimensions(bytes: u8, samples_log2: u8) [2]u32 {
+    const dimensions_log2 = [4][5][2]u5{
+        .{ .{ 8, 8 }, .{ 8, 7 }, .{ 7, 7 }, .{ 7, 6 }, .{ 6, 6 } },
+        .{ .{ 7, 8 }, .{ 7, 7 }, .{ 6, 7 }, .{ 6, 6 }, .{ 5, 6 } },
+        .{ .{ 7, 7 }, .{ 7, 6 }, .{ 6, 6 }, .{ 6, 5 }, .{ 5, 5 } },
+        .{ .{ 6, 7 }, .{ 6, 6 }, .{ 5, 6 }, .{ 5, 5 }, .{ 4, 5 } },
+    };
+    const value = dimensions_log2[samples_log2][std.math.log2_int(u8, bytes)];
+    return .{ @as(u32, 1) << value[0], @as(u32, 1) << value[1] };
+}
+
+fn shiftCeil(value: u32, shift: u8) u32 {
+    if (shift == 0) return value;
+    return @max(@as(u32, 1), @as(u32, @intCast(
+        (@as(u64, value) + (@as(u64, 1) << @intCast(shift)) - 1) >> @intCast(shift),
+    )));
+}
+
+fn findFirstTail(
+    width: u32,
+    height: u32,
+    levels: u8,
+    tail_width: u32,
+    tail_height: u32,
+    maximum_tail_levels: u8,
+) u8 {
+    if (levels <= 1) return levels;
+    var level: u8 = 0;
+    while (level < levels) : (level += 1) {
+        if (shiftCeil(width, level) <= tail_width and
+            shiftCeil(height, level) <= tail_height and
+            levels - level <= maximum_tail_levels) return level;
+    }
+    return levels;
+}
+
+fn tailLocation(block: SwizzleBlock, index: u8) [2]u32 {
+    const thick4 = block.family == .standard_4kb_3d;
+    const thick64 = block.family == .standard_64kb_3d or
+        block.family == .partially_resident_3d;
+    if (thick4) {
+        const tail_width = block.width;
+        const tail_height = block.height / 2;
+        return switch (index) {
+            0 => .{ 0, tail_height },
+            1 => .{ tail_width / 2, tail_height / 2 },
+            2 => .{ tail_width / 2, 0 },
+            3 => .{ 0, tail_height / 2 },
+            4 => .{ 0, 0 },
+            else => unreachable,
+        };
+    }
+    if (thick64) {
+        const tail_width = block.width / 2;
+        const tail_height = block.height;
+        return switch (index) {
+            0 => .{ tail_width, 0 },
+            1 => .{ 0, tail_height / 2 },
+            2 => .{ tail_width / 2, 0 },
+            3 => .{ tail_width / 4, tail_height / 4 },
+            4 => .{ 0, 3 * tail_height / 8 },
+            5 => .{ 0, tail_height / 4 },
+            6 => .{ tail_width / 4, tail_height / 8 },
+            7 => .{ tail_width / 4, 0 },
+            8 => .{ 0, tail_height / 8 },
+            9 => .{ 0, 0 },
+            else => unreachable,
+        };
+    }
+    const tail_width = block.width / 2;
+    const tail_height = block.height;
+    if (block.bytes == 4096) {
+        return switch (index) {
+            0 => .{ tail_width, 0 },
+            1 => .{ tail_width / 2, tail_height / 2 },
+            2 => .{ 0, 3 * tail_height / 4 },
+            3 => .{ 0, tail_height / 2 },
+            4 => .{ tail_width / 2, tail_height / 4 },
+            5 => .{ tail_width / 2, 0 },
+            6 => .{ 0, tail_height / 4 },
+            7 => .{ 0, 0 },
+            else => unreachable,
+        };
+    }
+    return switch (index) {
+        0 => .{ tail_width, 0 },
+        1 => .{ 0, tail_height / 2 },
+        2 => .{ tail_width / 2, 0 },
+        3 => .{ 0, tail_height / 4 },
+        4 => .{ tail_width / 4, 0 },
+        5 => .{ tail_width / 8, tail_height / 8 },
+        6 => .{ 0, 3 * tail_height / 16 },
+        7 => .{ 0, tail_height / 8 },
+        8 => .{ tail_width / 8, tail_height / 16 },
+        9 => .{ tail_width / 8, 0 },
+        10 => .{ 0, tail_height / 16 },
+        11 => .{ 0, 0 },
+        else => unreachable,
+    };
 }
 
 fn standard4kOffset(x: u32, y: u32, bytes: u8) u32 {
@@ -493,51 +1413,240 @@ fn prt64kOffset(x: u32, y: u32, bytes: u8) u32 {
     return offset;
 }
 
-fn render64kOffset(x: u32, y: u32, bytes: u8) u32 {
+fn standard4k3dOffset(x: u32, y: u32, z: u32, bytes: u8) u32 {
     return switch (bytes) {
-        1 => ((y << 2) & 0x0008) ^ ((y << 4) & 0x0010) ^ ((y << 3) & 0x00a0) ^
-            ((y << 5) & 0x0f00) ^ ((y << 6) & 0x1000) ^ ((y << 7) & 0x4000) ^
-            (x & 0x0007) ^ ((x << 3) & 0x0040) ^ ((x << 5) & 0x0300) ^
-            ((x << 4) & 0x0400) ^ ((x << 6) & 0x0800) ^ ((x << 7) & 0x2000) ^
-            ((x << 8) & 0x8000),
-        2 => ((y << 4) & 0x0070) ^ ((y << 5) & 0x0f00) ^ ((y << 8) & 0x5000) ^
-            ((x << 1) & 0x000e) ^ ((x << 4) & 0x0480) ^ ((x << 5) & 0x0300) ^
-            ((x << 6) & 0x0800) ^ ((x << 7) & 0x2000) ^ ((x << 8) & 0x8000),
-        4 => ((y << 4) & 0x0070) ^ ((y << 5) & 0x0f00) ^ ((y << 9) & 0x1000) ^
-            ((y << 8) & 0x4000) ^ ((x << 2) & 0x000c) ^ ((x << 5) & 0x0380) ^
-            ((x << 4) & 0x0400) ^ ((x << 6) & 0x0800) ^ ((x << 9) & 0xa000),
-        8 => ((y << 4) & 0x0010) ^ ((y << 6) & 0x0080) ^ ((y << 5) & 0x0f00) ^
-            ((y << 10) & 0x5000) ^ ((x << 3) & 0x0008) ^ ((x << 4) & 0x0460) ^
-            ((x << 5) & 0x0300) ^ ((x << 6) & 0x0800) ^ ((x << 10) & 0x2000) ^
-            ((x << 9) & 0x8000),
-        16 => ((x << 4) & 0x0410) ^ ((x << 5) & 0x0340) ^ ((x << 6) & 0x0800) ^
-            ((x << 11) & 0xa000) ^ ((y << 5) & 0x0f20) ^ ((y << 6) & 0x0080) ^
-            ((y << 10) & 0x1000) ^ ((y << 11) & 0x4000),
+        1 => (x & 0x003) ^ ((x << 4) & 0x040) ^ ((x << 6) & 0x200) ^
+            ((y << 3) & 0x008) ^ ((y << 4) & 0x020) ^ ((y << 6) & 0x100) ^
+            ((y << 8) & 0x800) ^ ((z << 2) & 0x004) ^ ((z << 3) & 0x010) ^
+            ((z << 5) & 0x080) ^ ((z << 7) & 0x400),
+        2 => ((x << 1) & 0x002) ^ ((x << 5) & 0x040) ^ ((x << 7) & 0x200) ^
+            ((y << 3) & 0x008) ^ ((y << 4) & 0x020) ^ ((y << 6) & 0x100) ^
+            ((y << 8) & 0x800) ^ ((z << 2) & 0x004) ^ ((z << 3) & 0x010) ^
+            ((z << 5) & 0x080) ^ ((z << 7) & 0x400),
+        4 => ((x << 2) & 0x004) ^ ((x << 5) & 0x040) ^ ((x << 7) & 0x200) ^
+            ((y << 3) & 0x008) ^ ((y << 4) & 0x020) ^ ((y << 6) & 0x100) ^
+            ((y << 8) & 0x800) ^ ((z << 4) & 0x010) ^ ((z << 6) & 0x080) ^
+            ((z << 8) & 0x400),
+        8 => ((x << 3) & 0x008) ^ ((x << 5) & 0x040) ^ ((x << 7) & 0x200) ^
+            ((y << 5) & 0x020) ^ ((y << 7) & 0x100) ^ ((y << 9) & 0x800) ^
+            ((z << 4) & 0x010) ^ ((z << 6) & 0x080) ^ ((z << 8) & 0x400),
+        16 => ((x << 6) & 0x040) ^ ((x << 8) & 0x200) ^
+            ((y << 5) & 0x020) ^ ((y << 7) & 0x100) ^ ((y << 9) & 0x800) ^
+            ((z << 4) & 0x010) ^ ((z << 6) & 0x080) ^ ((z << 8) & 0x400),
         else => unreachable,
     };
 }
 
-fn depth64kOffset(x: u32, y: u32, bytes: u8) u32 {
+fn standard64k3dOffset(x: u32, y: u32, z: u32, bytes: u8) u32 {
+    var offset = standard4k3dOffset(x, y, z, bytes);
+    const source = ([_][4]u5{
+        .{ 4, 4, 4, 5 }, .{ 3, 4, 4, 4 }, .{ 3, 3, 4, 4 },
+        .{ 3, 3, 3, 4 }, .{ 2, 3, 3, 3 },
+    })[std.math.log2_int(u8, bytes)];
+    offset ^= bit(x, source[0], 12) ^ bit(z, source[1], 13) ^
+        bit(y, source[2], 14) ^ bit(x, source[3], 15);
+    return offset;
+}
+
+fn prt64k3dOffset(x: u32, y: u32, z: u32, bytes: u8) u32 {
+    var offset = standard64k3dOffset(x, y, z, bytes);
+    const source = ([_][4]u5{
+        .{ 4, 5, 4, 4 }, .{ 4, 4, 3, 4 }, .{ 4, 4, 3, 3 },
+        .{ 3, 4, 3, 3 }, .{ 3, 3, 2, 3 },
+    })[std.math.log2_int(u8, bytes)];
+    offset ^= bit(y, source[0], 10) ^ bit(x, source[1], 10) ^
+        bit(x, source[2], 11) ^ bit(z, source[3], 11);
+    return offset;
+}
+
+// Decompressed from AMD AddrLib's GFX10_SW_64K_{R,Z}_X_{1,2,4,8}xaa
+// RBPLUS pattern-info rows for Oberon's 16-pipe / 8-pixel-packer topology.
+// Keeping the compact nibble indexes below avoids a 4 x 2 x 5 x 16 table while
+// preserving the exact X/Y/Z/sample XOR equation used by CPU and compute paths.
+const RbKind = enum { depth, render_target };
+
+const AddressTerm = struct {
+    x: u16 = 0,
+    y: u16 = 0,
+    z: u16 = 0,
+    sample: u8 = 0,
+};
+
+fn addressTerm(x: u16, y: u16, z: u16, sample: u8) AddressTerm {
+    return .{ .x = x, .y = y, .z = z, .sample = sample };
+}
+
+fn rbPlus64kOffset(
+    kind: RbKind,
+    x: u32,
+    y: u32,
+    z: u32,
+    sample: u32,
+    bytes: u8,
+    samples_log2: u8,
+) u32 {
+    const bytes_log2 = std.math.log2_int(u8, bytes);
+    var offset: u32 = if (kind == .render_target)
+        renderMsaaLowOffset(x, y, bytes)
+    else
+        depthMsaaLowOffset(x, y, sample, bytes_log2, samples_log2);
+    const indexes = rbPlusPatternIndexes(kind, samples_log2, bytes_log2);
+    for (0..4) |index| {
+        if (evaluateAddressTerm(nibble2Term(indexes[0], @intCast(index)), x, y, z, sample)) {
+            offset |= @as(u32, 1) << @intCast(index + 8);
+        }
+        if (evaluateAddressTerm(nibble3Term(indexes[1], @intCast(index)), x, y, z, sample)) {
+            offset |= @as(u32, 1) << @intCast(index + 12);
+        }
+    }
+    return offset;
+}
+
+fn renderMsaaLowOffset(x: u32, y: u32, bytes: u8) u32 {
     return switch (bytes) {
-        1 => (x & 0x0001) ^ ((x << 1) & 0x0004) ^ ((x << 2) & 0x0010) ^
-            ((x << 3) & 0x0040) ^ ((x << 5) & 0x0300) ^ ((x << 4) & 0x0400) ^
-            ((x << 6) & 0x0800) ^ ((x << 7) & 0x2000) ^ ((x << 8) & 0x8000) ^
-            ((y << 1) & 0x0002) ^ ((y << 2) & 0x0008) ^ ((y << 3) & 0x00a0) ^
-            ((y << 5) & 0x0f00) ^ ((y << 6) & 0x1000) ^ ((y << 7) & 0x4000),
-        2 => ((x << 1) & 0x0002) ^ ((x << 2) & 0x0008) ^ ((x << 3) & 0x0020) ^
-            ((x << 4) & 0x0480) ^ ((x << 5) & 0x0300) ^ ((x << 6) & 0x0800) ^
-            ((x << 7) & 0x2000) ^ ((x << 8) & 0x8000) ^ ((y << 2) & 0x0004) ^
-            ((y << 3) & 0x0010) ^ ((y << 4) & 0x0040) ^ ((y << 5) & 0x0f00) ^
-            ((y << 8) & 0x5000),
-        4 => ((x << 2) & 0x0004) ^ ((x << 3) & 0x0010) ^ ((x << 4) & 0x0440) ^
-            ((x << 5) & 0x0300) ^ ((x << 6) & 0x0800) ^ ((x << 9) & 0xa000) ^
-            ((y << 3) & 0x0008) ^ ((y << 4) & 0x0020) ^ ((y << 5) & 0x0f80) ^
-            ((y << 9) & 0x1000) ^ ((y << 8) & 0x4000),
-        8 => ((x << 3) & 0x0008) ^ ((x << 4) & 0x0420) ^ ((x << 5) & 0x0380) ^
-            ((x << 6) & 0x0800) ^ ((x << 10) & 0x2000) ^ ((x << 9) & 0x8000) ^
-            ((y << 4) & 0x0010) ^ ((y << 5) & 0x0f40) ^ ((y << 10) & 0x5000),
+        1 => (x & 0x0f) ^ ((y << 4) & 0xf0),
+        2 => ((x << 1) & 0x0e) ^ ((y << 4) & 0x70) ^ ((x << 4) & 0x80),
+        4 => ((x << 2) & 0x0c) ^ ((y << 4) & 0x30) ^
+            ((x << 4) & 0x40) ^ ((y << 5) & 0x80),
+        8 => ((x << 3) & 0x08) ^ ((y << 4) & 0x10) ^
+            ((x << 4) & 0x60) ^ ((y << 6) & 0x80),
+        16 => ((x << 4) & 0x10) ^ ((x << 5) & 0x40) ^
+            ((y << 5) & 0x20) ^ ((y << 6) & 0x80),
         else => unreachable,
     };
+}
+
+fn depthMsaaLowOffset(x: u32, y: u32, sample: u32, bytes_log2: u8, samples_log2: u8) u32 {
+    var offset: u32 = 0;
+    var destination: u8 = bytes_log2;
+    var source: u8 = 0;
+    while (source < samples_log2) : (source += 1) {
+        offset |= ((sample >> @intCast(source)) & 1) << @intCast(destination);
+        destination += 1;
+    }
+    source = 0;
+    while (destination < 8) : (destination += 1) {
+        const coordinate = if (source & 1 == 0) x else y;
+        offset |= ((coordinate >> @intCast(source / 2)) & 1) << @intCast(destination);
+        source += 1;
+    }
+    return offset;
+}
+
+fn evaluateAddressTerm(term: AddressTerm, x: u32, y: u32, z: u32, sample: u32) bool {
+    const parity = @popCount(x & term.x) + @popCount(y & term.y) +
+        @popCount(z & term.z) + @popCount(sample & term.sample);
+    return parity & 1 != 0;
+}
+
+fn rbPlusPatternIndexes(kind: RbKind, samples_log2: u8, bytes_log2: u8) [2]u16 {
+    const b: usize = bytes_log2;
+    return switch (kind) {
+        .render_target => switch (samples_log2) {
+            0 => .{ 307, ([_]u16{ 379, 389, 381, 382, 390 })[b] },
+            1 => .{ ([_]u16{ 307, 307, 307, 307, 427 })[b], ([_]u16{ 700, 701, 702, 703, 390 })[b] },
+            2 => .{ ([_]u16{ 307, 307, 307, 436, 437 })[b], ([_]u16{ 744, 751, 746, 703, 390 })[b] },
+            3 => .{ ([_]u16{ 339, 339, 422, 452, 453 })[b], ([_]u16{ 781, 782, 746, 703, 390 })[b] },
+            else => unreachable,
+        },
+        .depth => switch (samples_log2) {
+            0 => .{ ([_]u16{ 306, 306, 306, 307, 307 })[b], ([_]u16{ 379, 389, 381, 382, 390 })[b] },
+            1 => .{ ([_]u16{ 306, 306, 306, 307, 365 })[b], ([_]u16{ 380, 381, 434, 435, 435 })[b] },
+            2 => .{ ([_]u16{ 306, 306, 306, 372, 373 })[b], ([_]u16{ 381, 462, 470, 470, 470 })[b] },
+            3 => .{ ([_]u16{ 306, 306, 387, 373, 388 })[b], ([_]u16{ 434, 470, 490, 470, 470 })[b] },
+            else => unreachable,
+        },
+    };
+}
+
+fn nibble2Term(pattern: u16, index: u2) AddressTerm {
+    const terms: [4]AddressTerm = switch (pattern) {
+        306 => .{
+            addressTerm(0x080, 0x090, 0, 0),     addressTerm(0x010, 0x010, 0x002, 0),
+            addressTerm(0x040, 0x020, 0x001, 0), addressTerm(0x020, 0x040, 0, 0),
+        },
+        307 => .{
+            addressTerm(0x080, 0x090, 0, 0),     addressTerm(0x010, 0x010, 0x004, 0),
+            addressTerm(0x040, 0x020, 0x002, 0), addressTerm(0x020, 0x040, 0x001, 0),
+        },
+        339 => .{
+            addressTerm(0x080, 0x090, 0, 0),     addressTerm(0x010, 0x010, 0x002, 0),
+            addressTerm(0x040, 0x020, 0x001, 0), addressTerm(0x020, 0x040, 0x004, 0),
+        },
+        365 => .{
+            addressTerm(0x080, 0x090, 0, 0),     addressTerm(0x010, 0x010, 0x002, 0),
+            addressTerm(0x040, 0x020, 0x001, 0), addressTerm(0x020, 0x042, 0, 0),
+        },
+        372 => .{
+            addressTerm(0x080, 0x090, 0, 0), addressTerm(0x010, 0x010, 0x002, 0),
+            addressTerm(0x040, 0x022, 0, 0), addressTerm(0x020, 0x040, 0x001, 0),
+        },
+        373 => .{
+            addressTerm(0x080, 0x090, 0, 0), addressTerm(0x010, 0x010, 0x001, 0),
+            addressTerm(0x040, 0x022, 0, 0), addressTerm(0x022, 0x040, 0, 0),
+        },
+        387 => .{
+            addressTerm(0x080, 0x090, 0, 0),     addressTerm(0x010, 0x010, 0x002, 0),
+            addressTerm(0x040, 0x020, 0x001, 0), addressTerm(0x020, 0x044, 0, 0),
+        },
+        388 => .{
+            addressTerm(0x080, 0x090, 0, 0), addressTerm(0x010, 0x011, 0, 0),
+            addressTerm(0x040, 0x022, 0, 0), addressTerm(0x022, 0x040, 0, 0),
+        },
+        422 => .{
+            addressTerm(0x080, 0x090, 0, 0),     addressTerm(0x010, 0x010, 0x002, 0),
+            addressTerm(0x040, 0x020, 0x001, 0), addressTerm(0x020, 0x040, 0, 0x04),
+        },
+        427 => .{
+            addressTerm(0x080, 0x090, 0, 0),     addressTerm(0x010, 0x010, 0x002, 0),
+            addressTerm(0x040, 0x020, 0x001, 0), addressTerm(0x020, 0x040, 0, 0x01),
+        },
+        436 => .{
+            addressTerm(0x080, 0x090, 0, 0),    addressTerm(0x010, 0x010, 0x002, 0),
+            addressTerm(0x040, 0x020, 0, 0x02), addressTerm(0x020, 0x040, 0x001, 0),
+        },
+        437 => .{
+            addressTerm(0x080, 0x090, 0, 0),    addressTerm(0x010, 0x010, 0x001, 0),
+            addressTerm(0x040, 0x020, 0, 0x02), addressTerm(0x020, 0x040, 0, 0x01),
+        },
+        452 => .{
+            addressTerm(0x080, 0x090, 0, 0),    addressTerm(0x010, 0x010, 0x001, 0),
+            addressTerm(0x040, 0x020, 0, 0x04), addressTerm(0x020, 0x040, 0, 0x02),
+        },
+        453 => .{
+            addressTerm(0x080, 0x090, 0, 0),    addressTerm(0x010, 0x010, 0, 0x04),
+            addressTerm(0x040, 0x020, 0, 0x02), addressTerm(0x020, 0x040, 0, 0x01),
+        },
+        else => unreachable,
+    };
+    return terms[index];
+}
+
+fn nibble3Term(pattern: u16, index: u2) AddressTerm {
+    const terms: [4]AddressTerm = switch (pattern) {
+        379 => .{ addressTerm(0x040, 0, 0, 0), addressTerm(0, 0x040, 0, 0), addressTerm(0x080, 0x100, 0, 0), addressTerm(0x100, 0x080, 0, 0) },
+        380 => .{ addressTerm(0, 0x008, 0, 0), addressTerm(0x040, 0, 0, 0), addressTerm(0x100, 0x040, 0, 0), addressTerm(0x080, 0x080, 0, 0) },
+        381 => .{ addressTerm(0x008, 0, 0, 0), addressTerm(0, 0x008, 0, 0), addressTerm(0x040, 0x080, 0, 0), addressTerm(0x080, 0x040, 0, 0) },
+        382 => .{ addressTerm(0, 0x004, 0, 0), addressTerm(0x008, 0, 0, 0), addressTerm(0x080, 0x008, 0, 0), addressTerm(0x040, 0x040, 0, 0) },
+        389 => .{ addressTerm(0, 0x008, 0, 0), addressTerm(0x040, 0, 0, 0), addressTerm(0x080, 0x080, 0, 0), addressTerm(0x100, 0x040, 0, 0) },
+        390 => .{ addressTerm(0x004, 0, 0, 0), addressTerm(0, 0x004, 0, 0), addressTerm(0x040, 0x008, 0, 0), addressTerm(0x008, 0x040, 0, 0) },
+        434 => .{ addressTerm(0x008, 0, 0, 0), addressTerm(0, 0x008, 0, 0), addressTerm(0x080, 0x040, 0, 0), addressTerm(0x040, 0x084, 0, 0) },
+        435 => .{ addressTerm(0x004, 0, 0, 0), addressTerm(0x008, 0, 0, 0), addressTerm(0x080, 0x008, 0, 0), addressTerm(0x040, 0x044, 0, 0) },
+        462 => .{ addressTerm(0x008, 0, 0, 0), addressTerm(0, 0x008, 0, 0), addressTerm(0x040, 0x080, 0, 0), addressTerm(0x080, 0x044, 0, 0) },
+        470 => .{ addressTerm(0x008, 0, 0, 0), addressTerm(0, 0x008, 0, 0), addressTerm(0x084, 0x040, 0, 0), addressTerm(0x040, 0x084, 0, 0) },
+        490 => .{ addressTerm(0x008, 0, 0, 0), addressTerm(0, 0x008, 0, 0), addressTerm(0x084, 0x040, 0, 0), addressTerm(0x040, 0x082, 0, 0) },
+        700 => .{ addressTerm(0x040, 0, 0, 0), addressTerm(0, 0x040, 0, 0), addressTerm(0x100, 0x080, 0, 0), addressTerm(0x080, 0x100, 0, 0x01) },
+        701 => .{ addressTerm(0, 0x008, 0, 0), addressTerm(0x040, 0, 0, 0), addressTerm(0x100, 0x040, 0, 0), addressTerm(0x080, 0x080, 0, 0x01) },
+        702 => .{ addressTerm(0x008, 0, 0, 0), addressTerm(0, 0x008, 0, 0), addressTerm(0x080, 0x040, 0, 0), addressTerm(0x040, 0x080, 0, 0x01) },
+        703 => .{ addressTerm(0, 0x004, 0, 0), addressTerm(0x008, 0, 0, 0), addressTerm(0x080, 0x008, 0, 0), addressTerm(0x040, 0x040, 0, 0x01) },
+        744 => .{ addressTerm(0x040, 0, 0, 0), addressTerm(0, 0x040, 0, 0), addressTerm(0x080, 0x100, 0, 0x01), addressTerm(0x100, 0x080, 0, 0x02) },
+        746 => .{ addressTerm(0x008, 0, 0, 0), addressTerm(0, 0x008, 0, 0), addressTerm(0x040, 0x080, 0, 0x01), addressTerm(0x080, 0x040, 0, 0x02) },
+        751 => .{ addressTerm(0, 0x008, 0, 0), addressTerm(0x040, 0, 0, 0), addressTerm(0x080, 0x080, 0, 0x01), addressTerm(0x100, 0x040, 0, 0x02) },
+        781 => .{ addressTerm(0, 0x040, 0, 0), addressTerm(0x040, 0, 0, 0x01), addressTerm(0x100, 0x080, 0, 0x02), addressTerm(0x080, 0x100, 0, 0x04) },
+        782 => .{ addressTerm(0, 0x008, 0, 0), addressTerm(0x040, 0, 0, 0x01), addressTerm(0x100, 0x040, 0, 0x02), addressTerm(0x080, 0x080, 0, 0x04) },
+        else => unreachable,
+    };
+    return terms[index];
 }
 
 fn bit(value: u32, source: u5, destination: u5) u32 {
@@ -551,6 +1660,11 @@ fn divideRoundUp(value: u32, divisor: u32) Error!u32 {
 
 fn alignForward(value: u32, alignment: u32) Error!u32 {
     const biased = std.math.add(u32, value, alignment - 1) catch return Error.ArithmeticOverflow;
+    return biased & ~(alignment - 1);
+}
+
+fn alignForward64(value: u64, alignment: u64) Error!u64 {
+    const biased = std.math.add(u64, value, alignment - 1) catch return Error.ArithmeticOverflow;
     return biased & ~(alignment - 1);
 }
 
@@ -576,6 +1690,11 @@ fn addU32(a: u32, b: u32) Error!u32 {
 
 fn multiplyU32(a: u32, b: u32) Error!u32 {
     return std.math.mul(u32, a, b) catch Error.ArithmeticOverflow;
+}
+
+fn u32FromU64(value: u64) Error!u32 {
+    if (value > std.math.maxInt(u32)) return Error.ArithmeticOverflow;
+    return @intCast(value);
 }
 
 const TestMemory = struct {
@@ -604,13 +1723,15 @@ test "block layouts and fixed AddrLib vectors match PS5 Gen5" {
     const standard = try BlockLayout.init(.standard_64kb, 4);
     const prt = try BlockLayout.init(.partially_resident, 4);
     const color = try BlockLayout.init(.render_target, 4);
+    const color_bytes = try BlockLayout.init(.render_target, 1);
     const depth = try BlockLayout.init(.depth, 4);
     try testing.expectEqual(@as(u32, 128), standard.width);
     try testing.expectEqual(@as(u32, 128), standard.height);
     try testing.expectEqual(@as(u32, 0x8000), try standard.byteOffset(64, 0));
     try testing.expectEqual(@as(u32, 0x8100), try prt.byteOffset(64, 0));
     try testing.expectEqual(@as(u32, 0x0800), try color.blockXor(0, 0, 1));
-    try testing.expectEqual(@as(u32, 0x0f00), try depth.blockXor(0, 0, 15));
+    try testing.expectEqual(@as(u32, 0x0008), try color_bytes.byteOffset(8, 0));
+    try testing.expectEqual(@as(u32, 0x0600), try depth.blockXor(0, 0, 15));
     try testing.expectEqual(@as(u32, 0x009c), try depth.byteOffset(3, 5));
     try testing.expectError(Error.UnsupportedElementSize, BlockLayout.init(.depth, 16));
     try testing.expectError(Error.UnsupportedTileMode, BlockLayout.init(@enumFromInt(2), 4));
@@ -742,6 +1863,15 @@ test "resource adapters derive element grids slices and explicit limitations" {
     try testing.expectEqual(@as(u8, 8), image_layout.block.bytes_per_element);
     try testing.expectEqual(@as(u64, 120), image_layout.staging_bytes);
 
+    var msaa_words = image_words;
+    msaa_words[3] = (2 << 16) | (27 << 20) | (14 << 28);
+    const msaa_image = try resources.decodeImageDescriptor(&msaa_words);
+    try testing.expectEqual(@as(u8, 2), msaa_image.samplesLog2());
+    try testing.expectEqual(@as(u8, 1), msaa_image.resourceMipLevels());
+    const msaa_layout = try TextureLayout.fromImage(msaa_image);
+    try testing.expectEqual(@as(u32, 4), (try msaa_layout.base()).samples());
+    try testing.expectEqual(BlockFamily.render_target_64kb, msaa_layout.block.family);
+
     var color = std.mem.zeroes(resources.ColorTarget);
     color.width = 1920;
     color.height = 1080;
@@ -766,4 +1896,272 @@ test "resource adapters derive element grids slices and explicit limitations" {
     try testing.expectEqual(@as(u8, 4), depth_layout.block.bytes_per_element);
     depth.format = 2;
     try testing.expectError(Error.UnsupportedFormat, Layout.fromDepthTarget(depth));
+}
+
+test "mip chains place smallest records first and share exact tail blocks" {
+    const micro = try TextureLayout.init(.{
+        .tile_mode = .standard_256b,
+        .width = 65,
+        .height = 33,
+        .mip_levels = 7,
+    }, 4);
+    const expected_offsets = [_]u64{ 0x1a00, 0x0b00, 0x0500, 0x0300, 0x0200, 0x0100, 0x0000 };
+    const expected_sizes = [_]u64{ 0x2d00, 0x0f00, 0x0600, 0x0200, 0x0100, 0x0100, 0x0100 };
+    try testing.expectEqual(@as(u64, 0x4700), micro.source_layer_bytes);
+    for (expected_offsets, expected_sizes, 0..) |offset, size, level| {
+        try testing.expectEqual(offset, micro.levels[level].offset);
+        try testing.expectEqual(size, micro.levels[level].storage_bytes);
+    }
+
+    const macro = try TextureLayout.init(.{
+        .tile_mode = .standard_64kb,
+        .width = 256,
+        .height = 256,
+        .mip_levels = 9,
+    }, 4);
+    try testing.expectEqual(@as(u8, 2), macro.first_tail_level);
+    try testing.expectEqual(@as(u64, 0x60000), macro.source_layer_bytes);
+    try testing.expectEqual(@as(u64, 0x20000), macro.levels[0].offset);
+    try testing.expectEqual(@as(u64, 0x10000), macro.levels[1].offset);
+    try testing.expectEqual(@as(u64, 0), macro.levels[2].offset);
+    try testing.expectEqual([2]u32{ 64, 0 }, .{ macro.levels[2].tail_x, macro.levels[2].tail_y });
+    try testing.expectEqual([2]u32{ 0, 64 }, .{ macro.levels[3].tail_x, macro.levels[3].tail_y });
+    try testing.expect(macro.levels[8].in_tail);
+
+    var occupied = [_]bool{false} ** 65536;
+    for (macro.first_tail_level..macro.mip_levels) |level_index| {
+        const view = try macro.subresource(@intCast(level_index), 0, 1);
+        for (0..view.height) |y_index| {
+            for (0..view.width) |x_index| {
+                const address: usize = @intCast(try view.sourceByteOffset(
+                    @intCast(x_index),
+                    @intCast(y_index),
+                    0,
+                    0,
+                ));
+                try testing.expect(address < occupied.len);
+                try testing.expect(!occupied[address]);
+                occupied[address] = true;
+            }
+        }
+    }
+}
+
+test "thick 3D blocks and volume block slices match fixed GFX10 vectors" {
+    const block4 = try SwizzleBlock.init(.standard_4kb, 4, true, 0);
+    const block64 = try SwizzleBlock.init(.standard_64kb, 4, true, 0);
+    const block_prt = try SwizzleBlock.init(.partially_resident, 4, true, 0);
+    try testing.expectEqual([3]u32{ 8, 16, 8 }, .{ block4.width, block4.height, block4.depth });
+    try testing.expectEqual(@as(u32, 0x001c), try block4.byteOffset(1, 1, 1, 0));
+    try testing.expectEqual(@as(u32, 0x1000), try block64.byteOffset(8, 0, 0, 0));
+    try testing.expectEqual(@as(u32, 0x1800), try block_prt.byteOffset(8, 0, 0, 0));
+
+    const volume = try TextureLayout.init(.{
+        .tile_mode = .standard_4kb,
+        .kind = .volume_3d,
+        .width = 32,
+        .height = 32,
+        .depth_or_layers = 16,
+        .mip_levels = 6,
+    }, 4);
+    try testing.expectEqual(@as(u8, 2), volume.first_tail_level);
+    try testing.expectEqual(@as(u64, 0xb000), volume.block_slice_bytes);
+    try testing.expectEqual(@as(u64, 0x16000), volume.required_source_bytes);
+    try testing.expectEqual(@as(u64, 0x3000), volume.levels[0].offset);
+    try testing.expectEqual(@as(u64, 0x1000), volume.levels[1].offset);
+    try testing.expectEqual([2]u32{ 0, 8 }, .{ volume.levels[2].tail_x, volume.levels[2].tail_y });
+
+    const occupied = try testing.allocator.alloc(bool, @intCast(volume.required_source_bytes));
+    defer testing.allocator.free(occupied);
+    @memset(occupied, false);
+    for (volume.first_tail_level..volume.mip_levels) |level_index| {
+        const view = try volume.subresource(@intCast(level_index), 0, 1);
+        for (0..view.depth_or_layers) |z_index| {
+            for (0..view.height) |y_index| {
+                for (0..view.width) |x_index| {
+                    const address: usize = @intCast(try view.sourceByteOffset(
+                        @intCast(x_index),
+                        @intCast(y_index),
+                        @intCast(z_index),
+                        0,
+                    ));
+                    try testing.expect(!occupied[address]);
+                    occupied[address] = true;
+                }
+            }
+        }
+    }
+}
+
+test "Oberon RB+ MSAA keeps color planes and depth samples exact" {
+    const color4 = try SwizzleBlock.init(.render_target, 4, false, 2);
+    const color8 = try SwizzleBlock.init(.render_target, 4, false, 3);
+    const depth4 = try SwizzleBlock.init(.depth, 4, false, 2);
+    try testing.expectEqual([2]u32{ 64, 64 }, .{ color4.width, color4.height });
+    try testing.expectEqual(@as(u32, 0x0000), try color4.byteOffset(0, 0, 0, 0));
+    try testing.expectEqual(@as(u32, 0x4000), try color4.byteOffset(0, 0, 0, 1));
+    try testing.expectEqual(@as(u32, 0x8000), try color4.byteOffset(0, 0, 0, 2));
+    try testing.expectEqual(@as(u32, 0xc000), try color4.byteOffset(0, 0, 0, 3));
+    try testing.expectEqual(@as(u32, 0xc800), try color8.byteOffset(0, 0, 0, 7));
+    try testing.expectEqual(@as(u32, 0x0004), try depth4.byteOffset(0, 0, 0, 1));
+    try testing.expectEqual(@as(u32, 0x0008), try depth4.byteOffset(0, 0, 0, 2));
+    try testing.expectEqual(@as(u32, 0x000c), try depth4.byteOffset(0, 0, 0, 3));
+
+    const color_vectors = [3][5]u32{
+        .{ 0x8a9d, 0x9a9a, 0xba54, 0xea58, 0xdc30 },
+        .{ 0xca9d, 0xda9a, 0xfa54, 0xec58, 0xde30 },
+        .{ 0xec9d, 0xfc9a, 0xfc54, 0xee58, 0xde30 },
+    };
+    const depth_vectors = [3][4]u32{
+        .{ 0x14a7, 0x344e, 0x349c, 0x7a38 },
+        .{ 0x344f, 0x349e, 0x743c, 0x7878 },
+        .{ 0x349f, 0x743e, 0x747c, 0x72f8 },
+    };
+    const bytes_values = [_]u8{ 1, 2, 4, 8, 16 };
+    for (1..4) |samples_index| {
+        const samples_log2: u8 = @intCast(samples_index);
+        const sample = (@as(u32, 1) << @intCast(samples_log2)) - 1;
+        for (bytes_values, 0..) |bytes, bytes_index| {
+            const color = try SwizzleBlock.init(.render_target, bytes, false, samples_log2);
+            try testing.expectEqual(
+                color_vectors[samples_index - 1][bytes_index],
+                try color.byteOffset(13, 9, 5, sample),
+            );
+            if (bytes == 16) continue;
+            const depth = try SwizzleBlock.init(.depth, bytes, false, samples_log2);
+            try testing.expectEqual(
+                depth_vectors[samples_index - 1][bytes_index],
+                try depth.byteOffset(13, 9, 5, sample),
+            );
+        }
+    }
+}
+
+test "RB+ single-sample pattern decoder preserves the established PS5 vectors" {
+    for ([_]resources.TileMode{ .render_target, .depth }) |mode| {
+        for ([_]u8{ 1, 2, 4, 8 }) |bytes| {
+            const legacy = try BlockLayout.init(mode, bytes);
+            const block = try SwizzleBlock.init(mode, bytes, false, 0);
+            for (0..block.height) |y_index| {
+                for (0..block.width) |x_index| {
+                    const x: u32 = @intCast(x_index);
+                    const y: u32 = @intCast(y_index);
+                    try testing.expectEqual(
+                        try legacy.byteOffset(x, y),
+                        try block.byteOffset(x, y, 0, 0),
+                    );
+                }
+            }
+        }
+    }
+}
+
+test "3D and MSAA equations visit every element in one block exactly once" {
+    const bytes_values = [_]u8{ 1, 2, 4, 8, 16 };
+    const thick_modes = [_]resources.TileMode{ .standard_4kb, .standard_64kb, .partially_resident };
+    var visited = [_]bool{false} ** 65536;
+    for (thick_modes) |mode| {
+        for (bytes_values) |bytes| {
+            const block = try SwizzleBlock.init(mode, bytes, true, 0);
+            @memset(&visited, false);
+            for (0..block.depth) |z_index| {
+                for (0..block.height) |y_index| {
+                    for (0..block.width) |x_index| {
+                        const offset = try block.byteOffset(
+                            @intCast(x_index),
+                            @intCast(y_index),
+                            @intCast(z_index),
+                            0,
+                        );
+                        try testing.expect(!visited[offset]);
+                        visited[offset] = true;
+                    }
+                }
+            }
+        }
+    }
+    for ([_]resources.TileMode{ .render_target, .depth }) |mode| {
+        for ([_]u8{ 1, 2, 4, 8 }) |bytes| {
+            for (1..4) |samples_index| {
+                const samples_log2: u8 = @intCast(samples_index);
+                const block = try SwizzleBlock.init(mode, bytes, false, samples_log2);
+                @memset(&visited, false);
+                for (0..block.height) |y_index| {
+                    for (0..block.width) |x_index| {
+                        for (0..@as(u32, 1) << @intCast(samples_log2)) |sample_index| {
+                            const offset = try block.byteOffset(
+                                @intCast(x_index),
+                                @intCast(y_index),
+                                0,
+                                @intCast(sample_index),
+                            );
+                            try testing.expect(!visited[offset]);
+                            visited[offset] = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "mip tail volume and MSAA subresources share one CPU address contract" {
+    const descriptions = [_]Texture{
+        .{ .tile_mode = .standard_64kb, .width = 129, .height = 73, .depth_or_layers = 2, .first_slice = 1, .mip_levels = 8 },
+        .{ .tile_mode = .standard_4kb, .kind = .volume_3d, .width = 17, .height = 11, .depth_or_layers = 9, .mip_levels = 5 },
+        .{ .tile_mode = .render_target, .width = 37, .height = 29, .samples_log2 = 2 },
+        .{ .tile_mode = .depth, .width = 31, .height = 23, .samples_log2 = 3 },
+    };
+    for (descriptions) |description| {
+        const layout = try TextureLayout.init(description, 4);
+        const tiled = try testing.allocator.alloc(u8, @intCast(layout.required_source_bytes));
+        defer testing.allocator.free(tiled);
+        @memset(tiled, 0xa5);
+        for (0..layout.mip_levels) |level_index| {
+            const view = try layout.subresource(
+                @intCast(level_index),
+                0,
+                if (description.kind == .array_2d) layout.layers else 1,
+            );
+            const staging_bytes: usize = @intCast(try view.stagingBytes());
+            const expected = try testing.allocator.alloc(u8, staging_bytes);
+            defer testing.allocator.free(expected);
+            const actual = try testing.allocator.alloc(u8, staging_bytes);
+            defer testing.allocator.free(actual);
+            for (expected, 0..) |*value, index| value.* = @truncate(index * 29 + level_index * 17);
+            @memset(actual, 0);
+            try view.tile(expected, tiled);
+            try view.detile(tiled, actual);
+            try testing.expectEqualSlices(u8, expected, actual);
+            @memset(actual, 0);
+            const memory = TestMemory{ .base = 0x4000_0000, .bytes = tiled };
+            try view.stage(memory.reader(), memory.base, actual);
+            try testing.expectEqualSlices(u8, expected, actual);
+        }
+    }
+}
+
+test "compute detile constants are compact stable POD derived from the CPU view" {
+    const layout = try TextureLayout.init(.{
+        .tile_mode = .standard_64kb,
+        .width = 256,
+        .height = 128,
+        .depth_or_layers = 3,
+        .first_slice = 2,
+        .mip_levels = 8,
+    }, 4);
+    const view = try layout.subresource(3, 1, 2);
+    const plan = try view.computePlan(0x1_2345_6000, 0x2_0000_1000);
+    try testing.expectEqual(@as(usize, 4), @sizeOf(ComputeDetileKey));
+    try testing.expectEqual(@as(usize, 84), @sizeOf(ComputeDetileParams));
+    try testing.expectEqual(BlockFamily.standard_64kb, plan.key.family);
+    try testing.expectEqual(@as(u8, 2), plan.key.bytes_per_element_log2);
+    try testing.expectEqual(view.width, plan.params.width);
+    try testing.expectEqual(view.tail_x, plan.params.tail_x);
+    try testing.expectEqual(@as(u32, 3), plan.params.surface_z);
+    const encoded_source = (@as(u64, plan.params.source_offset_hi) << 32) | plan.params.source_offset_lo;
+    try testing.expectEqual(
+        try add(@as(u64, 0x1_2345_6000), try add(try multiply(layout.source_layer_bytes, 3), view.level_offset)),
+        encoded_source,
+    );
 }

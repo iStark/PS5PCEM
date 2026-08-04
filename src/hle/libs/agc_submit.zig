@@ -88,26 +88,29 @@ const shader_memory_reader = gpu.ShaderMemoryReader{
     .read_fn = backendRead,
 };
 
-fn traceSurfaceLayout(layout: gpu.SurfaceLayout) void {
+fn traceTextureLayout(layout: gpu.TextureLayout) void {
     std.debug.print(
-        "    layout block={d}x{d}/{d} pitch={d} source={d} staging={d}\n",
+        "    layout family={s} block={d}x{d}x{d}/{d} samples={d} mips={d} tail={d} source={d}\n",
         .{
+            @tagName(layout.block.family),
             layout.block.width,
             layout.block.height,
+            layout.block.depth,
             layout.block.bytes,
-            layout.row_pitch_elements,
+            @as(u32, 1) << @intCast(layout.block.samples_log2),
+            layout.mip_levels,
+            layout.first_tail_level,
             layout.required_source_bytes,
-            layout.staging_bytes,
         },
     );
 }
 
 fn traceImageLayout(image: gpu.ImageDescriptor) void {
-    const layout = gpu.SurfaceLayout.fromImage(image) catch |err| {
+    const layout = gpu.TextureLayout.fromImage(image) catch |err| {
         std.debug.print("    layout unavailable={s}\n", .{@errorName(err)});
         return;
     };
-    traceSurfaceLayout(layout);
+    traceTextureLayout(layout);
 }
 
 fn traceShaderBinding(state: *const gpu.State, stage: gpu.resources.ShaderStage) void {
@@ -284,8 +287,8 @@ fn backendDraw(_: ?*anyopaque, state: *const gpu.State, _: gpu.pm4.Packet) bool 
                 @intFromBool(depth.depth_read_only),
             },
         );
-        if (gpu.SurfaceLayout.fromDepthTarget(depth)) |layout| {
-            traceSurfaceLayout(layout);
+        if (gpu.TextureLayout.fromDepthTarget(depth)) |layout| {
+            traceTextureLayout(layout);
         } else |err| {
             std.debug.print("    layout unavailable={s}\n", .{@errorName(err)});
         }
@@ -307,8 +310,8 @@ fn backendDraw(_: ?*anyopaque, state: *const gpu.State, _: gpu.pm4.Packet) bool 
                 target.write_mask,
             },
         );
-        if (gpu.SurfaceLayout.fromColorTarget(target)) |layout| {
-            traceSurfaceLayout(layout);
+        if (gpu.TextureLayout.fromColorTarget(target)) |layout| {
+            traceTextureLayout(layout);
         } else |err| {
             std.debug.print("    layout unavailable={s}\n", .{@errorName(err)});
         }

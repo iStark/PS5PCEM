@@ -334,15 +334,21 @@ translator to consume.
 [`gpu.tiling`](src/gpu/tiling.zig) is the API-neutral bridge from those guest
 resources to host staging memory. It implements the exact GFX10 address XORs
 for linear, Standard 256 B/4 KiB/64 KiB, partially-resident 64 KiB, depth Z_X
-and render-target R_X layouts, including RB+ macro-block and array-slice XOR.
-One checked `Layout` owns block dimensions, padded guest pitch, physical slice
-stride and tightly packed staging size; both CPU tile/detile and direct
-`MemoryReader` staging consume its `sourceByteOffset`, so a later Vulkan compute
-path can use the same address contract. Buffer, image, BC-block, color-target
-and depth-target adapters allocate nothing, reject overflow and short ranges,
-and report unsupported MSAA, 3D or mip-tail cases instead of treating tiled
-bytes as linear. Live draw diagnostics now show block, pitch, guest range and
-staging size for every layout they can resolve.
+and render-target R_X layouts. `TextureLayout` extends the original one-level
+`Layout` without invalidating it: up to sixteen mips are placed smallest first,
+small levels share the exact 4 KiB/64 KiB mip-tail positions, and 3D resources
+use thick blocks plus depth block-slices. The Oberon 16-pipe/8-packer RB+
+equations include array-slice and 2x/4x/8x MSAA sample bits for both color and
+depth layouts.
+
+Every `SubresourceLayout` exposes one checked `sourceByteOffset` consumed by CPU
+tile/detile, direct `MemoryReader` staging and the future compute path. Its
+pointer-free `ComputeDetileKey` plus 84-byte `ComputeDetileParams` carry block,
+tail, pitch, slice, sample and 64-bit buffer-offset data with a stable all-u32
+layout suitable for SPIR-V scalar constants. Buffer, image, BC-block,
+color-target and depth-target adapters allocate nothing and reject overflow or
+short ranges. Live draw diagnostics now report family, 3D block dimensions,
+sample count, mip/tail boundary and complete guest allocation size.
 
 The executor is deliberately independent of Vulkan and guest-memory ownership.
 Its backend interface supplies checked reads/writes and optional callbacks for
@@ -377,15 +383,16 @@ packet per line with its word offset, and counts the draws and dispatches:
 
 ## Roadmap
 
-1. Extend the shared staging contract with GFX10 mip-chain/tail placement,
-   thick 3D blocks and MSAA sample addressing, then package it as compute-detile
-   constants without changing the CPU reference path.
-2. Complete the RDNA2 vector and memory ISA, build control flow and translate
+The shared GFX10 staging contract is complete for mip tails, thick 3D blocks,
+Oberon RB+ MSAA addressing and compute-detile constants. The remaining stages
+are:
+
+1. Complete the RDNA2 vector and memory ISA, build control flow and translate
    guest shaders to SPIR-V.
-3. Implement the Vulkan backend: device/queue selection, guest-memory staging,
+2. Implement the Vulkan backend: device/queue selection, guest-memory staging,
    image layout transitions and barriers, pipeline/cache creation, draw and
    dispatch recording, then swapchain presentation through `SetFlip`.
-4. Validate packet/state/shader results against captures before optimizing
+3. Validate packet/state/shader results against captures before optimizing
    asynchronous submission, descriptor caches and pipeline compilation.
 
 ---
