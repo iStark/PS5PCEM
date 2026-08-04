@@ -1,6 +1,6 @@
 # PS5 emulation components
 
-Building blocks for PlayStation 5 emulation, written in Zig. Eight modules cover
+Building blocks for PlayStation 5 emulation, written in Zig. Nine modules cover
 the independent subsystems and their end-to-end composition:
 
 | Module | What it does |
@@ -8,6 +8,7 @@ the independent subsystems and their end-to-end composition:
 | **`memory`** | Reserves and manages the fixed, identity-mapped guest address space |
 | **`rdna2`** | Decodes and disassembles RDNA2 shader machine code |
 | **`gpu`** | Decodes and executes the stateful part of submitted GPU command streams |
+| **`vulkan`** | Owns the host Vulkan device, queues, command submission and renderer boundary |
 | **`loader`** | Reads, maps, and relocates bare ELF64 and decrypted PS5 SELF module images |
 | **`hle`** | High-level emulation of the guest firmware: symbol resolution and firmware libraries |
 | **`cpu`** | Dispatches guest execution and provides the Windows x86-64 native machine bridge |
@@ -19,7 +20,7 @@ cross-compiles to Windows, Linux, and macOS. Direct guest execution currently
 requires Windows x86-64; the other targets still build the inspection and HLE
 layers but report the native bridge as unsupported.
 
-Five command-line tools come with them:
+Six command-line tools come with them:
 
 ```sh
 zig build run         -- shader.bin    # disassemble a shader
@@ -30,6 +31,7 @@ zig build pm4-dump    -- capture.bin   # decode a captured GPU command stream
 zig build graph-info  -- eboot.bin     # map and relocate the reachable PRX graph
 zig build game-run    -- eboot.bin     # load, initialize, and enter the title
 zig build game-run    -- --app0 full/game patched/eboot.bin # use full content with a patched executable
+zig build vulkan-smoke                 # run the headless compute/staging probe
 ```
 
 `module-info` is where the pieces meet. It reads a module, works out every
@@ -377,7 +379,7 @@ The executor is deliberately independent of Vulkan and guest-memory ownership.
 Its backend interface supplies checked reads/writes and optional callbacks for
 barriers, releases, waits, events, flips, draws and dispatches. Tests use an
 in-memory backend, live AGC submission uses the identity-mapped guest address
-space, and the Vulkan renderer will implement the same draw/dispatch boundary.
+space, and the Vulkan renderer attaches through the same draw/dispatch boundary.
 
 Three decisions are worth stating. Body length is stored biased by one, so there
 is no way to encode an empty body and a decoder that assumed otherwise would
@@ -407,19 +409,62 @@ packet per line with its word offset, and counts the draws and dispatches:
 ## Roadmap
 
 The shared GFX10 staging contract is complete for mip tails, thick 3D blocks,
-Oberon RB+ MSAA addressing and compute-detile constants. All major shader
-families are now length-safe, and decoded programs have a validated CFG, typed
-IR, SSA selection merges and an executable SPIR-V ALU/SDWA path. The remaining
-stages are:
+Oberon RB+ MSAA addressing and compute-detile constants. The Vulkan foundation
+now owns a Vulkan 1.2 instance, selects a device with one graphics/compute queue,
+creates the logical device and transient command pool, and exposes the existing
+DCB backend interface. Its headless smoke path creates a compute pipeline,
+submits through a fence and verifies a host-staging to device-local to host-
+readback transfer. All major shader families are length-safe, and decoded
+programs have a validated CFG, typed IR, SSA selection merges and an executable
+SPIR-V ALU/SDWA path. The remaining stages are:
 
 1. Finish DPP/VOP3/opcode semantics, structured loops and VCC/EXEC divergence,
    then lower stage interfaces, descriptors, memory, image, interpolation and
    export operations to SPIR-V.
-2. Implement the Vulkan backend: device/queue selection, guest-memory staging,
-   image layout transitions and barriers, pipeline/cache creation, draw and
-   dispatch recording, then swapchain presentation through `SetFlip`.
-3. Validate packet/state/shader results against captures before optimizing
+2. Extend the Vulkan foundation with persistent guest-memory staging, descriptor
+   layouts and caches, image creation/layout transitions, translated shader and
+   graphics/compute pipeline caches, then record real draw and dispatch work.
+3. Add surface/swapchain presentation through `SetFlip` and map PM4 acquire,
+   release and event scopes onto Vulkan barriers and host-visible labels.
+4. Validate packet/state/shader results against captures before optimizing
    asynchronous submission, descriptor caches and pipeline compilation.
+
+---
+
+# `vulkan` — host renderer foundation
+
+[`vulkan.Renderer`](src/vulkan/backend.zig) loads the platform Vulkan loader at
+runtime, so building and testing the emulator does not require Vulkan SDK
+headers or a link-time loader library. Initialization requires Vulkan 1.2 — the
+minimum core version that accepts the translator's SPIR-V 1.5 modules — and
+prefers a discrete device with one queue family supporting both graphics and
+compute. Validation is requested for debug builds when
+`VK_LAYER_KHRONOS_validation` is installed and otherwise disabled cleanly.
+
+The renderer already owns instance/device lifetime, the selected queue, a
+transient command pool and host/device memory-type selection. `dcbBackend`
+adapts checked guest reads and writes plus draw/dispatch callbacks to
+[`gpu.executor`](src/gpu/executor.zig) without adding a Vulkan dependency to the
+command processor. Those callbacks are the boundary for the next stage; until
+guest descriptors and complete shader interfaces are lowered, they count work
+but do not claim that a guest draw has been rendered.
+
+`vulkan-smoke` is an explicit hardware test rather than part of `zig build test`,
+so machines without a Vulkan runtime can still build and test every module. The
+probe creates a valid compute shader module and pipeline, dispatches it, copies
+known words from coherent host staging through a device-local storage buffer
+into coherent readback memory, inserts the required host/transfer barriers,
+waits on a fence and compares every byte:
+
+```sh
+zig build vulkan-smoke
+```
+
+```text
+Vulkan 1.4.321: NVIDIA GeForce RTX 3070 Ti
+device API 1.4.329, queue family 0, validation off
+headless smoke passed: 1 compute dispatch, 64 staging bytes copied and verified
+```
 
 ---
 

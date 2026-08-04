@@ -35,6 +35,15 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Host renderer foundation. Vulkan is loaded dynamically at runtime, so
+    // compiling the emulator does not require SDK headers or loader libraries.
+    const vulkan = b.addModule("vulkan", .{
+        .root_source_file = b.path("src/vulkan/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "gpu", .module = gpu }},
+    });
+
     // Guest module images: ELF64 parsing and the dynamic linking tables.
     const loader = b.addModule("loader", .{
         .root_source_file = b.path("src/loader/root.zig"),
@@ -206,12 +215,32 @@ pub fn build(b: *std.Build) void {
     const game_run_step = b.step("game-run", "Load and execute a decrypted PS5 title");
     game_run_step.dependOn(&game_run_cmd.step);
 
+    // Verifies device/queue creation, a compute pipeline and synchronized
+    // staging through device-local memory without opening a window.
+    const vulkan_smoke = b.addExecutable(.{
+        .name = "vulkan-smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/vulkan_smoke.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "vulkan", .module = vulkan }},
+        }),
+    });
+    b.installArtifact(vulkan_smoke);
+
+    const vulkan_smoke_cmd = b.addRunArtifact(vulkan_smoke);
+    vulkan_smoke_cmd.step.dependOn(b.getInstallStep());
+    const vulkan_smoke_step = b.step("vulkan-smoke", "Run the headless Vulkan compute/staging probe");
+    vulkan_smoke_step.dependOn(&vulkan_smoke_cmd.step);
+
     const test_step = b.step("test", "Run the test suite");
     const check_step = b.step("check", "Compile every module without running tests");
+    check_step.dependOn(&vulkan_smoke.step);
     for ([_]*std.Build.Module{
         memory,
         mod,
         gpu,
+        vulkan,
         hle,
         cpu,
         loader,
@@ -222,6 +251,7 @@ pub fn build(b: *std.Build) void {
         pm4_dump.root_module,
         graph_info.root_module,
         game_run.root_module,
+        vulkan_smoke.root_module,
     }) |m| {
         const tests = b.addTest(.{ .root_module = m });
         check_step.dependOn(&tests.step);
