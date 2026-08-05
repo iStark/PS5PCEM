@@ -18,6 +18,7 @@ const user_filter: i16 = -11;
 const timer_filter: i16 = -7;
 pub const video_out_filter: i16 = -13;
 pub const video_out_flip_ident: u64 = 6;
+pub const graphics_filter: i16 = -14;
 const event_add: u16 = 0x01;
 const event_clear: u16 = 0x20;
 const wait_key_prefix: u64 = 0x4551_0000_0000_0000;
@@ -320,6 +321,73 @@ pub fn deleteVideoOutFlipEvent(handle: i64) i32 {
     return KernelError.enoent.raw();
 }
 
+/// Registers one AGC completion interrupt under the identifier selected by the
+/// graphics driver. Graphics uses zero; compute queues use their owner handle.
+pub fn addGraphicsEvent(handle: i64, id: i32, user_data: u64) i32 {
+    return addRegistration(handle, id, .{
+        .edge = true,
+        .filter = graphics_filter,
+        .user_data = user_data,
+    });
+}
+
+pub fn deleteGraphicsEvent(handle: i64, id: i32) i32 {
+    lock.lock();
+    defer lock.unlock();
+    const queue = findQueue(handle) orelse return KernelError.ebadf.raw();
+    const ident: u64 = @bitCast(@as(i64, id));
+    for (&queue.registrations) |*registration| {
+        if (!registration.active or registration.ident != ident or
+            registration.filter != graphics_filter)
+        {
+            continue;
+        }
+        registration.* = .{};
+        return errno.ok;
+    }
+    return KernelError.enoent.raw();
+}
+
+/// Publishes a completed graphics/compute submission to every matching equeue.
+pub fn triggerGraphicsEvent(id: i32, context_id: u32) usize {
+    var wake_handles: [maximum_queues]i64 = undefined;
+    var wake_sequences: [maximum_queues]u64 = undefined;
+    var wake_count: usize = 0;
+    const ident: u64 = @bitCast(@as(i64, id));
+
+    lock.lock();
+    for (&queues) |*queue| {
+        if (!queue.active or queue.pending_count == maximum_events) continue;
+        const registration = for (queue.registrations) |candidate| {
+            if (candidate.active and candidate.ident == ident and
+                candidate.filter == graphics_filter)
+            {
+                break candidate;
+            }
+        } else continue;
+        const index = (queue.pending_head + queue.pending_count) % maximum_events;
+        queue.pending[index] = .{
+            .ident = ident,
+            .filter = graphics_filter,
+            .flags = event_clear,
+            .fflags = 1,
+            .data = context_id,
+            .user_data = registration.user_data,
+        };
+        queue.pending_count += 1;
+        queue.sequence +%= 1;
+        wake_handles[wake_count] = queue.handle;
+        wake_sequences[wake_count] = queue.sequence;
+        wake_count += 1;
+    }
+    lock.unlock();
+
+    for (wake_handles[0..wake_count], wake_sequences[0..wake_count]) |handle, sequence| {
+        threading.wakeWaiters(waitKey(handle), sequence, 1);
+    }
+    return wake_count;
+}
+
 /// Delivers one completed flip to every equeue that registered for it.
 pub fn triggerVideoOutFlip(flip_argument: i64) usize {
     var wake_handles: [maximum_queues]i64 = undefined;
@@ -576,4 +644,26 @@ test "VideoOut flip events retain their filter and user data" {
     try std.testing.expectEqual(video_out_flip_ident, event[0].ident);
     try std.testing.expectEqual(@as(i64, 77), event[0].data);
     try std.testing.expectEqual(@as(u64, 0x1234), event[0].user_data);
+}
+
+test "graphics completion events match the registered queue identifier" {
+    reset();
+    var handle: i64 = 0;
+    try std.testing.expectEqual(errno.ok, createEqueue(&handle, "graphics"));
+    defer _ = deleteEqueue(handle);
+    try std.testing.expectEqual(errno.ok, addGraphicsEvent(handle, 0x21, 0xcafe));
+    try std.testing.expectEqual(@as(usize, 0), triggerGraphicsEvent(0x20, 7));
+    try std.testing.expectEqual(@as(usize, 1), triggerGraphicsEvent(0x21, 9));
+
+    var event: [1]Event = .{.{}};
+    var count: i32 = 0;
+    var timeout: u32 = 0;
+    try std.testing.expectEqual(errno.ok, waitEqueue(handle, &event, 1, &count, &timeout));
+    try std.testing.expectEqual(@as(i16, graphics_filter), event[0].filter);
+    try std.testing.expectEqual(@as(u64, 0x21), event[0].ident);
+    try std.testing.expectEqual(@as(u16, event_clear), event[0].flags);
+    try std.testing.expectEqual(@as(u32, 1), event[0].fflags);
+    try std.testing.expectEqual(@as(i64, 9), event[0].data);
+    try std.testing.expectEqual(@as(u64, 0xcafe), event[0].user_data);
+    try std.testing.expectEqual(errno.ok, deleteGraphicsEvent(handle, 0x21));
 }

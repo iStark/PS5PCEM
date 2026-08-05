@@ -32,14 +32,18 @@
 //!   The payload carries engine/family/index identity, queue/control/completion
 //!   guest addresses and the fixed graphics aperture, so no reply handle needs
 //!   to be invented.
-//! - `/dev/gc` `#52` and `#38`, input, 4 bytes each. Their fields have not yet
-//!   been identified.
+//! - `/dev/gc` `#52` and `#38`, input, 4 bytes each. They retain the compute and
+//!   graphics mode selected by the process.
 //! - `/dev/gc` `#59`, in/out, 16 bytes. The wrapper fills the buffer with
 //!   `0xff` *before* calling and stores the reply in the final 16 bytes of the
 //!   driver's private device pool. Its individual fields are not yet consumed
 //!   by this layer, so the compatibility response clears them.
 //! - `/dev/gc` `#57`, in/out, 16 bytes. Queries the process suspend point.
 //!   Retail execution is not suspended, so its output state remains clear.
+//! - `/dev/gc` `#40`, input, 16 bytes. Installs the tessellation-factor ring as
+//!   a 256-byte-aligned base, dword-sized byte count and zero reserved word.
+//! - `/dev/gc` `#42`, input, 4 bytes. Retains the two 16-bit HS offchip values
+//!   in the same reversed argument order used by the driver's ioctl wrapper.
 //! - `/dev/dipsw` `#6`, out, 4 bytes. Answered here; see below.
 //!
 //! The discovery reply is only part of the contract. The driver's 2 MiB direct
@@ -270,6 +274,24 @@ fn answerGraphicsSuspendQuery(request: Request, payload: u64) bool {
     return true;
 }
 
+fn answerGraphicsTfRing(request: Request, payload: u64) bool {
+    if (request.group != 0x81 or request.number != 40) return false;
+    if (request.direction != .write or request.length != @sizeOf(graphics_device.TfRingRequest)) return false;
+    if (!memory.isGuestRangeAccessible(payload, request.length)) return false;
+    const source: *const graphics_device.TfRingRequest = @ptrFromInt(payload);
+    graphics_device.setTfRing(source.*) catch return false;
+    return true;
+}
+
+fn answerGraphicsHsOffchip(request: Request, payload: u64) bool {
+    if (request.group != 0x81 or request.number != 42) return false;
+    if (request.direction != .write or request.length != @sizeOf(graphics_device.HsOffchipRequest)) return false;
+    if (!memory.isGuestRangeAccessible(payload, request.length)) return false;
+    const source: *const graphics_device.HsOffchipRequest = @ptrFromInt(payload);
+    graphics_device.setHsOffchipParam(source.*);
+    return true;
+}
+
 /// Answers a read of the console's mode switches.
 ///
 /// The switches are development flags, and on a retail console every one of
@@ -310,6 +332,8 @@ fn ioctl(descriptor: i32, request_code: u64, payload: u64) callconv(abi.guest) i
     if (device == .graphics and answerGraphicsMode(request, payload)) return 0;
     if (device == .graphics and answerGraphicsServiceQuery(request, payload)) return 0;
     if (device == .graphics and answerGraphicsSuspendQuery(request, payload)) return 0;
+    if (device == .graphics and answerGraphicsTfRing(request, payload)) return 0;
+    if (device == .graphics and answerGraphicsHsOffchip(request, payload)) return 0;
     if (device == .dip_switches and answerDipSwitch(request, payload)) return 0;
 
     runtime_api.setPosixErrno(errno.Posix.enotty);
@@ -545,6 +569,36 @@ test "the graphics suspend query reports an active process" {
     ));
     try testing.expectEqualSlices(u32, &[_]u32{ 0, 1, 0, 0 }, &query);
     try testing.expectEqual(@as(u64, 1), graphics_device.status().suspend_query_count);
+}
+
+test "the graphics driver publishes tessellation device state" {
+    reset();
+    defer reset();
+    filesystem.detach();
+    const fd = try filesystem.open("/dev/gc", filesystem.O.rdonly);
+    defer filesystem.close(fd) catch {};
+
+    var tf_ring = graphics_device.TfRingRequest{
+        .base_address = 0x0000_0002_0312_6c00,
+        .size = 0x0003_fff8,
+        .reserved = 0,
+    };
+    try testing.expectEqual(@as(i64, 0), ioctl(
+        fd,
+        encode(direction_in, 0x81, 40, @sizeOf(@TypeOf(tf_ring))),
+        @intFromPtr(&tf_ring),
+    ));
+    var hs_offchip = graphics_device.HsOffchipRequest{ .value1 = 0x24, .value0 = 0x10 };
+    try testing.expectEqual(@as(i64, 0), ioctl(
+        fd,
+        encode(direction_in, 0x81, 42, @sizeOf(@TypeOf(hs_offchip))),
+        @intFromPtr(&hs_offchip),
+    ));
+    const current = graphics_device.status();
+    try testing.expectEqual(tf_ring.base_address, current.tf_ring_base);
+    try testing.expectEqual(tf_ring.size, current.tf_ring_size);
+    try testing.expectEqual(hs_offchip.value0, current.hs_offchip_value0);
+    try testing.expectEqual(hs_offchip.value1, current.hs_offchip_value1);
 }
 
 test "other graphics requests remain refused" {

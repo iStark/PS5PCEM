@@ -573,7 +573,7 @@ fn announce(label: []const u8, stream: []const u32) void {
 /// Queues one submitted buffer and advances both command processors. A blocked
 /// head retains its exact root/indirect continuation; a real release-label
 /// write from the other queue makes the following pump resume it in place.
-fn executeSubmitted(label: []const u8, stream: []const u32) void {
+fn executeSubmitted(label: []const u8, stream: []const u32) bool {
     execution_lock.lock();
     defer execution_lock.unlock();
 
@@ -585,9 +585,14 @@ fn executeSubmitted(label: []const u8, stream: []const u32) void {
         if (trace.isLive()) {
             std.debug.print("[{s}] queue stopped: {s}\n", .{ label, @errorName(err) });
         }
-        return;
+        return false;
     };
-    if (!trace.isLive()) return;
+    // A completion event can be attributed here only while this submission
+    // drains synchronously. A later cross-queue resume needs per-submission
+    // owner metadata before it can safely publish the matching event.
+    const completed = !submission_scheduler.isBlocked(kind) and
+        submission_scheduler.pendingCount(kind) == 0;
+    if (!trace.isLive()) return completed;
 
     if (submission_scheduler.isBlocked(kind)) {
         const submitted_state = submission_scheduler.state(kind);
@@ -613,11 +618,12 @@ fn executeSubmitted(label: []const u8, stream: []const u32) void {
             .{report.completed_submissions},
         );
     }
+    return completed;
 }
 
-fn acceptSubmitted(label: []const u8, stream: []const u32) void {
+fn acceptSubmitted(label: []const u8, stream: []const u32) bool {
     announce(label, stream);
-    executeSubmitted(label, stream);
+    return executeSubmitted(label, stream);
 }
 
 /// Turns a submitted address and length into a readable buffer, or null.
@@ -636,21 +642,24 @@ fn streamOf(address: ?[*]const u32, word_count: u32) ?[]const u32 {
 }
 
 /// Reads one submission descriptor and reports it.
-fn submitOne(label: []const u8, descriptor: ?*const Submission) void {
-    const submission = descriptor orelse return;
-    const stream = streamOf(submission.address, submission.word_count) orelse return;
-    acceptSubmitted(label, stream);
+fn submitOne(label: []const u8, descriptor: ?*const Submission) bool {
+    const submission = descriptor orelse return false;
+    const stream = streamOf(submission.address, submission.word_count) orelse return false;
+    return acceptSubmitted(label, stream);
 }
 
 /// Graphics work, described by one descriptor.
 fn submitDcb(descriptor: ?*const Submission) callconv(abi.guest) i32 {
-    submitOne("dcb", descriptor);
+    if (submitOne("dcb", descriptor)) _ = event_queue.triggerGraphicsEvent(0, 0);
     return errno.ok;
 }
 
 /// Compute work on a named queue.
-fn submitAcb(_: u32, descriptor: ?*const Submission) callconv(abi.guest) i32 {
-    submitOne("acb", descriptor);
+fn submitAcb(queue: u32, descriptor: ?*const Submission) callconv(abi.guest) i32 {
+    if (submitOne("acb", descriptor)) {
+        const identifier: i32 = @bitCast(queue);
+        _ = event_queue.triggerGraphicsEvent(identifier, queue);
+    }
     return errno.ok;
 }
 
@@ -670,7 +679,26 @@ fn submitMultiDcbs(
 
     for (0..count) |index| {
         const stream = streamOf(buffers[index], sizes[index]) orelse continue;
-        acceptSubmitted("dcb", stream);
+        if (acceptSubmitted("dcb", stream)) _ = event_queue.triggerGraphicsEvent(0, 0);
+    }
+    return errno.ok;
+}
+
+pub fn submitMultiAcbs(
+    queue: u32,
+    addresses: ?[*]const ?[*]const u32,
+    word_counts: ?[*]const u32,
+    count: u32,
+) callconv(abi.guest) i32 {
+    if (count == 0) return errno.ok;
+    const buffers = addresses orelse return errno.KernelError.einval.raw();
+    const sizes = word_counts orelse return errno.KernelError.einval.raw();
+    const identifier: i32 = @bitCast(queue);
+    for (0..count) |index| {
+        const stream = streamOf(buffers[index], sizes[index]) orelse continue;
+        if (acceptSubmitted("acb", stream)) {
+            _ = event_queue.triggerGraphicsEvent(identifier, queue);
+        }
     }
     return errno.ok;
 }
@@ -678,7 +706,7 @@ fn submitMultiDcbs(
 /// One buffer submitted directly, without a descriptor around it.
 fn submitCommandBuffer(_: u32, address: ?[*]const u32, word_count: u32) callconv(abi.guest) i32 {
     const stream = streamOf(address, word_count) orelse return errno.ok;
-    acceptSubmitted("dcb", stream);
+    if (acceptSubmitted("dcb", stream)) _ = event_queue.triggerGraphicsEvent(0, 0);
     return errno.ok;
 }
 
@@ -751,11 +779,13 @@ test "submission entry points accept what they cannot yet carry out" {
     try testing.expectEqual(errno.ok, submitDcb(null));
     try testing.expectEqual(errno.ok, submitAcb(0, null));
     try testing.expectEqual(errno.ok, submitMultiDcbs(null, null, 0));
+    try testing.expectEqual(errno.ok, submitMultiAcbs(0, null, null, 0));
     try testing.expectEqual(errno.ok, submitCommandBuffer(0, null, 0));
 
     // Naming a count but no arrays is a caller error, and saying so costs
     // nothing because there is no frame described anywhere to lose.
     try testing.expectEqual(errno.KernelError.einval.raw(), submitMultiDcbs(null, null, 2));
+    try testing.expectEqual(errno.KernelError.einval.raw(), submitMultiAcbs(0, null, null, 2));
 }
 
 test "an installed renderer receives CPU VideoOut flips before completion" {

@@ -27,8 +27,21 @@ pub const QueueRegistration = extern struct {
     completion_size: u64,
 };
 
+pub const TfRingRequest = extern struct {
+    base_address: u64,
+    size: u32,
+    reserved: u32,
+};
+
+pub const HsOffchipRequest = extern struct {
+    value1: u16,
+    value0: u16,
+};
+
 comptime {
     if (@sizeOf(QueueRegistration) != 64) @compileError("unexpected /dev/gc queue registration layout");
+    if (@sizeOf(TfRingRequest) != 16) @compileError("unexpected /dev/gc TF ring layout");
+    if (@sizeOf(HsOffchipRequest) != 4) @compileError("unexpected /dev/gc HS offchip layout");
 }
 
 pub const Error = error{
@@ -41,6 +54,7 @@ pub const Error = error{
     DuplicateIdentifier,
     DuplicateQueue,
     QueueTableFull,
+    InvalidTfRing,
 };
 
 pub const Status = struct {
@@ -49,6 +63,10 @@ pub const Status = struct {
     compute_mode: u32,
     graphics_mode: u32,
     suspend_query_count: u64,
+    tf_ring_base: u64,
+    tf_ring_size: u32,
+    hs_offchip_value0: u16,
+    hs_offchip_value1: u16,
 };
 
 const QueueSlot = struct {
@@ -75,6 +93,10 @@ var queue_count: u32 = 0;
 var compute_mode: u32 = 0;
 var graphics_mode: u32 = 0;
 var suspend_query_count: u64 = 0;
+var tf_ring_base: u64 = 0;
+var tf_ring_size: u32 = 0;
+var hs_offchip_value0: u16 = 0;
+var hs_offchip_value1: u16 = 0;
 
 pub fn reset() void {
     lock.lock();
@@ -85,6 +107,10 @@ pub fn reset() void {
     compute_mode = 0;
     graphics_mode = 0;
     suspend_query_count = 0;
+    tf_ring_base = 0;
+    tf_ring_size = 0;
+    hs_offchip_value0 = 0;
+    hs_offchip_value1 = 0;
 }
 
 pub fn installTrapResources() void {
@@ -148,6 +174,10 @@ pub fn status() Status {
         .compute_mode = compute_mode,
         .graphics_mode = graphics_mode,
         .suspend_query_count = suspend_query_count,
+        .tf_ring_base = tf_ring_base,
+        .tf_ring_size = tf_ring_size,
+        .hs_offchip_value0 = hs_offchip_value0,
+        .hs_offchip_value1 = hs_offchip_value1,
     };
 }
 
@@ -155,6 +185,23 @@ pub fn recordSuspendQuery() void {
     lock.lock();
     defer lock.unlock();
     suspend_query_count +%= 1;
+}
+
+pub fn setTfRing(request: TfRingRequest) Error!void {
+    if ((request.base_address & 0xff) != 0 or (request.size & 3) != 0 or request.reserved != 0) {
+        return error.InvalidTfRing;
+    }
+    lock.lock();
+    defer lock.unlock();
+    tf_ring_base = request.base_address;
+    tf_ring_size = request.size;
+}
+
+pub fn setHsOffchipParam(request: HsOffchipRequest) void {
+    lock.lock();
+    defer lock.unlock();
+    hs_offchip_value0 = request.value0;
+    hs_offchip_value1 = request.value1;
 }
 
 fn validateRegistration(registration: QueueRegistration) Error!void {
@@ -225,4 +272,26 @@ test "invalid and duplicate queue identities are rejected" {
     invalid.identifier = 2;
     invalid.index = 8;
     try std.testing.expectError(error.InvalidIndex, registerQueue(invalid));
+}
+
+test "tessellation ring and HS offchip parameters retain driver ordering" {
+    reset();
+    defer reset();
+    try setTfRing(.{
+        .base_address = 0x0000_0002_0312_6c00,
+        .size = 0x0003_fff8,
+        .reserved = 0,
+    });
+    setHsOffchipParam(.{ .value1 = 0x24, .value0 = 0x10 });
+    const current = status();
+    try std.testing.expectEqual(@as(u64, 0x0000_0002_0312_6c00), current.tf_ring_base);
+    try std.testing.expectEqual(@as(u32, 0x0003_fff8), current.tf_ring_size);
+    try std.testing.expectEqual(@as(u16, 0x10), current.hs_offchip_value0);
+    try std.testing.expectEqual(@as(u16, 0x24), current.hs_offchip_value1);
+
+    try std.testing.expectError(error.InvalidTfRing, setTfRing(.{
+        .base_address = 0x1234,
+        .size = 4,
+        .reserved = 0,
+    }));
 }

@@ -27,6 +27,7 @@ const gpu = @import("gpu");
 const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
+const event_queue = @import("kernel_event_queue.zig");
 
 /// The cursor a title keeps over its command buffer.
 ///
@@ -145,6 +146,30 @@ pub fn refuse(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest
     return errno.KernelError.enosys.raw();
 }
 
+pub fn driverAddEqEvent(equeue: i64, id: i32, user_data: u64) callconv(abi.guest) i32 {
+    return event_queue.addGraphicsEvent(equeue, id, user_data);
+}
+
+pub fn driverDeleteEqEvent(equeue: i64, id: i32) callconv(abi.guest) i32 {
+    return event_queue.deleteGraphicsEvent(equeue, id);
+}
+
+pub fn driverGetEqEventType(event: ?*const event_queue.Event) callconv(abi.guest) i32 {
+    const value = event orelse return 0;
+    return if (value.filter == event_queue.graphics_filter)
+        @bitCast(@as(u32, @truncate(value.ident)))
+    else
+        @bitCast(@as(u32, @truncate(@as(u64, @bitCast(value.data)))));
+}
+
+pub fn driverGetEqContextId(event: ?*const event_queue.Event) callconv(abi.guest) u32 {
+    const value = event orelse return 0;
+    return if (value.filter == event_queue.graphics_filter)
+        @truncate(@as(u64, @bitCast(value.data)))
+    else
+        @truncate(value.ident);
+}
+
 pub const exports = @import("agc_table.zig").exports;
 pub const driver_exports = @import("agc_table.zig").driver_exports;
 
@@ -249,6 +274,20 @@ test "a buffer that names no memory is refused rather than followed" {
 test "debugging facilities report themselves off, as on a retail machine" {
     // A title told a capture is in progress waits for one that is never taken.
     try testing.expectEqual(@as(i32, 0), switchedOff(0, 0, 0, 0, 0, 0));
+}
+
+test "AGC event accessors distinguish event type from context id" {
+    const graphics = event_queue.Event{
+        .ident = 0x40,
+        .filter = event_queue.graphics_filter,
+        .data = 0x1234,
+    };
+    try testing.expectEqual(@as(i32, 0x40), driverGetEqEventType(&graphics));
+    try testing.expectEqual(@as(u32, 0x1234), driverGetEqContextId(&graphics));
+
+    const foreign = event_queue.Event{ .ident = 7, .filter = -11, .data = 9 };
+    try testing.expectEqual(@as(i32, 9), driverGetEqEventType(&foreign));
+    try testing.expectEqual(@as(u32, 7), driverGetEqContextId(&foreign));
 }
 
 test "graphics exports register under published identifiers" {

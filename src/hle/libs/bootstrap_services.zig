@@ -15,6 +15,7 @@ const kernel_threading = @import("kernel_threading.zig");
 const kernel_memory = @import("kernel_memory.zig");
 const kernel_event_queue = @import("kernel_event_queue.zig");
 const agc_submit = @import("agc_submit.zig");
+const agc = @import("agc.zig");
 const agc_shader_registry = @import("agc_shader_registry.zig");
 const gpu = @import("gpu");
 const apr = @import("../apr.zig");
@@ -1023,8 +1024,8 @@ const agc_driver_exports = [_]symbols.Export{
     .{ .name = "sceAgcDriverRegisterOwner", .function = trace.wrap("sceAgcDriverRegisterOwner", &success), .expect_id = "X-Nm5KLREeg" },
     .{ .name = "sceAgcDriverSetHsOffchipParam", .function = trace.wrap("sceAgcDriverSetHsOffchipParam", &success), .expect_id = "MM4IZSEYytQ" },
     .{ .name = "sceAgcDriverRegisterResource", .function = trace.wrap("sceAgcDriverRegisterResource", &success), .expect_id = "W5z4eZrjEas" },
-    .{ .name = "sceAgcDriverAddEqEvent", .function = trace.wrap("sceAgcDriverAddEqEvent", &success), .expect_id = "w2rJhmD+dsE" },
-    .{ .name = "sceAgcDriverGetEqContextId", .function = trace.wrap("sceAgcDriverGetEqContextId", &success), .expect_id = "Zw7uUVPulbw" },
+    .{ .name = "sceAgcDriverAddEqEvent", .function = trace.wrap("sceAgcDriverAddEqEvent", &agc.driverAddEqEvent), .expect_id = "w2rJhmD+dsE" },
+    .{ .name = "sceAgcDriverGetEqContextId", .function = trace.wrap("sceAgcDriverGetEqContextId", &agc.driverGetEqContextId), .expect_id = "Zw7uUVPulbw" },
     .{ .name = "sceAgcDriverSetTFRing", .function = trace.wrap("sceAgcDriverSetTFRing", &success), .expect_id = "XlNp7jzGiPo" },
 };
 

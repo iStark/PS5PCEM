@@ -12,6 +12,7 @@
 //! fails at registration rather than becoming an import nothing resolves.
 
 const agc = @import("agc.zig");
+const agc_submit = @import("agc_submit.zig");
 const trace = @import("../trace.zig");
 const symbols = @import("../symbols.zig");
 
@@ -146,9 +147,9 @@ pub const exports = [_]symbols.Export{
 };
 
 pub const driver_exports = [_]symbols.Export{
-    .{ .name = "sceAgcDriverSubmitMultiAcbs", .function = trace.wrap("sceAgcDriverSubmitMultiAcbs", &agc.accept), .expect_id = "HF3YllT3mXU" },
-    .{ .name = "sceAgcDriverDeleteEqEvent", .function = trace.wrap("sceAgcDriverDeleteEqEvent", &agc.accept), .expect_id = "DL2RXaXOy88" },
-    .{ .name = "sceAgcDriverGetEqEventType", .function = trace.wrap("sceAgcDriverGetEqEventType", &agc.refuse), .expect_id = "5CdQTZIQPxM" },
+    .{ .name = "sceAgcDriverSubmitMultiAcbs", .function = trace.wrap("sceAgcDriverSubmitMultiAcbs", &agc_submit.submitMultiAcbs), .expect_id = "HF3YllT3mXU" },
+    .{ .name = "sceAgcDriverDeleteEqEvent", .function = trace.wrap("sceAgcDriverDeleteEqEvent", &agc.driverDeleteEqEvent), .expect_id = "DL2RXaXOy88" },
+    .{ .name = "sceAgcDriverGetEqEventType", .function = trace.wrap("sceAgcDriverGetEqEventType", &agc.driverGetEqEventType), .expect_id = "5CdQTZIQPxM" },
     .{ .name = "sceAgcDriverTriggerCapture", .function = trace.wrap("sceAgcDriverTriggerCapture", &agc.accept), .expect_id = "Xq5WmbwPTnQ" },
     .{ .name = "sceAgcDriverRequestCaptureStart", .function = trace.wrap("sceAgcDriverRequestCaptureStart", &agc.accept), .expect_id = "SAfhzJPcjuk" },
     .{ .name = "sceAgcDriverRequestCaptureStop", .function = trace.wrap("sceAgcDriverRequestCaptureStop", &agc.accept), .expect_id = "FOwvmNlFLjM" },
@@ -177,4 +178,3 @@ pub const driver_exports = [_]symbols.Export{
     .{ .name = "sceAgcDriverGetResourceShaderGuid", .function = trace.wrap("sceAgcDriverGetResourceShaderGuid", &agc.refuse), .expect_id = "mXn+K9E-wOA" },
     .{ .name = "sceAgcDriverGetOwnerName", .function = trace.wrap("sceAgcDriverGetOwnerName", &agc.refuse), .expect_id = "LepGrgk77sM" },
 };
-

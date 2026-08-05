@@ -1053,14 +1053,16 @@ UI actions that cannot exist without a shell return `UNAVAILABLE`.
 
 Kernel user-edge event queues retain registrations and pending event payloads,
 and their waits use the same sequence-aware dispatcher contract as pthread
-synchronization. Main direct-memory allocation, named direct mappings, stack
-queries, and live pthread scheduling metadata are also exposed. The APR/AMPR
-path now owns a read-only file registry and command-buffer lifecycle: it resolves
-guest paths to stable IDs and sizes, records reads with their 64-bit file
-offsets, submits them synchronously into checked guest memory, permits the short
-read expected at EOF, and reports completion once through the matching wait.
-Malformed headers, oversized transfers and invalid IDs are rejected rather than
-reported as successful I/O. The implementation is in
+synchronization. VideoOut filter `-13` and graphics filter `-14` use that same
+queue implementation, preserving each registration's identifier and user data.
+Main direct-memory allocation, named direct mappings, stack queries, and live
+pthread scheduling metadata are also exposed. The APR/AMPR path now owns a
+read-only file registry and command-buffer lifecycle: it resolves guest paths to
+stable IDs and sizes, records reads with their 64-bit file offsets, submits them
+synchronously into checked guest memory, permits the short read expected at EOF,
+and reports completion once through the matching wait. Malformed headers,
+oversized transfers and invalid IDs are rejected rather than reported as
+successful I/O. The implementation is in
 [src/hle/apr.zig](src/hle/apr.zig) and the guest ABI wrappers remain in
 [src/hle/libs/kernel_runtime.zig](src/hle/libs/kernel_runtime.zig) and
 [src/hle/libs/bootstrap_services.zig](src/hle/libs/bootstrap_services.zig).
@@ -1179,10 +1181,13 @@ to a bound. The device state in
 resources, compute and graphics modes, suspend queries, and the full matrix of
 56 queues requested by the shipped driver. Each 64-byte queue registration is
 validated by engine, family, index, ID, alignment, aperture and completion page
-before the resulting queue state is published. Verified discovery and service
-requests are handled exactly. Unknown requests, currently commands `#40` and
-`#42`, remain refused with `ENOTTY`: false success would replace an actionable
-error with delayed corruption.
+before the resulting queue state is published. Command `#40` now validates and
+retains the tessellation-factor ring's 256-byte-aligned address and dword-sized
+byte count. Command `#42` retains the two 16-bit HS offchip parameters in the
+argument order recovered from the wrapper. Their exact 16-byte and 4-byte
+payloads were confirmed against both the shipped driver's machine code and this
+title's live requests. No unknown `/dev/gc` command remains in the observed
+startup sequence; any unverified request is still refused with `ENOTTY`.
 
 The shipped driver also relies on addresses that look like hints but are part
 of its ABI. Its 2 MiB direct-memory pool remains at `0xfe0000000`, the small
@@ -1266,6 +1271,15 @@ that queue remain FIFO-ordered. The other queue continues, and a real release
 label makes the scheduler recheck and resume the blocked stream without
 replaying earlier side effects or forcing memory to a satisfying value.
 
+The AGC driver's event-queue API now registers and deletes graphics filter
+`-14`, decodes event type and context ID from the fields used by that filter,
+and retains the caller's user data. A graphics completion is published under ID
+zero; a compute completion uses its queue owner as both ID and context. Work
+that drains during submission is signalled immediately. A command buffer that
+remains blocked on `WAIT_REG_MEM` is deliberately not signalled early; tracking
+the originating owner across a later cross-queue resume is the next asynchronous
+completion extension.
+
 Successful `sceAgcCreateShader` calls also retain the association between each
 published GPU program address and its relocated AGC header. At draw/dispatch
 time the backend can therefore capture the active stage's metadata, hardware
@@ -1293,12 +1307,14 @@ The backported Terminator test with its complete directory supplied through
 `--app0` now creates the Vulkan VideoOut window, loads all six executable images,
 registers queues 32–87, and streams the Unity metadata and asset files through
 APR without the previous resource-corruption or VideoOut-label errors. A
-120-second live run remains stable and silent on standard error. This is not yet
-a rendered game frame: the complete-content path has not submitted its first
-observable DCB/ACB, while the shipped driver periodically reaches its suspend
-point. The next title-facing boundary is therefore the still-unhandled `/dev/gc`
-commands `#40` and `#42`, followed by verified graphics event-queue completion
-and capture of the first post-stream command buffer.
+120-second live run remains alive until it is stopped by the test harness and
+does not reject any observed graphics-device request. It reaches the asset,
+audio and worker synchronization loop, but this is not yet a rendered game
+frame: the complete-content path never calls AGC event registration or submits
+an observable DCB/ACB during that interval. The current title-facing boundary is
+therefore above the GPU API. The next trace must identify which Unity render-job
+or synchronization condition prevents the first submission instead of guessing
+another PM4 or Vulkan command before the title supplies one.
 
 ## Error codes
 
@@ -1314,12 +1330,12 @@ from leaking into host code where nothing would check it.
 
 ## Roadmap
 
-1. Recover the payload semantics of `/dev/gc` commands `#40` and `#42` from the
-   shipped driver and implement only their verified state transitions.
-2. Implement graphics event-queue registration and completion, then capture the
-   first post-stream DCB/ACB from the complete title path.
-3. Validate that command buffer against the supported PM4/Vulkan subset and add
-   the missing state or execution path required for the first real game frame.
+1. Trace the Unity render worker and its synchronization dependencies after APR
+   streaming to find why the complete title does not reach AGC submission.
+2. Capture the first post-stream DCB/ACB and validate it against the supported
+   PM4 state tracker, scheduler and Vulkan backend.
+3. Retain submission owner metadata across blocked `WAIT_REG_MEM` continuations,
+   then publish the correct delayed graphics completion event when needed.
 
 ---
 
