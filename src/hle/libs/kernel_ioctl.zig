@@ -162,7 +162,12 @@ pub fn write(
 }
 
 /// The most payload bytes shown in one trace line.
-const maximum_traced_payload: u16 = 64;
+///
+/// Wide enough for the largest request the shipped driver makes. A descriptor
+/// shown half-way is worse than useless: the fields that say what the request
+/// is for — addresses, sizes, counts — are spread through it, and half of them
+/// names nothing.
+const maximum_traced_payload: u16 = 128;
 
 /// Appends the bytes the caller sent, when it sent any.
 ///
