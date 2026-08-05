@@ -63,6 +63,10 @@ pub const Options = struct {
     /// stage-interface work rather than silently receiving zero.
     vertex_index_vgpr: ?u8 = null,
     storage_buffers: []const StorageBufferBinding = &.{},
+    /// Whether the program narrows the execution mask, and so needs to know
+    /// which lane it is running as. Decided from the program by `translate`,
+    /// because the input has to be declared before the body that reads it.
+    uses_execution_mask: bool = false,
     sampled_images: []const SampledImageBinding = &.{},
     scalar_registers: []const ScalarRegister = &.{},
     compute_inputs: ?ComputeInputs = null,
@@ -297,6 +301,7 @@ const Builder = struct {
             for (options.storage_buffers) |binding| {
                 needs_thread_id = needs_thread_id or binding.add_thread_id;
             }
+            needs_thread_id = needs_thread_id or options.uses_execution_mask;
             if (needs_thread_id) {
                 const input_uint_pointer = self.id();
                 self.local_invocation_index = self.id();
@@ -1000,7 +1005,26 @@ const Builder = struct {
         if (inst.opcode != .s_mov_b64) return Error.UnsupportedControlFlow;
 
         const low = try self.source(inst.src0, .bits32);
-        const high = try self.source(try consecutiveRegister(inst.src0, 1), .bits32);
+        // The mask is one sixty-four bit value. Held in scalar registers it
+        // occupies a pair, so the second half is the register after the first —
+        // the consecutive-register helper nearby is for vector registers and
+        // would refuse this, which is a different thing from the pair being
+        // wrong. Written from a constant instead, the second half is the first
+        // one's sign, which is what shifting it right by thirty-one produces.
+        const high = if (inst.src0.kind == .sgpr) blk: {
+            var high_operand = inst.src0;
+            high_operand.reg += 1;
+            break :blk try self.source(high_operand, .bits32);
+        } else blk: {
+            const extended = self.id();
+            try self.emit(&self.body, 195, &.{ // OpShiftRightArithmetic
+                self.bits_type,
+                extended,
+                low,
+                try self.constant(.bits32, 31),
+            });
+            break :blk extended;
+        };
         self.exec_mask = .{ low, high };
         return true;
     }
@@ -1260,7 +1284,11 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
 /// The writer fails explicitly for operations or control-flow shapes whose
 /// semantics are not implemented; it never emits a placeholder guest shader.
 pub fn translate(allocator: std.mem.Allocator, program: *const instruction.Program, options: Options) Error!Module {
-    var builder = try Builder.init(allocator, options);
+    var effective = options;
+    for (program.instructions.items) |candidate| {
+        if (candidate.dst.kind == .exec_lo) effective.uses_execution_mask = true;
+    }
+    var builder = try Builder.init(allocator, effective);
     defer builder.deinit();
     var graph = try control_flow.build(allocator, program);
     defer graph.deinit(allocator);
@@ -1390,6 +1418,91 @@ test "vertex system value and position export lower to a stage interface" {
     try std.testing.expect(containsOpcode(module.words, 112)); // OpConvertUToF
     try std.testing.expect(containsOpcode(module.words, 80)); // OpCompositeConstruct
     try std.testing.expect(containsOpcode(module.words, 62)); // OpStore Position
+}
+
+/// One indexed buffer access, encoded the way the hardware spells it.
+fn testMubuf(opcode: u7, byte_offset: u12, data: u8, address: u8, resource: u8) [2]u32 {
+    return .{
+        0xe000_0000 | (@as(u32, opcode) << 18) | (1 << 13) | byte_offset,
+        (0x80 << 24) | (@as(u32, resource / 4) << 16) | (@as(u32, data) << 8) | address,
+    };
+}
+
+fn testSop1(opcode: u8, destination: u8, source: u9) u32 {
+    return 0xbe80_0000 | (@as(u32, destination) << 16) | (@as(u32, opcode) << 8) | source;
+}
+
+test "an indexed copy is held to its buffer bounds and its execution mask" {
+    // The shape of nearly every compute kernel a title dispatches: each lane
+    // copies the element its own index names. What is established here is the
+    // two rules around that — a lane reading past the end of its source is
+    // given zero, a lane writing past the end of its destination is ignored,
+    // and lanes the mask has switched off do neither.
+    const decoder = @import("decoder.zig");
+    const code =
+        [_]u32{testSop1(0x04, 126, 128 + 15)} ++ // s_mov_b64 exec, 15 -> lanes 0..3
+        testMubuf(0x0c, 0, 1, 0, 8) ++ // v1 <- source[lane]
+        testMubuf(0x1c, 0, 1, 0, 12) ++ // destination[lane] <- v1
+        testMubuf(0x0c, 16, 2, 0, 8) ++ // v2 <- past the end of the source
+        testMubuf(0x1c, 32, 2, 0, 12) ++ // destination past its end <- v2
+        [_]u32{0xbf81_0000};
+
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+
+    const storage = [_]StorageBufferBinding{
+        .{ .resource_sgpr = 8, .descriptor_index = 0, .stride = 4, .extent_bytes = 16 },
+        .{ .resource_sgpr = 12, .descriptor_index = 1, .stride = 4, .extent_bytes = 32 },
+    };
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .local_size = .{ 16, 1, 1 },
+        .storage_buffers = &storage,
+        .descriptor_array_length = 2,
+        // The index each lane copies by is its own invocation id, which the
+        // hardware places in v0 before the kernel starts.
+        .compute_inputs = .{ .local_invocation_id_components = 1 },
+    });
+    defer module.deinit(std.testing.allocator);
+
+    // A bound turns every access into a question, and the answers are chosen
+    // and branched on rather than assumed.
+    try std.testing.expect(containsOpcode(module.words, 176)); // OpULessThan
+    try std.testing.expect(containsOpcode(module.words, 169)); // OpSelect
+    try std.testing.expect(containsOpcode(module.words, 247)); // OpSelectionMerge
+    try std.testing.expect(containsOpcode(module.words, 250)); // OpBranchConditional
+    // The mask is answered per lane, which means reading which lane this is.
+    try std.testing.expect(containsOpcode(module.words, 61)); // OpLoad LocalInvocationIndex
+    try std.testing.expect(containsOpcode(module.words, 171)); // OpINotEqual
+    try std.testing.expect(containsOpcode(module.words, 167)); // OpLogicalAnd
+}
+
+test "without a known extent nothing is checked" {
+    // A caller that has not recovered a descriptor says so by supplying no
+    // extent, and the access is emitted as it always was. Guessing a size would
+    // be worse than leaving it unchecked: it would drop writes a title made
+    // legitimately.
+    const decoder = @import("decoder.zig");
+    const code =
+        [_]u32{ (@as(u32, 0x3f) << 25) | (@as(u32, 1) << 17) | (@as(u32, 0x01) << 9) | 255, 7 } ++
+        testMubuf(0x1c, 0, 1, 0, 8) ++ [_]u32{0xbf81_0000};
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+
+    const storage = [_]StorageBufferBinding{
+        .{ .resource_sgpr = 8, .descriptor_index = 0, .stride = 4 },
+    };
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .storage_buffers = &storage,
+        .descriptor_array_length = 1,
+        .compute_inputs = .{ .local_invocation_id_components = 1 },
+    });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expect(containsOpcode(module.words, 62)); // OpStore
+    try std.testing.expect(!containsOpcode(module.words, 176)); // no OpULessThan
+    try std.testing.expect(!containsOpcode(module.words, 250)); // no OpBranchConditional
 }
 
 test "fragment MRT0 export lowers to location zero" {
@@ -1711,3 +1824,5 @@ test "full destination SDWA lowers source extraction before vector ALU" {
     try std.testing.expect(containsOpcode(module.words, 199)); // OpBitwiseAnd
     try std.testing.expect(containsOpcode(module.words, 129)); // OpFAdd
 }
+
+

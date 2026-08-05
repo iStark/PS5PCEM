@@ -79,6 +79,139 @@ fn vop2(opcode: u8, destination: u8, source0: u8, source1: u8) u32 {
         (256 + @as(u32, source0));
 }
 
+fn sop1(opcode: u8, destination: u8, source: u9) u32 {
+    return 0xbe80_0000 | (@as(u32, destination) << 16) | (@as(u32, opcode) << 8) | source;
+}
+
+/// One indexed buffer access, encoded the way the hardware spells it.
+///
+/// The resource names its descriptor by the first scalar register divided by
+/// four, and the scalar offset is the inline zero.
+fn mubuf(opcode: u7, byte_offset: u12, data: u8, address: u8, resource: u8) [2]u32 {
+    return .{
+        0xe000_0000 | (@as(u32, opcode) << 18) | (1 << 13) | byte_offset,
+        (0x80 << 24) | (@as(u32, resource / 4) << 16) | (@as(u32, data) << 8) | address,
+    };
+}
+
+/// A fourteen-instruction indexed copy, run for its bounds and its mask.
+///
+/// Each lane copies the element its own index names, which is the shape of
+/// nearly every compute kernel a title dispatches. What this establishes is the
+/// two rules around that: a lane reading past the end of its source is given
+/// zero, a lane writing past the end of its destination is ignored, and lanes
+/// the execution mask has switched off do neither.
+///
+/// Written as encoded instructions rather than assembled from a source, because
+/// what is under test is the path from those very words to a running pipeline —
+/// an assembler in between would be one more thing that could be the reason it
+/// worked.
+fn runIndexedCopyKernel(
+    allocator: std.mem.Allocator,
+    renderer: *vulkan.Renderer,
+    guest: *GuestMemory,
+    backend: gpu.DcbBackend,
+) !void {
+    const program = 0x800;
+    const source = 0x2000;
+    const destination = 0x2100;
+    const source_records = 4;
+    const destination_records = 16;
+    const guard = destination + destination_records * 4;
+    const sentinel: u32 = 0xdead_beef;
+    const enabled_lanes = 4;
+    const dispatched_lanes = 16;
+
+    var cursor: usize = program;
+    const emit = struct {
+        fn one(memory: *GuestMemory, at: *usize, value: u32) void {
+            memory.word(at.*, value);
+            at.* += 4;
+        }
+        fn pair(memory: *GuestMemory, at: *usize, values: [2]u32) void {
+            one(memory, at, values[0]);
+            one(memory, at, values[1]);
+        }
+    };
+
+    emit.pair(guest, &cursor, .{ 0xf40c_0200, 125 << 25 }); //  1 s_load_dwordx8 s8:s15, s0:s1
+    emit.one(guest, &cursor, 0xbf80_0000); //                    2 s_nop
+    emit.one(guest, &cursor, sop1(0x04, 126, 128 + enabled_lanes * 4 - 1)); // 3 exec = lanes 0..3
+    emit.one(guest, &cursor, 0xbf80_0000); //                    4 s_nop
+    emit.pair(guest, &cursor, mubuf(0x0c, 0, 1, 0, 8)); //       5 v1 <- source[lane]
+    emit.one(guest, &cursor, 0xbf80_0000); //                    6 s_nop
+    emit.pair(guest, &cursor, mubuf(0x1c, 0, 1, 0, 12)); //      7 destination[lane] <- v1
+    emit.one(guest, &cursor, 0xbf80_0000); //                    8 s_nop
+    emit.pair(guest, &cursor, mubuf(0x0c, 16, 2, 0, 8)); //      9 v2 <- past the source's end
+    emit.one(guest, &cursor, 0xbf80_0000); //                   10 s_nop
+    emit.pair(guest, &cursor, mubuf(0x1c, 32, 2, 0, 12)); //    11 destination[8..] <- v2
+    emit.pair(guest, &cursor, mubuf(0x1c, 64, 1, 0, 12)); //    12 past the destination's end
+    emit.one(guest, &cursor, 0xbf80_0000); //                   13 s_nop
+    emit.one(guest, &cursor, 0xbf81_0000); //                   14 s_endpgm
+
+    const input = [_]u32{ 0x0a0b_0c0d, 0x1a1b_1c1d, 0x2a2b_2c2d, 0x3a3b_3c3d };
+    for (input, 0..) |value, index| guest.word(source + index * 4, value);
+    for (0..destination_records + 4) |index| guest.word(destination + index * 4, sentinel);
+
+    const table = 0x900;
+    const descriptors = [_][4]u32{
+        .{ source, 4 << 16, source_records, 0 },
+        .{ destination, 4 << 16, destination_records, 0 },
+    };
+    for (descriptors, 0..) |descriptor, slot| {
+        for (descriptor, 0..) |value, index| guest.word(table + slot * 16 + index * 4, value);
+    }
+
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), program >> 8);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 2 << 1);
+    try state.writeRegister(.shader, 0x207, dispatched_lanes);
+    try state.writeRegister(.shader, 0x208, 1);
+    try state.writeRegister(.shader, 0x209, 1);
+    try state.writeRegister(.shader, compute.userDataBase(), table);
+    try state.writeRegister(.shader, compute.userDataBase() + 1, 0);
+
+    const stream = [_]u32{ command(gpu.pm4.dispatch_direct, 4), 1, 1, 1, 0x41 };
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = backend, .allocator = allocator };
+    _ = executor.execute(&stream) catch |err| {
+        // The renderer knows why it refused; the executor only knows that it
+        // did, and "rejected" on its own names nothing that can be acted on.
+        std.debug.print("indexed copy refused: {s} (renderer: {s})\n", .{
+            @errorName(err),
+            if (renderer.last_dispatch_error) |reason| @errorName(reason) else "none",
+        });
+        return err;
+    };
+
+    const read = struct {
+        fn at(memory: *GuestMemory, address: usize) u32 {
+            return std.mem.readInt(u32, memory.bytes[address..][0..4], .little);
+        }
+    };
+
+    for (input, 0..) |expected, index| {
+        if (read.at(guest, destination + index * 4) != expected) return error.IndexedCopyMismatch;
+    }
+    // Lanes the mask switched off wrote nothing, though their elements sit well
+    // inside the destination.
+    for (enabled_lanes..8) |index| {
+        if (read.at(guest, destination + index * 4) != sentinel) return error.ExecutionMaskIgnored;
+    }
+    // Reads past the end of the source produced zero rather than whatever lies
+    // beyond it.
+    for (0..enabled_lanes) |index| {
+        if (read.at(guest, destination + (8 + index) * 4) != 0) {
+            return error.BufferBoundsReadMismatch;
+        }
+    }
+    // Writes past the end of the destination were dropped.
+    for (0..4) |index| {
+        if (read.at(guest, guard + index * 4) != sentinel) return error.BufferBoundsWriteMismatch;
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
 
@@ -561,6 +694,8 @@ pub fn main(init: std.process.Init) !void {
     {
         return error.InvalidPresentedFrame;
     }
+
+    try runIndexedCopyKernel(allocator, &renderer, &guest, backend);
 
     var output_buffer: [1024]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &output_buffer);

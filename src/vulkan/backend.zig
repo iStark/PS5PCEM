@@ -1624,6 +1624,10 @@ pub const Renderer = struct {
                 .swizzled = descriptor.swizzle_enabled,
                 .index_stride = descriptor.index_stride,
                 .add_thread_id = descriptor.add_thread_id,
+                // The descriptor already says how far the buffer goes, so the
+                // shader can be held to it instead of being trusted to stay
+                // inside on its own.
+                .extent_bytes = std.math.cast(u32, descriptor.size_bytes),
             };
             result.mapping_count += 1;
             if (is_store) result.writable[descriptor_index] = true;
