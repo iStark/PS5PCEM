@@ -51,22 +51,90 @@ pub const Device = enum {
     graphics,
     /// Mode switches a system library reads during startup.
     dip_switches,
+    /// Entropy. Unlike the others this device *is* driven by reading it, which
+    /// is the whole of what it does.
+    random,
 
     pub fn name(self: Device) []const u8 {
         return switch (self) {
             .graphics => "/dev/gc",
             .dip_switches => "/dev/dipsw",
+            .random => "/dev/urandom",
         };
     }
 };
 
-const device_nodes = [_]Device{ .graphics, .dip_switches };
+const device_nodes = [_]Device{ .graphics, .dip_switches, .random };
+
+/// The second spelling of the entropy device.
+///
+/// The two differ on a console only in whether a read may block waiting for
+/// entropy to be gathered. Nothing here gathers any, so nothing here can
+/// block, and the distinction has no consequence — but a title asking for one
+/// name must not be told the other does not exist.
+const blocking_random_node = "/dev/random";
+
+/// Fills a buffer from the entropy device, and says how much it wrote.
+///
+/// Genuinely unpredictable rather than a fixed sequence. A title seeds its own
+/// generators from here, and a fixed sequence would make every run of a game
+/// deal the same cards and place the same debris — which is a difference a
+/// player sees, and one nothing in the title would explain.
+var entropy_source: ?std.Random.DefaultCsprng = null;
+var entropy_lock: Lock = .{};
+
+/// How far the processor has counted, where it can be asked.
+///
+/// Only used to make a seed differ between runs. Where the counter is not
+/// available the seed still varies, because the addresses mixed with it do.
+fn processorCounter() u64 {
+    if (@import("builtin").cpu.arch != .x86_64) return 0;
+    var low: u32 = undefined;
+    var high: u32 = undefined;
+    asm volatile ("rdtsc"
+        : [low] "={eax}" (low),
+          [high] "={edx}" (high),
+    );
+    return (@as(u64, high) << 32) | low;
+}
+
+/// Seeds the entropy device once, from what this process can observe of itself.
+///
+/// The host offers no single call here that yields real entropy, so the seed is
+/// mixed from things that differ between runs: where the loader placed this
+/// process, and how far the processor has counted. Neither is secret, and this
+/// device is not asked to keep secrets — it is asked not to repeat itself, and
+/// this does not.
+fn seedEntropy() std.Random.DefaultCsprng {
+    var seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
+    var mixed: u64 = @intFromPtr(&seed);
+    mixed ^= @intFromPtr(&entropy_source) *% 0x9e37_79b9_7f4a_7c15;
+    mixed ^= processorCounter() *% 0xff51_afd7_ed55_8ccd;
+
+    for (&seed, 0..) |*byte, index| {
+        mixed ^= mixed >> 33;
+        mixed *%= 0xc4ce_b9fe_1a85_ec53;
+        mixed +%= index;
+        byte.* = @truncate(mixed >> 24);
+    }
+    return std.Random.DefaultCsprng.init(seed);
+}
+
+fn fillWithEntropy(buffer: []u8) Error!usize {
+    if (buffer.len == 0) return 0;
+    entropy_lock.lock();
+    defer entropy_lock.unlock();
+    if (entropy_source == null) entropy_source = seedEntropy();
+    entropy_source.?.random().bytes(buffer);
+    return buffer.len;
+}
 
 /// Recognises a path as one of the devices served here.
 pub fn deviceForPath(path: []const u8) ?Device {
     for (device_nodes) |device| {
         if (std.ascii.eqlIgnoreCase(path, device.name())) return device;
     }
+    if (std.ascii.eqlIgnoreCase(path, blocking_random_node)) return .random;
     return null;
 }
 
@@ -348,8 +416,12 @@ pub fn read(descriptor: i32, buffer: []u8) Error!usize {
         return Error.BadDescriptor;
     }
     const offset = slot.*.?.offset;
+    const device = slot.*.?.device;
     const file = slot.*.?.file orelse {
         table_lock.unlock();
+        // The entropy device is read like a file even though nothing is stored
+        // behind it, which is the one exception to a device having no contents.
+        if (device == .random) return fillWithEntropy(buffer);
         return Error.NotSupported;
     };
     table_lock.unlock();
@@ -385,7 +457,12 @@ pub fn pread(descriptor: i32, buffer: []u8, offset: u64) Error!usize {
     };
     table_lock.unlock();
 
-    const file = entry.file orelse return Error.NotSupported;
+    const file = entry.file orelse {
+        // Reading entropy at an offset is the same as reading it anywhere: the
+        // device has no positions, so an offset names nothing to skip.
+        if (entry.device == .random) return fillWithEntropy(buffer);
+        return Error.NotSupported;
+    };
     const io = active_io orelse return Error.NotAttached;
     return file.readPositionalAll(io, buffer, offset) catch Error.IoFailed;
 }
@@ -531,6 +608,33 @@ test "a device opens without a mount and is not a file" {
     try testing.expectError(Error.NotSupported, read(fd, &buffer));
     try testing.expectError(Error.NotSupported, pread(fd, &buffer, 0));
     try testing.expectError(Error.NotSupported, seek(fd, 0, Seek.end));
+}
+
+test "the entropy device is read like a file, and does not repeat itself" {
+    // The one device that is driven by reading it. A fixed sequence would make
+    // every run of a game deal the same cards, which a player sees and nothing
+    // in the title explains.
+    detach();
+    for ([_][]const u8{ "/dev/urandom", "/dev/random" }) |path| {
+        const fd = try open(path, O.rdonly);
+        defer close(fd) catch {};
+        try testing.expectEqual(Device.random, deviceOf(fd).?);
+
+        var first: [64]u8 = @splat(0);
+        var second: [64]u8 = @splat(0);
+        try testing.expectEqual(first.len, try read(fd, &first));
+        try testing.expectEqual(second.len, try read(fd, &second));
+        try testing.expect(!std.mem.eql(u8, &first, &second));
+
+        // An offset names nothing to skip on a device with no positions, so a
+        // positional read is still a read.
+        var third: [32]u8 = @splat(0);
+        try testing.expectEqual(third.len, try pread(fd, &third, 4096));
+        try testing.expect(!std.mem.allEqual(u8, &third, 0));
+
+        // Asking for nothing yields nothing rather than failing.
+        try testing.expectEqual(@as(usize, 0), try read(fd, &.{}));
+    }
 }
 
 test "a device is described as a device" {

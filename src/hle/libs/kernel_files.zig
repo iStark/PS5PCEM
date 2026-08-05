@@ -100,7 +100,12 @@ fn writableRecord(comptime T: type, record: ?*T) ?*T {
 
 fn kernelOpen(path: ?[*:0]const u8, flags: i32, _: u16) callconv(abi.guest) i32 {
     const name = spanOf(path) orelse return KernelError.efault.raw();
-    return filesystem.open(name, flags) catch |err| kernelStatus(err);
+    const descriptor = filesystem.open(name, flags) catch |err| {
+        announceOpen(name, -1);
+        return kernelStatus(err);
+    };
+    announceOpen(name, descriptor);
+    return descriptor;
 }
 
 fn kernelClose(descriptor: i32) callconv(abi.guest) i32 {
@@ -171,9 +176,28 @@ fn readOnlyStatus(
 // POSIX-style entry points
 // ---------------------------------------------------------------------------
 
+/// Says which file was asked for, and what became of the request.
+///
+/// The trace records the arguments a call was given, and for an open that is a
+/// bare pointer — which names nothing. A title that cannot find its content
+/// makes exactly this call and gets exactly this failure, so the one thing
+/// worth seeing is the path.
+fn announceOpen(name: []const u8, result: i64) void {
+    if (!trace.announces("open")) return;
+    if (result < 0) {
+        std.debug.print("[open ] \"{s}\" refused\n", .{name});
+    } else {
+        std.debug.print("[open ] \"{s}\" -> {d}\n", .{ name, result });
+    }
+}
+
 fn posixOpen(path: ?[*:0]const u8, flags: i32, _: u16) callconv(abi.guest) i64 {
     const name = spanOf(path) orelse return posixFail(Error.InvalidArgument);
-    const descriptor = filesystem.open(name, flags) catch |err| return posixFail(err);
+    const descriptor = filesystem.open(name, flags) catch |err| {
+        announceOpen(name, -1);
+        return posixFail(err);
+    };
+    announceOpen(name, descriptor);
     return descriptor;
 }
 
