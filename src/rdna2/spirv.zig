@@ -1122,10 +1122,23 @@ const Builder = struct {
             .buffer_load_sbyte => try self.bufferLoadSubword(inst, 8, true),
             .buffer_load_ushort => try self.bufferLoadSubword(inst, 16, false),
             .buffer_load_sshort => try self.bufferLoadSubword(inst, 16, true),
-            .buffer_load_dword => try self.bufferLoadWords(inst, 1),
-            .buffer_load_dwordx2 => try self.bufferLoadWords(inst, 2),
-            .buffer_load_dwordx3 => try self.bufferLoadWords(inst, 3),
-            .buffer_load_dwordx4 => try self.bufferLoadWords(inst, 4),
+            // FORMAT ops with 32-bit components are dword transfers through the
+            // V# stride. Unity's first live compute after the GDS/copy path is
+            // exactly buffer_store_format_xyzw of a constant float4/uint4; the
+            // typed conversion path is not required until a non-32-bit format
+            // shows up in a rejected program.
+            .buffer_load_dword,
+            .buffer_load_format_x,
+            => try self.bufferLoadWords(inst, 1),
+            .buffer_load_dwordx2,
+            .buffer_load_format_xy,
+            => try self.bufferLoadWords(inst, 2),
+            .buffer_load_dwordx3,
+            .buffer_load_format_xyz,
+            => try self.bufferLoadWords(inst, 3),
+            .buffer_load_dwordx4,
+            .buffer_load_format_xyzw,
+            => try self.bufferLoadWords(inst, 4),
             .s_buffer_load_dword => try self.scalarBufferLoadWords(inst, 1),
             .s_buffer_load_dwordx2 => try self.scalarBufferLoadWords(inst, 2),
             .s_buffer_load_dwordx4 => try self.scalarBufferLoadWords(inst, 4),
@@ -1133,10 +1146,18 @@ const Builder = struct {
             .s_buffer_load_dwordx16 => try self.scalarBufferLoadWords(inst, 16),
             .buffer_store_byte => try self.bufferStoreSubword(inst, 8),
             .buffer_store_short => try self.bufferStoreSubword(inst, 16),
-            .buffer_store_dword => try self.bufferStoreWords(inst, 1),
-            .buffer_store_dwordx2 => try self.bufferStoreWords(inst, 2),
-            .buffer_store_dwordx3 => try self.bufferStoreWords(inst, 3),
-            .buffer_store_dwordx4 => try self.bufferStoreWords(inst, 4),
+            .buffer_store_dword,
+            .buffer_store_format_x,
+            => try self.bufferStoreWords(inst, 1),
+            .buffer_store_dwordx2,
+            .buffer_store_format_xy,
+            => try self.bufferStoreWords(inst, 2),
+            .buffer_store_dwordx3,
+            .buffer_store_format_xyz,
+            => try self.bufferStoreWords(inst, 3),
+            .buffer_store_dwordx4,
+            .buffer_store_format_xyzw,
+            => try self.bufferStoreWords(inst, 4),
             .buffer_atomic_swap => try self.bufferAtomic(inst, 229), // OpAtomicExchange
             .buffer_atomic_add => try self.bufferAtomic(inst, 234), // OpAtomicIAdd
             .buffer_atomic_sub => try self.bufferAtomic(inst, 235), // OpAtomicISub
@@ -1692,6 +1713,39 @@ test "MUBUF dword load and store lower through a descriptor array" {
     try std.testing.expect(containsOpcode(module.words, 65)); // OpAccessChain
     try std.testing.expect(containsOpcode(module.words, 61)); // OpLoad
     try std.testing.expect(containsOpcode(module.words, 62)); // OpStore
+}
+
+test "MUBUF format load and store lower as multi-dword transfers" {
+    const decoder = @import("decoder.zig");
+    // FORMAT ops with 32-bit components use the same MUBUF path as dwordxN.
+    // Encoded without idxen so the address does not depend on an undefined
+    // VGPR; the live Unity kernel adds an index after computing it.
+    const code = [_]u32{
+        0xe00c_0000, // buffer_load_format_xyzw v0:v3, v0, s4:s7, 0
+        0x8001_0000,
+        0xe01c_0010, // buffer_store_format_xyzw v0:v3, v0, s4:s7, offset:16
+        0x8001_0000,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    try std.testing.expectEqual(isa.Opcode.buffer_load_format_xyzw, program.instructions.items[0].opcode);
+    try std.testing.expectEqual(isa.Opcode.buffer_store_format_xyzw, program.instructions.items[1].opcode);
+
+    const storage = [_]StorageBufferBinding{.{
+        .resource_sgpr = 4,
+        .descriptor_index = 0,
+        .stride = 16,
+        .extent_bytes = 64,
+    }};
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .storage_buffers = &storage,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expect(containsOpcode(module.words, 61)); // OpLoad
+    try std.testing.expectEqual(@as(usize, 4), countOpcode(module.words, 62)); // four component stores
 }
 
 test "resolved SMEM descriptor prolog specializes before MUBUF" {

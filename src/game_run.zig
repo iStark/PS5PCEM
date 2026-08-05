@@ -299,6 +299,11 @@ fn run(init: std.process.Init) !bool {
         // Symbol-attributed report first: it names the module and, for a call
         // through a null pointer, the caller recovered from the stack. The raw
         // dumps below stay as supporting detail for cases it cannot classify.
+        //
+        // Do not join guest workers here: graphics threads can sit in tight
+        // guest loops (AGC suspendPoint) that ignore interrupt flags, and a
+        // join would hang while burning cores for the whole diagnostic dump.
+        // defer disableCpuDispatcher still runs on the way out.
         if (graph.buildSymbolMap(allocator)) |built| {
             var map = built;
             defer map.deinit(allocator);
