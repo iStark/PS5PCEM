@@ -4,6 +4,7 @@
 //! Deterministic SPIR-V 1.5 writer for executable RDNA2 graphics and compute shaders.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const isa = @import("isa.zig");
 const operand = @import("operand.zig");
 const instruction = @import("instruction.zig");
@@ -415,7 +416,10 @@ const Builder = struct {
     }
 
     fn source(self: *Builder, op: operand.Operand, expected: ValueType) Error!u32 {
-        if (op.dpp) return Error.UnsupportedOpcode;
+        if (op.dpp) {
+            std.debug.print("[rdna2] Unsupported DPP operand\n", .{});
+            return Error.UnsupportedOpcode;
+        }
         var raw = try self.rawSource(op);
         if (op.sdwa_sel != 6) {
             const width: u32 = if (op.sdwa_sel < 4) 8 else if (op.sdwa_sel < 6) 16 else return Error.UnsupportedOpcode;
@@ -443,7 +447,10 @@ const Builder = struct {
             }
         }
         if (op.absolute or op.negate) {
-            if (expected != .float32) return Error.UnsupportedOpcode;
+            if (expected != .float32) {
+                std.debug.print("[rdna2] Unsupported abs/neg on non-float type\n", .{});
+                return Error.UnsupportedOpcode;
+            }
             if (op.absolute) {
                 const absolute = self.id();
                 try self.emit(&self.body, 199, &.{ self.bits_type, absolute, raw, try self.constant(.bits32, 0x7fff_ffff) });
@@ -547,6 +554,11 @@ const Builder = struct {
 
     fn exportValue(self: *Builder, inst: instruction.Instruction) Error!void {
         if (inst.export_compressed or inst.export_enable != 0xf or self.vector4_type == 0) {
+            std.debug.print("[rdna2] Unsupported export: compressed={}, enable=0x{x}, vector4_type={}\n", .{
+                inst.export_compressed,
+                inst.export_enable,
+                self.vector4_type,
+            });
             return Error.UnsupportedOpcode;
         }
         const output = switch (self.stage) {
@@ -554,7 +566,13 @@ const Builder = struct {
             .fragment => if (inst.export_target == 0) self.color_output else 0,
             .compute => 0,
         };
-        if (output == 0) return Error.UnsupportedOpcode;
+        if (output == 0) {
+            std.debug.print("[rdna2] Unsupported export target {} for stage {s}\n", .{
+                inst.export_target,
+                @tagName(self.stage),
+            });
+            return Error.UnsupportedOpcode;
+        }
         const x = try self.source(inst.src0, .float32);
         const y = try self.source(inst.src1, .float32);
         const z = try self.source(inst.src2, .float32);
@@ -872,7 +890,7 @@ const Builder = struct {
     }
 
     fn bufferLoadWords(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
-        var addresses: [4]BufferAddress = undefined;
+        var addresses: [16]BufferAddress = undefined;
         for (0..count) |index| {
             addresses[index] = try self.bufferAddressDelta(inst, @intCast(index * 4));
         }
@@ -880,6 +898,15 @@ const Builder = struct {
             const result = try self.loadBufferWord(addresses[index], 0);
             try self.destination(try consecutiveRegister(inst.dst, @intCast(index)), .{ .id = result, .value_type = .bits32 });
         }
+    }
+
+    fn scalarBufferLoadWords(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
+        var mubuf_inst = inst;
+        mubuf_inst.src1 = inst.src0; // Descriptor
+        mubuf_inst.src2 = inst.src1; // SOFFSET
+        mubuf_inst.index_enable = false;
+        mubuf_inst.offset_enable = false;
+        try self.bufferLoadWords(mubuf_inst, count);
     }
 
     fn bufferStoreWords(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
@@ -1056,6 +1083,13 @@ const Builder = struct {
             .v_sub_f32 => try self.binary(inst, 131, .float32, false), // OpFSub
             .v_subrev_f32 => try self.binary(inst, 131, .float32, true),
             .v_mul_f32 => try self.binary(inst, 133, .float32, false), // OpFMul
+            .v_lshr_b32 => try self.binary(inst, 194, .bits32, false), // OpShiftRightLogical
+            .v_lshrrev_b32 => try self.binary(inst, 194, .bits32, true),
+            .v_ashr_i32 => try self.binary(inst, 195, .sint32, false), // OpShiftRightArithmetic
+            .v_ashrrev_i32 => try self.binary(inst, 195, .sint32, true),
+            .v_lshl_b32 => try self.binary(inst, 196, .bits32, false), // OpShiftLeftLogical
+            .v_lshlrev_b32 => try self.binary(inst, 196, .bits32, true),
+            .v_mul_lo_u32 => try self.binary(inst, 132, .bits32, false), // OpIMul
             .s_and_b32, .v_and_b32 => try self.binary(inst, 199, .bits32, false),
             .s_or_b32, .v_or_b32 => try self.binary(inst, 197, .bits32, false),
             .s_xor_b32, .v_xor_b32 => try self.binary(inst, 198, .bits32, false),
@@ -1077,6 +1111,11 @@ const Builder = struct {
             .buffer_load_dwordx2 => try self.bufferLoadWords(inst, 2),
             .buffer_load_dwordx3 => try self.bufferLoadWords(inst, 3),
             .buffer_load_dwordx4 => try self.bufferLoadWords(inst, 4),
+            .s_buffer_load_dword => try self.scalarBufferLoadWords(inst, 1),
+            .s_buffer_load_dwordx2 => try self.scalarBufferLoadWords(inst, 2),
+            .s_buffer_load_dwordx4 => try self.scalarBufferLoadWords(inst, 4),
+            .s_buffer_load_dwordx8 => try self.scalarBufferLoadWords(inst, 8),
+            .s_buffer_load_dwordx16 => try self.scalarBufferLoadWords(inst, 16),
             .buffer_store_byte => try self.bufferStoreSubword(inst, 8),
             .buffer_store_short => try self.bufferStoreSubword(inst, 16),
             .buffer_store_dword => try self.bufferStoreWords(inst, 1),
@@ -1095,7 +1134,16 @@ const Builder = struct {
             .buffer_atomic_xor => try self.bufferAtomic(inst, 242), // OpAtomicXor
             .image_sample => try self.sampleImage(inst),
             .exp => try self.exportValue(inst),
-            else => return Error.UnsupportedOpcode,
+            else => {
+                if (!builtin.is_test) {
+                    std.debug.print("[rdna2] Unsupported opcode: {s} (0x{x}) at pc=0x{x}\n", .{
+                        @tagName(inst.opcode),
+                        @intFromEnum(inst.opcode),
+                        inst.pc,
+                    });
+                }
+                return Error.UnsupportedOpcode;
+            },
         }
     }
 };
@@ -1359,6 +1407,50 @@ test "straight-line vector ALU translates to a SPIR-V function" {
     try std.testing.expectEqual(@as(u32, 0x0001_0500), module.words[1]);
     try std.testing.expect(containsOpcode(module.words, 129)); // OpFAdd
     try std.testing.expect(containsOpcode(module.words, 253)); // OpReturn
+}
+
+test "vector shifts and low unsigned multiply lower to SPIR-V arithmetic" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .v_mov_b32,
+        .dst = .{ .kind = .vgpr, .reg = 0 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 16, .signed_val = 16 },
+        .src_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .v_mov_b32,
+        .dst = .{ .kind = .vgpr, .reg = 1 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 2, .signed_val = 2 },
+        .src_count = 1,
+    });
+    inline for ([_]isa.Opcode{
+        .v_lshr_b32,
+        .v_lshrrev_b32,
+        .v_ashr_i32,
+        .v_ashrrev_i32,
+        .v_lshl_b32,
+        .v_lshlrev_b32,
+        .v_mul_lo_u32,
+    }, 0..) |opcode, index| {
+        try program.instructions.append(std.testing.allocator, .{
+            .opcode = opcode,
+            .dst = .{ .kind = .vgpr, .reg = @intCast(index + 2) },
+            .src0 = .{ .kind = .vgpr, .reg = 0 },
+            .src1 = .{ .kind = .vgpr, .reg = 1 },
+            .src_count = 2,
+        });
+    }
+    try program.instructions.append(std.testing.allocator, .{ .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .compute });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 194)); // OpShiftRightLogical
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 195)); // OpShiftRightArithmetic
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 196)); // OpShiftLeftLogical
+    try std.testing.expect(containsOpcode(module.words, 132)); // OpIMul
 }
 
 test "instruction prefetch is a translation no-op" {
@@ -1824,5 +1916,3 @@ test "full destination SDWA lowers source extraction before vector ALU" {
     try std.testing.expect(containsOpcode(module.words, 199)); // OpBitwiseAnd
     try std.testing.expect(containsOpcode(module.words, 129)); // OpFAdd
 }
-
-

@@ -516,7 +516,7 @@ with the matching descriptor-array element. Before translation,
 `scalar_provenance` executes the straight scalar prefix and checked SMEM reads;
 resolved SGPRs specialize that prefix out of SPIR-V while unresolved values
 still fail explicitly. The executable memory subset covers signed/unsigned
-byte and short, dword x1/x2/x3/x4, and V# stride-based `idxen` plus `offen`.
+byte and short, MUBUF dword x1/x2/x3/x4 and SMEM dword up to x16, plus V# stride-based `idxen` and `offen`.
 It also covers V# `add_tid` addressing and 32-bit MUBUF exchange, add/subtract,
 signed/unsigned min/max and bitwise atomics. A `glc` atomic writes the old value
 back to its source VGPR, and atomic target ranges participate in the same DCB
