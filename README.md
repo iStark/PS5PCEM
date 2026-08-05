@@ -1040,8 +1040,13 @@ instead of reporting false success.
 
 The Unity support PRXs also receive the small `libkernel_unity`, `libScePosix`,
 RTC, system-parameter, app-content, and network-control bootstrap surface they
-need to relocate. This is linkage coverage, not a claim that filesystems,
-networking, event flags, or semaphores are complete.
+need to relocate. App-content temporary storage is answered by
+`sceAppContentTemporaryDataMount2`, which fills a zero-terminated `/temp0`
+mount point rather than returning `ENOSYS` with an untouched buffer — Unity's
+temporary-file layer builds paths from that string, so leaving it uninitialised
+looks like an unrelated null dereference later. This is still bootstrap
+coverage, not a claim that filesystems, networking, event flags, or semaphores
+are complete.
 
 **Title bootstrap services** ([src/hle/libs/system_service.zig](src/hle/libs/system_service.zig),
 [src/hle/libs/user_service.zig](src/hle/libs/user_service.zig),
@@ -1332,13 +1337,14 @@ the workgroup-ID SGPRs, while the local invocation ID populates `v0..v2` as
 declared. Side-effect-free ALU-only dispatches can be elided, but memory, image,
 atomic, GDS, message and export effects are never discarded by that analysis.
 
-The scene still does not reach a draw. Its next 14-instruction compute kernel is
-a masked indexed dword copy: it loads source base, destination base and element
-count through `s8:s11`, then copies between the V# descriptors in `s0:s3` and
-`s4:s7`. Translation currently rejects that kernel at its dynamically indexed
-scalar/control-flow path, so the queue stops before later drawing commands. This
-is now the first concrete rendering blocker; loading, entropy and absence of GPU
-submission are no longer hypotheses.
+The following 14-instruction kernel — a masked indexed dword copy through the
+V# descriptors in `s0:s3` / `s4:s7` with extent and EXEC masking — is executed
+rather than rejected. Scene bring-up is therefore past "no GPU submission" and
+past that first concrete compute shape. A live headless run of the title still
+faults later in `Il2cppUserAssemblies.prx` on a null object while a VideoOut
+flip worker is waiting on filter `-13`, so the continuous draw/`SetFlip` stream
+is not yet the limiting observation; the guest CPU path has to finish
+initialising the object the IL2CPP code expects.
 
 ## Error codes
 
@@ -1354,15 +1360,20 @@ from leaking into host code where nothing would check it.
 
 ## Roadmap
 
-1. Execute the observed indexed-dword-copy kernel with exact V# bounds and EXEC
-   masking, then resume the same scene DCB rather than starting a new capture.
-2. Follow that DCB to its first draw, adding only the RDNA2 operations, resource
-   descriptors and GDS semantics demonstrated by each next rejected shader.
+1. Clear the IL2CPP null-object fault on the title's main thread so init reaches
+   a stable flip/submit loop rather than dying beside an already-waiting
+   VideoOut worker.
+2. Follow the scene DCB past the executed compute path to its first draw,
+   adding only the RDNA2 operations, resource descriptors and GDS semantics
+   demonstrated by each next rejected shader.
 3. Validate the first color-target write and `SetFlip` as a continuous game
    frame stream, then profile the current all-core spin and remove the hottest
    scheduler or guest-wait loop without changing its synchronization contract.
 4. Retain submission owner metadata across blocked `WAIT_REG_MEM` continuations
    and publish the correct delayed graphics completion event when needed.
+5. On contained guest faults, stop remaining guest workers promptly so a crash
+   does not leave AGC `suspendPoint` loops burning cores until the process is
+   killed.
 
 ---
 
@@ -1579,9 +1590,13 @@ failure.
      11412 sceKernelVirtualQuery(0x202500000, 0x0, ..., 0x48) = 0xffffffff8002000d  <- failure
 ```
 
-Both failure conventions are marked: the `0x8002_00xx` kernel scheme and the
-POSIX `-1`. Zero is deliberately not marked, since too many entry points return
-zero for success.
+Both failure conventions are marked when the entry point returns a **signed**
+status: the `0x8002_00xx` kernel scheme and the POSIX `-1`. Zero is deliberately
+not marked, since too many entry points return zero for success. Unsigned
+returns — process-time counters, sizes, frequencies — are left unmarked even
+when their bit pattern lands in the SCE error range. A few seconds of
+nanoseconds is `0x80e0_2a88`; that is a legitimate counter, not a kernel error,
+and labelling it `<- failure` sends bring-up after the wrong call.
 
 This is what the tooling is for. The trace above says a title reserved a range,
 allocated physical memory for it, failed to map the two together, and then wrote

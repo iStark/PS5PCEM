@@ -19,15 +19,17 @@ fn appContentInitialize(_: ?*const anyopaque, boot_param: ?*[40]u8) callconv(abi
     return errno.ok;
 }
 
-fn temporaryDataMount2(
-    _: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-) callconv(abi.guest) i32 {
-    return errno.KernelError.enosys.raw();
+/// Publishes the per-title scratch mount used by Unity's temporary-file layer.
+///
+/// `sceAppContentTemporaryDataMount2` takes a 32-bit option and a pointer to a
+/// fixed 16-byte mount-point buffer.  Reporting success without filling that
+/// buffer makes the caller construct paths from uninitialised data, which later
+/// appears as an unrelated null dereference in the title.
+fn temporaryDataMount2(_: u32, mount_point: ?*[16]u8) callconv(abi.guest) i32 {
+    const output = mount_point orelse return errno.KernelError.einval.raw();
+    @memset(output, 0);
+    @memcpy(output[0.."/temp0".len], "/temp0");
+    return errno.ok;
 }
 
 fn netCtlInit() callconv(abi.guest) i32 {
@@ -153,4 +155,12 @@ test "network control reports a coherent disconnected console" {
     var info: [256]u8 = [_]u8{0xff} ** 256;
     try std.testing.expectEqual(net_ctl_error_not_connected, netCtlGetInfo(14, &info));
     try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 256), &info);
+}
+
+test "temporary data mount returns a zero-terminated mount point" {
+    var mount_point: [16]u8 = [_]u8{0xff} ** 16;
+    try std.testing.expectEqual(errno.ok, temporaryDataMount2(1, &mount_point));
+    try std.testing.expectEqualStrings("/temp0", std.mem.sliceTo(&mount_point, 0));
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 9), mount_point[7..]);
+    try std.testing.expectEqual(errno.KernelError.einval.raw(), temporaryDataMount2(0, null));
 }

@@ -43,6 +43,13 @@ pub const Record = struct {
     /// false.
     result: u64 = 0,
     returns_value: bool = false,
+    /// Whether the result is a signed status code that can meaningfully fail.
+    ///
+    /// Unsigned returns (process-time counters, sizes, frequencies) share the
+    /// numeric space of SCE error codes once they pass `0x8000_0000`, so they
+    /// must not be marked by the same heuristic. A few seconds of nanoseconds
+    /// is `0x80e0_2a88` — a legitimate counter, not a kernel error.
+    result_is_status: bool = false,
     /// Monotonic call number, so the ring can be read back in order and gaps
     /// from wrapping are visible.
     sequence: u64 = 0,
@@ -184,7 +191,9 @@ fn emit(record: Record) void {
     std.debug.print(")", .{});
     if (record.returns_value) {
         std.debug.print(" = 0x{x}", .{record.result});
-        if (looksLikeFailure(record.result)) std.debug.print("  <- failure", .{});
+        if (record.result_is_status and looksLikeFailure(record.result)) {
+            std.debug.print("  <- failure", .{});
+        }
     }
     std.debug.print("\n", .{});
 }
@@ -541,6 +550,14 @@ fn enter(comptime name: []const u8, arguments: []const u64) void {
 ///
 /// The result is evaluated by the caller before this runs, so a function that
 /// never returns is never recorded — which is correct: it did not complete.
+fn resultIsStatus(comptime Result: type) bool {
+    return switch (@typeInfo(Result)) {
+        .int => |i| i.signedness == .signed,
+        .@"enum" => |e| @typeInfo(e.tag_type).int.signedness == .signed,
+        else => false,
+    };
+}
+
 fn finish(comptime name: []const u8, result: anytype, arguments: []const u64) @TypeOf(result) {
     const Result = @TypeOf(result);
     var record = Record{ .name = name, .argument_count = @intCast(arguments.len) };
@@ -548,6 +565,7 @@ fn finish(comptime name: []const u8, result: anytype, arguments: []const u64) @T
     if (Result != void) {
         record.result = word(result);
         record.returns_value = true;
+        record.result_is_status = resultIsStatus(Result);
     }
     store(record);
     return result;
@@ -595,7 +613,9 @@ pub fn write(w: *std.Io.Writer, limit: usize) std.Io.Writer.Error!void {
         try w.writeAll(")");
         if (record.returns_value) {
             try w.print(" = 0x{x}", .{record.result});
-            if (looksLikeFailure(record.result)) try w.writeAll("  <- failure");
+            if (record.result_is_status and looksLikeFailure(record.result)) {
+                try w.writeAll("  <- failure");
+            }
         }
         try w.writeAll("\n");
     }
@@ -758,6 +778,27 @@ test "kernel error codes are marked as failures" {
     try testing.expect(!looksLikeFailure(0x0000_0070_0012_7ed8));
     // Nor a plausible handle in the guest's high window.
     try testing.expect(!looksLikeFailure(0x0000_0801_8942_d0));
+}
+
+test "unsigned counter returns are not flagged as status failures" {
+    reset();
+    setEnabled(true);
+
+    // Same bit pattern as a few seconds of nanoseconds — and as some SCE
+    // facility errors. Only the signed return path may mark it as failure.
+    const counter_bits: u64 = 0x80e0_2a88;
+    try testing.expect(looksLikeFailure(counter_bits));
+
+    const traced = wrap("sceKernelGetProcessTimeCounter", &addTwo);
+    const typed: *const fn (u64, u64) callconv(abi.guest) u64 = @ptrCast(traced);
+    _ = typed(counter_bits, 0);
+
+    var buffer: [4]Record = undefined;
+    const records = recent(&buffer);
+    try testing.expectEqual(@as(usize, 1), records.len);
+    try testing.expect(records[0].returns_value);
+    try testing.expect(!records[0].result_is_status);
+    try testing.expectEqual(counter_bits, records[0].result);
 }
 
 test "a failing call is recorded and flagged" {
