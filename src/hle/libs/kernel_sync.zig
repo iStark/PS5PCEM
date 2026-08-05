@@ -438,19 +438,27 @@ pub const Manager = struct {
     }
 };
 
-var attached_manager: ?*Manager = null;
-var attach_lock: Lock = .{};
+/// The thread manager every synchronization entry point works through.
+///
+/// Held as an atomic pointer rather than behind a lock. Reading it is the first
+/// thing every mutex, condition and lock operation does, so a lock here is
+/// taken by every guest thread for every one of those calls — and this one was
+/// a spin lock, which does not yield. On a title with fifty threads that turns
+/// the busiest path in the emulator into a queue the whole machine spins in:
+/// measured on the title under test, sixteen cores fully busy while it managed
+/// a third of a frame per second.
+///
+/// Mutual exclusion buys nothing here anyway. There is one pointer, readers
+/// only read it, and a reader that races an attach sees either the old manager
+/// or the new one — which is exactly what the lock guaranteed.
+var attached_manager: std.atomic.Value(?*Manager) = .init(null);
 
 pub fn attachManager(new_manager: ?*Manager) void {
-    attach_lock.lock();
-    defer attach_lock.unlock();
-    attached_manager = new_manager;
+    attached_manager.store(new_manager, .release);
 }
 
 fn activeManager() ?*Manager {
-    attach_lock.lock();
-    defer attach_lock.unlock();
-    return attached_manager;
+    return attached_manager.load(.acquire);
 }
 
 fn findPointer(comptime T: type, objects: []const *T, handle: ?*T) ?*T {
@@ -1601,3 +1609,4 @@ test "synchronization exports register under published identifiers" {
     try testing.expect(db.findById("27bAgiJmOh0", .function) != null);
     try testing.expect(db.findById("1471ajPzxh0", .function) != null);
 }
+
