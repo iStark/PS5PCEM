@@ -60,6 +60,8 @@ const runtime_api = @import("kernel_runtime.zig");
 const filesystem = @import("../filesystem.zig");
 const graphics_device = @import("../graphics_device.zig");
 const memory = @import("kernel_memory.zig");
+const gpu = @import("gpu");
+const agc_submit = @import("agc_submit.zig");
 
 /// Which way the payload travels, from the caller's point of view.
 pub const Direction = enum {
@@ -267,6 +269,88 @@ fn answerGraphicsServiceQuery(request: Request, payload: u64) bool {
     return true;
 }
 
+/// Words in the descriptor through which graphics work is handed over.
+const submit_descriptor_words: u16 = 72 / @sizeOf(u32);
+
+/// One command stream the descriptor points at.
+const IndirectBuffer = struct {
+    address: u64,
+    /// Length in words. The field also carries flags above the length, which
+    /// select caching and privilege and say nothing about where the stream ends.
+    words: u32,
+};
+
+/// Length occupies the low twenty bits of an indirect buffer's size field.
+const indirect_buffer_length_mask: u32 = 0x000f_ffff;
+
+/// Finds the command streams a submission descriptor names.
+///
+/// The descriptor's own structure is not established, so it is searched rather
+/// than parsed: an indirect-buffer packet identifies itself, and does so on
+/// three counts at once — packet type, opcode, and a body length that has to be
+/// exactly the three words holding its address and size. Guessing a struct
+/// layout would risk reading a length as an address; this cannot.
+fn collectIndirectBuffers(descriptor: []const u32, out: []IndirectBuffer) usize {
+    var found: usize = 0;
+    var index: usize = 0;
+    while (index + 3 < descriptor.len and found < out.len) : (index += 1) {
+        const word = descriptor[index];
+        if (word >> 30 != 3) continue;
+        const opcode: u8 = @truncate(word >> 8);
+        if (opcode != gpu.pm4.indirect_buffer) continue;
+        if ((word >> 16) & 0x3fff != 2) continue;
+
+        const address = (@as(u64, descriptor[index + 2]) << 32) | descriptor[index + 1];
+        const words = descriptor[index + 3] & indirect_buffer_length_mask;
+        if (address == 0 or words == 0) continue;
+
+        out[found] = .{ .address = address, .words = words };
+        found += 1;
+        index += 3;
+    }
+    return found;
+}
+
+/// Carries out the request the shipped driver submits graphics work through.
+///
+/// The payload is a small command stream of its own whose indirect buffers name
+/// where the real work lives. Each is read out of guest memory and run.
+///
+/// A stream whose memory cannot be reached is reported rather than passed on.
+/// The driver addresses its buffers through an aperture it established with the
+/// device, and until that mapping is modelled some of those addresses name
+/// nothing here — saying which one, and how long it was, is what turns that from
+/// a silent refusal into something that can be acted on.
+fn answerGraphicsSubmit(request: Request, payload: u64) bool {
+    if (request.group != 0x81 or request.number != 49) return false;
+    if (request.direction != .read_write or request.length != 72) return false;
+    if (!memory.isGuestRangeAccessible(payload, request.length)) return false;
+
+    const words: [*]const u32 = @ptrFromInt(payload);
+    const descriptor = words[0..submit_descriptor_words];
+
+    var buffers: [8]IndirectBuffer = undefined;
+    const found = collectIndirectBuffers(descriptor, &buffers);
+    if (found == 0) return false;
+
+    var ran: usize = 0;
+    for (buffers[0..found]) |buffer| {
+        const bytes = @as(u64, buffer.words) * @sizeOf(u32);
+        if (!memory.isGuestRangeAccessible(buffer.address, bytes)) {
+            if (trace.announces("ioctl")) {
+                std.debug.print(
+                    "[gc submit] stream at 0x{x} ({d} dwords) is not reachable\n",
+                    .{ buffer.address, buffer.words },
+                );
+            }
+            continue;
+        }
+        const stream: [*]const u32 = @ptrFromInt(buffer.address);
+        if (agc_submit.submitDeviceStream(stream[0..buffer.words])) ran += 1;
+    }
+    return ran != 0;
+}
+
 fn answerGraphicsSuspendQuery(request: Request, payload: u64) bool {
     if (request.group != 0x81 or request.number != 57) return false;
     if (request.direction != .read_write or request.length != 16) return false;
@@ -339,6 +423,7 @@ fn ioctl(descriptor: i32, request_code: u64, payload: u64) callconv(abi.guest) i
     if (device == .graphics and answerGraphicsSuspendQuery(request, payload)) return 0;
     if (device == .graphics and answerGraphicsTfRing(request, payload)) return 0;
     if (device == .graphics and answerGraphicsHsOffchip(request, payload)) return 0;
+    if (device == .graphics and answerGraphicsSubmit(request, payload)) return 0;
     if (device == .dip_switches and answerDipSwitch(request, payload)) return 0;
 
     runtime_api.setPosixErrno(errno.Posix.enotty);
@@ -437,6 +522,64 @@ test "an unprintable group is written as a number" {
     var w = std.Io.Writer.fixed(&buffer);
     try write(decode(encode(direction_void, 0x01, 3, 0)), 9, null, &w);
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "0x01") != null);
+}
+
+/// Builds the indirect-buffer packet a submission descriptor carries.
+fn indirectBufferPacket(address: u64, words: u32) [4]u32 {
+    return .{
+        (@as(u32, 3) << 30) | (@as(u32, 2) << 16) | (@as(u32, gpu.pm4.indirect_buffer) << 8),
+        @truncate(address),
+        @truncate(address >> 32),
+        words,
+    };
+}
+
+test "the streams a submission names are found without parsing its shape" {
+    // The descriptor's own structure is not established, so it is searched. An
+    // indirect-buffer packet identifies itself on three counts at once — type,
+    // opcode, and a body length that has to be exactly its address and size.
+    const first = indirectBufferPacket(0x0f_e000_0000, 150);
+    const second = indirectBufferPacket(0x0f_e003_a200, 2);
+    const descriptor = [_]u32{
+        0,
+        // A command that is not an indirect buffer, which must be stepped over.
+        (@as(u32, 3) << 30) | (@as(u32, 1) << 16) | (@as(u32, gpu.pm4.context_control) << 8),
+        0,
+        0,
+    } ++ first ++ [_]u32{ 0, 0, 0, 0 } ++ second ++ [_]u32{1};
+
+    var found: [8]IndirectBuffer = undefined;
+    const count = collectIndirectBuffers(&descriptor, &found);
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expectEqual(@as(u64, 0x0f_e000_0000), found[0].address);
+    try testing.expectEqual(@as(u32, 150), found[0].words);
+    try testing.expectEqual(@as(u64, 0x0f_e003_a200), found[1].address);
+    try testing.expectEqual(@as(u32, 2), found[1].words);
+}
+
+test "flags above a stream's length are not read as length" {
+    // The size field carries caching and privilege bits above the twenty that
+    // hold the length. Taking the whole word would submit a stream millions of
+    // words long, reaching far past the memory the title set aside.
+    const packet = indirectBufferPacket(0x1000, 0x3000_0096);
+    const descriptor = [_]u32{0} ++ packet;
+
+    var found: [2]IndirectBuffer = undefined;
+    try testing.expectEqual(@as(usize, 1), collectIndirectBuffers(&descriptor, &found));
+    try testing.expectEqual(@as(u32, 0x96), found[0].words);
+}
+
+test "a descriptor naming nothing yields nothing" {
+    var found: [4]IndirectBuffer = undefined;
+    const empty = [_]u32{0} ** submit_descriptor_words;
+    try testing.expectEqual(@as(usize, 0), collectIndirectBuffers(&empty, &found));
+
+    // An indirect buffer with no address or no length names no stream, and
+    // running one would read from wherever zero happens to land.
+    const null_address = [_]u32{0} ++ indirectBufferPacket(0, 8);
+    try testing.expectEqual(@as(usize, 0), collectIndirectBuffers(&null_address, &found));
+    const empty_stream = [_]u32{0} ++ indirectBufferPacket(0x2000, 0);
+    try testing.expectEqual(@as(usize, 0), collectIndirectBuffers(&empty_stream, &found));
 }
 
 test "a request is refused rather than silently accepted" {

@@ -570,6 +570,17 @@ fn announce(label: []const u8, stream: []const u32) void {
     );
 }
 
+/// Runs a command stream handed over through the kernel device.
+///
+/// The shipped driver submits through `/dev/gc` rather than through the library
+/// entry points, so this is the same work arriving by a different door. It goes
+/// to the same scheduler, because the door a stream came through says nothing
+/// about what it contains.
+pub fn submitDeviceStream(stream: []const u32) bool {
+    announce("dcb", stream);
+    return executeSubmitted("dcb", stream);
+}
+
 /// Queues one submitted buffer and advances both command processors. A blocked
 /// head retains its exact root/indirect continuation; a real release-label
 /// write from the other queue makes the following pump resume it in place.
