@@ -25,6 +25,15 @@ pub const StorageBufferBinding = struct {
     swizzled: bool = false,
     index_stride: u8 = 0,
     add_thread_id: bool = false,
+    /// How many bytes the descriptor says the buffer holds, when the caller
+    /// knows. The hardware answers an access past this with zero on a read and
+    /// drops it on a write, rather than touching whatever lies beyond — a shader
+    /// that indexes past the end is a normal thing for one to do, because the
+    /// bound is how it discovers where the data stopped.
+    ///
+    /// Null leaves the access unchecked, which is what a caller that has not
+    /// recovered the descriptor should say rather than guessing a size.
+    extent_bytes: ?u32 = null,
 };
 
 pub const SampledImageBinding = struct {
@@ -124,6 +133,10 @@ const Builder = struct {
     storage_array: u32 = 0,
     storage_word_pointer_type: u32 = 0,
     local_invocation_index: u32 = 0,
+    /// The execution mask, as low and high halves, once a shader has narrowed
+    /// it. Null means untouched — every lane on — which is how a wave starts
+    /// and needs no test emitted for it.
+    exec_mask: ?[2]u32 = null,
     workgroup_id_input: u32 = 0,
     local_invocation_id_input: u32 = 0,
     compute_inputs: ?ComputeInputs,
@@ -684,10 +697,54 @@ const Builder = struct {
         return self.bufferAddressDelta(inst, 0);
     }
 
-    fn bufferWordPointer(self: *Builder, address: BufferAddress, delta: u32) Error!u32 {
+    /// Whether a word access lies inside what the descriptor describes.
+    ///
+    /// Null when the caller supplied no extent, which means every access is
+    /// taken as valid — the same behaviour as before a bound was known.
+    fn wordInRange(self: *Builder, address: BufferAddress, delta: u32) Error!?u32 {
+        const extent = address.binding.extent_bytes orelse return null;
+        // The last byte this word touches, so a word straddling the end counts
+        // as outside rather than half inside.
+        const last = try self.addBits(address.byte_offset, try self.constant(.bits32, delta * 4 + 3));
+        const result = self.id();
+        try self.emit(&self.body, 176, &.{ // OpULessThan
+            self.bool_type,
+            result,
+            last,
+            try self.constant(.bits32, extent),
+        });
+        return result;
+    }
+
+    /// A word access: where it is, and whether it is really there.
+    const WordAccess = struct {
+        pointer: u32,
+        /// Null when the descriptor carried no extent, so nothing was checked.
+        in_range: ?u32,
+    };
+
+    fn bufferWordAccess(self: *Builder, address: BufferAddress, delta: u32) Error!WordAccess {
         const word_index = self.id();
         try self.emit(&self.body, 194, &.{ self.bits_type, word_index, address.byte_offset, try self.constant(.bits32, 2) }); // OpShiftRightLogical
         const indexed_word = if (delta == 0) word_index else try self.addBits(word_index, try self.constant(.bits32, delta));
+
+        const in_range = try self.wordInRange(address, delta);
+        // Steered to the first word when out of range. The value there is never
+        // used — a read past the end selects zero and a write past it is
+        // skipped — but the access is emitted either way, and an access chain
+        // that leaves a bound buffer is not defined. Naming a word that exists
+        // keeps the undefined case from arising at all.
+        const safe_word = if (in_range) |predicate| blk: {
+            const chosen = self.id();
+            try self.emit(&self.body, 169, &.{ // OpSelect
+                self.bits_type,
+                chosen,
+                predicate,
+                indexed_word,
+                try self.constant(.bits32, 0),
+            });
+            break :blk chosen;
+        } else indexed_word;
 
         const pointer = self.id();
         try self.emit(&self.body, 65, &.{
@@ -696,15 +753,117 @@ const Builder = struct {
             self.storage_array,
             try self.constant(.bits32, address.binding.descriptor_index),
             try self.constant(.bits32, 0),
-            indexed_word,
+            safe_word,
         }); // OpAccessChain descriptor, block member, dword
-        return pointer;
+        return .{ .pointer = pointer, .in_range = in_range };
+    }
+
+    fn bufferWordPointer(self: *Builder, address: BufferAddress, delta: u32) Error!u32 {
+        return (try self.bufferWordAccess(address, delta)).pointer;
     }
 
     fn loadBufferWord(self: *Builder, address: BufferAddress, delta: u32) Error!u32 {
+        const access = try self.bufferWordAccess(address, delta);
+        const loaded = self.id();
+        try self.emit(&self.body, 61, &.{ self.bits_type, loaded, access.pointer }); // OpLoad
+        const predicate = access.in_range orelse return loaded;
+
+        // Zero past the end, which is what the hardware returns. A shader reads
+        // beyond its data on purpose — the bound is how it finds where the data
+        // stopped — so this is an ordinary answer rather than an error.
         const result = self.id();
-        try self.emit(&self.body, 61, &.{ self.bits_type, result, try self.bufferWordPointer(address, delta) }); // OpLoad
+        try self.emit(&self.body, 169, &.{ // OpSelect
+            self.bits_type,
+            result,
+            predicate,
+            loaded,
+            try self.constant(.bits32, 0),
+        });
         return result;
+    }
+
+    /// Writes a word only where the descriptor says there is one.
+    ///
+    /// A store past the end is dropped by the hardware. It cannot be dropped
+    /// with a select here, because a select still stores — so the store is put
+    /// behind a branch, which is the only way SPIR-V has of not doing one.
+    fn storeBufferWord(self: *Builder, address: BufferAddress, delta: u32, value: u32) Error!void {
+        const access = try self.bufferWordAccess(address, delta);
+        const predicate = try self.writePredicate(access.in_range) orelse {
+            try self.emit(&self.body, 62, &.{ access.pointer, value }); // OpStore
+            return;
+        };
+        try self.guardedStore(predicate, access.pointer, value);
+    }
+
+    /// Whether this invocation is a lane the execution mask has switched on.
+    ///
+    /// A wave runs all its lanes together and uses the mask to say which of them
+    /// count; a SPIR-V invocation *is* one lane, so the mask becomes a question
+    /// asked of the lane's own index. Null while the mask is untouched, which is
+    /// every lane enabled and needs no test.
+    fn laneEnabled(self: *Builder) Error!?u32 {
+        const mask = self.exec_mask orelse return null;
+        if (self.local_invocation_index == 0) return Error.UnsupportedControlFlow;
+
+        const invocation = self.id();
+        try self.emit(&self.body, 61, &.{ self.bits_type, invocation, self.local_invocation_index }); // OpLoad
+        const lane = try self.andBits(invocation, 63);
+
+        // The mask is sixty-four bits and a lane index is six, so which half a
+        // lane lives in is itself part of the question.
+        const half = try self.shiftRightBits(lane, 5);
+        const within = try self.andBits(lane, 31);
+        const chosen = self.id();
+        try self.emit(&self.body, 169, &.{ // OpSelect
+            self.bits_type,
+            chosen,
+            try self.isNonZero(half),
+            mask[1],
+            mask[0],
+        });
+
+        const bit = try self.andBits(try self.shiftRightVariable(chosen, within), 1);
+        return try self.isNonZero(bit);
+    }
+
+    fn isNonZero(self: *Builder, value: u32) Error!u32 {
+        const result = self.id();
+        try self.emit(&self.body, 171, &.{ // OpINotEqual
+            self.bool_type,
+            result,
+            value,
+            try self.constant(.bits32, 0),
+        });
+        return result;
+    }
+
+    fn shiftRightVariable(self: *Builder, value: u32, amount: u32) Error!u32 {
+        const result = self.id();
+        try self.emit(&self.body, 194, &.{ self.bits_type, result, value, amount }); // OpShiftRightLogical
+        return result;
+    }
+
+    /// Combines the execution mask with whatever else has to hold for a write.
+    fn writePredicate(self: *Builder, in_range: ?u32) Error!?u32 {
+        const lane = try self.laneEnabled();
+        const range = in_range orelse return lane;
+        const enabled = lane orelse return range;
+        const result = self.id();
+        try self.emit(&self.body, 167, &.{ self.bool_type, result, enabled, range }); // OpLogicalAnd
+        return result;
+    }
+
+    /// Emits `if (predicate) store` as a structured selection.
+    fn guardedStore(self: *Builder, predicate: u32, pointer: u32, value: u32) Error!void {
+        const taken = self.id();
+        const merge = self.id();
+        try self.emit(&self.body, 247, &.{ merge, 0 }); // OpSelectionMerge
+        try self.emit(&self.body, 250, &.{ predicate, taken, merge }); // OpBranchConditional
+        try self.emit(&self.body, 248, &.{taken}); // OpLabel
+        try self.emit(&self.body, 62, &.{ pointer, value }); // OpStore
+        try self.emit(&self.body, 249, &.{merge}); // OpBranch
+        try self.emit(&self.body, 248, &.{merge}); // OpLabel
     }
 
     fn bufferLoadWords(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
@@ -722,7 +881,7 @@ const Builder = struct {
         for (0..count) |index| {
             const value = try self.source(try consecutiveRegister(inst.dst, @intCast(index)), .bits32);
             const address = try self.bufferAddressDelta(inst, @intCast(index * 4));
-            try self.emit(&self.body, 62, &.{ try self.bufferWordPointer(address, 0), value }); // OpStore
+            try self.storeBufferWord(address, 0, value);
         }
     }
 
@@ -785,7 +944,8 @@ const Builder = struct {
     }
 
     fn storeBufferByte(self: *Builder, address: BufferAddress, value: u32) Error!void {
-        const pointer = try self.bufferWordPointer(address, 0);
+        const access = try self.bufferWordAccess(address, 0);
+        const pointer = access.pointer;
         const current = self.id();
         try self.emit(&self.body, 61, &.{ self.bits_type, current, pointer });
         const shift = try self.subwordShift(address.byte_offset);
@@ -800,7 +960,14 @@ const Builder = struct {
         try self.emit(&self.body, 196, &.{ self.bits_type, inserted, masked_value, shift });
         const combined = self.id();
         try self.emit(&self.body, 197, &.{ self.bits_type, combined, preserved, inserted }); // OpBitwiseOr
-        try self.emit(&self.body, 62, &.{ pointer, combined });
+        // A byte write past the end must not disturb the word it was clamped
+        // onto, so the read-modify-write is computed either way and only the
+        // store is withheld.
+        if (try self.writePredicate(access.in_range)) |predicate| {
+            try self.guardedStore(predicate, pointer, combined);
+        } else {
+            try self.emit(&self.body, 62, &.{ pointer, combined });
+        }
     }
 
     fn bufferStoreSubword(self: *Builder, inst: instruction.Instruction, width: u8) Error!void {
@@ -823,6 +990,21 @@ const Builder = struct {
         };
     }
 
+    /// Takes a write to the execution mask, and says whether it did.
+    ///
+    /// Only the plain move is taken. The read-modify-write forms that fold a
+    /// comparison into the mask carry a scalar result as well, and answering
+    /// half of one would leave the shader believing a value it never received.
+    fn lowerExecutionMask(self: *Builder, inst: instruction.Instruction) Error!bool {
+        if (inst.dst.kind != .exec_lo) return false;
+        if (inst.opcode != .s_mov_b64) return Error.UnsupportedControlFlow;
+
+        const low = try self.source(inst.src0, .bits32);
+        const high = try self.source(try consecutiveRegister(inst.src0, 1), .bits32);
+        self.exec_mask = .{ low, high };
+        return true;
+    }
+
     fn snapshot(self: *const Builder) State {
         return .{ .registers = self.registers, .scc = self.scc, .valid = true };
     }
@@ -834,6 +1016,7 @@ const Builder = struct {
 
     fn lower(self: *Builder, inst: instruction.Instruction) Error!void {
         if (inst.dst.clamp or inst.dst.omod != 0) return Error.UnsupportedOpcode;
+        if (try self.lowerExecutionMask(inst)) return;
         if (self.specializedScalarDestination(inst)) return;
         switch (inst.opcode) {
             .s_nop, .s_waitcnt, .s_barrier, .s_inst_prefetch, .v_nop, .s_endpgm => {},
