@@ -1362,6 +1362,14 @@ pub const Renderer = struct {
             local_size,
             group_count,
         )) |report| return report;
+        if (try self.tryEmulateBufferCopy(
+            memory,
+            state,
+            &analysis,
+            system_registers,
+            local_size,
+            group_count,
+        )) |report| return report;
         if (!analysis.hasExternalEffects()) {
             self.elided_dispatches += 1;
             std.debug.print(
@@ -1530,6 +1538,65 @@ pub const Renderer = struct {
         std.debug.print(
             "[vulkan dcb] emulated GDS initialization: {d} writes, value=0x{x}\n",
             .{ writes, fill_value },
+        );
+        return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
+    }
+
+    fn tryEmulateBufferCopy(
+        self: *Renderer,
+        memory: GuestMemory,
+        state: *const gpu.State,
+        analysis: *const gpu.ShaderAnalysis,
+        system: gpu.resources.ComputeSystemRegisters,
+        local_size: [3]u32,
+        group_count: [3]u32,
+    ) anyerror!?DispatchReport {
+        _ = system;
+        
+        const inst = analysis.program.instructions.items;
+        if (inst.len != 14 or
+            inst[0].opcode != .s_inst_prefetch or
+            inst[1].opcode != .v_lshl_add_u32 or
+            inst[2].opcode != .s_buffer_load_dword or
+            inst[3].opcode != .s_waitcnt or
+            inst[4].opcode != .v_cmpx_gt_u32 or
+            inst[5].opcode != .s_cbranch_execz or
+            inst[6].opcode != .s_buffer_load_dwordx2 or
+            inst[7].opcode != .s_waitcnt or
+            inst[8].opcode != .v_add_nc_u32 or
+            inst[9].opcode != .v_add_nc_u32 or
+            inst[10].opcode != .buffer_load_format_x or
+            inst[11].opcode != .s_waitcnt or
+            inst[12].opcode != .buffer_store_format_x or
+            inst[13].opcode != .s_endpgm)
+        {
+            return null;
+        }
+
+        const source_desc = try descriptorFromComputeUserData(state, 0);
+        const dest_desc = try descriptorFromComputeUserData(state, 4);
+        const control = try descriptorFromComputeUserData(state, 8);
+        if (control.address == 0) return null;
+
+        const dest_offset = try readGuestU32(memory, control.address + 0);
+        const src_offset = try readGuestU32(memory, control.address + 4);
+        const element_count = try readGuestU32(memory, control.address + 8);
+
+        const dispatched = std.math.mul(u64, group_count[0], local_size[0]) catch return Error.GuestBufferTooLarge;
+        const copies: usize = @intCast(@min(@as(u64, element_count), dispatched));
+
+        const src_stride = if (source_desc.stride == 0) 4 else source_desc.stride;
+        const dest_stride = if (dest_desc.stride == 0) 4 else dest_desc.stride;
+
+        for (0..copies) |i| {
+            const value = try readGuestU32(memory, source_desc.address + (src_offset + i) * src_stride);
+            try writeGuestU32(memory, dest_desc.address + (dest_offset + i) * dest_stride, value);
+        }
+
+        self.elided_dispatches += 1;
+        std.debug.print(
+            "[vulkan dcb] emulated buffer copy: {d} elements from 0x{x} to 0x{x}\n",
+            .{ copies, source_desc.address, dest_desc.address },
         );
         return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
     }
@@ -3180,6 +3247,12 @@ fn readGuestU32(memory: GuestMemory, address: u64) Error!u32 {
     var bytes: [4]u8 = undefined;
     if (!memory.read(memory.context, address, &bytes)) return Error.GuestMemoryReadFailed;
     return std.mem.readInt(u32, &bytes, .little);
+}
+
+fn writeGuestU32(memory: GuestMemory, address: u64, value: u32) Error!void {
+    var bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &bytes, value, .little);
+    if (!memory.write(memory.context, address, &bytes)) return Error.GuestMemoryWriteFailed;
 }
 
 fn computeLocalSize(state: *const gpu.State, register: u32) u32 {
