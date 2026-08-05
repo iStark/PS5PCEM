@@ -390,6 +390,10 @@ const Builder = struct {
         return switch (op.kind) {
             .sgpr => if (op.reg < 128) @intCast(op.reg) else null,
             .vgpr => if (op.reg < 256) @intCast(128 + op.reg) else null,
+            .vcc_lo => 106,
+            .vcc_hi => 107,
+            .exec_lo => 126,
+            .exec_hi => 127,
             else => null,
         };
     }
@@ -647,9 +651,20 @@ const Builder = struct {
     }
 
     fn consecutiveRegister(op: operand.Operand, delta: u32) Error!operand.Operand {
-        if (op.kind != .vgpr or op.reg + delta >= 256) return Error.UnsupportedBufferAddressing;
         var result = op;
-        result.reg += delta;
+        if (op.kind == .vgpr) {
+            if (op.reg + delta >= 256) return Error.UnsupportedBufferAddressing;
+            result.reg += delta;
+        } else if (op.kind == .sgpr) {
+            if (op.reg + delta >= 128) return Error.UnsupportedBufferAddressing;
+            result.reg += delta;
+        } else if (op.kind == .vcc_lo) {
+            if (delta == 1) result.kind = .vcc_hi else if (delta != 0) return Error.UnsupportedBufferAddressing;
+        } else if (op.kind == .exec_lo) {
+            if (delta == 1) result.kind = .exec_hi else if (delta != 0) return Error.UnsupportedBufferAddressing;
+        } else {
+            return Error.UnsupportedBufferAddressing;
+        }
         return result;
     }
 
