@@ -12,6 +12,9 @@ pub const SpirvOptions = rdna2.spirv.Options;
 pub const SpirvStorageBufferBinding = rdna2.spirv.StorageBufferBinding;
 pub const SpirvSampledImageBinding = rdna2.spirv.SampledImageBinding;
 pub const SpirvScalarRegister = rdna2.spirv.ScalarRegister;
+pub const SpirvComputeInputs = rdna2.spirv.ComputeInputs;
+pub const Operand = rdna2.Operand;
+pub const OperandKind = rdna2.OperandKind;
 
 pub const Error = shaders.Error || rdna2.Error || rdna2.control_flow.Error || std.mem.Allocator.Error || error{
     InstructionLimitExceeded,
@@ -37,6 +40,64 @@ pub const Analysis = struct {
             if (node.operation == .opaque_instruction) result += 1;
         }
         return result;
+    }
+
+    /// Whether a compute program can change state visible after its workgroup
+    /// ends. LDS-only writes are deliberately excluded because that storage
+    /// dies with the dispatch unless another instruction exports it.
+    pub fn hasExternalEffects(self: *const Analysis) bool {
+        for (self.program.instructions.items) |inst| {
+            if (inst.family == .ds and inst.gds) return true;
+            switch (inst.opcode) {
+                .buffer_store_format_x,
+                .buffer_store_format_xy,
+                .buffer_store_format_xyz,
+                .buffer_store_format_xyzw,
+                .buffer_store_byte,
+                .buffer_store_short,
+                .buffer_store_dword,
+                .buffer_store_dwordx2,
+                .buffer_store_dwordx3,
+                .buffer_store_dwordx4,
+                .buffer_atomic_swap,
+                .buffer_atomic_add,
+                .buffer_atomic_sub,
+                .buffer_atomic_smin,
+                .buffer_atomic_umin,
+                .buffer_atomic_smax,
+                .buffer_atomic_umax,
+                .buffer_atomic_and,
+                .buffer_atomic_or,
+                .buffer_atomic_xor,
+                .tbuffer_store_format_x,
+                .tbuffer_store_format_xy,
+                .tbuffer_store_format_xyz,
+                .tbuffer_store_format_xyzw,
+                .flat_store_byte,
+                .flat_store_short,
+                .flat_store_dword,
+                .flat_store_dwordx2,
+                .flat_store_dwordx3,
+                .flat_store_dwordx4,
+                .image_store,
+                .image_store_mip,
+                .image_atomic_add,
+                .image_atomic_umin,
+                .image_atomic_umax,
+                .image_atomic_and,
+                .image_atomic_or,
+                .image_atomic_xor,
+                .s_sendmsg,
+                .exp,
+                => return true,
+                .unsupported => switch (inst.family) {
+                    .vop1, .vop2, .vop3, .vop3p, .vopc, .vintrp => {},
+                    else => return true,
+                },
+                else => {},
+            }
+        }
+        return false;
     }
 
     pub fn translateSpirv(
@@ -132,6 +193,18 @@ test "analysis reads through literals and owns CFG plus typed IR" {
     var spirv = try analysis.translateSpirv(std.testing.allocator, .{ .stage = .compute });
     defer spirv.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 0x0723_0203), spirv.words[0]);
+    try std.testing.expect(!analysis.hasExternalEffects());
+}
+
+test "analysis identifies a global buffer store as externally visible" {
+    var memory = TestMemory{};
+    memory.word(0, 0xe000_0000 | (@as(u32, 0x1c) << 18)); // buffer_store_dword
+    memory.word(4, 0); // vdata=v0, vaddr=v0, srsrc=s0, soffset=0
+    memory.word(8, 0xbf81_0000);
+    var analysis = try decode(std.testing.allocator, memory.reader(), 0, 16);
+    defer analysis.deinit(std.testing.allocator);
+
+    try std.testing.expect(analysis.hasExternalEffects());
 }
 
 test "analysis enforces its instruction safety limit" {

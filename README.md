@@ -534,7 +534,9 @@ The PM4 synchronization callbacks currently choose correctness over overlap:
 acquire, release, write-data and event operations wait for the queue to become
 idle before publishing guest-visible labels or data. The executor remains
 responsible for deciding whether `WAIT_REG_MEM` is satisfied and preserving its
-continuation. Completed linear frames are retained by guest render-target
+continuation. `RELEASE_MEM` immediate 32/64-bit values and clock/counter
+selections publish their exact-width result only after Vulkan work completes;
+reserved data selections are rejected. Completed linear frames are retained by guest render-target
 address. `SetFlip` waits for completion, resolves its registered VideoOut slot,
 and sends the matching frame, dimensions, address and flip metadata to an
 optional `PresentationSink`.
@@ -1271,6 +1273,16 @@ that queue remain FIFO-ordered. The other queue continues, and a real release
 label makes the scheduler recheck and resume the blocked stream without
 replaying earlier side effects or forcing memory to a satisfying value.
 
+The title's shipped driver uses three consecutive `/dev/gc` operations for this
+path. Command `#49` has an exact 72-byte preamble layout and reports completion
+through the word at byte 64. Command `#50` has a 24-byte queue-list layout whose
+entries are packed 16-byte indirect-buffer descriptors; command `#51` commits
+the queue through an 8-byte payload. All three result sentinels are cleared only
+after their checked operation is accepted. A `#50` descriptor names the whole
+reserved ring allocation rather than only its producer prefix, so the executor
+stops at the driver's exact `0xffff1000` uncommitted-tail marker. Other malformed
+packets are not clipped or reinterpreted as that marker.
+
 The AGC driver's event-queue API now registers and deletes graphics filter
 `-14`, decodes event type and context ID from the fields used by that filter,
 and retains the caller's user data. A graphics completion is published under ID
@@ -1305,16 +1317,28 @@ callback without an invalid packet or a stopped queue.
 
 The backported Terminator test with its complete directory supplied through
 `--app0` now creates the Vulkan VideoOut window, loads all six executable images,
-registers queues 32–87, and streams the Unity metadata and asset files through
-APR without the previous resource-corruption or VideoOut-label errors. A
-120-second live run remains alive until it is stopped by the test harness and
-does not reject any observed graphics-device request. It reaches the asset,
-audio and worker synchronization loop, but this is not yet a rendered game
-frame: the complete-content path never calls AGC event registration or submits
-an observable DCB/ACB during that interval. The current title-facing boundary is
-therefore above the GPU API. The next trace must identify which Unity render-job
-or synchronization condition prevents the first submission instead of guessing
-another PM4 or Vulkan command before the title supplies one.
+registers queues 32–87, and completes 503 positional reads of Unity metadata and
+assets without an I/O refusal. The earlier repeated 16-packet preambles were not
+empty frames: they were command `#49`, while the scene indirect buffers arrived
+separately through the then-unknown command `#50`. With its ABI restored, the
+first scene DCB reaches the persistent PM4 tracker and Vulkan executor.
+
+That DCB now passes its timestamp `RELEASE_MEM` and first real compute dispatch.
+The latter is a 14-instruction, 96-workgroup initializer which reads 6,112 guest
+addresses and writes zero to the corresponding persistent 64 KiB GDS locations;
+it is executed by a shape- and descriptor-checked semantic path. Compute system
+inputs are also reconstructed from `COMPUTE_PGM_RSRC2`: user-SGPR count determines
+the workgroup-ID SGPRs, while the local invocation ID populates `v0..v2` as
+declared. Side-effect-free ALU-only dispatches can be elided, but memory, image,
+atomic, GDS, message and export effects are never discarded by that analysis.
+
+The scene still does not reach a draw. Its next 14-instruction compute kernel is
+a masked indexed dword copy: it loads source base, destination base and element
+count through `s8:s11`, then copies between the V# descriptors in `s0:s3` and
+`s4:s7`. Translation currently rejects that kernel at its dynamically indexed
+scalar/control-flow path, so the queue stops before later drawing commands. This
+is now the first concrete rendering blocker; loading, entropy and absence of GPU
+submission are no longer hypotheses.
 
 ## Error codes
 
@@ -1330,12 +1354,15 @@ from leaking into host code where nothing would check it.
 
 ## Roadmap
 
-1. Trace the Unity render worker and its synchronization dependencies after APR
-   streaming to find why the complete title does not reach AGC submission.
-2. Capture the first post-stream DCB/ACB and validate it against the supported
-   PM4 state tracker, scheduler and Vulkan backend.
-3. Retain submission owner metadata across blocked `WAIT_REG_MEM` continuations,
-   then publish the correct delayed graphics completion event when needed.
+1. Execute the observed indexed-dword-copy kernel with exact V# bounds and EXEC
+   masking, then resume the same scene DCB rather than starting a new capture.
+2. Follow that DCB to its first draw, adding only the RDNA2 operations, resource
+   descriptors and GDS semantics demonstrated by each next rejected shader.
+3. Validate the first color-target write and `SetFlip` as a continuous game
+   frame stream, then profile the current all-core spin and remove the hottest
+   scheduler or guest-wait loop without changing its synchronization contract.
+4. Retain submission owner metadata across blocked `WAIT_REG_MEM` continuations
+   and publish the correct delayed graphics completion event when needed.
 
 ---
 

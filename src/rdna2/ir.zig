@@ -14,6 +14,7 @@ pub const Operation = enum {
     nop,
     move,
     integer_add,
+    shift_left_add,
     integer_subtract,
     float_add,
     float_subtract,
@@ -70,9 +71,10 @@ pub const Module = struct {
 
 fn classify(inst: instruction.Instruction) struct { Operation, ValueType } {
     return switch (inst.opcode) {
-        .s_nop, .s_waitcnt, .s_barrier, .v_nop => .{ .nop, .none },
+        .s_nop, .s_waitcnt, .s_barrier, .s_inst_prefetch, .v_nop => .{ .nop, .none },
         .s_mov_b32, .v_mov_b32 => .{ .move, .bits32 },
         .s_add_u32, .s_add_i32, .v_add_nc_u32, .v_addc_u32 => .{ .integer_add, .uint32 },
+        .v_lshl_add_u32 => .{ .shift_left_add, .uint32 },
         .s_sub_u32, .s_sub_i32, .v_sub_nc_u32, .v_subrev_nc_u32 => .{ .integer_subtract, .uint32 },
         .v_add_f32 => .{ .float_add, .float32 },
         .v_sub_f32, .v_subrev_f32 => .{ .float_subtract, .float32 },
@@ -80,7 +82,7 @@ fn classify(inst: instruction.Instruction) struct { Operation, ValueType } {
         .s_and_b32, .v_and_b32 => .{ .bit_and, .bits32 },
         .s_or_b32, .v_or_b32 => .{ .bit_or, .bits32 },
         .s_xor_b32, .v_xor_b32 => .{ .bit_xor, .bits32 },
-        .s_cmp_eq_i32, .s_cmp_lg_i32, .s_cmp_gt_i32, .s_cmp_ge_i32, .s_cmp_lt_i32, .s_cmp_le_i32, .s_cmp_eq_u32, .s_cmp_lg_u32, .s_cmp_gt_u32, .s_cmp_ge_u32, .s_cmp_lt_u32, .s_cmp_le_u32, .v_cmp_f_f32, .v_cmp_lt_f32, .v_cmp_eq_f32, .v_cmp_le_f32, .v_cmp_gt_f32, .v_cmp_lg_f32, .v_cmp_ge_f32, .v_cmp_o_f32, .v_cmp_u_f32, .v_cmp_tru_f32, .v_cmp_lt_i32, .v_cmp_eq_i32, .v_cmp_le_i32, .v_cmp_gt_i32, .v_cmp_ne_i32, .v_cmp_ge_i32, .v_cmp_lt_u32, .v_cmp_eq_u32, .v_cmp_le_u32, .v_cmp_gt_u32, .v_cmp_ne_u32, .v_cmp_ge_u32 => .{ .compare, .mask64 },
+        .s_cmp_eq_i32, .s_cmp_lg_i32, .s_cmp_gt_i32, .s_cmp_ge_i32, .s_cmp_lt_i32, .s_cmp_le_i32, .s_cmp_eq_u32, .s_cmp_lg_u32, .s_cmp_gt_u32, .s_cmp_ge_u32, .s_cmp_lt_u32, .s_cmp_le_u32, .v_cmp_f_f32, .v_cmp_lt_f32, .v_cmp_eq_f32, .v_cmp_le_f32, .v_cmp_gt_f32, .v_cmp_lg_f32, .v_cmp_ge_f32, .v_cmp_o_f32, .v_cmp_u_f32, .v_cmp_tru_f32, .v_cmp_lt_i32, .v_cmp_eq_i32, .v_cmp_le_i32, .v_cmp_gt_i32, .v_cmp_ne_i32, .v_cmp_ge_i32, .v_cmp_lt_u32, .v_cmp_eq_u32, .v_cmp_le_u32, .v_cmp_gt_u32, .v_cmp_ne_u32, .v_cmp_ge_u32, .v_cmpx_gt_u32 => .{ .compare, .mask64 },
         .s_branch => .{ .branch, .none },
         .s_cbranch_scc0, .s_cbranch_scc1, .s_cbranch_vccz, .s_cbranch_vccnz, .s_cbranch_execz, .s_cbranch_execnz => .{ .branch_conditional, .none },
         .buffer_load_format_x,

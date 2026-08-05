@@ -269,8 +269,64 @@ fn answerGraphicsServiceQuery(request: Request, payload: u64) bool {
     return true;
 }
 
-/// Words in the descriptor through which graphics work is handed over.
-const submit_descriptor_words: u16 = 72 / @sizeOf(u32);
+/// The queue preamble submitted by `/dev/gc` command 49.
+///
+/// The shipped wrapper copies one queue selector and fifteen PM4 words, primes
+/// `result` to one, and accepts the operation only after the kernel replaces it
+/// with zero. The final word says whether the optional sixteen-byte context was
+/// copied into the PM4 template.
+const GraphicsPreambleSubmit = extern struct {
+    queue: u32,
+    commands: [15]u32,
+    result: u32,
+    has_optional_context: u32,
+};
+
+/// One packed indirect-buffer record consumed by `/dev/gc` command 50.
+///
+/// The GPU virtual address is 48 bits. The following words retain queue policy
+/// bits above the address and dword count, so only their verified low fields are
+/// interpreted here.
+const GraphicsIndirectDescriptor = extern struct {
+    address_low: u32,
+    address_high: u16,
+    address_flags: u16,
+    words_and_flags: u32,
+    control: u32,
+
+    fn address(self: GraphicsIndirectDescriptor) u64 {
+        return (@as(u64, self.address_high) << 32) | self.address_low;
+    }
+
+    fn wordCount(self: GraphicsIndirectDescriptor) u32 {
+        return self.words_and_flags & indirect_buffer_length_mask;
+    }
+};
+
+/// A flat list of constant/draw indirect buffers for one graphics queue.
+const GraphicsQueueSubmit = extern struct {
+    queue: u32,
+    descriptor_count: u32,
+    descriptors: u64,
+    result: u32,
+    reserved: u32,
+};
+
+/// Commits the queue after its indirect-buffer list has been accepted.
+const GraphicsQueueCommit = extern struct {
+    queue: u32,
+    result: u32,
+};
+
+comptime {
+    if (@sizeOf(GraphicsPreambleSubmit) != 72) @compileError("unexpected /dev/gc #49 layout");
+    if (@offsetOf(GraphicsPreambleSubmit, "result") != 64) @compileError("unexpected /dev/gc #49 result offset");
+    if (@sizeOf(GraphicsIndirectDescriptor) != 16) @compileError("unexpected /dev/gc #50 IB layout");
+    if (@sizeOf(GraphicsQueueSubmit) != 24) @compileError("unexpected /dev/gc #50 layout");
+    if (@offsetOf(GraphicsQueueSubmit, "result") != 16) @compileError("unexpected /dev/gc #50 result offset");
+    if (@sizeOf(GraphicsQueueCommit) != 8) @compileError("unexpected /dev/gc #51 layout");
+    if (@offsetOf(GraphicsQueueCommit, "result") != 4) @compileError("unexpected /dev/gc #51 result offset");
+}
 
 /// One command stream the descriptor points at.
 const IndirectBuffer = struct {
@@ -282,6 +338,9 @@ const IndirectBuffer = struct {
 
 /// Length occupies the low twenty bits of an indirect buffer's size field.
 const indirect_buffer_length_mask: u32 = 0x000f_ffff;
+/// The driver leaves this maximum-sized PACKET3_NOP at the first word it has
+/// reserved but not committed in a ring allocation.
+const uncommitted_ring_sentinel: u32 = 0xffff_1000;
 
 /// Finds the command streams a submission descriptor names.
 ///
@@ -311,6 +370,23 @@ fn collectIndirectBuffers(descriptor: []const u32, out: []IndirectBuffer) usize 
     return found;
 }
 
+/// Returns only the committed prefix of a capacity-sized queue allocation.
+///
+/// Command 50 describes the whole reserved range. The driver fills its unused
+/// tail with a maximum PACKET3_NOP whose declared body deliberately extends
+/// beyond that range; hardware stops at the producer write pointer, which is
+/// represented here by trimming at the exact sentinel instead.
+fn committedQueueStream(stream: []const u32) []const u32 {
+    var walker = gpu.pm4.Walker.init(stream);
+    while (true) {
+        const offset = walker.index;
+        _ = walker.next() catch {
+            if (stream[offset] == uncommitted_ring_sentinel) return stream[0..offset];
+            return stream;
+        } orelse return stream;
+    }
+}
+
 /// Carries out the request the shipped driver submits graphics work through.
 ///
 /// The payload is a small command stream of its own whose indirect buffers name
@@ -323,14 +399,13 @@ fn collectIndirectBuffers(descriptor: []const u32, out: []IndirectBuffer) usize 
 /// a silent refusal into something that can be acted on.
 fn answerGraphicsSubmit(request: Request, payload: u64) bool {
     if (request.group != 0x81 or request.number != 49) return false;
-    if (request.direction != .read_write or request.length != 72) return false;
+    if (request.direction != .read_write or request.length != @sizeOf(GraphicsPreambleSubmit)) return false;
     if (!memory.isGuestRangeAccessible(payload, request.length)) return false;
 
-    const words: [*]const u32 = @ptrFromInt(payload);
-    const descriptor = words[0..submit_descriptor_words];
+    const submission: *GraphicsPreambleSubmit = @ptrFromInt(payload);
 
     var buffers: [8]IndirectBuffer = undefined;
-    const found = collectIndirectBuffers(descriptor, &buffers);
+    const found = collectIndirectBuffers(&submission.commands, &buffers);
     if (found == 0) return false;
 
     var ran: usize = 0;
@@ -346,9 +421,79 @@ fn answerGraphicsSubmit(request: Request, payload: u64) bool {
             continue;
         }
         const stream: [*]const u32 = @ptrFromInt(buffer.address);
-        if (agc_submit.submitDeviceStream(stream[0..buffer.words])) ran += 1;
+        if (agc_submit.submitDeviceStream(stream[0..buffer.words]).accepted) ran += 1;
     }
-    return ran != 0;
+    if (ran == 0) return false;
+    submission.result = 0;
+    return true;
+}
+
+/// Executes the scene buffers that follow the queue preamble.
+fn answerGraphicsQueueSubmit(request: Request, payload: u64) bool {
+    if (request.group != 0x81 or request.number != 50) return false;
+    if (request.direction != .read_write or request.length != @sizeOf(GraphicsQueueSubmit)) return false;
+    if (!memory.isGuestRangeAccessible(payload, request.length)) return false;
+
+    const submission: *GraphicsQueueSubmit = @ptrFromInt(payload);
+    if (submission.reserved != 0 or submission.descriptor_count > 4096) return false;
+    if (submission.descriptor_count == 0) {
+        submission.result = 0;
+        return true;
+    }
+    if (submission.descriptors == 0) return false;
+    const descriptor_bytes = std.math.mul(
+        u64,
+        submission.descriptor_count,
+        @sizeOf(GraphicsIndirectDescriptor),
+    ) catch return false;
+    if (!memory.isGuestRangeAccessible(submission.descriptors, descriptor_bytes)) return false;
+
+    const pointer: [*]const GraphicsIndirectDescriptor = @ptrFromInt(submission.descriptors);
+    const descriptors = pointer[0..submission.descriptor_count];
+    for (descriptors, 0..) |descriptor, index| {
+        const address = descriptor.address();
+        const word_count = descriptor.wordCount();
+        if (trace.announces("ioctl")) {
+            std.debug.print(
+                "[gc submit #50] queue {d} IB {d}/{d}: 0x{x} ({d} dwords), addr_flags=0x{x}, control=0x{x}\n",
+                .{
+                    submission.queue,
+                    index,
+                    descriptors.len,
+                    address,
+                    word_count,
+                    descriptor.address_flags,
+                    descriptor.control,
+                },
+            );
+        }
+        if (address == 0 or word_count == 0) continue;
+        const byte_count = @as(u64, word_count) * @sizeOf(u32);
+        if (!memory.isGuestRangeAccessible(address, byte_count)) return false;
+        const stream_pointer: [*]const u32 = @ptrFromInt(address);
+        const reserved_stream = stream_pointer[0..word_count];
+        const stream = committedQueueStream(reserved_stream);
+        if (stream.len != reserved_stream.len and trace.announces("ioctl")) {
+            std.debug.print(
+                "[gc submit #50] committed {d}/{d} dwords before ring sentinel\n",
+                .{ stream.len, reserved_stream.len },
+            );
+        }
+        if (stream.len == 0) continue;
+        if (!agc_submit.submitDeviceStream(stream).accepted) return false;
+    }
+
+    submission.result = 0;
+    return true;
+}
+
+fn answerGraphicsQueueCommit(request: Request, payload: u64) bool {
+    if (request.group != 0x81 or request.number != 51) return false;
+    if (request.direction != .read_write or request.length != @sizeOf(GraphicsQueueCommit)) return false;
+    if (!memory.isGuestRangeAccessible(payload, request.length)) return false;
+    const commit: *GraphicsQueueCommit = @ptrFromInt(payload);
+    commit.result = 0;
+    return true;
 }
 
 fn answerGraphicsSuspendQuery(request: Request, payload: u64) bool {
@@ -424,6 +569,8 @@ fn ioctl(descriptor: i32, request_code: u64, payload: u64) callconv(abi.guest) i
     if (device == .graphics and answerGraphicsTfRing(request, payload)) return 0;
     if (device == .graphics and answerGraphicsHsOffchip(request, payload)) return 0;
     if (device == .graphics and answerGraphicsSubmit(request, payload)) return 0;
+    if (device == .graphics and answerGraphicsQueueSubmit(request, payload)) return 0;
+    if (device == .graphics and answerGraphicsQueueCommit(request, payload)) return 0;
     if (device == .dip_switches and answerDipSwitch(request, payload)) return 0;
 
     runtime_api.setPosixErrno(errno.Posix.enotty);
@@ -571,7 +718,7 @@ test "flags above a stream's length are not read as length" {
 
 test "a descriptor naming nothing yields nothing" {
     var found: [4]IndirectBuffer = undefined;
-    const empty = [_]u32{0} ** submit_descriptor_words;
+    const empty = [_]u32{0} ** 15;
     try testing.expectEqual(@as(usize, 0), collectIndirectBuffers(&empty, &found));
 
     // An indirect buffer with no address or no length names no stream, and
@@ -580,6 +727,97 @@ test "a descriptor naming nothing yields nothing" {
     try testing.expectEqual(@as(usize, 0), collectIndirectBuffers(&null_address, &found));
     const empty_stream = [_]u32{0} ++ indirectBufferPacket(0x2000, 0);
     try testing.expectEqual(@as(usize, 0), collectIndirectBuffers(&empty_stream, &found));
+}
+
+test "command 50 trims only its exact uncommitted ring sentinel" {
+    const reserved = [_]u32{
+        (@as(u32, 3) << 30) | (@as(u32, gpu.pm4.nop) << 8),
+        0,
+        uncommitted_ring_sentinel,
+        0,
+        0,
+    };
+    try testing.expectEqual(@as(usize, 2), committedQueueStream(&reserved).len);
+
+    var malformed = reserved;
+    malformed[2] = 0xffff_1001;
+    try testing.expectEqual(malformed.len, committedQueueStream(&malformed).len);
+}
+
+test "graphics preamble submission clears the driver's result sentinel" {
+    filesystem.detach();
+    agc_submit.reset();
+    defer agc_submit.reset();
+    const fd = try filesystem.open("/dev/gc", filesystem.O.rdonly);
+    defer filesystem.close(fd) catch {};
+
+    var stream = [_]u32{
+        (@as(u32, 3) << 30) | (@as(u32, gpu.pm4.nop) << 8),
+        0,
+    };
+    const packet = indirectBufferPacket(@intFromPtr(&stream), stream.len);
+    var submission = GraphicsPreambleSubmit{
+        .queue = 0,
+        .commands = [_]u32{0} ** 15,
+        .result = 1,
+        .has_optional_context = 0,
+    };
+    @memcpy(submission.commands[0..packet.len], &packet);
+
+    try testing.expectEqual(@as(i64, 0), ioctl(
+        fd,
+        encode(direction_in | direction_out, 0x81, 49, @sizeOf(GraphicsPreambleSubmit)),
+        @intFromPtr(&submission),
+    ));
+    try testing.expectEqual(@as(u32, 0), submission.result);
+}
+
+test "graphics queue submission decodes packed IB records and commits" {
+    filesystem.detach();
+    agc_submit.reset();
+    defer agc_submit.reset();
+    const fd = try filesystem.open("/dev/gc", filesystem.O.rdonly);
+    defer filesystem.close(fd) catch {};
+
+    var stream = [_]u32{
+        (@as(u32, 3) << 30) | (@as(u32, gpu.pm4.nop) << 8),
+        0,
+    };
+    const address = @intFromPtr(&stream);
+    var descriptors = [_]GraphicsIndirectDescriptor{
+        .{
+            .address_low = @truncate(address),
+            .address_high = @truncate(address >> 32),
+            .address_flags = 0x12,
+            .words_and_flags = 0x3000_0000 | stream.len,
+            .control = 0,
+        },
+        .{ .address_low = 0, .address_high = 0, .address_flags = 0, .words_and_flags = 0, .control = 0 },
+    };
+    try testing.expectEqual(@as(u64, address), descriptors[0].address());
+    try testing.expectEqual(@as(u32, stream.len), descriptors[0].wordCount());
+
+    var submission = GraphicsQueueSubmit{
+        .queue = 0,
+        .descriptor_count = descriptors.len,
+        .descriptors = @intFromPtr(&descriptors),
+        .result = 1,
+        .reserved = 0,
+    };
+    try testing.expectEqual(@as(i64, 0), ioctl(
+        fd,
+        encode(direction_in | direction_out, 0x81, 50, @sizeOf(GraphicsQueueSubmit)),
+        @intFromPtr(&submission),
+    ));
+    try testing.expectEqual(@as(u32, 0), submission.result);
+
+    var commit = GraphicsQueueCommit{ .queue = 0, .result = 1 };
+    try testing.expectEqual(@as(i64, 0), ioctl(
+        fd,
+        encode(direction_in | direction_out, 0x81, 51, @sizeOf(GraphicsQueueCommit)),
+        @intFromPtr(&commit),
+    ));
+    try testing.expectEqual(@as(u32, 0), commit.result);
 }
 
 test "a request is refused rather than silently accepted" {

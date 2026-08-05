@@ -521,6 +521,14 @@ pub fn main(init: std.process.Init) !void {
         0xaabb_ccdd,
         0,
         0,
+        customCommand(gpu.pm4.custom.release_mem, 7),
+        0x28 | (5 << 8),
+        3 << 29,
+        label_address + 0x18,
+        0,
+        0,
+        0,
+        0,
         command(gpu.pm4.event_write, 1),
         0x20,
         customCommand(gpu.pm4.custom.flip, 5),
@@ -533,7 +541,7 @@ pub fn main(init: std.process.Init) !void {
     const sync_result = try executor.execute(&sync_and_flip);
     if (sync_result.status != .complete or renderer.acquire_callbacks != 1 or
         renderer.write_data_callbacks != 1 or renderer.wait_callbacks != 1 or
-        renderer.release_callbacks != 1 or renderer.event_callbacks != 1 or
+        renderer.release_callbacks != 2 or renderer.event_callbacks != 1 or
         renderer.flip_callbacks != 1 or renderer.presented_frames != 1)
     {
         return error.InvalidVulkanSynchronizationCallbacks;
@@ -542,6 +550,9 @@ pub fn main(init: std.process.Init) !void {
         std.mem.readInt(u32, guest.bytes[label_address + 0x10 ..][0..4], .little) != 0xaabb_ccdd)
     {
         return error.InvalidVulkanLabelWrite;
+    }
+    if (std.mem.readInt(u64, guest.bytes[label_address + 0x18 ..][0..8], .little) == 0) {
+        return error.InvalidVulkanTimestampWrite;
     }
     if (present_probe.calls != 1 or present_probe.width != vulkan.graphics_probe_width or
         present_probe.height != vulkan.graphics_probe_height or

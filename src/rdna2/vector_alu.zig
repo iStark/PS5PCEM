@@ -145,13 +145,14 @@ fn vopcOpcode(id: u32) isa.Opcode {
         0xc6 => .v_cmp_ge_u32,
         0xd1 => .v_cmpx_lt_u32,
         0xd2 => .v_cmpx_eq_u32,
+        0xd4 => .v_cmpx_gt_u32,
         else => .unsupported,
     };
 }
 
 fn isCompareExec(op: isa.Opcode) bool {
     return switch (op) {
-        .v_cmpx_lt_f32, .v_cmpx_eq_f32, .v_cmpx_le_f32, .v_cmpx_gt_f32, .v_cmpx_lg_f32, .v_cmpx_ge_f32, .v_cmpx_lt_i32, .v_cmpx_eq_i32, .v_cmpx_lt_u32, .v_cmpx_eq_u32 => true,
+        .v_cmpx_lt_f32, .v_cmpx_eq_f32, .v_cmpx_le_f32, .v_cmpx_gt_f32, .v_cmpx_lg_f32, .v_cmpx_ge_f32, .v_cmpx_lt_i32, .v_cmpx_eq_i32, .v_cmpx_lt_u32, .v_cmpx_eq_u32, .v_cmpx_gt_u32 => true,
         else => false,
     };
 }
@@ -363,7 +364,10 @@ fn nativeVop3Opcode(id: u32) isa.Opcode {
         0x16b => .v_mul_lo_i32,
         0x16c => .v_mul_hi_i32,
         0x178 => .v_xor3_b32,
-        0x345 => .v_add3_u32,
+        0x345 => .v_xad_u32,
+        0x346 => .v_lshl_add_u32,
+        0x347 => .v_add_lshl_u32,
+        0x36d => .v_add3_u32,
         0x36f => .v_lshl_or_b32,
         0x371 => .v_and_or_b32,
         0x372 => .v_or3_b32,
@@ -486,6 +490,18 @@ test "VOP3 retains both encoding words and modifiers" {
     try std.testing.expectEqual(isa.Family.vop3, inst.family);
     try std.testing.expectEqual(@as(u32, 2), inst.word_count);
     try std.testing.expect(inst.dst.clamp);
+}
+
+test "native VOP3 shift-add opcode uses three sources" {
+    const code = [_]u32{ 0xd746_0000, 0x0401_0c08 };
+    const inst = try decodeVop3(4, &code, 0);
+    try std.testing.expectEqual(isa.Opcode.v_lshl_add_u32, inst.opcode);
+    try std.testing.expectEqual(@as(u32, 3), inst.src_count);
+    try std.testing.expectEqual(isa.OperandKind.sgpr, inst.src0.kind);
+    try std.testing.expectEqual(@as(u32, 8), inst.src0.reg);
+    try std.testing.expectEqual(@as(i32, 6), inst.src1.signed_val);
+    try std.testing.expectEqual(isa.OperandKind.vgpr, inst.src2.kind);
+    try std.testing.expectEqual(@as(u32, 0), inst.src2.reg);
 }
 
 test "truncated VOP3 is rejected" {

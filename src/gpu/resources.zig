@@ -24,6 +24,30 @@ pub const color_target_count: usize = 8;
 /// may also populate the accumulator-backed upper half.
 pub const maximum_user_data_words: u8 = 64;
 
+pub const ComputeSystemRegisters = struct {
+    workgroup_id_sgprs: [3]?u8 = .{ null, null, null },
+    threadgroup_size_sgpr: ?u8 = null,
+    local_invocation_id_components: u2 = 1,
+};
+
+/// Maps the system values appended after COMPUTE_USER_DATA to their hardware
+/// SGPR/VGPR positions. RSRC2 names which workgroup components exist; local
+/// invocation IDs always begin at v0 and TIDIG_COMP_CNT stores count minus one.
+pub fn decodeComputeSystemRegisters(state: *const gpu_state.State) ComputeSystemRegisters {
+    const rsrc2 = state.readRegister(.shader, 0x213) orelse 0;
+    var next = ShaderStage.compute.activeUserDataCount(state);
+    var result = ComputeSystemRegisters{
+        .local_invocation_id_components = @intCast(@min(@as(u32, 3), ((rsrc2 >> 11) & 0x3) + 1)),
+    };
+    for ([_]u5{ 7, 8, 9 }, 0..) |bit, component| {
+        if (rsrc2 & (@as(u32, 1) << bit) == 0) continue;
+        result.workgroup_id_sgprs[component] = next;
+        next += 1;
+    }
+    if (rsrc2 & (1 << 10) != 0) result.threadgroup_size_sgpr = next;
+    return result;
+}
+
 pub const TileMode = enum(u5) {
     linear = 0x00,
     standard_256b = 0x01,
@@ -906,4 +930,15 @@ test "inline user-data decoding is stage-relative and complete" {
         Error.IncompleteDescriptor,
         samplerDescriptorFromUserData(&state, .pixel, 0),
     );
+}
+
+test "compute system values follow the active user SGPR window" {
+    var state = gpu_state.State{};
+    try state.writeRegister(.shader, 0x213, (8 << 1) | (1 << 7) | (1 << 9) | (1 << 10) | (2 << 11));
+    const system = decodeComputeSystemRegisters(&state);
+    try testing.expectEqual(@as(?u8, 8), system.workgroup_id_sgprs[0]);
+    try testing.expectEqual(@as(?u8, null), system.workgroup_id_sgprs[1]);
+    try testing.expectEqual(@as(?u8, 9), system.workgroup_id_sgprs[2]);
+    try testing.expectEqual(@as(?u8, 10), system.threadgroup_size_sgpr);
+    try testing.expectEqual(@as(u2, 3), system.local_invocation_id_components);
 }

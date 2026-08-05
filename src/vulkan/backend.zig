@@ -67,6 +67,7 @@ pub const Error = error{
     InvalidDispatchPacket,
     UnsupportedIndirectDispatch,
     UnsupportedDrawPacket,
+    UnsupportedReleaseDataSelection,
     GraphicsProbeReadbackMismatch,
     MissingColorTarget,
     UnsupportedColorTarget,
@@ -639,6 +640,7 @@ pub const Renderer = struct {
     /// that names a buffer nothing was rendered into.
     guest_frame_scratch: std.ArrayList(u8) = .empty,
     guest_buffers: std.ArrayList(GuestBufferEntry) = .empty,
+    gds_storage: std.ArrayList(u8) = .empty,
     compute_pipelines: std.ArrayList(ComputePipelineEntry) = .empty,
     graphics_pipelines: std.ArrayList(GraphicsPipelineEntry) = .empty,
     active_descriptor_set: ?vk.DescriptorSet = null,
@@ -664,6 +666,8 @@ pub const Renderer = struct {
     flip_callbacks: u64 = 0,
     dispatch_callbacks: u64 = 0,
     translated_dispatches: u64 = 0,
+    elided_dispatches: u64 = 0,
+    emulated_gds_dispatches: u64 = 0,
     buffer_cache_hits: u64 = 0,
     buffer_cache_misses: u64 = 0,
     buffer_uploads: u64 = 0,
@@ -916,6 +920,7 @@ pub const Renderer = struct {
             self.destroyBuffer(entry.upload);
         }
         self.guest_buffers.deinit(self.allocator);
+        self.gds_storage.deinit(self.allocator);
         self.device_functions.destroy_pipeline_cache(self.device, self.driver_pipeline_cache, null);
         self.device_functions.destroy_pipeline_layout(self.device, self.compute_pipeline_layout, null);
         self.device_functions.destroy_descriptor_pool(self.device, self.descriptor_pool, null);
@@ -1346,8 +1351,31 @@ pub const Renderer = struct {
         else
             null;
         const bindings = try gpu.ShaderBindings.capture(state, .compute, header_address, reader);
+        const system_registers = gpu.resources.decodeComputeSystemRegisters(state);
         var analysis = try gpu.shader_analysis.decode(self.allocator, reader, program_address, 4096);
         defer analysis.deinit(self.allocator);
+        if (try self.tryEmulateGdsInitialization(
+            memory,
+            state,
+            &analysis,
+            system_registers,
+            local_size,
+            group_count,
+        )) |report| return report;
+        if (!analysis.hasExternalEffects()) {
+            self.elided_dispatches += 1;
+            std.debug.print(
+                "[vulkan dcb] elided side-effect-free compute program 0x{x} ({d} instructions, groups={d}x{d}x{d})\n",
+                .{
+                    program_address,
+                    analysis.program.instructions.items.len,
+                    group_count[0],
+                    group_count[1],
+                    group_count[2],
+                },
+            );
+            return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
+        }
         const specialized_scalar_prefix_end = scalarPrefixEnd(&analysis);
         const scalar = gpu.scalar_provenance.evaluatePrefixUntil(reader, &bindings, specialized_scalar_prefix_end);
         var resources = try self.prepareComputeResources(
@@ -1357,18 +1385,152 @@ pub const Renderer = struct {
             &scalar,
             specialized_scalar_prefix_end,
         );
-        var module = try analysis.translateSpirv(self.allocator, .{
+        var module = analysis.translateSpirv(self.allocator, .{
             .stage = .compute,
             .local_size = local_size,
             .storage_buffers = resources.mappings[0..resources.mapping_count],
             .scalar_registers = resources.scalar_registers[0..resources.scalar_count],
+            .compute_inputs = .{
+                .workgroup_id_sgprs = system_registers.workgroup_id_sgprs,
+                .threadgroup_size_sgpr = system_registers.threadgroup_size_sgpr,
+                .local_invocation_id_components = system_registers.local_invocation_id_components,
+            },
             .descriptor_array_length = maximum_storage_descriptors,
             .specialized_scalar_prefix_end = resources.specialized_scalar_prefix_end,
-        });
+        }) catch |err| {
+            std.debug.print(
+                "[vulkan dcb] compute program 0x{x}: {d} instructions, groups={d}x{d}x{d}, local={d}x{d}x{d}, rsrc2=0x{x}\n",
+                .{
+                    program_address,
+                    analysis.program.instructions.items.len,
+                    group_count[0],
+                    group_count[1],
+                    group_count[2],
+                    local_size[0],
+                    local_size[1],
+                    local_size[2],
+                    state.readRegister(.shader, 0x213) orelse 0,
+                },
+            );
+            for (analysis.program.instructions.items) |inst| {
+                std.debug.print(
+                    "  pc=0x{x:0>4} {s} dst={s}:{d} src=",
+                    .{ inst.pc, inst.opcode.mnemonic(), @tagName(inst.dst.kind), inst.dst.reg },
+                );
+                const sources = inst.sources();
+                for (sources.slice()) |source| {
+                    const source_value = switch (source.kind) {
+                        .sgpr, .vgpr => source.reg,
+                        else => source.value,
+                    };
+                    std.debug.print(" {s}:{d}", .{ @tagName(source.kind), source_value });
+                }
+                std.debug.print(
+                    " off={d} idx={d} offen={d} opid=0x{x}\n",
+                    .{ inst.memory_offset, @intFromBool(inst.index_enable), @intFromBool(inst.offset_enable), inst.opcode_id },
+                );
+            }
+            return err;
+        };
         defer module.deinit(self.allocator);
         const report = try self.dispatchSpirv(module.words, group_count);
         try self.commitComputeWrites(memory, &resources);
         return report;
+    }
+
+    fn tryEmulateGdsInitialization(
+        self: *Renderer,
+        memory: GuestMemory,
+        state: *const gpu.State,
+        analysis: *const gpu.ShaderAnalysis,
+        system: gpu.resources.ComputeSystemRegisters,
+        local_size: [3]u32,
+        group_count: [3]u32,
+    ) anyerror!?DispatchReport {
+        const inst = analysis.program.instructions.items;
+        if (inst.len != 14 or
+            inst[0].opcode != .s_inst_prefetch or
+            inst[1].opcode != .v_lshl_add_u32 or
+            inst[2].opcode != .s_buffer_load_dword or
+            inst[3].opcode != .s_waitcnt or
+            inst[4].opcode != .v_cmpx_gt_u32 or
+            inst[5].opcode != .s_cbranch_execz or
+            inst[6].opcode != .buffer_load_format_x or
+            inst[7].opcode != .s_buffer_load_dword or
+            inst[8].opcode != .s_waitcnt or
+            inst[9].opcode != .v_mov_b32 or
+            inst[10].opcode != .s_bfm_b32 or
+            inst[11].opcode != .s_waitcnt or
+            inst[12].opcode != .ds_write_b32 or
+            inst[13].opcode != .s_endpgm)
+        {
+            return null;
+        }
+        if (local_size[0] != 64 or local_size[1] != 1 or local_size[2] != 1 or
+            group_count[1] != 1 or group_count[2] != 1 or
+            system.workgroup_id_sgprs[0] != 8 or
+            system.workgroup_id_sgprs[1] != null or system.workgroup_id_sgprs[2] != null or
+            system.local_invocation_id_components != 1)
+        {
+            return null;
+        }
+        if (!registerOperand(inst[1].dst, .vgpr, 0) or
+            !registerOperand(inst[1].src0, .sgpr, 8) or
+            inst[1].src1.kind != .integer_inline_constant or inst[1].src1.value != 6 or
+            !registerOperand(inst[1].src2, .vgpr, 0) or
+            inst[2].dst.kind != .vcc_lo or !registerOperand(inst[2].src0, .sgpr, 4) or inst[2].memory_offset != 0 or
+            inst[4].dst.kind != .exec_lo or inst[4].src0.kind != .vcc_lo or !registerOperand(inst[4].src1, .vgpr, 0) or
+            !registerOperand(inst[6].dst, .vgpr, 0) or !registerOperand(inst[6].src0, .vgpr, 0) or
+            !registerOperand(inst[6].src1, .sgpr, 0) or !inst[6].index_enable or inst[6].offset_enable or
+            inst[7].dst.kind != .vcc_lo or !registerOperand(inst[7].src0, .sgpr, 4) or inst[7].memory_offset != 4 or
+            !registerOperand(inst[9].dst, .vgpr, 1) or inst[9].src0.kind != .vcc_lo or
+            inst[10].dst.kind != .m0 or inst[10].src0.value != 2 or inst[10].src1.value != 14 or
+            !inst[12].gds or !registerOperand(inst[12].src0, .vgpr, 0) or !registerOperand(inst[12].src1, .vgpr, 1))
+        {
+            return null;
+        }
+
+        const addresses = try descriptorFromComputeUserData(state, 0);
+        const control = try descriptorFromComputeUserData(state, 4);
+        if (addresses.stride != 4 or addresses.swizzle_enabled or addresses.add_thread_id or
+            addresses.out_of_bounds_select != 0 or addresses.unified_format != 20 or
+            addresses.dst_select[0] != 4 or control.address == 0 or control.size_bytes < 8)
+        {
+            return null;
+        }
+
+        const element_count = try readGuestU32(memory, control.address);
+        const fill_value = try readGuestU32(memory, control.address + 4);
+        const dispatched = std.math.mul(u64, group_count[0], local_size[0]) catch return Error.GuestBufferTooLarge;
+        const source_records = if (addresses.stride == 0)
+            @as(u64, addresses.record_count)
+        else
+            addresses.size_bytes / addresses.stride;
+        const writes: usize = @intCast(@min(@as(u64, element_count), @min(dispatched, source_records)));
+
+        const gds_bytes: usize = 64 * 1024;
+        if (self.gds_storage.items.len == 0) {
+            try self.gds_storage.resize(self.allocator, gds_bytes);
+            @memset(self.gds_storage.items, 0);
+        }
+        var address_bytes: [4]u8 = undefined;
+        var value_bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &value_bytes, fill_value, .little);
+        for (0..writes) |index| {
+            const guest_address = addresses.address + @as(u64, @intCast(index)) * addresses.stride;
+            if (!memory.read(memory.context, guest_address, &address_bytes)) return Error.GuestMemoryReadFailed;
+            const gds_address: usize = @intCast(std.mem.readInt(u32, &address_bytes, .little) & ~@as(u32, 3));
+            if (gds_address > self.gds_storage.items.len or 4 > self.gds_storage.items.len - gds_address) {
+                return Error.InvalidStorageDescriptor;
+            }
+            @memcpy(self.gds_storage.items[gds_address..][0..4], &value_bytes);
+        }
+        self.emulated_gds_dispatches += 1;
+        std.debug.print(
+            "[vulkan dcb] emulated GDS initialization: {d} writes, value=0x{x}\n",
+            .{ writes, fill_value },
+        );
+        return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
     }
 
     fn prepareComputeResources(
@@ -2705,16 +2867,21 @@ pub const Renderer = struct {
     fn dcbAcquire(context: ?*anyopaque, _: gpu.state.AcquireMem) bool {
         const self = fromContext(context);
         self.acquire_callbacks += 1;
-        return self.waitForDevice();
+        const accepted = self.waitForDevice();
+        if (!accepted) std.debug.print("[vulkan dcb] acquire rejected: {s}\n", .{@errorName(self.last_sync_error.?)});
+        return accepted;
     }
 
     fn dcbRelease(context: ?*anyopaque, release: gpu.state.ReleaseMem) bool {
         const self = fromContext(context);
         self.release_callbacks += 1;
-        if (!self.waitForDevice()) return false;
+        if (!self.waitForDevice()) {
+            std.debug.print("[vulkan dcb] release rejected: {s}\n", .{@errorName(self.last_sync_error.?)});
+            return false;
+        }
         if ((release.destination != 0 and release.destination != 1) or release.address == 0) return true;
         var bytes: [8]u8 = undefined;
-        return switch (release.data_selection) {
+        const accepted = switch (release.data_selection) {
             0 => true,
             1 => blk: {
                 std.mem.writeInt(u32, bytes[0..4], @truncate(release.data), .little);
@@ -2724,8 +2891,31 @@ pub const Renderer = struct {
                 std.mem.writeInt(u64, &bytes, release.data, .little);
                 break :blk dcbWrite(context, release.address, &bytes);
             },
-            else => false,
+            3, 4 => blk: {
+                std.mem.writeInt(u64, &bytes, releaseTimestampCounter(), .little);
+                break :blk dcbWrite(context, release.address, &bytes);
+            },
+            // GDS is not modelled yet. It is not the packet payload and must
+            // not be written as one; accepting the ordered release preserves
+            // queue progress until the GDS storage itself is implemented.
+            5 => true,
+            else => blk: {
+                self.last_sync_error = Error.UnsupportedReleaseDataSelection;
+                std.debug.print(
+                    "[vulkan dcb] release rejected: unsupported data selection {d} (dst={d}, address=0x{x})\n",
+                    .{ release.data_selection, release.destination, release.address },
+                );
+                break :blk false;
+            },
         };
+        if (!accepted and release.data_selection >= 1 and release.data_selection <= 4) {
+            self.last_sync_error = Error.GuestMemoryWriteFailed;
+            std.debug.print(
+                "[vulkan dcb] release rejected: {s} (address=0x{x}, selection={d})\n",
+                .{ @errorName(Error.GuestMemoryWriteFailed), release.address, release.data_selection },
+            );
+        }
+        return accepted;
     }
 
     fn dcbWait(context: ?*anyopaque, _: gpu.state.WaitRegMem, _: bool) bool {
@@ -2741,7 +2931,10 @@ pub const Renderer = struct {
     fn dcbWriteData(context: ?*anyopaque, info: gpu.state.WriteData, values: []const u32) bool {
         const self = fromContext(context);
         self.write_data_callbacks += 1;
-        if (!self.waitForDevice()) return false;
+        if (!self.waitForDevice()) {
+            std.debug.print("[vulkan dcb] write-data rejected: {s}\n", .{@errorName(self.last_sync_error.?)});
+            return false;
+        }
         if (info.destination != 1 and info.destination != 2 and
             info.destination != 4 and info.destination != 5)
         {
@@ -2751,7 +2944,14 @@ pub const Renderer = struct {
         for (values, 0..) |value, index| {
             std.mem.writeInt(u32, &bytes, value, .little);
             const address = info.address + if (info.increment_address) @as(u64, index) * 4 else 0;
-            if (!dcbWrite(context, address, &bytes)) return false;
+            if (!dcbWrite(context, address, &bytes)) {
+                self.last_sync_error = Error.GuestMemoryWriteFailed;
+                std.debug.print(
+                    "[vulkan dcb] write-data rejected: {s} (address=0x{x})\n",
+                    .{ @errorName(Error.GuestMemoryWriteFailed), address },
+                );
+                return false;
+            }
         }
         return true;
     }
@@ -2759,7 +2959,9 @@ pub const Renderer = struct {
     fn dcbEvent(context: ?*anyopaque, _: gpu.state.EventWrite) bool {
         const self = fromContext(context);
         self.event_callbacks += 1;
-        return self.waitForDevice();
+        const accepted = self.waitForDevice();
+        if (!accepted) std.debug.print("[vulkan dcb] event rejected: {s}\n", .{@errorName(self.last_sync_error.?)});
+        return accepted;
     }
 
     /// Shows a display buffer straight out of guest memory.
@@ -2863,20 +3065,27 @@ pub const Renderer = struct {
         if (!has_vertex and !has_fragment and !self.graphics_probe_enabled) return true;
         if (packet.opcode != gpu.pm4.draw_index_auto or packet.body.len < 1 or packet.body[0] != 3) {
             self.last_draw_error = Error.UnsupportedDrawPacket;
+            std.debug.print(
+                "[vulkan dcb] draw rejected: {s} (opcode=0x{x}, body={d})\n",
+                .{ @errorName(Error.UnsupportedDrawPacket), packet.opcode, packet.body.len },
+            );
             return false;
         }
         if (has_vertex != has_fragment) {
             self.last_draw_error = Error.MissingGraphicsProgram;
+            std.debug.print("[vulkan dcb] draw rejected: {s}\n", .{@errorName(Error.MissingGraphicsProgram)});
             return false;
         }
         if (has_vertex)
             self.drawGuestGraphics(state) catch |err| {
                 self.last_draw_error = err;
+                std.debug.print("[vulkan dcb] draw rejected: {s}\n", .{@errorName(err)});
                 return false;
             }
         else
             self.drawGraphicsProbe() catch |err| {
                 self.last_draw_error = err;
+                std.debug.print("[vulkan dcb] graphics probe rejected: {s}\n", .{@errorName(err)});
                 return false;
             };
         if (has_vertex) self.guest_graphics_draws += 1;
@@ -2890,14 +3099,17 @@ pub const Renderer = struct {
         self.dispatch_callbacks += 1;
         if (packet.opcode != gpu.pm4.dispatch_direct) {
             self.last_dispatch_error = Error.UnsupportedIndirectDispatch;
+            std.debug.print("[vulkan dcb] dispatch rejected: {s}\n", .{@errorName(Error.UnsupportedIndirectDispatch)});
             return false;
         }
         if (packet.body.len < 3) {
             self.last_dispatch_error = Error.InvalidDispatchPacket;
+            std.debug.print("[vulkan dcb] dispatch rejected: {s}\n", .{@errorName(Error.InvalidDispatchPacket)});
             return false;
         }
         if (gpu.resources.ShaderStage.compute.programAddress(state) == null) {
             self.last_dispatch_error = Error.MissingComputeProgram;
+            std.debug.print("[vulkan dcb] dispatch rejected: {s}\n", .{@errorName(Error.MissingComputeProgram)});
             return false;
         }
         const local_size = [3]u32{
@@ -2911,6 +3123,7 @@ pub const Renderer = struct {
             .{ packet.body[0], packet.body[1], packet.body[2] },
         ) catch |err| {
             self.last_dispatch_error = err;
+            std.debug.print("[vulkan dcb] dispatch rejected: {s}\n", .{@errorName(err)});
             return false;
         };
         self.translated_dispatches += 1;
@@ -2918,6 +3131,45 @@ pub const Renderer = struct {
         return true;
     }
 };
+
+var fallback_release_counter: std.atomic.Value(u64) = .init(0);
+
+/// A monotonic stand-in for the GPU/system clocks sampled by RELEASE_MEM.
+///
+/// The renderer currently completes submissions synchronously, so sampling the
+/// invariant host counter after `vkDeviceWaitIdle` preserves the ordering and
+/// progress properties titles rely on. A Vulkan timestamp query can replace
+/// this value when command submission becomes asynchronous.
+fn releaseTimestampCounter() u64 {
+    if (builtin.cpu.arch != .x86_64) return fallback_release_counter.fetchAdd(1, .monotonic) + 1;
+    var low: u32 = undefined;
+    var high: u32 = undefined;
+    asm volatile ("rdtsc"
+        : [low] "={eax}" (low),
+          [high] "={edx}" (high),
+    );
+    return (@as(u64, high) << 32) | low;
+}
+
+fn registerOperand(op: gpu.ShaderOperand, kind: gpu.ShaderOperandKind, register: u32) bool {
+    return op.kind == kind and op.reg == register;
+}
+
+fn descriptorFromComputeUserData(state: *const gpu.State, first_register: u32) anyerror!gpu.BufferDescriptor {
+    var words: [4]u32 = undefined;
+    for (&words, 0..) |*word, index| {
+        word.* = state.readRegister(.shader, 0x240 + first_register + @as(u32, @intCast(index))) orelse {
+            return Error.MissingStorageDescriptor;
+        };
+    }
+    return gpu.resources.decodeBufferDescriptor(&words);
+}
+
+fn readGuestU32(memory: GuestMemory, address: u64) Error!u32 {
+    var bytes: [4]u8 = undefined;
+    if (!memory.read(memory.context, address, &bytes)) return Error.GuestMemoryReadFailed;
+    return std.mem.readInt(u32, &bytes, .little);
+}
 
 fn computeLocalSize(state: *const gpu.State, register: u32) u32 {
     const encoded = state.readRegister(.shader, register) orelse return 1;

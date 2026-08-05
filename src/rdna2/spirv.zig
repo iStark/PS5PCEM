@@ -40,6 +40,12 @@ pub const ScalarRegister = struct {
     value: u32,
 };
 
+pub const ComputeInputs = struct {
+    workgroup_id_sgprs: [3]?u8 = .{ null, null, null },
+    threadgroup_size_sgpr: ?u8 = null,
+    local_invocation_id_components: u2 = 0,
+};
+
 pub const Options = struct {
     stage: Stage,
     local_size: [3]u32 = .{ 1, 1, 1 },
@@ -50,6 +56,7 @@ pub const Options = struct {
     storage_buffers: []const StorageBufferBinding = &.{},
     sampled_images: []const SampledImageBinding = &.{},
     scalar_registers: []const ScalarRegister = &.{},
+    compute_inputs: ?ComputeInputs = null,
     descriptor_array_length: u32 = 64,
     /// Exclusive PC ending a straight scalar prolog evaluated against the
     /// captured dispatch state and checked guest memory.
@@ -103,6 +110,7 @@ const Builder = struct {
     signed_type: u32,
     float_type: u32,
     bool_type: u32,
+    vector3_bits_type: u32 = 0,
     vector4_type: u32 = 0,
     main_function: u32,
     label: u32,
@@ -116,6 +124,10 @@ const Builder = struct {
     storage_array: u32 = 0,
     storage_word_pointer_type: u32 = 0,
     local_invocation_index: u32 = 0,
+    workgroup_id_input: u32 = 0,
+    local_invocation_id_input: u32 = 0,
+    compute_inputs: ?ComputeInputs,
+    local_size: [3]u32,
     vector2_type: u32 = 0,
     sampled_image_type: u32 = 0,
     sampled_image_array: u32 = 0,
@@ -139,6 +151,8 @@ const Builder = struct {
             .vertex_index_vgpr = options.vertex_index_vgpr,
             .storage_bindings = options.storage_buffers,
             .sampled_bindings = options.sampled_images,
+            .compute_inputs = options.compute_inputs,
+            .local_size = options.local_size,
             .specialized_scalar_prefix_end = options.specialized_scalar_prefix_end,
         };
         errdefer self.deinit();
@@ -160,6 +174,7 @@ const Builder = struct {
         if (options.vertex_index_vgpr != null and options.stage != .vertex) {
             return Error.InvalidStageInterface;
         }
+        if (options.compute_inputs != null and options.stage != .compute) return Error.InvalidStageInterface;
         switch (options.stage) {
             .vertex => {
                 self.vector4_type = self.id();
@@ -187,7 +202,37 @@ const Builder = struct {
                 try self.emit(&self.declarations, 32, &.{ output_pointer, 3, self.vector4_type }); // ptr Output
                 try self.emit(&self.declarations, 59, &.{ output_pointer, self.color_output, 3 }); // OpVariable
             },
-            .compute => {},
+            .compute => {
+                if (options.compute_inputs) |inputs| {
+                    if (inputs.local_invocation_id_components > 3) return Error.InvalidStageInterface;
+                    var needs_workgroup_id = false;
+                    for (inputs.workgroup_id_sgprs) |reg| {
+                        if (reg) |index| {
+                            if (index >= 128) return Error.InvalidStageInterface;
+                            needs_workgroup_id = true;
+                        }
+                    }
+                    if (inputs.threadgroup_size_sgpr) |index| {
+                        if (index >= 128) return Error.InvalidStageInterface;
+                    }
+                    if (needs_workgroup_id or inputs.local_invocation_id_components != 0) {
+                        self.vector3_bits_type = self.id();
+                        const input_vector_pointer = self.id();
+                        try self.emit(&self.declarations, 23, &.{ self.vector3_bits_type, self.bits_type, 3 }); // OpTypeVector
+                        try self.emit(&self.declarations, 32, &.{ input_vector_pointer, 1, self.vector3_bits_type }); // ptr Input
+                        if (needs_workgroup_id) {
+                            self.workgroup_id_input = self.id();
+                            try self.emit(&self.annotations, 71, &.{ self.workgroup_id_input, 11, 26 }); // BuiltIn WorkgroupId
+                            try self.emit(&self.declarations, 59, &.{ input_vector_pointer, self.workgroup_id_input, 1 });
+                        }
+                        if (inputs.local_invocation_id_components != 0) {
+                            self.local_invocation_id_input = self.id();
+                            try self.emit(&self.annotations, 71, &.{ self.local_invocation_id_input, 11, 27 }); // BuiltIn LocalInvocationId
+                            try self.emit(&self.declarations, 59, &.{ input_vector_pointer, self.local_invocation_id_input, 1 });
+                        }
+                    }
+                }
+            },
         }
 
         for (options.scalar_registers) |scalar| {
@@ -427,12 +472,51 @@ const Builder = struct {
         self.scc = result;
     }
 
-    fn initializeStageInputs(self: *Builder) Error!void {
-        if (self.vertex_index_input == 0) return;
+    fn shiftLeftAdd(self: *Builder, inst: instruction.Instruction) Error!void {
+        const value = try self.source(inst.src0, .bits32);
+        const raw_shift = try self.source(inst.src1, .bits32);
+        const addend = try self.source(inst.src2, .bits32);
+        const shift = self.id();
+        try self.emit(&self.body, 199, &.{ self.bits_type, shift, raw_shift, try self.constant(.bits32, 31) }); // OpBitwiseAnd
+        const shifted = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, shifted, value, shift }); // OpShiftLeftLogical
         const result = self.id();
-        try self.emit(&self.body, 61, &.{ self.signed_type, result, self.vertex_index_input }); // OpLoad
-        const vgpr = self.vertex_index_vgpr orelse return Error.InvalidStageInterface;
-        self.registers[128 + @as(usize, vgpr)] = .{ .id = result, .value_type = .sint32 };
+        try self.emit(&self.body, 128, &.{ self.bits_type, result, shifted, addend }); // OpIAdd
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
+    fn initializeStageInputs(self: *Builder) Error!void {
+        if (self.vertex_index_input != 0) {
+            const result = self.id();
+            try self.emit(&self.body, 61, &.{ self.signed_type, result, self.vertex_index_input }); // OpLoad
+            const vgpr = self.vertex_index_vgpr orelse return Error.InvalidStageInterface;
+            self.registers[128 + @as(usize, vgpr)] = .{ .id = result, .value_type = .sint32 };
+        }
+        const inputs = self.compute_inputs orelse return;
+        if (self.workgroup_id_input != 0) {
+            const vector = self.id();
+            try self.emit(&self.body, 61, &.{ self.vector3_bits_type, vector, self.workgroup_id_input }); // OpLoad
+            for (inputs.workgroup_id_sgprs, 0..) |maybe_register, component| {
+                const register = maybe_register orelse continue;
+                const value = self.id();
+                try self.emit(&self.body, 81, &.{ self.bits_type, value, vector, @intCast(component) }); // OpCompositeExtract
+                self.registers[register] = .{ .id = value, .value_type = .bits32 };
+            }
+        }
+        if (self.local_invocation_id_input != 0) {
+            const vector = self.id();
+            try self.emit(&self.body, 61, &.{ self.vector3_bits_type, vector, self.local_invocation_id_input }); // OpLoad
+            for (0..inputs.local_invocation_id_components) |component| {
+                const value = self.id();
+                try self.emit(&self.body, 81, &.{ self.bits_type, value, vector, @intCast(component) }); // OpCompositeExtract
+                self.registers[128 + component] = .{ .id = value, .value_type = .bits32 };
+            }
+        }
+        if (inputs.threadgroup_size_sgpr) |register| {
+            const xy = std.math.mul(u32, self.local_size[0], self.local_size[1]) catch return Error.InvalidStageInterface;
+            const size = std.math.mul(u32, xy, self.local_size[2]) catch return Error.InvalidStageInterface;
+            self.registers[register] = .{ .id = try self.constant(.bits32, size), .value_type = .bits32 };
+        }
     }
 
     fn integerToFloat(self: *Builder, inst: instruction.Instruction, signed: bool) Error!void {
@@ -752,12 +836,13 @@ const Builder = struct {
         if (inst.dst.clamp or inst.dst.omod != 0) return Error.UnsupportedOpcode;
         if (self.specializedScalarDestination(inst)) return;
         switch (inst.opcode) {
-            .s_nop, .s_waitcnt, .s_barrier, .v_nop, .s_endpgm => {},
+            .s_nop, .s_waitcnt, .s_barrier, .s_inst_prefetch, .v_nop, .s_endpgm => {},
             .s_branch, .s_cbranch_scc0, .s_cbranch_scc1, .s_cbranch_vccz, .s_cbranch_vccnz, .s_cbranch_execz, .s_cbranch_execnz => return Error.UnsupportedControlFlow,
             .s_mov_b32, .v_mov_b32 => try self.unary(inst, 83, .bits32), // OpCopyObject
             .v_cvt_f32_i32 => try self.integerToFloat(inst, true),
             .v_cvt_f32_u32 => try self.integerToFloat(inst, false),
             .s_add_u32, .s_add_i32, .v_add_nc_u32 => try self.binary(inst, 128, .bits32, false), // OpIAdd
+            .v_lshl_add_u32 => try self.shiftLeftAdd(inst),
             .s_sub_u32, .s_sub_i32, .v_sub_nc_u32 => try self.binary(inst, 130, .bits32, false), // OpISub
             .v_subrev_nc_u32 => try self.binary(inst, 130, .bits32, true),
             .v_add_f32 => try self.binary(inst, 129, .float32, false), // OpFAdd
@@ -969,6 +1054,8 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     if (builder.storage_array != 0) try entry_point.append(allocator, builder.storage_array);
     if (builder.sampled_image_array != 0) try entry_point.append(allocator, builder.sampled_image_array);
     if (builder.local_invocation_index != 0) try entry_point.append(allocator, builder.local_invocation_index);
+    if (builder.workgroup_id_input != 0) try entry_point.append(allocator, builder.workgroup_id_input);
+    if (builder.local_invocation_id_input != 0) try entry_point.append(allocator, builder.local_invocation_id_input);
     if (builder.vertex_index_input != 0) try entry_point.append(allocator, builder.vertex_index_input);
     if (builder.position_output != 0) try entry_point.append(allocator, builder.position_output);
     if (builder.color_output != 0) try entry_point.append(allocator, builder.color_output);
@@ -1061,6 +1148,37 @@ test "straight-line vector ALU translates to a SPIR-V function" {
     try std.testing.expectEqual(@as(u32, 0x0001_0500), module.words[1]);
     try std.testing.expect(containsOpcode(module.words, 129)); // OpFAdd
     try std.testing.expect(containsOpcode(module.words, 253)); // OpReturn
+}
+
+test "instruction prefetch is a translation no-op" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xbfa0_0001, // s_inst_prefetch 1
+        0xbf81_0000, // s_endpgm
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .compute });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expect(containsOpcode(module.words, 253)); // OpReturn
+}
+
+test "native vector shift-add masks its shift and adds the third source" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xd746_0000,
+        @as(u32, 129) | (@as(u32, 130) << 9) | (@as(u32, 131) << 18),
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .compute });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expect(containsOpcode(module.words, 199)); // OpBitwiseAnd
+    try std.testing.expect(containsOpcode(module.words, 196)); // OpShiftLeftLogical
+    try std.testing.expect(containsOpcode(module.words, 128)); // OpIAdd
 }
 
 test "vertex system value and position export lower to a stage interface" {
