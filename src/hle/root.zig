@@ -17,6 +17,8 @@ pub const modules = @import("modules.zig");
 pub const filesystem = @import("filesystem.zig");
 pub const host_stack = @import("host_stack.zig");
 pub const video_out = @import("video_out.zig");
+pub const graphics_device = @import("graphics_device.zig");
+pub const apr = @import("apr.zig");
 pub const errno = @import("errno.zig");
 pub const symbols = @import("symbols.zig");
 
@@ -94,6 +96,8 @@ test {
     _ = filesystem;
     _ = host_stack;
     _ = video_out;
+    _ = graphics_device;
+    _ = apr;
     _ = errno;
     _ = symbols;
     _ = libs.kernel_event_queue;

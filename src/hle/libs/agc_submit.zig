@@ -32,6 +32,7 @@ const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const memory = @import("kernel_memory.zig");
 const shader_registry = @import("agc_shader_registry.zig");
+const event_queue = @import("kernel_event_queue.zig");
 const video_out = @import("../video_out.zig");
 
 /// A submission descriptor: where the buffer is and how long it is.
@@ -73,6 +74,7 @@ var traced_shader_programs: [32]u64 = [_]u64{0} ** 32;
 var installed_backend: ?gpu.DcbBackend = null;
 
 pub fn readGuestMemory(_: ?*anyopaque, address: u64, bytes: []u8) bool {
+    if (video_out.readLabelMemory(address, bytes)) return true;
     if (!memory.isGuestRangeAccessible(address, bytes.len)) return false;
     const source: [*]const u8 = @ptrFromInt(address);
     @memcpy(bytes, source[0..bytes.len]);
@@ -80,6 +82,7 @@ pub fn readGuestMemory(_: ?*anyopaque, address: u64, bytes: []u8) bool {
 }
 
 pub fn writeGuestMemory(_: ?*anyopaque, address: u64, bytes: []const u8) bool {
+    if (video_out.writeLabelMemory(address, bytes)) return true;
     if (!memory.isGuestRangeAccessible(address, bytes.len)) return false;
     const destination: [*]u8 = @ptrFromInt(address);
     @memcpy(destination[0..bytes.len], bytes);
@@ -440,12 +443,16 @@ fn backendEvent(_: ?*anyopaque, value: gpu.state.EventWrite) bool {
 }
 
 fn backendFlip(_: ?*anyopaque, value: gpu.state.Flip) bool {
-    const accepted = if (installed_backend) |backend|
+    const accepted = if (value.display_buffer_index == -1)
+        true
+    else if (installed_backend) |backend|
         if (backend.vtable.flip) |callback| callback(backend.context, value) else true
     else
         true;
     if (!accepted) return false;
-    return video_out.completeFlip(value);
+    if (!video_out.completeFlip(value)) return false;
+    _ = event_queue.triggerVideoOutFlip(value.argument);
+    return true;
 }
 
 const executor_backend_vtable = gpu.DcbBackend.VTable{

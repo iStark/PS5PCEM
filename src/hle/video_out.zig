@@ -90,7 +90,9 @@ var lock = Lock{};
 var opened = false;
 var groups: [maximum_attribute_groups]AttributeGroup = [_]AttributeGroup{.{}} ** maximum_attribute_groups;
 var buffers: [maximum_buffers]BufferSlot = [_]BufferSlot{.{}} ** maximum_buffers;
+var buffer_labels: [maximum_buffers]u64 align(8) = [_]u64{0} ** maximum_buffers;
 var flip_status = FlipStatus{};
+var previous_buffer: i32 = -1;
 
 pub fn reset() void {
     lock.lock();
@@ -98,7 +100,9 @@ pub fn reset() void {
     opened = false;
     groups = [_]AttributeGroup{.{}} ** maximum_attribute_groups;
     buffers = [_]BufferSlot{.{}} ** maximum_buffers;
+    buffer_labels = [_]u64{0} ** maximum_buffers;
     flip_status = .{};
+    previous_buffer = -1;
 }
 
 pub fn open(index: i32) bool {
@@ -117,6 +121,8 @@ pub fn close(handle: i32) bool {
     opened = false;
     groups = [_]AttributeGroup{.{}} ** maximum_attribute_groups;
     buffers = [_]BufferSlot{.{}} ** maximum_buffers;
+    buffer_labels = [_]u64{0} ** maximum_buffers;
+    previous_buffer = -1;
     return true;
 }
 
@@ -160,12 +166,14 @@ pub fn registerBuffers(
         .attribute = attribute,
     };
     for (input, 0..) |entry, index| {
-        buffers[first + index] = .{
+        const slot_index = first + index;
+        buffers[slot_index] = .{
             .occupied = true,
             .set_index = set_index,
             .data_address = @intFromPtr(entry.data.?),
             .metadata_address = if (entry.metadata) |address| @intFromPtr(address) else 0,
         };
+        buffer_labels[slot_index] = 0;
     }
 }
 
@@ -186,8 +194,49 @@ pub fn unregisterBuffers(set_index: i32) RegisterError!void {
     if (!groups[group_index].occupied) return error.InvalidIndex;
     groups[group_index] = .{};
     for (&buffers) |*slot| {
-        if (slot.occupied and slot.set_index == set_index) slot.* = .{};
+        if (slot.occupied and slot.set_index == set_index) {
+            const slot_index = (@intFromPtr(slot) - @intFromPtr(&buffers)) / @sizeOf(BufferSlot);
+            slot.* = .{};
+            buffer_labels[slot_index] = 0;
+        }
     }
+}
+
+/// Base of the 16 contiguous 64-bit labels used by AGC flip packets.
+pub fn labelAddress(handle: i32) ?u64 {
+    lock.lock();
+    defer lock.unlock();
+    if (handle != primary_handle or !opened) return null;
+    return @intFromPtr(&buffer_labels);
+}
+
+/// Gives the command processor access to labels even though they live in HLE
+/// state rather than in a title-owned virtual-memory allocation.
+pub fn readLabelMemory(address: u64, output: []u8) bool {
+    const range = labelByteRange(address, output.len) orelse return false;
+    lock.lock();
+    defer lock.unlock();
+    const bytes = std.mem.asBytes(&buffer_labels);
+    @memcpy(output, bytes[range.start..range.end]);
+    return true;
+}
+
+pub fn writeLabelMemory(address: u64, input: []const u8) bool {
+    const range = labelByteRange(address, input.len) orelse return false;
+    lock.lock();
+    defer lock.unlock();
+    const bytes = std.mem.asBytes(&buffer_labels);
+    @memcpy(bytes[range.start..range.end], input);
+    return true;
+}
+
+fn labelByteRange(address: u64, length: usize) ?struct { start: usize, end: usize } {
+    const base = @intFromPtr(&buffer_labels);
+    if (address < base) return null;
+    const offset = address - base;
+    const byte_length = @sizeOf(@TypeOf(buffer_labels));
+    if (offset > byte_length or length > byte_length - offset) return null;
+    return .{ .start = @intCast(offset), .end = @intCast(offset + length) };
 }
 
 pub fn resolve(handle: u32, buffer_index: i32) ?Registration {
@@ -218,14 +267,18 @@ pub fn completeFlip(flip: gpu.state.Flip) bool {
     lock.lock();
     defer lock.unlock();
     if (flip.video_out_handle != primary_handle or !opened or
-        flip.display_buffer_index < 0 or flip.display_buffer_index >= maximum_buffers or
-        !buffers[@intCast(flip.display_buffer_index)].occupied)
+        flip.display_buffer_index < -1 or flip.display_buffer_index >= maximum_buffers or
+        (flip.display_buffer_index >= 0 and !buffers[@intCast(flip.display_buffer_index)].occupied))
     {
         return false;
     }
     flip_status.count += 1;
     flip_status.argument = flip.argument;
     flip_status.current_buffer = flip.display_buffer_index;
+    if (previous_buffer >= 0 and previous_buffer < maximum_buffers) {
+        buffer_labels[@intCast(previous_buffer)] = 0;
+    }
+    previous_buffer = flip.display_buffer_index;
     return true;
 }
 
@@ -271,4 +324,37 @@ test "attribute groups and buffer slots cannot overlap" {
     try std.testing.expectError(error.SlotOccupied, registerBuffers(2, 2, &b, .{}, 0));
     try unregisterBuffers(1);
     try registerBuffers(2, 2, &b, .{}, 0);
+}
+
+test "VideoOut labels are contiguous and the previous flip is released" {
+    reset();
+    defer reset();
+    try std.testing.expect(open(0));
+    const address = labelAddress(primary_handle).?;
+    var one: [8]u8 = undefined;
+    std.mem.writeInt(u64, &one, 1, .little);
+    try std.testing.expect(writeLabelMemory(address + 3 * @sizeOf(u64), &one));
+
+    var pixels: [8]u8 = @splat(0);
+    const input = [_]Buffer{
+        .{ .data = &pixels, .metadata = null, .reserved = .{ null, null } },
+        .{ .data = &pixels, .metadata = null, .reserved = .{ null, null } },
+    };
+    try registerBuffers(0, 3, &input, .{ .width = 1, .height = 1 }, 0);
+    try std.testing.expect(completeFlip(.{
+        .video_out_handle = 1,
+        .display_buffer_index = 3,
+        .mode = 1,
+        .argument = 0,
+    }));
+    try std.testing.expect(writeLabelMemory(address + 3 * @sizeOf(u64), &one));
+    try std.testing.expect(completeFlip(.{
+        .video_out_handle = 1,
+        .display_buffer_index = 4,
+        .mode = 1,
+        .argument = 0,
+    }));
+    var released: [8]u8 = undefined;
+    try std.testing.expect(readLabelMemory(address + 3 * @sizeOf(u64), &released));
+    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, &released, .little));
 }

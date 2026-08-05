@@ -196,7 +196,10 @@ fn posixLseek(descriptor: i32, offset: i64, whence: i32) callconv(abi.guest) i64
 fn posixStat(path: ?[*:0]const u8, out: ?*filesystem.Stat) callconv(abi.guest) i64 {
     const name = spanOf(path) orelse return posixFail(Error.InvalidArgument);
     const record = writableRecord(filesystem.Stat, out) orelse return posixFail(Error.InvalidArgument);
-    filesystem.stat(name, record) catch |err| return posixFail(err);
+    filesystem.stat(name, record) catch |err| {
+        if (trace.isLive()) std.debug.print("[stat] '{s}': {s}\n", .{ name, @errorName(err) });
+        return posixFail(err);
+    };
     return 0;
 }
 

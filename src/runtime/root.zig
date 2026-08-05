@@ -90,9 +90,11 @@ pub const Runtime = struct {
         }
         try hle.registerAll(&self.database, allocator);
         hle.libs.audio.reset();
+        hle.apr.reset();
         hle.libs.bootstrap_services.reset();
         hle.libs.dialogs.reset();
         hle.libs.kernel_event_queue.reset();
+        hle.libs.kernel_ioctl.reset();
         hle.libs.network.reset();
         hle.libs.system_service.reset();
         hle.libs.user_service.reset();
@@ -115,9 +117,11 @@ pub const Runtime = struct {
         hle.libs.kernel_memory.attachAddressSpace(null);
         hle.libs.kernel_memory.deinit();
         hle.libs.audio.reset();
+        hle.apr.reset();
         hle.libs.bootstrap_services.reset();
         hle.libs.dialogs.reset();
         hle.libs.kernel_event_queue.reset();
+        hle.libs.kernel_ioctl.reset();
         hle.libs.network.reset();
         hle.libs.system_service.reset();
         hle.libs.user_service.reset();

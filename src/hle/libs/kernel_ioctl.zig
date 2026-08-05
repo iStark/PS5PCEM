@@ -8,12 +8,11 @@
 //! hardware through exactly one door: a control request on a device descriptor.
 //! Everything a GPU is asked to do arrives here.
 //!
-//! Only the small discovery requests described below are carried out. What
-//! matters for the rest is that every request remains *legible*: a request code
-//! is not an opaque number but a packed record of which device group is being
-//! addressed, which command it is, which way the payload travels and how large
-//! it is. Decoding it turns a trace of bare integers into a description of what
-//! the driver wanted, which is the specification each implementation has to
+//! Discovery and queue registration requests described below are carried out.
+//! Every other request remains *legible*: a request code is not an opaque number
+//! but a packed record of which device group is being addressed, which command
+//! it is, which way the payload travels and how large it is. Decoding it turns a
+//! trace of bare integers into the specification each implementation has to
 //! satisfy.
 //!
 //! ## What a shipped driver asks for
@@ -29,22 +28,24 @@
 //!   the small `/dev/gc` aperture and builds the driver's context. A non-zero
 //!   reply skips that setup and leaves the context null.
 //! - `/dev/gc` `#35`, input, 136 bytes. Installs the trap-handler resources.
-//! - `/dev/gc` `#33`, in/out, 64 bytes. Repeated for the driver's hardware
-//!   queues; the observed payload enumerates queue families and queue indices.
+//! - `/dev/gc` `#33`, in/out, 64 bytes. Repeated for all 56 hardware queues.
+//!   The payload carries engine/family/index identity, queue/control/completion
+//!   guest addresses and the fixed graphics aperture, so no reply handle needs
+//!   to be invented.
 //! - `/dev/gc` `#52` and `#38`, input, 4 bytes each. Their fields have not yet
 //!   been identified.
 //! - `/dev/gc` `#59`, in/out, 16 bytes. The wrapper fills the buffer with
 //!   `0xff` *before* calling and stores the reply in the final 16 bytes of the
 //!   driver's private device pool. Its individual fields are not yet consumed
 //!   by this layer, so the compatibility response clears them.
+//! - `/dev/gc` `#57`, in/out, 16 bytes. Queries the process suspend point.
+//!   Retail execution is not suspended, so its output state remains clear.
 //! - `/dev/dipsw` `#6`, out, 4 bytes. Answered here; see below.
 //!
 //! The discovery reply is only part of the contract. The driver's 2 MiB direct
 //! pool must remain at `0xfe0000000`, while its small aperture remains at
 //! `0xfe0200000`; `libSceAgc` derives its required FS table address as pool base
-//! plus `0x40000` and fatally rejects a relocated pool. Queue registration is
-//! still refused until its output fields have been recovered rather than being
-//! acknowledged with invented handles.
+//! plus `0x40000` and fatally rejects a relocated pool.
 
 const std = @import("std");
 const abi = @import("../abi.zig");
@@ -53,6 +54,7 @@ const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const runtime_api = @import("kernel_runtime.zig");
 const filesystem = @import("../filesystem.zig");
+const graphics_device = @import("../graphics_device.zig");
 const memory = @import("kernel_memory.zig");
 
 /// Which way the payload travels, from the caller's point of view.
@@ -156,7 +158,7 @@ pub fn write(
 }
 
 /// The most payload bytes shown in one trace line.
-const maximum_traced_payload: u16 = 32;
+const maximum_traced_payload: u16 = 64;
 
 /// Appends the bytes the caller sent, when it sent any.
 ///
@@ -213,6 +215,37 @@ fn answerGraphicsPresence(request: Request, payload: u64) bool {
     return true;
 }
 
+fn answerGraphicsTrapResources(request: Request, payload: u64) bool {
+    if (request.group != 0x81 or request.number != 35) return false;
+    if (request.direction != .write or request.length != 136) return false;
+    if (!memory.isGuestRangeAccessible(payload, request.length)) return false;
+    graphics_device.installTrapResources();
+    return true;
+}
+
+fn answerGraphicsQueueRegistration(request: Request, payload: u64) bool {
+    if (request.group != 0x81 or request.number != 33) return false;
+    if (request.direction != .read_write or request.length != @sizeOf(graphics_device.QueueRegistration)) return false;
+    if (!memory.isGuestRangeAccessible(payload, request.length)) return false;
+    const source: *const graphics_device.QueueRegistration = @ptrFromInt(payload);
+    graphics_device.registerQueue(source.*) catch return false;
+    return true;
+}
+
+fn answerGraphicsMode(request: Request, payload: u64) bool {
+    if (request.group != 0x81 or (request.number != 52 and request.number != 38)) return false;
+    if (request.direction != .write or request.length != @sizeOf(u32)) return false;
+    if (!memory.isGuestRangeAccessible(payload, request.length)) return false;
+    const source: *const [4]u8 = @ptrFromInt(payload);
+    const value = std.mem.readInt(u32, source, .little);
+    if (request.number == 52) {
+        graphics_device.setComputeMode(value);
+    } else {
+        graphics_device.setGraphicsMode(value);
+    }
+    return true;
+}
+
 /// Clears the driver's small service reply. The firmware table address is not
 /// encoded here: the shipped driver derives it from its fixed device pool.
 fn answerGraphicsServiceQuery(request: Request, payload: u64) bool {
@@ -222,6 +255,18 @@ fn answerGraphicsServiceQuery(request: Request, payload: u64) bool {
 
     const destination: *[16]u8 = @ptrFromInt(payload);
     @memset(destination, 0);
+    return true;
+}
+
+fn answerGraphicsSuspendQuery(request: Request, payload: u64) bool {
+    if (request.group != 0x81 or request.number != 57) return false;
+    if (request.direction != .read_write or request.length != 16) return false;
+    if (!memory.isGuestRangeAccessible(payload, request.length)) return false;
+    const words: *[4]u32 = @ptrFromInt(payload);
+    if (words[0] != 0 or words[1] != 1) return false;
+    words[2] = 0;
+    words[3] = 0;
+    graphics_device.recordSuspendQuery();
     return true;
 }
 
@@ -260,11 +305,19 @@ fn ioctl(descriptor: i32, request_code: u64, payload: u64) callconv(abi.guest) i
     announce(descriptor, device, request, payload);
 
     if (device == .graphics and answerGraphicsPresence(request, payload)) return 0;
+    if (device == .graphics and answerGraphicsTrapResources(request, payload)) return 0;
+    if (device == .graphics and answerGraphicsQueueRegistration(request, payload)) return 0;
+    if (device == .graphics and answerGraphicsMode(request, payload)) return 0;
     if (device == .graphics and answerGraphicsServiceQuery(request, payload)) return 0;
+    if (device == .graphics and answerGraphicsSuspendQuery(request, payload)) return 0;
     if (device == .dip_switches and answerDipSwitch(request, payload)) return 0;
 
     runtime_api.setPosixErrno(errno.Posix.enotty);
     return -1;
+}
+
+pub fn reset() void {
+    graphics_device.reset();
 }
 
 /// A private graphics-related capability query used by the shipped driver.
@@ -419,6 +472,79 @@ test "the graphics service query returns a neutral reply" {
     const request = encode(direction_in | direction_out, 0x81, 59, reply.len);
     try testing.expectEqual(@as(i64, 0), ioctl(fd, request, @intFromPtr(&reply)));
     try testing.expectEqualSlices(u8, &([_]u8{0} ** 16), &reply);
+}
+
+test "the graphics driver registers exact queue-owned memory" {
+    reset();
+    defer reset();
+    filesystem.detach();
+    const fd = try filesystem.open("/dev/gc", filesystem.O.rdonly);
+    defer filesystem.close(fd) catch {};
+
+    const registration = graphics_device.QueueRegistration{
+        .engine = 1,
+        .family = 0,
+        .index = 0,
+        .identifier = 1,
+        .queue_address = 0x7000_1000_8000,
+        .control_address = 0x7000_1000_c000,
+        .aperture_address = graphics_device.aperture_address,
+        .aperture_slots = 12,
+        .completion_address = 0x7000_2000_1000,
+        .completion_size = 0x1000,
+    };
+    const request = encode(direction_in | direction_out, 0x81, 33, @sizeOf(@TypeOf(registration)));
+    try testing.expectEqual(@as(i64, 0), ioctl(fd, request, @intFromPtr(&registration)));
+    try testing.expectEqual(@as(u32, 1), graphics_device.status().queue_count);
+    try testing.expectEqual(registration.queue_address, graphics_device.findQueue(1).?.queue_address);
+}
+
+test "the graphics driver initialization requests update device state" {
+    reset();
+    defer reset();
+    filesystem.detach();
+    const fd = try filesystem.open("/dev/gc", filesystem.O.rdonly);
+    defer filesystem.close(fd) catch {};
+
+    var trap: [136]u8 = @splat(0);
+    try testing.expectEqual(@as(i64, 0), ioctl(
+        fd,
+        encode(direction_in, 0x81, 35, trap.len),
+        @intFromPtr(&trap),
+    ));
+    var compute_mode: u32 = 3;
+    var graphics_mode: u32 = 1;
+    try testing.expectEqual(@as(i64, 0), ioctl(
+        fd,
+        encode(direction_in, 0x81, 52, @sizeOf(u32)),
+        @intFromPtr(&compute_mode),
+    ));
+    try testing.expectEqual(@as(i64, 0), ioctl(
+        fd,
+        encode(direction_in, 0x81, 38, @sizeOf(u32)),
+        @intFromPtr(&graphics_mode),
+    ));
+    const current = graphics_device.status();
+    try testing.expect(current.trap_resources_installed);
+    try testing.expectEqual(compute_mode, current.compute_mode);
+    try testing.expectEqual(graphics_mode, current.graphics_mode);
+}
+
+test "the graphics suspend query reports an active process" {
+    reset();
+    defer reset();
+    filesystem.detach();
+    const fd = try filesystem.open("/dev/gc", filesystem.O.rdonly);
+    defer filesystem.close(fd) catch {};
+
+    var query = [4]u32{ 0, 1, 0xdead_beef, 0xdead_beef };
+    try testing.expectEqual(@as(i64, 0), ioctl(
+        fd,
+        encode(direction_in | direction_out, 0x81, 57, @sizeOf(@TypeOf(query))),
+        @intFromPtr(&query),
+    ));
+    try testing.expectEqualSlices(u32, &[_]u32{ 0, 1, 0, 0 }, &query);
+    try testing.expectEqual(@as(u64, 1), graphics_device.status().suspend_query_count);
 }
 
 test "other graphics requests remain refused" {

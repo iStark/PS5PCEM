@@ -1054,9 +1054,16 @@ UI actions that cannot exist without a shell return `UNAVAILABLE`.
 Kernel user-edge event queues retain registrations and pending event payloads,
 and their waits use the same sequence-aware dispatcher contract as pthread
 synchronization. Main direct-memory allocation, named direct mappings, stack
-queries, and live pthread scheduling metadata are also exposed. APR entry points
-are linkable but return `ENOSYS` until the runtime owns an accelerator backend;
-they never fabricate successful I/O.
+queries, and live pthread scheduling metadata are also exposed. The APR/AMPR
+path now owns a read-only file registry and command-buffer lifecycle: it resolves
+guest paths to stable IDs and sizes, records reads with their 64-bit file
+offsets, submits them synchronously into checked guest memory, permits the short
+read expected at EOF, and reports completion once through the matching wait.
+Malformed headers, oversized transfers and invalid IDs are rejected rather than
+reported as successful I/O. The implementation is in
+[src/hle/apr.zig](src/hle/apr.zig) and the guest ABI wrappers remain in
+[src/hle/libs/kernel_runtime.zig](src/hle/libs/kernel_runtime.zig) and
+[src/hle/libs/bootstrap_services.zig](src/hle/libs/bootstrap_services.zig).
 
 **Offline network, dialogs, and headless audio**
 ([src/hle/libs/network.zig](src/hle/libs/network.zig),
@@ -1078,9 +1085,12 @@ surface in [src/hle/libs/bootstrap_services.zig](src/hle/libs/bootstrap_services
 provides AvPlayer state and conservative platform/GPU command stubs for native
 title initialization. VideoOut is no longer only a headless counter: it retains
 up to sixteen registered display allocations and four attribute groups,
-validates register/change/unregister operations, routes CPU and EOP flips
-through the live DCB backend, and publishes completion status only after the
-presentation callback accepts the frame.
+publishes the contiguous sixteen-label ABI used by the driver, accepts the
+blank `-1` flip used during startup, and delivers completed flips through the
+VideoOut event-queue filter with the caller's user data. Register, change and
+unregister operations are validated; CPU and EOP flips pass through the live
+DCB backend, and a normal flip becomes complete only after the presentation
+callback accepts the frame.
 
 **Sound output** ([src/hle/audio_device.zig](src/hle/audio_device.zig))
 
@@ -1164,10 +1174,15 @@ reimplement the graphics API and never reach a device node.
 Mode-switch reads are answered as clear, which is the state of a retail console
 and not an invented value; only the byte count the request itself declares is
 written, through a pointer checked against the guest address space, and only up
-to a bound. The two recovered graphics discovery requests are answered exactly.
-Other graphics requests are refused with `ENOTTY`: queue registration hands
-back handles and addresses the driver will later dereference, so false success
-would replace an actionable error with delayed corruption.
+to a bound. The device state in
+[src/hle/graphics_device.zig](src/hle/graphics_device.zig) now retains trap
+resources, compute and graphics modes, suspend queries, and the full matrix of
+56 queues requested by the shipped driver. Each 64-byte queue registration is
+validated by engine, family, index, ID, alignment, aperture and completion page
+before the resulting queue state is published. Verified discovery and service
+requests are handled exactly. Unknown requests, currently commands `#40` and
+`#42`, remain refused with `ENOTTY`: false success would replace an actionable
+error with delayed corruption.
 
 The shipped driver also relies on addresses that look like hints but are part
 of its ABI. Its 2 MiB direct-memory pool remains at `0xfe0000000`, the small
@@ -1267,21 +1282,23 @@ and dereferences, so false success crashes it. A submission returns only a
 status and the title is not blocked on it, so reporting failure would abort a
 frame the title had already fully described — and lose the description with it.
 
-The current title reaches two submissions of 466 and 530 dwords. With its real
-register constructors restored, the decoder walks 38 and 42 packets respectively
-and observes one draw plus three dispatches in each. The early bootstrap draws
-do not bind a color or depth target, but their context, shader and user-config
-lists now reach the persistent tracker and the typed draw-state callback without
-an invalid packet or a stopped queue.
+An earlier bootstrap capture reached two submissions of 466 and 530 dwords. With
+its real register constructors restored, the decoder walks 38 and 42 packets
+respectively and observes one draw plus three dispatches in each. Those early
+bootstrap draws do not bind a color or depth target, but their context, shader
+and user-config lists reach the persistent tracker and the typed draw-state
+callback without an invalid packet or a stopped queue.
 
 The backported Terminator test with its complete directory supplied through
-`--app0` now creates the NVIDIA Vulkan VideoOut window, loads all six images and
-enters the shipped AGC driver. Its next live blocker precedes rendering: queue
-registration for queues 32–87 is still absent, so
-`submitCommandBufferAndGetResult` and `waitCommandBufferCompletion` return
-`0x80020002` before a displayable frame is submitted. That makes `/dev/gc`
-queue-registration/ioctl output recovery the next title-facing milestone,
-rather than more swapchain work.
+`--app0` now creates the Vulkan VideoOut window, loads all six executable images,
+registers queues 32–87, and streams the Unity metadata and asset files through
+APR without the previous resource-corruption or VideoOut-label errors. A
+120-second live run remains stable and silent on standard error. This is not yet
+a rendered game frame: the complete-content path has not submitted its first
+observable DCB/ACB, while the shipped driver periodically reaches its suspend
+point. The next title-facing boundary is therefore the still-unhandled `/dev/gc`
+commands `#40` and `#42`, followed by verified graphics event-queue completion
+and capture of the first post-stream command buffer.
 
 ## Error codes
 
@@ -1297,9 +1314,12 @@ from leaking into host code where nothing would check it.
 
 ## Roadmap
 
-1. Implement APR/AMPR file resolution and reads for titles whose patched
-   executable reaches streaming before graphics submission.
-2. Recover `/dev/gc` queue-registration outputs for the shipped driver path.
+1. Recover the payload semantics of `/dev/gc` commands `#40` and `#42` from the
+   shipped driver and implement only their verified state transitions.
+2. Implement graphics event-queue registration and completion, then capture the
+   first post-stream DCB/ACB from the complete title path.
+3. Validate that command buffer against the supported PM4/Vulkan subset and add
+   the missing state or execution path required for the first real game frame.
 
 ---
 

@@ -16,6 +16,8 @@ const maximum_queues = 64;
 const maximum_events = 64;
 const user_filter: i16 = -11;
 const timer_filter: i16 = -7;
+pub const video_out_filter: i16 = -13;
+pub const video_out_flip_ident: u64 = 6;
 const event_add: u16 = 0x01;
 const event_clear: u16 = 0x20;
 const wait_key_prefix: u64 = 0x4551_0000_0000_0000;
@@ -36,6 +38,7 @@ comptime {
 const Registration = struct {
     active: bool = false,
     ident: u64 = 0,
+    filter: i16 = user_filter,
     /// Edge-triggered registrations clear themselves once delivered; level
     /// ones stay raised until the title acts on them.
     edge: bool = true,
@@ -121,19 +124,7 @@ fn deleteEqueue(handle: i64) callconv(abi.guest) i32 {
 }
 
 fn addUserEventEdge(handle: i64, id: i32) callconv(abi.guest) i32 {
-    lock.lock();
-    defer lock.unlock();
-    const queue = findQueue(handle) orelse return KernelError.ebadf.raw();
-    const ident: u64 = @bitCast(@as(i64, id));
-    for (&queue.registrations) |*registration| {
-        if (registration.active and registration.ident == ident) return KernelError.eexist.raw();
-    }
-    for (&queue.registrations) |*registration| {
-        if (registration.active) continue;
-        registration.* = .{ .active = true, .ident = ident };
-        return errno.ok;
-    }
-    return KernelError.enospc.raw();
+    return addRegistration(handle, id, .{});
 }
 
 /// Registers a level-triggered user event.
@@ -147,6 +138,7 @@ fn addUserEvent(handle: i64, id: i32) callconv(abi.guest) i32 {
 
 const RegistrationOptions = struct {
     edge: bool = true,
+    filter: i16 = user_filter,
     deadline_microseconds: ?u64 = null,
     period_microseconds: ?u64 = null,
     user_data: u64 = 0,
@@ -159,13 +151,16 @@ fn addRegistration(handle: i64, id: i32, options: RegistrationOptions) i32 {
     const ident: u64 = @bitCast(@as(i64, id));
 
     for (&queue.registrations) |*registration| {
-        if (registration.active and registration.ident == ident) return KernelError.eexist.raw();
+        if (registration.active and registration.ident == ident and registration.filter == options.filter) {
+            return KernelError.eexist.raw();
+        }
     }
     for (&queue.registrations) |*registration| {
         if (registration.active) continue;
         registration.* = .{
             .active = true,
             .ident = ident,
+            .filter = options.filter,
             .edge = options.edge,
             .deadline_microseconds = options.deadline_microseconds,
             .period_microseconds = options.period_microseconds,
@@ -256,7 +251,7 @@ fn deleteUserEvent(handle: i64, id: i32) callconv(abi.guest) i32 {
     const queue = findQueue(handle) orelse return KernelError.ebadf.raw();
     const ident: u64 = @bitCast(@as(i64, id));
     for (&queue.registrations) |*registration| {
-        if (!registration.active or registration.ident != ident) continue;
+        if (!registration.active or registration.ident != ident or registration.filter != user_filter) continue;
         registration.* = .{};
         return errno.ok;
     }
@@ -272,7 +267,7 @@ fn triggerUserEvent(handle: i64, id: i32, user_data: u64) callconv(abi.guest) i3
     const ident: u64 = @bitCast(@as(i64, id));
     var registered = false;
     for (queue.registrations) |registration| {
-        if (registration.active and registration.ident == ident) {
+        if (registration.active and registration.ident == ident and registration.filter == user_filter) {
             registered = true;
             break;
         }
@@ -298,6 +293,69 @@ fn triggerUserEvent(handle: i64, id: i32, user_data: u64) callconv(abi.guest) i3
     lock.unlock();
     threading.wakeWaiters(waitKey(handle), sequence, 1);
     return errno.ok;
+}
+
+/// Registers the VideoOut flip edge used by display-worker event queues.
+pub fn addVideoOutFlipEvent(handle: i64, user_data: u64) i32 {
+    return addRegistration(handle, @intCast(video_out_flip_ident), .{
+        .edge = true,
+        .filter = video_out_filter,
+        .user_data = user_data,
+    });
+}
+
+pub fn deleteVideoOutFlipEvent(handle: i64) i32 {
+    lock.lock();
+    defer lock.unlock();
+    const queue = findQueue(handle) orelse return KernelError.ebadf.raw();
+    for (&queue.registrations) |*registration| {
+        if (!registration.active or registration.ident != video_out_flip_ident or
+            registration.filter != video_out_filter)
+        {
+            continue;
+        }
+        registration.* = .{};
+        return errno.ok;
+    }
+    return KernelError.enoent.raw();
+}
+
+/// Delivers one completed flip to every equeue that registered for it.
+pub fn triggerVideoOutFlip(flip_argument: i64) usize {
+    var wake_handles: [maximum_queues]i64 = undefined;
+    var wake_sequences: [maximum_queues]u64 = undefined;
+    var wake_count: usize = 0;
+
+    lock.lock();
+    for (&queues) |*queue| {
+        if (!queue.active or queue.pending_count == maximum_events) continue;
+        const registration = for (queue.registrations) |candidate| {
+            if (candidate.active and candidate.ident == video_out_flip_ident and
+                candidate.filter == video_out_filter)
+            {
+                break candidate;
+            }
+        } else continue;
+        const index = (queue.pending_head + queue.pending_count) % maximum_events;
+        queue.pending[index] = .{
+            .ident = video_out_flip_ident,
+            .filter = video_out_filter,
+            .flags = event_add | event_clear,
+            .data = flip_argument,
+            .user_data = registration.user_data,
+        };
+        queue.pending_count += 1;
+        queue.sequence +%= 1;
+        wake_handles[wake_count] = queue.handle;
+        wake_sequences[wake_count] = queue.sequence;
+        wake_count += 1;
+    }
+    lock.unlock();
+
+    for (wake_handles[0..wake_count], wake_sequences[0..wake_count]) |handle, sequence| {
+        threading.wakeWaiters(waitKey(handle), sequence, 1);
+    }
+    return wake_count;
 }
 
 fn dequeue(
@@ -500,4 +558,22 @@ test "user edge events round-trip through an event queue" {
     try std.testing.expectEqual(@as(i32, user_filter), getEventFilter(&event[0]));
     try std.testing.expectEqual(@as(u64, 0x1234), event[0].user_data);
     try std.testing.expectEqual(errno.ok, deleteEqueue(handle));
+}
+
+test "VideoOut flip events retain their filter and user data" {
+    reset();
+    var handle: i64 = 0;
+    try std.testing.expectEqual(errno.ok, createEqueue(&handle, "video-out"));
+    defer _ = deleteEqueue(handle);
+    try std.testing.expectEqual(errno.ok, addVideoOutFlipEvent(handle, 0x1234));
+    try std.testing.expectEqual(@as(usize, 1), triggerVideoOutFlip(77));
+
+    var event: [1]Event = .{.{}};
+    var count: i32 = 0;
+    var timeout: u32 = 0;
+    try std.testing.expectEqual(errno.ok, waitEqueue(handle, &event, 1, &count, &timeout));
+    try std.testing.expectEqual(@as(i16, video_out_filter), event[0].filter);
+    try std.testing.expectEqual(video_out_flip_ident, event[0].ident);
+    try std.testing.expectEqual(@as(i64, 77), event[0].data);
+    try std.testing.expectEqual(@as(u64, 0x1234), event[0].user_data);
 }

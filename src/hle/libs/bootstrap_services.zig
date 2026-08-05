@@ -13,15 +13,153 @@ const symbols = @import("../symbols.zig");
 const kernel_runtime = @import("kernel_runtime.zig");
 const kernel_threading = @import("kernel_threading.zig");
 const kernel_memory = @import("kernel_memory.zig");
+const kernel_event_queue = @import("kernel_event_queue.zig");
 const agc_submit = @import("agc_submit.zig");
 const agc_shader_registry = @import("agc_shader_registry.zig");
 const gpu = @import("gpu");
+const apr = @import("../apr.zig");
 const video_out = @import("../video_out.zig");
 
 const invalid_argument = errno.KernelError.einval.raw();
+const ampr_command_buffer_header_size: u64 = 0x18;
+const ampr_command_buffer_maximum_size: u64 = 64 * 1024 * 1024;
+const ampr_gather_scatter_valid: u32 = 0x0001_0000;
 
 fn success() callconv(abi.guest) i32 {
     return errno.ok;
+}
+
+fn aprError(err: apr.Error) i32 {
+    return switch (err) {
+        error.FileNotFound, error.UnknownFile => errno.KernelError.enoent.raw(),
+        error.FileTableFull, error.CommandBufferTableFull, error.SubmissionTableFull => errno.KernelError.enomem.raw(),
+        error.IoFailed => errno.KernelError.eio.raw(),
+        error.InvalidPath, error.InvalidCommandBuffer, error.TooManyCommands, error.InvalidRead, error.UnknownSubmission => errno.KernelError.einval.raw(),
+    };
+}
+
+fn amprCommandBufferConstructor(address: u64) callconv(abi.guest) i32 {
+    if (address == 0) return errno.ok;
+    if (!kernel_memory.isGuestRangeAccessible(address, ampr_command_buffer_header_size)) {
+        return errno.KernelError.efault.raw();
+    }
+    apr.constructCommandBuffer(address) catch |err| return aprError(err);
+    const header: *[ampr_command_buffer_header_size]u8 = @ptrFromInt(address);
+    @memset(header, 0);
+    return errno.ok;
+}
+
+fn amprAprCommandBufferConstructor(address: u64, reserved_state_0: u64, reserved_state_1: u64) callconv(abi.guest) i32 {
+    if (address == 0) return errno.ok;
+    apr.constructCommandBuffer(address) catch |err| return aprError(err);
+    const state_0 = if (reserved_state_0 == 0) address + 0x18 else reserved_state_0;
+    const state_1 = if (reserved_state_1 == 0) address + 0x20 else reserved_state_1;
+    if (!kernel_memory.isGuestRangeAccessible(state_0, @sizeOf(u64)) or
+        !kernel_memory.isGuestRangeAccessible(state_1, @sizeOf(u64)))
+    {
+        return errno.KernelError.efault.raw();
+    }
+    writeGuestU64(state_0, 0);
+    writeGuestU64(state_1, 0);
+    return errno.ok;
+}
+
+fn amprCommandBufferSetBuffer(address: u64, storage_address: u64, storage_size: usize) callconv(abi.guest) i32 {
+    if (!kernel_memory.isGuestRangeAccessible(address, ampr_command_buffer_header_size)) {
+        return errno.KernelError.efault.raw();
+    }
+    if (storage_address == 0 or (storage_address & 3) != 0 or storage_size == 0 or
+        storage_size > ampr_command_buffer_maximum_size or (storage_size & 3) != 0)
+    {
+        return errno.KernelError.einval.raw();
+    }
+    if (readGuestU64(address + 0x10) != 0) return errno.KernelError.ebusy.raw();
+    if (!kernel_memory.isGuestRangeAccessible(storage_address, storage_size)) {
+        return errno.KernelError.efault.raw();
+    }
+    apr.setCommandBufferStorage(address, storage_address, storage_size) catch |err| return aprError(err);
+    writeGuestU32(address + 0x04, 0);
+    writeGuestU32(address + 0x08, 0);
+    writeGuestU32(address + 0x0c, @intCast(storage_size));
+    writeGuestU64(address + 0x10, storage_address);
+    return errno.ok;
+}
+
+fn amprCommandBufferReset(address: u64) callconv(abi.guest) i32 {
+    if (!kernel_memory.isGuestRangeAccessible(address, ampr_command_buffer_header_size)) {
+        return errno.KernelError.efault.raw();
+    }
+    if (readGuestU64(address + 0x10) == 0 or readGuestU32(address + 0x0c) == 0) {
+        return errno.KernelError.eperm.raw();
+    }
+    apr.resetCommandBuffer(address) catch |err| return aprError(err);
+    writeGuestU32(address + 0x04, 0);
+    writeGuestU32(address + 0x08, 0);
+    return errno.ok;
+}
+
+fn amprAprCommandBufferReadFile(
+    address: u64,
+    _: u64,
+    _: u64,
+    file_identifier: u32,
+    destination: u64,
+    size: u64,
+    file_offset: u64,
+) callconv(abi.guest) i32 {
+    if (size == 0 or size > apr.maximum_read_bytes or file_offset >= apr.maximum_file_offset) {
+        return errno.KernelError.einval.raw();
+    }
+    if (!kernel_memory.isGuestRangeAccessible(destination, size)) return errno.KernelError.efault.raw();
+    if (!kernel_memory.isGuestRangeAccessible(address, ampr_command_buffer_header_size)) {
+        return errno.KernelError.efault.raw();
+    }
+    const record_size: u32 = if ((file_offset >> 32) != 0) 0x18 else 0x14;
+    const storage_address = readGuestU64(address + 0x10);
+    const storage_size = readGuestU32(address + 0x0c);
+    const write_offset = readGuestU32(address + 0x04);
+    if (storage_address == 0 or write_offset > storage_size or record_size > storage_size - write_offset) {
+        return errno.KernelError.efault.raw();
+    }
+    const record_address = std.math.add(u64, storage_address, write_offset) catch {
+        return errno.KernelError.efault.raw();
+    };
+    if (!kernel_memory.isGuestRangeAccessible(record_address, record_size)) {
+        return errno.KernelError.efault.raw();
+    }
+    apr.appendRead(address, .{
+        .file_identifier = file_identifier,
+        .destination = destination,
+        .size = @intCast(size),
+        .file_offset = file_offset,
+    }) catch |err| return aprError(err);
+    const record: [*]u8 = @ptrFromInt(record_address);
+    @memset(record[0..record_size], 0);
+    record[0] = 0x17;
+    writeGuestU32(address + 0x00, readGuestU32(address + 0x00) | ampr_gather_scatter_valid);
+    writeGuestU32(address + 0x04, write_offset + record_size);
+    writeGuestU32(address + 0x08, readGuestU32(address + 0x08) +% 1);
+    return errno.ok;
+}
+
+fn readGuestU32(address: u64) u32 {
+    const source: *const [4]u8 = @ptrFromInt(address);
+    return std.mem.readInt(u32, source, .little);
+}
+
+fn readGuestU64(address: u64) u64 {
+    const source: *const [8]u8 = @ptrFromInt(address);
+    return std.mem.readInt(u64, source, .little);
+}
+
+fn writeGuestU32(address: u64, value: u32) void {
+    const destination: *[4]u8 = @ptrFromInt(address);
+    std.mem.writeInt(u32, destination, value, .little);
+}
+
+fn writeGuestU64(address: u64, value: u64) void {
+    const destination: *[8]u8 = @ptrFromInt(address);
+    std.mem.writeInt(u64, destination, value, .little);
 }
 
 // Offline POSIX sockets ----------------------------------------------------
@@ -77,6 +215,7 @@ const video_out_error_invalid_value: i32 = @bitCast(@as(u32, 0x8029_0001));
 const video_out_error_invalid_address: i32 = @bitCast(@as(u32, 0x8029_0002));
 const video_out_error_invalid_index: i32 = @bitCast(@as(u32, 0x8029_000a));
 const video_out_error_invalid_handle: i32 = @bitCast(@as(u32, 0x8029_000b));
+const video_out_error_invalid_event_queue: i32 = @bitCast(@as(u32, 0x8029_000c));
 const video_out_error_slot_occupied: i32 = @bitCast(@as(u32, 0x8029_0010));
 const video_out_error_invalid_option: i32 = @bitCast(@as(u32, 0x8029_001a));
 const video_out_error_invalid_category: i32 = @bitCast(@as(u32, 0x8029_001d));
@@ -204,7 +343,9 @@ fn videoOutSubmitChangeBufferAttribute2(
 
 fn videoOutSubmitFlip(handle: i32, index: i32, mode: i32, argument: i64) callconv(abi.guest) i32 {
     if (!validVideoHandle(handle)) return video_out_error_invalid_handle;
-    if (video_out.resolve(@intCast(handle), index) == null) return video_out_error_invalid_index;
+    if (index < -1 or (index >= 0 and video_out.resolve(@intCast(handle), index) == null)) {
+        return video_out_error_invalid_index;
+    }
     _ = agc_submit.presentFlip(.{
         .video_out_handle = @intCast(handle),
         .display_buffer_index = index,
@@ -240,7 +381,28 @@ fn videoOutIsOutputSupported(handle: i32, _: u64, _: ?*const anyopaque, _: ?*any
 
 fn videoOutGetEventId(event: ?*const @import("kernel_event_queue.zig").Event) callconv(abi.guest) i32 {
     const value = event orelse return 0;
+    if (value.filter == kernel_event_queue.video_out_filter and
+        value.ident == kernel_event_queue.video_out_flip_ident)
+    {
+        return 0;
+    }
     return @bitCast(@as(u32, @truncate(value.ident)));
+}
+
+fn videoOutAddFlipEvent(equeue: i64, handle: i32, user_data: u64) callconv(abi.guest) i32 {
+    if (!validVideoHandle(handle)) return video_out_error_invalid_handle;
+    return if (kernel_event_queue.addVideoOutFlipEvent(equeue, user_data) == errno.ok)
+        errno.ok
+    else
+        video_out_error_invalid_event_queue;
+}
+
+fn videoOutDeleteFlipEvent(equeue: i64, handle: i32) callconv(abi.guest) i32 {
+    if (!validVideoHandle(handle)) return video_out_error_invalid_handle;
+    return if (kernel_event_queue.deleteVideoOutFlipEvent(equeue) == errno.ok)
+        errno.ok
+    else
+        video_out_error_invalid_event_queue;
 }
 
 fn videoOutIsFlipPending(handle: i32) callconv(abi.guest) i32 {
@@ -275,14 +437,15 @@ fn videoOutSysGetBus(handle: i32) callconv(abi.guest) i32 {
     return if (validVideoHandle(handle)) 0 else video_out_error_invalid_handle;
 }
 
-/// Where the hardware writes the labels that say a buffer is free again.
-///
-/// Refused. A driver reads these to know when it may reuse a buffer, so
-/// handing back an address whose contents nothing ever updates would leave it
-/// waiting on a value that never changes — a stall with nothing to point at,
-/// rather than an error naming the facility that is missing.
-fn videoOutGetBufferLabelAddress(_: i32, _: u64) callconv(abi.guest) i32 {
-    return video_out_error_invalid_address;
+/// Returns the base of 16 contiguous 64-bit flip-completion labels.
+fn videoOutGetBufferLabelAddress(handle: i32, output_address: u64) callconv(abi.guest) i32 {
+    if (output_address == 0 or !kernel_memory.isGuestRangeAccessible(output_address, @sizeOf(u64))) {
+        return video_out_error_invalid_address;
+    }
+    const label_address = video_out.labelAddress(handle) orelse return video_out_error_invalid_handle;
+    const output: *[8]u8 = @ptrFromInt(output_address);
+    std.mem.writeInt(u64, output, label_address, .little);
+    return video_out.maximum_buffers;
 }
 
 /// How far the display pipeline has progressed.
@@ -305,8 +468,8 @@ const video_out_exports = [_]symbols.Export{
     .{ .name = "sceVideoOutGetFlipStatus", .function = trace.wrap("sceVideoOutGetFlipStatus", &videoOutGetFlipStatus), .expect_id = "SbU3dwp80lQ" },
     .{ .name = "sceVideoOutIsFlipPending", .function = trace.wrap("sceVideoOutIsFlipPending", &videoOutIsFlipPending), .expect_id = "zgXifHT9ErY" },
     .{ .name = "sceVideoOutSetFlipRate", .function = trace.wrap("sceVideoOutSetFlipRate", &videoHandleOption), .expect_id = "CBiu4mCE1DA" },
-    .{ .name = "sceVideoOutAddFlipEvent", .function = trace.wrap("sceVideoOutAddFlipEvent", &videoHandleOption), .expect_id = "HXzjK9yI30k" },
-    .{ .name = "sceVideoOutDeleteFlipEvent", .function = trace.wrap("sceVideoOutDeleteFlipEvent", &videoHandleOption), .expect_id = "-Ozn0F1AFRg" },
+    .{ .name = "sceVideoOutAddFlipEvent", .function = trace.wrap("sceVideoOutAddFlipEvent", &videoOutAddFlipEvent), .expect_id = "HXzjK9yI30k" },
+    .{ .name = "sceVideoOutDeleteFlipEvent", .function = trace.wrap("sceVideoOutDeleteFlipEvent", &videoOutDeleteFlipEvent), .expect_id = "-Ozn0F1AFRg" },
     .{ .name = "sceVideoOutGetEventId", .function = trace.wrap("sceVideoOutGetEventId", &videoOutGetEventId), .expect_id = "U2JJtSqNKZI" },
     .{ .name = "sceVideoOutGetOutputStatus", .function = trace.wrap("sceVideoOutGetOutputStatus", &videoOutGetOutputStatus), .expect_id = "utPrVdxio-8" },
     .{ .name = "sceVideoOutIsOutputSupported", .function = trace.wrap("sceVideoOutIsOutputSupported", &videoOutIsOutputSupported), .expect_id = "Nv8c-Kb+DUM" },
@@ -866,11 +1029,11 @@ const agc_driver_exports = [_]symbols.Export{
 };
 
 const ampr_exports = [_]symbols.Export{
-    .{ .name = "sceAmprCommandBufferConstructor", .function = trace.wrap("sceAmprCommandBufferConstructor", &success), .expect_id = "8aI7R7WaOlc" },
-    .{ .name = "sceAmprAprCommandBufferConstructor", .function = trace.wrap("sceAmprAprCommandBufferConstructor", &success), .expect_id = "a8uLzYY--tM" },
-    .{ .name = "sceAmprCommandBufferReset", .function = trace.wrap("sceAmprCommandBufferReset", &success), .expect_id = "baQO9ez2gL4" },
-    .{ .name = "sceAmprCommandBufferSetBuffer", .function = trace.wrap("sceAmprCommandBufferSetBuffer", &success), .expect_id = "N-FSPA4S3nI" },
-    .{ .name = "sceAmprAprCommandBufferReadFile", .function = trace.wrap("sceAmprAprCommandBufferReadFile", &success), .expect_id = "mQ16-QdKv7k" },
+    .{ .name = "sceAmprCommandBufferConstructor", .function = trace.wrap("sceAmprCommandBufferConstructor", &amprCommandBufferConstructor), .expect_id = "8aI7R7WaOlc" },
+    .{ .name = "sceAmprAprCommandBufferConstructor", .function = trace.wrap("sceAmprAprCommandBufferConstructor", &amprAprCommandBufferConstructor), .expect_id = "a8uLzYY--tM" },
+    .{ .name = "sceAmprCommandBufferReset", .function = trace.wrap("sceAmprCommandBufferReset", &amprCommandBufferReset), .expect_id = "baQO9ez2gL4" },
+    .{ .name = "sceAmprCommandBufferSetBuffer", .function = trace.wrap("sceAmprCommandBufferSetBuffer", &amprCommandBufferSetBuffer), .expect_id = "N-FSPA4S3nI" },
+    .{ .name = "sceAmprAprCommandBufferReadFile", .function = trace.wrap("sceAmprAprCommandBufferReadFile", &amprAprCommandBufferReadFile), .expect_id = "mQ16-QdKv7k" },
 };
 
 pub fn reset() void {

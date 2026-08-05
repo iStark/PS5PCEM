@@ -16,6 +16,7 @@ const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const unwind = @import("../unwind.zig");
 const modules = @import("../modules.zig");
+const apr = @import("../apr.zig");
 const memory_api = @import("kernel_memory.zig");
 const threading = @import("kernel_threading.zig");
 
@@ -265,6 +266,98 @@ fn kernelUnsupported(
     _: u64,
 ) callconv(abi.guest) i32 {
     return KernelError.enosys.raw();
+}
+
+fn aprResolveFilepathsToIdsAndFileSizes(
+    paths_address: u64,
+    count: u64,
+    identifiers_address: u64,
+    sizes_address: u64,
+    results_address: u64,
+    option: u64,
+) callconv(abi.guest) i32 {
+    if (count == 0 or count > 64) return KernelError.einval.raw();
+    const path_bytes = std.math.mul(u64, count, @sizeOf(u64)) catch return KernelError.einval.raw();
+    const identifier_bytes = std.math.mul(u64, count, @sizeOf(u32)) catch return KernelError.einval.raw();
+    const size_bytes = std.math.mul(u64, count, @sizeOf(u64)) catch return KernelError.einval.raw();
+    const result_bytes = std.math.mul(u64, count, @sizeOf(i32)) catch return KernelError.einval.raw();
+    if (!memory_api.isGuestRangeAccessible(paths_address, path_bytes) or
+        !memory_api.isGuestRangeAccessible(identifiers_address, identifier_bytes) or
+        !memory_api.isGuestRangeAccessible(sizes_address, size_bytes) or
+        !memory_api.isGuestRangeAccessible(results_address, result_bytes))
+    {
+        return KernelError.efault.raw();
+    }
+
+    const paths: [*]const u64 = @ptrFromInt(paths_address);
+    for (paths[0..@intCast(count)], 0..) |path_address, index| {
+        var path_buffer: [apr.maximum_path]u8 = undefined;
+        const path = readGuestCString(path_address, &path_buffer) orelse return KernelError.efault.raw();
+        const resolved = apr.resolve(path) catch |err| return aprKernelError(err);
+        const identifier_destination: *[4]u8 = @ptrFromInt(identifiers_address + index * @sizeOf(u32));
+        const size_destination: *[8]u8 = @ptrFromInt(sizes_address + index * @sizeOf(u64));
+        const result_destination: *[4]u8 = @ptrFromInt(results_address + index * @sizeOf(i32));
+        std.mem.writeInt(u32, identifier_destination, resolved.identifier, .little);
+        std.mem.writeInt(u64, size_destination, resolved.size, .little);
+        std.mem.writeInt(i32, result_destination, 0, .little);
+        if (trace.isLive()) {
+            std.debug.print(
+                "[apr resolve {d}] '{s}' -> id={d} size={d} option=0x{x}\n",
+                .{ index, path, resolved.identifier, resolved.size, option },
+            );
+        }
+    }
+    return 0;
+}
+
+fn readGuestCString(address: u64, buffer: []u8) ?[]const u8 {
+    if (address == 0) return null;
+    var length: usize = 0;
+    while (length < buffer.len) : (length += 1) {
+        if (!memory_api.isGuestRangeAccessible(address + length, 1)) return null;
+        const source: *const u8 = @ptrFromInt(address + length);
+        if (source.* == 0) return if (length == 0) null else buffer[0..length];
+        buffer[length] = source.*;
+    }
+    return null;
+}
+
+fn aprKernelError(err: apr.Error) i32 {
+    return switch (err) {
+        error.FileNotFound, error.UnknownFile => KernelError.enoent.raw(),
+        error.FileTableFull, error.CommandBufferTableFull, error.SubmissionTableFull => KernelError.enomem.raw(),
+        error.IoFailed => KernelError.eio.raw(),
+        error.InvalidPath, error.InvalidCommandBuffer, error.TooManyCommands, error.InvalidRead, error.UnknownSubmission => KernelError.einval.raw(),
+    };
+}
+
+fn aprSubmitCommandBufferAndGetResult(
+    command_buffer: u64,
+    _: u64,
+    result_address: u64,
+    identifier_address: u64,
+) callconv(abi.guest) i32 {
+    if (command_buffer == 0) return KernelError.einval.raw();
+    if ((result_address != 0 and !memory_api.isGuestRangeAccessible(result_address, 8)) or
+        (identifier_address != 0 and !memory_api.isGuestRangeAccessible(identifier_address, @sizeOf(u32))))
+    {
+        return KernelError.efault.raw();
+    }
+    const identifier = apr.submitCommandBuffer(command_buffer) catch |err| return aprKernelError(err);
+    if (result_address != 0) {
+        const result: *[8]u8 = @ptrFromInt(result_address);
+        @memset(result, 0);
+    }
+    if (identifier_address != 0) {
+        const identifier_output: *[4]u8 = @ptrFromInt(identifier_address);
+        std.mem.writeInt(u32, identifier_output, identifier, .little);
+    }
+    return 0;
+}
+
+fn aprWaitCommandBuffer(identifier: u32) callconv(abi.guest) i32 {
+    apr.waitCommandBuffer(identifier) catch |err| return aprKernelError(err);
+    return 0;
 }
 
 /// Parks a guest worker on an address until a matching wake is published.
@@ -1292,9 +1385,9 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceKernelSetGPO", .function = trace.wrap("sceKernelSetGPO", &setGpo), .expect_id = "ca7v6Cxulzs" },
     .{ .name = "sceKernelCancelEventFlag", .function = trace.wrap("sceKernelCancelEventFlag", &cancelEventFlag), .expect_id = "PZku4ZrXJqg" },
     .{ .name = "sceKernelDeleteSema", .function = trace.wrap("sceKernelDeleteSema", &deleteSemaphore), .expect_id = "R1Jvn8bSCW8" },
-    .{ .name = "sceKernelAprResolveFilepathsToIdsAndFileSizes", .function = trace.wrap("sceKernelAprResolveFilepathsToIdsAndFileSizes", &kernelUnsupported), .expect_id = "gEpBkcwxUjw" },
-    .{ .name = "sceKernelAprSubmitCommandBufferAndGetResult", .function = trace.wrap("sceKernelAprSubmitCommandBufferAndGetResult", &kernelUnsupported), .expect_id = "ASoW5WE-UPo" },
-    .{ .name = "sceKernelAprWaitCommandBuffer", .function = trace.wrap("sceKernelAprWaitCommandBuffer", &kernelUnsupported), .expect_id = "rqwFKI4PAiM" },
+    .{ .name = "sceKernelAprResolveFilepathsToIdsAndFileSizes", .function = trace.wrap("sceKernelAprResolveFilepathsToIdsAndFileSizes", &aprResolveFilepathsToIdsAndFileSizes), .expect_id = "gEpBkcwxUjw" },
+    .{ .name = "sceKernelAprSubmitCommandBufferAndGetResult", .function = trace.wrap("sceKernelAprSubmitCommandBufferAndGetResult", &aprSubmitCommandBufferAndGetResult), .expect_id = "ASoW5WE-UPo" },
+    .{ .name = "sceKernelAprWaitCommandBuffer", .function = trace.wrap("sceKernelAprWaitCommandBuffer", &aprWaitCommandBuffer), .expect_id = "rqwFKI4PAiM" },
 
     // The rest of the accelerator's path-resolution and submission surface,
     // reported unimplemented like the entries above it. These turn a list of
