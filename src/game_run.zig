@@ -296,14 +296,14 @@ fn run(init: std.process.Init) !bool {
             .modules = graph.modules(),
         },
     ) catch |err| {
+        // Ask guest I/O hot paths (AGC suspendPoint spam via `_write`) to exit
+        // before the diagnostic dump; otherwise those workers keep burning cores
+        // while the report is formatted.
+        runtime.firmware.libs.kernel_runtime.requestGuestStop();
+
         // Symbol-attributed report first: it names the module and, for a call
         // through a null pointer, the caller recovered from the stack. The raw
         // dumps below stay as supporting detail for cases it cannot classify.
-        //
-        // Do not join guest workers here: graphics threads can sit in tight
-        // guest loops (AGC suspendPoint) that ignore interrupt flags, and a
-        // join would hang while burning cores for the whole diagnostic dump.
-        // defer disableCpuDispatcher still runs on the way out.
         if (graph.buildSymbolMap(allocator)) |built| {
             var map = built;
             defer map.deinit(allocator);
@@ -389,7 +389,12 @@ fn run(init: std.process.Init) !bool {
         }
         try stderr.print("guest execution stopped: {s}\n", .{@errorName(err)});
         try stderr.flush();
-        return false;
+        // Contained guest faults leave AGC/job workers in tight guest loops that
+        // ignore interrupt flags (suspendPoint spam). Joining them in defer hangs
+        // while burning every core. After the report is on the host terminal the
+        // process has nothing left to do for this title run — exit immediately
+        // so the OS reclaims the workers instead of waiting on them.
+        std.process.exit(1);
     };
 
     try out.print("guest process returned 0x{x}\n", .{result});

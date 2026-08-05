@@ -336,6 +336,8 @@ const DeviceFunctions = struct {
     cmd_begin_render_pass: vk.PfnCmdBeginRenderPass,
     cmd_end_render_pass: vk.PfnCmdEndRenderPass,
     cmd_draw: vk.PfnCmdDraw,
+    cmd_draw_indexed: vk.PfnCmdDrawIndexed,
+    cmd_bind_index_buffer: vk.PfnCmdBindIndexBuffer,
     cmd_copy_buffer: vk.PfnCmdCopyBuffer,
     cmd_copy_image_to_buffer: vk.PfnCmdCopyImageToBuffer,
     cmd_copy_buffer_to_image: vk.PfnCmdCopyBufferToImage,
@@ -397,6 +399,8 @@ const DeviceFunctions = struct {
             .cmd_begin_render_pass = try deviceProc(get_proc, device, vk.PfnCmdBeginRenderPass, "vkCmdBeginRenderPass"),
             .cmd_end_render_pass = try deviceProc(get_proc, device, vk.PfnCmdEndRenderPass, "vkCmdEndRenderPass"),
             .cmd_draw = try deviceProc(get_proc, device, vk.PfnCmdDraw, "vkCmdDraw"),
+            .cmd_draw_indexed = try deviceProc(get_proc, device, vk.PfnCmdDrawIndexed, "vkCmdDrawIndexed"),
+            .cmd_bind_index_buffer = try deviceProc(get_proc, device, vk.PfnCmdBindIndexBuffer, "vkCmdBindIndexBuffer"),
             .cmd_copy_buffer = try deviceProc(get_proc, device, vk.PfnCmdCopyBuffer, "vkCmdCopyBuffer"),
             .cmd_copy_image_to_buffer = try deviceProc(get_proc, device, vk.PfnCmdCopyImageToBuffer, "vkCmdCopyImageToBuffer"),
             .cmd_copy_buffer_to_image = try deviceProc(get_proc, device, vk.PfnCmdCopyBufferToImage, "vkCmdCopyBufferToImage"),
@@ -2167,6 +2171,18 @@ pub const Renderer = struct {
         return pipeline;
     }
 
+    /// How a graphics packet wants geometry issued on the host.
+    const GuestDraw = struct {
+        /// Non-indexed `DRAW_INDEX_AUTO` path (diagnostic triangle is count 3).
+        vertex_count: u32 = 3,
+        instance_count: u32 = 1,
+        /// When set, issue `vkCmdDrawIndexed` from guest memory at `index_address`.
+        index_count: ?u32 = null,
+        index_address: u64 = 0,
+        /// `false` = UINT16, `true` = UINT32. AGC defaults to 16-bit indices.
+        index_uint32: bool = false,
+    };
+
     fn drawGraphicsShaders(
         self: *Renderer,
         vertex_words: []const u32,
@@ -2175,6 +2191,7 @@ pub const Renderer = struct {
         guest_target: ?GuestColorTarget,
         bind_graphics_descriptors: bool,
         validate_diagnostic_color: bool,
+        draw: GuestDraw,
     ) anyerror!void {
         const width = pipeline_state.width;
         const height = pipeline_state.height;
@@ -2323,7 +2340,54 @@ pub const Renderer = struct {
                 null,
             );
         }
-        self.device_functions.cmd_draw(command_buffer, 3, 1, 0, 0);
+        var index_upload: ?OwnedBuffer = null;
+        defer if (index_upload) |buffer| self.destroyBuffer(buffer);
+        if (draw.index_count) |index_count| {
+            if (index_count != 0) {
+                const index_stride: u64 = if (draw.index_uint32) 4 else 2;
+                const index_bytes = std.math.mul(u64, index_count, index_stride) catch {
+                    return Error.GuestBufferTooLarge;
+                };
+                if (index_bytes == 0 or index_bytes > maximum_frame_bytes) {
+                    return Error.GuestBufferTooLarge;
+                }
+                const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+                const bytes: usize = @intCast(index_bytes);
+                const indices = try self.allocator.alloc(u8, bytes);
+                defer self.allocator.free(indices);
+                if (!memory.read(memory.context, draw.index_address, indices)) {
+                    return Error.GuestMemoryReadFailed;
+                }
+                index_upload = try self.createBuffer(
+                    bytes,
+                    vk.buffer_usage_index_buffer_bit | vk.buffer_usage_transfer_dst_bit,
+                    vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+                );
+                try self.writeMapped(index_upload.?, indices);
+                self.device_functions.cmd_bind_index_buffer(
+                    command_buffer,
+                    index_upload.?.handle,
+                    0,
+                    if (draw.index_uint32) vk.index_type_uint32 else vk.index_type_uint16,
+                );
+                self.device_functions.cmd_draw_indexed(
+                    command_buffer,
+                    index_count,
+                    draw.instance_count,
+                    0,
+                    0,
+                    0,
+                );
+            }
+        } else if (draw.vertex_count != 0) {
+            self.device_functions.cmd_draw(
+                command_buffer,
+                draw.vertex_count,
+                draw.instance_count,
+                0,
+                0,
+            );
+        }
         self.device_functions.cmd_end_render_pass(command_buffer);
 
         const image_barrier = vk.ImageMemoryBarrier{
@@ -2457,10 +2521,11 @@ pub const Renderer = struct {
             null,
             false,
             true,
+            .{ .vertex_count = 3 },
         );
     }
 
-    fn drawGuestGraphics(self: *Renderer, state: *const gpu.State) anyerror!void {
+    fn drawGuestGraphics(self: *Renderer, state: *const gpu.State, draw: GuestDraw) anyerror!void {
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
         const render_state = gpu.resources.decodeRenderState(state);
         if (render_state.active_color_count == 0) return Error.MissingColorTarget;
@@ -2522,6 +2587,7 @@ pub const Renderer = struct {
             target,
             graphics_resources.mapping_count != 0,
             false,
+            draw,
         );
     }
 
@@ -3149,21 +3215,42 @@ pub const Renderer = struct {
         const has_vertex = gpu.resources.ShaderStage.vertex.programAddress(state) != null;
         const has_fragment = gpu.resources.ShaderStage.pixel.programAddress(state) != null;
         if (!has_vertex and !has_fragment and !self.graphics_probe_enabled) return true;
-        if (packet.opcode != gpu.pm4.draw_index_auto or packet.body.len < 1 or packet.body[0] != 3) {
+
+        // AGC's DRAW_INDEX_2 body is max_size, index_va_lo/hi, index_count,
+        // draw_initiator — the same layout bootstrap services emit. AUTO is the
+        // non-indexed count form used by the diagnostic triangle probe.
+        const draw: GuestDraw = if (packet.opcode == gpu.pm4.draw_index_auto and packet.body.len >= 1)
+            .{ .vertex_count = packet.body[0] }
+        else if (packet.opcode == gpu.pm4.draw_index_2 and packet.body.len >= 5)
+            .{
+                .index_count = packet.body[3],
+                .index_address = (@as(u64, packet.body[2]) << 32) | packet.body[1],
+                // AGC index streams are 16-bit by default; 32-bit shows up as
+                // INDEX_TYPE later and is not tracked in GPU state yet.
+                .index_uint32 = false,
+            }
+        else {
             self.last_draw_error = Error.UnsupportedDrawPacket;
             std.debug.print(
                 "[vulkan dcb] draw rejected: {s} (opcode=0x{x}, body={d})\n",
                 .{ @errorName(Error.UnsupportedDrawPacket), packet.opcode, packet.body.len },
             );
             return false;
-        }
+        };
+
+        // Vertex-only or pixel-only draws show up in pre-passes before both
+        // stages are bound. Rejecting them aborts the DCB; accepting as a no-op
+        // lets the queue reach a complete pair (and later the flip).
         if (has_vertex != has_fragment) {
             self.last_draw_error = Error.MissingGraphicsProgram;
-            std.debug.print("[vulkan dcb] draw rejected: {s}\n", .{@errorName(Error.MissingGraphicsProgram)});
-            return false;
+            std.debug.print(
+                "[vulkan dcb] draw skipped: incomplete graphics programs (vs={any} ps={any})\n",
+                .{ has_vertex, has_fragment },
+            );
+            return true;
         }
         if (has_vertex)
-            self.drawGuestGraphics(state) catch |err| {
+            self.drawGuestGraphics(state, draw) catch |err| {
                 self.last_draw_error = err;
                 std.debug.print("[vulkan dcb] draw rejected: {s}\n", .{@errorName(err)});
                 return false;

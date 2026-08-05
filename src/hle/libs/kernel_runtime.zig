@@ -54,6 +54,11 @@ threadlocal var fallback_errno: i32 = 0;
 threadlocal var rtld_atexit_count: u32 = 0;
 threadlocal var undelivered_exception_waits: u8 = 0;
 
+/// Set when the launcher is done with guest execution (contained fault, clean
+/// exit). Hot firmware paths that would otherwise spin forever — guest stdout
+/// from AGC suspendPoint, for example — check this and leave guest code.
+var guest_stop_requested: std.atomic.Value(bool) = .init(false);
+
 var active_io: ?std.Io = null;
 var process_start_nanoseconds: i96 = 0;
 var process_param_address: std.atomic.Value(u64) = .init(0);
@@ -232,11 +237,25 @@ pub fn attachIo(io: ?std.Io) void {
         if (was_detached) {
             process_start_nanoseconds = std.Io.Clock.awake.now(value).nanoseconds;
         }
+        guest_stop_requested.store(false, .release);
     } else {
         process_start_nanoseconds = 0;
         resetSyncAddresses();
         resetKernelObjects();
+        guest_stop_requested.store(false, .release);
     }
+}
+
+/// Asks guest threads that pass through hot firmware to leave cleanly.
+///
+/// Used after a contained fault so AGC suspendPoint loops that only print
+/// through `_write` stop burning cores before the host process exits.
+pub fn requestGuestStop() void {
+    guest_stop_requested.store(true, .release);
+}
+
+fn guestStopRequested() bool {
+    return guest_stop_requested.load(.acquire);
 }
 
 /// The clock source firmware libraries share.
@@ -1062,6 +1081,10 @@ fn guestWrite(descriptor: i32, buffer: ?[*]const u8, length: u64) callconv(abi.g
         return -1;
     };
     writer.interface.flush() catch {};
+    // After a contained fault the launcher requests a stop. AGC's suspendPoint
+    // loop only talks to the host through this write; exiting here ends those
+    // workers without waiting on a join that never completes.
+    if (guestStopRequested()) threading.scePthreadExit(null);
     return @intCast(length);
 }
 
