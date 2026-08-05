@@ -46,7 +46,29 @@ pub const Record = struct {
     /// Monotonic call number, so the ring can be read back in order and gaps
     /// from wrapping are visible.
     sequence: u64 = 0,
+    /// Which guest thread made the call.
+    ///
+    /// A title runs its loading, its job workers and its rendering on separate
+    /// threads, and their calls arrive interleaved. Read as one sequence they
+    /// describe a program doing several things at once and none of them in
+    /// order; split by thread, each becomes a story that can be followed.
+    thread: u32 = 0,
 };
+
+/// A small number naming the calling thread, assigned on its first call.
+///
+/// Deliberately not the guest's own thread identifier: that would mean asking
+/// the threading layer, which is one of the things being traced, and a trace
+/// that calls into what it observes reports on itself. A counter of its own is
+/// enough, because the only question here is which calls came from the same
+/// thread.
+threadlocal var thread_ordinal: u32 = 0;
+var next_thread_ordinal = std.atomic.Value(u32).init(1);
+
+fn currentThreadOrdinal() u32 {
+    if (thread_ordinal == 0) thread_ordinal = next_thread_ordinal.fetchAdd(1, .monotonic);
+    return thread_ordinal;
+}
 
 /// Recording is a diagnostic aid, so it is cheap rather than exact: slots are
 /// claimed atomically but written without locking. A record can therefore be
@@ -96,20 +118,65 @@ pub fn isLive() bool {
     return live.load(.acquire);
 }
 
+/// The longest live-trace filter accepted.
+const filter_limit: usize = 256;
+
+var filter_storage: [filter_limit]u8 = undefined;
+var filter_length: usize = 0;
+
+/// Narrows live tracing to entry points whose names contain one of these.
+///
+/// Printing every call is not merely noisy: at tens of thousands of calls a
+/// second the printing itself becomes the program, and a title that would have
+/// reached its render loop in a second never arrives there at all. Anything
+/// that only appears once the title is running normally is therefore invisible
+/// to an unfiltered trace — which is precisely the part worth watching.
+///
+/// Comma-separated substrings; empty means everything.
+pub fn setLiveFilter(text: []const u8) void {
+    const kept = @min(text.len, filter_limit);
+    @memcpy(filter_storage[0..kept], text[0..kept]);
+    filter_length = kept;
+}
+
+/// Whether an entry point should print detail of its own right now.
+///
+/// Entry points that can say something the generic record cannot ask this
+/// first. It answers the filter as well as the switch, so narrowing a trace to
+/// one subsystem narrows everything it prints — otherwise the detail of every
+/// other subsystem would still arrive and the narrowing would buy nothing.
+pub fn announces(name: []const u8) bool {
+    return live.load(.acquire) and passesFilter(name);
+}
+
+/// Whether a name passes the live filter.
+fn passesFilter(name: []const u8) bool {
+    if (filter_length == 0) return true;
+    var remaining: []const u8 = filter_storage[0..filter_length];
+    while (remaining.len != 0) {
+        const cut = std.mem.indexOfScalar(u8, remaining, ',') orelse remaining.len;
+        const term = std.mem.trim(u8, remaining[0..cut], " \t");
+        if (term.len != 0 and std.mem.indexOf(u8, name, term) != null) return true;
+        remaining = if (cut == remaining.len) &.{} else remaining[cut + 1 ..];
+    }
+    return false;
+}
+
 fn store(record: Record) void {
     if (!isEnabled()) return;
     const sequence = next_sequence.fetchAdd(1, .monotonic);
     var stored = record;
     stored.sequence = sequence;
+    stored.thread = currentThreadOrdinal();
     ring[sequence % capacity] = stored;
 
-    if (live.load(.acquire)) emit(stored);
+    if (live.load(.acquire) and passesFilter(stored.name)) emit(stored);
 }
 
 /// Writes one record immediately. Uses the debug printer because it locks and
 /// needs no buffer, so it survives being called from any guest thread.
 fn emit(record: Record) void {
-    std.debug.print("[trace] {d} {s}(", .{ record.sequence, record.name });
+    std.debug.print("[trace] t{d} {d} {s}(", .{ record.thread, record.sequence, record.name });
     for (record.arguments[0..record.argument_count], 0..) |value, index| {
         if (index != 0) std.debug.print(", ", .{});
         std.debug.print("0x{x}", .{value});
@@ -432,6 +499,22 @@ fn takeStackSnapshot(comptime name: []const u8) void {
     for (capture_stack[0..readable], 0..) |*slot, index| slot.* = words[index];
     capture_length = readable;
     capture_taken_at = seen;
+
+    // Printed here as well as kept for the fault report, because a title that
+    // does not stop never produces one — and a loop that will not end is
+    // exactly the case where knowing who is calling matters most. Raw and
+    // unresolved: this layer knows nothing about which module owns an address,
+    // and a guess about that would be worse than leaving it to be looked up.
+    if (live.load(.acquire)) {
+        std.debug.print(
+            "[stack] t{d} at {s} call {d}\n",
+            .{ currentThreadOrdinal(), name, seen },
+        );
+        for (capture_stack[0..readable]) |value| {
+            if (value < 0x1000 or value > 0x8000_0000_0000) continue;
+            std.debug.print("  0x{x}\n", .{value});
+        }
+    }
 }
 
 /// Announces a call before it runs, and takes a stack snapshot if one is armed.
@@ -445,7 +528,8 @@ fn takeStackSnapshot(comptime name: []const u8) void {
 fn enter(comptime name: []const u8, arguments: []const u64) void {
     if (capture_armed.load(.acquire)) takeStackSnapshot(name);
     if (!live.load(.acquire) or !isEnabled()) return;
-    std.debug.print("[call ] {s}(", .{name});
+    if (!passesFilter(name)) return;
+    std.debug.print("[call ] t{d} {s}(", .{ currentThreadOrdinal(), name });
     for (arguments, 0..) |value, index| {
         if (index != 0) std.debug.print(", ", .{});
         std.debug.print("0x{x}", .{value});
@@ -503,7 +587,7 @@ pub fn write(w: *std.Io.Writer, limit: usize) std.Io.Writer.Error!void {
 
     try w.print("  last {d} firmware calls (of {d})\n", .{ records.len, count() });
     for (records) |record| {
-        try w.print("    {d:>6} {s}(", .{ record.sequence, record.name });
+        try w.print("    t{d:<2} {d:>6} {s}(", .{ record.thread, record.sequence, record.name });
         for (record.arguments[0..record.argument_count], 0..) |value, index| {
             if (index != 0) try w.writeAll(", ");
             try w.print("0x{x}", .{value});

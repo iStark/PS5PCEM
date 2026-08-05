@@ -424,12 +424,20 @@ fn videoOutSubmitEopFlip(
 ) callconv(abi.guest) i32 {
     if (!validVideoHandle(handle)) return video_out_error_invalid_handle;
     if (video_out.resolve(@intCast(handle), index) == null) return video_out_error_invalid_index;
-    _ = agc_submit.presentFlip(.{
+
+    // Reported rather than discarded. A flip that is not accepted publishes no
+    // completion, and a title that was told the flip was accepted waits for
+    // that completion for as long as it runs — with nothing anywhere saying
+    // which call was the one that did not happen. Answering truthfully turns a
+    // silent stall into a failure at the call responsible for it.
+    if (!agc_submit.presentFlip(.{
         .video_out_handle = @intCast(handle),
         .display_buffer_index = index,
         .mode = mode,
         .argument = @bitCast(argument),
-    });
+    })) {
+        return video_out_error_invalid_index;
+    }
     return errno.ok;
 }
 

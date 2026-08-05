@@ -16,6 +16,7 @@ pub const GuestMemory = backend.GuestMemory;
 pub const NativeWindow = backend.NativeWindow;
 pub const PresentedFrame = backend.PresentedFrame;
 pub const PresentationSink = backend.PresentationSink;
+pub const DisplayBuffer = backend.DisplayBuffer;
 pub const DisplayBufferResolver = backend.DisplayBufferResolver;
 pub const Renderer = backend.Renderer;
 pub const graphics_probe_width = backend.graphics_probe_width;

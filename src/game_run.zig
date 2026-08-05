@@ -21,9 +21,14 @@ const usage =
     \\
 ;
 
-fn resolveVideoOutBuffer(_: ?*anyopaque, flip: gpu.state.Flip) ?u64 {
+fn resolveVideoOutBuffer(_: ?*anyopaque, flip: gpu.state.Flip) ?vulkan.DisplayBuffer {
     const registration = runtime.firmware.video_out.resolveFlip(flip) orelse return null;
-    return registration.data_address;
+    return .{
+        .address = registration.data_address,
+        .width = registration.attribute.width,
+        .height = registration.attribute.height,
+        .pitch_in_pixels = registration.attribute.pitch_in_pixels,
+    };
 }
 
 fn reportRelocation(
@@ -155,9 +160,24 @@ fn run(init: std.process.Init) !bool {
     // A contained fault prints the retained calls afterwards, but a process
     // that dies outright takes the buffer with it. This is the escape hatch for
     // those, and it is far too noisy for anything else.
-    if (init.minimal.environ.containsUnempty(allocator, "PS5_TRACE") catch false) {
-        runtime.firmware.trace.setLive(true);
-    }
+    //
+    // The value may name which entry points to print, as comma-separated
+    // fragments of their names. That is not a convenience: printing every call
+    // costs more than the calls do, so a title that would reach its render loop
+    // in a second never gets there under a full trace — and the render loop is
+    // exactly what one wants to watch. Anything other than a bare "1" is read
+    // as a filter.
+    if (init.minimal.environ.getAlloc(allocator, "PS5_TRACE")) |text| {
+        defer allocator.free(text);
+        const request = std.mem.trim(u8, text, " \t\r\n");
+        if (request.len != 0) {
+            runtime.firmware.trace.setLive(true);
+            if (!std.mem.eql(u8, request, "1")) {
+                runtime.firmware.trace.setLiveFilter(request);
+                try out.print("  tracing only calls matching: {s}\n", .{request});
+            }
+        }
+    } else |_| {}
 
     // Arms a one-shot snapshot of the guest stack at one firmware call, named by
     // its number in the trace. The trace says which calls a title made; this

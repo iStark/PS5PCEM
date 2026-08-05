@@ -140,9 +140,21 @@ pub const PresentationSink = struct {
     present: *const fn (?*anyopaque, PresentedFrame) bool,
 };
 
+/// A display buffer a flip names, as the display side describes it.
+///
+/// The geometry travels with the address because a flip can name a buffer this
+/// renderer has never drawn into, and showing that buffer means reading it —
+/// which cannot be done without knowing its shape.
+pub const DisplayBuffer = struct {
+    address: u64,
+    width: u32,
+    height: u32,
+    pitch_in_pixels: u32,
+};
+
 pub const DisplayBufferResolver = struct {
     context: ?*anyopaque,
-    resolve: *const fn (?*anyopaque, gpu.state.Flip) ?u64,
+    resolve: *const fn (?*anyopaque, gpu.state.Flip) ?DisplayBuffer,
 };
 
 pub const StagedBuffer = struct {
@@ -623,6 +635,9 @@ pub const Renderer = struct {
     validation_enabled: bool,
     graphics_probe_enabled: bool,
     guest_memory: ?GuestMemory = null,
+    /// Holds a display buffer read straight out of guest memory, for a flip
+    /// that names a buffer nothing was rendered into.
+    guest_frame_scratch: std.ArrayList(u8) = .empty,
     guest_buffers: std.ArrayList(GuestBufferEntry) = .empty,
     compute_pipelines: std.ArrayList(ComputePipelineEntry) = .empty,
     graphics_pipelines: std.ArrayList(GraphicsPipelineEntry) = .empty,
@@ -2747,6 +2762,35 @@ pub const Renderer = struct {
         return self.waitForDevice();
     }
 
+    /// Shows a display buffer straight out of guest memory.
+    ///
+    /// Used when a flip names a buffer this renderer never drew into. The bytes
+    /// are the title's own: it may have cleared them, written them with the
+    /// processor, or left them untouched. Showing them is what the console
+    /// does, and it is closer to the truth than showing a colour of our
+    /// choosing would be.
+    fn presentGuestBuffer(self: *Renderer, buffer: DisplayBuffer, flip: gpu.state.Flip) bool {
+        const sink = self.presentation_sink orelse return true;
+        if (buffer.width == 0 or buffer.height == 0) return false;
+
+        const pitch_pixels = if (buffer.pitch_in_pixels != 0) buffer.pitch_in_pixels else buffer.width;
+        const row_bytes = @as(usize, pitch_pixels) * 4;
+        const needed = row_bytes * buffer.height;
+        self.guest_frame_scratch.resize(self.allocator, needed) catch return false;
+
+        const memory = self.guest_memory orelse return false;
+        if (!memory.read(memory.context, buffer.address, self.guest_frame_scratch.items)) return false;
+
+        return sink.present(sink.context, .{
+            .pixels = self.guest_frame_scratch.items,
+            .width = buffer.width,
+            .height = buffer.height,
+            .row_pitch_bytes = @intCast(row_bytes),
+            .guest_address = buffer.address,
+            .flip = flip,
+        });
+    }
+
     fn dcbFlip(context: ?*anyopaque, flip: gpu.state.Flip) bool {
         const self = fromContext(context);
         self.flip_callbacks += 1;
@@ -2755,20 +2799,36 @@ pub const Renderer = struct {
             return false;
         }
         var selected_index = self.latest_frame_index;
+        var requested: ?DisplayBuffer = null;
         if (self.display_buffer_resolver) |resolver| {
-            const requested_address = resolver.resolve(resolver.context, flip) orelse {
+            requested = resolver.resolve(resolver.context, flip) orelse {
                 self.last_flip_error = Error.MissingPresentedFrame;
                 return false;
             };
             selected_index = null;
             for (self.completed_frames.items, 0..) |cached, index| {
-                if (cached.guest_address == requested_address) {
+                if (cached.guest_address == requested.?.address) {
                     selected_index = index;
                     break;
                 }
             }
         }
+
         const frame_index = selected_index orelse {
+            // A flip naming a buffer nothing has rendered into is not an error.
+            // A title shows its first buffer before it draws anything, and
+            // hardware displays whatever that buffer holds. Refusing here is
+            // what stops such a title dead: no completion is published, its
+            // render thread waits for one, and it never reaches the drawing
+            // that would have produced a frame to show. So the buffer is read
+            // and shown as it stands.
+            if (requested) |buffer| {
+                if (self.presentGuestBuffer(buffer, flip)) {
+                    self.presented_frames += 1;
+                    self.last_flip_error = null;
+                    return true;
+                }
+            }
             self.last_flip_error = Error.MissingPresentedFrame;
             return false;
         };

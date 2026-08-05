@@ -162,6 +162,27 @@ fn resetKernelObjects() void {
     undelivered_exception_waits = 0;
 }
 
+/// Reports what a parked thread is actually looking at.
+///
+/// A thread waiting on an address is waiting for a value there to change, and
+/// the wait entry point is told only the address. When such a thread wakes,
+/// re-checks and parks again — which is what a stalled render loop looks like —
+/// the address alone says nothing: it cannot distinguish a wake that never
+/// arrived from one that arrived and found the condition still false. The word
+/// under the address separates the two, and it is the only thing that does.
+fn announceSyncAddress(what: []const u8, address: u64) void {
+    if (!trace.announces("sceKernelSyncOnAddress")) return;
+    if (!memory_api.isGuestRangeAccessible(address, @sizeOf(u64))) {
+        std.debug.print("[sync] {s} 0x{x} <unreadable>\n", .{ what, address });
+        return;
+    }
+    const words: *const [2]u32 = @ptrFromInt(address);
+    std.debug.print(
+        "[sync] {s} 0x{x} = 0x{x:0>8} 0x{x:0>8}\n",
+        .{ what, address, words[0], words[1] },
+    );
+}
+
 fn syncAddressIndex(address: u64) usize {
     var mixed = address ^ (address >> 33);
     mixed *%= 0xff51_afd7_ed55_8ccd;
@@ -376,6 +397,7 @@ fn syncOnAddressWait(
     _: u64,
 ) callconv(abi.guest) i32 {
     if (address == 0) return KernelError.einval.raw();
+    announceSyncAddress("wait", address);
     const generation = syncAddressGeneration(address, false);
     _ = threading.waitCurrent(.{
         .key = address,
@@ -395,6 +417,7 @@ fn syncOnAddressWake(
     _: u64,
 ) callconv(abi.guest) i32 {
     if (address == 0) return KernelError.einval.raw();
+    announceSyncAddress("wake", address);
     const generation = syncAddressGeneration(address, true);
     const maximum_waiters: usize = if (requested_waiters == 0 or
         requested_waiters >= std.math.maxInt(u32))
