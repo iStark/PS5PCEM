@@ -10,10 +10,11 @@
 //! complete description of a frame, without having to model any of the calls
 //! that produced it.
 //!
-//! Nothing is rendered yet. A submission is decoded into named commands for
-//! tracing and applied to persistent command-processor state. Register writes,
-//! labels, waits, events and flips therefore have their real ordering before a
-//! rendering backend exists, and draw/dispatch callbacks form its boundary.
+//! A submission is decoded into named commands for tracing and applied to
+//! persistent command-processor state. Register writes, labels, waits, events
+//! and flips therefore retain their real ordering. The executor stays
+//! API-neutral while an optional live backend receives the same memory,
+//! synchronization, draw, dispatch and presentation callbacks.
 //!
 //! Submissions are accepted rather than refused, which is the opposite of the
 //! choice made for the graphics device. The distinction is what a caller does
@@ -31,6 +32,7 @@ const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const memory = @import("kernel_memory.zig");
 const shader_registry = @import("agc_shader_registry.zig");
+const video_out = @import("../video_out.zig");
 
 /// A submission descriptor: where the buffer is and how long it is.
 ///
@@ -68,24 +70,29 @@ var execution_lock = ExecutionLock{};
 var traced_draw_states: u32 = 0;
 var traced_shader_program_count: usize = 0;
 var traced_shader_programs: [32]u64 = [_]u64{0} ** 32;
+var installed_backend: ?gpu.DcbBackend = null;
 
-fn backendRead(_: ?*anyopaque, address: u64, bytes: []u8) bool {
+pub fn readGuestMemory(_: ?*anyopaque, address: u64, bytes: []u8) bool {
     if (!memory.isGuestRangeAccessible(address, bytes.len)) return false;
     const source: [*]const u8 = @ptrFromInt(address);
     @memcpy(bytes, source[0..bytes.len]);
     return true;
 }
 
-fn backendWrite(_: ?*anyopaque, address: u64, bytes: []const u8) bool {
+pub fn writeGuestMemory(_: ?*anyopaque, address: u64, bytes: []const u8) bool {
     if (!memory.isGuestRangeAccessible(address, bytes.len)) return false;
     const destination: [*]u8 = @ptrFromInt(address);
     @memcpy(destination[0..bytes.len], bytes);
     return true;
 }
 
+pub fn findShaderHeader(_: ?*anyopaque, program_address: u64) ?u64 {
+    return shader_registry.find(program_address);
+}
+
 const shader_memory_reader = gpu.ShaderMemoryReader{
     .context = null,
-    .read_fn = backendRead,
+    .read_fn = readGuestMemory,
 };
 
 fn traceTextureLayout(layout: gpu.TextureLayout) void {
@@ -302,72 +309,154 @@ fn traceShaderBinding(state: *const gpu.State, stage: gpu.resources.ShaderStage)
     }
 }
 
-fn backendDraw(_: ?*anyopaque, state: *const gpu.State, _: gpu.pm4.Packet) bool {
+fn backendDraw(_: ?*anyopaque, state: *const gpu.State, packet: gpu.pm4.Packet) bool {
     traceShaderBinding(state, .export_shader);
     traceShaderBinding(state, .geometry);
     traceShaderBinding(state, .vertex);
     traceShaderBinding(state, .hull);
     traceShaderBinding(state, .pixel);
-    if (!trace.isLive() or traced_draw_states >= 16) return true;
-    traced_draw_states += 1;
-
-    const render = gpu.resources.decodeRenderState(state);
-    std.debug.print(
-        "[gpu draw state #{d}] color {d}/{d} mask=0x{x}",
-        .{ traced_draw_states, render.active_color_count, render.color_count, render.target_mask },
-    );
-    if (render.depth_target) |depth| {
+    if (trace.isLive() and traced_draw_states < 16) {
+        traced_draw_states += 1;
+        const render = gpu.resources.decodeRenderState(state);
         std.debug.print(
-            ", depth=0x{x} {d}x{d} fmt={d} sw={d} ro={d}\n",
-            .{
-                if (depth.write_address != 0) depth.write_address else depth.read_address,
-                depth.width,
-                depth.height,
-                depth.format,
-                @intFromEnum(depth.tile_mode),
-                @intFromBool(depth.depth_read_only),
-            },
+            "[gpu draw state #{d}] color {d}/{d} mask=0x{x}",
+            .{ traced_draw_states, render.active_color_count, render.color_count, render.target_mask },
         );
-        if (gpu.TextureLayout.fromDepthTarget(depth)) |layout| {
-            traceTextureLayout(layout);
-        } else |err| {
-            std.debug.print("    layout unavailable={s}\n", .{@errorName(err)});
+        if (render.depth_target) |depth| {
+            std.debug.print(
+                ", depth=0x{x} {d}x{d} fmt={d} sw={d} ro={d}\n",
+                .{
+                    if (depth.write_address != 0) depth.write_address else depth.read_address,
+                    depth.width,
+                    depth.height,
+                    depth.format,
+                    @intFromEnum(depth.tile_mode),
+                    @intFromBool(depth.depth_read_only),
+                },
+            );
+            if (gpu.TextureLayout.fromDepthTarget(depth)) |layout| {
+                traceTextureLayout(layout);
+            } else |err| {
+                std.debug.print("    layout unavailable={s}\n", .{@errorName(err)});
+            }
+        } else {
+            std.debug.print(", depth=none\n", .{});
         }
-    } else {
-        std.debug.print(", depth=none\n", .{});
+        for (render.color_targets) |maybe_target| {
+            const target = maybe_target orelse continue;
+            std.debug.print(
+                "  rt{d}=0x{x} {d}x{d} fmt={d}/{d} sw={d} write=0x{x}\n",
+                .{
+                    target.slot,
+                    target.address,
+                    target.width,
+                    target.height,
+                    target.format,
+                    target.number_type,
+                    @intFromEnum(target.tile_mode),
+                    target.write_mask,
+                },
+            );
+            if (gpu.TextureLayout.fromColorTarget(target)) |layout| {
+                traceTextureLayout(layout);
+            } else |err| {
+                std.debug.print("    layout unavailable={s}\n", .{@errorName(err)});
+            }
+        }
     }
-    for (render.color_targets) |maybe_target| {
-        const target = maybe_target orelse continue;
-        std.debug.print(
-            "  rt{d}=0x{x} {d}x{d} fmt={d}/{d} sw={d} write=0x{x}\n",
-            .{
-                target.slot,
-                target.address,
-                target.width,
-                target.height,
-                target.format,
-                target.number_type,
-                @intFromEnum(target.tile_mode),
-                target.write_mask,
-            },
-        );
-        if (gpu.TextureLayout.fromColorTarget(target)) |layout| {
-            traceTextureLayout(layout);
-        } else |err| {
-            std.debug.print("    layout unavailable={s}\n", .{@errorName(err)});
-        }
+    const backend = installed_backend orelse return true;
+    const callback = backend.vtable.draw orelse return true;
+    return callback(backend.context, state, packet);
+}
+
+fn backendDispatch(_: ?*anyopaque, state: *const gpu.State, packet: gpu.pm4.Packet) bool {
+    traceShaderBinding(state, .compute);
+    const backend = installed_backend orelse return true;
+    const callback = backend.vtable.dispatch orelse return true;
+    return callback(backend.context, state, packet);
+}
+
+fn backendRead(_: ?*anyopaque, address: u64, bytes: []u8) bool {
+    if (installed_backend) |backend| return backend.vtable.read(backend.context, address, bytes);
+    return readGuestMemory(null, address, bytes);
+}
+
+fn backendWrite(_: ?*anyopaque, address: u64, bytes: []const u8) bool {
+    if (installed_backend) |backend| return backend.vtable.write(backend.context, address, bytes);
+    return writeGuestMemory(null, address, bytes);
+}
+
+fn backendAcquire(_: ?*anyopaque, value: gpu.state.AcquireMem) bool {
+    const backend = installed_backend orelse return true;
+    const callback = backend.vtable.acquire orelse return true;
+    return callback(backend.context, value);
+}
+
+fn backendRelease(_: ?*anyopaque, value: gpu.state.ReleaseMem) bool {
+    if (installed_backend) |backend| {
+        if (backend.vtable.release) |callback| return callback(backend.context, value);
+    }
+    if ((value.destination != 0 and value.destination != 1) or value.address == 0) return true;
+    var bytes: [8]u8 = undefined;
+    return switch (value.data_selection) {
+        1 => blk: {
+            std.mem.writeInt(u32, bytes[0..4], @truncate(value.data), .little);
+            break :blk backendWrite(null, value.address, bytes[0..4]);
+        },
+        2 => blk: {
+            std.mem.writeInt(u64, &bytes, value.data, .little);
+            break :blk backendWrite(null, value.address, &bytes);
+        },
+        else => true,
+    };
+}
+
+fn backendWait(_: ?*anyopaque, value: gpu.state.WaitRegMem, satisfied: bool) bool {
+    const backend = installed_backend orelse return true;
+    const callback = backend.vtable.wait orelse return true;
+    return callback(backend.context, value, satisfied);
+}
+
+fn backendWriteData(_: ?*anyopaque, info: gpu.state.WriteData, values: []const u32) bool {
+    if (installed_backend) |backend| {
+        if (backend.vtable.write_data) |callback| return callback(backend.context, info, values);
+    }
+    if (info.destination != 1 and info.destination != 2 and info.destination != 4 and info.destination != 5) {
+        return true;
+    }
+    var bytes: [4]u8 = undefined;
+    for (values, 0..) |value, index| {
+        std.mem.writeInt(u32, &bytes, value, .little);
+        const address = info.address + if (info.increment_address) @as(u64, index) * 4 else 0;
+        if (!backendWrite(null, address, &bytes)) return false;
     }
     return true;
 }
 
-fn backendDispatch(_: ?*anyopaque, state: *const gpu.State, _: gpu.pm4.Packet) bool {
-    traceShaderBinding(state, .compute);
-    return true;
+fn backendEvent(_: ?*anyopaque, value: gpu.state.EventWrite) bool {
+    const backend = installed_backend orelse return true;
+    const callback = backend.vtable.event orelse return true;
+    return callback(backend.context, value);
+}
+
+fn backendFlip(_: ?*anyopaque, value: gpu.state.Flip) bool {
+    const accepted = if (installed_backend) |backend|
+        if (backend.vtable.flip) |callback| callback(backend.context, value) else true
+    else
+        true;
+    if (!accepted) return false;
+    return video_out.completeFlip(value);
 }
 
 const executor_backend_vtable = gpu.DcbBackend.VTable{
     .read = backendRead,
     .write = backendWrite,
+    .acquire = backendAcquire,
+    .release = backendRelease,
+    .wait = backendWait,
+    .write_data = backendWriteData,
+    .event = backendEvent,
+    .flip = backendFlip,
     .draw = backendDraw,
     .dispatch = backendDispatch,
 };
@@ -378,6 +467,35 @@ const executor_backend = gpu.DcbBackend{
 };
 
 var submission_scheduler = gpu.QueueScheduler.init(std.heap.page_allocator, executor_backend);
+
+/// Installs or removes the renderer behind the live HLE submission boundary.
+/// The execution lock guarantees that a detached backend is no longer inside a
+/// callback when this function returns.
+pub fn attachBackend(backend: ?gpu.DcbBackend) void {
+    execution_lock.lock();
+    defer execution_lock.unlock();
+    installed_backend = backend;
+}
+
+/// Presents a CPU/EOP VideoOut request through the same ordered backend used by
+/// a PM4 `SetFlip` packet.
+pub fn presentFlip(flip: gpu.state.Flip) bool {
+    execution_lock.lock();
+    defer execution_lock.unlock();
+    return backendFlip(null, flip);
+}
+
+/// Clears retained queue/register state between process runtimes.
+pub fn reset() void {
+    execution_lock.lock();
+    defer execution_lock.unlock();
+    installed_backend = null;
+    submission_scheduler.deinit();
+    submission_scheduler = gpu.QueueScheduler.init(std.heap.page_allocator, executor_backend);
+    traced_draw_states = 0;
+    traced_shader_program_count = 0;
+    traced_shader_programs = [_]u64{0} ** traced_shader_programs.len;
+}
 
 /// What one submitted buffer contained.
 pub const Summary = struct {
@@ -631,6 +749,63 @@ test "submission entry points accept what they cannot yet carry out" {
     // Naming a count but no arrays is a caller error, and saying so costs
     // nothing because there is no frame described anywhere to lose.
     try testing.expectEqual(errno.KernelError.einval.raw(), submitMultiDcbs(null, null, 2));
+}
+
+test "an installed renderer receives CPU VideoOut flips before completion" {
+    const Probe = struct {
+        calls: u32 = 0,
+        last: gpu.state.Flip = undefined,
+
+        fn read(_: ?*anyopaque, _: u64, _: []u8) bool {
+            return false;
+        }
+
+        fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+            return false;
+        }
+
+        fn flip(context: ?*anyopaque, value: gpu.state.Flip) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.calls += 1;
+            self.last = value;
+            return true;
+        }
+    };
+    const probe_vtable = gpu.DcbBackend.VTable{
+        .read = Probe.read,
+        .write = Probe.write,
+        .flip = Probe.flip,
+    };
+
+    reset();
+    video_out.reset();
+    defer reset();
+    defer video_out.reset();
+    try testing.expect(video_out.open(0));
+    var display: [64]u8 = @splat(0);
+    const buffers = [_]video_out.Buffer{.{
+        .data = &display,
+        .metadata = null,
+        .reserved = .{ null, null },
+    }};
+    try video_out.registerBuffers(0, 0, &buffers, .{
+        .width = 4,
+        .height = 4,
+        .pitch_in_pixels = 4,
+    }, 0);
+
+    var probe = Probe{};
+    attachBackend(.{ .context = &probe, .vtable = &probe_vtable });
+    const flip = gpu.state.Flip{
+        .video_out_handle = 1,
+        .display_buffer_index = 0,
+        .mode = 1,
+        .argument = 0x1234,
+    };
+    try testing.expect(presentFlip(flip));
+    try testing.expectEqual(@as(u32, 1), probe.calls);
+    try testing.expectEqual(flip.argument, probe.last.argument);
+    try testing.expectEqual(@as(u64, 1), video_out.status(1).?.count);
 }
 
 test "a hole in a batch does not drop the buffers after it" {

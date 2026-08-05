@@ -5,8 +5,12 @@
 //! Windows x86-64 guest bridge.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const gpu = @import("gpu");
 const runtime = @import("runtime");
 const loader = @import("loader");
+const vulkan = @import("vulkan");
+const window = @import("window");
 
 const usage =
     \\game-run [--app0 <content-directory>] <eboot.bin>
@@ -16,6 +20,11 @@ const usage =
     \\comes from a sparse patch directory. Direct execution requires Windows x86-64.
     \\
 ;
+
+fn resolveVideoOutBuffer(_: ?*anyopaque, flip: gpu.state.Flip) ?u64 {
+    const registration = runtime.firmware.video_out.resolveFlip(flip) orelse return null;
+    return registration.data_address;
+}
 
 fn reportRelocation(
     writer: *std.Io.Writer,
@@ -173,6 +182,70 @@ fn run(init: std.process.Init) !bool {
             runtime.firmware.trace.captureStackAt(name, occurrence);
         }
     } else |_| {}
+
+    // Live GPU submissions use the same serialized PM4 scheduler as tracing.
+    // The host renderer stays optional so loader/CPU diagnostics remain useful
+    // on machines without a Vulkan presentation device.
+    var host_window = window.HostWindow{};
+    var window_initialized = false;
+    var renderer: vulkan.Renderer = undefined;
+    var renderer_initialized = false;
+    defer {
+        // Stop every guest worker before taking away callbacks it may still be
+        // executing, then release Vulkan before destroying the HWND surface.
+        emu.disableCpuDispatcher();
+        runtime.firmware.libs.agc_submit.attachBackend(null);
+        if (renderer_initialized) renderer.deinit();
+        if (window_initialized) host_window.deinit();
+    }
+
+    const force_headless = init.minimal.environ.containsUnempty(allocator, "PS5_HEADLESS") catch false;
+    if (builtin.os.tag == .windows and !force_headless) live_gpu: {
+        host_window.init(1280, 720) catch |err| {
+            try stderr.print("live Vulkan window unavailable: {s}; continuing headless\n", .{@errorName(err)});
+            try stderr.flush();
+            break :live_gpu;
+        };
+        window_initialized = true;
+        const native = host_window.nativeHandle() orelse {
+            try stderr.writeAll("live Vulkan window returned no native handle; continuing headless\n");
+            try stderr.flush();
+            break :live_gpu;
+        };
+        renderer = vulkan.Renderer.init(allocator, .{
+            .native_window = .{
+                .instance = native.instance,
+                .window = native.window,
+                .width = native.width,
+                .height = native.height,
+            },
+        }) catch |err| {
+            try stderr.print("live Vulkan renderer unavailable: {s}; continuing headless\n", .{@errorName(err)});
+            try stderr.flush();
+            host_window.deinit();
+            window_initialized = false;
+            break :live_gpu;
+        };
+        renderer_initialized = true;
+        const presentation_sink = renderer.windowPresentationSink();
+        renderer.setPresentationSink(presentation_sink);
+        renderer.setDisplayBufferResolver(.{
+            .context = null,
+            .resolve = resolveVideoOutBuffer,
+        });
+        const guest_memory = vulkan.GuestMemory{
+            .context = null,
+            .read = runtime.firmware.libs.agc_submit.readGuestMemory,
+            .write = runtime.firmware.libs.agc_submit.writeGuestMemory,
+            .shader_header = runtime.firmware.libs.agc_submit.findShaderHeader,
+        };
+        runtime.firmware.libs.agc_submit.attachBackend(renderer.dcbBackend(guest_memory));
+        try out.print("  Vulkan  {s} ({d}x{d} VideoOut window)\n", .{
+            renderer.device_info.name(),
+            native.width,
+            native.height,
+        });
+    }
 
     try emu.enableNativeCpuDispatcher(io);
     const prepared = try emu.prepareInitialThread("eboot-main");

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Artur Strazewicz
 
-//! Headless Vulkan renderer foundation.
+//! Vulkan renderer foundation with optional Win32 presentation.
 //!
 //! This owns the host instance, device, queue and command pool while exposing
 //! the existing API-neutral DCB callback boundary. Supported direct compute
 //! work crosses RDNA2 decode, ShaderBindings capture, storage-buffer lowering
-//! and SPIR-V pipeline caching. An opt-in diagnostic graphics probe crosses the
-//! real DCB draw callback, render pass, rasterization and image readback path;
-//! guest vertex/pixel lowering remains separate. The smoke path proves queue
-//! submission, descriptor arrays, staging, device-local memory and readback.
+//! and SPIR-V pipeline caching. Supported guest vertex/pixel programs cross the
+//! real DCB draw callback, render pass, rasterization and image writeback path;
+//! an opt-in fixed-shader probe remains for diagnostics. The smoke paths prove
+//! queue submission, descriptors, staging, readback and a real
+//! surface/swapchain presentation path.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -74,6 +75,21 @@ pub const Error = error{
     PresentationRejected,
     UnsupportedSampledImage,
     SamplerCreationFailed,
+    UnsupportedPresentationPlatform,
+    SurfaceCreationFailed,
+    SurfaceQueryFailed,
+    SurfaceFormatUnavailable,
+    SwapchainCreationFailed,
+    SwapchainImageQueryFailed,
+    SwapchainAcquireFailed,
+    SwapchainPresentFailed,
+};
+
+pub const NativeWindow = struct {
+    instance: *anyopaque,
+    window: *anyopaque,
+    width: u32,
+    height: u32,
 };
 
 pub const Options = struct {
@@ -81,6 +97,10 @@ pub const Options = struct {
     /// Diagnostic-only fixed shaders used to prove the DCB graphics submission
     /// and color-target path before guest vertex/pixel lowering is connected.
     enable_graphics_probe: bool = false,
+    /// Optional Win32 output window. Supplying it enables the required surface
+    /// and swapchain extensions and constrains device selection to a queue that
+    /// can present to this exact surface.
+    native_window: ?NativeWindow = null,
 };
 
 pub const graphics_probe_width: u32 = 64;
@@ -118,6 +138,11 @@ pub const PresentedFrame = struct {
 pub const PresentationSink = struct {
     context: ?*anyopaque,
     present: *const fn (?*anyopaque, PresentedFrame) bool,
+};
+
+pub const DisplayBufferResolver = struct {
+    context: ?*anyopaque,
+    resolve: *const fn (?*anyopaque, gpu.state.Flip) ?u64,
 };
 
 pub const StagedBuffer = struct {
@@ -220,6 +245,25 @@ const InstanceFunctions = struct {
             .get_memory_properties = try loader.instance(instance_handle, vk.PfnGetPhysicalDeviceMemoryProperties, "vkGetPhysicalDeviceMemoryProperties"),
             .create_device = try loader.instance(instance_handle, vk.PfnCreateDevice, "vkCreateDevice"),
             .get_device_proc_addr = try loader.instance(instance_handle, vk.PfnGetDeviceProcAddr, "vkGetDeviceProcAddr"),
+        };
+    }
+};
+
+const SurfaceFunctions = struct {
+    create_win32_surface: vk.PfnCreateWin32SurfaceKHR,
+    destroy_surface: vk.PfnDestroySurfaceKHR,
+    get_surface_support: vk.PfnGetPhysicalDeviceSurfaceSupportKHR,
+    get_surface_capabilities: vk.PfnGetPhysicalDeviceSurfaceCapabilitiesKHR,
+    get_surface_formats: vk.PfnGetPhysicalDeviceSurfaceFormatsKHR,
+
+    fn load(loader: *const Loader, instance_handle: vk.Instance) Error!SurfaceFunctions {
+        if (builtin.os.tag != .windows) return Error.UnsupportedPresentationPlatform;
+        return .{
+            .create_win32_surface = try loader.instance(instance_handle, vk.PfnCreateWin32SurfaceKHR, "vkCreateWin32SurfaceKHR"),
+            .destroy_surface = try loader.instance(instance_handle, vk.PfnDestroySurfaceKHR, "vkDestroySurfaceKHR"),
+            .get_surface_support = try loader.instance(instance_handle, vk.PfnGetPhysicalDeviceSurfaceSupportKHR, "vkGetPhysicalDeviceSurfaceSupportKHR"),
+            .get_surface_capabilities = try loader.instance(instance_handle, vk.PfnGetPhysicalDeviceSurfaceCapabilitiesKHR, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"),
+            .get_surface_formats = try loader.instance(instance_handle, vk.PfnGetPhysicalDeviceSurfaceFormatsKHR, "vkGetPhysicalDeviceSurfaceFormatsKHR"),
         };
     }
 };
@@ -348,6 +392,24 @@ const DeviceFunctions = struct {
     }
 };
 
+const SwapchainFunctions = struct {
+    create_swapchain: vk.PfnCreateSwapchainKHR,
+    destroy_swapchain: vk.PfnDestroySwapchainKHR,
+    get_swapchain_images: vk.PfnGetSwapchainImagesKHR,
+    acquire_next_image: vk.PfnAcquireNextImageKHR,
+    queue_present: vk.PfnQueuePresentKHR,
+
+    fn load(get_proc: vk.PfnGetDeviceProcAddr, device: vk.Device) Error!SwapchainFunctions {
+        return .{
+            .create_swapchain = try deviceProc(get_proc, device, vk.PfnCreateSwapchainKHR, "vkCreateSwapchainKHR"),
+            .destroy_swapchain = try deviceProc(get_proc, device, vk.PfnDestroySwapchainKHR, "vkDestroySwapchainKHR"),
+            .get_swapchain_images = try deviceProc(get_proc, device, vk.PfnGetSwapchainImagesKHR, "vkGetSwapchainImagesKHR"),
+            .acquire_next_image = try deviceProc(get_proc, device, vk.PfnAcquireNextImageKHR, "vkAcquireNextImageKHR"),
+            .queue_present = try deviceProc(get_proc, device, vk.PfnQueuePresentKHR, "vkQueuePresentKHR"),
+        };
+    }
+};
+
 fn deviceProc(get_proc: vk.PfnGetDeviceProcAddr, device: vk.Device, comptime T: type, name: [*:0]const u8) Error!T {
     const address = get_proc(device, name) orelse return Error.MissingVulkanFunction;
     return @ptrCast(address);
@@ -377,6 +439,7 @@ const maximum_compute_pipelines = 256;
 const maximum_graphics_pipelines = 256;
 const maximum_staged_buffer_bytes = 128 * 1024 * 1024;
 const maximum_frame_bytes = 128 * 1024 * 1024;
+const maximum_completed_frames = 16;
 
 const GuestBufferEntry = struct {
     guest_address: u64,
@@ -457,6 +520,25 @@ const GraphicsPipelineState = extern struct {
 const GuestColorTarget = struct {
     descriptor: gpu.resources.ColorTarget,
     layout: gpu.SurfaceLayout,
+};
+
+const CachedFrame = struct {
+    pixels: std.ArrayList(u8) = .empty,
+    width: u32 = 0,
+    height: u32 = 0,
+    guest_address: u64 = 0,
+    sequence: u64 = 0,
+};
+
+const WindowPresentation = struct {
+    native_window: NativeWindow,
+    surface_functions: SurfaceFunctions,
+    swapchain_functions: SwapchainFunctions,
+    surface: vk.Surface,
+    swapchain: vk.Swapchain,
+    images: []vk.Image,
+    extent: vk.Extent2D,
+    format: u32,
 };
 
 const PreparedSampledImage = struct {
@@ -550,11 +632,12 @@ pub const Renderer = struct {
     guest_graphics_draws: u64 = 0,
     graphics_probe_colored_pixels: u32 = 0,
     graphics_probe_frame: [graphics_probe_bytes]u8 = @splat(0),
-    latest_frame: std.ArrayList(u8) = .empty,
-    latest_frame_width: u32 = 0,
-    latest_frame_height: u32 = 0,
-    latest_frame_address: u64 = 0,
+    completed_frames: std.ArrayList(CachedFrame) = .empty,
+    latest_frame_index: ?usize = null,
+    frame_sequence: u64 = 0,
     presentation_sink: ?PresentationSink = null,
+    display_buffer_resolver: ?DisplayBufferResolver = null,
+    window_presentation: ?WindowPresentation = null,
     presented_frames: u64 = 0,
     guest_color_target_writes: u64 = 0,
     sampled_image_uploads: u64 = 0,
@@ -579,6 +662,8 @@ pub const Renderer = struct {
     last_flip_error: ?anyerror = null,
 
     pub fn init(allocator: std.mem.Allocator, options: Options) (Error || std.mem.Allocator.Error)!Renderer {
+        const wants_presentation = options.native_window != null;
+        if (wants_presentation and builtin.os.tag != .windows) return Error.UnsupportedPresentationPlatform;
         var loader = try Loader.init();
         errdefer loader.deinit();
 
@@ -592,6 +677,10 @@ pub const Renderer = struct {
         const validation_enabled = options.enable_validation and layerAvailable(enumerate_layers, "VK_LAYER_KHRONOS_validation");
         const validation_name: [*:0]const u8 = "VK_LAYER_KHRONOS_validation";
         const layer_names = [_][*:0]const u8{validation_name};
+        const instance_extension_names = [_][*:0]const u8{
+            "VK_KHR_surface",
+            "VK_KHR_win32_surface",
+        };
 
         const application_info = vk.ApplicationInfo{
             .application_name = "PS5PCEM",
@@ -604,8 +693,8 @@ pub const Renderer = struct {
             .application_info = &application_info,
             .enabled_layer_count = @intFromBool(validation_enabled),
             .enabled_layer_names = if (validation_enabled) &layer_names else null,
-            .enabled_extension_count = 0,
-            .enabled_extension_names = null,
+            .enabled_extension_count = if (wants_presentation) instance_extension_names.len else 0,
+            .enabled_extension_names = if (wants_presentation) &instance_extension_names else null,
         };
         const create_instance = try loader.global(vk.PfnCreateInstance, "vkCreateInstance");
         var maybe_instance: ?vk.Instance = null;
@@ -614,16 +703,41 @@ pub const Renderer = struct {
         const instance_functions = try InstanceFunctions.load(&loader, instance_handle);
         errdefer instance_functions.destroy_instance(instance_handle, null);
 
-        const candidate = try choosePhysicalDevice(allocator, instance_handle, &instance_functions);
+        const surface_functions: ?SurfaceFunctions = if (wants_presentation)
+            try SurfaceFunctions.load(&loader, instance_handle)
+        else
+            null;
+        var surface: vk.Surface = 0;
+        if (options.native_window) |window| {
+            const surface_info = vk.Win32SurfaceCreateInfoKHR{
+                .instance = window.instance,
+                .window = window.window,
+            };
+            if (surface_functions.?.create_win32_surface(instance_handle, &surface_info, null, &surface) != vk.success) {
+                return Error.SurfaceCreationFailed;
+            }
+        }
+        errdefer if (surface != 0) surface_functions.?.destroy_surface(instance_handle, surface, null);
+
+        const candidate = try choosePhysicalDevice(
+            allocator,
+            instance_handle,
+            &instance_functions,
+            surface,
+            if (surface_functions) |*functions| functions else null,
+        );
         const queue_priority: f32 = 1.0;
         const queue_info = vk.DeviceQueueCreateInfo{
             .queue_family_index = candidate.queue_family_index,
             .queue_count = 1,
             .queue_priorities = @ptrCast(&queue_priority),
         };
+        const device_extension_names = [_][*:0]const u8{"VK_KHR_swapchain"};
         const device_info = vk.DeviceCreateInfo{
             .queue_create_info_count = 1,
             .queue_create_infos = @ptrCast(&queue_info),
+            .enabled_extension_count = if (wants_presentation) device_extension_names.len else 0,
+            .enabled_extension_names = if (wants_presentation) &device_extension_names else null,
         };
         var maybe_device: ?vk.Device = null;
         if (instance_functions.create_device(candidate.physical_device, &device_info, null, &maybe_device) != vk.success) {
@@ -632,6 +746,10 @@ pub const Renderer = struct {
         const device = maybe_device orelse return Error.DeviceCreationFailed;
         const device_functions = try DeviceFunctions.load(instance_functions.get_device_proc_addr, device);
         errdefer device_functions.destroy_device(device, null);
+        const swapchain_functions: ?SwapchainFunctions = if (wants_presentation)
+            try SwapchainFunctions.load(instance_functions.get_device_proc_addr, device)
+        else
+            null;
 
         var maybe_queue: ?vk.Queue = null;
         device_functions.get_device_queue(device, candidate.queue_family_index, 0, &maybe_queue);
@@ -720,6 +838,23 @@ pub const Renderer = struct {
         var memory_properties: vk.PhysicalDeviceMemoryProperties = undefined;
         instance_functions.get_memory_properties(candidate.physical_device, &memory_properties);
 
+        const window_presentation: ?WindowPresentation = if (options.native_window) |window|
+            try createWindowPresentation(
+                allocator,
+                candidate.physical_device,
+                device,
+                window,
+                surface,
+                surface_functions.?,
+                swapchain_functions.?,
+            )
+        else
+            null;
+        errdefer if (window_presentation) |presentation| {
+            swapchain_functions.?.destroy_swapchain(device, presentation.swapchain, null);
+            allocator.free(presentation.images);
+        };
+
         return .{
             .allocator = allocator,
             .loader = loader,
@@ -741,6 +876,7 @@ pub const Renderer = struct {
             .device_info = candidate.info,
             .validation_enabled = validation_enabled,
             .graphics_probe_enabled = options.enable_graphics_probe,
+            .window_presentation = window_presentation,
         };
     }
 
@@ -758,7 +894,8 @@ pub const Renderer = struct {
             self.allocator.free(entry.fragment_words);
         }
         self.graphics_pipelines.deinit(self.allocator);
-        self.latest_frame.deinit(self.allocator);
+        for (self.completed_frames.items) |*frame| frame.pixels.deinit(self.allocator);
+        self.completed_frames.deinit(self.allocator);
         for (self.guest_buffers.items) |entry| {
             self.destroyBuffer(entry.device_local);
             self.destroyBuffer(entry.upload);
@@ -769,6 +906,11 @@ pub const Renderer = struct {
         self.device_functions.destroy_descriptor_pool(self.device, self.descriptor_pool, null);
         self.device_functions.destroy_descriptor_set_layout(self.device, self.descriptor_set_layout, null);
         self.device_functions.destroy_command_pool(self.device, self.command_pool, null);
+        if (self.window_presentation) |presentation| {
+            presentation.swapchain_functions.destroy_swapchain(self.device, presentation.swapchain, null);
+            self.allocator.free(presentation.images);
+            presentation.surface_functions.destroy_surface(self.instance_handle, presentation.surface, null);
+        }
         self.device_functions.destroy_device(self.device, null);
         self.instance_functions.destroy_instance(self.instance_handle, null);
         self.loader.deinit();
@@ -791,6 +933,160 @@ pub const Renderer = struct {
     /// without owning Vulkan resources.
     pub fn setPresentationSink(self: *Renderer, sink: ?PresentationSink) void {
         self.presentation_sink = sink;
+    }
+
+    /// Selects the registered display-buffer allocation named by a flip. With
+    /// no resolver the most recently completed target is retained for isolated
+    /// DCB tests.
+    pub fn setDisplayBufferResolver(self: *Renderer, resolver: ?DisplayBufferResolver) void {
+        self.display_buffer_resolver = resolver;
+    }
+
+    /// A sink that copies completed guest frames into the renderer-owned host
+    /// swapchain. It is installed explicitly after `Renderer` reaches its final
+    /// address because the callback context points back to this value.
+    pub fn windowPresentationSink(self: *Renderer) ?PresentationSink {
+        if (self.window_presentation == null) return null;
+        return .{ .context = self, .present = presentWindowSink };
+    }
+
+    /// Presents one already-linear frame to the optional window swapchain.
+    pub fn presentWindowFrame(self: *Renderer, frame: PresentedFrame) bool {
+        self.copyFrameToSwapchain(frame) catch |err| {
+            self.last_flip_error = err;
+            return false;
+        };
+        return true;
+    }
+
+    fn presentWindowSink(context: ?*anyopaque, frame: PresentedFrame) bool {
+        const self: *Renderer = @ptrCast(@alignCast(context orelse return false));
+        return self.presentWindowFrame(frame);
+    }
+
+    fn copyFrameToSwapchain(self: *Renderer, frame: PresentedFrame) anyerror!void {
+        const presentation = &(self.window_presentation orelse return Error.PresentationRejected);
+        if (frame.width == 0 or frame.height == 0 or frame.row_pitch_bytes < frame.width * 4) {
+            return Error.PresentationRejected;
+        }
+        const minimum_source_bytes = try std.math.add(
+            usize,
+            try std.math.mul(usize, frame.height - 1, frame.row_pitch_bytes),
+            try std.math.mul(usize, frame.width, 4),
+        );
+        if (frame.pixels.len < minimum_source_bytes) return Error.PresentationRejected;
+        const output_bytes_u64 = @as(u64, presentation.extent.width) * presentation.extent.height * 4;
+        const output_bytes = std.math.cast(usize, output_bytes_u64) orelse return Error.PresentationRejected;
+        if (output_bytes == 0 or output_bytes > maximum_frame_bytes) return Error.PresentationRejected;
+
+        const upload = try self.createBuffer(
+            output_bytes,
+            vk.buffer_usage_transfer_src_bit,
+            vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+        );
+        defer self.destroyBuffer(upload);
+        var mapped: ?*anyopaque = null;
+        if (self.device_functions.map_memory(self.device, upload.memory, 0, output_bytes, 0, &mapped) != vk.success) {
+            return Error.MemoryMapFailed;
+        }
+        const output: [*]u8 = @ptrCast(mapped orelse {
+            self.device_functions.unmap_memory(self.device, upload.memory);
+            return Error.MemoryMapFailed;
+        });
+        scalePresentedFrame(
+            output[0..output_bytes],
+            presentation.extent.width,
+            presentation.extent.height,
+            presentation.format,
+            frame,
+        );
+        self.device_functions.unmap_memory(self.device, upload.memory);
+
+        const acquire_info = vk.FenceCreateInfo{};
+        var acquire_fence: vk.Fence = 0;
+        if (self.device_functions.create_fence(self.device, &acquire_info, null, &acquire_fence) != vk.success) {
+            return Error.FenceCreationFailed;
+        }
+        defer self.device_functions.destroy_fence(self.device, acquire_fence, null);
+        var image_index: u32 = 0;
+        const acquired = presentation.swapchain_functions.acquire_next_image(
+            self.device,
+            presentation.swapchain,
+            std.math.maxInt(u64),
+            0,
+            acquire_fence,
+            &image_index,
+        );
+        if (acquired != vk.success and acquired != vk.suboptimal_khr) return Error.SwapchainAcquireFailed;
+        if (image_index >= presentation.images.len or
+            self.device_functions.wait_for_fences(self.device, 1, @ptrCast(&acquire_fence), vk.true_value, std.math.maxInt(u64)) != vk.success)
+        {
+            return Error.FenceWaitFailed;
+        }
+
+        const command_buffer = try self.beginOneShot();
+        defer self.device_functions.free_command_buffers(self.device, self.command_pool, 1, @ptrCast(&command_buffer));
+        const upload_barrier = vk.ImageMemoryBarrier{
+            .source_access_mask = 0,
+            .destination_access_mask = vk.access_transfer_write_bit,
+            .old_layout = vk.image_layout_undefined,
+            .new_layout = vk.image_layout_transfer_dst_optimal,
+            .image = presentation.images[image_index],
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_top_of_pipe_bit,
+            vk.pipeline_stage_transfer_bit,
+            0,
+            0,
+            null,
+            0,
+            null,
+            1,
+            @ptrCast(&upload_barrier),
+        );
+        const copy = vk.BufferImageCopy{
+            .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+            .image_extent = .{ .width = presentation.extent.width, .height = presentation.extent.height, .depth = 1 },
+        };
+        self.device_functions.cmd_copy_buffer_to_image(
+            command_buffer,
+            upload.handle,
+            presentation.images[image_index],
+            vk.image_layout_transfer_dst_optimal,
+            1,
+            @ptrCast(&copy),
+        );
+        const present_barrier = vk.ImageMemoryBarrier{
+            .source_access_mask = vk.access_transfer_write_bit,
+            .destination_access_mask = 0,
+            .old_layout = vk.image_layout_transfer_dst_optimal,
+            .new_layout = vk.image_layout_present_src_khr,
+            .image = presentation.images[image_index],
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_transfer_bit,
+            vk.pipeline_stage_bottom_of_pipe_bit,
+            0,
+            0,
+            null,
+            0,
+            null,
+            1,
+            @ptrCast(&present_barrier),
+        );
+        try self.submitOneShot(command_buffer);
+
+        const present_info = vk.PresentInfoKHR{
+            .swapchain_count = 1,
+            .swapchains = @ptrCast(&presentation.swapchain),
+            .image_indices = @ptrCast(&image_index),
+        };
+        const presented = presentation.swapchain_functions.queue_present(self.queue, &present_info);
+        if (presented != vk.success and presented != vk.suboptimal_khr) return Error.SwapchainPresentFailed;
     }
 
     /// Reuses host/device allocations for an exact guest range while uploading
@@ -1859,11 +2155,34 @@ pub const Renderer = struct {
         if (!memory.read(memory.context, target.descriptor.address, tiled)) return Error.GuestMemoryReadFailed;
         try target.layout.tile(frame, tiled);
         if (!memory.write(memory.context, target.descriptor.address, tiled)) return Error.GuestMemoryWriteFailed;
-        self.latest_frame.clearRetainingCapacity();
-        try self.latest_frame.appendSlice(self.allocator, frame);
-        self.latest_frame_width = target.descriptor.width;
-        self.latest_frame_height = target.descriptor.height;
-        self.latest_frame_address = target.descriptor.address;
+        var frame_index: ?usize = null;
+        for (self.completed_frames.items, 0..) |cached, index| {
+            if (cached.guest_address == target.descriptor.address) {
+                frame_index = index;
+                break;
+            }
+        }
+        if (frame_index == null) {
+            if (self.completed_frames.items.len < maximum_completed_frames) {
+                try self.completed_frames.append(self.allocator, .{});
+                frame_index = self.completed_frames.items.len - 1;
+            } else {
+                var oldest_index: usize = 0;
+                for (self.completed_frames.items[1..], 1..) |cached, index| {
+                    if (cached.sequence < self.completed_frames.items[oldest_index].sequence) oldest_index = index;
+                }
+                frame_index = oldest_index;
+            }
+        }
+        const cached = &self.completed_frames.items[frame_index.?];
+        cached.pixels.clearRetainingCapacity();
+        try cached.pixels.appendSlice(self.allocator, frame);
+        self.frame_sequence +%= 1;
+        cached.width = target.descriptor.width;
+        cached.height = target.descriptor.height;
+        cached.guest_address = target.descriptor.address;
+        cached.sequence = self.frame_sequence;
+        self.latest_frame_index = frame_index;
         self.guest_color_target_writes += 1;
     }
 
@@ -2435,17 +2754,36 @@ pub const Renderer = struct {
             self.last_flip_error = self.last_sync_error;
             return false;
         }
-        if (self.latest_frame.items.len == 0) {
+        var selected_index = self.latest_frame_index;
+        if (self.display_buffer_resolver) |resolver| {
+            const requested_address = resolver.resolve(resolver.context, flip) orelse {
+                self.last_flip_error = Error.MissingPresentedFrame;
+                return false;
+            };
+            selected_index = null;
+            for (self.completed_frames.items, 0..) |cached, index| {
+                if (cached.guest_address == requested_address) {
+                    selected_index = index;
+                    break;
+                }
+            }
+        }
+        const frame_index = selected_index orelse {
+            self.last_flip_error = Error.MissingPresentedFrame;
+            return false;
+        };
+        const cached = &self.completed_frames.items[frame_index];
+        if (cached.pixels.items.len == 0) {
             self.last_flip_error = Error.MissingPresentedFrame;
             return false;
         }
         if (self.presentation_sink) |sink| {
             if (!sink.present(sink.context, .{
-                .pixels = self.latest_frame.items,
-                .width = self.latest_frame_width,
-                .height = self.latest_frame_height,
-                .row_pitch_bytes = self.latest_frame_width * 4,
-                .guest_address = self.latest_frame_address,
+                .pixels = cached.pixels.items,
+                .width = cached.width,
+                .height = cached.height,
+                .row_pitch_bytes = cached.width * 4,
+                .guest_address = cached.guest_address,
                 .flip = flip,
             })) {
                 self.last_flip_error = Error.PresentationRejected;
@@ -2570,10 +2908,55 @@ fn layerAvailable(enumerate: vk.PfnEnumerateInstanceLayerProperties, wanted: []c
     return false;
 }
 
+fn scalePresentedFrame(
+    output: []u8,
+    output_width_u32: u32,
+    output_height_u32: u32,
+    output_format: u32,
+    frame: PresentedFrame,
+) void {
+    @memset(output, 0);
+    const output_width: usize = output_width_u32;
+    const output_height: usize = output_height_u32;
+    const source_width: usize = frame.width;
+    const source_height: usize = frame.height;
+    const source_pitch: usize = frame.row_pitch_bytes;
+    var draw_width = output_width;
+    var draw_height = output_height;
+    if (@as(u64, output_width_u32) * frame.height <= @as(u64, output_height_u32) * frame.width) {
+        draw_height = @max(@as(usize, 1), output_width * source_height / source_width);
+    } else {
+        draw_width = @max(@as(usize, 1), output_height * source_width / source_height);
+    }
+    const offset_x = (output_width - draw_width) / 2;
+    const offset_y = (output_height - draw_height) / 2;
+    const swap_red_blue = output_format == vk.format_b8g8r8a8_unorm;
+    for (0..draw_height) |y| {
+        const source_y = @min(y * source_height / draw_height, source_height - 1);
+        for (0..draw_width) |x| {
+            const source_x = @min(x * source_width / draw_width, source_width - 1);
+            const source = source_y * source_pitch + source_x * 4;
+            const destination = ((offset_y + y) * output_width + offset_x + x) * 4;
+            if (swap_red_blue) {
+                output[destination] = frame.pixels[source + 2];
+                output[destination + 1] = frame.pixels[source + 1];
+                output[destination + 2] = frame.pixels[source];
+            } else {
+                output[destination] = frame.pixels[source];
+                output[destination + 1] = frame.pixels[source + 1];
+                output[destination + 2] = frame.pixels[source + 2];
+            }
+            output[destination + 3] = frame.pixels[source + 3];
+        }
+    }
+}
+
 fn choosePhysicalDevice(
     allocator: std.mem.Allocator,
     instance_handle: vk.Instance,
     functions: *const InstanceFunctions,
+    surface: vk.Surface,
+    surface_functions: ?*const SurfaceFunctions,
 ) (Error || std.mem.Allocator.Error)!Candidate {
     var count: u32 = 0;
     if (functions.enumerate_physical_devices(instance_handle, &count, null) != vk.success or count == 0) {
@@ -2601,10 +2984,15 @@ fn choosePhysicalDevice(
 
         var selected_family: ?u32 = null;
         for (families[0..family_count], 0..) |family, index| {
-            if (family.queue_count != 0 and family.queue_flags & vk.required_queue_flags == vk.required_queue_flags) {
-                selected_family = @intCast(index);
-                break;
+            if (family.queue_count == 0 or family.queue_flags & vk.required_queue_flags != vk.required_queue_flags) continue;
+            if (surface != 0) {
+                var supported: vk.Bool32 = 0;
+                const query = surface_functions orelse continue;
+                if (query.get_surface_support(physical_device, @intCast(index), surface, &supported) != vk.success or
+                    supported == 0) continue;
             }
+            selected_family = @intCast(index);
+            break;
         }
         const family_index = selected_family orelse continue;
 
@@ -2634,6 +3022,103 @@ fn choosePhysicalDevice(
         }
     }
     return best orelse Error.NoCompatiblePhysicalDevice;
+}
+
+fn createWindowPresentation(
+    allocator: std.mem.Allocator,
+    physical_device: vk.PhysicalDevice,
+    device: vk.Device,
+    native_window: NativeWindow,
+    surface: vk.Surface,
+    surface_functions: SurfaceFunctions,
+    swapchain_functions: SwapchainFunctions,
+) (Error || std.mem.Allocator.Error)!WindowPresentation {
+    var capabilities: vk.SurfaceCapabilitiesKHR = undefined;
+    if (surface_functions.get_surface_capabilities(physical_device, surface, &capabilities) != vk.success) {
+        return Error.SurfaceQueryFailed;
+    }
+    if (capabilities.supported_usage_flags & vk.image_usage_transfer_dst_bit == 0) {
+        return Error.SurfaceFormatUnavailable;
+    }
+
+    var format_count: u32 = 0;
+    if (surface_functions.get_surface_formats(physical_device, surface, &format_count, null) != vk.success or
+        format_count == 0 or format_count > 256)
+    {
+        return Error.SurfaceQueryFailed;
+    }
+    const formats = try allocator.alloc(vk.SurfaceFormatKHR, format_count);
+    defer allocator.free(formats);
+    if (surface_functions.get_surface_formats(physical_device, surface, &format_count, formats.ptr) != vk.success) {
+        return Error.SurfaceQueryFailed;
+    }
+    var selected: ?vk.SurfaceFormatKHR = null;
+    for (formats[0..format_count]) |format| {
+        if (format.format == vk.format_r8g8b8a8_unorm and format.color_space == vk.color_space_srgb_nonlinear_khr) {
+            selected = format;
+            break;
+        }
+        if (selected == null and format.format == vk.format_b8g8r8a8_unorm and
+            format.color_space == vk.color_space_srgb_nonlinear_khr)
+        {
+            selected = format;
+        }
+    }
+    const surface_format = selected orelse return Error.SurfaceFormatUnavailable;
+    const variable_extent = capabilities.current_extent.width == std.math.maxInt(u32);
+    const extent = if (variable_extent)
+        vk.Extent2D{
+            .width = std.math.clamp(native_window.width, capabilities.minimum_image_extent.width, capabilities.maximum_image_extent.width),
+            .height = std.math.clamp(native_window.height, capabilities.minimum_image_extent.height, capabilities.maximum_image_extent.height),
+        }
+    else
+        capabilities.current_extent;
+    if (extent.width == 0 or extent.height == 0) return Error.SurfaceFormatUnavailable;
+    var image_count = capabilities.minimum_image_count + 1;
+    if (capabilities.maximum_image_count != 0) image_count = @min(image_count, capabilities.maximum_image_count);
+    const composite_alpha = if (capabilities.supported_composite_alpha & vk.composite_alpha_opaque_bit_khr != 0)
+        vk.composite_alpha_opaque_bit_khr
+    else
+        capabilities.supported_composite_alpha & (~capabilities.supported_composite_alpha +% 1);
+    if (composite_alpha == 0) return Error.SurfaceFormatUnavailable;
+
+    const create_info = vk.SwapchainCreateInfoKHR{
+        .surface = surface,
+        .minimum_image_count = image_count,
+        .image_format = surface_format.format,
+        .image_color_space = surface_format.color_space,
+        .image_extent = extent,
+        .image_usage = vk.image_usage_transfer_dst_bit,
+        .pre_transform = capabilities.current_transform,
+        .composite_alpha = composite_alpha,
+        .present_mode = vk.present_mode_fifo_khr,
+    };
+    var swapchain: vk.Swapchain = 0;
+    if (swapchain_functions.create_swapchain(device, &create_info, null, &swapchain) != vk.success) {
+        return Error.SwapchainCreationFailed;
+    }
+    errdefer swapchain_functions.destroy_swapchain(device, swapchain, null);
+    var swapchain_image_count: u32 = 0;
+    if (swapchain_functions.get_swapchain_images(device, swapchain, &swapchain_image_count, null) != vk.success or
+        swapchain_image_count == 0)
+    {
+        return Error.SwapchainImageQueryFailed;
+    }
+    const images = try allocator.alloc(vk.Image, swapchain_image_count);
+    errdefer allocator.free(images);
+    if (swapchain_functions.get_swapchain_images(device, swapchain, &swapchain_image_count, images.ptr) != vk.success) {
+        return Error.SwapchainImageQueryFailed;
+    }
+    return .{
+        .native_window = native_window,
+        .surface_functions = surface_functions,
+        .swapchain_functions = swapchain_functions,
+        .surface = surface,
+        .swapchain = swapchain,
+        .images = images,
+        .extent = extent,
+        .format = surface_format.format,
+    };
 }
 
 // Diagnostic vertex shader: three positions selected from VertexIndex and
@@ -2725,4 +3210,35 @@ test "graphics probe is opt-in and carries standalone shader modules" {
     try std.testing.expect(graphics_probe_vertex_spirv.len > 32);
     try std.testing.expect(graphics_probe_fragment_spirv.len > 24);
     try std.testing.expectEqual(@as(usize, 64 * 64 * 4), graphics_probe_bytes);
+}
+
+test "presentation scaling letterboxes RGBA and converts BGRA" {
+    const pixels = [_]u8{
+        255, 0,   0,   255,
+        0,   255, 0,   255,
+        0,   0,   255, 255,
+        255, 255, 255, 255,
+    };
+    const frame = PresentedFrame{
+        .pixels = &pixels,
+        .width = 2,
+        .height = 2,
+        .row_pitch_bytes = 8,
+        .guest_address = 0x1000,
+        .flip = .{
+            .video_out_handle = 1,
+            .display_buffer_index = 0,
+            .mode = 1,
+            .argument = 7,
+        },
+    };
+    var rgba: [4 * 4 * 4]u8 = undefined;
+    scalePresentedFrame(&rgba, 4, 4, vk.format_r8g8b8a8_unorm, frame);
+    try std.testing.expectEqualSlices(u8, pixels[0..4], rgba[0..4]);
+    try std.testing.expectEqualSlices(u8, pixels[12..16], rgba[60..64]);
+
+    var bgra: [2 * 4 * 4]u8 = undefined;
+    scalePresentedFrame(&bgra, 2, 4, vk.format_b8g8r8a8_unorm, frame);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0 }, bgra[0..4]);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 255, 255 }, bgra[8..12]);
 }

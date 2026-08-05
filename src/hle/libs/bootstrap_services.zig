@@ -16,6 +16,7 @@ const kernel_memory = @import("kernel_memory.zig");
 const agc_submit = @import("agc_submit.zig");
 const agc_shader_registry = @import("agc_shader_registry.zig");
 const gpu = @import("gpu");
+const video_out = @import("../video_out.zig");
 
 const invalid_argument = errno.KernelError.einval.raw();
 
@@ -70,25 +71,18 @@ const random_exports = [_]symbols.Export{
     .{ .name = "sceRandomGetRandomNumber", .function = trace.wrap("sceRandomGetRandomNumber", &randomGetRandomNumber), .expect_id = "PI7jIZj4pcE" },
 };
 
-// Headless VideoOut -------------------------------------------------------
+// VideoOut ---------------------------------------------------------------
 
-const video_out_error_invalid_handle: i32 = @bitCast(@as(u32, 0x8029_0001));
+const video_out_error_invalid_value: i32 = @bitCast(@as(u32, 0x8029_0001));
 const video_out_error_invalid_address: i32 = @bitCast(@as(u32, 0x8029_0002));
+const video_out_error_invalid_index: i32 = @bitCast(@as(u32, 0x8029_000a));
+const video_out_error_invalid_handle: i32 = @bitCast(@as(u32, 0x8029_000b));
+const video_out_error_slot_occupied: i32 = @bitCast(@as(u32, 0x8029_0010));
+const video_out_error_invalid_option: i32 = @bitCast(@as(u32, 0x8029_001a));
+const video_out_error_invalid_category: i32 = @bitCast(@as(u32, 0x8029_001d));
 
-const VideoOutBufferAttribute2 = extern struct {
-    reserved0: u32 = 0,
-    tiling_mode: u32 = 0,
-    aspect_ratio: u32 = 0,
-    width: u32 = 0,
-    height: u32 = 0,
-    pitch_in_pixels: u32 = 0,
-    option: u64 = 0,
-    pixel_format: u64 = 0,
-    dcc_clear_color: u64 = 0,
-    dcc_control: u32 = 0,
-    padding: u32 = 0,
-    reserved1: [3]u64 = .{ 0, 0, 0 },
-};
+pub const VideoOutBufferAttribute2 = video_out.BufferAttribute2;
+pub const VideoOutBuffer = video_out.Buffer;
 
 const VideoOutFlipStatus = extern struct {
     count: u64 = 0,
@@ -113,18 +107,12 @@ const VideoOutOutputStatus = extern struct {
     reserved: [3]u64 = .{ 0, 0, 0 },
 };
 
-var video_open = std.atomic.Value(bool).init(false);
-var video_flip_count = std.atomic.Value(u64).init(0);
-var video_current_buffer = std.atomic.Value(i32).init(0);
-
 fn validVideoHandle(handle: i32) bool {
-    return handle == 1 and video_open.load(.acquire);
+    return video_out.validHandle(handle);
 }
 
 fn videoOutOpen(_: i32, _: i32, index: i32, _: ?*const anyopaque) callconv(abi.guest) i32 {
-    if (index != 0) return video_out_error_invalid_handle;
-    if (video_open.swap(true, .acq_rel)) return video_out_error_invalid_handle;
-    return 1;
+    return if (video_out.open(index)) video_out.primary_handle else video_out_error_invalid_handle;
 }
 
 fn videoOutSetBufferAttribute2(
@@ -155,25 +143,74 @@ fn videoHandleOption(handle: i32, _: u64, _: u64, _: u64, _: u64, _: u64) callco
     return if (validVideoHandle(handle)) errno.ok else video_out_error_invalid_handle;
 }
 
+fn videoOutClose(handle: i32) callconv(abi.guest) i32 {
+    return if (video_out.close(handle)) errno.ok else video_out_error_invalid_handle;
+}
+
+fn videoOutError(err: video_out.RegisterError) i32 {
+    return switch (err) {
+        error.InvalidValue => video_out_error_invalid_value,
+        error.InvalidAddress => video_out_error_invalid_address,
+        error.InvalidOption => video_out_error_invalid_option,
+        error.InvalidCategory => video_out_error_invalid_category,
+        error.InvalidIndex => video_out_error_invalid_index,
+        error.SlotOccupied => video_out_error_slot_occupied,
+    };
+}
+
 fn videoOutRegisterBuffers2(
     handle: i32,
-    _: i32,
-    _: i32,
-    buffers: ?*const anyopaque,
+    set_index: i32,
+    buffer_index_start: i32,
+    buffer_pointer: ?[*]const VideoOutBuffer,
     count: i32,
     attribute: ?*const VideoOutBufferAttribute2,
-    _: i32,
-    _: ?*anyopaque,
+    category: i32,
+    option: ?*anyopaque,
 ) callconv(abi.guest) i32 {
     if (!validVideoHandle(handle)) return video_out_error_invalid_handle;
-    if (buffers == null or attribute == null or count <= 0) return video_out_error_invalid_address;
+    const input = buffer_pointer orelse return video_out_error_invalid_address;
+    const attributes = attribute orelse return video_out_error_invalid_option;
+    if (count <= 0) return video_out_error_invalid_value;
+    if (option != null) return video_out_error_invalid_option;
+    video_out.registerBuffers(
+        set_index,
+        buffer_index_start,
+        input[0..@intCast(count)],
+        attributes.*,
+        category,
+    ) catch |err| return videoOutError(err);
     return errno.ok;
 }
 
-fn videoOutSubmitFlip(handle: i32, index: i32, _: i32, _: i64) callconv(abi.guest) i32 {
+fn videoOutUnregisterBuffers(handle: i32, set_index: i32) callconv(abi.guest) i32 {
     if (!validVideoHandle(handle)) return video_out_error_invalid_handle;
-    video_current_buffer.store(index, .release);
-    _ = video_flip_count.fetchAdd(1, .monotonic);
+    video_out.unregisterBuffers(set_index) catch |err| return videoOutError(err);
+    return errno.ok;
+}
+
+fn videoOutSubmitChangeBufferAttribute2(
+    handle: i32,
+    set_index: i32,
+    attribute: ?*const VideoOutBufferAttribute2,
+    option: ?*anyopaque,
+) callconv(abi.guest) i32 {
+    if (!validVideoHandle(handle)) return video_out_error_invalid_handle;
+    const value = attribute orelse return video_out_error_invalid_option;
+    if (option != null) return video_out_error_invalid_option;
+    video_out.changeAttribute(set_index, value.*) catch |err| return videoOutError(err);
+    return errno.ok;
+}
+
+fn videoOutSubmitFlip(handle: i32, index: i32, mode: i32, argument: i64) callconv(abi.guest) i32 {
+    if (!validVideoHandle(handle)) return video_out_error_invalid_handle;
+    if (video_out.resolve(@intCast(handle), index) == null) return video_out_error_invalid_index;
+    _ = agc_submit.presentFlip(.{
+        .video_out_handle = @intCast(handle),
+        .display_buffer_index = index,
+        .mode = @bitCast(mode),
+        .argument = argument,
+    });
     _ = kernel_threading.sceKernelUsleep(16_667);
     return errno.ok;
 }
@@ -181,9 +218,11 @@ fn videoOutSubmitFlip(handle: i32, index: i32, _: i32, _: i64) callconv(abi.gues
 fn videoOutGetFlipStatus(handle: i32, status: ?*VideoOutFlipStatus) callconv(abi.guest) i32 {
     if (!validVideoHandle(handle)) return video_out_error_invalid_handle;
     const output = status orelse return video_out_error_invalid_address;
+    const current = video_out.status(handle) orelse return video_out_error_invalid_handle;
     output.* = .{
-        .count = video_flip_count.load(.acquire),
-        .current_buffer = video_current_buffer.load(.acquire),
+        .count = current.count,
+        .flip_argument = current.argument,
+        .current_buffer = current.current_buffer,
     };
     return errno.ok;
 }
@@ -210,21 +249,24 @@ fn videoOutIsFlipPending(handle: i32) callconv(abi.guest) i32 {
 
 /// A flip submitted to complete when the GPU finishes the frame.
 ///
-/// The difference from an ordinary flip is only *when* it takes effect: the
-/// caller does not wait, because the pipeline signals it. Nothing here runs a
-/// pipeline, so it takes effect at once — and unlike the ordinary flip it does
-/// not pace itself, since a caller that expected to be paced would have used
-/// the other call.
+/// The live backend drains prior queue work before presenting it. Unlike the
+/// ordinary CPU flip, this entry point does not add display pacing because its
+/// caller expects GPU end-of-pipe ordering to provide that boundary.
 fn videoOutSubmitEopFlip(
     handle: i32,
     index: i32,
-    _: u32,
-    _: u64,
+    mode: u32,
+    argument: u64,
     _: u64,
 ) callconv(abi.guest) i32 {
     if (!validVideoHandle(handle)) return video_out_error_invalid_handle;
-    video_current_buffer.store(index, .release);
-    _ = video_flip_count.fetchAdd(1, .monotonic);
+    if (video_out.resolve(@intCast(handle), index) == null) return video_out_error_invalid_index;
+    _ = agc_submit.presentFlip(.{
+        .video_out_handle = @intCast(handle),
+        .display_buffer_index = index,
+        .mode = mode,
+        .argument = @bitCast(argument),
+    });
     return errno.ok;
 }
 
@@ -254,10 +296,11 @@ fn videoOutGetPipelineStatus(_: i32, _: u64) callconv(abi.guest) i32 {
 
 const video_out_exports = [_]symbols.Export{
     .{ .name = "sceVideoOutOpen", .function = trace.wrap("sceVideoOutOpen", &videoOutOpen), .expect_id = "Up36PTk687E" },
+    .{ .name = "sceVideoOutClose", .function = trace.wrap("sceVideoOutClose", &videoOutClose), .expect_id = "uquVH4-Du78" },
     .{ .name = "sceVideoOutSetBufferAttribute2", .function = trace.wrap("sceVideoOutSetBufferAttribute2", &videoOutSetBufferAttribute2), .expect_id = "PjS5uASwcV8" },
     .{ .name = "sceVideoOutRegisterBuffers2", .function = trace.wrap("sceVideoOutRegisterBuffers2", &videoOutRegisterBuffers2), .expect_id = "rKBUtgRrtbk" },
-    .{ .name = "sceVideoOutUnregisterBuffers", .function = trace.wrap("sceVideoOutUnregisterBuffers", &videoHandleOption), .expect_id = "N5KDtkIjjJ4" },
-    .{ .name = "sceVideoOutSubmitChangeBufferAttribute2", .function = trace.wrap("sceVideoOutSubmitChangeBufferAttribute2", &videoHandleOption), .expect_id = "HuViW4HnrOw" },
+    .{ .name = "sceVideoOutUnregisterBuffers", .function = trace.wrap("sceVideoOutUnregisterBuffers", &videoOutUnregisterBuffers), .expect_id = "N5KDtkIjjJ4" },
+    .{ .name = "sceVideoOutSubmitChangeBufferAttribute2", .function = trace.wrap("sceVideoOutSubmitChangeBufferAttribute2", &videoOutSubmitChangeBufferAttribute2), .expect_id = "HuViW4HnrOw" },
     .{ .name = "sceVideoOutSubmitFlip", .function = trace.wrap("sceVideoOutSubmitFlip", &videoOutSubmitFlip), .expect_id = "U46NwOiJpys" },
     .{ .name = "sceVideoOutGetFlipStatus", .function = trace.wrap("sceVideoOutGetFlipStatus", &videoOutGetFlipStatus), .expect_id = "SbU3dwp80lQ" },
     .{ .name = "sceVideoOutIsFlipPending", .function = trace.wrap("sceVideoOutIsFlipPending", &videoOutIsFlipPending), .expect_id = "zgXifHT9ErY" },
@@ -832,10 +875,9 @@ const ampr_exports = [_]symbols.Export{
 
 pub fn reset() void {
     agc_shader_registry.reset();
+    agc_submit.reset();
+    video_out.reset();
     random_state.store(0x9e37_79b9_7f4a_7c15, .monotonic);
-    video_open.store(false, .release);
-    video_flip_count.store(0, .monotonic);
-    video_current_buffer.store(0, .monotonic);
 }
 
 pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {

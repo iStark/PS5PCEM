@@ -65,6 +65,8 @@ pub const ImageView = u64;
 pub const RenderPass = u64;
 pub const Framebuffer = u64;
 pub const Sampler = u64;
+pub const Surface = u64;
+pub const Swapchain = u64;
 
 pub const structure_type_application_info: u32 = 0;
 pub const structure_type_instance_create_info: u32 = 1;
@@ -102,6 +104,9 @@ pub const structure_type_command_buffer_begin_info: u32 = 42;
 pub const structure_type_render_pass_begin_info: u32 = 43;
 pub const structure_type_buffer_memory_barrier: u32 = 44;
 pub const structure_type_image_memory_barrier: u32 = 45;
+pub const structure_type_swapchain_create_info_khr: u32 = 1_000_001_000;
+pub const structure_type_present_info_khr: u32 = 1_000_001_001;
+pub const structure_type_win32_surface_create_info_khr: u32 = 1_000_009_000;
 
 pub const queue_graphics_bit: Flags = 0x0000_0001;
 pub const queue_compute_bit: Flags = 0x0000_0002;
@@ -136,6 +141,7 @@ pub const pipeline_stage_compute_shader_bit: Flags = 0x0000_0800;
 pub const pipeline_stage_fragment_shader_bit: Flags = 0x0000_0080;
 pub const pipeline_stage_color_attachment_output_bit: Flags = 0x0000_0400;
 pub const pipeline_stage_host_bit: Flags = 0x0000_4000;
+pub const pipeline_stage_bottom_of_pipe_bit: Flags = 0x0000_2000;
 pub const access_shader_read_bit: Flags = 0x0000_0020;
 pub const access_shader_write_bit: Flags = 0x0000_0040;
 pub const access_transfer_read_bit: Flags = 0x0000_0800;
@@ -162,6 +168,7 @@ pub const image_layout_color_attachment_optimal: u32 = 2;
 pub const image_layout_shader_read_only_optimal: u32 = 5;
 pub const image_layout_transfer_src_optimal: u32 = 6;
 pub const image_layout_transfer_dst_optimal: u32 = 7;
+pub const image_layout_present_src_khr: u32 = 1_000_001_002;
 pub const image_aspect_color_bit: Flags = 1;
 pub const attachment_load_op_clear: u32 = 1;
 pub const attachment_load_op_load: u32 = 0;
@@ -173,6 +180,13 @@ pub const primitive_topology_triangle_list: u32 = 3;
 pub const polygon_mode_fill: u32 = 0;
 pub const color_component_rgba_bits: Flags = 0xf;
 pub const subpass_contents_inline: u32 = 0;
+pub const format_b8g8r8a8_unorm: u32 = 44;
+pub const color_space_srgb_nonlinear_khr: u32 = 0;
+pub const present_mode_fifo_khr: u32 = 2;
+pub const composite_alpha_opaque_bit_khr: Flags = 0x0000_0001;
+pub const surface_transform_identity_bit_khr: Flags = 0x0000_0001;
+pub const suboptimal_khr: Result = 1_000_001_003;
+pub const error_out_of_date_khr: Result = -1_000_001_004;
 
 pub const ApplicationInfo = extern struct {
     s_type: u32 = structure_type_application_info,
@@ -523,6 +537,64 @@ pub const Offset2D = extern struct { x: i32, y: i32 };
 pub const Extent2D = extern struct { width: u32, height: u32 };
 pub const Rect2D = extern struct { offset: Offset2D, extent: Extent2D };
 
+pub const SurfaceCapabilitiesKHR = extern struct {
+    minimum_image_count: u32,
+    maximum_image_count: u32,
+    current_extent: Extent2D,
+    minimum_image_extent: Extent2D,
+    maximum_image_extent: Extent2D,
+    maximum_image_array_layers: u32,
+    supported_transforms: Flags,
+    current_transform: Flags,
+    supported_composite_alpha: Flags,
+    supported_usage_flags: Flags,
+};
+
+pub const SurfaceFormatKHR = extern struct {
+    format: u32,
+    color_space: u32,
+};
+
+pub const Win32SurfaceCreateInfoKHR = extern struct {
+    s_type: u32 = structure_type_win32_surface_create_info_khr,
+    p_next: ?*const anyopaque = null,
+    flags: Flags = 0,
+    instance: *anyopaque,
+    window: *anyopaque,
+};
+
+pub const SwapchainCreateInfoKHR = extern struct {
+    s_type: u32 = structure_type_swapchain_create_info_khr,
+    p_next: ?*const anyopaque = null,
+    flags: Flags = 0,
+    surface: Surface,
+    minimum_image_count: u32,
+    image_format: u32,
+    image_color_space: u32,
+    image_extent: Extent2D,
+    image_array_layers: u32 = 1,
+    image_usage: Flags,
+    image_sharing_mode: u32 = sharing_mode_exclusive,
+    queue_family_index_count: u32 = 0,
+    queue_family_indices: ?[*]const u32 = null,
+    pre_transform: Flags,
+    composite_alpha: Flags,
+    present_mode: u32,
+    clipped: Bool32 = true_value,
+    old_swapchain: Swapchain = 0,
+};
+
+pub const PresentInfoKHR = extern struct {
+    s_type: u32 = structure_type_present_info_khr,
+    p_next: ?*const anyopaque = null,
+    wait_semaphore_count: u32 = 0,
+    wait_semaphores: ?[*]const u64 = null,
+    swapchain_count: u32,
+    swapchains: [*]const Swapchain,
+    image_indices: [*]const u32,
+    results: ?[*]Result = null,
+};
+
 pub const PipelineViewportStateCreateInfo = extern struct {
     s_type: u32 = structure_type_pipeline_viewport_state_create_info,
     p_next: ?*const anyopaque = null,
@@ -738,6 +810,11 @@ pub const PfnGetPhysicalDeviceProperties = *const fn (PhysicalDevice, *anyopaque
 pub const PfnGetPhysicalDeviceQueueFamilyProperties = *const fn (PhysicalDevice, *u32, ?[*]QueueFamilyProperties) callconv(call) void;
 pub const PfnGetPhysicalDeviceMemoryProperties = *const fn (PhysicalDevice, *PhysicalDeviceMemoryProperties) callconv(call) void;
 pub const PfnCreateDevice = *const fn (PhysicalDevice, *const DeviceCreateInfo, ?*const anyopaque, *?Device) callconv(call) Result;
+pub const PfnCreateWin32SurfaceKHR = *const fn (Instance, *const Win32SurfaceCreateInfoKHR, ?*const anyopaque, *Surface) callconv(call) Result;
+pub const PfnDestroySurfaceKHR = *const fn (Instance, Surface, ?*const anyopaque) callconv(call) void;
+pub const PfnGetPhysicalDeviceSurfaceSupportKHR = *const fn (PhysicalDevice, u32, Surface, *Bool32) callconv(call) Result;
+pub const PfnGetPhysicalDeviceSurfaceCapabilitiesKHR = *const fn (PhysicalDevice, Surface, *SurfaceCapabilitiesKHR) callconv(call) Result;
+pub const PfnGetPhysicalDeviceSurfaceFormatsKHR = *const fn (PhysicalDevice, Surface, *u32, ?[*]SurfaceFormatKHR) callconv(call) Result;
 
 pub const PfnDestroyDevice = *const fn (Device, ?*const anyopaque) callconv(call) void;
 pub const PfnGetDeviceQueue = *const fn (Device, u32, u32, *?Queue) callconv(call) void;
@@ -798,6 +875,11 @@ pub const PfnCmdCopyBuffer = *const fn (CommandBuffer, Buffer, Buffer, u32, [*]c
 pub const PfnCmdCopyImageToBuffer = *const fn (CommandBuffer, Image, u32, Buffer, u32, [*]const BufferImageCopy) callconv(call) void;
 pub const PfnCmdCopyBufferToImage = *const fn (CommandBuffer, Buffer, Image, u32, u32, [*]const BufferImageCopy) callconv(call) void;
 pub const PfnCmdPipelineBarrier = *const fn (CommandBuffer, Flags, Flags, Flags, u32, ?*const anyopaque, u32, ?[*]const BufferMemoryBarrier, u32, ?*const anyopaque) callconv(call) void;
+pub const PfnCreateSwapchainKHR = *const fn (Device, *const SwapchainCreateInfoKHR, ?*const anyopaque, *Swapchain) callconv(call) Result;
+pub const PfnDestroySwapchainKHR = *const fn (Device, Swapchain, ?*const anyopaque) callconv(call) void;
+pub const PfnGetSwapchainImagesKHR = *const fn (Device, Swapchain, *u32, ?[*]Image) callconv(call) Result;
+pub const PfnAcquireNextImageKHR = *const fn (Device, Swapchain, u64, u64, Fence, *u32) callconv(call) Result;
+pub const PfnQueuePresentKHR = *const fn (Queue, *const PresentInfoKHR) callconv(call) Result;
 
 comptime {
     if (@sizeOf(usize) != 8) @compileError("the Vulkan backend currently requires a 64-bit target");

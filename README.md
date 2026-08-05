@@ -1,6 +1,6 @@
 # PS5 emulation components
 
-Building blocks for PlayStation 5 emulation, written in Zig. Nine modules cover
+Building blocks for PlayStation 5 emulation, written in Zig. Ten modules cover
 the independent subsystems and their end-to-end composition:
 
 | Module | What it does |
@@ -9,6 +9,7 @@ the independent subsystems and their end-to-end composition:
 | **`rdna2`** | Decodes and disassembles RDNA2 shader machine code |
 | **`gpu`** | Decodes and executes the stateful part of submitted GPU command streams |
 | **`vulkan`** | Owns the host Vulkan device, queues, command submission and renderer boundary |
+| **`window`** | Owns the native host window and its platform message loop |
 | **`loader`** | Reads, maps, and relocates bare ELF64 and decrypted PS5 SELF module images |
 | **`hle`** | High-level emulation of the guest firmware: symbol resolution and firmware libraries |
 | **`cpu`** | Dispatches guest execution and provides the Windows x86-64 native machine bridge |
@@ -20,7 +21,7 @@ cross-compiles to Windows, Linux, and macOS. Direct guest execution currently
 requires Windows x86-64; the other targets still build the inspection and HLE
 layers but report the native bridge as unsupported.
 
-Six command-line tools come with them:
+Seven command-line tools come with them:
 
 ```sh
 zig build run         -- shader.bin    # disassemble a shader
@@ -32,7 +33,14 @@ zig build graph-info  -- eboot.bin     # map and relocate the reachable PRX grap
 zig build game-run    -- eboot.bin     # load, initialize, and enter the title
 zig build game-run    -- --app0 full/game patched/eboot.bin # use full content with a patched executable
 zig build vulkan-smoke                 # run the headless compute/graphics probe
+zig build vulkan-window-smoke          # present a diagnostic frame through a Win32 swapchain
 ```
+
+On Windows, `game-run` now creates a Vulkan VideoOut window by default and
+attaches the live AGC command queues before entering guest code. Set
+`PS5_HEADLESS=1` to keep loader/CPU diagnostics windowless. A missing Vulkan
+loader, compatible presentation device, or host window is reported and the
+title continues through the previous headless path.
 
 `module-info` is where the pieces meet. It reads a module, works out every
 symbol the module imports, and checks each one against the firmware registry
@@ -433,8 +441,10 @@ SPIR-V, and tiles the result back into the same guest allocation. A supported
 inline 2D texture and sampler can feed fragment `image_sample` through binding
 1. `ACQUIRE_MEM`, `RELEASE_MEM`, `WAIT_REG_MEM`, `WRITE_DATA` and `EVENT_WRITE`
 preserve ordering through the current synchronous Vulkan queue and checked
-guest labels. `SetFlip` publishes the most recent completed guest frame through
-an API-neutral presentation sink.
+guest labels. `SetFlip` resolves its handle and buffer index through the HLE
+VideoOut registry, selects the completed render target with the matching guest
+address, and publishes that immutable frame through an API-neutral presentation
+sink.
 
 The remaining stages are:
 
@@ -444,17 +454,16 @@ The remaining stages are:
    DCC/CMASK/FMASK/HTILE render surfaces.
 3. Resolve sampled/storage images through AGC SRT provenance and add the formats,
    mip/layer views, explicit-LOD operands and image operations seen in captures.
-4. Install the Vulkan DCB backend in live AGC submission, associate registered
-   VideoOut buffers with flips, and attach a window/surface/swapchain consumer to
-   the presentation sink.
-5. Validate packet/state/shader results against captures before optimizing
+4. Validate packet/state/shader results against captures before optimizing
    asynchronous queues, image/descriptor caches and pipeline compilation.
 
-This means the emulator can now produce and hand off an ordered sequence of
-completed guest render-target frames in the hardware smoke path. It is the
-foundation of the game's video output, but not yet a live game window: the HLE
-AGC scheduler and VideoOut registration still need the integration described in
-stage 4 above.
+The live path is now connected end to end: AGC DCB submission executes against
+the Vulkan backend, VideoOut registration identifies the requested display
+allocation, and CPU, EOP and PM4 flips reach the Win32 swapchain. This is a real
+game-output window, but not yet a promise of a stable game video stream. A title
+will only present after its shaders, target formats, tiling and resource usage
+all fit the currently supported subsets; an unsupported draw is still rejected
+explicitly instead of displaying a fabricated frame.
 
 ---
 
@@ -525,10 +534,19 @@ The PM4 synchronization callbacks currently choose correctness over overlap:
 acquire, release, write-data and event operations wait for the queue to become
 idle before publishing guest-visible labels or data. The executor remains
 responsible for deciding whether `WAIT_REG_MEM` is satisfied and preserving its
-continuation. `SetFlip` waits for completion and sends an immutable view of the
-latest linear frame, its dimensions, guest address and flip metadata to an
-optional `PresentationSink`. This is deliberately independent of a particular
-window system; a swapchain consumer is the next live-runtime integration step.
+continuation. Completed linear frames are retained by guest render-target
+address. `SetFlip` waits for completion, resolves its registered VideoOut slot,
+and sends the matching frame, dimensions, address and flip metadata to an
+optional `PresentationSink`.
+
+When initialized with a native Win32 handle, the renderer enables
+`VK_KHR_surface`, `VK_KHR_win32_surface` and `VK_KHR_swapchain`, selects a queue
+that can present to that surface, and creates an RGBA8/BGRA8 FIFO swapchain. The
+current synchronous presentation path acquires an image, aspect-fits the guest
+RGBA8 frame with nearest-neighbour CPU scaling, uploads it through staging,
+performs transfer/present layout transitions and calls `vkQueuePresentKHR`.
+The window owns its Win32 message loop on a dedicated host thread so a flip from
+any guest pthread can use the serialized GPU submission boundary safely.
 
 `vulkan-smoke` is an explicit hardware test rather than part of `zig build test`,
 so machines without a Vulkan runtime can still build and test every module. The
@@ -569,6 +587,17 @@ graphics DCB probe passed: 1 diagnostic + 3 guest draws, pipelines 3/1 miss/hit
 guest RDNA2 frame passed: 1152 colored pixels in 64x64 RGBA8 target
 sampled image passed: 1 guest texture upload
 PM4 synchronization + SetFlip passed: 1 presented frame
+```
+
+The explicit window probe exercises the same swapchain sink used by live
+VideoOut and keeps a generated frame visible for two seconds:
+
+```sh
+zig build vulkan-window-smoke
+```
+
+```text
+Win32 Vulkan presentation passed: NVIDIA GeForce RTX 3070 Ti, 320x180 guest frame -> 960x540 swapchain
 ```
 
 ---
@@ -1046,8 +1075,12 @@ title's batch lifecycle and emits zeroed PCM so audio setup cannot deadlock the
 process. It is a compatibility decoder, not ATRAC9/MP3 decoding. The additional
 early-bootstrap
 surface in [src/hle/libs/bootstrap_services.zig](src/hle/libs/bootstrap_services.zig)
-provides headless VideoOut/AvPlayer state and conservative platform/GPU command
-stubs solely to reach native title initialization; it does not render frames.
+provides AvPlayer state and conservative platform/GPU command stubs for native
+title initialization. VideoOut is no longer only a headless counter: it retains
+up to sixteen registered display allocations and four attribute groups,
+validates register/change/unregister operations, routes CPU and EOP flips
+through the live DCB backend, and publishes completion status only after the
+presentation callback accepts the frame.
 
 **Sound output** ([src/hle/audio_device.zig](src/hle/audio_device.zig))
 
@@ -1240,6 +1273,15 @@ and observes one draw plus three dispatches in each. The early bootstrap draws
 do not bind a color or depth target, but their context, shader and user-config
 lists now reach the persistent tracker and the typed draw-state callback without
 an invalid packet or a stopped queue.
+
+The backported Terminator test with its complete directory supplied through
+`--app0` now creates the NVIDIA Vulkan VideoOut window, loads all six images and
+enters the shipped AGC driver. Its next live blocker precedes rendering: queue
+registration for queues 32–87 is still absent, so
+`submitCommandBufferAndGetResult` and `waitCommandBufferCompletion` return
+`0x80020002` before a displayable frame is submitted. That makes `/dev/gc`
+queue-registration/ioctl output recovery the next title-facing milestone,
+rather than more swapchain work.
 
 ## Error codes
 
@@ -1520,9 +1562,11 @@ module list is already in dependency-first initializer order. Optional graph
 diagnostics report every unresolved strong import in the node that stops
 linking; the `graph-info` tool enables them by default.
 
-`game-run` continues from that verified graph, initializes the native CPU
-bridge and enters the title while reporting contained guest faults with the
-active initializer, registers, stack words, and relocation context. Its
+`game-run` continues from that verified graph, creates the optional Win32 Vulkan
+presentation session, installs it behind the live AGC scheduler, initializes
+the native CPU bridge and enters the title while reporting contained guest
+faults with the active initializer, registers, stack words, and relocation
+context. Its
 `--app0 <directory>` option lets a sparse patched executable use the complete
 content tree from another directory. Position-dependent executables which
 access the PS5 null/low-address window still need address translation or

@@ -44,6 +44,14 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "gpu", .module = gpu }},
     });
 
+    // Native host-window ownership. Kept separate from Vulkan so the renderer
+    // continues to support headless diagnostics and non-Windows builds.
+    const window = b.addModule("window", .{
+        .root_source_file = b.path("src/window/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Guest module images: ELF64 parsing and the dynamic linking tables.
     const loader = b.addModule("loader", .{
         .root_source_file = b.path("src/loader/root.zig"),
@@ -203,6 +211,9 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "runtime", .module = runtime },
                 .{ .name = "loader", .module = loader },
+                .{ .name = "gpu", .module = gpu },
+                .{ .name = "vulkan", .module = vulkan },
+                .{ .name = "window", .module = window },
             },
         }),
     });
@@ -236,6 +247,28 @@ pub fn build(b: *std.Build) void {
     const vulkan_smoke_step = b.step("vulkan-smoke", "Run the headless Vulkan compute/staging probe");
     vulkan_smoke_step.dependOn(&vulkan_smoke_cmd.step);
 
+    // Opens a real Win32 surface, uploads a diagnostic frame to a swapchain
+    // image and presents it through the same sink used by live VideoOut flips.
+    const vulkan_window_smoke = b.addExecutable(.{
+        .name = "vulkan-window-smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/vulkan_window_smoke.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "vulkan", .module = vulkan },
+                .{ .name = "gpu", .module = gpu },
+                .{ .name = "window", .module = window },
+            },
+        }),
+    });
+    b.installArtifact(vulkan_window_smoke);
+
+    const vulkan_window_smoke_cmd = b.addRunArtifact(vulkan_window_smoke);
+    vulkan_window_smoke_cmd.step.dependOn(b.getInstallStep());
+    const vulkan_window_smoke_step = b.step("vulkan-window-smoke", "Present a diagnostic frame to a Win32 Vulkan window");
+    vulkan_window_smoke_step.dependOn(&vulkan_window_smoke_cmd.step);
+
     const test_step = b.step("test", "Run the test suite");
     const check_step = b.step("check", "Compile every module without running tests");
     check_step.dependOn(&vulkan_smoke.step);
@@ -244,6 +277,7 @@ pub fn build(b: *std.Build) void {
         mod,
         gpu,
         vulkan,
+        window,
         hle,
         cpu,
         loader,
@@ -255,6 +289,7 @@ pub fn build(b: *std.Build) void {
         graph_info.root_module,
         game_run.root_module,
         vulkan_smoke.root_module,
+        vulkan_window_smoke.root_module,
     }) |m| {
         const tests = b.addTest(.{ .root_module = m });
         check_step.dependOn(&tests.step);
