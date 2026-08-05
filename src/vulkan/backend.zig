@@ -1412,6 +1412,7 @@ pub const Renderer = struct {
                     state.readRegister(.shader, 0x213) orelse 0,
                 },
             );
+            std.debug.print("[vulkan dcb] Translation error: {s}\n", .{@errorName(err)});
             for (analysis.program.instructions.items) |inst| {
                 std.debug.print(
                     "  pc=0x{x:0>4} {s} dst={s}:{d} src=",
@@ -1577,6 +1578,11 @@ pub const Renderer = struct {
                 .buffer_load_dwordx2,
                 .buffer_load_dwordx3,
                 .buffer_load_dwordx4,
+                .s_buffer_load_dword,
+                .s_buffer_load_dwordx2,
+                .s_buffer_load_dwordx4,
+                .s_buffer_load_dwordx8,
+                .s_buffer_load_dwordx16,
                 => false,
                 .buffer_store_byte,
                 .buffer_store_short,
@@ -1597,8 +1603,9 @@ pub const Renderer = struct {
                 => true,
                 else => continue,
             };
-            if (inst.src1.kind != .sgpr) return Error.MissingStorageDescriptor;
-            const resource_sgpr = inst.src1.reg;
+            const resource_operand = if (inst.family == .smem) inst.src0 else inst.src1;
+            if (resource_operand.kind != .sgpr) return Error.MissingStorageDescriptor;
+            const resource_sgpr = resource_operand.reg;
             if (result.mappingForSgpr(resource_sgpr)) |descriptor_index| {
                 if (is_store) result.writable[descriptor_index] = true;
                 continue;
