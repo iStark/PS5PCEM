@@ -1511,7 +1511,7 @@ const Builder = struct {
         if (try self.lowerExecutionMask(inst)) return;
         if (self.specializedScalarDestination(inst)) return;
         switch (inst.opcode) {
-            .s_nop, .s_waitcnt, .s_barrier, .s_inst_prefetch, .s_sendmsg, .s_sleep, .s_ttrace_data, .v_nop, .s_endpgm => {},
+            .s_nop, .s_waitcnt, .s_barrier, .s_inst_prefetch, .s_sendmsg, .s_sleep, .s_ttrace_data, .v_nop, .s_endpgm, .s_wqm_b64 => {},
             // Branches are handled by structured CF or skipped in the linear fallback.
             .s_branch, .s_cbranch_scc0, .s_cbranch_scc1, .s_cbranch_vccz, .s_cbranch_vccnz, .s_cbranch_execz, .s_cbranch_execnz, .s_setpc_b64 => {},
             .s_mov_b32, .v_mov_b32 => try self.unary(inst, 83, .bits32), // OpCopyObject
@@ -1877,7 +1877,12 @@ pub fn translate(allocator: std.mem.Allocator, program: *const instruction.Progr
             try builder.initializeStageInputs();
             for (program.instructions.items) |inst| {
                 if (inst.opcode.isBranch()) continue;
-                try builder.lower(inst);
+                builder.lower(inst) catch |e| {
+                    if (e == Error.UnsupportedOpcode) {
+                        std.debug.print("[rdna2] translate failed on opcode {s}\n", .{@tagName(inst.opcode)});
+                    }
+                    return e;
+                };
             }
             try builder.emit(&builder.body, 253, &.{});
         };

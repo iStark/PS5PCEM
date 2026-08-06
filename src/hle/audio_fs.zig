@@ -741,7 +741,7 @@ fn buildFromClip(
     // (and first hits). Other paths get a tiny silent WAV so File.Exists/open
     // succeed without decoding hundreds of multi-MB FSB banks on the load
     // thread (that was delaying first present by many seconds).
-    const want_full = true; // Disabled bulk preload silent stub optimization for testing NullReferenceException
+    const want_full = pathLooksAttract(relative_path) or (!hashed and n < 24);
     if (!want_full) {
         const wav = try buildSilentWav(allocator, 256, 2, 48_000);
         if (n < 40 or n % 200 == 0) {
