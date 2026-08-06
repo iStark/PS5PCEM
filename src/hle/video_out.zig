@@ -355,17 +355,19 @@ pub fn completeFlip(flip: gpu.state.Flip) bool {
     has_last_flip_argument = true;
     // process_time / process_time_counter filled at GetFlipStatus time so they
     // stay current when the title polls after the equeue wakes.
-    // Release labels for the buffer that just left the screen. Zeroing *all*
-    // slots erased in-flight sequence numbers titles poll for multi-buffer
-    // encode; only the previous (and current) displayed indices are freed.
-    if (previous_buffer >= 0 and previous_buffer < maximum_buffers) {
-        buffer_labels[@intCast(previous_buffer)] = 0;
+    // Publish a rising generation on every registered buffer label. Titles
+    // that CPU-poll WaitUntilSafe-style labels after flip often wait for a
+    // non-zero / increasing value; zeroing slots parked encode after the
+    // first full DCB (only ACQUIRE_MEM ring kicks followed).
+    const gen = flip_status.count;
+    for (&buffer_labels, 0..) |*label, i| {
+        if (buffers[i].occupied or label.* != 0) label.* = gen;
     }
     if (flip.display_buffer_index >= 0 and flip.display_buffer_index < maximum_buffers) {
-        // Mark the newly displayed buffer as "GPU done with prior use" by
-        // writing a non-zero done token some WaitUntilSafe CPU polls expect.
-        const idx: usize = @intCast(flip.display_buffer_index);
-        if (buffer_labels[idx] == 0) buffer_labels[idx] = flip_status.count;
+        buffer_labels[@intCast(flip.display_buffer_index)] = gen;
+    }
+    if (previous_buffer >= 0 and previous_buffer < maximum_buffers) {
+        buffer_labels[@intCast(previous_buffer)] = gen;
     }
     previous_buffer = flip.display_buffer_index;
     // Arm host audio on the second completed flip. The first is often a clear
@@ -441,14 +443,11 @@ test "attribute groups and buffer slots cannot overlap" {
     try registerBuffers(2, 2, &b, .{}, 0);
 }
 
-test "VideoOut labels are contiguous and the previous flip is released" {
+test "VideoOut labels advance with flip generation" {
     reset();
     defer reset();
     try std.testing.expect(open(0));
     const address = labelAddress(primary_handle).?;
-    var one: [8]u8 = undefined;
-    std.mem.writeInt(u64, &one, 1, .little);
-    try std.testing.expect(writeLabelMemory(address + 3 * @sizeOf(u64), &one));
 
     var pixels: [8]u8 = @splat(0);
     const input = [_]Buffer{
@@ -462,14 +461,20 @@ test "VideoOut labels are contiguous and the previous flip is released" {
         .mode = 1,
         .argument = 0,
     }));
-    try std.testing.expect(writeLabelMemory(address + 3 * @sizeOf(u64), &one));
+    var label3: [8]u8 = undefined;
+    try std.testing.expect(readLabelMemory(address + 3 * @sizeOf(u64), &label3));
+    try std.testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, &label3, .little));
+
     try std.testing.expect(completeFlip(.{
         .video_out_handle = 1,
         .display_buffer_index = 4,
         .mode = 1,
         .argument = 0,
     }));
-    var released: [8]u8 = undefined;
-    try std.testing.expect(readLabelMemory(address + 3 * @sizeOf(u64), &released));
-    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, &released, .little));
+    try std.testing.expect(readLabelMemory(address + 3 * @sizeOf(u64), &label3));
+    // Previous buffer keeps the latest generation (not zeroed).
+    try std.testing.expectEqual(@as(u64, 2), std.mem.readInt(u64, &label3, .little));
+    var label4: [8]u8 = undefined;
+    try std.testing.expect(readLabelMemory(address + 4 * @sizeOf(u64), &label4));
+    try std.testing.expectEqual(@as(u64, 2), std.mem.readInt(u64, &label4, .little));
 }

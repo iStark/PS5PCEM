@@ -3246,12 +3246,26 @@ pub const Renderer = struct {
             }
         }
         // Candidate bases: T# base and first non-zero offset (mip/padding skip).
+        // Never stage from near the DCC/metadata pointer — that region is
+        // control data (observed: +0x80000 lands on metadata and produced
+        // sparse garbage "textures").
         var bases_buf: [2]u64 = .{ descriptor.address, 0 };
         var bases_n: usize = 1;
         if (first_hit_off) |off| {
             if (off != 0) {
-                bases_buf[bases_n] = descriptor.address + off;
-                bases_n += 1;
+                const cand = descriptor.address + off;
+                const meta = descriptor.metadata_address;
+                const near_meta = meta != 0 and
+                    cand + 0x10000 > meta and cand < meta + 0x10000;
+                if (!near_meta) {
+                    bases_buf[bases_n] = cand;
+                    bases_n += 1;
+                } else {
+                    std.debug.print(
+                        "[vulkan dcb] skip hit @+0x{x} (near metadata 0x{x})\n",
+                        .{ off, meta },
+                    );
+                }
             }
         }
         const bases = bases_buf[0..bases_n];
@@ -3312,9 +3326,20 @@ pub const Renderer = struct {
                 }
             }
         }
-        // Last resort: do NOT paint a debug gradient (that became the whole
-        // "first frame" the user saw). Use opaque white so untextured/vertex-
-        // colored geometry stays real, and reuse the last good sample if any.
+        // Scan nearby guest pages for a linear RGBA payload of this size that
+        // is not solid fill / metadata junk (CPU-uploaded Unity atlases often
+        // sit near the T# but not exactly at the declared base).
+        if (nonzero == 0 and descriptor.width != 0 and descriptor.height != 0) {
+            if (scanNearbyLinearRgba(memory, descriptor, linear)) |found| {
+                nonzero = found.nonzero;
+                std.debug.print(
+                    "[vulkan dcb] nearby linear scan recovered {d} nonzero @0x{x} (off={d})\n",
+                    .{ nonzero, found.address, @as(i64, @bitCast(found.address -% descriptor.address)) },
+                );
+            }
+        }
+        // Last resort: reuse last good sample, else dark neutral (not a rainbow
+        // gradient and not pure white — pure white hid whether geometry exists).
         if (nonzero == 0 and descriptor.width != 0 and descriptor.height != 0) {
             if (tryReuseLastSampledTexture(linear, descriptor.width, descriptor.height)) |reused| {
                 nonzero = reused;
@@ -3325,7 +3350,7 @@ pub const Renderer = struct {
             } else {
                 fillNeutralTextureRgba8(linear);
                 std.debug.print(
-                    "[vulkan dcb] sample empty @0x{x} {d}x{d} tile={s} meta=0x{x} — neutral white (no fake gradient)\n",
+                    "[vulkan dcb] sample empty @0x{x} {d}x{d} tile={s} meta=0x{x} — neutral gray\n",
                     .{
                         descriptor.address,
                         descriptor.width,
@@ -4086,13 +4111,110 @@ fn countNonzeroRgba(linear: []const u8) u32 {
 }
 
 fn fillNeutralTextureRgba8(linear: []u8) void {
+    // Dark gray — distinguishable from black clear and from white UI fill.
     var i: usize = 0;
     while (i + 3 < linear.len) : (i += 4) {
-        linear[i] = 255;
-        linear[i + 1] = 255;
-        linear[i + 2] = 255;
+        linear[i] = 32;
+        linear[i + 1] = 32;
+        linear[i + 2] = 40;
         linear[i + 3] = 255;
     }
+}
+
+const NearbyLinearHit = struct { address: u64, nonzero: u32 };
+
+fn rgbaLooksLikeImage(chunk: []const u8) bool {
+    if (chunk.len < 64) return false;
+    var nonzero: u32 = 0;
+    var unique: u32 = 0;
+    var seen: [16]u32 = @splat(0);
+    var seen_n: usize = 0;
+    var i: usize = 0;
+    while (i + 3 < chunk.len) : (i += 4) {
+        const r = chunk[i];
+        const g = chunk[i + 1];
+        const b = chunk[i + 2];
+        const a = chunk[i + 3];
+        // Reject common poison / control fills.
+        if (r == 0xcd and g == 0xcd and b == 0xcd) continue;
+        if (r == 0 and g == 0 and b == 0 and a == 0) continue;
+        nonzero += 1;
+        const key = (@as(u32, r) << 16) | (@as(u32, g) << 8) | b;
+        var known = false;
+        for (seen[0..seen_n]) |s| {
+            if (s == key) {
+                known = true;
+                break;
+            }
+        }
+        if (!known and seen_n < seen.len) {
+            seen[seen_n] = key;
+            seen_n += 1;
+            unique += 1;
+        }
+    }
+    // Need real variance: not a solid poison block.
+    return nonzero >= chunk.len / 16 and unique >= 3;
+}
+
+fn scanNearbyLinearRgba(
+    memory: anytype,
+    descriptor: gpu.resources.ImageDescriptor,
+    linear: []u8,
+) ?NearbyLinearHit {
+    const w = descriptor.width;
+    const h = descriptor.height;
+    if (w == 0 or h == 0) return null;
+    const row = @as(usize, w) * 4;
+    const need = row * @as(usize, h);
+    if (linear.len < need) return null;
+    const meta = descriptor.metadata_address;
+    // Search ±2 MiB around the T# base in 4 KiB steps; sample a 256-byte head.
+    const radius: i64 = 2 * 1024 * 1024;
+    const step: i64 = 4096;
+    var best: ?NearbyLinearHit = null;
+    var best_score: u32 = 0;
+    var delta: i64 = -radius;
+    while (delta <= radius) : (delta += step) {
+        const addr_i = @as(i64, @bitCast(descriptor.address)) + delta;
+        if (addr_i < 0x10000) continue;
+        const addr: u64 = @bitCast(addr_i);
+        if (meta != 0 and addr + need > meta and addr < meta + 0x20000) continue;
+        var head: [256]u8 = undefined;
+        if (!memory.read(memory.context, addr, &head)) continue;
+        if (!rgbaLooksLikeImage(&head)) continue;
+        @memset(linear, 0);
+        var y: u32 = 0;
+        var ok = true;
+        while (y < h) : (y += 1) {
+            const src = addr + @as(u64, y) * row;
+            const dst = @as(usize, y) * row;
+            if (!memory.read(memory.context, src, linear[dst..][0..row])) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) continue;
+        forceOpaqueAlpha(linear[0..need]);
+        const nz = countNonzeroRgba(linear[0..need]);
+        if (nz > best_score and nz > need / 32) {
+            best_score = nz;
+            best = .{ .address = addr, .nonzero = nz };
+            // Good enough — take first high-quality hit near base.
+            if (nz > need / 4 and @abs(delta) < 256 * 1024) break;
+        }
+    }
+    if (best) |hit| {
+        // Re-read the winner into linear (may have been overwritten by later tries).
+        var y: u32 = 0;
+        while (y < h) : (y += 1) {
+            const src = hit.address + @as(u64, y) * row;
+            const dst = @as(usize, y) * row;
+            _ = memory.read(memory.context, src, linear[dst..][0..row]);
+        }
+        forceOpaqueAlpha(linear[0..need]);
+    }
+    return best;
 }
 
 fn forceOpaqueAlpha(rgba: []u8) void {

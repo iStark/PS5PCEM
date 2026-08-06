@@ -453,6 +453,7 @@ fn drainPendingTails() void {
 
 // Lazy import for graphics event triggers from drain path.
 const event_queue_mod = @import("kernel_event_queue.zig");
+const video_out_mod = @import("../video_out.zig");
 
 /// Finds the command streams a submission descriptor names.
 ///
@@ -629,11 +630,36 @@ fn answerGraphicsQueueSubmit(request: Request, payload: u64) bool {
             std.debug.print("  words:", .{});
             for (stream) |word| std.debug.print(" {x:0>8}", .{word});
             std.debug.print("\n", .{});
+        } else if (stream.len >= 64) {
+            // One-line packet census for full frames (helps multi-draw diagnosis).
+            var draws: u32 = 0;
+            var dispatches: u32 = 0;
+            var flips: u32 = 0;
+            var releases: u32 = 0;
+            var walker = gpu.pm4.Walker.init(stream);
+            while (walker.next() catch null) |packet| {
+                if (packet.kind != .command) continue;
+                if (gpu.pm4.isDraw(packet.opcode)) draws += 1;
+                if (gpu.pm4.isDispatch(packet.opcode)) dispatches += 1;
+                if (packet.opcode == gpu.pm4.release_mem) releases += 1;
+                if (gpu.pm4.customCode(packet)) |code| {
+                    if (code == gpu.pm4.custom.flip) flips += 1;
+                    if (code == gpu.pm4.custom.release_mem) releases += 1;
+                }
+            }
+            std.debug.print(
+                "  census: draws={d} dispatches={d} flips={d} releases={d}\n",
+                .{ draws, dispatches, flips, releases },
+            );
         }
         // Execute the committed prefix *now* and wake graphics waiters so the
         // producer can finish encoding into the same ring.
         if (!agc_submit.submitDeviceStream(stream).accepted) return false;
         _ = event_queue_mod.triggerAllGraphicsEvents(submission.queue);
+        _ = event_queue_mod.triggerVideoOutVblank();
+        if (video_out_mod.lastFlipArgument()) |arg| {
+            _ = event_queue_mod.triggerVideoOutFlip(arg);
+        }
 
         var executed: usize = stream.len;
         // Post-execute catch-up: poll for newly committed dwords after the

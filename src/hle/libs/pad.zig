@@ -19,10 +19,12 @@ const error_device_not_connected: i32 = @bitCast(@as(u32, 0x8092_0007));
 const primary_handle: i32 = 1;
 /// SCE_PAD_BUTTON_CROSS — used for auto-confirm during headless bring-up.
 const button_cross: u32 = 0x4000;
-/// Press Cross for 200 ms every 2 s after the pad opens so title/splash loops
-/// that wait for confirm can advance without a physical controller.
-const auto_cross_period_us: u64 = 2_000_000;
-const auto_cross_hold_us: u64 = 200_000;
+/// SCE_PAD_BUTTON_OPTIONS — often used for pause/menu / "press start".
+const button_options: u32 = 0x0008;
+/// Press Cross (+ Options pulse) so splash/attract loops that wait for confirm
+/// can advance without a physical controller.
+const auto_cross_period_us: u64 = 1_000_000;
+const auto_cross_hold_us: u64 = 250_000;
 
 const PadData = extern struct {
     buttons: u32 = 0,
@@ -112,9 +114,13 @@ fn fillPadData(output: *PadData) void {
     output.timestamp = @intCast(@max(@as(i96, 0), @divTrunc(nanoseconds, std.time.ns_per_us)));
     // Auto-confirm pulse for bring-up (same idea as env-driven auto-cross).
     const now_us = kernel_runtime.processTimeMicroseconds();
-    if (now_us > 1_000_000) {
+    if (now_us > 500_000) {
         const phase = now_us % auto_cross_period_us;
-        if (phase < auto_cross_hold_us) output.buttons |= button_cross;
+        if (phase < auto_cross_hold_us) {
+            output.buttons |= button_cross;
+            // Brief Options with every other pulse (title/menu / "press start").
+            if ((now_us / auto_cross_period_us) % 2 == 0) output.buttons |= button_options;
+        }
     }
 }
 
