@@ -126,8 +126,15 @@ fn evaluate(reader: shaders.MemoryReader, bindings: *const shaders.StageBindings
             return result;
         };
 
-        const inst = rdna2.decodeInstruction(pc, words[0..1], 0) catch |err| switch (err) {
-            error.MissingLiteralConstant, error.TruncatedInstruction => retry: {
+        // Decode may need a second word; unknown major families are skipped so a
+        // later SMEM load of a V# still runs. Stopping the prolog at the first
+        // unrecognised packet was producing MissingStorageDescriptor on every
+        // resource the shader used after that point.
+        var decoded: ?rdna2.Instruction = null;
+        if (rdna2.decodeInstruction(pc, words[0..1], 0)) |inst| {
+            decoded = inst;
+        } else |err| switch (err) {
+            error.MissingLiteralConstant, error.TruncatedInstruction => {
                 words[1] = reader.readU32(addProgramAddress(bindings.program_address, pc + 4) orelse {
                     result.stop_reason = .invalid_address;
                     return result;
@@ -135,26 +142,36 @@ fn evaluate(reader: shaders.MemoryReader, bindings: *const shaders.StageBindings
                     result.stop_reason = .inaccessible_code;
                     return result;
                 };
-                break :retry rdna2.decodeInstruction(pc, &words, 0) catch {
-                    result.stop_reason = .unknown_family;
-                    return result;
-                };
-            },
-            error.UnknownInstructionFamily => {
-                result.stop_reason = .unknown_family;
-                return result;
+                if (rdna2.decodeInstruction(pc, &words, 0)) |inst| {
+                    decoded = inst;
+                } else |_| {
+                    pc +%= if (words[0] & 0xc000_0000 == 0xc000_0000) @as(u32, 8) else 4;
+                    result.instruction_count += 1;
+                    continue;
+                }
             },
             else => {
-                result.stop_reason = .unsupported_instruction;
-                return result;
+                // Unknown family, operand decode failures, etc. — skip rather
+                // than abort the whole prolog before SMEM V# loads.
+                pc +%= if (words[0] & 0xc000_0000 == 0xc000_0000) @as(u32, 8) else 4;
+                result.instruction_count += 1;
+                continue;
             },
+        }
+        const inst = decoded orelse {
+            // Defensive: decode produced neither an instruction nor a handled
+            // error. Advance one dword rather than spinning.
+            pc +%= 4;
+            result.instruction_count += 1;
+            continue;
         };
         result.instruction_count += 1;
 
         if (inst.opcode == .unsupported) {
+            // Skip unknown opcodes inside a known family; do not abort the prolog.
             invalidateDestination(&result, inst.dst, @max(inst.data_words, 1));
-            result.stop_reason = .unsupported_instruction;
-            return result;
+            pc +%= inst.word_count * 4;
+            continue;
         }
         if (inst.family == .smem) {
             if (!executeSmem(&result, reader, bindings, inst)) {

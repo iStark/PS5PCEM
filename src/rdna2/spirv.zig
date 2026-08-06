@@ -501,6 +501,80 @@ const Builder = struct {
         self.scc = result;
     }
 
+    fn andOr(self: *Builder, inst: instruction.Instruction) Error!void {
+        const a = try self.source(inst.src0, .bits32);
+        const b = try self.source(inst.src1, .bits32);
+        const c = try self.source(inst.src2, .bits32);
+        const masked = self.id();
+        try self.emit(&self.body, 199, &.{ self.bits_type, masked, a, b }); // OpBitwiseAnd
+        const result = self.id();
+        try self.emit(&self.body, 197, &.{ self.bits_type, result, masked, c }); // OpBitwiseOr
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
+    fn bitfieldExtract(self: *Builder, inst: instruction.Instruction, signed_field: bool) Error!void {
+        const value = try self.source(inst.src0, .bits32);
+        const offset_raw = try self.source(inst.src1, .bits32);
+        const width_raw = try self.source(inst.src2, .bits32);
+        const offset = try self.andBits(offset_raw, 31);
+        const width = try self.andBits(width_raw, 31);
+        const shifted = self.id();
+        try self.emit(&self.body, 194, &.{ self.bits_type, shifted, value, offset }); // OpShiftRightLogical
+        // mask = width == 0 ? 0xffffffff : (1 << width) - 1
+        const one = try self.constant(.bits32, 1);
+        const shifted_one = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, shifted_one, one, width }); // OpShiftLeftLogical
+        const mask_from_width = self.id();
+        try self.emit(&self.body, 130, &.{ self.bits_type, mask_from_width, shifted_one, one }); // OpISub
+        const full_mask = try self.constant(.bits32, 0xffff_ffff);
+        const width_is_zero = self.id();
+        try self.emit(&self.body, 170, &.{ // OpIEqual
+            self.bool_type,
+            width_is_zero,
+            width,
+            try self.constant(.bits32, 0),
+        });
+        const mask = self.id();
+        try self.emit(&self.body, 169, &.{ // OpSelect
+            self.bits_type,
+            mask,
+            width_is_zero,
+            full_mask,
+            mask_from_width,
+        });
+        const extracted = self.id();
+        try self.emit(&self.body, 199, &.{ self.bits_type, extracted, shifted, mask }); // OpBitwiseAnd
+        if (signed_field) {
+            // Sign-extend: (extracted << (32-width)) >>a (32-width); width 0 keeps value.
+            const shift_amount = self.id();
+            try self.emit(&self.body, 130, &.{ // OpISub
+                self.bits_type,
+                shift_amount,
+                try self.constant(.bits32, 32),
+                width,
+            });
+            const up = self.id();
+            try self.emit(&self.body, 196, &.{ self.bits_type, up, extracted, shift_amount }); // OpShiftLeftLogical
+            const signed_up = self.id();
+            try self.emit(&self.body, 114, &.{ self.signed_type, signed_up, up }); // OpBitcast
+            const down = self.id();
+            try self.emit(&self.body, 195, &.{ self.signed_type, down, signed_up, shift_amount }); // OpShiftRightArithmetic
+            const as_bits = self.id();
+            try self.emit(&self.body, 114, &.{ self.bits_type, as_bits, down }); // OpBitcast
+            const result = self.id();
+            try self.emit(&self.body, 169, &.{ // OpSelect
+                self.bits_type,
+                result,
+                width_is_zero,
+                extracted,
+                as_bits,
+            });
+            try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+            return;
+        }
+        try self.destination(inst.dst, .{ .id = extracted, .value_type = .bits32 });
+    }
+
     fn shiftLeftAdd(self: *Builder, inst: instruction.Instruction) Error!void {
         const value = try self.source(inst.src0, .bits32);
         const raw_shift = try self.source(inst.src1, .bits32);
@@ -511,6 +585,19 @@ const Builder = struct {
         try self.emit(&self.body, 196, &.{ self.bits_type, shifted, value, shift }); // OpShiftLeftLogical
         const result = self.id();
         try self.emit(&self.body, 128, &.{ self.bits_type, result, shifted, addend }); // OpIAdd
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
+    fn addShiftLeft(self: *Builder, inst: instruction.Instruction) Error!void {
+        const a = try self.source(inst.src0, .bits32);
+        const b = try self.source(inst.src1, .bits32);
+        const raw_shift = try self.source(inst.src2, .bits32);
+        const sum = self.id();
+        try self.emit(&self.body, 128, &.{ self.bits_type, sum, a, b }); // OpIAdd
+        const shift = self.id();
+        try self.emit(&self.body, 199, &.{ self.bits_type, shift, raw_shift, try self.constant(.bits32, 31) }); // OpBitwiseAnd
+        const result = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, result, sum, shift }); // OpShiftLeftLogical
         try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
     }
 
@@ -1092,6 +1179,14 @@ const Builder = struct {
             .v_cvt_f32_u32 => try self.integerToFloat(inst, false),
             .s_add_u32, .s_add_i32, .v_add_nc_u32 => try self.binary(inst, 128, .bits32, false), // OpIAdd
             .v_lshl_add_u32 => try self.shiftLeftAdd(inst),
+            // dst = (src0 + src1) << (src2 & 31)
+            .v_add_lshl_u32 => try self.addShiftLeft(inst),
+            // Bitfield extract: dst = (src0 >> (src1 & 31)) & mask(src2 & 31).
+            // Width 0 means a full 32-bit field on GCN/RDNA.
+            .v_bfe_u32 => try self.bitfieldExtract(inst, false),
+            .v_bfe_i32 => try self.bitfieldExtract(inst, true),
+            // dst = (src0 & src1) | src2 — packing helper used heavily by Unity.
+            .v_and_or_b32 => try self.andOr(inst),
             .s_sub_u32, .s_sub_i32, .v_sub_nc_u32 => try self.binary(inst, 130, .bits32, false), // OpISub
             .v_subrev_nc_u32 => try self.binary(inst, 130, .bits32, true),
             .v_add_f32 => try self.binary(inst, 129, .float32, false), // OpFAdd

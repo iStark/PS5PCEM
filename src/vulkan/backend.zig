@@ -1425,7 +1425,16 @@ pub const Renderer = struct {
                 },
             );
             std.debug.print("[vulkan dcb] Translation error: {s}\n", .{@errorName(err)});
+            // Cap the dump: full shaders are hundreds of lines and a soft-skip
+            // path that still prints them burns more host time than the dispatch.
+            var printed: usize = 0;
             for (analysis.program.instructions.items) |inst| {
+                if (printed >= 12) {
+                    std.debug.print("  ... ({d} more instructions)\n", .{
+                        analysis.program.instructions.items.len - printed,
+                    });
+                    break;
+                }
                 std.debug.print(
                     "  pc=0x{x:0>4} {s} dst={s}:{d} src=",
                     .{ inst.pc, inst.opcode.mnemonic(), @tagName(inst.dst.kind), inst.dst.reg },
@@ -1442,6 +1451,7 @@ pub const Renderer = struct {
                     " off={d} idx={d} offen={d} opid=0x{x}\n",
                     .{ inst.memory_offset, @intFromBool(inst.index_enable), @intFromBool(inst.offset_enable), inst.opcode_id },
                 );
+                printed += 1;
             }
             return err;
         };
@@ -1683,21 +1693,77 @@ pub const Renderer = struct {
                 else => continue,
             };
             const resource_operand = if (inst.family == .smem) inst.src0 else inst.src1;
-            if (resource_operand.kind != .sgpr) return Error.MissingStorageDescriptor;
+            if (resource_operand.kind != .sgpr) {
+                std.debug.print(
+                    "[vulkan dcb] MissingStorageDescriptor: pc=0x{x} {s} resource is {s} not sgpr\n",
+                    .{ inst.pc, @tagName(inst.opcode), @tagName(resource_operand.kind) },
+                );
+                return Error.MissingStorageDescriptor;
+            }
             const resource_sgpr = resource_operand.reg;
             if (result.mappingForSgpr(resource_sgpr)) |descriptor_index| {
                 if (is_store) result.writable[descriptor_index] = true;
                 continue;
             }
 
-            const descriptor = (try scalarBufferDescriptor(scalar, resource_sgpr)) orelse {
+            const descriptor = (try resolveComputeBufferDescriptor(
+                bindings,
+                reader,
+                scalar,
+                resource_sgpr,
+            )) orelse {
+                const full = gpu.scalar_provenance.evaluatePrefix(reader, bindings);
+                std.debug.print(
+                    "[vulkan dcb] MissingStorageDescriptor: pc=0x{x} {s} V# s{d}:s{d} unknown (scalar stop={s} @0x{x}, loads={d}, user_data={d})\n",
+                    .{
+                        inst.pc,
+                        @tagName(inst.opcode),
+                        resource_sgpr,
+                        resource_sgpr + 3,
+                        @tagName(full.stop_reason),
+                        full.stop_pc,
+                        full.load_count,
+                        bindings.user_data_count,
+                    },
+                );
                 return Error.MissingStorageDescriptor;
             };
-            if (descriptor.isNull() or descriptor.size_bytes == 0) return Error.MissingStorageDescriptor;
-            const size = std.math.cast(usize, descriptor.size_bytes) orelse return Error.GuestBufferTooLarge;
+            if (descriptor.isNull() or descriptor.size_bytes == 0) {
+                std.debug.print(
+                    "[vulkan dcb] MissingStorageDescriptor: pc=0x{x} {s} V# s{d} null/empty (addr=0x{x} size={d})\n",
+                    .{
+                        inst.pc,
+                        @tagName(inst.opcode),
+                        resource_sgpr,
+                        descriptor.address,
+                        descriptor.size_bytes,
+                    },
+                );
+                return Error.MissingStorageDescriptor;
+            }
+            const size = std.math.cast(usize, descriptor.size_bytes) orelse {
+                std.debug.print(
+                    "[vulkan dcb] GuestBufferTooLarge: V# s{d} size_bytes=0x{x}\n",
+                    .{ resource_sgpr, descriptor.size_bytes },
+                );
+                return Error.GuestBufferTooLarge;
+            };
             const descriptor_index = result.descriptorForRange(descriptor.address, size) orelse blk: {
                 const free = result.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
-                _ = try self.stageGuestStorageBufferAt(free, descriptor.address, size);
+                _ = self.stageGuestStorageBufferAt(free, descriptor.address, size) catch |err| {
+                    std.debug.print(
+                        "[vulkan dcb] stage V# s{d} failed: {s} addr=0x{x} size=0x{x} stride={d} records={d}\n",
+                        .{
+                            resource_sgpr,
+                            @errorName(err),
+                            descriptor.address,
+                            size,
+                            descriptor.stride,
+                            descriptor.record_count,
+                        },
+                    );
+                    return err;
+                };
                 result.occupied[free] = true;
                 result.addresses[free] = descriptor.address;
                 result.sizes[free] = size;
@@ -3296,8 +3362,17 @@ pub const Renderer = struct {
             .{ packet.body[0], packet.body[1], packet.body[2] },
         ) catch |err| {
             self.last_dispatch_error = err;
-            std.debug.print("[vulkan dcb] dispatch rejected: {s}\n", .{@errorName(err)});
-            return false;
+            // Soft-skip resource/translation gaps so one incomplete compute
+            // kernel does not abort the DCB before later draws and flips.
+            const soft = err == Error.MissingStorageDescriptor or
+                err == Error.GuestMemoryReadFailed or
+                err == Error.GuestBufferTooLarge or
+                std.mem.eql(u8, @errorName(err), "UnsupportedOpcode");
+            std.debug.print(
+                "[vulkan dcb] dispatch {s}: {s}\n",
+                .{ if (soft) "skipped" else "rejected", @errorName(err) },
+            );
+            return soft;
         };
         self.translated_dispatches += 1;
         self.last_dispatch_error = null;
@@ -3385,6 +3460,53 @@ fn scalarBufferDescriptor(
         word.* = value.value;
     }
     return try gpu.resources.decodeBufferDescriptor(&words);
+}
+
+/// Whether a decoded V# can be staged as guest storage.
+///
+/// USER_DATA often starts with an SRT pointer whose low dword is a small
+/// integer. Treating those four words as a V# produces addresses like `0x4`
+/// with a large synthetic size — which then fails as `GuestMemoryReadFailed`.
+/// Real resource V#s live in mapped direct/flexible memory well above the
+/// first pages of the guest address space.
+fn isPlausibleBufferDescriptor(descriptor: gpu.BufferDescriptor) bool {
+    if (descriptor.isNull()) return false;
+    if (descriptor.address < 0x1_0000) return false;
+    if (descriptor.size_bytes == 0) return false;
+    if (descriptor.size_bytes > maximum_staged_buffer_bytes) return false;
+    return true;
+}
+
+fn takePlausibleBufferDescriptor(descriptor: ?gpu.BufferDescriptor) ?gpu.BufferDescriptor {
+    const value = descriptor orelse return null;
+    return if (isPlausibleBufferDescriptor(value)) value else null;
+}
+
+/// Recovers a V# for a compute MUBUF/SMEM instruction.
+///
+/// Order of attempts:
+/// 1. Specialized scalar prefix (what the SPIR-V specialization path sees).
+/// 2. Full scalar prolog — recovers descriptors loaded after the specialized
+///    cut or through a longer SMEM chain.
+/// 3. V# already resident in the USER_DATA snapshot (direct-bind path). Last,
+///    because mis-decoding SRT pointer words as a V# is common and harmful.
+fn resolveComputeBufferDescriptor(
+    bindings: *const gpu.ShaderBindings,
+    reader: gpu.ShaderMemoryReader,
+    specialized: *const gpu.ScalarEvaluation,
+    resource_sgpr: u32,
+) anyerror!?gpu.BufferDescriptor {
+    if (takePlausibleBufferDescriptor(try scalarBufferDescriptor(specialized, resource_sgpr))) |descriptor| {
+        return descriptor;
+    }
+    const full = gpu.scalar_provenance.evaluatePrefix(reader, bindings);
+    if (takePlausibleBufferDescriptor(try scalarBufferDescriptor(&full, resource_sgpr))) |descriptor| {
+        return descriptor;
+    }
+    if (takePlausibleBufferDescriptor(try bindings.inlineBufferDescriptor(resource_sgpr))) |descriptor| {
+        return descriptor;
+    }
+    return null;
 }
 
 fn layerAvailable(enumerate: vk.PfnEnumerateInstanceLayerProperties, wanted: []const u8) bool {
