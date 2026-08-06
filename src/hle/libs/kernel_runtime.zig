@@ -427,6 +427,13 @@ fn syncOnAddressWait(
 }
 
 /// Releases workers parked by `syncOnAddressWait` on the same address.
+pub fn wakeSyncAddress(address: u64, maximum_waiters: usize) void {
+    announceSyncAddress("wake", address);
+    const generation = syncAddressGeneration(address, true);
+    threading.wakeWaiters(address, generation, maximum_waiters);
+}
+
+/// Releases workers parked by `syncOnAddressWait` on the same address.
 fn syncOnAddressWake(
     address: u64,
     requested_waiters: u64,
@@ -436,14 +443,12 @@ fn syncOnAddressWake(
     _: u64,
 ) callconv(abi.guest) i32 {
     if (address == 0) return KernelError.einval.raw();
-    announceSyncAddress("wake", address);
-    const generation = syncAddressGeneration(address, true);
     const maximum_waiters: usize = if (requested_waiters == 0 or
         requested_waiters >= std.math.maxInt(u32))
         std.math.maxInt(usize)
     else
         @intCast(requested_waiters);
-    threading.wakeWaiters(address, generation, maximum_waiters);
+    wakeSyncAddress(address, maximum_waiters);
     return 0;
 }
 

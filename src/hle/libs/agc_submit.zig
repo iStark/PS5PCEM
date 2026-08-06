@@ -34,6 +34,7 @@ const memory = @import("kernel_memory.zig");
 const shader_registry = @import("agc_shader_registry.zig");
 const event_queue = @import("kernel_event_queue.zig");
 const video_out = @import("../video_out.zig");
+const kernel_runtime = @import("kernel_runtime.zig");
 
 /// A submission descriptor: where the buffer is and how long it is.
 ///
@@ -408,7 +409,7 @@ fn backendRelease(_: ?*anyopaque, value: gpu.state.ReleaseMem) bool {
     }
     if ((value.destination != 0 and value.destination != 1) or value.address == 0) return true;
     var bytes: [8]u8 = undefined;
-    return switch (value.data_selection) {
+    const ok = switch (value.data_selection) {
         1 => blk: {
             std.mem.writeInt(u32, bytes[0..4], @truncate(value.data), .little);
             break :blk backendWrite(null, value.address, bytes[0..4]);
@@ -419,6 +420,10 @@ fn backendRelease(_: ?*anyopaque, value: gpu.state.ReleaseMem) bool {
         },
         else => true,
     };
+    if (ok) {
+        kernel_runtime.wakeSyncAddress(value.address, std.math.maxInt(usize));
+    }
+    return ok;
 }
 
 fn backendWait(_: ?*anyopaque, value: gpu.state.WaitRegMem, satisfied: bool) bool {
@@ -439,14 +444,29 @@ fn backendWriteData(_: ?*anyopaque, info: gpu.state.WriteData, values: []const u
         std.mem.writeInt(u32, &bytes, value, .little);
         const address = info.address + if (info.increment_address) @as(u64, index) * 4 else 0;
         if (!backendWrite(null, address, &bytes)) return false;
+        kernel_runtime.wakeSyncAddress(address, std.math.maxInt(usize));
     }
     return true;
 }
 
 fn backendEvent(_: ?*anyopaque, value: gpu.state.EventWrite) bool {
-    const backend = installed_backend orelse return true;
-    const callback = backend.vtable.event orelse return true;
-    return callback(backend.context, value);
+    var handled = false;
+    var ok = true;
+    if (installed_backend) |backend| {
+        if (backend.vtable.event) |callback| {
+            ok = callback(backend.context, value);
+            handled = true;
+        }
+    }
+    if (!handled) {
+        if (value.address) |addr| {
+            var bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &bytes, 1, .little);
+            _ = backendWrite(null, addr, &bytes);
+            kernel_runtime.wakeSyncAddress(addr, std.math.maxInt(usize));
+        }
+    }
+    return ok;
 }
 
 fn backendFlip(_: ?*anyopaque, value: gpu.state.Flip) bool {
@@ -698,18 +718,22 @@ fn forceSatisfyWait(wait: gpu.state.WaitRegMem) bool {
         // Without a reliable register map, leave register waits alone.
         return false;
     }
-    switch (wait.width) {
-        .bits_32 => {
+    const ok = switch (wait.width) {
+        .bits_32 => blk: {
             var bytes: [4]u8 = undefined;
             std.mem.writeInt(u32, &bytes, @truncate(wait.reference), .little);
-            return writeGuestMemory(null, wait.address, &bytes);
+            break :blk writeGuestMemory(null, wait.address, &bytes);
         },
-        .bits_64 => {
+        .bits_64 => blk: {
             var bytes: [8]u8 = undefined;
             std.mem.writeInt(u64, &bytes, wait.reference, .little);
-            return writeGuestMemory(null, wait.address, &bytes);
+            break :blk writeGuestMemory(null, wait.address, &bytes);
         },
+    };
+    if (ok) {
+        kernel_runtime.wakeSyncAddress(wait.address, std.math.maxInt(usize));
     }
+    return ok;
 }
 
 fn acceptSubmitted(label: []const u8, stream: []const u32) SubmitOutcome {

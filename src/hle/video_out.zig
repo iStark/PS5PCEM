@@ -360,14 +360,20 @@ pub fn completeFlip(flip: gpu.state.Flip) bool {
     // non-zero / increasing value; zeroing slots parked encode after the
     // first full DCB (only ACQUIRE_MEM ring kicks followed).
     const gen = flip_status.count;
+    const kernel_runtime = @import("libs/kernel_runtime.zig");
     for (&buffer_labels, 0..) |*label, i| {
-        if (buffers[i].occupied or label.* != 0) label.* = gen;
+        if (buffers[i].occupied or label.* != 0) {
+            label.* = gen;
+            kernel_runtime.wakeSyncAddress(@intFromPtr(label), std.math.maxInt(usize));
+        }
     }
     if (flip.display_buffer_index >= 0 and flip.display_buffer_index < maximum_buffers) {
         buffer_labels[@intCast(flip.display_buffer_index)] = gen;
+        kernel_runtime.wakeSyncAddress(@intFromPtr(&buffer_labels[@intCast(flip.display_buffer_index)]), std.math.maxInt(usize));
     }
     if (previous_buffer >= 0 and previous_buffer < maximum_buffers) {
         buffer_labels[@intCast(previous_buffer)] = gen;
+        kernel_runtime.wakeSyncAddress(@intFromPtr(&buffer_labels[@intCast(previous_buffer)]), std.math.maxInt(usize));
     }
     previous_buffer = flip.display_buffer_index;
     // Arm host audio on the second completed flip. The first is often a clear
