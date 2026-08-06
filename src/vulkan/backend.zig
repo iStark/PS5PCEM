@@ -3376,6 +3376,18 @@ pub const Renderer = struct {
         };
         self.translated_dispatches += 1;
         self.last_dispatch_error = null;
+        std.debug.print(
+            "[vulkan dcb] dispatch ok: groups={d}x{d}x{d} local={d}x{d}x{d} (#{d})\n",
+            .{
+                packet.body[0],
+                packet.body[1],
+                packet.body[2],
+                local_size[0],
+                local_size[1],
+                local_size[2],
+                self.translated_dispatches,
+            },
+        );
         return true;
     }
 };

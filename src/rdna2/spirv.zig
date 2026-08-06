@@ -512,6 +512,35 @@ const Builder = struct {
         try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
     }
 
+    /// dst = (src0 OP1 src1) OP2 src2 for common ternary packing ops.
+    fn ternaryBits(
+        self: *Builder,
+        inst: instruction.Instruction,
+        op1: u16,
+        op2: u16,
+    ) Error!void {
+        const a = try self.source(inst.src0, .bits32);
+        const b = try self.source(inst.src1, .bits32);
+        const c = try self.source(inst.src2, .bits32);
+        const mid = self.id();
+        try self.emit(&self.body, op1, &.{ self.bits_type, mid, a, b });
+        const result = self.id();
+        try self.emit(&self.body, op2, &.{ self.bits_type, result, mid, c });
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
+    fn shiftLeftOr(self: *Builder, inst: instruction.Instruction) Error!void {
+        const value = try self.source(inst.src0, .bits32);
+        const raw_shift = try self.source(inst.src1, .bits32);
+        const or_value = try self.source(inst.src2, .bits32);
+        const shift = try self.andBits(raw_shift, 31);
+        const shifted = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, shifted, value, shift }); // OpShiftLeftLogical
+        const result = self.id();
+        try self.emit(&self.body, 197, &.{ self.bits_type, result, shifted, or_value }); // OpBitwiseOr
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
     fn bitfieldExtract(self: *Builder, inst: instruction.Instruction, signed_field: bool) Error!void {
         const value = try self.source(inst.src0, .bits32);
         const offset_raw = try self.source(inst.src1, .bits32);
@@ -1185,8 +1214,13 @@ const Builder = struct {
             // Width 0 means a full 32-bit field on GCN/RDNA.
             .v_bfe_u32 => try self.bitfieldExtract(inst, false),
             .v_bfe_i32 => try self.bitfieldExtract(inst, true),
-            // dst = (src0 & src1) | src2 — packing helper used heavily by Unity.
+            // Ternary packing helpers used heavily by Unity compute kernels.
             .v_and_or_b32 => try self.andOr(inst),
+            .v_or3_b32 => try self.ternaryBits(inst, 197, 197), // (a|b)|c
+            .v_xor3_b32 => try self.ternaryBits(inst, 198, 198), // (a^b)^c
+            .v_xad_u32 => try self.ternaryBits(inst, 198, 128), // (a^b)+c
+            .v_add3_u32 => try self.ternaryBits(inst, 128, 128), // (a+b)+c
+            .v_lshl_or_b32 => try self.shiftLeftOr(inst),
             .s_sub_u32, .s_sub_i32, .v_sub_nc_u32 => try self.binary(inst, 130, .bits32, false), // OpISub
             .v_subrev_nc_u32 => try self.binary(inst, 130, .bits32, true),
             .v_add_f32 => try self.binary(inst, 129, .float32, false), // OpFAdd
