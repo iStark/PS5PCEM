@@ -341,19 +341,24 @@ fn audioOutOutput(handle: i32, data: ?*const anyopaque) callconv(abi.guest) i32 
             // A device that stopped working mid-run falls back to pacing rather
             // than failing the call, because losing sound is not a reason to
             // stop a title.
-            // When the title's mixer is still silent, blend in FSB-backed clips
-            // that were opened via Media/Resources/audio/**.wav virtual files.
+            // When the title's mixer is still silent after first present, blend
+            // in FSB-backed attract clips (not the full load-time library).
             var mixed_storage: [audio_device.maximum_buffer_bytes]u8 align(16) = undefined;
             var peak = bufferPeak(port, play_slice);
             if (peak < 8 and length <= mixed_storage.len) {
-                @memcpy(mixed_storage[0..length], play_slice);
-                const mixed = if (port.samples == .float32)
-                    audio_fs.mixIntoFloat32Buffer(mixed_storage[0..length], port.channels)
-                else
-                    audio_fs.mixIntoInt16Buffer(mixed_storage[0..length], port.channels);
-                if (mixed) {
-                    play_slice = mixed_storage[0..length];
-                    peak = bufferPeak(port, play_slice);
+                if (audio_fs.isMixLive()) {
+                    filesystem.ensureAudioMixAfterPresent();
+                }
+                if (audio_fs.isMixLive()) {
+                    @memcpy(mixed_storage[0..length], play_slice);
+                    const mixed = if (port.samples == .float32)
+                        audio_fs.mixIntoFloat32Buffer(mixed_storage[0..length], port.channels)
+                    else
+                        audio_fs.mixIntoInt16Buffer(mixed_storage[0..length], port.channels);
+                    if (mixed) {
+                        play_slice = mixed_storage[0..length];
+                        peak = bufferPeak(port, play_slice);
+                    }
                 }
             }
             if (device.play(play_slice)) |_| {

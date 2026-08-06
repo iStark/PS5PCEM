@@ -303,6 +303,22 @@ pub fn ensureAudioIndexed() void {
     audio_fs.ensureIndexed(directory, io);
 }
 
+/// After the first VideoOut present, load a short attract bed into the host mix.
+pub fn ensureAudioMixAfterPresent() void {
+    const io = active_io orelse return;
+    const directory = root orelse return;
+    audio_fs.noteFirstPresent();
+    audio_fs.maybePreseedAfterPresent(directory, io);
+}
+
+pub fn attachedRoot() ?std.Io.Dir {
+    return root;
+}
+
+pub fn attachedIo() ?std.Io {
+    return active_io;
+}
+
 /// How many descriptors are currently held.
 pub fn openCount() usize {
     table_lock.lock();

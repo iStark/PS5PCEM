@@ -361,6 +361,12 @@ pub fn completeFlip(flip: gpu.state.Flip) bool {
     // the first full DCB, no second draw).
     @memset(std.mem.asBytes(&buffer_labels), 0);
     previous_buffer = flip.display_buffer_index;
+    // Arm host audio on the second completed flip. The first is often a clear
+    // / swap before the first real draw; waiting one frame keeps SFX from
+    // leading the picture during load.
+    if (flip_status.count == 2) {
+        @import("audio_fs.zig").noteFirstPresent();
+    }
     return true;
 }
 

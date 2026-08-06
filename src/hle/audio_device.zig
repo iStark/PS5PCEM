@@ -65,10 +65,10 @@ pub const Config = struct {
 ///
 /// One is not enough: the device would run dry between the moment it finishes a
 /// buffer and the moment the title hands over the next, which is audible as a
-/// click every buffer. Three gives the title room to be late without stopping
-/// the sound, while keeping the delay between what it submits and what is heard
-/// down to a few buffers.
-const queue_depth = 3;
+/// click every buffer. Two keeps latency near one buffer (~5–10 ms at 256
+/// frames) while still covering late submits; three was adding ~15–30 ms of
+/// host-side delay on top of the title's own mix timing.
+const queue_depth = 2;
 
 /// The largest buffer that can be played, as channels x bytes x frames.
 ///

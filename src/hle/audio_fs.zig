@@ -58,12 +58,19 @@ var mix_write: usize = 0;
 var mix_read: usize = 0;
 var mix_count: usize = 0;
 
-// Loopback: keep a short stereo float loop of preseeded/opened game audio so
-// the host mix does not go silent after the first few seconds of drain.
-const loop_max_samples = 48000 * 2 * 4; // ~4 s stereo
+// Loopback: short stereo float loop of attract/game audio for silent mixer.
+// Kept short so refill does not pile multi-second latency behind the picture.
+const loop_max_samples = 48000 * 2 * 2; // ~2 s stereo
 var loop_buf: [loop_max_samples]f32 = [_]f32{0} ** loop_max_samples;
 var loop_len: usize = 0;
 var loop_pos: usize = 0;
+
+/// Host mix stays muted until the first VideoOut flip so SFX are not heard
+/// seconds before the first picture (load-time open of 800+ clips used to
+/// flood the ring and create a long A/V delay).
+var mix_live: std.atomic.Value(bool) = .init(false);
+var preseed_done: bool = false;
+var mix_queue_opens: std.atomic.Value(u32) = .init(0);
 
 fn mixLock() void {
     while (!mix_lock.tryLock()) std.atomic.spinLoopHint();
@@ -99,8 +106,8 @@ fn appendLoopSampleLocked(left: f32, right: f32) void {
 /// When the ring is nearly empty, refill from the captured game-audio loop.
 fn refillFromLoopLocked() void {
     if (loop_len < 2) return;
-    // Top up to ~0.5 s of stereo.
-    const target: usize = 48000;
+    // Keep only ~80 ms ahead of the speakers — less backlog = less delay.
+    const target: usize = 48000 / 6 * 2; // stereo samples for ~80 ms
     while (mix_count < target) {
         const left = loop_buf[loop_pos];
         const right = loop_buf[loop_pos + 1];
@@ -110,12 +117,50 @@ fn refillFromLoopLocked() void {
     }
 }
 
+/// Call from VideoOut flip completion so host SFX start with the picture.
+pub fn noteFirstPresent() void {
+    const was = mix_live.swap(true, .monotonic);
+    if (!was) {
+        std.debug.print("[audio_fs] host mix live (first present)\n", .{});
+    }
+}
+
+pub fn isMixLive() bool {
+    return mix_live.load(.monotonic);
+}
+
+fn pathLooksAttract(path: []const u8) bool {
+    var buf: [512]u8 = undefined;
+    if (path.len > buf.len) return false;
+    for (path, 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    const lower = buf[0..path.len];
+    return std.mem.indexOf(u8, lower, "attract") != null or
+        std.mem.indexOf(u8, lower, "trailer") != null or
+        std.mem.indexOf(u8, lower, "title") != null or
+        std.mem.indexOf(u8, lower, "menu") != null or
+        std.mem.indexOf(u8, lower, "music") != null or
+        std.mem.indexOf(u8, lower, "bgm") != null;
+}
+
+fn nameLooksAttract(name: []const u8) bool {
+    return pathLooksAttract(name);
+}
+
 /// Push mono/stereo PCM16 into the host mix ring (converted to stereo float).
-pub fn queuePcm16ForHostMix(pcm: []const u8, channels: u8, _: u32) void {
+/// Caps length so one long bed cannot bury later SFX under multi-second delay.
+pub fn queuePcm16ForHostMix(pcm: []const u8, channels: u8, rate: u32) void {
+    if (!mix_live.load(.monotonic)) return;
     if (pcm.len < 2 or channels == 0) return;
-    const frames = pcm.len / (@as(usize, channels) * 2);
+    const ch: usize = channels;
+    const frame_bytes = ch * 2;
+    const frames_total = pcm.len / frame_bytes;
+    // At most ~0.75 s per enqueue — enough for a one-shot, not a full music bed.
+    const max_frames: usize = if (rate >= 8000) (@as(usize, rate) * 3) / 4 else 36_000;
+    const frames = @min(frames_total, max_frames);
     mixLock();
     defer mixUnlock();
+    // Drop new material if the ring already holds >250 ms (keeps latency tight).
+    if (mix_count > 48000 / 2) return;
     var f: usize = 0;
     while (f < frames) : (f += 1) {
         var left: f32 = 0;
@@ -130,7 +175,6 @@ pub fn queuePcm16ForHostMix(pcm: []const u8, channels: u8, _: u32) void {
             left = @as(f32, @floatFromInt(s0)) / 32768.0;
             right = @as(f32, @floatFromInt(s1)) / 32768.0;
         }
-        // Soft attenuate to avoid clipping when many clips queue.
         left *= 0.55;
         right *= 0.55;
         pushStereoSampleLocked(left, right);
@@ -141,6 +185,7 @@ pub fn queuePcm16ForHostMix(pcm: []const u8, channels: u8, _: u32) void {
 /// Mix queued game samples into an AudioOut buffer (float32 interleaved).
 /// Returns true if any non-zero sample was written.
 pub fn mixIntoFloat32Buffer(out: []u8, channels: u8) bool {
+    if (!mix_live.load(.monotonic)) return false;
     if (out.len < 4 or channels == 0) return false;
     const frames = out.len / (@as(usize, channels) * 4);
     mixLock();
@@ -174,6 +219,7 @@ pub fn mixIntoFloat32Buffer(out: []u8, channels: u8) bool {
 
 /// Mix into signed-16 AudioOut buffers.
 pub fn mixIntoInt16Buffer(out: []u8, channels: u8) bool {
+    if (!mix_live.load(.monotonic)) return false;
     if (out.len < 2 or channels == 0) return false;
     const frames = out.len / (@as(usize, channels) * 2);
     mixLock();
@@ -376,45 +422,60 @@ pub fn ensureIndexed(root: std.Io.Dir, io: std.Io) void {
         .{named_from_assets},
     );
     // Always merge raw FSB banks so PCM16/name-table entries not reachable via
-    // the assets walk still map, and host mix can preseed real samples.
+    // the assets walk still map.
     indexRawFsb(root, io);
     if (clip_count == 0) {
         index_failed = true;
         return;
     }
-    preseedHostMix(root, io);
+    // Preseed is deferred until the first present (see noteFirstPresent +
+    // maybePreseedAfterPresent) so audio does not lead the picture by seconds.
 }
 
-/// Decode a few PCM16 banks into the host mix ring so silent AudioOut ports
-/// carry real game samples before the title finishes its own mixer setup.
-fn preseedHostMix(root: std.Io.Dir, io: std.Io) void {
+/// After the first flip, load a few attract/title PCM16 clips into the mix ring.
+pub fn maybePreseedAfterPresent(root: std.Io.Dir, io: std.Io) void {
+    if (preseed_done or !mix_live.load(.monotonic)) return;
+    if (!indexed or clip_count == 0) ensureIndexed(root, io);
+    if (clip_count == 0) return;
+    preseed_done = true;
+
     const resource = root.openFile(io, "Media/resources.resource", .{}) catch return;
     defer resource.close(io);
+
+    // Prefer clips whose names look like attract/title audio.
     var queued: u32 = 0;
-    var i: usize = 0;
-    while (i < clip_count and queued < 6) : (i += 1) {
-        const clip = clips[i];
-        const decoded = parseFsbPcm16(
-            resource,
-            io,
-            clip.resource_offset,
-            clip.resource_size,
-            std.heap.page_allocator,
-        ) catch continue;
-        defer std.heap.page_allocator.free(decoded.pcm);
-        // Cap each clip to ~2 s so the ring is not filled by one long music bed.
-        const max_bytes = @min(decoded.pcm.len, @as(usize, decoded.channels) * 2 * decoded.rate * 2);
-        queuePcm16ForHostMix(decoded.pcm[0..max_bytes], decoded.channels, decoded.rate);
-        queued += 1;
-        if (queued <= 3) {
-            std.debug.print(
-                "[audio_fs] preseed mix \"{s}\" {d} bytes ch={d} rate={d}\n",
-                .{ clip.name[0..clip.name_len], max_bytes, decoded.channels, decoded.rate },
+    var pass: u8 = 0;
+    while (pass < 2 and queued < 4) : (pass += 1) {
+        var i: usize = 0;
+        while (i < clip_count and queued < 4) : (i += 1) {
+            const clip = clips[i];
+            const nm = clip.name[0..clip.name_len];
+            if (pass == 0 and !nameLooksAttract(nm)) continue;
+            const decoded = parseFsbPcm16(
+                resource,
+                io,
+                clip.resource_offset,
+                clip.resource_size,
+                std.heap.page_allocator,
+            ) catch continue;
+            defer std.heap.page_allocator.free(decoded.pcm);
+            // ~0.6 s each so the ring stays near real-time.
+            const max_bytes = @min(
+                decoded.pcm.len,
+                @as(usize, decoded.channels) * 2 * @divTrunc(decoded.rate * 3, 5),
             );
+            queuePcm16ForHostMix(decoded.pcm[0..max_bytes], decoded.channels, decoded.rate);
+            queued += 1;
+            if (queued <= 3) {
+                std.debug.print(
+                    "[audio_fs] preseed mix \"{s}\" {d} bytes ch={d} rate={d}\n",
+                    .{ nm, max_bytes, decoded.channels, decoded.rate },
+                );
+            }
         }
     }
     if (queued > 0) {
-        std.debug.print("[audio_fs] host mix preseeded with {d} PCM16 clips\n", .{queued});
+        std.debug.print("[audio_fs] host mix preseeded with {d} clips after first present\n", .{queued});
     }
 }
 
@@ -687,8 +748,15 @@ fn buildFromClip(
     };
     defer allocator.free(decoded.pcm);
 
-    // Queue for host mix so AudioOut silence is filled with real game SFX.
-    queuePcm16ForHostMix(decoded.pcm, decoded.channels, decoded.rate);
+    // Only feed the host mix for named attract/title opens after first present.
+    // Opening the whole audio tree at load used to enqueue hundreds of clips and
+    // delay heard SFX by many seconds relative to the picture.
+    if (mix_live.load(.monotonic) and !hashed and pathLooksAttract(relative_path)) {
+        const nq = mix_queue_opens.fetchAdd(1, .monotonic);
+        if (nq < 12) {
+            queuePcm16ForHostMix(decoded.pcm, decoded.channels, decoded.rate);
+        }
+    }
 
     const wav = try buildWavFromPcm(decoded.pcm, decoded.channels, decoded.rate, allocator);
     const n = virtual_serves.fetchAdd(1, .monotonic);
@@ -731,4 +799,7 @@ pub fn reset() void {
     loop_len = 0;
     loop_pos = 0;
     mixUnlock();
+    mix_live.store(false, .monotonic);
+    preseed_done = false;
+    mix_queue_opens.store(0, .monotonic);
 }

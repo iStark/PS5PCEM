@@ -633,6 +633,7 @@ var av_player_token: u8 = 0;
 fn avPlayerInitEx(_: ?*const anyopaque, handle: ?*?*anyopaque) callconv(abi.guest) i32 {
     const output = handle orelse return invalid_argument;
     output.* = &av_player_token;
+    std.debug.print("[avplayer] InitEx (stub: no FMV decode; title uses GPU path for attract)\n", .{});
     return errno.ok;
 }
 
@@ -645,6 +646,8 @@ fn avPlayerAction(handle: ?*anyopaque, _: u64, _: u64) callconv(abi.guest) i32 {
 }
 
 fn avPlayerNoFrame(handle: ?*anyopaque, _: ?*anyopaque) callconv(abi.guest) u8 {
+    // 0 = no frame/audio ready. Real FMV would need container decode; this
+    // title's boot sequence is GPU-drawn attract, not AvPlayer sources.
     return if (validAvHandle(handle)) 0 else 0;
 }
 
