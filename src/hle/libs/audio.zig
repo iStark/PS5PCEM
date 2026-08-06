@@ -9,6 +9,7 @@
 //! produces deterministic silent PCM; it is deliberately not a codec decoder.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const abi = @import("../abi.zig");
 const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
@@ -116,8 +117,18 @@ fn claimDevice(handle: i32, port: LegacyPort) bool {
         .channels = port.channels,
         .format = port.samples,
         .frames = port.frames,
-    }) catch return false;
+    }) catch |err| {
+        std.debug.print(
+            "[audio] host device open failed handle={d} {d}Hz ch={d} fmt={s} frames={d}: {s}\n",
+            .{ handle, port.frequency, port.channels, @tagName(port.samples), port.frames, @errorName(err) },
+        );
+        return false;
+    };
     device_owner = handle;
+    std.debug.print(
+        "[audio] host device open ok handle={d} {d}Hz ch={d} fmt={s} frames={d}\n",
+        .{ handle, port.frequency, port.channels, @tagName(port.samples), port.frames },
+    );
     return true;
 }
 
@@ -216,6 +227,92 @@ fn audioOutSetMixLevelPadSpeaker(handle: i32, _: f32) callconv(abi.guest) i32 {
 /// device provides it by making room for the next buffer, and where there is no
 /// device it is a sleep, exactly as before. A title cannot tell which, and must
 /// not be able to.
+var audio_out_play_ok: std.atomic.Value(u64) = .init(0);
+var audio_out_play_silent: std.atomic.Value(u64) = .init(0);
+var audio_out_play_fail: std.atomic.Value(u64) = .init(0);
+var audio_test_tone_phase: f32 = 0;
+/// Set once from `PS5_AUDIO_TEST_TONE=1` — inject a quiet 440 Hz tone when the
+/// title submits silent buffers so host speakers can be verified.
+var audio_test_tone_enabled: ?bool = null;
+
+extern "kernel32" fn GetEnvironmentVariableA(
+    name: [*:0]const u8,
+    buffer: ?[*]u8,
+    size: u32,
+) callconv(.winapi) u32;
+
+fn audioTestToneEnabled() bool {
+    if (audio_test_tone_enabled) |value| return value;
+    var on = false;
+    if (comptime builtin.os.tag == .windows) {
+        var buf: [8]u8 = undefined;
+        const n = GetEnvironmentVariableA("PS5_AUDIO_TEST_TONE", &buf, buf.len);
+        if (n > 0 and n < buf.len) {
+            on = buf[0] != '0' and buf[0] != 'n' and buf[0] != 'N';
+        }
+    }
+    audio_test_tone_enabled = on;
+    if (on) std.debug.print("[audio] PS5_AUDIO_TEST_TONE: inject 440 Hz on silent buffers\n", .{});
+    return on;
+}
+
+fn readF32Le(bytes: *const [4]u8) f32 {
+    return @bitCast(std.mem.readInt(u32, bytes, .little));
+}
+
+fn writeF32Le(bytes: *[4]u8, value: f32) void {
+    std.mem.writeInt(u32, bytes, @bitCast(value), .little);
+}
+
+fn bufferPeak(port: LegacyPort, bytes: []const u8) u32 {
+    var peak: u32 = 0;
+    if (port.samples == .signed16) {
+        var offset: usize = 0;
+        while (offset + 2 <= bytes.len) : (offset += 2) {
+            const s = std.mem.readInt(i16, bytes[offset..][0..2], .little);
+            peak = @max(peak, @as(u32, @intCast(@abs(s))));
+        }
+    } else {
+        var offset: usize = 0;
+        while (offset + 4 <= bytes.len) : (offset += 4) {
+            const s = readF32Le(bytes[offset..][0..4]);
+            const a: f32 = if (s < 0) -s else s;
+            peak = @max(peak, @as(u32, @intFromFloat(@min(a * 32768.0, 65535.0))));
+        }
+    }
+    return peak;
+}
+
+/// Quiet 440 Hz tone used only when `PS5_AUDIO_TEST_TONE` is set and the title
+/// buffer is effectively silent.
+fn fillTestTone(port: LegacyPort, dest: []u8) void {
+    const frames = port.frames;
+    const ch = port.channels;
+    const two_pi = 2.0 * std.math.pi;
+    const step = two_pi * 440.0 / @as(f32, @floatFromInt(port.frequency));
+    var frame: u32 = 0;
+    var phase = audio_test_tone_phase;
+    while (frame < frames) : (frame += 1) {
+        const sample = @sin(phase) * 0.15;
+        phase += step;
+        if (phase > two_pi) phase -= two_pi;
+        var c: u8 = 0;
+        while (c < ch) : (c += 1) {
+            if (port.samples == .signed16) {
+                const i: i16 = @intFromFloat(sample * 8000.0);
+                const off = (@as(usize, frame) * ch + c) * 2;
+                if (off + 2 > dest.len) return;
+                std.mem.writeInt(i16, dest[off..][0..2], i, .little);
+            } else {
+                const off = (@as(usize, frame) * ch + c) * 4;
+                if (off + 4 > dest.len) return;
+                writeF32Le(dest[off..][0..4], sample);
+            }
+        }
+    }
+    audio_test_tone_phase = phase;
+}
+
 fn audioOutOutput(handle: i32, data: ?*const anyopaque) callconv(abi.guest) i32 {
     const port = legacyPort(handle, .output) orelse return audio_out_error_invalid_port;
     const samples = data orelse return audio_out_error_invalid_pointer;
@@ -224,12 +321,41 @@ fn audioOutOutput(handle: i32, data: ?*const anyopaque) callconv(abi.guest) i32 
         const length = port.frames * @as(u32, port.channels) * port.samples.bytes();
         if (kernel_memory.isGuestRangeAccessible(@intFromPtr(samples), length)) {
             const bytes: [*]const u8 = @ptrCast(samples);
+            var play_slice = bytes[0..length];
+            // Optional host-side tone when the title is still feeding silence
+            // (codec/assets not ready). Real non-zero content is never replaced.
+            var tone_storage: [audio_device.maximum_buffer_bytes]u8 align(16) = undefined;
+            if (audioTestToneEnabled() and length <= tone_storage.len) {
+                const peak = bufferPeak(port, play_slice);
+                if (peak < 8) {
+                    @memcpy(tone_storage[0..length], play_slice);
+                    fillTestTone(port, tone_storage[0..length]);
+                    play_slice = tone_storage[0..length];
+                }
+            }
             // A device that stopped working mid-run falls back to pacing rather
             // than failing the call, because losing sound is not a reason to
             // stop a title.
-            if (device.play(bytes[0..length])) |_| {
+            if (device.play(play_slice)) |_| {
+                const n = audio_out_play_ok.fetchAdd(1, .monotonic);
+                if (n < 3 or n % 1000 == 0) {
+                    std.debug.print(
+                        "[audio] play ok #{d} handle={d} bytes={d} peak~{d}\n",
+                        .{ n + 1, handle, length, bufferPeak(port, play_slice) },
+                    );
+                }
                 return errno.ok;
-            } else |_| {}
+            } else |err| {
+                const n = audio_out_play_fail.fetchAdd(1, .monotonic);
+                if (n < 5) {
+                    std.debug.print("[audio] play failed #{d}: {s}\n", .{ n + 1, @errorName(err) });
+                }
+            }
+        }
+    } else {
+        const n = audio_out_play_silent.fetchAdd(1, .monotonic);
+        if (n == 0) {
+            std.debug.print("[audio] output on silent port handle={d} (no host device)\n", .{handle});
         }
     }
 

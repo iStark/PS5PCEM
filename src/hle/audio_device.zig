@@ -76,7 +76,7 @@ const queue_depth = 3;
 /// points that have no allocator of their own, and a title picks its buffer size
 /// once at startup. A title asking for more than this keeps the silent path
 /// rather than being refused outright.
-const maximum_buffer_bytes = 8 * 4 * 4096;
+pub const maximum_buffer_bytes = 8 * 4 * 4096;
 
 // ---------------------------------------------------------------------------
 // Windows multimedia output.
