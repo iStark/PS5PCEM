@@ -272,15 +272,10 @@ fn vblankTickerMain() void {
             kernel_runtime.processTimeMicroseconds(),
             kernel_runtime.processTimeCounter(),
         );
+        // Only the real vblank edge. Re-firing flip/graphics every tick flooded
+        // WaitEqueue (~60 Hz spam) and kept the GPU worker busy without new
+        // ring content — frame 2 never got encoded past ACQUIRE_MEM kicks.
         _ = kernel_event_queue.triggerVideoOutVblank();
-        // Re-publish the last flip edge so WaitEqueue(flip) cannot park forever
-        // when the title stops submitting DCBs after a soft-recovered null path.
-        if (video_out.lastFlipArgument()) |argument| {
-            _ = kernel_event_queue.triggerVideoOutFlip(argument);
-        }
-        // Graphics IRQs too: drivers wait on filter=-14 with an id we may not
-        // mirror exactly after the first batch of /dev/gc submits.
-        _ = kernel_event_queue.triggerAllGraphicsEvents(0);
     }
 }
 

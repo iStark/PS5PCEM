@@ -619,8 +619,11 @@ const WindowsX64Machine = struct {
         // Prefer fixing the null base register and retrying the instruction so
         // every opcode (ALU, SSE, cmp, mov, …) sees a real stub object instead of
         // permanently taking a soft-null branch that stalls multi-frame bring-up.
+        // Pure address 0 (no field displacement) stays a contained guest fault
+        // for diagnostics and the native-bridge tests.
         if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
             record.NumberParameters >= 2 and
+            record.ExceptionInformation[1] > 0 and
             record.ExceptionInformation[1] < lost_base_window and
             tryRedirectNullBaseRegister(context, record.ExceptionInformation[1]))
         {
@@ -774,7 +777,7 @@ const WindowsX64Machine = struct {
     /// register at the synthetic stub object and leave RIP unchanged so Windows
     /// re-executes the faulting instruction against real memory.
     fn tryRedirectNullBaseRegister(context: *std.os.windows.CONTEXT, memory_address: u64) bool {
-        if (memory_address >= lost_base_window) return false;
+        if (memory_address == 0 or memory_address >= lost_base_window) return false;
         const code: [*]const u8 = @ptrFromInt(context.Rip);
         var offset: usize = 0;
         var rex: u8 = 0;
@@ -813,7 +816,7 @@ const WindowsX64Machine = struct {
     /// Emulates `cmp [null+disp], imm` as if the memory byte/dword was zero.
     /// Returns true when the instruction was stepped past with flags updated.
     fn tryEmulateNullObjectCompare(context: *std.os.windows.CONTEXT, memory_address: u64) bool {
-        if (memory_address >= lost_base_window) return false;
+        if (memory_address == 0 or memory_address >= lost_base_window) return false;
         // Do not require isGuestAddress: the VEH already established this thread
         // is in a guest call, and some titles map PRX outside the nominal
         // ranges during bring-up.
@@ -866,7 +869,7 @@ const WindowsX64Machine = struct {
     /// 64-bit pointer MOVs). Covers MOV/MOVZX/MOVSX plus ALU forms that only
     /// read memory (`add/sub/cmp/and/or/xor/test reg, [null+disp]`).
     fn tryEmulateNullMemoryLoad(context: *std.os.windows.CONTEXT, memory_address: u64) bool {
-        if (memory_address >= lost_base_window) return false;
+        if (memory_address == 0 or memory_address >= lost_base_window) return false;
         const code: [*]const u8 = @ptrFromInt(context.Rip);
         var offset: usize = 0;
         var rex: u8 = 0;
@@ -957,7 +960,7 @@ const WindowsX64Machine = struct {
 
     /// Discards integer stores into the first page and steps past the instruction.
     fn tryEmulateNullMemoryStore(context: *std.os.windows.CONTEXT, memory_address: u64) bool {
-        if (memory_address >= lost_base_window) return false;
+        if (memory_address == 0 or memory_address >= lost_base_window) return false;
         const code: [*]const u8 = @ptrFromInt(context.Rip);
         var offset: usize = 0;
         if (code[0] & 0xf0 == 0x40) offset = 1;

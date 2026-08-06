@@ -355,13 +355,11 @@ pub fn completeFlip(flip: gpu.state.Flip) bool {
     has_last_flip_argument = true;
     // process_time / process_time_counter filled at GetFlipStatus time so they
     // stay current when the title polls after the equeue wakes.
-    if (previous_buffer >= 0 and previous_buffer < maximum_buffers) {
-        buffer_labels[@intCast(previous_buffer)] = 0;
-    }
-    // Mark the newly displayed buffer busy until the next flip releases it.
-    if (flip.display_buffer_index >= 0 and flip.display_buffer_index < maximum_buffers) {
-        buffer_labels[@intCast(flip.display_buffer_index)] = 1;
-    }
+    // Bring-up: release every buffer label on flip completion. Holding the
+    // displayed slot busy parks titles that CPU-poll labels / WaitUntilSafe
+    // before encoding frame N+1 (observed: only ACQUIRE_MEM ring kicks after
+    // the first full DCB, no second draw).
+    @memset(std.mem.asBytes(&buffer_labels), 0);
     previous_buffer = flip.display_buffer_index;
     return true;
 }

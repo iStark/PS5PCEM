@@ -50,6 +50,7 @@
 //! plus `0x40000` and fatally rejects a relocated pool.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const abi = @import("../abi.zig");
 const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
@@ -473,14 +474,40 @@ fn answerGraphicsQueueSubmit(request: Request, payload: u64) bool {
         if (!memory.isGuestRangeAccessible(address, byte_count)) return false;
         const stream_pointer: [*]const u32 = @ptrFromInt(address);
         const reserved_stream = stream_pointer[0..word_count];
-        const stream = committedQueueStream(reserved_stream);
-        if (stream.len != reserved_stream.len and trace.announces("ioctl")) {
-            std.debug.print(
-                "[gc submit #50] committed {d}/{d} dwords before ring sentinel\n",
-                .{ stream.len, reserved_stream.len },
-            );
+        // Producer may kick #50 before the ring is fully filled (sentinel still
+        // near the head). Re-sample a few times so late-written packets are not
+        // permanently dropped as an 8-dword ACQUIRE_MEM-only prefix.
+        var stream = committedQueueStream(reserved_stream);
+        var grow_round: u8 = 0;
+        while (stream.len < reserved_stream.len and stream.len < 64 and grow_round < 8) : (grow_round += 1) {
+            std.Thread.yield() catch {};
+            // Brief host pause so the title thread can finish the producer write.
+            if (comptime builtin.os.tag == .windows) {
+                var interval: i64 = -5000; // 0.5 ms in 100-ns units
+                _ = std.os.windows.ntdll.NtDelayExecution(.FALSE, &interval);
+            }
+            const again = committedQueueStream(reserved_stream);
+            if (again.len <= stream.len) break;
+            stream = again;
         }
         if (stream.len == 0) continue;
+        std.debug.print(
+            "[gc submit #50] queue {d} IB {d}/{d}: exec {d}/{d} dwords @0x{x}{s}\n",
+            .{
+                submission.queue,
+                index,
+                descriptors.len,
+                stream.len,
+                word_count,
+                address,
+                if (grow_round != 0) " (grew)" else "",
+            },
+        );
+        if (stream.len <= 16) {
+            std.debug.print("  words:", .{});
+            for (stream) |word| std.debug.print(" {x:0>8}", .{word});
+            std.debug.print("\n", .{});
+        }
         if (!agc_submit.submitDeviceStream(stream).accepted) return false;
     }
 

@@ -611,44 +611,84 @@ fn executeSubmitted(label: []const u8, stream: []const u32) SubmitOutcome {
         .compute
     else
         .graphics;
-    const report = submission_scheduler.submit(kind, stream) catch |err| {
-        if (trace.isLive()) {
-            std.debug.print("[{s}] queue stopped: {s}\n", .{ label, @errorName(err) });
-        }
+    var report = submission_scheduler.submit(kind, stream) catch |err| {
+        std.debug.print("[{s}] queue stopped: {s}\n", .{ label, @errorName(err) });
         return .{};
     };
+
+    // Bring-up: if WAIT_REG_MEM parks the queue on a label that never updates
+    // (missing EOP writer / wrong aperture), publish the expected value and
+    // pump again so later ring kicks are not stuck behind a permanent head.
+    var force_rounds: u8 = 0;
+    while (submission_scheduler.isBlocked(kind) and force_rounds < 16) : (force_rounds += 1) {
+        const wait = submission_scheduler.state(kind).blocked_wait orelse break;
+        std.debug.print(
+            "[{s}] WAIT_REG_MEM soft-satisfy addr=0x{x} mask=0x{x} ref=0x{x} (round {d}, queued={d})\n",
+            .{
+                label,
+                wait.address,
+                wait.mask,
+                wait.reference,
+                force_rounds + 1,
+                submission_scheduler.pendingCount(kind),
+            },
+        );
+        if (!forceSatisfyWait(wait)) break;
+        report = submission_scheduler.pump() catch |err| {
+            std.debug.print("[{s}] pump after soft-satisfy failed: {s}\n", .{ label, @errorName(err) });
+            break;
+        };
+    }
+
     // A completion event can be attributed here only while this submission
     // drains synchronously. A later cross-queue resume needs per-submission
     // owner metadata before it can safely publish the matching event.
     const completed = !submission_scheduler.isBlocked(kind) and
         submission_scheduler.pendingCount(kind) == 0;
-    if (!trace.isLive()) return .{ .accepted = true, .completed = completed };
-
     if (submission_scheduler.isBlocked(kind)) {
-        const submitted_state = submission_scheduler.state(kind);
-        const wait = submitted_state.blocked_wait.?;
-        const continuation = submission_scheduler.continuation(kind).?;
-        const resume_word = continuation.frames[0].resume_word;
-        std.debug.print(
-            "[{s}] blocked at root word {d} (depth {d}): WAIT_REG_MEM 0x{x} mask=0x{x} ref=0x{x}; {d} queued\n",
-            .{
-                label,
-                resume_word,
-                continuation.frame_count,
-                wait.address,
-                wait.mask,
-                wait.reference,
-                submission_scheduler.pendingCount(kind),
-            },
-        );
+        if (submission_scheduler.state(kind).blocked_wait) |wait| {
+            std.debug.print(
+                "[{s}] still blocked after soft-satisfy: WAIT_REG_MEM 0x{x} ref=0x{x}; {d} queued\n",
+                .{ label, wait.address, wait.reference, submission_scheduler.pendingCount(kind) },
+            );
+        }
     }
-    if (report.completed_submissions > 1) {
+    if (trace.isLive() and report.completed_submissions > 1) {
         std.debug.print(
             "[gpu queues] completed {d} submissions after cross-queue progress\n",
             .{report.completed_submissions},
         );
     }
     return .{ .accepted = true, .completed = completed };
+}
+
+/// Writes the WAIT_REG_MEM reference into the watched location so a re-poll
+/// succeeds. Register-space waits update the scheduler's tracked registers.
+fn forceSatisfyWait(wait: gpu.state.WaitRegMem) bool {
+    if (!wait.memory_space) {
+        // Absolute config/context register index — write into both queues' state.
+        const absolute: u32 = @truncate(wait.address);
+        for ([_]gpu.QueueKind{ .graphics, .compute }) |kind| {
+            const st = submission_scheduler.state(kind);
+            // Best-effort: map common UCONFIG/CONTEXT ranges via writeRegister if possible.
+            _ = st;
+            _ = absolute;
+        }
+        // Without a reliable register map, leave register waits alone.
+        return false;
+    }
+    switch (wait.width) {
+        .bits_32 => {
+            var bytes: [4]u8 = undefined;
+            std.mem.writeInt(u32, &bytes, @truncate(wait.reference), .little);
+            return writeGuestMemory(null, wait.address, &bytes);
+        },
+        .bits_64 => {
+            var bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &bytes, wait.reference, .little);
+            return writeGuestMemory(null, wait.address, &bytes);
+        },
+    }
 }
 
 fn acceptSubmitted(label: []const u8, stream: []const u32) SubmitOutcome {
