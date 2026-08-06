@@ -720,6 +720,14 @@ pub fn resolveVirtualWav(
     return buildFromClip(clip, relative_path, root, io, allocator, false);
 }
 
+fn buildSilentWav(allocator: std.mem.Allocator, frames: u32, channels: u8, rate: u32) Error![]u8 {
+    const pcm_len = @as(usize, frames) * @as(usize, channels) * 2;
+    const pcm = allocator.alloc(u8, pcm_len) catch return Error.OutOfMemory;
+    defer allocator.free(pcm);
+    @memset(pcm, 0);
+    return buildWavFromPcm(pcm, channels, rate, allocator);
+}
+
 fn buildFromClip(
     clip: ClipEntry,
     relative_path: []const u8,
@@ -728,6 +736,23 @@ fn buildFromClip(
     allocator: std.mem.Allocator,
     hashed: bool,
 ) Error!VirtualWav {
+    const n = virtual_serves.fetchAdd(1, .monotonic);
+    // Bulk preload: after the first few opens, only fully decode attract/title
+    // (and first hits). Other paths get a tiny silent WAV so File.Exists/open
+    // succeed without decoding hundreds of multi-MB FSB banks on the load
+    // thread (that was delaying first present by many seconds).
+    const want_full = pathLooksAttract(relative_path) or (!hashed and n < 24);
+    if (!want_full) {
+        const wav = try buildSilentWav(allocator, 256, 2, 48_000);
+        if (n < 40 or n % 200 == 0) {
+            std.debug.print(
+                "[audio_fs] virtual wav #{d} \"{s}\" -> silent stub (fast open)\n",
+                .{ n + 1, relative_path },
+            );
+        }
+        return .{ .bytes = wav, .size = wav.len };
+    }
+
     const resource = root.openFile(io, "Media/resources.resource", .{}) catch return Error.IoFailed;
     defer resource.close(io);
 
@@ -749,8 +774,6 @@ fn buildFromClip(
     defer allocator.free(decoded.pcm);
 
     // Only feed the host mix for named attract/title opens after first present.
-    // Opening the whole audio tree at load used to enqueue hundreds of clips and
-    // delay heard SFX by many seconds relative to the picture.
     if (mix_live.load(.monotonic) and !hashed and pathLooksAttract(relative_path)) {
         const nq = mix_queue_opens.fetchAdd(1, .monotonic);
         if (nq < 12) {
@@ -759,7 +782,6 @@ fn buildFromClip(
     }
 
     const wav = try buildWavFromPcm(decoded.pcm, decoded.channels, decoded.rate, allocator);
-    const n = virtual_serves.fetchAdd(1, .monotonic);
     if (n < 16 or n % 100 == 0) {
         std.debug.print(
             "[audio_fs] virtual wav #{d} \"{s}\" -> {s}{s} @0x{x} ({d} bytes)\n",

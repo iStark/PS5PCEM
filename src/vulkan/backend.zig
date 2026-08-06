@@ -2576,6 +2576,9 @@ pub const Renderer = struct {
                     center_pixel[3],
                 },
             );
+            // Guest PS often leaves alpha at 0 for premultiplied/unused paths;
+            // force opaque so the host window and PPM dump show RGB content.
+            forceOpaqueAlpha(frame);
             // Dump the first non-black guest frame for offline inspection.
             if (self.frame_dumps == 0 and colored != 0) {
                 dumpFramePpm("out\\first-frame.ppm", width, height, frame);
@@ -3212,53 +3215,129 @@ pub const Renderer = struct {
                 if (linear.len > 3) linear[3] else 0,
             },
         );
-        // If detile produced nothing but raw memory has data, retry as tightly
-        // packed linear (tile_mode wrong or not yet applied by the title).
-        if (nonzero == 0 and raw_nonzero != 0 and descriptor.width != 0 and descriptor.height != 0) {
-            const pitch = if (descriptor.pitch != 0) descriptor.pitch else descriptor.width;
-            const row_bytes = @as(usize, pitch) * 4;
-            const copy_w = @as(usize, descriptor.width) * 4;
-            var y: u32 = 0;
-            while (y < descriptor.height) : (y += 1) {
-                const src = descriptor.address + @as(u64, y) * row_bytes;
-                const dst = @as(usize, y) * @as(usize, descriptor.width) * 4;
-                if (dst + copy_w > linear.len) break;
-                if (!memory.read(memory.context, src, linear[dst..][0..copy_w])) break;
-            }
-            const linear_nz = countNonzeroRgba(linear);
-            if (linear_nz != 0) {
-                nonzero = linear_nz;
-                std.debug.print(
-                    "[vulkan dcb] linear fallback staging recovered {d} nonzero texels (pitch={d})\n",
-                    .{ nonzero, pitch },
-                );
+        // Deep raw probe: 64-byte samples across a wider window (title may
+        // place the true surface a few tiles past the T# base, or leave the
+        // head cleared while the body is valid).
+        var first_hit_off: ?u64 = null;
+        if (raw_nonzero == 0 and descriptor.width != 0 and descriptor.height != 0) {
+            const deep_span: u64 = @max(probe_span, @as(u64, descriptor.width) * descriptor.height * 4 * 2);
+            const deep_cap: u64 = 8 * 1024 * 1024;
+            const span = @min(deep_span, deep_cap);
+            var step: u64 = 0;
+            const stride: u64 = 4096;
+            while (step < span) : (step += stride) {
+                var chunk: [64]u8 = @splat(0);
+                if (!memory.read(memory.context, descriptor.address + step, &chunk)) break;
+                var nz: u32 = 0;
+                for (chunk) |b| {
+                    if (b != 0) nz += 1;
+                }
+                if (nz != 0) {
+                    raw_nonzero += nz;
+                    raw_probe_hits += 1;
+                    if (first_hit_off == null) first_hit_off = step;
+                    if (raw_probe_hits <= 3) {
+                        std.debug.print(
+                            "[vulkan dcb] raw hit @+0x{x} nz={d} head={x:0>2}{x:0>2}{x:0>2}{x:0>2}\n",
+                            .{ step, nz, chunk[0], chunk[1], chunk[2], chunk[3] },
+                        );
+                    }
+                }
             }
         }
-        // Second retry: force standard_64kb detile when render_target path
-        // produced empty output but the allocation is non-zero (common when
-        // the title's tile mode enum does not match the surface family).
-        if (nonzero == 0 and raw_nonzero != 0 and descriptor.tile_mode == .render_target) {
-            var alt = descriptor;
-            alt.tile_mode = .standard_64kb;
-            if (gpu.SurfaceLayout.fromImage(alt)) |alt_layout| {
-                if (alt_layout.staging_bytes == layout.staging_bytes) {
-                    alt_layout.stage(reader, descriptor.address, linear) catch {};
+        // Candidate bases: T# base and first non-zero offset (mip/padding skip).
+        var bases_buf: [2]u64 = .{ descriptor.address, 0 };
+        var bases_n: usize = 1;
+        if (first_hit_off) |off| {
+            if (off != 0) {
+                bases_buf[bases_n] = descriptor.address + off;
+                bases_n += 1;
+            }
+        }
+        const bases = bases_buf[0..bases_n];
+
+        // Linear fallback: try several pitches (explicit, width, 256/512 align).
+        if (nonzero == 0 and raw_nonzero != 0 and descriptor.width != 0 and descriptor.height != 0) {
+            const base_pitch = if (descriptor.pitch != 0) descriptor.pitch else descriptor.width;
+            const pitches = [_]u32{
+                base_pitch,
+                descriptor.width,
+                (descriptor.width + 63) & ~@as(u32, 63),
+                (descriptor.width + 255) & ~@as(u32, 255),
+            };
+            outer_linear: for (bases) |base| {
+                for (pitches) |pitch| {
+                    if (pitch == 0) continue;
+                    const row_bytes = @as(usize, pitch) * 4;
+                    const copy_w = @as(usize, descriptor.width) * 4;
+                    @memset(linear, 0);
+                    var y: u32 = 0;
+                    while (y < descriptor.height) : (y += 1) {
+                        const src = base + @as(u64, y) * row_bytes;
+                        const dst = @as(usize, y) * @as(usize, descriptor.width) * 4;
+                        if (dst + copy_w > linear.len) break;
+                        if (!memory.read(memory.context, src, linear[dst..][0..copy_w])) break;
+                    }
+                    const linear_nz = countNonzeroRgba(linear);
+                    if (linear_nz != 0) {
+                        nonzero = linear_nz;
+                        std.debug.print(
+                            "[vulkan dcb] linear fallback recovered {d} nonzero @0x{x} pitch={d}\n",
+                            .{ nonzero, base, pitch },
+                        );
+                        break :outer_linear;
+                    }
+                }
+            }
+        }
+        // Detile with alternate tile modes / bases when the declared path is empty.
+        if (nonzero == 0 and raw_nonzero != 0) {
+            const modes = [_]gpu.resources.TileMode{ .standard_64kb, .standard_4kb, .standard_256b, .linear, .render_target };
+            outer_tile: for (bases) |base| {
+                for (modes) |mode| {
+                    var alt = descriptor;
+                    alt.tile_mode = mode;
+                    const alt_layout = gpu.SurfaceLayout.fromImage(alt) catch continue;
+                    if (alt_layout.staging_bytes != layout.staging_bytes) continue;
+                    alt_layout.stage(reader, base, linear) catch continue;
                     const alt_nz = countNonzeroRgba(linear);
                     if (alt_nz != 0) {
                         nonzero = alt_nz;
                         std.debug.print(
-                            "[vulkan dcb] standard_64kb detile recovered {d} nonzero texels\n",
-                            .{nonzero},
+                            "[vulkan dcb] {s} detile recovered {d} nonzero @0x{x}\n",
+                            .{ @tagName(mode), nonzero, base },
                         );
+                        break :outer_tile;
                     }
                 }
-            } else |_| {}
+            }
         }
-        // Last resort: guest truly empty (not yet uploaded) — paint a gradient
-        // so the PS path stays visible during bring-up.
+        // Last resort: do NOT paint a debug gradient (that became the whole
+        // "first frame" the user saw). Use opaque white so untextured/vertex-
+        // colored geometry stays real, and reuse the last good sample if any.
         if (nonzero == 0 and descriptor.width != 0 and descriptor.height != 0) {
-            fillDebugTextureRgba8(linear, descriptor.width, descriptor.height);
-            std.debug.print("[vulkan dcb] sample was empty — filled debug gradient\n", .{});
+            if (tryReuseLastSampledTexture(linear, descriptor.width, descriptor.height)) |reused| {
+                nonzero = reused;
+                std.debug.print(
+                    "[vulkan dcb] sample empty — reused last good texture ({d} nonzero)\n",
+                    .{nonzero},
+                );
+            } else {
+                fillNeutralTextureRgba8(linear);
+                std.debug.print(
+                    "[vulkan dcb] sample empty @0x{x} {d}x{d} tile={s} meta=0x{x} — neutral white (no fake gradient)\n",
+                    .{
+                        descriptor.address,
+                        descriptor.width,
+                        descriptor.height,
+                        @tagName(descriptor.tile_mode),
+                        descriptor.metadata_address,
+                    },
+                );
+            }
+        } else if (nonzero != 0) {
+            forceOpaqueAlpha(linear);
+            rememberLastSampledTexture(linear, descriptor.width, descriptor.height);
         }
         const upload = try self.createBuffer(
             byte_count,
@@ -3643,6 +3722,28 @@ pub const Renderer = struct {
         const memory = self.guest_memory orelse return false;
         if (!memory.read(memory.context, buffer.address, self.guest_frame_scratch.items)) return false;
 
+        // Prefer last GPU writeback when the display slot is still cleared /
+        // not yet filled by the title (common while multi-draw is stuck after
+        // the first completed frame).
+        const guest_nz = countNonzeroRgba(self.guest_frame_scratch.items);
+        if (guest_nz == 0) {
+            if (self.latest_frame_index) |idx| {
+                if (idx < self.completed_frames.items.len) {
+                    const cached = &self.completed_frames.items[idx];
+                    if (cached.pixels.items.len != 0 and countNonzeroRgba(cached.pixels.items) != 0) {
+                        return sink.present(sink.context, .{
+                            .pixels = cached.pixels.items,
+                            .width = cached.width,
+                            .height = cached.height,
+                            .row_pitch_bytes = cached.width * 4,
+                            .guest_address = cached.guest_address,
+                            .flip = flip,
+                        });
+                    }
+                }
+            }
+        }
+
         return sink.present(sink.context, .{
             .pixels = self.guest_frame_scratch.items,
             .width = buffer.width,
@@ -3984,20 +4085,51 @@ fn countNonzeroRgba(linear: []const u8) u32 {
     return nonzero;
 }
 
-fn fillDebugTextureRgba8(linear: []u8, width: u32, height: u32) void {
-    var y: u32 = 0;
-    while (y < height) : (y += 1) {
-        var x: u32 = 0;
-        while (x < width) : (x += 1) {
-            const i = (@as(usize, y) * @as(usize, width) + x) * 4;
-            if (i + 3 >= linear.len) return;
-            // Horizontal red ramp, vertical green ramp, blue checker.
-            linear[i] = @truncate((x * 255) / @max(width - 1, 1));
-            linear[i + 1] = @truncate((y * 255) / @max(height - 1, 1));
-            linear[i + 2] = if (((x / 16) + (y / 16)) & 1 != 0) 200 else 40;
-            linear[i + 3] = 255;
-        }
+fn fillNeutralTextureRgba8(linear: []u8) void {
+    var i: usize = 0;
+    while (i + 3 < linear.len) : (i += 4) {
+        linear[i] = 255;
+        linear[i + 1] = 255;
+        linear[i + 2] = 255;
+        linear[i + 3] = 255;
     }
+}
+
+fn forceOpaqueAlpha(rgba: []u8) void {
+    var i: usize = 0;
+    while (i + 3 < rgba.len) : (i += 4) {
+        rgba[i + 3] = 255;
+    }
+}
+
+// Last successfully staged guest texture (RGBA8). When the next draw's T# is
+// still empty (upload race / wrong tile) reuse this instead of inventing art.
+var last_sample_w: u32 = 0;
+var last_sample_h: u32 = 0;
+var last_sample_rgba: []u8 = &.{};
+var last_sample_owned: bool = false;
+
+fn rememberLastSampledTexture(linear: []const u8, width: u32, height: u32) void {
+    if (width == 0 or height == 0 or linear.len < 4) return;
+    const need = linear.len;
+    if (!last_sample_owned or last_sample_rgba.len < need) {
+        if (last_sample_owned and last_sample_rgba.len != 0) {
+            std.heap.page_allocator.free(last_sample_rgba);
+        }
+        last_sample_rgba = std.heap.page_allocator.alloc(u8, need) catch return;
+        last_sample_owned = true;
+    }
+    @memcpy(last_sample_rgba[0..need], linear[0..need]);
+    last_sample_w = width;
+    last_sample_h = height;
+}
+
+fn tryReuseLastSampledTexture(linear: []u8, width: u32, height: u32) ?u32 {
+    if (!last_sample_owned or last_sample_w == 0 or last_sample_h == 0) return null;
+    if (last_sample_w != width or last_sample_h != height) return null;
+    if (last_sample_rgba.len < linear.len) return null;
+    @memcpy(linear, last_sample_rgba[0..linear.len]);
+    return countNonzeroRgba(linear);
 }
 
 /// Ensure s16..s19 (typical Unity PS colour scale from s_buffer_load_dwordx4)
