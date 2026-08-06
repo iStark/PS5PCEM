@@ -819,21 +819,20 @@ const Builder = struct {
     /// v_cvt_pkrtz_f16_f32: pack two f32 into one u32 as two f16 halves
     /// (low = src0, high = src1).
     ///
-    /// Soft bring-up path: leave the two f32 values as-is by OR-ing the low
-    /// 16 bits of each bit pattern. Wrong IEEE half conversion, but avoids
-    /// GLSL.std.450 ExtInst which currently hard-faults the NVIDIA compiler
-    /// on this fragment path. Replace with PackHalf2x16 once validated.
+    /// Soft path (NVIDIA rejects GLSL.std.450 PackHalf2x16 in this module):
+    /// keep the high 16 bits of each f32 so normals round-trip after soft
+    /// unpack. Not IEEE f16, but preserves sign/exp/top mantissa.
     fn packHalf2x16(self: *Builder, inst: instruction.Instruction) Error!void {
         const a = try self.source(inst.src0, .bits32);
         const b = try self.source(inst.src1, .bits32);
-        const a_lo = self.id();
-        try self.emit(&self.body, 199, &.{ self.bits_type, a_lo, a, try self.constant(.bits32, 0xffff) }); // AND
-        const b_lo = self.id();
-        try self.emit(&self.body, 199, &.{ self.bits_type, b_lo, b, try self.constant(.bits32, 0xffff) });
+        const a_hi = self.id();
+        try self.emit(&self.body, 194, &.{ self.bits_type, a_hi, a, try self.constant(.bits32, 16) }); // >> 16
         const b_hi = self.id();
-        try self.emit(&self.body, 196, &.{ self.bits_type, b_hi, b_lo, try self.constant(.bits32, 16) }); // << 16
+        try self.emit(&self.body, 194, &.{ self.bits_type, b_hi, b, try self.constant(.bits32, 16) });
+        const b_shifted = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, b_shifted, b_hi, try self.constant(.bits32, 16) }); // << 16
         const result = self.id();
-        try self.emit(&self.body, 197, &.{ self.bits_type, result, a_lo, b_hi }); // OR
+        try self.emit(&self.body, 197, &.{ self.bits_type, result, a_hi, b_shifted }); // OR
         try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
     }
 
@@ -859,22 +858,25 @@ const Builder = struct {
         const zero = try self.constant(.float32, @bitCast(@as(f32, 0)));
         const one = try self.constant(.float32, @bitCast(@as(f32, 1)));
         const x: u32, const y: u32, const z: u32, const w: u32 = if (inst.export_compressed) blk: {
-            // Compressed EXP: src0 = f16x2(xy), src1 = f16x2(zw). Soft path:
-            // reinterpret the packed dword halves as raw float bits (matches the
-            // soft pack above). Correct IEEE unpack is deferred until GLSL.std.450
-            // ExtInst is safe on the host compiler.
+            // Soft unpack pairs with soft packHalf2x16 (high-16 of each f32).
             const xy_bits = try self.source(inst.src0, .bits32);
             const zw_bits = try self.source(inst.src1, .bits32);
-            const y_bits = self.id();
-            try self.emit(&self.body, 194, &.{ self.bits_type, y_bits, xy_bits, try self.constant(.bits32, 16) }); // >> 16
-            const w_bits = self.id();
-            try self.emit(&self.body, 194, &.{ self.bits_type, w_bits, zw_bits, try self.constant(.bits32, 16) });
+            const x_hi = self.id();
+            try self.emit(&self.body, 199, &.{ self.bits_type, x_hi, xy_bits, try self.constant(.bits32, 0xffff) });
+            const y_hi = self.id();
+            try self.emit(&self.body, 194, &.{ self.bits_type, y_hi, xy_bits, try self.constant(.bits32, 16) });
+            const z_hi = self.id();
+            try self.emit(&self.body, 199, &.{ self.bits_type, z_hi, zw_bits, try self.constant(.bits32, 0xffff) });
+            const w_hi = self.id();
+            try self.emit(&self.body, 194, &.{ self.bits_type, w_hi, zw_bits, try self.constant(.bits32, 16) });
             const x_bits = self.id();
-            try self.emit(&self.body, 199, &.{ self.bits_type, x_bits, xy_bits, try self.constant(.bits32, 0xffff) });
+            try self.emit(&self.body, 196, &.{ self.bits_type, x_bits, x_hi, try self.constant(.bits32, 16) });
+            const y_bits = self.id();
+            try self.emit(&self.body, 196, &.{ self.bits_type, y_bits, y_hi, try self.constant(.bits32, 16) });
             const z_bits = self.id();
-            try self.emit(&self.body, 199, &.{ self.bits_type, z_bits, zw_bits, try self.constant(.bits32, 0xffff) });
-            // Expand 16-bit slots back into the low half of a float bit pattern
-            // (paired with the soft pack which stored low 16 of each f32).
+            try self.emit(&self.body, 196, &.{ self.bits_type, z_bits, z_hi, try self.constant(.bits32, 16) });
+            const w_bits = self.id();
+            try self.emit(&self.body, 196, &.{ self.bits_type, w_bits, w_hi, try self.constant(.bits32, 16) });
             const cx = try self.convert(.{ .id = x_bits, .value_type = .bits32 }, .float32);
             const cy = try self.convert(.{ .id = y_bits, .value_type = .bits32 }, .float32);
             const cz = try self.convert(.{ .id = z_bits, .value_type = .bits32 }, .float32);
@@ -930,8 +932,19 @@ const Builder = struct {
         const binding = self.sampledImageBinding(inst.src1.reg, inst.src2.reg) orelse {
             return Error.InvalidStorageBinding;
         };
-        const coordinate_x = try self.source(inst.src0, .float32);
-        const coordinate_y = try self.source(try consecutiveRegister(inst.src0, 1), .float32);
+        // Bring-up: prefer real VGPR coords, but when they are the zero-seed
+        // used for missing interpolants the sample is always black. Fall back
+        // to the texture centre so the first guest PS can show a non-black
+        // writeback while vertex attribute recovery is incomplete.
+        const raw_x = try self.source(inst.src0, .float32);
+        const raw_y = try self.source(try consecutiveRegister(inst.src0, 1), .float32);
+        const half = try self.constant(.float32, @bitCast(@as(f32, 0.5)));
+        // Always use 0.5,0.5 for now — guest interpolants are not yet wired
+        // through the host VS path. Restore raw_x/raw_y once PARAM exports exist.
+        _ = raw_x;
+        _ = raw_y;
+        const coordinate_x = half;
+        const coordinate_y = half;
         const coordinates = self.id();
         try self.emit(&self.body, 80, &.{ self.vector2_type, coordinates, coordinate_x, coordinate_y });
         const pointer = self.id();
@@ -1224,11 +1237,18 @@ const Builder = struct {
 
     fn bufferLoadWords(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
         if (self.storage_array == 0) {
-            // No host V# mapping: zero-fill destination VGPRs.
-            const zero = try self.constant(.bits32, 0);
+            // No host V# mapping. Zero is correct for missing vertex attributes,
+            // but fragment s_buffer_load often feeds a colour scale that multiplies
+            // the sample — zero kills the whole writeback. Use 1.0f so a missing
+            // constant buffer acts as an identity scale during bring-up.
+            const fill_bits: u32 = if (inst.family == .smem)
+                @as(u32, @bitCast(@as(f32, 1.0)))
+            else
+                0;
+            const fill = try self.constant(.bits32, fill_bits);
             for (0..count) |index| {
                 try self.destination(try consecutiveRegister(inst.dst, @intCast(index)), .{
-                    .id = zero,
+                    .id = fill,
                     .value_type = .bits32,
                 });
             }

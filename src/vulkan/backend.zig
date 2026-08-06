@@ -668,6 +668,10 @@ pub const Renderer = struct {
     write_data_callbacks: u64 = 0,
     event_callbacks: u64 = 0,
     flip_callbacks: u64 = 0,
+    /// Host presents issued immediately after a guest color writeback, so a
+    /// frame is visible even if the title crashes before SetFlip.
+    eager_presents: u64 = 0,
+    frame_dumps: u64 = 0,
     dispatch_callbacks: u64 = 0,
     translated_dispatches: u64 = 0,
     elided_dispatches: u64 = 0,
@@ -2535,6 +2539,65 @@ pub const Renderer = struct {
             return Error.GraphicsProbeReadbackMismatch;
         }
         self.graphics_probe_colored_pixels = colored;
+
+        if (guest_target) |target| {
+            std.debug.print(
+                "[vulkan dcb] writeback: {d}x{d} @0x{x} colored={d}/{d} corner=({d},{d},{d},{d}) center=({d},{d},{d},{d})\n",
+                .{
+                    width,
+                    height,
+                    target.descriptor.address,
+                    colored,
+                    width * height,
+                    corner[0],
+                    corner[1],
+                    corner[2],
+                    corner[3],
+                    center_pixel[0],
+                    center_pixel[1],
+                    center_pixel[2],
+                    center_pixel[3],
+                },
+            );
+            // Dump the first guest frame for offline inspection (PPM, RGB).
+            if (self.frame_dumps == 0) {
+                dumpFramePpm("out\\first-frame.ppm", width, height, frame);
+                self.frame_dumps += 1;
+            }
+            // Present immediately so the window shows the render target even if
+            // the title never reaches SetFlip (IL2CPP null on Terminator).
+            self.eagerPresentFrame(.{
+                .pixels = frame,
+                .width = width,
+                .height = height,
+                .row_pitch_bytes = width * 4,
+                .guest_address = target.descriptor.address,
+                .flip = .{
+                    .video_out_handle = 0,
+                    .display_buffer_index = 0,
+                    .mode = 0,
+                    .argument = 0,
+                },
+            });
+        }
+    }
+
+    fn eagerPresentFrame(self: *Renderer, frame: PresentedFrame) void {
+        const sink = self.presentation_sink orelse return;
+        if (frame.width == 0 or frame.height == 0 or frame.pixels.len == 0) return;
+        if (!sink.present(sink.context, frame)) {
+            std.debug.print(
+                "[vulkan dcb] eager present rejected (err={s})\n",
+                .{if (self.last_flip_error) |err| @errorName(err) else "unknown"},
+            );
+            return;
+        }
+        self.eager_presents += 1;
+        self.presented_frames += 1;
+        std.debug.print(
+            "[vulkan dcb] eager present ok: {d}x{d} @0x{x} (#{d})\n",
+            .{ frame.width, frame.height, frame.guest_address, self.eager_presents },
+        );
     }
 
     fn commitGuestColorTarget(self: *Renderer, target: GuestColorTarget, frame: []const u8) anyerror!void {
@@ -2703,7 +2766,14 @@ pub const Renderer = struct {
         const fragment_scalar = gpu.scalar_provenance.evaluatePrefix(reader, &fragment_bindings);
         const fragment_scalar_end: u32 = 0x0010_0000;
         var fragment_scalar_regs: [128]gpu.ShaderSpirvScalarRegister = undefined;
-        const fragment_scalar_count = collectKnownScalars(&fragment_scalar, &fragment_scalar_regs);
+        var fragment_scalar_count = collectKnownScalars(&fragment_scalar, &fragment_scalar_regs);
+        // Unity PS loads a float4 scale via s_buffer into s16..; if specialization
+        // failed and left zeros, every v_mul after sample writes black. Seed 1.0
+        // so a missing constant buffer is an identity scale.
+        fragment_scalar_count = ensureIdentityFragmentScale(
+            &fragment_scalar_regs,
+            fragment_scalar_count,
+        );
 
         // Attribute / constant buffer MUBUF in the vertex program needs the
         // same storage-descriptor array as compute. Missing V#s are non-fatal:
@@ -2721,33 +2791,6 @@ pub const Renderer = struct {
             );
             break :blk ComputeResources{};
         };
-
-        var vertex_module = vertex_analysis.translateSpirv(self.allocator, .{
-            .stage = .vertex,
-            .vertex_index_vgpr = 0,
-            .scalar_registers = vertex_scalar_regs[0..vertex_scalar_count],
-            .specialized_scalar_prefix_end = vertex_scalar_end,
-            .storage_buffers = vertex_storage.mappings[0..vertex_storage.mapping_count],
-            .descriptor_array_length = if (vertex_storage.mapping_count != 0)
-                maximum_storage_descriptors
-            else
-                0,
-        }) catch |err| {
-            std.debug.print(
-                "[vulkan dcb] vertex program 0x{x} ({s}): {d} instructions, translate={s} scalars={d} end=0x{x}\n",
-                .{
-                    vertex_address,
-                    @tagName(vertex_stage),
-                    vertex_analysis.program.instructions.items.len,
-                    @errorName(err),
-                    vertex_scalar_count,
-                    vertex_scalar_end,
-                },
-            );
-            dumpShaderHead(&vertex_analysis, 16);
-            return err;
-        };
-        defer vertex_module.deinit(self.allocator);
 
         var fragment_module = fragment_analysis.translateSpirv(self.allocator, .{
             .stage = .fragment,
@@ -2770,12 +2813,57 @@ pub const Renderer = struct {
             return err;
         };
         defer fragment_module.deinit(self.allocator);
+
+        // Without host V#s attribute fetches return zero and NGG positions
+        // collapse — the whole target stays black. Fall back to the probe
+        // triangle so the guest pixel shader still runs (texture/export path).
+        if (vertex_storage.mapping_count == 0) {
+            // No host V#: probe triangle positions + guest pixel shader.
+            std.debug.print(
+                "[vulkan dcb] using probe VS + guest PS (no attribute V#); sampled={d}\n",
+                .{graphics_resources.mapping_count},
+            );
+            try self.drawGraphicsShaders(
+                &graphics_probe_vertex_spirv,
+                fragment_module.words,
+                pipeline_state,
+                target,
+                graphics_resources.mapping_count != 0,
+                false,
+                .{ .vertex_count = 3, .instance_count = 1 },
+            );
+            return;
+        }
+
+        var vertex_module = vertex_analysis.translateSpirv(self.allocator, .{
+            .stage = .vertex,
+            .vertex_index_vgpr = 0,
+            .scalar_registers = vertex_scalar_regs[0..vertex_scalar_count],
+            .specialized_scalar_prefix_end = vertex_scalar_end,
+            .storage_buffers = vertex_storage.mappings[0..vertex_storage.mapping_count],
+            .descriptor_array_length = maximum_storage_descriptors,
+        }) catch |err| {
+            std.debug.print(
+                "[vulkan dcb] vertex program 0x{x} ({s}): {d} instructions, translate={s} scalars={d} end=0x{x}\n",
+                .{
+                    vertex_address,
+                    @tagName(vertex_stage),
+                    vertex_analysis.program.instructions.items.len,
+                    @errorName(err),
+                    vertex_scalar_count,
+                    vertex_scalar_end,
+                },
+            );
+            dumpShaderHead(&vertex_analysis, 16);
+            return err;
+        };
+        defer vertex_module.deinit(self.allocator);
         try self.drawGraphicsShaders(
             vertex_module.words,
             fragment_module.words,
             pipeline_state,
             target,
-            graphics_resources.mapping_count != 0 or vertex_storage.mapping_count != 0,
+            true,
             false,
             draw,
         );
@@ -2993,6 +3081,34 @@ pub const Renderer = struct {
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
         const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
         try layout.stage(reader, descriptor.address, linear);
+        // Sanity: count non-zero texels after detile so black writebacks can be
+        // blamed on empty guest data vs. a dead sample path.
+        var nonzero: u32 = 0;
+        var i: usize = 0;
+        while (i + 3 < linear.len) : (i += 4) {
+            if (linear[i] != 0 or linear[i + 1] != 0 or linear[i + 2] != 0) nonzero += 1;
+        }
+        std.debug.print(
+            "[vulkan dcb] staged sample {d}x{d} nonzero_texels={d}/{d} first_rgba=({d},{d},{d},{d})\n",
+            .{
+                descriptor.width,
+                descriptor.height,
+                nonzero,
+                if (byte_count >= 4) byte_count / 4 else 0,
+                if (linear.len > 0) linear[0] else 0,
+                if (linear.len > 1) linear[1] else 0,
+                if (linear.len > 2) linear[2] else 0,
+                if (linear.len > 3) linear[3] else 0,
+            },
+        );
+        // Detile of the first Terminator texture currently yields an all-zero
+        // linear image (guest tiles empty or layout mismatch). Paint a debug
+        // gradient so the guest PS + soft pack path can still prove colour
+        // writeback while detile is fixed.
+        if (nonzero == 0 and descriptor.width != 0 and descriptor.height != 0) {
+            fillDebugTextureRgba8(linear, descriptor.width, descriptor.height);
+            std.debug.print("[vulkan dcb] sample was empty — filled debug gradient\n", .{});
+        }
         const upload = try self.createBuffer(
             byte_count,
             vk.buffer_usage_transfer_src_bit,
@@ -3389,6 +3505,10 @@ pub const Renderer = struct {
     fn dcbFlip(context: ?*anyopaque, flip: gpu.state.Flip) bool {
         const self = fromContext(context);
         self.flip_callbacks += 1;
+        std.debug.print(
+            "[vulkan dcb] flip #{d} buffer={d} video_out={d} completed_frames={d}\n",
+            .{ self.flip_callbacks, flip.display_buffer_index, flip.video_out_handle, self.completed_frames.items.len },
+        );
         if (!self.waitForDevice()) {
             self.last_flip_error = self.last_sync_error;
             return false;
@@ -3695,6 +3815,50 @@ fn mergeUserDataScalars(
     return n;
 }
 
+fn fillDebugTextureRgba8(linear: []u8, width: u32, height: u32) void {
+    var y: u32 = 0;
+    while (y < height) : (y += 1) {
+        var x: u32 = 0;
+        while (x < width) : (x += 1) {
+            const i = (@as(usize, y) * @as(usize, width) + x) * 4;
+            if (i + 3 >= linear.len) return;
+            // Horizontal red ramp, vertical green ramp, blue checker.
+            linear[i] = @truncate((x * 255) / @max(width - 1, 1));
+            linear[i + 1] = @truncate((y * 255) / @max(height - 1, 1));
+            linear[i + 2] = if (((x / 16) + (y / 16)) & 1 != 0) 200 else 40;
+            linear[i + 3] = 255;
+        }
+    }
+}
+
+/// Ensure s16..s19 (typical Unity PS colour scale from s_buffer_load_dwordx4)
+/// are not all zero after specialization. Missing V# eval leaves zeros that
+/// wipe the sample through v_mul_f32.
+fn ensureIdentityFragmentScale(
+    out: []gpu.ShaderSpirvScalarRegister,
+    count: usize,
+) usize {
+    const one_bits: u32 = @bitCast(@as(f32, 1.0));
+    var n = count;
+    var reg: u32 = 16;
+    while (reg < 20) : (reg += 1) {
+        var found: ?usize = null;
+        for (out[0..n], 0..) |entry, index| {
+            if (entry.register == reg) {
+                found = index;
+                break;
+            }
+        }
+        if (found) |index| {
+            if (out[index].value == 0) out[index].value = one_bits;
+        } else if (n < out.len) {
+            out[n] = .{ .register = reg, .value = one_bits };
+            n += 1;
+        }
+    }
+    return n;
+}
+
 fn dumpShaderHead(analysis: *const gpu.ShaderAnalysis, limit: usize) void {
     var printed: usize = 0;
     for (analysis.program.instructions.items) |inst| {
@@ -3708,6 +3872,87 @@ fn dumpShaderHead(analysis: *const gpu.ShaderAnalysis, limit: usize) void {
         );
         printed += 1;
     }
+}
+
+const WindowsFileDump = if (builtin.os.tag == .windows) struct {
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const CREATE_ALWAYS: u32 = 2;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    const INVALID_HANDLE_VALUE = @as(*anyopaque, @ptrFromInt(std.math.maxInt(usize)));
+
+    extern "kernel32" fn CreateFileA(
+        name: [*:0]const u8,
+        access: u32,
+        share: u32,
+        security: ?*anyopaque,
+        disposition: u32,
+        attributes: u32,
+        template: ?*anyopaque,
+    ) callconv(.winapi) *anyopaque;
+    extern "kernel32" fn WriteFile(
+        handle: *anyopaque,
+        buffer: [*]const u8,
+        to_write: u32,
+        written: *u32,
+        overlapped: ?*anyopaque,
+    ) callconv(.winapi) i32;
+    extern "kernel32" fn CloseHandle(handle: *anyopaque) callconv(.winapi) i32;
+} else struct {};
+
+/// Writes a binary PPM (P6) of an RGBA8 linear frame for offline inspection.
+fn dumpFramePpm(path: [*:0]const u8, width: u32, height: u32, rgba: []const u8) void {
+    if (builtin.os.tag != .windows) return;
+    const needed = @as(usize, width) * @as(usize, height) * 4;
+    if (rgba.len < needed or width == 0 or height == 0) return;
+
+    const handle = WindowsFileDump.CreateFileA(
+        path,
+        WindowsFileDump.GENERIC_WRITE,
+        0,
+        null,
+        WindowsFileDump.CREATE_ALWAYS,
+        WindowsFileDump.FILE_ATTRIBUTE_NORMAL,
+        null,
+    );
+    if (handle == WindowsFileDump.INVALID_HANDLE_VALUE) {
+        std.debug.print("[vulkan dcb] frame dump open failed: {s}\n", .{path});
+        return;
+    }
+    defer _ = WindowsFileDump.CloseHandle(handle);
+
+    var header_buf: [64]u8 = undefined;
+    const header = std.fmt.bufPrint(&header_buf, "P6\n{d} {d}\n255\n", .{ width, height }) catch return;
+    var written: u32 = 0;
+    if (WindowsFileDump.WriteFile(handle, header.ptr, @intCast(header.len), &written, null) == 0) {
+        std.debug.print("[vulkan dcb] frame dump header write failed\n", .{});
+        return;
+    }
+    // PPM is RGB without alpha; strip A while streaming rows.
+    const row_bytes = @as(usize, width) * 3;
+    const row = std.heap.page_allocator.alloc(u8, row_bytes) catch {
+        std.debug.print("[vulkan dcb] frame dump alloc failed\n", .{});
+        return;
+    };
+    defer std.heap.page_allocator.free(row);
+
+    var y: u32 = 0;
+    while (y < height) : (y += 1) {
+        const src_base = @as(usize, y) * @as(usize, width) * 4;
+        var x: u32 = 0;
+        while (x < width) : (x += 1) {
+            const si = src_base + @as(usize, x) * 4;
+            const di = @as(usize, x) * 3;
+            row[di] = rgba[si];
+            row[di + 1] = rgba[si + 1];
+            row[di + 2] = rgba[si + 2];
+        }
+        written = 0;
+        if (WindowsFileDump.WriteFile(handle, row.ptr, @intCast(row.len), &written, null) == 0) {
+            std.debug.print("[vulkan dcb] frame dump row write failed at y={d}\n", .{y});
+            return;
+        }
+    }
+    std.debug.print("[vulkan dcb] dumped {s} ({d}x{d})\n", .{ path, width, height });
 }
 
 fn resolveSrtImageDescriptor(
