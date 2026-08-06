@@ -2570,7 +2570,7 @@ pub const Renderer = struct {
                 self.frame_dumps += 1;
             }
             // Present immediately so the window shows the render target even if
-            // the title never reaches SetFlip (IL2CPP null on Terminator).
+            // the title never reaches SetFlip (e.g. managed null faults mid-init).
             self.eagerPresentFrame(.{
                 .pixels = frame,
                 .width = width,
@@ -2669,8 +2669,8 @@ pub const Renderer = struct {
         const render_state = gpu.resources.decodeRenderState(state);
         if (render_state.active_color_count == 0) return Error.MissingColorTarget;
         // Depth and multi-MRT are ignored on this first host path: only colour
-        // target 0 is rendered. Rejecting depth-enabled draws was the entire
-        // scene path for Terminator (every draw had a depth state).
+        // target 0 is rendered. Many title draws enable depth; rejecting them
+        // would drop the whole colour path.
         if (render_state.depth_control.test_enabled or render_state.depth_control.write_enabled or
             render_state.active_color_count != 1)
         {
@@ -2700,7 +2700,7 @@ pub const Renderer = struct {
         }
         // DCC/CMASK/FMASK are ignored on the first path: the surface is staged
         // as raw tiles. Compressed contents may look wrong until a decompressor
-        // exists, but rejecting them blocks every Terminator draw (DCC=on).
+        // exists, but rejecting compressed targets blocks typical title draws.
         if (descriptor.dcc_enabled or descriptor.cmask_fast_clear or descriptor.fmask_compression) {
             std.debug.print(
                 "[vulkan dcb] draw: ignoring compression flags dcc={any} cmask={any} fmask={any} fmt={d}\n",

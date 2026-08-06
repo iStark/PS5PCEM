@@ -542,29 +542,49 @@ const ResolverContext = struct {
     guest_exports: *loader.GuestExportRegistry,
 };
 
+/// Symbols the live GPU path must own even when a guest PRX exports them.
+/// AGC shader construction records program→header mappings for draw-time
+/// attribute and SRT recovery; the guest libSceAgc copy would hide that.
+fn preferHleImportId(id: []const u8) bool {
+    return std.mem.eql(u8, id, "f3dg2CSgRKY") // sceAgcCreateShader
+        or std.mem.eql(u8, id, "dolOmWH+huQ") // sceAgcGetFusedShaderSize
+        or std.mem.eql(u8, id, "fd5Bp5tGTgo"); // sceAgcFuseShaderHalves
+}
+
+fn resolveHleExact(context: *const ResolverContext, import: *const loader.Import, symbol_type: hle.SymbolType) ?u64 {
+    if (import.id.len != hle.nid.encoded_len or
+        import.library == null or import.library_version == null or import.module == null)
+    {
+        return null;
+    }
+    var id: hle.nid.Encoded = undefined;
+    @memcpy(&id, import.id);
+    const key = hle.symbols.Key{
+        .id = id,
+        .library = .{
+            .name = import.library.?,
+            .version = @intCast(import.library_version.?),
+        },
+        .module = .{ .name = import.module.? },
+        .type = symbol_type,
+    };
+    const symbol = context.database.find(key) orelse return null;
+    return symbol.address;
+}
+
 fn resolveImport(raw_context: ?*anyopaque, import: *const loader.Import) ?u64 {
     const raw = raw_context orelse return null;
     const context: *ResolverContext = @ptrCast(@alignCast(raw));
     const symbol_type = toHleSymbolType(import.symbol_type);
 
+    if (preferHleImportId(import.id)) {
+        if (resolveHleExact(context, import, symbol_type)) |address| return address;
+        if (context.database.findById(import.id, symbol_type)) |symbol| return symbol.address;
+    }
+
     if (context.guest_exports.resolveExact(import)) |address| return address;
 
-    if (import.id.len == hle.nid.encoded_len and
-        import.library != null and import.library_version != null and import.module != null)
-    {
-        var id: hle.nid.Encoded = undefined;
-        @memcpy(&id, import.id);
-        const key = hle.symbols.Key{
-            .id = id,
-            .library = .{
-                .name = import.library.?,
-                .version = @intCast(import.library_version.?),
-            },
-            .module = .{ .name = import.module.? },
-            .type = symbol_type,
-        };
-        if (context.database.find(key)) |symbol| return symbol.address;
-    }
+    if (resolveHleExact(context, import, symbol_type)) |address| return address;
 
     if (context.guest_exports.resolveById(import)) |address| return address;
     const symbol = context.database.findById(import.id, symbol_type) orelse return null;

@@ -1333,6 +1333,13 @@ scheduler and Vulkan backend. Observed startup work now includes:
   and compressed colour export. Missing attribute V#s soft-skip; when the
   primary attribute bank is absent the draw uses a diagnostic vertex triangle
   so the guest pixel path still runs.
+- AGC `CreateShader` / `FuseShaderHalves` are taken from HLE even when a guest
+  `libSceAgc` PRX is loaded, so program→header mappings stay available to the
+  live GPU path. Gs/Hs front halves are accepted without a PGM pair; fuse
+  patches the export (ES/LS) program to front code and keeps the front header
+  for user-data / attribute-table lookup. Draws that resolve a vertex buffer
+  table seed attribute V#s (e.g. s4) and run the guest export program instead
+  of the diagnostic triangle.
 - Sampled textures staged through the tiling map. Empty guest surfaces are
   reported (tile mode, address, raw-byte probe) and may use a temporary
   gradient so the fragment path stays observable while detile/upload catch up.
@@ -1342,11 +1349,11 @@ scheduler and Vulkan backend. Observed startup work now includes:
   arguments are packed into event data as `ident | (arg << 16)` with
   `sceVideoOutGetEventData` for decoding.
 
-What still blocks a stable multi-frame game loop is mostly on the CPU/HLE side
-and deeper graphics recovery: AGC shader-header lookup for some NGG programs
-(so attribute tables and SRT roots appear), real vertex V# recovery instead of
-the probe triangle, genuine texture contents instead of empty/debug fills, and
-long-lived guest init after the first flips (null object faults in managed code
+What still blocks a stable multi-frame game loop is deeper graphics recovery
+and long-lived CPU/HLE work: guest VS attribute fetch often yields a black
+writeback (positions/format/clip still wrong while empty textures use a
+debug gradient), genuine texture contents when tiles are non-empty, and
+stable guest init after the first flips (null-object faults in managed code
 remain title-dependent).
 
 ## Error codes
@@ -1363,8 +1370,8 @@ from leaking into host code where nothing would check it.
 
 ## Roadmap
 
-1. Recover AGC shader headers for NGG/export programs so vertex buffer tables
-   and SRT roots resolve at draw time (attribute V#s instead of the probe VS).
+1. When shader headers resolve, bind real attribute V#s and drop the probe VS
+   for NGG/export draws that still soft-skip storage loads.
 2. Stage real sampled-image contents when guest tiles are non-empty; tighten
    detile and metadata handling where layout still disagrees with the title.
 3. Keep the guest process in a stable flip/submit loop after the first frames

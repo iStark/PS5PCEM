@@ -875,17 +875,44 @@ fn relocateShaderPointer(field_address: u64) bool {
     return true;
 }
 
+// Prospero ShaderBinaryType: Cs=0 Ps=1 Gs=2 Hs=3 GsFront=4 HsFront=5 GsBack=6 HsBack=7 Fs=8.
+// Front halves and fetch shaders publish no program PGM pair; fuse writes the
+// front code address into the fused back-half SH table (ES or LS bank).
 fn shaderProgramRegisters(shader_type: u8) ?struct { low: u32, high: u32 } {
     return switch (shader_type) {
         0 => .{ .low = 0x20c, .high = 0x20d }, // compute
         1 => .{ .low = 0x008, .high = 0x009 }, // pixel
-        2 => .{ .low = 0x0c8, .high = 0x0c9 }, // NGG export / GS front (ES bank)
-        3 => .{ .low = 0x148, .high = 0x149 }, // hull
-        4 => .{ .low = 0x048, .high = 0x049 }, // vertex
-        6 => .{ .low = 0x088, .high = 0x089 }, // geometry back half
-        7 => .{ .low = 0x108, .high = 0x109 }, // hull back half
-        else => null,
+        2 => .{ .low = 0x0c8, .high = 0x0c9 }, // GS / NGG export (ES bank)
+        3 => .{ .low = 0x148, .high = 0x149 }, // HS (LS bank)
+        6 => .{ .low = 0x088, .high = 0x089 }, // GS back half
+        7 => .{ .low = 0x108, .high = 0x109 }, // HS back half
+        else => null, // 4 GsFront, 5 HsFront, 8 Fs: no PGM pair here
     };
+}
+
+fn isShaderFrontOrFetch(shader_type: u8) bool {
+    return shader_type == 4 or shader_type == 5 or shader_type == 8;
+}
+
+fn isFusableShaderPair(front_type: u8, back_type: u8) bool {
+    return (front_type == 4 and back_type == 6) or (front_type == 5 and back_type == 7);
+}
+
+fn findShaderRegister(registers: [*]ShaderRegister, count: u8, offset: u32, occurrence: u32) ?*ShaderRegister {
+    var seen: u32 = 0;
+    for (registers[0..count]) |*entry| {
+        if (entry.offset != offset) continue;
+        if (seen == occurrence) return entry;
+        seen += 1;
+    }
+    return null;
+}
+
+fn patchShaderRegisterAddress(registers: [*]ShaderRegister, count: u8, lo_offset: u32, address: u64) void {
+    const low = findShaderRegister(registers, count, lo_offset, 0) orelse return;
+    const high = findShaderRegister(registers, count, lo_offset + 1, 0) orelse return;
+    low.value = @truncate(address >> 8);
+    high.value = (high.value & 0xffff_ff00) | @as(u32, @truncate(address >> 40));
 }
 
 fn patchShaderProgram(header_address: u64, code_address: u64) ?u64 {
@@ -895,7 +922,7 @@ fn patchShaderProgram(header_address: u64, code_address: u64) ?u64 {
     // Front halves publish their program address when they are fused with the
     // back half. Fetch shaders likewise have no SH program pair in this table.
     const wanted = shaderProgramRegisters(shader_type) orelse
-        return if (shader_type == 4 or shader_type == 5 or shader_type == 8) code_address else null;
+        return if (isShaderFrontOrFetch(shader_type)) code_address else null;
     const count = bytes[shader_sh_register_count_offset];
     const registers_address = @as(*const u64, @ptrFromInt(header_address + shader_sh_registers_offset)).*;
     if (registers_address == 0 or !accessible(registers_address, @as(usize, count) * @sizeOf(ShaderRegister))) {
@@ -953,9 +980,145 @@ fn agcCreateShader(
         }
     }
     const program_address = patchShaderProgram(header_address, code_address) orelse return invalid_argument;
+    // Prefer the front-half header for registry lookups: fused Gs/Hs headers
+    // clear user_data, while the export program still runs front code and the
+    // attribute / SRT tables live on the front half.
     _ = agc_shader_registry.record(code_address, header_address);
     if (program_address != code_address) _ = agc_shader_registry.record(program_address, header_address);
     if (output) |destination| destination.* = header_pointer;
+    return errno.ok;
+}
+
+const shader_special_vgt_stages_offset: usize = 0x08;
+const spi_shader_pgm_chksum_gs: u32 = 0x80;
+const spi_shader_pgm_lo_es: u32 = 0x0c8;
+const spi_shader_pgm_lo_ls: u32 = 0x148;
+const fused_shader_scratch_align: u64 = 4;
+const graphics_error_invalid_shader_halves: i32 = @bitCast(@as(u32, 0x8a6c_0008));
+
+const SizeAlign = extern struct {
+    size: u64,
+    align_bytes: u64,
+};
+
+fn agcGetFusedShaderSize(
+    destination: ?*SizeAlign,
+    front: ?*const anyopaque,
+    back: ?*const anyopaque,
+) callconv(abi.guest) i32 {
+    const out = destination orelse return invalid_argument;
+    const front_address = @intFromPtr(front orelse return invalid_argument);
+    const back_address = @intFromPtr(back orelse return invalid_argument);
+    if (!accessible(front_address, shader_structure_size) or !accessible(back_address, shader_structure_size)) {
+        return errno.KernelError.efault.raw();
+    }
+    const front_bytes: [*]const u8 = @ptrFromInt(front_address);
+    const back_bytes: [*]const u8 = @ptrFromInt(back_address);
+    if (!isFusableShaderPair(front_bytes[shader_type_offset], back_bytes[shader_type_offset])) {
+        return graphics_error_invalid_shader_halves;
+    }
+    const register_count = back_bytes[shader_sh_register_count_offset];
+    out.* = .{
+        .size = @as(u64, register_count) * @sizeOf(ShaderRegister),
+        .align_bytes = fused_shader_scratch_align,
+    };
+    return errno.ok;
+}
+
+fn agcFuseShaderHalves(
+    fused: ?*anyopaque,
+    front: ?*const anyopaque,
+    back: ?*const anyopaque,
+    scratch: ?*anyopaque,
+) callconv(abi.guest) i32 {
+    const fused_address = @intFromPtr(fused orelse return invalid_argument);
+    const front_address = @intFromPtr(front orelse return invalid_argument);
+    const back_address = @intFromPtr(back orelse return invalid_argument);
+    if (!accessible(fused_address, shader_structure_size) or
+        !accessible(front_address, shader_structure_size) or
+        !accessible(back_address, shader_structure_size))
+    {
+        return errno.KernelError.efault.raw();
+    }
+
+    const front_bytes: [*]const u8 = @ptrFromInt(front_address);
+    const back_bytes: [*]const u8 = @ptrFromInt(back_address);
+    const front_type = front_bytes[shader_type_offset];
+    const back_type = back_bytes[shader_type_offset];
+    if (!isFusableShaderPair(front_type, back_type)) return graphics_error_invalid_shader_halves;
+
+    const is_geometry = front_type == 4;
+    // Wave32 enable bits in VGT_SHADER_STAGES_EN must agree across halves.
+    const front_specials = @as(*const u64, @ptrFromInt(front_address + shader_specials_offset)).*;
+    const back_specials = @as(*const u64, @ptrFromInt(back_address + shader_specials_offset)).*;
+    if (front_specials != 0 and back_specials != 0) {
+        if (!accessible(front_specials + shader_special_vgt_stages_offset + 4, 4) or
+            !accessible(back_specials + shader_special_vgt_stages_offset + 4, 4))
+        {
+            return errno.KernelError.efault.raw();
+        }
+        const front_stages = @as(*const u32, @ptrFromInt(front_specials + shader_special_vgt_stages_offset + 4)).*;
+        const back_stages = @as(*const u32, @ptrFromInt(back_specials + shader_special_vgt_stages_offset + 4)).*;
+        const wave_bit: u32 = if (is_geometry) (@as(u32, 1) << 22) else (@as(u32, 1) << 21);
+        if ((front_stages ^ back_stages) & wave_bit != 0) return graphics_error_invalid_shader_halves;
+    }
+
+    // Fused header starts as a copy of the back half, then becomes Gs/Hs.
+    const fused_bytes: [*]u8 = @ptrFromInt(fused_address);
+    const back_src: [*]const u8 = @ptrFromInt(back_address);
+    @memcpy(fused_bytes[0..shader_structure_size], back_src[0..shader_structure_size]);
+    fused_bytes[shader_type_offset] = if (is_geometry) 2 else 3;
+    @as(*u64, @ptrFromInt(fused_address + shader_user_data_offset)).* = 0;
+
+    const back_registers_address = @as(*const u64, @ptrFromInt(back_address + shader_sh_registers_offset)).*;
+    const register_count = back_bytes[shader_sh_register_count_offset];
+    var fused_registers_address = back_registers_address;
+    if (scratch) |scratch_pointer| {
+        if (back_registers_address != 0 and register_count != 0) {
+            const byte_count = @as(usize, register_count) * @sizeOf(ShaderRegister);
+            const scratch_address = @intFromPtr(scratch_pointer);
+            if (!accessible(back_registers_address, byte_count) or !accessible(scratch_address, byte_count)) {
+                return errno.KernelError.efault.raw();
+            }
+            const dst: [*]u8 = @ptrFromInt(scratch_address);
+            const src: [*]const u8 = @ptrFromInt(back_registers_address);
+            @memcpy(dst[0..byte_count], src[0..byte_count]);
+            fused_registers_address = scratch_address;
+        }
+    }
+    @as(*u64, @ptrFromInt(fused_address + shader_sh_registers_offset)).* = fused_registers_address;
+
+    const front_code = @as(*const u64, @ptrFromInt(front_address + shader_code_offset)).*;
+    if (fused_registers_address != 0 and register_count != 0) {
+        if (!accessible(fused_registers_address, @as(usize, register_count) * @sizeOf(ShaderRegister))) {
+            return errno.KernelError.efault.raw();
+        }
+        const fused_regs: [*]ShaderRegister = @ptrFromInt(fused_registers_address);
+        if (is_geometry) {
+            const front_registers_address = @as(*const u64, @ptrFromInt(front_address + shader_sh_registers_offset)).*;
+            const front_count = front_bytes[shader_sh_register_count_offset];
+            if (front_registers_address != 0 and front_count != 0 and
+                accessible(front_registers_address, @as(usize, front_count) * @sizeOf(ShaderRegister)))
+            {
+                const front_regs: [*]ShaderRegister = @ptrFromInt(front_registers_address);
+                for (0..2) |occurrence| {
+                    const dst = findShaderRegister(fused_regs, register_count, spi_shader_pgm_chksum_gs, @intCast(occurrence));
+                    const src = findShaderRegister(front_regs, front_count, spi_shader_pgm_chksum_gs, @intCast(occurrence));
+                    if (dst) |d| {
+                        if (src) |s| d.value = s.value;
+                    }
+                }
+            }
+            patchShaderRegisterAddress(fused_regs, register_count, spi_shader_pgm_lo_es, front_code);
+        } else {
+            patchShaderRegisterAddress(fused_regs, register_count, spi_shader_pgm_lo_ls, front_code);
+        }
+    }
+
+    // Draw-time lookup keys off the export program address (front code). The
+    // front header still owns user_data / attribute tables after user_data is
+    // cleared on the fused object.
+    if (front_code != 0) _ = agc_shader_registry.record(front_code, front_address);
     return errno.ok;
 }
 
@@ -992,8 +1155,8 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcGetRegisterDefaults2", .function = trace.wrap("sceAgcGetRegisterDefaults2", &agcGetRegisterDefaults), .expect_id = "2JtWUUiYBXs" },
     .{ .name = "sceAgcGetRegisterDefaults2Internal", .function = trace.wrap("sceAgcGetRegisterDefaults2Internal", &agcGetRegisterDefaults), .expect_id = "wRbq6ZjNop4" },
     .{ .name = "sceAgcCreateShader", .function = trace.wrap("sceAgcCreateShader", &agcCreateShader), .expect_id = "f3dg2CSgRKY" },
-    .{ .name = "sceAgcUnknownGetFusedShaderSize", .function = trace.wrap("sceAgcUnknownGetFusedShaderSize", &agcPatch), .id_override = "dolOmWH+huQ" },
-    .{ .name = "sceAgcUnknownFuseShaderHalves", .function = trace.wrap("sceAgcUnknownFuseShaderHalves", &agcPatch), .id_override = "fd5Bp5tGTgo" },
+    .{ .name = "sceAgcUnknownGetFusedShaderSize", .function = trace.wrap("sceAgcUnknownGetFusedShaderSize", &agcGetFusedShaderSize), .id_override = "dolOmWH+huQ" },
+    .{ .name = "sceAgcUnknownFuseShaderHalves", .function = trace.wrap("sceAgcUnknownFuseShaderHalves", &agcFuseShaderHalves), .id_override = "fd5Bp5tGTgo" },
     .{ .name = "sceAgcSetCxRegIndirectPatchSetAddress", .function = trace.wrap("sceAgcSetCxRegIndirectPatchSetAddress", &agcPatch), .expect_id = "vcmNN+AAXnY" },
     .{ .name = "sceAgcSetShRegIndirectPatchSetAddress", .function = trace.wrap("sceAgcSetShRegIndirectPatchSetAddress", &agcPatch), .expect_id = "Qrj4c+61z4A" },
     .{ .name = "sceAgcSetUcRegIndirectPatchSetAddress", .function = trace.wrap("sceAgcSetUcRegIndirectPatchSetAddress", &agcPatch), .expect_id = "6lNcCp+fxi4" },
@@ -1301,6 +1464,83 @@ test "shader creation accepts a fused front half without program registers" {
     try std.testing.expectEqual(
         @as(?u64, @intFromPtr(&header)),
         agc_shader_registry.find(@intFromPtr(&code)),
+    );
+}
+
+test "fuse shader halves patches ES program and keeps front header lookup" {
+    agc_shader_registry.reset();
+    defer agc_shader_registry.reset();
+
+    var front: [shader_structure_size]u8 align(8) = @splat(0);
+    var back: [shader_structure_size]u8 align(8) = @splat(0);
+    var fused: [shader_structure_size]u8 align(8) = @splat(0);
+    var front_registers = [_]ShaderRegister{
+        .{ .offset = spi_shader_pgm_chksum_gs, .value = 0x1111_1111 },
+        .{ .offset = spi_shader_pgm_chksum_gs, .value = 0x2222_2222 },
+    };
+    var back_registers = [_]ShaderRegister{
+        .{ .offset = 0x088, .value = 0 }, // GS PGM for CreateShader(type=6)
+        .{ .offset = 0x089, .value = 0 },
+        .{ .offset = spi_shader_pgm_lo_es, .value = 0 },
+        .{ .offset = spi_shader_pgm_lo_es + 1, .value = 0 },
+        .{ .offset = spi_shader_pgm_chksum_gs, .value = 0 },
+        .{ .offset = spi_shader_pgm_chksum_gs, .value = 0 },
+    };
+    var scratch: [6]ShaderRegister = undefined;
+    var front_code: [16]u8 align(256) = @splat(0);
+    var back_code: [16]u8 align(256) = @splat(0);
+
+    std.mem.writeInt(u32, front[0..4], shader_file_header, .little);
+    std.mem.writeInt(u32, front[4..8], shader_version, .little);
+    front[shader_type_offset] = 4;
+    front[shader_sh_register_count_offset] = front_registers.len;
+    const front_address = @intFromPtr(&front);
+    @as(*u64, @ptrFromInt(front_address + shader_sh_registers_offset)).* =
+        @intFromPtr(&front_registers) -% (front_address + shader_sh_registers_offset);
+
+    std.mem.writeInt(u32, back[0..4], shader_file_header, .little);
+    std.mem.writeInt(u32, back[4..8], shader_version, .little);
+    back[shader_type_offset] = 6;
+    back[shader_sh_register_count_offset] = back_registers.len;
+    const back_address = @intFromPtr(&back);
+    @as(*u64, @ptrFromInt(back_address + shader_sh_registers_offset)).* =
+        @intFromPtr(&back_registers) -% (back_address + shader_sh_registers_offset);
+
+    var front_shader: ?*anyopaque = null;
+    var back_shader: ?*anyopaque = null;
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        agcCreateShader(&front_shader, &front, @ptrCast(&front_code)),
+    );
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        agcCreateShader(&back_shader, &back, @ptrCast(&back_code)),
+    );
+
+    var size_align: SizeAlign = .{ .size = 0, .align_bytes = 0 };
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        agcGetFusedShaderSize(&size_align, &front, &back),
+    );
+    try std.testing.expectEqual(@as(u64, back_registers.len * @sizeOf(ShaderRegister)), size_align.size);
+    try std.testing.expectEqual(fused_shader_scratch_align, size_align.align_bytes);
+
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        agcFuseShaderHalves(&fused, &front, &back, &scratch),
+    );
+    try std.testing.expectEqual(@as(u8, 2), fused[shader_type_offset]);
+    try std.testing.expectEqual(@as(u64, 0), @as(*const u64, @ptrFromInt(@intFromPtr(&fused) + shader_user_data_offset)).*);
+    try std.testing.expectEqual(@intFromPtr(&scratch), @as(*const u64, @ptrFromInt(@intFromPtr(&fused) + shader_sh_registers_offset)).*);
+
+    const front_code_address = @intFromPtr(&front_code);
+    // Scratch is a copy of back_registers; ES PGM pair is at indices 2/3.
+    try std.testing.expectEqual(@as(u32, @truncate(front_code_address >> 8)), scratch[2].value);
+    try std.testing.expectEqual(@as(u32, 0x1111_1111), scratch[4].value);
+    try std.testing.expectEqual(@as(u32, 0x2222_2222), scratch[5].value);
+    try std.testing.expectEqual(
+        @as(?u64, front_address),
+        agc_shader_registry.find(front_code_address),
     );
 }
 

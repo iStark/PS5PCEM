@@ -1489,8 +1489,8 @@ const Builder = struct {
             .s_mov_b64 => try self.mov64(inst),
             .v_cndmask_b32 => try self.cndmask(inst),
             // Attribute interpolation: without PARAM exports from the VS, map
-            // p1/p2 pairs onto FragCoord-based UVs (v4→u, v5→v is the Unity
-            // convention in the first Terminator PS). mov stays a soft move.
+            // p1/p2 pairs onto FragCoord-based UVs (common Unity PS layout:
+            // v4→u, v5→v). mov stays a soft move.
             .v_interp_p1_f32, .v_interp_p2_f32 => try self.interpStub(inst),
             .v_interp_mov_f32 => try self.unary(inst, 83, .float32),
             .v_cvt_f32_i32 => try self.integerToFloat(inst, true),

@@ -89,8 +89,15 @@ pub fn writeGuestMemory(_: ?*anyopaque, address: u64, bytes: []const u8) bool {
     return true;
 }
 
+var shader_header_miss_logged: bool = false;
+
 pub fn findShaderHeader(_: ?*anyopaque, program_address: u64) ?u64 {
-    return shader_registry.find(program_address);
+    if (shader_registry.find(program_address)) |header| return header;
+    if (!shader_header_miss_logged and program_address != 0) {
+        shader_header_miss_logged = true;
+        shader_registry.debugNearby(program_address);
+    }
+    return null;
 }
 
 const shader_memory_reader = gpu.ShaderMemoryReader{
