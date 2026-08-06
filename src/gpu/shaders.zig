@@ -498,10 +498,13 @@ fn findSrtAddress(
     const first = try metadata.directResourceOffset(reader, .shader_resource_table) orelse return null;
     if (@as(u32, first) + 1 >= user_data_count) return Error.UserDataOutOfRange;
     const high = user_data[first + 1];
-    if (high & 0xffff_0000 != 0) return Error.AddressOverflow;
+    // USER_DATA slots often hold V# descriptor words, not 48-bit pointers.
+    // Treat unusable high halves as "no SRT" rather than aborting the whole
+    // draw/dispatch with AddressOverflow.
+    if (high & 0xffff_0000 != 0) return null;
     const address = @as(u64, user_data[first]) | (@as(u64, high) << 32);
     if (address == 0) return null;
-    if (address & ~address_mask != 0) return Error.AddressOverflow;
+    if (address & ~address_mask != 0) return null;
     return address;
 }
 
@@ -515,10 +518,10 @@ fn findDirectPointer(
     const first = try metadata.directResourceOffset(reader, resource_type) orelse return null;
     if (@as(u32, first) + 1 >= user_data_count) return Error.UserDataOutOfRange;
     const high = user_data[first + 1];
-    if (high & 0xffff_0000 != 0) return Error.AddressOverflow;
+    if (high & 0xffff_0000 != 0) return null;
     const address = @as(u64, user_data[first]) | (@as(u64, high) << 32);
     if (address == 0) return null;
-    if (address & ~address_mask != 0) return Error.AddressOverflow;
+    if (address & ~address_mask != 0) return null;
     return address;
 }
 

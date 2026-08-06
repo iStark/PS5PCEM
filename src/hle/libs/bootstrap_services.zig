@@ -233,7 +233,7 @@ const VideoOutFlipStatus = extern struct {
     process_time_counter: u64 = 0,
     gc_queue_count: i32 = 0,
     flip_pending_count: i32 = 0,
-    current_buffer: i32 = 0,
+    current_buffer: i32 = -1,
     reserved2: u32 = 0,
     submit_process_time_counter: u64 = 0,
     reserved3: [7]u64 = [_]u64{0} ** 7,
@@ -347,6 +347,7 @@ fn videoOutSubmitFlip(handle: i32, index: i32, mode: i32, argument: i64) callcon
     if (index < -1 or (index >= 0 and video_out.resolve(@intCast(handle), index) == null)) {
         return video_out_error_invalid_index;
     }
+    video_out.noteFlipSubmit(argument, kernel_runtime.processTimeCounter());
     _ = agc_submit.presentFlip(.{
         .video_out_handle = @intCast(handle),
         .display_buffer_index = index,
@@ -461,11 +462,13 @@ fn videoOutSubmitEopFlip(
     // that completion for as long as it runs — with nothing anywhere saying
     // which call was the one that did not happen. Answering truthfully turns a
     // silent stall into a failure at the call responsible for it.
+    const flip_arg: i64 = @bitCast(argument);
+    video_out.noteFlipSubmit(flip_arg, kernel_runtime.processTimeCounter());
     if (!agc_submit.presentFlip(.{
         .video_out_handle = @intCast(handle),
         .display_buffer_index = index,
         .mode = mode,
-        .argument = @bitCast(argument),
+        .argument = flip_arg,
     })) {
         return video_out_error_invalid_index;
     }

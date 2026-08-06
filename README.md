@@ -1349,12 +1349,12 @@ scheduler and Vulkan backend. Observed startup work now includes:
   arguments are packed into event data as `ident | (arg << 16)` with
   `sceVideoOutGetEventData` for decoding.
 
-What still blocks a stable multi-frame game loop is deeper graphics recovery
-and long-lived CPU/HLE work: guest VS attribute fetch often yields a black
-writeback (positions/format/clip still wrong while empty textures use a
-debug gradient), genuine texture contents when tiles are non-empty, and
-stable guest init after the first flips (null-object faults in managed code
-remain title-dependent).
+First guest draws now cover the colour target with guest VS + guest PS
+(attribute MUBUF SOFFSET encodings and VertexIndex recovery). Empty textures
+still use a debug gradient. What still blocks a stable multi-frame game loop
+is mostly long-lived CPU/HLE work after the first flips (null-object faults
+in managed code remain title-dependent) and real texture contents when guest
+tiles are non-empty.
 
 ## Error codes
 
@@ -1370,15 +1370,13 @@ from leaking into host code where nothing would check it.
 
 ## Roadmap
 
-1. When shader headers resolve, bind real attribute V#s and drop the probe VS
-   for NGG/export draws that still soft-skip storage loads.
-2. Stage real sampled-image contents when guest tiles are non-empty; tighten
+1. Stage real sampled-image contents when guest tiles are non-empty; tighten
    detile and metadata handling where layout still disagrees with the title.
-3. Keep the guest process in a stable flip/submit loop after the first frames
+2. Keep the guest process in a stable flip/submit loop after the first frames
    (clear remaining null-object and missing-service faults during long init).
-4. Profile host CPU spin from AGC `suspendPoint` / guest waits and reduce the
+3. Profile host CPU spin from AGC `suspendPoint` / guest waits and reduce the
    hottest loops without changing synchronization contracts.
-5. Retain submission owner metadata across blocked `WAIT_REG_MEM` continuations
+4. Retain submission owner metadata across blocked `WAIT_REG_MEM` continuations
    and publish delayed graphics completion events when needed.
 
 ---

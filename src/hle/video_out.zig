@@ -54,7 +54,8 @@ pub const FlipStatus = struct {
     flip_argument: i64 = 0,
     process_time_counter: u64 = 0,
     flip_pending_count: i32 = 0,
-    current_buffer: i32 = 0,
+    /// -1 until the first completed flip (matches console init).
+    current_buffer: i32 = -1,
     submit_process_time_counter: u64 = 0,
 };
 
@@ -281,7 +282,10 @@ pub fn completeFlip(flip: gpu.state.Flip) bool {
     flip_status.count += 1;
     flip_status.flip_argument = flip.argument;
     flip_status.current_buffer = flip.display_buffer_index;
-    flip_status.flip_pending_count = 0;
+    flip_status.flip_pending_count = if (flip_status.flip_pending_count > 0)
+        flip_status.flip_pending_count - 1
+    else
+        0;
     // process_time / process_time_counter filled at GetFlipStatus time so they
     // stay current when the title polls after the equeue wakes.
     if (previous_buffer >= 0 and previous_buffer < maximum_buffers) {
@@ -289,6 +293,18 @@ pub fn completeFlip(flip: gpu.state.Flip) bool {
     }
     previous_buffer = flip.display_buffer_index;
     return true;
+}
+
+/// Records that a flip was submitted and is waiting to complete. Titles poll
+/// `flip_pending_count` / `submit_process_time_counter` between SubmitFlip and
+/// the equeue wake; leaving them zero can skip post-flip init paths.
+pub fn noteFlipSubmit(argument: i64, process_time_counter: u64) void {
+    lock.lock();
+    defer lock.unlock();
+    if (!opened) return;
+    flip_status.flip_argument = argument;
+    flip_status.flip_pending_count += 1;
+    flip_status.submit_process_time_counter = process_time_counter;
 }
 
 pub fn status(handle: i32) ?FlipStatus {

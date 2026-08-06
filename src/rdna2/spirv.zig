@@ -908,8 +908,18 @@ const Builder = struct {
             else
                 zero,
         };
+        // If W is exactly 0 (failed constant-buffer row), force W=1 so
+        // clip-space positions stay finite and rasterizable.
+        var out_w = w;
+        if (self.stage == .vertex) {
+            const w_is_zero = self.id();
+            try self.emit(&self.body, 180, &.{ self.bool_type, w_is_zero, w, zero }); // OpFOrdEqual
+            const w_fixed = self.id();
+            try self.emit(&self.body, 169, &.{ self.float_type, w_fixed, w_is_zero, one, w }); // OpSelect
+            out_w = w_fixed;
+        }
         const vector = self.id();
-        try self.emit(&self.body, 80, &.{ self.vector4_type, vector, x, y, z, w }); // OpCompositeConstruct
+        try self.emit(&self.body, 80, &.{ self.vector4_type, vector, x, y, z, out_w }); // OpCompositeConstruct
         try self.emit(&self.body, 62, &.{ output, vector }); // OpStore
     }
 
@@ -1071,10 +1081,21 @@ const Builder = struct {
             return Error.InvalidStorageBinding;
         };
 
-        var index = if (inst.index_enable)
-            try self.source(inst.src0, .bits32)
-        else
-            try self.constant(.bits32, 0);
+        // NGG/export VS programs often clobber the VertexIndex VGPR (v0) with
+        // v_cndmask before the attribute MUBUF. Prefer the system VertexIndex
+        // whenever the load still *names* that VGPR as its index so every
+        // vertex does not alias record 0 and collapse to a zero-area draw.
+        var index = if (inst.index_enable) blk: {
+            if (self.stage == .vertex and self.vertex_index_input != 0 and
+                inst.src0.kind == .vgpr and self.vertex_index_vgpr != null and
+                inst.src0.reg == self.vertex_index_vgpr.?)
+            {
+                const loaded = self.id();
+                try self.emit(&self.body, 61, &.{ self.signed_type, loaded, self.vertex_index_input }); // OpLoad
+                break :blk try self.convert(.{ .id = loaded, .value_type = .sint32 }, .bits32);
+            }
+            break :blk try self.source(inst.src0, .bits32);
+        } else try self.constant(.bits32, 0);
         if (binding.add_thread_id) {
             if (self.local_invocation_index == 0) return Error.UnsupportedBufferAddressing;
             const invocation = self.id();
@@ -1103,7 +1124,15 @@ const Builder = struct {
             try self.emit(&self.body, 196, &.{ self.bits_type, lsb_index, index_lsb, try self.constant(.bits32, 2) }); // OpShiftLeftLogical
             break :blk try self.addBits(msb, try self.addBits(lsb_index, offset_lsb));
         } else try self.addBits(try self.multiplyBits(index, stride), offset);
-        byte_offset = try self.addBits(byte_offset, try self.source(inst.src2, .bits32));
+        // SOFFSET: VCC/EXEC/M0 encodings mean "no scalar offset" (zero), not
+        // the all-ones mask used when those registers are read as lane masks.
+        // Treating them as 0xffffffff made every attribute MUBUF OOB → zero
+        // verts → black guest VS writeback.
+        const soffset = switch (inst.src2.kind) {
+            .null, .m0, .vcc_lo, .vcc_hi, .exec_lo, .exec_hi => try self.constant(.bits32, 0),
+            else => try self.source(inst.src2, .bits32),
+        };
+        byte_offset = try self.addBits(byte_offset, soffset);
         return .{ .binding = binding, .byte_offset = byte_offset };
     }
 

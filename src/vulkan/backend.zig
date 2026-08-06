@@ -2858,49 +2858,7 @@ pub const Renderer = struct {
             "[vulkan dcb] vertex storage: mappings={d} scalars={d}\n",
             .{ vertex_storage.mapping_count, vertex_storage.scalar_count },
         );
-        var map_i: usize = 0;
-        while (map_i < vertex_storage.mapping_count and map_i < 8) : (map_i += 1) {
-            const m = vertex_storage.mappings[map_i];
-            const di = m.descriptor_index;
-            const gaddr = if (di < vertex_storage.addresses.len) vertex_storage.addresses[di] else 0;
-            const gsize = if (di < vertex_storage.sizes.len) vertex_storage.sizes[di] else 0;
-            var cb_head: [4]u32 = @splat(0);
-            if (gaddr != 0 and gsize >= 16) {
-                reader.read(gaddr, std.mem.asBytes(&cb_head)) catch {};
-            }
-            const c0: f32 = @bitCast(cb_head[0]);
-            const c1: f32 = @bitCast(cb_head[1]);
-            const c2: f32 = @bitCast(cb_head[2]);
-            const c3: f32 = @bitCast(cb_head[3]);
-            std.debug.print(
-                "[vulkan dcb]   map s{d} -> desc[{d}] guest=0x{x} size=0x{x} stride={d} head_f32={d:.3} {d:.3} {d:.3} {d:.3}\n",
-                .{
-                    m.resource_sgpr,
-                    di,
-                    gaddr,
-                    gsize,
-                    m.stride,
-                    c0,
-                    c1,
-                    c2,
-                    c3,
-                },
-            );
-        }
-        // USER_DATA window (first 8 words) — SRT pointers and inline constants.
-        std.debug.print(
-            "[vulkan dcb] user_data[0..7]: {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8}\n",
-            .{
-                vertex_bindings.user_data[0],
-                vertex_bindings.user_data[1],
-                vertex_bindings.user_data[2],
-                vertex_bindings.user_data[3],
-                vertex_bindings.user_data[4],
-                vertex_bindings.user_data[5],
-                vertex_bindings.user_data[6],
-                vertex_bindings.user_data[7],
-            },
-        );
+
 
         var fragment_module = fragment_analysis.translateSpirv(self.allocator, .{
             .stage = .fragment,
@@ -2929,12 +2887,6 @@ pub const Renderer = struct {
         const try_guest_vs = vertex_storage.mapping_count != 0 and
             vertex_storage.mappingForSgpr(4) != null;
         if (try_guest_vs) {
-            var pos_exports: usize = 0;
-            for (vertex_analysis.program.instructions.items) |inst| {
-                if (inst.opcode == .exp and (inst.export_target == 12 or inst.export_target == 0)) {
-                    pos_exports += 1;
-                }
-            }
             if (vertex_analysis.translateSpirv(self.allocator, .{
                 .stage = .vertex,
                 .vertex_index_vgpr = 0,
@@ -2946,12 +2898,11 @@ pub const Renderer = struct {
                 var vertex_module = vertex_module_owned;
                 defer vertex_module.deinit(self.allocator);
                 std.debug.print(
-                    "[vulkan dcb] using guest VS + guest PS; sampled={d} idx={any} storage={d} pos_exports={d}\n",
+                    "[vulkan dcb] using guest VS + guest PS; sampled={d} idx={any} storage={d}\n",
                     .{
                         graphics_resources.mapping_count,
                         draw.index_count,
                         vertex_storage.mapping_count,
-                        pos_exports,
                     },
                 );
                 try self.drawGraphicsShaders(
@@ -3853,10 +3804,19 @@ pub const Renderer = struct {
             const soft = err == Error.MissingStorageDescriptor or
                 err == Error.GuestMemoryReadFailed or
                 err == Error.GuestBufferTooLarge or
-                std.mem.eql(u8, @errorName(err), "UnsupportedOpcode");
+                std.mem.eql(u8, @errorName(err), "AddressOverflow") or
+                std.mem.eql(u8, @errorName(err), "UnsupportedOpcode") or
+                std.mem.eql(u8, @errorName(err), "InvalidMetadata") or
+                std.mem.eql(u8, @errorName(err), "UserDataOutOfRange");
             std.debug.print(
-                "[vulkan dcb] dispatch {s}: {s}\n",
-                .{ if (soft) "skipped" else "rejected", @errorName(err) },
+                "[vulkan dcb] dispatch {s}: {s} (groups={d}x{d}x{d})\n",
+                .{
+                    if (soft) "skipped" else "rejected",
+                    @errorName(err),
+                    packet.body[0],
+                    packet.body[1],
+                    packet.body[2],
+                },
             );
             return soft;
         };
@@ -4370,12 +4330,6 @@ fn seedVertexBufferScalars(
     while (pair < pairs) : (pair += 1) {
         const sgpr = resource_sgprs[pair];
         const words = buffer_words[pair];
-        var head: [20]u32 = @splat(0);
-        const head_bytes = @min(buffers[pair].size_bytes, @as(u64, @sizeOf(@TypeOf(head))));
-        const head_words: usize = @intCast(head_bytes / 4);
-        if (head_bytes != 0) {
-            reader.read(buffers[pair].address, std.mem.sliceAsBytes(head[0..head_words])) catch {};
-        }
         std.debug.print(
             "[vulkan dcb] seed V# s{d}:s{d} addr=0x{x} size=0x{x} stride={d} records={d}\n",
             .{
@@ -4387,21 +4341,6 @@ fn seedVertexBufferScalars(
                 buffers[pair].record_count,
             },
         );
-        // Dump each record as five f32 (stride 20 is the common Unity path).
-        var record: u32 = 0;
-        while (record < buffers[pair].record_count and record < 4) : (record += 1) {
-            const base: usize = @as(usize, record) * 5;
-            if (base + 4 >= head_words) break;
-            const a: f32 = @bitCast(head[base]);
-            const b: f32 = @bitCast(head[base + 1]);
-            const c: f32 = @bitCast(head[base + 2]);
-            const d: f32 = @bitCast(head[base + 3]);
-            const e: f32 = @bitCast(head[base + 4]);
-            std.debug.print(
-                "[vulkan dcb]   vtx{d}: {d:.4} {d:.4} {d:.4} {d:.4} {d:.4}\n",
-                .{ record, a, b, c, d, e },
-            );
-        }
         var word_i: u32 = 0;
         while (word_i < 4) : (word_i += 1) {
             const reg = sgpr + word_i;
