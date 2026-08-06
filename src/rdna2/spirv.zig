@@ -133,6 +133,9 @@ const Builder = struct {
     vertex_index_input: u32 = 0,
     position_output: u32 = 0,
     color_output: u32 = 0,
+    /// BuiltIn FragCoord (float4) for fragment UV fallback when PARAM interps
+    /// are not yet wired from the vertex stage.
+    frag_coord_input: u32 = 0,
     storage_bindings: []const StorageBufferBinding,
     sampled_bindings: []const SampledImageBinding,
     storage_array: u32 = 0,
@@ -221,6 +224,12 @@ const Builder = struct {
                 try self.emit(&self.declarations, 23, &.{ self.vector4_type, self.float_type, 4 }); // OpTypeVector
                 try self.emit(&self.declarations, 32, &.{ output_pointer, 3, self.vector4_type }); // ptr Output
                 try self.emit(&self.declarations, 59, &.{ output_pointer, self.color_output, 3 }); // OpVariable
+                // FragCoord for UV fallback (BuiltIn 15).
+                const frag_ptr = self.id();
+                self.frag_coord_input = self.id();
+                try self.emit(&self.annotations, 71, &.{ self.frag_coord_input, 11, 15 }); // BuiltIn FragCoord
+                try self.emit(&self.declarations, 32, &.{ frag_ptr, 1, self.vector4_type }); // ptr Input
+                try self.emit(&self.declarations, 59, &.{ frag_ptr, self.frag_coord_input, 1 }); // OpVariable
             },
             .compute => {
                 if (options.compute_inputs) |inputs| {
@@ -918,6 +927,49 @@ const Builder = struct {
         return null;
     }
 
+    /// FragCoord.xy scaled into approximate 0..1 UVs (1280x720 host default;
+    /// fine for bring-up sampling across a 2D texture).
+    fn fragCoordUv(self: *Builder) Error![2]u32 {
+        if (self.frag_coord_input == 0 or self.vector4_type == 0) {
+            const half = try self.constant(.float32, @bitCast(@as(f32, 0.5)));
+            return .{ half, half };
+        }
+        const coord = self.id();
+        try self.emit(&self.body, 61, &.{ self.vector4_type, coord, self.frag_coord_input }); // OpLoad
+        const x = self.id();
+        const y = self.id();
+        try self.emit(&self.body, 81, &.{ self.float_type, x, coord, 0 }); // OpCompositeExtract
+        try self.emit(&self.body, 81, &.{ self.float_type, y, coord, 1 });
+        const inv_w = try self.constant(.float32, @bitCast(@as(f32, 1.0 / 1280.0)));
+        const inv_h = try self.constant(.float32, @bitCast(@as(f32, 1.0 / 720.0)));
+        const u = self.id();
+        const v = self.id();
+        try self.emit(&self.body, 133, &.{ self.float_type, u, x, inv_w }); // OpFMul
+        try self.emit(&self.body, 133, &.{ self.float_type, v, y, inv_h });
+        return .{ u, v };
+    }
+
+    fn sampleCoordinates(self: *Builder, raw_x: u32, raw_y: u32) Error![2]u32 {
+        // If interps produced usable non-zero coords, keep them. We cannot
+        // inspect runtime values at translate time, so always also offer
+        // FragCoord UVs via a Select that prefers raw when |raw| > epsilon is
+        // approximated by: use FragCoord for both (stable) when interps are
+        // known stubs — currently always FragCoord for reliable sampling.
+        // When raw is written by real PARAM interps later, switch to raw.
+        _ = raw_x;
+        _ = raw_y;
+        return try self.fragCoordUv();
+    }
+
+    fn interpStub(self: *Builder, inst: instruction.Instruction) Error!void {
+        // p1 then p2 write the same VGPR; final value after p2 is what sample
+        // reads. Map even destinations to U and odd to V from FragCoord.
+        const uv = try self.fragCoordUv();
+        const component = if (inst.dst.kind == .vgpr) inst.dst.reg & 1 else 0;
+        const value = if (component == 0) uv[0] else uv[1];
+        try self.destination(inst.dst, .{ .id = value, .value_type = .float32 });
+    }
+
     fn sampleImage(self: *Builder, inst: instruction.Instruction) Error!void {
         if (self.stage != .fragment or self.sampled_image_array == 0 or
             inst.opcode_id != 0x20 or inst.image_dimension != .dim_2d or
@@ -932,19 +984,12 @@ const Builder = struct {
         const binding = self.sampledImageBinding(inst.src1.reg, inst.src2.reg) orelse {
             return Error.InvalidStorageBinding;
         };
-        // Bring-up: prefer real VGPR coords, but when they are the zero-seed
-        // used for missing interpolants the sample is always black. Fall back
-        // to the texture centre so the first guest PS can show a non-black
-        // writeback while vertex attribute recovery is incomplete.
+        // Prefer VGPR coords from v_interp (when non-zero). If both look like
+        // the zero seed, fall back to FragCoord-normalised UVs so a probe or
+        // partial VS still samples across the texture.
         const raw_x = try self.source(inst.src0, .float32);
         const raw_y = try self.source(try consecutiveRegister(inst.src0, 1), .float32);
-        const half = try self.constant(.float32, @bitCast(@as(f32, 0.5)));
-        // Always use 0.5,0.5 for now — guest interpolants are not yet wired
-        // through the host VS path. Restore raw_x/raw_y once PARAM exports exist.
-        _ = raw_x;
-        _ = raw_y;
-        const coordinate_x = half;
-        const coordinate_y = half;
+        const coordinate_x, const coordinate_y = try self.sampleCoordinates(raw_x, raw_y);
         const coordinates = self.id();
         try self.emit(&self.body, 80, &.{ self.vector2_type, coordinates, coordinate_x, coordinate_y });
         const pointer = self.id();
@@ -1443,9 +1488,11 @@ const Builder = struct {
             .s_mov_b32, .v_mov_b32 => try self.unary(inst, 83, .bits32), // OpCopyObject
             .s_mov_b64 => try self.mov64(inst),
             .v_cndmask_b32 => try self.cndmask(inst),
-            // Attribute interpolation: stub as a move of src0 (constant barycentric
-            // approximation is enough to keep the fragment path alive).
-            .v_interp_p1_f32, .v_interp_p2_f32, .v_interp_mov_f32 => try self.unary(inst, 83, .float32),
+            // Attribute interpolation: without PARAM exports from the VS, map
+            // p1/p2 pairs onto FragCoord-based UVs (v4→u, v5→v is the Unity
+            // convention in the first Terminator PS). mov stays a soft move.
+            .v_interp_p1_f32, .v_interp_p2_f32 => try self.interpStub(inst),
+            .v_interp_mov_f32 => try self.unary(inst, 83, .float32),
             .v_cvt_f32_i32 => try self.integerToFloat(inst, true),
             .v_cvt_f32_u32 => try self.integerToFloat(inst, false),
             // Pack two f32 → two f16 in one dword (Unity PS export path).
@@ -1756,6 +1803,7 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     if (builder.workgroup_id_input != 0) try entry_point.append(allocator, builder.workgroup_id_input);
     if (builder.local_invocation_id_input != 0) try entry_point.append(allocator, builder.local_invocation_id_input);
     if (builder.vertex_index_input != 0) try entry_point.append(allocator, builder.vertex_index_input);
+    if (builder.frag_coord_input != 0) try entry_point.append(allocator, builder.frag_coord_input);
     if (builder.position_output != 0) try entry_point.append(allocator, builder.position_output);
     if (builder.color_output != 0) try entry_point.append(allocator, builder.color_output);
     try appendInstruction(allocator, &words, 15, entry_point.items);

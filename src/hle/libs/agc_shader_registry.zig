@@ -59,10 +59,57 @@ pub fn find(program_address: u64) ?u64 {
     for (0..capacity) |_| {
         const entry = entries[index];
         if (entry.program_address == program_address) return entry.header_address;
-        if (entry.program_address == 0) return null;
+        if (entry.program_address == 0) break;
         index = (index + 1) & (capacity - 1);
     }
-    return null;
+
+    // Fuzzy: PM4 sometimes publishes an entry point a few dwords past the
+    // code address recorded at create (s_inst_prefetch / prolog). Accept a
+    // registered code base that lies at or just below the program address.
+    var best_header: ?u64 = null;
+    var best_delta: u64 = std.math.maxInt(u64);
+    for (entries) |entry| {
+        if (entry.program_address == 0) continue;
+        if (entry.program_address > program_address) continue;
+        const delta = program_address - entry.program_address;
+        // Allow a small prolog offset from the recorded code base only.
+        if (delta < 0x1000 and delta < best_delta) {
+            best_delta = delta;
+            best_header = entry.header_address;
+        }
+    }
+    return best_header;
+}
+
+pub fn count() usize {
+    registry_lock.lock();
+    defer registry_lock.unlock();
+    var n: usize = 0;
+    for (entries) |entry| {
+        if (entry.program_address != 0) n += 1;
+    }
+    return n;
+}
+
+/// Debug: print a few registered program→header pairs near `program_address`.
+pub fn debugNearby(program_address: u64) void {
+    registry_lock.lock();
+    defer registry_lock.unlock();
+    var n: usize = 0;
+    var shown: usize = 0;
+    for (entries) |entry| {
+        if (entry.program_address == 0) continue;
+        n += 1;
+        const delta: i64 = @as(i64, @bitCast(entry.program_address)) -% @as(i64, @bitCast(program_address));
+        if (@abs(delta) < 0x100_000 and shown < 8) {
+            std.debug.print(
+                "[shader-registry] near prog=0x{x}: entry=0x{x} header=0x{x} delta={d}\n",
+                .{ program_address, entry.program_address, entry.header_address, delta },
+            );
+            shown += 1;
+        }
+    }
+    std.debug.print("[shader-registry] total entries={d} looking for 0x{x}\n", .{ n, program_address });
 }
 
 pub fn reset() void {

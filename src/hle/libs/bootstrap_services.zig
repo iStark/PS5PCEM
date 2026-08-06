@@ -847,8 +847,9 @@ fn shaderProgramRegisters(shader_type: u8) ?struct { low: u32, high: u32 } {
     return switch (shader_type) {
         0 => .{ .low = 0x20c, .high = 0x20d }, // compute
         1 => .{ .low = 0x008, .high = 0x009 }, // pixel
-        2 => .{ .low = 0x0c8, .high = 0x0c9 }, // geometry
+        2 => .{ .low = 0x0c8, .high = 0x0c9 }, // NGG export / GS front (ES bank)
         3 => .{ .low = 0x148, .high = 0x149 }, // hull
+        4 => .{ .low = 0x048, .high = 0x049 }, // vertex
         6 => .{ .low = 0x088, .high = 0x089 }, // geometry back half
         7 => .{ .low = 0x108, .high = 0x109 }, // hull back half
         else => null,

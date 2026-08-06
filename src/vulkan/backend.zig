@@ -1718,7 +1718,7 @@ pub const Renderer = struct {
             )) orelse {
                 const full = gpu.scalar_provenance.evaluatePrefix(reader, bindings);
                 std.debug.print(
-                    "[vulkan dcb] MissingStorageDescriptor: pc=0x{x} {s} V# s{d}:s{d} unknown (scalar stop={s} @0x{x}, loads={d}, user_data={d})\n",
+                    "[vulkan dcb] MissingStorageDescriptor: pc=0x{x} {s} V# s{d}:s{d} unknown (scalar stop={s} @0x{x}, loads={d}, user_data={d}); soft-skip\n",
                     .{
                         inst.pc,
                         @tagName(inst.opcode),
@@ -1730,11 +1730,13 @@ pub const Renderer = struct {
                         bindings.user_data_count,
                     },
                 );
-                return Error.MissingStorageDescriptor;
+                // Soft-skip: keep mapping other resources so a single missing
+                // V# does not abort the whole draw/dispatch.
+                continue;
             };
             if (descriptor.isNull() or descriptor.size_bytes == 0) {
                 std.debug.print(
-                    "[vulkan dcb] MissingStorageDescriptor: pc=0x{x} {s} V# s{d} null/empty (addr=0x{x} size={d})\n",
+                    "[vulkan dcb] MissingStorageDescriptor: pc=0x{x} {s} V# s{d} null/empty (addr=0x{x} size={d}); soft-skip\n",
                     .{
                         inst.pc,
                         @tagName(inst.opcode),
@@ -1743,20 +1745,23 @@ pub const Renderer = struct {
                         descriptor.size_bytes,
                     },
                 );
-                return Error.MissingStorageDescriptor;
+                continue;
             }
             const size = std.math.cast(usize, descriptor.size_bytes) orelse {
                 std.debug.print(
-                    "[vulkan dcb] GuestBufferTooLarge: V# s{d} size_bytes=0x{x}\n",
+                    "[vulkan dcb] GuestBufferTooLarge: V# s{d} size_bytes=0x{x}; soft-skip\n",
                     .{ resource_sgpr, descriptor.size_bytes },
                 );
-                return Error.GuestBufferTooLarge;
+                continue;
             };
             const descriptor_index = result.descriptorForRange(descriptor.address, size) orelse blk: {
-                const free = result.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
+                const free = result.freeDescriptor() orelse {
+                    std.debug.print("[vulkan dcb] no free storage slot for V# s{d}; soft-skip\n", .{resource_sgpr});
+                    continue;
+                };
                 _ = self.stageGuestStorageBufferAt(free, descriptor.address, size) catch |err| {
                     std.debug.print(
-                        "[vulkan dcb] stage V# s{d} failed: {s} addr=0x{x} size=0x{x} stride={d} records={d}\n",
+                        "[vulkan dcb] stage V# s{d} failed: {s} addr=0x{x} size=0x{x} stride={d} records={d}; soft-skip\n",
                         .{
                             resource_sgpr,
                             @errorName(err),
@@ -1766,7 +1771,7 @@ pub const Renderer = struct {
                             descriptor.record_count,
                         },
                     );
-                    return err;
+                    continue;
                 };
                 result.occupied[free] = true;
                 result.addresses[free] = descriptor.address;
@@ -2732,6 +2737,13 @@ pub const Renderer = struct {
             resolve(memory.context, vertex_address)
         else
             null;
+        if (vertex_header == null and memory.shader_header != null) {
+            // Registry miss: dump nearby entries once to diagnose mapping gaps.
+            std.debug.print(
+                "[vulkan dcb] no shader header for VS program 0x{x} stage={s}\n",
+                .{ vertex_address, @tagName(vertex_stage) },
+            );
+        }
         const fragment_header = if (memory.shader_header) |resolve|
             resolve(memory.context, fragment_address)
         else
@@ -2762,6 +2774,26 @@ pub const Renderer = struct {
             &vertex_scalar_regs,
             vertex_scalar_count,
         );
+        // Also seed at the hardware base (s8 for export_shader).
+        if (vertex_bindings.scalar_user_data_base != 0) {
+            vertex_scalar_count = mergeUserDataScalars(
+                &vertex_bindings,
+                vertex_bindings.scalar_user_data_base,
+                &vertex_scalar_regs,
+                vertex_scalar_count,
+            );
+        }
+        // Recover attribute V#s from the AGC vertex buffer table into the SGPRs
+        // the VS MUBUF instructions name (typically s4 for Unity NGG).
+        var vertex_scalar_mut = vertex_scalar;
+        vertex_scalar_count = seedVertexBufferScalars(
+            &vertex_bindings,
+            reader,
+            &vertex_analysis,
+            &vertex_scalar_regs,
+            vertex_scalar_count,
+            &vertex_scalar_mut,
+        );
 
         const fragment_scalar = gpu.scalar_provenance.evaluatePrefix(reader, &fragment_bindings);
         const fragment_scalar_end: u32 = 0x0010_0000;
@@ -2782,7 +2814,7 @@ pub const Renderer = struct {
             &vertex_bindings,
             reader,
             &vertex_analysis,
-            &vertex_scalar,
+            &vertex_scalar_mut,
             vertex_scalar_end,
         ) catch |err| blk: {
             std.debug.print(
@@ -2791,6 +2823,29 @@ pub const Renderer = struct {
             );
             break :blk ComputeResources{};
         };
+        // prepareComputeResources soft-skips missing V#s; rebuild its scalar
+        // list from the seeded specialization so SPIR-V and staging agree.
+        if (vertex_storage.scalar_count == 0 and vertex_scalar_count != 0) {
+            // already filled from evaluation; merge seeds into result scalars
+        }
+        for (vertex_scalar_regs[0..vertex_scalar_count]) |seeded| {
+            var found = false;
+            for (vertex_storage.scalar_registers[0..vertex_storage.scalar_count]) |*entry| {
+                if (entry.register == seeded.register) {
+                    entry.value = seeded.value;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found and vertex_storage.scalar_count < vertex_storage.scalar_registers.len) {
+                vertex_storage.scalar_registers[vertex_storage.scalar_count] = seeded;
+                vertex_storage.scalar_count += 1;
+            }
+        }
+        std.debug.print(
+            "[vulkan dcb] vertex storage: mappings={d} scalars={d}\n",
+            .{ vertex_storage.mapping_count, vertex_storage.scalar_count },
+        );
 
         var fragment_module = fragment_analysis.translateSpirv(self.allocator, .{
             .stage = .fragment,
@@ -2814,58 +2869,56 @@ pub const Renderer = struct {
         };
         defer fragment_module.deinit(self.allocator);
 
-        // Without host V#s attribute fetches return zero and NGG positions
-        // collapse — the whole target stays black. Fall back to the probe
-        // triangle so the guest pixel shader still runs (texture/export path).
-        if (vertex_storage.mapping_count == 0) {
-            // No host V#: probe triangle positions + guest pixel shader.
+        // Prefer guest VS when attribute V#s mapped; otherwise (or on translate
+        // failure) use the probe triangle so guest PS still paints something.
+        const try_guest_vs = vertex_storage.mapping_count != 0 and
+            vertex_storage.mappingForSgpr(4) != null;
+        if (try_guest_vs) {
+            if (vertex_analysis.translateSpirv(self.allocator, .{
+                .stage = .vertex,
+                .vertex_index_vgpr = 0,
+                .scalar_registers = vertex_scalar_regs[0..vertex_scalar_count],
+                .specialized_scalar_prefix_end = vertex_scalar_end,
+                .storage_buffers = vertex_storage.mappings[0..vertex_storage.mapping_count],
+                .descriptor_array_length = maximum_storage_descriptors,
+            })) |vertex_module_owned| {
+                var vertex_module = vertex_module_owned;
+                defer vertex_module.deinit(self.allocator);
+                std.debug.print(
+                    "[vulkan dcb] using guest VS + guest PS (attr V# mapped); sampled={d}\n",
+                    .{graphics_resources.mapping_count},
+                );
+                try self.drawGraphicsShaders(
+                    vertex_module.words,
+                    fragment_module.words,
+                    pipeline_state,
+                    target,
+                    true,
+                    false,
+                    draw,
+                );
+                return;
+            } else |err| {
+                std.debug.print(
+                    "[vulkan dcb] vertex program 0x{x} ({s}): translate={s}; falling back to probe VS\n",
+                    .{ vertex_address, @tagName(vertex_stage), @errorName(err) },
+                );
+                dumpShaderHead(&vertex_analysis, 12);
+            }
+        } else {
             std.debug.print(
-                "[vulkan dcb] using probe VS + guest PS (no attribute V#); sampled={d}\n",
-                .{graphics_resources.mapping_count},
+                "[vulkan dcb] using probe VS + guest PS (no attr V# s4); storage_maps={d} sampled={d}\n",
+                .{ vertex_storage.mapping_count, graphics_resources.mapping_count },
             );
-            try self.drawGraphicsShaders(
-                &graphics_probe_vertex_spirv,
-                fragment_module.words,
-                pipeline_state,
-                target,
-                graphics_resources.mapping_count != 0,
-                false,
-                .{ .vertex_count = 3, .instance_count = 1 },
-            );
-            return;
         }
-
-        var vertex_module = vertex_analysis.translateSpirv(self.allocator, .{
-            .stage = .vertex,
-            .vertex_index_vgpr = 0,
-            .scalar_registers = vertex_scalar_regs[0..vertex_scalar_count],
-            .specialized_scalar_prefix_end = vertex_scalar_end,
-            .storage_buffers = vertex_storage.mappings[0..vertex_storage.mapping_count],
-            .descriptor_array_length = maximum_storage_descriptors,
-        }) catch |err| {
-            std.debug.print(
-                "[vulkan dcb] vertex program 0x{x} ({s}): {d} instructions, translate={s} scalars={d} end=0x{x}\n",
-                .{
-                    vertex_address,
-                    @tagName(vertex_stage),
-                    vertex_analysis.program.instructions.items.len,
-                    @errorName(err),
-                    vertex_scalar_count,
-                    vertex_scalar_end,
-                },
-            );
-            dumpShaderHead(&vertex_analysis, 16);
-            return err;
-        };
-        defer vertex_module.deinit(self.allocator);
         try self.drawGraphicsShaders(
-            vertex_module.words,
+            &graphics_probe_vertex_spirv,
             fragment_module.words,
             pipeline_state,
             target,
-            true,
+            graphics_resources.mapping_count != 0,
             false,
-            draw,
+            .{ .vertex_count = 3, .instance_count = 1 },
         );
     }
 
@@ -3081,30 +3134,63 @@ pub const Renderer = struct {
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
         const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
         try layout.stage(reader, descriptor.address, linear);
-        // Sanity: count non-zero texels after detile so black writebacks can be
-        // blamed on empty guest data vs. a dead sample path.
-        var nonzero: u32 = 0;
-        var i: usize = 0;
-        while (i + 3 < linear.len) : (i += 4) {
-            if (linear[i] != 0 or linear[i + 1] != 0 or linear[i + 2] != 0) nonzero += 1;
+        var nonzero = countNonzeroRgba(linear);
+        // Probe raw guest bytes: all-zero detile may be a tile-mode mismatch
+        // rather than empty guest memory.
+        var raw_head: [64]u8 = @splat(0);
+        const raw_len = @min(raw_head.len, std.math.cast(usize, layout.required_source_bytes) orelse raw_head.len);
+        const raw_ok = if (raw_len != 0)
+            memory.read(memory.context, descriptor.address, raw_head[0..raw_len])
+        else
+            false;
+        var raw_nonzero: u32 = 0;
+        if (raw_ok) {
+            for (raw_head[0..raw_len]) |b| {
+                if (b != 0) raw_nonzero += 1;
+            }
         }
         std.debug.print(
-            "[vulkan dcb] staged sample {d}x{d} nonzero_texels={d}/{d} first_rgba=({d},{d},{d},{d})\n",
+            "[vulkan dcb] staged sample {d}x{d} tile={s} addr=0x{x} nonzero_texels={d}/{d} raw_head_nz={d}/{d} first_rgba=({d},{d},{d},{d})\n",
             .{
                 descriptor.width,
                 descriptor.height,
+                @tagName(descriptor.tile_mode),
+                descriptor.address,
                 nonzero,
                 if (byte_count >= 4) byte_count / 4 else 0,
+                raw_nonzero,
+                raw_len,
                 if (linear.len > 0) linear[0] else 0,
                 if (linear.len > 1) linear[1] else 0,
                 if (linear.len > 2) linear[2] else 0,
                 if (linear.len > 3) linear[3] else 0,
             },
         );
-        // Detile of the first Terminator texture currently yields an all-zero
-        // linear image (guest tiles empty or layout mismatch). Paint a debug
-        // gradient so the guest PS + soft pack path can still prove colour
-        // writeback while detile is fixed.
+        // If detile produced nothing but raw memory has data, retry as tightly
+        // packed linear (tile_mode wrong or not yet applied by the title).
+        if (nonzero == 0 and raw_nonzero != 0 and descriptor.width != 0 and descriptor.height != 0) {
+            const pitch = if (descriptor.pitch != 0) descriptor.pitch else descriptor.width;
+            const row_bytes = @as(usize, pitch) * 4;
+            const copy_w = @as(usize, descriptor.width) * 4;
+            var y: u32 = 0;
+            var linear_nz: u32 = 0;
+            while (y < descriptor.height) : (y += 1) {
+                const src = descriptor.address + @as(u64, y) * row_bytes;
+                const dst = @as(usize, y) * @as(usize, descriptor.width) * 4;
+                if (dst + copy_w > linear.len) break;
+                if (!memory.read(memory.context, src, linear[dst..][0..copy_w])) break;
+            }
+            linear_nz = countNonzeroRgba(linear);
+            if (linear_nz != 0) {
+                nonzero = linear_nz;
+                std.debug.print(
+                    "[vulkan dcb] linear fallback staging recovered {d} nonzero texels (pitch={d})\n",
+                    .{ nonzero, pitch },
+                );
+            }
+        }
+        // Last resort: guest truly empty (not yet uploaded) — paint a gradient
+        // so the PS path stays visible during bring-up.
         if (nonzero == 0 and descriptor.width != 0 and descriptor.height != 0) {
             fillDebugTextureRgba8(linear, descriptor.width, descriptor.height);
             std.debug.print("[vulkan dcb] sample was empty — filled debug gradient\n", .{});
@@ -3815,6 +3901,15 @@ fn mergeUserDataScalars(
     return n;
 }
 
+fn countNonzeroRgba(linear: []const u8) u32 {
+    var nonzero: u32 = 0;
+    var i: usize = 0;
+    while (i + 3 < linear.len) : (i += 4) {
+        if (linear[i] != 0 or linear[i + 1] != 0 or linear[i + 2] != 0) nonzero += 1;
+    }
+    return nonzero;
+}
+
 fn fillDebugTextureRgba8(linear: []u8, width: u32, height: u32) void {
     var y: u32 = 0;
     while (y < height) : (y += 1) {
@@ -4009,14 +4104,15 @@ fn takePlausibleBufferDescriptor(descriptor: ?gpu.BufferDescriptor) ?gpu.BufferD
     return if (isPlausibleBufferDescriptor(value)) value else null;
 }
 
-/// Recovers a V# for a compute MUBUF/SMEM instruction.
+/// Recovers a V# for a compute/graphics MUBUF/SMEM instruction.
 ///
 /// Order of attempts:
 /// 1. Specialized scalar prefix (what the SPIR-V specialization path sees).
 /// 2. Full scalar prolog — recovers descriptors loaded after the specialized
 ///    cut or through a longer SMEM chain.
-/// 3. V# already resident in the USER_DATA snapshot (direct-bind path). Last,
-///    because mis-decoding SRT pointer words as a V# is common and harmful.
+/// 3. V# already resident in USER_DATA (with capture base and with base=0 —
+///    NGG seeds often land at s0 even when scalar_user_data_base=8).
+/// 4. AGC vertex buffer table entry (graphics attribute path).
 fn resolveComputeBufferDescriptor(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
@@ -4033,7 +4129,160 @@ fn resolveComputeBufferDescriptor(
     if (takePlausibleBufferDescriptor(try bindings.inlineBufferDescriptor(resource_sgpr))) |descriptor| {
         return descriptor;
     }
+    // Absolute USER_DATA window only when the shader names an SGPR that sits
+    // inside the USER_DATA capture (not below scalar_user_data_base). For
+    // export_shader base=8, s4 is a system slot — do not mis-decode UD[4].
+    if (resource_sgpr >= bindings.scalar_user_data_base) {
+        const first = resource_sgpr - bindings.scalar_user_data_base;
+        if (first + 4 <= bindings.user_data_count) {
+            if (takePlausibleBufferDescriptor(try gpu.resources.decodeBufferDescriptor(
+                bindings.user_data[first..][0..4],
+            ))) |descriptor| {
+                return descriptor;
+            }
+        }
+    }
     return null;
+}
+
+/// Injects AGC vertex-buffer V#s into specialized scalar registers so the
+/// SPIR-V translator sees s4:s7 (etc.) as constants and prepareComputeResources
+/// can stage the underlying guest memory.
+fn seedVertexBufferScalars(
+    bindings: *const gpu.ShaderBindings,
+    reader: gpu.ShaderMemoryReader,
+    analysis: *const gpu.ShaderAnalysis,
+    out: []gpu.ShaderSpirvScalarRegister,
+    count: usize,
+    evaluation: ?*gpu.ScalarEvaluation,
+) usize {
+    std.debug.print(
+        "[vulkan dcb] vertex seed: stage={s} header={any} srt={any} ud_base={d} ud_count={d} scalar_s4={any}\n",
+        .{
+            @tagName(bindings.stage),
+            bindings.metadata != null,
+            bindings.srt_address != null,
+            bindings.scalar_user_data_base,
+            bindings.user_data_count,
+            if (evaluation) |e| e.registers[4].known else false,
+        },
+    );
+    const vertex = (gpu.VertexBindings.capture(bindings, reader) catch |err| {
+        std.debug.print("[vulkan dcb] VertexBindings.capture failed: {s}\n", .{@errorName(err)});
+        return count;
+    }) orelse {
+        std.debug.print(
+            "[vulkan dcb] VertexBindings: no attr/buffer tables (fetch={any})\n",
+            .{bindings.direct_pointers.fetch_shader != null},
+        );
+        return count;
+    };
+    if (vertex.attribute_count == 0) return count;
+
+    // Collect unique resource SGPRs referenced by MUBUF loads, in program order.
+    var resource_sgprs: [16]u32 = undefined;
+    var resource_count: usize = 0;
+    for (analysis.program.instructions.items) |inst| {
+        const is_load = switch (inst.opcode) {
+            .buffer_load_ubyte,
+            .buffer_load_sbyte,
+            .buffer_load_ushort,
+            .buffer_load_sshort,
+            .buffer_load_dword,
+            .buffer_load_dwordx2,
+            .buffer_load_dwordx3,
+            .buffer_load_dwordx4,
+            .buffer_load_format_x,
+            .buffer_load_format_xy,
+            .buffer_load_format_xyz,
+            .buffer_load_format_xyzw,
+            => true,
+            else => false,
+        };
+        if (!is_load or inst.src1.kind != .sgpr) continue;
+        const sgpr = inst.src1.reg;
+        var seen = false;
+        for (resource_sgprs[0..resource_count]) |existing| {
+            if (existing == sgpr) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen or resource_count >= resource_sgprs.len) continue;
+        resource_sgprs[resource_count] = sgpr;
+        resource_count += 1;
+    }
+    if (resource_count == 0) return count;
+
+    // Unique attribute buffers in location order.
+    var buffers: [16]gpu.BufferDescriptor = undefined;
+    var buffer_words: [16][4]u32 = undefined;
+    var buffer_count: usize = 0;
+    for (vertex.slice()) |attr| {
+        if (!isPlausibleBufferDescriptor(attr.buffer)) continue;
+        var dupe = false;
+        for (buffers[0..buffer_count]) |existing| {
+            if (existing.address == attr.buffer.address) {
+                dupe = true;
+                break;
+            }
+        }
+        if (dupe or buffer_count >= buffers.len) continue;
+        var words: [4]u32 = undefined;
+        reader.read(attr.descriptor_address, std.mem.asBytes(&words)) catch continue;
+        const decoded = gpu.resources.decodeBufferDescriptor(&words) catch continue;
+        if (!isPlausibleBufferDescriptor(decoded)) continue;
+        buffers[buffer_count] = decoded;
+        buffer_words[buffer_count] = words;
+        buffer_count += 1;
+    }
+    if (buffer_count == 0) {
+        std.debug.print(
+            "[vulkan dcb] VertexBindings: {d} attrs but no plausible buffers\n",
+            .{vertex.attribute_count},
+        );
+        return count;
+    }
+
+    var n = count;
+    const pairs = @min(resource_count, buffer_count);
+    var pair: usize = 0;
+    while (pair < pairs) : (pair += 1) {
+        const sgpr = resource_sgprs[pair];
+        const words = buffer_words[pair];
+        std.debug.print(
+            "[vulkan dcb] seed V# s{d}:s{d} from vertex buffer table addr=0x{x} size=0x{x}\n",
+            .{ sgpr, sgpr + 3, buffers[pair].address, buffers[pair].size_bytes },
+        );
+        var word_i: u32 = 0;
+        while (word_i < 4) : (word_i += 1) {
+            const reg = sgpr + word_i;
+            var found: ?usize = null;
+            for (out[0..n], 0..) |entry, index| {
+                if (entry.register == reg) {
+                    found = index;
+                    break;
+                }
+            }
+            if (found) |index| {
+                out[index].value = words[word_i];
+            } else if (n < out.len) {
+                out[n] = .{ .register = reg, .value = words[word_i] };
+                n += 1;
+            }
+            if (evaluation) |eval| {
+                if (reg < eval.registers.len) {
+                    eval.registers[reg] = .{
+                        .known = true,
+                        .value = words[word_i],
+                        .sources = .{},
+                        .producer_pc = 0,
+                    };
+                }
+            }
+        }
+    }
+    return n;
 }
 
 fn layerAvailable(enumerate: vk.PfnEnumerateInstanceLayerProperties, wanted: []const u8) bool {
