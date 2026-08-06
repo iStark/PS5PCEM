@@ -17,6 +17,8 @@ const symbols = @import("../symbols.zig");
 const kernel_threading = @import("kernel_threading.zig");
 const kernel_memory = @import("kernel_memory.zig");
 const audio_device = @import("../audio_device.zig");
+const audio_fs = @import("../audio_fs.zig");
+const filesystem = @import("../filesystem.zig");
 
 const audio_out_error_invalid_port: i32 = @bitCast(@as(u32, 0x8026_0003));
 const audio_out_error_invalid_pointer: i32 = @bitCast(@as(u32, 0x8026_0004));
@@ -112,6 +114,9 @@ var device_owner: i32 = -1;
 /// about the title.
 fn claimDevice(handle: i32, port: LegacyPort) bool {
     if (device_owner != -1) return false;
+    // Warm FSB index + host mix before the first audible Output so silent
+    // mixer buffers immediately carry real game PCM.
+    filesystem.ensureAudioIndexed();
     device.open(.{
         .frequency = port.frequency,
         .channels = port.channels,
@@ -336,12 +341,27 @@ fn audioOutOutput(handle: i32, data: ?*const anyopaque) callconv(abi.guest) i32 
             // A device that stopped working mid-run falls back to pacing rather
             // than failing the call, because losing sound is not a reason to
             // stop a title.
+            // When the title's mixer is still silent, blend in FSB-backed clips
+            // that were opened via Media/Resources/audio/**.wav virtual files.
+            var mixed_storage: [audio_device.maximum_buffer_bytes]u8 align(16) = undefined;
+            var peak = bufferPeak(port, play_slice);
+            if (peak < 8 and length <= mixed_storage.len) {
+                @memcpy(mixed_storage[0..length], play_slice);
+                const mixed = if (port.samples == .float32)
+                    audio_fs.mixIntoFloat32Buffer(mixed_storage[0..length], port.channels)
+                else
+                    audio_fs.mixIntoInt16Buffer(mixed_storage[0..length], port.channels);
+                if (mixed) {
+                    play_slice = mixed_storage[0..length];
+                    peak = bufferPeak(port, play_slice);
+                }
+            }
             if (device.play(play_slice)) |_| {
                 const n = audio_out_play_ok.fetchAdd(1, .monotonic);
-                if (n < 3 or n % 1000 == 0) {
+                if (n < 3 or n % 1000 == 0 or (peak > 8 and n < 20)) {
                     std.debug.print(
                         "[audio] play ok #{d} handle={d} bytes={d} peak~{d}\n",
-                        .{ n + 1, handle, length, bufferPeak(port, play_slice) },
+                        .{ n + 1, handle, length, peak },
                     );
                 }
                 return errno.ok;

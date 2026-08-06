@@ -295,6 +295,14 @@ pub fn isAttached() bool {
     return root != null;
 }
 
+/// Index FSB banks and preseed host mix as soon as `/app0` is mounted.
+/// Safe to call repeatedly; no-ops when detached or already indexed.
+pub fn ensureAudioIndexed() void {
+    const io = active_io orelse return;
+    const directory = root orelse return;
+    audio_fs.ensureIndexed(directory, io);
+}
+
 /// How many descriptors are currently held.
 pub fn openCount() usize {
     table_lock.lock();

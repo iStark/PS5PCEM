@@ -478,17 +478,34 @@ fn answerGraphicsQueueSubmit(request: Request, payload: u64) bool {
         // near the head). Re-sample a few times so late-written packets are not
         // permanently dropped as an 8-dword ACQUIRE_MEM-only prefix.
         var stream = committedQueueStream(reserved_stream);
+        // Producer often kicks #50 with only an ACQUIRE_MEM prefix (~6–8 dwords)
+        // while the rest of the frame DCB is still being encoded. Poll longer
+        // when the committed length is tiny relative to the reserved IB so
+        // multi-draw frames are not permanently dropped as ACQUIRE_only kicks.
         var grow_round: u8 = 0;
-        while (stream.len < reserved_stream.len and stream.len < 64 and grow_round < 8) : (grow_round += 1) {
+        const short_threshold: usize = 32;
+        const max_grow: u8 = if (stream.len <= short_threshold and reserved_stream.len > short_threshold)
+            64
+        else
+            8;
+        while (stream.len < reserved_stream.len and grow_round < max_grow) : (grow_round += 1) {
+            // Stop early once we have a substantial committed stream.
+            if (stream.len >= 256) break;
             std.Thread.yield() catch {};
-            // Brief host pause so the title thread can finish the producer write.
             if (comptime builtin.os.tag == .windows) {
-                var interval: i64 = -5000; // 0.5 ms in 100-ns units
+                // 0.5 ms early, 1 ms after a few empty polls.
+                const ticks: i64 = if (grow_round < 4) -5000 else -10_000;
+                var interval: i64 = ticks;
                 _ = std.os.windows.ntdll.NtDelayExecution(.FALSE, &interval);
             }
             const again = committedQueueStream(reserved_stream);
-            if (again.len <= stream.len) break;
-            stream = again;
+            if (again.len > stream.len) {
+                stream = again;
+                continue;
+            }
+            // No growth this round: if still ACQUIRE-sized and IB is large,
+            // keep waiting a bit more; otherwise stop.
+            if (stream.len > short_threshold or grow_round >= max_grow / 2) break;
         }
         if (stream.len == 0) continue;
         std.debug.print(

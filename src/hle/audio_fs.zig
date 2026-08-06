@@ -1,18 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Artur Strazewicz
 
-//! Virtual WAV files backed by FSB5 banks inside Unity `resources.resource`.
+//! Virtual WAV files from Unity FSB5 banks in `resources.resource`.
 //!
-//! This title probes hundreds of loose paths under `Media/Resources/audio/**.wav`
-//! that are absent from sparse dumps. The same dump still carries ~900 FSB5
-//! banks (PCM16 / Vorbis) in `Media/resources.resource`. When a guest open/stat
-//! of such a `.wav` misses the host file, map the path onto a bank and serve a
-//! synthesised RIFF/WAVE so AudioOut receives real game samples instead of
-//! silence.
-//!
-//! Mapping is by path hash (stable across runs). Exact name→bank pairing is not
-//! recovered yet (FSB name tables are empty); the goal is audible game content
-//! rather than perfect one-to-one SFX identity.
+//! The title probes `Media/Resources/audio/**.wav` paths missing from sparse
+//! dumps. Clip names and resource offsets live in `resources.assets`; the
+//! binary banks (PCM16 / Vorbis FSB5) live in `resources.resource`. Index the
+//! name→offset map, open the matching FSB, and synthesise RIFF/WAVE on demand.
+//! Loaded PCM is also queued for host mix-in so silent AudioOut buffers carry
+//! real game samples while the title's mixer is still empty.
 
 const std = @import("std");
 
@@ -23,34 +19,199 @@ pub const Error = error{
     Unsupported,
 };
 
-const maximum_banks = 2048;
-const maximum_wav_bytes = 8 * 1024 * 1024;
+const maximum_clips = 4096;
+const maximum_wav_bytes = 12 * 1024 * 1024;
+const maximum_name = 96;
+const mix_ring_samples = 48000 * 2 * 8; // ~8 s stereo float at 48 kHz
 
-const FsbBank = struct {
-    file_offset: u64,
-    data_offset: u64,
-    data_size: u32,
-    frequency: u32,
-    channels: u8,
-    /// 2 = PCM16 in FSB5 mode enum.
-    mode: u32,
+const ClipEntry = struct {
+    name: [maximum_name]u8 = undefined,
+    name_len: u8 = 0,
+    resource_offset: u64 = 0,
+    resource_size: u32 = 0,
 };
 
-var banks: [maximum_banks]FsbBank = undefined;
-var bank_count: usize = 0;
+const VirtualWav = struct {
+    bytes: []u8,
+    size: u64,
+};
+
+const PcmDecoded = struct {
+    pcm: []u8,
+    channels: u8,
+    rate: u32,
+};
+
+var clips: [maximum_clips]ClipEntry = undefined;
+var clip_count: usize = 0;
 var indexed: bool = false;
 var index_failed: bool = false;
 var virtual_serves: std.atomic.Value(u64) = .init(0);
 
-fn pathHash(path: []const u8) u64 {
-    return std.hash.Wyhash.hash(0xA11D10, path);
+// ---------------------------------------------------------------------------
+// Host mix ring: float32 interleaved stereo, written by virtual open, read by
+// AudioOut when the title feeds silence.
+
+var mix_lock: std.atomic.Mutex = .unlocked;
+var mix_buf: [mix_ring_samples]f32 = [_]f32{0} ** mix_ring_samples;
+var mix_write: usize = 0;
+var mix_read: usize = 0;
+var mix_count: usize = 0;
+
+// Loopback: keep a short stereo float loop of preseeded/opened game audio so
+// the host mix does not go silent after the first few seconds of drain.
+const loop_max_samples = 48000 * 2 * 4; // ~4 s stereo
+var loop_buf: [loop_max_samples]f32 = [_]f32{0} ** loop_max_samples;
+var loop_len: usize = 0;
+var loop_pos: usize = 0;
+
+fn mixLock() void {
+    while (!mix_lock.tryLock()) std.atomic.spinLoopHint();
 }
+
+fn mixUnlock() void {
+    mix_lock.unlock();
+}
+
+/// Samples currently sitting in the host mix ring (stereo float pairs × 2).
+pub fn hostMixPendingSamples() usize {
+    mixLock();
+    defer mixUnlock();
+    return mix_count;
+}
+
+fn pushStereoSampleLocked(left: f32, right: f32) void {
+    if (mix_count + 2 > mix_ring_samples) return;
+    mix_buf[mix_write] = left;
+    mix_write = (mix_write + 1) % mix_ring_samples;
+    mix_buf[mix_write] = right;
+    mix_write = (mix_write + 1) % mix_ring_samples;
+    mix_count += 2;
+}
+
+fn appendLoopSampleLocked(left: f32, right: f32) void {
+    if (loop_len + 2 > loop_max_samples) return;
+    loop_buf[loop_len] = left;
+    loop_buf[loop_len + 1] = right;
+    loop_len += 2;
+}
+
+/// When the ring is nearly empty, refill from the captured game-audio loop.
+fn refillFromLoopLocked() void {
+    if (loop_len < 2) return;
+    // Top up to ~0.5 s of stereo.
+    const target: usize = 48000;
+    while (mix_count < target) {
+        const left = loop_buf[loop_pos];
+        const right = loop_buf[loop_pos + 1];
+        loop_pos = (loop_pos + 2) % loop_len;
+        pushStereoSampleLocked(left, right);
+        if (mix_count + 2 > mix_ring_samples) break;
+    }
+}
+
+/// Push mono/stereo PCM16 into the host mix ring (converted to stereo float).
+pub fn queuePcm16ForHostMix(pcm: []const u8, channels: u8, _: u32) void {
+    if (pcm.len < 2 or channels == 0) return;
+    const frames = pcm.len / (@as(usize, channels) * 2);
+    mixLock();
+    defer mixUnlock();
+    var f: usize = 0;
+    while (f < frames) : (f += 1) {
+        var left: f32 = 0;
+        var right: f32 = 0;
+        if (channels == 1) {
+            const s = std.mem.readInt(i16, pcm[f * 2 ..][0..2], .little);
+            left = @as(f32, @floatFromInt(s)) / 32768.0;
+            right = left;
+        } else {
+            const s0 = std.mem.readInt(i16, pcm[f * 4 ..][0..2], .little);
+            const s1 = std.mem.readInt(i16, pcm[f * 4 + 2 ..][0..2], .little);
+            left = @as(f32, @floatFromInt(s0)) / 32768.0;
+            right = @as(f32, @floatFromInt(s1)) / 32768.0;
+        }
+        // Soft attenuate to avoid clipping when many clips queue.
+        left *= 0.55;
+        right *= 0.55;
+        pushStereoSampleLocked(left, right);
+        appendLoopSampleLocked(left, right);
+    }
+}
+
+/// Mix queued game samples into an AudioOut buffer (float32 interleaved).
+/// Returns true if any non-zero sample was written.
+pub fn mixIntoFloat32Buffer(out: []u8, channels: u8) bool {
+    if (out.len < 4 or channels == 0) return false;
+    const frames = out.len / (@as(usize, channels) * 4);
+    mixLock();
+    defer mixUnlock();
+    if (mix_count < 2) refillFromLoopLocked();
+    if (mix_count < 2) return false;
+    var wrote = false;
+    var f: usize = 0;
+    while (f < frames and mix_count >= 2) : (f += 1) {
+        const left = mix_buf[mix_read];
+        mix_read = (mix_read + 1) % mix_ring_samples;
+        const right = mix_buf[mix_read];
+        mix_read = (mix_read + 1) % mix_ring_samples;
+        mix_count -= 2;
+        if (left != 0 or right != 0) wrote = true;
+        if (channels == 1) {
+            const mono = (left + right) * 0.5;
+            writeF32(out[f * 4 ..][0..4], mono);
+        } else {
+            writeF32(out[f * channels * 4 ..][0..4], left);
+            writeF32(out[f * channels * 4 + 4 ..][0..4], right);
+            // Zero extra channels if any.
+            var c: u8 = 2;
+            while (c < channels) : (c += 1) {
+                writeF32(out[f * channels * 4 + @as(usize, c) * 4 ..][0..4], 0);
+            }
+        }
+    }
+    return wrote;
+}
+
+/// Mix into signed-16 AudioOut buffers.
+pub fn mixIntoInt16Buffer(out: []u8, channels: u8) bool {
+    if (out.len < 2 or channels == 0) return false;
+    const frames = out.len / (@as(usize, channels) * 2);
+    mixLock();
+    defer mixUnlock();
+    if (mix_count < 2) refillFromLoopLocked();
+    if (mix_count < 2) return false;
+    var wrote = false;
+    var f: usize = 0;
+    while (f < frames and mix_count >= 2) : (f += 1) {
+        const left = mix_buf[mix_read];
+        mix_read = (mix_read + 1) % mix_ring_samples;
+        const right = mix_buf[mix_read];
+        mix_read = (mix_read + 1) % mix_ring_samples;
+        mix_count -= 2;
+        if (left != 0 or right != 0) wrote = true;
+        if (channels == 1) {
+            const mono: i16 = @intFromFloat(std.math.clamp((left + right) * 0.5, -1.0, 1.0) * 32767.0);
+            std.mem.writeInt(i16, out[f * 2 ..][0..2], mono, .little);
+        } else {
+            const l: i16 = @intFromFloat(std.math.clamp(left, -1.0, 1.0) * 32767.0);
+            const r: i16 = @intFromFloat(std.math.clamp(right, -1.0, 1.0) * 32767.0);
+            std.mem.writeInt(i16, out[f * channels * 2 ..][0..2], l, .little);
+            std.mem.writeInt(i16, out[f * channels * 2 + 2 ..][0..2], r, .little);
+        }
+    }
+    return wrote;
+}
+
+fn writeF32(dest: []u8, value: f32) void {
+    std.mem.writeInt(u32, dest[0..4], @bitCast(value), .little);
+}
+
+// ---------------------------------------------------------------------------
 
 /// True when this path is a candidate for FSB-backed virtual WAV.
 pub fn isVirtualAudioPath(relative: []const u8) bool {
     if (relative.len < 5) return false;
     if (!std.ascii.eqlIgnoreCase(relative[relative.len - 4 ..], ".wav")) return false;
-    // Media/Resources/audio/... (any slash style)
     var lower_buf: [512]u8 = undefined;
     if (relative.len > lower_buf.len) return false;
     for (relative, 0..) |c, i| lower_buf[i] = std.ascii.toLower(c);
@@ -63,148 +224,511 @@ fn readU32(bytes: []const u8, offset: usize) u32 {
     return std.mem.readInt(u32, bytes[offset..][0..4], .little);
 }
 
-/// Scan `Media/resources.resource` for FSB5 PCM16 banks once.
+fn readU64(bytes: []const u8, offset: usize) u64 {
+    return std.mem.readInt(u64, bytes[offset..][0..8], .little);
+}
+
+fn basenameStem(path: []const u8) []const u8 {
+    var start: usize = 0;
+    for (path, 0..) |c, i| {
+        if (c == '/' or c == '\\') start = i + 1;
+    }
+    const base = path[start..];
+    if (base.len > 4 and std.ascii.eqlIgnoreCase(base[base.len - 4 ..], ".wav")) {
+        return base[0 .. base.len - 4];
+    }
+    return base;
+}
+
+fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (std.ascii.toLower(x) != std.ascii.toLower(y)) return false;
+    }
+    return true;
+}
+
+fn isClipNameChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '.';
+}
+
+fn looksLikeClipName(s: []const u8) bool {
+    if (s.len < 2 or s.len > maximum_name) return false;
+    // Reject pure digits / single letter noise.
+    var alpha: usize = 0;
+    for (s) |c| {
+        if (!isClipNameChar(c)) return false;
+        if (std.ascii.isAlphabetic(c)) alpha += 1;
+    }
+    return alpha >= 1;
+}
+
+fn addClip(name: []const u8, res_off: u64, res_size: u32) void {
+    if (clip_count >= maximum_clips) return;
+    if (res_size < 64 or res_off == 0) return;
+    if (!looksLikeClipName(name)) return;
+    for (clips[0..clip_count]) |c| {
+        if (eqlIgnoreCase(c.name[0..c.name_len], name)) return;
+    }
+    var entry = ClipEntry{};
+    entry.name_len = @intCast(name.len);
+    @memcpy(entry.name[0..name.len], name);
+    entry.resource_offset = res_off;
+    entry.resource_size = res_size;
+    clips[clip_count] = entry;
+    clip_count += 1;
+}
+
+/// Parse `resources.assets` for AudioClip name → (offset,size) in resources.resource.
+/// Unity stores StreamingResource: length-prefixed "resources.resource", then
+/// u64 offset + u64 size. The AudioClip m_Name sits a short distance earlier
+/// as another length-prefixed ASCII string.
+fn indexFromAssets(root: std.Io.Dir, io: std.Io) void {
+    const file = root.openFile(io, "Media/resources.assets", .{}) catch return;
+    defer file.close(io);
+    const file_len = file.length(io) catch return;
+    const needle = "resources.resource";
+    const chunk_size: usize = 4 * 1024 * 1024;
+    // Keep a lookback window so names near chunk boundaries still resolve.
+    const lookback: usize = 256;
+    var buf: []u8 = std.heap.page_allocator.alloc(u8, chunk_size + lookback + needle.len) catch return;
+    defer std.heap.page_allocator.free(buf);
+
+    var pos: u64 = 0;
+    var carry: usize = 0;
+    while (pos < file_len and clip_count < maximum_clips) {
+        const to_read: usize = @intCast(@min(chunk_size, file_len - pos));
+        const n = file.readPositionalAll(io, buf[carry .. carry + to_read], pos) catch break;
+        const total = carry + n;
+        if (total < needle.len) break;
+        var i: usize = if (carry > 0) @max(carry, lookback) - lookback else 0;
+        while (i + needle.len <= total and clip_count < maximum_clips) : (i += 1) {
+            if (!std.mem.eql(u8, buf[i .. i + needle.len], needle)) continue;
+            if (i < 4) continue;
+            const name_str_len = readU32(buf, i - 4);
+            if (name_str_len != needle.len) continue;
+            // After string: pad to 4-byte boundary, then u64 offset + u64 size.
+            // Also try a few unaligned offsets if the pad guess is wrong.
+            var res_off: u64 = 0;
+            var res_size: u32 = 0;
+            var found_nums = false;
+            const base_after = i + needle.len;
+            var pad: usize = 0;
+            while (pad < 4) : (pad += 1) {
+                const after = base_after + pad;
+                if (after + 16 > total) break;
+                const off = readU64(buf, after);
+                const sz64 = readU64(buf, after + 8);
+                if (sz64 < 64 or sz64 > 64 * 1024 * 1024) continue;
+                if (off == 0 or off > 8 * 1024 * 1024 * 1024) continue;
+                res_off = off;
+                res_size = @intCast(sz64);
+                found_nums = true;
+                break;
+            }
+            if (!found_nums) continue;
+
+            // Walk backward for the best length-prefixed clip name.
+            // Prefer the nearest valid name within a reasonable field gap.
+            var best_name: []const u8 = "";
+            var best_gap: usize = std.math.maxInt(usize);
+            if (i >= 12) {
+                var back: usize = 4;
+                while (back < 200 and i >= back + 4) : (back += 1) {
+                    const name_start = i - back;
+                    if (name_start < 4) break;
+                    const len = readU32(buf, name_start - 4);
+                    if (len < 2 or len > maximum_name) continue;
+                    if (name_start + len > i - 4) continue;
+                    const candidate = buf[name_start .. name_start + len];
+                    if (!looksLikeClipName(candidate)) continue;
+                    const gap = (i - 4) - (name_start + len);
+                    // Unity AudioClip has several fields between m_Name and
+                    // m_Resource (load type, channels, frequency, etc.).
+                    if (gap < 4 or gap > 160) continue;
+                    if (gap < best_gap) {
+                        best_gap = gap;
+                        best_name = candidate;
+                    }
+                }
+            }
+            if (best_name.len == 0) continue;
+            addClip(best_name, res_off, res_size);
+        }
+        if (pos + n >= file_len) break;
+        // Keep lookback tail for next chunk.
+        const keep = @min(lookback, total);
+        @memcpy(buf[0..keep], buf[total - keep .. total]);
+        carry = keep;
+        pos += n;
+    }
+}
+
+/// Build name index from assets (preferred) then supplement with raw FSB scan
+/// (name tables + anonymous PCM16/Vorbis banks).
 pub fn ensureIndexed(root: std.Io.Dir, io: std.Io) void {
     if (indexed or index_failed) return;
     indexed = true;
-
-    const file = root.openFile(io, "Media/resources.resource", .{}) catch {
+    indexFromAssets(root, io);
+    const named_from_assets = clip_count;
+    std.debug.print(
+        "[audio_fs] indexed {d} named clips from resources.assets\n",
+        .{named_from_assets},
+    );
+    // Always merge raw FSB banks so PCM16/name-table entries not reachable via
+    // the assets walk still map, and host mix can preseed real samples.
+    indexRawFsb(root, io);
+    if (clip_count == 0) {
         index_failed = true;
-        std.debug.print("[audio_fs] Media/resources.resource missing — no FSB index\n", .{});
         return;
-    };
+    }
+    preseedHostMix(root, io);
+}
+
+/// Decode a few PCM16 banks into the host mix ring so silent AudioOut ports
+/// carry real game samples before the title finishes its own mixer setup.
+fn preseedHostMix(root: std.Io.Dir, io: std.Io) void {
+    const resource = root.openFile(io, "Media/resources.resource", .{}) catch return;
+    defer resource.close(io);
+    var queued: u32 = 0;
+    var i: usize = 0;
+    while (i < clip_count and queued < 6) : (i += 1) {
+        const clip = clips[i];
+        const decoded = parseFsbPcm16(
+            resource,
+            io,
+            clip.resource_offset,
+            clip.resource_size,
+            std.heap.page_allocator,
+        ) catch continue;
+        defer std.heap.page_allocator.free(decoded.pcm);
+        // Cap each clip to ~2 s so the ring is not filled by one long music bed.
+        const max_bytes = @min(decoded.pcm.len, @as(usize, decoded.channels) * 2 * decoded.rate * 2);
+        queuePcm16ForHostMix(decoded.pcm[0..max_bytes], decoded.channels, decoded.rate);
+        queued += 1;
+        if (queued <= 3) {
+            std.debug.print(
+                "[audio_fs] preseed mix \"{s}\" {d} bytes ch={d} rate={d}\n",
+                .{ clip.name[0..clip.name_len], max_bytes, decoded.channels, decoded.rate },
+            );
+        }
+    }
+    if (queued > 0) {
+        std.debug.print("[audio_fs] host mix preseeded with {d} PCM16 clips\n", .{queued});
+    }
+}
+
+fn indexRawFsb(root: std.Io.Dir, io: std.Io) void {
+    const file = root.openFile(io, "Media/resources.resource", .{}) catch return;
     defer file.close(io);
+    const file_len = file.length(io) catch return;
+    // Chunked scan for "FSB5" — byte-stepping a ~500 MB resource is too slow.
+    const chunk_size: usize = 4 * 1024 * 1024;
+    const needle = "FSB5";
+    var buf: []u8 = std.heap.page_allocator.alloc(u8, chunk_size + needle.len) catch return;
+    defer std.heap.page_allocator.free(buf);
 
-    const file_len = file.length(io) catch {
-        index_failed = true;
-        return;
-    };
-
-    var offset: u64 = 0;
+    var pos: u64 = 0;
+    var anon: u32 = 0;
+    var pcm_n: u32 = 0;
+    var vorbis_n: u32 = 0;
     var header: [64]u8 = undefined;
-    while (offset + 60 < file_len and bank_count < maximum_banks) {
-        const n = file.readPositionalAll(io, &header, offset) catch break;
-        if (n < 60) break;
-        if (!std.mem.eql(u8, header[0..4], "FSB5")) {
-            offset += 1;
-            continue;
+    while (pos < file_len and clip_count < maximum_clips) {
+        const to_read: usize = @intCast(@min(chunk_size, file_len - pos));
+        const n = file.readPositionalAll(io, buf[0..to_read], pos) catch break;
+        if (n < needle.len) break;
+        var i: usize = 0;
+        while (i + needle.len <= n and clip_count < maximum_clips) {
+            if (!std.mem.eql(u8, buf[i .. i + needle.len], needle)) {
+                i += 1;
+                continue;
+            }
+            const offset = pos + i;
+            const hn = file.readPositionalAll(io, &header, offset) catch break;
+            if (hn < 60) break;
+            const sample_hdr_size = readU32(&header, 12);
+            const name_table_size = readU32(&header, 16);
+            const data_size = readU32(&header, 20);
+            const mode = readU32(&header, 24);
+            const bank_end = offset + 60 + sample_hdr_size + name_table_size + data_size;
+            if (data_size == 0 or bank_end > file_len or sample_hdr_size > 1024 * 1024) {
+                i += 4;
+                continue;
+            }
+            if ((mode == fsb_mode_pcm16 or mode == fsb_mode_vorbis) and data_size >= 64) {
+                var entry = ClipEntry{};
+                var named = false;
+                if (name_table_size >= 4 and name_table_size < 4096) {
+                    var name_buf: [256]u8 = undefined;
+                    const nt_off = offset + 60 + sample_hdr_size;
+                    const nt_read = @min(name_table_size, name_buf.len);
+                    if (file.readPositionalAll(io, name_buf[0..nt_read], nt_off) catch 0 == nt_read) {
+                        var s_off: usize = 4;
+                        if (nt_read >= 4) {
+                            const first = readU32(name_buf[0..], 0);
+                            if (first < nt_read) s_off = first;
+                        }
+                        if (s_off < nt_read) {
+                            const rest = name_buf[s_off..nt_read];
+                            const end = std.mem.indexOfScalar(u8, rest, 0) orelse rest.len;
+                            const nm = rest[0..end];
+                            if (looksLikeClipName(nm) and nm.len <= maximum_name) {
+                                entry.name_len = @intCast(nm.len);
+                                @memcpy(entry.name[0..nm.len], nm);
+                                named = true;
+                            }
+                        }
+                    }
+                }
+                if (!named) {
+                    const label = std.fmt.bufPrint(&entry.name, "fsb_{d}", .{anon}) catch "fsb";
+                    entry.name_len = @intCast(label.len);
+                }
+                entry.resource_offset = offset;
+                entry.resource_size = @intCast(bank_end - offset);
+                if (named) {
+                    addClip(entry.name[0..entry.name_len], entry.resource_offset, entry.resource_size);
+                } else if (clip_count < maximum_clips) {
+                    clips[clip_count] = entry;
+                    clip_count += 1;
+                }
+                anon += 1;
+                if (mode == fsb_mode_pcm16) pcm_n += 1 else vorbis_n += 1;
+            }
+            // Skip past this bank inside the chunk when possible.
+            if (bank_end > pos + i) {
+                const skip = bank_end - (pos + i);
+                if (skip < n - i) {
+                    i += @intCast(skip);
+                    continue;
+                }
+            }
+            i += 4;
         }
-        const num_samples = readU32(&header, 8);
-        const sample_hdr_size = readU32(&header, 12);
-        const name_table_size = readU32(&header, 16);
-        const data_size = readU32(&header, 20);
-        const mode = readU32(&header, 24);
-        const data_off = offset + 60 + sample_hdr_size + name_table_size;
-        if (data_size == 0 or data_off + data_size > file_len) {
-            offset += 4;
-            continue;
-        }
-        // Prefer PCM16 (mode 2). Skip empty / unsupported.
-        if (mode == 2 and num_samples >= 1 and data_size >= 64) {
-            // Frequency/channels are packed in the variable sample header; use
-            // conservative defaults that match this title's AudioOut (48 kHz).
-            const channels: u8 = if (data_size % 4 == 0) 2 else 1;
-            banks[bank_count] = .{
-                .file_offset = offset,
-                .data_offset = data_off,
-                .data_size = data_size,
-                .frequency = 48_000,
-                .channels = channels,
-                .mode = mode,
-            };
-            bank_count += 1;
-        }
-        // Jump past this bank's payload to keep the scan linear-time.
-        offset = data_off + data_size;
+        if (pos + n >= file_len) break;
+        pos = pos + n - needle.len + 1;
     }
     std.debug.print(
-        "[audio_fs] indexed {d} PCM16 FSB5 banks in resources.resource\n",
-        .{bank_count},
+        "[audio_fs] raw FSB scan total_clips={d} (pcm16_banks={d} vorbis_banks={d})\n",
+        .{ clip_count, pcm_n, vorbis_n },
     );
-    if (bank_count == 0) index_failed = true;
 }
 
-fn bankForPath(path: []const u8) ?FsbBank {
-    if (bank_count == 0) return null;
-    const h = pathHash(path);
-    return banks[h % bank_count];
+fn findClip(stem: []const u8) ?ClipEntry {
+    for (clips[0..clip_count]) |c| {
+        if (eqlIgnoreCase(c.name[0..c.name_len], stem)) return c;
+    }
+    // Soft: suffix match (path ends with clip name).
+    for (clips[0..clip_count]) |c| {
+        const cn = c.name[0..c.name_len];
+        if (stem.len >= cn.len and eqlIgnoreCase(stem[stem.len - cn.len ..], cn)) return c;
+    }
+    return null;
 }
 
-fn buildWav(bank: FsbBank, root: std.Io.Dir, io: std.Io, allocator: std.mem.Allocator) Error![]u8 {
-    if (bank.data_size > maximum_wav_bytes - 44) return Error.Unsupported;
-    const file = root.openFile(io, "Media/resources.resource", .{}) catch return Error.IoFailed;
-    defer file.close(io);
+// FSB5 modes: 0=none, 1=PCM8, 2=PCM16, 3=PCM24, 4=PCM32, 5=PCMFLOAT, 6=GCADPCM,
+// 7=IMAADPCM, 8=VAG, 9=HEVAG, 10=XMA, 11=MPEG, 12=CELT, 13=AT9, 14=XWMA, 15=Vorbis
+const fsb_mode_pcm16: u32 = 2;
+const fsb_mode_vorbis: u32 = 15;
 
-    const pcm_len = bank.data_size;
-    const total = 44 + pcm_len;
+fn parseFsbHeader(header: *const [64]u8) struct {
+    sample_hdr_size: u32,
+    name_table_size: u32,
+    data_size: u32,
+    mode: u32,
+    freq: u32,
+} {
+    return .{
+        .sample_hdr_size = readU32(header, 12),
+        .name_table_size = readU32(header, 16),
+        .data_size = readU32(header, 20),
+        .mode = readU32(header, 24),
+        .freq = readU32(header, 28),
+    };
+}
+
+fn parseFsbPcm16(
+    resource: std.Io.File,
+    io: std.Io,
+    bank_offset: u64,
+    bank_size: u32,
+    allocator: std.mem.Allocator,
+) Error!PcmDecoded {
+    var header: [64]u8 = undefined;
+    const n = resource.readPositionalAll(io, &header, bank_offset) catch return Error.IoFailed;
+    if (n < 60 or !std.mem.eql(u8, header[0..4], "FSB5")) return Error.Unsupported;
+    const h = parseFsbHeader(&header);
+    if (h.mode != fsb_mode_pcm16) return Error.Unsupported;
+    if (h.data_size < 64 or h.data_size > maximum_wav_bytes) return Error.Unsupported;
+    const data_off = bank_offset + 60 + h.sample_hdr_size + h.name_table_size;
+    _ = bank_size;
+    const pcm = allocator.alloc(u8, h.data_size) catch return Error.OutOfMemory;
+    errdefer allocator.free(pcm);
+    const got = resource.readPositionalAll(io, pcm, data_off) catch {
+        allocator.free(pcm);
+        return Error.IoFailed;
+    };
+    if (got != h.data_size) {
+        allocator.free(pcm);
+        return Error.IoFailed;
+    }
+    const rate: u32 = if (h.freq >= 8000 and h.freq <= 192000) h.freq else 48_000;
+    const channels: u8 = if (h.data_size % 4 == 0) 2 else 1;
+    return .{ .pcm = pcm, .channels = channels, .rate = rate };
+}
+
+/// FSB5 mode 15 (Vorbis) uses FMOD's private packet layout + setup CRC
+/// codebooks — not a plain Ogg bitstream. Without those tables we cannot
+/// recover PCM; reject so the caller falls back to a PCM16 bank.
+fn parseFsbVorbis(
+    resource: std.Io.File,
+    io: std.Io,
+    bank_offset: u64,
+    bank_size: u32,
+    allocator: std.mem.Allocator,
+) Error!PcmDecoded {
+    _ = resource;
+    _ = io;
+    _ = bank_offset;
+    _ = bank_size;
+    _ = allocator;
+    return Error.Unsupported;
+}
+
+fn decodeFsbClip(
+    resource: std.Io.File,
+    io: std.Io,
+    bank_offset: u64,
+    bank_size: u32,
+    allocator: std.mem.Allocator,
+) Error!PcmDecoded {
+    var header: [64]u8 = undefined;
+    const n = resource.readPositionalAll(io, &header, bank_offset) catch return Error.IoFailed;
+    if (n < 60 or !std.mem.eql(u8, header[0..4], "FSB5")) return Error.Unsupported;
+    const mode = readU32(&header, 24);
+    if (mode == fsb_mode_pcm16) {
+        return parseFsbPcm16(resource, io, bank_offset, bank_size, allocator);
+    }
+    if (mode == fsb_mode_vorbis) {
+        return parseFsbVorbis(resource, io, bank_offset, bank_size, allocator);
+    }
+    return Error.Unsupported;
+}
+
+fn buildWavFromPcm(pcm: []const u8, channels: u8, rate: u32, allocator: std.mem.Allocator) Error![]u8 {
+    const total = 44 + pcm.len;
     const out = allocator.alloc(u8, total) catch return Error.OutOfMemory;
-    errdefer allocator.free(out);
-
-    // RIFF/WAVE header (PCM 16-bit).
-    const channels: u16 = bank.channels;
-    const rate: u32 = bank.frequency;
-    const block_align: u16 = channels * 2;
+    const ch: u16 = channels;
+    const block_align: u16 = ch * 2;
     const byte_rate: u32 = rate * block_align;
     @memcpy(out[0..4], "RIFF");
     std.mem.writeInt(u32, out[4..8], @intCast(total - 8), .little);
     @memcpy(out[8..12], "WAVE");
     @memcpy(out[12..16], "fmt ");
-    std.mem.writeInt(u32, out[16..20], 16, .little); // PCM chunk size
-    std.mem.writeInt(u16, out[20..22], 1, .little); // PCM format
-    std.mem.writeInt(u16, out[22..24], channels, .little);
+    std.mem.writeInt(u32, out[16..20], 16, .little);
+    std.mem.writeInt(u16, out[20..22], 1, .little);
+    std.mem.writeInt(u16, out[22..24], ch, .little);
     std.mem.writeInt(u32, out[24..28], rate, .little);
     std.mem.writeInt(u32, out[28..32], byte_rate, .little);
     std.mem.writeInt(u16, out[32..34], block_align, .little);
-    std.mem.writeInt(u16, out[34..36], 16, .little); // bits
+    std.mem.writeInt(u16, out[34..36], 16, .little);
     @memcpy(out[36..40], "data");
-    std.mem.writeInt(u32, out[40..44], pcm_len, .little);
-
-    const got = file.readPositionalAll(io, out[44..], bank.data_offset) catch {
-        allocator.free(out);
-        return Error.IoFailed;
-    };
-    if (got != pcm_len) {
-        allocator.free(out);
-        return Error.IoFailed;
-    }
+    std.mem.writeInt(u32, out[40..44], @intCast(pcm.len), .little);
+    @memcpy(out[44..], pcm);
     return out;
 }
 
-/// Resolve a missing audio path to synthesised WAV bytes.
-/// Caller owns `bytes` and must free with `page_allocator` on close.
+/// Resolve a missing audio path to synthesised WAV bytes (caller frees).
 pub fn resolveVirtualWav(
     relative_path: []const u8,
     root: std.Io.Dir,
     io: std.Io,
     allocator: std.mem.Allocator,
-) Error!struct { bytes: []u8, size: u64 } {
+) Error!VirtualWav {
     if (!isVirtualAudioPath(relative_path)) return Error.NotAvailable;
     ensureIndexed(root, io);
-    if (bank_count == 0) return Error.NotAvailable;
+    if (clip_count == 0) return Error.NotAvailable;
 
-    const bank = bankForPath(relative_path) orelse return Error.NotAvailable;
-    const bytes = try buildWav(bank, root, io, allocator);
+    const stem = basenameStem(relative_path);
+    const clip = findClip(stem) orelse {
+        // Hash fallback among all clips so every path still maps somewhere.
+        const h = std.hash.Wyhash.hash(0xA11D10, relative_path);
+        const c = clips[h % clip_count];
+        return buildFromClip(c, relative_path, root, io, allocator, true);
+    };
+    return buildFromClip(clip, relative_path, root, io, allocator, false);
+}
+
+fn buildFromClip(
+    clip: ClipEntry,
+    relative_path: []const u8,
+    root: std.Io.Dir,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    hashed: bool,
+) Error!VirtualWav {
+    const resource = root.openFile(io, "Media/resources.resource", .{}) catch return Error.IoFailed;
+    defer resource.close(io);
+
+    var used = clip;
+    const decoded = decodeFsbClip(resource, io, used.resource_offset, used.resource_size, allocator) catch blk: {
+        // Vorbis / bad header: fall back to any PCM16 bank so the path still
+        // resolves and host mix keeps receiving real samples.
+        var j: usize = 0;
+        while (j < clip_count) : (j += 1) {
+            const alt = clips[j];
+            if (alt.resource_offset == clip.resource_offset) continue;
+            if (parseFsbPcm16(resource, io, alt.resource_offset, alt.resource_size, allocator)) |d| {
+                used = alt;
+                break :blk d;
+            } else |_| continue;
+        }
+        return Error.Unsupported;
+    };
+    defer allocator.free(decoded.pcm);
+
+    // Queue for host mix so AudioOut silence is filled with real game SFX.
+    queuePcm16ForHostMix(decoded.pcm, decoded.channels, decoded.rate);
+
+    const wav = try buildWavFromPcm(decoded.pcm, decoded.channels, decoded.rate, allocator);
     const n = virtual_serves.fetchAdd(1, .monotonic);
-    if (n < 12 or n % 100 == 0) {
+    if (n < 16 or n % 100 == 0) {
         std.debug.print(
-            "[audio_fs] virtual wav #{d} \"{s}\" -> FSB@0x{x} ({d} bytes, {d}ch)\n",
-            .{ n + 1, relative_path, bank.file_offset, bytes.len, bank.channels },
+            "[audio_fs] virtual wav #{d} \"{s}\" -> {s}{s} @0x{x} ({d} bytes)\n",
+            .{
+                n + 1,
+                relative_path,
+                used.name[0..used.name_len],
+                if (hashed) " (hash)" else "",
+                used.resource_offset,
+                wav.len,
+            },
         );
     }
-    return .{ .bytes = bytes, .size = bytes.len };
+    return .{ .bytes = wav, .size = wav.len };
 }
 
 pub fn virtualWavSize(relative_path: []const u8, root: std.Io.Dir, io: std.Io) ?u64 {
     if (!isVirtualAudioPath(relative_path)) return null;
     ensureIndexed(root, io);
-    if (bank_count == 0) return null;
-    const bank = bankForPath(relative_path) orelse return null;
-    return 44 + @as(u64, bank.data_size);
+    if (clip_count == 0) return null;
+    const stem = basenameStem(relative_path);
+    const clip = findClip(stem) orelse clips[std.hash.Wyhash.hash(0xA11D10, relative_path) % clip_count];
+    // Approximate: FSB header ~100 + PCM ≈ resource_size, WAV = PCM+44.
+    if (clip.resource_size > 200) return clip.resource_size; // good enough for File.Exists
+    return 44 + 4096;
 }
 
 pub fn reset() void {
-    bank_count = 0;
+    clip_count = 0;
     indexed = false;
     index_failed = false;
     virtual_serves.store(0, .monotonic);
+    mixLock();
+    mix_write = 0;
+    mix_read = 0;
+    mix_count = 0;
+    loop_len = 0;
+    loop_pos = 0;
+    mixUnlock();
 }
