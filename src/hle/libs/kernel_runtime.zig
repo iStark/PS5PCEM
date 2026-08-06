@@ -254,7 +254,7 @@ pub fn requestGuestStop() void {
     guest_stop_requested.store(true, .release);
 }
 
-fn guestStopRequested() bool {
+pub fn guestStopRequested() bool {
     return guest_stop_requested.load(.acquire);
 }
 

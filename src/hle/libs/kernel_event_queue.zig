@@ -323,6 +323,69 @@ pub fn deleteVideoOutFlipEvent(handle: i64) i32 {
     return KernelError.enoent.raw();
 }
 
+/// Registers a vblank edge (filter -13, distinct ident from flip).
+pub fn addVideoOutVblankEvent(handle: i64, user_data: u64) i32 {
+    return addRegistration(handle, @intCast(video_out_vblank_ident), .{
+        .edge = true,
+        .filter = video_out_filter,
+        .user_data = user_data,
+    });
+}
+
+pub fn deleteVideoOutVblankEvent(handle: i64) i32 {
+    lock.lock();
+    defer lock.unlock();
+    const queue = findQueue(handle) orelse return KernelError.ebadf.raw();
+    for (&queue.registrations) |*registration| {
+        if (!registration.active or registration.ident != video_out_vblank_ident or
+            registration.filter != video_out_filter)
+        {
+            continue;
+        }
+        registration.* = .{};
+        return errno.ok;
+    }
+    return KernelError.enoent.raw();
+}
+
+/// Delivers one vblank to every equeue that registered for it.
+pub fn triggerVideoOutVblank() usize {
+    var wake_handles: [maximum_queues]i64 = undefined;
+    var wake_sequences: [maximum_queues]u64 = undefined;
+    var wake_count: usize = 0;
+    const packed_data: i64 = @bitCast(video_out_vblank_ident);
+
+    lock.lock();
+    for (&queues) |*queue| {
+        if (!queue.active or queue.pending_count == maximum_events) continue;
+        const registration = for (queue.registrations) |candidate| {
+            if (candidate.active and candidate.ident == video_out_vblank_ident and
+                candidate.filter == video_out_filter)
+            {
+                break candidate;
+            }
+        } else continue;
+        const index = (queue.pending_head + queue.pending_count) % maximum_events;
+        queue.pending[index] = .{
+            .ident = video_out_vblank_ident,
+            .filter = video_out_filter,
+            .flags = event_add | event_clear,
+            .data = packed_data,
+            .user_data = registration.user_data,
+        };
+        queue.pending_count += 1;
+        queue.sequence +%= 1;
+        wake_handles[wake_count] = queue.handle;
+        wake_sequences[wake_count] = queue.sequence;
+        wake_count += 1;
+    }
+    lock.unlock();
+    for (wake_handles[0..wake_count], wake_sequences[0..wake_count]) |handle, sequence| {
+        threading.wakeWaiters(waitKey(handle), sequence, 1);
+    }
+    return wake_count;
+}
+
 /// Registers one AGC completion interrupt under the identifier selected by the
 /// graphics driver. Graphics uses zero; compute queues use their owner handle.
 pub fn addGraphicsEvent(handle: i64, id: i32, user_data: u64) i32 {

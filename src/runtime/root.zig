@@ -548,7 +548,9 @@ const ResolverContext = struct {
 fn preferHleImportId(id: []const u8) bool {
     return std.mem.eql(u8, id, "f3dg2CSgRKY") // sceAgcCreateShader
         or std.mem.eql(u8, id, "dolOmWH+huQ") // sceAgcGetFusedShaderSize
-        or std.mem.eql(u8, id, "fd5Bp5tGTgo"); // sceAgcFuseShaderHalves
+        or std.mem.eql(u8, id, "fd5Bp5tGTgo") // sceAgcFuseShaderHalves
+        // Guest libSceAgc SuspendPoint busy-waits / TRC-spams without a real GPU.
+        or std.mem.eql(u8, id, "h9z6+0hEydk"); // sceAgcSuspendPoint
 }
 
 fn resolveHleExact(context: *const ResolverContext, import: *const loader.Import, symbol_type: hle.SymbolType) ?u64 {

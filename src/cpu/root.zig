@@ -208,6 +208,8 @@ threadlocal var handling_native_fault = false;
 pub var fs_base_restorations: std.atomic.Value(usize) = .init(0);
 /// How many `cmp [null+disp], imm` probes were stepped past during bring-up.
 pub var null_object_compare_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many `mov/movzx/movsx dest, [null+disp]` loads were zeroed and stepped past.
+pub var null_memory_load_recoveries: std.atomic.Value(u64) = .init(0);
 
 /// Direct System V AMD64 execution on a Windows x86-64 host.
 ///
@@ -594,6 +596,22 @@ const WindowsX64Machine = struct {
             );
             return exception_continue_execution;
         }
+        // The null path often continues with field loads (`mov rax, [rbx+0x10]`).
+        // Soft-zero the destination and step past so bring-up can keep going.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0)
+        {
+            const fault_rip = context.Rip;
+            if (tryEmulateNullMemoryLoad(context, record.ExceptionInformation[1])) {
+                _ = null_memory_load_recoveries.fetchAdd(1, .monotonic);
+                std.debug.print(
+                    "[cpu] recovered null-memory load @rip=0x{x} addr=0x{x} (#{d})\n",
+                    .{ fault_rip, record.ExceptionInformation[1], null_memory_load_recoveries.load(.monotonic) },
+                );
+                return exception_continue_execution;
+            }
+        }
 
         if (handling_native_fault) return std.os.windows.EXCEPTION_CONTINUE_SEARCH;
         // A call through a function pointer that was never filled in leaves
@@ -723,6 +741,133 @@ const WindowsX64Machine = struct {
         context.EFlags = flags;
         context.Rip += length;
         return true;
+    }
+
+    /// Emulates integer loads from the first page as reading zeros.
+    /// Handles common MOV / MOVZX / MOVSX / MOVSXD forms used after null checks.
+    fn tryEmulateNullMemoryLoad(context: *std.os.windows.CONTEXT, memory_address: u64) bool {
+        if (memory_address >= lost_base_window) return false;
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        var offset: usize = 0;
+        var rex: u8 = 0;
+        if (code[0] & 0xf0 == 0x40) {
+            rex = code[0];
+            offset = 1;
+        }
+        const opcode0 = code[offset];
+
+        // Two-byte opcodes: 0F B6/B7/BE/BF (MOVZX/MOVSX).
+        if (opcode0 == 0x0f) {
+            const opcode1 = code[offset + 1];
+            const kind: enum { movzx8, movzx16, movsx8, movsx16 } = switch (opcode1) {
+                0xb6 => .movzx8,
+                0xb7 => .movzx16,
+                0xbe => .movsx8,
+                0xbf => .movsx16,
+                else => return false,
+            };
+            const modrm = code[offset + 2];
+            const mem_len = modrmMemoryOperandLength(modrm, code[offset + 3 ..]) orelse return false;
+            const length = offset + 3 + mem_len;
+            if (length > 15) return false;
+            const reg = @as(u4, @truncate(((modrm >> 3) & 7) | ((rex & 0x04) << 1)));
+            // Zero-extend / sign-extend of zero is still zero.
+            _ = kind;
+            writeGpr(context, reg, 0);
+            context.Rip += length;
+            return true;
+        }
+
+        // One-byte loads: 8A r8,[m] / 8B r,[m] / 63 MOVSXD r64,[m32].
+        const op_kind: enum { mov8, mov_gp, movsxd } = switch (opcode0) {
+            0x8a => .mov8,
+            0x8b => .mov_gp,
+            0x63 => .movsxd,
+            else => return false,
+        };
+        const modrm = code[offset + 1];
+        const mem_len = modrmMemoryOperandLength(modrm, code[offset + 2 ..]) orelse return false;
+        const length = offset + 2 + mem_len;
+        if (length > 15) return false;
+        const reg = @as(u4, @truncate(((modrm >> 3) & 7) | ((rex & 0x04) << 1)));
+        switch (op_kind) {
+            .mov8 => {
+                // 8-bit write leaves upper bits alone; soft-zero only the low byte.
+                const current = readGpr(context, reg);
+                writeGpr(context, reg, current & ~@as(u64, 0xff));
+            },
+            .mov_gp => {
+                // REX.W → 64-bit; else 32-bit (zeros upper half).
+                writeGpr(context, reg, 0);
+            },
+            .movsxd => writeGpr(context, reg, 0),
+        }
+        context.Rip += length;
+        return true;
+    }
+
+    /// Bytes following ModRM for a memory operand (SIB + displacement), or null
+    /// when the form is register-only / unsupported.
+    fn modrmMemoryOperandLength(modrm: u8, after_modrm: [*]const u8) ?usize {
+        const mod = modrm >> 6;
+        const rm = modrm & 7;
+        if (mod == 3) return null; // register form
+        var length: usize = 0;
+        if (rm == 4) {
+            // SIB present.
+            length += 1;
+            const sib = after_modrm[0];
+            const base = sib & 7;
+            if (mod == 0 and base == 5) length += 4; // disp32 with no base
+        } else if (mod == 0 and rm == 5) {
+            // RIP-relative: not a null-object field load we care about.
+            return null;
+        }
+        if (mod == 1) length += 1;
+        if (mod == 2) length += 4;
+        return length;
+    }
+
+    fn readGpr(context: *std.os.windows.CONTEXT, index: u4) u64 {
+        return switch (index) {
+            0 => context.Rax,
+            1 => context.Rcx,
+            2 => context.Rdx,
+            3 => context.Rbx,
+            4 => context.Rsp,
+            5 => context.Rbp,
+            6 => context.Rsi,
+            7 => context.Rdi,
+            8 => context.R8,
+            9 => context.R9,
+            10 => context.R10,
+            11 => context.R11,
+            12 => context.R12,
+            13 => context.R13,
+            14 => context.R14,
+            15 => context.R15,
+        };
+    }
+
+    fn writeGpr(context: *std.os.windows.CONTEXT, index: u4, value: u64) void {
+        switch (index) {
+            0 => context.Rax = value,
+            1 => context.Rcx = value,
+            2 => context.Rdx = value,
+            3 => context.Rbx = value,
+            4 => context.Rsp = value,
+            5 => context.Rbp = value,
+            6 => context.Rsi = value,
+            7 => context.Rdi = value,
+            8 => context.R8 = value,
+            9 => context.R9 = value,
+            10 => context.R10 = value,
+            11 => context.R11 = value,
+            12 => context.R12 = value,
+            13 => context.R13 = value,
+            14 => context.R14 = value,
+            15 => context.R15 = value,
+        }
     }
 
     fn tryEmulateIllegalInstruction(context: *std.os.windows.CONTEXT) bool {

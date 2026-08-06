@@ -6,6 +6,7 @@
 //! handles and output structures so a title can pass initialization safely.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const abi = @import("../abi.zig");
 const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
@@ -251,8 +252,44 @@ fn validVideoHandle(handle: i32) bool {
     return video_out.validHandle(handle);
 }
 
+/// Host-side ~60 Hz refresh so WaitEqueue(vblank) keeps waking between flips.
+var vblank_ticker_started: std.atomic.Value(bool) = .init(false);
+
+fn hostSleepMilliseconds(ms: u32) void {
+    if (comptime builtin.os.tag != .windows) return;
+    // Negative 100-ns units = relative delay (not wall-clock sensitive).
+    var interval: i64 = -@as(i64, @intCast(ms)) * 10_000;
+    _ = std.os.windows.ntdll.NtDelayExecution(.FALSE, &interval);
+}
+
+fn vblankTickerMain() void {
+    while (!kernel_runtime.guestStopRequested()) {
+        // Host sleep: this thread is not a guest pthread, so sceKernelUsleep
+        // would return ENOSYS and spin.
+        hostSleepMilliseconds(16);
+        if (!video_out.validHandle(video_out.primary_handle)) continue;
+        _ = video_out.advanceVblank(
+            kernel_runtime.processTimeMicroseconds(),
+            kernel_runtime.processTimeCounter(),
+        );
+        _ = kernel_event_queue.triggerVideoOutVblank();
+    }
+}
+
+fn ensureVblankTicker() void {
+    if (vblank_ticker_started.swap(true, .monotonic)) return;
+    const thread = std.Thread.spawn(.{}, vblankTickerMain, .{}) catch {
+        vblank_ticker_started.store(false, .monotonic);
+        return;
+    };
+    thread.detach();
+}
+
 fn videoOutOpen(_: i32, _: i32, index: i32, _: ?*const anyopaque) callconv(abi.guest) i32 {
-    return if (video_out.open(index)) video_out.primary_handle else video_out_error_invalid_handle;
+    if (!video_out.open(index)) return video_out_error_invalid_handle;
+    video_out.noteOpenProcessTime(kernel_runtime.processTimeMicroseconds());
+    ensureVblankTicker();
+    return video_out.primary_handle;
 }
 
 fn videoOutSetBufferAttribute2(
@@ -414,12 +451,61 @@ fn videoOutIsOutputSupported(handle: i32, _: u64, _: ?*const anyopaque, _: ?*any
 
 fn videoOutGetEventId(event: ?*const @import("kernel_event_queue.zig").Event) callconv(abi.guest) i32 {
     const value = event orelse return 0;
-    if (value.filter == kernel_event_queue.video_out_filter and
-        value.ident == kernel_event_queue.video_out_flip_ident)
-    {
-        return 0;
-    }
+    if (value.filter != kernel_event_queue.video_out_filter) return 0;
+    // 0 = flip, 1 = vblank (console convention).
+    if (value.ident == kernel_event_queue.video_out_flip_ident) return 0;
+    if (value.ident == kernel_event_queue.video_out_vblank_ident) return 1;
     return @bitCast(@as(u32, @truncate(value.ident)));
+}
+
+const VideoOutVblankStatus = extern struct {
+    count: u64 = 0,
+    process_time: u64 = 0,
+    reserved: u64 = 0,
+    process_time_counter: u64 = 0,
+    flags: u8 = 0,
+    phase: u8 = 0,
+    pad: [6]u8 = @splat(0),
+};
+
+fn videoOutAddVblankEvent(equeue: i64, handle: i32, user_data: u64) callconv(abi.guest) i32 {
+    if (!validVideoHandle(handle)) return video_out_error_invalid_handle;
+    return if (kernel_event_queue.addVideoOutVblankEvent(equeue, user_data) == errno.ok)
+        errno.ok
+    else
+        video_out_error_invalid_event_queue;
+}
+
+fn videoOutWaitVblank(handle: i32) callconv(abi.guest) i32 {
+    if (!validVideoHandle(handle)) return video_out_error_invalid_handle;
+    // Pace to ~60 Hz so titles that spin on vblank do not burn a core.
+    _ = kernel_threading.sceKernelUsleep(16_667);
+    _ = video_out.advanceVblank(
+        kernel_runtime.processTimeMicroseconds(),
+        kernel_runtime.processTimeCounter(),
+    );
+    _ = kernel_event_queue.triggerVideoOutVblank();
+    return errno.ok;
+}
+
+fn videoOutGetVblankStatus(handle: i32, status: ?*VideoOutVblankStatus) callconv(abi.guest) i32 {
+    if (!validVideoHandle(handle)) return video_out_error_invalid_handle;
+    const output = status orelse return video_out_error_invalid_address;
+    const current = video_out.vblankStatus(
+        handle,
+        kernel_runtime.processTimeMicroseconds(),
+        kernel_runtime.processTimeCounter(),
+    ) orelse return video_out_error_invalid_handle;
+    output.* = .{
+        .count = current.count,
+        .process_time = current.process_time,
+        .reserved = 0,
+        .process_time_counter = current.process_time_counter,
+        .flags = current.flags,
+        .phase = current.phase,
+        .pad = @splat(0),
+    };
+    return errno.ok;
 }
 
 fn videoOutAddFlipEvent(equeue: i64, handle: i32, user_data: u64) callconv(abi.guest) i32 {
@@ -513,6 +599,9 @@ const video_out_exports = [_]symbols.Export{
     .{ .name = "sceVideoOutSetFlipRate", .function = trace.wrap("sceVideoOutSetFlipRate", &videoHandleOption), .expect_id = "CBiu4mCE1DA" },
     .{ .name = "sceVideoOutAddFlipEvent", .function = trace.wrap("sceVideoOutAddFlipEvent", &videoOutAddFlipEvent), .expect_id = "HXzjK9yI30k" },
     .{ .name = "sceVideoOutDeleteFlipEvent", .function = trace.wrap("sceVideoOutDeleteFlipEvent", &videoOutDeleteFlipEvent), .expect_id = "-Ozn0F1AFRg" },
+    .{ .name = "sceVideoOutAddVblankEvent", .function = trace.wrap("sceVideoOutAddVblankEvent", &videoOutAddVblankEvent), .expect_id = "Xru92wHJRmg" },
+    .{ .name = "sceVideoOutWaitVblank", .function = trace.wrap("sceVideoOutWaitVblank", &videoOutWaitVblank), .expect_id = "j6RaAUlaLv0" },
+    .{ .name = "sceVideoOutGetVblankStatus", .function = trace.wrap("sceVideoOutGetVblankStatus", &videoOutGetVblankStatus), .expect_id = "1FZBKy8HeNU" },
     .{ .name = "sceVideoOutGetEventId", .function = trace.wrap("sceVideoOutGetEventId", &videoOutGetEventId), .expect_id = "U2JJtSqNKZI" },
     .{ .name = "sceVideoOutGetEventData", .function = trace.wrap("sceVideoOutGetEventData", &videoOutGetEventData), .expect_id = "rWUTcKdkUzQ" },
     .{ .name = "sceVideoOutGetOutputStatus", .function = trace.wrap("sceVideoOutGetOutputStatus", &videoOutGetOutputStatus), .expect_id = "utPrVdxio-8" },
@@ -836,6 +925,18 @@ fn agcSetShRegisterRangeDirectGetSize(value_count: u32) callconv(abi.guest) u32 
 }
 
 fn agcPatch(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
+/// Guest libSceAgc's SuspendPoint busy-waits and prints TRC R5089 forever when
+/// the real GPU is not there. Prefer the HLE entry (see preferHleImportId) and
+/// yield so other threads can submit frames.
+fn agcSuspendPoint() callconv(abi.guest) i32 {
+    if (kernel_runtime.guestStopRequested()) {
+        kernel_threading.scePthreadExit(null);
+    }
+    // ~1 ms: enough to free a core without under-pacing a 60 Hz flip loop.
+    _ = kernel_threading.sceKernelUsleep(1_000);
     return errno.ok;
 }
 
@@ -1171,7 +1272,7 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcQueueEndOfPipeActionPatchAddress", .function = trace.wrap("sceAgcQueueEndOfPipeActionPatchAddress", &agcPatch), .expect_id = "0fWWK5uG9rQ" },
     .{ .name = "sceAgcWaitRegMemPatchAddress", .function = trace.wrap("sceAgcWaitRegMemPatchAddress", &agcPatch), .expect_id = "3KDcnM3lrcU" },
     .{ .name = "sceAgcSetNop", .function = trace.wrap("sceAgcSetNop", &agcPatch), .expect_id = "K2mciNVxUCE" },
-    .{ .name = "sceAgcSuspendPoint", .function = trace.wrap("sceAgcSuspendPoint", &agcPatch), .expect_id = "h9z6+0hEydk" },
+    .{ .name = "sceAgcSuspendPoint", .function = trace.wrap("sceAgcSuspendPoint", &agcSuspendPoint), .expect_id = "h9z6+0hEydk" },
     .{ .name = "sceAgcGetIsTrinityMode", .function = trace.wrap("sceAgcGetIsTrinityMode", &agcPatch), .expect_id = "BfBDZGbti7A" },
     .{ .name = "sceAgcDebugRaiseException", .function = trace.wrap("sceAgcDebugRaiseException", &agcPatch), .expect_id = "T6xuVw0KUJo" },
     .{ .name = "sceAgcCbSetShRegisterRangeDirectGetSize", .function = trace.wrap("sceAgcCbSetShRegisterRangeDirectGetSize", &agcSetShRegisterRangeDirectGetSize), .expect_id = "bxGoVxpdSPQ" },

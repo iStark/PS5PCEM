@@ -459,6 +459,9 @@ fn backendFlip(_: ?*anyopaque, value: gpu.state.Flip) bool {
     if (!accepted) return false;
     if (!video_out.completeFlip(value)) return false;
     _ = event_queue.triggerVideoOutFlip(value.argument);
+    // Titles that wait on vblank edges (or poll GetVblankStatus) need refresh
+    // progress even when only flips are submitted.
+    _ = event_queue.triggerVideoOutVblank();
     return true;
 }
 

@@ -425,10 +425,7 @@ pub const share_exports = [_]symbols.Export{
 };
 
 pub const videoout_exports = [_]symbols.Export{
-    .{ .name = "sceVideoOutClose", .function = trace.wrap("sceVideoOutClose", &services.absent), .expect_id = "uquVH4-Du78" },
-    .{ .name = "sceVideoOutAddVblankEvent", .function = trace.wrap("sceVideoOutAddVblankEvent", &services.absent), .expect_id = "Xru92wHJRmg" },
-    .{ .name = "sceVideoOutGetVblankStatus", .function = trace.wrap("sceVideoOutGetVblankStatus", &services.absent), .expect_id = "1FZBKy8HeNU" },
-    .{ .name = "sceVideoOutWaitVblank", .function = trace.wrap("sceVideoOutWaitVblank", &services.absent), .expect_id = "j6RaAUlaLv0" },
+    // Flip/vblank live in bootstrap_services; only keep the remaining stubs here.
     .{ .name = "sceVideoOutInitializeOutputOptions", .function = trace.wrap("sceVideoOutInitializeOutputOptions", &services.absent), .expect_id = "+I4K03i3EL0" },
 };
 

@@ -59,6 +59,15 @@ pub const FlipStatus = struct {
     submit_process_time_counter: u64 = 0,
 };
 
+/// Guest `SceVideoOutVblankStatus` (0x28 bytes).
+pub const VblankStatus = struct {
+    count: u64 = 0,
+    process_time: u64 = 0,
+    process_time_counter: u64 = 0,
+    flags: u8 = 0,
+    phase: u8 = 0,
+};
+
 pub const RegisterError = error{
     InvalidValue,
     InvalidAddress,
@@ -100,6 +109,8 @@ var buffers: [maximum_buffers]BufferSlot = [_]BufferSlot{.{}} ** maximum_buffers
 var buffer_labels: [maximum_buffers]u64 align(8) = [_]u64{0} ** maximum_buffers;
 var flip_status = FlipStatus{};
 var previous_buffer: i32 = -1;
+var vblank_count: u64 = 0;
+var open_process_time_us: u64 = 0;
 
 pub fn reset() void {
     lock.lock();
@@ -110,6 +121,8 @@ pub fn reset() void {
     buffer_labels = [_]u64{0} ** maximum_buffers;
     flip_status = .{};
     previous_buffer = -1;
+    vblank_count = 0;
+    open_process_time_us = 0;
 }
 
 pub fn open(index: i32) bool {
@@ -118,7 +131,55 @@ pub fn open(index: i32) bool {
     defer lock.unlock();
     if (opened) return false;
     opened = true;
+    vblank_count = 0;
+    open_process_time_us = 0;
     return true;
+}
+
+/// Records process time at open so GetVblankStatus can report elapsed time.
+pub fn noteOpenProcessTime(process_time_us: u64) void {
+    lock.lock();
+    defer lock.unlock();
+    open_process_time_us = process_time_us;
+}
+
+/// Advances the emulated display refresh once (~16.7 ms at 60 Hz).
+pub fn advanceVblank(process_time_us: u64, process_time_counter: u64) VblankStatus {
+    lock.lock();
+    defer lock.unlock();
+    if (!opened) return .{};
+    vblank_count += 1;
+    const elapsed = if (process_time_us >= open_process_time_us)
+        process_time_us - open_process_time_us
+    else
+        0;
+    return .{
+        .count = vblank_count,
+        .process_time = elapsed,
+        .process_time_counter = process_time_counter,
+        .flags = 0,
+        .phase = 0,
+    };
+}
+
+pub fn vblankStatus(handle: i32, process_time_us: u64, process_time_counter: u64) ?VblankStatus {
+    lock.lock();
+    defer lock.unlock();
+    if (handle != primary_handle or !opened) return null;
+    // Advance count with wall time so a title that only polls still sees progress.
+    const elapsed = if (process_time_us >= open_process_time_us)
+        process_time_us - open_process_time_us
+    else
+        0;
+    const expected = elapsed / 16_667;
+    if (expected > vblank_count) vblank_count = expected;
+    return .{
+        .count = vblank_count,
+        .process_time = elapsed,
+        .process_time_counter = process_time_counter,
+        .flags = 0,
+        .phase = 0,
+    };
 }
 
 pub fn close(handle: i32) bool {
