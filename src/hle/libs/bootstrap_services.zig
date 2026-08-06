@@ -15,6 +15,7 @@ const kernel_runtime = @import("kernel_runtime.zig");
 const kernel_threading = @import("kernel_threading.zig");
 const kernel_memory = @import("kernel_memory.zig");
 const kernel_event_queue = @import("kernel_event_queue.zig");
+const kernel_ioctl = @import("kernel_ioctl.zig");
 const agc_submit = @import("agc_submit.zig");
 const agc = @import("agc.zig");
 const agc_shader_registry = @import("agc_shader_registry.zig");
@@ -276,6 +277,9 @@ fn vblankTickerMain() void {
         // WaitEqueue (~60 Hz spam) and kept the GPU worker busy without new
         // ring content — frame 2 never got encoded past ACQUIRE_MEM kicks.
         _ = kernel_event_queue.triggerVideoOutVblank();
+        // Producer may finish filling a short-kicked ring IB between submits;
+        // re-scan remembered tails each refresh so multi-draw DCBs land.
+        kernel_ioctl.drainPendingTailsPublic();
     }
 }
 

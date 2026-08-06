@@ -341,6 +341,119 @@ const indirect_buffer_length_mask: u32 = 0x000f_ffff;
 /// reserved but not committed in a ring allocation.
 const uncommitted_ring_sentinel: u32 = 0xffff_1000;
 
+/// Ring IBs that were kicked while only an ACQUIRE_MEM (or similarly short)
+/// prefix was committed. The producer often continues filling the same reserved
+/// range *after* ioctl returns; re-scan those tails on later kicks/commits so
+/// multi-draw DCBs are not permanently dropped.
+const maximum_pending_tails = 8;
+const PendingTail = struct {
+    address: u64 = 0,
+    capacity_words: u32 = 0,
+    executed_words: u32 = 0,
+    queue: u32 = 0,
+};
+var pending_tails: [maximum_pending_tails]PendingTail = [_]PendingTail{.{}} ** maximum_pending_tails;
+var pending_tail_count: usize = 0;
+
+fn rememberPendingTail(queue: u32, address: u64, capacity_words: u32, executed_words: u32) void {
+    if (address == 0 or capacity_words == 0 or executed_words >= capacity_words) return;
+    // Update existing entry for the same IB base.
+    for (pending_tails[0..pending_tail_count]) |*slot| {
+        if (slot.address == address) {
+            slot.capacity_words = capacity_words;
+            slot.executed_words = executed_words;
+            slot.queue = queue;
+            return;
+        }
+    }
+    if (pending_tail_count < maximum_pending_tails) {
+        pending_tails[pending_tail_count] = .{
+            .address = address,
+            .capacity_words = capacity_words,
+            .executed_words = executed_words,
+            .queue = queue,
+        };
+        pending_tail_count += 1;
+        return;
+    }
+    // Drop oldest (shift without overlapping memcpy).
+    var s: usize = 0;
+    while (s + 1 < maximum_pending_tails) : (s += 1) {
+        pending_tails[s] = pending_tails[s + 1];
+    }
+    pending_tails[maximum_pending_tails - 1] = .{
+        .address = address,
+        .capacity_words = capacity_words,
+        .executed_words = executed_words,
+        .queue = queue,
+    };
+}
+
+fn clearPendingTail(address: u64) void {
+    var i: usize = 0;
+    while (i < pending_tail_count) {
+        if (pending_tails[i].address == address) {
+            var j = i;
+            while (j + 1 < pending_tail_count) : (j += 1) {
+                pending_tails[j] = pending_tails[j + 1];
+            }
+            pending_tail_count -= 1;
+            pending_tails[pending_tail_count] = .{};
+            continue;
+        }
+        i += 1;
+    }
+}
+
+/// Re-scan remembered IBs; execute any newly committed suffix past executed_words.
+pub fn drainPendingTailsPublic() void {
+    drainPendingTails();
+}
+
+fn drainPendingTails() void {
+    var i: usize = 0;
+    while (i < pending_tail_count) {
+        const slot = pending_tails[i];
+        const byte_count = @as(u64, slot.capacity_words) * @sizeOf(u32);
+        if (!memory.isGuestRangeAccessible(slot.address, byte_count)) {
+            i += 1;
+            continue;
+        }
+        const pointer: [*]const u32 = @ptrFromInt(slot.address);
+        const reserved = pointer[0..slot.capacity_words];
+        const committed = committedQueueStream(reserved);
+        if (committed.len <= slot.executed_words) {
+            i += 1;
+            continue;
+        }
+        const suffix = committed[slot.executed_words..];
+        std.debug.print(
+            "[gc submit #50] tail catch-up queue {d}: +{d} dwords @0x{x} (now {d}/{d})\n",
+            .{ slot.queue, suffix.len, slot.address, committed.len, slot.capacity_words },
+        );
+        if (suffix.len <= 16) {
+            std.debug.print("  words:", .{});
+            for (suffix) |word| std.debug.print(" {x:0>8}", .{word});
+            std.debug.print("\n", .{});
+        }
+        if (agc_submit.submitDeviceStream(suffix).accepted) {
+            _ = event_queue_mod.triggerAllGraphicsEvents(slot.queue);
+            if (committed.len >= slot.capacity_words or committed.len >= 64) {
+                // Fully (or substantially) drained — drop the pending slot.
+                clearPendingTail(slot.address);
+                // clearPendingTail may shrink the array; restart scan.
+                i = 0;
+                continue;
+            }
+            pending_tails[i].executed_words = @intCast(committed.len);
+        }
+        i += 1;
+    }
+}
+
+// Lazy import for graphics event triggers from drain path.
+const event_queue_mod = @import("kernel_event_queue.zig");
+
 /// Finds the command streams a submission descriptor names.
 ///
 /// The descriptor's own structure is not established, so it is searched rather
@@ -526,10 +639,19 @@ fn answerGraphicsQueueSubmit(request: Request, payload: u64) bool {
             std.debug.print("\n", .{});
         }
         if (!agc_submit.submitDeviceStream(stream).accepted) return false;
+        // Short commit vs large reserved IB: remember for tail catch-up after
+        // the producer finishes encoding into the same ring allocation.
+        if (stream.len < word_count and stream.len <= 32 and word_count > 64) {
+            rememberPendingTail(submission.queue, address, word_count, @intCast(stream.len));
+        } else {
+            clearPendingTail(address);
+        }
     }
 
-    const event_queue = @import("kernel_event_queue.zig");
-    _ = event_queue.triggerAllGraphicsEvents(submission.queue);
+    // Catch up any earlier short IBs that the producer has since filled.
+    drainPendingTails();
+
+    _ = event_queue_mod.triggerAllGraphicsEvents(submission.queue);
     submission.result = 0;
     return true;
 }
@@ -539,6 +661,8 @@ fn answerGraphicsQueueCommit(request: Request, payload: u64) bool {
     if (request.direction != .read_write or request.length != @sizeOf(GraphicsQueueCommit)) return false;
     if (!memory.isGuestRangeAccessible(payload, request.length)) return false;
     const commit: *GraphicsQueueCommit = @ptrFromInt(payload);
+    // Commit is the natural "producer finished" edge — drain any pending tails.
+    drainPendingTails();
     commit.result = 0;
     return true;
 }
