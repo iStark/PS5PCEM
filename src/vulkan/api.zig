@@ -140,6 +140,7 @@ pub const shader_stage_fragment_bit: Flags = 0x0000_0010;
 pub const shader_stage_compute_bit: Flags = 0x0000_0020;
 pub const pipeline_stage_transfer_bit: Flags = 0x0000_1000;
 pub const pipeline_stage_top_of_pipe_bit: Flags = 0x0000_0001;
+pub const pipeline_stage_vertex_shader_bit: Flags = 0x0000_0008;
 pub const pipeline_stage_compute_shader_bit: Flags = 0x0000_0800;
 pub const pipeline_stage_fragment_shader_bit: Flags = 0x0000_0080;
 pub const pipeline_stage_color_attachment_output_bit: Flags = 0x0000_0400;

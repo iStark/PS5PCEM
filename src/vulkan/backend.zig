@@ -792,11 +792,16 @@ pub const Renderer = struct {
         }
         errdefer device_functions.destroy_command_pool(device, command_pool, null);
 
+        // Storage is shared by compute and by graphics attribute / constant
+        // buffer MUBUF lowering. Restricting it to compute left guest VS loads
+        // unbound and produced a black writeback after V# recovery.
         const storage_binding = vk.DescriptorSetLayoutBinding{
             .binding = 0,
             .descriptor_type = vk.descriptor_type_storage_buffer,
             .descriptor_count = maximum_storage_descriptors,
-            .stage_flags = vk.shader_stage_compute_bit,
+            .stage_flags = vk.shader_stage_compute_bit |
+                vk.shader_stage_vertex_bit |
+                vk.shader_stage_fragment_bit,
         };
         const sampled_image_binding = vk.DescriptorSetLayoutBinding{
             .binding = 1,
@@ -1219,7 +1224,9 @@ pub const Renderer = struct {
         self.device_functions.cmd_pipeline_barrier(
             command_buffer,
             vk.pipeline_stage_transfer_bit,
-            vk.pipeline_stage_compute_shader_bit,
+            vk.pipeline_stage_compute_shader_bit |
+                vk.pipeline_stage_vertex_shader_bit |
+                vk.pipeline_stage_fragment_shader_bit,
             0,
             0,
             null,
@@ -1263,7 +1270,10 @@ pub const Renderer = struct {
         };
         self.device_functions.cmd_pipeline_barrier(
             command_buffer,
-            vk.pipeline_stage_compute_shader_bit | vk.pipeline_stage_transfer_bit,
+            vk.pipeline_stage_compute_shader_bit |
+                vk.pipeline_stage_vertex_shader_bit |
+                vk.pipeline_stage_fragment_shader_bit |
+                vk.pipeline_stage_transfer_bit,
             vk.pipeline_stage_transfer_bit,
             0,
             0,
@@ -2065,8 +2075,10 @@ pub const Renderer = struct {
         {
             return Error.UnsupportedGraphicsState;
         }
-        result.cull_mode = @as(u32, @intFromBool(render.raster.cull_front)) |
-            (@as(u32, @intFromBool(render.raster.cull_back)) << 1);
+        // Ignore guest culling on the first host path: attribute fetch and
+        // winding often disagree until NGG export is fully correct, and a
+        // full cull makes every black writeback look identical.
+        result.cull_mode = 0;
         result.front_face = if (render.raster.clockwise_front_face) 0 else 1;
         result.rasterizer_discard = @intFromBool(render.raster.rasterizer_discard);
         result.color_write_mask = target.write_mask;
@@ -2564,8 +2576,8 @@ pub const Renderer = struct {
                     center_pixel[3],
                 },
             );
-            // Dump the first guest frame for offline inspection (PPM, RGB).
-            if (self.frame_dumps == 0) {
+            // Dump the first non-black guest frame for offline inspection.
+            if (self.frame_dumps == 0 and colored != 0) {
                 dumpFramePpm("out\\first-frame.ppm", width, height, frame);
                 self.frame_dumps += 1;
             }
@@ -2846,6 +2858,49 @@ pub const Renderer = struct {
             "[vulkan dcb] vertex storage: mappings={d} scalars={d}\n",
             .{ vertex_storage.mapping_count, vertex_storage.scalar_count },
         );
+        var map_i: usize = 0;
+        while (map_i < vertex_storage.mapping_count and map_i < 8) : (map_i += 1) {
+            const m = vertex_storage.mappings[map_i];
+            const di = m.descriptor_index;
+            const gaddr = if (di < vertex_storage.addresses.len) vertex_storage.addresses[di] else 0;
+            const gsize = if (di < vertex_storage.sizes.len) vertex_storage.sizes[di] else 0;
+            var cb_head: [4]u32 = @splat(0);
+            if (gaddr != 0 and gsize >= 16) {
+                reader.read(gaddr, std.mem.asBytes(&cb_head)) catch {};
+            }
+            const c0: f32 = @bitCast(cb_head[0]);
+            const c1: f32 = @bitCast(cb_head[1]);
+            const c2: f32 = @bitCast(cb_head[2]);
+            const c3: f32 = @bitCast(cb_head[3]);
+            std.debug.print(
+                "[vulkan dcb]   map s{d} -> desc[{d}] guest=0x{x} size=0x{x} stride={d} head_f32={d:.3} {d:.3} {d:.3} {d:.3}\n",
+                .{
+                    m.resource_sgpr,
+                    di,
+                    gaddr,
+                    gsize,
+                    m.stride,
+                    c0,
+                    c1,
+                    c2,
+                    c3,
+                },
+            );
+        }
+        // USER_DATA window (first 8 words) — SRT pointers and inline constants.
+        std.debug.print(
+            "[vulkan dcb] user_data[0..7]: {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8} {x:0>8}\n",
+            .{
+                vertex_bindings.user_data[0],
+                vertex_bindings.user_data[1],
+                vertex_bindings.user_data[2],
+                vertex_bindings.user_data[3],
+                vertex_bindings.user_data[4],
+                vertex_bindings.user_data[5],
+                vertex_bindings.user_data[6],
+                vertex_bindings.user_data[7],
+            },
+        );
 
         var fragment_module = fragment_analysis.translateSpirv(self.allocator, .{
             .stage = .fragment,
@@ -2874,6 +2929,12 @@ pub const Renderer = struct {
         const try_guest_vs = vertex_storage.mapping_count != 0 and
             vertex_storage.mappingForSgpr(4) != null;
         if (try_guest_vs) {
+            var pos_exports: usize = 0;
+            for (vertex_analysis.program.instructions.items) |inst| {
+                if (inst.opcode == .exp and (inst.export_target == 12 or inst.export_target == 0)) {
+                    pos_exports += 1;
+                }
+            }
             if (vertex_analysis.translateSpirv(self.allocator, .{
                 .stage = .vertex,
                 .vertex_index_vgpr = 0,
@@ -2885,8 +2946,13 @@ pub const Renderer = struct {
                 var vertex_module = vertex_module_owned;
                 defer vertex_module.deinit(self.allocator);
                 std.debug.print(
-                    "[vulkan dcb] using guest VS + guest PS (attr V# mapped); sampled={d}\n",
-                    .{graphics_resources.mapping_count},
+                    "[vulkan dcb] using guest VS + guest PS; sampled={d} idx={any} storage={d} pos_exports={d}\n",
+                    .{
+                        graphics_resources.mapping_count,
+                        draw.index_count,
+                        vertex_storage.mapping_count,
+                        pos_exports,
+                    },
                 );
                 try self.drawGraphicsShaders(
                     vertex_module.words,
@@ -2897,6 +2963,24 @@ pub const Renderer = struct {
                     false,
                     draw,
                 );
+                // Guest NGG index/MVP still often collapses to a zero-area
+                // writeback. Fall back to the probe triangle so guest PS and
+                // texture path stay observable until attribute index recovery.
+                if (self.guest_graphics_draws == 0 and self.graphics_probe_colored_pixels == 0) {
+                    std.debug.print(
+                        "[vulkan dcb] guest VS writeback empty; probe VS + guest PS fallback\n",
+                        .{},
+                    );
+                    try self.drawGraphicsShaders(
+                        &graphics_probe_vertex_spirv,
+                        fragment_module.words,
+                        pipeline_state,
+                        target,
+                        graphics_resources.mapping_count != 0,
+                        false,
+                        .{ .vertex_count = 3, .instance_count = 1 },
+                    );
+                }
                 return;
             } else |err| {
                 std.debug.print(
@@ -3961,10 +4045,46 @@ fn dumpShaderHead(analysis: *const gpu.ShaderAnalysis, limit: usize) void {
             std.debug.print("  ... ({d} more)\n", .{analysis.program.instructions.items.len - printed});
             break;
         }
-        std.debug.print(
-            "  pc=0x{x:0>4} {s} dst={s}:{d}\n",
-            .{ inst.pc, inst.opcode.mnemonic(), @tagName(inst.dst.kind), inst.dst.reg },
-        );
+        if (inst.opcode == .exp) {
+            std.debug.print(
+                "  pc=0x{x:0>4} exp target={d} en=0x{x} done={any} compr={any} src0={s}:{d}\n",
+                .{
+                    inst.pc,
+                    inst.export_target,
+                    inst.export_enable,
+                    inst.export_done,
+                    inst.export_compressed,
+                    @tagName(inst.src0.kind),
+                    inst.src0.reg,
+                },
+            );
+        } else if (inst.opcode == .buffer_load_format_xyz or
+            inst.opcode == .buffer_load_format_xy or
+            inst.opcode == .buffer_load_format_xyzw or
+            inst.opcode == .s_buffer_load_dwordx4 or
+            inst.opcode == .s_buffer_load_dwordx16 or
+            inst.opcode == .s_load_dwordx2)
+        {
+            const resource = if (inst.family == .smem) inst.src0 else inst.src1;
+            std.debug.print(
+                "  pc=0x{x:0>4} {s} dst={s}:{d} res={s}:{d} idx={s}:{d}\n",
+                .{
+                    inst.pc,
+                    inst.opcode.mnemonic(),
+                    @tagName(inst.dst.kind),
+                    inst.dst.reg,
+                    @tagName(resource.kind),
+                    resource.reg,
+                    @tagName(inst.src0.kind),
+                    inst.src0.reg,
+                },
+            );
+        } else {
+            std.debug.print(
+                "  pc=0x{x:0>4} {s} dst={s}:{d}\n",
+                .{ inst.pc, inst.opcode.mnemonic(), @tagName(inst.dst.kind), inst.dst.reg },
+            );
+        }
         printed += 1;
     }
 }
@@ -4250,10 +4370,38 @@ fn seedVertexBufferScalars(
     while (pair < pairs) : (pair += 1) {
         const sgpr = resource_sgprs[pair];
         const words = buffer_words[pair];
+        var head: [20]u32 = @splat(0);
+        const head_bytes = @min(buffers[pair].size_bytes, @as(u64, @sizeOf(@TypeOf(head))));
+        const head_words: usize = @intCast(head_bytes / 4);
+        if (head_bytes != 0) {
+            reader.read(buffers[pair].address, std.mem.sliceAsBytes(head[0..head_words])) catch {};
+        }
         std.debug.print(
-            "[vulkan dcb] seed V# s{d}:s{d} from vertex buffer table addr=0x{x} size=0x{x}\n",
-            .{ sgpr, sgpr + 3, buffers[pair].address, buffers[pair].size_bytes },
+            "[vulkan dcb] seed V# s{d}:s{d} addr=0x{x} size=0x{x} stride={d} records={d}\n",
+            .{
+                sgpr,
+                sgpr + 3,
+                buffers[pair].address,
+                buffers[pair].size_bytes,
+                buffers[pair].stride,
+                buffers[pair].record_count,
+            },
         );
+        // Dump each record as five f32 (stride 20 is the common Unity path).
+        var record: u32 = 0;
+        while (record < buffers[pair].record_count and record < 4) : (record += 1) {
+            const base: usize = @as(usize, record) * 5;
+            if (base + 4 >= head_words) break;
+            const a: f32 = @bitCast(head[base]);
+            const b: f32 = @bitCast(head[base + 1]);
+            const c: f32 = @bitCast(head[base + 2]);
+            const d: f32 = @bitCast(head[base + 3]);
+            const e: f32 = @bitCast(head[base + 4]);
+            std.debug.print(
+                "[vulkan dcb]   vtx{d}: {d:.4} {d:.4} {d:.4} {d:.4} {d:.4}\n",
+                .{ record, a, b, c, d, e },
+            );
+        }
         var word_i: u32 = 0;
         while (word_i < 4) : (word_i += 1) {
             const reg = sgpr + word_i;
