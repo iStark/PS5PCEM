@@ -2665,10 +2665,15 @@ pub const Renderer = struct {
         defer vertex_analysis.deinit(self.allocator);
         var fragment_analysis = try gpu.shader_analysis.decode(self.allocator, reader, fragment_address, 4096);
         defer fragment_analysis.deinit(self.allocator);
+        const vertex_header = if (memory.shader_header) |resolve|
+            resolve(memory.context, vertex_address)
+        else
+            null;
         const fragment_header = if (memory.shader_header) |resolve|
             resolve(memory.context, fragment_address)
         else
             null;
+        const vertex_bindings = try gpu.ShaderBindings.capture(state, vertex_stage, vertex_header, reader);
         const fragment_bindings = try gpu.ShaderBindings.capture(state, .pixel, fragment_header, reader);
         var graphics_resources = try self.prepareGraphicsResources(
             &fragment_bindings,
@@ -2676,23 +2681,101 @@ pub const Renderer = struct {
             &fragment_analysis,
         );
         defer graphics_resources.deinit(self);
-        var vertex_module = try vertex_analysis.translateSpirv(self.allocator, .{
+
+        // Full scalar evaluation (not only the straight prolog cut): vertex
+        // programs interleave SMEM loads after a few VALU ops, and those SGPRs
+        // must be constants in SPIR-V rather than live s_load (no host pointer
+        // load path yet). Specialize every known SGPR across the whole program.
+        const vertex_scalar = gpu.scalar_provenance.evaluatePrefix(reader, &vertex_bindings);
+        const vertex_scalar_end: u32 = 0x0010_0000;
+        var vertex_scalar_regs: [128]gpu.ShaderSpirvScalarRegister = undefined;
+        var vertex_scalar_count = collectKnownScalars(&vertex_scalar, &vertex_scalar_regs);
+        // NGG/export programs often address USER_DATA as s0.. even when the
+        // capture table records scalar_user_data_base=8 for the ES bank. Seed
+        // the raw USER_DATA window at s0 so s3.. are not left undefined.
+        vertex_scalar_count = mergeUserDataScalars(
+            &vertex_bindings,
+            0,
+            &vertex_scalar_regs,
+            vertex_scalar_count,
+        );
+
+        const fragment_scalar = gpu.scalar_provenance.evaluatePrefix(reader, &fragment_bindings);
+        const fragment_scalar_end: u32 = 0x0010_0000;
+        var fragment_scalar_regs: [128]gpu.ShaderSpirvScalarRegister = undefined;
+        const fragment_scalar_count = collectKnownScalars(&fragment_scalar, &fragment_scalar_regs);
+
+        // Attribute / constant buffer MUBUF in the vertex program needs the
+        // same storage-descriptor array as compute. Missing V#s are non-fatal:
+        // translate without storage and skip MUBUF rather than abort the draw.
+        var vertex_storage = self.prepareComputeResources(
+            &vertex_bindings,
+            reader,
+            &vertex_analysis,
+            &vertex_scalar,
+            vertex_scalar_end,
+        ) catch |err| blk: {
+            std.debug.print(
+                "[vulkan dcb] vertex storage incomplete: {s}; translating without buffers\n",
+                .{@errorName(err)},
+            );
+            break :blk ComputeResources{};
+        };
+
+        var vertex_module = vertex_analysis.translateSpirv(self.allocator, .{
             .stage = .vertex,
             .vertex_index_vgpr = 0,
-        });
+            .scalar_registers = vertex_scalar_regs[0..vertex_scalar_count],
+            .specialized_scalar_prefix_end = vertex_scalar_end,
+            .storage_buffers = vertex_storage.mappings[0..vertex_storage.mapping_count],
+            .descriptor_array_length = if (vertex_storage.mapping_count != 0)
+                maximum_storage_descriptors
+            else
+                0,
+        }) catch |err| {
+            std.debug.print(
+                "[vulkan dcb] vertex program 0x{x} ({s}): {d} instructions, translate={s} scalars={d} end=0x{x}\n",
+                .{
+                    vertex_address,
+                    @tagName(vertex_stage),
+                    vertex_analysis.program.instructions.items.len,
+                    @errorName(err),
+                    vertex_scalar_count,
+                    vertex_scalar_end,
+                },
+            );
+            dumpShaderHead(&vertex_analysis, 16);
+            return err;
+        };
         defer vertex_module.deinit(self.allocator);
-        var fragment_module = try fragment_analysis.translateSpirv(self.allocator, .{
+
+        var fragment_module = fragment_analysis.translateSpirv(self.allocator, .{
             .stage = .fragment,
             .sampled_images = graphics_resources.mappings[0..graphics_resources.mapping_count],
             .descriptor_array_length = maximum_storage_descriptors,
-        });
+            .scalar_registers = fragment_scalar_regs[0..fragment_scalar_count],
+            .specialized_scalar_prefix_end = fragment_scalar_end,
+        }) catch |err| {
+            std.debug.print(
+                "[vulkan dcb] fragment program 0x{x}: {d} instructions, translate={s} scalars={d} end=0x{x}\n",
+                .{
+                    fragment_address,
+                    fragment_analysis.program.instructions.items.len,
+                    @errorName(err),
+                    fragment_scalar_count,
+                    fragment_scalar_end,
+                },
+            );
+            dumpShaderHead(&fragment_analysis, 16);
+            return err;
+        };
         defer fragment_module.deinit(self.allocator);
         try self.drawGraphicsShaders(
             vertex_module.words,
             fragment_module.words,
             pipeline_state,
             target,
-            graphics_resources.mapping_count != 0,
+            graphics_resources.mapping_count != 0 or vertex_storage.mapping_count != 0,
             false,
             draw,
         );
@@ -3571,6 +3654,60 @@ fn scalarPrefixEnd(analysis: *const gpu.ShaderAnalysis) u32 {
         }
     }
     return end;
+}
+
+fn collectKnownScalars(
+    scalar: *const gpu.ScalarEvaluation,
+    out: []gpu.ShaderSpirvScalarRegister,
+) usize {
+    var count: usize = 0;
+    for (scalar.registers, 0..) |value, index| {
+        if (!value.known) continue;
+        if (count >= out.len) break;
+        out[count] = .{ .register = @intCast(index), .value = value.value };
+        count += 1;
+    }
+    return count;
+}
+
+fn mergeUserDataScalars(
+    bindings: *const gpu.ShaderBindings,
+    base: u32,
+    out: []gpu.ShaderSpirvScalarRegister,
+    count: usize,
+) usize {
+    var n = count;
+    for (bindings.user_data[0..bindings.user_data_count], 0..) |word, index| {
+        const reg: u32 = base + @as(u32, @intCast(index));
+        if (reg >= 128) break;
+        var exists = false;
+        for (out[0..n]) |entry| {
+            if (entry.register == reg) {
+                exists = true;
+                break;
+            }
+        }
+        if (exists) continue;
+        if (n >= out.len) break;
+        out[n] = .{ .register = reg, .value = word };
+        n += 1;
+    }
+    return n;
+}
+
+fn dumpShaderHead(analysis: *const gpu.ShaderAnalysis, limit: usize) void {
+    var printed: usize = 0;
+    for (analysis.program.instructions.items) |inst| {
+        if (printed >= limit) {
+            std.debug.print("  ... ({d} more)\n", .{analysis.program.instructions.items.len - printed});
+            break;
+        }
+        std.debug.print(
+            "  pc=0x{x:0>4} {s} dst={s}:{d}\n",
+            .{ inst.pc, inst.opcode.mnemonic(), @tagName(inst.dst.kind), inst.dst.reg },
+        );
+        printed += 1;
+    }
 }
 
 fn resolveSrtImageDescriptor(
