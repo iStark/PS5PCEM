@@ -408,8 +408,9 @@ fn videoOutGetFlipStatus(handle: i32, status: ?*VideoOutFlipStatus) callconv(abi
     const current = video_out.status(handle) orelse return video_out_error_invalid_handle;
     // Full PS5 layout: titles poll process-time fields after
     // WaitEqueue(filter=-13) and skip init paths when they look unset/stale.
-    // Report flip_pending_count as 0 so bring-up never parks forever waiting for
-    // a pending flip to drain when GPU completion accounting is still approximate.
+    // Report the real pending count so the title does not race the next frame
+    // encode against an incomplete flip (observed as ACQUIRE_MEM-only #50 kicks
+    // after the first full DCB). completeFlip drains the counter.
     output.* = .{
         .count = current.count,
         .process_time = kernel_runtime.processTimeMicroseconds(),
@@ -418,7 +419,7 @@ fn videoOutGetFlipStatus(handle: i32, status: ?*VideoOutFlipStatus) callconv(abi
         .reserved1 = 0,
         .process_time_counter = kernel_runtime.processTimeCounter(),
         .gc_queue_count = 0,
-        .flip_pending_count = 0,
+        .flip_pending_count = current.flip_pending_count,
         .current_buffer = current.current_buffer,
         .reserved2 = 0,
         .submit_process_time_counter = current.submit_process_time_counter,
@@ -947,6 +948,12 @@ fn agcSuspendPoint() callconv(abi.guest) i32 {
     if (kernel_runtime.guestStopRequested()) {
         kernel_threading.scePthreadExit(null);
     }
+    // Pump deferred ring tails and soft-unblock WAIT_REG_MEM so the driver
+    // sees GPU "progress" between frames. Without this the title can park
+    // mid-encode after ACQUIRE_MEM while SuspendPoint spins on a stale view.
+    kernel_ioctl.drainPendingTailsPublic();
+    agc_submit.pumpQueues();
+    _ = kernel_event_queue.triggerAllGraphicsEvents(0);
     // ~1 ms: enough to free a core without under-pacing a 60 Hz flip loop.
     _ = kernel_threading.sceKernelUsleep(1_000);
     return errno.ok;

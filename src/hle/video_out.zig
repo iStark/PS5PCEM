@@ -355,11 +355,18 @@ pub fn completeFlip(flip: gpu.state.Flip) bool {
     has_last_flip_argument = true;
     // process_time / process_time_counter filled at GetFlipStatus time so they
     // stay current when the title polls after the equeue wakes.
-    // Bring-up: release every buffer label on flip completion. Holding the
-    // displayed slot busy parks titles that CPU-poll labels / WaitUntilSafe
-    // before encoding frame N+1 (observed: only ACQUIRE_MEM ring kicks after
-    // the first full DCB, no second draw).
-    @memset(std.mem.asBytes(&buffer_labels), 0);
+    // Release labels for the buffer that just left the screen. Zeroing *all*
+    // slots erased in-flight sequence numbers titles poll for multi-buffer
+    // encode; only the previous (and current) displayed indices are freed.
+    if (previous_buffer >= 0 and previous_buffer < maximum_buffers) {
+        buffer_labels[@intCast(previous_buffer)] = 0;
+    }
+    if (flip.display_buffer_index >= 0 and flip.display_buffer_index < maximum_buffers) {
+        // Mark the newly displayed buffer as "GPU done with prior use" by
+        // writing a non-zero done token some WaitUntilSafe CPU polls expect.
+        const idx: usize = @intCast(flip.display_buffer_index);
+        if (buffer_labels[idx] == 0) buffer_labels[idx] = flip_status.count;
+    }
     previous_buffer = flip.display_buffer_index;
     // Arm host audio on the second completed flip. The first is often a clear
     // / swap before the first real draw; waiting one frame keeps SFX from

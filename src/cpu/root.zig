@@ -227,19 +227,27 @@ fn ensureNullObjectStub() u64 {
     if (!null_object_stub_ready) {
         const base: u64 = @intFromPtr(&null_object_stub);
         @memset(&null_object_stub, 0);
-        // Object body: every 8-byte slot is a pointer back to the stub.
-        var offset: usize = 0;
-        while (offset + 8 <= 0x100) : (offset += 8) {
-            std.mem.writeInt(u64, null_object_stub[offset..][0..8], base, .little);
-        }
-        // Fake vtable at +0x100: every slot points at the RET sled.
+        // Fake vtable at +0x100: every slot points at the RET sled so accidental
+        // virtual calls return instead of faulting.
         const ret_thunk = base + 0x300;
-        offset = 0x100;
+        var offset: usize = 0x100;
         while (offset + 8 <= 0x300) : (offset += 8) {
             std.mem.writeInt(u64, null_object_stub[offset..][0..8], ret_thunk, .little);
         }
         // [0] = vtable pointer (common C++/IL2CPP layout).
         std.mem.writeInt(u64, null_object_stub[0..8], base + 0x100, .little);
+        // Leave body fields at +0x08..+0xF8 as zero. Unity/IL2CPP null checks
+        // are often `cmp [obj+0x10/0x20], 0` / `je null_path`. A self-pointer
+        // here made the check pass and the title followed a "ready" path with a
+        // hollow object — frame encode then stopped after ACQUIRE_MEM. Zero
+        // fields take the null branch while still giving the instruction a
+        // mapped page to read.
+        // Deeper slots (+0x80..) self-reference for pointer-chasing that is not
+        // a null-test.
+        offset = 0x80;
+        while (offset + 8 <= 0x100) : (offset += 8) {
+            std.mem.writeInt(u64, null_object_stub[offset..][0..8], base, .little);
+        }
         @memset(null_object_stub[0x300..], 0xc3); // RET
         null_object_stub_ready = true;
     }
@@ -616,9 +624,26 @@ const WindowsX64Machine = struct {
             _ = fs_base_restorations.fetchAdd(1, .monotonic);
             return exception_continue_execution;
         }
-        // Prefer fixing the null base register and retrying the instruction so
-        // every opcode (ALU, SSE, cmp, mov, …) sees a real stub object instead of
-        // permanently taking a soft-null branch that stalls multi-frame bring-up.
+        // IL2CPP/Unity often does `cmp byte/dword [obj+0x20], 0` / `je null_path`
+        // after a flip. Handle compares *before* base redirect: redirecting the
+        // base to a self-pointer stub makes `[stub+0x20]` look non-null and the
+        // title takes the "object ready" path with a fake object — observed to
+        // abort frame encoding after the first full DCB (only ACQUIRE_MEM left).
+        // Treating the memory as zero takes the real null branch instead.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            tryEmulateNullObjectCompare(context, record.ExceptionInformation[1]))
+        {
+            _ = null_object_compare_recoveries.fetchAdd(1, .monotonic);
+            std.debug.print(
+                "[cpu] recovered null-object cmp @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip, record.ExceptionInformation[1], null_object_compare_recoveries.load(.monotonic) },
+            );
+            return exception_continue_execution;
+        }
+        // For non-compare field access, rewrite the null base to a synthetic
+        // stub object and retry the instruction so ALU/SSE/mov see real memory.
         // Pure address 0 (no field displacement) stays a contained guest fault
         // for diagnostics and the native-bridge tests.
         if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
@@ -631,21 +656,6 @@ const WindowsX64Machine = struct {
             std.debug.print(
                 "[cpu] redirected null base -> stub @rip=0x{x} addr=0x{x} (#{d})\n",
                 .{ context.Rip, record.ExceptionInformation[1], null_base_redirect_recoveries.load(.monotonic) },
-            );
-            return exception_continue_execution;
-        }
-        // IL2CPP/Unity often does `cmp byte/dword [obj+0x20], 0` / `je null_path`
-        // after a flip. When obj is still null during bring-up, treat the read as
-        // zero and take the null branch instead of killing the process.
-        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
-            record.NumberParameters >= 2 and
-            record.ExceptionInformation[0] == 0 and
-            tryEmulateNullObjectCompare(context, record.ExceptionInformation[1]))
-        {
-            _ = null_object_compare_recoveries.fetchAdd(1, .monotonic);
-            std.debug.print(
-                "[cpu] recovered null-object cmp @rip=0x{x} addr=0x{x} (#{d})\n",
-                .{ context.Rip, record.ExceptionInformation[1], null_object_compare_recoveries.load(.monotonic) },
             );
             return exception_continue_execution;
         }

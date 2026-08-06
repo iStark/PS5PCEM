@@ -591,34 +591,26 @@ fn answerGraphicsQueueSubmit(request: Request, payload: u64) bool {
         // near the head). Re-sample a few times so late-written packets are not
         // permanently dropped as an 8-dword ACQUIRE_MEM-only prefix.
         var stream = committedQueueStream(reserved_stream);
-        // Producer often kicks #50 with only an ACQUIRE_MEM prefix (~6–8 dwords)
-        // while the rest of the frame DCB is still being encoded. Poll longer
-        // when the committed length is tiny relative to the reserved IB so
-        // multi-draw frames are not permanently dropped as ACQUIRE_only kicks.
+        // Brief re-sample first (producer may still be writing). Keep this short:
+        // holding the ioctl while only an ACQUIRE_MEM prefix is committed can
+        // deadlock the encoder if it waits on the graphics completion event we
+        // only fire after this call returns.
         var grow_round: u8 = 0;
         const short_threshold: usize = 32;
-        const max_grow: u8 = if (stream.len <= short_threshold and reserved_stream.len > short_threshold)
-            64
+        const pre_exec_grow: u8 = if (stream.len <= short_threshold and reserved_stream.len > short_threshold)
+            16
         else
-            8;
-        while (stream.len < reserved_stream.len and grow_round < max_grow) : (grow_round += 1) {
-            // Stop early once we have a substantial committed stream.
+            4;
+        while (stream.len < reserved_stream.len and grow_round < pre_exec_grow) : (grow_round += 1) {
             if (stream.len >= 256) break;
             std.Thread.yield() catch {};
             if (comptime builtin.os.tag == .windows) {
-                // 0.5 ms early, 1 ms after a few empty polls.
-                const ticks: i64 = if (grow_round < 4) -5000 else -10_000;
-                var interval: i64 = ticks;
+                var interval: i64 = -5000; // 0.5 ms
                 _ = std.os.windows.ntdll.NtDelayExecution(.FALSE, &interval);
             }
             const again = committedQueueStream(reserved_stream);
-            if (again.len > stream.len) {
-                stream = again;
-                continue;
-            }
-            // No growth this round: if still ACQUIRE-sized and IB is large,
-            // keep waiting a bit more; otherwise stop.
-            if (stream.len > short_threshold or grow_round >= max_grow / 2) break;
+            if (again.len <= stream.len) break;
+            stream = again;
         }
         if (stream.len == 0) continue;
         std.debug.print(
@@ -638,11 +630,42 @@ fn answerGraphicsQueueSubmit(request: Request, payload: u64) bool {
             for (stream) |word| std.debug.print(" {x:0>8}", .{word});
             std.debug.print("\n", .{});
         }
+        // Execute the committed prefix *now* and wake graphics waiters so the
+        // producer can finish encoding into the same ring.
         if (!agc_submit.submitDeviceStream(stream).accepted) return false;
-        // Short commit vs large reserved IB: remember for tail catch-up after
-        // the producer finishes encoding into the same ring allocation.
-        if (stream.len < word_count and stream.len <= 32 and word_count > 64) {
-            rememberPendingTail(submission.queue, address, word_count, @intCast(stream.len));
+        _ = event_queue_mod.triggerAllGraphicsEvents(submission.queue);
+
+        var executed: usize = stream.len;
+        // Post-execute catch-up: poll for newly committed dwords after the
+        // producer was unblocked by the ACQUIRE/event above.
+        if (executed < word_count and executed <= short_threshold and word_count > 64) {
+            var post: u8 = 0;
+            const post_max: u8 = 80; // up to ~80–160 ms
+            while (post < post_max) : (post += 1) {
+                std.Thread.yield() catch {};
+                if (comptime builtin.os.tag == .windows) {
+                    var interval: i64 = if (post < 8) -5000 else -10_000;
+                    _ = std.os.windows.ntdll.NtDelayExecution(.FALSE, &interval);
+                }
+                const again = committedQueueStream(reserved_stream);
+                if (again.len <= executed) {
+                    if (post >= 16 and executed <= short_threshold) break;
+                    continue;
+                }
+                const suffix = again[executed..];
+                std.debug.print(
+                    "[gc submit #50] post-exec catch-up +{d} dwords @0x{x} (now {d}/{d})\n",
+                    .{ suffix.len, address, again.len, word_count },
+                );
+                if (!agc_submit.submitDeviceStream(suffix).accepted) return false;
+                _ = event_queue_mod.triggerAllGraphicsEvents(submission.queue);
+                executed = again.len;
+                if (executed >= 256) break;
+            }
+        }
+        // Remember residual tail for vblank/commit drain if still short.
+        if (executed < word_count and executed <= 32 and word_count > 64) {
+            rememberPendingTail(submission.queue, address, word_count, @intCast(executed));
         } else {
             clearPendingTail(address);
         }

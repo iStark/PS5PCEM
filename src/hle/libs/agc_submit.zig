@@ -600,6 +600,27 @@ pub fn submitDeviceStream(stream: []const u32) SubmitOutcome {
     return executeSubmitted("dcb", stream);
 }
 
+/// Advance both queues and soft-satisfy any permanent WAIT_REG_MEM heads.
+/// Called from SuspendPoint so the driver observes GPU progress between frames.
+pub fn pumpQueues() void {
+    execution_lock.lock();
+    defer execution_lock.unlock();
+    var force_rounds: u8 = 0;
+    while (force_rounds < 8) : (force_rounds += 1) {
+        var progressed = false;
+        for ([_]gpu.QueueKind{ .graphics, .compute }) |kind| {
+            if (!submission_scheduler.isBlocked(kind)) continue;
+            const wait = submission_scheduler.state(kind).blocked_wait orelse continue;
+            if (!forceSatisfyWait(wait)) continue;
+            progressed = true;
+        }
+        _ = submission_scheduler.pump() catch break;
+        if (!progressed and
+            !submission_scheduler.isBlocked(.graphics) and
+            !submission_scheduler.isBlocked(.compute)) break;
+    }
+}
+
 /// Queues one submitted buffer and advances both command processors. A blocked
 /// head retains its exact root/indirect continuation; a real release-label
 /// write from the other queue makes the following pump resume it in place.
