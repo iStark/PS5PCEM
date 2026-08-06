@@ -18,10 +18,8 @@
 //! ## What a shipped driver asks for
 //!
 //! Observed by running a title's own `libSceAgcDriver` against this layer and
-//! reading its diagnostics. Neither reference emulator records any of it: both
-//! reimplement the graphics API instead and never reach a device node. Recorded
-//! here because it is the specification, and it took a working driver to
-//! obtain.
+//! reading its diagnostics. Recorded here because it is the specification, and
+//! it took a working driver to obtain.
 //!
 //! - `/dev/gc` `#46`, in/out, 4 bytes. Asked first, with the buffer zeroed.
 //!   A successful zero reply selects the retail compatibility path, which maps

@@ -9,8 +9,7 @@
 //! boundary is intentional. In particular, Windows uses FS for the host TEB,
 //! so replacing it while Zig or Win32 code is running would corrupt the host
 //! thread. A native/JIT backend must install the supplied FS base only while it
-//! is executing guest instructions, or patch segment-relative accesses as the
-//! reference emulators do.
+//! is executing guest instructions, or patch segment-relative accesses.
 
 const std = @import("std");
 const memory = @import("memory");

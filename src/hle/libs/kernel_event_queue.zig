@@ -18,6 +18,8 @@ const user_filter: i16 = -11;
 const timer_filter: i16 = -7;
 pub const video_out_filter: i16 = -13;
 pub const video_out_flip_ident: u64 = 6;
+/// Distinct from flip; only distinctness matters for GetEventId.
+pub const video_out_vblank_ident: u64 = 0x40;
 pub const graphics_filter: i16 = -14;
 const event_add: u16 = 0x01;
 const event_clear: u16 = 0x20;
@@ -388,11 +390,21 @@ pub fn triggerGraphicsEvent(id: i32, context_id: u32) usize {
     return wake_count;
 }
 
+/// Packs a flip argument into event `data` as
+/// `ident | ((flip_arg & 0x0000_ffff_ffff_ffff) << 16)`. Titles then read the
+/// argument with `sceVideoOutGetEventData` (`data >> 16`).
+pub fn packVideoOutFlipData(flip_argument: i64) i64 {
+    const payload: u64 = @as(u64, @bitCast(flip_argument)) & 0x0000_ffff_ffff_ffff;
+    const bits: u64 = video_out_flip_ident | (payload << 16);
+    return @bitCast(bits);
+}
+
 /// Delivers one completed flip to every equeue that registered for it.
 pub fn triggerVideoOutFlip(flip_argument: i64) usize {
     var wake_handles: [maximum_queues]i64 = undefined;
     var wake_sequences: [maximum_queues]u64 = undefined;
     var wake_count: usize = 0;
+    const packed_data = packVideoOutFlipData(flip_argument);
 
     lock.lock();
     for (&queues) |*queue| {
@@ -409,7 +421,7 @@ pub fn triggerVideoOutFlip(flip_argument: i64) usize {
             .ident = video_out_flip_ident,
             .filter = video_out_filter,
             .flags = event_add | event_clear,
-            .data = flip_argument,
+            .data = packed_data,
             .user_data = registration.user_data,
         };
         queue.pending_count += 1;
@@ -642,7 +654,8 @@ test "VideoOut flip events retain their filter and user data" {
     try std.testing.expectEqual(errno.ok, waitEqueue(handle, &event, 1, &count, &timeout));
     try std.testing.expectEqual(@as(i16, video_out_filter), event[0].filter);
     try std.testing.expectEqual(video_out_flip_ident, event[0].ident);
-    try std.testing.expectEqual(@as(i64, 77), event[0].data);
+    try std.testing.expectEqual(packVideoOutFlipData(77), event[0].data);
+    try std.testing.expectEqual(@as(u64, 77), @as(u64, @bitCast(event[0].data)) >> 16);
     try std.testing.expectEqual(@as(u64, 0x1234), event[0].user_data);
 }
 

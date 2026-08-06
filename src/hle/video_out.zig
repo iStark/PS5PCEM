@@ -46,10 +46,16 @@ pub const Registration = struct {
     attribute: BufferAttribute2,
 };
 
+/// Host-side flip status. Guest `sceVideoOutGetFlipStatus` maps this into the
+/// full PS5 `SceVideoOutFlipStatus` layout (see bootstrap VideoOutFlipStatus).
 pub const FlipStatus = struct {
     count: u64 = 0,
-    argument: i64 = 0,
+    process_time: u64 = 0,
+    flip_argument: i64 = 0,
+    process_time_counter: u64 = 0,
+    flip_pending_count: i32 = 0,
     current_buffer: i32 = 0,
+    submit_process_time_counter: u64 = 0,
 };
 
 pub const RegisterError = error{
@@ -273,8 +279,11 @@ pub fn completeFlip(flip: gpu.state.Flip) bool {
         return false;
     }
     flip_status.count += 1;
-    flip_status.argument = flip.argument;
+    flip_status.flip_argument = flip.argument;
     flip_status.current_buffer = flip.display_buffer_index;
+    flip_status.flip_pending_count = 0;
+    // process_time / process_time_counter filled at GetFlipStatus time so they
+    // stay current when the title polls after the equeue wakes.
     if (previous_buffer >= 0 and previous_buffer < maximum_buffers) {
         buffer_labels[@intCast(previous_buffer)] = 0;
     }
@@ -308,7 +317,7 @@ test "registered buffers resolve through a completed SetFlip" {
     try std.testing.expectEqual(@as(u32, 4), registration.attribute.width);
     try std.testing.expect(completeFlip(flip));
     try std.testing.expectEqual(@as(u64, 1), status(primary_handle).?.count);
-    try std.testing.expectEqual(@as(i64, 77), status(primary_handle).?.argument);
+    try std.testing.expectEqual(@as(i64, 77), status(primary_handle).?.flip_argument);
 }
 
 test "attribute groups and buffer slots cannot overlap" {

@@ -1272,16 +1272,27 @@ fn kernelSleep(seconds: u32) callconv(abi.guest) i32 {
     return errno.ok;
 }
 
-fn getProcessTime() callconv(abi.guest) u64 {
+/// Process time in microseconds since attach — used by VideoOut flip status
+/// so titles can pace off completed flips.
+pub fn processTimeMicroseconds() u64 {
     const now = clockNanoseconds(1);
     const elapsed = @max(@as(i96, 0), now - process_start_nanoseconds);
     return @intCast(@divTrunc(elapsed, std.time.ns_per_us));
 }
 
-fn getProcessTimeCounter() callconv(abi.guest) u64 {
+/// Nanosecond process-time counter (same units as sceKernelGetProcessTimeCounter).
+pub fn processTimeCounter() u64 {
     const now = clockNanoseconds(1);
     const elapsed = @max(@as(i96, 0), now - process_start_nanoseconds);
     return @intCast(elapsed);
+}
+
+fn getProcessTime() callconv(abi.guest) u64 {
+    return processTimeMicroseconds();
+}
+
+fn getProcessTimeCounter() callconv(abi.guest) u64 {
+    return processTimeCounter();
 }
 
 fn getProcessTimeCounterFrequency() callconv(abi.guest) u64 {

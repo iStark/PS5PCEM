@@ -983,7 +983,7 @@ mapping metadata where required.
 **`libkernel` — pthread bootstrap and TLS** ([src/hle/libs/kernel_threading.zig](src/hle/libs/kernel_threading.zig))
 
 Guest pthread and attribute handles are stable opaque pointers, matching the
-firmware ABI used by both reference emulators. The manager owns their lifecycle,
+firmware ABI. The manager owns their lifecycle,
 copies attributes at creation, creates one TLS/TCB/DTV mapping per thread, and
 reclaims it after join or detached completion. The initial process thread uses
 the same path through `Runtime.prepareInitialThread`, so it does not receive a
@@ -1177,8 +1177,7 @@ What a shipped `libSceAgcDriver` asks for is documented in
 comes first, what answering it unlocks, and — for the one whose payload looks
 like a request but is not — why. It was obtained by running the driver against
 this layer and reading its own diagnostics, then confirming each reading against
-its machine code. Neither reference emulator records any of it, because both
-reimplement the graphics API and never reach a device node.
+its machine code.
 
 Mode-switch reads are answered as clear, which is the state of a retail console
 and not an invented value; only the byte count the request itself declares is
@@ -1320,31 +1319,35 @@ bootstrap draws do not bind a color or depth target, but their context, shader
 and user-config lists reach the persistent tracker and the typed draw-state
 callback without an invalid packet or a stopped queue.
 
-The backported Terminator test with its complete directory supplied through
-`--app0` now creates the Vulkan VideoOut window, loads all six executable images,
-registers queues 32–87, and completes 503 positional reads of Unity metadata and
-assets without an I/O refusal. The earlier repeated 16-packet preambles were not
-empty frames: they were command `#49`, while the scene indirect buffers arrived
-separately through the then-unknown command `#50`. With its ABI restored, the
-first scene DCB reaches the persistent PM4 tracker and Vulkan executor.
+### Live title bring-up (current)
 
-That DCB now passes its timestamp `RELEASE_MEM` and first real compute dispatch.
-The latter is a 14-instruction, 96-workgroup initializer which reads 6,112 guest
-addresses and writes zero to the corresponding persistent 64 KiB GDS locations;
-it is executed by a shape- and descriptor-checked semantic path. Compute system
-inputs are also reconstructed from `COMPUTE_PGM_RSRC2`: user-SGPR count determines
-the workgroup-ID SGPRs, while the local invocation ID populates `v0..v2` as
-declared. Side-effect-free ALU-only dispatches can be elided, but memory, image,
-atomic, GDS, message and export effects are never discarded by that analysis.
+On Windows, `game-run` with a full content tree attaches a Vulkan VideoOut
+window, loads the reachable module graph, and feeds submitted DCBs into the
+scheduler and Vulkan backend. Observed startup work now includes:
 
-The following 14-instruction kernel — a masked indexed dword copy through the
-V# descriptors in `s0:s3` / `s4:s7` with extent and EXEC masking — is executed
-rather than rejected. Scene bring-up is therefore past "no GPU submission" and
-past that first concrete compute shape. A live headless run of the title still
-faults later in `Il2cppUserAssemblies.prx` on a null object while a VideoOut
-flip worker is waiting on filter `-13`, so the continuous draw/`SetFlip` stream
-is not yet the limiting observation; the guest CPU path has to finish
-initialising the object the IL2CPP code expects.
+- GDS initialization and several compute dispatches (including buffer-copy
+  shapes) that complete successfully when V# descriptors resolve.
+- Graphics draws that ignore depth/MRT extras and DCC/compression flags on the
+  first host path so colour-target work is not rejected wholesale.
+- Guest vertex/pixel SPIR-V translation for common RDNA2 ALU, MUBUF, sampling
+  and compressed colour export. Missing attribute V#s soft-skip; when the
+  primary attribute bank is absent the draw uses a diagnostic vertex triangle
+  so the guest pixel path still runs.
+- Sampled textures staged through the tiling map. Empty guest surfaces are
+  reported (tile mode, address, raw-byte probe) and may use a temporary
+  gradient so the fragment path stays observable while detile/upload catch up.
+- After a successful colour writeback: a host PPM dump of the first frame,
+  an eager present into the VideoOut swapchain, and normal `SetFlip` / equeue
+  delivery (filter `-13`). Flip status fills process-time fields; flip
+  arguments are packed into event data as `ident | (arg << 16)` with
+  `sceVideoOutGetEventData` for decoding.
+
+What still blocks a stable multi-frame game loop is mostly on the CPU/HLE side
+and deeper graphics recovery: AGC shader-header lookup for some NGG programs
+(so attribute tables and SRT roots appear), real vertex V# recovery instead of
+the probe triangle, genuine texture contents instead of empty/debug fills, and
+long-lived guest init after the first flips (null object faults in managed code
+remain title-dependent).
 
 ## Error codes
 
@@ -1360,20 +1363,16 @@ from leaking into host code where nothing would check it.
 
 ## Roadmap
 
-1. Clear the IL2CPP null-object fault on the title's main thread so init reaches
-   a stable flip/submit loop rather than dying beside an already-waiting
-   VideoOut worker.
-2. Follow the scene DCB past the executed compute path to its first draw,
-   adding only the RDNA2 operations, resource descriptors and GDS semantics
-   demonstrated by each next rejected shader.
-3. Validate the first color-target write and `SetFlip` as a continuous game
-   frame stream, then profile the current all-core spin and remove the hottest
-   scheduler or guest-wait loop without changing its synchronization contract.
-4. Retain submission owner metadata across blocked `WAIT_REG_MEM` continuations
-   and publish the correct delayed graphics completion event when needed.
-5. On contained guest faults, stop remaining guest workers promptly so a crash
-   does not leave AGC `suspendPoint` loops burning cores until the process is
-   killed.
+1. Recover AGC shader headers for NGG/export programs so vertex buffer tables
+   and SRT roots resolve at draw time (attribute V#s instead of the probe VS).
+2. Stage real sampled-image contents when guest tiles are non-empty; tighten
+   detile and metadata handling where layout still disagrees with the title.
+3. Keep the guest process in a stable flip/submit loop after the first frames
+   (clear remaining null-object and missing-service faults during long init).
+4. Profile host CPU spin from AGC `suspendPoint` / guest waits and reduce the
+   hottest loops without changing synchronization contracts.
+5. Retain submission owner metadata across blocked `WAIT_REG_MEM` continuations
+   and publish delayed graphics completion events when needed.
 
 ---
 
@@ -1397,8 +1396,7 @@ Machine execution is represented by `cpu.Bridge`. Its request includes the
 entry point, six System V AMD64 integer arguments, thread identity, guest stack,
 optional pre-call RSP, and complete TLS context. This boundary is intentionally
 strict: POSIX hosts commonly use FS for their own TLS, while Windows x86-64
-keeps the TEB under GS and leaves FS available to guest code. Kyty and SharpEmu
-make the same separation, although their patch/trampoline machinery differs.
+keeps the TEB under GS and leaves FS available to guest code.
 
 `cpu.NativeBridge` implements the first direct backend for Windows x86-64. It
 checks the operating system's `PF_RDWRFSGSBASE_AVAILABLE` capability before use,

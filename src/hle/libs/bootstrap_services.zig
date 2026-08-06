@@ -361,11 +361,42 @@ fn videoOutGetFlipStatus(handle: i32, status: ?*VideoOutFlipStatus) callconv(abi
     if (!validVideoHandle(handle)) return video_out_error_invalid_handle;
     const output = status orelse return video_out_error_invalid_address;
     const current = video_out.status(handle) orelse return video_out_error_invalid_handle;
+    // Full PS5 layout: titles poll process-time fields after
+    // WaitEqueue(filter=-13) and skip init paths when they look unset/stale.
     output.* = .{
         .count = current.count,
-        .flip_argument = current.argument,
+        .process_time = kernel_runtime.processTimeMicroseconds(),
+        .reserved0 = 0,
+        .flip_argument = current.flip_argument,
+        .reserved1 = 0,
+        .process_time_counter = kernel_runtime.processTimeCounter(),
+        .gc_queue_count = 0,
+        .flip_pending_count = current.flip_pending_count,
         .current_buffer = current.current_buffer,
+        .reserved2 = 0,
+        .submit_process_time_counter = current.submit_process_time_counter,
+        .reserved3 = [_]u64{0} ** 7,
     };
+    return errno.ok;
+}
+
+/// Decodes the flip/vblank payload from a VideoOut equeue event.
+/// Event `data` stores `ident | (flip_arg << 16)`; titles read the arg via
+/// this helper rather than raw sceKernelGetEventData.
+fn videoOutGetEventData(event: ?*const kernel_event_queue.Event, out_data: ?*u64) callconv(abi.guest) i32 {
+    const value = event orelse return video_out_error_invalid_address;
+    const output = out_data orelse return video_out_error_invalid_address;
+    if (value.filter != kernel_event_queue.video_out_filter) {
+        return video_out_error_invalid_value;
+    }
+    if (value.ident != kernel_event_queue.video_out_flip_ident and
+        value.ident != kernel_event_queue.video_out_vblank_ident)
+    {
+        return video_out_error_invalid_value;
+    }
+    // High 48 bits of data carry the flip argument.
+    const packed_data: u64 = @bitCast(value.data);
+    output.* = packed_data >> 16;
     return errno.ok;
 }
 
@@ -480,6 +511,7 @@ const video_out_exports = [_]symbols.Export{
     .{ .name = "sceVideoOutAddFlipEvent", .function = trace.wrap("sceVideoOutAddFlipEvent", &videoOutAddFlipEvent), .expect_id = "HXzjK9yI30k" },
     .{ .name = "sceVideoOutDeleteFlipEvent", .function = trace.wrap("sceVideoOutDeleteFlipEvent", &videoOutDeleteFlipEvent), .expect_id = "-Ozn0F1AFRg" },
     .{ .name = "sceVideoOutGetEventId", .function = trace.wrap("sceVideoOutGetEventId", &videoOutGetEventId), .expect_id = "U2JJtSqNKZI" },
+    .{ .name = "sceVideoOutGetEventData", .function = trace.wrap("sceVideoOutGetEventData", &videoOutGetEventData), .expect_id = "rWUTcKdkUzQ" },
     .{ .name = "sceVideoOutGetOutputStatus", .function = trace.wrap("sceVideoOutGetOutputStatus", &videoOutGetOutputStatus), .expect_id = "utPrVdxio-8" },
     .{ .name = "sceVideoOutIsOutputSupported", .function = trace.wrap("sceVideoOutIsOutputSupported", &videoOutIsOutputSupported), .expect_id = "Nv8c-Kb+DUM" },
     .{ .name = "sceVideoOutConfigureOutput", .function = trace.wrap("sceVideoOutConfigureOutput", &videoHandleOption), .expect_id = "w0hLuNarQxY" },
