@@ -2591,14 +2591,29 @@ pub const Renderer = struct {
         );
     }
 
-    fn drawGuestGraphics(self: *Renderer, state: *const gpu.State, draw: GuestDraw) anyerror!void {
+    fn drawGuestGraphics(
+        self: *Renderer,
+        state: *const gpu.State,
+        draw: GuestDraw,
+        vertex_stage: gpu.resources.ShaderStage,
+    ) anyerror!void {
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
         const render_state = gpu.resources.decodeRenderState(state);
         if (render_state.active_color_count == 0) return Error.MissingColorTarget;
-        if (render_state.active_color_count != 1 or render_state.depth_control.test_enabled or
-            render_state.depth_control.write_enabled)
+        // Depth and multi-MRT are ignored on this first host path: only colour
+        // target 0 is rendered. Rejecting depth-enabled draws was the entire
+        // scene path for Terminator (every draw had a depth state).
+        if (render_state.depth_control.test_enabled or render_state.depth_control.write_enabled or
+            render_state.active_color_count != 1)
         {
-            return Error.UnsupportedGraphicsState;
+            std.debug.print(
+                "[vulkan dcb] draw: ignoring depth/mrt extras (colors={d} depth_test={any} depth_write={any})\n",
+                .{
+                    render_state.active_color_count,
+                    render_state.depth_control.test_enabled,
+                    render_state.depth_control.write_enabled,
+                },
+            );
         }
         var target_descriptor: ?gpu.resources.ColorTarget = null;
         for (render_state.color_targets) |candidate| {
@@ -2608,16 +2623,38 @@ pub const Renderer = struct {
             break;
         }
         const descriptor = target_descriptor orelse return Error.MissingColorTarget;
-        if (descriptor.format != 10 or descriptor.samples_log2 != 0 or descriptor.fragments_log2 != 0 or
-            descriptor.dcc_enabled or descriptor.cmask_fast_clear or descriptor.fmask_compression)
-        {
+        if (descriptor.samples_log2 != 0 or descriptor.fragments_log2 != 0) {
+            std.debug.print(
+                "[vulkan dcb] draw rejected: MSAA color target samples={d} frags={d}\n",
+                .{ descriptor.samples_log2, descriptor.fragments_log2 },
+            );
             return Error.UnsupportedColorTarget;
+        }
+        // DCC/CMASK/FMASK are ignored on the first path: the surface is staged
+        // as raw tiles. Compressed contents may look wrong until a decompressor
+        // exists, but rejecting them blocks every Terminator draw (DCC=on).
+        if (descriptor.dcc_enabled or descriptor.cmask_fast_clear or descriptor.fmask_compression) {
+            std.debug.print(
+                "[vulkan dcb] draw: ignoring compression flags dcc={any} cmask={any} fmask={any} fmt={d}\n",
+                .{
+                    descriptor.dcc_enabled,
+                    descriptor.cmask_fast_clear,
+                    descriptor.fmask_compression,
+                    descriptor.format,
+                },
+            );
+        }
+        if (descriptor.format != 10) {
+            std.debug.print(
+                "[vulkan dcb] draw: treating color format {d} as 32bpp RGBA\n",
+                .{descriptor.format},
+            );
         }
         const layout = try gpu.SurfaceLayout.fromColorTarget(descriptor);
         if (layout.layers != 1 or layout.block.bytes_per_element != 4) return Error.UnsupportedColorTarget;
         const pipeline_state = try guestGraphicsState(&render_state, descriptor);
         const target = GuestColorTarget{ .descriptor = descriptor, .layout = layout };
-        const vertex_address = gpu.resources.ShaderStage.vertex.programAddress(state) orelse {
+        const vertex_address = vertex_stage.programAddress(state) orelse {
             return Error.MissingGraphicsProgram;
         };
         const fragment_address = gpu.resources.ShaderStage.pixel.programAddress(state) orelse {
@@ -2633,7 +2670,11 @@ pub const Renderer = struct {
         else
             null;
         const fragment_bindings = try gpu.ShaderBindings.capture(state, .pixel, fragment_header, reader);
-        var graphics_resources = try self.prepareGraphicsResources(&fragment_bindings, &fragment_analysis);
+        var graphics_resources = try self.prepareGraphicsResources(
+            &fragment_bindings,
+            reader,
+            &fragment_analysis,
+        );
         defer graphics_resources.deinit(self);
         var vertex_module = try vertex_analysis.translateSpirv(self.allocator, .{
             .stage = .vertex,
@@ -2660,13 +2701,20 @@ pub const Renderer = struct {
     fn prepareGraphicsResources(
         self: *Renderer,
         bindings: *const gpu.ShaderBindings,
+        reader: gpu.ShaderMemoryReader,
         analysis: *const gpu.ShaderAnalysis,
     ) anyerror!GraphicsResources {
         var result = GraphicsResources{};
         errdefer result.deinit(self);
         for (analysis.program.instructions.items) |inst| {
             if (inst.opcode != .image_sample) continue;
-            if (inst.src1.kind != .sgpr or inst.src2.kind != .sgpr) return Error.UnsupportedSampledImage;
+            if (inst.src1.kind != .sgpr or inst.src2.kind != .sgpr) {
+                std.debug.print(
+                    "[vulkan dcb] image_sample resource kinds t#={s} s#={s}\n",
+                    .{ @tagName(inst.src1.kind), @tagName(inst.src2.kind) },
+                );
+                return Error.UnsupportedSampledImage;
+            }
             var existing = false;
             for (result.mappings[0..result.mapping_count]) |mapping| {
                 if (mapping.resource_sgpr == inst.src1.reg and mapping.sampler_sgpr == inst.src2.reg) {
@@ -2676,14 +2724,38 @@ pub const Renderer = struct {
             }
             if (existing) continue;
             if (result.mapping_count >= maximum_storage_descriptors) return Error.UnsupportedSampledImage;
-            const image_descriptor = (try bindings.inlineImageDescriptor(inst.src1.reg)) orelse {
+            // Prefer T#/S# already in USER_DATA; otherwise take the next SRT
+            // texture/sampler slots in declaration order (common AGC layout).
+            const image_descriptor = (try bindings.inlineImageDescriptor(inst.src1.reg)) orelse
+                (try resolveSrtImageDescriptor(bindings, reader, result.mapping_count)) orelse {
+                std.debug.print(
+                    "[vulkan dcb] sampled image missing for s{d} (user_data={d} srt={any})\n",
+                    .{ inst.src1.reg, bindings.user_data_count, bindings.srt_address != null },
+                );
                 return Error.UnsupportedSampledImage;
             };
-            const sampler_descriptor = (try bindings.inlineSamplerDescriptor(inst.src2.reg)) orelse {
+            const sampler_descriptor = (try bindings.inlineSamplerDescriptor(inst.src2.reg)) orelse
+                (try resolveSrtSamplerDescriptor(bindings, reader, result.mapping_count)) orelse {
+                std.debug.print(
+                    "[vulkan dcb] sampler missing for s{d}\n",
+                    .{inst.src2.reg},
+                );
                 return Error.UnsupportedSampledImage;
             };
             const descriptor_index: u32 = @intCast(result.mapping_count);
-            const image = try self.stageSampledImage(image_descriptor, sampler_descriptor, descriptor_index);
+            const image = self.stageSampledImage(image_descriptor, sampler_descriptor, descriptor_index) catch |err| {
+                std.debug.print(
+                    "[vulkan dcb] stageSampledImage failed: {s} addr=0x{x} {d}x{d} fmt={d}\n",
+                    .{
+                        @errorName(err),
+                        image_descriptor.address,
+                        image_descriptor.width,
+                        image_descriptor.height,
+                        image_descriptor.unified_format,
+                    },
+                );
+                return err;
+            };
             result.images[result.image_count] = image;
             result.image_count += 1;
             result.mappings[result.mapping_count] = .{
@@ -2801,15 +2873,35 @@ pub const Renderer = struct {
         sampler_descriptor: gpu.resources.SamplerDescriptor,
         descriptor_index: u32,
     ) anyerror!PreparedSampledImage {
-        if (descriptor.unified_format != 56 or descriptor.image_type != .color_2d or
-            descriptor.metadata_address != 0)
-        {
+        if (descriptor.unified_format != 56) {
+            std.debug.print(
+                "[vulkan dcb] sampled image format {d} (want 56/RGBA8)\n",
+                .{descriptor.unified_format},
+            );
             return Error.UnsupportedSampledImage;
+        }
+        if (descriptor.image_type != .color_2d) {
+            std.debug.print(
+                "[vulkan dcb] sampled image type {s} (want color_2d)\n",
+                .{@tagName(descriptor.image_type)},
+            );
+            return Error.UnsupportedSampledImage;
+        }
+        // Metadata pointers (counter/DCC) are ignored for the first sample path.
+        if (descriptor.metadata_address != 0) {
+            std.debug.print(
+                "[vulkan dcb] sampled image: ignoring metadata @0x{x}\n",
+                .{descriptor.metadata_address},
+            );
         }
         const layout = try gpu.SurfaceLayout.fromImage(descriptor);
         if (layout.layers != 1 or layout.block.bytes_per_element != 4 or
             layout.staging_bytes == 0 or layout.staging_bytes > maximum_frame_bytes)
         {
+            std.debug.print(
+                "[vulkan dcb] sampled image layout rejected layers={d} bpp={d} stage=0x{x}\n",
+                .{ layout.layers, layout.block.bytes_per_element, layout.staging_bytes },
+            );
             return Error.UnsupportedSampledImage;
         }
         const byte_count = std.math.cast(usize, layout.staging_bytes) orelse return Error.UnsupportedSampledImage;
@@ -3275,10 +3367,21 @@ pub const Renderer = struct {
         return true;
     }
 
+    /// VS program bank for a draw. NGG/export paths publish the vertex program
+    /// in the ES (export) registers rather than the classic VS bank; geometry
+    /// is a last resort for the same reason.
+    fn graphicsVertexStage(state: *const gpu.State) ?gpu.resources.ShaderStage {
+        for ([_]gpu.resources.ShaderStage{ .vertex, .export_shader, .geometry }) |stage| {
+            if (stage.programAddress(state) != null) return stage;
+        }
+        return null;
+    }
+
     fn dcbDraw(context: ?*anyopaque, state: *const gpu.State, packet: gpu.pm4.Packet) bool {
         const self = fromContext(context);
         self.draw_callbacks += 1;
-        const has_vertex = gpu.resources.ShaderStage.vertex.programAddress(state) != null;
+        const vertex_stage = graphicsVertexStage(state);
+        const has_vertex = vertex_stage != null;
         const has_fragment = gpu.resources.ShaderStage.pixel.programAddress(state) != null;
         if (!has_vertex and !has_fragment and !self.graphics_probe_enabled) return true;
 
@@ -3310,16 +3413,22 @@ pub const Renderer = struct {
         if (has_vertex != has_fragment) {
             self.last_draw_error = Error.MissingGraphicsProgram;
             std.debug.print(
-                "[vulkan dcb] draw skipped: incomplete graphics programs (vs={any} ps={any})\n",
-                .{ has_vertex, has_fragment },
+                "[vulkan dcb] draw skipped: incomplete graphics programs (vs={any} ps={any} vs_bank={s})\n",
+                .{
+                    has_vertex,
+                    has_fragment,
+                    if (vertex_stage) |stage| @tagName(stage) else "none",
+                },
             );
             return true;
         }
         if (has_vertex)
-            self.drawGuestGraphics(state, draw) catch |err| {
+            self.drawGuestGraphics(state, draw, vertex_stage.?) catch |err| {
                 self.last_draw_error = err;
                 std.debug.print("[vulkan dcb] draw rejected: {s}\n", .{@errorName(err)});
-                return false;
+                // Soft-skip shader/state gaps so one incomplete draw does not
+                // kill the DCB before a later flip.
+                return true;
             }
         else
             self.drawGraphicsProbe() catch |err| {
@@ -3330,6 +3439,10 @@ pub const Renderer = struct {
         if (has_vertex) self.guest_graphics_draws += 1;
         self.translated_draws += 1;
         self.last_draw_error = null;
+        std.debug.print(
+            "[vulkan dcb] draw ok: {s} (#{d})\n",
+            .{ if (has_vertex) "guest" else "probe", self.translated_draws },
+        );
         return true;
     }
 
@@ -3458,6 +3571,26 @@ fn scalarPrefixEnd(analysis: *const gpu.ShaderAnalysis) u32 {
         }
     }
     return end;
+}
+
+fn resolveSrtImageDescriptor(
+    bindings: *const gpu.ShaderBindings,
+    reader: gpu.ShaderMemoryReader,
+    slot: usize,
+) anyerror!?gpu.resources.ImageDescriptor {
+    if (slot > std.math.maxInt(u16)) return null;
+    const binding = (try bindings.resolve(reader, .read_only_texture, @intCast(slot))) orelse return null;
+    return binding.descriptor.read_only_texture;
+}
+
+fn resolveSrtSamplerDescriptor(
+    bindings: *const gpu.ShaderBindings,
+    reader: gpu.ShaderMemoryReader,
+    slot: usize,
+) anyerror!?gpu.resources.SamplerDescriptor {
+    if (slot > std.math.maxInt(u16)) return null;
+    const binding = (try bindings.resolve(reader, .sampler, @intCast(slot))) orelse return null;
+    return binding.descriptor.sampler;
 }
 
 fn scalarBufferDescriptor(

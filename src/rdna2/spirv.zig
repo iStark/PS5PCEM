@@ -1212,7 +1212,7 @@ const Builder = struct {
             .v_add_lshl_u32 => try self.addShiftLeft(inst),
             // Bitfield extract: dst = (src0 >> (src1 & 31)) & mask(src2 & 31).
             // Width 0 means a full 32-bit field on GCN/RDNA.
-            .v_bfe_u32 => try self.bitfieldExtract(inst, false),
+            .s_bfe_u32, .v_bfe_u32 => try self.bitfieldExtract(inst, false),
             .v_bfe_i32 => try self.bitfieldExtract(inst, true),
             // Ternary packing helpers used heavily by Unity compute kernels.
             .v_and_or_b32 => try self.andOr(inst),
