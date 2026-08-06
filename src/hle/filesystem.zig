@@ -13,6 +13,7 @@
 //! told plainly that the filesystem is read-only.
 
 const std = @import("std");
+const audio_fs = @import("audio_fs.zig");
 
 /// Descriptors below this belong to the standard streams.
 pub const first_descriptor: i32 = 3;
@@ -226,6 +227,9 @@ const OpenFile = struct {
     /// Null for a device node, which has no host file behind it.
     file: ?std.Io.File = null,
     device: ?Device = null,
+    /// In-memory payload for synthesised files (FSB-backed virtual WAVs).
+    /// Owned by this descriptor; freed on close via page_allocator.
+    memory: ?[]u8 = null,
     /// Read position. Kept here and used with positional reads so that two
     /// descriptors on one file cannot disturb each other.
     offset: u64 = 0,
@@ -284,6 +288,7 @@ pub fn detach() void {
     }
     active_io = null;
     root = null;
+    audio_fs.reset();
 }
 
 pub fn isAttached() bool {
@@ -334,7 +339,11 @@ pub fn open(path: []const u8, flags: i32) Error!i32 {
     if (flags & O.directory != 0) return Error.IsDirectory;
 
     const file = directory.openFile(io, relative, .{}) catch |err| switch (err) {
-        error.FileNotFound, error.NotDir, error.BadPathName => return Error.NotFound,
+        error.FileNotFound, error.NotDir, error.BadPathName => {
+            // Sparse dumps omit loose Media/Resources/audio/**.wav; serve PCM
+            // extracted from FSB5 banks inside resources.resource instead.
+            return openVirtualAudio(path, relative, io, directory);
+        },
         error.IsDir => return Error.IsDirectory,
         else => return Error.IoFailed,
     };
@@ -348,6 +357,25 @@ pub fn open(path: []const u8, flags: i32) Error!i32 {
     for (&open_files, 0..) |*slot, index| {
         if (slot.* != null) continue;
         var entry = OpenFile{ .file = file, .size = size };
+        entry.path_length = @min(path.len, maximum_path);
+        @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
+        slot.* = entry;
+        return first_descriptor + @as(i32, @intCast(index));
+    }
+    return Error.TooManyOpenFiles;
+}
+
+fn openVirtualAudio(path: []const u8, relative: []const u8, io: std.Io, directory: std.Io.Dir) Error!i32 {
+    const resolved = audio_fs.resolveVirtualWav(relative, directory, io, std.heap.page_allocator) catch {
+        return Error.NotFound;
+    };
+
+    table_lock.lock();
+    defer table_lock.unlock();
+
+    for (&open_files, 0..) |*slot, index| {
+        if (slot.* != null) continue;
+        var entry = OpenFile{ .memory = resolved.bytes, .size = resolved.size };
         entry.path_length = @min(path.len, maximum_path);
         @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
         slot.* = entry;
@@ -401,6 +429,9 @@ pub fn close(descriptor: i32) Error!void {
         const io = active_io orelse return Error.NotAttached;
         file.close(io);
     }
+    if (entry.memory) |memory| {
+        std.heap.page_allocator.free(memory);
+    }
     slot.* = null;
 }
 
@@ -417,6 +448,19 @@ pub fn read(descriptor: i32, buffer: []u8) Error!usize {
     }
     const offset = slot.*.?.offset;
     const device = slot.*.?.device;
+    if (slot.*.?.memory) |memory| {
+        table_lock.unlock();
+        if (offset >= memory.len) return 0;
+        const available = memory.len - offset;
+        const count = @min(buffer.len, available);
+        @memcpy(buffer[0..count], memory[offset .. offset + count]);
+        table_lock.lock();
+        defer table_lock.unlock();
+        if (slot.*) |*entry| {
+            if (entry.memory != null) entry.offset = offset + count;
+        }
+        return count;
+    }
     const file = slot.*.?.file orelse {
         table_lock.unlock();
         // The entropy device is read like a file even though nothing is stored
@@ -457,6 +501,13 @@ pub fn pread(descriptor: i32, buffer: []u8, offset: u64) Error!usize {
     };
     table_lock.unlock();
 
+    if (entry.memory) |memory| {
+        if (offset >= memory.len) return 0;
+        const available = memory.len - offset;
+        const count = @min(buffer.len, available);
+        @memcpy(buffer[0..count], memory[offset .. offset + count]);
+        return count;
+    }
     const file = entry.file orelse {
         // Reading entropy at an offset is the same as reading it anywhere: the
         // device has no positions, so an offset names nothing to skip.
@@ -521,7 +572,13 @@ pub fn stat(path: []const u8, out: *Stat) Error!void {
     const relative = stripMount(path) orelse return Error.NotFound;
 
     const info = directory.statFile(io, relative, .{}) catch |err| switch (err) {
-        error.FileNotFound, error.NotDir, error.BadPathName => return Error.NotFound,
+        error.FileNotFound, error.NotDir, error.BadPathName => {
+            if (audio_fs.virtualWavSize(relative, directory, io)) |size| {
+                fillStat(out, size, false);
+                return;
+            }
+            return Error.NotFound;
+        },
         else => return Error.IoFailed,
     };
     fillStat(out, info.size, info.kind == .directory);

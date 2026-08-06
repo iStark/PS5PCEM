@@ -86,6 +86,7 @@ pub fn registerAll(db: *Database, gpa: @import("std").mem.Allocator) symbols.Err
 
 test {
     _ = libs.audio;
+    _ = @import("audio_fs.zig");
     _ = libs.bootstrap_services;
     _ = libs.dialogs;
     _ = nid;
