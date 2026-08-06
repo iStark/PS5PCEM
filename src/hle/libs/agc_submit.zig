@@ -418,6 +418,15 @@ fn backendRelease(_: ?*anyopaque, value: gpu.state.ReleaseMem) bool {
             std.mem.writeInt(u64, &bytes, value.data, .little);
             break :blk backendWrite(null, value.address, &bytes);
         },
+        3, 4 => blk: {
+            // Timestamp or GPU counter. Write a dummy 64-bit value if the backend didn't handle it.
+            const dummy_timestamp = struct {
+                var counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(1);
+            };
+            const val = dummy_timestamp.counter.fetchAdd(1, .monotonic);
+            std.mem.writeInt(u64, &bytes, val, .little);
+            break :blk backendWrite(null, value.address, &bytes);
+        },
         else => true,
     };
     if (ok) {
@@ -461,7 +470,11 @@ fn backendEvent(_: ?*anyopaque, value: gpu.state.EventWrite) bool {
     if (!handled) {
         if (value.address) |addr| {
             var bytes: [8]u8 = undefined;
-            std.mem.writeInt(u64, &bytes, 1, .little);
+            const dummy_timestamp = struct {
+                var counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(1);
+            };
+            const val = dummy_timestamp.counter.fetchAdd(1, .monotonic);
+            std.mem.writeInt(u64, &bytes, val, .little);
             _ = backendWrite(null, addr, &bytes);
             kernel_runtime.wakeSyncAddress(addr, std.math.maxInt(usize));
         }
