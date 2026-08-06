@@ -1349,12 +1349,14 @@ scheduler and Vulkan backend. Observed startup work now includes:
   arguments are packed into event data as `ident | (arg << 16)` with
   `sceVideoOutGetEventData` for decoding.
 
-First guest draws now cover the colour target with guest VS + guest PS
-(attribute MUBUF SOFFSET encodings and VertexIndex recovery). Empty textures
-still use a debug gradient. What still blocks a stable multi-frame game loop
-is mostly long-lived CPU/HLE work after the first flips (null-object faults
-in managed code remain title-dependent) and real texture contents when guest
-tiles are non-empty.
+First guest draws cover the colour target with guest VS + guest PS (attribute
+MUBUF SOFFSET encodings and VertexIndex recovery). Empty textures still use a
+debug gradient when the guest surface is all-zero (typical of the first
+fullscreen pass before asset upload). Near-null object probes in managed code
+(`cmp [obj+disp], 0` with `obj == null`) are stepped past so the title can take
+its null branch instead of dying after the first flip; the process now survives
+past that historical crash site, though multi-draw progress may still stall in
+AGC `suspendPoint` / wait loops.
 
 ## Error codes
 

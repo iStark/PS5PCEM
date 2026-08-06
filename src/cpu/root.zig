@@ -206,6 +206,8 @@ threadlocal var handling_native_fault = false;
 /// host is losing state the guest depends on, and a run where it stays at zero
 /// means something else is keeping threads on the processor.
 pub var fs_base_restorations: std.atomic.Value(usize) = .init(0);
+/// How many `cmp [null+disp], imm` probes were stepped past during bring-up.
+pub var null_object_compare_recoveries: std.atomic.Value(u64) = .init(0);
 
 /// Direct System V AMD64 execution on a Windows x86-64 host.
 ///
@@ -577,6 +579,21 @@ const WindowsX64Machine = struct {
             _ = fs_base_restorations.fetchAdd(1, .monotonic);
             return exception_continue_execution;
         }
+        // IL2CPP/Unity often does `cmp byte/dword [obj+0x20], 0` / `je null_path`
+        // after a flip. When obj is still null during bring-up, treat the read as
+        // zero and take the null branch instead of killing the process.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            tryEmulateNullObjectCompare(context, record.ExceptionInformation[1]))
+        {
+            _ = null_object_compare_recoveries.fetchAdd(1, .monotonic);
+            std.debug.print(
+                "[cpu] recovered null-object cmp @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip, record.ExceptionInformation[1], null_object_compare_recoveries.load(.monotonic) },
+            );
+            return exception_continue_execution;
+        }
 
         if (handling_native_fault) return std.os.windows.EXCEPTION_CONTINUE_SEARCH;
         // A call through a function pointer that was never filled in leaves
@@ -645,6 +662,67 @@ const WindowsX64Machine = struct {
         context.Rcx = @intFromPtr(frame);
         context.Rip = @intFromPtr(&ps5NativeEscapeWindowsX64);
         return exception_continue_execution;
+    }
+
+    /// Arithmetic flag bits used by conditional branches after CMP.
+    const flag_cf: u32 = 0x0001;
+    const flag_pf: u32 = 0x0004;
+    const flag_af: u32 = 0x0010;
+    const flag_zf: u32 = 0x0040;
+    const flag_sf: u32 = 0x0080;
+    const flag_of: u32 = 0x0800;
+    const flag_arith_mask: u32 = flag_cf | flag_pf | flag_af | flag_zf | flag_sf | flag_of;
+
+    /// Emulates `cmp [null+disp], imm` as if the memory byte/dword was zero.
+    /// Returns true when the instruction was stepped past with flags updated.
+    fn tryEmulateNullObjectCompare(context: *std.os.windows.CONTEXT, memory_address: u64) bool {
+        if (memory_address >= lost_base_window) return false;
+        // Do not require isGuestAddress: the VEH already established this thread
+        // is in a guest call, and some titles map PRX outside the nominal
+        // ranges during bring-up.
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        var offset: usize = 0;
+        if (code[0] & 0xf0 == 0x40) offset = 1;
+        const opcode = code[offset];
+        // 80 /7 ib  — CMP r/m8, imm8
+        // 83 /7 ib  — CMP r/m16/32/64, imm8
+        // 81 /7 id  — CMP r/m32/64, imm32
+        if (opcode != 0x80 and opcode != 0x83 and opcode != 0x81) return false;
+        const modrm = code[offset + 1];
+        if ((modrm >> 3) & 7 != 7) return false; // /7 = CMP
+        const mod = modrm >> 6;
+        const rm = modrm & 7;
+        // Reject SIB and rip-relative — only plain [reg(+disp)].
+        if (rm == 4) return false;
+        if (mod == 0 and rm == 5) return false;
+        if (mod == 3) return false; // register form
+        var length: usize = offset + 2;
+        if (mod == 1) length += 1;
+        if (mod == 2) length += 4;
+        const imm_is_byte = opcode == 0x80 or opcode == 0x83;
+        length += if (imm_is_byte) @as(usize, 1) else 4;
+        if (length > 15) return false;
+
+        var imm: u32 = 0;
+        if (imm_is_byte) {
+            imm = code[length - 1];
+        } else {
+            var imm_bytes: [4]u8 = undefined;
+            @memcpy(&imm_bytes, code[length - 4 ..][0..4]);
+            imm = std.mem.readInt(u32, &imm_bytes, .little);
+        }
+        // cmp 0, imm → ZF iff imm==0; CF set when imm!=0 (unsigned borrow).
+        var flags = context.EFlags & ~flag_arith_mask;
+        if (imm == 0) {
+            flags |= flag_zf | flag_pf;
+        } else {
+            flags |= flag_cf;
+            if (imm_is_byte and imm & 0x80 != 0) flags |= flag_sf;
+            if (!imm_is_byte and imm & 0x8000_0000 != 0) flags |= flag_sf;
+        }
+        context.EFlags = flags;
+        context.Rip += length;
+        return true;
     }
 
     fn tryEmulateIllegalInstruction(context: *std.os.windows.CONTEXT) bool {

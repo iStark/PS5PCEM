@@ -3170,22 +3170,33 @@ pub const Renderer = struct {
         const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
         try layout.stage(reader, descriptor.address, linear);
         var nonzero = countNonzeroRgba(linear);
-        // Probe raw guest bytes: all-zero detile may be a tile-mode mismatch
-        // rather than empty guest memory.
-        var raw_head: [64]u8 = @splat(0);
-        const raw_len = @min(raw_head.len, std.math.cast(usize, layout.required_source_bytes) orelse raw_head.len);
-        const raw_ok = if (raw_len != 0)
-            memory.read(memory.context, descriptor.address, raw_head[0..raw_len])
-        else
-            false;
+        // Probe several points in the guest surface: tiled data may put the
+        // first texels far from the base while the head of the allocation is
+        // still zero (clear/padding).
+        const probe_span = std.math.cast(usize, layout.required_source_bytes) orelse 0;
         var raw_nonzero: u32 = 0;
-        if (raw_ok) {
-            for (raw_head[0..raw_len]) |b| {
-                if (b != 0) raw_nonzero += 1;
+        var raw_probe_hits: u32 = 0;
+        if (probe_span != 0) {
+            const steps = [_]u64{ 0, probe_span / 4, probe_span / 2, (probe_span * 3) / 4 };
+            var step_i: usize = 0;
+            while (step_i < steps.len) : (step_i += 1) {
+                var chunk: [64]u8 = @splat(0);
+                const at = descriptor.address + steps[step_i];
+                const want = @min(chunk.len, probe_span -% @as(usize, @intCast(@min(steps[step_i], probe_span))));
+                if (want == 0) continue;
+                if (!memory.read(memory.context, at, chunk[0..want])) continue;
+                var nz: u32 = 0;
+                for (chunk[0..want]) |b| {
+                    if (b != 0) nz += 1;
+                }
+                if (nz != 0) {
+                    raw_nonzero += nz;
+                    raw_probe_hits += 1;
+                }
             }
         }
         std.debug.print(
-            "[vulkan dcb] staged sample {d}x{d} tile={s} addr=0x{x} nonzero_texels={d}/{d} raw_head_nz={d}/{d} first_rgba=({d},{d},{d},{d})\n",
+            "[vulkan dcb] staged sample {d}x{d} tile={s} addr=0x{x} nonzero_texels={d}/{d} raw_probe_nz={d} hits={d} first_rgba=({d},{d},{d},{d})\n",
             .{
                 descriptor.width,
                 descriptor.height,
@@ -3194,7 +3205,7 @@ pub const Renderer = struct {
                 nonzero,
                 if (byte_count >= 4) byte_count / 4 else 0,
                 raw_nonzero,
-                raw_len,
+                raw_probe_hits,
                 if (linear.len > 0) linear[0] else 0,
                 if (linear.len > 1) linear[1] else 0,
                 if (linear.len > 2) linear[2] else 0,
@@ -3208,14 +3219,13 @@ pub const Renderer = struct {
             const row_bytes = @as(usize, pitch) * 4;
             const copy_w = @as(usize, descriptor.width) * 4;
             var y: u32 = 0;
-            var linear_nz: u32 = 0;
             while (y < descriptor.height) : (y += 1) {
                 const src = descriptor.address + @as(u64, y) * row_bytes;
                 const dst = @as(usize, y) * @as(usize, descriptor.width) * 4;
                 if (dst + copy_w > linear.len) break;
                 if (!memory.read(memory.context, src, linear[dst..][0..copy_w])) break;
             }
-            linear_nz = countNonzeroRgba(linear);
+            const linear_nz = countNonzeroRgba(linear);
             if (linear_nz != 0) {
                 nonzero = linear_nz;
                 std.debug.print(
@@ -3223,6 +3233,26 @@ pub const Renderer = struct {
                     .{ nonzero, pitch },
                 );
             }
+        }
+        // Second retry: force standard_64kb detile when render_target path
+        // produced empty output but the allocation is non-zero (common when
+        // the title's tile mode enum does not match the surface family).
+        if (nonzero == 0 and raw_nonzero != 0 and descriptor.tile_mode == .render_target) {
+            var alt = descriptor;
+            alt.tile_mode = .standard_64kb;
+            if (gpu.SurfaceLayout.fromImage(alt)) |alt_layout| {
+                if (alt_layout.staging_bytes == layout.staging_bytes) {
+                    alt_layout.stage(reader, descriptor.address, linear) catch {};
+                    const alt_nz = countNonzeroRgba(linear);
+                    if (alt_nz != 0) {
+                        nonzero = alt_nz;
+                        std.debug.print(
+                            "[vulkan dcb] standard_64kb detile recovered {d} nonzero texels\n",
+                            .{nonzero},
+                        );
+                    }
+                }
+            } else |_| {}
         }
         // Last resort: guest truly empty (not yet uploaded) — paint a gradient
         // so the PS path stays visible during bring-up.
