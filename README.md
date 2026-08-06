@@ -1465,8 +1465,9 @@ fault containment and the first AMD compatibility handlers are now present,
 but mixed guest/HLE frames do not yet have an unwind-safe import transition and
 unrecognized illegal instructions still stop execution. Arbitrary `eboot.bin`
 execution is therefore not safe yet. Linux and macOS need a different
-FS/HLE-transition strategy because their host TLS rules differ. GPU submission
-and host audio output consequently remain beyond the current title bootstrap.
+FS/HLE-transition strategy because their host TLS rules differ.
+
+Basic GPU command submission and host audio output are now functional during the title bootstrap, allowing rendering of primitive graphics (via translation to SPIR-V) and playback of guest audio buffers.
 
 ## Roadmap
 
