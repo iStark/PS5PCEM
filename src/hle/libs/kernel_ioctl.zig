@@ -422,6 +422,9 @@ fn answerGraphicsSubmit(request: Request, payload: u64) bool {
         if (agc_submit.submitDeviceStream(stream[0..buffer.words]).accepted) ran += 1;
     }
     if (ran == 0) return false;
+    // /dev/gc path does not go through sceAgcDriverSubmit*; still need IRQs.
+    const event_queue = @import("kernel_event_queue.zig");
+    _ = event_queue.triggerAllGraphicsEvents(0);
     submission.result = 0;
     return true;
 }
@@ -481,6 +484,8 @@ fn answerGraphicsQueueSubmit(request: Request, payload: u64) bool {
         if (!agc_submit.submitDeviceStream(stream).accepted) return false;
     }
 
+    const event_queue = @import("kernel_event_queue.zig");
+    _ = event_queue.triggerAllGraphicsEvents(submission.queue);
     submission.result = 0;
     return true;
 }

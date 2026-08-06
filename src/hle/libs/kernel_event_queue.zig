@@ -415,6 +415,17 @@ pub fn deleteGraphicsEvent(handle: i64, id: i32) i32 {
 
 /// Publishes a completed graphics/compute submission to every matching equeue.
 pub fn triggerGraphicsEvent(id: i32, context_id: u32) usize {
+    return triggerGraphicsEventsMatching(id, context_id, false);
+}
+
+/// Wakes every active graphics registration (any id). Bring-up uses this when
+/// the real interrupt id is still approximate so WaitEqueue(graphics) cannot
+/// park forever after the first frame.
+pub fn triggerAllGraphicsEvents(context_id: u32) usize {
+    return triggerGraphicsEventsMatching(0, context_id, true);
+}
+
+fn triggerGraphicsEventsMatching(id: i32, context_id: u32, any_id: bool) usize {
     var wake_handles: [maximum_queues]i64 = undefined;
     var wake_sequences: [maximum_queues]u64 = undefined;
     var wake_count: usize = 0;
@@ -423,27 +434,27 @@ pub fn triggerGraphicsEvent(id: i32, context_id: u32) usize {
     lock.lock();
     for (&queues) |*queue| {
         if (!queue.active or queue.pending_count == maximum_events) continue;
-        const registration = for (queue.registrations) |candidate| {
-            if (candidate.active and candidate.ident == ident and
-                candidate.filter == graphics_filter)
-            {
-                break candidate;
-            }
-        } else continue;
-        const index = (queue.pending_head + queue.pending_count) % maximum_events;
-        queue.pending[index] = .{
-            .ident = ident,
-            .filter = graphics_filter,
-            .flags = event_clear,
-            .fflags = 1,
-            .data = context_id,
-            .user_data = registration.user_data,
-        };
-        queue.pending_count += 1;
-        queue.sequence +%= 1;
-        wake_handles[wake_count] = queue.handle;
-        wake_sequences[wake_count] = queue.sequence;
-        wake_count += 1;
+        // Deliver one event per matching registration (or all graphics regs).
+        for (queue.registrations) |candidate| {
+            if (!candidate.active or candidate.filter != graphics_filter) continue;
+            if (!any_id and candidate.ident != ident) continue;
+            if (queue.pending_count == maximum_events) break;
+            const index = (queue.pending_head + queue.pending_count) % maximum_events;
+            queue.pending[index] = .{
+                .ident = if (any_id) candidate.ident else ident,
+                .filter = graphics_filter,
+                .flags = event_clear,
+                .fflags = 1,
+                .data = context_id,
+                .user_data = candidate.user_data,
+            };
+            queue.pending_count += 1;
+            queue.sequence +%= 1;
+            wake_handles[wake_count] = queue.handle;
+            wake_sequences[wake_count] = queue.sequence;
+            wake_count += 1;
+            if (wake_count == maximum_queues) break;
+        }
     }
     lock.unlock();
 

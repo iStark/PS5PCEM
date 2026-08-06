@@ -273,6 +273,14 @@ fn vblankTickerMain() void {
             kernel_runtime.processTimeCounter(),
         );
         _ = kernel_event_queue.triggerVideoOutVblank();
+        // Re-publish the last flip edge so WaitEqueue(flip) cannot park forever
+        // when the title stops submitting DCBs after a soft-recovered null path.
+        if (video_out.lastFlipArgument()) |argument| {
+            _ = kernel_event_queue.triggerVideoOutFlip(argument);
+        }
+        // Graphics IRQs too: drivers wait on filter=-14 with an id we may not
+        // mirror exactly after the first batch of /dev/gc submits.
+        _ = kernel_event_queue.triggerAllGraphicsEvents(0);
     }
 }
 
@@ -401,6 +409,8 @@ fn videoOutGetFlipStatus(handle: i32, status: ?*VideoOutFlipStatus) callconv(abi
     const current = video_out.status(handle) orelse return video_out_error_invalid_handle;
     // Full PS5 layout: titles poll process-time fields after
     // WaitEqueue(filter=-13) and skip init paths when they look unset/stale.
+    // Report flip_pending_count as 0 so bring-up never parks forever waiting for
+    // a pending flip to drain when GPU completion accounting is still approximate.
     output.* = .{
         .count = current.count,
         .process_time = kernel_runtime.processTimeMicroseconds(),
@@ -409,7 +419,7 @@ fn videoOutGetFlipStatus(handle: i32, status: ?*VideoOutFlipStatus) callconv(abi
         .reserved1 = 0,
         .process_time_counter = kernel_runtime.processTimeCounter(),
         .gc_queue_count = 0,
-        .flip_pending_count = current.flip_pending_count,
+        .flip_pending_count = 0,
         .current_buffer = current.current_buffer,
         .reserved2 = 0,
         .submit_process_time_counter = current.submit_process_time_counter,

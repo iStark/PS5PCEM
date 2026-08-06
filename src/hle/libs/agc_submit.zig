@@ -680,15 +680,18 @@ fn submitOne(label: []const u8, descriptor: ?*const Submission) SubmitOutcome {
 
 /// Graphics work, described by one descriptor.
 fn submitDcb(descriptor: ?*const Submission) callconv(abi.guest) i32 {
-    if (submitOne("dcb", descriptor).completed) _ = event_queue.triggerGraphicsEvent(0, 0);
+    // Fire every graphics registration on accept: the real interrupt id is not
+    // always zero, and a blocked WAIT_REG_MEM head still progressed work.
+    if (submitOne("dcb", descriptor).accepted) _ = event_queue.triggerAllGraphicsEvents(0);
     return errno.ok;
 }
 
 /// Compute work on a named queue.
 fn submitAcb(queue: u32, descriptor: ?*const Submission) callconv(abi.guest) i32 {
-    if (submitOne("acb", descriptor).completed) {
+    if (submitOne("acb", descriptor).accepted) {
         const identifier: i32 = @bitCast(queue);
         _ = event_queue.triggerGraphicsEvent(identifier, queue);
+        _ = event_queue.triggerAllGraphicsEvents(queue);
     }
     return errno.ok;
 }
@@ -709,7 +712,7 @@ fn submitMultiDcbs(
 
     for (0..count) |index| {
         const stream = streamOf(buffers[index], sizes[index]) orelse continue;
-        if (acceptSubmitted("dcb", stream).completed) _ = event_queue.triggerGraphicsEvent(0, 0);
+        if (acceptSubmitted("dcb", stream).accepted) _ = event_queue.triggerAllGraphicsEvents(0);
     }
     return errno.ok;
 }
@@ -726,8 +729,9 @@ pub fn submitMultiAcbs(
     const identifier: i32 = @bitCast(queue);
     for (0..count) |index| {
         const stream = streamOf(buffers[index], sizes[index]) orelse continue;
-        if (acceptSubmitted("acb", stream).completed) {
+        if (acceptSubmitted("acb", stream).accepted) {
             _ = event_queue.triggerGraphicsEvent(identifier, queue);
+            _ = event_queue.triggerAllGraphicsEvents(queue);
         }
     }
     return errno.ok;
@@ -736,7 +740,7 @@ pub fn submitMultiAcbs(
 /// One buffer submitted directly, without a descriptor around it.
 fn submitCommandBuffer(_: u32, address: ?[*]const u32, word_count: u32) callconv(abi.guest) i32 {
     const stream = streamOf(address, word_count) orelse return errno.ok;
-    if (acceptSubmitted("dcb", stream).completed) _ = event_queue.triggerGraphicsEvent(0, 0);
+    if (acceptSubmitted("dcb", stream).accepted) _ = event_queue.triggerAllGraphicsEvents(0);
     return errno.ok;
 }
 

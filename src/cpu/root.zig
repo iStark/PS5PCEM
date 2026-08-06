@@ -210,6 +210,41 @@ pub var fs_base_restorations: std.atomic.Value(usize) = .init(0);
 pub var null_object_compare_recoveries: std.atomic.Value(u64) = .init(0);
 /// How many `mov/movzx/movsx dest, [null+disp]` loads were zeroed and stepped past.
 pub var null_memory_load_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many stores into the first page were discarded and stepped past.
+pub var null_memory_store_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many calls through a null pointer were treated as `return 0`.
+pub var null_call_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many times a null base register was redirected to the synthetic stub object.
+pub var null_base_redirect_recoveries: std.atomic.Value(u64) = .init(0);
+
+/// Synthetic object used when soft-recovering 8-byte loads from the first page.
+/// Pointer fields self-reference; call targets land on a RET sled so accidental
+/// virtual calls through the stub return instead of killing the process.
+var null_object_stub: [4096]u8 align(16) = undefined;
+var null_object_stub_ready: bool = false;
+
+fn ensureNullObjectStub() u64 {
+    if (!null_object_stub_ready) {
+        const base: u64 = @intFromPtr(&null_object_stub);
+        @memset(&null_object_stub, 0);
+        // Object body: every 8-byte slot is a pointer back to the stub.
+        var offset: usize = 0;
+        while (offset + 8 <= 0x100) : (offset += 8) {
+            std.mem.writeInt(u64, null_object_stub[offset..][0..8], base, .little);
+        }
+        // Fake vtable at +0x100: every slot points at the RET sled.
+        const ret_thunk = base + 0x300;
+        offset = 0x100;
+        while (offset + 8 <= 0x300) : (offset += 8) {
+            std.mem.writeInt(u64, null_object_stub[offset..][0..8], ret_thunk, .little);
+        }
+        // [0] = vtable pointer (common C++/IL2CPP layout).
+        std.mem.writeInt(u64, null_object_stub[0..8], base + 0x100, .little);
+        @memset(null_object_stub[0x300..], 0xc3); // RET
+        null_object_stub_ready = true;
+    }
+    return @intFromPtr(&null_object_stub);
+}
 
 /// Direct System V AMD64 execution on a Windows x86-64 host.
 ///
@@ -581,6 +616,21 @@ const WindowsX64Machine = struct {
             _ = fs_base_restorations.fetchAdd(1, .monotonic);
             return exception_continue_execution;
         }
+        // Prefer fixing the null base register and retrying the instruction so
+        // every opcode (ALU, SSE, cmp, mov, …) sees a real stub object instead of
+        // permanently taking a soft-null branch that stalls multi-frame bring-up.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[1] < lost_base_window and
+            tryRedirectNullBaseRegister(context, record.ExceptionInformation[1]))
+        {
+            _ = null_base_redirect_recoveries.fetchAdd(1, .monotonic);
+            std.debug.print(
+                "[cpu] redirected null base -> stub @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip, record.ExceptionInformation[1], null_base_redirect_recoveries.load(.monotonic) },
+            );
+            return exception_continue_execution;
+        }
         // IL2CPP/Unity often does `cmp byte/dword [obj+0x20], 0` / `je null_path`
         // after a flip. When obj is still null during bring-up, treat the read as
         // zero and take the null branch instead of killing the process.
@@ -596,8 +646,7 @@ const WindowsX64Machine = struct {
             );
             return exception_continue_execution;
         }
-        // The null path often continues with field loads (`mov rax, [rbx+0x10]`).
-        // Soft-zero the destination and step past so bring-up can keep going.
+        // Fallback: soft-zero / stub individual loads when base redirect failed.
         if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
             record.NumberParameters >= 2 and
             record.ExceptionInformation[0] == 0)
@@ -608,6 +657,36 @@ const WindowsX64Machine = struct {
                 std.debug.print(
                     "[cpu] recovered null-memory load @rip=0x{x} addr=0x{x} (#{d})\n",
                     .{ fault_rip, record.ExceptionInformation[1], null_memory_load_recoveries.load(.monotonic) },
+                );
+                return exception_continue_execution;
+            }
+        }
+        // Discard stores into the first page (null object field writes).
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 1)
+        {
+            const fault_rip = context.Rip;
+            if (tryEmulateNullMemoryStore(context, record.ExceptionInformation[1])) {
+                _ = null_memory_store_recoveries.fetchAdd(1, .monotonic);
+                std.debug.print(
+                    "[cpu] recovered null-memory store @rip=0x{x} addr=0x{x} (#{d})\n",
+                    .{ fault_rip, record.ExceptionInformation[1], null_memory_store_recoveries.load(.monotonic) },
+                );
+                return exception_continue_execution;
+            }
+        }
+        // Call/jmp through a null function pointer: pretend the callee returned 0.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            (record.ExceptionInformation[0] == 8 or isNullControlTransfer(context.Rip)))
+        {
+            const fault_rip = context.Rip;
+            if (tryEmulateNullCallReturn(context)) {
+                _ = null_call_recoveries.fetchAdd(1, .monotonic);
+                std.debug.print(
+                    "[cpu] recovered null-call return @rip=0x{x} -> 0x{x} (#{d})\n",
+                    .{ fault_rip, context.Rip, null_call_recoveries.load(.monotonic) },
                 );
                 return exception_continue_execution;
             }
@@ -691,6 +770,46 @@ const WindowsX64Machine = struct {
     const flag_of: u32 = 0x0800;
     const flag_arith_mask: u32 = flag_cf | flag_pf | flag_af | flag_zf | flag_sf | flag_of;
 
+    /// When a first-page AV is caused by a null base register, point that
+    /// register at the synthetic stub object and leave RIP unchanged so Windows
+    /// re-executes the faulting instruction against real memory.
+    fn tryRedirectNullBaseRegister(context: *std.os.windows.CONTEXT, memory_address: u64) bool {
+        if (memory_address >= lost_base_window) return false;
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        var offset: usize = 0;
+        var rex: u8 = 0;
+        // Skip optional segment override / REX / multi-byte escape carefully.
+        // Only handle the common REX + opcode + modrm form used by field accesses.
+        if (code[0] & 0xf0 == 0x40) {
+            rex = code[0];
+            offset = 1;
+        }
+        // Two-byte opcode (0F xx) places modrm at offset+2.
+        const modrm_index: usize = if (code[offset] == 0x0f) offset + 2 else offset + 1;
+        if (modrm_index >= 14) return false;
+        const modrm = code[modrm_index];
+        const mod = modrm >> 6;
+        const rm = modrm & 7;
+        if (mod == 3) return false; // register form
+        // SIB form: base is in the SIB byte.
+        if (rm == 4) {
+            const sib = code[modrm_index + 1];
+            const base = sib & 7;
+            if (mod == 0 and base == 5) return false; // disp32, no base
+            const reg_index: u4 = @truncate(base | ((rex & 0x01) << 3));
+            if (readGpr(context, reg_index) != 0) return false;
+            writeGpr(context, reg_index, ensureNullObjectStub());
+            return true;
+        }
+        if (mod == 0 and rm == 5) return false; // rip-relative
+        const reg_index: u4 = @truncate(rm | ((rex & 0x01) << 3));
+        if (readGpr(context, reg_index) != 0) return false;
+        // Sanity: base 0 + small disp should match the fault address.
+        // (disp is not re-decoded here; a null base always lands in the first page.)
+        writeGpr(context, reg_index, ensureNullObjectStub());
+        return true;
+    }
+
     /// Emulates `cmp [null+disp], imm` as if the memory byte/dword was zero.
     /// Returns true when the instruction was stepped past with flags updated.
     fn tryEmulateNullObjectCompare(context: *std.os.windows.CONTEXT, memory_address: u64) bool {
@@ -743,8 +862,9 @@ const WindowsX64Machine = struct {
         return true;
     }
 
-    /// Emulates integer loads from the first page as reading zeros.
-    /// Handles common MOV / MOVZX / MOVSX / MOVSXD forms used after null checks.
+    /// Emulates integer reads from the first page as zeros (or a stub object for
+    /// 64-bit pointer MOVs). Covers MOV/MOVZX/MOVSX plus ALU forms that only
+    /// read memory (`add/sub/cmp/and/or/xor/test reg, [null+disp]`).
     fn tryEmulateNullMemoryLoad(context: *std.os.windows.CONTEXT, memory_address: u64) bool {
         if (memory_address >= lost_base_window) return false;
         const code: [*]const u8 = @ptrFromInt(context.Rip);
@@ -759,50 +879,119 @@ const WindowsX64Machine = struct {
         // Two-byte opcodes: 0F B6/B7/BE/BF (MOVZX/MOVSX).
         if (opcode0 == 0x0f) {
             const opcode1 = code[offset + 1];
-            const kind: enum { movzx8, movzx16, movsx8, movsx16 } = switch (opcode1) {
-                0xb6 => .movzx8,
-                0xb7 => .movzx16,
-                0xbe => .movsx8,
-                0xbf => .movsx16,
+            switch (opcode1) {
+                0xb6, 0xb7, 0xbe, 0xbf => {},
                 else => return false,
-            };
+            }
             const modrm = code[offset + 2];
             const mem_len = modrmMemoryOperandLength(modrm, code[offset + 3 ..]) orelse return false;
             const length = offset + 3 + mem_len;
             if (length > 15) return false;
             const reg = @as(u4, @truncate(((modrm >> 3) & 7) | ((rex & 0x04) << 1)));
-            // Zero-extend / sign-extend of zero is still zero.
-            _ = kind;
             writeGpr(context, reg, 0);
             context.Rip += length;
             return true;
         }
 
-        // One-byte loads: 8A r8,[m] / 8B r,[m] / 63 MOVSXD r64,[m32].
-        const op_kind: enum { mov8, mov_gp, movsxd } = switch (opcode0) {
-            0x8a => .mov8,
-            0x8b => .mov_gp,
-            0x63 => .movsxd,
-            else => return false,
-        };
+        // 8A/8B MOV, 63 MOVSXD, and r,r/m ALU ops that read memory as the second operand.
+        const op = opcode0;
+        const is_mov8 = op == 0x8a;
+        const is_mov = op == 0x8b;
+        const is_movsxd = op == 0x63;
+        const is_alu_rm = op == 0x03 or op == 0x0b or op == 0x23 or op == 0x2b or
+            op == 0x33 or op == 0x3b or op == 0x85; // ADD/OR/AND/SUB/XOR/CMP/TEST r, r/m
+        if (!is_mov8 and !is_mov and !is_movsxd and !is_alu_rm) return false;
+
         const modrm = code[offset + 1];
         const mem_len = modrmMemoryOperandLength(modrm, code[offset + 2 ..]) orelse return false;
         const length = offset + 2 + mem_len;
         if (length > 15) return false;
         const reg = @as(u4, @truncate(((modrm >> 3) & 7) | ((rex & 0x04) << 1)));
-        switch (op_kind) {
-            .mov8 => {
-                // 8-bit write leaves upper bits alone; soft-zero only the low byte.
-                const current = readGpr(context, reg);
-                writeGpr(context, reg, current & ~@as(u64, 0xff));
-            },
-            .mov_gp => {
-                // REX.W → 64-bit; else 32-bit (zeros upper half).
-                writeGpr(context, reg, 0);
-            },
-            .movsxd => writeGpr(context, reg, 0),
+        const stub = ensureNullObjectStub();
+        const reg_value = readGpr(context, reg);
+
+        if (is_mov8) {
+            writeGpr(context, reg, reg_value & ~@as(u64, 0xff));
+        } else if (is_mov) {
+            // 64-bit pointer loads get a synthetic object so follow-up field
+            // accesses hit real memory; 32-bit loads stay zero.
+            if (rex & 0x08 != 0) writeGpr(context, reg, stub) else writeGpr(context, reg, 0);
+        } else if (is_movsxd) {
+            writeGpr(context, reg, 0);
+        } else {
+            // ALU with mem=0: result is identity for ADD/SUB/OR/XOR, zero for AND,
+            // flags-only for CMP/TEST.
+            const mem: u64 = 0;
+            const wide = (rex & 0x08) != 0;
+            const mask: u64 = if (wide) std.math.maxInt(u64) else 0xffff_ffff;
+            const a = reg_value & mask;
+            const b = mem & mask;
+            var result: u64 = a;
+            var flags = context.EFlags & ~flag_arith_mask;
+            switch (op) {
+                0x03 => result = a +% b, // ADD
+                0x0b => result = a | b, // OR
+                0x23 => result = a & b, // AND
+                0x2b => result = a -% b, // SUB
+                0x33 => result = a ^ b, // XOR
+                0x3b, 0x85 => { // CMP / TEST — flags only
+                    result = if (op == 0x85) a & b else a -% b;
+                    if (result == 0) flags |= flag_zf | flag_pf;
+                    if (result & (if (wide) @as(u64, 1) << 63 else 0x8000_0000) != 0) flags |= flag_sf;
+                    if (op == 0x3b and a < b) flags |= flag_cf;
+                    context.EFlags = flags;
+                    context.Rip += length;
+                    return true;
+                },
+                else => return false,
+            }
+            if (!wide) result &= 0xffff_ffff;
+            writeGpr(context, reg, result);
+            if (result == 0) flags |= flag_zf | flag_pf;
+            if (result & (if (wide) @as(u64, 1) << 63 else 0x8000_0000) != 0) flags |= flag_sf;
+            context.EFlags = flags;
         }
         context.Rip += length;
+        return true;
+    }
+
+    /// Discards integer stores into the first page and steps past the instruction.
+    fn tryEmulateNullMemoryStore(context: *std.os.windows.CONTEXT, memory_address: u64) bool {
+        if (memory_address >= lost_base_window) return false;
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        var offset: usize = 0;
+        if (code[0] & 0xf0 == 0x40) offset = 1;
+        const opcode = code[offset];
+        // 88 /r MOV r/m8, r8 · 89 /r MOV r/m16/32/64, r · C6 /0 ib · C7 /0 id
+        if (opcode != 0x88 and opcode != 0x89 and opcode != 0xc6 and opcode != 0xc7) return false;
+        const modrm = code[offset + 1];
+        if (opcode == 0xc6 or opcode == 0xc7) {
+            if ((modrm >> 3) & 7 != 0) return false; // /0 = MOV
+        }
+        const mem_len = modrmMemoryOperandLength(modrm, code[offset + 2 ..]) orelse return false;
+        var length: usize = offset + 2 + mem_len;
+        if (opcode == 0xc6) length += 1;
+        if (opcode == 0xc7) {
+            // imm32 (or imm16 with 66 — treat as 4 for bring-up).
+            length += 4;
+        }
+        if (length > 15) return false;
+        context.Rip += length;
+        return true;
+    }
+
+    /// Treats execute-at-null / near-null as a callee that returned zero.
+    fn tryEmulateNullCallReturn(context: *std.os.windows.CONTEXT) bool {
+        if (!isNullControlTransfer(context.Rip)) return false;
+        // Pop the return address from the guest stack.
+        const rsp = context.Rsp;
+        if (rsp < 8 or rsp > std.math.maxInt(u64) - 8) return false;
+        const ret_ptr: *align(1) const u64 = @ptrFromInt(rsp);
+        const return_address = ret_ptr.*;
+        if (!isGuestAddress(return_address)) return false;
+        context.Rax = 0;
+        context.Rsp = rsp + 8;
+        context.Rip = return_address;
         return true;
     }
 

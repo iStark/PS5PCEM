@@ -445,6 +445,10 @@ pub const DcbExecutor = struct {
                 pm4.custom.wait_mem_64 => return self.waitRegMem(packet, false, true),
                 pm4.custom.write_data => try self.writeData(packet, false),
                 pm4.custom.flip => try self.setFlip(packet),
+                // WaitUntilSafeForRendering: labels are released on the next flip
+                // of a different buffer. Bring-up treats the wait as already
+                // satisfied so a second frame can be built without parking the CP.
+                pm4.custom.wait_flip_done => {},
                 else => {},
             }
             return .complete;

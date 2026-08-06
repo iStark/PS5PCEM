@@ -111,6 +111,8 @@ var flip_status = FlipStatus{};
 var previous_buffer: i32 = -1;
 var vblank_count: u64 = 0;
 var open_process_time_us: u64 = 0;
+var last_flip_argument: i64 = 0;
+var has_last_flip_argument: bool = false;
 
 pub fn reset() void {
     lock.lock();
@@ -123,6 +125,8 @@ pub fn reset() void {
     previous_buffer = -1;
     vblank_count = 0;
     open_process_time_us = 0;
+    last_flip_argument = 0;
+    has_last_flip_argument = false;
 }
 
 pub fn open(index: i32) bool {
@@ -347,13 +351,27 @@ pub fn completeFlip(flip: gpu.state.Flip) bool {
         flip_status.flip_pending_count - 1
     else
         0;
+    last_flip_argument = flip.argument;
+    has_last_flip_argument = true;
     // process_time / process_time_counter filled at GetFlipStatus time so they
     // stay current when the title polls after the equeue wakes.
     if (previous_buffer >= 0 and previous_buffer < maximum_buffers) {
         buffer_labels[@intCast(previous_buffer)] = 0;
     }
+    // Mark the newly displayed buffer busy until the next flip releases it.
+    if (flip.display_buffer_index >= 0 and flip.display_buffer_index < maximum_buffers) {
+        buffer_labels[@intCast(flip.display_buffer_index)] = 1;
+    }
     previous_buffer = flip.display_buffer_index;
     return true;
+}
+
+/// Argument of the most recent completed flip, for vblank-edge re-delivery.
+pub fn lastFlipArgument() ?i64 {
+    lock.lock();
+    defer lock.unlock();
+    if (!opened or !has_last_flip_argument) return null;
+    return last_flip_argument;
 }
 
 /// Records that a flip was submitted and is waiting to complete. Titles poll
