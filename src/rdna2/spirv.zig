@@ -532,6 +532,26 @@ const Builder = struct {
     }
 
     fn destination(self: *Builder, op: operand.Operand, value: Value) Error!void {
+        var final_value = value;
+        if (op.omod != 0 or op.clamp) {
+            if (value.value_type == .float32) {
+                if (op.omod != 0) {
+                    const mul_bits: u32 = if (op.omod == 1) 0x4000_0000 else if (op.omod == 2) 0x4080_0000 else 0x3f00_0000;
+                    const cst = try self.constant(.float32, mul_bits);
+                    const mul_res = self.id();
+                    try self.emit(&self.body, 133, &.{ self.float_type, mul_res, final_value.id, cst });
+                    final_value.id = mul_res;
+                }
+                if (op.clamp) {
+                    const glsl = self.ensureGlslStd450();
+                    const zero = try self.constant(.float32, 0);
+                    const one = try self.constant(.float32, 0x3f80_0000);
+                    const clamped = self.id();
+                    try self.emit(&self.body, 12, &.{ self.float_type, clamped, glsl, 43, final_value.id, zero, one });
+                    final_value.id = clamped;
+                }
+            }
+        }
         // SDWA destination packing is not modelled yet; keep the full dword.
         const index = registerIndex(op) orelse {
             // Writes to SCC/VCC/EXEC are tracked separately or ignored.
@@ -547,7 +567,7 @@ const Builder = struct {
             return Error.UnsupportedDestination;
         };
         self.registers[index] = .{
-            .id = try self.convert(value, .bits32),
+            .id = try self.convert(final_value, .bits32),
             .value_type = .bits32,
         };
     }
