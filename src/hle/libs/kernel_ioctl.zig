@@ -357,9 +357,11 @@ var pending_tail_count: usize = 0;
 
 fn rememberPendingTail(queue: u32, address: u64, capacity_words: u32, executed_words: u32) void {
     if (address == 0 or capacity_words == 0 or executed_words >= capacity_words) return;
+    std.debug.print("[gc submit] rememberPendingTail called: queue {d} addr=0x{x} cap={d} exec={d}\n", .{ queue, address, capacity_words, executed_words });
     // Update existing entry for the same IB base.
     for (pending_tails[0..pending_tail_count]) |*slot| {
         if (slot.address == address) {
+            std.debug.print("[gc submit] rememberPendingTail update existing: addr=0x{x} old_exec={d} -> new_exec={d}\n", .{ address, slot.executed_words, executed_words });
             slot.capacity_words = capacity_words;
             slot.executed_words = executed_words;
             slot.queue = queue;
@@ -367,6 +369,7 @@ fn rememberPendingTail(queue: u32, address: u64, capacity_words: u32, executed_w
         }
     }
     if (pending_tail_count < maximum_pending_tails) {
+        std.debug.print("[gc submit] rememberPendingTail append: addr=0x{x} cap={d} exec={d} slot={d}\n", .{ address, capacity_words, executed_words, pending_tail_count });
         pending_tails[pending_tail_count] = .{
             .address = address,
             .capacity_words = capacity_words,
@@ -377,6 +380,7 @@ fn rememberPendingTail(queue: u32, address: u64, capacity_words: u32, executed_w
         return;
     }
     // Drop oldest (shift without overlapping memcpy).
+    std.debug.print("[gc submit] rememberPendingTail dropping oldest to make room: addr=0x{x}\n", .{address});
     var s: usize = 0;
     while (s + 1 < maximum_pending_tails) : (s += 1) {
         pending_tails[s] = pending_tails[s + 1];
@@ -393,6 +397,7 @@ fn clearPendingTail(address: u64) void {
     var i: usize = 0;
     while (i < pending_tail_count) {
         if (pending_tails[i].address == address) {
+            std.debug.print("[gc submit] clearPendingTail: addr=0x{x} slot={d}\n", .{address, i});
             var j = i;
             while (j + 1 < pending_tail_count) : (j += 1) {
                 pending_tails[j] = pending_tails[j + 1];
@@ -403,6 +408,25 @@ fn clearPendingTail(address: u64) void {
         }
         i += 1;
     }
+}
+
+// Dump the first `maxWords` of a reserved ring and locate the sentinel.
+fn dumpReserved(address: u64, reserved: []const u32, maxWords: usize) void {
+    const count: usize = if (reserved.len < maxWords) reserved.len else maxWords;
+    std.debug.print("[gc submit] reserved dump @0x{x} first {d} words:", .{ address, count });
+    for (reserved[0..count]) |w| std.debug.print(" {x:0>8}", .{w});
+    std.debug.print("\n", .{});
+
+    var j: usize = 0;
+    var found: bool = false;
+    while (j < count) : (j += 1) {
+        if (reserved[j] == uncommitted_ring_sentinel) {
+            std.debug.print("[gc submit] sentinel at index {d} (word offset {d})\n", .{ j, j });
+            found = true;
+            break;
+        }
+    }
+    if (!found) std.debug.print("[gc submit] sentinel not found in first {d} words (capacity {d})\n", .{ count, reserved.len });
 }
 
 /// Re-scan remembered IBs; execute any newly committed suffix past executed_words.
@@ -416,27 +440,29 @@ fn drainPendingTails() void {
         const slot = pending_tails[i];
         const byte_count = @as(u64, slot.capacity_words) * @sizeOf(u32);
         if (!memory.isGuestRangeAccessible(slot.address, byte_count)) {
-            i += 1;
+            std.debug.print("[gc submit] drainPendingTails: slot addr=0x{x} not accessible\n", .{slot.address});
+                i += 1;
             continue;
         }
         const pointer: [*]const u32 = @ptrFromInt(slot.address);
         const reserved = pointer[0..slot.capacity_words];
         const committed = committedQueueStream(reserved);
+        std.debug.print("[gc submit] drainPendingTails: slot addr=0x{x} cap={d} exec={d} committed={d}\n", .{ slot.address, slot.capacity_words, slot.executed_words, committed.len });
         if (committed.len <= slot.executed_words) {
+            dumpReserved(slot.address, reserved, 256);
             i += 1;
             continue;
         }
         const suffix = committed[slot.executed_words..];
-        std.debug.print(
-            "[gc submit #50] tail catch-up queue {d}: +{d} dwords @0x{x} (now {d}/{d})\n",
-            .{ slot.queue, suffix.len, slot.address, committed.len, slot.capacity_words },
-        );
+        std.debug.print("[gc submit #50] tail catch-up queue {d}: +{d} dwords @0x{x} (now {d}/{d})\n", .{ slot.queue, suffix.len, slot.address, committed.len, slot.capacity_words });
         if (suffix.len <= 16) {
             std.debug.print("  words:", .{});
             for (suffix) |word| std.debug.print(" {x:0>8}", .{word});
             std.debug.print("\n", .{});
         }
-        if (agc_submit.submitDeviceStream(suffix).accepted) {
+        const outcome = agc_submit.submitDeviceStream(suffix);
+        std.debug.print("[gc submit] tail catch-up submitDeviceStream.accepted={s}\n", .{ if (outcome.accepted) "true" else "false" });
+        if (outcome.accepted) {
             _ = event_queue_mod.triggerAllGraphicsEvents(slot.queue);
             if (committed.len >= slot.capacity_words or committed.len >= 64) {
                 // Fully (or substantially) drained — drop the pending slot.
@@ -483,19 +509,24 @@ fn collectIndirectBuffers(descriptor: []const u32, out: []IndirectBuffer) usize 
     return found;
 }
 
-/// Returns only the committed prefix of a capacity-sized queue allocation.
+/// Returns the largest parseable prefix of a capacity-sized queue allocation.
 ///
 /// Command 50 describes the whole reserved range. The driver fills its unused
 /// tail with a maximum PACKET3_NOP whose declared body deliberately extends
-/// beyond that range; hardware stops at the producer write pointer, which is
-/// represented here by trimming at the exact sentinel instead.
+/// beyond that range. That marker is a reservation placeholder, not an end-of-
+/// stream boundary for the valid packets that follow it, so skip it and keep
+/// walking the stream.
 fn committedQueueStream(stream: []const u32) []const u32 {
     var walker = gpu.pm4.Walker.init(stream);
     while (true) {
         const offset = walker.index;
+        if (offset >= stream.len) return stream[0..offset];
+        if (stream[offset] == uncommitted_ring_sentinel) {
+            walker.index = offset + 1;
+            continue;
+        }
         _ = walker.next() catch {
-            if (stream[offset] == uncommitted_ring_sentinel) return stream[0..offset];
-            return stream;
+            return stream[0..offset];
         } orelse return stream;
     }
 }
@@ -588,10 +619,20 @@ fn answerGraphicsQueueSubmit(request: Request, payload: u64) bool {
         if (!memory.isGuestRangeAccessible(address, byte_count)) return false;
         const stream_pointer: [*]const u32 = @ptrFromInt(address);
         const reserved_stream = stream_pointer[0..word_count];
+        if (trace.announces("ioctl")) {
+            std.debug.print("[gc submit #50] reserved_stream @0x{x} capacity={d} words (peek up to 16):", .{ address, reserved_stream.len });
+            const peek = if (reserved_stream.len < 16) reserved_stream.len else 16;
+            for (reserved_stream[0..peek]) |w| std.debug.print(" {x:0>8}", .{w});
+            std.debug.print("\n", .{});
+        }
         // Producer may kick #50 before the ring is fully filled (sentinel still
         // near the head). Re-sample a few times so late-written packets are not
         // permanently dropped as an 8-dword ACQUIRE_MEM-only prefix.
         var stream = committedQueueStream(reserved_stream);
+        if (trace.announces("ioctl")) std.debug.print("[gc submit #50] committed prefix len={d} (capacity={d})\n", .{ stream.len, reserved_stream.len });
+        // If the committed prefix is very small, dump more of the reserved ring
+        // to locate the sentinel and inspect producer state.
+        if (stream.len <= 32) dumpReserved(address, reserved_stream, 256);
         // Brief re-sample first (producer may still be writing). Keep this short:
         // holding the ioctl while only an ACQUIRE_MEM prefix is committed can
         // deadlock the encoder if it waits on the graphics completion event we
@@ -611,6 +652,7 @@ fn answerGraphicsQueueSubmit(request: Request, payload: u64) bool {
             }
             const again = committedQueueStream(reserved_stream);
             if (again.len <= stream.len) break;
+            std.debug.print("[gc submit #50] grow round {d}: {d}->{d} dwords @0x{x}\n", .{ grow_round, stream.len, again.len, address });
             stream = again;
         }
         if (stream.len == 0) continue;
@@ -949,19 +991,19 @@ test "a descriptor naming nothing yields nothing" {
     try testing.expectEqual(@as(usize, 0), collectIndirectBuffers(&empty_stream, &found));
 }
 
-test "command 50 trims only its exact uncommitted ring sentinel" {
+test "command 50 skips the uncommitted ring sentinel and keeps parsing later packets" {
     const reserved = [_]u32{
         (@as(u32, 3) << 30) | (@as(u32, gpu.pm4.nop) << 8),
         0,
         uncommitted_ring_sentinel,
-        0,
+        (@as(u32, 3) << 30) | (@as(u32, gpu.pm4.set_base) << 8),
         0,
     };
-    try testing.expectEqual(@as(usize, 2), committedQueueStream(&reserved).len);
+    try testing.expectEqual(@as(usize, reserved.len), committedQueueStream(&reserved).len);
 
     var malformed = reserved;
     malformed[2] = 0xffff_1001;
-    try testing.expectEqual(malformed.len, committedQueueStream(&malformed).len);
+    try testing.expectEqual(@as(usize, 6), committedQueueStream(&malformed).len);
 }
 
 test "graphics preamble submission clears the driver's result sentinel" {
