@@ -21,6 +21,20 @@ const vk = @import("api.zig");
 /// Disable for performance — each print is a blocking I/O syscall.
 const log_verbose_gpu = false;
 
+fn hostTimestampNs() u64 {
+    if (comptime builtin.os.tag != .windows) return 0;
+    var counter: std.os.windows.LARGE_INTEGER = 0;
+    var frequency: std.os.windows.LARGE_INTEGER = 0;
+    if (!std.os.windows.ntdll.RtlQueryPerformanceCounter(&counter).toBool() or
+        !std.os.windows.ntdll.RtlQueryPerformanceFrequency(&frequency).toBool() or
+        counter < 0 or frequency <= 0)
+    {
+        return 0;
+    }
+    const scaled = @as(u128, @intCast(counter)) * std.time.ns_per_s;
+    return @intCast(scaled / @as(u128, @intCast(frequency)));
+}
+
 pub const Error = error{
     VulkanLoaderNotFound,
     MissingVulkanFunction,
@@ -75,6 +89,7 @@ pub const Error = error{
     GraphicsProbeReadbackMismatch,
     MissingColorTarget,
     UnsupportedColorTarget,
+    RenderTargetCacheFull,
     UnsupportedGraphicsState,
     MissingPresentedFrame,
     PresentationRejected,
@@ -458,13 +473,18 @@ const OwnedImage = struct {
     memory: vk.DeviceMemory,
 };
 
-const maximum_guest_buffers = 256;
+// Guest vertex/constant ranges are highly transient. A bounded LRU avoids
+// keeping hundreds of individual Vulkan allocations alive after the title has
+// moved its ring buffers on, while still covering every descriptor in a draw.
+const maximum_guest_buffers = maximum_storage_descriptors;
 pub const maximum_storage_descriptors = 64;
 const maximum_compute_pipelines = 256;
 const maximum_graphics_pipelines = 256;
 const maximum_staged_buffer_bytes = 128 * 1024 * 1024;
 const maximum_frame_bytes = 128 * 1024 * 1024;
 const maximum_completed_frames = 16;
+const maximum_render_targets = 16;
+const maximum_sampled_images = 32;
 /// On-disk driver pipeline cache. Reused across runs so per-title shader
 /// compilation is paid once instead of on every launch.
 const pipeline_cache_path = "vulkan_pipeline_cache.bin";
@@ -512,10 +532,11 @@ fn savePipelineCacheBytes(self: *Renderer) void {
 }
 
 const GuestBufferEntry = struct {
+    descriptor_index: u32,
     guest_address: u64,
     size: vk.DeviceSize,
-    upload: OwnedBuffer,
     device_local: OwnedBuffer,
+    last_used_sequence: u64,
 };
 
 const ComputePipelineEntry = struct {
@@ -531,6 +552,7 @@ const GraphicsPipelineEntry = struct {
     vertex_words: []u32,
     fragment_words: []u32,
     pipeline: vk.Pipeline,
+    last_used_sequence: u64,
 };
 
 const GraphicsPipelineState = extern struct {
@@ -590,6 +612,38 @@ const GraphicsPipelineState = extern struct {
 const GuestColorTarget = struct {
     descriptor: gpu.resources.ColorTarget,
     layout: gpu.SurfaceLayout,
+};
+
+/// One guest color allocation kept resident as a Vulkan attachment across
+/// draws.  The old path recreated this entire object graph and round-tripped
+/// every pixel through the CPU after each draw, which both destroyed
+/// multi-pass composition and serialized the host GPU.
+const CachedRenderTarget = struct {
+    target: GuestColorTarget,
+    image: OwnedImage,
+    view: vk.ImageView,
+    render_pass: vk.RenderPass,
+    framebuffer: vk.Framebuffer,
+    readback: OwnedBuffer,
+    initialized: bool = false,
+    gpu_generation: u64 = 0,
+    host_generation: u64 = 0,
+    last_used_sequence: u64 = 0,
+};
+
+const FrameProfile = struct {
+    draws: u64 = 0,
+    dispatches: u64 = 0,
+    submits: u64 = 0,
+    fence_wait_ns: u64 = 0,
+    upload_bytes: u64 = 0,
+    readback_bytes: u64 = 0,
+    render_target_hits: u64 = 0,
+    render_target_misses: u64 = 0,
+
+    fn reset(self: *FrameProfile) void {
+        self.* = .{};
+    }
 };
 
 const CachedFrame = struct {
@@ -718,6 +772,7 @@ pub const Renderer = struct {
     /// that names a buffer nothing was rendered into.
     guest_frame_scratch: std.ArrayList(u8) = .empty,
     guest_buffers: std.ArrayList(GuestBufferEntry) = .empty,
+    guest_buffer_sequence: u64 = 0,
     gds_storage: std.ArrayList(u8) = .empty,
     compute_pipelines: std.ArrayList(ComputePipelineEntry) = .empty,
     graphics_pipelines: std.ArrayList(GraphicsPipelineEntry) = .empty,
@@ -730,6 +785,9 @@ pub const Renderer = struct {
     guest_graphics_draws: u64 = 0,
     graphics_probe_colored_pixels: u32 = 0,
     graphics_probe_frame: [graphics_probe_bytes]u8 = @splat(0),
+    render_targets: std.ArrayList(CachedRenderTarget) = .empty,
+    latest_render_target_index: ?usize = null,
+    render_target_sequence: u64 = 0,
     completed_frames: std.ArrayList(CachedFrame) = .empty,
     latest_frame_index: ?usize = null,
     frame_sequence: u64 = 0,
@@ -770,6 +828,17 @@ pub const Renderer = struct {
     pipeline_cache_misses: u64 = 0,
     graphics_pipeline_cache_hits: u64 = 0,
     graphics_pipeline_cache_misses: u64 = 0,
+    graphics_pipeline_sequence: u64 = 0,
+    frame_profile: FrameProfile = .{},
+    last_flip_profile_ns: u64 = 0,
+    last_shader_failure_address: u64 = 0,
+    last_shader_failure_stage: ?gpu.resources.ShaderStage = null,
+    last_shader_failure_error: ?anyerror = null,
+    last_interface_vertex_address: u64 = 0,
+    last_interface_fragment_address: u64 = 0,
+    reported_interface_pairs: u8 = 0,
+    reported_vertex_storage_bindings: bool = false,
+    reported_draw_errors: [16]?anyerror = @splat(null),
     last_dispatch_error: ?anyerror = null,
     last_draw_error: ?anyerror = null,
     last_sync_error: ?anyerror = null,
@@ -1023,6 +1092,14 @@ pub const Renderer = struct {
 
     pub fn deinit(self: *Renderer) void {
         _ = self.device_functions.device_wait_idle(self.device);
+        for (self.render_targets.items) |target| self.destroyCachedRenderTarget(target);
+        self.render_targets.deinit(self.allocator);
+        for (self.sampled_image_cache.items) |image| {
+            self.device_functions.destroy_sampler(self.device, image.sampler, null);
+            self.device_functions.destroy_image_view(self.device, image.view, null);
+            self.destroyImage(image.image);
+        }
+        self.sampled_image_cache.deinit(self.allocator);
         for (self.compute_pipelines.items) |entry| {
             self.device_functions.destroy_pipeline(self.device, entry.pipeline, null);
             self.device_functions.destroy_shader_module(self.device, entry.shader, null);
@@ -1037,9 +1114,9 @@ pub const Renderer = struct {
         self.graphics_pipelines.deinit(self.allocator);
         for (self.completed_frames.items) |*frame| frame.pixels.deinit(self.allocator);
         self.completed_frames.deinit(self.allocator);
+        self.guest_frame_scratch.deinit(self.allocator);
         for (self.guest_buffers.items) |entry| {
             self.destroyBuffer(entry.device_local);
-            self.destroyBuffer(entry.upload);
         }
         self.guest_buffers.deinit(self.allocator);
         self.gds_storage.deinit(self.allocator);
@@ -1275,100 +1352,99 @@ pub const Renderer = struct {
         if (size == 0) return Error.GuestMemoryReadFailed;
         if (size > maximum_staged_buffer_bytes) return Error.GuestBufferTooLarge;
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        self.guest_buffer_sequence +%= 1;
 
         var entry_index: ?usize = null;
         for (self.guest_buffers.items, 0..) |entry, index| {
-            if (entry.guest_address == guest_address and entry.size == size) {
+            if (entry.descriptor_index == descriptor_index and
+                entry.guest_address == guest_address and entry.size == size)
+            {
                 entry_index = index;
                 break;
             }
         }
         const cache_hit = entry_index != null;
         if (entry_index == null) {
-            if (self.guest_buffers.items.len >= maximum_guest_buffers) return Error.GuestBufferCacheFull;
-            try self.guest_buffers.ensureUnusedCapacity(self.allocator, 1);
-            const upload = try self.createBuffer(
-                size,
-                vk.buffer_usage_transfer_src_bit,
-                vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
-            );
-            errdefer self.destroyBuffer(upload);
-            const device_local = try self.createBuffer(
-                size,
-                vk.buffer_usage_transfer_src_bit | vk.buffer_usage_transfer_dst_bit | vk.buffer_usage_storage_buffer_bit,
-                0x0000_0001,
-            );
-            errdefer self.destroyBuffer(device_local);
-            self.guest_buffers.appendAssumeCapacity(.{
-                .guest_address = guest_address,
-                .size = size,
-                .upload = upload,
-                .device_local = device_local,
-            });
-            entry_index = self.guest_buffers.items.len - 1;
+            // Each descriptor slot owns at most one backing allocation. Guest
+            // ring addresses change constantly, but rebinding slot N does not
+            // require retaining every address slot N used in prior frames.
+            var recycle_index: ?usize = null;
+            for (self.guest_buffers.items, 0..) |entry, index| {
+                if (entry.descriptor_index == descriptor_index) {
+                    recycle_index = index;
+                    break;
+                }
+            }
+            if (recycle_index == null and self.guest_buffers.items.len >= maximum_guest_buffers) {
+                var oldest_index: usize = 0;
+                var oldest: u64 = std.math.maxInt(u64);
+                for (self.guest_buffers.items, 0..) |entry, index| {
+                    if (entry.last_used_sequence < oldest) {
+                        oldest = entry.last_used_sequence;
+                        oldest_index = index;
+                    }
+                }
+                recycle_index = oldest_index;
+            }
+
+            if (recycle_index == null) {
+                try self.guest_buffers.ensureUnusedCapacity(self.allocator, 1);
+                const device_local = try self.createBuffer(
+                    size,
+                    vk.buffer_usage_storage_buffer_bit,
+                    vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+                );
+                errdefer self.destroyBuffer(device_local);
+                self.guest_buffers.appendAssumeCapacity(.{
+                    .descriptor_index = descriptor_index,
+                    .guest_address = guest_address,
+                    .size = size,
+                    .device_local = device_local,
+                    .last_used_sequence = self.guest_buffer_sequence,
+                });
+                entry_index = self.guest_buffers.items.len - 1;
+            } else {
+                // Every submission using these buffers has completed before
+                // this point. Recycle the least-recent range instead of
+                // dropping later geometry once the guest ring has wrapped.
+                const victim_index = recycle_index.?;
+                const victim = &self.guest_buffers.items[victim_index];
+                if (victim.device_local.size < size) {
+                    const replacement_device = try self.createBuffer(
+                        size,
+                        vk.buffer_usage_storage_buffer_bit,
+                        vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+                    );
+                    errdefer self.destroyBuffer(replacement_device);
+                    self.destroyBuffer(victim.device_local);
+                    victim.device_local = replacement_device;
+                }
+                victim.descriptor_index = descriptor_index;
+                victim.guest_address = guest_address;
+                victim.size = size;
+                victim.last_used_sequence = self.guest_buffer_sequence;
+                entry_index = victim_index;
+            }
             self.buffer_cache_misses += 1;
         } else {
             self.buffer_cache_hits += 1;
         }
 
         const entry = &self.guest_buffers.items[entry_index.?];
+        entry.descriptor_index = descriptor_index;
+        entry.last_used_sequence = self.guest_buffer_sequence;
         var mapped: ?*anyopaque = null;
-        if (self.device_functions.map_memory(self.device, entry.upload.memory, 0, size, 0, &mapped) != vk.success) {
+        if (self.device_functions.map_memory(self.device, entry.device_local.memory, 0, size, 0, &mapped) != vk.success) {
             return Error.MemoryMapFailed;
         }
         const destination: [*]u8 = @ptrCast(mapped orelse {
-            self.device_functions.unmap_memory(self.device, entry.upload.memory);
+            self.device_functions.unmap_memory(self.device, entry.device_local.memory);
             return Error.MemoryMapFailed;
         });
         const read_ok = memory.read(memory.context, guest_address, destination[0..size]);
-        self.device_functions.unmap_memory(self.device, entry.upload.memory);
+        self.device_functions.unmap_memory(self.device, entry.device_local.memory);
         if (!read_ok) return Error.GuestMemoryReadFailed;
-
-        const command_buffer = try self.beginOneShot();
-        defer self.device_functions.free_command_buffers(self.device, self.command_pool, 1, @ptrCast(&command_buffer));
-        const host_barrier = vk.BufferMemoryBarrier{
-            .source_access_mask = vk.access_host_write_bit,
-            .destination_access_mask = vk.access_transfer_read_bit,
-            .buffer = entry.upload.handle,
-            .offset = 0,
-            .size = entry.size,
-        };
-        self.device_functions.cmd_pipeline_barrier(
-            command_buffer,
-            vk.pipeline_stage_host_bit,
-            vk.pipeline_stage_transfer_bit,
-            0,
-            0,
-            null,
-            1,
-            @ptrCast(&host_barrier),
-            0,
-            null,
-        );
-        const copy = vk.BufferCopy{ .source_offset = 0, .destination_offset = 0, .size = entry.size };
-        self.device_functions.cmd_copy_buffer(command_buffer, entry.upload.handle, entry.device_local.handle, 1, @ptrCast(&copy));
-        const shader_barrier = vk.BufferMemoryBarrier{
-            .source_access_mask = vk.access_transfer_write_bit,
-            .destination_access_mask = vk.access_shader_read_bit | vk.access_shader_write_bit,
-            .buffer = entry.device_local.handle,
-            .offset = 0,
-            .size = entry.size,
-        };
-        self.device_functions.cmd_pipeline_barrier(
-            command_buffer,
-            vk.pipeline_stage_transfer_bit,
-            vk.pipeline_stage_compute_shader_bit |
-                vk.pipeline_stage_vertex_shader_bit |
-                vk.pipeline_stage_fragment_shader_bit,
-            0,
-            0,
-            null,
-            1,
-            @ptrCast(&shader_barrier),
-            0,
-            null,
-        );
-        try self.submitOneShot(command_buffer);
+        self.frame_profile.upload_bytes +%= size;
         self.updateStorageDescriptor(descriptor_index, entry.device_local);
         self.active_descriptor_set = self.descriptor_set;
         self.buffer_uploads += 1;
@@ -1385,60 +1461,8 @@ pub const Renderer = struct {
         const entry = for (self.guest_buffers.items) |*candidate| {
             if (candidate.guest_address == guest_address and candidate.size == destination.len) break candidate;
         } else return Error.GuestBufferNotStaged;
-        const readback = try self.createBuffer(
-            destination.len,
-            vk.buffer_usage_transfer_dst_bit,
-            vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
-        );
-        defer self.destroyBuffer(readback);
-
-        const command_buffer = try self.beginOneShot();
-        defer self.device_functions.free_command_buffers(self.device, self.command_pool, 1, @ptrCast(&command_buffer));
-        const transfer_barrier = vk.BufferMemoryBarrier{
-            .source_access_mask = vk.access_shader_write_bit | vk.access_transfer_write_bit,
-            .destination_access_mask = vk.access_transfer_read_bit,
-            .buffer = entry.device_local.handle,
-            .offset = 0,
-            .size = entry.size,
-        };
-        self.device_functions.cmd_pipeline_barrier(
-            command_buffer,
-            vk.pipeline_stage_compute_shader_bit |
-                vk.pipeline_stage_vertex_shader_bit |
-                vk.pipeline_stage_fragment_shader_bit |
-                vk.pipeline_stage_transfer_bit,
-            vk.pipeline_stage_transfer_bit,
-            0,
-            0,
-            null,
-            1,
-            @ptrCast(&transfer_barrier),
-            0,
-            null,
-        );
-        const copy = vk.BufferCopy{ .source_offset = 0, .destination_offset = 0, .size = entry.size };
-        self.device_functions.cmd_copy_buffer(command_buffer, entry.device_local.handle, readback.handle, 1, @ptrCast(&copy));
-        const host_barrier = vk.BufferMemoryBarrier{
-            .source_access_mask = vk.access_transfer_write_bit,
-            .destination_access_mask = vk.access_host_read_bit,
-            .buffer = readback.handle,
-            .offset = 0,
-            .size = readback.size,
-        };
-        self.device_functions.cmd_pipeline_barrier(
-            command_buffer,
-            vk.pipeline_stage_transfer_bit,
-            vk.pipeline_stage_host_bit,
-            0,
-            0,
-            null,
-            1,
-            @ptrCast(&host_barrier),
-            0,
-            null,
-        );
-        try self.submitOneShot(command_buffer);
-        try self.readMapped(readback, destination);
+        try self.readMapped(entry.device_local, destination);
+        self.frame_profile.readback_bytes +%= destination.len;
     }
 
     pub fn dispatchSpirv(self: *Renderer, words: []const u32, group_count: [3]u32) (Error || std.mem.Allocator.Error)!DispatchReport {
@@ -1772,6 +1796,11 @@ pub const Renderer = struct {
     ) anyerror!ComputeResources {
         var result = ComputeResources{};
         result.specialized_scalar_prefix_end = specialized_scalar_prefix_end;
+        const vertex_table = if (bindings.stage != .compute)
+            (gpu.VertexBindings.capture(bindings, reader) catch null)
+        else
+            null;
+        var vertex_attribute_index: usize = 0;
         for (scalar.registers, 0..) |value, index| {
             if (!value.known) continue;
             result.scalar_registers[result.scalar_count] = .{ .register = @intCast(index), .value = value.value };
@@ -1841,44 +1870,58 @@ pub const Renderer = struct {
             };
             const resource_operand = if (inst.family == .smem) inst.src0 else inst.src1;
             if (resource_operand.kind != .sgpr) {
-                std.debug.print(
+                if (log_verbose_gpu) std.debug.print(
                     "[vulkan dcb] MissingStorageDescriptor: pc=0x{x} {s} resource is {s} not sgpr\n",
                     .{ inst.pc, @tagName(inst.opcode), @tagName(resource_operand.kind) },
                 );
                 return Error.MissingStorageDescriptor;
             }
             const resource_sgpr = resource_operand.reg;
-            if (result.mappingForSgpr(resource_sgpr)) |descriptor_index| {
+            if (bindings.stage == .compute) if (result.mappingForSgpr(resource_sgpr)) |descriptor_index| {
                 if (is_store) result.writable[descriptor_index] = true;
                 continue;
-            }
+            };
 
-            const descriptor = (try resolveComputeBufferDescriptor(
+            var vertex_attribute: ?gpu.VertexAttribute = null;
+            if (bindings.stage != .compute and inst.family != .smem and !is_store) {
+                if (vertex_table) |table| {
+                    if (vertex_attribute_index < table.attribute_count) {
+                        vertex_attribute = table.attributes[vertex_attribute_index];
+                        vertex_attribute_index += 1;
+                    }
+                }
+            }
+            const descriptor = (if (vertex_attribute) |attribute|
+                takePlausibleBufferDescriptor(attribute.buffer)
+            else
+                null) orelse try resolveComputeBufferDescriptor(
                 bindings,
                 reader,
                 scalar,
                 resource_sgpr,
-            )) orelse {
-                const full = gpu.scalar_provenance.evaluatePrefix(reader, bindings);
-                std.debug.print(
-                    "[vulkan dcb] MissingStorageDescriptor: pc=0x{x} {s} V# s{d}:s{d} unknown (scalar stop={s} @0x{x}, loads={d}, user_data={d}); soft-skip\n",
-                    .{
-                        inst.pc,
-                        @tagName(inst.opcode),
-                        resource_sgpr,
-                        resource_sgpr + 3,
-                        @tagName(full.stop_reason),
-                        full.stop_pc,
-                        full.load_count,
-                        bindings.user_data_count,
-                    },
-                );
+            ) orelse {
+                if (log_verbose_gpu) {
+                    const full = gpu.scalar_provenance.evaluatePrefix(reader, bindings);
+                    std.debug.print(
+                        "[vulkan dcb] MissingStorageDescriptor: pc=0x{x} {s} V# s{d}:s{d} unknown (scalar stop={s} @0x{x}, loads={d}, user_data={d}); soft-skip\n",
+                        .{
+                            inst.pc,
+                            @tagName(inst.opcode),
+                            resource_sgpr,
+                            resource_sgpr + 3,
+                            @tagName(full.stop_reason),
+                            full.stop_pc,
+                            full.load_count,
+                            bindings.user_data_count,
+                        },
+                    );
+                }
                 // Soft-skip: keep mapping other resources so a single missing
                 // V# does not abort the whole draw/dispatch.
                 continue;
             };
             if (descriptor.isNull() or descriptor.size_bytes == 0) {
-                std.debug.print(
+                if (log_verbose_gpu) std.debug.print(
                     "[vulkan dcb] MissingStorageDescriptor: pc=0x{x} {s} V# s{d} null/empty (addr=0x{x} size={d}); soft-skip\n",
                     .{
                         inst.pc,
@@ -1891,7 +1934,7 @@ pub const Renderer = struct {
                 continue;
             }
             const size = std.math.cast(usize, descriptor.size_bytes) orelse {
-                std.debug.print(
+                if (log_verbose_gpu) std.debug.print(
                     "[vulkan dcb] GuestBufferTooLarge: V# s{d} size_bytes=0x{x}; soft-skip\n",
                     .{ resource_sgpr, descriptor.size_bytes },
                 );
@@ -1899,11 +1942,11 @@ pub const Renderer = struct {
             };
             const descriptor_index = result.descriptorForRange(descriptor.address, size) orelse blk: {
                 const free = result.freeDescriptor() orelse {
-                    std.debug.print("[vulkan dcb] no free storage slot for V# s{d}; soft-skip\n", .{resource_sgpr});
+                    if (log_verbose_gpu) std.debug.print("[vulkan dcb] no free storage slot for V# s{d}; soft-skip\n", .{resource_sgpr});
                     continue;
                 };
                 _ = self.stageGuestStorageBufferAt(free, descriptor.address, size) catch |err| {
-                    std.debug.print(
+                    if (log_verbose_gpu) std.debug.print(
                         "[vulkan dcb] stage V# s{d} failed: {s} addr=0x{x} size=0x{x} stride={d} records={d}; soft-skip\n",
                         .{
                             resource_sgpr,
@@ -1924,6 +1967,9 @@ pub const Renderer = struct {
             result.mappings[result.mapping_count] = .{
                 .resource_sgpr = resource_sgpr,
                 .descriptor_index = descriptor_index,
+                .instruction_pc = if (bindings.stage == .compute) null else inst.pc,
+                .soffset_value = if (vertex_attribute) |attribute| attribute.offset_bytes else null,
+                .use_vertex_index = vertex_attribute != null,
                 .stride = descriptor.stride,
                 .swizzled = descriptor.swizzle_enabled,
                 .index_stride = descriptor.index_stride,
@@ -2358,21 +2404,20 @@ pub const Renderer = struct {
         vertex_words: []const u32,
         fragment_words: []const u32,
     ) (Error || std.mem.Allocator.Error)!vk.Pipeline {
+        self.graphics_pipeline_sequence +%= 1;
         const state_hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&pipeline_state));
         const vertex_hash = std.hash.Wyhash.hash(state_hash, std.mem.sliceAsBytes(vertex_words));
         const hash = std.hash.Wyhash.hash(vertex_hash, std.mem.sliceAsBytes(fragment_words));
-        for (self.graphics_pipelines.items) |entry| {
+        for (self.graphics_pipelines.items) |*entry| {
             if (entry.hash == hash and
                 std.mem.eql(u8, std.mem.asBytes(&entry.state), std.mem.asBytes(&pipeline_state)) and
                 std.mem.eql(u32, entry.vertex_words, vertex_words) and
                 std.mem.eql(u32, entry.fragment_words, fragment_words))
             {
                 self.graphics_pipeline_cache_hits += 1;
+                entry.last_used_sequence = self.graphics_pipeline_sequence;
                 return entry.pipeline;
             }
-        }
-        if (self.graphics_pipelines.items.len >= maximum_graphics_pipelines) {
-            return Error.GraphicsPipelineCacheFull;
         }
         const owned_vertex = try self.allocator.dupe(u32, vertex_words);
         errdefer self.allocator.free(owned_vertex);
@@ -2380,15 +2425,261 @@ pub const Renderer = struct {
         errdefer self.allocator.free(owned_fragment);
         const pipeline = try self.createGraphicsPipeline(render_pass, pipeline_state, vertex_words, fragment_words);
         errdefer self.device_functions.destroy_pipeline(self.device, pipeline, null);
-        try self.graphics_pipelines.append(self.allocator, .{
+        const replacement = GraphicsPipelineEntry{
             .hash = hash,
             .state = pipeline_state,
             .vertex_words = owned_vertex,
             .fragment_words = owned_fragment,
             .pipeline = pipeline,
-        });
+            .last_used_sequence = self.graphics_pipeline_sequence,
+        };
+        if (self.graphics_pipelines.items.len < maximum_graphics_pipelines) {
+            try self.graphics_pipelines.append(self.allocator, replacement);
+        } else {
+            // Every one-shot submission is fenced before returning, so the
+            // least-recently-used pipeline cannot still be executing here.
+            // Recycling it preserves correctness in titles which specialize
+            // transform constants into more than 256 shader variants.
+            var oldest_index: usize = 0;
+            var oldest_sequence = self.graphics_pipelines.items[0].last_used_sequence;
+            for (self.graphics_pipelines.items[1..], 1..) |entry, index| {
+                if (entry.last_used_sequence >= oldest_sequence) continue;
+                oldest_index = index;
+                oldest_sequence = entry.last_used_sequence;
+            }
+            const victim = &self.graphics_pipelines.items[oldest_index];
+            self.device_functions.destroy_pipeline(self.device, victim.pipeline, null);
+            self.allocator.free(victim.vertex_words);
+            self.allocator.free(victim.fragment_words);
+            victim.* = replacement;
+        }
         self.graphics_pipeline_cache_misses += 1;
         return pipeline;
+    }
+
+    fn colorTargetFrameBytes(target: GuestColorTarget) Error!usize {
+        const bytes = std.math.cast(usize, target.layout.staging_bytes) orelse
+            return Error.UnsupportedColorTarget;
+        if (bytes == 0 or bytes > maximum_frame_bytes) return Error.UnsupportedColorTarget;
+        return bytes;
+    }
+
+    fn sameRenderTarget(a: GuestColorTarget, b: GuestColorTarget) bool {
+        return a.descriptor.address == b.descriptor.address and
+            a.descriptor.width == b.descriptor.width and
+            a.descriptor.height == b.descriptor.height and
+            a.descriptor.pitch == b.descriptor.pitch and
+            a.descriptor.format == b.descriptor.format and
+            a.descriptor.tile_mode == b.descriptor.tile_mode and
+            a.descriptor.samples_log2 == b.descriptor.samples_log2 and
+            a.descriptor.fragments_log2 == b.descriptor.fragments_log2 and
+            a.descriptor.base_array_slice == b.descriptor.base_array_slice and
+            a.descriptor.mip_level == b.descriptor.mip_level and
+            a.layout.required_source_bytes == b.layout.required_source_bytes and
+            a.layout.staging_bytes == b.layout.staging_bytes;
+    }
+
+    fn createCachedRenderTarget(self: *Renderer, target: GuestColorTarget) anyerror!CachedRenderTarget {
+        const frame_bytes = try colorTargetFrameBytes(target);
+        const image = try self.createImage(
+            target.descriptor.width,
+            target.descriptor.height,
+            vk.format_r8g8b8a8_unorm,
+            vk.image_usage_color_attachment_bit |
+                vk.image_usage_transfer_src_bit |
+                vk.image_usage_transfer_dst_bit,
+        );
+        errdefer self.destroyImage(image);
+
+        const view_info = vk.ImageViewCreateInfo{
+            .image = image.handle,
+            .format = vk.format_r8g8b8a8_unorm,
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        var view: vk.ImageView = 0;
+        if (self.device_functions.create_image_view(self.device, &view_info, null, &view) != vk.success) {
+            return Error.ImageViewCreationFailed;
+        }
+        errdefer self.device_functions.destroy_image_view(self.device, view, null);
+
+        const render_pass = try self.createGraphicsRenderPass(true);
+        errdefer self.device_functions.destroy_render_pass(self.device, render_pass, null);
+        const framebuffer_info = vk.FramebufferCreateInfo{
+            .render_pass = render_pass,
+            .attachment_count = 1,
+            .attachments = @ptrCast(&view),
+            .width = target.descriptor.width,
+            .height = target.descriptor.height,
+        };
+        var framebuffer: vk.Framebuffer = 0;
+        if (self.device_functions.create_framebuffer(self.device, &framebuffer_info, null, &framebuffer) != vk.success) {
+            return Error.FramebufferCreationFailed;
+        }
+        errdefer self.device_functions.destroy_framebuffer(self.device, framebuffer, null);
+
+        const readback = try self.createBuffer(
+            frame_bytes,
+            vk.buffer_usage_transfer_dst_bit,
+            vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+        );
+        errdefer self.destroyBuffer(readback);
+        return .{
+            .target = target,
+            .image = image,
+            .view = view,
+            .render_pass = render_pass,
+            .framebuffer = framebuffer,
+            .readback = readback,
+        };
+    }
+
+    fn destroyCachedRenderTarget(self: *Renderer, target: CachedRenderTarget) void {
+        self.device_functions.destroy_framebuffer(self.device, target.framebuffer, null);
+        self.device_functions.destroy_render_pass(self.device, target.render_pass, null);
+        self.device_functions.destroy_image_view(self.device, target.view, null);
+        self.destroyBuffer(target.readback);
+        self.destroyImage(target.image);
+    }
+
+    fn acquireRenderTarget(self: *Renderer, target: GuestColorTarget) anyerror!usize {
+        for (self.render_targets.items, 0..) |*cached, index| {
+            if (!sameRenderTarget(cached.target, target)) continue;
+            self.render_target_sequence +%= 1;
+            cached.last_used_sequence = self.render_target_sequence;
+            self.frame_profile.render_target_hits += 1;
+            return index;
+        }
+        if (self.render_targets.items.len >= maximum_render_targets) return Error.RenderTargetCacheFull;
+        try self.render_targets.ensureUnusedCapacity(self.allocator, 1);
+        var cached = try self.createCachedRenderTarget(target);
+        self.render_target_sequence +%= 1;
+        cached.last_used_sequence = self.render_target_sequence;
+        self.render_targets.appendAssumeCapacity(cached);
+        self.frame_profile.render_target_misses += 1;
+        if (self.render_targets.items.len == 1) {
+            std.debug.print(
+                "[vulkan dcb] render target cache: first @0x{x} {d}x{d}\n",
+                .{ target.descriptor.address, target.layout.width, target.layout.height },
+            );
+        }
+        return self.render_targets.items.len - 1;
+    }
+
+    /// Copies one persistent attachment to host memory only when something
+    /// outside the GPU needs it (flip, CPU visibility, or texture staging).
+    /// Consecutive draws therefore stay resident and compose in-order.
+    fn materializeRenderTarget(self: *Renderer, index: usize) anyerror!void {
+        if (index >= self.render_targets.items.len) return Error.MissingPresentedFrame;
+        const snapshot = self.render_targets.items[index];
+        if (!snapshot.initialized or snapshot.gpu_generation == snapshot.host_generation) return;
+        const frame_bytes = try colorTargetFrameBytes(snapshot.target);
+
+        const command_buffer = try self.beginOneShot();
+        defer self.device_functions.free_command_buffers(self.device, self.command_pool, 1, @ptrCast(&command_buffer));
+        const to_transfer = vk.ImageMemoryBarrier{
+            .source_access_mask = vk.access_color_attachment_write_bit,
+            .destination_access_mask = vk.access_transfer_read_bit,
+            .old_layout = vk.image_layout_color_attachment_optimal,
+            .new_layout = vk.image_layout_transfer_src_optimal,
+            .image = snapshot.image.handle,
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_color_attachment_output_bit,
+            vk.pipeline_stage_transfer_bit,
+            0,
+            0,
+            null,
+            0,
+            null,
+            1,
+            @ptrCast(&to_transfer),
+        );
+        const copy = vk.BufferImageCopy{
+            .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+            .image_extent = .{
+                .width = snapshot.target.descriptor.width,
+                .height = snapshot.target.descriptor.height,
+                .depth = 1,
+            },
+        };
+        self.device_functions.cmd_copy_image_to_buffer(
+            command_buffer,
+            snapshot.image.handle,
+            vk.image_layout_transfer_src_optimal,
+            snapshot.readback.handle,
+            1,
+            @ptrCast(&copy),
+        );
+        const host_barrier = vk.BufferMemoryBarrier{
+            .source_access_mask = vk.access_transfer_write_bit,
+            .destination_access_mask = vk.access_host_read_bit,
+            .buffer = snapshot.readback.handle,
+            .offset = 0,
+            .size = snapshot.readback.size,
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_transfer_bit,
+            vk.pipeline_stage_host_bit,
+            0,
+            0,
+            null,
+            1,
+            @ptrCast(&host_barrier),
+            0,
+            null,
+        );
+        const back_to_attachment = vk.ImageMemoryBarrier{
+            .source_access_mask = vk.access_transfer_read_bit,
+            .destination_access_mask = vk.access_color_attachment_read_bit | vk.access_color_attachment_write_bit,
+            .old_layout = vk.image_layout_transfer_src_optimal,
+            .new_layout = vk.image_layout_color_attachment_optimal,
+            .image = snapshot.image.handle,
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_transfer_bit,
+            vk.pipeline_stage_color_attachment_output_bit,
+            0,
+            0,
+            null,
+            0,
+            null,
+            1,
+            @ptrCast(&back_to_attachment),
+        );
+        try self.submitOneShot(command_buffer);
+
+        const frame = try self.allocator.alloc(u8, frame_bytes);
+        defer self.allocator.free(frame);
+        try self.readMapped(snapshot.readback, frame);
+        self.frame_profile.readback_bytes += frame_bytes;
+        forceOpaqueAlpha(frame);
+        try self.recordGuestColorTarget(snapshot.target, frame);
+        self.render_targets.items[index].host_generation = snapshot.gpu_generation;
+
+        var colored: u32 = 0;
+        var pixel: usize = 0;
+        while (pixel < frame.len) : (pixel += 4) {
+            if (frame[pixel] != 0 or frame[pixel + 1] != 0 or frame[pixel + 2] != 0) colored += 1;
+        }
+        self.graphics_probe_colored_pixels = colored;
+        if (self.frame_dumps == 0 and colored != 0) {
+            dumpFramePpm("out\\first-frame.ppm", snapshot.target.descriptor.width, snapshot.target.descriptor.height, frame);
+            self.frame_dumps += 1;
+        }
+    }
+
+    fn materializeRenderTargetAt(self: *Renderer, address: u64) anyerror!bool {
+        for (self.render_targets.items, 0..) |cached, index| {
+            if (cached.target.descriptor.address != address) continue;
+            try self.materializeRenderTarget(index);
+            return true;
+        }
+        return false;
     }
 
     /// How a graphics packet wants geometry issued on the host.
@@ -2403,6 +2694,171 @@ pub const Renderer = struct {
         index_uint32: bool = false,
     };
 
+    fn drawPersistentGraphicsShaders(
+        self: *Renderer,
+        vertex_words: []const u32,
+        fragment_words: []const u32,
+        pipeline_state: GraphicsPipelineState,
+        target: GuestColorTarget,
+        bind_graphics_descriptors: bool,
+        draw: GuestDraw,
+    ) anyerror!void {
+        const target_index = try self.acquireRenderTarget(target);
+        const cached_snapshot = self.render_targets.items[target_index];
+        const frame_bytes = try colorTargetFrameBytes(target);
+
+        var initial_upload: ?OwnedBuffer = null;
+        defer if (initial_upload) |buffer| self.destroyBuffer(buffer);
+        if (!cached_snapshot.initialized) {
+            const frame = try self.allocator.alloc(u8, frame_bytes);
+            defer self.allocator.free(frame);
+            const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+            const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
+            try target.layout.stage(reader, target.descriptor.address, frame);
+            initial_upload = try self.createBuffer(
+                frame_bytes,
+                vk.buffer_usage_transfer_src_bit,
+                vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+            );
+            try self.writeMapped(initial_upload.?, frame);
+            self.frame_profile.upload_bytes += frame_bytes;
+        }
+
+        const pipeline = try self.getGraphicsPipeline(
+            cached_snapshot.render_pass,
+            pipeline_state,
+            vertex_words,
+            fragment_words,
+        );
+        const command_buffer = try self.beginOneShot();
+        defer self.device_functions.free_command_buffers(self.device, self.command_pool, 1, @ptrCast(&command_buffer));
+
+        if (initial_upload) |upload| {
+            const to_transfer = vk.ImageMemoryBarrier{
+                .source_access_mask = 0,
+                .destination_access_mask = vk.access_transfer_write_bit,
+                .old_layout = vk.image_layout_undefined,
+                .new_layout = vk.image_layout_transfer_dst_optimal,
+                .image = cached_snapshot.image.handle,
+                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+            };
+            self.device_functions.cmd_pipeline_barrier(
+                command_buffer,
+                vk.pipeline_stage_top_of_pipe_bit,
+                vk.pipeline_stage_transfer_bit,
+                0,
+                0,
+                null,
+                0,
+                null,
+                1,
+                @ptrCast(&to_transfer),
+            );
+            const upload_copy = vk.BufferImageCopy{
+                .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+                .image_extent = .{
+                    .width = target.descriptor.width,
+                    .height = target.descriptor.height,
+                    .depth = 1,
+                },
+            };
+            self.device_functions.cmd_copy_buffer_to_image(
+                command_buffer,
+                upload.handle,
+                cached_snapshot.image.handle,
+                vk.image_layout_transfer_dst_optimal,
+                1,
+                @ptrCast(&upload_copy),
+            );
+            const to_attachment = vk.ImageMemoryBarrier{
+                .source_access_mask = vk.access_transfer_write_bit,
+                .destination_access_mask = vk.access_color_attachment_read_bit | vk.access_color_attachment_write_bit,
+                .old_layout = vk.image_layout_transfer_dst_optimal,
+                .new_layout = vk.image_layout_color_attachment_optimal,
+                .image = cached_snapshot.image.handle,
+                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+            };
+            self.device_functions.cmd_pipeline_barrier(
+                command_buffer,
+                vk.pipeline_stage_transfer_bit,
+                vk.pipeline_stage_color_attachment_output_bit,
+                0,
+                0,
+                null,
+                0,
+                null,
+                1,
+                @ptrCast(&to_attachment),
+            );
+        }
+
+        const begin_info = vk.RenderPassBeginInfo{
+            .render_pass = cached_snapshot.render_pass,
+            .framebuffer = cached_snapshot.framebuffer,
+            .render_area = .{
+                .offset = .{ .x = 0, .y = 0 },
+                .extent = .{ .width = pipeline_state.width, .height = pipeline_state.height },
+            },
+            .clear_value_count = 0,
+            .clear_values = undefined,
+        };
+        self.device_functions.cmd_begin_render_pass(command_buffer, &begin_info, vk.subpass_contents_inline);
+        self.device_functions.cmd_bind_pipeline(command_buffer, vk.pipeline_bind_point_graphics, pipeline);
+        if (bind_graphics_descriptors) {
+            self.device_functions.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk.pipeline_bind_point_graphics,
+                self.compute_pipeline_layout,
+                0,
+                1,
+                @ptrCast(&self.descriptor_set),
+                0,
+                null,
+            );
+        }
+
+        var index_upload: ?OwnedBuffer = null;
+        defer if (index_upload) |buffer| self.destroyBuffer(buffer);
+        if (draw.index_count) |index_count| {
+            if (index_count != 0) {
+                const index_stride: u64 = if (draw.index_uint32) 4 else 2;
+                const index_bytes = std.math.mul(u64, index_count, index_stride) catch
+                    return Error.GuestBufferTooLarge;
+                if (index_bytes == 0 or index_bytes > maximum_frame_bytes) return Error.GuestBufferTooLarge;
+                const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+                const bytes: usize = @intCast(index_bytes);
+                const indices = try self.allocator.alloc(u8, bytes);
+                defer self.allocator.free(indices);
+                if (!memory.read(memory.context, draw.index_address, indices)) return Error.GuestMemoryReadFailed;
+                index_upload = try self.createBuffer(
+                    bytes,
+                    vk.buffer_usage_index_buffer_bit,
+                    vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+                );
+                try self.writeMapped(index_upload.?, indices);
+                self.frame_profile.upload_bytes += bytes;
+                self.device_functions.cmd_bind_index_buffer(
+                    command_buffer,
+                    index_upload.?.handle,
+                    0,
+                    if (draw.index_uint32) vk.index_type_uint32 else vk.index_type_uint16,
+                );
+                self.device_functions.cmd_draw_indexed(command_buffer, index_count, draw.instance_count, 0, 0, 0);
+            }
+        } else if (draw.vertex_count != 0) {
+            self.device_functions.cmd_draw(command_buffer, draw.vertex_count, draw.instance_count, 0, 0);
+        }
+        self.device_functions.cmd_end_render_pass(command_buffer);
+        try self.submitOneShot(command_buffer);
+
+        self.render_target_sequence +%= 1;
+        const cached = &self.render_targets.items[target_index];
+        cached.initialized = true;
+        cached.gpu_generation +%= 1;
+        cached.last_used_sequence = self.render_target_sequence;
+        self.latest_render_target_index = target_index;
+    }
+
     fn drawGraphicsShaders(
         self: *Renderer,
         vertex_words: []const u32,
@@ -2413,6 +2869,16 @@ pub const Renderer = struct {
         validate_diagnostic_color: bool,
         draw: GuestDraw,
     ) anyerror!void {
+        if (guest_target) |target| {
+            return self.drawPersistentGraphicsShaders(
+                vertex_words,
+                fragment_words,
+                pipeline_state,
+                target,
+                bind_graphics_descriptors,
+                draw,
+            );
+        }
         const width = pipeline_state.width;
         const height = pipeline_state.height;
         const frame_pixels = std.math.mul(usize, @as(usize, width), @as(usize, height)) catch {
@@ -2821,6 +3287,10 @@ pub const Renderer = struct {
     /// Publishes every deferred guest writeback. Cheap when nothing is
     /// pending, which is the common case between synchronization packets.
     pub fn flushPendingGuestWrites(self: *Renderer) anyerror!void {
+        var target_index: usize = 0;
+        while (target_index < self.render_targets.items.len) : (target_index += 1) {
+            try self.materializeRenderTarget(target_index);
+        }
         for (self.completed_frames.items) |*cached| {
             if (!cached.needs_writeback) continue;
             const target = cached.target orelse continue;
@@ -2832,6 +3302,7 @@ pub const Renderer = struct {
     /// Publishes only the deferred writeback for one guest address, used
     /// before guest memory at that address is staged or read.
     fn flushPendingGuestWrite(self: *Renderer, address: u64) anyerror!void {
+        _ = try self.materializeRenderTargetAt(address);
         for (self.completed_frames.items) |*cached| {
             if (!cached.needs_writeback or cached.guest_address != address) continue;
             const target = cached.target orelse continue;
@@ -2886,7 +3357,7 @@ pub const Renderer = struct {
         }
         const descriptor = target_descriptor orelse return Error.MissingColorTarget;
         if (descriptor.samples_log2 != 0 or descriptor.fragments_log2 != 0) {
-            std.debug.print(
+            if (log_verbose_gpu) std.debug.print(
                 "[vulkan dcb] draw rejected: MSAA color target samples={d} frags={d}\n",
                 .{ descriptor.samples_log2, descriptor.fragments_log2 },
             );
@@ -2896,7 +3367,7 @@ pub const Renderer = struct {
         // as raw tiles. Compressed contents may look wrong until a decompressor
         // exists, but rejecting compressed targets blocks typical title draws.
         if (descriptor.dcc_enabled or descriptor.cmask_fast_clear or descriptor.fmask_compression) {
-            std.debug.print(
+            if (log_verbose_gpu) std.debug.print(
                 "[vulkan dcb] draw: ignoring compression flags dcc={any} cmask={any} fmask={any} fmt={d}\n",
                 .{
                     descriptor.dcc_enabled,
@@ -2907,7 +3378,7 @@ pub const Renderer = struct {
             );
         }
         if (descriptor.format != 10) {
-            std.debug.print(
+            if (log_verbose_gpu) std.debug.print(
                 "[vulkan dcb] draw: treating color format {d} as 32bpp RGBA\n",
                 .{descriptor.format},
             );
@@ -2927,6 +3398,38 @@ pub const Renderer = struct {
         defer vertex_analysis.deinit(self.allocator);
         var fragment_analysis = try gpu.shader_analysis.decode(self.allocator, reader, fragment_address, 4096);
         defer fragment_analysis.deinit(self.allocator);
+        if (self.reported_interface_pairs < 2 and
+            (self.last_interface_vertex_address != vertex_address or
+                self.last_interface_fragment_address != fragment_address))
+        {
+            var vertex_export_mask: u64 = 0;
+            var vertex_parameter_mask: u32 = 0;
+            for (vertex_analysis.program.instructions.items) |inst| {
+                if (inst.opcode != .exp) continue;
+                vertex_export_mask |= @as(u64, 1) << inst.export_target;
+                if (inst.export_target >= 0x20) {
+                    vertex_parameter_mask |= @as(u32, 1) << @intCast(inst.export_target - 0x20);
+                }
+            }
+            var fragment_attribute_mask: u32 = 0;
+            for (fragment_analysis.program.instructions.items) |inst| {
+                switch (inst.opcode) {
+                    .v_interp_p1_f32, .v_interp_p2_f32, .v_interp_mov_f32 => {
+                        if (inst.src1.kind == .integer_inline_constant and inst.src1.value < 32) {
+                            fragment_attribute_mask |= @as(u32, 1) << @intCast(inst.src1.value);
+                        }
+                    },
+                    else => {},
+                }
+            }
+            std.debug.print(
+                "[vulkan dcb] shader interface VS=0x{x} exports=0x{x} params=0x{x} PS=0x{x} attrs=0x{x}\n",
+                .{ vertex_address, vertex_export_mask, vertex_parameter_mask, fragment_address, fragment_attribute_mask },
+            );
+            self.last_interface_vertex_address = vertex_address;
+            self.last_interface_fragment_address = fragment_address;
+            self.reported_interface_pairs += 1;
+        }
         const vertex_header = if (memory.shader_header) |resolve|
             resolve(memory.context, vertex_address)
         else
@@ -3000,6 +3503,23 @@ pub const Renderer = struct {
             &fragment_scalar_regs,
             fragment_scalar_count,
         );
+        // T#/S# descriptor payloads select host descriptor-array elements;
+        // they are not shader constants. Specializing their changing guest
+        // addresses creates a new Vulkan pipeline for every streamed texture.
+        for (graphics_resources.mappings[0..graphics_resources.mapping_count]) |mapping| {
+            fragment_scalar_count = removeScalarRegisterRange(
+                &fragment_scalar_regs,
+                fragment_scalar_count,
+                mapping.resource_sgpr,
+                8,
+            );
+            fragment_scalar_count = removeScalarRegisterRange(
+                &fragment_scalar_regs,
+                fragment_scalar_count,
+                mapping.sampler_sgpr,
+                4,
+            );
+        }
 
         // Attribute / constant buffer MUBUF in the vertex program needs the
         // same storage-descriptor array as compute. Missing V#s are non-fatal:
@@ -3036,6 +3556,25 @@ pub const Renderer = struct {
                 vertex_storage.scalar_count += 1;
             }
         }
+        if (!self.reported_vertex_storage_bindings) {
+            std.debug.print("[vulkan dcb] first vertex storage mappings={d}\n", .{vertex_storage.mapping_count});
+            for (vertex_storage.mappings[0..vertex_storage.mapping_count]) |mapping| {
+                const slot: usize = @intCast(mapping.descriptor_index);
+                std.debug.print(
+                    "  pc={any} V#s{d} slot={d} addr=0x{x} size=0x{x} stride={d} soffset={any}\n",
+                    .{
+                        mapping.instruction_pc,
+                        mapping.resource_sgpr,
+                        mapping.descriptor_index,
+                        vertex_storage.addresses[slot],
+                        vertex_storage.sizes[slot],
+                        mapping.stride,
+                        mapping.soffset_value,
+                    },
+                );
+            }
+            self.reported_vertex_storage_bindings = true;
+        }
         if (log_verbose_gpu) std.debug.print(
             "[vulkan dcb] vertex storage: mappings={d} scalars={d}\n",
             .{ vertex_storage.mapping_count, vertex_storage.scalar_count },
@@ -3048,25 +3587,28 @@ pub const Renderer = struct {
             .scalar_registers = fragment_scalar_regs[0..fragment_scalar_count],
             .specialized_scalar_prefix_end = fragment_scalar_end,
         }) catch |err| {
-            std.debug.print(
-                "[vulkan dcb] fragment program 0x{x}: {d} instructions, translate={s} scalars={d} end=0x{x}\n",
-                .{
-                    fragment_address,
-                    fragment_analysis.program.instructions.items.len,
-                    @errorName(err),
-                    fragment_scalar_count,
-                    fragment_scalar_end,
-                },
-            );
-            dumpShaderHead(&fragment_analysis, 16);
+            if (self.shouldReportShaderFailure(fragment_address, .pixel, err)) {
+                std.debug.print(
+                    "[vulkan dcb] fragment program 0x{x}: {d} instructions, translate={s} scalars={d} end=0x{x}\n",
+                    .{
+                        fragment_address,
+                        fragment_analysis.program.instructions.items.len,
+                        @errorName(err),
+                        fragment_scalar_count,
+                        fragment_scalar_end,
+                    },
+                );
+                dumpShaderHead(&fragment_analysis, 16);
+                dumpScalarRegisters(fragment_scalar_regs[0..fragment_scalar_count]);
+            }
             return err;
         };
         defer fragment_module.deinit(self.allocator);
 
-        // Prefer guest VS when attribute V#s mapped; otherwise (or on translate
-        // failure) use the probe triangle so guest PS still paints something.
-        const try_guest_vs = vertex_storage.mapping_count != 0 and
-            vertex_storage.mappingForSgpr(4) != null;
+        // Prefer the guest VS whenever at least one attribute V# mapped. AGC
+        // commonly places it at s0 or s8 as well as s4; requiring one fixed
+        // SGPR was what collapsed whole scenes onto the probe triangle.
+        const try_guest_vs = vertex_storage.mapping_count != 0;
         if (try_guest_vs) {
             if (vertex_analysis.translateSpirv(self.allocator, .{
                 .stage = .vertex,
@@ -3095,31 +3637,19 @@ pub const Renderer = struct {
                     false,
                     draw,
                 );
-                // Guest NGG index/MVP still often collapses to a zero-area
-                // writeback. Fall back to the probe triangle so guest PS and
-                // texture path stay observable until attribute index recovery.
-                if (self.guest_graphics_draws == 0 and self.graphics_probe_colored_pixels == 0) {
-                    std.debug.print(
-                        "[vulkan dcb] guest VS writeback empty; probe VS + guest PS fallback\n",
-                        .{},
-                    );
-                    try self.drawGraphicsShaders(
-                        &graphics_probe_vertex_spirv,
-                        fragment_module.words,
-                        pipeline_state,
-                        target,
-                        graphics_resources.mapping_count != 0,
-                        false,
-                        .{ .vertex_count = 3, .instance_count = 1 },
-                    );
-                }
+                // The persistent attachment is intentionally not read back
+                // here.  A probe-VS retry used to require a full-frame GPU→CPU
+                // round trip after every draw and also painted over valid
+                // multi-pass output.  Geometry diagnostics now happen at flip.
                 return;
             } else |err| {
-                std.debug.print(
-                    "[vulkan dcb] vertex program 0x{x} ({s}): translate={s}; falling back to probe VS\n",
-                    .{ vertex_address, @tagName(vertex_stage), @errorName(err) },
-                );
-                dumpShaderHead(&vertex_analysis, 12);
+                if (self.shouldReportShaderFailure(vertex_address, vertex_stage, err)) {
+                    std.debug.print(
+                        "[vulkan dcb] vertex program 0x{x} ({s}): translate={s}; falling back to probe VS\n",
+                        .{ vertex_address, @tagName(vertex_stage), @errorName(err) },
+                    );
+                    dumpShaderHead(&vertex_analysis, vertex_analysis.program.instructions.items.len);
+                }
             }
         } else {
             if (log_verbose_gpu) std.debug.print(
@@ -3149,7 +3679,7 @@ pub const Renderer = struct {
         for (analysis.program.instructions.items) |inst| {
             if (inst.opcode != .image_sample) continue;
             if (inst.src1.kind != .sgpr or inst.src2.kind != .sgpr) {
-                std.debug.print(
+                if (log_verbose_gpu) std.debug.print(
                     "[vulkan dcb] image_sample resource kinds t#={s} s#={s}\n",
                     .{ @tagName(inst.src1.kind), @tagName(inst.src2.kind) },
                 );
@@ -3403,7 +3933,9 @@ pub const Renderer = struct {
             return .{ .image = item.image, .view = item.view, .sampler = item.sampler };
         }
         self.texture_cache_misses += 1;
-        std.debug.print("[vulkan dcb] texture cache miss: addr=0x{x} hash={x}\n", .{ descriptor.address, content_hash });
+        if (self.texture_cache_misses == 1) {
+            std.debug.print("[vulkan dcb] texture cache miss: first @0x{x} hash={x}\n", .{ descriptor.address, content_hash });
+        }
 
         const linear = try self.allocator.alloc(u8, byte_count);
         defer self.allocator.free(linear);
@@ -3583,6 +4115,7 @@ pub const Renderer = struct {
             @ptrCast(&shader_barrier),
         );
         try self.submitOneShot(command_buffer);
+        self.frame_profile.upload_bytes +%= byte_count;
 
         const view_info = vk.ImageViewCreateInfo{
             .image = image.handle,
@@ -3599,7 +4132,28 @@ pub const Renderer = struct {
         self.updateSampledImageDescriptor(descriptor_index, view, sampler);
         self.sampled_image_uploads += 1;
 
-        if (self.sampled_image_cache.items.len >= 64) {
+        // A streamed/video texture keeps one allocation per guest surface, not
+        // one allocation per content hash. All earlier draws are complete at
+        // this synchronous upload point, so the superseded image is no longer
+        // in flight and can be retired safely.
+        var stale_index = self.sampled_image_cache.items.len;
+        while (stale_index > 0) {
+            stale_index -= 1;
+            const stale = self.sampled_image_cache.items[stale_index];
+            if (stale.guest_address != descriptor.address or
+                stale.width != descriptor.width or
+                stale.height != descriptor.height or
+                stale.tile_mode != @intFromEnum(descriptor.tile_mode))
+            {
+                continue;
+            }
+            self.device_functions.destroy_image_view(self.device, stale.view, null);
+            self.device_functions.destroy_sampler(self.device, stale.sampler, null);
+            self.destroyImage(stale.image);
+            _ = self.sampled_image_cache.orderedRemove(stale_index);
+        }
+
+        if (self.sampled_image_cache.items.len >= maximum_sampled_images) {
             var oldest_idx: usize = 0;
             var oldest_frame: u64 = std.math.maxInt(u64);
             for (self.sampled_image_cache.items, 0..) |item, idx| {
@@ -3609,9 +4163,9 @@ pub const Renderer = struct {
                 }
             }
             const evicted = self.sampled_image_cache.items[oldest_idx];
-            self.destroyImage(evicted.image);
             self.device_functions.destroy_image_view(self.device, evicted.view, null);
             self.device_functions.destroy_sampler(self.device, evicted.sampler, null);
+            self.destroyImage(evicted.image);
             _ = self.sampled_image_cache.orderedRemove(oldest_idx);
         }
 
@@ -3699,9 +4253,13 @@ pub const Renderer = struct {
         if (self.device_functions.queue_submit(self.queue, 1, @ptrCast(&submit_info), fence) != vk.success) {
             return Error.QueueSubmissionFailed;
         }
+        self.frame_profile.submits += 1;
+        const wait_started = hostTimestampNs();
         if (self.device_functions.wait_for_fences(self.device, 1, @ptrCast(&fence), vk.true_value, ~@as(u64, 0)) != vk.success) {
             return Error.FenceWaitFailed;
         }
+        const wait_finished = hostTimestampNs();
+        if (wait_finished >= wait_started) self.frame_profile.fence_wait_ns +%= wait_finished - wait_started;
     }
 
     fn destroyBuffer(self: *Renderer, buffer: OwnedBuffer) void {
@@ -3963,36 +4521,76 @@ pub const Renderer = struct {
         });
     }
 
+    fn reportFrameProfile(self: *Renderer) void {
+        const profile = self.frame_profile;
+        const now = hostTimestampNs();
+        const interval_ns = if (now != 0 and self.last_flip_profile_ns != 0 and now >= self.last_flip_profile_ns)
+            now - self.last_flip_profile_ns
+        else
+            0;
+        self.last_flip_profile_ns = now;
+        const should_print = self.flip_callbacks <= 8 or
+            self.flip_callbacks % 60 == 0 or
+            interval_ns >= std.time.ns_per_s or
+            profile.fence_wait_ns >= std.time.ns_per_s;
+        if (should_print) {
+            std.debug.print(
+                "[gpu frame] flip={d} frame_ms={d} draws={d} dispatches={d} submits={d} fence_wait_us={d} upload_kib={d} readback_kib={d} rt_hit={d} rt_miss={d} buf_cache={d} tex_cache={d}\n",
+                .{
+                    self.flip_callbacks,
+                    interval_ns / std.time.ns_per_ms,
+                    profile.draws,
+                    profile.dispatches,
+                    profile.submits,
+                    profile.fence_wait_ns / std.time.ns_per_us,
+                    profile.upload_bytes / 1024,
+                    profile.readback_bytes / 1024,
+                    profile.render_target_hits,
+                    profile.render_target_misses,
+                    self.guest_buffers.items.len,
+                    self.sampled_image_cache.items.len,
+                },
+            );
+        }
+        self.frame_profile.reset();
+    }
+
     fn dcbFlip(context: ?*anyopaque, flip: gpu.state.Flip) bool {
         const self = fromContext(context);
         self.flip_callbacks += 1;
+        defer self.reportFrameProfile();
         if (log_verbose_gpu) std.debug.print(
             "[vulkan dcb] flip #{d} buffer={d} video_out={d} completed_frames={d}\n",
             .{ self.flip_callbacks, flip.display_buffer_index, flip.video_out_handle, self.completed_frames.items.len },
         );
-        // The flip is the frame boundary: publish deferred guest writebacks so
-        // a display buffer read straight out of guest memory sees the frame
-        // that was actually rendered. No device wait is needed — every draw
-        // submission is already fence-completed synchronously, and the guest
-        // writeback below is a host-side tile operation.
-        self.flushPendingGuestWrites() catch |err| {
-            self.last_flip_error = err;
-            return false;
-        };
-        var selected_index = self.latest_frame_index;
+        // A display flip consumes the host attachment directly.  Materialize
+        // only the selected target; tiling it back into guest memory is reserved
+        // for a real CPU-visible synchronization point.
+        var selected_index: ?usize = null;
         var requested: ?DisplayBuffer = null;
         if (self.display_buffer_resolver) |resolver| {
             requested = resolver.resolve(resolver.context, flip) orelse {
                 self.last_flip_error = Error.MissingPresentedFrame;
                 return false;
             };
-            selected_index = null;
+            _ = self.materializeRenderTargetAt(requested.?.address) catch |err| {
+                self.last_flip_error = err;
+                return false;
+            };
             for (self.completed_frames.items, 0..) |cached, index| {
                 if (cached.guest_address == requested.?.address) {
                     selected_index = index;
                     break;
                 }
             }
+        } else if (self.latest_render_target_index) |target_index| {
+            self.materializeRenderTarget(target_index) catch |err| {
+                self.last_flip_error = err;
+                return false;
+            };
+            selected_index = self.latest_frame_index;
+        } else {
+            selected_index = self.latest_frame_index;
         }
 
         const frame_index = selected_index orelse {
@@ -4017,6 +4615,24 @@ pub const Renderer = struct {
         if (cached.pixels.items.len == 0) {
             self.last_flip_error = Error.MissingPresentedFrame;
             return false;
+        }
+        switch (self.flip_callbacks) {
+            8, 16, 32, 64, 96, 128 => {
+                var path_buffer: [64]u8 = undefined;
+                const path: ?[:0]u8 = std.fmt.bufPrintZ(
+                    &path_buffer,
+                    "out\\frame-{d:0>4}.ppm",
+                    .{self.flip_callbacks},
+                ) catch null;
+                if (path) |name| {
+                    dumpFramePpm(name.ptr, cached.width, cached.height, cached.pixels.items);
+                    std.debug.print(
+                        "[vulkan dcb] dumped progress frame {d} ({d}x{d})\n",
+                        .{ self.flip_callbacks, cached.width, cached.height },
+                    );
+                }
+            },
+            else => {},
         }
         if (self.presentation_sink) |sink| {
             if (!sink.present(sink.context, .{
@@ -4046,9 +4662,41 @@ pub const Renderer = struct {
         return null;
     }
 
+    /// Shader translation failures are keyed by program and stage. A command
+    /// buffer may issue the same unsupported draw thousands of times; printing
+    /// the full disassembly for each one can cost more wall time than the GPU.
+    fn shouldReportShaderFailure(
+        self: *Renderer,
+        address: u64,
+        stage: gpu.resources.ShaderStage,
+        err: anyerror,
+    ) bool {
+        const repeated = self.last_shader_failure_address == address and
+            self.last_shader_failure_stage != null and
+            self.last_shader_failure_stage.? == stage and
+            self.last_shader_failure_error != null and
+            self.last_shader_failure_error.? == err;
+        self.last_shader_failure_address = address;
+        self.last_shader_failure_stage = stage;
+        self.last_shader_failure_error = err;
+        return !repeated;
+    }
+
+    fn shouldReportDrawError(self: *Renderer, err: anyerror) bool {
+        for (&self.reported_draw_errors) |*reported| {
+            if (reported.* == null) {
+                reported.* = err;
+                return true;
+            }
+            if (reported.*.? == err) return false;
+        }
+        return false;
+    }
+
     fn dcbDraw(context: ?*anyopaque, state: *const gpu.State, packet: gpu.pm4.Packet) bool {
         const self = fromContext(context);
         self.draw_callbacks += 1;
+        self.frame_profile.draws += 1;
         const vertex_stage = graphicsVertexStage(state);
         const has_vertex = vertex_stage != null;
         const has_fragment = gpu.resources.ShaderStage.pixel.programAddress(state) != null;
@@ -4081,20 +4729,22 @@ pub const Renderer = struct {
         // lets the queue reach a complete pair (and later the flip).
         if (has_vertex != has_fragment) {
             self.last_draw_error = Error.MissingGraphicsProgram;
-            std.debug.print(
-                "[vulkan dcb] draw skipped: incomplete graphics programs (vs={any} ps={any} vs_bank={s})\n",
-                .{
-                    has_vertex,
-                    has_fragment,
-                    if (vertex_stage) |stage| @tagName(stage) else "none",
-                },
-            );
+            if (self.shouldReportDrawError(Error.MissingGraphicsProgram)) {
+                std.debug.print(
+                    "[vulkan dcb] draw skipped: incomplete graphics programs (vs={any} ps={any} vs_bank={s})\n",
+                    .{
+                        has_vertex,
+                        has_fragment,
+                        if (vertex_stage) |stage| @tagName(stage) else "none",
+                    },
+                );
+            }
             return true;
         }
         if (has_vertex)
             self.drawGuestGraphics(state, draw, vertex_stage.?) catch |err| {
                 self.last_draw_error = err;
-                std.debug.print("[vulkan dcb] draw rejected: {s}\n", .{@errorName(err)});
+                if (self.shouldReportDrawError(err)) std.debug.print("[vulkan dcb] draw rejected: {s}\n", .{@errorName(err)});
                 // Soft-skip shader/state gaps so one incomplete draw does not
                 // kill the DCB before a later flip.
                 return true;
@@ -4118,6 +4768,7 @@ pub const Renderer = struct {
     fn dcbDispatch(context: ?*anyopaque, state: *const gpu.State, packet: gpu.pm4.Packet) bool {
         const self = fromContext(context);
         self.dispatch_callbacks += 1;
+        self.frame_profile.dispatches += 1;
         if (packet.opcode != gpu.pm4.dispatch_direct) {
             self.last_dispatch_error = Error.UnsupportedIndirectDispatch;
             std.debug.print("[vulkan dcb] dispatch rejected: {s}\n", .{@errorName(Error.UnsupportedIndirectDispatch)});
@@ -4288,6 +4939,22 @@ fn mergeUserDataScalars(
         n += 1;
     }
     return n;
+}
+
+fn removeScalarRegisterRange(
+    registers: []gpu.ShaderSpirvScalarRegister,
+    count: usize,
+    first: u32,
+    width: u32,
+) usize {
+    const end = @min(first +| width, 128);
+    var write: usize = 0;
+    for (registers[0..count]) |entry| {
+        if (entry.register >= first and entry.register < end) continue;
+        registers[write] = entry;
+        write += 1;
+    }
+    return write;
 }
 
 fn countNonzeroRgba(linear: []const u8) u32 {
@@ -4514,12 +5181,30 @@ fn dumpShaderHead(analysis: *const gpu.ShaderAnalysis, limit: usize) void {
             );
         } else {
             std.debug.print(
-                "  pc=0x{x:0>4} {s} dst={s}:{d}\n",
-                .{ inst.pc, inst.opcode.mnemonic(), @tagName(inst.dst.kind), inst.dst.reg },
+                "  pc=0x{x:0>4} word=0x{x:0>8} {s} dst={s}:{d} src0={s}:{d} src1={s}:{d} src2={s}:{d}\n",
+                .{
+                    inst.pc,
+                    inst.word,
+                    inst.opcode.mnemonic(),
+                    @tagName(inst.dst.kind),
+                    inst.dst.reg,
+                    @tagName(inst.src0.kind),
+                    inst.src0.reg,
+                    @tagName(inst.src1.kind),
+                    inst.src1.reg,
+                    @tagName(inst.src2.kind),
+                    inst.src2.reg,
+                },
             );
         }
         printed += 1;
     }
+}
+
+fn dumpScalarRegisters(registers: []const gpu.ShaderSpirvScalarRegister) void {
+    std.debug.print("  scalar seeds ({d}):", .{registers.len});
+    for (registers) |entry| std.debug.print(" s{d}=0x{x}", .{ entry.register, entry.value });
+    std.debug.print("\n", .{});
 }
 
 const WindowsFileDump = if (builtin.os.tag == .windows) struct {
