@@ -9,6 +9,9 @@
 //! produces deterministic silent PCM; it is deliberately not a codec decoder.
 
 const std = @import("std");
+
+/// Set to true to enable verbose per-frame audio debug logging.
+const log_verbose_audio = false;
 const builtin = @import("builtin");
 const abi = @import("../abi.zig");
 const trace = @import("../trace.zig");
@@ -364,7 +367,7 @@ fn audioOutOutput(handle: i32, data: ?*const anyopaque) callconv(abi.guest) i32 
             if (device.play(play_slice)) |_| {
                 const n = audio_out_play_ok.fetchAdd(1, .monotonic);
                 if (n < 3 or n % 1000 == 0 or (peak > 8 and n < 20)) {
-                    std.debug.print(
+                    if (log_verbose_audio) std.debug.print(
                         "[audio] play ok #{d} handle={d} bytes={d} peak~{d}\n",
                         .{ n + 1, handle, length, peak },
                     );

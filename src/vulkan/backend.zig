@@ -17,6 +17,10 @@ const builtin = @import("builtin");
 const gpu = @import("gpu");
 const vk = @import("api.zig");
 
+/// Set to true to enable verbose per-frame GPU debug logging.
+/// Disable for performance — each print is a blocking I/O syscall.
+const log_verbose_gpu = false;
+
 pub const Error = error{
     VulkanLoaderNotFound,
     MissingVulkanFunction,
@@ -571,11 +575,7 @@ const GraphicsResources = struct {
     mapping_count: usize = 0,
 
     fn deinit(self: *GraphicsResources, renderer: *Renderer) void {
-        for (self.images[0..self.image_count]) |image| {
-            renderer.device_functions.destroy_sampler(renderer.device, image.sampler, null);
-            renderer.device_functions.destroy_image_view(renderer.device, image.view, null);
-            renderer.destroyImage(image.image);
-        }
+        _ = renderer;
         self.* = undefined;
     }
 };
@@ -618,6 +618,18 @@ const ComputeResources = struct {
     }
 };
 
+const CachedSampledImage = struct {
+    guest_address: u64,
+    width: u32,
+    height: u32,
+    tile_mode: u8,
+    content_hash: u64,
+    image: OwnedImage,
+    view: vk.ImageView,
+    sampler: vk.Sampler,
+    last_used_frame: u64,
+};
+
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
     loader: Loader,
@@ -647,6 +659,9 @@ pub const Renderer = struct {
     gds_storage: std.ArrayList(u8) = .empty,
     compute_pipelines: std.ArrayList(ComputePipelineEntry) = .empty,
     graphics_pipelines: std.ArrayList(GraphicsPipelineEntry) = .empty,
+    sampled_image_cache: std.ArrayList(CachedSampledImage) = .empty,
+    texture_cache_hits: u64 = 0,
+    texture_cache_misses: u64 = 0,
     active_descriptor_set: ?vk.DescriptorSet = null,
     draw_callbacks: u64 = 0,
     translated_draws: u64 = 0,
@@ -1563,7 +1578,7 @@ pub const Renderer = struct {
             @memcpy(self.gds_storage.items[gds_address..][0..4], &value_bytes);
         }
         self.emulated_gds_dispatches += 1;
-        std.debug.print(
+        if (log_verbose_gpu) std.debug.print(
             "[vulkan dcb] emulated GDS initialization: {d} writes, value=0x{x}\n",
             .{ writes, fill_value },
         );
@@ -1622,7 +1637,7 @@ pub const Renderer = struct {
         }
 
         self.elided_dispatches += 1;
-        std.debug.print(
+        if (log_verbose_gpu) std.debug.print(
             "[vulkan dcb] emulated buffer copy: {d} elements from 0x{x} to 0x{x}\n",
             .{ copies, source_desc.address, dest_desc.address },
         );
@@ -2558,7 +2573,7 @@ pub const Renderer = struct {
         self.graphics_probe_colored_pixels = colored;
 
         if (guest_target) |target| {
-            std.debug.print(
+            if (log_verbose_gpu) std.debug.print(
                 "[vulkan dcb] writeback: {d}x{d} @0x{x} colored={d}/{d} corner=({d},{d},{d},{d}) center=({d},{d},{d},{d})\n",
                 .{
                     width,
@@ -2614,7 +2629,7 @@ pub const Renderer = struct {
         }
         self.eager_presents += 1;
         self.presented_frames += 1;
-        std.debug.print(
+        if (log_verbose_gpu) std.debug.print(
             "[vulkan dcb] eager present ok: {d}x{d} @0x{x} (#{d})\n",
             .{ frame.width, frame.height, frame.guest_address, self.eager_presents },
         );
@@ -2689,7 +2704,7 @@ pub const Renderer = struct {
         if (render_state.depth_control.test_enabled or render_state.depth_control.write_enabled or
             render_state.active_color_count != 1)
         {
-            std.debug.print(
+            if (log_verbose_gpu) std.debug.print(
                 "[vulkan dcb] draw: ignoring depth/mrt extras (colors={d} depth_test={any} depth_write={any})\n",
                 .{
                     render_state.active_color_count,
@@ -2832,7 +2847,7 @@ pub const Renderer = struct {
             &vertex_scalar_mut,
             vertex_scalar_end,
         ) catch |err| blk: {
-            std.debug.print(
+            if (log_verbose_gpu) std.debug.print(
                 "[vulkan dcb] vertex storage incomplete: {s}; translating without buffers\n",
                 .{@errorName(err)},
             );
@@ -2857,7 +2872,7 @@ pub const Renderer = struct {
                 vertex_storage.scalar_count += 1;
             }
         }
-        std.debug.print(
+        if (log_verbose_gpu) std.debug.print(
             "[vulkan dcb] vertex storage: mappings={d} scalars={d}\n",
             .{ vertex_storage.mapping_count, vertex_storage.scalar_count },
         );
@@ -2900,7 +2915,7 @@ pub const Renderer = struct {
             })) |vertex_module_owned| {
                 var vertex_module = vertex_module_owned;
                 defer vertex_module.deinit(self.allocator);
-                std.debug.print(
+                if (log_verbose_gpu) std.debug.print(
                     "[vulkan dcb] using guest VS + guest PS; sampled={d} idx={any} storage={d}\n",
                     .{
                         graphics_resources.mapping_count,
@@ -2944,7 +2959,7 @@ pub const Renderer = struct {
                 dumpShaderHead(&vertex_analysis, 12);
             }
         } else {
-            std.debug.print(
+            if (log_verbose_gpu) std.debug.print(
                 "[vulkan dcb] using probe VS + guest PS (no attr V# s4); storage_maps={d} sampled={d}\n",
                 .{ vertex_storage.mapping_count, graphics_resources.mapping_count },
             );
@@ -3136,14 +3151,14 @@ pub const Renderer = struct {
         descriptor_index: u32,
     ) anyerror!PreparedSampledImage {
         if (descriptor.unified_format != 56) {
-            std.debug.print(
+            if (log_verbose_gpu) std.debug.print(
                 "[vulkan dcb] sampled image format {d} (want 56/RGBA8)\n",
                 .{descriptor.unified_format},
             );
             return Error.UnsupportedSampledImage;
         }
         if (descriptor.image_type != .color_2d) {
-            std.debug.print(
+            if (log_verbose_gpu) std.debug.print(
                 "[vulkan dcb] sampled image type {s} (want color_2d)\n",
                 .{@tagName(descriptor.image_type)},
             );
@@ -3151,7 +3166,7 @@ pub const Renderer = struct {
         }
         // Metadata pointers (counter/DCC) are ignored for the first sample path.
         if (descriptor.metadata_address != 0) {
-            std.debug.print(
+            if (log_verbose_gpu) std.debug.print(
                 "[vulkan dcb] sampled image: ignoring metadata @0x{x}\n",
                 .{descriptor.metadata_address},
             );
@@ -3160,16 +3175,64 @@ pub const Renderer = struct {
         if (layout.layers != 1 or layout.block.bytes_per_element != 4 or
             layout.staging_bytes == 0 or layout.staging_bytes > maximum_frame_bytes)
         {
-            std.debug.print(
+            if (log_verbose_gpu) std.debug.print(
                 "[vulkan dcb] sampled image layout rejected layers={d} bpp={d} stage=0x{x}\n",
                 .{ layout.layers, layout.block.bytes_per_element, layout.staging_bytes },
             );
             return Error.UnsupportedSampledImage;
         }
         const byte_count = std.math.cast(usize, layout.staging_bytes) orelse return Error.UnsupportedSampledImage;
+        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+
+        var content_hash: u64 = 14695981039346656037;
+        const probe_span = std.math.cast(usize, layout.required_source_bytes) orelse 0;
+        if (probe_span > 0) {
+            const num_chunks = 16;
+            const chunk_size = 256;
+            const step = probe_span / num_chunks;
+            var i: usize = 0;
+            while (i < num_chunks) : (i += 1) {
+                var chunk: [chunk_size]u8 = @splat(0);
+                const offset = i * step;
+                const want = @min(chunk.len, probe_span - offset);
+                if (want > 0) {
+                    _ = memory.read(memory.context, descriptor.address + offset, chunk[0..want]);
+                    for (chunk[0..want]) |b| {
+                        content_hash ^= b;
+                        content_hash +%= content_hash *% 1099511628211;
+                    }
+                }
+            }
+        }
+
+        var cache_hit_idx: ?usize = null;
+        for (self.sampled_image_cache.items, 0..) |*item, idx| {
+            if (item.guest_address == descriptor.address and
+                item.width == descriptor.width and
+                item.height == descriptor.height and
+                item.tile_mode == @intFromEnum(descriptor.tile_mode) and
+                item.content_hash == content_hash)
+            {
+                cache_hit_idx = idx;
+                break;
+            }
+        }
+
+        if (cache_hit_idx) |idx| {
+            var item = &self.sampled_image_cache.items[idx];
+            item.last_used_frame = self.frame_sequence;
+            self.texture_cache_hits += 1;
+            if (self.texture_cache_hits == 1) {
+                std.debug.print("[vulkan dcb] texture cache hit: first time! addr=0x{x} hash={x}\n", .{descriptor.address, content_hash});
+            }
+            self.updateSampledImageDescriptor(descriptor_index, item.view, item.sampler);
+            return .{ .image = item.image, .view = item.view, .sampler = item.sampler };
+        }
+        self.texture_cache_misses += 1;
+        std.debug.print("[vulkan dcb] texture cache miss: addr=0x{x} hash={x}\n", .{descriptor.address, content_hash});
+
         const linear = try self.allocator.alloc(u8, byte_count);
         defer self.allocator.free(linear);
-        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
         const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
         try layout.stage(reader, descriptor.address, linear);
         var nonzero = countNonzeroRgba(linear);
@@ -3178,7 +3241,7 @@ pub const Renderer = struct {
             try metadata.stageRgba(reader, linear, layout.width, layout.height);
             nonzero = countNonzeroRgba(linear);
             if (nonzero != 0) {
-                std.debug.print(
+                if (log_verbose_gpu) std.debug.print(
                     "[vulkan dcb] metadata surface recovered {d} nonzero from metadata addr=0x{x} dcc=0x{x} cmask=0x{x} fmask=0x{x}\n",
                     .{ nonzero, metadata.metadata_address, metadata.dcc_address, metadata.cmask_address, metadata.fmask_address },
                 );
@@ -3187,16 +3250,16 @@ pub const Renderer = struct {
         // Probe several points in the guest surface: tiled data may put the
         // first texels far from the base while the head of the allocation is
         // still zero (clear/padding).
-        const probe_span = std.math.cast(usize, layout.required_source_bytes) orelse 0;
+        const raw_probe_span = std.math.cast(usize, layout.required_source_bytes) orelse 0;
         var raw_nonzero: u32 = 0;
         var raw_probe_hits: u32 = 0;
-        if (probe_span != 0) {
-            const steps = [_]u64{ 0, probe_span / 4, probe_span / 2, (probe_span * 3) / 4 };
+        if (raw_probe_span != 0) {
+            const steps = [_]u64{ 0, raw_probe_span / 4, raw_probe_span / 2, (raw_probe_span * 3) / 4 };
             var step_i: usize = 0;
             while (step_i < steps.len) : (step_i += 1) {
                 var chunk: [64]u8 = @splat(0);
                 const at = descriptor.address + steps[step_i];
-                const want = @min(chunk.len, probe_span -% @as(usize, @intCast(@min(steps[step_i], probe_span))));
+                const want = @min(chunk.len, raw_probe_span -% @as(usize, @intCast(@min(steps[step_i], raw_probe_span))));
                 if (want == 0) continue;
                 if (!memory.read(memory.context, at, chunk[0..want])) continue;
                 var nz: u32 = 0;
@@ -3209,7 +3272,7 @@ pub const Renderer = struct {
                 }
             }
         }
-        std.debug.print(
+        if (log_verbose_gpu) std.debug.print(
             "[vulkan dcb] staged sample {d}x{d} tile={s} addr=0x{x} nonzero_texels={d}/{d} raw_probe_nz={d} hits={d} first_rgba=({d},{d},{d},{d})\n",
             .{
                 descriptor.width,
@@ -3231,7 +3294,7 @@ pub const Renderer = struct {
         // head cleared while the body is valid).
         var first_hit_off: ?u64 = null;
         if (raw_nonzero == 0 and descriptor.width != 0 and descriptor.height != 0) {
-            const deep_span: u64 = @max(probe_span, @as(u64, descriptor.width) * descriptor.height * 4 * 2);
+            const deep_span: u64 = @max(raw_probe_span, @as(u64, descriptor.width) * descriptor.height * 4 * 2);
             const deep_cap: u64 = 8 * 1024 * 1024;
             const span = @min(deep_span, deep_cap);
             var step: u64 = 0;
@@ -3248,7 +3311,7 @@ pub const Renderer = struct {
                     raw_probe_hits += 1;
                     if (first_hit_off == null) first_hit_off = step;
                     if (raw_probe_hits <= 3) {
-                        std.debug.print(
+                        if (log_verbose_gpu) std.debug.print(
                             "[vulkan dcb] raw hit @+0x{x} nz={d} head={x:0>2}{x:0>2}{x:0>2}{x:0>2}\n",
                             .{ step, nz, chunk[0], chunk[1], chunk[2], chunk[3] },
                         );
@@ -3261,7 +3324,7 @@ pub const Renderer = struct {
         // unrelated linear region from guest memory. That fallback path is what
         // turns a bad tiled/DCC decode into a striped or "borrowed" texture.
         if (nonzero == 0 and descriptor.width != 0 and descriptor.height != 0) {
-            std.debug.print(
+            if (log_verbose_gpu) std.debug.print(
                 "[vulkan dcb] sample empty @0x{x} {d}x{d} tile={s} meta=0x{x} — no fallback decode\n",
                 .{
                     descriptor.address,
@@ -3361,6 +3424,35 @@ pub const Renderer = struct {
         errdefer self.device_functions.destroy_sampler(self.device, sampler, null);
         self.updateSampledImageDescriptor(descriptor_index, view, sampler);
         self.sampled_image_uploads += 1;
+
+        if (self.sampled_image_cache.items.len >= 64) {
+            var oldest_idx: usize = 0;
+            var oldest_frame: u64 = std.math.maxInt(u64);
+            for (self.sampled_image_cache.items, 0..) |item, idx| {
+                if (item.last_used_frame < oldest_frame) {
+                    oldest_frame = item.last_used_frame;
+                    oldest_idx = idx;
+                }
+            }
+            const evicted = self.sampled_image_cache.items[oldest_idx];
+            self.destroyImage(evicted.image);
+            self.device_functions.destroy_image_view(self.device, evicted.view, null);
+            self.device_functions.destroy_sampler(self.device, evicted.sampler, null);
+            _ = self.sampled_image_cache.orderedRemove(oldest_idx);
+        }
+
+        self.sampled_image_cache.append(self.allocator, .{
+            .guest_address = descriptor.address,
+            .width = descriptor.width,
+            .height = descriptor.height,
+            .tile_mode = @intFromEnum(descriptor.tile_mode),
+            .content_hash = content_hash,
+            .image = image,
+            .view = view,
+            .sampler = sampler,
+            .last_used_frame = self.frame_sequence,
+        }) catch {};
+
         return .{ .image = image, .view = view, .sampler = sampler };
     }
 
@@ -3694,7 +3786,7 @@ pub const Renderer = struct {
     fn dcbFlip(context: ?*anyopaque, flip: gpu.state.Flip) bool {
         const self = fromContext(context);
         self.flip_callbacks += 1;
-        std.debug.print(
+        if (log_verbose_gpu) std.debug.print(
             "[vulkan dcb] flip #{d} buffer={d} video_out={d} completed_frames={d}\n",
             .{ self.flip_callbacks, flip.display_buffer_index, flip.video_out_handle, self.completed_frames.items.len },
         );
@@ -3831,7 +3923,7 @@ pub const Renderer = struct {
         if (has_vertex) self.guest_graphics_draws += 1;
         self.translated_draws += 1;
         self.last_draw_error = null;
-        std.debug.print(
+        if (log_verbose_gpu) std.debug.print(
             "[vulkan dcb] draw ok: {s} (#{d})\n",
             .{ if (has_vertex) "guest" else "probe", self.translated_draws },
         );
@@ -3890,7 +3982,7 @@ pub const Renderer = struct {
         };
         self.translated_dispatches += 1;
         self.last_dispatch_error = null;
-        std.debug.print(
+        if (log_verbose_gpu) std.debug.print(
             "[vulkan dcb] dispatch ok: groups={d}x{d}x{d} local={d}x{d}x{d} (#{d})\n",
             .{
                 packet.body[0],
@@ -4432,7 +4524,7 @@ fn seedVertexBufferScalars(
     count: usize,
     evaluation: ?*gpu.ScalarEvaluation,
 ) usize {
-    std.debug.print(
+    if (log_verbose_gpu) std.debug.print(
         "[vulkan dcb] vertex seed: stage={s} header={any} srt={any} ud_base={d} ud_count={d} scalar_s4={any}\n",
         .{
             @tagName(bindings.stage),
@@ -4526,7 +4618,7 @@ fn seedVertexBufferScalars(
     while (pair < pairs) : (pair += 1) {
         const sgpr = resource_sgprs[pair];
         const words = buffer_words[pair];
-        std.debug.print(
+        if (log_verbose_gpu) std.debug.print(
             "[vulkan dcb] seed V# s{d}:s{d} addr=0x{x} size=0x{x} stride={d} records={d}\n",
             .{
                 sgpr,

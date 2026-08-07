@@ -1335,6 +1335,12 @@ scheduler and Vulkan backend. Observed startup work now includes:
   and compressed colour export. Missing attribute V#s soft-skip; when the
   primary attribute bank is absent the draw uses a diagnostic vertex triangle
   so the guest pixel path still runs.
+- **Sampled Texture Caching**: Sampled image descriptors with valid RGBA payloads
+  are hashed and cached with a 64-item LRU scheme, reusing `vk.ImageView` and `vk.Sampler`
+  to significantly reduce per-frame host uploads.
+- **Verbose GPU Logging**: An optional `log_verbose_gpu` flag at the top of the Vulkan backend
+  allows muting high-frequency I/O blocking prints (like GDS writes, queue states, and texture probes)
+  to stabilize frame pacing.
 - AGC `CreateShader` / `FuseShaderHalves` are taken from HLE even when a guest
   `libSceAgc` PRX is loaded, so program→header mappings stay available to the
   live GPU path. Gs/Hs front halves are accepted without a PGM pair; fuse
@@ -1382,6 +1388,8 @@ from leaking into host code where nothing would check it.
    hottest loops without changing synchronization contracts.
 4. Retain submission owner metadata across blocked `WAIT_REG_MEM` continuations
    and publish delayed graphics completion events when needed.
+5. Expand texture caching to support more formats and invalidation mechanisms
+   beyond the current LRU implementation.
 
 ---
 

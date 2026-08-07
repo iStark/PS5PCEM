@@ -12,6 +12,9 @@
 
 const std = @import("std");
 
+/// Set to true to enable verbose per-frame audio debug logging.
+const log_verbose_audio = false;
+
 pub const Error = error{
     NotAvailable,
     OutOfMemory,
@@ -121,7 +124,7 @@ fn refillFromLoopLocked() void {
 pub fn noteFirstPresent() void {
     const was = mix_live.swap(true, .monotonic);
     if (!was) {
-        std.debug.print("[audio_fs] host mix live (first present)\n", .{});
+        if (log_verbose_audio) std.debug.print("[audio_fs] host mix live (first present)\n", .{});
     }
 }
 
@@ -467,7 +470,7 @@ pub fn maybePreseedAfterPresent(root: std.Io.Dir, io: std.Io) void {
             queuePcm16ForHostMix(decoded.pcm[0..max_bytes], decoded.channels, decoded.rate);
             queued += 1;
             if (queued <= 3) {
-                std.debug.print(
+                if (log_verbose_audio) std.debug.print(
                     "[audio_fs] preseed mix \"{s}\" {d} bytes ch={d} rate={d}\n",
                     .{ nm, max_bytes, decoded.channels, decoded.rate },
                 );
@@ -475,7 +478,7 @@ pub fn maybePreseedAfterPresent(root: std.Io.Dir, io: std.Io) void {
         }
     }
     if (queued > 0) {
-        std.debug.print("[audio_fs] host mix preseeded with {d} clips after first present\n", .{queued});
+        if (log_verbose_audio) std.debug.print("[audio_fs] host mix preseeded with {d} clips after first present\n", .{queued});
     }
 }
 
@@ -745,7 +748,7 @@ fn buildFromClip(
     if (!want_full) {
         const wav = try buildSilentWav(allocator, 256, 2, 48_000);
         if (n < 40 or n % 200 == 0) {
-            std.debug.print(
+            if (log_verbose_audio) std.debug.print(
                 "[audio_fs] virtual wav #{d} \"{s}\" -> silent stub (fast open)\n",
                 .{ n + 1, relative_path },
             );
@@ -783,7 +786,7 @@ fn buildFromClip(
 
     const wav = try buildWavFromPcm(decoded.pcm, decoded.channels, decoded.rate, allocator);
     if (n < 16 or n % 100 == 0) {
-        std.debug.print(
+        if (log_verbose_audio) std.debug.print(
             "[audio_fs] virtual wav #{d} \"{s}\" -> {s}{s} @0x{x} ({d} bytes)\n",
             .{
                 n + 1,

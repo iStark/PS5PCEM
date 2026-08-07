@@ -52,6 +52,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const abi = @import("../abi.zig");
+
+/// Set to true to enable verbose per-frame GPU debug logging.
+const log_verbose_gpu = false;
+
 const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
@@ -357,11 +361,11 @@ var pending_tail_count: usize = 0;
 
 fn rememberPendingTail(queue: u32, address: u64, capacity_words: u32, executed_words: u32) void {
     if (address == 0 or capacity_words == 0 or executed_words >= capacity_words) return;
-    std.debug.print("[gc submit] rememberPendingTail called: queue {d} addr=0x{x} cap={d} exec={d}\n", .{ queue, address, capacity_words, executed_words });
+    if (log_verbose_gpu) std.debug.print("[gc submit] rememberPendingTail called: queue {d} addr=0x{x} cap={d} exec={d}\n", .{ queue, address, capacity_words, executed_words });
     // Update existing entry for the same IB base.
     for (pending_tails[0..pending_tail_count]) |*slot| {
         if (slot.address == address) {
-            std.debug.print("[gc submit] rememberPendingTail update existing: addr=0x{x} old_exec={d} -> new_exec={d}\n", .{ address, slot.executed_words, executed_words });
+            if (log_verbose_gpu) std.debug.print("[gc submit] rememberPendingTail update existing: addr=0x{x} old_exec={d} -> new_exec={d}\n", .{ address, slot.executed_words, executed_words });
             slot.capacity_words = capacity_words;
             slot.executed_words = executed_words;
             slot.queue = queue;
@@ -369,7 +373,7 @@ fn rememberPendingTail(queue: u32, address: u64, capacity_words: u32, executed_w
         }
     }
     if (pending_tail_count < maximum_pending_tails) {
-        std.debug.print("[gc submit] rememberPendingTail append: addr=0x{x} cap={d} exec={d} slot={d}\n", .{ address, capacity_words, executed_words, pending_tail_count });
+        if (log_verbose_gpu) std.debug.print("[gc submit] rememberPendingTail append: addr=0x{x} cap={d} exec={d} slot={d}\n", .{ address, capacity_words, executed_words, pending_tail_count });
         pending_tails[pending_tail_count] = .{
             .address = address,
             .capacity_words = capacity_words,
@@ -380,7 +384,7 @@ fn rememberPendingTail(queue: u32, address: u64, capacity_words: u32, executed_w
         return;
     }
     // Drop oldest (shift without overlapping memcpy).
-    std.debug.print("[gc submit] rememberPendingTail dropping oldest to make room: addr=0x{x}\n", .{address});
+    if (log_verbose_gpu) std.debug.print("[gc submit] rememberPendingTail dropping oldest to make room: addr=0x{x}\n", .{address});
     var s: usize = 0;
     while (s + 1 < maximum_pending_tails) : (s += 1) {
         pending_tails[s] = pending_tails[s + 1];
@@ -397,7 +401,7 @@ fn clearPendingTail(address: u64) void {
     var i: usize = 0;
     while (i < pending_tail_count) {
         if (pending_tails[i].address == address) {
-            std.debug.print("[gc submit] clearPendingTail: addr=0x{x} slot={d}\n", .{address, i});
+            if (log_verbose_gpu) std.debug.print("[gc submit] clearPendingTail: addr=0x{x} slot={d}\n", .{address, i});
             var j = i;
             while (j + 1 < pending_tail_count) : (j += 1) {
                 pending_tails[j] = pending_tails[j + 1];
@@ -413,7 +417,7 @@ fn clearPendingTail(address: u64) void {
 // Dump the first `maxWords` of a reserved ring and locate the sentinel.
 fn dumpReserved(address: u64, reserved: []const u32, maxWords: usize) void {
     const count: usize = if (reserved.len < maxWords) reserved.len else maxWords;
-    std.debug.print("[gc submit] reserved dump @0x{x} first {d} words:", .{ address, count });
+    if (log_verbose_gpu) std.debug.print("[gc submit] reserved dump @0x{x} first {d} words:", .{ address, count });
     for (reserved[0..count]) |w| std.debug.print(" {x:0>8}", .{w});
     std.debug.print("\n", .{});
 
@@ -421,12 +425,12 @@ fn dumpReserved(address: u64, reserved: []const u32, maxWords: usize) void {
     var found: bool = false;
     while (j < count) : (j += 1) {
         if (reserved[j] == uncommitted_ring_sentinel) {
-            std.debug.print("[gc submit] sentinel at index {d} (word offset {d})\n", .{ j, j });
+            if (log_verbose_gpu) std.debug.print("[gc submit] sentinel at index {d} (word offset {d})\n", .{ j, j });
             found = true;
             break;
         }
     }
-    if (!found) std.debug.print("[gc submit] sentinel not found in first {d} words (capacity {d})\n", .{ count, reserved.len });
+    if (!found) if (log_verbose_gpu) std.debug.print("[gc submit] sentinel not found in first {d} words (capacity {d})\n", .{ count, reserved.len });
 }
 
 /// Re-scan remembered IBs; execute any newly committed suffix past executed_words.
@@ -440,28 +444,28 @@ fn drainPendingTails() void {
         const slot = pending_tails[i];
         const byte_count = @as(u64, slot.capacity_words) * @sizeOf(u32);
         if (!memory.isGuestRangeAccessible(slot.address, byte_count)) {
-            std.debug.print("[gc submit] drainPendingTails: slot addr=0x{x} not accessible\n", .{slot.address});
+            if (log_verbose_gpu) std.debug.print("[gc submit] drainPendingTails: slot addr=0x{x} not accessible\n", .{slot.address});
                 i += 1;
             continue;
         }
         const pointer: [*]const u32 = @ptrFromInt(slot.address);
         const reserved = pointer[0..slot.capacity_words];
         const committed = committedQueueStream(reserved);
-        std.debug.print("[gc submit] drainPendingTails: slot addr=0x{x} cap={d} exec={d} committed={d}\n", .{ slot.address, slot.capacity_words, slot.executed_words, committed.len });
+        if (log_verbose_gpu) std.debug.print("[gc submit] drainPendingTails: slot addr=0x{x} cap={d} exec={d} committed={d}\n", .{ slot.address, slot.capacity_words, slot.executed_words, committed.len });
         if (committed.len <= slot.executed_words) {
             dumpReserved(slot.address, reserved, 256);
             i += 1;
             continue;
         }
         const suffix = committed[slot.executed_words..];
-        std.debug.print("[gc submit #50] tail catch-up queue {d}: +{d} dwords @0x{x} (now {d}/{d})\n", .{ slot.queue, suffix.len, slot.address, committed.len, slot.capacity_words });
+        if (log_verbose_gpu) std.debug.print("[gc submit #50] tail catch-up queue {d}: +{d} dwords @0x{x} (now {d}/{d})\n", .{ slot.queue, suffix.len, slot.address, committed.len, slot.capacity_words });
         if (suffix.len <= 16) {
             std.debug.print("  words:", .{});
             for (suffix) |word| std.debug.print(" {x:0>8}", .{word});
             std.debug.print("\n", .{});
         }
         const outcome = agc_submit.submitDeviceStream(suffix);
-        std.debug.print("[gc submit] tail catch-up submitDeviceStream.accepted={s}\n", .{ if (outcome.accepted) "true" else "false" });
+        if (log_verbose_gpu) std.debug.print("[gc submit] tail catch-up submitDeviceStream.accepted={s}\n", .{ if (outcome.accepted) "true" else "false" });
         if (outcome.accepted) {
             _ = event_queue_mod.triggerAllGraphicsEvents(slot.queue);
             if (committed.len >= slot.capacity_words or committed.len >= 64) {
@@ -557,7 +561,7 @@ fn answerGraphicsSubmit(request: Request, payload: u64) bool {
         const bytes = @as(u64, buffer.words) * @sizeOf(u32);
         if (!memory.isGuestRangeAccessible(buffer.address, bytes)) {
             if (trace.announces("ioctl")) {
-                std.debug.print(
+                if (log_verbose_gpu) std.debug.print(
                     "[gc submit] stream at 0x{x} ({d} dwords) is not reachable\n",
                     .{ buffer.address, buffer.words },
                 );
@@ -601,7 +605,7 @@ fn answerGraphicsQueueSubmit(request: Request, payload: u64) bool {
         const address = descriptor.address();
         const word_count = descriptor.wordCount();
         if (trace.announces("ioctl")) {
-            std.debug.print(
+            if (log_verbose_gpu) std.debug.print(
                 "[gc submit #50] queue {d} IB {d}/{d}: 0x{x} ({d} dwords), addr_flags=0x{x}, control=0x{x}\n",
                 .{
                     submission.queue,
@@ -620,7 +624,7 @@ fn answerGraphicsQueueSubmit(request: Request, payload: u64) bool {
         const stream_pointer: [*]const u32 = @ptrFromInt(address);
         const reserved_stream = stream_pointer[0..word_count];
         if (trace.announces("ioctl")) {
-            std.debug.print("[gc submit #50] reserved_stream @0x{x} capacity={d} words (peek up to 16):", .{ address, reserved_stream.len });
+            if (log_verbose_gpu) std.debug.print("[gc submit #50] reserved_stream @0x{x} capacity={d} words (peek up to 16):", .{ address, reserved_stream.len });
             const peek = if (reserved_stream.len < 16) reserved_stream.len else 16;
             for (reserved_stream[0..peek]) |w| std.debug.print(" {x:0>8}", .{w});
             std.debug.print("\n", .{});
@@ -629,7 +633,7 @@ fn answerGraphicsQueueSubmit(request: Request, payload: u64) bool {
         // near the head). Re-sample a few times so late-written packets are not
         // permanently dropped as an 8-dword ACQUIRE_MEM-only prefix.
         var stream = committedQueueStream(reserved_stream);
-        if (trace.announces("ioctl")) std.debug.print("[gc submit #50] committed prefix len={d} (capacity={d})\n", .{ stream.len, reserved_stream.len });
+        if (trace.announces("ioctl") and log_verbose_gpu) std.debug.print("[gc submit #50] committed prefix len={d} (capacity={d})\n", .{ stream.len, reserved_stream.len });
         // If the committed prefix is very small, dump more of the reserved ring
         // to locate the sentinel and inspect producer state.
         if (stream.len <= 32) dumpReserved(address, reserved_stream, 256);
@@ -652,11 +656,11 @@ fn answerGraphicsQueueSubmit(request: Request, payload: u64) bool {
             }
             const again = committedQueueStream(reserved_stream);
             if (again.len <= stream.len) break;
-            std.debug.print("[gc submit #50] grow round {d}: {d}->{d} dwords @0x{x}\n", .{ grow_round, stream.len, again.len, address });
+            if (log_verbose_gpu) std.debug.print("[gc submit #50] grow round {d}: {d}->{d} dwords @0x{x}\n", .{ grow_round, stream.len, again.len, address });
             stream = again;
         }
         if (stream.len == 0) continue;
-        std.debug.print(
+        if (log_verbose_gpu) std.debug.print(
             "[gc submit #50] queue {d} IB {d}/{d}: exec {d}/{d} dwords @0x{x}{s}\n",
             .{
                 submission.queue,
@@ -689,7 +693,7 @@ fn answerGraphicsQueueSubmit(request: Request, payload: u64) bool {
                     if (code == gpu.pm4.custom.release_mem) releases += 1;
                 }
             }
-            std.debug.print(
+            if (log_verbose_gpu) std.debug.print(
                 "  census: draws={d} dispatches={d} flips={d} releases={d}\n",
                 .{ draws, dispatches, flips, releases },
             );
@@ -721,7 +725,7 @@ fn answerGraphicsQueueSubmit(request: Request, payload: u64) bool {
                     continue;
                 }
                 const suffix = again[executed..];
-                std.debug.print(
+                if (log_verbose_gpu) std.debug.print(
                     "[gc submit #50] post-exec catch-up +{d} dwords @0x{x} (now {d}/{d})\n",
                     .{ suffix.len, address, again.len, word_count },
                 );
