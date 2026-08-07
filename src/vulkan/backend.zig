@@ -3199,7 +3199,7 @@ pub const Renderer = struct {
                     _ = memory.read(memory.context, descriptor.address + offset, chunk[0..want]);
                     for (chunk[0..want]) |b| {
                         content_hash ^= b;
-                        content_hash +%= content_hash *% 1099511628211;
+                        content_hash *%= 1099511628211;
                     }
                 }
             }
