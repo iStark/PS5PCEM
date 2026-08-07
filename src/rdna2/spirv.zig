@@ -4,7 +4,6 @@
 //! Deterministic SPIR-V 1.5 writer for executable RDNA2 graphics and compute shaders.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const isa = @import("isa.zig");
 const operand = @import("operand.zig");
 const instruction = @import("instruction.zig");
@@ -22,6 +21,18 @@ pub const Stage = enum(u32) {
 pub const StorageBufferBinding = struct {
     resource_sgpr: u32,
     descriptor_index: u32,
+    /// When present, this descriptor is the value held by `resource_sgpr` at
+    /// one particular memory instruction. Vertex shaders routinely reload the
+    /// same four SGPRs with position and UV V#s at different PCs.
+    instruction_pc: ?u32 = null,
+    /// Scalar byte offset as it stood at `instruction_pc`. Attribute fetch
+    /// prologs reuse (and overwrite) the same SOFFSET SGPR between position and
+    /// UV loads even when both attributes share one interleaved allocation.
+    soffset_value: ?u32 = null,
+    /// This mapping came from the AGC vertex-attribute table. NGG prologs may
+    /// copy the hardware vertex id into v0, v3, or another temporary before
+    /// MUBUF; Vulkan's VertexIndex is the authoritative per-vertex index.
+    use_vertex_index: bool = false,
     stride: u32 = 0,
     swizzled: bool = false,
     index_stride: u8 = 0,
@@ -69,6 +80,10 @@ pub const Options = struct {
     /// because the input has to be declared before the body that reads it.
     uses_execution_mask: bool = false,
     sampled_images: []const SampledImageBinding = &.{},
+    /// PARAM locations exported by a vertex shader or consumed by a fragment
+    /// shader. `translate` discovers these from EXP/VINTRP instructions before
+    /// the entry-point interface is declared.
+    parameter_mask: u32 = 0,
     scalar_registers: []const ScalarRegister = &.{},
     compute_inputs: ?ComputeInputs = null,
     descriptor_array_length: u32 = 64,
@@ -133,6 +148,7 @@ const Builder = struct {
     vertex_index_input: u32 = 0,
     position_output: u32 = 0,
     color_output: u32 = 0,
+    parameter_variables: [32]u32 = @splat(0),
     /// BuiltIn FragCoord (float4) for fragment UV fallback when PARAM interps
     /// are not yet wired from the vertex stage.
     frag_coord_input: u32 = 0,
@@ -208,6 +224,15 @@ const Builder = struct {
                 try self.emit(&self.declarations, 32, &.{ output_pointer, 3, self.vector4_type }); // ptr Output
                 try self.emit(&self.declarations, 59, &.{ output_pointer, self.position_output, 3 }); // OpVariable
 
+                for (0..32) |location| {
+                    const bit = @as(u32, 1) << @intCast(location);
+                    if (options.parameter_mask & bit == 0) continue;
+                    const variable = self.id();
+                    self.parameter_variables[location] = variable;
+                    try self.emit(&self.annotations, 71, &.{ variable, 30, @intCast(location) }); // Location
+                    try self.emit(&self.declarations, 59, &.{ output_pointer, variable, 3 }); // OpVariable
+                }
+
                 if (options.vertex_index_vgpr != null) {
                     const input_pointer = self.id();
                     self.vertex_index_input = self.id();
@@ -230,6 +255,15 @@ const Builder = struct {
                 try self.emit(&self.annotations, 71, &.{ self.frag_coord_input, 11, 15 }); // BuiltIn FragCoord
                 try self.emit(&self.declarations, 32, &.{ frag_ptr, 1, self.vector4_type }); // ptr Input
                 try self.emit(&self.declarations, 59, &.{ frag_ptr, self.frag_coord_input, 1 }); // OpVariable
+
+                for (0..32) |location| {
+                    const bit = @as(u32, 1) << @intCast(location);
+                    if (options.parameter_mask & bit == 0) continue;
+                    const variable = self.id();
+                    self.parameter_variables[location] = variable;
+                    try self.emit(&self.annotations, 71, &.{ variable, 30, @intCast(location) }); // Location
+                    try self.emit(&self.declarations, 59, &.{ frag_ptr, variable, 1 }); // OpVariable
+                }
             },
             .compute => {
                 if (options.compute_inputs) |inputs| {
@@ -287,7 +321,11 @@ const Builder = struct {
                     return Error.InvalidStorageBinding;
                 }
                 for (options.storage_buffers[0..index]) |previous| {
-                    if (previous.resource_sgpr == binding.resource_sgpr) return Error.InvalidStorageBinding;
+                    if (previous.resource_sgpr == binding.resource_sgpr and
+                        previous.instruction_pc == binding.instruction_pc)
+                    {
+                        return Error.InvalidStorageBinding;
+                    }
                 }
             }
 
@@ -428,34 +466,16 @@ const Builder = struct {
             .exec_hi, .vcc_hi => self.constant(.bits32, 0xffff_ffff),
             .m0 => self.constant(.bits32, 0),
             .sgpr, .vgpr => blk: {
-                const index = registerIndex(op) orelse {
-                    std.debug.print(
-                        "[rdna2] UndefinedRegister: bad register index kind={s} reg={d}\n",
-                        .{ @tagName(op.kind), op.reg },
-                    );
-                    return Error.UndefinedRegister;
-                };
+                const index = registerIndex(op) orelse return Error.UndefinedRegister;
                 const current = self.registers[index];
-                if (current.id == 0) {
-                    std.debug.print(
-                        "[rdna2] UndefinedRegister: {s}{d} never written (stage={s})\n",
-                        .{ if (op.kind == .sgpr) "s" else "v", op.reg, @tagName(self.stage) },
-                    );
-                    return Error.UndefinedRegister;
-                }
+                if (current.id == 0) return Error.UndefinedRegister;
                 break :blk try self.convert(current, .bits32);
             },
             // Partially decoded sources (NSA holes, unimplemented specials)
             // read as zero so a single unknown operand does not abort the whole
             // shader — wrong values are better than no draw during bring-up.
             .unknown => self.constant(.bits32, 0),
-            else => {
-                std.debug.print(
-                    "[rdna2] UndefinedRegister: unsupported operand kind={s} reg={d} value=0x{x}\n",
-                    .{ @tagName(op.kind), op.reg, op.value },
-                );
-                return Error.UndefinedRegister;
-            },
+            else => return Error.UndefinedRegister,
         };
     }
 
@@ -466,7 +486,7 @@ const Builder = struct {
             var shuffled = self.id();
             if (op.dpp_ctrl <= 0x0ff) { // quad_perm
                 // TODO: exact quad perm using shift/and lane math + Shuffle
-                shuffled = raw; 
+                shuffled = raw;
             } else if (op.dpp_ctrl >= 0x101 and op.dpp_ctrl <= 0x10f) { // row_shl
                 const delta = try self.constant(.bits32, op.dpp_ctrl - 0x100);
                 try self.emit(&self.body, 347, &.{ self.bits_type, shuffled, scope, raw, delta }); // OpGroupNonUniformShuffleUp
@@ -513,10 +533,7 @@ const Builder = struct {
             }
         }
         if (op.absolute or op.negate) {
-            if (expected != .float32) {
-                std.debug.print("[rdna2] Unsupported abs/neg on non-float type\n", .{});
-                return Error.UnsupportedOpcode;
-            }
+            if (expected != .float32) return Error.UnsupportedOpcode;
             if (op.absolute) {
                 const absolute = self.id();
                 try self.emit(&self.body, 199, &.{ self.bits_type, absolute, raw, try self.constant(.bits32, 0x7fff_ffff) });
@@ -560,10 +577,6 @@ const Builder = struct {
             {
                 return;
             }
-            std.debug.print(
-                "[rdna2] UnsupportedDestination: kind={s} reg={d} sdwa_sel={d}\n",
-                .{ @tagName(op.kind), op.reg, op.sdwa_sel },
-            );
             return Error.UnsupportedDestination;
         };
         self.registers[index] = .{
@@ -888,24 +901,26 @@ const Builder = struct {
     }
 
     fn exportValue(self: *Builder, inst: instruction.Instruction) Error!void {
-        if (self.vector4_type == 0) {
-            std.debug.print("[rdna2] Unsupported export: no vector4_type stage={s}\n", .{@tagName(self.stage)});
-            return Error.UnsupportedOpcode;
-        }
-        // POS0 is 12; also accept common NGG/param targets that alias position
-        // during bring-up when only one export is present.
+        if (self.vector4_type == 0) return Error.UnsupportedOpcode;
         const output = switch (self.stage) {
-            .vertex => if (inst.export_target == 12 or inst.export_target == 0)
+            // GFX10 export targets: POS0 is 0x0c and PARAM0..31 are
+            // 0x20..0x3f. PARAM values become ordinary Vulkan locations and
+            // are interpolated by the rasterizer for the fragment stage.
+            .vertex => if (inst.export_target == 0x0c or inst.export_target == 0)
                 self.position_output
+            else if (inst.export_target >= 0x20)
+                self.parameter_variables[inst.export_target - 0x20]
             else
                 0,
             .fragment => if (inst.export_target == 0) self.color_output else 0,
             .compute => 0,
         };
         if (output == 0) {
-            // Skip non-position/param exports rather than aborting the shader.
+            // Skip secondary position, primitive and null exports rather than
+            // aborting the complete shader.
             return;
         }
+        const is_position = output == self.position_output;
         const zero = try self.constant(.float32, @bitCast(@as(f32, 0)));
         const one = try self.constant(.float32, @bitCast(@as(f32, 1)));
         const x: u32, const y: u32, const z: u32, const w: u32 = if (inst.export_compressed) blk: {
@@ -936,7 +951,7 @@ const Builder = struct {
                 if (inst.export_enable & 1 != 0) cx else zero,
                 if (inst.export_enable & 2 != 0) cy else zero,
                 if (inst.export_enable & 4 != 0) cz else zero,
-                if (inst.export_enable & 8 != 0) cw else if (self.stage == .vertex) one else zero,
+                if (inst.export_enable & 8 != 0) cw else if (is_position) one else zero,
             };
         } else .{
             // Uncompressed: one f32 per channel from src0..src3.
@@ -945,7 +960,7 @@ const Builder = struct {
             if (inst.export_enable & 4 != 0) try self.source(inst.src2, .float32) else zero,
             if (inst.export_enable & 8 != 0)
                 try self.source(inst.src3, .float32)
-            else if (self.stage == .vertex)
+            else if (is_position)
                 one
             else
                 zero,
@@ -953,7 +968,7 @@ const Builder = struct {
         // If W is exactly 0 (failed constant-buffer row), force W=1 so
         // clip-space positions stay finite and rasterizable.
         var out_w = w;
-        if (self.stage == .vertex) {
+        if (is_position) {
             const w_is_zero = self.id();
             try self.emit(&self.body, 180, &.{ self.bool_type, w_is_zero, w, zero }); // OpFOrdEqual
             const w_fixed = self.id();
@@ -965,9 +980,16 @@ const Builder = struct {
         try self.emit(&self.body, 62, &.{ output, vector }); // OpStore
     }
 
-    fn storageBinding(self: *const Builder, resource_sgpr: u32) ?StorageBufferBinding {
+    fn storageBinding(self: *const Builder, resource_sgpr: u32, instruction_pc: u32) ?StorageBufferBinding {
         for (self.storage_bindings) |binding| {
-            if (binding.resource_sgpr == resource_sgpr) return binding;
+            if (binding.resource_sgpr == resource_sgpr and
+                binding.instruction_pc != null and binding.instruction_pc.? == instruction_pc)
+            {
+                return binding;
+            }
+        }
+        for (self.storage_bindings) |binding| {
+            if (binding.resource_sgpr == resource_sgpr and binding.instruction_pc == null) return binding;
         }
         return null;
     }
@@ -1001,24 +1023,37 @@ const Builder = struct {
         return .{ u, v };
     }
 
-    fn sampleCoordinates(self: *Builder, raw_x: u32, raw_y: u32) Error![2]u32 {
-        // If interps produced usable non-zero coords, keep them. We cannot
-        // inspect runtime values at translate time, so always also offer
-        // FragCoord UVs via a Select that prefers raw when |raw| > epsilon is
-        // approximated by: use FragCoord for both (stable) when interps are
-        // known stubs — currently always FragCoord for reliable sampling.
-        // When raw is written by real PARAM interps later, switch to raw.
-        _ = raw_x;
-        _ = raw_y;
-        return try self.fragCoordUv();
+    fn sampleCoordinates(_: *Builder, raw_x: u32, raw_y: u32) Error![2]u32 {
+        return .{ raw_x, raw_y };
     }
 
-    fn interpStub(self: *Builder, inst: instruction.Instruction) Error!void {
-        // p1 then p2 write the same VGPR; final value after p2 is what sample
-        // reads. Map even destinations to U and odd to V from FragCoord.
-        const uv = try self.fragCoordUv();
-        const component = if (inst.dst.kind == .vgpr) inst.dst.reg & 1 else 0;
-        const value = if (component == 0) uv[0] else uv[1];
+    fn interpolateParameter(self: *Builder, inst: instruction.Instruction) Error!void {
+        if (self.stage != .fragment or inst.src1.kind != .integer_inline_constant) {
+            return Error.InvalidStageInterface;
+        }
+        const attribute = inst.src1.value;
+        const component = if (inst.opcode == .v_interp_mov_f32)
+            inst.src0.value
+        else
+            inst.src2.value;
+        if (attribute >= self.parameter_variables.len or component >= 4) {
+            return Error.InvalidStageInterface;
+        }
+
+        const variable = self.parameter_variables[attribute];
+        const value = if (variable != 0) blk: {
+            const vector = self.id();
+            try self.emit(&self.body, 61, &.{ self.vector4_type, vector, variable }); // OpLoad
+            const scalar = self.id();
+            try self.emit(&self.body, 81, &.{ self.float_type, scalar, vector, component }); // OpCompositeExtract
+            break :blk scalar;
+        } else blk: {
+            // A malformed or partially recovered interface still gets a
+            // deterministic screen-space fallback instead of an undefined VGPR.
+            const uv = try self.fragCoordUv();
+            if (component < 2) break :blk uv[component];
+            break :blk try self.constant(.float32, @bitCast(@as(f32, 0)));
+        };
         try self.destination(inst.dst, .{ .id = value, .value_type = .float32 });
     }
 
@@ -1036,9 +1071,7 @@ const Builder = struct {
         const binding = self.sampledImageBinding(inst.src1.reg, inst.src2.reg) orelse {
             return Error.InvalidStorageBinding;
         };
-        // Prefer VGPR coords from v_interp (when non-zero). If both look like
-        // the zero seed, fall back to FragCoord-normalised UVs so a probe or
-        // partial VS still samples across the texture.
+        // Coordinates now come from the real VS PARAM -> PS VINTRP interface.
         const raw_x = try self.source(inst.src0, .float32);
         const raw_y = try self.source(try consecutiveRegister(inst.src0, 1), .float32);
         const coordinate_x, const coordinate_y = try self.sampleCoordinates(raw_x, raw_y);
@@ -1119,7 +1152,7 @@ const Builder = struct {
             return Error.UnsupportedBufferAddressing;
         }
         if (inst.memory_offset < 0) return Error.UnsupportedBufferAddressing;
-        const binding = self.storageBinding(inst.src1.reg) orelse {
+        const binding = self.storageBinding(inst.src1.reg, inst.pc) orelse {
             return Error.InvalidStorageBinding;
         };
 
@@ -1129,8 +1162,9 @@ const Builder = struct {
         // vertex does not alias record 0 and collapse to a zero-area draw.
         var index = if (inst.index_enable) blk: {
             if (self.stage == .vertex and self.vertex_index_input != 0 and
-                inst.src0.kind == .vgpr and self.vertex_index_vgpr != null and
-                inst.src0.reg == self.vertex_index_vgpr.?)
+                (binding.use_vertex_index or
+                    (inst.src0.kind == .vgpr and self.vertex_index_vgpr != null and
+                        inst.src0.reg == self.vertex_index_vgpr.?)))
             {
                 const loaded = self.id();
                 try self.emit(&self.body, 61, &.{ self.signed_type, loaded, self.vertex_index_input }); // OpLoad
@@ -1170,7 +1204,9 @@ const Builder = struct {
         // the all-ones mask used when those registers are read as lane masks.
         // Treating them as 0xffffffff made every attribute MUBUF OOB → zero
         // verts → black guest VS writeback.
-        const soffset = switch (inst.src2.kind) {
+        const soffset = if (binding.soffset_value) |value|
+            try self.constant(.bits32, value)
+        else switch (inst.src2.kind) {
             .null, .m0, .vcc_lo, .vcc_hi, .exec_lo, .exec_hi => try self.constant(.bits32, 0),
             else => try self.source(inst.src2, .bits32),
         };
@@ -1514,6 +1550,21 @@ const Builder = struct {
         // vertex/pixel translation can continue during bring-up.
         if (inst.opcode != .s_mov_b64) return true;
 
+        // Pixel prologs may restore EXEC from a hardware-provided SGPR pair
+        // which is not part of USER_DATA. Vulkan has already selected the live
+        // fragment invocations, so an unavailable snapshot means "keep the
+        // current host mask", not "reject the shader". Known compute masks
+        // still take the exact lowering below for guarded buffer accesses.
+        if (inst.src0.kind == .sgpr) {
+            const low_index = registerIndex(inst.src0) orelse return true;
+            if (low_index + 1 >= self.registers.len or
+                self.registers[low_index].id == 0 or
+                self.registers[low_index + 1].id == 0)
+            {
+                return true;
+            }
+        }
+
         const low = try self.source(inst.src0, .bits32);
         // The mask is one sixty-four bit value. Held in scalar registers it
         // occupies a pair, so the second half is the register after the first —
@@ -1552,6 +1603,11 @@ const Builder = struct {
         if (inst.dst.clamp or inst.dst.omod != 0) return Error.UnsupportedOpcode;
         if (try self.lowerExecutionMask(inst)) return;
         if (self.specializedScalarDestination(inst)) return;
+        // M0 only feeds hardware interpolation/LDS addressing. Those paths
+        // are represented by host built-ins or dedicated lowering below, so
+        // copying an unavailable hardware SGPR into M0 must not reject the
+        // entire shader merely to produce a value nobody subsequently reads.
+        if (inst.dst.kind == .m0) return;
         switch (inst.opcode) {
             .s_nop, .s_waitcnt, .s_barrier, .s_inst_prefetch, .s_sendmsg, .s_sleep, .s_ttrace_data, .v_nop, .s_endpgm, .s_wqm_b64 => {},
             // Branches are handled by structured CF or skipped in the linear fallback.
@@ -1559,11 +1615,7 @@ const Builder = struct {
             .s_mov_b32, .v_mov_b32 => try self.unary(inst, 83, .bits32), // OpCopyObject
             .s_mov_b64 => try self.mov64(inst),
             .v_cndmask_b32 => try self.cndmask(inst),
-            // Attribute interpolation: without PARAM exports from the VS, map
-            // p1/p2 pairs onto FragCoord-based UVs (common Unity PS layout:
-            // v4→u, v5→v). mov stays a soft move.
-            .v_interp_p1_f32, .v_interp_p2_f32 => try self.interpStub(inst),
-            .v_interp_mov_f32 => try self.unary(inst, 83, .float32),
+            .v_interp_p1_f32, .v_interp_p2_f32, .v_interp_mov_f32 => try self.interpolateParameter(inst),
             .v_cvt_f32_i32 => try self.integerToFloat(inst, true),
             .v_cvt_f32_u32 => try self.integerToFloat(inst, false),
             // Pack two f32 → two f16 in one dword (Unity PS export path).
@@ -1685,16 +1737,7 @@ const Builder = struct {
             .buffer_atomic_xor => try self.bufferAtomic(inst, 242), // OpAtomicXor
             .image_sample => try self.sampleImage(inst),
             .exp => try self.exportValue(inst),
-            else => {
-                if (!builtin.is_test) {
-                    std.debug.print("[rdna2] Unsupported opcode: {s} (0x{x}) at pc=0x{x}\n", .{
-                        @tagName(inst.opcode),
-                        @intFromEnum(inst.opcode),
-                        inst.pc,
-                    });
-                }
-                return Error.UnsupportedOpcode;
-            },
+            else => return Error.UnsupportedOpcode,
         }
     }
 };
@@ -1879,6 +1922,9 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     if (builder.frag_coord_input != 0) try entry_point.append(allocator, builder.frag_coord_input);
     if (builder.position_output != 0) try entry_point.append(allocator, builder.position_output);
     if (builder.color_output != 0) try entry_point.append(allocator, builder.color_output);
+    for (builder.parameter_variables) |variable| {
+        if (variable != 0) try entry_point.append(allocator, variable);
+    }
     try appendInstruction(allocator, &words, 15, entry_point.items);
     switch (options.stage) {
         .fragment => try appendInstruction(allocator, &words, 16, &.{ builder.main_function, 7 }),
@@ -1900,6 +1946,20 @@ pub fn translate(allocator: std.mem.Allocator, program: *const instruction.Progr
     var effective = options;
     for (program.instructions.items) |candidate| {
         if (candidate.dst.kind == .exec_lo) effective.uses_execution_mask = true;
+        switch (effective.stage) {
+            .vertex => if (candidate.opcode == .exp and candidate.export_target >= 0x20) {
+                effective.parameter_mask |= @as(u32, 1) << @intCast(candidate.export_target - 0x20);
+            },
+            .fragment => switch (candidate.opcode) {
+                .v_interp_p1_f32, .v_interp_p2_f32, .v_interp_mov_f32 => {
+                    if (candidate.src1.kind == .integer_inline_constant and candidate.src1.value < 32) {
+                        effective.parameter_mask |= @as(u32, 1) << @intCast(candidate.src1.value);
+                    }
+                },
+                else => {},
+            },
+            .compute => {},
+        }
     }
     var builder = try Builder.init(allocator, effective);
     defer builder.deinit();
@@ -1921,17 +1981,12 @@ pub fn translate(allocator: std.mem.Allocator, program: *const instruction.Progr
             try builder.initializeStageInputs();
             for (program.instructions.items) |inst| {
                 if (inst.opcode.isBranch()) continue;
-                builder.lower(inst) catch |e| {
-                    if (e == Error.UnsupportedOpcode) {
-                        std.debug.print("[rdna2] translate failed on opcode {s}\n", .{@tagName(inst.opcode)});
-                    }
-                    return e;
-                };
+                builder.lower(inst) catch |e| return e;
             }
             try builder.emit(&builder.body, 253, &.{});
         };
     }
-    return assemble(allocator, &builder, options);
+    return assemble(allocator, &builder, effective);
 }
 
 fn containsOpcode(words: []const u32, wanted: u16) bool {
@@ -2095,12 +2150,84 @@ test "vertex system value and position export lower to a stage interface" {
     try std.testing.expect(containsOpcode(module.words, 62)); // OpStore Position
 }
 
+test "vertex PARAM export and fragment interpolation share a location" {
+    var vertex = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer vertex.deinit(std.testing.allocator);
+    for (0..4) |component| {
+        try vertex.instructions.append(std.testing.allocator, .{
+            .opcode = .v_mov_b32,
+            .dst = .{ .kind = .vgpr, .reg = @intCast(component) },
+            .src0 = .{ .kind = .literal_constant, .value = @bitCast(@as(f32, @floatFromInt(component))) },
+            .src_count = 1,
+        });
+    }
+    try vertex.instructions.append(std.testing.allocator, .{
+        .opcode = .exp,
+        .export_target = 0x20,
+        .export_enable = 0xf,
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src1 = .{ .kind = .vgpr, .reg = 1 },
+        .src2 = .{ .kind = .vgpr, .reg = 2 },
+        .src3 = .{ .kind = .vgpr, .reg = 3 },
+        .src_count = 4,
+    });
+    try vertex.instructions.append(std.testing.allocator, .{ .opcode = .s_endpgm });
+    var vertex_module = try translate(std.testing.allocator, &vertex, .{ .stage = .vertex });
+    defer vertex_module.deinit(std.testing.allocator);
+
+    var fragment = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer fragment.deinit(std.testing.allocator);
+    inline for (.{ isa.Opcode.v_interp_p1_f32, isa.Opcode.v_interp_p2_f32 }) |opcode| {
+        try fragment.instructions.append(std.testing.allocator, .{
+            .opcode = opcode,
+            .dst = .{ .kind = .vgpr, .reg = 4 },
+            .src0 = .{ .kind = .vgpr, .reg = 4 },
+            .src1 = .{ .kind = .integer_inline_constant, .value = 0 }, // ATTR0
+            .src2 = .{ .kind = .integer_inline_constant, .value = 0 }, // channel X
+            .src_count = 3,
+        });
+    }
+    try fragment.instructions.append(std.testing.allocator, .{ .opcode = .s_endpgm });
+    var fragment_module = try translate(std.testing.allocator, &fragment, .{ .stage = .fragment });
+    defer fragment_module.deinit(std.testing.allocator);
+
+    // Both modules declare Location 0. The VS stores PARAM0 and VINTRP loads
+    // and extracts ATTR0 in the PS instead of manufacturing screen-space UVs.
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(vertex_module.words, 71)); // OpDecorate
+    try std.testing.expectEqual(@as(usize, 1), countOpcode(vertex_module.words, 62)); // OpStore PARAM0
+    try std.testing.expectEqual(@as(usize, 3), countOpcode(fragment_module.words, 71)); // OpDecorate
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(fragment_module.words, 61)); // OpLoad
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(fragment_module.words, 81)); // OpCompositeExtract
+}
+
 /// One indexed buffer access, encoded the way the hardware spells it.
 fn testMubuf(opcode: u7, byte_offset: u12, data: u8, address: u8, resource: u8) [2]u32 {
     return .{
         0xe000_0000 | (@as(u32, opcode) << 18) | (1 << 13) | byte_offset,
         (0x80 << 24) | (@as(u32, resource / 4) << 16) | (@as(u32, data) << 8) | address,
     };
+}
+
+test "one V# SGPR can select different buffers at different instruction PCs" {
+    const decoder = @import("decoder.zig");
+    const code = testMubuf(0x0c, 0, 1, 0, 4) ++
+        testMubuf(0x0c, 0, 2, 0, 4) ++ [_]u32{0xbf81_0000};
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+
+    const storage = [_]StorageBufferBinding{
+        .{ .resource_sgpr = 4, .descriptor_index = 0, .instruction_pc = 0, .stride = 12, .extent_bytes = 48 },
+        .{ .resource_sgpr = 4, .descriptor_index = 1, .instruction_pc = 8, .stride = 8, .extent_bytes = 32 },
+    };
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .vertex,
+        .vertex_index_vgpr = 0,
+        .storage_buffers = &storage,
+        .descriptor_array_length = 2,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expect(countOpcode(module.words, 65) >= 2); // OpAccessChain
 }
 
 fn testSop1(opcode: u8, destination: u8, source: u9) u32 {
@@ -2203,6 +2330,34 @@ test "fragment MRT0 export lowers to location zero" {
     try std.testing.expect(containsOpcode(module.words, 80)); // OpCompositeConstruct
     try std.testing.expect(containsOpcode(module.words, 62)); // OpStore MRT0
     try std.testing.expectEqual(@as(u32, 4), @intFromEnum(Stage.fragment));
+}
+
+test "fragment EXEC restore from an unavailable hardware SGPR is a no-op" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        testSop1(0x04, 126, 12), // s_mov_b64 exec, s[12:13]
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expect(containsOpcode(module.words, 253)); // OpReturn
+}
+
+test "fragment M0 setup from an unavailable hardware SGPR is a no-op" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        testSop1(0x03, 124, 12), // s_mov_b32 m0, s12
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expect(containsOpcode(module.words, 253)); // OpReturn
 }
 
 test "fragment image sample lowers through a combined descriptor array" {
