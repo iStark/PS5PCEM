@@ -1329,6 +1329,8 @@ scheduler and Vulkan backend. Observed startup work now includes:
   shapes) that complete successfully when V# descriptors resolve.
 - Graphics draws that ignore depth/MRT extras and DCC/compression flags on the
   first host path so colour-target work is not rejected wholesale.
+- `InvalidPitch` rejections are averted by clamping decoded target pitch, enabling
+  valid Vulkan swapchain presentation and successful `sceVideoOutSubmitEopFlip` completions.
 - Guest vertex/pixel SPIR-V translation for common RDNA2 ALU, MUBUF, sampling
   and compressed colour export. Missing attribute V#s soft-skip; when the
   primary attribute bank is absent the draw uses a diagnostic vertex triangle
