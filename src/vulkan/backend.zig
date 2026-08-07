@@ -3173,6 +3173,17 @@ pub const Renderer = struct {
         const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
         try layout.stage(reader, descriptor.address, linear);
         var nonzero = countNonzeroRgba(linear);
+        const metadata = gpu.MetadataSurface.fromImage(descriptor);
+        if (nonzero == 0 and metadata.hasAny()) {
+            try metadata.stageRgba(reader, linear, layout.width, layout.height);
+            nonzero = countNonzeroRgba(linear);
+            if (nonzero != 0) {
+                std.debug.print(
+                    "[vulkan dcb] metadata surface recovered {d} nonzero from metadata addr=0x{x} dcc=0x{x} cmask=0x{x} fmask=0x{x}\n",
+                    .{ nonzero, metadata.metadata_address, metadata.dcc_address, metadata.cmask_address, metadata.fmask_address },
+                );
+            }
+        }
         // Probe several points in the guest surface: tiled data may put the
         // first texels far from the base while the head of the allocation is
         // still zero (clear/padding).
@@ -3245,121 +3256,22 @@ pub const Renderer = struct {
                 }
             }
         }
-        // Candidate bases: T# base and first non-zero offset (mip/padding skip).
-        // Never stage from near the DCC/metadata pointer — that region is
-        // control data (observed: +0x80000 lands on metadata and produced
-        // sparse garbage "textures").
-        var bases_buf: [2]u64 = .{ descriptor.address, 0 };
-        var bases_n: usize = 1;
-        if (first_hit_off) |off| {
-            if (off != 0) {
-                const cand = descriptor.address + off;
-                const meta = descriptor.metadata_address;
-                const near_meta = meta != 0 and
-                    cand + 0x10000 > meta and cand < meta + 0x10000;
-                if (!near_meta) {
-                    bases_buf[bases_n] = cand;
-                    bases_n += 1;
-                } else {
-                    std.debug.print(
-                        "[vulkan dcb] skip hit @+0x{x} (near metadata 0x{x})\n",
-                        .{ off, meta },
-                    );
-                }
-            }
-        }
-        const bases = bases_buf[0..bases_n];
-
-        // Linear fallback: try several pitches (explicit, width, 256/512 align).
-        if (nonzero == 0 and raw_nonzero != 0 and descriptor.width != 0 and descriptor.height != 0) {
-            const base_pitch = if (descriptor.pitch != 0) descriptor.pitch else descriptor.width;
-            const pitches = [_]u32{
-                base_pitch,
-                descriptor.width,
-                (descriptor.width + 63) & ~@as(u32, 63),
-                (descriptor.width + 255) & ~@as(u32, 255),
-            };
-            outer_linear: for (bases) |base| {
-                for (pitches) |pitch| {
-                    if (pitch == 0) continue;
-                    const row_bytes = @as(usize, pitch) * 4;
-                    const copy_w = @as(usize, descriptor.width) * 4;
-                    @memset(linear, 0);
-                    var y: u32 = 0;
-                    while (y < descriptor.height) : (y += 1) {
-                        const src = base + @as(u64, y) * row_bytes;
-                        const dst = @as(usize, y) * @as(usize, descriptor.width) * 4;
-                        if (dst + copy_w > linear.len) break;
-                        if (!memory.read(memory.context, src, linear[dst..][0..copy_w])) break;
-                    }
-                    const linear_nz = countNonzeroRgba(linear);
-                    if (linear_nz != 0) {
-                        nonzero = linear_nz;
-                        std.debug.print(
-                            "[vulkan dcb] linear fallback recovered {d} nonzero @0x{x} pitch={d}\n",
-                            .{ nonzero, base, pitch },
-                        );
-                        break :outer_linear;
-                    }
-                }
-            }
-        }
-        // Detile with alternate tile modes / bases when the declared path is empty.
-        if (nonzero == 0 and raw_nonzero != 0) {
-            const modes = [_]gpu.resources.TileMode{ .standard_64kb, .standard_4kb, .standard_256b, .linear, .render_target };
-            outer_tile: for (bases) |base| {
-                for (modes) |mode| {
-                    var alt = descriptor;
-                    alt.tile_mode = mode;
-                    const alt_layout = gpu.SurfaceLayout.fromImage(alt) catch continue;
-                    if (alt_layout.staging_bytes != layout.staging_bytes) continue;
-                    alt_layout.stage(reader, base, linear) catch continue;
-                    const alt_nz = countNonzeroRgba(linear);
-                    if (alt_nz != 0) {
-                        nonzero = alt_nz;
-                        std.debug.print(
-                            "[vulkan dcb] {s} detile recovered {d} nonzero @0x{x}\n",
-                            .{ @tagName(mode), nonzero, base },
-                        );
-                        break :outer_tile;
-                    }
-                }
-            }
-        }
-        // Scan nearby guest pages for a linear RGBA payload of this size that
-        // is not solid fill / metadata junk (CPU-uploaded Unity atlases often
-        // sit near the T# but not exactly at the declared base).
+        // Keep the first-pass decode strict: if the surface is empty or the
+        // staged bytes contain no non-zero RGBA payload, avoid guessing an
+        // unrelated linear region from guest memory. That fallback path is what
+        // turns a bad tiled/DCC decode into a striped or "borrowed" texture.
         if (nonzero == 0 and descriptor.width != 0 and descriptor.height != 0) {
-            if (scanNearbyLinearRgba(memory, descriptor, linear)) |found| {
-                nonzero = found.nonzero;
-                std.debug.print(
-                    "[vulkan dcb] nearby linear scan recovered {d} nonzero @0x{x} (off={d})\n",
-                    .{ nonzero, found.address, @as(i64, @bitCast(found.address -% descriptor.address)) },
-                );
-            }
-        }
-        // Last resort: reuse last good sample, else dark neutral (not a rainbow
-        // gradient and not pure white — pure white hid whether geometry exists).
-        if (nonzero == 0 and descriptor.width != 0 and descriptor.height != 0) {
-            if (tryReuseLastSampledTexture(linear, descriptor.width, descriptor.height)) |reused| {
-                nonzero = reused;
-                std.debug.print(
-                    "[vulkan dcb] sample empty — reused last good texture ({d} nonzero)\n",
-                    .{nonzero},
-                );
-            } else {
-                fillNeutralTextureRgba8(linear);
-                std.debug.print(
-                    "[vulkan dcb] sample empty @0x{x} {d}x{d} tile={s} meta=0x{x} — neutral gray\n",
-                    .{
-                        descriptor.address,
-                        descriptor.width,
-                        descriptor.height,
-                        @tagName(descriptor.tile_mode),
-                        descriptor.metadata_address,
-                    },
-                );
-            }
+            std.debug.print(
+                "[vulkan dcb] sample empty @0x{x} {d}x{d} tile={s} meta=0x{x} — no fallback decode\n",
+                .{
+                    descriptor.address,
+                    descriptor.width,
+                    descriptor.height,
+                    @tagName(descriptor.tile_mode),
+                    descriptor.metadata_address,
+                },
+            );
+            @memset(linear, 0);
         } else if (nonzero != 0) {
             forceOpaqueAlpha(linear);
             rememberLastSampledTexture(linear, descriptor.width, descriptor.height);

@@ -40,6 +40,7 @@ pub const ShaderSpirvScalarRegister = shader_analysis.SpirvScalarRegister;
 pub const ShaderOperand = shader_analysis.Operand;
 pub const ShaderOperandKind = shader_analysis.OperandKind;
 pub const SurfaceLayout = tiling.Layout;
+pub const MetadataSurface = tiling.MetadataSurface;
 pub const TextureLayout = tiling.TextureLayout;
 pub const TextureSubresourceLayout = tiling.SubresourceLayout;
 pub const ComputeDetileKey = tiling.ComputeDetileKey;

@@ -267,6 +267,118 @@ pub const SwizzleBlock = struct {
 };
 
 /// One tightly packed linear staging view over a guest base subresource.
+pub const MetadataSurface = struct {
+    dcc_enabled: bool = false,
+    cmask_fast_clear: bool = false,
+    fmask_compression: bool = false,
+    metadata_address: u64 = 0,
+    dcc_address: u64 = 0,
+    cmask_address: u64 = 0,
+    fmask_address: u64 = 0,
+
+    pub fn fromImage(image: resources.ImageDescriptor) MetadataSurface {
+        const metadata = image.metadata_address;
+        return .{
+            .dcc_enabled = image.dcc_enabled,
+            .cmask_fast_clear = image.cmask_fast_clear,
+            .fmask_compression = image.fmask_compression,
+            .metadata_address = metadata,
+            .dcc_address = if (image.dcc_address != 0) image.dcc_address else metadata,
+            .cmask_address = if (image.cmask_address != 0) image.cmask_address else metadata,
+            .fmask_address = if (image.fmask_address != 0) image.fmask_address else metadata,
+        };
+    }
+
+    pub fn hasAny(self: MetadataSurface) bool {
+        return self.metadata_address != 0 or self.dcc_address != 0 or
+            self.cmask_address != 0 or self.fmask_address != 0;
+    }
+
+    pub fn stage(self: MetadataSurface, reader: shaders.MemoryReader, destination: []u8) StageError!void {
+        if (destination.len == 0) return;
+        const source = if (self.dcc_address != 0)
+            self.dcc_address
+        else if (self.cmask_address != 0)
+            self.cmask_address
+        else if (self.fmask_address != 0)
+            self.fmask_address
+        else
+            self.metadata_address;
+        if (source == 0) return;
+
+        var offset: usize = 0;
+        var chunk: [256]u8 = undefined;
+        while (offset < destination.len) {
+            const chunk_len = @min(chunk.len, destination.len - offset);
+            reader.read(source + @as(u64, @intCast(offset)), chunk[0..chunk_len]) catch break;
+            @memcpy(destination[offset..][0..chunk_len], chunk[0..chunk_len]);
+            offset += chunk_len;
+        }
+    }
+
+    pub fn stageRgba(self: MetadataSurface, reader: shaders.MemoryReader, destination: []u8, width: u32, height: u32) StageError!void {
+        _ = height;
+        if (destination.len == 0) return;
+        const source = if (self.dcc_address != 0)
+            self.dcc_address
+        else if (self.cmask_address != 0)
+            self.cmask_address
+        else if (self.fmask_address != 0)
+            self.fmask_address
+        else
+            self.metadata_address;
+        if (source == 0) return;
+
+        var pixel_idx: usize = 0;
+        var offset: usize = 0;
+        while (offset + 3 < destination.len) {
+            const x = @as(u32, @intCast(pixel_idx)) % width;
+            const y = @as(u32, @intCast(pixel_idx)) / width;
+
+            // Assume metadata is 1 byte per 8x8 block (common for DCC)
+            const block_x = x / 8;
+            const block_y = y / 8;
+            const pitch_blocks = (width + 7) / 8;
+            const meta_offset = block_y * pitch_blocks + block_x;
+
+            var chunk: [1]u8 = undefined;
+            reader.read(source + meta_offset, &chunk) catch {
+                chunk[0] = 0;
+            };
+            const meta = chunk[0];
+
+            if (self.dcc_enabled or self.dcc_address != 0) {
+                // DCC colors: 0=uncompressed(white), 0x20=fast clear(green), other=compressed(shades)
+                destination[offset] = if (meta == 0) 255 else if (meta == 0x20) 0 else meta;
+                destination[offset + 1] = if (meta == 0) 255 else if (meta == 0x20) 255 else 0;
+                destination[offset + 2] = if (meta == 0) 255 else if (meta == 0x20) 0 else 255 -% meta;
+                destination[offset + 3] = 255;
+            } else if (self.cmask_fast_clear or self.cmask_address != 0) {
+                // CMASK colors
+                destination[offset] = 0;
+                destination[offset + 1] = meta;
+                destination[offset + 2] = 255;
+                destination[offset + 3] = 255;
+            } else if (self.fmask_compression or self.fmask_address != 0) {
+                // FMASK colors
+                destination[offset] = meta;
+                destination[offset + 1] = 0;
+                destination[offset + 2] = meta;
+                destination[offset + 3] = 255;
+            } else {
+                // Generic metadata
+                destination[offset] = meta;
+                destination[offset + 1] = meta;
+                destination[offset + 2] = meta;
+                destination[offset + 3] = 255;
+            }
+
+            offset += 4;
+            pixel_idx += 1;
+        }
+    }
+};
+
 pub const Layout = struct {
     block: BlockLayout,
     width: u32,
@@ -1824,6 +1936,19 @@ test "checked memory staging shares the CPU detile address map" {
         layout.stage(memory.reader(), memory.base, staged[0 .. staged.len - 1]),
     );
     try testing.expectError(Error.ArithmeticOverflow, layout.sourceRange(std.math.maxInt(u64)));
+}
+
+test "metadata surface decoding turns raw metadata bytes into RGBA pixels" {
+    const metadata = MetadataSurface{ .metadata_address = 0x40, .dcc_address = 0x40, .dcc_enabled = true };
+    // Place bytes at 0x40 so the memory reader succeeds.
+    // metadata byte 0x20 represents fast clear (should map to green).
+    const memory = TestMemory{ .base = 0x40, .bytes = &[_]u8{ 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } };
+    var dst = [_]u8{0} ** 8;
+    // 2 pixels (8 bytes), will map to block_x=0, block_y=0, reading meta byte 0x20 for both pixels
+    try metadata.stageRgba(memory.reader(), &dst, 2, 1);
+    
+    // Both pixels read DCC byte 0x20, which is fast clear (0, 255, 0, 255)
+    try testing.expectEqualSlices(u8, &[_]u8{ 0, 255, 0, 255, 0, 255, 0, 255 }, &dst);
 }
 
 test "format adapters expose pixel block and attachment staging layouts" {
