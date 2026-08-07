@@ -460,11 +460,33 @@ const Builder = struct {
     }
 
     fn source(self: *Builder, op: operand.Operand, expected: ValueType) Error!u32 {
-        if (op.dpp) {
-            std.debug.print("[rdna2] Unsupported DPP operand\n", .{});
-            return Error.UnsupportedOpcode;
-        }
         var raw = try self.rawSource(op);
+        if (op.dpp) {
+            const scope = try self.constant(.bits32, 3); // Subgroup scope
+            var shuffled = self.id();
+            if (op.dpp_ctrl <= 0x0ff) { // quad_perm
+                // TODO: exact quad perm using shift/and lane math + Shuffle
+                shuffled = raw; 
+            } else if (op.dpp_ctrl >= 0x101 and op.dpp_ctrl <= 0x10f) { // row_shl
+                const delta = try self.constant(.bits32, op.dpp_ctrl - 0x100);
+                try self.emit(&self.body, 347, &.{ self.bits_type, shuffled, scope, raw, delta }); // OpGroupNonUniformShuffleUp
+            } else if (op.dpp_ctrl >= 0x111 and op.dpp_ctrl <= 0x11f) { // row_shr
+                const delta = try self.constant(.bits32, op.dpp_ctrl - 0x110);
+                try self.emit(&self.body, 348, &.{ self.bits_type, shuffled, scope, raw, delta }); // OpGroupNonUniformShuffleDown
+            } else if (op.dpp_ctrl >= 0x121 and op.dpp_ctrl <= 0x12f) { // row_ror
+                const delta = try self.constant(.bits32, op.dpp_ctrl - 0x120);
+                try self.emit(&self.body, 348, &.{ self.bits_type, shuffled, scope, raw, delta }); // Approx using down
+            } else if (op.dpp_ctrl == 0x140) { // row_mirror
+                const mask = try self.constant(.bits32, 15);
+                try self.emit(&self.body, 346, &.{ self.bits_type, shuffled, scope, raw, mask }); // OpGroupNonUniformShuffleXor
+            } else if (op.dpp_ctrl == 0x141) { // row_half_mirror
+                const mask = try self.constant(.bits32, 7);
+                try self.emit(&self.body, 346, &.{ self.bits_type, shuffled, scope, raw, mask }); // OpGroupNonUniformShuffleXor
+            } else {
+                shuffled = raw;
+            }
+            raw = shuffled;
+        }
         if (op.sdwa_sel != 6) {
             const width: u32 = if (op.sdwa_sel < 4) 8 else if (op.sdwa_sel < 6) 16 else return Error.UnsupportedOpcode;
             const shift: u32 = if (op.sdwa_sel < 4)
@@ -1811,6 +1833,8 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
         0,
     });
     try appendInstruction(allocator, &words, 17, &.{1}); // OpCapability Shader
+    try appendInstruction(allocator, &words, 17, &.{61}); // OpCapability GroupNonUniform
+    try appendInstruction(allocator, &words, 17, &.{64}); // OpCapability GroupNonUniformShuffle
     // ExtInstImport must precede OpMemoryModel when PackHalf2x16 (etc.) is used.
     if (builder.glsl_std_450 != 0) {
         // "GLSL.std.450" null-terminated, padded to 4-word alignment.
