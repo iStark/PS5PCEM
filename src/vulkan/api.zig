@@ -18,6 +18,7 @@ pub const Bool32 = u32;
 pub const DeviceSize = u64;
 
 pub const success: Result = 0;
+pub const not_ready: Result = 1;
 pub const incomplete: Result = 5;
 pub const true_value: Bool32 = 1;
 pub const whole_size: DeviceSize = ~@as(DeviceSize, 0);
@@ -853,6 +854,8 @@ pub const PfnCreateShaderModule = *const fn (Device, *const ShaderModuleCreateIn
 pub const PfnDestroyShaderModule = *const fn (Device, ShaderModule, ?*const anyopaque) callconv(call) void;
 pub const PfnCreatePipelineCache = *const fn (Device, *const PipelineCacheCreateInfo, ?*const anyopaque, *PipelineCache) callconv(call) Result;
 pub const PfnDestroyPipelineCache = *const fn (Device, PipelineCache, ?*const anyopaque) callconv(call) void;
+pub const PfnGetPipelineCacheData = *const fn (Device, PipelineCache, *usize, ?*anyopaque) callconv(call) Result;
+pub const PfnResetFences = *const fn (Device, u32, [*]const Fence) callconv(call) Result;
 pub const PfnCreateDescriptorSetLayout = *const fn (Device, *const DescriptorSetLayoutCreateInfo, ?*const anyopaque, *DescriptorSetLayout) callconv(call) Result;
 pub const PfnDestroyDescriptorSetLayout = *const fn (Device, DescriptorSetLayout, ?*const anyopaque) callconv(call) void;
 pub const PfnCreateDescriptorPool = *const fn (Device, *const DescriptorPoolCreateInfo, ?*const anyopaque, *DescriptorPool) callconv(call) Result;

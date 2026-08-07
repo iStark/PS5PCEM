@@ -481,7 +481,10 @@ The renderer owns instance/device lifetime, the selected queue, a transient
 command pool, host/device memory-type selection, one descriptor layout with
 64 storage buffers plus 64 combined sampled images, its pool, image/view/sampler/
 render-pass/framebuffer creation, and both Vulkan-driver and exact-SPIR-V
-software pipeline caches.
+software pipeline caches. The Vulkan-driver cache is persisted as
+`vulkan_pipeline_cache.bin` between runs; invalid, unreadable, or oversized
+cache data simply falls back to an empty driver cache, so it can only affect
+startup compilation time, never correctness.
 `stageGuestStorageBuffer` caches up to 256 exact ranges (each at most the Vulkan
 1.2 minimum 128 MiB storage-buffer range). It never treats guest bytes as
 immutable: a cache hit reuses allocations but uploads the current guest range
@@ -505,8 +508,11 @@ three-vertex `DRAW_INDEX_AUTO` decodes both guest programs, lowers their stage
 interfaces and exports, creates or reuses a pipeline keyed by exact SPIR-V and
 decoded graphics state, and records a real Vulkan draw into the active guest
 RGBA8 color target. Existing target bytes are detiled and uploaded before the
-render pass; the completed image is read back and tiled into guest memory. A
-half-bound graphics program fails explicitly.
+render pass; the completed linear image stays in the host frame cache until the
+guest can observe it. It is tiled back into guest memory before a matching
+sampled-image upload or display read, at `SetFlip`, and at CPU-visible PM4
+synchronization points. This preserves guest-visible ordering while avoiding a
+tile/writeback after every draw. A half-bound graphics program fails explicitly.
 `enable_graphics_probe` retains the fixed-shader diagnostic only for draws with
 no guest graphics programs. Compute dispatch captures scalar user data,
 optionally resolves
@@ -530,23 +536,27 @@ to shader-read layout and bound through set 0/binding 1. The first MIMG lowering
 supports normalized two-coordinate `image_sample`; other formats, dimensions,
 mips and sampling operands fail explicitly.
 
-The PM4 synchronization callbacks currently choose correctness over overlap:
-acquire, release, write-data and event operations wait for the queue to become
-idle before publishing guest-visible labels or data. The executor remains
-responsible for deciding whether `WAIT_REG_MEM` is satisfied and preserving its
+Each draw submission completes through its fence before the executor reaches a
+PM4 synchronization callback. `ACQUIRE_MEM`, `RELEASE_MEM`, `WRITE_DATA`, and
+events consequently do not add a device-idle wait; the CPU-visible callbacks
+first publish any deferred target writebacks. The executor remains responsible
+for deciding whether `WAIT_REG_MEM` is satisfied and preserving its
 continuation. `RELEASE_MEM` immediate 32/64-bit values and clock/counter
 selections publish their exact-width result only after Vulkan work completes;
-reserved data selections are rejected. Completed linear frames are retained by guest render-target
-address. `SetFlip` waits for completion, resolves its registered VideoOut slot,
-and sends the matching frame, dimensions, address and flip metadata to an
-optional `PresentationSink`.
+reserved data selections are rejected. Completed linear frames are retained by
+guest render-target address. `SetFlip` publishes deferred targets, resolves its
+registered VideoOut slot, and sends the matching frame, dimensions, address and
+flip metadata to an optional `PresentationSink`.
 
 When initialized with a native Win32 handle, the renderer enables
 `VK_KHR_surface`, `VK_KHR_win32_surface` and `VK_KHR_swapchain`, selects a queue
 that can present to that surface, and creates an RGBA8/BGRA8 FIFO swapchain. The
-current synchronous presentation path acquires an image, aspect-fits the guest
-RGBA8 frame with nearest-neighbour CPU scaling, uploads it through staging,
-performs transfer/present layout transitions and calls `vkQueuePresentKHR`.
+presentation path keeps one persistent upload buffer and acquire fence for the
+swapchain lifetime. It aspect-fits the guest RGBA8 frame with nearest-neighbour
+CPU scaling, uploads it, performs transfer/present layout transitions and calls
+`vkQueuePresentKHR`. Bursts collapse to the latest pending frame; if no image is
+immediately available, that stale frame is dropped rather than stalling guest
+execution on the display refresh rate.
 The window owns its Win32 message loop on a dedicated host thread so a flip from
 any guest pthread can use the serialized GPU submission boundary safely.
 

@@ -299,6 +299,7 @@ const DeviceFunctions = struct {
     create_fence: vk.PfnCreateFence,
     destroy_fence: vk.PfnDestroyFence,
     wait_for_fences: vk.PfnWaitForFences,
+    reset_fences: vk.PfnResetFences,
     create_buffer: vk.PfnCreateBuffer,
     destroy_buffer: vk.PfnDestroyBuffer,
     get_buffer_memory_requirements: vk.PfnGetBufferMemoryRequirements,
@@ -319,6 +320,7 @@ const DeviceFunctions = struct {
     destroy_shader_module: vk.PfnDestroyShaderModule,
     create_pipeline_cache: vk.PfnCreatePipelineCache,
     destroy_pipeline_cache: vk.PfnDestroyPipelineCache,
+    get_pipeline_cache_data: vk.PfnGetPipelineCacheData,
     create_descriptor_set_layout: vk.PfnCreateDescriptorSetLayout,
     destroy_descriptor_set_layout: vk.PfnDestroyDescriptorSetLayout,
     create_descriptor_pool: vk.PfnCreateDescriptorPool,
@@ -362,6 +364,7 @@ const DeviceFunctions = struct {
             .create_fence = try deviceProc(get_proc, device, vk.PfnCreateFence, "vkCreateFence"),
             .destroy_fence = try deviceProc(get_proc, device, vk.PfnDestroyFence, "vkDestroyFence"),
             .wait_for_fences = try deviceProc(get_proc, device, vk.PfnWaitForFences, "vkWaitForFences"),
+            .reset_fences = try deviceProc(get_proc, device, vk.PfnResetFences, "vkResetFences"),
             .create_buffer = try deviceProc(get_proc, device, vk.PfnCreateBuffer, "vkCreateBuffer"),
             .destroy_buffer = try deviceProc(get_proc, device, vk.PfnDestroyBuffer, "vkDestroyBuffer"),
             .get_buffer_memory_requirements = try deviceProc(get_proc, device, vk.PfnGetBufferMemoryRequirements, "vkGetBufferMemoryRequirements"),
@@ -382,6 +385,7 @@ const DeviceFunctions = struct {
             .destroy_shader_module = try deviceProc(get_proc, device, vk.PfnDestroyShaderModule, "vkDestroyShaderModule"),
             .create_pipeline_cache = try deviceProc(get_proc, device, vk.PfnCreatePipelineCache, "vkCreatePipelineCache"),
             .destroy_pipeline_cache = try deviceProc(get_proc, device, vk.PfnDestroyPipelineCache, "vkDestroyPipelineCache"),
+            .get_pipeline_cache_data = try deviceProc(get_proc, device, vk.PfnGetPipelineCacheData, "vkGetPipelineCacheData"),
             .create_descriptor_set_layout = try deviceProc(get_proc, device, vk.PfnCreateDescriptorSetLayout, "vkCreateDescriptorSetLayout"),
             .destroy_descriptor_set_layout = try deviceProc(get_proc, device, vk.PfnDestroyDescriptorSetLayout, "vkDestroyDescriptorSetLayout"),
             .create_descriptor_pool = try deviceProc(get_proc, device, vk.PfnCreateDescriptorPool, "vkCreateDescriptorPool"),
@@ -461,6 +465,51 @@ const maximum_graphics_pipelines = 256;
 const maximum_staged_buffer_bytes = 128 * 1024 * 1024;
 const maximum_frame_bytes = 128 * 1024 * 1024;
 const maximum_completed_frames = 16;
+/// On-disk driver pipeline cache. Reused across runs so per-title shader
+/// compilation is paid once instead of on every launch.
+const pipeline_cache_path = "vulkan_pipeline_cache.bin";
+/// Sanity cap: a pipeline cache payload this large is not ours.
+const maximum_pipeline_cache_bytes = 64 * 1024 * 1024;
+
+/// Reads the persisted driver pipeline cache, if any. Any failure — missing
+/// file, unreadable file, unreasonable size — returns null; the caller then
+/// creates an empty cache and saves over it later.
+fn loadPipelineCacheBytes(allocator: std.mem.Allocator) ?[]u8 {
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const file = std.Io.Dir.cwd().openFile(io, pipeline_cache_path, .{}) catch return null;
+    defer file.close(io);
+    const size = file.length(io) catch return null;
+    if (size == 0 or size > maximum_pipeline_cache_bytes) return null;
+    const bytes = allocator.alloc(u8, @intCast(size)) catch return null;
+    errdefer allocator.free(bytes);
+    const read = file.readPositionalAll(io, bytes, 0) catch return null;
+    if (read != bytes.len) return null;
+    return bytes;
+}
+
+/// Writes the current driver pipeline cache to disk. Failure is deliberately
+/// silent: a cache is an optimization, and losing it only costs compilation
+/// time on the next run.
+fn savePipelineCacheBytes(self: *Renderer) void {
+    var data_size: usize = 0;
+    if (self.device_functions.get_pipeline_cache_data(self.device, self.driver_pipeline_cache, &data_size, null) != vk.success) {
+        return;
+    }
+    if (data_size == 0 or data_size > maximum_pipeline_cache_bytes) return;
+    const bytes = self.allocator.alloc(u8, data_size) catch return;
+    defer self.allocator.free(bytes);
+    if (self.device_functions.get_pipeline_cache_data(self.device, self.driver_pipeline_cache, &data_size, bytes.ptr) != vk.success) {
+        return;
+    }
+    var threaded = std.Io.Threaded.init(self.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const file = std.Io.Dir.cwd().createFile(io, pipeline_cache_path, .{ .truncate = true }) catch return;
+    defer file.close(io);
+    file.writePositionalAll(io, bytes, 0) catch return;
+}
 
 const GuestBufferEntry = struct {
     guest_address: u64,
@@ -549,6 +598,13 @@ const CachedFrame = struct {
     height: u32 = 0,
     guest_address: u64 = 0,
     sequence: u64 = 0,
+    /// Tiling metadata of the render that produced `pixels`, retained so a
+    /// deferred (lazy) writeback can tile the linear frame back into guest
+    /// memory when the guest actually needs it.
+    target: ?GuestColorTarget = null,
+    /// The guest allocation at `guest_address` is stale: the rendered frame
+    /// has not been tiled back into guest memory yet.
+    needs_writeback: bool = false,
 };
 
 const WindowPresentation = struct {
@@ -560,6 +616,12 @@ const WindowPresentation = struct {
     images: []vk.Image,
     extent: vk.Extent2D,
     format: u32,
+    /// Persistent host-visible transfer source for swapchain uploads. Created
+    /// once at swapchain setup instead of per present, so a flip no longer
+    /// allocates a buffer and device memory on every frame.
+    upload: OwnedBuffer,
+    /// Persistent acquire fence, reset and reused by every batched present.
+    acquire_fence: vk.Fence,
 };
 
 const PreparedSampledImage = struct {
@@ -675,6 +737,16 @@ pub const Renderer = struct {
     display_buffer_resolver: ?DisplayBufferResolver = null,
     window_presentation: ?WindowPresentation = null,
     presented_frames: u64 = 0,
+    /// Batched present queue. Only the most recent frame survives: a burst of
+    /// flips or eager presents collapses to a single swapchain present, and a
+    /// swapchain that cannot accept another image drops the frame instead of
+    /// stalling the emulator on acquire.
+    pending_present: ?PresentedFrame = null,
+    present_in_flight: bool = false,
+    /// Frames skipped because the swapchain had no free image yet. A count,
+    /// not an error: dropping stale frames is how a real display pipeline
+    /// paces itself.
+    present_dropped: u64 = 0,
     guest_color_target_writes: u64 = 0,
     sampled_image_uploads: u64 = 0,
     acquire_callbacks: u64 = 0,
@@ -875,10 +947,27 @@ pub const Renderer = struct {
         }
         errdefer device_functions.destroy_pipeline_layout(device, compute_pipeline_layout, null);
 
-        const pipeline_cache_info = vk.PipelineCacheCreateInfo{};
+        // The driver pipeline cache is reused across runs: a previous session's
+        // compiled pipelines seed this one, so the first frames of a title do
+        // not pay full driver compilation again. Stale or foreign cache bytes
+        // are rejected by the driver; any failure falls back to an empty cache.
+        const cached_bytes = loadPipelineCacheBytes(allocator);
+        defer if (cached_bytes) |bytes| allocator.free(bytes);
+        const pipeline_cache_info = vk.PipelineCacheCreateInfo{
+            .initial_data_size = if (cached_bytes) |bytes| bytes.len else 0,
+            .initial_data = if (cached_bytes) |bytes| bytes.ptr else null,
+        };
         var driver_pipeline_cache: vk.PipelineCache = 0;
         if (device_functions.create_pipeline_cache(device, &pipeline_cache_info, null, &driver_pipeline_cache) != vk.success) {
-            return Error.PipelineCacheCreationFailed;
+            if (cached_bytes != null) {
+                // Invalid payload (wrong driver/device): start over.
+                const empty_info = vk.PipelineCacheCreateInfo{};
+                if (device_functions.create_pipeline_cache(device, &empty_info, null, &driver_pipeline_cache) != vk.success) {
+                    return Error.PipelineCacheCreationFailed;
+                }
+            } else {
+                return Error.PipelineCacheCreationFailed;
+            }
         }
         errdefer device_functions.destroy_pipeline_cache(device, driver_pipeline_cache, null);
 
@@ -890,6 +979,8 @@ pub const Renderer = struct {
                 allocator,
                 candidate.physical_device,
                 device,
+                &device_functions,
+                memory_properties,
                 window,
                 surface,
                 surface_functions.?,
@@ -900,6 +991,9 @@ pub const Renderer = struct {
         errdefer if (window_presentation) |presentation| {
             swapchain_functions.?.destroy_swapchain(device, presentation.swapchain, null);
             allocator.free(presentation.images);
+            device_functions.destroy_buffer(device, presentation.upload.handle, null);
+            device_functions.free_memory(device, presentation.upload.memory, null);
+            device_functions.destroy_fence(device, presentation.acquire_fence, null);
         };
 
         return .{
@@ -949,6 +1043,9 @@ pub const Renderer = struct {
         }
         self.guest_buffers.deinit(self.allocator);
         self.gds_storage.deinit(self.allocator);
+        // Persist compiled pipelines for the next run before the cache handle
+        // is destroyed.
+        savePipelineCacheBytes(self);
         self.device_functions.destroy_pipeline_cache(self.device, self.driver_pipeline_cache, null);
         self.device_functions.destroy_pipeline_layout(self.device, self.compute_pipeline_layout, null);
         self.device_functions.destroy_descriptor_pool(self.device, self.descriptor_pool, null);
@@ -957,6 +1054,9 @@ pub const Renderer = struct {
         if (self.window_presentation) |presentation| {
             presentation.swapchain_functions.destroy_swapchain(self.device, presentation.swapchain, null);
             self.allocator.free(presentation.images);
+            self.device_functions.destroy_buffer(self.device, presentation.upload.handle, null);
+            self.device_functions.free_memory(self.device, presentation.upload.memory, null);
+            self.device_functions.destroy_fence(self.device, presentation.acquire_fence, null);
             presentation.surface_functions.destroy_surface(self.instance_handle, presentation.surface, null);
         }
         self.device_functions.destroy_device(self.device, null);
@@ -999,7 +1099,23 @@ pub const Renderer = struct {
     }
 
     /// Presents one already-linear frame to the optional window swapchain.
+    ///
+    /// Batched present: the frame becomes the pending frame and is flushed
+    /// unless a present is already running. A frame arriving during a flush
+    /// replaces the pending one and is shown by the next flush, so a burst of
+    /// eager presents and flips collapses to the latest frame instead of
+    /// queuing one swapchain round-trip per draw.
     pub fn presentWindowFrame(self: *Renderer, frame: PresentedFrame) bool {
+        self.pending_present = frame;
+        return self.flushPendingPresent();
+    }
+
+    fn flushPendingPresent(self: *Renderer) bool {
+        const frame = self.pending_present orelse return true;
+        if (self.present_in_flight) return true;
+        self.present_in_flight = true;
+        defer self.present_in_flight = false;
+        self.pending_present = null;
         self.copyFrameToSwapchain(frame) catch |err| {
             self.last_flip_error = err;
             return false;
@@ -1027,12 +1143,8 @@ pub const Renderer = struct {
         const output_bytes = std.math.cast(usize, output_bytes_u64) orelse return Error.PresentationRejected;
         if (output_bytes == 0 or output_bytes > maximum_frame_bytes) return Error.PresentationRejected;
 
-        const upload = try self.createBuffer(
-            output_bytes,
-            vk.buffer_usage_transfer_src_bit,
-            vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
-        );
-        defer self.destroyBuffer(upload);
+        const upload = &presentation.upload;
+        if (output_bytes > upload.size) return Error.PresentationRejected;
         var mapped: ?*anyopaque = null;
         if (self.device_functions.map_memory(self.device, upload.memory, 0, output_bytes, 0, &mapped) != vk.success) {
             return Error.MemoryMapFailed;
@@ -1050,24 +1162,30 @@ pub const Renderer = struct {
         );
         self.device_functions.unmap_memory(self.device, upload.memory);
 
-        const acquire_info = vk.FenceCreateInfo{};
-        var acquire_fence: vk.Fence = 0;
-        if (self.device_functions.create_fence(self.device, &acquire_info, null, &acquire_fence) != vk.success) {
-            return Error.FenceCreationFailed;
+        // Non-blocking acquire: a swapchain with no free image drops this
+        // frame (the pending queue already holds a newer one). Waiting here is
+        // what used to stall the emulator's frame pacing on the display rate.
+        if (self.device_functions.reset_fences(self.device, 1, @ptrCast(&presentation.acquire_fence)) != vk.success) {
+            return Error.FenceWaitFailed;
         }
-        defer self.device_functions.destroy_fence(self.device, acquire_fence, null);
         var image_index: u32 = 0;
         const acquired = presentation.swapchain_functions.acquire_next_image(
             self.device,
             presentation.swapchain,
-            std.math.maxInt(u64),
             0,
-            acquire_fence,
+            0,
+            presentation.acquire_fence,
             &image_index,
         );
+        if (acquired == vk.not_ready or acquired == vk.error_out_of_date_khr) {
+            // Frame dropped, not an error: the swapchain is still showing the
+            // previous frame and a newer one will replace this one.
+            self.present_dropped += 1;
+            return;
+        }
         if (acquired != vk.success and acquired != vk.suboptimal_khr) return Error.SwapchainAcquireFailed;
         if (image_index >= presentation.images.len or
-            self.device_functions.wait_for_fences(self.device, 1, @ptrCast(&acquire_fence), vk.true_value, std.math.maxInt(u64)) != vk.success)
+            self.device_functions.wait_for_fences(self.device, 1, @ptrCast(&presentation.acquire_fence), vk.true_value, std.math.maxInt(u64)) != vk.success)
         {
             return Error.FenceWaitFailed;
         }
@@ -1595,7 +1713,7 @@ pub const Renderer = struct {
         group_count: [3]u32,
     ) anyerror!?DispatchReport {
         _ = system;
-        
+
         const inst = analysis.program.instructions.items;
         if (inst.len != 14 or
             inst[0].opcode != .s_inst_prefetch or
@@ -2545,7 +2663,7 @@ pub const Renderer = struct {
         );
         try self.submitOneShot(command_buffer);
         try self.readMapped(readback, frame);
-        if (guest_target) |target| try self.commitGuestColorTarget(target, frame);
+        if (guest_target) |target| try self.recordGuestColorTarget(target, frame);
         if (frame.len == self.graphics_probe_frame.len) @memcpy(&self.graphics_probe_frame, frame);
 
         const center = (@as(usize, height / 2) * width + width / 2) * 4;
@@ -2635,6 +2753,10 @@ pub const Renderer = struct {
         );
     }
 
+    /// Lazy writeback: tiles `frame` into the guest allocation `target` names.
+    /// Called only when the guest is about to observe the target — at flip,
+    /// before a guest readback or a sampled-image staging of that address, or
+    /// at a synchronization packet — never after every draw.
     fn commitGuestColorTarget(self: *Renderer, target: GuestColorTarget, frame: []const u8) anyerror!void {
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
         const allocation_bytes = std.math.cast(usize, target.layout.required_source_bytes) orelse {
@@ -2646,6 +2768,15 @@ pub const Renderer = struct {
         if (!memory.read(memory.context, target.descriptor.address, tiled)) return Error.GuestMemoryReadFailed;
         try target.layout.tile(frame, tiled);
         if (!memory.write(memory.context, target.descriptor.address, tiled)) return Error.GuestMemoryWriteFailed;
+        self.guest_color_target_writes += 1;
+    }
+
+    /// Records a completed render in host memory without touching the guest
+    /// allocation. The frame is presented from this host copy; the guest copy
+    /// is produced by `flushPendingGuestWrites` only when it is actually
+    /// needed, so a frame with many draws costs one tile+writeback instead of
+    /// one per draw.
+    fn recordGuestColorTarget(self: *Renderer, target: GuestColorTarget, frame: []const u8) anyerror!void {
         var frame_index: ?usize = null;
         for (self.completed_frames.items, 0..) |cached, index| {
             if (cached.guest_address == target.descriptor.address) {
@@ -2658,9 +2789,18 @@ pub const Renderer = struct {
                 try self.completed_frames.append(self.allocator, .{});
                 frame_index = self.completed_frames.items.len - 1;
             } else {
+                // Evicting a slot whose writeback is still pending would lose
+                // the rendered frame for good; flush it before reuse.
                 var oldest_index: usize = 0;
                 for (self.completed_frames.items[1..], 1..) |cached, index| {
                     if (cached.sequence < self.completed_frames.items[oldest_index].sequence) oldest_index = index;
+                }
+                const evicted = &self.completed_frames.items[oldest_index];
+                if (evicted.needs_writeback) {
+                    if (evicted.target) |evicted_target| {
+                        try self.commitGuestColorTarget(evicted_target, evicted.pixels.items);
+                    }
+                    evicted.needs_writeback = false;
                 }
                 frame_index = oldest_index;
             }
@@ -2673,8 +2813,32 @@ pub const Renderer = struct {
         cached.height = target.descriptor.height;
         cached.guest_address = target.descriptor.address;
         cached.sequence = self.frame_sequence;
+        cached.target = target;
+        cached.needs_writeback = true;
         self.latest_frame_index = frame_index;
-        self.guest_color_target_writes += 1;
+    }
+
+    /// Publishes every deferred guest writeback. Cheap when nothing is
+    /// pending, which is the common case between synchronization packets.
+    pub fn flushPendingGuestWrites(self: *Renderer) anyerror!void {
+        for (self.completed_frames.items) |*cached| {
+            if (!cached.needs_writeback) continue;
+            const target = cached.target orelse continue;
+            try self.commitGuestColorTarget(target, cached.pixels.items);
+            cached.needs_writeback = false;
+        }
+    }
+
+    /// Publishes only the deferred writeback for one guest address, used
+    /// before guest memory at that address is staged or read.
+    fn flushPendingGuestWrite(self: *Renderer, address: u64) anyerror!void {
+        for (self.completed_frames.items) |*cached| {
+            if (!cached.needs_writeback or cached.guest_address != address) continue;
+            const target = cached.target orelse continue;
+            try self.commitGuestColorTarget(target, cached.pixels.items);
+            cached.needs_writeback = false;
+            return;
+        }
     }
 
     fn drawGraphicsProbe(self: *Renderer) anyerror!void {
@@ -2876,7 +3040,6 @@ pub const Renderer = struct {
             "[vulkan dcb] vertex storage: mappings={d} scalars={d}\n",
             .{ vertex_storage.mapping_count, vertex_storage.scalar_count },
         );
-
 
         var fragment_module = fragment_analysis.translateSpirv(self.allocator, .{
             .stage = .fragment,
@@ -3184,6 +3347,17 @@ pub const Renderer = struct {
         const byte_count = std.math.cast(usize, layout.staging_bytes) orelse return Error.UnsupportedSampledImage;
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
 
+        // A rendered target sampled as a texture must see the rendered frame:
+        // publish its deferred writeback before hashing or staging guest bytes,
+        // otherwise the cache would bind stale contents.
+        self.flushPendingGuestWrite(descriptor.address) catch |err| {
+            if (log_verbose_gpu) std.debug.print(
+                "[vulkan dcb] sampled image writeback flush failed: {s} addr=0x{x}\n",
+                .{ @errorName(err), descriptor.address },
+            );
+            return err;
+        };
+
         var content_hash: u64 = 14695981039346656037;
         const probe_span = std.math.cast(usize, layout.required_source_bytes) orelse 0;
         if (probe_span > 0) {
@@ -3223,13 +3397,13 @@ pub const Renderer = struct {
             item.last_used_frame = self.frame_sequence;
             self.texture_cache_hits += 1;
             if (self.texture_cache_hits == 1) {
-                std.debug.print("[vulkan dcb] texture cache hit: first time! addr=0x{x} hash={x}\n", .{descriptor.address, content_hash});
+                std.debug.print("[vulkan dcb] texture cache hit: first time! addr=0x{x} hash={x}\n", .{ descriptor.address, content_hash });
             }
             self.updateSampledImageDescriptor(descriptor_index, item.view, item.sampler);
             return .{ .image = item.image, .view = item.view, .sampler = item.sampler };
         }
         self.texture_cache_misses += 1;
-        std.debug.print("[vulkan dcb] texture cache miss: addr=0x{x} hash={x}\n", .{descriptor.address, content_hash});
+        std.debug.print("[vulkan dcb] texture cache miss: addr=0x{x} hash={x}\n", .{ descriptor.address, content_hash });
 
         const linear = try self.allocator.alloc(u8, byte_count);
         defer self.allocator.free(linear);
@@ -3541,13 +3715,7 @@ pub const Renderer = struct {
     }
 
     fn findMemoryType(self: *const Renderer, supported_bits: u32, required: vk.Flags) ?u32 {
-        var index: u32 = 0;
-        while (index < self.memory_properties.memory_type_count and index < 32) : (index += 1) {
-            const bit = @as(u32, 1) << @intCast(index);
-            const flags = self.memory_properties.memory_types[index].property_flags;
-            if (supported_bits & bit != 0 and flags & required == required) return index;
-        }
-        return null;
+        return findMemoryTypeIn(self.memory_properties, supported_bits, required);
     }
 
     fn writeMapped(self: *Renderer, buffer: OwnedBuffer, bytes: []const u8) Error!void {
@@ -3623,30 +3791,26 @@ pub const Renderer = struct {
         return memory.write(memory.context, address, bytes);
     }
 
-    fn waitForDevice(self: *Renderer) bool {
-        if (self.device_functions.device_wait_idle(self.device) != vk.success) {
-            self.last_sync_error = Error.DeviceWaitFailed;
-            return false;
-        }
-        self.last_sync_error = null;
-        return true;
-    }
-
     fn dcbAcquire(context: ?*anyopaque, _: gpu.state.AcquireMem) bool {
         const self = fromContext(context);
         self.acquire_callbacks += 1;
-        const accepted = self.waitForDevice();
-        if (!accepted) std.debug.print("[vulkan dcb] acquire rejected: {s}\n", .{@errorName(self.last_sync_error.?)});
-        return accepted;
+        // No device wait: every submission is fence-completed synchronously
+        // before the executor reaches a synchronization packet, so the queue
+        // is already idle and guest memory is current.
+        self.last_sync_error = null;
+        return true;
     }
 
     fn dcbRelease(context: ?*anyopaque, release: gpu.state.ReleaseMem) bool {
         const self = fromContext(context);
         self.release_callbacks += 1;
-        if (!self.waitForDevice()) {
-            std.debug.print("[vulkan dcb] release rejected: {s}\n", .{@errorName(self.last_sync_error.?)});
+        // A release publishes GPU progress to the guest CPU; publish deferred
+        // guest writebacks with it so a CPU read of a rendered target after
+        // the fence sees the rendered frame. The queue itself needs no wait.
+        self.flushPendingGuestWrites() catch |err| {
+            self.last_sync_error = err;
             return false;
-        }
+        };
         if ((release.destination != 0 and release.destination != 1) or release.address == 0) return true;
         var bytes: [8]u8 = undefined;
         const accepted = switch (release.data_selection) {
@@ -3699,10 +3863,12 @@ pub const Renderer = struct {
     fn dcbWriteData(context: ?*anyopaque, info: gpu.state.WriteData, values: []const u32) bool {
         const self = fromContext(context);
         self.write_data_callbacks += 1;
-        if (!self.waitForDevice()) {
-            std.debug.print("[vulkan dcb] write-data rejected: {s}\n", .{@errorName(self.last_sync_error.?)});
+        // CPU-visible publish point: flush deferred writebacks and skip the
+        // device wait (submissions are already fence-completed here).
+        self.flushPendingGuestWrites() catch |err| {
+            self.last_sync_error = err;
             return false;
-        }
+        };
         if (info.destination != 1 and info.destination != 2 and
             info.destination != 4 and info.destination != 5)
         {
@@ -3727,9 +3893,15 @@ pub const Renderer = struct {
     fn dcbEvent(context: ?*anyopaque, _: gpu.state.EventWrite) bool {
         const self = fromContext(context);
         self.event_callbacks += 1;
-        const accepted = self.waitForDevice();
-        if (!accepted) std.debug.print("[vulkan dcb] event rejected: {s}\n", .{@errorName(self.last_sync_error.?)});
-        return accepted;
+        // An event is a CPU-visible completion point; publish deferred guest
+        // writebacks so the event consumer sees rendered data. No device wait:
+        // submissions are fence-completed before the executor reaches here.
+        self.flushPendingGuestWrites() catch |err| {
+            self.last_sync_error = err;
+            return false;
+        };
+        self.last_sync_error = null;
+        return true;
     }
 
     /// Shows a display buffer straight out of guest memory.
@@ -3742,6 +3914,14 @@ pub const Renderer = struct {
     fn presentGuestBuffer(self: *Renderer, buffer: DisplayBuffer, flip: gpu.state.Flip) bool {
         const sink = self.presentation_sink orelse return true;
         if (buffer.width == 0 or buffer.height == 0) return false;
+
+        // The buffer may be one this renderer drew into and then evicted from
+        // the host frame cache; publish its deferred writeback so the guest
+        // bytes being shown are the rendered frame, not stale contents.
+        self.flushPendingGuestWrite(buffer.address) catch |err| {
+            self.last_flip_error = err;
+            return false;
+        };
 
         const pitch_pixels = if (buffer.pitch_in_pixels != 0) buffer.pitch_in_pixels else buffer.width;
         const row_bytes = @as(usize, pitch_pixels) * 4;
@@ -3790,10 +3970,15 @@ pub const Renderer = struct {
             "[vulkan dcb] flip #{d} buffer={d} video_out={d} completed_frames={d}\n",
             .{ self.flip_callbacks, flip.display_buffer_index, flip.video_out_handle, self.completed_frames.items.len },
         );
-        if (!self.waitForDevice()) {
-            self.last_flip_error = self.last_sync_error;
+        // The flip is the frame boundary: publish deferred guest writebacks so
+        // a display buffer read straight out of guest memory sees the frame
+        // that was actually rendered. No device wait is needed — every draw
+        // submission is already fence-completed synchronously, and the guest
+        // writeback below is a host-side tile operation.
+        self.flushPendingGuestWrites() catch |err| {
+            self.last_flip_error = err;
             return false;
-        }
+        };
         var selected_index = self.latest_frame_index;
         var requested: ?DisplayBuffer = null;
         if (self.display_buffer_resolver) |resolver| {
@@ -4788,10 +4973,22 @@ fn choosePhysicalDevice(
     return best orelse Error.NoCompatiblePhysicalDevice;
 }
 
+fn findMemoryTypeIn(properties: vk.PhysicalDeviceMemoryProperties, supported_bits: u32, required: vk.Flags) ?u32 {
+    var index: u32 = 0;
+    while (index < properties.memory_type_count and index < 32) : (index += 1) {
+        const bit = @as(u32, 1) << @intCast(index);
+        const flags = properties.memory_types[index].property_flags;
+        if (supported_bits & bit != 0 and flags & required == required) return index;
+    }
+    return null;
+}
+
 fn createWindowPresentation(
     allocator: std.mem.Allocator,
     physical_device: vk.PhysicalDevice,
     device: vk.Device,
+    device_functions: *const DeviceFunctions,
+    memory_properties: vk.PhysicalDeviceMemoryProperties,
     native_window: NativeWindow,
     surface: vk.Surface,
     surface_functions: SurfaceFunctions,
@@ -4873,6 +5070,45 @@ fn createWindowPresentation(
     if (swapchain_functions.get_swapchain_images(device, swapchain, &swapchain_image_count, images.ptr) != vk.success) {
         return Error.SwapchainImageQueryFailed;
     }
+    // One persistent upload buffer and acquire fence serve every present, so
+    // a flip no longer allocates Vulkan objects or blocks waiting for the
+    // swapchain. The extent is fixed at swapchain creation (FIFO mode), so the
+    // buffer never needs to grow.
+    const output_bytes = @as(vk.DeviceSize, extent.width) * extent.height * 4;
+    const upload_info = vk.BufferCreateInfo{
+        .size = output_bytes,
+        .usage = vk.buffer_usage_transfer_src_bit,
+    };
+    var upload_handle: vk.Buffer = 0;
+    if (device_functions.create_buffer(device, &upload_info, null, &upload_handle) != vk.success) {
+        return Error.BufferCreationFailed;
+    }
+    errdefer device_functions.destroy_buffer(device, upload_handle, null);
+    var upload_requirements: vk.MemoryRequirements = undefined;
+    device_functions.get_buffer_memory_requirements(device, upload_handle, &upload_requirements);
+    const upload_memory_type = findMemoryTypeIn(
+        memory_properties,
+        upload_requirements.memory_type_bits,
+        vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+    ) orelse return Error.NoCompatibleMemoryType;
+    const upload_allocation = vk.MemoryAllocateInfo{
+        .allocation_size = upload_requirements.size,
+        .memory_type_index = upload_memory_type,
+    };
+    var upload_memory: vk.DeviceMemory = 0;
+    if (device_functions.allocate_memory(device, &upload_allocation, null, &upload_memory) != vk.success) {
+        return Error.MemoryAllocationFailed;
+    }
+    errdefer device_functions.free_memory(device, upload_memory, null);
+    if (device_functions.bind_buffer_memory(device, upload_handle, upload_memory, 0) != vk.success) {
+        return Error.MemoryBindingFailed;
+    }
+    const acquire_fence_info = vk.FenceCreateInfo{};
+    var acquire_fence: vk.Fence = 0;
+    if (device_functions.create_fence(device, &acquire_fence_info, null, &acquire_fence) != vk.success) {
+        return Error.FenceCreationFailed;
+    }
+    errdefer device_functions.destroy_fence(device, acquire_fence, null);
     return .{
         .native_window = native_window,
         .surface_functions = surface_functions,
@@ -4882,6 +5118,8 @@ fn createWindowPresentation(
         .images = images,
         .extent = extent,
         .format = surface_format.format,
+        .upload = .{ .handle = upload_handle, .memory = upload_memory, .size = output_bytes },
+        .acquire_fence = acquire_fence,
     };
 }
 
