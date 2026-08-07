@@ -646,14 +646,16 @@ pub fn decodeColorTarget(state: *const gpu_state.State, slot: u8, target_mask: u
     if (address == 0 or format == 0) return null;
     const view = context(state, base + 3) orelse 0;
     const pitch = context(state, base + 1);
+    const width: u32 = ((attrib2 >> 14) & 0x3fff) + 1;
+    const decoded_pitch: u32 = if (pitch) |value| ((value & 0x7ff) + 1) * 8 else 0;
 
     return .{
         .slot = slot,
         .address = address,
-        .width = ((attrib2 >> 14) & 0x3fff) + 1,
+        .width = width,
         .height = (attrib2 & 0x3fff) + 1,
         .depth = (attrib3 & 0x1fff) + 1,
-        .pitch = if (pitch) |value| ((value & 0x7ff) + 1) * 8 else 0,
+        .pitch = if (decoded_pitch < width) 0 else decoded_pitch,
         .format = format,
         .number_type = @truncate((info >> 8) & 0x7),
         .component_swap = @truncate((info >> 11) & 0x3),

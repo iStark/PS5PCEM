@@ -120,7 +120,7 @@ pub const Walker = struct {
         const body_length: usize = switch (kind) {
             // Padding is one word and carries nothing.
             .filler => 0,
-            else => @as(usize, (header >> count_shift) & count_mask) + 1,
+            else => if (header == 0xffff_1000) 0 else @as(usize, (header >> count_shift) & count_mask) + 1,
         };
 
         const body_start = self.index + 1;
