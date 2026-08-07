@@ -1,7 +1,40 @@
-# PS5 emulation components
+# PS5PCEM
 
-Building blocks for PlayStation 5 emulation, written in Zig. Ten modules cover
-the independent subsystems and their end-to-end composition:
+PS5PCEM is an experimental PlayStation 5 emulator and interoperability research
+project written in Zig. It can load decrypted PS5 executables, run selected
+x86-64 guest code directly on Windows, execute AGC command streams, translate a
+growing RDNA2 shader subset to SPIR-V, and present the resulting frames through
+Vulkan.
+
+> [!IMPORTANT]
+> This is an early development project, not a general-purpose game emulator.
+> Rendering, synchronization, firmware coverage, and title compatibility are
+> incomplete. Use only software and system files that you are legally allowed
+> to access.
+
+## Current status
+
+- Native guest execution is available on Windows x86-64; inspection, decoding,
+  and HLE components also build on Linux and macOS.
+- Live VideoOut reaches a Vulkan swapchain, while host audio accepts decoded
+  guest buffers at 48 kHz.
+- Guest vertex and pixel shaders can render sampled textures using AGC vertex
+  tables, per-instruction V# mappings, `VertexIndex`, PARAM exports, and
+  fragment interpolation.
+- Persistent render targets and bounded buffer, texture, and pipeline caches
+  keep frame resources alive across draws and reduce redundant queue submits.
+- Real title frames are visible, but color, composition, depth/MRT, compressed
+  surfaces, and some texture layouts are still incomplete.
+
+![Live gameplay rendered by PS5PCEM](docs/images/live-gameplay.png)
+
+*A live gameplay frame produced by the current guest VS/PS and sampled-texture
+path. The HUD, character, and background come from title data; the red color
+shows the remaining render-state and surface-format work.*
+
+## Components
+
+Ten modules cover the independent subsystems and their end-to-end composition:
 
 | Module | What it does |
 |---|---|
@@ -21,7 +54,7 @@ cross-compiles to Windows, Linux, and macOS. Direct guest execution currently
 requires Windows x86-64; the other targets still build the inspection and HLE
 layers but report the native bridge as unsupported.
 
-Seven command-line tools come with them:
+The repository includes these command-line tools and hardware probes:
 
 ```sh
 zig build run         -- shader.bin    # disassemble a shader
@@ -41,6 +74,13 @@ attaches the live AGC command queues before entering guest code. Set
 `PS5_HEADLESS=1` to keep loader/CPU diagnostics windowless. A missing Vulkan
 loader, compatible presentation device, or host window is reported and the
 title continues through the previous headless path.
+
+For a native optimized build, install Zig 0.16 and use a current Vulkan driver:
+
+```powershell
+zig build -Doptimize=ReleaseFast
+.\zig-out\bin\game-run.exe "X:\path\to\decrypted-title\eboot.bin"
+```
 
 `module-info` is where the pieces meet. It reads a module, works out every
 symbol the module imports, and checks each one against the firmware registry
@@ -135,22 +175,26 @@ typed branch/fallthrough edges with SCC/VCC/EXEC predicate domains. It discovers
 forward selection merges and records backward edges separately. `ir.zig`
 supplies the API-neutral typed boundary for ALU, memory, image, interpolation
 and export work. The SPIR-V 1.5 writer translates 32-bit move,
-integer/bitwise/floating-point ALU and SDWA source extraction. Forward scalar
-selections become structured `OpSelectionMerge`/`OpBranchConditional` regions;
-register values crossing a merge use `OpPhi`. Back edges, DPP lane shuffles and
-VCC/EXEC predicates return a precise unsupported error until their structured
-lowering exists, rather than producing a placeholder shader. Executable MUBUF
-lowering covers byte/short/dword scalar and vector transfers plus the ten common
-32-bit buffer atomics; `glc` atomics preserve their returned old value in the
-guest VGPR. Graphics modules now declare Vulkan stage interfaces: vertex
-`VertexIndex` can seed an explicit guest VGPR, integer-to-float conversions feed
-position math, `EXP POS0` stores `BuiltIn Position`, and fragment `EXP MRT0`
-stores a four-component color at location zero. The first executable MIMG path
-lowers a 2D `image_sample` with inline image/sampler SGPR descriptors into a
-combined sampled-image descriptor array and `OpImageSampleImplicitLod`.
-Compressed and masked exports, additional position/parameter/MRT targets,
-non-trivial image operands and the remaining graphics system VGPRs still fail
-explicitly.
+integer/bitwise/floating-point ALU, SDWA extraction, and the supported DPP/VOP3
+modifiers. Forward scalar selections become structured
+`OpSelectionMerge`/`OpBranchConditional` regions and register values crossing a
+merge use `OpPhi`. During graphics bring-up, unsupported control-flow shapes
+can take a documented linear pass which skips branches; it keeps a frame
+observable but is not correct for divergent paths.
+
+Executable MUBUF lowering covers byte/short/dword scalar and vector transfers
+plus the ten common 32-bit buffer atomics; `glc` atomics preserve their returned
+old value in the guest VGPR. A binding may select a different staged V# at each
+instruction PC, retain the resolved SOFFSET, and use Vulkan `VertexIndex` for
+per-vertex fetches even when one guest SGPR is reused by several attributes.
+Graphics modules connect vertex `EXP POS0` to `BuiltIn Position`, vertex
+`PARAM0..31` exports to Vulkan locations, fragment VINTRP instructions to the
+matching inputs, and fragment `EXP MRT0` to color location zero. Hardware-only
+M0 setup and EXEC restoration from unavailable pixel-prolog SGPRs are tolerated
+without inventing guest data. The current MIMG path lowers normalized 2D
+`image_sample` through the combined sampled-image descriptor array.
+Compressed/masked exports, additional MRT targets, non-trivial image operands,
+and the remaining graphics system VGPRs are still incomplete.
 
 ## Building
 
@@ -430,40 +474,41 @@ packet per line with its word offset, and counts the draws and dispatches:
 
 ## Roadmap
 
-The shared GFX10 staging contract is complete for mip tails, thick 3D blocks,
-Oberon RB+ MSAA addressing and compute-detile constants. Compute submissions
-already translate the supported RDNA2 ALU/SMEM/MUBUF path, specialize bounded
-scalar prologs, bind staged guest buffers and copy device writes back to guest
-memory. The first graphics frame path now also consumes a decoded PS5 RGBA8
-color target, detiles its existing contents, applies viewport/scissor,
-cull/front-face, write-mask and blend state, executes guest vertex/fragment
-SPIR-V, and tiles the result back into the same guest allocation. A supported
-inline 2D texture and sampler can feed fragment `image_sample` through binding
-1. `ACQUIRE_MEM`, `RELEASE_MEM`, `WAIT_REG_MEM`, `WRITE_DATA` and `EVENT_WRITE`
-preserve ordering through the current synchronous Vulkan queue and checked
-guest labels. `SetFlip` resolves its handle and buffer index through the HLE
-VideoOut registry, selects the completed render target with the matching guest
-address, and publishes that immutable frame through an API-neutral presentation
-sink.
+The shared GFX10 staging contract covers mip tails, thick 3D blocks, Oberon RB+
+MSAA addressing, and compute-detile constants. Compute submissions translate
+the supported RDNA2 ALU/SMEM/MUBUF path, specialize bounded scalar prologs, bind
+guest buffers, and copy device writes back to guest memory. Graphics draws
+consume decoded color targets, viewport/scissor, cull/front-face, write-mask and
+blend state, then execute guest vertex/fragment SPIR-V. Render-target images are
+persistent across draws and are materialized back to guest memory only before a
+CPU-visible synchronization point, a dependent texture upload, or `SetFlip`.
+
+Supported 2D image/sampler descriptors feed fragment `image_sample`. AGC
+vertex tables provide distinct position and texture-coordinate buffers even
+when the shader reuses one V# SGPR, and vertex PARAM exports now supply the
+fragment interpolation inputs. `ACQUIRE_MEM`, `RELEASE_MEM`, `WAIT_REG_MEM`,
+`WRITE_DATA`, and `EVENT_WRITE` retain checked guest ordering. `SetFlip`
+resolves its VideoOut slot and buffer index, selects the cached target with the
+matching guest address, and publishes the frame through an API-neutral sink.
 
 The remaining stages are:
 
-1. Finish the DPP/VOP3 operations needed by captures, structured loops and
-   VCC/EXEC divergence, then widen vertex input and export conventions.
-2. Add depth/stencil, multiple render targets, MSAA and compressed
-   DCC/CMASK/FMASK/HTILE render surfaces.
-3. Resolve sampled/storage images through AGC SRT provenance and add the formats,
-   mip/layer views, explicit-LOD operands and image operations seen in captures.
-4. Validate packet/state/shader results against captures before optimizing
-   asynchronous queues, image/descriptor caches and pipeline compilation.
+1. Move frequently changing shader scalars from SPIR-V specialization into a
+   runtime constant path so graphics pipelines can be reused across frames.
+2. Add depth/stencil, multiple render targets, MSAA, texture component swizzles,
+   and compressed DCC/CMASK/FMASK/HTILE surfaces.
+3. Complete structured loops, VCC/EXEC divergence, formats, mip/layer views,
+   explicit-LOD operands, and the remaining image operations seen in captures.
+4. Reduce synchronous dispatch/readback work and validate state and resource
+   invalidation against longer title captures.
 
 The live path is now connected end to end: AGC DCB submission executes against
 the Vulkan backend, VideoOut registration identifies the requested display
 allocation, and CPU, EOP and PM4 flips reach the Win32 swapchain. This is a real
 game-output window, but not yet a promise of a stable game video stream. A title
 will only present after its shaders, target formats, tiling and resource usage
-all fit the currently supported subsets; an unsupported draw is still rejected
-explicitly instead of displaying a fabricated frame.
+all fit the currently supported subsets. Diagnostic shader fallbacks remain
+limited to bring-up paths and are reported when selected.
 
 ---
 
@@ -479,20 +524,20 @@ compute. Validation is requested for debug builds when
 
 The renderer owns instance/device lifetime, the selected queue, a transient
 command pool, host/device memory-type selection, one descriptor layout with
-64 storage buffers plus 64 combined sampled images, its pool, image/view/sampler/
-render-pass/framebuffer creation, and both Vulkan-driver and exact-SPIR-V
-software pipeline caches. The Vulkan-driver cache is persisted as
+64 storage buffers plus 64 combined sampled images, its pool, persistent guest
+render targets, and image/view/sampler/render-pass/framebuffer creation. It also
+owns bounded compute and LRU graphics-pipeline caches plus a 32-entry sampled
+image LRU. The Vulkan-driver cache is persisted as
 `vulkan_pipeline_cache.bin` between runs; invalid, unreadable, or oversized
 cache data simply falls back to an empty driver cache, so it can only affect
 startup compilation time, never correctness.
-`stageGuestStorageBuffer` caches up to 256 exact ranges (each at most the Vulkan
-1.2 minimum 128 MiB storage-buffer range). It never treats guest bytes as
-immutable: a cache hit reuses allocations but uploads the current guest range
-again. `stageGuestStorageBufferAt` independently publishes any cached allocation
-at one of 64 elements in set 0/binding 0; descriptor-set allocation therefore
-does not grow with the buffer cache. Host-write/transfer/compute/readback
-barriers keep the synchronous path explicit, and readback can verify the
-device-local contents.
+`stageGuestStorageBuffer` retains at most one allocation per descriptor slot,
+with 64 slots and a 128 MiB per-range cap. Rebinding a slot recycles its old
+allocation instead of retaining every transient guest ring address. Buffers use
+host-visible coherent storage, so current guest bytes are copied directly into
+the mapped Vulkan allocation and compute results are read from the same memory
+after the fenced dispatch. This removes the former upload/copy/readback submit
+pair for every staged range while keeping descriptor-set growth bounded.
 
 `dcbBackend` adapts checked guest reads and writes plus synchronization,
 draw/dispatch and flip callbacks to [`gpu.executor`](src/gpu/executor.zig)
@@ -503,16 +548,16 @@ supported shader to SPIR-V 1.5, creates or reuses its compute pipeline, binds th
 active storage set and dispatches the packet's XYZ group counts. Errors remain
 explicit: a missing program, unsupported shader semantic or indirect dispatch
 rejects that backend callback and records the exact error. Draw callbacks count
-work by default. When both vertex and pixel program registers are present, a
-three-vertex `DRAW_INDEX_AUTO` decodes both guest programs, lowers their stage
-interfaces and exports, creates or reuses a pipeline keyed by exact SPIR-V and
-decoded graphics state, and records a real Vulkan draw into the active guest
-RGBA8 color target. Existing target bytes are detiled and uploaded before the
-render pass; the completed linear image stays in the host frame cache until the
-guest can observe it. It is tiled back into guest memory before a matching
-sampled-image upload or display read, at `SetFlip`, and at CPU-visible PM4
-synchronization points. This preserves guest-visible ordering while avoiding a
-tile/writeback after every draw. A half-bound graphics program fails explicitly.
+work by default. When both vertex and pixel program registers are present,
+`DRAW_INDEX_AUTO` decodes both guest programs, resolves AGC vertex resources,
+lowers matching PARAM/VINTRP stage interfaces, creates or reuses a pipeline
+keyed by SPIR-V and decoded graphics state, and records a Vulkan draw into the
+active guest color target. Existing target bytes are detiled only when a target
+first enters the cache; later draws reuse its Vulkan image. The image is tiled
+back before a matching sampled-image upload or display read, at `SetFlip`, and
+at CPU-visible PM4 synchronization points. This preserves guest-visible ordering
+while avoiding a full-frame readback after every draw. A half-bound graphics
+program fails explicitly.
 `enable_graphics_probe` retains the fixed-shader diagnostic only for draws with
 no guest graphics programs. Compute dispatch captures scalar user data,
 optionally resolves
@@ -530,11 +575,14 @@ readback as stores. Swizzled descriptors use V# `index_stride` to permute each
 dword address, while short loads/stores are split into byte operations so they
 remain correct across both linear and swizzle-separated dword boundaries.
 Dynamically unresolved SMEM and images remain explicit unsupported semantics.
-For the supported fragment subset, inline 2D RGBA8 image and sampler descriptors
-are decoded from user SGPRs, detiled into a sampled Vulkan image, transitioned
-to shader-read layout and bound through set 0/binding 1. The first MIMG lowering
+For the supported fragment subset, inline 2D image and sampler descriptors are
+decoded from user SGPRs, detiled into a sampled Vulkan image, transitioned to
+shader-read layout, and bound through set 0/binding 1. Cache identity includes
+the guest payload hash; rewriting the same address replaces its stale image,
+while descriptor SGPR addresses are excluded from scalar specialization to
+avoid recompiling a pipeline for every streamed texture. The first MIMG lowering
 supports normalized two-coordinate `image_sample`; other formats, dimensions,
-mips and sampling operands fail explicitly.
+mips, component swizzles, and sampling operands remain incomplete.
 
 Each draw submission completes through its fence before the executor reaches a
 PM4 synchronization callback. `ACQUIRE_MEM`, `RELEASE_MEM`, `WRITE_DATA`, and
@@ -547,6 +595,12 @@ reserved data selections are rejected. Completed linear frames are retained by
 guest render-target address. `SetFlip` publishes deferred targets, resolves its
 registered VideoOut slot, and sends the matching frame, dimensions, address and
 flip metadata to an optional `PresentationSink`.
+
+Compact `[gpu frame]` diagnostics report frame time, draw/dispatch/submit counts,
+fence wait time, upload/readback volume, render-target hits, and current buffer
+and texture cache sizes. Progress captures include selected later flips rather
+than only the first presented image, which makes missing textures and frame-state
+regressions visible during title bring-up.
 
 When initialized with a native Win32 handle, the renderer enables
 `VK_KHR_surface`, `VK_KHR_win32_surface` and `VK_KHR_swapchain`, selects a queue
@@ -1337,44 +1391,45 @@ scheduler and Vulkan backend. Observed startup work now includes:
 
 - GDS initialization and several compute dispatches (including buffer-copy
   shapes) that complete successfully when V# descriptors resolve.
-- Graphics draws that ignore depth/MRT extras and DCC/compression flags on the
-  first host path so colour-target work is not rejected wholesale.
-- `InvalidPitch` rejections are averted by clamping decoded target pitch, enabling
-  valid Vulkan swapchain presentation and successful `sceVideoOutSubmitEopFlip` completions.
-- Guest vertex/pixel SPIR-V translation for common RDNA2 ALU, MUBUF, sampling
-  and compressed colour export. Missing attribute V#s soft-skip; when the
-  primary attribute bank is absent the draw uses a diagnostic vertex triangle
-  so the guest pixel path still runs.
-- **Sampled Texture Caching**: Sampled image descriptors with valid RGBA payloads
-  are hashed and cached with a 64-item LRU scheme, reusing `vk.ImageView` and `vk.Sampler`
-  to significantly reduce per-frame host uploads.
-- **Verbose GPU Logging**: An optional `log_verbose_gpu` flag at the top of the Vulkan backend
-  allows muting high-frequency I/O blocking prints (like GDS writes, queue states, and texture probes)
-  to stabilize frame pacing.
+- Guest VS/PS translation for common RDNA2 ALU, per-vertex MUBUF fetches,
+  PARAM/VINTRP interfaces, sampling, and color export. The renderer uses exact
+  instruction-PC mappings when one shader SGPR addresses multiple attributes.
+- AGC vertex-buffer entries supply their resolved address, stride, byte offset,
+  and `VertexIndex` addressing. A diagnostic triangle is used only when guest
+  vertex resources or translation remain unavailable.
+- Persistent color targets accumulate multi-draw output on the GPU and defer
+  detile/readback until guest visibility or presentation requires it.
+- Guest storage buffers are mapped directly through bounded coherent
+  allocations. This substantially reduces submissions on compute-heavy and
+  draw-heavy frames without changing the synchronization contract.
+- Sampled images use a 32-entry content-aware LRU, and the graphics-pipeline
+  cache recycles its least-recently-used entry instead of dropping later draws
+  after reaching its fixed capacity.
+- Compact per-frame profiling replaces high-frequency default logging; verbose
+  resource probes remain opt-in through `log_verbose_gpu`.
+- `InvalidPitch` rejections are averted by clamping decoded target pitch,
+  enabling Vulkan presentation and successful `sceVideoOutSubmitEopFlip`
+  completions.
 - AGC `CreateShader` / `FuseShaderHalves` are taken from HLE even when a guest
   `libSceAgc` PRX is loaded, so program→header mappings stay available to the
   live GPU path. Gs/Hs front halves are accepted without a PGM pair; fuse
   patches the export (ES/LS) program to front code and keeps the front header
   for user-data / attribute-table lookup. Draws that resolve a vertex buffer
-  table seed attribute V#s (e.g. s4) and run the guest export program instead
-  of the diagnostic triangle.
-- Sampled textures staged through the tiling map. Empty guest surfaces are
-  reported (tile mode, address, raw-byte probe) and may use a temporary
-  gradient so the fragment path stays observable while detile/upload catch up.
-- After a successful colour writeback: a host PPM dump of the first frame,
-  an eager present into the VideoOut swapchain, and normal `SetFlip` / equeue
-  delivery (filter `-13`). Flip status fills process-time fields; flip
-  arguments are packed into event data as `ident | (arg << 16)` with
-  `sceVideoOutGetEventData` for decoding.
+  table seed attribute V#s and run the guest export program.
+- Later progress captures show title-provided logos, HUD elements, characters,
+  and scene textures rather than only the initial presentation surface.
+  Color/channel handling, depth/MRT composition, compression metadata, and some
+  layouts still produce visible corruption.
+- `SetFlip` and equeue delivery use VideoOut filter `-13`; flip status fills
+  process-time fields and event data retains the guest flip argument.
 
-First guest draws cover the colour target with guest VS + guest PS (attribute
-MUBUF SOFFSET encodings and VertexIndex recovery). Empty textures still use a
-debug gradient when the guest surface is all-zero (typical of the first
-fullscreen pass before asset upload). Near-null object probes in managed code
+Near-null object probes in managed code
 (`cmp [obj+disp], 0` with `obj == null`) are stepped past so the title can take
 its null branch instead of dying after the first flip; the process now survives
-past that historical crash site, though multi-draw progress may still stall in
-AGC `suspendPoint` / wait loops.
+past that historical crash site. Frame pacing is still CPU-bound even when host
+GPU utilization is low: ordinary frames repeatedly translate/specialize shaders
+and move tens of MiB of guest data, while texture-streaming frames perform much
+larger uploads.
 
 ## Error codes
 
@@ -1390,16 +1445,16 @@ from leaking into host code where nothing would check it.
 
 ## Roadmap
 
-1. Stage real sampled-image contents when guest tiles are non-empty; tighten
-   detile and metadata handling where layout still disagrees with the title.
-2. Keep the guest process in a stable flip/submit loop after the first frames
-   (clear remaining null-object and missing-service faults during long init).
-3. Profile host CPU spin from AGC `suspendPoint` / guest waits and reduce the
-   hottest loops without changing synchronization contracts.
-4. Retain submission owner metadata across blocked `WAIT_REG_MEM` continuations
-   and publish delayed graphics completion events when needed.
-5. Expand texture caching to support more formats and invalidation mechanisms
-   beyond the current LRU implementation.
+1. Move changing vertex/scalar constants out of SPIR-V specialization so the
+   same graphics pipelines survive transform and resource updates.
+2. Implement component swizzles, more color/texture formats, mip views,
+   depth/stencil, MRT, and compressed-surface metadata.
+3. Tighten render ordering and composition against later title captures, then
+   replace the remaining diagnostic shader fallbacks.
+4. Reduce repeated compute readbacks and large texture uploads without changing
+   guest-visible synchronization.
+5. Keep the guest process in a stable long-running flip/submit loop and close
+   remaining HLE or wait-loop gaps as they appear.
 
 ---
 
@@ -1487,7 +1542,10 @@ unrecognized illegal instructions still stop execution. Arbitrary `eboot.bin`
 execution is therefore not safe yet. Linux and macOS need a different
 FS/HLE-transition strategy because their host TLS rules differ.
 
-Basic GPU command submission and host audio output are now functional during the title bootstrap, allowing rendering of primitive graphics (via translation to SPIR-V) and playback of guest audio buffers.
+GPU command submission and host audio output are functional during title
+bootstrap. The live path can translate guest vertex/pixel shaders, fetch AGC
+vertex attributes, sample title textures, and present multi-draw frames, though
+render-state and surface-format coverage remains incomplete.
 
 ## Roadmap
 
