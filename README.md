@@ -26,8 +26,10 @@ Vulkan.
 - Title plugins can be mapped explicitly before execution; later
   `sceKernelLoadStartModule` calls receive stable handles and
   `sceKernelDlsym` resolves readable export names inside the selected PRX.
-- Real title frames are visible, but color, composition, depth/MRT, compressed
-  surfaces, and some texture layouts are still incomplete.
+- Terminator 2D now reaches gameplay with the intended color balance, textured
+  backgrounds, characters, and UI. Early publisher logos and the in-game pause
+  menu still expose composition/compression gaps, while synchronous texture
+  upload and render-target readback continue to limit frame pacing.
 - PS VR2 libraries currently expose only compatibility/no-device behavior.
   VR plugins can initialize far enough to load Unity assets, but headset
   rendering, tracking, controllers, and a host OpenXR bridge do not exist yet.
@@ -36,11 +38,12 @@ Vulkan.
   its first graphics command buffer. Synchronization-only AGC constructors are
   still placeholders, so this path does not produce a VR frame yet.
 
-![Live gameplay rendered by PS5PCEM](docs/images/live-gameplay.png)
+![Terminator 2D gameplay rendered by PS5PCEM](docs/images/live-gameplay.png)
 
-*A live gameplay frame produced by the current guest VS/PS and sampled-texture
-path. The HUD, character, and background come from title data; the red color
-shows the remaining render-state and surface-format work.*
+*A live Terminator 2D gameplay frame produced by the current guest VS/PS,
+sampled-texture, render-target, and Vulkan presentation paths. Texture alpha,
+component swizzles, and sRGB sampling now preserve the title's intended color
+balance.*
 
 ### Observed title milestones
 
@@ -50,7 +53,7 @@ the repository contains none of that content.
 
 | Title | Observed milestone | Current limit |
 |---|---|---|
-| **Terminator 2D: No Fate** | Reaches gameplay and renders title-provided backgrounds, characters, HUD elements, and textures | Frame pacing, color channels, depth/composition, compression metadata, and several layouts remain incomplete |
+| **Terminator 2D: No Fate** | Reaches gameplay with correct color reproduction and clean title-provided backgrounds, characters, HUD elements, and textures | Early publisher logos and the pause menu retain artifacts; synchronous upload/readback limits frame pacing, while depth/MRT and compression metadata remain incomplete |
 | **Pistol Whip** | Maps the native PS VR2 plugin and Burst module, then starts loading Unity asset archives | Headset, tracking, controller, and host OpenXR support are intentionally deferred |
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | The initial synchronization DCB contains placeholder fence/event commands, so startup waits before VideoOut or VR presentation |
 
