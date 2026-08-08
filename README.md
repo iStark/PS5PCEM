@@ -18,6 +18,8 @@ Vulkan.
   and HLE components also build on Linux and macOS.
 - Live VideoOut reaches a Vulkan swapchain, while host audio accepts decoded
   guest buffers at 48 kHz.
+- A native Windows launcher selects a title directory, persists sound and input
+  profiles, and starts `game-run` with XInput, keyboard, or hybrid controls.
 - Guest vertex and pixel shaders can render sampled textures using AGC vertex
   tables, per-instruction V# mappings, `VertexIndex`, PARAM exports, and
   fragment interpolation.
@@ -59,7 +61,7 @@ the repository contains none of that content.
 
 ## Components
 
-Ten modules cover the independent subsystems and their end-to-end composition:
+Eleven modules cover the independent subsystems and their end-to-end composition:
 
 | Module | What it does |
 |---|---|
@@ -68,6 +70,7 @@ Ten modules cover the independent subsystems and their end-to-end composition:
 | **`gpu`** | Decodes and executes the stateful part of submitted GPU command streams |
 | **`vulkan`** | Owns the host Vulkan device, queues, command submission and renderer boundary |
 | **`window`** | Owns the native host window and its platform message loop |
+| **`input`** | Polls XInput and the host keyboard, then applies launcher remapping profiles |
 | **`loader`** | Reads, maps, and relocates bare ELF64 and decrypted PS5 SELF module images |
 | **`hle`** | High-level emulation of the guest firmware: symbol resolution and firmware libraries |
 | **`cpu`** | Dispatches guest execution and provides the Windows x86-64 native machine bridge |
@@ -90,6 +93,7 @@ zig build pm4-dump    -- capture.bin   # decode a captured GPU command stream
 zig build graph-info  -- eboot.bin     # map and relocate the reachable PRX graph
 zig build game-run    -- eboot.bin     # load, initialize, and enter the title
 zig build game-run    -- --app0 full/game patched/eboot.bin # use full content with a patched executable
+zig build launcher                      # open the native Windows launcher
 zig build vulkan-smoke                 # run the headless compute/graphics probe
 zig build vulkan-window-smoke          # present a diagnostic frame through a Win32 swapchain
 ```
@@ -99,6 +103,21 @@ attaches the live AGC command queues before entering guest code. Set
 `PS5_HEADLESS=1` to keep loader/CPU diagnostics windowless. A missing Vulkan
 loader, compatible presentation device, or host window is reported and the
 title continues through the previous headless path.
+
+The recommended Windows entry point is `zig-out\bin\ps5pcem.exe` (or
+`zig build launcher`). The launcher remembers the selected game directory,
+sound state, input mode, keyboard bindings, and interface language in
+`ps5pcem.ini` next to the executable. English is the default; Russian, German,
+and French are available from Settings. It looks for `eboot.bin` in the
+selected directory and its common `decrypted` subdirectory, then starts the
+sibling `game-run.exe` with the full content directory mounted as `/app0`.
+
+Input profiles can use the first XInput controller, a remappable keyboard
+profile, or both at once. WASD controls the left stick; Alt plus the arrow keys
+controls the right stick. The launcher passes these preferences through
+`PS5_INPUT_MODE`, `PS5_CONTROLLER_INDEX`, `PS5_KEYMAP`, and
+`PS5_AUDIO_DISABLED`, so direct CLI and automated runs keep their previous
+behaviour unless those variables are set.
 
 For a native optimized build, install Zig 0.16 and use a current Vulkan driver:
 
