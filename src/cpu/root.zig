@@ -791,11 +791,19 @@ const WindowsX64Machine = struct {
         const code: [*]const u8 = @ptrFromInt(context.Rip);
         var offset: usize = 0;
         var rex: u8 = 0;
-        // Skip optional segment override / REX / multi-byte escape carefully.
-        // Only handle the common REX + opcode + modrm form used by field accesses.
+        var vex_b: u8 = 0;
+        // Skip optional REX or VEX prefixes. Unity's generated setters commonly
+        // use `vmovss [null+disp], xmm` (C5 FA 11 /r), which has the same ModRM
+        // base encoding as a regular MOV but puts the ModRM after a VEX prefix.
         if (code[0] & 0xf0 == 0x40) {
             rex = code[0];
             offset = 1;
+        } else if (code[0] == 0xc5) {
+            offset = 2;
+        } else if (code[0] == 0xc4) {
+            // VEX.~B is inverted: zero means the high base-register bit is set.
+            vex_b = if (code[1] & 0x20 == 0) 8 else 0;
+            offset = 3;
         }
         // Two-byte opcode (0F xx) places modrm at offset+2.
         const modrm_index: usize = if (code[offset] == 0x0f) offset + 2 else offset + 1;
@@ -809,13 +817,13 @@ const WindowsX64Machine = struct {
             const sib = code[modrm_index + 1];
             const base = sib & 7;
             if (mod == 0 and base == 5) return false; // disp32, no base
-            const reg_index: u4 = @truncate(base | ((rex & 0x01) << 3));
+            const reg_index: u4 = @truncate(base | ((rex & 0x01) << 3) | vex_b);
             if (readGpr(context, reg_index) != 0) return false;
             writeGpr(context, reg_index, ensureNullObjectStub());
             return true;
         }
         if (mod == 0 and rm == 5) return false; // rip-relative
-        const reg_index: u4 = @truncate(rm | ((rex & 0x01) << 3));
+        const reg_index: u4 = @truncate(rm | ((rex & 0x01) << 3) | vex_b);
         if (readGpr(context, reg_index) != 0) return false;
         // Sanity: base 0 + small disp should match the fault address.
         // (disp is not re-decoded here; a null base always lands in the first page.)
@@ -1165,6 +1173,26 @@ test "a dropped thread pointer is repaired, a null dereference is not" {
 
     // A thread with no guest thread pointer has none to lose.
     try std.testing.expect(!shouldRestore(0x28, 0, 0));
+}
+
+test "null base recovery decodes VEX2 and VEX3 memory operands" {
+    if (can_use_native_bridge) {
+        // vmovss dword ptr [rax+0x70], xmm0
+        const vex2 = [_]u8{ 0xc5, 0xfa, 0x11, 0x40, 0x70 };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&vex2);
+        try std.testing.expect(WindowsX64Machine.tryRedirectNullBaseRegister(&context, 0x70));
+        try std.testing.expectEqual(ensureNullObjectStub(), context.Rax);
+
+        // The inverted VEX.B bit extends the ModRM base from RAX to R8.
+        const vex3 = [_]u8{ 0xc4, 0xc1, 0x7a, 0x11, 0x40, 0x70 };
+        context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&vex3);
+        try std.testing.expect(WindowsX64Machine.tryRedirectNullBaseRegister(&context, 0x70));
+        try std.testing.expectEqual(ensureNullObjectStub(), context.R8);
+    } else {
+        return error.SkipZigTest;
+    }
 }
 
 extern fn ps5NativeCallWindowsX64(
