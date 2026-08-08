@@ -101,6 +101,53 @@ fn amprCommandBufferReset(address: u64) callconv(abi.guest) i32 {
     return errno.ok;
 }
 
+fn amprCommandBufferClearBuffer(address: u64) callconv(abi.guest) u64 {
+    if (!kernel_memory.isGuestRangeAccessible(address, ampr_command_buffer_header_size)) return 0;
+    const storage_address = readGuestU64(address + 0x10);
+    apr.destroyCommandBuffer(address) catch {};
+    const header: *[ampr_command_buffer_header_size]u8 = @ptrFromInt(address);
+    @memset(header, 0);
+    return storage_address;
+}
+
+fn amprCommandBufferDestructor(address: u64) callconv(abi.guest) void {
+    if (!kernel_memory.isGuestRangeAccessible(address, ampr_command_buffer_header_size)) return;
+    apr.destroyCommandBuffer(address) catch {};
+    const header: *[ampr_command_buffer_header_size]u8 = @ptrFromInt(address);
+    @memset(header, 0);
+}
+
+fn amprAprCommandBufferDestructor(address: u64) callconv(abi.guest) void {
+    if (!kernel_memory.isGuestRangeAccessible(address + 0x18, 16)) return;
+    writeGuestU64(address + 0x18, 0);
+    writeGuestU64(address + 0x20, 0);
+}
+
+fn amprCommandBufferGetType(address: u64) callconv(abi.guest) u64 {
+    if (!kernel_memory.isGuestRangeAccessible(address, 4)) return 0;
+    return readGuestU32(address);
+}
+
+fn amprCommandBufferGetSize(address: u64) callconv(abi.guest) u64 {
+    if (!kernel_memory.isGuestRangeAccessible(address + 0x0c, 4)) return 0;
+    return readGuestU32(address + 0x0c);
+}
+
+fn amprCommandBufferGetBufferBaseAddress(address: u64) callconv(abi.guest) u64 {
+    if (!kernel_memory.isGuestRangeAccessible(address + 0x10, 8)) return 0;
+    return readGuestU64(address + 0x10);
+}
+
+fn amprCommandBufferGetNumCommands(address: u64) callconv(abi.guest) u64 {
+    if (!kernel_memory.isGuestRangeAccessible(address + 0x08, 4)) return 0;
+    return readGuestU32(address + 0x08);
+}
+
+fn amprCommandBufferGetCurrentOffset(address: u64) callconv(abi.guest) u64 {
+    if (!kernel_memory.isGuestRangeAccessible(address + 0x04, 4)) return 0;
+    return readGuestU32(address + 0x04);
+}
+
 fn amprAprCommandBufferReadFile(
     address: u64,
     _: u64,
@@ -140,6 +187,74 @@ fn amprAprCommandBufferReadFile(
     @memset(record[0..record_size], 0);
     record[0] = 0x17;
     writeGuestU32(address + 0x00, readGuestU32(address + 0x00) | ampr_gather_scatter_valid);
+    writeGuestU32(address + 0x04, write_offset + record_size);
+    writeGuestU32(address + 0x08, readGuestU32(address + 0x08) +% 1);
+    return errno.ok;
+}
+
+fn amprMeasureCommandSizeReadFile(
+    _: u64,
+    destination: u64,
+    size: u64,
+    file_offset: u64,
+) callconv(abi.guest) u64 {
+    if ((destination == 0 and size != 0) or
+        size > apr.maximum_read_bytes or
+        file_offset >= apr.maximum_file_offset)
+    {
+        return @bitCast(@as(i64, errno.KernelError.einval.raw()));
+    }
+    return if ((file_offset >> 32) != 0) 0x18 else 0x14;
+}
+
+fn amprMeasureCommandSizeWriteKernelEventQueue(
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) u64 {
+    return 0x30;
+}
+
+fn amprCommandBufferWriteKernelEventQueue(
+    address: u64,
+    queue_handle: i64,
+    ident: u64,
+    completion_token: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    if (!kernel_memory.isGuestRangeAccessible(address, ampr_command_buffer_header_size)) {
+        return errno.KernelError.efault.raw();
+    }
+    const record_size: u32 = 0x30;
+    const storage_address = readGuestU64(address + 0x10);
+    const storage_size = readGuestU32(address + 0x0c);
+    const write_offset = readGuestU32(address + 0x04);
+    if (storage_address == 0 or write_offset > storage_size or record_size > storage_size - write_offset) {
+        return errno.KernelError.efault.raw();
+    }
+    const record_address = std.math.add(u64, storage_address, write_offset) catch
+        return errno.KernelError.efault.raw();
+    if (!kernel_memory.isGuestRangeAccessible(record_address, record_size)) {
+        return errno.KernelError.efault.raw();
+    }
+    apr.appendCompletion(address, .{
+        .queue_handle = queue_handle,
+        .ident = ident,
+        .completion_token = completion_token,
+        .user_data = 0,
+    }) catch |err| return aprError(err);
+
+    const record: [*]u8 = @ptrFromInt(record_address);
+    @memset(record[0..record_size], 0);
+    writeGuestU32(record_address + 0x00, 2);
+    @as(*i16, @ptrFromInt(record_address + 0x04)).* = kernel_event_queue.ampr_filter;
+    writeGuestU64(record_address + 0x08, @bitCast(queue_handle));
+    writeGuestU64(record_address + 0x10, ident);
+    writeGuestU64(record_address + 0x18, completion_token);
     writeGuestU32(address + 0x04, write_offset + record_size);
     writeGuestU32(address + 0x08, readGuestU32(address + 0x08) +% 1);
     return errno.ok;
@@ -1443,9 +1558,20 @@ const agc_driver_exports = [_]symbols.Export{
 const ampr_exports = [_]symbols.Export{
     .{ .name = "sceAmprCommandBufferConstructor", .function = trace.wrap("sceAmprCommandBufferConstructor", &amprCommandBufferConstructor), .expect_id = "8aI7R7WaOlc" },
     .{ .name = "sceAmprAprCommandBufferConstructor", .function = trace.wrap("sceAmprAprCommandBufferConstructor", &amprAprCommandBufferConstructor), .expect_id = "a8uLzYY--tM" },
+    .{ .name = "sceAmprCommandBufferDestructor", .function = trace.wrap("sceAmprCommandBufferDestructor", &amprCommandBufferDestructor), .expect_id = "GuchCTefuZw" },
+    .{ .name = "sceAmprAprCommandBufferDestructor", .function = trace.wrap("sceAmprAprCommandBufferDestructor", &amprAprCommandBufferDestructor), .expect_id = "Qs1xtplKo0U" },
     .{ .name = "sceAmprCommandBufferReset", .function = trace.wrap("sceAmprCommandBufferReset", &amprCommandBufferReset), .expect_id = "baQO9ez2gL4" },
     .{ .name = "sceAmprCommandBufferSetBuffer", .function = trace.wrap("sceAmprCommandBufferSetBuffer", &amprCommandBufferSetBuffer), .expect_id = "N-FSPA4S3nI" },
+    .{ .name = "sceAmprCommandBufferClearBuffer", .function = trace.wrap("sceAmprCommandBufferClearBuffer", &amprCommandBufferClearBuffer), .expect_id = "ULvXMDz56po" },
+    .{ .name = "sceAmprCommandBufferGetType", .function = trace.wrap("sceAmprCommandBufferGetType", &amprCommandBufferGetType), .expect_id = "VEDMaQmJZng" },
+    .{ .name = "sceAmprCommandBufferGetSize", .function = trace.wrap("sceAmprCommandBufferGetSize", &amprCommandBufferGetSize), .expect_id = "tZDDEo2tE5k" },
+    .{ .name = "sceAmprCommandBufferGetBufferBaseAddress", .function = trace.wrap("sceAmprCommandBufferGetBufferBaseAddress", &amprCommandBufferGetBufferBaseAddress), .expect_id = "RPCAhx-aabE" },
+    .{ .name = "sceAmprCommandBufferGetNumCommands", .function = trace.wrap("sceAmprCommandBufferGetNumCommands", &amprCommandBufferGetNumCommands), .expect_id = "gzndltBEzWc" },
+    .{ .name = "sceAmprCommandBufferGetCurrentOffset", .function = trace.wrap("sceAmprCommandBufferGetCurrentOffset", &amprCommandBufferGetCurrentOffset), .expect_id = "GnxKOHEawhk" },
     .{ .name = "sceAmprAprCommandBufferReadFile", .function = trace.wrap("sceAmprAprCommandBufferReadFile", &amprAprCommandBufferReadFile), .expect_id = "mQ16-QdKv7k" },
+    .{ .name = "sceAmprMeasureCommandSizeReadFile", .function = trace.wrap("sceAmprMeasureCommandSizeReadFile", &amprMeasureCommandSizeReadFile), .expect_id = "vWU-odnS+fU" },
+    .{ .name = "sceAmprMeasureCommandSizeWriteKernelEventQueue_04_00", .function = trace.wrap("sceAmprMeasureCommandSizeWriteKernelEventQueue_04_00", &amprMeasureCommandSizeWriteKernelEventQueue), .expect_id = "sSAUCCU1dv4" },
+    .{ .name = "sceAmprCommandBufferWriteKernelEventQueue_04_00", .function = trace.wrap("sceAmprCommandBufferWriteKernelEventQueue_04_00", &amprCommandBufferWriteKernelEventQueue), .expect_id = "H896Pt-yB4I" },
 };
 
 pub fn reset() void {

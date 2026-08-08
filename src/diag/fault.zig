@@ -62,9 +62,10 @@ pub const Report = struct {
 /// has to be guarded, because reading unmapped memory while reporting a fault
 /// would fault again and lose the original report.
 fn readGuestWord(address_space: *memory.AddressSpace, address: u64) ?u64 {
-    if (address == 0 or !address_space.isMapped(address, @sizeOf(u64))) return null;
-    const bytes: [*]const u8 = @ptrFromInt(address);
-    return std.mem.readInt(u64, bytes[0..8], .little);
+    if (address == 0) return null;
+    var bytes: [8]u8 = undefined;
+    address_space.read(address, &bytes) catch return null;
+    return std.mem.readInt(u64, &bytes, .little);
 }
 
 /// Copies a run of guest bytes, or null if the range is not fully mapped.
@@ -80,10 +81,7 @@ pub fn readGuestText(
 ) ?[]const u8 {
     if (address == 0 or length == 0) return null;
     const wanted: usize = @intCast(@min(length, buffer.len));
-    if (!address_space.isMapped(address, wanted)) return null;
-
-    const bytes: [*]const u8 = @ptrFromInt(address);
-    @memcpy(buffer[0..wanted], bytes[0..wanted]);
+    address_space.read(address, buffer[0..wanted]) catch return null;
     return buffer[0..wanted];
 }
 

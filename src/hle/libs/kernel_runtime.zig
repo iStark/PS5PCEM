@@ -317,18 +317,20 @@ fn aprResolveFilepathsToIdsAndFileSizes(
     count: u64,
     identifiers_address: u64,
     sizes_address: u64,
-    results_address: u64,
-    option: u64,
+    error_index_address: u64,
 ) callconv(abi.guest) i32 {
-    if (count == 0 or count > 64) return KernelError.einval.raw();
+    if (paths_address == 0 or count == 0 or count > 1024 or
+        (identifiers_address == 0 and sizes_address == 0))
+    {
+        return KernelError.einval.raw();
+    }
     const path_bytes = std.math.mul(u64, count, @sizeOf(u64)) catch return KernelError.einval.raw();
     const identifier_bytes = std.math.mul(u64, count, @sizeOf(u32)) catch return KernelError.einval.raw();
     const size_bytes = std.math.mul(u64, count, @sizeOf(u64)) catch return KernelError.einval.raw();
-    const result_bytes = std.math.mul(u64, count, @sizeOf(i32)) catch return KernelError.einval.raw();
     if (!memory_api.isGuestRangeAccessible(paths_address, path_bytes) or
-        !memory_api.isGuestRangeAccessible(identifiers_address, identifier_bytes) or
-        !memory_api.isGuestRangeAccessible(sizes_address, size_bytes) or
-        !memory_api.isGuestRangeAccessible(results_address, result_bytes))
+        (identifiers_address != 0 and !memory_api.isGuestRangeAccessible(identifiers_address, identifier_bytes)) or
+        (sizes_address != 0 and !memory_api.isGuestRangeAccessible(sizes_address, size_bytes)) or
+        (error_index_address != 0 and !memory_api.isGuestRangeAccessible(error_index_address, @sizeOf(u32))))
     {
         return KernelError.efault.raw();
     }
@@ -337,17 +339,42 @@ fn aprResolveFilepathsToIdsAndFileSizes(
     for (paths[0..@intCast(count)], 0..) |path_address, index| {
         var path_buffer: [apr.maximum_path]u8 = undefined;
         const path = readGuestCString(path_address, &path_buffer) orelse return KernelError.efault.raw();
-        const resolved = apr.resolve(path) catch |err| return aprKernelError(err);
-        const identifier_destination: *[4]u8 = @ptrFromInt(identifiers_address + index * @sizeOf(u32));
-        const size_destination: *[8]u8 = @ptrFromInt(sizes_address + index * @sizeOf(u64));
-        const result_destination: *[4]u8 = @ptrFromInt(results_address + index * @sizeOf(i32));
-        std.mem.writeInt(u32, identifier_destination, resolved.identifier, .little);
-        std.mem.writeInt(u64, size_destination, resolved.size, .little);
-        std.mem.writeInt(i32, result_destination, 0, .little);
-        if (trace.isLive()) {
+        const resolved = apr.resolve(path) catch |err| {
+            // This API stops at the first miss. Its outputs are nevertheless
+            // defined: callers use the zero size to select their ordinary
+            // file-open fallback instead of retaining stack garbage as a size.
+            if (identifiers_address != 0) {
+                const destination: *[4]u8 = @ptrFromInt(identifiers_address + index * @sizeOf(u32));
+                std.mem.writeInt(u32, destination, std.math.maxInt(u32), .little);
+            }
+            if (sizes_address != 0) {
+                const destination: *[8]u8 = @ptrFromInt(sizes_address + index * @sizeOf(u64));
+                std.mem.writeInt(u64, destination, 0, .little);
+            }
+            if (error_index_address != 0) {
+                const destination: *[4]u8 = @ptrFromInt(error_index_address);
+                std.mem.writeInt(u32, destination, @intCast(index), .little);
+            }
+            if (trace.announces("sceKernelAprResolveFilepathsToIdsAndFileSizes")) {
+                std.debug.print(
+                    "[apr resolve {d}] '{s}' failed: {s}\n",
+                    .{ index, path, @errorName(err) },
+                );
+            }
+            return aprKernelError(err);
+        };
+        if (identifiers_address != 0) {
+            const destination: *[4]u8 = @ptrFromInt(identifiers_address + index * @sizeOf(u32));
+            std.mem.writeInt(u32, destination, resolved.identifier, .little);
+        }
+        if (sizes_address != 0) {
+            const destination: *[8]u8 = @ptrFromInt(sizes_address + index * @sizeOf(u64));
+            std.mem.writeInt(u64, destination, resolved.size, .little);
+        }
+        if (trace.announces("sceKernelAprResolveFilepathsToIdsAndFileSizes")) {
             std.debug.print(
-                "[apr resolve {d}] '{s}' -> id={d} size={d} option=0x{x}\n",
-                .{ index, path, resolved.identifier, resolved.size, option },
+                "[apr resolve {d}] '{s}' -> id={d} size={d}\n",
+                .{ index, path, resolved.identifier, resolved.size },
             );
         }
     }
@@ -1151,8 +1178,19 @@ fn setApplicationHeapApi(address: u64) callconv(abi.guest) i32 {
     return errno.ok;
 }
 
-fn sanitizerHooksUnavailable() callconv(abi.guest) ?*anyopaque {
-    return null;
+// The system libc treats these as optional callback tables, not optional table
+// pointers. A null table is dereferenced while it installs the C/C++ allocation
+// layer; the supported "no replacement hooks" state is a valid structure whose
+// size field is populated and whose callback slots are all null.
+var sanitizer_malloc_replace = [_]u64{@sizeOf([14]u64)} ++ [_]u64{0} ** 13;
+var sanitizer_new_replace = [_]u64{@sizeOf([13]u64)} ++ [_]u64{0} ** 12;
+
+fn sanitizerMallocReplaceExternal() callconv(abi.guest) *anyopaque {
+    return @ptrCast(&sanitizer_malloc_replace);
+}
+
+fn sanitizerNewReplaceExternal() callconv(abi.guest) *anyopaque {
+    return @ptrCast(&sanitizer_new_replace);
 }
 
 fn mapNamedFlexibleMemoryInternal(
@@ -1402,7 +1440,7 @@ pub const exports = [_]symbols.Export{
     .{ .name = "nanosleep", .function = trace.wrap("nanosleep", &nanosleep), .expect_id = "yS8U2TGCe1A" },
     .{ .name = "gettimeofday", .function = trace.wrap("gettimeofday", &gettimeofday), .expect_id = "n88vx3C5nW8" },
     .{ .name = "_sceKernelRtldSetApplicationHeapAPI", .function = trace.wrap("_sceKernelRtldSetApplicationHeapAPI", &setApplicationHeapApi), .expect_id = "p5EcQeEeJAE" },
-    .{ .name = "sceKernelGetSanitizerMallocReplaceExternal", .function = trace.wrap("sceKernelGetSanitizerMallocReplaceExternal", &sanitizerHooksUnavailable), .expect_id = "py6L8jiVAN8" },
+    .{ .name = "sceKernelGetSanitizerMallocReplaceExternal", .function = trace.wrap("sceKernelGetSanitizerMallocReplaceExternal", &sanitizerMallocReplaceExternal), .expect_id = "py6L8jiVAN8" },
     .{ .name = "sceKernelInternalMemoryGetModuleSegmentInfo", .function = trace.wrap("sceKernelInternalMemoryGetModuleSegmentInfo", &kernelUnsupported), .expect_id = "-YTW+qXc3CQ" },
     .{ .name = "sceKernelMapNamedFlexibleMemoryInternal", .function = trace.wrap("sceKernelMapNamedFlexibleMemoryInternal", &mapNamedFlexibleMemoryInternal), .expect_id = "4h6F1LLbTiw" },
     .{ .name = "sceKernelMlock", .function = trace.wrap("sceKernelMlock", &compatSuccess), .expect_id = "3k6kx-zOOSQ" },
@@ -1410,7 +1448,7 @@ pub const exports = [_]symbols.Export{
     .{ .name = "_write", .function = trace.wrap("_write", &guestWrite), .expect_id = "FxVZqBAA7ks" },
     .{ .name = "rmdir", .function = trace.wrap("rmdir", &posixUnsupported), .expect_id = "c7ZnT7V1B98" },
     .{ .name = "unlink", .function = trace.wrap("unlink", &posixUnsupported), .expect_id = "VAzswvTOCzI" },
-    .{ .name = "sceKernelGetSanitizerNewReplaceExternal", .function = trace.wrap("sceKernelGetSanitizerNewReplaceExternal", &sanitizerHooksUnavailable), .expect_id = "bnZxYgAFeA0" },
+    .{ .name = "sceKernelGetSanitizerNewReplaceExternal", .function = trace.wrap("sceKernelGetSanitizerNewReplaceExternal", &sanitizerNewReplaceExternal), .expect_id = "bnZxYgAFeA0" },
     .{ .name = "unknown_libkernel_cfwBSQyr5Ys", .function = trace.wrap("unknown_libkernel_cfwBSQyr5Ys", &compatSuccess), .id_override = "cfwBSQyr5Ys" },
     .{ .name = "__tls_get_addr", .function = trace.wrap("__tls_get_addr", &tlsGetAddr), .expect_id = "vNe1w4diLCs" },
     .{ .name = "_sceKernelRtldThreadAtexitIncrement", .function = trace.wrap("_sceKernelRtldThreadAtexitIncrement", &rtldThreadAtexitIncrement), .expect_id = "Tz4RNUCBbGI" },
@@ -1431,7 +1469,6 @@ pub const exports = [_]symbols.Export{
     .{ .name = "clock_gettime", .function = trace.wrap("clock_gettime", &clockGettime), .expect_id = "lLMT9vJAck0" },
     .{ .name = "sceKernelClockGettime", .function = trace.wrap("sceKernelClockGettime", &kernelClockGettime), .expect_id = "QBi7HCK03hw" },
     .{ .name = "sceKernelClose", .function = trace.wrap("sceKernelClose", &kernelUnsupported), .expect_id = "UK2Tl2DWUns" },
-    .{ .name = "sceKernelGetdents", .function = trace.wrap("sceKernelGetdents", &kernelUnsupported), .expect_id = "j2AIqSqJP0w" },
     .{ .name = "sceKernelOpen", .function = trace.wrap("sceKernelOpen", &kernelUnsupported), .expect_id = "1G3lF1Gg1k8" },
     .{ .name = "sceKernelStat", .function = trace.wrap("sceKernelStat", &kernelUnsupported), .expect_id = "eV9wAD2riIA" },
     .{ .name = "sceKernelMkdir", .function = trace.wrap("sceKernelMkdir", &kernelUnsupported), .expect_id = "1-LFLmRFxxM" },
@@ -1491,10 +1528,6 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizesForEach", .function = trace.wrap("sceKernelAprResolveFilepathsWithPrefixToIdsAndFileSizesForEach", &kernelUnsupported), .expect_id = "C+Khtbbx2g8" },
     .{ .name = "sceKernelAprSubmitCommandBuffer", .function = trace.wrap("sceKernelAprSubmitCommandBuffer", &kernelUnsupported), .expect_id = "eE4Szl8sil8" },
     .{ .name = "sceKernelAprSubmitCommandBufferAndGetId", .function = trace.wrap("sceKernelAprSubmitCommandBufferAndGetId", &kernelUnsupported), .expect_id = "qvMUCyyaCSI" },
-
-    // An accelerator event on a queue that will never carry one. Registering
-    // the event would leave a title waiting on something nothing signals.
-    .{ .name = "sceKernelAddAmprEvent", .function = trace.wrap("sceKernelAddAmprEvent", &kernelUnsupported), .expect_id = "bBfz7kMF2Ho" },
 };
 
 pub const unity_exports = [_]symbols.Export{
@@ -1574,6 +1607,19 @@ test "runtime compatibility exports include libc bootstrap data and private NIDs
     try std.testing.expect(db.findById("B2n8aDorSH4", .function) != null);
     try std.testing.expect(db.findByName("sceKernelSyncOnAddressWait", .function) != null);
     try std.testing.expect(db.findByName("sceKernelSyncOnAddressWake", .function) != null);
+}
+
+test "sanitizer replacement queries return sized empty hook tables" {
+    const testing = std.testing;
+    const malloc_hooks: *[14]u64 = @ptrCast(@alignCast(sanitizerMallocReplaceExternal()));
+    const new_hooks: *[13]u64 = @ptrCast(@alignCast(sanitizerNewReplaceExternal()));
+
+    try testing.expectEqual(@as(u64, @sizeOf(@TypeOf(malloc_hooks.*))), malloc_hooks[0]);
+    try testing.expectEqual(@as(u64, @sizeOf(@TypeOf(new_hooks.*))), new_hooks[0]);
+    try testing.expectEqualSlices(u64, &([_]u64{0} ** 13), malloc_hooks[1..]);
+    try testing.expectEqualSlices(u64, &([_]u64{0} ** 12), new_hooks[1..]);
+    try testing.expectEqual(@intFromPtr(malloc_hooks), @intFromPtr(sanitizerMallocReplaceExternal()));
+    try testing.expectEqual(@intFromPtr(new_hooks), @intFromPtr(sanitizerNewReplaceExternal()));
 }
 
 const SyncAddressTestBackend = struct {

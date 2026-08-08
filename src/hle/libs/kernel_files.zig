@@ -152,6 +152,28 @@ fn kernelFstat(descriptor: i32, out: ?*filesystem.Stat) callconv(abi.guest) i32 
     return errno.ok;
 }
 
+fn kernelGetdents(descriptor: i32, buffer: ?[*]u8, length: usize) callconv(abi.guest) i32 {
+    const bytes = writableSlice(buffer, length) orelse return KernelError.efault.raw();
+    const count = filesystem.getDents(descriptor, bytes, null) catch |err| return kernelStatus(err);
+    return @intCast(count);
+}
+
+fn kernelGetdirentries(
+    descriptor: i32,
+    buffer: ?[*]u8,
+    length: usize,
+    base_position: ?*u64,
+) callconv(abi.guest) i32 {
+    const bytes = writableSlice(buffer, length) orelse return KernelError.efault.raw();
+    if (base_position) |position| {
+        if (!memory_api.isGuestRangeAccessible(@intFromPtr(position), @sizeOf(u64))) {
+            return KernelError.efault.raw();
+        }
+    }
+    const count = filesystem.getDents(descriptor, bytes, base_position) catch |err| return kernelStatus(err);
+    return @intCast(count);
+}
+
 /// Writing is refused for every descriptor the filesystem owns.
 fn kernelWrite(_: i32, _: ?[*]const u8, _: usize) callconv(abi.guest) i64 {
     return KernelError.eacces.raw();
@@ -256,6 +278,8 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceKernelLseek", .function = trace.wrap("sceKernelLseek", &kernelLseek), .expect_id = "oib76F-12fk" },
     .{ .name = "sceKernelStat", .function = trace.wrap("sceKernelStat", &kernelStat), .expect_id = "eV9wAD2riIA" },
     .{ .name = "sceKernelFstat", .function = trace.wrap("sceKernelFstat", &kernelFstat), .expect_id = "kBwCPsYX-m4" },
+    .{ .name = "sceKernelGetdents", .function = trace.wrap("sceKernelGetdents", &kernelGetdents), .expect_id = "j2AIqSqJP0w" },
+    .{ .name = "sceKernelGetdirentries", .function = trace.wrap("sceKernelGetdirentries", &kernelGetdirentries), .expect_id = "taRWhTJFTgE" },
     .{ .name = "sceKernelFsync", .function = trace.wrap("sceKernelFsync", &readOnlyStatus), .expect_id = "fTx66l5iWIA" },
     .{ .name = "sceKernelFchmod", .function = trace.wrap("sceKernelFchmod", &readOnlyStatus), .expect_id = "UtszJWHrDcA" },
     .{ .name = "sceKernelFtruncate", .function = trace.wrap("sceKernelFtruncate", &readOnlyStatus), .expect_id = "VW3TVZiM4-E" },

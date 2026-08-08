@@ -7,6 +7,7 @@
 //! services.zig, where it can be read without a thousand lines in the way.
 
 const services = @import("services.zig");
+const platform_services = @import("platform_services.zig");
 const trace = @import("../trace.zig");
 const symbols = @import("../symbols.zig");
 
@@ -398,12 +399,12 @@ pub const playerinvitationdialog_exports = [_]symbols.Export{
 };
 
 pub const rtc_exports = [_]symbols.Export{
-    .{ .name = "sceRtcGetCurrentClockLocalTime", .function = trace.wrap("sceRtcGetCurrentClockLocalTime", &services.absent), .expect_id = "ZPD1YOKI+Kw" },
-    .{ .name = "sceRtcSetTick", .function = trace.wrap("sceRtcSetTick", &services.absent), .expect_id = "ueega6v3GUw" },
-    .{ .name = "sceRtcGetTickResolution", .function = trace.wrap("sceRtcGetTickResolution", &services.absent), .expect_id = "jMNwqYr4R-k" },
-    .{ .name = "sceRtcIsLeapYear", .function = trace.wrap("sceRtcIsLeapYear", &services.absent), .expect_id = "Ug8pCwQvh0c" },
-    .{ .name = "sceRtcGetDayOfWeek", .function = trace.wrap("sceRtcGetDayOfWeek", &services.absent), .expect_id = "CyIK-i4XdgQ" },
-    .{ .name = "sceRtcGetTick", .function = trace.wrap("sceRtcGetTick", &services.absent), .expect_id = "8w-H19ip48I" },
+    .{ .name = "sceRtcGetCurrentClockLocalTime", .function = trace.wrap("sceRtcGetCurrentClockLocalTime", &platform_services.rtcGetCurrentClockLocalTime), .expect_id = "ZPD1YOKI+Kw" },
+    .{ .name = "sceRtcSetTick", .function = trace.wrap("sceRtcSetTick", &platform_services.rtcSetTick), .expect_id = "ueega6v3GUw" },
+    .{ .name = "sceRtcGetTickResolution", .function = trace.wrap("sceRtcGetTickResolution", &platform_services.rtcGetTickResolution), .expect_id = "jMNwqYr4R-k" },
+    .{ .name = "sceRtcIsLeapYear", .function = trace.wrap("sceRtcIsLeapYear", &platform_services.rtcIsLeapYear), .expect_id = "Ug8pCwQvh0c" },
+    .{ .name = "sceRtcGetDayOfWeek", .function = trace.wrap("sceRtcGetDayOfWeek", &platform_services.rtcGetDayOfWeek), .expect_id = "CyIK-i4XdgQ" },
+    .{ .name = "sceRtcGetTick", .function = trace.wrap("sceRtcGetTick", &platform_services.rtcGetTick), .expect_id = "8w-H19ip48I" },
 };
 
 pub const savedatadialog_native_exports = [_]symbols.Export{

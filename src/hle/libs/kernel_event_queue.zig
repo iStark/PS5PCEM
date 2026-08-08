@@ -16,6 +16,7 @@ const maximum_queues = 64;
 const maximum_events = 64;
 const user_filter: i16 = -11;
 const timer_filter: i16 = -7;
+pub const ampr_filter: i16 = -16;
 pub const video_out_filter: i16 = -13;
 pub const video_out_flip_ident: u64 = 6;
 /// Distinct from flip; only distinctness matters for GetEventId.
@@ -137,6 +138,60 @@ fn addUserEventEdge(handle: i64, id: i32) callconv(abi.guest) i32 {
 /// itself. Recording which kind was asked for is the whole distinction.
 fn addUserEvent(handle: i64, id: i32) callconv(abi.guest) i32 {
     return addRegistration(handle, id, .{ .edge = false });
+}
+
+fn addAmprEvent(handle: i64, id: u32, user_data: u64) callconv(abi.guest) i32 {
+    return addRegistration(handle, @bitCast(id), .{
+        .edge = true,
+        .filter = ampr_filter,
+        .user_data = user_data,
+    });
+}
+
+fn deleteAmprEvent(handle: i64, id: u32) callconv(abi.guest) i32 {
+    lock.lock();
+    defer lock.unlock();
+    const queue = findQueue(handle) orelse return KernelError.ebadf.raw();
+    const ident: u64 = @bitCast(@as(i64, @as(i32, @bitCast(id))));
+    for (&queue.registrations) |*registration| {
+        if (!registration.active or registration.ident != ident or registration.filter != ampr_filter) continue;
+        registration.* = .{};
+        return errno.ok;
+    }
+    return KernelError.enoent.raw();
+}
+
+fn triggerAmprCompletion(command: @import("../apr.zig").CompletionCommand) bool {
+    lock.lock();
+    const queue = findQueue(command.queue_handle) orelse {
+        lock.unlock();
+        return false;
+    };
+    var registered = false;
+    for (queue.registrations) |registration| {
+        if (registration.active and registration.ident == command.ident and registration.filter == ampr_filter) {
+            registered = true;
+            break;
+        }
+    }
+    if (!registered or queue.pending_count == maximum_events) {
+        lock.unlock();
+        return false;
+    }
+    const index = (queue.pending_head + queue.pending_count) % maximum_events;
+    queue.pending[index] = .{
+        .ident = command.ident,
+        .filter = ampr_filter,
+        .flags = event_clear,
+        .data = @bitCast(command.completion_token),
+        .user_data = command.user_data,
+    };
+    queue.pending_count += 1;
+    queue.sequence +%= 1;
+    const sequence = queue.sequence;
+    lock.unlock();
+    threading.wakeWaiters(waitKey(command.queue_handle), sequence, 1);
+    return true;
 }
 
 const RegistrationOptions = struct {
@@ -617,6 +672,8 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceKernelDeleteUserEvent", .function = trace.wrap("sceKernelDeleteUserEvent", &deleteUserEvent), .expect_id = "LJDwdSNTnDg" },
     .{ .name = "sceKernelAddUserEvent", .function = trace.wrap("sceKernelAddUserEvent", &addUserEvent), .expect_id = "4R6-OvI2cEA" },
     .{ .name = "sceKernelAddTimerEvent", .function = trace.wrap("sceKernelAddTimerEvent", &addTimerEvent), .expect_id = "57ZK+ODEXWY" },
+    .{ .name = "sceKernelAddAmprEvent", .function = trace.wrap("sceKernelAddAmprEvent", &addAmprEvent), .expect_id = "bBfz7kMF2Ho" },
+    .{ .name = "sceKernelDeleteAmprEvent", .function = trace.wrap("sceKernelDeleteAmprEvent", &deleteAmprEvent), .expect_id = "bMmid3pfyjo" },
     .{ .name = "sceKernelGetEventData", .function = trace.wrap("sceKernelGetEventData", &getEventData), .expect_id = "kwGyyjohI50" },
     .{ .name = "sceKernelGetEventUserData", .function = trace.wrap("sceKernelGetEventUserData", &getEventUserData), .expect_id = "vz+pg2zdopI" },
     .{ .name = "kevent", .function = trace.wrap("kevent", &kevent), .expect_id = "RW-GEfpnsqg" },
@@ -626,6 +683,7 @@ pub const library = symbols.Library{ .name = "libkernel", .version = 1 };
 pub const module = symbols.Module{ .name = "libkernel", .version_major = 1, .version_minor = 1 };
 
 pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {
+    @import("../apr.zig").attachCompletionSink(&triggerAmprCompletion);
     try db.addLibrary(gpa, library, module, &exports);
 }
 

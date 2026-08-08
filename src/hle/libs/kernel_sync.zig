@@ -16,6 +16,7 @@ const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const threading = @import("kernel_threading.zig");
 const runtime_api = @import("kernel_runtime.zig");
+const kernel_memory = @import("kernel_memory.zig");
 
 const KernelError = errno.KernelError;
 const Posix = errno.Posix;
@@ -557,6 +558,9 @@ fn mutexLockCore(
     absolute_deadline_ns: ?u64,
 ) Error!void {
     const handle = outer orelse return error.InvalidArgument;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(handle), @sizeOf(MutexHandle))) {
+        return error.InvalidArgument;
+    }
     const manager = activeManager() orelse return error.NotAttached;
     const thread_id = try currentThread();
     const object = try manager.lockMutex(handle);
@@ -617,6 +621,9 @@ fn mutexLockCore(
 
 fn mutexUnlockCore(outer: ?*MutexHandle) Error!void {
     const handle = outer orelse return error.InvalidArgument;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(handle), @sizeOf(MutexHandle))) {
+        return error.InvalidArgument;
+    }
     const manager = activeManager() orelse return error.NotAttached;
     const thread_id = try currentThread();
     const object = try manager.lockMutex(handle);
@@ -1609,4 +1616,3 @@ test "synchronization exports register under published identifiers" {
     try testing.expect(db.findById("27bAgiJmOh0", .function) != null);
     try testing.expect(db.findById("1471ajPzxh0", .function) != null);
 }
-

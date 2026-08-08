@@ -31,12 +31,28 @@ Vulkan.
 - PS VR2 libraries currently expose only compatibility/no-device behavior.
   VR plugins can initialize far enough to load Unity assets, but headset
   rendering, tracking, controllers, and a host OpenXR bridge do not exist yet.
+- An Unreal Engine PS5 bootstrap can mount a multi-gigabyte PAK, initialize ICU,
+  load cooked configuration and shader archives, create AGC shaders, and submit
+  its first graphics command buffer. Synchronization-only AGC constructors are
+  still placeholders, so this path does not produce a VR frame yet.
 
 ![Live gameplay rendered by PS5PCEM](docs/images/live-gameplay.png)
 
 *A live gameplay frame produced by the current guest VS/PS and sampled-texture
 path. The HUD, character, and background come from title data; the red color
 shows the remaining render-state and surface-format work.*
+
+### Observed title milestones
+
+These are development captures, not compatibility ratings. They describe the
+furthest repeatable point reached with legally supplied local title content;
+the repository contains none of that content.
+
+| Title | Observed milestone | Current limit |
+|---|---|---|
+| **Terminator 2D: No Fate** | Reaches gameplay and renders title-provided backgrounds, characters, HUD elements, and textures | Frame pacing, color channels, depth/composition, compression metadata, and several layouts remain incomplete |
+| **Pistol Whip** | Maps the native PS VR2 plugin and Burst module, then starts loading Unity asset archives | Headset, tracking, controller, and host OpenXR support are intentionally deferred |
+| **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | The initial synchronization DCB contains placeholder fence/event commands, so startup waits before VideoOut or VR presentation |
 
 ## Components
 
@@ -712,7 +728,8 @@ intervals in the implementation:
 | System managed | `0x00_0004_0000 .. 0x07_FFFF_C000` | just under 32 GiB |
 | System reserved | `0x08_0000_0000 .. 0x0F_C000_0000` | 31 GiB |
 | Device | `0x0F_E000_0000 .. 0x0F_F000_0000` | 256 MiB |
-| User | `0x70_0000_0000 .. 0xFC_0000_0000` | 560 GiB |
+| User (Windows/Linux) | `0x10_0000_0000 .. 0xFC_0000_0000` | 944 GiB |
+| User (macOS) | `0x70_0000_0000 .. 0xFC_0000_0000` | 560 GiB |
 
 These are reservations, not allocations of physical RAM. Pages are committed
 in 16 KiB units only when `mapFixed` or `map` creates a guest mapping. `unmap`
@@ -1136,9 +1153,11 @@ parallel HLE libc. Its 120 lower-level imports resolve through a focused
 libkernel bridge plus `libSceLibcInternalExt` and `libSceSysmodule`. Data imports
 such as `__stack_chk_guard` and `__progname` are registered as storage addresses,
 not function stubs. Runtime hooks provide per-thread errno/TLS, clocks, sleep,
-process parameters, sanitizer opt-out records, and rtld callbacks. Operations
-whose backing subsystem is not implemented yet return `ENOSYS` or `ENOENT`
-instead of reporting false success.
+process parameters, sized empty sanitizer callback tables, and rtld callbacks.
+Owner-aware `__cxa_guard_acquire`, `release`, and `abort` handling prevents a
+recursive static initializer from deadlocking the guest while preserving the
+one-initializer contract. Operations whose backing subsystem is not implemented
+yet return `ENOSYS` or `ENOENT` instead of reporting false success.
 
 The Unity support PRXs also receive the small `libkernel_unity`, `libScePosix`,
 RTC, system-parameter, app-content, and network-control bootstrap surface they
@@ -1169,14 +1188,21 @@ and their waits use the same sequence-aware dispatcher contract as pthread
 synchronization. VideoOut filter `-13` and graphics filter `-14` use that same
 queue implementation, preserving each registration's identifier and user data.
 Main direct-memory allocation, named direct mappings, stack queries, and live
-pthread scheduling metadata are also exposed. The APR/AMPR path now owns a
-read-only file registry and command-buffer lifecycle: it resolves guest paths to
-stable IDs and sizes, records reads with their 64-bit file offsets, submits them
-synchronously into checked guest memory, permits the short read expected at EOF,
-and reports completion once through the matching wait. Malformed headers,
-oversized transfers and invalid IDs are rejected rather than reported as
-successful I/O. The implementation is in
-[src/hle/apr.zig](src/hle/apr.zig) and the guest ABI wrappers remain in
+pthread scheduling metadata are also exposed. `sceKernelBatchMap` applies
+checked direct/flexible map, unmap, and protection batches with the 32-byte PS5
+entry layout used by Unreal Engine. RTC entry points provide coherent UTC/local
+clocks, tick conversion, resolution, leap-year, and day-of-week results.
+
+The APR/AMPR path now owns a read-only file registry and complete command-buffer
+lifecycle: it resolves guest paths to stable IDs and sizes, records reads with
+their 64-bit file offsets, submits them synchronously into checked guest memory,
+permits the short read expected at EOF, and delivers completion through the
+registered AMPR event queue. A failed path resolution writes the ABI-defined
+sentinels (`id = 0xffffffff`, `size = 0`, and the failing index), allowing an
+engine to take its loose-file fallback without treating uninitialized memory as
+a multi-gigabyte allocation. Malformed headers, oversized transfers and invalid
+IDs are rejected rather than reported as successful I/O. The implementation is
+in [src/hle/apr.zig](src/hle/apr.zig) and the guest ABI wrappers remain in
 [src/hle/libs/kernel_runtime.zig](src/hle/libs/kernel_runtime.zig) and
 [src/hle/libs/bootstrap_services.zig](src/hle/libs/bootstrap_services.zig).
 
@@ -1262,6 +1288,11 @@ a title never proceeds believing its data was stored. Each descriptor carries
 its own position and reads positionally, so two descriptors on one file cannot
 disturb each other, and a descriptor closed during a read cannot have a reused
 slot's position corrupted afterwards.
+
+Directories are first-class descriptors rather than failed file opens.
+`sceKernelGetdents` and `sceKernelGetdirentries` emit fixed 512-byte PS5/BSD
+records with stable names and types, which lets cooked engines enumerate their
+content and configuration trees through the same confined `/app0` mount.
 
 Device nodes share that namespace because that is how a title reaches them, but
 they are answered here rather than from the host, which has no such devices.
@@ -1486,6 +1517,16 @@ plugin's initial configuration setters, and begins loading `unity_builtin_extra`
 submission: HMD, tracker, and VR-controller calls intentionally report no
 device, and there is no host headset integration. VR compatibility is therefore
 deferred until the non-VR graphics and synchronization paths are stable.
+
+An Unreal Engine PS VR2 bring-up now reserves the larger PS5 user address
+window, initializes the real system libc in inferred guest-import dependency
+order, maps memory in batches, enumerates content, mounts its 8.8 GiB PAK through
+APR/AMPR, and passes ICU initialization. It loads cooked configuration and the
+Global shader archive, creates AGC shader objects, and submits its initial DCB.
+That DCB currently contains synchronization commands whose HLE constructors are
+still fixed-size no-operations; without their release/event payloads no fence is
+published, so the title waits before its first VideoOut or VR frame. This is the
+next graphics boundary, not an I/O or memory-exhaustion failure.
 
 ## Error codes
 
@@ -1782,12 +1823,15 @@ first; identifier-only lookup remains the documented fallback for incomplete
 module metadata. [src/runtime/module_graph.zig](src/runtime/module_graph.zig)
 recursively indexes adjacent `.prx`/`.sprx` files, follows both `DT_NEEDED` and
 PS5 needed-module declarations, maps the complete reachable graph, and only then
-relocates it. Explicit preload roots extend that graph for plugins the title
-will request later. Missing files remain firmware/HLE dependencies. The
-resulting module list is already in dependency-first initializer order and
-publishes per-module export ownership for `sceKernelDlsym`. Optional graph
-diagnostics report every unresolved strong import in the node that stops
-linking; the `graph-info` tool enables them by default.
+relocates it. After all guest exports are published, resolved imports add
+provider edges that filenames alone cannot express (for example a short
+`libc.prx` filename exporting the `libSceLibcInternal` module). Explicit preload
+roots extend that graph for plugins the title will request later. Missing files
+remain firmware/HLE dependencies. The resulting module list is already in
+dependency-first initializer order and publishes per-module export ownership
+for `sceKernelDlsym`. Optional graph diagnostics report every unresolved strong
+import in the node that stops linking; the `graph-info` tool enables them by
+default.
 
 `game-run` continues from that verified graph, creates the optional Win32 Vulkan
 presentation session, installs it behind the live AGC scheduler, initializes

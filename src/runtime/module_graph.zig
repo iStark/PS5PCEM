@@ -372,7 +372,6 @@ pub fn loadFromDir(
         }
     }
 
-    try buildInitializationOrder(&graph);
     try prepareAll(
         &graph,
         address_space,
@@ -380,6 +379,8 @@ pub fn loadFromDir(
         guest_exports,
         options,
     );
+    try inferGuestDependencies(&graph, guest_exports);
+    try buildInitializationOrder(&graph);
     try linkAll(&graph, resolver, options.diagnostics);
 
     try graph.module_images.ensureTotalCapacity(gpa, graph.initialization_order.items.len);
@@ -466,6 +467,46 @@ fn appendDependency(graph: *ModuleGraph, owner: usize, dependency: usize) !void 
         if (existing == dependency) return;
     }
     try graph.nodes.items[owner].dependencies.append(graph.allocator, dependency);
+}
+
+/// Adds the dependencies which PS5 import metadata cannot express as a file
+/// edge. Some firmware modules are shipped under a short filename but export
+/// a different public module name (notably libc.prx/libSceLibcInternal), so a
+/// filename-only graph can otherwise run a consumer's initializer first.
+///
+/// Every image has already published its guest exports during prepareAll. Use
+/// the same exact-then-NID-fallback lookup as relocation, then attribute the
+/// resolved address back to its mapped provider.
+fn inferGuestDependencies(
+    graph: *ModuleGraph,
+    guest_exports: *loader.GuestExportRegistry,
+) !void {
+    for (graph.nodes.items, 0..) |*node, owner_index| {
+        var module_imports = try loader.collectImports(
+            graph.allocator,
+            node.image,
+            &node.dynamic_info,
+        );
+        defer module_imports.deinit(graph.allocator);
+
+        for (module_imports.items.items) |*import| {
+            if (import.symbol_type == .tls) continue;
+            const address = guest_exports.resolveExact(import) orelse
+                guest_exports.resolveById(import) orelse continue;
+            const provider_index = findPreparedProvider(graph, address) orelse continue;
+            try appendDependency(graph, owner_index, provider_index);
+        }
+    }
+}
+
+fn findPreparedProvider(graph: *const ModuleGraph, address: u64) ?usize {
+    for (graph.nodes.items, 0..) |node, index| {
+        const prepared = node.prepared orelse continue;
+        for (prepared.mapped.ranges.items) |range| {
+            if (address >= range.start and address < range.end) return index;
+        }
+    }
+    return null;
 }
 
 const Visit = enum { unseen, active, complete };

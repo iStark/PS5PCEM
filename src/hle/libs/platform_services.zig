@@ -9,10 +9,25 @@ const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const kernel_runtime = @import("kernel_runtime.zig");
+const kernel_memory = @import("kernel_memory.zig");
 
 const rtc_unix_epoch_microseconds: i96 = 62_135_596_800 * std.time.us_per_s;
+const rtc_error_invalid_pointer: i32 = @bitCast(@as(u32, 0x80b5_0002));
+const rtc_error_invalid_value: i32 = @bitCast(@as(u32, 0x80b5_0004));
+const rtc_error_invalid_year: i32 = @bitCast(@as(u32, 0x80b5_0008));
+const gen2_error_memory_fault: i32 = @bitCast(@as(u32, 0x8002_0101));
 const net_ctl_error_invalid_address: i32 = @bitCast(@as(u32, 0x8041_2107));
 const net_ctl_error_not_connected: i32 = @bitCast(@as(u32, 0x8041_2108));
+
+pub const RtcDateTime = extern struct {
+    year: u16,
+    month: u16,
+    day: u16,
+    hour: u16,
+    minute: u16,
+    second: u16,
+    microsecond: u32,
+};
 
 fn appContentInitialize(_: ?*const anyopaque, boot_param: ?*[40]u8) callconv(abi.guest) i32 {
     if (boot_param) |output| @memset(output, 0);
@@ -95,6 +110,137 @@ fn rtcGetCurrentTick(output: ?*u64) callconv(abi.guest) i32 {
     return errno.ok;
 }
 
+fn validRtcDateTime(value: RtcDateTime) bool {
+    if (value.year < 1 or value.year > 9999 or value.month < 1 or value.month > 12) return false;
+    if (value.hour > 23 or value.minute > 59 or value.second > 59 or value.microsecond >= std.time.us_per_s) return false;
+    const month: std.time.epoch.Month = @enumFromInt(value.month);
+    return value.day >= 1 and value.day <= std.time.epoch.getDaysInMonth(value.year, month);
+}
+
+/// Number of days since 1970-01-01. This is Howard Hinnant's civil-calendar
+/// conversion, expressed with floor division so years before 1970 work too.
+fn daysFromCivil(year_value: i64, month_value: i64, day_value: i64) i64 {
+    var year = year_value;
+    if (month_value <= 2) year -= 1;
+    const era = @divFloor(year, 400);
+    const year_of_era = year - era * 400;
+    const shifted_month = month_value + (if (month_value > 2) @as(i64, -3) else 9);
+    const day_of_year = @divFloor(153 * shifted_month + 2, 5) + day_value - 1;
+    const day_of_era = year_of_era * 365 + @divFloor(year_of_era, 4) - @divFloor(year_of_era, 100) + day_of_year;
+    return era * 146_097 + day_of_era - 719_468;
+}
+
+fn civilFromDays(days_since_unix_epoch: i64) RtcDateTime {
+    const adjusted = days_since_unix_epoch + 719_468;
+    const era = @divFloor(adjusted, 146_097);
+    const day_of_era = adjusted - era * 146_097;
+    const year_of_era = @divFloor(
+        day_of_era - @divFloor(day_of_era, 1460) + @divFloor(day_of_era, 36_524) - @divFloor(day_of_era, 146_096),
+        365,
+    );
+    var year = year_of_era + era * 400;
+    const day_of_year = day_of_era - (365 * year_of_era + @divFloor(year_of_era, 4) - @divFloor(year_of_era, 100));
+    const month_piece = @divFloor(5 * day_of_year + 2, 153);
+    const day = day_of_year - @divFloor(153 * month_piece + 2, 5) + 1;
+    const month = month_piece + (if (month_piece < 10) @as(i64, 3) else -9);
+    if (month <= 2) year += 1;
+    return .{
+        .year = @intCast(year),
+        .month = @intCast(month),
+        .day = @intCast(day),
+        .hour = 0,
+        .minute = 0,
+        .second = 0,
+        .microsecond = 0,
+    };
+}
+
+fn rtcDateTimeFromTick(tick: u64) ?RtcDateTime {
+    const unix_microseconds: i128 = @as(i128, tick) - rtc_unix_epoch_microseconds;
+    const microseconds_per_day: i128 = std.time.us_per_day;
+    const days = @divFloor(unix_microseconds, microseconds_per_day);
+    if (days < std.math.minInt(i64) or days > std.math.maxInt(i64)) return null;
+
+    var result = civilFromDays(@intCast(days));
+    if (result.year < 1 or result.year > 9999) return null;
+    const into_day: u64 = @intCast(@mod(unix_microseconds, microseconds_per_day));
+    result.hour = @intCast(into_day / std.time.us_per_hour);
+    result.minute = @intCast((into_day % std.time.us_per_hour) / std.time.us_per_min);
+    result.second = @intCast((into_day % std.time.us_per_min) / std.time.us_per_s);
+    result.microsecond = @intCast(into_day % std.time.us_per_s);
+    return result;
+}
+
+fn tickFromRtcDateTime(value: RtcDateTime) ?u64 {
+    if (!validRtcDateTime(value)) return null;
+    const days: i128 = daysFromCivil(value.year, value.month, value.day);
+    const tick: i128 = rtc_unix_epoch_microseconds +
+        days * std.time.us_per_day +
+        @as(i128, value.hour) * std.time.us_per_hour +
+        @as(i128, value.minute) * std.time.us_per_min +
+        @as(i128, value.second) * std.time.us_per_s +
+        value.microsecond;
+    if (tick < 0 or tick > std.math.maxInt(u64)) return null;
+    return @intCast(tick);
+}
+
+fn checkedRtcOutput(output: ?*RtcDateTime) ?*RtcDateTime {
+    const destination = output orelse return null;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(destination), @sizeOf(RtcDateTime))) return null;
+    return destination;
+}
+
+pub fn rtcGetCurrentClockLocalTime(output: ?*RtcDateTime) callconv(abi.guest) i32 {
+    const destination = output orelse return rtc_error_invalid_pointer;
+    if (checkedRtcOutput(destination) == null) return gen2_error_memory_fault;
+    const unix_nanoseconds = @max(@as(i96, 0), kernel_runtime.realTimeNanoseconds());
+    const unix_microseconds: u64 = @intCast(@divTrunc(unix_nanoseconds, std.time.ns_per_us));
+    destination.* = rtcDateTimeFromTick(@intCast(rtc_unix_epoch_microseconds + unix_microseconds)) orelse
+        return rtc_error_invalid_value;
+    return errno.ok;
+}
+
+pub fn rtcSetTick(output: ?*RtcDateTime, tick_pointer: ?*const u64) callconv(abi.guest) i32 {
+    const destination = output orelse return rtc_error_invalid_pointer;
+    const source = tick_pointer orelse return rtc_error_invalid_pointer;
+    if (checkedRtcOutput(destination) == null or
+        !kernel_memory.isGuestRangeAccessible(@intFromPtr(source), @sizeOf(u64)))
+    {
+        return gen2_error_memory_fault;
+    }
+    destination.* = rtcDateTimeFromTick(source.*) orelse return rtc_error_invalid_value;
+    return errno.ok;
+}
+
+pub fn rtcGetTickResolution() callconv(abi.guest) u64 {
+    return std.time.us_per_s;
+}
+
+pub fn rtcIsLeapYear(year: i32) callconv(abi.guest) i32 {
+    if (year < 1 or year > 9999) return rtc_error_invalid_year;
+    return @intFromBool(std.time.epoch.isLeapYear(@intCast(year)));
+}
+
+pub fn rtcGetDayOfWeek(year: i32, month: i32, day: i32) callconv(abi.guest) i32 {
+    if (year < 1 or year > 9999 or month < 1 or month > 12 or day < 1) return rtc_error_invalid_value;
+    const month_enum: std.time.epoch.Month = @enumFromInt(@as(u4, @intCast(month)));
+    if (day > std.time.epoch.getDaysInMonth(@intCast(year), month_enum)) return rtc_error_invalid_value;
+    // The firmware uses Sunday=0; 1970-01-01 was Thursday=4.
+    return @intCast(@mod(daysFromCivil(year, month, day) + 4, 7));
+}
+
+pub fn rtcGetTick(time_pointer: ?*const RtcDateTime, output: ?*u64) callconv(abi.guest) i32 {
+    const source = time_pointer orelse return rtc_error_invalid_pointer;
+    const destination = output orelse return rtc_error_invalid_pointer;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(source), @sizeOf(RtcDateTime)) or
+        !kernel_memory.isGuestRangeAccessible(@intFromPtr(destination), @sizeOf(u64)))
+    {
+        return gen2_error_memory_fault;
+    }
+    destination.* = tickFromRtcDateTime(source.*) orelse return rtc_error_invalid_value;
+    return errno.ok;
+}
+
 const app_content_exports = [_]symbols.Export{
     .{ .name = "sceAppContentInitialize", .function = trace.wrap("sceAppContentInitialize", &appContentInitialize), .expect_id = "R9lA82OraNs" },
     .{ .name = "sceAppContentTemporaryDataMount2", .function = trace.wrap("sceAppContentTemporaryDataMount2", &temporaryDataMount2), .expect_id = "buYbeLOGWmA" },
@@ -146,6 +292,23 @@ test "Unity bootstrap platform services register" {
     try register(&db, std.testing.allocator);
     try std.testing.expect(db.findByName("sceAppContentInitialize", .function) != null);
     try std.testing.expect(db.findByName("sceRtcGetCurrentTick", .function) != null);
+}
+
+test "RTC calendar and tick conversions preserve subsecond time" {
+    const date = RtcDateTime{
+        .year = 2024,
+        .month = 2,
+        .day = 29,
+        .hour = 23,
+        .minute = 58,
+        .second = 57,
+        .microsecond = 654_321,
+    };
+    const tick = tickFromRtcDateTime(date) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualDeep(date, rtcDateTimeFromTick(tick).?);
+    try std.testing.expectEqual(@as(i32, 4), rtcGetDayOfWeek(1970, 1, 1));
+    try std.testing.expectEqual(@as(i32, 1), rtcIsLeapYear(2024));
+    try std.testing.expectEqual(@as(i32, 0), rtcIsLeapYear(2023));
 }
 
 test "network control reports a coherent disconnected console" {

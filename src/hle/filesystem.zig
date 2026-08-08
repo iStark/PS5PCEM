@@ -226,6 +226,11 @@ pub fn stripMount(path: []const u8) ?[]const u8 {
 const OpenFile = struct {
     /// Null for a device node, which has no host file behind it.
     file: ?std.Io.File = null,
+    /// Directory descriptors retain their iterator between getdents calls.
+    directory: ?std.Io.Dir = null,
+    directory_iterator: ?std.Io.Dir.Iterator = null,
+    /// The first two directory entries are synthesized as `.` and `..`.
+    directory_index: u64 = 0,
     device: ?Device = null,
     /// In-memory payload for synthesised files (FSB-backed virtual WAVs).
     /// Owned by this descriptor; freed on close via page_allocator.
@@ -280,6 +285,7 @@ pub fn detach() void {
         for (&open_files) |*slot| {
             if (slot.*) |entry| {
                 if (entry.file) |file| file.close(io);
+                if (entry.directory) |directory| directory.close(io);
             }
             slot.* = null;
         }
@@ -357,10 +363,7 @@ pub fn open(path: []const u8, flags: i32) Error!i32 {
     const relative = stripMount(path) orelse return Error.NotFound;
     if (relative.len > maximum_path) return Error.InvalidArgument;
 
-    // A directory open needs directory reads to be useful, which do not exist
-    // yet; saying so is better than handing back a descriptor that cannot be
-    // read.
-    if (flags & O.directory != 0) return Error.IsDirectory;
+    if (flags & O.directory != 0) return openDirectory(path, relative, io, directory);
 
     const file = directory.openFile(io, relative, .{}) catch |err| switch (err) {
         error.FileNotFound, error.NotDir, error.BadPathName => {
@@ -368,7 +371,7 @@ pub fn open(path: []const u8, flags: i32) Error!i32 {
             // extracted from FSB5 banks inside resources.resource instead.
             return openVirtualAudio(path, relative, io, directory);
         },
-        error.IsDir => return Error.IsDirectory,
+        error.IsDir => return openDirectory(path, relative, io, directory),
         else => return Error.IoFailed,
     };
     errdefer file.close(io);
@@ -381,6 +384,35 @@ pub fn open(path: []const u8, flags: i32) Error!i32 {
     for (&open_files, 0..) |*slot, index| {
         if (slot.* != null) continue;
         var entry = OpenFile{ .file = file, .size = size };
+        entry.path_length = @min(path.len, maximum_path);
+        @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
+        slot.* = entry;
+        return first_descriptor + @as(i32, @intCast(index));
+    }
+    return Error.TooManyOpenFiles;
+}
+
+fn openDirectory(
+    path: []const u8,
+    relative: []const u8,
+    io: std.Io,
+    root_directory: std.Io.Dir,
+) Error!i32 {
+    var directory = root_directory.openDir(io, relative, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir, error.BadPathName => return Error.NotFound,
+        else => return Error.IoFailed,
+    };
+    errdefer directory.close(io);
+    const iterator = directory.iterateAssumeFirstIteration();
+
+    table_lock.lock();
+    defer table_lock.unlock();
+    for (&open_files, 0..) |*slot, index| {
+        if (slot.* != null) continue;
+        var entry = OpenFile{
+            .directory = directory,
+            .directory_iterator = iterator,
+        };
         entry.path_length = @min(path.len, maximum_path);
         @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
         slot.* = entry;
@@ -453,6 +485,10 @@ pub fn close(descriptor: i32) Error!void {
         const io = active_io orelse return Error.NotAttached;
         file.close(io);
     }
+    if (entry.directory) |directory| {
+        const io = active_io orelse return Error.NotAttached;
+        directory.close(io);
+    }
     if (entry.memory) |memory| {
         std.heap.page_allocator.free(memory);
     }
@@ -472,6 +508,10 @@ pub fn read(descriptor: i32, buffer: []u8) Error!usize {
     }
     const offset = slot.*.?.offset;
     const device = slot.*.?.device;
+    if (slot.*.?.directory != null) {
+        table_lock.unlock();
+        return Error.NotSupported;
+    }
     if (slot.*.?.memory) |memory| {
         table_lock.unlock();
         if (offset >= memory.len) return 0;
@@ -525,6 +565,7 @@ pub fn pread(descriptor: i32, buffer: []u8, offset: u64) Error!usize {
     };
     table_lock.unlock();
 
+    if (entry.directory != null) return Error.NotSupported;
     if (entry.memory) |memory| {
         if (offset >= memory.len) return 0;
         const available = memory.len - offset;
@@ -549,7 +590,7 @@ pub fn seek(descriptor: i32, offset: i64, whence: i32) Error!i64 {
     const slot = slotOf(descriptor) orelse return Error.BadDescriptor;
     const entry = if (slot.*) |*value| value else return Error.BadDescriptor;
     // A device has no contents to hold a position in.
-    if (entry.device != null) return Error.NotSupported;
+    if (entry.device != null or entry.directory != null) return Error.NotSupported;
 
     const base: i64 = switch (whence) {
         Seek.set => 0,
@@ -618,7 +659,53 @@ pub fn fstat(descriptor: i32, out: *Stat) Error!void {
         fillDeviceStat(out);
         return;
     }
-    fillStat(out, entry.size, false);
+    fillStat(out, entry.size, entry.directory != null);
+}
+
+fn directoryEntryHash(name: []const u8) u32 {
+    var hash: u32 = 2_166_136_261;
+    for (name) |byte| {
+        hash ^= byte;
+        hash *%= 16_777_619;
+    }
+    return hash;
+}
+
+/// Writes one PS5/BSD directory record. The ABI uses a fixed 512-byte record:
+/// inode, record length, type, name length, then a zero-terminated name.
+pub fn getDents(descriptor: i32, buffer: []u8, base_position: ?*u64) Error!usize {
+    if (buffer.len < 512) return Error.InvalidArgument;
+    const io = active_io orelse return Error.NotAttached;
+
+    table_lock.lock();
+    defer table_lock.unlock();
+    const slot = slotOf(descriptor) orelse return Error.BadDescriptor;
+    const entry = if (slot.*) |*value| value else return Error.BadDescriptor;
+    if (entry.directory == null) return Error.InvalidArgument;
+    if (base_position) |position| position.* = entry.directory_index;
+
+    var kind: std.Io.File.Kind = .directory;
+    const name: []const u8 = switch (entry.directory_index) {
+        0 => ".",
+        1 => "..",
+        else => blk: {
+            const iterator = if (entry.directory_iterator) |*value| value else return Error.IoFailed;
+            const child = iterator.next(io) catch return Error.IoFailed;
+            const found = child orelse return 0;
+            kind = found.kind;
+            break :blk found.name;
+        },
+    };
+
+    const name_length = @min(name.len, 255);
+    @memset(buffer[0..512], 0);
+    std.mem.writeInt(u32, buffer[0..4], directoryEntryHash(name[0..name_length]), .little);
+    std.mem.writeInt(u16, buffer[4..6], 512, .little);
+    buffer[6] = if (kind == .directory) 4 else 8;
+    buffer[7] = @intCast(name_length);
+    @memcpy(buffer[8 .. 8 + name_length], name[0..name_length]);
+    entry.directory_index += 1;
+    return 512;
 }
 
 /// The guest path a descriptor was opened with, for diagnostics.
@@ -861,13 +948,35 @@ test "missing files and bad descriptors are reported precisely" {
 
     try testing.expectError(Error.NotFound, open("/app0/absent.bin", O.rdonly));
     try testing.expectError(Error.NotFound, open("/system/secret", O.rdonly));
-    try testing.expectError(Error.IsDirectory, open("/app0/sub", O.rdonly | O.directory));
+    const directory = try open("/app0/sub", O.rdonly | O.directory);
+    try close(directory);
 
     var buffer: [4]u8 = undefined;
     try testing.expectError(Error.BadDescriptor, read(99, &buffer));
     try testing.expectError(Error.BadDescriptor, close(99));
     // The standard streams are not filesystem descriptors.
     try testing.expectError(Error.BadDescriptor, read(1, &buffer));
+}
+
+test "directory descriptors enumerate BSD dirent records" {
+    var fixture = try Fixture.init("data");
+    defer fixture.deinit();
+
+    const fd = try open("/app0/sub", O.rdonly | O.directory);
+    defer close(fd) catch {};
+    var record: [512]u8 = undefined;
+    var base: u64 = 99;
+
+    try testing.expectEqual(@as(usize, 512), try getDents(fd, &record, &base));
+    try testing.expectEqual(@as(u64, 0), base);
+    try testing.expectEqualStrings(".", std.mem.sliceTo(record[8..], 0));
+    try testing.expectEqual(@as(u8, 4), record[6]);
+
+    _ = try getDents(fd, &record, null); // `..`
+    try testing.expectEqual(@as(usize, 512), try getDents(fd, &record, null));
+    try testing.expectEqualStrings("inner.txt", std.mem.sliceTo(record[8..], 0));
+    try testing.expectEqual(@as(u8, 8), record[6]);
+    try testing.expectEqual(@as(usize, 0), try getDents(fd, &record, null));
 }
 
 test "descriptors are released and reused" {

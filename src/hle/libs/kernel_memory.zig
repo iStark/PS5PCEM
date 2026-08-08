@@ -913,14 +913,131 @@ fn getPageTableStats() callconv(abi.guest) i32 {
     return KernelError.enosys.raw();
 }
 
-/// Applies several mappings in one call.
-///
-/// Refused for now. The entry describes each operation through a record whose
-/// layout is not established, and misreading it would map the wrong physical
-/// memory at the wrong address — a failure that surfaces as corruption rather
-/// than as an error.
-fn batchMap2() callconv(abi.guest) i32 {
-    return KernelError.enosys.raw();
+const BatchMapEntry = extern struct {
+    start: u64,
+    offset: u64,
+    length: u64,
+    protection: u8,
+    memory_type: u8,
+    reserved: i16,
+    operation: i32,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(BatchMapEntry) == 32);
+}
+
+const BatchOperation = enum(i32) {
+    map_direct = 0,
+    unmap = 1,
+    protect = 2,
+    map_flexible = 3,
+    type_protect = 4,
+};
+
+/// Applies mappings in order and reports how many completed before an error.
+/// The ABI is intentionally non-transactional: callers use the processed count
+/// to retain successful prefix operations when a later entry fails.
+fn batchMapCore(
+    entries_pointer: ?[*]BatchMapEntry,
+    entry_count: i32,
+    processed_pointer: ?*i32,
+    flags: i32,
+) i32 {
+    if (entry_count < 0) return KernelError.einval.raw();
+    const entries = entries_pointer orelse return KernelError.einval.raw();
+    const count: usize = @intCast(entry_count);
+    const entries_size = std.math.mul(u64, count, @sizeOf(BatchMapEntry)) catch
+        return KernelError.einval.raw();
+    if (entries_size != 0 and
+        !isGuestRangeAccessible(@intFromPtr(entries), entries_size))
+    {
+        return KernelError.efault.raw();
+    }
+    if (processed_pointer) |processed| {
+        if (!isGuestRangeAccessible(@intFromPtr(processed), @sizeOf(i32))) {
+            return KernelError.efault.raw();
+        }
+        processed.* = 0;
+    }
+
+    var processed: i32 = 0;
+    for (entries[0..count], 0..) |*entry, index| {
+        if (trace.announces("sceKernelBatchMap")) {
+            std.debug.print(
+                "[batch map {d}] op={d} start=0x{x} offset=0x{x} length=0x{x} prot=0x{x} type=0x{x} flags=0x{x}\n",
+                .{
+                    index,
+                    entry.operation,
+                    entry.start,
+                    entry.offset,
+                    entry.length,
+                    entry.protection,
+                    entry.memory_type,
+                    flags,
+                },
+            );
+        }
+        if (entry.length == 0) {
+            if (processed_pointer) |output| output.* = processed;
+            return KernelError.einval.raw();
+        }
+        if (entry.operation < @intFromEnum(BatchOperation.map_direct) or
+            entry.operation > @intFromEnum(BatchOperation.type_protect))
+        {
+            if (processed_pointer) |output| output.* = processed;
+            return KernelError.einval.raw();
+        }
+        const operation: BatchOperation = @enumFromInt(entry.operation);
+        const protection_bits: i32 = entry.protection;
+        const result = switch (operation) {
+            .map_direct => sceKernelMapDirectMemory(
+                &entry.start,
+                entry.length,
+                protection_bits,
+                flags,
+                entry.offset,
+                0,
+            ),
+            .unmap => sceKernelMunmap(entry.start, entry.length),
+            .protect, .type_protect => sceKernelMprotect(
+                entry.start,
+                entry.length,
+                protection_bits,
+            ),
+            .map_flexible => mapFlexibleMemory(
+                &entry.start,
+                entry.length,
+                protection_bits,
+                flags,
+                "batch",
+            ),
+        };
+        if (result != errno.ok) {
+            if (processed_pointer) |output| output.* = processed;
+            return result;
+        }
+        processed += 1;
+    }
+    if (processed_pointer) |output| output.* = processed;
+    return errno.ok;
+}
+
+fn sceKernelBatchMap(
+    entries: ?[*]BatchMapEntry,
+    entry_count: i32,
+    processed: ?*i32,
+) callconv(abi.guest) i32 {
+    return batchMapCore(entries, entry_count, processed, map_fixed);
+}
+
+fn sceKernelBatchMap2(
+    entries: ?[*]BatchMapEntry,
+    entry_count: i32,
+    processed: ?*i32,
+    flags: i32,
+) callconv(abi.guest) i32 {
+    return batchMapCore(entries, entry_count, processed, flags);
 }
 
 /// Maps direct memory, naming the type it should be treated as.
@@ -1118,7 +1235,22 @@ fn sceKernelReserveVirtualRange(
             hint,
             len,
             effective_alignment,
-        ) catch |err| return mapAddressSpaceError(err);
+        ) catch |err| {
+            if (trace.announces("sceKernelReserveVirtualRange")) {
+                std.debug.print(
+                    "[virtual reserve] requested=0x{x} hint=0x{x} len=0x{x} align=0x{x} area={s} error={s}\n",
+                    .{
+                        requested_address,
+                        hint,
+                        len,
+                        effective_alignment,
+                        @tagName(area),
+                        @errorName(err),
+                    },
+                );
+            }
+            return mapAddressSpaceError(err);
+        };
     };
 
     output.* = reserved_address;
@@ -1248,17 +1380,13 @@ pub const exports = [_]symbols.Export{
         .expect_id = "BQQniolj9tQ",
     },
     .{
-        // The single-operation form of the batch entry below, and refused for
-        // the same reason: the record describing each operation has a layout
-        // that is not established, and misreading it maps the wrong physical
-        // memory at the wrong address — corruption rather than an error.
         .name = "sceKernelBatchMap",
-        .function = trace.wrap("sceKernelBatchMap", &batchMap2),
+        .function = trace.wrap("sceKernelBatchMap", &sceKernelBatchMap),
         .expect_id = "2SKEx6bSq-4",
     },
     .{
         .name = "sceKernelBatchMap2",
-        .function = trace.wrap("sceKernelBatchMap2", &batchMap2),
+        .function = trace.wrap("sceKernelBatchMap2", &sceKernelBatchMap2),
         .expect_id = "kBJzF8x4SyE",
     },
     .{
@@ -1884,6 +2012,33 @@ test "direct memory maps into part of a larger reservation" {
     );
     try testing.expectEqual(tail, tail_mapped);
     try testing.expect(address_space.isMappedAs(tail_mapped, map_size, .direct_memory));
+}
+
+test "large hinted user reservation leaves room for a later window" {
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+
+    init(testing.allocator);
+    defer deinit();
+    attachAddressSpace(&address_space);
+
+    // Unreal's libc bootstrap reserves a large arena at the native user-area
+    // boundary and then searches from the same hint for a much smaller window.
+    const arena_size: u64 = 0x80_0000_0000;
+    var arena = memory.user.start;
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelReserveVirtualRange(&arena, arena_size, 0, 0x20_0000),
+    );
+    try testing.expectEqual(memory.user.start, arena);
+
+    const window_size: u64 = 0x400_0000;
+    var window = memory.user.start;
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelReserveVirtualRange(&window, window_size, 0, page_size),
+    );
+    try testing.expect(window >= arena + arena_size);
 }
 
 test "a query reports what a range is and whether it is committed" {

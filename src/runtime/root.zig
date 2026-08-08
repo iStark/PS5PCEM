@@ -547,10 +547,14 @@ const ResolverContext = struct {
 /// attribute and SRT recovery; the guest libSceAgc copy would hide that.
 fn preferHleImportId(id: []const u8) bool {
     return std.mem.eql(u8, id, "f3dg2CSgRKY") // sceAgcCreateShader
-        or std.mem.eql(u8, id, "dolOmWH+huQ") // sceAgcGetFusedShaderSize
-        or std.mem.eql(u8, id, "fd5Bp5tGTgo") // sceAgcFuseShaderHalves
+    or std.mem.eql(u8, id, "dolOmWH+huQ") // sceAgcGetFusedShaderSize
+    or std.mem.eql(u8, id, "fd5Bp5tGTgo") // sceAgcFuseShaderHalves
         // Guest libSceAgc SuspendPoint busy-waits / TRC-spams without a real GPU.
-        or std.mem.eql(u8, id, "h9z6+0hEydk"); // sceAgcSuspendPoint
+    or std.mem.eql(u8, id, "h9z6+0hEydk") // sceAgcSuspendPoint
+        // Owner-aware guards avoid a same-thread bootstrap recursion deadlock.
+    or std.mem.eql(u8, id, "3GPpjQdAMTw") // __cxa_guard_acquire
+    or std.mem.eql(u8, id, "9rAeANT2tyE") // __cxa_guard_release
+    or std.mem.eql(u8, id, "2emaaluWzUw"); // __cxa_guard_abort
 }
 
 fn resolveHleExact(context: *const ResolverContext, import: *const loader.Import, symbol_type: hle.SymbolType) ?u64 {

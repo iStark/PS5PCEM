@@ -16,6 +16,7 @@ pub const maximum_files: usize = 256;
 pub const maximum_path: usize = 1024;
 pub const maximum_command_buffers: usize = 32;
 pub const maximum_reads_per_buffer: usize = 32;
+pub const maximum_completions_per_buffer: usize = 32;
 pub const maximum_submissions: usize = 64;
 pub const maximum_read_bytes: usize = 4 * 1024 * 1024 * 1024;
 pub const maximum_file_offset: u64 = 0x0000_0100_0000_0000;
@@ -58,6 +59,15 @@ pub const ReadCommand = struct {
     file_offset: u64,
 };
 
+pub const CompletionCommand = struct {
+    queue_handle: i64,
+    ident: u64,
+    completion_token: u64,
+    user_data: u64,
+};
+
+pub const CompletionSink = *const fn (CompletionCommand) bool;
+
 const CommandBuffer = struct {
     active: bool = false,
     address: u64 = 0,
@@ -65,6 +75,8 @@ const CommandBuffer = struct {
     storage_size: usize = 0,
     reads: [maximum_reads_per_buffer]ReadCommand = undefined,
     read_count: usize = 0,
+    completions: [maximum_completions_per_buffer]CompletionCommand = undefined,
+    completion_count: usize = 0,
 };
 
 const Submission = struct {
@@ -91,6 +103,13 @@ var next_identifier: u32 = 1;
 var command_buffers: [maximum_command_buffers]CommandBuffer = [_]CommandBuffer{.{}} ** maximum_command_buffers;
 var submissions: [maximum_submissions]Submission = [_]Submission{.{}} ** maximum_submissions;
 var next_submission_identifier: u32 = 1;
+var completion_sink: ?CompletionSink = null;
+
+pub fn attachCompletionSink(sink: ?CompletionSink) void {
+    lock.lock();
+    defer lock.unlock();
+    completion_sink = sink;
+}
 
 pub fn reset() void {
     lock.lock();
@@ -162,7 +181,7 @@ pub fn constructCommandBuffer(address: u64) Error!void {
     lock.lock();
     defer lock.unlock();
     if (findCommandBufferLocked(address)) |buffer| {
-        buffer.read_count = 0;
+        buffer.* = .{ .active = true, .address = address };
         return;
     }
     for (&command_buffers) |*buffer| {
@@ -171,6 +190,13 @@ pub fn constructCommandBuffer(address: u64) Error!void {
         return;
     }
     return error.CommandBufferTableFull;
+}
+
+pub fn destroyCommandBuffer(address: u64) Error!void {
+    lock.lock();
+    defer lock.unlock();
+    const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
+    buffer.* = .{};
 }
 
 pub fn setCommandBufferStorage(address: u64, storage_address: u64, storage_size: usize) Error!void {
@@ -187,6 +213,7 @@ pub fn resetCommandBuffer(address: u64) Error!void {
     defer lock.unlock();
     const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
     buffer.read_count = 0;
+    buffer.completion_count = 0;
 }
 
 pub fn appendRead(address: u64, command: ReadCommand) Error!void {
@@ -204,19 +231,36 @@ pub fn appendRead(address: u64, command: ReadCommand) Error!void {
     buffer.read_count += 1;
 }
 
+pub fn appendCompletion(address: u64, command: CompletionCommand) Error!void {
+    lock.lock();
+    defer lock.unlock();
+    const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
+    if (buffer.completion_count >= buffer.completions.len) return error.TooManyCommands;
+    buffer.completions[buffer.completion_count] = command;
+    buffer.completion_count += 1;
+}
+
 pub fn submitCommandBuffer(address: u64) Error!u32 {
     var pending: [maximum_reads_per_buffer]ReadCommand = undefined;
-    const pending_count = blk: {
+    var pending_completions: [maximum_completions_per_buffer]CompletionCommand = undefined;
+    var sink: ?CompletionSink = null;
+    const counts = blk: {
         lock.lock();
         defer lock.unlock();
         const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
         @memcpy(pending[0..buffer.read_count], buffer.reads[0..buffer.read_count]);
-        break :blk buffer.read_count;
+        @memcpy(pending_completions[0..buffer.completion_count], buffer.completions[0..buffer.completion_count]);
+        sink = completion_sink;
+        break :blk .{ buffer.read_count, buffer.completion_count };
     };
-    for (pending[0..pending_count]) |command| {
+    for (pending[0..counts[0]]) |command| {
         if (!memory.isGuestRangeAccessible(command.destination, command.size)) return error.InvalidRead;
         const destination: [*]u8 = @ptrFromInt(command.destination);
         _ = try read(command.file_identifier, command.file_offset, destination[0..command.size]);
+    }
+    for (pending_completions[0..counts[1]]) |command| {
+        const callback = sink orelse return error.IoFailed;
+        if (!callback(command)) return error.IoFailed;
     }
 
     lock.lock();

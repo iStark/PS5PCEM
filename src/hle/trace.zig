@@ -29,10 +29,11 @@ pub const capacity: usize = 256;
 /// Arguments captured per call.
 ///
 /// The System V AMD64 convention passes the first six integer arguments in
-/// registers and the rest on the stack. A handful of entry points take more
-/// than six; those still record, but only the first six are kept, because the
-/// leading arguments are what identify the object being operated on.
-pub const maximum_arguments: usize = 6;
+/// registers and the rest on the stack. The generated thunks already receive
+/// the stack arguments with their declared types, so keep all supported
+/// arguments: file offsets and output pointers often live past the sixth word
+/// and are precisely the values needed to diagnose a bad firmware boundary.
+pub const maximum_arguments: usize = 10;
 
 pub const Record = struct {
     /// Firmware export name. Static, so this is a borrow with no lifetime.
@@ -250,7 +251,7 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
             fn call(a0: P.t(0)) callconv(abi.guest) Result {
                 const args = [_]u64{word(a0)};
                 enter(name, &args);
-                return finish(name, host_stack.call(Result, func, .{ a0 }), &args);
+                return finish(name, host_stack.call(Result, func, .{a0}), &args);
             }
         },
         2 => struct {
@@ -315,10 +316,7 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
                 a5: P.t(5),
                 a6: P.t(6),
             ) callconv(abi.guest) Result {
-                // Beyond six the arguments arrive on the stack; only the
-                // register ones are recorded, which is where the identifying
-                // parameters live.
-                const args = [_]u64{ word(a0), word(a1), word(a2), word(a3), word(a4), word(a5) };
+                const args = [_]u64{ word(a0), word(a1), word(a2), word(a3), word(a4), word(a5), word(a6) };
                 enter(name, &args);
                 return finish(
                     name,
@@ -338,7 +336,7 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
                 a6: P.t(6),
                 a7: P.t(7),
             ) callconv(abi.guest) Result {
-                const args = [_]u64{ word(a0), word(a1), word(a2), word(a3), word(a4), word(a5) };
+                const args = [_]u64{ word(a0), word(a1), word(a2), word(a3), word(a4), word(a5), word(a6), word(a7) };
                 enter(name, &args);
                 return finish(
                     name,
@@ -359,7 +357,7 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
                 a7: P.t(7),
                 a8: P.t(8),
             ) callconv(abi.guest) Result {
-                const args = [_]u64{ word(a0), word(a1), word(a2), word(a3), word(a4), word(a5) };
+                const args = [_]u64{ word(a0), word(a1), word(a2), word(a3), word(a4), word(a5), word(a6), word(a7), word(a8) };
                 enter(name, &args);
                 return finish(
                     name,
@@ -381,7 +379,10 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
                 a8: P.t(8),
                 a9: P.t(9),
             ) callconv(abi.guest) Result {
-                const args = [_]u64{ word(a0), word(a1), word(a2), word(a3), word(a4), word(a5) };
+                const args = [_]u64{
+                    word(a0), word(a1), word(a2), word(a3), word(a4),
+                    word(a5), word(a6), word(a7), word(a8), word(a9),
+                };
                 enter(name, &args);
                 return finish(
                     name,
@@ -675,6 +676,33 @@ test "a wrapped call is recorded with its arguments and result" {
 
 fn takesFour(a: u64, b: u64, c: u64, d: u64) callconv(abi.guest) u64 {
     return a + b + c + d;
+}
+
+fn takesSeven(
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+) callconv(abi.guest) u64 {
+    return a0 + a1 + a2 + a3 + a4 + a5 + a6;
+}
+
+test "stack arguments are retained by the trace" {
+    reset();
+    setEnabled(true);
+
+    const traced = wrap("takesSeven", &takesSeven);
+    const typed: *const fn (u64, u64, u64, u64, u64, u64, u64) callconv(abi.guest) u64 = @ptrCast(traced);
+    try testing.expectEqual(@as(u64, 28), typed(1, 2, 3, 4, 5, 6, 7));
+
+    var buffer: [1]Record = undefined;
+    const records = recent(&buffer);
+    try testing.expectEqual(@as(usize, 1), records.len);
+    try testing.expectEqual(@as(u8, 7), records[0].argument_count);
+    try testing.expectEqual(@as(u64, 7), records[0].arguments[6]);
 }
 
 test "every arity announces its entry, not just the short ones" {

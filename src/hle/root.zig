@@ -25,6 +25,7 @@ pub const symbols = @import("symbols.zig");
 pub const libs = struct {
     pub const audio = @import("libs/audio.zig");
     pub const bootstrap_services = @import("libs/bootstrap_services.zig");
+    pub const cxx_abi = @import("libs/cxx_abi.zig");
     pub const dialogs = @import("libs/dialogs.zig");
     pub const kernel_event_queue = @import("libs/kernel_event_queue.zig");
     pub const kernel_info = @import("libs/kernel_info.zig");
@@ -64,6 +65,7 @@ pub fn registerAll(db: *Database, gpa: @import("std").mem.Allocator) symbols.Err
     try libs.agc.register(db, gpa);
     try libs.kernel_aio.register(db, gpa);
     try libs.bootstrap_services.register(db, gpa);
+    try libs.cxx_abi.register(db, gpa);
     try libs.dialogs.register(db, gpa);
     try libs.kernel_event_queue.register(db, gpa);
     try libs.kernel_files.register(db, gpa);
@@ -88,6 +90,7 @@ test {
     _ = libs.audio;
     _ = @import("audio_fs.zig");
     _ = libs.bootstrap_services;
+    _ = libs.cxx_abi;
     _ = libs.dialogs;
     _ = nid;
     _ = abi;

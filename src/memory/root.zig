@@ -112,7 +112,10 @@ pub const device = Range{
 
 /// Addresses exposed to title-controlled mappings.
 pub const user = Range{
-    .start = 0x70_0000_0000,
+    // macOS keeps the lower host VA span unavailable to this native-x64
+    // layout. Windows and Linux can expose the console user window from
+    // 64 GiB, which is also a common explicit reservation hint from titles.
+    .start = if (builtin.os.tag == .macos) 0x70_0000_0000 else 0x10_0000_0000,
     .end = 0xfc_0000_0000,
 };
 
@@ -1548,7 +1551,11 @@ test "guest windows match the native layout" {
     try testing.expectEqual(@as(u64, 0x0f_c000_0000), system_reserved.end);
     try testing.expectEqual(@as(u64, 0x0f_e000_0000), device.start);
     try testing.expectEqual(@as(u64, 0x0f_f000_0000), device.end);
-    try testing.expectEqual(@as(u64, 0x70_0000_0000), user.start);
+    const expected_user_start: u64 = if (builtin.os.tag == .macos)
+        0x70_0000_0000
+    else
+        0x10_0000_0000;
+    try testing.expectEqual(expected_user_start, user.start);
     try testing.expectEqual(@as(u64, 0xfc_0000_0000), user.end);
 }
 
