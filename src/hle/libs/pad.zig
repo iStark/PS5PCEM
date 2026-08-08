@@ -10,6 +10,7 @@ const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const kernel_runtime = @import("kernel_runtime.zig");
 const user_service = @import("user_service.zig");
+const host_input = @import("input");
 
 const error_invalid_argument: i32 = @bitCast(@as(u32, 0x8092_0001));
 const error_invalid_handle: i32 = @bitCast(@as(u32, 0x8092_0003));
@@ -82,6 +83,7 @@ pub fn reset() void {
     initialized.store(0, .release);
     open.store(0, .release);
     motion_sensor_enabled.store(0, .release);
+    host_input.reset();
 }
 
 fn validHandle(handle: i32) bool {
@@ -112,7 +114,18 @@ fn fillPadData(output: *PadData) void {
     output.* = .{};
     const nanoseconds = kernel_runtime.realTimeNanoseconds();
     output.timestamp = @intCast(@max(@as(i96, 0), @divTrunc(nanoseconds, std.time.ns_per_us)));
-    // Auto-confirm pulse for bring-up (same idea as env-driven auto-cross).
+    const host = host_input.read();
+    output.buttons = host.buttons;
+    output.left_stick_x = host.left_stick_x;
+    output.left_stick_y = host.left_stick_y;
+    output.right_stick_x = host.right_stick_x;
+    output.right_stick_y = host.right_stick_y;
+    output.analog_l2 = host.analog_l2;
+    output.analog_r2 = host.analog_r2;
+
+    // Direct CLI runs retain the automatic bring-up pulse. The launcher always
+    // selects an explicit mode, so physical input is never mixed with it.
+    if (host_input.mode() != .automatic) return;
     const now_us = kernel_runtime.processTimeMicroseconds();
     if (now_us > 500_000) {
         const phase = now_us % auto_cross_period_us;

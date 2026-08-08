@@ -52,6 +52,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Host keyboard and XInput polling. Kept out of libScePad so the guest ABI
+    // remains independent from the launcher and Windows message handling.
+    const input = b.addModule("input", .{
+        .root_source_file = b.path("src/input/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Guest module images: ELF64 parsing and the dynamic linking tables.
     const loader = b.addModule("loader", .{
         .root_source_file = b.path("src/loader/root.zig"),
@@ -73,6 +81,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "memory", .module = memory },
             .{ .name = "loader", .module = loader },
             .{ .name = "gpu", .module = gpu },
+            .{ .name = "input", .module = input },
         },
     });
 
@@ -217,6 +226,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    if (target.result.os.tag == .windows) game_run.root_module.linkSystemLibrary("xinput1_4", .{});
     b.installArtifact(game_run);
 
     const game_run_cmd = b.addRunArtifact(game_run);
@@ -225,6 +235,31 @@ pub fn build(b: *std.Build) void {
 
     const game_run_step = b.step("game-run", "Load and execute a decrypted PS5 title");
     game_run_step.dependOn(&game_run_cmd.step);
+
+    // Zero-dependency native launcher. It selects the title directory, stores
+    // user preferences and starts game-run with the corresponding environment.
+    var launcher: ?*std.Build.Step.Compile = null;
+    if (target.result.os.tag == .windows) {
+        const native_launcher = b.addExecutable(.{
+            .name = "ps5pcem",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/launcher.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        native_launcher.subsystem = .windows;
+        inline for (&.{ "user32", "gdi32", "shell32", "ole32", "dwmapi" }) |library| {
+            native_launcher.root_module.linkSystemLibrary(library, .{});
+        }
+        b.installArtifact(native_launcher);
+
+        const launcher_cmd = b.addRunArtifact(native_launcher);
+        launcher_cmd.step.dependOn(b.getInstallStep());
+        const launcher_step = b.step("launcher", "Open the PS5PCEM launcher");
+        launcher_step.dependOn(&launcher_cmd.step);
+        launcher = native_launcher;
+    }
 
     // Verifies device/queue creation, a compute pipeline and synchronized
     // staging through device-local memory without opening a window.
@@ -272,12 +307,14 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run the test suite");
     const check_step = b.step("check", "Compile every module without running tests");
     check_step.dependOn(&vulkan_smoke.step);
+    if (launcher) |native_launcher| check_step.dependOn(&native_launcher.step);
     for ([_]*std.Build.Module{
         memory,
         mod,
         gpu,
         vulkan,
         window,
+        input,
         hle,
         cpu,
         loader,

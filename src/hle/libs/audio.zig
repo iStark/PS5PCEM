@@ -117,6 +117,10 @@ var device_owner: i32 = -1;
 /// about the title.
 fn claimDevice(handle: i32, port: LegacyPort) bool {
     if (device_owner != -1) return false;
+    if (audioDisabled()) {
+        std.debug.print("[audio] host output disabled by launcher\n", .{});
+        return false;
+    }
     // Warm FSB index + host mix before the first audible Output so silent
     // mixer buffers immediately carry real game PCM.
     filesystem.ensureAudioIndexed();
@@ -242,6 +246,7 @@ var audio_test_tone_phase: f32 = 0;
 /// Set once from `PS5_AUDIO_TEST_TONE=1` — inject a quiet 440 Hz tone when the
 /// title submits silent buffers so host speakers can be verified.
 var audio_test_tone_enabled: ?bool = null;
+var audio_disabled: ?bool = null;
 
 extern "kernel32" fn GetEnvironmentVariableA(
     name: [*:0]const u8,
@@ -262,6 +267,18 @@ fn audioTestToneEnabled() bool {
     audio_test_tone_enabled = on;
     if (on) std.debug.print("[audio] PS5_AUDIO_TEST_TONE: inject 440 Hz on silent buffers\n", .{});
     return on;
+}
+
+fn audioDisabled() bool {
+    if (audio_disabled) |value| return value;
+    var disabled = false;
+    if (comptime builtin.os.tag == .windows) {
+        var buf: [8]u8 = undefined;
+        const n = GetEnvironmentVariableA("PS5_AUDIO_DISABLED", &buf, buf.len);
+        if (n > 0 and n < buf.len) disabled = buf[0] != '0' and buf[0] != 'n' and buf[0] != 'N';
+    }
+    audio_disabled = disabled;
+    return disabled;
 }
 
 fn readF32Le(bytes: *const [4]u8) f32 {
