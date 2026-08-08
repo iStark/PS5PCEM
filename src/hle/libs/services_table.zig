@@ -137,6 +137,7 @@ pub const gameupdate_exports = [_]symbols.Export{
 pub const hmd2_exports = [_]symbols.Export{
     .{ .name = "sceHmd2ReprojectionSetRenderConfig", .function = trace.wrap("sceHmd2ReprojectionSetRenderConfig", &services.noDevice), .expect_id = "hA9LshbSkzw" },
     .{ .name = "sceHmd2GetDeviceInformation", .function = trace.wrap("sceHmd2GetDeviceInformation", &services.noDevice), .expect_id = "bIi4YUfSRys" },
+    .{ .name = "sceHmd2GetDeviceInformationByHandle", .function = trace.wrap("sceHmd2GetDeviceInformationByHandle", &services.noDevice), .expect_id = "4BlE4IPXP0Q" },
     .{ .name = "sceHmd2Open", .function = trace.wrap("sceHmd2Open", &services.noDevice), .expect_id = "f3kPeoTZnIE" },
     .{ .name = "sceHmd2GetFieldOfViewWithoutHandle", .function = trace.wrap("sceHmd2GetFieldOfViewWithoutHandle", &services.noDevice), .expect_id = "gF8+lvc7GuQ" },
     .{ .name = "sceHmd2ReprojectionBeginFrame", .function = trace.wrap("sceHmd2ReprojectionBeginFrame", &services.noDevice), .expect_id = "Ocf081WpBpA" },
@@ -155,8 +156,10 @@ pub const hmd2_exports = [_]symbols.Export{
     .{ .name = "sceHmd2ReprojectionEnableVrMode", .function = trace.wrap("sceHmd2ReprojectionEnableVrMode", &services.noDevice), .expect_id = "VVvFh51o20s" },
     .{ .name = "sceHmd2ReprojectionSetTiming", .function = trace.wrap("sceHmd2ReprojectionSetTiming", &services.noDevice), .expect_id = "FkQX7rjFomk" },
     .{ .name = "sceHmd2ReprojectionDisableVrMode", .function = trace.wrap("sceHmd2ReprojectionDisableVrMode", &services.noDevice), .expect_id = "wj1kOyNF4vM" },
+    .{ .name = "sceHmd2ReprojectionGetStatus", .function = trace.wrap("sceHmd2ReprojectionGetStatus", &services.noDevice), .expect_id = "8GkaY2B7opM" },
     .{ .name = "sceHmd2ReprojectionTerminate", .function = trace.wrap("sceHmd2ReprojectionTerminate", &services.noDevice), .expect_id = "4Q11W4M2h5Q" },
     .{ .name = "sceHmd2Close", .function = trace.wrap("sceHmd2Close", &services.noDevice), .expect_id = "oPhtjySuHa8" },
+    .{ .name = "sceHmd2Terminate", .function = trace.wrap("sceHmd2Terminate", &services.noDevice), .expect_id = "QU2M1pPNbaY" },
     .{ .name = "sceHmd2GazeGetResult", .function = trace.wrap("sceHmd2GazeGetResult", &services.noDevice), .expect_id = "lAoFUedcfqA" },
     .{ .name = "sceHmd2GazeGetResultForFoveatedRendering", .function = trace.wrap("sceHmd2GazeGetResultForFoveatedRendering", &services.noDevice), .expect_id = "retc+-uRMhk" },
 };
@@ -363,7 +366,15 @@ pub const pad_exports = [_]symbols.Export{
     .{ .name = "scePadVrControllerGetTriggerEffectState", .function = trace.wrap("scePadVrControllerGetTriggerEffectState", &services.noDevice), .expect_id = "OL2CJ2idmhk" },
     .{ .name = "scePadVrControllerSetTriggerEffects", .function = trace.wrap("scePadVrControllerSetTriggerEffects", &services.noDevice), .expect_id = "v8P+9PRqg10" },
     .{ .name = "scePadVrControllerSetTriggerEffect", .function = trace.wrap("scePadVrControllerSetTriggerEffect", &services.noDevice), .expect_id = "6Cdc9bbjrRY" },
+    .{ .name = "scePadVrControllerSetVibrationMode", .function = trace.wrap("scePadVrControllerSetVibrationMode", &services.noDevice), .expect_id = "Wf6-PNCyY20" },
+    .{ .name = "scePadVrControllerSetVibration", .function = trace.wrap("scePadVrControllerSetVibration", &services.noDevice), .expect_id = "DGCwN1Lmmys" },
     .{ .name = "scePadReadState", .function = trace.wrap("scePadReadState", &services.noDevice), .expect_id = "YndgXqQVV7c" },
+};
+
+pub const razorcpu_exports = [_]symbols.Export{
+    .{ .name = "sceRazorCpuPushMarker", .function = trace.wrap("sceRazorCpuPushMarker", &services.accept), .expect_id = "zw+celG7zSI" },
+    .{ .name = "sceRazorCpuPopMarker", .function = trace.wrap("sceRazorCpuPopMarker", &services.accept), .expect_id = "YpkGsMXP3ew" },
+    .{ .name = "sceRazorCpuPushMarkerStatic", .function = trace.wrap("sceRazorCpuPushMarkerStatic", &services.accept), .expect_id = "uZrOwuNJX-M" },
 };
 
 pub const playgo_exports = [_]symbols.Export{
@@ -446,6 +457,9 @@ pub const voiceqos_exports = [_]symbols.Export{
 
 pub const vrtracker2_exports = [_]symbols.Export{
     .{ .name = "sceVrTracker2SetCoordinateSystem", .function = trace.wrap("sceVrTracker2SetCoordinateSystem", &services.noDevice), .expect_id = "UVCMLmS-Eas" },
+    .{ .name = "sceVrTracker2GetCoordinateSystem", .function = trace.wrap("sceVrTracker2GetCoordinateSystem", &services.noDevice), .expect_id = "Y-3JCiU9bbU" },
+    .{ .name = "sceVrTracker2ResetLocalCoordinate", .function = trace.wrap("sceVrTracker2ResetLocalCoordinate", &services.noDevice), .expect_id = "IdI2f+xHIeA" },
+    .{ .name = "sceVrTracker2GetPlayAreaBoundaryGeometry", .function = trace.wrap("sceVrTracker2GetPlayAreaBoundaryGeometry", &services.noDevice), .expect_id = "SCph4ZbkqzU" },
     .{ .name = "sceVrTracker2GetPlayAreaOrientedBoundingBox", .function = trace.wrap("sceVrTracker2GetPlayAreaOrientedBoundingBox", &services.noDevice), .expect_id = "snYs7Nf-RKk" },
     .{ .name = "sceVrTracker2RegisterDevice", .function = trace.wrap("sceVrTracker2RegisterDevice", &services.noDevice), .expect_id = "Dog+g25QYjw" },
     .{ .name = "sceVrTracker2UnregisterDevice", .function = trace.wrap("sceVrTracker2UnregisterDevice", &services.noDevice), .expect_id = "kFt4MB3SUEk" },
@@ -546,6 +560,7 @@ pub const all = [_]Table{
     .{ .library = "libScePad", .module = "libScePad", .exports = &pad_exports },
     .{ .library = "libScePlayGo", .module = "libScePlayGo", .exports = &playgo_exports },
     .{ .library = "libScePlayerInvitationDialog", .module = "libScePlayerInvitationDialog", .exports = &playerinvitationdialog_exports },
+    .{ .library = "libSceRazorCpu", .module = "libSceRazorCpu", .exports = &razorcpu_exports },
     .{ .library = "libSceRtc", .module = "libSceRtc", .exports = &rtc_exports },
     .{ .library = "libSceSaveDataDialog.native", .module = "libSceSaveDataDialog", .exports = &savedatadialog_native_exports },
     .{ .library = "libSceSaveData_native", .module = "libSceSaveData_native", .exports = &savedata_native_exports },
@@ -560,4 +575,3 @@ pub const all = [_]Table{
     .{ .library = "libSceNpWebApi2", .module = "libSceNpWebApi2", .exports = &npwebapi2_extra_exports },
     .{ .library = "libSceRtc", .module = "libSceRtc", .exports = &rtc_extra_exports },
 };
-

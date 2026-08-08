@@ -123,7 +123,22 @@ fn run(init: std.process.Init) !bool {
     try emu.init(allocator);
     defer emu.deinit();
 
-    var graph = emu.loadModuleGraph(io, executable_path, .{}) catch |err| {
+    var preload_modules: std.ArrayList([]const u8) = .empty;
+    defer preload_modules.deinit(allocator);
+    var preload_text: ?[]u8 = null;
+    defer if (preload_text) |text| allocator.free(text);
+    if (init.minimal.environ.getAlloc(allocator, "PS5_PRELOAD")) |text| {
+        preload_text = text;
+        var parts = std.mem.splitScalar(u8, text, ';');
+        while (parts.next()) |part| {
+            const path = std.mem.trim(u8, part, " \t\r\n");
+            if (path.len != 0) try preload_modules.append(allocator, path);
+        }
+    } else |_| {}
+
+    var graph = emu.loadModuleGraph(io, executable_path, .{
+        .preload_modules = preload_modules.items,
+    }) catch |err| {
         try stderr.print("cannot link {s}: {s}\n", .{ executable_path, @errorName(err) });
         try stderr.flush();
         return false;
@@ -141,7 +156,7 @@ fn run(init: std.process.Init) !bool {
 
     // Titles load some of their own modules by path once running; everything is
     // already mapped, so the request has to resolve to what exists.
-    const loaded_modules = try graph.publishModules(allocator);
+    const loaded_modules = try graph.publishModules(allocator, &emu.guest_exports);
     defer {
         runtime.firmware.modules.detach();
         allocator.free(loaded_modules);

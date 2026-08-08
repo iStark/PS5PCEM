@@ -233,6 +233,19 @@ fn posixFstat(descriptor: i32, out: ?*filesystem.Stat) callconv(abi.guest) i64 {
     return 0;
 }
 
+/// Validates the descriptor and length before reporting the filesystem's
+/// read-only policy. This preserves the useful POSIX distinction between an
+/// invalid request and a valid file which cannot be modified.
+fn posixFtruncate(descriptor: i32, length: i64) callconv(abi.guest) i64 {
+    if (length < 0) {
+        runtime_api.setPosixErrno(errno.Posix.einval);
+        return -1;
+    }
+    var info = filesystem.Stat{};
+    filesystem.fstat(descriptor, &info) catch |err| return posixFail(err);
+    return posixFail(Error.ReadOnly);
+}
+
 pub const exports = [_]symbols.Export{
     .{ .name = "sceKernelOpen", .function = trace.wrap("sceKernelOpen", &kernelOpen), .expect_id = "1G3lF1Gg1k8" },
     .{ .name = "sceKernelClose", .function = trace.wrap("sceKernelClose", &kernelClose), .expect_id = "UK2Tl2DWUns" },
@@ -257,13 +270,20 @@ pub const exports = [_]symbols.Export{
     .{ .name = "lseek", .function = trace.wrap("lseek", &posixLseek), .expect_id = "Oy6IpwgtYOk" },
     .{ .name = "stat", .function = trace.wrap("stat", &posixStat), .expect_id = "E6ao34wPw+U" },
     .{ .name = "fstat", .function = trace.wrap("fstat", &posixFstat), .expect_id = "mqQMh1zPPT8" },
+    .{ .name = "ftruncate", .function = trace.wrap("ftruncate", &posixFtruncate), .expect_id = "ih4CD9-gghM" },
+};
+
+const posix_exports = [_]symbols.Export{
+    .{ .name = "ftruncate", .function = trace.wrap("ftruncate", &posixFtruncate), .expect_id = "ih4CD9-gghM" },
 };
 
 pub const library = symbols.Library{ .name = "libkernel", .version = 1 };
+pub const posix_library = symbols.Library{ .name = "libScePosix", .version = 1 };
 pub const module = symbols.Module{ .name = "libkernel", .version_major = 1, .version_minor = 1 };
 
 pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {
     try db.addLibrary(gpa, library, module, &exports);
+    try db.addLibrary(gpa, posix_library, module, &posix_exports);
 }
 
 // ---------------------------------------------------------------------------
@@ -366,5 +386,6 @@ test "file exports register under published identifiers" {
     defer db.deinit(testing.allocator);
     try register(&db, testing.allocator);
     try testing.expect(db.findById("nKWi-N2HBV4", .function) != null);
+    try testing.expect(db.findById("ih4CD9-gghM", .function) != null);
     try testing.expect(db.findByName("sceKernelOpen", .function) != null);
 }

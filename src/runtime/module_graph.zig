@@ -17,6 +17,11 @@ pub const Options = struct {
     /// Shared PRX images are packed into the guest system-software window.
     module_load_start: u64 = memory.system_reserved.start,
     maximum_file_size: usize = 512 * 1024 * 1024,
+    /// Additional title PRX files to map before guest execution. This models
+    /// modules a title later names through `sceKernelLoadStartModule` while the
+    /// current runtime still performs graph construction as one safe phase.
+    /// Entries may be paths relative to the executable or just basenames.
+    preload_modules: []const []const u8 = &.{},
     diagnostics: ?Diagnostics = null,
 };
 
@@ -192,6 +197,7 @@ pub const ModuleGraph = struct {
     pub fn publishModules(
         self: *ModuleGraph,
         gpa: std.mem.Allocator,
+        guest_exports: *loader.GuestExportRegistry,
     ) std.mem.Allocator.Error![]hle.modules.Module {
         var list: std.ArrayList(hle.modules.Module) = .empty;
         errdefer list.deinit(gpa);
@@ -224,11 +230,13 @@ pub const ModuleGraph = struct {
                 .load_bias = mapped.load_bias,
                 .start = start,
                 .end = end,
+                .export_module_id = if (mapped.guest_export_module) |module| module.id else 0,
             });
         }
 
         const published = try list.toOwnedSlice(gpa);
         hle.modules.attach(published);
+        hle.modules.attachExportResolver(@ptrCast(guest_exports), &resolvePublishedExport);
         return published;
     }
 
@@ -313,6 +321,23 @@ pub fn loadFromDir(
     );
     try appendNode(&graph, executable_name, root_bytes);
 
+    // Explicitly requested modules are roots of their own dynamic subgraphs.
+    // Making them dependencies of the executable maps, relocates and
+    // initializes them in the existing dependency-first phase, after which a
+    // guest LoadStartModule request can return their published handle.
+    for (options.preload_modules) |requested| {
+        const candidate_index = findCandidate(candidates.items, requested, true) orelse
+            return error.FileNotFound;
+        const dependency = try ensureNode(
+            &graph,
+            io,
+            directory,
+            candidates.items[candidate_index].path,
+            options.maximum_file_size,
+        );
+        try appendDependency(&graph, graph.root_index, dependency);
+    }
+
     // Iterating a growing list is the graph-discovery queue. Each path is
     // parsed at most once, while duplicate dependency declarations become one
     // edge to the existing node.
@@ -362,6 +387,14 @@ pub fn loadFromDir(
         graph.module_images.appendAssumeCapacity(&graph.nodes.items[index].mapped.?);
     }
     return graph;
+}
+
+fn resolvePublishedExport(context: *anyopaque, module_id: u64, name: []const u8) ?u64 {
+    const registry: *loader.GuestExportRegistry = @ptrCast(@alignCast(context));
+    const id = hle.nid.fromName(name);
+    return registry.resolveInModule(module_id, &id, .func) orelse
+        registry.resolveInModule(module_id, &id, .object) orelse
+        registry.resolveInModule(module_id, &id, .no_type);
 }
 
 fn collectCandidates(

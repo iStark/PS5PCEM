@@ -25,6 +25,9 @@ pub const Module = struct {
     load_bias: u64,
     start: u64,
     end: u64,
+    /// Registration id of the exports owned by this mapped image. Zero means
+    /// the image publishes no dynamic symbols.
+    export_module_id: u64 = 0,
 
     pub fn contains(self: Module, address: u64) bool {
         return address >= self.start and address < self.end;
@@ -32,13 +35,23 @@ pub const Module = struct {
 };
 
 var modules: []const Module = &.{};
+pub const ResolveExportFn = *const fn (*anyopaque, u64, []const u8) ?u64;
+var export_resolver_context: ?*anyopaque = null;
+var export_resolver: ?ResolveExportFn = null;
 
 pub fn attach(value: []const Module) void {
     modules = value;
 }
 
+pub fn attachExportResolver(context: *anyopaque, resolver: ResolveExportFn) void {
+    export_resolver_context = context;
+    export_resolver = resolver;
+}
+
 pub fn detach() void {
     modules = &.{};
+    export_resolver_context = null;
+    export_resolver = null;
 }
 
 pub fn count() usize {
@@ -57,6 +70,14 @@ pub fn findByAddress(address: u64) ?*const Module {
         if (module.contains(address)) return module;
     }
     return null;
+}
+
+pub fn resolveExport(handle: i32, name: []const u8) ?u64 {
+    const module = findByHandle(handle) orelse return null;
+    if (module.export_module_id == 0) return null;
+    const resolver = export_resolver orelse return null;
+    const context = export_resolver_context orelse return null;
+    return resolver(context, module.export_module_id, name);
 }
 
 /// Mount points a title uses to name its own files.

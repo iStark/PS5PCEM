@@ -113,7 +113,11 @@ var sync_fallback_generation: u64 = 1;
 /// through them. Handles are never reused during one process, which also keeps
 /// a waiter on a deleted object from attaching to a newly created one.
 const maximum_event_flags: usize = 64;
-const maximum_semaphores: usize = 64;
+// Unity Baselib creates one semaphore per worker plus runtime/service objects;
+// current titles can cross 64 before their first frame. Keep this allocation-
+// free while matching the scale expected by a full process rather than a
+// bootstrap-only workload.
+const maximum_semaphores: usize = 1024;
 const event_flag_key_prefix: u64 = 0x4556_0000_0000_0000;
 const semaphore_key_prefix: u64 = 0x5345_0000_0000_0000;
 
@@ -1004,6 +1008,25 @@ fn loadStartModule(
     return loaded.handle;
 }
 
+fn kernelDlsym(
+    handle: i32,
+    symbol_name: ?[*:0]const u8,
+    destination: ?*u64,
+) callconv(abi.guest) i32 {
+    const output = destination orelse return KernelError.efault.raw();
+    if (!memory_api.isGuestRangeAccessible(@intFromPtr(output), @sizeOf(u64))) {
+        return KernelError.efault.raw();
+    }
+    output.* = 0;
+    const raw_name = symbol_name orelse return KernelError.efault.raw();
+    var name_buffer: [1024]u8 = undefined;
+    const name = readGuestCString(@intFromPtr(raw_name), &name_buffer) orelse
+        return KernelError.efault.raw();
+    if (modules.findByHandle(handle) == null) return KernelError.esrch.raw();
+    output.* = modules.resolveExport(handle, name) orelse return KernelError.enoent.raw();
+    return errno.ok;
+}
+
 /// Accepts a request to stop and unload a module.
 ///
 /// Nothing is unloaded: modules stay mapped for the life of the process, and a
@@ -1434,7 +1457,7 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceKernelWaitSema", .function = trace.wrap("sceKernelWaitSema", &waitSemaphore), .expect_id = "Zxa0VhQVTsk" },
     .{ .name = "sceKernelSignalSema", .function = trace.wrap("sceKernelSignalSema", &signalSemaphore), .expect_id = "4czppHBiriw" },
     .{ .name = "sceKernelCancelSema", .function = trace.wrap("sceKernelCancelSema", &cancelSemaphore), .expect_id = "4DM06U2BNEY" },
-    .{ .name = "sceKernelDlsym", .function = trace.wrap("sceKernelDlsym", &kernelUnsupported), .expect_id = "LwG8g3niqwA" },
+    .{ .name = "sceKernelDlsym", .function = trace.wrap("sceKernelDlsym", &kernelDlsym), .expect_id = "LwG8g3niqwA" },
     .{ .name = "sceKernelLoadStartModule", .function = trace.wrap("sceKernelLoadStartModule", &loadStartModule), .expect_id = "wzvqT4UqKX8" },
     .{ .name = "sceKernelStopUnloadModule", .function = trace.wrap("sceKernelStopUnloadModule", &stopUnloadModule), .expect_id = "QKd0qM58Qes" },
     .{ .name = "sceKernelGetProcessTimeCounter", .function = trace.wrap("sceKernelGetProcessTimeCounter", &getProcessTimeCounter), .expect_id = "fgxnMeTNUtY" },

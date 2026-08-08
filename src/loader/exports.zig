@@ -183,6 +183,33 @@ pub const Registry = struct {
         return null;
     }
 
+    /// Resolves one NID inside the image identified by its registration id.
+    ///
+    /// `sceKernelDlsym` supplies a module handle and a readable symbol name,
+    /// rather than the library/module metadata carried by an ELF import. The
+    /// runtime hashes that name and uses this narrower lookup so two plugins
+    /// exporting the same Unity callback do not alias each other.
+    pub fn resolveInModule(
+        self: *Registry,
+        module_id: u64,
+        id: []const u8,
+        symbol_type: symbols.Type,
+    ) ?u64 {
+        if (module_id == 0) return null;
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (self.modules.items) |module| {
+            if (module.id != module_id) continue;
+            for (module.exports.items) |symbol| {
+                if (symbol.symbol_type == symbol_type and std.mem.eql(u8, symbol.id, id)) {
+                    return symbol.address;
+                }
+            }
+            return null;
+        }
+        return null;
+    }
+
     pub fn moduleCount(self: *Registry) usize {
         self.lock.lock();
         defer self.lock.unlock();
@@ -278,6 +305,31 @@ test "guest exports resolve exactly and unregister as one module" {
     registry.unregister(testing.allocator, module.id);
     try testing.expectEqual(@as(usize, 0), registry.moduleCount());
     try testing.expect(registry.resolveById(&import) == null);
+}
+
+test "guest exports resolve by owning module for dlsym" {
+    var registry = Registry{};
+    defer registry.deinit(testing.allocator);
+    const first = try registry.register(testing.allocator, &.{.{
+        .id = "same-nid",
+        .library = "plugin-a",
+        .library_version = 1,
+        .module = "plugin-a",
+        .symbol_type = .func,
+        .address = 0x1111,
+    }});
+    const second = try registry.register(testing.allocator, &.{.{
+        .id = "same-nid",
+        .library = "plugin-b",
+        .library_version = 1,
+        .module = "plugin-b",
+        .symbol_type = .func,
+        .address = 0x2222,
+    }});
+
+    try testing.expectEqual(@as(?u64, 0x1111), registry.resolveInModule(first.id, "same-nid", .func));
+    try testing.expectEqual(@as(?u64, 0x2222), registry.resolveInModule(second.id, "same-nid", .func));
+    try testing.expectEqual(@as(?u64, null), registry.resolveInModule(first.id, "same-nid", .object));
 }
 
 test "identifier fallback still checks the ELF symbol type" {

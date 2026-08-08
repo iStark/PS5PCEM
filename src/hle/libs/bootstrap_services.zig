@@ -177,6 +177,64 @@ fn posixSocketOperation(_: i32, _: u64, _: u64, _: u64, _: u64, _: u64) callconv
     return -1;
 }
 
+fn posixMessageOperation(_: i32, _: ?*anyopaque, _: i32) callconv(abi.guest) i64 {
+    kernel_runtime.setPosixErrno(50); // FreeBSD/Orbis ENETDOWN
+    return -1;
+}
+
+fn posixInetNtopFail(reason: i32) ?[*]u8 {
+    kernel_runtime.setPosixErrno(reason);
+    return null;
+}
+
+/// Converts a binary IP address without opening a host socket. The guest uses
+/// this during runtime initialization even when all networking is offline.
+fn posixInetNtop(
+    family: i32,
+    source_optional: ?[*]const u8,
+    destination_optional: ?[*]u8,
+    destination_size: u32,
+) callconv(abi.guest) ?[*]u8 {
+    const source = source_optional orelse return posixInetNtopFail(errno.Posix.efault);
+    const destination = destination_optional orelse return posixInetNtopFail(errno.Posix.efault);
+    const source_size: usize = switch (family) {
+        2 => 4, // ORBIS_AF_INET
+        28 => 16, // ORBIS_AF_INET6
+        else => return posixInetNtopFail(errno.Posix.einval),
+    };
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(source), source_size)) {
+        return posixInetNtopFail(errno.Posix.efault);
+    }
+
+    var text_buffer: [40]u8 = undefined;
+    const text = if (family == 2)
+        std.fmt.bufPrint(
+            &text_buffer,
+            "{d}.{d}.{d}.{d}",
+            .{ source[0], source[1], source[2], source[3] },
+        ) catch return posixInetNtopFail(errno.Posix.einval)
+    else blk: {
+        const bytes = source[0..16];
+        var groups: [8]u16 = undefined;
+        for (&groups, 0..) |*group, index| {
+            group.* = std.mem.readInt(u16, bytes[index * 2 ..][0..2], .big);
+        }
+        break :blk std.fmt.bufPrint(
+            &text_buffer,
+            "{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}",
+            .{ groups[0], groups[1], groups[2], groups[3], groups[4], groups[5], groups[6], groups[7] },
+        ) catch return posixInetNtopFail(errno.Posix.einval);
+    };
+    const required = text.len + 1;
+    if (destination_size < required) return posixInetNtopFail(errno.Posix.enospc);
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(destination), required)) {
+        return posixInetNtopFail(errno.Posix.efault);
+    }
+    @memcpy(destination[0..text.len], text);
+    destination[text.len] = 0;
+    return destination;
+}
+
 fn posixSelect(_: i32, _: u64, _: u64, _: u64, timeout: ?*const anyopaque) callconv(abi.guest) i32 {
     _ = timeout;
     return 0;
@@ -188,6 +246,9 @@ const posix_exports = [_]symbols.Export{
     .{ .name = "shutdown", .function = trace.wrap("shutdown", &posixSocketOperation), .expect_id = "TUuiYS2kE8s" },
     .{ .name = "setsockopt", .function = trace.wrap("setsockopt", &posixSocketOperation), .expect_id = "fFxGkxF2bVo" },
     .{ .name = "recv", .function = trace.wrap("recv", &posixSocketOperation), .expect_id = "Ez8xjo9UF4E" },
+    .{ .name = "sendmsg", .function = trace.wrap("sendmsg", &posixMessageOperation), .expect_id = "aNeavPDNKzA" },
+    .{ .name = "recvmsg", .function = trace.wrap("recvmsg", &posixMessageOperation), .expect_id = "hI7oVeOluPM" },
+    .{ .name = "inet_ntop", .function = trace.wrap("inet_ntop", &posixInetNtop), .expect_id = "5jRCs2axtr4" },
     .{ .name = "select", .function = trace.wrap("select", &posixSelect), .expect_id = "T8fER+tIGgk" },
 };
 
@@ -486,6 +547,14 @@ fn videoOutAddVblankEvent(equeue: i64, handle: i32, user_data: u64) callconv(abi
         video_out_error_invalid_event_queue;
 }
 
+fn videoOutDeleteVblankEvent(equeue: i64, handle: i32) callconv(abi.guest) i32 {
+    if (!validVideoHandle(handle)) return video_out_error_invalid_handle;
+    return if (kernel_event_queue.deleteVideoOutVblankEvent(equeue) == errno.ok)
+        errno.ok
+    else
+        video_out_error_invalid_event_queue;
+}
+
 fn videoOutWaitVblank(handle: i32) callconv(abi.guest) i32 {
     if (!validVideoHandle(handle)) return video_out_error_invalid_handle;
     // Pace to ~60 Hz so titles that spin on vblank do not burn a core.
@@ -610,6 +679,7 @@ const video_out_exports = [_]symbols.Export{
     .{ .name = "sceVideoOutAddFlipEvent", .function = trace.wrap("sceVideoOutAddFlipEvent", &videoOutAddFlipEvent), .expect_id = "HXzjK9yI30k" },
     .{ .name = "sceVideoOutDeleteFlipEvent", .function = trace.wrap("sceVideoOutDeleteFlipEvent", &videoOutDeleteFlipEvent), .expect_id = "-Ozn0F1AFRg" },
     .{ .name = "sceVideoOutAddVblankEvent", .function = trace.wrap("sceVideoOutAddVblankEvent", &videoOutAddVblankEvent), .expect_id = "Xru92wHJRmg" },
+    .{ .name = "sceVideoOutDeleteVblankEvent", .function = trace.wrap("sceVideoOutDeleteVblankEvent", &videoOutDeleteVblankEvent), .expect_id = "oNOQn3knW6s" },
     .{ .name = "sceVideoOutWaitVblank", .function = trace.wrap("sceVideoOutWaitVblank", &videoOutWaitVblank), .expect_id = "j6RaAUlaLv0" },
     .{ .name = "sceVideoOutGetVblankStatus", .function = trace.wrap("sceVideoOutGetVblankStatus", &videoOutGetVblankStatus), .expect_id = "1FZBKy8HeNU" },
     .{ .name = "sceVideoOutGetEventId", .function = trace.wrap("sceVideoOutGetEventId", &videoOutGetEventId), .expect_id = "U2JJtSqNKZI" },
@@ -856,6 +926,19 @@ fn agcSetNumInstances(
 ) callconv(abi.guest) ?[*]u32 {
     const body = [_]u32{instance_count};
     return writeAgcPacket(buffer, gpu.pm4.num_instances, &body);
+}
+
+fn agcSetIndexSize(
+    buffer: ?*AgcCommandBuffer,
+    index_size: u32,
+    cache_policy: u32,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) ?[*]u32 {
+    if (cache_policy != 0 or index_size > 2) return null;
+    const body = [_]u32{index_size};
+    return writeAgcPacket(buffer, gpu.pm4.index_type, &body);
 }
 
 fn agcSetRegistersIndirect(
@@ -1324,6 +1407,7 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcDcbWaitUntilSafeForRendering", .function = trace.wrap("sceAgcDcbWaitUntilSafeForRendering", &agcCommand), .expect_id = "MWiElSNE8j8" },
     .{ .name = "sceAgcDcbSetIndexBuffer", .function = trace.wrap("sceAgcDcbSetIndexBuffer", &agcCommand), .expect_id = "l4fM9K-Lyks" },
     .{ .name = "sceAgcDcbSetIndexCount", .function = trace.wrap("sceAgcDcbSetIndexCount", &agcCommand), .expect_id = "8N2tmT3jmC8" },
+    .{ .name = "sceAgcDcbSetIndexSize", .function = trace.wrap("sceAgcDcbSetIndexSize", &agcSetIndexSize), .expect_id = "GIIW2J37e70" },
     .{ .name = "sceAgcDcbDrawIndex", .function = trace.wrap("sceAgcDcbDrawIndex", &agcDrawIndex), .expect_id = "q88lQ+GP5Yk" },
     .{ .name = "sceAgcDcbDrawIndexAuto", .function = trace.wrap("sceAgcDcbDrawIndexAuto", &agcCommand), .expect_id = "Yw0jKSqop+E" },
     .{ .name = "sceAgcDcbDrawIndexIndirect", .function = trace.wrap("sceAgcDcbDrawIndexIndirect", &agcCommand), .expect_id = "t1vNu082-jM" },
