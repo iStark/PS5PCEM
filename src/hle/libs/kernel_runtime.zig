@@ -244,6 +244,7 @@ pub fn attachIo(io: ?std.Io) void {
         guest_stop_requested.store(false, .release);
     } else {
         process_start_nanoseconds = 0;
+        application_heap_api.store(0, .release);
         resetSyncAddresses();
         resetKernelObjects();
         guest_stop_requested.store(false, .release);
@@ -1050,8 +1051,20 @@ fn kernelDlsym(
     const name = readGuestCString(@intFromPtr(raw_name), &name_buffer) orelse
         return KernelError.efault.raw();
     if (modules.findByHandle(handle) == null) return KernelError.esrch.raw();
-    output.* = modules.resolveExport(handle, name) orelse return KernelError.enoent.raw();
-    return errno.ok;
+    if (modules.resolveExport(handle, name)) |address| {
+        output.* = address;
+        return errno.ok;
+    }
+
+    // Unity's IL2CPP runtime asks the main executable for this private bridge.
+    // It is supplied by libkernel on the console rather than by the executable's
+    // dynamic symbol table, so a normal export lookup cannot find it.
+    if (handle == modules.executable_handle and std.mem.eql(u8, name, "scriptingGetMem")) {
+        output.* = @intFromPtr(trace.wrap("scriptingGetMem", &scriptingGetMem));
+        return errno.ok;
+    }
+
+    return KernelError.enoent.raw();
 }
 
 /// Accepts a request to stop and unload a module.
@@ -1176,6 +1189,36 @@ fn getProcParam() callconv(abi.guest) ?*const anyopaque {
 fn setApplicationHeapApi(address: u64) callconv(abi.guest) i32 {
     application_heap_api.store(address, .release);
     return errno.ok;
+}
+
+/// Unity allocation bridge returned by `sceKernelDlsym(0, "scriptingGetMem")`.
+///
+/// The genuine libc publishes ten allocator callbacks through
+/// `_sceKernelRtldSetApplicationHeapAPI`; slot six is `posix_memalign`. Calling
+/// that guest function keeps allocations owned by libc, so Unity can later
+/// release them through the matching heap implementation.
+fn scriptingGetMem(requested_alignment: u64, size: u64) callconv(abi.guest) ?*anyopaque {
+    const alignment = @max(requested_alignment, @as(u64, 0x10));
+    if (!std.math.isPowerOfTwo(alignment)) return null;
+
+    const api_address = application_heap_api.load(.acquire);
+    const api_size = @sizeOf([10]u64);
+    if (!memory_api.isGuestRangeAccessible(api_address, api_size)) return null;
+    const api: *const [10]u64 = @ptrFromInt(api_address);
+    const posix_memalign = api[6];
+    if (posix_memalign == 0) return null;
+
+    // The callback executes synchronously on this host worker. Like the real
+    // runtime bridge, a temporary output word is therefore valid until it
+    // returns; only the allocated guest pointer escapes this frame.
+    var address: u64 = 0;
+    const status = threading.callGuestCurrent(posix_memalign, &.{
+        @intFromPtr(&address),
+        alignment,
+        size,
+    }) catch return null;
+    if (@as(u32, @truncate(status)) != 0 or address == 0) return null;
+    return @ptrFromInt(address);
 }
 
 // The system libc treats these as optional callback tables, not optional table
@@ -1620,6 +1663,54 @@ test "sanitizer replacement queries return sized empty hook tables" {
     try testing.expectEqualSlices(u64, &([_]u64{0} ** 12), new_hooks[1..]);
     try testing.expectEqual(@intFromPtr(malloc_hooks), @intFromPtr(sanitizerMallocReplaceExternal()));
     try testing.expectEqual(@intFromPtr(new_hooks), @intFromPtr(sanitizerNewReplaceExternal()));
+}
+
+const ApplicationHeapTestBackend = struct {
+    allocated_address: u64,
+    last_call: ?threading.GuestCall = null,
+
+    fn start(_: ?*anyopaque, _: threading.StartRequest) threading.BackendError!void {
+        return error.Unsupported;
+    }
+
+    fn call(raw: ?*anyopaque, request: threading.GuestCall) threading.BackendError!u64 {
+        const self: *ApplicationHeapTestBackend = @ptrCast(@alignCast(raw.?));
+        if (request.argument_count != 3) return error.CallFailed;
+        const output: *u64 = @ptrFromInt(request.arguments[0]);
+        output.* = self.allocated_address;
+        self.last_call = request;
+        return 0;
+    }
+
+    fn backend(self: *ApplicationHeapTestBackend) threading.Backend {
+        return .{
+            .context = self,
+            .start_fn = &start,
+            .call_fn = &call,
+        };
+    }
+};
+
+test "Unity scripting allocator uses the application heap memalign callback" {
+    var thread_manager = threading.Manager{};
+    var backend = ApplicationHeapTestBackend{ .allocated_address = 0x1234_5000 };
+    thread_manager.setBackend(backend.backend());
+    threading.attachManager(&thread_manager);
+    defer threading.attachManager(null);
+
+    var api = [_]u64{0} ** 10;
+    api[6] = 0xfeed_0000;
+    try std.testing.expectEqual(errno.ok, setApplicationHeapApi(@intFromPtr(&api)));
+    defer application_heap_api.store(0, .release);
+
+    try std.testing.expectEqual(
+        @as(?*anyopaque, @ptrFromInt(backend.allocated_address)),
+        scriptingGetMem(8, 0x40000),
+    );
+    try std.testing.expectEqual(@as(u64, 0xfeed_0000), backend.last_call.?.entry_point);
+    try std.testing.expectEqual(@as(u64, 0x10), backend.last_call.?.arguments[1]);
+    try std.testing.expectEqual(@as(u64, 0x40000), backend.last_call.?.arguments[2]);
+    try std.testing.expect(scriptingGetMem(24, 1) == null);
 }
 
 const SyncAddressTestBackend = struct {

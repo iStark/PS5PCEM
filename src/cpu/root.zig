@@ -1694,7 +1694,7 @@ pub const Dispatcher = struct {
         self.publishWake();
     }
 
-    fn call(raw: ?*anyopaque, guest_call: threading.GuestCall) threading.BackendError!void {
+    fn call(raw: ?*anyopaque, guest_call: threading.GuestCall) threading.BackendError!u64 {
         const self = fromContext(raw) orelse return error.Unsupported;
         const active = active_execution orelse return error.CallFailed;
         if (active.dispatcher != self or active.thread_handle != guest_call.thread_handle) {
@@ -1711,9 +1711,9 @@ pub const Dispatcher = struct {
             .guard_size = active.guard_size,
         };
         @memcpy(request.arguments[0..guest_call.argument_count], guest_call.arguments[0..guest_call.argument_count]);
-        _ = self.bridge.execute(request) catch |err| {
+        return self.bridge.execute(request) catch |err| {
             if (err == error.Unsupported) return error.Unsupported;
-            if (err == error.Interrupted and active_execution.?.exit_requested) return;
+            if (err == error.Interrupted and active_execution.?.exit_requested) return 0;
             return error.CallFailed;
         };
     }

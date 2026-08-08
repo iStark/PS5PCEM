@@ -82,7 +82,7 @@ pub const WaitRequest = struct {
 pub const GuestCall = struct {
     entry_point: u64,
     thread_handle: u64,
-    arguments: [2]u64 = .{ 0, 0 },
+    arguments: [6]u64 = [_]u64{0} ** 6,
     argument_count: u8 = 0,
 };
 
@@ -129,7 +129,7 @@ pub const Backend = struct {
     sleep_fn: ?*const fn (?*anyopaque, u64) BackendError!void = null,
     wait_fn: ?*const fn (?*anyopaque, WaitRequest) BackendError!WaitResult = null,
     wake_fn: ?*const fn (?*anyopaque, u64, u64, usize) void = null,
-    call_fn: ?*const fn (?*anyopaque, GuestCall) BackendError!void = null,
+    call_fn: ?*const fn (?*anyopaque, GuestCall) BackendError!u64 = null,
     request_exit_fn: ?*const fn (?*anyopaque, u64, u64) void = null,
 
     fn start(self: Backend, request: StartRequest) BackendError!void {
@@ -697,8 +697,8 @@ pub const Manager = struct {
         }
     }
 
-    pub fn callGuest(self: *Manager, entry_point: u64, arguments: []const u64) Error!void {
-        if (arguments.len > 2) return error.InvalidArgument;
+    pub fn callGuestResult(self: *Manager, entry_point: u64, arguments: []const u64) Error!u64 {
+        if (arguments.len > 6) return error.InvalidArgument;
         self.lock.lock();
         const backend = self.backend;
         self.lock.unlock();
@@ -711,6 +711,10 @@ pub const Manager = struct {
         };
         @memcpy(request.arguments[0..arguments.len], arguments);
         return call_fn(active_backend.context, request);
+    }
+
+    pub fn callGuest(self: *Manager, entry_point: u64, arguments: []const u64) Error!void {
+        _ = try self.callGuestResult(entry_point, arguments);
     }
 
     pub fn keyCreate(self: *Manager, out_key: *u32, destructor: u64) Error!void {
@@ -1001,6 +1005,14 @@ pub fn waitCurrent(request: WaitRequest) Error!WaitResult {
 pub fn wakeWaiters(key: u64, sequence: u64, maximum_waiters: usize) void {
     const active_manager = activeManager() orelse return;
     active_manager.wake(key, sequence, maximum_waiters);
+}
+
+/// Executes a callback on the current guest thread and returns its RAX value.
+/// Runtime allocator hooks use this to call back into the genuine libc while
+/// preserving that thread's guest TLS and execution context.
+pub fn callGuestCurrent(entry_point: u64, arguments: []const u64) Error!u64 {
+    const active_manager = activeManager() orelse return error.NotAttached;
+    return active_manager.callGuestResult(entry_point, arguments);
 }
 
 fn alignForward(value: u64, alignment: u64) Error!u64 {
@@ -1726,10 +1738,11 @@ const TestBackend = struct {
         return record.result.load(.acquire);
     }
 
-    fn call(raw: ?*anyopaque, request: GuestCall) BackendError!void {
+    fn call(raw: ?*anyopaque, request: GuestCall) BackendError!u64 {
         const self: *TestBackend = @ptrCast(@alignCast(raw.?));
         self.once_calls += 1;
         self.last_call = request;
+        return request.entry_point;
     }
 
     fn value(self: *TestBackend) Backend {
@@ -1842,6 +1855,11 @@ test "attributes and once expose POSIX-compatible state" {
     try testing.expectEqual(errno.ok, pthread_once(&once, @ptrFromInt(0x1234)));
     try testing.expectEqual(errno.ok, pthread_once(&once, @ptrFromInt(0x1234)));
     try testing.expectEqual(@as(usize, 1), backend.once_calls);
+
+    const callback_result = try callGuestCurrent(0x4567, &.{ 1, 2, 3 });
+    try testing.expectEqual(@as(u64, 0x4567), callback_result);
+    try testing.expectEqual(@as(u8, 3), backend.last_call.?.argument_count);
+    try testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, backend.last_call.?.arguments[0..3]);
     try testing.expectEqual(errno.ok, pthread_attr_destroy(&attr));
     try testing.expect(attr == null);
 }
