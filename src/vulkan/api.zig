@@ -164,6 +164,14 @@ pub const descriptor_type_storage_buffer: u32 = 7;
 pub const descriptor_type_combined_image_sampler: u32 = 1;
 
 pub const format_r8g8b8a8_unorm: u32 = 37;
+pub const format_r8g8b8a8_srgb: u32 = 43;
+pub const component_swizzle_identity: u32 = 0;
+pub const component_swizzle_zero: u32 = 1;
+pub const component_swizzle_one: u32 = 2;
+pub const component_swizzle_r: u32 = 3;
+pub const component_swizzle_g: u32 = 4;
+pub const component_swizzle_b: u32 = 5;
+pub const component_swizzle_a: u32 = 6;
 pub const image_type_2d: u32 = 1;
 pub const image_view_type_2d: u32 = 1;
 pub const image_tiling_optimal: u32 = 0;

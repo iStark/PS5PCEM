@@ -739,6 +739,8 @@ const CachedSampledImage = struct {
     width: u32,
     height: u32,
     tile_mode: u8,
+    state_hash: u64,
+    source_generation: u64,
     content_hash: u64,
     image: OwnedImage,
     view: vk.ImageView,
@@ -2657,7 +2659,7 @@ pub const Renderer = struct {
         defer self.allocator.free(frame);
         try self.readMapped(snapshot.readback, frame);
         self.frame_profile.readback_bytes += frame_bytes;
-        forceOpaqueAlpha(frame);
+        if (snapshot.target.descriptor.force_destination_alpha_one) forceDestinationAlphaOne(frame);
         try self.recordGuestColorTarget(snapshot.target, frame);
         self.render_targets.items[index].host_generation = snapshot.gpu_generation;
 
@@ -3129,7 +3131,10 @@ pub const Renderer = struct {
         );
         try self.submitOneShot(command_buffer);
         try self.readMapped(readback, frame);
-        if (guest_target) |target| try self.recordGuestColorTarget(target, frame);
+        if (guest_target) |target| {
+            if (target.descriptor.force_destination_alpha_one) forceDestinationAlphaOne(frame);
+            try self.recordGuestColorTarget(target, frame);
+        }
         if (frame.len == self.graphics_probe_frame.len) @memcpy(&self.graphics_probe_frame, frame);
 
         const center = (@as(usize, height / 2) * width + width / 2) * 4;
@@ -3177,7 +3182,7 @@ pub const Renderer = struct {
             );
             // Guest PS often leaves alpha at 0 for premultiplied/unused paths;
             // force opaque so the host window and PPM dump show RGB content.
-            forceOpaqueAlpha(frame);
+            makePresentationOpaque(frame);
             // Dump the first non-black guest frame for offline inspection.
             if (self.frame_dumps == 0 and colored != 0) {
                 dumpFramePpm("out\\first-frame.ppm", width, height, frame);
@@ -3857,7 +3862,9 @@ pub const Renderer = struct {
             );
             return Error.UnsupportedSampledImage;
         }
-        // Metadata pointers (counter/DCC) are ignored for the first sample path.
+        // Compressed metadata is not decoded yet. In particular, it must never
+        // be interpreted as color pixels: DCC/CMASK are control data, not an
+        // alternate image payload.
         if (descriptor.metadata_address != 0) {
             if (log_verbose_gpu) std.debug.print(
                 "[vulkan dcb] sampled image: ignoring metadata @0x{x}\n",
@@ -3888,26 +3895,10 @@ pub const Renderer = struct {
             return err;
         };
 
-        var content_hash: u64 = 14695981039346656037;
         const probe_span = std.math.cast(usize, layout.required_source_bytes) orelse 0;
-        if (probe_span > 0) {
-            const num_chunks = 16;
-            const chunk_size = 256;
-            const step = probe_span / num_chunks;
-            var i: usize = 0;
-            while (i < num_chunks) : (i += 1) {
-                var chunk: [chunk_size]u8 = @splat(0);
-                const offset = i * step;
-                const want = @min(chunk.len, probe_span - offset);
-                if (want > 0) {
-                    _ = memory.read(memory.context, descriptor.address + offset, chunk[0..want]);
-                    for (chunk[0..want]) |b| {
-                        content_hash ^= b;
-                        content_hash *%= 1099511628211;
-                    }
-                }
-            }
-        }
+        const content_hash = hashGuestMemoryRange(memory, descriptor.address, probe_span);
+        const state_hash = sampledImageStateHash(descriptor, sampler_descriptor);
+        const source_generation = self.sampledSourceGeneration(descriptor.address);
 
         var cache_hit_idx: ?usize = null;
         for (self.sampled_image_cache.items, 0..) |*item, idx| {
@@ -3915,6 +3906,8 @@ pub const Renderer = struct {
                 item.width == descriptor.width and
                 item.height == descriptor.height and
                 item.tile_mode == @intFromEnum(descriptor.tile_mode) and
+                item.state_hash == state_hash and
+                item.source_generation == source_generation and
                 item.content_hash == content_hash)
             {
                 cache_hit_idx = idx;
@@ -3941,17 +3934,13 @@ pub const Renderer = struct {
         defer self.allocator.free(linear);
         const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
         try layout.stage(reader, descriptor.address, linear);
-        var nonzero = countNonzeroRgba(linear);
+        const nonzero = countNonzeroRgba(linear);
         const metadata = gpu.MetadataSurface.fromImage(descriptor);
         if (nonzero == 0 and metadata.hasAny()) {
-            try metadata.stageRgba(reader, linear, layout.width, layout.height);
-            nonzero = countNonzeroRgba(linear);
-            if (nonzero != 0) {
-                if (log_verbose_gpu) std.debug.print(
-                    "[vulkan dcb] metadata surface recovered {d} nonzero from metadata addr=0x{x} dcc=0x{x} cmask=0x{x} fmask=0x{x}\n",
-                    .{ nonzero, metadata.metadata_address, metadata.dcc_address, metadata.cmask_address, metadata.fmask_address },
-                );
-            }
+            if (log_verbose_gpu) std.debug.print(
+                "[vulkan dcb] compressed/metadata-only sample left transparent addr=0x{x} meta=0x{x} dcc=0x{x} cmask=0x{x} fmask=0x{x}\n",
+                .{ descriptor.address, metadata.metadata_address, metadata.dcc_address, metadata.cmask_address, metadata.fmask_address },
+            );
         }
         // Probe several points in the guest surface: tiled data may put the
         // first texels far from the base while the head of the allocation is
@@ -4041,10 +4030,9 @@ pub const Renderer = struct {
                 },
             );
             @memset(linear, 0);
-        } else if (nonzero != 0) {
-            forceOpaqueAlpha(linear);
-            rememberLastSampledTexture(linear, descriptor.width, descriptor.height);
         }
+        const image_format = sampledImageFormat(sampler_descriptor.force_srgb);
+        const components = try sampledImageComponents(descriptor.dst_select);
         const upload = try self.createBuffer(
             byte_count,
             vk.buffer_usage_transfer_src_bit,
@@ -4055,7 +4043,7 @@ pub const Renderer = struct {
         const image = try self.createImage(
             descriptor.width,
             descriptor.height,
-            vk.format_r8g8b8a8_unorm,
+            image_format,
             vk.image_usage_transfer_dst_bit | vk.image_usage_sampled_bit,
         );
         errdefer self.destroyImage(image);
@@ -4119,7 +4107,8 @@ pub const Renderer = struct {
 
         const view_info = vk.ImageViewCreateInfo{
             .image = image.handle,
-            .format = vk.format_r8g8b8a8_unorm,
+            .format = image_format,
+            .components = components,
             .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
         };
         var view: vk.ImageView = 0;
@@ -4143,7 +4132,8 @@ pub const Renderer = struct {
             if (stale.guest_address != descriptor.address or
                 stale.width != descriptor.width or
                 stale.height != descriptor.height or
-                stale.tile_mode != @intFromEnum(descriptor.tile_mode))
+                stale.tile_mode != @intFromEnum(descriptor.tile_mode) or
+                stale.state_hash != state_hash)
             {
                 continue;
             }
@@ -4174,6 +4164,8 @@ pub const Renderer = struct {
             .width = descriptor.width,
             .height = descriptor.height,
             .tile_mode = @intFromEnum(descriptor.tile_mode),
+            .state_hash = state_hash,
+            .source_generation = source_generation,
             .content_hash = content_hash,
             .image = image,
             .view = view,
@@ -4182,6 +4174,16 @@ pub const Renderer = struct {
         }) catch {};
 
         return .{ .image = image, .view = view, .sampler = sampler };
+    }
+
+    fn sampledSourceGeneration(self: *const Renderer, address: u64) u64 {
+        for (self.render_targets.items) |cached| {
+            if (cached.target.descriptor.address == address) return cached.gpu_generation;
+        }
+        for (self.completed_frames.items) |cached| {
+            if (cached.guest_address == address) return cached.sequence;
+        }
+        return 0;
     }
 
     fn createGuestSampler(self: *Renderer, descriptor: gpu.resources.SamplerDescriptor) Error!vk.Sampler {
@@ -4961,9 +4963,86 @@ fn countNonzeroRgba(linear: []const u8) u32 {
     var nonzero: u32 = 0;
     var i: usize = 0;
     while (i + 3 < linear.len) : (i += 4) {
-        if (linear[i] != 0 or linear[i + 1] != 0 or linear[i + 2] != 0) nonzero += 1;
+        if (linear[i] != 0 or linear[i + 1] != 0 or linear[i + 2] != 0 or linear[i + 3] != 0) nonzero += 1;
     }
     return nonzero;
+}
+
+fn hashGuestMemoryRange(memory: GuestMemory, address: u64, span: usize) u64 {
+    var hash: u64 = 14695981039346656037;
+    if (span == 0) return hash;
+
+    // Hash a distributed set of cache lines rather than only the first few
+    // kilobytes. GPU render-target generations cover exact host writes; these
+    // probes catch CPU/streaming updates without hashing a multi-megabyte image
+    // for every draw.
+    const chunk_size: usize = 64;
+    const maximum_chunks: usize = 128;
+    const target_stride: usize = 64 * 1024;
+    const ideal_chunks = 1 + ((span - 1) / target_stride);
+    const chunk_count = @min(maximum_chunks, @max(@as(usize, 1), ideal_chunks));
+    const readable = @min(chunk_size, span);
+    const last_offset = span - readable;
+    var index: usize = 0;
+    while (index < chunk_count) : (index += 1) {
+        var chunk: [chunk_size]u8 = @splat(0);
+        const offset = if (chunk_count == 1) 0 else (last_offset * index) / (chunk_count - 1);
+        if (!memory.read(memory.context, address + offset, chunk[0..readable])) continue;
+        for (chunk[0..readable]) |byte| {
+            hash ^= byte;
+            hash *%= 1099511628211;
+        }
+    }
+    return hash;
+}
+
+fn sampledImageFormat(force_srgb: bool) u32 {
+    return if (force_srgb) vk.format_r8g8b8a8_srgb else vk.format_r8g8b8a8_unorm;
+}
+
+fn vulkanComponentSwizzle(selector: u8) Error!u32 {
+    return switch (selector) {
+        0 => vk.component_swizzle_zero,
+        1 => vk.component_swizzle_one,
+        4 => vk.component_swizzle_r,
+        5 => vk.component_swizzle_g,
+        6 => vk.component_swizzle_b,
+        7 => vk.component_swizzle_a,
+        else => Error.UnsupportedSampledImage,
+    };
+}
+
+fn sampledImageComponents(selectors: [4]u8) Error!vk.ComponentMapping {
+    return .{
+        .r = try vulkanComponentSwizzle(selectors[0]),
+        .g = try vulkanComponentSwizzle(selectors[1]),
+        .b = try vulkanComponentSwizzle(selectors[2]),
+        .a = try vulkanComponentSwizzle(selectors[3]),
+    };
+}
+
+fn sampledImageStateHash(
+    descriptor: gpu.resources.ImageDescriptor,
+    sampler: gpu.resources.SamplerDescriptor,
+) u64 {
+    const words = [_]u32{
+        @as(u32, descriptor.dst_select[0]) |
+            (@as(u32, descriptor.dst_select[1]) << 8) |
+            (@as(u32, descriptor.dst_select[2]) << 16) |
+            (@as(u32, descriptor.dst_select[3]) << 24),
+        @intFromBool(sampler.force_srgb),
+        @as(u32, sampler.clamp_x) |
+            (@as(u32, sampler.clamp_y) << 8) |
+            (@as(u32, sampler.clamp_z) << 16) |
+            (@as(u32, @intFromBool(sampler.unnormalized_coordinates)) << 24),
+        @as(u32, sampler.magnification_filter) |
+            (@as(u32, sampler.minification_filter) << 8) |
+            (@as(u32, sampler.mip_filter) << 16),
+        @bitCast(sampler.minimum_lod),
+        @bitCast(sampler.maximum_lod),
+        @bitCast(sampler.lod_bias),
+    };
+    return std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(&words));
 }
 
 fn fillNeutralTextureRgba8(linear: []u8) void {
@@ -5051,7 +5130,6 @@ fn scanNearbyLinearRgba(
             }
         }
         if (!ok) continue;
-        forceOpaqueAlpha(linear[0..need]);
         const nz = countNonzeroRgba(linear[0..need]);
         if (nz > best_score and nz > need / 32) {
             best_score = nz;
@@ -5068,46 +5146,19 @@ fn scanNearbyLinearRgba(
             const dst = @as(usize, y) * row;
             _ = memory.read(memory.context, src, linear[dst..][0..row]);
         }
-        forceOpaqueAlpha(linear[0..need]);
     }
     return best;
 }
 
-fn forceOpaqueAlpha(rgba: []u8) void {
+fn forceDestinationAlphaOne(rgba: []u8) void {
     var i: usize = 0;
     while (i + 3 < rgba.len) : (i += 4) {
         rgba[i + 3] = 255;
     }
 }
 
-// Last successfully staged guest texture (RGBA8). When the next draw's T# is
-// still empty (upload race / wrong tile) reuse this instead of inventing art.
-var last_sample_w: u32 = 0;
-var last_sample_h: u32 = 0;
-var last_sample_rgba: []u8 = &.{};
-var last_sample_owned: bool = false;
-
-fn rememberLastSampledTexture(linear: []const u8, width: u32, height: u32) void {
-    if (width == 0 or height == 0 or linear.len < 4) return;
-    const need = linear.len;
-    if (!last_sample_owned or last_sample_rgba.len < need) {
-        if (last_sample_owned and last_sample_rgba.len != 0) {
-            std.heap.page_allocator.free(last_sample_rgba);
-        }
-        last_sample_rgba = std.heap.page_allocator.alloc(u8, need) catch return;
-        last_sample_owned = true;
-    }
-    @memcpy(last_sample_rgba[0..need], linear[0..need]);
-    last_sample_w = width;
-    last_sample_h = height;
-}
-
-fn tryReuseLastSampledTexture(linear: []u8, width: u32, height: u32) ?u32 {
-    if (!last_sample_owned or last_sample_w == 0 or last_sample_h == 0) return null;
-    if (last_sample_w != width or last_sample_h != height) return null;
-    if (last_sample_rgba.len < linear.len) return null;
-    @memcpy(linear, last_sample_rgba[0..linear.len]);
-    return countNonzeroRgba(linear);
+fn makePresentationOpaque(rgba: []u8) void {
+    forceDestinationAlphaOne(rgba);
 }
 
 /// Ensure s16..s19 (typical Unity PS colour scale from s_buffer_load_dwordx4)
@@ -5897,6 +5948,35 @@ test "graphics probe is opt-in and carries standalone shader modules" {
     try std.testing.expect(graphics_probe_vertex_spirv.len > 32);
     try std.testing.expect(graphics_probe_fragment_spirv.len > 24);
     try std.testing.expectEqual(@as(usize, 64 * 64 * 4), graphics_probe_bytes);
+}
+
+test "sampled image views honor sRGB and destination selectors" {
+    try std.testing.expectEqual(vk.format_r8g8b8a8_unorm, sampledImageFormat(false));
+    try std.testing.expectEqual(vk.format_r8g8b8a8_srgb, sampledImageFormat(true));
+
+    const identity = try sampledImageComponents(.{ 4, 5, 6, 7 });
+    try std.testing.expectEqual(vk.component_swizzle_r, identity.r);
+    try std.testing.expectEqual(vk.component_swizzle_g, identity.g);
+    try std.testing.expectEqual(vk.component_swizzle_b, identity.b);
+    try std.testing.expectEqual(vk.component_swizzle_a, identity.a);
+
+    const blue_one_red_zero = try sampledImageComponents(.{ 6, 1, 4, 0 });
+    try std.testing.expectEqual(vk.component_swizzle_b, blue_one_red_zero.r);
+    try std.testing.expectEqual(vk.component_swizzle_one, blue_one_red_zero.g);
+    try std.testing.expectEqual(vk.component_swizzle_r, blue_one_red_zero.b);
+    try std.testing.expectEqual(vk.component_swizzle_zero, blue_one_red_zero.a);
+    try std.testing.expectError(Error.UnsupportedSampledImage, sampledImageComponents(.{ 2, 5, 6, 7 }));
+}
+
+test "RGBA occupancy preserves black alpha and destination alpha is explicit" {
+    var pixels = [_]u8{
+        0, 0, 0, 0,
+        0, 0, 0, 17,
+        5, 0, 0, 31,
+    };
+    try std.testing.expectEqual(@as(u32, 2), countNonzeroRgba(&pixels));
+    forceDestinationAlphaOne(&pixels);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255 }, &.{ pixels[3], pixels[7], pixels[11] });
 }
 
 test "presentation scaling letterboxes RGBA and converts BGRA" {
