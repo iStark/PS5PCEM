@@ -23,8 +23,14 @@ Vulkan.
   fragment interpolation.
 - Persistent render targets and bounded buffer, texture, and pipeline caches
   keep frame resources alive across draws and reduce redundant queue submits.
+- Title plugins can be mapped explicitly before execution; later
+  `sceKernelLoadStartModule` calls receive stable handles and
+  `sceKernelDlsym` resolves readable export names inside the selected PRX.
 - Real title frames are visible, but color, composition, depth/MRT, compressed
   surfaces, and some texture layouts are still incomplete.
+- PS VR2 libraries currently expose only compatibility/no-device behavior.
+  VR plugins can initialize far enough to load Unity assets, but headset
+  rendering, tracking, controllers, and a host OpenXR bridge do not exist yet.
 
 ![Live gameplay rendered by PS5PCEM](docs/images/live-gameplay.png)
 
@@ -81,6 +87,29 @@ For a native optimized build, install Zig 0.16 and use a current Vulkan driver:
 zig build -Doptimize=ReleaseFast
 .\zig-out\bin\game-run.exe "X:\path\to\decrypted-title\eboot.bin"
 ```
+
+When the decrypted executable is stored separately from the installed content,
+pass the content root through `--app0`:
+
+```powershell
+.\zig-out\bin\game-run.exe --app0 "X:\path\to\title" `
+  "X:\path\to\title\decrypted\eboot.bin"
+```
+
+Some Unity titles load native plugins after startup rather than naming them in
+the executable's dependency tables. Until live graph extension is available,
+`PS5_PRELOAD` maps those PRXs during the safe dependency-first load phase. The
+value is a semicolon-separated list of relative paths or unique basenames:
+
+```powershell
+$env:PS5_PRELOAD = "plugin-a.prx;plugin-b.prx"
+.\zig-out\bin\game-run.exe --app0 "X:\path\to\title" `
+  "X:\path\to\title\decrypted\eboot.bin"
+```
+
+Preloading does not emulate the device or service behind a plugin; it only
+makes the module, its initializer, and its own exported symbols available to
+the guest process.
 
 `module-info` is where the pieces meet. It reads a module, works out every
 symbol the module imports, and checks each one against the firmware registry
@@ -1007,11 +1036,20 @@ partial unmaps, and zero-filled reuse are covered by the same lifecycle rules.
 **`libkernel` — module loading** ([src/hle/modules.zig](src/hle/modules.zig))
 
 A title does not reach all of its own code through the dynamic tables. Some
-modules it loads itself, by path, at the point it needs them. Everything
-adjacent to the executable is already mapped and relocated before guest code
-runs, so `sceKernelLoadStartModule` resolves the request to what exists and
-returns its handle. Loading again would produce a second copy with its own
-relocations and duplicate the state the title expects to be shared.
+modules it loads itself, by path, at the point it needs them. The runtime maps
+the reachable dependency graph plus any modules requested through
+`PS5_PRELOAD` before guest code runs. `sceKernelLoadStartModule` then resolves a
+request to that published set and returns a stable handle. Loading the same PRX
+again would produce a second copy with its own relocations and duplicate state
+the title expects to be shared.
+
+Each published module retains the registration ID of its own guest exports.
+`sceKernelDlsym` hashes the readable name supplied by the title and searches
+only the module selected by the handle, including function, object, and
+untyped exports. This prevents two Unity plugins that publish the same callback
+name from aliasing each other. Truly on-demand mapping is still future work;
+an unlisted late module returns `ENOENT` rather than being loaded while guest
+threads are active.
 
 Path matching ignores separator style and case. The case part is not
 defensiveness: this title asks for `Il2CppUserAssemblies.prx` while shipping
@@ -1110,7 +1148,11 @@ mount point rather than returning `ENOSYS` with an untouched buffer — Unity's
 temporary-file layer builds paths from that string, so leaving it uninitialised
 looks like an unrelated null dereference later. This is still bootstrap
 coverage, not a claim that filesystems, networking, event flags, or semaphores
-are complete.
+are complete. POSIX `inet_ntop` formats IPv4/IPv6 addresses locally, while
+`sendmsg`/`recvmsg` report the offline network state and `ftruncate` preserves
+the read-only filesystem policy. The fixed semaphore store now has room for
+1,024 entries because Unity Baselib can create more than 64 before its first
+frame.
 
 **Title bootstrap services** ([src/hle/libs/system_service.zig](src/hle/libs/system_service.zig),
 [src/hle/libs/user_service.zig](src/hle/libs/user_service.zig),
@@ -1422,14 +1464,28 @@ scheduler and Vulkan backend. Observed startup work now includes:
   layouts still produce visible corruption.
 - `SetFlip` and equeue delivery use VideoOut filter `-13`; flip status fills
   process-time fields and event data retains the guest flip argument.
+- Indexed draws can emit AGC `SetIndexSize` as a real `INDEX_TYPE` packet, and
+  deleting a vblank event now removes the corresponding VideoOut queue
+  registration instead of returning placeholder success.
 
 Near-null object probes in managed code
 (`cmp [obj+disp], 0` with `obj == null`) are stepped past so the title can take
 its null branch instead of dying after the first flip; the process now survives
-past that historical crash site. Frame pacing is still CPU-bound even when host
-GPU utilization is low: ordinary frames repeatedly translate/specialize shaders
-and move tens of MiB of guest data, while texture-streaming frames perform much
+past that historical crash site. Non-compare field accesses use a bounded
+synthetic object recovery path; its instruction decoder now recognizes both
+ordinary REX and two-/three-byte VEX memory forms used by generated Unity
+floating-point setters. Frame pacing is still CPU-bound even when host GPU
+utilization is low: ordinary frames repeatedly translate/specialize shaders and
+move tens of MiB of guest data, while texture-streaming frames perform much
 larger uploads.
+
+A PS VR2 Unity bring-up now maps both its native VR plugin and generated Burst
+module, resolves their callbacks by module-scoped `sceKernelDlsym`, survives the
+plugin's initial configuration setters, and begins loading `unity_builtin_extra`,
+`sharedassets0`, `level0`, and `resources.assets`. It does not reach VR frame
+submission: HMD, tracker, and VR-controller calls intentionally report no
+device, and there is no host headset integration. VR compatibility is therefore
+deferred until the non-VR graphics and synchronization paths are stable.
 
 ## Error codes
 
@@ -1455,6 +1511,8 @@ from leaking into host code where nothing would check it.
    guest-visible synchronization.
 5. Keep the guest process in a stable long-running flip/submit loop and close
    remaining HLE or wait-loop gaps as they appear.
+6. Add real HMD/tracker/controller state and a host VR bridge only after the
+   ordinary VideoOut path is stable enough to support it.
 
 ---
 
@@ -1532,6 +1590,11 @@ immediate register forms of SSE4a `EXTRQ` and `INSERTQ` update the saved XMM
 state according to AMD's six-bit length/index rules. Returning from VEH then
 resumes at the following guest instruction. Unknown opcodes retain the normal
 `error.GuestFault` path.
+
+First-page null-object compatibility recovery decodes the ModRM base through
+ordinary REX and VEX2/VEX3 prefixes. This covers scalar `vmovss`/`vmovsd` field
+accesses generated by Unity without treating an arbitrary unmapped address as a
+recoverable null object.
 
 The bridge intentionally does not force a context change in another host
 thread. Shutdown marks such an execution interrupted and observes it when guest
@@ -1719,8 +1782,10 @@ first; identifier-only lookup remains the documented fallback for incomplete
 module metadata. [src/runtime/module_graph.zig](src/runtime/module_graph.zig)
 recursively indexes adjacent `.prx`/`.sprx` files, follows both `DT_NEEDED` and
 PS5 needed-module declarations, maps the complete reachable graph, and only then
-relocates it. Missing files remain firmware/HLE dependencies. The resulting
-module list is already in dependency-first initializer order. Optional graph
+relocates it. Explicit preload roots extend that graph for plugins the title
+will request later. Missing files remain firmware/HLE dependencies. The
+resulting module list is already in dependency-first initializer order and
+publishes per-module export ownership for `sceKernelDlsym`. Optional graph
 diagnostics report every unresolved strong import in the node that stops
 linking; the `graph-info` tool enables them by default.
 
