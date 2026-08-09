@@ -51,7 +51,10 @@ Vulkan.
   Connected reaches repeated graphics/compute submissions and VideoOut flips;
   its compact typed image-clear dispatches now update guest render-target and
   depth memory, while its bounded buffer-to-volume uploads populate 3D images.
-  Output remains black because submitted draws still have no usable color target.
+  Final compositor draws that omit color-buffer registers are now retained for
+  the following VideoOut flip, which supplies the scanout target. Output remains
+  black because unsupported compute shaders and a later guest fault currently
+  stop the measured run before that following flip.
 
 ![Terminator 2D gameplay rendered by PS5PCEM](docs/images/live-gameplay.png)
 
@@ -71,7 +74,7 @@ the repository contains none of that content.
 | **Terminator 2D: No Fate** | Reaches gameplay with correct color reproduction and clean title-provided backgrounds, characters, HUD elements, and textures | Early publisher logos and the pause menu retain artifacts; synchronous upload/readback limits frame pacing, while depth/MRT and compression metadata remain incomplete |
 | **Pistol Whip** | Maps the native PS VR2 plugin and Burst module, then starts loading Unity asset archives | Headset, tracking, controller, and host OpenXR support are intentionally deferred |
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
-| **Tetris Effect: Connected** | Completes Unreal filesystem/config bootstrap, creates AGC workloads, executes compact typed UAV clears and 3D volume uploads, and reaches a repeated graphics/compute submit loop with six observed VideoOut flips | Output is black: the draw path has no usable color target, and the 512 GiB virtual reservation can still depend on host address-space placement |
+| **Tetris Effect: Connected** | Completes Unreal filesystem/config bootstrap, creates AGC workloads, executes compact typed UAV clears and 3D volume uploads, reaches VideoOut flips, and retains a targetless final draw for the next scanout buffer | Output is black: several compute shaders still need lowering and the latest run faults in guest code before the pending display draw reaches its following flip; the 512 GiB virtual reservation can also depend on host address-space placement |
 
 ## Components
 
@@ -1614,9 +1617,14 @@ run before its next boundary can be stated. Host VR presentation remains absent.
 
 Tetris Effect: Connected exercises the same expanded Unreal path without a VR
 plugin. It reaches a repeated graphics/compute loop, records three draws on
-ordinary frames, and produced six observed VideoOut flips in the current test
-window without the earlier host-side `memcpy` access violation. Vulkan still
-rejects those draws as `MissingColorTarget`, so the presented image is black.
+ordinary frames, and produced six observed VideoOut flips in an earlier test
+window without the previous host-side `memcpy` access violation. Its final
+compositor can legally omit CB descriptors and rely on the following VideoOut
+flip to name the scanout allocation. The renderer now keeps the latest complete
+targetless draw, snapshots its graphics state, and resolves a bounded 32-bit
+color target from the registered display address, dimensions, pitch, and tiling
+mode at that flip. `MissingColorTarget` is therefore no longer the immediate
+rendering boundary.
 Its compact 8- and 11-instruction typed clears now execute for `R8_UINT`,
 `R32_UINT`, `RGBA8_UNORM`, `RGBA8_UINT`, and `RGBA16_FLOAT`, including inverse
 storage swizzles and tiled render-target/depth addressing. Its observed
@@ -1624,9 +1632,12 @@ storage swizzles and tiled render-target/depth addressing. Its observed
 `R16_UINT→R16_UINT` volumes with the shader's bounds, strides, base coordinates,
 and linear/tiled target layout. A measured startup frame consequently completes
 all four volume uploads (two 1×1×1 and two 16×16×16) without a rejected compute
-dispatch; `MissingColorTarget` is now the immediate rendering boundary.
+dispatch. The latest measured run accepts and defers the formerly rejected draw,
+but later compute programs still report `UndefinedRegister`,
+`InvalidStorageBinding`, and `UnsupportedOpcode`; guest execution then faults at
+`eboot.bin+0x16af4ef` before another flip can validate the pending display draw.
 Its 3840×2160 display buffers now register with the expected pitch. A measured
-loading run held private memory near 2.14 GiB instead of retaining a geometric
+loading run held private memory near 2.2–2.3 GiB instead of retaining a geometric
 chain of arena-backed temporary buffers past 9 GiB; the remaining working-set
 growth tracks newly touched guest asset pages. A separate startup risk remains:
 placement of the title's 512 GiB sparse virtual reservation can fail when the
@@ -1651,8 +1662,8 @@ from leaking into host code where nothing would check it.
 2. Replace the exact UAV fast paths with general storage-image lowering, then
    implement more color/texture formats, mip views, depth/stencil, MRT, and
    compressed-surface metadata.
-3. Tighten render ordering and composition against later title captures, then
-   replace the remaining diagnostic shader fallbacks.
+3. Lower the compute register/storage/opcode gaps that stop the current loading
+   run before its pending scanout draw reaches the following VideoOut flip.
 4. Reduce repeated compute readbacks and large texture uploads without changing
    guest-visible synchronization.
 5. Keep the guest process in a stable long-running flip/submit loop and close

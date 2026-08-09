@@ -28,6 +28,7 @@ fn resolveVideoOutBuffer(_: ?*anyopaque, flip: gpu.state.Flip) ?vulkan.DisplayBu
         .width = registration.attribute.width,
         .height = registration.attribute.height,
         .pitch_in_pixels = registration.attribute.pitch_in_pixels,
+        .tiling_mode = registration.attribute.tiling_mode,
     };
 }
 

@@ -170,6 +170,8 @@ pub const DisplayBuffer = struct {
     width: u32,
     height: u32,
     pitch_in_pixels: u32,
+    /// SceVideoOutTilingMode: 0 is the display-tiled layout, 1 is linear.
+    tiling_mode: u32 = 0,
 };
 
 pub const DisplayBufferResolver = struct {
@@ -614,6 +616,50 @@ const GuestColorTarget = struct {
     layout: gpu.SurfaceLayout,
 };
 
+/// How a graphics packet wants geometry issued on the host.
+const GuestDraw = struct {
+    /// Non-indexed `DRAW_INDEX_AUTO` path (diagnostic triangle is count 3).
+    vertex_count: u32 = 3,
+    instance_count: u32 = 1,
+    /// When set, issue `vkCmdDrawIndexed` from guest memory at `index_address`.
+    index_count: ?u32 = null,
+    index_address: u64 = 0,
+    /// `false` = UINT16, `true` = UINT32. AGC defaults to 16-bit indices.
+    index_uint32: bool = false,
+};
+
+/// Some final compositors omit CB registers because the following VideoOut
+/// flip names the scanout allocation. Keep only the most recent such draw.
+const PendingGuestDraw = struct {
+    state: gpu.State,
+    draw: GuestDraw,
+    vertex_stage: gpu.resources.ShaderStage,
+};
+
+fn displayColorTarget(buffer: DisplayBuffer) ?gpu.resources.ColorTarget {
+    if (buffer.address == 0 or buffer.width == 0 or buffer.height == 0) return null;
+    const pitch = if (buffer.pitch_in_pixels != 0) buffer.pitch_in_pixels else buffer.width;
+    if (pitch < buffer.width) return null;
+    const tile_mode: gpu.resources.TileMode = switch (buffer.tiling_mode) {
+        0 => .render_target,
+        1 => .linear,
+        else => return null,
+    };
+    var target = std.mem.zeroes(gpu.resources.ColorTarget);
+    target.address = buffer.address;
+    target.width = buffer.width;
+    target.height = buffer.height;
+    target.depth = 1;
+    target.pitch = pitch;
+    // DATA_FORMAT_8_8_8_8. VideoOut's pixel format is a separate unified
+    // format enum; the colour-target descriptor stores the data format only.
+    target.format = 10;
+    target.tile_mode = tile_mode;
+    target.write_mask = 0xf;
+    target.force_destination_alpha_one = true;
+    return target;
+}
+
 /// One guest color allocation kept resident as a Vulkan attachment across
 /// draws.  The old path recreated this entire object graph and round-tripped
 /// every pixel through the CPU after each draw, which both destroyed
@@ -785,6 +831,8 @@ pub const Renderer = struct {
     draw_callbacks: u64 = 0,
     translated_draws: u64 = 0,
     guest_graphics_draws: u64 = 0,
+    targetless_draws_deferred: u64 = 0,
+    targetless_draws_resolved: u64 = 0,
     graphics_probe_colored_pixels: u32 = 0,
     graphics_probe_frame: [graphics_probe_bytes]u8 = @splat(0),
     render_targets: std.ArrayList(CachedRenderTarget) = .empty,
@@ -795,6 +843,7 @@ pub const Renderer = struct {
     frame_sequence: u64 = 0,
     presentation_sink: ?PresentationSink = null,
     display_buffer_resolver: ?DisplayBufferResolver = null,
+    pending_targetless_draw: ?*PendingGuestDraw = null,
     window_presentation: ?WindowPresentation = null,
     presented_frames: u64 = 0,
     /// Batched present queue. Only the most recent frame survives: a burst of
@@ -1096,6 +1145,7 @@ pub const Renderer = struct {
 
     pub fn deinit(self: *Renderer) void {
         _ = self.device_functions.device_wait_idle(self.device);
+        if (self.pending_targetless_draw) |pending| self.allocator.destroy(pending);
         for (self.render_targets.items) |target| self.destroyCachedRenderTarget(target);
         self.render_targets.deinit(self.allocator);
         for (self.sampled_image_cache.items) |image| {
@@ -2935,18 +2985,6 @@ pub const Renderer = struct {
         return false;
     }
 
-    /// How a graphics packet wants geometry issued on the host.
-    const GuestDraw = struct {
-        /// Non-indexed `DRAW_INDEX_AUTO` path (diagnostic triangle is count 3).
-        vertex_count: u32 = 3,
-        instance_count: u32 = 1,
-        /// When set, issue `vkCmdDrawIndexed` from guest memory at `index_address`.
-        index_count: ?u32 = null,
-        index_address: u64 = 0,
-        /// `false` = UINT16, `true` = UINT32. AGC defaults to 16-bit indices.
-        index_uint32: bool = false,
-    };
-
     fn drawPersistentGraphicsShaders(
         self: *Renderer,
         vertex_words: []const u32,
@@ -3585,15 +3623,15 @@ pub const Renderer = struct {
         state: *const gpu.State,
         draw: GuestDraw,
         vertex_stage: gpu.resources.ShaderStage,
+        target_override: ?gpu.resources.ColorTarget,
     ) anyerror!void {
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
         const render_state = gpu.resources.decodeRenderState(state);
-        if (render_state.active_color_count == 0) return Error.MissingColorTarget;
         // Depth and multi-MRT are ignored on this first host path: only colour
         // target 0 is rendered. Many title draws enable depth; rejecting them
         // would drop the whole colour path.
         if (render_state.depth_control.test_enabled or render_state.depth_control.write_enabled or
-            render_state.active_color_count != 1)
+            (target_override == null and render_state.active_color_count != 1))
         {
             if (log_verbose_gpu) std.debug.print(
                 "[vulkan dcb] draw: ignoring depth/mrt extras (colors={d} depth_test={any} depth_write={any})\n",
@@ -3604,12 +3642,14 @@ pub const Renderer = struct {
                 },
             );
         }
-        var target_descriptor: ?gpu.resources.ColorTarget = null;
-        for (render_state.color_targets) |candidate| {
-            const target = candidate orelse continue;
-            if (!target.isActive()) continue;
-            target_descriptor = target;
-            break;
+        var target_descriptor = target_override;
+        if (target_descriptor == null) {
+            for (render_state.color_targets) |candidate| {
+                const target = candidate orelse continue;
+                if (!target.isActive()) continue;
+                target_descriptor = target;
+                break;
+            }
         }
         const descriptor = target_descriptor orelse return Error.MissingColorTarget;
         if (descriptor.samples_log2 != 0 or descriptor.fragments_log2 != 0) {
@@ -4808,6 +4848,44 @@ pub const Renderer = struct {
         self.frame_profile.reset();
     }
 
+    fn discardPendingTargetlessDraw(self: *Renderer) void {
+        if (self.pending_targetless_draw) |pending| self.allocator.destroy(pending);
+        self.pending_targetless_draw = null;
+    }
+
+    fn resolvePendingTargetlessDraw(self: *Renderer, buffer: DisplayBuffer) void {
+        const pending = self.pending_targetless_draw orelse return;
+        self.pending_targetless_draw = null;
+        defer self.allocator.destroy(pending);
+        const target = displayColorTarget(buffer) orelse {
+            self.last_draw_error = Error.UnsupportedColorTarget;
+            if (self.shouldReportDrawError(Error.UnsupportedColorTarget)) {
+                std.debug.print(
+                    "[vulkan dcb] deferred display draw rejected: invalid display buffer 0x{x} {d}x{d} pitch={d} tile={d}\n",
+                    .{ buffer.address, buffer.width, buffer.height, buffer.pitch_in_pixels, buffer.tiling_mode },
+                );
+            }
+            return;
+        };
+        self.drawGuestGraphics(&pending.state, pending.draw, pending.vertex_stage, target) catch |err| {
+            self.last_draw_error = err;
+            if (self.shouldReportDrawError(err)) {
+                std.debug.print("[vulkan dcb] deferred display draw rejected: {s}\n", .{@errorName(err)});
+            }
+            return;
+        };
+        self.guest_graphics_draws += 1;
+        self.translated_draws += 1;
+        self.targetless_draws_resolved += 1;
+        self.last_draw_error = null;
+        if (self.targetless_draws_resolved == 1 or log_verbose_gpu) {
+            std.debug.print(
+                "[vulkan dcb] deferred display draw ok: target=0x{x} {d}x{d} tile={d}\n",
+                .{ buffer.address, buffer.width, buffer.height, buffer.tiling_mode },
+            );
+        }
+    }
+
     fn dcbFlip(context: ?*anyopaque, flip: gpu.state.Flip) bool {
         const self = fromContext(context);
         self.flip_callbacks += 1;
@@ -4826,6 +4904,7 @@ pub const Renderer = struct {
                 self.last_flip_error = Error.MissingPresentedFrame;
                 return false;
             };
+            self.resolvePendingTargetlessDraw(requested.?);
             _ = self.materializeRenderTargetAt(requested.?.address) catch |err| {
                 self.last_flip_error = err;
                 return false;
@@ -4994,20 +5073,42 @@ pub const Renderer = struct {
             }
             return true;
         }
-        if (has_vertex)
-            self.drawGuestGraphics(state, draw, vertex_stage.?) catch |err| {
+        if (has_vertex) {
+            const render_state = gpu.resources.decodeRenderState(state);
+            if (render_state.active_color_count == 0) {
+                const pending = self.pending_targetless_draw orelse self.allocator.create(PendingGuestDraw) catch |err| {
+                    self.last_draw_error = err;
+                    if (self.shouldReportDrawError(err)) {
+                        std.debug.print("[vulkan dcb] targetless draw skipped: {s}\n", .{@errorName(err)});
+                    }
+                    return true;
+                };
+                pending.* = .{
+                    .state = state.*,
+                    .draw = draw,
+                    .vertex_stage = vertex_stage.?,
+                };
+                self.pending_targetless_draw = pending;
+                self.targetless_draws_deferred += 1;
+                self.last_draw_error = null;
+                if (self.targetless_draws_deferred == 1 or log_verbose_gpu) {
+                    std.debug.print("[vulkan dcb] deferred targetless draw until display flip\n", .{});
+                }
+                return true;
+            }
+            self.discardPendingTargetlessDraw();
+            self.drawGuestGraphics(state, draw, vertex_stage.?, null) catch |err| {
                 self.last_draw_error = err;
                 if (self.shouldReportDrawError(err)) std.debug.print("[vulkan dcb] draw rejected: {s}\n", .{@errorName(err)});
                 // Soft-skip shader/state gaps so one incomplete draw does not
                 // kill the DCB before a later flip.
                 return true;
-            }
-        else
-            self.drawGraphicsProbe() catch |err| {
-                self.last_draw_error = err;
-                std.debug.print("[vulkan dcb] graphics probe rejected: {s}\n", .{@errorName(err)});
-                return false;
             };
+        } else self.drawGraphicsProbe() catch |err| {
+            self.last_draw_error = err;
+            std.debug.print("[vulkan dcb] graphics probe rejected: {s}\n", .{@errorName(err)});
+            return false;
+        };
         if (has_vertex) self.guest_graphics_draws += 1;
         self.translated_draws += 1;
         self.last_draw_error = null;
@@ -6519,6 +6620,40 @@ test "graphics probe is opt-in and carries standalone shader modules" {
     try std.testing.expect(graphics_probe_vertex_spirv.len > 32);
     try std.testing.expect(graphics_probe_fragment_spirv.len > 24);
     try std.testing.expectEqual(@as(usize, 64 * 64 * 4), graphics_probe_bytes);
+}
+
+test "display buffers become bounded 32-bit color targets" {
+    const tiled = displayColorTarget(.{
+        .address = 0x1234_0000,
+        .width = 3840,
+        .height = 2160,
+        .pitch_in_pixels = 3840,
+        .tiling_mode = 0,
+    }).?;
+    try std.testing.expectEqual(@as(u64, 0x1234_0000), tiled.address);
+    try std.testing.expectEqual(@as(u8, 10), tiled.format);
+    try std.testing.expectEqual(gpu.resources.TileMode.render_target, tiled.tile_mode);
+    try std.testing.expectEqual(@as(u8, 0xf), tiled.write_mask);
+    const layout = try gpu.SurfaceLayout.fromColorTarget(tiled);
+    try std.testing.expectEqual(@as(u8, 4), layout.block.bytes_per_element);
+    try std.testing.expectEqual(@as(u32, 3840), layout.row_pitch_elements);
+
+    const linear = displayColorTarget(.{
+        .address = 0x5678_0000,
+        .width = 1280,
+        .height = 720,
+        .pitch_in_pixels = 0,
+        .tiling_mode = 1,
+    }).?;
+    try std.testing.expectEqual(gpu.resources.TileMode.linear, linear.tile_mode);
+    try std.testing.expectEqual(@as(u32, 1280), linear.pitch);
+
+    try std.testing.expect(displayColorTarget(.{
+        .address = 0x1000,
+        .width = 1920,
+        .height = 1080,
+        .pitch_in_pixels = 1280,
+    }) == null);
 }
 
 test "sampled image views honor sRGB and destination selectors" {
