@@ -33,7 +33,7 @@ pub const capacity: usize = 256;
 /// the stack arguments with their declared types, so keep all supported
 /// arguments: file offsets and output pointers often live past the sixth word
 /// and are precisely the values needed to diagnose a bad firmware boundary.
-pub const maximum_arguments: usize = 10;
+pub const maximum_arguments: usize = 12;
 
 pub const Record = struct {
     /// Firmware export name. Static, so this is a borrow with no lifetime.
@@ -760,6 +760,23 @@ fn takesSeven(
     return a0 + a1 + a2 + a3 + a4 + a5 + a6;
 }
 
+fn takesTwelve(
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    a7: u64,
+    a8: u64,
+    a9: u64,
+    a10: u64,
+    a11: u64,
+) callconv(abi.guest) u64 {
+    return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10 + a11;
+}
+
 test "stack arguments are retained by the trace" {
     reset();
     setEnabled(true);
@@ -773,6 +790,35 @@ test "stack arguments are retained by the trace" {
     try testing.expectEqual(@as(usize, 1), records.len);
     try testing.expectEqual(@as(u8, 7), records[0].argument_count);
     try testing.expectEqual(@as(u64, 7), records[0].arguments[6]);
+}
+
+test "the maximum supported arity fits in one trace record" {
+    reset();
+    setEnabled(true);
+
+    const traced = wrap("takesTwelve", &takesTwelve);
+    const typed: *const fn (
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+        u64,
+    ) callconv(abi.guest) u64 = @ptrCast(traced);
+    try testing.expectEqual(@as(u64, 78), typed(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12));
+
+    var buffer: [1]Record = undefined;
+    const records = recent(&buffer);
+    try testing.expectEqual(@as(usize, 1), records.len);
+    try testing.expectEqual(@as(u8, 12), records[0].argument_count);
+    try testing.expectEqual(@as(u64, 1), records[0].arguments[0]);
+    try testing.expectEqual(@as(u64, 12), records[0].arguments[11]);
 }
 
 test "every arity announces its entry, not just the short ones" {
