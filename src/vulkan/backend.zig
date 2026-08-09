@@ -636,6 +636,11 @@ const PendingGuestDraw = struct {
     vertex_stage: gpu.resources.ShaderStage,
 };
 
+const ComputeShaderFailure = struct {
+    address: u64,
+    err: anyerror,
+};
+
 fn displayColorTarget(buffer: DisplayBuffer) ?gpu.resources.ColorTarget {
     if (buffer.address == 0 or buffer.width == 0 or buffer.height == 0) return null;
     const pitch = if (buffer.pitch_in_pixels != 0) buffer.pitch_in_pixels else buffer.width;
@@ -874,6 +879,7 @@ pub const Renderer = struct {
     emulated_gds_dispatches: u64 = 0,
     emulated_image_store_dispatches: u64 = 0,
     emulated_volume_copies: u64 = 0,
+    reported_dual_image_clear_fallback: bool = false,
     buffer_cache_hits: u64 = 0,
     buffer_cache_misses: u64 = 0,
     buffer_uploads: u64 = 0,
@@ -892,6 +898,7 @@ pub const Renderer = struct {
     reported_interface_pairs: u8 = 0,
     reported_vertex_storage_bindings: bool = false,
     reported_draw_errors: [16]?anyerror = @splat(null),
+    reported_compute_shader_failures: [32]?ComputeShaderFailure = @splat(null),
     last_dispatch_error: ?anyerror = null,
     last_draw_error: ?anyerror = null,
     last_sync_error: ?anyerror = null,
@@ -1604,6 +1611,7 @@ pub const Renderer = struct {
             &bindings,
             reader,
             &analysis,
+            system_registers,
             local_size,
             group_count,
         )) |report| return report;
@@ -1652,48 +1660,52 @@ pub const Renderer = struct {
             .descriptor_array_length = maximum_storage_descriptors,
             .specialized_scalar_prefix_end = resources.specialized_scalar_prefix_end,
         }) catch |err| {
-            std.debug.print(
-                "[vulkan dcb] compute program 0x{x}: {d} instructions, groups={d}x{d}x{d}, local={d}x{d}x{d}, rsrc2=0x{x}\n",
-                .{
-                    program_address,
-                    analysis.program.instructions.items.len,
-                    group_count[0],
-                    group_count[1],
-                    group_count[2],
-                    local_size[0],
-                    local_size[1],
-                    local_size[2],
-                    state.readRegister(.shader, 0x213) orelse 0,
-                },
-            );
-            std.debug.print("[vulkan dcb] Translation error: {s}\n", .{@errorName(err)});
-            // Cap the dump: full shaders are hundreds of lines and a soft-skip
-            // path that still prints them burns more host time than the dispatch.
-            var printed: usize = 0;
-            for (analysis.program.instructions.items) |inst| {
-                if (printed >= 12) {
-                    std.debug.print("  ... ({d} more instructions)\n", .{
-                        analysis.program.instructions.items.len - printed,
-                    });
-                    break;
-                }
+            if (self.shouldReportComputeShaderFailure(program_address, err)) {
                 std.debug.print(
-                    "  pc=0x{x:0>4} {s} dst={s}:{d} src=",
-                    .{ inst.pc, inst.opcode.mnemonic(), @tagName(inst.dst.kind), inst.dst.reg },
+                    "[vulkan dcb] compute program 0x{x}: {d} instructions, groups={d}x{d}x{d}, local={d}x{d}x{d}, rsrc2=0x{x}\n",
+                    .{
+                        program_address,
+                        analysis.program.instructions.items.len,
+                        group_count[0],
+                        group_count[1],
+                        group_count[2],
+                        local_size[0],
+                        local_size[1],
+                        local_size[2],
+                        state.readRegister(.shader, 0x213) orelse 0,
+                    },
                 );
-                const sources = inst.sources();
-                for (sources.slice()) |source| {
-                    const source_value = switch (source.kind) {
-                        .sgpr, .vgpr => source.reg,
-                        else => source.value,
-                    };
-                    std.debug.print(" {s}:{d}", .{ @tagName(source.kind), source_value });
+                std.debug.print("[vulkan dcb] Translation error: {s}\n", .{@errorName(err)});
+                // Unique small kernels are cheap and useful to print in full;
+                // large programs stay capped. Repeated failures are suppressed
+                // by address/error above, avoiding per-frame disassembly spam.
+                const dump_limit: usize = if (analysis.program.instructions.items.len <= 64) 64 else 12;
+                var printed: usize = 0;
+                for (analysis.program.instructions.items) |inst| {
+                    if (printed >= dump_limit) {
+                        std.debug.print("  ... ({d} more instructions)\n", .{
+                            analysis.program.instructions.items.len - printed,
+                        });
+                        break;
+                    }
+                    std.debug.print(
+                        "  pc=0x{x:0>4} {s} dst={s}:{d} src=",
+                        .{ inst.pc, inst.opcode.mnemonic(), @tagName(inst.dst.kind), inst.dst.reg },
+                    );
+                    const sources = inst.sources();
+                    for (sources.slice()) |source| {
+                        const source_value = switch (source.kind) {
+                            .sgpr, .vgpr => source.reg,
+                            else => source.value,
+                        };
+                        std.debug.print(" {s}:{d}", .{ @tagName(source.kind), source_value });
+                    }
+                    std.debug.print(
+                        " off={d} idx={d} offen={d} opid=0x{x}\n",
+                        .{ inst.memory_offset, @intFromBool(inst.index_enable), @intFromBool(inst.offset_enable), inst.opcode_id },
+                    );
+                    printed += 1;
                 }
-                std.debug.print(
-                    " off={d} idx={d} offen={d} opid=0x{x}\n",
-                    .{ inst.memory_offset, @intFromBool(inst.index_enable), @intFromBool(inst.offset_enable), inst.opcode_id },
-                );
-                printed += 1;
             }
             return err;
         };
@@ -1857,11 +1869,11 @@ pub const Renderer = struct {
         return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
     }
 
-    /// Executes the two compact AGC UAV-clear kernels seen during bootstrap.
+    /// Executes the compact AGC UAV-clear kernel shapes seen during bootstrap.
     ///
     /// Both kernels form x/y from an 8x8 workgroup, take z from the workgroup
-    /// id, load one constant texel from the first constant buffer, and issue a
-    /// single image_store. Matching the complete instruction shape keeps this
+    /// id, load constant texels from the first constant buffer, and issue one or
+    /// two image_store operations. Matching the complete instruction shape keeps this
     /// path honest: general MIMG control flow and typed conversion still go
     /// through the translator and remain explicit when unsupported.
     fn tryEmulateImageStoreClear(
@@ -1870,10 +1882,22 @@ pub const Renderer = struct {
         bindings: *const gpu.ShaderBindings,
         reader: gpu.ShaderMemoryReader,
         analysis: *const gpu.ShaderAnalysis,
+        system: gpu.resources.ComputeSystemRegisters,
         local_size: [3]u32,
         group_count: [3]u32,
     ) anyerror!?DispatchReport {
         const instructions = analysis.program.instructions.items;
+        if (matchesDualImageClear(instructions)) {
+            return self.emulateDualImageClear(
+                memory,
+                bindings,
+                reader,
+                instructions,
+                system,
+                local_size,
+                group_count,
+            );
+        }
         const Shape = enum { rgba, scalar };
         const shape: Shape = if (matchesRgbaImageClear(instructions))
             .rgba
@@ -1959,6 +1983,154 @@ pub const Renderer = struct {
             );
         }
         return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
+    }
+
+    fn emulateDualImageClear(
+        self: *Renderer,
+        memory: GuestMemory,
+        bindings: *const gpu.ShaderBindings,
+        reader: gpu.ShaderMemoryReader,
+        instructions: []const gpu.ShaderInstruction,
+        system: gpu.resources.ComputeSystemRegisters,
+        local_size: [3]u32,
+        group_count: [3]u32,
+    ) anyerror!?DispatchReport {
+        if (local_size[0] != 4 or local_size[1] != 4 or local_size[2] != 1 or
+            system.workgroup_id_sgprs[0] != 14 or
+            system.workgroup_id_sgprs[1] != 15 or
+            system.local_invocation_id_components != 2)
+        {
+            self.reportDualImageClearFallback("compute system registers", null, null);
+            return null;
+        }
+
+        const first = try resolveReadWriteImageDescriptor(bindings, reader, 0) orelse {
+            self.reportDualImageClearFallback("first image descriptor", null, null);
+            return null;
+        };
+        const second = try imageDescriptorFromUserDataPointer(bindings, reader, 12) orelse {
+            self.reportDualImageClearFallback("second image descriptor pointer", first, null);
+            return null;
+        };
+        const constants = (try bindings.inlineBufferDescriptor(8)) orelse {
+            self.reportDualImageClearFallback("constant buffer descriptor", first, second);
+            return null;
+        };
+        const constant_offset: u64 = 384;
+        if (constants.address == 0 or constants.size_bytes < constant_offset + 3 * @sizeOf(u32)) {
+            self.reportDualImageClearFallback("constant buffer range", first, second);
+            return null;
+        }
+
+        var first_values: [4]u32 = .{ 0, 0, 0, @bitCast(@as(f32, -1.0)) };
+        for (first_values[0..3], 0..) |*value, index| {
+            value.* = try readGuestU32(memory, constants.address + constant_offset + index * @sizeOf(u32));
+        }
+        const second_values = [4]u32{ 0, 0, 0, @bitCast(@as(f32, -1.0)) };
+
+        const dispatched_width = std.math.mul(u64, group_count[0], local_size[0]) catch
+            return Error.GuestBufferTooLarge;
+        const dispatched_height = std.math.mul(u64, group_count[1], local_size[1]) catch
+            return Error.GuestBufferTooLarge;
+        const first_clear = planWholeImageClear(
+            first,
+            first_values,
+            instructions[14].data_mask,
+            dispatched_width,
+            dispatched_height,
+        ) orelse {
+            self.reportDualImageClearFallback("first image layout/format", first, second);
+            return null;
+        };
+        const second_clear = planWholeImageClear(
+            second,
+            second_values,
+            instructions[16].data_mask,
+            dispatched_width,
+            dispatched_height,
+        ) orelse {
+            self.reportDualImageClearFallback("second image layout/format", first, second);
+            return null;
+        };
+        const first_writes = try self.applyWholeImageClear(memory, first_clear);
+        const second_writes = try self.applyWholeImageClear(memory, second_clear);
+
+        self.emulated_image_store_dispatches += 1;
+        std.debug.print(
+            "[vulkan dcb] emulated dual image clear: {d}+{d} texels fmt={d}/{d} tile={s}/{s} (#{d})\n",
+            .{
+                first_writes,
+                second_writes,
+                first.unified_format,
+                second.unified_format,
+                @tagName(first.tile_mode),
+                @tagName(second.tile_mode),
+                self.emulated_image_store_dispatches,
+            },
+        );
+        return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
+    }
+
+    fn reportDualImageClearFallback(
+        self: *Renderer,
+        reason: []const u8,
+        first: ?gpu.ImageDescriptor,
+        second: ?gpu.ImageDescriptor,
+    ) void {
+        if (self.reported_dual_image_clear_fallback) return;
+        self.reported_dual_image_clear_fallback = true;
+        std.debug.print("[vulkan dcb] dual image clear fallback: {s}\n", .{reason});
+        for ([_]?gpu.ImageDescriptor{ first, second }, 0..) |maybe, index| {
+            const image = maybe orelse continue;
+            std.debug.print(
+                "  image[{d}] addr=0x{x} {d}x{d}x{d} pitch={d} fmt={d} type={s} tile={s} levels={d}/{d} samples={d} meta=0x{x} dcc={any} cmask={any} fmask={any}\n",
+                .{
+                    index,
+                    image.address,
+                    image.width,
+                    image.height,
+                    image.depth_or_layers,
+                    image.pitch,
+                    image.unified_format,
+                    @tagName(image.image_type),
+                    @tagName(image.tile_mode),
+                    image.viewBaseLevel(),
+                    image.viewMipLevels(),
+                    image.samplesLog2(),
+                    image.metadata_address,
+                    image.dcc_enabled,
+                    image.cmask_fast_clear,
+                    image.fmask_compression,
+                },
+            );
+        }
+    }
+
+    fn applyWholeImageClear(
+        self: *Renderer,
+        memory: GuestMemory,
+        clear: WholeImageClear,
+    ) anyerror!u64 {
+        const allocation = try self.allocator.alloc(u8, clear.allocation_bytes);
+        defer self.allocator.free(allocation);
+        if (!memory.read(memory.context, clear.descriptor.address, allocation)) return Error.GuestMemoryReadFailed;
+        for (0..clear.subresource.height) |y_index| {
+            const y: u32 = @intCast(y_index);
+            for (0..clear.subresource.width) |x_index| {
+                const x: u32 = @intCast(x_index);
+                const offset_u64 = try clear.subresource.sourceByteOffset(x, y, 0, 0);
+                const offset = std.math.cast(usize, offset_u64) orelse return Error.GuestBufferTooLarge;
+                if (offset > allocation.len or clear.texel.length > allocation.len - offset) {
+                    return Error.GuestBufferTooLarge;
+                }
+                @memcpy(
+                    allocation[offset..][0..clear.texel.length],
+                    clear.texel.bytes[0..clear.texel.length],
+                );
+            }
+        }
+        if (!memory.write(memory.context, clear.descriptor.address, allocation)) return Error.GuestMemoryWriteFailed;
+        return @as(u64, clear.subresource.width) * clear.subresource.height;
     }
 
     /// Executes the bounded AGC buffer-to-3D-image upload kernel used for
@@ -5025,6 +5197,17 @@ pub const Renderer = struct {
         return false;
     }
 
+    fn shouldReportComputeShaderFailure(self: *Renderer, address: u64, err: anyerror) bool {
+        for (&self.reported_compute_shader_failures) |*reported| {
+            if (reported.* == null) {
+                reported.* = .{ .address = address, .err = err };
+                return true;
+            }
+            if (reported.*.?.address == address and reported.*.?.err == err) return false;
+        }
+        return false;
+    }
+
     fn dcbDraw(context: ?*anyopaque, state: *const gpu.State, packet: gpu.pm4.Packet) bool {
         const self = fromContext(context);
         self.draw_callbacks += 1;
@@ -5294,6 +5477,80 @@ fn matchesScalarImageClear(inst: anytype) bool {
         inst[6].data_mask == 0x1 and inst[6].image_nsa_words == 1;
 }
 
+fn matchesDualImageClear(inst: anytype) bool {
+    if (inst.len != 18) return false;
+    const expected = [_]gpu.ShaderOpcode{
+        .s_inst_prefetch,
+        .v_lshl_add_u32,
+        .s_buffer_load_dwordx4,
+        .v_lshl_add_u32,
+        .s_waitcnt,
+        .v_mov_b32,
+        .v_mov_b32,
+        .v_mov_b32,
+        .v_mov_b32,
+        .v_mov_b32,
+        .v_mov_b32,
+        .v_mov_b32,
+        .v_mov_b32,
+        .s_load_dwordx8,
+        .image_store,
+        .s_waitcnt,
+        .image_store,
+        .s_endpgm,
+    };
+    for (expected, inst) |opcode, instruction| {
+        if (instruction.opcode != opcode) return false;
+    }
+    if (!registerOperand(inst[1].dst, .vgpr, 8) or
+        !registerOperand(inst[1].src0, .sgpr, 14) or
+        !inlineIntegerOperand(inst[1].src1, 2) or
+        !registerOperand(inst[1].src2, .vgpr, 0) or
+        !registerOperand(inst[2].dst, .sgpr, 16) or
+        !registerOperand(inst[2].src0, .sgpr, 8) or inst[2].memory_offset != 384 or
+        !registerOperand(inst[3].dst, .vgpr, 9) or
+        !registerOperand(inst[3].src0, .sgpr, 15) or
+        !inlineIntegerOperand(inst[3].src1, 2) or
+        !registerOperand(inst[3].src2, .vgpr, 1))
+    {
+        return false;
+    }
+    for (5..8) |index| {
+        const channel: u32 = @intCast(index - 5);
+        if (!registerOperand(inst[index].dst, .vgpr, channel) or
+            !registerOperand(inst[index].src0, .sgpr, 16 + channel)) return false;
+    }
+    if (!registerOperand(inst[8].dst, .vgpr, 3) or
+        inst[8].src0.kind != .float_inline_constant or
+        inst[8].src0.value != @as(u32, @bitCast(@as(f32, -1.0))))
+    {
+        return false;
+    }
+    for (9..12) |index| {
+        const channel: u32 = @intCast(index - 9 + 4);
+        if (!registerOperand(inst[index].dst, .vgpr, channel) or
+            !inlineIntegerOperand(inst[index].src0, 0)) return false;
+    }
+    if (!registerOperand(inst[12].dst, .vgpr, 7) or
+        inst[12].src0.kind != .float_inline_constant or
+        inst[12].src0.value != @as(u32, @bitCast(@as(f32, -1.0))) or
+        !registerOperand(inst[13].dst, .sgpr, 24) or
+        !registerOperand(inst[13].src0, .sgpr, 12) or inst[13].memory_offset != 0)
+    {
+        return false;
+    }
+    return registerOperand(inst[14].dst, .vgpr, 0) and
+        registerOperand(inst[14].src0, .vgpr, 8) and
+        registerOperand(inst[14].src1, .sgpr, 0) and
+        inst[14].data_mask == 0xf and inst[14].image_nsa_words == 0 and
+        inst[14].image_dimension == .dim_2d and
+        registerOperand(inst[16].dst, .vgpr, 4) and
+        registerOperand(inst[16].src0, .vgpr, 8) and
+        registerOperand(inst[16].src1, .sgpr, 24) and
+        inst[16].data_mask == 0xf and inst[16].image_nsa_words == 0 and
+        inst[16].image_dimension == .dim_2d;
+}
+
 fn matchesVolumeBufferCopy(inst: anytype) bool {
     if (inst.len != 32) return false;
     const expected = [_]@TypeOf(inst[0].opcode){
@@ -5439,10 +5696,74 @@ fn resolveReadWriteImageDescriptor(
     return binding.descriptor.read_write_texture;
 }
 
+fn imageDescriptorFromUserDataPointer(
+    bindings: *const gpu.ShaderBindings,
+    reader: gpu.ShaderMemoryReader,
+    pointer_sgpr: u32,
+) anyerror!?gpu.ImageDescriptor {
+    if (pointer_sgpr < bindings.scalar_user_data_base) return null;
+    const first: usize = pointer_sgpr - bindings.scalar_user_data_base;
+    if (first + 2 > bindings.user_data_count) return null;
+    const low = bindings.user_data[first];
+    const high = bindings.user_data[first + 1];
+    if (high & 0xffff_0000 != 0) return null;
+    const address = @as(u64, low) | (@as(u64, high) << 32);
+    if (address == 0) return null;
+    var words: [8]u32 = undefined;
+    try reader.readWords(address, &words);
+    return try gpu.resources.decodeImageDescriptor(&words);
+}
+
 const PackedImageStoreTexel = struct {
-    bytes: [8]u8 = @splat(0),
+    bytes: [16]u8 = @splat(0),
     length: u8,
 };
+
+const WholeImageClear = struct {
+    descriptor: gpu.ImageDescriptor,
+    subresource: gpu.TextureSubresourceLayout,
+    texel: PackedImageStoreTexel,
+    allocation_bytes: usize,
+};
+
+fn planWholeImageClear(
+    descriptor: gpu.ImageDescriptor,
+    values: [4]u32,
+    data_mask: u4,
+    dispatched_width: u64,
+    dispatched_height: u64,
+) ?WholeImageClear {
+    if (descriptor.address == 0 or descriptor.dcc_enabled or
+        descriptor.cmask_fast_clear or descriptor.fmask_compression or
+        descriptor.samplesLog2() != 0 or
+        descriptor.viewBaseLevel() != 0 or descriptor.viewMipLevels() != 1 or
+        descriptor.image_type != .color_2d)
+    {
+        return null;
+    }
+    const texel = packImageStoreTexel(
+        descriptor.unified_format,
+        values,
+        data_mask,
+        descriptor.dst_select,
+    ) orelse return null;
+    const texture = gpu.TextureLayout.fromImage(descriptor) catch return null;
+    const subresource = texture.subresource(0, 0, 1) catch return null;
+    if (texel.length != subresource.block.bytes_per_element or
+        dispatched_width < subresource.width or dispatched_height < subresource.height)
+    {
+        return null;
+    }
+    const maximum_clear_bytes: u64 = 256 * 1024 * 1024;
+    if (texture.required_source_bytes == 0 or texture.required_source_bytes > maximum_clear_bytes) return null;
+    const allocation_bytes = std.math.cast(usize, texture.required_source_bytes) orelse return null;
+    return .{
+        .descriptor = descriptor,
+        .subresource = subresource,
+        .texel = texel,
+        .allocation_bytes = allocation_bytes,
+    };
+}
 
 fn unorm8FromFloatBits(bits: u32) u8 {
     const value: f32 = @bitCast(bits);
@@ -5474,7 +5795,7 @@ fn packImageStoreTexel(
     return switch (format) {
         // IMG_DATA_FORMAT_8 / IMG_NUM_FORMAT_UINT
         5 => if (data_mask == 0x1) .{
-            .bytes = .{ @intCast(@min(values[0], 255)), 0, 0, 0, 0, 0, 0, 0 },
+            .bytes = .{ @intCast(@min(values[0], 255)), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
             .length = 1,
         } else null,
         // IMG_DATA_FORMAT_16 / IMG_NUM_FORMAT_UINT
@@ -5500,6 +5821,14 @@ fn packImageStoreTexel(
                 0,
                 0,
                 0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
             },
             .length = 4,
         } else null,
@@ -5514,6 +5843,14 @@ fn packImageStoreTexel(
                 0,
                 0,
                 0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
             },
             .length = 4,
         } else null,
@@ -5524,6 +5861,14 @@ fn packImageStoreTexel(
                 const value: f32 = @bitCast(bits);
                 const half: f16 = @floatCast(value);
                 std.mem.writeInt(u16, result.bytes[channel * 2 ..][0..2], @bitCast(half), .little);
+            }
+            break :blk result;
+        } else null,
+        // IMG_DATA_FORMAT_32_32_32_32 / IMG_NUM_FORMAT_FLOAT
+        77 => if (data_mask == 0xf) blk: {
+            var result = PackedImageStoreTexel{ .length = 16 };
+            for (values, 0..) |bits, channel| {
+                std.mem.writeInt(u32, result.bytes[channel * 4 ..][0..4], bits, .little);
             }
             break :blk result;
         } else null,
@@ -6656,6 +7001,78 @@ test "display buffers become bounded 32-bit color targets" {
     }) == null);
 }
 
+test "dual image clear matcher requires the complete bounded kernel" {
+    const register = struct {
+        fn make(kind: gpu.ShaderOperandKind, index: u32) gpu.ShaderOperand {
+            return .{ .kind = kind, .reg = index };
+        }
+    }.make;
+    const integer = struct {
+        fn make(value: u32) gpu.ShaderOperand {
+            return .{ .kind = .integer_inline_constant, .value = value };
+        }
+    }.make;
+    var instructions = [_]gpu.ShaderInstruction{.{}} ** 18;
+    const opcodes = [_]gpu.ShaderOpcode{
+        .s_inst_prefetch,
+        .v_lshl_add_u32,
+        .s_buffer_load_dwordx4,
+        .v_lshl_add_u32,
+        .s_waitcnt,
+        .v_mov_b32,
+        .v_mov_b32,
+        .v_mov_b32,
+        .v_mov_b32,
+        .v_mov_b32,
+        .v_mov_b32,
+        .v_mov_b32,
+        .v_mov_b32,
+        .s_load_dwordx8,
+        .image_store,
+        .s_waitcnt,
+        .image_store,
+        .s_endpgm,
+    };
+    for (&instructions, opcodes) |*instruction, opcode| instruction.opcode = opcode;
+    instructions[1].dst = register(.vgpr, 8);
+    instructions[1].src0 = register(.sgpr, 14);
+    instructions[1].src1 = integer(2);
+    instructions[1].src2 = register(.vgpr, 0);
+    instructions[2].dst = register(.sgpr, 16);
+    instructions[2].src0 = register(.sgpr, 8);
+    instructions[2].memory_offset = 384;
+    instructions[3].dst = register(.vgpr, 9);
+    instructions[3].src0 = register(.sgpr, 15);
+    instructions[3].src1 = integer(2);
+    instructions[3].src2 = register(.vgpr, 1);
+    for (5..8) |index| {
+        instructions[index].dst = register(.vgpr, @intCast(index - 5));
+        instructions[index].src0 = register(.sgpr, @intCast(16 + index - 5));
+    }
+    instructions[8].dst = register(.vgpr, 3);
+    instructions[8].src0 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, -1.0)) };
+    for (9..12) |index| {
+        instructions[index].dst = register(.vgpr, @intCast(index - 9 + 4));
+        instructions[index].src0 = integer(0);
+    }
+    instructions[12].dst = register(.vgpr, 7);
+    instructions[12].src0 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, -1.0)) };
+    instructions[13].dst = register(.sgpr, 24);
+    instructions[13].src0 = register(.sgpr, 12);
+    instructions[14].dst = register(.vgpr, 0);
+    instructions[14].src0 = register(.vgpr, 8);
+    instructions[14].src1 = register(.sgpr, 0);
+    instructions[14].data_mask = 0xf;
+    instructions[16].dst = register(.vgpr, 4);
+    instructions[16].src0 = register(.vgpr, 8);
+    instructions[16].src1 = register(.sgpr, 24);
+    instructions[16].data_mask = 0xf;
+
+    try std.testing.expect(matchesDualImageClear(&instructions));
+    instructions[16].data_mask = 0x7;
+    try std.testing.expect(!matchesDualImageClear(&instructions));
+}
+
 test "sampled image views honor sRGB and destination selectors" {
     try std.testing.expectEqual(vk.format_r8g8b8a8_unorm, sampledImageFormat(false));
     try std.testing.expectEqual(vk.format_r8g8b8a8_srgb, sampledImageFormat(true));
@@ -6725,8 +7142,61 @@ test "typed image clear texels use the descriptor number format" {
     try std.testing.expectEqual(@as(u16, @bitCast(@as(f16, 0.5))), std.mem.readInt(u16, rgba16_float.bytes[2..4], .little));
     try std.testing.expectEqual(@as(u16, @bitCast(@as(f16, -2.0))), std.mem.readInt(u16, rgba16_float.bytes[6..8], .little));
 
+    const rgba32_float = packImageStoreTexel(77, .{
+        @bitCast(@as(f32, 0.0)),
+        @bitCast(@as(f32, 0.5)),
+        @bitCast(@as(f32, 1.0)),
+        @bitCast(@as(f32, -2.0)),
+    }, 0xf, rgba).?;
+    try std.testing.expectEqual(@as(u8, 16), rgba32_float.length);
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, 0.5))), std.mem.readInt(u32, rgba32_float.bytes[4..8], .little));
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, -2.0))), std.mem.readInt(u32, rgba32_float.bytes[12..16], .little));
+
     try std.testing.expect(packImageStoreTexel(56, .{ 0, 0, 0, 0 }, 0x1, rgba) == null);
     try std.testing.expect(packImageStoreTexel(61, .{ 0, 0, 0, 0 }, 0xf, rgba) == null);
+}
+
+test "whole image clear plans are bounded and reject partial dispatches" {
+    var image = gpu.ImageDescriptor{
+        .address = 0x2000_0000,
+        .width = 64,
+        .height = 64,
+        .depth_or_layers = 1,
+        .pitch = 64,
+        .unified_format = 77,
+        .tile_mode = .linear,
+        .image_type = .color_2d,
+        .dst_select = .{ 4, 5, 6, 7 },
+        .base_level = 0,
+        .last_level = 0,
+        .base_array = 0,
+        .array_pitch = 0,
+        .max_mip = 0,
+        .min_lod = 0,
+        .min_lod_warning = 0,
+        .bc_swizzle = 0,
+        .metadata_address = 0x3000_0000,
+        .dcc_enabled = false,
+        .cmask_fast_clear = false,
+        .fmask_compression = false,
+        .cmask_address = 0,
+        .fmask_address = 0,
+        .dcc_address = 0,
+        .descriptor_flags = 0,
+        .extended = true,
+    };
+    const clear = planWholeImageClear(
+        image,
+        .{ 0, @bitCast(@as(f32, 0.5)), @bitCast(@as(f32, 1.0)), @bitCast(@as(f32, -1.0)) },
+        0xf,
+        64,
+        64,
+    ).?;
+    try std.testing.expectEqual(@as(u8, 16), clear.texel.length);
+    try std.testing.expect(clear.allocation_bytes <= 256 * 1024 * 1024);
+    try std.testing.expect(planWholeImageClear(image, .{ 0, 0, 0, 0 }, 0xf, 63, 64) == null);
+    image.dcc_enabled = true;
+    try std.testing.expect(planWholeImageClear(image, .{ 0, 0, 0, 0 }, 0xf, 64, 64) == null);
 }
 
 test "volume upload source index uses x y and z record strides" {

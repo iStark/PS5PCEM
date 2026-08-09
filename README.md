@@ -50,7 +50,8 @@ Vulkan.
   wait, event, DMA, indirect-register, draw and flip packets. Tetris Effect:
   Connected reaches repeated graphics/compute submissions and VideoOut flips;
   its compact typed image-clear dispatches now update guest render-target and
-  depth memory, while its bounded buffer-to-volume uploads populate 3D images.
+  depth memory, including a dual 1024×1024 `RGBA32_FLOAT` clear, while its
+  bounded buffer-to-volume uploads populate 3D images.
   Final compositor draws that omit color-buffer registers are now retained for
   the following VideoOut flip, which supplies the scanout target. Output remains
   black because unsupported compute shaders and a later guest fault currently
@@ -74,7 +75,7 @@ the repository contains none of that content.
 | **Terminator 2D: No Fate** | Reaches gameplay with correct color reproduction and clean title-provided backgrounds, characters, HUD elements, and textures | Early publisher logos and the pause menu retain artifacts; synchronous upload/readback limits frame pacing, while depth/MRT and compression metadata remain incomplete |
 | **Pistol Whip** | Maps the native PS VR2 plugin and Burst module, then starts loading Unity asset archives | Headset, tracking, controller, and host OpenXR support are intentionally deferred |
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
-| **Tetris Effect: Connected** | Completes Unreal filesystem/config bootstrap, creates AGC workloads, executes compact typed UAV clears and 3D volume uploads, reaches VideoOut flips, and retains a targetless final draw for the next scanout buffer | Output is black: several compute shaders still need lowering and the latest run faults in guest code before the pending display draw reaches its following flip; the 512 GiB virtual reservation can also depend on host address-space placement |
+| **Tetris Effect: Connected** | Completes Unreal filesystem/config bootstrap, creates AGC workloads, executes compact typed UAV clears (including two 1024×1024 `RGBA32_FLOAT` targets) and 3D volume uploads, reaches VideoOut flips, and retains a targetless final draw for the next scanout buffer | Output is black: several compute shaders still need lowering and the latest run faults in guest code before the pending display draw reaches its following flip; the 512 GiB virtual reservation can also depend on host address-space placement |
 
 ## Components
 
@@ -642,14 +643,14 @@ supported shader to SPIR-V 1.5, creates or reuses its compute pipeline, binds th
 active storage set and dispatches the packet's XYZ group counts. Errors remain
 visible in diagnostics, but missing compute state and selected resource or
 translation gaps skip only that dispatch instead of stopping the complete
-command queue. Before general translation, two exact compact AGC UAV-clear
-kernels execute directly against checked guest memory. They cover `R8_UINT`,
-`R32_UINT`, `RGBA8_UNORM`, `RGBA8_UINT`, and `RGBA16_FLOAT`, apply the inverse
-descriptor storage swizzle, and use the render-target/depth tiling layout for
-each written texel. A separately matched bounds-checked upload kernel copies
-`R8_UINT` buffers into `RGBA8_UINT` 3D images and `R16_UINT` buffers into
-`R16_UINT` 3D images; linear volumes use aligned rows and consecutive depth
-slices through the same texture-layout contract. General `image_store`
+command queue. Before general translation, exact compact AGC UAV-clear kernels
+execute directly against checked guest memory. They cover `R8_UINT`, `R32_UINT`,
+`RGBA8_UNORM`, `RGBA8_UINT`, `RGBA16_FLOAT`, and dual `RGBA32_FLOAT` targets,
+apply the inverse descriptor storage swizzle, and use the render-target/depth
+tiling layout for each written texel. A separately matched bounds-checked upload
+kernel copies `R8_UINT` buffers into `RGBA8_UINT` 3D images and `R16_UINT`
+buffers into `R16_UINT` 3D images; linear volumes use aligned rows and
+consecutive depth slices through the same texture-layout contract. General `image_store`
 programs remain explicit unsupported work rather than taking either narrow
 path. Draw callbacks count work by default. When both vertex and pixel
 program registers are present,
@@ -1627,15 +1628,19 @@ mode at that flip. `MissingColorTarget` is therefore no longer the immediate
 rendering boundary.
 Its compact 8- and 11-instruction typed clears now execute for `R8_UINT`,
 `R32_UINT`, `RGBA8_UNORM`, `RGBA8_UINT`, and `RGBA16_FLOAT`, including inverse
-storage swizzles and tiled render-target/depth addressing. Its observed
+storage swizzles and tiled render-target/depth addressing. The exact observed
+18-instruction dual-store kernel also clears two 1024×1024 `RGBA32_FLOAT`
+render targets (2,097,152 texels total); inactive metadata pointers are accepted,
+while actual DCC/CMASK/FMASK compression remains rejected. Its observed
 32-instruction 3D upload program now copies `R8_UINT→RGBA8_UINT` and
 `R16_UINT→R16_UINT` volumes with the shader's bounds, strides, base coordinates,
 and linear/tiled target layout. A measured startup frame consequently completes
 all four volume uploads (two 1×1×1 and two 16×16×16) without a rejected compute
-dispatch. The latest measured run accepts and defers the formerly rejected draw,
-but later compute programs still report `UndefinedRegister`,
-`InvalidStorageBinding`, and `UnsupportedOpcode`; guest execution then faults at
-`eboot.bin+0x16af4ef` before another flip can validate the pending display draw.
+dispatch. The latest measured run accepts and defers the formerly rejected draw
+and completes the dual clear, but later compute programs still report
+`UndefinedRegister`, `InvalidStorageBinding`, and `UnsupportedOpcode`; guest
+execution then faults at `eboot.bin+0x16ef4ef` before another flip can validate
+the pending display draw.
 Its 3840×2160 display buffers now register with the expected pitch. A measured
 loading run held private memory near 2.2–2.3 GiB instead of retaining a geometric
 chain of arena-backed temporary buffers past 9 GiB; the remaining working-set

@@ -15,6 +15,8 @@ pub const SpirvScalarRegister = rdna2.spirv.ScalarRegister;
 pub const SpirvComputeInputs = rdna2.spirv.ComputeInputs;
 pub const Operand = rdna2.Operand;
 pub const OperandKind = rdna2.OperandKind;
+pub const Instruction = rdna2.Instruction;
+pub const Opcode = rdna2.Opcode;
 
 pub const Error = shaders.Error || rdna2.Error || rdna2.control_flow.Error || std.mem.Allocator.Error || error{
     InstructionLimitExceeded,
