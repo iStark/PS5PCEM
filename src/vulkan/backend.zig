@@ -35,6 +35,12 @@ fn hostTimestampNs() u64 {
     return @intCast(scaled / @as(u128, @intCast(frequency)));
 }
 
+fn elapsedHostNanoseconds(started: u64) u64 {
+    const finished = hostTimestampNs();
+    if (started == 0 or finished < started) return 0;
+    return finished - started;
+}
+
 pub const Error = error{
     VulkanLoaderNotFound,
     MissingVulkanFunction,
@@ -364,6 +370,7 @@ const DeviceFunctions = struct {
     cmd_copy_buffer: vk.PfnCmdCopyBuffer,
     cmd_copy_image_to_buffer: vk.PfnCmdCopyImageToBuffer,
     cmd_copy_buffer_to_image: vk.PfnCmdCopyBufferToImage,
+    cmd_blit_image: vk.PfnCmdBlitImage,
     cmd_pipeline_barrier: vk.PfnCmdPipelineBarrier,
 
     fn load(get_proc: vk.PfnGetDeviceProcAddr, device: vk.Device) Error!DeviceFunctions {
@@ -429,6 +436,7 @@ const DeviceFunctions = struct {
             .cmd_copy_buffer = try deviceProc(get_proc, device, vk.PfnCmdCopyBuffer, "vkCmdCopyBuffer"),
             .cmd_copy_image_to_buffer = try deviceProc(get_proc, device, vk.PfnCmdCopyImageToBuffer, "vkCmdCopyImageToBuffer"),
             .cmd_copy_buffer_to_image = try deviceProc(get_proc, device, vk.PfnCmdCopyBufferToImage, "vkCmdCopyBufferToImage"),
+            .cmd_blit_image = try deviceProc(get_proc, device, vk.PfnCmdBlitImage, "vkCmdBlitImage"),
             .cmd_pipeline_barrier = try deviceProc(get_proc, device, vk.PfnCmdPipelineBarrier, "vkCmdPipelineBarrier"),
         };
     }
@@ -483,6 +491,11 @@ pub const maximum_storage_descriptors = 64;
 const maximum_compute_pipelines = 256;
 const maximum_graphics_pipelines = 256;
 const maximum_staged_buffer_bytes = 128 * 1024 * 1024;
+/// Large compute outputs are overwhelmingly GPU-only working sets. Reading
+/// them over PCIe after every dispatch serializes work that remains resident
+/// on the console; keep those allocations authoritative until an actual guest
+/// or resource read needs their bytes.
+const deferred_storage_write_min_bytes = 1024 * 1024;
 const maximum_frame_bytes = 128 * 1024 * 1024;
 const maximum_completed_frames = 16;
 const maximum_render_targets = 16;
@@ -539,6 +552,7 @@ const GuestBufferEntry = struct {
     size: vk.DeviceSize,
     device_local: OwnedBuffer,
     last_used_sequence: u64,
+    gpu_dirty: bool = false,
 };
 
 const ComputePipelineEntry = struct {
@@ -689,6 +703,18 @@ const FrameProfile = struct {
     fence_wait_ns: u64 = 0,
     upload_bytes: u64 = 0,
     readback_bytes: u64 = 0,
+    storage_upload_bytes: u64 = 0,
+    storage_readback_bytes: u64 = 0,
+    target_upload_bytes: u64 = 0,
+    target_readback_bytes: u64 = 0,
+    texture_upload_bytes: u64 = 0,
+    index_upload_bytes: u64 = 0,
+    draw_ns: u64 = 0,
+    dispatch_ns: u64 = 0,
+    storage_stage_ns: u64 = 0,
+    storage_commit_ns: u64 = 0,
+    target_materialize_ns: u64 = 0,
+    resident_storage_bytes: u64 = 0,
     render_target_hits: u64 = 0,
     render_target_misses: u64 = 0,
 
@@ -1393,9 +1419,134 @@ pub const Renderer = struct {
         if (presented != vk.success and presented != vk.suboptimal_khr) return Error.SwapchainPresentFailed;
     }
 
-    /// Reuses host/device allocations for an exact guest range while uploading
-    /// current guest bytes on every call. Allocation identity is cached; guest
-    /// memory is never assumed immutable between submissions.
+    /// Presents a resident color attachment without a GPU→CPU→GPU round trip.
+    /// Vulkan performs format conversion and 1920×1080→window scaling in the
+    /// blit; the source returns to attachment layout for the next guest draw.
+    fn blitRenderTargetToSwapchain(self: *Renderer, target_index: usize) anyerror!void {
+        if (target_index >= self.render_targets.items.len) return Error.MissingPresentedFrame;
+        const target = self.render_targets.items[target_index];
+        if (!target.initialized) return Error.MissingPresentedFrame;
+        const presentation = &(self.window_presentation orelse return Error.PresentationRejected);
+
+        if (self.device_functions.reset_fences(self.device, 1, @ptrCast(&presentation.acquire_fence)) != vk.success) {
+            return Error.FenceWaitFailed;
+        }
+        var image_index: u32 = 0;
+        const acquired = presentation.swapchain_functions.acquire_next_image(
+            self.device,
+            presentation.swapchain,
+            0,
+            0,
+            presentation.acquire_fence,
+            &image_index,
+        );
+        if (acquired == vk.not_ready or acquired == vk.error_out_of_date_khr) {
+            self.present_dropped += 1;
+            return;
+        }
+        if (acquired != vk.success and acquired != vk.suboptimal_khr) return Error.SwapchainAcquireFailed;
+        if (image_index >= presentation.images.len or
+            self.device_functions.wait_for_fences(self.device, 1, @ptrCast(&presentation.acquire_fence), vk.true_value, std.math.maxInt(u64)) != vk.success)
+        {
+            return Error.FenceWaitFailed;
+        }
+
+        const command_buffer = try self.beginOneShot();
+        defer self.device_functions.free_command_buffers(self.device, self.command_pool, 1, @ptrCast(&command_buffer));
+        const source_to_transfer = vk.ImageMemoryBarrier{
+            .source_access_mask = vk.access_color_attachment_write_bit,
+            .destination_access_mask = vk.access_transfer_read_bit,
+            .old_layout = vk.image_layout_color_attachment_optimal,
+            .new_layout = vk.image_layout_transfer_src_optimal,
+            .image = target.image.handle,
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        const destination_to_transfer = vk.ImageMemoryBarrier{
+            .source_access_mask = 0,
+            .destination_access_mask = vk.access_transfer_write_bit,
+            .old_layout = vk.image_layout_undefined,
+            .new_layout = vk.image_layout_transfer_dst_optimal,
+            .image = presentation.images[image_index],
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        const before_blit = [_]vk.ImageMemoryBarrier{ source_to_transfer, destination_to_transfer };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_color_attachment_output_bit | vk.pipeline_stage_top_of_pipe_bit,
+            vk.pipeline_stage_transfer_bit,
+            0,
+            0,
+            null,
+            0,
+            null,
+            before_blit.len,
+            @ptrCast(&before_blit),
+        );
+        const blit = vk.ImageBlit{
+            .source_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+            .source_offsets = .{
+                .{ .x = 0, .y = 0, .z = 0 },
+                .{ .x = @intCast(target.target.descriptor.width), .y = @intCast(target.target.descriptor.height), .z = 1 },
+            },
+            .destination_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+            .destination_offsets = .{
+                .{ .x = 0, .y = 0, .z = 0 },
+                .{ .x = @intCast(presentation.extent.width), .y = @intCast(presentation.extent.height), .z = 1 },
+            },
+        };
+        self.device_functions.cmd_blit_image(
+            command_buffer,
+            target.image.handle,
+            vk.image_layout_transfer_src_optimal,
+            presentation.images[image_index],
+            vk.image_layout_transfer_dst_optimal,
+            1,
+            @ptrCast(&blit),
+            vk.filter_nearest,
+        );
+        const source_to_attachment = vk.ImageMemoryBarrier{
+            .source_access_mask = vk.access_transfer_read_bit,
+            .destination_access_mask = vk.access_color_attachment_read_bit | vk.access_color_attachment_write_bit,
+            .old_layout = vk.image_layout_transfer_src_optimal,
+            .new_layout = vk.image_layout_color_attachment_optimal,
+            .image = target.image.handle,
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        const destination_to_present = vk.ImageMemoryBarrier{
+            .source_access_mask = vk.access_transfer_write_bit,
+            .destination_access_mask = 0,
+            .old_layout = vk.image_layout_transfer_dst_optimal,
+            .new_layout = vk.image_layout_present_src_khr,
+            .image = presentation.images[image_index],
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        const after_blit = [_]vk.ImageMemoryBarrier{ source_to_attachment, destination_to_present };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_transfer_bit,
+            vk.pipeline_stage_color_attachment_output_bit | vk.pipeline_stage_bottom_of_pipe_bit,
+            0,
+            0,
+            null,
+            0,
+            null,
+            after_blit.len,
+            @ptrCast(&after_blit),
+        );
+        try self.submitOneShot(command_buffer);
+
+        const present_info = vk.PresentInfoKHR{
+            .swapchain_count = 1,
+            .swapchains = @ptrCast(&presentation.swapchain),
+            .image_indices = @ptrCast(&image_index),
+        };
+        const presented = presentation.swapchain_functions.queue_present(self.queue, &present_info);
+        if (presented != vk.success and presented != vk.suboptimal_khr) return Error.SwapchainPresentFailed;
+    }
+
+    /// Reuses host/device allocations for an exact guest range. Guest-authored
+    /// buffers upload current bytes; large GPU-authored outputs stay resident
+    /// until a consumer explicitly needs guest-visible data.
     pub fn stageGuestStorageBuffer(self: *Renderer, guest_address: u64, size: usize) (Error || std.mem.Allocator.Error)!StagedBuffer {
         return self.stageGuestStorageBufferAt(0, guest_address, size);
     }
@@ -1409,6 +1560,8 @@ pub const Renderer = struct {
         guest_address: u64,
         size: usize,
     ) (Error || std.mem.Allocator.Error)!StagedBuffer {
+        const profile_started = hostTimestampNs();
+        defer self.frame_profile.storage_stage_ns +|= elapsedHostNanoseconds(profile_started);
         if (descriptor_index >= maximum_storage_descriptors) return Error.InvalidStorageDescriptor;
         if (size == 0) return Error.GuestMemoryReadFailed;
         if (size > maximum_staged_buffer_bytes) return Error.GuestBufferTooLarge;
@@ -1417,9 +1570,7 @@ pub const Renderer = struct {
 
         var entry_index: ?usize = null;
         for (self.guest_buffers.items, 0..) |entry, index| {
-            if (entry.descriptor_index == descriptor_index and
-                entry.guest_address == guest_address and entry.size == size)
-            {
+            if (entry.guest_address == guest_address and entry.size == size) {
                 entry_index = index;
                 break;
             }
@@ -1434,6 +1585,17 @@ pub const Renderer = struct {
                 if (entry.descriptor_index == descriptor_index) {
                     recycle_index = index;
                     break;
+                }
+            }
+            // Do not evict a large GPU-authored range merely because the next
+            // shader binds this descriptor slot to another address. Retain it
+            // as an address-keyed allocation while capacity remains; a later
+            // shader can bind it from any slot without a guest round trip.
+            if (recycle_index) |index| {
+                if (self.guest_buffers.items[index].gpu_dirty and
+                    self.guest_buffers.items.len < maximum_guest_buffers)
+                {
+                    recycle_index = null;
                 }
             }
             if (recycle_index == null and self.guest_buffers.items.len >= maximum_guest_buffers) {
@@ -1469,6 +1631,9 @@ pub const Renderer = struct {
                 // this point. Recycle the least-recent range instead of
                 // dropping later geometry once the guest ring has wrapped.
                 const victim_index = recycle_index.?;
+                if (self.guest_buffers.items[victim_index].gpu_dirty) {
+                    try self.flushGuestStorageBuffer(victim_index);
+                }
                 const victim = &self.guest_buffers.items[victim_index];
                 if (victim.device_local.size < size) {
                     const replacement_device = try self.createBuffer(
@@ -1484,6 +1649,7 @@ pub const Renderer = struct {
                 victim.guest_address = guest_address;
                 victim.size = size;
                 victim.last_used_sequence = self.guest_buffer_sequence;
+                victim.gpu_dirty = false;
                 entry_index = victim_index;
             }
             self.buffer_cache_misses += 1;
@@ -1492,23 +1658,27 @@ pub const Renderer = struct {
         }
 
         const entry = &self.guest_buffers.items[entry_index.?];
-        entry.descriptor_index = descriptor_index;
         entry.last_used_sequence = self.guest_buffer_sequence;
-        var mapped: ?*anyopaque = null;
-        if (self.device_functions.map_memory(self.device, entry.device_local.memory, 0, size, 0, &mapped) != vk.success) {
-            return Error.MemoryMapFailed;
-        }
-        const destination: [*]u8 = @ptrCast(mapped orelse {
+        if (!entry.gpu_dirty) {
+            var mapped: ?*anyopaque = null;
+            if (self.device_functions.map_memory(self.device, entry.device_local.memory, 0, size, 0, &mapped) != vk.success) {
+                return Error.MemoryMapFailed;
+            }
+            const destination: [*]u8 = @ptrCast(mapped orelse {
+                self.device_functions.unmap_memory(self.device, entry.device_local.memory);
+                return Error.MemoryMapFailed;
+            });
+            const read_ok = memory.read(memory.context, guest_address, destination[0..size]);
             self.device_functions.unmap_memory(self.device, entry.device_local.memory);
-            return Error.MemoryMapFailed;
-        });
-        const read_ok = memory.read(memory.context, guest_address, destination[0..size]);
-        self.device_functions.unmap_memory(self.device, entry.device_local.memory);
-        if (!read_ok) return Error.GuestMemoryReadFailed;
-        self.frame_profile.upload_bytes +%= size;
+            if (!read_ok) return Error.GuestMemoryReadFailed;
+            self.frame_profile.upload_bytes +%= size;
+            self.frame_profile.storage_upload_bytes +%= size;
+            self.buffer_uploads += 1;
+        } else {
+            self.frame_profile.resident_storage_bytes +%= size;
+        }
         self.updateStorageDescriptor(descriptor_index, entry.device_local);
         self.active_descriptor_set = self.descriptor_set;
-        self.buffer_uploads += 1;
         return .{
             .buffer = entry.device_local.handle,
             .descriptor_set = self.descriptor_set,
@@ -1524,6 +1694,41 @@ pub const Renderer = struct {
         } else return Error.GuestBufferNotStaged;
         try self.readMapped(entry.device_local, destination);
         self.frame_profile.readback_bytes +%= destination.len;
+        self.frame_profile.storage_readback_bytes +%= destination.len;
+    }
+
+    fn flushGuestStoragePrefix(self: *Renderer, index: usize, requested_size: usize) (Error || std.mem.Allocator.Error)!void {
+        if (index >= self.guest_buffers.items.len) return Error.GuestBufferNotStaged;
+        const entry = &self.guest_buffers.items[index];
+        if (!entry.gpu_dirty) return;
+        const entry_size = std.math.cast(usize, entry.size) orelse return Error.GuestBufferTooLarge;
+        const size = @min(requested_size, entry_size);
+        if (size == 0) return;
+        const bytes = try self.allocator.alloc(u8, size);
+        defer self.allocator.free(bytes);
+        try self.readMapped(entry.device_local, bytes);
+        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        if (!memory.write(memory.context, entry.guest_address, bytes)) return Error.GuestMemoryWriteFailed;
+        self.frame_profile.readback_bytes +%= size;
+        self.frame_profile.storage_readback_bytes +%= size;
+        if (size == entry_size) entry.gpu_dirty = false;
+    }
+
+    fn flushGuestStorageBuffer(self: *Renderer, index: usize) (Error || std.mem.Allocator.Error)!void {
+        return self.flushGuestStoragePrefix(index, std.math.maxInt(usize));
+    }
+
+    fn flushGuestStorageRange(self: *Renderer, address: u64, size: usize) (Error || std.mem.Allocator.Error)!void {
+        for (self.guest_buffers.items, 0..) |entry, index| {
+            if (!entry.gpu_dirty) continue;
+            // Guest V# record counts are occasionally conservative enough to
+            // span unrelated fence/label allocations. A four-byte command
+            // processor access inside that declared range is not evidence that
+            // the CPU is reading the compute output. Materialize only a read
+            // that names the resource itself; sampled-image and presentation
+            // paths also use the exact base address.
+            if (address == entry.guest_address) try self.flushGuestStoragePrefix(index, size);
+        }
     }
 
     pub fn dispatchSpirv(self: *Renderer, words: []const u32, group_count: [3]u32) (Error || std.mem.Allocator.Error)!DispatchReport {
@@ -2461,8 +2666,19 @@ pub const Renderer = struct {
     }
 
     fn commitComputeWrites(self: *Renderer, memory: GuestMemory, resources: *const ComputeResources) anyerror!void {
+        const profile_started = hostTimestampNs();
+        defer self.frame_profile.storage_commit_ns +|= elapsedHostNanoseconds(profile_started);
         for (resources.writable, 0..) |writable, index| {
             if (!writable) continue;
+            if (resources.sizes[index] >= deferred_storage_write_min_bytes) {
+                for (self.guest_buffers.items) |*entry| {
+                    if (entry.guest_address != resources.addresses[index] or
+                        entry.size != resources.sizes[index]) continue;
+                    entry.gpu_dirty = true;
+                    break;
+                }
+                continue;
+            }
             const bytes = try self.allocator.alloc(u8, resources.sizes[index]);
             defer self.allocator.free(bytes);
             try self.readbackGuestStorageBuffer(resources.addresses[index], bytes);
@@ -3044,6 +3260,8 @@ pub const Renderer = struct {
     /// outside the GPU needs it (flip, CPU visibility, or texture staging).
     /// Consecutive draws therefore stay resident and compose in-order.
     fn materializeRenderTarget(self: *Renderer, index: usize) anyerror!void {
+        const profile_started = hostTimestampNs();
+        defer self.frame_profile.target_materialize_ns +|= elapsedHostNanoseconds(profile_started);
         if (index >= self.render_targets.items.len) return Error.MissingPresentedFrame;
         const snapshot = self.render_targets.items[index];
         if (!snapshot.initialized or snapshot.gpu_generation == snapshot.host_generation) return;
@@ -3132,6 +3350,7 @@ pub const Renderer = struct {
         defer self.allocator.free(frame);
         try self.readMapped(snapshot.readback, frame);
         self.frame_profile.readback_bytes += frame_bytes;
+        self.frame_profile.target_readback_bytes += frame_bytes;
         if (snapshot.target.descriptor.force_destination_alpha_one) forceDestinationAlphaOne(frame);
         try self.recordGuestColorTarget(snapshot.target, frame);
         self.render_targets.items[index].host_generation = snapshot.gpu_generation;
@@ -3185,6 +3404,7 @@ pub const Renderer = struct {
             );
             try self.writeMapped(initial_upload.?, frame);
             self.frame_profile.upload_bytes += frame_bytes;
+            self.frame_profile.target_upload_bytes += frame_bytes;
         }
 
         const pipeline = try self.getGraphicsPipeline(
@@ -3300,6 +3520,7 @@ pub const Renderer = struct {
                 );
                 try self.writeMapped(index_upload.?, indices);
                 self.frame_profile.upload_bytes += bytes;
+                self.frame_profile.index_upload_bytes += bytes;
                 self.device_functions.cmd_bind_index_buffer(
                     command_buffer,
                     index_upload.?.handle,
@@ -3767,7 +3988,8 @@ pub const Renderer = struct {
 
     /// Publishes only the deferred writeback for one guest address, used
     /// before guest memory at that address is staged or read.
-    fn flushPendingGuestWrite(self: *Renderer, address: u64) anyerror!void {
+    fn flushPendingGuestWrite(self: *Renderer, address: u64, visible_bytes: usize) anyerror!void {
+        try self.flushGuestStorageRange(address, visible_bytes);
         _ = try self.materializeRenderTargetAt(address);
         for (self.completed_frames.items) |*cached| {
             if (!cached.needs_writeback or cached.guest_address != address) continue;
@@ -4345,12 +4567,13 @@ pub const Renderer = struct {
             return Error.UnsupportedSampledImage;
         }
         const byte_count = std.math.cast(usize, layout.staging_bytes) orelse return Error.UnsupportedSampledImage;
+        const probe_span = std.math.cast(usize, layout.required_source_bytes) orelse 0;
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
 
         // A rendered target sampled as a texture must see the rendered frame:
         // publish its deferred writeback before hashing or staging guest bytes,
         // otherwise the cache would bind stale contents.
-        self.flushPendingGuestWrite(descriptor.address) catch |err| {
+        self.flushPendingGuestWrite(descriptor.address, probe_span) catch |err| {
             if (log_verbose_gpu) std.debug.print(
                 "[vulkan dcb] sampled image writeback flush failed: {s} addr=0x{x}\n",
                 .{ @errorName(err), descriptor.address },
@@ -4358,7 +4581,6 @@ pub const Renderer = struct {
             return err;
         };
 
-        const probe_span = std.math.cast(usize, layout.required_source_bytes) orelse 0;
         const content_hash = hashGuestMemoryRange(memory, descriptor.address, probe_span);
         const state_hash = sampledImageStateHash(descriptor, sampler_descriptor);
         const source_generation = self.sampledSourceGeneration(descriptor.address);
@@ -4396,7 +4618,18 @@ pub const Renderer = struct {
         const linear = try self.allocator.alloc(u8, byte_count);
         defer self.allocator.free(linear);
         const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
-        try layout.stage(reader, descriptor.address, linear);
+        if (layout.block.tile_mode.isLinear()) {
+            try layout.stage(reader, descriptor.address, linear);
+        } else {
+            // Layout.stage performs one checked guest-memory callback per
+            // texel. A 4096×4096 RGBA texture therefore issued 16.7 million
+            // range checks and took several seconds. Validate/copy the tiled
+            // allocation once, then detile the host slice without callbacks.
+            const tiled = try self.allocator.alloc(u8, probe_span);
+            defer self.allocator.free(tiled);
+            if (!memory.read(memory.context, descriptor.address, tiled)) return Error.GuestMemoryReadFailed;
+            try layout.detile(tiled, linear);
+        }
         const nonzero = countNonzeroRgba(linear);
         const metadata = gpu.MetadataSurface.fromImage(descriptor);
         if (nonzero == 0 and metadata.hasAny()) {
@@ -4567,6 +4800,7 @@ pub const Renderer = struct {
         );
         try self.submitOneShot(command_buffer);
         self.frame_profile.upload_bytes +%= byte_count;
+        self.frame_profile.texture_upload_bytes +%= byte_count;
 
         const view_info = vk.ImageViewCreateInfo{
             .image = image.handle,
@@ -4805,12 +5039,16 @@ pub const Renderer = struct {
     }
 
     fn dcbRead(context: ?*anyopaque, address: u64, bytes: []u8) bool {
-        const memory = fromContext(context).guest_memory orelse return false;
+        const self = fromContext(context);
+        self.flushGuestStorageRange(address, bytes.len) catch return false;
+        const memory = self.guest_memory orelse return false;
         return memory.read(memory.context, address, bytes);
     }
 
     fn dcbWrite(context: ?*anyopaque, address: u64, bytes: []const u8) bool {
-        const memory = fromContext(context).guest_memory orelse return false;
+        const self = fromContext(context);
+        self.flushGuestStorageRange(address, bytes.len) catch return false;
+        const memory = self.guest_memory orelse return false;
         return memory.write(memory.context, address, bytes);
     }
 
@@ -4827,13 +5065,10 @@ pub const Renderer = struct {
     fn dcbRelease(context: ?*anyopaque, release: gpu.state.ReleaseMem) bool {
         const self = fromContext(context);
         self.release_callbacks += 1;
-        // A release publishes GPU progress to the guest CPU; publish deferred
-        // guest writebacks with it so a CPU read of a rendered target after
-        // the fence sees the rendered frame. The queue itself needs no wait.
-        self.flushPendingGuestWrites() catch |err| {
-            self.last_sync_error = err;
-            return false;
-        };
+        // The synchronous queue has completed, but a release normally exposes
+        // only its fence/timestamp payload to the CPU. Keep color attachments
+        // and large compute outputs resident; exact texture/presentation reads
+        // materialize the resource they name instead of every dirty target.
         if ((release.destination != 0 and release.destination != 1) or release.address == 0) return true;
         var bytes: [8]u8 = undefined;
         const accepted = switch (release.data_selection) {
@@ -4886,12 +5121,8 @@ pub const Renderer = struct {
     fn dcbWriteData(context: ?*anyopaque, info: gpu.state.WriteData, values: []const u32) bool {
         const self = fromContext(context);
         self.write_data_callbacks += 1;
-        // CPU-visible publish point: flush deferred writebacks and skip the
-        // device wait (submissions are already fence-completed here).
-        self.flushPendingGuestWrites() catch |err| {
-            self.last_sync_error = err;
-            return false;
-        };
+        // WRITE_DATA publishes only the named destination. It does not require
+        // unrelated resident images to round-trip through guest memory.
         if (info.destination != 1 and info.destination != 2 and
             info.destination != 4 and info.destination != 5)
         {
@@ -4916,13 +5147,8 @@ pub const Renderer = struct {
     fn dcbEvent(context: ?*anyopaque, _: gpu.state.EventWrite) bool {
         const self = fromContext(context);
         self.event_callbacks += 1;
-        // An event is a CPU-visible completion point; publish deferred guest
-        // writebacks so the event consumer sees rendered data. No device wait:
-        // submissions are fence-completed before the executor reaches here.
-        self.flushPendingGuestWrites() catch |err| {
-            self.last_sync_error = err;
-            return false;
-        };
+        // Queue work is already fence-completed. Resource consumers perform
+        // address-specific materialization when they actually need host bytes.
         self.last_sync_error = null;
         return true;
     }
@@ -4941,14 +5167,13 @@ pub const Renderer = struct {
         // The buffer may be one this renderer drew into and then evicted from
         // the host frame cache; publish its deferred writeback so the guest
         // bytes being shown are the rendered frame, not stale contents.
-        self.flushPendingGuestWrite(buffer.address) catch |err| {
-            self.last_flip_error = err;
-            return false;
-        };
-
         const pitch_pixels = if (buffer.pitch_in_pixels != 0) buffer.pitch_in_pixels else buffer.width;
         const row_bytes = @as(usize, pitch_pixels) * 4;
         const needed = row_bytes * buffer.height;
+        self.flushPendingGuestWrite(buffer.address, needed) catch |err| {
+            self.last_flip_error = err;
+            return false;
+        };
         self.guest_frame_scratch.resize(self.allocator, needed) catch return false;
 
         const memory = self.guest_memory orelse return false;
@@ -5000,16 +5225,28 @@ pub const Renderer = struct {
             profile.fence_wait_ns >= std.time.ns_per_s;
         if (should_print) {
             std.debug.print(
-                "[gpu frame] flip={d} frame_ms={d} draws={d} dispatches={d} submits={d} fence_wait_us={d} upload_kib={d} readback_kib={d} rt_hit={d} rt_miss={d} buf_cache={d} tex_cache={d}\n",
+                "[gpu frame] flip={d} frame_ms={d} draws={d}/{d}ms dispatches={d}/{d}ms submits={d} fence_wait_us={d} upload_kib={d}(buf={d},rt={d},tex={d},idx={d}) resident_kib={d} readback_kib={d}(buf={d},rt={d}) storage_ms={d}+{d} target_ms={d} rt_hit={d} rt_miss={d} buf_cache={d} tex_cache={d}\n",
                 .{
                     self.flip_callbacks,
                     interval_ns / std.time.ns_per_ms,
                     profile.draws,
+                    profile.draw_ns / std.time.ns_per_ms,
                     profile.dispatches,
+                    profile.dispatch_ns / std.time.ns_per_ms,
                     profile.submits,
                     profile.fence_wait_ns / std.time.ns_per_us,
                     profile.upload_bytes / 1024,
+                    profile.storage_upload_bytes / 1024,
+                    profile.target_upload_bytes / 1024,
+                    profile.texture_upload_bytes / 1024,
+                    profile.index_upload_bytes / 1024,
+                    profile.resident_storage_bytes / 1024,
                     profile.readback_bytes / 1024,
+                    profile.storage_readback_bytes / 1024,
+                    profile.target_readback_bytes / 1024,
+                    profile.storage_stage_ns / std.time.ns_per_ms,
+                    profile.storage_commit_ns / std.time.ns_per_ms,
+                    profile.target_materialize_ns / std.time.ns_per_ms,
                     profile.render_target_hits,
                     profile.render_target_misses,
                     self.guest_buffers.items.len,
@@ -5077,6 +5314,18 @@ pub const Renderer = struct {
                 return false;
             };
             self.resolvePendingTargetlessDraw(requested.?);
+            if (self.window_presentation != null and self.flip_callbacks != 8) {
+                for (self.render_targets.items, 0..) |target, target_index| {
+                    if (target.target.descriptor.address != requested.?.address or !target.initialized) continue;
+                    self.blitRenderTargetToSwapchain(target_index) catch |err| {
+                        self.last_flip_error = err;
+                        return false;
+                    };
+                    self.presented_frames += 1;
+                    self.last_flip_error = null;
+                    return true;
+                }
+            }
             _ = self.materializeRenderTargetAt(requested.?.address) catch |err| {
                 self.last_flip_error = err;
                 return false;
@@ -5210,6 +5459,8 @@ pub const Renderer = struct {
 
     fn dcbDraw(context: ?*anyopaque, state: *const gpu.State, packet: gpu.pm4.Packet) bool {
         const self = fromContext(context);
+        const profile_started = hostTimestampNs();
+        defer self.frame_profile.draw_ns +|= elapsedHostNanoseconds(profile_started);
         self.draw_callbacks += 1;
         self.frame_profile.draws += 1;
         const vertex_stage = graphicsVertexStage(state);
@@ -5304,6 +5555,8 @@ pub const Renderer = struct {
 
     fn dcbDispatch(context: ?*anyopaque, state: *const gpu.State, packet: gpu.pm4.Packet) bool {
         const self = fromContext(context);
+        const profile_started = hostTimestampNs();
+        defer self.frame_profile.dispatch_ns +|= elapsedHostNanoseconds(profile_started);
         self.dispatch_callbacks += 1;
         self.frame_profile.dispatches += 1;
         if (packet.opcode != gpu.pm4.dispatch_direct) {

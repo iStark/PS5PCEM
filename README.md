@@ -23,8 +23,9 @@ Vulkan.
 - Guest vertex and pixel shaders can render sampled textures using AGC vertex
   tables, per-instruction V# mappings, `VertexIndex`, PARAM exports, and
   fragment interpolation.
-- Persistent render targets and bounded buffer, texture, and pipeline caches
-  keep frame resources alive across draws and reduce redundant queue submits.
+- Persistent render targets, large writable storage buffers, and bounded texture
+  and pipeline caches keep frame resources on the GPU across draws and reduce
+  redundant queue submits, uploads, and readbacks.
 - Long-running title execution uses a freeing, thread-safe allocator, and
   aligned Windows direct-memory ranges share 64 KiB section views. Temporary
   uploads/readbacks and 16 KiB guest pages therefore no longer accumulate as
@@ -37,8 +38,10 @@ Vulkan.
   `sceKernelDlsym` resolves readable export names inside the selected PRX.
 - Terminator 2D now reaches gameplay with the intended color balance, textured
   backgrounds, characters, and UI. Early publisher logos and the in-game pause
-  menu still expose composition/compression gaps, while synchronous texture
-  upload and render-target readback continue to limit frame pacing.
+  menu still expose composition/compression gaps. Direct render-target scanout,
+  GPU-resident storage and bulk tiled-texture staging reduced warmed-up frames
+  from roughly 208–240 ms to 22–65 ms in the current startup capture; first-use
+  texture uploads remain scene-dependent.
 - PS VR2 libraries currently expose only compatibility/no-device behavior.
   VR plugins can initialize far enough to load Unity assets, but headset
   rendering, tracking, controllers, and a host OpenXR bridge do not exist yet.
@@ -72,7 +75,7 @@ the repository contains none of that content.
 
 | Title | Observed milestone | Current limit |
 |---|---|---|
-| **Terminator 2D: No Fate** | Reaches gameplay with correct color reproduction and clean title-provided backgrounds, characters, HUD elements, and textures | Early publisher logos and the pause menu retain artifacts; synchronous upload/readback limits frame pacing, while depth/MRT and compression metadata remain incomplete |
+| **Terminator 2D: No Fate** | Reaches gameplay with correct color reproduction and clean title-provided backgrounds, characters, HUD elements, and textures; warmed-up startup frames measure 22–65 ms on the current test host | Early publisher logos and the pause menu retain artifacts; first-use texture staging, depth/MRT, and compression metadata remain incomplete |
 | **Pistol Whip** | Maps the native PS VR2 plugin and Burst module, then starts loading Unity asset archives | Headset, tracking, controller, and host OpenXR support are intentionally deferred |
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
 | **Tetris Effect: Connected** | Completes Unreal filesystem/config bootstrap, executes compact typed UAV clears (including two 1024×1024 `RGBA32_FLOAT` targets) and 3D volume uploads, and reaches a second measured VideoOut frame with 6 draws/63 dispatches | Output is black: the deferred compositor reaches its scanout buffer but is rejected by an unsupported scalar source; a compact image-copy compute kernel and other compute gaps also remain, while the 512 GiB reservation can depend on host address-space placement |
@@ -594,8 +597,8 @@ The remaining stages are:
    and compressed DCC/CMASK/FMASK/HTILE surfaces.
 3. Complete structured loops, VCC/EXEC divergence, formats, mip/layer views,
    explicit-LOD operands, and the remaining image operations seen in captures.
-4. Reduce synchronous dispatch/readback work and validate state and resource
-   invalidation against longer title captures.
+4. Continue reducing first-use texture and synchronous dispatch work, and
+   validate state and resource invalidation against longer title captures.
 
 The live path is now connected end to end: AGC DCB submission executes against
 the Vulkan backend, VideoOut registration identifies the requested display
@@ -626,13 +629,13 @@ image LRU. The Vulkan-driver cache is persisted as
 `vulkan_pipeline_cache.bin` between runs; invalid, unreadable, or oversized
 cache data simply falls back to an empty driver cache, so it can only affect
 startup compilation time, never correctness.
-`stageGuestStorageBuffer` retains at most one allocation per descriptor slot,
-with 64 slots and a 128 MiB per-range cap. Rebinding a slot recycles its old
-allocation instead of retaining every transient guest ring address. Buffers use
-host-visible coherent storage, so current guest bytes are copied directly into
-the mapped Vulkan allocation and compute results are read from the same memory
-after the fenced dispatch. This removes the former upload/copy/readback submit
-pair for every staged range while keeping descriptor-set growth bounded.
+`stageGuestStorageBuffer` keys coherent allocations by exact guest address and
+size, with 64 slots and a 128 MiB per-range cap. Large writable ranges remain
+GPU-authoritative across descriptor-slot rebinding; a real guest consumer reads
+back only the requested prefix, while eviction materializes the complete dirty
+range. Small buffers retain eager visibility. This removes the former
+multi-megabyte upload/readback cycle from every dispatch while keeping cache and
+descriptor-set growth bounded.
 
 `dcbBackend` adapts checked guest reads and writes plus synchronization,
 draw/dispatch and flip callbacks to [`gpu.executor`](src/gpu/executor.zig)
@@ -685,25 +688,29 @@ decoded from user SGPRs, detiled into a sampled Vulkan image, transitioned to
 shader-read layout, and bound through set 0/binding 1. Cache identity includes
 the guest payload hash; rewriting the same address replaces its stale image,
 while descriptor SGPR addresses are excluded from scalar specialization to
-avoid recompiling a pipeline for every streamed texture. The first MIMG lowering
-supports normalized two-coordinate `image_sample`; other formats, dimensions,
+avoid recompiling a pipeline for every streamed texture. Non-linear surfaces are
+read once into a checked contiguous allocation and detiled in host memory,
+avoiding one guest callback per texel for large streamed textures. The first
+MIMG lowering supports normalized two-coordinate `image_sample`; other formats, dimensions,
 mips, component swizzles, and sampling operands remain incomplete.
 
 Each draw submission completes through its fence before the executor reaches a
 PM4 synchronization callback. `ACQUIRE_MEM`, `RELEASE_MEM`, `WRITE_DATA`, and
-events consequently do not add a device-idle wait; the CPU-visible callbacks
-first publish any deferred target writebacks. The executor remains responsible
+events consequently do not add a device-idle wait or materialize unrelated
+render targets and storage buffers. Exact-address consumers publish only the
+resource range they actually need. The executor remains responsible
 for deciding whether `WAIT_REG_MEM` is satisfied and preserving its
 continuation. `RELEASE_MEM` immediate 32/64-bit values and clock/counter
 selections publish their exact-width result only after Vulkan work completes;
-reserved data selections are rejected. Completed linear frames are retained by
-guest render-target address. `SetFlip` publishes deferred targets, resolves its
-registered VideoOut slot, and sends the matching frame, dimensions, address and
-flip metadata to an optional `PresentationSink`.
+reserved data selections are rejected. Completed render targets are retained by
+guest address. `SetFlip` resolves its registered VideoOut slot and sends the
+matching address and dimensions to the presentation path; diagnostic captures
+can still request a CPU-visible linear frame explicitly.
 
 Compact `[gpu frame]` diagnostics report frame time, draw/dispatch/submit counts,
-fence wait time, upload/readback volume, render-target hits, and current buffer
-and texture cache sizes. Progress captures include selected later flips rather
+fence wait time, categorized upload/readback volume, GPU-resident storage,
+draw/dispatch/materialization time, render-target hits, and current buffer and
+texture cache sizes. Progress captures include selected later flips rather
 than only the first presented image, which makes missing textures and frame-state
 regressions visible during title bring-up.
 
@@ -712,10 +719,12 @@ When initialized with a native Win32 handle, the renderer enables
 that can present to that surface, and creates an RGBA8/BGRA8 FIFO swapchain. The
 presentation path keeps one persistent upload buffer and acquire fence for the
 swapchain lifetime. It aspect-fits the guest RGBA8 frame with nearest-neighbour
-CPU scaling, uploads it, performs transfer/present layout transitions and calls
-`vkQueuePresentKHR`. Bursts collapse to the latest pending frame; if no image is
-immediately available, that stale frame is dropped rather than stalling guest
-execution on the display refresh rate.
+scaling. A resident render target is blitted directly to the acquired swapchain
+image without a guest-memory round trip; CPU-visible frames retain the persistent
+upload fallback. Both paths perform the required transfer/present layout
+transitions and call `vkQueuePresentKHR`. Bursts collapse to the latest pending
+frame; if no image is immediately available, that stale frame is dropped rather
+than stalling guest execution on the display refresh rate.
 The window owns its Win32 message loop on a dedicated host thread so a flip from
 any guest pthread can use the serialized GPU submission boundary safely.
 
@@ -1227,11 +1236,11 @@ such as `__stack_chk_guard` and `__progname` are registered as storage addresses
 not function stubs. Runtime hooks provide per-thread errno/TLS, clocks, sleep,
 process parameters, process `argc`/`argv`, sized empty sanitizer callback
 tables, and rtld callbacks.
-Synchronous host GPU execution is excluded from the emulated process clock while
-an AGC submit is active. Console submission is asynchronous, so charging minutes
-of host translation/readback latency to the guest render thread incorrectly
-triggers engine watchdogs; clocks continue normally before and after that exact
-host-only interval.
+Only anomalously long synchronous host GPU execution is excluded from the
+emulated process clock while an AGC submit is active. The first 100 ms of every
+submit remains visible to the guest, so ordinary multi-submit frames advance
+game clocks normally; excess host translation/readback latency is hidden to
+avoid false engine watchdogs on work that would be asynchronous on the console.
 Owner-aware `__cxa_guard_acquire`, `release`, and `abort` handling prevents a
 recursive static initializer from deadlocking the guest while preserving the
 one-initializer contract. Operations whose backing subsystem is not implemented
@@ -1565,10 +1574,12 @@ scheduler and Vulkan backend. Observed startup work now includes:
   and `VertexIndex` addressing. A diagnostic triangle is used only when guest
   vertex resources or translation remain unavailable.
 - Persistent color targets accumulate multi-draw output on the GPU and defer
-  detile/readback until guest visibility or presentation requires it.
-- Guest storage buffers are mapped directly through bounded coherent
-  allocations. This substantially reduces submissions on compute-heavy and
-  draw-heavy frames without changing the synchronization contract.
+  detile/readback until an exact guest-memory consumer requires it. VideoOut can
+  blit an exact resident target directly into the swapchain.
+- Large writable guest storage buffers remain GPU-authoritative in bounded
+  coherent allocations across dispatches. Small synchronization payloads and
+  explicitly consumed prefixes are still published immediately, preserving the
+  guest-visible ordering contract.
 - Sampled images use a 32-entry content-aware LRU, and the graphics-pipeline
   cache recycles its least-recently-used entry instead of dropping later draws
   after reaching its fixed capacity.
@@ -1599,10 +1610,12 @@ its null branch instead of dying after the first flip; the process now survives
 past that historical crash site. Non-compare field accesses use a bounded
 synthetic object recovery path; its instruction decoder now recognizes both
 ordinary REX and two-/three-byte VEX memory forms used by generated Unity
-floating-point setters. Frame pacing is still CPU-bound even when host GPU
-utilization is low: ordinary frames repeatedly translate/specialize shaders and
-move tens of MiB of guest data, while texture-streaming frames perform much
-larger uploads.
+floating-point setters. In the current 1920×1080 startup capture, warmed-up
+frames dropped from roughly 208–240 ms to 22–65 ms: steady transfer volume fell
+from about 18 MiB upload plus 26 MiB readback to about 0.9 MiB each. A first-use
+64 MiB tiled texture frame fell from roughly 6.5 seconds to 0.66 seconds by
+replacing per-texel guest reads with one checked bulk read. Larger scene changes
+still incur first-use texture and pipeline work.
 
 A PS VR2 Unity bring-up now maps both its native VR plugin and generated Burst
 module, resolves their callbacks by module-scoped `sceKernelDlsym`, survives the
@@ -1641,9 +1654,11 @@ while actual DCC/CMASK/FMASK compression remains rejected. Its observed
 `R16_UINT→R16_UINT` volumes with the shader's bounds, strides, base coordinates,
 and linear/tiled target layout. A measured startup frame consequently completes
 all four volume uploads (two 1×1×1 and two 16×16×16) without a rejected compute
-dispatch. Synchronous AGC backend time is now excluded from the guest process
-clock, preventing the false `GameThread timed out waiting for RenderThread`
-watchdog that previously ended this slow host run at `eboot.bin+0x16af4ef`.
+dispatch. Synchronous AGC backend time beyond a 100 ms allowance per submit is
+excluded from the guest process clock, preventing the false
+`GameThread timed out waiting for RenderThread` watchdog that previously ended
+this slow host run at `eboot.bin+0x16af4ef` without stalling clocks in titles
+that issue many ordinary submissions per frame.
 The latest measurement reaches the following VideoOut flip after 464.684 host
 seconds and reports 6 draws, 63 dispatches, and 41 submissions. The pending
 display draw is resolved against the scanout allocation but is then rejected by
@@ -1678,8 +1693,8 @@ from leaking into host code where nothing would check it.
 3. Lower the deferred compositor's scalar source and the compact image-copy
    kernel now exposed at the following VideoOut flip, then close the remaining
    compute register/storage/opcode gaps.
-4. Reduce repeated compute readbacks and large texture uploads without changing
-   guest-visible synchronization.
+4. Move the remaining first-use texture conversion and synchronous compute work
+   off the frame-critical path without changing guest-visible synchronization.
 5. Keep the guest process in a stable long-running flip/submit loop and close
    remaining HLE or wait-loop gaps as they appear.
 6. Add real HMD/tracker/controller state and a host VR bridge only after the

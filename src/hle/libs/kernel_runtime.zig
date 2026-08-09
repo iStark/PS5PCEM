@@ -67,6 +67,7 @@ var process_start_nanoseconds: i96 = 0;
 var process_clock_sequence: std.atomic.Value(u32) = .init(0);
 var excluded_host_nanoseconds: std.atomic.Value(u64) = .init(0);
 var active_host_exclusion_start: std.atomic.Value(u64) = .init(0);
+const host_time_exclusion_grace_ns: u64 = 100 * std.time.ns_per_ms;
 var process_param_address: std.atomic.Value(u64) = .init(0);
 var application_heap_api: std.atomic.Value(u64) = .init(0);
 var thread_dtors: std.atomic.Value(u64) = .init(0);
@@ -1426,12 +1427,13 @@ pub fn realTimeNanoseconds() i96 {
     return clockNanoseconds(0);
 }
 
-/// A synchronous host operation whose duration is not guest process time.
+/// A synchronous host operation that can contain excess emulator latency.
 ///
 /// GPU submission is asynchronous on the console, but the current backend
 /// decodes, translates, executes, and reads back the work before returning from
-/// the submit call. Freezing the process clock over that host-only interval
-/// keeps engine watchdogs from charging emulation latency to the render thread.
+/// the submit call. The first short interval remains guest process time so
+/// ordinary titles keep advancing their clocks; only latency past that grace
+/// period is hidden from engine watchdogs.
 pub const HostTimeExclusion = struct {
     active: bool = false,
 
@@ -1442,7 +1444,8 @@ pub const HostTimeExclusion = struct {
 
         _ = process_clock_sequence.fetchAdd(1, .acq_rel);
         const started = active_host_exclusion_start.swap(0, .acq_rel);
-        if (now > started) _ = excluded_host_nanoseconds.fetchAdd(now - started, .monotonic);
+        const excess = excessHostNanoseconds(started, now);
+        if (excess != 0) _ = excluded_host_nanoseconds.fetchAdd(excess, .monotonic);
         _ = process_clock_sequence.fetchAdd(1, .release);
     }
 };
@@ -1463,13 +1466,16 @@ fn nonnegativeNanoseconds(value: i96) u64 {
     return std.math.cast(u64, value) orelse std.math.maxInt(u64);
 }
 
+fn excessHostNanoseconds(started: u64, now: u64) u64 {
+    if (started == 0 or now <= started) return 0;
+    return (now - started) -| host_time_exclusion_grace_ns;
+}
+
 fn effectiveProcessNanoseconds(now: i96, started: i96, excluded: u64, active_start: u64) u64 {
     const elapsed: u64 = nonnegativeNanoseconds(@max(@as(i96, 0), now - started));
     var total_excluded = excluded;
     const current = nonnegativeNanoseconds(now);
-    if (active_start != 0 and current > active_start) {
-        total_excluded +|= current - active_start;
-    }
+    total_excluded +|= excessHostNanoseconds(active_start, current);
     return elapsed -| total_excluded;
 }
 
@@ -1898,19 +1904,22 @@ const ApplicationHeapTestBackend = struct {
     }
 };
 
-test "host time exclusions freeze only the emulated process clock" {
+test "host time exclusions preserve normal submits and hide only excess latency" {
+    const ms = std.time.ns_per_ms;
     try std.testing.expectEqual(
-        @as(u64, 125),
-        effectiveProcessNanoseconds(1150, 1000, 25, 0),
+        @as(u64, 225 * ms),
+        effectiveProcessNanoseconds(1250 * ms, 1000 * ms, 25 * ms, 0),
     );
     try std.testing.expectEqual(
-        @as(u64, 75),
-        effectiveProcessNanoseconds(1150, 1000, 25, 1100),
+        @as(u64, 175 * ms),
+        effectiveProcessNanoseconds(1250 * ms, 1000 * ms, 25 * ms, 1100 * ms),
     );
     try std.testing.expectEqual(
         @as(u64, 0),
-        effectiveProcessNanoseconds(1050, 1000, 200, 0),
+        effectiveProcessNanoseconds(1050 * ms, 1000 * ms, 200 * ms, 0),
     );
+    try std.testing.expectEqual(@as(u64, 0), excessHostNanoseconds(1000 * ms, 1100 * ms));
+    try std.testing.expectEqual(@as(u64, 50 * ms), excessHostNanoseconds(1000 * ms, 1150 * ms));
 }
 
 test "Unity scripting allocator uses the application heap memalign callback" {

@@ -193,6 +193,7 @@ pub const primitive_topology_triangle_list: u32 = 3;
 pub const polygon_mode_fill: u32 = 0;
 pub const color_component_rgba_bits: Flags = 0xf;
 pub const subpass_contents_inline: u32 = 0;
+pub const filter_nearest: u32 = 0;
 pub const format_b8g8r8a8_unorm: u32 = 44;
 pub const color_space_srgb_nonlinear_khr: u32 = 0;
 pub const present_mode_fifo_khr: u32 = 2;
@@ -809,6 +810,13 @@ pub const BufferImageCopy = extern struct {
     image_extent: Extent3D,
 };
 
+pub const ImageBlit = extern struct {
+    source_subresource: ImageSubresourceLayers,
+    source_offsets: [2]Offset3D,
+    destination_subresource: ImageSubresourceLayers,
+    destination_offsets: [2]Offset3D,
+};
+
 pub const PfnVoidFunction = ?*const anyopaque;
 pub const PfnGetInstanceProcAddr = *const fn (?Instance, [*:0]const u8) callconv(call) PfnVoidFunction;
 pub const PfnGetDeviceProcAddr = *const fn (Device, [*:0]const u8) callconv(call) PfnVoidFunction;
@@ -891,6 +899,7 @@ pub const PfnCmdFillBuffer = *const fn (CommandBuffer, Buffer, DeviceSize, Devic
 pub const PfnCmdCopyBuffer = *const fn (CommandBuffer, Buffer, Buffer, u32, [*]const BufferCopy) callconv(call) void;
 pub const PfnCmdCopyImageToBuffer = *const fn (CommandBuffer, Image, u32, Buffer, u32, [*]const BufferImageCopy) callconv(call) void;
 pub const PfnCmdCopyBufferToImage = *const fn (CommandBuffer, Buffer, Image, u32, u32, [*]const BufferImageCopy) callconv(call) void;
+pub const PfnCmdBlitImage = *const fn (CommandBuffer, Image, u32, Image, u32, u32, [*]const ImageBlit, u32) callconv(call) void;
 pub const PfnCmdPipelineBarrier = *const fn (CommandBuffer, Flags, Flags, Flags, u32, ?*const anyopaque, u32, ?[*]const BufferMemoryBarrier, u32, ?*const anyopaque) callconv(call) void;
 pub const PfnCreateSwapchainKHR = *const fn (Device, *const SwapchainCreateInfoKHR, ?*const anyopaque, *Swapchain) callconv(call) Result;
 pub const PfnDestroySwapchainKHR = *const fn (Device, Swapchain, ?*const anyopaque) callconv(call) void;
