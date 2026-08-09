@@ -823,6 +823,7 @@ pub const Renderer = struct {
     translated_dispatches: u64 = 0,
     elided_dispatches: u64 = 0,
     emulated_gds_dispatches: u64 = 0,
+    emulated_image_store_dispatches: u64 = 0,
     buffer_cache_hits: u64 = 0,
     buffer_cache_misses: u64 = 0,
     buffer_uploads: u64 = 0,
@@ -1547,6 +1548,14 @@ pub const Renderer = struct {
             local_size,
             group_count,
         )) |report| return report;
+        if (try self.tryEmulateImageStoreClear(
+            memory,
+            &bindings,
+            reader,
+            &analysis,
+            local_size,
+            group_count,
+        )) |report| return report;
         if (!analysis.hasExternalEffects()) {
             self.elided_dispatches += 1;
             std.debug.print(
@@ -1785,6 +1794,110 @@ pub const Renderer = struct {
             "[vulkan dcb] emulated buffer copy: {d} elements from 0x{x} to 0x{x}\n",
             .{ copies, source_desc.address, dest_desc.address },
         );
+        return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
+    }
+
+    /// Executes the two compact AGC UAV-clear kernels seen during bootstrap.
+    ///
+    /// Both kernels form x/y from an 8x8 workgroup, take z from the workgroup
+    /// id, load one constant texel from the first constant buffer, and issue a
+    /// single image_store. Matching the complete instruction shape keeps this
+    /// path honest: general MIMG control flow and typed conversion still go
+    /// through the translator and remain explicit when unsupported.
+    fn tryEmulateImageStoreClear(
+        self: *Renderer,
+        memory: GuestMemory,
+        bindings: *const gpu.ShaderBindings,
+        reader: gpu.ShaderMemoryReader,
+        analysis: *const gpu.ShaderAnalysis,
+        local_size: [3]u32,
+        group_count: [3]u32,
+    ) anyerror!?DispatchReport {
+        const instructions = analysis.program.instructions.items;
+        const Shape = enum { rgba, scalar };
+        const shape: Shape = if (matchesRgbaImageClear(instructions))
+            .rgba
+        else if (matchesScalarImageClear(instructions))
+            .scalar
+        else
+            return null;
+        if (local_size[0] != 8 or local_size[1] != 8 or local_size[2] != 1) return null;
+
+        const image_inst = switch (shape) {
+            .rgba => instructions[9],
+            .scalar => instructions[6],
+        };
+        const descriptor = try resolveReadWriteImageDescriptor(bindings, reader, image_inst.src1.reg) orelse
+            return null;
+        if (descriptor.dcc_enabled or descriptor.cmask_fast_clear or descriptor.fmask_compression or
+            descriptor.metadata_address != 0 or descriptor.samplesLog2() != 0 or
+            descriptor.viewMipLevels() != 1 or descriptor.viewBaseLevel() != 0 or
+            image_inst.image_dimension != .dim_2d_array_alt)
+        {
+            return null;
+        }
+        if (shape == .scalar and descriptor.dst_select[0] != 4) return null;
+
+        const constants = (try bindings.inlineBufferDescriptor(8)) orelse blk: {
+            const binding = (try bindings.resolve(reader, .constant_buffer, 0)) orelse return null;
+            break :blk binding.descriptor.constant_buffer;
+        };
+        const word_count: usize = if (shape == .rgba) 4 else 1;
+        if (constants.address == 0 or constants.size_bytes < word_count * @sizeOf(u32)) return null;
+        var values: [4]u32 = @splat(0);
+        for (values[0..word_count], 0..) |*value, index| {
+            value.* = try readGuestU32(memory, constants.address + index * @sizeOf(u32));
+        }
+        const texel = packImageStoreTexel(
+            descriptor.unified_format,
+            values,
+            image_inst.data_mask,
+            descriptor.dst_select,
+        ) orelse return null;
+
+        const texture = try gpu.TextureLayout.fromImage(descriptor);
+        const subresource = try texture.subresource(0, 0, texture.layers);
+        if (texel.length != subresource.block.bytes_per_element) return null;
+
+        const dispatched_width = std.math.mul(u64, group_count[0], local_size[0]) catch
+            return Error.GuestBufferTooLarge;
+        const dispatched_height = std.math.mul(u64, group_count[1], local_size[1]) catch
+            return Error.GuestBufferTooLarge;
+        const width: u32 = @intCast(@min(@as(u64, subresource.width), dispatched_width));
+        const height: u32 = @intCast(@min(@as(u64, subresource.height), dispatched_height));
+        const depth = @min(subresource.depth_or_layers, group_count[2]);
+
+        var writes: u64 = 0;
+        for (0..depth) |z_index| {
+            const z: u32 = @intCast(z_index);
+            for (0..height) |y_index| {
+                const y: u32 = @intCast(y_index);
+                for (0..width) |x_index| {
+                    const x: u32 = @intCast(x_index);
+                    const offset = try subresource.sourceByteOffset(x, y, z, 0);
+                    const address = std.math.add(u64, descriptor.address, offset) catch
+                        return Error.GuestMemoryWriteFailed;
+                    if (!memory.write(memory.context, address, texel.bytes[0..texel.length])) {
+                        return Error.GuestMemoryWriteFailed;
+                    }
+                    writes += 1;
+                }
+            }
+        }
+
+        self.emulated_image_store_dispatches += 1;
+        if (log_verbose_gpu or self.emulated_image_store_dispatches <= 4) {
+            std.debug.print(
+                "[vulkan dcb] emulated image clear: {d} texels addr=0x{x} fmt={d} tile={s} (#{d})\n",
+                .{
+                    writes,
+                    descriptor.address,
+                    descriptor.unified_format,
+                    @tagName(descriptor.tile_mode),
+                    self.emulated_image_store_dispatches,
+                },
+            );
+        }
         return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
     }
 
@@ -4865,6 +4978,179 @@ fn registerOperand(op: gpu.ShaderOperand, kind: gpu.ShaderOperandKind, register:
     return op.kind == kind and op.reg == register;
 }
 
+fn inlineIntegerOperand(op: gpu.ShaderOperand, value: u32) bool {
+    return op.kind == .integer_inline_constant and op.value == value;
+}
+
+fn matchesRgbaImageClear(inst: anytype) bool {
+    if (inst.len != 11 or
+        inst[0].opcode != .v_lshl_add_u32 or
+        inst[1].opcode != .s_buffer_load_dwordx4 or
+        inst[2].opcode != .v_lshl_add_u32 or
+        inst[3].opcode != .v_mov_b32 or
+        inst[4].opcode != .s_waitcnt or
+        inst[5].opcode != .v_mov_b32 or
+        inst[6].opcode != .v_mov_b32 or
+        inst[7].opcode != .v_mov_b32 or
+        inst[8].opcode != .v_mov_b32 or
+        inst[9].opcode != .image_store or
+        inst[10].opcode != .s_endpgm)
+    {
+        return false;
+    }
+    if (!registerOperand(inst[0].dst, .vgpr, 4) or
+        !registerOperand(inst[0].src0, .sgpr, 12) or
+        !inlineIntegerOperand(inst[0].src1, 3) or
+        !registerOperand(inst[0].src2, .vgpr, 0) or
+        !registerOperand(inst[1].dst, .sgpr, 16) or
+        !registerOperand(inst[1].src0, .sgpr, 8) or inst[1].memory_offset != 0 or
+        !registerOperand(inst[2].dst, .vgpr, 5) or
+        !registerOperand(inst[2].src0, .sgpr, 13) or
+        !inlineIntegerOperand(inst[2].src1, 3) or
+        !registerOperand(inst[2].src2, .vgpr, 1) or
+        !registerOperand(inst[3].dst, .vgpr, 6) or
+        !registerOperand(inst[3].src0, .sgpr, 14))
+    {
+        return false;
+    }
+    for (5..9) |index| {
+        const channel: u32 = @intCast(index - 5);
+        if (!registerOperand(inst[index].dst, .vgpr, channel) or
+            !registerOperand(inst[index].src0, .sgpr, 16 + channel)) return false;
+    }
+    return registerOperand(inst[9].dst, .vgpr, 0) and
+        registerOperand(inst[9].src0, .vgpr, 4) and
+        registerOperand(inst[9].src1, .sgpr, 0) and
+        inst[9].data_mask == 0xf and inst[9].image_nsa_words == 0;
+}
+
+fn matchesScalarImageClear(inst: anytype) bool {
+    if (inst.len != 8 or
+        inst[0].opcode != .v_lshl_add_u32 or
+        inst[1].opcode != .s_buffer_load_dword or
+        inst[2].opcode != .s_waitcnt or
+        inst[3].opcode != .v_mov_b32 or
+        inst[4].opcode != .v_lshl_add_u32 or
+        inst[5].opcode != .v_mov_b32 or
+        inst[6].opcode != .image_store or
+        inst[7].opcode != .s_endpgm)
+    {
+        return false;
+    }
+    return registerOperand(inst[0].dst, .vgpr, 0) and
+        registerOperand(inst[0].src0, .sgpr, 12) and
+        inlineIntegerOperand(inst[0].src1, 3) and
+        registerOperand(inst[0].src2, .vgpr, 0) and
+        inst[1].dst.kind == .vcc_lo and registerOperand(inst[1].src0, .sgpr, 8) and
+        inst[1].memory_offset == 0 and
+        registerOperand(inst[3].dst, .vgpr, 2) and inst[3].src0.kind == .vcc_lo and
+        registerOperand(inst[4].dst, .vgpr, 1) and
+        registerOperand(inst[4].src0, .sgpr, 13) and
+        inlineIntegerOperand(inst[4].src1, 3) and
+        registerOperand(inst[4].src2, .vgpr, 1) and
+        registerOperand(inst[5].dst, .vgpr, 3) and registerOperand(inst[5].src0, .sgpr, 14) and
+        registerOperand(inst[6].dst, .vgpr, 2) and
+        registerOperand(inst[6].src0, .vgpr, 0) and
+        registerOperand(inst[6].src1, .sgpr, 0) and
+        inst[6].data_mask == 0x1 and inst[6].image_nsa_words == 1;
+}
+
+fn resolveReadWriteImageDescriptor(
+    bindings: *const gpu.ShaderBindings,
+    reader: gpu.ShaderMemoryReader,
+    resource_sgpr: u32,
+) anyerror!?gpu.ImageDescriptor {
+    if (try bindings.inlineImageDescriptor(resource_sgpr)) |descriptor| return descriptor;
+    const binding = (try bindings.resolve(reader, .read_write_texture, 0)) orelse return null;
+    return binding.descriptor.read_write_texture;
+}
+
+const PackedImageStoreTexel = struct {
+    bytes: [8]u8 = @splat(0),
+    length: u8,
+};
+
+fn unorm8FromFloatBits(bits: u32) u8 {
+    const value: f32 = @bitCast(bits);
+    if (std.math.isNan(value) or value <= 0.0) return 0;
+    if (value >= 1.0) return 255;
+    return @intFromFloat(@round(value * 255.0));
+}
+
+fn storageImageValues(values: [4]u32, dst_select: [4]u8) [4]u32 {
+    var result: [4]u32 = @splat(0);
+    for (0..4) |physical_channel| {
+        const target: u8 = @intCast(4 + physical_channel);
+        for (dst_select, 0..) |selector, shader_channel| {
+            if (selector != target) continue;
+            result[physical_channel] = values[shader_channel];
+            break;
+        }
+    }
+    return result;
+}
+
+fn packImageStoreTexel(
+    format: u16,
+    shader_values: [4]u32,
+    data_mask: u4,
+    dst_select: [4]u8,
+) ?PackedImageStoreTexel {
+    const values = storageImageValues(shader_values, dst_select);
+    return switch (format) {
+        // IMG_DATA_FORMAT_8 / IMG_NUM_FORMAT_UINT
+        5 => if (data_mask == 0x1) .{
+            .bytes = .{ @intCast(@min(values[0], 255)), 0, 0, 0, 0, 0, 0, 0 },
+            .length = 1,
+        } else null,
+        // IMG_DATA_FORMAT_32 / IMG_NUM_FORMAT_UINT
+        20 => if (data_mask == 0xf) blk: {
+            var result = PackedImageStoreTexel{ .length = 4 };
+            std.mem.writeInt(u32, result.bytes[0..4], values[0], .little);
+            break :blk result;
+        } else null,
+        // IMG_DATA_FORMAT_8_8_8_8 / IMG_NUM_FORMAT_UNORM
+        56 => if (data_mask == 0xf) .{
+            .bytes = .{
+                unorm8FromFloatBits(values[0]),
+                unorm8FromFloatBits(values[1]),
+                unorm8FromFloatBits(values[2]),
+                unorm8FromFloatBits(values[3]),
+                0,
+                0,
+                0,
+                0,
+            },
+            .length = 4,
+        } else null,
+        // IMG_DATA_FORMAT_8_8_8_8 / IMG_NUM_FORMAT_UINT
+        60 => if (data_mask == 0xf) .{
+            .bytes = .{
+                @intCast(@min(values[0], 255)),
+                @intCast(@min(values[1], 255)),
+                @intCast(@min(values[2], 255)),
+                @intCast(@min(values[3], 255)),
+                0,
+                0,
+                0,
+                0,
+            },
+            .length = 4,
+        } else null,
+        // IMG_DATA_FORMAT_16_16_16_16 / IMG_NUM_FORMAT_FLOAT
+        71 => if (data_mask == 0xf) blk: {
+            var result = PackedImageStoreTexel{ .length = 8 };
+            for (values, 0..) |bits, channel| {
+                const value: f32 = @bitCast(bits);
+                const half: f16 = @floatCast(value);
+                std.mem.writeInt(u16, result.bytes[channel * 2 ..][0..2], @bitCast(half), .little);
+            }
+            break :blk result;
+        } else null,
+        else => null,
+    };
+}
+
 fn descriptorFromComputeUserData(state: *const gpu.State, first_register: u32) anyerror!gpu.BufferDescriptor {
     var words: [4]u32 = undefined;
     for (&words, 0..) |*word, index| {
@@ -5983,6 +6269,46 @@ test "RGBA occupancy preserves black alpha and destination alpha is explicit" {
     try std.testing.expectEqual(@as(u32, 2), countNonzeroRgba(&pixels));
     forceDestinationAlphaOne(&pixels);
     try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255 }, &.{ pixels[3], pixels[7], pixels[11] });
+}
+
+test "typed image clear texels use the descriptor number format" {
+    const rgba = [4]u8{ 4, 5, 6, 7 };
+    const unorm = packImageStoreTexel(56, .{
+        @bitCast(@as(f32, 0.0)),
+        @bitCast(@as(f32, 0.5)),
+        @bitCast(@as(f32, 1.0)),
+        @bitCast(@as(f32, 2.0)),
+    }, 0xf, rgba).?;
+    try std.testing.expectEqual(@as(u8, 4), unorm.length);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 128, 255, 255 }, unorm.bytes[0..unorm.length]);
+
+    const rgba_uint = packImageStoreTexel(60, .{ 0, 1, 255, 300 }, 0xf, rgba).?;
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 255, 255 }, rgba_uint.bytes[0..rgba_uint.length]);
+    const bgra = packImageStoreTexel(60, .{ 0, 1, 255, 300 }, 0xf, .{ 6, 5, 4, 7 }).?;
+    try std.testing.expectEqualSlices(u8, &.{ 255, 1, 0, 255 }, bgra.bytes[0..bgra.length]);
+    const missing_green = packImageStoreTexel(60, .{ 0, 1, 255, 300 }, 0xf, .{ 4, 4, 6, 7 }).?;
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, missing_green.bytes[0..missing_green.length]);
+
+    const r_uint = packImageStoreTexel(5, .{ 300, 0, 0, 0 }, 0x1, rgba).?;
+    try std.testing.expectEqual(@as(u8, 1), r_uint.length);
+    try std.testing.expectEqual(@as(u8, 255), r_uint.bytes[0]);
+
+    const r32_uint = packImageStoreTexel(20, .{ 0x1234_5678, 0, 0, 0 }, 0xf, rgba).?;
+    try std.testing.expectEqual(@as(u8, 4), r32_uint.length);
+    try std.testing.expectEqual(@as(u32, 0x1234_5678), std.mem.readInt(u32, r32_uint.bytes[0..4], .little));
+
+    const rgba16_float = packImageStoreTexel(71, .{
+        @bitCast(@as(f32, 0.0)),
+        @bitCast(@as(f32, 0.5)),
+        @bitCast(@as(f32, 1.0)),
+        @bitCast(@as(f32, -2.0)),
+    }, 0xf, rgba).?;
+    try std.testing.expectEqual(@as(u8, 8), rgba16_float.length);
+    try std.testing.expectEqual(@as(u16, @bitCast(@as(f16, 0.5))), std.mem.readInt(u16, rgba16_float.bytes[2..4], .little));
+    try std.testing.expectEqual(@as(u16, @bitCast(@as(f16, -2.0))), std.mem.readInt(u16, rgba16_float.bytes[6..8], .little));
+
+    try std.testing.expect(packImageStoreTexel(56, .{ 0, 0, 0, 0 }, 0x1, rgba) == null);
+    try std.testing.expect(packImageStoreTexel(61, .{ 0, 0, 0, 0 }, 0xf, rgba) == null);
 }
 
 test "presentation scaling letterboxes RGBA and converts BGRA" {
