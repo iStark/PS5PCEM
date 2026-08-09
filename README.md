@@ -25,6 +25,10 @@ Vulkan.
   fragment interpolation.
 - Persistent render targets and bounded buffer, texture, and pipeline caches
   keep frame resources alive across draws and reduce redundant queue submits.
+- Long-running title execution uses a freeing, thread-safe allocator, and
+  aligned Windows direct-memory ranges share 64 KiB section views. Temporary
+  uploads/readbacks and 16 KiB guest pages therefore no longer accumulate as
+  an ever-growing host commit charge.
 - Graphics and compute queues retain recursively referenced indirect command
   buffers and register lists, so an AGC arena can be recycled while a real
   `WAIT_REG_MEM` continuation remains blocked and later resumes in place.
@@ -112,6 +116,12 @@ attaches the live AGC command queues before entering guest code. Set
 `PS5_HEADLESS=1` to keep loader/CPU diagnostics windowless. A missing Vulkan
 loader, compatible presentation device, or host window is reported and the
 title continues through the previous headless path.
+
+`game-run` keeps command-line parsing in the process startup arena but gives
+the runtime and renderer `std.heap.smp_allocator`. Unlike an arena, this
+allocator returns superseded frame, staging, shader, and container allocations
+when their normal `free` paths run; long asset-loading sessions therefore do
+not retain every historical temporary buffer until process exit.
 
 The recommended Windows entry point is `zig-out\bin\ps5pcem.exe` (or
 `zig build launcher`). The launcher remembers the selected game directory,
@@ -791,10 +801,13 @@ Windows has permanent low-address mappings, notably `KUSER_SHARED_DATA`, inside
 the system-managed window. A single `VirtualAlloc` reservation would therefore
 fail even though almost the whole window is free. Initialization scans with
 `VirtualQuery` and reserves every free extent as a placeholder at its exact
-address. Placeholders are split into 16 KiB units before use, replaced by
-private pages or section views, and restored and coalesced on unmap. This keeps
-partial protection and unmap operations page-accurate. A requested mapping that
-lands in a host-owned hole fails explicitly. Linux uses
+address. Private and unaligned mappings retain 16 KiB placeholder/view
+boundaries. Fully aligned direct-memory mappings use 64 KiB Windows section
+views instead, matching the host allocation granularity and avoiding four
+separate view/commit operations per group of guest pages. Views are restored
+as placeholders and coalesced on unmap, while mapping metadata and protection
+remain accurate at 16 KiB guest-page boundaries. A requested mapping that lands
+in a host-owned hole fails explicitly. Linux uses
 `MAP_FIXED_NOREPLACE`; macOS uses a non-destructive fixed hint and rejects a
 result returned at any other address. No path uses a `MAP_FIXED` operation that
 could overwrite an unrelated host mapping.
@@ -1592,8 +1605,12 @@ ordinary frames, and produced six observed VideoOut flips in the current test
 window without the earlier host-side `memcpy` access violation. Vulkan still
 rejects those draws as `MissingColorTarget`, and several compute programs stop
 at unsupported or unresolved RDNA2 semantics, so the presented image is black.
-A separate startup risk remains: placement of the title's 512 GiB sparse virtual
-reservation can fail when the Windows process layout leaves no suitable hole.
+Its 3840×2160 display buffers now register with the expected pitch. A measured
+loading run held private memory near 2.14 GiB instead of retaining a geometric
+chain of arena-backed temporary buffers past 9 GiB; the remaining working-set
+growth tracks newly touched guest asset pages. A separate startup risk remains:
+placement of the title's 512 GiB sparse virtual reservation can fail when the
+Windows process layout leaves no suitable hole.
 
 ## Error codes
 

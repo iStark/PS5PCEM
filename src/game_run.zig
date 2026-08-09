@@ -96,7 +96,13 @@ pub fn main(init: std.process.Init) !void {
 
 fn run(init: std.process.Init) !bool {
     const io = init.io;
-    const allocator = init.arena.allocator();
+    const startup_arena = init.arena.allocator();
+    // The process init arena intentionally ignores individual frees. That is
+    // useful for short-lived CLI parsing but disastrous for a long-running
+    // renderer: temporary uploads, readbacks, tiled frames, and grown array
+    // capacities would all remain committed until process exit. Use the
+    // thread-safe freeing allocator for runtime-owned state instead.
+    const allocator = std.heap.smp_allocator;
 
     var stderr_buffer: [2048]u8 = undefined;
     var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
@@ -106,7 +112,7 @@ fn run(init: std.process.Init) !bool {
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
     const out = &stdout_writer.interface;
 
-    const args = try init.minimal.args.toSlice(allocator);
+    const args = try init.minimal.args.toSlice(startup_arena);
     const has_app0_override = args.len == 4 and std.mem.eql(u8, args[1], "--app0");
     if (args.len != 2 and !has_app0_override) {
         try stderr.writeAll(usage);

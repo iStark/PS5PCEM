@@ -576,6 +576,24 @@ fn videoOutRegisterBuffers2(
     const attributes = attribute orelse return video_out_error_invalid_option;
     if (count <= 0) return video_out_error_invalid_value;
     if (option != null) return video_out_error_invalid_option;
+    if (trace.announces("sceVideoOutRegisterBuffers2")) {
+        std.debug.print(
+            "[video out] register set={d} first={d} count={d} category={d} " ++
+                "format=0x{x} tile={d} size={d}x{d} pitch={d} option=0x{x}\n",
+            .{
+                set_index,
+                buffer_index_start,
+                count,
+                category,
+                attributes.pixel_format,
+                attributes.tiling_mode,
+                attributes.width,
+                attributes.height,
+                attributes.pitch_in_pixels,
+                attributes.option,
+            },
+        );
+    }
     video_out.registerBuffers(
         set_index,
         buffer_index_start,

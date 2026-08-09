@@ -81,6 +81,28 @@ fn windowsVirtualQuery(address: u64, info: *WindowsMemoryInfo) usize {
     return WindowsApi.VirtualQuery(@ptrFromInt(address), info, @sizeOf(WindowsMemoryInfo));
 }
 
+/// Returns the complete native allocation containing `address`. Protection can
+/// split one section view into several VirtualQuery regions, but every region
+/// retains the same allocation base.
+fn windowsAllocationRange(address: u64) Error!Range {
+    if (builtin.os.tag != .windows) unreachable;
+
+    var info: WindowsMemoryInfo = undefined;
+    if (windowsVirtualQuery(address, &info) == 0) return Error.HostDecommitFailed;
+    const allocation_start: u64 = @intFromPtr(info.allocation_base);
+    var cursor = allocation_start;
+    while (true) {
+        if (windowsVirtualQuery(cursor, &info) == 0) return Error.HostDecommitFailed;
+        if (@intFromPtr(info.allocation_base) != allocation_start) break;
+        const region_start: u64 = @intFromPtr(info.base_address);
+        const region_end = std.math.add(u64, region_start, info.region_size) catch
+            return Error.HostDecommitFailed;
+        if (region_end <= cursor) return Error.HostDecommitFailed;
+        cursor = region_end;
+    }
+    return .{ .start = allocation_start, .end = cursor };
+}
+
 const HostPermission = enum { read, write };
 
 fn windowsRangeAccessible(address: u64, size: u64, required: HostPermission) bool {
@@ -732,7 +754,8 @@ pub const AddressSpace = struct {
 
         const free_range = self.freeRangeLocked(address, size) orelse
             return Error.AddressUnavailable;
-        try hostPreparePagePlaceholders(free_range, address, size);
+        const host_view_size = hostMappingViewSize(kind, address, size, backing_offset);
+        try hostPrepareMappingPlaceholders(free_range, address, size, host_view_size);
         errdefer hostCoalescePlaceholder(free_range) catch {};
 
         if (kind == .direct_memory) {
@@ -812,7 +835,8 @@ pub const AddressSpace = struct {
         // The placeholder to re-split is the reservation's own extent, not the
         // surrounding free space.
         const placeholder = Range{ .start = reservation.address, .end = reservation.end() };
-        try hostSplitWithinPlaceholder(placeholder, address, size);
+        const host_view_size = hostMappingViewSize(kind, address, size, backing_offset);
+        try hostSplitWithinPlaceholder(placeholder, address, size, host_view_size);
         errdefer hostCoalescePlaceholder(placeholder) catch {};
 
         if (kind == .direct_memory) {
@@ -878,27 +902,59 @@ pub const AddressSpace = struct {
 
     fn hostUnmapLocked(self: *AddressSpace, address: u64, size: u64) Error!void {
         const end = address + size;
+        var direct_start: ?u64 = null;
+        var direct_end: u64 = 0;
         for (self.mappings.items) |mapping| {
             const part_start = @max(address, mapping.address);
             const part_end = @min(end, mapping.end());
             if (part_start >= part_end) continue;
 
             if (mapping.kind == .direct_memory) {
-                try hostUnmapBacking(part_start, part_end - part_start);
+                if (direct_start == null) {
+                    direct_start = part_start;
+                    direct_end = part_end;
+                } else if (part_start == direct_end) {
+                    direct_end = part_end;
+                } else {
+                    try hostUnmapBacking(direct_start.?, direct_end - direct_start.?);
+                    direct_start = part_start;
+                    direct_end = part_end;
+                }
             } else if (mapping.kind != .reserved) {
+                if (direct_start) |start| {
+                    try hostUnmapBacking(start, direct_end - start);
+                    direct_start = null;
+                }
                 try hostDecommit(part_start, part_end - part_start);
             }
         }
+        if (direct_start) |start| try hostUnmapBacking(start, direct_end - start);
     }
 
     fn discardMappingsLocked(self: *AddressSpace) void {
+        var direct_start: ?u64 = null;
+        var direct_end: u64 = 0;
         for (self.mappings.items) |mapping| {
             if (mapping.kind == .direct_memory) {
-                hostUnmapBacking(mapping.address, mapping.size) catch {};
+                if (direct_start == null) {
+                    direct_start = mapping.address;
+                    direct_end = mapping.end();
+                } else if (mapping.address == direct_end) {
+                    direct_end = mapping.end();
+                } else {
+                    hostUnmapBacking(direct_start.?, direct_end - direct_start.?) catch {};
+                    direct_start = mapping.address;
+                    direct_end = mapping.end();
+                }
             } else if (mapping.kind != .reserved) {
+                if (direct_start) |start| {
+                    hostUnmapBacking(start, direct_end - start) catch {};
+                    direct_start = null;
+                }
                 hostDecommit(mapping.address, mapping.size) catch {};
             }
         }
+        if (direct_start) |start| hostUnmapBacking(start, direct_end - start) catch {};
         self.mappings.clearRetainingCapacity();
         for (self.reservations.items) |reservation| {
             hostCoalescePlaceholder(reservation) catch {};
@@ -1404,10 +1460,36 @@ fn hostDecommit(address: u64, size: u64) Error!void {
     }
 }
 
-/// Splits one Windows placeholder into 16 KiB pieces for a mapping. Keeping the
-/// host allocation boundaries equal to guest pages makes partial unmaps and
-/// permission changes safe even for section views.
-fn hostPreparePagePlaceholders(free: Range, address: u64, size: u64) Error!void {
+/// Windows charges page-file section views at its 64 KiB allocation
+/// granularity. Use that granularity when the guest address, physical offset,
+/// and complete mapping permit it; otherwise retain one host view per 16 KiB
+/// guest page so unaligned direct-memory windows remain representable.
+fn hostMappingViewSize(
+    kind: MappingKind,
+    address: u64,
+    size: u64,
+    backing_offset: ?u64,
+) u64 {
+    if (builtin.os.tag == .windows and kind == .direct_memory) {
+        const offset = backing_offset orelse return page_size;
+        if (isAligned(address, windows_allocation_granularity) and
+            isAligned(size, windows_allocation_granularity) and
+            isAligned(offset, windows_allocation_granularity))
+        {
+            return windows_allocation_granularity;
+        }
+    }
+    return page_size;
+}
+
+/// Splits one Windows placeholder into pieces matching the views that will
+/// replace them.
+fn hostPrepareMappingPlaceholders(
+    free: Range,
+    address: u64,
+    size: u64,
+    view_size: u64,
+) Error!void {
     if (builtin.os.tag != .windows) return;
 
     try hostCoalescePlaceholder(free);
@@ -1415,9 +1497,9 @@ fn hostPreparePagePlaceholders(free: Range, address: u64, size: u64) Error!void 
 
     var cursor = address;
     const end = address + size;
-    while (cursor < end) : (cursor += page_size) {
-        if (cursor + page_size < free.end) {
-            try hostSplitPlaceholder(cursor, page_size);
+    while (cursor < end) : (cursor += view_size) {
+        if (cursor + view_size < free.end) {
+            try hostSplitPlaceholder(cursor, view_size);
         }
     }
 }
@@ -1432,15 +1514,19 @@ fn hostPreparePlaceholderRange(free: Range, address: u64, size: u64) Error!void 
     if (address + size < free.end) try hostSplitPlaceholder(address, size);
 }
 
-/// Carves per-page placeholders for `address`/`size` out of an existing one.
+/// Carves per-view placeholders for `address`/`size` out of an existing one.
 ///
-/// Two differences from `hostPreparePagePlaceholders`. It does not coalesce
+/// Two differences from `hostPrepareMappingPlaceholders`. It does not coalesce
 /// first: a guest reservation is already a single placeholder, and coalescing
 /// needs at least two adjacent ones to merge, so asking for it fails outright.
-/// And the pages have to be split individually, because a backing view is
-/// mapped a page at a time and replacing a placeholder requires the target to
-/// be a placeholder of exactly that size.
-fn hostSplitWithinPlaceholder(placeholder: Range, address: u64, size: u64) Error!void {
+/// And each view has to be split individually because replacing a placeholder
+/// requires the target to be a placeholder of exactly that size.
+fn hostSplitWithinPlaceholder(
+    placeholder: Range,
+    address: u64,
+    size: u64,
+    view_size: u64,
+) Error!void {
     if (builtin.os.tag != .windows) return;
 
     if (address > placeholder.start) {
@@ -1449,11 +1535,11 @@ fn hostSplitWithinPlaceholder(placeholder: Range, address: u64, size: u64) Error
 
     var cursor = address;
     const end = address + size;
-    while (cursor < end) : (cursor += page_size) {
-        // The final page needs no split when it already ends the placeholder;
+    while (cursor < end) : (cursor += view_size) {
+        // The final view needs no split when it already ends the placeholder;
         // splitting a placeholder at its own end is rejected.
-        if (cursor + page_size < placeholder.end) {
-            try hostSplitPlaceholder(cursor, page_size);
+        if (cursor + view_size < placeholder.end) {
+            try hostSplitPlaceholder(cursor, view_size);
         }
     }
 }
@@ -1505,12 +1591,18 @@ fn hostMapBacking(
             const windows = std.os.windows;
             const page = windows.PAGE.fromProtection(protection.host()) orelse
                 return Error.ProtectionDenied;
+            const view_size_bytes = hostMappingViewSize(
+                .direct_memory,
+                address,
+                size,
+                offset,
+            );
             var cursor = address;
-            while (cursor < address + size) : (cursor += page_size) {
+            while (cursor < address + size) : (cursor += view_size_bytes) {
                 const page_offset = offset + (cursor - address);
                 var base: ?*anyopaque = @ptrFromInt(cursor);
                 var section_offset: windows.LARGE_INTEGER = @intCast(page_offset);
-                var view_size: windows.SIZE_T = @intCast(page_size);
+                var view_size: windows.SIZE_T = @intCast(view_size_bytes);
                 const status = WindowsApi.NtMapViewOfSectionEx(
                     backing.handle,
                     windows.GetCurrentProcess(),
@@ -1528,7 +1620,7 @@ fn hostMapBacking(
                 }
 
                 var commit_base = base;
-                var commit_size: windows.SIZE_T = @intCast(page_size);
+                var commit_size: windows.SIZE_T = @intCast(view_size_bytes);
                 const commit_status = WindowsApi.NtAllocateVirtualMemoryEx(
                     windows.GetCurrentProcess(),
                     @ptrCast(&commit_base),
@@ -1575,14 +1667,19 @@ fn hostMapBacking(
 fn hostUnmapBacking(address: u64, size: u64) Error!void {
     switch (builtin.os.tag) {
         .windows => {
+            const end = address + size;
             var cursor = address;
-            while (cursor < address + size) : (cursor += page_size) {
+            while (cursor < end) {
+                const view = try windowsAllocationRange(cursor);
+                if (view.start != cursor or view.end > end) return Error.HostDecommitFailed;
+
                 const status = std.os.windows.ntdll.NtUnmapViewOfSectionEx(
                     std.os.windows.GetCurrentProcess(),
                     @ptrFromInt(cursor),
                     .{ .PRESERVE_PLACEHOLDER = true },
                 );
                 if (status != .SUCCESS) return Error.HostDecommitFailed;
+                cursor = view.end;
             }
         },
         .linux, .macos => {
@@ -1678,6 +1775,30 @@ test "direct-memory aliases share one sparse backing store" {
     try testing.expect(space.isMappedAs(first + page_size, page_size, .direct_memory));
     try space.read(second, &output);
     try testing.expectEqualStrings("coherent", &output);
+}
+
+test "aligned Windows direct memory shares one allocation-granularity view" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const view_size = windows_allocation_granularity;
+    var space = try AddressSpace.initWithDirectMemory(testing.allocator, view_size);
+    defer space.deinit();
+
+    const address = user.start;
+    try space.mapFixed(address, view_size, .read_write, .direct_memory, 0);
+
+    var first_info: WindowsMemoryInfo = undefined;
+    var last_info: WindowsMemoryInfo = undefined;
+    try testing.expect(windowsVirtualQuery(address, &first_info) != 0);
+    try testing.expect(windowsVirtualQuery(address + view_size - page_size, &last_info) != 0);
+    try testing.expectEqual(address, @intFromPtr(first_info.allocation_base));
+    try testing.expectEqual(address, @intFromPtr(last_info.allocation_base));
+
+    // Permission metadata may split VirtualQuery regions, but releasing the
+    // complete guest range still has to unmap its single section view once.
+    try space.protect(address + page_size, page_size, .read_only);
+    try space.unmap(address, view_size);
+    try testing.expect(!space.isMapped(address, view_size));
 }
 
 test "virtual reservations and mapping queries retain guest metadata" {
