@@ -64,6 +64,9 @@ var guest_stop_requested: std.atomic.Value(bool) = .init(false);
 
 var active_io: ?std.Io = null;
 var process_start_nanoseconds: i96 = 0;
+var process_clock_sequence: std.atomic.Value(u32) = .init(0);
+var excluded_host_nanoseconds: std.atomic.Value(u64) = .init(0);
+var active_host_exclusion_start: std.atomic.Value(u64) = .init(0);
 var process_param_address: std.atomic.Value(u64) = .init(0);
 var application_heap_api: std.atomic.Value(u64) = .init(0);
 var thread_dtors: std.atomic.Value(u64) = .init(0);
@@ -243,10 +246,16 @@ pub fn attachIo(io: ?std.Io) void {
     if (io) |value| {
         if (was_detached) {
             process_start_nanoseconds = std.Io.Clock.awake.now(value).nanoseconds;
+            process_clock_sequence.store(0, .release);
+            excluded_host_nanoseconds.store(0, .release);
+            active_host_exclusion_start.store(0, .release);
         }
         guest_stop_requested.store(false, .release);
     } else {
         process_start_nanoseconds = 0;
+        process_clock_sequence.store(0, .release);
+        excluded_host_nanoseconds.store(0, .release);
+        active_host_exclusion_start.store(0, .release);
         application_heap_api.store(0, .release);
         resetSyncAddresses();
         resetKernelObjects();
@@ -1417,6 +1426,69 @@ pub fn realTimeNanoseconds() i96 {
     return clockNanoseconds(0);
 }
 
+/// A synchronous host operation whose duration is not guest process time.
+///
+/// GPU submission is asynchronous on the console, but the current backend
+/// decodes, translates, executes, and reads back the work before returning from
+/// the submit call. Freezing the process clock over that host-only interval
+/// keeps engine watchdogs from charging emulation latency to the render thread.
+pub const HostTimeExclusion = struct {
+    active: bool = false,
+
+    pub fn end(self: *HostTimeExclusion) void {
+        if (!self.active) return;
+        self.active = false;
+        const now = nonnegativeNanoseconds(clockNanoseconds(1));
+
+        _ = process_clock_sequence.fetchAdd(1, .acq_rel);
+        const started = active_host_exclusion_start.swap(0, .acq_rel);
+        if (now > started) _ = excluded_host_nanoseconds.fetchAdd(now - started, .monotonic);
+        _ = process_clock_sequence.fetchAdd(1, .release);
+    }
+};
+
+pub fn beginHostTimeExclusion() HostTimeExclusion {
+    if (active_io == null) return .{};
+    const now = nonnegativeNanoseconds(clockNanoseconds(1));
+    if (now == 0 or active_host_exclusion_start.load(.acquire) != 0) return .{};
+
+    _ = process_clock_sequence.fetchAdd(1, .acq_rel);
+    active_host_exclusion_start.store(now, .release);
+    _ = process_clock_sequence.fetchAdd(1, .release);
+    return .{ .active = true };
+}
+
+fn nonnegativeNanoseconds(value: i96) u64 {
+    if (value <= 0) return 0;
+    return std.math.cast(u64, value) orelse std.math.maxInt(u64);
+}
+
+fn effectiveProcessNanoseconds(now: i96, started: i96, excluded: u64, active_start: u64) u64 {
+    const elapsed: u64 = nonnegativeNanoseconds(@max(@as(i96, 0), now - started));
+    var total_excluded = excluded;
+    const current = nonnegativeNanoseconds(now);
+    if (active_start != 0 and current > active_start) {
+        total_excluded +|= current - active_start;
+    }
+    return elapsed -| total_excluded;
+}
+
+fn processNanoseconds() u64 {
+    while (true) {
+        const before = process_clock_sequence.load(.acquire);
+        if (before & 1 != 0) {
+            std.atomic.spinLoopHint();
+            continue;
+        }
+        const excluded = excluded_host_nanoseconds.load(.monotonic);
+        const active_start = active_host_exclusion_start.load(.monotonic);
+        const now = clockNanoseconds(1);
+        if (before == process_clock_sequence.load(.acquire)) {
+            return effectiveProcessNanoseconds(now, process_start_nanoseconds, excluded, active_start);
+        }
+    }
+}
+
 fn writeTimespec(clock_id: i32, output: ?*Timespec, kernel_errors: bool) i32 {
     const value = output orelse return if (kernel_errors)
         KernelError.einval.raw()
@@ -1516,16 +1588,12 @@ fn kernelSleep(seconds: u32) callconv(abi.guest) i32 {
 /// Process time in microseconds since attach — used by VideoOut flip status
 /// so titles can pace off completed flips.
 pub fn processTimeMicroseconds() u64 {
-    const now = clockNanoseconds(1);
-    const elapsed = @max(@as(i96, 0), now - process_start_nanoseconds);
-    return @intCast(@divTrunc(elapsed, std.time.ns_per_us));
+    return processNanoseconds() / std.time.ns_per_us;
 }
 
 /// Nanosecond process-time counter (same units as sceKernelGetProcessTimeCounter).
 pub fn processTimeCounter() u64 {
-    const now = clockNanoseconds(1);
-    const elapsed = @max(@as(i96, 0), now - process_start_nanoseconds);
-    return @intCast(elapsed);
+    return processNanoseconds();
 }
 
 fn getProcessTime() callconv(abi.guest) u64 {
@@ -1829,6 +1897,21 @@ const ApplicationHeapTestBackend = struct {
         };
     }
 };
+
+test "host time exclusions freeze only the emulated process clock" {
+    try std.testing.expectEqual(
+        @as(u64, 125),
+        effectiveProcessNanoseconds(1150, 1000, 25, 0),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 75),
+        effectiveProcessNanoseconds(1150, 1000, 25, 1100),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        effectiveProcessNanoseconds(1050, 1000, 200, 0),
+    );
+}
 
 test "Unity scripting allocator uses the application heap memalign callback" {
     var thread_manager = threading.Manager{};

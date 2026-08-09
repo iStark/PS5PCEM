@@ -1690,7 +1690,17 @@ pub const Dispatcher = struct {
 
             if (deadline) |end| {
                 const now = std.Io.Clock.Timestamp.now(self.io, end.clock);
-                if (std.Io.Clock.Timestamp.compare(end, .lte, now)) return .timed_out;
+                if (std.Io.Clock.Timestamp.compare(end, .lte, now)) {
+                    // A zero-duration kernel wait is still a scheduling point
+                    // on the console. Returning entirely in userspace lets a
+                    // polling guest issue millions of traced firmware calls and
+                    // contend with the thread that is expected to signal it.
+                    // Yield once without extending the requested timeout.
+                    if (request.timeout_microseconds) |duration_us| {
+                        if (duration_us == 0) std.Thread.yield() catch {};
+                    }
+                    return .timed_out;
+                }
             }
             self.io.futexWaitTimeout(u32, &self.wake_epoch, epoch, timeout) catch
                 return error.WaitFailed;

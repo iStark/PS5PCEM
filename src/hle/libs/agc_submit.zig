@@ -638,6 +638,8 @@ pub fn submitDeviceStream(stream: []const u32) SubmitOutcome {
 pub fn pumpQueues() void {
     execution_lock.lock();
     defer execution_lock.unlock();
+    var host_time = kernel_runtime.beginHostTimeExclusion();
+    defer host_time.end();
     var force_rounds: u8 = 0;
     while (force_rounds < 8) : (force_rounds += 1) {
         var progressed = false;
@@ -660,6 +662,8 @@ pub fn pumpQueues() void {
 fn executeSubmitted(label: []const u8, stream: []const u32) SubmitOutcome {
     execution_lock.lock();
     defer execution_lock.unlock();
+    var host_time = kernel_runtime.beginHostTimeExclusion();
+    defer host_time.end();
 
     const kind: gpu.QueueKind = if (std.mem.eql(u8, label, "acb"))
         .compute

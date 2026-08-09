@@ -53,9 +53,9 @@ Vulkan.
   depth memory, including a dual 1024×1024 `RGBA32_FLOAT` clear, while its
   bounded buffer-to-volume uploads populate 3D images.
   Final compositor draws that omit color-buffer registers are now retained for
-  the following VideoOut flip, which supplies the scanout target. Output remains
-  black because unsupported compute shaders and a later guest fault currently
-  stop the measured run before that following flip.
+  the following VideoOut flip, which supplies the scanout target. That flip now
+  completes without the engine's RenderThread watchdog, but output remains black
+  because the deferred display draw still needs scalar-source lowering.
 
 ![Terminator 2D gameplay rendered by PS5PCEM](docs/images/live-gameplay.png)
 
@@ -75,7 +75,7 @@ the repository contains none of that content.
 | **Terminator 2D: No Fate** | Reaches gameplay with correct color reproduction and clean title-provided backgrounds, characters, HUD elements, and textures | Early publisher logos and the pause menu retain artifacts; synchronous upload/readback limits frame pacing, while depth/MRT and compression metadata remain incomplete |
 | **Pistol Whip** | Maps the native PS VR2 plugin and Burst module, then starts loading Unity asset archives | Headset, tracking, controller, and host OpenXR support are intentionally deferred |
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
-| **Tetris Effect: Connected** | Completes Unreal filesystem/config bootstrap, creates AGC workloads, executes compact typed UAV clears (including two 1024×1024 `RGBA32_FLOAT` targets) and 3D volume uploads, reaches VideoOut flips, and retains a targetless final draw for the next scanout buffer | Output is black: several compute shaders still need lowering and the latest run faults in guest code before the pending display draw reaches its following flip; the 512 GiB virtual reservation can also depend on host address-space placement |
+| **Tetris Effect: Connected** | Completes Unreal filesystem/config bootstrap, executes compact typed UAV clears (including two 1024×1024 `RGBA32_FLOAT` targets) and 3D volume uploads, and reaches a second measured VideoOut frame with 6 draws/63 dispatches | Output is black: the deferred compositor reaches its scanout buffer but is rejected by an unsupported scalar source; a compact image-copy compute kernel and other compute gaps also remain, while the 512 GiB reservation can depend on host address-space placement |
 
 ## Components
 
@@ -1227,6 +1227,11 @@ such as `__stack_chk_guard` and `__progname` are registered as storage addresses
 not function stubs. Runtime hooks provide per-thread errno/TLS, clocks, sleep,
 process parameters, process `argc`/`argv`, sized empty sanitizer callback
 tables, and rtld callbacks.
+Synchronous host GPU execution is excluded from the emulated process clock while
+an AGC submit is active. Console submission is asynchronous, so charging minutes
+of host translation/readback latency to the guest render thread incorrectly
+triggers engine watchdogs; clocks continue normally before and after that exact
+host-only interval.
 Owner-aware `__cxa_guard_acquire`, `release`, and `abort` handling prevents a
 recursive static initializer from deadlocking the guest while preserving the
 one-initializer contract. Operations whose backing subsystem is not implemented
@@ -1636,11 +1641,14 @@ while actual DCC/CMASK/FMASK compression remains rejected. Its observed
 `R16_UINT→R16_UINT` volumes with the shader's bounds, strides, base coordinates,
 and linear/tiled target layout. A measured startup frame consequently completes
 all four volume uploads (two 1×1×1 and two 16×16×16) without a rejected compute
-dispatch. The latest measured run accepts and defers the formerly rejected draw
-and completes the dual clear, but later compute programs still report
-`UndefinedRegister`, `InvalidStorageBinding`, and `UnsupportedOpcode`; guest
-execution then faults at `eboot.bin+0x16ef4ef` before another flip can validate
-the pending display draw.
+dispatch. Synchronous AGC backend time is now excluded from the guest process
+clock, preventing the false `GameThread timed out waiting for RenderThread`
+watchdog that previously ended this slow host run at `eboot.bin+0x16af4ef`.
+The latest measurement reaches the following VideoOut flip after 464.684 host
+seconds and reports 6 draws, 63 dispatches, and 41 submissions. The pending
+display draw is resolved against the scanout allocation but is then rejected by
+`UnsupportedScalarSource`; an observed 20-instruction `image_load`/`image_store`
+copy kernel and other compute programs also remain unsupported.
 Its 3840×2160 display buffers now register with the expected pitch. A measured
 loading run held private memory near 2.2–2.3 GiB instead of retaining a geometric
 chain of arena-backed temporary buffers past 9 GiB; the remaining working-set
@@ -1667,8 +1675,9 @@ from leaking into host code where nothing would check it.
 2. Replace the exact UAV fast paths with general storage-image lowering, then
    implement more color/texture formats, mip views, depth/stencil, MRT, and
    compressed-surface metadata.
-3. Lower the compute register/storage/opcode gaps that stop the current loading
-   run before its pending scanout draw reaches the following VideoOut flip.
+3. Lower the deferred compositor's scalar source and the compact image-copy
+   kernel now exposed at the following VideoOut flip, then close the remaining
+   compute register/storage/opcode gaps.
 4. Reduce repeated compute readbacks and large texture uploads without changing
    guest-visible synchronization.
 5. Keep the guest process in a stable long-running flip/submit loop and close
