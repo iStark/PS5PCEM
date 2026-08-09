@@ -28,6 +28,7 @@ var message_status: std.atomic.Value(i32) = .init(status_none);
 var message_mode: std.atomic.Value(i32) = .init(0);
 var browser_status: std.atomic.Value(i32) = .init(status_none);
 var ime_dialog_status: std.atomic.Value(i32) = .init(status_none);
+var signin_dialog_status: std.atomic.Value(i32) = .init(status_none);
 var keyboard_open: std.atomic.Value(u8) = .init(0);
 
 pub fn reset() void {
@@ -35,6 +36,7 @@ pub fn reset() void {
     message_mode.store(0, .release);
     browser_status.store(status_none, .release);
     ime_dialog_status.store(status_none, .release);
+    signin_dialog_status.store(status_none, .release);
     keyboard_open.store(0, .release);
 }
 
@@ -153,6 +155,39 @@ const browser_dialog_exports = [_]symbols.Export{
     .{ .name = "sceWebBrowserDialogTerminate", .function = trace.wrap("sceWebBrowserDialogTerminate", &browserTerminate), .expect_id = "ocHtyBwHfys" },
 };
 
+// Sign-in dialog -----------------------------------------------------------
+
+fn signinDialogInitialize() callconv(abi.guest) i32 {
+    signin_dialog_status.store(status_initialized, .release);
+    return errno.ok;
+}
+
+fn signinDialogOpen(_: ?*const anyopaque) callconv(abi.guest) i32 {
+    if (signin_dialog_status.load(.acquire) == status_none) {
+        signin_dialog_status.store(status_initialized, .release);
+    }
+    // The emulator already exposes its local user, so there is no shell UI to
+    // wait for. Completing the dialog lets the title continue offline.
+    signin_dialog_status.store(status_finished, .release);
+    return errno.ok;
+}
+
+fn signinDialogUpdateStatus() callconv(abi.guest) i32 {
+    return signin_dialog_status.load(.acquire);
+}
+
+fn signinDialogTerminate() callconv(abi.guest) i32 {
+    signin_dialog_status.store(status_none, .release);
+    return errno.ok;
+}
+
+const signin_dialog_exports = [_]symbols.Export{
+    .{ .name = "sceSigninDialogUpdateStatus", .function = trace.wrap("sceSigninDialogUpdateStatus", &signinDialogUpdateStatus), .expect_id = "Bw31liTFT3A" },
+    .{ .name = "sceSigninDialogInitialize", .function = trace.wrap("sceSigninDialogInitialize", &signinDialogInitialize), .expect_id = "mlYGfmqE3fQ" },
+    .{ .name = "sceSigninDialogOpen", .function = trace.wrap("sceSigninDialogOpen", &signinDialogOpen), .expect_id = "JlpJVoRWv7U" },
+    .{ .name = "sceSigninDialogTerminate", .function = trace.wrap("sceSigninDialogTerminate", &signinDialogTerminate), .expect_id = "LXlmS6PvJdU" },
+};
+
 // IME dialog and optional physical keyboard --------------------------------
 
 fn imeDialogInit(parameter: ?*const anyopaque) callconv(abi.guest) i32 {
@@ -226,6 +261,7 @@ pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!voi
     try db.addLibrary(gpa, .{ .name = "libSceCommonDialog" }, .{ .name = "libSceCommonDialog" }, &common_dialog_exports);
     try db.addLibrary(gpa, .{ .name = "libSceMsgDialog.native" }, .{ .name = "libSceMsgDialog" }, &message_dialog_exports);
     try db.addLibrary(gpa, .{ .name = "libSceWebBrowserDialog" }, .{ .name = "libSceWebBrowserDialog" }, &browser_dialog_exports);
+    try db.addLibrary(gpa, .{ .name = "libSceSigninDialog" }, .{ .name = "libSceSigninDialog" }, &signin_dialog_exports);
     try db.addLibrary(gpa, .{ .name = "libSceImeDialog" }, .{ .name = "libSceImeDialog" }, &ime_dialog_exports);
     try db.addLibrary(gpa, .{ .name = "libSceIme" }, .{ .name = "libSceIme" }, &ime_exports);
 }

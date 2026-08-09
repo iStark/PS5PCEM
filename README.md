@@ -25,6 +25,9 @@ Vulkan.
   fragment interpolation.
 - Persistent render targets and bounded buffer, texture, and pipeline caches
   keep frame resources alive across draws and reduce redundant queue submits.
+- Graphics and compute queues retain recursively referenced indirect command
+  buffers and register lists, so an AGC arena can be recycled while a real
+  `WAIT_REG_MEM` continuation remains blocked and later resumes in place.
 - Title plugins can be mapped explicitly before execution; later
   `sceKernelLoadStartModule` calls receive stable handles and
   `sceKernelDlsym` resolves readable export names inside the selected PRX.
@@ -35,10 +38,15 @@ Vulkan.
 - PS VR2 libraries currently expose only compatibility/no-device behavior.
   VR plugins can initialize far enough to load Unity assets, but headset
   rendering, tracking, controllers, and a host OpenXR bridge do not exist yet.
-- An Unreal Engine PS5 bootstrap can mount a multi-gigabyte PAK, initialize ICU,
-  load cooked configuration and shader archives, create AGC shaders, and submit
-  its first graphics command buffer. Synchronization-only AGC constructors are
-  still placeholders, so this path does not produce a VR frame yet.
+- Offline bootstrap coverage now includes a fully-installed PlayGo profile,
+  normalized `/app0` paths, large sparse virtual reservations, POSIX semaphores
+  and local listener sockets, sign-in dialog state, and split AJM batch jobs.
+- Unreal Engine titles can mount multi-gigabyte PAKs, initialize ICU, load
+  cooked configuration and shader archives, and emit real AGC acquire, release,
+  wait, event, DMA, indirect-register, draw and flip packets. Tetris Effect:
+  Connected reaches repeated graphics/compute submissions and VideoOut flips;
+  its current output remains black because color-target state and several
+  compute shader operations are not reconstructed yet.
 
 ![Terminator 2D gameplay rendered by PS5PCEM](docs/images/live-gameplay.png)
 
@@ -57,7 +65,8 @@ the repository contains none of that content.
 |---|---|---|
 | **Terminator 2D: No Fate** | Reaches gameplay with correct color reproduction and clean title-provided backgrounds, characters, HUD elements, and textures | Early publisher logos and the pause menu retain artifacts; synchronous upload/readback limits frame pacing, while depth/MRT and compression metadata remain incomplete |
 | **Pistol Whip** | Maps the native PS VR2 plugin and Burst module, then starts loading Unity asset archives | Headset, tracking, controller, and host OpenXR support are intentionally deferred |
-| **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | The initial synchronization DCB contains placeholder fence/event commands, so startup waits before VideoOut or VR presentation |
+| **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
+| **Tetris Effect: Connected** | Completes Unreal filesystem/config bootstrap, creates AGC workloads, and reaches a repeated graphics/compute submit loop with six observed VideoOut flips | Output is black: the draw path has no usable color target, several compute shaders use unsupported operations, and the 512 GiB virtual reservation can still depend on host address-space placement |
 
 ## Components
 
@@ -65,14 +74,14 @@ Eleven modules cover the independent subsystems and their end-to-end composition
 
 | Module | What it does |
 |---|---|
-| **`memory`** | Reserves and manages the fixed, identity-mapped guest address space |
+| **`memory`** | Reserves and manages fixed guest ranges, sparse mappings, host permissions, and identity-mapped access checks |
 | **`rdna2`** | Decodes and disassembles RDNA2 shader machine code |
-| **`gpu`** | Decodes and executes the stateful part of submitted GPU command streams |
+| **`gpu`** | Decodes, snapshots, schedules, and executes the stateful part of submitted GPU command streams |
 | **`vulkan`** | Owns the host Vulkan device, queues, command submission and renderer boundary |
 | **`window`** | Owns the native host window and its platform message loop |
 | **`input`** | Polls XInput and the host keyboard, then applies launcher remapping profiles |
 | **`loader`** | Reads, maps, and relocates bare ELF64 and decrypted PS5 SELF module images |
-| **`hle`** | High-level emulation of the guest firmware: symbol resolution and firmware libraries |
+| **`hle`** | High-level emulation of guest firmware, files, memory, synchronization, media, network, and platform services |
 | **`cpu`** | Dispatches guest execution and provides the Windows x86-64 native machine bridge |
 | **`diag`** | Attributes guest addresses to modules and explains contained faults |
 | **`runtime`** | Composes memory, loader, HLE, and the optional CPU execution path |
@@ -432,12 +441,16 @@ are rejected. A blocked child returns a fixed root-to-leaf continuation, so
 resuming it does not replay draws, events or memory writes before the wait.
 
 [`gpu.scheduler`](src/gpu/scheduler.zig) owns separate graphics and compute FIFO
-queues. It copies each root DCB when it is submitted, retains the complete
-continuation of a blocked queue head, and keeps later work on that queue behind
-it. Work on the other queue can still run: once a real `RELEASE_MEM` writes the
-awaited label, the scheduler rechecks guest memory and resumes the exact nested
-stream position before draining the rest of the FIFO. It never fabricates a
-fence value to break a wait.
+queues. It copies each root DCB and recursively snapshots reachable ordinary or
+conditional indirect buffers plus native and legacy indirect register lists.
+The snapshot remains readable at the original guest addresses while all other
+backend operations stay live. A blocked queue head therefore retains both its
+exact continuation and the payload it will consume after resuming, even if AGC
+recycles the caller's arena. Later work stays behind it; work on the other queue
+can still run. Once a real `RELEASE_MEM` writes the awaited label, the scheduler
+rechecks guest memory and resumes the exact nested stream position before
+draining the rest of the FIFO. It never fabricates a fence value to break a
+wait.
 
 [`gpu.resources`](src/gpu/resources.zig) turns that lossless register state into
 typed GFX10 resources at the draw/dispatch boundary. It decodes 128-bit buffer
@@ -613,9 +626,10 @@ packet resolves `COMPUTE_PGM`, reads
 `COMPUTE_NUM_THREAD_X/Y/Z`, incrementally decodes guest code, translates the
 supported shader to SPIR-V 1.5, creates or reuses its compute pipeline, binds the
 active storage set and dispatches the packet's XYZ group counts. Errors remain
-explicit: a missing program, unsupported shader semantic or indirect dispatch
-rejects that backend callback and records the exact error. Draw callbacks count
-work by default. When both vertex and pixel program registers are present,
+visible in diagnostics, but missing compute state and selected resource or
+translation gaps skip only that dispatch instead of stopping the complete
+command queue. Draw callbacks count work by default. When both vertex and pixel
+program registers are present,
 `DRAW_INDEX_AUTO` decodes both guest programs, resolves AGC vertex resources,
 lowers matching PARAM/VINTRP stage interfaces, creates or reuses a pipeline
 keyed by SPIR-V and decoded graphics state, and records a Vulkan draw into the
@@ -1104,6 +1118,15 @@ the original guest protection bits, and support both containing and next-range
 lookups. Protection changes and names are applied to exact subranges, splitting
 mapping metadata where required.
 
+Large reservations use the system-managed window when their requested size
+cannot fit below the ordinary user range; a usable hint is retained and an
+aligned fallback is searched when necessary. Range validation now distinguishes
+metadata-only reservations from committed readable or writable pages before an
+HLE implementation dereferences a pointer. Windows CRT allocations passed by
+guest libraries are accepted only after `VirtualQuery` confirms that the full
+host range is committed with the required permission, preventing a reserved
+placeholder from reaching a host `memcpy`.
+
 | Export | State |
 |---|---|
 | `sceKernelAllocateDirectMemory` | Implemented |
@@ -1175,7 +1198,8 @@ parallel HLE libc. Its 120 lower-level imports resolve through a focused
 libkernel bridge plus `libSceLibcInternalExt` and `libSceSysmodule`. Data imports
 such as `__stack_chk_guard` and `__progname` are registered as storage addresses,
 not function stubs. Runtime hooks provide per-thread errno/TLS, clocks, sleep,
-process parameters, sized empty sanitizer callback tables, and rtld callbacks.
+process parameters, process `argc`/`argv`, sized empty sanitizer callback
+tables, and rtld callbacks.
 Owner-aware `__cxa_guard_acquire`, `release`, and `abort` handling prevents a
 recursive static initializer from deadlocking the guest while preserving the
 one-initializer contract. Operations whose backing subsystem is not implemented
@@ -1189,11 +1213,13 @@ mount point rather than returning `ENOSYS` with an untouched buffer — Unity's
 temporary-file layer builds paths from that string, so leaving it uninitialised
 looks like an unrelated null dereference later. This is still bootstrap
 coverage, not a claim that filesystems, networking, event flags, or semaphores
-are complete. POSIX `inet_ntop` formats IPv4/IPv6 addresses locally, while
-`sendmsg`/`recvmsg` report the offline network state and `ftruncate` preserves
-the read-only filesystem policy. The fixed semaphore store now has room for
-1,024 entries because Unity Baselib can create more than 64 before its first
-frame.
+are complete. POSIX `sem_init`/wait/post/destroy use the fixed kernel semaphore
+store, `inet_ntop` formats IPv4/IPv6 addresses locally, and a bounded virtual
+listener socket covers bind/listen/accept/name, options, select and send without
+exposing the host network. Peer traffic still reports the offline state, and
+`ftruncate` preserves the read-only filesystem policy. The semaphore store has
+room for 1,024 entries because Unity Baselib can create more than 64 before its
+first frame.
 
 **Title bootstrap services** ([src/hle/libs/system_service.zig](src/hle/libs/system_service.zig),
 [src/hle/libs/user_service.zig](src/hle/libs/user_service.zig),
@@ -1228,21 +1254,29 @@ in [src/hle/apr.zig](src/hle/apr.zig) and the guest ABI wrappers remain in
 [src/hle/libs/kernel_runtime.zig](src/hle/libs/kernel_runtime.zig) and
 [src/hle/libs/bootstrap_services.zig](src/hle/libs/bootstrap_services.zig).
 
+PlayGo presents the already dumped `/app0` tree as one fully installed base
+chunk. Initialize/open/close state, locus, ETA, progress, prefetch and install
+speed use checked guest buffers and reject invalid handles or chunk IDs. This
+lets an offline Unreal title mount complete local content without pretending a
+download service or remote entitlement exists.
+
 **Offline network, dialogs, and headless audio**
 ([src/hle/libs/network.zig](src/hle/libs/network.zig),
 [src/hle/libs/dialogs.zig](src/hle/libs/dialogs.zig),
 [src/hle/libs/audio.zig](src/hle/libs/audio.zig))
 
 Net, SSL, HTTP/HTTP2, and NP Web API preserve their normal context and request
-lifecycles without opening host sockets. Local URI parsing remains available,
-while DNS and peer traffic return deterministic offline errors. NetCtl reports
-a disconnected interface. Common, message, web-browser, and IME dialogs finish
-immediately with coherent headless results instead of blocking on unavailable
-UI.
+lifecycles without opening host sockets. Local URI parsing, byte-order helpers,
+the virtual listener described above, and current RTC/network ticks remain
+available, while DNS and peer traffic return deterministic offline errors.
+NetCtl reports a disconnected interface. Common, message, web-browser, IME,
+and sign-in dialogs finish immediately with coherent headless results instead
+of blocking on unavailable UI.
 
-AudioOut, AudioIn, and AudioOut2 expose paced ports and queues. AJM accepts the
-title's batch lifecycle and emits zeroed PCM so audio setup cannot deadlock the
-process. It is a compatibility decoder, not ATRAC9/MP3 decoding. The additional
+AudioOut, AudioIn, and AudioOut2 expose paced ports, queues, and speaker
+metadata. AJM accepts contiguous and split decode jobs plus resample/statistics
+queries and emits zeroed PCM so audio setup cannot deadlock the process. It is
+a compatibility decoder, not ATRAC9/MP3 decoding. The additional
 early-bootstrap
 surface in [src/hle/libs/bootstrap_services.zig](src/hle/libs/bootstrap_services.zig)
 provides AvPlayer state and conservative platform/GPU command stubs for native
@@ -1397,8 +1431,9 @@ that the buffer stays a walkable sequence of commands afterwards.
 Unimplemented constructors write a correctly formed no-operation of the size
 the real command would have taken, which is not the same as filling the space
 with zeroes. Zeroes decode as a register write of one word and desynchronise the
-rest of the stream. `Dispatch`, `DrawIndex`, and `SetNumInstances` write their
-real PM4 packets. `SetCx/Sh/UcRegistersIndirect` now emits the native Gen5
+rest of the stream. `Dispatch`, indexed and auto-indexed draws, instance state,
+release/wait/event/acquire, DMA, and `SetFlip` now write real typed PM4 packets.
+`SetCx/Sh/UcRegistersIndirect` emits the native Gen5
 `0x9f`/`0x63`/`0x64` packets, and `SetShRegisterRangeDirect` emits an exact-size
 `SET_SH_REG` packet with a matching size query, including the title's 16-word
 user-data ranges. Fixed-slot commands keep a valid no-operation in their unused
@@ -1406,13 +1441,14 @@ tail. Shader constructors validate their AGC headers, relocate internal
 pointers and program addresses, and apply the recovered program-register pairs.
 Everything remains walkable through [`gpu.pm4`](src/gpu/pm4.zig).
 
-Patch entry points are accepted and change nothing: they edit a field of a
-command already written, usually an address unknown when it was built, and
-editing a no-operation is harmless. Frame capture, submission validation and
-shader debugging report themselves off, which is the retail answer and the one
-that stops a title waiting for a capture nobody will take. Resource
-registration is refused, because it hands back names and addresses a title
-keeps and later follows.
+Patch entry points for implemented wait, release, DMA and indirect-register
+commands validate the existing opcode and update its address or register count
+in place; data-packet payload lookup returns the real writable body. Remaining
+placeholder packets still accept harmless patches. Frame capture, submission
+validation and shader debugging report themselves off, which is the retail
+answer and the one that stops a title waiting for a capture nobody will take.
+Resource registration is refused, because it hands back names and addresses a
+title keeps and later follows.
 
 **GPU submission** ([src/hle/libs/agc_submit.zig](src/hle/libs/agc_submit.zig))
 
@@ -1431,10 +1467,11 @@ The same submission enters persistent graphics/compute queues through
 [`gpu.DcbExecutor`](src/gpu/executor.zig). Register state therefore survives
 between buffers; label writes reach checked guest memory; acquire, release,
 wait, event and flip packets become typed state. A blocked head retains its own
-root DCB copy and complete root/indirect resume path while later submissions on
-that queue remain FIFO-ordered. The other queue continues, and a real release
-label makes the scheduler recheck and resume the blocked stream without
-replaying earlier side effects or forcing memory to a satisfying value.
+root DCB plus recursive snapshots of referenced command/register data and the
+complete root/indirect resume path while later submissions on that queue remain
+FIFO-ordered. The other queue continues, and a real release label makes the
+scheduler recheck and resume the blocked stream without replaying earlier side
+effects or forcing memory to a satisfying value.
 
 The title's shipped driver uses three consecutive `/dev/gc` operations for this
 path. Command `#49` has an exact 72-byte preamble layout and reports completion
@@ -1545,10 +1582,18 @@ window, initializes the real system libc in inferred guest-import dependency
 order, maps memory in batches, enumerates content, mounts its 8.8 GiB PAK through
 APR/AMPR, and passes ICU initialization. It loads cooked configuration and the
 Global shader archive, creates AGC shader objects, and submits its initial DCB.
-That DCB currently contains synchronization commands whose HLE constructors are
-still fixed-size no-operations; without their release/event payloads no fence is
-published, so the title waits before its first VideoOut or VR frame. This is the
-next graphics boundary, not an I/O or memory-exhaustion failure.
+The acquire/release/wait/event/DMA constructors that were no-operations at that
+milestone now emit executable packets, so this title needs a fresh compatibility
+run before its next boundary can be stated. Host VR presentation remains absent.
+
+Tetris Effect: Connected exercises the same expanded Unreal path without a VR
+plugin. It reaches a repeated graphics/compute loop, records three draws on
+ordinary frames, and produced six observed VideoOut flips in the current test
+window without the earlier host-side `memcpy` access violation. Vulkan still
+rejects those draws as `MissingColorTarget`, and several compute programs stop
+at unsupported or unresolved RDNA2 semantics, so the presented image is black.
+A separate startup risk remains: placement of the title's 512 GiB sparse virtual
+reservation can fail when the Windows process layout leaves no suitable hole.
 
 ## Error codes
 
@@ -1792,6 +1837,17 @@ generates a thunk per entry point at compile time, with the same signature, that
 records the call and forwards it. Only the most recent calls are kept, in a
 fixed ring: a title makes millions, and the last few dozen are what explain a
 failure.
+
+`PS5_TRACE=1` streams every call, while a comma-separated value limits output
+to matching entry-point name fragments. `PS5_TRACE_FAILURES=1` is the practical
+long-run mode: it suppresses successful calls and prints only completed signed
+status failures. Trace thunks support firmware functions with up to twelve ABI
+arguments.
+
+```powershell
+$env:PS5_TRACE = "sceAgcDcbSetFlip,sceKernelDlsym"
+# or: $env:PS5_TRACE_FAILURES = "1"
+```
 
 ```
   last 32 firmware calls (of 11412)

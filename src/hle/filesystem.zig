@@ -223,6 +223,63 @@ pub fn stripMount(path: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Resolves a guest path relative to its mount without ever letting `..`
+/// escape the title root.
+///
+/// Unreal Engine builds its base directory as `<app>/Binaries/<platform>` and
+/// consequently opens cooked content through paths such as
+/// `../../../TetrisEffect/Content/Paks`. On the console those leading parents
+/// are clamped at `/app0`; passing them directly to the host directory instead
+/// walks above the title and makes the engine enumerate the wrong directory.
+fn normalizedMountRelative(path: []const u8, storage: *[maximum_path]u8) ?[]const u8 {
+    const raw = stripMount(path) orelse return null;
+    if (raw.len > maximum_path) return null;
+
+    // One start per possible non-empty segment. With a 256-byte path there can
+    // be no more than 128 one-byte segments separated by slashes, but keeping a
+    // full-path-sized stack makes the bound self-evident and cheap.
+    var starts: [maximum_path]usize = undefined;
+    var depth: usize = 0;
+    var written: usize = 0;
+    var cursor: usize = 0;
+    while (cursor < raw.len) {
+        while (cursor < raw.len and (raw[cursor] == '/' or raw[cursor] == '\\')) cursor += 1;
+        const begin = cursor;
+        while (cursor < raw.len and raw[cursor] != '/' and raw[cursor] != '\\') cursor += 1;
+        const segment = raw[begin..cursor];
+        if (segment.len == 0 or std.mem.eql(u8, segment, ".")) continue;
+        if (std.mem.eql(u8, segment, "..")) {
+            if (depth != 0) {
+                depth -= 1;
+                written = starts[depth];
+            }
+            continue;
+        }
+
+        // A drive-qualified segment would make a Windows host API discard the
+        // mount root. Guest filenames cannot contain a colon, so reject it.
+        if (std.mem.indexOfScalar(u8, segment, ':') != null) return null;
+        const old_written = written;
+        const needed = segment.len + @as(usize, if (written == 0) 0 else 1);
+        if (written + needed > storage.len) return null;
+        if (written != 0) {
+            storage[written] = '/';
+            written += 1;
+        }
+        @memcpy(storage[written .. written + segment.len], segment);
+        written += segment.len;
+        starts[depth] = old_written;
+        depth += 1;
+    }
+
+    // std.Io.Dir names its own root as "." rather than an empty path.
+    if (written == 0) {
+        storage[0] = '.';
+        written = 1;
+    }
+    return storage[0..written];
+}
+
 const OpenFile = struct {
     /// Null for a device node, which has no host file behind it.
     file: ?std.Io.File = null,
@@ -232,6 +289,9 @@ const OpenFile = struct {
     /// The first two directory entries are synthesized as `.` and `..`.
     directory_index: u64 = 0,
     device: ?Device = null,
+    /// An offline POSIX socket. It owns only a descriptor slot; network
+    /// operations decide whether to acknowledge local state or report ENETDOWN.
+    virtual_socket: bool = false,
     /// In-memory payload for synthesised files (FSB-backed virtual WAVs).
     /// Owned by this descriptor; freed on close via page_allocator.
     memory: ?[]u8 = null,
@@ -268,6 +328,7 @@ var active_io: ?std.Io = null;
 var root: ?std.Io.Dir = null;
 var open_files: [maximum_open_files]?OpenFile = @splat(null);
 var table_lock: Lock = .{};
+var virtual_socket_signal: std.atomic.Value(u8) = .init(0);
 
 /// Makes a host directory visible to the title as `/app0`.
 pub fn attach(io: std.Io, directory: std.Io.Dir) void {
@@ -275,6 +336,7 @@ pub fn attach(io: std.Io, directory: std.Io.Dir) void {
     defer table_lock.unlock();
     active_io = io;
     root = directory;
+    virtual_socket_signal.store(0, .release);
 }
 
 /// Closes everything still open and detaches the mount.
@@ -294,6 +356,7 @@ pub fn detach() void {
     }
     active_io = null;
     root = null;
+    virtual_socket_signal.store(0, .release);
     audio_fs.reset();
 }
 
@@ -360,8 +423,8 @@ pub fn open(path: []const u8, flags: i32) Error!i32 {
     if (flags & O.accmode != O.rdonly) return Error.ReadOnly;
     if (flags & (O.creat | O.trunc | O.excl | O.append) != 0) return Error.ReadOnly;
 
-    const relative = stripMount(path) orelse return Error.NotFound;
-    if (relative.len > maximum_path) return Error.InvalidArgument;
+    var relative_storage: [maximum_path]u8 = undefined;
+    const relative = normalizedMountRelative(path, &relative_storage) orelse return Error.NotFound;
 
     if (flags & O.directory != 0) return openDirectory(path, relative, io, directory);
 
@@ -463,6 +526,38 @@ fn openDevice(device: Device, path: []const u8) Error!i32 {
     return Error.TooManyOpenFiles;
 }
 
+/// Allocates a descriptor for a POSIX socket without opening host networking.
+pub fn openVirtualSocket() Error!i32 {
+    table_lock.lock();
+    defer table_lock.unlock();
+    for (&open_files, 0..) |*slot, index| {
+        if (slot.* != null) continue;
+        slot.* = OpenFile{ .virtual_socket = true };
+        return first_descriptor + @as(i32, @intCast(index));
+    }
+    return Error.TooManyOpenFiles;
+}
+
+pub fn isVirtualSocket(descriptor: i32) bool {
+    table_lock.lock();
+    defer table_lock.unlock();
+    const slot = slotOf(descriptor) orelse return false;
+    return if (slot.*) |entry| entry.virtual_socket else false;
+}
+
+/// A local wake byte has no remote peer and may be discarded after it has
+/// served its purpose. Returning the byte count keeps event-loop bookkeeping
+/// coherent while all actual network traffic remains offline.
+pub fn writeVirtualSocket(descriptor: i32, length: usize) Error!usize {
+    if (!isVirtualSocket(descriptor)) return Error.BadDescriptor;
+    if (length != 0) virtual_socket_signal.store(1, .release);
+    return length;
+}
+
+pub fn virtualSocketReadable() bool {
+    return virtual_socket_signal.load(.acquire) != 0;
+}
+
 /// The device a descriptor names, if it names one.
 ///
 /// Control requests arrive with nothing but a descriptor number, so this is how
@@ -508,9 +603,16 @@ pub fn read(descriptor: i32, buffer: []u8) Error!usize {
     }
     const offset = slot.*.?.offset;
     const device = slot.*.?.device;
+    const virtual_socket = slot.*.?.virtual_socket;
     if (slot.*.?.directory != null) {
         table_lock.unlock();
         return Error.NotSupported;
+    }
+    if (virtual_socket) {
+        table_lock.unlock();
+        if (buffer.len == 0 or virtual_socket_signal.swap(0, .acq_rel) == 0) return 0;
+        buffer[0] = 0;
+        return 1;
     }
     if (slot.*.?.memory) |memory| {
         table_lock.unlock();
@@ -634,7 +736,8 @@ pub fn stat(path: []const u8, out: *Stat) Error!void {
     const io = active_io orelse return Error.NotAttached;
     const directory = root orelse return Error.NotAttached;
 
-    const relative = stripMount(path) orelse return Error.NotFound;
+    var relative_storage: [maximum_path]u8 = undefined;
+    const relative = normalizedMountRelative(path, &relative_storage) orelse return Error.NotFound;
 
     const info = directory.statFile(io, relative, .{}) catch |err| switch (err) {
         error.FileNotFound, error.NotDir, error.BadPathName => {
@@ -740,6 +843,20 @@ test "mount prefixes are stripped and foreign paths refused" {
     try testing.expect(stripMount("/") == null);
     try testing.expect(stripMount("/app0/") == null);
     try testing.expect(stripMount("") == null);
+}
+
+test "mount-relative parent segments clamp at the title root" {
+    var storage: [maximum_path]u8 = undefined;
+    try testing.expectEqualStrings(
+        "TetrisEffect/Content/Paks",
+        normalizedMountRelative("../../../TetrisEffect/Content/Paks", &storage).?,
+    );
+    try testing.expectEqualStrings(
+        "Media/file.bin",
+        normalizedMountRelative("/app0/Media/tmp/../file.bin", &storage).?,
+    );
+    try testing.expectEqualStrings(".", normalizedMountRelative("/app0/..", &storage).?);
+    try testing.expect(normalizedMountRelative("C:/Windows/system.ini", &storage) == null);
 }
 
 test "unattached filesystem reports so rather than failing obscurely" {

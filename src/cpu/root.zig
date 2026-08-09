@@ -216,6 +216,13 @@ pub var null_memory_store_recoveries: std.atomic.Value(u64) = .init(0);
 pub var null_call_recoveries: std.atomic.Value(u64) = .init(0);
 /// How many times a null base register was redirected to the synthetic stub object.
 pub var null_base_redirect_recoveries: std.atomic.Value(u64) = .init(0);
+/// First native access violation declined by the guest exception bridge.
+///
+/// Host faults normally disappear into Windows with only process exit code
+/// 0xc0000005.  Keep this diagnostic one-shot: it preserves the original
+/// exception while leaving enough information to distinguish emulator code,
+/// a graphics driver, and an invalid guest address crossing the HLE boundary.
+var declined_host_access_violations: std.atomic.Value(u64) = .init(0);
 
 /// Synthetic object used when soft-recovering 8-byte loads from the first page.
 /// Pointer fields self-reference; call targets land on a RET sled so accidental
@@ -714,6 +721,15 @@ const WindowsX64Machine = struct {
         // already established that this thread is inside a guest call.
         const from_guest = isGuestAddress(context.Rip) or isNullControlTransfer(context.Rip);
         if (record.ExceptionFlags & exception_noncontinuable != 0 or !from_guest) {
+            if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+                record.NumberParameters >= 2 and
+                declined_host_access_violations.fetchAdd(1, .monotonic) == 0)
+            {
+                std.debug.print(
+                    "[cpu] unhandled host access violation rip=0x{x} target=0x{x} operation={d}\n",
+                    .{ context.Rip, record.ExceptionInformation[1], record.ExceptionInformation[0] },
+                );
+            }
             return std.os.windows.EXCEPTION_CONTINUE_SEARCH;
         }
 

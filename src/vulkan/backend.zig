@@ -4783,8 +4783,12 @@ pub const Renderer = struct {
         }
         if (gpu.resources.ShaderStage.compute.programAddress(state) == null) {
             self.last_dispatch_error = Error.MissingComputeProgram;
-            std.debug.print("[vulkan dcb] dispatch rejected: {s}\n", .{@errorName(Error.MissingComputeProgram)});
-            return false;
+            // A reset/default-state packet may be followed by a dispatch that
+            // has no executable program in the subset of state we retain.
+            // Do not discard later graphics work and the frame's flip merely
+            // because this one compute operation cannot be reproduced yet.
+            std.debug.print("[vulkan dcb] dispatch skipped: {s}\n", .{@errorName(Error.MissingComputeProgram)});
+            return true;
         }
         const local_size = [3]u32{
             computeLocalSize(state, 0x207),
@@ -4804,6 +4808,8 @@ pub const Renderer = struct {
                 err == Error.GuestBufferTooLarge or
                 std.mem.eql(u8, @errorName(err), "AddressOverflow") or
                 std.mem.eql(u8, @errorName(err), "UnsupportedOpcode") or
+                std.mem.eql(u8, @errorName(err), "UndefinedRegister") or
+                std.mem.eql(u8, @errorName(err), "InvalidStorageBinding") or
                 std.mem.eql(u8, @errorName(err), "InvalidMetadata") or
                 std.mem.eql(u8, @errorName(err), "UserDataOutOfRange");
             std.debug.print(

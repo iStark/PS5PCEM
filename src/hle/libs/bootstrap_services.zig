@@ -21,12 +21,13 @@ const agc = @import("agc.zig");
 const agc_shader_registry = @import("agc_shader_registry.zig");
 const gpu = @import("gpu");
 const apr = @import("../apr.zig");
+const filesystem = @import("../filesystem.zig");
 const video_out = @import("../video_out.zig");
 
 const invalid_argument = errno.KernelError.einval.raw();
-const ampr_command_buffer_header_size: u64 = 0x18;
+const ampr_command_buffer_header_size: u64 = 0x28;
 const ampr_command_buffer_maximum_size: u64 = 64 * 1024 * 1024;
-const ampr_gather_scatter_valid: u32 = 0x0001_0000;
+const ampr_read_file_record_size: u32 = 0x30;
 
 fn success() callconv(abi.guest) i32 {
     return errno.ok;
@@ -49,21 +50,19 @@ fn amprCommandBufferConstructor(address: u64) callconv(abi.guest) i32 {
     apr.constructCommandBuffer(address) catch |err| return aprError(err);
     const header: *[ampr_command_buffer_header_size]u8 = @ptrFromInt(address);
     @memset(header, 0);
+    writeGuestU64(address + 0x00, address);
     return errno.ok;
 }
 
 fn amprAprCommandBufferConstructor(address: u64, reserved_state_0: u64, reserved_state_1: u64) callconv(abi.guest) i32 {
     if (address == 0) return errno.ok;
-    apr.constructCommandBuffer(address) catch |err| return aprError(err);
-    const state_0 = if (reserved_state_0 == 0) address + 0x18 else reserved_state_0;
-    const state_1 = if (reserved_state_1 == 0) address + 0x20 else reserved_state_1;
-    if (!kernel_memory.isGuestRangeAccessible(state_0, @sizeOf(u64)) or
-        !kernel_memory.isGuestRangeAccessible(state_1, @sizeOf(u64)))
-    {
+    if (!kernel_memory.isGuestRangeAccessible(address, ampr_command_buffer_header_size)) {
         return errno.KernelError.efault.raw();
     }
-    writeGuestU64(state_0, 0);
-    writeGuestU64(state_1, 0);
+    apr.constructCommandBuffer(address) catch |err| return aprError(err);
+    writeGuestU64(address + 0x00, address);
+    writeGuestU64(address + 0x18, reserved_state_0);
+    writeGuestU64(address + 0x20, reserved_state_1);
     return errno.ok;
 }
 
@@ -76,15 +75,14 @@ fn amprCommandBufferSetBuffer(address: u64, storage_address: u64, storage_size: 
     {
         return errno.KernelError.einval.raw();
     }
-    if (readGuestU64(address + 0x10) != 0) return errno.KernelError.ebusy.raw();
+    if (readGuestU64(address + 0x08) != 0) return errno.KernelError.ebusy.raw();
     if (!kernel_memory.isGuestRangeAccessible(storage_address, storage_size)) {
         return errno.KernelError.efault.raw();
     }
     apr.setCommandBufferStorage(address, storage_address, storage_size) catch |err| return aprError(err);
-    writeGuestU32(address + 0x04, 0);
-    writeGuestU32(address + 0x08, 0);
-    writeGuestU32(address + 0x0c, @intCast(storage_size));
-    writeGuestU64(address + 0x10, storage_address);
+    writeGuestU64(address + 0x00, address);
+    writeGuestU64(address + 0x08, storage_address);
+    writeGuestU64(address + 0x10, storage_size);
     return errno.ok;
 }
 
@@ -92,29 +90,30 @@ fn amprCommandBufferReset(address: u64) callconv(abi.guest) i32 {
     if (!kernel_memory.isGuestRangeAccessible(address, ampr_command_buffer_header_size)) {
         return errno.KernelError.efault.raw();
     }
-    if (readGuestU64(address + 0x10) == 0 or readGuestU32(address + 0x0c) == 0) {
+    if (readGuestU64(address + 0x08) == 0 or readGuestU64(address + 0x10) == 0) {
         return errno.KernelError.eperm.raw();
     }
     apr.resetCommandBuffer(address) catch |err| return aprError(err);
-    writeGuestU32(address + 0x04, 0);
-    writeGuestU32(address + 0x08, 0);
+    writeGuestU64(address + 0x00, address);
     return errno.ok;
 }
 
 fn amprCommandBufferClearBuffer(address: u64) callconv(abi.guest) u64 {
     if (!kernel_memory.isGuestRangeAccessible(address, ampr_command_buffer_header_size)) return 0;
-    const storage_address = readGuestU64(address + 0x10);
+    const storage_address = readGuestU64(address + 0x08);
     apr.destroyCommandBuffer(address) catch {};
-    const header: *[ampr_command_buffer_header_size]u8 = @ptrFromInt(address);
-    @memset(header, 0);
+    writeGuestU64(address + 0x00, address);
+    writeGuestU64(address + 0x08, 0);
+    writeGuestU64(address + 0x10, 0);
     return storage_address;
 }
 
 fn amprCommandBufferDestructor(address: u64) callconv(abi.guest) void {
     if (!kernel_memory.isGuestRangeAccessible(address, ampr_command_buffer_header_size)) return;
     apr.destroyCommandBuffer(address) catch {};
-    const header: *[ampr_command_buffer_header_size]u8 = @ptrFromInt(address);
-    @memset(header, 0);
+    writeGuestU64(address + 0x00, address);
+    writeGuestU64(address + 0x08, 0);
+    writeGuestU64(address + 0x10, 0);
 }
 
 fn amprAprCommandBufferDestructor(address: u64) callconv(abi.guest) void {
@@ -124,28 +123,28 @@ fn amprAprCommandBufferDestructor(address: u64) callconv(abi.guest) void {
 }
 
 fn amprCommandBufferGetType(address: u64) callconv(abi.guest) u64 {
-    if (!kernel_memory.isGuestRangeAccessible(address, 4)) return 0;
-    return readGuestU32(address);
+    _ = address;
+    return 0;
 }
 
 fn amprCommandBufferGetSize(address: u64) callconv(abi.guest) u64 {
-    if (!kernel_memory.isGuestRangeAccessible(address + 0x0c, 4)) return 0;
-    return readGuestU32(address + 0x0c);
-}
-
-fn amprCommandBufferGetBufferBaseAddress(address: u64) callconv(abi.guest) u64 {
     if (!kernel_memory.isGuestRangeAccessible(address + 0x10, 8)) return 0;
     return readGuestU64(address + 0x10);
 }
 
+fn amprCommandBufferGetBufferBaseAddress(address: u64) callconv(abi.guest) u64 {
+    if (!kernel_memory.isGuestRangeAccessible(address + 0x08, 8)) return 0;
+    return readGuestU64(address + 0x08);
+}
+
 fn amprCommandBufferGetNumCommands(address: u64) callconv(abi.guest) u64 {
-    if (!kernel_memory.isGuestRangeAccessible(address + 0x08, 4)) return 0;
-    return readGuestU32(address + 0x08);
+    const info = apr.commandBufferInfo(address) catch return 0;
+    return info.command_count;
 }
 
 fn amprCommandBufferGetCurrentOffset(address: u64) callconv(abi.guest) u64 {
-    if (!kernel_memory.isGuestRangeAccessible(address + 0x04, 4)) return 0;
-    return readGuestU32(address + 0x04);
+    const info = apr.commandBufferInfo(address) catch return 0;
+    return info.write_offset;
 }
 
 fn amprAprCommandBufferReadFile(
@@ -164,17 +163,16 @@ fn amprAprCommandBufferReadFile(
     if (!kernel_memory.isGuestRangeAccessible(address, ampr_command_buffer_header_size)) {
         return errno.KernelError.efault.raw();
     }
-    const record_size: u32 = if ((file_offset >> 32) != 0) 0x18 else 0x14;
-    const storage_address = readGuestU64(address + 0x10);
-    const storage_size = readGuestU32(address + 0x0c);
-    const write_offset = readGuestU32(address + 0x04);
-    if (storage_address == 0 or write_offset > storage_size or record_size > storage_size - write_offset) {
+    const info = apr.commandBufferInfo(address) catch |err| return aprError(err);
+    if (info.storage_address == 0 or info.write_offset > info.storage_size or
+        ampr_read_file_record_size > info.storage_size - info.write_offset)
+    {
         return errno.KernelError.efault.raw();
     }
-    const record_address = std.math.add(u64, storage_address, write_offset) catch {
+    const record_address = std.math.add(u64, info.storage_address, info.write_offset) catch {
         return errno.KernelError.efault.raw();
     };
-    if (!kernel_memory.isGuestRangeAccessible(record_address, record_size)) {
+    if (!kernel_memory.isGuestRangeAccessible(record_address, ampr_read_file_record_size)) {
         return errno.KernelError.efault.raw();
     }
     apr.appendRead(address, .{
@@ -184,11 +182,13 @@ fn amprAprCommandBufferReadFile(
         .file_offset = file_offset,
     }) catch |err| return aprError(err);
     const record: [*]u8 = @ptrFromInt(record_address);
-    @memset(record[0..record_size], 0);
-    record[0] = 0x17;
-    writeGuestU32(address + 0x00, readGuestU32(address + 0x00) | ampr_gather_scatter_valid);
-    writeGuestU32(address + 0x04, write_offset + record_size);
-    writeGuestU32(address + 0x08, readGuestU32(address + 0x08) +% 1);
+    @memset(record[0..ampr_read_file_record_size], 0);
+    writeGuestU32(record_address + 0x00, 1);
+    writeGuestU32(record_address + 0x04, file_identifier);
+    writeGuestU64(record_address + 0x08, destination);
+    writeGuestU64(record_address + 0x10, size);
+    writeGuestU64(record_address + 0x18, file_offset);
+    writeGuestU64(record_address + 0x20, size);
     return errno.ok;
 }
 
@@ -204,7 +204,7 @@ fn amprMeasureCommandSizeReadFile(
     {
         return @bitCast(@as(i64, errno.KernelError.einval.raw()));
     }
-    return if ((file_offset >> 32) != 0) 0x18 else 0x14;
+    return ampr_read_file_record_size;
 }
 
 fn amprMeasureCommandSizeWriteKernelEventQueue(
@@ -230,13 +230,13 @@ fn amprCommandBufferWriteKernelEventQueue(
         return errno.KernelError.efault.raw();
     }
     const record_size: u32 = 0x30;
-    const storage_address = readGuestU64(address + 0x10);
-    const storage_size = readGuestU32(address + 0x0c);
-    const write_offset = readGuestU32(address + 0x04);
-    if (storage_address == 0 or write_offset > storage_size or record_size > storage_size - write_offset) {
+    const info = apr.commandBufferInfo(address) catch |err| return aprError(err);
+    if (info.storage_address == 0 or info.write_offset > info.storage_size or
+        record_size > info.storage_size - info.write_offset)
+    {
         return errno.KernelError.efault.raw();
     }
-    const record_address = std.math.add(u64, storage_address, write_offset) catch
+    const record_address = std.math.add(u64, info.storage_address, info.write_offset) catch
         return errno.KernelError.efault.raw();
     if (!kernel_memory.isGuestRangeAccessible(record_address, record_size)) {
         return errno.KernelError.efault.raw();
@@ -254,9 +254,8 @@ fn amprCommandBufferWriteKernelEventQueue(
     @as(*i16, @ptrFromInt(record_address + 0x04)).* = kernel_event_queue.ampr_filter;
     writeGuestU64(record_address + 0x08, @bitCast(queue_handle));
     writeGuestU64(record_address + 0x10, ident);
-    writeGuestU64(record_address + 0x18, completion_token);
-    writeGuestU32(address + 0x04, write_offset + record_size);
-    writeGuestU32(address + 0x08, readGuestU32(address + 0x08) +% 1);
+    writeGuestU64(record_address + 0x18, 0);
+    writeGuestU64(record_address + 0x20, completion_token);
     return errno.ok;
 }
 
@@ -282,13 +281,45 @@ fn writeGuestU64(address: u64, value: u64) void {
 
 // Offline POSIX sockets ----------------------------------------------------
 
-fn posixSocket(_: i32, _: i32, _: i32) callconv(abi.guest) i32 {
+fn posixSocket(family: i32, socket_type: i32, _: i32) callconv(abi.guest) i32 {
+    if (family != 2 or socket_type & 0xf == 0) {
+        kernel_runtime.setPosixErrno(errno.Posix.einval);
+        return -1;
+    }
+    return filesystem.openVirtualSocket() catch {
+        kernel_runtime.setPosixErrno(errno.Posix.emfile);
+        return -1;
+    };
+}
+
+fn posixSocketConnect(descriptor: i32, address: ?[*]const u8, length: u32) callconv(abi.guest) i32 {
+    if (!filesystem.isVirtualSocket(descriptor)) {
+        kernel_runtime.setPosixErrno(errno.Posix.ebadf);
+        return -1;
+    }
+    const peer = address orelse {
+        kernel_runtime.setPosixErrno(errno.Posix.efault);
+        return -1;
+    };
+    if (length >= 8 and peer[1] == 2 and peer[4] == 127 and peer[5] == 0 and peer[6] == 0 and peer[7] == 1) {
+        return errno.ok;
+    }
     kernel_runtime.setPosixErrno(50); // FreeBSD/Orbis ENETDOWN
     return -1;
 }
 
-fn posixSocketOperation(_: i32, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
-    kernel_runtime.setPosixErrno(50); // FreeBSD/Orbis ENETDOWN
+fn posixSocketNeedsPeer(descriptor: i32, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    if (!filesystem.isVirtualSocket(descriptor)) {
+        kernel_runtime.setPosixErrno(errno.Posix.ebadf);
+        return -1;
+    }
+    kernel_runtime.setPosixErrno(50);
+    return -1;
+}
+
+fn posixSocketLocalState(descriptor: i32, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    if (filesystem.isVirtualSocket(descriptor)) return errno.ok;
+    kernel_runtime.setPosixErrno(errno.Posix.ebadf);
     return -1;
 }
 
@@ -350,17 +381,29 @@ fn posixInetNtop(
     return destination;
 }
 
-fn posixSelect(_: i32, _: u64, _: u64, _: u64, timeout: ?*const anyopaque) callconv(abi.guest) i32 {
+fn posixSelect(nfds: i32, read_set: u64, write_set: u64, error_set: u64, timeout: ?*const anyopaque) callconv(abi.guest) i32 {
     _ = timeout;
-    return 0;
+    const bytes: usize = if (nfds <= 0) 0 else @min(@as(usize, @intCast(nfds + 7)) / 8, 128);
+    if (!filesystem.virtualSocketReadable()) {
+        _ = kernel_threading.sceKernelUsleep(1_000);
+    }
+    const readable = filesystem.virtualSocketReadable();
+    const first_to_clear: usize = if (readable) 1 else 0;
+    for (([_]u64{ read_set, write_set, error_set })[first_to_clear..]) |address| {
+        if (address != 0 and bytes != 0 and kernel_memory.isGuestRangeAccessible(address, bytes)) {
+            const output: [*]u8 = @ptrFromInt(address);
+            @memset(output[0..bytes], 0);
+        }
+    }
+    return if (readable) 1 else 0;
 }
 
 const posix_exports = [_]symbols.Export{
     .{ .name = "socket", .function = trace.wrap("socket", &posixSocket), .expect_id = "TU-d9PfIHPM" },
-    .{ .name = "connect", .function = trace.wrap("connect", &posixSocketOperation), .expect_id = "XVL8So3QJUk" },
-    .{ .name = "shutdown", .function = trace.wrap("shutdown", &posixSocketOperation), .expect_id = "TUuiYS2kE8s" },
-    .{ .name = "setsockopt", .function = trace.wrap("setsockopt", &posixSocketOperation), .expect_id = "fFxGkxF2bVo" },
-    .{ .name = "recv", .function = trace.wrap("recv", &posixSocketOperation), .expect_id = "Ez8xjo9UF4E" },
+    .{ .name = "connect", .function = trace.wrap("connect", &posixSocketConnect), .expect_id = "XVL8So3QJUk" },
+    .{ .name = "shutdown", .function = trace.wrap("shutdown", &posixSocketLocalState), .expect_id = "TUuiYS2kE8s" },
+    .{ .name = "setsockopt", .function = trace.wrap("setsockopt", &posixSocketLocalState), .expect_id = "fFxGkxF2bVo" },
+    .{ .name = "recv", .function = trace.wrap("recv", &posixSocketNeedsPeer), .expect_id = "Ez8xjo9UF4E" },
     .{ .name = "sendmsg", .function = trace.wrap("sendmsg", &posixMessageOperation), .expect_id = "aNeavPDNKzA" },
     .{ .name = "recvmsg", .function = trace.wrap("recvmsg", &posixMessageOperation), .expect_id = "hI7oVeOluPM" },
     .{ .name = "inet_ntop", .function = trace.wrap("inet_ntop", &posixInetNtop), .expect_id = "5jRCs2axtr4" },
@@ -991,9 +1034,290 @@ fn writeAgcPacket(buffer: ?*AgcCommandBuffer, opcode: u8, body: []const u32) ?[*
     return cursor;
 }
 
+fn writeAgcCustomPacket(buffer: ?*AgcCommandBuffer, code: u6, body: []const u32) ?[*]u32 {
+    const cursor = reserveAgcCommand(buffer) orelse return null;
+    cursor[0] = pm4Header(gpu.pm4.nop, body.len) | (@as(u32, code) << 2);
+    @memcpy(cursor[1 .. 1 + body.len], body);
+
+    const used = 1 + body.len;
+    const remaining = 16 - used;
+    if (remaining != 0) {
+        std.debug.assert(remaining >= 2);
+        cursor[used] = pm4Header(gpu.pm4.nop, remaining - 1);
+        @memset(cursor[used + 1 .. 16], 0);
+    }
+    return cursor;
+}
+
 fn agcCommand(buffer: ?*AgcCommandBuffer, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) ?[*]u32 {
     const body = [_]u32{0} ** 15;
     return writeAgcPacket(buffer, gpu.pm4.nop, &body);
+}
+
+fn agcReleaseMem(
+    buffer: ?*AgcCommandBuffer,
+    action: u64,
+    gcr_control: u64,
+    destination: u64,
+    cache_policy: u64,
+    destination_address: u64,
+    data_selection: u64,
+    data: u64,
+    gds_offset: u64,
+    gds_size: u64,
+    interrupt: u64,
+    interrupt_context_id: u64,
+) callconv(abi.guest) ?[*]u32 {
+    if (destination > 1 or data_selection > 5 or gds_offset != 0 or gds_size > 2 or interrupt > 3) {
+        return null;
+    }
+    const body = [_]u32{
+        @as(u32, @truncate(action)) |
+            ((@as(u32, @truncate(gcr_control)) & 0x0fff) << 12) |
+            ((@as(u32, @truncate(cache_policy)) & 0x3) << 25),
+        ((@as(u32, @truncate(destination)) & 0x3) << 16) |
+            ((@as(u32, @truncate(interrupt)) & 0x7) << 24) |
+            ((@as(u32, @truncate(data_selection)) & 0x7) << 29),
+        @truncate(destination_address),
+        @truncate(destination_address >> 32),
+        @truncate(data),
+        @truncate(data >> 32),
+        @as(u32, @truncate(interrupt_context_id)) & 0x07ff_ffff,
+    };
+    return writeAgcCustomPacket(buffer, gpu.pm4.custom.release_mem, &body);
+}
+
+fn agcWaitRegMem(
+    buffer: ?*AgcCommandBuffer,
+    size: u64,
+    compare_function: u64,
+    operation: u64,
+    cache_policy: u64,
+    address: u64,
+    reference: u64,
+    mask: u64,
+    poll_cycles: u64,
+) callconv(abi.guest) ?[*]u32 {
+    if (size > 1 or compare_function > 7 or operation > 4 or cache_policy > 3) return null;
+
+    if (size == 0) {
+        const body = [_]u32{
+            @as(u32, @truncate(address)) & 0xffff_fffc,
+            @as(u32, @truncate(address >> 32)) & 0x0003_ffff,
+            @truncate(mask),
+            @truncate(reference),
+            0x10 |
+                (@as(u32, @truncate(compare_function)) & 0x7) |
+                ((@as(u32, @truncate(operation)) & 0x3) << 8) |
+                ((@as(u32, @truncate(operation)) & 0xc) << 4) |
+                ((@as(u32, @truncate(cache_policy)) & 0x3) << 25),
+            @intCast(@min(poll_cycles >> 4, 0xffff)),
+        };
+        return writeAgcCustomPacket(buffer, gpu.pm4.custom.wait_mem_32, &body);
+    }
+
+    const body = [_]u32{
+        @as(u32, @truncate(address)) & 0xffff_fff8,
+        @as(u32, @truncate(address >> 32)) & 0x0003_ffff,
+        @truncate(mask),
+        @truncate(mask >> 32),
+        @truncate(reference),
+        @truncate(reference >> 32),
+        0x10 |
+            (@as(u32, @truncate(compare_function)) & 0x7) |
+            ((@as(u32, @truncate(operation)) & 0x1) << 8) |
+            ((@as(u32, @truncate(operation)) & 0x6) << 5) |
+            ((@as(u32, @truncate(cache_policy)) & 0x3) << 25),
+        @intCast(@min(poll_cycles >> 4, 0xffff)),
+    };
+    return writeAgcCustomPacket(buffer, gpu.pm4.custom.wait_mem_64, &body);
+}
+
+fn agcWaitRegMemPatchAddress(command_address: u64, address: u64) callconv(abi.guest) i32 {
+    if (!kernel_memory.isGuestRangeAccessible(command_address, 12)) {
+        return errno.KernelError.efault.raw();
+    }
+    const header = readGuestU32(command_address);
+    if (((header >> 30) & 0x3) != 3 or @as(u8, @truncate(header >> 8)) != gpu.pm4.nop) {
+        return errno.KernelError.einval.raw();
+    }
+    const code: u6 = @truncate(header >> 2);
+    const alignment_mask: u32 = switch (code) {
+        gpu.pm4.custom.wait_mem_32 => 0xffff_fffc,
+        gpu.pm4.custom.wait_mem_64 => 0xffff_fff8,
+        else => return errno.KernelError.einval.raw(),
+    };
+    writeGuestU32(command_address + 4, @as(u32, @truncate(address)) & alignment_mask);
+    writeGuestU32(command_address + 8, @as(u32, @truncate(address >> 32)) & 0x0003_ffff);
+    return errno.ok;
+}
+
+fn agcEventWrite(
+    buffer: ?*AgcCommandBuffer,
+    event_type_raw: u64,
+    address: u64,
+) callconv(abi.guest) ?[*]u32 {
+    if (event_type_raw > 0x3f) return null;
+    const event_type: u32 = @truncate(event_type_raw);
+    if ((event_type & 0x3e) == 0x38) {
+        const body = [_]u32{
+            0x100 | event_type,
+            @as(u32, @truncate(address)) & 0xffff_fff8,
+            @truncate(address >> 32),
+        };
+        return writeAgcPacket(buffer, gpu.pm4.event_write, &body);
+    }
+
+    const body = [_]u32{if (event_type == 7 or event_type == 15 or event_type == 16)
+        0x400 | event_type
+    else
+        event_type};
+    return writeAgcPacket(buffer, gpu.pm4.event_write, &body);
+}
+
+fn agcAcquireMem(
+    buffer: ?*AgcCommandBuffer,
+    engine: u64,
+    cb_db_control: u64,
+    gcr_control: u64,
+    base_address: u64,
+    size_bytes: u64,
+    poll_cycles: u64,
+) callconv(abi.guest) ?[*]u32 {
+    const no_size = size_bytes == std.math.maxInt(u64);
+    const body = [_]u32{
+        ((@as(u32, @truncate(engine)) & 1) << 31) | @as(u32, @truncate(cb_db_control)),
+        if (no_size) 0 else @as(u32, @truncate(size_bytes >> 8)),
+        0,
+        @truncate(base_address >> 8),
+        0,
+        @intCast(@min(poll_cycles / 40, std.math.maxInt(u32))),
+        @truncate(gcr_control),
+    };
+    return writeAgcCustomPacket(buffer, gpu.pm4.custom.acquire_mem, &body);
+}
+
+fn agcDmaData(
+    buffer: ?*AgcCommandBuffer,
+    engine: u64,
+    destination: u64,
+    destination_cache_policy: u64,
+    destination_address_or_offset: u64,
+    source: u64,
+    source_cache_policy: u64,
+    source_address_or_offset_or_immediate: u64,
+    byte_count: u64,
+    wait_for_previous: u64,
+    write_confirm: u64,
+    block_engine: u64,
+) callconv(abi.guest) ?[*]u32 {
+    var source_address = source_address_or_offset_or_immediate;
+    source_address = switch (source) {
+        0x14 => if (engine == 1) 0x30148 else 0x30174,
+        0x24 => if (engine == 1) 0x30150 else 0x3017c,
+        0x64 => if (engine == 1) 0x30158 else 0x30184,
+        else => source_address,
+    };
+
+    const source_u32: u32 = @truncate(source);
+    const destination_u32: u32 = @truncate(destination);
+    const body = [_]u32{
+        (@as(u32, @truncate(engine)) & 1) |
+            ((@as(u32, @truncate(source_cache_policy)) & 3) << 13) |
+            ((destination_u32 & 3) << 20) |
+            ((@as(u32, @truncate(destination_cache_policy)) & 3) << 25) |
+            ((source_u32 & 3) << 29) |
+            ((@as(u32, @truncate(block_engine)) & 1) << 31),
+        @truncate(source_address),
+        @truncate(source_address >> 32),
+        @truncate(destination_address_or_offset),
+        @truncate(destination_address_or_offset >> 32),
+        (@as(u32, @truncate(byte_count)) & 0x03ff_ffff) |
+            ((source_u32 & 4) << 24) |
+            ((destination_u32 & 4) << 25) |
+            ((source_u32 & 8) << 25) |
+            ((destination_u32 & 8) << 26) |
+            ((@as(u32, @truncate(wait_for_previous)) & 1) << 30) |
+            ((@as(u32, @truncate(write_confirm)) & 1) << 31),
+    };
+    return writeAgcPacket(buffer, gpu.pm4.dma_data, &body);
+}
+
+fn agcDmaDataPatchDestination(command_address: u64, address: u64) callconv(abi.guest) i32 {
+    if (!kernel_memory.isGuestRangeAccessible(command_address, 24)) {
+        return errno.KernelError.efault.raw();
+    }
+    const header = readGuestU32(command_address);
+    if (((header >> 30) & 3) != 3 or @as(u8, @truncate(header >> 8)) != gpu.pm4.dma_data) {
+        return errno.KernelError.einval.raw();
+    }
+    writeGuestU32(command_address + 16, @truncate(address));
+    writeGuestU32(command_address + 20, @truncate(address >> 32));
+    return errno.ok;
+}
+
+fn agcDmaDataPatchSource(command_address: u64, address: u64) callconv(abi.guest) i32 {
+    if (!kernel_memory.isGuestRangeAccessible(command_address, 16)) {
+        return errno.KernelError.efault.raw();
+    }
+    const header = readGuestU32(command_address);
+    if (((header >> 30) & 3) != 3 or @as(u8, @truncate(header >> 8)) != gpu.pm4.dma_data) {
+        return errno.KernelError.einval.raw();
+    }
+    writeGuestU32(command_address + 8, @truncate(address));
+    writeGuestU32(command_address + 12, @truncate(address >> 32));
+    return errno.ok;
+}
+
+fn agcGetDataPacketPayloadAddress(
+    out_address: ?*u64,
+    command_address: u64,
+    payload_type: i32,
+) callconv(abi.guest) i32 {
+    const output = out_address orelse return errno.KernelError.einval.raw();
+    if (command_address == 0 or
+        !kernel_memory.isGuestRangeAccessible(@intFromPtr(output), @sizeOf(u64)) or
+        !kernel_memory.isGuestRangeAccessible(command_address, @sizeOf(u32)))
+    {
+        return errno.KernelError.efault.raw();
+    }
+
+    if (payload_type != 0) {
+        output.* = command_address + 2 * @sizeOf(u32);
+        return errno.ok;
+    }
+
+    const header = readGuestU32(command_address);
+    // The maximal type-3 count represents a packet with no separately
+    // addressable payload. Every ordinary packet exposes its first body word.
+    output.* = if (header & 0x3fff_0000 == 0x3fff_0000)
+        0
+    else
+        command_address + @sizeOf(u32);
+    return errno.ok;
+}
+
+fn agcReleaseMemPatchAddress(command_address: u64, address: u64) callconv(abi.guest) i32 {
+    if (!kernel_memory.isGuestRangeAccessible(command_address, 20)) {
+        return errno.KernelError.efault.raw();
+    }
+    const header = readGuestU32(command_address);
+    const opcode: u8 = @truncate(header >> 8);
+    if (((header >> 30) & 3) != 3) return errno.KernelError.einval.raw();
+
+    if (opcode == gpu.pm4.nop and
+        @as(u6, @truncate(header >> 2)) == gpu.pm4.custom.release_mem)
+    {
+        writeGuestU32(command_address + 12, @truncate(address));
+        writeGuestU32(command_address + 16, @truncate(address >> 32));
+        return errno.ok;
+    }
+    if (opcode == gpu.pm4.release_mem) {
+        writeGuestU32(command_address + 12, @truncate(address));
+        writeGuestU32(command_address + 16, @truncate(address >> 32));
+        return errno.ok;
+    }
+    return errno.KernelError.einval.raw();
 }
 
 fn agcDispatch(
@@ -1006,6 +1330,24 @@ fn agcDispatch(
 ) callconv(abi.guest) ?[*]u32 {
     const body = [_]u32{ group_x, group_y, group_z, (modifier & 0xa038) | 0x41 };
     return writeAgcPacket(buffer, gpu.pm4.dispatch_direct, &body);
+}
+
+fn agcSetFlip(
+    buffer: ?*AgcCommandBuffer,
+    video_out_handle: u32,
+    display_buffer_index: i32,
+    flip_mode: u32,
+    flip_argument: i64,
+) callconv(abi.guest) ?[*]u32 {
+    const raw_argument: u64 = @bitCast(flip_argument);
+    const body = [_]u32{
+        video_out_handle,
+        @bitCast(display_buffer_index),
+        flip_mode,
+        @truncate(raw_argument),
+        @truncate(raw_argument >> 32),
+    };
+    return writeAgcCustomPacket(buffer, gpu.pm4.custom.flip, &body);
 }
 
 fn agcDrawIndex(
@@ -1029,6 +1371,26 @@ fn agcDrawIndex(
         initiator,
     };
     return writeAgcPacket(buffer, gpu.pm4.draw_index_2, &body);
+}
+
+fn agcDrawIndexAuto(
+    buffer: ?*AgcCommandBuffer,
+    index_count: u32,
+    modifier: u64,
+) callconv(abi.guest) ?[*]u32 {
+    const cursor = reserveAgcDwords(buffer, 3) orelse return null;
+    const initiator: u32 = if (modifier & (@as(u64, 1) << 32) != 0)
+        0
+    else
+        @as(u32, @truncate(modifier >> 3)) & 0x20;
+    cursor[0] = pm4Header(gpu.pm4.draw_index_auto, 2);
+    cursor[1] = index_count;
+    cursor[2] = initiator | 0x2;
+    return cursor;
+}
+
+fn agcDrawIndexAutoGetSize() callconv(abi.guest) u32 {
+    return 3 * @sizeOf(u32);
 }
 
 fn agcSetNumInstances(
@@ -1069,6 +1431,94 @@ fn agcSetRegistersIndirect(
         register_count & 0x3fff,
     };
     return writeAgcPacket(buffer, opcode, &body);
+}
+
+const graphics_error_invalid_packet: i32 = @bitCast(@as(u32, 0x8a6c_000c));
+
+fn agcRegIndirectPatchSetAddress(command_address: u64, registers_address: u64, opcode: u8) i32 {
+    if (!kernel_memory.isGuestRangeAccessible(command_address, 3 * @sizeOf(u32))) {
+        return errno.KernelError.efault.raw();
+    }
+    const header = readGuestU32(command_address);
+    if (((header >> 30) & 3) != 3 or @as(u8, @truncate(header >> 8)) != opcode) {
+        return graphics_error_invalid_packet;
+    }
+    const old_low = readGuestU32(command_address + @sizeOf(u32));
+    writeGuestU32(
+        command_address + @sizeOf(u32),
+        (old_low & 0x3) | (@as(u32, @truncate(registers_address)) & 0xffff_fffc),
+    );
+    writeGuestU32(command_address + 2 * @sizeOf(u32), @truncate(registers_address >> 32));
+    return errno.ok;
+}
+
+fn agcRegIndirectPatchSetNumRegisters(command_address: u64, register_count: u32, opcode: u8) i32 {
+    if (!kernel_memory.isGuestRangeAccessible(command_address, 5 * @sizeOf(u32))) {
+        return errno.KernelError.efault.raw();
+    }
+    const header = readGuestU32(command_address);
+    if (((header >> 30) & 3) != 3 or @as(u8, @truncate(header >> 8)) != opcode) {
+        return graphics_error_invalid_packet;
+    }
+    const old_count = readGuestU32(command_address + 4 * @sizeOf(u32));
+    writeGuestU32(
+        command_address + 4 * @sizeOf(u32),
+        (old_count & ~@as(u32, 0x3fff)) | (register_count & 0x3fff),
+    );
+    return errno.ok;
+}
+
+fn agcRegIndirectPatchAddRegisters(command_address: u64, register_count: u32, opcode: u8) i32 {
+    if (!kernel_memory.isGuestRangeAccessible(command_address, 5 * @sizeOf(u32))) {
+        return errno.KernelError.efault.raw();
+    }
+    const header = readGuestU32(command_address);
+    if (((header >> 30) & 3) != 3 or @as(u8, @truncate(header >> 8)) != opcode) {
+        return graphics_error_invalid_packet;
+    }
+    const old_count = readGuestU32(command_address + 4 * @sizeOf(u32));
+    const new_count = ((old_count & 0x3fff) +% register_count) & 0x3fff;
+    writeGuestU32(
+        command_address + 4 * @sizeOf(u32),
+        (old_count & ~@as(u32, 0x3fff)) | new_count,
+    );
+    return errno.ok;
+}
+
+fn agcSetCxRegIndirectPatchSetAddress(command_address: u64, registers_address: u64) callconv(abi.guest) i32 {
+    return agcRegIndirectPatchSetAddress(command_address, registers_address, gpu.pm4.set_context_reg_indirect);
+}
+
+fn agcSetShRegIndirectPatchSetAddress(command_address: u64, registers_address: u64) callconv(abi.guest) i32 {
+    return agcRegIndirectPatchSetAddress(command_address, registers_address, gpu.pm4.set_sh_reg_indirect);
+}
+
+fn agcSetUcRegIndirectPatchSetAddress(command_address: u64, registers_address: u64) callconv(abi.guest) i32 {
+    return agcRegIndirectPatchSetAddress(command_address, registers_address, gpu.pm4.set_uconfig_reg_indirect);
+}
+
+fn agcSetCxRegIndirectPatchSetNumRegisters(command_address: u64, register_count: u32) callconv(abi.guest) i32 {
+    return agcRegIndirectPatchSetNumRegisters(command_address, register_count, gpu.pm4.set_context_reg_indirect);
+}
+
+fn agcSetShRegIndirectPatchSetNumRegisters(command_address: u64, register_count: u32) callconv(abi.guest) i32 {
+    return agcRegIndirectPatchSetNumRegisters(command_address, register_count, gpu.pm4.set_sh_reg_indirect);
+}
+
+fn agcSetUcRegIndirectPatchSetNumRegisters(command_address: u64, register_count: u32) callconv(abi.guest) i32 {
+    return agcRegIndirectPatchSetNumRegisters(command_address, register_count, gpu.pm4.set_uconfig_reg_indirect);
+}
+
+fn agcSetCxRegIndirectPatchAddRegisters(command_address: u64, register_count: u32) callconv(abi.guest) i32 {
+    return agcRegIndirectPatchAddRegisters(command_address, register_count, gpu.pm4.set_context_reg_indirect);
+}
+
+fn agcSetShRegIndirectPatchAddRegisters(command_address: u64, register_count: u32) callconv(abi.guest) i32 {
+    return agcRegIndirectPatchAddRegisters(command_address, register_count, gpu.pm4.set_sh_reg_indirect);
+}
+
+fn agcSetUcRegIndirectPatchAddRegisters(command_address: u64, register_count: u32) callconv(abi.guest) i32 {
+    return agcRegIndirectPatchAddRegisters(command_address, register_count, gpu.pm4.set_uconfig_reg_indirect);
 }
 
 fn agcSetCxRegistersIndirect(
@@ -1478,16 +1928,21 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcCreateShader", .function = trace.wrap("sceAgcCreateShader", &agcCreateShader), .expect_id = "f3dg2CSgRKY" },
     .{ .name = "sceAgcUnknownGetFusedShaderSize", .function = trace.wrap("sceAgcUnknownGetFusedShaderSize", &agcGetFusedShaderSize), .id_override = "dolOmWH+huQ" },
     .{ .name = "sceAgcUnknownFuseShaderHalves", .function = trace.wrap("sceAgcUnknownFuseShaderHalves", &agcFuseShaderHalves), .id_override = "fd5Bp5tGTgo" },
-    .{ .name = "sceAgcSetCxRegIndirectPatchSetAddress", .function = trace.wrap("sceAgcSetCxRegIndirectPatchSetAddress", &agcPatch), .expect_id = "vcmNN+AAXnY" },
-    .{ .name = "sceAgcSetShRegIndirectPatchSetAddress", .function = trace.wrap("sceAgcSetShRegIndirectPatchSetAddress", &agcPatch), .expect_id = "Qrj4c+61z4A" },
-    .{ .name = "sceAgcSetUcRegIndirectPatchSetAddress", .function = trace.wrap("sceAgcSetUcRegIndirectPatchSetAddress", &agcPatch), .expect_id = "6lNcCp+fxi4" },
-    .{ .name = "sceAgcSetCxRegIndirectPatchAddRegisters", .function = trace.wrap("sceAgcSetCxRegIndirectPatchAddRegisters", &agcPatch), .expect_id = "d-6uF9sZDIU" },
-    .{ .name = "sceAgcSetShRegIndirectPatchAddRegisters", .function = trace.wrap("sceAgcSetShRegIndirectPatchAddRegisters", &agcPatch), .expect_id = "z2duB-hHQSM" },
-    .{ .name = "sceAgcSetUcRegIndirectPatchAddRegisters", .function = trace.wrap("sceAgcSetUcRegIndirectPatchAddRegisters", &agcPatch), .expect_id = "vRoArM9zaIk" },
+    .{ .name = "sceAgcSetCxRegIndirectPatchSetAddress", .function = trace.wrap("sceAgcSetCxRegIndirectPatchSetAddress", &agcSetCxRegIndirectPatchSetAddress), .expect_id = "vcmNN+AAXnY" },
+    .{ .name = "sceAgcSetShRegIndirectPatchSetAddress", .function = trace.wrap("sceAgcSetShRegIndirectPatchSetAddress", &agcSetShRegIndirectPatchSetAddress), .expect_id = "Qrj4c+61z4A" },
+    .{ .name = "sceAgcSetUcRegIndirectPatchSetAddress", .function = trace.wrap("sceAgcSetUcRegIndirectPatchSetAddress", &agcSetUcRegIndirectPatchSetAddress), .expect_id = "6lNcCp+fxi4" },
+    .{ .name = "sceAgcSetCxRegIndirectPatchSetNumRegisters", .function = trace.wrap("sceAgcSetCxRegIndirectPatchSetNumRegisters", &agcSetCxRegIndirectPatchSetNumRegisters), .expect_id = "whb1RL7K4Ss" },
+    .{ .name = "sceAgcSetShRegIndirectPatchSetNumRegisters", .function = trace.wrap("sceAgcSetShRegIndirectPatchSetNumRegisters", &agcSetShRegIndirectPatchSetNumRegisters), .expect_id = "nCUgItdN2ms" },
+    .{ .name = "sceAgcSetUcRegIndirectPatchSetNumRegisters", .function = trace.wrap("sceAgcSetUcRegIndirectPatchSetNumRegisters", &agcSetUcRegIndirectPatchSetNumRegisters), .expect_id = "fRG-JOH5+sI" },
+    .{ .name = "sceAgcSetCxRegIndirectPatchAddRegisters", .function = trace.wrap("sceAgcSetCxRegIndirectPatchAddRegisters", &agcSetCxRegIndirectPatchAddRegisters), .expect_id = "d-6uF9sZDIU" },
+    .{ .name = "sceAgcSetShRegIndirectPatchAddRegisters", .function = trace.wrap("sceAgcSetShRegIndirectPatchAddRegisters", &agcSetShRegIndirectPatchAddRegisters), .expect_id = "z2duB-hHQSM" },
+    .{ .name = "sceAgcSetUcRegIndirectPatchAddRegisters", .function = trace.wrap("sceAgcSetUcRegIndirectPatchAddRegisters", &agcSetUcRegIndirectPatchAddRegisters), .expect_id = "vRoArM9zaIk" },
     .{ .name = "sceAgcCreatePrimState", .function = trace.wrap("sceAgcCreatePrimState", &agcCreatePrimState), .expect_id = "D9sr1xGUriE" },
     .{ .name = "sceAgcWriteDataPatchSetAddressOrOffset", .function = trace.wrap("sceAgcWriteDataPatchSetAddressOrOffset", &agcPatch), .expect_id = "fPSCdQxgpSw" },
-    .{ .name = "sceAgcQueueEndOfPipeActionPatchAddress", .function = trace.wrap("sceAgcQueueEndOfPipeActionPatchAddress", &agcPatch), .expect_id = "0fWWK5uG9rQ" },
-    .{ .name = "sceAgcWaitRegMemPatchAddress", .function = trace.wrap("sceAgcWaitRegMemPatchAddress", &agcPatch), .expect_id = "3KDcnM3lrcU" },
+    .{ .name = "sceAgcDmaDataPatchSetDstAddressOrOffset", .function = trace.wrap("sceAgcDmaDataPatchSetDstAddressOrOffset", &agcDmaDataPatchDestination), .expect_id = "IxYiarKlXxM" },
+    .{ .name = "sceAgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate", .function = trace.wrap("sceAgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate", &agcDmaDataPatchSource), .expect_id = "cdDRpqcFGbU" },
+    .{ .name = "sceAgcQueueEndOfPipeActionPatchAddress", .function = trace.wrap("sceAgcQueueEndOfPipeActionPatchAddress", &agcReleaseMemPatchAddress), .expect_id = "0fWWK5uG9rQ" },
+    .{ .name = "sceAgcWaitRegMemPatchAddress", .function = trace.wrap("sceAgcWaitRegMemPatchAddress", &agcWaitRegMemPatchAddress), .expect_id = "3KDcnM3lrcU" },
     .{ .name = "sceAgcSetNop", .function = trace.wrap("sceAgcSetNop", &agcPatch), .expect_id = "K2mciNVxUCE" },
     .{ .name = "sceAgcSuspendPoint", .function = trace.wrap("sceAgcSuspendPoint", &agcSuspendPoint), .expect_id = "h9z6+0hEydk" },
     .{ .name = "sceAgcGetIsTrinityMode", .function = trace.wrap("sceAgcGetIsTrinityMode", &agcPatch), .expect_id = "BfBDZGbti7A" },
@@ -1496,14 +1951,14 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcUnknownDb", .function = trace.wrap("sceAgcUnknownDb", &agcPatch), .id_override = "dbOlWdppb4o" },
     .{ .name = "sceAgcUnknownKRzWekV120", .function = trace.wrap("sceAgcUnknownKRzWekV120", &agcPatch), .id_override = "-KRzWekV120" },
     .{ .name = "sceAgcUnknownIkfdtRIqCE", .function = trace.wrap("sceAgcUnknownIkfdtRIqCE", &agcPatch), .id_override = "Ikfdt-rIqCE" },
-    .{ .name = "sceAgcGetDataPacketPayloadAddress", .function = trace.wrap("sceAgcGetDataPacketPayloadAddress", &agcPatch), .id_override = "V++UgBtQhn0" },
+    .{ .name = "sceAgcGetDataPacketPayloadAddress", .function = trace.wrap("sceAgcGetDataPacketPayloadAddress", &agcGetDataPacketPayloadAddress), .id_override = "V++UgBtQhn0" },
 
     .{ .name = "sceAgcCbNop", .function = trace.wrap("sceAgcCbNop", &agcCommand), .expect_id = "LtTouSCZjHM" },
     .{ .name = "sceAgcCbDispatch", .function = trace.wrap("sceAgcCbDispatch", &agcDispatch), .expect_id = "k3GhuSNmBLU" },
     .{ .name = "sceAgcCbSetShRegisterRangeDirect", .function = trace.wrap("sceAgcCbSetShRegisterRangeDirect", &agcSetShRegisterRangeDirect), .expect_id = "n2fD4A+pb+g" },
     .{ .name = "sceAgcCbSetShRegistersDirect", .function = trace.wrap("sceAgcCbSetShRegistersDirect", &agcCommand), .expect_id = "UZbQjYAwwXM" },
     .{ .name = "sceAgcCbSetUcRegistersDirect", .function = trace.wrap("sceAgcCbSetUcRegistersDirect", &agcCommand), .expect_id = "03RZmELWWzw" },
-    .{ .name = "sceAgcCbReleaseMem", .function = trace.wrap("sceAgcCbReleaseMem", &agcCommand), .expect_id = "wr23dPKyWc0" },
+    .{ .name = "sceAgcCbReleaseMem", .function = trace.wrap("sceAgcCbReleaseMem", &agcReleaseMem), .expect_id = "wr23dPKyWc0" },
 
     .{ .name = "sceAgcAcbResetQueue", .function = trace.wrap("sceAgcAcbResetQueue", &agcCommand), .expect_id = "JrtiDtKeS38" },
     .{ .name = "sceAgcAcbDispatchIndirect", .function = trace.wrap("sceAgcAcbDispatchIndirect", &agcCommand), .expect_id = "j3EtxFkSIhQ" },
@@ -1524,7 +1979,8 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcDcbSetIndexCount", .function = trace.wrap("sceAgcDcbSetIndexCount", &agcCommand), .expect_id = "8N2tmT3jmC8" },
     .{ .name = "sceAgcDcbSetIndexSize", .function = trace.wrap("sceAgcDcbSetIndexSize", &agcSetIndexSize), .expect_id = "GIIW2J37e70" },
     .{ .name = "sceAgcDcbDrawIndex", .function = trace.wrap("sceAgcDcbDrawIndex", &agcDrawIndex), .expect_id = "q88lQ+GP5Yk" },
-    .{ .name = "sceAgcDcbDrawIndexAuto", .function = trace.wrap("sceAgcDcbDrawIndexAuto", &agcCommand), .expect_id = "Yw0jKSqop+E" },
+    .{ .name = "sceAgcDcbDrawIndexAuto", .function = trace.wrap("sceAgcDcbDrawIndexAuto", &agcDrawIndexAuto), .expect_id = "Yw0jKSqop+E" },
+    .{ .name = "sceAgcDcbDrawIndexAutoGetSize", .function = trace.wrap("sceAgcDcbDrawIndexAutoGetSize", &agcDrawIndexAutoGetSize), .expect_id = "WrdP9Zxx3lQ" },
     .{ .name = "sceAgcDcbDrawIndexIndirect", .function = trace.wrap("sceAgcDcbDrawIndexIndirect", &agcCommand), .expect_id = "t1vNu082-jM" },
     .{ .name = "sceAgcDcbDrawIndirect", .function = trace.wrap("sceAgcDcbDrawIndirect", &agcCommand), .expect_id = "1q1titRBL6o" },
     .{ .name = "sceAgcDcbDispatchIndirect", .function = trace.wrap("sceAgcDcbDispatchIndirect", &agcCommand), .expect_id = "CtB+A9-VxO0" },
@@ -1534,16 +1990,16 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcDcbSetShRegistersIndirect", .function = trace.wrap("sceAgcDcbSetShRegistersIndirect", &agcSetShRegistersIndirect), .expect_id = "-HOOCn0JY48" },
     .{ .name = "sceAgcDcbSetUcRegistersIndirect", .function = trace.wrap("sceAgcDcbSetUcRegistersIndirect", &agcSetUcRegistersIndirect), .expect_id = "hvUfkUIQcOE" },
     .{ .name = "sceAgcDcbSetCxRegistersIndirect", .function = trace.wrap("sceAgcDcbSetCxRegistersIndirect", &agcSetCxRegistersIndirect), .expect_id = "ZvwO9euwYzc" },
-    .{ .name = "sceAgcDcbWaitRegMem", .function = trace.wrap("sceAgcDcbWaitRegMem", &agcCommand), .expect_id = "VmW0Tdpy420" },
-    .{ .name = "sceAgcDcbAcquireMem", .function = trace.wrap("sceAgcDcbAcquireMem", &agcCommand), .expect_id = "57labkp+rSQ" },
-    .{ .name = "sceAgcDcbDmaData", .function = trace.wrap("sceAgcDcbDmaData", &agcCommand), .expect_id = "WmAc2MEj6Io" },
+    .{ .name = "sceAgcDcbWaitRegMem", .function = trace.wrap("sceAgcDcbWaitRegMem", &agcWaitRegMem), .expect_id = "VmW0Tdpy420" },
+    .{ .name = "sceAgcDcbAcquireMem", .function = trace.wrap("sceAgcDcbAcquireMem", &agcAcquireMem), .expect_id = "57labkp+rSQ" },
+    .{ .name = "sceAgcDcbDmaData", .function = trace.wrap("sceAgcDcbDmaData", &agcDmaData), .expect_id = "WmAc2MEj6Io" },
     .{ .name = "sceAgcDcbCopyData", .function = trace.wrap("sceAgcDcbCopyData", &agcCommand), .expect_id = "1rZSWUv1IRc" },
     .{ .name = "sceAgcDcbWriteData", .function = trace.wrap("sceAgcDcbWriteData", &agcCommand), .expect_id = "i1jyy49AjXU" },
-    .{ .name = "sceAgcDcbEventWrite", .function = trace.wrap("sceAgcDcbEventWrite", &agcCommand), .expect_id = "aJf+j5yntiU" },
+    .{ .name = "sceAgcDcbEventWrite", .function = trace.wrap("sceAgcDcbEventWrite", &agcEventWrite), .expect_id = "aJf+j5yntiU" },
     .{ .name = "sceAgcDcbJump", .function = trace.wrap("sceAgcDcbJump", &agcCommand), .expect_id = "xSAR0LTcRKM" },
     .{ .name = "sceAgcDcbPushMarker", .function = trace.wrap("sceAgcDcbPushMarker", &agcCommand), .expect_id = "+kSrjIVxKFE" },
     .{ .name = "sceAgcDcbPopMarker", .function = trace.wrap("sceAgcDcbPopMarker", &agcCommand), .expect_id = "H7uZqCoNuWk" },
-    .{ .name = "sceAgcDcbSetFlip", .function = trace.wrap("sceAgcDcbSetFlip", &agcCommand), .expect_id = "YUeqkyT7mEQ" },
+    .{ .name = "sceAgcDcbSetFlip", .function = trace.wrap("sceAgcDcbSetFlip", &agcSetFlip), .expect_id = "YUeqkyT7mEQ" },
 };
 
 const agc_driver_exports = [_]symbols.Export{
@@ -1622,6 +2078,125 @@ test "bootstrap AGC commands are one walkable PM4 NOP" {
     try std.testing.expect((try walker.next()) == null);
 }
 
+test "bootstrap AGC release publishes a walkable custom fence packet" {
+    var words: [16]u32 = @splat(0xdead_beef);
+    var command_buffer = AgcCommandBuffer{
+        .bottom = words[0..].ptr,
+        .top = words[0..].ptr + words.len,
+        .cursor_up = words[0..].ptr,
+        .cursor_down = null,
+        .callback = null,
+        .user_data = null,
+        .reserved_dwords = 0,
+    };
+    const address: u64 = 0x1234_5678_9abc_def0;
+    const data: u64 = 0xfedc_ba98_7654_3210;
+    try std.testing.expect(agcReleaseMem(
+        &command_buffer,
+        0x28,
+        0x345,
+        1,
+        2,
+        address,
+        2,
+        data,
+        0,
+        0,
+        1,
+        7,
+    ) != null);
+
+    var walker = gpu.pm4.Walker.init(&words);
+    const release = (try walker.next()).?;
+    try std.testing.expectEqual(gpu.pm4.custom.release_mem, gpu.pm4.customCode(release).?);
+    try std.testing.expectEqual(@as(usize, 8), release.wordCount());
+    try std.testing.expectEqual(@as(u32, @truncate(address)), release.body[2]);
+    try std.testing.expectEqual(@as(u32, @truncate(address >> 32)), release.body[3]);
+    try std.testing.expectEqual(@as(u32, @truncate(data)), release.body[4]);
+    try std.testing.expectEqual(@as(u32, @truncate(data >> 32)), release.body[5]);
+    try std.testing.expectEqual(gpu.pm4.nop, (try walker.next()).?.opcode);
+    try std.testing.expect((try walker.next()) == null);
+}
+
+test "bootstrap AGC wait packet keeps its copied address patchable" {
+    var words: [16]u32 = @splat(0xdead_beef);
+    var command_buffer = AgcCommandBuffer{
+        .bottom = words[0..].ptr,
+        .top = words[0..].ptr + words.len,
+        .cursor_up = words[0..].ptr,
+        .cursor_down = null,
+        .callback = null,
+        .user_data = null,
+        .reserved_dwords = 0,
+    };
+    try std.testing.expect(agcWaitRegMem(&command_buffer, 0, 3, 0, 0, 0, 1, 0xffff_ffff, 16) != null);
+    const patched_address: u64 = 0x0000_8833_0c05_00;
+    try std.testing.expectEqual(errno.ok, agcWaitRegMemPatchAddress(@intFromPtr(&words), patched_address));
+
+    var walker = gpu.pm4.Walker.init(&words);
+    const wait = (try walker.next()).?;
+    try std.testing.expectEqual(gpu.pm4.custom.wait_mem_32, gpu.pm4.customCode(wait).?);
+    try std.testing.expectEqual(@as(u32, @truncate(patched_address)), wait.body[0]);
+    try std.testing.expectEqual(@as(u32, @truncate(patched_address >> 32)), wait.body[1]);
+    try std.testing.expectEqual(@as(u32, 0xffff_ffff), wait.body[2]);
+    try std.testing.expectEqual(@as(u32, 1), wait.body[3]);
+    try std.testing.expectEqual(gpu.pm4.nop, (try walker.next()).?.opcode);
+}
+
+test "bootstrap AGC emits event acquire and patchable DMA packets" {
+    var words: [48]u32 = @splat(0xdead_beef);
+    var command_buffer = AgcCommandBuffer{
+        .bottom = words[0..].ptr,
+        .top = words[0..].ptr + words.len,
+        .cursor_up = words[0..].ptr,
+        .cursor_down = null,
+        .callback = null,
+        .user_data = null,
+        .reserved_dwords = 0,
+    };
+    try std.testing.expect(agcEventWrite(&command_buffer, 16, 0) != null);
+    try std.testing.expect(agcDmaData(
+        &command_buffer,
+        0,
+        3,
+        0,
+        0,
+        2,
+        0,
+        0x1122_3344,
+        256,
+        1,
+        1,
+        0,
+    ) != null);
+    try std.testing.expect(agcAcquireMem(&command_buffer, 1, 0, 0x9000, 0, 0x20, 40) != null);
+
+    var walker = gpu.pm4.Walker.init(&words);
+    const event = (try walker.next()).?;
+    try std.testing.expectEqual(gpu.pm4.event_write, event.opcode);
+    try std.testing.expectEqual(@as(u32, 0x410), event.body[0]);
+    try std.testing.expectEqual(gpu.pm4.nop, (try walker.next()).?.opcode);
+
+    const dma = (try walker.next()).?;
+    try std.testing.expectEqual(gpu.pm4.dma_data, dma.opcode);
+    const dma_address = @intFromPtr(&words[16]);
+    try std.testing.expectEqual(errno.ok, agcDmaDataPatchDestination(dma_address, 0x1234_5678_9abc_def0));
+    try std.testing.expectEqual(errno.ok, agcDmaDataPatchSource(dma_address, 0xfedc_ba98_7654_3210));
+    try std.testing.expectEqual(@as(u32, 0x9abc_def0), dma.body[3]);
+    try std.testing.expectEqual(@as(u32, 0x1234_5678), dma.body[4]);
+    try std.testing.expectEqual(@as(u32, 0x7654_3210), dma.body[1]);
+    try std.testing.expectEqual(@as(u32, 0xfedc_ba98), dma.body[2]);
+    try std.testing.expectEqual(gpu.pm4.nop, (try walker.next()).?.opcode);
+
+    const acquire = (try walker.next()).?;
+    try std.testing.expectEqual(gpu.pm4.custom.acquire_mem, gpu.pm4.customCode(acquire).?);
+    try std.testing.expectEqual(@as(u32, 0x8000_0000), acquire.body[0]);
+    try std.testing.expectEqual(@as(u32, 1), acquire.body[5]);
+    try std.testing.expectEqual(@as(u32, 0x9000), acquire.body[6]);
+    try std.testing.expectEqual(gpu.pm4.nop, (try walker.next()).?.opcode);
+    try std.testing.expect((try walker.next()) == null);
+}
+
 test "bootstrap AGC emits dispatch draw and instance packets in fixed slots" {
     var words: [48]u32 = @splat(0xdead_beef);
     var command_buffer = AgcCommandBuffer{
@@ -1656,6 +2231,28 @@ test "bootstrap AGC emits dispatch draw and instance packets in fixed slots" {
     try std.testing.expect((try walker.next()) == null);
 }
 
+test "bootstrap AGC emits exact draw-index-auto packet" {
+    var words: [3]u32 = @splat(0xdead_beef);
+    var command_buffer = AgcCommandBuffer{
+        .bottom = words[0..].ptr,
+        .top = words[0..].ptr + words.len,
+        .cursor_up = words[0..].ptr,
+        .cursor_down = null,
+        .callback = null,
+        .user_data = null,
+        .reserved_dwords = 0,
+    };
+    try std.testing.expectEqual(@as(u32, 12), agcDrawIndexAutoGetSize());
+    try std.testing.expect(agcDrawIndexAuto(&command_buffer, 3, 0x4000_0000) != null);
+    try std.testing.expectEqual(words[0..].ptr + words.len, command_buffer.cursor_up.?);
+
+    var walker = gpu.pm4.Walker.init(&words);
+    const draw = (try walker.next()).?;
+    try std.testing.expectEqual(gpu.pm4.draw_index_auto, draw.opcode);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 0x2 }, draw.body);
+    try std.testing.expect((try walker.next()) == null);
+}
+
 test "bootstrap AGC emits native indirect register packets in fixed slots" {
     var words: [48]u32 = @splat(0xdead_beef);
     var command_buffer = AgcCommandBuffer{
@@ -1687,6 +2284,74 @@ test "bootstrap AGC emits native indirect register packets in fixed slots" {
     try std.testing.expectEqual(@as(u32, @truncate(address >> 32)), words[2]);
     try std.testing.expectEqual(@as(u32, 0x8000_0000), words[3]);
     try std.testing.expectEqual(@as(u32, 7), words[4]);
+}
+
+test "bootstrap AGC patches native indirect register packets" {
+    var words: [48]u32 = @splat(0xdead_beef);
+    var command_buffer = AgcCommandBuffer{
+        .bottom = words[0..].ptr,
+        .top = words[0..].ptr + words.len,
+        .cursor_up = words[0..].ptr,
+        .cursor_down = null,
+        .callback = null,
+        .user_data = null,
+        .reserved_dwords = 0,
+    };
+    const cx_command = agcSetCxRegistersIndirect(&command_buffer, 8, 0, 0, 0, 0).?;
+    const sh_command = agcSetShRegistersIndirect(&command_buffer, 8, 0, 0, 0, 0).?;
+    const uc_command = agcSetUcRegistersIndirect(&command_buffer, 8, 0, 0, 0, 0).?;
+
+    const cx_address: u64 = 0x1234_5678_9abc_def1;
+    const sh_address: u64 = 0x2234_5678_8765_4322;
+    const uc_address: u64 = 0x3234_5678_1020_3043;
+    try std.testing.expectEqual(errno.ok, agcSetCxRegIndirectPatchSetAddress(@intFromPtr(cx_command), cx_address));
+    try std.testing.expectEqual(errno.ok, agcSetShRegIndirectPatchSetAddress(@intFromPtr(sh_command), sh_address));
+    try std.testing.expectEqual(errno.ok, agcSetUcRegIndirectPatchSetAddress(@intFromPtr(uc_command), uc_address));
+    try std.testing.expectEqual(errno.ok, agcSetCxRegIndirectPatchAddRegisters(@intFromPtr(cx_command), 10));
+    try std.testing.expectEqual(errno.ok, agcSetCxRegIndirectPatchAddRegisters(@intFromPtr(cx_command), 5));
+    try std.testing.expectEqual(errno.ok, agcSetShRegIndirectPatchSetNumRegisters(@intFromPtr(sh_command), 0x400b));
+    try std.testing.expectEqual(errno.ok, agcSetUcRegIndirectPatchAddRegisters(@intFromPtr(uc_command), 3));
+
+    try std.testing.expectEqual(@as(u32, @truncate(cx_address)) & 0xffff_fffc, cx_command[1]);
+    try std.testing.expectEqual(@as(u32, @truncate(cx_address >> 32)), cx_command[2]);
+    try std.testing.expectEqual(@as(u32, 15), cx_command[4] & 0x3fff);
+    try std.testing.expectEqual(@as(u32, @truncate(sh_address)) & 0xffff_fffc, sh_command[1]);
+    try std.testing.expectEqual(@as(u32, 11), sh_command[4] & 0x3fff);
+    try std.testing.expectEqual(@as(u32, @truncate(uc_address)) & 0xffff_fffc, uc_command[1]);
+    try std.testing.expectEqual(@as(u32, 3), uc_command[4] & 0x3fff);
+    try std.testing.expectEqual(
+        graphics_error_invalid_packet,
+        agcSetShRegIndirectPatchAddRegisters(@intFromPtr(cx_command), 1),
+    );
+}
+
+test "bootstrap AGC emits a backend-visible flip packet" {
+    var words: [16]u32 = @splat(0xdead_beef);
+    var command_buffer = AgcCommandBuffer{
+        .bottom = words[0..].ptr,
+        .top = words[0..].ptr + words.len,
+        .cursor_up = words[0..].ptr,
+        .cursor_down = null,
+        .callback = null,
+        .user_data = null,
+        .reserved_dwords = 0,
+    };
+    const argument: i64 = @bitCast(@as(u64, 0x0123_4567_89ab_cdef));
+    try std.testing.expect(agcSetFlip(&command_buffer, 4, -2, 1, argument) != null);
+
+    var walker = gpu.pm4.Walker.init(&words);
+    const flip = (try walker.next()).?;
+    try std.testing.expectEqual(gpu.pm4.nop, flip.opcode);
+    try std.testing.expectEqual(@as(?u6, gpu.pm4.custom.flip), gpu.pm4.customCode(flip));
+    try std.testing.expectEqualSlices(u32, &.{
+        4,
+        @bitCast(@as(i32, -2)),
+        1,
+        0x89ab_cdef,
+        0x0123_4567,
+    }, flip.body);
+    try std.testing.expectEqual(gpu.pm4.nop, (try walker.next()).?.opcode);
+    try std.testing.expect((try walker.next()) == null);
 }
 
 test "bootstrap AGC shader range uses its exact variable packet size" {

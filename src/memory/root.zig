@@ -20,6 +20,15 @@ const builtin = @import("builtin");
 pub const SharedBacking = @import("backing_store.zig").SharedBacking;
 
 const windows_mem_free: u32 = 0x0001_0000;
+const windows_mem_commit: u32 = 0x0000_1000;
+const windows_page_noaccess: u32 = 0x01;
+const windows_page_readonly: u32 = 0x02;
+const windows_page_readwrite: u32 = 0x04;
+const windows_page_writecopy: u32 = 0x08;
+const windows_page_execute_read: u32 = 0x20;
+const windows_page_execute_readwrite: u32 = 0x40;
+const windows_page_execute_writecopy: u32 = 0x80;
+const windows_page_guard: u32 = 0x100;
 const windows_allocation_granularity: u64 = 0x1_0000;
 
 /// Native x64 layout returned by VirtualQuery. Kept local so the memory module
@@ -70,6 +79,44 @@ const WindowsApi = if (builtin.os.tag == .windows) struct {
 fn windowsVirtualQuery(address: u64, info: *WindowsMemoryInfo) usize {
     if (builtin.os.tag != .windows) unreachable;
     return WindowsApi.VirtualQuery(@ptrFromInt(address), info, @sizeOf(WindowsMemoryInfo));
+}
+
+const HostPermission = enum { read, write };
+
+fn windowsRangeAccessible(address: u64, size: u64, required: HostPermission) bool {
+    if (builtin.os.tag != .windows or address == 0 or size == 0) return false;
+    const end = std.math.add(u64, address, size) catch return false;
+    var cursor = address;
+    while (cursor < end) {
+        var info: WindowsMemoryInfo = undefined;
+        if (windowsVirtualQuery(cursor, &info) == 0 or info.state != windows_mem_commit) return false;
+        const protection = info.protect;
+        if (protection & (windows_page_noaccess | windows_page_guard) != 0) return false;
+        const allowed = switch (required) {
+            .read => protection & (windows_page_readonly | windows_page_readwrite |
+                windows_page_writecopy | windows_page_execute_read |
+                windows_page_execute_readwrite | windows_page_execute_writecopy) != 0,
+            .write => protection & (windows_page_readwrite | windows_page_writecopy |
+                windows_page_execute_readwrite | windows_page_execute_writecopy) != 0,
+        };
+        if (!allowed) return false;
+        const region_start: u64 = @intFromPtr(info.base_address);
+        const region_end = std.math.add(u64, region_start, info.region_size) catch return false;
+        if (region_end <= cursor) return false;
+        cursor = @min(end, region_end);
+    }
+    return true;
+}
+
+/// Checks native allocations returned to guest code by the host CRT. These
+/// pages are outside AddressSpace's console windows but remain valid pointers
+/// for native guest execution and for HLE output parameters.
+pub fn isHostRangeReadable(address: u64, size: u64) bool {
+    return windowsRangeAccessible(address, size, .read);
+}
+
+pub fn isHostRangeWritable(address: u64, size: u64) bool {
+    return windowsRangeAccessible(address, size, .write);
 }
 
 /// Guest mappings are aligned to the hardware's 16 KiB page size.
@@ -464,6 +511,25 @@ pub const AddressSpace = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.coversLocked(address, size, null);
+    }
+
+    /// Whether every byte is backed by committed, CPU-readable guest pages.
+    ///
+    /// `isMapped` intentionally includes virtual reservations because kernel
+    /// queries need to see them. HLE code must use this stricter predicate
+    /// before turning a guest integer into a native pointer: reserved and
+    /// GPU-only/no-access mappings have no host-readable storage.
+    pub fn isReadable(self: *AddressSpace, address: u64, size: u64) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.coversWithProtectionLocked(address, size, .read);
+    }
+
+    /// Whether every byte is backed by committed, CPU-writable guest pages.
+    pub fn isWritable(self: *AddressSpace, address: u64, size: u64) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.coversWithProtectionLocked(address, size, .write);
     }
 
     pub fn isMappedAs(
@@ -1623,6 +1689,9 @@ test "virtual reservations and mapping queries retain guest metadata" {
     const reservation = space.query(reserved_address + page_size, false).?;
     try testing.expectEqual(MappingKind.reserved, reservation.kind);
     try testing.expectEqual(@as(i32, 0), reservation.protection_bits);
+    try testing.expect(space.isMapped(reserved_address, 2 * page_size));
+    try testing.expect(!space.isReadable(reserved_address, 2 * page_size));
+    try testing.expect(!space.isWritable(reserved_address, 2 * page_size));
 
     try space.unmap(reserved_address, 2 * page_size);
     try space.mapFixed(
@@ -1641,6 +1710,8 @@ test "virtual reservations and mapping queries retain guest metadata" {
     const mapping = space.query(reserved_address, false).?;
     try testing.expectEqual(MappingKind.flexible, mapping.kind);
     try testing.expectEqual(@as(i32, 0x23), mapping.protection_bits);
+    try testing.expect(space.isReadable(reserved_address, 2 * page_size));
+    try testing.expect(space.isWritable(reserved_address, 2 * page_size));
     try testing.expectEqual(@as(i32, 7), mapping.memory_type);
     try testing.expectEqualStrings("flex-test", std.mem.sliceTo(&mapping.name, 0));
 

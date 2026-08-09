@@ -194,6 +194,16 @@ fn run(init: std.process.Init) !bool {
         }
     } else |_| {}
 
+    if (init.minimal.environ.getAlloc(allocator, "PS5_TRACE_FAILURES")) |text| {
+        defer allocator.free(text);
+        const request = std.mem.trim(u8, text, " \t\r\n");
+        if (request.len != 0 and !std.mem.eql(u8, request, "0")) {
+            runtime.firmware.trace.setLive(true);
+            runtime.firmware.trace.setLiveFailuresOnly(true);
+            try out.print("  tracing failed firmware calls only\n", .{});
+        }
+    } else |_| {}
+
     // Arms a one-shot snapshot of the guest stack at one firmware call, named by
     // its number in the trace. The trace says which calls a title made; this
     // says which of the title's own code made one of them, which is the only

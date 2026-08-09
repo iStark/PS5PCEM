@@ -17,6 +17,7 @@ const symbols = @import("../symbols.zig");
 const unwind = @import("../unwind.zig");
 const modules = @import("../modules.zig");
 const apr = @import("../apr.zig");
+const filesystem = @import("../filesystem.zig");
 const memory_api = @import("kernel_memory.zig");
 const threading = @import("kernel_threading.zig");
 
@@ -49,7 +50,9 @@ const TlsIndex = extern struct {
 };
 
 var stack_check_guard: u64 align(16) = 0xc0de_c0de_cafe_ba00;
-var program_name: usize = 0;
+const process_argument_zero = "eboot.bin";
+var process_arguments = [_]?[*:0]const u8{ process_argument_zero, null };
+var program_name: ?[*:0]const u8 = process_argument_zero;
 threadlocal var fallback_errno: i32 = 0;
 threadlocal var rtld_atexit_count: u32 = 0;
 threadlocal var undelivered_exception_waits: u8 = 0;
@@ -997,6 +1000,51 @@ fn deleteSemaphore(
     return 0;
 }
 
+fn posixSemaphoreHandle(address: ?*const u32) ?u32 {
+    const semaphore = address orelse return null;
+    if (!memory_api.isGuestRangeAccessible(@intFromPtr(semaphore), @sizeOf(u32))) return null;
+    const handle = semaphore.*;
+    return if (handle == 0) null else handle;
+}
+
+fn posixSemaphoreInit(destination: ?*u32, process_shared: i32, initial_count: u32) callconv(abi.guest) i32 {
+    if (process_shared != 0 or initial_count > std.math.maxInt(i32)) return KernelError.einval.raw();
+    return createSemaphore(
+        destination,
+        "posix".ptr,
+        0,
+        @intCast(initial_count),
+        std.math.maxInt(i32),
+        0,
+    );
+}
+
+fn posixSemaphoreWait(address: ?*const u32) callconv(abi.guest) i32 {
+    const handle = posixSemaphoreHandle(address) orelse return KernelError.einval.raw();
+    return waitSemaphore(handle, 1, null, 0, 0, 0);
+}
+
+fn posixSemaphorePost(address: ?*const u32) callconv(abi.guest) i32 {
+    const handle = posixSemaphoreHandle(address) orelse return KernelError.einval.raw();
+    return signalSemaphore(handle, 1, 0, 0, 0, 0);
+}
+
+fn posixSemaphoreDestroy(address: ?*u32) callconv(abi.guest) i32 {
+    const semaphore = address orelse return KernelError.einval.raw();
+    const handle = posixSemaphoreHandle(semaphore) orelse return KernelError.einval.raw();
+    const result = deleteSemaphore(handle, 0, 0, 0, 0, 0);
+    if (result == 0) semaphore.* = 0;
+    return result;
+}
+
+fn getArgc() callconv(abi.guest) i32 {
+    return 1;
+}
+
+fn getArgv() callconv(abi.guest) u64 {
+    return @intFromPtr(&process_arguments);
+}
+
 fn posixUnsupported(
     _: u64,
     _: u64,
@@ -1007,6 +1055,73 @@ fn posixUnsupported(
 ) callconv(abi.guest) i64 {
     setErrno(errno.Posix.enosys);
     return -1;
+}
+
+fn posixSocketFailure(reason: i32) i32 {
+    setErrno(reason);
+    return -1;
+}
+
+fn posixSocketBind(descriptor: i32, address: ?[*]const u8, length: u32) callconv(abi.guest) i32 {
+    if (!filesystem.isVirtualSocket(descriptor)) return posixSocketFailure(errno.Posix.ebadf);
+    if (address == null or length < 2) return posixSocketFailure(errno.Posix.einval);
+    return errno.ok;
+}
+
+fn posixSocketListen(descriptor: i32, backlog: i32) callconv(abi.guest) i32 {
+    if (!filesystem.isVirtualSocket(descriptor)) return posixSocketFailure(errno.Posix.ebadf);
+    if (backlog < 0) return posixSocketFailure(errno.Posix.einval);
+    return errno.ok;
+}
+
+fn writeLoopbackSocketAddress(address: ?[*]u8, length: ?*u32) bool {
+    const size_pointer = length orelse return address == null;
+    const capacity = size_pointer.*;
+    size_pointer.* = 16;
+    const output = address orelse return false;
+    if (capacity < 16) return false;
+    @memset(output[0..16], 0);
+    output[0] = 16;
+    output[1] = 2; // AF_INET
+    output[2] = 0x9c; // synthetic port 40000, network byte order
+    output[3] = 0x40;
+    output[4] = 127;
+    output[7] = 1;
+    return true;
+}
+
+fn posixSocketAccept(descriptor: i32, address: ?[*]u8, length: ?*u32) callconv(abi.guest) i32 {
+    if (!filesystem.isVirtualSocket(descriptor)) return posixSocketFailure(errno.Posix.ebadf);
+    if ((address == null) != (length == null)) return posixSocketFailure(errno.Posix.efault);
+    if (!writeLoopbackSocketAddress(address, length)) return posixSocketFailure(errno.Posix.einval);
+    return filesystem.openVirtualSocket() catch posixSocketFailure(errno.Posix.emfile);
+}
+
+fn posixSocketName(descriptor: i32, address: ?[*]u8, length: ?*u32) callconv(abi.guest) i32 {
+    if (!filesystem.isVirtualSocket(descriptor)) return posixSocketFailure(errno.Posix.ebadf);
+    return if (writeLoopbackSocketAddress(address, length)) errno.ok else posixSocketFailure(errno.Posix.einval);
+}
+
+fn posixSocketGetOption(
+    descriptor: i32,
+    _: i32,
+    _: i32,
+    value: ?*i32,
+    length: ?*u32,
+) callconv(abi.guest) i32 {
+    if (!filesystem.isVirtualSocket(descriptor)) return posixSocketFailure(errno.Posix.ebadf);
+    const output = value orelse return posixSocketFailure(errno.Posix.efault);
+    const size = length orelse return posixSocketFailure(errno.Posix.efault);
+    if (size.* < @sizeOf(i32)) return posixSocketFailure(errno.Posix.einval);
+    output.* = 0;
+    size.* = @sizeOf(i32);
+    return errno.ok;
+}
+
+fn posixSocketSend(descriptor: i32, buffer: ?[*]const u8, length: usize, _: i32) callconv(abi.guest) i64 {
+    if (!filesystem.isVirtualSocket(descriptor)) return posixSocketFailure(errno.Posix.ebadf);
+    if (buffer == null and length != 0) return posixSocketFailure(errno.Posix.efault);
+    return @intCast(filesystem.writeVirtualSocket(descriptor, length) catch return posixSocketFailure(errno.Posix.ebadf));
 }
 
 /// Returns the handle of a module the title asks for by path.
@@ -1125,6 +1240,16 @@ fn getModuleInfoForUnwind(
 /// pretending a write succeeded and letting the guest believe data was stored.
 fn guestWrite(descriptor: i32, buffer: ?[*]const u8, length: u64) callconv(abi.guest) i64 {
     if (descriptor != 1 and descriptor != 2) {
+        if (filesystem.isVirtualSocket(descriptor)) {
+            if (buffer == null and length != 0) {
+                setErrno(errno.Posix.efault);
+                return -1;
+            }
+            return @intCast(filesystem.writeVirtualSocket(descriptor, @intCast(length)) catch {
+                setErrno(errno.Posix.ebadf);
+                return -1;
+            });
+        }
         setErrno(errno.Posix.ebadf);
         return -1;
     }
@@ -1364,6 +1489,13 @@ fn nanosleep(request: ?*const Timespec, remaining: ?*Timespec) callconv(abi.gues
     return errno.ok;
 }
 
+fn usleep(microseconds: u32) callconv(abi.guest) i32 {
+    const status = threading.sceKernelUsleep(microseconds);
+    if (status == errno.ok) return errno.ok;
+    setErrno(errno.kernelToPosix(status));
+    return -1;
+}
+
 fn kernelNanosleep(request: ?*const Timespec, remaining: ?*Timespec) callconv(abi.guest) i32 {
     const result = nanosleep(request, remaining);
     return if (result == errno.ok) errno.ok else errno.posixToKernel(errnoAddress().*);
@@ -1477,6 +1609,8 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceKernelDebugRaiseException", .function = trace.wrap("sceKernelDebugRaiseException", &compatSuccess), .expect_id = "OMDRKKAZ8I4" },
     .{ .name = "sceKernelDebugRaiseExceptionOnReleaseMode", .function = trace.wrap("sceKernelDebugRaiseExceptionOnReleaseMode", &compatSuccess), .expect_id = "zE-wXIZjLoM" },
     .{ .name = "__error", .function = trace.wrap("__error", &errorAddress), .expect_id = "9BcDykPmo1I" },
+    .{ .name = "getargc", .function = trace.wrap("getargc", &getArgc), .expect_id = "iKJMWrAumPE" },
+    .{ .name = "getargv", .function = trace.wrap("getargv", &getArgv), .expect_id = "FJmglmTMdr4" },
     .{ .name = "__stack_chk_fail", .function = trace.wrap("__stack_chk_fail", &stackCheckFail), .expect_id = "Ou3iL1abvng" },
     .{ .name = "signal", .function = trace.wrap("signal", &compatSuccess), .expect_id = "VADc3MNQ3cM" },
     .{ .name = "sceKernelGetProcParam", .function = trace.wrap("sceKernelGetProcParam", &getProcParam), .expect_id = "959qrazPIrg" },
@@ -1589,7 +1723,12 @@ pub const posix_exports = [_]symbols.Export{
     .{ .name = "utimes", .function = trace.wrap("utimes", &posixUnsupported), .expect_id = "GDuV00CHrUg" },
     .{ .name = "sched_yield", .function = trace.wrap("sched_yield", &schedYield), .expect_id = "6XG4B33N09g" },
     .{ .name = "inet_pton", .function = trace.wrap("inet_pton", &posixUnsupported), .expect_id = "4n51s0zEf0c" },
-    .{ .name = "send", .function = trace.wrap("send", &posixUnsupported), .expect_id = "fZOeZIOEmLw" },
+    .{ .name = "send", .function = trace.wrap("send", &posixSocketSend), .expect_id = "fZOeZIOEmLw" },
+    .{ .name = "usleep", .function = trace.wrap("usleep", &usleep), .expect_id = "QcteRwbsnV0" },
+    .{ .name = "sem_init", .function = trace.wrap("sem_init", &posixSemaphoreInit), .expect_id = "pDuPEf3m4fI" },
+    .{ .name = "sem_wait", .function = trace.wrap("sem_wait", &posixSemaphoreWait), .expect_id = "YCV5dGGBcCo" },
+    .{ .name = "sem_post", .function = trace.wrap("sem_post", &posixSemaphorePost), .expect_id = "IKP8typ0QUk" },
+    .{ .name = "sem_destroy", .function = trace.wrap("sem_destroy", &posixSemaphoreDestroy), .expect_id = "cDW233RAwWo" },
 
     // The rest of the socket surface, refused like `send` above it. The
     // networking model here is deliberately offline — no host socket is ever
@@ -1597,14 +1736,14 @@ pub const posix_exports = [_]symbols.Export{
     // would then wait for a peer that cannot arrive. An error it can see is
     // the better answer, and it is the one it would get from a console with no
     // connection.
-    .{ .name = "bind", .function = trace.wrap("bind", &posixUnsupported), .expect_id = "KuOmgKoqCdY" },
-    .{ .name = "listen", .function = trace.wrap("listen", &posixUnsupported), .expect_id = "pxnCmagrtao" },
-    .{ .name = "accept", .function = trace.wrap("accept", &posixUnsupported), .expect_id = "3e+4Iv7IJ8U" },
+    .{ .name = "bind", .function = trace.wrap("bind", &posixSocketBind), .expect_id = "KuOmgKoqCdY" },
+    .{ .name = "listen", .function = trace.wrap("listen", &posixSocketListen), .expect_id = "pxnCmagrtao" },
+    .{ .name = "accept", .function = trace.wrap("accept", &posixSocketAccept), .expect_id = "3e+4Iv7IJ8U" },
     .{ .name = "sendto", .function = trace.wrap("sendto", &posixUnsupported), .expect_id = "oBr313PppNE" },
     .{ .name = "recvfrom", .function = trace.wrap("recvfrom", &posixUnsupported), .expect_id = "lUk6wrGXyMw" },
-    .{ .name = "getsockname", .function = trace.wrap("getsockname", &posixUnsupported), .expect_id = "RenI1lL1WFk" },
-    .{ .name = "getpeername", .function = trace.wrap("getpeername", &posixUnsupported), .expect_id = "TXFFFiNldU8" },
-    .{ .name = "getsockopt", .function = trace.wrap("getsockopt", &posixUnsupported), .expect_id = "6O8EwYOgH9Y" },
+    .{ .name = "getsockname", .function = trace.wrap("getsockname", &posixSocketName), .expect_id = "RenI1lL1WFk" },
+    .{ .name = "getpeername", .function = trace.wrap("getpeername", &posixSocketName), .expect_id = "TXFFFiNldU8" },
+    .{ .name = "getsockopt", .function = trace.wrap("getsockopt", &posixSocketGetOption), .expect_id = "6O8EwYOgH9Y" },
 
     // Descriptor flags. Refused rather than answered, because the flag a title
     // most often sets here is non-blocking, and claiming that took effect on a

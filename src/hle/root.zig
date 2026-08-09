@@ -41,6 +41,7 @@ pub const libs = struct {
     pub const libc_internal = @import("libs/libc_internal.zig");
     pub const network = @import("libs/network.zig");
     pub const platform_services = @import("libs/platform_services.zig");
+    pub const playgo = @import("libs/playgo.zig");
     pub const registry = @import("libs/registry.zig");
     pub const services = @import("libs/services.zig");
     pub const pad = @import("libs/pad.zig");

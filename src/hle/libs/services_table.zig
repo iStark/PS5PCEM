@@ -8,6 +8,7 @@
 
 const services = @import("services.zig");
 const platform_services = @import("platform_services.zig");
+const playgo = @import("playgo.zig");
 const trace = @import("../trace.zig");
 const symbols = @import("../symbols.zig");
 
@@ -96,6 +97,15 @@ pub const ampr_exports = [_]symbols.Export{
 
 pub const audioout2_exports = [_]symbols.Export{
     .{ .name = "sceAudioOut2PortGetState", .function = trace.wrap("sceAudioOut2PortGetState", &services.absent), .expect_id = "gatEUKG+Ea4" },
+};
+
+pub const audiodec_exports = [_]symbols.Export{
+    .{ .name = "sceAudiodecInitLibrary", .function = trace.wrap("sceAudiodecInitLibrary", &services.absent), .expect_id = "VjhsmxpcezI" },
+    .{ .name = "sceAudiodecTermLibrary", .function = trace.wrap("sceAudiodecTermLibrary", &services.absent), .expect_id = "h5jSB2QIDV0" },
+    .{ .name = "sceAudiodecDeleteDecoder", .function = trace.wrap("sceAudiodecDeleteDecoder", &services.absent), .expect_id = "Tp+ZEy69mLk" },
+    .{ .name = "sceAudiodecDecode", .function = trace.wrap("sceAudiodecDecode", &services.absent), .expect_id = "KHXHMDLkILw" },
+    .{ .name = "sceAudiodecClearContext", .function = trace.wrap("sceAudiodecClearContext", &services.absent), .expect_id = "6Vf9WTLDoss" },
+    .{ .name = "sceAudiodecCreateDecoder", .function = trace.wrap("sceAudiodecCreateDecoder", &services.absent), .expect_id = "O3f1sLMWRvs" },
 };
 
 pub const avplayer_exports = [_]symbols.Export{
@@ -379,16 +389,16 @@ pub const razorcpu_exports = [_]symbols.Export{
 };
 
 pub const playgo_exports = [_]symbols.Export{
-    .{ .name = "scePlayGoInitialize", .function = trace.wrap("scePlayGoInitialize", &services.absent), .expect_id = "ts6GlZOKRrE" },
-    .{ .name = "scePlayGoOpen", .function = trace.wrap("scePlayGoOpen", &services.absent), .expect_id = "M1Gma1ocrGE" },
-    .{ .name = "scePlayGoTerminate", .function = trace.wrap("scePlayGoTerminate", &services.absent), .expect_id = "MPe0EeBGM-E" },
-    .{ .name = "scePlayGoClose", .function = trace.wrap("scePlayGoClose", &services.absent), .expect_id = "Uco1I0dlDi8" },
-    .{ .name = "scePlayGoGetLocus", .function = trace.wrap("scePlayGoGetLocus", &services.absent), .expect_id = "uWIYLFkkwqk" },
-    .{ .name = "scePlayGoGetEta", .function = trace.wrap("scePlayGoGetEta", &services.absent), .expect_id = "v6EZ-YWRdMs" },
-    .{ .name = "scePlayGoGetProgress", .function = trace.wrap("scePlayGoGetProgress", &services.absent), .expect_id = "-RJWNMK3fC8" },
-    .{ .name = "scePlayGoSetInstallSpeed", .function = trace.wrap("scePlayGoSetInstallSpeed", &services.absent), .expect_id = "4AAcTU9R3XM" },
-    .{ .name = "scePlayGoPrefetch", .function = trace.wrap("scePlayGoPrefetch", &services.absent), .expect_id = "-Q1-u1a7p0g" },
-    .{ .name = "scePlayGoGetInstallSpeed", .function = trace.wrap("scePlayGoGetInstallSpeed", &services.absent), .expect_id = "rvBSfTimejE" },
+    .{ .name = "scePlayGoInitialize", .function = trace.wrap("scePlayGoInitialize", &playgo.initialize), .expect_id = "ts6GlZOKRrE" },
+    .{ .name = "scePlayGoOpen", .function = trace.wrap("scePlayGoOpen", &playgo.open), .expect_id = "M1Gma1ocrGE" },
+    .{ .name = "scePlayGoTerminate", .function = trace.wrap("scePlayGoTerminate", &playgo.terminate), .expect_id = "MPe0EeBGM-E" },
+    .{ .name = "scePlayGoClose", .function = trace.wrap("scePlayGoClose", &playgo.close), .expect_id = "Uco1I0dlDi8" },
+    .{ .name = "scePlayGoGetLocus", .function = trace.wrap("scePlayGoGetLocus", &playgo.getLocus), .expect_id = "uWIYLFkkwqk" },
+    .{ .name = "scePlayGoGetEta", .function = trace.wrap("scePlayGoGetEta", &playgo.getEta), .expect_id = "v6EZ-YWRdMs" },
+    .{ .name = "scePlayGoGetProgress", .function = trace.wrap("scePlayGoGetProgress", &playgo.getProgress), .expect_id = "-RJWNMK3fC8" },
+    .{ .name = "scePlayGoSetInstallSpeed", .function = trace.wrap("scePlayGoSetInstallSpeed", &playgo.setInstallSpeed), .expect_id = "4AAcTU9R3XM" },
+    .{ .name = "scePlayGoPrefetch", .function = trace.wrap("scePlayGoPrefetch", &playgo.prefetch), .expect_id = "-Q1-u1a7p0g" },
+    .{ .name = "scePlayGoGetInstallSpeed", .function = trace.wrap("scePlayGoGetInstallSpeed", &playgo.getInstallSpeed), .expect_id = "rvBSfTimejE" },
 };
 
 pub const playerinvitationdialog_exports = [_]symbols.Export{
@@ -427,6 +437,9 @@ pub const savedata_native_exports = [_]symbols.Export{
     .{ .name = "sceSaveDataPrepare", .function = trace.wrap("sceSaveDataPrepare", &services.absent), .expect_id = "sDCBrmc61XU" },
     .{ .name = "sceSaveDataCommit", .function = trace.wrap("sceSaveDataCommit", &services.absent), .expect_id = "ie7qhZ4X0Cc" },
     .{ .name = "sceSaveDataUmount2", .function = trace.wrap("sceSaveDataUmount2", &services.absent), .expect_id = "uW4vfTwMQVo" },
+    .{ .name = "sceSaveDataDirNameSearchPs4", .function = trace.wrap("sceSaveDataDirNameSearchPs4", &services.absent), .expect_id = "X4MYzukPc3g" },
+    .{ .name = "sceSaveDataTransferringMountPs4", .function = trace.wrap("sceSaveDataTransferringMountPs4", &services.absent), .expect_id = "RjMlsR8EXrw" },
+    .{ .name = "sceSaveDataSaveIconByPath", .function = trace.wrap("sceSaveDataSaveIconByPath", &services.absent), .expect_id = "Z7z6HXWORJY" },
 };
 
 pub const share_exports = [_]symbols.Export{
@@ -454,6 +467,19 @@ pub const voiceqos_exports = [_]symbols.Export{
     .{ .name = "sceVoiceQoSDisconnect", .function = trace.wrap("sceVoiceQoSDisconnect", &services.offline), .expect_id = "j9Xt85krooc" },
     .{ .name = "sceVoiceQoSInit", .function = trace.wrap("sceVoiceQoSInit", &services.offline), .expect_id = "U8IfNl6-Css" },
     .{ .name = "sceVoiceQoSEnd", .function = trace.wrap("sceVoiceQoSEnd", &services.offline), .expect_id = "ATRGkmbolVM" },
+};
+
+pub const videodec2_exports = [_]symbols.Export{
+    .{ .name = "sceVideodec2ReleaseComputeQueue", .function = trace.wrap("sceVideodec2ReleaseComputeQueue", &services.absent), .expect_id = "UvtA3FAiF4Y" },
+    .{ .name = "sceVideodec2Reset", .function = trace.wrap("sceVideodec2Reset", &services.absent), .expect_id = "wJXikG6QFN8" },
+    .{ .name = "sceVideodec2DeleteDecoder", .function = trace.wrap("sceVideodec2DeleteDecoder", &services.absent), .expect_id = "jwImxXRGSKA" },
+    .{ .name = "sceVideodec2QueryComputeMemoryInfo", .function = trace.wrap("sceVideodec2QueryComputeMemoryInfo", &services.absent), .expect_id = "RnDibcGCPKw" },
+    .{ .name = "sceVideodec2AllocateComputeQueue", .function = trace.wrap("sceVideodec2AllocateComputeQueue", &services.absent), .expect_id = "eD+X2SmxUt4" },
+    .{ .name = "sceVideodec2Decode", .function = trace.wrap("sceVideodec2Decode", &services.absent), .expect_id = "852F5+q6+iM" },
+    .{ .name = "sceVideodec2QueryDecoderMemoryInfo", .function = trace.wrap("sceVideodec2QueryDecoderMemoryInfo", &services.absent), .expect_id = "qqMCwlULR+E" },
+    .{ .name = "sceVideodec2GetPictureInfo", .function = trace.wrap("sceVideodec2GetPictureInfo", &services.absent), .expect_id = "NtXRa3dRzU0" },
+    .{ .name = "sceVideodec2CreateDecoder", .function = trace.wrap("sceVideodec2CreateDecoder", &services.absent), .expect_id = "CNNRoRYd8XI" },
+    .{ .name = "sceVideodec2Flush", .function = trace.wrap("sceVideodec2Flush", &services.absent), .expect_id = "l1hXwscLuCY" },
 };
 
 pub const vrtracker2_exports = [_]symbols.Export{
@@ -496,11 +522,15 @@ pub const http_extra_exports = [_]symbols.Export{
 
 pub const json2_extra_exports = [_]symbols.Export{
     .{ .name = "_ZN3sce4Json5Value11referObjectEv", .function = trace.wrap("_ZN3sce4Json5Value11referObjectEv", &services.absent), .expect_id = "-NxEk7XLkDY" },
+    .{ .name = "_ZN3sce4Json5Value3setERKNS0_6ObjectE", .function = trace.wrap("_ZN3sce4Json5Value3setERKNS0_6ObjectE", &services.absent), .expect_id = "dFCphqnd+a4" },
     .{ .name = "_ZN3sce4Json5ValueC1El", .function = trace.wrap("_ZN3sce4Json5ValueC1El", &services.absent), .expect_id = "0lLK8+kDqmE" },
+    .{ .name = "_ZN3sce4Json5ValueC1ERKNS0_5ArrayE", .function = trace.wrap("_ZN3sce4Json5ValueC1ERKNS0_5ArrayE", &services.absent), .expect_id = "iZeYfOxtMRg" },
     .{ .name = "_ZNK3sce4Json5Value7getRealEv", .function = trace.wrap("_ZNK3sce4Json5Value7getRealEv", &services.absent), .expect_id = "3qrge7L-AU4" },
     .{ .name = "_ZN3sce4Json5ValueC1ERKNS0_6ObjectE", .function = trace.wrap("_ZN3sce4Json5ValueC1ERKNS0_6ObjectE", &services.absent), .expect_id = "3xUXnmUkXfo" },
     .{ .name = "_ZN3sce4Json5ValueC1EPKc", .function = trace.wrap("_ZN3sce4Json5ValueC1EPKc", &services.absent), .expect_id = "b9V6fmppLXY" },
     .{ .name = "_ZNK3sce4Json5Array4backEv", .function = trace.wrap("_ZNK3sce4Json5Array4backEv", &services.absent), .expect_id = "bAM9Qwofus0" },
+    .{ .name = "_ZN3sce4Json5ArrayC1Ev", .function = trace.wrap("_ZN3sce4Json5ArrayC1Ev", &services.absent), .expect_id = "JP-PtKMiI1E" },
+    .{ .name = "_ZN3sce4Json5ArrayD1Ev", .function = trace.wrap("_ZN3sce4Json5ArrayD1Ev", &services.absent), .expect_id = "HJ8GpRT1aiw" },
     .{ .name = "_ZN3sce4Json6StringaSERKS1_", .function = trace.wrap("_ZN3sce4Json6StringaSERKS1_", &services.absent), .expect_id = "cn9svYGWKDQ" },
     .{ .name = "_ZNK3sce4Json5Value10getIntegerEv", .function = trace.wrap("_ZNK3sce4Json5Value10getIntegerEv", &services.absent), .expect_id = "DIxvoy7Ngvk" },
     .{ .name = "_ZNK3sce4Json6String6lengthEv", .function = trace.wrap("_ZNK3sce4Json6String6lengthEv", &services.absent), .expect_id = "EUH+EmT-v9E" },
@@ -537,6 +567,7 @@ pub const all = [_]Table{
     .{ .library = "libSceAgc", .module = "libSceAgc", .exports = &agc_exports },
     .{ .library = "libSceAjm", .module = "libSceAjm", .exports = &ajm_exports },
     .{ .library = "libSceAmpr", .module = "libSceAmpr", .exports = &ampr_exports },
+    .{ .library = "libSceAudiodec", .module = "libSceAudiodec", .exports = &audiodec_exports },
     .{ .library = "libSceAudioOut2", .module = "libSceAudioOut", .exports = &audioout2_exports },
     .{ .library = "libSceAvPlayer", .module = "libSceAvPlayer", .exports = &avplayer_exports },
     .{ .library = "libSceCoredump", .module = "libkernel", .exports = &coredump_exports },
@@ -567,6 +598,7 @@ pub const all = [_]Table{
     .{ .library = "libSceSaveData_native", .module = "libSceSaveData_native", .exports = &savedata_native_exports },
     .{ .library = "libSceShare", .module = "libSceShare", .exports = &share_exports },
     .{ .library = "libSceVideoOut", .module = "libSceVideoOut", .exports = &videoout_exports },
+    .{ .library = "libSceVideodec2", .module = "libSceVideodec2", .exports = &videodec2_exports },
     .{ .library = "libSceVoiceQoS", .module = "libSceVoiceQoS", .exports = &voiceqos_exports },
     .{ .library = "libSceVrTracker2", .module = "libSceVrTracker2", .exports = &vrtracker2_exports },
     .{ .library = "libSceWebBrowserDialog", .module = "libSceWebBrowserDialog", .exports = &webbrowserdialog_exports },

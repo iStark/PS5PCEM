@@ -294,6 +294,14 @@ fn netHtons(value: u16) callconv(abi.guest) u16 {
     return @byteSwap(value);
 }
 
+fn netSwap32(value: u32) callconv(abi.guest) u32 {
+    return @byteSwap(value);
+}
+
+fn netSwap64(value: u64) callconv(abi.guest) u64 {
+    return @byteSwap(value);
+}
+
 fn netInetPton(family: i32, text: ?[*:0]const u8, output: ?[*]u8) callconv(abi.guest) i32 {
     if (family != 2) return setNetError(net_error_invalid_argument);
     const source = text orelse return setNetError(net_error_invalid_argument);
@@ -336,6 +344,11 @@ const net_exports = [_]symbols.Export{
     .{ .name = "sceNetEpollWait", .function = trace.wrap("sceNetEpollWait", &netEpollWait), .expect_id = "drjIbDbA7UQ" },
     .{ .name = "sceNetEpollDestroy", .function = trace.wrap("sceNetEpollDestroy", &netEpollDestroy), .expect_id = "Inp1lfL+Jdw" },
     .{ .name = "sceNetHtons", .function = trace.wrap("sceNetHtons", &netHtons), .expect_id = "iWQWrwiSt8A" },
+    .{ .name = "sceNetHtonl", .function = trace.wrap("sceNetHtonl", &netSwap32), .expect_id = "9T2pDF2Ryqg" },
+    .{ .name = "sceNetNtohl", .function = trace.wrap("sceNetNtohl", &netSwap32), .expect_id = "pQGpHYopAIY" },
+    .{ .name = "sceNetNtohs", .function = trace.wrap("sceNetNtohs", &netHtons), .expect_id = "Rbvt+5Y2iEw" },
+    .{ .name = "sceNetHtonll", .function = trace.wrap("sceNetHtonll", &netSwap64), .expect_id = "3CHi1K1wsCQ" },
+    .{ .name = "sceNetNtohll", .function = trace.wrap("sceNetNtohll", &netSwap64), .expect_id = "tOrRi-v3AOM" },
     .{ .name = "sceNetInetPton", .function = trace.wrap("sceNetInetPton", &netInetPton), .expect_id = "8Kcp5d-q1Uo" },
 };
 

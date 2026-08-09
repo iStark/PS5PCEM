@@ -2630,7 +2630,7 @@ test "swizzled V# addressing lowers index_stride permutation" {
 
 test "unsupported shader semantics never produce placeholder SPIR-V" {
     const decoder = @import("decoder.zig");
-    const code = [_]u32{ 0xf404_0201, 0, 0xbf81_0000 };
+    const code = [_]u32{ 0xbe80_0200, 0xbf81_0000 }; // unsupported SOP1 opcode 0x02
     var program = try decoder.decodeProgram(std.testing.allocator, &code);
     defer program.deinit(std.testing.allocator);
     try std.testing.expectError(Error.UnsupportedOpcode, translate(std.testing.allocator, &program, .{ .stage = .compute }));
@@ -2658,15 +2658,15 @@ test "forward scalar selection lowers with a structured merge and register phi" 
     try std.testing.expect(containsOpcode(module.words, 245)); // OpPhi
 }
 
-test "back edges remain explicit until loop structuring is implemented" {
+test "back edges use the linear fallback until loop structuring is implemented" {
     const decoder = @import("decoder.zig");
     const code = [_]u32{ 0xbf80_0000, 0xbf82_fffe, 0xbf81_0000 };
     var program = try decoder.decodeProgram(std.testing.allocator, &code);
     defer program.deinit(std.testing.allocator);
-    try std.testing.expectError(
-        Error.UnsupportedControlFlow,
-        translate(std.testing.allocator, &program, .{ .stage = .compute }),
-    );
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .compute });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(!containsOpcode(module.words, 246)); // OpLoopMerge
+    try std.testing.expect(containsOpcode(module.words, 253)); // OpReturn
 }
 
 test "full destination SDWA lowers source extraction before vector ALU" {

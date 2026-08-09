@@ -331,7 +331,18 @@ pub fn isGuestRangeAccessible(address: u64, length: u64) bool {
     pool_lock.lock();
     defer pool_lock.unlock();
     const address_space = guest_address_space orelse return true;
-    return address_space.isMapped(address, length);
+    // AddressSpace mappings include virtual reservations so firmware queries
+    // can report them. They are not safe native pointers until pages are
+    // committed with CPU access; treating a reserve as readable turns a bad
+    // guest descriptor into a host-side memcpy access violation.
+    if (address_space.isReadable(address, length)) return true;
+
+    // Native guest code also receives allocations from the Windows CRT. Those
+    // pages are not AddressSpace mappings and can sit in a hole covered by the
+    // title's logical VA reservation. Accept only ranges VirtualQuery proves
+    // are committed and CPU-readable; an untouched placeholder/reserve still
+    // fails this check.
+    return memory.isHostRangeReadable(address, length);
 }
 
 pub fn deinit() void {
@@ -466,8 +477,11 @@ const prot_gpu_read: i32 = 0x10;
 const prot_gpu_write: i32 = 0x20;
 const prot_ampr_read: i32 = 0x40;
 const prot_ampr_write: i32 = 0x80;
+const prot_acp_read: i32 = 0x100;
+const prot_acp_write: i32 = 0x200;
 const supported_protection_bits: i32 = prot_cpu_read | prot_cpu_write | prot_cpu_execute |
-    prot_gpu_read | prot_gpu_write | prot_ampr_read | prot_ampr_write;
+    prot_gpu_read | prot_gpu_write | prot_ampr_read | prot_ampr_write |
+    prot_acp_read | prot_acp_write;
 
 fn decodeProtection(bits: i32) ?memory.Protection {
     if (bits & ~supported_protection_bits != 0) return null;
@@ -950,12 +964,15 @@ fn batchMapCore(
     const entries_size = std.math.mul(u64, count, @sizeOf(BatchMapEntry)) catch
         return KernelError.einval.raw();
     if (entries_size != 0 and
-        !isGuestRangeAccessible(@intFromPtr(entries), entries_size))
+        !isGuestRangeAccessible(@intFromPtr(entries), entries_size) and
+        !memory.isHostRangeReadable(@intFromPtr(entries), entries_size))
     {
         return KernelError.efault.raw();
     }
     if (processed_pointer) |processed| {
-        if (!isGuestRangeAccessible(@intFromPtr(processed), @sizeOf(i32))) {
+        if (!isGuestRangeAccessible(@intFromPtr(processed), @sizeOf(i32)) and
+            !memory.isHostRangeWritable(@intFromPtr(processed), @sizeOf(i32)))
+        {
             return KernelError.efault.raw();
         }
         processed.* = 0;
@@ -1228,8 +1245,22 @@ fn sceKernelReserveVirtualRange(
             return mapAddressSpaceError(err);
         break :fixed requested_address;
     } else first_fit: {
-        const hint = if (requested_address == 0) default_map_search_base else requested_address;
-        const area: memory.Area = if (hint >= memory.user.start) .user else .system_managed;
+        // A null hint normally starts in the compact system-managed window,
+        // but Unreal reserves a 512 GiB address arena during libc startup.
+        // Such a request cannot fit below the user boundary and must start in
+        // the title-controlled window just as an explicit user hint would.
+        const fits_system_window = len <= memory.system_managed.end - default_map_search_base;
+        const area: memory.Area = if (requested_address >= memory.user.start or
+            (requested_address == 0 and !fits_system_window))
+            .user
+        else
+            .system_managed;
+        const hint = if (requested_address != 0)
+            requested_address
+        else if (area == .user)
+            memory.user.start
+        else
+            default_map_search_base;
         break :first_fit address_space.reserve(
             area,
             hint,
@@ -1451,7 +1482,8 @@ test "guest GPU protection does not grant native CPU access" {
 test "guest AMPR protection is accepted without granting native CPU access" {
     const protection = decodeProtection(prot_ampr_read | prot_ampr_write).?;
     try testing.expectEqual(memory.Protection.none, protection);
-    try testing.expect(decodeProtection(0x100) == null);
+    try testing.expect(decodeProtection(prot_cpu_write | prot_acp_read | prot_acp_write) != null);
+    try testing.expect(decodeProtection(0x400) == null);
 }
 
 test "reservations are aligned and do not overlap" {
@@ -2039,6 +2071,22 @@ test "large hinted user reservation leaves room for a later window" {
         sceKernelReserveVirtualRange(&window, window_size, 0, page_size),
     );
     try testing.expect(window >= arena + arena_size);
+}
+
+test "large unhinted reservation is placed in the user window" {
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+
+    init(testing.allocator);
+    defer deinit();
+    attachAddressSpace(&address_space);
+
+    var arena: u64 = 0;
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelReserveVirtualRange(&arena, 0x80_0000_0000, 0, 0x20_0000),
+    );
+    try testing.expectEqual(memory.user.start, arena);
 }
 
 test "a query reports what a range is and whether it is committed" {

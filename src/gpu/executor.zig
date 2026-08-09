@@ -529,6 +529,14 @@ pub const DcbExecutor = struct {
             const value = std.mem.readInt(u32, pair[4..8], .little);
             if (raw_offset == std.math.maxInt(u32)) continue;
             const offset = normalizeIndirectOffset(space, raw_offset);
+            // AGC register lists can carry generation-specific extension and
+            // pseudo-register selectors alongside ordinary hardware state.
+            // They do not fit the architectural register files we retain and
+            // are intentionally skipped by real-world Gen5 command processors;
+            // rejecting one here would discard every later draw and flip.
+            if (!indirectOffsetTracked(space, offset)) {
+                continue;
+            }
             try self.state.writeRegister(space, offset, value);
         }
     }
@@ -827,6 +835,15 @@ fn normalizeIndirectOffset(space: pm4.RegisterSpace, raw: u32) u32 {
     return offset;
 }
 
+fn indirectOffsetTracked(space: pm4.RegisterSpace, offset: u32) bool {
+    return offset < switch (space) {
+        .config => configCount(),
+        .context => 0x400,
+        .shader => 0x300,
+        .uconfig => 0x4000,
+    };
+}
+
 fn units256(low: u32, high: u32, high_bits: u6) u64 {
     const mask = if (high_bits == 32) std.math.maxInt(u32) else (@as(u32, 1) << @intCast(high_bits)) - 1;
     return ((@as(u64, high & mask) << 32) | low) << 8;
@@ -960,6 +977,27 @@ test "direct and Gen5 indirect register packets share persistent state" {
     try testing.expectEqual(@as(?u32, 0x1357_2468), state.readRegister(.context, 0x193));
     try testing.expectEqual(@as(?u32, 0x3333), state.readRegister(.uconfig, 7));
     try testing.expectEqual(@as(?u32, 0xcafe_babe), state.readRegister(.uconfig, 8));
+}
+
+test "Gen5 indirect lists skip untracked extension registers" {
+    var host = FakeBackend{};
+    std.mem.writeInt(u32, host.memory[0..4], 0x400, .little);
+    std.mem.writeInt(u32, host.memory[4..8], 0xdead_beef, .little);
+    std.mem.writeInt(u32, host.memory[8..12], 0x21, .little);
+    std.mem.writeInt(u32, host.memory[12..16], 0x1234_5678, .little);
+    const stream = [_]u32{
+        command(pm4.set_context_reg_indirect, 4),
+        0x1000,
+        0,
+        0x8000_0000,
+        2,
+    };
+    var state = gpu_state.State{};
+    var executor = DcbExecutor{ .state = &state, .backend = host.interface() };
+    const result = try executor.execute(&stream);
+
+    try testing.expectEqual(Status.complete, result.status);
+    try testing.expectEqual(@as(?u32, 0x1234_5678), state.readRegister(.context, 0x21));
 }
 
 test "write data and release memory publish values seen by a wait" {

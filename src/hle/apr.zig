@@ -59,6 +59,13 @@ pub const ReadCommand = struct {
     file_offset: u64,
 };
 
+pub const CommandBufferInfo = struct {
+    storage_address: u64,
+    storage_size: usize,
+    write_offset: usize,
+    command_count: usize,
+};
+
 pub const CompletionCommand = struct {
     queue_handle: i64,
     ident: u64,
@@ -214,6 +221,18 @@ pub fn resetCommandBuffer(address: u64) Error!void {
     const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
     buffer.read_count = 0;
     buffer.completion_count = 0;
+}
+
+pub fn commandBufferInfo(address: u64) Error!CommandBufferInfo {
+    lock.lock();
+    defer lock.unlock();
+    const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
+    return .{
+        .storage_address = buffer.storage_address,
+        .storage_size = buffer.storage_size,
+        .write_offset = (buffer.read_count + buffer.completion_count) * 0x30,
+        .command_count = buffer.read_count + buffer.completion_count,
+    };
 }
 
 pub fn appendRead(address: u64, command: ReadCommand) Error!void {

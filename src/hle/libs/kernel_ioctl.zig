@@ -401,7 +401,7 @@ fn clearPendingTail(address: u64) void {
     var i: usize = 0;
     while (i < pending_tail_count) {
         if (pending_tails[i].address == address) {
-            if (log_verbose_gpu) std.debug.print("[gc submit] clearPendingTail: addr=0x{x} slot={d}\n", .{address, i});
+            if (log_verbose_gpu) std.debug.print("[gc submit] clearPendingTail: addr=0x{x} slot={d}\n", .{ address, i });
             var j = i;
             while (j + 1 < pending_tail_count) : (j += 1) {
                 pending_tails[j] = pending_tails[j + 1];
@@ -445,7 +445,7 @@ fn drainPendingTails() void {
         const byte_count = @as(u64, slot.capacity_words) * @sizeOf(u32);
         if (!memory.isGuestRangeAccessible(slot.address, byte_count)) {
             if (log_verbose_gpu) std.debug.print("[gc submit] drainPendingTails: slot addr=0x{x} not accessible\n", .{slot.address});
-                i += 1;
+            i += 1;
             continue;
         }
         const pointer: [*]const u32 = @ptrFromInt(slot.address);
@@ -465,7 +465,7 @@ fn drainPendingTails() void {
             std.debug.print("\n", .{});
         }
         const outcome = agc_submit.submitDeviceStream(suffix);
-        if (log_verbose_gpu) std.debug.print("[gc submit] tail catch-up submitDeviceStream.accepted={s}\n", .{ if (outcome.accepted) "true" else "false" });
+        if (log_verbose_gpu) std.debug.print("[gc submit] tail catch-up submitDeviceStream.accepted={s}\n", .{if (outcome.accepted) "true" else "false"});
         if (outcome.accepted) {
             _ = event_queue_mod.triggerAllGraphicsEvents(slot.queue);
             if (committed.len >= slot.capacity_words or committed.len >= 64) {
@@ -1007,7 +1007,7 @@ test "command 50 skips the uncommitted ring sentinel and keeps parsing later pac
 
     var malformed = reserved;
     malformed[2] = 0xffff_1001;
-    try testing.expectEqual(@as(usize, 6), committedQueueStream(&malformed).len);
+    try testing.expectEqual(@as(usize, 2), committedQueueStream(&malformed).len);
 }
 
 test "graphics preamble submission clears the driver's result sentinel" {

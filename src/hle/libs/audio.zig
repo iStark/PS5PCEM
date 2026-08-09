@@ -617,6 +617,15 @@ fn audioOut2UserDestroy(user: usize) callconv(abi.guest) i32 {
     return if (releaseAudioObject(user, .user)) errno.ok else audio_out2_error_invalid_parameter;
 }
 
+fn audioOut2GetSpeakerInfo(output: ?*[0x20]u8, _: u32) callconv(abi.guest) i32 {
+    const info = output orelse return audio_out2_error_invalid_parameter;
+    @memset(info, 0);
+    std.mem.writeInt(u32, info[0x00..0x04], 2, .little); // stereo
+    std.mem.writeInt(u32, info[0x04..0x08], 48_000, .little);
+    std.mem.writeInt(u16, info[0x08..0x0a], 1, .little); // connected primary output
+    return errno.ok;
+}
+
 const audio_out2_exports = [_]symbols.Export{
     .{ .name = "sceAudioOut2Initialize", .function = trace.wrap("sceAudioOut2Initialize", &audioOut2Initialize), .expect_id = "g2tViFIohHE" },
     .{ .name = "sceAudioOut2ContextResetParam", .function = trace.wrap("sceAudioOut2ContextResetParam", &audioOut2ContextResetParam), .expect_id = "t5YrizufpQc" },
@@ -631,6 +640,7 @@ const audio_out2_exports = [_]symbols.Export{
     .{ .name = "sceAudioOut2PortSetAttributes", .function = trace.wrap("sceAudioOut2PortSetAttributes", &audioOut2PortSetAttributes), .expect_id = "8XTArSPyWHk" },
     .{ .name = "sceAudioOut2UserCreate", .function = trace.wrap("sceAudioOut2UserCreate", &audioOut2UserCreate), .expect_id = "xywYcRB7nbQ" },
     .{ .name = "sceAudioOut2UserDestroy", .function = trace.wrap("sceAudioOut2UserDestroy", &audioOut2UserDestroy), .expect_id = "IaZXJ9M79uo" },
+    .{ .name = "sceAudioOut2GetSpeakerInfo", .function = trace.wrap("sceAudioOut2GetSpeakerInfo", &audioOut2GetSpeakerInfo), .expect_id = "DImz2Ft9E2g" },
 };
 
 // libSceAjm ---------------------------------------------------------------
@@ -660,6 +670,11 @@ const AjmDecodeResult = extern struct {
     total_decoded_samples: u64 = 0,
     number_of_frames: u32 = 0,
     reserved: u32 = 0,
+};
+
+const AjmBuffer = extern struct {
+    address: ?[*]u8 = null,
+    size: usize = 0,
 };
 
 const AjmInstance = struct {
@@ -862,6 +877,67 @@ fn ajmBatchJobDecode(
     return appendAjmJob(info, 64);
 }
 
+fn ajmBatchJobDecodeSplit(
+    info: ?*AjmBatchInfo,
+    instance: u32,
+    _: ?[*]const AjmBuffer,
+    input_count: usize,
+    output_buffers: ?[*]const AjmBuffer,
+    output_count: usize,
+    result: ?*AjmDecodeResult,
+) callconv(abi.guest) i32 {
+    const valid = isAjmInstance(instance);
+    var produced: usize = 0;
+    if (output_buffers) |buffers| {
+        for (buffers[0..@min(output_count, 4096)]) |buffer| {
+            const output = buffer.address orelse continue;
+            const size = @min(buffer.size, 64 * 1024 * 1024);
+            if (kernel_memory.isGuestRangeAccessible(@intFromPtr(output), size)) {
+                @memset(output[0..size], 0);
+                produced = std.math.add(usize, produced, size) catch std.math.maxInt(usize);
+            }
+        }
+    }
+    if (result) |output| {
+        output.* = .{
+            .result = if (valid) 0 else ajm_result_invalid_parameter,
+            .size_consumed = 0,
+            .size_produced = std.math.cast(i32, produced) orelse std.math.maxInt(i32),
+            .number_of_frames = if (valid and (input_count != 0 or produced != 0)) 1 else 0,
+        };
+    }
+    const buffer_count = std.math.add(usize, input_count, output_count) catch return ajm_error_job_creation;
+    const buffer_bytes = std.math.mul(usize, buffer_count, 16) catch return ajm_error_job_creation;
+    const job_size = std.math.add(usize, buffer_bytes, 32) catch return ajm_error_job_creation;
+    return appendAjmJob(info, job_size);
+}
+
+fn ajmBatchJobSetResampleParametersEx(
+    info: ?*AjmBatchInfo,
+    instance: u32,
+    _: f32,
+    _: f32,
+    _: u32,
+    result: ?[*]u8,
+) callconv(abi.guest) i32 {
+    zeroAjmResult(result, 8, isAjmInstance(instance));
+    return appendAjmJob(info, 72);
+}
+
+fn ajmBatchJobGetResampleInfo(info: ?*AjmBatchInfo, instance: u32, result: ?[*]u8) callconv(abi.guest) i32 {
+    zeroAjmResult(result, 48, isAjmInstance(instance));
+    if (result) |output| {
+        var unity: f32 = 1.0;
+        @memcpy(output[8..12], std.mem.asBytes(&unity));
+    }
+    return appendAjmJob(info, 64);
+}
+
+fn ajmBatchJobGetStatistics(info: ?*AjmBatchInfo, _: f32, result: ?[*]u8) callconv(abi.guest) i32 {
+    if (result) |output| @memset(output[0..48], 0);
+    return appendAjmJob(info, 88);
+}
+
 const ajm_exports = [_]symbols.Export{
     .{ .name = "sceAjmInitialize", .function = trace.wrap("sceAjmInitialize", &ajmInitialize), .expect_id = "dl+4eHSzUu4" },
     .{ .name = "sceAjmFinalize", .function = trace.wrap("sceAjmFinalize", &ajmFinalize), .expect_id = "MHur6qCsUus" },
@@ -878,6 +954,10 @@ const ajm_exports = [_]symbols.Export{
     .{ .name = "sceAjmBatchJobGetCodecInfo", .function = trace.wrap("sceAjmBatchJobGetCodecInfo", &ajmBatchJobGetCodecInfo), .expect_id = "uSrXaxT+oPQ" },
     .{ .name = "sceAjmBatchJobSetGaplessDecode", .function = trace.wrap("sceAjmBatchJobSetGaplessDecode", &ajmBatchJobSetGaplessDecode), .expect_id = "SkEwpiu3tZg" },
     .{ .name = "sceAjmBatchJobDecode", .function = trace.wrap("sceAjmBatchJobDecode", &ajmBatchJobDecode), .expect_id = "39WxhR-ePew" },
+    .{ .name = "sceAjmBatchJobDecodeSplit", .function = trace.wrap("sceAjmBatchJobDecodeSplit", &ajmBatchJobDecodeSplit), .expect_id = "SJ3i0DXP8vg" },
+    .{ .name = "sceAjmBatchJobSetResampleParametersEx", .function = trace.wrap("sceAjmBatchJobSetResampleParametersEx", &ajmBatchJobSetResampleParametersEx), .expect_id = "5ldnD16rYZw" },
+    .{ .name = "sceAjmBatchJobGetResampleInfo", .function = trace.wrap("sceAjmBatchJobGetResampleInfo", &ajmBatchJobGetResampleInfo), .expect_id = "JkdNCocpu1M" },
+    .{ .name = "sceAjmBatchJobGetStatistics", .function = trace.wrap("sceAjmBatchJobGetStatistics", &ajmBatchJobGetStatistics), .expect_id = "3cAg7xN995U" },
 };
 
 pub fn reset() void {

@@ -33,7 +33,23 @@ pub const PumpReport = struct {
 
 const Submission = struct {
     words: []u32,
+    snapshots: std.ArrayList(Snapshot) = .empty,
     continuation: ?executor.Continuation = null,
+
+    fn deinit(self: *Submission, allocator: std.mem.Allocator) void {
+        allocator.free(self.words);
+        for (self.snapshots.items) |snapshot| allocator.free(snapshot.words);
+        self.snapshots.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+/// Guest ranges referenced by a command stream must live as long as the root
+/// DCB. AGC is free to recycle both indirect command buffers and indirect
+/// register lists immediately after submit returns.
+const Snapshot = struct {
+    address: u64,
+    words: []u32,
 };
 
 const Queue = struct {
@@ -77,12 +93,13 @@ pub const Scheduler = struct {
     }
 
     /// Owns a copy immediately: AGC may recycle the caller's command arena as
-    /// soon as submit returns, while a blocked queue must retain its root DCB.
+    /// soon as submit returns, while a blocked queue must retain its root DCB
+    /// and every indirect command/register buffer reachable from it.
     pub fn submit(self: *Scheduler, kind: QueueKind, stream: []const u32) Error!PumpReport {
         if (stream.len == 0) return Error.InvalidPacket;
-        const words = try self.allocator.dupe(u32, stream);
-        self.queueFor(kind).pending.append(self.allocator, .{ .words = words }) catch |err| {
-            self.allocator.free(words);
+        var submission = try self.copySubmission(stream);
+        self.queueFor(kind).pending.append(self.allocator, submission) catch |err| {
+            submission.deinit(self.allocator);
             return err;
         };
         return self.pump();
@@ -125,9 +142,14 @@ pub const Scheduler = struct {
         }
 
         const active = &queue.active.?;
+        var snapshot_backend = SnapshotBackend{
+            .original = self.backend,
+            .snapshots = active.snapshots.items,
+        };
+        var snapshot_vtable = snapshot_backend.makeVtable();
         var dcb_executor = executor.DcbExecutor{
             .state = &queue.state,
-            .backend = self.backend,
+            .backend = .{ .context = &snapshot_backend, .vtable = &snapshot_vtable },
             .allocator = self.allocator,
         };
         const result = (if (active.continuation) |resume_point|
@@ -148,16 +170,119 @@ pub const Scheduler = struct {
     }
 
     fn discardActive(self: *Scheduler, queue: *Queue) void {
-        const finished = queue.active orelse return;
+        var finished = queue.active orelse return;
         queue.active = null;
-        self.allocator.free(finished.words);
+        finished.deinit(self.allocator);
     }
 
     fn deinitQueue(self: *Scheduler, queue: *Queue) void {
         self.discardActive(queue);
-        for (queue.pending.items) |submission| self.allocator.free(submission.words);
+        for (queue.pending.items) |*submission| submission.deinit(self.allocator);
         queue.pending.deinit(self.allocator);
         queue.pending = .empty;
+    }
+
+    fn copySubmission(self: *Scheduler, stream: []const u32) Error!Submission {
+        var submission = Submission{ .words = try self.allocator.dupe(u32, stream) };
+        errdefer submission.deinit(self.allocator);
+
+        var active_addresses: [executor.maximum_stream_depth]u64 = undefined;
+        try self.snapshotStream(&submission, submission.words, 0, &active_addresses);
+        return submission;
+    }
+
+    fn snapshotStream(
+        self: *Scheduler,
+        submission: *Submission,
+        stream: []const u32,
+        depth: usize,
+        active_addresses: *[executor.maximum_stream_depth]u64,
+    ) Error!void {
+        var walker = pm4.Walker.init(stream);
+        while (try walker.next()) |packet| {
+            if (pm4.indirectRegisterSpaceOf(packet.opcode) != null and packet.body.len == 4) {
+                const address = (@as(u64, packet.body[1]) << 32) | (packet.body[0] & 0xffff_fffc);
+                const count: usize = packet.body[3] & 0x3fff;
+                if (address != 0 and count != 0) {
+                    const word_count = std.math.mul(usize, count, 2) catch return Error.InvalidPacket;
+                    _ = try self.captureWords(submission, address, word_count);
+                }
+            } else if (pm4.customCode(packet)) |code| {
+                const is_indirect_registers = code == pm4.custom.context_regs_indirect or
+                    code == pm4.custom.sh_regs_indirect or
+                    code == pm4.custom.uconfig_regs_indirect;
+                if (is_indirect_registers and packet.body.len >= 3) {
+                    const address = (@as(u64, packet.body[2]) << 32) | (packet.body[1] & 0xffff_fffc);
+                    const count: usize = packet.body[0] & 0x3fff;
+                    if (address != 0 and count != 0) {
+                        const word_count = std.math.mul(usize, count, 2) catch return Error.InvalidPacket;
+                        _ = try self.captureWords(submission, address, word_count);
+                    }
+                }
+            }
+
+            if (packet.kind != .command or packet.opcode != pm4.indirect_buffer) continue;
+            if (packet.body.len == 3) {
+                const address = (@as(u64, packet.body[1]) << 32) | packet.body[0];
+                const word_count: usize = packet.body[2] & 0x000f_ffff;
+                try self.snapshotIndirectStream(submission, address, word_count, depth, active_addresses);
+            } else if (packet.body.len == 13) {
+                const then_address = (@as(u64, packet.body[8]) << 32) | packet.body[7];
+                const then_count: usize = packet.body[9] & 0x000f_ffff;
+                try self.snapshotIndirectStream(submission, then_address, then_count, depth, active_addresses);
+
+                const else_address = (@as(u64, packet.body[11]) << 32) | packet.body[10];
+                const else_count: usize = packet.body[12] & 0x000f_ffff;
+                try self.snapshotIndirectStream(submission, else_address, else_count, depth, active_addresses);
+            }
+        }
+    }
+
+    fn snapshotIndirectStream(
+        self: *Scheduler,
+        submission: *Submission,
+        address: u64,
+        word_count: usize,
+        depth: usize,
+        active_addresses: *[executor.maximum_stream_depth]u64,
+    ) Error!void {
+        if (address == 0 or address & 0x3 != 0 or word_count == 0) return;
+        if (depth + 1 >= executor.maximum_stream_depth) return;
+        for (active_addresses[0..depth]) |active| {
+            if (active == address) return;
+        }
+
+        const child = try self.captureWords(submission, address, word_count);
+        active_addresses[depth] = address;
+        try self.snapshotStream(submission, child, depth + 1, active_addresses);
+    }
+
+    fn captureWords(
+        self: *Scheduler,
+        submission: *Submission,
+        address: u64,
+        word_count: usize,
+    ) Error![]const u32 {
+        const byte_count = std.math.mul(usize, word_count, @sizeOf(u32)) catch return Error.InvalidPacket;
+        const requested_end = std.math.add(u64, address, byte_count) catch return Error.InvalidPacket;
+
+        for (submission.snapshots.items) |snapshot| {
+            if (address < snapshot.address) continue;
+            const snapshot_bytes = std.mem.sliceAsBytes(snapshot.words);
+            const snapshot_end = std.math.add(u64, snapshot.address, snapshot_bytes.len) catch continue;
+            if (requested_end > snapshot_end) continue;
+            const offset: usize = @intCast(address - snapshot.address);
+            if (offset & 0x3 != 0) return Error.InvalidPacket;
+            return snapshot.words[offset / 4 ..][0..word_count];
+        }
+
+        const words = try self.allocator.alloc(u32, word_count);
+        errdefer self.allocator.free(words);
+        if (!self.backend.vtable.read(self.backend.context, address, std.mem.sliceAsBytes(words))) {
+            return Error.MemoryReadFailed;
+        }
+        try submission.snapshots.append(self.allocator, .{ .address = address, .words = words });
+        return words;
     }
 
     fn queueFor(self: *Scheduler, kind: QueueKind) *Queue {
@@ -172,6 +297,92 @@ pub const Scheduler = struct {
             .graphics => &self.graphics,
             .compute => &self.compute,
         };
+    }
+};
+
+/// Presents immutable submission snapshots at their original guest addresses
+/// while forwarding every other operation to the live renderer/backend.
+const SnapshotBackend = struct {
+    original: executor.Backend,
+    snapshots: []const Snapshot,
+
+    fn from(context: ?*anyopaque) *SnapshotBackend {
+        return @ptrCast(@alignCast(context.?));
+    }
+
+    fn makeVtable(self: *const SnapshotBackend) executor.Backend.VTable {
+        return .{
+            .read = read,
+            .write = write,
+            .acquire = if (self.original.vtable.acquire != null) acquire else null,
+            .release = if (self.original.vtable.release != null) release else null,
+            .wait = if (self.original.vtable.wait != null) wait else null,
+            .write_data = if (self.original.vtable.write_data != null) writeData else null,
+            .event = if (self.original.vtable.event != null) event else null,
+            .flip = if (self.original.vtable.flip != null) flip else null,
+            .draw = if (self.original.vtable.draw != null) draw else null,
+            .dispatch = if (self.original.vtable.dispatch != null) dispatch else null,
+        };
+    }
+
+    fn read(context: ?*anyopaque, address: u64, bytes: []u8) bool {
+        const self = from(context);
+        for (self.snapshots) |snapshot| {
+            if (address < snapshot.address) continue;
+            const source = std.mem.sliceAsBytes(snapshot.words);
+            const offset64 = address - snapshot.address;
+            if (offset64 > source.len) continue;
+            const offset: usize = @intCast(offset64);
+            if (bytes.len > source.len - offset) continue;
+            @memcpy(bytes, source[offset..][0..bytes.len]);
+            return true;
+        }
+        return self.original.vtable.read(self.original.context, address, bytes);
+    }
+
+    fn write(context: ?*anyopaque, address: u64, bytes: []const u8) bool {
+        const self = from(context);
+        return self.original.vtable.write(self.original.context, address, bytes);
+    }
+
+    fn acquire(context: ?*anyopaque, value: gpu_state.AcquireMem) bool {
+        const self = from(context);
+        return self.original.vtable.acquire.?(self.original.context, value);
+    }
+
+    fn release(context: ?*anyopaque, value: gpu_state.ReleaseMem) bool {
+        const self = from(context);
+        return self.original.vtable.release.?(self.original.context, value);
+    }
+
+    fn wait(context: ?*anyopaque, value: gpu_state.WaitRegMem, satisfied: bool) bool {
+        const self = from(context);
+        return self.original.vtable.wait.?(self.original.context, value, satisfied);
+    }
+
+    fn writeData(context: ?*anyopaque, value: gpu_state.WriteData, words: []const u32) bool {
+        const self = from(context);
+        return self.original.vtable.write_data.?(self.original.context, value, words);
+    }
+
+    fn event(context: ?*anyopaque, value: gpu_state.EventWrite) bool {
+        const self = from(context);
+        return self.original.vtable.event.?(self.original.context, value);
+    }
+
+    fn flip(context: ?*anyopaque, value: gpu_state.Flip) bool {
+        const self = from(context);
+        return self.original.vtable.flip.?(self.original.context, value);
+    }
+
+    fn draw(context: ?*anyopaque, state: *const gpu_state.State, packet: pm4.Packet) bool {
+        const self = from(context);
+        return self.original.vtable.draw.?(self.original.context, state, packet);
+    }
+
+    fn dispatch(context: ?*anyopaque, state: *const gpu_state.State, packet: pm4.Packet) bool {
+        const self = from(context);
+        return self.original.vtable.dispatch.?(self.original.context, state, packet);
     }
 };
 
@@ -252,10 +463,13 @@ test "release on compute resumes graphics and drains its FIFO without replay" {
         customCommand(pm4.custom.wait_mem_32, 6), 0x1080,
         0,                                        0xffff_ffff,
         1,                                        0x13,
-        1,                                        command(pm4.event_write, 1),
-        0x21,
+        1,                                        command(pm4.set_context_reg_indirect, 4),
+        0x1180,                                   0,
+        0,                                        1,
+        command(pm4.event_write, 1),              0x21,
     };
     host.putWords(0x1100, &child);
+    host.putWords(0x1180, &.{ 0x318, 0x1234_5678 });
     var graphics = [_]u32{
         command(pm4.indirect_buffer, 3), 0x1100, 0, 0x0f20_0000 | child.len,
     };
@@ -282,8 +496,11 @@ test "release on compute resumes graphics and drains its FIFO without replay" {
     try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, host.memory[0x80..0x84], .little));
 
     // The scheduler owns the root DCB; recycling the caller's words cannot
-    // redirect the saved indirect continuation.
+    // redirect the saved indirect continuation. The child command buffer and
+    // its indirect register list are equally immutable after submission.
     graphics[1] = 0x11c0;
+    host.putWords(0x1100 + (child.len - 1) * 4, &.{0x7f});
+    host.putWords(0x1180, &.{ 0x318, 0xdead_beef });
     _ = try scheduler.submit(.graphics, &queued_graphics);
     try testing.expectEqual(@as(usize, 1), scheduler.pendingCount(.graphics));
 
@@ -292,6 +509,10 @@ test "release on compute resumes graphics and drains its FIFO without replay" {
     try testing.expect(!scheduler.isBlocked(.graphics));
     try testing.expectEqual(@as(usize, 0), scheduler.pendingCount(.graphics));
     try testing.expectEqualSlices(u8, &.{ 0x20, 0x21, 0x22 }, host.events[0..host.event_count]);
+    try testing.expectEqual(
+        @as(?u32, 0x1234_5678),
+        scheduler.state(.graphics).readRegister(.context, 0x318),
+    );
     try testing.expectEqual(@as(u64, 3), scheduler.state(.graphics).event_count);
     try testing.expectEqual(@as(u64, 1), scheduler.state(.compute).release_count);
     try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, host.memory[0x80..0x84], .little));

@@ -107,6 +107,7 @@ pub fn count() u64 {
 }
 
 var live = std.atomic.Value(bool).init(false);
+var live_failures_only = std.atomic.Value(bool).init(false);
 
 /// Also writes every call to standard error as it happens.
 ///
@@ -116,6 +117,13 @@ var live = std.atomic.Value(bool).init(false);
 /// far too noisy to leave on.
 pub fn setLive(value: bool) void {
     live.store(value, .release);
+}
+
+/// Narrows live output to completed calls whose signed status failed. This is
+/// the practical way to audit a title with millions of successful runtime
+/// calls without making diagnostic printing slower than the guest itself.
+pub fn setLiveFailuresOnly(value: bool) void {
+    live_failures_only.store(value, .release);
 }
 
 /// Whether calls are being announced as they happen.
@@ -154,7 +162,9 @@ pub fn setLiveFilter(text: []const u8) void {
 /// one subsystem narrows everything it prints — otherwise the detail of every
 /// other subsystem would still arrive and the narrowing would buy nothing.
 pub fn announces(name: []const u8) bool {
-    return live.load(.acquire) and passesFilter(name);
+    return live.load(.acquire) and
+        !live_failures_only.load(.acquire) and
+        passesFilter(name);
 }
 
 /// Whether a name passes the live filter.
@@ -178,7 +188,13 @@ fn store(record: Record) void {
     stored.thread = currentThreadOrdinal();
     ring[sequence % capacity] = stored;
 
-    if (live.load(.acquire) and passesFilter(stored.name)) emit(stored);
+    if (live.load(.acquire) and passesFilter(stored.name)) {
+        if (!live_failures_only.load(.acquire) or
+            (stored.returns_value and stored.result_is_status and looksLikeFailure(stored.result)))
+        {
+            emit(stored);
+        }
+    }
 }
 
 /// Writes one record immediately. Uses the debug printer because it locks and
@@ -391,6 +407,59 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
                 );
             }
         },
+        11 => struct {
+            fn call(
+                a0: P.t(0),
+                a1: P.t(1),
+                a2: P.t(2),
+                a3: P.t(3),
+                a4: P.t(4),
+                a5: P.t(5),
+                a6: P.t(6),
+                a7: P.t(7),
+                a8: P.t(8),
+                a9: P.t(9),
+                a10: P.t(10),
+            ) callconv(abi.guest) Result {
+                const args = [_]u64{
+                    word(a0), word(a1), word(a2), word(a3), word(a4),  word(a5),
+                    word(a6), word(a7), word(a8), word(a9), word(a10),
+                };
+                enter(name, &args);
+                return finish(
+                    name,
+                    host_stack.call(Result, func, .{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10 }),
+                    &args,
+                );
+            }
+        },
+        12 => struct {
+            fn call(
+                a0: P.t(0),
+                a1: P.t(1),
+                a2: P.t(2),
+                a3: P.t(3),
+                a4: P.t(4),
+                a5: P.t(5),
+                a6: P.t(6),
+                a7: P.t(7),
+                a8: P.t(8),
+                a9: P.t(9),
+                a10: P.t(10),
+                a11: P.t(11),
+            ) callconv(abi.guest) Result {
+                const args = [_]u64{
+                    word(a0), word(a1), word(a2), word(a3), word(a4),  word(a5),
+                    word(a6), word(a7), word(a8), word(a9), word(a10), word(a11),
+                };
+                enter(name, &args);
+                return finish(
+                    name,
+                    host_stack.call(Result, func, .{ a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11 }),
+                    &args,
+                );
+            }
+        },
         else => @compileError(std.fmt.comptimePrint(
             "cannot trace {s}: {d} parameters exceeds the generated arities",
             .{ name, info.params.len },
@@ -538,6 +607,7 @@ fn takeStackSnapshot(comptime name: []const u8) void {
 fn enter(comptime name: []const u8, arguments: []const u64) void {
     if (capture_armed.load(.acquire)) takeStackSnapshot(name);
     if (!live.load(.acquire) or !isEnabled()) return;
+    if (live_failures_only.load(.acquire)) return;
     if (!passesFilter(name)) return;
     std.debug.print("[call ] t{d} {s}(", .{ currentThreadOrdinal(), name });
     for (arguments, 0..) |value, index| {

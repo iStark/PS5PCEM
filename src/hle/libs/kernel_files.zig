@@ -142,7 +142,11 @@ fn kernelLseek(descriptor: i32, offset: i64, whence: i32) callconv(abi.guest) i6
 fn kernelStat(path: ?[*:0]const u8, out: ?*filesystem.Stat) callconv(abi.guest) i32 {
     const name = spanOf(path) orelse return KernelError.efault.raw();
     const record = writableRecord(filesystem.Stat, out) orelse return KernelError.efault.raw();
-    filesystem.stat(name, record) catch |err| return kernelStatus(err);
+    filesystem.stat(name, record) catch |err| {
+        announceStat(name, false, err);
+        return kernelStatus(err);
+    };
+    announceStat(name, true, null);
     return errno.ok;
 }
 
@@ -213,6 +217,15 @@ fn announceOpen(name: []const u8, result: i64) void {
     }
 }
 
+fn announceStat(name: []const u8, succeeded: bool, failure: ?Error) void {
+    if (!trace.announces("stat")) return;
+    if (succeeded) {
+        std.debug.print("[stat ] \"{s}\" -> ok\n", .{name});
+    } else {
+        std.debug.print("[stat ] \"{s}\" -> {s}\n", .{ name, @errorName(failure.?) });
+    }
+}
+
 fn posixOpen(path: ?[*:0]const u8, flags: i32, _: u16) callconv(abi.guest) i64 {
     const name = spanOf(path) orelse return posixFail(Error.InvalidArgument);
     const descriptor = filesystem.open(name, flags) catch |err| {
@@ -243,9 +256,10 @@ fn posixStat(path: ?[*:0]const u8, out: ?*filesystem.Stat) callconv(abi.guest) i
     const name = spanOf(path) orelse return posixFail(Error.InvalidArgument);
     const record = writableRecord(filesystem.Stat, out) orelse return posixFail(Error.InvalidArgument);
     filesystem.stat(name, record) catch |err| {
-        if (trace.isLive()) std.debug.print("[stat] '{s}': {s}\n", .{ name, @errorName(err) });
+        announceStat(name, false, err);
         return posixFail(err);
     };
+    announceStat(name, true, null);
     return 0;
 }
 

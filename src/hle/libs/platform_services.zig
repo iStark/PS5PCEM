@@ -110,6 +110,12 @@ fn rtcGetCurrentTick(output: ?*u64) callconv(abi.guest) i32 {
     return errno.ok;
 }
 
+fn rtcGetCurrentNetworkTick(output: ?*u64) callconv(abi.guest) i32 {
+    // There is no console network clock to query. The host real-time clock is
+    // still expressed in the same RTC epoch and keeps offline titles moving.
+    return rtcGetCurrentTick(output);
+}
+
 fn validRtcDateTime(value: RtcDateTime) bool {
     if (value.year < 1 or value.year > 9999 or value.month < 1 or value.month > 12) return false;
     if (value.hour > 23 or value.minute > 59 or value.second > 59 or value.microsecond >= std.time.us_per_s) return false;
@@ -259,11 +265,18 @@ const net_ctl_exports = [_]symbols.Export{
     .{ .name = "sceNetCtlGetInfo", .function = trace.wrap("sceNetCtlGetInfo", &netCtlGetInfo), .expect_id = "obuxdTiwkF8" },
 };
 
-const rtc_exports = [_]symbols.Export{.{
-    .name = "sceRtcGetCurrentTick",
-    .function = trace.wrap("sceRtcGetCurrentTick", &rtcGetCurrentTick),
-    .expect_id = "18B2NS1y9UU",
-}};
+const rtc_exports = [_]symbols.Export{
+    .{
+        .name = "sceRtcGetCurrentTick",
+        .function = trace.wrap("sceRtcGetCurrentTick", &rtcGetCurrentTick),
+        .expect_id = "18B2NS1y9UU",
+    },
+    .{
+        .name = "sceRtcGetCurrentNetworkTick",
+        .function = trace.wrap("sceRtcGetCurrentNetworkTick", &rtcGetCurrentNetworkTick),
+        .expect_id = "zO9UL3qIINQ",
+    },
+};
 
 pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {
     try db.addLibrary(
