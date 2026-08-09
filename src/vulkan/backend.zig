@@ -500,6 +500,10 @@ const maximum_frame_bytes = 128 * 1024 * 1024;
 const maximum_completed_frames = 16;
 const maximum_render_targets = 16;
 const maximum_sampled_images = 32;
+/// One DCC key byte covers this many bytes of the compressed colour surface.
+const dcc_block_bytes = 256;
+/// Bounds the key read for a fast-clear probe; covers surfaces up to 1 GiB.
+const maximum_dcc_key_bytes = 4 * 1024 * 1024;
 /// On-disk driver pipeline cache. Reused across runs so per-title shader
 /// compilation is paid once instead of on every launch.
 const pipeline_cache_path = "vulkan_pipeline_cache.bin";
@@ -906,6 +910,7 @@ pub const Renderer = struct {
     emulated_image_store_dispatches: u64 = 0,
     emulated_volume_copies: u64 = 0,
     reported_dual_image_clear_fallback: bool = false,
+    reported_fast_clear_seeds: u32 = 0,
     buffer_cache_hits: u64 = 0,
     buffer_cache_misses: u64 = 0,
     buffer_uploads: u64 = 0,
@@ -3170,6 +3175,53 @@ pub const Renderer = struct {
             a.layout.staging_bytes == b.layout.staging_bytes;
     }
 
+    /// Resolves what a DCC-compressed colour target actually reads as.
+    ///
+    /// A target with DCC enabled does not hold plain texels: the key holds one
+    /// byte per 256-byte block saying whether that block was fast cleared, and
+    /// the base allocation only holds compressed data for blocks something has
+    /// since rendered into. Staging the base allocation as an image is
+    /// therefore only meaningful when the key reads uncompressed everywhere;
+    /// a uniform clear code means the hardware returns the clear colour for
+    /// every texel, whatever the bytes underneath happen to be.
+    ///
+    /// Returns null when the raw allocation is the honest source: no DCC, a
+    /// key we cannot read, a mixed key, or a code this does not model.
+    fn colorTargetFastClearTexel(self: *Renderer, target: GuestColorTarget) anyerror!?[4]u8 {
+        const descriptor = target.descriptor;
+        if (!descriptor.dcc_enabled or descriptor.dcc_address == 0) return null;
+        const memory = self.guest_memory orelse return null;
+        const key_bytes_u64 = target.layout.required_source_bytes / dcc_block_bytes;
+        if (key_bytes_u64 == 0 or key_bytes_u64 > maximum_dcc_key_bytes) return null;
+        const key_bytes: usize = @intCast(key_bytes_u64);
+        const key = try self.allocator.alloc(u8, key_bytes);
+        defer self.allocator.free(key);
+        if (!memory.read(memory.context, descriptor.dcc_address, key)) return null;
+        const code = key[0];
+        for (key[1..]) |byte| {
+            if (byte != code) return null;
+        }
+        return dccClearTexel(code, descriptor);
+    }
+
+    fn reportFastClearSeed(self: *Renderer, target: GuestColorTarget, texel: [4]u8) void {
+        if (self.reported_fast_clear_seeds >= 4 and !log_verbose_gpu) return;
+        self.reported_fast_clear_seeds += 1;
+        std.debug.print(
+            "[vulkan dcb] dcc fast-clear target @0x{x} {d}x{d} key@0x{x} rgba={d},{d},{d},{d}\n",
+            .{
+                target.descriptor.address,
+                target.descriptor.width,
+                target.descriptor.height,
+                target.descriptor.dcc_address,
+                texel[0],
+                texel[1],
+                texel[2],
+                texel[3],
+            },
+        );
+    }
+
     fn createCachedRenderTarget(self: *Renderer, target: GuestColorTarget) anyerror!CachedRenderTarget {
         const frame_bytes = try colorTargetFrameBytes(target);
         const image = try self.createImage(
@@ -3396,7 +3448,12 @@ pub const Renderer = struct {
             defer self.allocator.free(frame);
             const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
             const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
-            try target.layout.stage(reader, target.descriptor.address, frame);
+            if (try self.colorTargetFastClearTexel(target)) |texel| {
+                fillRgba8(frame, texel);
+                self.reportFastClearSeed(target, texel);
+            } else {
+                try target.layout.stage(reader, target.descriptor.address, frame);
+            }
             initial_upload = try self.createBuffer(
                 frame_bytes,
                 vk.buffer_usage_transfer_src_bit,
@@ -4186,9 +4243,10 @@ pub const Renderer = struct {
         const fragment_scalar_end: u32 = 0x0010_0000;
         var fragment_scalar_regs: [128]gpu.ShaderSpirvScalarRegister = undefined;
         var fragment_scalar_count = collectKnownScalars(&fragment_scalar, &fragment_scalar_regs);
-        // Unity PS loads a float4 scale via s_buffer into s16..; if specialization
-        // failed and left zeros, every v_mul after sample writes black. Seed 1.0
-        // so a missing constant buffer is an identity scale.
+        // Unity PS loads a float4 scale via s_buffer into s16..; when the
+        // constant buffer could not be resolved at all those registers stay
+        // unknown and every v_mul after the sample would write black. Seed 1.0
+        // for exactly those, so a missing constant buffer is an identity scale.
         fragment_scalar_count = ensureIdentityFragmentScale(
             &fragment_scalar_regs,
             fragment_scalar_count,
@@ -6315,6 +6373,39 @@ fn sampledImageStateHash(
     return std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(&words));
 }
 
+/// The colour a uniform DCC key resolves to, in the RGBA8 order `stage`
+/// produces. The comparison codes are the ones GFX9-GFX10 colour blocks write:
+/// four fixed clear colours, one "use the clear registers" code, and 0xff for
+/// uncompressed data that has to be read from the surface itself.
+fn dccClearTexel(code: u8, descriptor: gpu.resources.ColorTarget) ?[4]u8 {
+    return switch (code) {
+        0x00 => .{ 0, 0, 0, 0 },
+        0x40 => .{ 0, 0, 0, 255 },
+        0x80 => .{ 255, 255, 255, 0 },
+        0xc0 => .{ 255, 255, 255, 255 },
+        // CB_COLOR*_CLEAR_WORD0 holds the cleared texel in the surface's own
+        // encoding. Only the 8_8_8_8 UNORM standard swap is unpacked here; any
+        // other encoding would be a guess, so it keeps the raw path.
+        0x20 => if (descriptor.format == 10 and descriptor.number_type == 0 and descriptor.component_swap == 0) blk: {
+            const word = descriptor.clear_words[0];
+            break :blk .{
+                @truncate(word),
+                @truncate(word >> 8),
+                @truncate(word >> 16),
+                @truncate(word >> 24),
+            };
+        } else null,
+        else => null,
+    };
+}
+
+fn fillRgba8(linear: []u8, texel: [4]u8) void {
+    var index: usize = 0;
+    while (index + 3 < linear.len) : (index += 4) {
+        linear[index..][0..4].* = texel;
+    }
+}
+
 fn fillNeutralTextureRgba8(linear: []u8) void {
     // Dark gray — distinguishable from black clear and from white UI fill.
     var i: usize = 0;
@@ -6442,19 +6533,21 @@ fn ensureIdentityFragmentScale(
     var n = count;
     var reg: u32 = 16;
     while (reg < 20) : (reg += 1) {
-        var found: ?usize = null;
-        for (out[0..n], 0..) |entry, index| {
+        var found = false;
+        for (out[0..n]) |entry| {
             if (entry.register == reg) {
-                found = index;
+                found = true;
                 break;
             }
         }
-        if (found) |index| {
-            if (out[index].value == 0) out[index].value = one_bits;
-        } else if (n < out.len) {
-            out[n] = .{ .register = reg, .value = one_bits };
-            n += 1;
-        }
+        // Only a register the evaluator could not resolve gets the identity.
+        // A resolved 0.0 is a real constant: sprite batchers fill solid
+        // rectangles with scale 0 and bias the colour in, and rewriting that
+        // to 1.0 replaces the fill with the raw atlas.
+        if (found) continue;
+        if (n >= out.len) break;
+        out[n] = .{ .register = reg, .value = one_bits };
+        n += 1;
     }
     return n;
 }
@@ -7252,6 +7345,42 @@ test "display buffers become bounded 32-bit color targets" {
         .height = 1080,
         .pitch_in_pixels = 1280,
     }) == null);
+}
+
+test "identity fragment scale only fills registers the evaluator left unknown" {
+    const one_bits: u32 = @bitCast(@as(f32, 1.0));
+    var registers: [8]gpu.ShaderSpirvScalarRegister = undefined;
+    // A sprite batcher fills a solid rectangle with scale 0 and a colour bias;
+    // that zero is a resolved constant and must survive untouched.
+    registers[0] = .{ .register = 16, .value = 0 };
+    registers[1] = .{ .register = 17, .value = 0 };
+    registers[2] = .{ .register = 19, .value = 0 };
+
+    const count = ensureIdentityFragmentScale(&registers, 3);
+    try std.testing.expectEqual(@as(usize, 4), count);
+    try std.testing.expectEqual(@as(u32, 0), registers[0].value);
+    try std.testing.expectEqual(@as(u32, 0), registers[1].value);
+    try std.testing.expectEqual(@as(u32, 0), registers[2].value);
+    // s18 was absent, so it is the only one that gets the identity default.
+    try std.testing.expectEqual(@as(u32, 18), registers[3].register);
+    try std.testing.expectEqual(one_bits, registers[3].value);
+}
+
+test "a uniform dcc key resolves to the colour the hardware would return" {
+    var descriptor = std.mem.zeroes(gpu.resources.ColorTarget);
+    descriptor.format = 10;
+    descriptor.number_type = 0;
+    descriptor.component_swap = 0;
+    descriptor.clear_words = .{ 0x8040_2010, 0 };
+
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, dccClearTexel(0x00, descriptor).?);
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 255 }, dccClearTexel(0x40, descriptor).?);
+    try std.testing.expectEqual([4]u8{ 0x10, 0x20, 0x40, 0x80 }, dccClearTexel(0x20, descriptor).?);
+    // Uncompressed: the surface itself is the only honest source.
+    try std.testing.expect(dccClearTexel(0xff, descriptor) == null);
+    // An encoding the clear-word unpack does not model keeps the raw path.
+    descriptor.format = 11;
+    try std.testing.expect(dccClearTexel(0x20, descriptor) == null);
 }
 
 test "dual image clear matcher requires the complete bounded kernel" {

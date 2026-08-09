@@ -37,9 +37,10 @@ Vulkan.
   `sceKernelLoadStartModule` calls receive stable handles and
   `sceKernelDlsym` resolves readable export names inside the selected PRX.
 - Terminator 2D now reaches gameplay with the intended color balance, textured
-  backgrounds, characters, and UI. Early publisher logos and the in-game pause
-  menu still expose composition/compression gaps. Direct render-target scanout,
-  GPU-resident storage and bulk tiled-texture staging reduced warmed-up frames
+  backgrounds, characters, and UI. Its publisher logo screens render exactly as
+  on the console: the sprite batcher's solid fills are honored, so the logos sit
+  on a clean black background instead of the sprite atlas. Direct render-target
+  scanout, GPU-resident storage and bulk tiled-texture staging reduced warmed-up frames
   from roughly 208–240 ms to 22–65 ms in the current startup capture; first-use
   texture uploads remain scene-dependent.
 - PS VR2 libraries currently expose only compatibility/no-device behavior.
@@ -75,7 +76,7 @@ the repository contains none of that content.
 
 | Title | Observed milestone | Current limit |
 |---|---|---|
-| **Terminator 2D: No Fate** | Reaches gameplay with correct color reproduction and clean title-provided backgrounds, characters, HUD elements, and textures; warmed-up startup frames measure 22–65 ms on the current test host | Early publisher logos and the pause menu retain artifacts; first-use texture staging, depth/MRT, and compression metadata remain incomplete |
+| **Terminator 2D: No Fate** | Reaches gameplay with correct color reproduction and clean title-provided backgrounds, characters, HUD elements, and textures; publisher logo screens and menus now match the console capture; warmed-up startup frames measure 22–65 ms on the current test host | First-use texture staging, depth/MRT, and compression metadata remain incomplete |
 | **Pistol Whip** | Maps the native PS VR2 plugin and Burst module, then starts loading Unity asset archives | Headset, tracking, controller, and host OpenXR support are intentionally deferred |
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
 | **Tetris Effect: Connected** | Completes Unreal filesystem/config bootstrap, executes compact typed UAV clears (including two 1024×1024 `RGBA32_FLOAT` targets) and 3D volume uploads, and reaches a second measured VideoOut frame with 6 draws/63 dispatches | Output is black: the deferred compositor reaches its scanout buffer but is rejected by an unsupported scalar source; a compact image-copy compute kernel and other compute gaps also remain, while the 512 GiB reservation can depend on host address-space placement |
@@ -1596,8 +1597,19 @@ scheduler and Vulkan backend. Observed startup work now includes:
   table seed attribute V#s and run the guest export program.
 - Later progress captures show title-provided logos, HUD elements, characters,
   and scene textures rather than only the initial presentation surface.
-  Color/channel handling, depth/MRT composition, compression metadata, and some
-  layouts still produce visible corruption.
+  Depth/MRT composition, compression metadata, and some layouts can still
+  produce visible corruption.
+- Pixel-shader constants recovered from a resolved `s_buffer_load` are used as
+  written, including zeros. A sprite batcher fills solid rectangles by scaling
+  the sampled texel by zero and biasing the colour in, so substituting an
+  identity scale for a real zero replaced the fill with the raw sprite atlas.
+  The identity default now applies only to registers the scalar evaluator could
+  not resolve at all.
+- Colour targets that enable DCC no longer seed their resident attachment from
+  the base allocation. That allocation holds compressed blocks, not texels; a
+  uniform DCC key means the hardware returns the fast-clear colour, so the
+  attachment starts at that colour instead of at whatever the raw bytes decode
+  to. Uncompressed and mixed keys keep the staged path.
 - `SetFlip` and equeue delivery use VideoOut filter `-13`; flip status fills
   process-time fields and event data retains the guest flip argument.
 - Indexed draws can emit AGC `SetIndexSize` as a real `INDEX_TYPE` packet, and
