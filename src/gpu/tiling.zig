@@ -179,6 +179,15 @@ pub const SwizzleBlock = struct {
         if (tile_mode == .depth and bytes_per_element > 8) return Error.UnsupportedElementSize;
 
         if (volume) {
+            if (tile_mode == .linear) return .{
+                .family = .linear,
+                .bytes_per_element = bytes_per_element,
+                .samples_log2 = 0,
+                .bytes = bytes_per_element,
+                .width = 1,
+                .height = 1,
+                .depth = 1,
+            };
             const family: BlockFamily = switch (tile_mode) {
                 .standard_4kb => .standard_4kb_3d,
                 .standard_64kb => .standard_64kb_3d,
@@ -933,6 +942,36 @@ pub const TextureLayout = struct {
     }
 
     fn placeVolume(self: *TextureLayout, texture: Texture) Error!void {
+        if (self.block.family == .linear) {
+            if (texture.mip_levels != 1) return Error.UnsupportedMipChain;
+            const requested_pitch = if (texture.row_pitch_elements == 0)
+                texture.width
+            else
+                texture.row_pitch_elements;
+            if (requested_pitch < texture.width) return Error.InvalidPitch;
+            const pitch = try alignForward(
+                requested_pitch,
+                @max(@as(u32, 1), 256 / @as(u32, self.block.bytes_per_element)),
+            );
+            const slice_bytes = try multiply3(
+                pitch,
+                texture.height,
+                self.block.bytes_per_element,
+            );
+            const storage_bytes = try multiply(slice_bytes, texture.depth_or_layers);
+            self.levels[0] = .{
+                .width = texture.width,
+                .height = texture.height,
+                .depth = texture.depth_or_layers,
+                .padded_width = pitch,
+                .padded_height = texture.height,
+                .storage_bytes = storage_bytes,
+            };
+            self.source_layer_bytes = slice_bytes;
+            self.block_slice_bytes = slice_bytes;
+            self.required_source_bytes = storage_bytes;
+            return;
+        }
         const thick4 = self.block.family == .standard_4kb_3d;
         const thick64 = self.block.family == .standard_64kb_3d or
             self.block.family == .partially_resident_3d;
@@ -1946,7 +1985,7 @@ test "metadata surface decoding turns raw metadata bytes into RGBA pixels" {
     var dst = [_]u8{0} ** 8;
     // 2 pixels (8 bytes), will map to block_x=0, block_y=0, reading meta byte 0x20 for both pixels
     try metadata.stageRgba(memory.reader(), &dst, 2, 1);
-    
+
     // Both pixels read DCC byte 0x20, which is fast clear (0, 255, 0, 255)
     try testing.expectEqualSlices(u8, &[_]u8{ 0, 255, 0, 255, 0, 255, 0, 255 }, &dst);
 }
@@ -2070,6 +2109,27 @@ test "mip chains place smallest records first and share exact tail blocks" {
             }
         }
     }
+}
+
+test "linear 3D volumes use aligned rows and consecutive depth slices" {
+    const volume = try TextureLayout.init(.{
+        .tile_mode = .linear,
+        .kind = .volume_3d,
+        .width = 16,
+        .height = 16,
+        .depth_or_layers = 16,
+        .row_pitch_elements = 16,
+    }, 4);
+    const base = try volume.base();
+    try testing.expectEqual(BlockFamily.linear, base.block.family);
+    try testing.expectEqual(@as(u32, 64), base.padded_width);
+    try testing.expectEqual(@as(u64, 4096), base.source_layer_bytes);
+    try testing.expectEqual(@as(u64, 65536), base.required_source_bytes);
+    try testing.expectEqual(@as(u64, 0), try base.sourceByteOffset(0, 0, 0, 0));
+    try testing.expectEqual(@as(u64, 4), try base.sourceByteOffset(1, 0, 0, 0));
+    try testing.expectEqual(@as(u64, 256), try base.sourceByteOffset(0, 1, 0, 0));
+    try testing.expectEqual(@as(u64, 4096), try base.sourceByteOffset(0, 0, 1, 0));
+    try testing.expectEqual(@as(u64, 65340), try base.sourceByteOffset(15, 15, 15, 0));
 }
 
 test "thick 3D blocks and volume block slices match fixed GFX10 vectors" {

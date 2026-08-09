@@ -50,8 +50,8 @@ Vulkan.
   wait, event, DMA, indirect-register, draw and flip packets. Tetris Effect:
   Connected reaches repeated graphics/compute submissions and VideoOut flips;
   its compact typed image-clear dispatches now update guest render-target and
-  depth memory. Output remains black because color-target state and a separate
-  complex 3D image-store shader are not reconstructed yet.
+  depth memory, while its bounded buffer-to-volume uploads populate 3D images.
+  Output remains black because submitted draws still have no usable color target.
 
 ![Terminator 2D gameplay rendered by PS5PCEM](docs/images/live-gameplay.png)
 
@@ -71,7 +71,7 @@ the repository contains none of that content.
 | **Terminator 2D: No Fate** | Reaches gameplay with correct color reproduction and clean title-provided backgrounds, characters, HUD elements, and textures | Early publisher logos and the pause menu retain artifacts; synchronous upload/readback limits frame pacing, while depth/MRT and compression metadata remain incomplete |
 | **Pistol Whip** | Maps the native PS VR2 plugin and Burst module, then starts loading Unity asset archives | Headset, tracking, controller, and host OpenXR support are intentionally deferred |
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
-| **Tetris Effect: Connected** | Completes Unreal filesystem/config bootstrap, creates AGC workloads, executes compact typed UAV clears, and reaches a repeated graphics/compute submit loop with six observed VideoOut flips | Output is black: the draw path has no usable color target, a complex 3D image-store shader remains unsupported, and the 512 GiB virtual reservation can still depend on host address-space placement |
+| **Tetris Effect: Connected** | Completes Unreal filesystem/config bootstrap, creates AGC workloads, executes compact typed UAV clears and 3D volume uploads, and reaches a repeated graphics/compute submit loop with six observed VideoOut flips | Output is black: the draw path has no usable color target, and the 512 GiB virtual reservation can still depend on host address-space placement |
 
 ## Components
 
@@ -643,9 +643,12 @@ command queue. Before general translation, two exact compact AGC UAV-clear
 kernels execute directly against checked guest memory. They cover `R8_UINT`,
 `R32_UINT`, `RGBA8_UNORM`, `RGBA8_UINT`, and `RGBA16_FLOAT`, apply the inverse
 descriptor storage swizzle, and use the render-target/depth tiling layout for
-each written texel. More complex control flow and general 3D `image_store`
-remain explicit unsupported work rather than taking this narrow path. Draw
-callbacks count work by default. When both vertex and pixel
+each written texel. A separately matched bounds-checked upload kernel copies
+`R8_UINT` buffers into `RGBA8_UINT` 3D images and `R16_UINT` buffers into
+`R16_UINT` 3D images; linear volumes use aligned rows and consecutive depth
+slices through the same texture-layout contract. General `image_store`
+programs remain explicit unsupported work rather than taking either narrow
+path. Draw callbacks count work by default. When both vertex and pixel
 program registers are present,
 `DRAW_INDEX_AUTO` decodes both guest programs, resolves AGC vertex resources,
 lowers matching PARAM/VINTRP stage interfaces, creates or reuses a pipeline
@@ -1544,7 +1547,8 @@ scheduler and Vulkan backend. Observed startup work now includes:
 - GDS initialization and several compute dispatches (including buffer-copy
   shapes) that complete successfully when V# descriptors resolve. Exact compact
   typed image-clear kernels also update tiled guest render-target/depth memory
-  without entering the incomplete general MIMG translator.
+  without entering the incomplete general MIMG translator. The observed bounded
+  buffer-to-volume kernel uploads both 1×1×1 and 16×16×16 3D images.
 - Guest VS/PS translation for common RDNA2 ALU, per-vertex MUBUF fetches,
   PARAM/VINTRP interfaces, sampling, and color export. The renderer uses exact
   instruction-PC mappings when one shader SGPR addresses multiple attributes.
@@ -1615,9 +1619,12 @@ window without the earlier host-side `memcpy` access violation. Vulkan still
 rejects those draws as `MissingColorTarget`, so the presented image is black.
 Its compact 8- and 11-instruction typed clears now execute for `R8_UINT`,
 `R32_UINT`, `RGBA8_UNORM`, `RGBA8_UINT`, and `RGBA16_FLOAT`, including inverse
-storage swizzles and tiled render-target/depth addressing. The remaining
-observed compute blocker is a separate 32-instruction 3D `image_store` program
-with bounds checks and address arithmetic.
+storage swizzles and tiled render-target/depth addressing. Its observed
+32-instruction 3D upload program now copies `R8_UINT→RGBA8_UINT` and
+`R16_UINT→R16_UINT` volumes with the shader's bounds, strides, base coordinates,
+and linear/tiled target layout. A measured startup frame consequently completes
+all four volume uploads (two 1×1×1 and two 16×16×16) without a rejected compute
+dispatch; `MissingColorTarget` is now the immediate rendering boundary.
 Its 3840×2160 display buffers now register with the expected pitch. A measured
 loading run held private memory near 2.14 GiB instead of retaining a geometric
 chain of arena-backed temporary buffers past 9 GiB; the remaining working-set
@@ -1641,9 +1648,9 @@ from leaking into host code where nothing would check it.
 
 1. Move changing vertex/scalar constants out of SPIR-V specialization so the
    same graphics pipelines survive transform and resource updates.
-2. Lower the remaining general 3D `image_store`, then implement more
-   color/texture formats, mip views, depth/stencil, MRT, and compressed-surface
-   metadata.
+2. Replace the exact UAV fast paths with general storage-image lowering, then
+   implement more color/texture formats, mip views, depth/stencil, MRT, and
+   compressed-surface metadata.
 3. Tighten render ordering and composition against later title captures, then
    replace the remaining diagnostic shader fallbacks.
 4. Reduce repeated compute readbacks and large texture uploads without changing

@@ -824,6 +824,7 @@ pub const Renderer = struct {
     elided_dispatches: u64 = 0,
     emulated_gds_dispatches: u64 = 0,
     emulated_image_store_dispatches: u64 = 0,
+    emulated_volume_copies: u64 = 0,
     buffer_cache_hits: u64 = 0,
     buffer_cache_misses: u64 = 0,
     buffer_uploads: u64 = 0,
@@ -1556,6 +1557,15 @@ pub const Renderer = struct {
             local_size,
             group_count,
         )) |report| return report;
+        if (try self.tryEmulateVolumeBufferCopy(
+            memory,
+            &bindings,
+            reader,
+            &analysis,
+            system_registers,
+            local_size,
+            group_count,
+        )) |report| return report;
         if (!analysis.hasExternalEffects()) {
             self.elided_dispatches += 1;
             std.debug.print(
@@ -1855,8 +1865,8 @@ pub const Renderer = struct {
             descriptor.dst_select,
         ) orelse return null;
 
-        const texture = try gpu.TextureLayout.fromImage(descriptor);
-        const subresource = try texture.subresource(0, 0, texture.layers);
+        const texture = gpu.TextureLayout.fromImage(descriptor) catch return null;
+        const subresource = texture.subresource(0, 0, texture.layers) catch return null;
         if (texel.length != subresource.block.bytes_per_element) return null;
 
         const dispatched_width = std.math.mul(u64, group_count[0], local_size[0]) catch
@@ -1895,6 +1905,134 @@ pub const Renderer = struct {
                     descriptor.unified_format,
                     @tagName(descriptor.tile_mode),
                     self.emulated_image_store_dispatches,
+                },
+            );
+        }
+        return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
+    }
+
+    /// Executes the bounded AGC buffer-to-3D-image upload kernel used for
+    /// small lookup textures. The exact shader shape is matched separately;
+    /// this method only implements its observed R8->RGBA8 and R16->R16 typed
+    /// transfers and leaves general image-store programs to the translator.
+    fn tryEmulateVolumeBufferCopy(
+        self: *Renderer,
+        memory: GuestMemory,
+        bindings: *const gpu.ShaderBindings,
+        reader: gpu.ShaderMemoryReader,
+        analysis: *const gpu.ShaderAnalysis,
+        system: gpu.resources.ComputeSystemRegisters,
+        local_size: [3]u32,
+        group_count: [3]u32,
+    ) anyerror!?DispatchReport {
+        if (!matchesVolumeBufferCopy(analysis.program.instructions.items)) return null;
+        if (local_size[0] != 8 or local_size[1] != 8 or local_size[2] != 1 or
+            system.workgroup_id_sgprs[0] != 16 or
+            system.workgroup_id_sgprs[1] != 17 or
+            system.workgroup_id_sgprs[2] != 18 or
+            system.local_invocation_id_components != 2)
+        {
+            return null;
+        }
+
+        const source = (try bindings.inlineBufferDescriptor(8)) orelse return null;
+        const control = (try bindings.inlineBufferDescriptor(12)) orelse return null;
+        const image = try resolveReadWriteImageDescriptor(bindings, reader, 0) orelse return null;
+        if (source.address == 0 or source.record_count == 0 or source.swizzle_enabled or
+            source.add_thread_id or source.index_stride != 0 or source.out_of_bounds_select != 0 or
+            source.dst_select[0] != 4 or control.address == 0 or control.size_bytes < 44 or
+            image.image_type != .color_3d or image.dcc_enabled or image.cmask_fast_clear or
+            image.fmask_compression or image.metadata_address != 0 or image.samplesLog2() != 0 or
+            image.viewMipLevels() != 1 or image.viewBaseLevel() != 0)
+        {
+            return null;
+        }
+        const format_supported = (source.unified_format == 5 and source.stride == 1 and
+            image.unified_format == 60) or
+            (source.unified_format == 11 and source.stride == 2 and image.unified_format == 11);
+        if (!format_supported) return null;
+
+        var words: [11]u32 = undefined;
+        for (&words, 0..) |*word, index| {
+            word.* = try readGuestU32(memory, control.address + index * @sizeOf(u32));
+        }
+        const texture = gpu.TextureLayout.fromImage(image) catch return null;
+        const subresource = texture.subresource(0, 0, 1) catch return null;
+
+        const dispatched_x = std.math.mul(u64, group_count[0], local_size[0]) catch
+            return Error.GuestBufferTooLarge;
+        const dispatched_y = std.math.mul(u64, group_count[1], local_size[1]) catch
+            return Error.GuestBufferTooLarge;
+        const dispatched_z = std.math.mul(u64, group_count[2], local_size[2]) catch
+            return Error.GuestBufferTooLarge;
+        const base_x = words[4];
+        const base_y = words[5];
+        const base_z = words[6];
+        if (base_x > subresource.width or base_y > subresource.height or
+            base_z > subresource.depth_or_layers) return null;
+        const width: u32 = @intCast(@min(
+            @as(u64, @min(words[8], subresource.width - base_x)),
+            dispatched_x,
+        ));
+        const height: u32 = @intCast(@min(
+            @as(u64, @min(words[9], subresource.height - base_y)),
+            dispatched_y,
+        ));
+        const depth: u32 = @intCast(@min(
+            @as(u64, @min(words[10], subresource.depth_or_layers - base_z)),
+            dispatched_z,
+        ));
+        const texel_count = std.math.mul(u64, width, height) catch return Error.GuestBufferTooLarge;
+        const volume_texels = std.math.mul(u64, texel_count, depth) catch return Error.GuestBufferTooLarge;
+        if (volume_texels > 16 * 1024 * 1024) return null;
+
+        var writes: u64 = 0;
+        for (0..depth) |z_index| {
+            const z: u32 = @intCast(z_index);
+            for (0..height) |y_index| {
+                const y: u32 = @intCast(y_index);
+                for (0..width) |x_index| {
+                    const x: u32 = @intCast(x_index);
+                    const source_index = volumeSourceIndex(words[0..3].*, x, y, z) catch
+                        return Error.GuestBufferTooLarge;
+                    var values: [4]u32 = @splat(0);
+                    for (&values, 0..) |*value, channel| {
+                        const index = std.math.add(u64, source_index, channel) catch
+                            return Error.GuestBufferTooLarge;
+                        value.* = try readTypedBufferValue(memory, source, index);
+                    }
+                    const texel = packImageStoreTexel(
+                        image.unified_format,
+                        values,
+                        0xf,
+                        image.dst_select,
+                    ) orelse return null;
+                    if (texel.length != subresource.block.bytes_per_element) return null;
+
+                    const target_x = base_x + x;
+                    const target_y = base_y + y;
+                    const target_z = base_z + z;
+                    const offset = try subresource.sourceByteOffset(target_x, target_y, target_z, 0);
+                    const address = std.math.add(u64, image.address, offset) catch
+                        return Error.GuestMemoryWriteFailed;
+                    if (!memory.write(memory.context, address, texel.bytes[0..texel.length])) {
+                        return Error.GuestMemoryWriteFailed;
+                    }
+                    writes += 1;
+                }
+            }
+        }
+
+        self.emulated_volume_copies += 1;
+        if (log_verbose_gpu or self.emulated_volume_copies <= 4) {
+            std.debug.print(
+                "[vulkan dcb] emulated volume upload: {d} texels src_fmt={d} dst_fmt={d} tile={s} (#{d})\n",
+                .{
+                    writes,
+                    source.unified_format,
+                    image.unified_format,
+                    @tagName(image.tile_mode),
+                    self.emulated_volume_copies,
                 },
             );
         }
@@ -5055,6 +5193,141 @@ fn matchesScalarImageClear(inst: anytype) bool {
         inst[6].data_mask == 0x1 and inst[6].image_nsa_words == 1;
 }
 
+fn matchesVolumeBufferCopy(inst: anytype) bool {
+    if (inst.len != 32) return false;
+    const expected = [_]@TypeOf(inst[0].opcode){
+        .s_inst_prefetch,
+        .v_lshl_add_u32,
+        .s_buffer_load_dwordx4,
+        .v_lshl_add_u32,
+        .s_waitcnt,
+        .v_cmpx_lt_u32,
+        .v_cmpx_gt_u32,
+        .v_cmpx_gt_u32,
+        .s_cbranch_execz,
+        .s_buffer_load_dwordx2,
+        .s_waitcnt,
+        .v_mul_lo_u32,
+        .v_mul_lo_u32,
+        .s_buffer_load_dword,
+        .s_waitcnt,
+        .s_mul_i32,
+        .s_buffer_load_dwordx4,
+        .s_waitcnt,
+        .v_add_nc_u32,
+        .v_add3_u32,
+        .v_add_nc_u32,
+        .v_add_nc_u32,
+        .v_add_nc_u32,
+        .v_add_nc_u32,
+        .v_add_nc_u32,
+        .buffer_load_format_x,
+        .buffer_load_format_x,
+        .buffer_load_format_x,
+        .buffer_load_format_x,
+        .s_waitcnt,
+        .image_store,
+        .s_endpgm,
+    };
+    for (expected, inst) |opcode, instruction| {
+        if (instruction.opcode != opcode) return false;
+    }
+    if (!registerOperand(inst[1].dst, .vgpr, 1) or
+        !registerOperand(inst[1].src0, .sgpr, 17) or
+        !inlineIntegerOperand(inst[1].src1, 3) or
+        !registerOperand(inst[1].src2, .vgpr, 1) or
+        !registerOperand(inst[2].dst, .sgpr, 20) or
+        !registerOperand(inst[2].src0, .sgpr, 12) or inst[2].memory_offset != 32 or
+        !registerOperand(inst[3].dst, .vgpr, 3) or
+        !registerOperand(inst[3].src0, .sgpr, 16) or
+        !inlineIntegerOperand(inst[3].src1, 3) or
+        !registerOperand(inst[3].src2, .vgpr, 0) or
+        inst[5].dst.kind != .exec_lo or !registerOperand(inst[5].src0, .sgpr, 18) or
+        !registerOperand(inst[5].src1, .sgpr, 22) or
+        inst[6].dst.kind != .exec_lo or !registerOperand(inst[6].src0, .sgpr, 21) or
+        !registerOperand(inst[6].src1, .vgpr, 1) or
+        inst[7].dst.kind != .exec_lo or !registerOperand(inst[7].src0, .sgpr, 20) or
+        !registerOperand(inst[7].src1, .vgpr, 3) or
+        inst[9].dst.kind != .vcc_lo or !registerOperand(inst[9].src0, .sgpr, 12) or
+        inst[9].memory_offset != 0 or
+        !registerOperand(inst[11].dst, .vgpr, 0) or inst[11].src0.kind != .vcc_lo or
+        !registerOperand(inst[11].src1, .vgpr, 1) or
+        !registerOperand(inst[12].dst, .vgpr, 2) or inst[12].src0.kind != .vcc_hi or
+        !registerOperand(inst[12].src1, .vgpr, 3) or
+        inst[13].dst.kind != .vcc_lo or !registerOperand(inst[13].src0, .sgpr, 12) or
+        inst[13].memory_offset != 8 or
+        inst[15].dst.kind != .vcc_lo or inst[15].src0.kind != .vcc_lo or
+        !registerOperand(inst[15].src1, .sgpr, 18) or
+        !registerOperand(inst[16].dst, .sgpr, 20) or
+        !registerOperand(inst[16].src0, .sgpr, 12) or inst[16].memory_offset != 16)
+    {
+        return false;
+    }
+    if (!registerOperand(inst[18].dst, .vgpr, 4) or
+        !registerOperand(inst[18].src0, .sgpr, 20) or
+        !registerOperand(inst[18].src1, .vgpr, 3) or
+        !registerOperand(inst[19].dst, .vgpr, 0) or inst[19].src0.kind != .vcc_lo or
+        !registerOperand(inst[19].src1, .vgpr, 2) or
+        !registerOperand(inst[19].src2, .vgpr, 0) or
+        !registerOperand(inst[20].dst, .vgpr, 5) or
+        !registerOperand(inst[20].src0, .sgpr, 21) or
+        !registerOperand(inst[20].src1, .vgpr, 1) or
+        !registerOperand(inst[21].dst, .vgpr, 6) or
+        !registerOperand(inst[21].src0, .sgpr, 18) or
+        !registerOperand(inst[21].src1, .sgpr, 22))
+    {
+        return false;
+    }
+    for (22..25) |index| {
+        const channel: u32 = @intCast(index - 21);
+        if (!registerOperand(inst[index].dst, .vgpr, channel) or
+            !inlineIntegerOperand(inst[index].src0, channel) or
+            !registerOperand(inst[index].src1, .vgpr, 0)) return false;
+    }
+    for (25..29) |index| {
+        const channel: u32 = @intCast(index - 25);
+        if (!registerOperand(inst[index].dst, .vgpr, channel) or
+            !registerOperand(inst[index].src0, .vgpr, channel) or
+            !registerOperand(inst[index].src1, .sgpr, 8) or
+            !inst[index].index_enable or inst[index].offset_enable or
+            inst[index].memory_offset != 0) return false;
+    }
+    return registerOperand(inst[30].dst, .vgpr, 0) and
+        registerOperand(inst[30].src0, .vgpr, 4) and
+        registerOperand(inst[30].src1, .sgpr, 0) and
+        inst[30].data_mask == 0xf and inst[30].image_nsa_words == 0 and
+        inst[30].image_dimension == .dim_3d;
+}
+
+fn volumeSourceIndex(strides: [3]u32, x: u32, y: u32, z: u32) error{Overflow}!u64 {
+    const x_offset = std.math.mul(u64, strides[1], x) catch return error.Overflow;
+    const y_offset = std.math.mul(u64, strides[0], y) catch return error.Overflow;
+    const z_offset = std.math.mul(u64, strides[2], z) catch return error.Overflow;
+    const xy = std.math.add(u64, x_offset, y_offset) catch return error.Overflow;
+    return std.math.add(u64, xy, z_offset) catch return error.Overflow;
+}
+
+fn readTypedBufferValue(memory: GuestMemory, descriptor: gpu.BufferDescriptor, index: u64) Error!u32 {
+    if (index >= descriptor.record_count) return 0;
+    const byte_offset = std.math.mul(u64, index, descriptor.stride) catch
+        return Error.GuestBufferTooLarge;
+    const address = std.math.add(u64, descriptor.address, byte_offset) catch
+        return Error.GuestMemoryReadFailed;
+    return switch (descriptor.unified_format) {
+        5 => blk: {
+            var byte: [1]u8 = undefined;
+            if (!memory.read(memory.context, address, &byte)) return Error.GuestMemoryReadFailed;
+            break :blk byte[0];
+        },
+        11 => blk: {
+            var bytes: [2]u8 = undefined;
+            if (!memory.read(memory.context, address, &bytes)) return Error.GuestMemoryReadFailed;
+            break :blk std.mem.readInt(u16, &bytes, .little);
+        },
+        else => return Error.InvalidStorageDescriptor,
+    };
+}
+
 fn resolveReadWriteImageDescriptor(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
@@ -5102,6 +5375,12 @@ fn packImageStoreTexel(
         5 => if (data_mask == 0x1) .{
             .bytes = .{ @intCast(@min(values[0], 255)), 0, 0, 0, 0, 0, 0, 0 },
             .length = 1,
+        } else null,
+        // IMG_DATA_FORMAT_16 / IMG_NUM_FORMAT_UINT
+        11 => if (data_mask == 0xf) blk: {
+            var result = PackedImageStoreTexel{ .length = 2 };
+            std.mem.writeInt(u16, result.bytes[0..2], @intCast(@min(values[0], 65535)), .little);
+            break :blk result;
         } else null,
         // IMG_DATA_FORMAT_32 / IMG_NUM_FORMAT_UINT
         20 => if (data_mask == 0xf) blk: {
@@ -6293,6 +6572,10 @@ test "typed image clear texels use the descriptor number format" {
     try std.testing.expectEqual(@as(u8, 1), r_uint.length);
     try std.testing.expectEqual(@as(u8, 255), r_uint.bytes[0]);
 
+    const r16_uint = packImageStoreTexel(11, .{ 0x1234, 0, 0, 0 }, 0xf, rgba).?;
+    try std.testing.expectEqual(@as(u8, 2), r16_uint.length);
+    try std.testing.expectEqual(@as(u16, 0x1234), std.mem.readInt(u16, r16_uint.bytes[0..2], .little));
+
     const r32_uint = packImageStoreTexel(20, .{ 0x1234_5678, 0, 0, 0 }, 0xf, rgba).?;
     try std.testing.expectEqual(@as(u8, 4), r32_uint.length);
     try std.testing.expectEqual(@as(u32, 0x1234_5678), std.mem.readInt(u32, r32_uint.bytes[0..4], .little));
@@ -6309,6 +6592,11 @@ test "typed image clear texels use the descriptor number format" {
 
     try std.testing.expect(packImageStoreTexel(56, .{ 0, 0, 0, 0 }, 0x1, rgba) == null);
     try std.testing.expect(packImageStoreTexel(61, .{ 0, 0, 0, 0 }, 0xf, rgba) == null);
+}
+
+test "volume upload source index uses x y and z record strides" {
+    try std.testing.expectEqual(@as(u64, 3 * 4 + 2 * 64 + 5 * 1024), try volumeSourceIndex(.{ 64, 4, 1024 }, 3, 2, 5));
+    try std.testing.expectEqual(@as(u64, 15 + 15 * 16 + 15 * 256), try volumeSourceIndex(.{ 16, 1, 256 }, 15, 15, 15));
 }
 
 test "presentation scaling letterboxes RGBA and converts BGRA" {
