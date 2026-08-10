@@ -62,9 +62,14 @@ If you would like to support continued PS5PCEM development, you can do so on
   depth memory, including a dual 1024×1024 `RGBA32_FLOAT` clear, while its
   bounded buffer-to-volume uploads populate 3D images.
   Final compositor draws that omit color-buffer registers are now retained for
-  the following VideoOut flip, which supplies the scanout target. That flip now
-  completes without the engine's RenderThread watchdog, but output remains black
-  because the deferred display draw still needs scalar-source lowering.
+  the following VideoOut flip, which supplies the scanout target. The observed
+  2,401-instruction fragment shader now translates to structured SPIR-V, passes
+  validation, compiles on the host driver, and writes the full 3840×2160
+  scanout. The first repeatable guest framebuffer is no longer black, but it is
+  still a uniform light gray rather than a recognizable scene because several
+  LDS, storage-image, and resource-binding compute paths remain incomplete.
+
+### Screenshot
 
 ![Terminator 2D gameplay rendered by PS5PCEM](docs/images/live-gameplay.png)
 
@@ -72,6 +77,10 @@ If you would like to support continued PS5PCEM development, you can do so on
 sampled-texture, render-target, and Vulkan presentation paths. Texture alpha,
 component swizzles, and sRGB sampling now preserve the title's intended color
 balance.*
+
+*The current Tetris Effect capture is not presented as gameplay: it is a
+uniform light-gray first guest framebuffer. A title screenshot will be added
+when the emulator produces recognizable scene content.*
 
 ### Observed title milestones
 
@@ -84,7 +93,7 @@ the repository contains none of that content.
 | **Terminator 2D: No Fate** | Reaches gameplay with correct color reproduction and clean title-provided backgrounds, characters, HUD elements, and textures; publisher logo screens and menus now match the console capture; warmed-up startup frames measure 22–65 ms on the current test host | First-use texture staging, Vulkan depth/MRT, and the remaining compression metadata are incomplete |
 | **Pistol Whip** | Maps the native PS VR2 plugin and Burst module, then starts loading Unity asset archives | Headset, tracking, controller, and host OpenXR support are intentionally deferred |
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
-| **Tetris Effect: Connected** | Completes Unreal filesystem/config bootstrap, executes compact typed UAV clears (including two 1024×1024 `RGBA32_FLOAT` targets) and 3D volume uploads, and reaches a second measured VideoOut frame with 6 draws/63 dispatches | Output is black: the deferred compositor reaches its scanout buffer but is rejected by an unsupported scalar source; a compact image-copy compute kernel and other compute gaps also remain, while the 512 GiB reservation can depend on host address-space placement |
+| **Tetris Effect: Connected** | Completes Unreal filesystem/config bootstrap, executes compact typed UAV clears and 3D volume uploads, then translates, compiles, and submits its 2,401-instruction deferred compositor; the draw writes all 8,294,400 pixels of the 3840×2160 scanout on the second measured VideoOut frame | The first repeatable guest framebuffer is uniform light gray rather than a recognizable scene; skipped LDS and `image_load`/`image_store` compute kernels plus unresolved storage-buffer bindings still leave compositor inputs incomplete, while the 512 GiB reservation can depend on host address-space placement |
 
 ## Components
 
@@ -155,6 +164,13 @@ controls the right stick. The launcher passes these preferences through
 `PS5_INPUT_MODE`, `PS5_CONTROLLER_INDEX`, `PS5_KEYMAP`, `PS5_SHOW_FPS`, and
 `PS5_AUDIO_DISABLED`, so direct CLI and automated runs keep their previous
 behaviour unless those variables are set.
+
+Graphics bring-up runs can set `PS5_CAPTURE_FIRST_FRAME=1` to write the first
+submitted guest draw to `out\first-frame.ppm`. `PS5_PROBE_FRAGMENT_COLOR=1`
+replaces the guest fragment shader with a fixed-color diagnostic, and
+`PS5_SKIP_COMPUTE=1` skips guest compute dispatches to shorten pipeline tests.
+The latter two switches deliberately change rendering and are not compatibility
+or correctness modes.
 
 For a native optimized build, install Zig 0.16 and use a current Vulkan driver:
 
@@ -276,14 +292,17 @@ sign extension, source/output modifiers, DPP lane control and row/bank masks.
 `control_flow.zig` splits decoded programs at direct branch targets and
 terminators, validates that every direct target begins an instruction and emits
 typed branch/fallthrough edges with SCC/VCC/EXEC predicate domains. It discovers
-forward selection merges and records backward edges separately. `ir.zig`
-supplies the API-neutral typed boundary for ALU, memory, image, interpolation
-and export work. The SPIR-V 1.5 writer translates 32-bit move,
+forward selection merges, derives a dominator hierarchy for nested and shared
+merge regions, and records backward edges separately. `ir.zig` supplies the
+API-neutral typed boundary for ALU, memory, image, interpolation and export
+work. The SPIR-V 1.5 writer translates 32-bit move,
 integer/bitwise/floating-point ALU, SDWA extraction, and the supported DPP/VOP3
-modifiers. Forward scalar selections become structured
-`OpSelectionMerge`/`OpBranchConditional` regions and register values crossing a
-merge use `OpPhi`. During graphics bring-up, unsupported control-flow shapes
-can take a documented linear pass which skips branches; it keeps a frame
+modifiers. Acyclic scalar selections become structured
+`OpSelectionMerge`/`OpBranchConditional` regions and register values crossing
+their joins use hierarchical `OpPhi` state merging. The Tetris Effect
+compositor exercises this path with 2,401 instructions, 131 basic blocks, and
+76 selections. Unsupported loop and irreducible shapes can still take a
+documented linear diagnostic pass which skips branches; it keeps a frame
 observable but is not correct for divergent paths.
 
 Executable MUBUF lowering covers byte/short/dword scalar and vector transfers
@@ -295,8 +314,10 @@ Graphics modules connect vertex `EXP POS0` to `BuiltIn Position`, vertex
 `PARAM0..31` exports to Vulkan locations, fragment VINTRP instructions to the
 matching inputs, and fragment `EXP MRT0` to color location zero. Hardware-only
 M0 setup and EXEC restoration from unavailable pixel-prolog SGPRs are tolerated
-without inventing guest data. The current MIMG path lowers normalized 2D
-`image_sample` through the combined sampled-image descriptor array.
+without inventing guest data. Fragment EXEC/VCC predicates use the subgroup
+local invocation index rather than a compute-only builtin. The current MIMG
+path lowers normalized 2D `image_sample` through the combined sampled-image
+descriptor array.
 Compressed/masked exports, additional MRT targets, non-trivial image operands,
 and the remaining graphics system VGPRs are still incomplete.
 
@@ -327,7 +348,14 @@ no container or header.
 
 ```sh
 rdna2-disasm shader.bin
+rdna2-disasm --cfg shader.bin
+rdna2-disasm --check-fragment shader.bin
+rdna2-disasm --write-fragment shader.bin module.spv
 ```
+
+`--cfg` prints control-flow statistics and back edges. `--check-fragment`
+requires a fully structured fragment translation, while `--write-fragment`
+writes that SPIR-V module for an external validator or driver reproducer.
 
 ```
 0x00000000: s_mov_b32 s0, s1
@@ -1696,15 +1724,15 @@ milestone now emit executable packets, so this title needs a fresh compatibility
 run before its next boundary can be stated. Host VR presentation remains absent.
 
 Tetris Effect: Connected exercises the same expanded Unreal path without a VR
-plugin. It reaches a repeated graphics/compute loop, records three draws on
-ordinary frames, and produced six observed VideoOut flips in an earlier test
-window without the previous host-side `memcpy` access violation. Its final
-compositor can legally omit CB descriptors and rely on the following VideoOut
-flip to name the scanout allocation. The renderer now keeps the latest complete
-targetless draw, snapshots its graphics state, and resolves a bounded 32-bit
-color target from the registered display address, dimensions, pitch, and tiling
-mode at that flip. `MissingColorTarget` is therefore no longer the immediate
-rendering boundary.
+plugin. It reaches a repeated graphics/compute loop and the second measured
+VideoOut frame contains 6 draws and 63 dispatches without the previous
+host-side `memcpy` access violation. Its final compositor can legally omit CB
+descriptors and rely on the following VideoOut flip to name the scanout
+allocation. The renderer keeps the latest complete targetless draw, snapshots
+its graphics state, and resolves a bounded 32-bit color target from the
+registered display address, dimensions, pitch, and tiling mode at that flip.
+An all-ones AGC screen-scissor register is treated as the unset sentinel rather
+than as an empty rectangle, so this path uses the complete 3840×2160 extent.
 Its compact 8- and 11-instruction typed clears now execute for `R8_UINT`,
 `R32_UINT`, `RGBA8_UNORM`, `RGBA8_UINT`, and `RGBA16_FLOAT`, including inverse
 storage swizzles and tiled render-target/depth addressing. The exact observed
@@ -1721,17 +1749,29 @@ excluded from the guest process clock, preventing the false
 `GameThread timed out waiting for RenderThread` watchdog that previously ended
 this slow host run at `eboot.bin+0x16af4ef` without stalling clocks in titles
 that issue many ordinary submissions per frame.
-The latest measurement reaches the following VideoOut flip after 464.684 host
-seconds and reports 6 draws, 63 dispatches, and 41 submissions. The pending
-display draw is resolved against the scanout allocation but is then rejected by
-`UnsupportedScalarSource`; an observed 20-instruction `image_load`/`image_store`
-copy kernel and other compute programs also remain unsupported.
-Its 3840×2160 display buffers now register with the expected pitch. A measured
-loading run held private memory near 2.2–2.3 GiB instead of retaining a geometric
-chain of arena-backed temporary buffers past 9 GiB; the remaining working-set
-growth tracks newly touched guest asset pages. A separate startup risk remains:
-placement of the title's 512 GiB sparse virtual reservation can fail when the
-Windows process layout leaves no suitable hole.
+The deferred compositor fragment program decodes to 2,401 instructions, 131
+basic blocks, and 76 forward selections. Dominator-ordered selection regions
+and hierarchical register `OpPhi` merging produce valid structured SPIR-V; the
+module passes `spirv-val`, compiles on the NVIDIA test driver, and submits with
+a fullscreen input mapping for the still-unimplemented NGG export stage. The
+draw writes all 8,294,400 pixels of the scanout, so
+`UnsupportedScalarSource`, a zero-sized scissor, and host pipeline compilation
+are no longer the immediate rendering boundary. The repeatable output is
+currently a uniform light gray rather than a recognizable title image because
+upstream compositor inputs are incomplete: observed LDS operations, a
+20-instruction `image_load`/`image_store` copy kernel, and unresolved
+storage-buffer bindings are still skipped or substituted.
+
+The normal diagnostic frame takes about 208 host seconds on the current test
+machine, of which roughly 170 seconds are synchronous compute emulation. The
+opt-in `PS5_SKIP_COMPUTE=1` bring-up mode reaches the same framebuffer in about
+44 seconds and must not be treated as correct execution. Its 3840×2160 display
+buffers register with the expected pitch. A measured loading run held private
+memory near 2.2–2.3 GiB instead of retaining a geometric chain of arena-backed
+temporary buffers past 9 GiB; the remaining working-set growth tracks newly
+touched guest asset pages. A separate startup risk remains: placement of the
+title's 512 GiB sparse virtual reservation can fail when the Windows process
+layout leaves no suitable hole.
 
 ## Error codes
 
@@ -1752,9 +1792,9 @@ from leaking into host code where nothing would check it.
 2. Replace the exact UAV fast paths with general storage-image lowering, then
    implement more color/texture formats, mip views, depth/stencil, MRT, and
    compressed-surface metadata.
-3. Lower the deferred compositor's scalar source and the compact image-copy
-   kernel now exposed at the following VideoOut flip, then close the remaining
-   compute register/storage/opcode gaps.
+3. Implement the NGG export/LDS path, the compact image-copy kernel, and the
+   missing storage-buffer descriptors that currently leave the deferred
+   compositor with incomplete inputs.
 4. Move the remaining first-use texture conversion and synchronous compute work
    off the frame-critical path without changing guest-visible synchronization.
 5. Keep the guest process in a stable long-running flip/submit loop and close
