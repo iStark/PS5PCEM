@@ -78,7 +78,16 @@ pub const Evaluation = struct {
 };
 
 pub fn evaluatePrefix(reader: shaders.MemoryReader, bindings: *const shaders.StageBindings) Evaluation {
-    return evaluate(reader, bindings, null);
+    return evaluate(reader, bindings, null, false);
+}
+
+/// Evaluates scalar resource setup past lane-mask branches. EXEC/VCC branches
+/// only decide whether active lanes reach a memory operation; the descriptor
+/// used by lanes that do reach it is normally prepared on the fallthrough
+/// path. Following that path recovers late V#/T# loads without changing the
+/// strict prefix evaluator used for shader specialization.
+pub fn evaluateResourceState(reader: shaders.MemoryReader, bindings: *const shaders.StageBindings) Evaluation {
+    return evaluate(reader, bindings, null, true);
 }
 
 /// Evaluates only the straight scalar region ending before `end_pc`. This is
@@ -89,10 +98,15 @@ pub fn evaluatePrefixUntil(
     bindings: *const shaders.StageBindings,
     end_pc: u32,
 ) Evaluation {
-    return evaluate(reader, bindings, end_pc);
+    return evaluate(reader, bindings, end_pc, false);
 }
 
-fn evaluate(reader: shaders.MemoryReader, bindings: *const shaders.StageBindings, end_pc: ?u32) Evaluation {
+fn evaluate(
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    end_pc: ?u32,
+    follow_lane_mask_fallthrough: bool,
+) Evaluation {
     var result = Evaluation{};
     const scalar_base: usize = bindings.scalar_user_data_base;
     const available = @min(
@@ -203,6 +217,13 @@ fn evaluate(reader: shaders.MemoryReader, bindings: *const shaders.StageBindings
                 };
                 if (taken) |is_taken| {
                     pc = if (is_taken) inst.branch_target else pc + inst.word_count * 4;
+                    continue;
+                }
+                if (follow_lane_mask_fallthrough and switch (inst.opcode) {
+                    .s_cbranch_vccz, .s_cbranch_vccnz, .s_cbranch_execz, .s_cbranch_execnz => true,
+                    else => false,
+                }) {
+                    pc +%= inst.word_count * 4;
                     continue;
                 }
                 result.stop_reason = .branch;
@@ -658,4 +679,21 @@ test "bounded scalar prefix does not observe later shader writes" {
     try std.testing.expectEqual(StopReason.prefix_complete, result.stop_reason);
     try std.testing.expectEqual(@as(u32, 1), result.register(2).?.value);
     try std.testing.expectEqual(@as(u32, 4), result.stop_pc);
+}
+
+test "resource evaluation follows the active-lane branch path" {
+    var storage = [_]u8{0} ** 0x40;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    memory.write(0x4000, 0xbf88_0001); // s_cbranch_execz skips the resource setup
+    memory.write(0x4004, 0xbe82_0381); // s_mov_b32 s2, 1
+    memory.write(0x4008, 0xbf81_0000);
+    const bindings = testBindings(0x4000, 0x1234);
+
+    const strict = evaluatePrefix(memory.reader(), &bindings);
+    try std.testing.expectEqual(StopReason.branch, strict.stop_reason);
+    try std.testing.expect(strict.register(2) == null);
+
+    const resources = evaluateResourceState(memory.reader(), &bindings);
+    try std.testing.expectEqual(StopReason.end_program, resources.stop_reason);
+    try std.testing.expectEqual(@as(u32, 1), resources.register(2).?.value);
 }

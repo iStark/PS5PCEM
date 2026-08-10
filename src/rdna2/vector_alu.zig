@@ -459,8 +459,14 @@ pub fn decodeVop3(pc: u32, code: []const u32, word_index: u32) Error!Instruction
     } else {
         inst.dst = try operand.decodeVectorGpr(word0 & 0xff);
     }
+    if (op == .v_addc_u32) {
+        // VOP3B repurposes the ABS field as a seven-bit scalar destination.
+        inst.dst2 = try operand.decodeScalarDestination((word0 >> 8) & 0x7f);
+    }
     inst.src0 = try operand.decodeScalarSource(word1 & 0x1ff);
-    inst.src_count = if (id >= 0x180 and id <= 0x1ff)
+    inst.src_count = if (op == .v_addc_u32)
+        3
+    else if (id >= 0x180 and id <= 0x1ff)
         1
     else if (id <= 0x13f or id == 0x365 or id == 0x366)
         2
@@ -468,7 +474,7 @@ pub fn decodeVop3(pc: u32, code: []const u32, word_index: u32) Error!Instruction
         3;
     if (inst.src_count >= 2) inst.src1 = try operand.decodeScalarSource((word1 >> 9) & 0x1ff);
     if (inst.src_count >= 3) inst.src2 = try operand.decodeScalarSource((word1 >> 18) & 0x1ff);
-    const abs = (word0 >> 8) & 7;
+    const abs = if (op == .v_addc_u32) 0 else (word0 >> 8) & 7;
     const neg = (word1 >> 29) & 7;
     const sources = [_]*operand.Operand{ &inst.src0, &inst.src1, &inst.src2 };
     for (sources, 0..) |src, i| {
@@ -567,6 +573,17 @@ test "native VOP3 shift-add opcode uses three sources" {
     try std.testing.expectEqual(@as(i32, 6), inst.src1.signed_val);
     try std.testing.expectEqual(isa.OperandKind.vgpr, inst.src2.kind);
     try std.testing.expectEqual(@as(u32, 0), inst.src2.reg);
+}
+
+test "VOP3B addc decodes scalar carry input and destination" {
+    const inst = try decodeVop3(0x7c, &.{ 0xd528_6a00, 0x0032_0080 }, 0);
+    try std.testing.expectEqual(isa.Opcode.v_addc_u32, inst.opcode);
+    try std.testing.expectEqual(@as(u32, 3), inst.src_count);
+    try std.testing.expectEqual(isa.OperandKind.vcc_lo, inst.dst2.kind);
+    try std.testing.expectEqual(isa.OperandKind.sgpr, inst.src2.kind);
+    try std.testing.expectEqual(@as(u32, 12), inst.src2.reg);
+    try std.testing.expect(!inst.src0.absolute);
+    try std.testing.expect(!inst.src1.absolute);
 }
 
 test "native VOP3 ordered float min max use two sources" {

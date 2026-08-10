@@ -212,6 +212,97 @@ fn runIndexedCopyKernel(
     }
 }
 
+fn imageDescriptorWords(address: u32, width: u32, height: u32) [8]u32 {
+    const encoded = address >> 8;
+    const width_minus_one = width - 1;
+    return .{
+        encoded,
+        (@as(u32, 60) << 20) | ((width_minus_one & 3) << 30), // RGBA8_UINT
+        (width_minus_one >> 2) | ((height - 1) << 14),
+        0x0000_0fac | (@as(u32, 9) << 28), // identity dst_sel, linear 2D
+        width - 1, // explicit pitch
+        0,
+        0,
+        0,
+    };
+}
+
+fn runStorageImageCopyKernel(
+    allocator: std.mem.Allocator,
+    renderer: *vulkan.Renderer,
+    guest: *GuestMemory,
+    backend: gpu.DcbBackend,
+) !void {
+    const program = 0x1800;
+    const width = 4;
+    const height = 4;
+    var program_cursor: usize = program;
+    for (0..height) |y| {
+        for (0..width) |x| {
+            guest.word(program_cursor, vop1(0x01, 0, @intCast(128 + x))); // v0 = x
+            guest.word(program_cursor + 4, vop1(0x01, 1, @intCast(128 + y))); // v1 = y
+            guest.word(program_cursor + 8, 0xf000_0f08); // image_load v4:v7, v[0:1], s[0:7]
+            guest.word(program_cursor + 12, 0x0000_0400);
+            guest.word(program_cursor + 16, 0xf020_0f08); // image_store v4:v7, v[0:1], s[8:15]
+            guest.word(program_cursor + 20, 0x0002_0400);
+            program_cursor += 24;
+        }
+    }
+    guest.word(program_cursor, 0xbf81_0000);
+
+    const source = 0x5000;
+    const destination = 0x6000;
+    const row_pitch_bytes = 256;
+    const allocation_bytes = row_pitch_bytes * height;
+    @memset(guest.bytes[source .. source + allocation_bytes], 0);
+    @memset(guest.bytes[destination .. destination + allocation_bytes], 0);
+    for (0..height) |y| {
+        for (0..width * 4) |byte| {
+            guest.bytes[source + y * row_pitch_bytes + byte] = @intCast(((y * width * 4 + byte) * 13 + 7) & 0xff);
+        }
+    }
+
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), program >> 8);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 16 << 1);
+    try state.writeRegister(.shader, 0x207, 1);
+    try state.writeRegister(.shader, 0x208, 1);
+    try state.writeRegister(.shader, 0x209, 1);
+    const descriptors = [_][8]u32{
+        imageDescriptorWords(source, width, height),
+        imageDescriptorWords(destination, width, height),
+    };
+    for (descriptors, 0..) |descriptor, descriptor_index| {
+        for (descriptor, 0..) |word, word_index| {
+            try state.writeRegister(
+                .shader,
+                compute.userDataBase() + @as(u32, @intCast(descriptor_index * 8 + word_index)),
+                word,
+            );
+        }
+    }
+    const stream = [_]u32{ command(gpu.pm4.dispatch_direct, 4), 1, 1, 1, 0x41 };
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = backend, .allocator = allocator };
+    _ = executor.execute(&stream) catch |err| {
+        std.debug.print("storage image copy refused: {s} (renderer: {s})\n", .{
+            @errorName(err),
+            if (renderer.last_dispatch_error) |reason| @errorName(reason) else "none",
+        });
+        return err;
+    };
+    for (0..height) |y| {
+        for (0..width * 4) |byte| {
+            const source_byte = guest.bytes[source + y * row_pitch_bytes + byte];
+            const destination_byte = guest.bytes[destination + y * row_pitch_bytes + byte];
+            if (source_byte != destination_byte) {
+                return error.StorageImageCopyMismatch;
+            }
+        }
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
 
@@ -219,6 +310,11 @@ pub fn main(init: std.process.Init) !void {
     defer renderer.deinit();
     var guest = GuestMemory{};
     const backend = renderer.dcbBackend(guest.interface());
+    if (init.minimal.environ.containsUnempty(allocator, "PS5_IMAGE_SMOKE_ONLY") catch false) {
+        try runStorageImageCopyKernel(allocator, &renderer, &guest, backend);
+        std.debug.print("storage image passed: 4x4 RGBA8_UINT load/store and guest writeback\n", .{});
+        return;
+    }
     const report = try renderer.smokeTest();
 
     const program_address = 0x100;
@@ -567,6 +663,10 @@ pub fn main(init: std.process.Init) !void {
     if (target_pixel[0] < 200 or target_pixel[1] < 40 or target_pixel[1] > 100 or
         target_pixel[2] > 80 or target_pixel[3] != 255)
     {
+        std.debug.print(
+            "guest color target mismatch: rgba=({d},{d},{d},{d})\n",
+            .{ target_pixel[0], target_pixel[1], target_pixel[2], target_pixel[3] },
+        );
         return error.InvalidGuestColorTargetWriteback;
     }
 
@@ -696,6 +796,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     try runIndexedCopyKernel(allocator, &renderer, &guest, backend);
+    try runStorageImageCopyKernel(allocator, &renderer, &guest, backend);
 
     var output_buffer: [1024]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &output_buffer);
@@ -708,6 +809,7 @@ pub fn main(init: std.process.Init) !void {
             "graphics DCB probe passed: 1 diagnostic + {d} guest draws, pipelines {d}/{d} miss/hit\n" ++
             "guest RDNA2 frame passed: {d} colored pixels in {d}x{d} RGBA8 target\n" ++
             "sampled image passed: {d} guest texture upload\n" ++
+            "storage image passed: 4x4 RGBA8_UINT load/store and guest writeback\n" ++
             "PM4 synchronization + SetFlip passed: {d} presented frame\n",
         .{
             vulkan.api.apiMajor(renderer.loader_api_version),

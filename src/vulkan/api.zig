@@ -128,6 +128,7 @@ pub const image_usage_transfer_src_bit: Flags = 0x0000_0001;
 pub const image_usage_transfer_dst_bit: Flags = 0x0000_0002;
 pub const image_usage_color_attachment_bit: Flags = 0x0000_0010;
 pub const image_usage_sampled_bit: Flags = 0x0000_0004;
+pub const image_usage_storage_bit: Flags = 0x0000_0008;
 pub const sharing_mode_exclusive: u32 = 0;
 
 pub const memory_property_host_visible_bit: Flags = 0x0000_0002;
@@ -162,9 +163,17 @@ pub const physical_device_type_discrete_gpu: u32 = 2;
 
 pub const descriptor_type_storage_buffer: u32 = 7;
 pub const descriptor_type_combined_image_sampler: u32 = 1;
+pub const descriptor_type_storage_image: u32 = 3;
 
+pub const format_r8_uint: u32 = 13;
+pub const format_r16_uint: u32 = 74;
+pub const format_r32_uint: u32 = 98;
 pub const format_r8g8b8a8_unorm: u32 = 37;
+pub const format_r8g8b8a8_uint: u32 = 41;
 pub const format_r8g8b8a8_srgb: u32 = 43;
+pub const format_r16g16b16a16_sfloat: u32 = 97;
+pub const format_r32g32b32a32_sfloat: u32 = 109;
+pub const format_b10g11r11_ufloat_pack32: u32 = 122;
 pub const component_swizzle_identity: u32 = 0;
 pub const component_swizzle_zero: u32 = 1;
 pub const component_swizzle_one: u32 = 2;
@@ -177,6 +186,7 @@ pub const image_view_type_2d: u32 = 1;
 pub const image_tiling_optimal: u32 = 0;
 pub const sample_count_1_bit: Flags = 1;
 pub const image_layout_undefined: u32 = 0;
+pub const image_layout_general: u32 = 1;
 pub const image_layout_color_attachment_optimal: u32 = 2;
 pub const image_layout_shader_read_only_optimal: u32 = 5;
 pub const image_layout_transfer_src_optimal: u32 = 6;
@@ -465,7 +475,7 @@ pub const WriteDescriptorSet = extern struct {
     descriptor_count: u32,
     descriptor_type: u32,
     image_info: ?*const anyopaque = null,
-    buffer_info: ?[*]const DescriptorBufferInfo,
+    buffer_info: ?[*]const DescriptorBufferInfo = null,
     texel_buffer_view: ?[*]const u64 = null,
 };
 

@@ -60,14 +60,21 @@ If you would like to support continued PS5PCEM development, you can do so on
   Connected reaches repeated graphics/compute submissions and VideoOut flips;
   its compact typed image-clear dispatches now update guest render-target and
   depth memory, including a dual 1024×1024 `RGBA32_FLOAT` clear, while its
-  bounded buffer-to-volume uploads populate 3D images.
+  bounded buffer-to-volume uploads populate 3D images. General compute
+  `image_load`/`image_store` now use individually typed Vulkan storage images,
+  including mixed `R11G11B10_FLOAT` and `RGBA8_UNORM` bindings, with checked
+  detile/upload and readback/retile. LDS is allocated from
+  `COMPUTE_PGM_RSRC2`, and the common DS read/write, paired, subword, atomic,
+  and barrier operations lower to SPIR-V Workgroup memory.
   Final compositor draws that omit color-buffer registers are now retained for
   the following VideoOut flip, which supplies the scanout target. The observed
   2,401-instruction fragment shader now translates to structured SPIR-V, passes
   validation, compiles on the host driver, and writes the full 3840×2160
   scanout. The first repeatable guest framebuffer is no longer black, but it is
-  still a uniform light gray rather than a recognizable scene because several
-  LDS, storage-image, and resource-binding compute paths remain incomplete.
+  still a uniform light gray rather than a recognizable scene. The former LDS,
+  storage-image-format, and late V# binding blockers have moved forward to an
+  unsupported compute `image_sample` in the observed 176-instruction prepass;
+  NGG export and additional image semantics remain incomplete.
 
 ### Screenshot
 
@@ -93,7 +100,7 @@ the repository contains none of that content.
 | **Terminator 2D: No Fate** | Reaches gameplay with correct color reproduction and clean title-provided backgrounds, characters, HUD elements, and textures; publisher logo screens and menus now match the console capture; warmed-up startup frames measure 22–65 ms on the current test host | First-use texture staging, Vulkan depth/MRT, and the remaining compression metadata are incomplete |
 | **Pistol Whip** | Maps the native PS VR2 plugin and Burst module, then starts loading Unity asset archives | Headset, tracking, controller, and host OpenXR support are intentionally deferred |
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
-| **Tetris Effect: Connected** | Completes Unreal filesystem/config bootstrap, executes compact typed UAV clears and 3D volume uploads, then translates, compiles, and submits its 2,401-instruction deferred compositor; the draw writes all 8,294,400 pixels of the 3840×2160 scanout on the second measured VideoOut frame | The first repeatable guest framebuffer is uniform light gray rather than a recognizable scene; skipped LDS and `image_load`/`image_store` compute kernels plus unresolved storage-buffer bindings still leave compositor inputs incomplete, while the 512 GiB reservation can depend on host address-space placement |
+| **Tetris Effect: Connected** | Completes Unreal filesystem/config bootstrap, executes compact typed UAV clears and 3D volume uploads, translates two 344/125-instruction volume dispatches with recursively recovered V# chains, and reaches mixed-format storage images in its LDS prepass; its 2,401-instruction deferred compositor writes all 8,294,400 pixels of the 3840×2160 scanout | The first repeatable guest framebuffer is uniform light gray rather than a recognizable scene; the observed 176-instruction prepass now stops at compute `image_sample`, while NGG export and some image forms remain incomplete and the 512 GiB reservation can depend on host address-space placement |
 
 ## Components
 
@@ -310,6 +317,23 @@ plus the ten common 32-bit buffer atomics; `glc` atomics preserve their returned
 old value in the guest VGPR. A binding may select a different staged V# at each
 instruction PC, retain the resolved SOFFSET, and use Vulkan `VertexIndex` for
 per-vertex fetches even when one guest SGPR is reused by several attributes.
+Compute V# recovery follows late `s_load_dwordxN` and nested
+`s_buffer_load_dwordxN` producers across EXEC/VCC bounds branches. The producer
+immediately preceding a memory instruction takes priority over the dispatch
+snapshot, because guest shaders routinely reuse dimension SGPRs before loading
+the real descriptor into them.
+
+Compute LDS is declared as bounded SPIR-V Workgroup memory using the size encoded
+by `COMPUTE_PGM_RSRC2`. Lowering covers 32/64/96/128-bit DS reads and writes,
+paired `read2`/`write2` byte addressing (including `st64` scaling), signed and
+unsigned byte/short reads, the common 32-bit integer/bitwise atomics,
+`s_barrier`, and `v_readfirstlane_b32`. General 2D `image_load` and full-mask
+`image_store` use independent typed storage-image bindings, so one shader can
+mix `R8_UINT`, `R16_UINT`, `R32_UINT`, `R11G11B10_FLOAT`, `RGBA8_UNORM`,
+`RGBA8_UINT`, `RGBA16_FLOAT`, and `RGBA32_FLOAT` without optional
+read/write-without-format device features. Array, mip, MSAA, 3D and image-atomic
+forms remain explicit future work.
+
 Graphics modules connect vertex `EXP POS0` to `BuiltIn Position`, vertex
 `PARAM0..31` exports to Vulkan locations, fragment VINTRP instructions to the
 matching inputs, and fragment `EXP MRT0` to color location zero. Hardware-only
@@ -317,7 +341,8 @@ M0 setup and EXEC restoration from unavailable pixel-prolog SGPRs are tolerated
 without inventing guest data. Fragment EXEC/VCC predicates use the subgroup
 local invocation index rather than a compute-only builtin. The current MIMG
 path lowers normalized 2D `image_sample` through the combined sampled-image
-descriptor array.
+descriptor array for fragment programs. Compute `image_sample` is not lowered
+yet.
 Compressed/masked exports, additional MRT targets, non-trivial image operands,
 and the remaining graphics system VGPRs are still incomplete.
 
@@ -462,8 +487,9 @@ set.
    DPP subgroup lowering, VOP3 modifiers plus the remaining opcode tables.
 2. Structure back edges with loop merges and lower VCC/EXEC lane-mask changes
    through the divergence-aware SSA boundary.
-3. Lower images, LDS, interpolation, masked/multiple exports and the remaining
-   system VGPRs against captured shader-resource and stage-interface metadata.
+3. Extend image and LDS lowering to sampled/array/mip/MSAA and remaining DS
+   forms, then finish masked/multiple exports and the remaining system VGPRs
+   against captured shader-resource and stage-interface metadata.
 
 ---
 
@@ -617,8 +643,9 @@ packet per line with its word offset, and counts the draws and dispatches:
 
 The shared GFX10 staging contract covers mip tails, thick 3D blocks, Oberon RB+
 MSAA addressing, and compute-detile constants. Compute submissions translate
-the supported RDNA2 ALU/SMEM/MUBUF path, specialize bounded scalar prologs, bind
-guest buffers, and copy device writes back to guest memory. Graphics draws
+the supported RDNA2 ALU/SMEM/MUBUF/DS and storage-image paths, specialize
+bounded scalar prologs, bind guest buffers and independently typed 2D images,
+and copy device writes back to guest memory. Graphics draws
 consume decoded color targets, viewport/scissor, cull/front-face, write-mask and
 blend state, then execute guest vertex/fragment SPIR-V. Render-target images are
 persistent across draws and are materialized back to guest memory only before a
@@ -697,9 +724,13 @@ apply the inverse descriptor storage swizzle, and use the render-target/depth
 tiling layout for each written texel. A separately matched bounds-checked upload
 kernel copies `R8_UINT` buffers into `RGBA8_UINT` 3D images and `R16_UINT`
 buffers into `R16_UINT` 3D images; linear volumes use aligned rows and
-consecutive depth slices through the same texture-layout contract. General `image_store`
-programs remain explicit unsupported work rather than taking either narrow
-path. Draw callbacks count work by default. When both vertex and pixel
+consecutive depth slices through the same texture-layout contract. General
+single-sample 2D `image_load`/`image_store` dispatches now stage each T# through
+the same texture-layout contract, bind up to eight independently typed Vulkan
+storage images, and retile writable results into guest memory after completion.
+Mip, array, 3D, MSAA, compressed and partial-mask store forms remain explicit
+unsupported work rather than taking a narrow fast path. Draw callbacks count
+work by default. When both vertex and pixel
 program registers are present,
 `DRAW_INDEX_AUTO` decodes both guest programs, resolves AGC vertex resources,
 lowers matching PARAM/VINTRP stage interfaces, creates or reuses a pipeline
@@ -798,10 +829,21 @@ positions and exports `POS0`; fragment variants export an MRT0 color or sample a
 4×4 guest texture. Three guest draws pass through the real decoder/translator,
 decoded graphics state and exact pipeline cache, render into a 64×64 guest RGBA8
 target, validate its tiled writeback, execute the PM4 synchronization packets and
-verify that `SetFlip` delivers the completed frame to a presentation sink:
+verify that `SetFlip` delivers the completed frame to a presentation sink.
+
+The final storage-image probe runs an RDNA2 `image_load`/`image_store` copy over
+a 4×4 `RGBA8_UINT` surface, including the guest's 256-byte linear row pitch,
+Vulkan storage-image transitions, and guest-visible readback. It can be isolated
+while diagnosing image support with `PS5_IMAGE_SMOKE_ONLY=1`.
 
 ```sh
 zig build vulkan-smoke
+```
+
+Run only the storage-image copy from PowerShell:
+
+```powershell
+$env:PS5_IMAGE_SMOKE_ONLY='1'; zig build vulkan-smoke
 ```
 
 ```text
@@ -812,8 +854,15 @@ translated RDNA2 passed: 6 dispatches, pipelines 3/3 miss/hit, buffers 6/6 miss/
 graphics DCB probe passed: 1 diagnostic + 3 guest draws, pipelines 3/1 miss/hit
 guest RDNA2 frame passed: 1152 colored pixels in 64x64 RGBA8 target
 sampled image passed: 1 guest texture upload
+storage image passed: 4x4 RGBA8_UINT load/store and guest writeback
 PM4 synchronization + SetFlip passed: 1 presented frame
 ```
+
+The isolated storage-image command above passes on the current Vulkan test
+host. The complete probe currently advances through its translated compute
+coverage and then stops later at `InvalidGuestColorTargetWriteback` in the
+synthetic graphics section; that renderer regression is separate from the
+storage-image copy result.
 
 The explicit window probe exercises the same swapchain sink used by live
 VideoOut and keeps a generated frame visible for two seconds:
@@ -1756,11 +1805,16 @@ module passes `spirv-val`, compiles on the NVIDIA test driver, and submits with
 a fullscreen input mapping for the still-unimplemented NGG export stage. The
 draw writes all 8,294,400 pixels of the scanout, so
 `UnsupportedScalarSource`, a zero-sized scissor, and host pipeline compilation
-are no longer the immediate rendering boundary. The repeatable output is
-currently a uniform light gray rather than a recognizable title image because
-upstream compositor inputs are incomplete: observed LDS operations, a
-20-instruction `image_load`/`image_store` copy kernel, and unresolved
-storage-buffer bindings are still skipped or substituted.
+are no longer the immediate rendering boundary. LDS now uses bounded SPIR-V
+Workgroup memory with DS paired/subword/atomic lowering, and the 20-instruction
+`image_load`/`image_store` path has a real typed Vulkan storage-image pipeline
+with detile/retile writeback. Late and nested compute V# chains are recovered
+from their SMEM producers; in the observed startup, both `15×9×8` volume
+dispatches that previously failed at the final `buffer_atomic_swap` now submit.
+The 176-instruction `30×34×1` prepass also resolves mixed
+`R11G11B10_FLOAT`/`RGBA8_UNORM` images, then reaches the next explicit gap:
+compute `image_sample` at PC `0x29c`. The repeatable output therefore remains a
+uniform light gray rather than a recognizable title image.
 
 The normal diagnostic frame takes about 208 host seconds on the current test
 machine, of which roughly 170 seconds are synchronous compute emulation. The
@@ -1789,11 +1843,12 @@ from leaking into host code where nothing would check it.
 
 1. Move changing vertex/scalar constants out of SPIR-V specialization so the
    same graphics pipelines survive transform and resource updates.
-2. Replace the exact UAV fast paths with general storage-image lowering, then
-   implement more color/texture formats, mip views, depth/stencil, MRT, and
-   compressed-surface metadata.
-3. Implement the NGG export/LDS path, the compact image-copy kernel, and the
-   missing storage-buffer descriptors that currently leave the deferred
+2. Extend general storage-image lowering to mip, array, 3D, MSAA, partial-mask,
+   depth/stencil, atomic, and compressed-surface forms; retain exact UAV fast
+   paths only where they reduce synchronous startup work without changing
+   semantics.
+3. Implement compute `image_sample`, finish the NGG export path, and cover the
+   remaining indirect descriptor variants that still leave the deferred
    compositor with incomplete inputs.
 4. Move the remaining first-use texture conversion and synchronous compute work
    off the frame-critical path without changing guest-visible synchronization.

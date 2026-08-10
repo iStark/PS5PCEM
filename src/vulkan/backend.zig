@@ -101,6 +101,7 @@ pub const Error = error{
     MissingPresentedFrame,
     PresentationRejected,
     UnsupportedSampledImage,
+    UnsupportedStorageImage,
     SamplerCreationFailed,
     UnsupportedPresentationPlatform,
     SurfaceCreationFailed,
@@ -530,6 +531,8 @@ const OwnedImage = struct {
 // moved its ring buffers on, while still covering every descriptor in a draw.
 const maximum_guest_buffers = maximum_storage_descriptors;
 pub const maximum_storage_descriptors = 64;
+const maximum_storage_images = 8;
+const maximum_storage_mappings = 1024;
 const maximum_compute_pipelines = 256;
 /// Titles that specialize transform and colour constants reach thousands of
 /// shader variants in seconds: Terminator 2D passes six thousand within a
@@ -899,6 +902,17 @@ const PreparedSampledImage = struct {
     sampler: vk.Sampler,
 };
 
+const PreparedStorageImage = struct {
+    descriptor: gpu.ImageDescriptor,
+    subresource: gpu.TextureSubresourceLayout,
+    image: OwnedImage,
+    view: vk.ImageView,
+    transfer: OwnedBuffer,
+    allocation_bytes: usize,
+    staging_bytes: usize,
+    writable: bool,
+};
+
 const GraphicsResources = struct {
     images: [maximum_storage_descriptors]PreparedSampledImage = undefined,
     image_count: usize = 0,
@@ -917,7 +931,7 @@ const PipelineLookup = struct {
 };
 
 const ComputeResources = struct {
-    mappings: [maximum_storage_descriptors]gpu.ShaderSpirvStorageBufferBinding = undefined,
+    mappings: [maximum_storage_mappings]gpu.ShaderSpirvStorageBufferBinding = undefined,
     mapping_count: usize = 0,
     scalar_registers: [gpu.resources.maximum_user_data_words]gpu.ShaderSpirvScalarRegister = undefined,
     scalar_count: usize = 0,
@@ -926,6 +940,10 @@ const ComputeResources = struct {
     occupied: [maximum_storage_descriptors]bool = @splat(false),
     writable: [maximum_storage_descriptors]bool = @splat(false),
     specialized_scalar_prefix_end: u32 = 0,
+    storage_images: [maximum_storage_images]PreparedStorageImage = undefined,
+    storage_image_count: usize = 0,
+    storage_image_mappings: [maximum_storage_images]gpu.ShaderSpirvStorageImageBinding = undefined,
+    storage_image_mapping_count: usize = 0,
 
     fn descriptorForRange(self: *const ComputeResources, address: u64, size: usize) ?u32 {
         for (self.occupied, 0..) |used, index| {
@@ -946,6 +964,23 @@ const ComputeResources = struct {
             if (mapping.resource_sgpr == resource_sgpr) return mapping.descriptor_index;
         }
         return null;
+    }
+
+    fn storageImageMappingForSgpr(self: *const ComputeResources, resource_sgpr: u32) ?u32 {
+        for (self.storage_image_mappings[0..self.storage_image_mapping_count]) |mapping| {
+            if (mapping.resource_sgpr == resource_sgpr) return mapping.descriptor_index;
+        }
+        return null;
+    }
+
+    fn deinit(self: *ComputeResources, renderer: *Renderer) void {
+        for (self.storage_images[0..self.storage_image_count]) |image| {
+            renderer.device_functions.destroy_image_view(renderer.device, image.view, null);
+            renderer.destroyImage(image.image);
+            renderer.destroyBuffer(image.transfer);
+        }
+        self.storage_image_count = 0;
+        self.storage_image_mapping_count = 0;
     }
 };
 
@@ -1208,7 +1243,17 @@ pub const Renderer = struct {
             .descriptor_count = maximum_storage_descriptors,
             .stage_flags = vk.shader_stage_fragment_bit,
         };
-        const descriptor_bindings = [_]vk.DescriptorSetLayoutBinding{ storage_binding, sampled_image_binding };
+        var descriptor_bindings: [2 + maximum_storage_images]vk.DescriptorSetLayoutBinding = undefined;
+        descriptor_bindings[0] = storage_binding;
+        descriptor_bindings[1] = sampled_image_binding;
+        for (0..maximum_storage_images) |index| {
+            descriptor_bindings[2 + index] = .{
+                .binding = @intCast(2 + index),
+                .descriptor_type = vk.descriptor_type_storage_image,
+                .descriptor_count = 1,
+                .stage_flags = vk.shader_stage_compute_bit,
+            };
+        }
         const descriptor_layout_info = vk.DescriptorSetLayoutCreateInfo{
             .binding_count = descriptor_bindings.len,
             .bindings = &descriptor_bindings,
@@ -1227,7 +1272,11 @@ pub const Renderer = struct {
             .descriptor_type = vk.descriptor_type_combined_image_sampler,
             .descriptor_count = maximum_storage_descriptors,
         };
-        const pool_sizes = [_]vk.DescriptorPoolSize{ pool_size, image_pool_size };
+        const storage_image_pool_size = vk.DescriptorPoolSize{
+            .descriptor_type = vk.descriptor_type_storage_image,
+            .descriptor_count = maximum_storage_images,
+        };
+        const pool_sizes = [_]vk.DescriptorPoolSize{ pool_size, image_pool_size, storage_image_pool_size };
         const descriptor_pool_info = vk.DescriptorPoolCreateInfo{
             .max_sets = 1,
             .pool_size_count = pool_sizes.len,
@@ -2021,16 +2070,19 @@ pub const Renderer = struct {
             specialized_scalar_prefix_end,
             null,
         );
+        defer resources.deinit(self);
         var module = analysis.translateSpirv(self.allocator, .{
             .stage = .compute,
             .local_size = local_size,
             .storage_buffers = resources.mappings[0..resources.mapping_count],
+            .storage_images = resources.storage_image_mappings[0..resources.storage_image_mapping_count],
             .scalar_registers = resources.scalar_registers[0..resources.scalar_count],
             .compute_inputs = .{
                 .workgroup_id_sgprs = system_registers.workgroup_id_sgprs,
                 .threadgroup_size_sgpr = system_registers.threadgroup_size_sgpr,
                 .local_invocation_id_components = system_registers.local_invocation_id_components,
             },
+            .workgroup_memory_size_bytes = computeLdsSizeBytes(state),
             .descriptor_array_length = maximum_storage_descriptors,
             .specialized_scalar_prefix_end = resources.specialized_scalar_prefix_end,
         }) catch |err| {
@@ -2086,6 +2138,7 @@ pub const Renderer = struct {
         defer module.deinit(self.allocator);
         const report = try self.dispatchSpirv(module.words, group_count);
         try self.commitComputeWrites(memory, &resources);
+        try self.commitStorageImages(memory, &resources);
         return report;
     }
 
@@ -2645,6 +2698,7 @@ pub const Renderer = struct {
         reserved_resources: ?*const ComputeResources,
     ) anyerror!ComputeResources {
         var result = ComputeResources{};
+        errdefer result.deinit(self);
         result.specialized_scalar_prefix_end = specialized_scalar_prefix_end;
         if (reserved_resources) |reserved| {
             for (reserved.occupied, 0..) |used, index| {
@@ -2668,6 +2722,7 @@ pub const Renderer = struct {
             result.scalar_registers[result.scalar_count] = .{ .register = @intCast(index), .value = value.value };
             result.scalar_count += 1;
         }
+        const resource_scalar = gpu.scalar_provenance.evaluateResourceState(reader, bindings);
 
         // Preserve the AGC slot number whenever possible. This makes the host
         // descriptor table stable across shaders that share one SRT layout.
@@ -2740,11 +2795,6 @@ pub const Renderer = struct {
                 return Error.MissingStorageDescriptor;
             }
             const resource_sgpr = resource_operand.reg;
-            if (bindings.stage == .compute or vertex_table == null) if (result.mappingForSgpr(resource_sgpr)) |descriptor_index| {
-                if (is_store) result.writable[descriptor_index] = true;
-                continue;
-            };
-
             var vertex_attribute: ?gpu.VertexAttribute = null;
             if (bindings.stage != .compute and inst.family != .smem and !is_store) {
                 if (vertex_table) |table| {
@@ -2758,7 +2808,7 @@ pub const Renderer = struct {
             // SGPR. Only actual vertex attributes need a PC-qualified mapping,
             // because two fetch instructions may pair the same SGPR with
             // different attribute-table entries.
-            if (vertex_attribute == null) if (result.mappingForSgpr(resource_sgpr)) |descriptor_index| {
+            if (bindings.stage != .compute and vertex_attribute == null) if (result.mappingForSgpr(resource_sgpr)) |descriptor_index| {
                 if (is_store) result.writable[descriptor_index] = true;
                 continue;
             };
@@ -2768,8 +2818,11 @@ pub const Renderer = struct {
                 null) orelse try resolveComputeBufferDescriptor(
                 bindings,
                 reader,
+                analysis,
                 scalar,
+                &resource_scalar,
                 resource_sgpr,
+                inst.pc,
             ) orelse {
                 if (log_verbose_gpu) {
                     const full = gpu.scalar_provenance.evaluatePrefix(reader, bindings);
@@ -2835,10 +2888,26 @@ pub const Renderer = struct {
                 result.sizes[free] = size;
                 break :blk free;
             };
+            const previous_descriptor_index = result.mappingForSgpr(resource_sgpr);
+            if (previous_descriptor_index != null and previous_descriptor_index.? == descriptor_index) {
+                if (is_store) result.writable[descriptor_index] = true;
+                continue;
+            }
+            if (result.mapping_count >= result.mappings.len) {
+                if (log_verbose_gpu) std.debug.print(
+                    "[vulkan dcb] no free V# mapping for pc=0x{x} s{d}; soft-skip\n",
+                    .{ inst.pc, resource_sgpr },
+                );
+                continue;
+            }
             result.mappings[result.mapping_count] = .{
                 .resource_sgpr = resource_sgpr,
                 .descriptor_index = descriptor_index,
-                .instruction_pc = if (vertex_attribute != null) inst.pc else null,
+                .instruction_pc = if (vertex_attribute != null or
+                    (bindings.stage == .compute and previous_descriptor_index != null))
+                    inst.pc
+                else
+                    null,
                 .soffset_value = if (vertex_attribute) |attribute| attribute.offset_bytes else null,
                 .use_vertex_index = vertex_attribute != null,
                 .stride = descriptor.stride,
@@ -2852,6 +2921,102 @@ pub const Renderer = struct {
             };
             result.mapping_count += 1;
             if (is_store) result.writable[descriptor_index] = true;
+        }
+
+        for (analysis.program.instructions.items) |inst| {
+            const writable = switch (inst.opcode) {
+                .image_load => false,
+                .image_store => true,
+                else => continue,
+            };
+            if (inst.src1.kind != .sgpr) {
+                if (log_verbose_gpu) std.debug.print(
+                    "[vulkan dcb] storage image pc=0x{x}: resource is {s}, not SGPR\n",
+                    .{ inst.pc, @tagName(inst.src1.kind) },
+                );
+                return Error.UnsupportedStorageImage;
+            }
+            const resource_sgpr = inst.src1.reg;
+            if (result.storageImageMappingForSgpr(resource_sgpr)) |descriptor_index| {
+                if (writable) result.storage_images[descriptor_index].writable = true;
+                continue;
+            }
+            if (result.storage_image_mapping_count >= maximum_storage_images) {
+                return Error.UnsupportedStorageImage;
+            }
+            const descriptor = (try resolveComputeImageDescriptor(
+                bindings,
+                reader,
+                analysis,
+                scalar,
+                resource_sgpr,
+                result.storage_image_mapping_count,
+            )) orelse {
+                if (log_verbose_gpu) std.debug.print(
+                    "[vulkan dcb] storage image pc=0x{x}: T# s{d}:s{d} unresolved\n",
+                    .{ inst.pc, resource_sgpr, resource_sgpr + 7 },
+                );
+                return Error.UnsupportedStorageImage;
+            };
+            const format = storageImageFormat(descriptor.unified_format) orelse {
+                if (log_verbose_gpu) std.debug.print(
+                    "[vulkan dcb] storage image pc=0x{x}: format {d} is unsupported\n",
+                    .{ inst.pc, descriptor.unified_format },
+                );
+                return Error.UnsupportedStorageImage;
+            };
+            var descriptor_index: ?u32 = null;
+            for (result.storage_images[0..result.storage_image_count], 0..) |*existing, index| {
+                if (existing.descriptor.address == descriptor.address and
+                    existing.descriptor.width == descriptor.width and
+                    existing.descriptor.height == descriptor.height and
+                    existing.descriptor.unified_format == descriptor.unified_format and
+                    existing.descriptor.tile_mode == descriptor.tile_mode)
+                {
+                    if (writable) existing.writable = true;
+                    descriptor_index = @intCast(index);
+                    break;
+                }
+            }
+            if (descriptor_index == null) {
+                if (result.storage_image_count >= maximum_storage_images) {
+                    return Error.UnsupportedStorageImage;
+                }
+                const index: u32 = @intCast(result.storage_image_count);
+                result.storage_images[result.storage_image_count] = self.stageStorageImage(
+                    descriptor,
+                    index,
+                    writable,
+                ) catch |err| {
+                    if (log_verbose_gpu) std.debug.print(
+                        "[vulkan dcb] storage image pc=0x{x}: stage failed {s} addr=0x{x} {d}x{d}x{d} fmt={d} type={s} tile={s} dcc={any} cmask={any} fmask={any}\n",
+                        .{
+                            inst.pc,
+                            @errorName(err),
+                            descriptor.address,
+                            descriptor.width,
+                            descriptor.height,
+                            descriptor.depth_or_layers,
+                            descriptor.unified_format,
+                            @tagName(descriptor.image_type),
+                            @tagName(descriptor.tile_mode),
+                            descriptor.dcc_enabled,
+                            descriptor.cmask_fast_clear,
+                            descriptor.fmask_compression,
+                        },
+                    );
+                    return err;
+                };
+                result.storage_image_count += 1;
+                descriptor_index = index;
+            }
+            result.storage_image_mappings[result.storage_image_mapping_count] = .{
+                .resource_sgpr = resource_sgpr,
+                .descriptor_index = descriptor_index.?,
+                .format = format.spirv,
+                .dst_select = descriptor.dst_select,
+            };
+            result.storage_image_mapping_count += 1;
         }
         return result;
     }
@@ -5350,6 +5515,216 @@ pub const Renderer = struct {
         self.device_functions.update_descriptor_sets(self.device, 1, @ptrCast(&write), 0, null);
     }
 
+    fn updateStorageImageDescriptor(self: *Renderer, descriptor_index: u32, view: vk.ImageView) void {
+        const image_info = vk.DescriptorImageInfo{
+            .sampler = 0,
+            .image_view = view,
+            .image_layout = vk.image_layout_general,
+        };
+        const write = vk.WriteDescriptorSet{
+            .destination_set = self.descriptor_set,
+            .destination_binding = 2 + descriptor_index,
+            .destination_array_element = 0,
+            .descriptor_count = 1,
+            .descriptor_type = vk.descriptor_type_storage_image,
+            .image_info = @ptrCast(&image_info),
+        };
+        self.device_functions.update_descriptor_sets(self.device, 1, @ptrCast(&write), 0, null);
+        self.active_descriptor_set = self.descriptor_set;
+    }
+
+    fn stageStorageImage(
+        self: *Renderer,
+        descriptor: gpu.ImageDescriptor,
+        descriptor_index: u32,
+        writable: bool,
+    ) anyerror!PreparedStorageImage {
+        if (descriptor.image_type != .color_2d or descriptor.samplesLog2() != 0 or
+            descriptor.viewBaseLevel() != 0 or descriptor.viewMipLevels() != 1 or
+            descriptor.depth_or_layers != 1 or descriptor.dcc_enabled or
+            descriptor.cmask_fast_clear or descriptor.fmask_compression)
+        {
+            return Error.UnsupportedStorageImage;
+        }
+        const format = storageImageFormat(descriptor.unified_format) orelse
+            return Error.UnsupportedStorageImage;
+        const texture = gpu.TextureLayout.fromImage(descriptor) catch return Error.UnsupportedStorageImage;
+        const subresource = texture.subresource(0, 0, 1) catch return Error.UnsupportedStorageImage;
+        const staging_bytes_u64 = subresource.stagingBytes() catch return Error.UnsupportedStorageImage;
+        if (staging_bytes_u64 == 0 or staging_bytes_u64 > maximum_frame_bytes or
+            texture.required_source_bytes == 0 or texture.required_source_bytes > maximum_frame_bytes or
+            subresource.block.bytes_per_element != storageImageBytesPerTexel(descriptor.unified_format))
+        {
+            return Error.UnsupportedStorageImage;
+        }
+        const staging_bytes = std.math.cast(usize, staging_bytes_u64) orelse return Error.UnsupportedStorageImage;
+        const allocation_bytes = std.math.cast(usize, texture.required_source_bytes) orelse
+            return Error.UnsupportedStorageImage;
+        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        try self.flushPendingGuestWrite(descriptor.address, allocation_bytes);
+
+        const allocation = try self.allocator.alloc(u8, allocation_bytes);
+        defer self.allocator.free(allocation);
+        if (!memory.read(memory.context, descriptor.address, allocation)) return Error.GuestMemoryReadFailed;
+        const linear = try self.allocator.alloc(u8, staging_bytes);
+        defer self.allocator.free(linear);
+        try subresource.detile(allocation, linear);
+
+        const transfer = try self.createBuffer(
+            staging_bytes,
+            vk.buffer_usage_transfer_src_bit | vk.buffer_usage_transfer_dst_bit,
+            vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+        );
+        errdefer self.destroyBuffer(transfer);
+        try self.writeMapped(transfer, linear);
+        const image = try self.createImage(
+            descriptor.width,
+            descriptor.height,
+            format.vulkan,
+            vk.image_usage_transfer_src_bit | vk.image_usage_transfer_dst_bit | vk.image_usage_storage_bit,
+        );
+        errdefer self.destroyImage(image);
+        const view_info = vk.ImageViewCreateInfo{
+            .image = image.handle,
+            .format = format.vulkan,
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        var view: vk.ImageView = 0;
+        if (self.device_functions.create_image_view(self.device, &view_info, null, &view) != vk.success) {
+            return Error.ImageViewCreationFailed;
+        }
+        errdefer self.device_functions.destroy_image_view(self.device, view, null);
+
+        const command_buffer = try self.beginOneShot();
+        defer self.device_functions.free_command_buffers(self.device, self.command_pool, 1, @ptrCast(&command_buffer));
+        const upload_barrier = vk.ImageMemoryBarrier{
+            .source_access_mask = 0,
+            .destination_access_mask = vk.access_transfer_write_bit,
+            .old_layout = vk.image_layout_undefined,
+            .new_layout = vk.image_layout_transfer_dst_optimal,
+            .image = image.handle,
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_top_of_pipe_bit,
+            vk.pipeline_stage_transfer_bit,
+            0,
+            0,
+            null,
+            0,
+            null,
+            1,
+            @ptrCast(&upload_barrier),
+        );
+        const copy = vk.BufferImageCopy{
+            .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+            .image_extent = .{ .width = descriptor.width, .height = descriptor.height, .depth = 1 },
+        };
+        self.device_functions.cmd_copy_buffer_to_image(
+            command_buffer,
+            transfer.handle,
+            image.handle,
+            vk.image_layout_transfer_dst_optimal,
+            1,
+            @ptrCast(&copy),
+        );
+        const shader_barrier = vk.ImageMemoryBarrier{
+            .source_access_mask = vk.access_transfer_write_bit,
+            .destination_access_mask = vk.access_shader_read_bit | vk.access_shader_write_bit,
+            .old_layout = vk.image_layout_transfer_dst_optimal,
+            .new_layout = vk.image_layout_general,
+            .image = image.handle,
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_transfer_bit,
+            vk.pipeline_stage_compute_shader_bit,
+            0,
+            0,
+            null,
+            0,
+            null,
+            1,
+            @ptrCast(&shader_barrier),
+        );
+        try self.submitOneShot(command_buffer);
+        self.updateStorageImageDescriptor(descriptor_index, view);
+        self.frame_profile.upload_bytes +%= staging_bytes;
+        self.frame_profile.texture_upload_bytes +%= staging_bytes;
+        return .{
+            .descriptor = descriptor,
+            .subresource = subresource,
+            .image = image,
+            .view = view,
+            .transfer = transfer,
+            .allocation_bytes = allocation_bytes,
+            .staging_bytes = staging_bytes,
+            .writable = writable,
+        };
+    }
+
+    fn commitStorageImages(self: *Renderer, memory: GuestMemory, resources: *const ComputeResources) anyerror!void {
+        for (resources.storage_images[0..resources.storage_image_count]) |prepared| {
+            if (!prepared.writable) continue;
+            const command_buffer = try self.beginOneShot();
+            defer self.device_functions.free_command_buffers(self.device, self.command_pool, 1, @ptrCast(&command_buffer));
+            const transfer_barrier = vk.ImageMemoryBarrier{
+                .source_access_mask = vk.access_shader_write_bit,
+                .destination_access_mask = vk.access_transfer_read_bit,
+                .old_layout = vk.image_layout_general,
+                .new_layout = vk.image_layout_transfer_src_optimal,
+                .image = prepared.image.handle,
+                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+            };
+            self.device_functions.cmd_pipeline_barrier(
+                command_buffer,
+                vk.pipeline_stage_compute_shader_bit,
+                vk.pipeline_stage_transfer_bit,
+                0,
+                0,
+                null,
+                0,
+                null,
+                1,
+                @ptrCast(&transfer_barrier),
+            );
+            const copy = vk.BufferImageCopy{
+                .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+                .image_extent = .{
+                    .width = prepared.descriptor.width,
+                    .height = prepared.descriptor.height,
+                    .depth = 1,
+                },
+            };
+            self.device_functions.cmd_copy_image_to_buffer(
+                command_buffer,
+                prepared.image.handle,
+                vk.image_layout_transfer_src_optimal,
+                prepared.transfer.handle,
+                1,
+                @ptrCast(&copy),
+            );
+            try self.submitOneShot(command_buffer);
+
+            const linear = try self.allocator.alloc(u8, prepared.staging_bytes);
+            defer self.allocator.free(linear);
+            try self.readMapped(prepared.transfer, linear);
+            const allocation = try self.allocator.alloc(u8, prepared.allocation_bytes);
+            defer self.allocator.free(allocation);
+            if (!memory.read(memory.context, prepared.descriptor.address, allocation)) {
+                return Error.GuestMemoryReadFailed;
+            }
+            try prepared.subresource.tile(linear, allocation);
+            if (!memory.write(memory.context, prepared.descriptor.address, allocation)) {
+                return Error.GuestMemoryWriteFailed;
+            }
+            self.frame_profile.readback_bytes +%= prepared.staging_bytes;
+            self.frame_profile.storage_readback_bytes +%= prepared.staging_bytes;
+        }
+    }
+
     fn stageSampledImage(
         self: *Renderer,
         descriptor: gpu.resources.ImageDescriptor,
@@ -6871,6 +7246,32 @@ fn imageDescriptorFromUserDataPointer(
     return try gpu.resources.decodeImageDescriptor(&words);
 }
 
+fn bufferDescriptorFromUserDataPointer(
+    bindings: *const gpu.ShaderBindings,
+    reader: gpu.ShaderMemoryReader,
+    pointer_sgpr: u32,
+    byte_offset: i32,
+) anyerror!?gpu.BufferDescriptor {
+    if (pointer_sgpr < bindings.scalar_user_data_base) return null;
+    const first: usize = pointer_sgpr - bindings.scalar_user_data_base;
+    if (first + 2 > bindings.user_data_count) return null;
+    const low = bindings.user_data[first];
+    const high = bindings.user_data[first + 1];
+    if (high & 0xffff_0000 != 0) return null;
+    const base = @as(u64, low) | (@as(u64, high) << 32);
+    const address = if (byte_offset >= 0)
+        std.math.add(u64, base, @intCast(byte_offset)) catch return null
+    else
+        std.math.sub(u64, base, @intCast(-byte_offset)) catch return null;
+    if (address == 0) return null;
+    var words: [4]u32 = undefined;
+    try reader.readWords(address & ~@as(u64, 3), &words);
+    return gpu.resources.decodeBufferDescriptor(&words) catch |err| switch (err) {
+        error.InvalidDescriptor, error.InvalidFormat => null,
+        else => return err,
+    };
+}
+
 const PackedImageStoreTexel = struct {
     bytes: [16]u8 = @splat(0),
     length: u8,
@@ -7060,6 +7461,12 @@ fn computeLocalSize(state: *const gpu.State, register: u32) u32 {
     return @max(encoded, 1);
 }
 
+fn computeLdsSizeBytes(state: *const gpu.State) u32 {
+    const rsrc2 = state.readRegister(.shader, 0x213) orelse return 0;
+    const blocks = (rsrc2 >> 15) & 0x1ff;
+    return blocks * 512;
+}
+
 fn scalarPrefixEnd(analysis: *const gpu.ShaderAnalysis) u32 {
     var end: u32 = 0;
     for (analysis.program.instructions.items) |inst| {
@@ -7194,6 +7601,36 @@ fn hashGuestMemoryRange(memory: GuestMemory, address: u64, span: usize) u64 {
 
 fn sampledImageFormat(force_srgb: bool) u32 {
     return if (force_srgb) vk.format_r8g8b8a8_srgb else vk.format_r8g8b8a8_unorm;
+}
+
+const StorageImageFormat = struct {
+    spirv: gpu.ShaderSpirvStorageImageFormat,
+    vulkan: u32,
+};
+
+fn storageImageFormat(unified_format: u16) ?StorageImageFormat {
+    return switch (unified_format) {
+        5 => .{ .spirv = .r8_uint, .vulkan = vk.format_r8_uint },
+        11 => .{ .spirv = .r16_uint, .vulkan = vk.format_r16_uint },
+        20 => .{ .spirv = .r32_uint, .vulkan = vk.format_r32_uint },
+        36 => .{ .spirv = .r11g11b10_float, .vulkan = vk.format_b10g11r11_ufloat_pack32 },
+        56 => .{ .spirv = .rgba8_unorm, .vulkan = vk.format_r8g8b8a8_unorm },
+        60 => .{ .spirv = .rgba8_uint, .vulkan = vk.format_r8g8b8a8_uint },
+        71 => .{ .spirv = .rgba16_float, .vulkan = vk.format_r16g16b16a16_sfloat },
+        77 => .{ .spirv = .rgba32_float, .vulkan = vk.format_r32g32b32a32_sfloat },
+        else => null,
+    };
+}
+
+fn storageImageBytesPerTexel(unified_format: u16) u8 {
+    return switch (unified_format) {
+        5 => 1,
+        11 => 2,
+        20, 36, 56, 60 => 4,
+        71 => 8,
+        77 => 16,
+        else => 0,
+    };
 }
 
 fn vulkanComponentSwizzle(selector: u8) Error!u32 {
@@ -7803,6 +8240,74 @@ fn scalarBufferDescriptor(
     return try gpu.resources.decodeBufferDescriptor(&words);
 }
 
+fn scalarImageDescriptor(
+    scalar: *const gpu.ScalarEvaluation,
+    resource_sgpr: u32,
+) gpu.resources.Error!?gpu.ImageDescriptor {
+    if (resource_sgpr + 8 > gpu.scalar_provenance.maximum_scalar_registers) return null;
+    var words: [8]u32 = undefined;
+    for (&words, 0..) |*word, index| {
+        const value = scalar.registers[resource_sgpr + index];
+        if (!value.known) return null;
+        word.* = value.value;
+    }
+    return gpu.resources.decodeImageDescriptor(&words) catch |err| switch (err) {
+        error.InvalidDescriptor, error.InvalidFormat => null,
+        else => return err,
+    };
+}
+
+fn inlineBufferDescriptorOrNull(
+    bindings: *const gpu.ShaderBindings,
+    resource_sgpr: u32,
+) anyerror!?gpu.BufferDescriptor {
+    return bindings.inlineBufferDescriptor(resource_sgpr) catch |err| switch (err) {
+        error.InvalidDescriptor, error.InvalidFormat => null,
+        else => return err,
+    };
+}
+
+fn inlineImageDescriptorOrNull(
+    bindings: *const gpu.ShaderBindings,
+    resource_sgpr: u32,
+) anyerror!?gpu.ImageDescriptor {
+    return bindings.inlineImageDescriptor(resource_sgpr) catch |err| switch (err) {
+        error.InvalidDescriptor, error.InvalidFormat => null,
+        else => return err,
+    };
+}
+
+fn resolveComputeImageDescriptor(
+    bindings: *const gpu.ShaderBindings,
+    reader: gpu.ShaderMemoryReader,
+    analysis: *const gpu.ShaderAnalysis,
+    scalar: *const gpu.ScalarEvaluation,
+    resource_sgpr: u32,
+    fallback_slot: usize,
+) anyerror!?gpu.ImageDescriptor {
+    if (try scalarImageDescriptor(scalar, resource_sgpr)) |descriptor| return descriptor;
+    if (try inlineImageDescriptorOrNull(bindings, resource_sgpr)) |descriptor| return descriptor;
+
+    // A common AGC compute prolog loads a destination T# from a pointer held
+    // directly in USER_DATA after an EXECZ bounds check. Scalar prefix
+    // specialization deliberately ends at that branch, so recover the exact
+    // s_load_dwordx8 producer rather than leaving the later image_store
+    // unbound.
+    for (analysis.program.instructions.items) |inst| {
+        if (inst.opcode != .s_load_dwordx8 or inst.dst.kind != .sgpr or
+            inst.dst.reg != resource_sgpr or inst.src0.kind != .sgpr) continue;
+        if (try imageDescriptorFromUserDataPointer(bindings, reader, inst.src0.reg)) |descriptor| {
+            return descriptor;
+        }
+    }
+    if (fallback_slot <= std.math.maxInt(u16)) {
+        if (try bindings.resolve(reader, .read_write_texture, @intCast(fallback_slot))) |binding| {
+            return binding.descriptor.read_write_texture;
+        }
+    }
+    return null;
+}
+
 /// Whether a decoded V# can be staged as guest storage.
 ///
 /// USER_DATA often starts with an SRT pointer whose low dword is a small
@@ -7818,34 +8323,151 @@ fn isPlausibleBufferDescriptor(descriptor: gpu.BufferDescriptor) bool {
     return true;
 }
 
+/// An explicit SMEM producer is stronger evidence than an arbitrary four-word
+/// USER_DATA window. Keep its range checks, but allow low addresses used by
+/// synthetic heaps and small guest mappings.
+fn isBoundedProducedBufferDescriptor(descriptor: gpu.BufferDescriptor) bool {
+    if (descriptor.isNull() or descriptor.size_bytes == 0) return false;
+    return descriptor.size_bytes <= maximum_staged_buffer_bytes;
+}
+
 fn takePlausibleBufferDescriptor(descriptor: ?gpu.BufferDescriptor) ?gpu.BufferDescriptor {
     const value = descriptor orelse return null;
     return if (isPlausibleBufferDescriptor(value)) value else null;
 }
 
+fn isPointerScalarLoad(opcode: gpu.ShaderOpcode) bool {
+    return switch (opcode) {
+        .s_load_dword, .s_load_dwordx2, .s_load_dwordx4, .s_load_dwordx8, .s_load_dwordx16 => true,
+        else => false,
+    };
+}
+
+fn isBufferScalarLoad(opcode: gpu.ShaderOpcode) bool {
+    return switch (opcode) {
+        .s_buffer_load_dword,
+        .s_buffer_load_dwordx2,
+        .s_buffer_load_dwordx4,
+        .s_buffer_load_dwordx8,
+        .s_buffer_load_dwordx16,
+        => true,
+        else => false,
+    };
+}
+
+fn scalarMemoryOffset(inst: gpu.ShaderInstruction, scalar: *const gpu.ScalarEvaluation) ?i64 {
+    const operand_offset: i64 = switch (inst.src1.kind) {
+        .null => 0,
+        .integer_inline_constant, .literal_constant => inst.src1.value,
+        .sgpr => if (inst.src1.reg < gpu.scalar_provenance.maximum_scalar_registers and
+            scalar.registers[inst.src1.reg].known)
+            scalar.registers[inst.src1.reg].value
+        else
+            return null,
+        else => return null,
+    };
+    return @as(i64, inst.memory_offset) + operand_offset;
+}
+
+fn decodeBufferDescriptorAt(reader: gpu.ShaderMemoryReader, address: u64) anyerror!?gpu.BufferDescriptor {
+    var words: [4]u32 = undefined;
+    try reader.readWords(address & ~@as(u64, 3), &words);
+    return gpu.resources.decodeBufferDescriptor(&words) catch |err| switch (err) {
+        error.InvalidDescriptor, error.InvalidFormat => null,
+        else => return err,
+    };
+}
+
+/// Finds the last scalar-memory producer of a V# before one memory operation.
+/// Besides direct `s_load_dwordxN` table reads this follows descriptor-buffer
+/// chains (`s_buffer_load_dwordxN`) recursively. This is the common layout of
+/// large AGC compute prologs after an EXEC bounds branch.
+fn resolveProducedBufferDescriptor(
+    bindings: *const gpu.ShaderBindings,
+    reader: gpu.ShaderMemoryReader,
+    analysis: *const gpu.ShaderAnalysis,
+    scalar: *const gpu.ScalarEvaluation,
+    resource_sgpr: u32,
+    before_pc: u32,
+    depth: u8,
+) anyerror!?gpu.BufferDescriptor {
+    if (depth >= 8) return null;
+    var index = analysis.program.instructions.items.len;
+    while (index != 0) {
+        index -= 1;
+        const inst = analysis.program.instructions.items[index];
+        if (inst.pc >= before_pc or inst.dst.kind != .sgpr or inst.src0.kind != .sgpr) continue;
+        if (!isPointerScalarLoad(inst.opcode) and !isBufferScalarLoad(inst.opcode)) continue;
+        if (resource_sgpr < inst.dst.reg) continue;
+        const word_delta = resource_sgpr - inst.dst.reg;
+        if (word_delta + 4 > inst.data_words) continue;
+        const base_offset = scalarMemoryOffset(inst, scalar) orelse continue;
+        const byte_offset = base_offset + @as(i64, word_delta) * 4;
+
+        if (isPointerScalarLoad(inst.opcode)) {
+            if (byte_offset < std.math.minInt(i32) or byte_offset > std.math.maxInt(i32)) continue;
+            if (try bufferDescriptorFromUserDataPointer(
+                bindings,
+                reader,
+                inst.src0.reg,
+                @intCast(byte_offset),
+            )) |descriptor| return descriptor;
+            continue;
+        }
+
+        const parent = (try inlineBufferDescriptorOrNull(bindings, inst.src0.reg)) orelse
+            (try resolveProducedBufferDescriptor(
+                bindings,
+                reader,
+                analysis,
+                scalar,
+                inst.src0.reg,
+                inst.pc,
+                depth + 1,
+            )) orelse continue;
+        if (!isPlausibleBufferDescriptor(parent) or byte_offset < 0) continue;
+        const address = std.math.add(u64, parent.address, @intCast(byte_offset)) catch continue;
+        if (try decodeBufferDescriptorAt(reader, address)) |descriptor| return descriptor;
+    }
+    return null;
+}
+
 /// Recovers a V# for a compute/graphics MUBUF/SMEM instruction.
 ///
 /// Order of attempts:
-/// 1. Specialized scalar prefix (what the SPIR-V specialization path sees).
-/// 2. Full scalar prolog — recovers descriptors loaded after the specialized
-///    cut or through a longer SMEM chain.
-/// 3. V# already resident in USER_DATA (with capture base and with base=0 —
-///    NGG seeds often land at s0 even when scalar_user_data_base=8).
-/// 4. AGC vertex buffer table entry (graphics attribute path).
+/// 1. The last scalar-memory producer before this instruction. Shader inputs
+///    are frequently reused as dimensions before an `s_buffer_load` overwrites
+///    the same SGPRs with the real V#; decoding the entry snapshot first can
+///    therefore produce a syntactically valid but completely unrelated V#.
+/// 2. Specialized and full scalar state.
+/// 3. V# already resident in USER_DATA.
 fn resolveComputeBufferDescriptor(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
+    analysis: *const gpu.ShaderAnalysis,
     specialized: *const gpu.ScalarEvaluation,
+    full: *const gpu.ScalarEvaluation,
     resource_sgpr: u32,
+    instruction_pc: u32,
 ) anyerror!?gpu.BufferDescriptor {
+    if (try resolveProducedBufferDescriptor(
+        bindings,
+        reader,
+        analysis,
+        full,
+        resource_sgpr,
+        instruction_pc,
+        0,
+    )) |descriptor| {
+        if (isBoundedProducedBufferDescriptor(descriptor)) return descriptor;
+    }
     if (takePlausibleBufferDescriptor(try scalarBufferDescriptor(specialized, resource_sgpr))) |descriptor| {
         return descriptor;
     }
-    const full = gpu.scalar_provenance.evaluatePrefix(reader, bindings);
-    if (takePlausibleBufferDescriptor(try scalarBufferDescriptor(&full, resource_sgpr))) |descriptor| {
+    if (takePlausibleBufferDescriptor(try scalarBufferDescriptor(full, resource_sgpr))) |descriptor| {
         return descriptor;
     }
-    if (takePlausibleBufferDescriptor(try bindings.inlineBufferDescriptor(resource_sgpr))) |descriptor| {
+    if (takePlausibleBufferDescriptor(try inlineBufferDescriptorOrNull(bindings, resource_sgpr))) |descriptor| {
         return descriptor;
     }
     // Absolute USER_DATA window only when the shader names an SGPR that sits

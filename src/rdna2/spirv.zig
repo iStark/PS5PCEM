@@ -54,6 +54,28 @@ pub const SampledImageBinding = struct {
     descriptor_index: u32,
 };
 
+/// Static association between a GFX10 T# and an element in Vulkan's storage
+/// image array. Storage images are declared with an exact format: this avoids
+/// requiring the optional read/write-without-format device features and keeps
+/// validation deterministic on older Vulkan drivers.
+pub const StorageImageBinding = struct {
+    resource_sgpr: u32,
+    descriptor_index: u32,
+    format: StorageImageFormat,
+    dst_select: [4]u8 = .{ 4, 5, 6, 7 },
+};
+
+pub const StorageImageFormat = enum(u16) {
+    r8_uint = 5,
+    r16_uint = 11,
+    r32_uint = 20,
+    r11g11b10_float = 36,
+    rgba8_unorm = 56,
+    rgba8_uint = 60,
+    rgba16_float = 71,
+    rgba32_float = 77,
+};
+
 /// Scalar user data is captured by the API-neutral GPU state tracker. Supplying
 /// it here lets address operands use the same values that the guest shader saw.
 pub const ScalarRegister = struct {
@@ -83,6 +105,10 @@ pub const Options = struct {
     /// because the input has to be declared before the body that reads it.
     uses_execution_mask: bool = false,
     sampled_images: []const SampledImageBinding = &.{},
+    storage_images: []const StorageImageBinding = &.{},
+    /// Amount of per-workgroup LDS made available by COMPUTE_PGM_RSRC2. DS
+    /// instructions address it in bytes; the SPIR-V declaration is a u32 array.
+    workgroup_memory_size_bytes: u32 = 0,
     /// PARAM locations exported by a vertex shader or consumed by a fragment
     /// shader. `translate` discovers these from EXP/VINTRP instructions before
     /// the entry-point interface is declared.
@@ -137,6 +163,31 @@ const BufferAddress = struct {
     byte_offset: u32,
 };
 
+const WorkgroupAccess = struct {
+    pointer: u32,
+    in_range: u32,
+};
+
+fn storageImageValueType(format: StorageImageFormat) ValueType {
+    return switch (format) {
+        .r8_uint, .r16_uint, .r32_uint, .rgba8_uint => .bits32,
+        .r11g11b10_float, .rgba8_unorm, .rgba16_float, .rgba32_float => .float32,
+    };
+}
+
+fn storageImageSpirvFormat(format: StorageImageFormat) u32 {
+    return switch (format) {
+        .rgba32_float => 1, // Rgba32f
+        .rgba16_float => 2, // Rgba16f
+        .rgba8_unorm => 4, // Rgba8
+        .r11g11b10_float => 8, // R11fG11fB10f
+        .rgba8_uint => 32, // Rgba8ui
+        .r32_uint => 33, // R32ui
+        .r16_uint => 38, // R16ui
+        .r8_uint => 39, // R8ui
+    };
+}
+
 const Builder = struct {
     allocator: std.mem.Allocator,
     annotations: std.ArrayList(u32) = .empty,
@@ -166,6 +217,7 @@ const Builder = struct {
     frag_coord_input: u32 = 0,
     storage_bindings: []const StorageBufferBinding,
     sampled_bindings: []const SampledImageBinding,
+    storage_image_bindings: []const StorageImageBinding,
     storage_array: u32 = 0,
     storage_word_pointer_type: u32 = 0,
     local_invocation_index: u32 = 0,
@@ -179,9 +231,16 @@ const Builder = struct {
     local_size: [3]u32,
     fragment_extent: [2]u32,
     vector2_type: u32 = 0,
+    vector2_bits_type: u32 = 0,
     sampled_image_type: u32 = 0,
     sampled_image_array: u32 = 0,
     sampled_image_pointer_type: u32 = 0,
+    storage_image_types: [8]u32 = @splat(0),
+    storage_image_vector_types: [8]u32 = @splat(0),
+    storage_image_variables: [8]u32 = @splat(0),
+    workgroup_memory: u32 = 0,
+    workgroup_word_pointer_type: u32 = 0,
+    workgroup_memory_words: u32 = 0,
     /// GLSL.std.450 extended instruction set (PackHalf2x16, etc.). 0 = unused.
     glsl_std_450: u32 = 0,
     specialized_scalar_registers: [128]bool = @splat(false),
@@ -207,6 +266,7 @@ const Builder = struct {
             .vertex_index_vgpr = options.vertex_index_vgpr,
             .storage_bindings = options.storage_buffers,
             .sampled_bindings = options.sampled_images,
+            .storage_image_bindings = options.storage_images,
             .compute_inputs = options.compute_inputs,
             .local_size = options.local_size,
             .fragment_extent = options.fragment_extent,
@@ -419,6 +479,78 @@ const Builder = struct {
             try self.emit(&self.declarations, 32, &.{ array_pointer, 0, descriptor_array }); // ptr UniformConstant
             try self.emit(&self.declarations, 32, &.{ self.sampled_image_pointer_type, 0, self.sampled_image_type });
             try self.emit(&self.declarations, 59, &.{ array_pointer, self.sampled_image_array, 0 }); // OpVariable
+        }
+        if (options.storage_images.len != 0) {
+            if (options.stage != .compute) return Error.InvalidStorageBinding;
+            for (options.storage_images, 0..) |binding, index| {
+                if (binding.resource_sgpr >= 128 or
+                    binding.descriptor_index >= self.storage_image_variables.len)
+                {
+                    return Error.InvalidStorageBinding;
+                }
+                for (options.storage_images[0..index]) |previous| {
+                    if (previous.resource_sgpr == binding.resource_sgpr) {
+                        return Error.InvalidStorageBinding;
+                    }
+                    if (previous.descriptor_index == binding.descriptor_index and
+                        previous.format != binding.format)
+                    {
+                        return Error.InvalidStorageBinding;
+                    }
+                }
+                for (binding.dst_select) |selector| {
+                    if (selector > 7 or selector == 2 or selector == 3) {
+                        return Error.InvalidStorageBinding;
+                    }
+                }
+            }
+
+            self.vector2_bits_type = if (self.vector2_bits_type != 0) self.vector2_bits_type else self.id();
+            try self.emit(&self.declarations, 23, &.{ self.vector2_bits_type, self.bits_type, 2 });
+            for (options.storage_images) |binding| {
+                const descriptor_index: usize = @intCast(binding.descriptor_index);
+                if (self.storage_image_variables[descriptor_index] != 0) continue;
+                const value_type = storageImageValueType(binding.format);
+                const component_type = self.typeId(value_type);
+                const vector_type = self.id();
+                const image_type = self.id();
+                const image_pointer_type = self.id();
+                const variable = self.id();
+                self.storage_image_vector_types[descriptor_index] = vector_type;
+                self.storage_image_types[descriptor_index] = image_type;
+                self.storage_image_variables[descriptor_index] = variable;
+                try self.emit(&self.annotations, 71, &.{ variable, 34, 0 }); // DescriptorSet 0
+                try self.emit(&self.annotations, 71, &.{ variable, 33, 2 + binding.descriptor_index }); // Binding 2 + slot
+                try self.emit(&self.declarations, 23, &.{ vector_type, component_type, 4 });
+                try self.emit(&self.declarations, 25, &.{
+                    image_type,
+                    component_type,
+                    1, // Dim2D
+                    0, // not depth
+                    0, // not arrayed
+                    0, // not multisampled
+                    2, // storage image
+                    storageImageSpirvFormat(binding.format),
+                });
+                try self.emit(&self.declarations, 32, &.{ image_pointer_type, 0, image_type }); // ptr UniformConstant
+                try self.emit(&self.declarations, 59, &.{ image_pointer_type, variable, 0 });
+            }
+        }
+        if (options.workgroup_memory_size_bytes != 0) {
+            if (options.stage != .compute) return Error.InvalidStageInterface;
+            const words = std.math.divCeil(u32, options.workgroup_memory_size_bytes, 4) catch
+                return Error.InvalidStageInterface;
+            if (words == 0) return Error.InvalidStageInterface;
+            self.workgroup_memory_words = words;
+            const word_count = try self.constant(.bits32, words);
+            const array_type = self.id();
+            const array_pointer_type = self.id();
+            self.workgroup_word_pointer_type = self.id();
+            self.workgroup_memory = self.id();
+            try self.emit(&self.declarations, 28, &.{ array_type, self.bits_type, word_count }); // OpTypeArray
+            try self.emit(&self.declarations, 32, &.{ array_pointer_type, 4, array_type }); // ptr Workgroup array
+            try self.emit(&self.declarations, 32, &.{ self.workgroup_word_pointer_type, 4, self.bits_type });
+            try self.emit(&self.declarations, 59, &.{ array_pointer_type, self.workgroup_memory, 4 }); // OpVariable
         }
         return self;
     }
@@ -751,6 +883,36 @@ const Builder = struct {
         try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
         self.arithmetic_carry = carry;
         if (with_carry) self.scc = carry;
+    }
+
+    fn vectorAddCarry(self: *Builder, inst: instruction.Instruction) Error!void {
+        var first = inst.src0;
+        var second = inst.src1;
+        // VOP3 integer ADDC reuses modifier bits for its scalar carry/output
+        // encoding. They are not integer abs/neg modifiers.
+        first.absolute = false;
+        first.negate = false;
+        second.absolute = false;
+        second.negate = false;
+        const a = try self.source(first, .bits32);
+        const b = try self.source(second, .bits32);
+        const carry_source = if (inst.src2.kind == .unknown)
+            try self.source(.{ .kind = .vcc_lo }, .bits32)
+        else
+            try self.source(inst.src2, .bits32);
+        const carry = try self.andBits(carry_source, 1);
+        const partial = try self.addBits(a, b);
+        const partial_carry = self.id();
+        try self.emit(&self.body, 176, &.{ self.bool_type, partial_carry, partial, a }); // OpULessThan
+        const result = try self.addBits(partial, carry);
+        const carry_overflow = self.id();
+        try self.emit(&self.body, 176, &.{ self.bool_type, carry_overflow, result, partial });
+        const carry_out = self.id();
+        try self.emit(&self.body, 166, &.{ self.bool_type, carry_out, partial_carry, carry_overflow }); // OpLogicalOr
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+        var carry_inst = inst;
+        carry_inst.dst = inst.dst2;
+        try self.vectorConditionDestination(carry_inst, carry_out);
     }
 
     fn multiply24(self: *Builder, inst: instruction.Instruction, signed: bool) Error!void {
@@ -1389,6 +1551,126 @@ const Builder = struct {
         return null;
     }
 
+    fn storageImageBinding(self: *const Builder, resource_sgpr: u32) ?StorageImageBinding {
+        for (self.storage_image_bindings) |binding| {
+            if (binding.resource_sgpr == resource_sgpr) return binding;
+        }
+        return null;
+    }
+
+    fn loadStorageImage(self: *Builder, binding: StorageImageBinding) Error!u32 {
+        if (binding.descriptor_index >= self.storage_image_variables.len) return Error.InvalidStorageBinding;
+        const descriptor_index: usize = @intCast(binding.descriptor_index);
+        const image_type = self.storage_image_types[descriptor_index];
+        const variable = self.storage_image_variables[descriptor_index];
+        if (image_type == 0 or variable == 0) return Error.InvalidStorageBinding;
+        const image = self.id();
+        try self.emit(&self.body, 61, &.{ image_type, image, variable }); // OpLoad
+        return image;
+    }
+
+    fn storageImageCoordinates(self: *Builder, inst: instruction.Instruction) Error!u32 {
+        const x = try self.source(inst.src0, .bits32);
+        const y = try self.source(try consecutiveRegister(inst.src0, 1), .bits32);
+        const coordinates = self.id();
+        try self.emit(&self.body, 80, &.{ self.vector2_bits_type, coordinates, x, y }); // OpCompositeConstruct
+        return coordinates;
+    }
+
+    fn storageImageConstant(self: *Builder, value_type: ValueType, selector: u8) Error!u32 {
+        return switch (selector) {
+            0 => self.constant(value_type, 0),
+            1 => self.constant(
+                value_type,
+                if (value_type == .float32) @bitCast(@as(f32, 1.0)) else 1,
+            ),
+            else => Error.InvalidStorageBinding,
+        };
+    }
+
+    fn imageLoad(self: *Builder, inst: instruction.Instruction) Error!void {
+        if (self.stage != .compute or
+            inst.opcode_id != 0 or inst.image_dimension != .dim_2d or
+            inst.image_address_components != 2 or inst.image_nsa_words != 0 or inst.data_mask == 0 or
+            inst.src0.kind != .vgpr or inst.src1.kind != .sgpr)
+        {
+            return Error.UnsupportedOpcode;
+        }
+        const binding = self.storageImageBinding(inst.src1.reg) orelse return Error.InvalidStorageBinding;
+        const descriptor_index: usize = @intCast(binding.descriptor_index);
+        const value_type = storageImageValueType(binding.format);
+        const vector_type = self.storage_image_vector_types[descriptor_index];
+        if (vector_type == 0) return Error.InvalidStorageBinding;
+        const image = try self.loadStorageImage(binding);
+        const coordinates = try self.storageImageCoordinates(inst);
+        const texel = self.id();
+        try self.emit(&self.body, 98, &.{ vector_type, texel, image, coordinates }); // OpImageRead
+
+        var destination_index: u32 = 0;
+        for (0..4) |component| {
+            const bit = @as(u4, 1) << @intCast(component);
+            if (inst.data_mask & bit == 0) continue;
+            const selector = binding.dst_select[component];
+            const value = if (selector >= 4) blk: {
+                const extracted = self.id();
+                try self.emit(&self.body, 81, &.{
+                    self.typeId(value_type),
+                    extracted,
+                    texel,
+                    selector - 4,
+                }); // OpCompositeExtract
+                break :blk extracted;
+            } else try self.storageImageConstant(value_type, selector);
+            try self.destination(
+                try consecutiveRegister(inst.dst, destination_index),
+                .{ .id = value, .value_type = value_type },
+            );
+            destination_index += 1;
+        }
+    }
+
+    fn imageStore(self: *Builder, inst: instruction.Instruction) Error!void {
+        if (self.stage != .compute or
+            inst.opcode_id != 8 or inst.image_dimension != .dim_2d or
+            inst.image_address_components != 2 or inst.image_nsa_words != 0 or inst.data_mask != 0xf or
+            inst.dst.kind != .vgpr or inst.src0.kind != .vgpr or inst.src1.kind != .sgpr)
+        {
+            return Error.UnsupportedOpcode;
+        }
+        const binding = self.storageImageBinding(inst.src1.reg) orelse return Error.InvalidStorageBinding;
+        const descriptor_index: usize = @intCast(binding.descriptor_index);
+        const value_type = storageImageValueType(binding.format);
+        const vector_type = self.storage_image_vector_types[descriptor_index];
+        if (vector_type == 0) return Error.InvalidStorageBinding;
+        const image = try self.loadStorageImage(binding);
+        const coordinates = try self.storageImageCoordinates(inst);
+        var shader_values: [4]u32 = undefined;
+        for (&shader_values, 0..) |*value, component| {
+            value.* = try self.source(try consecutiveRegister(inst.dst, @intCast(component)), value_type);
+        }
+        var physical_values: [4]u32 = undefined;
+        for (&physical_values, 0..) |*value, physical_component| {
+            value.* = try self.storageImageConstant(value_type, 0);
+            const target: u8 = @intCast(4 + physical_component);
+            for (binding.dst_select, 0..) |selector, shader_component| {
+                if (selector == target) {
+                    value.* = shader_values[shader_component];
+                    break;
+                }
+            }
+        }
+        const texel = self.id();
+        try self.emit(&self.body, 80, &.{
+            vector_type,
+            texel,
+            physical_values[0],
+            physical_values[1],
+            physical_values[2],
+            physical_values[3],
+        }); // OpCompositeConstruct
+        try self.emit(&self.body, 99, &.{ image, coordinates, texel }); // OpImageWrite
+    }
+
     /// FragCoord.xy scaled into 0..1 UVs for the active color-target extent.
     fn fragCoordUv(self: *Builder) Error![2]u32 {
         if (self.frag_coord_input == 0 or self.vector4_type == 0) {
@@ -1523,6 +1805,36 @@ const Builder = struct {
         return result;
     }
 
+    fn multiplyHighUnsigned(self: *Builder, inst: instruction.Instruction) Error!void {
+        const a = try self.source(inst.src0, .bits32);
+        const b = try self.source(inst.src1, .bits32);
+        const mask = try self.constant(.bits32, 0xffff);
+        const sixteen = try self.constant(.bits32, 16);
+        const a0 = try self.andBits(a, 0xffff);
+        const b0 = try self.andBits(b, 0xffff);
+        const a1 = self.id();
+        try self.emit(&self.body, 194, &.{ self.bits_type, a1, a, sixteen });
+        const b1 = self.id();
+        try self.emit(&self.body, 194, &.{ self.bits_type, b1, b, sixteen });
+
+        const w0 = try self.multiplyBits(a0, b0);
+        const w0_high = self.id();
+        try self.emit(&self.body, 194, &.{ self.bits_type, w0_high, w0, sixteen });
+        const t0 = try self.multiplyBits(a1, b0);
+        const t = try self.addBits(t0, w0_high);
+        const w2 = self.id();
+        try self.emit(&self.body, 194, &.{ self.bits_type, w2, t, sixteen });
+        const w1_low = self.id();
+        try self.emit(&self.body, 199, &.{ self.bits_type, w1_low, t, mask });
+        const cross = try self.multiplyBits(a0, b1);
+        const w1 = try self.addBits(w1_low, cross);
+        const w1_high = self.id();
+        try self.emit(&self.body, 194, &.{ self.bits_type, w1_high, w1, sixteen });
+        const high_product = try self.multiplyBits(a1, b1);
+        const high = try self.addBits(try self.addBits(high_product, w2), w1_high);
+        try self.destination(inst.dst, .{ .id = high, .value_type = .bits32 });
+    }
+
     fn shiftRightBits(self: *Builder, value: u32, amount: u32) Error!u32 {
         const result = self.id();
         try self.emit(&self.body, 194, &.{ self.bits_type, result, value, try self.constant(.bits32, amount) });
@@ -1533,6 +1845,196 @@ const Builder = struct {
         const result = self.id();
         try self.emit(&self.body, 199, &.{ self.bits_type, result, value, try self.constant(.bits32, mask) });
         return result;
+    }
+
+    fn workgroupByteAddress(self: *Builder, inst: instruction.Instruction, offset: u32) Error!u32 {
+        if (self.stage != .compute or self.workgroup_memory == 0 or inst.gds or
+            inst.src0.kind != .vgpr or inst.memory_offset < 0)
+        {
+            return Error.UnsupportedBufferAddressing;
+        }
+        const address = try self.source(inst.src0, .bits32);
+        return self.addBits(address, try self.constant(.bits32, offset));
+    }
+
+    fn workgroupAccess(self: *Builder, byte_address: u32) Error!WorkgroupAccess {
+        if (self.workgroup_memory == 0 or self.workgroup_word_pointer_type == 0) {
+            return Error.UnsupportedBufferAddressing;
+        }
+        const word_index = try self.shiftRightBits(byte_address, 2);
+        const in_range = self.id();
+        try self.emit(&self.body, 176, &.{
+            self.bool_type,
+            in_range,
+            word_index,
+            try self.constant(.bits32, self.workgroup_memory_words),
+        }); // OpULessThan
+        const safe_index = self.id();
+        try self.emit(&self.body, 169, &.{
+            self.bits_type,
+            safe_index,
+            in_range,
+            word_index,
+            try self.constant(.bits32, 0),
+        }); // OpSelect
+        const pointer = self.id();
+        try self.emit(&self.body, 65, &.{
+            self.workgroup_word_pointer_type,
+            pointer,
+            self.workgroup_memory,
+            safe_index,
+        }); // OpAccessChain
+        return .{ .pointer = pointer, .in_range = in_range };
+    }
+
+    fn loadWorkgroupWord(self: *Builder, byte_address: u32) Error!u32 {
+        const access = try self.workgroupAccess(byte_address);
+        const loaded = self.id();
+        try self.emit(&self.body, 61, &.{ self.bits_type, loaded, access.pointer }); // OpLoad
+        const result = self.id();
+        try self.emit(&self.body, 169, &.{
+            self.bits_type,
+            result,
+            access.in_range,
+            loaded,
+            try self.constant(.bits32, 0),
+        }); // OpSelect
+        return result;
+    }
+
+    fn storeWorkgroupWord(self: *Builder, byte_address: u32, value: u32) Error!void {
+        const access = try self.workgroupAccess(byte_address);
+        const predicate = (try self.writePredicate(access.in_range)) orelse access.in_range;
+        try self.guardedStore(predicate, access.pointer, value);
+    }
+
+    fn loadDsWord(self: *Builder, inst: instruction.Instruction, offset: u32) Error!u32 {
+        return self.loadWorkgroupWord(try self.workgroupByteAddress(inst, offset));
+    }
+
+    fn storeDsWord(self: *Builder, inst: instruction.Instruction, offset: u32, value: u32) Error!void {
+        try self.storeWorkgroupWord(try self.workgroupByteAddress(inst, offset), value);
+    }
+
+    fn dsReadWords(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
+        const base_offset: u32 = @intCast(inst.memory_offset);
+        for (0..count) |index| {
+            const value = try self.loadDsWord(inst, base_offset + @as(u32, @intCast(index)) * 4);
+            try self.destination(try consecutiveRegister(inst.dst, @intCast(index)), .{
+                .id = value,
+                .value_type = .bits32,
+            });
+        }
+    }
+
+    fn dsWriteWords(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
+        const base_offset: u32 = @intCast(inst.memory_offset);
+        for (0..count) |index| {
+            const value = try self.source(try consecutiveRegister(inst.src1, @intCast(index)), .bits32);
+            try self.storeDsWord(inst, base_offset + @as(u32, @intCast(index)) * 4, value);
+        }
+    }
+
+    fn dsReadPair(self: *Builder, inst: instruction.Instruction) Error!void {
+        const offsets = [_]u32{
+            @intCast(inst.memory_offset),
+            @intCast(inst.secondary_memory_offset),
+        };
+        for (offsets, 0..) |offset, index| {
+            const value = try self.loadDsWord(inst, offset);
+            try self.destination(try consecutiveRegister(inst.dst, @intCast(index)), .{
+                .id = value,
+                .value_type = .bits32,
+            });
+        }
+    }
+
+    fn dsWritePair(self: *Builder, inst: instruction.Instruction) Error!void {
+        const offsets = [_]u32{
+            @intCast(inst.memory_offset),
+            @intCast(inst.secondary_memory_offset),
+        };
+        const sources = [_]operand.Operand{ inst.src1, inst.src2 };
+        for (offsets, sources) |offset, source_operand| {
+            try self.storeDsWord(inst, offset, try self.source(source_operand, .bits32));
+        }
+    }
+
+    fn loadDsByte(self: *Builder, inst: instruction.Instruction, offset: u32) Error!u32 {
+        const byte_address = try self.workgroupByteAddress(inst, offset);
+        const word = try self.loadWorkgroupWord(byte_address);
+        const byte_index = try self.andBits(byte_address, 3);
+        const shift = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, shift, byte_index, try self.constant(.bits32, 3) });
+        const shifted = self.id();
+        try self.emit(&self.body, 194, &.{ self.bits_type, shifted, word, shift });
+        return self.andBits(shifted, 0xff);
+    }
+
+    fn dsReadSubword(self: *Builder, inst: instruction.Instruction, width: u8, signed: bool) Error!void {
+        const base_offset: u32 = @intCast(inst.memory_offset);
+        var result = try self.loadDsByte(inst, base_offset);
+        if (width == 16) {
+            const high = try self.loadDsByte(inst, base_offset + 1);
+            const shifted = self.id();
+            try self.emit(&self.body, 196, &.{ self.bits_type, shifted, high, try self.constant(.bits32, 8) });
+            const combined = self.id();
+            try self.emit(&self.body, 197, &.{ self.bits_type, combined, result, shifted });
+            result = combined;
+        }
+        if (signed) {
+            const amount: u32 = 32 - width;
+            const left = self.id();
+            try self.emit(&self.body, 196, &.{ self.bits_type, left, result, try self.constant(.bits32, amount) });
+            const as_signed = try self.convert(.{ .id = left, .value_type = .bits32 }, .sint32);
+            const extended = self.id();
+            try self.emit(&self.body, 195, &.{ self.signed_type, extended, as_signed, try self.constant(.sint32, amount) });
+            result = try self.convert(.{ .id = extended, .value_type = .sint32 }, .bits32);
+        }
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
+    fn dsAtomic(self: *Builder, inst: instruction.Instruction, opcode: u16) Error!void {
+        const byte_address = try self.workgroupByteAddress(inst, @intCast(inst.memory_offset));
+        const access = try self.workgroupAccess(byte_address);
+        const predicate = (try self.writePredicate(access.in_range)) orelse access.in_range;
+        const taken = self.id();
+        const merge = self.id();
+        try self.emit(&self.body, 247, &.{ merge, 0 }); // OpSelectionMerge
+        try self.emit(&self.body, 250, &.{ predicate, taken, merge }); // OpBranchConditional
+        try self.emit(&self.body, 248, &.{taken});
+        const result = self.id();
+        try self.emit(&self.body, opcode, &.{
+            self.bits_type,
+            result,
+            access.pointer,
+            try self.constant(.bits32, 2), // ScopeWorkgroup
+            try self.constant(.bits32, 0), // relaxed
+            try self.source(inst.src1, .bits32),
+        });
+        try self.emit(&self.body, 249, &.{merge});
+        try self.emit(&self.body, 248, &.{merge});
+    }
+
+    fn controlBarrier(self: *Builder) Error!void {
+        if (self.stage != .compute) return;
+        try self.emit(&self.body, 224, &.{
+            try self.constant(.bits32, 2), // execution scope Workgroup
+            try self.constant(.bits32, 2), // memory scope Workgroup
+            try self.constant(.bits32, 0x108), // AcquireRelease | WorkgroupMemory
+        });
+    }
+
+    fn readFirstLane(self: *Builder, inst: instruction.Instruction) Error!void {
+        const source_value = try self.source(inst.src0, .bits32);
+        const result = self.id();
+        try self.emit(&self.body, 338, &.{
+            self.bits_type,
+            result,
+            try self.constant(.bits32, 3), // ScopeSubgroup
+            source_value,
+        }); // OpGroupNonUniformBroadcastFirst
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
     }
 
     fn bufferAddressDelta(self: *Builder, inst: instruction.Instruction, extra_offset: u32) Error!BufferAddress {
@@ -2065,10 +2567,12 @@ const Builder = struct {
         // entire shader merely to produce a value nobody subsequently reads.
         if (inst.dst.kind == .m0) return;
         switch (inst.opcode) {
-            .s_nop, .s_waitcnt, .s_barrier, .s_inst_prefetch, .s_sendmsg, .s_sleep, .s_ttrace_data, .v_nop, .s_endpgm, .s_code_end, .s_wqm_b64 => {},
+            .s_nop, .s_waitcnt, .s_inst_prefetch, .s_sendmsg, .s_sleep, .s_ttrace_data, .v_nop, .s_endpgm, .s_code_end, .s_wqm_b64 => {},
+            .s_barrier => try self.controlBarrier(),
             // Branches are handled by structured CF or skipped in the linear fallback.
             .s_branch, .s_cbranch_scc0, .s_cbranch_scc1, .s_cbranch_vccz, .s_cbranch_vccnz, .s_cbranch_execz, .s_cbranch_execnz, .s_setpc_b64 => {},
             .s_mov_b32, .s_movk_i32, .v_mov_b32 => try self.unary(inst, 83, .bits32), // OpCopyObject
+            .v_readfirstlane_b32 => try self.readFirstLane(inst),
             .s_mov_b64 => try self.mov64(inst),
             .s_getpc_b64 => try self.getPcFallback(inst),
             .s_not_b64 => try self.not64(inst),
@@ -2093,6 +2597,7 @@ const Builder = struct {
             .v_cvt_pkrtz_f16_f32 => try self.packHalf2x16(inst),
             .s_add_u32 => try self.scalarAddUnsigned(inst, false),
             .s_addc_u32 => try self.scalarAddUnsigned(inst, true),
+            .v_addc_u32 => try self.vectorAddCarry(inst),
             .s_add_i32, .v_add_nc_u32 => try self.binary(inst, 128, .bits32, false), // OpIAdd
             .v_lshl_add_u32 => try self.shiftLeftAdd(inst),
             // dst = (src0 + src1) << (src2 & 31)
@@ -2151,7 +2656,8 @@ const Builder = struct {
             .v_ashrrev_i32 => try self.binary(inst, 195, .sint32, true),
             .s_lshl_b32, .v_lshl_b32 => try self.binary(inst, 196, .bits32, false), // OpShiftLeftLogical
             .v_lshlrev_b32 => try self.binary(inst, 196, .bits32, true),
-            .v_mul_lo_u32 => try self.binary(inst, 132, .bits32, false), // OpIMul
+            .s_mul_i32, .v_mul_lo_u32 => try self.binary(inst, 132, .bits32, false), // OpIMul
+            .s_mul_hi_u32, .v_mul_hi_u32 => try self.multiplyHighUnsigned(inst),
             .s_and_b32, .v_and_b32 => try self.binary(inst, 199, .bits32, false),
             .s_or_b32, .v_or_b32 => try self.binary(inst, 197, .bits32, false),
             .s_xor_b32, .v_xor_b32 => try self.binary(inst, 198, .bits32, false),
@@ -2260,6 +2766,31 @@ const Builder = struct {
             .buffer_atomic_and => try self.bufferAtomic(inst, 240), // OpAtomicAnd
             .buffer_atomic_or => try self.bufferAtomic(inst, 241), // OpAtomicOr
             .buffer_atomic_xor => try self.bufferAtomic(inst, 242), // OpAtomicXor
+            .ds_write_b32 => try self.dsWriteWords(inst, 1),
+            .ds_write2_b32 => try self.dsWritePair(inst),
+            .ds_write_b64 => try self.dsWriteWords(inst, 2),
+            .ds_write_b96 => try self.dsWriteWords(inst, 3),
+            .ds_write_b128 => try self.dsWriteWords(inst, 4),
+            .ds_read_b32 => try self.dsReadWords(inst, 1),
+            .ds_read2_b32 => try self.dsReadPair(inst),
+            .ds_read_b64 => try self.dsReadWords(inst, 2),
+            .ds_read_b96 => try self.dsReadWords(inst, 3),
+            .ds_read_b128 => try self.dsReadWords(inst, 4),
+            .ds_read_ubyte => try self.dsReadSubword(inst, 8, false),
+            .ds_read_sbyte => try self.dsReadSubword(inst, 8, true),
+            .ds_read_ushort => try self.dsReadSubword(inst, 16, false),
+            .ds_read_sshort => try self.dsReadSubword(inst, 16, true),
+            .ds_add_u32 => try self.dsAtomic(inst, 234),
+            .ds_sub_u32 => try self.dsAtomic(inst, 235),
+            .ds_min_i32 => try self.dsAtomic(inst, 236),
+            .ds_min_u32 => try self.dsAtomic(inst, 237),
+            .ds_max_i32 => try self.dsAtomic(inst, 238),
+            .ds_max_u32 => try self.dsAtomic(inst, 239),
+            .ds_and_b32 => try self.dsAtomic(inst, 240),
+            .ds_or_b32 => try self.dsAtomic(inst, 241),
+            .ds_xor_b32 => try self.dsAtomic(inst, 242),
+            .image_load => try self.imageLoad(inst),
+            .image_store => try self.imageStore(inst),
             .image_sample => try self.sampleImage(inst),
             .exp => try self.exportValue(inst),
             else => return Error.UnsupportedOpcode,
@@ -2740,6 +3271,9 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     try entry_point.appendSlice(allocator, &.{ @intFromEnum(options.stage), builder.main_function, 0x6e69_616d, 0 });
     if (builder.storage_array != 0) try entry_point.append(allocator, builder.storage_array);
     if (builder.sampled_image_array != 0) try entry_point.append(allocator, builder.sampled_image_array);
+    for (builder.storage_image_variables) |variable| {
+        if (variable != 0) try entry_point.append(allocator, variable);
+    }
     if (builder.local_invocation_index != 0) try entry_point.append(allocator, builder.local_invocation_index);
     if (builder.workgroup_id_input != 0) try entry_point.append(allocator, builder.workgroup_id_input);
     if (builder.local_invocation_id_input != 0) try entry_point.append(allocator, builder.local_invocation_id_input);
@@ -3464,6 +3998,31 @@ test "fragment image sample lowers through a combined descriptor array" {
     try std.testing.expectEqual(@as(usize, 4), countOpcode(module.words, 81)); // RGBA extracts
 }
 
+test "compute image load and store use independently typed storage image bindings" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xf000_0f08, // image_load dmask:xyzw v0, v[0:1], s[0:7]
+        0x0000_0000,
+        0xf020_0f08, // image_store dmask:xyzw v0, v[4:5], s[24:31]
+        0x0006_0004,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    const images = [_]StorageImageBinding{
+        .{ .resource_sgpr = 0, .descriptor_index = 0, .format = .rgba32_float },
+        .{ .resource_sgpr = 24, .descriptor_index = 1, .format = .rgba8_unorm },
+    };
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .storage_images = &images,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expect(containsOpcode(module.words, 98)); // OpImageRead
+    try std.testing.expect(containsOpcode(module.words, 99)); // OpImageWrite
+}
+
 test "MUBUF dword load and store lower through a descriptor array" {
     const decoder = @import("decoder.zig");
     const code = [_]u32{
@@ -3674,6 +4233,75 @@ test "cross-dword short load and store lower as two byte accesses" {
     defer module.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 62)); // two byte stores
     try std.testing.expect(containsOpcode(module.words, 195)); // signed extension
+}
+
+test "LDS paired reads writes barriers and first-lane transfer lower explicitly" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .opcode = .v_mov_b32,
+        .dst = .{ .kind = .vgpr, .reg = 0 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 0 },
+        .src_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 4,
+        .opcode = .v_mov_b32,
+        .dst = .{ .kind = .vgpr, .reg = 1 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 1 },
+        .src_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 8,
+        .opcode = .v_mov_b32,
+        .dst = .{ .kind = .vgpr, .reg = 2 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 2 },
+        .src_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 12,
+        .family = .ds,
+        .opcode = .ds_write2_b32,
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src1 = .{ .kind = .vgpr, .reg = 1 },
+        .src2 = .{ .kind = .vgpr, .reg = 2 },
+        .src_count = 3,
+        .memory_offset = 0,
+        .secondary_memory_offset = 128,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 20, .opcode = .s_barrier });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 24,
+        .family = .ds,
+        .opcode = .ds_read2_b32,
+        .dst = .{ .kind = .vgpr, .reg = 3 },
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src_count = 1,
+        .memory_offset = 0,
+        .secondary_memory_offset = 128,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 32,
+        .opcode = .v_readfirstlane_b32,
+        .dst = .{ .kind = .sgpr, .reg = 0 },
+        .src0 = .{ .kind = .vgpr, .reg = 3 },
+        .src_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 36, .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .local_size = .{ 8, 4, 1 },
+        .workgroup_memory_size_bytes = 8192,
+    });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 28)); // OpTypeArray
+    try std.testing.expect(containsOpcode(module.words, 65)); // OpAccessChain
+    try std.testing.expect(containsOpcode(module.words, 62)); // OpStore
+    try std.testing.expect(containsOpcode(module.words, 61)); // OpLoad
+    try std.testing.expect(containsOpcode(module.words, 224)); // OpControlBarrier
+    try std.testing.expect(containsOpcode(module.words, 338)); // OpGroupNonUniformBroadcastFirst
 }
 
 test "swizzled V# addressing lowers index_stride permutation" {

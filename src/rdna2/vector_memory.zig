@@ -220,8 +220,21 @@ pub fn decodeDs(pc: u32, code: []const u32, word_index: u32) Error!Instruction {
     const offset1 = (word0 >> 8) & 0xff;
     var inst = Instruction{ .pc = pc, .word = word0, .family = .ds, .opcode_id = id };
     inst.setRawWords(code, word_index, 2);
-    inst.memory_offset = @intCast(offset0);
-    inst.secondary_memory_offset = @intCast(offset1);
+    // Most DS instructions carry one 16-bit byte offset. The paired forms use
+    // two independent 8-bit offsets whose unit depends on the opcode.
+    inst.memory_offset = @intCast(offset0 | (offset1 << 8));
+    inst.secondary_memory_offset = 0;
+    switch (id) {
+        0x0e, 0x37 => {
+            inst.memory_offset = @intCast(offset0 * 4);
+            inst.secondary_memory_offset = @intCast(offset1 * 4);
+        },
+        0x0f, 0x38 => {
+            inst.memory_offset = @intCast(offset0 * 256);
+            inst.secondary_memory_offset = @intCast(offset1 * 256);
+        },
+        else => {},
+    }
     inst.gds = (word0 >> 17) & 1 != 0;
     applyInfo(&inst, dsInfo(id), "DS opcode is not implemented");
     inst.dst = try operand.decodeVectorGpr((word1 >> 24) & 0xff);
@@ -354,6 +367,25 @@ test "MIMG NSA words are retained in the instruction length" {
     try std.testing.expectEqual(@as(u32, 4), inst.word_count);
     try std.testing.expectEqual(@as(u8, 1), inst.image_nsa_address[0]);
     try std.testing.expectEqual(@as(u8, 8), inst.image_nsa_address[7]);
+}
+
+test "DS offsets use byte units required by paired operations" {
+    const paired = [_]u32{
+        (@as(u32, 0x0e) << 18) | (@as(u32, 0x20) << 8) | 3,
+        (@as(u32, 2) << 16) | (@as(u32, 1) << 8) | 4,
+    };
+    const write2 = try decodeDs(0, &paired, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_write2_b32, write2.opcode);
+    try std.testing.expectEqual(@as(i32, 12), write2.memory_offset);
+    try std.testing.expectEqual(@as(i32, 128), write2.secondary_memory_offset);
+
+    const single = [_]u32{
+        (@as(u32, 0x0d) << 18) | (@as(u32, 0x12) << 8) | 0x34,
+        (@as(u32, 1) << 8) | 4,
+    };
+    const write = try decodeDs(0, &single, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_write_b32, write.opcode);
+    try std.testing.expectEqual(@as(i32, 0x1234), write.memory_offset);
 }
 
 test "truncated EXP is rejected" {
