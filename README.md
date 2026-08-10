@@ -63,18 +63,24 @@ If you would like to support continued PS5PCEM development, you can do so on
   bounded buffer-to-volume uploads populate 3D images. General compute
   `image_load`/`image_store` now use individually typed Vulkan storage images,
   including mixed `R11G11B10_FLOAT` and `RGBA8_UNORM` bindings, with checked
-  detile/upload and readback/retile. LDS is allocated from
-  `COMPUTE_PGM_RSRC2`, and the common DS read/write, paired, subword, atomic,
-  and barrier operations lower to SPIR-V Workgroup memory.
+  detile/upload and readback/retile. The compute sampled-image path recovers T#
+  and S# values at the exact MIMG instruction, binds a combined image/sampler,
+  and lowers 2D `image_sample_lz` with explicit LOD 0 and NSA coordinates. LDS
+  is allocated from `COMPUTE_PGM_RSRC2`, and the common DS read/write, paired,
+  subword, atomic, and barrier operations lower to SPIR-V Workgroup memory.
   Final compositor draws that omit color-buffer registers are now retained for
   the following VideoOut flip, which supplies the scanout target. The observed
   2,401-instruction fragment shader now translates to structured SPIR-V, passes
   validation, compiles on the host driver, and writes the full 3840×2160
   scanout. The first repeatable guest framebuffer is no longer black, but it is
   still a uniform light gray rather than a recognizable scene. The former LDS,
-  storage-image-format, and late V# binding blockers have moved forward to an
-  unsupported compute `image_sample` in the observed 176-instruction prepass;
-  NGG export and additional image semantics remain incomplete.
+  storage-image-format, late V# binding, compute sample, and NSA image-store
+  blockers are translated through the complete observed 176-instruction
+  prepass. A translation-only diagnostic produces 5,421 SPIR-V words for that
+  program. Normal execution on the current NVIDIA host instead reports a GPU
+  fault during an earlier `15×9×8` volume dispatch, so execution correctness for
+  the completed prepass is not claimed yet; NGG export and additional image
+  semantics also remain incomplete.
 
 ### Screenshot
 
@@ -100,7 +106,7 @@ the repository contains none of that content.
 | **Terminator 2D: No Fate** | Reaches gameplay with correct color reproduction and clean title-provided backgrounds, characters, HUD elements, and textures; publisher logo screens and menus now match the console capture; warmed-up startup frames measure 22–65 ms on the current test host | First-use texture staging, Vulkan depth/MRT, and the remaining compression metadata are incomplete |
 | **Pistol Whip** | Maps the native PS VR2 plugin and Burst module, then starts loading Unity asset archives | Headset, tracking, controller, and host OpenXR support are intentionally deferred |
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
-| **Tetris Effect: Connected** | Completes Unreal filesystem/config bootstrap, executes compact typed UAV clears and 3D volume uploads, translates two 344/125-instruction volume dispatches with recursively recovered V# chains, and reaches mixed-format storage images in its LDS prepass; its 2,401-instruction deferred compositor writes all 8,294,400 pixels of the 3840×2160 scanout | The first repeatable guest framebuffer is uniform light gray rather than a recognizable scene; the observed 176-instruction prepass now stops at compute `image_sample`, while NGG export and some image forms remain incomplete and the 512 GiB reservation can depend on host address-space placement |
+| **Tetris Effect: Connected** | Completes Unreal filesystem/config bootstrap, executes compact typed UAV clears and 3D volume uploads, translates two 344/125-instruction volume dispatches with recursively recovered V# chains, and translates the complete 176-instruction mixed-image/LDS prepass, including compute `image_sample_lz` at PC `0x29c` and NSA `image_store` at PC `0x440`; its 2,401-instruction deferred compositor writes all 8,294,400 pixels of the 3840×2160 scanout | The first repeatable guest framebuffer is uniform light gray rather than a recognizable scene; a normal run currently produces an NVIDIA GPU fault during an earlier `15×9×8` dispatch, while NGG export and some image forms remain incomplete and the 512 GiB reservation can depend on host address-space placement |
 
 ## Components
 
@@ -176,8 +182,11 @@ Graphics bring-up runs can set `PS5_CAPTURE_FIRST_FRAME=1` to write the first
 submitted guest draw to `out\first-frame.ppm`. `PS5_PROBE_FRAGMENT_COLOR=1`
 replaces the guest fragment shader with a fixed-color diagnostic, and
 `PS5_SKIP_COMPUTE=1` skips guest compute dispatches to shorten pipeline tests.
-The latter two switches deliberately change rendering and are not compatibility
-or correctness modes.
+`PS5_COMPUTE_TRANSLATE_ONLY=1` goes further through resource recovery and SPIR-V
+translation but stops before Vulkan pipeline creation and dispatch. It is useful
+for separating translation/binding failures from GPU execution faults. All three
+diagnostic switches deliberately change rendering and are not compatibility or
+correctness modes.
 
 For a native optimized build, install Zig 0.16 and use a current Vulkan driver:
 
@@ -331,8 +340,9 @@ unsigned byte/short reads, the common 32-bit integer/bitwise atomics,
 `image_store` use independent typed storage-image bindings, so one shader can
 mix `R8_UINT`, `R16_UINT`, `R32_UINT`, `R11G11B10_FLOAT`, `RGBA8_UNORM`,
 `RGBA8_UINT`, `RGBA16_FLOAT`, and `RGBA32_FLOAT` without optional
-read/write-without-format device features. Array, mip, MSAA, 3D and image-atomic
-forms remain explicit future work.
+read/write-without-format device features. Both consecutive and NSA coordinate
+VGPR encodings are accepted for 2D loads/stores. Array, mip, MSAA, 3D,
+partial-mask store, and image-atomic forms remain explicit future work.
 
 Graphics modules connect vertex `EXP POS0` to `BuiltIn Position`, vertex
 `PARAM0..31` exports to Vulkan locations, fragment VINTRP instructions to the
@@ -341,8 +351,9 @@ M0 setup and EXEC restoration from unavailable pixel-prolog SGPRs are tolerated
 without inventing guest data. Fragment EXEC/VCC predicates use the subgroup
 local invocation index rather than a compute-only builtin. The current MIMG
 path lowers normalized 2D `image_sample` through the combined sampled-image
-descriptor array for fragment programs. Compute `image_sample` is not lowered
-yet.
+descriptor array for fragment programs. Compute programs additionally support
+the observed `image_sample_lz` form with explicit LOD 0, including NSA
+coordinates and per-instruction recovery of reused T#/S# SGPRs.
 Compressed/masked exports, additional MRT targets, non-trivial image operands,
 and the remaining graphics system VGPRs are still incomplete.
 
@@ -651,7 +662,8 @@ blend state, then execute guest vertex/fragment SPIR-V. Render-target images are
 persistent across draws and are materialized back to guest memory only before a
 CPU-visible synchronization point, a dependent texture upload, or `SetFlip`.
 
-Supported 2D image/sampler descriptors feed fragment `image_sample`. AGC
+Supported 2D image/sampler descriptors feed fragment `image_sample` and compute
+`image_sample_lz`. AGC
 vertex tables provide distinct position and texture-coordinate buffers even
 when the shader reuses one V# SGPR, and vertex PARAM exports now supply the
 fragment interpolation inputs. `ACQUIRE_MEM`, `RELEASE_MEM`, `WAIT_REG_MEM`,
@@ -727,7 +739,8 @@ buffers into `R16_UINT` 3D images; linear volumes use aligned rows and
 consecutive depth slices through the same texture-layout contract. General
 single-sample 2D `image_load`/`image_store` dispatches now stage each T# through
 the same texture-layout contract, bind up to eight independently typed Vulkan
-storage images, and retile writable results into guest memory after completion.
+storage images, accept consecutive or NSA coordinate VGPRs, and retile writable
+results into guest memory after completion.
 Mip, array, 3D, MSAA, compressed and partial-mask store forms remain explicit
 unsupported work rather than taking a narrow fast path. Draw callbacks count
 work by default. When both vertex and pixel
@@ -759,17 +772,20 @@ dword address, while short loads/stores are split into byte operations so they
 remain correct across both linear and swizzle-separated dword boundaries.
 Dynamically unresolved SMEM and images remain explicit unsupported semantics.
 For the supported fragment subset, inline 2D image and sampler descriptors are
-decoded from user SGPRs, detiled into a sampled Vulkan image, transitioned to
-shader-read layout, and bound through set 0/binding 1. Cache identity includes
+decoded from user SGPRs. Compute sampling also recovers descriptors from the
+exact preceding scalar loads or the dispatch SRT after SGPR reuse. Both paths
+detile into a sampled Vulkan image, transition it to shader-read layout, and bind
+it through set 0/binding 1. Cache identity includes
 the guest payload hash; rewriting the same address replaces its stale image,
 while descriptor SGPR addresses are excluded from scalar specialization to
 avoid recompiling a pipeline for every streamed texture. Non-linear surfaces are
 read once into a checked contiguous allocation and detiled in host memory,
 avoiding one guest callback per texel for large streamed textures. Legacy
 detiling walks macro-block rows and reuses their local offset table instead of
-recomputing checked coordinates for every texel. The first
-MIMG lowering supports normalized two-coordinate `image_sample`; other formats, dimensions,
-mips, component swizzles, and sampling operands remain incomplete.
+recomputing checked coordinates for every texel. MIMG lowering supports
+normalized two-coordinate fragment `image_sample` and compute `image_sample_lz`
+with explicit LOD 0; other dimensions, mips, component swizzles, and sampling
+operands remain incomplete.
 
 Each draw submission completes through its fence before the executor reaches a
 PM4 synchronization callback. `ACQUIRE_MEM`, `RELEASE_MEM`, `WRITE_DATA`, and
@@ -831,16 +847,18 @@ decoded graphics state and exact pipeline cache, render into a 64×64 guest RGBA
 target, validate its tiled writeback, execute the PM4 synchronization packets and
 verify that `SetFlip` delivers the completed frame to a presentation sink.
 
-The final storage-image probe runs an RDNA2 `image_load`/`image_store` copy over
-a 4×4 `RGBA8_UINT` surface, including the guest's 256-byte linear row pitch,
-Vulkan storage-image transitions, and guest-visible readback. It can be isolated
+The final image probes run an RDNA2 `image_load`/NSA `image_store` copy over a
+4×4 `RGBA8_UINT` surface, including the guest's 256-byte linear row pitch,
+Vulkan storage-image transitions, and guest-visible readback. A second compute
+kernel samples a 4×4 `RGBA8_UNORM` texture with `image_sample_lz`, explicit LOD 0
+and an NSA Y coordinate, then verifies the returned float. They can be isolated
 while diagnosing image support with `PS5_IMAGE_SMOKE_ONLY=1`.
 
 ```sh
 zig build vulkan-smoke
 ```
 
-Run only the storage-image copy from PowerShell:
+Run only the storage and sampled compute image probes from PowerShell:
 
 ```powershell
 $env:PS5_IMAGE_SMOKE_ONLY='1'; zig build vulkan-smoke
@@ -858,8 +876,9 @@ storage image passed: 4x4 RGBA8_UINT load/store and guest writeback
 PM4 synchronization + SetFlip passed: 1 presented frame
 ```
 
-The isolated storage-image command above passes on the current Vulkan test
-host. The complete probe currently advances through its translated compute
+The isolated image command above passes both the NSA storage writeback and
+compute sampled-image checks on the current Vulkan test host. The complete probe
+currently advances through its translated compute
 coverage and then stops later at `InvalidGuestColorTargetWriteback` in the
 synthetic graphics section; that renderer regression is separate from the
 storage-image copy result.
@@ -1810,11 +1829,22 @@ Workgroup memory with DS paired/subword/atomic lowering, and the 20-instruction
 `image_load`/`image_store` path has a real typed Vulkan storage-image pipeline
 with detile/retile writeback. Late and nested compute V# chains are recovered
 from their SMEM producers; in the observed startup, both `15×9×8` volume
-dispatches that previously failed at the final `buffer_atomic_swap` now submit.
-The 176-instruction `30×34×1` prepass also resolves mixed
-`R11G11B10_FLOAT`/`RGBA8_UNORM` images, then reaches the next explicit gap:
-compute `image_sample` at PC `0x29c`. The repeatable output therefore remains a
-uniform light gray rather than a recognizable title image.
+dispatches that previously failed at the final `buffer_atomic_swap` translate.
+The 176-instruction `30×34×1` prepass resolves mixed
+`R11G11B10_FLOAT`/`RGBA8_UNORM` images, lowers compute `image_sample_lz` at PC
+`0x29c`, consumes its NSA coordinate, then lowers the NSA `image_store` at PC
+`0x440`. A safe `PS5_COMPUTE_TRANSLATE_ONLY=1` capture translates the complete
+program into 5,421 SPIR-V words and continues the command stream without another
+translation error. It deliberately performs no compute writes, so it cannot
+produce a correct title image.
+
+Normal execution is currently bounded earlier: two fresh-cache runs on the
+current RTX 3070 Ti returned `FenceWaitFailed` at the first `15×9×8` dispatch,
+and Windows recorded an `nvlddmkm` GPU fault for the same submission. The driver
+pipeline cache was ruled out, but the shader/resource execution fault still
+needs isolation before the newly translated prepass can be tested end to end.
+The last repeatable framebuffer therefore remains uniform light gray rather than
+a recognizable title image.
 
 The normal diagnostic frame takes about 208 host seconds on the current test
 machine, of which roughly 170 seconds are synchronous compute emulation. The
@@ -1847,9 +1877,10 @@ from leaking into host code where nothing would check it.
    depth/stencil, atomic, and compressed-surface forms; retain exact UAV fast
    paths only where they reduce synchronous startup work without changing
    semantics.
-3. Implement compute `image_sample`, finish the NGG export path, and cover the
-   remaining indirect descriptor variants that still leave the deferred
-   compositor with incomplete inputs.
+3. Extend compute sampling beyond `image_sample_lz` to explicit LOD/bias,
+   mip/layer and additional dimension forms, finish the NGG export path, and
+   cover the remaining indirect descriptor variants that still leave the
+   deferred compositor with incomplete inputs.
 4. Move the remaining first-use texture conversion and synchronous compute work
    off the frame-critical path without changing guest-visible synchronization.
 5. Keep the guest process in a stable long-running flip/submit loop and close

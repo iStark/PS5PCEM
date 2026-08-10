@@ -135,6 +135,10 @@ pub const Options = struct {
     /// Diagnostic fast path for graphics bring-up. Command processing and
     /// draws continue, but guest compute dispatches are not submitted.
     skip_compute_dispatches: bool = false,
+    /// Translates guest compute programs and prepares their resources without
+    /// submitting them to Vulkan. This isolates translation and binding gaps
+    /// from GPU execution faults while preserving later command processing.
+    translate_compute_only: bool = false,
     /// Optional Win32 output window. Supplying it enables the required surface
     /// and swapchain extensions and constrains device selection to a queue that
     /// can present to this exact surface.
@@ -944,6 +948,10 @@ const ComputeResources = struct {
     storage_image_count: usize = 0,
     storage_image_mappings: [maximum_storage_images]gpu.ShaderSpirvStorageImageBinding = undefined,
     storage_image_mapping_count: usize = 0,
+    sampled_images: [maximum_storage_descriptors]PreparedSampledImage = undefined,
+    sampled_image_count: usize = 0,
+    sampled_image_mappings: [maximum_storage_descriptors]gpu.ShaderSpirvSampledImageBinding = undefined,
+    sampled_image_mapping_count: usize = 0,
 
     fn descriptorForRange(self: *const ComputeResources, address: u64, size: usize) ?u32 {
         for (self.occupied, 0..) |used, index| {
@@ -973,6 +981,23 @@ const ComputeResources = struct {
         return null;
     }
 
+    fn sampledImageMappingForInstruction(
+        self: *const ComputeResources,
+        resource_sgpr: u32,
+        sampler_sgpr: u32,
+        instruction_pc: u32,
+    ) ?u32 {
+        for (self.sampled_image_mappings[0..self.sampled_image_mapping_count]) |mapping| {
+            if (mapping.resource_sgpr == resource_sgpr and
+                mapping.sampler_sgpr == sampler_sgpr and
+                mapping.instruction_pc != null and mapping.instruction_pc.? == instruction_pc)
+            {
+                return mapping.descriptor_index;
+            }
+        }
+        return null;
+    }
+
     fn deinit(self: *ComputeResources, renderer: *Renderer) void {
         for (self.storage_images[0..self.storage_image_count]) |image| {
             renderer.device_functions.destroy_image_view(renderer.device, image.view, null);
@@ -981,6 +1006,10 @@ const ComputeResources = struct {
         }
         self.storage_image_count = 0;
         self.storage_image_mapping_count = 0;
+        // Sampled images are cache-owned and survive this dispatch. The local
+        // entries only keep their handles alive while descriptors are prepared.
+        self.sampled_image_count = 0;
+        self.sampled_image_mapping_count = 0;
     }
 };
 
@@ -1022,6 +1051,7 @@ pub const Renderer = struct {
     capture_first_graphics_frame: bool,
     force_probe_fragment: bool,
     skip_compute_dispatches: bool,
+    translate_compute_only: bool,
     guest_memory: ?GuestMemory = null,
     /// Holds a display buffer read straight out of guest memory, for a flip
     /// that names a buffer nothing was rendered into.
@@ -1241,7 +1271,7 @@ pub const Renderer = struct {
             .binding = 1,
             .descriptor_type = vk.descriptor_type_combined_image_sampler,
             .descriptor_count = maximum_storage_descriptors,
-            .stage_flags = vk.shader_stage_fragment_bit,
+            .stage_flags = vk.shader_stage_fragment_bit | vk.shader_stage_compute_bit,
         };
         var descriptor_bindings: [2 + maximum_storage_images]vk.DescriptorSetLayoutBinding = undefined;
         descriptor_bindings[0] = storage_binding;
@@ -1381,6 +1411,7 @@ pub const Renderer = struct {
             .capture_first_graphics_frame = options.capture_first_graphics_frame,
             .force_probe_fragment = options.force_probe_fragment,
             .skip_compute_dispatches = options.skip_compute_dispatches,
+            .translate_compute_only = options.translate_compute_only,
             .window_presentation = window_presentation,
         };
     }
@@ -2075,6 +2106,7 @@ pub const Renderer = struct {
             .stage = .compute,
             .local_size = local_size,
             .storage_buffers = resources.mappings[0..resources.mapping_count],
+            .sampled_images = resources.sampled_image_mappings[0..resources.sampled_image_mapping_count],
             .storage_images = resources.storage_image_mappings[0..resources.storage_image_mapping_count],
             .scalar_registers = resources.scalar_registers[0..resources.scalar_count],
             .compute_inputs = .{
@@ -2136,6 +2168,23 @@ pub const Renderer = struct {
             return err;
         };
         defer module.deinit(self.allocator);
+        if (self.translate_compute_only) {
+            std.debug.print(
+                "[vulkan dcb] compute translated only: program=0x{x} spirv_words={d} groups={d}x{d}x{d}\n",
+                .{
+                    program_address,
+                    module.words.len,
+                    group_count[0],
+                    group_count[1],
+                    group_count[2],
+                },
+            );
+            return .{
+                .pipeline_cache_hit = false,
+                .group_count = group_count,
+                .spirv_words = module.words.len,
+            };
+        }
         const report = try self.dispatchSpirv(module.words, group_count);
         try self.commitComputeWrites(memory, &resources);
         try self.commitStorageImages(memory, &resources);
@@ -3017,6 +3066,89 @@ pub const Renderer = struct {
                 .dst_select = descriptor.dst_select,
             };
             result.storage_image_mapping_count += 1;
+        }
+
+        for (analysis.program.instructions.items) |inst| {
+            if (inst.opcode != .image_sample) continue;
+            if (inst.src1.kind != .sgpr or inst.src2.kind != .sgpr) {
+                if (log_verbose_gpu) std.debug.print(
+                    "[vulkan dcb] sampled image pc=0x{x}: T# is {s}, S# is {s}\n",
+                    .{ inst.pc, @tagName(inst.src1.kind), @tagName(inst.src2.kind) },
+                );
+                return Error.UnsupportedSampledImage;
+            }
+            const resource_sgpr = inst.src1.reg;
+            const sampler_sgpr = inst.src2.reg;
+            if (result.sampledImageMappingForInstruction(resource_sgpr, sampler_sgpr, inst.pc) != null) continue;
+            if (result.sampled_image_mapping_count >= maximum_sampled_images) {
+                return Error.UnsupportedSampledImage;
+            }
+
+            const descriptor_slot = result.sampled_image_mapping_count;
+            const sampled_scalar = gpu.scalar_provenance.evaluateResourceStateUntil(
+                reader,
+                bindings,
+                inst.pc,
+            );
+            const image_descriptor = (try resolveComputeSampledImageDescriptor(
+                bindings,
+                reader,
+                analysis,
+                &sampled_scalar,
+                resource_sgpr,
+                inst.pc,
+                descriptor_slot,
+            )) orelse {
+                if (log_verbose_gpu) std.debug.print(
+                    "[vulkan dcb] sampled image pc=0x{x}: T# s{d}:s{d} unresolved\n",
+                    .{ inst.pc, resource_sgpr, resource_sgpr + 7 },
+                );
+                return Error.UnsupportedSampledImage;
+            };
+            const sampler_descriptor = (try resolveComputeSamplerDescriptor(
+                bindings,
+                reader,
+                analysis,
+                &sampled_scalar,
+                sampler_sgpr,
+                inst.pc,
+                descriptor_slot,
+            )) orelse {
+                if (log_verbose_gpu) std.debug.print(
+                    "[vulkan dcb] sampled image pc=0x{x}: S# s{d}:s{d} unresolved\n",
+                    .{ inst.pc, sampler_sgpr, sampler_sgpr + 3 },
+                );
+                return Error.UnsupportedSampledImage;
+            };
+            const descriptor_index: u32 = @intCast(descriptor_slot);
+            const image = self.stageSampledImage(
+                image_descriptor,
+                sampler_descriptor,
+                descriptor_index,
+            ) catch |err| {
+                if (log_verbose_gpu) std.debug.print(
+                    "[vulkan dcb] sampled image pc=0x{x}: stage failed {s} addr=0x{x} {d}x{d} fmt={d} type={s}\n",
+                    .{
+                        inst.pc,
+                        @errorName(err),
+                        image_descriptor.address,
+                        image_descriptor.width,
+                        image_descriptor.height,
+                        image_descriptor.unified_format,
+                        @tagName(image_descriptor.image_type),
+                    },
+                );
+                return err;
+            };
+            result.sampled_images[result.sampled_image_count] = image;
+            result.sampled_image_count += 1;
+            result.sampled_image_mappings[result.sampled_image_mapping_count] = .{
+                .resource_sgpr = resource_sgpr,
+                .sampler_sgpr = sampler_sgpr,
+                .descriptor_index = descriptor_index,
+                .instruction_pc = inst.pc,
+            };
+            result.sampled_image_mapping_count += 1;
         }
         return result;
     }
@@ -5513,6 +5645,7 @@ pub const Renderer = struct {
             .buffer_info = null,
         };
         self.device_functions.update_descriptor_sets(self.device, 1, @ptrCast(&write), 0, null);
+        self.active_descriptor_set = self.descriptor_set;
     }
 
     fn updateStorageImageDescriptor(self: *Renderer, descriptor_index: u32, view: vk.ImageView) void {
@@ -6007,7 +6140,7 @@ pub const Renderer = struct {
         self.device_functions.cmd_pipeline_barrier(
             command_buffer,
             vk.pipeline_stage_transfer_bit,
-            vk.pipeline_stage_fragment_shader_bit,
+            vk.pipeline_stage_fragment_shader_bit | vk.pipeline_stage_compute_shader_bit,
             0,
             0,
             null,
@@ -7246,6 +7379,24 @@ fn imageDescriptorFromUserDataPointer(
     return try gpu.resources.decodeImageDescriptor(&words);
 }
 
+fn samplerDescriptorFromUserDataPointer(
+    bindings: *const gpu.ShaderBindings,
+    reader: gpu.ShaderMemoryReader,
+    pointer_sgpr: u32,
+) anyerror!?gpu.resources.SamplerDescriptor {
+    if (pointer_sgpr < bindings.scalar_user_data_base) return null;
+    const first: usize = pointer_sgpr - bindings.scalar_user_data_base;
+    if (first + 2 > bindings.user_data_count) return null;
+    const low = bindings.user_data[first];
+    const high = bindings.user_data[first + 1];
+    if (high & 0xffff_0000 != 0) return null;
+    const address = @as(u64, low) | (@as(u64, high) << 32);
+    if (address == 0) return null;
+    var words: [4]u32 = undefined;
+    try reader.readWords(address, &words);
+    return try gpu.resources.decodeSamplerDescriptor(&words);
+}
+
 fn bufferDescriptorFromUserDataPointer(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
@@ -8257,6 +8408,20 @@ fn scalarImageDescriptor(
     };
 }
 
+fn scalarSamplerDescriptor(
+    scalar: *const gpu.ScalarEvaluation,
+    sampler_sgpr: u32,
+) gpu.resources.Error!?gpu.resources.SamplerDescriptor {
+    if (sampler_sgpr + 4 > gpu.scalar_provenance.maximum_scalar_registers) return null;
+    var words: [4]u32 = undefined;
+    for (&words, 0..) |*word, index| {
+        const value = scalar.registers[sampler_sgpr + index];
+        if (!value.known) return null;
+        word.* = value.value;
+    }
+    return try gpu.resources.decodeSamplerDescriptor(&words);
+}
+
 fn inlineBufferDescriptorOrNull(
     bindings: *const gpu.ShaderBindings,
     resource_sgpr: u32,
@@ -8275,6 +8440,77 @@ fn inlineImageDescriptorOrNull(
         error.InvalidDescriptor, error.InvalidFormat => null,
         else => return err,
     };
+}
+
+fn inlineSamplerDescriptorOrNull(
+    bindings: *const gpu.ShaderBindings,
+    sampler_sgpr: u32,
+) anyerror!?gpu.resources.SamplerDescriptor {
+    return try bindings.inlineSamplerDescriptor(sampler_sgpr);
+}
+
+fn resolveComputeSampledImageDescriptor(
+    bindings: *const gpu.ShaderBindings,
+    reader: gpu.ShaderMemoryReader,
+    analysis: *const gpu.ShaderAnalysis,
+    scalar: *const gpu.ScalarEvaluation,
+    resource_sgpr: u32,
+    instruction_pc: u32,
+    fallback_slot: usize,
+) anyerror!?gpu.ImageDescriptor {
+    if (try scalarImageDescriptor(scalar, resource_sgpr)) |descriptor| return descriptor;
+    if (try inlineImageDescriptorOrNull(bindings, resource_sgpr)) |descriptor| return descriptor;
+
+    var pointer_sgpr: ?u32 = null;
+    for (analysis.program.instructions.items) |inst| {
+        if (inst.pc >= instruction_pc) break;
+        if (inst.opcode != .s_load_dwordx8 or inst.dst.kind != .sgpr or
+            inst.dst.reg != resource_sgpr or inst.src0.kind != .sgpr) continue;
+        pointer_sgpr = inst.src0.reg;
+    }
+    if (pointer_sgpr) |pointer| {
+        if (try imageDescriptorFromUserDataPointer(bindings, reader, pointer)) |descriptor| {
+            return descriptor;
+        }
+    }
+    if (fallback_slot <= std.math.maxInt(u16)) {
+        if (try bindings.resolve(reader, .read_only_texture, @intCast(fallback_slot))) |binding| {
+            return binding.descriptor.read_only_texture;
+        }
+    }
+    return null;
+}
+
+fn resolveComputeSamplerDescriptor(
+    bindings: *const gpu.ShaderBindings,
+    reader: gpu.ShaderMemoryReader,
+    analysis: *const gpu.ShaderAnalysis,
+    scalar: *const gpu.ScalarEvaluation,
+    sampler_sgpr: u32,
+    instruction_pc: u32,
+    fallback_slot: usize,
+) anyerror!?gpu.resources.SamplerDescriptor {
+    if (try scalarSamplerDescriptor(scalar, sampler_sgpr)) |descriptor| return descriptor;
+    if (try inlineSamplerDescriptorOrNull(bindings, sampler_sgpr)) |descriptor| return descriptor;
+
+    var pointer_sgpr: ?u32 = null;
+    for (analysis.program.instructions.items) |inst| {
+        if (inst.pc >= instruction_pc) break;
+        if (inst.opcode != .s_load_dwordx4 or inst.dst.kind != .sgpr or
+            inst.dst.reg != sampler_sgpr or inst.src0.kind != .sgpr) continue;
+        pointer_sgpr = inst.src0.reg;
+    }
+    if (pointer_sgpr) |pointer| {
+        if (try samplerDescriptorFromUserDataPointer(bindings, reader, pointer)) |descriptor| {
+            return descriptor;
+        }
+    }
+    if (fallback_slot <= std.math.maxInt(u16)) {
+        if (try bindings.resolve(reader, .sampler, @intCast(fallback_slot))) |binding| {
+            return binding.descriptor.sampler;
+        }
+    }
+    return null;
 }
 
 fn resolveComputeImageDescriptor(

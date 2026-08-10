@@ -90,6 +90,17 @@ pub fn evaluateResourceState(reader: shaders.MemoryReader, bindings: *const shad
     return evaluate(reader, bindings, null, true);
 }
 
+/// Recovers descriptor state immediately before one vector-memory instruction.
+/// Compute kernels may reload the same T#/S# SGPRs for several resources, so a
+/// final whole-program snapshot is not authoritative for an earlier sample.
+pub fn evaluateResourceStateUntil(
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    end_pc: u32,
+) Evaluation {
+    return evaluate(reader, bindings, end_pc, true);
+}
+
 /// Evaluates only the straight scalar region ending before `end_pc`. This is
 /// the dispatch-specialization entry point: later scalar writes must not alter
 /// descriptors captured for the first vector-memory instruction.

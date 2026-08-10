@@ -8,7 +8,7 @@ const vulkan = @import("vulkan");
 const gpu = @import("gpu");
 
 const GuestMemory = struct {
-    bytes: [65536]u8 = @splat(0),
+    bytes: [131072]u8 = @splat(0),
 
     fn read(context: ?*anyopaque, address: u64, destination: []u8) bool {
         const self: *GuestMemory = @ptrCast(@alignCast(context.?));
@@ -227,6 +227,13 @@ fn imageDescriptorWords(address: u32, width: u32, height: u32) [8]u32 {
     };
 }
 
+fn sampledImageDescriptorWords(address: u32, width: u32, height: u32) [8]u32 {
+    var words = imageDescriptorWords(address, width, height);
+    words[1] &= ~(@as(u32, 0xff) << 20);
+    words[1] |= @as(u32, 56) << 20; // RGBA8_UNORM
+    return words;
+}
+
 fn runStorageImageCopyKernel(
     allocator: std.mem.Allocator,
     renderer: *vulkan.Renderer,
@@ -243,9 +250,10 @@ fn runStorageImageCopyKernel(
             guest.word(program_cursor + 4, vop1(0x01, 1, @intCast(128 + y))); // v1 = y
             guest.word(program_cursor + 8, 0xf000_0f08); // image_load v4:v7, v[0:1], s[0:7]
             guest.word(program_cursor + 12, 0x0000_0400);
-            guest.word(program_cursor + 16, 0xf020_0f08); // image_store v4:v7, v[0:1], s[8:15]
+            guest.word(program_cursor + 16, 0xf020_0f0a); // image_store v4:v7, v0, s[8:15], NSA v1
             guest.word(program_cursor + 20, 0x0002_0400);
-            program_cursor += 24;
+            guest.word(program_cursor + 24, 0x0000_0001);
+            program_cursor += 28;
         }
     }
     guest.word(program_cursor, 0xbf81_0000);
@@ -303,6 +311,82 @@ fn runStorageImageCopyKernel(
     }
 }
 
+fn runComputeSampledImageKernel(
+    allocator: std.mem.Allocator,
+    renderer: *vulkan.Renderer,
+    guest: *GuestMemory,
+    backend: gpu.DcbBackend,
+) !void {
+    const program = 0x1c00;
+    var cursor: usize = program;
+    guest.word(cursor, vop1(0x01, 0, 255)); // v0 = 0.25
+    guest.word(cursor + 4, 0x3e80_0000);
+    cursor += 8;
+    guest.word(cursor, vop1(0x01, 1, 255)); // v1 = 0.25
+    guest.word(cursor + 4, 0x3e80_0000);
+    cursor += 8;
+    guest.word(cursor, 0xf09c_010a); // image_sample_lz dmask:x, dim:2d, one NSA dword
+    guest.word(cursor + 4, 0x0040_0200); // v2, v0 + NSA, s[0:7], s[8:11]
+    guest.word(cursor + 8, 0x0000_0001); // NSA coordinate 1 is v1
+    cursor += 12;
+    guest.word(cursor, 0xe070_0000); // buffer_store_dword v2, v0, s[12:15], 0
+    guest.word(cursor + 4, 0x8003_0200);
+    guest.word(cursor + 8, 0xbf81_0000);
+
+    const width = 4;
+    const height = 4;
+    const source = 0x7000;
+    const destination = 0x10000;
+    const row_pitch_bytes = 256;
+    const allocation_bytes = row_pitch_bytes * height;
+    @memset(guest.bytes[source .. source + allocation_bytes], 0);
+    @memset(guest.bytes[destination .. destination + 4], 0);
+    for (0..height) |y| {
+        for (0..width) |x| {
+            const pixel = source + y * row_pitch_bytes + x * 4;
+            guest.bytes[pixel] = 255;
+            guest.bytes[pixel + 1] = @intCast(x * 17);
+            guest.bytes[pixel + 2] = @intCast(y * 19);
+            guest.bytes[pixel + 3] = 255;
+        }
+    }
+
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), program >> 8);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 16 << 1);
+    try state.writeRegister(.shader, 0x207, 1);
+    try state.writeRegister(.shader, 0x208, 1);
+    try state.writeRegister(.shader, 0x209, 1);
+    const image = sampledImageDescriptorWords(source, width, height);
+    for (image, 0..) |word, index| {
+        try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+    }
+    for (0..4) |index| {
+        try state.writeRegister(.shader, compute.userDataBase() + 8 + @as(u32, @intCast(index)), 0);
+    }
+    const output_descriptor = [_]u32{ destination, 4 << 16, 1, 0 };
+    for (output_descriptor, 0..) |word, index| {
+        try state.writeRegister(.shader, compute.userDataBase() + 12 + @as(u32, @intCast(index)), word);
+    }
+
+    const stream = [_]u32{ command(gpu.pm4.dispatch_direct, 4), 1, 1, 1, 0x41 };
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = backend, .allocator = allocator };
+    _ = executor.execute(&stream) catch |err| {
+        std.debug.print("compute sampled image refused: {s} (renderer: {s})\n", .{
+            @errorName(err),
+            if (renderer.last_dispatch_error) |reason| @errorName(reason) else "none",
+        });
+        return err;
+    };
+    const sampled = std.mem.readInt(u32, guest.bytes[destination..][0..4], .little);
+    if (sampled != 0x3f80_0000) {
+        std.debug.print("compute sampled image mismatch: got 0x{x:0>8}, want 0x3f800000\n", .{sampled});
+        return error.ComputeSampledImageMismatch;
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
 
@@ -312,7 +396,11 @@ pub fn main(init: std.process.Init) !void {
     const backend = renderer.dcbBackend(guest.interface());
     if (init.minimal.environ.containsUnempty(allocator, "PS5_IMAGE_SMOKE_ONLY") catch false) {
         try runStorageImageCopyKernel(allocator, &renderer, &guest, backend);
-        std.debug.print("storage image passed: 4x4 RGBA8_UINT load/store and guest writeback\n", .{});
+        try runComputeSampledImageKernel(allocator, &renderer, &guest, backend);
+        std.debug.print(
+            "images passed: storage load/NSA store writeback and compute image_sample_lz NSA\n",
+            .{},
+        );
         return;
     }
     const report = try renderer.smokeTest();

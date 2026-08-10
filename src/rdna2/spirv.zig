@@ -52,6 +52,9 @@ pub const SampledImageBinding = struct {
     resource_sgpr: u32,
     sampler_sgpr: u32,
     descriptor_index: u32,
+    /// Null is a stage-wide association. Compute shaders can qualify a binding
+    /// by PC when the guest reloads the same T#/S# SGPR pair between samples.
+    instruction_pc: ?u32 = null,
 };
 
 /// Static association between a GFX10 T# and an element in Vulkan's storage
@@ -445,7 +448,9 @@ const Builder = struct {
             }
         }
         if (options.sampled_images.len != 0) {
-            if (options.stage != .fragment or options.descriptor_array_length == 0) {
+            if ((options.stage != .fragment and options.stage != .compute) or
+                options.descriptor_array_length == 0)
+            {
                 return Error.InvalidStorageBinding;
             }
             for (options.sampled_images, 0..) |binding, index| {
@@ -456,11 +461,16 @@ const Builder = struct {
                 }
                 for (options.sampled_images[0..index]) |previous| {
                     if (previous.resource_sgpr == binding.resource_sgpr and
-                        previous.sampler_sgpr == binding.sampler_sgpr)
+                        previous.sampler_sgpr == binding.sampler_sgpr and
+                        previous.instruction_pc == binding.instruction_pc)
                     {
                         return Error.InvalidStorageBinding;
                     }
                 }
+            }
+            if (self.vector4_type == 0) {
+                self.vector4_type = self.id();
+                try self.emit(&self.declarations, 23, &.{ self.vector4_type, self.float_type, 4 }); // OpTypeVector
             }
             self.vector2_type = self.id();
             const image_type = self.id();
@@ -1544,9 +1554,26 @@ const Builder = struct {
         return null;
     }
 
-    fn sampledImageBinding(self: *const Builder, resource_sgpr: u32, sampler_sgpr: u32) ?SampledImageBinding {
+    fn sampledImageBinding(
+        self: *const Builder,
+        resource_sgpr: u32,
+        sampler_sgpr: u32,
+        instruction_pc: u32,
+    ) ?SampledImageBinding {
         for (self.sampled_bindings) |binding| {
-            if (binding.resource_sgpr == resource_sgpr and binding.sampler_sgpr == sampler_sgpr) return binding;
+            if (binding.resource_sgpr == resource_sgpr and
+                binding.sampler_sgpr == sampler_sgpr and
+                binding.instruction_pc != null and binding.instruction_pc.? == instruction_pc)
+            {
+                return binding;
+            }
+        }
+        for (self.sampled_bindings) |binding| {
+            if (binding.resource_sgpr == resource_sgpr and
+                binding.sampler_sgpr == sampler_sgpr and binding.instruction_pc == null)
+            {
+                return binding;
+            }
         }
         return null;
     }
@@ -1570,8 +1597,8 @@ const Builder = struct {
     }
 
     fn storageImageCoordinates(self: *Builder, inst: instruction.Instruction) Error!u32 {
-        const x = try self.source(inst.src0, .bits32);
-        const y = try self.source(try consecutiveRegister(inst.src0, 1), .bits32);
+        const x = try self.source(try imageAddressOperand(inst, 0), .bits32);
+        const y = try self.source(try imageAddressOperand(inst, 1), .bits32);
         const coordinates = self.id();
         try self.emit(&self.body, 80, &.{ self.vector2_bits_type, coordinates, x, y }); // OpCompositeConstruct
         return coordinates;
@@ -1591,7 +1618,7 @@ const Builder = struct {
     fn imageLoad(self: *Builder, inst: instruction.Instruction) Error!void {
         if (self.stage != .compute or
             inst.opcode_id != 0 or inst.image_dimension != .dim_2d or
-            inst.image_address_components != 2 or inst.image_nsa_words != 0 or inst.data_mask == 0 or
+            inst.image_address_components != 2 or inst.data_mask == 0 or
             inst.src0.kind != .vgpr or inst.src1.kind != .sgpr)
         {
             return Error.UnsupportedOpcode;
@@ -1632,7 +1659,7 @@ const Builder = struct {
     fn imageStore(self: *Builder, inst: instruction.Instruction) Error!void {
         if (self.stage != .compute or
             inst.opcode_id != 8 or inst.image_dimension != .dim_2d or
-            inst.image_address_components != 2 or inst.image_nsa_words != 0 or inst.data_mask != 0xf or
+            inst.image_address_components != 2 or inst.data_mask != 0xf or
             inst.dst.kind != .vgpr or inst.src0.kind != .vgpr or inst.src1.kind != .sgpr)
         {
             return Error.UnsupportedOpcode;
@@ -1698,6 +1725,18 @@ const Builder = struct {
         return .{ raw_x, raw_y };
     }
 
+    fn imageAddressOperand(inst: instruction.Instruction, component: u32) Error!operand.Operand {
+        if (inst.src0.kind != .vgpr) return Error.UnsupportedBufferAddressing;
+        if (component == 0) return inst.src0;
+        if (inst.image_nsa_words != 0) {
+            const nsa_index = component - 1;
+            const nsa_count = @as(u32, inst.image_nsa_words) * 4;
+            if (nsa_index >= nsa_count) return Error.UnsupportedBufferAddressing;
+            return .{ .kind = .vgpr, .reg = inst.image_nsa_address[nsa_index] };
+        }
+        return consecutiveRegister(inst.src0, component);
+    }
+
     fn interpolateParameter(self: *Builder, inst: instruction.Instruction) Error!void {
         if (self.stage != .fragment or inst.src1.kind != .integer_inline_constant) {
             return Error.InvalidStageInterface;
@@ -1729,22 +1768,30 @@ const Builder = struct {
     }
 
     fn sampleImage(self: *Builder, inst: instruction.Instruction) Error!void {
-        if (self.stage != .fragment or self.sampled_image_array == 0 or
-            inst.opcode_id != 0x20 or inst.image_dimension != .dim_2d or
-            inst.image_address_components != 2 or inst.image_nsa_words != 0 or
-            @as(u16, @bitCast(inst.image_sample_flags)) != 0 or inst.data_mask == 0)
+        const flags: u16 = @bitCast(inst.image_sample_flags);
+        const implicit_lod = inst.opcode_id == 0x20 and flags == 0;
+        const level_zero = inst.opcode_id == 0x27 and
+            inst.image_sample_flags.level_zero and
+            flags == (@as(u16, 1) << 5);
+        if ((self.stage != .fragment and self.stage != .compute) or
+            self.sampled_image_array == 0 or
+            (!implicit_lod and !level_zero) or
+            (self.stage == .compute and !level_zero) or
+            inst.image_dimension != .dim_2d or
+            inst.image_address_components != 2 or
+            inst.data_mask == 0)
         {
             return Error.UnsupportedOpcode;
         }
         if (inst.src0.kind != .vgpr or inst.src1.kind != .sgpr or inst.src2.kind != .sgpr) {
             return Error.UnsupportedBufferAddressing;
         }
-        const binding = self.sampledImageBinding(inst.src1.reg, inst.src2.reg) orelse {
+        const binding = self.sampledImageBinding(inst.src1.reg, inst.src2.reg, inst.pc) orelse {
             return Error.InvalidStorageBinding;
         };
         // Coordinates now come from the real VS PARAM -> PS VINTRP interface.
-        const raw_x = try self.source(inst.src0, .float32);
-        const raw_y = try self.source(try consecutiveRegister(inst.src0, 1), .float32);
+        const raw_x = try self.source(try imageAddressOperand(inst, 0), .float32);
+        const raw_y = try self.source(try imageAddressOperand(inst, 1), .float32);
         const coordinate_x, const coordinate_y = try self.sampleCoordinates(raw_x, raw_y);
         const coordinates = self.id();
         try self.emit(&self.body, 80, &.{ self.vector2_type, coordinates, coordinate_x, coordinate_y });
@@ -1758,7 +1805,21 @@ const Builder = struct {
         const sampled_image = self.id();
         try self.emit(&self.body, 61, &.{ self.sampled_image_type, sampled_image, pointer });
         const sampled = self.id();
-        try self.emit(&self.body, 87, &.{ self.vector4_type, sampled, sampled_image, coordinates }); // OpImageSampleImplicitLod
+        if (level_zero) {
+            // Compute shaders have no implicit derivatives. GFX10's
+            // image_sample_lz names mip zero explicitly, which maps directly to
+            // an explicit SPIR-V Lod operand and is valid in every shader stage.
+            try self.emit(&self.body, 88, &.{
+                self.vector4_type,
+                sampled,
+                sampled_image,
+                coordinates,
+                0x2, // ImageOperands Lod
+                try self.constant(.float32, @bitCast(@as(f32, 0))),
+            }); // OpImageSampleExplicitLod
+        } else {
+            try self.emit(&self.body, 87, &.{ self.vector4_type, sampled, sampled_image, coordinates }); // OpImageSampleImplicitLod
+        }
 
         var destination_index: u32 = 0;
         for (0..4) |component| {
@@ -3998,13 +4059,46 @@ test "fragment image sample lowers through a combined descriptor array" {
     try std.testing.expectEqual(@as(usize, 4), countOpcode(module.words, 81)); // RGBA extracts
 }
 
-test "compute image load and store use independently typed storage image bindings" {
+test "compute image sample level zero uses explicit lod" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        (@as(u32, 0x3f) << 25) | (@as(u32, 0) << 17) | (@as(u32, 0x01) << 9) | 255,
+        0x3e80_0000,
+        (@as(u32, 0x3f) << 25) | (@as(u32, 1) << 17) | (@as(u32, 0x01) << 9) | 255,
+        0x3e80_0000,
+        0xf09c_010a, // image_sample_lz dim:2d dmask:x v2, v[0:1], s[0:7], s[8:11]
+        0x0040_0200,
+        0x0000_0001, // NSA: the second coordinate is v1
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    const images = [_]SampledImageBinding{.{
+        .resource_sgpr = 0,
+        .sampler_sgpr = 8,
+        .descriptor_index = 0,
+        .instruction_pc = 0x10,
+    }};
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .sampled_images = &images,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expect(containsOpcode(module.words, 88)); // OpImageSampleExplicitLod
+    try std.testing.expect((firstInstructionOperand(module.words, 88, 0) orelse 0) != 0); // vec4 result type
+    try std.testing.expect(!containsOpcode(module.words, 87)); // no derivative-dependent implicit LOD
+    try std.testing.expectEqual(@as(usize, 1), countOpcode(module.words, 81)); // dmask:x extract
+}
+
+test "compute image load and NSA store use independently typed storage image bindings" {
     const decoder = @import("decoder.zig");
     const code = [_]u32{
         0xf000_0f08, // image_load dmask:xyzw v0, v[0:1], s[0:7]
         0x0000_0000,
-        0xf020_0f08, // image_store dmask:xyzw v0, v[4:5], s[24:31]
+        0xf020_0f0a, // image_store dmask:xyzw v0, v4, s[24:31], NSA v5
         0x0006_0004,
+        0x0000_0005,
         0xbf81_0000,
     };
     var program = try decoder.decodeProgram(std.testing.allocator, &code);
