@@ -32,6 +32,11 @@ fn resolveVideoOutBuffer(_: ?*anyopaque, flip: gpu.state.Flip) ?vulkan.DisplayBu
     };
 }
 
+fn updateHostWindowFps(context: ?*anyopaque, fps_tenths: u32) void {
+    const host_window: *window.HostWindow = @ptrCast(@alignCast(context orelse return));
+    host_window.updateFps(fps_tenths);
+}
+
 fn reportRelocation(
     writer: *std.Io.Writer,
     allocator: std.mem.Allocator,
@@ -252,6 +257,7 @@ fn run(init: std.process.Init) !bool {
     }
 
     const force_headless = init.minimal.environ.containsUnempty(allocator, "PS5_HEADLESS") catch false;
+    const show_fps = init.minimal.environ.containsUnempty(allocator, "PS5_SHOW_FPS") catch false;
     if (builtin.os.tag == .windows and !force_headless) live_gpu: {
         host_window.init(1280, 720) catch |err| {
             try stderr.print("live Vulkan window unavailable: {s}; continuing headless\n", .{@errorName(err)});
@@ -281,6 +287,10 @@ fn run(init: std.process.Init) !bool {
         renderer_initialized = true;
         const presentation_sink = renderer.windowPresentationSink();
         renderer.setPresentationSink(presentation_sink);
+        if (show_fps) renderer.setFrameRateSink(.{
+            .context = &host_window,
+            .update = updateHostWindowFps,
+        });
         renderer.setDisplayBufferResolver(.{
             .context = null,
             .resolve = resolveVideoOutBuffer,

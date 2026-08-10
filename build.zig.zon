@@ -5,7 +5,16 @@
     .version = "0.3.0",
     .fingerprint = 0x70cc9aa6f444796,
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .libatrac9 = .{
+            .url = "https://github.com/shadps4-emu/ext-LibAtrac9/archive/946e05a9212976626a9f5e52f29c0a7202871f29.tar.gz",
+            .hash = "N-V-__8AACDxBADvLCQVTh9mzhuIbwV2zj1QXzdDWXU8J1ZZ",
+        },
+        .minimp3 = .{
+            .url = "https://github.com/lieff/minimp3/archive/7b590fdcfa5a79c033e76eacc05d0c3e4c79f536.tar.gz",
+            .hash = "N-V-__8AAITPDQK9zXacGDpSmTu7XxdPQyDUWldJBmJHdXWU",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

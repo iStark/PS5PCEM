@@ -6,6 +6,8 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const libatrac9 = b.dependency("libatrac9", .{});
+    const minimp3 = b.dependency("minimp3", .{});
 
     // Fixed-address guest virtual memory. Kept below loader and HLE so both can
     // use the same identity-mapped address space without depending on each
@@ -84,6 +86,34 @@ pub fn build(b: *std.Build) void {
             .{ .name = "input", .module = input },
         },
     });
+    hle.addIncludePath(libatrac9.path("C/src"));
+    hle.addIncludePath(minimp3.path("."));
+    hle.addCSourceFiles(.{
+        .root = libatrac9.path("C/src"),
+        .files = &.{
+            "band_extension.c",
+            "bit_allocation.c",
+            "bit_reader.c",
+            "decinit.c",
+            "decoder.c",
+            "huffCodes.c",
+            "imdct.c",
+            "libatrac9.c",
+            "quantization.c",
+            "scale_factors.c",
+            "tables.c",
+            "unpack.c",
+        },
+        .flags = &.{ "-std=c99", "-O2" },
+    });
+    hle.addCSourceFiles(.{
+        .files = &.{
+            "src/hle/codecs/libatrac9_utility.c",
+            "src/hle/codecs/minimp3_impl.c",
+        },
+        .flags = &.{ "-std=c99", "-O2" },
+    });
+    hle.link_libc = true;
 
     // Guest CPU dispatch: host worker lifecycle and scheduler semantics stay
     // separate from the platform-specific machine execution bridge.

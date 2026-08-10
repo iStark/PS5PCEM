@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Artur Strazewicz
 
-//! Headless audio services used while the host audio backend is brought up.
+//! Guest audio services and the host AudioOut backend.
 //!
 //! AudioOut and AudioIn preserve port lifetimes, validate the common ABI, and
 //! pace producer/consumer calls without touching a host sound device. AudioOut2
-//! does the same for its context/port queue model. AJM accepts batches and
-//! produces deterministic silent PCM; it is deliberately not a codec decoder.
+//! does the same for its context/port queue model. AJM executes ATRAC9 and MP3
+//! decode jobs through stateful host codec instances.
 
 const std = @import("std");
 
@@ -21,6 +21,7 @@ const kernel_threading = @import("kernel_threading.zig");
 const kernel_memory = @import("kernel_memory.zig");
 const audio_device = @import("../audio_device.zig");
 const audio_fs = @import("../audio_fs.zig");
+const ajm_codec = @import("../ajm_codec.zig");
 const filesystem = @import("../filesystem.zig");
 
 const audio_out_error_invalid_port: i32 = @bitCast(@as(u32, 0x8026_0003));
@@ -683,6 +684,7 @@ const AjmInstance = struct {
     codec: u32 = 0,
     flags: u64 = 0,
     id: u32 = 0,
+    decoder: ajm_codec.Decoder = .{},
 };
 
 const maximum_ajm_contexts = 16;
@@ -693,6 +695,7 @@ var ajm_contexts: [maximum_ajm_contexts]bool = [_]bool{false} ** maximum_ajm_con
 var ajm_modules: [maximum_ajm_contexts][maximum_ajm_codecs]bool = [_][maximum_ajm_codecs]bool{[_]bool{false} ** maximum_ajm_codecs} ** maximum_ajm_contexts;
 var ajm_instances: [maximum_ajm_instances]AjmInstance = [_]AjmInstance{.{}} ** maximum_ajm_instances;
 var next_batch = std.atomic.Value(u32).init(1);
+var ajm_decode_jobs = std.atomic.Value(u64).init(0);
 
 fn ajmContextIndex(context: u32) ?usize {
     if (context == 0 or context > maximum_ajm_contexts) return null;
@@ -713,7 +716,15 @@ fn isAjmInstance(instance: u32) bool {
     return false;
 }
 
-fn ajmInitialize(_: i64, context: ?*u32) callconv(abi.guest) i32 {
+fn findAjmInstanceLocked(instance: u32) ?*AjmInstance {
+    for (&ajm_instances) |*candidate| {
+        if (candidate.active and candidate.id == instance) return candidate;
+    }
+    return null;
+}
+
+fn ajmInitialize(reserved: i64, context: ?*u32) callconv(abi.guest) i32 {
+    if (reserved != 0) return ajm_error_invalid_parameter;
     const output = context orelse return ajm_error_invalid_parameter;
     ajm_mutex.lock();
     defer ajm_mutex.unlock();
@@ -734,14 +745,16 @@ fn ajmFinalize(context: u32) callconv(abi.guest) i32 {
     ajm_contexts[index] = false;
     ajm_modules[index] = [_]bool{false} ** maximum_ajm_codecs;
     for (&ajm_instances) |*instance| if (instance.active and instance.context == context) {
+        instance.decoder.deinit();
         instance.* = .{};
     };
     return errno.ok;
 }
 
-fn ajmModuleRegister(context: u32, codec: u32, _: i64) callconv(abi.guest) i32 {
+fn ajmModuleRegister(context: u32, codec: u32, reserved: i64) callconv(abi.guest) i32 {
+    if (reserved != 0) return ajm_error_invalid_parameter;
     const context_index = ajmContextIndex(context) orelse return ajm_error_invalid_context;
-    if (codec >= maximum_ajm_codecs) return ajm_error_codec_not_supported;
+    if (codec != ajm_codec.codec_mp3 and codec != ajm_codec.codec_atrac9) return ajm_error_codec_not_supported;
     ajm_mutex.lock();
     defer ajm_mutex.unlock();
     if (!ajm_contexts[context_index]) return ajm_error_invalid_context;
@@ -762,18 +775,24 @@ fn ajmModuleUnregister(context: u32, codec: u32) callconv(abi.guest) i32 {
 fn ajmInstanceCreate(context: u32, codec: u32, flags: u64, instance: ?*u32) callconv(abi.guest) i32 {
     const output = instance orelse return ajm_error_invalid_parameter;
     const context_index = ajmContextIndex(context) orelse return ajm_error_invalid_context;
-    if (codec >= maximum_ajm_codecs) return ajm_error_codec_not_supported;
+    if (codec != ajm_codec.codec_mp3 and codec != ajm_codec.codec_atrac9) return ajm_error_codec_not_supported;
     ajm_mutex.lock();
     defer ajm_mutex.unlock();
     if (!ajm_contexts[context_index]) return ajm_error_invalid_context;
     if (!ajm_modules[context_index][codec]) return ajm_error_codec_not_supported;
+    var decoder = ajm_codec.Decoder.create(codec, flags) catch return ajm_error_codec_not_supported;
     for (&ajm_instances, 0..) |*candidate, index| {
         if (candidate.active) continue;
         const id = (codec << 14) | @as(u32, @intCast(index + 1));
-        candidate.* = .{ .active = true, .context = context, .codec = codec, .flags = flags, .id = id };
+        candidate.* = .{ .active = true, .context = context, .codec = codec, .flags = flags, .id = id, .decoder = decoder };
         output.* = id;
+        std.debug.print(
+            "[audio ajm] instance={d} codec={s} flags=0x{x} format={d} channels={d}\n",
+            .{ id, if (codec == ajm_codec.codec_atrac9) "atrac9" else "mp3", flags, (flags >> 7) & 7, (flags >> 3) & 0xf },
+        );
         return errno.ok;
     }
+    decoder.deinit();
     return ajm_error_invalid_parameter;
 }
 
@@ -783,6 +802,7 @@ fn ajmInstanceDestroy(context: u32, instance: u32) callconv(abi.guest) i32 {
     defer ajm_mutex.unlock();
     for (&ajm_instances) |*candidate| {
         if (!candidate.active or candidate.id != instance or candidate.context != context) continue;
+        candidate.decoder.deinit();
         candidate.* = .{};
         return errno.ok;
     }
@@ -840,39 +860,118 @@ fn zeroAjmResult(result: ?[*]u8, size: usize, valid_instance: bool) void {
     }
 }
 
-fn ajmBatchJobInitialize(info: ?*AjmBatchInfo, instance: u32, _: ?*const anyopaque, _: usize, result: ?[*]u8) callconv(abi.guest) i32 {
-    zeroAjmResult(result, 8, isAjmInstance(instance));
+fn writeAjmBasicResult(result: ?[*]u8, code: i32, internal: i32) void {
+    const output = result orelse return;
+    @memcpy(output[0..4], std.mem.asBytes(&code));
+    @memcpy(output[4..8], std.mem.asBytes(&internal));
+}
+
+fn ajmBatchJobInitialize(info: ?*AjmBatchInfo, instance: u32, parameters: ?*const anyopaque, parameter_size: usize, result: ?[*]u8) callconv(abi.guest) i32 {
+    var decoded = ajm_codec.Report{ .result = ajm_result_invalid_parameter };
+    ajm_mutex.lock();
+    if (findAjmInstanceLocked(instance)) |candidate| {
+        const input: []const u8 = if (parameters) |address|
+            @as([*]const u8, @ptrCast(address))[0..@min(parameter_size, 4096)]
+        else
+            &.{};
+        decoded = candidate.decoder.initialize(input);
+        const codec_info = candidate.decoder.codecInfo();
+        std.debug.print(
+            "[audio ajm] initialized instance={d} result=0x{x} {d}Hz ch={d} frame={d} superframe={d}\n",
+            .{ instance, @as(u32, @bitCast(decoded.result)), codec_info.sample_rate, codec_info.channels, codec_info.frame_samples, codec_info.superframe_size },
+        );
+    }
+    ajm_mutex.unlock();
+    writeAjmBasicResult(result, decoded.result, decoded.internal_result);
     return appendAjmJob(info, 48);
 }
 
 fn ajmBatchJobGetCodecInfo(info: ?*AjmBatchInfo, instance: u32, result: ?[*]u8, result_size: usize) callconv(abi.guest) i32 {
-    zeroAjmResult(result, @min(result_size, 4096), isAjmInstance(instance));
+    const output_size = @min(result_size, 4096);
+    if (result) |output| @memset(output[0..output_size], 0);
+    var valid = false;
+    ajm_mutex.lock();
+    if (findAjmInstanceLocked(instance)) |candidate| {
+        valid = true;
+        const codec_info = candidate.decoder.codecInfo();
+        if (result) |output| {
+            if (candidate.codec == ajm_codec.codec_atrac9 and output_size >= 24) {
+                std.mem.writeInt(u32, output[8..12], codec_info.superframe_size, .little);
+                std.mem.writeInt(u32, output[12..16], codec_info.frames_in_superframe, .little);
+                std.mem.writeInt(u32, output[16..20], codec_info.next_frame_size, .little);
+                std.mem.writeInt(u32, output[20..24], codec_info.frame_samples, .little);
+            } else if (candidate.codec == ajm_codec.codec_mp3 and output_size >= 24) {
+                std.mem.writeInt(u32, output[8..12], codec_info.mp3_header, .little);
+                const header = @byteSwap(codec_info.mp3_header);
+                output[12] = @intFromBool(header & 0x0001_0000 == 0);
+                output[13] = @truncate((header >> 6) & 3);
+                output[14] = @truncate((header >> 4) & 3);
+                output[15] = @truncate((header >> 3) & 1);
+                output[16] = @truncate((header >> 2) & 1);
+                output[17] = @truncate(header & 3);
+            }
+        }
+    }
+    ajm_mutex.unlock();
+    if (result != null and output_size >= 8) writeAjmBasicResult(result, if (valid) 0 else ajm_result_invalid_parameter, 0);
     return appendAjmJob(info, 64);
 }
 
-fn ajmBatchJobSetGaplessDecode(info: ?*AjmBatchInfo, instance: u32, _: ?*const anyopaque, _: i32, result: ?[*]u8) callconv(abi.guest) i32 {
-    zeroAjmResult(result, 8, isAjmInstance(instance));
+fn ajmBatchJobSetGaplessDecode(info: ?*AjmBatchInfo, instance: u32, parameters: ?*const anyopaque, parameter_size: i32, result: ?[*]u8) callconv(abi.guest) i32 {
+    _ = parameter_size;
+    var code: i32 = ajm_result_invalid_parameter;
+    ajm_mutex.lock();
+    if (findAjmInstanceLocked(instance)) |candidate| {
+        if (parameters != null) {
+            const bytes = @as([*]const u8, @ptrCast(parameters.?))[0..8];
+            candidate.decoder.setGapless(std.mem.readInt(u32, bytes[0..4], .little), std.mem.readInt(u16, bytes[4..6], .little));
+            code = 0;
+        }
+    }
+    ajm_mutex.unlock();
+    writeAjmBasicResult(result, code, 0);
     return appendAjmJob(info, 48);
+}
+
+fn setAjmDecodeResult(result: ?*AjmDecodeResult, decoded: ajm_codec.Report) void {
+    const output = result orelse return;
+    output.* = .{
+        .result = decoded.result,
+        .internal_result = decoded.internal_result,
+        .size_consumed = std.math.cast(i32, decoded.consumed) orelse std.math.maxInt(i32),
+        .size_produced = std.math.cast(i32, decoded.produced) orelse std.math.maxInt(i32),
+        .total_decoded_samples = decoded.total_samples,
+        .number_of_frames = decoded.frames,
+    };
 }
 
 fn ajmBatchJobDecode(
     info: ?*AjmBatchInfo,
     instance: u32,
-    _: ?*const anyopaque,
+    input: ?*const anyopaque,
     input_size: usize,
     pcm: ?[*]u8,
     pcm_size: usize,
     result: ?*AjmDecodeResult,
 ) callconv(abi.guest) i32 {
-    const valid = isAjmInstance(instance);
-    if (pcm) |output| @memset(output[0..@min(pcm_size, 64 * 1024 * 1024)], 0);
-    if (result) |output| {
-        output.* = .{
-            .result = if (valid) 0 else ajm_result_invalid_parameter,
-            .size_consumed = std.math.cast(i32, input_size) orelse std.math.maxInt(i32),
-            .size_produced = if (pcm != null) std.math.cast(i32, pcm_size) orelse std.math.maxInt(i32) else 0,
-            .number_of_frames = if (valid and input_size != 0) 1 else 0,
-        };
+    const bounded_input_size = @min(input_size, 64 * 1024 * 1024);
+    const bounded_pcm_size = @min(pcm_size, 64 * 1024 * 1024);
+    if (pcm) |output| @memset(output[0..bounded_pcm_size], 0);
+    var decoded = ajm_codec.Report{ .result = ajm_result_invalid_parameter };
+    if ((input != null or bounded_input_size == 0) and (pcm != null or bounded_pcm_size == 0)) {
+        const input_bytes: []const u8 = if (input) |address| @as([*]const u8, @ptrCast(address))[0..bounded_input_size] else &.{};
+        const output_bytes: []u8 = if (pcm) |address| address[0..bounded_pcm_size] else &.{};
+        ajm_mutex.lock();
+        if (findAjmInstanceLocked(instance)) |candidate| decoded = candidate.decoder.decode(input_bytes, output_bytes);
+        ajm_mutex.unlock();
+    }
+    setAjmDecodeResult(result, decoded);
+    const job_number = ajm_decode_jobs.fetchAdd(1, .monotonic) + 1;
+    if (job_number <= 6 or (decoded.result != 0 and std.math.isPowerOfTwo(job_number))) {
+        std.debug.print(
+            "[audio ajm] decode #{d} instance={d} in={d}/{d} pcm={d}/{d} frames={d} result=0x{x}\n",
+            .{ job_number, instance, decoded.consumed, bounded_input_size, decoded.produced, bounded_pcm_size, decoded.frames, @as(u32, @bitCast(decoded.result)) },
+        );
     }
     return appendAjmJob(info, 64);
 }
@@ -880,32 +979,63 @@ fn ajmBatchJobDecode(
 fn ajmBatchJobDecodeSplit(
     info: ?*AjmBatchInfo,
     instance: u32,
-    _: ?[*]const AjmBuffer,
+    input_buffers: ?[*]const AjmBuffer,
     input_count: usize,
     output_buffers: ?[*]const AjmBuffer,
     output_count: usize,
     result: ?*AjmDecodeResult,
 ) callconv(abi.guest) i32 {
-    const valid = isAjmInstance(instance);
-    var produced: usize = 0;
-    if (output_buffers) |buffers| {
-        for (buffers[0..@min(output_count, 4096)]) |buffer| {
-            const output = buffer.address orelse continue;
-            const size = @min(buffer.size, 64 * 1024 * 1024);
-            if (kernel_memory.isGuestRangeAccessible(@intFromPtr(output), size)) {
-                @memset(output[0..size], 0);
-                produced = std.math.add(usize, produced, size) catch std.math.maxInt(usize);
-            }
-        }
-    }
-    if (result) |output| {
-        output.* = .{
-            .result = if (valid) 0 else ajm_result_invalid_parameter,
-            .size_consumed = 0,
-            .size_produced = std.math.cast(i32, produced) orelse std.math.maxInt(i32),
-            .number_of_frames = if (valid and (input_count != 0 or produced != 0)) 1 else 0,
+    const maximum_buffers: usize = 4096;
+    const maximum_bytes: usize = 64 * 1024 * 1024;
+    const safe_input_count = @min(input_count, maximum_buffers);
+    const safe_output_count = @min(output_count, maximum_buffers);
+    var input_bytes: usize = 0;
+    var output_bytes: usize = 0;
+    var buffers_valid = input_count == safe_input_count and output_count == safe_output_count;
+    if (safe_input_count != 0 and input_buffers == null) buffers_valid = false;
+    if (safe_output_count != 0 and output_buffers == null) buffers_valid = false;
+    if (input_buffers) |buffers| for (buffers[0..safe_input_count]) |buffer| {
+        if (buffer.size != 0 and buffer.address == null) buffers_valid = false;
+        input_bytes = std.math.add(usize, input_bytes, buffer.size) catch {
+            buffers_valid = false;
+            break;
+        };
+        if (input_bytes > maximum_bytes) buffers_valid = false;
+    };
+    if (output_buffers) |buffers| for (buffers[0..safe_output_count]) |buffer| {
+        if (buffer.size != 0 and buffer.address == null) buffers_valid = false;
+        output_bytes = std.math.add(usize, output_bytes, buffer.size) catch {
+            buffers_valid = false;
+            break;
+        };
+        if (output_bytes > maximum_bytes) buffers_valid = false;
+        if (buffer.address) |address| @memset(address[0..@min(buffer.size, maximum_bytes)], 0);
+    };
+
+    var decoded = ajm_codec.Report{ .result = ajm_result_invalid_parameter };
+    if (buffers_valid) decode: {
+        const joined_input = std.heap.page_allocator.alloc(u8, input_bytes) catch break :decode;
+        defer std.heap.page_allocator.free(joined_input);
+        const joined_output = std.heap.page_allocator.alloc(u8, output_bytes) catch break :decode;
+        defer std.heap.page_allocator.free(joined_output);
+        @memset(joined_output, 0);
+        var offset: usize = 0;
+        if (input_buffers) |buffers| for (buffers[0..safe_input_count]) |buffer| {
+            if (buffer.address) |address| @memcpy(joined_input[offset..][0..buffer.size], address[0..buffer.size]);
+            offset += buffer.size;
+        };
+        ajm_mutex.lock();
+        if (findAjmInstanceLocked(instance)) |candidate| decoded = candidate.decoder.decode(joined_input, joined_output);
+        ajm_mutex.unlock();
+
+        offset = 0;
+        if (output_buffers) |buffers| for (buffers[0..safe_output_count]) |buffer| {
+            const copied = @min(buffer.size, decoded.produced -| offset);
+            if (buffer.address) |address| @memcpy(address[0..copied], joined_output[offset..][0..copied]);
+            offset += copied;
         };
     }
+    setAjmDecodeResult(result, decoded);
     const buffer_count = std.math.add(usize, input_count, output_count) catch return ajm_error_job_creation;
     const buffer_bytes = std.math.mul(usize, buffer_count, 16) catch return ajm_error_job_creation;
     const job_size = std.math.add(usize, buffer_bytes, 32) catch return ajm_error_job_creation;
@@ -920,7 +1050,7 @@ fn ajmBatchJobSetResampleParametersEx(
     _: u32,
     result: ?[*]u8,
 ) callconv(abi.guest) i32 {
-    zeroAjmResult(result, 8, isAjmInstance(instance));
+    writeAjmBasicResult(result, if (isAjmInstance(instance)) ajm_codec.result_unsupported_flag else ajm_result_invalid_parameter, 0);
     return appendAjmJob(info, 72);
 }
 
@@ -961,6 +1091,12 @@ const ajm_exports = [_]symbols.Export{
 };
 
 pub fn reset() void {
+    // Runtime teardown can happen without the title closing its port. Release
+    // WinMM before forgetting port ownership so a later runtime in this process
+    // can claim the device cleanly.
+    device.close();
+    device_owner = -1;
+
     port_mutex.lock();
     legacy_ports = [_]LegacyPort{.{}} ** maximum_legacy_ports;
     port_mutex.unlock();
@@ -970,11 +1106,19 @@ pub fn reset() void {
     audio_object_mutex.unlock();
 
     ajm_mutex.lock();
+    for (&ajm_instances) |*instance| if (instance.active) instance.decoder.deinit();
     ajm_contexts = [_]bool{false} ** maximum_ajm_contexts;
     ajm_modules = [_][maximum_ajm_codecs]bool{[_]bool{false} ** maximum_ajm_codecs} ** maximum_ajm_contexts;
     ajm_instances = [_]AjmInstance{.{}} ** maximum_ajm_instances;
     ajm_mutex.unlock();
     next_batch.store(1, .monotonic);
+    ajm_decode_jobs.store(0, .monotonic);
+    audio_out_play_ok.store(0, .monotonic);
+    audio_out_play_silent.store(0, .monotonic);
+    audio_out_play_fail.store(0, .monotonic);
+    audio_test_tone_phase = 0;
+    audio_test_tone_enabled = null;
+    audio_disabled = null;
 }
 
 pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {
@@ -1012,22 +1156,64 @@ test "AudioOut2 context defaults and handles are deterministic" {
     try std.testing.expectEqual(@as(u32, 4), available);
 }
 
-test "AJM accepts a batch and emits silent decoded PCM" {
+test "AJM executes an MP3 decode job and reports actual PCM" {
     reset();
     var context: u32 = 0;
     try std.testing.expectEqual(errno.ok, ajmInitialize(0, &context));
     try std.testing.expectEqual(errno.ok, ajmModuleRegister(context, 0, 0));
     var instance: u32 = 0;
-    try std.testing.expectEqual(errno.ok, ajmInstanceCreate(context, 0, 0, &instance));
+    try std.testing.expectEqual(errno.ok, ajmInstanceCreate(context, 0, 1, &instance));
     var storage: [256]u8 = undefined;
     var info = AjmBatchInfo{};
     try std.testing.expectEqual(errno.ok, ajmBatchInitialize(&storage, storage.len, &info));
-    var pcm: [32]u8 = [_]u8{0xff} ** 32;
+    var frame: [417]u8 = @splat(0);
+    frame[0..4].* = .{ 0xff, 0xfb, 0x90, 0x64 };
+    var pcm: [4608]u8 = undefined;
     var result = AjmDecodeResult{};
-    try std.testing.expectEqual(errno.ok, ajmBatchJobDecode(&info, instance, null, 5, &pcm, pcm.len, &result));
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 32), &pcm);
-    try std.testing.expectEqual(@as(i32, 5), result.size_consumed);
-    try std.testing.expectEqual(@as(i32, 32), result.size_produced);
+    try std.testing.expectEqual(errno.ok, ajmBatchJobDecode(&info, instance, &frame, frame.len, &pcm, pcm.len, &result));
+    try std.testing.expectEqual(@as(i32, 0), result.result);
+    try std.testing.expectEqual(@as(i32, frame.len), result.size_consumed);
+    try std.testing.expect(result.size_produced > 0);
+    try std.testing.expectEqual(@as(u32, 1), result.number_of_frames);
+    var codec_info: [24]u8 = undefined;
+    try std.testing.expectEqual(errno.ok, ajmBatchJobGetCodecInfo(&info, instance, &codec_info, codec_info.len));
+    try std.testing.expectEqualSlices(u8, frame[0..4], codec_info[8..12]);
+    try std.testing.expectEqual(@as(u8, 0), codec_info[12]);
+    try std.testing.expectEqual(@as(u8, 1), codec_info[13]);
+}
+
+test "AJM split decode joins input and scatters actual output" {
+    reset();
+    var context: u32 = 0;
+    try std.testing.expectEqual(errno.ok, ajmInitialize(0, &context));
+    try std.testing.expectEqual(errno.ok, ajmModuleRegister(context, ajm_codec.codec_mp3, 0));
+    var instance: u32 = 0;
+    try std.testing.expectEqual(errno.ok, ajmInstanceCreate(context, ajm_codec.codec_mp3, 1, &instance));
+
+    var storage: [256]u8 = undefined;
+    var info = AjmBatchInfo{};
+    try std.testing.expectEqual(errno.ok, ajmBatchInitialize(&storage, storage.len, &info));
+    var frame: [417]u8 = @splat(0);
+    frame[0..4].* = .{ 0xff, 0xfb, 0x90, 0x64 };
+    const inputs = [_]AjmBuffer{
+        .{ .address = frame[0..2].ptr, .size = 2 },
+        .{ .address = frame[2..].ptr, .size = frame.len - 2 },
+    };
+    var first: [1024]u8 = undefined;
+    var second: [3584]u8 = undefined;
+    const outputs = [_]AjmBuffer{
+        .{ .address = &first, .size = first.len },
+        .{ .address = &second, .size = second.len },
+    };
+    var result = AjmDecodeResult{};
+    try std.testing.expectEqual(
+        errno.ok,
+        ajmBatchJobDecodeSplit(&info, instance, &inputs, inputs.len, &outputs, outputs.len, &result),
+    );
+    try std.testing.expectEqual(@as(i32, 0), result.result);
+    try std.testing.expectEqual(@as(i32, frame.len), result.size_consumed);
+    try std.testing.expectEqual(@as(i32, first.len + second.len), result.size_produced);
+    try std.testing.expectEqual(@as(u32, 1), result.number_of_frames);
 }
 
 test "audio libraries register the title import surface" {

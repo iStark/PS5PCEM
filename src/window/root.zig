@@ -89,6 +89,22 @@ pub const HostWindow = struct {
         if (value != 0) _ = Win32.PostMessageA(@ptrFromInt(value), Win32.wm_close, 0, 0);
     }
 
+    /// Updates the native title at the renderer's low-frequency sampling rate.
+    /// SetWindowText is safe across threads within the same process and avoids
+    /// touching the Vulkan client area or adding work to every presented frame.
+    pub fn updateFps(self: *HostWindow, fps_tenths: u32) void {
+        if (builtin.os.tag != .windows) return;
+        const value = self.window.load(.acquire);
+        if (value == 0) return;
+        var title: [96]u8 = undefined;
+        const title_z = std.fmt.bufPrintZ(
+            &title,
+            "PS5PCEM - Vulkan guest output - {d}.{d} FPS",
+            .{ fps_tenths / 10, fps_tenths % 10 },
+        ) catch return;
+        _ = Win32.SetWindowTextA(@ptrFromInt(value), title_z.ptr);
+    }
+
     fn threadMain(self: *HostWindow) void {
         if (builtin.os.tag != .windows) {
             self.status.store(status_failed, .release);
@@ -235,6 +251,7 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     extern "user32" fn PostMessageA(Window, u32, usize, isize) callconv(.winapi) i32;
     extern "user32" fn ShowWindow(Window, i32) callconv(.winapi) i32;
     extern "user32" fn UpdateWindow(Window) callconv(.winapi) i32;
+    extern "user32" fn SetWindowTextA(Window, [*:0]const u8) callconv(.winapi) i32;
     extern "user32" fn GetMessageA(*Message, Window, u32, u32) callconv(.winapi) i32;
     extern "user32" fn TranslateMessage(*const Message) callconv(.winapi) i32;
     extern "user32" fn DispatchMessageA(*const Message) callconv(.winapi) isize;

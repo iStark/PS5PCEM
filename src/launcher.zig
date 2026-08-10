@@ -17,6 +17,7 @@ comptime {
 }
 
 const github_url = "https://github.com/iStark/PS5PCEM";
+const boosty_url = "https://boosty.to/ps5pcem";
 const window_width = 1180;
 const window_height = 760;
 const sidebar_width = 222;
@@ -30,6 +31,7 @@ const Phrase = enum {
     nav_input,
     nav_settings,
     project,
+    support_boosty,
     library_heading,
     library_subtitle,
     folder_label,
@@ -65,6 +67,8 @@ const Phrase = enum {
     language,
     sound_output,
     sound_output_description,
+    fps_counter,
+    fps_counter_description,
     compatibility,
     compatibility_text,
     author,
@@ -75,6 +79,8 @@ const Phrase = enum {
     status_controller_saved,
     status_sound_on,
     status_sound_off,
+    status_fps_on,
+    status_fps_off,
     status_folder_selected,
     status_choose_folder,
     status_eboot_missing,
@@ -105,6 +111,7 @@ var input_mode: InputMode = .hybrid;
 var language: Language = .english;
 var controller_index: u8 = 0;
 var sound_enabled = true;
+var show_fps = false;
 var mapping = mapping_defaults;
 var capture_mapping: ?usize = null;
 var game_folder: [1024]u16 = [_]u16{0} ** 1024;
@@ -126,6 +133,7 @@ fn tr(phrase: Phrase) []const u8 {
             .nav_input => "Controls",
             .nav_settings => "Settings",
             .project => "PROJECT",
+            .support_boosty => "Support on Boosty  ↗",
             .library_heading => "Game library",
             .library_subtitle => "Choose a local folder containing a decrypted copy of your game",
             .folder_label => "GAME FOLDER",
@@ -161,6 +169,8 @@ fn tr(phrase: Phrase) []const u8 {
             .language => "LANGUAGE",
             .sound_output => "Sound output",
             .sound_output_description => "Disabling sound does not affect AudioOut timing",
+            .fps_counter => "FPS counter",
+            .fps_counter_description => "Show the measured frame rate in the game window title",
             .compatibility => "Compatibility",
             .compatibility_text => "PS5PCEM is at an early stage. Not every title boots yet; advanced DualSense features, native PS5 keyboard/mouse and controller-to-keyboard conversion still need more HLE support.",
             .author => "Author: Artur Strazewicz · GitHub: iStark/PS5PCEM",
@@ -171,6 +181,8 @@ fn tr(phrase: Phrase) []const u8 {
             .status_controller_saved => "Controller slot saved",
             .status_sound_on => "Sound enabled",
             .status_sound_off => "Sound disabled",
+            .status_fps_on => "FPS counter enabled",
+            .status_fps_off => "FPS counter disabled",
             .status_folder_selected => "Folder selected · ready to launch",
             .status_choose_folder => "Choose a game folder first",
             .status_eboot_missing => "eboot.bin was not found in the selected folder or decrypted subfolder",
@@ -183,6 +195,7 @@ fn tr(phrase: Phrase) []const u8 {
             .nav_input => "Управление",
             .nav_settings => "Настройки",
             .project => "ПРОЕКТ",
+            .support_boosty => "Поддержать на Boosty  ↗",
             .library_heading => "Игровая библиотека",
             .library_subtitle => "Выберите локальную папку с расшифрованной копией игры",
             .folder_label => "ПАПКА С ИГРОЙ",
@@ -218,6 +231,8 @@ fn tr(phrase: Phrase) []const u8 {
             .language => "ЯЗЫК",
             .sound_output => "Вывод звука",
             .sound_output_description => "Отключение не нарушает тайминг AudioOut",
+            .fps_counter => "Счётчик FPS",
+            .fps_counter_description => "Показывать частоту кадров в заголовке окна игры",
             .compatibility => "Совместимость",
             .compatibility_text => "PS5PCEM находится на ранней стадии. Не все игры загружаются; функции DualSense, нативные PS5-клавиатура/мышь и преобразование геймпада в клавиши требуют дальнейшей HLE-поддержки.",
             .author => "Автор: Artur Strazewicz · GitHub: iStark/PS5PCEM",
@@ -228,6 +243,8 @@ fn tr(phrase: Phrase) []const u8 {
             .status_controller_saved => "Слот контроллера сохранён",
             .status_sound_on => "Звук включён",
             .status_sound_off => "Звук выключен",
+            .status_fps_on => "Счётчик FPS включён",
+            .status_fps_off => "Счётчик FPS выключен",
             .status_folder_selected => "Папка выбрана · готово к запуску",
             .status_choose_folder => "Сначала выберите папку с игрой",
             .status_eboot_missing => "В выбранной папке не найден eboot.bin (проверены корень и decrypted)",
@@ -240,6 +257,7 @@ fn tr(phrase: Phrase) []const u8 {
             .nav_input => "Steuerung",
             .nav_settings => "Einstellungen",
             .project => "PROJEKT",
+            .support_boosty => "Auf Boosty unterstützen  ↗",
             .library_heading => "Spielebibliothek",
             .library_subtitle => "Wähle einen lokalen Ordner mit einer entschlüsselten Spielkopie",
             .folder_label => "SPIELORDNER",
@@ -275,6 +293,8 @@ fn tr(phrase: Phrase) []const u8 {
             .language => "SPRACHE",
             .sound_output => "Tonausgabe",
             .sound_output_description => "Deaktivieren beeinflusst das AudioOut-Timing nicht",
+            .fps_counter => "FPS-Anzeige",
+            .fps_counter_description => "Bildrate im Titel des Spielfensters anzeigen",
             .compatibility => "Kompatibilität",
             .compatibility_text => "PS5PCEM ist in einer frühen Phase. Nicht jedes Spiel startet; erweiterte DualSense-Funktionen, native PS5-Tastatur/Maus und Controller-zu-Tastatur benötigen weitere HLE-Unterstützung.",
             .author => "Autor: Artur Strazewicz · GitHub: iStark/PS5PCEM",
@@ -285,6 +305,8 @@ fn tr(phrase: Phrase) []const u8 {
             .status_controller_saved => "Controller-Slot gespeichert",
             .status_sound_on => "Ton eingeschaltet",
             .status_sound_off => "Ton ausgeschaltet",
+            .status_fps_on => "FPS-Anzeige eingeschaltet",
+            .status_fps_off => "FPS-Anzeige ausgeschaltet",
             .status_folder_selected => "Ordner gewählt · startbereit",
             .status_choose_folder => "Zuerst einen Spielordner wählen",
             .status_eboot_missing => "eboot.bin wurde im Ordner und Unterordner decrypted nicht gefunden",
@@ -297,6 +319,7 @@ fn tr(phrase: Phrase) []const u8 {
             .nav_input => "Commandes",
             .nav_settings => "Paramètres",
             .project => "PROJET",
+            .support_boosty => "Soutenir sur Boosty  ↗",
             .library_heading => "Bibliothèque de jeux",
             .library_subtitle => "Choisissez un dossier local contenant une copie déchiffrée du jeu",
             .folder_label => "DOSSIER DU JEU",
@@ -332,6 +355,8 @@ fn tr(phrase: Phrase) []const u8 {
             .language => "LANGUE",
             .sound_output => "Sortie audio",
             .sound_output_description => "La désactivation n'affecte pas le rythme AudioOut",
+            .fps_counter => "Compteur FPS",
+            .fps_counter_description => "Afficher la fréquence d'images dans le titre de la fenêtre",
             .compatibility => "Compatibilité",
             .compatibility_text => "PS5PCEM est encore expérimental. Tous les jeux ne démarrent pas ; les fonctions DualSense avancées, le clavier/souris PS5 natif et la conversion manette-clavier demandent davantage de prise en charge HLE.",
             .author => "Auteur : Artur Strazewicz · GitHub : iStark/PS5PCEM",
@@ -342,6 +367,8 @@ fn tr(phrase: Phrase) []const u8 {
             .status_controller_saved => "Emplacement de manette enregistré",
             .status_sound_on => "Son activé",
             .status_sound_off => "Son désactivé",
+            .status_fps_on => "Compteur FPS activé",
+            .status_fps_off => "Compteur FPS désactivé",
             .status_folder_selected => "Dossier sélectionné · prêt à lancer",
             .status_choose_folder => "Choisissez d'abord un dossier de jeu",
             .status_eboot_missing => "eboot.bin est introuvable dans le dossier ou le sous-dossier decrypted",
@@ -460,7 +487,9 @@ fn handleClick(window: Win32.Window, x: i32, y: i32) void {
         current_page = .input;
     } else if ((Rect{ .left = 20, .top = 242, .right = 202, .bottom = 290 }).contains(x, y)) {
         current_page = .settings;
-    } else if ((Rect{ .left = 20, .top = 684, .right = 202, .bottom = 724 }).contains(x, y)) {
+    } else if ((Rect{ .left = 20, .top = 626, .right = 202, .bottom = 670 }).contains(x, y)) {
+        openBoosty(window);
+    } else if ((Rect{ .left = 20, .top = 680, .right = 202, .bottom = 724 }).contains(x, y)) {
         openGithub(window);
     } else switch (current_page) {
         .library => handleLibraryClick(window, x, y),
@@ -549,6 +578,12 @@ fn handleSettingsClick(x: i32, y: i32) void {
         sound_enabled = !sound_enabled;
         saveSettings();
         setStatusPhrase(if (sound_enabled) .status_sound_on else .status_sound_off, false);
+        return;
+    }
+    if ((Rect{ .left = 282, .top = 382, .right = 1086, .bottom = 464 }).contains(x, y)) {
+        show_fps = !show_fps;
+        saveSettings();
+        setStatusPhrase(if (show_fps) .status_fps_on else .status_fps_off, false);
     }
 }
 
@@ -584,8 +619,10 @@ fn drawNavigation(dc: Win32.DeviceContext) void {
     drawNavItem(dc, .library, 126, .nav_library, "01");
     drawNavItem(dc, .input, 184, .nav_input, "02");
     drawNavItem(dc, .settings, 242, .nav_settings, "03");
-    localizedText(dc, .project, .{ .left = 28, .top = 650, .right = 190, .bottom = 670 }, 0x007c716a, small_font, Win32.dt_left);
-    text(dc, w("GitHub · iStark  ↗"), -1, .{ .left = 28, .top = 690, .right = 198, .bottom = 716 }, 0x00ffac64, regular_font, Win32.dt_left);
+    localizedText(dc, .project, .{ .left = 28, .top = 596, .right = 190, .bottom = 616 }, 0x007c716a, small_font, Win32.dt_left);
+    roundFill(dc, .{ .left = 20, .top = 626, .right = 202, .bottom = 670 }, 10, 0x003d3029);
+    localizedText(dc, .support_boosty, .{ .left = 32, .top = 639, .right = 192, .bottom = 660 }, 0x00ffac64, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    text(dc, w("GitHub · iStark  ↗"), -1, .{ .left = 28, .top = 690, .right = 198, .bottom = 716 }, 0x00b9afa8, regular_font, Win32.dt_left);
 }
 
 fn drawNavItem(dc: Win32.DeviceContext, page: Page, top: i32, label: Phrase, comptime index: []const u8) void {
@@ -669,14 +706,19 @@ fn drawSettings(dc: Win32.DeviceContext) void {
     localizedText(dc, .sound_output_description, .{ .left = 310, .top = 328, .right = 760, .bottom = 350 }, 0x008b817a, regular_font, Win32.dt_left);
     drawToggle(dc, 988, 302, sound_enabled);
 
-    card(dc, .{ .left = 282, .top = 382, .right = 1086, .bottom = 510 });
-    localizedText(dc, .compatibility, .{ .left = 310, .top = 402, .right = 550, .bottom = 428 }, 0x00f4f0ea, medium_font, Win32.dt_left);
-    localizedText(dc, .compatibility_text, .{ .left = 310, .top = 440, .right = 1048, .bottom = 494 }, 0x00aaa098, regular_font, Win32.dt_left | Win32.dt_word_break);
+    card(dc, .{ .left = 282, .top = 382, .right = 1086, .bottom = 464 });
+    localizedText(dc, .fps_counter, .{ .left = 310, .top = 400, .right = 550, .bottom = 425 }, 0x00f4f0ea, medium_font, Win32.dt_left);
+    localizedText(dc, .fps_counter_description, .{ .left = 310, .top = 432, .right = 860, .bottom = 454 }, 0x008b817a, regular_font, Win32.dt_left);
+    drawToggle(dc, 988, 406, show_fps);
 
-    card(dc, .{ .left = 282, .top = 532, .right = 1086, .bottom = 636 });
-    text(dc, w("PS5PCEM"), -1, .{ .left = 310, .top = 553, .right = 500, .bottom = 580 }, 0x00f4f0ea, medium_font, Win32.dt_left);
-    localizedText(dc, .author, .{ .left = 310, .top = 592, .right = 840, .bottom = 616 }, 0x00ffac64, regular_font, Win32.dt_left);
-    text(dc, w("GPL-3.0-or-later"), -1, .{ .left = 860, .top = 592, .right = 1048, .bottom = 616 }, 0x008b817a, regular_font, Win32.dt_right);
+    card(dc, .{ .left = 282, .top = 486, .right = 1086, .bottom = 588 });
+    localizedText(dc, .compatibility, .{ .left = 310, .top = 504, .right = 550, .bottom = 530 }, 0x00f4f0ea, medium_font, Win32.dt_left);
+    localizedText(dc, .compatibility_text, .{ .left = 310, .top = 538, .right = 1048, .bottom = 578 }, 0x00aaa098, regular_font, Win32.dt_left | Win32.dt_word_break);
+
+    card(dc, .{ .left = 282, .top = 610, .right = 1086, .bottom = 700 });
+    text(dc, w("PS5PCEM"), -1, .{ .left = 310, .top = 627, .right = 500, .bottom = 654 }, 0x00f4f0ea, medium_font, Win32.dt_left);
+    localizedText(dc, .author, .{ .left = 310, .top = 667, .right = 840, .bottom = 691 }, 0x00ffac64, regular_font, Win32.dt_left);
+    text(dc, w("GPL-3.0-or-later"), -1, .{ .left = 860, .top = 667, .right = 1048, .bottom = 691 }, 0x008b817a, regular_font, Win32.dt_right);
 }
 
 fn pageHeading(dc: Win32.DeviceContext, heading: Phrase, subtitle: Phrase) void {
@@ -807,6 +849,7 @@ fn launchGame(owner: Win32.Window) void {
     }
 
     _ = Win32.SetEnvironmentVariableW(w("PS5_AUDIO_DISABLED"), if (sound_enabled) null else w("1"));
+    _ = Win32.SetEnvironmentVariableW(w("PS5_SHOW_FPS"), if (show_fps) w("1") else null);
     _ = Win32.SetEnvironmentVariableW(w("PS5_INPUT_MODE"), inputModeEnvironment());
     var controller_value = [_:0]u16{@as(u16, '0') + controller_index};
     _ = Win32.SetEnvironmentVariableW(w("PS5_CONTROLLER_INDEX"), &controller_value);
@@ -866,6 +909,10 @@ fn findGameExecutable(output: *[1024]u16) bool {
 
 fn openGithub(owner: Win32.Window) void {
     _ = Win32.ShellExecuteW(owner, w("open"), w(github_url), null, null, Win32.show_normal);
+}
+
+fn openBoosty(owner: Win32.Window) void {
+    _ = Win32.ShellExecuteW(owner, w("open"), w(boosty_url), null, null, Win32.show_normal);
 }
 
 fn inputModeTitle() Phrase {
@@ -944,6 +991,7 @@ fn loadSettings() void {
     if (ini_path_length == 0) return;
     game_folder_length = Win32.GetPrivateProfileStringW(w("launcher"), w("game_folder"), w(""), &game_folder, game_folder.len, @ptrCast(&ini_path));
     sound_enabled = Win32.GetPrivateProfileIntW(w("launcher"), w("sound"), 1, @ptrCast(&ini_path)) != 0;
+    show_fps = Win32.GetPrivateProfileIntW(w("launcher"), w("show_fps"), 0, @ptrCast(&ini_path)) != 0;
     const mode_value = Win32.GetPrivateProfileIntW(w("launcher"), w("input_mode"), 2, @ptrCast(&ini_path));
     if (mode_value <= 2) input_mode = @enumFromInt(mode_value);
     const language_value = Win32.GetPrivateProfileIntW(w("launcher"), w("language"), 0, @ptrCast(&ini_path));
@@ -962,6 +1010,7 @@ fn saveSettings() void {
     if (ini_path_length == 0) return;
     _ = Win32.WritePrivateProfileStringW(w("launcher"), w("game_folder"), @ptrCast(&game_folder), @ptrCast(&ini_path));
     writeIniInt(w("launcher"), w("sound"), @intFromBool(sound_enabled));
+    writeIniInt(w("launcher"), w("show_fps"), @intFromBool(show_fps));
     writeIniInt(w("launcher"), w("input_mode"), @intFromEnum(input_mode));
     writeIniInt(w("launcher"), w("language"), @intFromEnum(language));
     writeIniInt(w("launcher"), w("controller_index"), controller_index);

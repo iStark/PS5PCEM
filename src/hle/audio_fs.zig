@@ -25,7 +25,8 @@ pub const Error = error{
 const maximum_clips = 4096;
 const maximum_wav_bytes = 12 * 1024 * 1024;
 const maximum_name = 96;
-const mix_ring_samples = 48000 * 2 * 8; // ~8 s stereo float at 48 kHz
+const host_mix_rate = 48_000;
+const mix_ring_samples = host_mix_rate * 2 * 8; // ~8 s stereo float at 48 kHz
 
 const ClipEntry = struct {
     name: [maximum_name]u8 = undefined,
@@ -61,13 +62,6 @@ var mix_write: usize = 0;
 var mix_read: usize = 0;
 var mix_count: usize = 0;
 
-// Loopback: short stereo float loop of attract/game audio for silent mixer.
-// Kept short so refill does not pile multi-second latency behind the picture.
-const loop_max_samples = 48000 * 2 * 2; // ~2 s stereo
-var loop_buf: [loop_max_samples]f32 = [_]f32{0} ** loop_max_samples;
-var loop_len: usize = 0;
-var loop_pos: usize = 0;
-
 /// Host mix stays muted until the first VideoOut flip so SFX are not heard
 /// seconds before the first picture (load-time open of 800+ clips used to
 /// flood the ring and create a long A/V delay).
@@ -99,27 +93,6 @@ fn pushStereoSampleLocked(left: f32, right: f32) void {
     mix_count += 2;
 }
 
-fn appendLoopSampleLocked(left: f32, right: f32) void {
-    if (loop_len + 2 > loop_max_samples) return;
-    loop_buf[loop_len] = left;
-    loop_buf[loop_len + 1] = right;
-    loop_len += 2;
-}
-
-/// When the ring is nearly empty, refill from the captured game-audio loop.
-fn refillFromLoopLocked() void {
-    if (loop_len < 2) return;
-    // Keep only ~80 ms ahead of the speakers — less backlog = less delay.
-    const target: usize = 48000 / 6 * 2; // stereo samples for ~80 ms
-    while (mix_count < target) {
-        const left = loop_buf[loop_pos];
-        const right = loop_buf[loop_pos + 1];
-        loop_pos = (loop_pos + 2) % loop_len;
-        pushStereoSampleLocked(left, right);
-        if (mix_count + 2 > mix_ring_samples) break;
-    }
-}
-
 /// Call from VideoOut flip completion so host SFX start with the picture.
 pub fn noteFirstPresent() void {
     const was = mix_live.swap(true, .monotonic);
@@ -149,40 +122,65 @@ fn nameLooksAttract(name: []const u8) bool {
     return pathLooksAttract(name);
 }
 
-/// Push mono/stereo PCM16 into the host mix ring (converted to stereo float).
-/// Caps length so one long bed cannot bury later SFX under multi-second delay.
-pub fn queuePcm16ForHostMix(pcm: []const u8, channels: u8, rate: u32) void {
-    if (!mix_live.load(.monotonic)) return;
-    if (pcm.len < 2 or channels == 0) return;
+fn pcm16StereoFrame(pcm: []const u8, channels: u8, frame: usize) [2]f32 {
+    const ch: usize = channels;
+    const frame_bytes = ch * 2;
+    const offset = frame * frame_bytes;
+    const left_i16 = std.mem.readInt(i16, pcm[offset..][0..2], .little);
+    const right_i16 = if (channels == 1)
+        left_i16
+    else
+        std.mem.readInt(i16, pcm[offset + 2 ..][0..2], .little);
+    return .{
+        @as(f32, @floatFromInt(left_i16)) / 32768.0,
+        @as(f32, @floatFromInt(right_i16)) / 32768.0,
+    };
+}
+
+/// Push mono/stereo PCM16 into the host mix ring (converted and resampled to
+/// 48 kHz stereo float). A short edge envelope prevents a non-zero clip start
+/// or truncated preview end from becoming an audible click.
+///
+/// Returns whether at least one frame was queued. Callers use this to avoid
+/// counting clips rejected by the real-time backlog limit.
+pub fn queuePcm16ForHostMix(pcm: []const u8, channels: u8, rate: u32) bool {
+    if (!mix_live.load(.monotonic)) return false;
+    if (pcm.len < 2 or channels == 0 or rate < 8_000 or rate > 192_000) return false;
     const ch: usize = channels;
     const frame_bytes = ch * 2;
     const frames_total = pcm.len / frame_bytes;
+    if (frames_total == 0) return false;
     // At most ~0.75 s per enqueue — enough for a one-shot, not a full music bed.
-    const max_frames: usize = if (rate >= 8000) (@as(usize, rate) * 3) / 4 else 36_000;
-    const frames = @min(frames_total, max_frames);
+    const source_frames = @min(frames_total, (@as(usize, rate) * 3) / 4);
+    const output_frames_u64 = (@as(u64, source_frames) * host_mix_rate + rate / 2) / rate;
+    const output_frames: usize = @intCast(@max(output_frames_u64, 1));
+    const fade_frames = @min(@as(usize, host_mix_rate / 200), output_frames / 2); // 5 ms
     mixLock();
     defer mixUnlock();
     // Drop new material if the ring already holds >250 ms (keeps latency tight).
-    if (mix_count > 48000 / 2) return;
-    var f: usize = 0;
-    while (f < frames) : (f += 1) {
-        var left: f32 = 0;
-        var right: f32 = 0;
-        if (channels == 1) {
-            const s = std.mem.readInt(i16, pcm[f * 2 ..][0..2], .little);
-            left = @as(f32, @floatFromInt(s)) / 32768.0;
-            right = left;
-        } else {
-            const s0 = std.mem.readInt(i16, pcm[f * 4 ..][0..2], .little);
-            const s1 = std.mem.readInt(i16, pcm[f * 4 + 2 ..][0..2], .little);
-            left = @as(f32, @floatFromInt(s0)) / 32768.0;
-            right = @as(f32, @floatFromInt(s1)) / 32768.0;
+    if (mix_count > host_mix_rate / 2) return false;
+    var queued_frames: usize = 0;
+    for (0..output_frames) |output_frame| {
+        if (mix_count + 2 > mix_ring_samples) break;
+        const source_position = @as(u64, output_frame) * rate;
+        const source_index: usize = @intCast(@min(source_position / host_mix_rate, source_frames - 1));
+        const next_index = @min(source_index + 1, source_frames - 1);
+        const fraction = @as(f32, @floatFromInt(source_position % host_mix_rate)) / host_mix_rate;
+        const first = pcm16StereoFrame(pcm, channels, source_index);
+        const second = pcm16StereoFrame(pcm, channels, next_index);
+        var gain: f32 = 0.55;
+        if (fade_frames != 0) {
+            const fade_in = @min(@as(f32, 1), @as(f32, @floatFromInt(output_frame)) / @as(f32, @floatFromInt(fade_frames)));
+            const remaining = output_frames - 1 - output_frame;
+            const fade_out = @min(@as(f32, 1), @as(f32, @floatFromInt(remaining)) / @as(f32, @floatFromInt(fade_frames)));
+            gain *= @min(fade_in, fade_out);
         }
-        left *= 0.55;
-        right *= 0.55;
+        const left = (first[0] + (second[0] - first[0]) * fraction) * gain;
+        const right = (first[1] + (second[1] - first[1]) * fraction) * gain;
         pushStereoSampleLocked(left, right);
-        appendLoopSampleLocked(left, right);
+        queued_frames += 1;
     }
+    return queued_frames != 0;
 }
 
 /// Mix queued game samples into an AudioOut buffer (float32 interleaved).
@@ -193,7 +191,6 @@ pub fn mixIntoFloat32Buffer(out: []u8, channels: u8) bool {
     const frames = out.len / (@as(usize, channels) * 4);
     mixLock();
     defer mixUnlock();
-    if (mix_count < 2) refillFromLoopLocked();
     if (mix_count < 2) return false;
     var wrote = false;
     var f: usize = 0;
@@ -227,7 +224,6 @@ pub fn mixIntoInt16Buffer(out: []u8, channels: u8) bool {
     const frames = out.len / (@as(usize, channels) * 2);
     mixLock();
     defer mixUnlock();
-    if (mix_count < 2) refillFromLoopLocked();
     if (mix_count < 2) return false;
     var wrote = false;
     var f: usize = 0;
@@ -448,9 +444,9 @@ pub fn maybePreseedAfterPresent(root: std.Io.Dir, io: std.Io) void {
     // Prefer clips whose names look like attract/title audio.
     var queued: u32 = 0;
     var pass: u8 = 0;
-    while (pass < 2 and queued < 4) : (pass += 1) {
+    while (pass < 2 and queued == 0) : (pass += 1) {
         var i: usize = 0;
-        while (i < clip_count and queued < 4) : (i += 1) {
+        while (i < clip_count and queued == 0) : (i += 1) {
             const clip = clips[i];
             const nm = clip.name[0..clip.name_len];
             if (pass == 0 and !nameLooksAttract(nm)) continue;
@@ -467,9 +463,8 @@ pub fn maybePreseedAfterPresent(root: std.Io.Dir, io: std.Io) void {
                 decoded.pcm.len,
                 @as(usize, decoded.channels) * 2 * @divTrunc(decoded.rate * 3, 5),
             );
-            queuePcm16ForHostMix(decoded.pcm[0..max_bytes], decoded.channels, decoded.rate);
-            queued += 1;
-            if (queued <= 3) {
+            if (queuePcm16ForHostMix(decoded.pcm[0..max_bytes], decoded.channels, decoded.rate)) {
+                queued += 1;
                 if (log_verbose_audio) std.debug.print(
                     "[audio_fs] preseed mix \"{s}\" {d} bytes ch={d} rate={d}\n",
                     .{ nm, max_bytes, decoded.channels, decoded.rate },
@@ -596,18 +591,55 @@ const fsb_mode_pcm16: u32 = 2;
 const fsb_mode_vorbis: u32 = 15;
 
 fn parseFsbHeader(header: *const [64]u8) struct {
+    sample_count: u32,
     sample_hdr_size: u32,
     name_table_size: u32,
     data_size: u32,
     mode: u32,
-    freq: u32,
 } {
     return .{
+        .sample_count = readU32(header, 8),
         .sample_hdr_size = readU32(header, 12),
         .name_table_size = readU32(header, 16),
         .data_size = readU32(header, 20),
         .mode = readU32(header, 24),
-        .freq = readU32(header, 28),
+    };
+}
+
+/// FSB5 stores the sample rate as a four-bit index in each sample header, not
+/// in the bank flags at byte 28. The latter is commonly zero and previously
+/// made every clip fall back to 48 kHz (including this title's 44.1 kHz PCM).
+fn fsbFrequency(index: u4) ?u32 {
+    return switch (index) {
+        0 => 4_000,
+        1 => 8_000,
+        2 => 11_000,
+        3 => 11_025,
+        4 => 16_000,
+        5 => 22_050,
+        6 => 24_000,
+        7 => 32_000,
+        8 => 44_100,
+        9 => 48_000,
+        10 => 96_000,
+        else => null,
+    };
+}
+
+const FsbPcmSample = struct {
+    rate: u32,
+    channels: u8,
+    data_offset: u64,
+    frames: u64,
+};
+
+fn parseFsbPcmSample(sample_header: u64) ?FsbPcmSample {
+    const frequency_index: u4 = @truncate(sample_header >> 1);
+    return .{
+        .rate = fsbFrequency(frequency_index) orelse return null,
+        .channels = @intCast(((sample_header >> 5) & 1) + 1),
+        .data_offset = ((sample_header >> 6) & 0x0fff_ffff) * 16,
+        .frames = (sample_header >> 34) & 0x3fff_ffff,
     };
 }
 
@@ -618,27 +650,37 @@ fn parseFsbPcm16(
     bank_size: u32,
     allocator: std.mem.Allocator,
 ) Error!PcmDecoded {
-    var header: [64]u8 = undefined;
+    var header: [68]u8 = undefined;
     const n = resource.readPositionalAll(io, &header, bank_offset) catch return Error.IoFailed;
     if (n < 60 or !std.mem.eql(u8, header[0..4], "FSB5")) return Error.Unsupported;
-    const h = parseFsbHeader(&header);
+    const fixed_header: *const [64]u8 = @ptrCast(&header);
+    const h = parseFsbHeader(fixed_header);
     if (h.mode != fsb_mode_pcm16) return Error.Unsupported;
     if (h.data_size < 64 or h.data_size > maximum_wav_bytes) return Error.Unsupported;
-    const data_off = bank_offset + 60 + h.sample_hdr_size + h.name_table_size;
-    _ = bank_size;
-    const pcm = allocator.alloc(u8, h.data_size) catch return Error.OutOfMemory;
+    // The fallback decoder currently exposes one WAV per one-sample FSB bank.
+    // Multi-sample banks need their individual metadata chunks walked first.
+    if (h.sample_count != 1 or h.sample_hdr_size < 8 or n < 68) return Error.Unsupported;
+    const sample = parseFsbPcmSample(readU64(&header, 60)) orelse return Error.Unsupported;
+    const decoded_bytes = std.math.mul(u64, sample.frames, @as(u64, sample.channels) * 2) catch return Error.Unsupported;
+    if (sample.data_offset >= h.data_size) return Error.Unsupported;
+    const available = @as(u64, h.data_size) - sample.data_offset;
+    const pcm_size_u64 = @min(decoded_bytes, available);
+    if (pcm_size_u64 < @as(u64, sample.channels) * 2 or pcm_size_u64 > maximum_wav_bytes) return Error.Unsupported;
+    const fixed_data_off = bank_offset + 60 + h.sample_hdr_size + h.name_table_size;
+    const data_off = fixed_data_off + sample.data_offset;
+    if (bank_size != 0 and data_off + pcm_size_u64 > bank_offset + bank_size) return Error.Unsupported;
+    const pcm_size: usize = @intCast(pcm_size_u64);
+    const pcm = allocator.alloc(u8, pcm_size) catch return Error.OutOfMemory;
     errdefer allocator.free(pcm);
     const got = resource.readPositionalAll(io, pcm, data_off) catch {
         allocator.free(pcm);
         return Error.IoFailed;
     };
-    if (got != h.data_size) {
+    if (got != pcm_size) {
         allocator.free(pcm);
         return Error.IoFailed;
     }
-    const rate: u32 = if (h.freq >= 8000 and h.freq <= 192000) h.freq else 48_000;
-    const channels: u8 = if (h.data_size % 4 == 0) 2 else 1;
-    return .{ .pcm = pcm, .channels = channels, .rate = rate };
+    return .{ .pcm = pcm, .channels = sample.channels, .rate = sample.rate };
 }
 
 /// FSB5 mode 15 (Vorbis) uses FMOD's private packet layout + setup CRC
@@ -780,7 +822,7 @@ fn buildFromClip(
     if (mix_live.load(.monotonic) and !hashed and pathLooksAttract(relative_path)) {
         const nq = mix_queue_opens.fetchAdd(1, .monotonic);
         if (nq < 12) {
-            queuePcm16ForHostMix(decoded.pcm, decoded.channels, decoded.rate);
+            _ = queuePcm16ForHostMix(decoded.pcm, decoded.channels, decoded.rate);
         }
     }
 
@@ -821,10 +863,52 @@ pub fn reset() void {
     mix_write = 0;
     mix_read = 0;
     mix_count = 0;
-    loop_len = 0;
-    loop_pos = 0;
     mixUnlock();
     mix_live.store(false, .monotonic);
     preseed_done = false;
     mix_queue_opens.store(0, .monotonic);
+}
+
+test "host fallback resamples 44.1 kHz PCM and never replays drained audio" {
+    reset();
+    defer reset();
+    noteFirstPresent();
+
+    // Ten milliseconds of non-zero stereo PCM at 44.1 kHz becomes exactly
+    // 480 frames / 960 interleaved samples in the 48 kHz host ring.
+    var pcm: [441 * 2]i16 = @splat(12_000);
+    try std.testing.expect(queuePcm16ForHostMix(std.mem.sliceAsBytes(&pcm), 2, 44_100));
+    try std.testing.expectEqual(@as(usize, 480 * 2), hostMixPendingSamples());
+
+    var output: [480 * 2 * 4]u8 = @splat(0);
+    try std.testing.expect(mixIntoFloat32Buffer(&output, 2));
+    try std.testing.expectEqual(@as(usize, 0), hostMixPendingSamples());
+
+    // The old loopback refilled the ring here and replayed the same fragment
+    // forever, producing both the perceived echo and a click at every seam.
+    @memset(&output, 0);
+    try std.testing.expect(!mixIntoFloat32Buffer(&output, 2));
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** output.len), &output);
+}
+
+test "FSB5 PCM sample word carries rate channels and decoded length" {
+    // Captured from this title's attract_reload bank.
+    const sample = parseFsbPcmSample(0x0002_4090_0000_0030).?;
+    try std.testing.expectEqual(@as(u32, 44_100), sample.rate);
+    try std.testing.expectEqual(@as(u8, 2), sample.channels);
+    try std.testing.expectEqual(@as(u64, 0), sample.data_offset);
+    try std.testing.expectEqual(@as(u64, 36_900), sample.frames);
+}
+
+test "host fallback envelope reaches silence at both clip boundaries" {
+    reset();
+    defer reset();
+    noteFirstPresent();
+
+    var pcm: [600 * 2]i16 = @splat(20_000);
+    try std.testing.expect(queuePcm16ForHostMix(std.mem.sliceAsBytes(&pcm), 2, 48_000));
+    var output: [600 * 2 * 4]u8 = undefined;
+    try std.testing.expect(mixIntoFloat32Buffer(&output, 2));
+    try std.testing.expectEqual(@as(f32, 0), @as(f32, @bitCast(readU32(&output, 0))));
+    try std.testing.expectEqual(@as(f32, 0), @as(f32, @bitCast(readU32(&output, output.len - 4))));
 }

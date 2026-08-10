@@ -166,6 +166,37 @@ pub const PresentationSink = struct {
     present: *const fn (?*anyopaque, PresentedFrame) bool,
 };
 
+/// Receives the rolling guest flip rate in tenths of a frame per second.
+/// Keeping this callback API-neutral lets the Win32 window own its title while
+/// the renderer remains usable by headless and non-Windows tools.
+pub const FrameRateSink = struct {
+    context: ?*anyopaque,
+    update: *const fn (?*anyopaque, u32) void,
+};
+
+pub const FrameRateCounter = struct {
+    started_ns: u64 = 0,
+    frames: u64 = 0,
+
+    pub fn note(self: *FrameRateCounter, now_ns: u64) ?u32 {
+        if (now_ns == 0) return null;
+        if (self.started_ns == 0 or now_ns < self.started_ns) {
+            self.started_ns = now_ns;
+            self.frames = 0;
+            return null;
+        }
+        self.frames +|= 1;
+        const elapsed_ns = now_ns - self.started_ns;
+        if (elapsed_ns < std.time.ns_per_s) return null;
+
+        const scaled = @as(u128, self.frames) * 10 * std.time.ns_per_s / elapsed_ns;
+        const fps_tenths: u32 = @intCast(@min(scaled, std.math.maxInt(u32)));
+        self.started_ns = now_ns;
+        self.frames = 0;
+        return fps_tenths;
+    }
+};
+
 /// A display buffer a flip names, as the display side describes it.
 ///
 /// The geometry travels with the address because a flip can name a buffer this
@@ -877,6 +908,8 @@ pub const Renderer = struct {
     latest_frame_index: ?usize = null,
     frame_sequence: u64 = 0,
     presentation_sink: ?PresentationSink = null,
+    frame_rate_sink: ?FrameRateSink = null,
+    frame_rate_counter: FrameRateCounter = .{},
     display_buffer_resolver: ?DisplayBufferResolver = null,
     pending_targetless_draw: ?*PendingGuestDraw = null,
     window_presentation: ?WindowPresentation = null,
@@ -1250,6 +1283,13 @@ pub const Renderer = struct {
     /// without owning Vulkan resources.
     pub fn setPresentationSink(self: *Renderer, sink: ?PresentationSink) void {
         self.presentation_sink = sink;
+    }
+
+    /// Installs an optional low-frequency FPS consumer. Updates are emitted
+    /// once per measured second rather than once per frame.
+    pub fn setFrameRateSink(self: *Renderer, sink: ?FrameRateSink) void {
+        self.frame_rate_sink = sink;
+        self.frame_rate_counter = .{};
     }
 
     /// Selects the registered display-buffer allocation named by a flip. With
@@ -4672,6 +4712,12 @@ pub const Renderer = struct {
         if (self.texture_cache_misses == 1) {
             std.debug.print("[vulkan dcb] texture cache miss: first @0x{x} hash={x}\n", .{ descriptor.address, content_hash });
         }
+        if (byte_count >= 16 * 1024 * 1024) {
+            std.debug.print(
+                "[vulkan dcb] large texture upload #{d}: @0x{x} {d}x{d} bytes={d} generation={d} hash={x}\n",
+                .{ self.texture_cache_misses, descriptor.address, descriptor.width, descriptor.height, byte_count, source_generation, content_hash },
+            );
+        }
 
         const linear = try self.allocator.alloc(u8, byte_count);
         defer self.allocator.free(linear);
@@ -4688,7 +4734,16 @@ pub const Renderer = struct {
             if (!memory.read(memory.context, descriptor.address, tiled)) return Error.GuestMemoryReadFailed;
             try layout.detile(tiled, linear);
         }
-        const nonzero = countNonzeroRgba(linear);
+        // Counting every non-zero texel is useful only in verbose diagnostics;
+        // doing it unconditionally added another full 64 MiB CPU pass for a
+        // 4096² texture after detiling. Normal rendering only needs to know
+        // whether the image is entirely empty.
+        const nonzero = if (log_verbose_gpu)
+            countNonzeroRgba(linear)
+        else if (containsNonzeroByte(linear))
+            @as(u32, 1)
+        else
+            @as(u32, 0);
         const metadata = gpu.MetadataSurface.fromImage(descriptor);
         if (nonzero == 0 and metadata.hasAny()) {
             if (log_verbose_gpu) std.debug.print(
@@ -5272,6 +5327,11 @@ pub const Renderer = struct {
     fn reportFrameProfile(self: *Renderer) void {
         const profile = self.frame_profile;
         const now = hostTimestampNs();
+        if (self.frame_rate_sink) |sink| {
+            if (self.frame_rate_counter.note(now)) |fps_tenths| {
+                sink.update(sink.context, fps_tenths);
+            }
+        }
         const interval_ns = if (now != 0 and self.last_flip_profile_ns != 0 and now >= self.last_flip_profile_ns)
             now - self.last_flip_profile_ns
         else
@@ -6294,6 +6354,28 @@ fn countNonzeroRgba(linear: []const u8) u32 {
         if (linear[i] != 0 or linear[i + 1] != 0 or linear[i + 2] != 0 or linear[i + 3] != 0) nonzero += 1;
     }
     return nonzero;
+}
+
+fn containsNonzeroByte(bytes: []const u8) bool {
+    var offset: usize = 0;
+    while (offset + 8 <= bytes.len) : (offset += 8) {
+        if (std.mem.readInt(u64, bytes[offset..][0..8], .little) != 0) return true;
+    }
+    for (bytes[offset..]) |byte| if (byte != 0) return true;
+    return false;
+}
+
+test "nonzero byte probe covers word chunks and tails" {
+    const zeroes = [_]u8{0} ** 17;
+    try std.testing.expect(!containsNonzeroByte(&zeroes));
+
+    var word_nonzero = zeroes;
+    word_nonzero[9] = 1;
+    try std.testing.expect(containsNonzeroByte(&word_nonzero));
+
+    var tail_nonzero = zeroes;
+    tail_nonzero[16] = 1;
+    try std.testing.expect(containsNonzeroByte(&tail_nonzero));
 }
 
 fn hashGuestMemoryRange(memory: GuestMemory, address: u64, span: usize) u64 {
@@ -7615,4 +7697,18 @@ test "presentation scaling letterboxes RGBA and converts BGRA" {
     scalePresentedFrame(&bgra, 2, 4, vk.format_b8g8r8a8_unorm, frame);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0 }, bgra[0..4]);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 255, 255 }, bgra[8..12]);
+}
+
+test "frame rate counter emits a one-second rolling rate" {
+    var counter = FrameRateCounter{};
+    try std.testing.expect(counter.note(1) == null);
+    for (1..61) |frame| {
+        const now = 1 + @as(u64, frame) * std.time.ns_per_s / 60;
+        if (frame < 60) {
+            try std.testing.expect(counter.note(now) == null);
+        } else {
+            try std.testing.expectEqual(@as(u32, 600), counter.note(now).?);
+        }
+    }
+    try std.testing.expect(counter.note(1 + std.time.ns_per_s / 60) == null);
 }

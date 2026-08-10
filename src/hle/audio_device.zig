@@ -65,10 +65,10 @@ pub const Config = struct {
 ///
 /// One is not enough: the device would run dry between the moment it finishes a
 /// buffer and the moment the title hands over the next, which is audible as a
-/// click every buffer. Two keeps latency near one buffer (~5–10 ms at 256
-/// frames) while still covering late submits; three was adding ~15–30 ms of
-/// host-side delay on top of the title's own mix timing.
-const queue_depth = 2;
+/// click every buffer. Four cover about 21 ms at the common 256/48 kHz setup:
+/// enough for ordinary Windows scheduling jitter without building a perceptible
+/// delay behind the picture.
+const queue_depth = 4;
 
 /// The largest buffer that can be played, as channels x bytes x frames.
 ///
@@ -143,6 +143,8 @@ pub const Device = struct {
     headers: [queue_depth]WAVEHDR = @splat(.{ .lpData = null, .dwBufferLength = 0 }),
     prepared: usize = 0,
     next: usize = 0,
+    submitted: u64 = 0,
+    underruns: u64 = 0,
 
     pub fn isOpen(self: *const Device) bool {
         return self.handle != null;
@@ -182,6 +184,8 @@ pub const Device = struct {
         self.config = config;
         self.prepared = 0;
         self.next = 0;
+        self.submitted = 0;
+        self.underruns = 0;
 
         const length: u32 = @intCast(config.bufferBytes());
         for (&self.headers, 0..) |*header, index| {
@@ -211,17 +215,33 @@ pub const Device = struct {
 
         const slot = self.next;
         const header = &self.headers[slot];
+        var recovering_from_underrun = false;
+
+        // Once the queue has been primed, finding every header completed means
+        // the host device ran dry between producer calls. Report this separately
+        // from playback errors so renderer/scheduler regressions are visible.
+        if (self.submitted >= queue_depth and self.queuedBufferCount() == 0) {
+            self.underruns +%= 1;
+            recovering_from_underrun = true;
+            if (self.underruns <= 3 or std.math.isPowerOfTwo(self.underruns)) {
+                std.debug.print(
+                    "[audio] host underrun #{d} ({d} queued buffers, {d} frames each)\n",
+                    .{ self.underruns, queue_depth, self.config.frames },
+                );
+            }
+        }
 
         // A buffer still playing is exactly the back-pressure wanted. Waiting a
         // fraction of a buffer keeps the check cheap without adding a delay of
         // its own.
         const slice = self.waitSliceMilliseconds();
-        while (header.dwFlags & header_done == 0) Sleep(slice);
+        while (!headerIsDone(header)) Sleep(slice);
 
         // Into the buffer this header was prepared against. The pairing is
         // fixed at open: a prepared header is pinned to its buffer, and pointing
         // it somewhere else afterwards is not something the device permits.
         @memcpy(buffers[slot][0..samples.len], samples);
+        if (recovering_from_underrun) self.fadeInAfterUnderrun(buffers[slot][0..samples.len]);
         header.dwBufferLength = @intCast(samples.len);
         header.dwFlags &= ~header_done;
         self.next = (slot + 1) % queue_depth;
@@ -229,6 +249,47 @@ pub const Device = struct {
         if (waveOutWrite(handle, header, @sizeOf(WAVEHDR)) != mmsyserr_noerror) {
             header.dwFlags |= header_done;
             return Error.DeviceUnavailable;
+        }
+        self.submitted +%= 1;
+    }
+
+    fn queuedBufferCount(self: *const Device) usize {
+        var count: usize = 0;
+        for (self.headers[0..self.prepared]) |*header| {
+            if (!headerIsDone(header)) count += 1;
+        }
+        return count;
+    }
+
+    /// The previous waveform has already fallen to device silence when an
+    /// underrun is detected. Ramp the recovered buffer in over 2 ms so an
+    /// arbitrary non-zero first sample cannot turn recovery into another click.
+    fn fadeInAfterUnderrun(self: *const Device, bytes: []u8) void {
+        const bytes_per_frame = self.config.bytesPerFrame();
+        if (bytes_per_frame == 0) return;
+        const available_frames = bytes.len / bytes_per_frame;
+        const fade_frames = @min(available_frames, @as(usize, self.config.frequency / 500));
+        if (fade_frames < 2) return;
+        const denominator: f32 = @floatFromInt(fade_frames - 1);
+        for (0..fade_frames) |frame| {
+            const gain = @as(f32, @floatFromInt(frame)) / denominator;
+            for (0..self.config.channels) |channel| {
+                const sample_index = frame * self.config.channels + channel;
+                switch (self.config.format) {
+                    .signed16 => {
+                        const offset = sample_index * 2;
+                        const sample = std.mem.readInt(i16, bytes[offset..][0..2], .little);
+                        const faded: i16 = @intFromFloat(@as(f32, @floatFromInt(sample)) * gain);
+                        std.mem.writeInt(i16, bytes[offset..][0..2], faded, .little);
+                    },
+                    .float32 => {
+                        const offset = sample_index * 4;
+                        const bits = std.mem.readInt(u32, bytes[offset..][0..4], .little);
+                        const sample: f32 = @bitCast(bits);
+                        std.mem.writeInt(u32, bytes[offset..][0..4], @bitCast(sample * gain), .little);
+                    },
+                }
+            }
         }
     }
 
@@ -256,8 +317,17 @@ pub const Device = struct {
         self.handle = null;
         self.prepared = 0;
         self.next = 0;
+        self.submitted = 0;
     }
 };
+
+/// `WHDR_DONE` is written by the multimedia driver, not by the thread polling
+/// it. A volatile load prevents an optimized build from retaining a stale flag
+/// across `Sleep` calls.
+fn headerIsDone(header: *const WAVEHDR) bool {
+    const flags: *const volatile u32 = &header.dwFlags;
+    return flags.* & header_done != 0;
+}
 
 // ---------------------------------------------------------------------------
 
@@ -367,4 +437,24 @@ test "the wait between checks is a fraction of a buffer and never zero" {
     try testing.expectEqual(@as(u32, 1), device.waitSliceMilliseconds());
     device.config = .{ .frequency = 0, .channels = 2, .format = .signed16, .frames = 0 };
     try testing.expectEqual(@as(u32, 1), device.waitSliceMilliseconds());
+}
+
+test "queued buffer accounting observes completed headers" {
+    var device = Device{};
+    device.prepared = queue_depth;
+    for (&device.headers) |*header| header.dwFlags = header_done;
+    try testing.expectEqual(@as(usize, 0), device.queuedBufferCount());
+    device.headers[1].dwFlags &= ~header_done;
+    device.headers[3].dwFlags &= ~header_done;
+    try testing.expectEqual(@as(usize, 2), device.queuedBufferCount());
+}
+
+test "underrun recovery fades a resumed buffer in without changing its tail" {
+    var device = Device{};
+    device.config = .{ .frequency = 48_000, .channels = 2, .format = .signed16, .frames = 128 };
+    var samples: [128 * 2]i16 = @splat(20_000);
+    device.fadeInAfterUnderrun(std.mem.sliceAsBytes(&samples));
+    try testing.expectEqual(@as(i16, 0), samples[0]);
+    try testing.expect(samples[40 * 2] > 0 and samples[40 * 2] < 20_000);
+    try testing.expectEqual(@as(i16, 20_000), samples[100 * 2]);
 }

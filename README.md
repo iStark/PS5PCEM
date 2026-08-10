@@ -12,6 +12,11 @@ Vulkan.
 > incomplete. Use only software and system files that you are legally allowed
 > to access.
 
+## Support the project
+
+If you would like to support continued PS5PCEM development, you can do so on
+[Boosty](https://boosty.to/ps5pcem).
+
 ## Current status
 
 - Native guest execution is available on Windows x86-64; inspection, decoding,
@@ -134,16 +139,20 @@ not retain every historical temporary buffer until process exit.
 
 The recommended Windows entry point is `zig-out\bin\ps5pcem.exe` (or
 `zig build launcher`). The launcher remembers the selected game directory,
-sound state, input mode, keyboard bindings, and interface language in
+sound state, FPS-counter preference, input mode, keyboard bindings, and
+interface language in
 `ps5pcem.ini` next to the executable. English is the default; Russian, German,
 and French are available from Settings. It looks for `eboot.bin` in the
 selected directory and its common `decrypted` subdirectory, then starts the
 sibling `game-run.exe` with the full content directory mounted as `/app0`.
+The optional counter updates the measured guest flip rate once per second in
+the Vulkan game-window title. Direct command-line runs can enable it with
+`PS5_SHOW_FPS=1`.
 
 Input profiles can use the first XInput controller, a remappable keyboard
 profile, or both at once. WASD controls the left stick; Alt plus the arrow keys
 controls the right stick. The launcher passes these preferences through
-`PS5_INPUT_MODE`, `PS5_CONTROLLER_INDEX`, `PS5_KEYMAP`, and
+`PS5_INPUT_MODE`, `PS5_CONTROLLER_INDEX`, `PS5_KEYMAP`, `PS5_SHOW_FPS`, and
 `PS5_AUDIO_DISABLED`, so direct CLI and automated runs keep their previous
 behaviour unless those variables are set.
 
@@ -691,7 +700,9 @@ the guest payload hash; rewriting the same address replaces its stale image,
 while descriptor SGPR addresses are excluded from scalar specialization to
 avoid recompiling a pipeline for every streamed texture. Non-linear surfaces are
 read once into a checked contiguous allocation and detiled in host memory,
-avoiding one guest callback per texel for large streamed textures. The first
+avoiding one guest callback per texel for large streamed textures. Legacy
+detiling walks macro-block rows and reuses their local offset table instead of
+recomputing checked coordinates for every texel. The first
 MIMG lowering supports normalized two-coordinate `image_sample`; other formats, dimensions,
 mips, component swizzles, and sampling operands remain incomplete.
 
@@ -1316,10 +1327,15 @@ and sign-in dialogs finish immediately with coherent headless results instead
 of blocking on unavailable UI.
 
 AudioOut, AudioIn, and AudioOut2 expose paced ports, queues, and speaker
-metadata. AJM accepts contiguous and split decode jobs plus resample/statistics
-queries and emits zeroed PCM so audio setup cannot deadlock the process. It is
-a compatibility decoder, not ATRAC9/MP3 decoding. The additional
-early-bootstrap
+metadata. AJM owns state per codec instance and performs real ATRAC9 (`codec 1`)
+and MP3 (`codec 0`) decoding for contiguous and split-buffer jobs. Initialize,
+codec-info, gapless, stream byte counts, decoded-frame counts, and total
+sample sidebands are preserved. ATRAC9 output supports signed 16-bit, signed
+32-bit, float, and planar layouts; M4AAC remains unsupported and is rejected
+instead of being reported as successful silent PCM. FSB-backed fallback
+previews are resampled to the 48 kHz host mix, use short de-click envelopes,
+and drain once; they are never looped as a substitute for missing codec output.
+The additional early-bootstrap
 surface in [src/hle/libs/bootstrap_services.zig](src/hle/libs/bootstrap_services.zig)
 provides AvPlayer state and conservative platform/GPU command stubs for native
 title initialization. VideoOut is no longer only a headless counter: it retains
@@ -1337,9 +1353,11 @@ A title hands over one buffer of samples at a time and expects the call to take
 about as long as the sound lasts, because that is how it keeps time with audio.
 That wait now comes from a host device making room for the next buffer rather
 than from a sleep, so the clock is the real one and the samples are heard
-instead of discarded. Three buffers stay in flight: one is not enough, because
+instead of discarded. Four buffers stay in flight: one is not enough, because
 the device runs dry between finishing a buffer and the title handing over the
-next, which is audible as a click every buffer.
+next. At the common 256-frame/48 kHz configuration this provides about 21 ms
+of scheduling margin, and actual underruns are reported separately from device
+failures.
 
 One port is audible, because there is one pair of speakers. A title opens a main
 output port and often others besides; letting each claim the device would
@@ -2075,6 +2093,11 @@ What this means in practice, for anyone building on this:
   original.
 
 There is no warranty; see sections 15 and 16 of the license.
+
+The build fetches two hash-pinned audio decoder dependencies: LibAtrac9 under
+the MIT license and minimp3 under CC0. Their source archives retain the upstream
+license texts; neither dependency contains console firmware or proprietary SDK
+code.
 
 ## Legal note
 

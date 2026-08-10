@@ -567,16 +567,75 @@ pub const Layout = struct {
     /// Copies guest tiled bytes into tightly packed layer-major staging bytes.
     pub fn detile(self: Layout, source: []const u8, destination: []u8) Error!void {
         try self.validateCopies(source.len, destination.len);
-        const bytes = self.block.bytes_per_element;
+        return switch (self.block.bytes_per_element) {
+            1 => self.detileElements(1, source, destination),
+            2 => self.detileElements(2, source, destination),
+            4 => self.detileElements(4, source, destination),
+            8 => self.detileElements(8, source, destination),
+            16 => self.detileElements(16, source, destination),
+            else => Error.UnsupportedElementSize,
+        };
+    }
+
+    fn detileElements(
+        self: Layout,
+        comptime element_bytes: usize,
+        source: []const u8,
+        destination: []u8,
+    ) Error!void {
+        if (self.block.tile_mode.isLinear()) {
+            const row_bytes = @as(usize, self.width) * element_bytes;
+            const source_row_bytes = @as(usize, self.row_pitch_elements) * element_bytes;
+            for (0..self.layers) |layer_index| {
+                const physical_slice = @as(usize, self.first_slice) + layer_index;
+                const source_slice: usize = @intCast(self.source_slice_bytes * physical_slice);
+                const staging_slice: usize = @intCast(self.staging_slice_bytes * layer_index);
+                for (0..self.height) |y| {
+                    const src = source_slice + y * source_row_bytes;
+                    const dst = staging_slice + y * row_bytes;
+                    @memcpy(destination[dst..][0..row_bytes], source[src..][0..row_bytes]);
+                }
+            }
+            return;
+        }
+
+        // Addressing inside a swizzle block repeats for every macro block. The
+        // former pixel-major loop recomputed divisions and checked coordinate
+        // arithmetic for every texel (16.7 million times for a 4096² image).
+        // Cache one local row of offsets and reuse it across all blocks in that
+        // macro row while keeping source and destination accesses contiguous.
+        var row_offsets: [256]u32 = undefined;
+        if (self.block.width > row_offsets.len) return Error.UnsupportedTileMode;
         for (0..self.layers) |layer_index| {
-            const layer: u32 = @intCast(layer_index);
-            for (0..self.height) |y_index| {
-                const y: u32 = @intCast(y_index);
-                for (0..self.width) |x_index| {
-                    const x: u32 = @intCast(x_index);
-                    const src: usize = @intCast(try self.sourceByteOffset(x, y, layer));
-                    const dst: usize = @intCast(try self.stagingByteOffset(x, y, layer));
-                    @memcpy(destination[dst..][0..bytes], source[src..][0..bytes]);
+            const physical_slice: u32 = try addU32(self.first_slice, @intCast(layer_index));
+            const source_slice: usize = @intCast(try multiply(self.source_slice_bytes, physical_slice));
+            const staging_slice: usize = @intCast(try multiply(self.staging_slice_bytes, layer_index));
+            for (0..self.blocks_per_column) |block_y_index| {
+                const block_y: u32 = @intCast(block_y_index);
+                const y_base = block_y * self.block.height;
+                const copy_height = @min(self.block.height, self.height - y_base);
+                for (0..copy_height) |local_y_index| {
+                    const local_y: u32 = @intCast(local_y_index);
+                    for (0..self.block.width) |local_x_index| {
+                        row_offsets[local_x_index] = try self.block.byteOffset(@intCast(local_x_index), local_y);
+                    }
+                    const y = y_base + local_y;
+                    for (0..self.blocks_per_row) |block_x_index| {
+                        const block_x: u32 = @intCast(block_x_index);
+                        const x_base = block_x * self.block.width;
+                        if (x_base >= self.width) continue;
+                        const copy_width = @min(self.block.width, self.width - x_base);
+                        const block_index = @as(usize, block_y) * self.blocks_per_row + block_x;
+                        const source_block = source_slice + block_index * self.block.bytes;
+                        const block_xor = try self.block.blockXor(block_x, block_y, physical_slice);
+                        const destination_row = staging_slice +
+                            (@as(usize, y) * self.width + x_base) * element_bytes;
+                        for (0..copy_width) |local_x| {
+                            const src = source_block + (row_offsets[local_x] ^ block_xor);
+                            const dst = destination_row + local_x * element_bytes;
+                            @memcpy(destination[dst..][0..element_bytes], source[src..][0..element_bytes]);
+                        }
+                    }
                 }
             }
         }
@@ -587,16 +646,70 @@ pub const Layout = struct {
     pub fn tile(self: Layout, source: []const u8, destination: []u8) Error!void {
         if (@as(u64, source.len) < self.staging_bytes) return Error.SourceTooSmall;
         if (@as(u64, destination.len) < self.required_source_bytes) return Error.DestinationTooSmall;
-        const bytes = self.block.bytes_per_element;
+        return switch (self.block.bytes_per_element) {
+            1 => self.tileElements(1, source, destination),
+            2 => self.tileElements(2, source, destination),
+            4 => self.tileElements(4, source, destination),
+            8 => self.tileElements(8, source, destination),
+            16 => self.tileElements(16, source, destination),
+            else => Error.UnsupportedElementSize,
+        };
+    }
+
+    fn tileElements(
+        self: Layout,
+        comptime element_bytes: usize,
+        source: []const u8,
+        destination: []u8,
+    ) Error!void {
+        if (self.block.tile_mode.isLinear()) {
+            const row_bytes = @as(usize, self.width) * element_bytes;
+            const destination_row_bytes = @as(usize, self.row_pitch_elements) * element_bytes;
+            for (0..self.layers) |layer_index| {
+                const physical_slice = @as(usize, self.first_slice) + layer_index;
+                const destination_slice: usize = @intCast(self.source_slice_bytes * physical_slice);
+                const staging_slice: usize = @intCast(self.staging_slice_bytes * layer_index);
+                for (0..self.height) |y| {
+                    const src = staging_slice + y * row_bytes;
+                    const dst = destination_slice + y * destination_row_bytes;
+                    @memcpy(destination[dst..][0..row_bytes], source[src..][0..row_bytes]);
+                }
+            }
+            return;
+        }
+
+        var row_offsets: [256]u32 = undefined;
+        if (self.block.width > row_offsets.len) return Error.UnsupportedTileMode;
         for (0..self.layers) |layer_index| {
-            const layer: u32 = @intCast(layer_index);
-            for (0..self.height) |y_index| {
-                const y: u32 = @intCast(y_index);
-                for (0..self.width) |x_index| {
-                    const x: u32 = @intCast(x_index);
-                    const src: usize = @intCast(try self.stagingByteOffset(x, y, layer));
-                    const dst: usize = @intCast(try self.sourceByteOffset(x, y, layer));
-                    @memcpy(destination[dst..][0..bytes], source[src..][0..bytes]);
+            const physical_slice: u32 = try addU32(self.first_slice, @intCast(layer_index));
+            const destination_slice: usize = @intCast(try multiply(self.source_slice_bytes, physical_slice));
+            const staging_slice: usize = @intCast(try multiply(self.staging_slice_bytes, layer_index));
+            for (0..self.blocks_per_column) |block_y_index| {
+                const block_y: u32 = @intCast(block_y_index);
+                const y_base = block_y * self.block.height;
+                const copy_height = @min(self.block.height, self.height - y_base);
+                for (0..copy_height) |local_y_index| {
+                    const local_y: u32 = @intCast(local_y_index);
+                    for (0..self.block.width) |local_x_index| {
+                        row_offsets[local_x_index] = try self.block.byteOffset(@intCast(local_x_index), local_y);
+                    }
+                    const y = y_base + local_y;
+                    for (0..self.blocks_per_row) |block_x_index| {
+                        const block_x: u32 = @intCast(block_x_index);
+                        const x_base = block_x * self.block.width;
+                        if (x_base >= self.width) continue;
+                        const copy_width = @min(self.block.width, self.width - x_base);
+                        const block_index = @as(usize, block_y) * self.blocks_per_row + block_x;
+                        const destination_block = destination_slice + block_index * self.block.bytes;
+                        const block_xor = try self.block.blockXor(block_x, block_y, physical_slice);
+                        const source_row = staging_slice +
+                            (@as(usize, y) * self.width + x_base) * element_bytes;
+                        for (0..copy_width) |local_x| {
+                            const src = source_row + local_x * element_bytes;
+                            const dst = destination_block + (row_offsets[local_x] ^ block_xor);
+                            @memcpy(destination[dst..][0..element_bytes], source[src..][0..element_bytes]);
+                        }
+                    }
                 }
             }
         }
@@ -1947,6 +2060,31 @@ test "tile and detile round trip every supported 2D swizzle family and element s
             try testing.expectEqualSlices(u8, linear, actual);
         }
     }
+}
+
+test "optimized tile and detile preserve partial pitched blocks and slice offsets" {
+    const layout = try Layout.init(.{
+        .tile_mode = .standard_4kb,
+        .width = 70,
+        .height = 35,
+        .layers = 2,
+        .first_slice = 1,
+        .row_pitch_elements = 72,
+    }, 4);
+    const linear = try testing.allocator.alloc(u8, @intCast(layout.staging_bytes));
+    defer testing.allocator.free(linear);
+    const tiled = try testing.allocator.alloc(u8, @intCast(layout.required_source_bytes));
+    defer testing.allocator.free(tiled);
+    const actual = try testing.allocator.alloc(u8, @intCast(layout.staging_bytes));
+    defer testing.allocator.free(actual);
+    for (linear, 0..) |*value, index| value.* = @truncate(index * 29 + 11);
+    @memset(tiled, 0xa5);
+    @memset(actual, 0);
+    try layout.tile(linear, tiled);
+    // The unused physical slice preceding first_slice remains untouched.
+    try testing.expect(std.mem.allEqual(u8, tiled[0..@intCast(layout.source_slice_bytes)], 0xa5));
+    try layout.detile(tiled, actual);
+    try testing.expectEqualSlices(u8, linear, actual);
 }
 
 test "checked memory staging shares the CPU detile address map" {
