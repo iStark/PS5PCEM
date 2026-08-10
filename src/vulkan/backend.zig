@@ -540,6 +540,7 @@ const deferred_storage_write_min_bytes = 1024 * 1024;
 const maximum_frame_bytes = 128 * 1024 * 1024;
 const maximum_completed_frames = 16;
 const maximum_render_targets = 16;
+const maximum_depth_targets = 16;
 const maximum_sampled_images = 32;
 /// One DCC key byte covers this many bytes of the compressed colour surface.
 const dcc_block_bytes = 256;
@@ -548,6 +549,9 @@ const maximum_dcc_key_bytes = 4 * 1024 * 1024;
 /// CMASK is one nibble per 8x8 pixel region; this cap covers extremely large
 /// render targets while rejecting corrupt descriptors before allocation.
 const maximum_cmask_bytes = 4 * 1024 * 1024;
+/// HTILE is one dword per 8x8 region. This cap covers depth arrays far larger
+/// than the current attachment path while rejecting corrupt dimensions.
+const maximum_htile_bytes = 8 * 1024 * 1024;
 /// On-disk driver pipeline cache. Reused across runs so per-title shader
 /// compilation is paid once instead of on every launch.
 const pipeline_cache_path = "vulkan_pipeline_cache.bin";
@@ -748,6 +752,22 @@ const CmaskSeed = struct {
     texel: [4]u8,
     clear_blocks: u32,
     expanded_blocks: u32,
+};
+
+const CachedHtileTarget = struct {
+    target: gpu.resources.DepthTarget,
+    resolved: bool = false,
+    last_used_sequence: u64 = 0,
+};
+
+const HtileResolveStats = struct {
+    clear_zero_blocks: u32 = 0,
+    clear_one_blocks: u32 = 0,
+    base_blocks: u32 = 0,
+
+    fn clearBlocks(self: HtileResolveStats) u32 {
+        return self.clear_zero_blocks +| self.clear_one_blocks;
+    }
 };
 
 /// One remembered content probe of a sampled source.
@@ -981,6 +1001,8 @@ pub const Renderer = struct {
     graphics_probe_colored_pixels: u32 = 0,
     graphics_probe_frame: [graphics_probe_bytes]u8 = @splat(0),
     render_targets: std.ArrayList(CachedRenderTarget) = .empty,
+    htile_targets: std.ArrayList(CachedHtileTarget) = .empty,
+    htile_target_sequence: u64 = 0,
     latest_render_target_index: ?usize = null,
     render_target_sequence: u64 = 0,
     completed_frames: std.ArrayList(CachedFrame) = .empty,
@@ -1023,6 +1045,7 @@ pub const Renderer = struct {
     emulated_volume_copies: u64 = 0,
     reported_dual_image_clear_fallback: bool = false,
     reported_fast_clear_seeds: u32 = 0,
+    reported_htile_resolves: u32 = 0,
     buffer_cache_hits: u64 = 0,
     buffer_cache_misses: u64 = 0,
     buffer_uploads: u64 = 0,
@@ -1298,6 +1321,7 @@ pub const Renderer = struct {
         if (self.pending_targetless_draw) |pending| self.allocator.destroy(pending);
         for (self.render_targets.items) |target| self.destroyCachedRenderTarget(target);
         self.render_targets.deinit(self.allocator);
+        self.htile_targets.deinit(self.allocator);
         for (self.sampled_image_cache.items) |image| {
             self.device_functions.destroy_sampler(self.device, image.sampler, null);
             self.device_functions.destroy_image_view(self.device, image.view, null);
@@ -3537,6 +3561,211 @@ pub const Renderer = struct {
         );
     }
 
+    fn sameHtileTarget(a: gpu.resources.DepthTarget, b: gpu.resources.DepthTarget) bool {
+        return a.read_address == b.read_address and
+            a.write_address == b.write_address and
+            a.stencil_read_address == b.stencil_read_address and
+            a.stencil_write_address == b.stencil_write_address and
+            a.htile_address == b.htile_address and
+            a.width == b.width and a.height == b.height and
+            a.format == b.format and a.stencil_format == b.stencil_format and
+            a.tile_mode == b.tile_mode and a.stencil_tile_mode == b.stencil_tile_mode and
+            a.samples_log2 == b.samples_log2 and a.maximum_mip == b.maximum_mip and
+            a.base_array_slice == b.base_array_slice and
+            a.last_array_slice == b.last_array_slice and a.mip_level == b.mip_level and
+            a.htile_enabled == b.htile_enabled and
+            a.htile_pipe_aligned == b.htile_pipe_aligned and
+            a.tile_stencil_disabled == b.tile_stencil_disabled;
+    }
+
+    fn acquireHtileTarget(self: *Renderer, target: gpu.resources.DepthTarget) !usize {
+        self.htile_target_sequence +%= 1;
+        for (self.htile_targets.items, 0..) |*cached, index| {
+            if (!sameHtileTarget(cached.target, target)) continue;
+            cached.target = target;
+            cached.last_used_sequence = self.htile_target_sequence;
+            return index;
+        }
+        const entry = CachedHtileTarget{
+            .target = target,
+            .last_used_sequence = self.htile_target_sequence,
+        };
+        if (self.htile_targets.items.len < maximum_depth_targets) {
+            try self.htile_targets.append(self.allocator, entry);
+            return self.htile_targets.items.len - 1;
+        }
+        var oldest_index: usize = 0;
+        for (self.htile_targets.items[1..], 1..) |cached, index| {
+            if (cached.last_used_sequence < self.htile_targets.items[oldest_index].last_used_sequence) {
+                oldest_index = index;
+            }
+        }
+        self.htile_targets.items[oldest_index] = entry;
+        return oldest_index;
+    }
+
+    /// Materializes the only HTILE states which can make the base allocation
+    /// stale: exact 0.0/1.0 fast clears. Ordinary Z-range words are left in
+    /// place because their base depth/stencil texels are already authoritative.
+    fn resolveHtileTarget(self: *Renderer, target: gpu.resources.DepthTarget) anyerror!void {
+        if (!target.htile_enabled or target.htile_address == 0) return;
+        const index = try self.acquireHtileTarget(target);
+        if (self.htile_targets.items[index].resolved) return;
+        const stats = try self.expandHtileFastClears(target);
+        self.htile_targets.items[index].resolved = true;
+        const resolved = stats orelse return;
+        if (resolved.clearBlocks() == 0) return;
+        if (self.reported_htile_resolves >= 4 and !log_verbose_gpu) return;
+        self.reported_htile_resolves += 1;
+        std.debug.print(
+            "[vulkan dcb] htile fast-clear resolve depth@0x{x} {d}x{d} meta@0x{x} zero={d} one={d} base={d}\n",
+            .{
+                if (target.write_address != 0) target.write_address else target.read_address,
+                target.width,
+                target.height,
+                target.htile_address,
+                resolved.clear_zero_blocks,
+                resolved.clear_one_blocks,
+                resolved.base_blocks,
+            },
+        );
+    }
+
+    fn expandHtileFastClears(
+        self: *Renderer,
+        target: gpu.resources.DepthTarget,
+    ) anyerror!?HtileResolveStats {
+        const htile = gpu.HtileLayout.fromDepthTarget(target) catch return null;
+        const metadata_bytes = std.math.cast(usize, htile.required_bytes) orelse return null;
+        if (metadata_bytes == 0 or metadata_bytes > maximum_htile_bytes) return null;
+        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        const metadata = try self.allocator.alloc(u8, metadata_bytes);
+        defer self.allocator.free(metadata);
+        if (!memory.read(memory.context, target.htile_address, metadata)) {
+            return Error.GuestMemoryReadFailed;
+        }
+
+        const stats = classifyHtileBlocks(htile, metadata, target.tile_stencil_disabled) orelse return null;
+        if (stats.clearBlocks() == 0) return stats;
+
+        const depth_texture = gpu.TextureLayout.fromDepthTarget(target) catch return null;
+        const depth = depth_texture.base() catch return null;
+        const depth_bytes = std.math.cast(usize, depth_texture.required_source_bytes) orelse return null;
+        if (depth_bytes == 0 or depth_bytes > maximum_frame_bytes) return null;
+        var depth_addresses: [2]u64 = @splat(0);
+        var depth_count: usize = 0;
+        for ([_]u64{ target.read_address, target.write_address }) |address| {
+            if (address == 0) continue;
+            var duplicate = false;
+            for (depth_addresses[0..depth_count]) |present| {
+                if (present == address) duplicate = true;
+            }
+            if (!duplicate) {
+                depth_addresses[depth_count] = address;
+                depth_count += 1;
+            }
+        }
+        if (depth_count == 0) return null;
+        for (depth_addresses[0..depth_count]) |address| {
+            const allocation = try self.allocator.alloc(u8, depth_bytes);
+            defer self.allocator.free(allocation);
+            if (!memory.read(memory.context, address, allocation)) return Error.GuestMemoryReadFailed;
+            try applyHtileDepthFastClears(htile, metadata, target, depth, allocation);
+            if (!memory.write(memory.context, address, allocation)) return Error.GuestMemoryWriteFailed;
+        }
+
+        if (!target.tile_stencil_disabled and target.stencil_format != 0) {
+            const stencil_texture = gpu.TextureLayout.fromStencilTarget(target) catch return null;
+            const stencil = stencil_texture.base() catch return null;
+            const stencil_bytes = std.math.cast(usize, stencil_texture.required_source_bytes) orelse return null;
+            if (stencil_bytes == 0 or stencil_bytes > maximum_frame_bytes) return null;
+            var stencil_addresses: [2]u64 = @splat(0);
+            var stencil_count: usize = 0;
+            for ([_]u64{ target.stencil_read_address, target.stencil_write_address }) |address| {
+                if (address == 0) continue;
+                var duplicate = false;
+                for (stencil_addresses[0..stencil_count]) |present| {
+                    if (present == address) duplicate = true;
+                }
+                if (!duplicate) {
+                    stencil_addresses[stencil_count] = address;
+                    stencil_count += 1;
+                }
+            }
+            // Expanding the shared depth/stencil word without publishing the
+            // stencil clear would expose stale stencil bytes.
+            if (stencil_count == 0) return null;
+            for (stencil_addresses[0..stencil_count]) |address| {
+                const allocation = try self.allocator.alloc(u8, stencil_bytes);
+                defer self.allocator.free(allocation);
+                if (!memory.read(memory.context, address, allocation)) return Error.GuestMemoryReadFailed;
+                try applyHtileStencilFastClears(htile, metadata, target, stencil, allocation);
+                if (!memory.write(memory.context, address, allocation)) return Error.GuestMemoryWriteFailed;
+            }
+        }
+
+        for (0..htile.layers) |layer_index| {
+            var y: u32 = 0;
+            while (y < htile.height) : (y += gpu.HtileLayout.region_height) {
+                var x: u32 = 0;
+                while (x < htile.width) : (x += gpu.HtileLayout.region_width) {
+                    const layer: u32 = @intCast(layer_index);
+                    const word = try htile.word(metadata, x, y, layer);
+                    if (gpu.HtileLayout.fastClearDepth(word, target.tile_stencil_disabled) == null) continue;
+                    try htile.setWord(
+                        metadata,
+                        x,
+                        y,
+                        layer,
+                        gpu.HtileLayout.expandedWord(target.tile_stencil_disabled),
+                    );
+                }
+            }
+        }
+        if (!memory.write(memory.context, target.htile_address, metadata)) {
+            return Error.GuestMemoryWriteFailed;
+        }
+        return stats;
+    }
+
+    fn materializeHtileTargetAt(self: *Renderer, address: u64, size: usize) anyerror!bool {
+        for (self.htile_targets.items) |cached| {
+            if (cached.resolved) continue;
+            const target = cached.target;
+            const depth = gpu.TextureLayout.fromDepthTarget(target) catch continue;
+            const depth_hit = (target.read_address != 0 and byteRangesOverlap(
+                address,
+                size,
+                target.read_address,
+                depth.required_source_bytes,
+            )) or (target.write_address != 0 and byteRangesOverlap(
+                address,
+                size,
+                target.write_address,
+                depth.required_source_bytes,
+            ));
+            var stencil_hit = false;
+            if (!depth_hit and target.stencil_format != 0) {
+                const stencil = gpu.TextureLayout.fromStencilTarget(target) catch continue;
+                stencil_hit = (target.stencil_read_address != 0 and byteRangesOverlap(
+                    address,
+                    size,
+                    target.stencil_read_address,
+                    stencil.required_source_bytes,
+                )) or (target.stencil_write_address != 0 and byteRangesOverlap(
+                    address,
+                    size,
+                    target.stencil_write_address,
+                    stencil.required_source_bytes,
+                ));
+            }
+            if (!depth_hit and !stencil_hit) continue;
+            try self.resolveHtileTarget(target);
+            return true;
+        }
+        return false;
+    }
+
     fn createCachedRenderTarget(self: *Renderer, target: GuestColorTarget) anyerror!CachedRenderTarget {
         const frame_bytes = try colorTargetFrameBytes(target);
         const image = try self.createImage(
@@ -4401,6 +4630,7 @@ pub const Renderer = struct {
     fn flushPendingGuestWrite(self: *Renderer, address: u64, visible_bytes: usize) anyerror!void {
         try self.flushGuestStorageRange(address, visible_bytes);
         _ = try self.materializeRenderTargetAt(address);
+        _ = try self.materializeHtileTargetAt(address, visible_bytes);
         for (self.completed_frames.items) |*cached| {
             if (!cached.needs_writeback or cached.guest_address != address) continue;
             const target = cached.target orelse continue;
@@ -4431,9 +4661,20 @@ pub const Renderer = struct {
     ) anyerror!void {
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
         const render_state = gpu.resources.decodeRenderState(state);
-        // Depth and multi-MRT are ignored on this first host path: only colour
-        // target 0 is rendered. Many title draws enable depth; rejecting them
-        // would drop the whole colour path.
+        // The current Vulkan attachment path still renders colour target 0
+        // only. Preserve depth resource semantics meanwhile: exact HTILE fast
+        // clears are materialized into the base depth/stencil allocations so
+        // later CPU or texture reads never observe stale tiles.
+        if (render_state.depth_target) |depth| {
+            self.resolveHtileTarget(depth) catch |err| {
+                if (log_verbose_gpu) std.debug.print(
+                    "[vulkan dcb] HTILE resolve failed @0x{x}: {s}\n",
+                    .{ depth.htile_address, @errorName(err) },
+                );
+            };
+        }
+        // Depth testing and multi-MRT output are ignored here. Many title draws
+        // enable them; rejecting those draws would drop the whole colour path.
         if (render_state.depth_control.test_enabled or render_state.depth_control.write_enabled or
             (target_override == null and render_state.active_color_count != 1))
         {
@@ -5481,6 +5722,7 @@ pub const Renderer = struct {
     fn dcbRead(context: ?*anyopaque, address: u64, bytes: []u8) bool {
         const self = fromContext(context);
         self.flushGuestStorageRange(address, bytes.len) catch return false;
+        _ = self.materializeHtileTargetAt(address, bytes.len) catch return false;
         const memory = self.guest_memory orelse return false;
         return memory.read(memory.context, address, bytes);
     }
@@ -5505,10 +5747,21 @@ pub const Renderer = struct {
         }
     }
 
+    fn prepareHtileWrite(self: *Renderer, address: u64, size: usize) void {
+        if (size == 0) return;
+        for (self.htile_targets.items) |*cached| {
+            if (!cached.target.htile_enabled or cached.target.htile_address == 0) continue;
+            const layout = gpu.HtileLayout.fromDepthTarget(cached.target) catch continue;
+            if (!byteRangesOverlap(address, size, cached.target.htile_address, layout.required_bytes)) continue;
+            cached.resolved = false;
+        }
+    }
+
     fn dcbWrite(context: ?*anyopaque, address: u64, bytes: []const u8) bool {
         const self = fromContext(context);
         self.flushGuestStorageRange(address, bytes.len) catch return false;
         self.prepareCmaskWrite(address, bytes.len) catch return false;
+        self.prepareHtileWrite(address, bytes.len);
         const memory = self.guest_memory orelse return false;
         return memory.write(memory.context, address, bytes);
     }
@@ -6887,6 +7140,134 @@ fn classifyCmaskBlocks(layout: gpu.CmaskLayout, metadata: []const u8) ?CmaskBloc
     return stats;
 }
 
+fn classifyHtileBlocks(
+    layout: gpu.HtileLayout,
+    metadata: []const u8,
+    tile_stencil_disabled: bool,
+) ?HtileResolveStats {
+    var stats = HtileResolveStats{};
+    for (0..layout.layers) |layer_index| {
+        var y: u32 = 0;
+        while (y < layout.height) : (y += gpu.HtileLayout.region_height) {
+            var x: u32 = 0;
+            while (x < layout.width) : (x += gpu.HtileLayout.region_width) {
+                const word = layout.word(metadata, x, y, @intCast(layer_index)) catch return null;
+                if (gpu.HtileLayout.fastClearDepth(word, tile_stencil_disabled)) |depth| {
+                    if (depth == 0.0)
+                        stats.clear_zero_blocks +|= 1
+                    else
+                        stats.clear_one_blocks +|= 1;
+                } else {
+                    stats.base_blocks +|= 1;
+                }
+            }
+        }
+    }
+    return stats;
+}
+
+fn applyHtileDepthFastClears(
+    htile: gpu.HtileLayout,
+    metadata: []const u8,
+    target: gpu.resources.DepthTarget,
+    depth: gpu.TextureSubresourceLayout,
+    allocation: []u8,
+) anyerror!void {
+    const bytes: usize = switch (target.format) {
+        1 => 2,
+        3 => 4,
+        else => return error.UnsupportedFormat,
+    };
+    if (depth.block.bytes_per_element != bytes or allocation.len < depth.required_source_bytes) {
+        return error.DestinationTooSmall;
+    }
+    for (0..htile.layers) |layer_index| {
+        const layer: u32 = @intCast(layer_index);
+        var block_y: u32 = 0;
+        while (block_y < htile.height) : (block_y += gpu.HtileLayout.region_height) {
+            var block_x: u32 = 0;
+            while (block_x < htile.width) : (block_x += gpu.HtileLayout.region_width) {
+                const word = try htile.word(metadata, block_x, block_y, layer);
+                const clear_depth = gpu.HtileLayout.fastClearDepth(
+                    word,
+                    target.tile_stencil_disabled,
+                ) orelse continue;
+                const end_y = @min(block_y + gpu.HtileLayout.region_height, htile.height);
+                const end_x = @min(block_x + gpu.HtileLayout.region_width, htile.width);
+                var y = block_y;
+                while (y < end_y) : (y += 1) {
+                    var x = block_x;
+                    while (x < end_x) : (x += 1) {
+                        for (0..depth.samples()) |sample_index| {
+                            const offset = std.math.cast(
+                                usize,
+                                try depth.sourceByteOffset(x, y, layer, @intCast(sample_index)),
+                            ) orelse return error.GuestBufferTooLarge;
+                            if (offset > allocation.len or allocation.len - offset < bytes) {
+                                return error.GuestBufferTooLarge;
+                            }
+                            switch (target.format) {
+                                1 => std.mem.writeInt(
+                                    u16,
+                                    allocation[offset..][0..2],
+                                    if (clear_depth == 0.0) 0 else std.math.maxInt(u16),
+                                    .little,
+                                ),
+                                3 => std.mem.writeInt(
+                                    u32,
+                                    allocation[offset..][0..4],
+                                    @bitCast(clear_depth),
+                                    .little,
+                                ),
+                                else => unreachable,
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn applyHtileStencilFastClears(
+    htile: gpu.HtileLayout,
+    metadata: []const u8,
+    target: gpu.resources.DepthTarget,
+    stencil: gpu.TextureSubresourceLayout,
+    allocation: []u8,
+) anyerror!void {
+    if (stencil.block.bytes_per_element != 1 or allocation.len < stencil.required_source_bytes) {
+        return error.DestinationTooSmall;
+    }
+    for (0..htile.layers) |layer_index| {
+        const layer: u32 = @intCast(layer_index);
+        var block_y: u32 = 0;
+        while (block_y < htile.height) : (block_y += gpu.HtileLayout.region_height) {
+            var block_x: u32 = 0;
+            while (block_x < htile.width) : (block_x += gpu.HtileLayout.region_width) {
+                const word = try htile.word(metadata, block_x, block_y, layer);
+                if (gpu.HtileLayout.fastClearDepth(word, target.tile_stencil_disabled) == null) continue;
+                const end_y = @min(block_y + gpu.HtileLayout.region_height, htile.height);
+                const end_x = @min(block_x + gpu.HtileLayout.region_width, htile.width);
+                var y = block_y;
+                while (y < end_y) : (y += 1) {
+                    var x = block_x;
+                    while (x < end_x) : (x += 1) {
+                        for (0..stencil.samples()) |sample_index| {
+                            const offset = std.math.cast(
+                                usize,
+                                try stencil.sourceByteOffset(x, y, layer, @intCast(sample_index)),
+                            ) orelse return error.GuestBufferTooLarge;
+                            if (offset >= allocation.len) return error.GuestBufferTooLarge;
+                            allocation[offset] = 0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn applyCmaskClearBlocks(
     layout: gpu.CmaskLayout,
     metadata: []const u8,
@@ -7920,6 +8301,69 @@ test "CMASK clear and expanded nibbles materialize only the selected 8x8 blocks"
 
     try layout.setValue(&metadata, 8, 0, 0, 5);
     try std.testing.expect(classifyCmaskBlocks(layout, &metadata) == null);
+}
+
+test "HTILE fast-clear words materialize exact depth and stencil blocks" {
+    var target = std.mem.zeroes(gpu.resources.DepthTarget);
+    target.read_address = 0x1000_0000;
+    target.write_address = target.read_address;
+    target.htile_address = 0x2000_0000;
+    target.width = 16;
+    target.height = 8;
+    target.format = 3;
+    target.tile_mode = .depth;
+    target.stencil_tile_mode = .depth;
+    target.samples_log2 = 2;
+    target.htile_enabled = true;
+    target.htile_pipe_aligned = true;
+    target.tile_stencil_disabled = true;
+
+    const htile = try gpu.HtileLayout.fromDepthTarget(target);
+    const metadata = try std.testing.allocator.alloc(u8, @intCast(htile.required_bytes));
+    defer std.testing.allocator.free(metadata);
+    var word_offset: usize = 0;
+    while (word_offset < metadata.len) : (word_offset += 4) {
+        std.mem.writeInt(u32, metadata[word_offset..][0..4], gpu.HtileLayout.expanded_depth, .little);
+    }
+    try htile.setWord(metadata, 0, 0, 0, 0x0000_0000);
+    try htile.setWord(metadata, 8, 0, 0, 0xffff_fff0);
+    const stats = classifyHtileBlocks(htile, metadata, true).?;
+    try std.testing.expectEqual(@as(u32, 1), stats.clear_zero_blocks);
+    try std.testing.expectEqual(@as(u32, 1), stats.clear_one_blocks);
+    try std.testing.expectEqual(@as(u32, 0), stats.base_blocks);
+
+    const depth_texture = try gpu.TextureLayout.fromDepthTarget(target);
+    const depth = try depth_texture.base();
+    const depth_allocation = try std.testing.allocator.alloc(u8, @intCast(depth_texture.required_source_bytes));
+    defer std.testing.allocator.free(depth_allocation);
+    @memset(depth_allocation, 0xaa);
+    try applyHtileDepthFastClears(htile, metadata, target, depth, depth_allocation);
+    for (0..depth.samples()) |sample| {
+        const zero_offset: usize = @intCast(try depth.sourceByteOffset(7, 7, 0, @intCast(sample)));
+        const one_offset: usize = @intCast(try depth.sourceByteOffset(8, 0, 0, @intCast(sample)));
+        try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, depth_allocation[zero_offset..][0..4], .little));
+        try std.testing.expectEqual(
+            @as(u32, @bitCast(@as(f32, 1.0))),
+            std.mem.readInt(u32, depth_allocation[one_offset..][0..4], .little),
+        );
+    }
+
+    target.tile_stencil_disabled = false;
+    target.stencil_format = 1;
+    try htile.setWord(metadata, 0, 0, 0, 0x0000_00f0);
+    try htile.setWord(metadata, 8, 0, 0, 0xfffc_00f0);
+    const stencil_texture = try gpu.TextureLayout.fromStencilTarget(target);
+    const stencil = try stencil_texture.base();
+    const stencil_allocation = try std.testing.allocator.alloc(u8, @intCast(stencil_texture.required_source_bytes));
+    defer std.testing.allocator.free(stencil_allocation);
+    @memset(stencil_allocation, 0xaa);
+    try applyHtileStencilFastClears(htile, metadata, target, stencil, stencil_allocation);
+    for (0..stencil.samples()) |sample| {
+        const stencil_zero: usize = @intCast(try stencil.sourceByteOffset(7, 7, 0, @intCast(sample)));
+        const stencil_one: usize = @intCast(try stencil.sourceByteOffset(8, 0, 0, @intCast(sample)));
+        try std.testing.expectEqual(@as(u8, 0), stencil_allocation[stencil_zero]);
+        try std.testing.expectEqual(@as(u8, 0), stencil_allocation[stencil_one]);
+    }
 }
 
 test "CMASK write overlap checks use checked half-open guest ranges" {

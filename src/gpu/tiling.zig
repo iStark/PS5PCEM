@@ -521,6 +521,133 @@ pub const CmaskLayout = struct {
     }
 };
 
+/// GFX10 HTILE allocation and dword addressing for Oberon's RB+ topology.
+///
+/// One 32-bit word summarizes an 8x8 depth region. A 16-pipe, eight-pixel-
+/// packer device selects AMD AddrLib's HTILE pattern 21, whose 1024x512-pixel
+/// metadata blocks occupy 32 KiB. HTILE is only defined for pipe-aligned
+/// 64KB_Z_X depth surfaces on this path.
+pub const HtileLayout = struct {
+    pub const block_width: u32 = 1024;
+    pub const block_height: u32 = 512;
+    pub const block_bytes: u32 = 32 * 1024;
+    pub const region_width: u32 = 8;
+    pub const region_height: u32 = 8;
+
+    /// Uncompressed, full-range metadata values used after materializing a
+    /// fast clear into the base depth/stencil allocations.
+    pub const expanded_depth: u32 = 0xfffc_000f;
+    pub const expanded_depth_stencil: u32 = 0xffff_f3ff;
+
+    width: u32,
+    height: u32,
+    layers: u32,
+    first_slice: u32,
+    pitch: u32,
+    padded_height: u32,
+    blocks_per_row: u32,
+    slice_bytes: u64,
+    required_bytes: u64,
+    /// ADDR2's pipeBankXor. AGC depth-target state currently supplies no
+    /// separate XOR value, so decoded targets use zero.
+    pipe_xor: u8 = 0,
+
+    pub fn init(
+        width: u32,
+        height: u32,
+        layers: u32,
+        first_slice: u32,
+        row_pitch_pixels: u32,
+    ) Error!HtileLayout {
+        if (width == 0 or height == 0 or layers == 0) return Error.InvalidExtent;
+        const requested_pitch = if (row_pitch_pixels == 0) width else row_pitch_pixels;
+        if (requested_pitch < width) return Error.InvalidPitch;
+        const pitch = try alignForward(requested_pitch, block_width);
+        const padded_height = try alignForward(height, block_height);
+        const slice_pixels = try multiply(pitch, padded_height);
+        const slice_bytes = slice_pixels / 16;
+        std.debug.assert(slice_pixels % 16 == 0);
+        const physical_slices = try addU32(first_slice, layers);
+        return .{
+            .width = width,
+            .height = height,
+            .layers = layers,
+            .first_slice = first_slice,
+            .pitch = pitch,
+            .padded_height = padded_height,
+            .blocks_per_row = pitch / block_width,
+            .slice_bytes = slice_bytes,
+            .required_bytes = try multiply(slice_bytes, physical_slices),
+        };
+    }
+
+    pub fn fromDepthTarget(target: resources.DepthTarget) Error!HtileLayout {
+        if (!target.htile_enabled or target.htile_address == 0 or !target.htile_pipe_aligned or
+            target.tile_mode != .depth)
+        {
+            return Error.UnsupportedMetadataLayout;
+        }
+        if (target.mip_level != 0 or target.maximum_mip != 0) return Error.UnsupportedMipChain;
+        if (target.samples_log2 > 3) return Error.UnsupportedMultisample;
+        const layers: u32 = if (target.last_array_slice >= target.base_array_slice)
+            @as(u32, target.last_array_slice) - target.base_array_slice + 1
+        else
+            1;
+        return init(target.width, target.height, layers, target.base_array_slice, target.width);
+    }
+
+    /// Returns the byte address of the 32-bit HTILE word covering `(x, y)`.
+    pub fn wordOffset(self: HtileLayout, x: u32, y: u32, layer: u32) Error!u64 {
+        if (x >= self.width or y >= self.height or layer >= self.layers) {
+            return Error.CoordinateOutOfRange;
+        }
+        const physical_slice = try addU32(self.first_slice, layer);
+        const slice_base = try multiply(self.slice_bytes, physical_slice);
+        const block_x = x / block_width;
+        const block_y = y / block_height;
+        const block_index = try add(try multiply(block_y, self.blocks_per_row), block_x);
+        const block_base = try multiply(block_index, block_bytes);
+        const local = htileRbPlusByteOffset(x, y, physical_slice);
+        const pipe_xor = (@as(u32, self.pipe_xor & 0x0f) << 8) & (block_bytes - 1);
+        return add(try add(slice_base, block_base), local ^ pipe_xor);
+    }
+
+    pub fn word(self: HtileLayout, metadata: []const u8, x: u32, y: u32, layer: u32) Error!u32 {
+        const byte_offset = std.math.cast(usize, try self.wordOffset(x, y, layer)) orelse
+            return Error.ArithmeticOverflow;
+        if (byte_offset > metadata.len or metadata.len - byte_offset < @sizeOf(u32)) {
+            return Error.SourceTooSmall;
+        }
+        return std.mem.readInt(u32, metadata[byte_offset..][0..4], .little);
+    }
+
+    pub fn setWord(self: HtileLayout, metadata: []u8, x: u32, y: u32, layer: u32, value: u32) Error!void {
+        const byte_offset = std.math.cast(usize, try self.wordOffset(x, y, layer)) orelse
+            return Error.ArithmeticOverflow;
+        if (byte_offset > metadata.len or metadata.len - byte_offset < @sizeOf(u32)) {
+            return Error.DestinationTooSmall;
+        }
+        std.mem.writeInt(u32, metadata[byte_offset..][0..4], value, .little);
+    }
+
+    pub fn fastClearDepth(word_: u32, tile_stencil_disabled: bool) ?f32 {
+        if (tile_stencil_disabled) return switch (word_) {
+            0x0000_0000 => 0.0,
+            0xffff_fff0 => 1.0,
+            else => null,
+        };
+        return switch (word_) {
+            0x0000_00f0 => 0.0,
+            0xfffc_00f0 => 1.0,
+            else => null,
+        };
+    }
+
+    pub fn expandedWord(tile_stencil_disabled: bool) u32 {
+        return if (tile_stencil_disabled) expanded_depth else expanded_depth_stencil;
+    }
+};
+
 pub const Layout = struct {
     block: BlockLayout,
     width: u32,
@@ -1044,6 +1171,23 @@ pub const TextureLayout = struct {
             .mip_levels = @max(target.maximum_mip + 1, 1),
             .samples_log2 = target.samples_log2,
         }, bytes);
+    }
+
+    pub fn fromStencilTarget(target: resources.DepthTarget) Error!TextureLayout {
+        if (target.stencil_format != 1) return Error.UnsupportedFormat;
+        const layers: u32 = if (target.last_array_slice >= target.base_array_slice)
+            @as(u32, target.last_array_slice) - target.base_array_slice + 1
+        else
+            1;
+        return init(.{
+            .tile_mode = target.stencil_tile_mode,
+            .width = target.width,
+            .height = target.height,
+            .depth_or_layers = layers,
+            .first_slice = target.base_array_slice,
+            .mip_levels = @max(target.maximum_mip + 1, 1),
+            .samples_log2 = target.samples_log2,
+        }, 1);
     }
 
     pub fn subresource(
@@ -1920,6 +2064,28 @@ fn cmaskRbPlusNibbleOffset(x: u32, y: u32, slice: u32) u32 {
     return offset;
 }
 
+/// GFX10_HTILE_SW_PATTERN[21] after AddrLib converts its nibble address to a
+/// byte address. Bits 0-1 are zero because every element is one dword.
+fn htileRbPlusByteOffset(x: u32, y: u32, slice: u32) u32 {
+    var offset: u32 = 0;
+    offset |= bit(x, 3, 2);
+    offset |= bit(y, 3, 3);
+    offset |= bit(x, 6, 4);
+    offset |= bit(y, 6, 5);
+    offset |= bit(x, 7, 6);
+    offset |= bit(y, 7, 7);
+    if (evaluateAddressTerm(addressTerm(0x080, 0x090, 0, 0), x, y, slice, 0)) offset |= 1 << 8;
+    if (evaluateAddressTerm(addressTerm(0x010, 0x010, 0x002, 0), x, y, slice, 0)) offset |= 1 << 9;
+    if (evaluateAddressTerm(addressTerm(0x040, 0x020, 0x001, 0), x, y, slice, 0)) offset |= 1 << 10;
+    if (evaluateAddressTerm(addressTerm(0x020, 0x040, 0, 0), x, y, slice, 0)) offset |= 1 << 11;
+    offset |= bit(x, 8, 12);
+    offset |= bit(y, 8, 13);
+    offset |= bit(x, 9, 14);
+    std.debug.assert(offset < HtileLayout.block_bytes);
+    std.debug.assert(offset & 3 == 0);
+    return offset;
+}
+
 fn blockNibbles(bytes: u32) u32 {
     return bytes * 2;
 }
@@ -2350,6 +2516,68 @@ test "CMASK array slices preserve slice XOR and checked reads" {
     try testing.expectEqual(@as(u8, 0xac), metadata[5 * 1024]);
     try testing.expectError(Error.SourceTooSmall, layout.value(metadata[0..8], 0, 0, 0));
     try testing.expectError(Error.DestinationTooSmall, layout.setValue(metadata[0..8], 0, 0, 0, 0));
+}
+
+test "Oberon HTILE layout uses AddrLib dword swizzle and padded allocation" {
+    const layout = try HtileLayout.init(1920, 1080, 1, 0, 1920);
+    try testing.expectEqual(@as(u32, 2048), layout.pitch);
+    try testing.expectEqual(@as(u32, 1536), layout.padded_height);
+    try testing.expectEqual(@as(u64, 192 * 1024), layout.slice_bytes);
+    try testing.expectEqual(layout.slice_bytes, layout.required_bytes);
+
+    try testing.expectEqual(@as(u64, 0), try layout.wordOffset(0, 0, 0));
+    try testing.expectEqual(@as(u64, 4), try layout.wordOffset(8, 0, 0));
+    try testing.expectEqual(@as(u64, 8), try layout.wordOffset(0, 8, 0));
+    try testing.expectEqual(@as(u64, 1040), try layout.wordOffset(64, 0, 0));
+    try testing.expectEqual(@as(u64, 2080), try layout.wordOffset(0, 64, 0));
+    try testing.expectEqual(@as(u64, 320), try layout.wordOffset(128, 0, 0));
+    try testing.expectEqual(@as(u64, 32 * 1024), try layout.wordOffset(1024, 0, 0));
+    try testing.expectEqual(@as(u64, 64 * 1024), try layout.wordOffset(0, 512, 0));
+    try testing.expectError(Error.CoordinateOutOfRange, layout.wordOffset(1920, 0, 0));
+
+    var target = std.mem.zeroes(resources.DepthTarget);
+    target.width = 1920;
+    target.height = 1080;
+    target.format = 3;
+    target.tile_mode = .depth;
+    target.htile_address = 0x10000;
+    target.htile_enabled = true;
+    target.htile_pipe_aligned = true;
+    target.samples_log2 = 3;
+    try testing.expectEqual(@as(u64, 192 * 1024), (try HtileLayout.fromDepthTarget(target)).slice_bytes);
+    target.htile_pipe_aligned = false;
+    try testing.expectError(Error.UnsupportedMetadataLayout, HtileLayout.fromDepthTarget(target));
+}
+
+test "one HTILE metadata block visits every dword exactly once" {
+    const layout = try HtileLayout.init(HtileLayout.block_width, HtileLayout.block_height, 1, 0, 0);
+    var occupied = [_]bool{false} ** (HtileLayout.block_bytes / 4);
+    var y: u32 = 0;
+    while (y < HtileLayout.block_height) : (y += HtileLayout.region_height) {
+        var x: u32 = 0;
+        while (x < HtileLayout.block_width) : (x += HtileLayout.region_width) {
+            const index: usize = @intCast((try layout.wordOffset(x, y, 0)) / 4);
+            try testing.expect(!occupied[index]);
+            occupied[index] = true;
+        }
+    }
+    try testing.expect(std.mem.allEqual(bool, &occupied, true));
+}
+
+test "HTILE array slices preserve slice XOR and classify fast clears" {
+    const layout = try HtileLayout.init(64, 64, 2, 1, 64);
+    try testing.expectEqual(@as(u64, 96 * 1024), layout.required_bytes);
+    try testing.expectEqual(@as(u64, 33 * 1024), try layout.wordOffset(0, 0, 0));
+    try testing.expectEqual(@as(u64, 64 * 1024 + 512), try layout.wordOffset(0, 0, 1));
+
+    var metadata = [_]u8{0xff} ** (96 * 1024);
+    try layout.setWord(&metadata, 0, 0, 0, 0xffff_fff0);
+    try testing.expectEqual(@as(u32, 0xffff_fff0), try layout.word(&metadata, 0, 0, 0));
+    try testing.expectEqual(@as(?f32, 1.0), HtileLayout.fastClearDepth(0xffff_fff0, true));
+    try testing.expectEqual(@as(?f32, 0.0), HtileLayout.fastClearDepth(0x0000_00f0, false));
+    try testing.expect(HtileLayout.fastClearDepth(HtileLayout.expanded_depth, true) == null);
+    try testing.expectError(Error.SourceTooSmall, layout.word(metadata[0..8], 0, 0, 0));
+    try testing.expectError(Error.DestinationTooSmall, layout.setWord(metadata[0..8], 0, 0, 0, 0));
 }
 
 test "format adapters expose pixel block and attachment staging layouts" {

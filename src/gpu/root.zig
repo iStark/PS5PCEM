@@ -44,6 +44,7 @@ pub const ShaderOpcode = shader_analysis.Opcode;
 pub const SurfaceLayout = tiling.Layout;
 pub const MetadataSurface = tiling.MetadataSurface;
 pub const CmaskLayout = tiling.CmaskLayout;
+pub const HtileLayout = tiling.HtileLayout;
 pub const TextureLayout = tiling.TextureLayout;
 pub const TextureSubresourceLayout = tiling.SubresourceLayout;
 pub const ComputeDetileKey = tiling.ComputeDetileKey;

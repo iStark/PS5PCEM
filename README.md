@@ -81,7 +81,7 @@ the repository contains none of that content.
 
 | Title | Observed milestone | Current limit |
 |---|---|---|
-| **Terminator 2D: No Fate** | Reaches gameplay with correct color reproduction and clean title-provided backgrounds, characters, HUD elements, and textures; publisher logo screens and menus now match the console capture; warmed-up startup frames measure 22–65 ms on the current test host | First-use texture staging, depth/MRT, and compression metadata remain incomplete |
+| **Terminator 2D: No Fate** | Reaches gameplay with correct color reproduction and clean title-provided backgrounds, characters, HUD elements, and textures; publisher logo screens and menus now match the console capture; warmed-up startup frames measure 22–65 ms on the current test host | First-use texture staging, Vulkan depth/MRT, and the remaining compression metadata are incomplete |
 | **Pistol Whip** | Maps the native PS VR2 plugin and Burst module, then starts loading Unity asset archives | Headset, tracking, controller, and host OpenXR support are intentionally deferred |
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
 | **Tetris Effect: Connected** | Completes Unreal filesystem/config bootstrap, executes compact typed UAV clears (including two 1024×1024 `RGBA32_FLOAT` targets) and 3D volume uploads, and reaches a second measured VideoOut frame with 6 draws/63 dispatches | Output is black: the deferred compositor reaches its scanout buffer but is rejected by an unsupported scalar source; a compact image-copy compute kernel and other compute gaps also remain, while the 512 GiB reservation can depend on host address-space placement |
@@ -541,7 +541,9 @@ and render-target R_X layouts. `TextureLayout` extends the original one-level
 small levels share the exact 4 KiB/64 KiB mip-tail positions, and 3D resources
 use thick blocks plus depth block-slices. The Oberon 16-pipe/8-packer RB+
 equations include array-slice and 2x/4x/8x MSAA sample bits for both color and
-depth layouts.
+depth layouts. The same contract includes exact pipe-aligned GFX10 HTILE
+pattern-21 addressing: one dword per 8×8 region in a 32 KiB, 1024×512-pixel
+metadata block.
 
 Every `SubresourceLayout` exposes one checked `sourceByteOffset` consumed by CPU
 tile/detile, direct `MemoryReader` staging and the future compute path. Its
@@ -607,8 +609,8 @@ The remaining stages are:
 1. Move frequently changing shader scalars from SPIR-V specialization into a
    runtime constant path so graphics pipelines can be reused across frames.
 2. Add depth/stencil, multiple render targets, MSAA, texture component swizzles,
-   the remaining compressed DCC/FMASK/HTILE states, and CMASK states coupled
-   to MSAA/FMASK.
+   the remaining compressed DCC/FMASK states, HTILE Z-range/HiZ handling, and
+   CMASK states coupled to MSAA/FMASK.
 3. Complete structured loops, VCC/EXEC divergence, formats, mip/layer views,
    explicit-LOD operands, and the remaining image operations seen in captures.
 4. Continue reducing first-use texture and synchronous dispatch work, and
@@ -1647,6 +1649,16 @@ scheduler and Vulkan backend. Observed startup work now includes:
   CMASK invalidate the attachment after preserving prior draws, and host
   writeback marks materialized blocks expanded so stale metadata cannot clear
   them again. MSAA/FMASK-linked CMASK states remain outside this path.
+- Pipe-aligned HTILE depth targets now use Oberon's exact GFX10 RB+ pattern-21
+  dword address equation, including array-slice XOR and 1×/2×/4×/8× layouts.
+  Exact depth-only (`0`/`0xfffffff0`) and depth+stencil
+  (`0x000000f0`/`0xfffc00f0`) fast-clear words materialize their 0.0/1.0 depth
+  and zero stencil values into every sample of the swizzled base allocation,
+  then become full-range expanded words. Mixed ordinary Z-range words retain
+  their authoritative base texels. Overlapping guest HTILE writes invalidate
+  the bounded resolve cache, and dependent CPU/texture reads resolve again.
+  Vulkan depth testing and general HiZ range interpretation remain separate
+  follow-up work.
 - `SetFlip` and equeue delivery use VideoOut filter `-13`; flip status fills
   process-time fields and event data retains the guest flip argument.
 - Indexed draws can emit AGC `SetIndexSize` as a real `INDEX_TYPE` packet, and
@@ -1698,8 +1710,8 @@ Its compact 8- and 11-instruction typed clears now execute for `R8_UINT`,
 storage swizzles and tiled render-target/depth addressing. The exact observed
 18-instruction dual-store kernel also clears two 1024×1024 `RGBA32_FLOAT`
 render targets (2,097,152 texels total); inactive metadata pointers are accepted,
-while actual DCC/FMASK/HTILE compression and CMASK states beyond the supported
-single-sample clear/expanded pair remain rejected. Its observed
+while actual DCC/FMASK compression, non-fast-clear HTILE range states, and CMASK
+states beyond the supported single-sample clear/expanded pair remain rejected. Its observed
 32-instruction 3D upload program now copies `R8_UINT→RGBA8_UINT` and
 `R16_UINT→R16_UINT` volumes with the shader's bounds, strides, base coordinates,
 and linear/tiled target layout. A measured startup frame consequently completes

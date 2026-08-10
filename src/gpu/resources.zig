@@ -304,6 +304,7 @@ pub const DepthTarget = struct {
     format: u8,
     stencil_format: u8,
     tile_mode: TileMode,
+    stencil_tile_mode: TileMode,
     samples_log2: u8,
     maximum_mip: u8,
     base_array_slice: u16,
@@ -314,6 +315,8 @@ pub const DepthTarget = struct {
     clear_depth: f32,
     clear_stencil: u8,
     htile_enabled: bool,
+    htile_pipe_aligned: bool,
+    tile_stencil_disabled: bool,
 };
 
 pub const ViewportTransform = struct {
@@ -710,6 +713,7 @@ pub fn decodeDepthTarget(state: *const gpu_state.State) ?DepthTarget {
     if (read_address == 0 and write_address == 0) return null;
     const view = context(state, 0x002) orelse 0;
     const stencil_info = context(state, 0x011) orelse 0;
+    const htile_surface = context(state, 0x2af) orelse 0;
 
     return .{
         .read_address = read_address,
@@ -722,6 +726,7 @@ pub fn decodeDepthTarget(state: *const gpu_state.State) ?DepthTarget {
         .format = format,
         .stencil_format = @truncate(stencil_info & 0x1),
         .tile_mode = @enumFromInt(@as(u5, @truncate((z_info >> 4) & 0x1f))),
+        .stencil_tile_mode = @enumFromInt(@as(u5, @truncate((stencil_info >> 4) & 0x1f))),
         .samples_log2 = @truncate((z_info >> 2) & 0x3),
         .maximum_mip = @truncate((z_info >> 16) & 0xf),
         .base_array_slice = @truncate((view & 0x7ff) | (((view >> 11) & 0x3) << 11)),
@@ -732,6 +737,8 @@ pub fn decodeDepthTarget(state: *const gpu_state.State) ?DepthTarget {
         .clear_depth = @bitCast(context(state, 0x00b) orelse @as(u32, 0x3f80_0000)),
         .clear_stencil = @truncate(context(state, 0x00a) orelse 0),
         .htile_enabled = z_info & (1 << 29) != 0,
+        .htile_pipe_aligned = htile_surface & (1 << 18) != 0,
+        .tile_stencil_disabled = stencil_info & (1 << 29) != 0,
     };
 }
 
@@ -896,10 +903,12 @@ test "render state decodes PS5 color and depth target extensions" {
     try state.writeRegister(.context, 0x007, 1919 | (1079 << 16));
     try state.writeRegister(.context, 0x00b, 0x3f00_0000);
     try state.writeRegister(.context, 0x010, 3 | (0x18 << 4) | (1 << 29));
+    try state.writeRegister(.context, 0x011, (0x18 << 4) | (1 << 29));
     try state.writeRegister(.context, 0x012, @truncate(depth_address >> 8));
     try state.writeRegister(.context, 0x014, @truncate(depth_address >> 8));
     try state.writeRegister(.context, 0x01a, @truncate(depth_address >> 40));
     try state.writeRegister(.context, 0x01c, @truncate(depth_address >> 40));
+    try state.writeRegister(.context, 0x2af, 1 << 18);
     try state.writeRegister(.context, 0x200, 2 | 4 | (3 << 4));
 
     const render = decodeRenderState(&state);
@@ -921,8 +930,11 @@ test "render state decodes PS5 color and depth target extensions" {
     try testing.expectEqual(@as(u32, 1920), depth.width);
     try testing.expectEqual(@as(u32, 1080), depth.height);
     try testing.expectEqual(TileMode.depth, depth.tile_mode);
+    try testing.expectEqual(TileMode.depth, depth.stencil_tile_mode);
     try testing.expect(depth.depth_read_only);
     try testing.expectEqual(@as(f32, 0.5), depth.clear_depth);
+    try testing.expect(depth.htile_pipe_aligned);
+    try testing.expect(depth.tile_stencil_disabled);
     try testing.expect(render.depth_control.test_enabled);
     try testing.expect(render.depth_control.write_enabled);
     try testing.expectEqual(@as(f32, 960), render.viewport.?.x_scale);
