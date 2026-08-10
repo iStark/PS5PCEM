@@ -62,7 +62,7 @@ pub fn decodeInstruction(pc: u32, code: []const u32, word_index: u32) Error!Inst
     };
 }
 
-/// Parses a shader up to `s_endpgm`.
+/// Parses a shader up to `s_endpgm` or the GFX10 `s_code_end` marker.
 ///
 /// The program is considered finished at an `s_endpgm` that no branch in the
 /// already-parsed code targets: in shaders with control flow, `s_endpgm` can
@@ -90,7 +90,7 @@ pub fn decodeProgram(allocator: std.mem.Allocator, code: []const u32) ProgramErr
             try branch_targets.put(allocator, inst.branch_target, {});
         }
 
-        if (inst.opcode == .s_endpgm) {
+        if (inst.opcode.isProgramEnd()) {
             const at_end = word_index >= code.len;
             if (at_end or !branch_targets.contains(word_index * 4)) {
                 return .{ .code = code, .instructions = instructions };
@@ -114,6 +114,18 @@ test "a two-instruction program" {
     try std.testing.expectEqual(isa.Opcode.s_mov_b32, program.instructions.items[0].opcode);
     try std.testing.expectEqual(isa.Opcode.s_endpgm, program.instructions.items[1].opcode);
     try std.testing.expectEqual(@as(u32, 4), program.instructions.items[1].pc);
+}
+
+test "s_code_end stops before embedded shader metadata" {
+    const code = [_]u32{
+        0xbe80_0301, // s_mov_b32 s0, s1
+        0xbf9f_0000, // s_code_end
+        0x0000_00d3, // metadata, not an instruction
+    };
+    var program = try decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), program.instructions.items.len);
+    try std.testing.expectEqual(isa.Opcode.s_code_end, program.instructions.items[1].opcode);
 }
 
 test "a literal shifts the pc of the next instruction" {

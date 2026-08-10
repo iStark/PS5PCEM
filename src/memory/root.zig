@@ -748,12 +748,20 @@ pub const AddressSpace = struct {
         kind: MappingKind,
         backing_offset: ?u64,
     ) Error!void {
-        if (!self.ownsLocked(address, size)) return Error.AddressUnavailable;
-        if (self.overlapsLocked(address, size)) return Error.AddressUnavailable;
+        if (!self.ownsLocked(address, size)) {
+            std.debug.print("[memory] fixed map not owned addr=0x{x} size=0x{x} kind={s}\n", .{ address, size, @tagName(kind) });
+            return Error.AddressUnavailable;
+        }
+        if (self.overlapsLocked(address, size)) {
+            std.debug.print("[memory] fixed map overlaps addr=0x{x} size=0x{x} kind={s}\n", .{ address, size, @tagName(kind) });
+            return Error.AddressUnavailable;
+        }
         try self.mappings.ensureUnusedCapacity(self.allocator, 1);
 
-        const free_range = self.freeRangeLocked(address, size) orelse
+        const free_range = self.freeRangeLocked(address, size) orelse {
+            std.debug.print("[memory] fixed map has no host extent addr=0x{x} size=0x{x} kind={s}\n", .{ address, size, @tagName(kind) });
             return Error.AddressUnavailable;
+        };
         const host_view_size = hostMappingViewSize(kind, address, size, backing_offset);
         try hostPrepareMappingPlaceholders(free_range, address, size, host_view_size);
         errdefer hostCoalescePlaceholder(free_range) catch {};

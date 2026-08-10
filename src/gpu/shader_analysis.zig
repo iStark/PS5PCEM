@@ -143,13 +143,19 @@ pub fn decode(
                     try readNextWord(reader, address, &code, allocator);
                     continue;
                 },
-                else => return err,
+                else => {
+                    std.debug.print(
+                        "[gpu shader] decode failed program=0x{x} pc=0x{x} word=0x{x:0>8} error={s}\n",
+                        .{ address, pc, code.items[word_index], @errorName(err) },
+                    );
+                    return err;
+                },
             };
         };
         try instructions.append(allocator, inst);
         word_index += inst.word_count;
         if (inst.opcode.isBranch()) try branch_targets.put(allocator, inst.branch_target, {});
-        if (inst.opcode == .s_endpgm and !branch_targets.contains(word_index * 4)) break;
+        if (inst.opcode.isProgramEnd() and !branch_targets.contains(word_index * 4)) break;
     } else return Error.InstructionLimitExceeded;
 
     var program = rdna2.Program{ .code = code.items, .instructions = instructions };

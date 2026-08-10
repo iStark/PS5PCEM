@@ -179,7 +179,7 @@ fn evaluate(reader: shaders.MemoryReader, bindings: *const shaders.StageBindings
                 return result;
             }
         } else switch (inst.opcode) {
-            .s_endpgm => {
+            .s_endpgm, .s_code_end => {
                 result.stop_reason = .end_program;
                 return result;
             },

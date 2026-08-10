@@ -62,6 +62,9 @@ pub fn decodeScalarSource(code: u32) DecodeError!Operand {
     if (code <= 105) {
         return .{ .kind = .sgpr, .reg = code };
     }
+    if (code >= 108 and code <= 123) {
+        return .{ .kind = .ttmp, .reg = code - 108 };
+    }
     if (code >= 128 and code <= 192) {
         const signed: i32 = @intCast(code - 128);
         return .{
@@ -97,6 +100,12 @@ pub fn decodeScalarSource(code: u32) DecodeError!Operand {
         125 => .{ .kind = .null },
         126 => .{ .kind = .exec_lo },
         127 => .{ .kind = .exec_hi },
+        230 => .{ .kind = .flat_scratch_base_lo },
+        231 => .{ .kind = .flat_scratch_base_hi },
+        235 => .{ .kind = .shared_base },
+        236 => .{ .kind = .shared_limit },
+        237 => .{ .kind = .private_base },
+        238 => .{ .kind = .private_limit },
         239 => .{ .kind = .pops_exiting_wave_id },
         248 => .{
             .kind = .float_inline_constant,
@@ -106,6 +115,7 @@ pub fn decodeScalarSource(code: u32) DecodeError!Operand {
         251 => .{ .kind = .vcc_z },
         252 => .{ .kind = .exec_z },
         253 => .{ .kind = .scc },
+        254 => .{ .kind = .lds_direct },
         255 => .{ .kind = .literal_constant },
         else => DecodeError.UnsupportedScalarSource,
     };
@@ -118,6 +128,9 @@ pub fn decodeScalarSource(code: u32) DecodeError!Operand {
 pub fn decodeScalarDestination(code: u32) DecodeError!Operand {
     if (code <= 105) {
         return .{ .kind = .sgpr, .reg = code };
+    }
+    if (code >= 108 and code <= 123) {
+        return .{ .kind = .ttmp, .reg = code - 108 };
     }
     return switch (code) {
         106 => .{ .kind = .vcc_lo },
@@ -182,14 +195,25 @@ test "floating-point constants" {
 
 test "special registers" {
     try std.testing.expectEqual(OperandKind.vcc_lo, (try decodeScalarSource(106)).kind);
+    const ttmp = try decodeScalarSource(110);
+    try std.testing.expectEqual(OperandKind.ttmp, ttmp.kind);
+    try std.testing.expectEqual(@as(u32, 2), ttmp.reg);
     try std.testing.expectEqual(OperandKind.exec_hi, (try decodeScalarSource(127)).kind);
+    try std.testing.expectEqual(OperandKind.flat_scratch_base_lo, (try decodeScalarSource(230)).kind);
+    try std.testing.expectEqual(OperandKind.shared_base, (try decodeScalarSource(235)).kind);
+    try std.testing.expectEqual(OperandKind.private_limit, (try decodeScalarSource(238)).kind);
     try std.testing.expectEqual(OperandKind.scc, (try decodeScalarSource(253)).kind);
+    try std.testing.expectEqual(OperandKind.lds_direct, (try decodeScalarSource(254)).kind);
     try std.testing.expectEqual(OperandKind.literal_constant, (try decodeScalarSource(255)).kind);
+
+    const ttmp_destination = try decodeScalarDestination(123);
+    try std.testing.expectEqual(OperandKind.ttmp, ttmp_destination.kind);
+    try std.testing.expectEqual(@as(u32, 15), ttmp_destination.reg);
 }
 
 test "invalid codes are rejected" {
-    try std.testing.expectError(DecodeError.UnsupportedScalarSource, decodeScalarSource(110));
-    try std.testing.expectError(DecodeError.UnsupportedScalarSource, decodeScalarSource(254));
+    try std.testing.expectError(DecodeError.UnsupportedScalarSource, decodeScalarSource(209));
+    try std.testing.expectError(DecodeError.UnsupportedScalarSource, decodeScalarSource(249));
     // A destination cannot be a constant.
     try std.testing.expectError(DecodeError.UnsupportedScalarDestination, decodeScalarDestination(128));
     try std.testing.expectError(DecodeError.UnsupportedScalarDestination, decodeScalarDestination(255));

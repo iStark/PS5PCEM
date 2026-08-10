@@ -63,6 +63,16 @@ pub const OperandKind = enum {
     exec_z,
     scc,
     m0,
+    /// Trap temporary register (TTMP0..TTMP15 on GFX9+).
+    ttmp,
+    flat_scratch_base_lo,
+    flat_scratch_base_hi,
+    shared_base,
+    shared_limit,
+    private_base,
+    private_limit,
+    /// Per-lane LDS value selected by M0.
+    lds_direct,
     /// Discarded destination / zero-valued source selector.
     null,
     pops_exiting_wave_id,
@@ -194,6 +204,7 @@ pub const Opcode = enum {
     // SOPP
     s_nop,
     s_endpgm,
+    s_code_end,
     s_branch,
     s_cbranch_scc0,
     s_cbranch_scc1,
@@ -352,6 +363,12 @@ pub const Opcode = enum {
     v_cmp_ge_f32,
     v_cmp_o_f32,
     v_cmp_u_f32,
+    v_cmp_nge_f32,
+    v_cmp_nlg_f32,
+    v_cmp_ngt_f32,
+    v_cmp_nle_f32,
+    v_cmp_neq_f32,
+    v_cmp_nlt_f32,
     v_cmp_tru_f32,
     v_cmp_lt_i32,
     v_cmp_eq_i32,
@@ -371,11 +388,28 @@ pub const Opcode = enum {
     v_cmpx_gt_f32,
     v_cmpx_lg_f32,
     v_cmpx_ge_f32,
+    v_cmpx_f_f32,
+    v_cmpx_o_f32,
+    v_cmpx_u_f32,
+    v_cmpx_nge_f32,
+    v_cmpx_nlg_f32,
+    v_cmpx_ngt_f32,
+    v_cmpx_nle_f32,
+    v_cmpx_neq_f32,
+    v_cmpx_nlt_f32,
+    v_cmpx_tru_f32,
     v_cmpx_lt_i32,
     v_cmpx_eq_i32,
+    v_cmpx_le_i32,
+    v_cmpx_gt_i32,
+    v_cmpx_ne_i32,
+    v_cmpx_ge_i32,
     v_cmpx_lt_u32,
     v_cmpx_eq_u32,
+    v_cmpx_le_u32,
     v_cmpx_gt_u32,
+    v_cmpx_ne_u32,
+    v_cmpx_ge_u32,
     v_interp_p1_f32,
     v_interp_p2_f32,
     v_interp_mov_f32,
@@ -495,6 +529,12 @@ pub const Opcode = enum {
             else => false,
         };
     }
+
+    /// Shader termination opcodes. GFX10 export shaders commonly use
+    /// `s_code_end` before their embedded metadata instead of `s_endpgm`.
+    pub fn isProgramEnd(self: Opcode) bool {
+        return self == .s_endpgm or self == .s_code_end;
+    }
 };
 
 test "mnemonic is derived from the variant name" {
@@ -518,4 +558,6 @@ test "branches are recognized" {
     try std.testing.expect(Opcode.s_cbranch_vccz.isBranch());
     try std.testing.expect(!Opcode.s_endpgm.isBranch());
     try std.testing.expect(!Opcode.s_mov_b32.isBranch());
+    try std.testing.expect(Opcode.s_endpgm.isProgramEnd());
+    try std.testing.expect(Opcode.s_code_end.isProgramEnd());
 }

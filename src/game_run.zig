@@ -258,6 +258,10 @@ fn run(init: std.process.Init) !bool {
 
     const force_headless = init.minimal.environ.containsUnempty(allocator, "PS5_HEADLESS") catch false;
     const show_fps = init.minimal.environ.containsUnempty(allocator, "PS5_SHOW_FPS") catch false;
+    const enable_vulkan_validation = init.minimal.environ.containsUnempty(allocator, "PS5_VULKAN_VALIDATION") catch false;
+    const capture_first_graphics_frame = init.minimal.environ.containsUnempty(allocator, "PS5_CAPTURE_FIRST_FRAME") catch false;
+    const force_probe_fragment = init.minimal.environ.containsUnempty(allocator, "PS5_PROBE_FRAGMENT_COLOR") catch false;
+    const skip_compute_dispatches = init.minimal.environ.containsUnempty(allocator, "PS5_SKIP_COMPUTE") catch false;
     if (builtin.os.tag == .windows and !force_headless) live_gpu: {
         host_window.init(1280, 720) catch |err| {
             try stderr.print("live Vulkan window unavailable: {s}; continuing headless\n", .{@errorName(err)});
@@ -271,6 +275,10 @@ fn run(init: std.process.Init) !bool {
             break :live_gpu;
         };
         renderer = vulkan.Renderer.init(allocator, .{
+            .enable_validation = enable_vulkan_validation,
+            .capture_first_graphics_frame = capture_first_graphics_frame,
+            .force_probe_fragment = force_probe_fragment,
+            .skip_compute_dispatches = skip_compute_dispatches,
             .native_window = .{
                 .instance = native.instance,
                 .window = native.window,

@@ -43,7 +43,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/vulkan/root.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "gpu", .module = gpu }},
+        .imports = &.{
+            .{ .name = "gpu", .module = gpu },
+            .{ .name = "rdna2", .module = mod },
+        },
     });
 
     // Native host-window ownership. Kept separate from Vulkan so the renderer
@@ -256,7 +259,14 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    if (target.result.os.tag == .windows) game_run.root_module.linkSystemLibrary("xinput1_4", .{});
+    if (target.result.os.tag == .windows) {
+        // Native guest code requires the complete 64 GiB..1008 GiB PS5 user
+        // window. High-entropy ASLR occasionally placed game-run itself in
+        // that range and split it so Unreal could not reserve its 512 GiB
+        // arena. Keep the host image at 2 TiB, outside every guest aperture.
+        game_run.image_base = 0x0200_0000_0000;
+        game_run.root_module.linkSystemLibrary("xinput1_4", .{});
+    }
     b.installArtifact(game_run);
 
     const game_run_cmd = b.addRunArtifact(game_run);

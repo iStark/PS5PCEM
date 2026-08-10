@@ -122,13 +122,29 @@ fn vopcOpcode(id: u32) isa.Opcode {
         0x06 => .v_cmp_ge_f32,
         0x07 => .v_cmp_o_f32,
         0x08 => .v_cmp_u_f32,
+        0x09 => .v_cmp_nge_f32,
+        0x0a => .v_cmp_nlg_f32,
+        0x0b => .v_cmp_ngt_f32,
+        0x0c => .v_cmp_nle_f32,
+        0x0d => .v_cmp_neq_f32,
+        0x0e => .v_cmp_nlt_f32,
         0x0f => .v_cmp_tru_f32,
+        0x10 => .v_cmpx_f_f32,
         0x11 => .v_cmpx_lt_f32,
         0x12 => .v_cmpx_eq_f32,
         0x13 => .v_cmpx_le_f32,
         0x14 => .v_cmpx_gt_f32,
         0x15 => .v_cmpx_lg_f32,
         0x16 => .v_cmpx_ge_f32,
+        0x17 => .v_cmpx_o_f32,
+        0x18 => .v_cmpx_u_f32,
+        0x19 => .v_cmpx_nge_f32,
+        0x1a => .v_cmpx_nlg_f32,
+        0x1b => .v_cmpx_ngt_f32,
+        0x1c => .v_cmpx_nle_f32,
+        0x1d => .v_cmpx_neq_f32,
+        0x1e => .v_cmpx_nlt_f32,
+        0x1f => .v_cmpx_tru_f32,
         0x81 => .v_cmp_lt_i32,
         0x82 => .v_cmp_eq_i32,
         0x83 => .v_cmp_le_i32,
@@ -137,6 +153,10 @@ fn vopcOpcode(id: u32) isa.Opcode {
         0x86 => .v_cmp_ge_i32,
         0x91 => .v_cmpx_lt_i32,
         0x92 => .v_cmpx_eq_i32,
+        0x93 => .v_cmpx_le_i32,
+        0x94 => .v_cmpx_gt_i32,
+        0x95 => .v_cmpx_ne_i32,
+        0x96 => .v_cmpx_ge_i32,
         0xc1 => .v_cmp_lt_u32,
         0xc2 => .v_cmp_eq_u32,
         0xc3 => .v_cmp_le_u32,
@@ -145,14 +165,45 @@ fn vopcOpcode(id: u32) isa.Opcode {
         0xc6 => .v_cmp_ge_u32,
         0xd1 => .v_cmpx_lt_u32,
         0xd2 => .v_cmpx_eq_u32,
+        0xd3 => .v_cmpx_le_u32,
         0xd4 => .v_cmpx_gt_u32,
+        0xd5 => .v_cmpx_ne_u32,
+        0xd6 => .v_cmpx_ge_u32,
         else => .unsupported,
     };
 }
 
 fn isCompareExec(op: isa.Opcode) bool {
     return switch (op) {
-        .v_cmpx_lt_f32, .v_cmpx_eq_f32, .v_cmpx_le_f32, .v_cmpx_gt_f32, .v_cmpx_lg_f32, .v_cmpx_ge_f32, .v_cmpx_lt_i32, .v_cmpx_eq_i32, .v_cmpx_lt_u32, .v_cmpx_eq_u32, .v_cmpx_gt_u32 => true,
+        .v_cmpx_f_f32,
+        .v_cmpx_lt_f32,
+        .v_cmpx_eq_f32,
+        .v_cmpx_le_f32,
+        .v_cmpx_gt_f32,
+        .v_cmpx_lg_f32,
+        .v_cmpx_ge_f32,
+        .v_cmpx_o_f32,
+        .v_cmpx_u_f32,
+        .v_cmpx_nge_f32,
+        .v_cmpx_nlg_f32,
+        .v_cmpx_ngt_f32,
+        .v_cmpx_nle_f32,
+        .v_cmpx_neq_f32,
+        .v_cmpx_nlt_f32,
+        .v_cmpx_tru_f32,
+        .v_cmpx_lt_i32,
+        .v_cmpx_eq_i32,
+        .v_cmpx_le_i32,
+        .v_cmpx_gt_i32,
+        .v_cmpx_ne_i32,
+        .v_cmpx_ge_i32,
+        .v_cmpx_lt_u32,
+        .v_cmpx_eq_u32,
+        .v_cmpx_le_u32,
+        .v_cmpx_gt_u32,
+        .v_cmpx_ne_u32,
+        .v_cmpx_ge_u32,
+        => true,
         else => false,
     };
 }
@@ -286,6 +337,10 @@ fn finalizeVop2(inst: *Instruction) void {
             inst.src2.kind = .vcc_lo;
             inst.src_count = 3;
         },
+        .v_cndmask_b32 => {
+            inst.src2.kind = .vcc_lo;
+            inst.src_count = 3;
+        },
         else => inst.src_count = 2,
     }
 }
@@ -373,6 +428,11 @@ fn nativeVop3Opcode(id: u32) isa.Opcode {
         0x372 => .v_or3_b32,
         0x360 => .v_readlane_b32,
         0x361 => .v_writelane_b32,
+        // RDNA2's ordered min/max encodings.  LLVM exposes the same opcode
+        // numbers as V_MINIMUM/V_MAXIMUM on newer targets; PS5 shaders use
+        // them for finite clamp bounds in export programs.
+        0x365 => .v_min_f32,
+        0x366 => .v_max_f32,
         else => .unsupported,
     };
 }
@@ -400,7 +460,12 @@ pub fn decodeVop3(pc: u32, code: []const u32, word_index: u32) Error!Instruction
         inst.dst = try operand.decodeVectorGpr(word0 & 0xff);
     }
     inst.src0 = try operand.decodeScalarSource(word1 & 0x1ff);
-    inst.src_count = if (id >= 0x180 and id <= 0x1ff) 1 else if (id <= 0x13f) 2 else 3;
+    inst.src_count = if (id >= 0x180 and id <= 0x1ff)
+        1
+    else if (id <= 0x13f or id == 0x365 or id == 0x366)
+        2
+    else
+        3;
     if (inst.src_count >= 2) inst.src1 = try operand.decodeScalarSource((word1 >> 9) & 0x1ff);
     if (inst.src_count >= 3) inst.src2 = try operand.decodeScalarSource((word1 >> 18) & 0x1ff);
     const abs = (word0 >> 8) & 7;
@@ -504,6 +569,18 @@ test "native VOP3 shift-add opcode uses three sources" {
     try std.testing.expectEqual(@as(u32, 0), inst.src2.reg);
 }
 
+test "native VOP3 ordered float min max use two sources" {
+    const minimum = try decodeVop3(0, &.{ 0xd765_0007, 0x0001_00c1 }, 0);
+    try std.testing.expectEqual(isa.Opcode.v_min_f32, minimum.opcode);
+    try std.testing.expectEqual(@as(u32, 2), minimum.src_count);
+    try std.testing.expectEqual(@as(i32, -1), minimum.src0.signed_val);
+    try std.testing.expectEqual(@as(i32, 0), minimum.src1.signed_val);
+
+    const maximum = try decodeVop3(8, &.{ 0xd766_0009, 0x0001_00c1 }, 0);
+    try std.testing.expectEqual(isa.Opcode.v_max_f32, maximum.opcode);
+    try std.testing.expectEqual(@as(u32, 2), maximum.src_count);
+}
+
 test "truncated VOP3 is rejected" {
     const code = [_]u32{0xd14b_0000};
     try std.testing.expectError(Error.TruncatedInstruction, decodeVop3(0, &code, 0));
@@ -532,6 +609,15 @@ test "VOP2 SDWA retains selectors and scalar bank bits" {
     try std.testing.expectEqual(@as(u32, 7), inst.src1.reg);
     try std.testing.expectEqual(@as(u3, 5), inst.src1.sdwa_sel);
     try std.testing.expect(inst.src1.absolute);
+}
+
+test "VOP2 SDWA conditional mask keeps implicit VCC and integer negate" {
+    const code = [_]u32{ 0x020c_0cf9, 0x1606_0606 };
+    const inst = try decodeVop2(0xc50, &code, 0);
+    try std.testing.expectEqual(isa.Opcode.v_cndmask_b32, inst.opcode);
+    try std.testing.expectEqual(@as(u32, 3), inst.src_count);
+    try std.testing.expectEqual(isa.OperandKind.vcc_lo, inst.src2.kind);
+    try std.testing.expect(inst.src1.negate);
 }
 
 test "VOP1 DPP retains lane control and masks" {
@@ -568,6 +654,25 @@ test "VOPC SDWA may select an explicit scalar destination" {
     try std.testing.expectEqual(isa.OperandKind.sgpr, inst.dst.kind);
     try std.testing.expectEqual(@as(u32, 12), inst.dst.reg);
     try std.testing.expectEqual(@as(u32, 2), inst.word_count);
+}
+
+test "VOPC SDWA decodes GFX10 CMPX NLE predicate" {
+    const code = [_]u32{ 0x7c38_d4f9, 0x8606_000a };
+    const inst = try decodeVopc(0xb3c, &code, 0);
+    try std.testing.expectEqual(isa.Opcode.v_cmpx_nle_f32, inst.opcode);
+    try std.testing.expectEqual(isa.OperandKind.exec_lo, inst.dst.kind);
+    try std.testing.expectEqual(isa.OperandKind.vgpr, inst.src0.kind);
+    try std.testing.expectEqual(@as(u32, 10), inst.src0.reg);
+    try std.testing.expectEqual(isa.OperandKind.vcc_lo, inst.src1.kind);
+    try std.testing.expectEqual(@as(u32, 2), inst.word_count);
+}
+
+test "VOPC decodes unsigned CMPX not-equal predicate" {
+    const code = [_]u32{0x7daa_0e83};
+    const inst = try decodeVopc(0x1710, &code, 0);
+    try std.testing.expectEqual(isa.Opcode.v_cmpx_ne_u32, inst.opcode);
+    try std.testing.expectEqual(isa.OperandKind.exec_lo, inst.dst.kind);
+    try std.testing.expectEqual(@as(u32, 1), inst.word_count);
 }
 
 test "VOP2 mad literal operands keep their three-source order" {

@@ -2062,7 +2062,12 @@ test "large hinted user reservation leaves room for a later window" {
         errno.ok,
         sceKernelReserveVirtualRange(&arena, arena_size, 0, 0x20_0000),
     );
-    try testing.expectEqual(memory.user.start, arena);
+    // The test executable itself may occupy a high-entropy-ASLR hole in the
+    // guest window. AddressSpace must choose the first owned extent large
+    // enough, which need not begin at the architectural boundary.
+    try testing.expect(arena >= memory.user.start);
+    try testing.expectEqual(@as(u64, 0), arena % 0x20_0000);
+    try testing.expect(arena + arena_size <= memory.user.end);
 
     const window_size: u64 = 0x400_0000;
     var window = memory.user.start;
@@ -2070,7 +2075,10 @@ test "large hinted user reservation leaves room for a later window" {
         errno.ok,
         sceKernelReserveVirtualRange(&window, window_size, 0, page_size),
     );
-    try testing.expect(window >= arena + arena_size);
+    // If ASLR split the architectural range, the smaller allocation may fit
+    // in the free extent before the arena instead of after it.  What matters
+    // is that both reservations coexist without overlap.
+    try testing.expect(window + window_size <= arena or window >= arena + arena_size);
 }
 
 test "large unhinted reservation is placed in the user window" {
@@ -2086,7 +2094,9 @@ test "large unhinted reservation is placed in the user window" {
         errno.ok,
         sceKernelReserveVirtualRange(&arena, 0x80_0000_0000, 0, 0x20_0000),
     );
-    try testing.expectEqual(memory.user.start, arena);
+    try testing.expect(arena >= memory.user.start);
+    try testing.expectEqual(@as(u64, 0), arena % 0x20_0000);
+    try testing.expect(arena + 0x80_0000_0000 <= memory.user.end);
 }
 
 test "a query reports what a range is and whether it is committed" {

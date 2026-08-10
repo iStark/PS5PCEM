@@ -334,6 +334,10 @@ pub const Scissor = struct {
     right: u16,
     bottom: u16,
 
+    pub fn isSet(self: Scissor) bool {
+        return self.left != 0 or self.top != 0 or self.right != 0 or self.bottom != 0;
+    }
+
     pub fn intersect(a: Scissor, b: Scissor) Scissor {
         const left = @max(a.left, b.left);
         const top = @max(a.top, b.top);
@@ -577,8 +581,22 @@ pub fn decodeScissor(state: *const gpu_state.State, index: u8) ?Scissor {
     const viewport_br = context(state, viewport_base + 1);
     const screen_tl = context(state, 0x00c);
     const screen_br = context(state, 0x00d);
-    const viewport = decodeScissorWords(viewport_tl, viewport_br, 0x7fff);
-    const screen = decodeScissorWords(screen_tl, screen_br, 0xffff);
+    const mode_control = context(state, 0x292);
+    const viewport_enabled = mode_control == null or mode_control.? & (1 << 1) != 0;
+    const decoded_viewport = decodeScissorWords(viewport_tl, viewport_br, 0x7fff);
+    const viewport = if (viewport_enabled and decoded_viewport != null and decoded_viewport.?.isSet())
+        decoded_viewport
+    else
+        null;
+    // AGC reset-state blocks use an all-zero screen-scissor pair as an
+    // unpatched placeholder while the viewport scissor carries the active
+    // bounds. Test decoded coordinates: TL can contain only the window-offset
+    // flag while the rectangle itself is still unset. Some AGC paths use an
+    // all-ones pair as the same unset sentinel.
+    const decoded_screen = decodeScissorWords(screen_tl, screen_br, 0xffff);
+    const screen_is_unset = screen_tl != null and screen_br != null and
+        screen_tl.? == std.math.maxInt(u32) and screen_br.? == std.math.maxInt(u32);
+    const screen = if (!screen_is_unset and decoded_screen != null and decoded_screen.?.isSet()) decoded_screen else null;
     if (viewport) |value| return if (screen) |screen_value| value.intersect(screen_value) else value;
     return screen;
 }
@@ -592,6 +610,50 @@ fn decodeScissorWords(tl: ?u32, br: ?u32, mask: u32) ?Scissor {
         .right = @truncate(bottom_right & mask),
         .bottom = @truncate((bottom_right >> 16) & mask),
     };
+}
+
+test "an all-zero AGC screen scissor does not erase the viewport scissor" {
+    var state = gpu_state.State{};
+    try state.writeRegister(.context, 0x00c, 0);
+    try state.writeRegister(.context, 0x00d, 0);
+    try state.writeRegister(.context, 0x094, 1 << 31);
+    try state.writeRegister(.context, 0x095, 3840 | (2160 << 16));
+
+    const scissor = decodeScissor(&state, 0).?;
+    try std.testing.expectEqual(@as(u16, 0), scissor.left);
+    try std.testing.expectEqual(@as(u16, 0), scissor.top);
+    try std.testing.expectEqual(@as(u16, 3840), scissor.right);
+    try std.testing.expectEqual(@as(u16, 2160), scissor.bottom);
+}
+
+test "an all-ones AGC screen scissor is an unset sentinel" {
+    var state = gpu_state.State{};
+    try state.writeRegister(.context, 0x00c, std.math.maxInt(u32));
+    try state.writeRegister(.context, 0x00d, std.math.maxInt(u32));
+
+    try std.testing.expectEqual(@as(?Scissor, null), decodeScissor(&state, 0));
+}
+
+test "a disabled viewport scissor does not clip with reset-state zeros" {
+    var state = gpu_state.State{};
+    try state.writeRegister(.context, 0x00c, 0);
+    try state.writeRegister(.context, 0x00d, 0);
+    try state.writeRegister(.context, 0x094, 0);
+    try state.writeRegister(.context, 0x095, 0);
+    try state.writeRegister(.context, 0x292, 0);
+
+    try std.testing.expectEqual(@as(?Scissor, null), decodeScissor(&state, 0));
+}
+
+test "a viewport scissor with only the offset flag is an AGC reset placeholder" {
+    var state = gpu_state.State{};
+    try state.writeRegister(.context, 0x00c, 0);
+    try state.writeRegister(.context, 0x00d, 0);
+    try state.writeRegister(.context, 0x094, 1 << 31);
+    try state.writeRegister(.context, 0x095, 0);
+    try state.writeRegister(.context, 0x292, 1 << 1);
+
+    try std.testing.expectEqual(@as(?Scissor, null), decodeScissor(&state, 0));
 }
 
 pub fn decodeRasterState(state: *const gpu_state.State) RasterState {

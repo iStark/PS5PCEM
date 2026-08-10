@@ -116,6 +116,7 @@ const sopp_table = buildTable(128, &.{
     .{ 0x09, .s_cbranch_execnz }, .{ 0x0a, .s_barrier },
     .{ 0x0c, .s_waitcnt },        .{ 0x0e, .s_sleep },
     .{ 0x10, .s_sendmsg },        .{ 0x16, .s_ttrace_data },
+    .{ 0x1f, .s_code_end },
     .{ 0x20, .s_inst_prefetch },
 });
 
@@ -126,6 +127,7 @@ comptime {
     std.debug.assert(sop2_table[0x00] == .s_add_u32);
     std.debug.assert(sopc_table[0x00] == .s_cmp_eq_i32);
     std.debug.assert(sopp_table[0x01] == .s_endpgm);
+    std.debug.assert(sopp_table[0x1f] == .s_code_end);
 }
 
 /// Decodes both scalar sources and fetches the literal, if any.
@@ -378,6 +380,13 @@ test "s_endpgm" {
     const code = [_]u32{0xbf81_0000};
     const inst = try decodeSopp(0, &code, 0);
     try std.testing.expectEqual(Opcode.s_endpgm, inst.opcode);
+    try std.testing.expectEqual(@as(u32, 0), inst.src_count);
+}
+
+test "s_code_end" {
+    const code = [_]u32{0xbf9f_0000};
+    const inst = try decodeSopp(0, &code, 0);
+    try std.testing.expectEqual(Opcode.s_code_end, inst.opcode);
     try std.testing.expectEqual(@as(u32, 0), inst.src_count);
 }
 

@@ -70,6 +70,9 @@ pub const ComputeInputs = struct {
 pub const Options = struct {
     stage: Stage,
     local_size: [3]u32 = .{ 1, 1, 1 },
+    /// Pixel extent used to normalize FragCoord when the paired vertex PARAM
+    /// interface is unavailable. The backend supplies the active color target.
+    fragment_extent: [2]u32 = .{ 1280, 720 },
     /// VGPR populated from Vulkan's VertexIndex system value before a vertex
     /// shader starts. Other graphics system values remain explicit future
     /// stage-interface work rather than silently receiving zero.
@@ -84,12 +87,20 @@ pub const Options = struct {
     /// shader. `translate` discovers these from EXP/VINTRP instructions before
     /// the entry-point interface is declared.
     parameter_mask: u32 = 0,
+    /// Standalone translation infers PARAM inputs from VINTRP. A graphics
+    /// backend that knows the paired VS interface can disable that inference
+    /// and supply only locations the vertex stage actually exports.
+    infer_fragment_parameter_mask: bool = true,
     scalar_registers: []const ScalarRegister = &.{},
     compute_inputs: ?ComputeInputs = null,
     descriptor_array_length: u32 = 64,
     /// Exclusive PC ending a straight scalar prolog evaluated against the
     /// captured dispatch state and checked guest memory.
     specialized_scalar_prefix_end: u32 = 0,
+    /// Keep the permissive straight-line path for runtime bring-up. Offline
+    /// shader validation can disable it to prove that the complete CFG was
+    /// represented with structured SPIR-V selections.
+    allow_control_flow_fallback: bool = true,
 };
 
 pub const Error = std.mem.Allocator.Error || control_flow.Error || error{
@@ -117,6 +128,7 @@ const Constant = struct { value_type: ValueType, bits: u32, id: u32 };
 const State = struct {
     registers: [384]Value = [_]Value{.{}} ** 384,
     scc: u32 = 0,
+    arithmetic_carry: u32 = 0,
     valid: bool = false,
 };
 
@@ -165,6 +177,7 @@ const Builder = struct {
     local_invocation_id_input: u32 = 0,
     compute_inputs: ?ComputeInputs,
     local_size: [3]u32,
+    fragment_extent: [2]u32,
     vector2_type: u32 = 0,
     sampled_image_type: u32 = 0,
     sampled_image_array: u32 = 0,
@@ -174,6 +187,10 @@ const Builder = struct {
     specialized_scalar_registers: [128]bool = @splat(false),
     specialized_scalar_prefix_end: u32,
     scc: u32 = 0,
+    /// Carry chained specifically between S_ADD_U32 and S_ADDC_U32. Keep it
+    /// separate from branch SCC until all scalar arithmetic flag consumers are
+    /// modelled, so adding carry support cannot perturb established CFG paths.
+    arithmetic_carry: u32 = 0,
 
     fn init(allocator: std.mem.Allocator, options: Options) Error!Builder {
         var self = Builder{
@@ -192,6 +209,7 @@ const Builder = struct {
             .sampled_bindings = options.sampled_images,
             .compute_inputs = options.compute_inputs,
             .local_size = options.local_size,
+            .fragment_extent = options.fragment_extent,
             .specialized_scalar_prefix_end = options.specialized_scalar_prefix_end,
         };
         errdefer self.deinit();
@@ -357,7 +375,11 @@ const Builder = struct {
             if (needs_thread_id) {
                 const input_uint_pointer = self.id();
                 self.local_invocation_index = self.id();
-                try self.emit(&self.annotations, 71, &.{ self.local_invocation_index, 11, 29 }); // BuiltIn LocalInvocationIndex
+                const invocation_builtin: u32 = if (options.stage == .compute) 29 else 41;
+                try self.emit(&self.annotations, 71, &.{ self.local_invocation_index, 11, invocation_builtin });
+                if (options.stage == .fragment) {
+                    try self.emit(&self.annotations, 71, &.{ self.local_invocation_index, 14 }); // Flat
+                }
                 try self.emit(&self.declarations, 32, &.{ input_uint_pointer, 1, self.bits_type }); // ptr Input
                 try self.emit(&self.declarations, 59, &.{ input_uint_pointer, self.local_invocation_index, 1 }); // OpVariable
             }
@@ -460,11 +482,29 @@ const Builder = struct {
         return switch (op.kind) {
             .integer_inline_constant, .literal_constant, .float_inline_constant => self.constant(.bits32, op.value),
             .null => self.constant(.bits32, 0),
-            // Untouched EXEC/VCC read as "all lanes" for specialization paths
-            // that have not yet modelled those masks explicitly.
-            .exec_lo, .vcc_lo => self.constant(.bits32, 0xffff_ffff),
-            .exec_hi, .vcc_hi => self.constant(.bits32, 0xffff_ffff),
-            .m0 => self.constant(.bits32, 0),
+            // An untouched mask starts with all lanes enabled. VCC writes from
+            // vector comparisons are kept in the scalar register slots so a
+            // following CNDMASK or scalar mask operation observes the result.
+            .exec_lo, .exec_hi, .vcc_lo, .vcc_hi => blk: {
+                const index = registerIndex(op).?;
+                const current = self.registers[index];
+                if (current.id == 0) break :blk try self.constant(.bits32, 0xffff_ffff);
+                break :blk try self.convert(current, .bits32);
+            },
+            .m0,
+            .ttmp,
+            .flat_scratch_base_lo,
+            .flat_scratch_base_hi,
+            .shared_base,
+            .shared_limit,
+            .private_base,
+            .private_limit,
+            .lds_direct,
+            .vcc_z,
+            .exec_z,
+            .scc,
+            .pops_exiting_wave_id,
+            => self.constant(.bits32, 0),
             .sgpr, .vgpr => blk: {
                 const index = registerIndex(op) orelse return Error.UndefinedRegister;
                 const current = self.registers[index];
@@ -475,7 +515,6 @@ const Builder = struct {
             // read as zero so a single unknown operand does not abort the whole
             // shader — wrong values are better than no draw during bring-up.
             .unknown => self.constant(.bits32, 0),
-            else => return Error.UndefinedRegister,
         };
     }
 
@@ -533,16 +572,30 @@ const Builder = struct {
             }
         }
         if (op.absolute or op.negate) {
-            if (expected != .float32) return Error.UnsupportedOpcode;
-            if (op.absolute) {
-                const absolute = self.id();
-                try self.emit(&self.body, 199, &.{ self.bits_type, absolute, raw, try self.constant(.bits32, 0x7fff_ffff) });
-                raw = absolute;
-            }
-            if (op.negate) {
-                const negated = self.id();
-                try self.emit(&self.body, 198, &.{ self.bits_type, negated, raw, try self.constant(.bits32, 0x8000_0000) });
-                raw = negated;
+            if (expected == .float32) {
+                if (op.absolute) {
+                    const absolute = self.id();
+                    try self.emit(&self.body, 199, &.{ self.bits_type, absolute, raw, try self.constant(.bits32, 0x7fff_ffff) });
+                    raw = absolute;
+                }
+                if (op.negate) {
+                    const negated = self.id();
+                    try self.emit(&self.body, 198, &.{ self.bits_type, negated, raw, try self.constant(.bits32, 0x8000_0000) });
+                    raw = negated;
+                }
+            } else {
+                var signed_value = try self.convert(.{ .id = raw, .value_type = .bits32 }, .sint32);
+                if (op.absolute) {
+                    const absolute = self.id();
+                    try self.emit(&self.body, 12, &.{ self.signed_type, absolute, self.ensureGlslStd450(), 5, signed_value }); // SAbs
+                    signed_value = absolute;
+                }
+                if (op.negate) {
+                    const negated = self.id();
+                    try self.emit(&self.body, 126, &.{ self.signed_type, negated, signed_value }); // OpSNegate
+                    signed_value = negated;
+                }
+                raw = try self.convert(.{ .id = signed_value, .value_type = .sint32 }, .bits32);
             }
         }
         return self.convert(.{ .id = raw, .value_type = .bits32 }, expected);
@@ -551,29 +604,29 @@ const Builder = struct {
     fn destination(self: *Builder, op: operand.Operand, value: Value) Error!void {
         var final_value = value;
         if (op.omod != 0 or op.clamp) {
-            if (value.value_type == .float32) {
-                if (op.omod != 0) {
-                    const mul_bits: u32 = if (op.omod == 1) 0x4000_0000 else if (op.omod == 2) 0x4080_0000 else 0x3f00_0000;
-                    const cst = try self.constant(.float32, mul_bits);
-                    const mul_res = self.id();
-                    try self.emit(&self.body, 133, &.{ self.float_type, mul_res, final_value.id, cst });
-                    final_value.id = mul_res;
-                }
-                if (op.clamp) {
-                    const glsl = self.ensureGlslStd450();
-                    const zero = try self.constant(.float32, 0);
-                    const one = try self.constant(.float32, 0x3f80_0000);
-                    const clamped = self.id();
-                    try self.emit(&self.body, 12, &.{ self.float_type, clamped, glsl, 43, final_value.id, zero, one });
-                    final_value.id = clamped;
-                }
+            if (value.value_type != .float32) return Error.UnsupportedOpcode;
+            if (op.omod != 0) {
+                const mul_bits: u32 = if (op.omod == 1) 0x4000_0000 else if (op.omod == 2) 0x4080_0000 else 0x3f00_0000;
+                const cst = try self.constant(.float32, mul_bits);
+                const mul_res = self.id();
+                try self.emit(&self.body, 133, &.{ self.float_type, mul_res, final_value.id, cst });
+                final_value.id = mul_res;
+            }
+            if (op.clamp) {
+                const glsl = self.ensureGlslStd450();
+                const zero = try self.constant(.float32, 0);
+                const one = try self.constant(.float32, 0x3f80_0000);
+                const clamped = self.id();
+                try self.emit(&self.body, 12, &.{ self.float_type, clamped, glsl, 43, final_value.id, zero, one });
+                final_value.id = clamped;
             }
         }
         // SDWA destination packing is not modelled yet; keep the full dword.
         const index = registerIndex(op) orelse {
             // Writes to SCC/VCC/EXEC are tracked separately or ignored.
             if (op.kind == .vcc_lo or op.kind == .vcc_hi or
-                op.kind == .exec_lo or op.kind == .exec_hi or op.kind == .m0)
+                op.kind == .exec_lo or op.kind == .exec_hi or op.kind == .m0 or
+                op.kind == .ttmp)
             {
                 return;
             }
@@ -592,12 +645,140 @@ const Builder = struct {
         try self.destination(inst.dst, .{ .id = result, .value_type = value_type });
     }
 
+    fn glslFloatUnary(self: *Builder, inst: instruction.Instruction, opcode: u32) Error!void {
+        const source_id = try self.source(inst.src0, .float32);
+        const result = self.id();
+        try self.emit(&self.body, 12, &.{ // OpExtInst
+            self.float_type,
+            result,
+            self.ensureGlslStd450(),
+            opcode,
+            source_id,
+        });
+        try self.destination(inst.dst, .{ .id = result, .value_type = .float32 });
+    }
+
+    fn glslBinary(self: *Builder, inst: instruction.Instruction, opcode: u32, value_type: ValueType) Error!void {
+        const a = try self.source(inst.src0, value_type);
+        const b = try self.source(inst.src1, value_type);
+        const result = try self.glslBinaryValue(opcode, value_type, a, b);
+        try self.destination(inst.dst, .{ .id = result, .value_type = value_type });
+    }
+
+    fn glslBinaryValue(self: *Builder, opcode: u32, value_type: ValueType, a: u32, b: u32) Error!u32 {
+        const result = self.id();
+        try self.emit(&self.body, 12, &.{ // OpExtInst
+            self.typeId(value_type),
+            result,
+            self.ensureGlslStd450(),
+            opcode,
+            a,
+            b,
+        });
+        return result;
+    }
+
+    fn minMax3Float(self: *Builder, inst: instruction.Instruction, opcode: isa.Opcode) Error!void {
+        const a = try self.source(inst.src0, .float32);
+        const b = try self.source(inst.src1, .float32);
+        const c = try self.source(inst.src2, .float32);
+        const result = switch (opcode) {
+            .v_min3_f32 => try self.glslBinaryValue(37, .float32, try self.glslBinaryValue(37, .float32, a, b), c),
+            .v_max3_f32 => try self.glslBinaryValue(40, .float32, try self.glslBinaryValue(40, .float32, a, b), c),
+            .v_med3_f32 => blk: {
+                const low = try self.glslBinaryValue(37, .float32, a, b);
+                const high = try self.glslBinaryValue(40, .float32, a, b);
+                const upper_low = try self.glslBinaryValue(37, .float32, high, c);
+                break :blk try self.glslBinaryValue(40, .float32, low, upper_low);
+            },
+            else => unreachable,
+        };
+        try self.destination(inst.dst, .{ .id = result, .value_type = .float32 });
+    }
+
+    fn reciprocalFloat(self: *Builder, inst: instruction.Instruction) Error!void {
+        const divisor = try self.source(inst.src0, .float32);
+        const result = self.id();
+        try self.emit(&self.body, 136, &.{ // OpFDiv
+            self.float_type,
+            result,
+            try self.constant(.float32, @bitCast(@as(f32, 1.0))),
+            divisor,
+        });
+        try self.destination(inst.dst, .{ .id = result, .value_type = .float32 });
+    }
+
     fn binary(self: *Builder, inst: instruction.Instruction, opcode: u16, value_type: ValueType, reverse: bool) Error!void {
         const a = try self.source(if (reverse) inst.src1 else inst.src0, value_type);
         const b = try self.source(if (reverse) inst.src0 else inst.src1, value_type);
         const result = self.id();
         try self.emit(&self.body, opcode, &.{ self.typeId(value_type), result, a, b });
         try self.destination(inst.dst, .{ .id = result, .value_type = value_type });
+    }
+
+    fn scalarAddUnsigned(self: *Builder, inst: instruction.Instruction, with_carry: bool) Error!void {
+        const a = try self.source(inst.src0, .bits32);
+        const b = try self.source(inst.src1, .bits32);
+        const partial = self.id();
+        try self.emit(&self.body, 128, &.{ self.bits_type, partial, a, b }); // OpIAdd
+        const partial_carry = self.id();
+        try self.emit(&self.body, 176, &.{ self.bool_type, partial_carry, partial, a }); // OpULessThan
+
+        var result = partial;
+        var carry = partial_carry;
+        if (with_carry) {
+            const carry_condition = if (self.arithmetic_carry != 0) self.arithmetic_carry else blk: {
+                const zero = try self.constant(.bits32, 0);
+                const false_value = self.id();
+                try self.emit(&self.body, 171, &.{ self.bool_type, false_value, zero, zero }); // false
+                break :blk false_value;
+            };
+            const carry_bits = self.id();
+            try self.emit(&self.body, 169, &.{ // OpSelect
+                self.bits_type,
+                carry_bits,
+                carry_condition,
+                try self.constant(.bits32, 1),
+                try self.constant(.bits32, 0),
+            });
+            result = self.id();
+            try self.emit(&self.body, 128, &.{ self.bits_type, result, partial, carry_bits });
+            const carry_overflow = self.id();
+            try self.emit(&self.body, 176, &.{ self.bool_type, carry_overflow, result, partial });
+            carry = self.id();
+            try self.emit(&self.body, 166, &.{ self.bool_type, carry, partial_carry, carry_overflow }); // OpLogicalOr
+        }
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+        self.arithmetic_carry = carry;
+        if (with_carry) self.scc = carry;
+    }
+
+    fn multiply24(self: *Builder, inst: instruction.Instruction, signed: bool) Error!void {
+        var a = try self.source(inst.src0, if (signed) .sint32 else .bits32);
+        var b = try self.source(inst.src1, if (signed) .sint32 else .bits32);
+        if (signed) {
+            const shift = try self.constant(.bits32, 8);
+            const a_shifted = self.id();
+            try self.emit(&self.body, 196, &.{ self.signed_type, a_shifted, a, shift }); // OpShiftLeftLogical
+            a = self.id();
+            try self.emit(&self.body, 195, &.{ self.signed_type, a, a_shifted, shift }); // OpShiftRightArithmetic
+            const b_shifted = self.id();
+            try self.emit(&self.body, 196, &.{ self.signed_type, b_shifted, b, shift });
+            b = self.id();
+            try self.emit(&self.body, 195, &.{ self.signed_type, b, b_shifted, shift });
+        } else {
+            const mask = try self.constant(.bits32, 0x00ff_ffff);
+            const masked_a = self.id();
+            try self.emit(&self.body, 199, &.{ self.bits_type, masked_a, a, mask }); // OpBitwiseAnd
+            a = masked_a;
+            const masked_b = self.id();
+            try self.emit(&self.body, 199, &.{ self.bits_type, masked_b, b, mask });
+            b = masked_b;
+        }
+        const result = self.id();
+        const result_type: ValueType = if (signed) .sint32 else .bits32;
+        try self.emit(&self.body, 132, &.{ self.typeId(result_type), result, a, b }); // OpIMul
+        try self.destination(inst.dst, .{ .id = result, .value_type = result_type });
     }
 
     fn comparison(self: *Builder, inst: instruction.Instruction, opcode: u16, value_type: ValueType) Error!void {
@@ -608,19 +789,165 @@ const Builder = struct {
         self.scc = result;
     }
 
+    fn vectorConditionDestination(self: *Builder, inst: instruction.Instruction, condition: u32) Error!void {
+        const mask = self.id();
+        try self.emit(&self.body, 169, &.{ // OpSelect
+            self.bits_type,
+            mask,
+            condition,
+            try self.constant(.bits32, 0xffff_ffff),
+            try self.constant(.bits32, 0),
+        });
+        try self.destination(inst.dst, .{ .id = mask, .value_type = .bits32 });
+    }
+
+    fn vectorComparison(self: *Builder, inst: instruction.Instruction, opcode: u16, value_type: ValueType) Error!void {
+        const a = try self.source(inst.src0, value_type);
+        const b = try self.source(inst.src1, value_type);
+        const result = self.id();
+        try self.emit(&self.body, opcode, &.{ self.bool_type, result, a, b });
+        try self.vectorConditionDestination(inst, result);
+    }
+
+    fn vectorConstantComparison(self: *Builder, inst: instruction.Instruction, truth: bool) Error!void {
+        const zero = try self.constant(.bits32, 0);
+        const result = self.id();
+        try self.emit(&self.body, if (truth) 170 else 171, &.{ self.bool_type, result, zero, zero });
+        try self.vectorConditionDestination(inst, result);
+    }
+
+    fn vectorOrderedComparison(self: *Builder, inst: instruction.Instruction, unordered: bool) Error!void {
+        const a = try self.source(inst.src0, .float32);
+        const b = try self.source(inst.src1, .float32);
+        const a_ordered = self.id();
+        try self.emit(&self.body, 180, &.{ self.bool_type, a_ordered, a, a }); // OpFOrdEqual
+        const b_ordered = self.id();
+        try self.emit(&self.body, 180, &.{ self.bool_type, b_ordered, b, b });
+        const both_ordered = self.id();
+        try self.emit(&self.body, 167, &.{ self.bool_type, both_ordered, a_ordered, b_ordered }); // OpLogicalAnd
+        if (!unordered) return self.vectorConditionDestination(inst, both_ordered);
+        const any_unordered = self.id();
+        try self.emit(&self.body, 168, &.{ self.bool_type, any_unordered, both_ordered }); // OpLogicalNot
+        try self.vectorConditionDestination(inst, any_unordered);
+    }
+
     fn mov64(self: *Builder, inst: instruction.Instruction) Error!void {
-        // Copy a 64-bit SGPR pair (or zero when src is EXEC/VCC specials).
-        if (inst.dst.kind != .sgpr) return;
-        const low = try self.source(inst.src0, .bits32);
-        const high = if (inst.src0.kind == .sgpr) blk: {
-            var hi_op = inst.src0;
-            hi_op.reg += 1;
-            break :blk try self.source(hi_op, .bits32);
-        } else try self.constant(.bits32, 0);
-        try self.destination(inst.dst, .{ .id = low, .value_type = .bits32 });
-        var hi_dst = inst.dst;
-        hi_dst.reg += 1;
-        try self.destination(hi_dst, .{ .id = high, .value_type = .bits32 });
+        const value = try self.sourcePair(inst.src0);
+        try self.destinationPair(inst.dst, value);
+    }
+
+    fn sourcePair(self: *Builder, op: operand.Operand) Error![2]u32 {
+        const low = try self.source(op, .bits32);
+        const high = switch (op.kind) {
+            .sgpr, .vgpr, .vcc_lo, .exec_lo => try self.source(try consecutiveRegister(op, 1), .bits32),
+            else => blk: {
+                // Scalar constants in a 64-bit ALU instruction are sign
+                // extended to the high dword.
+                const extended = self.id();
+                try self.emit(&self.body, 195, &.{
+                    self.bits_type,
+                    extended,
+                    low,
+                    try self.constant(.bits32, 31),
+                }); // OpShiftRightArithmetic
+                break :blk extended;
+            },
+        };
+        return .{ low, high };
+    }
+
+    fn destinationPair(self: *Builder, op: operand.Operand, value: [2]u32) Error!void {
+        try self.destination(op, .{ .id = value[0], .value_type = .bits32 });
+        try self.destination(try consecutiveRegister(op, 1), .{ .id = value[1], .value_type = .bits32 });
+    }
+
+    fn updateSccFromPair(self: *Builder, value: [2]u32) Error!void {
+        const zero = try self.constant(.bits32, 0);
+        const low_nonzero = self.id();
+        try self.emit(&self.body, 171, &.{ self.bool_type, low_nonzero, value[0], zero }); // OpINotEqual
+        const high_nonzero = self.id();
+        try self.emit(&self.body, 171, &.{ self.bool_type, high_nonzero, value[1], zero });
+        self.scc = self.id();
+        try self.emit(&self.body, 166, &.{ self.bool_type, self.scc, low_nonzero, high_nonzero }); // OpLogicalOr
+    }
+
+    fn bitwise64(self: *Builder, inst: instruction.Instruction, opcode: isa.Opcode) Error!void {
+        const a = try self.sourcePair(inst.src0);
+        const b = try self.sourcePair(inst.src1);
+        var result: [2]u32 = undefined;
+        for (0..2) |index| {
+            var right = b[index];
+            if (opcode == .s_andn2_b64 or opcode == .s_orn2_b64) {
+                const inverted = self.id();
+                try self.emit(&self.body, 200, &.{ self.bits_type, inverted, right }); // OpNot
+                right = inverted;
+            }
+            const binary_opcode: u16 = switch (opcode) {
+                .s_and_b64, .s_andn2_b64, .s_nand_b64 => 199,
+                .s_or_b64, .s_orn2_b64, .s_nor_b64 => 197,
+                .s_xor_b64, .s_xnor_b64 => 198,
+                else => unreachable,
+            };
+            const combined = self.id();
+            try self.emit(&self.body, binary_opcode, &.{ self.bits_type, combined, a[index], right });
+            if (opcode == .s_nand_b64 or opcode == .s_nor_b64 or opcode == .s_xnor_b64) {
+                result[index] = self.id();
+                try self.emit(&self.body, 200, &.{ self.bits_type, result[index], combined });
+            } else {
+                result[index] = combined;
+            }
+        }
+        try self.destinationPair(inst.dst, result);
+        try self.updateSccFromPair(result);
+    }
+
+    fn not64(self: *Builder, inst: instruction.Instruction) Error!void {
+        const source_value = try self.sourcePair(inst.src0);
+        var result: [2]u32 = undefined;
+        for (0..2) |index| {
+            result[index] = self.id();
+            try self.emit(&self.body, 200, &.{ self.bits_type, result[index], source_value[index] });
+        }
+        try self.destinationPair(inst.dst, result);
+        try self.updateSccFromPair(result);
+    }
+
+    fn cselect64(self: *Builder, inst: instruction.Instruction) Error!void {
+        const condition = if (self.scc != 0) self.scc else blk: {
+            const zero = try self.constant(.bits32, 0);
+            const fallback = self.id();
+            try self.emit(&self.body, 170, &.{ self.bool_type, fallback, zero, zero });
+            break :blk fallback;
+        };
+        const true_value = try self.sourcePair(inst.src0);
+        const false_value = try self.sourcePair(inst.src1);
+        var result: [2]u32 = undefined;
+        for (0..2) |index| {
+            result[index] = self.id();
+            try self.emit(&self.body, 169, &.{ self.bits_type, result[index], condition, true_value[index], false_value[index] });
+        }
+        try self.destinationPair(inst.dst, result);
+    }
+
+    fn cselect32(self: *Builder, inst: instruction.Instruction) Error!void {
+        const condition = if (self.scc != 0) self.scc else blk: {
+            const zero = try self.constant(.bits32, 0);
+            const fallback = self.id();
+            try self.emit(&self.body, 170, &.{ self.bool_type, fallback, zero, zero });
+            break :blk fallback;
+        };
+        const true_value = try self.source(inst.src0, .bits32);
+        const false_value = try self.source(inst.src1, .bits32);
+        const result = self.id();
+        try self.emit(&self.body, 169, &.{ self.bits_type, result, condition, true_value, false_value });
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
+    fn getPcFallback(self: *Builder, inst: instruction.Instruction) Error!void {
+        // Live shaders specialize GETPC-derived descriptor pointers before
+        // lowering. Keep a deterministic null pair for standalone translation.
+        const zero = try self.constant(.bits32, 0);
+        try self.destinationPair(inst.dst, .{ zero, zero });
     }
 
     fn cndmask(self: *Builder, inst: instruction.Instruction) Error!void {
@@ -654,6 +981,23 @@ const Builder = struct {
         try self.emit(&self.body, 199, &.{ self.bits_type, masked, a, b }); // OpBitwiseAnd
         const result = self.id();
         try self.emit(&self.body, 197, &.{ self.bits_type, result, masked, c }); // OpBitwiseOr
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
+    fn bitfieldInsert(self: *Builder, inst: instruction.Instruction) Error!void {
+        // V_BFI_B32 selects bits from src1 where src0 is set and from src2
+        // everywhere else: (mask & src1) | (~mask & src2).
+        const mask = try self.source(inst.src0, .bits32);
+        const selected = try self.source(inst.src1, .bits32);
+        const fallback = try self.source(inst.src2, .bits32);
+        const masked_selected = self.id();
+        try self.emit(&self.body, 199, &.{ self.bits_type, masked_selected, mask, selected }); // OpBitwiseAnd
+        const inverted_mask = self.id();
+        try self.emit(&self.body, 200, &.{ self.bits_type, inverted_mask, mask }); // OpNot
+        const masked_fallback = self.id();
+        try self.emit(&self.body, 199, &.{ self.bits_type, masked_fallback, inverted_mask, fallback }); // OpBitwiseAnd
+        const result = self.id();
+        try self.emit(&self.body, 197, &.{ self.bits_type, result, masked_selected, masked_fallback }); // OpBitwiseOr
         try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
     }
 
@@ -791,6 +1135,21 @@ const Builder = struct {
     }
 
     fn initializeStageInputs(self: *Builder) Error!void {
+        // Graphics descriptor payloads are represented by Vulkan bindings and
+        // deliberately removed from scalar specialization. Their remaining
+        // bitfield uses still need a deterministic value on paths where no
+        // scalar instruction writes the corresponding SGPR. Zero mirrors the
+        // unavailable-hardware-register policy used by the pixel prolog. Keep
+        // VCC and EXEC untouched: rawSource gives pristine wave masks all ones.
+        if (self.stage == .fragment) {
+            const zero = try self.constant(.bits32, 0);
+            for (0..126) |sgpr| {
+                if (sgpr == 106 or sgpr == 107) continue;
+                if (self.registers[sgpr].id == 0) {
+                    self.registers[sgpr] = .{ .id = zero, .value_type = .bits32 };
+                }
+            }
+        }
         // Seed unused VGPRs with zero so attribute holes / skipped ops do not
         // abort translation with UndefinedRegister during bring-up.
         const zero = try self.constant(.bits32, 0);
@@ -840,6 +1199,18 @@ const Builder = struct {
         try self.destination(inst.dst, .{ .id = result, .value_type = .float32 });
     }
 
+    fn floatToInteger(self: *Builder, inst: instruction.Instruction, signed: bool) Error!void {
+        const source_id = try self.source(inst.src0, .float32);
+        const result = self.id();
+        const destination_type: ValueType = if (signed) .sint32 else .bits32;
+        try self.emit(&self.body, if (signed) 110 else 109, &.{
+            self.typeId(destination_type),
+            result,
+            source_id,
+        });
+        try self.destination(inst.dst, .{ .id = result, .value_type = destination_type });
+    }
+
     fn madFloat(self: *Builder, inst: instruction.Instruction) Error!void {
         // dst = src0 * src1 + src2
         const a = try self.source(inst.src0, .float32);
@@ -849,6 +1220,23 @@ const Builder = struct {
         try self.emit(&self.body, 133, &.{ self.float_type, product, a, b }); // OpFMul
         const result = self.id();
         try self.emit(&self.body, 129, &.{ self.float_type, result, product, c }); // OpFAdd
+        try self.destination(inst.dst, .{ .id = result, .value_type = .float32 });
+    }
+
+    fn fmaFloat(self: *Builder, inst: instruction.Instruction) Error!void {
+        const a = try self.source(inst.src0, .float32);
+        const b = try self.source(inst.src1, .float32);
+        const c = try self.source(inst.src2, .float32);
+        const result = self.id();
+        try self.emit(&self.body, 12, &.{ // GLSL.std.450 Fma
+            self.float_type,
+            result,
+            self.ensureGlslStd450(),
+            50,
+            a,
+            b,
+            c,
+        });
         try self.destination(inst.dst, .{ .id = result, .value_type = .float32 });
     }
 
@@ -1001,8 +1389,7 @@ const Builder = struct {
         return null;
     }
 
-    /// FragCoord.xy scaled into approximate 0..1 UVs (1280x720 host default;
-    /// fine for bring-up sampling across a 2D texture).
+    /// FragCoord.xy scaled into 0..1 UVs for the active color-target extent.
     fn fragCoordUv(self: *Builder) Error![2]u32 {
         if (self.frag_coord_input == 0 or self.vector4_type == 0) {
             const half = try self.constant(.float32, @bitCast(@as(f32, 0.5)));
@@ -1014,8 +1401,10 @@ const Builder = struct {
         const y = self.id();
         try self.emit(&self.body, 81, &.{ self.float_type, x, coord, 0 }); // OpCompositeExtract
         try self.emit(&self.body, 81, &.{ self.float_type, y, coord, 1 });
-        const inv_w = try self.constant(.float32, @bitCast(@as(f32, 1.0 / 1280.0)));
-        const inv_h = try self.constant(.float32, @bitCast(@as(f32, 1.0 / 720.0)));
+        const width: f32 = @floatFromInt(@max(self.fragment_extent[0], 1));
+        const height: f32 = @floatFromInt(@max(self.fragment_extent[1], 1));
+        const inv_w = try self.constant(.float32, @bitCast(@as(f32, 1.0) / width));
+        const inv_h = try self.constant(.float32, @bitCast(@as(f32, 1.0) / height));
         const u = self.id();
         const v = self.id();
         try self.emit(&self.body, 133, &.{ self.float_type, u, x, inv_w }); // OpFMul
@@ -1110,6 +1499,7 @@ const Builder = struct {
     }
 
     fn consecutiveRegister(op: operand.Operand, delta: u32) Error!operand.Operand {
+        if (delta == 0) return op;
         var result = op;
         if (op.kind == .vgpr) {
             if (op.reg + delta >= 256) return Error.UnsupportedBufferAddressing;
@@ -1207,7 +1597,25 @@ const Builder = struct {
         const soffset = if (binding.soffset_value) |value|
             try self.constant(.bits32, value)
         else switch (inst.src2.kind) {
-            .null, .m0, .vcc_lo, .vcc_hi, .exec_lo, .exec_hi => try self.constant(.bits32, 0),
+            .null,
+            .m0,
+            .vcc_lo,
+            .vcc_hi,
+            .exec_lo,
+            .exec_hi,
+            .ttmp,
+            .flat_scratch_base_lo,
+            .flat_scratch_base_hi,
+            .shared_base,
+            .shared_limit,
+            .private_base,
+            .private_limit,
+            .lds_direct,
+            .vcc_z,
+            .exec_z,
+            .scc,
+            .pops_exiting_wave_id,
+            => try self.constant(.bits32, 0),
             else => try self.source(inst.src2, .bits32),
         };
         byte_offset = try self.addBits(byte_offset, soffset);
@@ -1546,6 +1954,10 @@ const Builder = struct {
     /// half of one would leave the shader believing a value it never received.
     fn lowerExecutionMask(self: *Builder, inst: instruction.Instruction) Error!bool {
         if (inst.dst.kind != .exec_lo) return false;
+        // CMPX is a vector comparison whose destination is EXEC. Lower it like
+        // the matching V_CMP operation so EXECZ/EXECNZ branches can consume the
+        // per-invocation predicate in structured SPIR-V.
+        if (inst.family == .vopc or inst.family == .vop3) return self.stage != .fragment;
         // Only plain s_mov_b64 is modelled; other exec updates are ignored so
         // vertex/pixel translation can continue during bring-up.
         if (inst.opcode != .s_mov_b64) return true;
@@ -1587,20 +1999,64 @@ const Builder = struct {
             break :blk extended;
         };
         self.exec_mask = .{ low, high };
+        try self.destinationPair(inst.dst, .{ low, high });
         return true;
     }
 
+    fn nonExecCompareOpcode(opcode: isa.Opcode) ?isa.Opcode {
+        return switch (opcode) {
+            .v_cmpx_f_f32 => .v_cmp_f_f32,
+            .v_cmpx_lt_f32 => .v_cmp_lt_f32,
+            .v_cmpx_eq_f32 => .v_cmp_eq_f32,
+            .v_cmpx_le_f32 => .v_cmp_le_f32,
+            .v_cmpx_gt_f32 => .v_cmp_gt_f32,
+            .v_cmpx_lg_f32 => .v_cmp_lg_f32,
+            .v_cmpx_ge_f32 => .v_cmp_ge_f32,
+            .v_cmpx_o_f32 => .v_cmp_o_f32,
+            .v_cmpx_u_f32 => .v_cmp_u_f32,
+            .v_cmpx_nge_f32 => .v_cmp_nge_f32,
+            .v_cmpx_nlg_f32 => .v_cmp_nlg_f32,
+            .v_cmpx_ngt_f32 => .v_cmp_ngt_f32,
+            .v_cmpx_nle_f32 => .v_cmp_nle_f32,
+            .v_cmpx_neq_f32 => .v_cmp_neq_f32,
+            .v_cmpx_nlt_f32 => .v_cmp_nlt_f32,
+            .v_cmpx_tru_f32 => .v_cmp_tru_f32,
+            .v_cmpx_lt_i32 => .v_cmp_lt_i32,
+            .v_cmpx_eq_i32 => .v_cmp_eq_i32,
+            .v_cmpx_le_i32 => .v_cmp_le_i32,
+            .v_cmpx_gt_i32 => .v_cmp_gt_i32,
+            .v_cmpx_ne_i32 => .v_cmp_ne_i32,
+            .v_cmpx_ge_i32 => .v_cmp_ge_i32,
+            .v_cmpx_lt_u32 => .v_cmp_lt_u32,
+            .v_cmpx_eq_u32 => .v_cmp_eq_u32,
+            .v_cmpx_le_u32 => .v_cmp_le_u32,
+            .v_cmpx_gt_u32 => .v_cmp_gt_u32,
+            .v_cmpx_ne_u32 => .v_cmp_ne_u32,
+            .v_cmpx_ge_u32 => .v_cmp_ge_u32,
+            else => null,
+        };
+    }
+
     fn snapshot(self: *const Builder) State {
-        return .{ .registers = self.registers, .scc = self.scc, .valid = true };
+        return .{
+            .registers = self.registers,
+            .scc = self.scc,
+            .arithmetic_carry = self.arithmetic_carry,
+            .valid = true,
+        };
     }
 
     fn restore(self: *Builder, state: State) void {
         self.registers = state.registers;
         self.scc = state.scc;
+        self.arithmetic_carry = state.arithmetic_carry;
     }
 
-    fn lower(self: *Builder, inst: instruction.Instruction) Error!void {
-        if (inst.dst.clamp or inst.dst.omod != 0) return Error.UnsupportedOpcode;
+    fn lower(self: *Builder, source_inst: instruction.Instruction) Error!void {
+        var inst = source_inst;
+        if (self.stage == .fragment) {
+            if (nonExecCompareOpcode(inst.opcode)) |opcode| inst.opcode = opcode;
+        }
         if (try self.lowerExecutionMask(inst)) return;
         if (self.specializedScalarDestination(inst)) return;
         // M0 only feeds hardware interpolation/LDS addressing. Those paths
@@ -1609,18 +2065,35 @@ const Builder = struct {
         // entire shader merely to produce a value nobody subsequently reads.
         if (inst.dst.kind == .m0) return;
         switch (inst.opcode) {
-            .s_nop, .s_waitcnt, .s_barrier, .s_inst_prefetch, .s_sendmsg, .s_sleep, .s_ttrace_data, .v_nop, .s_endpgm, .s_wqm_b64 => {},
+            .s_nop, .s_waitcnt, .s_barrier, .s_inst_prefetch, .s_sendmsg, .s_sleep, .s_ttrace_data, .v_nop, .s_endpgm, .s_code_end, .s_wqm_b64 => {},
             // Branches are handled by structured CF or skipped in the linear fallback.
             .s_branch, .s_cbranch_scc0, .s_cbranch_scc1, .s_cbranch_vccz, .s_cbranch_vccnz, .s_cbranch_execz, .s_cbranch_execnz, .s_setpc_b64 => {},
-            .s_mov_b32, .v_mov_b32 => try self.unary(inst, 83, .bits32), // OpCopyObject
+            .s_mov_b32, .s_movk_i32, .v_mov_b32 => try self.unary(inst, 83, .bits32), // OpCopyObject
             .s_mov_b64 => try self.mov64(inst),
+            .s_getpc_b64 => try self.getPcFallback(inst),
+            .s_not_b64 => try self.not64(inst),
+            .s_and_b64,
+            .s_or_b64,
+            .s_xor_b64,
+            .s_andn2_b64,
+            .s_orn2_b64,
+            .s_nand_b64,
+            .s_nor_b64,
+            .s_xnor_b64,
+            => try self.bitwise64(inst, inst.opcode),
+            .s_cselect_b32 => try self.cselect32(inst),
+            .s_cselect_b64 => try self.cselect64(inst),
             .v_cndmask_b32 => try self.cndmask(inst),
             .v_interp_p1_f32, .v_interp_p2_f32, .v_interp_mov_f32 => try self.interpolateParameter(inst),
             .v_cvt_f32_i32 => try self.integerToFloat(inst, true),
             .v_cvt_f32_u32 => try self.integerToFloat(inst, false),
+            .v_cvt_i32_f32 => try self.floatToInteger(inst, true),
+            .v_cvt_u32_f32 => try self.floatToInteger(inst, false),
             // Pack two f32 → two f16 in one dword (Unity PS export path).
             .v_cvt_pkrtz_f16_f32 => try self.packHalf2x16(inst),
-            .s_add_u32, .s_add_i32, .v_add_nc_u32 => try self.binary(inst, 128, .bits32, false), // OpIAdd
+            .s_add_u32 => try self.scalarAddUnsigned(inst, false),
+            .s_addc_u32 => try self.scalarAddUnsigned(inst, true),
+            .s_add_i32, .v_add_nc_u32 => try self.binary(inst, 128, .bits32, false), // OpIAdd
             .v_lshl_add_u32 => try self.shiftLeftAdd(inst),
             // dst = (src0 + src1) << (src2 & 31)
             .v_add_lshl_u32 => try self.addShiftLeft(inst),
@@ -1636,6 +2109,7 @@ const Builder = struct {
             .s_bfe_u64 => try self.unary(inst, 83, .bits32),
             // Ternary packing helpers used heavily by Unity compute kernels.
             .v_and_or_b32 => try self.andOr(inst),
+            .v_bfi_b32 => try self.bitfieldInsert(inst),
             .v_or3_b32 => try self.ternaryBits(inst, 197, 197), // (a|b)|c
             .v_xor3_b32 => try self.ternaryBits(inst, 198, 198), // (a^b)^c
             .v_xad_u32 => try self.ternaryBits(inst, 198, 128), // (a^b)+c
@@ -1647,8 +2121,30 @@ const Builder = struct {
             .v_sub_f32 => try self.binary(inst, 131, .float32, false), // OpFSub
             .v_subrev_f32 => try self.binary(inst, 131, .float32, true),
             .v_mul_f32 => try self.binary(inst, 133, .float32, false), // OpFMul
-            .v_mad_f32 => try self.madFloat(inst),
+            .v_mul_i32_i24 => try self.multiply24(inst, true),
+            .v_mul_u32_u24 => try self.multiply24(inst, false),
+            .v_mad_f32, .v_madmk_f32, .v_madak_f32 => try self.madFloat(inst),
+            .v_fma_f32 => try self.fmaFloat(inst),
             .v_mac_f32 => try self.macFloat(inst),
+            .v_min_f32 => try self.glslBinary(inst, 37, .float32), // FMin
+            .v_min_u32 => try self.glslBinary(inst, 38, .bits32), // UMin
+            .v_min_i32 => try self.glslBinary(inst, 39, .sint32), // SMin
+            .v_max_f32 => try self.glslBinary(inst, 40, .float32), // FMax
+            .v_max_u32 => try self.glslBinary(inst, 41, .bits32), // UMax
+            .v_max_i32 => try self.glslBinary(inst, 42, .sint32), // SMax
+            .v_min3_f32, .v_max3_f32, .v_med3_f32 => try self.minMax3Float(inst, inst.opcode),
+            .v_rcp_f32 => try self.reciprocalFloat(inst),
+            .v_rndne_f32 => try self.glslFloatUnary(inst, 2), // RoundEven
+            .v_trunc_f32 => try self.glslFloatUnary(inst, 3),
+            .v_floor_f32 => try self.glslFloatUnary(inst, 8),
+            .v_ceil_f32 => try self.glslFloatUnary(inst, 9),
+            .v_fract_f32 => try self.glslFloatUnary(inst, 10),
+            .v_sin_f32 => try self.glslFloatUnary(inst, 13),
+            .v_cos_f32 => try self.glslFloatUnary(inst, 14),
+            .v_exp_f32 => try self.glslFloatUnary(inst, 29), // Exp2
+            .v_log_f32 => try self.glslFloatUnary(inst, 30), // Log2
+            .v_sqrt_f32 => try self.glslFloatUnary(inst, 31),
+            .v_rsq_f32 => try self.glslFloatUnary(inst, 32), // InverseSqrt
             .s_lshr_b32, .v_lshr_b32 => try self.binary(inst, 194, .bits32, false), // OpShiftRightLogical
             .v_lshrrev_b32 => try self.binary(inst, 194, .bits32, true),
             .s_ashr_i32, .v_ashr_i32 => try self.binary(inst, 195, .sint32, false), // OpShiftRightArithmetic
@@ -1670,6 +2166,34 @@ const Builder = struct {
             .s_cmp_ge_u32 => try self.comparison(inst, 174, .bits32),
             .s_cmp_lt_u32 => try self.comparison(inst, 176, .bits32),
             .s_cmp_le_u32 => try self.comparison(inst, 178, .bits32),
+            .v_cmp_f_f32 => try self.vectorConstantComparison(inst, false),
+            .v_cmp_lt_f32 => try self.vectorComparison(inst, 184, .float32), // OpFOrdLessThan
+            .v_cmp_eq_f32 => try self.vectorComparison(inst, 180, .float32), // OpFOrdEqual
+            .v_cmp_le_f32 => try self.vectorComparison(inst, 188, .float32), // OpFOrdLessThanEqual
+            .v_cmp_gt_f32 => try self.vectorComparison(inst, 186, .float32), // OpFOrdGreaterThan
+            .v_cmp_lg_f32 => try self.vectorComparison(inst, 182, .float32), // OpFOrdNotEqual
+            .v_cmp_ge_f32 => try self.vectorComparison(inst, 190, .float32), // OpFOrdGreaterThanEqual
+            .v_cmp_o_f32 => try self.vectorOrderedComparison(inst, false),
+            .v_cmp_u_f32 => try self.vectorOrderedComparison(inst, true),
+            .v_cmp_nge_f32 => try self.vectorComparison(inst, 185, .float32), // OpFUnordLessThan
+            .v_cmp_nlg_f32 => try self.vectorComparison(inst, 181, .float32), // OpFUnordEqual
+            .v_cmp_ngt_f32 => try self.vectorComparison(inst, 189, .float32), // OpFUnordLessThanEqual
+            .v_cmp_nle_f32 => try self.vectorComparison(inst, 187, .float32), // OpFUnordGreaterThan
+            .v_cmp_neq_f32 => try self.vectorComparison(inst, 183, .float32), // OpFUnordNotEqual
+            .v_cmp_nlt_f32 => try self.vectorComparison(inst, 191, .float32), // OpFUnordGreaterThanEqual
+            .v_cmp_tru_f32 => try self.vectorConstantComparison(inst, true),
+            .v_cmp_lt_i32 => try self.vectorComparison(inst, 177, .sint32),
+            .v_cmp_eq_i32 => try self.vectorComparison(inst, 170, .sint32),
+            .v_cmp_le_i32 => try self.vectorComparison(inst, 179, .sint32),
+            .v_cmp_gt_i32 => try self.vectorComparison(inst, 173, .sint32),
+            .v_cmp_ne_i32 => try self.vectorComparison(inst, 171, .sint32),
+            .v_cmp_ge_i32 => try self.vectorComparison(inst, 175, .sint32),
+            .v_cmp_lt_u32 => try self.vectorComparison(inst, 176, .bits32),
+            .v_cmp_eq_u32 => try self.vectorComparison(inst, 170, .bits32),
+            .v_cmp_le_u32 => try self.vectorComparison(inst, 178, .bits32),
+            .v_cmp_gt_u32 => try self.vectorComparison(inst, 172, .bits32),
+            .v_cmp_ne_u32 => try self.vectorComparison(inst, 171, .bits32),
+            .v_cmp_ge_u32 => try self.vectorComparison(inst, 174, .bits32),
             .buffer_load_ubyte => try self.bufferLoadSubword(inst, 8, false),
             .buffer_load_sbyte => try self.bufferLoadSubword(inst, 8, true),
             .buffer_load_ushort => try self.bufferLoadSubword(inst, 16, false),
@@ -1681,6 +2205,7 @@ const Builder = struct {
             // shows up in a rejected program.
             .buffer_load_dword,
             .buffer_load_format_x,
+            .tbuffer_load_format_x,
             => try self.bufferLoadWords(inst, 1),
             .buffer_load_dwordx2,
             .buffer_load_format_xy,
@@ -1742,6 +2267,45 @@ const Builder = struct {
     }
 };
 
+fn lowerDiagnosed(builder: *Builder, inst: instruction.Instruction) Error!void {
+    builder.lower(inst) catch |err| {
+        std.debug.print(
+            "[rdna2 spirv] stage={s} pc=0x{x} word=0x{x:0>8} raw1=0x{x:0>8} opcode={s} dst={s}:{d}(clamp={d},omod={d}) src0={s}:{d}(sel={d},abs={d},neg={d},dpp={d}) src1={s}:{d}(sel={d},abs={d},neg={d},dpp={d}) src2={s}:{d}(sel={d},abs={d},neg={d},dpp={d}) error={s}\n",
+            .{
+                @tagName(builder.stage),
+                inst.pc,
+                inst.word,
+                inst.raw[1],
+                @tagName(inst.opcode),
+                @tagName(inst.dst.kind),
+                inst.dst.reg,
+                @intFromBool(inst.dst.clamp),
+                inst.dst.omod,
+                @tagName(inst.src0.kind),
+                inst.src0.reg,
+                inst.src0.sdwa_sel,
+                @intFromBool(inst.src0.absolute),
+                @intFromBool(inst.src0.negate),
+                @intFromBool(inst.src0.dpp),
+                @tagName(inst.src1.kind),
+                inst.src1.reg,
+                inst.src1.sdwa_sel,
+                @intFromBool(inst.src1.absolute),
+                @intFromBool(inst.src1.negate),
+                @intFromBool(inst.src1.dpp),
+                @tagName(inst.src2.kind),
+                inst.src2.reg,
+                inst.src2.sdwa_sel,
+                @intFromBool(inst.src2.absolute),
+                @intFromBool(inst.src2.negate),
+                @intFromBool(inst.src2.dpp),
+                @errorName(err),
+            },
+        );
+        return err;
+    };
+}
+
 fn appendInstruction(allocator: std.mem.Allocator, words: *std.ArrayList(u32), opcode: u16, args: []const u32) Error!void {
     try words.append(allocator, (@as(u32, @intCast(args.len + 1)) << 16) | opcode);
     try words.appendSlice(allocator, args);
@@ -1767,23 +2331,48 @@ fn emitPhi(
     return result;
 }
 
-fn mergeState(
-    builder: *Builder,
-    graph: *const control_flow.Graph,
-    states: []const State,
-    labels: []const u32,
-    block: u32,
-) Error!State {
-    if (block == 0) return .{ .valid = true };
-    var predecessors: std.ArrayList(u32) = .empty;
-    defer predecessors.deinit(builder.allocator);
-    for (graph.edges.items) |edge| {
-        if (edge.to != block) continue;
-        if (edge.from >= block or !states[edge.from].valid) return Error.UnsupportedControlFlow;
-        try predecessors.append(builder.allocator, edge.from);
+fn falseCondition(builder: *Builder) Error!u32 {
+    const result = builder.id();
+    try builder.emit(&builder.body, 170, &.{
+        builder.bool_type,
+        result,
+        try builder.constant(.bits32, 0),
+        try builder.constant(.bits32, 1),
+    }); // OpIEqual(false)
+    return result;
+}
+
+fn structuredCondition(builder: *Builder, condition: control_flow.Condition) Error!u32 {
+    return switch (condition) {
+        .scc => if (builder.scc != 0) builder.scc else try falseCondition(builder),
+        .vcc_zero, .exec_zero => blk: {
+            // Wave-wide EXEC/VCC semantics need a separate compute model. The
+            // scalar per-fragment predicate below is correct for the pixel
+            // path we currently expose, while applying it to workgroups can
+            // send invalid buffer traffic to the driver.
+            if (builder.stage != .fragment) return Error.UnsupportedControlFlow;
+            const index: usize = if (condition == .vcc_zero) 106 else 126;
+            const mask = builder.registers[index];
+            if (mask.id == 0) break :blk try falseCondition(builder);
+            const zero = builder.id();
+            try builder.emit(&builder.body, 170, &.{
+                builder.bool_type,
+                zero,
+                try builder.convert(mask, .bits32),
+                try builder.constant(.bits32, 0),
+            }); // OpIEqual
+            break :blk zero;
+        },
+        .none => return Error.UnsupportedControlFlow,
+    };
+}
+
+fn mergeIncomingStates(builder: *Builder, incoming: []const State, parent_labels: []const u32) Error!State {
+    if (incoming.len == 0 or incoming.len != parent_labels.len) return Error.UnsupportedControlFlow;
+    for (incoming) |state| {
+        if (!state.valid) return Error.UnsupportedControlFlow;
     }
-    if (predecessors.items.len == 0) return Error.UnsupportedControlFlow;
-    if (predecessors.items.len == 1) return states[predecessors.items[0]];
+    if (incoming.len == 1) return incoming[0];
 
     var merged = State{ .valid = true };
     var values: std.ArrayList(Value) = .empty;
@@ -1797,12 +2386,12 @@ fn mergeState(
         var missing = false;
         var differs = false;
         var first = Value{};
-        for (predecessors.items, 0..) |pred, index| {
-            const value = states[pred].registers[reg];
+        for (incoming, 0..) |state, index| {
+            const value = state.registers[reg];
             if (value.id == 0) missing = true;
             if (index == 0) first = value else if (value.id != first.id) differs = true;
             try values.append(builder.allocator, value);
-            try parents.append(builder.allocator, labels[pred]);
+            try parents.append(builder.allocator, parent_labels[index]);
         }
         if (missing) continue;
         merged.registers[reg] = if (!differs)
@@ -1816,12 +2405,12 @@ fn mergeState(
     var missing_scc = false;
     var different_scc = false;
     var first_scc: u32 = 0;
-    for (predecessors.items, 0..) |pred, index| {
-        const id = states[pred].scc;
+    for (incoming, 0..) |state, index| {
+        const id = state.scc;
         if (id == 0) missing_scc = true;
         if (index == 0) first_scc = id else if (id != first_scc) different_scc = true;
         try values.append(builder.allocator, .{ .id = id, .value_type = .bits32 });
-        try parents.append(builder.allocator, labels[pred]);
+        try parents.append(builder.allocator, parent_labels[index]);
     }
     if (!missing_scc) {
         merged.scc = if (!different_scc)
@@ -1829,7 +2418,149 @@ fn mergeState(
         else
             try emitPhi(builder, builder.bool_type, values.items, parents.items);
     }
+
+    values.clearRetainingCapacity();
+    parents.clearRetainingCapacity();
+    var missing_carry = false;
+    var different_carry = false;
+    var first_carry: u32 = 0;
+    for (incoming, 0..) |state, index| {
+        const id = state.arithmetic_carry;
+        if (id == 0) missing_carry = true;
+        if (index == 0) first_carry = id else if (id != first_carry) different_carry = true;
+        try values.append(builder.allocator, .{ .id = id, .value_type = .bits32 });
+        try parents.append(builder.allocator, parent_labels[index]);
+    }
+    if (!missing_carry) {
+        merged.arithmetic_carry = if (!different_carry)
+            first_carry
+        else
+            try emitPhi(builder, builder.bool_type, values.items, parents.items);
+    }
     return merged;
+}
+
+fn mergeState(
+    builder: *Builder,
+    graph: *const control_flow.Graph,
+    states: []const State,
+    labels: []const u32,
+    block: u32,
+) Error!State {
+    // Builder initialization owns the ABI inputs: specialized USER_DATA,
+    // descriptors and any stage-provided registers. Starting the entry block
+    // from an empty State discarded those values only for shaders with CFG,
+    // so their first scalar comparison failed with UndefinedRegister even
+    // though the caller had supplied the SGPR.
+    if (block == 0) return builder.snapshot();
+    var incoming: std.ArrayList(State) = .empty;
+    defer incoming.deinit(builder.allocator);
+    var parents: std.ArrayList(u32) = .empty;
+    defer parents.deinit(builder.allocator);
+    for (graph.edges.items) |edge| {
+        if (edge.to != block) continue;
+        if (edge.from >= block or !states[edge.from].valid) return Error.UnsupportedControlFlow;
+        try incoming.append(builder.allocator, states[edge.from]);
+        try parents.append(builder.allocator, labels[edge.from]);
+    }
+    return mergeIncomingStates(builder, incoming.items, parents.items);
+}
+
+fn buildDominators(builder: *Builder, graph: *const control_flow.Graph) Error![]bool {
+    const block_count = graph.blocks.items.len;
+    const dominators = try builder.allocator.alloc(bool, block_count * block_count);
+    @memset(dominators, false);
+    if (block_count == 0) return dominators;
+    dominators[0] = true;
+
+    for (1..block_count) |block| {
+        var saw_predecessor = false;
+        for (graph.edges.items) |edge| {
+            if (edge.to != block) continue;
+            if (edge.from >= block) {
+                builder.allocator.free(dominators);
+                return Error.UnsupportedControlFlow;
+            }
+            const row = dominators[block * block_count ..][0..block_count];
+            const predecessor_row = dominators[@as(usize, edge.from) * block_count ..][0..block_count];
+            if (!saw_predecessor) {
+                @memcpy(row, predecessor_row);
+                saw_predecessor = true;
+            } else {
+                for (row, predecessor_row) |*value, predecessor_value| value.* = value.* and predecessor_value;
+            }
+        }
+        if (!saw_predecessor) {
+            builder.allocator.free(dominators);
+            return Error.UnsupportedControlFlow;
+        }
+        dominators[block * block_count + block] = true;
+    }
+    return dominators;
+}
+
+fn blockDominates(dominators: []const bool, block_count: usize, dominator: u32, block: u32) bool {
+    return dominators[@as(usize, block) * block_count + dominator];
+}
+
+fn structuredSelectionForEdge(
+    graph: *const control_flow.Graph,
+    dominators: []const bool,
+    source: u32,
+    target: u32,
+) ?usize {
+    const block_count = graph.blocks.items.len;
+    var chosen: ?usize = null;
+    for (graph.selections.items, 0..) |selection, index| {
+        if (selection.merge != target or !blockDominates(dominators, block_count, selection.header, source)) continue;
+        if (chosen == null or blockDominates(
+            dominators,
+            block_count,
+            graph.selections.items[chosen.?].header,
+            selection.header,
+        )) chosen = index;
+    }
+    return chosen;
+}
+
+fn structuredEdgeLabel(
+    graph: *const control_flow.Graph,
+    dominators: []const bool,
+    labels: []const u32,
+    selection_merge_labels: []const u32,
+    source: u32,
+    target: u32,
+) u32 {
+    const selection = structuredSelectionForEdge(graph, dominators, source, target) orelse return labels[target];
+    return selection_merge_labels[selection];
+}
+
+fn structuredSelectionIndex(graph: *const control_flow.Graph, header: u32) ?usize {
+    for (graph.selections.items, 0..) |selection, index| {
+        if (selection.header == header) return index;
+    }
+    return null;
+}
+
+fn structuredSelectionParent(
+    graph: *const control_flow.Graph,
+    dominators: []const bool,
+    selection_index: usize,
+) ?usize {
+    const selection = graph.selections.items[selection_index];
+    const block_count = graph.blocks.items.len;
+    var parent: ?usize = null;
+    for (graph.selections.items, 0..) |candidate, index| {
+        if (index == selection_index or candidate.merge != selection.merge or
+            !blockDominates(dominators, block_count, candidate.header, selection.header)) continue;
+        if (parent == null or blockDominates(
+            dominators,
+            block_count,
+            graph.selections.items[parent.?].header,
+            candidate.header,
+        )) parent = index;
+    }
+    return parent;
 }
 
 fn translateStructured(builder: *Builder, program: *const instruction.Program, graph: *const control_flow.Graph) Error!void {
@@ -1838,13 +2569,93 @@ fn translateStructured(builder: *Builder, program: *const instruction.Program, g
     defer builder.allocator.free(labels);
     labels[0] = builder.label;
     for (labels[1..]) |*label| label.* = builder.id();
+    // SPIR-V forbids two selection headers from naming the same merge block.
+    // Acyclic guest shaders commonly produce if/else-if ladders whose immediate
+    // post-dominator is shared. Give every header a synthetic merge and chain
+    // those blocks from the innermost (latest header) to the outermost.
+    const selection_merge_labels = try builder.allocator.alloc(u32, graph.selections.items.len);
+    defer builder.allocator.free(selection_merge_labels);
+    for (selection_merge_labels) |*label| label.* = builder.id();
+    const dominators = try buildDominators(builder, graph);
+    defer builder.allocator.free(dominators);
     const states = try builder.allocator.alloc(State, graph.blocks.items.len);
     defer builder.allocator.free(states);
     @memset(states, State{});
+    const selection_states = try builder.allocator.alloc(State, graph.selections.items.len);
+    defer builder.allocator.free(selection_states);
+    @memset(selection_states, State{});
 
     for (graph.blocks.items) |block| {
-        try builder.emit(&builder.body, 248, &.{labels[block.index]}); // OpLabel
-        const incoming = try mergeState(builder, graph, states, labels, block.index);
+        var incoming: State = undefined;
+        var has_selection_merge = false;
+        for (graph.selections.items) |selection| {
+            if (selection.merge == block.index) {
+                has_selection_merge = true;
+                break;
+            }
+        }
+        if (has_selection_merge) {
+            // Emit child merges before their parents. Each synthetic block only
+            // receives original edges dominated by that selection plus the
+            // completed states of its immediately nested selections.
+            var index = graph.selections.items.len;
+            while (index != 0) {
+                index -= 1;
+                if (graph.selections.items[index].merge != block.index) continue;
+                try builder.emit(&builder.body, 248, &.{selection_merge_labels[index]}); // OpLabel
+
+                var merge_incoming: std.ArrayList(State) = .empty;
+                defer merge_incoming.deinit(builder.allocator);
+                var merge_parents: std.ArrayList(u32) = .empty;
+                defer merge_parents.deinit(builder.allocator);
+                for (graph.edges.items) |edge| {
+                    if (edge.to != block.index) continue;
+                    const owner = structuredSelectionForEdge(graph, dominators, edge.from, block.index) orelse continue;
+                    if (owner != index or !states[edge.from].valid) continue;
+                    try merge_incoming.append(builder.allocator, states[edge.from]);
+                    try merge_parents.append(builder.allocator, labels[edge.from]);
+                }
+                for (graph.selections.items, 0..) |candidate, child_index| {
+                    if (candidate.merge != block.index) continue;
+                    if (structuredSelectionParent(graph, dominators, child_index) != index) continue;
+                    if (!selection_states[child_index].valid) return Error.UnsupportedControlFlow;
+                    try merge_incoming.append(builder.allocator, selection_states[child_index]);
+                    try merge_parents.append(builder.allocator, selection_merge_labels[child_index]);
+                }
+                const merged = try mergeIncomingStates(builder, merge_incoming.items, merge_parents.items);
+                builder.restore(merged);
+                selection_states[index] = merged;
+                const parent_label = if (structuredSelectionParent(graph, dominators, index)) |parent|
+                    selection_merge_labels[parent]
+                else
+                    labels[block.index];
+                try builder.emit(&builder.body, 249, &.{parent_label}); // OpBranch
+            }
+
+            try builder.emit(&builder.body, 248, &.{labels[block.index]}); // OpLabel
+            var block_incoming: std.ArrayList(State) = .empty;
+            defer block_incoming.deinit(builder.allocator);
+            var block_parents: std.ArrayList(u32) = .empty;
+            defer block_parents.deinit(builder.allocator);
+            for (graph.edges.items) |edge| {
+                if (edge.to != block.index or
+                    structuredSelectionForEdge(graph, dominators, edge.from, block.index) != null) continue;
+                if (!states[edge.from].valid) return Error.UnsupportedControlFlow;
+                try block_incoming.append(builder.allocator, states[edge.from]);
+                try block_parents.append(builder.allocator, labels[edge.from]);
+            }
+            for (graph.selections.items, 0..) |selection, selection_index| {
+                if (selection.merge != block.index or
+                    structuredSelectionParent(graph, dominators, selection_index) != null) continue;
+                if (!selection_states[selection_index].valid) return Error.UnsupportedControlFlow;
+                try block_incoming.append(builder.allocator, selection_states[selection_index]);
+                try block_parents.append(builder.allocator, selection_merge_labels[selection_index]);
+            }
+            incoming = try mergeIncomingStates(builder, block_incoming.items, block_parents.items);
+        } else {
+            try builder.emit(&builder.body, 248, &.{labels[block.index]}); // OpLabel
+            incoming = try mergeState(builder, graph, states, labels, block.index);
+        }
         builder.restore(incoming);
         if (block.index == 0) try builder.initializeStageInputs();
 
@@ -1852,33 +2663,47 @@ fn translateStructured(builder: *Builder, program: *const instruction.Program, g
         const end: usize = first + block.instruction_count;
         const last = program.instructions.items[end - 1];
         for (program.instructions.items[first..end]) |inst| {
-            if (inst.opcode.isBranch() or inst.opcode == .s_endpgm or inst.opcode == .s_setpc_b64) continue;
-            try builder.lower(inst);
+            if (inst.opcode.isBranch() or inst.opcode.isProgramEnd() or inst.opcode == .s_setpc_b64) continue;
+            try lowerDiagnosed(builder, inst);
         }
         states[block.index] = builder.snapshot();
 
-        if (last.opcode == .s_endpgm) {
+        if (last.opcode.isProgramEnd()) {
             try builder.emit(&builder.body, 253, &.{}); // OpReturn
         } else if (last.opcode == .s_branch) {
             const target = graph.blockForPc(last.branch_target) orelse return Error.UnsupportedControlFlow;
-            try builder.emit(&builder.body, 249, &.{labels[target]}); // OpBranch
+            try builder.emit(&builder.body, 249, &.{structuredEdgeLabel(
+                graph,
+                dominators,
+                labels,
+                selection_merge_labels,
+                block.index,
+                target,
+            )}); // OpBranch
         } else if (last.opcode.isBranch()) {
-            const selection = graph.selectionForHeader(block.index) orelse return Error.UnsupportedControlFlow;
-            if (selection.condition != .scc or builder.scc == 0) return Error.UnsupportedControlFlow;
-            var condition = builder.scc;
+            const selection_index = structuredSelectionIndex(graph, block.index) orelse return Error.UnsupportedControlFlow;
+            const selection = graph.selections.items[selection_index];
+            var condition = try structuredCondition(builder, selection.condition);
             if (!selection.branch_when) {
                 const inverted = builder.id();
                 try builder.emit(&builder.body, 168, &.{ builder.bool_type, inverted, condition }); // OpLogicalNot
                 condition = inverted;
             }
-            try builder.emit(&builder.body, 247, &.{ labels[selection.merge], 0 }); // OpSelectionMerge
+            try builder.emit(&builder.body, 247, &.{ selection_merge_labels[selection_index], 0 }); // OpSelectionMerge
             try builder.emit(&builder.body, 250, &.{
                 condition,
-                labels[selection.branch_successor],
-                labels[selection.fallthrough_successor],
+                structuredEdgeLabel(graph, dominators, labels, selection_merge_labels, block.index, selection.branch_successor),
+                structuredEdgeLabel(graph, dominators, labels, selection_merge_labels, block.index, selection.fallthrough_successor),
             });
         } else if (block.index + 1 < graph.blocks.items.len) {
-            try builder.emit(&builder.body, 249, &.{labels[block.index + 1]});
+            try builder.emit(&builder.body, 249, &.{structuredEdgeLabel(
+                graph,
+                dominators,
+                labels,
+                selection_merge_labels,
+                block.index,
+                block.index + 1,
+            )});
         } else {
             return Error.UnsupportedControlFlow;
         }
@@ -1950,7 +2775,7 @@ pub fn translate(allocator: std.mem.Allocator, program: *const instruction.Progr
             .vertex => if (candidate.opcode == .exp and candidate.export_target >= 0x20) {
                 effective.parameter_mask |= @as(u32, 1) << @intCast(candidate.export_target - 0x20);
             },
-            .fragment => switch (candidate.opcode) {
+            .fragment => if (effective.infer_fragment_parameter_mask) switch (candidate.opcode) {
                 .v_interp_p1_f32, .v_interp_p2_f32, .v_interp_mov_f32 => {
                     if (candidate.src1.kind == .integer_inline_constant and candidate.src1.value < 32) {
                         effective.parameter_mask |= @as(u32, 1) << @intCast(candidate.src1.value);
@@ -1962,13 +2787,14 @@ pub fn translate(allocator: std.mem.Allocator, program: *const instruction.Progr
         }
     }
     var builder = try Builder.init(allocator, effective);
-    defer builder.deinit();
+    var builder_alive = true;
+    defer if (builder_alive) builder.deinit();
     var graph = try control_flow.build(allocator, program);
     defer graph.deinit(allocator);
     if (graph.blocks.items.len == 1) {
         try builder.emit(&builder.body, 248, &.{builder.label});
         try builder.initializeStageInputs();
-        for (program.instructions.items) |inst| try builder.lower(inst);
+        for (program.instructions.items) |inst| try lowerDiagnosed(&builder, inst);
         try builder.emit(&builder.body, 253, &.{});
     } else {
         translateStructured(&builder, program, &graph) catch |err| {
@@ -1976,12 +2802,22 @@ pub fn translate(allocator: std.mem.Allocator, program: *const instruction.Progr
             // that skips branches so vertex/pixel programs still produce SPIR-V
             // during bring-up (wrong for divergent paths, enough for a frame).
             if (err != Error.UnsupportedControlFlow) return err;
-            builder.body.clearRetainingCapacity();
+            if (!effective.allow_control_flow_fallback) return err;
+            // Structured lowering may already have created labels, function
+            // values and stage-input loads before discovering an unsupported
+            // branch condition. Reusing that half-built Builder leaves the
+            // linear body referring to IDs whose defining instructions were
+            // cleared, which is invalid SPIR-V and can crash a driver during
+            // pipeline compilation. Restart from the same immutable options.
+            builder.deinit();
+            builder_alive = false;
+            builder = try Builder.init(allocator, effective);
+            builder_alive = true;
             try builder.emit(&builder.body, 248, &.{builder.label});
             try builder.initializeStageInputs();
             for (program.instructions.items) |inst| {
                 if (inst.opcode.isBranch()) continue;
-                builder.lower(inst) catch |e| return e;
+                try lowerDiagnosed(&builder, inst);
             }
             try builder.emit(&builder.body, 253, &.{});
         };
@@ -2047,6 +2883,216 @@ test "straight-line vector ALU translates to a SPIR-V function" {
     try std.testing.expect(containsOpcode(module.words, 253)); // OpReturn
 }
 
+test "float transcendental VOP1 operations use explicit SPIR-V math" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .v_mov_b32,
+        .dst = .{ .kind = .vgpr, .reg = 0 },
+        .src0 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, 1.0)) },
+        .src_count = 1,
+    });
+    inline for ([_]isa.Opcode{
+        .v_rndne_f32, .v_trunc_f32, .v_floor_f32, .v_ceil_f32, .v_fract_f32,
+        .v_sin_f32,   .v_cos_f32,   .v_exp_f32,   .v_log_f32,  .v_sqrt_f32,
+        .v_rsq_f32,
+    }, 0..) |opcode, index| {
+        try program.instructions.append(std.testing.allocator, .{
+            .opcode = opcode,
+            .dst = .{ .kind = .vgpr, .reg = @intCast(index + 1) },
+            .src0 = .{ .kind = .vgpr, .reg = 0 },
+            .src_count = 1,
+        });
+    }
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .v_rcp_f32,
+        .dst = .{ .kind = .vgpr, .reg = 12 },
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .compute });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 11), countOpcode(module.words, 12)); // OpExtInst
+    try std.testing.expect(containsOpcode(module.words, 136)); // OpFDiv
+}
+
+test "literal MAD conversions and min-max lower explicitly" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .v_madak_f32,
+        .dst = .{ .kind = .vgpr, .reg = 1 },
+        .src0 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, 2.0)) },
+        .src1 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, 3.0)) },
+        .src2 = .{ .kind = .literal_constant, .value = @bitCast(@as(f32, 4.0)) },
+        .src_count = 3,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .v_cvt_u32_f32,
+        .dst = .{ .kind = .vgpr, .reg = 2 },
+        .src0 = .{ .kind = .vgpr, .reg = 1 },
+        .src_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .v_min_u32,
+        .dst = .{ .kind = .vgpr, .reg = 3 },
+        .src0 = .{ .kind = .vgpr, .reg = 2 },
+        .src1 = .{ .kind = .integer_inline_constant, .value = 64, .signed_val = 64 },
+        .src_count = 2,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .opcode = .s_endpgm });
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .compute });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 133)); // OpFMul
+    try std.testing.expect(containsOpcode(module.words, 129)); // OpFAdd
+    try std.testing.expect(containsOpcode(module.words, 109)); // OpConvertFToU
+    try std.testing.expect(containsOpcode(module.words, 12)); // UMin via OpExtInst
+}
+
+test "fused multiply-add uses GLSL Fma" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .v_fma_f32,
+        .dst = .{ .kind = .vgpr, .reg = 0 },
+        .src0 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, 2.0)) },
+        .src1 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, 4.0)) },
+        .src2 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, -1.0)) },
+        .src_count = 3,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), countOpcode(module.words, 12));
+    try std.testing.expect(!containsOpcode(module.words, 133)); // no separate multiply
+    try std.testing.expect(!containsOpcode(module.words, 129)); // no separate add
+}
+
+test "floating destination clamp and output modifier lower after arithmetic" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .v_mul_f32,
+        .dst = .{ .kind = .vgpr, .reg = 0, .clamp = true, .omod = 1 },
+        .src0 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, 0.25)) },
+        .src1 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, 4.0)) },
+        .src_count = 2,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 133)); // multiply plus OMOD x2
+    try std.testing.expectEqual(@as(usize, 1), countOpcode(module.words, 12)); // FClamp
+}
+
+test "three-input float min max and median lower explicitly" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    inline for ([_]isa.Opcode{ .v_min3_f32, .v_max3_f32, .v_med3_f32 }, 0..) |opcode, index| {
+        try program.instructions.append(std.testing.allocator, .{
+            .opcode = opcode,
+            .dst = .{ .kind = .vgpr, .reg = @intCast(index) },
+            .src0 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, 1.0)) },
+            .src1 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, 2.0)) },
+            .src2 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, 4.0)) },
+            .src_count = 3,
+        });
+    }
+    try program.instructions.append(std.testing.allocator, .{ .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 8), countOpcode(module.words, 12)); // min3/max3: two, med3: four
+}
+
+test "bitfield insert lowers to mask select operations" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .v_bfi_b32,
+        .dst = .{ .kind = .vgpr, .reg = 0 },
+        .src0 = .{ .kind = .literal_constant, .value = 0x00ff_00ff },
+        .src1 = .{ .kind = .literal_constant, .value = 0x1234_5678 },
+        .src2 = .{ .kind = .literal_constant, .value = 0xabcd_ef01 },
+        .src_count = 3,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 199)); // OpBitwiseAnd
+    try std.testing.expectEqual(@as(usize, 1), countOpcode(module.words, 200)); // OpNot
+    try std.testing.expectEqual(@as(usize, 1), countOpcode(module.words, 197)); // OpBitwiseOr
+}
+
+test "vector comparison writes VCC for a following conditional mask" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .v_cmp_le_f32,
+        .dst = .{ .kind = .vcc_lo },
+        .src0 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, 0.5)) },
+        .src1 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, 1.0)) },
+        .src_count = 2,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .v_cndmask_b32,
+        .dst = .{ .kind = .vgpr, .reg = 0 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 1 },
+        .src1 = .{ .kind = .integer_inline_constant, .value = 2 },
+        .src2 = .{ .kind = .vcc_lo },
+        .src_count = 3,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 188)); // OpFOrdLessThanEqual
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 169)); // mask and cndmask selects
+}
+
+test "64-bit scalar mask operations lower both register halves" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .s_nand_b64,
+        .dst = .{ .kind = .vcc_lo },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 7, .signed_val = 7 },
+        .src1 = .{ .kind = .integer_inline_constant, .value = 3, .signed_val = 3 },
+        .src_count = 2,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .s_andn2_b64,
+        .dst = .{ .kind = .sgpr, .reg = 0 },
+        .src0 = .{ .kind = .vcc_lo },
+        .src1 = .{ .kind = .integer_inline_constant, .value = 1, .signed_val = 1 },
+        .src_count = 2,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .s_cselect_b64,
+        .dst = .{ .kind = .sgpr, .reg = 2 },
+        .src0 = .{ .kind = .vcc_lo },
+        .src1 = .{ .kind = .sgpr, .reg = 0 },
+        .src_count = 2,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 4), countOpcode(module.words, 199)); // two NAND and two ANDN2 halves
+    try std.testing.expectEqual(@as(usize, 4), countOpcode(module.words, 200)); // NAND results and ANDN2 rhs
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 169)); // 64-bit CSELECT halves
+}
+
+test "zero register delta accepts a high mask register" {
+    const same = try Builder.consecutiveRegister(.{ .kind = .vcc_hi }, 0);
+    try std.testing.expectEqual(isa.OperandKind.vcc_hi, same.kind);
+}
+
 test "vector shifts and low unsigned multiply lower to SPIR-V arithmetic" {
     var program = instruction.Program{ .code = &.{}, .instructions = .empty };
     defer program.deinit(std.testing.allocator);
@@ -2089,6 +3135,32 @@ test "vector shifts and low unsigned multiply lower to SPIR-V arithmetic" {
     try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 195)); // OpShiftRightArithmetic
     try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 196)); // OpShiftLeftLogical
     try std.testing.expect(containsOpcode(module.words, 132)); // OpIMul
+}
+
+test "24-bit vector multiply masks or sign extends its inputs" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    inline for ([_]isa.Opcode{ .v_mul_u32_u24, .v_mul_i32_i24 }, 0..) |opcode, index| {
+        try program.instructions.append(std.testing.allocator, .{
+            .opcode = .v_mov_b32,
+            .dst = .{ .kind = .vgpr, .reg = @intCast(index * 2) },
+            .src0 = .{ .kind = .integer_inline_constant, .value = 3, .signed_val = 3 },
+            .src_count = 1,
+        });
+        try program.instructions.append(std.testing.allocator, .{
+            .opcode = opcode,
+            .dst = .{ .kind = .vgpr, .reg = @intCast(index * 2 + 1) },
+            .src0 = .{ .kind = .vgpr, .reg = @intCast(index * 2) },
+            .src1 = .{ .kind = .integer_inline_constant, .value = 7, .signed_val = 7 },
+            .src_count = 2,
+        });
+    }
+    try program.instructions.append(std.testing.allocator, .{ .opcode = .s_endpgm });
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .compute });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 132)); // OpIMul
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 199)); // unsigned masks
+    try std.testing.expect(countOpcode(module.words, 195) >= 2); // signed extension
 }
 
 test "instruction prefetch is a translation no-op" {
@@ -2658,6 +3730,110 @@ test "forward scalar selection lowers with a structured merge and register phi" 
     try std.testing.expect(containsOpcode(module.words, 245)); // OpPhi
 }
 
+test "scalar unsigned add and addc lower carry through SCC" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0x8000_81c1, // s_add_u32 s0, -1, 1 -> SCC=1
+        0x8201_8080, // s_addc_u32 s1, 0, 0 -> 1
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .compute });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(countOpcode(module.words, 128) >= 3); // OpIAdd
+    try std.testing.expect(countOpcode(module.words, 176) >= 3); // OpULessThan carry tests
+    try std.testing.expect(containsOpcode(module.words, 169)); // carry bit OpSelect
+    try std.testing.expect(containsOpcode(module.words, 166)); // combined carry OpLogicalOr
+}
+
+test "structured EXECZ selection consumes a CMPX predicate" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .family = .vopc,
+        .opcode = .v_cmpx_gt_u32,
+        .dst = .{ .kind = .exec_lo },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 2, .signed_val = 2 },
+        .src1 = .{ .kind = .integer_inline_constant, .value = 1, .signed_val = 1 },
+        .src_count = 2,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 4,
+        .family = .sopp,
+        .opcode = .s_cbranch_execz,
+        .branch_target = 12,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 8,
+        .family = .vop1,
+        .opcode = .v_mov_b32,
+        .dst = .{ .kind = .vgpr, .reg = 0 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 1, .signed_val = 1 },
+        .src_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 12, .family = .sopp, .opcode = .s_endpgm });
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 247)); // OpSelectionMerge
+    try std.testing.expect(containsOpcode(module.words, 250)); // OpBranchConditional
+}
+
+test "compute EXECZ selection stays on the wave-safe linear fallback" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .family = .vopc,
+        .opcode = .v_cmpx_gt_u32,
+        .dst = .{ .kind = .exec_lo },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 2, .signed_val = 2 },
+        .src1 = .{ .kind = .integer_inline_constant, .value = 1, .signed_val = 1 },
+        .src_count = 2,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 4,
+        .family = .sopp,
+        .opcode = .s_cbranch_execz,
+        .branch_target = 12,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 8,
+        .family = .vop1,
+        .opcode = .v_mov_b32,
+        .dst = .{ .kind = .vgpr, .reg = 0 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 1, .signed_val = 1 },
+        .src_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 12, .family = .sopp, .opcode = .s_endpgm });
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .compute });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(!containsOpcode(module.words, 247)); // OpSelectionMerge
+}
+
+test "structured entry block retains specialized scalar inputs" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xbf09_8356, // s_cmp_ge_u32 s86, 0
+        0xbf84_0001, // s_cbranch_scc0 -> pc 12
+        0xbf81_0000, // fallthrough end
+        0xbf81_0000, // branch end
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    const scalars = [_]ScalarRegister{.{ .register = 86, .value = 0 }};
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .fragment,
+        .scalar_registers = &scalars,
+        .specialized_scalar_prefix_end = 0x100,
+    });
+    defer module.deinit(std.testing.allocator);
+    // Translation itself is the assertion: before entry-state inheritance the
+    // first comparison returned UndefinedRegister for s86.
+    try std.testing.expect(containsOpcode(module.words, 253)); // OpReturn
+}
+
 test "back edges use the linear fallback until loop structuring is implemented" {
     const decoder = @import("decoder.zig");
     const code = [_]u32{ 0xbf80_0000, 0xbf82_fffe, 0xbf81_0000 };
@@ -2667,6 +3843,51 @@ test "back edges use the linear fallback until loop structuring is implemented" 
     defer module.deinit(std.testing.allocator);
     try std.testing.expect(!containsOpcode(module.words, 246)); // OpLoopMerge
     try std.testing.expect(containsOpcode(module.words, 253)); // OpReturn
+}
+
+test "partial structured lowering restarts a clean linear builder" {
+    const first = instruction.Instruction{
+        .pc = 0,
+        .opcode = .v_mov_b32,
+        .dst = .{ .kind = .vgpr, .reg = 0 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 1, .signed_val = 1 },
+        .src_count = 1,
+    };
+    const second = instruction.Instruction{
+        .pc = 8,
+        .opcode = .v_mov_b32,
+        .dst = .{ .kind = .vgpr, .reg = 1 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 2, .signed_val = 2 },
+        .src_count = 1,
+    };
+    const finish = instruction.Instruction{ .pc = 12, .opcode = .s_endpgm };
+
+    var branched = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer branched.deinit(std.testing.allocator);
+    try branched.instructions.append(std.testing.allocator, first);
+    try branched.instructions.append(std.testing.allocator, .{
+        .pc = 4,
+        .family = .sopp,
+        // The direct branch leaves the following block unreachable. Structured
+        // lowering deliberately rejects that graph after it has already
+        // emitted the entry block, exercising the clean-builder fallback.
+        .opcode = .s_branch,
+        .branch_target = 12,
+    });
+    try branched.instructions.append(std.testing.allocator, second);
+    try branched.instructions.append(std.testing.allocator, finish);
+
+    var straight = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer straight.deinit(std.testing.allocator);
+    try straight.instructions.append(std.testing.allocator, first);
+    try straight.instructions.append(std.testing.allocator, second);
+    try straight.instructions.append(std.testing.allocator, finish);
+
+    var fallback_module = try translate(std.testing.allocator, &branched, .{ .stage = .fragment });
+    defer fallback_module.deinit(std.testing.allocator);
+    var straight_module = try translate(std.testing.allocator, &straight, .{ .stage = .fragment });
+    defer straight_module.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(u32, straight_module.words, fallback_module.words);
 }
 
 test "full destination SDWA lowers source extraction before vector ALU" {

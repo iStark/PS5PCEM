@@ -535,6 +535,30 @@ const UnsupportedMachine = struct {
 const WindowsX64Machine = struct {
     const exception_continue_execution: c_long = -1;
     const exception_noncontinuable: u32 = 0x1;
+    const WindowsMemoryInfo = extern struct {
+        base_address: ?*anyopaque,
+        allocation_base: ?*anyopaque,
+        allocation_protect: u32,
+        partition_id: u16,
+        _padding0: u16,
+        region_size: usize,
+        state: u32,
+        protect: u32,
+        kind: u32,
+        _padding1: u32,
+    };
+
+    extern "kernel32" fn VirtualQuery(
+        address: ?*const anyopaque,
+        info: *WindowsMemoryInfo,
+        length: usize,
+    ) callconv(.winapi) usize;
+
+    fn hostAllocationBase(address: u64) u64 {
+        var info: WindowsMemoryInfo = undefined;
+        if (VirtualQuery(@ptrFromInt(address), &info, @sizeOf(WindowsMemoryInfo)) == 0) return 0;
+        return if (info.allocation_base) |base| @intFromPtr(base) else 0;
+    }
 
     fn isSupported() bool {
         return std.os.windows.IsProcessorFeaturePresent(.RDWRFSGBASE_AVAILABLE);
@@ -725,9 +749,16 @@ const WindowsX64Machine = struct {
                 record.NumberParameters >= 2 and
                 declined_host_access_violations.fetchAdd(1, .monotonic) == 0)
             {
+                const allocation_base = hostAllocationBase(context.Rip);
                 std.debug.print(
-                    "[cpu] unhandled host access violation rip=0x{x} target=0x{x} operation={d}\n",
-                    .{ context.Rip, record.ExceptionInformation[1], record.ExceptionInformation[0] },
+                    "[cpu] unhandled host access violation rip=0x{x} module_base=0x{x} offset=0x{x} target=0x{x} operation={d}\n",
+                    .{
+                        context.Rip,
+                        allocation_base,
+                        context.Rip -| allocation_base,
+                        record.ExceptionInformation[1],
+                        record.ExceptionInformation[0],
+                    },
                 );
             }
             return std.os.windows.EXCEPTION_CONTINUE_SEARCH;

@@ -13,6 +13,7 @@
 //! surface/swapchain presentation path.
 
 const std = @import("std");
+const rdna2 = @import("rdna2");
 const builtin = @import("builtin");
 const gpu = @import("gpu");
 const vk = @import("api.zig");
@@ -123,6 +124,16 @@ pub const Options = struct {
     /// Diagnostic-only fixed shaders used to prove the DCB graphics submission
     /// and color-target path before guest vertex/pixel lowering is connected.
     enable_graphics_probe: bool = false,
+    /// One-shot diagnostic readback after the first guest graphics draw.
+    /// Disabled by default because a 4K target costs roughly 32 MiB of PCIe
+    /// traffic and a queue synchronization.
+    capture_first_graphics_frame: bool = false,
+    /// Replaces translated guest pixel shaders with an opaque diagnostic
+    /// colour while retaining the guest target and pipeline state.
+    force_probe_fragment: bool = false,
+    /// Diagnostic fast path for graphics bring-up. Command processing and
+    /// draws continue, but guest compute dispatches are not submitted.
+    skip_compute_dispatches: bool = false,
     /// Optional Win32 output window. Supplying it enables the required surface
     /// and swapchain extensions and constrains device selection to a queue that
     /// can present to this exact surface.
@@ -973,6 +984,9 @@ pub const Renderer = struct {
     device_info: DeviceInfo,
     validation_enabled: bool,
     graphics_probe_enabled: bool,
+    capture_first_graphics_frame: bool,
+    force_probe_fragment: bool,
+    skip_compute_dispatches: bool,
     guest_memory: ?GuestMemory = null,
     /// Holds a display buffer read straight out of guest memory, for a flip
     /// that names a buffer nothing was rendered into.
@@ -1063,6 +1077,9 @@ pub const Renderer = struct {
     last_interface_fragment_address: u64 = 0,
     reported_interface_pairs: u8 = 0,
     reported_vertex_storage_bindings: bool = false,
+    reported_fragment_storage_bindings: bool = false,
+    reported_first_graphics_draw_checkpoints: bool = false,
+    reported_first_scissor_state: bool = false,
     reported_draw_errors: [16]?anyerror = @splat(null),
     reported_compute_shader_failures: [32]?ComputeShaderFailure = @splat(null),
     last_dispatch_error: ?anyerror = null,
@@ -1312,6 +1329,9 @@ pub const Renderer = struct {
             .device_info = candidate.info,
             .validation_enabled = validation_enabled,
             .graphics_probe_enabled = options.enable_graphics_probe,
+            .capture_first_graphics_frame = options.capture_first_graphics_frame,
+            .force_probe_fragment = options.force_probe_fragment,
+            .skip_compute_dispatches = options.skip_compute_dispatches,
             .window_presentation = window_presentation,
         };
     }
@@ -1999,6 +2019,7 @@ pub const Renderer = struct {
             analysis,
             &scalar,
             specialized_scalar_prefix_end,
+            null,
         );
         var module = analysis.translateSpirv(self.allocator, .{
             .stage = .compute,
@@ -2621,10 +2642,23 @@ pub const Renderer = struct {
         analysis: *const gpu.ShaderAnalysis,
         scalar: *const gpu.ScalarEvaluation,
         specialized_scalar_prefix_end: u32,
+        reserved_resources: ?*const ComputeResources,
     ) anyerror!ComputeResources {
         var result = ComputeResources{};
         result.specialized_scalar_prefix_end = specialized_scalar_prefix_end;
-        const vertex_table = if (bindings.stage != .compute)
+        if (reserved_resources) |reserved| {
+            for (reserved.occupied, 0..) |used, index| {
+                if (!used) continue;
+                result.occupied[index] = true;
+                result.addresses[index] = reserved.addresses[index];
+                result.sizes[index] = reserved.sizes[index];
+            }
+        }
+        const is_vertex_stage = switch (bindings.stage) {
+            .vertex, .geometry, .export_shader, .hull => true,
+            .pixel, .compute => false,
+        };
+        const vertex_table = if (is_vertex_stage)
             (gpu.VertexBindings.capture(bindings, reader) catch null)
         else
             null;
@@ -2642,6 +2676,7 @@ pub const Renderer = struct {
             const descriptor = binding.descriptor.constant_buffer;
             if (descriptor.isNull() or descriptor.size_bytes == 0) continue;
             const size = std.math.cast(usize, descriptor.size_bytes) orelse return Error.GuestBufferTooLarge;
+            if (result.descriptorForRange(descriptor.address, size) != null) continue;
             const descriptor_index: u32 = if (binding.mapping.slot < maximum_storage_descriptors and
                 !result.occupied[binding.mapping.slot])
                 binding.mapping.slot
@@ -2705,7 +2740,7 @@ pub const Renderer = struct {
                 return Error.MissingStorageDescriptor;
             }
             const resource_sgpr = resource_operand.reg;
-            if (bindings.stage == .compute) if (result.mappingForSgpr(resource_sgpr)) |descriptor_index| {
+            if (bindings.stage == .compute or vertex_table == null) if (result.mappingForSgpr(resource_sgpr)) |descriptor_index| {
                 if (is_store) result.writable[descriptor_index] = true;
                 continue;
             };
@@ -2719,6 +2754,14 @@ pub const Renderer = struct {
                     }
                 }
             }
+            // Non-attribute constant/structured buffers use one descriptor per
+            // SGPR. Only actual vertex attributes need a PC-qualified mapping,
+            // because two fetch instructions may pair the same SGPR with
+            // different attribute-table entries.
+            if (vertex_attribute == null) if (result.mappingForSgpr(resource_sgpr)) |descriptor_index| {
+                if (is_store) result.writable[descriptor_index] = true;
+                continue;
+            };
             const descriptor = (if (vertex_attribute) |attribute|
                 takePlausibleBufferDescriptor(attribute.buffer)
             else
@@ -2795,7 +2838,7 @@ pub const Renderer = struct {
             result.mappings[result.mapping_count] = .{
                 .resource_sgpr = resource_sgpr,
                 .descriptor_index = descriptor_index,
-                .instruction_pc = if (bindings.stage == .compute) null else inst.pc,
+                .instruction_pc = if (vertex_attribute != null) inst.pc else null,
                 .soffset_value = if (vertex_attribute) |attribute| attribute.offset_bytes else null,
                 .use_vertex_index = vertex_attribute != null,
                 .stride = descriptor.stride,
@@ -3994,6 +4037,11 @@ pub const Renderer = struct {
         const target_index = try self.acquireRenderTarget(target);
         const cached_snapshot = self.render_targets.items[target_index];
         const frame_bytes = try colorTargetFrameBytes(target);
+        const report_checkpoints = !self.reported_first_graphics_draw_checkpoints;
+        if (report_checkpoints) std.debug.print(
+            "[vulkan dcb] first graphics draw: target ready bytes={d} initialized={any}\n",
+            .{ frame_bytes, cached_snapshot.initialized },
+        );
 
         var initial_upload: ?OwnedBuffer = null;
         defer if (initial_upload) |buffer| self.destroyBuffer(buffer);
@@ -4011,14 +4059,32 @@ pub const Renderer = struct {
             try self.writeMapped(initial_upload.?, frame);
             self.frame_profile.upload_bytes += frame_bytes;
             self.frame_profile.target_upload_bytes += frame_bytes;
+            if (report_checkpoints) std.debug.print("[vulkan dcb] first graphics draw: initial target staged\n", .{});
         }
 
+        if (report_checkpoints) std.debug.print(
+            "[vulkan dcb] first graphics draw: compiling pipeline vs_words={d} ps_words={d}\n",
+            .{ vertex_words.len, fragment_words.len },
+        );
+        if (report_checkpoints) std.debug.print(
+            "[vulkan dcb] first graphics draw: viewport={d}x{d} scissor={d}x{d} discard={d} write=0x{x} blend={d}\n",
+            .{
+                @as(f32, @bitCast(pipeline_state.viewport_width_bits)),
+                @as(f32, @bitCast(pipeline_state.viewport_height_bits)),
+                pipeline_state.scissor_width,
+                pipeline_state.scissor_height,
+                pipeline_state.rasterizer_discard,
+                pipeline_state.color_write_mask,
+                pipeline_state.blend_enable,
+            },
+        );
         const pipeline = try self.getGraphicsPipeline(
             cached_snapshot.render_pass,
             pipeline_state,
             vertex_words,
             fragment_words,
         );
+        if (report_checkpoints) std.debug.print("[vulkan dcb] first graphics draw: pipeline ready\n", .{});
         const command_buffer = try self.beginOneShot();
         defer self.device_functions.free_command_buffers(self.device, self.command_pool, 1, @ptrCast(&command_buffer));
 
@@ -4140,6 +4206,10 @@ pub const Renderer = struct {
         }
         self.device_functions.cmd_end_render_pass(command_buffer);
         try self.submitOneShot(command_buffer);
+        if (report_checkpoints) {
+            std.debug.print("[vulkan dcb] first graphics draw: submitted\n", .{});
+            self.reported_first_graphics_draw_checkpoints = true;
+        }
 
         self.render_target_sequence +%= 1;
         const cached = &self.render_targets.items[target_index];
@@ -4147,6 +4217,13 @@ pub const Renderer = struct {
         cached.gpu_generation +%= 1;
         cached.last_used_sequence = self.render_target_sequence;
         self.latest_render_target_index = target_index;
+        if (report_checkpoints and self.capture_first_graphics_frame) {
+            try self.materializeRenderTarget(target_index);
+            std.debug.print(
+                "[vulkan dcb] first graphics draw: readback colored_pixels={d}\n",
+                .{self.graphics_probe_colored_pixels},
+            );
+        }
     }
 
     fn drawGraphicsShaders(
@@ -4661,6 +4738,24 @@ pub const Renderer = struct {
     ) anyerror!void {
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
         const render_state = gpu.resources.decodeRenderState(state);
+        if (!self.reported_first_scissor_state) {
+            std.debug.print(
+                "[vulkan dcb] first scissor state decoded={any} screen={any}/{any} window={any}/{any} generic={any}/{any} viewport={any}/{any} mode={any}\n",
+                .{
+                    render_state.scissor,
+                    state.readRegister(.context, 0x00c),
+                    state.readRegister(.context, 0x00d),
+                    state.readRegister(.context, 0x081),
+                    state.readRegister(.context, 0x082),
+                    state.readRegister(.context, 0x090),
+                    state.readRegister(.context, 0x091),
+                    state.readRegister(.context, 0x094),
+                    state.readRegister(.context, 0x095),
+                    state.readRegister(.context, 0x292),
+                },
+            );
+            self.reported_first_scissor_state = true;
+        }
         // The current Vulkan attachment path still renders colour target 0
         // only. Preserve depth resource semantics meanwhile: exact HTILE fast
         // clears are materialized into the base depth/stencil allocations so
@@ -4738,30 +4833,39 @@ pub const Renderer = struct {
         const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
         const vertex_analysis = try self.analyzedProgram(reader, vertex_address);
         const fragment_analysis = try self.analyzedProgram(reader, fragment_address);
+        var vertex_export_mask: u64 = 0;
+        var vertex_parameter_mask: u32 = 0;
+        for (vertex_analysis.program.instructions.items) |inst| {
+            if (inst.opcode != .exp) continue;
+            vertex_export_mask |= @as(u64, 1) << inst.export_target;
+            if (inst.export_target >= 0x20) {
+                vertex_parameter_mask |= @as(u32, 1) << @intCast(inst.export_target - 0x20);
+            }
+        }
+        var fragment_attribute_mask: u32 = 0;
+        for (fragment_analysis.program.instructions.items) |inst| {
+            switch (inst.opcode) {
+                .v_interp_p1_f32, .v_interp_p2_f32, .v_interp_mov_f32 => {
+                    if (inst.src1.kind == .integer_inline_constant and inst.src1.value < 32) {
+                        fragment_attribute_mask |= @as(u32, 1) << @intCast(inst.src1.value);
+                    }
+                },
+                else => {},
+            }
+        }
+        // NGG export shaders communicate through LDS and therefore expose no
+        // ordinary PARAM EXP before their continuation is implemented. For the
+        // common single-PARAM fullscreen pass, pair the guest PS with the probe
+        // VS's explicit UV location instead of synthesizing interpolation in PS.
+        const probe_parameter_mask: u32 = if (vertex_parameter_mask == 0 and fragment_attribute_mask == 1) 1 else 0;
+        const paired_parameter_mask = if (probe_parameter_mask != 0)
+            probe_parameter_mask
+        else
+            vertex_parameter_mask & fragment_attribute_mask;
         if (self.reported_interface_pairs < 2 and
             (self.last_interface_vertex_address != vertex_address or
                 self.last_interface_fragment_address != fragment_address))
         {
-            var vertex_export_mask: u64 = 0;
-            var vertex_parameter_mask: u32 = 0;
-            for (vertex_analysis.program.instructions.items) |inst| {
-                if (inst.opcode != .exp) continue;
-                vertex_export_mask |= @as(u64, 1) << inst.export_target;
-                if (inst.export_target >= 0x20) {
-                    vertex_parameter_mask |= @as(u32, 1) << @intCast(inst.export_target - 0x20);
-                }
-            }
-            var fragment_attribute_mask: u32 = 0;
-            for (fragment_analysis.program.instructions.items) |inst| {
-                switch (inst.opcode) {
-                    .v_interp_p1_f32, .v_interp_p2_f32, .v_interp_mov_f32 => {
-                        if (inst.src1.kind == .integer_inline_constant and inst.src1.value < 32) {
-                            fragment_attribute_mask |= @as(u32, 1) << @intCast(inst.src1.value);
-                        }
-                    },
-                    else => {},
-                }
-            }
             std.debug.print(
                 "[vulkan dcb] shader interface VS=0x{x} exports=0x{x} params=0x{x} PS=0x{x} attrs=0x{x}\n",
                 .{ vertex_address, vertex_export_mask, vertex_parameter_mask, fragment_address, fragment_attribute_mask },
@@ -4842,14 +4946,6 @@ pub const Renderer = struct {
         const fragment_scalar_end: u32 = 0x0010_0000;
         var fragment_scalar_regs: [128]gpu.ShaderSpirvScalarRegister = undefined;
         var fragment_scalar_count = collectKnownScalars(&fragment_scalar, &fragment_scalar_regs);
-        // Unity PS loads a float4 scale via s_buffer into s16..; when the
-        // constant buffer could not be resolved at all those registers stay
-        // unknown and every v_mul after the sample would write black. Seed 1.0
-        // for exactly those, so a missing constant buffer is an identity scale.
-        fragment_scalar_count = ensureIdentityFragmentScale(
-            &fragment_scalar_regs,
-            fragment_scalar_count,
-        );
         // T#/S# descriptor payloads select host descriptor-array elements;
         // they are not shader constants. Specializing their changing guest
         // addresses creates a new Vulkan pipeline for every streamed texture.
@@ -4877,6 +4973,7 @@ pub const Renderer = struct {
             vertex_analysis,
             &vertex_scalar_mut,
             vertex_scalar_end,
+            null,
         ) catch |err| blk: {
             if (log_verbose_gpu) std.debug.print(
                 "[vulkan dcb] vertex storage incomplete: {s}; translating without buffers\n",
@@ -4927,10 +5024,55 @@ pub const Renderer = struct {
             .{ vertex_storage.mapping_count, vertex_storage.scalar_count },
         );
 
+        // Pixel shaders use MUBUF/TBUFFER for constant and structured data as
+        // well as sampled images.  Keep their descriptor slots disjoint from
+        // the vertex resources already staged for this draw.
+        var fragment_scalar_mut = fragment_scalar;
+        var fragment_storage = self.prepareComputeResources(
+            &fragment_bindings,
+            reader,
+            fragment_analysis,
+            &fragment_scalar_mut,
+            fragment_scalar_end,
+            &vertex_storage,
+        ) catch |err| blk: {
+            if (log_verbose_gpu) std.debug.print(
+                "[vulkan dcb] fragment storage incomplete: {s}; translating without buffers\n",
+                .{@errorName(err)},
+            );
+            break :blk ComputeResources{};
+        };
+        // Unity PS loads color scales and matrices through s_buffer. Identity
+        // constants are only a fallback for a genuinely missing V#: once the
+        // constant buffer is staged, specializing those destinations would
+        // suppress the real loads and turn complex post-processing black.
+        if (fragment_storage.mapping_count == 0) {
+            fragment_scalar_count = ensureIdentityFragmentScale(
+                &fragment_scalar_regs,
+                fragment_scalar_count,
+            );
+        }
+        for (fragment_storage.mappings[0..fragment_storage.mapping_count]) |mapping| {
+            fragment_scalar_count = removeScalarRegisterRange(
+                &fragment_scalar_regs,
+                fragment_scalar_count,
+                mapping.resource_sgpr,
+                4,
+            );
+        }
+        if (!self.reported_fragment_storage_bindings) {
+            std.debug.print("[vulkan dcb] first fragment storage mappings={d}\n", .{fragment_storage.mapping_count});
+            self.reported_fragment_storage_bindings = true;
+        }
+
         const fragment_translate_started = hostTimestampNs();
         var fragment_module = fragment_analysis.translateSpirv(self.allocator, .{
             .stage = .fragment,
+            .fragment_extent = .{ target.descriptor.width, target.descriptor.height },
             .sampled_images = graphics_resources.mappings[0..graphics_resources.mapping_count],
+            .storage_buffers = fragment_storage.mappings[0..fragment_storage.mapping_count],
+            .parameter_mask = paired_parameter_mask,
+            .infer_fragment_parameter_mask = false,
             .descriptor_array_length = maximum_storage_descriptors,
             .scalar_registers = fragment_scalar_regs[0..fragment_scalar_count],
             .specialized_scalar_prefix_end = fragment_scalar_end,
@@ -4953,11 +5095,15 @@ pub const Renderer = struct {
         };
         self.frame_profile.shader_translate_ns +|= elapsedHostNanoseconds(fragment_translate_started);
         defer fragment_module.deinit(self.allocator);
+        const fragment_words = if (self.force_probe_fragment)
+            graphics_probe_fragment_spirv[0..]
+        else
+            fragment_module.words;
 
         // Prefer the guest VS whenever at least one attribute V# mapped. AGC
         // commonly places it at s0 or s8 as well as s4; requiring one fixed
         // SGPR was what collapsed whole scenes onto the probe triangle.
-        const try_guest_vs = vertex_storage.mapping_count != 0;
+        const try_guest_vs = vertex_storage.mapping_count != 0 and probe_parameter_mask == 0;
         if (try_guest_vs) {
             const vertex_translate_started = hostTimestampNs();
             if (vertex_analysis.translateSpirv(self.allocator, .{
@@ -4981,10 +5127,12 @@ pub const Renderer = struct {
                 );
                 try self.drawGraphicsShaders(
                     vertex_module.words,
-                    fragment_module.words,
+                    fragment_words,
                     pipeline_state,
                     target,
-                    true,
+                    graphics_resources.mapping_count != 0 or
+                        vertex_storage.mapping_count != 0 or
+                        fragment_storage.mapping_count != 0,
                     false,
                     draw,
                 );
@@ -5008,12 +5156,26 @@ pub const Renderer = struct {
                 .{ vertex_storage.mapping_count, graphics_resources.mapping_count },
             );
         }
+        if (probe_parameter_mask != 0) {
+            var probe_vertex_module = try buildFullscreenProbeVertexSpirv(self.allocator);
+            defer probe_vertex_module.deinit(self.allocator);
+            try self.drawGraphicsShaders(
+                probe_vertex_module.words,
+                fragment_words,
+                pipeline_state,
+                target,
+                graphics_resources.mapping_count != 0 or fragment_storage.mapping_count != 0,
+                false,
+                .{ .vertex_count = 3, .instance_count = 1 },
+            );
+            return;
+        }
         try self.drawGraphicsShaders(
             &graphics_probe_vertex_spirv,
-            fragment_module.words,
+            fragment_words,
             pipeline_state,
             target,
-            graphics_resources.mapping_count != 0,
+            graphics_resources.mapping_count != 0 or fragment_storage.mapping_count != 0,
             false,
             .{ .vertex_count = 3, .instance_count = 1 },
         );
@@ -6297,6 +6459,10 @@ pub const Renderer = struct {
         defer self.frame_profile.dispatch_ns +|= elapsedHostNanoseconds(profile_started);
         self.dispatch_callbacks += 1;
         self.frame_profile.dispatches += 1;
+        if (self.skip_compute_dispatches) {
+            self.last_dispatch_error = null;
+            return true;
+        }
         if (packet.opcode != gpu.pm4.dispatch_direct) {
             self.last_dispatch_error = Error.UnsupportedIndirectDispatch;
             std.debug.print("[vulkan dcb] dispatch rejected: {s}\n", .{@errorName(Error.UnsupportedIndirectDispatch)});
@@ -8121,6 +8287,50 @@ fn createWindowPresentation(
         .upload = .{ .handle = upload_handle, .memory = upload_memory, .size = output_bytes },
         .acquire_fence = acquire_fence,
     };
+}
+
+fn buildFullscreenProbeVertexSpirv(allocator: std.mem.Allocator) !rdna2.spirv.Module {
+    const vgpr = struct {
+        fn at(reg: u32) rdna2.Operand {
+            return .{ .kind = .vgpr, .reg = reg };
+        }
+    }.at;
+    const uint = struct {
+        fn value(bits: u32) rdna2.Operand {
+            return .{ .kind = .integer_inline_constant, .value = bits, .signed_val = @intCast(bits) };
+        }
+    }.value;
+    const float = struct {
+        fn value(number: f32) rdna2.Operand {
+            return .{ .kind = .literal_constant, .value = @bitCast(number) };
+        }
+    }.value;
+
+    var program = rdna2.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(allocator);
+    try program.instructions.appendSlice(allocator, &.{
+        // Match SharpEmu's fixed fullscreen vertex mapping exactly:
+        // x=(VertexIndex<<1)&2, y=VertexIndex&2. Position is x/y*2-1,
+        // while PARAM0 carries the unscaled 0..2 fullscreen UV triangle.
+        .{ .pc = 0, .opcode = .v_lshlrev_b32, .dst = vgpr(1), .src0 = uint(1), .src1 = vgpr(0), .src_count = 2 },
+        .{ .pc = 4, .opcode = .v_and_b32, .dst = vgpr(1), .src0 = vgpr(1), .src1 = uint(2), .src_count = 2 },
+        .{ .pc = 8, .opcode = .v_and_b32, .dst = vgpr(2), .src0 = vgpr(0), .src1 = uint(2), .src_count = 2 },
+        .{ .pc = 12, .opcode = .v_cvt_f32_u32, .dst = vgpr(3), .src0 = vgpr(1), .src_count = 1 },
+        .{ .pc = 16, .opcode = .v_cvt_f32_u32, .dst = vgpr(4), .src0 = vgpr(2), .src_count = 1 },
+        .{ .pc = 20, .opcode = .v_mul_f32, .dst = vgpr(1), .src0 = vgpr(3), .src1 = float(2.0), .src_count = 2 },
+        .{ .pc = 24, .opcode = .v_mul_f32, .dst = vgpr(2), .src0 = vgpr(4), .src1 = float(2.0), .src_count = 2 },
+        .{ .pc = 28, .opcode = .v_sub_f32, .dst = vgpr(1), .src0 = vgpr(1), .src1 = float(1.0), .src_count = 2 },
+        .{ .pc = 32, .opcode = .v_sub_f32, .dst = vgpr(2), .src0 = vgpr(2), .src1 = float(1.0), .src_count = 2 },
+        .{ .pc = 36, .opcode = .v_mov_b32, .dst = vgpr(5), .src0 = float(0.0), .src_count = 1 },
+        .{ .pc = 40, .opcode = .v_mov_b32, .dst = vgpr(6), .src0 = float(1.0), .src_count = 1 },
+        .{ .pc = 44, .family = .exp, .opcode = .exp, .export_target = 0x0c, .export_enable = 0xf, .src0 = vgpr(1), .src1 = vgpr(2), .src2 = vgpr(5), .src3 = vgpr(6), .src_count = 4 },
+        .{ .pc = 52, .family = .exp, .opcode = .exp, .export_target = 0x20, .export_enable = 0xf, .export_done = true, .src0 = vgpr(3), .src1 = vgpr(4), .src2 = vgpr(5), .src3 = vgpr(6), .src_count = 4 },
+        .{ .pc = 60, .family = .sopp, .opcode = .s_endpgm },
+    });
+    return rdna2.translateSpirv(allocator, &program, .{
+        .stage = .vertex,
+        .vertex_index_vgpr = 0,
+    });
 }
 
 // Diagnostic vertex shader: three positions selected from VertexIndex and

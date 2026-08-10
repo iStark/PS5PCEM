@@ -176,7 +176,7 @@ fn classify(inst: instruction.Instruction) struct { Operation, ValueType } {
         .image_load, .image_load_mip, .image_store, .image_store_mip, .image_get_resinfo, .image_get_lod, .image_atomic_add, .image_atomic_umin, .image_atomic_umax, .image_atomic_and, .image_atomic_or, .image_atomic_xor, .image_sample, .image_gather4 => .{ .image, .bits32 },
         .v_interp_p1_f32, .v_interp_p2_f32, .v_interp_mov_f32 => .{ .interpolation, .float32 },
         .exp => .{ .export_value, .bits32 },
-        .s_endpgm => .{ .end, .none },
+        .s_endpgm, .s_code_end => .{ .end, .none },
         else => .{ .opaque_instruction, .none },
     };
 }

@@ -184,7 +184,7 @@ pub fn build(allocator: std.mem.Allocator, program: *const instruction.Program) 
                 return Error.InvalidBranchTarget;
             leaders[target] = true;
             if (index + 1 < count) leaders[index + 1] = true;
-        } else if (inst.opcode == .s_endpgm and index + 1 < count) {
+        } else if (inst.opcode.isProgramEnd() and index + 1 < count) {
             leaders[index + 1] = true;
         }
     }
@@ -208,7 +208,7 @@ pub fn build(allocator: std.mem.Allocator, program: *const instruction.Program) 
     for (graph.blocks.items, 0..) |block, block_index| {
         const last_index = block.first_instruction + block.instruction_count - 1;
         const last = program.instructions.items[last_index];
-        if (last.opcode == .s_endpgm or last.opcode == .s_setpc_b64) continue;
+        if (last.opcode.isProgramEnd() or last.opcode == .s_setpc_b64) continue;
 
         if (last.opcode.isBranch()) {
             const target = graph.blockForPc(last.branch_target) orelse return Error.InvalidBranchTarget;
