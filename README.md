@@ -1603,7 +1603,14 @@ scheduler and Vulkan backend. Observed startup work now includes:
   cache recycles its least-recently-used entry instead of dropping later draws
   after reaching its fixed capacity.
 - Compact per-frame profiling replaces high-frequency default logging; verbose
-  resource probes remain opt-in through `log_verbose_gpu`.
+  resource probes remain opt-in through `log_verbose_gpu`. A second profile line
+  reports pipeline and shader-analysis cache behaviour alongside the time spent
+  in scalar provenance, SPIR-V translation, and sampled-resource preparation.
+- Decoded shader programs are held across draws instead of being walked out of
+  guest memory and lowered to IR for every one, and a sampled source is content
+  probed at most once per frame rather than once per draw that binds it. On a
+  50-draw Terminator 2D frame those two, with a pipeline cache large enough to
+  hold the title's variant set, took draw time from 167 ms to 80 ms.
 - `InvalidPitch` rejections are averted by clamping decoded target pitch,
   enabling Vulkan presentation and successful `sceVideoOutSubmitEopFlip`
   completions.

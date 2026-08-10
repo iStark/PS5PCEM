@@ -520,7 +520,17 @@ const OwnedImage = struct {
 const maximum_guest_buffers = maximum_storage_descriptors;
 pub const maximum_storage_descriptors = 64;
 const maximum_compute_pipelines = 256;
-const maximum_graphics_pipelines = 256;
+/// Titles that specialize transform and colour constants reach thousands of
+/// shader variants in seconds: Terminator 2D passes six thousand within a
+/// minute of play. At 256 the cache recycled entries the next frame needed and
+/// every draw paid a driver compile. The bound stays large until those
+/// constants stop being specialized, at which point a title needs one pipeline
+/// per program and this can come back down.
+const maximum_graphics_pipelines = 8192;
+/// Distinct guest shader programs kept in decoded form.
+const maximum_analyzed_programs = 512;
+/// Longest program the decoder will walk before giving up on it.
+const maximum_shader_instructions = 4096;
 const maximum_staged_buffer_bytes = 128 * 1024 * 1024;
 /// Large compute outputs are overwhelmingly GPU-only working sets. Reading
 /// them over PCIe after every dispatch serializes work that remains resident
@@ -731,6 +741,49 @@ const CachedRenderTarget = struct {
     last_used_sequence: u64 = 0,
 };
 
+/// One remembered content probe of a sampled source.
+///
+/// The probe reads a spread of cache lines out of guest memory, and a frame
+/// samples the same few textures from many draws. Repeating the read for every
+/// draw costs more than the comparison it feeds, so the result is remembered
+/// for as long as the source cannot have changed: the same span, and the same
+/// render-target generation behind it.
+const TextureProbe = struct {
+    address: u64 = 0,
+    span: usize = 0,
+    source_generation: u64 = 0,
+    hash: u64 = 0,
+    valid: bool = false,
+};
+
+/// Distinct sampled sources remembered per frame. A title binding more than
+/// this many in one frame simply re-probes the ones that fall out.
+const maximum_texture_probes = 32;
+
+/// Whether guest memory still holds the words a program was decoded from.
+fn programWordsMatch(reader: gpu.ShaderMemoryReader, address: u64, words: []const u32) bool {
+    const expected = std.mem.sliceAsBytes(words);
+    var chunk: [1024]u8 = undefined;
+    var offset: usize = 0;
+    while (offset < expected.len) {
+        const span = @min(chunk.len, expected.len - offset);
+        if (!reader.read_fn(reader.context, address + offset, chunk[0..span])) return false;
+        if (!std.mem.eql(u8, chunk[0..span], expected[offset..][0..span])) return false;
+        offset += span;
+    }
+    return true;
+}
+
+/// One guest shader program in decoded form.
+///
+/// `analysis` owns the words it was decoded from, and those words are what a
+/// later lookup compares against guest memory, so no separate copy is kept.
+const AnalyzedProgram = struct {
+    address: u64,
+    analysis: gpu.ShaderAnalysis,
+    last_used_sequence: u64 = 0,
+};
+
 const FrameProfile = struct {
     draws: u64 = 0,
     dispatches: u64 = 0,
@@ -752,6 +805,16 @@ const FrameProfile = struct {
     resident_storage_bytes: u64 = 0,
     render_target_hits: u64 = 0,
     render_target_misses: u64 = 0,
+    graphics_pipeline_hits: u64 = 0,
+    graphics_pipeline_misses: u64 = 0,
+    graphics_pipeline_build_ns: u64 = 0,
+    shader_analysis_hits: u64 = 0,
+    shader_analysis_misses: u64 = 0,
+    shader_analysis_ns: u64 = 0,
+    scalar_provenance_ns: u64 = 0,
+    shader_translate_ns: u64 = 0,
+    graphics_resource_ns: u64 = 0,
+    texture_probe_ns: u64 = 0,
 
     fn reset(self: *FrameProfile) void {
         self.* = .{};
@@ -891,6 +954,13 @@ pub const Renderer = struct {
     compute_pipelines: std.ArrayList(ComputePipelineEntry) = .empty,
     graphics_pipelines: std.ArrayList(GraphicsPipelineEntry) = .empty,
     sampled_image_cache: std.ArrayList(CachedSampledImage) = .empty,
+    /// Decoded shader programs, held across draws. Its capacity is reserved
+    /// once so entries never move: callers hold `*const Analysis` into it for
+    /// the length of a draw.
+    analyzed_programs: std.ArrayList(AnalyzedProgram) = .empty,
+    analyzed_program_sequence: u64 = 0,
+    texture_probes: [maximum_texture_probes]TextureProbe = @splat(.{}),
+    texture_probe_count: usize = 0,
     texture_cache_hits: u64 = 0,
     texture_cache_misses: u64 = 0,
     active_descriptor_set: ?vk.DescriptorSet = null,
@@ -1237,6 +1307,8 @@ pub const Renderer = struct {
             self.allocator.free(entry.fragment_words);
         }
         self.graphics_pipelines.deinit(self.allocator);
+        for (self.analyzed_programs.items) |*entry| entry.analysis.deinit(self.allocator);
+        self.analyzed_programs.deinit(self.allocator);
         for (self.completed_frames.items) |*frame| frame.pixels.deinit(self.allocator);
         self.completed_frames.deinit(self.allocator);
         self.guest_frame_scratch.deinit(self.allocator);
@@ -1810,8 +1882,7 @@ pub const Renderer = struct {
     ) anyerror!DispatchReport {
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
         const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
-        var analysis = try gpu.shader_analysis.decode(self.allocator, reader, program_address, 4096);
-        defer analysis.deinit(self.allocator);
+        const analysis = try self.analyzedProgram(reader, program_address);
         var module = try analysis.translateSpirv(self.allocator, .{ .stage = .compute, .local_size = local_size });
         defer module.deinit(self.allocator);
         return self.dispatchSpirv(module.words, group_count);
@@ -1838,12 +1909,11 @@ pub const Renderer = struct {
             null;
         const bindings = try gpu.ShaderBindings.capture(state, .compute, header_address, reader);
         const system_registers = gpu.resources.decodeComputeSystemRegisters(state);
-        var analysis = try gpu.shader_analysis.decode(self.allocator, reader, program_address, 4096);
-        defer analysis.deinit(self.allocator);
+        const analysis = try self.analyzedProgram(reader, program_address);
         if (try self.tryEmulateGdsInitialization(
             memory,
             state,
-            &analysis,
+            analysis,
             system_registers,
             local_size,
             group_count,
@@ -1851,7 +1921,7 @@ pub const Renderer = struct {
         if (try self.tryEmulateBufferCopy(
             memory,
             state,
-            &analysis,
+            analysis,
             system_registers,
             local_size,
             group_count,
@@ -1860,7 +1930,7 @@ pub const Renderer = struct {
             memory,
             &bindings,
             reader,
-            &analysis,
+            analysis,
             system_registers,
             local_size,
             group_count,
@@ -1869,7 +1939,7 @@ pub const Renderer = struct {
             memory,
             &bindings,
             reader,
-            &analysis,
+            analysis,
             system_registers,
             local_size,
             group_count,
@@ -1888,12 +1958,12 @@ pub const Renderer = struct {
             );
             return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
         }
-        const specialized_scalar_prefix_end = scalarPrefixEnd(&analysis);
+        const specialized_scalar_prefix_end = scalarPrefixEnd(analysis);
         const scalar = gpu.scalar_provenance.evaluatePrefixUntil(reader, &bindings, specialized_scalar_prefix_end);
         var resources = try self.prepareComputeResources(
             &bindings,
             reader,
-            &analysis,
+            analysis,
             &scalar,
             specialized_scalar_prefix_end,
         );
@@ -3133,6 +3203,112 @@ pub const Renderer = struct {
         return pipeline;
     }
 
+    /// The decoded form of one guest shader program, reused across draws.
+    ///
+    /// Decoding walks the instruction stream a word at a time out of guest
+    /// memory and then lowers it to IR. That result depends on the program's
+    /// own bytes and nothing else, so repeating it for every draw of the same
+    /// shader is pure cost. A candidate is confirmed by comparing the words it
+    /// was decoded from against guest memory, which is a bulk read and a
+    /// compare rather than a decode; a program rebuilt at the same address is
+    /// therefore picked up instead of being served stale.
+    ///
+    /// The returned pointer stays valid for the caller's draw: capacity is
+    /// reserved up front so entries never move, and the entry just returned
+    /// carries the newest sequence, so a later miss in the same draw cannot
+    /// choose it as the least-recently-used victim.
+    fn analyzedProgram(
+        self: *Renderer,
+        reader: gpu.ShaderMemoryReader,
+        address: u64,
+    ) anyerror!*const gpu.ShaderAnalysis {
+        self.analyzed_program_sequence +%= 1;
+        var stale_index: ?usize = null;
+        for (self.analyzed_programs.items, 0..) |*entry, index| {
+            if (entry.address != address) continue;
+            if (programWordsMatch(reader, address, entry.analysis.code.items)) {
+                entry.last_used_sequence = self.analyzed_program_sequence;
+                self.frame_profile.shader_analysis_hits += 1;
+                return &entry.analysis;
+            }
+            stale_index = index;
+            break;
+        }
+
+        const started = hostTimestampNs();
+        var analysis = try gpu.shader_analysis.decode(
+            self.allocator,
+            reader,
+            address,
+            maximum_shader_instructions,
+        );
+        errdefer analysis.deinit(self.allocator);
+        self.frame_profile.shader_analysis_ns +|= elapsedHostNanoseconds(started);
+        self.frame_profile.shader_analysis_misses += 1;
+        const replacement = AnalyzedProgram{
+            .address = address,
+            .analysis = analysis,
+            .last_used_sequence = self.analyzed_program_sequence,
+        };
+
+        const slot = stale_index orelse blk: {
+            if (self.analyzed_programs.items.len < maximum_analyzed_programs) {
+                try self.analyzed_programs.ensureTotalCapacity(self.allocator, maximum_analyzed_programs);
+                self.analyzed_programs.appendAssumeCapacity(replacement);
+                return &self.analyzed_programs.items[self.analyzed_programs.items.len - 1].analysis;
+            }
+            var oldest_index: usize = 0;
+            var oldest_sequence = self.analyzed_programs.items[0].last_used_sequence;
+            for (self.analyzed_programs.items[1..], 1..) |entry, index| {
+                if (entry.last_used_sequence >= oldest_sequence) continue;
+                oldest_index = index;
+                oldest_sequence = entry.last_used_sequence;
+            }
+            break :blk oldest_index;
+        };
+        const victim = &self.analyzed_programs.items[slot];
+        victim.analysis.deinit(self.allocator);
+        victim.* = replacement;
+        return &victim.analysis;
+    }
+
+    /// The content probe of one sampled source, taken at most once per frame
+    /// per source. See `TextureProbe`.
+    fn probeSampledSource(
+        self: *Renderer,
+        memory: GuestMemory,
+        address: u64,
+        span: usize,
+        source_generation: u64,
+    ) u64 {
+        for (self.texture_probes[0..self.texture_probe_count]) |probe| {
+            if (!probe.valid or probe.address != address or probe.span != span) continue;
+            if (probe.source_generation != source_generation) break;
+            return probe.hash;
+        }
+        const started = hostTimestampNs();
+        const hash = hashGuestMemoryRange(memory, address, span);
+        self.frame_profile.texture_probe_ns +|= elapsedHostNanoseconds(started);
+
+        const entry = TextureProbe{
+            .address = address,
+            .span = span,
+            .source_generation = source_generation,
+            .hash = hash,
+            .valid = true,
+        };
+        for (self.texture_probes[0..self.texture_probe_count]) |*probe| {
+            if (probe.address != address or probe.span != span) continue;
+            probe.* = entry;
+            return hash;
+        }
+        if (self.texture_probe_count < self.texture_probes.len) {
+            self.texture_probes[self.texture_probe_count] = entry;
+            self.texture_probe_count += 1;
+        }
+        return hash;
+    }
+
     fn getGraphicsPipeline(
         self: *Renderer,
         render_pass: vk.RenderPass,
@@ -3151,6 +3327,7 @@ pub const Renderer = struct {
                 std.mem.eql(u32, entry.fragment_words, fragment_words))
             {
                 self.graphics_pipeline_cache_hits += 1;
+                self.frame_profile.graphics_pipeline_hits += 1;
                 entry.last_used_sequence = self.graphics_pipeline_sequence;
                 return entry.pipeline;
             }
@@ -3159,7 +3336,9 @@ pub const Renderer = struct {
         errdefer self.allocator.free(owned_vertex);
         const owned_fragment = try self.allocator.dupe(u32, fragment_words);
         errdefer self.allocator.free(owned_fragment);
+        const build_started = hostTimestampNs();
         const pipeline = try self.createGraphicsPipeline(render_pass, pipeline_state, vertex_words, fragment_words);
+        self.frame_profile.graphics_pipeline_build_ns +|= elapsedHostNanoseconds(build_started);
         errdefer self.device_functions.destroy_pipeline(self.device, pipeline, null);
         const replacement = GraphicsPipelineEntry{
             .hash = hash,
@@ -3190,6 +3369,7 @@ pub const Renderer = struct {
             victim.* = replacement;
         }
         self.graphics_pipeline_cache_misses += 1;
+        self.frame_profile.graphics_pipeline_misses += 1;
         return pipeline;
     }
 
@@ -4181,10 +4361,8 @@ pub const Renderer = struct {
             return Error.MissingGraphicsProgram;
         };
         const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
-        var vertex_analysis = try gpu.shader_analysis.decode(self.allocator, reader, vertex_address, 4096);
-        defer vertex_analysis.deinit(self.allocator);
-        var fragment_analysis = try gpu.shader_analysis.decode(self.allocator, reader, fragment_address, 4096);
-        defer fragment_analysis.deinit(self.allocator);
+        const vertex_analysis = try self.analyzedProgram(reader, vertex_address);
+        const fragment_analysis = try self.analyzedProgram(reader, fragment_address);
         if (self.reported_interface_pairs < 2 and
             (self.last_interface_vertex_address != vertex_address or
                 self.last_interface_fragment_address != fragment_address))
@@ -4234,18 +4412,22 @@ pub const Renderer = struct {
             null;
         const vertex_bindings = try gpu.ShaderBindings.capture(state, vertex_stage, vertex_header, reader);
         const fragment_bindings = try gpu.ShaderBindings.capture(state, .pixel, fragment_header, reader);
+        const resource_started = hostTimestampNs();
         var graphics_resources = try self.prepareGraphicsResources(
             &fragment_bindings,
             reader,
-            &fragment_analysis,
+            fragment_analysis,
         );
+        self.frame_profile.graphics_resource_ns +|= elapsedHostNanoseconds(resource_started);
         defer graphics_resources.deinit(self);
 
         // Full scalar evaluation (not only the straight prolog cut): vertex
         // programs interleave SMEM loads after a few VALU ops, and those SGPRs
         // must be constants in SPIR-V rather than live s_load (no host pointer
         // load path yet). Specialize every known SGPR across the whole program.
+        const vertex_provenance_started = hostTimestampNs();
         const vertex_scalar = gpu.scalar_provenance.evaluatePrefix(reader, &vertex_bindings);
+        self.frame_profile.scalar_provenance_ns +|= elapsedHostNanoseconds(vertex_provenance_started);
         const vertex_scalar_end: u32 = 0x0010_0000;
         var vertex_scalar_regs: [128]gpu.ShaderSpirvScalarRegister = undefined;
         var vertex_scalar_count = collectKnownScalars(&vertex_scalar, &vertex_scalar_regs);
@@ -4273,13 +4455,15 @@ pub const Renderer = struct {
         vertex_scalar_count = seedVertexBufferScalars(
             &vertex_bindings,
             reader,
-            &vertex_analysis,
+            vertex_analysis,
             &vertex_scalar_regs,
             vertex_scalar_count,
             &vertex_scalar_mut,
         );
 
+        const fragment_provenance_started = hostTimestampNs();
         const fragment_scalar = gpu.scalar_provenance.evaluatePrefix(reader, &fragment_bindings);
+        self.frame_profile.scalar_provenance_ns +|= elapsedHostNanoseconds(fragment_provenance_started);
         const fragment_scalar_end: u32 = 0x0010_0000;
         var fragment_scalar_regs: [128]gpu.ShaderSpirvScalarRegister = undefined;
         var fragment_scalar_count = collectKnownScalars(&fragment_scalar, &fragment_scalar_regs);
@@ -4315,7 +4499,7 @@ pub const Renderer = struct {
         var vertex_storage = self.prepareComputeResources(
             &vertex_bindings,
             reader,
-            &vertex_analysis,
+            vertex_analysis,
             &vertex_scalar_mut,
             vertex_scalar_end,
         ) catch |err| blk: {
@@ -4368,6 +4552,7 @@ pub const Renderer = struct {
             .{ vertex_storage.mapping_count, vertex_storage.scalar_count },
         );
 
+        const fragment_translate_started = hostTimestampNs();
         var fragment_module = fragment_analysis.translateSpirv(self.allocator, .{
             .stage = .fragment,
             .sampled_images = graphics_resources.mappings[0..graphics_resources.mapping_count],
@@ -4386,11 +4571,12 @@ pub const Renderer = struct {
                         fragment_scalar_end,
                     },
                 );
-                dumpShaderHead(&fragment_analysis, 16);
+                dumpShaderHead(fragment_analysis, 16);
                 dumpScalarRegisters(fragment_scalar_regs[0..fragment_scalar_count]);
             }
             return err;
         };
+        self.frame_profile.shader_translate_ns +|= elapsedHostNanoseconds(fragment_translate_started);
         defer fragment_module.deinit(self.allocator);
 
         // Prefer the guest VS whenever at least one attribute V# mapped. AGC
@@ -4398,6 +4584,7 @@ pub const Renderer = struct {
         // SGPR was what collapsed whole scenes onto the probe triangle.
         const try_guest_vs = vertex_storage.mapping_count != 0;
         if (try_guest_vs) {
+            const vertex_translate_started = hostTimestampNs();
             if (vertex_analysis.translateSpirv(self.allocator, .{
                 .stage = .vertex,
                 .vertex_index_vgpr = 0,
@@ -4406,6 +4593,7 @@ pub const Renderer = struct {
                 .storage_buffers = vertex_storage.mappings[0..vertex_storage.mapping_count],
                 .descriptor_array_length = maximum_storage_descriptors,
             })) |vertex_module_owned| {
+                self.frame_profile.shader_translate_ns +|= elapsedHostNanoseconds(vertex_translate_started);
                 var vertex_module = vertex_module_owned;
                 defer vertex_module.deinit(self.allocator);
                 if (log_verbose_gpu) std.debug.print(
@@ -4436,7 +4624,7 @@ pub const Renderer = struct {
                         "[vulkan dcb] vertex program 0x{x} ({s}): translate={s}; falling back to probe VS\n",
                         .{ vertex_address, @tagName(vertex_stage), @errorName(err) },
                     );
-                    dumpShaderHead(&vertex_analysis, vertex_analysis.program.instructions.items.len);
+                    dumpShaderHead(vertex_analysis, vertex_analysis.program.instructions.items.len);
                 }
             }
         } else {
@@ -4679,9 +4867,14 @@ pub const Renderer = struct {
             return err;
         };
 
-        const content_hash = hashGuestMemoryRange(memory, descriptor.address, probe_span);
         const state_hash = sampledImageStateHash(descriptor, sampler_descriptor);
         const source_generation = self.sampledSourceGeneration(descriptor.address);
+        const content_hash = self.probeSampledSource(
+            memory,
+            descriptor.address,
+            probe_span,
+            source_generation,
+        );
 
         var cache_hit_idx: ?usize = null;
         for (self.sampled_image_cache.items, 0..) |*item, idx| {
@@ -5371,6 +5564,23 @@ pub const Renderer = struct {
                     self.sampled_image_cache.items.len,
                 },
             );
+            std.debug.print(
+                "[gpu shaders] flip={d} pso_hit={d} pso_miss={d}/{d}ms pso_cache={d} sa_hit={d} sa_miss={d}/{d}ms prov_ms={d} xlat_ms={d} res_ms={d} probe_ms={d}\n",
+                .{
+                    self.flip_callbacks,
+                    profile.graphics_pipeline_hits,
+                    profile.graphics_pipeline_misses,
+                    profile.graphics_pipeline_build_ns / std.time.ns_per_ms,
+                    self.graphics_pipelines.items.len,
+                    profile.shader_analysis_hits,
+                    profile.shader_analysis_misses,
+                    profile.shader_analysis_ns / std.time.ns_per_ms,
+                    profile.scalar_provenance_ns / std.time.ns_per_ms,
+                    profile.shader_translate_ns / std.time.ns_per_ms,
+                    profile.graphics_resource_ns / std.time.ns_per_ms,
+                    profile.texture_probe_ns / std.time.ns_per_ms,
+                },
+            );
         }
         self.frame_profile.reset();
     }
@@ -5417,6 +5627,8 @@ pub const Renderer = struct {
         const self = fromContext(context);
         self.flip_callbacks += 1;
         defer self.reportFrameProfile();
+        // Content probes only hold within the frame they were taken in.
+        defer self.texture_probe_count = 0;
         if (log_verbose_gpu) std.debug.print(
             "[vulkan dcb] flip #{d} buffer={d} video_out={d} completed_frames={d}\n",
             .{ self.flip_callbacks, flip.display_buffer_index, flip.video_out_handle, self.completed_frames.items.len },
