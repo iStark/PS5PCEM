@@ -107,6 +107,7 @@ the repository contains none of that content.
 | **Pistol Whip** | Maps the native PS VR2 plugin and Burst module, then starts loading Unity asset archives | Headset, tracking, controller, and host OpenXR support are intentionally deferred |
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
 | **Tetris Effect: Connected** | Completes Unreal filesystem/config bootstrap, executes compact typed UAV clears and 3D volume uploads, translates two 344/125-instruction volume dispatches with recursively recovered V# chains, and translates the complete 176-instruction mixed-image/LDS prepass, including compute `image_sample_lz` at PC `0x29c` and NSA `image_store` at PC `0x440`; its 2,401-instruction deferred compositor writes all 8,294,400 pixels of the 3840×2160 scanout | The first repeatable guest framebuffer is uniform light gray rather than a recognizable scene; a normal run currently produces an NVIDIA GPU fault during an earlier `15×9×8` dispatch, while NGG export and some image forms remain incomplete and the 512 GiB reservation can depend on host address-space placement |
+| **The Precinct** | Links the complete six-image guest graph, enters Unity, initializes AudioOut and the asset-backed audio index, reports the baseline PS5 operation mode, uploads the 1920×1080 `RGBA16_FLOAT` sampled surface, builds the first guest graphics pipelines, and sustains a warmed-up 14–19 ms frame loop on the current test host | The captured scanout is still black; one early color-target pre-pass is unsupported and the rendered scene source is not yet populated correctly |
 
 ## Components
 
@@ -353,7 +354,10 @@ local invocation index rather than a compute-only builtin. The current MIMG
 path lowers normalized 2D `image_sample` through the combined sampled-image
 descriptor array for fragment programs. Compute programs additionally support
 the observed `image_sample_lz` form with explicit LOD 0, including NSA
-coordinates and per-instruction recovery of reused T#/S# SGPRs.
+coordinates and per-instruction recovery of reused T#/S# SGPRs. Sampled-image
+staging detiles both `RGBA8_UNORM` and `RGBA16_FLOAT` surfaces into matching
+Vulkan formats; the unified format is part of the cache key so aliases cannot
+reuse an incompatible image view.
 Compressed/masked exports, additional MRT targets, non-trivial image operands,
 and the remaining graphics system VGPRs are still incomplete.
 
@@ -1349,7 +1353,10 @@ libkernel bridge plus `libSceLibcInternalExt` and `libSceSysmodule`. Data import
 such as `__stack_chk_guard` and `__progname` are registered as storage addresses,
 not function stubs. Runtime hooks provide per-thread errno/TLS, clocks, sleep,
 process parameters, process `argc`/`argv`, sized empty sanitizer callback
-tables, and rtld callbacks.
+tables, and rtld callbacks. `libSceLibcInternalExt` also keeps the fixed-capacity
+per-thread LIFO used by `__cxa_thread_atexit` and invokes registered guest
+destructors through the current-thread callback bridge during forced TLS and
+process-exit finalization.
 Only anomalously long synchronous host GPU execution is excluded from the
 emulated process clock while an AGC submit is active. The first 100 ms of every
 submit remains visible to the guest, so ordinary multi-submit frames advance

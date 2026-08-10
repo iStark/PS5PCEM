@@ -45,6 +45,13 @@ pub const user_id: i32 = 1;
 /// baseline part, which is the model a title is always prepared for.
 pub const main_soc_id: u32 = 0;
 
+/// The ordinary PS5 execution mode and its baseline submode.
+///
+/// Enhanced and compatibility modes change which hardware paths a title
+/// selects. Report neither until those differences are emulated.
+pub const operation_mode: i32 = 0;
+pub const operation_submode: i32 = 0;
+
 /// Reported as the SDK the title was built against, and as the firmware it is
 /// running on, in the packed `0xMMmmpppp` form these values use.
 ///
@@ -147,6 +154,19 @@ fn getCurrentCpu() callconv(abi.guest) i32 {
     return 0;
 }
 
+/// Reports the hardware execution mode selected for this process.
+///
+/// Both values describe one answer, so validate both destinations before
+/// writing either of them. This also keeps a failed call from leaving the
+/// guest with a half-updated pair.
+fn getOperationMode(mode: ?*i32, submode: ?*i32) callconv(abi.guest) i32 {
+    const mode_output = mode orelse return KernelError.einval.raw();
+    const submode_output = submode orelse return KernelError.einval.raw();
+    mode_output.* = operation_mode;
+    submode_output.* = operation_submode;
+    return errno.ok;
+}
+
 fn getCompiledSdkVersion() callconv(abi.guest) u32 {
     return sdk_version;
 }
@@ -224,6 +244,7 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceKernelIsNeoMode", .function = trace.wrap("sceKernelIsNeoMode", &isNeoMode), .expect_id = "WslcK1FQcGI" },
     .{ .name = "sceKernelGetMainSocId", .function = trace.wrap("sceKernelGetMainSocId", &getMainSocId), .expect_id = "0vTn5IDMU9A" },
     .{ .name = "sceKernelGetCurrentCpu", .function = trace.wrap("sceKernelGetCurrentCpu", &getCurrentCpu), .expect_id = "g0VTBxfJyu0" },
+    .{ .name = "sceKernelGetOperationMode", .function = trace.wrap("sceKernelGetOperationMode", &getOperationMode), .expect_id = "NH6xARDOVv8" },
     .{ .name = "sceKernelGetCompiledSdkVersion", .function = trace.wrap("sceKernelGetCompiledSdkVersion", &getCompiledSdkVersion), .expect_id = "WB66evu8bsU" },
     .{ .name = "sceKernelGetProsperoCompiledSdkVersion", .function = trace.wrap("sceKernelGetProsperoCompiledSdkVersion", &getCompiledSdkVersion), .expect_id = "GGeRJk1XdWc" },
     .{ .name = "sceKernelGetProsperoSystemSwVersion", .function = trace.wrap("sceKernelGetProsperoSystemSwVersion", &getSystemSwVersion), .expect_id = "aML18Z0J0t0" },
@@ -264,6 +285,14 @@ test "machine facts are reported consistently" {
     try testing.expectEqual(process_id, getPid());
     try testing.expectEqual(user_id, getUid());
     try testing.expect(getPid() != 0);
+
+    var mode: i32 = -1;
+    var submode: i32 = -1;
+    try testing.expectEqual(errno.ok, getOperationMode(&mode, &submode));
+    try testing.expectEqual(operation_mode, mode);
+    try testing.expectEqual(operation_submode, submode);
+    try testing.expectEqual(KernelError.einval.raw(), getOperationMode(null, &submode));
+    try testing.expectEqual(KernelError.einval.raw(), getOperationMode(&mode, null));
 }
 
 test "a record whose layout is unknown is refused rather than guessed" {
@@ -313,5 +342,6 @@ test "machine-info exports register under published identifiers" {
     try register(&db, testing.allocator);
     try testing.expectEqual(exports.len, db.count());
     try testing.expect(db.findByName("sceKernelIsNeoMode", .function) != null);
+    try testing.expect(db.findByName("sceKernelGetOperationMode", .function) != null);
     try testing.expect(db.findByName("sceKernelReadTsc", .function) != null);
 }

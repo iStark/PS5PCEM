@@ -5864,13 +5864,17 @@ pub const Renderer = struct {
         sampler_descriptor: gpu.resources.SamplerDescriptor,
         descriptor_index: u32,
     ) anyerror!PreparedSampledImage {
-        if (descriptor.unified_format != 56) {
+        const image_format = sampledImageFormat(
+            descriptor.unified_format,
+            sampler_descriptor.force_srgb,
+        ) orelse {
             if (log_verbose_gpu) std.debug.print(
-                "[vulkan dcb] sampled image format {d} (want 56/RGBA8)\n",
+                "[vulkan dcb] unsupported sampled image format {d}\n",
                 .{descriptor.unified_format},
             );
             return Error.UnsupportedSampledImage;
-        }
+        };
+        const bytes_per_texel = storageImageBytesPerTexel(descriptor.unified_format);
         if (descriptor.image_type != .color_2d) {
             if (log_verbose_gpu) std.debug.print(
                 "[vulkan dcb] sampled image type {s} (want color_2d)\n",
@@ -5888,7 +5892,7 @@ pub const Renderer = struct {
             );
         }
         const layout = try gpu.SurfaceLayout.fromImage(descriptor);
-        if (layout.layers != 1 or layout.block.bytes_per_element != 4 or
+        if (layout.layers != 1 or layout.block.bytes_per_element != bytes_per_texel or
             layout.staging_bytes == 0 or layout.staging_bytes > maximum_frame_bytes)
         {
             if (log_verbose_gpu) std.debug.print(
@@ -6022,7 +6026,10 @@ pub const Renderer = struct {
                 @tagName(descriptor.tile_mode),
                 descriptor.address,
                 nonzero,
-                if (byte_count >= 4) byte_count / 4 else 0,
+                if (byte_count >= @as(usize, bytes_per_texel))
+                    byte_count / @as(usize, bytes_per_texel)
+                else
+                    0,
                 raw_nonzero,
                 raw_probe_hits,
                 if (linear.len > 0) linear[0] else 0,
@@ -6036,7 +6043,10 @@ pub const Renderer = struct {
         // head cleared while the body is valid).
         var first_hit_off: ?u64 = null;
         if (raw_nonzero == 0 and descriptor.width != 0 and descriptor.height != 0) {
-            const deep_span: u64 = @max(raw_probe_span, @as(u64, descriptor.width) * descriptor.height * 4 * 2);
+            const deep_span: u64 = @max(
+                raw_probe_span,
+                @as(u64, descriptor.width) * descriptor.height * @as(u64, bytes_per_texel) * 2,
+            );
             const deep_cap: u64 = 8 * 1024 * 1024;
             const span = @min(deep_span, deep_cap);
             var step: u64 = 0;
@@ -6078,7 +6088,6 @@ pub const Renderer = struct {
             );
             @memset(linear, 0);
         }
-        const image_format = sampledImageFormat(sampler_descriptor.force_srgb);
         const components = try sampledImageComponents(descriptor.dst_select);
         const upload = try self.createBuffer(
             byte_count,
@@ -7750,8 +7759,12 @@ fn hashGuestMemoryRange(memory: GuestMemory, address: u64, span: usize) u64 {
     return hash;
 }
 
-fn sampledImageFormat(force_srgb: bool) u32 {
-    return if (force_srgb) vk.format_r8g8b8a8_srgb else vk.format_r8g8b8a8_unorm;
+fn sampledImageFormat(unified_format: u16, force_srgb: bool) ?u32 {
+    return switch (unified_format) {
+        56 => if (force_srgb) vk.format_r8g8b8a8_srgb else vk.format_r8g8b8a8_unorm,
+        71 => vk.format_r16g16b16a16_sfloat,
+        else => null,
+    };
 }
 
 const StorageImageFormat = struct {
@@ -7810,6 +7823,7 @@ fn sampledImageStateHash(
     sampler: gpu.resources.SamplerDescriptor,
 ) u64 {
     const words = [_]u32{
+        descriptor.unified_format,
         @as(u32, descriptor.dst_select[0]) |
             (@as(u32, descriptor.dst_select[1]) << 8) |
             (@as(u32, descriptor.dst_select[2]) << 16) |
@@ -9514,8 +9528,11 @@ test "dual image clear matcher requires the complete bounded kernel" {
 }
 
 test "sampled image views honor sRGB and destination selectors" {
-    try std.testing.expectEqual(vk.format_r8g8b8a8_unorm, sampledImageFormat(false));
-    try std.testing.expectEqual(vk.format_r8g8b8a8_srgb, sampledImageFormat(true));
+    try std.testing.expectEqual(vk.format_r8g8b8a8_unorm, sampledImageFormat(56, false).?);
+    try std.testing.expectEqual(vk.format_r8g8b8a8_srgb, sampledImageFormat(56, true).?);
+    try std.testing.expectEqual(vk.format_r16g16b16a16_sfloat, sampledImageFormat(71, false).?);
+    try std.testing.expectEqual(vk.format_r16g16b16a16_sfloat, sampledImageFormat(71, true).?);
+    try std.testing.expect(sampledImageFormat(0, false) == null);
 
     const identity = try sampledImageComponents(.{ 4, 5, 6, 7 });
     try std.testing.expectEqual(vk.component_swizzle_r, identity.r);
