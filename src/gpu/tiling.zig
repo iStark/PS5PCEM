@@ -22,6 +22,7 @@ pub const Error = error{
     UnsupportedMultisample,
     UnsupportedVolume,
     UnsupportedMipChain,
+    UnsupportedMetadataLayout,
     CoordinateOutOfRange,
     ArithmeticOverflow,
     SourceTooSmall,
@@ -385,6 +386,138 @@ pub const MetadataSurface = struct {
             offset += 4;
             pixel_idx += 1;
         }
+    }
+};
+
+/// GFX10 CMASK allocation and nibble addressing for Oberon's RB+ topology.
+///
+/// CMASK stores one four-bit element per 8x8 pixel region. On a 16-pipe,
+/// eight-pixel-packer RB+ device those elements are swizzled in 1024x512 pixel
+/// metadata blocks; each block occupies 4 KiB. The equation below is AMD
+/// AddrLib's GFX10 CMASK pattern 15, selected by PS5's supported 1x-8x
+/// sample/fragment combinations.
+pub const CmaskLayout = struct {
+    pub const block_width: u32 = 1024;
+    pub const block_height: u32 = 512;
+    pub const block_bytes: u32 = 4096;
+
+    width: u32,
+    height: u32,
+    layers: u32,
+    first_slice: u32,
+    pitch: u32,
+    padded_height: u32,
+    blocks_per_row: u32,
+    slice_bytes: u64,
+    required_bytes: u64,
+    /// ADDR2's pipeBankXor. AGC colour-target state currently supplies no
+    /// separate XOR value, so decoded targets use zero.
+    pipe_xor: u8 = 0,
+
+    pub const Element = struct {
+        byte_offset: u64,
+        shift: u3,
+    };
+
+    pub fn init(
+        width: u32,
+        height: u32,
+        layers: u32,
+        first_slice: u32,
+        row_pitch_pixels: u32,
+    ) Error!CmaskLayout {
+        if (width == 0 or height == 0 or layers == 0) return Error.InvalidExtent;
+        const requested_pitch = if (row_pitch_pixels == 0) width else row_pitch_pixels;
+        if (requested_pitch < width) return Error.InvalidPitch;
+        const pitch = try alignForward(requested_pitch, block_width);
+        const padded_height = try alignForward(height, block_height);
+        const slice_pixels = try multiply(pitch, padded_height);
+        const slice_bytes = slice_pixels / 128;
+        std.debug.assert(slice_pixels % 128 == 0);
+        const physical_slices = try addU32(first_slice, layers);
+        const required_bytes = try multiply(slice_bytes, physical_slices);
+        return .{
+            .width = width,
+            .height = height,
+            .layers = layers,
+            .first_slice = first_slice,
+            .pitch = pitch,
+            .padded_height = padded_height,
+            .blocks_per_row = pitch / block_width,
+            .slice_bytes = slice_bytes,
+            .required_bytes = required_bytes,
+        };
+    }
+
+    pub fn fromColorTarget(target: resources.ColorTarget) Error!CmaskLayout {
+        if (target.mip_level != 0) return Error.UnsupportedMipChain;
+        // AddrLib exposes CMASK only for GFX10's 64KB_Z_X surface mode. The
+        // resource enum calls that mode `depth`, but it is also legal for a
+        // colour/MSAA allocation.
+        if (target.cmask_linear or target.tile_mode != .depth) {
+            return Error.UnsupportedMetadataLayout;
+        }
+        const layers: u32 = if (target.last_array_slice >= target.base_array_slice)
+            @as(u32, target.last_array_slice) - target.base_array_slice + 1
+        else
+            1;
+        var metadata_pitch = target.width;
+        if (target.cmask_slice_bytes != 0) {
+            const padded_height = try alignForward(target.height, block_height);
+            const slice_pixels = try multiply(target.cmask_slice_bytes, 128);
+            if (slice_pixels % padded_height != 0) return Error.UnsupportedMetadataLayout;
+            metadata_pitch = try u32FromU64(slice_pixels / padded_height);
+            if (metadata_pitch < target.width or metadata_pitch % block_width != 0) {
+                return Error.UnsupportedMetadataLayout;
+            }
+        }
+        const layout = try init(
+            target.width,
+            target.height,
+            layers,
+            target.base_array_slice,
+            metadata_pitch,
+        );
+        if (target.cmask_slice_bytes != 0 and layout.slice_bytes != target.cmask_slice_bytes) {
+            return Error.UnsupportedMetadataLayout;
+        }
+        return layout;
+    }
+
+    pub fn element(self: CmaskLayout, x: u32, y: u32, layer: u32) Error!Element {
+        if (x >= self.width or y >= self.height or layer >= self.layers) {
+            return Error.CoordinateOutOfRange;
+        }
+        const physical_slice = try addU32(self.first_slice, layer);
+        const slice_base = try multiply(self.slice_bytes, physical_slice);
+        const block_x = x / block_width;
+        const block_y = y / block_height;
+        const block_index = try add(try multiply(block_y, self.blocks_per_row), block_x);
+        const block_base = try multiply(block_index, block_bytes);
+        const nibble_offset = cmaskRbPlusNibbleOffset(x, y, physical_slice);
+        const pipe_xor = (@as(u32, self.pipe_xor & 0x0f) << 8) & (block_bytes - 1);
+        return .{
+            .byte_offset = try add(try add(slice_base, block_base), (nibble_offset >> 1) ^ pipe_xor),
+            .shift = @intCast((nibble_offset & 1) << 2),
+        };
+    }
+
+    pub fn value(self: CmaskLayout, metadata: []const u8, x: u32, y: u32, layer: u32) Error!u4 {
+        const location = try self.element(x, y, layer);
+        const byte_offset = std.math.cast(usize, location.byte_offset) orelse
+            return Error.ArithmeticOverflow;
+        if (byte_offset >= metadata.len) return Error.SourceTooSmall;
+        return @truncate(metadata[byte_offset] >> location.shift);
+    }
+
+    pub fn setValue(self: CmaskLayout, metadata: []u8, x: u32, y: u32, layer: u32, value_: u4) Error!void {
+        const location = try self.element(x, y, layer);
+        const byte_offset = std.math.cast(usize, location.byte_offset) orelse
+            return Error.ArithmeticOverflow;
+        if (byte_offset >= metadata.len) return Error.DestinationTooSmall;
+        const mask: u8 = @as(u8, 0x0f) << location.shift;
+        metadata[byte_offset] = (metadata[byte_offset] & ~mask) |
+            (@as(u8, value_) << location.shift);
     }
 };
 
@@ -1766,6 +1899,31 @@ fn rbPlus64kOffset(
     return offset;
 }
 
+/// GFX10_CMASK_SW_PATTERN[15], expressed as the nibble rather than byte
+/// offset. Coordinates are pixels, hence the first element bits are X3/Y3.
+fn cmaskRbPlusNibbleOffset(x: u32, y: u32, slice: u32) u32 {
+    var offset: u32 = 0;
+    offset |= bit(x, 3, 0);
+    offset |= bit(y, 3, 1);
+    offset |= bit(x, 6, 2);
+    offset |= bit(y, 6, 3);
+    offset |= bit(x, 7, 4);
+    offset |= bit(y, 7, 5);
+    offset |= bit(x, 8, 6);
+    offset |= bit(y, 8, 7);
+    offset |= bit(x, 9, 8);
+    if (evaluateAddressTerm(addressTerm(0x080, 0x090, 0, 0), x, y, slice, 0)) offset |= 1 << 9;
+    if (evaluateAddressTerm(addressTerm(0x010, 0x010, 0x002, 0), x, y, slice, 0)) offset |= 1 << 10;
+    if (evaluateAddressTerm(addressTerm(0x040, 0x020, 0x001, 0), x, y, slice, 0)) offset |= 1 << 11;
+    if (evaluateAddressTerm(addressTerm(0x020, 0x040, 0, 0), x, y, slice, 0)) offset |= 1 << 12;
+    std.debug.assert(offset < blockNibbles(CmaskLayout.block_bytes));
+    return offset;
+}
+
+fn blockNibbles(bytes: u32) u32 {
+    return bytes * 2;
+}
+
 fn renderMsaaLowOffset(x: u32, y: u32, bytes: u8) u32 {
     return switch (bytes) {
         1 => (x & 0x0f) ^ ((y << 4) & 0xf0),
@@ -2126,6 +2284,72 @@ test "metadata surface decoding turns raw metadata bytes into RGBA pixels" {
 
     // Both pixels read DCC byte 0x20, which is fast clear (0, 255, 0, 255)
     try testing.expectEqualSlices(u8, &[_]u8{ 0, 255, 0, 255, 0, 255, 0, 255 }, &dst);
+}
+
+test "Oberon CMASK layout uses AddrLib nibble swizzle and padded allocation" {
+    const layout = try CmaskLayout.init(1920, 1080, 1, 0, 1920);
+    try testing.expectEqual(@as(u32, 2048), layout.pitch);
+    try testing.expectEqual(@as(u32, 1536), layout.padded_height);
+    try testing.expectEqual(@as(u64, 24 * 1024), layout.slice_bytes);
+    try testing.expectEqual(layout.slice_bytes, layout.required_bytes);
+
+    try testing.expectEqual(CmaskLayout.Element{ .byte_offset = 0, .shift = 0 }, try layout.element(0, 0, 0));
+    try testing.expectEqual(CmaskLayout.Element{ .byte_offset = 0, .shift = 4 }, try layout.element(8, 0, 0));
+    try testing.expectEqual(CmaskLayout.Element{ .byte_offset = 1, .shift = 0 }, try layout.element(0, 8, 0));
+    try testing.expectEqual(CmaskLayout.Element{ .byte_offset = 1026, .shift = 0 }, try layout.element(64, 0, 0));
+    try testing.expectEqual(CmaskLayout.Element{ .byte_offset = 2052, .shift = 0 }, try layout.element(0, 64, 0));
+    try testing.expectEqual(CmaskLayout.Element{ .byte_offset = 4096, .shift = 0 }, try layout.element(1024, 0, 0));
+    try testing.expectEqual(CmaskLayout.Element{ .byte_offset = 8192, .shift = 0 }, try layout.element(0, 512, 0));
+    try testing.expectError(Error.CoordinateOutOfRange, layout.element(1920, 0, 0));
+
+    var target = std.mem.zeroes(resources.ColorTarget);
+    target.width = 1920;
+    target.height = 1080;
+    target.pitch = 1920;
+    target.tile_mode = .depth;
+    target.cmask_slice_bytes = 24 * 1024;
+    try testing.expectEqual(@as(u32, 2048), (try CmaskLayout.fromColorTarget(target)).pitch);
+    target.samples_log2 = 3;
+    target.fragments_log2 = 3;
+    try testing.expectEqual(@as(u32, 2048), (try CmaskLayout.fromColorTarget(target)).pitch);
+    target.samples_log2 = 0;
+    target.fragments_log2 = 0;
+    target.cmask_slice_bytes = 256;
+    try testing.expectError(Error.UnsupportedMetadataLayout, CmaskLayout.fromColorTarget(target));
+    target.cmask_slice_bytes = 24 * 1024;
+    target.cmask_linear = true;
+    try testing.expectError(Error.UnsupportedMetadataLayout, CmaskLayout.fromColorTarget(target));
+}
+
+test "one CMASK metadata block visits every nibble exactly once" {
+    const layout = try CmaskLayout.init(CmaskLayout.block_width, CmaskLayout.block_height, 1, 0, 0);
+    var occupied = [_]bool{false} ** (CmaskLayout.block_bytes * 2);
+    var y: u32 = 0;
+    while (y < CmaskLayout.block_height) : (y += 8) {
+        var x: u32 = 0;
+        while (x < CmaskLayout.block_width) : (x += 8) {
+            const location = try layout.element(x, y, 0);
+            const index: usize = @intCast(location.byte_offset * 2 + location.shift / 4);
+            try testing.expect(!occupied[index]);
+            occupied[index] = true;
+        }
+    }
+    try testing.expect(std.mem.allEqual(bool, &occupied, true));
+}
+
+test "CMASK array slices preserve slice XOR and checked reads" {
+    const layout = try CmaskLayout.init(64, 64, 2, 1, 64);
+    try testing.expectEqual(@as(u64, 12 * 1024), layout.required_bytes);
+    try testing.expectEqual(CmaskLayout.Element{ .byte_offset = 5 * 1024, .shift = 0 }, try layout.element(0, 0, 0));
+    try testing.expectEqual(CmaskLayout.Element{ .byte_offset = 17 * 512, .shift = 0 }, try layout.element(0, 0, 1));
+
+    var metadata = [_]u8{0xff} ** (12 * 1024);
+    metadata[5 * 1024] = 0xa5;
+    try testing.expectEqual(@as(u4, 5), try layout.value(&metadata, 0, 0, 0));
+    try layout.setValue(&metadata, 0, 0, 0, 0xc);
+    try testing.expectEqual(@as(u8, 0xac), metadata[5 * 1024]);
+    try testing.expectError(Error.SourceTooSmall, layout.value(metadata[0..8], 0, 0, 0));
+    try testing.expectError(Error.DestinationTooSmall, layout.setValue(metadata[0..8], 0, 0, 0, 0));
 }
 
 test "format adapters expose pixel block and attachment staging layouts" {

@@ -486,6 +486,9 @@ and sampler descriptors, 256-bit image descriptors, stage-relative inline
 user-SGPR data, all eight color targets and the depth/stencil target. The result
 retains 48-bit addresses, unified formats, views and mip ranges, component
 selection, PS5 swizzle modes, MSAA state and CMASK/FMASK/DCC/HTILE metadata.
+Color-target state also retains the GFX10 linear-CMASK selector so the backend
+can reject an unsupported metadata layout instead of applying a tiled equation
+to it.
 The same snapshot now decodes viewport transforms, viewport/screen scissor
 intersection, cull/front-face/polygon state, per-target blend controls and color
 control, so a renderer does not need to interpret raw context-register offsets.
@@ -604,7 +607,8 @@ The remaining stages are:
 1. Move frequently changing shader scalars from SPIR-V specialization into a
    runtime constant path so graphics pipelines can be reused across frames.
 2. Add depth/stencil, multiple render targets, MSAA, texture component swizzles,
-   and compressed DCC/CMASK/FMASK/HTILE surfaces.
+   the remaining compressed DCC/FMASK/HTILE states, and CMASK states coupled
+   to MSAA/FMASK.
 3. Complete structured loops, VCC/EXEC divergence, formats, mip/layer views,
    explicit-LOD operands, and the remaining image operations seen in captures.
 4. Continue reducing first-use texture and synchronous dispatch work, and
@@ -1635,6 +1639,14 @@ scheduler and Vulkan backend. Observed startup work now includes:
   uniform DCC key means the hardware returns the fast-clear colour, so the
   attachment starts at that colour instead of at whatever the raw bytes decode
   to. Uncompressed and mixed keys keep the staged path.
+- Single-sample CMASK-only colour targets now use Oberon's exact GFX10 RB+
+  `64KB_Z_X` nibble address equation. Fast-cleared (`0`) and expanded (`F`) 8×8 blocks
+  can coexist in one surface: only cleared blocks take `CB_COLOR_CLEAR_WORD0`,
+  while expanded blocks retain their base texels. A uniform clear avoids
+  staging the base allocation entirely. Guest writes that overlap resident
+  CMASK invalidate the attachment after preserving prior draws, and host
+  writeback marks materialized blocks expanded so stale metadata cannot clear
+  them again. MSAA/FMASK-linked CMASK states remain outside this path.
 - `SetFlip` and equeue delivery use VideoOut filter `-13`; flip status fills
   process-time fields and event data retains the guest flip argument.
 - Indexed draws can emit AGC `SetIndexSize` as a real `INDEX_TYPE` packet, and
@@ -1686,7 +1698,8 @@ Its compact 8- and 11-instruction typed clears now execute for `R8_UINT`,
 storage swizzles and tiled render-target/depth addressing. The exact observed
 18-instruction dual-store kernel also clears two 1024×1024 `RGBA32_FLOAT`
 render targets (2,097,152 texels total); inactive metadata pointers are accepted,
-while actual DCC/CMASK/FMASK compression remains rejected. Its observed
+while actual DCC/FMASK/HTILE compression and CMASK states beyond the supported
+single-sample clear/expanded pair remain rejected. Its observed
 32-instruction 3D upload program now copies `R8_UINT→RGBA8_UINT` and
 `R16_UINT→R16_UINT` volumes with the shader's bounds, strides, base coordinates,
 and linear/tiled target layout. A measured startup frame consequently completes

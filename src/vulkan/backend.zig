@@ -545,6 +545,9 @@ const maximum_sampled_images = 32;
 const dcc_block_bytes = 256;
 /// Bounds the key read for a fast-clear probe; covers surfaces up to 1 GiB.
 const maximum_dcc_key_bytes = 4 * 1024 * 1024;
+/// CMASK is one nibble per 8x8 pixel region; this cap covers extremely large
+/// render targets while rejecting corrupt descriptors before allocation.
+const maximum_cmask_bytes = 4 * 1024 * 1024;
 /// On-disk driver pipeline cache. Reused across runs so per-title shader
 /// compilation is paid once instead of on every launch.
 const pipeline_cache_path = "vulkan_pipeline_cache.bin";
@@ -739,6 +742,12 @@ const CachedRenderTarget = struct {
     gpu_generation: u64 = 0,
     host_generation: u64 = 0,
     last_used_sequence: u64 = 0,
+};
+
+const CmaskSeed = struct {
+    texel: [4]u8,
+    clear_blocks: u32,
+    expanded_blocks: u32,
 };
 
 /// One remembered content probe of a sampled source.
@@ -3395,6 +3404,17 @@ pub const Renderer = struct {
             a.layout.staging_bytes == b.layout.staging_bytes;
     }
 
+    fn sameRenderTargetMetadata(a: gpu.resources.ColorTarget, b: gpu.resources.ColorTarget) bool {
+        return a.dcc_enabled == b.dcc_enabled and
+            a.cmask_fast_clear == b.cmask_fast_clear and
+            a.cmask_linear == b.cmask_linear and
+            a.fmask_compression == b.fmask_compression and
+            a.cmask_address == b.cmask_address and
+            a.cmask_slice_bytes == b.cmask_slice_bytes and
+            a.fmask_address == b.fmask_address and
+            a.dcc_address == b.dcc_address;
+    }
+
     /// Resolves what a DCC-compressed colour target actually reads as.
     ///
     /// A target with DCC enabled does not hold plain texels: the key holds one
@@ -3424,7 +3444,62 @@ pub const Renderer = struct {
         return dccClearTexel(code, descriptor);
     }
 
-    fn reportFastClearSeed(self: *Renderer, target: GuestColorTarget, texel: [4]u8) void {
+    fn stageCmaskFastClear(
+        self: *Renderer,
+        target: GuestColorTarget,
+        reader: gpu.ShaderMemoryReader,
+        frame: []u8,
+    ) anyerror!?CmaskSeed {
+        const descriptor = target.descriptor;
+        if (!descriptor.cmask_fast_clear or descriptor.cmask_address == 0 or descriptor.dcc_enabled) return null;
+        const texel = clearWordTexel(descriptor) orelse return null;
+        const layout = gpu.CmaskLayout.fromColorTarget(descriptor) catch return null;
+        const byte_count = std.math.cast(usize, layout.required_bytes) orelse return null;
+        if (byte_count == 0 or byte_count > maximum_cmask_bytes) return null;
+        const metadata = try self.allocator.alloc(u8, byte_count);
+        defer self.allocator.free(metadata);
+        const memory = self.guest_memory orelse return null;
+        if (!memory.read(memory.context, descriptor.cmask_address, metadata)) return null;
+
+        const stats = classifyCmaskBlocks(layout, metadata) orelse {
+            if (log_verbose_gpu) std.debug.print(
+                "[vulkan dcb] CMASK contains an unsupported compressed state @0x{x}\n",
+                .{descriptor.cmask_address},
+            );
+            return null;
+        };
+        if (stats.expanded_blocks == 0) {
+            fillRgba8(frame, texel);
+        } else {
+            try target.layout.stage(reader, descriptor.address, frame);
+            applyCmaskClearBlocks(layout, metadata, frame, texel);
+        }
+        return .{
+            .texel = texel,
+            .clear_blocks = stats.clear_blocks,
+            .expanded_blocks = stats.expanded_blocks,
+        };
+    }
+
+    fn stageInitialColorTarget(
+        self: *Renderer,
+        target: GuestColorTarget,
+        reader: gpu.ShaderMemoryReader,
+        frame: []u8,
+    ) anyerror!void {
+        if (try self.colorTargetFastClearTexel(target)) |texel| {
+            fillRgba8(frame, texel);
+            self.reportDccFastClearSeed(target, texel);
+            return;
+        }
+        if (try self.stageCmaskFastClear(target, reader, frame)) |seed| {
+            if (seed.clear_blocks != 0) self.reportCmaskFastClearSeed(target, seed);
+            return;
+        }
+        try target.layout.stage(reader, target.descriptor.address, frame);
+    }
+
+    fn reportDccFastClearSeed(self: *Renderer, target: GuestColorTarget, texel: [4]u8) void {
         if (self.reported_fast_clear_seeds >= 4 and !log_verbose_gpu) return;
         self.reported_fast_clear_seeds += 1;
         std.debug.print(
@@ -3438,6 +3513,26 @@ pub const Renderer = struct {
                 texel[1],
                 texel[2],
                 texel[3],
+            },
+        );
+    }
+
+    fn reportCmaskFastClearSeed(self: *Renderer, target: GuestColorTarget, seed: CmaskSeed) void {
+        if (self.reported_fast_clear_seeds >= 4 and !log_verbose_gpu) return;
+        self.reported_fast_clear_seeds += 1;
+        std.debug.print(
+            "[vulkan dcb] cmask fast-clear target @0x{x} {d}x{d} meta@0x{x} blocks={d}/{d} rgba={d},{d},{d},{d}\n",
+            .{
+                target.descriptor.address,
+                target.descriptor.width,
+                target.descriptor.height,
+                target.descriptor.cmask_address,
+                seed.clear_blocks,
+                seed.clear_blocks + seed.expanded_blocks,
+                seed.texel[0],
+                seed.texel[1],
+                seed.texel[2],
+                seed.texel[3],
             },
         );
     }
@@ -3505,8 +3600,18 @@ pub const Renderer = struct {
     }
 
     fn acquireRenderTarget(self: *Renderer, target: GuestColorTarget) anyerror!usize {
-        for (self.render_targets.items, 0..) |*cached, index| {
-            if (!sameRenderTarget(cached.target, target)) continue;
+        for (self.render_targets.items, 0..) |cached_snapshot, index| {
+            if (!sameRenderTarget(cached_snapshot.target, target)) continue;
+            const metadata_changed = !sameRenderTargetMetadata(cached_snapshot.target.descriptor, target.descriptor);
+            if (metadata_changed and cached_snapshot.initialized) {
+                const visible_bytes = try colorTargetFrameBytes(cached_snapshot.target);
+                try self.flushPendingGuestWrite(cached_snapshot.target.descriptor.address, visible_bytes);
+            }
+            const cached = &self.render_targets.items[index];
+            if (metadata_changed) cached.initialized = false;
+            // Clear registers can change without changing the allocation.
+            // Keep the newest descriptor for a subsequent metadata resolve.
+            cached.target = target;
             self.render_target_sequence +%= 1;
             cached.last_used_sequence = self.render_target_sequence;
             self.frame_profile.render_target_hits += 1;
@@ -3668,12 +3773,7 @@ pub const Renderer = struct {
             defer self.allocator.free(frame);
             const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
             const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
-            if (try self.colorTargetFastClearTexel(target)) |texel| {
-                fillRgba8(frame, texel);
-                self.reportFastClearSeed(target, texel);
-            } else {
-                try target.layout.stage(reader, target.descriptor.address, frame);
-            }
+            try self.stageInitialColorTarget(target, reader, frame);
             initial_upload = try self.createBuffer(
                 frame_bytes,
                 vk.buffer_usage_transfer_src_bit,
@@ -4198,7 +4298,40 @@ pub const Renderer = struct {
         if (!memory.read(memory.context, target.descriptor.address, tiled)) return Error.GuestMemoryReadFailed;
         try target.layout.tile(frame, tiled);
         if (!memory.write(memory.context, target.descriptor.address, tiled)) return Error.GuestMemoryWriteFailed;
+        try self.commitExpandedCmask(target);
         self.guest_color_target_writes += 1;
+    }
+
+    /// Host rendering publishes ordinary base-surface texels. Mark every
+    /// active CMASK block expanded so a later cache miss never re-applies an
+    /// obsolete fast clear over those newly written pixels.
+    fn commitExpandedCmask(self: *Renderer, target: GuestColorTarget) anyerror!void {
+        const descriptor = target.descriptor;
+        if (!descriptor.cmask_fast_clear or descriptor.cmask_address == 0 or descriptor.dcc_enabled) return;
+        const layout = gpu.CmaskLayout.fromColorTarget(descriptor) catch return;
+        const byte_count = std.math.cast(usize, layout.required_bytes) orelse return;
+        if (byte_count == 0 or byte_count > maximum_cmask_bytes) return;
+        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        const metadata = try self.allocator.alloc(u8, byte_count);
+        defer self.allocator.free(metadata);
+        if (!memory.read(memory.context, descriptor.cmask_address, metadata)) return Error.GuestMemoryReadFailed;
+
+        var changed = false;
+        for (0..layout.layers) |layer_index| {
+            var y: u32 = 0;
+            while (y < layout.height) : (y += 8) {
+                var x: u32 = 0;
+                while (x < layout.width) : (x += 8) {
+                    const layer: u32 = @intCast(layer_index);
+                    if (try layout.value(metadata, x, y, layer) == 0xf) continue;
+                    try layout.setValue(metadata, x, y, layer, 0xf);
+                    changed = true;
+                }
+            }
+        }
+        if (changed and !memory.write(memory.context, descriptor.cmask_address, metadata)) {
+            return Error.GuestMemoryWriteFailed;
+        }
     }
 
     /// Records a completed render in host memory without touching the guest
@@ -4330,12 +4463,13 @@ pub const Renderer = struct {
             );
             return Error.UnsupportedColorTarget;
         }
-        // DCC/CMASK/FMASK are ignored on the first path: the surface is staged
-        // as raw tiles. Compressed contents may look wrong until a decompressor
-        // exists, but rejecting compressed targets blocks typical title draws.
+        // The persistent target path resolves uniform DCC and CMASK-only
+        // clear/expanded blocks during its initial upload. FMASK and other
+        // compressed states still fall back to raw tiles rather than blocking
+        // otherwise usable title draws.
         if (descriptor.dcc_enabled or descriptor.cmask_fast_clear or descriptor.fmask_compression) {
             if (log_verbose_gpu) std.debug.print(
-                "[vulkan dcb] draw: ignoring compression flags dcc={any} cmask={any} fmask={any} fmt={d}\n",
+                "[vulkan dcb] draw metadata dcc={any} cmask={any} fmask={any} fmt={d}\n",
                 .{
                     descriptor.dcc_enabled,
                     descriptor.cmask_fast_clear,
@@ -5351,9 +5485,30 @@ pub const Renderer = struct {
         return memory.read(memory.context, address, bytes);
     }
 
+    fn prepareCmaskWrite(self: *Renderer, address: u64, size: usize) anyerror!void {
+        if (size == 0) return;
+        var index: usize = 0;
+        while (index < self.render_targets.items.len) : (index += 1) {
+            const snapshot = self.render_targets.items[index];
+            const descriptor = snapshot.target.descriptor;
+            if (!descriptor.cmask_fast_clear or descriptor.cmask_address == 0 or descriptor.dcc_enabled) continue;
+            const layout = gpu.CmaskLayout.fromColorTarget(descriptor) catch continue;
+            if (!byteRangesOverlap(address, size, descriptor.cmask_address, layout.required_bytes)) continue;
+
+            // Preserve any resident rendering before the guest changes the
+            // metadata which defines how the base allocation is interpreted.
+            if (snapshot.initialized) {
+                const visible_bytes = try colorTargetFrameBytes(snapshot.target);
+                try self.flushPendingGuestWrite(descriptor.address, visible_bytes);
+            }
+            self.render_targets.items[index].initialized = false;
+        }
+    }
+
     fn dcbWrite(context: ?*anyopaque, address: u64, bytes: []const u8) bool {
         const self = fromContext(context);
         self.flushGuestStorageRange(address, bytes.len) catch return false;
+        self.prepareCmaskWrite(address, bytes.len) catch return false;
         const memory = self.guest_memory orelse return false;
         return memory.write(memory.context, address, bytes);
     }
@@ -6667,6 +6822,15 @@ fn sampledImageStateHash(
     return std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(&words));
 }
 
+fn byteRangesOverlap(a_address: u64, a_size_usize: usize, b_address: u64, b_size: u64) bool {
+    if (a_size_usize == 0 or b_size == 0) return false;
+    const a_size = std.math.cast(u64, a_size_usize) orelse std.math.maxInt(u64);
+    return if (a_address <= b_address)
+        b_address - a_address < a_size
+    else
+        a_address - b_address < b_size;
+}
+
 /// The colour a uniform DCC key resolves to, in the RGBA8 order `stage`
 /// produces. The comparison codes are the ones GFX9-GFX10 colour blocks write:
 /// four fixed clear colours, one "use the clear registers" code, and 0xff for
@@ -6680,17 +6844,79 @@ fn dccClearTexel(code: u8, descriptor: gpu.resources.ColorTarget) ?[4]u8 {
         // CB_COLOR*_CLEAR_WORD0 holds the cleared texel in the surface's own
         // encoding. Only the 8_8_8_8 UNORM standard swap is unpacked here; any
         // other encoding would be a guess, so it keeps the raw path.
-        0x20 => if (descriptor.format == 10 and descriptor.number_type == 0 and descriptor.component_swap == 0) blk: {
-            const word = descriptor.clear_words[0];
-            break :blk .{
-                @truncate(word),
-                @truncate(word >> 8),
-                @truncate(word >> 16),
-                @truncate(word >> 24),
-            };
-        } else null,
+        0x20 => clearWordTexel(descriptor),
         else => null,
     };
+}
+
+fn clearWordTexel(descriptor: gpu.resources.ColorTarget) ?[4]u8 {
+    if (descriptor.format != 10 or descriptor.number_type != 0 or descriptor.component_swap != 0) return null;
+    const word = descriptor.clear_words[0];
+    return .{
+        @truncate(word),
+        @truncate(word >> 8),
+        @truncate(word >> 16),
+        @truncate(word >> 24),
+    };
+}
+
+const CmaskBlockStats = struct {
+    clear_blocks: u32 = 0,
+    expanded_blocks: u32 = 0,
+};
+
+/// CMASK-only fast clears use nibble 0; nibble F says the corresponding base
+/// blocks are expanded and can be staged normally. Other values describe
+/// coverage/compression states which need FMASK/MSAA support and are rejected.
+fn classifyCmaskBlocks(layout: gpu.CmaskLayout, metadata: []const u8) ?CmaskBlockStats {
+    var stats = CmaskBlockStats{};
+    for (0..layout.layers) |layer_index| {
+        var y: u32 = 0;
+        while (y < layout.height) : (y += 8) {
+            var x: u32 = 0;
+            while (x < layout.width) : (x += 8) {
+                const value = layout.value(metadata, x, y, @intCast(layer_index)) catch return null;
+                switch (value) {
+                    0 => stats.clear_blocks +|= 1,
+                    0xf => stats.expanded_blocks +|= 1,
+                    else => return null,
+                }
+            }
+        }
+    }
+    return stats;
+}
+
+fn applyCmaskClearBlocks(
+    layout: gpu.CmaskLayout,
+    metadata: []const u8,
+    linear: []u8,
+    texel: [4]u8,
+) void {
+    const layer_stride = @as(usize, layout.width) * @as(usize, layout.height) * 4;
+    std.debug.assert(linear.len >= layer_stride * @as(usize, layout.layers));
+    for (0..layout.layers) |layer_index| {
+        var block_y: u32 = 0;
+        while (block_y < layout.height) : (block_y += 8) {
+            var block_x: u32 = 0;
+            while (block_x < layout.width) : (block_x += 8) {
+                const layer: u32 = @intCast(layer_index);
+                const value = layout.value(metadata, block_x, block_y, layer) catch unreachable;
+                if (value != 0) continue;
+                const end_y = @min(block_y + 8, layout.height);
+                const end_x = @min(block_x + 8, layout.width);
+                var y = block_y;
+                while (y < end_y) : (y += 1) {
+                    var x = block_x;
+                    while (x < end_x) : (x += 1) {
+                        const pixel = layer_index * layer_stride +
+                            (@as(usize, y) * @as(usize, layout.width) + @as(usize, x)) * 4;
+                        linear[pixel..][0..4].* = texel;
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn fillRgba8(linear: []u8, texel: [4]u8) void {
@@ -7675,6 +7901,32 @@ test "a uniform dcc key resolves to the colour the hardware would return" {
     // An encoding the clear-word unpack does not model keeps the raw path.
     descriptor.format = 11;
     try std.testing.expect(dccClearTexel(0x20, descriptor) == null);
+}
+
+test "CMASK clear and expanded nibbles materialize only the selected 8x8 blocks" {
+    const layout = try gpu.CmaskLayout.init(16, 8, 1, 0, 16);
+    var metadata = [_]u8{0xff} ** gpu.CmaskLayout.block_bytes;
+    try layout.setValue(&metadata, 0, 0, 0, 0);
+    const stats = classifyCmaskBlocks(layout, &metadata).?;
+    try std.testing.expectEqual(@as(u32, 1), stats.clear_blocks);
+    try std.testing.expectEqual(@as(u32, 1), stats.expanded_blocks);
+
+    var frame = [_]u8{0xaa} ** (16 * 8 * 4);
+    const clear = [4]u8{ 0x10, 0x20, 0x40, 0x80 };
+    applyCmaskClearBlocks(layout, &metadata, &frame, clear);
+    try std.testing.expectEqualSlices(u8, &clear, frame[0..4]);
+    try std.testing.expectEqualSlices(u8, &clear, frame[(7 * 16 + 7) * 4 ..][0..4]);
+    try std.testing.expectEqualSlices(u8, &[_]u8{0xaa} ** 4, frame[8 * 4 ..][0..4]);
+
+    try layout.setValue(&metadata, 8, 0, 0, 5);
+    try std.testing.expect(classifyCmaskBlocks(layout, &metadata) == null);
+}
+
+test "CMASK write overlap checks use checked half-open guest ranges" {
+    try std.testing.expect(byteRangesOverlap(0x1000, 4, 0x1003, 8));
+    try std.testing.expect(!byteRangesOverlap(0x1000, 4, 0x1004, 8));
+    try std.testing.expect(!byteRangesOverlap(0x1000, 0, 0x1000, 8));
+    try std.testing.expect(byteRangesOverlap(std.math.maxInt(u64) - 1, 8, std.math.maxInt(u64), 1));
 }
 
 test "dual image clear matcher requires the complete bounded kernel" {

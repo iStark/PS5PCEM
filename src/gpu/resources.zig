@@ -271,9 +271,11 @@ pub const ColorTarget = struct {
     fragments_log2: u8,
     dcc_enabled: bool,
     cmask_fast_clear: bool,
+    cmask_linear: bool,
     fmask_compression: bool,
     force_destination_alpha_one: bool,
     cmask_address: u64,
+    cmask_slice_bytes: u32,
     fmask_address: u64,
     dcc_address: u64,
     clear_words: [2]u32,
@@ -646,6 +648,7 @@ pub fn decodeColorTarget(state: *const gpu_state.State, slot: u8, target_mask: u
     if (address == 0 or format == 0) return null;
     const view = context(state, base + 3) orelse 0;
     const pitch = context(state, base + 1);
+    const cmask_slice = context(state, base + 8);
     const width: u32 = ((attrib2 >> 14) & 0x3fff) + 1;
     const decoded_pitch: u32 = if (pitch) |value| ((value & 0x7ff) + 1) * 8 else 0;
 
@@ -670,9 +673,11 @@ pub fn decodeColorTarget(state: *const gpu_state.State, slot: u8, target_mask: u
         .fragments_log2 = @truncate((attrib >> 15) & 0x3),
         .dcc_enabled = info & (1 << 28) != 0,
         .cmask_fast_clear = info & (1 << 13) != 0,
+        .cmask_linear = info & (1 << 19) != 0,
         .fmask_compression = info & (1 << 14) != 0,
         .force_destination_alpha_one = attrib & (1 << 17) != 0,
         .cmask_address = optionalAddress256(state, base + 7, 0x398 + index),
+        .cmask_slice_bytes = if (cmask_slice) |value| ((value & 0x3fff) + 1) * 256 else 0,
         .fmask_address = optionalAddress256(state, base + 9, 0x3a0 + index),
         .dcc_address = optionalAddress256(state, base + 13, 0x3a8 + index),
         .clear_words = .{
@@ -857,9 +862,11 @@ test "render state decodes PS5 color and depth target extensions" {
     try state.writeRegister(.context, 0x318, @truncate(color_address >> 8));
     try state.writeRegister(.context, 0x319, 239);
     try state.writeRegister(.context, 0x31b, 2 | (5 << 13) | (1 << 26));
-    try state.writeRegister(.context, 0x31c, (10 << 2) | (1 << 8) | (2 << 11) | (1 << 28));
+    try state.writeRegister(.context, 0x31c, (10 << 2) | (1 << 8) | (2 << 11) |
+        (1 << 13) | (1 << 19) | (1 << 28));
     try state.writeRegister(.context, 0x31d, (2 << 12) | (1 << 15));
     try state.writeRegister(.context, 0x31f, 0x0012_0000);
+    try state.writeRegister(.context, 0x320, 95);
     try state.writeRegister(.context, 0x323, 0x1122_3344);
     try state.writeRegister(.context, 0x324, 0x5566_7788);
     try state.writeRegister(.context, 0x325, 0x0013_0000);
@@ -904,6 +911,10 @@ test "render state decodes PS5 color and depth target extensions" {
     try testing.expectEqual(@as(u32, 1080), color.height);
     try testing.expectEqual(TileMode.render_target, color.tile_mode);
     try testing.expect(color.dcc_enabled);
+    try testing.expect(color.cmask_fast_clear);
+    try testing.expect(color.cmask_linear);
+    try testing.expectEqual(@as(u64, 0x1200_0000), color.cmask_address);
+    try testing.expectEqual(@as(u32, 24 * 1024), color.cmask_slice_bytes);
 
     const depth = render.depth_target.?;
     try testing.expectEqual(depth_address, depth.read_address);
