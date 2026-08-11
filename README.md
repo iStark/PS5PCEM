@@ -126,7 +126,7 @@ the repository contains none of that content.
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
 | **Tetris Effect: Connected** | Completes Unreal filesystem/config bootstrap, executes compact typed UAV clears and 3D volume uploads, translates two 344/125-instruction volume dispatches with recursively recovered V# chains, and translates the complete 176-instruction mixed-image/LDS prepass, including compute `image_sample_lz` at PC `0x29c` and NSA `image_store` at PC `0x440`; its 2,401-instruction deferred compositor writes all 8,294,400 pixels of the 3840×2160 scanout | The first repeatable guest framebuffer is uniform light gray rather than a recognizable scene; a normal run currently produces an NVIDIA GPU fault during an earlier `15×9×8` dispatch, while NGG export and some image forms remain incomplete and the 512 GiB reservation can depend on host address-space placement |
 | **The Precinct** | Links the complete six-image guest graph, defers and starts Unity plug-ins through `sceKernelLoadStartModule`, enters Unity, indexes its audio assets, and plays both observed intro movies through the new SceAvPlayer path. The title receives synchronized 3840×2160 NV12 video and 48 kHz stereo PCM; its guest YUV conversion shader produces the recognizable Kwalee frame above. Post-video graphics continue through seven draws and nine dispatches per frame, with warmed-up frames around 20–22 ms on the current RTX 3070 Ti test host | The post-video scene source is still incorrect: draw 1 receives a sparse/corrupted pixel strip, draw 2 copies it to the scanout, and later UI draws do not restore a recognizable scene. Gameplay is not claimed yet |
-| **Jets 'n' Guns 2** | Loads the three-image guest graph, resolves the title content through `/app0`, completes AGC resource-registration setup without the former bogus allocation, enters a sustained graphics loop, registers a 3840×2160 target, and submits repeated DCBs with up to 24 draws per pass and regular VideoOut flips | Captured frames remain black. The current run eventually stalls after `libSceAudiodec` rejects MP3 decoder creation/decoding, leaving the music path with invalid stream parameters; full legacy Audiodec support and the remaining vertex-shader translation gap are the next bring-up targets |
+| **Jets 'n' Guns 2** | Loads the three-image guest graph, resolves the title content through `/app0`, completes AGC resource-registration setup without the former bogus allocation, enters a sustained graphics loop, registers a 3840×2160 target, and submits repeated DCBs with up to 24 draws per pass and regular VideoOut flips. Its merged NGG vertex programs now translate instead of falling back to the probe shader | Captured frames remain black for a separate reason: the title never programs the colour-buffer context registers in the stream that is parsed, so every draw is treated as targetless and only the deferred display draw reaches the GPU. `libSceAudiodec` also rejects MP3 decoder creation, and the 8-channel output the title opens has no host fallback, so the music path fails and retries |
 
 ## Components
 
@@ -1792,6 +1792,16 @@ scheduler and Vulkan backend. Observed startup work now includes:
   and scene textures rather than only the initial presentation surface.
   Depth/MRT composition, compression metadata, and some layouts can still
   produce visible corruption.
+- A vertex program is translated as what it is on this generation: the ES half
+  of a merged NGG wave. Its vertex id arrives in V5 and its instance id in V8,
+  which is what the usual `v_cndmask v0, v8, v5, s8` prolog selects between;
+  seeding only the attribute-fetch VGPR left both at zero, so a program that
+  computes its position from V5 placed every vertex at the same corner. The
+  hardware SGPRs describing the wave are not user data and scalar provenance
+  never resolves them, so they read as zero rather than rejecting the shader —
+  the GS_ALLOC_REQ payload and the execution masks derived from them are
+  dropped anyway, because Vulkan runs one invocation per vertex and does its
+  own primitive assembly. Primitive exports are skipped for the same reason.
 - Pixel-shader constants recovered from a resolved `s_buffer_load` are used as
   written, including zeros. A sprite batcher fills solid rectangles by scaling
   the sampled texel by zero and biasing the colour in, so substituting an

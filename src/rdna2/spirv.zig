@@ -344,6 +344,7 @@ const Builder = struct {
     stage: Stage,
     vertex_index_vgpr: ?u8,
     vertex_index_input: u32 = 0,
+    instance_index_input: u32 = 0,
     position_output: u32 = 0,
     color_output: u32 = 0,
     parameter_variables: [32]u32 = @splat(0),
@@ -454,6 +455,12 @@ const Builder = struct {
                     try self.emit(&self.annotations, 71, &.{ self.vertex_index_input, 11, 42 }); // BuiltIn VertexIndex
                     try self.emit(&self.declarations, 32, &.{ input_pointer, 1, self.signed_type }); // ptr Input
                     try self.emit(&self.declarations, 59, &.{ input_pointer, self.vertex_index_input, 1 }); // OpVariable
+
+                    const instance_pointer = self.id();
+                    self.instance_index_input = self.id();
+                    try self.emit(&self.annotations, 71, &.{ self.instance_index_input, 11, 43 }); // BuiltIn InstanceIndex
+                    try self.emit(&self.declarations, 32, &.{ instance_pointer, 1, self.signed_type }); // ptr Input
+                    try self.emit(&self.declarations, 59, &.{ instance_pointer, self.instance_index_input, 1 }); // OpVariable
                 }
             },
             .fragment => {
@@ -1454,7 +1461,19 @@ const Builder = struct {
         // scalar instruction writes the corresponding SGPR. Zero mirrors the
         // unavailable-hardware-register policy used by the pixel prolog. Keep
         // VCC and EXEC untouched: rawSource gives pristine wave masks all ones.
-        if (self.stage == .fragment) {
+        //
+        // A vertex program needs the same treatment for a different reason. On
+        // this generation a vertex shader is launched as the ES half of a
+        // merged NGG wave, and its prolog reads hardware SGPRs that describe
+        // the wave rather than the draw: the merged wave info holds the vertex
+        // and primitive counts packed into bitfields. Those registers are not
+        // user data, so scalar provenance never resolves them. Everything the
+        // prolog derives from them — the GS_ALLOC_REQ payload in M0 and the
+        // execution masks that narrow the wave to its live lanes — is dropped
+        // here anyway, because Vulkan runs one invocation per vertex and does
+        // its own primitive assembly. Leaving them undefined only rejects the
+        // shader; zero lets the live part of the program translate.
+        if (self.stage == .fragment or self.stage == .vertex) {
             const zero = try self.constant(.bits32, 0);
             for (0..126) |sgpr| {
                 if (sgpr == 106 or sgpr == 107) continue;
@@ -1476,6 +1495,20 @@ const Builder = struct {
             try self.emit(&self.body, 61, &.{ self.signed_type, result, self.vertex_index_input }); // OpLoad
             const vgpr = self.vertex_index_vgpr orelse return Error.InvalidStageInterface;
             self.registers[128 + @as(usize, vgpr)] = .{ .id = result, .value_type = .sint32 };
+
+            // The hardware VGPRs of a merged NGG wave. The ES half receives its
+            // vertex id in V5 and its instance id in V8, and a vertex prolog
+            // reads them directly: the usual `v_cndmask v0, v8, v5, s8` picks
+            // one of the two as the attribute-fetch index. Seeding only the
+            // configured fetch VGPR left both at zero, so a program that
+            // computes its position from V5 — a procedural full-screen
+            // triangle, for one — placed every vertex at the same corner.
+            self.registers[128 + 5] = .{ .id = result, .value_type = .sint32 };
+            if (self.instance_index_input != 0) {
+                const instance = self.id();
+                try self.emit(&self.body, 61, &.{ self.signed_type, instance, self.instance_index_input }); // OpLoad
+                self.registers[128 + 8] = .{ .id = instance, .value_type = .sint32 };
+            }
         }
         const inputs = self.compute_inputs orelse return;
         if (self.workgroup_id_input != 0) {
@@ -3774,6 +3807,7 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     if (builder.workgroup_id_input != 0) try entry_point.append(allocator, builder.workgroup_id_input);
     if (builder.local_invocation_id_input != 0) try entry_point.append(allocator, builder.local_invocation_id_input);
     if (builder.vertex_index_input != 0) try entry_point.append(allocator, builder.vertex_index_input);
+    if (builder.instance_index_input != 0) try entry_point.append(allocator, builder.instance_index_input);
     if (builder.frag_coord_input != 0) try entry_point.append(allocator, builder.frag_coord_input);
     if (builder.position_output != 0) try entry_point.append(allocator, builder.position_output);
     if (builder.color_output != 0) try entry_point.append(allocator, builder.color_output);
@@ -4254,6 +4288,64 @@ test "vertex system value and position export lower to a stage interface" {
     try std.testing.expect(containsOpcode(module.words, 112)); // OpConvertUToF
     try std.testing.expect(containsOpcode(module.words, 80)); // OpCompositeConstruct
     try std.testing.expect(containsOpcode(module.words, 62)); // OpStore Position
+}
+
+test "merged NGG vertex prolog reaches its position export" {
+    // The shape a Gen5 vertex program actually arrives in: it runs as the ES
+    // half of a merged NGG wave, reads the wave description out of a hardware
+    // SGPR that is not user data, and takes its vertex id from V5 rather than
+    // from the attribute-fetch VGPR.
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    // s_bfe_u32 vcc_lo, s3, 0x80008 — unpack the merged wave info.
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .s_bfe_u32,
+        .dst = .{ .kind = .vcc_lo },
+        .src0 = .{ .kind = .sgpr, .reg = 3 },
+        .src1 = .{ .kind = .literal_constant, .value = 0x8_0008 },
+        .src_count = 2,
+    });
+    // The primitive export a merged wave issues before its vertex work.
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .exp,
+        .export_target = 20,
+        .export_enable = 0x1,
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src_count = 1,
+    });
+    inline for (.{ 0, 1, 2, 3 }) |component| {
+        try program.instructions.append(std.testing.allocator, .{
+            .opcode = .v_cvt_f32_i32,
+            .dst = .{ .kind = .vgpr, .reg = component },
+            .src0 = .{ .kind = .vgpr, .reg = 5 },
+            .src_count = 1,
+        });
+    }
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .exp,
+        .export_target = 0x0c,
+        .export_enable = 0xf,
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src1 = .{ .kind = .vgpr, .reg = 1 },
+        .src2 = .{ .kind = .vgpr, .reg = 2 },
+        .src3 = .{ .kind = .vgpr, .reg = 3 },
+        .src_count = 4,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .vertex,
+        .vertex_index_vgpr = 0,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    // The wave-info read no longer rejects the program, the primitive export is
+    // dropped rather than translated, and the position still reaches Vulkan.
+    try std.testing.expectEqual(@as(usize, 1), countOpcode(module.words, 62)); // OpStore Position
+    try std.testing.expect(containsOpcode(module.words, 111)); // OpConvertSToF from V5
+    // Position, VertexIndex and InstanceIndex are decorated: a vertex prolog
+    // selects between the latter two, so neither may be left undefined.
+    try std.testing.expectEqual(@as(usize, 3), countOpcode(module.words, 71)); // OpDecorate BuiltIn
 }
 
 test "vertex PARAM export and fragment interpolation share a location" {
