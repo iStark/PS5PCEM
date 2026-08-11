@@ -47,6 +47,7 @@ const ajm_error_invalid_parameter: i32 = @bitCast(@as(u32, 0x8093_0005));
 const ajm_error_codec_not_supported: i32 = @bitCast(@as(u32, 0x8093_0008));
 const ajm_error_job_creation: i32 = @bitCast(@as(u32, 0x8093_0012));
 const ajm_result_invalid_parameter: i32 = 0x0000_0004;
+const ngs2_error_invalid_output: i32 = @bitCast(@as(u32, 0x804a_0053));
 
 const Lock = struct {
     inner: std.atomic.Mutex = .unlocked,
@@ -433,6 +434,49 @@ fn audioOutOutput(handle: i32, data: ?*const anyopaque) callconv(abi.guest) i32 
     return errno.ok;
 }
 
+const AudioOutOutputParam = extern struct {
+    handle: i32,
+    padding: u32,
+    data: u64,
+};
+
+fn audioOutOutputs(parameters: ?[*]const AudioOutOutputParam, count: u32) callconv(abi.guest) i32 {
+    if (count == 0 or count > 25) return audio_out_error_port_full;
+    const list = parameters orelse return audio_out_error_invalid_pointer;
+    const byte_size = @as(u64, count) * @sizeOf(AudioOutOutputParam);
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(list), byte_size)) {
+        return audio_out_error_invalid_pointer;
+    }
+
+    // Validate the complete batch before submitting its first buffer. A bad
+    // later descriptor must not leave the host device with a partial batch.
+    var frames: ?u32 = null;
+    for (list[0..count], 0..) |entry, index| {
+        const port = legacyPort(entry.handle, .output) orelse return audio_out_error_invalid_port;
+        if (frames) |expected| {
+            if (port.frames != expected) return audio_out_error_invalid_size;
+        } else frames = port.frames;
+        for (list[0..index]) |previous| {
+            if (previous.handle == entry.handle) return audio_out_error_invalid_port;
+        }
+        if (entry.data != 0) {
+            const length = port.frames * @as(u32, port.channels) * port.samples.bytes();
+            if (!kernel_memory.isGuestRangeAccessible(entry.data, length)) return audio_out_error_invalid_pointer;
+        }
+    }
+
+    for (list[0..count]) |entry| {
+        if (entry.data == 0) {
+            const port = legacyPort(entry.handle, .output) orelse return audio_out_error_invalid_port;
+            pace(port.frames, port.frequency);
+            continue;
+        }
+        const status = audioOutOutput(entry.handle, @ptrFromInt(entry.data));
+        if (status != errno.ok) return status;
+    }
+    return errno.ok;
+}
+
 fn audioOutClose(handle: i32) callconv(abi.guest) i32 {
     return if (releaseLegacyPort(handle, .output)) errno.ok else audio_out_error_invalid_port;
 }
@@ -450,6 +494,7 @@ const audio_out_exports = [_]symbols.Export{
     .{ .name = "sceAudioOutSetVolume", .function = trace.wrap("sceAudioOutSetVolume", &audioOutSetVolume), .expect_id = "b+uAV89IlxE" },
     .{ .name = "sceAudioOutSetMixLevelPadSpk", .function = trace.wrap("sceAudioOutSetMixLevelPadSpk", &audioOutSetMixLevelPadSpeaker), .expect_id = "wVwPU50pS1c" },
     .{ .name = "sceAudioOutOutput", .function = trace.wrap("sceAudioOutOutput", &audioOutOutput), .expect_id = "QOQtbeDqsT4" },
+    .{ .name = "sceAudioOutOutputs", .function = trace.wrap("sceAudioOutOutputs", &audioOutOutputs), .expect_id = "w3PdaSTSwGE" },
     .{ .name = "sceAudioOutClose", .function = trace.wrap("sceAudioOutClose", &audioOutClose), .expect_id = "s1--uE9mBFw" },
     .{ .name = "sceAudioOutGetPortState", .function = trace.wrap("sceAudioOutGetPortState", &audioOutGetPortState), .expect_id = "GrQ9s4IrNaQ" },
 };
@@ -666,6 +711,134 @@ const audio_out2_exports = [_]symbols.Export{
     .{ .name = "sceAudioOut2UserCreate", .function = trace.wrap("sceAudioOut2UserCreate", &audioOut2UserCreate), .expect_id = "xywYcRB7nbQ" },
     .{ .name = "sceAudioOut2UserDestroy", .function = trace.wrap("sceAudioOut2UserDestroy", &audioOut2UserDestroy), .expect_id = "IaZXJ9M79uo" },
     .{ .name = "sceAudioOut2GetSpeakerInfo", .function = trace.wrap("sceAudioOut2GetSpeakerInfo", &audioOut2GetSpeakerInfo), .expect_id = "DImz2Ft9E2g" },
+};
+
+// libSceNgs2 ---------------------------------------------------------------
+
+const Ngs2RenderBuffer = extern struct {
+    address: u64,
+    size: u64,
+    waveform_type: u32,
+    channels: u32,
+};
+
+var next_ngs2_handle = std.atomic.Value(u64).init(0x4e47_0001);
+
+fn ngs2Handle() u64 {
+    return next_ngs2_handle.fetchAdd(1, .monotonic);
+}
+
+fn ngs2WriteHandle(output: ?*u64) i32 {
+    const destination = output orelse return ngs2_error_invalid_output;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(destination), @sizeOf(u64))) {
+        return errno.KernelError.efault.raw();
+    }
+    destination.* = ngs2Handle();
+    return errno.ok;
+}
+
+fn ngs2SystemCreateWithAllocator(_: u64, _: u64, output: ?*u64) callconv(abi.guest) i32 {
+    return ngs2WriteHandle(output);
+}
+
+fn ngs2RackCreateWithAllocator(
+    system: u64,
+    _: u32,
+    _: u64,
+    _: u64,
+    output: ?*u64,
+) callconv(abi.guest) i32 {
+    if (system == 0) return errno.KernelError.einval.raw();
+    return ngs2WriteHandle(output);
+}
+
+fn ngs2RackGetVoiceHandle(rack: u64, _: u32, output: ?*u64) callconv(abi.guest) i32 {
+    if (rack == 0) return errno.KernelError.einval.raw();
+    return ngs2WriteHandle(output);
+}
+
+fn ngs2AcceptHandle(handle: u64) callconv(abi.guest) i32 {
+    return if (handle == 0) errno.KernelError.einval.raw() else errno.ok;
+}
+
+fn ngs2VoiceOperation(handle: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return if (handle == 0) errno.KernelError.einval.raw() else errno.ok;
+}
+
+fn ngs2SystemRender(system: u64, buffers_address: u64, count: u32) callconv(abi.guest) i32 {
+    if (system == 0) return errno.KernelError.einval.raw();
+    if (count == 0) return errno.ok;
+    if (buffers_address == 0 or count > 32 or
+        !kernel_memory.isGuestRangeAccessible(buffers_address, @as(u64, count) * @sizeOf(Ngs2RenderBuffer)))
+    {
+        return errno.KernelError.efault.raw();
+    }
+    const buffers: [*]const Ngs2RenderBuffer = @ptrFromInt(buffers_address);
+    for (buffers[0..count]) |buffer| {
+        if (buffer.address == 0 or buffer.size == 0) continue;
+        if (buffer.size > 16 * 1024 * 1024 or
+            !kernel_memory.isGuestRangeAccessible(buffer.address, buffer.size))
+        {
+            return errno.KernelError.efault.raw();
+        }
+        const destination: [*]u8 = @ptrFromInt(buffer.address);
+        @memset(destination[0..buffer.size], 0);
+    }
+    return errno.ok;
+}
+
+fn ngs2VoiceGetState(handle: u64, state_address: u64, state_size: usize) callconv(abi.guest) i32 {
+    if (handle == 0) return errno.KernelError.einval.raw();
+    if (state_address != 0 and state_size != 0) {
+        const bounded_size = @min(state_size, 0x400);
+        if (!kernel_memory.isGuestRangeAccessible(state_address, bounded_size)) return errno.KernelError.efault.raw();
+        const destination: [*]u8 = @ptrFromInt(state_address);
+        @memset(destination[0..bounded_size], 0);
+    }
+    return errno.ok;
+}
+
+fn ngs2VoiceGetStateFlags(handle: u64, output: ?*u64) callconv(abi.guest) i32 {
+    if (handle == 0) return errno.KernelError.einval.raw();
+    if (output) |flags| {
+        if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(flags), @sizeOf(u64))) return errno.KernelError.efault.raw();
+        flags.* = 0;
+    }
+    return errno.ok;
+}
+
+fn ngs2PanInit(work_address: u64, _: u64, _: f32, _: u32) callconv(abi.guest) i32 {
+    if (work_address == 0) return errno.KernelError.einval.raw();
+    // The exact work area is SDK-private; callers only pass it back to the pan
+    // query, so no host state has to be embedded in guest memory.
+    return errno.ok;
+}
+
+fn ngs2PanGetVolumeMatrix(_: u64, _: u64, count: u32, format: u32, output_address: u64) callconv(abi.guest) i32 {
+    if (count == 0) return errno.ok;
+    const channel_count: usize = if (format == 0) 2 else @min(format, 8);
+    const float_count = std.math.mul(usize, count, channel_count) catch return errno.KernelError.einval.raw();
+    const byte_size = std.math.mul(usize, float_count, @sizeOf(f32)) catch return errno.KernelError.einval.raw();
+    if (!kernel_memory.isGuestRangeAccessible(output_address, byte_size)) return errno.KernelError.efault.raw();
+    const matrix: [*]f32 = @ptrFromInt(output_address);
+    @memset(matrix[0..float_count], 0);
+    for (0..count) |row| matrix[row * channel_count] = 1.0;
+    return errno.ok;
+}
+
+const ngs2_exports = [_]symbols.Export{
+    .{ .name = "sceNgs2SystemCreateWithAllocator", .function = trace.wrap("sceNgs2SystemCreateWithAllocator", &ngs2SystemCreateWithAllocator), .expect_id = "mPYgU4oYpuY" },
+    .{ .name = "sceNgs2RackCreateWithAllocator", .function = trace.wrap("sceNgs2RackCreateWithAllocator", &ngs2RackCreateWithAllocator), .expect_id = "U546k6orxQo" },
+    .{ .name = "sceNgs2RackGetVoiceHandle", .function = trace.wrap("sceNgs2RackGetVoiceHandle", &ngs2RackGetVoiceHandle), .expect_id = "MwmHz8pAdAo" },
+    .{ .name = "sceNgs2VoiceControl", .function = trace.wrap("sceNgs2VoiceControl", &ngs2VoiceOperation), .expect_id = "uu94irFOGpA" },
+    .{ .name = "sceNgs2VoiceRunCommands", .function = trace.wrap("sceNgs2VoiceRunCommands", &ngs2VoiceOperation), .expect_id = "AbYvTOZ8Pts" },
+    .{ .name = "sceNgs2RackDestroy", .function = trace.wrap("sceNgs2RackDestroy", &ngs2AcceptHandle), .expect_id = "lCqD7oycmIM" },
+    .{ .name = "sceNgs2SystemDestroy", .function = trace.wrap("sceNgs2SystemDestroy", &ngs2AcceptHandle), .expect_id = "u-WrYDaJA3k" },
+    .{ .name = "sceNgs2SystemRender", .function = trace.wrap("sceNgs2SystemRender", &ngs2SystemRender), .expect_id = "i0VnXM-C9fc" },
+    .{ .name = "sceNgs2PanInit", .function = trace.wrap("sceNgs2PanInit", &ngs2PanInit), .expect_id = "xa8oL9dmXkM" },
+    .{ .name = "sceNgs2PanGetVolumeMatrix", .function = trace.wrap("sceNgs2PanGetVolumeMatrix", &ngs2PanGetVolumeMatrix), .expect_id = "gbMKV+8Enuo" },
+    .{ .name = "sceNgs2VoiceGetState", .function = trace.wrap("sceNgs2VoiceGetState", &ngs2VoiceGetState), .expect_id = "-TOuuAQ-buE" },
+    .{ .name = "sceNgs2VoiceGetStateFlags", .function = trace.wrap("sceNgs2VoiceGetStateFlags", &ngs2VoiceGetStateFlags), .expect_id = "rEh728kXk3w" },
 };
 
 // libSceAjm ---------------------------------------------------------------
@@ -1136,6 +1309,7 @@ pub fn reset() void {
     ajm_instances = [_]AjmInstance{.{}} ** maximum_ajm_instances;
     ajm_mutex.unlock();
     next_batch.store(1, .monotonic);
+    next_ngs2_handle.store(0x4e47_0001, .monotonic);
     ajm_decode_jobs.store(0, .monotonic);
     audio_out_play_ok.store(0, .monotonic);
     audio_out_play_silent.store(0, .monotonic);
@@ -1149,6 +1323,7 @@ pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!voi
     try db.addLibrary(gpa, .{ .name = "libSceAudioOut", .version = 1 }, .{ .name = "libSceAudioOut" }, &audio_out_exports);
     try db.addLibrary(gpa, .{ .name = "libSceAudioIn", .version = 1 }, .{ .name = "libSceAudioIn" }, &audio_in_exports);
     try db.addLibrary(gpa, .{ .name = "libSceAudioOut2", .version = 1 }, .{ .name = "libSceAudioOut" }, &audio_out2_exports);
+    try db.addLibrary(gpa, .{ .name = "libSceNgs2", .version = 1 }, .{ .name = "libSceNgs2" }, &ngs2_exports);
     try db.addLibrary(gpa, .{ .name = "libSceAjm", .version = 1 }, .{ .name = "libSceAjm" }, &ajm_exports);
 }
 

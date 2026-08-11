@@ -219,6 +219,21 @@ comptime {
 /// Mount points a title uses to name its own files.
 const mount_points = [_][]const u8{ "/app0/", "/hostapp/", "/host/" };
 
+/// Whether a path names a mount itself rather than one of its children.
+///
+/// `stripMount` deliberately has no relative child to return for these paths,
+/// but filesystem APIs still have to expose the mount as a directory. Managed
+/// runtimes commonly stat every parent before opening a file; reporting
+/// `/app0` missing makes an existing `/app0/content.txt` look unreachable.
+fn isMountRoot(path: []const u8) bool {
+    for (mount_points) |mount| {
+        const without_slash = mount[0 .. mount.len - 1];
+        if (std.ascii.eqlIgnoreCase(path, without_slash) or
+            std.ascii.eqlIgnoreCase(path, mount)) return true;
+    }
+    return false;
+}
+
 /// Strips a mount prefix, yielding a path relative to the title root.
 ///
 /// Returns null for a path outside every known mount: only content the title
@@ -245,6 +260,10 @@ pub fn stripMount(path: []const u8) ?[]const u8 {
 /// are clamped at `/app0`; passing them directly to the host directory instead
 /// walks above the title and makes the engine enumerate the wrong directory.
 fn normalizedMountRelative(path: []const u8, storage: *[maximum_path]u8) ?[]const u8 {
+    if (isMountRoot(path)) {
+        storage[0] = '.';
+        return storage[0..1];
+    }
     const raw = stripMount(path) orelse return null;
     if (raw.len > maximum_path) return null;
 
@@ -979,6 +998,9 @@ test "mount prefixes are stripped and foreign paths refused" {
 
 test "mount-relative parent segments clamp at the title root" {
     var storage: [maximum_path]u8 = undefined;
+    try testing.expectEqualStrings(".", normalizedMountRelative("/app0", &storage).?);
+    try testing.expectEqualStrings(".", normalizedMountRelative("/APP0/", &storage).?);
+    try testing.expectEqualStrings(".", normalizedMountRelative("/hostapp", &storage).?);
     try testing.expectEqualStrings(
         "TetrisEffect/Content/Paks",
         normalizedMountRelative("../../../TetrisEffect/Content/Paks", &storage).?,

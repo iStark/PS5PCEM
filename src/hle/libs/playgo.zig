@@ -178,6 +178,43 @@ pub fn getInstallSpeed(value: u32, output: ?*i32) callconv(abi.guest) i32 {
     return errno.ok;
 }
 
+pub fn getLanguageMask(value: u32, output: ?*u64) callconv(abi.guest) i32 {
+    const status = validateHandle(value);
+    if (status != errno.ok) return status;
+    const result = output orelse return error_bad_pointer;
+    if (!writable(@intFromPtr(result), @sizeOf(u64))) return error_bad_pointer;
+    // A complete local package makes every language group immediately usable.
+    result.* = std.math.maxInt(u64);
+    return errno.ok;
+}
+
+pub fn getToDoList(
+    value: u32,
+    output_list_address: u64,
+    capacity: u32,
+    output_count: ?*u32,
+) callconv(abi.guest) i32 {
+    const status = validateHandle(value);
+    if (status != errno.ok) return status;
+    if (output_list_address == 0 or output_count == null) return error_bad_pointer;
+    if (capacity == 0) return error_bad_size;
+    const result = output_count.?;
+    if (!writable(@intFromPtr(result), @sizeOf(u32))) return error_bad_pointer;
+    result.* = 0;
+    return errno.ok;
+}
+
+pub fn setToDoList(value: u32, list_address: u64, count: u32) callconv(abi.guest) i32 {
+    const status = validateHandle(value);
+    if (status != errno.ok) return status;
+    if (list_address == 0) return error_bad_pointer;
+    if (count == 0) return error_bad_size;
+    if (count > maximum_entries or !readable(list_address, @as(u64, count) * @sizeOf(u16))) {
+        return error_bad_pointer;
+    }
+    return errno.ok;
+}
+
 pub fn reset() void {
     initialized.store(false, .release);
     opened.store(false, .release);

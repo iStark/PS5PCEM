@@ -27,6 +27,7 @@ const cond_magic: u64 = 0x5054_434f_4e44_0001;
 const cond_attr_magic: u64 = 0x5054_4341_5454_5201;
 const rwlock_magic: u64 = 0x5054_5257_4c4f_434b;
 const rwlock_attr_magic: u64 = 0x5054_5257_4154_5452;
+const barrier_magic: u64 = 0x5054_4241_5252_4945;
 
 const wake_all = std.math.maxInt(usize);
 
@@ -53,6 +54,7 @@ pub const CondHandle = ?*Cond;
 pub const CondAttrHandle = ?*CondAttr;
 pub const RwlockHandle = ?*Rwlock;
 pub const RwlockAttrHandle = ?*RwlockAttr;
+pub const BarrierHandle = ?*Barrier;
 
 const Mutex = struct {
     magic: u64 = mutex_magic,
@@ -111,6 +113,15 @@ const RwlockAttr = struct {
     kind: i32 = 1,
 };
 
+const Barrier = struct {
+    magic: u64 = barrier_magic,
+    state_lock: Lock = .{},
+    threshold: u32,
+    arrived: u32 = 0,
+    waiters: usize = 0,
+    generation: u64 = 1,
+};
+
 pub const Error = error{
     NotAttached,
     InvalidArgument,
@@ -129,6 +140,7 @@ pub const Manager = struct {
     cond_attrs: std.ArrayList(*CondAttr) = .empty,
     rwlocks: std.ArrayList(*Rwlock) = .empty,
     rwlock_attrs: std.ArrayList(*RwlockAttr) = .empty,
+    barriers: std.ArrayList(*Barrier) = .empty,
     lock: Lock = .{},
     initialized: bool = false,
 
@@ -148,12 +160,14 @@ pub const Manager = struct {
             self.allocator.destroy(object);
         }
         for (self.rwlock_attrs.items) |attr| self.allocator.destroy(attr);
+        for (self.barriers.items) |object| self.allocator.destroy(object);
         self.mutexes.deinit(self.allocator);
         self.mutex_attrs.deinit(self.allocator);
         self.conditions.deinit(self.allocator);
         self.cond_attrs.deinit(self.allocator);
         self.rwlocks.deinit(self.allocator);
         self.rwlock_attrs.deinit(self.allocator);
+        self.barriers.deinit(self.allocator);
         self.lock.unlock();
         self.* = .{};
     }
@@ -435,6 +449,56 @@ pub const Manager = struct {
         object.state_lock.unlock();
         self.lock.unlock();
         object.deinit();
+        self.allocator.destroy(object);
+    }
+
+    fn createBarrier(self: *Manager, out: *BarrierHandle, count: u32) Error!void {
+        if (count == 0) return error.InvalidArgument;
+        self.lock.lock();
+        defer self.lock.unlock();
+        if (findPointer(Barrier, self.barriers.items, out.*)) |existing| {
+            if (existing.waiters != 0 or existing.arrived != 0) return error.Busy;
+            existing.threshold = count;
+            _ = advanceSequence(&existing.generation);
+            return;
+        }
+        if (out.* != null) return error.InvalidArgument;
+        const object = try self.allocator.create(Barrier);
+        object.* = .{ .threshold = count };
+        errdefer self.allocator.destroy(object);
+        try self.barriers.append(self.allocator, object);
+        out.* = object;
+    }
+
+    fn lockBarrier(self: *Manager, out: *BarrierHandle) Error!*Barrier {
+        self.lock.lock();
+        const object = findPointer(Barrier, self.barriers.items, out.*) orelse {
+            self.lock.unlock();
+            return error.InvalidArgument;
+        };
+        object.state_lock.lock();
+        self.lock.unlock();
+        return object;
+    }
+
+    fn destroyBarrier(self: *Manager, out: *BarrierHandle) Error!void {
+        self.lock.lock();
+        const index = findIndex(Barrier, self.barriers.items, out.*) orelse {
+            self.lock.unlock();
+            return error.InvalidArgument;
+        };
+        const object = self.barriers.items[index];
+        object.state_lock.lock();
+        if (object.waiters != 0 or object.arrived != 0) {
+            object.state_lock.unlock();
+            self.lock.unlock();
+            return error.Busy;
+        }
+        _ = self.barriers.orderedRemove(index);
+        object.magic = 0;
+        out.* = null;
+        object.state_lock.unlock();
+        self.lock.unlock();
         self.allocator.destroy(object);
     }
 };
@@ -1334,6 +1398,80 @@ pub fn scePthreadRwlockattrSettype(attr_raw: ?*RwlockAttrHandle, kind: i32) call
     return errno.ok;
 }
 
+pub fn scePthreadBarrierInit(
+    barrier: ?*BarrierHandle,
+    _: ?*const anyopaque,
+    count: u32,
+    _: ?[*:0]const u8,
+) callconv(abi.guest) i32 {
+    const output = barrier orelse return KernelError.einval.raw();
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(output), @sizeOf(BarrierHandle))) {
+        return KernelError.einval.raw();
+    }
+    const manager = activeManager() orelse return KernelError.enosys.raw();
+    manager.createBarrier(output, count) catch |err| return kernelStatus(err);
+    return errno.ok;
+}
+
+pub fn scePthreadBarrierDestroy(barrier: ?*BarrierHandle) callconv(abi.guest) i32 {
+    const output = barrier orelse return KernelError.einval.raw();
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(output), @sizeOf(BarrierHandle))) {
+        return KernelError.einval.raw();
+    }
+    const manager = activeManager() orelse return KernelError.enosys.raw();
+    manager.destroyBarrier(output) catch |err| return kernelStatus(err);
+    return errno.ok;
+}
+
+/// Waits for one complete barrier generation. Exactly one participant receives
+/// the FreeBSD/console `PTHREAD_BARRIER_SERIAL_THREAD` result (-1); all other
+/// participants receive zero.
+pub fn scePthreadBarrierWait(barrier: ?*BarrierHandle) callconv(abi.guest) i32 {
+    const output = barrier orelse return KernelError.einval.raw();
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(output), @sizeOf(BarrierHandle))) {
+        return KernelError.einval.raw();
+    }
+    const manager = activeManager() orelse return KernelError.enosys.raw();
+    const object = manager.lockBarrier(output) catch |err| return kernelStatus(err);
+    const observed_generation = object.generation;
+    object.arrived += 1;
+    if (object.arrived == object.threshold) {
+        object.arrived = 0;
+        const generation = advanceSequence(&object.generation);
+        const waiters = object.waiters;
+        object.state_lock.unlock();
+        if (waiters != 0) threading.wakeWaiters(@intFromPtr(object), generation, wake_all);
+        return -1;
+    }
+
+    object.waiters += 1;
+    object.state_lock.unlock();
+    while (true) {
+        _ = threading.waitCurrent(.{
+            .key = @intFromPtr(object),
+            .observed_sequence = observed_generation,
+        }) catch |err| {
+            object.state_lock.lock();
+            if (object.generation != observed_generation) {
+                object.waiters -= 1;
+                object.state_lock.unlock();
+                return errno.ok;
+            }
+            object.waiters -= 1;
+            object.arrived -= 1;
+            object.state_lock.unlock();
+            return kernelStatus(err);
+        };
+        object.state_lock.lock();
+        if (object.generation != observed_generation) {
+            object.waiters -= 1;
+            object.state_lock.unlock();
+            return errno.ok;
+        }
+        object.state_lock.unlock();
+    }
+}
+
 /// The kernel primitive a libc builds its own locks on.
 ///
 /// Reported as unimplemented. Every lock a title actually takes goes through
@@ -1412,6 +1550,10 @@ pub const exports = [_]symbols.Export{
     .{ .name = "pthread_rwlockattr_destroy", .function = trace.wrap("pthread_rwlockattr_destroy", &pthread_rwlockattr_destroy), .expect_id = "qsdmgXjqSgk" },
     .{ .name = "scePthreadRwlockattrGettype", .function = trace.wrap("scePthreadRwlockattrGettype", &scePthreadRwlockattrGettype) },
     .{ .name = "scePthreadRwlockattrSettype", .function = trace.wrap("scePthreadRwlockattrSettype", &scePthreadRwlockattrSettype), .expect_id = "h-OifiouBd8" },
+
+    .{ .name = "scePthreadBarrierWait", .function = trace.wrap("scePthreadBarrierWait", &scePthreadBarrierWait), .expect_id = "t9vVyTglqHQ" },
+    .{ .name = "scePthreadBarrierDestroy", .function = trace.wrap("scePthreadBarrierDestroy", &scePthreadBarrierDestroy), .expect_id = "HudB2Jv2MPY" },
+    .{ .name = "scePthreadBarrierInit", .function = trace.wrap("scePthreadBarrierInit", &scePthreadBarrierInit), .expect_id = "5dgOEPsEGqw" },
 };
 
 pub const library = symbols.Library{ .name = "libkernel", .version = 1 };

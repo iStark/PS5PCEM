@@ -26,6 +26,7 @@ const abi = @import("../abi.zig");
 const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
+const kernel_memory = @import("kernel_memory.zig");
 
 /// Status a service library returns when it has not been, and cannot be,
 /// brought up.
@@ -55,12 +56,65 @@ pub fn noDevice(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.gue
     return unavailable;
 }
 
+/// Boolean device probes return false without manufacturing an error path.
+pub fn notAttached(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return 0;
+}
+
 /// Bookkeeping that changes nothing observable and has nothing to report back.
 ///
 /// Kept apart from the refusals on purpose: refusing a title's attempt to, say,
 /// release something it allocated would leave it believing the thing is still
 /// live. Nothing here hands back a value a caller then follows.
 pub fn accept(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
+/// UDS is an offline telemetry sink here, but its bootstrap objects are still
+/// real from the title's point of view. Initialisation validates the parameter
+/// record and context creation supplies the handle later calls carry around.
+pub fn udsInitialize(parameters: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    if (parameters == 0) return @bitCast(@as(u32, 0x8055_3102));
+    if (!kernel_memory.isGuestRangeAccessible(parameters, 16)) return errno.KernelError.efault.raw();
+    return errno.ok;
+}
+
+pub fn udsCreateContext(output: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    if (output == 0) return errno.ok;
+    if (!kernel_memory.isGuestRangeAccessible(output, @sizeOf(i32))) {
+        return errno.KernelError.efault.raw();
+    }
+    const handle: *i32 = @ptrFromInt(output);
+    handle.* = 1;
+    return errno.ok;
+}
+
+var uds_next_handle = std.atomic.Value(i32).init(1);
+
+/// SDK revisions place the created UDS handle in either the first or second
+/// argument. Write the first accessible output, matching the firmware's
+/// compatibility behaviour without uploading any telemetry.
+pub fn udsCreateHandle(first: u64, second: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    const output = if (first != 0 and kernel_memory.isGuestRangeAccessible(first, @sizeOf(i32)))
+        first
+    else if (second != 0 and kernel_memory.isGuestRangeAccessible(second, @sizeOf(i32)))
+        second
+    else
+        return errno.KernelError.efault.raw();
+    const handle: *i32 = @ptrFromInt(output);
+    handle.* = uds_next_handle.fetchAdd(1, .acq_rel);
+    return errno.ok;
+}
+
+pub fn udsCreateEvent(_: u64, _: u64, third: u64, fourth: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    const output = if (third != 0 and kernel_memory.isGuestRangeAccessible(third, @sizeOf(i32)))
+        third
+    else if (fourth != 0 and kernel_memory.isGuestRangeAccessible(fourth, @sizeOf(i32)))
+        fourth
+    else
+        return errno.KernelError.efault.raw();
+    const handle: *i32 = @ptrFromInt(output);
+    handle.* = uds_next_handle.fetchAdd(1, .acq_rel);
     return errno.ok;
 }
 

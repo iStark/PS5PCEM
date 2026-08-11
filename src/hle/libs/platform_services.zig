@@ -247,6 +247,22 @@ pub fn rtcGetTick(time_pointer: ?*const RtcDateTime, output: ?*u64) callconv(abi
     return errno.ok;
 }
 
+pub fn rtcGetTimeT(time_pointer: ?*const RtcDateTime, output: ?*i64) callconv(abi.guest) i32 {
+    const source = time_pointer orelse return rtc_error_invalid_pointer;
+    const destination = output orelse return rtc_error_invalid_pointer;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(source), @sizeOf(RtcDateTime)) or
+        !kernel_memory.isGuestRangeAccessible(@intFromPtr(destination), @sizeOf(i64)))
+    {
+        return gen2_error_memory_fault;
+    }
+    const tick = tickFromRtcDateTime(source.*) orelse return rtc_error_invalid_value;
+    destination.* = if (tick < rtc_unix_epoch_microseconds)
+        0
+    else
+        @intCast(@divTrunc(tick - rtc_unix_epoch_microseconds, std.time.us_per_s));
+    return errno.ok;
+}
+
 const app_content_exports = [_]symbols.Export{
     .{ .name = "sceAppContentInitialize", .function = trace.wrap("sceAppContentInitialize", &appContentInitialize), .expect_id = "R9lA82OraNs" },
     .{ .name = "sceAppContentTemporaryDataMount2", .function = trace.wrap("sceAppContentTemporaryDataMount2", &temporaryDataMount2), .expect_id = "buYbeLOGWmA" },

@@ -29,6 +29,9 @@ var message_mode: std.atomic.Value(i32) = .init(0);
 var browser_status: std.atomic.Value(i32) = .init(status_none);
 var ime_dialog_status: std.atomic.Value(i32) = .init(status_none);
 var signin_dialog_status: std.atomic.Value(i32) = .init(status_none);
+var save_dialog_status: std.atomic.Value(i32) = .init(status_none);
+var save_dialog_mode: std.atomic.Value(i32) = .init(0);
+var save_dialog_user_data: std.atomic.Value(u64) = .init(0);
 var keyboard_open: std.atomic.Value(u8) = .init(0);
 
 pub fn reset() void {
@@ -37,6 +40,9 @@ pub fn reset() void {
     browser_status.store(status_none, .release);
     ime_dialog_status.store(status_none, .release);
     signin_dialog_status.store(status_none, .release);
+    save_dialog_status.store(status_none, .release);
+    save_dialog_mode.store(0, .release);
+    save_dialog_user_data.store(0, .release);
     keyboard_open.store(0, .release);
 }
 
@@ -188,6 +194,67 @@ const signin_dialog_exports = [_]symbols.Export{
     .{ .name = "sceSigninDialogTerminate", .function = trace.wrap("sceSigninDialogTerminate", &signinDialogTerminate), .expect_id = "LXlmS6PvJdU" },
 };
 
+// Save-data dialog ---------------------------------------------------------
+
+fn saveDialogInitialize() callconv(abi.guest) i32 {
+    save_dialog_status.store(status_initialized, .release);
+    save_dialog_mode.store(0, .release);
+    save_dialog_user_data.store(0, .release);
+    return errno.ok;
+}
+
+fn saveDialogOpen(parameter: ?[*]const u8) callconv(abi.guest) i32 {
+    if (parameter) |bytes| {
+        // Common-dialog base (0x30), then size/mode/dispType/padding and eight
+        // pointers. Mode and userData are reflected by GetResult.
+        save_dialog_mode.store(std.mem.readInt(i32, bytes[0x34..0x38], .little), .release);
+        save_dialog_user_data.store(std.mem.readInt(u64, bytes[0x70..0x78], .little), .release);
+    }
+    save_dialog_status.store(status_finished, .release);
+    return errno.ok;
+}
+
+fn saveDialogStatus() callconv(abi.guest) i32 {
+    return save_dialog_status.load(.acquire);
+}
+
+fn saveDialogGetResult(result: ?*[72]u8) callconv(abi.guest) i32 {
+    const output = result orelse return msg_error_argument_null;
+    @memset(output, 0);
+    std.mem.writeInt(i32, output[0..4], save_dialog_mode.load(.acquire), .little);
+    std.mem.writeInt(i32, output[4..8], 0, .little); // OK
+    std.mem.writeInt(i32, output[8..12], 1, .little); // OK button
+    std.mem.writeInt(u64, output[32..40], save_dialog_user_data.load(.acquire), .little);
+    return errno.ok;
+}
+
+fn saveDialogClose(_: ?*const anyopaque) callconv(abi.guest) i32 {
+    save_dialog_status.store(status_finished, .release);
+    return errno.ok;
+}
+
+fn saveDialogReady() callconv(abi.guest) i32 {
+    return 1;
+}
+
+fn saveDialogTerminate() callconv(abi.guest) i32 {
+    save_dialog_status.store(status_none, .release);
+    return errno.ok;
+}
+
+const save_dialog_exports = [_]symbols.Export{
+    .{ .name = "sceSaveDataDialogInitialize", .function = trace.wrap("sceSaveDataDialogInitialize", &saveDialogInitialize), .expect_id = "s9e3+YpRnzw" },
+    .{ .name = "sceSaveDataDialogOpen", .function = trace.wrap("sceSaveDataDialogOpen", &saveDialogOpen), .expect_id = "4tPhsP6FpDI" },
+    .{ .name = "sceSaveDataDialogUpdateStatus", .function = trace.wrap("sceSaveDataDialogUpdateStatus", &saveDialogStatus), .expect_id = "KK3Bdg1RWK0" },
+    .{ .name = "sceSaveDataDialogGetStatus", .function = trace.wrap("sceSaveDataDialogGetStatus", &saveDialogStatus), .expect_id = "ERKzksauAJA" },
+    .{ .name = "sceSaveDataDialogGetResult", .function = trace.wrap("sceSaveDataDialogGetResult", &saveDialogGetResult), .expect_id = "yEiJ-qqr6Cg" },
+    .{ .name = "sceSaveDataDialogClose", .function = trace.wrap("sceSaveDataDialogClose", &saveDialogClose), .expect_id = "fH46Lag88XY" },
+    .{ .name = "sceSaveDataDialogIsReadyToDisplay", .function = trace.wrap("sceSaveDataDialogIsReadyToDisplay", &saveDialogReady), .expect_id = "en7gNVnh878" },
+    .{ .name = "sceSaveDataDialogTerminate", .function = trace.wrap("sceSaveDataDialogTerminate", &saveDialogTerminate), .expect_id = "YuH2FA7azqQ" },
+    .{ .name = "sceSaveDataDialogProgressBarInc", .function = trace.wrap("sceSaveDataDialogProgressBarInc", &messageProgress), .expect_id = "V-uEeFKARJU" },
+    .{ .name = "sceSaveDataDialogProgressBarSetValue", .function = trace.wrap("sceSaveDataDialogProgressBarSetValue", &messageProgress), .expect_id = "hay1CfTmLyA" },
+};
+
 // IME dialog and optional physical keyboard --------------------------------
 
 fn imeDialogInit(parameter: ?*const anyopaque) callconv(abi.guest) i32 {
@@ -262,6 +329,7 @@ pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!voi
     try db.addLibrary(gpa, .{ .name = "libSceMsgDialog.native" }, .{ .name = "libSceMsgDialog" }, &message_dialog_exports);
     try db.addLibrary(gpa, .{ .name = "libSceWebBrowserDialog" }, .{ .name = "libSceWebBrowserDialog" }, &browser_dialog_exports);
     try db.addLibrary(gpa, .{ .name = "libSceSigninDialog" }, .{ .name = "libSceSigninDialog" }, &signin_dialog_exports);
+    try db.addLibrary(gpa, .{ .name = "libSceSaveDataDialog.native" }, .{ .name = "libSceSaveDataDialog" }, &save_dialog_exports);
     try db.addLibrary(gpa, .{ .name = "libSceImeDialog" }, .{ .name = "libSceImeDialog" }, &ime_dialog_exports);
     try db.addLibrary(gpa, .{ .name = "libSceIme" }, .{ .name = "libSceIme" }, &ime_exports);
 }

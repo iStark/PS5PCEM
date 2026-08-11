@@ -41,6 +41,7 @@ pub const libs = struct {
     pub const libc_internal = @import("libs/libc_internal.zig");
     pub const network = @import("libs/network.zig");
     pub const platform_services = @import("libs/platform_services.zig");
+    pub const png_dec = @import("libs/png_dec.zig");
     pub const playgo = @import("libs/playgo.zig");
     pub const registry = @import("libs/registry.zig");
     pub const services = @import("libs/services.zig");
@@ -79,6 +80,7 @@ pub fn registerAll(db: *Database, gpa: @import("std").mem.Allocator) symbols.Err
     try libs.libc_internal.register(db, gpa);
     try libs.network.register(db, gpa);
     try libs.platform_services.register(db, gpa);
+    try libs.png_dec.register(db, gpa);
     try libs.registry.register(db, gpa);
     try libs.services.register(db, gpa);
     try libs.pad.register(db, gpa);
@@ -108,6 +110,7 @@ test {
     _ = libs.kernel_event_queue;
     _ = libs.kernel_info;
     _ = libs.kernel_ioctl;
+    _ = libs.png_dec;
     _ = libs.agc;
     _ = libs.agc_submit;
     _ = libs.kernel_aio;

@@ -28,6 +28,7 @@ const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const event_queue = @import("kernel_event_queue.zig");
+const kernel_memory = @import("kernel_memory.zig");
 
 /// The cursor a title keeps over its command buffer.
 ///
@@ -144,6 +145,101 @@ pub fn switchedOff(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.
 /// something failed far from here.
 pub fn refuse(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
     return errno.KernelError.enosys.raw();
+}
+
+const resource_registration_bytes_per_resource: u64 = 0x118;
+const resource_registration_bytes_per_owner: u64 = 0x1e0;
+const resource_registration_max_name_length: u32 = 256;
+
+var default_owner = std.atomic.Value(u32).init(1);
+var next_owner = std.atomic.Value(u32).init(1);
+
+fn writable(comptime T: type, output: ?*T) ?*T {
+    const pointer = output orelse return null;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(pointer), @sizeOf(T))) return null;
+    return pointer;
+}
+
+/// Returns the exact backing-store requirement used by the PS5 resource
+/// registry. Leaving this output untouched makes the caller interpret stack
+/// data as a byte count and attempt multi-gigabyte direct-memory allocations.
+pub fn driverQueryResourceRegistrationUserMemoryRequirements(
+    output: ?*u64,
+    resource_count: u64,
+    owner_count: u64,
+) callconv(abi.guest) i32 {
+    const result = writable(u64, output) orelse return errno.KernelError.efault.raw();
+    if (resource_count == 0 or owner_count == 0) return errno.KernelError.einval.raw();
+    const resources = std.math.mul(u64, resource_count, resource_registration_bytes_per_resource) catch
+        return errno.KernelError.einval.raw();
+    const owners = std.math.mul(u64, owner_count, resource_registration_bytes_per_owner) catch
+        return errno.KernelError.einval.raw();
+    result.* = std.math.add(u64, resources, owners) catch
+        return errno.KernelError.einval.raw();
+    return errno.ok;
+}
+
+pub fn driverInitResourceRegistration(
+    memory_address: u64,
+    memory_size: u64,
+    owner_count: u64,
+) callconv(abi.guest) i32 {
+    if (memory_address == 0 or memory_size == 0 or owner_count == 0) {
+        return errno.KernelError.einval.raw();
+    }
+    if (!kernel_memory.isGuestRangeAccessible(memory_address, memory_size)) {
+        return errno.KernelError.efault.raw();
+    }
+    default_owner.store(1, .release);
+    next_owner.store(1, .release);
+    return errno.ok;
+}
+
+pub fn driverGetResourceRegistrationMaxNameLength(output: ?*u32) callconv(abi.guest) i32 {
+    const result = writable(u32, output) orelse return errno.KernelError.efault.raw();
+    result.* = resource_registration_max_name_length;
+    return errno.ok;
+}
+
+pub fn driverRegisterDefaultOwner(owner: u32) callconv(abi.guest) i32 {
+    default_owner.store(owner, .release);
+    return errno.ok;
+}
+
+pub fn driverGetDefaultOwner(output: ?*u32) callconv(abi.guest) i32 {
+    const result = writable(u32, output) orelse return errno.KernelError.efault.raw();
+    result.* = default_owner.load(.acquire);
+    return errno.ok;
+}
+
+pub fn driverRegisterOwner(output: ?*u32, name: ?[*:0]const u8) callconv(abi.guest) i32 {
+    const result = writable(u32, output) orelse return errno.KernelError.efault.raw();
+    if (name == null) return errno.KernelError.einval.raw();
+    var owner = next_owner.fetchAdd(1, .acq_rel);
+    if (owner == default_owner.load(.acquire)) owner = next_owner.fetchAdd(1, .acq_rel);
+    if (owner == 0) return errno.KernelError.enospc.raw();
+    result.* = owner;
+    return errno.ok;
+}
+
+/// Registration is diagnostic metadata; command submission consumes the
+/// addresses directly. Preserve the full ABI so callers and traces retain the
+/// resource identity even though no host-side name database is needed yet.
+pub fn driverRegisterResource(
+    resource_address: u64,
+    owner: u32,
+    name: ?[*:0]const u8,
+    base_address: u64,
+    resource_type: u32,
+    flags: u32,
+) callconv(abi.guest) i32 {
+    _ = resource_address;
+    _ = owner;
+    _ = name;
+    _ = base_address;
+    _ = resource_type;
+    _ = flags;
+    return errno.ok;
 }
 
 pub fn driverAddEqEvent(equeue: i64, id: i32, user_data: u64) callconv(abi.guest) i32 {

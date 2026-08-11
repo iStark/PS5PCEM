@@ -56,9 +56,15 @@ If you would like to support continued PS5PCEM development, you can do so on
 - PS VR2 libraries currently expose only compatibility/no-device behavior.
   VR plugins can initialize far enough to load Unity assets, but headset
   rendering, tracking, controllers, and a host OpenXR bridge do not exist yet.
-- Offline bootstrap coverage now includes a fully-installed PlayGo profile,
-  normalized `/app0` paths, large sparse virtual reservations, POSIX semaphores
-  and local listener sockets, sign-in dialog state, and split AJM batch jobs.
+- Offline bootstrap coverage now includes a fully-installed PlayGo profile and
+  language/to-do queries, mount-root-aware `/app0` paths, software PNG decoding,
+  save-data mount/dialog lifecycles, POSIX semaphores and pthread barriers,
+  local listener sockets, sign-in dialog state, offline telemetry handles, and
+  split AJM batch jobs.
+- AGC resource registration now reports deterministic backing-memory
+  requirements and retains owner handles instead of leaving output sizes
+  uninitialized. This prevents otherwise valid titles from turning stack data
+  into enormous direct-memory allocation requests during renderer startup.
 - Unreal Engine titles can mount multi-gigabyte PAKs, initialize ICU, load
   cooked configuration and shader archives, and emit real AGC acquire, release,
   wait, event, DMA, indirect-register, draw and flip packets. Tetris Effect:
@@ -120,6 +126,7 @@ the repository contains none of that content.
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
 | **Tetris Effect: Connected** | Completes Unreal filesystem/config bootstrap, executes compact typed UAV clears and 3D volume uploads, translates two 344/125-instruction volume dispatches with recursively recovered V# chains, and translates the complete 176-instruction mixed-image/LDS prepass, including compute `image_sample_lz` at PC `0x29c` and NSA `image_store` at PC `0x440`; its 2,401-instruction deferred compositor writes all 8,294,400 pixels of the 3840×2160 scanout | The first repeatable guest framebuffer is uniform light gray rather than a recognizable scene; a normal run currently produces an NVIDIA GPU fault during an earlier `15×9×8` dispatch, while NGG export and some image forms remain incomplete and the 512 GiB reservation can depend on host address-space placement |
 | **The Precinct** | Links the complete six-image guest graph, defers and starts Unity plug-ins through `sceKernelLoadStartModule`, enters Unity, indexes its audio assets, and plays both observed intro movies through the new SceAvPlayer path. The title receives synchronized 3840×2160 NV12 video and 48 kHz stereo PCM; its guest YUV conversion shader produces the recognizable Kwalee frame above. Post-video graphics continue through seven draws and nine dispatches per frame, with warmed-up frames around 20–22 ms on the current RTX 3070 Ti test host | The post-video scene source is still incorrect: draw 1 receives a sparse/corrupted pixel strip, draw 2 copies it to the scanout, and later UI draws do not restore a recognizable scene. Gameplay is not claimed yet |
+| **Jets 'n' Guns 2** | Loads the three-image guest graph, resolves the title content through `/app0`, completes AGC resource-registration setup without the former bogus allocation, enters a sustained graphics loop, registers a 3840×2160 target, and submits repeated DCBs with up to 24 draws per pass and regular VideoOut flips | Captured frames remain black. The current run eventually stalls after `libSceAudiodec` rejects MP3 decoder creation/decoding, leaving the music path with invalid stream parameters; full legacy Audiodec support and the remaining vertex-shader translation gap are the next bring-up targets |
 
 ## Components
 
@@ -1340,13 +1347,16 @@ continues thread exit if a destructor callback fails.
 
 **`libkernel` — pthread synchronization** ([src/hle/libs/kernel_sync.zig](src/hle/libs/kernel_sync.zig))
 
-Mutexes, condition variables, and reader/writer locks use stable opaque guest
-handles backed by host-owned records. Null static initializers are materialized
-lazily. Mutexes track ownership, recursive depth, type, protocol metadata, and
-timed/try operations. Condition waits atomically publish themselves and release
-the associated mutex, then always reacquire it before returning, including after
-a timeout. Reader/writer locks retain per-thread reader ownership and prefer a
-queued writer over new readers so writers cannot be starved indefinitely.
+Mutexes, condition variables, reader/writer locks, and reusable pthread
+barriers use stable opaque guest handles backed by host-owned records. Null
+static initializers are materialized lazily. Mutexes track ownership, recursive
+depth, type, protocol metadata, and timed/try operations. Condition waits
+atomically publish themselves and release the associated mutex, then always
+reacquire it before returning, including after a timeout. Reader/writer locks
+retain per-thread reader ownership and prefer a queued writer over new readers
+so writers cannot be starved indefinitely. Barriers retain their generation
+across reuse, wake every participant at the threshold, and return the console's
+`PTHREAD_BARRIER_SERIAL_THREAD` result to exactly one participant.
 
 Blocking is scheduler-neutral. Every object has a monotonic sequence number;
 the backend receives the number observed before parking and can therefore avoid
@@ -1430,9 +1440,17 @@ in [src/hle/apr.zig](src/hle/apr.zig) and the guest ABI wrappers remain in
 
 PlayGo presents the already dumped `/app0` tree as one fully installed base
 chunk. Initialize/open/close state, locus, ETA, progress, prefetch and install
-speed use checked guest buffers and reject invalid handles or chunk IDs. This
-lets an offline Unreal title mount complete local content without pretending a
-download service or remote entitlement exists.
+speed use checked guest buffers and reject invalid handles or chunk IDs.
+Language-mask and to-do-list queries describe the same already-installed local
+package. This lets an offline title mount complete local content without
+pretending a download service or remote entitlement exists.
+
+SaveData now exposes transaction-resource creation, `/savedata0` mount results,
+prepare/commit/unmount calls, and the immediate headless dialog lifecycle. These
+are compatibility objects only: persistent writable save storage is not yet
+implemented. Camera2 consistently reports no attached camera, while Universal
+Data System contexts, handles, events, and property calls form an offline
+telemetry sink. RTC conversion also includes `sceRtcGetTime_t`.
 
 **Offline network, dialogs, and headless audio**
 ([src/hle/libs/network.zig](src/hle/libs/network.zig),
@@ -1445,15 +1463,23 @@ the virtual listener described above, and current RTC/network ticks remain
 available, while DNS and peer traffic return deterministic offline errors.
 NetCtl reports a disconnected interface. Common, message, web-browser, IME,
 and sign-in dialogs finish immediately with coherent headless results instead
-of blocking on unavailable UI.
+of blocking on unavailable UI. The software `libScePngDec` implementation
+parses PNG metadata and decodes non-interlaced grayscale, palette, RGB, and
+RGBA images into checked guest RGBA/BGRA buffers, including scanline filters
+and palette transparency. Adam7 input is recognized but not decoded yet.
 
-AudioOut, AudioIn, and AudioOut2 expose paced ports, queues, and speaker
-metadata. AJM owns state per codec instance and performs real ATRAC9 (`codec 1`)
-and MP3 (`codec 0`) decoding for contiguous and split-buffer jobs. Initialize,
-codec-info, gapless, stream byte counts, decoded-frame counts, and total
-sample sidebands are preserved. ATRAC9 output supports signed 16-bit, signed
-32-bit, float, and planar layouts; M4AAC remains unsupported and is rejected
-instead of being reported as successful silent PCM. FSB-backed fallback
+AudioOut, AudioIn, and AudioOut2 expose paced ports, queues, speaker metadata,
+and atomic multi-port `sceAudioOutOutputs` batches. The initial NGS2
+compatibility layer supplies stable system/rack/voice handles, silent render
+buffers, state queries, and a neutral pan matrix; waveform parsing and actual
+NGS2 voice synthesis remain incomplete. AJM owns state per codec instance and
+performs real ATRAC9 (`codec 1`) and MP3 (`codec 0`) decoding for contiguous and
+split-buffer jobs. Initialize, codec-info, gapless, stream byte counts,
+decoded-frame counts, and total sample sidebands are preserved. ATRAC9 output
+supports signed 16-bit, signed 32-bit, float, and planar layouts; M4AAC remains
+unsupported and is rejected instead of being reported as successful silent
+PCM. The separate legacy `libSceAudiodec` decoder lifecycle is not complete
+yet. FSB-backed fallback
 previews are resampled to the 48 kHz host mix, use short de-click envelopes,
 and drain once. Direct fallback mixing is disabled by default because replaying
 a clip beside the title's real AudioOut/AJM mix is heard as echo; it remains
@@ -1538,6 +1564,11 @@ a title never proceeds believing its data was stored. Each descriptor carries
 its own position and reads positionally, so two descriptors on one file cannot
 disturb each other, and a descriptor closed during a read cannot have a reused
 slot's position corrupted afterwards.
+
+The mount roots themselves (`/app0`, `/hostapp`, and `/host`) stat as existing
+directories. This matters independently of child lookup: managed runtimes often
+verify every parent before opening a known file, and must not see a missing
+`/app0` beside a successfully resolved `/app0/content.txt`.
 
 Directories are first-class descriptors rather than failed file opens.
 `sceKernelGetdents` and `sceKernelGetdirentries` emit fixed 512-byte PS5/BSD
@@ -1641,8 +1672,11 @@ in place; data-packet payload lookup returns the real writable body. Remaining
 placeholder packets still accept harmless patches. Frame capture, submission
 validation and shader debugging report themselves off, which is the retail
 answer and the one that stops a title waiting for a capture nobody will take.
-Resource registration is refused, because it hands back names and addresses a
-title keeps and later follows.
+Resource-registration setup reports checked backing-memory requirements,
+initializes the caller-owned store, exposes the maximum name length, and
+allocates stable owner handles. Typed resource registration is accepted because
+submission consumes the resource addresses directly; enumeration and name/type
+lookup remain unimplemented, so no host-side resource database is claimed.
 
 **GPU submission** ([src/hle/libs/agc_submit.zig](src/hle/libs/agc_submit.zig))
 

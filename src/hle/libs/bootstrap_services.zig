@@ -900,10 +900,56 @@ fn mouseRead(_: i32, _: ?*anyopaque, _: i32) callconv(abi.guest) i32 {
     return 0;
 }
 
+const SaveDataMountResult = extern struct {
+    mount_point: [16]u8,
+    required_blocks: u64,
+    unused: u32,
+    mount_status: u32,
+    reserved: [28]u8,
+    padding: i32,
+};
+
+var next_save_data_resource = std.atomic.Value(u32).init(1);
+
+fn saveDataCreateTransactionResource(_: u32) callconv(abi.guest) i32 {
+    const resource = next_save_data_resource.fetchAdd(1, .monotonic);
+    return @intCast(if (resource == 0) 1 else resource);
+}
+
+fn saveDataMount3(_: u64, result: ?*SaveDataMountResult) callconv(abi.guest) i32 {
+    const output = result orelse return invalid_argument;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(output), @sizeOf(SaveDataMountResult))) {
+        return errno.KernelError.efault.raw();
+    }
+    output.* = .{
+        .mount_point = [_]u8{0} ** 16,
+        .required_blocks = 0,
+        .unused = 0,
+        .mount_status = 1,
+        .reserved = [_]u8{0} ** 28,
+        .padding = 0,
+    };
+    @memcpy(output.mount_point[0.."/savedata0".len], "/savedata0");
+    return errno.ok;
+}
+
+fn saveDataTwoPointers(first: u64, second: u64) callconv(abi.guest) i32 {
+    return if (first == 0 or second == 0) invalid_argument else errno.ok;
+}
+
+fn saveDataOnePointer(pointer: u64) callconv(abi.guest) i32 {
+    return if (pointer == 0) invalid_argument else errno.ok;
+}
+
+fn saveDataUmount(_: u32, mount_point: u64) callconv(abi.guest) i32 {
+    return if (mount_point == 0) invalid_argument else errno.ok;
+}
+
 const app_content_exports = [_]symbols.Export{
     .{ .name = "sceAppContentAddcontMount", .function = trace.wrap("sceAppContentAddcontMount", &success), .expect_id = "VANhIWcqYak" },
     .{ .name = "sceAppContentAddcontUnmount", .function = trace.wrap("sceAppContentAddcontUnmount", &success), .expect_id = "3rHWaV-1KC4" },
     .{ .name = "sceAppContentTemporaryDataFormat", .function = trace.wrap("sceAppContentTemporaryDataFormat", &success), .expect_id = "a5N7lAG0y2Q" },
+    .{ .name = "sceAppContentTemporaryDataUnmount", .function = trace.wrap("sceAppContentTemporaryDataUnmount", &success), .expect_id = "bcolXMmp6qQ" },
     .{ .name = "sceAppContentTemporaryDataGetAvailableSpaceKb", .function = trace.wrap("sceAppContentTemporaryDataGetAvailableSpaceKb", &availableSpace), .expect_id = "SaKib2Ug0yI" },
     .{ .name = "sceAppContentDownloadDataGetAvailableSpaceKb", .function = trace.wrap("sceAppContentDownloadDataGetAvailableSpaceKb", &availableSpace), .expect_id = "Gl6w5i0JokY" },
     .{ .name = "sceAppContentAppParamGetInt", .function = trace.wrap("sceAppContentAppParamGetInt", &outputZero32), .expect_id = "99b82IKXpH4" },
@@ -919,6 +965,7 @@ const np_manager_exports = [_]symbols.Export{
 const remoteplay_exports = [_]symbols.Export{
     .{ .name = "sceRemoteplayInitialize", .function = trace.wrap("sceRemoteplayInitialize", &success), .expect_id = "k1SwgkMSOM8" },
     .{ .name = "sceRemoteplayGetConnectionStatus", .function = trace.wrap("sceRemoteplayGetConnectionStatus", &outputZero32), .expect_id = "g3PNjYKWqnQ" },
+    .{ .name = "sceRemoteplayTerminate", .function = trace.wrap("sceRemoteplayTerminate", &success), .expect_id = "BOwybKVa3Do" },
 };
 
 const mouse_exports = [_]symbols.Export{
@@ -937,6 +984,12 @@ const save_data_exports = [_]symbols.Export{
     .{ .name = "sceSaveDataGetSaveDataMemory2", .function = trace.wrap("sceSaveDataGetSaveDataMemory2", &success), .expect_id = "QwOO7vegnV8" },
     .{ .name = "sceSaveDataSetSaveDataMemory2", .function = trace.wrap("sceSaveDataSetSaveDataMemory2", &success), .expect_id = "cduy9v4YmT4" },
     .{ .name = "sceSaveDataSyncSaveDataMemory", .function = trace.wrap("sceSaveDataSyncSaveDataMemory", &success), .expect_id = "wiT9jeC7xPw" },
+    .{ .name = "sceSaveDataCreateTransactionResource", .function = trace.wrap("sceSaveDataCreateTransactionResource", &saveDataCreateTransactionResource), .expect_id = "gjRZNnw0JPE" },
+    .{ .name = "sceSaveDataDeleteTransactionResource", .function = trace.wrap("sceSaveDataDeleteTransactionResource", &success), .expect_id = "lJUQuaKqoKY" },
+    .{ .name = "sceSaveDataMount3", .function = trace.wrap("sceSaveDataMount3", &saveDataMount3), .expect_id = "ZP4e7rlzOUk" },
+    .{ .name = "sceSaveDataPrepare", .function = trace.wrap("sceSaveDataPrepare", &saveDataTwoPointers), .expect_id = "sDCBrmc61XU" },
+    .{ .name = "sceSaveDataCommit", .function = trace.wrap("sceSaveDataCommit", &saveDataOnePointer), .expect_id = "ie7qhZ4X0Cc" },
+    .{ .name = "sceSaveDataUmount2", .function = trace.wrap("sceSaveDataUmount2", &saveDataUmount), .expect_id = "uW4vfTwMQVo" },
 };
 
 const sysmodule_bootstrap_exports = [_]symbols.Export{
@@ -1998,6 +2051,7 @@ pub fn reset() void {
     agc_submit.reset();
     video_out.reset();
     random_state.store(0x9e37_79b9_7f4a_7c15, .monotonic);
+    next_save_data_resource.store(1, .monotonic);
 }
 
 pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {

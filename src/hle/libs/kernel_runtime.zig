@@ -1275,7 +1275,7 @@ fn getModuleInfoForUnwind(
 ///
 /// Any other descriptor still reports that files are unimplemented, rather than
 /// pretending a write succeeded and letting the guest believe data was stored.
-fn guestWrite(descriptor: i32, buffer: ?[*]const u8, length: u64) callconv(abi.guest) i64 {
+pub fn guestWrite(descriptor: i32, buffer: ?[*]const u8, length: u64) callconv(abi.guest) i64 {
     if (descriptor != 1 and descriptor != 2) {
         if (filesystem.isVirtualSocket(descriptor)) {
             if (buffer == null and length != 0) {

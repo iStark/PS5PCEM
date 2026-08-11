@@ -257,6 +257,9 @@ fn posixWrite(descriptor: i32, buffer: ?[*]const u8, length: usize) callconv(abi
     if (length != 0 and !memory_api.isGuestRangeAccessible(@intFromPtr(source), length)) {
         return posixFail(Error.InvalidArgument);
     }
+    if (descriptor == 1 or descriptor == 2) {
+        return runtime_api.guestWrite(descriptor, source, length);
+    }
     const count = filesystem.write(descriptor, source[0..length]) catch |err| return posixFail(err);
     return @intCast(count);
 }
