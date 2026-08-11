@@ -128,6 +128,10 @@ pub const State = struct {
     draw_count: u64 = 0,
     dispatch_count: u64 = 0,
     instance_count: u32 = 1,
+    index_base_address: u64 = 0,
+    index_buffer_size: u32 = 0,
+    /// 0 = u16, 1 = u32, 2 = u8 (VGT_INDEX_TYPE).
+    index_type: u2 = 0,
 
     pub fn writeRegister(self: *State, space: pm4.RegisterSpace, offset: u32, value: u32) Error!void {
         switch (space) {
@@ -156,6 +160,9 @@ pub const State = struct {
         self.shader.clear();
         self.uconfig.clear();
         self.instance_count = 1;
+        self.index_base_address = 0;
+        self.index_buffer_size = 0;
+        self.index_type = 0;
     }
 };
 
@@ -185,4 +192,6 @@ test "clearing register state does not erase submission statistics" {
     try testing.expectEqual(@as(u64, 7), gpu_state.packets_executed);
     try testing.expectEqual(@as(u64, 1), gpu_state.register_writes);
     try testing.expectEqual(@as(u32, 1), gpu_state.instance_count);
+    try testing.expectEqual(@as(u64, 0), gpu_state.index_base_address);
+    try testing.expectEqual(@as(u32, 0), gpu_state.index_buffer_size);
 }

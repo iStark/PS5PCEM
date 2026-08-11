@@ -145,6 +145,13 @@ fn padRead(handle: i32, output: ?[*]PadData, count: i32) callconv(abi.guest) i32
     return 1;
 }
 
+fn padReadState(handle: i32, output: ?*PadData) callconv(abi.guest) i32 {
+    if (!validHandle(handle)) return error_invalid_handle;
+    const data = output orelse return error_invalid_argument;
+    fillPadData(data);
+    return errno.ok;
+}
+
 fn getControllerInformation(handle: i32, output: ?*[0x1c]u8) callconv(abi.guest) i32 {
     if (!validHandle(handle)) return error_invalid_handle;
     const info = output orelse return error_invalid_argument;
@@ -219,6 +226,7 @@ pub const exports = [_]symbols.Export{
     .{ .name = "scePadOpen", .function = trace.wrap("scePadOpen", &padOpen), .expect_id = "xk0AcarP3V4" },
     .{ .name = "scePadClose", .function = trace.wrap("scePadClose", &padClose), .expect_id = "6ncge5+l5Qs" },
     .{ .name = "scePadRead", .function = trace.wrap("scePadRead", &padRead), .expect_id = "q1cHNfGycLI" },
+    .{ .name = "scePadReadState", .function = trace.wrap("scePadReadState", &padReadState), .expect_id = "YndgXqQVV7c" },
     .{ .name = "scePadGetControllerInformation", .function = trace.wrap("scePadGetControllerInformation", &getControllerInformation), .expect_id = "gjP9-KQzoUk" },
     .{ .name = "scePadDeviceClassGetExtendedInformation", .function = trace.wrap("scePadDeviceClassGetExtendedInformation", &deviceClassGetExtendedInformation), .expect_id = "AcslpN1jHR8" },
     .{ .name = "scePadDeviceClassParseData", .function = trace.wrap("scePadDeviceClassParseData", &deviceClassParseData), .expect_id = "IHPqcbc0zCA" },

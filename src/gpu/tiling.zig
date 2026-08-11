@@ -873,16 +873,19 @@ pub const Layout = struct {
             const physical_slice: u32 = try addU32(self.first_slice, @intCast(layer_index));
             const source_slice: usize = @intCast(try multiply(self.source_slice_bytes, physical_slice));
             const staging_slice: usize = @intCast(try multiply(self.staging_slice_bytes, layer_index));
-            for (0..self.blocks_per_column) |block_y_index| {
-                const block_y: u32 = @intCast(block_y_index);
-                const y_base = block_y * self.block.height;
-                const copy_height = @min(self.block.height, self.height - y_base);
-                for (0..copy_height) |local_y_index| {
-                    const local_y: u32 = @intCast(local_y_index);
-                    for (0..self.block.width) |local_x_index| {
-                        row_offsets[local_x_index] = try self.block.byteOffset(@intCast(local_x_index), local_y);
-                    }
-                    const y = y_base + local_y;
+            // The in-block address map is identical in every macro-block row.
+            // Make local_y the outer loop so each row is evaluated once per
+            // layer, rather than once per block_y. For a 3840x2160 64 KiB
+            // surface this removes 17 repeats of the expensive RB+ parity map.
+            for (0..self.block.height) |local_y_index| {
+                const local_y: u32 = @intCast(local_y_index);
+                for (0..self.block.width) |local_x_index| {
+                    row_offsets[local_x_index] = try self.block.byteOffset(@intCast(local_x_index), local_y);
+                }
+                for (0..self.blocks_per_column) |block_y_index| {
+                    const block_y: u32 = @intCast(block_y_index);
+                    const y = block_y * self.block.height + local_y;
+                    if (y >= self.height) continue;
                     for (0..self.blocks_per_row) |block_x_index| {
                         const block_x: u32 = @intCast(block_x_index);
                         const x_base = block_x * self.block.width;
@@ -947,16 +950,15 @@ pub const Layout = struct {
             const physical_slice: u32 = try addU32(self.first_slice, @intCast(layer_index));
             const destination_slice: usize = @intCast(try multiply(self.source_slice_bytes, physical_slice));
             const staging_slice: usize = @intCast(try multiply(self.staging_slice_bytes, layer_index));
-            for (0..self.blocks_per_column) |block_y_index| {
-                const block_y: u32 = @intCast(block_y_index);
-                const y_base = block_y * self.block.height;
-                const copy_height = @min(self.block.height, self.height - y_base);
-                for (0..copy_height) |local_y_index| {
-                    const local_y: u32 = @intCast(local_y_index);
-                    for (0..self.block.width) |local_x_index| {
-                        row_offsets[local_x_index] = try self.block.byteOffset(@intCast(local_x_index), local_y);
-                    }
-                    const y = y_base + local_y;
+            for (0..self.block.height) |local_y_index| {
+                const local_y: u32 = @intCast(local_y_index);
+                for (0..self.block.width) |local_x_index| {
+                    row_offsets[local_x_index] = try self.block.byteOffset(@intCast(local_x_index), local_y);
+                }
+                for (0..self.blocks_per_column) |block_y_index| {
+                    const block_y: u32 = @intCast(block_y_index);
+                    const y = block_y * self.block.height + local_y;
+                    if (y >= self.height) continue;
                     for (0..self.blocks_per_row) |block_x_index| {
                         const block_x: u32 = @intCast(block_x_index);
                         const x_base = block_x * self.block.width;

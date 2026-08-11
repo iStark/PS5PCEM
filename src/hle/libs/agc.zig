@@ -391,6 +391,6 @@ test "graphics exports register under published identifiers" {
     defer db.deinit(testing.allocator);
     try register(&db, testing.allocator);
     try testing.expectEqual(exports.len + driver_exports.len, db.count());
-    try testing.expect(db.findByName("sceAgcDcbDrawIndexOffset", .function) != null);
+    try testing.expect(db.findByName("sceAgcDcbDrawIndexIndirectMulti", .function) != null);
     try testing.expect(db.findByName("sceAgcDriverSubmitMultiAcbs", .function) != null);
 }

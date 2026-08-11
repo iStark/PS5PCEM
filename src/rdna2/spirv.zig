@@ -96,6 +96,14 @@ pub const ScalarRegister = struct {
     producer_pc: ?u32 = null,
 };
 
+/// Places recovered SGPR values in a host-updated storage buffer instead of
+/// baking them into OpConstant instructions. The list index is stable for one
+/// shader/resource shape, while the value can change for every draw.
+pub const DynamicScalarBinding = struct {
+    binding: u32,
+    value_base: u32 = 0,
+};
+
 pub const ComputeInputs = struct {
     workgroup_id_sgprs: [3]?u8 = .{ null, null, null },
     threadgroup_size_sgpr: ?u8 = null,
@@ -135,6 +143,7 @@ pub const Options = struct {
     /// and supply only locations the vertex stage actually exports.
     infer_fragment_parameter_mask: bool = true,
     scalar_registers: []const ScalarRegister = &.{},
+    dynamic_scalar_binding: ?DynamicScalarBinding = null,
     compute_inputs: ?ComputeInputs = null,
     descriptor_array_length: u32 = 64,
     /// Exclusive PC ending a straight scalar prolog evaluated against the
@@ -356,6 +365,7 @@ const Builder = struct {
     storage_image_bindings: []const StorageImageBinding,
     storage_array: u32 = 0,
     storage_word_pointer_type: u32 = 0,
+    storage_block_pointer_type: u32 = 0,
     local_invocation_index: u32 = 0,
     /// The execution mask, as low and high halves, once a shader has narrowed
     /// it. Null means untouched — every lane on — which is how a wave starts
@@ -380,6 +390,9 @@ const Builder = struct {
     /// GLSL.std.450 extended instruction set (PackHalf2x16, etc.). 0 = unused.
     glsl_std_450: u32 = 0,
     scalar_specializations: []const ScalarRegister,
+    dynamic_scalar_binding: ?DynamicScalarBinding,
+    scalar_buffer: u32 = 0,
+    scalar_word_pointer_type: u32 = 0,
     specialized_scalar_prefix_end: u32,
     scc: u32 = 0,
     /// Carry chained specifically between S_ADD_U32 and S_ADDC_U32. Keep it
@@ -408,6 +421,7 @@ const Builder = struct {
             .local_size = options.local_size,
             .fragment_extent = options.fragment_extent,
             .scalar_specializations = options.scalar_registers,
+            .dynamic_scalar_binding = options.dynamic_scalar_binding,
             .specialized_scalar_prefix_end = options.specialized_scalar_prefix_end,
         };
         errdefer self.deinit();
@@ -425,6 +439,24 @@ const Builder = struct {
         try self.emit(&self.declarations, 21, &.{ self.signed_type, 32, 1 }); // OpTypeInt
         try self.emit(&self.declarations, 22, &.{ self.float_type, 32 }); // OpTypeFloat
         try self.emit(&self.declarations, 20, &.{self.bool_type}); // OpTypeBool
+
+        if (options.dynamic_scalar_binding) |dynamic| {
+            const runtime_words = self.id();
+            const storage_block = self.id();
+            const storage_pointer = self.id();
+            self.scalar_word_pointer_type = self.id();
+            self.scalar_buffer = self.id();
+            try self.emit(&self.annotations, 71, &.{ runtime_words, 6, 4 }); // ArrayStride 4
+            try self.emit(&self.annotations, 72, &.{ storage_block, 0, 35, 0 }); // member Offset 0
+            try self.emit(&self.annotations, 71, &.{ storage_block, 2 }); // Block
+            try self.emit(&self.annotations, 71, &.{ self.scalar_buffer, 34, 0 }); // DescriptorSet 0
+            try self.emit(&self.annotations, 71, &.{ self.scalar_buffer, 33, dynamic.binding }); // Binding
+            try self.emit(&self.declarations, 29, &.{ runtime_words, self.bits_type }); // OpTypeRuntimeArray
+            try self.emit(&self.declarations, 30, &.{ storage_block, runtime_words }); // OpTypeStruct
+            try self.emit(&self.declarations, 32, &.{ storage_pointer, 12, storage_block }); // ptr StorageBuffer
+            try self.emit(&self.declarations, 32, &.{ self.scalar_word_pointer_type, 12, self.bits_type });
+            try self.emit(&self.declarations, 59, &.{ storage_pointer, self.scalar_buffer, 12 }); // OpVariable
+        }
 
         if (options.vertex_index_vgpr != null and options.stage != .vertex) {
             return Error.InvalidStageInterface;
@@ -530,6 +562,7 @@ const Builder = struct {
         for (options.scalar_registers) |scalar| {
             if (scalar.register >= 128) return Error.InvalidStorageBinding;
             if (scalar.producer_pc != null) continue;
+            if (options.dynamic_scalar_binding != null) continue;
             self.registers[scalar.register] = .{
                 .id = try self.constant(.bits32, scalar.value),
                 .value_type = .bits32,
@@ -564,6 +597,7 @@ const Builder = struct {
             const descriptor_array = self.id();
             const storage_array_pointer = self.id();
             self.storage_word_pointer_type = self.id();
+            self.storage_block_pointer_type = self.id();
             self.storage_array = self.id();
 
             try self.emit(&self.annotations, 71, &.{ runtime_words, 6, 4 }); // ArrayStride 4
@@ -576,6 +610,7 @@ const Builder = struct {
             try self.emit(&self.declarations, 28, &.{ descriptor_array, storage_block, descriptor_count }); // OpTypeArray
             try self.emit(&self.declarations, 32, &.{ storage_array_pointer, 12, descriptor_array }); // ptr StorageBuffer
             try self.emit(&self.declarations, 32, &.{ self.storage_word_pointer_type, 12, self.bits_type });
+            try self.emit(&self.declarations, 32, &.{ self.storage_block_pointer_type, 12, storage_block });
             try self.emit(&self.declarations, 59, &.{ storage_array_pointer, self.storage_array, 12 }); // OpVariable
 
             var needs_thread_id = false;
@@ -747,6 +782,24 @@ const Builder = struct {
         try self.emit(&self.declarations, 43, &.{ self.typeId(value_type), result, bits }); // OpConstant
         try self.constants.append(self.allocator, .{ .value_type = value_type, .bits = bits, .id = result });
         return result;
+    }
+
+    fn dynamicScalar(self: *Builder, specialization_index: usize) Error!u32 {
+        const dynamic = self.dynamic_scalar_binding orelse return Error.InvalidStorageBinding;
+        if (self.scalar_buffer == 0 or self.scalar_word_pointer_type == 0) return Error.InvalidStorageBinding;
+        const word_index = std.math.add(u32, dynamic.value_base, @intCast(specialization_index)) catch
+            return Error.InvalidStorageBinding;
+        const pointer = self.id();
+        try self.emit(&self.body, 65, &.{
+            self.scalar_word_pointer_type,
+            pointer,
+            self.scalar_buffer,
+            try self.constant(.bits32, 0),
+            try self.constant(.bits32, word_index),
+        }); // OpAccessChain block member, dword
+        const loaded = self.id();
+        try self.emit(&self.body, 61, &.{ self.bits_type, loaded, pointer }); // OpLoad
+        return loaded;
     }
 
     fn registerIndex(op: operand.Operand) ?usize {
@@ -1221,6 +1274,25 @@ const Builder = struct {
         try self.updateSccFromPair(result);
     }
 
+    /// Saves the current wave mask and intersects EXEC with a lane predicate.
+    /// A Vulkan fragment invocation represents one RDNA lane, so the low mask
+    /// word produced by V_CMP becomes that invocation's structured-branch
+    /// condition. Keeping both halves also preserves the guest SGPR snapshot
+    /// used by the later `s_mov_b64 exec, saved` reconvergence sequence.
+    fn andSaveExec64(self: *Builder, inst: instruction.Instruction) Error!void {
+        const previous = try self.sourcePair(.{ .kind = .exec_lo });
+        const predicate = try self.sourcePair(inst.src0);
+        var active: [2]u32 = undefined;
+        for (0..2) |index| {
+            active[index] = self.id();
+            try self.emit(&self.body, 199, &.{ self.bits_type, active[index], previous[index], predicate[index] }); // OpBitwiseAnd
+        }
+        try self.destinationPair(inst.dst, previous);
+        try self.destinationPair(.{ .kind = .exec_lo }, active);
+        self.exec_mask = active;
+        try self.updateSccFromPair(active);
+    }
+
     fn not64(self: *Builder, inst: instruction.Instruction) Error!void {
         const source_value = try self.sourcePair(inst.src0);
         var result: [2]u32 = undefined;
@@ -1455,6 +1527,15 @@ const Builder = struct {
     }
 
     fn initializeStageInputs(self: *Builder) Error!void {
+        if (self.dynamic_scalar_binding != null) {
+            for (self.scalar_specializations, 0..) |scalar, index| {
+                if (scalar.producer_pc != null) continue;
+                self.registers[scalar.register] = .{
+                    .id = try self.dynamicScalar(index),
+                    .value_type = .bits32,
+                };
+            }
+        }
         // Graphics descriptor payloads are represented by Vulkan bindings and
         // deliberately removed from scalar specialization. Their remaining
         // bitfield uses still need a deterministic value on paths where no
@@ -2393,12 +2474,25 @@ const Builder = struct {
         return self.bufferAddressDelta(inst, 0);
     }
 
-    /// Whether a word access lies inside what the descriptor describes.
-    ///
-    /// Null when the caller supplied no extent, which means every access is
-    /// taken as valid — the same behaviour as before a bound was known.
+    /// Whether a word access lies inside the descriptor's live Vulkan range.
+    /// Keeping the range dynamic prevents streamed buffer sizes from becoming
+    /// part of the generated module (and consequently the pipeline cache key).
     fn wordInRange(self: *Builder, address: BufferAddress, delta: u32) Error!?u32 {
-        const extent = address.binding.extent_bytes orelse return null;
+        if (self.storage_array == 0 or self.storage_block_pointer_type == 0) return null;
+        // Query the descriptor's live range. Baking `extent_bytes` into SPIR-V
+        // makes an otherwise identical shader a new pipeline whenever a sprite
+        // batch contains a different number of vertices.
+        const block_pointer = self.id();
+        try self.emit(&self.body, 65, &.{
+            self.storage_block_pointer_type,
+            block_pointer,
+            self.storage_array,
+            try self.constant(.bits32, address.binding.descriptor_index),
+        }); // OpAccessChain descriptor
+        const word_count = self.id();
+        try self.emit(&self.body, 68, &.{ self.bits_type, word_count, block_pointer, 0 }); // OpArrayLength
+        const extent = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, extent, word_count, try self.constant(.bits32, 2) });
         // The last byte this word touches, so a word straddling the end counts
         // as outside rather than half inside.
         const last = try self.addBits(address.byte_offset, try self.constant(.bits32, delta * 4 + 3));
@@ -2407,7 +2501,7 @@ const Builder = struct {
             self.bool_type,
             result,
             last,
-            try self.constant(.bits32, extent),
+            extent,
         });
         return result;
     }
@@ -2415,7 +2509,7 @@ const Builder = struct {
     /// A word access: where it is, and whether it is really there.
     const WordAccess = struct {
         pointer: u32,
-        /// Null when the descriptor carried no extent, so nothing was checked.
+        /// Null only when no storage descriptor array was declared.
         in_range: ?u32,
     };
 
@@ -2984,13 +3078,15 @@ const Builder = struct {
         const first = registerIndex(inst.dst) orelse return false;
         if (first + word_count > 128) return false;
         var values: [16]u32 = @splat(0);
+        var specialization_indices: [16]usize = @splat(0);
         if (word_count > values.len) return false;
         for (0..word_count) |word_index| {
             const register: u32 = @intCast(first + word_index);
             var found = false;
-            for (self.scalar_specializations) |scalar| {
+            for (self.scalar_specializations, 0..) |scalar, specialization_index| {
                 if (scalar.producer_pc == inst.pc and scalar.register == register) {
                     values[word_index] = scalar.value;
+                    specialization_indices[word_index] = specialization_index;
                     found = true;
                     break;
                 }
@@ -2999,7 +3095,10 @@ const Builder = struct {
         }
         for (0..word_count) |word_index| {
             try self.destination(try consecutiveRegister(inst.dst, @intCast(word_index)), .{
-                .id = try self.constant(.bits32, values[word_index]),
+                .id = if (self.dynamic_scalar_binding != null)
+                    try self.dynamicScalar(specialization_indices[word_index])
+                else
+                    try self.constant(.bits32, values[word_index]),
                 .value_type = .bits32,
             });
         }
@@ -3144,6 +3243,7 @@ const Builder = struct {
             => try self.bitwise64(inst, inst.opcode),
             .s_cselect_b32 => try self.cselect32(inst),
             .s_cselect_b64 => try self.cselect64(inst),
+            .s_and_saveexec_b64 => try self.andSaveExec64(inst),
             .v_cndmask_b32 => try self.cndmask(inst),
             .v_interp_p1_f32, .v_interp_p2_f32, .v_interp_mov_f32 => try self.interpolateParameter(inst),
             .v_cvt_f32_i32 => try self.integerToFloat(inst, true),
@@ -3799,6 +3899,7 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     defer entry_point.deinit(allocator);
     try entry_point.appendSlice(allocator, &.{ @intFromEnum(options.stage), builder.main_function, 0x6e69_616d, 0 });
     if (builder.storage_array != 0) try entry_point.append(allocator, builder.storage_array);
+    if (builder.scalar_buffer != 0) try entry_point.append(allocator, builder.scalar_buffer);
     if (builder.sampled_image_array != 0) try entry_point.append(allocator, builder.sampled_image_array);
     for (builder.storage_image_variables) |variable| {
         if (variable != 0) try entry_point.append(allocator, variable);
@@ -4154,6 +4255,35 @@ test "64-bit scalar mask operations lower both register halves" {
     try std.testing.expectEqual(@as(usize, 4), countOpcode(module.words, 199)); // two NAND and two ANDN2 halves
     try std.testing.expectEqual(@as(usize, 4), countOpcode(module.words, 200)); // NAND results and ANDN2 rhs
     try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 169)); // 64-bit CSELECT halves
+}
+
+test "and-saveexec preserves the old mask and lowers the new mask" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .v_cmp_eq_f32,
+        .dst = .{ .kind = .vcc_lo },
+        .src0 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, 1.0)) },
+        .src1 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, 1.0)) },
+        .src_count = 2,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .s_and_saveexec_b64,
+        .dst = .{ .kind = .sgpr, .reg = 44 },
+        .src0 = .{ .kind = .vcc_lo },
+        .src_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .s_mov_b64,
+        .dst = .{ .kind = .exec_lo },
+        .src0 = .{ .kind = .sgpr, .reg = 44 },
+        .src_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 199)); // two EXEC halves
 }
 
 test "zero register delta accepts a high mask register" {
@@ -4520,11 +4650,11 @@ test "an indexed copy is held to its buffer bounds and its execution mask" {
     try std.testing.expect(containsOpcode(module.words, 167)); // OpLogicalAnd
 }
 
-test "without a known extent nothing is checked" {
-    // A caller that has not recovered a descriptor says so by supplying no
-    // extent, and the access is emitted as it always was. Guessing a size would
-    // be worse than leaving it unchecked: it would drop writes a title made
-    // legitimately.
+test "live descriptor extent guards access without a static extent" {
+    // A caller that has not recovered a stable descriptor size leaves the
+    // compile-time extent empty. The shader still queries the descriptor's
+    // live Vulkan range, so streamed buffer sizes remain safe without becoming
+    // part of the generated module or pipeline key.
     const decoder = @import("decoder.zig");
     const code =
         [_]u32{ (@as(u32, 0x3f) << 25) | (@as(u32, 1) << 17) | (@as(u32, 0x01) << 9) | 255, 7 } ++
@@ -4544,8 +4674,9 @@ test "without a known extent nothing is checked" {
     defer module.deinit(std.testing.allocator);
 
     try std.testing.expect(containsOpcode(module.words, 62)); // OpStore
-    try std.testing.expect(!containsOpcode(module.words, 176)); // no OpULessThan
-    try std.testing.expect(!containsOpcode(module.words, 250)); // no OpBranchConditional
+    try std.testing.expect(containsOpcode(module.words, 68)); // OpArrayLength
+    try std.testing.expect(containsOpcode(module.words, 176)); // OpULessThan
+    try std.testing.expect(containsOpcode(module.words, 250)); // OpBranchConditional
 }
 
 test "fragment MRT0 export lowers to location zero" {
@@ -4885,6 +5016,37 @@ test "resolved SMEM descriptor prolog specializes before MUBUF" {
     });
     defer module.deinit(std.testing.allocator);
     try std.testing.expect(containsOpcode(module.words, 62)); // OpStore
+}
+
+test "dynamic scalar values do not create distinct SPIR-V modules" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .v_mov_b32,
+        .dst = .{ .kind = .vgpr, .reg = 0 },
+        .src0 = .{ .kind = .sgpr, .reg = 0 },
+        .src_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .opcode = .s_endpgm });
+
+    const first = [_]ScalarRegister{.{ .register = 0, .value = 0x1122_3344 }};
+    const second = [_]ScalarRegister{.{ .register = 0, .value = 0xaabb_ccdd }};
+    var first_module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .scalar_registers = &first,
+        .dynamic_scalar_binding = .{ .binding = 10 },
+    });
+    defer first_module.deinit(std.testing.allocator);
+    var second_module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .scalar_registers = &second,
+        .dynamic_scalar_binding = .{ .binding = 10 },
+    });
+    defer second_module.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualSlices(u32, first_module.words, second_module.words);
+    try std.testing.expect(containsOpcode(first_module.words, 65)); // OpAccessChain
+    try std.testing.expect(containsOpcode(first_module.words, 61)); // OpLoad
 }
 
 test "SMEM recovery requires every word from the same producer" {

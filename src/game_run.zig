@@ -505,6 +505,38 @@ fn run(init: std.process.Init) !bool {
         std.process.exit(1);
     };
 
+    if (runtime.firmware.trace.isLive()) {
+        try stderr.writeAll("[trace] recent firmware calls before guest return:\n");
+        try runtime.firmware.trace.write(stderr, runtime.firmware.trace.capacity);
+        try stderr.flush();
+    }
+
+    const live_threads = emu.liveGuestThreadCount();
+    var thread_info: [16]runtime.firmware.libs.kernel_threading.LiveThreadInfo = @splat(.{});
+    const reported = @min(emu.liveGuestThreads(&thread_info), thread_info.len);
+    var has_non_audio_thread = false;
+    for (thread_info[0..reported]) |thread| {
+        const name = std.mem.sliceTo(&thread.name, 0);
+        if (!std.mem.startsWith(u8, name, "Audio")) has_non_audio_thread = true;
+    }
+    if (live_threads != 0) {
+        try out.print(
+            "guest bootstrap returned 0x{x}; {d} guest thread{s} still running\n",
+            .{ result, live_threads, if (live_threads == 1) "" else "s" },
+        );
+        for (thread_info[0..reported]) |thread| {
+            try out.print(
+                "  live pthread 0x{x} {s}\n",
+                .{ thread.entry_point, std.mem.sliceTo(&thread.name, 0) },
+            );
+        }
+        try out.flush();
+    }
+    if (renderer_initialized and window_initialized and live_threads != 0 and has_non_audio_thread) {
+        while (host_window.isOpen() and emu.liveGuestThreadCount() != 0) {
+            try io.sleep(.fromMilliseconds(10), .awake);
+        }
+    }
     try out.print("guest process returned 0x{x}\n", .{result});
     try out.flush();
     return true;

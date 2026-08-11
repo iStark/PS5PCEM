@@ -83,7 +83,7 @@ pub const Evaluation = struct {
 };
 
 pub fn evaluatePrefix(reader: shaders.MemoryReader, bindings: *const shaders.StageBindings) Evaluation {
-    return evaluate(reader, bindings, null, false);
+    return evaluate(reader, bindings, null, false, null);
 }
 
 /// Evaluates scalar resource setup past lane-mask branches. EXEC/VCC branches
@@ -92,7 +92,18 @@ pub fn evaluatePrefix(reader: shaders.MemoryReader, bindings: *const shaders.Sta
 /// path. Following that path recovers late V#/T# loads without changing the
 /// strict prefix evaluator used for shader specialization.
 pub fn evaluateResourceState(reader: shaders.MemoryReader, bindings: *const shaders.StageBindings) Evaluation {
-    return evaluate(reader, bindings, null, true);
+    return evaluate(reader, bindings, null, true, null);
+}
+
+/// Evaluates resource state using a shader which the backend has already
+/// decoded. Guest data loads remain live; only redundant instruction fetch and
+/// decode work is avoided at draw time.
+pub fn evaluateDecodedResourceState(
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    instructions: []const rdna2.Instruction,
+) Evaluation {
+    return evaluate(reader, bindings, null, true, instructions);
 }
 
 /// Recovers descriptor state immediately before one vector-memory instruction.
@@ -103,7 +114,7 @@ pub fn evaluateResourceStateUntil(
     bindings: *const shaders.StageBindings,
     end_pc: u32,
 ) Evaluation {
-    return evaluate(reader, bindings, end_pc, true);
+    return evaluate(reader, bindings, end_pc, true, null);
 }
 
 /// Evaluates only the straight scalar region ending before `end_pc`. This is
@@ -114,7 +125,7 @@ pub fn evaluatePrefixUntil(
     bindings: *const shaders.StageBindings,
     end_pc: u32,
 ) Evaluation {
-    return evaluate(reader, bindings, end_pc, false);
+    return evaluate(reader, bindings, end_pc, false, null);
 }
 
 fn evaluate(
@@ -122,6 +133,7 @@ fn evaluate(
     bindings: *const shaders.StageBindings,
     end_pc: ?u32,
     follow_lane_mask_fallthrough: bool,
+    decoded_instructions: ?[]const rdna2.Instruction,
 ) Evaluation {
     var result = Evaluation{};
     const scalar_base: usize = bindings.scalar_user_data_base;
@@ -147,53 +159,60 @@ fn evaluate(
                 return result;
             }
         }
-        var words = [_]u32{ 0, 0 };
-        words[0] = reader.readU32(addProgramAddress(bindings.program_address, pc) orelse {
-            result.stop_reason = .invalid_address;
-            return result;
-        }) catch {
-            result.stop_reason = .inaccessible_code;
-            return result;
-        };
+        const inst = if (decoded_instructions) |instructions| decoded: {
+            const candidate = decodedInstructionAtOrAfter(instructions, pc) orelse {
+                result.stop_reason = .end_program;
+                return result;
+            };
+            if (candidate.pc != pc) {
+                // The cached decoder omitted an unknown word. Resume at its
+                // next known instruction just as the live decoder skips an
+                // unsupported family.
+                pc = candidate.pc;
+                continue;
+            }
+            break :decoded candidate;
+        } else live: {
+            var words = [_]u32{ 0, 0 };
+            words[0] = reader.readU32(addProgramAddress(bindings.program_address, pc) orelse {
+                result.stop_reason = .invalid_address;
+                return result;
+            }) catch {
+                result.stop_reason = .inaccessible_code;
+                return result;
+            };
 
-        // Decode may need a second word; unknown major families are skipped so a
-        // later SMEM load of a V# still runs. Stopping the prolog at the first
-        // unrecognised packet was producing MissingStorageDescriptor on every
-        // resource the shader used after that point.
-        var decoded: ?rdna2.Instruction = null;
-        if (rdna2.decodeInstruction(pc, words[0..1], 0)) |inst| {
-            decoded = inst;
-        } else |err| switch (err) {
-            error.MissingLiteralConstant, error.TruncatedInstruction => {
-                words[1] = reader.readU32(addProgramAddress(bindings.program_address, pc + 4) orelse {
-                    result.stop_reason = .invalid_address;
-                    return result;
-                }) catch {
-                    result.stop_reason = .inaccessible_code;
-                    return result;
-                };
-                if (rdna2.decodeInstruction(pc, &words, 0)) |inst| {
-                    decoded = inst;
-                } else |_| {
+            // Decode may need a second word; unknown major families are skipped so a
+            // later SMEM load of a V# still runs. Stopping the prolog at the first
+            // unrecognised packet was producing MissingStorageDescriptor on every
+            // resource the shader used after that point.
+            if (rdna2.decodeInstruction(pc, words[0..1], 0)) |decoded| {
+                break :live decoded;
+            } else |err| switch (err) {
+                error.MissingLiteralConstant, error.TruncatedInstruction => {
+                    words[1] = reader.readU32(addProgramAddress(bindings.program_address, pc + 4) orelse {
+                        result.stop_reason = .invalid_address;
+                        return result;
+                    }) catch {
+                        result.stop_reason = .inaccessible_code;
+                        return result;
+                    };
+                    if (rdna2.decodeInstruction(pc, &words, 0)) |decoded| {
+                        break :live decoded;
+                    } else |_| {
+                        pc +%= if (words[0] & 0xc000_0000 == 0xc000_0000) @as(u32, 8) else 4;
+                        result.instruction_count += 1;
+                        continue;
+                    }
+                },
+                else => {
+                    // Unknown family, operand decode failures, etc. — skip rather
+                    // than abort the whole prolog before SMEM V# loads.
                     pc +%= if (words[0] & 0xc000_0000 == 0xc000_0000) @as(u32, 8) else 4;
                     result.instruction_count += 1;
                     continue;
-                }
-            },
-            else => {
-                // Unknown family, operand decode failures, etc. — skip rather
-                // than abort the whole prolog before SMEM V# loads.
-                pc +%= if (words[0] & 0xc000_0000 == 0xc000_0000) @as(u32, 8) else 4;
-                result.instruction_count += 1;
-                continue;
-            },
-        }
-        const inst = decoded orelse {
-            // Defensive: decode produced neither an instruction nor a handled
-            // error. Advance one dword rather than spinning.
-            pc +%= 4;
-            result.instruction_count += 1;
-            continue;
+                },
+            }
         };
         result.instruction_count += 1;
 
@@ -256,6 +275,20 @@ fn evaluate(
     result.stop_pc = pc;
     result.stop_reason = .instruction_limit;
     return result;
+}
+
+fn decodedInstructionAtOrAfter(instructions: []const rdna2.Instruction, pc: u32) ?rdna2.Instruction {
+    var low: usize = 0;
+    var high = instructions.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        if (instructions[middle].pc < pc) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    return if (low < instructions.len) instructions[low] else null;
 }
 
 fn executeSmem(
@@ -389,7 +422,7 @@ fn executeScalar(result: *Evaluation, program_address: u64, inst: rdna2.Instruct
     const combined_sources = if (b) |value| Sources.merge(a.sources, value.sources) else a.sources;
 
     if (destinationWords(inst.opcode) == 2) {
-        executeScalar64(result, inst, a, b, combined_sources);
+        executeScalar64(result, inst, a, b, combined_sources, scc.*);
         return;
     }
     const bv = if (b) |value| value.value else 0;
@@ -435,6 +468,11 @@ fn executeScalar(result: *Evaluation, program_address: u64, inst: rdna2.Instruct
             scc.* = first[1] == 0 and second[1] == 0;
             break :subb second[0];
         },
+        .s_cselect_b32 => if (scc.*) |condition|
+            if (condition) a.value else bv
+        else
+            null,
+        .s_bfe_u32 => bitfieldExtractUnsigned32(a.value, bv),
         .s_and_b32 => a.value & bv,
         .s_or_b32 => a.value | bv,
         .s_xor_b32 => a.value ^ bv,
@@ -461,7 +499,14 @@ fn executeScalar(result: *Evaluation, program_address: u64, inst: rdna2.Instruct
     if (value) |known| write(result, inst.dst, known, combined_sources, inst.pc) else invalidateDestination(result, inst.dst, 1);
 }
 
-fn executeScalar64(result: *Evaluation, inst: rdna2.Instruction, a: ScalarValue, b: ?ScalarValue, sources: Sources) void {
+fn executeScalar64(
+    result: *Evaluation,
+    inst: rdna2.Instruction,
+    a: ScalarValue,
+    b: ?ScalarValue,
+    sources: Sources,
+    scc: ?bool,
+) void {
     if (inst.src0.kind != .sgpr or inst.src0.reg + 1 >= maximum_scalar_registers or
         inst.dst.kind != .sgpr or inst.dst.reg + 1 >= maximum_scalar_registers)
     {
@@ -491,6 +536,10 @@ fn executeScalar64(result: *Evaluation, inst: rdna2.Instruction, a: ScalarValue,
     }
     const value: ?u64 = switch (inst.opcode) {
         .s_mov_b64 => av,
+        .s_cselect_b64 => if (scc) |condition|
+            if (condition) av else bv
+        else
+            null,
         .s_not_b64 => ~av,
         .s_and_b64 => av & bv,
         .s_or_b64 => av | bv,
@@ -524,6 +573,16 @@ fn source(result: *const Evaluation, operand: rdna2.Operand) ?ScalarValue {
         .null => .{ .known = true, .value = 0, .sources = .{ .immediate = true } },
         else => null,
     };
+}
+
+fn bitfieldExtractUnsigned32(value: u32, control: u32) u32 {
+    const offset: u5 = @intCast(control & 0x1f);
+    const encoded_width: u32 = (control >> 16) & 0x7f;
+    const width: u6 = @intCast(@min(encoded_width, 32 - @as(u32, offset)));
+    if (width == 0) return 0;
+    if (width == 32) return value;
+    const shift_width: u5 = @intCast(width);
+    return (value >> offset) & ((@as(u32, 1) << shift_width) - 1);
 }
 
 fn write(result: *Evaluation, destination: rdna2.Operand, value: u32, sources: Sources, pc: u32) void {
@@ -751,4 +810,67 @@ test "resource evaluation follows an unknown conditional fallthrough" {
     try std.testing.expectEqual(StopReason.branch, strict.stop_reason);
     const resources = evaluateResourceState(memory.reader(), &bindings);
     try std.testing.expectEqual(@as(u32, 1), resources.register(2).?.value);
+}
+
+test "scalar conditional select preserves descriptor words" {
+    var result = Evaluation{};
+    result.registers[1] = .{ .known = true, .value = 0x1111_1111 };
+    result.registers[2] = .{ .known = true, .value = 0x2222_2222 };
+
+    var scc: ?bool = true;
+    executeScalar(&result, 0, .{
+        .pc = 0x40,
+        .opcode = .s_cselect_b32,
+        .dst = .{ .kind = .sgpr, .reg = 3 },
+        .src0 = .{ .kind = .sgpr, .reg = 1 },
+        .src1 = .{ .kind = .sgpr, .reg = 2 },
+        .src_count = 2,
+    }, &scc);
+    try std.testing.expectEqual(@as(u32, 0x1111_1111), result.register(3).?.value);
+
+    scc = false;
+    executeScalar(&result, 0, .{
+        .pc = 0x44,
+        .opcode = .s_cselect_b32,
+        .dst = .{ .kind = .sgpr, .reg = 3 },
+        .src0 = .{ .kind = .sgpr, .reg = 1 },
+        .src1 = .{ .kind = .sgpr, .reg = 2 },
+        .src_count = 2,
+    }, &scc);
+    try std.testing.expectEqual(@as(u32, 0x2222_2222), result.register(3).?.value);
+}
+
+test "descriptor BFE comparison drives conditional select" {
+    var result = Evaluation{};
+    result.registers[7] = .{ .known = true, .value = 0x0004_022c };
+    result.registers[34] = .{ .known = true, .value = 2 };
+    result.registers[106] = .{ .known = true, .value = 0x0003_8fac };
+
+    var scc: ?bool = null;
+    executeScalar(&result, 0, .{
+        .pc = 0x10c,
+        .opcode = .s_bfe_u32,
+        .dst = .{ .kind = .sgpr, .reg = 14 },
+        .src0 = .{ .kind = .sgpr, .reg = 34 },
+        .src1 = .{ .kind = .literal_constant, .value = 0x0007_0007 },
+        .src_count = 2,
+    }, &scc);
+    executeScalar(&result, 0, .{
+        .pc = 0x160,
+        .opcode = .s_cmp_eq_u32,
+        .src0 = .{ .kind = .sgpr, .reg = 14 },
+        .src1 = .{ .kind = .integer_inline_constant, .value = 0 },
+        .src_count = 2,
+    }, &scc);
+    executeScalar(&result, 0, .{
+        .pc = 0x168,
+        .opcode = .s_cselect_b32,
+        .dst = .{ .kind = .sgpr, .reg = 7 },
+        .src0 = .{ .kind = .sgpr, .reg = 7 },
+        .src1 = .{ .kind = .vcc_lo },
+        .src_count = 2,
+    }, &scc);
+
+    try std.testing.expectEqual(true, scc.?);
+    try std.testing.expectEqual(@as(u32, 0x0004_022c), result.register(7).?.value);
 }

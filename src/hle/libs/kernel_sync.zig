@@ -43,6 +43,13 @@ const Lock = struct {
     }
 };
 
+const MutexOrigin = enum {
+    explicit_default,
+    explicit_attr,
+    static_zero,
+    static_adaptive,
+};
+
 pub const Timespec = extern struct {
     tv_sec: i64,
     tv_nsec: i64,
@@ -65,6 +72,8 @@ const Mutex = struct {
     protocol: i32 = 0,
     waiters: usize = 0,
     sequence: u64 = 1,
+    origin: MutexOrigin = .static_zero,
+    reported_self_lock: bool = false,
 };
 
 const MutexAttr = struct {
@@ -172,7 +181,12 @@ pub const Manager = struct {
         self.* = .{};
     }
 
-    fn createMutex(self: *Manager, out: *MutexHandle, attr: ?MutexAttr) Error!void {
+    fn createMutex(
+        self: *Manager,
+        out: *MutexHandle,
+        attr: ?MutexAttr,
+        origin: MutexOrigin,
+    ) Error!void {
         self.lock.lock();
         defer self.lock.unlock();
         // Re-initializing a live object is undefined per POSIX, but titles do
@@ -188,10 +202,12 @@ pub const Manager = struct {
             existing.sequence +%= 1;
             existing.kind = if (attr) |value| value.kind else 1;
             existing.protocol = if (attr) |value| value.protocol else 0;
+            existing.origin = origin;
+            existing.reported_self_lock = false;
             return;
         }
         const object = try self.allocator.create(Mutex);
-        object.* = .{};
+        object.* = .{ .origin = origin };
         if (attr) |value| {
             object.kind = value.kind;
             object.protocol = value.protocol;
@@ -209,7 +225,8 @@ pub const Manager = struct {
             self.lock.unlock();
             return object;
         }
-        if (out.* != null) {
+        const static_adaptive = if (out.*) |pointer| @intFromPtr(pointer) == 1 else false;
+        if (out.* != null and !static_adaptive) {
             self.lock.unlock();
             return error.InvalidArgument;
         }
@@ -217,7 +234,10 @@ pub const Manager = struct {
             self.lock.unlock();
             return err;
         };
-        object.* = .{};
+        object.* = .{
+            .kind = if (static_adaptive) 4 else 1,
+            .origin = if (static_adaptive) .static_adaptive else .static_zero,
+        };
         self.mutexes.append(self.allocator, object) catch |err| {
             self.allocator.destroy(object);
             self.lock.unlock();
@@ -606,6 +626,19 @@ fn currentThread() Error!u64 {
     return if (thread_id == 0) error.InvalidArgument else thread_id;
 }
 
+/// Gen5's CRT initializes the process-wide static-initializer guard with a
+/// null attribute, then recursively enters that guard while constructing
+/// nested function-local statics.  The wrapper ignores the raw lock status and
+/// always performs a matching unlock, so surfacing EDEADLK corrupts its guard
+/// ownership.  Preserve strict error-checking for an explicitly supplied type
+/// 1 attribute; only the firmware-default forms need compatible recursion.
+fn mutexSupportsRecursion(object: *const Mutex) bool {
+    return object.kind == 2 or switch (object.origin) {
+        .explicit_default, .static_zero => true,
+        .explicit_attr, .static_adaptive => false,
+    };
+}
+
 fn readMutexAttr(raw: ?*const MutexAttrHandle) ?MutexAttr {
     const outer = raw orelse return null;
     const manager = activeManager() orelse return null;
@@ -640,7 +673,14 @@ fn mutexLockCore(
             return;
         }
         if (object.owner == thread_id) {
-            if (object.kind == 2) {
+            if (!object.reported_self_lock and trace.isLive()) {
+                object.reported_self_lock = true;
+                std.debug.print(
+                    "[kernel sync] mutex self-lock outer=0x{x} object=0x{x} kind={d} origin={s} recursion={d}\n",
+                    .{ @intFromPtr(handle), @intFromPtr(object), object.kind, @tagName(object.origin), object.recursion },
+                );
+            }
+            if (mutexSupportsRecursion(object)) {
                 if (object.recursion == std.math.maxInt(u32)) return error.ResourceLimit;
                 object.recursion += 1;
                 if (registered_waiter) object.waiters -= 1;
@@ -695,7 +735,7 @@ fn mutexUnlockCore(outer: ?*MutexHandle) Error!void {
         object.state_lock.unlock();
         return error.PermissionDenied;
     }
-    if (object.kind == 2 and object.recursion > 1) {
+    if (mutexSupportsRecursion(object) and object.recursion > 1) {
         object.recursion -= 1;
         object.state_lock.unlock();
         return;
@@ -715,7 +755,15 @@ pub fn scePthreadMutexInit(
 ) callconv(abi.guest) i32 {
     const output = mutex orelse return KernelError.einval.raw();
     const manager = activeManager() orelse return KernelError.enosys.raw();
-    manager.createMutex(output, if (attr == null) null else readMutexAttr(attr)) catch |err|
+    const value = if (attr) |supplied|
+        readMutexAttr(supplied) orelse return KernelError.einval.raw()
+    else
+        null;
+    manager.createMutex(
+        output,
+        value,
+        if (attr == null) .explicit_default else .explicit_attr,
+    ) catch |err|
         return kernelStatus(err);
     return errno.ok;
 }
@@ -899,7 +947,20 @@ fn condWaitCore(
     const cond = pair.cond;
     const mutex = pair.mutex;
 
+    if (mutex.owner == 0 and mutex.recursion == 0) {
+        // Gen5 libkernel may acquire the uncontended mutex word entirely in
+        // guest code.  No HLE lock call then exists to establish host-side
+        // ownership, but cond_wait still has to perform its atomic
+        // unlock/wait/relock cycle.  Adopt the uncontended owner here; a mutex
+        // owned by another tracked thread remains a real EPERM below.
+        mutex.owner = thread_id;
+        mutex.recursion = 1;
+    }
     if (mutex.owner != thread_id) {
+        if (trace.isLive()) std.debug.print(
+            "[kernel sync] cond wait ownership mismatch outer=0x{x} owner=0x{x} current=0x{x} recursion={d} waiters={d} origin={s}\n",
+            .{ @intFromPtr(mutex_handle), mutex.owner, thread_id, mutex.recursion, mutex.waiters, @tagName(mutex.origin) },
+        );
         mutex.state_lock.unlock();
         cond.state_lock.unlock();
         return error.PermissionDenied;
@@ -1641,6 +1702,65 @@ test "recursive mutexes preserve ownership and reject busy destruction" {
     try testing.expectEqual(errno.ok, pthread_mutexattr_destroy(&attr));
 }
 
+test "default mutexes keep nested Gen5 CRT guard locks balanced" {
+    var context = TestContext{};
+    try context.init();
+    defer context.deinit();
+    const thread = try context.thread_manager.prepareInitialThread("default-nested");
+    defer context.thread_manager.releaseInitialThread(thread.handle) catch {};
+    try context.thread_manager.enter(thread.handle);
+    defer context.thread_manager.leave();
+
+    var mutex: MutexHandle = null;
+    try testing.expectEqual(errno.ok, scePthreadMutexInit(&mutex, null, null));
+    try testing.expectEqual(errno.ok, scePthreadMutexLock(&mutex));
+    try testing.expectEqual(errno.ok, scePthreadMutexTrylock(&mutex));
+    try testing.expectEqual(@as(u32, 2), mutex.?.recursion);
+    try testing.expectEqual(errno.ok, scePthreadMutexUnlock(&mutex));
+    try testing.expectEqual(errno.ok, scePthreadMutexUnlock(&mutex));
+    try testing.expectEqual(errno.ok, scePthreadMutexDestroy(&mutex));
+}
+
+test "explicit error-checking mutex remains strict on self lock" {
+    var context = TestContext{};
+    try context.init();
+    defer context.deinit();
+    const thread = try context.thread_manager.prepareInitialThread("errorcheck");
+    defer context.thread_manager.releaseInitialThread(thread.handle) catch {};
+    try context.thread_manager.enter(thread.handle);
+    defer context.thread_manager.leave();
+
+    var attr: MutexAttrHandle = null;
+    try testing.expectEqual(errno.ok, scePthreadMutexattrInit(&attr));
+    try testing.expectEqual(errno.ok, scePthreadMutexattrSettype(&attr, 1));
+    var mutex: MutexHandle = null;
+    try testing.expectEqual(errno.ok, scePthreadMutexInit(&mutex, &attr, null));
+    try testing.expectEqual(errno.ok, scePthreadMutexLock(&mutex));
+    try testing.expectEqual(KernelError.ebusy.raw(), scePthreadMutexTrylock(&mutex));
+    try testing.expectEqual(KernelError.edeadlk.raw(), scePthreadMutexLock(&mutex));
+    try testing.expectEqual(errno.ok, scePthreadMutexUnlock(&mutex));
+    try testing.expectEqual(errno.ok, scePthreadMutexDestroy(&mutex));
+    try testing.expectEqual(errno.ok, scePthreadMutexattrDestroy(&attr));
+}
+
+test "static adaptive mutex initializer preserves its ABI type" {
+    var context = TestContext{};
+    try context.init();
+    defer context.deinit();
+    const thread = try context.thread_manager.prepareInitialThread("static-adaptive");
+    defer context.thread_manager.releaseInitialThread(thread.handle) catch {};
+    try context.thread_manager.enter(thread.handle);
+    defer context.thread_manager.leave();
+
+    var raw_mutex_handle: usize = 1;
+    const mutex: *MutexHandle = @ptrCast(&raw_mutex_handle);
+    try testing.expectEqual(errno.ok, scePthreadMutexLock(mutex));
+    try testing.expectEqual(@as(i32, 4), mutex.*.?.kind);
+    try testing.expectEqual(MutexOrigin.static_adaptive, mutex.*.?.origin);
+    try testing.expectEqual(errno.ok, scePthreadMutexUnlock(mutex));
+    try testing.expectEqual(errno.ok, scePthreadMutexDestroy(mutex));
+}
+
 test "re-initializing a live object succeeds and resets its state" {
     var context = TestContext{};
     try context.init();
@@ -1705,6 +1825,29 @@ test "timed condition wait reacquires its mutex" {
     try testing.expectEqual(errno.ok, pthread_mutex_unlock(&mutex));
     try testing.expectEqual(errno.ok, pthread_cond_destroy(&cond));
     try testing.expectEqual(errno.ok, pthread_condattr_destroy(&attr));
+    try testing.expectEqual(errno.ok, pthread_mutex_destroy(&mutex));
+}
+
+test "condition wait adopts an untracked uncontended fast-path owner" {
+    var context = TestContext{};
+    try context.init();
+    defer context.deinit();
+    const thread = try context.thread_manager.prepareInitialThread("cond-fast-path");
+    defer context.thread_manager.releaseInitialThread(thread.handle) catch {};
+    try context.thread_manager.enter(thread.handle);
+    defer context.thread_manager.leave();
+    var backend = TestWaitBackend{};
+    context.thread_manager.setBackend(backend.value());
+
+    var mutex: MutexHandle = null;
+    var cond: CondHandle = null;
+    try testing.expectEqual(errno.ok, pthread_mutex_init(&mutex, null));
+    try testing.expectEqual(errno.ok, pthread_cond_init(&cond, null));
+    const deadline = Timespec{ .tv_sec = 1, .tv_nsec = 0 };
+    try testing.expectEqual(Posix.etimedout, pthread_cond_timedwait(&cond, &mutex, &deadline));
+    // Reacquisition proves the adopted owner took the ordinary wait path.
+    try testing.expectEqual(errno.ok, pthread_mutex_unlock(&mutex));
+    try testing.expectEqual(errno.ok, pthread_cond_destroy(&cond));
     try testing.expectEqual(errno.ok, pthread_mutex_destroy(&mutex));
 }
 

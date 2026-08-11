@@ -18,6 +18,7 @@ const kernel_event_queue = @import("kernel_event_queue.zig");
 const kernel_ioctl = @import("kernel_ioctl.zig");
 const agc_submit = @import("agc_submit.zig");
 const agc = @import("agc.zig");
+const agc_register_defaults = @import("agc_register_defaults.zig");
 const agc_shader_registry = @import("agc_shader_registry.zig");
 const av_player = @import("av_player.zig");
 const gpu = @import("gpu");
@@ -1050,6 +1051,14 @@ fn writeAgcPacket(buffer: ?*AgcCommandBuffer, opcode: u8, body: []const u32) ?[*
     return cursor;
 }
 
+fn writeExactAgcPacket(buffer: ?*AgcCommandBuffer, opcode: u8, body: []const u32) ?[*]u32 {
+    if (body.len == 0) return null;
+    const cursor = reserveAgcDwords(buffer, body.len + 1) orelse return null;
+    cursor[0] = pm4Header(opcode, body.len);
+    @memcpy(cursor[1 .. body.len + 1], body);
+    return cursor;
+}
+
 fn writeAgcCustomPacket(buffer: ?*AgcCommandBuffer, code: u6, body: []const u32) ?[*]u32 {
     const cursor = reserveAgcCommand(buffer) orelse return null;
     cursor[0] = pm4Header(gpu.pm4.nop, body.len) | (@as(u32, code) << 2);
@@ -1409,6 +1418,60 @@ fn agcDrawIndexAutoGetSize() callconv(abi.guest) u32 {
     return 3 * @sizeOf(u32);
 }
 
+fn agcSetIndexBuffer(
+    buffer: ?*AgcCommandBuffer,
+    index_address: u64,
+) callconv(abi.guest) ?[*]u32 {
+    if (index_address & 1 != 0) return null;
+    const body = [_]u32{ @truncate(index_address), @truncate(index_address >> 32) };
+    return writeExactAgcPacket(buffer, gpu.pm4.index_base, &body);
+}
+
+fn agcSetIndexCount(
+    buffer: ?*AgcCommandBuffer,
+    index_count: u32,
+) callconv(abi.guest) ?[*]u32 {
+    const body = [_]u32{index_count};
+    return writeExactAgcPacket(buffer, gpu.pm4.index_buffer_size, &body);
+}
+
+fn agcDrawIndexOffset(
+    buffer: ?*AgcCommandBuffer,
+    index_offset: u32,
+    index_count: u32,
+    modifier: u64,
+) callconv(abi.guest) ?[*]u32 {
+    const initiator: u32 = if (modifier & (@as(u64, 1) << 32) != 0)
+        0
+    else
+        @as(u32, @truncate(modifier >> 3)) & 0x20;
+    const body = [_]u32{
+        if (index_count == 0) 1 else index_count,
+        index_offset,
+        index_count,
+        initiator,
+    };
+    return writeExactAgcPacket(buffer, gpu.pm4.draw_index_offset_2, &body);
+}
+
+fn agcDrawIndexOffsetGetSize() callconv(abi.guest) u32 {
+    return 5 * @sizeOf(u32);
+}
+
+fn agcSetIndexTypeIndexed(
+    buffer: ?*AgcCommandBuffer,
+    index_size: u32,
+    cache_policy: u32,
+    index_swap: u32,
+) callconv(abi.guest) ?[*]u32 {
+    if (index_size > 2 or cache_policy > 3 or index_swap > 1) return null;
+    const body = [_]u32{
+        0x2000_0243,
+        0x400 | (index_size & 3) | ((cache_policy & 3) << 6) | ((index_swap & 1) << 14),
+    };
+    return writeExactAgcPacket(buffer, gpu.pm4.set_uconfig_reg_index, &body);
+}
+
 fn agcSetNumInstances(
     buffer: ?*AgcCommandBuffer,
     instance_count: u32,
@@ -1498,7 +1561,50 @@ fn agcRegIndirectPatchAddRegisters(command_address: u64, register_count: u32, op
         command_address + 4 * @sizeOf(u32),
         (old_count & ~@as(u32, 0x3fff)) | new_count,
     );
+    if (opcode == gpu.pm4.set_sh_reg_indirect and
+        trace.announces("sceAgcDcbSetShRegistersIndirect"))
+    {
+        traceIndirectShaderPrograms(command_address, new_count);
+    }
     return errno.ok;
+}
+
+/// AGC builds indirect lists incrementally.  When call tracing is enabled,
+/// report the program registers visible after each patch so a missing shader
+/// can be distinguished from a command-processor decode error without dumping
+/// thousands of unrelated state pairs.
+fn traceIndirectShaderPrograms(command_address: u64, register_count: u32) void {
+    const low = readGuestU32(command_address + @sizeOf(u32)) & 0xffff_fffc;
+    const high = readGuestU32(command_address + 2 * @sizeOf(u32));
+    const registers_address = (@as(u64, high) << 32) | low;
+    const byte_count = @as(usize, register_count) * @sizeOf(ShaderRegister);
+    if (register_count == 0 or registers_address == 0 or !accessible(registers_address, byte_count)) return;
+
+    const registers: [*]const ShaderRegister = @ptrFromInt(registers_address);
+    var found = false;
+    for (registers[0..register_count], 0..) |entry, index| {
+        if (entry.offset == std.math.maxInt(u32)) continue;
+        var offset = entry.offset & ~@as(u32, 0x7000_0000);
+        if (offset >= gpu.pm4.RegisterSpace.shader.base()) {
+            offset -%= gpu.pm4.RegisterSpace.shader.base();
+        }
+        const is_program_word = switch (offset) {
+            0x008, 0x009, 0x048, 0x049, 0x088, 0x089, 0x0c8, 0x0c9, 0x108, 0x109, 0x20c, 0x20d => true,
+            else => false,
+        };
+        if (!is_program_word) continue;
+        if (!found) {
+            std.debug.print(
+                "[agc sh indirect] cmd=0x{x} list=0x{x} count={d}\n",
+                .{ command_address, registers_address, register_count },
+            );
+            found = true;
+        }
+        std.debug.print(
+            "  sh[{d}] raw=0x{x} offset=0x{x} value=0x{x}\n",
+            .{ index, entry.offset, offset, entry.value },
+        );
+    }
 }
 
 fn agcSetCxRegIndirectPatchSetAddress(command_address: u64, registers_address: u64) callconv(abi.guest) i32 {
@@ -1601,6 +1707,70 @@ fn agcSetShRegisterRangeDirectGetSize(value_count: u32) callconv(abi.guest) u32 
     return (value_count + 2) * @sizeOf(u32);
 }
 
+fn agcSetRegistersDirect(
+    buffer: ?*AgcCommandBuffer,
+    registers_address: u64,
+    register_count: u32,
+    opcode: u8,
+) ?[*]u32 {
+    if (register_count == 0 or register_count > 0x1000 or registers_address == 0) return null;
+    const byte_count = std.math.mul(
+        usize,
+        @as(usize, register_count),
+        @sizeOf(agc_register_defaults.ShaderRegister),
+    ) catch return null;
+    if (registers_address & (@alignOf(agc_register_defaults.ShaderRegister) - 1) != 0 or
+        !accessible(registers_address, byte_count)) return null;
+
+    // Snapshot the volatile list before advancing the command cursor. Besides
+    // matching the retail API, this keeps an aliased source from being
+    // overwritten while several register runs are emitted.
+    var local: [0x1000]agc_register_defaults.ShaderRegister = undefined;
+    const registers: [*]const agc_register_defaults.ShaderRegister = @ptrFromInt(registers_address);
+    @memcpy(local[0..register_count], registers[0..register_count]);
+
+    var first_command: ?[*]u32 = null;
+    var run_start: usize = 0;
+    while (run_start < register_count) {
+        var run_end = run_start + 1;
+        while (run_end < register_count and
+            local[run_end].offset == local[run_end - 1].offset +% 1) : (run_end += 1)
+        {}
+
+        const run_count = run_end - run_start;
+        const total_dwords = run_count + 2;
+        const cursor = reserveAgcDwords(buffer, total_dwords) orelse return first_command;
+        if (first_command == null) first_command = cursor;
+        cursor[0] = pm4Header(opcode, run_count + 1);
+        cursor[1] = local[run_start].offset & 0xffff;
+        for (local[run_start..run_end], 0..) |entry, index| cursor[index + 2] = entry.value;
+        run_start = run_end;
+    }
+    return first_command;
+}
+
+fn agcSetShRegistersDirect(
+    buffer: ?*AgcCommandBuffer,
+    registers_address: u64,
+    register_count: u32,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) ?[*]u32 {
+    return agcSetRegistersDirect(buffer, registers_address, register_count, gpu.pm4.set_sh_reg);
+}
+
+fn agcSetUcRegistersDirect(
+    buffer: ?*AgcCommandBuffer,
+    registers_address: u64,
+    register_count: u32,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) ?[*]u32 {
+    return agcSetRegistersDirect(buffer, registers_address, register_count, gpu.pm4.set_uconfig_reg);
+}
+
 fn agcPatch(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
     return errno.ok;
 }
@@ -1627,10 +1797,12 @@ fn agcGetSize(_: u64) callconv(abi.guest) u32 {
     return 64;
 }
 
-var register_defaults: [256]u32 align(16) = [_]u32{0} ** 256;
+fn agcGetRegisterDefaults(version: u32) callconv(abi.guest) *anyopaque {
+    return agc_register_defaults.get(version, false);
+}
 
-fn agcGetRegisterDefaults(_: u32) callconv(abi.guest) *anyopaque {
-    return &register_defaults;
+fn agcGetRegisterDefaultsInternal(version: u32) callconv(abi.guest) *anyopaque {
+    return agc_register_defaults.get(version, true);
 }
 
 const shader_file_header: u32 = 0x3433_3231;
@@ -1940,7 +2112,7 @@ fn agcCreatePrimState(
 const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcInitialize", .function = trace.wrap("sceAgcInitialize", &agcPatch), .id_override = "23LRUSvYu1M" },
     .{ .name = "sceAgcGetRegisterDefaults2", .function = trace.wrap("sceAgcGetRegisterDefaults2", &agcGetRegisterDefaults), .expect_id = "2JtWUUiYBXs" },
-    .{ .name = "sceAgcGetRegisterDefaults2Internal", .function = trace.wrap("sceAgcGetRegisterDefaults2Internal", &agcGetRegisterDefaults), .expect_id = "wRbq6ZjNop4" },
+    .{ .name = "sceAgcGetRegisterDefaults2Internal", .function = trace.wrap("sceAgcGetRegisterDefaults2Internal", &agcGetRegisterDefaultsInternal), .expect_id = "wRbq6ZjNop4" },
     .{ .name = "sceAgcCreateShader", .function = trace.wrap("sceAgcCreateShader", &agcCreateShader), .expect_id = "f3dg2CSgRKY" },
     .{ .name = "sceAgcUnknownGetFusedShaderSize", .function = trace.wrap("sceAgcUnknownGetFusedShaderSize", &agcGetFusedShaderSize), .id_override = "dolOmWH+huQ" },
     .{ .name = "sceAgcUnknownFuseShaderHalves", .function = trace.wrap("sceAgcUnknownFuseShaderHalves", &agcFuseShaderHalves), .id_override = "fd5Bp5tGTgo" },
@@ -1965,15 +2137,15 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcDebugRaiseException", .function = trace.wrap("sceAgcDebugRaiseException", &agcPatch), .expect_id = "T6xuVw0KUJo" },
     .{ .name = "sceAgcCbSetShRegisterRangeDirectGetSize", .function = trace.wrap("sceAgcCbSetShRegisterRangeDirectGetSize", &agcSetShRegisterRangeDirectGetSize), .expect_id = "bxGoVxpdSPQ" },
     .{ .name = "sceAgcUnknownDb", .function = trace.wrap("sceAgcUnknownDb", &agcPatch), .id_override = "dbOlWdppb4o" },
-    .{ .name = "sceAgcUnknownKRzWekV120", .function = trace.wrap("sceAgcUnknownKRzWekV120", &agcPatch), .id_override = "-KRzWekV120" },
+    .{ .name = "sceAgcUnknownKRzWekV120", .function = trace.wrap("sceAgcUnknownKRzWekV120", &agcSetIndexTypeIndexed), .id_override = "-KRzWekV120" },
     .{ .name = "sceAgcUnknownIkfdtRIqCE", .function = trace.wrap("sceAgcUnknownIkfdtRIqCE", &agcPatch), .id_override = "Ikfdt-rIqCE" },
     .{ .name = "sceAgcGetDataPacketPayloadAddress", .function = trace.wrap("sceAgcGetDataPacketPayloadAddress", &agcGetDataPacketPayloadAddress), .id_override = "V++UgBtQhn0" },
 
     .{ .name = "sceAgcCbNop", .function = trace.wrap("sceAgcCbNop", &agcCommand), .expect_id = "LtTouSCZjHM" },
     .{ .name = "sceAgcCbDispatch", .function = trace.wrap("sceAgcCbDispatch", &agcDispatch), .expect_id = "k3GhuSNmBLU" },
     .{ .name = "sceAgcCbSetShRegisterRangeDirect", .function = trace.wrap("sceAgcCbSetShRegisterRangeDirect", &agcSetShRegisterRangeDirect), .expect_id = "n2fD4A+pb+g" },
-    .{ .name = "sceAgcCbSetShRegistersDirect", .function = trace.wrap("sceAgcCbSetShRegistersDirect", &agcCommand), .expect_id = "UZbQjYAwwXM" },
-    .{ .name = "sceAgcCbSetUcRegistersDirect", .function = trace.wrap("sceAgcCbSetUcRegistersDirect", &agcCommand), .expect_id = "03RZmELWWzw" },
+    .{ .name = "sceAgcCbSetShRegistersDirect", .function = trace.wrap("sceAgcCbSetShRegistersDirect", &agcSetShRegistersDirect), .expect_id = "UZbQjYAwwXM" },
+    .{ .name = "sceAgcCbSetUcRegistersDirect", .function = trace.wrap("sceAgcCbSetUcRegistersDirect", &agcSetUcRegistersDirect), .expect_id = "03RZmELWWzw" },
     .{ .name = "sceAgcCbReleaseMem", .function = trace.wrap("sceAgcCbReleaseMem", &agcReleaseMem), .expect_id = "wr23dPKyWc0" },
 
     .{ .name = "sceAgcAcbResetQueue", .function = trace.wrap("sceAgcAcbResetQueue", &agcCommand), .expect_id = "JrtiDtKeS38" },
@@ -1991,12 +2163,14 @@ const agc_exports = [_]symbols.Export{
 
     .{ .name = "sceAgcDcbResetQueue", .function = trace.wrap("sceAgcDcbResetQueue", &agcCommand), .expect_id = "TRO721eVt4g" },
     .{ .name = "sceAgcDcbWaitUntilSafeForRendering", .function = trace.wrap("sceAgcDcbWaitUntilSafeForRendering", &agcCommand), .expect_id = "MWiElSNE8j8" },
-    .{ .name = "sceAgcDcbSetIndexBuffer", .function = trace.wrap("sceAgcDcbSetIndexBuffer", &agcCommand), .expect_id = "l4fM9K-Lyks" },
-    .{ .name = "sceAgcDcbSetIndexCount", .function = trace.wrap("sceAgcDcbSetIndexCount", &agcCommand), .expect_id = "8N2tmT3jmC8" },
+    .{ .name = "sceAgcDcbSetIndexBuffer", .function = trace.wrap("sceAgcDcbSetIndexBuffer", &agcSetIndexBuffer), .expect_id = "l4fM9K-Lyks" },
+    .{ .name = "sceAgcDcbSetIndexCount", .function = trace.wrap("sceAgcDcbSetIndexCount", &agcSetIndexCount), .expect_id = "8N2tmT3jmC8" },
     .{ .name = "sceAgcDcbSetIndexSize", .function = trace.wrap("sceAgcDcbSetIndexSize", &agcSetIndexSize), .expect_id = "GIIW2J37e70" },
     .{ .name = "sceAgcDcbDrawIndex", .function = trace.wrap("sceAgcDcbDrawIndex", &agcDrawIndex), .expect_id = "q88lQ+GP5Yk" },
     .{ .name = "sceAgcDcbDrawIndexAuto", .function = trace.wrap("sceAgcDcbDrawIndexAuto", &agcDrawIndexAuto), .expect_id = "Yw0jKSqop+E" },
     .{ .name = "sceAgcDcbDrawIndexAutoGetSize", .function = trace.wrap("sceAgcDcbDrawIndexAutoGetSize", &agcDrawIndexAutoGetSize), .expect_id = "WrdP9Zxx3lQ" },
+    .{ .name = "sceAgcDcbDrawIndexOffset", .function = trace.wrap("sceAgcDcbDrawIndexOffset", &agcDrawIndexOffset), .expect_id = "B+aG9DUnTKA" },
+    .{ .name = "sceAgcDcbDrawIndexOffsetGetSize", .function = trace.wrap("sceAgcDcbDrawIndexOffsetGetSize", &agcDrawIndexOffsetGetSize), .expect_id = "qMlfB1ZhMDc" },
     .{ .name = "sceAgcDcbDrawIndexIndirect", .function = trace.wrap("sceAgcDcbDrawIndexIndirect", &agcCommand), .expect_id = "t1vNu082-jM" },
     .{ .name = "sceAgcDcbDrawIndirect", .function = trace.wrap("sceAgcDcbDrawIndirect", &agcCommand), .expect_id = "1q1titRBL6o" },
     .{ .name = "sceAgcDcbDispatchIndirect", .function = trace.wrap("sceAgcDcbDispatchIndirect", &agcCommand), .expect_id = "CtB+A9-VxO0" },
@@ -2267,6 +2441,44 @@ test "bootstrap AGC emits exact draw-index-auto packet" {
     const draw = (try walker.next()).?;
     try std.testing.expectEqual(gpu.pm4.draw_index_auto, draw.opcode);
     try std.testing.expectEqualSlices(u32, &.{ 3, 0x2 }, draw.body);
+    try std.testing.expect((try walker.next()) == null);
+}
+
+test "bootstrap AGC emits indexed-buffer state and offset draw packets" {
+    var words: [13]u32 = @splat(0xdead_beef);
+    var command_buffer = AgcCommandBuffer{
+        .bottom = words[0..].ptr,
+        .top = words[0..].ptr + words.len,
+        .cursor_up = words[0..].ptr,
+        .cursor_down = null,
+        .callback = null,
+        .user_data = null,
+        .reserved_dwords = 0,
+    };
+    const address: u64 = 0x1234_5678_9abc_def0;
+    try std.testing.expect(agcSetIndexBuffer(&command_buffer, address) != null);
+    try std.testing.expect(agcSetIndexCount(&command_buffer, 0x200) != null);
+    try std.testing.expect(agcSetIndexTypeIndexed(&command_buffer, 2, 1, 1) != null);
+    try std.testing.expectEqual(@as(u32, 20), agcDrawIndexOffsetGetSize());
+    try std.testing.expect(agcDrawIndexOffset(&command_buffer, 5, 12, 0) != null);
+    try std.testing.expectEqual(words[0..].ptr + words.len, command_buffer.cursor_up.?);
+
+    var walker = gpu.pm4.Walker.init(&words);
+    const base = (try walker.next()).?;
+    try std.testing.expectEqual(gpu.pm4.index_base, base.opcode);
+    try std.testing.expectEqualSlices(u32, &.{ 0x9abc_def0, 0x1234_5678 }, base.body);
+
+    const count = (try walker.next()).?;
+    try std.testing.expectEqual(gpu.pm4.index_buffer_size, count.opcode);
+    try std.testing.expectEqualSlices(u32, &.{0x200}, count.body);
+
+    const index_type = (try walker.next()).?;
+    try std.testing.expectEqual(gpu.pm4.set_uconfig_reg_index, index_type.opcode);
+    try std.testing.expectEqualSlices(u32, &.{ 0x2000_0243, 0x4442 }, index_type.body);
+
+    const draw = (try walker.next()).?;
+    try std.testing.expectEqual(gpu.pm4.draw_index_offset_2, draw.opcode);
+    try std.testing.expectEqualSlices(u32, &.{ 12, 5, 12, 0 }, draw.body);
     try std.testing.expect((try walker.next()) == null);
 }
 
@@ -2566,4 +2778,5 @@ test "bootstrap service libraries register the title link surface" {
     try std.testing.expect(db.findById("Up36PTk687E", .function) != null);
     try std.testing.expect(db.findById("PI7jIZj4pcE", .function) != null);
     try std.testing.expect(db.findById("YUeqkyT7mEQ", .function) != null);
+    try std.testing.expect(db.findByName("sceAgcDcbDrawIndexOffset", .function) != null);
 }

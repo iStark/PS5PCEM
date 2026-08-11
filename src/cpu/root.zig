@@ -1677,25 +1677,29 @@ pub const Dispatcher = struct {
             .clock = .awake,
             .raw = .fromNanoseconds(@as(i96, microseconds) * std.time.ns_per_us),
         };
-        const deadline = std.Io.Clock.Timestamp.fromNow(self.io, duration);
-        while (true) {
-            self.lock.lock();
-            if (self.shutting_down) {
-                self.lock.unlock();
-                return error.WaitFailed;
-            }
-            const epoch = @atomicLoad(u32, &self.wake_epoch, .acquire);
-            self.lock.unlock();
+        self.lock.lock();
+        const shutting_down = self.shutting_down;
+        self.lock.unlock();
+        if (shutting_down) return error.WaitFailed;
 
-            const now = std.Io.Clock.Timestamp.now(self.io, deadline.clock);
-            if (std.Io.Clock.Timestamp.compare(deadline, .lte, now)) return;
-            self.io.futexWaitTimeout(
-                u32,
-                &self.wake_epoch,
-                epoch,
-                .{ .deadline = deadline },
-            ) catch return error.WaitFailed;
+        // `wake_epoch` belongs to mutex/condition scheduling. Waiting on it for
+        // a plain timed sleep makes every unrelated guest wake a spurious
+        // wakeup; audio render loops then spend the entire timeout repeatedly
+        // entering RtlWaitOnAddress/ZwYieldExecution and burn a CPU core.
+        //
+        // The threaded-I/O sleep is cancelable and a guest worker can inherit
+        // a pending I/O cancellation, making it return immediately forever.
+        // NtDelayExecution is the primitive a firmware-style synchronous
+        // usleep needs here: a private, relative, non-alertable deadline.
+        if (builtin.os.tag == .windows) {
+            const maximum_us: u64 = @intCast(std.math.maxInt(i64) / 10);
+            const bounded_us: i64 = @intCast(@min(microseconds, maximum_us));
+            const interval: std.os.windows.LARGE_INTEGER = -bounded_us * 10;
+            const status = std.os.windows.ntdll.NtDelayExecution(.FALSE, &interval);
+            if (status != .SUCCESS and status != .TIMEOUT) return error.WaitFailed;
+            return;
         }
+        duration.sleep(self.io) catch return error.WaitFailed;
     }
 
     fn wait(

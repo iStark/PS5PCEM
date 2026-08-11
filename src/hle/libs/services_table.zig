@@ -311,10 +311,10 @@ pub const npentitlementaccess_exports = [_]symbols.Export{
 };
 
 pub const npgameintent_exports = [_]symbols.Export{
-    .{ .name = "sceNpGameIntentTerminate", .function = trace.wrap("sceNpGameIntentTerminate", &services.offline), .expect_id = "0HBYxYAjmf0" },
-    .{ .name = "sceNpGameIntentInitialize", .function = trace.wrap("sceNpGameIntentInitialize", &services.offline), .expect_id = "m87BHxt-H60" },
-    .{ .name = "sceNpGameIntentReceiveIntent", .function = trace.wrap("sceNpGameIntentReceiveIntent", &services.offline), .expect_id = "jEIXUAr9XE8" },
-    .{ .name = "sceNpGameIntentGetPropertyValueString", .function = trace.wrap("sceNpGameIntentGetPropertyValueString", &services.offline), .expect_id = "rPl0INNc-M8" },
+    .{ .name = "sceNpGameIntentTerminate", .function = trace.wrap("sceNpGameIntentTerminate", &services.npGameIntentTerminate), .expect_id = "0HBYxYAjmf0" },
+    .{ .name = "sceNpGameIntentInitialize", .function = trace.wrap("sceNpGameIntentInitialize", &services.npGameIntentInitialize), .expect_id = "m87BHxt-H60" },
+    .{ .name = "sceNpGameIntentReceiveIntent", .function = trace.wrap("sceNpGameIntentReceiveIntent", &services.npGameIntentReceiveIntent), .expect_id = "jEIXUAr9XE8" },
+    .{ .name = "sceNpGameIntentGetPropertyValueString", .function = trace.wrap("sceNpGameIntentGetPropertyValueString", &services.npGameIntentGetPropertyValueString), .expect_id = "rPl0INNc-M8" },
 };
 
 pub const npmanager_exports = [_]symbols.Export{
@@ -409,7 +409,6 @@ pub const pad_exports = [_]symbols.Export{
     .{ .name = "scePadVrControllerSetTriggerEffect", .function = trace.wrap("scePadVrControllerSetTriggerEffect", &services.noDevice), .expect_id = "6Cdc9bbjrRY" },
     .{ .name = "scePadVrControllerSetVibrationMode", .function = trace.wrap("scePadVrControllerSetVibrationMode", &services.noDevice), .expect_id = "Wf6-PNCyY20" },
     .{ .name = "scePadVrControllerSetVibration", .function = trace.wrap("scePadVrControllerSetVibration", &services.noDevice), .expect_id = "DGCwN1Lmmys" },
-    .{ .name = "scePadReadState", .function = trace.wrap("scePadReadState", &services.noDevice), .expect_id = "YndgXqQVV7c" },
 };
 
 pub const razorcpu_exports = [_]symbols.Export{

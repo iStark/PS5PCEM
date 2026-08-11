@@ -193,6 +193,20 @@ pub const Runtime = struct {
         self.native_cpu_bridge.deinit();
     }
 
+    /// Live pthreads created by the guest, excluding the process bootstrap.
+    pub fn liveGuestThreadCount(self: *Runtime) usize {
+        if (!self.initialized) return 0;
+        return self.thread_manager.liveChildCount();
+    }
+
+    pub fn liveGuestThreads(
+        self: *Runtime,
+        output: []hle.libs.kernel_threading.LiveThreadInfo,
+    ) usize {
+        if (!self.initialized) return 0;
+        return self.thread_manager.liveChildren(output);
+    }
+
     /// Returns the latest guest fault contained by the runtime-owned native
     /// bridge. Custom CPU bridges keep their own diagnostic channel.
     pub fn lastNativeFault(self: *Runtime) ?cpu.FaultRecord {

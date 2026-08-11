@@ -53,6 +53,16 @@ If you would like to support continued PS5PCEM development, you can do so on
   scanout, GPU-resident storage and bulk tiled-texture staging reduced warmed-up frames
   from roughly 208–240 ms to 22–65 ms in the current startup capture; first-use
   texture uploads remain scene-dependent.
+- Jets 'n' Guns 2 now renders its animated 3840×2160 title screen, complete main
+  menu, and options UI instead of a black framebuffer. The complete ordered
+  final pass without an explicit color target is retained until VideoOut supplies
+  the scanout target.
+  Recovered graphics SGPR values and live storage-buffer bounds are supplied as
+  runtime data, so changing sprite batches no longer generate dozens of new
+  vertex pipelines per frame. After warm-up, pipeline misses fall to zero and
+  the observed 53-draw startup frames take roughly 113–124 ms on the current
+  RTX 3070 Ti test host, down from approximately 1–1.8 seconds before the
+  specialization fix.
 - PS VR2 libraries currently expose only compatibility/no-device behavior.
   VR plugins can initialize far enough to load Unity assets, but headset
   rendering, tracking, controllers, and a host OpenXR bridge do not exist yet.
@@ -61,6 +71,11 @@ If you would like to support continued PS5PCEM development, you can do so on
   save-data mount/dialog lifecycles, POSIX semaphores and pthread barriers,
   local listener sockets, sign-in dialog state, offline telemetry handles, and
   split AJM batch jobs.
+- NGS2 now preserves system/rack/voice lifecycles, parses RIFF/WAVE geometry,
+  applies play/pause/resume/stop/kill events, reports 32-bit voice-state flags,
+  and paces silent render grains instead of spinning a host core. The legacy
+  `libSceAudiodec` lifecycle also performs real ATRAC9 and MP3 decoding; NGS2
+  voice mixing and M4AAC decoding are still incomplete.
 - AGC resource registration now reports deterministic backing-memory
   requirements and retains owner handles instead of leaving output sizes
   uninitialized. This prevents otherwise valid titles from turning stack data
@@ -102,6 +117,13 @@ sampled-texture, render-target, and Vulkan presentation paths. Texture alpha,
 component swizzles, and sRGB sampling now preserve the title's intended color
 balance.*
 
+![Jets 'n' Guns 2 main menu rendered by PS5PCEM](docs/images/jets-n-guns-2.png)
+
+*A live 3840×2160 Jets 'n' Guns 2 title/menu frame produced by the guest
+multi-draw, sampled-texture, persistent-render-target, and VideoOut paths. This
+is an in-title rendering milestone rather than a gameplay claim: selecting
+`NEW GAME` currently stops the graphics loop before a playable scene appears.*
+
 ![The Precinct Kwalee video frame rendered by PS5PCEM](docs/images/precinct-kwalee.png)
 
 *A decoded 3840x2160 H.264 frame from The Precinct's Kwalee intro, converted by
@@ -126,7 +148,7 @@ the repository contains none of that content.
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
 | **Tetris Effect: Connected** | Completes Unreal filesystem/config bootstrap, executes compact typed UAV clears and 3D volume uploads, translates two 344/125-instruction volume dispatches with recursively recovered V# chains, and translates the complete 176-instruction mixed-image/LDS prepass, including compute `image_sample_lz` at PC `0x29c` and NSA `image_store` at PC `0x440`; its 2,401-instruction deferred compositor writes all 8,294,400 pixels of the 3840×2160 scanout | The first repeatable guest framebuffer is uniform light gray rather than a recognizable scene; a normal run currently produces an NVIDIA GPU fault during an earlier `15×9×8` dispatch, while NGG export and some image forms remain incomplete and the 512 GiB reservation can depend on host address-space placement |
 | **The Precinct** | Links the complete six-image guest graph, defers and starts Unity plug-ins through `sceKernelLoadStartModule`, enters Unity, indexes its audio assets, and plays both observed intro movies through the new SceAvPlayer path. The title receives synchronized 3840×2160 NV12 video and 48 kHz stereo PCM; its guest YUV conversion shader produces the recognizable Kwalee frame above. Post-video graphics continue through seven draws and nine dispatches per frame, with warmed-up frames around 20–22 ms on the current RTX 3070 Ti test host | The post-video scene source is still incorrect: draw 1 receives a sparse/corrupted pixel strip, draw 2 copies it to the scanout, and later UI draws do not restore a recognizable scene. Gameplay is not claimed yet |
-| **Jets 'n' Guns 2** | Loads the three-image guest graph, resolves the title content through `/app0`, completes AGC resource-registration setup without the former bogus allocation, enters a sustained graphics loop, registers a 3840×2160 target, and submits repeated DCBs with up to 24 draws per pass and regular VideoOut flips. Its merged NGG vertex programs now translate instead of falling back to the probe shader | Captured frames remain black for a separate reason: the title never programs the colour-buffer context registers in the stream that is parsed, so every draw is treated as targetless and only the deferred display draw reaches the GPU. `libSceAudiodec` also rejects MP3 decoder creation, and the 8-channel output the title opens has no host fallback, so the music path fails and retries |
+| **Jets 'n' Guns 2** | Resolves title content through `/app0`, completes AGC resource registration, and sustains the full graphics/compute/VideoOut loop. Targetless final passes are preserved through flip, while dynamic SGPR data and descriptor-sized buffer bounds keep streamed sprite batches on stable Vulkan pipelines. The title now renders the recognizable 3840×2160 title screen, main menu, and options UI shown above; warmed 53-draw startup frames measure roughly 113–124 ms on the current RTX 3070 Ti host with zero pipeline misses after warm-up | A manual `Cross` reaches the main menu without the automatic `Options` pulse, but selecting `NEW GAME` currently stops further flips after the audio decode/output loops exit. A playable scene and working in-game audio are therefore not claimed yet |
 
 ## Components
 
@@ -178,6 +200,12 @@ the runtime and renderer `std.heap.smp_allocator`. Unlike an arena, this
 allocator returns superseded frame, staging, shader, and container allocations
 when their normal `free` paths run; long asset-loading sessions therefore do
 not retain every historical temporary buffer until process exit.
+
+If the process bootstrap returns after handing work to guest pthreads,
+`game-run` reports their names and entry points rather than treating the return
+as an immediate process exit. The window and runtime remain alive while a
+non-audio guest worker is still running; audio-only leftovers do not keep a
+finished title open forever.
 
 The recommended Windows entry point is `zig-out\bin\ps5pcem.exe` (or
 `zig build launcher`). The launcher remembers the selected game directory,
@@ -606,13 +634,15 @@ supported domain are rejected before any guest read.
 [`gpu.scalar_provenance`](src/gpu/scalar_provenance.zig) initializes physical
 SGPRs from that immutable user-data snapshot (at `s8` for an NGG export
 program), evaluates a bounded scalar shader prefix and performs checked SMEM
-loads. Each known value carries its user-data, immediate, program-counter and
-memory roots; each load records its exact guest address, destination range and
-whether it stays inside the declared SRT. Unknown instruction lengths,
-unresolved branches, inaccessible memory and invalid 48-bit addresses stop the
-walk explicitly instead of inventing state. Draw/dispatch diagnostics expose
-this load plan together with the direct and vertex tables, ready for the shader
-translator to consume.
+loads. Graphics evaluation can walk the shader-analysis cache's already decoded
+instruction stream while keeping guest data loads live, avoiding a second
+fetch/decode pass for every draw. Each known value carries its user-data,
+immediate, program-counter and memory roots; each load records its exact guest
+address, destination range and whether it stays inside the declared SRT.
+Unknown instruction lengths, unresolved branches, inaccessible memory and
+invalid 48-bit addresses stop the walk explicitly instead of inventing state.
+Draw/dispatch diagnostics expose this load plan together with the direct and
+vertex tables, ready for the shader translator to consume.
 
 [`gpu.shader_analysis`](src/gpu/shader_analysis.zig) incrementally reads only
 the guest words required by the RDNA2 decoder, including literals and MIMG NSA
@@ -696,8 +726,8 @@ matching guest address, and publishes the frame through an API-neutral sink.
 
 The remaining stages are:
 
-1. Move frequently changing shader scalars from SPIR-V specialization into a
-   runtime constant path so graphics pipelines can be reused across frames.
+1. Cache stable translated graphics modules and resource layouts across draws,
+   leaving only runtime scalar values and descriptor updates on the hot path.
 2. Add depth/stencil, multiple render targets, MSAA, texture component swizzles,
    the remaining compressed DCC/FMASK states, HTILE Z-range/HiZ handling, and
    CMASK states coupled to MSAA/FMASK.
@@ -727,11 +757,13 @@ compute. Validation is requested for debug builds when
 `VK_LAYER_KHRONOS_validation` is installed and otherwise disabled cleanly.
 
 The renderer owns instance/device lifetime, the selected queue, a transient
-command pool, host/device memory-type selection, one descriptor layout with
-64 storage buffers plus 64 combined sampled images, its pool, persistent guest
-render targets, and image/view/sampler/render-pass/framebuffer creation. It also
-owns bounded compute and LRU graphics-pipeline caches plus a 32-entry sampled
-image LRU. The Vulkan-driver cache is persisted as
+command pool with a resettable one-shot command buffer/fence, host/device
+memory-type selection, one descriptor layout with 64 storage buffers, 64
+combined sampled images, typed storage images, and a persistently mapped dynamic
+scalar buffer, its pool, persistent guest render targets, and
+image/view/sampler/render-pass/framebuffer creation. It also owns bounded
+compute and LRU graphics-pipeline caches plus a 32-entry sampled-image LRU. The
+Vulkan-driver cache is persisted as
 `vulkan_pipeline_cache.bin` between runs; invalid, unreadable, or oversized
 cache data simply falls back to an empty driver cache, so it can only affect
 startup compilation time, never correctness.
@@ -764,6 +796,9 @@ single-sample 2D `image_load`/`image_store` dispatches now stage each T# through
 the same texture-layout contract, bind up to eight independently typed Vulkan
 storage images, accept consecutive or NSA coordinate VGPRs, and retile writable
 results into guest memory after completion.
+An exact packed `RGBA8` V# clear shape operates directly on an already resident
+color attachment, avoiding a full-frame storage-buffer transfer and stale
+aliased image contents.
 Mip, array, 3D, MSAA, compressed and partial-mask store forms remain explicit
 unsupported work rather than taking a narrow fast path. Draw callbacks count
 work by default. When both vertex and pixel
@@ -777,6 +812,12 @@ back before a matching sampled-image upload or display read, at `SetFlip`, and
 at CPU-visible PM4 synchronization points. This preserves guest-visible ordering
 while avoiding a full-frame readback after every draw. A half-bound graphics
 program fails explicitly.
+Recovered vertex and fragment SGPR values are read from the mapped scalar buffer
+at draw time instead of becoming SPIR-V constants. Storage-buffer shaders query
+the descriptor's live word count with `OpArrayLength`, so changing streamed
+addresses, values, or batch extents does not create a new shader module or
+graphics-pipeline key. Indexed draws retain `INDEX_BASE`, buffer size and index
+type; `DRAW_INDEX_OFFSET_2` uploads the exact 16- or 32-bit guest index range.
 `enable_graphics_probe` retains the fixed-shader diagnostic only for draws with
 no guest graphics programs. Compute dispatch captures scalar user data,
 optionally resolves
@@ -1349,10 +1390,14 @@ continues thread exit if a destructor callback fails.
 
 Mutexes, condition variables, reader/writer locks, and reusable pthread
 barriers use stable opaque guest handles backed by host-owned records. Null
-static initializers are materialized lazily. Mutexes track ownership, recursive
-depth, type, protocol metadata, and timed/try operations. Condition waits
-atomically publish themselves and release the associated mutex, then always
-reacquire it before returning, including after a timeout. Reader/writer locks
+and adaptive static initializers are materialized lazily with their ABI type.
+Firmware-default mutexes preserve the recursive nesting used by Gen5 CRT static
+guards, while explicitly error-checking/adaptive mutexes remain strict. Mutexes
+track ownership, recursive depth, type, origin, protocol metadata, and timed/try
+operations. A condition wait can adopt an otherwise uncontended mutex acquired
+entirely by the guest fast path, then atomically publishes itself and releases
+that mutex before always reacquiring it on return, including after a timeout.
+Reader/writer locks
 retain per-thread reader ownership and prefer a queued writer over new readers
 so writers cannot be starved indefinitely. Barriers retain their generation
 across reuse, wake every participant at the threshold, and return the console's
@@ -1469,17 +1514,22 @@ RGBA images into checked guest RGBA/BGRA buffers, including scanline filters
 and palette transparency. Adam7 input is recognized but not decoded yet.
 
 AudioOut, AudioIn, and AudioOut2 expose paced ports, queues, speaker metadata,
-and atomic multi-port `sceAudioOutOutputs` batches. The initial NGS2
-compatibility layer supplies stable system/rack/voice handles, silent render
-buffers, state queries, and a neutral pan matrix; waveform parsing and actual
-NGS2 voice synthesis remain incomplete. AJM owns state per codec instance and
-performs real ATRAC9 (`codec 1`) and MP3 (`codec 0`) decoding for contiguous and
-split-buffer jobs. Initialize, codec-info, gapless, stream byte counts,
-decoded-frame counts, and total sample sidebands are preserved. ATRAC9 output
-supports signed 16-bit, signed 32-bit, float, and planar layouts; M4AAC remains
-unsupported and is rejected instead of being reported as successful silent
-PCM. The separate legacy `libSceAudiodec` decoder lifecycle is not complete
-yet. FSB-backed fallback
+and atomic multi-port `sceAudioOutOutputs` batches. NGS2 supplies stable
+system/rack/voice handles with checked parent lifetimes, parses ordinary
+RIFF/WAVE geometry, walks bounded linked voice-parameter lists, applies
+play/pause/resume/stop/kill events on render, reports exact 32-bit state flags,
+and preserves a neutral pan matrix. Each silent float32 render grain is paced at
+48 kHz, preventing a title's software-DSP worker from becoming a host busy loop;
+actual NGS2 voice synthesis and mixing remain incomplete. AJM owns state per
+codec instance and performs real ATRAC9 (`codec 1`) and MP3 (`codec 0`) decoding
+for contiguous and split-buffer jobs. Initialize, codec-info, gapless, stream
+byte counts, decoded-frame counts, and total sample sidebands are preserved.
+ATRAC9 output supports signed 16-bit, signed 32-bit, float, and planar layouts;
+M4AAC remains unsupported and is rejected instead of being reported as
+successful silent PCM. The legacy `libSceAudiodec` path now implements library
+init/term, checked decoder create/delete/reset, codec metadata, and real ATRAC9
+and MP3 decode through the shared codec backend. Its M4AAC branch remains a
+bounded silent compatibility path rather than a decoder. FSB-backed fallback
 previews are resampled to the 48 kHz host mix, use short de-click envelopes,
 and drain once. Direct fallback mixing is disabled by default because replaying
 a clip beside the title's real AudioOut/AJM mix is heard as echo; it remains
@@ -1665,6 +1715,14 @@ user-data ranges. Fixed-slot commands keep a valid no-operation in their unused
 tail. Shader constructors validate their AGC headers, relocate internal
 pointers and program addresses, and apply the recovered program-register pairs.
 Everything remains walkable through [`gpu.pm4`](src/gpu/pm4.zig).
+
+`sceAgcGetRegisterDefaults2` and its internal variant expose the complete Gen5
+version-10 primary/internal pointer tables instead of an all-zero placeholder.
+This matters before command decoding: titles use those tables to construct the
+state lists that contain color-target, viewport, shader and user-config
+registers. Direct SH/UC list constructors now coalesce consecutive entries into
+real register packets. Index-buffer address/count/size and indexed-offset draws
+also emit typed packets whose state is retained through submission.
 
 Patch entry points for implemented wait, release, DMA and indirect-register
 commands validate the existing opcode and update its address or register count
@@ -1880,13 +1938,23 @@ The acquire/release/wait/event/DMA constructors that were no-operations at that
 milestone now emit executable packets, so this title needs a fresh compatibility
 run before its next boundary can be stated. Host VR presentation remains absent.
 
+Jets 'n' Guns 2 constructs almost all graphics state through native
+`SET_CONTEXT_REG_INDIRECT`. Its former black frame was caused upstream of that
+decoder: the placeholder `sceAgcGetRegisterDefaults2` result left the guest
+without the complete register templates used to build color-target state. With
+the exact Gen5 version-10 defaults exposed, the title emits the required state;
+the renderer then retains all targetless draws in order until VideoOut identifies
+the 3840×2160 scanout allocation. Recovered graphics scalars and live descriptor
+bounds are runtime data, so warmed 53-draw frames reuse the same Vulkan pipelines
+and render the title screen, main menu, and options UI shown above.
+
 Tetris Effect: Connected exercises the same expanded Unreal path without a VR
 plugin. It reaches a repeated graphics/compute loop and the second measured
 VideoOut frame contains 6 draws and 63 dispatches without the previous
 host-side `memcpy` access violation. Its final compositor can legally omit CB
 descriptors and rely on the following VideoOut flip to name the scanout
-allocation. The renderer keeps the latest complete targetless draw, snapshots
-its graphics state, and resolves a bounded 32-bit color target from the
+allocation. The renderer keeps the complete ordered targetless pass, snapshots
+each draw's graphics state, and resolves a bounded 32-bit color target from the
 registered display address, dimensions, pitch, and tiling mode at that flip.
 An all-ones AGC screen-scissor register is treated as the unset sentinel rather
 than as an empty rectangle, so this path uses the complete 3840×2160 extent.
@@ -1960,8 +2028,8 @@ from leaking into host code where nothing would check it.
 
 ## Roadmap
 
-1. Move changing vertex/scalar constants out of SPIR-V specialization so the
-   same graphics pipelines survive transform and resource updates.
+1. Complete the remaining AGC command constructors, especially indirect indexed
+   draws, and retain submission ownership across cross-queue asynchronous waits.
 2. Extend general storage-image lowering to mip, array, 3D, MSAA, partial-mask,
    depth/stencil, atomic, and compressed-surface forms; retain exact UAV fast
    paths only where they reduce synchronous startup work without changing
@@ -1994,6 +2062,10 @@ worker actually parking is consumed exactly once. Broadcasts remain visible to
 every waiter that observed an older sequence. If the fixed key/event history is
 ever saturated, the dispatcher deliberately over-wakes and lets HLE recheck the
 object instead of risking a dropped wake and process deadlock.
+Plain timed sleeps are separate from that object-wake epoch. On Windows they use
+a private non-alertable `NtDelayExecution` deadline, so unrelated mutex/condition
+wakes or a pending I/O cancellation cannot turn an audio render worker into a
+full-core spin loop.
 
 Machine execution is represented by `cpu.Bridge`. Its request includes the
 entry point, six System V AMD64 integer arguments, thread identity, guest stack,

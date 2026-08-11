@@ -137,6 +137,71 @@ pub fn saveDataNoEvent(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(
     return @bitCast(@as(u32, 0x809f0008));
 }
 
+const np_game_intent_error_invalid_argument: i32 = @bitCast(@as(u32, 0x8055_3804));
+const np_game_intent_error_intent_not_found: i32 = @bitCast(@as(u32, 0x8055_3806));
+const np_game_intent_error_value_not_found: i32 = @bitCast(@as(u32, 0x8055_3807));
+
+const NpGameIntentData = extern struct {
+    data: [16 * 1024 + 1]u8,
+    padding: [7]u8,
+};
+
+const NpGameIntentInfo = extern struct {
+    size: usize,
+    user_id: i32,
+    intent_type: [33]u8,
+    padding: [7]u8,
+    reserved: [256]u8,
+    intent_data: NpGameIntentData,
+};
+
+/// Game Intent is available even when PlayStation Network is offline.  There
+/// simply is no launch intent to deliver for a title started from this runner.
+pub fn npGameIntentInitialize(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
+pub fn npGameIntentTerminate(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
+pub fn npGameIntentReceiveIntent(info_address: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    if (info_address == 0) return np_game_intent_error_invalid_argument;
+    if (!kernel_memory.isGuestRangeAccessible(info_address, @sizeOf(NpGameIntentInfo))) {
+        return errno.KernelError.efault.raw();
+    }
+
+    const info: *NpGameIntentInfo = @ptrFromInt(info_address);
+    info.user_id = -1;
+    @memset(&info.intent_type, 0);
+    @memset(&info.intent_data.data, 0);
+    @memset(&info.intent_data.padding, 0);
+    return np_game_intent_error_intent_not_found;
+}
+
+pub fn npGameIntentGetPropertyValueString(
+    intent_data_address: u64,
+    key_address: u64,
+    value_address: u64,
+    value_size: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    if (intent_data_address == 0 or key_address == 0 or value_address == 0 or value_size == 0) {
+        return np_game_intent_error_invalid_argument;
+    }
+    if (!kernel_memory.isGuestRangeAccessible(intent_data_address, @sizeOf(NpGameIntentData)) or
+        !kernel_memory.isGuestRangeAccessible(key_address, 1) or
+        !kernel_memory.isGuestRangeAccessible(value_address, 1))
+    {
+        return errno.KernelError.efault.raw();
+    }
+
+    const value: *u8 = @ptrFromInt(value_address);
+    value.* = 0;
+    return np_game_intent_error_value_not_found;
+}
+
 const table = @import("services_table.zig");
 
 pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {
@@ -176,6 +241,15 @@ test "the refusal sits outside every library's own numbering" {
     // outcome and acted on; this one cannot.
     const status: u32 = @bitCast(unavailable);
     try testing.expectEqual(@as(u32, 0x8002_004e), status);
+}
+
+test "game intent ABI and offline outcomes match the platform" {
+    try testing.expectEqual(@as(usize, 16_392), @sizeOf(NpGameIntentData));
+    try testing.expectEqual(@as(usize, 16_704), @sizeOf(NpGameIntentInfo));
+    try testing.expectEqual(errno.ok, npGameIntentInitialize(0, 0, 0, 0, 0, 0));
+    try testing.expectEqual(errno.ok, npGameIntentTerminate(0, 0, 0, 0, 0, 0));
+    try testing.expectEqual(np_game_intent_error_invalid_argument, npGameIntentReceiveIntent(0, 0, 0, 0, 0, 0));
+    try testing.expectEqual(np_game_intent_error_invalid_argument, npGameIntentGetPropertyValueString(0, 0, 0, 0, 0, 0));
 }
 
 test "every service entry point registers under its published identifier" {

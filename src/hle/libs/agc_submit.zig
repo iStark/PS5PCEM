@@ -73,6 +73,7 @@ var traced_draw_states: u32 = 0;
 var traced_shader_program_count: usize = 0;
 var traced_shader_programs: [32]u64 = [_]u64{0} ** 32;
 var installed_backend: ?gpu.DcbBackend = null;
+var soft_wait_batch_reports: u32 = 0;
 
 pub fn readGuestMemory(_: ?*anyopaque, address: u64, bytes: []u8) bool {
     if (video_out.readLabelMemory(address, bytes)) return true;
@@ -640,8 +641,8 @@ pub fn pumpQueues() void {
     defer execution_lock.unlock();
     var host_time = kernel_runtime.beginHostTimeExclusion();
     defer host_time.end();
-    var force_rounds: u8 = 0;
-    while (force_rounds < 8) : (force_rounds += 1) {
+    var force_rounds: u16 = 0;
+    while (force_rounds < 256) : (force_rounds += 1) {
         var progressed = false;
         for ([_]gpu.QueueKind{ .graphics, .compute }) |kind| {
             if (!submission_scheduler.isBlocked(kind)) continue;
@@ -677,25 +678,36 @@ fn executeSubmitted(label: []const u8, stream: []const u32) SubmitOutcome {
     // Bring-up: if WAIT_REG_MEM parks the queue on a label that never updates
     // (missing EOP writer / wrong aperture), publish the expected value and
     // pump again so later ring kicks are not stuck behind a permanent head.
-    var force_rounds: u8 = 0;
-    while (submission_scheduler.isBlocked(kind) and force_rounds < 16) : (force_rounds += 1) {
+    var force_rounds: u16 = 0;
+    var first_forced_wait: ?gpu.state.WaitRegMem = null;
+    var last_forced_wait: ?gpu.state.WaitRegMem = null;
+    while (submission_scheduler.isBlocked(kind) and force_rounds < 256) : (force_rounds += 1) {
         const wait = submission_scheduler.state(kind).blocked_wait orelse break;
-        std.debug.print(
-            "[{s}] WAIT_REG_MEM soft-satisfy addr=0x{x} mask=0x{x} ref=0x{x} (round {d}, queued={d})\n",
-            .{
-                label,
-                wait.address,
-                wait.mask,
-                wait.reference,
-                force_rounds + 1,
-                submission_scheduler.pendingCount(kind),
-            },
-        );
         if (!forceSatisfyWait(wait)) break;
+        if (first_forced_wait == null) first_forced_wait = wait;
+        last_forced_wait = wait;
         report = submission_scheduler.pump() catch |err| {
             std.debug.print("[{s}] pump after soft-satisfy failed: {s}\n", .{ label, @errorName(err) });
             break;
         };
+    }
+    if (first_forced_wait) |first| {
+        if (trace.isLive() or soft_wait_batch_reports < 8) {
+            const last = last_forced_wait.?;
+            std.debug.print(
+                "[{s}] soft-satisfied {d} WAIT_REG_MEM packets: first=0x{x}/0x{x}, last=0x{x}/0x{x}, queued={d}\n",
+                .{
+                    label,
+                    force_rounds,
+                    first.address,
+                    first.reference,
+                    last.address,
+                    last.reference,
+                    submission_scheduler.pendingCount(kind),
+                },
+            );
+        }
+        soft_wait_batch_reports +|= 1;
     }
 
     // A completion event can be attributed here only while this submission

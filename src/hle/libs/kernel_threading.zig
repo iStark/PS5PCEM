@@ -279,6 +279,11 @@ pub const PreparedThread = struct {
     guard_size: u64,
 };
 
+pub const LiveThreadInfo = struct {
+    entry_point: u64 = 0,
+    name: [32]u8 = @splat(0),
+};
+
 const KeyRecord = struct {
     allocated: bool = false,
     destructor: u64 = 0,
@@ -345,6 +350,36 @@ pub const Manager = struct {
         self.lock.lock();
         defer self.lock.unlock();
         return self.backend != null;
+    }
+
+    /// Number of child pthreads that have not completed yet. The externally
+    /// owned process-entry record is excluded: some PS5 CRTs return from that
+    /// bootstrap after handing the actual game loop to a child pthread.
+    pub fn liveChildCount(self: *Manager) usize {
+        self.lock.lock();
+        defer self.lock.unlock();
+        var count: usize = 0;
+        for (self.threads.items) |record| {
+            if (record.external) continue;
+            if (record.state.load(.acquire) != @intFromEnum(ThreadState.finished)) count += 1;
+        }
+        return count;
+    }
+
+    pub fn liveChildren(self: *Manager, output: []LiveThreadInfo) usize {
+        self.lock.lock();
+        defer self.lock.unlock();
+        var count: usize = 0;
+        for (self.threads.items) |record| {
+            if (record.external or
+                record.state.load(.acquire) == @intFromEnum(ThreadState.finished)) continue;
+            if (count < output.len) output[count] = .{
+                .entry_point = record.entry_point,
+                .name = record.name,
+            };
+            count += 1;
+        }
+        return count;
     }
 
     /// Creates TLS for a process-entry thread already owned by the executor.

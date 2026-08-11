@@ -413,6 +413,21 @@ pub const DcbExecutor = struct {
             self.state.instance_count = @max(packet.body[0], 1);
             return .complete;
         }
+        if (packet.opcode == pm4.index_base) {
+            if (packet.body.len != 2) return Error.InvalidPacket;
+            self.state.index_base_address = (@as(u64, packet.body[1]) << 32) | packet.body[0];
+            return .complete;
+        }
+        if (packet.opcode == pm4.index_buffer_size) {
+            if (packet.body.len != 1) return Error.InvalidPacket;
+            self.state.index_buffer_size = packet.body[0];
+            return .complete;
+        }
+        if (packet.opcode == pm4.index_type) {
+            if (packet.body.len < 1) return Error.InvalidPacket;
+            self.state.index_type = @truncate(packet.body[0]);
+            return .complete;
+        }
 
         if (packet.opcode == pm4.acquire_mem) {
             try self.acquireMem(packet, true);
@@ -487,6 +502,9 @@ pub const DcbExecutor = struct {
         const first = body[0] & 0xffff;
         for (body[1..], 0..) |value, index| {
             try self.state.writeRegister(space, first + @as(u32, @intCast(index)), value);
+        }
+        if (space == .uconfig and first <= 0x243 and first + body.len - 1 > 0x243) {
+            self.state.index_type = @truncate(body[1 + 0x243 - first]);
         }
     }
 
@@ -977,6 +995,27 @@ test "direct and Gen5 indirect register packets share persistent state" {
     try testing.expectEqual(@as(?u32, 0x1357_2468), state.readRegister(.context, 0x193));
     try testing.expectEqual(@as(?u32, 0x3333), state.readRegister(.uconfig, 7));
     try testing.expectEqual(@as(?u32, 0xcafe_babe), state.readRegister(.uconfig, 8));
+}
+
+test "indexed offset draw retains index buffer state for the backend" {
+    var host = FakeBackend{};
+    const stream = [_]u32{
+        command(pm4.index_base, 2),        0x9abc_def0, 0x1234_5678,
+        command(pm4.index_buffer_size, 1), 0x200,       command(pm4.set_uconfig_reg_index, 2),
+        0x2000_0243,                       0x400,       command(pm4.draw_index_offset_2, 4),
+        12,                                5,           12,
+        0,
+    };
+    var state = gpu_state.State{};
+    var executor = DcbExecutor{ .state = &state, .backend = host.interface() };
+    const result = try executor.execute(&stream);
+
+    try testing.expectEqual(Status.complete, result.status);
+    try testing.expectEqual(@as(u64, 0x1234_5678_9abc_def0), state.index_base_address);
+    try testing.expectEqual(@as(u32, 0x200), state.index_buffer_size);
+    try testing.expectEqual(@as(u2, 0), state.index_type);
+    try testing.expectEqual(@as(usize, 1), result.draws);
+    try testing.expectEqual(@as(usize, 1), host.draws);
 }
 
 test "Gen5 indirect lists skip untracked extension registers" {
