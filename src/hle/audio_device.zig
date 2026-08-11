@@ -65,10 +65,10 @@ pub const Config = struct {
 ///
 /// One is not enough: the device would run dry between the moment it finishes a
 /// buffer and the moment the title hands over the next, which is audible as a
-/// click every buffer. Four cover about 21 ms at the common 256/48 kHz setup:
-/// enough for ordinary Windows scheduling jitter without building a perceptible
-/// delay behind the picture.
-const queue_depth = 4;
+/// click every buffer. Eight cover about 43 ms at the common 256/48 kHz setup.
+/// That absorbs Windows scheduling jitter and short shader-compilation stalls
+/// without building a perceptible delay behind the picture.
+const queue_depth = 8;
 
 /// The largest buffer that can be played, as channels x bytes x frames.
 ///

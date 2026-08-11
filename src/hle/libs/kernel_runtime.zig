@@ -1147,17 +1147,34 @@ fn posixSocketSend(descriptor: i32, buffer: ?[*]const u8, length: usize, _: i32)
 /// there is accurate — initializers ran during loading — and titles check it.
 fn loadStartModule(
     path: ?[*:0]const u8,
-    _: u64,
-    _: u64,
+    args_size: u64,
+    args: u64,
     _: u32,
     _: u64,
     result: ?*i32,
 ) callconv(abi.guest) i32 {
     const name = path orelse return KernelError.efault.raw();
-    const loaded = modules.findByPath(std.mem.span(name)) orelse
+    var name_buffer: [1024]u8 = undefined;
+    const module_path = readGuestCString(@intFromPtr(name), &name_buffer) orelse
+        return KernelError.efault.raw();
+    const loaded = modules.findByPath(module_path) orelse {
+        if (trace.announces("sceKernelLoadStartModule")) {
+            std.debug.print("[module] not mapped: {s}\n", .{module_path});
+        }
         return KernelError.enoent.raw();
+    };
 
-    if (result) |out| out.* = errno.ok;
+    if (trace.announces("sceKernelLoadStartModule")) {
+        std.debug.print("[module] start: {s} handle={d} args={d}@0x{x}\n", .{
+            module_path,
+            loaded.handle,
+            args_size,
+            args,
+        });
+    }
+
+    const start_result = loaded.startDeferred(args_size, args);
+    if (result) |out| out.* = start_result;
     return loaded.handle;
 }
 
@@ -1178,6 +1195,9 @@ fn kernelDlsym(
     if (modules.findByHandle(handle) == null) return KernelError.esrch.raw();
     if (modules.resolveExport(handle, name)) |address| {
         output.* = address;
+        if (trace.announces("sceKernelDlsym")) {
+            std.debug.print("[module] dlsym handle={d} {s} -> 0x{x}\n", .{ handle, name, address });
+        }
         return errno.ok;
     }
 
@@ -1186,7 +1206,14 @@ fn kernelDlsym(
     // dynamic symbol table, so a normal export lookup cannot find it.
     if (handle == modules.executable_handle and std.mem.eql(u8, name, "scriptingGetMem")) {
         output.* = @intFromPtr(trace.wrap("scriptingGetMem", &scriptingGetMem));
+        if (trace.announces("sceKernelDlsym")) {
+            std.debug.print("[module] dlsym handle={d} {s} -> 0x{x}\n", .{ handle, name, output.* });
+        }
         return errno.ok;
+    }
+
+    if (trace.announces("sceKernelDlsym")) {
+        std.debug.print("[module] missing export handle={d}: {s}\n", .{ handle, name });
     }
 
     return KernelError.enoent.raw();

@@ -464,7 +464,7 @@ pub fn decodeVop3(pc: u32, code: []const u32, word_index: u32) Error!Instruction
         inst.dst2 = try operand.decodeScalarDestination((word0 >> 8) & 0x7f);
     }
     inst.src0 = try operand.decodeScalarSource(word1 & 0x1ff);
-    inst.src_count = if (op == .v_addc_u32)
+    inst.src_count = if (op == .v_addc_u32 or op == .v_cndmask_b32)
         3
     else if (id >= 0x180 and id <= 0x1ff)
         1
@@ -635,6 +635,17 @@ test "VOP2 SDWA conditional mask keeps implicit VCC and integer negate" {
     try std.testing.expectEqual(@as(u32, 3), inst.src_count);
     try std.testing.expectEqual(isa.OperandKind.vcc_lo, inst.src2.kind);
     try std.testing.expect(inst.src1.negate);
+}
+
+test "VOP3 conditional mask decodes its explicit scalar predicate" {
+    const word0 = (@as(u32, 0x101) << 16) | 10;
+    const word1 = @as(u32, 4) | (@as(u32, 5) << 9) | (@as(u32, 6) << 18);
+    const code = [_]u32{ word0, word1 };
+    const inst = try decodeVop3(0x7c, &code, 0);
+    try std.testing.expectEqual(isa.Opcode.v_cndmask_b32, inst.opcode);
+    try std.testing.expectEqual(@as(u32, 3), inst.src_count);
+    try std.testing.expectEqual(isa.OperandKind.sgpr, inst.src2.kind);
+    try std.testing.expectEqual(@as(u32, 6), inst.src2.reg);
 }
 
 test "VOP1 DPP retains lane control and masks" {

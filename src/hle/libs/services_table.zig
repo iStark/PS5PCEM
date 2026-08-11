@@ -291,7 +291,9 @@ pub const npgameintent_exports = [_]symbols.Export{
 
 pub const npmanager_exports = [_]symbols.Export{
     .{ .name = "sceNpNotifyPremiumFeature", .function = trace.wrap("sceNpNotifyPremiumFeature", &services.offline), .expect_id = "P6piso307SE" },
-    .{ .name = "sceNpCheckCallback", .function = trace.wrap("sceNpCheckCallback", &services.offline), .expect_id = "3Zl8BePTh9Y" },
+    // Polling an empty callback queue is a successful no-op. Returning ENOSYS
+    // makes Unity's frontend treat normal offline polling as a service fault.
+    .{ .name = "sceNpCheckCallback", .function = trace.wrap("sceNpCheckCallback", &services.accept), .expect_id = "3Zl8BePTh9Y" },
     .{ .name = "sceNpCreateRequest", .function = trace.wrap("sceNpCreateRequest", &services.offline), .expect_id = "GpLQDNKICac" },
     .{ .name = "sceNpCheckPremium", .function = trace.wrap("sceNpCheckPremium", &services.offline), .expect_id = "O80NrhUOPGY" },
     .{ .name = "sceNpDeleteRequest", .function = trace.wrap("sceNpDeleteRequest", &services.offline), .expect_id = "S7QTn72PrDw" },
@@ -423,6 +425,11 @@ pub const savedatadialog_native_exports = [_]symbols.Export{
     .{ .name = "sceSaveDataDialogUpdateStatus", .function = trace.wrap("sceSaveDataDialogUpdateStatus", &services.absent), .expect_id = "KK3Bdg1RWK0" },
     .{ .name = "sceSaveDataDialogGetResult", .function = trace.wrap("sceSaveDataDialogGetResult", &services.absent), .expect_id = "yEiJ-qqr6Cg" },
     .{ .name = "sceSaveDataDialogInitialize", .function = trace.wrap("sceSaveDataDialogInitialize", &services.absent), .expect_id = "s9e3+YpRnzw" },
+    .{ .name = "sceSaveDataDialogGetStatus", .function = trace.wrap("sceSaveDataDialogGetStatus", &services.saveDataDialogFinished), .expect_id = "ERKzksauAJA" },
+    .{ .name = "sceSaveDataDialogIsReadyToDisplay", .function = trace.wrap("sceSaveDataDialogIsReadyToDisplay", &services.saveDataDialogReady), .expect_id = "en7gNVnh878" },
+    .{ .name = "sceSaveDataDialogClose", .function = trace.wrap("sceSaveDataDialogClose", &services.accept), .expect_id = "fH46Lag88XY" },
+    .{ .name = "sceSaveDataDialogProgressBarInc", .function = trace.wrap("sceSaveDataDialogProgressBarInc", &services.accept), .expect_id = "V-uEeFKARJU" },
+    .{ .name = "sceSaveDataDialogProgressBarSetValue", .function = trace.wrap("sceSaveDataDialogProgressBarSetValue", &services.accept), .expect_id = "hay1CfTmLyA" },
 };
 
 pub const savedata_native_exports = [_]symbols.Export{
@@ -440,6 +447,11 @@ pub const savedata_native_exports = [_]symbols.Export{
     .{ .name = "sceSaveDataDirNameSearchPs4", .function = trace.wrap("sceSaveDataDirNameSearchPs4", &services.absent), .expect_id = "X4MYzukPc3g" },
     .{ .name = "sceSaveDataTransferringMountPs4", .function = trace.wrap("sceSaveDataTransferringMountPs4", &services.absent), .expect_id = "RjMlsR8EXrw" },
     .{ .name = "sceSaveDataSaveIconByPath", .function = trace.wrap("sceSaveDataSaveIconByPath", &services.absent), .expect_id = "Z7z6HXWORJY" },
+    .{ .name = "sceSaveDataBackup", .function = trace.wrap("sceSaveDataBackup", &services.absent), .expect_id = "z1JA8-iJt3k" },
+    .{ .name = "sceSaveDataGetParam", .function = trace.wrap("sceSaveDataGetParam", &services.absent), .expect_id = "XgvSuIdnMlw" },
+    .{ .name = "sceSaveDataLoadIcon", .function = trace.wrap("sceSaveDataLoadIcon", &services.absent), .expect_id = "cGjO3wM3V28" },
+    .{ .name = "sceSaveDataGetEventResult", .function = trace.wrap("sceSaveDataGetEventResult", &services.saveDataNoEvent), .expect_id = "j8xKtiFj0SY" },
+    .{ .name = "sceSaveDataDeleteTransactionResource", .function = trace.wrap("sceSaveDataDeleteTransactionResource", &services.accept), .expect_id = "lJUQuaKqoKY" },
 };
 
 pub const share_exports = [_]symbols.Export{

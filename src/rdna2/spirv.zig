@@ -37,6 +37,11 @@ pub const StorageBufferBinding = struct {
     swizzled: bool = false,
     index_stride: u8 = 0,
     add_thread_id: bool = false,
+    /// GFX10 unified FORMAT and destination-channel selectors captured from
+    /// the V# descriptor. FORMAT loads convert packed vertex attributes to
+    /// the values the shader expects; ordinary DWORD loads ignore these.
+    unified_format: u8 = 0,
+    dst_select: [4]u8 = .{ 4, 5, 6, 7 },
     /// How many bytes the descriptor says the buffer holds, when the caller
     /// knows. The hardware answers an access past this with zero on a read and
     /// drops it on a write, rather than touching whatever lies beyond — a shader
@@ -84,6 +89,11 @@ pub const StorageImageFormat = enum(u16) {
 pub const ScalarRegister = struct {
     register: u32,
     value: u32,
+    /// Null denotes state present at shader entry (USER_DATA or another host
+    /// input). A PC denotes the SMEM instruction whose destination receives
+    /// this value. Keeping these distinct is essential when a shader reuses
+    /// the same SGPRs for several loads.
+    producer_pc: ?u32 = null,
 };
 
 pub const ComputeInputs = struct {
@@ -112,10 +122,14 @@ pub const Options = struct {
     /// Amount of per-workgroup LDS made available by COMPUTE_PGM_RSRC2. DS
     /// instructions address it in bytes; the SPIR-V declaration is a u32 array.
     workgroup_memory_size_bytes: u32 = 0,
-    /// PARAM locations exported by a vertex shader or consumed by a fragment
-    /// shader. `translate` discovers these from EXP/VINTRP instructions before
-    /// the entry-point interface is declared.
+    /// PARAM locations exported by a vertex shader, or raw VINTRP ATTR slots
+    /// consumed by a fragment shader. `fragment_input_controls` maps the latter
+    /// onto the former before declaring the Vulkan interface.
     parameter_mask: u32 = 0,
+    /// SPI_PS_INPUT_CNTL values indexed by the raw VINTRP ATTR slot. The low
+    /// five bits select the matching VS PARAM export; bit 10 requests flat
+    /// interpolation. An empty slice preserves the identity mapping.
+    fragment_input_controls: []const u32 = &.{},
     /// Standalone translation infers PARAM inputs from VINTRP. A graphics
     /// backend that knows the paired VS interface can disable that inference
     /// and supply only locations the vertex stage actually exports.
@@ -144,6 +158,9 @@ pub const Error = std.mem.Allocator.Error || control_flow.Error || error{
 
 pub const Module = struct {
     words: []u32,
+    /// True when structured control-flow lowering was unavailable and the
+    /// translator used its linear graphics bring-up fallback.
+    used_control_flow_fallback: bool = false,
 
     pub fn deinit(self: *Module, allocator: std.mem.Allocator) void {
         allocator.free(self.words);
@@ -165,6 +182,121 @@ const BufferAddress = struct {
     binding: StorageBufferBinding,
     byte_offset: u32,
 };
+
+const BufferFormat = struct {
+    data: u8,
+    number: u8,
+};
+
+const BufferComponentLayout = struct {
+    byte_offset: u8,
+    bit_offset: u8 = 0,
+    bit_count: u8,
+};
+
+/// RDNA2 ISA table 47. Keeping this static is intentional: each translated
+/// Vulkan binding is already qualified by the exact guest instruction PC, so
+/// unlike a reusable native descriptor the format cannot change underneath
+/// the generated module.
+fn decodeBufferUnifiedFormat(format: u8) ?BufferFormat {
+    return switch (format) {
+        0 => .{ .data = 0, .number = 0 },
+        1...6 => .{ .data = 1, .number = format - 1 },
+        7...12 => .{ .data = 2, .number = format - 7 },
+        13 => .{ .data = 2, .number = 7 },
+        14...19 => .{ .data = 3, .number = format - 14 },
+        20 => .{ .data = 4, .number = 4 },
+        21 => .{ .data = 4, .number = 5 },
+        22 => .{ .data = 4, .number = 7 },
+        23...28 => .{ .data = 5, .number = format - 23 },
+        29 => .{ .data = 5, .number = 7 },
+        36 => .{ .data = 6, .number = 7 },
+        43 => .{ .data = 7, .number = 7 },
+        44 => .{ .data = 8, .number = 0 },
+        45 => .{ .data = 8, .number = 1 },
+        48 => .{ .data = 8, .number = 4 },
+        49 => .{ .data = 8, .number = 5 },
+        50...55 => .{ .data = 9, .number = format - 50 },
+        56...61 => .{ .data = 10, .number = format - 56 },
+        62 => .{ .data = 11, .number = 4 },
+        63 => .{ .data = 11, .number = 5 },
+        64 => .{ .data = 11, .number = 7 },
+        65...70 => .{ .data = 12, .number = format - 65 },
+        71 => .{ .data = 12, .number = 7 },
+        72 => .{ .data = 13, .number = 4 },
+        73 => .{ .data = 13, .number = 5 },
+        74 => .{ .data = 13, .number = 7 },
+        75 => .{ .data = 14, .number = 4 },
+        76 => .{ .data = 14, .number = 5 },
+        77 => .{ .data = 14, .number = 7 },
+        else => null,
+    };
+}
+
+fn bufferComponentLayout(data_format: u8, component: u8) ?BufferComponentLayout {
+    return switch (data_format) {
+        1 => if (component == 0) .{ .byte_offset = 0, .bit_count = 8 } else null,
+        2 => if (component == 0) .{ .byte_offset = 0, .bit_count = 16 } else null,
+        3 => switch (component) {
+            0 => .{ .byte_offset = 0, .bit_count = 8 },
+            1 => .{ .byte_offset = 1, .bit_count = 8 },
+            else => null,
+        },
+        4 => if (component == 0) .{ .byte_offset = 0, .bit_count = 32 } else null,
+        5 => switch (component) {
+            0 => .{ .byte_offset = 0, .bit_count = 16 },
+            1 => .{ .byte_offset = 2, .bit_count = 16 },
+            else => null,
+        },
+        6 => switch (component) {
+            0 => .{ .byte_offset = 0, .bit_offset = 0, .bit_count = 10 },
+            1 => .{ .byte_offset = 0, .bit_offset = 10, .bit_count = 11 },
+            2 => .{ .byte_offset = 0, .bit_offset = 21, .bit_count = 11 },
+            else => null,
+        },
+        7 => switch (component) {
+            0 => .{ .byte_offset = 0, .bit_offset = 0, .bit_count = 11 },
+            1 => .{ .byte_offset = 0, .bit_offset = 11, .bit_count = 11 },
+            2 => .{ .byte_offset = 0, .bit_offset = 22, .bit_count = 10 },
+            else => null,
+        },
+        8 => switch (component) {
+            0 => .{ .byte_offset = 0, .bit_offset = 0, .bit_count = 10 },
+            1 => .{ .byte_offset = 0, .bit_offset = 10, .bit_count = 10 },
+            2 => .{ .byte_offset = 0, .bit_offset = 20, .bit_count = 10 },
+            3 => .{ .byte_offset = 0, .bit_offset = 30, .bit_count = 2 },
+            else => null,
+        },
+        9 => switch (component) {
+            0 => .{ .byte_offset = 0, .bit_offset = 0, .bit_count = 2 },
+            1 => .{ .byte_offset = 0, .bit_offset = 2, .bit_count = 10 },
+            2 => .{ .byte_offset = 0, .bit_offset = 12, .bit_count = 10 },
+            3 => .{ .byte_offset = 0, .bit_offset = 22, .bit_count = 10 },
+            else => null,
+        },
+        10 => if (component < 4)
+            .{ .byte_offset = component, .bit_count = 8 }
+        else
+            null,
+        11 => if (component < 2)
+            .{ .byte_offset = component * 4, .bit_count = 32 }
+        else
+            null,
+        12 => if (component < 4)
+            .{ .byte_offset = component * 2, .bit_count = 16 }
+        else
+            null,
+        13 => if (component < 3)
+            .{ .byte_offset = component * 4, .bit_count = 32 }
+        else
+            null,
+        14 => if (component < 4)
+            .{ .byte_offset = component * 4, .bit_count = 32 }
+        else
+            null,
+        else => null,
+    };
+}
 
 const WorkgroupAccess = struct {
     pointer: u32,
@@ -246,13 +378,14 @@ const Builder = struct {
     workgroup_memory_words: u32 = 0,
     /// GLSL.std.450 extended instruction set (PackHalf2x16, etc.). 0 = unused.
     glsl_std_450: u32 = 0,
-    specialized_scalar_registers: [128]bool = @splat(false),
+    scalar_specializations: []const ScalarRegister,
     specialized_scalar_prefix_end: u32,
     scc: u32 = 0,
     /// Carry chained specifically between S_ADD_U32 and S_ADDC_U32. Keep it
     /// separate from branch SCC until all scalar arithmetic flag consumers are
     /// modelled, so adding carry support cannot perturb established CFG paths.
     arithmetic_carry: u32 = 0,
+    used_control_flow_fallback: bool = false,
 
     fn init(allocator: std.mem.Allocator, options: Options) Error!Builder {
         var self = Builder{
@@ -273,6 +406,7 @@ const Builder = struct {
             .compute_inputs = options.compute_inputs,
             .local_size = options.local_size,
             .fragment_extent = options.fragment_extent,
+            .scalar_specializations = options.scalar_registers,
             .specialized_scalar_prefix_end = options.specialized_scalar_prefix_end,
         };
         errdefer self.deinit();
@@ -342,7 +476,14 @@ const Builder = struct {
                     if (options.parameter_mask & bit == 0) continue;
                     const variable = self.id();
                     self.parameter_variables[location] = variable;
-                    try self.emit(&self.annotations, 71, &.{ variable, 30, @intCast(location) }); // Location
+                    const control = if (location < options.fragment_input_controls.len)
+                        options.fragment_input_controls[location]
+                    else
+                        @as(u32, @intCast(location));
+                    try self.emit(&self.annotations, 71, &.{ variable, 30, control & 0x1f }); // Location
+                    if (control & 0x400 != 0) {
+                        try self.emit(&self.annotations, 71, &.{ variable, 14 }); // Flat
+                    }
                     try self.emit(&self.declarations, 59, &.{ frag_ptr, variable, 1 }); // OpVariable
                 }
             },
@@ -381,11 +522,11 @@ const Builder = struct {
 
         for (options.scalar_registers) |scalar| {
             if (scalar.register >= 128) return Error.InvalidStorageBinding;
+            if (scalar.producer_pc != null) continue;
             self.registers[scalar.register] = .{
                 .id = try self.constant(.bits32, scalar.value),
                 .value_type = .bits32,
             };
-            self.specialized_scalar_registers[scalar.register] = true;
         }
 
         if (options.storage_buffers.len != 0) {
@@ -1440,23 +1581,23 @@ const Builder = struct {
         return self.glsl_std_450;
     }
 
-    /// v_cvt_pkrtz_f16_f32: pack two f32 into one u32 as two f16 halves
-    /// (low = src0, high = src1).
-    ///
-    /// Soft path (NVIDIA rejects GLSL.std.450 PackHalf2x16 in this module):
-    /// keep the high 16 bits of each f32 so normals round-trip after soft
-    /// unpack. Not IEEE f16, but preserves sign/exp/top mantissa.
+    /// v_cvt_pkrtz_f16_f32: pack two f32 into one u32 as two IEEE f16 halves
+    /// (low = src0, high = src1). GLSL.std.450 performs the conversion without
+    /// requiring Float16 storage or arithmetic capabilities from the device.
     fn packHalf2x16(self: *Builder, inst: instruction.Instruction) Error!void {
-        const a = try self.source(inst.src0, .bits32);
-        const b = try self.source(inst.src1, .bits32);
-        const a_hi = self.id();
-        try self.emit(&self.body, 194, &.{ self.bits_type, a_hi, a, try self.constant(.bits32, 16) }); // >> 16
-        const b_hi = self.id();
-        try self.emit(&self.body, 194, &.{ self.bits_type, b_hi, b, try self.constant(.bits32, 16) });
-        const b_shifted = self.id();
-        try self.emit(&self.body, 196, &.{ self.bits_type, b_shifted, b_hi, try self.constant(.bits32, 16) }); // << 16
+        const a = try self.source(inst.src0, .float32);
+        const b = try self.source(inst.src1, .float32);
+        const vector_type = try self.ensureFloatVec2();
+        const pair = self.id();
+        try self.emit(&self.body, 80, &.{ vector_type, pair, a, b }); // OpCompositeConstruct
         const result = self.id();
-        try self.emit(&self.body, 197, &.{ self.bits_type, result, a_hi, b_shifted }); // OR
+        try self.emit(&self.body, 12, &.{
+            self.bits_type,
+            result,
+            self.ensureGlslStd450(),
+            58, // PackHalf2x16
+            pair,
+        });
         try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
     }
 
@@ -1484,29 +1625,33 @@ const Builder = struct {
         const zero = try self.constant(.float32, @bitCast(@as(f32, 0)));
         const one = try self.constant(.float32, @bitCast(@as(f32, 1)));
         const x: u32, const y: u32, const z: u32, const w: u32 = if (inst.export_compressed) blk: {
-            // Soft unpack pairs with soft packHalf2x16 (high-16 of each f32).
             const xy_bits = try self.source(inst.src0, .bits32);
             const zw_bits = try self.source(inst.src1, .bits32);
-            const x_hi = self.id();
-            try self.emit(&self.body, 199, &.{ self.bits_type, x_hi, xy_bits, try self.constant(.bits32, 0xffff) });
-            const y_hi = self.id();
-            try self.emit(&self.body, 194, &.{ self.bits_type, y_hi, xy_bits, try self.constant(.bits32, 16) });
-            const z_hi = self.id();
-            try self.emit(&self.body, 199, &.{ self.bits_type, z_hi, zw_bits, try self.constant(.bits32, 0xffff) });
-            const w_hi = self.id();
-            try self.emit(&self.body, 194, &.{ self.bits_type, w_hi, zw_bits, try self.constant(.bits32, 16) });
-            const x_bits = self.id();
-            try self.emit(&self.body, 196, &.{ self.bits_type, x_bits, x_hi, try self.constant(.bits32, 16) });
-            const y_bits = self.id();
-            try self.emit(&self.body, 196, &.{ self.bits_type, y_bits, y_hi, try self.constant(.bits32, 16) });
-            const z_bits = self.id();
-            try self.emit(&self.body, 196, &.{ self.bits_type, z_bits, z_hi, try self.constant(.bits32, 16) });
-            const w_bits = self.id();
-            try self.emit(&self.body, 196, &.{ self.bits_type, w_bits, w_hi, try self.constant(.bits32, 16) });
-            const cx = try self.convert(.{ .id = x_bits, .value_type = .bits32 }, .float32);
-            const cy = try self.convert(.{ .id = y_bits, .value_type = .bits32 }, .float32);
-            const cz = try self.convert(.{ .id = z_bits, .value_type = .bits32 }, .float32);
-            const cw = try self.convert(.{ .id = w_bits, .value_type = .bits32 }, .float32);
+            const vector_type = try self.ensureFloatVec2();
+            const xy = self.id();
+            try self.emit(&self.body, 12, &.{
+                vector_type,
+                xy,
+                self.ensureGlslStd450(),
+                62, // UnpackHalf2x16
+                xy_bits,
+            });
+            const zw = self.id();
+            try self.emit(&self.body, 12, &.{
+                vector_type,
+                zw,
+                self.ensureGlslStd450(),
+                62,
+                zw_bits,
+            });
+            const cx = self.id();
+            try self.emit(&self.body, 81, &.{ self.float_type, cx, xy, 0 }); // OpCompositeExtract
+            const cy = self.id();
+            try self.emit(&self.body, 81, &.{ self.float_type, cy, xy, 1 });
+            const cz = self.id();
+            try self.emit(&self.body, 81, &.{ self.float_type, cz, zw, 0 });
+            const cw = self.id();
+            try self.emit(&self.body, 81, &.{ self.float_type, cw, zw, 1 });
             break :blk .{
                 if (inst.export_enable & 1 != 0) cx else zero,
                 if (inst.export_enable & 2 != 0) cy else zero,
@@ -1552,6 +1697,18 @@ const Builder = struct {
             if (binding.resource_sgpr == resource_sgpr and binding.instruction_pc == null) return binding;
         }
         return null;
+    }
+
+    /// Returns whether this particular buffer instruction has a staged host
+    /// descriptor. A shader can legitimately reference more V# descriptors
+    /// than the backend managed to recover for one draw. Treating that as a
+    /// fatal translation error discards every other valid attribute fetch in
+    /// the shader, so missing resources are handled as null buffers by the
+    /// individual load/store lowering paths instead.
+    fn hasBufferStorage(self: *const Builder, inst: instruction.Instruction) Error!bool {
+        if (self.storage_array == 0) return false;
+        if (inst.src1.kind != .sgpr) return Error.UnsupportedBufferAddressing;
+        return self.storageBinding(inst.src1.reg, inst.pc) != null;
     }
 
     fn sampledImageBinding(
@@ -1658,8 +1815,10 @@ const Builder = struct {
 
     fn imageStore(self: *Builder, inst: instruction.Instruction) Error!void {
         if (self.stage != .compute or
-            inst.opcode_id != 8 or inst.image_dimension != .dim_2d or
-            inst.image_address_components != 2 or inst.data_mask != 0xf or
+            inst.opcode_id != 8 or
+            (inst.image_dimension != .dim_2d and inst.image_dimension != .dim_2d_array_alt) or
+            (inst.image_address_components != 2 and inst.image_address_components != 3) or
+            inst.data_mask != 0xf or
             inst.dst.kind != .vgpr or inst.src0.kind != .vgpr or inst.src1.kind != .sgpr)
         {
             return Error.UnsupportedOpcode;
@@ -1670,6 +1829,9 @@ const Builder = struct {
         const vector_type = self.storage_image_vector_types[descriptor_index];
         if (vector_type == 0) return Error.InvalidStorageBinding;
         const image = try self.loadStorageImage(binding);
+        // Unity's generic copy kernel uses the 2D-array opcode even when the
+        // bound T# is a one-slice 2D view. The descriptor already selects that
+        // slice, so its third coordinate is intentionally ignored here.
         const coordinates = try self.storageImageCoordinates(inst);
         var shader_values: [4]u32 = undefined;
         for (&shader_values, 0..) |*value, component| {
@@ -2182,6 +2344,15 @@ const Builder = struct {
             else => try self.source(inst.src2, .bits32),
         };
         byte_offset = try self.addBits(byte_offset, soffset);
+        // Scalar-buffer addressing is dword based: GFX10 clears the low two
+        // bits after adding the descriptor-relative immediate and SOFFSET.
+        // This differs subtly from MUBUF, where byte/subword addressing must
+        // retain those bits.  Keeping the alignment here also makes dynamic
+        // S_BUFFER_LOAD match the host scalar evaluator used for recovered
+        // prolog constants.
+        if (inst.family == .smem) {
+            byte_offset = try self.andBits(byte_offset, 0xffff_fffc);
+        }
         return .{ .binding = binding, .byte_offset = byte_offset };
     }
 
@@ -2359,7 +2530,7 @@ const Builder = struct {
     }
 
     fn bufferLoadWords(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
-        if (self.storage_array == 0) {
+        if (!try self.hasBufferStorage(inst)) {
             // No host V# mapping. Zero is correct for missing vertex attributes,
             // but fragment s_buffer_load often feeds a colour scale that multiplies
             // the sample — zero kills the whole writeback. Use 1.0f so a missing
@@ -2397,7 +2568,7 @@ const Builder = struct {
     }
 
     fn bufferStoreWords(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
-        if (self.storage_array == 0) return; // drop stores without a host V#
+        if (!try self.hasBufferStorage(inst)) return; // drop stores without this host V#
         for (0..count) |index| {
             const value = try self.source(try consecutiveRegister(inst.dst, @intCast(index)), .bits32);
             const address = try self.bufferAddressDelta(inst, @intCast(index * 4));
@@ -2406,6 +2577,15 @@ const Builder = struct {
     }
 
     fn bufferAtomic(self: *Builder, inst: instruction.Instruction, opcode: u16) Error!void {
+        if (!try self.hasBufferStorage(inst)) {
+            if (inst.globally_coherent) {
+                try self.destination(inst.dst, .{
+                    .id = try self.constant(.bits32, 0),
+                    .value_type = .bits32,
+                });
+            }
+            return;
+        }
         const value = try self.source(inst.dst, .bits32);
         const address = try self.bufferAddress(inst);
         const result = self.id();
@@ -2440,7 +2620,261 @@ const Builder = struct {
         return self.andBits(shifted, 0xff);
     }
 
+    fn bufferAddressAdd(self: *Builder, address: BufferAddress, byte_offset: u32) Error!BufferAddress {
+        if (byte_offset == 0) return address;
+        return .{
+            .binding = address.binding,
+            .byte_offset = try self.addBits(
+                address.byte_offset,
+                try self.constant(.bits32, byte_offset),
+            ),
+        };
+    }
+
+    /// A formatted component may start at any byte and packed formats share a
+    /// dword. Rebuild one little-endian word byte-by-byte so the generated
+    /// access remains correct across host storage-buffer word boundaries.
+    fn loadUnalignedBufferWord(self: *Builder, address: BufferAddress) Error!u32 {
+        var result = try self.loadBufferByte(address);
+        for (1..4) |byte_index| {
+            const byte = try self.loadBufferByte(try self.bufferAddressAdd(address, @intCast(byte_index)));
+            const shifted = self.id();
+            try self.emit(&self.body, 196, &.{
+                self.bits_type,
+                shifted,
+                byte,
+                try self.constant(.bits32, @intCast(byte_index * 8)),
+            }); // OpShiftLeftLogical
+            const combined = self.id();
+            try self.emit(&self.body, 197, &.{ self.bits_type, combined, result, shifted }); // OpBitwiseOr
+            result = combined;
+        }
+        return result;
+    }
+
+    fn signExtendBits(self: *Builder, raw: u32, width: u8) Error!u32 {
+        if (width == 32) return raw;
+        const amount: u32 = 32 - width;
+        const left = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, left, raw, try self.constant(.bits32, amount) });
+        const as_signed = try self.convert(.{ .id = left, .value_type = .bits32 }, .sint32);
+        const extended = self.id();
+        try self.emit(&self.body, 195, &.{ self.signed_type, extended, as_signed, try self.constant(.sint32, amount) });
+        return self.convert(.{ .id = extended, .value_type = .sint32 }, .bits32);
+    }
+
+    fn unsignedBitsToFloat(self: *Builder, raw: u32) Error!u32 {
+        const result = self.id();
+        try self.emit(&self.body, 112, &.{ self.float_type, result, raw }); // OpConvertUToF
+        return result;
+    }
+
+    fn signedBitsToFloat(self: *Builder, raw: u32) Error!u32 {
+        const signed = try self.convert(.{ .id = raw, .value_type = .bits32 }, .sint32);
+        const result = self.id();
+        try self.emit(&self.body, 111, &.{ self.float_type, result, signed }); // OpConvertSToF
+        return result;
+    }
+
+    fn divideFloat(self: *Builder, numerator: u32, denominator: f32) Error!u32 {
+        const result = self.id();
+        try self.emit(&self.body, 136, &.{
+            self.float_type,
+            result,
+            numerator,
+            try self.constant(.float32, @bitCast(denominator)),
+        }); // OpFDiv
+        return result;
+    }
+
+    /// Decode the unsigned 10/11-bit floating components used by
+    /// 10_11_11_FLOAT and 11_11_10_FLOAT. They have a five-bit exponent and no
+    /// sign, with a six- or five-bit mantissa respectively.
+    fn decodeUnsignedMiniFloat(self: *Builder, raw: u32, width: u8) Error!u32 {
+        const mantissa_bits: u32 = width - 5;
+        const mantissa_mask: u32 = (@as(u32, 1) << @intCast(mantissa_bits)) - 1;
+        const mantissa = try self.andBits(raw, mantissa_mask);
+        const exponent = try self.andBits(try self.shiftRightBits(raw, mantissa_bits), 0x1f);
+
+        const biased = try self.addBits(exponent, try self.constant(.bits32, 112));
+        const exponent_bits = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, exponent_bits, biased, try self.constant(.bits32, 23) });
+        const fraction_bits = self.id();
+        try self.emit(&self.body, 196, &.{
+            self.bits_type,
+            fraction_bits,
+            mantissa,
+            try self.constant(.bits32, 23 - mantissa_bits),
+        });
+        const normal = self.id();
+        try self.emit(&self.body, 197, &.{ self.bits_type, normal, exponent_bits, fraction_bits });
+
+        const mantissa_float = try self.unsignedBitsToFloat(mantissa);
+        const scale: f32 = if (mantissa_bits == 6) 1.0 / 1_048_576.0 else 1.0 / 524_288.0;
+        const subnormal_float = self.id();
+        try self.emit(&self.body, 133, &.{
+            self.float_type,
+            subnormal_float,
+            mantissa_float,
+            try self.constant(.float32, @bitCast(scale)),
+        }); // OpFMul
+        const subnormal = try self.convert(.{ .id = subnormal_float, .value_type = .float32 }, .bits32);
+        const special = self.id();
+        try self.emit(&self.body, 197, &.{ self.bits_type, special, try self.constant(.bits32, 0x7f80_0000), fraction_bits });
+
+        const exponent_is_zero = self.id();
+        try self.emit(&self.body, 170, &.{ self.bool_type, exponent_is_zero, exponent, try self.constant(.bits32, 0) });
+        const finite = self.id();
+        try self.emit(&self.body, 169, &.{ self.bits_type, finite, exponent_is_zero, subnormal, normal });
+        const exponent_is_special = self.id();
+        try self.emit(&self.body, 170, &.{ self.bool_type, exponent_is_special, exponent, try self.constant(.bits32, 31) });
+        const result = self.id();
+        try self.emit(&self.body, 169, &.{ self.bits_type, result, exponent_is_special, special, finite });
+        return result;
+    }
+
+    fn convertFormattedBufferComponent(
+        self: *Builder,
+        raw: u32,
+        layout: BufferComponentLayout,
+        format: BufferFormat,
+    ) Error!u32 {
+        const unsigned_max: u32 = if (layout.bit_count == 32)
+            0xffff_ffff
+        else
+            (@as(u32, 1) << @intCast(layout.bit_count)) - 1;
+        const signed_bits = try self.signExtendBits(raw, layout.bit_count);
+        return switch (format.number) {
+            0 => blk: { // UNORM
+                const value = try self.divideFloat(
+                    try self.unsignedBitsToFloat(raw),
+                    @floatFromInt(unsigned_max),
+                );
+                break :blk try self.convert(.{ .id = value, .value_type = .float32 }, .bits32);
+            },
+            1 => blk: { // SNORM
+                const signed_max: u32 = unsigned_max >> 1;
+                const normalized = try self.divideFloat(
+                    try self.signedBitsToFloat(signed_bits),
+                    @floatFromInt(signed_max),
+                );
+                const clamped = try self.glslBinaryValue(
+                    40,
+                    .float32,
+                    normalized,
+                    try self.constant(.float32, @bitCast(@as(f32, -1.0))),
+                ); // FMax
+                break :blk try self.convert(.{ .id = clamped, .value_type = .float32 }, .bits32);
+            },
+            2 => blk: { // USCALED
+                const value = try self.unsignedBitsToFloat(raw);
+                break :blk try self.convert(.{ .id = value, .value_type = .float32 }, .bits32);
+            },
+            3 => blk: { // SSCALED
+                const value = try self.signedBitsToFloat(signed_bits);
+                break :blk try self.convert(.{ .id = value, .value_type = .float32 }, .bits32);
+            },
+            4 => raw, // UINT
+            5 => signed_bits, // SINT
+            7 => blk: { // FLOAT
+                if (format.data == 6 or format.data == 7) {
+                    break :blk try self.decodeUnsignedMiniFloat(raw, layout.bit_count);
+                }
+                if (layout.bit_count == 16) {
+                    const vector_type = try self.ensureFloatVec2();
+                    const unpacked = self.id();
+                    try self.emit(&self.body, 12, &.{
+                        vector_type,
+                        unpacked,
+                        self.ensureGlslStd450(),
+                        62, // UnpackHalf2x16
+                        raw,
+                    });
+                    const value = self.id();
+                    try self.emit(&self.body, 81, &.{ self.float_type, value, unpacked, 0 });
+                    break :blk try self.convert(.{ .id = value, .value_type = .float32 }, .bits32);
+                }
+                break :blk raw;
+            },
+            else => raw,
+        };
+    }
+
+    fn loadFormattedBufferComponent(
+        self: *Builder,
+        element_address: BufferAddress,
+        layout: BufferComponentLayout,
+        format: BufferFormat,
+    ) Error!u32 {
+        const component_address = try self.bufferAddressAdd(element_address, layout.byte_offset);
+        var raw = try self.loadUnalignedBufferWord(component_address);
+        if (layout.bit_offset != 0) raw = try self.shiftRightBits(raw, layout.bit_offset);
+        if (layout.bit_count != 32) {
+            const mask = (@as(u32, 1) << @intCast(layout.bit_count)) - 1;
+            raw = try self.andBits(raw, mask);
+        }
+        return self.convertFormattedBufferComponent(raw, layout, format);
+    }
+
+    fn bufferLoadFormat(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
+        if (!try self.hasBufferStorage(inst)) {
+            const zero = try self.constant(.bits32, 0);
+            for (0..count) |destination_index| {
+                try self.destination(try consecutiveRegister(inst.dst, @intCast(destination_index)), .{
+                    .id = zero,
+                    .value_type = .bits32,
+                });
+            }
+            return;
+        }
+        const binding = self.storageBinding(inst.src1.reg, inst.pc) orelse return Error.InvalidStorageBinding;
+        const format = decodeBufferUnifiedFormat(binding.unified_format) orelse {
+            try self.bufferLoadWords(inst, count);
+            return;
+        };
+        // FORMAT=0 is invalid/null. Preserve the former raw-dword behaviour
+        // for callers that have not captured descriptor format metadata yet.
+        if (format.data == 0) {
+            try self.bufferLoadWords(inst, count);
+            return;
+        }
+
+        const element_address = try self.bufferAddress(inst);
+        const one_bits: u32 = if (format.number == 4 or format.number == 5)
+            1
+        else
+            @bitCast(@as(f32, 1.0));
+        var canonical: [4]u32 = undefined;
+        for (&canonical, 0..) |*value, component| {
+            value.* = if (bufferComponentLayout(format.data, @intCast(component))) |layout|
+                try self.loadFormattedBufferComponent(element_address, layout, format)
+            else
+                try self.constant(.bits32, if (component == 3) one_bits else 0);
+        }
+
+        for (0..count) |destination_index| {
+            const selector = binding.dst_select[destination_index];
+            const value = switch (selector) {
+                0 => try self.constant(.bits32, 0),
+                1 => try self.constant(.bits32, one_bits),
+                4...7 => canonical[selector - 4],
+                else => try self.constant(.bits32, 0),
+            };
+            try self.destination(try consecutiveRegister(inst.dst, @intCast(destination_index)), .{
+                .id = value,
+                .value_type = .bits32,
+            });
+        }
+    }
+
     fn bufferLoadSubword(self: *Builder, inst: instruction.Instruction, width: u8, signed: bool) Error!void {
+        if (!try self.hasBufferStorage(inst)) {
+            try self.destination(inst.dst, .{
+                .id = try self.constant(.bits32, 0),
+                .value_type = .bits32,
+            });
+            return;
+        }
         const address = try self.bufferAddress(inst);
         var result = try self.loadBufferByte(address);
         if (width == 16) {
@@ -2491,6 +2925,7 @@ const Builder = struct {
     }
 
     fn bufferStoreSubword(self: *Builder, inst: instruction.Instruction, width: u8) Error!void {
+        if (!try self.hasBufferStorage(inst)) return;
         const value = try self.source(inst.dst, .bits32);
         try self.storeBufferByte(try self.bufferAddress(inst), value);
         if (width == 16) {
@@ -2501,13 +2936,41 @@ const Builder = struct {
         }
     }
 
-    fn specializedScalarDestination(self: *const Builder, inst: instruction.Instruction) bool {
-        if (inst.pc >= self.specialized_scalar_prefix_end or inst.dst.kind != .sgpr or inst.dst.reg >= 128) return false;
-        if (!self.specialized_scalar_registers[inst.dst.reg]) return false;
-        return switch (inst.family) {
-            .sop1, .sop2, .sopk, .smem => true,
-            else => false,
-        };
+    fn lowerSpecializedScalarDestination(self: *Builder, inst: instruction.Instruction) Error!bool {
+        if (inst.pc >= self.specialized_scalar_prefix_end or
+            inst.family != .smem)
+        {
+            return false;
+        }
+
+        // Multi-dword SMEM writes may only be replaced when every destination
+        // word was recovered from this exact instruction. A final register
+        // snapshot is not sufficient: Unity NGG prologs repeatedly reuse the
+        // same SGPR window for unrelated descriptors and matrices.
+        const word_count: usize = @max(inst.data_words, 1);
+        const first = registerIndex(inst.dst) orelse return false;
+        if (first + word_count > 128) return false;
+        var values: [16]u32 = @splat(0);
+        if (word_count > values.len) return false;
+        for (0..word_count) |word_index| {
+            const register: u32 = @intCast(first + word_index);
+            var found = false;
+            for (self.scalar_specializations) |scalar| {
+                if (scalar.producer_pc == inst.pc and scalar.register == register) {
+                    values[word_index] = scalar.value;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return false;
+        }
+        for (0..word_count) |word_index| {
+            try self.destination(try consecutiveRegister(inst.dst, @intCast(word_index)), .{
+                .id = try self.constant(.bits32, values[word_index]),
+                .value_type = .bits32,
+            });
+        }
+        return true;
     }
 
     /// Takes a write to the execution mask, and says whether it did.
@@ -2621,7 +3084,7 @@ const Builder = struct {
             if (nonExecCompareOpcode(inst.opcode)) |opcode| inst.opcode = opcode;
         }
         if (try self.lowerExecutionMask(inst)) return;
-        if (self.specializedScalarDestination(inst)) return;
+        if (try self.lowerSpecializedScalarDestination(inst)) return;
         // M0 only feeds hardware interpolation/LDS addressing. Those paths
         // are represented by host built-ins or dedicated lowering below, so
         // copying an unavailable hardware SGPR into M0 must not reject the
@@ -2723,6 +3186,7 @@ const Builder = struct {
             .s_or_b32, .v_or_b32 => try self.binary(inst, 197, .bits32, false),
             .s_xor_b32, .v_xor_b32 => try self.binary(inst, 198, .bits32, false),
             .s_not_b32, .v_not_b32 => try self.unary(inst, 200, .bits32), // OpNot
+            .s_brev_b32 => try self.unary(inst, 204, .bits32), // OpBitReverse
             .s_cmp_eq_i32, .s_cmp_eq_u32 => try self.comparison(inst, 170, .bits32), // OpIEqual
             .s_cmp_lg_i32, .s_cmp_lg_u32 => try self.comparison(inst, 171, .bits32), // OpINotEqual
             .s_cmp_gt_i32 => try self.comparison(inst, 173, .sint32),
@@ -2765,24 +3229,26 @@ const Builder = struct {
             .buffer_load_sbyte => try self.bufferLoadSubword(inst, 8, true),
             .buffer_load_ushort => try self.bufferLoadSubword(inst, 16, false),
             .buffer_load_sshort => try self.bufferLoadSubword(inst, 16, true),
-            // FORMAT ops with 32-bit components are dword transfers through the
-            // V# stride. Unity's first live compute after the GDS/copy path is
-            // exactly buffer_store_format_xyzw of a constant float4/uint4; the
-            // typed conversion path is not required until a non-32-bit format
-            // shows up in a rejected program.
             .buffer_load_dword,
-            .buffer_load_format_x,
-            .tbuffer_load_format_x,
             => try self.bufferLoadWords(inst, 1),
             .buffer_load_dwordx2,
-            .buffer_load_format_xy,
             => try self.bufferLoadWords(inst, 2),
             .buffer_load_dwordx3,
-            .buffer_load_format_xyz,
             => try self.bufferLoadWords(inst, 3),
             .buffer_load_dwordx4,
-            .buffer_load_format_xyzw,
             => try self.bufferLoadWords(inst, 4),
+            .buffer_load_format_x,
+            .tbuffer_load_format_x,
+            => try self.bufferLoadFormat(inst, 1),
+            .buffer_load_format_xy,
+            .tbuffer_load_format_xy,
+            => try self.bufferLoadFormat(inst, 2),
+            .buffer_load_format_xyz,
+            .tbuffer_load_format_xyz,
+            => try self.bufferLoadFormat(inst, 3),
+            .buffer_load_format_xyzw,
+            .tbuffer_load_format_xyzw,
+            => try self.bufferLoadFormat(inst, 4),
             .s_buffer_load_dword => try self.scalarBufferLoadWords(inst, 1),
             .s_buffer_load_dwordx2 => try self.scalarBufferLoadWords(inst, 2),
             .s_buffer_load_dwordx4 => try self.scalarBufferLoadWords(inst, 4),
@@ -2860,42 +3326,11 @@ const Builder = struct {
 };
 
 fn lowerDiagnosed(builder: *Builder, inst: instruction.Instruction) Error!void {
-    builder.lower(inst) catch |err| {
-        std.debug.print(
-            "[rdna2 spirv] stage={s} pc=0x{x} word=0x{x:0>8} raw1=0x{x:0>8} opcode={s} dst={s}:{d}(clamp={d},omod={d}) src0={s}:{d}(sel={d},abs={d},neg={d},dpp={d}) src1={s}:{d}(sel={d},abs={d},neg={d},dpp={d}) src2={s}:{d}(sel={d},abs={d},neg={d},dpp={d}) error={s}\n",
-            .{
-                @tagName(builder.stage),
-                inst.pc,
-                inst.word,
-                inst.raw[1],
-                @tagName(inst.opcode),
-                @tagName(inst.dst.kind),
-                inst.dst.reg,
-                @intFromBool(inst.dst.clamp),
-                inst.dst.omod,
-                @tagName(inst.src0.kind),
-                inst.src0.reg,
-                inst.src0.sdwa_sel,
-                @intFromBool(inst.src0.absolute),
-                @intFromBool(inst.src0.negate),
-                @intFromBool(inst.src0.dpp),
-                @tagName(inst.src1.kind),
-                inst.src1.reg,
-                inst.src1.sdwa_sel,
-                @intFromBool(inst.src1.absolute),
-                @intFromBool(inst.src1.negate),
-                @intFromBool(inst.src1.dpp),
-                @tagName(inst.src2.kind),
-                inst.src2.reg,
-                inst.src2.sdwa_sel,
-                @intFromBool(inst.src2.absolute),
-                @intFromBool(inst.src2.negate),
-                @intFromBool(inst.src2.dpp),
-                @errorName(err),
-            },
-        );
-        return err;
-    };
+    // The backend reports a translation failure once per program/stage and
+    // includes a bounded disassembly there. Printing here emitted the same
+    // failed instruction for every draw and could dominate a title's frame
+    // time while it was already using the probe fallback.
+    try builder.lower(inst);
 }
 
 fn appendInstruction(allocator: std.mem.Allocator, words: *std.ArrayList(u32), opcode: u16, args: []const u32) Error!void {
@@ -2938,11 +3373,11 @@ fn structuredCondition(builder: *Builder, condition: control_flow.Condition) Err
     return switch (condition) {
         .scc => if (builder.scc != 0) builder.scc else try falseCondition(builder),
         .vcc_zero, .exec_zero => blk: {
-            // Wave-wide EXEC/VCC semantics need a separate compute model. The
-            // scalar per-fragment predicate below is correct for the pixel
-            // path we currently expose, while applying it to workgroups can
-            // send invalid buffer traffic to the driver.
-            if (builder.stage != .fragment) return Error.UnsupportedControlFlow;
+            // One Vulkan vertex/fragment invocation represents one active
+            // RDNA lane, so its VCC/EXEC word is a valid per-invocation branch
+            // predicate. Compute still needs a wave-wide ballot model: taking
+            // this path there could send inactive lanes into buffer traffic.
+            if (builder.stage == .compute) return Error.UnsupportedControlFlow;
             const index: usize = if (condition == .vcc_zero) 106 else 126;
             const mask = builder.registers[index];
             if (mask.id == 0) break :blk try falseCondition(builder);
@@ -3356,7 +3791,10 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     try appendInstruction(allocator, &words, 54, &.{ builder.void_type, builder.main_function, 0, builder.function_type });
     try words.appendSlice(allocator, builder.body.items);
     try appendInstruction(allocator, &words, 56, &.{});
-    return .{ .words = try words.toOwnedSlice(allocator) };
+    return .{
+        .words = try words.toOwnedSlice(allocator),
+        .used_control_flow_fallback = builder.used_control_flow_fallback,
+    };
 }
 
 /// Translates the executable ALU/SDWA subset and forward scalar selections.
@@ -3408,6 +3846,7 @@ pub fn translate(allocator: std.mem.Allocator, program: *const instruction.Progr
             builder_alive = false;
             builder = try Builder.init(allocator, effective);
             builder_alive = true;
+            builder.used_control_flow_fallback = true;
             try builder.emit(&builder.body, 248, &.{builder.label});
             try builder.initializeStageInputs();
             for (program.instructions.items) |inst| {
@@ -3867,6 +4306,49 @@ test "vertex PARAM export and fragment interpolation share a location" {
     try std.testing.expectEqual(@as(usize, 2), countOpcode(fragment_module.words, 81)); // OpCompositeExtract
 }
 
+test "pixel input control maps VINTRP attribute to vertex PARAM location" {
+    var fragment = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer fragment.deinit(std.testing.allocator);
+    try fragment.instructions.appendSlice(std.testing.allocator, &.{
+        .{
+            .opcode = .v_interp_mov_f32,
+            .dst = .{ .kind = .vgpr, .reg = 0 },
+            .src0 = .{ .kind = .integer_inline_constant, .value = 0 },
+            .src1 = .{ .kind = .integer_inline_constant, .value = 0 }, // ATTR0
+            .src2 = .{ .kind = .integer_inline_constant, .value = 0 },
+            .src_count = 3,
+        },
+        .{ .opcode = .s_endpgm },
+    });
+    const controls = [_]u32{0x402}; // PARAM2 + FLAT_SHADE
+    var module = try translate(std.testing.allocator, &fragment, .{
+        .stage = .fragment,
+        .fragment_input_controls = &controls,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    var location_variable: u32 = 0;
+    var saw_flat = false;
+    var index: usize = 5;
+    while (index < module.words.len) {
+        const word_count: usize = @intCast(module.words[index] >> 16);
+        if (word_count == 0 or index + word_count > module.words.len) break;
+        if (@as(u16, @truncate(module.words[index])) == 71) { // OpDecorate
+            if (word_count == 4 and module.words[index + 2] == 30 and module.words[index + 3] == 2) {
+                location_variable = module.words[index + 1];
+            }
+            if (word_count == 3 and module.words[index + 2] == 14 and
+                module.words[index + 1] == location_variable and location_variable != 0)
+            {
+                saw_flat = true;
+            }
+        }
+        index += word_count;
+    }
+    try std.testing.expect(location_variable != 0);
+    try std.testing.expect(saw_flat);
+}
+
 /// One indexed buffer access, encoded the way the hardware spells it.
 fn testMubuf(opcode: u7, byte_offset: u12, data: u8, address: u8, resource: u8) [2]u32 {
     return .{
@@ -4117,6 +4599,43 @@ test "compute image load and NSA store use independently typed storage image bin
     try std.testing.expect(containsOpcode(module.words, 99)); // OpImageWrite
 }
 
+test "compute image store accepts a one-slice 2D array opcode" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xf020_0f28, // image_store dim:2d_array dmask:xyzw v0, v[4:6], s[16:23]
+        0x0004_0004,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    const images = [_]StorageImageBinding{.{
+        .resource_sgpr = 16,
+        .descriptor_index = 0,
+        .format = .rgba8_unorm,
+    }};
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .storage_images = &images,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expect(containsOpcode(module.words, 99)); // OpImageWrite
+}
+
+test "scalar bit reverse lowers to SPIR-V" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xbeeb_0bc4, // s_brev_b32 vcc_hi, 4
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expect(containsOpcode(module.words, 204)); // OpBitReverse
+}
+
 test "MUBUF dword load and store lower through a descriptor array" {
     const decoder = @import("decoder.zig");
     const code = [_]u32{
@@ -4142,7 +4661,47 @@ test "MUBUF dword load and store lower through a descriptor array" {
     try std.testing.expect(containsOpcode(module.words, 62)); // OpStore
 }
 
-test "MUBUF format load and store lower as multi-dword transfers" {
+test "unresolved individual MUBUF binding behaves as a null buffer" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xe030_0000, // buffer_load_dword v0, v0, s4:s7, 0
+        0x8001_0000,
+        0xe070_0004, // buffer_store_dword v0, v0, s4:s7, offset:4
+        0x8001_0000,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+
+    // A different descriptor is available to the shader, but the V# used by
+    // these two instructions was not recoverable for this draw.
+    const storage = [_]StorageBufferBinding{.{ .resource_sgpr = 8, .descriptor_index = 0 }};
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .storage_buffers = &storage,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expect(!containsOpcode(module.words, 65)); // no OpAccessChain
+    try std.testing.expect(!containsOpcode(module.words, 62)); // missing store is dropped
+}
+
+test "GFX10 unified buffer formats expose packed component layouts" {
+    try std.testing.expectEqual(BufferFormat{ .data = 10, .number = 0 }, decodeBufferUnifiedFormat(56).?);
+    try std.testing.expectEqual(BufferFormat{ .data = 12, .number = 7 }, decodeBufferUnifiedFormat(71).?);
+    try std.testing.expectEqual(
+        BufferComponentLayout{ .byte_offset = 3, .bit_count = 8 },
+        bufferComponentLayout(10, 3).?,
+    );
+    try std.testing.expectEqual(
+        BufferComponentLayout{ .byte_offset = 0, .bit_offset = 30, .bit_count = 2 },
+        bufferComponentLayout(8, 3).?,
+    );
+    try std.testing.expect(bufferComponentLayout(5, 2) == null);
+    try std.testing.expect(decodeBufferUnifiedFormat(47) == null);
+}
+
+test "MUBUF format load converts packed descriptor components" {
     const decoder = @import("decoder.zig");
     // FORMAT ops with 32-bit components use the same MUBUF path as dwordxN.
     // Encoded without idxen so the address does not depend on an undefined
@@ -4163,6 +4722,8 @@ test "MUBUF format load and store lower as multi-dword transfers" {
         .resource_sgpr = 4,
         .descriptor_index = 0,
         .stride = 16,
+        .unified_format = 56, // R8G8B8A8_UNORM
+        .dst_select = .{ 4, 5, 6, 7 },
         .extent_bytes = 64,
     }};
     var module = try translate(std.testing.allocator, &program, .{
@@ -4172,7 +4733,36 @@ test "MUBUF format load and store lower as multi-dword transfers" {
     defer module.deinit(std.testing.allocator);
 
     try std.testing.expect(containsOpcode(module.words, 61)); // OpLoad
+    try std.testing.expect(containsOpcode(module.words, 112)); // OpConvertUToF
+    try std.testing.expect(containsOpcode(module.words, 136)); // OpFDiv
     try std.testing.expectEqual(@as(usize, 4), countOpcode(module.words, 62)); // four component stores
+}
+
+test "MUBUF format load unpacks half-float components" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xe004_0000, // buffer_load_format_xy v0:v1, v0, s4:s7, 0
+        0x8001_0000,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+
+    const storage = [_]StorageBufferBinding{.{
+        .resource_sgpr = 4,
+        .descriptor_index = 0,
+        .stride = 4,
+        .unified_format = 29, // R16G16_FLOAT
+        .extent_bytes = 64,
+    }};
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .storage_buffers = &storage,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expect(containsOpcode(module.words, 12)); // UnpackHalf2x16 via OpExtInst
+    try std.testing.expect(containsOpcode(module.words, 81)); // OpCompositeExtract
 }
 
 test "resolved SMEM descriptor prolog specializes before MUBUF" {
@@ -4190,10 +4780,10 @@ test "resolved SMEM descriptor prolog specializes before MUBUF" {
     defer program.deinit(std.testing.allocator);
     const storage = [_]StorageBufferBinding{.{ .resource_sgpr = 8, .descriptor_index = 0 }};
     const scalars = [_]ScalarRegister{
-        .{ .register = 8, .value = 0x1000 },
-        .{ .register = 9, .value = 0 },
-        .{ .register = 10, .value = 64 },
-        .{ .register = 11, .value = 0 },
+        .{ .register = 8, .value = 0x1000, .producer_pc = 0 },
+        .{ .register = 9, .value = 0, .producer_pc = 0 },
+        .{ .register = 10, .value = 64, .producer_pc = 0 },
+        .{ .register = 11, .value = 0, .producer_pc = 0 },
     };
     var module = try translate(std.testing.allocator, &program, .{
         .stage = .compute,
@@ -4203,6 +4793,48 @@ test "resolved SMEM descriptor prolog specializes before MUBUF" {
     });
     defer module.deinit(std.testing.allocator);
     try std.testing.expect(containsOpcode(module.words, 62)); // OpStore
+}
+
+test "SMEM recovery requires every word from the same producer" {
+    var partial_scalars = [_]ScalarRegister{.{
+        .register = 28,
+        .value = 0x1000,
+        .producer_pc = 0x20,
+    }};
+    var partial_builder = try Builder.init(std.testing.allocator, .{
+        .stage = .vertex,
+        .scalar_registers = &partial_scalars,
+        .specialized_scalar_prefix_end = 0x100,
+    });
+    defer partial_builder.deinit();
+
+    const load = instruction.Instruction{
+        .pc = 0x20,
+        .family = .smem,
+        .opcode = .s_buffer_load_dwordx16,
+        .dst = .{ .kind = .sgpr, .reg = 28 },
+        .data_words = 16,
+    };
+    try std.testing.expect(!try partial_builder.lowerSpecializedScalarDestination(load));
+
+    var complete_scalars: [16]ScalarRegister = undefined;
+    for (&complete_scalars, 0..) |*scalar, index| {
+        scalar.* = .{
+            .register = @intCast(28 + index),
+            .value = @intCast(index),
+            .producer_pc = 0x20,
+        };
+    }
+    var complete_builder = try Builder.init(std.testing.allocator, .{
+        .stage = .vertex,
+        .scalar_registers = &complete_scalars,
+        .specialized_scalar_prefix_end = 0x100,
+    });
+    defer complete_builder.deinit();
+    try std.testing.expect(try complete_builder.lowerSpecializedScalarDestination(load));
+    for (0..16) |index| {
+        try std.testing.expect(complete_builder.registers[28 + index].id != 0);
+    }
 }
 
 test "vector and subword MUBUF operations lower explicitly" {
@@ -4497,6 +5129,40 @@ test "structured EXECZ selection consumes a CMPX predicate" {
     });
     try program.instructions.append(std.testing.allocator, .{ .pc = 12, .family = .sopp, .opcode = .s_endpgm });
     var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 247)); // OpSelectionMerge
+    try std.testing.expect(containsOpcode(module.words, 250)); // OpBranchConditional
+}
+
+test "vertex VCC selection preserves divergent attribute paths" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .family = .vopc,
+        .opcode = .v_cmp_neq_f32,
+        .dst = .{ .kind = .vcc_lo },
+        .src0 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, 1.0)) },
+        .src1 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, 0.0)) },
+        .src_count = 2,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 4,
+        .family = .sopp,
+        .opcode = .s_cbranch_vccnz,
+        .branch_target = 12,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 8,
+        .family = .vop1,
+        .opcode = .v_mov_b32,
+        .dst = .{ .kind = .vgpr, .reg = 0 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 1, .signed_val = 1 },
+        .src_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 12, .family = .sopp, .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .vertex });
     defer module.deinit(std.testing.allocator);
     try std.testing.expect(containsOpcode(module.words, 247)); // OpSelectionMerge
     try std.testing.expect(containsOpcode(module.words, 250)); // OpBranchConditional

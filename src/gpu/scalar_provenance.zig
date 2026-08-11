@@ -14,6 +14,10 @@ const shaders = @import("shaders.zig");
 
 pub const maximum_scalar_registers = 128;
 pub const maximum_loads = 128;
+/// A scalar load can write sixteen SGPRs. Keep every recovered write, rather
+/// than only the final value of each physical register, because shaders reuse
+/// the same SGPR window for several descriptors and constant blocks.
+pub const maximum_scalar_specializations = maximum_loads * 16 + maximum_scalar_registers * 2;
 pub const maximum_instructions = 4096;
 const address_mask: u64 = 0x0000_ffff_ffff_ffff;
 
@@ -45,6 +49,7 @@ pub const ScalarLoad = struct {
     from_srt: bool,
     base_sources: Sources,
     offset_sources: Sources,
+    values: [16]u32,
 };
 
 pub const StopReason = enum {
@@ -230,10 +235,12 @@ fn evaluate(
                     pc = if (is_taken) inst.branch_target else pc + inst.word_count * 4;
                     continue;
                 }
-                if (follow_lane_mask_fallthrough and switch (inst.opcode) {
-                    .s_cbranch_vccz, .s_cbranch_vccnz, .s_cbranch_execz, .s_cbranch_execnz => true,
-                    else => false,
-                }) {
+                // Resource recovery follows the fallthrough of a conditional
+                // whose predicate depends on per-lane values. The translated
+                // shader will still make the real branch decision at runtime;
+                // we only need the descriptors/constants for the path when it
+                // is taken by at least one invocation.
+                if (follow_lane_mask_fallthrough and inst.opcode != .s_branch) {
                     pc +%= inst.word_count * 4;
                     continue;
                 }
@@ -307,12 +314,16 @@ fn executeSmem(
         result.stop_reason = .invalid_address;
         return false;
     }
-    if (inst.dst.kind != .sgpr or @as(usize, inst.dst.reg) + inst.data_words > maximum_scalar_registers) {
+    const destination = scalarRegisterIndex(inst.dst) orelse {
+        result.stop_reason = .invalid_address;
+        return false;
+    };
+    if (destination + inst.data_words > maximum_scalar_registers) {
         result.stop_reason = .invalid_address;
         return false;
     }
 
-    var loaded: [16]u32 = undefined;
+    var loaded: [16]u32 = @splat(0);
     for (loaded[0..inst.data_words], 0..) |*word, index| {
         word.* = reader.readU32(address + index * 4) catch {
             invalidateDestination(result, inst.dst, inst.data_words);
@@ -324,7 +335,7 @@ fn executeSmem(
     const base_sources = Sources.merge(base_lo.sources, base_hi.sources);
     const loaded_sources = Sources.merge(Sources.merge(base_sources, offset.sources), .{ .memory = true });
     for (loaded[0..inst.data_words], 0..) |word, index| {
-        result.registers[inst.dst.reg + index] = .{
+        result.registers[destination + index] = .{
             .known = true,
             .value = word,
             .sources = loaded_sources,
@@ -335,12 +346,13 @@ fn executeSmem(
         result.loads[result.load_count] = .{
             .pc = inst.pc,
             .address = address,
-            .destination = @intCast(inst.dst.reg),
+            .destination = @intCast(destination),
             .word_count = inst.data_words,
             .buffer_descriptor = is_buffer_load,
             .from_srt = addressInsideSrt(bindings, address, inst.data_words),
             .base_sources = base_sources,
             .offset_sources = offset.sources,
+            .values = loaded,
         };
         result.load_count += 1;
     }
@@ -500,7 +512,10 @@ fn executeScalar64(result: *Evaluation, inst: rdna2.Instruction, a: ScalarValue,
 
 fn source(result: *const Evaluation, operand: rdna2.Operand) ?ScalarValue {
     return switch (operand.kind) {
-        .sgpr => if (operand.reg < maximum_scalar_registers and result.registers[operand.reg].known) result.registers[operand.reg] else null,
+        .sgpr, .vcc_lo, .vcc_hi, .exec_lo, .exec_hi, .m0 => if (scalarRegisterIndex(operand)) |index|
+            if (result.registers[index].known) result.registers[index] else null
+        else
+            null,
         .integer_inline_constant, .float_inline_constant, .literal_constant => .{
             .known = true,
             .value = operand.value,
@@ -512,14 +527,26 @@ fn source(result: *const Evaluation, operand: rdna2.Operand) ?ScalarValue {
 }
 
 fn write(result: *Evaluation, destination: rdna2.Operand, value: u32, sources: Sources, pc: u32) void {
-    if (destination.kind != .sgpr or destination.reg >= maximum_scalar_registers) return;
-    result.registers[destination.reg] = .{ .known = true, .value = value, .sources = sources, .producer_pc = pc };
+    const index = scalarRegisterIndex(destination) orelse return;
+    result.registers[index] = .{ .known = true, .value = value, .sources = sources, .producer_pc = pc };
 }
 
 fn invalidateDestination(result: *Evaluation, destination: rdna2.Operand, count: u8) void {
-    if (destination.kind != .sgpr or destination.reg >= maximum_scalar_registers) return;
-    const end = @min(maximum_scalar_registers, @as(usize, destination.reg) + count);
-    for (result.registers[destination.reg..end]) |*value| value.* = .{};
+    const first = scalarRegisterIndex(destination) orelse return;
+    const end = @min(maximum_scalar_registers, first + count);
+    for (result.registers[first..end]) |*value| value.* = .{};
+}
+
+fn scalarRegisterIndex(value: rdna2.Operand) ?usize {
+    return switch (value.kind) {
+        .sgpr => if (value.reg < maximum_scalar_registers) @intCast(value.reg) else null,
+        .vcc_lo => 106,
+        .vcc_hi => 107,
+        .m0 => 124,
+        .exec_lo => 126,
+        .exec_hi => 127,
+        else => null,
+    };
 }
 
 fn destinationWords(opcode: rdna2.Opcode) u8 {
@@ -663,6 +690,8 @@ test "scalar provenance follows an SRT pointer through ALU and SMEM" {
     try std.testing.expect(result.loads[0].from_srt);
     try std.testing.expect(result.loads[0].base_sources.user_data);
     try std.testing.expect(result.loads[0].base_sources.immediate);
+    try std.testing.expectEqual(@as(u32, 0x1122_3344), result.loads[0].values[0]);
+    try std.testing.expectEqual(@as(u32, 0x5566_7788), result.loads[0].values[1]);
     try std.testing.expectEqual(@as(u32, 0x1122_3344), result.register(8).?.value);
     try std.testing.expect(result.register(8).?.sources.memory);
     try std.testing.expect(result.register(8).?.sources.user_data);
@@ -706,5 +735,20 @@ test "resource evaluation follows the active-lane branch path" {
 
     const resources = evaluateResourceState(memory.reader(), &bindings);
     try std.testing.expectEqual(StopReason.end_program, resources.stop_reason);
+    try std.testing.expectEqual(@as(u32, 1), resources.register(2).?.value);
+}
+
+test "resource evaluation follows an unknown conditional fallthrough" {
+    var storage = [_]u8{0} ** 0x40;
+    var memory = TestMemory{ .base = 0x5000, .bytes = &storage };
+    memory.write(0x5000, 0xbf09_8356); // s_cmp_ge_u32 s86, 0; s86 is unknown
+    memory.write(0x5004, 0xbf84_0001); // s_cbranch_scc0 skips the resource path
+    memory.write(0x5008, 0xbe82_0381); // s_mov_b32 s2, 1
+    memory.write(0x500c, 0xbf81_0000);
+    const bindings = testBindings(0x5000, 0x1234);
+
+    const strict = evaluatePrefix(memory.reader(), &bindings);
+    try std.testing.expectEqual(StopReason.branch, strict.stop_reason);
+    const resources = evaluateResourceState(memory.reader(), &bindings);
     try std.testing.expectEqual(@as(u32, 1), resources.register(2).?.value);
 }

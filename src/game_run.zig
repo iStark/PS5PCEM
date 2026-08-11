@@ -21,6 +21,15 @@ const usage =
     \\
 ;
 
+fn reportUnresolvedImport(_: ?*anyopaque, diagnostic: runtime.module_graph.UnresolvedImport) void {
+    std.debug.print("  unresolved {s}: {s} {s} {s}\n", .{
+        diagnostic.path,
+        diagnostic.import.id,
+        diagnostic.import.library orelse diagnostic.import.library_code,
+        @tagName(diagnostic.import.symbol_type),
+    });
+}
+
 fn resolveVideoOutBuffer(_: ?*anyopaque, flip: gpu.state.Flip) ?vulkan.DisplayBuffer {
     const registration = runtime.firmware.video_out.resolveFlip(flip) orelse return null;
     return .{
@@ -35,6 +44,25 @@ fn resolveVideoOutBuffer(_: ?*anyopaque, flip: gpu.state.Flip) ?vulkan.DisplayBu
 fn updateHostWindowFps(context: ?*anyopaque, fps_tenths: u32) void {
     const host_window: *window.HostWindow = @ptrCast(@alignCast(context orelse return));
     host_window.updateFps(fps_tenths);
+}
+
+fn appendUnityDeferredModules(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    title_root: []const u8,
+    modules: *std.ArrayList([]const u8),
+) !void {
+    var directory = std.Io.Dir.cwd().openDir(io, title_root, .{}) catch return;
+    defer directory.close(io);
+    const candidates = [_][]const u8{
+        "Media/Plugins/lib_burst_generated.prx",
+        "Media/Plugins/SaveData.prx",
+        "Media/Plugins/PSN.prx",
+    };
+    for (candidates) |path| {
+        _ = directory.statFile(io, path, .{}) catch continue;
+        try modules.append(allocator, path);
+    }
 }
 
 fn reportRelocation(
@@ -148,8 +176,30 @@ fn run(init: std.process.Init) !bool {
         }
     } else |_| {}
 
+    var deferred_modules: std.ArrayList([]const u8) = .empty;
+    defer deferred_modules.deinit(allocator);
+    var deferred_text: ?[]u8 = null;
+    defer if (deferred_text) |text| allocator.free(text);
+    if (init.minimal.environ.getAlloc(allocator, "PS5_DEFERRED_MODULES")) |text| {
+        deferred_text = text;
+        var parts = std.mem.splitScalar(u8, text, ';');
+        while (parts.next()) |part| {
+            const path = std.mem.trim(u8, part, " \t\r\n");
+            if (path.len != 0) try deferred_modules.append(allocator, path);
+        }
+    } else |_| {
+        // These Unity plug-ins are loaded explicitly after startup rather than
+        // through DT_NEEDED. Map them ahead of guest execution, while leaving
+        // their constructors deferred until LoadStartModule supplies the real
+        // argument block. The environment variable remains the override for
+        // uncommon title-specific modules.
+        try appendUnityDeferredModules(allocator, io, title_root, &deferred_modules);
+    }
+
     var graph = emu.loadModuleGraph(io, executable_path, .{
         .preload_modules = preload_modules.items,
+        .deferred_modules = deferred_modules.items,
+        .diagnostics = .{ .unresolved_fn = &reportUnresolvedImport },
     }) catch |err| {
         try stderr.print("cannot link {s}: {s}\n", .{ executable_path, @errorName(err) });
         try stderr.flush();
@@ -261,6 +311,9 @@ fn run(init: std.process.Init) !bool {
     const enable_vulkan_validation = init.minimal.environ.containsUnempty(allocator, "PS5_VULKAN_VALIDATION") catch false;
     const capture_first_graphics_frame = init.minimal.environ.containsUnempty(allocator, "PS5_CAPTURE_FIRST_FRAME") catch false;
     const force_probe_fragment = init.minimal.environ.containsUnempty(allocator, "PS5_PROBE_FRAGMENT_COLOR") catch false;
+    const force_probe_fragment_texture = init.minimal.environ.containsUnempty(allocator, "PS5_PROBE_FRAGMENT_TEXTURE") catch false;
+    const force_probe_fragment_parameter = init.minimal.environ.containsUnempty(allocator, "PS5_PROBE_FRAGMENT_PARAMETER") catch false;
+    const force_probe_fragment_ui = init.minimal.environ.containsUnempty(allocator, "PS5_PROBE_FRAGMENT_UI") catch false;
     const skip_compute_dispatches = init.minimal.environ.containsUnempty(allocator, "PS5_SKIP_COMPUTE") catch false;
     const translate_compute_only = init.minimal.environ.containsUnempty(allocator, "PS5_COMPUTE_TRANSLATE_ONLY") catch false;
     if (builtin.os.tag == .windows and !force_headless) live_gpu: {
@@ -279,6 +332,9 @@ fn run(init: std.process.Init) !bool {
             .enable_validation = enable_vulkan_validation,
             .capture_first_graphics_frame = capture_first_graphics_frame,
             .force_probe_fragment = force_probe_fragment,
+            .force_probe_fragment_texture = force_probe_fragment_texture,
+            .force_probe_fragment_parameter = force_probe_fragment_parameter,
+            .force_probe_fragment_ui = force_probe_fragment_ui,
             .skip_compute_dispatches = skip_compute_dispatches,
             .translate_compute_only = translate_compute_only,
             .native_window = .{

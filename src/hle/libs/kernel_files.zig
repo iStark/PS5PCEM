@@ -179,12 +179,23 @@ fn kernelGetdirentries(
 }
 
 /// Writing is refused for every descriptor the filesystem owns.
-fn kernelWrite(_: i32, _: ?[*]const u8, _: usize) callconv(abi.guest) i64 {
-    return KernelError.eacces.raw();
+fn kernelWrite(descriptor: i32, buffer: ?[*]const u8, length: usize) callconv(abi.guest) i64 {
+    const source = buffer orelse return KernelError.efault.raw();
+    if (length != 0 and !memory_api.isGuestRangeAccessible(@intFromPtr(source), length)) {
+        return KernelError.efault.raw();
+    }
+    const count = filesystem.write(descriptor, source[0..length]) catch |err| return kernelStatus(err);
+    return @intCast(count);
 }
 
 fn kernelPwrite(_: i32, _: ?[*]const u8, _: usize, _: i64) callconv(abi.guest) i64 {
     return KernelError.eacces.raw();
+}
+
+fn kernelMkdir(path: ?[*:0]const u8, _: u16) callconv(abi.guest) i32 {
+    const name = spanOf(path) orelse return KernelError.efault.raw();
+    filesystem.makeDirectory(name) catch |err| return kernelStatus(err);
+    return errno.ok;
 }
 
 fn readOnlyStatus(
@@ -241,6 +252,21 @@ fn posixClose(descriptor: i32) callconv(abi.guest) i64 {
     return 0;
 }
 
+fn posixWrite(descriptor: i32, buffer: ?[*]const u8, length: usize) callconv(abi.guest) i64 {
+    const source = buffer orelse return posixFail(Error.InvalidArgument);
+    if (length != 0 and !memory_api.isGuestRangeAccessible(@intFromPtr(source), length)) {
+        return posixFail(Error.InvalidArgument);
+    }
+    const count = filesystem.write(descriptor, source[0..length]) catch |err| return posixFail(err);
+    return @intCast(count);
+}
+
+fn posixMkdir(path: ?[*:0]const u8, _: u16) callconv(abi.guest) i64 {
+    const name = spanOf(path) orelse return posixFail(Error.InvalidArgument);
+    filesystem.makeDirectory(name) catch |err| return posixFail(err);
+    return 0;
+}
+
 fn posixRead(descriptor: i32, buffer: ?[*]u8, length: usize) callconv(abi.guest) i64 {
     const bytes = writableSlice(buffer, length) orelse return posixFail(Error.InvalidArgument);
     if (length == 0) return 0;
@@ -289,6 +315,7 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceKernelWrite", .function = trace.wrap("sceKernelWrite", &kernelWrite), .expect_id = "4wSze92BhLI" },
     .{ .name = "sceKernelPread", .function = trace.wrap("sceKernelPread", &kernelPread), .expect_id = "+r3rMFwItV4" },
     .{ .name = "sceKernelPwrite", .function = trace.wrap("sceKernelPwrite", &kernelPwrite), .expect_id = "nKWi-N2HBV4" },
+    .{ .name = "sceKernelMkdir", .function = trace.wrap("sceKernelMkdir", &kernelMkdir), .expect_id = "1-LFLmRFxxM" },
     .{ .name = "sceKernelLseek", .function = trace.wrap("sceKernelLseek", &kernelLseek), .expect_id = "oib76F-12fk" },
     .{ .name = "sceKernelStat", .function = trace.wrap("sceKernelStat", &kernelStat), .expect_id = "eV9wAD2riIA" },
     .{ .name = "sceKernelFstat", .function = trace.wrap("sceKernelFstat", &kernelFstat), .expect_id = "kBwCPsYX-m4" },
@@ -305,6 +332,9 @@ pub const exports = [_]symbols.Export{
     .{ .name = "_close", .function = trace.wrap("_close", &posixClose), .expect_id = "NNtFaKJbPt0" },
     .{ .name = "read", .function = trace.wrap("read", &posixRead), .expect_id = "AqBioC2vF3I" },
     .{ .name = "_read", .function = trace.wrap("_read", &posixRead), .expect_id = "DRuBt2pvICk" },
+    .{ .name = "write", .function = trace.wrap("write", &posixWrite), .expect_id = "FN4gaPmuFV8" },
+    .{ .name = "_write", .function = trace.wrap("_write", &posixWrite), .expect_id = "FxVZqBAA7ks" },
+    .{ .name = "mkdir", .function = trace.wrap("mkdir", &posixMkdir), .expect_id = "JGMio+21L4c" },
     .{ .name = "lseek", .function = trace.wrap("lseek", &posixLseek), .expect_id = "Oy6IpwgtYOk" },
     .{ .name = "stat", .function = trace.wrap("stat", &posixStat), .expect_id = "E6ao34wPw+U" },
     .{ .name = "fstat", .function = trace.wrap("fstat", &posixFstat), .expect_id = "mqQMh1zPPT8" },
@@ -405,7 +435,9 @@ test "writes are refused through every path" {
         KernelError.eacces.raw(),
         kernelOpen("/app0/data.bin", filesystem.O.wronly, 0),
     );
-    try testing.expectEqual(@as(i64, KernelError.eacces.raw()), kernelWrite(3, "x", 1));
+    const fd = kernelOpen("/app0/data.bin", filesystem.O.rdonly, 0);
+    defer _ = kernelClose(fd);
+    try testing.expectEqual(@as(i64, KernelError.eacces.raw()), kernelWrite(fd, "x", 1));
     try testing.expectEqual(KernelError.eacces.raw(), readOnlyStatus(0, 0, 0, 0, 0, 0));
 }
 
@@ -426,4 +458,6 @@ test "file exports register under published identifiers" {
     try testing.expect(db.findById("nKWi-N2HBV4", .function) != null);
     try testing.expect(db.findById("ih4CD9-gghM", .function) != null);
     try testing.expect(db.findByName("sceKernelOpen", .function) != null);
+    try testing.expect(db.findByName("sceKernelMkdir", .function) != null);
+    try testing.expect(db.findByName("write", .function) != null);
 }

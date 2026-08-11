@@ -595,8 +595,31 @@ fn resolveImport(raw_context: ?*anyopaque, import: *const loader.Import) ?u64 {
     if (resolveHleExact(context, import, symbol_type)) |address| return address;
 
     if (context.guest_exports.resolveById(import)) |address| return address;
-    const symbol = context.database.findById(import.id, symbol_type) orelse return null;
-    return symbol.address;
+    if (context.database.findById(import.id, symbol_type)) |symbol| return symbol.address;
+    return unsupportedServiceFunction(import);
+}
+
+/// Optional platform services expose many SDK-version-specific entry points.
+/// A title should still be able to load its own wrapper when this machine is
+/// offline, even if that wrapper references a newer function than our named
+/// table knows. Keep the fallback deliberately narrow and function-only: data
+/// objects and TLS require real storage and must never point at a callable
+/// refusal stub.
+fn unsupportedServiceFunction(import: *const loader.Import) ?u64 {
+    if (import.symbol_type != .func) return null;
+    const library = import.library orelse return null;
+
+    if (std.mem.startsWith(u8, library, "libSceNp") or
+        std.mem.eql(u8, library, "libSceGameUpdate") or
+        std.mem.eql(u8, library, "libScePlayerInvitationDialog") or
+        std.mem.eql(u8, library, "libSceNet"))
+    {
+        return @intFromPtr(&hle.libs.services.offline);
+    }
+    if (std.mem.eql(u8, library, "libSceJson2")) {
+        return @intFromPtr(&hle.libs.services.absent);
+    }
+    return null;
 }
 
 fn resolveTlsImport(
@@ -775,6 +798,34 @@ test "runtime resolves ordinary imports to mapped guest exports before HLE" {
         @as(?u64, 0x08_1234_5000),
         resolveImport(&context, &import),
     );
+}
+
+test "unknown optional service functions resolve to a typed refusal" {
+    const online_import = loader.Import{
+        .id = "unknown-nid",
+        .library = "libSceNpUtility",
+        .library_version = 1,
+        .module = "libSceNpUtility",
+        .library_code = "A",
+        .module_code = "A",
+        .symbol_type = .func,
+        .relocation_type = .jump_slot,
+        .table = .plt,
+        .target_offset = 0,
+        .addend = 0,
+    };
+    try testing.expectEqual(
+        @as(?u64, @intFromPtr(&hle.libs.services.offline)),
+        unsupportedServiceFunction(&online_import),
+    );
+
+    var object_import = online_import;
+    object_import.symbol_type = .object;
+    try testing.expectEqual(@as(?u64, null), unsupportedServiceFunction(&object_import));
+
+    var unrelated_import = online_import;
+    unrelated_import.library = "libkernel";
+    try testing.expectEqual(@as(?u64, null), unsupportedServiceFunction(&unrelated_import));
 }
 
 test "runtime prepares and identifies the initial guest thread" {

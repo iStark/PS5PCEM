@@ -19,6 +19,7 @@ const kernel_ioctl = @import("kernel_ioctl.zig");
 const agc_submit = @import("agc_submit.zig");
 const agc = @import("agc.zig");
 const agc_shader_registry = @import("agc_shader_registry.zig");
+const av_player = @import("av_player.zig");
 const gpu = @import("gpu");
 const apr = @import("../apr.zig");
 const filesystem = @import("../filesystem.zig");
@@ -871,62 +872,6 @@ const video_out_exports = [_]symbols.Export{
     .{ .name = "sceVideoOutSysAddSetModeEvent2", .function = trace.wrap("sceVideoOutSysAddSetModeEvent2", &videoHandleOption), .expect_id = "fYWVVDKZOCk" },
     .{ .name = "sceVideoOutGetBufferLabelAddress", .function = trace.wrap("sceVideoOutGetBufferLabelAddress", &videoOutGetBufferLabelAddress), .expect_id = "OcQybQejHEY" },
     .{ .name = "sceVideoOutGetPipelineStatus", .function = trace.wrap("sceVideoOutGetPipelineStatus", &videoOutGetPipelineStatus), .expect_id = "Ygv0S+Hi+hA" },
-};
-
-// Headless AV player ------------------------------------------------------
-
-var av_player_token: u8 = 0;
-
-fn avPlayerInitEx(_: ?*const anyopaque, handle: ?*?*anyopaque) callconv(abi.guest) i32 {
-    const output = handle orelse return invalid_argument;
-    output.* = &av_player_token;
-    std.debug.print("[avplayer] InitEx (stub: no FMV decode; title uses GPU path for attract)\n", .{});
-    return errno.ok;
-}
-
-fn validAvHandle(handle: ?*anyopaque) bool {
-    return handle == @as(*anyopaque, @ptrCast(&av_player_token));
-}
-
-fn avPlayerAction(handle: ?*anyopaque, _: u64, _: u64) callconv(abi.guest) i32 {
-    return if (validAvHandle(handle)) errno.ok else invalid_argument;
-}
-
-fn avPlayerNoFrame(handle: ?*anyopaque, _: ?*anyopaque) callconv(abi.guest) u8 {
-    // 0 = no frame/audio ready. Real FMV would need container decode; this
-    // title's boot sequence is GPU-drawn attract, not AvPlayer sources.
-    return if (validAvHandle(handle)) 0 else 0;
-}
-
-fn avPlayerStreamCount(handle: ?*anyopaque) callconv(abi.guest) i32 {
-    return if (validAvHandle(handle)) 0 else invalid_argument;
-}
-
-fn avPlayerClose(handle: ?*anyopaque) callconv(abi.guest) i32 {
-    return if (validAvHandle(handle)) errno.ok else invalid_argument;
-}
-
-const av_player_exports = [_]symbols.Export{
-    .{ .name = "sceAvPlayerInitEx", .function = trace.wrap("sceAvPlayerInitEx", &avPlayerInitEx), .expect_id = "o9eWRkSL+M4" },
-    .{ .name = "sceAvPlayerPostInit", .function = trace.wrap("sceAvPlayerPostInit", &avPlayerAction), .expect_id = "HD1YKVU26-M" },
-    .{ .name = "sceAvPlayerAddSourceEx", .function = trace.wrap("sceAvPlayerAddSourceEx", &avPlayerAction), .expect_id = "x8uvuFOPZhU" },
-    .{ .name = "sceAvPlayerStart", .function = trace.wrap("sceAvPlayerStart", &avPlayerAction), .expect_id = "ET4Gr-Uu07s" },
-    .{ .name = "sceAvPlayerStop", .function = trace.wrap("sceAvPlayerStop", &avPlayerAction), .expect_id = "ZC17w3vB5Lo" },
-    .{ .name = "sceAvPlayerPause", .function = trace.wrap("sceAvPlayerPause", &avPlayerAction), .expect_id = "9y5v+fGN4Wk" },
-    .{ .name = "sceAvPlayerResume", .function = trace.wrap("sceAvPlayerResume", &avPlayerAction), .expect_id = "w5moABNwnRY" },
-    .{ .name = "sceAvPlayerSetLooping", .function = trace.wrap("sceAvPlayerSetLooping", &avPlayerAction), .expect_id = "OVths0xGfho" },
-    .{ .name = "sceAvPlayerSetAvSyncMode", .function = trace.wrap("sceAvPlayerSetAvSyncMode", &avPlayerAction), .expect_id = "k-q+xOxdc3E" },
-    .{ .name = "sceAvPlayerSetAvailableBandwidth", .function = trace.wrap("sceAvPlayerSetAvailableBandwidth", &avPlayerAction), .expect_id = "N6Oy-EjduiY" },
-    .{ .name = "sceAvPlayerJumpToTime", .function = trace.wrap("sceAvPlayerJumpToTime", &avPlayerAction), .expect_id = "XC9wM+xULz8" },
-    .{ .name = "sceAvPlayerChangeStream", .function = trace.wrap("sceAvPlayerChangeStream", &avPlayerAction), .expect_id = "buMCiJftcfw" },
-    .{ .name = "sceAvPlayerEnableStream", .function = trace.wrap("sceAvPlayerEnableStream", &avPlayerAction), .expect_id = "ODJK2sn9w4A" },
-    .{ .name = "sceAvPlayerGetVideoDataEx", .function = trace.wrap("sceAvPlayerGetVideoDataEx", &avPlayerNoFrame), .expect_id = "JdksQu8pNdQ" },
-    .{ .name = "sceAvPlayerGetAudioData", .function = trace.wrap("sceAvPlayerGetAudioData", &avPlayerNoFrame), .expect_id = "Wnp1OVcrZgk" },
-    .{ .name = "sceAvPlayerGetStreamInfoEx", .function = trace.wrap("sceAvPlayerGetStreamInfoEx", &avPlayerAction), .expect_id = "ctTAcF5DiKQ" },
-    .{ .name = "sceAvPlayerStreamCount", .function = trace.wrap("sceAvPlayerStreamCount", &avPlayerStreamCount), .expect_id = "hdTyRzCXQeQ" },
-    .{ .name = "sceAvPlayerIsActive", .function = trace.wrap("sceAvPlayerIsActive", &avPlayerNoFrame), .expect_id = "UbQoYawOsfY" },
-    .{ .name = "sceAvPlayerClose", .function = trace.wrap("sceAvPlayerClose", &avPlayerClose), .expect_id = "NkJwDzKmIlw" },
-    .{ .name = "sceAvPlayerSetLogCallback", .function = trace.wrap("sceAvPlayerSetLogCallback", &success), .expect_id = "eBTreZ84JFY" },
 };
 
 // Offline platform peripherals and account services -----------------------
@@ -2059,7 +2004,7 @@ pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!voi
     try db.addLibrary(gpa, .{ .name = "libScePosix" }, .{ .name = "libkernel" }, &posix_exports);
     try db.addLibrary(gpa, .{ .name = "libSceRandom" }, .{ .name = "libSceRandom" }, &random_exports);
     try db.addLibrary(gpa, .{ .name = "libSceVideoOut" }, .{ .name = "libSceVideoOut" }, &video_out_exports);
-    try db.addLibrary(gpa, .{ .name = "libSceAvPlayer" }, .{ .name = "libSceAvPlayer", .version_minor = 0 }, &av_player_exports);
+    try db.addLibrary(gpa, .{ .name = "libSceAvPlayer" }, .{ .name = "libSceAvPlayer", .version_minor = 0 }, &av_player.exports);
     try db.addLibrary(gpa, .{ .name = "libSceAppContent" }, .{ .name = "libSceAppContentUtil" }, &app_content_exports);
     try db.addLibrary(gpa, .{ .name = "libSceNpManager" }, .{ .name = "libSceNpManager" }, &np_manager_exports);
     try db.addLibrary(gpa, .{ .name = "libSceRemoteplay" }, .{ .name = "libSceRemoteplay" }, &remoteplay_exports);

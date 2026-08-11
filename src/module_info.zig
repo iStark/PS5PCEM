@@ -272,6 +272,15 @@ pub fn main(init: std.process.Init) !void {
     }
 
     try out.print("\nexports ({d})\n", .{module_exports.items.len});
+    for (module_exports.items) |exp| {
+        try out.print("  0x{x:0>12}  {s}  {s}/{s}  {s}\n", .{
+            exp.address,
+            exp.id,
+            exp.module,
+            exp.library,
+            @tagName(exp.symbol_type),
+        });
+    }
 
     try out.print("\nimports ({d})\n", .{module_imports.items.items.len});
     var resolved: usize = 0;

@@ -707,8 +707,11 @@ pub const Layout = struct {
         if (image.image_type == .color_2d_msaa or image.image_type == .color_2d_msaa_array) {
             return Error.UnsupportedMultisample;
         }
-        if (image.base_level != 0 or image.last_level != 0 or
-            (image.extended and image.max_mip != 0)) return Error.UnsupportedMipChain;
+        // Staging only the top level is sufficient for a one-mip Vulkan view.
+        // The lower levels follow it in guest memory and do not affect the
+        // base-level tile layout. Non-zero base views still need explicit mip
+        // offset calculation and remain unsupported.
+        if (image.base_level != 0) return Error.UnsupportedMipChain;
 
         const element = elementLayoutForUnifiedFormat(image.unified_format) orelse
             return Error.UnsupportedFormat;

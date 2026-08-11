@@ -7,10 +7,10 @@
 //! paths: everything it ships lives under `/app0`. This maps those paths onto a
 //! host directory and hands out descriptors.
 //!
-//! Read-only for now. Writable mounts mean save data, which needs a location
-//! policy and a container format that do not exist yet — and a title that
-//! believes a write succeeded when nothing was stored is far worse off than one
-//! told plainly that the filesystem is read-only.
+//! Title content remains read-only. The one writable exception is `/devlog`, a
+//! console diagnostic mount redirected to the emulator's `out` directory. It
+//! cannot alter game data and lets Unity explain startup failures that would
+//! otherwise disappear with the console's debug logger.
 
 const std = @import("std");
 const audio_fs = @import("audio_fs.zig");
@@ -74,6 +74,19 @@ const device_nodes = [_]Device{ .graphics, .dip_switches, .random };
 /// block, and the distinction has no consequence — but a title asking for one
 /// name must not be told the other does not exist.
 const blocking_random_node = "/dev/random";
+const devlog_root = "/devlog";
+const devlog_app = "/devlog/app";
+const devlog_file = "/devlog/app/debug.log";
+const host_devlog_file = "out/guest-debug.log";
+
+fn isDevlogDirectory(path: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(path, devlog_root) or
+        std.ascii.eqlIgnoreCase(path, devlog_app);
+}
+
+fn isDevlogFile(path: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(path, devlog_file);
+}
 
 /// Fills a buffer from the entropy device, and says how much it wrote.
 ///
@@ -280,6 +293,13 @@ fn normalizedMountRelative(path: []const u8, storage: *[maximum_path]u8) ?[]cons
     return storage[0..written];
 }
 
+/// Returns a normalized path below the attached title root for host helpers
+/// which need to consume the same file through an external decoder. Parent
+/// segments remain clamped at the mount and drive-qualified paths are rejected.
+pub fn mountRelative(path: []const u8, storage: *[maximum_path]u8) ?[]const u8 {
+    return normalizedMountRelative(path, storage);
+}
+
 const OpenFile = struct {
     /// Null for a device node, which has no host file behind it.
     file: ?std.Io.File = null,
@@ -292,6 +312,10 @@ const OpenFile = struct {
     /// An offline POSIX socket. It owns only a descriptor slot; network
     /// operations decide whether to acknowledge local state or report ENETDOWN.
     virtual_socket: bool = false,
+    /// `/devlog/app/debug.log`, redirected outside the read-only title mount.
+    diagnostic_log: bool = false,
+    /// In-memory `/devlog` directory; it owns no host directory handle.
+    diagnostic_directory: bool = false,
     /// In-memory payload for synthesised files (FSB-backed virtual WAVs).
     /// Owned by this descriptor; freed on close via page_allocator.
     memory: ?[]u8 = null,
@@ -411,6 +435,12 @@ fn slotOf(descriptor: i32) ?*?OpenFile {
 /// Anything that would modify the filesystem is refused rather than ignored, so
 /// a title cannot proceed believing its data was stored.
 pub fn open(path: []const u8, flags: i32) Error!i32 {
+    if (isDevlogDirectory(path)) {
+        if (flags & O.directory == 0) return Error.IsDirectory;
+        return openDevlogDirectory(path);
+    }
+    if (isDevlogFile(path)) return openDevlog(path, flags);
+
     // Creation flags are refused everywhere, devices included: a title asking
     // to create `/dev/gc` has misunderstood something, and answering it would
     // hide that.
@@ -453,6 +483,58 @@ pub fn open(path: []const u8, flags: i32) Error!i32 {
         return first_descriptor + @as(i32, @intCast(index));
     }
     return Error.TooManyOpenFiles;
+}
+
+fn openDevlogDirectory(path: []const u8) Error!i32 {
+    table_lock.lock();
+    defer table_lock.unlock();
+    for (&open_files, 0..) |*slot, index| {
+        if (slot.* != null) continue;
+        var entry = OpenFile{ .diagnostic_directory = true, .directory_index = 0 };
+        entry.path_length = @min(path.len, maximum_path);
+        @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
+        slot.* = entry;
+        return first_descriptor + @as(i32, @intCast(index));
+    }
+    return Error.TooManyOpenFiles;
+}
+
+fn openDevlog(path: []const u8, flags: i32) Error!i32 {
+    const io = active_io orelse return Error.NotAttached;
+    if (flags & O.accmode == O.rdonly) return Error.ReadOnly;
+    const cwd = std.Io.Dir.cwd();
+    cwd.createDirPath(io, "out") catch return Error.IoFailed;
+    const truncate = flags & O.trunc != 0;
+    const file = cwd.createFile(io, host_devlog_file, .{
+        .read = flags & O.accmode == O.rdwr,
+        .truncate = truncate,
+    }) catch return Error.IoFailed;
+    errdefer file.close(io);
+    const size = if (truncate) 0 else file.length(io) catch return Error.IoFailed;
+
+    table_lock.lock();
+    defer table_lock.unlock();
+    for (&open_files, 0..) |*slot, index| {
+        if (slot.* != null) continue;
+        var entry = OpenFile{
+            .file = file,
+            .diagnostic_log = true,
+            .offset = if (flags & O.append != 0) size else 0,
+            .size = size,
+        };
+        entry.path_length = @min(path.len, maximum_path);
+        @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
+        slot.* = entry;
+        return first_descriptor + @as(i32, @intCast(index));
+    }
+    return Error.TooManyOpenFiles;
+}
+
+/// Accepts only the diagnostic directories; all title/save-data paths retain
+/// the read-only policy until a real writable mount is implemented.
+pub fn makeDirectory(path: []const u8) Error!void {
+    if (isDevlogDirectory(path)) return;
+    return Error.ReadOnly;
 }
 
 fn openDirectory(
@@ -604,7 +686,7 @@ pub fn read(descriptor: i32, buffer: []u8) Error!usize {
     const offset = slot.*.?.offset;
     const device = slot.*.?.device;
     const virtual_socket = slot.*.?.virtual_socket;
-    if (slot.*.?.directory != null) {
+    if (slot.*.?.directory != null or slot.*.?.diagnostic_directory) {
         table_lock.unlock();
         return Error.NotSupported;
     }
@@ -667,7 +749,7 @@ pub fn pread(descriptor: i32, buffer: []u8, offset: u64) Error!usize {
     };
     table_lock.unlock();
 
-    if (entry.directory != null) return Error.NotSupported;
+    if (entry.directory != null or entry.diagnostic_directory) return Error.NotSupported;
     if (entry.memory) |memory| {
         if (offset >= memory.len) return 0;
         const available = memory.len - offset;
@@ -685,6 +767,39 @@ pub fn pread(descriptor: i32, buffer: []u8, offset: u64) Error!usize {
     return file.readPositionalAll(io, buffer, offset) catch Error.IoFailed;
 }
 
+/// Writes only to the redirected diagnostic descriptor. Reserving the range
+/// under the table lock makes concurrent Unity logging positional and prevents
+/// two messages from overwriting one another.
+pub fn write(descriptor: i32, buffer: []const u8) Error!usize {
+    if (buffer.len == 0) return 0;
+    const io = active_io orelse return Error.NotAttached;
+
+    table_lock.lock();
+    const slot = slotOf(descriptor) orelse {
+        table_lock.unlock();
+        return Error.BadDescriptor;
+    };
+    const entry = if (slot.*) |*value| value else {
+        table_lock.unlock();
+        return Error.BadDescriptor;
+    };
+    if (!entry.diagnostic_log) {
+        table_lock.unlock();
+        return Error.ReadOnly;
+    }
+    const file = entry.file orelse {
+        table_lock.unlock();
+        return Error.BadDescriptor;
+    };
+    const offset = entry.offset;
+    entry.offset +|= buffer.len;
+    entry.size = @max(entry.size, entry.offset);
+    table_lock.unlock();
+
+    file.writePositionalAll(io, buffer, offset) catch return Error.IoFailed;
+    return buffer.len;
+}
+
 pub fn seek(descriptor: i32, offset: i64, whence: i32) Error!i64 {
     table_lock.lock();
     defer table_lock.unlock();
@@ -692,7 +807,7 @@ pub fn seek(descriptor: i32, offset: i64, whence: i32) Error!i64 {
     const slot = slotOf(descriptor) orelse return Error.BadDescriptor;
     const entry = if (slot.*) |*value| value else return Error.BadDescriptor;
     // A device has no contents to hold a position in.
-    if (entry.device != null or entry.directory != null) return Error.NotSupported;
+    if (entry.device != null or entry.directory != null or entry.diagnostic_directory) return Error.NotSupported;
 
     const base: i64 = switch (whence) {
         Seek.set => 0,
@@ -728,6 +843,16 @@ fn fillDeviceStat(out: *Stat) void {
 }
 
 pub fn stat(path: []const u8, out: *Stat) Error!void {
+    if (isDevlogDirectory(path)) {
+        fillStat(out, 0, true);
+        out.mode = mode_ifdir | mode_read_write;
+        return;
+    }
+    if (isDevlogFile(path)) {
+        fillStat(out, 0, false);
+        out.mode = mode_ifreg | mode_read_write;
+        return;
+    }
     if (deviceForPath(path) != null) {
         fillDeviceStat(out);
         return;
@@ -762,7 +887,8 @@ pub fn fstat(descriptor: i32, out: *Stat) Error!void {
         fillDeviceStat(out);
         return;
     }
-    fillStat(out, entry.size, entry.directory != null);
+    fillStat(out, entry.size, entry.directory != null or entry.diagnostic_directory);
+    if (entry.diagnostic_log) out.mode = mode_ifreg | mode_read_write;
 }
 
 fn directoryEntryHash(name: []const u8) u32 {
@@ -784,7 +910,7 @@ pub fn getDents(descriptor: i32, buffer: []u8, base_position: ?*u64) Error!usize
     defer table_lock.unlock();
     const slot = slotOf(descriptor) orelse return Error.BadDescriptor;
     const entry = if (slot.*) |*value| value else return Error.BadDescriptor;
-    if (entry.directory == null) return Error.InvalidArgument;
+    if (entry.directory == null and !entry.diagnostic_directory) return Error.InvalidArgument;
     if (base_position) |position| position.* = entry.directory_index;
 
     var kind: std.Io.File.Kind = .directory;
@@ -792,6 +918,12 @@ pub fn getDents(descriptor: i32, buffer: []u8, base_position: ?*u64) Error!usize
         0 => ".",
         1 => "..",
         else => blk: {
+            if (entry.diagnostic_directory) {
+                const child = if (std.ascii.eqlIgnoreCase(entry.path(), devlog_root)) "app" else "debug.log";
+                if (entry.directory_index > 2) return 0;
+                kind = if (std.ascii.eqlIgnoreCase(entry.path(), devlog_root)) .directory else .file;
+                break :blk child;
+            }
             const iterator = if (entry.directory_iterator) |*value| value else return Error.IoFailed;
             const child = iterator.next(io) catch return Error.IoFailed;
             const found = child orelse return 0;
@@ -875,6 +1007,14 @@ test "device paths are recognised however they are spelled" {
     try testing.expect(deviceForPath("/dev/gcx") == null);
     try testing.expect(deviceForPath("/dev/") == null);
     try testing.expect(deviceForPath("/app0/dev/gc") == null);
+}
+
+test "devlog directories exist without making title content writable" {
+    var info: Stat = undefined;
+    try stat("/devlog", &info);
+    try testing.expect(info.mode & mode_ifdir != 0);
+    try makeDirectory("/devlog/app");
+    try testing.expectError(Error.ReadOnly, makeDirectory("/app0/save"));
 }
 
 test "a device opens without a mount and is not a file" {

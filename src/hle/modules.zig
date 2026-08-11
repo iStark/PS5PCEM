@@ -13,6 +13,7 @@
 //! Registered by the runtime once loading finishes; nothing here owns memory.
 
 const std = @import("std");
+const abi = @import("abi.zig");
 
 /// Handle of the main executable. Titles treat this value as the process
 /// image and never expect it to be handed out for a library.
@@ -28,18 +29,43 @@ pub const Module = struct {
     /// Registration id of the exports owned by this mapped image. Zero means
     /// the image publishes no dynamic symbols.
     export_module_id: u64 = 0,
+    /// Entry points held until sceKernelLoadStartModule supplies the plug-in's
+    /// actual argument block.
+    init_functions: []const u64 = &.{},
+    deferred_start: bool = false,
+    start_state: std.atomic.Value(u8) = .init(0),
 
     pub fn contains(self: Module, address: u64) bool {
         return address >= self.start and address < self.end;
     }
+
+    /// Starts a deferred native module in the calling guest thread. A direct
+    /// System V call is intentional: LoadStartModule is already executing
+    /// inside the dispatcher's protected guest boundary, so recursively
+    /// entering the dispatcher would reject the active execution.
+    pub fn startDeferred(self: *Module, args_size: u64, args: u64) i32 {
+        if (!self.deferred_start) return 0;
+        if (self.start_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) return 0;
+        defer self.start_state.store(2, .release);
+
+        const Entry = *const fn (u64, u64, u64) callconv(abi.guest) u64;
+        var result: u64 = 0;
+        for (self.init_functions) |address| {
+            if (address == 0) continue;
+            const entry: Entry = @ptrFromInt(address);
+            result = entry(args_size, args, 0);
+        }
+        return @bitCast(@as(u32, @truncate(result)));
+    }
 };
 
-var modules: []const Module = &.{};
+var empty_modules: [0]Module = .{};
+var modules: []Module = &empty_modules;
 pub const ResolveExportFn = *const fn (*anyopaque, u64, []const u8) ?u64;
 var export_resolver_context: ?*anyopaque = null;
 var export_resolver: ?ResolveExportFn = null;
 
-pub fn attach(value: []const Module) void {
+pub fn attach(value: []Module) void {
     modules = value;
 }
 
@@ -49,7 +75,7 @@ pub fn attachExportResolver(context: *anyopaque, resolver: ResolveExportFn) void
 }
 
 pub fn detach() void {
-    modules = &.{};
+    modules = &empty_modules;
     export_resolver_context = null;
     export_resolver = null;
 }
@@ -58,14 +84,14 @@ pub fn count() usize {
     return modules.len;
 }
 
-pub fn findByHandle(handle: i32) ?*const Module {
+pub fn findByHandle(handle: i32) ?*Module {
     for (modules) |*module| {
         if (module.handle == handle) return module;
     }
     return null;
 }
 
-pub fn findByAddress(address: u64) ?*const Module {
+pub fn findByAddress(address: u64) ?*Module {
     for (modules) |*module| {
         if (module.contains(address)) return module;
     }
@@ -129,7 +155,7 @@ fn baseName(path: []const u8) []const u8 {
 /// The relative path is tried first so that two modules sharing a file name
 /// stay distinguishable; a base-name match is the fallback for titles that
 /// name a module without its directory.
-pub fn findByPath(guest_path: []const u8) ?*const Module {
+pub fn findByPath(guest_path: []const u8) ?*Module {
     if (guest_path.len == 0) return null;
     const wanted = stripMount(guest_path);
     if (wanted.len == 0) return null;
@@ -149,7 +175,16 @@ pub fn findByPath(guest_path: []const u8) ?*const Module {
 
 const testing = std.testing;
 
-const sample = [_]Module{
+var test_start_calls: usize = 0;
+var test_start_args: [3]u64 = .{ 0, 0, 0 };
+
+fn testStartEntry(args_size: u64, args: u64, reserved: u64) callconv(abi.guest) u64 {
+    test_start_calls += 1;
+    test_start_args = .{ args_size, args, reserved };
+    return 0xffff_ffff_89ab_cdef;
+}
+
+var sample = [_]Module{
     .{
         .handle = executable_handle,
         .path = "eboot.bin",
@@ -210,7 +245,7 @@ test "a bare file name still resolves" {
 }
 
 test "the full path wins over a matching base name" {
-    const ambiguous = [_]Module{
+    var ambiguous = [_]Module{
         .{ .handle = 1, .path = "a\\shared.prx", .load_bias = 0, .start = 0, .end = 1 },
         .{ .handle = 2, .path = "b\\shared.prx", .load_bias = 0, .start = 1, .end = 2 },
     };
@@ -239,4 +274,25 @@ test "handles and addresses resolve" {
 
     try testing.expectEqual(@as(i32, 2), findByAddress(0x8016e8100).?.handle);
     try testing.expect(findByAddress(0) == null);
+}
+
+test "a deferred module starts once with the loader argument block" {
+    test_start_calls = 0;
+    test_start_args = .{ 0, 0, 0 };
+    const initializers = [_]u64{@intFromPtr(&testStartEntry)};
+    var module = Module{
+        .handle = 7,
+        .path = "plugin.prx",
+        .load_bias = 0x1000,
+        .start = 0x1000,
+        .end = 0x2000,
+        .init_functions = &initializers,
+        .deferred_start = true,
+    };
+
+    try testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x89ab_cdef))), module.startDeferred(0x34, 0x1234));
+    try testing.expectEqual(@as(usize, 1), test_start_calls);
+    try testing.expectEqual([3]u64{ 0x34, 0x1234, 0 }, test_start_args);
+    try testing.expectEqual(@as(i32, 0), module.startDeferred(1, 2));
+    try testing.expectEqual(@as(usize, 1), test_start_calls);
 }

@@ -390,6 +390,9 @@ pub const RenderState = struct {
     raster: RasterState,
     blends: [color_target_count]BlendControl,
     color_control: ColorControl,
+    /// VGT_PRIMITIVE_TYPE from the uconfig register bank. AGC uses value 7
+    /// for the NGG rectangle-list auto draws that back fullscreen passes.
+    primitive_type: u32 = 4,
 };
 
 pub fn decodeBufferDescriptor(words: []const u32) Error!BufferDescriptor {
@@ -545,6 +548,7 @@ pub fn decodeRenderState(state: *const gpu_state.State) RenderState {
         .raster = decodeRasterState(state),
         .blends = decodeBlendControls(state),
         .color_control = decodeColorControl(state),
+        .primitive_type = state.readRegister(.uconfig, 0x242) orelse 4,
     };
     for (0..color_target_count) |slot| {
         const target = decodeColorTarget(state, @intCast(slot), target_mask) orelse continue;
@@ -927,6 +931,7 @@ test "sampler descriptors normalize fixed-point lod values" {
 
 test "render state decodes PS5 color and depth target extensions" {
     var state = gpu_state.State{};
+    try state.writeRegister(.uconfig, 0x242, 7);
     const color_address: u64 = 0x00ab_cdef_1200;
     try state.writeRegister(.context, 0x318, @truncate(color_address >> 8));
     try state.writeRegister(.context, 0x319, 239);
@@ -1010,6 +1015,7 @@ test "render state decodes PS5 color and depth target extensions" {
     try testing.expectEqual(@as(u5, 5), render.blends[0].color_destination);
     try testing.expectEqual(@as(u3, 1), render.color_control.mode);
     try testing.expectEqual(@as(u8, 0xcc), render.color_control.logic_operation);
+    try testing.expectEqual(@as(u32, 7), render.primitive_type);
 }
 
 test "inline user-data decoding is stage-relative and complete" {

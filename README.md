@@ -22,7 +22,9 @@ If you would like to support continued PS5PCEM development, you can do so on
 - Native guest execution is available on Windows x86-64; inspection, decoding,
   and HLE components also build on Linux and macOS.
 - Live VideoOut reaches a Vulkan swapchain, while host audio accepts decoded
-  guest buffers at 48 kHz.
+  guest buffers at 48 kHz. SceAvPlayer uses FFmpeg for H.264/AAC media and
+  returns synchronized NV12 video plus stereo PCM through the title's own
+  allocation and file callbacks.
 - A native Windows launcher selects a title directory, persists sound and input
   profiles, and starts `game-run` with XInput, keyboard, or hybrid controls.
 - Guest vertex and pixel shaders can render sampled textures using AGC vertex
@@ -41,6 +43,9 @@ If you would like to support continued PS5PCEM development, you can do so on
 - Title plugins can be mapped explicitly before execution; later
   `sceKernelLoadStartModule` calls receive stable handles and
   `sceKernelDlsym` resolves readable export names inside the selected PRX.
+- Unity plug-ins may also be mapped with deferred constructors, so
+  `sceKernelLoadStartModule` can start them once with the title's real argument
+  block instead of running them prematurely during graph initialization.
 - Terminator 2D now reaches gameplay with the intended color balance, textured
   backgrounds, characters, and UI. Its publisher logo screens render exactly as
   on the console: the sprite batcher's solid fills are honored, so the logos sit
@@ -91,6 +96,13 @@ sampled-texture, render-target, and Vulkan presentation paths. Texture alpha,
 component swizzles, and sRGB sampling now preserve the title's intended color
 balance.*
 
+![The Precinct Kwalee video frame rendered by PS5PCEM](docs/images/precinct-kwalee.png)
+
+*A decoded 3840x2160 H.264 frame from The Precinct's Kwalee intro, converted by
+the guest pixel shader from the NV12 planes returned by SceAvPlayer and
+presented through the normal Vulkan VideoOut path. Audio from the same media is
+delivered as synchronized 48 kHz stereo PCM.*
+
 *The current Tetris Effect capture is not presented as gameplay: it is a
 uniform light-gray first guest framebuffer. A title screenshot will be added
 when the emulator produces recognizable scene content.*
@@ -107,7 +119,7 @@ the repository contains none of that content.
 | **Pistol Whip** | Maps the native PS VR2 plugin and Burst module, then starts loading Unity asset archives | Headset, tracking, controller, and host OpenXR support are intentionally deferred |
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
 | **Tetris Effect: Connected** | Completes Unreal filesystem/config bootstrap, executes compact typed UAV clears and 3D volume uploads, translates two 344/125-instruction volume dispatches with recursively recovered V# chains, and translates the complete 176-instruction mixed-image/LDS prepass, including compute `image_sample_lz` at PC `0x29c` and NSA `image_store` at PC `0x440`; its 2,401-instruction deferred compositor writes all 8,294,400 pixels of the 3840×2160 scanout | The first repeatable guest framebuffer is uniform light gray rather than a recognizable scene; a normal run currently produces an NVIDIA GPU fault during an earlier `15×9×8` dispatch, while NGG export and some image forms remain incomplete and the 512 GiB reservation can depend on host address-space placement |
-| **The Precinct** | Links the complete six-image guest graph, enters Unity, initializes AudioOut and the asset-backed audio index, reports the baseline PS5 operation mode, uploads the 1920×1080 `RGBA16_FLOAT` sampled surface, builds the first guest graphics pipelines, and sustains a warmed-up 14–19 ms frame loop on the current test host | The captured scanout is still black; one early color-target pre-pass is unsupported and the rendered scene source is not yet populated correctly |
+| **The Precinct** | Links the complete six-image guest graph, defers and starts Unity plug-ins through `sceKernelLoadStartModule`, enters Unity, indexes its audio assets, and plays both observed intro movies through the new SceAvPlayer path. The title receives synchronized 3840×2160 NV12 video and 48 kHz stereo PCM; its guest YUV conversion shader produces the recognizable Kwalee frame above. Post-video graphics continue through seven draws and nine dispatches per frame, with warmed-up frames around 20–22 ms on the current RTX 3070 Ti test host | The post-video scene source is still incorrect: draw 1 receives a sparse/corrupted pixel strip, draw 2 copies it to the scanout, and later UI draws do not restore a recognizable scene. Gameplay is not claimed yet |
 
 ## Components
 
@@ -1443,11 +1455,22 @@ sample sidebands are preserved. ATRAC9 output supports signed 16-bit, signed
 32-bit, float, and planar layouts; M4AAC remains unsupported and is rejected
 instead of being reported as successful silent PCM. FSB-backed fallback
 previews are resampled to the 48 kHz host mix, use short de-click envelopes,
-and drain once; they are never looped as a substitute for missing codec output.
-The additional early-bootstrap
-surface in [src/hle/libs/bootstrap_services.zig](src/hle/libs/bootstrap_services.zig)
-provides AvPlayer state and conservative platform/GPU command stubs for native
-title initialization. VideoOut is no longer only a headless counter: it retains
+and drain once. Direct fallback mixing is disabled by default because replaying
+a clip beside the title's real AudioOut/AJM mix is heard as echo; it remains
+available explicitly with `PS5_AUDIO_FALLBACK_MIX=1`.
+
+[src/hle/libs/av_player.zig](src/hle/libs/av_player.zig) implements the
+SceAvPlayer lifecycle, callback-based file input and title-owned allocations.
+FFmpeg probes and decodes container media into source-resolution NV12 video and
+interleaved signed 16-bit, 48 kHz stereo PCM. Video and audio have independent
+locks and buffered decoder processes, playback timestamps share one monotonic
+clock, pause/seek/loop/end-of-stream state is retained, and the software-decoder
+ABI reports aligned pitch, allocation height, and visible crop consistently.
+
+The additional early-bootstrap surface in
+[src/hle/libs/bootstrap_services.zig](src/hle/libs/bootstrap_services.zig)
+provides conservative platform/GPU command stubs for native title
+initialization. VideoOut is no longer only a headless counter: it retains
 up to sixteen registered display allocations and four attribute groups,
 publishes the contiguous sixteen-label ABI used by the driver, accepts the
 blank `-1` flip used during startup, and delivers completed flips through the
@@ -1462,11 +1485,13 @@ A title hands over one buffer of samples at a time and expects the call to take
 about as long as the sound lasts, because that is how it keeps time with audio.
 That wait now comes from a host device making room for the next buffer rather
 than from a sleep, so the clock is the real one and the samples are heard
-instead of discarded. Four buffers stay in flight: one is not enough, because
+instead of discarded. Eight buffers stay in flight: one is not enough, because
 the device runs dry between finishing a buffer and the title handing over the
-next. At the common 256-frame/48 kHz configuration this provides about 21 ms
-of scheduling margin, and actual underruns are reported separately from device
-failures.
+next. At the common 256-frame/48 kHz configuration this provides about 43 ms
+of scheduling margin, enough to absorb ordinary Windows jitter and short shader
+compilation stalls. Actual underruns are reported separately from device
+failures, and access to the single host device is serialized across guest audio
+threads.
 
 One port is audible, because there is one pair of speakers. A title opens a main
 output port and often others besides; letting each claim the device would
@@ -1767,6 +1792,19 @@ scheduler and Vulkan backend. Observed startup work now includes:
 - Indexed draws can emit AGC `SetIndexSize` as a real `INDEX_TYPE` packet, and
   deleting a vblank event now removes the corresponding VideoOut queue
   registration instead of returning placeholder success.
+- SceAvPlayer now consumes media through the guest's file callbacks, invokes
+  FFmpeg for container/H.264/AAC decoding, and returns double-buffered NV12 plus
+  PCM from title-owned allocations. The Precinct plays both observed intro
+  movies with synchronized sound; its guest YUV shader converts the 4K planes
+  and the normal VideoOut path presents a recognizable Kwalee logo. After the
+  movies, the title settles at roughly 20–22 ms per frame on the current test
+  host. The remaining visual fault begins before the compositor: the first
+  post-video draw receives a sparse/corrupted scene source, which is then copied
+  faithfully to the display target.
+- The writable `/devlog/app/debug.log` console path is redirected to
+  `out/guest-debug.log` without making `/app0` writable. Unity diagnostics can
+  therefore survive startup failures while title content retains its read-only
+  mount policy.
 
 Near-null object probes in managed code
 (`cmp [obj+disp], 0` with `obj == null`) are stepped past so the title can take

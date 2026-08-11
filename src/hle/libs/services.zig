@@ -64,6 +64,25 @@ pub fn accept(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest
     return errno.ok;
 }
 
+/// There is no host save-data dialog yet, so an opened dialog is considered
+/// dismissed by the time the title polls it.  Returning FINISHED avoids the
+/// Unity save plug-in waiting forever for UI that cannot be displayed.
+pub fn saveDataDialogFinished(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return 3;
+}
+
+/// A headless dialog can always be serviced immediately.
+pub fn saveDataDialogReady(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return 1;
+}
+
+/// Save-data event queues are empty until persistent storage is implemented.
+/// This is the platform's normal NOT_FOUND/no-event result, not ENOSYS, and is
+/// therefore safe for polling workers.
+pub fn saveDataNoEvent(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return @bitCast(@as(u32, 0x809f0008));
+}
+
 const table = @import("services_table.zig");
 
 pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {

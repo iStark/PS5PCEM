@@ -11,6 +11,7 @@
 //! real game samples while the title's mixer is still empty.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// Set to true to enable verbose per-frame audio debug logging.
 const log_verbose_audio = false;
@@ -68,6 +69,32 @@ var mix_count: usize = 0;
 var mix_live: std.atomic.Value(bool) = .init(false);
 var preseed_done: bool = false;
 var mix_queue_opens: std.atomic.Value(u32) = .init(0);
+var fallback_mix_enabled: ?bool = null;
+
+extern "kernel32" fn GetEnvironmentVariableA(
+    name: [*:0]const u8,
+    buffer: ?[*]u8,
+    size: u32,
+) callconv(.winapi) u32;
+
+/// Direct host mixing predates the real AudioOut/AJM path and is useful only
+/// as an explicit compatibility fallback. Enabling it for every title can play
+/// a virtual clip once here and again later through Unity's mixer, perceived as
+/// an echo. Keep accurate guest-driven audio as the default.
+fn hostFallbackMixEnabled() bool {
+    if (fallback_mix_enabled) |enabled| return enabled;
+    var enabled = false;
+    if (comptime builtin.os.tag == .windows) {
+        var buffer: [8]u8 = undefined;
+        const length = GetEnvironmentVariableA("PS5_AUDIO_FALLBACK_MIX", &buffer, buffer.len);
+        if (length > 0 and length < buffer.len) {
+            enabled = buffer[0] != '0' and buffer[0] != 'n' and buffer[0] != 'N';
+        }
+    }
+    fallback_mix_enabled = enabled;
+    if (enabled) std.debug.print("[audio_fs] direct fallback mix enabled\n", .{});
+    return enabled;
+}
 
 fn mixLock() void {
     while (!mix_lock.tryLock()) std.atomic.spinLoopHint();
@@ -95,6 +122,7 @@ fn pushStereoSampleLocked(left: f32, right: f32) void {
 
 /// Call from VideoOut flip completion so host SFX start with the picture.
 pub fn noteFirstPresent() void {
+    if (!hostFallbackMixEnabled()) return;
     const was = mix_live.swap(true, .monotonic);
     if (!was) {
         if (log_verbose_audio) std.debug.print("[audio_fs] host mix live (first present)\n", .{});
@@ -867,12 +895,15 @@ pub fn reset() void {
     mix_live.store(false, .monotonic);
     preseed_done = false;
     mix_queue_opens.store(0, .monotonic);
+    fallback_mix_enabled = null;
 }
 
 test "host fallback resamples 44.1 kHz PCM and never replays drained audio" {
     reset();
     defer reset();
-    noteFirstPresent();
+    // Exercise the opt-in mixer directly; environment policy is not part of
+    // the resampler contract under test.
+    mix_live.store(true, .monotonic);
 
     // Ten milliseconds of non-zero stereo PCM at 44.1 kHz becomes exactly
     // 480 frames / 960 interleaved samples in the 48 kHz host ring.
@@ -903,7 +934,7 @@ test "FSB5 PCM sample word carries rate channels and decoded length" {
 test "host fallback envelope reaches silence at both clip boundaries" {
     reset();
     defer reset();
-    noteFirstPresent();
+    mix_live.store(true, .monotonic);
 
     var pcm: [600 * 2]i16 = @splat(20_000);
     try std.testing.expect(queuePcm16ForHostMix(std.mem.sliceAsBytes(&pcm), 2, 48_000));

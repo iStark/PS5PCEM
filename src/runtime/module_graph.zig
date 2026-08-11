@@ -22,6 +22,11 @@ pub const Options = struct {
     /// current runtime still performs graph construction as one safe phase.
     /// Entries may be paths relative to the executable or just basenames.
     preload_modules: []const []const u8 = &.{},
+    /// Modules that must be mapped and relocated up front, but whose entry
+    /// points are invoked only when the guest calls sceKernelLoadStartModule.
+    /// Unity native plug-ins receive their startup argument through that call
+    /// and are not valid during the process' dependency initialization phase.
+    deferred_modules: []const []const u8 = &.{},
     diagnostics: ?Diagnostics = null,
 };
 
@@ -46,6 +51,7 @@ pub const Module = struct {
     image: loader.Image,
     dynamic_info: loader.DynamicInfo,
     dependencies: std.ArrayList(usize) = .empty,
+    deferred_start: bool = false,
     prepared: ?loader.PreparedImage = null,
     mapped: ?loader.MappedImage = null,
 
@@ -231,6 +237,8 @@ pub const ModuleGraph = struct {
                 .start = start,
                 .end = end,
                 .export_module_id = if (mapped.guest_export_module) |module| module.id else 0,
+                .init_functions = mapped.init_functions.items,
+                .deferred_start = node.deferred_start,
             });
         }
 
@@ -338,6 +346,24 @@ pub fn loadFromDir(
         try appendDependency(&graph, graph.root_index, dependency);
     }
 
+    // Native plug-ins are still part of the mapped graph so their relocations,
+    // exports and unwind information are ready before concurrent guest code
+    // begins. Their constructors are deliberately held back: LoadStartModule
+    // supplies an argument block that Unity plug-ins commonly require.
+    for (options.deferred_modules) |requested| {
+        const candidate_index = findCandidate(candidates.items, requested, true) orelse
+            return error.FileNotFound;
+        const dependency = try ensureNode(
+            &graph,
+            io,
+            directory,
+            candidates.items[candidate_index].path,
+            options.maximum_file_size,
+        );
+        graph.nodes.items[dependency].deferred_start = true;
+        try appendDependency(&graph, graph.root_index, dependency);
+    }
+
     // Iterating a growing list is the graph-discovery queue. Each path is
     // parsed at most once, while duplicate dependency declarations become one
     // edge to the existing node.
@@ -385,6 +411,7 @@ pub fn loadFromDir(
 
     try graph.module_images.ensureTotalCapacity(gpa, graph.initialization_order.items.len);
     for (graph.initialization_order.items) |index| {
+        if (graph.nodes.items[index].deferred_start) continue;
         graph.module_images.appendAssumeCapacity(&graph.nodes.items[index].mapped.?);
     }
     return graph;
@@ -700,6 +727,43 @@ test "a needed module is discovered recursively and initialized before the execu
     try testing.expectEqualStrings("leaf.prx", graph.nodes.items[2].path);
     try testing.expect(graph.modules()[0] == &graph.nodes.items[2].mapped.?);
     try testing.expect(graph.modules()[1] == &graph.nodes.items[1].mapped.?);
+}
+
+test "a deferred module is linked but omitted from process initialization" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var plugin = try minimalImage(testing.allocator, .sce_dynamic, null);
+    defer plugin.deinit(testing.allocator);
+    var executable = try minimalImage(testing.allocator, .sce_dynexec, null);
+    defer executable.deinit(testing.allocator);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "eboot.bin", .data = executable.bytes() });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "plugin.prx", .data = plugin.bytes() });
+
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    var tls_registry = loader.TlsRegistry{};
+    defer tls_registry.deinit(testing.allocator);
+    var guest_exports = loader.GuestExportRegistry{};
+    defer guest_exports.deinit(testing.allocator);
+
+    var graph = try loadFromDir(
+        testing.allocator,
+        testing.io,
+        tmp.dir,
+        "eboot.bin",
+        &address_space,
+        &tls_registry,
+        &guest_exports,
+        null,
+        .{ .deferred_modules = &.{"plugin.prx"} },
+    );
+    defer graph.deinit();
+
+    try testing.expectEqual(@as(usize, 1), graph.moduleCount());
+    try testing.expectEqual(@as(usize, 0), graph.modules().len);
+    try testing.expect(graph.nodes.items[1].deferred_start);
+    try testing.expect(graph.nodes.items[1].mapped != null);
 }
 
 test "the symbol map covers every mapped module" {

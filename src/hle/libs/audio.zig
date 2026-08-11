@@ -109,6 +109,17 @@ const LegacyPort = struct {
 /// nothing.
 var device: audio_device.Device = .{};
 var device_owner: i32 = -1;
+var device_mutex: std.Io.Mutex = .init;
+
+fn lockDevice() ?std.Io {
+    const io = filesystem.attachedIo() orelse return null;
+    device_mutex.lockUncancelable(io);
+    return io;
+}
+
+fn unlockDevice(io: std.Io) void {
+    device_mutex.unlock(io);
+}
 
 /// Tries to make a port audible, and says whether it worked.
 ///
@@ -117,6 +128,8 @@ var device_owner: i32 = -1;
 /// not take the format it asked for — those are facts about this machine, not
 /// about the title.
 fn claimDevice(handle: i32, port: LegacyPort) bool {
+    const io = lockDevice() orelse return false;
+    defer unlockDevice(io);
     if (device_owner != -1) return false;
     if (audioDisabled()) {
         std.debug.print("[audio] host output disabled by launcher\n", .{});
@@ -146,6 +159,8 @@ fn claimDevice(handle: i32, port: LegacyPort) bool {
 }
 
 fn releaseDevice(handle: i32) void {
+    const io = lockDevice() orelse return;
+    defer unlockDevice(io);
     if (device_owner != handle) return;
     device.close();
     device_owner = -1;
@@ -382,7 +397,16 @@ fn audioOutOutput(handle: i32, data: ?*const anyopaque) callconv(abi.guest) i32 
                     }
                 }
             }
-            if (device.play(play_slice)) |_| {
+            const io = lockDevice() orelse {
+                pace(port.frames, port.frequency);
+                return errno.ok;
+            };
+            const play_result = if (device_owner == handle)
+                device.play(play_slice)
+            else
+                audio_device.Error.DeviceUnavailable;
+            unlockDevice(io);
+            if (play_result) |_| {
                 const n = audio_out_play_ok.fetchAdd(1, .monotonic);
                 if (n < 3 or n % 1000 == 0 or (peak > 8 and n < 20)) {
                     if (log_verbose_audio) std.debug.print(

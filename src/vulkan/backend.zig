@@ -132,6 +132,16 @@ pub const Options = struct {
     /// Replaces translated guest pixel shaders with an opaque diagnostic
     /// colour while retaining the guest target and pipeline state.
     force_probe_fragment: bool = false,
+    /// Replaces a guest pixel shader with a minimal sample from its first T#/S#
+    /// binding. This separates texture staging/sampling from guest PS ALU.
+    force_probe_fragment_texture: bool = false,
+    /// Displays PARAM0 directly, separating vertex export/interpolation from
+    /// fragment texture sampling and ALU.
+    force_probe_fragment_parameter: bool = false,
+    /// Samples with PARAM1.xy and multiplies by PARAM0. This mirrors the common
+    /// Unity UI pixel path while omitting its constant-buffer and packed-export
+    /// tail, making those two halves independently diagnosable.
+    force_probe_fragment_ui: bool = false,
     /// Diagnostic fast path for graphics bring-up. Command processing and
     /// draws continue, but guest compute dispatches are not submitted.
     skip_compute_dispatches: bool = false,
@@ -537,7 +547,10 @@ const maximum_guest_buffers = maximum_storage_descriptors;
 pub const maximum_storage_descriptors = 64;
 const maximum_storage_images = 8;
 const maximum_storage_mappings = 1024;
-const maximum_compute_pipelines = 256;
+/// Modern Unity titles specialize hundreds of compute kernels during scene
+/// bootstrap. Keep those pipelines resident instead of stopping the DCB queue
+/// as soon as the initial 256-entry bring-up bound is reached.
+const maximum_compute_pipelines = 2048;
 /// Titles that specialize transform and colour constants reach thousands of
 /// shader variants in seconds: Terminator 2D passes six thousand within a
 /// minute of play. At 256 the cache recycled entries the next frame needed and
@@ -644,6 +657,8 @@ const GraphicsPipelineEntry = struct {
 const GraphicsPipelineState = extern struct {
     width: u32,
     height: u32,
+    color_attachment_format: u32,
+    topology: u32,
     viewport_x_bits: u32,
     viewport_y_bits: u32,
     viewport_width_bits: u32,
@@ -670,6 +685,8 @@ const GraphicsPipelineState = extern struct {
         return .{
             .width = width,
             .height = height,
+            .color_attachment_format = vk.format_r8g8b8a8_unorm,
+            .topology = vk.primitive_topology_triangle_list,
             .viewport_x_bits = @bitCast(@as(f32, 0)),
             .viewport_y_bits = @bitCast(@as(f32, 0)),
             .viewport_width_bits = @bitCast(@as(f32, @floatFromInt(width))),
@@ -695,9 +712,15 @@ const GraphicsPipelineState = extern struct {
     }
 };
 
+const ColorTargetFormat = struct {
+    vulkan: u32,
+    bytes_per_texel: u8,
+};
+
 const GuestColorTarget = struct {
     descriptor: gpu.resources.ColorTarget,
     layout: gpu.SurfaceLayout,
+    format: ColorTargetFormat,
 };
 
 /// How a graphics packet wants geometry issued on the host.
@@ -712,6 +735,28 @@ const GuestDraw = struct {
     index_uint32: bool = false,
 };
 
+fn guestPrimitiveTopology(primitive_type: u32, draw: GuestDraw) u32 {
+    return switch (primitive_type) {
+        1 => vk.primitive_topology_point_list,
+        2 => vk.primitive_topology_line_list,
+        3, 18 => vk.primitive_topology_line_strip,
+        5 => vk.primitive_topology_triangle_fan,
+        6 => vk.primitive_topology_triangle_strip,
+        // PS5 NGG rectangle lists use a four-vertex auto draw as a host
+        // triangle strip. Indexed and batched rectangle lists already carry
+        // expanded triangle-list indices and must retain triangle-list order.
+        7 => if (draw.index_count == null and draw.vertex_count <= 4)
+            vk.primitive_topology_triangle_strip
+        else
+            vk.primitive_topology_triangle_list,
+        17 => if (draw.index_count == null)
+            vk.primitive_topology_triangle_strip
+        else
+            vk.primitive_topology_triangle_list,
+        else => vk.primitive_topology_triangle_list,
+    };
+}
+
 /// Some final compositors omit CB registers because the following VideoOut
 /// flip names the scanout allocation. Keep only the most recent such draw.
 const PendingGuestDraw = struct {
@@ -724,6 +769,26 @@ const ComputeShaderFailure = struct {
     address: u64,
     err: anyerror,
 };
+
+const GraphicsShaderFailure = struct {
+    address: u64,
+    stage: gpu.resources.ShaderStage,
+    err: anyerror,
+};
+
+fn colorTargetFormat(descriptor: gpu.resources.ColorTarget) ?ColorTargetFormat {
+    return switch (descriptor.format) {
+        // DATA_FORMAT_8_8_8_8. Preserve the existing UNORM attachment path
+        // for the number-type variants titles have already exercised.
+        10 => .{ .vulkan = vk.format_r8g8b8a8_unorm, .bytes_per_texel = 4 },
+        // DATA_FORMAT_16_16_16_16 + NUMBER_FORMAT_FLOAT.
+        12 => if (descriptor.number_type == 7)
+            .{ .vulkan = vk.format_r16g16b16a16_sfloat, .bytes_per_texel = 8 }
+        else
+            null,
+        else => null,
+    };
+}
 
 fn displayColorTarget(buffer: DisplayBuffer) ?gpu.resources.ColorTarget {
     if (buffer.address == 0 or buffer.width == 0 or buffer.height == 0) return null;
@@ -761,6 +826,7 @@ const CachedRenderTarget = struct {
     framebuffer: vk.Framebuffer,
     readback: OwnedBuffer,
     initialized: bool = false,
+    shader_read_layout: bool = false,
     gpu_generation: u64 = 0,
     host_generation: u64 = 0,
     last_used_sequence: u64 = 0,
@@ -770,6 +836,11 @@ const CmaskSeed = struct {
     texel: [4]u8,
     clear_blocks: u32,
     expanded_blocks: u32,
+};
+
+const DccClearTexel = struct {
+    bytes: [8]u8,
+    length: u8,
 };
 
 const CachedHtileTarget = struct {
@@ -904,6 +975,8 @@ const PreparedSampledImage = struct {
     image: OwnedImage,
     view: vk.ImageView,
     sampler: vk.Sampler,
+    owns_view: bool = false,
+    owns_sampler: bool = false,
 };
 
 const PreparedStorageImage = struct {
@@ -920,11 +993,15 @@ const PreparedStorageImage = struct {
 const GraphicsResources = struct {
     images: [maximum_storage_descriptors]PreparedSampledImage = undefined,
     image_count: usize = 0,
+    descriptors: [maximum_storage_descriptors]gpu.ImageDescriptor = undefined,
     mappings: [maximum_storage_descriptors]gpu.ShaderSpirvSampledImageBinding = undefined,
     mapping_count: usize = 0,
 
     fn deinit(self: *GraphicsResources, renderer: *Renderer) void {
-        _ = renderer;
+        for (self.images[0..self.image_count]) |image| {
+            if (image.owns_view) renderer.device_functions.destroy_image_view(renderer.device, image.view, null);
+            if (image.owns_sampler) renderer.device_functions.destroy_sampler(renderer.device, image.sampler, null);
+        }
         self.* = undefined;
     }
 };
@@ -937,7 +1014,7 @@ const PipelineLookup = struct {
 const ComputeResources = struct {
     mappings: [maximum_storage_mappings]gpu.ShaderSpirvStorageBufferBinding = undefined,
     mapping_count: usize = 0,
-    scalar_registers: [gpu.resources.maximum_user_data_words]gpu.ShaderSpirvScalarRegister = undefined,
+    scalar_registers: [gpu.scalar_provenance.maximum_scalar_specializations]gpu.ShaderSpirvScalarRegister = undefined,
     scalar_count: usize = 0,
     addresses: [maximum_storage_descriptors]u64 = @splat(0),
     sizes: [maximum_storage_descriptors]usize = @splat(0),
@@ -1006,12 +1083,27 @@ const ComputeResources = struct {
         }
         self.storage_image_count = 0;
         self.storage_image_mapping_count = 0;
-        // Sampled images are cache-owned and survive this dispatch. The local
-        // entries only keep their handles alive while descriptors are prepared.
+        // Cached sampled images survive this dispatch. Direct render-target
+        // views and samplers are temporary because submissions are synchronous.
+        for (self.sampled_images[0..self.sampled_image_count]) |image| {
+            if (image.owns_view) renderer.device_functions.destroy_image_view(renderer.device, image.view, null);
+            if (image.owns_sampler) renderer.device_functions.destroy_sampler(renderer.device, image.sampler, null);
+        }
         self.sampled_image_count = 0;
         self.sampled_image_mapping_count = 0;
     }
 };
+
+fn canReuseStorageMapping(attribute_specific: bool, previous: ?u32, current: u32) bool {
+    return !attribute_specific and previous != null and previous.? == current;
+}
+
+fn shouldDumpProgressFrame(flip: u64) bool {
+    return switch (flip) {
+        8, 16, 32, 64, 96, 128 => true,
+        else => false,
+    };
+}
 
 const CachedSampledImage = struct {
     guest_address: u64,
@@ -1050,6 +1142,9 @@ pub const Renderer = struct {
     graphics_probe_enabled: bool,
     capture_first_graphics_frame: bool,
     force_probe_fragment: bool,
+    force_probe_fragment_texture: bool,
+    force_probe_fragment_parameter: bool,
+    force_probe_fragment_ui: bool,
     skip_compute_dispatches: bool,
     translate_compute_only: bool,
     guest_memory: ?GuestMemory = null,
@@ -1124,6 +1219,7 @@ pub const Renderer = struct {
     emulated_volume_copies: u64 = 0,
     reported_dual_image_clear_fallback: bool = false,
     reported_fast_clear_seeds: u32 = 0,
+    reported_non_rgba_materializations: u32 = 0,
     reported_htile_resolves: u32 = 0,
     buffer_cache_hits: u64 = 0,
     buffer_cache_misses: u64 = 0,
@@ -1135,18 +1231,20 @@ pub const Renderer = struct {
     graphics_pipeline_sequence: u64 = 0,
     frame_profile: FrameProfile = .{},
     last_flip_profile_ns: u64 = 0,
-    last_shader_failure_address: u64 = 0,
-    last_shader_failure_stage: ?gpu.resources.ShaderStage = null,
-    last_shader_failure_error: ?anyerror = null,
+    reported_shader_failures: [64]?GraphicsShaderFailure = @splat(null),
+    reported_vertex_resource_programs: [16]u64 = @splat(0),
+    reported_fragment_resource_programs: [16]u64 = @splat(0),
     last_interface_vertex_address: u64 = 0,
     last_interface_fragment_address: u64 = 0,
     reported_interface_pairs: u8 = 0,
     reported_vertex_storage_bindings: bool = false,
     reported_fragment_storage_bindings: bool = false,
     reported_first_graphics_draw_checkpoints: bool = false,
+    captured_targeted_fragment_probe: bool = false,
     reported_first_scissor_state: bool = false,
     reported_draw_errors: [16]?anyerror = @splat(null),
     reported_compute_shader_failures: [32]?ComputeShaderFailure = @splat(null),
+    reported_compute_resource_programs: [32]u64 = @splat(0),
     last_dispatch_error: ?anyerror = null,
     last_draw_error: ?anyerror = null,
     last_sync_error: ?anyerror = null,
@@ -1410,6 +1508,9 @@ pub const Renderer = struct {
             .graphics_probe_enabled = options.enable_graphics_probe,
             .capture_first_graphics_frame = options.capture_first_graphics_frame,
             .force_probe_fragment = options.force_probe_fragment,
+            .force_probe_fragment_texture = options.force_probe_fragment_texture,
+            .force_probe_fragment_parameter = options.force_probe_fragment_parameter,
+            .force_probe_fragment_ui = options.force_probe_fragment_ui,
             .skip_compute_dispatches = options.skip_compute_dispatches,
             .translate_compute_only = options.translate_compute_only,
             .window_presentation = window_presentation,
@@ -1674,6 +1775,7 @@ pub const Renderer = struct {
     /// blit; the source returns to attachment layout for the next guest draw.
     fn blitRenderTargetToSwapchain(self: *Renderer, target_index: usize) anyerror!void {
         if (target_index >= self.render_targets.items.len) return Error.MissingPresentedFrame;
+        try self.transitionRenderTargetToColorAttachment(target_index);
         const target = self.render_targets.items[target_index];
         if (!target.initialized) return Error.MissingPresentedFrame;
         const presentation = &(self.window_presentation orelse return Error.PresentationRejected);
@@ -1837,15 +1939,25 @@ pub const Renderer = struct {
                     break;
                 }
             }
-            // Do not evict a large GPU-authored range merely because the next
-            // shader binds this descriptor slot to another address. Retain it
-            // as an address-keyed allocation while capacity remains; a later
-            // shader can bind it from any slot without a guest round trip.
+            // Do not evict a GPU-authored range merely because the next shader
+            // binds this descriptor slot to another address. Descriptor-array
+            // slots do not own cache allocations: keep the dirty range by
+            // address and recycle an old clean allocation first. Unity clears
+            // several buffers through the same UAV slot before consuming them;
+            // flushing the previous slot owner here otherwise turns a resident
+            // render target into a full device -> guest -> device round trip.
             if (recycle_index) |index| {
-                if (self.guest_buffers.items[index].gpu_dirty and
-                    self.guest_buffers.items.len < maximum_guest_buffers)
-                {
+                if (self.guest_buffers.items[index].gpu_dirty) {
                     recycle_index = null;
+                    if (self.guest_buffers.items.len >= maximum_guest_buffers) {
+                        var oldest_clean: u64 = std.math.maxInt(u64);
+                        for (self.guest_buffers.items, 0..) |entry, candidate_index| {
+                            if (!entry.gpu_dirty and entry.last_used_sequence < oldest_clean) {
+                                oldest_clean = entry.last_used_sequence;
+                                recycle_index = candidate_index;
+                            }
+                        }
+                    }
                 }
             }
             if (recycle_index == null and self.guest_buffers.items.len >= maximum_guest_buffers) {
@@ -2102,6 +2214,109 @@ pub const Renderer = struct {
             null,
         );
         defer resources.deinit(self);
+        if (self.flip_callbacks == 240) {
+            std.debug.print(
+                "[vulkan dcb] traced compute resources dispatch={d} program=0x{x} buffers={d} sampled={d} storage_images={d}\n",
+                .{
+                    self.frame_profile.dispatches,
+                    program_address,
+                    resources.mapping_count,
+                    resources.sampled_image_mapping_count,
+                    resources.storage_image_mapping_count,
+                },
+            );
+            for (resources.mappings[0..resources.mapping_count]) |mapping| {
+                const slot: usize = @intCast(mapping.descriptor_index);
+                std.debug.print(
+                    "  traced buffer slot={d} V#s{d} addr=0x{x} size=0x{x} stride={d} fmt={d} writable={any}\n",
+                    .{
+                        mapping.descriptor_index,
+                        mapping.resource_sgpr,
+                        resources.addresses[slot],
+                        resources.sizes[slot],
+                        mapping.stride,
+                        mapping.unified_format,
+                        resources.writable[slot],
+                    },
+                );
+            }
+            for (resources.storage_images[0..resources.storage_image_count], 0..) |image, index| {
+                std.debug.print(
+                    "  traced storage image slot={d} addr=0x{x} {d}x{d} fmt={d} writable={any}\n",
+                    .{
+                        index,
+                        image.descriptor.address,
+                        image.descriptor.width,
+                        image.descriptor.height,
+                        image.descriptor.unified_format,
+                        image.writable,
+                    },
+                );
+            }
+            for (resources.sampled_images[0..resources.sampled_image_count], 0..) |_, index| {
+                const sampled = resources.sampled_image_mappings[index];
+                std.debug.print(
+                    "  traced compute sampled slot={d} T#s{d} S#s{d} pc={any}\n",
+                    .{ sampled.descriptor_index, sampled.resource_sgpr, sampled.sampler_sgpr, sampled.instruction_pc },
+                );
+            }
+        }
+        if (self.shouldReportComputeResources(program_address)) {
+            std.debug.print(
+                "[vulkan dcb] compute resources program=0x{x} groups={d}x{d}x{d} buffers={d} sampled={d} storage_images={d} scalars={d}\n",
+                .{
+                    program_address,
+                    group_count[0],
+                    group_count[1],
+                    group_count[2],
+                    resources.mapping_count,
+                    resources.sampled_image_mapping_count,
+                    resources.storage_image_mapping_count,
+                    resources.scalar_count,
+                },
+            );
+            for (resources.mappings[0..resources.mapping_count]) |mapping| {
+                const slot: usize = @intCast(mapping.descriptor_index);
+                std.debug.print(
+                    "  buffer pc={any} V#s{d} slot={d} addr=0x{x} size=0x{x} writable={any}\n",
+                    .{
+                        mapping.instruction_pc,
+                        mapping.resource_sgpr,
+                        mapping.descriptor_index,
+                        resources.addresses[slot],
+                        resources.sizes[slot],
+                        resources.writable[slot],
+                    },
+                );
+            }
+            for (resources.storage_images[0..resources.storage_image_count], 0..) |image, index| {
+                std.debug.print(
+                    "  storage image slot={d} addr=0x{x} {d}x{d}x{d} fmt={d} type={s} writable={any}\n",
+                    .{
+                        index,
+                        image.descriptor.address,
+                        image.descriptor.width,
+                        image.descriptor.height,
+                        image.descriptor.depth_or_layers,
+                        image.descriptor.unified_format,
+                        @tagName(image.descriptor.image_type),
+                        image.writable,
+                    },
+                );
+            }
+            for (resources.sampled_image_mappings[0..resources.sampled_image_mapping_count]) |mapping| {
+                std.debug.print(
+                    "  sampled pc={any} T#s{d} S#s{d} slot={d}\n",
+                    .{
+                        mapping.instruction_pc,
+                        mapping.resource_sgpr,
+                        mapping.sampler_sgpr,
+                        mapping.descriptor_index,
+                    },
+                );
+            }
+            dumpShaderHead(analysis, 48);
+        }
         var module = analysis.translateSpirv(self.allocator, .{
             .stage = .compute,
             .local_size = local_size,
@@ -2766,13 +2981,13 @@ pub const Renderer = struct {
         else
             null;
         var vertex_attribute_index: usize = 0;
-        for (scalar.registers, 0..) |value, index| {
-            if (!value.known) continue;
-            result.scalar_registers[result.scalar_count] = .{ .register = @intCast(index), .value = value.value };
-            result.scalar_count += 1;
-        }
-        const resource_scalar = gpu.scalar_provenance.evaluateResourceState(reader, bindings);
-
+        result.scalar_count = collectScalarLoadSpecializations(scalar, &result.scalar_registers);
+        result.scalar_count = mergeUserDataScalars(
+            bindings,
+            bindings.scalar_user_data_base,
+            &result.scalar_registers,
+            result.scalar_count,
+        );
         // Preserve the AGC slot number whenever possible. This makes the host
         // descriptor table stable across shaders that share one SRT layout.
         var iterator = bindings.iterator(reader, .constant_buffer);
@@ -2853,14 +3068,15 @@ pub const Renderer = struct {
                     }
                 }
             }
-            // Non-attribute constant/structured buffers use one descriptor per
-            // SGPR. Only actual vertex attributes need a PC-qualified mapping,
-            // because two fetch instructions may pair the same SGPR with
-            // different attribute-table entries.
-            if (bindings.stage != .compute and vertex_attribute == null) if (result.mappingForSgpr(resource_sgpr)) |descriptor_index| {
-                if (is_store) result.writable[descriptor_index] = true;
-                continue;
-            };
+            // Resolve the descriptor at the instruction itself. Shader prologs
+            // reuse the same SGPR quartet for several SMEM-loaded V# values;
+            // a final whole-program snapshot (or the first mapping for that
+            // SGPR) is not authoritative for a later MUBUF operation.
+            const instruction_scalar = gpu.scalar_provenance.evaluateResourceStateUntil(
+                reader,
+                bindings,
+                inst.pc,
+            );
             const descriptor = (if (vertex_attribute) |attribute|
                 takePlausibleBufferDescriptor(attribute.buffer)
             else
@@ -2868,8 +3084,8 @@ pub const Renderer = struct {
                 bindings,
                 reader,
                 analysis,
-                scalar,
-                &resource_scalar,
+                &instruction_scalar,
+                &instruction_scalar,
                 resource_sgpr,
                 inst.pc,
             ) orelse {
@@ -2938,7 +3154,15 @@ pub const Renderer = struct {
                 break :blk free;
             };
             const previous_descriptor_index = result.mappingForSgpr(resource_sgpr);
-            if (previous_descriptor_index != null and previous_descriptor_index.? == descriptor_index) {
+            // Constant-buffer mappings are interchangeable when the SGPR and
+            // staged range match. Vertex attributes are not: several fetches
+            // commonly share one V# and buffer while using different table
+            // offsets, so every instruction needs its own PC-qualified entry.
+            if (canReuseStorageMapping(
+                vertex_attribute != null,
+                previous_descriptor_index,
+                descriptor_index,
+            )) {
                 if (is_store) result.writable[descriptor_index] = true;
                 continue;
             }
@@ -2953,7 +3177,7 @@ pub const Renderer = struct {
                 .resource_sgpr = resource_sgpr,
                 .descriptor_index = descriptor_index,
                 .instruction_pc = if (vertex_attribute != null or
-                    (bindings.stage == .compute and previous_descriptor_index != null))
+                    previous_descriptor_index != null)
                     inst.pc
                 else
                     null,
@@ -2963,6 +3187,8 @@ pub const Renderer = struct {
                 .swizzled = descriptor.swizzle_enabled,
                 .index_stride = descriptor.index_stride,
                 .add_thread_id = descriptor.add_thread_id,
+                .unified_format = descriptor.unified_format,
+                .dst_select = descriptor.dst_select,
                 // The descriptor already says how far the buffer goes, so the
                 // shader can be held to it instead of being trusted to stay
                 // inside on its own.
@@ -3366,9 +3592,9 @@ pub const Renderer = struct {
         };
     }
 
-    fn createGraphicsRenderPass(self: *Renderer, preserve_color: bool) Error!vk.RenderPass {
+    fn createGraphicsRenderPass(self: *Renderer, format: u32, preserve_color: bool) Error!vk.RenderPass {
         const attachment = vk.AttachmentDescription{
-            .format = vk.format_r8g8b8a8_unorm,
+            .format = format,
             .load_operation = if (preserve_color) vk.attachment_load_op_load else vk.attachment_load_op_clear,
             .store_operation = vk.attachment_store_op_store,
             .initial_layout = if (preserve_color) vk.image_layout_color_attachment_optimal else vk.image_layout_undefined,
@@ -3511,7 +3737,9 @@ pub const Renderer = struct {
             .{ .stage = vk.shader_stage_fragment_bit, .module = fragment, .name = "main" },
         };
         const vertex_input = vk.PipelineVertexInputStateCreateInfo{};
-        const input_assembly = vk.PipelineInputAssemblyStateCreateInfo{};
+        const input_assembly = vk.PipelineInputAssemblyStateCreateInfo{
+            .topology = pipeline_state.topology,
+        };
         const viewport = vk.Viewport{
             .x = @bitCast(pipeline_state.viewport_x_bits),
             .y = @bitCast(pipeline_state.viewport_y_bits),
@@ -3759,11 +3987,16 @@ pub const Renderer = struct {
             a.descriptor.height == b.descriptor.height and
             a.descriptor.pitch == b.descriptor.pitch and
             a.descriptor.format == b.descriptor.format and
+            a.descriptor.number_type == b.descriptor.number_type and
+            a.descriptor.component_swap == b.descriptor.component_swap and
+            a.descriptor.force_destination_alpha_one == b.descriptor.force_destination_alpha_one and
             a.descriptor.tile_mode == b.descriptor.tile_mode and
             a.descriptor.samples_log2 == b.descriptor.samples_log2 and
             a.descriptor.fragments_log2 == b.descriptor.fragments_log2 and
             a.descriptor.base_array_slice == b.descriptor.base_array_slice and
             a.descriptor.mip_level == b.descriptor.mip_level and
+            a.format.vulkan == b.format.vulkan and
+            a.format.bytes_per_texel == b.format.bytes_per_texel and
             a.layout.required_source_bytes == b.layout.required_source_bytes and
             a.layout.staging_bytes == b.layout.staging_bytes;
     }
@@ -3791,7 +4024,7 @@ pub const Renderer = struct {
     ///
     /// Returns null when the raw allocation is the honest source: no DCC, a
     /// key we cannot read, a mixed key, or a code this does not model.
-    fn colorTargetFastClearTexel(self: *Renderer, target: GuestColorTarget) anyerror!?[4]u8 {
+    fn colorTargetFastClearTexel(self: *Renderer, target: GuestColorTarget) anyerror!?DccClearTexel {
         const descriptor = target.descriptor;
         if (!descriptor.dcc_enabled or descriptor.dcc_address == 0) return null;
         const memory = self.guest_memory orelse return null;
@@ -3805,7 +4038,7 @@ pub const Renderer = struct {
         for (key[1..]) |byte| {
             if (byte != code) return null;
         }
-        return dccClearTexel(code, descriptor);
+        return colorDccClearTexel(code, descriptor);
     }
 
     fn stageCmaskFastClear(
@@ -3852,7 +4085,7 @@ pub const Renderer = struct {
         frame: []u8,
     ) anyerror!void {
         if (try self.colorTargetFastClearTexel(target)) |texel| {
-            fillRgba8(frame, texel);
+            fillTexels(frame, texel.bytes[0..texel.length]);
             self.reportDccFastClearSeed(target, texel);
             return;
         }
@@ -3863,20 +4096,26 @@ pub const Renderer = struct {
         try target.layout.stage(reader, target.descriptor.address, frame);
     }
 
-    fn reportDccFastClearSeed(self: *Renderer, target: GuestColorTarget, texel: [4]u8) void {
+    fn reportDccFastClearSeed(self: *Renderer, target: GuestColorTarget, texel: DccClearTexel) void {
         if (self.reported_fast_clear_seeds >= 4 and !log_verbose_gpu) return;
         self.reported_fast_clear_seeds += 1;
         std.debug.print(
-            "[vulkan dcb] dcc fast-clear target @0x{x} {d}x{d} key@0x{x} rgba={d},{d},{d},{d}\n",
+            "[vulkan dcb] dcc fast-clear target @0x{x} {d}x{d} key@0x{x} fmt={d} texel_bytes={d} raw={x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n",
             .{
                 target.descriptor.address,
                 target.descriptor.width,
                 target.descriptor.height,
                 target.descriptor.dcc_address,
-                texel[0],
-                texel[1],
-                texel[2],
-                texel[3],
+                target.descriptor.format,
+                texel.length,
+                texel.bytes[0],
+                texel.bytes[1],
+                texel.bytes[2],
+                texel.bytes[3],
+                texel.bytes[4],
+                texel.bytes[5],
+                texel.bytes[6],
+                texel.bytes[7],
             },
         );
     }
@@ -4111,16 +4350,17 @@ pub const Renderer = struct {
         const image = try self.createImage(
             target.descriptor.width,
             target.descriptor.height,
-            vk.format_r8g8b8a8_unorm,
+            target.format.vulkan,
             vk.image_usage_color_attachment_bit |
                 vk.image_usage_transfer_src_bit |
-                vk.image_usage_transfer_dst_bit,
+                vk.image_usage_transfer_dst_bit |
+                vk.image_usage_sampled_bit,
         );
         errdefer self.destroyImage(image);
 
         const view_info = vk.ImageViewCreateInfo{
             .image = image.handle,
-            .format = vk.format_r8g8b8a8_unorm,
+            .format = target.format.vulkan,
             .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
         };
         var view: vk.ImageView = 0;
@@ -4129,7 +4369,7 @@ pub const Renderer = struct {
         }
         errdefer self.device_functions.destroy_image_view(self.device, view, null);
 
-        const render_pass = try self.createGraphicsRenderPass(true);
+        const render_pass = try self.createGraphicsRenderPass(target.format.vulkan, true);
         errdefer self.device_functions.destroy_render_pass(self.device, render_pass, null);
         const framebuffer_info = vk.FramebufferCreateInfo{
             .render_pass = render_pass,
@@ -4166,6 +4406,109 @@ pub const Renderer = struct {
         self.device_functions.destroy_image_view(self.device, target.view, null);
         self.destroyBuffer(target.readback);
         self.destroyImage(target.image);
+    }
+
+    fn transitionRenderTargetToShaderRead(self: *Renderer, index: usize) anyerror!void {
+        if (index >= self.render_targets.items.len) return Error.MissingPresentedFrame;
+        const snapshot = self.render_targets.items[index];
+        if (!snapshot.initialized or snapshot.shader_read_layout) return;
+        const command_buffer = try self.beginOneShot();
+        defer self.device_functions.free_command_buffers(self.device, self.command_pool, 1, @ptrCast(&command_buffer));
+        const barrier = vk.ImageMemoryBarrier{
+            .source_access_mask = vk.access_color_attachment_write_bit,
+            .destination_access_mask = vk.access_shader_read_bit,
+            .old_layout = vk.image_layout_color_attachment_optimal,
+            .new_layout = vk.image_layout_shader_read_only_optimal,
+            .image = snapshot.image.handle,
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_color_attachment_output_bit,
+            vk.pipeline_stage_fragment_shader_bit | vk.pipeline_stage_compute_shader_bit,
+            0,
+            0,
+            null,
+            0,
+            null,
+            1,
+            @ptrCast(&barrier),
+        );
+        try self.submitOneShot(command_buffer);
+        self.render_targets.items[index].shader_read_layout = true;
+    }
+
+    fn transitionRenderTargetToColorAttachment(self: *Renderer, index: usize) anyerror!void {
+        if (index >= self.render_targets.items.len) return Error.MissingPresentedFrame;
+        const snapshot = self.render_targets.items[index];
+        if (!snapshot.initialized or !snapshot.shader_read_layout) return;
+        const command_buffer = try self.beginOneShot();
+        defer self.device_functions.free_command_buffers(self.device, self.command_pool, 1, @ptrCast(&command_buffer));
+        const barrier = vk.ImageMemoryBarrier{
+            .source_access_mask = vk.access_shader_read_bit,
+            .destination_access_mask = vk.access_color_attachment_read_bit | vk.access_color_attachment_write_bit,
+            .old_layout = vk.image_layout_shader_read_only_optimal,
+            .new_layout = vk.image_layout_color_attachment_optimal,
+            .image = snapshot.image.handle,
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_fragment_shader_bit | vk.pipeline_stage_compute_shader_bit,
+            vk.pipeline_stage_color_attachment_output_bit,
+            0,
+            0,
+            null,
+            0,
+            null,
+            1,
+            @ptrCast(&barrier),
+        );
+        try self.submitOneShot(command_buffer);
+        self.render_targets.items[index].shader_read_layout = false;
+    }
+
+    fn stageResidentRenderTarget(
+        self: *Renderer,
+        descriptor: gpu.resources.ImageDescriptor,
+        sampler_descriptor: gpu.resources.SamplerDescriptor,
+        image_format: u32,
+        descriptor_index: u32,
+    ) anyerror!?PreparedSampledImage {
+        for (self.render_targets.items, 0..) |cached, index| {
+            if (!cached.initialized or
+                cached.target.descriptor.address != descriptor.address or
+                cached.target.descriptor.width != descriptor.width or
+                cached.target.descriptor.height != descriptor.height or
+                cached.target.format.vulkan != image_format)
+            {
+                continue;
+            }
+            try self.transitionRenderTargetToShaderRead(index);
+            const components = try sampledImageComponents(descriptor.dst_select);
+            const view_info = vk.ImageViewCreateInfo{
+                .image = cached.image.handle,
+                .format = image_format,
+                .components = components,
+                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+            };
+            var view: vk.ImageView = 0;
+            if (self.device_functions.create_image_view(self.device, &view_info, null, &view) != vk.success) {
+                return Error.ImageViewCreationFailed;
+            }
+            errdefer self.device_functions.destroy_image_view(self.device, view, null);
+            const sampler = try self.createGuestSampler(sampler_descriptor);
+            errdefer self.device_functions.destroy_sampler(self.device, sampler, null);
+            self.updateSampledImageDescriptor(descriptor_index, view, sampler);
+            return .{
+                .image = cached.image,
+                .view = view,
+                .sampler = sampler,
+                .owns_view = true,
+                .owns_sampler = true,
+            };
+        }
+        return null;
     }
 
     fn acquireRenderTarget(self: *Renderer, target: GuestColorTarget) anyerror!usize {
@@ -4210,22 +4553,35 @@ pub const Renderer = struct {
         defer self.frame_profile.target_materialize_ns +|= elapsedHostNanoseconds(profile_started);
         if (index >= self.render_targets.items.len) return Error.MissingPresentedFrame;
         const snapshot = self.render_targets.items[index];
-        if (!snapshot.initialized or snapshot.gpu_generation == snapshot.host_generation) return;
+        if (!snapshot.initialized) return;
+        if (snapshot.gpu_generation == snapshot.host_generation) {
+            try self.transitionRenderTargetToColorAttachment(index);
+            return;
+        }
         const frame_bytes = try colorTargetFrameBytes(snapshot.target);
 
         const command_buffer = try self.beginOneShot();
         defer self.device_functions.free_command_buffers(self.device, self.command_pool, 1, @ptrCast(&command_buffer));
         const to_transfer = vk.ImageMemoryBarrier{
-            .source_access_mask = vk.access_color_attachment_write_bit,
+            .source_access_mask = if (snapshot.shader_read_layout)
+                vk.access_shader_read_bit
+            else
+                vk.access_color_attachment_write_bit,
             .destination_access_mask = vk.access_transfer_read_bit,
-            .old_layout = vk.image_layout_color_attachment_optimal,
+            .old_layout = if (snapshot.shader_read_layout)
+                vk.image_layout_shader_read_only_optimal
+            else
+                vk.image_layout_color_attachment_optimal,
             .new_layout = vk.image_layout_transfer_src_optimal,
             .image = snapshot.image.handle,
             .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
         };
         self.device_functions.cmd_pipeline_barrier(
             command_buffer,
-            vk.pipeline_stage_color_attachment_output_bit,
+            if (snapshot.shader_read_layout)
+                vk.pipeline_stage_fragment_shader_bit | vk.pipeline_stage_compute_shader_bit
+            else
+                vk.pipeline_stage_color_attachment_output_bit,
             vk.pipeline_stage_transfer_bit,
             0,
             0,
@@ -4297,19 +4653,48 @@ pub const Renderer = struct {
         try self.readMapped(snapshot.readback, frame);
         self.frame_profile.readback_bytes += frame_bytes;
         self.frame_profile.target_readback_bytes += frame_bytes;
-        if (snapshot.target.descriptor.force_destination_alpha_one) forceDestinationAlphaOne(frame);
+        if (snapshot.target.descriptor.force_destination_alpha_one) {
+            forceColorTargetAlphaOne(frame, snapshot.target.format);
+        }
         try self.recordGuestColorTarget(snapshot.target, frame);
         self.render_targets.items[index].host_generation = snapshot.gpu_generation;
+        self.render_targets.items[index].shader_read_layout = false;
 
-        var colored: u32 = 0;
-        var pixel: usize = 0;
-        while (pixel < frame.len) : (pixel += 4) {
-            if (frame[pixel] != 0 or frame[pixel + 1] != 0 or frame[pixel + 2] != 0) colored += 1;
-        }
+        const colored = countNonzeroTexels(frame, snapshot.target.format.bytes_per_texel);
         self.graphics_probe_colored_pixels = colored;
-        if (self.frame_dumps == 0 and colored != 0) {
-            dumpFramePpm("out\\first-frame.ppm", snapshot.target.descriptor.width, snapshot.target.descriptor.height, frame);
-            self.frame_dumps += 1;
+        if (snapshot.target.format.bytes_per_texel == 4) {
+            if (self.frame_dumps == 0 and colored != 0) {
+                dumpFramePpm("out\\first-frame.ppm", snapshot.target.descriptor.width, snapshot.target.descriptor.height, frame);
+                self.frame_dumps += 1;
+            }
+            if (colored != 0) switch (self.frame_sequence) {
+                32, 64, 128 => {
+                    var path_buffer: [64]u8 = undefined;
+                    const path: ?[:0]u8 = std.fmt.bufPrintZ(
+                        &path_buffer,
+                        "out\\render-{d:0>4}.ppm",
+                        .{self.frame_sequence},
+                    ) catch null;
+                    if (path) |name| dumpFramePpm(
+                        name.ptr,
+                        snapshot.target.descriptor.width,
+                        snapshot.target.descriptor.height,
+                        frame,
+                    );
+                },
+                else => {},
+            };
+        } else if (log_verbose_gpu or self.reported_non_rgba_materializations < 4) {
+            self.reported_non_rgba_materializations += 1;
+            std.debug.print(
+                "[vulkan dcb] materialized color target @0x{x} fmt={d} nonzero_texels={d}/{d}\n",
+                .{
+                    snapshot.target.descriptor.address,
+                    snapshot.target.descriptor.format,
+                    colored,
+                    snapshot.target.descriptor.width * snapshot.target.descriptor.height,
+                },
+            );
         }
     }
 
@@ -4332,6 +4717,7 @@ pub const Renderer = struct {
         draw: GuestDraw,
     ) anyerror!void {
         const target_index = try self.acquireRenderTarget(target);
+        try self.transitionRenderTargetToColorAttachment(target_index);
         const cached_snapshot = self.render_targets.items[target_index];
         const frame_bytes = try colorTargetFrameBytes(target);
         const report_checkpoints = !self.reported_first_graphics_draw_checkpoints;
@@ -4586,7 +4972,7 @@ pub const Renderer = struct {
         }
         defer self.device_functions.destroy_image_view(self.device, view, null);
 
-        const render_pass = try self.createGraphicsRenderPass(guest_target != null);
+        const render_pass = try self.createGraphicsRenderPass(vk.format_r8g8b8a8_unorm, guest_target != null);
         defer self.device_functions.destroy_render_pass(self.device, render_pass, null);
         const framebuffer_info = vk.FramebufferCreateInfo{
             .render_pass = render_pass,
@@ -5111,22 +5497,48 @@ pub const Renderer = struct {
                 },
             );
         }
-        if (descriptor.format != 10) {
-            if (log_verbose_gpu) std.debug.print(
-                "[vulkan dcb] draw: treating color format {d} as 32bpp RGBA\n",
-                .{descriptor.format},
-            );
-        }
+        const target_format = colorTargetFormat(descriptor) orelse return Error.UnsupportedColorTarget;
+        if (log_verbose_gpu) std.debug.print(
+            "[vulkan dcb] draw color format={d} number={d} -> vk={d} bytes_per_texel={d}\n",
+            .{ descriptor.format, descriptor.number_type, target_format.vulkan, target_format.bytes_per_texel },
+        );
         const layout = try gpu.SurfaceLayout.fromColorTarget(descriptor);
-        if (layout.layers != 1 or layout.block.bytes_per_element != 4) return Error.UnsupportedColorTarget;
-        const pipeline_state = try guestGraphicsState(&render_state, descriptor);
-        const target = GuestColorTarget{ .descriptor = descriptor, .layout = layout };
+        if (layout.layers != 1 or layout.block.bytes_per_element != target_format.bytes_per_texel) {
+            return Error.UnsupportedColorTarget;
+        }
+        var pipeline_state = try guestGraphicsState(&render_state, descriptor);
+        pipeline_state.color_attachment_format = target_format.vulkan;
+        pipeline_state.topology = guestPrimitiveTopology(render_state.primitive_type, draw);
+        const target = GuestColorTarget{ .descriptor = descriptor, .layout = layout, .format = target_format };
         const vertex_address = vertex_stage.programAddress(state) orelse {
             return Error.MissingGraphicsProgram;
         };
         const fragment_address = gpu.resources.ShaderStage.pixel.programAddress(state) orelse {
             return Error.MissingGraphicsProgram;
         };
+        if (self.flip_callbacks == 240) {
+            std.debug.print(
+                "[vulkan dcb] draw trace next_flip={d} draw={d} target=0x{x} VS=0x{x} PS=0x{x} indices={any} vertices={d} viewport={d}x{d} scissor={d},{d}+{d}x{d} discard={d} write=0x{x} blend={d}\n",
+                .{
+                    self.flip_callbacks + 1,
+                    self.frame_profile.draws,
+                    descriptor.address,
+                    vertex_address,
+                    fragment_address,
+                    draw.index_count,
+                    draw.vertex_count,
+                    @as(f32, @bitCast(pipeline_state.viewport_width_bits)),
+                    @as(f32, @bitCast(pipeline_state.viewport_height_bits)),
+                    pipeline_state.scissor_x,
+                    pipeline_state.scissor_y,
+                    pipeline_state.scissor_width,
+                    pipeline_state.scissor_height,
+                    pipeline_state.rasterizer_discard,
+                    pipeline_state.color_write_mask,
+                    pipeline_state.blend_enable,
+                },
+            );
+        }
         const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
         const vertex_analysis = try self.analyzedProgram(reader, vertex_address);
         const fragment_analysis = try self.analyzedProgram(reader, fragment_address);
@@ -5150,26 +5562,57 @@ pub const Renderer = struct {
                 else => {},
             }
         }
+        var fragment_input_controls: [32]u32 = undefined;
+        var mapped_fragment_attribute_mask: u32 = 0;
+        var fragment_parameter_mask: u32 = 0;
+        for (0..fragment_input_controls.len) |attribute| {
+            const control = state.readRegister(.context, 0x191 + @as(u32, @intCast(attribute))) orelse
+                @as(u32, @intCast(attribute));
+            fragment_input_controls[attribute] = control;
+            const attribute_bit = @as(u32, 1) << @intCast(attribute);
+            if (fragment_attribute_mask & attribute_bit == 0) continue;
+            const parameter: u5 = @truncate(control);
+            const parameter_bit = @as(u32, 1) << parameter;
+            mapped_fragment_attribute_mask |= parameter_bit;
+            if (vertex_parameter_mask & parameter_bit != 0) {
+                fragment_parameter_mask |= attribute_bit;
+            }
+        }
         // NGG export shaders communicate through LDS and therefore expose no
         // ordinary PARAM EXP before their continuation is implemented. For the
         // common single-PARAM fullscreen pass, pair the guest PS with the probe
         // VS's explicit UV location instead of synthesizing interpolation in PS.
-        const probe_parameter_mask: u32 = if (vertex_parameter_mask == 0 and fragment_attribute_mask == 1) 1 else 0;
-        const paired_parameter_mask = if (probe_parameter_mask != 0)
+        var probe_parameter_mask: u32 = if (vertex_parameter_mask == 0 and fragment_attribute_mask == 1) 1 else 0;
+        if (probe_parameter_mask != 0) fragment_input_controls[0] = 0;
+        var paired_parameter_mask = if (probe_parameter_mask != 0)
             probe_parameter_mask
         else
-            vertex_parameter_mask & fragment_attribute_mask;
-        if (self.reported_interface_pairs < 2 and
-            (self.last_interface_vertex_address != vertex_address or
-                self.last_interface_fragment_address != fragment_address))
+            fragment_parameter_mask;
+        const trace_interface = self.flip_callbacks == 240;
+        if (trace_interface or
+            (self.reported_interface_pairs < 2 and
+                (self.last_interface_vertex_address != vertex_address or
+                    self.last_interface_fragment_address != fragment_address)))
         {
             std.debug.print(
-                "[vulkan dcb] shader interface VS=0x{x} exports=0x{x} params=0x{x} PS=0x{x} attrs=0x{x}\n",
-                .{ vertex_address, vertex_export_mask, vertex_parameter_mask, fragment_address, fragment_attribute_mask },
+                "[vulkan dcb] shader interface VS=0x{x} exports=0x{x} params=0x{x} PS=0x{x} attrs=0x{x}->params=0x{x}\n",
+                .{ vertex_address, vertex_export_mask, vertex_parameter_mask, fragment_address, fragment_attribute_mask, mapped_fragment_attribute_mask },
             );
-            self.last_interface_vertex_address = vertex_address;
-            self.last_interface_fragment_address = fragment_address;
-            self.reported_interface_pairs += 1;
+            var remaining_attributes = fragment_attribute_mask;
+            while (remaining_attributes != 0) {
+                const attribute: u5 = @intCast(@ctz(remaining_attributes));
+                const control = fragment_input_controls[attribute];
+                std.debug.print(
+                    "  PS attr{d} -> PARAM{d} cntl=0x{x} flat={any}\n",
+                    .{ attribute, control & 0x1f, control, control & 0x400 != 0 },
+                );
+                remaining_attributes &= remaining_attributes - 1;
+            }
+            if (!trace_interface) {
+                self.last_interface_vertex_address = vertex_address;
+                self.last_interface_fragment_address = fragment_address;
+                self.reported_interface_pairs += 1;
+            }
         }
         const vertex_header = if (memory.shader_header) |resolve|
             resolve(memory.context, vertex_address)
@@ -5196,17 +5639,35 @@ pub const Renderer = struct {
         );
         self.frame_profile.graphics_resource_ns +|= elapsedHostNanoseconds(resource_started);
         defer graphics_resources.deinit(self);
+        if (self.flip_callbacks == 240) {
+            for (graphics_resources.mappings[0..graphics_resources.mapping_count]) |mapping| {
+                const sampled = graphics_resources.descriptors[@intCast(mapping.descriptor_index)];
+                std.debug.print(
+                    "[vulkan dcb] traced sampled image draw={d} slot={d} addr=0x{x} {d}x{d} pitch={d} fmt={d} tile={s}\n",
+                    .{
+                        self.frame_profile.draws,
+                        mapping.descriptor_index,
+                        sampled.address,
+                        sampled.width,
+                        sampled.height,
+                        sampled.pitch,
+                        sampled.unified_format,
+                        @tagName(sampled.tile_mode),
+                    },
+                );
+            }
+        }
 
         // Full scalar evaluation (not only the straight prolog cut): vertex
-        // programs interleave SMEM loads after a few VALU ops, and those SGPRs
-        // must be constants in SPIR-V rather than live s_load (no host pointer
-        // load path yet). Specialize every known SGPR across the whole program.
+        // programs interleave SMEM loads after a few VALU ops. Preserve each
+        // recovered load at its producer PC; a final SGPR snapshot is invalid
+        // for NGG shaders which reuse the same registers many times.
         const vertex_provenance_started = hostTimestampNs();
-        const vertex_scalar = gpu.scalar_provenance.evaluatePrefix(reader, &vertex_bindings);
+        const vertex_scalar = gpu.scalar_provenance.evaluateResourceState(reader, &vertex_bindings);
         self.frame_profile.scalar_provenance_ns +|= elapsedHostNanoseconds(vertex_provenance_started);
         const vertex_scalar_end: u32 = 0x0010_0000;
-        var vertex_scalar_regs: [128]gpu.ShaderSpirvScalarRegister = undefined;
-        var vertex_scalar_count = collectKnownScalars(&vertex_scalar, &vertex_scalar_regs);
+        var vertex_scalar_regs: [gpu.scalar_provenance.maximum_scalar_specializations]gpu.ShaderSpirvScalarRegister = undefined;
+        var vertex_scalar_count = collectScalarLoadSpecializations(&vertex_scalar, &vertex_scalar_regs);
         // NGG/export programs often address USER_DATA as s0.. even when the
         // capture table records scalar_user_data_base=8 for the ES bank. Seed
         // the raw USER_DATA window at s0 so s3.. are not left undefined.
@@ -5238,11 +5699,17 @@ pub const Renderer = struct {
         );
 
         const fragment_provenance_started = hostTimestampNs();
-        const fragment_scalar = gpu.scalar_provenance.evaluatePrefix(reader, &fragment_bindings);
+        const fragment_scalar = gpu.scalar_provenance.evaluateResourceState(reader, &fragment_bindings);
         self.frame_profile.scalar_provenance_ns +|= elapsedHostNanoseconds(fragment_provenance_started);
         const fragment_scalar_end: u32 = 0x0010_0000;
-        var fragment_scalar_regs: [128]gpu.ShaderSpirvScalarRegister = undefined;
-        var fragment_scalar_count = collectKnownScalars(&fragment_scalar, &fragment_scalar_regs);
+        var fragment_scalar_regs: [gpu.scalar_provenance.maximum_scalar_specializations]gpu.ShaderSpirvScalarRegister = undefined;
+        var fragment_scalar_count = collectScalarLoadSpecializations(&fragment_scalar, &fragment_scalar_regs);
+        fragment_scalar_count = mergeUserDataScalars(
+            &fragment_bindings,
+            fragment_bindings.scalar_user_data_base,
+            &fragment_scalar_regs,
+            fragment_scalar_count,
+        );
         // T#/S# descriptor payloads select host descriptor-array elements;
         // they are not shader constants. Specializing their changing guest
         // addresses creates a new Vulkan pipeline for every streamed texture.
@@ -5278,6 +5745,29 @@ pub const Renderer = struct {
             );
             break :blk ComputeResources{};
         };
+        // Fullscreen video passes are safest with the backend's canonical
+        // triangle and UVs. The guest VS path is still incomplete for some
+        // Unity export programs, and a fallback VS without PARAM0 leaves every
+        // image sample at (0, 0). Detect the exact planar NV12 conversion
+        // layout, plus the already-fallback no-buffer case, and provide the
+        // matching UV interface instead of globally overriding texture
+        // coordinates in every fragment shader.
+        const planar_video_pass = graphics_resources.image_count == 2 and
+            graphics_resources.descriptors[0].tile_mode.isLinear() and
+            graphics_resources.descriptors[0].unified_format == 1 and
+            graphics_resources.descriptors[0].width == descriptor.width and
+            graphics_resources.descriptors[0].height == descriptor.height and
+            graphics_resources.descriptors[1].tile_mode.isLinear() and
+            graphics_resources.descriptors[1].unified_format == 14 and
+            graphics_resources.descriptors[1].width * 2 == descriptor.width and
+            graphics_resources.descriptors[1].height * 2 == descriptor.height;
+        if (fragment_attribute_mask == 1 and
+            (planar_video_pass or vertex_storage.mapping_count == 0))
+        {
+            probe_parameter_mask = 1;
+            paired_parameter_mask = 1;
+            fragment_input_controls[0] = 0;
+        }
         // prepareComputeResources soft-skips missing V#s; rebuild its scalar
         // list from the seeded specialization so SPIR-V and staging agree.
         if (vertex_storage.scalar_count == 0 and vertex_scalar_count != 0) {
@@ -5286,7 +5776,7 @@ pub const Renderer = struct {
         for (vertex_scalar_regs[0..vertex_scalar_count]) |seeded| {
             var found = false;
             for (vertex_storage.scalar_registers[0..vertex_storage.scalar_count]) |*entry| {
-                if (entry.register == seeded.register) {
+                if (entry.register == seeded.register and entry.producer_pc == seeded.producer_pc) {
                     entry.value = seeded.value;
                     found = true;
                     break;
@@ -5302,7 +5792,7 @@ pub const Renderer = struct {
             for (vertex_storage.mappings[0..vertex_storage.mapping_count]) |mapping| {
                 const slot: usize = @intCast(mapping.descriptor_index);
                 std.debug.print(
-                    "  pc={any} V#s{d} slot={d} addr=0x{x} size=0x{x} stride={d} soffset={any}\n",
+                    "  pc={any} V#s{d} slot={d} addr=0x{x} size=0x{x} stride={d} fmt={d} dst={any} soffset={any}\n",
                     .{
                         mapping.instruction_pc,
                         mapping.resource_sgpr,
@@ -5310,6 +5800,8 @@ pub const Renderer = struct {
                         vertex_storage.addresses[slot],
                         vertex_storage.sizes[slot],
                         mapping.stride,
+                        mapping.unified_format,
+                        mapping.dst_select,
                         mapping.soffset_value,
                     },
                 );
@@ -5320,6 +5812,71 @@ pub const Renderer = struct {
             "[vulkan dcb] vertex storage: mappings={d} scalars={d}\n",
             .{ vertex_storage.mapping_count, vertex_storage.scalar_count },
         );
+        if (self.shouldReportVertexResources(vertex_address)) {
+            std.debug.print(
+                "[vulkan dcb] vertex resources program=0x{x} mappings={d} scalars={d} index=0x{x}/{any} vertices={any} cfg={d}/{d} back={d}\n",
+                .{
+                    vertex_address,
+                    vertex_storage.mapping_count,
+                    vertex_storage.scalar_count,
+                    draw.index_address,
+                    draw.index_count,
+                    draw.vertex_count,
+                    vertex_analysis.graph.blocks.items.len,
+                    vertex_analysis.graph.selections.items.len,
+                    vertex_analysis.graph.back_edge_count,
+                },
+            );
+            for (vertex_storage.mappings[0..vertex_storage.mapping_count]) |mapping| {
+                const slot: usize = @intCast(mapping.descriptor_index);
+                std.debug.print(
+                    "  pc={any} V#s{d} slot={d} addr=0x{x} size=0x{x} stride={d} fmt={d} dst={any} soffset={any} vertex_index={any}\n",
+                    .{
+                        mapping.instruction_pc,
+                        mapping.resource_sgpr,
+                        mapping.descriptor_index,
+                        vertex_storage.addresses[slot],
+                        vertex_storage.sizes[slot],
+                        mapping.stride,
+                        mapping.unified_format,
+                        mapping.dst_select,
+                        mapping.soffset_value,
+                        mapping.use_vertex_index,
+                    },
+                );
+                if (mapping.use_vertex_index) {
+                    var first_record: [8]u32 = undefined;
+                    if (reader.readWords(vertex_storage.addresses[slot], &first_record)) |_| {
+                        std.debug.print(
+                            "    first={x:0>8} {x:0>8} {x:0>8} {x:0>8} as_f32={d:.3},{d:.3},{d:.3},{d:.3}\n",
+                            .{
+                                first_record[0],
+                                first_record[1],
+                                first_record[2],
+                                first_record[3],
+                                @as(f32, @bitCast(first_record[0])),
+                                @as(f32, @bitCast(first_record[1])),
+                                @as(f32, @bitCast(first_record[2])),
+                                @as(f32, @bitCast(first_record[3])),
+                            },
+                        );
+                    } else |_| {}
+                }
+            }
+            if (draw.index_address != 0 and draw.index_count != null and draw.index_count.? != 0) {
+                var index_bytes: [16]u8 = undefined;
+                if (reader.read(draw.index_address, &index_bytes)) |_| {
+                    std.debug.print("  indices", .{});
+                    var index: usize = 0;
+                    while (index < index_bytes.len) : (index += 2) {
+                        std.debug.print(" {d}", .{std.mem.readInt(u16, index_bytes[index..][0..2], .little)});
+                    }
+                    std.debug.print("\n", .{});
+                } else |_| {}
+            }
+            dumpWideScalarLoads(vertex_scalar_regs[0..vertex_scalar_count]);
+            dumpShaderHead(vertex_analysis, vertex_analysis.program.instructions.items.len);
+        }
 
         // Pixel shaders use MUBUF/TBUFFER for constant and structured data as
         // well as sampled images.  Keep their descriptor slots disjoint from
@@ -5361,6 +5918,50 @@ pub const Renderer = struct {
             std.debug.print("[vulkan dcb] first fragment storage mappings={d}\n", .{fragment_storage.mapping_count});
             self.reported_fragment_storage_bindings = true;
         }
+        if (self.shouldReportFragmentResources(fragment_address)) {
+            std.debug.print(
+                "[vulkan dcb] fragment resources program=0x{x} sampled={d} storage={d} scalars={d} loads={d} params=0x{x}\n",
+                .{
+                    fragment_address,
+                    graphics_resources.mapping_count,
+                    fragment_storage.mapping_count,
+                    fragment_scalar_count,
+                    fragment_scalar.load_count,
+                    paired_parameter_mask,
+                },
+            );
+            for (graphics_resources.mappings[0..graphics_resources.mapping_count]) |mapping| {
+                const sampled_descriptor = graphics_resources.descriptors[@intCast(mapping.descriptor_index)];
+                std.debug.print(
+                    "  image T#s{d} S#s{d} slot={d} addr=0x{x} {d}x{d} pitch={d} fmt={d} tile={s}\n",
+                    .{
+                        mapping.resource_sgpr,
+                        mapping.sampler_sgpr,
+                        mapping.descriptor_index,
+                        sampled_descriptor.address,
+                        sampled_descriptor.width,
+                        sampled_descriptor.height,
+                        sampled_descriptor.pitch,
+                        sampled_descriptor.unified_format,
+                        @tagName(sampled_descriptor.tile_mode),
+                    },
+                );
+            }
+            for (fragment_storage.mappings[0..fragment_storage.mapping_count]) |mapping| {
+                std.debug.print(
+                    "  buffer pc={any} V#s{d} slot={d} stride={d} soffset={any}\n",
+                    .{
+                        mapping.instruction_pc,
+                        mapping.resource_sgpr,
+                        mapping.descriptor_index,
+                        mapping.stride,
+                        mapping.soffset_value,
+                    },
+                );
+            }
+            dumpScalarRegisters(fragment_scalar_regs[0..fragment_scalar_count]);
+            dumpShaderHead(fragment_analysis, fragment_analysis.program.instructions.items.len);
+        }
 
         const fragment_translate_started = hostTimestampNs();
         var fragment_module = fragment_analysis.translateSpirv(self.allocator, .{
@@ -5369,6 +5970,7 @@ pub const Renderer = struct {
             .sampled_images = graphics_resources.mappings[0..graphics_resources.mapping_count],
             .storage_buffers = fragment_storage.mappings[0..fragment_storage.mapping_count],
             .parameter_mask = paired_parameter_mask,
+            .fragment_input_controls = &fragment_input_controls,
             .infer_fragment_parameter_mask = false,
             .descriptor_array_length = maximum_storage_descriptors,
             .scalar_registers = fragment_scalar_regs[0..fragment_scalar_count],
@@ -5392,20 +5994,56 @@ pub const Renderer = struct {
         };
         self.frame_profile.shader_translate_ns +|= elapsedHostNanoseconds(fragment_translate_started);
         defer fragment_module.deinit(self.allocator);
+        if (self.flip_callbacks == 240 and fragment_module.used_control_flow_fallback) {
+            std.debug.print("[vulkan dcb] traced fragment program 0x{x} uses linear control-flow fallback\n", .{fragment_address});
+        }
+        var texture_probe_module: ?rdna2.spirv.Module = null;
+        defer if (texture_probe_module) |*module| module.deinit(self.allocator);
+        if (self.force_probe_fragment_texture and graphics_resources.mapping_count != 0) {
+            texture_probe_module = try buildTextureProbeFragmentSpirv(
+                self.allocator,
+                graphics_resources.mappings[0],
+                .{ target.descriptor.width, target.descriptor.height },
+            );
+        }
+        var parameter_probe_module: ?rdna2.spirv.Module = null;
+        defer if (parameter_probe_module) |*module| module.deinit(self.allocator);
+        if (self.force_probe_fragment_parameter) {
+            parameter_probe_module = try buildParameterProbeFragmentSpirv(self.allocator);
+        }
+        var ui_probe_module: ?rdna2.spirv.Module = null;
+        defer if (ui_probe_module) |*module| module.deinit(self.allocator);
+        if (self.force_probe_fragment_ui and graphics_resources.mapping_count != 0) {
+            ui_probe_module = try buildUiProbeFragmentSpirv(
+                self.allocator,
+                graphics_resources.mappings[0],
+                .{ target.descriptor.width, target.descriptor.height },
+            );
+        }
         const fragment_words = if (self.force_probe_fragment)
             graphics_probe_fragment_spirv[0..]
+        else if (texture_probe_module) |module|
+            module.words
+        else if (parameter_probe_module) |module|
+            module.words
+        else if (ui_probe_module) |module|
+            module.words
         else
             fragment_module.words;
 
-        // Prefer the guest VS whenever at least one attribute V# mapped. AGC
-        // commonly places it at s0 or s8 as well as s4; requiring one fixed
-        // SGPR was what collapsed whole scenes onto the probe triangle.
-        const try_guest_vs = vertex_storage.mapping_count != 0 and probe_parameter_mask == 0;
+        // Procedural draws deliberately have no V# mappings: fullscreen NGG
+        // programs synthesize their rectangle from the system vertex index.
+        // Attempt every guest VS unless the paired pixel shader explicitly
+        // requires our video/UV probe. Missing individual buffers lower as
+        // null resources, so they no longer justify replacing the whole stage.
+        const try_guest_vs = probe_parameter_mask == 0;
         if (try_guest_vs) {
             const vertex_translate_started = hostTimestampNs();
             if (vertex_analysis.translateSpirv(self.allocator, .{
                 .stage = .vertex,
-                .vertex_index_vgpr = 0,
+                // The PS5 NGG/export ABI supplies S_NGG_VERTEX_INDEX in v5;
+                // ordinary VS programs retain the legacy v0 convention.
+                .vertex_index_vgpr = if (vertex_stage == .export_shader) 5 else 0,
                 .scalar_registers = vertex_scalar_regs[0..vertex_scalar_count],
                 .specialized_scalar_prefix_end = vertex_scalar_end,
                 .storage_buffers = vertex_storage.mappings[0..vertex_storage.mapping_count],
@@ -5414,6 +6052,9 @@ pub const Renderer = struct {
                 self.frame_profile.shader_translate_ns +|= elapsedHostNanoseconds(vertex_translate_started);
                 var vertex_module = vertex_module_owned;
                 defer vertex_module.deinit(self.allocator);
+                if (self.flip_callbacks == 240 and vertex_module.used_control_flow_fallback) {
+                    std.debug.print("[vulkan dcb] traced vertex program 0x{x} uses linear control-flow fallback\n", .{vertex_address});
+                }
                 if (log_verbose_gpu) std.debug.print(
                     "[vulkan dcb] using guest VS + guest PS; sampled={d} idx={any} storage={d}\n",
                     .{
@@ -5433,6 +6074,47 @@ pub const Renderer = struct {
                     false,
                     draw,
                 );
+                if (self.flip_callbacks == 240) {
+                    if (self.latest_render_target_index) |target_index| {
+                        try self.materializeRenderTarget(target_index);
+                        const captured_target = self.render_targets.items[target_index].target;
+                        std.debug.print(
+                            "[vulkan dcb] traced draw target @0x{x} {d}x{d} bpp={d} draw={d}\n",
+                            .{
+                                captured_target.descriptor.address,
+                                captured_target.descriptor.width,
+                                captured_target.descriptor.height,
+                                captured_target.format.bytes_per_texel,
+                                self.frame_profile.draws,
+                            },
+                        );
+                        for (self.completed_frames.items) |captured| {
+                            if (captured.guest_address != captured_target.descriptor.address) continue;
+                            var trace_path_buffer: [96]u8 = undefined;
+                            const trace_path = std.fmt.bufPrintZ(
+                                &trace_path_buffer,
+                                "out\\trace-frame-{d:0>4}-draw-{d}.ppm",
+                                .{ self.flip_callbacks + 1, self.frame_profile.draws },
+                            ) catch break;
+                            if (captured_target.format.bytes_per_texel == 4) {
+                                dumpFramePpm(
+                                    trace_path.ptr,
+                                    captured.width,
+                                    captured.height,
+                                    captured.pixels.items,
+                                );
+                            } else if (captured_target.format.bytes_per_texel == 8) {
+                                dumpRgba16FloatFramePpm(
+                                    trace_path.ptr,
+                                    captured.width,
+                                    captured.height,
+                                    captured.pixels.items,
+                                );
+                            }
+                            break;
+                        }
+                    }
+                }
                 // The persistent attachment is intentionally not read back
                 // here.  A probe-VS retry used to require a full-frame GPU→CPU
                 // round trip after every draw and also painted over valid
@@ -5444,6 +6126,29 @@ pub const Renderer = struct {
                         "[vulkan dcb] vertex program 0x{x} ({s}): translate={s}; falling back to probe VS\n",
                         .{ vertex_address, @tagName(vertex_stage), @errorName(err) },
                     );
+                    std.debug.print(
+                        "[vulkan dcb] vertex recovery stop={s}@0x{x} loads={d} known={d} storage={d}\n",
+                        .{
+                            @tagName(vertex_scalar.stop_reason),
+                            vertex_scalar.stop_pc,
+                            vertex_scalar.load_count,
+                            vertex_scalar_count,
+                            vertex_storage.mapping_count,
+                        },
+                    );
+                    dumpScalarRegisters(vertex_scalar_regs[0..vertex_scalar_count]);
+                    for (vertex_storage.mappings[0..vertex_storage.mapping_count]) |mapping| {
+                        std.debug.print(
+                            "  storage pc={any} V#s{d} slot={d} stride={d} soffset={any}\n",
+                            .{
+                                mapping.instruction_pc,
+                                mapping.resource_sgpr,
+                                mapping.descriptor_index,
+                                mapping.stride,
+                                mapping.soffset_value,
+                            },
+                        );
+                    }
                     dumpShaderHead(vertex_analysis, vertex_analysis.program.instructions.items.len);
                 }
             }
@@ -5454,7 +6159,14 @@ pub const Renderer = struct {
             );
         }
         if (probe_parameter_mask != 0) {
-            var probe_vertex_module = try buildFullscreenProbeVertexSpirv(self.allocator);
+            // Decoded FFmpeg rows already use top-to-bottom image order. Keep
+            // the NV12 conversion pass unflipped, then compensate exactly once
+            // when the converted texture is composed through our negative-
+            // height guest viewport.
+            var probe_vertex_module = try buildFullscreenProbeVertexSpirv(
+                self.allocator,
+                !planar_video_pass,
+            );
             defer probe_vertex_module.deinit(self.allocator);
             try self.drawGraphicsShaders(
                 probe_vertex_module.words,
@@ -5504,18 +6216,51 @@ pub const Renderer = struct {
             }
             if (existing) continue;
             if (result.mapping_count >= maximum_storage_descriptors) return Error.UnsupportedSampledImage;
-            // Prefer T#/S# already in USER_DATA; otherwise take the next SRT
-            // texture/sampler slots in declaration order (common AGC layout).
-            const image_descriptor = (try bindings.inlineImageDescriptor(inst.src1.reg)) orelse
-                (try resolveSrtImageDescriptor(bindings, reader, result.mapping_count)) orelse {
+            // T# and S# declarations have independent slot spaces. A shader
+            // commonly samples the Y and UV video planes through one shared
+            // sampler; advancing both slots per T#/S# pair incorrectly asks
+            // for sampler 1 even though both instructions name sampler 0.
+            const image_slot = graphicsSrtImageSlot(
+                result.mappings[0..result.mapping_count],
+                inst.src1.reg,
+            );
+            const sampler_slot = graphicsSrtSamplerSlot(
+                result.mappings[0..result.mapping_count],
+                inst.src2.reg,
+            );
+            // Graphics programs load T#/S# through scalar prologs just like
+            // compute programs. Recover the state at this particular sample;
+            // the fallback slots still cover shaders that reference only SRT
+            // metadata and have no executable scalar producer.
+            const sampled_scalar = gpu.scalar_provenance.evaluateResourceStateUntil(
+                reader,
+                bindings,
+                inst.pc,
+            );
+            const image_descriptor = (try resolveComputeSampledImageDescriptor(
+                bindings,
+                reader,
+                analysis,
+                &sampled_scalar,
+                inst.src1.reg,
+                inst.pc,
+                image_slot,
+            )) orelse {
                 std.debug.print(
                     "[vulkan dcb] sampled image missing for s{d} (user_data={d} srt={any})\n",
                     .{ inst.src1.reg, bindings.user_data_count, bindings.srt_address != null },
                 );
                 return Error.UnsupportedSampledImage;
             };
-            const sampler_descriptor = (try bindings.inlineSamplerDescriptor(inst.src2.reg)) orelse
-                (try resolveSrtSamplerDescriptor(bindings, reader, result.mapping_count)) orelse {
+            const sampler_descriptor = (try resolveComputeSamplerDescriptor(
+                bindings,
+                reader,
+                analysis,
+                &sampled_scalar,
+                inst.src2.reg,
+                inst.pc,
+                sampler_slot,
+            )) orelse {
                 std.debug.print(
                     "[vulkan dcb] sampler missing for s{d}\n",
                     .{inst.src2.reg},
@@ -5537,6 +6282,7 @@ pub const Renderer = struct {
                 return err;
             };
             result.images[result.image_count] = image;
+            result.descriptors[result.image_count] = image_descriptor;
             result.image_count += 1;
             result.mappings[result.mapping_count] = .{
                 .resource_sgpr = inst.src1.reg,
@@ -5901,6 +6647,14 @@ pub const Renderer = struct {
             );
             return Error.UnsupportedSampledImage;
         }
+        if (try self.stageResidentRenderTarget(
+            descriptor,
+            sampler_descriptor,
+            image_format,
+            descriptor_index,
+        )) |resident| {
+            return resident;
+        }
         const byte_count = std.math.cast(usize, layout.staging_bytes) orelse return Error.UnsupportedSampledImage;
         const probe_span = std.math.cast(usize, layout.required_source_bytes) orelse 0;
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
@@ -6018,7 +6772,7 @@ pub const Renderer = struct {
                 }
             }
         }
-        if (log_verbose_gpu) std.debug.print(
+        if (log_verbose_gpu or self.texture_cache_misses <= 4) std.debug.print(
             "[vulkan dcb] staged sample {d}x{d} tile={s} addr=0x{x} nonzero_texels={d}/{d} raw_probe_nz={d} hits={d} first_rgba=({d},{d},{d},{d})\n",
             .{
                 descriptor.width,
@@ -6244,15 +6998,14 @@ pub const Renderer = struct {
     }
 
     fn createGuestSampler(self: *Renderer, descriptor: gpu.resources.SamplerDescriptor) Error!vk.Sampler {
-        if (descriptor.magnification_filter > 1 or descriptor.minification_filter > 1 or
-            descriptor.mip_filter > 1 or descriptor.unnormalized_coordinates)
-        {
-            return Error.UnsupportedSampledImage;
-        }
+        if (descriptor.unnormalized_coordinates) return Error.UnsupportedSampledImage;
         const info = vk.SamplerCreateInfo{
-            .magnification_filter = descriptor.magnification_filter,
-            .minification_filter = descriptor.minification_filter,
-            .mipmap_mode = descriptor.mip_filter,
+            // GFX10 encodes anisotropic point/linear as 2/3. Vulkan keeps
+            // anisotropy as a separate setting, so preserve their base
+            // point/linear behavior even while anisotropic filtering is off.
+            .magnification_filter = vulkanMinMagFilter(descriptor.magnification_filter),
+            .minification_filter = vulkanMinMagFilter(descriptor.minification_filter),
+            .mipmap_mode = if (descriptor.mip_filter == 2) 1 else 0,
             .address_mode_u = try vulkanAddressMode(descriptor.clamp_x),
             .address_mode_v = try vulkanAddressMode(descriptor.clamp_y),
             .address_mode_w = try vulkanAddressMode(descriptor.clamp_z),
@@ -6275,6 +7028,8 @@ pub const Renderer = struct {
             3 => 4,
             4 => 3,
             5 => 4,
+            6 => 3,
+            7 => 4,
             else => Error.UnsupportedSampledImage,
         };
     }
@@ -6581,6 +7336,12 @@ pub const Renderer = struct {
                 if (idx < self.completed_frames.items.len) {
                     const cached = &self.completed_frames.items[idx];
                     if (cached.pixels.items.len != 0 and countNonzeroRgba(cached.pixels.items) != 0) {
+                        self.maybeDumpProgressFrame(
+                            cached.pixels.items,
+                            cached.width,
+                            cached.height,
+                            cached.width * 4,
+                        );
                         return sink.present(sink.context, .{
                             .pixels = cached.pixels.items,
                             .width = cached.width,
@@ -6594,6 +7355,12 @@ pub const Renderer = struct {
             }
         }
 
+        self.maybeDumpProgressFrame(
+            self.guest_frame_scratch.items,
+            buffer.width,
+            buffer.height,
+            @intCast(row_bytes),
+        );
         return sink.present(sink.context, .{
             .pixels = self.guest_frame_scratch.items,
             .width = buffer.width,
@@ -6602,6 +7369,31 @@ pub const Renderer = struct {
             .guest_address = buffer.address,
             .flip = flip,
         });
+    }
+
+    fn maybeDumpProgressFrame(
+        self: *Renderer,
+        pixels: []const u8,
+        width: u32,
+        height: u32,
+        row_pitch_bytes: u32,
+    ) void {
+        if (row_pitch_bytes != width * 4) return;
+        if (shouldDumpProgressFrame(self.flip_callbacks)) {
+            var path_buffer: [64]u8 = undefined;
+            const path: ?[:0]u8 = std.fmt.bufPrintZ(
+                &path_buffer,
+                "out\\frame-{d:0>4}.ppm",
+                .{self.flip_callbacks},
+            ) catch null;
+            if (path) |name| {
+                dumpFramePpm(name.ptr, width, height, pixels);
+                std.debug.print(
+                    "[vulkan dcb] dumped progress frame {d} ({d}x{d})\n",
+                    .{ self.flip_callbacks, width, height },
+                );
+            }
+        }
     }
 
     fn reportFrameProfile(self: *Renderer) void {
@@ -6731,7 +7523,13 @@ pub const Renderer = struct {
                 return false;
             };
             self.resolvePendingTargetlessDraw(requested.?);
-            if (self.window_presentation != null and self.flip_callbacks != 8) {
+            // Most frames can go directly from the resident render target to
+            // the swapchain. At a handful of diagnostic checkpoints take the
+            // normal materialization path so the PPM is the frame that was
+            // actually presented, not stale guest memory.
+            if (self.window_presentation != null and
+                !shouldDumpProgressFrame(self.flip_callbacks))
+            {
                 for (self.render_targets.items, 0..) |target, target_index| {
                     if (target.target.descriptor.address != requested.?.address or !target.initialized) continue;
                     self.blitRenderTargetToSwapchain(target_index) catch |err| {
@@ -6786,24 +7584,12 @@ pub const Renderer = struct {
             self.last_flip_error = Error.MissingPresentedFrame;
             return false;
         }
-        switch (self.flip_callbacks) {
-            8, 16, 32, 64, 96, 128 => {
-                var path_buffer: [64]u8 = undefined;
-                const path: ?[:0]u8 = std.fmt.bufPrintZ(
-                    &path_buffer,
-                    "out\\frame-{d:0>4}.ppm",
-                    .{self.flip_callbacks},
-                ) catch null;
-                if (path) |name| {
-                    dumpFramePpm(name.ptr, cached.width, cached.height, cached.pixels.items);
-                    std.debug.print(
-                        "[vulkan dcb] dumped progress frame {d} ({d}x{d})\n",
-                        .{ self.flip_callbacks, cached.width, cached.height },
-                    );
-                }
-            },
-            else => {},
-        }
+        self.maybeDumpProgressFrame(
+            cached.pixels.items,
+            cached.width,
+            cached.height,
+            cached.width * 4,
+        );
         if (self.presentation_sink) |sink| {
             if (!sink.present(sink.context, .{
                 .pixels = cached.pixels.items,
@@ -6841,15 +7627,41 @@ pub const Renderer = struct {
         stage: gpu.resources.ShaderStage,
         err: anyerror,
     ) bool {
-        const repeated = self.last_shader_failure_address == address and
-            self.last_shader_failure_stage != null and
-            self.last_shader_failure_stage.? == stage and
-            self.last_shader_failure_error != null and
-            self.last_shader_failure_error.? == err;
-        self.last_shader_failure_address = address;
-        self.last_shader_failure_stage = stage;
-        self.last_shader_failure_error = err;
-        return !repeated;
+        for (&self.reported_shader_failures) |*reported| {
+            if (reported.* == null) {
+                reported.* = .{ .address = address, .stage = stage, .err = err };
+                return true;
+            }
+            if (reported.*.?.address == address and
+                reported.*.?.stage == stage and
+                reported.*.?.err == err)
+            {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    fn shouldReportVertexResources(self: *Renderer, address: u64) bool {
+        for (&self.reported_vertex_resource_programs) |*reported| {
+            if (reported.* == address) return false;
+            if (reported.* == 0) {
+                reported.* = address;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn shouldReportFragmentResources(self: *Renderer, address: u64) bool {
+        for (&self.reported_fragment_resource_programs) |*reported| {
+            if (reported.* == address) return false;
+            if (reported.* == 0) {
+                reported.* = address;
+                return true;
+            }
+        }
+        return false;
     }
 
     fn shouldReportDrawError(self: *Renderer, err: anyerror) bool {
@@ -6870,6 +7682,17 @@ pub const Renderer = struct {
                 return true;
             }
             if (reported.*.?.address == address and reported.*.?.err == err) return false;
+        }
+        return false;
+    }
+
+    fn shouldReportComputeResources(self: *Renderer, address: u64) bool {
+        for (&self.reported_compute_resource_programs) |*reported| {
+            if (reported.* == address) return false;
+            if (reported.* == 0) {
+                reported.* = address;
+                return true;
+            }
         }
         return false;
     }
@@ -6950,7 +7773,35 @@ pub const Renderer = struct {
             self.discardPendingTargetlessDraw();
             self.drawGuestGraphics(state, draw, vertex_stage.?, null) catch |err| {
                 self.last_draw_error = err;
-                if (self.shouldReportDrawError(err)) std.debug.print("[vulkan dcb] draw rejected: {s}\n", .{@errorName(err)});
+                if (self.shouldReportDrawError(err)) {
+                    std.debug.print("[vulkan dcb] draw rejected: {s}\n", .{@errorName(err)});
+                    if (err == Error.UnsupportedColorTarget) {
+                        const rejected_state = gpu.resources.decodeRenderState(state);
+                        for (rejected_state.color_targets) |candidate| {
+                            const target = candidate orelse continue;
+                            if (!target.isActive()) continue;
+                            std.debug.print(
+                                "[vulkan dcb] rejected target slot={d} addr=0x{x} {d}x{d} pitch={d} fmt={d} num={d} swap={d} tile={s} samples={d} frags={d} dcc={any} cmask={any} fmask={any}\n",
+                                .{
+                                    target.slot,
+                                    target.address,
+                                    target.width,
+                                    target.height,
+                                    target.pitch,
+                                    target.format,
+                                    target.number_type,
+                                    target.component_swap,
+                                    @tagName(target.tile_mode),
+                                    target.samples_log2,
+                                    target.fragments_log2,
+                                    target.dcc_enabled,
+                                    target.cmask_fast_clear,
+                                    target.fmask_compression,
+                                },
+                            );
+                        }
+                    }
+                }
                 // Soft-skip shader/state gaps so one incomplete draw does not
                 // kill the DCB before a later flip.
                 return true;
@@ -6990,7 +7841,7 @@ pub const Renderer = struct {
             std.debug.print("[vulkan dcb] dispatch rejected: {s}\n", .{@errorName(Error.InvalidDispatchPacket)});
             return false;
         }
-        if (gpu.resources.ShaderStage.compute.programAddress(state) == null) {
+        const program_address = gpu.resources.ShaderStage.compute.programAddress(state) orelse {
             self.last_dispatch_error = Error.MissingComputeProgram;
             // A reset/default-state packet may be followed by a dispatch that
             // has no executable program in the subset of state we retain.
@@ -6998,12 +7849,28 @@ pub const Renderer = struct {
             // because this one compute operation cannot be reproduced yet.
             std.debug.print("[vulkan dcb] dispatch skipped: {s}\n", .{@errorName(Error.MissingComputeProgram)});
             return true;
-        }
+        };
         const local_size = [3]u32{
             computeLocalSize(state, 0x207),
             computeLocalSize(state, 0x208),
             computeLocalSize(state, 0x209),
         };
+        if (self.flip_callbacks == 240) {
+            std.debug.print(
+                "[vulkan dcb] dispatch trace next_flip={d} dispatch={d} program=0x{x} groups={d}x{d}x{d} local={d}x{d}x{d}\n",
+                .{
+                    self.flip_callbacks + 1,
+                    self.frame_profile.dispatches,
+                    program_address,
+                    packet.body[0],
+                    packet.body[1],
+                    packet.body[2],
+                    local_size[0],
+                    local_size[1],
+                    local_size[2],
+                },
+            );
+        }
         _ = self.dispatchRdna2State(
             state,
             local_size,
@@ -7645,16 +8512,21 @@ fn scalarPrefixEnd(analysis: *const gpu.ShaderAnalysis) u32 {
     return end;
 }
 
-fn collectKnownScalars(
+fn collectScalarLoadSpecializations(
     scalar: *const gpu.ScalarEvaluation,
     out: []gpu.ShaderSpirvScalarRegister,
 ) usize {
     var count: usize = 0;
-    for (scalar.registers, 0..) |value, index| {
-        if (!value.known) continue;
-        if (count >= out.len) break;
-        out[count] = .{ .register = @intCast(index), .value = value.value };
-        count += 1;
+    for (scalar.loadSlice()) |load| {
+        for (load.values[0..load.word_count], 0..) |value, word_index| {
+            if (count >= out.len) return count;
+            out[count] = .{
+                .register = load.destination + @as(u32, @intCast(word_index)),
+                .value = value,
+                .producer_pc = load.pc,
+            };
+            count += 1;
+        }
     }
     return count;
 }
@@ -7671,7 +8543,7 @@ fn mergeUserDataScalars(
         if (reg >= 128) break;
         var exists = false;
         for (out[0..n]) |entry| {
-            if (entry.register == reg) {
+            if (entry.register == reg and entry.producer_pc == null) {
                 exists = true;
                 break;
             }
@@ -7761,8 +8633,31 @@ fn hashGuestMemoryRange(memory: GuestMemory, address: u64, span: usize) u64 {
 
 fn sampledImageFormat(unified_format: u16, force_srgb: bool) ?u32 {
     return switch (unified_format) {
+        1 => vk.format_r8_unorm,
+        2 => vk.format_r8_snorm,
+        5 => vk.format_r8_uint,
+        6 => vk.format_r8_sint,
+        14 => vk.format_r8g8_unorm,
+        15 => vk.format_r8g8_snorm,
+        18 => vk.format_r8g8_uint,
+        19 => vk.format_r8g8_sint,
         56 => if (force_srgb) vk.format_r8g8b8a8_srgb else vk.format_r8g8b8a8_unorm,
         71 => vk.format_r16g16b16a16_sfloat,
+        130 => vk.format_r8g8b8a8_srgb,
+        169 => if (force_srgb) vk.format_bc1_rgba_srgb_block else vk.format_bc1_rgba_unorm_block,
+        170 => vk.format_bc1_rgba_srgb_block,
+        171 => if (force_srgb) vk.format_bc2_srgb_block else vk.format_bc2_unorm_block,
+        172 => vk.format_bc2_srgb_block,
+        173 => if (force_srgb) vk.format_bc3_srgb_block else vk.format_bc3_unorm_block,
+        174 => vk.format_bc3_srgb_block,
+        175 => vk.format_bc4_unorm_block,
+        176 => vk.format_bc4_snorm_block,
+        177 => vk.format_bc5_unorm_block,
+        178 => vk.format_bc5_snorm_block,
+        179 => vk.format_bc6h_ufloat_block,
+        180 => vk.format_bc6h_sfloat_block,
+        181 => if (force_srgb) vk.format_bc7_srgb_block else vk.format_bc7_unorm_block,
+        182 => vk.format_bc7_srgb_block,
         else => null,
     };
 }
@@ -7788,13 +8683,19 @@ fn storageImageFormat(unified_format: u16) ?StorageImageFormat {
 
 fn storageImageBytesPerTexel(unified_format: u16) u8 {
     return switch (unified_format) {
-        5 => 1,
-        11 => 2,
-        20, 36, 56, 60 => 4,
+        1...6 => 1,
+        7...19 => 2,
+        20, 36, 56, 60, 130 => 4,
         71 => 8,
         77 => 16,
+        169, 170 => 8,
+        171...182 => 16,
         else => 0,
     };
+}
+
+fn vulkanMinMagFilter(filter: u8) u32 {
+    return if (filter == 1 or filter == 3) 1 else 0;
 }
 
 fn vulkanComponentSwizzle(selector: u8) Error!u32 {
@@ -7810,6 +8711,12 @@ fn vulkanComponentSwizzle(selector: u8) Error!u32 {
 }
 
 fn sampledImageComponents(selectors: [4]u8) Error!vk.ComponentMapping {
+    for (selectors) |selector| {
+        if (selector != 0 and selector != 1 and (selector < 4 or selector > 7)) {
+            std.debug.print("[vulkan dcb] unsupported sampled component selectors {any}\n", .{selectors});
+            return Error.UnsupportedSampledImage;
+        }
+    }
     return .{
         .r = try vulkanComponentSwizzle(selectors[0]),
         .g = try vulkanComponentSwizzle(selectors[1]),
@@ -7868,6 +8775,40 @@ fn dccClearTexel(code: u8, descriptor: gpu.resources.ColorTarget) ?[4]u8 {
         0x20 => clearWordTexel(descriptor),
         else => null,
     };
+}
+
+/// Materializes the uniform DCC clear encodings used by supported colour
+/// attachments into the surface's native texel representation.
+fn colorDccClearTexel(code: u8, descriptor: gpu.resources.ColorTarget) ?DccClearTexel {
+    var result = DccClearTexel{ .bytes = @splat(0), .length = 0 };
+    switch (descriptor.format) {
+        10 => {
+            const rgba = dccClearTexel(code, descriptor) orelse return null;
+            result.bytes[0..4].* = rgba;
+            result.length = 4;
+        },
+        12 => {
+            if (descriptor.number_type != 7) return null;
+            result.length = 8;
+            if (code == 0x20) {
+                std.mem.writeInt(u32, result.bytes[0..4], descriptor.clear_words[0], .little);
+                std.mem.writeInt(u32, result.bytes[4..8], descriptor.clear_words[1], .little);
+                return result;
+            }
+            const channels: [4]u16 = switch (code) {
+                0x00 => .{ 0x0000, 0x0000, 0x0000, 0x0000 },
+                0x40 => .{ 0x0000, 0x0000, 0x0000, 0x3c00 },
+                0x80 => .{ 0x3c00, 0x3c00, 0x3c00, 0x0000 },
+                0xc0 => .{ 0x3c00, 0x3c00, 0x3c00, 0x3c00 },
+                else => return null,
+            };
+            for (channels, 0..) |channel, index| {
+                std.mem.writeInt(u16, result.bytes[index * 2 ..][0..2], channel, .little);
+            }
+        },
+        else => return null,
+    }
+    return result;
 }
 
 fn clearWordTexel(descriptor: gpu.resources.ColorTarget) ?[4]u8 {
@@ -8075,6 +9016,30 @@ fn fillRgba8(linear: []u8, texel: [4]u8) void {
     }
 }
 
+fn fillTexels(linear: []u8, texel: []const u8) void {
+    if (texel.len == 0 or linear.len % texel.len != 0) return;
+    var index: usize = 0;
+    while (index < linear.len) : (index += texel.len) {
+        @memcpy(linear[index..][0..texel.len], texel);
+    }
+}
+
+fn countNonzeroTexels(linear: []const u8, bytes_per_texel: u8) u32 {
+    const stride: usize = bytes_per_texel;
+    if (stride == 0 or linear.len % stride != 0) return 0;
+    var count: u32 = 0;
+    var index: usize = 0;
+    while (index < linear.len) : (index += stride) {
+        for (linear[index..][0..stride]) |byte| {
+            if (byte != 0) {
+                count +|= 1;
+                break;
+            }
+        }
+    }
+    return count;
+}
+
 fn fillNeutralTextureRgba8(linear: []u8) void {
     // Dark gray — distinguishable from black clear and from white UI fill.
     var i: usize = 0;
@@ -8187,6 +9152,19 @@ fn forceDestinationAlphaOne(rgba: []u8) void {
     }
 }
 
+fn forceColorTargetAlphaOne(linear: []u8, format: ColorTargetFormat) void {
+    switch (format.vulkan) {
+        vk.format_r8g8b8a8_unorm => forceDestinationAlphaOne(linear),
+        vk.format_r16g16b16a16_sfloat => {
+            var index: usize = 0;
+            while (index + 7 < linear.len) : (index += 8) {
+                std.mem.writeInt(u16, linear[index + 6 ..][0..2], 0x3c00, .little);
+            }
+        },
+        else => {},
+    }
+}
+
 fn makePresentationOpaque(rgba: []u8) void {
     forceDestinationAlphaOne(rgba);
 }
@@ -8230,7 +9208,7 @@ fn dumpShaderHead(analysis: *const gpu.ShaderAnalysis, limit: usize) void {
         }
         if (inst.opcode == .exp) {
             std.debug.print(
-                "  pc=0x{x:0>4} exp target={d} en=0x{x} done={any} compr={any} src0={s}:{d}\n",
+                "  pc=0x{x:0>4} exp target={d} en=0x{x} done={any} compr={any} src0={s}:r{d}/0x{x} src1={s}:r{d}/0x{x}\n",
                 .{
                     inst.pc,
                     inst.export_target,
@@ -8239,6 +9217,10 @@ fn dumpShaderHead(analysis: *const gpu.ShaderAnalysis, limit: usize) void {
                     inst.export_compressed,
                     @tagName(inst.src0.kind),
                     inst.src0.reg,
+                    inst.src0.value,
+                    @tagName(inst.src1.kind),
+                    inst.src1.reg,
+                    inst.src1.value,
                 },
             );
         } else if (inst.opcode == .buffer_load_format_xyz or
@@ -8264,7 +9246,7 @@ fn dumpShaderHead(analysis: *const gpu.ShaderAnalysis, limit: usize) void {
             );
         } else {
             std.debug.print(
-                "  pc=0x{x:0>4} word=0x{x:0>8} {s} dst={s}:{d} src0={s}:{d} src1={s}:{d} src2={s}:{d}\n",
+                "  pc=0x{x:0>4} word=0x{x:0>8} {s} dst={s}:{d} src0={s}:r{d}/0x{x} src1={s}:r{d}/0x{x} src2={s}:r{d}/0x{x}\n",
                 .{
                     inst.pc,
                     inst.word,
@@ -8273,10 +9255,13 @@ fn dumpShaderHead(analysis: *const gpu.ShaderAnalysis, limit: usize) void {
                     inst.dst.reg,
                     @tagName(inst.src0.kind),
                     inst.src0.reg,
+                    inst.src0.value,
                     @tagName(inst.src1.kind),
                     inst.src1.reg,
+                    inst.src1.value,
                     @tagName(inst.src2.kind),
                     inst.src2.reg,
+                    inst.src2.value,
                 },
             );
         }
@@ -8288,6 +9273,38 @@ fn dumpScalarRegisters(registers: []const gpu.ShaderSpirvScalarRegister) void {
     std.debug.print("  scalar seeds ({d}):", .{registers.len});
     for (registers) |entry| std.debug.print(" s{d}=0x{x}", .{ entry.register, entry.value });
     std.debug.print("\n", .{});
+}
+
+fn dumpWideScalarLoads(registers: []const gpu.ShaderSpirvScalarRegister) void {
+    var reported: [32]u32 = undefined;
+    var reported_count: usize = 0;
+    for (registers) |entry| {
+        const pc = entry.producer_pc orelse continue;
+        var words: usize = 0;
+        for (registers) |candidate| {
+            if (candidate.producer_pc == pc) words += 1;
+        }
+        if (words == 0) continue;
+        var seen = false;
+        for (reported[0..reported_count]) |existing| {
+            if (existing == pc) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen or reported_count >= reported.len) continue;
+        reported[reported_count] = pc;
+        reported_count += 1;
+        std.debug.print("  scalar load pc=0x{x} words={d}:", .{ pc, words });
+        for (registers) |candidate| {
+            if (candidate.producer_pc != pc) continue;
+            std.debug.print(
+                " s{d}=0x{x}({d:.5})",
+                .{ candidate.register, candidate.value, @as(f32, @bitCast(candidate.value)) },
+            );
+        }
+        std.debug.print("\n", .{});
+    }
 }
 
 const WindowsFileDump = if (builtin.os.tag == .windows) struct {
@@ -8371,6 +9388,30 @@ fn dumpFramePpm(path: [*:0]const u8, width: u32, height: u32, rgba: []const u8) 
     std.debug.print("[vulkan dcb] dumped {s} ({d}x{d})\n", .{ path, width, height });
 }
 
+/// Converts a linear RGBA16F attachment to an inspectable RGBA8 PPM. This is
+/// used only by the targeted draw tracer; a simple Reinhard curve keeps HDR
+/// highlights visible without letting a few large values wash out the frame.
+fn dumpRgba16FloatFramePpm(path: [*:0]const u8, width: u32, height: u32, rgba16: []const u8) void {
+    const pixel_count = @as(usize, width) * @as(usize, height);
+    if (width == 0 or height == 0 or rgba16.len < pixel_count * 8) return;
+    const rgba8 = std.heap.page_allocator.alloc(u8, pixel_count * 4) catch return;
+    defer std.heap.page_allocator.free(rgba8);
+
+    for (0..pixel_count) |pixel| {
+        for (0..3) |component| {
+            const source_offset = pixel * 8 + component * 2;
+            const bits = std.mem.readInt(u16, rgba16[source_offset..][0..2], .little);
+            const half: f16 = @bitCast(bits);
+            var value: f32 = @floatCast(half);
+            if (!std.math.isFinite(value) or value <= 0) value = 0;
+            const mapped = value / (1.0 + value);
+            rgba8[pixel * 4 + component] = @intFromFloat(@round(@min(mapped, 1.0) * 255.0));
+        }
+        rgba8[pixel * 4 + 3] = 255;
+    }
+    dumpFramePpm(path, width, height, rgba8);
+}
+
 fn resolveSrtImageDescriptor(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
@@ -8389,6 +9430,46 @@ fn resolveSrtSamplerDescriptor(
     if (slot > std.math.maxInt(u16)) return null;
     const binding = (try bindings.resolve(reader, .sampler, @intCast(slot))) orelse return null;
     return binding.descriptor.sampler;
+}
+
+fn graphicsSrtImageSlot(
+    mappings: []const gpu.ShaderSpirvSampledImageBinding,
+    resource_sgpr: u32,
+) usize {
+    var slot: usize = 0;
+    for (mappings, 0..) |mapping, index| {
+        var first_use = true;
+        for (mappings[0..index]) |previous| {
+            if (previous.resource_sgpr == mapping.resource_sgpr) {
+                first_use = false;
+                break;
+            }
+        }
+        if (!first_use) continue;
+        if (mapping.resource_sgpr == resource_sgpr) return slot;
+        slot += 1;
+    }
+    return slot;
+}
+
+fn graphicsSrtSamplerSlot(
+    mappings: []const gpu.ShaderSpirvSampledImageBinding,
+    sampler_sgpr: u32,
+) usize {
+    var slot: usize = 0;
+    for (mappings, 0..) |mapping, index| {
+        var first_use = true;
+        for (mappings[0..index]) |previous| {
+            if (previous.sampler_sgpr == mapping.sampler_sgpr) {
+                first_use = false;
+                break;
+            }
+        }
+        if (!first_use) continue;
+        if (mapping.sampler_sgpr == sampler_sgpr) return slot;
+        slot += 1;
+    }
+    return slot;
 }
 
 fn scalarBufferDescriptor(
@@ -8700,6 +9781,12 @@ fn resolveComputeBufferDescriptor(
     resource_sgpr: u32,
     instruction_pc: u32,
 ) anyerror!?gpu.BufferDescriptor {
+    // `specialized` is the scalar state immediately before this memory
+    // instruction. It is stronger than a producer-chain reconstruction and
+    // preserves SGPR reuse across several descriptor loads.
+    if (takePlausibleBufferDescriptor(try scalarBufferDescriptor(specialized, resource_sgpr))) |descriptor| {
+        return descriptor;
+    }
     if (try resolveProducedBufferDescriptor(
         bindings,
         reader,
@@ -8710,9 +9797,6 @@ fn resolveComputeBufferDescriptor(
         0,
     )) |descriptor| {
         if (isBoundedProducedBufferDescriptor(descriptor)) return descriptor;
-    }
-    if (takePlausibleBufferDescriptor(try scalarBufferDescriptor(specialized, resource_sgpr))) |descriptor| {
-        return descriptor;
     }
     if (takePlausibleBufferDescriptor(try scalarBufferDescriptor(full, resource_sgpr))) |descriptor| {
         return descriptor;
@@ -8857,7 +9941,7 @@ fn seedVertexBufferScalars(
             const reg = sgpr + word_i;
             var found: ?usize = null;
             for (out[0..n], 0..) |entry, index| {
-                if (entry.register == reg) {
+                if (entry.register == reg and entry.producer_pc == null) {
                     found = index;
                     break;
                 }
@@ -9161,7 +10245,171 @@ fn createWindowPresentation(
     };
 }
 
-fn buildFullscreenProbeVertexSpirv(allocator: std.mem.Allocator) !rdna2.spirv.Module {
+fn buildParameterProbeFragmentSpirv(allocator: std.mem.Allocator) !rdna2.spirv.Module {
+    const vgpr = struct {
+        fn at(reg: u32) rdna2.Operand {
+            return .{ .kind = .vgpr, .reg = reg };
+        }
+    }.at;
+    const uint = struct {
+        fn value(bits: u32) rdna2.Operand {
+            return .{ .kind = .integer_inline_constant, .value = bits, .signed_val = @intCast(bits) };
+        }
+    }.value;
+
+    var program = rdna2.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(allocator);
+    for (0..4) |component| {
+        const channel: u32 = @intCast(component);
+        try program.instructions.append(allocator, .{
+            .pc = channel * 4,
+            .family = .vintrp,
+            .opcode = .v_interp_mov_f32,
+            .dst = vgpr(channel),
+            .src0 = uint(channel),
+            .src1 = uint(0),
+            .src2 = uint(channel),
+            .src_count = 3,
+        });
+    }
+    try program.instructions.appendSlice(allocator, &.{
+        .{ .pc = 16, .family = .exp, .opcode = .exp, .export_target = 0, .export_enable = 0xf, .export_done = true, .src0 = vgpr(0), .src1 = vgpr(1), .src2 = vgpr(2), .src3 = vgpr(3), .src_count = 4 },
+        .{ .pc = 24, .family = .sopp, .opcode = .s_endpgm },
+    });
+    return rdna2.translateSpirv(allocator, &program, .{
+        .stage = .fragment,
+        .parameter_mask = 1,
+        .infer_fragment_parameter_mask = false,
+    });
+}
+
+fn buildTextureProbeFragmentSpirv(
+    allocator: std.mem.Allocator,
+    binding: rdna2.spirv.SampledImageBinding,
+    fragment_extent: [2]u32,
+) !rdna2.spirv.Module {
+    const vgpr = struct {
+        fn at(reg: u32) rdna2.Operand {
+            return .{ .kind = .vgpr, .reg = reg };
+        }
+    }.at;
+    const sgpr = struct {
+        fn at(reg: u32) rdna2.Operand {
+            return .{ .kind = .sgpr, .reg = reg };
+        }
+    }.at;
+    const uint = struct {
+        fn value(bits: u32) rdna2.Operand {
+            return .{ .kind = .integer_inline_constant, .value = bits, .signed_val = @intCast(bits) };
+        }
+    }.value;
+    const sample_pc = binding.instruction_pc orelse 8;
+
+    var program = rdna2.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(allocator);
+    try program.instructions.appendSlice(allocator, &.{
+        // The traced Unity UI shader samples from PARAM1.xy. PARAM0 carries
+        // the per-vertex colour and is intentionally not involved here.
+        .{ .pc = 0, .family = .vintrp, .opcode = .v_interp_mov_f32, .dst = vgpr(0), .src0 = uint(0), .src1 = uint(1), .src2 = uint(0), .src_count = 3 },
+        .{ .pc = 4, .family = .vintrp, .opcode = .v_interp_mov_f32, .dst = vgpr(1), .src0 = uint(1), .src1 = uint(1), .src2 = uint(1), .src_count = 3 },
+        .{
+            .pc = sample_pc,
+            .family = .mimg,
+            .opcode_id = 0x20,
+            .opcode = .image_sample,
+            .dst = vgpr(2),
+            .src0 = vgpr(0),
+            .src1 = sgpr(binding.resource_sgpr),
+            .src2 = sgpr(binding.sampler_sgpr),
+            .src_count = 3,
+            .data_mask = 0xf,
+            .image_dimension = .dim_2d,
+            .image_address_components = 2,
+        },
+        .{ .pc = sample_pc + 8, .family = .exp, .opcode = .exp, .export_target = 0, .export_enable = 0xf, .export_done = true, .src0 = vgpr(2), .src1 = vgpr(3), .src2 = vgpr(4), .src3 = vgpr(5), .src_count = 4 },
+        .{ .pc = sample_pc + 16, .family = .sopp, .opcode = .s_endpgm },
+    });
+    const sampled = [_]rdna2.spirv.SampledImageBinding{binding};
+    return rdna2.translateSpirv(allocator, &program, .{
+        .stage = .fragment,
+        .fragment_extent = fragment_extent,
+        .sampled_images = &sampled,
+        .parameter_mask = 2,
+        .infer_fragment_parameter_mask = false,
+    });
+}
+
+fn buildUiProbeFragmentSpirv(
+    allocator: std.mem.Allocator,
+    binding: rdna2.spirv.SampledImageBinding,
+    fragment_extent: [2]u32,
+) !rdna2.spirv.Module {
+    const vgpr = struct {
+        fn at(reg: u32) rdna2.Operand {
+            return .{ .kind = .vgpr, .reg = reg };
+        }
+    }.at;
+    const sgpr = struct {
+        fn at(reg: u32) rdna2.Operand {
+            return .{ .kind = .sgpr, .reg = reg };
+        }
+    }.at;
+    const uint = struct {
+        fn value(bits: u32) rdna2.Operand {
+            return .{ .kind = .integer_inline_constant, .value = bits, .signed_val = @intCast(bits) };
+        }
+    }.value;
+    const float = struct {
+        fn value(number: f32) rdna2.Operand {
+            return .{ .kind = .literal_constant, .value = @bitCast(number) };
+        }
+    }.value;
+    const sample_pc = binding.instruction_pc orelse 0x44;
+
+    var program = rdna2.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(allocator);
+    try program.instructions.appendSlice(allocator, &.{
+        // The traced Unity UI shader uses PARAM1.xy as UV and PARAM0 as its
+        // per-vertex colour. Keep the output uncompressed so this probe ends
+        // before the guest's alpha quantization and packed MRT export.
+        .{ .pc = 0, .family = .vintrp, .opcode = .v_interp_mov_f32, .dst = vgpr(0), .src0 = uint(0), .src1 = uint(1), .src2 = uint(0), .src_count = 3 },
+        .{ .pc = 4, .family = .vintrp, .opcode = .v_interp_mov_f32, .dst = vgpr(1), .src0 = uint(1), .src1 = uint(1), .src2 = uint(1), .src_count = 3 },
+        .{
+            .pc = sample_pc,
+            .family = .mimg,
+            .opcode_id = 0x20,
+            .opcode = .image_sample,
+            .dst = vgpr(2),
+            .src0 = vgpr(0),
+            .src1 = sgpr(binding.resource_sgpr),
+            .src2 = sgpr(binding.sampler_sgpr),
+            .src_count = 3,
+            .data_mask = 0xf,
+            .image_dimension = .dim_2d,
+            .image_address_components = 2,
+        },
+        .{ .pc = sample_pc + 8, .family = .vintrp, .opcode = .v_interp_mov_f32, .dst = vgpr(6), .src0 = uint(0), .src1 = uint(0), .src2 = uint(0), .src_count = 3 },
+        .{ .pc = sample_pc + 12, .family = .vintrp, .opcode = .v_interp_mov_f32, .dst = vgpr(7), .src0 = uint(1), .src1 = uint(0), .src2 = uint(1), .src_count = 3 },
+        .{ .pc = sample_pc + 16, .family = .vintrp, .opcode = .v_interp_mov_f32, .dst = vgpr(8), .src0 = uint(2), .src1 = uint(0), .src2 = uint(2), .src_count = 3 },
+        .{ .pc = sample_pc + 20, .family = .vintrp, .opcode = .v_interp_mov_f32, .dst = vgpr(9), .src0 = uint(3), .src1 = uint(0), .src2 = uint(3), .src_count = 3 },
+        .{ .pc = sample_pc + 24, .opcode = .v_mul_f32, .dst = vgpr(2), .src0 = vgpr(2), .src1 = vgpr(6), .src_count = 2 },
+        .{ .pc = sample_pc + 28, .opcode = .v_mul_f32, .dst = vgpr(3), .src0 = vgpr(3), .src1 = vgpr(7), .src_count = 2 },
+        .{ .pc = sample_pc + 32, .opcode = .v_mul_f32, .dst = vgpr(4), .src0 = vgpr(4), .src1 = vgpr(8), .src_count = 2 },
+        .{ .pc = sample_pc + 36, .opcode = .v_mul_f32, .dst = vgpr(5), .src0 = vgpr(5), .src1 = vgpr(9), .src_count = 2 },
+        .{ .pc = sample_pc + 40, .family = .exp, .opcode = .exp, .export_target = 0, .export_enable = 0xf, .export_done = true, .src0 = vgpr(2), .src1 = vgpr(3), .src2 = vgpr(4), .src3 = float(1.0), .src_count = 4 },
+        .{ .pc = sample_pc + 48, .family = .sopp, .opcode = .s_endpgm },
+    });
+    const sampled = [_]rdna2.spirv.SampledImageBinding{binding};
+    return rdna2.translateSpirv(allocator, &program, .{
+        .stage = .fragment,
+        .fragment_extent = fragment_extent,
+        .sampled_images = &sampled,
+        .parameter_mask = 3,
+        .infer_fragment_parameter_mask = false,
+    });
+}
+
+fn buildFullscreenProbeVertexSpirv(allocator: std.mem.Allocator, flip_v: bool) !rdna2.spirv.Module {
     const vgpr = struct {
         fn at(reg: u32) rdna2.Operand {
             return .{ .kind = .vgpr, .reg = reg };
@@ -9181,7 +10429,9 @@ fn buildFullscreenProbeVertexSpirv(allocator: std.mem.Allocator) !rdna2.spirv.Mo
     var program = rdna2.Program{ .code = &.{}, .instructions = .empty };
     defer program.deinit(allocator);
     try program.instructions.appendSlice(allocator, &.{
-        // Match SharpEmu's fixed fullscreen vertex mapping exactly:
+        // Match SharpEmu's fixed fullscreen vertex mapping, with PARAM0.y
+        // inverted for the negative-height Vulkan viewport used by guest
+        // render targets. Position keeps the original 0..2 triangle mapping.
         // x=(VertexIndex<<1)&2, y=VertexIndex&2. Position is x/y*2-1,
         // while PARAM0 carries the unscaled 0..2 fullscreen UV triangle.
         .{ .pc = 0, .opcode = .v_lshlrev_b32, .dst = vgpr(1), .src0 = uint(1), .src1 = vgpr(0), .src_count = 2 },
@@ -9195,9 +10445,10 @@ fn buildFullscreenProbeVertexSpirv(allocator: std.mem.Allocator) !rdna2.spirv.Mo
         .{ .pc = 32, .opcode = .v_sub_f32, .dst = vgpr(2), .src0 = vgpr(2), .src1 = float(1.0), .src_count = 2 },
         .{ .pc = 36, .opcode = .v_mov_b32, .dst = vgpr(5), .src0 = float(0.0), .src_count = 1 },
         .{ .pc = 40, .opcode = .v_mov_b32, .dst = vgpr(6), .src0 = float(1.0), .src_count = 1 },
-        .{ .pc = 44, .family = .exp, .opcode = .exp, .export_target = 0x0c, .export_enable = 0xf, .src0 = vgpr(1), .src1 = vgpr(2), .src2 = vgpr(5), .src3 = vgpr(6), .src_count = 4 },
-        .{ .pc = 52, .family = .exp, .opcode = .exp, .export_target = 0x20, .export_enable = 0xf, .export_done = true, .src0 = vgpr(3), .src1 = vgpr(4), .src2 = vgpr(5), .src3 = vgpr(6), .src_count = 4 },
-        .{ .pc = 60, .family = .sopp, .opcode = .s_endpgm },
+        .{ .pc = 44, .opcode = .v_sub_f32, .dst = vgpr(7), .src0 = float(1.0), .src1 = vgpr(4), .src_count = 2 },
+        .{ .pc = 48, .family = .exp, .opcode = .exp, .export_target = 0x0c, .export_enable = 0xf, .src0 = vgpr(1), .src1 = vgpr(2), .src2 = vgpr(5), .src3 = vgpr(6), .src_count = 4 },
+        .{ .pc = 56, .family = .exp, .opcode = .exp, .export_target = 0x20, .export_enable = 0xf, .export_done = true, .src0 = vgpr(3), .src1 = if (flip_v) vgpr(7) else vgpr(4), .src2 = vgpr(5), .src3 = vgpr(6), .src_count = 4 },
+        .{ .pc = 64, .family = .sopp, .opcode = .s_endpgm },
     });
     return rdna2.translateSpirv(allocator, &program, .{
         .stage = .vertex,
@@ -9366,6 +10617,34 @@ test "a uniform dcc key resolves to the colour the hardware would return" {
     try std.testing.expect(dccClearTexel(0x20, descriptor) == null);
 }
 
+test "RGBA16F color targets and DCC clears preserve native half-float texels" {
+    var descriptor = std.mem.zeroes(gpu.resources.ColorTarget);
+    descriptor.format = 12;
+    descriptor.number_type = 7;
+    descriptor.component_swap = 0;
+    descriptor.clear_words = .{ 0x3800_3400, 0x3c00_3a00 };
+
+    const format = colorTargetFormat(descriptor).?;
+    try std.testing.expectEqual(vk.format_r16g16b16a16_sfloat, format.vulkan);
+    try std.testing.expectEqual(@as(u8, 8), format.bytes_per_texel);
+
+    const fixed = colorDccClearTexel(0x40, descriptor).?;
+    try std.testing.expectEqual(@as(u8, 8), fixed.length);
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3c },
+        fixed.bytes[0..fixed.length],
+    );
+
+    const registers = colorDccClearTexel(0x20, descriptor).?;
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0x00, 0x34, 0x00, 0x38, 0x00, 0x3a, 0x00, 0x3c },
+        registers.bytes[0..registers.length],
+    );
+    try std.testing.expect(colorDccClearTexel(0xff, descriptor) == null);
+}
+
 test "CMASK clear and expanded nibbles materialize only the selected 8x8 blocks" {
     const layout = try gpu.CmaskLayout.init(16, 8, 1, 0, 16);
     var metadata = [_]u8{0xff} ** gpu.CmaskLayout.block_bytes;
@@ -9528,10 +10807,27 @@ test "dual image clear matcher requires the complete bounded kernel" {
 }
 
 test "sampled image views honor sRGB and destination selectors" {
+    try std.testing.expectEqual(vk.format_r8_unorm, sampledImageFormat(1, false).?);
+    try std.testing.expectEqual(vk.format_r8g8_unorm, sampledImageFormat(14, false).?);
     try std.testing.expectEqual(vk.format_r8g8b8a8_unorm, sampledImageFormat(56, false).?);
     try std.testing.expectEqual(vk.format_r8g8b8a8_srgb, sampledImageFormat(56, true).?);
     try std.testing.expectEqual(vk.format_r16g16b16a16_sfloat, sampledImageFormat(71, false).?);
     try std.testing.expectEqual(vk.format_r16g16b16a16_sfloat, sampledImageFormat(71, true).?);
+    try std.testing.expectEqual(vk.format_r8g8b8a8_srgb, sampledImageFormat(130, false).?);
+    try std.testing.expectEqual(vk.format_bc3_unorm_block, sampledImageFormat(173, false).?);
+    try std.testing.expectEqual(vk.format_bc3_srgb_block, sampledImageFormat(173, true).?);
+    try std.testing.expectEqual(vk.format_bc3_srgb_block, sampledImageFormat(174, false).?);
+    try std.testing.expectEqual(vk.format_bc7_unorm_block, sampledImageFormat(181, false).?);
+    try std.testing.expectEqual(vk.format_bc7_srgb_block, sampledImageFormat(181, true).?);
+    try std.testing.expectEqual(vk.format_bc7_srgb_block, sampledImageFormat(182, false).?);
+    try std.testing.expectEqual(@as(u8, 4), storageImageBytesPerTexel(130));
+    try std.testing.expectEqual(@as(u8, 8), storageImageBytesPerTexel(169));
+    try std.testing.expectEqual(@as(u8, 16), storageImageBytesPerTexel(174));
+    try std.testing.expectEqual(@as(u8, 16), storageImageBytesPerTexel(182));
+    try std.testing.expectEqual(@as(u32, 0), vulkanMinMagFilter(0));
+    try std.testing.expectEqual(@as(u32, 1), vulkanMinMagFilter(1));
+    try std.testing.expectEqual(@as(u32, 0), vulkanMinMagFilter(2));
+    try std.testing.expectEqual(@as(u32, 1), vulkanMinMagFilter(3));
     try std.testing.expect(sampledImageFormat(0, false) == null);
 
     const identity = try sampledImageComponents(.{ 4, 5, 6, 7 });
@@ -9546,6 +10842,42 @@ test "sampled image views honor sRGB and destination selectors" {
     try std.testing.expectEqual(vk.component_swizzle_r, blue_one_red_zero.b);
     try std.testing.expectEqual(vk.component_swizzle_zero, blue_one_red_zero.a);
     try std.testing.expectError(Error.UnsupportedSampledImage, sampledImageComponents(.{ 2, 5, 6, 7 }));
+}
+
+test "graphics SRT slots allow multiple images to share one sampler" {
+    const mappings = [_]gpu.ShaderSpirvSampledImageBinding{
+        .{ .resource_sgpr = 8, .sampler_sgpr = 32, .descriptor_index = 0 },
+        .{ .resource_sgpr = 16, .sampler_sgpr = 32, .descriptor_index = 1 },
+    };
+    try std.testing.expectEqual(@as(usize, 0), graphicsSrtImageSlot(mappings[0..0], 8));
+    try std.testing.expectEqual(@as(usize, 1), graphicsSrtImageSlot(mappings[0..1], 16));
+    try std.testing.expectEqual(@as(usize, 0), graphicsSrtSamplerSlot(mappings[0..1], 32));
+    try std.testing.expectEqual(@as(usize, 0), graphicsSrtSamplerSlot(&mappings, 32));
+    try std.testing.expectEqual(@as(usize, 1), graphicsSrtSamplerSlot(&mappings, 40));
+}
+
+test "vertex attributes keep distinct PC-qualified storage mappings" {
+    try std.testing.expect(canReuseStorageMapping(false, 3, 3));
+    try std.testing.expect(!canReuseStorageMapping(false, 3, 4));
+    try std.testing.expect(!canReuseStorageMapping(false, null, 3));
+    try std.testing.expect(!canReuseStorageMapping(true, 3, 3));
+}
+
+test "compute resources retain temporal scalar load specializations" {
+    const resources = ComputeResources{};
+    try std.testing.expectEqual(
+        @as(usize, gpu.scalar_provenance.maximum_scalar_specializations),
+        resources.scalar_registers.len,
+    );
+    try std.testing.expect(resources.scalar_registers.len > gpu.scalar_provenance.maximum_scalar_registers);
+}
+
+test "progress dumps select bounded presentation checkpoints" {
+    try std.testing.expect(shouldDumpProgressFrame(8));
+    try std.testing.expect(shouldDumpProgressFrame(64));
+    try std.testing.expect(shouldDumpProgressFrame(128));
+    try std.testing.expect(!shouldDumpProgressFrame(7));
+    try std.testing.expect(!shouldDumpProgressFrame(129));
 }
 
 test "RGBA occupancy preserves black alpha and destination alpha is explicit" {
@@ -9704,4 +11036,19 @@ test "frame rate counter emits a one-second rolling rate" {
         }
     }
     try std.testing.expect(counter.note(1 + std.time.ns_per_s / 60) == null);
+}
+
+test "NGG auto rectangle uses a triangle strip topology" {
+    try std.testing.expectEqual(
+        vk.primitive_topology_triangle_strip,
+        guestPrimitiveTopology(7, .{ .vertex_count = 4 }),
+    );
+    try std.testing.expectEqual(
+        vk.primitive_topology_triangle_list,
+        guestPrimitiveTopology(7, .{ .index_count = 6 }),
+    );
+    try std.testing.expectEqual(
+        vk.primitive_topology_triangle_list,
+        guestPrimitiveTopology(4, .{ .vertex_count = 3 }),
+    );
 }
