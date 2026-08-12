@@ -21,6 +21,9 @@ const kernel_threading = @import("kernel_threading.zig");
 
 const av_error_invalid_params: i32 = @bitCast(@as(u32, 0x806a_0001));
 const av_error_operation_failed: i32 = @bitCast(@as(u32, 0x806a_0002));
+const av_error_not_supported: i32 = @bitCast(@as(u32, 0x806a_0004));
+
+const trick_speed_normal: i32 = 100;
 
 const event_state_stop: u64 = 0x01;
 const event_state_ready: u64 = 0x02;
@@ -45,6 +48,8 @@ const audio_sample_rate: u32 = 48_000;
 const audio_samples_per_frame: u32 = 1024;
 const audio_frame_bytes: usize = audio_samples_per_frame * audio_channels * @sizeOf(i16);
 const audio_buffer_count = 8;
+const playback_frame_ms: u64 = (1000 + video_fps - 1) / video_fps;
+const unbounded_playback_ms: u64 = std.math.maxInt(u64);
 
 const pipe_buffer_bytes = 64 * 1024;
 const callback_read_bytes = 1024 * 1024;
@@ -97,6 +102,10 @@ const Player = struct {
     play_clock_started_ns: u64 = 0,
     pause_clock_started_ns: u64 = 0,
     paused_clock_ns: u64 = 0,
+    /// Host shader translation can take seconds while one guest frame is in
+    /// flight. Do not let that host-only stall skip an entire short movie:
+    /// video delivery advances this ceiling one media frame at a time.
+    playback_ceiling_ms: std.atomic.Value(u64) = .init(unbounded_playback_ms),
     software_video_decoder: bool = false,
     video_visible_width: u32 = default_video_width,
     video_visible_height: u32 = default_video_height,
@@ -387,6 +396,7 @@ fn stopDecoders(player: *Player) void {
 fn finishStream(player: *Player, video: bool) void {
     if (video) {
         player.video_end_of_stream = true;
+        player.playback_ceiling_ms.store(unbounded_playback_ms, .release);
     } else {
         player.audio_end_of_stream = true;
     }
@@ -815,6 +825,7 @@ fn addSourceEx(
     player.seek_video_frame_pending = false;
     player.seek_time_ms = 0;
     player.video_decode_start_ms = 0;
+    player.playback_ceiling_ms.store(unbounded_playback_ms, .release);
     if (!probeVideoGeometry(player)) {
         std.debug.print("[avplayer] ffprobe video geometry unavailable; using {d}x{d}\n", .{
             player.video_visible_width,
@@ -845,6 +856,41 @@ fn streamCount(handle: ?*anyopaque) callconv(abi.guest) i32 {
     return if (player.source_ready) 2 else 0;
 }
 
+/// Writes the original 32-byte `SceAvPlayerStreamInfo` ABI. Some PS5 Unity
+/// middleware still queries this view even when the player itself was created
+/// with `sceAvPlayerInitEx`.
+fn writeStreamInfo(player: *const Player, stream_id: u32, address: u64) void {
+    if (stream_id == 0) {
+        writeGuestU32(address, stream_video);
+        writeGuestU32(address + 8, player.video_visible_width);
+        writeGuestU32(address + 12, player.video_visible_height);
+        writeGuestF32(
+            address + 16,
+            @as(f32, @floatFromInt(player.video_visible_width)) /
+                @as(f32, @floatFromInt(player.video_visible_height)),
+        );
+        @as(*[3]u8, @ptrFromInt(address + 20)).* = .{ 'u', 'n', 'd' };
+    } else {
+        writeGuestU32(address, stream_audio);
+        writeGuestU16(address + 8, audio_channels);
+        writeGuestU32(address + 12, audio_sample_rate);
+        // Stream metadata describes the format; the per-frame API supplies
+        // the actual decoded payload size.
+        writeGuestU32(address + 16, 0);
+        @as(*[3]u8, @ptrFromInt(address + 20)).* = .{ 'u', 'n', 'd' };
+    }
+    writeGuestU64(address + 24, player.duration_ms);
+}
+
+pub fn getStreamInfo(handle: ?*anyopaque, stream_id: u32, info: ?*anyopaque) callconv(abi.guest) i32 {
+    const player = playerForHandle(handle) orelse return av_error_invalid_params;
+    if (!player.source_ready or stream_id > 1) return av_error_invalid_params;
+    const address = if (info) |value| @intFromPtr(value) else return av_error_invalid_params;
+    if (!clearGuest(address, 32)) return av_error_invalid_params;
+    writeStreamInfo(player, stream_id, address);
+    return errno.ok;
+}
+
 fn getStreamInfoEx(handle: ?*anyopaque, stream_id: u32, info: ?*anyopaque) callconv(abi.guest) i32 {
     const player = playerForHandle(handle) orelse return av_error_invalid_params;
     if (!player.source_ready or stream_id > 1) return av_error_invalid_params;
@@ -872,6 +918,14 @@ fn enableStream(handle: ?*anyopaque, stream_id: u32) callconv(abi.guest) i32 {
         av_error_invalid_params;
 }
 
+pub fn disableStream(handle: ?*anyopaque, stream_id: u32) callconv(abi.guest) i32 {
+    const player = playerForHandle(handle) orelse return av_error_invalid_params;
+    return if (player.source_ready and stream_id < 2)
+        errno.ok
+    else
+        av_error_invalid_params;
+}
+
 fn startLocked(player: *Player) i32 {
     if (!player.source_ready) return av_error_invalid_params;
     stopDecoders(player);
@@ -888,6 +942,7 @@ fn startLocked(player: *Player) i32 {
     player.play_clock_started_ns = playbackClockNs();
     player.pause_clock_started_ns = 0;
     player.paused_clock_ns = 0;
+    player.playback_ceiling_ms.store(playback_frame_ms, .release);
     startVideoDecoder(player) catch |err| {
         std.debug.print("[avplayer] cannot start FFmpeg video: {s}\n", .{@errorName(err)});
         player.started = false;
@@ -923,6 +978,7 @@ fn stop(handle: ?*anyopaque) callconv(abi.guest) i32 {
     player.end_of_stream = true;
     player.video_end_of_stream = true;
     player.audio_end_of_stream = true;
+    player.playback_ceiling_ms.store(unbounded_playback_ms, .release);
     emitEvent(player, event_state_stop);
     return errno.ok;
 }
@@ -979,6 +1035,7 @@ fn jumpToTime(handle: ?*anyopaque, time_ms: u64) callconv(abi.guest) i32 {
     player.play_clock_started_ns = playbackClockNs();
     player.pause_clock_started_ns = if (player.paused) player.play_clock_started_ns else 0;
     player.paused_clock_ns = 0;
+    player.playback_ceiling_ms.store(time_ms +| playback_frame_ms, .release);
     player.end_of_stream = false;
     player.video_end_of_stream = false;
     player.audio_end_of_stream = false;
@@ -998,7 +1055,25 @@ fn playbackPositionMs(player: *const Player) u64 {
     }
     const elapsed_ns = now - player.play_clock_started_ns;
     const active_ns = elapsed_ns -| player.paused_clock_ns;
-    return player.seek_time_ms + active_ns / std.time.ns_per_ms;
+    const host_position = player.seek_time_ms + active_ns / std.time.ns_per_ms;
+    return @min(host_position, player.playback_ceiling_ms.load(.acquire));
+}
+
+pub fn currentTime(handle: ?*anyopaque) callconv(abi.guest) u64 {
+    const player = playerForHandle(handle) orelse return 0;
+    if (!player.source_ready or !player.started) return 0;
+    const io = lockStreams(player) orelse return 0;
+    defer unlockStreams(player, io);
+    return playbackPositionMs(player);
+}
+
+pub fn setTrickSpeed(handle: ?*anyopaque, speed: i32) callconv(abi.guest) i32 {
+    const player = playerForHandle(handle) orelse return av_error_invalid_params;
+    if (!player.source_ready) return av_error_invalid_params;
+    // Software playback currently implements real-time forward playback only.
+    // Reporting the other documented rates as unsupported lets middleware
+    // fall back cleanly instead of assuming that the clock was changed.
+    return if (speed == trick_speed_normal) errno.ok else av_error_not_supported;
 }
 
 fn playbackVideoFrame(position_ms: u64, duration_ms: u64) u64 {
@@ -1037,6 +1112,10 @@ fn getVideoDataEx(handle: ?*anyopaque, info: ?*anyopaque) callconv(abi.guest) u8
     const frame_address = readVideoFrame(player) orelse return 0;
     const timestamp = next_timestamp;
     player.video_frame_index += 1;
+    player.playback_ceiling_ms.store(
+        player.video_frame_index * 1000 / video_fps +| playback_frame_ms,
+        .release,
+    );
     player.seek_video_frame_pending = false;
     writeGuestU64(address, frame_address);
     writeGuestU64(address + 16, timestamp);
@@ -1123,6 +1202,7 @@ fn close(handle: ?*anyopaque) callconv(abi.guest) i32 {
     player.end_of_stream = true;
     player.video_end_of_stream = true;
     player.audio_end_of_stream = true;
+    player.playback_ceiling_ms.store(unbounded_playback_ms, .release);
     player.event_object = 0;
     player.event_callback = 0;
     return errno.ok;
@@ -1159,6 +1239,32 @@ test "video details use the SceAvPlayerVideoEx ABI layout" {
         @as(f64, video_fps),
         @as(f64, @bitCast(std.mem.readInt(u64, bytes[48..56], .little))),
     );
+}
+
+test "legacy stream info uses the bounded 32-byte ABI layout" {
+    var player = Player{
+        .duration_ms = 2_950,
+        .video_visible_width = 1920,
+        .video_visible_height = 1080,
+    };
+    var bytes: [40]u8 = @splat(0xcc);
+
+    @memset(bytes[0..32], 0);
+    writeStreamInfo(&player, 0, @intFromPtr(&bytes));
+    try std.testing.expectEqual(stream_video, std.mem.readInt(u32, bytes[0..4], .little));
+    try std.testing.expectEqual(player.video_visible_width, std.mem.readInt(u32, bytes[8..12], .little));
+    try std.testing.expectEqual(player.video_visible_height, std.mem.readInt(u32, bytes[12..16], .little));
+    try std.testing.expectEqualSlices(u8, "und", bytes[20..23]);
+    try std.testing.expectEqual(player.duration_ms, std.mem.readInt(u64, bytes[24..32], .little));
+    try std.testing.expectEqualSlices(u8, &([_]u8{0xcc} ** 8), bytes[32..40]);
+
+    @memset(bytes[0..32], 0);
+    writeStreamInfo(&player, 1, @intFromPtr(&bytes));
+    try std.testing.expectEqual(stream_audio, std.mem.readInt(u32, bytes[0..4], .little));
+    try std.testing.expectEqual(audio_channels, std.mem.readInt(u16, bytes[8..10], .little));
+    try std.testing.expectEqual(audio_sample_rate, std.mem.readInt(u32, bytes[12..16], .little));
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, bytes[16..20], .little));
+    try std.testing.expectEqualSlices(u8, &([_]u8{0xcc} ** 8), bytes[32..40]);
 }
 
 pub const exports = [_]symbols.Export{

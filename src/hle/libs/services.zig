@@ -70,6 +70,183 @@ pub fn accept(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest
     return errno.ok;
 }
 
+const game_update_error_not_initialized: i32 = @bitCast(@as(u32, 0x8041_2801));
+const game_update_error_invalid_argument: i32 = @bitCast(@as(u32, 0x8041_2803));
+const game_update_error_invalid_size: i32 = @bitCast(@as(u32, 0x8041_2804));
+const game_update_error_request_not_found: i32 = @bitCast(@as(u32, 0x8041_2805));
+
+const GameUpdateCheckParam = extern struct {
+    size: u64,
+    option: u32,
+    reserved: [9]u32,
+};
+
+const GameUpdateCheckResult = extern struct {
+    size: u64,
+    found: u8,
+    addcont_found: u8,
+    padding: [2]u8,
+    content_version: [11]u8,
+    padding2: u8,
+    reserved: [6]u32,
+};
+
+const GameUpdateAddcontVersionInfo = extern struct {
+    size: u64,
+    found: u8,
+    content_version: [11]u8,
+    reserved: [6]u32,
+};
+
+var game_update_initialized = std.atomic.Value(bool).init(false);
+var game_update_next_request = std.atomic.Value(u32).init(1);
+var game_update_requests = std.atomic.Value(u64).init(0);
+
+fn gameUpdateRequestBit(request_id: i32) ?u64 {
+    if (request_id < 1 or request_id >= 64) return null;
+    return @as(u64, 1) << @intCast(request_id);
+}
+
+/// Offline consoles still expose GameUpdate successfully; a check simply says
+/// that no newer content is available. Treating the whole service as ENOSYS
+/// aborts Unity's platform bootstrap before it can create the first scene.
+pub fn gameUpdateInitialize() callconv(abi.guest) i32 {
+    game_update_requests.store(0, .release);
+    game_update_next_request.store(1, .release);
+    game_update_initialized.store(true, .release);
+    return errno.ok;
+}
+
+pub fn gameUpdateTerminate() callconv(abi.guest) i32 {
+    game_update_initialized.store(false, .release);
+    game_update_requests.store(0, .release);
+    return errno.ok;
+}
+
+pub fn gameUpdateCreateRequest() callconv(abi.guest) i32 {
+    if (!game_update_initialized.load(.acquire)) return game_update_error_not_initialized;
+    var attempts: usize = 0;
+    while (attempts < 63) : (attempts += 1) {
+        const raw = game_update_next_request.fetchAdd(1, .acq_rel);
+        const request_id: u32 = (raw -% 1) % 63 + 1;
+        const bit = @as(u64, 1) << @intCast(request_id);
+        const old = game_update_requests.fetchOr(bit, .acq_rel);
+        if (old & bit == 0) return @intCast(request_id);
+    }
+    return errno.KernelError.enospc.raw();
+}
+
+fn validGameUpdateRequest(request_id: i32) bool {
+    const bit = gameUpdateRequestBit(request_id) orelse return false;
+    return game_update_requests.load(.acquire) & bit != 0;
+}
+
+pub fn gameUpdateCheck(
+    request_id: i32,
+    parameters: ?*const GameUpdateCheckParam,
+    result: ?*GameUpdateCheckResult,
+) callconv(abi.guest) i32 {
+    if (!game_update_initialized.load(.acquire)) return game_update_error_not_initialized;
+    if (!validGameUpdateRequest(request_id)) return game_update_error_request_not_found;
+    const input = parameters orelse return game_update_error_invalid_argument;
+    const output = result orelse return game_update_error_invalid_argument;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(input), @sizeOf(GameUpdateCheckParam)) or
+        !kernel_memory.isGuestRangeAccessible(@intFromPtr(output), @sizeOf(GameUpdateCheckResult)))
+    {
+        return game_update_error_invalid_argument;
+    }
+    if (input.size < @sizeOf(GameUpdateCheckParam) or output.size < @sizeOf(GameUpdateCheckResult)) {
+        return game_update_error_invalid_size;
+    }
+    const size = output.size;
+    output.* = std.mem.zeroes(GameUpdateCheckResult);
+    output.size = size;
+    return errno.ok;
+}
+
+pub fn gameUpdateAbortRequest(request_id: i32) callconv(abi.guest) i32 {
+    if (!game_update_initialized.load(.acquire)) return game_update_error_not_initialized;
+    return if (validGameUpdateRequest(request_id)) errno.ok else game_update_error_request_not_found;
+}
+
+pub fn gameUpdateDeleteRequest(request_id: i32) callconv(abi.guest) i32 {
+    if (!game_update_initialized.load(.acquire)) return game_update_error_not_initialized;
+    const bit = gameUpdateRequestBit(request_id) orelse return game_update_error_request_not_found;
+    const old = game_update_requests.fetchAnd(~bit, .acq_rel);
+    return if (old & bit != 0) errno.ok else game_update_error_request_not_found;
+}
+
+pub fn gameUpdateGetAddcontLatestVersion(
+    _: u32,
+    _: ?*const anyopaque,
+    info: ?*GameUpdateAddcontVersionInfo,
+) callconv(abi.guest) i32 {
+    if (!game_update_initialized.load(.acquire)) return game_update_error_not_initialized;
+    const output = info orelse return game_update_error_invalid_argument;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(output), @sizeOf(GameUpdateAddcontVersionInfo))) {
+        return game_update_error_invalid_argument;
+    }
+    if (output.size < @sizeOf(GameUpdateAddcontVersionInfo)) return game_update_error_invalid_size;
+    const size = output.size;
+    output.* = std.mem.zeroes(GameUpdateAddcontVersionInfo);
+    output.size = size;
+    return errno.ok;
+}
+
+const np_entitlement_error_parameter: i32 = @bitCast(@as(u32, 0x817d_0002));
+var np_trophy_next_context = std.atomic.Value(i32).init(1);
+var np_trophy_next_handle = std.atomic.Value(i32).init(1);
+var np_webapi_next_push_handle = std.atomic.Value(i32).init(1);
+
+/// Entitlement and signaling libraries have useful offline bootstrap states.
+/// Network-backed requests may fail later, but constructing these contexts is
+/// local and is required before Unity can finish its platform initialization.
+pub fn npEntitlementAccessInitialize(
+    init_parameters: u64,
+    boot_parameters: u64,
+) callconv(abi.guest) i32 {
+    if (init_parameters == 0 or boot_parameters == 0) return np_entitlement_error_parameter;
+    if (!kernel_memory.isGuestRangeAccessible(init_parameters, 32) or
+        !kernel_memory.isGuestRangeAccessible(boot_parameters, 32))
+    {
+        return errno.KernelError.efault.raw();
+    }
+    const output: *[32]u8 = @ptrFromInt(boot_parameters);
+    @memset(output, 0);
+    return errno.ok;
+}
+
+pub fn npSessionSignalingInitialize(_: u64) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
+fn writeServiceHandle(output: ?*i32, counter: *std.atomic.Value(i32)) i32 {
+    const destination = output orelse return errno.KernelError.einval.raw();
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(destination), @sizeOf(i32))) {
+        return errno.KernelError.efault.raw();
+    }
+    destination.* = counter.fetchAdd(1, .acq_rel);
+    return errno.ok;
+}
+
+pub fn npTrophy2CreateContext(
+    output: ?*i32,
+    _: i32,
+    _: u32,
+    _: u64,
+) callconv(abi.guest) i32 {
+    return writeServiceHandle(output, &np_trophy_next_context);
+}
+
+pub fn npTrophy2CreateHandle(output: ?*i32) callconv(abi.guest) i32 {
+    return writeServiceHandle(output, &np_trophy_next_handle);
+}
+
+pub fn npWebApi2PushEventCreateHandle(library_context: i32) callconv(abi.guest) i32 {
+    if (library_context <= 0) return errno.KernelError.einval.raw();
+    return np_webapi_next_push_handle.fetchAdd(1, .acq_rel);
+}
+
 /// UDS is an offline telemetry sink here, but its bootstrap objects are still
 /// real from the title's point of view. Initialisation validates the parameter
 /// record and context creation supplies the handle later calls carry around.
@@ -250,6 +427,52 @@ test "game intent ABI and offline outcomes match the platform" {
     try testing.expectEqual(errno.ok, npGameIntentTerminate(0, 0, 0, 0, 0, 0));
     try testing.expectEqual(np_game_intent_error_invalid_argument, npGameIntentReceiveIntent(0, 0, 0, 0, 0, 0));
     try testing.expectEqual(np_game_intent_error_invalid_argument, npGameIntentGetPropertyValueString(0, 0, 0, 0, 0, 0));
+}
+
+test "game update reports a successful offline check" {
+    try testing.expectEqual(@as(usize, 48), @sizeOf(GameUpdateCheckParam));
+    try testing.expectEqual(@as(usize, 48), @sizeOf(GameUpdateCheckResult));
+    try testing.expectEqual(@as(usize, 48), @sizeOf(GameUpdateAddcontVersionInfo));
+    try testing.expectEqual(errno.ok, gameUpdateInitialize());
+    const request = gameUpdateCreateRequest();
+    try testing.expectEqual(@as(i32, 1), request);
+    const parameters = GameUpdateCheckParam{
+        .size = @sizeOf(GameUpdateCheckParam),
+        .option = 0,
+        .reserved = @splat(0),
+    };
+    var result = std.mem.zeroes(GameUpdateCheckResult);
+    result.size = @sizeOf(GameUpdateCheckResult);
+    result.found = 1;
+    result.addcont_found = 1;
+    try testing.expectEqual(errno.ok, gameUpdateCheck(request, &parameters, &result));
+    try testing.expectEqual(@as(u8, 0), result.found);
+    try testing.expectEqual(@as(u8, 0), result.addcont_found);
+    try testing.expectEqual(errno.ok, gameUpdateDeleteRequest(request));
+    try testing.expectEqual(game_update_error_request_not_found, gameUpdateDeleteRequest(request));
+    try testing.expectEqual(errno.ok, gameUpdateTerminate());
+}
+
+test "offline NP bootstrap creates local contexts" {
+    var init_parameters: [32]u8 = @splat(0xa5);
+    var boot_parameters: [32]u8 = @splat(0xa5);
+    try testing.expectEqual(
+        errno.ok,
+        npEntitlementAccessInitialize(@intFromPtr(&init_parameters), @intFromPtr(&boot_parameters)),
+    );
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** 32), &boot_parameters);
+    try testing.expectEqual(errno.ok, npSessionSignalingInitialize(0));
+
+    np_trophy_next_context.store(1, .release);
+    np_trophy_next_handle.store(1, .release);
+    np_webapi_next_push_handle.store(1, .release);
+    var context: i32 = 0;
+    var handle: i32 = 0;
+    try testing.expectEqual(errno.ok, npTrophy2CreateContext(&context, 0x1000_0000, 0, 0));
+    try testing.expectEqual(errno.ok, npTrophy2CreateHandle(&handle));
+    try testing.expectEqual(@as(i32, 1), context);
+    try testing.expectEqual(@as(i32, 1), handle);
+    try testing.expectEqual(@as(i32, 1), npWebApi2PushEventCreateHandle(4));
 }
 
 test "every service entry point registers under its published identifier" {

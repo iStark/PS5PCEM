@@ -806,6 +806,32 @@ fn colorTargetFormat(descriptor: gpu.resources.ColorTarget) ?ColorTargetFormat {
     };
 }
 
+/// The first host implementation keeps one color value per pixel.  Preserve
+/// the guest allocation and fixed-function resolve semantics while rendering
+/// an MSAA target as a single-sample attachment; a later CB resolve copies the
+/// resulting pixels to its single-sample destination.
+fn hostColorTargetDescriptor(descriptor: gpu.resources.ColorTarget) gpu.resources.ColorTarget {
+    var host = descriptor;
+    host.samples_log2 = 0;
+    host.fragments_log2 = 0;
+    host.fmask_compression = false;
+    host.fmask_address = 0;
+    return host;
+}
+
+fn guestColorTarget(descriptor_: gpu.resources.ColorTarget) anyerror!GuestColorTarget {
+    if (descriptor_.samples_log2 > 3 or descriptor_.fragments_log2 > descriptor_.samples_log2) {
+        return Error.UnsupportedColorTarget;
+    }
+    const descriptor = hostColorTargetDescriptor(descriptor_);
+    const format = colorTargetFormat(descriptor) orelse return Error.UnsupportedColorTarget;
+    const layout = try gpu.SurfaceLayout.fromColorTarget(descriptor);
+    if (layout.layers != 1 or layout.block.bytes_per_element != format.bytes_per_texel) {
+        return Error.UnsupportedColorTarget;
+    }
+    return .{ .descriptor = descriptor, .layout = layout, .format = format };
+}
+
 fn displayColorTarget(buffer: DisplayBuffer) ?gpu.resources.ColorTarget {
     if (buffer.address == 0 or buffer.width == 0 or buffer.height == 0) return null;
     const pitch = if (buffer.pitch_in_pixels != 0) buffer.pitch_in_pixels else buffer.width;
@@ -1230,6 +1256,7 @@ pub const Renderer = struct {
     release_callbacks: u64 = 0,
     wait_callbacks: u64 = 0,
     write_data_callbacks: u64 = 0,
+    dma_data_callbacks: u64 = 0,
     event_callbacks: u64 = 0,
     flip_callbacks: u64 = 0,
     /// Host presents issued immediately after a guest color writeback, so a
@@ -1242,11 +1269,17 @@ pub const Renderer = struct {
     emulated_gds_dispatches: u64 = 0,
     emulated_buffer_clear_dispatches: u64 = 0,
     emulated_image_store_dispatches: u64 = 0,
+    emulated_image_copy_dispatches: u64 = 0,
+    video_surface_addresses: [8]u64 = @splat(0),
+    video_surface_count: usize = 0,
+    video_surface_last_flip: u64 = 0,
+    latest_video_render_target_index: ?usize = null,
     emulated_volume_copies: u64 = 0,
     reported_dual_image_clear_fallback: bool = false,
     reported_fast_clear_seeds: u32 = 0,
     reported_non_rgba_materializations: u32 = 0,
     reported_htile_resolves: u32 = 0,
+    reported_color_resolves: u32 = 0,
     buffer_cache_hits: u64 = 0,
     buffer_cache_misses: u64 = 0,
     buffer_uploads: u64 = 0,
@@ -1267,6 +1300,8 @@ pub const Renderer = struct {
     reported_fragment_storage_bindings: bool = false,
     reported_first_graphics_draw_checkpoints: bool = false,
     captured_targeted_fragment_probe: bool = false,
+    reported_planar_video_pass: bool = false,
+    captured_planar_video_pass: bool = false,
     reported_first_scissor_state: bool = false,
     reported_draw_errors: [16]?anyerror = @splat(null),
     reported_compute_shader_failures: [32]?ComputeShaderFailure = @splat(null),
@@ -2274,6 +2309,15 @@ pub const Renderer = struct {
             local_size,
             group_count,
         )) |report| return report;
+        if (try self.tryEmulateImageCopy(
+            memory,
+            &bindings,
+            reader,
+            analysis,
+            system_registers,
+            local_size,
+            group_count,
+        )) |report| return report;
         if (try self.tryEmulateVolumeBufferCopy(
             memory,
             &bindings,
@@ -2593,6 +2637,108 @@ pub const Renderer = struct {
             "[vulkan dcb] emulated GDS initialization: {d} writes, value=0x{x}\n",
             .{ writes, fill_value },
         );
+        return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
+    }
+
+    /// Executes Unity's full-surface 2D image copy without round-tripping two
+    /// eight-megabyte tiled images through temporary Vulkan resources.  The
+    /// matched kernel only changes the allocation address: source and target
+    /// use the same format, dimensions and tile equation, so their guest
+    /// payloads are byte-for-byte compatible after the resident source target
+    /// has been materialized.
+    fn tryEmulateImageCopy(
+        self: *Renderer,
+        memory: GuestMemory,
+        bindings: *const gpu.ShaderBindings,
+        reader: gpu.ShaderMemoryReader,
+        analysis: *const gpu.ShaderAnalysis,
+        system: gpu.resources.ComputeSystemRegisters,
+        local_size: [3]u32,
+        group_count: [3]u32,
+    ) anyerror!?DispatchReport {
+        const instructions = analysis.program.instructions.items;
+        if (!matchesWholeImageCopy(instructions) or
+            local_size[0] != 8 or local_size[1] != 8 or local_size[2] != 1)
+        {
+            return null;
+        }
+        _ = system;
+
+        const source = (try bindings.inlineImageDescriptor(0)) orelse return null;
+        const destination = try imageDescriptorFromUserDataPointer(bindings, reader, 12) orelse return null;
+        const control = (try bindings.inlineBufferDescriptor(8)) orelse return null;
+        if (control.address == 0 or control.size_bytes < 24 or
+            source.address == 0 or destination.address == 0 or source.address == destination.address or
+            source.image_type != .color_2d or destination.image_type != .color_2d or
+            source.width != destination.width or source.height != destination.height or
+            source.depth_or_layers != 1 or destination.depth_or_layers != 1 or
+            source.pitch != destination.pitch or source.unified_format != destination.unified_format or
+            source.tile_mode != destination.tile_mode or source.samplesLog2() != 0 or
+            destination.samplesLog2() != 0 or source.viewBaseLevel() != 0 or
+            destination.viewBaseLevel() != 0 or source.viewMipLevels() != 1 or
+            destination.viewMipLevels() != 1 or source.dcc_enabled or destination.dcc_enabled or
+            source.cmask_fast_clear or destination.cmask_fast_clear or
+            source.fmask_compression or destination.fmask_compression)
+        {
+            return null;
+        }
+
+        const bounds_offset = std.math.cast(u64, instructions[2].memory_offset) orelse return null;
+        const source_offset = std.math.cast(u64, instructions[9].memory_offset) orelse return null;
+        const destination_offset = std.math.cast(u64, instructions[13].memory_offset) orelse return null;
+        const last_control_byte = @max(bounds_offset, @max(source_offset, destination_offset)) + 8;
+        if (last_control_byte > control.size_bytes) return null;
+        const copy_width = try readGuestU32(memory, control.address + bounds_offset);
+        const copy_height = try readGuestU32(memory, control.address + bounds_offset + 4);
+        const source_x = try readGuestU32(memory, control.address + source_offset);
+        const source_y = try readGuestU32(memory, control.address + source_offset + 4);
+        const destination_x = try readGuestU32(memory, control.address + destination_offset);
+        const destination_y = try readGuestU32(memory, control.address + destination_offset + 4);
+        const dispatched_width = std.math.mul(u64, group_count[0], local_size[0]) catch
+            return Error.GuestBufferTooLarge;
+        const dispatched_height = std.math.mul(u64, group_count[1], local_size[1]) catch
+            return Error.GuestBufferTooLarge;
+        if (copy_width != source.width or copy_height != source.height or
+            source_x != 0 or source_y != 0 or destination_x != 0 or destination_y != 0 or
+            dispatched_width < source.width or dispatched_height < source.height)
+        {
+            return null;
+        }
+
+        const source_layout = gpu.TextureLayout.fromImage(source) catch return null;
+        const destination_layout = gpu.TextureLayout.fromImage(destination) catch return null;
+        if (source_layout.required_source_bytes == 0 or
+            source_layout.required_source_bytes != destination_layout.required_source_bytes or
+            source_layout.required_source_bytes > maximum_frame_bytes)
+        {
+            return null;
+        }
+        const allocation_bytes = std.math.cast(usize, source_layout.required_source_bytes) orelse
+            return Error.GuestBufferTooLarge;
+        try self.flushPendingGuestWrite(source.address, allocation_bytes);
+        const allocation = try self.allocator.alloc(u8, allocation_bytes);
+        defer self.allocator.free(allocation);
+        if (!memory.read(memory.context, source.address, allocation)) return Error.GuestMemoryReadFailed;
+        if (!memory.write(memory.context, destination.address, allocation)) return Error.GuestMemoryWriteFailed;
+        self.invalidateDmaDestination(destination.address, allocation_bytes);
+        if (self.isVideoSurface(source.address)) self.markVideoSurface(destination.address);
+
+        self.emulated_image_copy_dispatches += 1;
+        if (log_verbose_gpu or self.emulated_image_copy_dispatches <= 4) {
+            std.debug.print(
+                "[vulkan dcb] emulated whole-image copy: 0x{x} -> 0x{x} {d}x{d} fmt={d} tile={s} bytes=0x{x} (#{d})\n",
+                .{
+                    source.address,
+                    destination.address,
+                    source.width,
+                    source.height,
+                    source.unified_format,
+                    @tagName(source.tile_mode),
+                    allocation_bytes,
+                    self.emulated_image_copy_dispatches,
+                },
+            );
+        }
         return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
     }
 
@@ -5011,6 +5157,84 @@ pub const Renderer = struct {
         return false;
     }
 
+    /// CB_COLOR_CONTROL.MODE=RESOLVE uses slot 0 as the multisampled source and
+    /// slot 1 as the single-sample destination.  Until Vulkan MSAA attachments
+    /// are exposed, normal draws retain one representative sample; publishing
+    /// that resident image under the resolve destination preserves the fixed-
+    /// function data flow used by Unity before its final fullscreen blit.
+    fn resolveColorTargets(self: *Renderer, render_state: gpu.resources.RenderState) anyerror!bool {
+        if (render_state.color_control.mode != 3) return false;
+        const source_descriptor = render_state.color_targets[0] orelse return false;
+        const destination_descriptor = render_state.color_targets[1] orelse return false;
+        if (source_descriptor.address == destination_descriptor.address) return false;
+
+        const source = try guestColorTarget(source_descriptor);
+        const destination = try guestColorTarget(destination_descriptor);
+        if (source.descriptor.width != destination.descriptor.width or
+            source.descriptor.height != destination.descriptor.height or
+            source.format.vulkan != destination.format.vulkan)
+        {
+            return Error.UnsupportedColorTarget;
+        }
+
+        var source_index: ?usize = null;
+        for (self.render_targets.items, 0..) |cached, index| {
+            if (cached.target.descriptor.address != source.descriptor.address or
+                cached.target.descriptor.width != source.descriptor.width or
+                cached.target.descriptor.height != source.descriptor.height or
+                cached.target.format.vulkan != source.format.vulkan)
+            {
+                continue;
+            }
+            source_index = index;
+            break;
+        }
+        const index = source_index orelse return Error.MissingPresentedFrame;
+        try self.materializeRenderTarget(index);
+
+        var resolved_index: ?usize = null;
+        var resolved_sequence: u64 = 0;
+        for (self.completed_frames.items, 0..) |cached, frame_index| {
+            if (cached.guest_address != source.descriptor.address or
+                cached.width != source.descriptor.width or
+                cached.height != source.descriptor.height or
+                cached.sequence < resolved_sequence)
+            {
+                continue;
+            }
+            resolved_index = frame_index;
+            resolved_sequence = cached.sequence;
+        }
+        const frame_index = resolved_index orelse return Error.MissingPresentedFrame;
+        const pixels = try self.allocator.dupe(u8, self.completed_frames.items[frame_index].pixels.items);
+        defer self.allocator.free(pixels);
+        try self.recordGuestColorTarget(destination, pixels);
+
+        // A destination retained from an earlier frame must not shadow the new
+        // deferred resolve when it is immediately sampled as a texture.
+        for (self.render_targets.items) |*cached| {
+            if (cached.target.descriptor.address != destination.descriptor.address) continue;
+            cached.initialized = false;
+            cached.gpu_generation = 0;
+            cached.host_generation = 0;
+        }
+
+        if (self.reported_color_resolves < 4 or log_verbose_gpu) {
+            self.reported_color_resolves += 1;
+            std.debug.print(
+                "[vulkan dcb] color resolve approximated 0x{x} -> 0x{x} {d}x{d} samples={d}\n",
+                .{
+                    source.descriptor.address,
+                    destination.descriptor.address,
+                    destination.descriptor.width,
+                    destination.descriptor.height,
+                    source_descriptor.samples_log2,
+                },
+            );
+        }
+        return true;
+    }
+
     fn drawPersistentGraphicsShaders(
         self: *Renderer,
         vertex_words: []const u32,
@@ -5792,14 +6016,15 @@ pub const Renderer = struct {
                 break;
             }
         }
-        const descriptor = target_descriptor orelse return Error.MissingColorTarget;
-        if (descriptor.samples_log2 != 0 or descriptor.fragments_log2 != 0) {
+        const guest_descriptor = target_descriptor orelse return Error.MissingColorTarget;
+        if (guest_descriptor.samples_log2 != 0 or guest_descriptor.fragments_log2 != 0) {
             if (log_verbose_gpu) std.debug.print(
-                "[vulkan dcb] draw rejected: MSAA color target samples={d} frags={d}\n",
-                .{ descriptor.samples_log2, descriptor.fragments_log2 },
+                "[vulkan dcb] approximating MSAA color target samples={d} frags={d} with one host sample\n",
+                .{ guest_descriptor.samples_log2, guest_descriptor.fragments_log2 },
             );
-            return Error.UnsupportedColorTarget;
         }
+        const target = try guestColorTarget(guest_descriptor);
+        const descriptor = target.descriptor;
         // The persistent target path resolves uniform DCC and CMASK-only
         // clear/expanded blocks during its initial upload. FMASK and other
         // compressed states still fall back to raw tiles rather than blocking
@@ -5815,19 +6040,13 @@ pub const Renderer = struct {
                 },
             );
         }
-        const target_format = colorTargetFormat(descriptor) orelse return Error.UnsupportedColorTarget;
         if (log_verbose_gpu) std.debug.print(
             "[vulkan dcb] draw color format={d} number={d} -> vk={d} bytes_per_texel={d}\n",
-            .{ descriptor.format, descriptor.number_type, target_format.vulkan, target_format.bytes_per_texel },
+            .{ descriptor.format, descriptor.number_type, target.format.vulkan, target.format.bytes_per_texel },
         );
-        const layout = try gpu.SurfaceLayout.fromColorTarget(descriptor);
-        if (layout.layers != 1 or layout.block.bytes_per_element != target_format.bytes_per_texel) {
-            return Error.UnsupportedColorTarget;
-        }
         var pipeline_state = try guestGraphicsState(&render_state, descriptor);
-        pipeline_state.color_attachment_format = target_format.vulkan;
+        pipeline_state.color_attachment_format = target.format.vulkan;
         pipeline_state.topology = guestPrimitiveTopology(render_state.primitive_type, draw);
-        const target = GuestColorTarget{ .descriptor = descriptor, .layout = layout, .format = target_format };
         const vertex_address = vertex_stage.programAddress(state) orelse {
             return Error.MissingGraphicsProgram;
         };
@@ -6085,28 +6304,66 @@ pub const Renderer = struct {
                 4,
             );
         }
-        // Fullscreen video passes are safest with the backend's canonical
-        // triangle and UVs. The guest VS path is still incomplete for some
-        // Unity export programs, and a fallback VS without PARAM0 leaves every
-        // image sample at (0, 0). Detect the exact planar NV12 conversion
-        // layout, plus the already-fallback no-buffer case, and provide the
-        // matching UV interface instead of globally overriding texture
-        // coordinates in every fragment shader.
+        // Detect the planar NV12 conversion layout so its visible width and
+        // allocation pitch can be handled without affecting ordinary sampled
+        // draws. This Unity pass has a complete four-vertex guest VS; its
+        // constants contain the required 1920/2048 U scale, so it must not be
+        // replaced by the procedural fallback triangle.
         const planar_video_pass = graphics_resources.image_count == 2 and
             graphics_resources.descriptors[0].tile_mode.isLinear() and
             graphics_resources.descriptors[0].unified_format == 1 and
-            graphics_resources.descriptors[0].width == descriptor.width and
+            // AvPlayer exposes the visible width separately from the NV12
+            // allocation pitch. Unity consequently describes the luma plane
+            // as 2048 wide for a 1920-pixel movie. Accept that right-hand
+            // padding here; requiring exact equality silently disabled the
+            // canonical fullscreen VS and left the video pass black.
+            graphics_resources.descriptors[0].width >= descriptor.width and
+            graphics_resources.descriptors[0].width - descriptor.width < 256 and
+            graphics_resources.descriptors[0].pitch == graphics_resources.descriptors[0].width and
             graphics_resources.descriptors[0].height == descriptor.height and
             graphics_resources.descriptors[1].tile_mode.isLinear() and
             graphics_resources.descriptors[1].unified_format == 14 and
-            graphics_resources.descriptors[1].width * 2 == descriptor.width and
+            graphics_resources.descriptors[1].width * 2 == graphics_resources.descriptors[0].width and
             graphics_resources.descriptors[1].height * 2 == descriptor.height;
-        if (fragment_attribute_mask == 1 and
-            (planar_video_pass or vertex_storage.mapping_count == 0))
+        if (planar_video_pass and !self.reported_planar_video_pass) {
+            std.debug.print(
+                "[vulkan dcb] planar video pass target=0x{x} {d}x{d} luma={d}x{d}/pitch={d}\n",
+                .{
+                    descriptor.address,
+                    descriptor.width,
+                    descriptor.height,
+                    graphics_resources.descriptors[0].width,
+                    graphics_resources.descriptors[0].height,
+                    graphics_resources.descriptors[0].pitch,
+                },
+            );
+            self.reported_planar_video_pass = true;
+        }
+        if (planar_video_pass) {
+            self.markVideoSurface(target.descriptor.address);
+            self.video_surface_last_flip = self.flip_callbacks;
+            try self.emulatePlanarVideoPass(
+                memory,
+                target,
+                graphics_resources.descriptors[0],
+                graphics_resources.descriptors[1],
+            );
+            return;
+        }
+        if (graphics_resources.image_count == 1 and
+            draw.index_count != null and draw.index_count.? == 6 and
+            matchesFullscreenSampleBlit(fragment_analysis.program.instructions.items))
         {
+            if (try self.emulateFullscreenSampleBlit(
+                memory,
+                target,
+                graphics_resources.descriptors[0],
+            )) return;
+        }
+        if (fragment_attribute_mask == 1 and vertex_storage.mapping_count == 0) {
             probe_parameter_mask = 1;
-            paired_parameter_mask = 1;
             fragment_input_controls[0] = 0;
+            paired_parameter_mask = 1;
         }
         // prepareComputeResources soft-skips missing V#s; rebuild its scalar
         // list from the seeded specialization so SPIR-V and staging agree.
@@ -6306,7 +6563,14 @@ pub const Renderer = struct {
         const fragment_translate_started = hostTimestampNs();
         var fragment_module = fragment_analysis.translateSpirv(self.allocator, .{
             .stage = .fragment,
-            .fragment_extent = .{ target.descriptor.width, target.descriptor.height },
+            // FragCoord is measured in visible render-target pixels. Dividing
+            // X by the NV12 allocation pitch (2048 for a 1920-wide movie)
+            // maps the last visible pixel to the last visible luma column and
+            // avoids sampling the decoder's right-hand padding.
+            .fragment_extent = if (planar_video_pass)
+                .{ graphics_resources.descriptors[0].width, target.descriptor.height }
+            else
+                .{ target.descriptor.width, target.descriptor.height },
             .sampled_images = graphics_resources.mappings[0..graphics_resources.mapping_count],
             .storage_buffers = fragment_storage.mappings[0..fragment_storage.mapping_count],
             .parameter_mask = paired_parameter_mask,
@@ -6529,6 +6793,38 @@ pub const Renderer = struct {
                 false,
                 .{ .vertex_count = 3, .instance_count = 1 },
             );
+            if (planar_video_pass and self.capture_first_graphics_frame and
+                !self.captured_planar_video_pass)
+            {
+                self.captured_planar_video_pass = true;
+                if (self.latest_render_target_index) |target_index| {
+                    try self.materializeRenderTarget(target_index);
+                    const captured_target = self.render_targets.items[target_index].target;
+                    for (self.completed_frames.items) |captured| {
+                        if (captured.guest_address != captured_target.descriptor.address) continue;
+                        if (captured_target.format.bytes_per_texel == 4) {
+                            dumpFramePpm(
+                                "out\\first-video-pass.ppm",
+                                captured.width,
+                                captured.height,
+                                captured.pixels.items,
+                            );
+                        } else if (captured_target.format.bytes_per_texel == 8) {
+                            dumpRgba16FloatFramePpm(
+                                "out\\first-video-pass.ppm",
+                                captured.width,
+                                captured.height,
+                                captured.pixels.items,
+                            );
+                        }
+                        std.debug.print(
+                            "[vulkan dcb] dumped out\\first-video-pass.ppm target=0x{x}\n",
+                            .{captured_target.descriptor.address},
+                        );
+                        break;
+                    }
+                }
+            }
             return;
         }
         try self.drawGraphicsShaders(
@@ -6542,6 +6838,271 @@ pub const Renderer = struct {
             false,
             .{ .vertex_count = 3, .instance_count = 1 },
         );
+    }
+
+    /// Convert the linear NV12 surfaces returned by AvPlayer directly into
+    /// the resident RGBA color target. Unity normally performs this with a
+    /// four-vertex NGG pass. Keeping the conversion independent of that
+    /// partially implemented vertex ABI gives video frames their exact visible
+    /// size while preserving the padded decoder pitch.
+    fn emulatePlanarVideoPass(
+        self: *Renderer,
+        memory: GuestMemory,
+        target: GuestColorTarget,
+        luma: gpu.ImageDescriptor,
+        chroma: gpu.ImageDescriptor,
+    ) anyerror!void {
+        if (target.format.vulkan != vk.format_r8g8b8a8_unorm or
+            target.format.bytes_per_texel != 4 or luma.unified_format != 1 or
+            chroma.unified_format != 14 or !luma.tile_mode.isLinear() or
+            !chroma.tile_mode.isLinear())
+        {
+            return Error.UnsupportedSampledImage;
+        }
+        const width: usize = target.descriptor.width;
+        const height: usize = target.descriptor.height;
+        const luma_pitch: usize = luma.pitch;
+        const chroma_pitch = std.math.mul(usize, chroma.pitch, 2) catch
+            return Error.GuestBufferTooLarge;
+        if (width == 0 or height == 0 or luma_pitch < width or
+            chroma_pitch < width or chroma.height * 2 != height)
+        {
+            return Error.UnsupportedSampledImage;
+        }
+        const luma_bytes = std.math.mul(usize, luma_pitch, height) catch
+            return Error.GuestBufferTooLarge;
+        const chroma_bytes = std.math.mul(usize, chroma_pitch, chroma.height) catch
+            return Error.GuestBufferTooLarge;
+        const rgba_bytes = std.math.mul(usize, width, height) catch
+            return Error.GuestBufferTooLarge;
+        const frame_bytes = std.math.mul(usize, rgba_bytes, 4) catch
+            return Error.GuestBufferTooLarge;
+        if (luma_bytes > maximum_frame_bytes or chroma_bytes > maximum_frame_bytes or
+            frame_bytes > maximum_frame_bytes)
+        {
+            return Error.GuestBufferTooLarge;
+        }
+
+        const y_plane = try self.allocator.alloc(u8, luma_bytes);
+        defer self.allocator.free(y_plane);
+        const uv_plane = try self.allocator.alloc(u8, chroma_bytes);
+        defer self.allocator.free(uv_plane);
+        const rgba = try self.allocator.alloc(u8, frame_bytes);
+        defer self.allocator.free(rgba);
+        if (!memory.read(memory.context, luma.address, y_plane) or
+            !memory.read(memory.context, chroma.address, uv_plane))
+        {
+            return Error.GuestMemoryReadFailed;
+        }
+
+        for (0..height) |y| {
+            const y_row = y * luma_pitch;
+            const uv_row = (y / 2) * chroma_pitch;
+            const rgba_row = y * width * 4;
+            for (0..width) |x| {
+                const c = @max(@as(i32, y_plane[y_row + x]) - 16, 0);
+                const uv = uv_row + (x / 2) * 2;
+                const u = @as(i32, uv_plane[uv]) - 128;
+                const v = @as(i32, uv_plane[uv + 1]) - 128;
+                const r = std.math.clamp((298 * c + 409 * v + 128) >> 8, 0, 255);
+                const g = std.math.clamp((298 * c - 100 * u - 208 * v + 128) >> 8, 0, 255);
+                const b = std.math.clamp((298 * c + 516 * u + 128) >> 8, 0, 255);
+                const pixel = rgba_row + x * 4;
+                rgba[pixel] = @intCast(r);
+                rgba[pixel + 1] = @intCast(g);
+                rgba[pixel + 2] = @intCast(b);
+                rgba[pixel + 3] = 255;
+            }
+        }
+
+        self.latest_video_render_target_index = try self.uploadLinearColorTarget(target, rgba);
+    }
+
+    /// Bypass Unity's identity sampled-image present pass. Its guest quad is
+    /// indexed through the merged NGG ABI; until that ABI is complete, the
+    /// translated vertices cover only a small central part of the display.
+    /// The narrowly matched PS changes alpha only and copies RGB unchanged.
+    fn emulateFullscreenSampleBlit(
+        self: *Renderer,
+        memory: GuestMemory,
+        target: GuestColorTarget,
+        source: gpu.ImageDescriptor,
+    ) anyerror!bool {
+        if ((target.format.vulkan != vk.format_r8g8b8a8_unorm and
+            target.format.vulkan != vk.format_r8g8b8a8_srgb) or
+            target.format.bytes_per_texel != 4 or source.unified_format != 56 or
+            source.width != target.descriptor.width or
+            source.height != target.descriptor.height or
+            source.samplesLog2() != 0 or source.dcc_enabled or
+            source.cmask_fast_clear or source.fmask_compression)
+        {
+            return false;
+        }
+        const layout = gpu.SurfaceLayout.fromImage(source) catch return false;
+        const allocation_bytes = std.math.cast(usize, layout.required_source_bytes) orelse
+            return Error.GuestBufferTooLarge;
+        const frame_bytes = std.math.mul(
+            usize,
+            std.math.mul(usize, source.width, source.height) catch
+                return Error.GuestBufferTooLarge,
+            4,
+        ) catch return Error.GuestBufferTooLarge;
+        if (allocation_bytes == 0 or allocation_bytes > maximum_frame_bytes or
+            frame_bytes > maximum_frame_bytes)
+        {
+            return Error.GuestBufferTooLarge;
+        }
+        try self.flushPendingGuestWrite(source.address, allocation_bytes);
+        const allocation = try self.allocator.alloc(u8, allocation_bytes);
+        defer self.allocator.free(allocation);
+        const rgba = try self.allocator.alloc(u8, frame_bytes);
+        defer self.allocator.free(rgba);
+        if (!memory.read(memory.context, source.address, allocation)) {
+            return Error.GuestMemoryReadFailed;
+        }
+        try layout.detile(allocation, rgba);
+        const target_index = try self.uploadLinearColorTarget(target, rgba);
+        if (self.isVideoSurface(source.address)) {
+            self.markVideoSurface(target.descriptor.address);
+            self.latest_video_render_target_index = target_index;
+        }
+        if (log_verbose_gpu or self.flip_callbacks < 24) {
+            std.debug.print(
+                "[vulkan dcb] emulated fullscreen sample blit: 0x{x} -> 0x{x} {d}x{d}\n",
+                .{ source.address, target.descriptor.address, source.width, source.height },
+            );
+        }
+        return true;
+    }
+
+    fn uploadLinearColorTarget(
+        self: *Renderer,
+        target: GuestColorTarget,
+        rgba: []const u8,
+    ) anyerror!usize {
+        const frame_bytes = try colorTargetFrameBytes(target);
+        if (rgba.len != frame_bytes) return Error.UnsupportedGraphicsState;
+        const target_index = try self.acquireRenderTarget(target);
+        const snapshot = self.render_targets.items[target_index];
+        const upload = try self.createBuffer(
+            frame_bytes,
+            vk.buffer_usage_transfer_src_bit,
+            vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+        );
+        defer self.destroyBuffer(upload);
+        try self.writeMapped(upload, rgba);
+
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        const source_stage: vk.Flags = if (!snapshot.initialized)
+            vk.pipeline_stage_top_of_pipe_bit
+        else if (snapshot.shader_read_layout)
+            vk.pipeline_stage_fragment_shader_bit | vk.pipeline_stage_compute_shader_bit
+        else
+            vk.pipeline_stage_color_attachment_output_bit;
+        const to_transfer = vk.ImageMemoryBarrier{
+            .source_access_mask = if (!snapshot.initialized)
+                0
+            else if (snapshot.shader_read_layout)
+                vk.access_shader_read_bit
+            else
+                vk.access_color_attachment_read_bit | vk.access_color_attachment_write_bit,
+            .destination_access_mask = vk.access_transfer_write_bit,
+            .old_layout = if (!snapshot.initialized)
+                vk.image_layout_undefined
+            else if (snapshot.shader_read_layout)
+                vk.image_layout_shader_read_only_optimal
+            else
+                vk.image_layout_color_attachment_optimal,
+            .new_layout = vk.image_layout_transfer_dst_optimal,
+            .image = snapshot.image.handle,
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            source_stage,
+            vk.pipeline_stage_transfer_bit,
+            0,
+            0,
+            null,
+            0,
+            null,
+            1,
+            @ptrCast(&to_transfer),
+        );
+        const copy = vk.BufferImageCopy{
+            .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+            .image_extent = .{
+                .width = target.descriptor.width,
+                .height = target.descriptor.height,
+                .depth = 1,
+            },
+        };
+        self.device_functions.cmd_copy_buffer_to_image(
+            command_buffer,
+            upload.handle,
+            snapshot.image.handle,
+            vk.image_layout_transfer_dst_optimal,
+            1,
+            @ptrCast(&copy),
+        );
+        const to_attachment = vk.ImageMemoryBarrier{
+            .source_access_mask = vk.access_transfer_write_bit,
+            .destination_access_mask = vk.access_color_attachment_read_bit | vk.access_color_attachment_write_bit,
+            .old_layout = vk.image_layout_transfer_dst_optimal,
+            .new_layout = vk.image_layout_color_attachment_optimal,
+            .image = snapshot.image.handle,
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_transfer_bit,
+            vk.pipeline_stage_color_attachment_output_bit,
+            0,
+            0,
+            null,
+            0,
+            null,
+            1,
+            @ptrCast(&to_attachment),
+        );
+        try self.submitOneShot(command_buffer);
+
+        self.frame_profile.upload_bytes +%= frame_bytes;
+        self.frame_profile.texture_upload_bytes +%= frame_bytes;
+        self.render_target_sequence +%= 1;
+        const cached = &self.render_targets.items[target_index];
+        cached.initialized = true;
+        cached.shader_read_layout = false;
+        cached.gpu_generation +%= 1;
+        cached.last_used_sequence = self.render_target_sequence;
+        self.latest_render_target_index = target_index;
+        for (self.completed_frames.items) |*frame| {
+            if (frame.guest_address == target.descriptor.address) frame.needs_writeback = false;
+        }
+        return target_index;
+    }
+
+    fn isVideoSurface(self: *const Renderer, address: u64) bool {
+        for (self.video_surface_addresses[0..self.video_surface_count]) |candidate| {
+            if (candidate == address) return true;
+        }
+        return false;
+    }
+
+    fn markVideoSurface(self: *Renderer, address: u64) void {
+        if (address == 0 or self.isVideoSurface(address)) return;
+        if (self.video_surface_count < self.video_surface_addresses.len) {
+            self.video_surface_addresses[self.video_surface_count] = address;
+            self.video_surface_count += 1;
+            return;
+        }
+        std.mem.copyForwards(
+            u64,
+            self.video_surface_addresses[0 .. self.video_surface_addresses.len - 1],
+            self.video_surface_addresses[1..],
+        );
+        self.video_surface_addresses[self.video_surface_addresses.len - 1] = address;
     }
 
     fn prepareGraphicsResources(
@@ -7512,6 +8073,7 @@ pub const Renderer = struct {
         .release = dcbRelease,
         .wait = dcbWait,
         .write_data = dcbWriteData,
+        .dma_data = dcbDmaData,
         .event = dcbEvent,
         .flip = dcbFlip,
         .draw = dcbDraw,
@@ -7654,6 +8216,98 @@ pub const Renderer = struct {
                 );
                 return false;
             }
+        }
+        return true;
+    }
+
+    fn invalidateDmaDestination(self: *Renderer, address: u64, size: usize) void {
+        for (self.render_targets.items) |*cached| {
+            const frame_bytes = colorTargetFrameBytes(cached.target) catch continue;
+            if (!byteRangesOverlap(address, size, cached.target.descriptor.address, frame_bytes)) continue;
+            cached.initialized = false;
+            cached.gpu_generation = 0;
+            cached.host_generation = 0;
+        }
+        for (self.completed_frames.items) |*cached| {
+            const target = cached.target orelse continue;
+            const frame_bytes = colorTargetFrameBytes(target) catch continue;
+            if (!byteRangesOverlap(address, size, cached.guest_address, frame_bytes)) continue;
+            cached.needs_writeback = false;
+            cached.guest_address = 0;
+            cached.sequence = 0;
+            cached.target = null;
+        }
+    }
+
+    fn ensureGdsStorage(self: *Renderer) bool {
+        if (self.gds_storage.items.len != 0) return true;
+        self.gds_storage.resize(self.allocator, 64 * 1024) catch return false;
+        @memset(self.gds_storage.items, 0);
+        return true;
+    }
+
+    fn dcbDmaData(context: ?*anyopaque, dma: gpu.state.DmaData) bool {
+        const self = fromContext(context);
+        self.dma_data_callbacks += 1;
+        if (self.dma_data_callbacks <= 16) {
+            std.debug.print(
+                "[vulkan dcb] DMA_DATA #{d} src={d}@0x{x} dst={d}@0x{x} bytes=0x{x}\n",
+                .{
+                    self.dma_data_callbacks,
+                    dma.source,
+                    dma.source_address,
+                    dma.destination,
+                    dma.destination_address,
+                    dma.byte_count,
+                },
+            );
+        }
+        if (dma.byte_count == 0) return true;
+        const byte_count: usize = dma.byte_count;
+        const bytes = self.allocator.alloc(u8, byte_count) catch return false;
+        defer self.allocator.free(bytes);
+        const memory = self.guest_memory orelse return false;
+
+        switch (dma.source) {
+            0, 3 => {
+                self.flushPendingGuestWrite(dma.source_address, byte_count) catch return false;
+                if (!memory.read(memory.context, dma.source_address, bytes)) return false;
+            },
+            1 => {
+                if (!self.ensureGdsStorage()) return false;
+                const offset = std.math.cast(usize, dma.source_address) orelse return false;
+                if (offset > self.gds_storage.items.len or byte_count > self.gds_storage.items.len - offset) return false;
+                @memcpy(bytes, self.gds_storage.items[offset..][0..byte_count]);
+            },
+            2 => {
+                const immediate: [4]u8 = @bitCast(@as(u32, @truncate(dma.source_address)));
+                for (bytes, 0..) |*byte, index| byte.* = immediate[index & 3];
+            },
+            // Clock/counter selectors are synchronization aids, not bulk
+            // image sources. Preserve queue progress until their counters are
+            // modelled without inventing bytes.
+            else => return true,
+        }
+
+        switch (dma.destination) {
+            0, 3 => {
+                // Unity emits four-byte immediate-to-L2 markers with a null
+                // destination between workloads. They carry ordering bits but
+                // intentionally publish no guest memory.
+                if (dma.destination_address == 0) return true;
+                self.flushPendingGuestWrite(dma.destination_address, byte_count) catch return false;
+                self.prepareCmaskWrite(dma.destination_address, byte_count) catch return false;
+                self.prepareHtileWrite(dma.destination_address, byte_count);
+                if (!memory.write(memory.context, dma.destination_address, bytes)) return false;
+                self.invalidateDmaDestination(dma.destination_address, byte_count);
+            },
+            1 => {
+                if (!self.ensureGdsStorage()) return false;
+                const offset = std.math.cast(usize, dma.destination_address) orelse return false;
+                if (offset > self.gds_storage.items.len or byte_count > self.gds_storage.items.len - offset) return false;
+                @memcpy(self.gds_storage.items[offset..][0..byte_count], bytes);
+            },
+            else => return true,
         }
         return true;
     }
@@ -7929,6 +8583,33 @@ pub const Renderer = struct {
                 return false;
             };
             self.resolvePendingTargetlessDraw(requested.?);
+            // Until the merged Unity quad path can compose the decoded movie
+            // into its older camera target, present the newest proven video
+            // surface directly. The override expires as soon as planar video
+            // draws stop, so menus/gameplay resume using the requested buffer.
+            if (self.window_presentation != null and
+                self.latest_video_render_target_index != null and
+                self.flip_callbacks -| self.video_surface_last_flip <= 2)
+            {
+                const video_index = self.latest_video_render_target_index.?;
+                if (video_index < self.render_targets.items.len and
+                    self.render_targets.items[video_index].initialized)
+                {
+                    self.blitRenderTargetToSwapchain(video_index) catch |err| {
+                        self.last_flip_error = err;
+                        return false;
+                    };
+                    if (self.flip_callbacks <= 24 or log_verbose_gpu) {
+                        std.debug.print(
+                            "[vulkan dcb] presenting active video target @0x{x}\n",
+                            .{self.render_targets.items[video_index].target.descriptor.address},
+                        );
+                    }
+                    self.presented_frames += 1;
+                    self.last_flip_error = null;
+                    return true;
+                }
+            }
             // Most frames can go directly from the resident render target to
             // the swapchain. At a handful of diagnostic checkpoints take the
             // normal materialization path so the PPM is the frame that was
@@ -8166,6 +8847,21 @@ pub const Renderer = struct {
         }
         if (has_vertex) {
             const render_state = gpu.resources.decodeRenderState(state);
+            if (render_state.color_control.mode == 3) {
+                const resolved = self.resolveColorTargets(render_state) catch |err| {
+                    self.last_draw_error = err;
+                    if (self.shouldReportDrawError(err)) {
+                        std.debug.print("[vulkan dcb] color resolve skipped: {s}\n", .{@errorName(err)});
+                    }
+                    return true;
+                };
+                if (resolved) {
+                    self.guest_graphics_draws += 1;
+                    self.translated_draws += 1;
+                    self.last_draw_error = null;
+                    return true;
+                }
+            }
             if (render_state.active_color_count == 0) {
                 self.appendPendingTargetlessDraw(state, draw, vertex_stage.?);
                 return true;
@@ -8515,6 +9211,60 @@ fn matchesDualImageClear(inst: anytype) bool {
         registerOperand(inst[16].src1, .sgpr, 24) and
         inst[16].data_mask == 0xf and inst[16].image_nsa_words == 0 and
         inst[16].image_dimension == .dim_2d;
+}
+
+fn matchesFullscreenSampleBlit(inst: anytype) bool {
+    if (inst.len < 12 or inst.len > 20) return false;
+    var samples: u32 = 0;
+    var color_exports: u32 = 0;
+    for (inst) |candidate| {
+        if (candidate.opcode == .image_sample) {
+            if (candidate.data_mask != 0xf) return false;
+            samples += 1;
+        }
+        if (candidate.opcode == .image_store) return false;
+        if (candidate.opcode == .exp and candidate.export_target == 0) {
+            if (!candidate.export_done) return false;
+            color_exports += 1;
+        }
+    }
+    return samples == 1 and color_exports == 1;
+}
+
+fn matchesWholeImageCopy(inst: anytype) bool {
+    if (inst.len != 22) return false;
+    const expected = [_]gpu.ShaderOpcode{
+        .s_inst_prefetch,
+        .v_lshl_add_u32,
+        .s_buffer_load_dwordx2,
+        .v_lshl_add_u32,
+        .s_waitcnt,
+        .v_cmpx_gt_u32,
+        .v_cmpx_gt_u32,
+        .s_cbranch_execz,
+        .v_mov_b32,
+        .s_buffer_load_dwordx2,
+        .s_waitcnt,
+        .v_add_nc_u32,
+        .v_add_nc_u32,
+        .s_buffer_load_dwordx2,
+        .s_waitcnt,
+        .v_add_nc_u32,
+        .v_add_nc_u32,
+        .s_load_dwordx8,
+        .image_load,
+        .s_waitcnt,
+        .image_store,
+        .s_endpgm,
+    };
+    for (expected, inst) |opcode, instruction| {
+        if (instruction.opcode != opcode) return false;
+    }
+    // Descriptor resolution and the six control words below validate the
+    // concrete resources and copy rectangle.  Operand aliases vary between
+    // compiler revisions (notably VCC and the 2D/2D-array MIMG spelling), so
+    // the complete opcode/control-flow shape is the stable kernel identity.
+    return true;
 }
 
 fn matchesVolumeBufferCopy(inst: anytype) bool {
@@ -11107,6 +11857,28 @@ test "RGBA16F color targets and DCC clears preserve native half-float texels" {
         registers.bytes[0..registers.length],
     );
     try std.testing.expect(colorDccClearTexel(0xff, descriptor) == null);
+}
+
+test "MSAA color targets retain their allocation while using one host sample" {
+    var descriptor = std.mem.zeroes(gpu.resources.ColorTarget);
+    descriptor.address = 0x1234_0000;
+    descriptor.width = 1920;
+    descriptor.height = 1080;
+    descriptor.format = 10;
+    descriptor.tile_mode = .render_target;
+    descriptor.samples_log2 = 2;
+    descriptor.fragments_log2 = 1;
+    descriptor.fmask_compression = true;
+    descriptor.fmask_address = 0x5678_0000;
+
+    const host = hostColorTargetDescriptor(descriptor);
+    try std.testing.expectEqual(descriptor.address, host.address);
+    try std.testing.expectEqual(descriptor.width, host.width);
+    try std.testing.expectEqual(descriptor.height, host.height);
+    try std.testing.expectEqual(@as(u8, 0), host.samples_log2);
+    try std.testing.expectEqual(@as(u8, 0), host.fragments_log2);
+    try std.testing.expect(!host.fmask_compression);
+    try std.testing.expectEqual(@as(u64, 0), host.fmask_address);
 }
 
 test "CMASK clear and expanded nibbles materialize only the selected 8x8 blocks" {

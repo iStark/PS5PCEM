@@ -331,8 +331,8 @@ fn backendDraw(_: ?*anyopaque, state: *const gpu.State, packet: gpu.pm4.Packet) 
         traced_draw_states += 1;
         const render = gpu.resources.decodeRenderState(state);
         std.debug.print(
-            "[gpu draw state #{d}] color {d}/{d} mask=0x{x}",
-            .{ traced_draw_states, render.active_color_count, render.color_count, render.target_mask },
+            "[gpu draw state #{d}] color {d}/{d} mask=0x{x} mode={d}",
+            .{ traced_draw_states, render.active_color_count, render.color_count, render.target_mask, render.color_control.mode },
         );
         if (render.depth_target) |depth| {
             std.debug.print(
@@ -459,6 +459,13 @@ fn backendWriteData(_: ?*anyopaque, info: gpu.state.WriteData, values: []const u
     return true;
 }
 
+fn backendDmaData(_: ?*anyopaque, value: gpu.state.DmaData) bool {
+    if (installed_backend) |backend| {
+        if (backend.vtable.dma_data) |callback| return callback(backend.context, value);
+    }
+    return true;
+}
+
 fn backendEvent(_: ?*anyopaque, value: gpu.state.EventWrite) bool {
     var handled = false;
     var ok = true;
@@ -506,6 +513,7 @@ const executor_backend_vtable = gpu.DcbBackend.VTable{
     .release = backendRelease,
     .wait = backendWait,
     .write_data = backendWriteData,
+    .dma_data = backendDmaData,
     .event = backendEvent,
     .flip = backendFlip,
     .draw = backendDraw,

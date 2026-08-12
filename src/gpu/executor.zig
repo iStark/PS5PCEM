@@ -41,6 +41,7 @@ pub const Backend = struct {
         release: ?*const fn (?*anyopaque, gpu_state.ReleaseMem) bool = null,
         wait: ?*const fn (?*anyopaque, gpu_state.WaitRegMem, bool) bool = null,
         write_data: ?*const fn (?*anyopaque, gpu_state.WriteData, []const u32) bool = null,
+        dma_data: ?*const fn (?*anyopaque, gpu_state.DmaData) bool = null,
         event: ?*const fn (?*anyopaque, gpu_state.EventWrite) bool = null,
         flip: ?*const fn (?*anyopaque, gpu_state.Flip) bool = null,
         draw: ?*const fn (?*anyopaque, *const gpu_state.State, pm4.Packet) bool = null,
@@ -444,6 +445,10 @@ pub const DcbExecutor = struct {
             try self.writeData(packet, true);
             return .complete;
         }
+        if (packet.opcode == pm4.dma_data) {
+            try self.dmaData(packet);
+            return .complete;
+        }
         if (packet.opcode == pm4.event_write) {
             try self.eventWrite(packet);
             return .complete;
@@ -735,6 +740,49 @@ pub const DcbExecutor = struct {
         }
         self.state.last_write = info;
         self.state.write_data_count += 1;
+    }
+
+    fn dmaData(self: *DcbExecutor, packet: pm4.Packet) Error!void {
+        if (packet.body.len != 6) return Error.InvalidPacket;
+        const body = packet.body;
+        const control = body[0];
+        const control2 = body[5];
+        const value = gpu_state.DmaData{
+            .engine = @truncate(control & 1),
+            .source = @truncate(((control >> 29) & 3) |
+                ((control2 >> 24) & 4) | ((control2 >> 25) & 8)),
+            .source_cache_policy = @truncate((control >> 13) & 3),
+            .source_address = (@as(u64, body[2]) << 32) | body[1],
+            .destination = @truncate(((control >> 20) & 3) |
+                ((control2 >> 25) & 4) | ((control2 >> 26) & 8)),
+            .destination_cache_policy = @truncate((control >> 25) & 3),
+            .destination_address = (@as(u64, body[4]) << 32) | body[3],
+            .byte_count = control2 & 0x03ff_ffff,
+            .wait_for_previous = control2 & (1 << 30) != 0,
+            .write_confirm = control2 & (1 << 31) != 0,
+            .block_engine = control & (1 << 31) != 0,
+        };
+
+        if (self.backend.vtable.dma_data) |callback| {
+            if (!callback(self.backend.context, value)) return Error.BackendRejected;
+        } else if ((value.destination == 0 or value.destination == 3) and value.byte_count != 0) {
+            const byte_count = std.math.cast(usize, value.byte_count) orelse return Error.InvalidPacket;
+            const bytes = try self.allocator.alloc(u8, byte_count);
+            defer self.allocator.free(bytes);
+            switch (value.source) {
+                0, 3 => try self.backend.read(value.source_address, bytes),
+                2 => {
+                    const immediate: [4]u8 = @bitCast(@as(u32, @truncate(value.source_address)));
+                    for (bytes, 0..) |*byte, index| byte.* = immediate[index & 3];
+                },
+                else => {},
+            }
+            if (value.source == 0 or value.source == 2 or value.source == 3) {
+                try self.backend.write(value.destination_address, bytes);
+            }
+        }
+        self.state.last_dma = value;
+        self.state.dma_data_count += 1;
     }
 
     fn eventWrite(self: *DcbExecutor, packet: pm4.Packet) Error!void {

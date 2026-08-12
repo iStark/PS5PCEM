@@ -7,6 +7,7 @@
 //! services.zig, where it can be read without a thousand lines in the way.
 
 const services = @import("services.zig");
+const av_player = @import("av_player.zig");
 const platform_services = @import("platform_services.zig");
 const playgo = @import("playgo.zig");
 const trace = @import("../trace.zig");
@@ -113,10 +114,10 @@ pub const audiodec_exports = [_]symbols.Export{
 
 pub const avplayer_exports = [_]symbols.Export{
     .{ .name = "sceAvPlayerAddSource", .function = trace.wrap("sceAvPlayerAddSource", &services.absent), .expect_id = "KMcEa+rHsIo" },
-    .{ .name = "sceAvPlayerCurrentTime", .function = trace.wrap("sceAvPlayerCurrentTime", &services.absent), .expect_id = "wwM99gjFf1Y" },
-    .{ .name = "sceAvPlayerSetTrickSpeed", .function = trace.wrap("sceAvPlayerSetTrickSpeed", &services.absent), .expect_id = "av8Z++94rs0" },
-    .{ .name = "sceAvPlayerGetStreamInfo", .function = trace.wrap("sceAvPlayerGetStreamInfo", &services.absent), .expect_id = "d8FcbzfAdQw" },
-    .{ .name = "sceAvPlayerDisableStream", .function = trace.wrap("sceAvPlayerDisableStream", &services.absent), .expect_id = "BOVKAzRmuTQ" },
+    .{ .name = "sceAvPlayerCurrentTime", .function = trace.wrap("sceAvPlayerCurrentTime", &av_player.currentTime), .expect_id = "wwM99gjFf1Y" },
+    .{ .name = "sceAvPlayerSetTrickSpeed", .function = trace.wrap("sceAvPlayerSetTrickSpeed", &av_player.setTrickSpeed), .expect_id = "av8Z++94rs0" },
+    .{ .name = "sceAvPlayerGetStreamInfo", .function = trace.wrap("sceAvPlayerGetStreamInfo", &av_player.getStreamInfo), .expect_id = "d8FcbzfAdQw" },
+    .{ .name = "sceAvPlayerDisableStream", .function = trace.wrap("sceAvPlayerDisableStream", &av_player.disableStream), .expect_id = "BOVKAzRmuTQ" },
     .{ .name = "sceAvPlayerInit", .function = trace.wrap("sceAvPlayerInit", &services.absent), .expect_id = "aS66RI0gGgo" },
 };
 
@@ -166,11 +167,13 @@ pub const gamelivestreaming_exports = [_]symbols.Export{
 };
 
 pub const gameupdate_exports = [_]symbols.Export{
-    .{ .name = "sceGameUpdateInitialize", .function = trace.wrap("sceGameUpdateInitialize", &services.absent), .expect_id = "YJtKLttI9fM" },
-    .{ .name = "sceGameUpdateTerminate", .function = trace.wrap("sceGameUpdateTerminate", &services.absent), .expect_id = "NSH-C-OmoNI" },
-    .{ .name = "sceGameUpdateCreateRequest", .function = trace.wrap("sceGameUpdateCreateRequest", &services.absent), .expect_id = "UvcvKaFvupA" },
-    .{ .name = "sceGameUpdateCheck", .function = trace.wrap("sceGameUpdateCheck", &services.absent), .expect_id = "LYVV9z8+owM" },
-    .{ .name = "sceGameUpdateDeleteRequest", .function = trace.wrap("sceGameUpdateDeleteRequest", &services.absent), .expect_id = "bcCyjHN5sn0" },
+    .{ .name = "sceGameUpdateInitialize", .function = trace.wrap("sceGameUpdateInitialize", &services.gameUpdateInitialize), .expect_id = "YJtKLttI9fM" },
+    .{ .name = "sceGameUpdateTerminate", .function = trace.wrap("sceGameUpdateTerminate", &services.gameUpdateTerminate), .expect_id = "NSH-C-OmoNI" },
+    .{ .name = "sceGameUpdateCreateRequest", .function = trace.wrap("sceGameUpdateCreateRequest", &services.gameUpdateCreateRequest), .expect_id = "UvcvKaFvupA" },
+    .{ .name = "sceGameUpdateCheck", .function = trace.wrap("sceGameUpdateCheck", &services.gameUpdateCheck), .expect_id = "LYVV9z8+owM" },
+    .{ .name = "sceGameUpdateAbortRequest", .function = trace.wrap("sceGameUpdateAbortRequest", &services.gameUpdateAbortRequest), .expect_id = "d1CNGEOaK28" },
+    .{ .name = "sceGameUpdateDeleteRequest", .function = trace.wrap("sceGameUpdateDeleteRequest", &services.gameUpdateDeleteRequest), .expect_id = "bcCyjHN5sn0" },
+    .{ .name = "sceGameUpdateGetAddcontLatestVersion", .function = trace.wrap("sceGameUpdateGetAddcontLatestVersion", &services.gameUpdateGetAddcontLatestVersion), .expect_id = "0g0+Oq9xcI0" },
 };
 
 pub const hmd2_exports = [_]symbols.Export{
@@ -246,15 +249,19 @@ pub const json2_exports = [_]symbols.Export{
     .{ .name = "_ZNK3sce4Json5ValueixEPKc", .function = trace.wrap("_ZNK3sce4Json5ValueixEPKc", &services.absent), .expect_id = "HwDt5lD9Bfo" },
     .{ .name = "_ZNK3sce4Json5Value9getStringEv", .function = trace.wrap("_ZNK3sce4Json5Value9getStringEv", &services.absent), .expect_id = "epJ6x2LV0kU" },
     .{ .name = "_ZNK3sce4Json6String5c_strEv", .function = trace.wrap("_ZNK3sce4Json6String5c_strEv", &services.absent), .expect_id = "L1KAkYWml-M" },
-    .{ .name = "_ZN3sce4Json12MemAllocatorC2Ev", .function = trace.wrap("_ZN3sce4Json12MemAllocatorC2Ev", &services.absent), .expect_id = "-hJRce8wn1U" },
-    .{ .name = "_ZN3sce4Json14InitParameter2C1Ev", .function = trace.wrap("_ZN3sce4Json14InitParameter2C1Ev", &services.absent), .expect_id = "WSOuge5IsCg" },
-    .{ .name = "_ZN3sce4Json14InitParameter212setAllocatorEPNS0_12MemAllocatorEPv", .function = trace.wrap("_ZN3sce4Json14InitParameter212setAllocatorEPNS0_12MemAllocatorEPv", &services.absent), .expect_id = "I2QC8PYhJWY" },
-    .{ .name = "_ZN3sce4Json14InitParameter217setFileBufferSizeEm", .function = trace.wrap("_ZN3sce4Json14InitParameter217setFileBufferSizeEm", &services.absent), .expect_id = "Eu95jmqn5Rw" },
-    .{ .name = "_ZN3sce4Json11InitializerC1Ev", .function = trace.wrap("_ZN3sce4Json11InitializerC1Ev", &services.absent), .expect_id = "cK6bYHf-Q5E" },
-    .{ .name = "_ZN3sce4Json11Initializer10initializeEPKNS0_14InitParameter2E", .function = trace.wrap("_ZN3sce4Json11Initializer10initializeEPKNS0_14InitParameter2E", &services.absent), .expect_id = "IXW-z8pggfg" },
-    .{ .name = "_ZN3sce4Json11Initializer9terminateEv", .function = trace.wrap("_ZN3sce4Json11Initializer9terminateEv", &services.absent), .expect_id = "PR5k1penBLM" },
-    .{ .name = "_ZN3sce4Json11InitializerD1Ev", .function = trace.wrap("_ZN3sce4Json11InitializerD1Ev", &services.absent), .expect_id = "RujUxbr3haM" },
-    .{ .name = "_ZN3sce4Json12MemAllocatorD2Ev", .function = trace.wrap("_ZN3sce4Json12MemAllocatorD2Ev", &services.absent), .expect_id = "OcAgPxcq5Vk" },
+    // JSON's process-wide bootstrap owns no guest-visible result handles. The
+    // offline CppWebApi module still initializes it before deciding that no
+    // network service is available, so returning ENOSYS here aborts the whole
+    // Unity plug-in bootstrap instead of selecting that offline path.
+    .{ .name = "_ZN3sce4Json12MemAllocatorC2Ev", .function = trace.wrap("_ZN3sce4Json12MemAllocatorC2Ev", &services.accept), .expect_id = "-hJRce8wn1U" },
+    .{ .name = "_ZN3sce4Json14InitParameter2C1Ev", .function = trace.wrap("_ZN3sce4Json14InitParameter2C1Ev", &services.accept), .expect_id = "WSOuge5IsCg" },
+    .{ .name = "_ZN3sce4Json14InitParameter212setAllocatorEPNS0_12MemAllocatorEPv", .function = trace.wrap("_ZN3sce4Json14InitParameter212setAllocatorEPNS0_12MemAllocatorEPv", &services.accept), .expect_id = "I2QC8PYhJWY" },
+    .{ .name = "_ZN3sce4Json14InitParameter217setFileBufferSizeEm", .function = trace.wrap("_ZN3sce4Json14InitParameter217setFileBufferSizeEm", &services.accept), .expect_id = "Eu95jmqn5Rw" },
+    .{ .name = "_ZN3sce4Json11InitializerC1Ev", .function = trace.wrap("_ZN3sce4Json11InitializerC1Ev", &services.accept), .expect_id = "cK6bYHf-Q5E" },
+    .{ .name = "_ZN3sce4Json11Initializer10initializeEPKNS0_14InitParameter2E", .function = trace.wrap("_ZN3sce4Json11Initializer10initializeEPKNS0_14InitParameter2E", &services.accept), .expect_id = "IXW-z8pggfg" },
+    .{ .name = "_ZN3sce4Json11Initializer9terminateEv", .function = trace.wrap("_ZN3sce4Json11Initializer9terminateEv", &services.accept), .expect_id = "PR5k1penBLM" },
+    .{ .name = "_ZN3sce4Json11InitializerD1Ev", .function = trace.wrap("_ZN3sce4Json11InitializerD1Ev", &services.accept), .expect_id = "RujUxbr3haM" },
+    .{ .name = "_ZN3sce4Json12MemAllocatorD2Ev", .function = trace.wrap("_ZN3sce4Json12MemAllocatorD2Ev", &services.accept), .expect_id = "OcAgPxcq5Vk" },
 };
 
 pub const net_exports = [_]symbols.Export{
@@ -307,7 +314,7 @@ pub const npentitlementaccess_exports = [_]symbols.Export{
     .{ .name = "sceNpEntitlementAccessPollServiceEntitlementInfoList", .function = trace.wrap("sceNpEntitlementAccessPollServiceEntitlementInfoList", &services.offline), .expect_id = "aFv8qms6XTM" },
     .{ .name = "sceNpEntitlementAccessRequestUnifiedEntitlementInfoList", .function = trace.wrap("sceNpEntitlementAccessRequestUnifiedEntitlementInfoList", &services.offline), .expect_id = "uCZf2L27th8" },
     .{ .name = "sceNpEntitlementAccessRequestServiceEntitlementInfoList", .function = trace.wrap("sceNpEntitlementAccessRequestServiceEntitlementInfoList", &services.offline), .expect_id = "brbRxzr7qyI" },
-    .{ .name = "sceNpEntitlementAccessInitialize", .function = trace.wrap("sceNpEntitlementAccessInitialize", &services.offline), .expect_id = "jO8DM8oyego" },
+    .{ .name = "sceNpEntitlementAccessInitialize", .function = trace.wrap("sceNpEntitlementAccessInitialize", &services.npEntitlementAccessInitialize), .expect_id = "jO8DM8oyego" },
 };
 
 pub const npgameintent_exports = [_]symbols.Export{
@@ -333,8 +340,8 @@ pub const npmanager_exports = [_]symbols.Export{
 };
 
 pub const npsessionsignaling_exports = [_]symbols.Export{
-    .{ .name = "sceNpSessionSignalingTerminate", .function = trace.wrap("sceNpSessionSignalingTerminate", &services.offline), .expect_id = "CqJuNXo5yiM" },
-    .{ .name = "sceNpSessionSignalingInitialize", .function = trace.wrap("sceNpSessionSignalingInitialize", &services.offline), .expect_id = "ysmw6J-P8Ak" },
+    .{ .name = "sceNpSessionSignalingTerminate", .function = trace.wrap("sceNpSessionSignalingTerminate", &services.accept), .expect_id = "CqJuNXo5yiM" },
+    .{ .name = "sceNpSessionSignalingInitialize", .function = trace.wrap("sceNpSessionSignalingInitialize", &services.npSessionSignalingInitialize), .expect_id = "ysmw6J-P8Ak" },
     .{ .name = "sceNpSessionSignalingCreateContext2", .function = trace.wrap("sceNpSessionSignalingCreateContext2", &services.offline), .expect_id = "aBuX0PX-T7I" },
     .{ .name = "sceNpSessionSignalingDestroyContext", .function = trace.wrap("sceNpSessionSignalingDestroyContext", &services.offline), .expect_id = "Z9Q9LzQDXf0" },
     .{ .name = "sceNpSessionSignalingDeactivate", .function = trace.wrap("sceNpSessionSignalingDeactivate", &services.offline), .expect_id = "cQkBH-pXhF0" },
@@ -344,15 +351,15 @@ pub const npsessionsignaling_exports = [_]symbols.Export{
 };
 
 pub const nptrophy2_exports = [_]symbols.Export{
-    .{ .name = "sceNpTrophy2CreateContext", .function = trace.wrap("sceNpTrophy2CreateContext", &services.offline), .expect_id = "Bagshr7OQ6Q" },
-    .{ .name = "sceNpTrophy2CreateHandle", .function = trace.wrap("sceNpTrophy2CreateHandle", &services.offline), .expect_id = "Gz1rmUZpROM" },
-    .{ .name = "sceNpTrophy2RegisterContext", .function = trace.wrap("sceNpTrophy2RegisterContext", &services.offline), .expect_id = "bIDov3wBu5Q" },
-    .{ .name = "sceNpTrophy2DestroyContext", .function = trace.wrap("sceNpTrophy2DestroyContext", &services.offline), .expect_id = "sysY2FHYff4" },
-    .{ .name = "sceNpTrophy2DestroyHandle", .function = trace.wrap("sceNpTrophy2DestroyHandle", &services.offline), .expect_id = "d8P11CI40KE" },
+    .{ .name = "sceNpTrophy2CreateContext", .function = trace.wrap("sceNpTrophy2CreateContext", &services.npTrophy2CreateContext), .expect_id = "Bagshr7OQ6Q" },
+    .{ .name = "sceNpTrophy2CreateHandle", .function = trace.wrap("sceNpTrophy2CreateHandle", &services.npTrophy2CreateHandle), .expect_id = "Gz1rmUZpROM" },
+    .{ .name = "sceNpTrophy2RegisterContext", .function = trace.wrap("sceNpTrophy2RegisterContext", &services.accept), .expect_id = "bIDov3wBu5Q" },
+    .{ .name = "sceNpTrophy2DestroyContext", .function = trace.wrap("sceNpTrophy2DestroyContext", &services.accept), .expect_id = "sysY2FHYff4" },
+    .{ .name = "sceNpTrophy2DestroyHandle", .function = trace.wrap("sceNpTrophy2DestroyHandle", &services.accept), .expect_id = "d8P11CI40KE" },
     .{ .name = "sceNpTrophy2GetGameInfo", .function = trace.wrap("sceNpTrophy2GetGameInfo", &services.offline), .expect_id = "4IzqhhUQ3nk" },
     .{ .name = "sceNpTrophy2GetTrophyInfoArray", .function = trace.wrap("sceNpTrophy2GetTrophyInfoArray", &services.offline), .expect_id = "y3zHpdZO6ME" },
-    .{ .name = "sceNpTrophy2RegisterUnlockCallback", .function = trace.wrap("sceNpTrophy2RegisterUnlockCallback", &services.offline), .expect_id = "sUXGfNMalIo" },
-    .{ .name = "sceNpTrophy2UnregisterUnlockCallback", .function = trace.wrap("sceNpTrophy2UnregisterUnlockCallback", &services.offline), .expect_id = "wVqxM58sIKs" },
+    .{ .name = "sceNpTrophy2RegisterUnlockCallback", .function = trace.wrap("sceNpTrophy2RegisterUnlockCallback", &services.accept), .expect_id = "sUXGfNMalIo" },
+    .{ .name = "sceNpTrophy2UnregisterUnlockCallback", .function = trace.wrap("sceNpTrophy2UnregisterUnlockCallback", &services.accept), .expect_id = "wVqxM58sIKs" },
 };
 
 pub const npuniversaldatasystem_exports = [_]symbols.Export{
@@ -388,17 +395,17 @@ pub const npuniversaldatasystem_exports = [_]symbols.Export{
 };
 
 pub const npwebapi2_exports = [_]symbols.Export{
-    .{ .name = "sceNpWebApi2SetRequestTimeout", .function = trace.wrap("sceNpWebApi2SetRequestTimeout", &services.offline), .expect_id = "TjAutbrkr60" },
-    .{ .name = "sceNpWebApi2PushEventCreateFilter", .function = trace.wrap("sceNpWebApi2PushEventCreateFilter", &services.offline), .expect_id = "MsaFhR+lPE4" },
-    .{ .name = "sceNpWebApi2PushEventDeleteFilter", .function = trace.wrap("sceNpWebApi2PushEventDeleteFilter", &services.offline), .expect_id = "KJdPcOGmK58" },
-    .{ .name = "sceNpWebApi2PushEventUnregisterCallback", .function = trace.wrap("sceNpWebApi2PushEventUnregisterCallback", &services.offline), .expect_id = "hOnIlcGrO6g" },
-    .{ .name = "sceNpWebApi2PushEventRegisterCallback", .function = trace.wrap("sceNpWebApi2PushEventRegisterCallback", &services.offline), .expect_id = "fY3QqeNkF8k" },
-    .{ .name = "sceNpWebApi2PushEventDeletePushContext", .function = trace.wrap("sceNpWebApi2PushEventDeletePushContext", &services.offline), .expect_id = "QafxeZM3WK4" },
-    .{ .name = "sceNpWebApi2PushEventUnregisterPushContextCallback", .function = trace.wrap("sceNpWebApi2PushEventUnregisterPushContextCallback", &services.offline), .expect_id = "PmyrbbJSFz0" },
-    .{ .name = "sceNpWebApi2PushEventRegisterPushContextCallback", .function = trace.wrap("sceNpWebApi2PushEventRegisterPushContextCallback", &services.offline), .expect_id = "lxtHJMwBsaU" },
-    .{ .name = "sceNpWebApi2PushEventCreatePushContext", .function = trace.wrap("sceNpWebApi2PushEventCreatePushContext", &services.offline), .expect_id = "NNVf18SlbT8" },
-    .{ .name = "sceNpWebApi2PushEventStartPushContextCallback", .function = trace.wrap("sceNpWebApi2PushEventStartPushContextCallback", &services.offline), .expect_id = "AAj9X+4aGYA" },
-    .{ .name = "sceNpWebApi2PushEventCreateHandle", .function = trace.wrap("sceNpWebApi2PushEventCreateHandle", &services.offline), .expect_id = "WV1GwM32NgY" },
+    .{ .name = "sceNpWebApi2SetRequestTimeout", .function = trace.wrap("sceNpWebApi2SetRequestTimeout", &services.accept), .expect_id = "TjAutbrkr60" },
+    .{ .name = "sceNpWebApi2PushEventCreateFilter", .function = trace.wrap("sceNpWebApi2PushEventCreateFilter", &services.npWebApi2PushEventCreateHandle), .expect_id = "MsaFhR+lPE4" },
+    .{ .name = "sceNpWebApi2PushEventDeleteFilter", .function = trace.wrap("sceNpWebApi2PushEventDeleteFilter", &services.accept), .expect_id = "KJdPcOGmK58" },
+    .{ .name = "sceNpWebApi2PushEventUnregisterCallback", .function = trace.wrap("sceNpWebApi2PushEventUnregisterCallback", &services.accept), .expect_id = "hOnIlcGrO6g" },
+    .{ .name = "sceNpWebApi2PushEventRegisterCallback", .function = trace.wrap("sceNpWebApi2PushEventRegisterCallback", &services.accept), .expect_id = "fY3QqeNkF8k" },
+    .{ .name = "sceNpWebApi2PushEventDeletePushContext", .function = trace.wrap("sceNpWebApi2PushEventDeletePushContext", &services.accept), .expect_id = "QafxeZM3WK4" },
+    .{ .name = "sceNpWebApi2PushEventUnregisterPushContextCallback", .function = trace.wrap("sceNpWebApi2PushEventUnregisterPushContextCallback", &services.accept), .expect_id = "PmyrbbJSFz0" },
+    .{ .name = "sceNpWebApi2PushEventRegisterPushContextCallback", .function = trace.wrap("sceNpWebApi2PushEventRegisterPushContextCallback", &services.accept), .expect_id = "lxtHJMwBsaU" },
+    .{ .name = "sceNpWebApi2PushEventCreatePushContext", .function = trace.wrap("sceNpWebApi2PushEventCreatePushContext", &services.npWebApi2PushEventCreateHandle), .expect_id = "NNVf18SlbT8" },
+    .{ .name = "sceNpWebApi2PushEventStartPushContextCallback", .function = trace.wrap("sceNpWebApi2PushEventStartPushContextCallback", &services.accept), .expect_id = "AAj9X+4aGYA" },
+    .{ .name = "sceNpWebApi2PushEventCreateHandle", .function = trace.wrap("sceNpWebApi2PushEventCreateHandle", &services.npWebApi2PushEventCreateHandle), .expect_id = "WV1GwM32NgY" },
 };
 
 pub const pad_exports = [_]symbols.Export{

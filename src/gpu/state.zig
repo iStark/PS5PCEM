@@ -89,6 +89,20 @@ pub const WriteData = struct {
     standard_packet: bool,
 };
 
+pub const DmaData = struct {
+    engine: u8,
+    source: u8,
+    source_cache_policy: u8,
+    source_address: u64,
+    destination: u8,
+    destination_cache_policy: u8,
+    destination_address: u64,
+    byte_count: u32,
+    wait_for_previous: bool,
+    write_confirm: bool,
+    block_engine: bool,
+};
+
 pub const EventWrite = struct {
     event_type: u8,
     event_index: u8,
@@ -113,6 +127,7 @@ pub const State = struct {
     last_wait: ?WaitRegMem = null,
     blocked_wait: ?WaitRegMem = null,
     last_write: ?WriteData = null,
+    last_dma: ?DmaData = null,
     last_event: ?EventWrite = null,
     last_flip: ?Flip = null,
 
@@ -122,6 +137,7 @@ pub const State = struct {
     release_count: u64 = 0,
     wait_count: u64 = 0,
     write_data_count: u64 = 0,
+    dma_data_count: u64 = 0,
     event_count: u64 = 0,
     flip_count: u64 = 0,
     indirect_buffer_count: u64 = 0,

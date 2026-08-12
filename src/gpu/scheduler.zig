@@ -318,6 +318,7 @@ const SnapshotBackend = struct {
             .release = if (self.original.vtable.release != null) release else null,
             .wait = if (self.original.vtable.wait != null) wait else null,
             .write_data = if (self.original.vtable.write_data != null) writeData else null,
+            .dma_data = if (self.original.vtable.dma_data != null) dmaData else null,
             .event = if (self.original.vtable.event != null) event else null,
             .flip = if (self.original.vtable.flip != null) flip else null,
             .draw = if (self.original.vtable.draw != null) draw else null,
@@ -363,6 +364,11 @@ const SnapshotBackend = struct {
     fn writeData(context: ?*anyopaque, value: gpu_state.WriteData, words: []const u32) bool {
         const self = from(context);
         return self.original.vtable.write_data.?(self.original.context, value, words);
+    }
+
+    fn dmaData(context: ?*anyopaque, value: gpu_state.DmaData) bool {
+        const self = from(context);
+        return self.original.vtable.dma_data.?(self.original.context, value);
     }
 
     fn event(context: ?*anyopaque, value: gpu_state.EventWrite) bool {

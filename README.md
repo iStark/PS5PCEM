@@ -63,14 +63,23 @@ If you would like to support continued PS5PCEM development, you can do so on
   the observed 53-draw startup frames take roughly 113–124 ms on the current
   RTX 3070 Ti test host, down from approximately 1–1.8 seconds before the
   specialization fix.
+- Asterix & Obelix: Slap Them All! now completes its Unity and PSN plug-in
+  bootstrap, creates AGC shaders from four-byte-aligned headers, and reaches
+  repeated 1920×1080 VideoOut frames. Its ATL intro is decoded by SceAvPlayer
+  into title-owned NV12 surfaces. The observed full-image compute copy,
+  fullscreen sample blit, planar YUV conversion, and color-resolve passes have
+  bounded host implementations, avoiding multi-second general shader paths
+  during the movie. This is an intro-video milestone; a repeatable menu or
+  gameplay frame is not claimed yet.
 - PS VR2 libraries currently expose only compatibility/no-device behavior.
   VR plugins can initialize far enough to load Unity assets, but headset
   rendering, tracking, controllers, and a host OpenXR bridge do not exist yet.
 - Offline bootstrap coverage now includes a fully-installed PlayGo profile and
   language/to-do queries, mount-root-aware `/app0` paths, software PNG decoding,
   save-data mount/dialog lifecycles, POSIX semaphores and pthread barriers,
-  local listener sockets, sign-in dialog state, offline telemetry handles, and
-  split AJM batch jobs.
+  local listener sockets, sign-in and player-review dialog state, GameUpdate
+  request lifecycles, conservative offline NP handles, offline telemetry
+  handles, and split AJM batch jobs.
 - NGS2 now preserves system/rack/voice lifecycles, parses RIFF/WAVE geometry,
   applies play/pause/resume/stop/kill events, reports 32-bit voice-state flags,
   and paces silent render grains instead of spinning a host core. The legacy
@@ -149,6 +158,7 @@ the repository contains none of that content.
 | **Tetris Effect: Connected** | Completes Unreal filesystem/config bootstrap, executes compact typed UAV clears and 3D volume uploads, translates two 344/125-instruction volume dispatches with recursively recovered V# chains, and translates the complete 176-instruction mixed-image/LDS prepass, including compute `image_sample_lz` at PC `0x29c` and NSA `image_store` at PC `0x440`; its 2,401-instruction deferred compositor writes all 8,294,400 pixels of the 3840×2160 scanout | The first repeatable guest framebuffer is uniform light gray rather than a recognizable scene; a normal run currently produces an NVIDIA GPU fault during an earlier `15×9×8` dispatch, while NGG export and some image forms remain incomplete and the 512 GiB reservation can depend on host address-space placement |
 | **The Precinct** | Links the complete six-image guest graph, defers and starts Unity plug-ins through `sceKernelLoadStartModule`, enters Unity, indexes its audio assets, and plays both observed intro movies through the new SceAvPlayer path. The title receives synchronized 3840×2160 NV12 video and 48 kHz stereo PCM; its guest YUV conversion shader produces the recognizable Kwalee frame above. Post-video graphics continue through seven draws and nine dispatches per frame, with warmed-up frames around 20–22 ms on the current RTX 3070 Ti test host | The post-video scene source is still incorrect: draw 1 receives a sparse/corrupted pixel strip, draw 2 copies it to the scanout, and later UI draws do not restore a recognizable scene. Gameplay is not claimed yet |
 | **Jets 'n' Guns 2** | Resolves title content through `/app0`, completes AGC resource registration, and sustains the full graphics/compute/VideoOut loop. Targetless final passes are preserved through flip, while dynamic SGPR data and descriptor-sized buffer bounds keep streamed sprite batches on stable Vulkan pipelines. The title now renders the recognizable 3840×2160 title screen, main menu, and options UI shown above; warmed 53-draw startup frames measure roughly 113–124 ms on the current RTX 3070 Ti host with zero pipeline misses after warm-up | A manual `Cross` reaches the main menu without the automatic `Options` pulse, but selecting `NEW GAME` currently stops further flips after the audio decode/output loops exit. A playable scene and working in-game audio are therefore not claimed yet |
+| **Asterix & Obelix: Slap Them All!** | Maps the Unity/PSN plug-in graph, passes GameUpdate, trophy, entitlement, WebApi, and player-review bootstrap calls, accepts four-byte-aligned AGC shader headers, and reaches repeated 1920×1080 frames. SceAvPlayer returns the ATL intro as correctly decoded NV12 frames, while matched image-copy, planar-conversion, fullscreen-blit, and color-resolve paths keep the observed movie pipeline moving without its former multi-second shader compilation/dispatch blockers | The decoded source is recognizable, but final compositor scaling/presentation still needs validation and no repeatable menu or gameplay frame is claimed yet |
 
 ## Components
 
@@ -720,7 +730,10 @@ Supported 2D image/sampler descriptors feed fragment `image_sample` and compute
 vertex tables provide distinct position and texture-coordinate buffers even
 when the shader reuses one V# SGPR, and vertex PARAM exports now supply the
 fragment interpolation inputs. `ACQUIRE_MEM`, `RELEASE_MEM`, `WAIT_REG_MEM`,
-`WRITE_DATA`, and `EVENT_WRITE` retain checked guest ordering. `SetFlip`
+`DMA_DATA`, `WRITE_DATA`, and `EVENT_WRITE` retain checked guest ordering.
+`DMA_DATA` decodes source/destination selectors, cache policy, immediate-fill
+and copy forms, and routes guest-memory transfers through the renderer
+boundary. `SetFlip`
 resolves its VideoOut slot and buffer index, selects the cached target with the
 matching guest address, and publishes the frame through an API-neutral sink.
 
@@ -1542,6 +1555,10 @@ interleaved signed 16-bit, 48 kHz stereo PCM. Video and audio have independent
 locks and buffered decoder processes, playback timestamps share one monotonic
 clock, pause/seek/loop/end-of-stream state is retained, and the software-decoder
 ABI reports aligned pitch, allocation height, and visible crop consistently.
+Both extended and legacy stream-info calls are available; current-time,
+normal-speed trick mode, stream disable, and bounded media-clock advancement
+cover the older Unity middleware used by Asterix without letting a long host
+shader stall skip its complete intro movie.
 
 The additional early-bootstrap surface in
 [src/hle/libs/bootstrap_services.zig](src/hle/libs/bootstrap_services.zig)
@@ -1903,6 +1920,14 @@ scheduler and Vulkan backend. Observed startup work now includes:
   host. The remaining visual fault begins before the compositor: the first
   post-video draw receives a sparse/corrupted scene source, which is then copied
   faithfully to the display target.
+- Asterix & Obelix exercises the corresponding 1920×1080 Unity movie path.
+  Exact shader-shape matching handles its full-surface compute copies and
+  indexed fullscreen sample blits without compiling large general pipelines;
+  the planar NV12 pass converts the title-owned luma/chroma allocations into a
+  persistent RGBA target, and the observed color resolve preserves the result
+  through the final VideoOut copies. These paths validate dimensions, formats,
+  descriptors, dispatch geometry, and instruction shape before taking the fast
+  path; unmatched work continues through normal shader translation.
 - The writable `/devlog/app/debug.log` console path is redirected to
   `out/guest-debug.log` without making `/app0` writable. Unity diagnostics can
   therefore survive startup failures while title content retains its read-only

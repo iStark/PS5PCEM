@@ -58,6 +58,7 @@ fn appendUnityDeferredModules(
         "Media/Plugins/lib_burst_generated.prx",
         "Media/Plugins/SaveData.prx",
         "Media/Plugins/PSN.prx",
+        "Media/Plugins/PSNCore.prx",
     };
     for (candidates) |path| {
         _ = directory.statFile(io, path, .{}) catch continue;

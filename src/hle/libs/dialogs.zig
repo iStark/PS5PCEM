@@ -32,6 +32,7 @@ var signin_dialog_status: std.atomic.Value(i32) = .init(status_none);
 var save_dialog_status: std.atomic.Value(i32) = .init(status_none);
 var save_dialog_mode: std.atomic.Value(i32) = .init(0);
 var save_dialog_user_data: std.atomic.Value(u64) = .init(0);
+var player_review_status: std.atomic.Value(i32) = .init(status_none);
 var keyboard_open: std.atomic.Value(u8) = .init(0);
 
 pub fn reset() void {
@@ -43,6 +44,7 @@ pub fn reset() void {
     save_dialog_status.store(status_none, .release);
     save_dialog_mode.store(0, .release);
     save_dialog_user_data.store(0, .release);
+    player_review_status.store(status_none, .release);
     keyboard_open.store(0, .release);
 }
 
@@ -194,6 +196,55 @@ const signin_dialog_exports = [_]symbols.Export{
     .{ .name = "sceSigninDialogTerminate", .function = trace.wrap("sceSigninDialogTerminate", &signinDialogTerminate), .expect_id = "LXlmS6PvJdU" },
 };
 
+// Player-review dialog ------------------------------------------------------
+
+fn playerReviewInitialize() callconv(abi.guest) i32 {
+    player_review_status.store(status_initialized, .release);
+    return errno.ok;
+}
+
+fn playerReviewOpen(_: ?*const anyopaque) callconv(abi.guest) i32 {
+    if (player_review_status.load(.acquire) == status_none) {
+        player_review_status.store(status_initialized, .release);
+    }
+    // There is no platform shell to collect a review. Completing immediately
+    // is the offline result and, importantly, never stalls a polling plug-in.
+    player_review_status.store(status_finished, .release);
+    return errno.ok;
+}
+
+fn playerReviewStatus() callconv(abi.guest) i32 {
+    return player_review_status.load(.acquire);
+}
+
+fn playerReviewGetResult(result: ?*[8]u8) callconv(abi.guest) i32 {
+    const output = result orelse return msg_error_argument_null;
+    @memset(output, 0);
+    return errno.ok;
+}
+
+fn playerReviewClose() callconv(abi.guest) i32 {
+    if (player_review_status.load(.acquire) != status_none) {
+        player_review_status.store(status_finished, .release);
+    }
+    return errno.ok;
+}
+
+fn playerReviewTerminate() callconv(abi.guest) i32 {
+    player_review_status.store(status_none, .release);
+    return errno.ok;
+}
+
+const player_review_dialog_exports = [_]symbols.Export{
+    .{ .name = "scePlayerReviewDialogInitialize", .function = trace.wrap("scePlayerReviewDialogInitialize", &playerReviewInitialize), .expect_id = "UtXl-tmi7iw" },
+    .{ .name = "scePlayerReviewDialogOpen", .function = trace.wrap("scePlayerReviewDialogOpen", &playerReviewOpen), .expect_id = "CtygVRCL+bA" },
+    .{ .name = "scePlayerReviewDialogUpdateStatus", .function = trace.wrap("scePlayerReviewDialogUpdateStatus", &playerReviewStatus), .expect_id = "4J5F23VgTjY" },
+    .{ .name = "scePlayerReviewDialogGetStatus", .function = trace.wrap("scePlayerReviewDialogGetStatus", &playerReviewStatus), .expect_id = "UYw6RlK7bcQ" },
+    .{ .name = "scePlayerReviewDialogGetResult", .function = trace.wrap("scePlayerReviewDialogGetResult", &playerReviewGetResult), .expect_id = "VuKbx6zlEG4" },
+    .{ .name = "scePlayerReviewDialogClose", .function = trace.wrap("scePlayerReviewDialogClose", &playerReviewClose), .expect_id = "HDMHJ9zsCFg" },
+    .{ .name = "scePlayerReviewDialogTerminate", .function = trace.wrap("scePlayerReviewDialogTerminate", &playerReviewTerminate), .expect_id = "RmJKkzZFNFA" },
+};
+
 // Save-data dialog ---------------------------------------------------------
 
 fn saveDialogInitialize() callconv(abi.guest) i32 {
@@ -329,6 +380,7 @@ pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!voi
     try db.addLibrary(gpa, .{ .name = "libSceMsgDialog.native" }, .{ .name = "libSceMsgDialog" }, &message_dialog_exports);
     try db.addLibrary(gpa, .{ .name = "libSceWebBrowserDialog" }, .{ .name = "libSceWebBrowserDialog" }, &browser_dialog_exports);
     try db.addLibrary(gpa, .{ .name = "libSceSigninDialog" }, .{ .name = "libSceSigninDialog" }, &signin_dialog_exports);
+    try db.addLibrary(gpa, .{ .name = "libSceCdlgPlayerReview" }, .{ .name = "libSceCdlgPlayerReview" }, &player_review_dialog_exports);
     try db.addLibrary(gpa, .{ .name = "libSceSaveDataDialog.native" }, .{ .name = "libSceSaveDataDialog" }, &save_dialog_exports);
     try db.addLibrary(gpa, .{ .name = "libSceImeDialog" }, .{ .name = "libSceImeDialog" }, &ime_dialog_exports);
     try db.addLibrary(gpa, .{ .name = "libSceIme" }, .{ .name = "libSceIme" }, &ime_exports);
@@ -347,6 +399,19 @@ test "headless message dialog finishes immediately with an affirmative result" {
     try std.testing.expectEqual(@as(i32, 1), std.mem.readInt(i32, result[8..12], .little));
 }
 
+test "headless player-review dialog completes without shell UI" {
+    reset();
+    try std.testing.expectEqual(errno.ok, playerReviewInitialize());
+    try std.testing.expectEqual(status_initialized, playerReviewStatus());
+    try std.testing.expectEqual(errno.ok, playerReviewOpen(null));
+    try std.testing.expectEqual(status_finished, playerReviewStatus());
+    var result: [8]u8 = @splat(0xff);
+    try std.testing.expectEqual(errno.ok, playerReviewGetResult(&result));
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 8), &result);
+    try std.testing.expectEqual(errno.ok, playerReviewTerminate());
+    try std.testing.expectEqual(status_none, playerReviewStatus());
+}
+
 test "dialog libraries register the title import surface" {
     var db = symbols.Database{};
     defer db.deinit(std.testing.allocator);
@@ -355,4 +420,5 @@ test "dialog libraries register the title import surface" {
     try std.testing.expect(db.findById("6fIC3XKt2k0", .function) != null);
     try std.testing.expect(db.findById("x01jxu+vxlc", .function) != null);
     try std.testing.expect(db.findById("-4GCfYdNF1s", .function) != null);
+    try std.testing.expect(db.findById("UtXl-tmi7iw", .function) != null);
 }
