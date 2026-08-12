@@ -1709,6 +1709,21 @@ const Builder = struct {
         try self.destination(inst.dst, .{ .id = result, .value_type = destination_type });
     }
 
+    fn floatFloorToSignedInteger(self: *Builder, inst: instruction.Instruction) Error!void {
+        const source_id = try self.source(inst.src0, .float32);
+        const floored = self.id();
+        try self.emit(&self.body, 12, &.{ // GLSL.std.450 Floor
+            self.float_type,
+            floored,
+            self.ensureGlslStd450(),
+            8,
+            source_id,
+        });
+        const result = self.id();
+        try self.emit(&self.body, 110, &.{ self.signed_type, result, floored }); // OpConvertFToS
+        try self.destination(inst.dst, .{ .id = result, .value_type = .sint32 });
+    }
+
     fn madFloat(self: *Builder, inst: instruction.Instruction) Error!void {
         // dst = src0 * src1 + src2
         const a = try self.source(inst.src0, .float32);
@@ -2243,9 +2258,7 @@ const Builder = struct {
         return result;
     }
 
-    fn multiplyHighUnsigned(self: *Builder, inst: instruction.Instruction) Error!void {
-        const a = try self.source(inst.src0, .bits32);
-        const b = try self.source(inst.src1, .bits32);
+    fn multiplyHighUnsignedBits(self: *Builder, a: u32, b: u32) Error!u32 {
         const mask = try self.constant(.bits32, 0xffff);
         const sixteen = try self.constant(.bits32, 16);
         const a0 = try self.andBits(a, 0xffff);
@@ -2269,7 +2282,36 @@ const Builder = struct {
         const w1_high = self.id();
         try self.emit(&self.body, 194, &.{ self.bits_type, w1_high, w1, sixteen });
         const high_product = try self.multiplyBits(a1, b1);
-        const high = try self.addBits(try self.addBits(high_product, w2), w1_high);
+        return self.addBits(try self.addBits(high_product, w2), w1_high);
+    }
+
+    fn multiplyHighUnsigned(self: *Builder, inst: instruction.Instruction) Error!void {
+        const a = try self.source(inst.src0, .bits32);
+        const b = try self.source(inst.src1, .bits32);
+        const high = try self.multiplyHighUnsignedBits(a, b);
+        try self.destination(inst.dst, .{ .id = high, .value_type = .bits32 });
+    }
+
+    fn multiplyHighSigned(self: *Builder, inst: instruction.Instruction) Error!void {
+        const a = try self.source(inst.src0, .bits32);
+        const b = try self.source(inst.src1, .bits32);
+        const unsigned_high = try self.multiplyHighUnsignedBits(a, b);
+        const signed_a = try self.convert(.{ .id = a, .value_type = .bits32 }, .sint32);
+        const signed_b = try self.convert(.{ .id = b, .value_type = .bits32 }, .sint32);
+        const signed_zero = try self.constant(.sint32, 0);
+        const a_negative = self.id();
+        try self.emit(&self.body, 177, &.{ self.bool_type, a_negative, signed_a, signed_zero }); // OpSLessThan
+        const b_negative = self.id();
+        try self.emit(&self.body, 177, &.{ self.bool_type, b_negative, signed_b, signed_zero }); // OpSLessThan
+        const zero = try self.constant(.bits32, 0);
+        const correction_a = self.id();
+        try self.emit(&self.body, 169, &.{ self.bits_type, correction_a, a_negative, b, zero }); // OpSelect
+        const correction_b = self.id();
+        try self.emit(&self.body, 169, &.{ self.bits_type, correction_b, b_negative, a, zero }); // OpSelect
+        const partially_corrected = self.id();
+        try self.emit(&self.body, 130, &.{ self.bits_type, partially_corrected, unsigned_high, correction_a }); // OpISub
+        const high = self.id();
+        try self.emit(&self.body, 130, &.{ self.bits_type, high, partially_corrected, correction_b }); // OpISub
         try self.destination(inst.dst, .{ .id = high, .value_type = .bits32 });
     }
 
@@ -3351,6 +3393,7 @@ const Builder = struct {
             .v_cvt_f32_u32 => try self.integerToFloat(inst, false),
             .v_cvt_i32_f32 => try self.floatToInteger(inst, true),
             .v_cvt_u32_f32 => try self.floatToInteger(inst, false),
+            .v_cvt_flr_i32_f32 => try self.floatFloorToSignedInteger(inst),
             // Pack two f32 → two f16 in one dword (Unity PS export path).
             .v_cvt_pkrtz_f16_f32 => try self.packHalf2x16(inst),
             .s_add_u32 => try self.scalarAddUnsigned(inst, false),
@@ -3417,6 +3460,7 @@ const Builder = struct {
             .v_lshlrev_b32 => try self.binary(inst, 196, .bits32, true),
             .s_mul_i32, .v_mul_lo_u32 => try self.binary(inst, 132, .bits32, false), // OpIMul
             .s_mul_hi_u32, .v_mul_hi_u32 => try self.multiplyHighUnsigned(inst),
+            .v_mul_hi_i32 => try self.multiplyHighSigned(inst),
             .s_and_b32, .v_and_b32 => try self.binary(inst, 199, .bits32, false),
             .s_or_b32, .v_or_b32 => try self.binary(inst, 197, .bits32, false),
             .s_xor_b32, .v_xor_b32 => try self.binary(inst, 198, .bits32, false),
@@ -4222,6 +4266,33 @@ test "literal MAD conversions and min-max lower explicitly" {
     try std.testing.expect(containsOpcode(module.words, 129)); // OpFAdd
     try std.testing.expect(containsOpcode(module.words, 109)); // OpConvertFToU
     try std.testing.expect(containsOpcode(module.words, 12)); // UMin via OpExtInst
+}
+
+test "signed high multiply and floor conversion lower explicitly" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .v_mul_hi_i32,
+        .dst = .{ .kind = .vgpr, .reg = 0 },
+        .src0 = .{ .kind = .literal_constant, .value = @bitCast(@as(i32, -7)) },
+        .src1 = .{ .kind = .integer_inline_constant, .value = 3, .signed_val = 3 },
+        .src_count = 2,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .v_cvt_flr_i32_f32,
+        .dst = .{ .kind = .vgpr, .reg = 1 },
+        .src0 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, -1.25)) },
+        .src_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 177)); // OpSLessThan
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 169)); // OpSelect
+    try std.testing.expect(countOpcode(module.words, 130) >= 2); // OpISub
+    try std.testing.expect(containsOpcode(module.words, 12)); // GLSL Floor
+    try std.testing.expect(containsOpcode(module.words, 110)); // OpConvertFToS
 }
 
 test "fused multiply-add uses GLSL Fma" {

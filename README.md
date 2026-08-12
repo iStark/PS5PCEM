@@ -79,12 +79,15 @@ If you would like to support continued PS5PCEM development, you can do so on
   guest execution across `sceFiberRun`, `sceFiberSwitch`, and
   `sceFiberReturnToThread`; `scePadGetHandle` exposes the system-associated
   primary controller even when the title does not call `scePadOpen`. Its guest
-  vertex shaders use the newly decoded `V_SAD_U32`, so the animated publisher
-  and title intro renders through the actual indexed VS/PS, multi-target, and
-  sampled-image passes instead of the diagnostic triangle. The observed warmed
-  intro frames take roughly 13–20 ms on the current RTX 3070 Ti host, with no
-  shader fallback or visible audio stutter. This capture establishes the intro
-  path; menu and gameplay have not been validated yet.
+  shaders use the newly decoded `V_SAD_U32`, `V_MUL_HI_I32`, and
+  `V_CVT_FLR_I32_F32`, so the animated publisher sequence, menu, and post-menu
+  scene render through the title's indexed VS/PS, multi-target, and sampled-image
+  passes instead of the diagnostic triangle or CRT static. A narrowly matched
+  CRT-composite compatibility path scales the title's 480×270 RGBA8 scene to its
+  1920×1080 target while leaving the remaining post-processing chain intact.
+  The observed warmed intro frames take roughly 13–20 ms on the current RTX
+  3070 Ti host, with smooth audio; the heavier post-menu scene is functional but
+  remains a performance target.
 - PS VR2 libraries currently expose only compatibility/no-device behavior.
   VR plugins can initialize far enough to load Unity assets, but headset
   rendering, tracking, controllers, and a host OpenXR bridge do not exist yet.
@@ -160,6 +163,13 @@ guest indexed vertex, sampled fragment, render-target composition, and VideoOut
 paths. The corresponding animation and audio remain smooth in the observed
 run; this is an intro milestone rather than a gameplay claim.*
 
+![Mighty Morphin Power Rangers: Rita's Rewind post-menu scene rendered by PS5PCEM](docs/images/ritas-rewind-post-menu.png)
+
+*Rita's Rewind after the title menu, rendered from the real 480×270 guest scene
+target and carried through the 1920×1080 CRT/post-processing chain. The strict
+CRT-composite compatibility path removes the former full-screen static while
+preserving the title's pixel-art presentation.*
+
 ![The Precinct Kwalee video frame rendered by PS5PCEM](docs/images/precinct-kwalee.png)
 
 *A decoded 3840x2160 H.264 frame from The Precinct's Kwalee intro, converted by
@@ -186,7 +196,7 @@ the repository contains none of that content.
 | **The Precinct** | Links the complete six-image guest graph, defers and starts Unity plug-ins through `sceKernelLoadStartModule`, enters Unity, indexes its audio assets, and plays both observed intro movies through the new SceAvPlayer path. The title receives synchronized 3840×2160 NV12 video and 48 kHz stereo PCM; its guest YUV conversion shader produces the recognizable Kwalee frame above. Post-video graphics continue through seven draws and nine dispatches per frame, with warmed-up frames around 20–22 ms on the current RTX 3070 Ti test host | The post-video scene source is still incorrect: draw 1 receives a sparse/corrupted pixel strip, draw 2 copies it to the scanout, and later UI draws do not restore a recognizable scene. Gameplay is not claimed yet |
 | **Jets 'n' Guns 2** | Resolves title content through `/app0`, completes AGC resource registration, and sustains the full graphics/compute/VideoOut loop. Targetless final passes are preserved through flip, while dynamic SGPR data and descriptor-sized buffer bounds keep streamed sprite batches on stable Vulkan pipelines. The title now renders the recognizable 3840×2160 title screen, main menu, and options UI shown above; warmed 53-draw startup frames measure roughly 113–124 ms on the current RTX 3070 Ti host with zero pipeline misses after warm-up | A manual `Cross` reaches the main menu without the automatic `Options` pulse, but selecting `NEW GAME` currently stops further flips after the audio decode/output loops exit. A playable scene and working in-game audio are therefore not claimed yet |
 | **Asterix & Obelix: Slap Them All!** | Maps the Unity/PSN plug-in graph, passes GameUpdate, trophy, entitlement, WebApi, and player-review bootstrap calls, accepts four-byte-aligned AGC shader headers, and reaches repeated 1920×1080 frames. SceAvPlayer returns the ATL intro as correctly decoded NV12 frames, while matched image-copy, planar-conversion, fullscreen-blit, and color-resolve paths keep the observed movie pipeline moving without its former multi-second shader compilation/dispatch blockers | The decoded source is recognizable, but final compositor scaling/presentation still needs validation and no repeatable menu or gameplay frame is claimed yet |
-| **Mighty Morphin Power Rangers: Rita's Rewind** | Resolves the observed Fiber, Pad, offline NP, AGC 1.1, and AGC driver imports, enters a stable 1920×1080 graphics/audio loop, and renders the animated publisher/title sequence shown above through real guest shaders. Native cooperative fibers retain suspended guest stacks, `scePadGetHandle` supplies a readable primary controller, and `V_SAD_U32` translation removes the diagnostic triangle fallback. Warmed intro frames measure roughly 13–20 ms on the current RTX 3070 Ti host | The current repeatable capture covers smooth intro animation/video and audio only. Menu navigation and gameplay rendering remain to be exercised before either is claimed |
+| **Mighty Morphin Power Rangers: Rita's Rewind** | Resolves the observed Fiber, Pad, offline NP, AGC 1.1, and AGC driver imports, enters a stable 1920×1080 graphics/audio loop, and renders the animated publisher sequence, title menu, and post-menu scene shown above. Native cooperative fibers retain suspended guest stacks, `scePadGetHandle` supplies a readable primary controller, and exact `V_SAD_U32`, `V_MUL_HI_I32`, and `V_CVT_FLR_I32_F32` lowering removes the diagnostic shader fallback. Holding `Cross` advances through the title prompt, and the observed intro remains smooth at roughly 13–20 ms per frame on the current RTX 3070 Ti host | The exact guest CRT composite still produces static on the current host, so a strict shader-signature fallback performs the observed 4× RGBA8 scene scale before downstream post-processing. Dense post-menu frames can contain roughly 255 draws and currently take about 470 ms, dominated by repeated guest-buffer staging; broad gameplay and input compatibility are not claimed yet |
 
 ## Components
 
@@ -401,7 +411,11 @@ work. The SPIR-V 1.5 writer translates 32-bit move,
 integer/bitwise/floating-point ALU, SDWA extraction, and the supported DPP/VOP3
 modifiers. The native VOP3 table includes unsigned sum-of-absolute-differences
 (`V_SAD_U32`), lowered exactly as `abs(src0 - src1) + src2`; Rita's Rewind uses
-it in the address/index arithmetic of its vertex shaders. Acyclic scalar
+it in the address/index arithmetic of its vertex shaders. Signed high-word
+multiplication (`V_MUL_HI_I32`) uses the exact two's-complement correction over
+the unsigned 64-bit product, and `V_CVT_FLR_I32_F32` applies GLSL `Floor` before
+the signed conversion. Rita's Rewind exercises both operations in its CRT
+fragment shader. Acyclic scalar
 selections become structured
 `OpSelectionMerge`/`OpBranchConditional` regions and register values crossing
 their joins use hierarchical `OpPhi` state merging. The Tetris Effect
@@ -1892,6 +1906,12 @@ scheduler and Vulkan backend. Observed startup work now includes:
 - Persistent color targets accumulate multi-draw output on the GPU and defer
   detile/readback until an exact guest-memory consumer requires it. VideoOut can
   blit an exact resident target directly into the swapchain.
+- A strict fragment-instruction and resource-shape matcher recognizes the
+  observed Rita's Rewind CRT composite only when its two signed high multiplies,
+  floor conversion, five samples, completed MRT0 export, two image bindings,
+  six indices, and exact 4× RGBA8 geometry all agree. That bounded path performs
+  a nearest-neighbour scene scale and then returns to the normal guest
+  post-processing chain; unrelated shaders continue through Vulkan unchanged.
 - Large writable guest storage buffers remain GPU-authoritative in bounded
   coherent allocations across dispatches. Small synchronization payloads and
   explicitly consumed prefixes are still published immediately, preserving the

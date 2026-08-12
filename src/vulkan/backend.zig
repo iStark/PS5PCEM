@@ -1469,6 +1469,7 @@ pub const Renderer = struct {
     captured_targeted_fragment_probe: bool = false,
     reported_planar_video_pass: bool = false,
     captured_planar_video_pass: bool = false,
+    reported_crt_composite_fallback: bool = false,
     reported_first_scissor_state: bool = false,
     reported_draw_errors: [16]?anyerror = @splat(null),
     reported_compute_shader_failures: [32]?ComputeShaderFailure = @splat(null),
@@ -6917,6 +6918,30 @@ pub const Renderer = struct {
             );
             return;
         }
+        if (graphics_resources.image_count == 2 and
+            draw.index_count != null and draw.index_count.? == 6 and
+            matchesCrtComposite(fragment_analysis.program.instructions.items))
+        {
+            for (graphics_resources.descriptors[0..graphics_resources.image_count]) |source| {
+                if (try self.emulateIntegerScaledSampleBlit(memory, target, source)) {
+                    if (!self.reported_crt_composite_fallback) {
+                        self.reported_crt_composite_fallback = true;
+                        std.debug.print(
+                            "[vulkan dcb] emulated CRT composite: 0x{x} {d}x{d} -> 0x{x} {d}x{d}\n",
+                            .{
+                                source.address,
+                                source.width,
+                                source.height,
+                                target.descriptor.address,
+                                target.descriptor.width,
+                                target.descriptor.height,
+                            },
+                        );
+                    }
+                    return;
+                }
+            }
+        }
         if (graphics_resources.image_count == 1 and
             draw.index_count != null and draw.index_count.? == 6 and
             matchesFullscreenSampleBlit(fragment_analysis.program.instructions.items))
@@ -7545,6 +7570,71 @@ pub const Renderer = struct {
                 .{ source.address, target.descriptor.address, source.width, source.height },
             );
         }
+        return true;
+    }
+
+    /// The front-end CRT shader used by Digital Eclipse titles performs a
+    /// large distortion/noise pass around an already complete low-resolution
+    /// scene. Until every wave-level detail of that shader is represented,
+    /// preserve the useful image with its native integer pixel scale instead
+    /// of presenting the noise layer alone.
+    fn emulateIntegerScaledSampleBlit(
+        self: *Renderer,
+        memory: GuestMemory,
+        target: GuestColorTarget,
+        source: gpu.ImageDescriptor,
+    ) anyerror!bool {
+        if ((target.format.vulkan != vk.format_r8g8b8a8_unorm and
+            target.format.vulkan != vk.format_r8g8b8a8_srgb) or
+            target.format.bytes_per_texel != 4 or source.unified_format != 56 or
+            source.width == 0 or source.height == 0 or
+            source.width >= target.descriptor.width or
+            source.height >= target.descriptor.height or
+            target.descriptor.width % source.width != 0 or
+            target.descriptor.height % source.height != 0 or
+            target.descriptor.width / source.width != target.descriptor.height / source.height or
+            target.descriptor.width / source.width != 4 or
+            source.samplesLog2() != 0 or source.dcc_enabled or
+            source.cmask_fast_clear or source.fmask_compression)
+        {
+            return false;
+        }
+        const scale = target.descriptor.width / source.width;
+        const layout = gpu.SurfaceLayout.fromImage(source) catch return false;
+        const allocation_bytes = std.math.cast(usize, layout.required_source_bytes) orelse
+            return Error.GuestBufferTooLarge;
+        const source_bytes = std.math.mul(
+            usize,
+            std.math.mul(usize, source.width, source.height) catch
+                return Error.GuestBufferTooLarge,
+            4,
+        ) catch return Error.GuestBufferTooLarge;
+        const target_bytes = try colorTargetFrameBytes(target);
+        if (allocation_bytes == 0 or allocation_bytes > maximum_frame_bytes or
+            source_bytes > maximum_frame_bytes or target_bytes > maximum_frame_bytes or
+            target_bytes != @as(usize, target.descriptor.width) * target.descriptor.height * 4)
+        {
+            return Error.GuestBufferTooLarge;
+        }
+        try self.flushPendingGuestWrite(source.address, allocation_bytes);
+        const allocation = try self.allocator.alloc(u8, allocation_bytes);
+        defer self.allocator.free(allocation);
+        const source_rgba = try self.allocator.alloc(u8, source_bytes);
+        defer self.allocator.free(source_rgba);
+        const target_rgba = try self.allocator.alloc(u8, target_bytes);
+        defer self.allocator.free(target_rgba);
+        if (!memory.read(memory.context, source.address, allocation)) {
+            return Error.GuestMemoryReadFailed;
+        }
+        try layout.detile(allocation, source_rgba);
+        scaleRgba8Nearest(
+            source_rgba,
+            @intCast(source.width),
+            @intCast(source.height),
+            target_rgba,
+            @intCast(scale),
+        );
+        _ = try self.uploadLinearColorTarget(target, target_rgba);
         return true;
     }
 
@@ -9816,6 +9906,57 @@ fn matchesDualImageClear(inst: anytype) bool {
         registerOperand(inst[16].src1, .sgpr, 24) and
         inst[16].data_mask == 0xf and inst[16].image_nsa_words == 0 and
         inst[16].image_dimension == .dim_2d;
+}
+
+fn matchesCrtComposite(inst: anytype) bool {
+    if (inst.len < 32) return false;
+    var signed_high_multiply: u32 = 0;
+    var floor_integer_conversions: u32 = 0;
+    var samples: u32 = 0;
+    var color_exports: u32 = 0;
+    for (inst) |candidate| switch (candidate.opcode) {
+        .v_mul_hi_i32 => signed_high_multiply += 1,
+        .v_cvt_flr_i32_f32 => floor_integer_conversions += 1,
+        .image_sample => samples += 1,
+        .image_store => return false,
+        .exp => if (candidate.export_target == 0 and candidate.export_done) {
+            color_exports += 1;
+        },
+        else => {},
+    };
+    return signed_high_multiply == 2 and floor_integer_conversions == 1 and
+        samples == 5 and color_exports == 1;
+}
+
+fn scaleRgba8Nearest(
+    source: []const u8,
+    source_width: usize,
+    source_height: usize,
+    destination: []u8,
+    scale: usize,
+) void {
+    std.debug.assert(source.len == source_width * source_height * 4);
+    std.debug.assert(scale != 0);
+    const destination_width = source_width * scale;
+    const source_row_bytes = source_width * 4;
+    const destination_row_bytes = destination_width * 4;
+    std.debug.assert(destination.len == destination_row_bytes * source_height * scale);
+    for (0..source_height) |source_y| {
+        const source_row = source[source_y * source_row_bytes ..][0..source_row_bytes];
+        const first_destination_y = source_y * scale;
+        const first_row = destination[first_destination_y * destination_row_bytes ..][0..destination_row_bytes];
+        for (0..source_width) |source_x| {
+            const pixel = source_row[source_x * 4 ..][0..4];
+            for (0..scale) |repeat_x| {
+                const destination_x = source_x * scale + repeat_x;
+                @memcpy(first_row[destination_x * 4 ..][0..4], pixel);
+            }
+        }
+        for (1..scale) |repeat_y| {
+            const row = destination[(first_destination_y + repeat_y) * destination_row_bytes ..][0..destination_row_bytes];
+            @memcpy(row, first_row);
+        }
+    }
 }
 
 fn matchesFullscreenSampleBlit(inst: anytype) bool {
@@ -12391,6 +12532,33 @@ test "group-dimension dispatches are preserved" {
         [3]u32{ 7, 5, 3 },
         dispatchGroupCounts(.{ 7, 5, 3 }, .{ 64, 2, 1 }, 0x41),
     );
+}
+
+test "CRT composite matcher is narrow and rejects an incomplete signature" {
+    var instructions = [_]gpu.ShaderInstruction{.{}} ** 32;
+    instructions[0].opcode = .v_mul_hi_i32;
+    instructions[1].opcode = .v_mul_hi_i32;
+    instructions[2].opcode = .v_cvt_flr_i32_f32;
+    for (3..8) |index| instructions[index].opcode = .image_sample;
+    instructions[8].opcode = .exp;
+    instructions[8].export_target = 0;
+    instructions[8].export_done = true;
+    try std.testing.expect(matchesCrtComposite(&instructions));
+    instructions[1].opcode = .v_mul_hi_u32;
+    try std.testing.expect(!matchesCrtComposite(&instructions));
+}
+
+test "RGBA8 integer scaling preserves every source pixel" {
+    const source = [_]u8{
+        1, 2, 3, 4,
+        5, 6, 7, 8,
+    };
+    var destination: [32]u8 = undefined;
+    scaleRgba8Nearest(&source, 2, 1, &destination, 2);
+    try std.testing.expectEqualSlices(u8, &.{
+        1, 2, 3, 4, 1, 2, 3, 4, 5, 6, 7, 8, 5, 6, 7, 8,
+        1, 2, 3, 4, 1, 2, 3, 4, 5, 6, 7, 8, 5, 6, 7, 8,
+    }, &destination);
 }
 
 test "Vulkan version packing matches the registry layout" {
