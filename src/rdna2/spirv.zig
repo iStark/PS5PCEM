@@ -57,10 +57,26 @@ pub const SampledImageBinding = struct {
     resource_sgpr: u32,
     sampler_sgpr: u32,
     descriptor_index: u32,
+    dimension: SampledImageDimension = .two_d,
     /// Null is a stage-wide association. Compute shaders can qualify a binding
     /// by PC when the guest reloads the same T#/S# SGPR pair between samples.
     instruction_pc: ?u32 = null,
 };
+
+pub const SampledImageDimension = enum {
+    two_d,
+    three_d,
+};
+
+pub const sampled_image_2d_descriptor_binding: u32 = 1;
+pub const sampled_image_3d_descriptor_binding: u32 = 11;
+
+fn sampledImageDimensionIndex(dimension: SampledImageDimension) usize {
+    return switch (dimension) {
+        .two_d => 0,
+        .three_d => 1,
+    };
+}
 
 /// Static association between a GFX10 T# and an element in Vulkan's storage
 /// image array. Storage images are declared with an exact format: this avoids
@@ -70,7 +86,13 @@ pub const StorageImageBinding = struct {
     resource_sgpr: u32,
     descriptor_index: u32,
     format: StorageImageFormat,
+    dimension: StorageImageDimension = .two_d,
     dst_select: [4]u8 = .{ 4, 5, 6, 7 },
+};
+
+pub const StorageImageDimension = enum(u8) {
+    two_d,
+    three_d,
 };
 
 pub const StorageImageFormat = enum(u16) {
@@ -347,6 +369,7 @@ const Builder = struct {
     float_type: u32,
     bool_type: u32,
     vector3_bits_type: u32 = 0,
+    vector3_type: u32 = 0,
     vector4_type: u32 = 0,
     main_function: u32,
     label: u32,
@@ -378,9 +401,9 @@ const Builder = struct {
     fragment_extent: [2]u32,
     vector2_type: u32 = 0,
     vector2_bits_type: u32 = 0,
-    sampled_image_type: u32 = 0,
-    sampled_image_array: u32 = 0,
-    sampled_image_pointer_type: u32 = 0,
+    sampled_image_types: [2]u32 = @splat(0),
+    sampled_image_arrays: [2]u32 = @splat(0),
+    sampled_image_pointer_types: [2]u32 = @splat(0),
     storage_image_types: [8]u32 = @splat(0),
     storage_image_vector_types: [8]u32 = @splat(0),
     storage_image_variables: [8]u32 = @splat(0),
@@ -636,6 +659,7 @@ const Builder = struct {
             {
                 return Error.InvalidStorageBinding;
             }
+            var sampled_dimensions: [2]bool = @splat(false);
             for (options.sampled_images, 0..) |binding, index| {
                 if (binding.resource_sgpr >= 128 or binding.sampler_sgpr >= 128 or
                     binding.descriptor_index >= options.descriptor_array_length)
@@ -650,28 +674,43 @@ const Builder = struct {
                         return Error.InvalidStorageBinding;
                     }
                 }
+                sampled_dimensions[sampledImageDimensionIndex(binding.dimension)] = true;
             }
             if (self.vector4_type == 0) {
                 self.vector4_type = self.id();
                 try self.emit(&self.declarations, 23, &.{ self.vector4_type, self.float_type, 4 }); // OpTypeVector
             }
-            self.vector2_type = self.id();
-            const image_type = self.id();
-            self.sampled_image_type = self.id();
             const descriptor_count = try self.constant(.bits32, options.descriptor_array_length);
-            const descriptor_array = self.id();
-            const array_pointer = self.id();
-            self.sampled_image_pointer_type = self.id();
-            self.sampled_image_array = self.id();
-            try self.emit(&self.annotations, 71, &.{ self.sampled_image_array, 34, 0 }); // DescriptorSet 0
-            try self.emit(&self.annotations, 71, &.{ self.sampled_image_array, 33, 1 }); // Binding 1
-            try self.emit(&self.declarations, 23, &.{ self.vector2_type, self.float_type, 2 }); // OpTypeVector
-            try self.emit(&self.declarations, 25, &.{ image_type, self.float_type, 1, 0, 0, 0, 1, 0 }); // sampled 2D image
-            try self.emit(&self.declarations, 27, &.{ self.sampled_image_type, image_type }); // OpTypeSampledImage
-            try self.emit(&self.declarations, 28, &.{ descriptor_array, self.sampled_image_type, descriptor_count });
-            try self.emit(&self.declarations, 32, &.{ array_pointer, 0, descriptor_array }); // ptr UniformConstant
-            try self.emit(&self.declarations, 32, &.{ self.sampled_image_pointer_type, 0, self.sampled_image_type });
-            try self.emit(&self.declarations, 59, &.{ array_pointer, self.sampled_image_array, 0 }); // OpVariable
+            for (sampled_dimensions, 0..) |present, dimension_index| {
+                if (!present) continue;
+                const dimensions: u32 = if (dimension_index == 0) 2 else 3;
+                const spirv_dimension: u32 = if (dimension_index == 0) 1 else 3;
+                const descriptor_binding = if (dimension_index == 0)
+                    sampled_image_2d_descriptor_binding
+                else
+                    sampled_image_3d_descriptor_binding;
+                if (dimension_index == 0 and self.vector2_type == 0) {
+                    self.vector2_type = self.id();
+                    try self.emit(&self.declarations, 23, &.{ self.vector2_type, self.float_type, dimensions }); // OpTypeVector
+                } else if (dimension_index == 1 and self.vector3_type == 0) {
+                    self.vector3_type = self.id();
+                    try self.emit(&self.declarations, 23, &.{ self.vector3_type, self.float_type, dimensions }); // OpTypeVector
+                }
+                const image_type = self.id();
+                self.sampled_image_types[dimension_index] = self.id();
+                const descriptor_array = self.id();
+                const array_pointer = self.id();
+                self.sampled_image_pointer_types[dimension_index] = self.id();
+                self.sampled_image_arrays[dimension_index] = self.id();
+                try self.emit(&self.annotations, 71, &.{ self.sampled_image_arrays[dimension_index], 34, 0 }); // DescriptorSet 0
+                try self.emit(&self.annotations, 71, &.{ self.sampled_image_arrays[dimension_index], 33, descriptor_binding });
+                try self.emit(&self.declarations, 25, &.{ image_type, self.float_type, spirv_dimension, 0, 0, 0, 1, 0 });
+                try self.emit(&self.declarations, 27, &.{ self.sampled_image_types[dimension_index], image_type });
+                try self.emit(&self.declarations, 28, &.{ descriptor_array, self.sampled_image_types[dimension_index], descriptor_count });
+                try self.emit(&self.declarations, 32, &.{ array_pointer, 0, descriptor_array }); // ptr UniformConstant
+                try self.emit(&self.declarations, 32, &.{ self.sampled_image_pointer_types[dimension_index], 0, self.sampled_image_types[dimension_index] });
+                try self.emit(&self.declarations, 59, &.{ array_pointer, self.sampled_image_arrays[dimension_index], 0 }); // OpVariable
+            }
         }
         if (options.storage_images.len != 0) {
             if (options.stage != .compute) return Error.InvalidStorageBinding;
@@ -686,7 +725,7 @@ const Builder = struct {
                         return Error.InvalidStorageBinding;
                     }
                     if (previous.descriptor_index == binding.descriptor_index and
-                        previous.format != binding.format)
+                        (previous.format != binding.format or previous.dimension != binding.dimension))
                     {
                         return Error.InvalidStorageBinding;
                     }
@@ -700,6 +739,14 @@ const Builder = struct {
 
             self.vector2_bits_type = if (self.vector2_bits_type != 0) self.vector2_bits_type else self.id();
             try self.emit(&self.declarations, 23, &.{ self.vector2_bits_type, self.bits_type, 2 });
+            var needs_3d_coordinates = false;
+            for (options.storage_images) |binding| {
+                needs_3d_coordinates = needs_3d_coordinates or binding.dimension == .three_d;
+            }
+            if (needs_3d_coordinates and self.vector3_bits_type == 0) {
+                self.vector3_bits_type = self.id();
+                try self.emit(&self.declarations, 23, &.{ self.vector3_bits_type, self.bits_type, 3 });
+            }
             for (options.storage_images) |binding| {
                 const descriptor_index: usize = @intCast(binding.descriptor_index);
                 if (self.storage_image_variables[descriptor_index] != 0) continue;
@@ -718,7 +765,7 @@ const Builder = struct {
                 try self.emit(&self.declarations, 25, &.{
                     image_type,
                     component_type,
-                    1, // Dim2D
+                    if (binding.dimension == .three_d) 3 else 1, // Dim3D / Dim2D
                     0, // not depth
                     0, // not arrayed
                     0, // not multisampled
@@ -1867,11 +1914,21 @@ const Builder = struct {
         return image;
     }
 
-    fn storageImageCoordinates(self: *Builder, inst: instruction.Instruction) Error!u32 {
+    fn storageImageCoordinates(
+        self: *Builder,
+        inst: instruction.Instruction,
+        dimension: StorageImageDimension,
+    ) Error!u32 {
         const x = try self.source(try imageAddressOperand(inst, 0), .bits32);
         const y = try self.source(try imageAddressOperand(inst, 1), .bits32);
         const coordinates = self.id();
-        try self.emit(&self.body, 80, &.{ self.vector2_bits_type, coordinates, x, y }); // OpCompositeConstruct
+        if (dimension == .three_d) {
+            if (self.vector3_bits_type == 0) return Error.InvalidStorageBinding;
+            const z = try self.source(try imageAddressOperand(inst, 2), .bits32);
+            try self.emit(&self.body, 80, &.{ self.vector3_bits_type, coordinates, x, y, z }); // OpCompositeConstruct
+        } else {
+            try self.emit(&self.body, 80, &.{ self.vector2_bits_type, coordinates, x, y }); // OpCompositeConstruct
+        }
         return coordinates;
     }
 
@@ -1887,20 +1944,24 @@ const Builder = struct {
     }
 
     fn imageLoad(self: *Builder, inst: instruction.Instruction) Error!void {
-        if (self.stage != .compute or
-            inst.opcode_id != 0 or inst.image_dimension != .dim_2d or
-            inst.image_address_components != 2 or inst.data_mask == 0 or
+        if (self.stage != .compute or inst.opcode_id != 0 or
+            (inst.image_dimension != .dim_2d and inst.image_dimension != .dim_3d) or
+            (inst.image_address_components != 2 and inst.image_address_components != 3) or
+            inst.data_mask == 0 or
             inst.src0.kind != .vgpr or inst.src1.kind != .sgpr)
         {
             return Error.UnsupportedOpcode;
         }
         const binding = self.storageImageBinding(inst.src1.reg) orelse return Error.InvalidStorageBinding;
+        if ((binding.dimension == .three_d) != (inst.image_dimension == .dim_3d)) {
+            return Error.InvalidStorageBinding;
+        }
         const descriptor_index: usize = @intCast(binding.descriptor_index);
         const value_type = storageImageValueType(binding.format);
         const vector_type = self.storage_image_vector_types[descriptor_index];
         if (vector_type == 0) return Error.InvalidStorageBinding;
         const image = try self.loadStorageImage(binding);
-        const coordinates = try self.storageImageCoordinates(inst);
+        const coordinates = try self.storageImageCoordinates(inst, binding.dimension);
         const texel = self.id();
         try self.emit(&self.body, 98, &.{ vector_type, texel, image, coordinates }); // OpImageRead
 
@@ -1930,7 +1991,8 @@ const Builder = struct {
     fn imageStore(self: *Builder, inst: instruction.Instruction) Error!void {
         if (self.stage != .compute or
             inst.opcode_id != 8 or
-            (inst.image_dimension != .dim_2d and inst.image_dimension != .dim_2d_array_alt) or
+            (inst.image_dimension != .dim_2d and inst.image_dimension != .dim_3d and
+                inst.image_dimension != .dim_2d_array_alt) or
             (inst.image_address_components != 2 and inst.image_address_components != 3) or
             inst.data_mask != 0xf or
             inst.dst.kind != .vgpr or inst.src0.kind != .vgpr or inst.src1.kind != .sgpr)
@@ -1938,6 +2000,9 @@ const Builder = struct {
             return Error.UnsupportedOpcode;
         }
         const binding = self.storageImageBinding(inst.src1.reg) orelse return Error.InvalidStorageBinding;
+        if ((binding.dimension == .three_d) != (inst.image_dimension == .dim_3d)) {
+            return Error.InvalidStorageBinding;
+        }
         const descriptor_index: usize = @intCast(binding.descriptor_index);
         const value_type = storageImageValueType(binding.format);
         const vector_type = self.storage_image_vector_types[descriptor_index];
@@ -1946,7 +2011,7 @@ const Builder = struct {
         // Unity's generic copy kernel uses the 2D-array opcode even when the
         // bound T# is a one-slice 2D view. The descriptor already selects that
         // slice, so its third coordinate is intentionally ignored here.
-        const coordinates = try self.storageImageCoordinates(inst);
+        const coordinates = try self.storageImageCoordinates(inst, binding.dimension);
         var shader_values: [4]u32 = undefined;
         for (&shader_values, 0..) |*value, component| {
             value.* = try self.source(try consecutiveRegister(inst.dst, @intCast(component)), value_type);
@@ -2049,12 +2114,18 @@ const Builder = struct {
         const level_zero = inst.opcode_id == 0x27 and
             inst.image_sample_flags.level_zero and
             flags == (@as(u16, 1) << 5);
+        const image_dimension: SampledImageDimension = switch (inst.image_dimension) {
+            .dim_2d => .two_d,
+            .dim_3d => .three_d,
+            else => return Error.UnsupportedOpcode,
+        };
+        const dimension_index = sampledImageDimensionIndex(image_dimension);
+        const coordinate_components: u8 = if (image_dimension == .three_d) 3 else 2;
         if ((self.stage != .fragment and self.stage != .compute) or
-            self.sampled_image_array == 0 or
+            self.sampled_image_arrays[dimension_index] == 0 or
             (!implicit_lod and !level_zero) or
             (self.stage == .compute and !level_zero) or
-            inst.image_dimension != .dim_2d or
-            inst.image_address_components != 2 or
+            inst.image_address_components != coordinate_components or
             inst.data_mask == 0)
         {
             return Error.UnsupportedOpcode;
@@ -2065,21 +2136,27 @@ const Builder = struct {
         const binding = self.sampledImageBinding(inst.src1.reg, inst.src2.reg, inst.pc) orelse {
             return Error.InvalidStorageBinding;
         };
+        if (binding.dimension != image_dimension) return Error.InvalidStorageBinding;
         // Coordinates now come from the real VS PARAM -> PS VINTRP interface.
         const raw_x = try self.source(try imageAddressOperand(inst, 0), .float32);
         const raw_y = try self.source(try imageAddressOperand(inst, 1), .float32);
         const coordinate_x, const coordinate_y = try self.sampleCoordinates(raw_x, raw_y);
         const coordinates = self.id();
-        try self.emit(&self.body, 80, &.{ self.vector2_type, coordinates, coordinate_x, coordinate_y });
+        if (image_dimension == .three_d) {
+            const coordinate_z = try self.source(try imageAddressOperand(inst, 2), .float32);
+            try self.emit(&self.body, 80, &.{ self.vector3_type, coordinates, coordinate_x, coordinate_y, coordinate_z });
+        } else {
+            try self.emit(&self.body, 80, &.{ self.vector2_type, coordinates, coordinate_x, coordinate_y });
+        }
         const pointer = self.id();
         try self.emit(&self.body, 65, &.{
-            self.sampled_image_pointer_type,
+            self.sampled_image_pointer_types[dimension_index],
             pointer,
-            self.sampled_image_array,
+            self.sampled_image_arrays[dimension_index],
             try self.constant(.bits32, binding.descriptor_index),
         });
         const sampled_image = self.id();
-        try self.emit(&self.body, 61, &.{ self.sampled_image_type, sampled_image, pointer });
+        try self.emit(&self.body, 61, &.{ self.sampled_image_types[dimension_index], sampled_image, pointer });
         const sampled = self.id();
         if (level_zero) {
             // Compute shaders have no implicit derivatives. GFX10's
@@ -3900,7 +3977,9 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     try entry_point.appendSlice(allocator, &.{ @intFromEnum(options.stage), builder.main_function, 0x6e69_616d, 0 });
     if (builder.storage_array != 0) try entry_point.append(allocator, builder.storage_array);
     if (builder.scalar_buffer != 0) try entry_point.append(allocator, builder.scalar_buffer);
-    if (builder.sampled_image_array != 0) try entry_point.append(allocator, builder.sampled_image_array);
+    for (builder.sampled_image_arrays) |sampled_image_array| {
+        if (sampled_image_array != 0) try entry_point.append(allocator, sampled_image_array);
+    }
     for (builder.storage_image_variables) |variable| {
         if (variable != 0) try entry_point.append(allocator, variable);
     }
@@ -4764,6 +4843,34 @@ test "fragment image sample lowers through a combined descriptor array" {
     try std.testing.expectEqual(@as(usize, 4), countOpcode(module.words, 81)); // RGBA extracts
 }
 
+test "fragment image sample supports a three-dimensional descriptor" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xf080_0f10, // image_sample dim:3d dmask:xyzw v2, v[0:2], s[0:7], s[8:11]
+        0x0040_0200,
+        0xf800_080f, // exp mrt0, v2, v3, v4, v5 done
+        0x0504_0302,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    const images = [_]SampledImageBinding{.{
+        .resource_sgpr = 0,
+        .sampler_sgpr = 8,
+        .descriptor_index = 0,
+        .dimension = .three_d,
+    }};
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .fragment,
+        .sampled_images = &images,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 3), firstInstructionOperand(module.words, 25, 2)); // Dim3D
+    try std.testing.expect(containsOpcode(module.words, 87)); // OpImageSampleImplicitLod
+    try std.testing.expectEqual(@as(usize, 4), countOpcode(module.words, 81)); // RGBA extracts
+}
+
 test "compute image sample level zero uses explicit lod" {
     const decoder = @import("decoder.zig");
     const code = [_]u32{
@@ -4842,6 +4949,34 @@ test "compute image store accepts a one-slice 2D array opcode" {
     });
     defer module.deinit(std.testing.allocator);
 
+    try std.testing.expect(containsOpcode(module.words, 99)); // OpImageWrite
+}
+
+test "compute image load and store support three-dimensional storage images" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xf000_0f10, // image_load dim:3d dmask:xyzw v0, v[4:6], s[16:23]
+        0x0004_0004,
+        0xf020_0f10, // image_store dim:3d dmask:xyzw v0, v[4:6], s[16:23]
+        0x0004_0004,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    const images = [_]StorageImageBinding{.{
+        .resource_sgpr = 16,
+        .descriptor_index = 0,
+        .format = .rgba16_float,
+        .dimension = .three_d,
+    }};
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .storage_images = &images,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 3), firstInstructionOperand(module.words, 25, 2)); // Dim3D
+    try std.testing.expect(containsOpcode(module.words, 98)); // OpImageRead
     try std.testing.expect(containsOpcode(module.words, 99)); // OpImageWrite
 }
 

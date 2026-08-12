@@ -98,11 +98,15 @@ If you would like to support continued PS5PCEM development, you can do so on
   its compact typed image-clear dispatches now update guest render-target and
   depth memory, including a dual 1024×1024 `RGBA32_FLOAT` clear, while its
   bounded buffer-to-volume uploads populate 3D images. General compute
-  `image_load`/`image_store` now use individually typed Vulkan storage images,
-  including mixed `R11G11B10_FLOAT` and `RGBA8_UNORM` bindings, with checked
-  detile/upload and readback/retile. The compute sampled-image path recovers T#
-  and S# values at the exact MIMG instruction, binds a combined image/sampler,
-  and lowers 2D `image_sample_lz` with explicit LOD 0 and NSA coordinates. LDS
+  `image_load`/`image_store` now use individually typed Vulkan 2D and 3D storage
+  images, including mixed `R11G11B10_FLOAT`, `RGBA8_UNORM`, and `RGBA16_FLOAT`
+  bindings, with checked volume detile/upload and readback/retile. Sampled-image
+  paths recover T# and S# values at the exact MIMG instruction and bind separate
+  combined 2D/3D descriptor arrays. Fragment shaders can mix ordinary 2D images
+  with 3D `10_10_10_2_UNORM` lookup volumes, while compute lowers the observed
+  2D `image_sample_lz` with explicit LOD 0 and NSA coordinates. Unnormalized
+  guest samplers are represented with Vulkan-compliant clamp, filter, and LOD
+  state. LDS
   is allocated from `COMPUTE_PGM_RSRC2`, and the common DS read/write, paired,
   subword, atomic, and barrier operations lower to SPIR-V Workgroup memory.
   Final compositor draws that omit color-buffer registers are now retained for
@@ -114,10 +118,12 @@ If you would like to support continued PS5PCEM development, you can do so on
   storage-image-format, late V# binding, compute sample, and NSA image-store
   blockers are translated through the complete observed 176-instruction
   prepass. A translation-only diagnostic produces 5,421 SPIR-V words for that
-  program. Normal execution on the current NVIDIA host instead reports a GPU
-  fault during an earlier `15×9×8` volume dispatch, so execution correctness for
-  the completed prepass is not claimed yet; NGG export and additional image
-  semantics also remain incomplete.
+  program. Normal execution now completes both `15×9×8` dispatches, the
+  `16×16×16` four-binding `RGBA16_FLOAT` storage-volume pass, and the mixed
+  four-image fragment setup containing a `32×32×32` sampled volume. The host
+  driver accepts the resulting pipeline without a validation, fence, or GPU
+  fault. Recognizable scene output is still blocked by unsupported graphics
+  opcodes, DCC color-target state, and incomplete NGG export semantics.
 
 ### Screenshot
 
@@ -157,7 +163,7 @@ the repository contains none of that content.
 | **Terminator 2D: No Fate** | Reaches gameplay with correct color reproduction and clean title-provided backgrounds, characters, HUD elements, and textures; publisher logo screens and menus now match the console capture; warmed-up startup frames measure 22–65 ms on the current test host | First-use texture staging, multiple render targets, and the remaining compression metadata are incomplete |
 | **Pistol Whip** | Maps the native PS VR2 plugin and Burst module, then starts loading Unity asset archives | Headset, tracking, controller, and host OpenXR support are intentionally deferred |
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
-| **Tetris Effect: Connected** | Completes Unreal filesystem/config bootstrap, executes compact typed UAV clears and 3D volume uploads, translates two 344/125-instruction volume dispatches with recursively recovered V# chains, and translates the complete 176-instruction mixed-image/LDS prepass, including compute `image_sample_lz` at PC `0x29c` and NSA `image_store` at PC `0x440`; its 2,401-instruction deferred compositor writes all 8,294,400 pixels of the 3840×2160 scanout | The first repeatable guest framebuffer is uniform light gray rather than a recognizable scene; a normal run currently produces an NVIDIA GPU fault during an earlier `15×9×8` dispatch, while NGG export and some image forms remain incomplete and the 512 GiB reservation can depend on host address-space placement |
+| **Tetris Effect: Connected** | Completes Unreal filesystem/config bootstrap, typed UAV clears, both `15×9×8` dispatches, and a general `16×16×16` storage-image dispatch with four 3D bindings backed by two `64×64×64 RGBA16_FLOAT` volumes. Its mixed fragment setup stages three 2D images plus a `32×32×32 10_10_10_2_UNORM` volume, emits separate SPIR-V 2D/3D sampled-image types, and creates the Vulkan graphics pipeline without the former sampled-image or NVIDIA GPU fault. The complete 176-instruction mixed-image/LDS prepass also includes compute `image_sample_lz` at PC `0x29c` and NSA `image_store` at PC `0x440` | The first repeatable guest framebuffer remains uniform light gray rather than a recognizable scene. Unsupported graphics opcodes, DCC color-target state, incomplete NGG export semantics, very slow synchronous startup compute, an intermittent early guest `libc` null fault, and host placement of the 512 GiB sparse reservation remain active limits |
 | **The Precinct** | Links the complete six-image guest graph, defers and starts Unity plug-ins through `sceKernelLoadStartModule`, enters Unity, indexes its audio assets, and plays both observed intro movies through the new SceAvPlayer path. The title receives synchronized 3840×2160 NV12 video and 48 kHz stereo PCM; its guest YUV conversion shader produces the recognizable Kwalee frame above. Post-video graphics continue through seven draws and nine dispatches per frame, with warmed-up frames around 20–22 ms on the current RTX 3070 Ti test host | The post-video scene source is still incorrect: draw 1 receives a sparse/corrupted pixel strip, draw 2 copies it to the scanout, and later UI draws do not restore a recognizable scene. Gameplay is not claimed yet |
 | **Jets 'n' Guns 2** | Resolves title content through `/app0`, completes AGC resource registration, and sustains the full graphics/compute/VideoOut loop. Targetless final passes are preserved through flip, while dynamic SGPR data and descriptor-sized buffer bounds keep streamed sprite batches on stable Vulkan pipelines. The title now renders the recognizable 3840×2160 title screen, main menu, and options UI shown above; warmed 53-draw startup frames measure roughly 113–124 ms on the current RTX 3070 Ti host with zero pipeline misses after warm-up | A manual `Cross` reaches the main menu without the automatic `Options` pulse, but selecting `NEW GAME` currently stops further flips after the audio decode/output loops exit. A playable scene and working in-game audio are therefore not claimed yet |
 | **Asterix & Obelix: Slap Them All!** | Maps the Unity/PSN plug-in graph, passes GameUpdate, trophy, entitlement, WebApi, and player-review bootstrap calls, accepts four-byte-aligned AGC shader headers, and reaches repeated 1920×1080 frames. SceAvPlayer returns the ATL intro as correctly decoded NV12 frames, while matched image-copy, planar-conversion, fullscreen-blit, and color-resolve paths keep the observed movie pipeline moving without its former multi-second shader compilation/dispatch blockers | The decoded source is recognizable, but final compositor scaling/presentation still needs validation and no repeatable menu or gameplay frame is claimed yet |
@@ -401,7 +407,7 @@ unsigned byte/short reads, the common 32-bit integer/bitwise atomics,
 mix `R8_UINT`, `R16_UINT`, `R32_UINT`, `R11G11B10_FLOAT`, `RGBA8_UNORM`,
 `RGBA8_UINT`, `RGBA16_FLOAT`, and `RGBA32_FLOAT` without optional
 read/write-without-format device features. Both consecutive and NSA coordinate
-VGPR encodings are accepted for 2D loads/stores. Array, mip, MSAA, 3D,
+VGPR encodings are accepted for 2D and 3D loads/stores. Array, mip, MSAA,
 partial-mask store, and image-atomic forms remain explicit future work.
 
 Graphics modules connect vertex `EXP POS0` to `BuiltIn Position`, vertex
@@ -410,13 +416,15 @@ matching inputs, and fragment `EXP MRT0` to color location zero. Hardware-only
 M0 setup and EXEC restoration from unavailable pixel-prolog SGPRs are tolerated
 without inventing guest data. Fragment EXEC/VCC predicates use the subgroup
 local invocation index rather than a compute-only builtin. The current MIMG
-path lowers normalized 2D `image_sample` through the combined sampled-image
-descriptor array for fragment programs. Compute programs additionally support
+path lowers normalized 2D and 3D `image_sample` through dimension-specific
+combined sampled-image descriptor arrays for fragment programs. Compute
+programs additionally support
 the observed `image_sample_lz` form with explicit LOD 0, including NSA
 coordinates and per-instruction recovery of reused T#/S# SGPRs. Sampled-image
-staging detiles both `RGBA8_UNORM` and `RGBA16_FLOAT` surfaces into matching
-Vulkan formats; the unified format is part of the cache key so aliases cannot
-reuse an incompatible image view.
+staging detiles 2D surfaces and thick 3D volumes, including `RGBA8_UNORM`,
+`R11G11B10_FLOAT`, `RGBA16_FLOAT`, and `10_10_10_2_UNORM`, into matching Vulkan
+formats. Resource dimension and depth are part of the cache key so 2D/3D
+aliases cannot reuse an incompatible image view.
 Compressed/masked exports, additional MRT targets, non-trivial image operands,
 and the remaining graphics system VGPRs are still incomplete.
 
@@ -720,15 +728,15 @@ packet per line with its word offset, and counts the draws and dispatches:
 The shared GFX10 staging contract covers mip tails, thick 3D blocks, Oberon RB+
 MSAA addressing, and compute-detile constants. Compute submissions translate
 the supported RDNA2 ALU/SMEM/MUBUF/DS and storage-image paths, specialize
-bounded scalar prologs, bind guest buffers and independently typed 2D images,
+bounded scalar prologs, bind guest buffers and independently typed 2D/3D images,
 and copy device writes back to guest memory. Graphics draws
 consume decoded color targets, viewport/scissor, cull/front-face, write-mask and
 blend state, then execute guest vertex/fragment SPIR-V. Render-target images are
 persistent across draws and are materialized back to guest memory only before a
 CPU-visible synchronization point, a dependent texture upload, or `SetFlip`.
 
-Supported 2D image/sampler descriptors feed fragment `image_sample` and compute
-`image_sample_lz`. AGC
+Supported 2D and 3D image/sampler descriptors feed fragment `image_sample`, and
+2D descriptors feed compute `image_sample_lz`. AGC
 vertex tables provide distinct position and texture-coordinate buffers even
 when the shader reuses one V# SGPR, and vertex PARAM exports now supply the
 fragment interpolation inputs. `ACQUIRE_MEM`, `RELEASE_MEM`, `WAIT_REG_MEM`,
@@ -773,8 +781,8 @@ compute. Validation is requested for debug builds when
 
 The renderer owns instance/device lifetime, the selected queue, a transient
 command pool with a resettable one-shot command buffer/fence, host/device
-memory-type selection, one descriptor layout with 64 storage buffers, 64
-combined sampled images, typed storage images, and a persistently mapped dynamic
+memory-type selection, one descriptor layout with 64 storage buffers, separate
+64-entry 2D and 3D combined sampled-image arrays, typed storage images, and a persistently mapped dynamic
 scalar buffer, its pool, persistent guest render targets, and
 image/view/sampler/render-pass/framebuffer creation. It also owns bounded
 compute and LRU graphics-pipeline caches plus a 32-entry sampled-image LRU. The
@@ -807,14 +815,14 @@ tiling layout for each written texel. A separately matched bounds-checked upload
 kernel copies `R8_UINT` buffers into `RGBA8_UINT` 3D images and `R16_UINT`
 buffers into `R16_UINT` 3D images; linear volumes use aligned rows and
 consecutive depth slices through the same texture-layout contract. General
-single-sample 2D `image_load`/`image_store` dispatches now stage each T# through
+single-sample 2D/3D `image_load`/`image_store` dispatches now stage each T# through
 the same texture-layout contract, bind up to eight independently typed Vulkan
 storage images, accept consecutive or NSA coordinate VGPRs, and retile writable
 results into guest memory after completion.
 An exact packed `RGBA8` V# clear shape operates directly on an already resident
 color attachment, avoiding a full-frame storage-buffer transfer and stale
 aliased image contents.
-Mip, array, 3D, MSAA, compressed and partial-mask store forms remain explicit
+Mip, array, MSAA, compressed and partial-mask store forms remain explicit
 unsupported work rather than taking a narrow fast path. Draw callbacks count
 work by default. When both vertex and pixel
 program registers are present,
@@ -850,21 +858,23 @@ readback as stores. Swizzled descriptors use V# `index_stride` to permute each
 dword address, while short loads/stores are split into byte operations so they
 remain correct across both linear and swizzle-separated dword boundaries.
 Dynamically unresolved SMEM and images remain explicit unsupported semantics.
-For the supported fragment subset, inline 2D image and sampler descriptors are
+For the supported fragment subset, inline 2D/3D image and sampler descriptors are
 decoded from user SGPRs. Compute sampling also recovers descriptors from the
 exact preceding scalar loads or the dispatch SRT after SGPR reuse. Both paths
 detile into a sampled Vulkan image, transition it to shader-read layout, and bind
-it through set 0/binding 1. Cache identity includes
+it through dimension-specific combined-image bindings. Cache identity includes
 the guest payload hash; rewriting the same address replaces its stale image,
 while descriptor SGPR addresses are excluded from scalar specialization to
 avoid recompiling a pipeline for every streamed texture. Non-linear surfaces are
 read once into a checked contiguous allocation and detiled in host memory,
 avoiding one guest callback per texel for large streamed textures. Legacy
 detiling walks macro-block rows and reuses their local offset table instead of
-recomputing checked coordinates for every texel. MIMG lowering supports
-normalized two-coordinate fragment `image_sample` and compute `image_sample_lz`
-with explicit LOD 0; other dimensions, mips, component swizzles, and sampling
-operands remain incomplete.
+recomputing checked coordinates for every texel. Thick render-target volumes use
+the shared 3D texture layout and upload all depth slices into a Vulkan 3D image.
+MIMG lowering supports normalized two-coordinate 2D and three-coordinate 3D
+fragment `image_sample`, plus compute `image_sample_lz` with explicit LOD 0;
+array/cube dimensions, mips, component swizzles, and additional sampling operands
+remain incomplete.
 
 Each draw submission completes through its fence before the executor reaches a
 PM4 synchronization callback. `ACQUIRE_MEM`, `RELEASE_MEM`, `WRITE_DATA`, and
@@ -2032,22 +2042,24 @@ dispatches that previously failed at the final `buffer_atomic_swap` translate.
 The 176-instruction `30×34×1` prepass resolves mixed
 `R11G11B10_FLOAT`/`RGBA8_UNORM` images, lowers compute `image_sample_lz` at PC
 `0x29c`, consumes its NSA coordinate, then lowers the NSA `image_store` at PC
-`0x440`. A safe `PS5_COMPUTE_TRANSLATE_ONLY=1` capture translates the complete
-program into 5,421 SPIR-V words and continues the command stream without another
-translation error. It deliberately performs no compute writes, so it cannot
-produce a correct title image.
+`0x440`. Normal execution also reaches the general `16×16×16` storage-image
+program: four 3D T# bindings alias two `64×64×64 RGBA16_FLOAT` volumes and pass
+through upload, Vulkan writes, readback, and retile without a fence or GPU fault.
+The following fragment setup mixes three 2D textures with one
+`32×32×32 10_10_10_2_UNORM` lookup volume. Separate SPIR-V Dim2D/Dim3D combined
+descriptor arrays preserve the mixed shader interface, and the NVIDIA driver
+accepts the resulting graphics pipeline. The former `FenceWaitFailed`/
+`nvlddmkm` boundary is therefore no longer current.
 
-Normal execution is currently bounded earlier: two fresh-cache runs on the
-current RTX 3070 Ti returned `FenceWaitFailed` at the first `15×9×8` dispatch,
-and Windows recorded an `nvlddmkm` GPU fault for the same submission. The driver
-pipeline cache was ruled out, but the shader/resource execution fault still
-needs isolation before the newly translated prepass can be tested end to end.
-The last repeatable framebuffer therefore remains uniform light gray rather than
-a recognizable title image.
-
-The normal diagnostic frame takes about 208 host seconds on the current test
-machine, of which roughly 170 seconds are synchronous compute emulation. The
-opt-in `PS5_SKIP_COMPUTE=1` bring-up mode reaches the same framebuffer in about
+The last repeatable framebuffer remains uniform light gray rather than a
+recognizable title image. DCC-backed color state is still rejected in an early
+draw, and later vertex/fragment programs expose unsupported opcodes and
+incomplete NGG export behavior. A separate nondeterministic startup issue can
+fault in the guest `libc.prx` initializer on a null read before any GPU work; a
+fresh second launch has repeatedly passed that point. A measured full-compute
+second frame takes roughly 336 host seconds on the current test machine, with
+most time spent in synchronous compute emulation. The opt-in
+`PS5_SKIP_COMPUTE=1` bring-up mode reaches the same framebuffer in about
 44 seconds and must not be treated as correct execution. Its 3840×2160 display
 buffers register with the expected pitch. A measured loading run held private
 memory near 2.2–2.3 GiB instead of retaining a geometric chain of arena-backed
@@ -2072,12 +2084,12 @@ from leaking into host code where nothing would check it.
 
 1. Complete the remaining AGC command constructors, especially indirect indexed
    draws, and retain submission ownership across cross-queue asynchronous waits.
-2. Extend general storage-image lowering to mip, array, 3D, MSAA, partial-mask,
+2. Extend general storage-image lowering to mip, array, MSAA, partial-mask,
    depth/stencil, atomic, and compressed-surface forms; retain exact UAV fast
    paths only where they reduce synchronous startup work without changing
    semantics.
 3. Extend compute sampling beyond `image_sample_lz` to explicit LOD/bias,
-   mip/layer and additional dimension forms, finish the NGG export path, and
+   mip/layer and array/cube forms, finish the NGG export path, and
    cover the remaining indirect descriptor variants that still leave the
    deferred compositor with incomplete inputs.
 4. Move the remaining first-use texture conversion and synchronous compute work
