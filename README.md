@@ -32,7 +32,9 @@ If you would like to support continued PS5PCEM development, you can do so on
   fragment interpolation.
 - Persistent render targets, large writable storage buffers, and bounded texture
   and pipeline caches keep frame resources on the GPU across draws and reduce
-  redundant queue submits, uploads, and readbacks.
+  redundant queue submits, uploads, and readbacks. A bound depth allocation
+  becomes a resident attachment, so guest depth testing and depth writes reach
+  the rasterizer; stencil and multi-sample depth do not yet.
 - Long-running title execution uses a freeing, thread-safe allocator, and
   aligned Windows direct-memory ranges share 64 KiB section views. Temporary
   uploads/readbacks and 16 KiB guest pages therefore no longer accumulate as
@@ -152,7 +154,7 @@ the repository contains none of that content.
 
 | Title | Observed milestone | Current limit |
 |---|---|---|
-| **Terminator 2D: No Fate** | Reaches gameplay with correct color reproduction and clean title-provided backgrounds, characters, HUD elements, and textures; publisher logo screens and menus now match the console capture; warmed-up startup frames measure 22–65 ms on the current test host | First-use texture staging, Vulkan depth/MRT, and the remaining compression metadata are incomplete |
+| **Terminator 2D: No Fate** | Reaches gameplay with correct color reproduction and clean title-provided backgrounds, characters, HUD elements, and textures; publisher logo screens and menus now match the console capture; warmed-up startup frames measure 22–65 ms on the current test host | First-use texture staging, multiple render targets, and the remaining compression metadata are incomplete |
 | **Pistol Whip** | Maps the native PS VR2 plugin and Burst module, then starts loading Unity asset archives | Headset, tracking, controller, and host OpenXR support are intentionally deferred |
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
 | **Tetris Effect: Connected** | Completes Unreal filesystem/config bootstrap, executes compact typed UAV clears and 3D volume uploads, translates two 344/125-instruction volume dispatches with recursively recovered V# chains, and translates the complete 176-instruction mixed-image/LDS prepass, including compute `image_sample_lz` at PC `0x29c` and NSA `image_store` at PC `0x440`; its 2,401-instruction deferred compositor writes all 8,294,400 pixels of the 3840×2160 scanout | The first repeatable guest framebuffer is uniform light gray rather than a recognizable scene; a normal run currently produces an NVIDIA GPU fault during an earlier `15×9×8` dispatch, while NGG export and some image forms remain incomplete and the 512 GiB reservation can depend on host address-space placement |
@@ -741,7 +743,7 @@ The remaining stages are:
 
 1. Cache stable translated graphics modules and resource layouts across draws,
    leaving only runtime scalar values and descriptor updates on the hot path.
-2. Add depth/stencil, multiple render targets, MSAA, texture component swizzles,
+2. Add stencil, multiple render targets, MSAA, texture component swizzles,
    the remaining compressed DCC/FMASK states, HTILE Z-range/HiZ handling, and
    CMASK states coupled to MSAA/FMASK.
 3. Complete structured loops, VCC/EXEC divergence, formats, mip/layer views,
@@ -1904,8 +1906,23 @@ scheduler and Vulkan backend. Observed startup work now includes:
   then become full-range expanded words. Mixed ordinary Z-range words retain
   their authoritative base texels. Overlapping guest HTILE writes invalidate
   the bounded resolve cache, and dependent CPU/texture reads resolve again.
-  Vulkan depth testing and general HiZ range interpretation remain separate
-  follow-up work.
+  General HiZ range interpretation remains separate follow-up work.
+- A bound depth allocation now becomes a resident Vulkan attachment, so guest
+  depth testing and depth writes take effect instead of being dropped. The
+  stored precision selects the attachment format exactly — `Z_16` becomes
+  `D16_UNORM` and `Z_32_FLOAT` becomes `D32_SFLOAT` — and a precision with no
+  counterpart is refused rather than rounded to a nearby one, because silently
+  changing depth precision changes which fragments a title keeps. The guest
+  compare selector and Vulkan's compare operation enumerate the same eight
+  functions in the same order, so the field transfers unchanged. Depth is
+  attached only when the title both binds a usable allocation and asks for the
+  test, the write, or a clear; a render pass and framebuffer pair the colour and
+  depth attachments and are rebuilt only when the depth allocation changes. The
+  attachment is cleared on first use, because a title that enables the test
+  before its own clear would otherwise compare against undefined contents.
+  Stencil translation, importing tiled guest depth, and multi-sample depth
+  (which would need a multi-sample colour attachment to resolve against) are
+  not part of this path.
 - `SetFlip` and equeue delivery use VideoOut filter `-13`; flip status fills
   process-time fields and event data retains the guest flip argument.
 - Indexed draws can emit AGC `SetIndexSize` as a real `INDEX_TYPE` packet, and

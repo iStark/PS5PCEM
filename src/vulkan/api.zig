@@ -88,6 +88,7 @@ pub const structure_type_pipeline_input_assembly_state_create_info: u32 = 20;
 pub const structure_type_pipeline_viewport_state_create_info: u32 = 22;
 pub const structure_type_pipeline_rasterization_state_create_info: u32 = 23;
 pub const structure_type_pipeline_multisample_state_create_info: u32 = 24;
+pub const structure_type_pipeline_depth_stencil_state_create_info: u32 = 25;
 pub const structure_type_pipeline_color_blend_state_create_info: u32 = 26;
 pub const structure_type_graphics_pipeline_create_info: u32 = 28;
 pub const structure_type_compute_pipeline_create_info: u32 = 29;
@@ -127,6 +128,7 @@ pub const index_type_uint32: u32 = 1;
 pub const image_usage_transfer_src_bit: Flags = 0x0000_0001;
 pub const image_usage_transfer_dst_bit: Flags = 0x0000_0002;
 pub const image_usage_color_attachment_bit: Flags = 0x0000_0010;
+pub const image_usage_depth_stencil_attachment_bit: Flags = 0x0000_0020;
 pub const image_usage_sampled_bit: Flags = 0x0000_0004;
 pub const image_usage_storage_bit: Flags = 0x0000_0008;
 pub const sharing_mode_exclusive: u32 = 0;
@@ -146,6 +148,8 @@ pub const pipeline_stage_vertex_shader_bit: Flags = 0x0000_0008;
 pub const pipeline_stage_compute_shader_bit: Flags = 0x0000_0800;
 pub const pipeline_stage_fragment_shader_bit: Flags = 0x0000_0080;
 pub const pipeline_stage_color_attachment_output_bit: Flags = 0x0000_0400;
+pub const pipeline_stage_early_fragment_tests_bit: Flags = 0x0000_0100;
+pub const pipeline_stage_late_fragment_tests_bit: Flags = 0x0000_0200;
 pub const pipeline_stage_host_bit: Flags = 0x0000_4000;
 pub const pipeline_stage_bottom_of_pipe_bit: Flags = 0x0000_2000;
 pub const access_shader_read_bit: Flags = 0x0000_0020;
@@ -154,6 +158,8 @@ pub const access_transfer_read_bit: Flags = 0x0000_0800;
 pub const access_transfer_write_bit: Flags = 0x0000_1000;
 pub const access_color_attachment_write_bit: Flags = 0x0000_0100;
 pub const access_color_attachment_read_bit: Flags = 0x0000_0080;
+pub const access_depth_stencil_attachment_read_bit: Flags = 0x0000_0200;
+pub const access_depth_stencil_attachment_write_bit: Flags = 0x0000_0400;
 pub const access_host_read_bit: Flags = 0x0000_2000;
 pub const access_host_write_bit: Flags = 0x0000_4000;
 
@@ -195,6 +201,10 @@ pub const format_bc6h_ufloat_block: u32 = 143;
 pub const format_bc6h_sfloat_block: u32 = 144;
 pub const format_bc7_unorm_block: u32 = 145;
 pub const format_bc7_srgb_block: u32 = 146;
+pub const format_d16_unorm: u32 = 124;
+pub const format_d32_sfloat: u32 = 126;
+pub const format_d24_unorm_s8_uint: u32 = 129;
+pub const format_d32_sfloat_s8_uint: u32 = 130;
 pub const component_swizzle_identity: u32 = 0;
 pub const component_swizzle_zero: u32 = 1;
 pub const component_swizzle_one: u32 = 2;
@@ -209,11 +219,15 @@ pub const sample_count_1_bit: Flags = 1;
 pub const image_layout_undefined: u32 = 0;
 pub const image_layout_general: u32 = 1;
 pub const image_layout_color_attachment_optimal: u32 = 2;
+pub const image_layout_depth_stencil_attachment_optimal: u32 = 3;
+pub const image_layout_depth_stencil_read_only_optimal: u32 = 4;
 pub const image_layout_shader_read_only_optimal: u32 = 5;
 pub const image_layout_transfer_src_optimal: u32 = 6;
 pub const image_layout_transfer_dst_optimal: u32 = 7;
 pub const image_layout_present_src_khr: u32 = 1_000_001_002;
 pub const image_aspect_color_bit: Flags = 1;
+pub const image_aspect_depth_bit: Flags = 2;
+pub const image_aspect_stencil_bit: Flags = 4;
 pub const attachment_load_op_clear: u32 = 1;
 pub const attachment_load_op_load: u32 = 0;
 pub const attachment_store_op_store: u32 = 0;
@@ -705,6 +719,34 @@ pub const PipelineColorBlendStateCreateInfo = extern struct {
     blend_constants: [4]f32 = .{ 0, 0, 0, 0 },
 };
 
+/// Stencil is not translated yet; the struct exists because the depth state it
+/// belongs to cannot be described without it, and zeroed operations keep the
+/// stencil test inert when it is disabled.
+pub const StencilOperationState = extern struct {
+    fail_operation: u32 = 0,
+    pass_operation: u32 = 0,
+    depth_fail_operation: u32 = 0,
+    compare_operation: u32 = 0,
+    compare_mask: u32 = 0,
+    write_mask: u32 = 0,
+    reference: u32 = 0,
+};
+
+pub const PipelineDepthStencilStateCreateInfo = extern struct {
+    s_type: u32 = structure_type_pipeline_depth_stencil_state_create_info,
+    p_next: ?*const anyopaque = null,
+    flags: Flags = 0,
+    depth_test_enable: u32,
+    depth_write_enable: u32,
+    depth_compare_operation: u32,
+    depth_bounds_test_enable: u32 = 0,
+    stencil_test_enable: u32 = 0,
+    front: StencilOperationState = .{},
+    back: StencilOperationState = .{},
+    minimum_depth_bounds: f32 = 0,
+    maximum_depth_bounds: f32 = 1,
+};
+
 pub const GraphicsPipelineCreateInfo = extern struct {
     s_type: u32 = structure_type_graphics_pipeline_create_info,
     p_next: ?*const anyopaque = null,
@@ -717,7 +759,7 @@ pub const GraphicsPipelineCreateInfo = extern struct {
     viewport_state: *const PipelineViewportStateCreateInfo,
     rasterization_state: *const PipelineRasterizationStateCreateInfo,
     multisample_state: *const PipelineMultisampleStateCreateInfo,
-    depth_stencil_state: ?*const anyopaque = null,
+    depth_stencil_state: ?*const PipelineDepthStencilStateCreateInfo = null,
     color_blend_state: *const PipelineColorBlendStateCreateInfo,
     dynamic_state: ?*const anyopaque = null,
     layout: PipelineLayout,
@@ -749,7 +791,7 @@ pub const SubpassDescription = extern struct {
     color_attachment_count: u32,
     color_attachments: [*]const AttachmentReference,
     resolve_attachments: ?*const anyopaque = null,
-    depth_stencil_attachment: ?*const anyopaque = null,
+    depth_stencil_attachment: ?*const AttachmentReference = null,
     preserve_attachment_count: u32 = 0,
     preserve_attachments: ?[*]const u32 = null,
 };
@@ -934,6 +976,7 @@ pub const PfnCmdDrawIndexed = *const fn (CommandBuffer, u32, u32, u32, i32, u32)
 pub const PfnCmdBindIndexBuffer = *const fn (CommandBuffer, Buffer, DeviceSize, u32) callconv(call) void;
 pub const PfnCmdFillBuffer = *const fn (CommandBuffer, Buffer, DeviceSize, DeviceSize, u32) callconv(call) void;
 pub const PfnCmdClearColorImage = *const fn (CommandBuffer, Image, u32, *const ClearColorValue, u32, [*]const ImageSubresourceRange) callconv(call) void;
+pub const PfnCmdClearDepthStencilImage = *const fn (CommandBuffer, Image, u32, *const ClearDepthStencilValue, u32, [*]const ImageSubresourceRange) callconv(call) void;
 pub const PfnCmdCopyBuffer = *const fn (CommandBuffer, Buffer, Buffer, u32, [*]const BufferCopy) callconv(call) void;
 pub const PfnCmdCopyImageToBuffer = *const fn (CommandBuffer, Image, u32, Buffer, u32, [*]const BufferImageCopy) callconv(call) void;
 pub const PfnCmdCopyBufferToImage = *const fn (CommandBuffer, Buffer, Image, u32, u32, [*]const BufferImageCopy) callconv(call) void;

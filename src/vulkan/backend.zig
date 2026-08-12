@@ -428,6 +428,7 @@ const DeviceFunctions = struct {
     cmd_draw_indexed: vk.PfnCmdDrawIndexed,
     cmd_bind_index_buffer: vk.PfnCmdBindIndexBuffer,
     cmd_clear_color_image: vk.PfnCmdClearColorImage,
+    cmd_clear_depth_stencil_image: vk.PfnCmdClearDepthStencilImage,
     cmd_copy_buffer: vk.PfnCmdCopyBuffer,
     cmd_copy_image_to_buffer: vk.PfnCmdCopyImageToBuffer,
     cmd_copy_buffer_to_image: vk.PfnCmdCopyBufferToImage,
@@ -496,6 +497,7 @@ const DeviceFunctions = struct {
             .cmd_draw_indexed = try deviceProc(get_proc, device, vk.PfnCmdDrawIndexed, "vkCmdDrawIndexed"),
             .cmd_bind_index_buffer = try deviceProc(get_proc, device, vk.PfnCmdBindIndexBuffer, "vkCmdBindIndexBuffer"),
             .cmd_clear_color_image = try deviceProc(get_proc, device, vk.PfnCmdClearColorImage, "vkCmdClearColorImage"),
+            .cmd_clear_depth_stencil_image = try deviceProc(get_proc, device, vk.PfnCmdClearDepthStencilImage, "vkCmdClearDepthStencilImage"),
             .cmd_copy_buffer = try deviceProc(get_proc, device, vk.PfnCmdCopyBuffer, "vkCmdCopyBuffer"),
             .cmd_copy_image_to_buffer = try deviceProc(get_proc, device, vk.PfnCmdCopyImageToBuffer, "vkCmdCopyImageToBuffer"),
             .cmd_copy_buffer_to_image = try deviceProc(get_proc, device, vk.PfnCmdCopyBufferToImage, "vkCmdCopyBufferToImage"),
@@ -693,6 +695,13 @@ const GraphicsPipelineState = extern struct {
     source_alpha_blend_factor: u32,
     destination_alpha_blend_factor: u32,
     alpha_blend_operation: u32,
+    /// Zero when the draw has no depth attachment. A pipeline is only
+    /// compatible with a render pass that agrees about depth, so this belongs
+    /// in the cache key.
+    depth_attachment_format: u32,
+    depth_test_enable: u32,
+    depth_write_enable: u32,
+    depth_compare_operation: u32,
 
     fn default(width: u32, height: u32) GraphicsPipelineState {
         return .{
@@ -721,6 +730,10 @@ const GraphicsPipelineState = extern struct {
             .source_alpha_blend_factor = 0,
             .destination_alpha_blend_factor = 0,
             .alpha_blend_operation = 0,
+            .depth_attachment_format = 0,
+            .depth_test_enable = 0,
+            .depth_write_enable = 0,
+            .depth_compare_operation = 0,
         };
     }
 };
@@ -806,6 +819,27 @@ fn colorTargetFormat(descriptor: gpu.resources.ColorTarget) ?ColorTargetFormat {
     };
 }
 
+/// The Vulkan attachment format for a guest depth plane.
+///
+/// DB_Z_INFO.FORMAT names the stored precision: 1 is sixteen-bit unorm and 3 is
+/// thirty-two bit float. Both have a direct Vulkan counterpart, so nothing is
+/// approximated here; formats outside that pair are left unsupported instead of
+/// being forced into a nearby one, because silently changing depth precision
+/// changes which fragments a title keeps.
+fn depthTargetFormat(descriptor: gpu.resources.DepthTarget) ?u32 {
+    return switch (descriptor.format) {
+        1 => vk.format_d16_unorm,
+        3 => vk.format_d32_sfloat,
+        else => null,
+    };
+}
+
+/// The guest depth-compare selector and Vulkan's `VkCompareOp` enumerate the
+/// same eight functions in the same order, so the raw field is the host value.
+fn depthCompareOperation(function: u8) u32 {
+    return @as(u32, function & 0x7);
+}
+
 /// The first host implementation keeps one color value per pixel.  Preserve
 /// the guest allocation and fixed-function resolve semantics while rendering
 /// an MSAA target as a single-sample attachment; a later CB resolve copies the
@@ -866,12 +900,72 @@ const CachedRenderTarget = struct {
     view: vk.ImageView,
     render_pass: vk.RenderPass,
     framebuffer: vk.Framebuffer,
+    depth_pass: ?DepthPass = null,
     readback: OwnedBuffer,
     initialized: bool = false,
     shader_read_layout: bool = false,
     gpu_generation: u64 = 0,
     host_generation: u64 = 0,
     last_used_sequence: u64 = 0,
+};
+
+/// A guest depth allocation reduced to what a Vulkan attachment needs.
+///
+/// The guest describes depth as a base allocation plus an optional separate
+/// stencil allocation and an HTILE metadata surface. Only the depth plane is
+/// represented here: stencil has no translation yet, and HTILE is resolved into
+/// the base allocation by the existing metadata path rather than being handed to
+/// the rasterizer.
+const GuestDepthTarget = struct {
+    address: u64,
+    width: u32,
+    height: u32,
+    /// DB_Z_INFO.FORMAT, kept so a re-decode of the same registers matches.
+    guest_format: u8,
+    format: u32,
+    tile_mode: gpu.resources.TileMode,
+    base_array_slice: u16,
+    mip_level: u8,
+    clear_depth: f32,
+
+    fn sameAllocation(self: GuestDepthTarget, other: GuestDepthTarget) bool {
+        return self.address == other.address and
+            self.width == other.width and
+            self.height == other.height and
+            self.guest_format == other.guest_format and
+            self.tile_mode == other.tile_mode and
+            self.base_array_slice == other.base_array_slice and
+            self.mip_level == other.mip_level;
+    }
+};
+
+/// One guest depth allocation kept resident as a Vulkan attachment.
+///
+/// The image is not staged from guest memory and is never read back. A title
+/// establishes depth by clearing it and then testing against what its own draws
+/// wrote, so the contents only have to be consistent from the first clear
+/// onwards; importing tiled guest depth would add a conversion this path does
+/// not need yet.
+const CachedDepthTarget = struct {
+    target: GuestDepthTarget,
+    image: OwnedImage,
+    view: vk.ImageView,
+    /// False until the image has been transitioned out of `undefined`.
+    initialized: bool = false,
+    last_used_sequence: u64 = 0,
+};
+
+/// A render pass and framebuffer pairing one colour attachment with one depth
+/// attachment.
+///
+/// Held on the colour target because that is what owns the framebuffer. A title
+/// keeps the same pair bound across long runs of draws, so the single slot is
+/// rebuilt only when the depth allocation actually changes.
+const DepthPass = struct {
+    depth_view: vk.ImageView,
+    depth_format: u32,
+    render_pass: vk.RenderPass,
+    framebuffer: vk.Framebuffer,
 };
 
 const CmaskSeed = struct {
@@ -1226,6 +1320,9 @@ pub const Renderer = struct {
     graphics_probe_colored_pixels: u32 = 0,
     graphics_probe_frame: [graphics_probe_bytes]u8 = @splat(0),
     render_targets: std.ArrayList(CachedRenderTarget) = .empty,
+    depth_targets: std.ArrayList(CachedDepthTarget) = .empty,
+    depth_target_sequence: u64 = 0,
+    reported_depth_attachment: bool = false,
     htile_targets: std.ArrayList(CachedHtileTarget) = .empty,
     htile_target_sequence: u64 = 0,
     latest_render_target_index: ?usize = null,
@@ -1639,6 +1736,8 @@ pub const Renderer = struct {
         self.pending_targetless_draws.deinit(self.allocator);
         for (self.render_targets.items) |target| self.destroyCachedRenderTarget(target);
         self.render_targets.deinit(self.allocator);
+        for (self.depth_targets.items) |target| self.destroyCachedDepthTarget(target);
+        self.depth_targets.deinit(self.allocator);
         self.htile_targets.deinit(self.allocator);
         for (self.sampled_image_cache.items) |image| {
             self.device_functions.destroy_sampler(self.device, image.sampler, null);
@@ -4057,6 +4156,196 @@ pub const Renderer = struct {
         return render_pass;
     }
 
+    /// Brings a depth attachment into the layout its render pass expects, and
+    /// applies the guest's depth clear when one is pending.
+    ///
+    /// A freshly created image has undefined contents, so the first use always
+    /// clears: a title that enables the depth test before its own clear would
+    /// otherwise compare against whatever the allocator left behind. Later
+    /// clears happen only when DB_RENDER_CONTROL asks for one.
+    fn prepareDepthAttachment(
+        self: *Renderer,
+        command_buffer: vk.CommandBuffer,
+        depth_index: usize,
+        clear_requested: bool,
+    ) void {
+        const cached = &self.depth_targets.items[depth_index];
+        const first_use = !cached.initialized;
+        const clearing = clear_requested or first_use;
+        const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_depth_bit };
+
+        const old_layout: u32 = if (first_use)
+            vk.image_layout_undefined
+        else
+            vk.image_layout_depth_stencil_attachment_optimal;
+        const target_layout: u32 = if (clearing)
+            vk.image_layout_transfer_dst_optimal
+        else
+            vk.image_layout_depth_stencil_attachment_optimal;
+
+        const to_target = vk.ImageMemoryBarrier{
+            .source_access_mask = if (first_use) 0 else vk.access_depth_stencil_attachment_write_bit,
+            .destination_access_mask = if (clearing)
+                vk.access_transfer_write_bit
+            else
+                vk.access_depth_stencil_attachment_read_bit | vk.access_depth_stencil_attachment_write_bit,
+            .old_layout = old_layout,
+            .new_layout = target_layout,
+            .image = cached.image.handle,
+            .subresource_range = range,
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            if (first_use) vk.pipeline_stage_top_of_pipe_bit else vk.pipeline_stage_late_fragment_tests_bit,
+            if (clearing) vk.pipeline_stage_transfer_bit else vk.pipeline_stage_early_fragment_tests_bit,
+            0,
+            0,
+            null,
+            0,
+            null,
+            1,
+            @ptrCast(&to_target),
+        );
+        cached.initialized = true;
+        if (!clearing) return;
+
+        const clear = vk.ClearDepthStencilValue{
+            .depth = std.math.clamp(cached.target.clear_depth, 0, 1),
+            .stencil = 0,
+        };
+        self.device_functions.cmd_clear_depth_stencil_image(
+            command_buffer,
+            cached.image.handle,
+            vk.image_layout_transfer_dst_optimal,
+            &clear,
+            1,
+            @ptrCast(&range),
+        );
+        const to_attachment = vk.ImageMemoryBarrier{
+            .source_access_mask = vk.access_transfer_write_bit,
+            .destination_access_mask = vk.access_depth_stencil_attachment_read_bit |
+                vk.access_depth_stencil_attachment_write_bit,
+            .old_layout = vk.image_layout_transfer_dst_optimal,
+            .new_layout = vk.image_layout_depth_stencil_attachment_optimal,
+            .image = cached.image.handle,
+            .subresource_range = range,
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_transfer_bit,
+            vk.pipeline_stage_early_fragment_tests_bit,
+            0,
+            0,
+            null,
+            0,
+            null,
+            1,
+            @ptrCast(&to_attachment),
+        );
+    }
+
+    /// A render pass that keeps both attachments across draws.
+    ///
+    /// Depth loads rather than clears for the same reason colour does: a title
+    /// builds a frame from many draws against one allocation, and a clear baked
+    /// into the pass would erase what the previous draw established. The guest's
+    /// own depth clear is issued separately, against the image.
+    fn createDepthGraphicsRenderPass(
+        self: *Renderer,
+        color_format: u32,
+        depth_format: u32,
+        preserve_color: bool,
+    ) Error!vk.RenderPass {
+        const attachments = [2]vk.AttachmentDescription{
+            .{
+                .format = color_format,
+                .load_operation = if (preserve_color) vk.attachment_load_op_load else vk.attachment_load_op_clear,
+                .store_operation = vk.attachment_store_op_store,
+                .initial_layout = if (preserve_color) vk.image_layout_color_attachment_optimal else vk.image_layout_undefined,
+                .final_layout = vk.image_layout_color_attachment_optimal,
+            },
+            .{
+                .format = depth_format,
+                .load_operation = vk.attachment_load_op_load,
+                .store_operation = vk.attachment_store_op_store,
+                .initial_layout = vk.image_layout_depth_stencil_attachment_optimal,
+                .final_layout = vk.image_layout_depth_stencil_attachment_optimal,
+            },
+        };
+        const color_reference = vk.AttachmentReference{
+            .attachment = 0,
+            .layout = vk.image_layout_color_attachment_optimal,
+        };
+        const depth_reference = vk.AttachmentReference{
+            .attachment = 1,
+            .layout = vk.image_layout_depth_stencil_attachment_optimal,
+        };
+        const subpass = vk.SubpassDescription{
+            .color_attachment_count = 1,
+            .color_attachments = @ptrCast(&color_reference),
+            .depth_stencil_attachment = &depth_reference,
+        };
+        const info = vk.RenderPassCreateInfo{
+            .attachment_count = attachments.len,
+            .attachments = &attachments,
+            .subpass_count = 1,
+            .subpasses = @ptrCast(&subpass),
+        };
+        var render_pass: vk.RenderPass = 0;
+        if (self.device_functions.create_render_pass(self.device, &info, null, &render_pass) != vk.success) {
+            return Error.RenderPassCreationFailed;
+        }
+        return render_pass;
+    }
+
+    /// The colour target's framebuffer paired with one depth attachment,
+    /// rebuilt only when the pairing changes.
+    fn acquireDepthPass(
+        self: *Renderer,
+        target_index: usize,
+        depth_index: usize,
+    ) anyerror!DepthPass {
+        const color = self.render_targets.items[target_index];
+        const depth = self.depth_targets.items[depth_index];
+        if (color.depth_pass) |existing| {
+            if (existing.depth_view == depth.view and existing.depth_format == depth.target.format) {
+                return existing;
+            }
+            self.destroyDepthPass(existing);
+            self.render_targets.items[target_index].depth_pass = null;
+        }
+
+        const color_format = colorTargetFormat(color.target.descriptor) orelse
+            return Error.UnsupportedColorTarget;
+        const render_pass = try self.createDepthGraphicsRenderPass(
+            color_format.vulkan,
+            depth.target.format,
+            true,
+        );
+        errdefer self.device_functions.destroy_render_pass(self.device, render_pass, null);
+
+        const views = [2]vk.ImageView{ color.view, depth.view };
+        const framebuffer_info = vk.FramebufferCreateInfo{
+            .render_pass = render_pass,
+            .attachment_count = views.len,
+            .attachments = &views,
+            .width = color.target.descriptor.width,
+            .height = color.target.descriptor.height,
+        };
+        var framebuffer: vk.Framebuffer = 0;
+        if (self.device_functions.create_framebuffer(self.device, &framebuffer_info, null, &framebuffer) != vk.success) {
+            return Error.FramebufferCreationFailed;
+        }
+        const pass = DepthPass{
+            .depth_view = depth.view,
+            .depth_format = depth.target.format,
+            .render_pass = render_pass,
+            .framebuffer = framebuffer,
+        };
+        self.render_targets.items[target_index].depth_pass = pass;
+        return pass;
+    }
+
     fn guestGraphicsState(render: *const gpu.RenderState, target: gpu.resources.ColorTarget) Error!GraphicsPipelineState {
         var result = GraphicsPipelineState.default(target.width, target.height);
         if (render.viewport) |viewport| {
@@ -4214,6 +4503,11 @@ pub const Renderer = struct {
             .attachment_count = 1,
             .attachments = @ptrCast(&blend_attachment),
         };
+        const depth_stencil = vk.PipelineDepthStencilStateCreateInfo{
+            .depth_test_enable = pipeline_state.depth_test_enable,
+            .depth_write_enable = pipeline_state.depth_write_enable,
+            .depth_compare_operation = pipeline_state.depth_compare_operation,
+        };
         const info = vk.GraphicsPipelineCreateInfo{
             .stage_count = stages.len,
             .stages = &stages,
@@ -4222,6 +4516,7 @@ pub const Renderer = struct {
             .viewport_state = &viewport_state,
             .rasterization_state = &rasterization,
             .multisample_state = &multisample,
+            .depth_stencil_state = if (pipeline_state.depth_attachment_format != 0) &depth_stencil else null,
             .color_blend_state = &color_blend,
             .layout = self.compute_pipeline_layout,
             .render_pass = render_pass,
@@ -4851,10 +5146,22 @@ pub const Renderer = struct {
     }
 
     fn destroyCachedRenderTarget(self: *Renderer, target: CachedRenderTarget) void {
+        self.destroyDepthPass(target.depth_pass);
         self.device_functions.destroy_framebuffer(self.device, target.framebuffer, null);
         self.device_functions.destroy_render_pass(self.device, target.render_pass, null);
         self.device_functions.destroy_image_view(self.device, target.view, null);
         self.destroyBuffer(target.readback);
+        self.destroyImage(target.image);
+    }
+
+    fn destroyDepthPass(self: *Renderer, pass: ?DepthPass) void {
+        const active = pass orelse return;
+        self.device_functions.destroy_framebuffer(self.device, active.framebuffer, null);
+        self.device_functions.destroy_render_pass(self.device, active.render_pass, null);
+    }
+
+    fn destroyCachedDepthTarget(self: *Renderer, target: CachedDepthTarget) void {
+        self.device_functions.destroy_image_view(self.device, target.view, null);
         self.destroyImage(target.image);
     }
 
@@ -4959,6 +5266,106 @@ pub const Renderer = struct {
             };
         }
         return null;
+    }
+
+    /// Reduces the bound depth registers to the plane a Vulkan attachment can
+    /// represent, or reports that this draw has no usable depth.
+    fn guestDepthTarget(descriptor: gpu.resources.DepthTarget) ?GuestDepthTarget {
+        const address = if (descriptor.write_address != 0)
+            descriptor.write_address
+        else
+            descriptor.read_address;
+        if (address == 0 or descriptor.width == 0 or descriptor.height == 0) return null;
+        // Multi-sample depth would have to resolve against a multi-sample colour
+        // attachment, and the colour path is still single-sample.
+        if (descriptor.samples_log2 != 0) return null;
+        const format = depthTargetFormat(descriptor) orelse return null;
+        return .{
+            .address = address,
+            .width = descriptor.width,
+            .height = descriptor.height,
+            .guest_format = descriptor.format,
+            .format = format,
+            .tile_mode = descriptor.tile_mode,
+            .base_array_slice = descriptor.base_array_slice,
+            .mip_level = descriptor.mip_level,
+            .clear_depth = descriptor.clear_depth,
+        };
+    }
+
+    fn createCachedDepthTarget(self: *Renderer, target: GuestDepthTarget) anyerror!CachedDepthTarget {
+        const image = try self.createImage(
+            target.width,
+            target.height,
+            target.format,
+            vk.image_usage_depth_stencil_attachment_bit | vk.image_usage_transfer_dst_bit,
+        );
+        errdefer self.destroyImage(image);
+
+        const view_info = vk.ImageViewCreateInfo{
+            .image = image.handle,
+            .format = target.format,
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_depth_bit },
+        };
+        var view: vk.ImageView = 0;
+        if (self.device_functions.create_image_view(self.device, &view_info, null, &view) != vk.success) {
+            return Error.ImageViewCreationFailed;
+        }
+        return .{ .target = target, .image = image, .view = view };
+    }
+
+    fn acquireDepthTarget(self: *Renderer, target: GuestDepthTarget) anyerror!usize {
+        for (self.depth_targets.items, 0..) |cached_snapshot, index| {
+            if (!cached_snapshot.target.sameAllocation(target)) continue;
+            const cached = &self.depth_targets.items[index];
+            // The clear value lives in its own register and moves without the
+            // allocation changing; keep the newest one for the next clear.
+            cached.target.clear_depth = target.clear_depth;
+            self.depth_target_sequence +%= 1;
+            cached.last_used_sequence = self.depth_target_sequence;
+            return index;
+        }
+
+        var cached = try self.createCachedDepthTarget(target);
+        self.depth_target_sequence +%= 1;
+        cached.last_used_sequence = self.depth_target_sequence;
+        if (self.depth_targets.items.len < maximum_depth_targets) {
+            try self.depth_targets.append(self.allocator, cached);
+            if (!self.reported_depth_attachment) {
+                self.reported_depth_attachment = true;
+                std.debug.print(
+                    "[vulkan dcb] depth attachment: first @0x{x} {d}x{d} format={d}\n",
+                    .{ target.address, target.width, target.height, target.guest_format },
+                );
+            }
+            return self.depth_targets.items.len - 1;
+        }
+
+        // Every draw is fenced before it returns, so the least-recently-used
+        // attachment cannot still be in flight when it is recycled.
+        var oldest_index: usize = 0;
+        var oldest_sequence = self.depth_targets.items[0].last_used_sequence;
+        for (self.depth_targets.items[1..], 1..) |entry, index| {
+            if (entry.last_used_sequence >= oldest_sequence) continue;
+            oldest_index = index;
+            oldest_sequence = entry.last_used_sequence;
+        }
+        const victim = &self.depth_targets.items[oldest_index];
+        self.invalidateDepthPasses(victim.view);
+        self.destroyCachedDepthTarget(victim.*);
+        victim.* = cached;
+        return oldest_index;
+    }
+
+    /// Drops any colour framebuffer still paired with a depth view that is
+    /// about to be destroyed.
+    fn invalidateDepthPasses(self: *Renderer, view: vk.ImageView) void {
+        for (self.render_targets.items) |*cached| {
+            const pass = cached.depth_pass orelse continue;
+            if (pass.depth_view != view) continue;
+            self.destroyDepthPass(pass);
+            cached.depth_pass = null;
+        }
     }
 
     fn acquireRenderTarget(self: *Renderer, target: GuestColorTarget) anyerror!usize {
@@ -5243,6 +5650,8 @@ pub const Renderer = struct {
         fragment_scalars: []const gpu.ShaderSpirvScalarRegister,
         pipeline_state: GraphicsPipelineState,
         target: GuestColorTarget,
+        depth: ?GuestDepthTarget,
+        depth_clear_requested: bool,
         bind_graphics_descriptors: bool,
         draw: GuestDraw,
     ) anyerror!void {
@@ -5315,8 +5724,18 @@ pub const Renderer = struct {
                 pipeline_state.blend_enable,
             },
         );
+        // A depth attachment changes the render pass a pipeline must be
+        // compatible with, so it has to be resolved before the pipeline is
+        // looked up rather than at the point the pass begins.
+        const depth_index: ?usize = if (depth) |plane| try self.acquireDepthTarget(plane) else null;
+        const depth_pass: ?DepthPass = if (depth_index) |index|
+            try self.acquireDepthPass(target_index, index)
+        else
+            null;
+        const pass_handle = if (depth_pass) |pass| pass.render_pass else cached_snapshot.render_pass;
+        const framebuffer_handle = if (depth_pass) |pass| pass.framebuffer else cached_snapshot.framebuffer;
         const pipeline = try self.getGraphicsPipeline(
-            cached_snapshot.render_pass,
+            pass_handle,
             pipeline_state,
             vertex_words,
             fragment_words,
@@ -5385,9 +5804,12 @@ pub const Renderer = struct {
             );
         }
 
+        if (depth_index) |index| {
+            self.prepareDepthAttachment(command_buffer, index, depth_clear_requested);
+        }
         const begin_info = vk.RenderPassBeginInfo{
-            .render_pass = cached_snapshot.render_pass,
-            .framebuffer = cached_snapshot.framebuffer,
+            .render_pass = pass_handle,
+            .framebuffer = framebuffer_handle,
             .render_area = .{
                 .offset = .{ .x = 0, .y = 0 },
                 .extent = .{ .width = pipeline_state.width, .height = pipeline_state.height },
@@ -5453,6 +5875,8 @@ pub const Renderer = struct {
         fragment_scalars: []const gpu.ShaderSpirvScalarRegister,
         pipeline_state: GraphicsPipelineState,
         guest_target: ?GuestColorTarget,
+        depth: ?GuestDepthTarget,
+        depth_clear_requested: bool,
         bind_graphics_descriptors: bool,
         validate_diagnostic_color: bool,
         draw: GuestDraw,
@@ -5465,6 +5889,8 @@ pub const Renderer = struct {
                 fragment_scalars,
                 pipeline_state,
                 target,
+                depth,
+                depth_clear_requested,
                 bind_graphics_descriptors,
                 draw,
             );
@@ -5948,6 +6374,8 @@ pub const Renderer = struct {
             &.{},
             GraphicsPipelineState.default(graphics_probe_width, graphics_probe_height),
             null,
+            null,
+            false,
             false,
             true,
             .{ .vertex_count = 3 },
@@ -5993,18 +6421,28 @@ pub const Renderer = struct {
                 );
             };
         }
-        // Depth testing and multi-MRT output are ignored here. Many title draws
-        // enable them; rejecting those draws would drop the whole colour path.
-        if (render_state.depth_control.test_enabled or render_state.depth_control.write_enabled or
-            (target_override == null and render_state.active_color_count != 1))
-        {
+        // Depth is attached only when the guest both binds a usable allocation
+        // and asks for the test or the write. A title that leaves stale DB
+        // registers bound while drawing its UI would otherwise pay for an
+        // attachment nothing reads. Multi-MRT output is still ignored: the
+        // attachment path carries one colour target.
+        const depth_wanted = render_state.depth_control.test_enabled or
+            render_state.depth_control.write_enabled or
+            render_state.depth_control.clear_enabled;
+        const depth_plane: ?GuestDepthTarget = if (depth_wanted)
+            if (render_state.depth_target) |bound| guestDepthTarget(bound) else null
+        else
+            null;
+        if (target_override == null and render_state.active_color_count != 1) {
             if (log_verbose_gpu) std.debug.print(
-                "[vulkan dcb] draw: ignoring depth/mrt extras (colors={d} depth_test={any} depth_write={any})\n",
-                .{
-                    render_state.active_color_count,
-                    render_state.depth_control.test_enabled,
-                    render_state.depth_control.write_enabled,
-                },
+                "[vulkan dcb] draw: ignoring extra colour targets (colors={d})\n",
+                .{render_state.active_color_count},
+            );
+        }
+        if (depth_wanted and depth_plane == null) {
+            if (log_verbose_gpu) std.debug.print(
+                "[vulkan dcb] draw: depth requested but not representable (bound={any})\n",
+                .{render_state.depth_target != null},
             );
         }
         var target_descriptor = target_override;
@@ -6047,6 +6485,13 @@ pub const Renderer = struct {
         var pipeline_state = try guestGraphicsState(&render_state, descriptor);
         pipeline_state.color_attachment_format = target.format.vulkan;
         pipeline_state.topology = guestPrimitiveTopology(render_state.primitive_type, draw);
+        if (depth_plane) |plane| {
+            pipeline_state.depth_attachment_format = plane.format;
+            pipeline_state.depth_test_enable = @intFromBool(render_state.depth_control.test_enabled);
+            pipeline_state.depth_write_enable = @intFromBool(render_state.depth_control.write_enabled);
+            pipeline_state.depth_compare_operation =
+                depthCompareOperation(render_state.depth_control.compare_function);
+        }
         const vertex_address = vertex_stage.programAddress(state) orelse {
             return Error.MissingGraphicsProgram;
         };
@@ -6682,6 +7127,8 @@ pub const Renderer = struct {
                     fragment_scalar_regs[0..fragment_scalar_count],
                     pipeline_state,
                     target,
+                    depth_plane,
+                    render_state.depth_control.clear_enabled,
                     graphics_resources.mapping_count != 0 or
                         vertex_storage.mapping_count != 0 or
                         fragment_storage.mapping_count != 0,
@@ -6789,6 +7236,8 @@ pub const Renderer = struct {
                 fragment_scalar_regs[0..fragment_scalar_count],
                 pipeline_state,
                 target,
+                depth_plane,
+                render_state.depth_control.clear_enabled,
                 graphics_resources.mapping_count != 0 or fragment_storage.mapping_count != 0,
                 false,
                 .{ .vertex_count = 3, .instance_count = 1 },
@@ -6834,6 +7283,8 @@ pub const Renderer = struct {
             fragment_scalar_regs[0..fragment_scalar_count],
             pipeline_state,
             target,
+            depth_plane,
+            render_state.depth_control.clear_enabled,
             graphics_resources.mapping_count != 0 or fragment_storage.mapping_count != 0,
             false,
             .{ .vertex_count = 3, .instance_count = 1 },
@@ -12287,4 +12738,73 @@ test "NGG auto rectangle uses a triangle strip topology" {
         vk.primitive_topology_triangle_list,
         guestPrimitiveTopology(4, .{ .vertex_count = 3 }),
     );
+}
+
+test "depth attachment formats follow the stored precision" {
+    var descriptor = std.mem.zeroes(gpu.resources.DepthTarget);
+    descriptor.format = 1;
+    try std.testing.expectEqual(@as(?u32, vk.format_d16_unorm), depthTargetFormat(descriptor));
+    descriptor.format = 3;
+    try std.testing.expectEqual(@as(?u32, vk.format_d32_sfloat), depthTargetFormat(descriptor));
+    // A precision this path cannot reproduce is refused rather than rounded to
+    // a nearby one, which would silently change which fragments survive.
+    descriptor.format = 2;
+    try std.testing.expectEqual(@as(?u32, null), depthTargetFormat(descriptor));
+}
+
+test "guest depth compare selectors map onto the host operations" {
+    // Both enumerations run never, less, equal, less-or-equal, greater,
+    // not-equal, greater-or-equal, always.
+    for (0..8) |function| {
+        try std.testing.expectEqual(
+            @as(u32, @intCast(function)),
+            depthCompareOperation(@intCast(function)),
+        );
+    }
+}
+
+test "a depth attachment is refused when it cannot back a single-sample pass" {
+    var descriptor = std.mem.zeroes(gpu.resources.DepthTarget);
+    descriptor.format = 3;
+    descriptor.width = 1920;
+    descriptor.height = 1080;
+    descriptor.write_address = 0x2000;
+
+    const plane = Renderer.guestDepthTarget(descriptor) orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(u64, 0x2000), plane.address);
+    try std.testing.expectEqual(vk.format_d32_sfloat, plane.format);
+
+    // Multi-sample depth would have to resolve against a multi-sample colour
+    // attachment, which the colour path does not create.
+    var multisample = descriptor;
+    multisample.samples_log2 = 2;
+    try std.testing.expect(Renderer.guestDepthTarget(multisample) == null);
+
+    // Read-only bindings still name the allocation through the read address.
+    var read_only = descriptor;
+    read_only.write_address = 0;
+    read_only.read_address = 0x3000;
+    const fallback = Renderer.guestDepthTarget(read_only) orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(u64, 0x3000), fallback.address);
+}
+
+test "depth allocations compare by surface, not by clear value" {
+    const base = GuestDepthTarget{
+        .address = 0x4000,
+        .width = 1280,
+        .height = 720,
+        .guest_format = 3,
+        .format = vk.format_d32_sfloat,
+        .tile_mode = .depth,
+        .base_array_slice = 0,
+        .mip_level = 0,
+        .clear_depth = 1.0,
+    };
+    var recleared = base;
+    recleared.clear_depth = 0.0;
+    try std.testing.expect(base.sameAllocation(recleared));
+
+    var resized = base;
+    resized.height = 1080;
+    try std.testing.expect(!base.sameAllocation(resized));
 }
