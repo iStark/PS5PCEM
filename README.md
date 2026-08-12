@@ -1898,7 +1898,14 @@ scheduler and Vulkan backend. Observed startup work now includes:
   guest-visible ordering contract.
 - Sampled images use a 32-entry content-aware LRU, and the graphics-pipeline
   cache recycles its least-recently-used entry instead of dropping later draws
-  after reaching its fixed capacity.
+  after reaching its fixed capacity. Colour attachments now recycle on the same
+  terms. Refusing them once the bound was reached froze the cache on whichever
+  allocations it happened to see first, so a scene working through more
+  attachments than the bound had its later draws dropped and never recovered:
+  Rita's Rewind reached gameplay issuing over five hundred draws a frame of
+  which eighteen still found a target. A recycled attachment owes its contents
+  to the guest, so it is published before it goes away and a later sample or
+  flip still reads what was drawn into it.
 - Compact per-frame profiling replaces high-frequency default logging; verbose
   resource probes remain opt-in through `log_verbose_gpu`. A second profile line
   reports pipeline and shader-analysis cache behaviour alongside the time spent

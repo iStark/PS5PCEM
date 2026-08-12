@@ -5454,6 +5454,37 @@ pub const Renderer = struct {
         }
     }
 
+    /// Frees the slot of the least-recently-used colour attachment.
+    ///
+    /// Without this the cache froze on whichever allocations it happened to see
+    /// first: once full it refused every later target outright, so a scene that
+    /// works through more attachments than the bound has draws silently dropped
+    /// from that point on and never recovers. Every other resource cache here
+    /// recycles instead, and colour targets only differ in owing their contents
+    /// to the guest — so the victim is published before it goes away, and a
+    /// later sample or flip still reads what was drawn into it.
+    ///
+    /// Every draw is fenced before it returns, so the recycled attachment
+    /// cannot still be executing.
+    fn evictRenderTarget(self: *Renderer) anyerror!usize {
+        var oldest_index: usize = 0;
+        var oldest_sequence = self.render_targets.items[0].last_used_sequence;
+        for (self.render_targets.items[1..], 1..) |entry, index| {
+            if (entry.last_used_sequence >= oldest_sequence) continue;
+            oldest_index = index;
+            oldest_sequence = entry.last_used_sequence;
+        }
+        try self.materializeRenderTarget(oldest_index);
+        const victim = self.render_targets.items[oldest_index];
+        self.destroyCachedRenderTarget(victim);
+        // The evicted slot is about to hold an unrelated attachment, so a
+        // recorded "most recent" index pointing at it would name the wrong one.
+        if (self.latest_render_target_index) |latest| {
+            if (latest == oldest_index) self.latest_render_target_index = null;
+        }
+        return oldest_index;
+    }
+
     fn acquireRenderTarget(self: *Renderer, target: GuestColorTarget) anyerror!usize {
         for (self.render_targets.items, 0..) |cached_snapshot, index| {
             if (!sameRenderTarget(cached_snapshot.target, target)) continue;
@@ -5472,11 +5503,16 @@ pub const Renderer = struct {
             self.frame_profile.render_target_hits += 1;
             return index;
         }
-        if (self.render_targets.items.len >= maximum_render_targets) return Error.RenderTargetCacheFull;
-        try self.render_targets.ensureUnusedCapacity(self.allocator, 1);
         var cached = try self.createCachedRenderTarget(target);
         self.render_target_sequence +%= 1;
         cached.last_used_sequence = self.render_target_sequence;
+        if (self.render_targets.items.len >= maximum_render_targets) {
+            const victim_index = try self.evictRenderTarget();
+            self.render_targets.items[victim_index] = cached;
+            self.frame_profile.render_target_misses += 1;
+            return victim_index;
+        }
+        try self.render_targets.ensureUnusedCapacity(self.allocator, 1);
         self.render_targets.appendAssumeCapacity(cached);
         self.frame_profile.render_target_misses += 1;
         if (self.render_targets.items.len == 1) {
