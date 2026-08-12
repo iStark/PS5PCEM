@@ -15,6 +15,7 @@ pub const trace = @import("trace.zig");
 pub const unwind = @import("unwind.zig");
 pub const modules = @import("modules.zig");
 pub const filesystem = @import("filesystem.zig");
+pub const savedata = @import("savedata.zig");
 pub const host_stack = @import("host_stack.zig");
 pub const video_out = @import("video_out.zig");
 pub const graphics_device = @import("graphics_device.zig");
@@ -104,6 +105,7 @@ test {
     _ = unwind;
     _ = modules;
     _ = filesystem;
+    _ = savedata;
     _ = host_stack;
     _ = video_out;
     _ = graphics_device;

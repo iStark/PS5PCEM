@@ -21,6 +21,36 @@ const usage =
     \\
 ;
 
+/// Prepares the directory a title's saved games live in and tells the firmware
+/// which title is running.
+///
+/// The root sits beside the emulator rather than inside the game, because a
+/// title's installation is read-only, may be on removable media, and is
+/// replaced wholesale when it is patched; a save must outlive all three. The
+/// identifier comes from what the title publishes about itself, so two dumps of
+/// the same game share their saves and two different games never do.
+fn openSaveDataHome(io: std.Io, content: std.Io.Dir) !std.Io.Dir {
+    var identifier_storage: [runtime.firmware.savedata.maximum_slot_name]u8 = undefined;
+    const identifier = readTitleIdentifier(io, content, &identifier_storage) orelse
+        "unknown-title";
+
+    const cwd = std.Io.Dir.cwd();
+    cwd.createDirPath(io, save_data_home) catch {};
+    const home = try cwd.openDir(io, save_data_home, .{});
+    runtime.firmware.filesystem.attachSaveDataHome(home, identifier);
+    return home;
+}
+
+const save_data_home = "savedata";
+
+/// Reads the product code a title publishes in its own parameter document.
+fn readTitleIdentifier(io: std.Io, content: std.Io.Dir, storage: []u8) ?[]const u8 {
+    const savedata = runtime.firmware.savedata;
+    var document: [8192]u8 = undefined;
+    const text = content.readFile(io, savedata.title_parameter_path, &document) catch return null;
+    return savedata.findJsonString(text, "titleId", storage);
+}
+
 fn reportUnresolvedImport(_: ?*anyopaque, diagnostic: runtime.module_graph.UnresolvedImport) void {
     std.debug.print("  unresolved {s}: {s} {s} {s}\n", .{
         diagnostic.path,
@@ -234,6 +264,10 @@ fn run(init: std.process.Init) !bool {
     defer content.close(io);
     runtime.firmware.filesystem.attach(io, content);
     defer runtime.firmware.filesystem.detach();
+
+    var saves = openSaveDataHome(io, content) catch null;
+    defer if (saves) |*directory| directory.close(io);
+    defer runtime.firmware.filesystem.unmountSaveData();
 
     // A contained fault prints the retained calls afterwards, but a process
     // that dies outright takes the buffer with it. This is the escape hatch for

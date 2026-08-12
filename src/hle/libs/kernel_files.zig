@@ -36,6 +36,7 @@ fn kernelStatus(err: Error) i32 {
         Error.InvalidArgument => KernelError.einval.raw(),
         Error.IoFailed => KernelError.eio.raw(),
         Error.NotSupported => KernelError.enodev.raw(),
+        Error.Exists => KernelError.eexist.raw(),
     };
 }
 
@@ -51,6 +52,7 @@ fn posixNumber(err: Error) i32 {
         Error.InvalidArgument => errno.Posix.einval,
         Error.IoFailed => errno.Posix.eio,
         Error.NotSupported => errno.Posix.enodev,
+        Error.Exists => errno.Posix.eexist,
     };
 }
 

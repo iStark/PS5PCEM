@@ -25,6 +25,9 @@ If you would like to support continued PS5PCEM development, you can do so on
   guest buffers at 48 kHz. SceAvPlayer uses FFmpeg for H.264/AAC media and
   returns synchronized NV12 video plus stereo PCM through the title's own
   allocation and file callbacks.
+- Titles can save. A mounted slot becomes a writable `/savedata0`, so a game
+  stores its progress through the ordinary file API and finds it again on the
+  next run; the launcher lists what each title has written.
 - A native Windows launcher selects a title directory, persists sound and input
   profiles, and starts `game-run` with controller, keyboard, or hybrid controls.
   Sony's own pads are read directly over HID, so a DualSense or DualShock 4
@@ -214,7 +217,7 @@ Eleven modules cover the independent subsystems and their end-to-end composition
 | **`window`** | Owns the native host window and its platform message loop |
 | **`input`** | Reads Sony pads over HID, falls back to XInput, polls the host keyboard, and applies launcher remapping profiles |
 | **`loader`** | Reads, maps, and relocates bare ELF64 and decrypted PS5 SELF module images |
-| **`hle`** | High-level emulation of guest firmware, files, memory, synchronization, media, network, and platform services |
+| **`hle`** | High-level emulation of guest firmware, files, saved games, memory, synchronization, media, network, and platform services |
 | **`cpu`** | Dispatches guest execution and provides the Windows x86-64 native machine bridge |
 | **`diag`** | Attributes guest addresses to modules and explains contained faults |
 | **`runtime`** | Composes memory, loader, HLE, and the optional CPU execution path |
@@ -278,6 +281,28 @@ Alt plus the arrow keys controls the right stick. The launcher passes these pref
 `PS5_INPUT_MODE`, `PS5_CONTROLLER_INDEX`, `PS5_KEYMAP`, `PS5_SHOW_FPS`, and
 `PS5_AUDIO_DISABLED`, so direct CLI and automated runs keep their previous
 behaviour unless those variables are set.
+
+Saved games are kept beside the emulator in `savedata/<titleId>/<slot>/`, keyed
+by the product code the title publishes about itself. That is deliberate: a
+title's installation is read-only, can sit on removable media and is replaced
+wholesale when it is patched, so a save must outlive all three, and keying by
+the published identifier means two dumps of the same game share their saves
+while two different games never do. The slot name comes from the guest, so it is
+sanitized before it becomes a directory: separators, the drive colon and parent
+links become underscores rather than being dropped, since dropping them would
+let two distinct names collapse onto one and overwrite each other's saves. A
+name that cannot be a directory at all falls back to a fixed one instead of
+failing the mount, because losing the save is worse than putting it somewhere
+predictable.
+
+A mount resolves the slot and points `/savedata0` at it; the title's own files
+are then written through the ordinary file API. Mounting a slot that does not
+exist reports it missing unless the title asked for one to be created, because a
+title probing for a save it never wrote expects to be told so rather than handed
+an empty one. Everything a title ships stays read-only; the save mount is the
+one place writing is allowed. The block-shaped save API is backed by a separate
+per-title blob under `sce_sdmemory`, loaded when the title reserves it and
+written when the title asks for it to be synchronized.
 
 XInput cannot enumerate Sony's controllers at all: it reports only
 Xbox-compatible devices, so a pad plugged straight into the host is invisible to

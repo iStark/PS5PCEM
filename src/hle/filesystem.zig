@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const audio_fs = @import("audio_fs.zig");
+const savedata = @import("savedata.zig");
 
 /// Descriptors below this belong to the standard streams.
 pub const first_descriptor: i32 = 3;
@@ -36,6 +37,8 @@ pub const Error = error{
     /// The descriptor names a device, which is not driven by reading and
     /// writing it.
     NotSupported,
+    /// An exclusive create found the file already there.
+    Exists,
 };
 
 /// Devices a title can open by name.
@@ -216,8 +219,23 @@ comptime {
     std.debug.assert(@offsetOf(Stat, "mode") == 8);
 }
 
+/// Which host directory a mount point resolves against.
+///
+/// Everything a title ships is read-only and lives together; its saves are
+/// writable, outlive the installation and are keyed by the title rather than
+/// stored beside it. They are therefore two separate host directories, and a
+/// path has to say which one it means before it can be resolved.
+pub const Mount = enum { title, savedata };
+
+const MountPoint = struct { prefix: []const u8, mount: Mount };
+
 /// Mount points a title uses to name its own files.
-const mount_points = [_][]const u8{ "/app0/", "/hostapp/", "/host/" };
+const mount_points = [_]MountPoint{
+    .{ .prefix = "/app0/", .mount = .title },
+    .{ .prefix = "/hostapp/", .mount = .title },
+    .{ .prefix = "/host/", .mount = .title },
+    .{ .prefix = "/savedata0/", .mount = .savedata },
+};
 
 /// Whether a path names a mount itself rather than one of its children.
 ///
@@ -226,12 +244,26 @@ const mount_points = [_][]const u8{ "/app0/", "/hostapp/", "/host/" };
 /// runtimes commonly stat every parent before opening a file; reporting
 /// `/app0` missing makes an existing `/app0/content.txt` look unreachable.
 fn isMountRoot(path: []const u8) bool {
-    for (mount_points) |mount| {
-        const without_slash = mount[0 .. mount.len - 1];
+    for (mount_points) |point| {
+        const without_slash = point.prefix[0 .. point.prefix.len - 1];
         if (std.ascii.eqlIgnoreCase(path, without_slash) or
-            std.ascii.eqlIgnoreCase(path, mount)) return true;
+            std.ascii.eqlIgnoreCase(path, point.prefix)) return true;
     }
     return false;
+}
+
+/// Which host directory a guest path resolves against.
+///
+/// Anything that names no mount is a path relative to the title's own files,
+/// which is how the loader refers to them.
+pub fn mountOf(path: []const u8) Mount {
+    for (mount_points) |point| {
+        const without_slash = point.prefix[0 .. point.prefix.len - 1];
+        if (path.len >= point.prefix.len and
+            std.ascii.eqlIgnoreCase(path[0..point.prefix.len], point.prefix)) return point.mount;
+        if (std.ascii.eqlIgnoreCase(path, without_slash)) return point.mount;
+    }
+    return .title;
 }
 
 /// Strips a mount prefix, yielding a path relative to the title root.
@@ -240,9 +272,11 @@ fn isMountRoot(path: []const u8) bool {
 /// ships is visible, and quietly resolving anything else against the host
 /// filesystem would expose more than a title can see on hardware.
 pub fn stripMount(path: []const u8) ?[]const u8 {
-    for (mount_points) |mount| {
-        if (path.len >= mount.len and std.ascii.eqlIgnoreCase(path[0..mount.len], mount)) {
-            const rest = path[mount.len..];
+    for (mount_points) |point| {
+        if (path.len >= point.prefix.len and
+            std.ascii.eqlIgnoreCase(path[0..point.prefix.len], point.prefix))
+        {
+            const rest = path[point.prefix.len..];
             return if (rest.len == 0) null else rest;
         }
     }
@@ -331,6 +365,8 @@ const OpenFile = struct {
     /// An offline POSIX socket. It owns only a descriptor slot; network
     /// operations decide whether to acknowledge local state or report ENETDOWN.
     virtual_socket: bool = false,
+    /// Set for a descriptor inside the writable save mount.
+    writable: bool = false,
     /// `/devlog/app/debug.log`, redirected outside the read-only title mount.
     diagnostic_log: bool = false,
     /// In-memory `/devlog` directory; it owns no host directory handle.
@@ -369,6 +405,10 @@ const Lock = struct {
 
 var active_io: ?std.Io = null;
 var root: ?std.Io.Dir = null;
+/// Where `/savedata0` resolves. Absent until a title's save directory has been
+/// prepared, which is what keeps a title without one from writing into its own
+/// installation.
+var savedata_root: ?std.Io.Dir = null;
 var open_files: [maximum_open_files]?OpenFile = @splat(null);
 var table_lock: Lock = .{};
 var virtual_socket_signal: std.atomic.Value(u8) = .init(0);
@@ -380,6 +420,129 @@ pub fn attach(io: std.Io, directory: std.Io.Dir) void {
     active_io = io;
     root = directory;
     virtual_socket_signal.store(0, .release);
+}
+
+/// Makes a host directory visible to the title as `/savedata0`.
+pub fn attachSaveData(directory: std.Io.Dir) void {
+    table_lock.lock();
+    defer table_lock.unlock();
+    savedata_root = directory;
+}
+
+/// The host directory a mount resolves against, if one is attached.
+fn rootFor(mount: Mount) ?std.Io.Dir {
+    return switch (mount) {
+        .title => root,
+        .savedata => savedata_root,
+    };
+}
+
+pub fn attachedSaveDataRoot() ?std.Io.Dir {
+    return savedata_root;
+}
+
+/// Where every title's saves are kept, and which title is running.
+///
+/// Set once at startup. The directory is opened rather than kept as a path so a
+/// mount cannot be redirected by anything that renames the tree underneath it.
+var savedata_home: ?std.Io.Dir = null;
+var title_identifier_storage: [savedata.maximum_slot_name]u8 = undefined;
+var title_identifier_length: usize = 0;
+
+pub fn attachSaveDataHome(directory: std.Io.Dir, title_id: []const u8) void {
+    table_lock.lock();
+    defer table_lock.unlock();
+    savedata_home = directory;
+    title_identifier_length = @min(title_id.len, title_identifier_storage.len);
+    @memcpy(title_identifier_storage[0..title_identifier_length], title_id[0..title_identifier_length]);
+}
+
+pub fn titleIdentifier() []const u8 {
+    return title_identifier_storage[0..title_identifier_length];
+}
+
+/// Points `/savedata0` at one slot of the running title.
+///
+/// Answers false when the slot does not exist and the title did not ask for one
+/// to be made: a title probing for a save it has never written expects to be
+/// told so, and inventing an empty slot would have it load a save that was
+/// never there.
+pub fn mountSaveDataSlot(slot: []const u8, may_create: bool) Error!bool {
+    const io = active_io orelse return Error.NotAttached;
+    const home = savedata_home orelse return Error.NotAttached;
+
+    var slot_storage: [savedata.maximum_slot_name]u8 = undefined;
+    const safe_slot = savedata.sanitizeName(slot, &slot_storage);
+    var identifier_storage: [savedata.maximum_slot_name]u8 = undefined;
+    const safe_title = savedata.sanitizeName(titleIdentifier(), &identifier_storage);
+
+    var path_storage: [maximum_path]u8 = undefined;
+    const relative = savedata.joinPath(&path_storage, &.{ safe_title, safe_slot }) orelse
+        return Error.InvalidArgument;
+
+    const directory = home.openDir(io, relative, .{ .iterate = true }) catch |err| blk: {
+        switch (err) {
+            error.FileNotFound, error.NotDir, error.BadPathName => {},
+            else => return Error.IoFailed,
+        }
+        if (!may_create) return false;
+        home.createDirPath(io, relative) catch return Error.IoFailed;
+        break :blk home.openDir(io, relative, .{ .iterate = true }) catch return Error.IoFailed;
+    };
+
+    table_lock.lock();
+    defer table_lock.unlock();
+    if (savedata_root) |previous| previous.close(io);
+    savedata_root = directory;
+    return true;
+}
+
+/// Fills a buffer from the title's memory-backed save, leaving it untouched
+/// where none has been stored yet.
+pub fn readSaveDataMemory(buffer: []u8) void {
+    const io = active_io orelse return;
+    const home = savedata_home orelse return;
+    var path_storage: [maximum_path]u8 = undefined;
+    const relative = saveDataMemoryPath(&path_storage) orelse return;
+    _ = home.readFile(io, relative, buffer) catch return;
+}
+
+/// Stores the title's memory-backed save.
+pub fn writeSaveDataMemory(buffer: []const u8) Error!void {
+    const io = active_io orelse return Error.NotAttached;
+    const home = savedata_home orelse return Error.NotAttached;
+    var identifier_storage: [savedata.maximum_slot_name]u8 = undefined;
+    const safe_title = savedata.sanitizeName(titleIdentifier(), &identifier_storage);
+    var directory_storage: [maximum_path]u8 = undefined;
+    const directory = savedata.joinPath(&directory_storage, &.{ safe_title, savedata.memory_directory }) orelse
+        return Error.InvalidArgument;
+    home.createDirPath(io, directory) catch return Error.IoFailed;
+
+    var path_storage: [maximum_path]u8 = undefined;
+    const relative = saveDataMemoryPath(&path_storage) orelse return Error.InvalidArgument;
+    const file = home.createFile(io, relative, .{ .truncate = true }) catch return Error.IoFailed;
+    defer file.close(io);
+    file.writeStreamingAll(io, buffer) catch return Error.IoFailed;
+}
+
+fn saveDataMemoryPath(storage: *[maximum_path]u8) ?[]const u8 {
+    var identifier_storage: [savedata.maximum_slot_name]u8 = undefined;
+    const safe_title = savedata.sanitizeName(titleIdentifier(), &identifier_storage);
+    return savedata.joinPath(storage, &.{
+        safe_title,
+        savedata.memory_directory,
+        savedata.memory_file,
+    });
+}
+
+/// Stops `/savedata0` resolving. The files themselves are already on disk.
+pub fn unmountSaveData() void {
+    table_lock.lock();
+    defer table_lock.unlock();
+    if (savedata_root) |directory| {
+        if (active_io) |io| directory.close(io);
+    }
+    savedata_root = null;
 }
 
 /// Closes everything still open and detaches the mount.
@@ -460,22 +623,32 @@ pub fn open(path: []const u8, flags: i32) Error!i32 {
     }
     if (isDevlogFile(path)) return openDevlog(path, flags);
 
-    // Creation flags are refused everywhere, devices included: a title asking
-    // to create `/dev/gc` has misunderstood something, and answering it would
-    // hide that.
-    if (flags & (O.creat | O.trunc | O.excl) != 0) return Error.ReadOnly;
-    if (deviceForPath(path)) |device| return openDevice(device, path);
+    if (deviceForPath(path)) |device| {
+        // A title asking to create `/dev/gc` has misunderstood something, and
+        // answering it would hide that.
+        if (flags & (O.creat | O.trunc | O.excl) != 0) return Error.ReadOnly;
+        return openDevice(device, path);
+    }
 
     const io = active_io orelse return Error.NotAttached;
-    const directory = root orelse return Error.NotAttached;
+    const mount = mountOf(path);
+    const directory = rootFor(mount) orelse return Error.NotAttached;
 
-    if (flags & O.accmode != O.rdonly) return Error.ReadOnly;
-    if (flags & (O.creat | O.trunc | O.excl | O.append) != 0) return Error.ReadOnly;
+    // Everything a title ships stays read-only; its saves are the one place it
+    // is allowed to write, and refusing that is what made saved games
+    // impossible rather than merely unimplemented.
+    if (mount != .savedata) {
+        if (flags & (O.creat | O.trunc | O.excl) != 0) return Error.ReadOnly;
+        if (flags & O.accmode != O.rdonly) return Error.ReadOnly;
+        if (flags & O.append != 0) return Error.ReadOnly;
+    }
 
     var relative_storage: [maximum_path]u8 = undefined;
     const relative = normalizedMountRelative(path, &relative_storage) orelse return Error.NotFound;
 
     if (flags & O.directory != 0) return openDirectory(path, relative, io, directory);
+
+    if (mount == .savedata) return openSaveDataFile(path, relative, flags, io, directory);
 
     const file = directory.openFile(io, relative, .{}) catch |err| switch (err) {
         error.FileNotFound, error.NotDir, error.BadPathName => {
@@ -549,11 +722,78 @@ fn openDevlog(path: []const u8, flags: i32) Error!i32 {
     return Error.TooManyOpenFiles;
 }
 
-/// Accepts only the diagnostic directories; all title/save-data paths retain
-/// the read-only policy until a real writable mount is implemented.
+/// Opens a file inside the writable save mount, creating it when asked.
+fn openSaveDataFile(
+    path: []const u8,
+    relative: []const u8,
+    flags: i32,
+    io: std.Io,
+    directory: std.Io.Dir,
+) Error!i32 {
+    const writing = flags & O.accmode != O.rdonly;
+    const create = flags & O.creat != 0;
+    const truncate = flags & O.trunc != 0;
+
+    if (create) ensureParentDirectory(relative, io, directory);
+    const file = if (create)
+        directory.createFile(io, relative, .{
+            .read = true,
+            .truncate = truncate,
+            .exclusive = flags & O.excl != 0,
+        }) catch |err| switch (err) {
+            error.PathAlreadyExists => return Error.Exists,
+            else => return Error.IoFailed,
+        }
+    else
+        directory.openFile(io, relative, .{
+            .mode = if (writing) .read_write else .read_only,
+        }) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir, error.BadPathName => return Error.NotFound,
+            error.IsDir => return openDirectory(path, relative, io, directory),
+            else => return Error.IoFailed,
+        };
+    errdefer file.close(io);
+
+    const size = if (create and truncate) 0 else file.length(io) catch return Error.IoFailed;
+
+    table_lock.lock();
+    defer table_lock.unlock();
+    for (&open_files, 0..) |*slot, index| {
+        if (slot.* != null) continue;
+        var entry = OpenFile{ .file = file, .size = size, .writable = writing };
+        // Appending starts at the end; a title reopening its save to add to it
+        // must not overwrite what it wrote last time.
+        if (flags & O.append != 0) entry.offset = size;
+        entry.path_length = @min(path.len, maximum_path);
+        @memcpy(entry.path_buffer[0..entry.path_length], path[0..entry.path_length]);
+        slot.* = entry;
+        return first_descriptor + @as(i32, @intCast(index));
+    }
+    return Error.TooManyOpenFiles;
+}
+
+/// Creates the directories leading to a file a title is about to write.
+///
+/// A title that mounts a save and immediately opens `data/progress.bin` expects
+/// the mount to have made the path usable. Failing here is not reported: the
+/// create that follows produces the real error if the path is genuinely bad.
+fn ensureParentDirectory(relative: []const u8, io: std.Io, directory: std.Io.Dir) void {
+    const separator = std.mem.lastIndexOfAny(u8, relative, "/\\") orelse return;
+    if (separator == 0) return;
+    directory.createDirPath(io, relative[0..separator]) catch {};
+}
+
+/// Creates a directory inside the writable save mount, or accepts the
+/// diagnostic directories. Everything a title ships stays read-only.
 pub fn makeDirectory(path: []const u8) Error!void {
     if (isDevlogDirectory(path)) return;
-    return Error.ReadOnly;
+    if (mountOf(path) != .savedata) return Error.ReadOnly;
+    const io = active_io orelse return Error.NotAttached;
+    const directory = savedata_root orelse return Error.NotAttached;
+    var relative_storage: [maximum_path]u8 = undefined;
+    const relative = normalizedMountRelative(path, &relative_storage) orelse return Error.NotFound;
+    if (std.mem.eql(u8, relative, ".")) return;
+    directory.createDirPath(io, relative) catch return Error.IoFailed;
 }
 
 fn openDirectory(
@@ -802,7 +1042,7 @@ pub fn write(descriptor: i32, buffer: []const u8) Error!usize {
         table_lock.unlock();
         return Error.BadDescriptor;
     };
-    if (!entry.diagnostic_log) {
+    if (!entry.diagnostic_log and !entry.writable) {
         table_lock.unlock();
         return Error.ReadOnly;
     }

@@ -23,7 +23,7 @@ const window_width = 1180;
 const window_height = 760;
 const sidebar_width = 222;
 
-const Page = enum { library, input, settings };
+const Page = enum { library, input, saves, settings };
 const InputMode = enum(u8) { controller = 0, keyboard = 1, hybrid = 2 };
 const Language = enum(u8) { english = 0, russian = 1, german = 2, french = 3 };
 
@@ -75,6 +75,11 @@ const Phrase = enum {
     author,
     browse_dialog,
     pad_searching,
+    nav_saves,
+    saves_heading,
+    saves_subtitle,
+    saves_empty,
+    saves_open_folder,
     pad_test,
     pad_test_unavailable,
     pad_absent,
@@ -130,6 +135,10 @@ var mapping = mapping_defaults;
 var capture_mapping: ?usize = null;
 var game_folder: [1024]u16 = [_]u16{0} ** 1024;
 var game_folder_length: usize = 0;
+/// The product code the selected title publishes about itself. Saves are keyed
+/// by it, so without one there is no directory to show.
+var title_identifier: [32]u16 = @splat(0);
+var title_identifier_length: usize = 0;
 var status_text: [256]u16 = [_]u16{0} ** 256;
 var status_length: usize = 0;
 var status_error = false;
@@ -189,6 +198,16 @@ fn tr(phrase: Phrase) []const u8 {
             .compatibility_text => "PS5PCEM is at an early stage. Not every title boots yet; advanced DualSense features, native PS5 keyboard/mouse and controller-to-keyboard conversion still need more HLE support.",
             .author => "Author: Artur Strazewicz · GitHub: iStark/PS5PCEM",
             .browse_dialog => "Choose the folder containing a decrypted PS5 game",
+            .nav_saves => "Saves"
+            ,
+            .saves_heading => "Saved games"
+            ,
+            .saves_subtitle => "What the selected title has written. Saves live beside the emulator and survive reinstalling the game."
+            ,
+            .saves_empty => "This title has not written a save yet"
+            ,
+            .saves_open_folder => "Open folder"
+            ,
             .pad_test => "Test",
             .pad_test_unavailable => "Controller cannot be driven",
             .pad_searching => "Searching for a controller",
@@ -255,6 +274,16 @@ fn tr(phrase: Phrase) []const u8 {
             .compatibility_text => "PS5PCEM находится на ранней стадии. Не все игры загружаются; функции DualSense, нативные PS5-клавиатура/мышь и преобразование геймпада в клавиши требуют дальнейшей HLE-поддержки.",
             .author => "Автор: Artur Strazewicz · GitHub: iStark/PS5PCEM",
             .browse_dialog => "Выберите папку с расшифрованной игрой PS5",
+            .nav_saves => "Сохранения"
+            ,
+            .saves_heading => "Сохранения"
+            ,
+            .saves_subtitle => "Что записала выбранная игра. Сохранения лежат рядом с эмулятором и переживают переустановку игры."
+            ,
+            .saves_empty => "Эта игра ещё ничего не сохраняла"
+            ,
+            .saves_open_folder => "Открыть папку"
+            ,
             .pad_test => "Тест",
             .pad_test_unavailable => "Контроллер недоступен для управления",
             .pad_searching => "Поиск контроллера",
@@ -321,6 +350,11 @@ fn tr(phrase: Phrase) []const u8 {
             .compatibility_text => "PS5PCEM ist in einer frühen Phase. Nicht jedes Spiel startet; erweiterte DualSense-Funktionen, native PS5-Tastatur/Maus und Controller-zu-Tastatur benötigen weitere HLE-Unterstützung.",
             .author => "Autor: Artur Strazewicz · GitHub: iStark/PS5PCEM",
             .browse_dialog => "Ordner mit dem entschlüsselten PS5-Spiel wählen",
+            .nav_saves => "Speicherstände",
+            .saves_heading => "Speicherstände",
+            .saves_subtitle => "Was der gewählte Titel geschrieben hat. Speicherstände liegen neben dem Emulator.",
+            .saves_empty => "Dieser Titel hat noch nichts gespeichert",
+            .saves_open_folder => "Ordner öffnen",
             .pad_test => "Test",
             .pad_test_unavailable => "Controller nicht ansteuerbar",
             .pad_searching => "Controller wird gesucht",
@@ -387,6 +421,11 @@ fn tr(phrase: Phrase) []const u8 {
             .compatibility_text => "PS5PCEM est encore expérimental. Tous les jeux ne démarrent pas ; les fonctions DualSense avancées, le clavier/souris PS5 natif et la conversion manette-clavier demandent davantage de prise en charge HLE.",
             .author => "Auteur : Artur Strazewicz · GitHub : iStark/PS5PCEM",
             .browse_dialog => "Choisissez le dossier du jeu PS5 déchiffré",
+            .nav_saves => "Sauvegardes",
+            .saves_heading => "Sauvegardes",
+            .saves_subtitle => "Ce que le titre sélectionné a écrit. Les sauvegardes résident à côté de l’émulateur.",
+            .saves_empty => "Ce titre n’a encore rien sauvegardé",
+            .saves_open_folder => "Ouvrir le dossier",
             .pad_test => "Test",
             .pad_test_unavailable => "Manette non pilotable",
             .pad_searching => "Recherche d'une manette",
@@ -568,6 +607,7 @@ const nav_rects = [_]Rect{
     .{ .left = 20, .top = 126, .right = 202, .bottom = 174 },
     .{ .left = 20, .top = 184, .right = 202, .bottom = 232 },
     .{ .left = 20, .top = 242, .right = 202, .bottom = 290 },
+    .{ .left = 20, .top = 300, .right = 202, .bottom = 348 },
     .{ .left = 20, .top = 626, .right = 202, .bottom = 670 },
     .{ .left = 20, .top = 680, .right = 202, .bottom = 724 },
 };
@@ -639,6 +679,7 @@ fn clickableAt(x: i32, y: i32) bool {
             }
             break :blk false;
         },
+        .saves => saves_open_rect.contains(x, y),
         .settings => indexOfRect(&language_rects, x, y) != null or
             indexOfRect(&settings_toggle_rects, x, y) != null,
     };
@@ -649,13 +690,15 @@ fn handleClick(window: Win32.Window, x: i32, y: i32) void {
         switch (index) {
             0 => current_page = .library,
             1 => current_page = .input,
-            2 => current_page = .settings,
-            3 => openBoosty(window),
+            2 => current_page = .saves,
+            3 => current_page = .settings,
+            4 => openBoosty(window),
             else => openGithub(window),
         }
     } else switch (current_page) {
         .library => handleLibraryClick(window, x, y),
         .input => handleInputClick(x, y),
+        .saves => handleSavesClick(window, x, y),
         .settings => handleSettingsClick(x, y),
     }
     _ = Win32.InvalidateRect(window, null, 0);
@@ -745,6 +788,7 @@ fn paint(window: Win32.Window) void {
     switch (current_page) {
         .library => drawLibrary(dc),
         .input => drawInput(dc),
+        .saves => drawSaves(dc),
         .settings => drawSettings(dc),
     }
     drawFooter(dc);
@@ -760,7 +804,8 @@ fn drawBrand(dc: Win32.DeviceContext) void {
 fn drawNavigation(dc: Win32.DeviceContext) void {
     drawNavItem(dc, .library, 126, .nav_library, "01");
     drawNavItem(dc, .input, 184, .nav_input, "02");
-    drawNavItem(dc, .settings, 242, .nav_settings, "03");
+    drawNavItem(dc, .saves, 242, .nav_saves, "03");
+    drawNavItem(dc, .settings, 300, .nav_settings, "04");
     localizedText(dc, .project, .{ .left = 28, .top = 596, .right = 190, .bottom = 616 }, 0x007c716a, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
     roundFill(dc, .{ .left = 20, .top = 626, .right = 202, .bottom = 670 }, 10, 0x003d3029);
     localizedText(dc, .support_boosty, .{ .left = 32, .top = 639, .right = 192, .bottom = 660 }, 0x00ffac64, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
@@ -899,6 +944,249 @@ fn deviceColour(red: u8, green: u8, blue: u8) u32 {
     return (@as(u32, blue) << 16) | (@as(u32, green) << 8) | @as(u32, red);
 }
 
+/// Opens the host directory holding the selected title's saves.
+const saves_open_rect = Rect{ .left = 880, .top = 148, .right = 1086, .bottom = 180 };
+
+/// How many slots the page will list. A title with more has written more saves
+/// than a launcher page can usefully show at once.
+const maximum_listed_saves = 12;
+
+const SaveSlot = struct {
+    name: [64]u16 = @splat(0),
+    name_length: usize = 0,
+    detail: [96]u16 = @splat(0),
+    detail_length: usize = 0,
+};
+
+var save_slots: [maximum_listed_saves]SaveSlot = @splat(.{});
+var save_slot_count: usize = 0;
+var save_scan_done = false;
+
+/// Rescans on the next paint. Called when the selected title changes, because
+/// the list belongs to that title rather than to the launcher.
+fn invalidateSaves() void {
+    save_scan_done = false;
+}
+
+/// Builds the host path of the save root for the selected title.
+///
+/// Returns nothing when no title is selected or it publishes no identifier:
+/// without one there is no directory to look in, and guessing would show
+/// another game's saves.
+fn saveDirectoryPath(output: *[1024]u16) usize {
+    if (title_identifier_length == 0) return 0;
+    var length = siblingDirectory(output);
+    if (length == 0) return 0;
+    const parts = [_][*:0]const u16{ w("savedata"), w("\\") };
+    for (parts) |part| {
+        const part_length = wideLength(part);
+        if (length + part_length >= output.len) return 0;
+        @memcpy(output[length..][0..part_length], part[0..part_length]);
+        length += part_length;
+    }
+    if (length + title_identifier_length >= output.len) return 0;
+    @memcpy(output[length..][0..title_identifier_length], title_identifier[0..title_identifier_length]);
+    length += title_identifier_length;
+    output[length] = 0;
+    return length;
+}
+
+/// The directory the launcher itself lives in.
+fn siblingDirectory(output: *[1024]u16) usize {
+    var length = Win32.GetModuleFileNameW(null, output, output.len);
+    if (length == 0 or length >= output.len) return 0;
+    while (length > 0 and output[length - 1] != '\\') : (length -= 1) {}
+    return length;
+}
+
+/// Lists the slots the selected title has written.
+fn scanSaves() void {
+    save_slot_count = 0;
+    save_scan_done = true;
+
+    var path: [1024]u16 = undefined;
+    const length = saveDirectoryPath(&path);
+    if (length == 0) return;
+    // FindFirstFileW wants a pattern rather than a directory.
+    const pattern = w("\\*");
+    const pattern_length = wideLength(pattern);
+    if (length + pattern_length >= path.len) return;
+    @memcpy(path[length..][0..pattern_length], pattern[0..pattern_length]);
+    path[length + pattern_length] = 0;
+
+    var found: Win32.FindData = undefined;
+    const handle = Win32.FindFirstFileW(@ptrCast(&path), &found);
+    if (@intFromPtr(handle) == Win32.invalid_handle) return;
+    defer _ = Win32.FindClose(handle);
+
+    while (true) {
+        const is_directory = found.attributes & Win32.file_attribute_directory != 0;
+        const name_length = wideLength(@ptrCast(&found.name));
+        const skip = !is_directory or name_length == 0 or found.name[0] == '.';
+        if (!skip and save_slot_count < save_slots.len) {
+            var slot = SaveSlot{};
+            slot.name_length = @min(name_length, slot.name.len - 1);
+            @memcpy(slot.name[0..slot.name_length], found.name[0..slot.name_length]);
+            slot.detail_length = describeSlot(&path, length, found.name[0..name_length], &slot.detail);
+            save_slots[save_slot_count] = slot;
+            save_slot_count += 1;
+        }
+        if (Win32.FindNextFileW(handle, &found) == 0) break;
+    }
+}
+
+/// Reads the title a slot recorded for itself, falling back to its size.
+///
+/// The descriptive parameters are what a save browser is for: a directory name
+/// is chosen by the game and often means nothing to the player.
+fn describeSlot(
+    root: *[1024]u16,
+    root_length: usize,
+    name: []const u16,
+    output: *[96]u16,
+) usize {
+    var path: [1024]u16 = undefined;
+    @memcpy(path[0..root_length], root[0..root_length]);
+    var length = root_length;
+    const separator = w("\\");
+    const tail = w("\\sce_sys\\param.txt");
+    if (length + name.len + wideLength(tail) + 2 >= path.len) return 0;
+    const separator_length = wideLength(separator);
+    @memcpy(path[length..][0..separator_length], separator[0..separator_length]);
+    length += separator_length;
+    @memcpy(path[length..][0..name.len], name);
+    length += name.len;
+    const tail_length = wideLength(tail);
+    @memcpy(path[length..][0..tail_length], tail[0..tail_length]);
+    length += tail_length;
+    path[length] = 0;
+
+    var contents: [512]u8 = undefined;
+    const read = readSmallFile(@ptrCast(&path), &contents) orelse return 0;
+    const title = parameterValue(read, "title=") orelse return 0;
+    var written: usize = 0;
+    for (title) |byte| {
+        if (written + 1 >= output.len) break;
+        output[written] = byte;
+        written += 1;
+    }
+    output[written] = 0;
+    return written;
+}
+
+/// Reads the first record of a parameter file. Only the title is shown, so the
+/// rest of the file is not parsed.
+fn parameterValue(document: []const u8, key: []const u8) ?[]const u8 {
+    var cursor: usize = 0;
+    while (cursor < document.len) {
+        var end = cursor;
+        while (end < document.len and document[end] != '\n') end += 1;
+        var line = document[cursor..end];
+        while (line.len != 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+        if (line.len > key.len and std.mem.eql(u8, line[0..key.len], key)) {
+            const value = line[key.len..];
+            return if (value.len == 0) null else value;
+        }
+        cursor = end + 1;
+    }
+    return null;
+}
+
+fn readSmallFile(path: [*:0]const u16, buffer: []u8) ?[]const u8 {
+    const handle = Win32.CreateFileW(
+        path,
+        Win32.generic_read,
+        Win32.file_share_read,
+        null,
+        Win32.open_existing,
+        0,
+        null,
+    );
+    if (@intFromPtr(handle) == Win32.invalid_handle) return null;
+    defer _ = Win32.CloseHandle(handle);
+    var read: u32 = 0;
+    if (Win32.ReadFile(handle, buffer.ptr, @intCast(buffer.len), &read, null) == 0) return null;
+    return buffer[0..read];
+}
+
+/// Reads the selected title's product code out of the document it ships.
+///
+/// The launcher needs the same identifier the emulator keys saves by; deriving
+/// it from the folder name instead would disagree the moment a dump is renamed.
+fn refreshTitleIdentifier() void {
+    title_identifier_length = 0;
+    invalidateSaves();
+    if (game_folder_length == 0) return;
+
+    var path: [1024]u16 = undefined;
+    if (game_folder_length >= path.len) return;
+    @memcpy(path[0..game_folder_length], game_folder[0..game_folder_length]);
+    var length = game_folder_length;
+    const tail = w("\\sce_sys\\param.json");
+    const tail_length = wideLength(tail);
+    if (length + tail_length >= path.len) return;
+    @memcpy(path[length..][0..tail_length], tail[0..tail_length]);
+    length += tail_length;
+    path[length] = 0;
+
+    var document: [8192]u8 = undefined;
+    const text_bytes = readSmallFile(@ptrCast(&path), &document) orelse return;
+    const value = jsonStringValue(text_bytes, "\"titleId\"") orelse return;
+    for (value) |byte| {
+        if (title_identifier_length + 1 >= title_identifier.len) break;
+        title_identifier[title_identifier_length] = byte;
+        title_identifier_length += 1;
+    }
+    title_identifier[title_identifier_length] = 0;
+}
+
+/// Finds a quoted string value following a quoted key.
+fn jsonStringValue(document: []const u8, quoted_key: []const u8) ?[]const u8 {
+    const key_at = std.mem.indexOf(u8, document, quoted_key) orelse return null;
+    var cursor = key_at + quoted_key.len;
+    while (cursor < document.len and (document[cursor] == ' ' or document[cursor] == '\t')) cursor += 1;
+    if (cursor >= document.len or document[cursor] != ':') return null;
+    cursor += 1;
+    while (cursor < document.len and
+        (document[cursor] == ' ' or document[cursor] == '\t' or
+            document[cursor] == '\r' or document[cursor] == '\n')) cursor += 1;
+    if (cursor >= document.len or document[cursor] != '"') return null;
+    const start = cursor + 1;
+    const end = std.mem.indexOfScalarPos(u8, document, start, '"') orelse return null;
+    return document[start..end];
+}
+
+fn handleSavesClick(window: Win32.Window, x: i32, y: i32) void {
+    if (!saves_open_rect.contains(x, y)) return;
+    var path: [1024]u16 = undefined;
+    const length = saveDirectoryPath(&path);
+    if (length == 0) return;
+    _ = Win32.ShellExecuteW(window, w("open"), @ptrCast(&path), null, null, Win32.show_normal);
+}
+
+fn drawSaves(dc: Win32.DeviceContext) void {
+    pageHeading(dc, .saves_heading, .saves_subtitle);
+    if (!save_scan_done) scanSaves();
+
+    button(dc, saves_open_rect, .saves_open_folder, title_identifier_length == 0);
+
+    if (save_slot_count == 0) {
+        card(dc, .{ .left = 282, .top = 200, .right = 1086, .bottom = 268 });
+        localizedText(dc, .saves_empty, .{ .left = 306, .top = 224, .right = 1062, .bottom = 248 }, 0x008b817a, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
+        return;
+    }
+
+    for (save_slots[0..save_slot_count], 0..) |slot, index| {
+        const top = 200 + @as(i32, @intCast(index)) * 44;
+        if (top > 660) break;
+        roundFill(dc, .{ .left = 282, .top = top, .right = 1086, .bottom = top + 38 }, 8, 0x00251f1b);
+        text(dc, &slot.name, @intCast(slot.name_length), .{ .left = 300, .top = top + 9, .right = 560, .bottom = top + 32 }, 0x00f4f0ea, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
+        if (slot.detail_length != 0) {
+            text(dc, &slot.detail, @intCast(slot.detail_length), .{ .left = 580, .top = top + 10, .right = 1066, .bottom = top + 32 }, 0x009b9088, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
+        }
+    }
+}
+
 fn drawSettings(dc: Win32.DeviceContext) void {
     pageHeading(dc, .settings_heading, .settings_subtitle);
     localizedText(dc, .language, .{ .left = 282, .top = 158, .right = 600, .bottom = 180 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
@@ -1035,6 +1323,7 @@ fn chooseGameFolder(owner: Win32.Window) void {
     defer Win32.CoTaskMemFree(item);
     if (Win32.SHGetPathFromIDListW(item, &game_folder) == 0) return;
     game_folder_length = wideLength(@ptrCast(&game_folder));
+    refreshTitleIdentifier();
     saveSettings();
     setStatusPhrase(.status_folder_selected, false);
 }
@@ -1199,6 +1488,7 @@ fn siblingExecutable(comptime name: []const u8, output: *[1024]u16) usize {
 fn loadSettings() void {
     if (ini_path_length == 0) return;
     game_folder_length = Win32.GetPrivateProfileStringW(w("launcher"), w("game_folder"), w(""), &game_folder, game_folder.len, @ptrCast(&ini_path));
+    refreshTitleIdentifier();
     sound_enabled = Win32.GetPrivateProfileIntW(w("launcher"), w("sound"), 1, @ptrCast(&ini_path)) != 0;
     show_fps = Win32.GetPrivateProfileIntW(w("launcher"), w("show_fps"), 0, @ptrCast(&ini_path)) != 0;
     const mode_value = Win32.GetPrivateProfileIntW(w("launcher"), w("input_mode"), 2, @ptrCast(&ini_path));
@@ -1405,6 +1695,24 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     const null_pen: i32 = 8;
     const arrow_cursor: [*:0]const u16 = @ptrFromInt(32512);
     const NativePoint = extern struct { x: i32 = 0, y: i32 = 0 };
+
+    const FindData = extern struct {
+        attributes: u32 = 0,
+        creation_time: [2]u32 = .{ 0, 0 },
+        access_time: [2]u32 = .{ 0, 0 },
+        write_time: [2]u32 = .{ 0, 0 },
+        size_high: u32 = 0,
+        size_low: u32 = 0,
+        reserved: [2]u32 = .{ 0, 0 },
+        name: [260]u16 = @splat(0),
+        alternate_name: [14]u16 = @splat(0),
+    };
+
+    const file_attribute_directory: u32 = 0x10;
+    const generic_read: u32 = 0x8000_0000;
+    const file_share_read: u32 = 0x0000_0001;
+    const open_existing: u32 = 3;
+    const invalid_handle: usize = std.math.maxInt(usize);
     const error_class_already_exists: u32 = 1410;
     const bif_return_only_fs_dirs: u32 = 0x0001;
     const bif_new_dialog_style: u32 = 0x0040;
@@ -1439,6 +1747,11 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     extern "user32" fn AdjustWindowRect(*NativeRect, u32, i32) callconv(.winapi) i32;
     extern "user32" fn SetTimer(Window, usize, u32, ?*anyopaque) callconv(.winapi) usize;
     extern "user32" fn KillTimer(Window, usize) callconv(.winapi) i32;
+    extern "kernel32" fn FindFirstFileW([*:0]const u16, *FindData) callconv(.winapi) *anyopaque;
+    extern "kernel32" fn FindNextFileW(*anyopaque, *FindData) callconv(.winapi) i32;
+    extern "kernel32" fn FindClose(*anyopaque) callconv(.winapi) i32;
+    extern "kernel32" fn CreateFileW([*:0]const u16, u32, u32, ?*anyopaque, u32, u32, ?*anyopaque) callconv(.winapi) Handle;
+    extern "kernel32" fn ReadFile(Handle, [*]u8, u32, ?*u32, ?*anyopaque) callconv(.winapi) i32;
     extern "user32" fn GetCursorPos(*NativePoint) callconv(.winapi) i32;
     extern "user32" fn ScreenToClient(Window, *NativePoint) callconv(.winapi) i32;
     extern "user32" fn LoadIconW(Instance, ?[*:0]const u16) callconv(.winapi) Icon;

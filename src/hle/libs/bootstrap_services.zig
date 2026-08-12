@@ -18,6 +18,7 @@ const kernel_event_queue = @import("kernel_event_queue.zig");
 const kernel_ioctl = @import("kernel_ioctl.zig");
 const agc_submit = @import("agc_submit.zig");
 const agc = @import("agc.zig");
+const savedata = @import("../savedata.zig");
 const agc_register_defaults = @import("agc_register_defaults.zig");
 const agc_shader_registry = @import("agc_shader_registry.zig");
 const av_player = @import("av_player.zig");
@@ -917,11 +918,53 @@ fn saveDataCreateTransactionResource(_: u32) callconv(abi.guest) i32 {
     return @intCast(if (resource == 0) 1 else resource);
 }
 
-fn saveDataMount3(_: u64, result: ?*SaveDataMountResult) callconv(abi.guest) i32 {
+/// The request a title hands to `sceSaveDataMount3`.
+///
+/// Only the fields the mount actually turns into a decision are named: which
+/// slot, and whether the title is willing to have it created. The block counts
+/// describe a quota this host does not impose.
+const SaveDataMountRequest = extern struct {
+    user_id: i32,
+    reserved: u32,
+    directory_name: u64,
+    blocks: u64,
+    system_blocks: u64,
+    mount_mode: u32,
+    resource: u32,
+    mode: u32,
+    padding: u32,
+};
+
+/// Mount-mode bits that say the title accepts a slot being made for it.
+///
+/// A title probing for an existing save mounts read-only and expects to be told
+/// it is not there; answering that probe by creating an empty slot would make
+/// it load a save that never existed.
+const save_data_mount_create_bits: u32 = 0x04 | 0x20;
+
+const save_data_error_not_found: i32 = @bitCast(@as(u32, 0x809f0008));
+
+fn saveDataMount3(request_address: u64, result: ?*SaveDataMountResult) callconv(abi.guest) i32 {
     const output = result orelse return invalid_argument;
     if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(output), @sizeOf(SaveDataMountResult))) {
         return errno.KernelError.efault.raw();
     }
+    if (request_address == 0 or
+        !kernel_memory.isGuestRangeAccessible(request_address, @sizeOf(SaveDataMountRequest)))
+    {
+        return invalid_argument;
+    }
+    const request: *const SaveDataMountRequest = @ptrFromInt(request_address);
+
+    var slot_storage: [savedata.maximum_slot_name]u8 = undefined;
+    const slot = readSlotName(request.directory_name, &slot_storage) orelse return invalid_argument;
+    const may_create = request.mount_mode & save_data_mount_create_bits != 0;
+
+    const mounted = filesystem.mountSaveDataSlot(slot, may_create) catch {
+        return errno.KernelError.eio.raw();
+    };
+    if (!mounted) return save_data_error_not_found;
+
     output.* = .{
         .mount_point = [_]u8{0} ** 16,
         .required_blocks = 0,
@@ -934,6 +977,14 @@ fn saveDataMount3(_: u64, result: ?*SaveDataMountResult) callconv(abi.guest) i32
     return errno.ok;
 }
 
+/// Copies the fixed-width slot name out of guest memory.
+fn readSlotName(address: u64, storage: *[savedata.maximum_slot_name]u8) ?[]const u8 {
+    if (address == 0 or !kernel_memory.isGuestRangeAccessible(address, storage.len)) return null;
+    const bytes: [*]const u8 = @ptrFromInt(address);
+    @memcpy(storage, bytes[0..storage.len]);
+    return savedata.boundedName(storage);
+}
+
 fn saveDataTwoPointers(first: u64, second: u64) callconv(abi.guest) i32 {
     return if (first == 0 or second == 0) invalid_argument else errno.ok;
 }
@@ -943,7 +994,123 @@ fn saveDataOnePointer(pointer: u64) callconv(abi.guest) i32 {
 }
 
 fn saveDataUmount(_: u32, mount_point: u64) callconv(abi.guest) i32 {
-    return if (mount_point == 0) invalid_argument else errno.ok;
+    if (mount_point == 0) return invalid_argument;
+    // Everything written through the mount is already on disk; detaching only
+    // stops the path resolving, which is what makes a later mount of another
+    // slot land in the right place.
+    filesystem.unmountSaveData();
+    return errno.ok;
+}
+
+
+/// The block-shaped save API.
+///
+/// It is the other half of saved games: instead of writing files through a
+/// mount, a title hands over one buffer and expects the same bytes back on a
+/// later run. There is no slot to name, so the blob belongs to the title as a
+/// whole and is kept beside its slots rather than inside one.
+const SaveDataMemoryData = extern struct {
+    buffer: u64,
+    size: u64,
+    offset: u64,
+};
+
+/// The largest blob that will be held. A title asking for more than this has
+/// not understood the API, and reserving it would be a denial of service
+/// against the host rather than a save.
+const maximum_save_data_memory = 32 * 1024 * 1024;
+
+var save_data_memory: ?[]u8 = null;
+/// A spin lock rather than a general mutex: the critical sections are a memcpy
+/// of a save blob, and this module has no `std.Io` instance to hand.
+var save_data_memory_lock: std.atomic.Mutex = .unlocked;
+
+fn lockSaveDataMemory() void {
+    while (!save_data_memory_lock.tryLock()) std.atomic.spinLoopHint();
+}
+
+/// Reads the descriptor a title passes for a memory transfer.
+fn readMemoryData(address: u64) ?SaveDataMemoryData {
+    if (address == 0 or !kernel_memory.isGuestRangeAccessible(address, @sizeOf(SaveDataMemoryData))) {
+        return null;
+    }
+    const data: *const SaveDataMemoryData = @ptrFromInt(address);
+    return data.*;
+}
+
+/// Prepares the blob and loads whatever a previous run left in it.
+fn saveDataSetupMemory(parameter_address: u64, _: u64) callconv(abi.guest) i32 {
+    if (parameter_address == 0 or !kernel_memory.isGuestRangeAccessible(parameter_address, 0x10)) {
+        return invalid_argument;
+    }
+    const requested: u64 = @as(*const u64, @ptrFromInt(parameter_address + 0x08)).*;
+    if (requested == 0 or requested > maximum_save_data_memory) return invalid_argument;
+    const size: usize = @intCast(requested);
+
+    lockSaveDataMemory();
+    defer save_data_memory_lock.unlock();
+    if (save_data_memory) |existing| {
+        if (existing.len == size) return errno.ok;
+        std.heap.page_allocator.free(existing);
+        save_data_memory = null;
+    }
+    const buffer = std.heap.page_allocator.alloc(u8, size) catch return errno.KernelError.enomem.raw();
+    @memset(buffer, 0);
+    // A title expects the blob it stored last time, so the reserve is filled
+    // from disk before it is handed back rather than starting empty.
+    filesystem.readSaveDataMemory(buffer);
+    save_data_memory = buffer;
+    return errno.ok;
+}
+
+/// Copies out of the blob into the title's buffer.
+fn saveDataGetMemory(request_address: u64) callconv(abi.guest) i32 {
+    return transferSaveDataMemory(request_address, false);
+}
+
+/// Copies the title's buffer into the blob.
+fn saveDataSetMemory(request_address: u64) callconv(abi.guest) i32 {
+    return transferSaveDataMemory(request_address, true);
+}
+
+fn transferSaveDataMemory(request_address: u64, storing: bool) i32 {
+    if (request_address == 0 or !kernel_memory.isGuestRangeAccessible(request_address, 0x10)) {
+        return invalid_argument;
+    }
+    const data_address: u64 = @as(*const u64, @ptrFromInt(request_address + 0x08)).*;
+    const data = readMemoryData(data_address) orelse return invalid_argument;
+    if (data.buffer == 0 or data.size == 0) return invalid_argument;
+    if (!kernel_memory.isGuestRangeAccessible(data.buffer, @intCast(data.size))) {
+        return errno.KernelError.efault.raw();
+    }
+
+    lockSaveDataMemory();
+    defer save_data_memory_lock.unlock();
+    const blob = save_data_memory orelse return invalid_argument;
+    // A transfer past the end of the reserve is refused rather than clamped: a
+    // short read would hand the title a partly stale save and look like one it
+    // had written.
+    if (data.offset > blob.len or data.size > blob.len - data.offset) return invalid_argument;
+
+    const start: usize = @intCast(data.offset);
+    const length: usize = @intCast(data.size);
+    const guest: [*]u8 = @ptrFromInt(data.buffer);
+    if (storing) {
+        @memcpy(blob[start..][0..length], guest[0..length]);
+    } else {
+        @memcpy(guest[0..length], blob[start..][0..length]);
+    }
+    return errno.ok;
+}
+
+/// Puts the blob on disk. A title calls this when it wants the save to survive
+/// the process, so nothing is written until it does.
+fn saveDataSyncMemory(_: u64) callconv(abi.guest) i32 {
+    lockSaveDataMemory();
+    defer save_data_memory_lock.unlock();
+    const blob = save_data_memory orelse return errno.ok;
+    filesystem.writeSaveDataMemory(blob) catch return errno.KernelError.eio.raw();
+    return errno.ok;
 }
 
 const app_content_exports = [_]symbols.Export{
@@ -976,15 +1143,15 @@ const mouse_exports = [_]symbols.Export{
     .{ .name = "sceMouseClose", .function = trace.wrap("sceMouseClose", &success), .expect_id = "cAnT0Rw-IwU" },
 };
 
-// Save-data memory is accepted as an in-process compatibility surface. The
-// title still sees no persistent storage until a VFS-backed implementation is
-// attached.
+// Mounting resolves a slot under the host save directory and makes it the
+// title's `/savedata0`; its files are then written through the ordinary file
+// API, which is how a title stores its progress.
 const save_data_exports = [_]symbols.Export{
     .{ .name = "sceSaveDataInitialize3", .function = trace.wrap("sceSaveDataInitialize3", &success), .expect_id = "TywrFKCoLGY" },
-    .{ .name = "sceSaveDataSetupSaveDataMemory2", .function = trace.wrap("sceSaveDataSetupSaveDataMemory2", &success), .expect_id = "oQySEUfgXRA" },
-    .{ .name = "sceSaveDataGetSaveDataMemory2", .function = trace.wrap("sceSaveDataGetSaveDataMemory2", &success), .expect_id = "QwOO7vegnV8" },
-    .{ .name = "sceSaveDataSetSaveDataMemory2", .function = trace.wrap("sceSaveDataSetSaveDataMemory2", &success), .expect_id = "cduy9v4YmT4" },
-    .{ .name = "sceSaveDataSyncSaveDataMemory", .function = trace.wrap("sceSaveDataSyncSaveDataMemory", &success), .expect_id = "wiT9jeC7xPw" },
+    .{ .name = "sceSaveDataSetupSaveDataMemory2", .function = trace.wrap("sceSaveDataSetupSaveDataMemory2", &saveDataSetupMemory), .expect_id = "oQySEUfgXRA" },
+    .{ .name = "sceSaveDataGetSaveDataMemory2", .function = trace.wrap("sceSaveDataGetSaveDataMemory2", &saveDataGetMemory), .expect_id = "QwOO7vegnV8" },
+    .{ .name = "sceSaveDataSetSaveDataMemory2", .function = trace.wrap("sceSaveDataSetSaveDataMemory2", &saveDataSetMemory), .expect_id = "cduy9v4YmT4" },
+    .{ .name = "sceSaveDataSyncSaveDataMemory", .function = trace.wrap("sceSaveDataSyncSaveDataMemory", &saveDataSyncMemory), .expect_id = "wiT9jeC7xPw" },
     .{ .name = "sceSaveDataCreateTransactionResource", .function = trace.wrap("sceSaveDataCreateTransactionResource", &saveDataCreateTransactionResource), .expect_id = "gjRZNnw0JPE" },
     .{ .name = "sceSaveDataDeleteTransactionResource", .function = trace.wrap("sceSaveDataDeleteTransactionResource", &success), .expect_id = "lJUQuaKqoKY" },
     .{ .name = "sceSaveDataMount3", .function = trace.wrap("sceSaveDataMount3", &saveDataMount3), .expect_id = "ZP4e7rlzOUk" },
