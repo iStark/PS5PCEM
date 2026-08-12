@@ -266,6 +266,9 @@ pub fn build(b: *std.Build) void {
         // arena. Keep the host image at 2 TiB, outside every guest aperture.
         game_run.image_base = 0x0200_0000_0000;
         game_run.root_module.linkSystemLibrary("xinput1_4", .{});
+        // Sony pads are read straight from HID; XInput never enumerates them.
+        game_run.root_module.linkSystemLibrary("setupapi", .{});
+        game_run.root_module.linkSystemLibrary("hid", .{});
     }
     b.installArtifact(game_run);
 
@@ -286,10 +289,11 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path("src/launcher.zig"),
                 .target = target,
                 .optimize = optimize,
+                .imports = &.{.{ .name = "input", .module = input }},
             }),
         });
         native_launcher.subsystem = .windows;
-        inline for (&.{ "user32", "gdi32", "shell32", "ole32", "dwmapi" }) |library| {
+        inline for (&.{ "user32", "gdi32", "shell32", "ole32", "dwmapi", "setupapi", "hid" }) |library| {
             native_launcher.root_module.linkSystemLibrary(library, .{});
         }
         b.installArtifact(native_launcher);

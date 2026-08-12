@@ -8,6 +8,7 @@
 //! passed to game-run through its small environment contract.
 
 const std = @import("std");
+const input = @import("input");
 const builtin = @import("builtin");
 
 comptime {
@@ -73,6 +74,10 @@ const Phrase = enum {
     compatibility_text,
     author,
     browse_dialog,
+    pad_searching,
+    pad_test,
+    pad_test_unavailable,
+    pad_absent,
     status_layout_saved,
     status_press_key,
     status_input_saved,
@@ -110,6 +115,15 @@ var current_page: Page = .library;
 var input_mode: InputMode = .hybrid;
 var language: Language = .english;
 var controller_index: u8 = 0;
+/// What the HID scan last saw. Polled on a timer rather than during paint so
+/// the answer does not depend on how often the window happens to redraw.
+var pad_presence: input.hid.Presence = .{};
+const pad_timer_id: usize = 1;
+const pad_test_timer_id: usize = 2;
+/// How often the self-test advances. Fine enough that the colours read as a
+/// sweep rather than a slideshow.
+const pad_test_tick_ms: u32 = 40;
+var current_window: Win32.Window = null;
 var sound_enabled = true;
 var show_fps = false;
 var mapping = mapping_defaults;
@@ -175,6 +189,10 @@ fn tr(phrase: Phrase) []const u8 {
             .compatibility_text => "PS5PCEM is at an early stage. Not every title boots yet; advanced DualSense features, native PS5 keyboard/mouse and controller-to-keyboard conversion still need more HLE support.",
             .author => "Author: Artur Strazewicz · GitHub: iStark/PS5PCEM",
             .browse_dialog => "Choose the folder containing a decrypted PS5 game",
+            .pad_test => "Test",
+            .pad_test_unavailable => "Controller cannot be driven",
+            .pad_searching => "Searching for a controller",
+            .pad_absent => "No controller detected",
             .status_layout_saved => "Keyboard bindings saved",
             .status_press_key => "Press a new key · Esc to cancel",
             .status_input_saved => "Input profile saved",
@@ -237,6 +255,10 @@ fn tr(phrase: Phrase) []const u8 {
             .compatibility_text => "PS5PCEM находится на ранней стадии. Не все игры загружаются; функции DualSense, нативные PS5-клавиатура/мышь и преобразование геймпада в клавиши требуют дальнейшей HLE-поддержки.",
             .author => "Автор: Artur Strazewicz · GitHub: iStark/PS5PCEM",
             .browse_dialog => "Выберите папку с расшифрованной игрой PS5",
+            .pad_test => "Тест",
+            .pad_test_unavailable => "Контроллер недоступен для управления",
+            .pad_searching => "Поиск контроллера",
+            .pad_absent => "Контроллер не найден",
             .status_layout_saved => "Раскладка сохранена",
             .status_press_key => "Нажмите новую клавишу · Esc — отмена",
             .status_input_saved => "Профиль ввода сохранён",
@@ -299,6 +321,10 @@ fn tr(phrase: Phrase) []const u8 {
             .compatibility_text => "PS5PCEM ist in einer frühen Phase. Nicht jedes Spiel startet; erweiterte DualSense-Funktionen, native PS5-Tastatur/Maus und Controller-zu-Tastatur benötigen weitere HLE-Unterstützung.",
             .author => "Autor: Artur Strazewicz · GitHub: iStark/PS5PCEM",
             .browse_dialog => "Ordner mit dem entschlüsselten PS5-Spiel wählen",
+            .pad_test => "Test",
+            .pad_test_unavailable => "Controller nicht ansteuerbar",
+            .pad_searching => "Controller wird gesucht",
+            .pad_absent => "Kein Controller erkannt",
             .status_layout_saved => "Tastenbelegung gespeichert",
             .status_press_key => "Neue Taste drücken · Esc zum Abbrechen",
             .status_input_saved => "Eingabeprofil gespeichert",
@@ -361,6 +387,10 @@ fn tr(phrase: Phrase) []const u8 {
             .compatibility_text => "PS5PCEM est encore expérimental. Tous les jeux ne démarrent pas ; les fonctions DualSense avancées, le clavier/souris PS5 natif et la conversion manette-clavier demandent davantage de prise en charge HLE.",
             .author => "Auteur : Artur Strazewicz · GitHub : iStark/PS5PCEM",
             .browse_dialog => "Choisissez le dossier du jeu PS5 déchiffré",
+            .pad_test => "Test",
+            .pad_test_unavailable => "Manette non pilotable",
+            .pad_searching => "Recherche d'une manette",
+            .pad_absent => "Aucune manette détectée",
             .status_layout_saved => "Affectation des touches enregistrée",
             .status_press_key => "Pressez une nouvelle touche · Échap pour annuler",
             .status_input_saved => "Profil d'entrée enregistré",
@@ -409,6 +439,12 @@ pub fn main(_: std.process.Init) !void {
         return error.WindowCreationFailed;
     }
 
+    // CreateWindowExW sizes the whole window, frame included, so passing the
+    // layout size directly left the client area short of it. The bottom row of
+    // the page fell outside and was clipped away, and a taller caption at a
+    // higher DPI took more of it.
+    var outer = Win32.NativeRect{ .left = 0, .top = 0, .right = window_width, .bottom = window_height };
+    _ = Win32.AdjustWindowRect(&outer, Win32.window_style, 0);
     const window = Win32.CreateWindowExW(
         0,
         w("PS5PCEM_LAUNCHER"),
@@ -416,8 +452,8 @@ pub fn main(_: std.process.Init) !void {
         Win32.window_style,
         Win32.centered,
         Win32.centered,
-        window_width,
-        window_height,
+        outer.right - outer.left,
+        outer.bottom - outer.top,
         null,
         null,
         instance,
@@ -427,6 +463,12 @@ pub fn main(_: std.process.Init) !void {
     _ = Win32.DwmSetWindowAttribute(window, 20, &dark, @sizeOf(i32));
     _ = Win32.ShowWindow(window, Win32.show_normal);
     _ = Win32.UpdateWindow(window);
+    // Half a second is fast enough to feel immediate for a pad that is plugged
+    // in while the launcher is open, and rare enough that the HID scan costs
+    // nothing noticeable when none is attached.
+    current_window = window;
+    pad_presence = input.hid.presence();
+    _ = Win32.SetTimer(window, pad_timer_id, 500, null);
 
     var message: Win32.Message = undefined;
     while (Win32.GetMessageW(&message, null, 0, 0) > 0) {
@@ -447,6 +489,41 @@ fn windowProcedure(
             return 0;
         },
         Win32.wm_erase_background => return 1,
+        Win32.wm_timer => {
+            if (word_parameter == pad_test_timer_id) {
+                if (!input.hid.advanceTest(pad_test_tick_ms)) {
+                    _ = Win32.KillTimer(window, pad_test_timer_id);
+                    _ = Win32.InvalidateRect(window, null, 0);
+                }
+                return 0;
+            }
+            const found = input.hid.presence();
+            if (found.connected != pad_presence.connected or found.family != pad_presence.family) {
+                pad_presence = found;
+                _ = Win32.InvalidateRect(window, null, 0);
+            }
+            return 0;
+        },
+        Win32.wm_device_change => {
+            // A pad that was just plugged in should appear now, not at the end
+            // of the scan interval.
+            input.hid.invalidate();
+            pad_presence = input.hid.presence();
+            _ = Win32.InvalidateRect(window, null, 0);
+            return 0;
+        },
+        Win32.wm_set_cursor => {
+            // Only the client area; the frame keeps the cursors Windows gives
+            // it for sizing and the system menu.
+            if (@as(u16, @truncate(@as(usize, @bitCast(long_parameter)))) == Win32.hit_test_client) {
+                var point = Win32.NativePoint{};
+                if (Win32.GetCursorPos(&point) != 0 and Win32.ScreenToClient(window, &point) != 0) {
+                    const over = clickableAt(point.x, point.y);
+                    _ = Win32.SetCursor(Win32.LoadCursorW(null, if (over) Win32.hand_cursor else Win32.arrow_cursor));
+                    return 1;
+                }
+            }
+        },
         Win32.wm_left_button_up => {
             const x: i32 = @as(i16, @bitCast(@as(u16, @truncate(@as(usize, @bitCast(long_parameter))))));
             const y: i32 = @as(i16, @bitCast(@as(u16, @truncate(@as(usize, @bitCast(long_parameter)) >> 16))));
@@ -472,6 +549,7 @@ fn windowProcedure(
             return 0;
         },
         Win32.wm_destroy => {
+            input.hid.stopTest();
             Win32.PostQuitMessage(0);
             return 0;
         },
@@ -480,17 +558,101 @@ fn windowProcedure(
     return Win32.DefWindowProcW(window, message, word_parameter, long_parameter);
 }
 
+/// Every rectangle the pointer can act on, in one place.
+///
+/// The click handler and the hover cursor have to agree about what is
+/// interactive: a hand over something inert, or an arrow over a real button,
+/// is worse than having no hand cursor at all. Sharing the geometry is what
+/// keeps the two from drifting apart.
+const nav_rects = [_]Rect{
+    .{ .left = 20, .top = 126, .right = 202, .bottom = 174 },
+    .{ .left = 20, .top = 184, .right = 202, .bottom = 232 },
+    .{ .left = 20, .top = 242, .right = 202, .bottom = 290 },
+    .{ .left = 20, .top = 626, .right = 202, .bottom = 670 },
+    .{ .left = 20, .top = 680, .right = 202, .bottom = 724 },
+};
+
+const library_rects = [_]Rect{
+    .{ .left = 846, .top = 235, .right = 1086, .bottom = 283 },
+    .{ .left = 812, .top = 646, .right = 1086, .bottom = 700 },
+    .{ .left = 282, .top = 415, .right = 528, .bottom = 535 },
+    .{ .left = 550, .top = 415, .right = 1086, .bottom = 535 },
+};
+
+/// Sits beside the presence indicator on the input page.
+const pad_test_rect = Rect{ .left = 946, .top = 250, .right = 1086, .bottom = 278 };
+
+const input_mode_rects = [_]Rect{
+    .{ .left = 282, .top = 170, .right = 532, .bottom = 246 },
+    .{ .left = 548, .top = 170, .right = 798, .bottom = 246 },
+    .{ .left = 814, .top = 170, .right = 1086, .bottom = 246 },
+};
+
+const language_rects = [_]Rect{
+    .{ .left = 282, .top = 190, .right = 472, .bottom = 246 },
+    .{ .left = 486, .top = 190, .right = 676, .bottom = 246 },
+    .{ .left = 690, .top = 190, .right = 880, .bottom = 246 },
+    .{ .left = 894, .top = 190, .right = 1086, .bottom = 246 },
+};
+
+const settings_toggle_rects = [_]Rect{
+    .{ .left = 282, .top = 278, .right = 1086, .bottom = 360 },
+    .{ .left = 282, .top = 382, .right = 1086, .bottom = 464 },
+};
+
+fn controllerSlotRect(index: usize) Rect {
+    const left = 406 + @as(i32, @intCast(index)) * 28;
+    return .{ .left = left, .top = 212, .right = left + 24, .bottom = 238 };
+}
+
+fn mappingRect(index: usize) Rect {
+    const column: i32 = @intCast(index / 7);
+    const row: i32 = @intCast(index % 7);
+    return .{
+        .left = 282 + column * 404,
+        .top = 310 + row * 48,
+        .right = 660 + column * 404,
+        .bottom = 350 + row * 48,
+    };
+}
+
+fn indexOfRect(rects: []const Rect, x: i32, y: i32) ?usize {
+    for (rects, 0..) |rectangle, index| {
+        if (rectangle.contains(x, y)) return index;
+    }
+    return null;
+}
+
+/// Whether the pointer is over something that responds to a click.
+fn clickableAt(x: i32, y: i32) bool {
+    if (indexOfRect(&nav_rects, x, y) != null) return true;
+    return switch (current_page) {
+        .library => indexOfRect(&library_rects, x, y) != null,
+        .input => blk: {
+            if (pad_presence.connected and pad_test_rect.contains(x, y)) break :blk true;
+            if (indexOfRect(&input_mode_rects, x, y) != null) break :blk true;
+            for (0..4) |index| {
+                if (controllerSlotRect(index).contains(x, y)) break :blk true;
+            }
+            for (0..mapping.len) |index| {
+                if (mappingRect(index).contains(x, y)) break :blk true;
+            }
+            break :blk false;
+        },
+        .settings => indexOfRect(&language_rects, x, y) != null or
+            indexOfRect(&settings_toggle_rects, x, y) != null,
+    };
+}
+
 fn handleClick(window: Win32.Window, x: i32, y: i32) void {
-    if ((Rect{ .left = 20, .top = 126, .right = 202, .bottom = 174 }).contains(x, y)) {
-        current_page = .library;
-    } else if ((Rect{ .left = 20, .top = 184, .right = 202, .bottom = 232 }).contains(x, y)) {
-        current_page = .input;
-    } else if ((Rect{ .left = 20, .top = 242, .right = 202, .bottom = 290 }).contains(x, y)) {
-        current_page = .settings;
-    } else if ((Rect{ .left = 20, .top = 626, .right = 202, .bottom = 670 }).contains(x, y)) {
-        openBoosty(window);
-    } else if ((Rect{ .left = 20, .top = 680, .right = 202, .bottom = 724 }).contains(x, y)) {
-        openGithub(window);
+    if (indexOfRect(&nav_rects, x, y)) |index| {
+        switch (index) {
+            0 => current_page = .library,
+            1 => current_page = .input,
+            2 => current_page = .settings,
+            3 => openBoosty(window),
+            else => openGithub(window),
+        }
     } else switch (current_page) {
         .library => handleLibraryClick(window, x, y),
         .input => handleInputClick(x, y),
@@ -500,58 +662,47 @@ fn handleClick(window: Win32.Window, x: i32, y: i32) void {
 }
 
 fn handleLibraryClick(window: Win32.Window, x: i32, y: i32) void {
-    if ((Rect{ .left = 846, .top = 235, .right = 1086, .bottom = 283 }).contains(x, y)) {
-        chooseGameFolder(window);
-        return;
-    }
-    if ((Rect{ .left = 812, .top = 646, .right = 1086, .bottom = 700 }).contains(x, y)) {
-        launchGame(window);
-        return;
-    }
-    if ((Rect{ .left = 282, .top = 415, .right = 528, .bottom = 535 }).contains(x, y)) {
-        sound_enabled = !sound_enabled;
-        saveSettings();
-        setStatusPhrase(if (sound_enabled) .status_sound_on else .status_sound_off, false);
-        return;
-    }
-    if ((Rect{ .left = 550, .top = 415, .right = 1086, .bottom = 535 }).contains(x, y)) {
-        current_page = .input;
+    const index = indexOfRect(&library_rects, x, y) orelse return;
+    switch (index) {
+        0 => chooseGameFolder(window),
+        1 => launchGame(window),
+        2 => {
+            sound_enabled = !sound_enabled;
+            saveSettings();
+            setStatusPhrase(if (sound_enabled) .status_sound_on else .status_sound_off, false);
+        },
+        else => current_page = .input,
     }
 }
 
 fn handleInputClick(x: i32, y: i32) void {
+    if (pad_presence.connected and pad_test_rect.contains(x, y)) {
+        if (input.hid.startTest()) {
+            // A short timer drives the colour steps; the half-second presence
+            // timer is far too coarse to walk through them.
+            _ = Win32.SetTimer(current_window, pad_test_timer_id, pad_test_tick_ms, null);
+            setStatusPhrase(.pad_test, false);
+        } else {
+            setStatusPhrase(.pad_test_unavailable, true);
+        }
+        return;
+    }
     for (0..4) |index| {
-        const left = 406 + @as(i32, @intCast(index)) * 28;
-        if ((Rect{ .left = left, .top = 212, .right = left + 24, .bottom = 238 }).contains(x, y)) {
+        if (controllerSlotRect(index).contains(x, y)) {
             controller_index = @intCast(index);
             saveSettings();
             setStatusPhrase(.status_controller_saved, false);
             return;
         }
     }
-    const modes = [_]Rect{
-        .{ .left = 282, .top = 170, .right = 532, .bottom = 246 },
-        .{ .left = 548, .top = 170, .right = 798, .bottom = 246 },
-        .{ .left = 814, .top = 170, .right = 1086, .bottom = 246 },
-    };
-    for (modes, 0..) |rectangle, index| {
-        if (rectangle.contains(x, y)) {
-            input_mode = @enumFromInt(index);
-            saveSettings();
-            setStatusPhrase(.status_input_saved, false);
-            return;
-        }
+    if (indexOfRect(&input_mode_rects, x, y)) |index| {
+        input_mode = @enumFromInt(index);
+        saveSettings();
+        setStatusPhrase(.status_input_saved, false);
+        return;
     }
     for (0..mapping.len) |index| {
-        const column: i32 = @intCast(index / 7);
-        const row: i32 = @intCast(index % 7);
-        const rectangle = Rect{
-            .left = 282 + column * 404,
-            .top = 310 + row * 48,
-            .right = 660 + column * 404,
-            .bottom = 350 + row * 48,
-        };
-        if (rectangle.contains(x, y)) {
+        if (mappingRect(index).contains(x, y)) {
             capture_mapping = index;
             setStatusPhrase(.status_press_key, false);
             return;
@@ -560,27 +711,18 @@ fn handleInputClick(x: i32, y: i32) void {
 }
 
 fn handleSettingsClick(x: i32, y: i32) void {
-    const languages = [_]Rect{
-        .{ .left = 282, .top = 190, .right = 472, .bottom = 246 },
-        .{ .left = 486, .top = 190, .right = 676, .bottom = 246 },
-        .{ .left = 690, .top = 190, .right = 880, .bottom = 246 },
-        .{ .left = 894, .top = 190, .right = 1086, .bottom = 246 },
-    };
-    for (languages, 0..) |rectangle, index| {
-        if (rectangle.contains(x, y)) {
-            language = @enumFromInt(index);
-            status_length = 0;
-            saveSettings();
-            return;
-        }
+    if (indexOfRect(&language_rects, x, y)) |index| {
+        language = @enumFromInt(index);
+        status_length = 0;
+        saveSettings();
+        return;
     }
-    if ((Rect{ .left = 282, .top = 278, .right = 1086, .bottom = 360 }).contains(x, y)) {
+    const toggle = indexOfRect(&settings_toggle_rects, x, y) orelse return;
+    if (toggle == 0) {
         sound_enabled = !sound_enabled;
         saveSettings();
         setStatusPhrase(if (sound_enabled) .status_sound_on else .status_sound_off, false);
-        return;
-    }
-    if ((Rect{ .left = 282, .top = 382, .right = 1086, .bottom = 464 }).contains(x, y)) {
+    } else {
         show_fps = !show_fps;
         saveSettings();
         setStatusPhrase(if (show_fps) .status_fps_on else .status_fps_off, false);
@@ -619,7 +761,7 @@ fn drawNavigation(dc: Win32.DeviceContext) void {
     drawNavItem(dc, .library, 126, .nav_library, "01");
     drawNavItem(dc, .input, 184, .nav_input, "02");
     drawNavItem(dc, .settings, 242, .nav_settings, "03");
-    localizedText(dc, .project, .{ .left = 28, .top = 596, .right = 190, .bottom = 616 }, 0x007c716a, small_font, Win32.dt_left);
+    localizedText(dc, .project, .{ .left = 28, .top = 596, .right = 190, .bottom = 616 }, 0x007c716a, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
     roundFill(dc, .{ .left = 20, .top = 626, .right = 202, .bottom = 670 }, 10, 0x003d3029);
     localizedText(dc, .support_boosty, .{ .left = 32, .top = 639, .right = 192, .bottom = 660 }, 0x00ffac64, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
     text(dc, w("GitHub · iStark  ↗"), -1, .{ .left = 28, .top = 690, .right = 198, .bottom = 716 }, 0x00b9afa8, regular_font, Win32.dt_left);
@@ -636,8 +778,8 @@ fn drawLibrary(dc: Win32.DeviceContext) void {
     pageHeading(dc, .library_heading, .library_subtitle);
 
     card(dc, .{ .left = 282, .top = 158, .right = 1086, .bottom = 332 });
-    localizedText(dc, .folder_label, .{ .left = 310, .top = 183, .right = 600, .bottom = 205 }, 0x009b9088, small_font, Win32.dt_left);
-    localizedText(dc, .folder_prompt, .{ .left = 310, .top = 211, .right = 800, .bottom = 238 }, 0x00f4f0ea, medium_font, Win32.dt_left);
+    localizedText(dc, .folder_label, .{ .left = 310, .top = 183, .right = 600, .bottom = 205 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    localizedText(dc, .folder_prompt, .{ .left = 310, .top = 211, .right = 800, .bottom = 238 }, 0x00f4f0ea, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
     roundFill(dc, .{ .left = 310, .top = 249, .right = 824, .bottom = 289 }, 9, 0x00201915);
     if (game_folder_length == 0) {
         localizedText(dc, .folder_empty, .{ .left = 326, .top = 260, .right = 808, .bottom = 283 }, 0x007e746d, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
@@ -645,23 +787,23 @@ fn drawLibrary(dc: Win32.DeviceContext) void {
         text(dc, &game_folder, @intCast(game_folder_length), .{ .left = 326, .top = 260, .right = 808, .bottom = 283 }, 0x00d8d0c9, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
     }
     button(dc, .{ .left = 846, .top = 249, .right = 1058, .bottom = 289 }, .choose_folder, false);
-    localizedText(dc, .legal_notice, .{ .left = 310, .top = 302, .right = 1048, .bottom = 322 }, 0x007e746d, small_font, Win32.dt_left);
+    localizedText(dc, .legal_notice, .{ .left = 310, .top = 302, .right = 1048, .bottom = 322 }, 0x007e746d, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
 
     card(dc, .{ .left = 282, .top = 365, .right = 528, .bottom = 535 });
-    localizedText(dc, .sound, .{ .left = 306, .top = 389, .right = 410, .bottom = 410 }, 0x009b9088, small_font, Win32.dt_left);
+    localizedText(dc, .sound, .{ .left = 306, .top = 389, .right = 410, .bottom = 410 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
     localizedText(dc, if (sound_enabled) .enabled else .disabled, .{ .left = 306, .top = 423, .right = 435, .bottom = 450 }, 0x00f4f0ea, medium_font, Win32.dt_left);
     drawToggle(dc, 442, 420, sound_enabled);
     localizedText(dc, .sound_timing, .{ .left = 306, .top = 470, .right = 498, .bottom = 522 }, 0x008b817a, small_font, Win32.dt_left | Win32.dt_word_break);
 
     card(dc, .{ .left = 550, .top = 365, .right = 1086, .bottom = 535 });
-    localizedText(dc, .controls, .{ .left = 576, .top = 389, .right = 760, .bottom = 410 }, 0x009b9088, small_font, Win32.dt_left);
+    localizedText(dc, .controls, .{ .left = 576, .top = 389, .right = 760, .bottom = 410 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
     localizedText(dc, inputModeTitle(), .{ .left = 576, .top = 422, .right = 970, .bottom = 450 }, 0x00f4f0ea, medium_font, Win32.dt_left);
     localizedText(dc, inputModeDescription(), .{ .left = 576, .top = 462, .right = 1010, .bottom = 493 }, 0x008b817a, regular_font, Win32.dt_left);
-    localizedText(dc, .configure_layout, .{ .left = 576, .top = 502, .right = 850, .bottom = 525 }, 0x00ffac64, regular_font, Win32.dt_left);
+    localizedText(dc, .configure_layout, .{ .left = 576, .top = 502, .right = 850, .bottom = 525 }, 0x00ffac64, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
 
     roundFill(dc, .{ .left = 282, .top = 564, .right = 1086, .bottom = 616 }, 10, 0x00251f1b);
     roundFill(dc, .{ .left = 300, .top = 581, .right = 309, .bottom = 590 }, 5, 0x0068d391);
-    localizedText(dc, .core_ready, .{ .left = 323, .top = 577, .right = 760, .bottom = 602 }, 0x00bbb2aa, regular_font, Win32.dt_left);
+    localizedText(dc, .core_ready, .{ .left = 323, .top = 577, .right = 760, .bottom = 602 }, 0x00bbb2aa, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
     button(dc, .{ .left = 812, .top = 646, .right = 1086, .bottom = 700 }, .launch_game, game_folder_length == 0);
 }
 
@@ -678,7 +820,10 @@ fn drawInput(dc: Win32.DeviceContext) void {
         text(dc, &number, 1, .{ .left = left, .top = 218, .right = left + 24, .bottom = 234 }, if (selected) 0x00181510 else 0x00a89e96, small_font, Win32.dt_center);
     }
 
-    localizedText(dc, .keyboard_layout, .{ .left = 282, .top = 278, .right = 650, .bottom = 300 }, 0x009b9088, small_font, Win32.dt_left);
+    drawPadPresence(dc);
+    drawPadTest(dc);
+
+    localizedText(dc, .keyboard_layout, .{ .left = 282, .top = 278, .right = 650, .bottom = 300 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
     for (0..mapping.len) |index| {
         const column: i32 = @intCast(index / 7);
         const row: i32 = @intCast(index % 7);
@@ -690,34 +835,95 @@ fn drawInput(dc: Win32.DeviceContext) void {
         const key_length = keyDisplayName(mapping[index], &key_buffer);
         text(dc, &key_buffer, @intCast(key_length), .{ .left = left + 218, .top = top + 10, .right = left + 356, .bottom = top + 33 }, if (capture_mapping == index) 0x00ffac64 else 0x00f4f0ea, medium_font, Win32.dt_right);
     }
-    localizedText(dc, .mapping_hint, .{ .left = 282, .top = 660, .right = 1086, .bottom = 686 }, 0x008b817a, small_font, Win32.dt_left);
+    localizedText(dc, .mapping_hint, .{ .left = 282, .top = 660, .right = 1086, .bottom = 686 }, 0x008b817a, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
+}
+
+/// Reports whether a Sony pad is attached, and which one.
+///
+/// The XInput slot beside it selects an Xbox-compatible controller; a DualSense
+/// or DualShock 4 is read straight from HID and needs no slot, so saying which
+/// path is live is the only way to tell that a connected pad will actually be
+/// heard.
+fn drawPadPresence(dc: Win32.DeviceContext) void {
+    const area = Rect{ .left = 282, .top = 252, .right = 1086, .bottom = 274 };
+    const connected = pad_presence.connected;
+    roundFill(dc, .{ .left = area.left, .top = area.top + 6, .right = area.left + 10, .bottom = area.top + 16 }, 5, if (connected) 0x0055c46a else 0x00554a44);
+    if (pad_presence.family) |family| {
+        const name = switch (family) {
+            .dual_sense => "DualSense",
+            .dual_shock_4 => "DualShock 4",
+        };
+        textUtf8(dc, name, .{ .left = area.left + 20, .top = area.top, .right = area.right, .bottom = area.bottom }, 0x00d8d0c9, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
+        return;
+    }
+    localizedText(dc, .pad_absent, .{ .left = area.left + 20, .top = area.top, .right = area.right, .bottom = area.bottom }, 0x008b817a, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
+}
+
+/// Runs the pad through a second of rumble and its colour sweep, so a player
+/// can tell a pad that is merely detected from one the host can actually drive.
+fn drawPadTest(dc: Win32.DeviceContext) void {
+    if (!pad_presence.connected) return;
+    const running = input.hid.testRunning();
+    roundFill(dc, pad_test_rect, 8, if (running) 0x00ff9c3d else 0x00352c27);
+
+    // The swatch is the light bar the pad is showing at this instant, so the
+    // button doubles as the readout for its own test: a pad that rumbles but
+    // never lights up is visible here without watching the hardware.
+    const swatch = Rect{
+        .left = pad_test_rect.left + 12,
+        .top = pad_test_rect.top + 8,
+        .right = pad_test_rect.left + 24,
+        .bottom = pad_test_rect.top + 20,
+    };
+    const swatch_colour: u32 = if (input.hid.testColour()) |colour|
+        deviceColour(colour[0], colour[1], colour[2])
+    else if (running)
+        0x00181510
+    else
+        0x00a89e96;
+    roundFill(dc, swatch, 6, swatch_colour);
+
+    localizedText(
+        dc,
+        .pad_test,
+        .{ .left = swatch.right + 8, .top = pad_test_rect.top + 6, .right = pad_test_rect.right - 10, .bottom = pad_test_rect.bottom },
+        if (running) 0x00181510 else 0x00d8d0c9,
+        small_font,
+        Win32.dt_center | Win32.dt_end_ellipsis,
+    );
+}
+
+/// GDI takes its colours as blue, green and red packed low to high, which is
+/// the reverse of the order the pad reports them in.
+fn deviceColour(red: u8, green: u8, blue: u8) u32 {
+    return (@as(u32, blue) << 16) | (@as(u32, green) << 8) | @as(u32, red);
 }
 
 fn drawSettings(dc: Win32.DeviceContext) void {
     pageHeading(dc, .settings_heading, .settings_subtitle);
-    localizedText(dc, .language, .{ .left = 282, .top = 158, .right = 600, .bottom = 180 }, 0x009b9088, small_font, Win32.dt_left);
+    localizedText(dc, .language, .{ .left = 282, .top = 158, .right = 600, .bottom = 180 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
     drawLanguageCard(dc, .english, .{ .left = 282, .top = 190, .right = 472, .bottom = 246 }, "English");
     drawLanguageCard(dc, .russian, .{ .left = 486, .top = 190, .right = 676, .bottom = 246 }, "Русский");
     drawLanguageCard(dc, .german, .{ .left = 690, .top = 190, .right = 880, .bottom = 246 }, "Deutsch");
     drawLanguageCard(dc, .french, .{ .left = 894, .top = 190, .right = 1086, .bottom = 246 }, "Français");
 
     card(dc, .{ .left = 282, .top = 278, .right = 1086, .bottom = 360 });
-    localizedText(dc, .sound_output, .{ .left = 310, .top = 296, .right = 550, .bottom = 321 }, 0x00f4f0ea, medium_font, Win32.dt_left);
-    localizedText(dc, .sound_output_description, .{ .left = 310, .top = 328, .right = 760, .bottom = 350 }, 0x008b817a, regular_font, Win32.dt_left);
+    localizedText(dc, .sound_output, .{ .left = 310, .top = 296, .right = 550, .bottom = 321 }, 0x00f4f0ea, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    localizedText(dc, .sound_output_description, .{ .left = 310, .top = 328, .right = 760, .bottom = 350 }, 0x008b817a, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
     drawToggle(dc, 988, 302, sound_enabled);
 
     card(dc, .{ .left = 282, .top = 382, .right = 1086, .bottom = 464 });
-    localizedText(dc, .fps_counter, .{ .left = 310, .top = 400, .right = 550, .bottom = 425 }, 0x00f4f0ea, medium_font, Win32.dt_left);
-    localizedText(dc, .fps_counter_description, .{ .left = 310, .top = 432, .right = 860, .bottom = 454 }, 0x008b817a, regular_font, Win32.dt_left);
+    localizedText(dc, .fps_counter, .{ .left = 310, .top = 400, .right = 550, .bottom = 425 }, 0x00f4f0ea, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    localizedText(dc, .fps_counter_description, .{ .left = 310, .top = 432, .right = 860, .bottom = 454 }, 0x008b817a, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
     drawToggle(dc, 988, 406, show_fps);
 
     card(dc, .{ .left = 282, .top = 486, .right = 1086, .bottom = 588 });
-    localizedText(dc, .compatibility, .{ .left = 310, .top = 504, .right = 550, .bottom = 530 }, 0x00f4f0ea, medium_font, Win32.dt_left);
+    localizedText(dc, .compatibility, .{ .left = 310, .top = 504, .right = 550, .bottom = 530 }, 0x00f4f0ea, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
     localizedText(dc, .compatibility_text, .{ .left = 310, .top = 538, .right = 1048, .bottom = 578 }, 0x00aaa098, regular_font, Win32.dt_left | Win32.dt_word_break);
 
     card(dc, .{ .left = 282, .top = 610, .right = 1086, .bottom = 700 });
     text(dc, w("PS5PCEM"), -1, .{ .left = 310, .top = 627, .right = 500, .bottom = 654 }, 0x00f4f0ea, medium_font, Win32.dt_left);
-    localizedText(dc, .author, .{ .left = 310, .top = 667, .right = 840, .bottom = 691 }, 0x00ffac64, regular_font, Win32.dt_left);
+    localizedText(dc, .author, .{ .left = 310, .top = 667, .right = 840, .bottom = 691 }, 0x00ffac64, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
     text(dc, w("GPL-3.0-or-later"), -1, .{ .left = 860, .top = 667, .right = 1048, .bottom = 691 }, 0x008b817a, regular_font, Win32.dt_right);
 }
 
@@ -725,7 +931,10 @@ fn pageHeading(dc: Win32.DeviceContext, heading: Phrase, subtitle: Phrase) void 
     localizedText(dc, heading, .{ .left = 282, .top = 42, .right = 1000, .bottom = 82 }, 0x00f4f0ea, title_font, Win32.dt_left);
     localizedText(dc, subtitle, .{ .left = 282, .top = 91, .right = 1086, .bottom = 118 }, 0x009b9088, regular_font, Win32.dt_left);
     roundFill(dc, .{ .left = 984, .top = 44, .right = 1086, .bottom = 72 }, 14, 0x00342a25);
-    text(dc, w("EARLY BUILD"), -1, .{ .left = 1000, .top = 52, .right = 1072, .bottom = 67 }, 0x00ffac64, small_font, Win32.dt_center);
+    // The label needs the pill's whole inner width. A narrower rectangle
+    // centred the text and then clipped both of its ends, which read as a
+    // misspelling rather than as truncation.
+    text(dc, w("EARLY BUILD"), -1, .{ .left = 988, .top = 52, .right = 1082, .bottom = 68 }, 0x00ffac64, small_font, Win32.dt_center | Win32.dt_end_ellipsis);
 }
 
 fn drawFooter(dc: Win32.DeviceContext) void {
@@ -1177,6 +1386,13 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     const wm_paint: u32 = 0x000f;
     const wm_close: u32 = 0x0010;
     const wm_erase_background: u32 = 0x0014;
+    const wm_timer: u32 = 0x0113;
+    const wm_device_change: u32 = 0x0219;
+    const hit_test_client: u16 = 1;
+    const wm_set_cursor: u32 = 0x0020;
+    // IDC_HAND is an odd numeric identifier passed in a pointer slot, so it
+    // cannot carry the alignment a real UTF-16 string would.
+    const hand_cursor: [*:0]align(1) const u16 = @ptrFromInt(32649);
     const wm_key_down: u32 = 0x0100;
     const wm_left_button_up: u32 = 0x0202;
     const transparent: i32 = 1;
@@ -1188,6 +1404,7 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     const dt_end_ellipsis: u32 = 0x8000;
     const null_pen: i32 = 8;
     const arrow_cursor: [*:0]const u16 = @ptrFromInt(32512);
+    const NativePoint = extern struct { x: i32 = 0, y: i32 = 0 };
     const error_class_already_exists: u32 = 1410;
     const bif_return_only_fs_dirs: u32 = 0x0001;
     const bif_new_dialog_style: u32 = 0x0040;
@@ -1217,7 +1434,13 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     extern "user32" fn GetMessageW(*Message, Window, u32, u32) callconv(.winapi) i32;
     extern "user32" fn TranslateMessage(*const Message) callconv(.winapi) i32;
     extern "user32" fn DispatchMessageW(*const Message) callconv(.winapi) isize;
-    extern "user32" fn LoadCursorW(Instance, [*:0]const u16) callconv(.winapi) Cursor;
+    extern "user32" fn LoadCursorW(Instance, [*:0]align(1) const u16) callconv(.winapi) Cursor;
+    extern "user32" fn SetCursor(Cursor) callconv(.winapi) Cursor;
+    extern "user32" fn AdjustWindowRect(*NativeRect, u32, i32) callconv(.winapi) i32;
+    extern "user32" fn SetTimer(Window, usize, u32, ?*anyopaque) callconv(.winapi) usize;
+    extern "user32" fn KillTimer(Window, usize) callconv(.winapi) i32;
+    extern "user32" fn GetCursorPos(*NativePoint) callconv(.winapi) i32;
+    extern "user32" fn ScreenToClient(Window, *NativePoint) callconv(.winapi) i32;
     extern "user32" fn LoadIconW(Instance, ?[*:0]const u16) callconv(.winapi) Icon;
     extern "user32" fn BeginPaint(Window, *PaintStruct) callconv(.winapi) DeviceContext;
     extern "user32" fn EndPaint(Window, *const PaintStruct) callconv(.winapi) i32;

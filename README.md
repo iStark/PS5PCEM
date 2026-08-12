@@ -26,7 +26,10 @@ If you would like to support continued PS5PCEM development, you can do so on
   returns synchronized NV12 video plus stereo PCM through the title's own
   allocation and file callbacks.
 - A native Windows launcher selects a title directory, persists sound and input
-  profiles, and starts `game-run` with XInput, keyboard, or hybrid controls.
+  profiles, and starts `game-run` with controller, keyboard, or hybrid controls.
+  Sony's own pads are read directly over HID, so a DualSense or DualShock 4
+  works without a translation layer; the launcher reports which one it found and
+  can drive its motors and light bar as a check.
 - Guest vertex and pixel shaders can render sampled textures using AGC vertex
   tables, per-instruction V# mappings, `VertexIndex`, PARAM exports, and
   fragment interpolation.
@@ -209,7 +212,7 @@ Eleven modules cover the independent subsystems and their end-to-end composition
 | **`gpu`** | Decodes, snapshots, schedules, and executes the stateful part of submitted GPU command streams |
 | **`vulkan`** | Owns the host Vulkan device, queues, command submission and renderer boundary |
 | **`window`** | Owns the native host window and its platform message loop |
-| **`input`** | Polls XInput and the host keyboard, then applies launcher remapping profiles |
+| **`input`** | Reads Sony pads over HID, falls back to XInput, polls the host keyboard, and applies launcher remapping profiles |
 | **`loader`** | Reads, maps, and relocates bare ELF64 and decrypted PS5 SELF module images |
 | **`hle`** | High-level emulation of guest firmware, files, memory, synchronization, media, network, and platform services |
 | **`cpu`** | Dispatches guest execution and provides the Windows x86-64 native machine bridge |
@@ -267,12 +270,38 @@ The optional counter updates the measured guest flip rate once per second in
 the Vulkan game-window title. Direct command-line runs can enable it with
 `PS5_SHOW_FPS=1`.
 
-Input profiles can use the first XInput controller, a remappable keyboard
-profile, or both at once. WASD controls the left stick; Alt plus the arrow keys
-controls the right stick. The launcher passes these preferences through
+Input profiles can use a controller, a remappable keyboard profile, or both at
+once. A DualSense or DualShock 4 is read straight from HID over either USB or
+Bluetooth and takes precedence; XInput remains the path for Xbox-compatible
+pads and for anything presenting itself as one. WASD controls the left stick;
+Alt plus the arrow keys controls the right stick. The launcher passes these preferences through
 `PS5_INPUT_MODE`, `PS5_CONTROLLER_INDEX`, `PS5_KEYMAP`, `PS5_SHOW_FPS`, and
 `PS5_AUDIO_DISABLED`, so direct CLI and automated runs keep their previous
 behaviour unless those variables are set.
+
+XInput cannot enumerate Sony's controllers at all: it reports only
+Xbox-compatible devices, so a pad plugged straight into the host is invisible to
+it and appears connected only when a translation layer puts a virtual Xbox pad
+in front of it. The input module therefore opens the device over HID and decodes
+its reports. Both the DualSense (including the Edge revision) and the
+DualShock 4 are covered, over USB and over Bluetooth: the fields are the same in
+every form and only their offsets move, because Bluetooth prefixes the payload
+and the DualSense carries its triggers ahead of the button bytes. The
+directional pad arrives as one of eight compass positions rather than four
+independent bits. Reads are overlapped and never block; a poll drains the
+driver's queue and keeps the newest report, because the queue holds several
+samples once a frame runs long and answering with the oldest would make the
+sticks lag by however far behind the emulator had fallen.
+
+The same path drives the pad. Output reports carry both motors and the light
+bar, and over Bluetooth they are shifted along and end in a checksum the pad
+verifies before acting, so a report built for the cable is ignored over the air.
+The launcher's input page reports which pad it found and offers a one-second
+test that runs both motors while sweeping the light bar through its colours; the
+button mirrors the colour it is currently showing, so a pad that rumbles but
+never lights up is visible without watching the hardware. The device is opened
+shared and for writing where the host allows it, falling back to reading only
+when another process already holds it for output.
 
 Graphics bring-up runs can set `PS5_CAPTURE_FIRST_FRAME=1` to write the first
 submitted guest draw to `out\first-frame.ppm`. `PS5_PROBE_FRAGMENT_COLOR=1`

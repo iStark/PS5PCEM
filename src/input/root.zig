@@ -10,6 +10,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+pub const dualshock = @import("dualshock.zig");
+pub const hid = @import("hid.zig");
 
 pub const Mode = enum {
     /// Preserve the old unattended bring-up behaviour when game-run is invoked
@@ -140,6 +142,10 @@ fn mergeKeyboard(state: *State, keys: Mapping) void {
 
 fn mergeController(state: *State) void {
     if (comptime builtin.os.tag != .windows) return;
+    // Sony's own pads are not XInput devices, so they are read straight from
+    // HID and take precedence. XInput remains the path for Xbox-compatible
+    // controllers and for anything presenting itself as one.
+    if (hid.poll()) |pad| return mergeSonyPad(state, pad);
     var native: Win32.XInputState = .{};
     if (Win32.XInputGetState(controllerIndex(), &native) != 0) return;
     const pad = native.gamepad;
@@ -165,6 +171,39 @@ fn mergeController(state: *State) void {
     state.left_stick_y = invertStickAxis(pad.thumb_ly);
     state.right_stick_x = stickAxis(pad.thumb_rx);
     state.right_stick_y = invertStickAxis(pad.thumb_ry);
+}
+
+fn mergeSonyPad(state: *State, pad: dualshock.Pad) void {
+    state.connected = true;
+    const bindings = [_]struct { held: bool, mask: u32 }{
+        .{ .held = pad.cross, .mask = Button.cross },
+        .{ .held = pad.circle, .mask = Button.circle },
+        .{ .held = pad.square, .mask = Button.square },
+        .{ .held = pad.triangle, .mask = Button.triangle },
+        .{ .held = pad.l1, .mask = Button.l1 },
+        .{ .held = pad.r1, .mask = Button.r1 },
+        .{ .held = pad.l2, .mask = Button.l2 },
+        .{ .held = pad.r2, .mask = Button.r2 },
+        .{ .held = pad.l3, .mask = Button.l3 },
+        .{ .held = pad.r3, .mask = Button.r3 },
+        .{ .held = pad.options, .mask = Button.options },
+        .{ .held = pad.touch_pad, .mask = Button.touch_pad },
+        .{ .held = pad.up, .mask = Button.up },
+        .{ .held = pad.right, .mask = Button.right },
+        .{ .held = pad.down, .mask = Button.down },
+        .{ .held = pad.left, .mask = Button.left },
+    };
+    for (bindings) |binding| {
+        if (binding.held) state.buttons |= binding.mask;
+    }
+    // The reports already use the guest's own convention: unsigned axes with
+    // 128 at rest and Y growing downwards, so nothing is inverted here.
+    state.left_stick_x = pad.left_x;
+    state.left_stick_y = pad.left_y;
+    state.right_stick_x = pad.right_x;
+    state.right_stick_y = pad.right_y;
+    state.analog_l2 = pad.analog_l2;
+    state.analog_r2 = pad.analog_r2;
 }
 
 fn controllerIndex() u32 {
@@ -287,4 +326,9 @@ test "keyboard mapping parser changes only named keys" {
     try std.testing.expectEqual(@as(u8, 'X'), value.cross);
     try std.testing.expectEqual(@as(u8, 'C'), value.circle);
     try std.testing.expectEqual(@as(u8, 'F'), value.square);
+}
+
+test {
+    _ = dualshock;
+    _ = hid;
 }
