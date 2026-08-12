@@ -35,6 +35,8 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceAgcGetDataPacketPayloadRange", .function = trace.wrap("sceAgcGetDataPacketPayloadRange", &agc.zeroQuery), .expect_id = "s+VGAMDQ0AQ" },
     .{ .name = "sceAgcDmaDataPatchSetDstAddressOrOffset", .function = trace.wrap("sceAgcDmaDataPatchSetDstAddressOrOffset", &agc.patchCommand), .expect_id = "IxYiarKlXxM" },
     .{ .name = "sceAgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate", .function = trace.wrap("sceAgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate", &agc.patchCommand), .expect_id = "cdDRpqcFGbU" },
+    .{ .name = "sceAgcWriteDataPatchSetCachePolicy", .function = trace.wrap("sceAgcWriteDataPatchSetCachePolicy", &agc.patchCommand), .expect_id = "eAy8eGNsCuU" },
+    .{ .name = "sceAgcWriteDataPatchSetDst", .function = trace.wrap("sceAgcWriteDataPatchSetDst", &agc.patchCommand), .expect_id = "tmy-+rBpspY" },
     .{ .name = "sceAgcWaitRegMemPatchCompareFunction", .function = trace.wrap("sceAgcWaitRegMemPatchCompareFunction", &agc.patchCommand), .expect_id = "n485EBnIWmk" },
     .{ .name = "sceAgcWaitRegMemPatchReference", .function = trace.wrap("sceAgcWaitRegMemPatchReference", &agc.patchCommand), .expect_id = "7nOoijNPvEU" },
     .{ .name = "sceAgcQueueEndOfPipeActionPatchGcrCntl", .function = trace.wrap("sceAgcQueueEndOfPipeActionPatchGcrCntl", &agc.patchCommand), .expect_id = "J8YCgfKAMQs" },
@@ -142,6 +144,18 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceAgcDcbSetPredicationDisableGetSize", .function = trace.wrap("sceAgcDcbSetPredicationDisableGetSize", &agc.writeCommand), .expect_id = "vLrBL8DQiz8" },
     .{ .name = "sceAgcDcbPrimeUtcl2GetSize", .function = trace.wrap("sceAgcDcbPrimeUtcl2GetSize", &agc.writeCommand), .expect_id = "KjPeVduz6jU" },
     .{ .name = "sceAgcDcbSetIndexIndirectArgsGetSize", .function = trace.wrap("sceAgcDcbSetIndexIndirectArgsGetSize", &agc.writeCommand), .expect_id = "AFIh8SQkYlQ" },
+    // These identifiers occur in the AGC 1.1 surface used by Rita's Rewind,
+    // but their public SDK spellings are not present in the available symbol
+    // lists.  Keep them explicit and traced until their command ABI is
+    // identified from a live call; returning success is safe for patch/config
+    // helpers and avoids fabricating a packet of an unknown width.
+    .{ .name = "sceAgcUnknownY5K5tPktiL8", .function = trace.wrap("sceAgcUnknownY5K5tPktiL8", &agc.accept), .id_override = "y5K5tPktiL8" },
+    .{ .name = "sceAgcUnknown6nths4DHNrs", .function = trace.wrap("sceAgcUnknown6nths4DHNrs", &agc.accept), .id_override = "6nths4DHNrs" },
+    .{ .name = "sceAgcUnknownICkECTBxrMw", .function = trace.wrap("sceAgcUnknownICkECTBxrMw", &agc.accept), .id_override = "ICkECTBxrMw" },
+    .{ .name = "sceAgcUnknownEJBA4dbmvfg", .function = trace.wrap("sceAgcUnknownEJBA4dbmvfg", &agc.accept), .id_override = "EJBA4dbmvfg" },
+    .{ .name = "sceAgcUnknownRTpjTIlvZc", .function = trace.wrap("sceAgcUnknownRTpjTIlvZc", &agc.accept), .id_override = "RTpj-tIlvZc" },
+    .{ .name = "sceAgcUnknownSwI6QxqwAC0", .function = trace.wrap("sceAgcUnknownSwI6QxqwAC0", &agc.accept), .id_override = "SwI6QxqwAC0" },
+    .{ .name = "sceAgcUnknownD4NZIlguzv0", .function = trace.wrap("sceAgcUnknownD4NZIlguzv0", &agc.accept), .id_override = "d4NZIlguzv0" },
 };
 
 pub const driver_exports = [_]symbols.Export{
@@ -177,4 +191,11 @@ pub const driver_exports = [_]symbols.Export{
     .{ .name = "sceAgcDriverSetResourceUserData", .function = trace.wrap("sceAgcDriverSetResourceUserData", &agc.accept), .expect_id = "VOMSpd9+vxU" },
     .{ .name = "sceAgcDriverGetResourceShaderGuid", .function = trace.wrap("sceAgcDriverGetResourceShaderGuid", &agc.refuse), .expect_id = "mXn+K9E-wOA" },
     .{ .name = "sceAgcDriverGetOwnerName", .function = trace.wrap("sceAgcDriverGetOwnerName", &agc.refuse), .expect_id = "LepGrgk77sM" },
+    // Newer driver helpers without recovered public names.  They are traced so
+    // their argument shapes can be promoted to typed implementations as soon
+    // as a title reaches them.
+    .{ .name = "sceAgcDriverUnknownICaGtkEIXTk", .function = trace.wrap("sceAgcDriverUnknownICaGtkEIXTk", &agc.accept), .id_override = "ICaGtkEIXTk" },
+    .{ .name = "sceAgcDriverUnknownWHIOMbbIIU", .function = trace.wrap("sceAgcDriverUnknownWHIOMbbIIU", &agc.accept), .id_override = "WHIOMbb+iIU" },
+    .{ .name = "sceAgcDriverUnknownChJWZcNSzjk", .function = trace.wrap("sceAgcDriverUnknownChJWZcNSzjk", &agc.accept), .id_override = "chJWZcNSzjk" },
+    .{ .name = "sceAgcDriverUnknownIAOE3jCnkk", .function = trace.wrap("sceAgcDriverUnknownIAOE3jCnkk", &agc.accept), .id_override = "+iAOE3jCnkk" },
 };

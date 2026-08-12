@@ -418,6 +418,7 @@ fn nativeVop3Opcode(id: u32) isa.Opcode {
         0x16a => .v_mul_hi_u32,
         0x16b => .v_mul_lo_i32,
         0x16c => .v_mul_hi_i32,
+        0x15d => .v_sad_u32,
         0x178 => .v_xor3_b32,
         0x345 => .v_xad_u32,
         0x346 => .v_lshl_add_u32,
@@ -573,6 +574,20 @@ test "native VOP3 shift-add opcode uses three sources" {
     try std.testing.expectEqual(@as(i32, 6), inst.src1.signed_val);
     try std.testing.expectEqual(isa.OperandKind.vgpr, inst.src2.kind);
     try std.testing.expectEqual(@as(u32, 0), inst.src2.reg);
+}
+
+test "native VOP3 unsigned SAD opcode uses three sources" {
+    // v_sad_u32 v5, s16, 0, v5 — emitted by Rita's Rewind vertex shaders.
+    const code = [_]u32{ 0xd55d_0005, 0x0415_0010 };
+    const inst = try decodeVop3(0x1c, &code, 0);
+    try std.testing.expectEqual(isa.Opcode.v_sad_u32, inst.opcode);
+    try std.testing.expectEqual(@as(u32, 3), inst.src_count);
+    try std.testing.expectEqual(isa.OperandKind.sgpr, inst.src0.kind);
+    try std.testing.expectEqual(@as(u32, 16), inst.src0.reg);
+    try std.testing.expectEqual(isa.OperandKind.integer_inline_constant, inst.src1.kind);
+    try std.testing.expectEqual(@as(i32, 0), inst.src1.signed_val);
+    try std.testing.expectEqual(isa.OperandKind.vgpr, inst.src2.kind);
+    try std.testing.expectEqual(@as(u32, 5), inst.src2.reg);
 }
 
 test "VOP3B addc decodes scalar carry input and destination" {

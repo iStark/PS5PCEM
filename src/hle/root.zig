@@ -27,6 +27,7 @@ pub const libs = struct {
     pub const bootstrap_services = @import("libs/bootstrap_services.zig");
     pub const cxx_abi = @import("libs/cxx_abi.zig");
     pub const dialogs = @import("libs/dialogs.zig");
+    pub const fiber = @import("libs/fiber.zig");
     pub const kernel_event_queue = @import("libs/kernel_event_queue.zig");
     pub const kernel_info = @import("libs/kernel_info.zig");
     pub const kernel_ioctl = @import("libs/kernel_ioctl.zig");
@@ -69,6 +70,7 @@ pub fn registerAll(db: *Database, gpa: @import("std").mem.Allocator) symbols.Err
     try libs.bootstrap_services.register(db, gpa);
     try libs.cxx_abi.register(db, gpa);
     try libs.dialogs.register(db, gpa);
+    try libs.fiber.register(db, gpa);
     try libs.kernel_event_queue.register(db, gpa);
     try libs.kernel_files.register(db, gpa);
     try libs.kernel_info.register(db, gpa);
@@ -95,6 +97,7 @@ test {
     _ = libs.bootstrap_services;
     _ = libs.cxx_abi;
     _ = libs.dialogs;
+    _ = libs.fiber;
     _ = nid;
     _ = abi;
     _ = trace;

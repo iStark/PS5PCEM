@@ -334,7 +334,11 @@ pub const npmanager_exports = [_]symbols.Export{
     .{ .name = "sceNpDeleteRequest", .function = trace.wrap("sceNpDeleteRequest", &services.offline), .expect_id = "S7QTn72PrDw" },
     .{ .name = "sceNpGetUserIdByAccountId", .function = trace.wrap("sceNpGetUserIdByAccountId", &services.offline), .expect_id = "VgYczPGB5ss" },
     .{ .name = "sceNpGetOnlineId", .function = trace.wrap("sceNpGetOnlineId", &services.offline), .expect_id = "XDncXQIJUSk" },
-    .{ .name = "sceNpRegisterStateCallbackA", .function = trace.wrap("sceNpRegisterStateCallbackA", &services.offline), .expect_id = "qQJfO8HAiaY" },
+    // Registration itself is local and succeeds on an offline console.  No
+    // callback is delivered until the NP state changes, which cannot happen in
+    // the emulator's stable offline profile.
+    .{ .name = "sceNpRegisterStateCallbackA", .function = trace.wrap("sceNpRegisterStateCallbackA", &services.accept), .expect_id = "qQJfO8HAiaY" },
+    .{ .name = "sceNpRegisterNpReachabilityStateCallback", .function = trace.wrap("sceNpRegisterNpReachabilityStateCallback", &services.accept), .expect_id = "hw5KNqAAels" },
     .{ .name = "sceNpCheckNpReachability", .function = trace.wrap("sceNpCheckNpReachability", &services.offline), .expect_id = "KfGZg2y73oM" },
     .{ .name = "sceNpHasSignedUp", .function = trace.wrap("sceNpHasSignedUp", &services.offline), .expect_id = "Oad3rvY-NJQ" },
 };

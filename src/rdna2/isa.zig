@@ -335,6 +335,7 @@ pub const Opcode = enum {
     v_mul_hi_u32,
     v_mul_lo_i32,
     v_mul_hi_i32,
+    v_sad_u32,
     v_xad_u32,
     v_lshl_add_u32,
     v_add_lshl_u32,

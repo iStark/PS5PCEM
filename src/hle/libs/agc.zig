@@ -342,6 +342,29 @@ test "the size a title is told matches what a write consumes" {
     try testing.expectEqual(@as(usize, announced), consumed);
 }
 
+test "Rita's Rewind AGC 1.1 imports resolve" {
+    var db = symbols.Database{};
+    defer db.deinit(testing.allocator);
+    try register(&db, testing.allocator);
+    inline for (&.{
+        "eAy8eGNsCuU",
+        "tmy-+rBpspY",
+        "y5K5tPktiL8",
+        "6nths4DHNrs",
+        "ICkECTBxrMw",
+        "EJBA4dbmvfg",
+        "RTpj-tIlvZc",
+        "SwI6QxqwAC0",
+        "d4NZIlguzv0",
+        "ICaGtkEIXTk",
+        "WHIOMbb+iIU",
+        "chJWZcNSzjk",
+        "+iAOE3jCnkk",
+    }) |id| {
+        try testing.expect(db.findById(id, .function) != null);
+    }
+}
+
 test "a buffer with no room left says so instead of writing past its end" {
     var storage: [command_words]u32 = @splat(0);
     var buffer = fixture(&storage);

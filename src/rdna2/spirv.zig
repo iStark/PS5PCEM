@@ -1457,6 +1457,30 @@ const Builder = struct {
         try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
     }
 
+    /// V_SAD_U32: dst = abs(src0 - src1) + src2, with unsigned operands.
+    fn sadUnsigned(self: *Builder, inst: instruction.Instruction) Error!void {
+        const a = try self.source(inst.src0, .bits32);
+        const b = try self.source(inst.src1, .bits32);
+        const addend = try self.source(inst.src2, .bits32);
+        const a_less_b = self.id();
+        try self.emit(&self.body, 176, &.{ self.bool_type, a_less_b, a, b }); // OpULessThan
+        const a_minus_b = self.id();
+        try self.emit(&self.body, 130, &.{ self.bits_type, a_minus_b, a, b }); // OpISub
+        const b_minus_a = self.id();
+        try self.emit(&self.body, 130, &.{ self.bits_type, b_minus_a, b, a }); // OpISub
+        const difference = self.id();
+        try self.emit(&self.body, 169, &.{ // OpSelect
+            self.bits_type,
+            difference,
+            a_less_b,
+            b_minus_a,
+            a_minus_b,
+        });
+        const result = self.id();
+        try self.emit(&self.body, 128, &.{ self.bits_type, result, difference, addend }); // OpIAdd
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
     fn shiftLeftOr(self: *Builder, inst: instruction.Instruction) Error!void {
         const value = try self.source(inst.src0, .bits32);
         const raw_shift = try self.source(inst.src1, .bits32);
@@ -3353,6 +3377,7 @@ const Builder = struct {
             .v_xor3_b32 => try self.ternaryBits(inst, 198, 198), // (a^b)^c
             .v_xad_u32 => try self.ternaryBits(inst, 198, 128), // (a^b)+c
             .v_add3_u32 => try self.ternaryBits(inst, 128, 128), // (a+b)+c
+            .v_sad_u32 => try self.sadUnsigned(inst),
             .v_lshl_or_b32 => try self.shiftLeftOr(inst),
             .s_sub_u32, .s_sub_i32, .v_sub_nc_u32 => try self.binary(inst, 130, .bits32, false), // OpISub
             .v_subrev_nc_u32 => try self.binary(inst, 130, .bits32, true),
@@ -4468,6 +4493,24 @@ test "native vector shift-add masks its shift and adds the third source" {
 
     try std.testing.expect(containsOpcode(module.words, 199)); // OpBitwiseAnd
     try std.testing.expect(containsOpcode(module.words, 196)); // OpShiftLeftLogical
+    try std.testing.expect(containsOpcode(module.words, 128)); // OpIAdd
+}
+
+test "native vector unsigned SAD lowers absolute difference plus addend" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xd55d_0005,
+        @as(u32, 16) | (@as(u32, 128) << 9) | (@as(u32, 256 + 5) << 18),
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .vertex });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expect(containsOpcode(module.words, 176)); // OpULessThan
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 130)); // OpISub
+    try std.testing.expect(containsOpcode(module.words, 169)); // OpSelect
     try std.testing.expect(containsOpcode(module.words, 128)); // OpIAdd
 }
 

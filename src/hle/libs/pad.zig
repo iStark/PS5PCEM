@@ -110,6 +110,20 @@ fn padClose(handle: i32) callconv(abi.guest) i32 {
     return errno.ok;
 }
 
+/// Returns the system-managed primary pad handle. Some titles never call
+/// scePadOpen and acquire the login user's already-associated controller only
+/// through this API, so obtaining the handle also makes it readable locally.
+fn padGetHandle(user_id: i32, port_type: i32, index: i32) callconv(abi.guest) i32 {
+    if (initialized.load(.acquire) == 0) return error_not_initialized;
+    if (user_id != user_service.primary_user_id or
+        (port_type != 0 and port_type != 1 and port_type != 2) or index != 0)
+    {
+        return error_device_not_connected;
+    }
+    open.store(1, .release);
+    return primary_handle;
+}
+
 fn fillPadData(output: *PadData) void {
     output.* = .{};
     const nanoseconds = kernel_runtime.realTimeNanoseconds();
@@ -225,6 +239,7 @@ pub const exports = [_]symbols.Export{
     .{ .name = "scePadInit", .function = trace.wrap("scePadInit", &padInit), .expect_id = "hv1luiJrqQM" },
     .{ .name = "scePadOpen", .function = trace.wrap("scePadOpen", &padOpen), .expect_id = "xk0AcarP3V4" },
     .{ .name = "scePadClose", .function = trace.wrap("scePadClose", &padClose), .expect_id = "6ncge5+l5Qs" },
+    .{ .name = "scePadGetHandle", .function = trace.wrap("scePadGetHandle", &padGetHandle), .expect_id = "u1GRHp+oWoY" },
     .{ .name = "scePadRead", .function = trace.wrap("scePadRead", &padRead), .expect_id = "q1cHNfGycLI" },
     .{ .name = "scePadReadState", .function = trace.wrap("scePadReadState", &padReadState), .expect_id = "YndgXqQVV7c" },
     .{ .name = "scePadGetControllerInformation", .function = trace.wrap("scePadGetControllerInformation", &getControllerInformation), .expect_id = "gjP9-KQzoUk" },
@@ -261,6 +276,17 @@ test "pad opens for the primary user and reports neutral connected data" {
     try std.testing.expectEqual(@as(u8, 128), data[0].left_stick_x);
     try std.testing.expectEqual(@as(u8, 1), data[0].connected);
     try std.testing.expectEqual(errno.ok, padClose(handle));
+}
+
+test "pad get handle exposes the system-managed primary controller" {
+    reset();
+    try std.testing.expectEqual(errno.ok, padInit());
+    const handle = padGetHandle(user_service.primary_user_id, 0, 0);
+    try std.testing.expectEqual(primary_handle, handle);
+
+    var data: [1]PadData = .{.{}};
+    try std.testing.expectEqual(@as(i32, 1), padRead(handle, &data, 1));
+    try std.testing.expectEqual(@as(u8, 1), data[0].connected);
 }
 
 test "pad exports include the PS5 remote-controller query" {

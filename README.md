@@ -73,6 +73,18 @@ If you would like to support continued PS5PCEM development, you can do so on
   bounded host implementations, avoiding multi-second general shader paths
   during the movie. This is an intro-video milestone; a repeatable menu or
   gameplay frame is not claimed yet.
+- Mighty Morphin Power Rangers: Rita's Rewind now resolves its Fiber, Pad,
+  offline NP, AGC 1.1, and AGC driver imports, then sustains the title's real
+  1920×1080 graphics and audio loop. Native Windows fibers preserve suspended
+  guest execution across `sceFiberRun`, `sceFiberSwitch`, and
+  `sceFiberReturnToThread`; `scePadGetHandle` exposes the system-associated
+  primary controller even when the title does not call `scePadOpen`. Its guest
+  vertex shaders use the newly decoded `V_SAD_U32`, so the animated publisher
+  and title intro renders through the actual indexed VS/PS, multi-target, and
+  sampled-image passes instead of the diagnostic triangle. The observed warmed
+  intro frames take roughly 13–20 ms on the current RTX 3070 Ti host, with no
+  shader fallback or visible audio stutter. This capture establishes the intro
+  path; menu and gameplay have not been validated yet.
 - PS VR2 libraries currently expose only compatibility/no-device behavior.
   VR plugins can initialize far enough to load Unity assets, but headset
   rendering, tracking, controllers, and a host OpenXR bridge do not exist yet.
@@ -141,6 +153,13 @@ multi-draw, sampled-texture, persistent-render-target, and VideoOut paths. This
 is an in-title rendering milestone rather than a gameplay claim: selecting
 `NEW GAME` currently stops the graphics loop before a playable scene appears.*
 
+![Mighty Morphin Power Rangers: Rita's Rewind intro rendered by PS5PCEM](docs/images/ritas-rewind-intro.png)
+
+*A live 1920×1080 Rita's Rewind publisher/title intro frame produced by the
+guest indexed vertex, sampled fragment, render-target composition, and VideoOut
+paths. The corresponding animation and audio remain smooth in the observed
+run; this is an intro milestone rather than a gameplay claim.*
+
 ![The Precinct Kwalee video frame rendered by PS5PCEM](docs/images/precinct-kwalee.png)
 
 *A decoded 3840x2160 H.264 frame from The Precinct's Kwalee intro, converted by
@@ -167,6 +186,7 @@ the repository contains none of that content.
 | **The Precinct** | Links the complete six-image guest graph, defers and starts Unity plug-ins through `sceKernelLoadStartModule`, enters Unity, indexes its audio assets, and plays both observed intro movies through the new SceAvPlayer path. The title receives synchronized 3840×2160 NV12 video and 48 kHz stereo PCM; its guest YUV conversion shader produces the recognizable Kwalee frame above. Post-video graphics continue through seven draws and nine dispatches per frame, with warmed-up frames around 20–22 ms on the current RTX 3070 Ti test host | The post-video scene source is still incorrect: draw 1 receives a sparse/corrupted pixel strip, draw 2 copies it to the scanout, and later UI draws do not restore a recognizable scene. Gameplay is not claimed yet |
 | **Jets 'n' Guns 2** | Resolves title content through `/app0`, completes AGC resource registration, and sustains the full graphics/compute/VideoOut loop. Targetless final passes are preserved through flip, while dynamic SGPR data and descriptor-sized buffer bounds keep streamed sprite batches on stable Vulkan pipelines. The title now renders the recognizable 3840×2160 title screen, main menu, and options UI shown above; warmed 53-draw startup frames measure roughly 113–124 ms on the current RTX 3070 Ti host with zero pipeline misses after warm-up | A manual `Cross` reaches the main menu without the automatic `Options` pulse, but selecting `NEW GAME` currently stops further flips after the audio decode/output loops exit. A playable scene and working in-game audio are therefore not claimed yet |
 | **Asterix & Obelix: Slap Them All!** | Maps the Unity/PSN plug-in graph, passes GameUpdate, trophy, entitlement, WebApi, and player-review bootstrap calls, accepts four-byte-aligned AGC shader headers, and reaches repeated 1920×1080 frames. SceAvPlayer returns the ATL intro as correctly decoded NV12 frames, while matched image-copy, planar-conversion, fullscreen-blit, and color-resolve paths keep the observed movie pipeline moving without its former multi-second shader compilation/dispatch blockers | The decoded source is recognizable, but final compositor scaling/presentation still needs validation and no repeatable menu or gameplay frame is claimed yet |
+| **Mighty Morphin Power Rangers: Rita's Rewind** | Resolves the observed Fiber, Pad, offline NP, AGC 1.1, and AGC driver imports, enters a stable 1920×1080 graphics/audio loop, and renders the animated publisher/title sequence shown above through real guest shaders. Native cooperative fibers retain suspended guest stacks, `scePadGetHandle` supplies a readable primary controller, and `V_SAD_U32` translation removes the diagnostic triangle fallback. Warmed intro frames measure roughly 13–20 ms on the current RTX 3070 Ti host | The current repeatable capture covers smooth intro animation/video and audio only. Menu navigation and gameplay rendering remain to be exercised before either is claimed |
 
 ## Components
 
@@ -379,7 +399,10 @@ merge regions, and records backward edges separately. `ir.zig` supplies the
 API-neutral typed boundary for ALU, memory, image, interpolation and export
 work. The SPIR-V 1.5 writer translates 32-bit move,
 integer/bitwise/floating-point ALU, SDWA extraction, and the supported DPP/VOP3
-modifiers. Acyclic scalar selections become structured
+modifiers. The native VOP3 table includes unsigned sum-of-absolute-differences
+(`V_SAD_U32`), lowered exactly as `abs(src0 - src1) + src2`; Rita's Rewind uses
+it in the address/index arithmetic of its vertex shaders. Acyclic scalar
+selections become structured
 `OpSelectionMerge`/`OpBranchConditional` regions and register values crossing
 their joins use hierarchical `OpPhi` state merging. The Tetris Effect
 compositor exercises this path with 2,401 instructions, 131 basic blocks, and
@@ -1484,6 +1507,25 @@ controller. User login is delivered once through the service event API; later
 polls report `NO_EVENT`. System preferences, safe-area and HDR defaults, the
 notice-screen flag, and music-player suppression retain coherent state. System
 UI actions that cannot exist without a shell return `UNAVAILABLE`.
+
+The primary pad can be acquired through either `scePadOpen` or the
+system-associated `scePadGetHandle` path. The latter is required by titles that
+never explicitly open their login user's controller before polling it. Offline
+NP state and reachability callback registration succeeds without fabricating a
+state transition; no callback is delivered while the stable offline profile is
+unchanged.
+
+**`libSceFiber` — cooperative guest execution** ([src/hle/libs/fiber.zig](src/hle/libs/fiber.zig))
+
+On Windows x86-64, each initialized guest fiber is backed by a native Windows
+fiber. `sceFiberRun`, `sceFiberSwitch`, and `sceFiberReturnToThread` therefore
+preserve the suspended guest registers, mixed guest/HLE call frames, stack, and
+resume point instead of treating a switch as a successful no-op. The public
+128-byte `SceFiber` record retains its ABI signatures, state, entry argument,
+name, and caller-provided context range, while Windows owns the guarded host
+stack required for safe native switching. `sceFiberGetSelf`, finalization,
+cross-thread ownership checks, and runtime reset are implemented; this backend
+is intentionally limited to the Windows native-execution target.
 
 Kernel user-edge event queues retain registrations and pending event payloads,
 and their waits use the same sequence-aware dispatcher contract as pthread
