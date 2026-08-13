@@ -376,6 +376,19 @@ pub const BlendControl = struct {
 pub const ColorControl = struct {
     mode: u3 = 0,
     logic_operation: u8 = 0xcc,
+
+    /// These modes use the bound graphics programs only as a vehicle for a
+    /// fixed-function colour-buffer metadata operation. Their pixel exports
+    /// must never be blended into the target as an ordinary draw.
+    pub fn isMetadataOperation(self: ColorControl) bool {
+        return switch (self.mode) {
+            2, // EliminateFastClear
+            5, // FmaskDecompress
+            6, // DccDecompress
+            => true,
+            else => false,
+        };
+    }
 };
 
 pub const RenderState = struct {
@@ -927,6 +940,14 @@ test "sampler descriptors normalize fixed-point lod values" {
     try testing.expectEqual(@as(f32, -0.5), descriptor.lod_bias);
     try testing.expectEqual(@as(u8, 2), descriptor.mip_filter);
     try testing.expectEqual(@as(u8, 2), descriptor.border_color_type);
+}
+
+test "color control identifies fixed-function metadata operations" {
+    for (0..8) |raw_mode| {
+        const control = ColorControl{ .mode = @intCast(raw_mode) };
+        const expected = raw_mode == 2 or raw_mode == 5 or raw_mode == 6;
+        try testing.expectEqual(expected, control.isMetadataOperation());
+    }
 }
 
 test "render state decodes PS5 color and depth target extensions" {

@@ -38,6 +38,19 @@ const Timezone = extern struct {
     dst_time: i32,
 };
 
+/// Extended timezone result used by the PS5 calendar conversion entry point.
+///
+/// This is deliberately distinct from the eight-byte POSIX `timezone` above.
+/// The PS5 libc reads the two trailing second-resolution fields after calling
+/// `sceKernelConvertLocaltimeToUtc`; leaving them outside the declared output
+/// made libc consume adjacent guest-stack data as a timezone correction.
+const ConversionTimezone = extern struct {
+    minutes_west: i32,
+    dst_time: i32,
+    west_seconds: i32,
+    dst_seconds: i32,
+};
+
 const TimeSeconds = extern struct {
     seconds: i64,
     west_seconds: u32,
@@ -1720,11 +1733,16 @@ fn convertLocaltimeToUtc(
     local_time: i64,
     _: i64,
     utc_time: ?*i64,
-    timezone: ?*Timezone,
+    timezone: ?*ConversionTimezone,
     dst_seconds: ?*i32,
 ) callconv(abi.guest) i32 {
     const zone = timezone orelse return KernelError.einval.raw();
-    zone.* = .{ .minutes_west = 0, .dst_time = 0 };
+    zone.* = .{
+        .minutes_west = 0,
+        .dst_time = 0,
+        .west_seconds = 0,
+        .dst_seconds = 0,
+    };
     if (utc_time) |output| output.* = local_time;
     if (dst_seconds) |output| output.* = 0;
     return errno.ok;
@@ -1929,6 +1947,35 @@ pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!voi
     try db.addLibrary(gpa, library, module, &exports);
     try db.addLibrary(gpa, unity_library, module, &unity_exports);
     try db.addLibrary(gpa, posix_library, module, &posix_exports);
+}
+
+test "calendar conversion clears the complete PS5 timezone result" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(usize, 16), @sizeOf(ConversionTimezone));
+
+    var utc_time: i64 = -1;
+    var timezone = ConversionTimezone{
+        .minutes_west = 1,
+        .dst_time = 2,
+        .west_seconds = 3,
+        .dst_seconds = 4,
+    };
+    var dst_seconds: i32 = -1;
+    try testing.expectEqual(
+        errno.ok,
+        convertLocaltimeToUtc(1_234_567, 0, &utc_time, &timezone, &dst_seconds),
+    );
+    try testing.expectEqual(@as(i64, 1_234_567), utc_time);
+    try testing.expectEqualDeep(
+        ConversionTimezone{
+            .minutes_west = 0,
+            .dst_time = 0,
+            .west_seconds = 0,
+            .dst_seconds = 0,
+        },
+        timezone,
+    );
+    try testing.expectEqual(@as(i32, 0), dst_seconds);
 }
 
 test "runtime compatibility exports include libc bootstrap data and private NIDs" {

@@ -3077,7 +3077,7 @@ pub const Renderer = struct {
         if (self.isVideoSurface(source.address)) self.markVideoSurface(destination.address);
 
         self.emulated_image_copy_dispatches += 1;
-        if (log_verbose_gpu or self.emulated_image_copy_dispatches <= 4) {
+        if (log_verbose_gpu or self.emulated_image_copy_dispatches <= 4 or self.traceCurrentGraphicsFrame()) {
             std.debug.print(
                 "[vulkan dcb] emulated whole-image copy: 0x{x} -> 0x{x} {d}x{d} fmt={d} tile={s} bytes=0x{x} (#{d})\n",
                 .{
@@ -6993,7 +6993,7 @@ pub const Renderer = struct {
         };
         if (self.traceCurrentGraphicsFrame()) {
             std.debug.print(
-                "[vulkan dcb] draw trace next_flip={d} draw={d} target=0x{x} VS=0x{x} PS=0x{x} indices={any} vertices={d} viewport={d}x{d} scissor={d},{d}+{d}x{d} discard={d} write=0x{x} blend={d}\n",
+                "[vulkan dcb] draw trace next_flip={d} draw={d} target=0x{x} VS=0x{x} PS=0x{x} indices={any} vertices={d} viewport={d}x{d} scissor={d},{d}+{d}x{d} discard={d} write=0x{x} blend={d} color_mode={d} target_mask=0x{x} cb0={any}/{any}/{any}/{any}/{any}\n",
                 .{
                     self.flip_callbacks + 1,
                     self.frame_profile.draws,
@@ -7011,6 +7011,13 @@ pub const Renderer = struct {
                     pipeline_state.rasterizer_discard,
                     pipeline_state.color_write_mask,
                     pipeline_state.blend_enable,
+                    render_state.color_control.mode,
+                    render_state.target_mask,
+                    state.readRegister(.context, 0x318),
+                    state.readRegister(.context, 0x390),
+                    state.readRegister(.context, 0x31c),
+                    state.readRegister(.context, 0x3b0),
+                    state.readRegister(.context, 0x3b8),
                 },
             );
         }
@@ -8831,6 +8838,17 @@ pub const Renderer = struct {
             if (!memory.read(memory.context, descriptor.address, tiled)) return Error.GuestMemoryReadFailed;
             try layout.detile(tiled, linear);
         }
+        if (self.traceCurrentGraphicsFrame() and bytes_per_texel == 4 and
+            descriptor.depth_or_layers == 1)
+        {
+            var trace_path_buffer: [112]u8 = undefined;
+            const trace_path = std.fmt.bufPrintZ(
+                &trace_path_buffer,
+                "out\\trace-frame-{d:0>4}-draw-{d}-sample-{d}.ppm",
+                .{ self.flip_callbacks + 1, self.frame_profile.draws, descriptor_index },
+            ) catch null;
+            if (trace_path) |path| dumpFramePpm(path.ptr, descriptor.width, descriptor.height, linear);
+        }
         // Counting every non-zero texel is useful only in verbose diagnostics;
         // doing it unconditionally added another full 64 MiB CPU pass for a
         // 4096² texture after detiling. Normal rendering only needs to know
@@ -10247,6 +10265,27 @@ pub const Renderer = struct {
         }
         if (has_vertex) {
             const render_state = gpu.resources.decodeRenderState(state);
+            // EliminateFastClear, FMASK decompress, and DCC decompress are
+            // fixed-function colour-buffer metadata operations. The guest
+            // shaders bound for those packets are only a launch vehicle; in
+            // particular, Unity's DCC helper exports constant white. Running
+            // that export as a normal draw destroys the already rendered
+            // scene. Our persistent Vulkan attachments are canonical,
+            // expanded images, so the corresponding host operation is to
+            // preserve their contents. Lazy materialization publishes those
+            // contents before a subsequent guest image copy or CPU read.
+            if (render_state.color_control.isMetadataOperation()) {
+                if (log_verbose_gpu or self.traceCurrentGraphicsFrame()) {
+                    std.debug.print(
+                        "[vulkan dcb] color metadata operation preserved resident targets: mode={d}\n",
+                        .{render_state.color_control.mode},
+                    );
+                }
+                self.guest_graphics_draws += 1;
+                self.translated_draws += 1;
+                self.last_draw_error = null;
+                return true;
+            }
             if (render_state.color_control.mode == 3) {
                 const resolved = self.resolveColorTargets(render_state) catch |err| {
                     self.last_draw_error = err;

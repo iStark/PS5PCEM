@@ -120,6 +120,30 @@ fn markReachable(
     }
 }
 
+fn canReachWithout(
+    allocator: std.mem.Allocator,
+    graph: *const Graph,
+    from: u32,
+    wanted: u32,
+    forbidden: u32,
+) Error!bool {
+    const visited = try allocator.alloc(bool, graph.blocks.items.len);
+    defer allocator.free(visited);
+    @memset(visited, false);
+    var pending: std.ArrayList(u32) = .empty;
+    defer pending.deinit(allocator);
+    try pending.append(allocator, from);
+    while (pending.pop()) |block| {
+        if (block == forbidden or block >= visited.len or visited[block]) continue;
+        if (block == wanted) return true;
+        visited[block] = true;
+        for (graph.edges.items) |edge| {
+            if (edge.from == block and !visited[edge.to]) try pending.append(allocator, edge.to);
+        }
+    }
+    return false;
+}
+
 fn buildSelections(allocator: std.mem.Allocator, graph: *Graph) Error!void {
     const branch_reachable = try allocator.alloc(bool, graph.blocks.items.len);
     defer allocator.free(branch_reachable);
@@ -146,6 +170,38 @@ fn buildSelections(allocator: std.mem.Allocator, graph: *Graph) Error!void {
         const branch = branch_successor orelse continue;
         const fallthrough = fallthrough_successor orelse continue;
         if (predicate == .none) continue;
+
+        // For a natural loop, ordinary reachability is misleading: the exit
+        // path can travel around an enclosing loop and eventually revisit this
+        // header, making an inner body block look like a post-dominator. Find
+        // the successor that reaches the latch without crossing the header;
+        // the other successor is the canonical loop merge.
+        var latch: ?u32 = null;
+        for (graph.edges.items) |edge| {
+            if (edge.to == block.index and edge.from >= block.index) {
+                if (latch != null) {
+                    latch = null;
+                    break;
+                }
+                latch = edge.from;
+            }
+        }
+        if (latch) |back_edge_source| {
+            const branch_is_body = try canReachWithout(allocator, graph, branch, back_edge_source, block.index);
+            const fallthrough_is_body = try canReachWithout(allocator, graph, fallthrough, back_edge_source, block.index);
+            if (branch_is_body != fallthrough_is_body) {
+                try graph.selections.append(allocator, .{
+                    .header = block.index,
+                    .merge = if (branch_is_body) fallthrough else branch,
+                    .branch_successor = branch,
+                    .fallthrough_successor = fallthrough,
+                    .condition = predicate,
+                    .branch_when = expected,
+                });
+                continue;
+            }
+        }
+
         try markReachable(allocator, graph, branch, branch_reachable, &pending);
         try markReachable(allocator, graph, fallthrough, fallthrough_reachable, &pending);
         var candidate = block.index + 1;

@@ -445,6 +445,15 @@ const Builder = struct {
     /// separate from branch SCC until all scalar arithmetic flag consumers are
     /// modelled, so adding carry support cannot perturb established CFG paths.
     arithmetic_carry: u32 = 0,
+    /// Function-local backing used only while translating reducible guest
+    /// loops. SSA snapshots are sufficient for acyclic selections, but a
+    /// back edge needs values produced later in the function. Keeping the
+    /// guest registers mutable in that path avoids manufacturing forward
+    /// OpPhi operands and maps naturally onto nested RDNA scalar loops.
+    mutable_register_pointers: [384]u32 = @splat(0),
+    mutable_scc_pointer: u32 = 0,
+    mutable_carry_pointer: u32 = 0,
+    function_bits_pointer_type: u32 = 0,
     used_control_flow_fallback: bool = false,
 
     fn init(allocator: std.mem.Allocator, options: Options) Error!Builder {
@@ -896,6 +905,17 @@ const Builder = struct {
         };
     }
 
+    fn registerBits(self: *Builder, index: usize, default_bits: u32) Error!u32 {
+        if (self.mutable_register_pointers[index] != 0) {
+            const loaded = self.id();
+            try self.emit(&self.body, 61, &.{ self.bits_type, loaded, self.mutable_register_pointers[index] }); // OpLoad
+            return loaded;
+        }
+        const current = self.registers[index];
+        if (current.id == 0) return self.constant(.bits32, default_bits);
+        return self.convert(current, .bits32);
+    }
+
     fn convert(self: *Builder, value: Value, expected: ValueType) Error!u32 {
         if (value.value_type == expected) return value.id;
         const converted = self.id();
@@ -912,9 +932,7 @@ const Builder = struct {
             // following CNDMASK or scalar mask operation observes the result.
             .exec_lo, .exec_hi, .vcc_lo, .vcc_hi => blk: {
                 const index = registerIndex(op).?;
-                const current = self.registers[index];
-                if (current.id == 0) break :blk try self.constant(.bits32, 0xffff_ffff);
-                break :blk try self.convert(current, .bits32);
+                break :blk try self.registerBits(index, 0xffff_ffff);
             },
             .m0,
             .ttmp,
@@ -932,6 +950,9 @@ const Builder = struct {
             => self.constant(.bits32, 0),
             .sgpr, .vgpr => blk: {
                 const index = registerIndex(op) orelse return Error.UndefinedRegister;
+                if (self.mutable_register_pointers[index] != 0) {
+                    break :blk try self.registerBits(index, 0);
+                }
                 const current = self.registers[index];
                 if (current.id == 0) return Error.UndefinedRegister;
                 break :blk try self.convert(current, .bits32);
@@ -1057,10 +1078,14 @@ const Builder = struct {
             }
             return Error.UnsupportedDestination;
         };
+        const bits = try self.convert(final_value, .bits32);
         self.registers[index] = .{
-            .id = try self.convert(final_value, .bits32),
+            .id = bits,
             .value_type = .bits32,
         };
+        if (self.mutable_register_pointers[index] != 0) {
+            try self.emit(&self.body, 62, &.{ self.mutable_register_pointers[index], bits }); // OpStore
+        }
     }
 
     fn unary(self: *Builder, inst: instruction.Instruction, opcode: u16, value_type: ValueType) Error!void {
@@ -3774,8 +3799,10 @@ const Builder = struct {
         if (inst.src0.kind == .sgpr) {
             const low_index = registerIndex(inst.src0) orelse return true;
             if (low_index + 1 >= self.registers.len or
-                self.registers[low_index].id == 0 or
-                self.registers[low_index + 1].id == 0)
+                (self.mutable_register_pointers[low_index] == 0 and
+                    self.registers[low_index].id == 0) or
+                (self.mutable_register_pointers[low_index + 1] == 0 and
+                    self.registers[low_index + 1].id == 0))
             {
                 return true;
             }
@@ -4176,7 +4203,10 @@ fn structuredCondition(builder: *Builder, condition: control_flow.Condition) Err
             // this path there could send inactive lanes into buffer traffic.
             if (builder.stage == .compute) return Error.UnsupportedControlFlow;
             const index: usize = if (condition == .vcc_zero) 106 else 126;
-            const mask = builder.registers[index];
+            const mask = if (builder.mutable_register_pointers[index] != 0)
+                Value{ .id = try builder.registerBits(index, 0xffff_ffff), .value_type = .bits32 }
+            else
+                builder.registers[index];
             if (mask.id == 0) break :blk try falseCondition(builder);
             const zero = builder.id();
             try builder.emit(&builder.body, 170, &.{
@@ -4188,6 +4218,18 @@ fn structuredCondition(builder: *Builder, condition: control_flow.Condition) Err
             break :blk zero;
         },
         .none => return Error.UnsupportedControlFlow,
+    };
+}
+
+fn directBranchCondition(opcode: isa.Opcode) ?struct { control_flow.Condition, bool } {
+    return switch (opcode) {
+        .s_cbranch_scc0 => .{ .scc, false },
+        .s_cbranch_scc1 => .{ .scc, true },
+        .s_cbranch_vccz => .{ .vcc_zero, true },
+        .s_cbranch_vccnz => .{ .vcc_zero, false },
+        .s_cbranch_execz => .{ .exec_zero, true },
+        .s_cbranch_execnz => .{ .exec_zero, false },
+        else => null,
     };
 }
 
@@ -4387,6 +4429,178 @@ fn structuredSelectionParent(
     return parent;
 }
 
+fn markMutableOperand(marked: *[384]bool, op: operand.Operand) void {
+    const first = Builder.registerIndex(op) orelse return;
+    // Memory instructions name the first word of a descriptor, coordinate or
+    // result tuple. A small conservative window covers those implicit words
+    // as well as all scalar/vector pairs without teaching the CFG pass every
+    // individual instruction width.
+    const end = @min(marked.len, first + 16);
+    @memset(marked[first..end], true);
+}
+
+fn configureMutableLoopState(builder: *Builder, program: *const instruction.Program) Error!void {
+    var marked: [384]bool = @splat(false);
+    for (program.instructions.items) |inst| {
+        markMutableOperand(&marked, inst.dst);
+        markMutableOperand(&marked, inst.dst2);
+        const sources = inst.sources();
+        for (sources.slice()) |source_op| markMutableOperand(&marked, source_op);
+    }
+
+    builder.function_bits_pointer_type = builder.id();
+    try builder.emit(&builder.declarations, 32, &.{ builder.function_bits_pointer_type, 7, builder.bits_type }); // ptr Function
+    for (marked, 0..) |needed, index| {
+        if (needed) builder.mutable_register_pointers[index] = builder.id();
+    }
+    builder.mutable_scc_pointer = builder.id();
+    builder.mutable_carry_pointer = builder.id();
+}
+
+fn emitMutableLoopPrelude(builder: *Builder, entry_label: u32) Error!void {
+    try builder.emit(&builder.body, 248, &.{builder.label}); // OpLabel
+    for (builder.mutable_register_pointers) |pointer| {
+        if (pointer != 0) {
+            try builder.emit(&builder.body, 59, &.{ builder.function_bits_pointer_type, pointer, 7 }); // OpVariable Function
+        }
+    }
+    try builder.emit(&builder.body, 59, &.{ builder.function_bits_pointer_type, builder.mutable_scc_pointer, 7 });
+    try builder.emit(&builder.body, 59, &.{ builder.function_bits_pointer_type, builder.mutable_carry_pointer, 7 });
+
+    try builder.initializeStageInputs();
+    for (builder.mutable_register_pointers, 0..) |pointer, index| {
+        if (pointer == 0) continue;
+        const current = builder.registers[index];
+        const default_bits: u32 = if (index == 106 or index == 107 or index == 126 or index == 127)
+            0xffff_ffff
+        else
+            0;
+        const value = if (current.id != 0)
+            try builder.convert(current, .bits32)
+        else
+            try builder.constant(.bits32, default_bits);
+        try builder.emit(&builder.body, 62, &.{ pointer, value }); // OpStore
+    }
+    const zero = try builder.constant(.bits32, 0);
+    try builder.emit(&builder.body, 62, &.{ builder.mutable_scc_pointer, zero });
+    try builder.emit(&builder.body, 62, &.{ builder.mutable_carry_pointer, zero });
+    try builder.emit(&builder.body, 249, &.{entry_label}); // OpBranch
+}
+
+fn loadMutableControlState(builder: *Builder) Error!void {
+    const zero = try builder.constant(.bits32, 0);
+    const scc_bits = builder.id();
+    try builder.emit(&builder.body, 61, &.{ builder.bits_type, scc_bits, builder.mutable_scc_pointer }); // OpLoad
+    builder.scc = builder.id();
+    try builder.emit(&builder.body, 171, &.{ builder.bool_type, builder.scc, scc_bits, zero }); // OpINotEqual
+    const carry_bits = builder.id();
+    try builder.emit(&builder.body, 61, &.{ builder.bits_type, carry_bits, builder.mutable_carry_pointer });
+    builder.arithmetic_carry = builder.id();
+    try builder.emit(&builder.body, 171, &.{ builder.bool_type, builder.arithmetic_carry, carry_bits, zero });
+}
+
+fn storeMutableControlState(builder: *Builder) Error!void {
+    const zero = try builder.constant(.bits32, 0);
+    const one = try builder.constant(.bits32, 1);
+    const scc_condition = if (builder.scc != 0) builder.scc else try falseCondition(builder);
+    const scc_bits = builder.id();
+    try builder.emit(&builder.body, 169, &.{ builder.bits_type, scc_bits, scc_condition, one, zero }); // OpSelect
+    try builder.emit(&builder.body, 62, &.{ builder.mutable_scc_pointer, scc_bits });
+    const carry_condition = if (builder.arithmetic_carry != 0) builder.arithmetic_carry else try falseCondition(builder);
+    const carry_bits = builder.id();
+    try builder.emit(&builder.body, 169, &.{ builder.bits_type, carry_bits, carry_condition, one, zero });
+    try builder.emit(&builder.body, 62, &.{ builder.mutable_carry_pointer, carry_bits });
+}
+
+/// Lowers reducible natural loops through function-local guest registers. The
+/// RDNA programs seen in Unity post-processing use canonical nested loops: a
+/// conditional header, one latch/back edge and the header's other successor as
+/// the merge. SPIR-V requires those edges to be declared with OpLoopMerge.
+fn translateStructuredLoops(builder: *Builder, program: *const instruction.Program, graph: *const control_flow.Graph) Error!void {
+    if (graph.back_edge_count == 0) return Error.UnsupportedControlFlow;
+    const block_count = graph.blocks.items.len;
+    const none = std.math.maxInt(u32);
+    const loop_merges = try builder.allocator.alloc(u32, block_count);
+    defer builder.allocator.free(loop_merges);
+    const loop_continues = try builder.allocator.alloc(u32, block_count);
+    defer builder.allocator.free(loop_continues);
+    @memset(loop_merges, none);
+    @memset(loop_continues, none);
+
+    var loop_count: u32 = 0;
+    for (graph.edges.items) |edge| {
+        if (edge.to > edge.from) continue;
+        const selection = graph.selectionForHeader(edge.to) orelse return Error.UnsupportedControlFlow;
+        if (selection.merge <= edge.to or loop_merges[edge.to] != none) return Error.UnsupportedControlFlow;
+        loop_merges[edge.to] = selection.merge;
+        loop_continues[edge.to] = edge.from;
+        loop_count += 1;
+    }
+    if (loop_count != graph.back_edge_count) return Error.UnsupportedControlFlow;
+    // Acyclic selections retain the existing SSA path. Mixing them with loop
+    // headers needs selection nesting analysis beyond the canonical loop form.
+    for (graph.selections.items) |selection| {
+        if (loop_merges[selection.header] == none) return Error.UnsupportedControlFlow;
+    }
+
+    try configureMutableLoopState(builder, program);
+    const labels = try builder.allocator.alloc(u32, block_count);
+    defer builder.allocator.free(labels);
+    for (labels) |*label| label.* = builder.id();
+    try emitMutableLoopPrelude(builder, labels[0]);
+
+    for (graph.blocks.items) |block| {
+        try builder.emit(&builder.body, 248, &.{labels[block.index]}); // OpLabel
+        try loadMutableControlState(builder);
+
+        const first: usize = block.first_instruction;
+        const end: usize = first + block.instruction_count;
+        const last = program.instructions.items[end - 1];
+        for (program.instructions.items[first..end]) |inst| {
+            if (inst.opcode.isBranch() or inst.opcode.isProgramEnd() or inst.opcode == .s_setpc_b64) continue;
+            try lowerDiagnosed(builder, inst);
+        }
+
+        if (last.opcode.isProgramEnd()) {
+            try builder.emit(&builder.body, 253, &.{}); // OpReturn
+        } else if (last.opcode == .s_setpc_b64) {
+            try builder.exportNggLdsRecord();
+            try builder.emit(&builder.body, 253, &.{});
+        } else if (last.opcode == .s_branch) {
+            try storeMutableControlState(builder);
+            const target = graph.blockForPc(last.branch_target) orelse return Error.UnsupportedControlFlow;
+            try builder.emit(&builder.body, 249, &.{labels[target]});
+        } else if (last.opcode.isBranch()) {
+            const selection = graph.selectionForHeader(block.index) orelse return Error.UnsupportedControlFlow;
+            if (loop_merges[block.index] == none or loop_merges[block.index] != selection.merge) {
+                return Error.UnsupportedControlFlow;
+            }
+            var condition = try structuredCondition(builder, selection.condition);
+            if (!selection.branch_when) {
+                const inverted = builder.id();
+                try builder.emit(&builder.body, 168, &.{ builder.bool_type, inverted, condition }); // OpLogicalNot
+                condition = inverted;
+            }
+            try storeMutableControlState(builder);
+            try builder.emit(&builder.body, 246, &.{ // OpLoopMerge
+                labels[loop_merges[block.index]],
+                labels[loop_continues[block.index]],
+                0,
+            });
+            try builder.emit(&builder.body, 250, &.{
+                condition,
+                labels[selection.branch_successor],
+                labels[selection.fallthrough_successor],
+            });
+        } else if (block.index + 1 < block_count) {
+            try storeMutableControlState(builder);
+            try builder.emit(&builder.body, 249, &.{labels[block.index + 1]});
+        } else {
+            return Error.UnsupportedControlFlow;
+        }
+    }
+}
+
 fn translateStructured(builder: *Builder, program: *const instruction.Program, graph: *const control_flow.Graph) Error!void {
     if (graph.back_edge_count != 0) return Error.UnsupportedControlFlow;
     const labels = try builder.allocator.alloc(u32, graph.blocks.items.len);
@@ -4400,6 +4614,24 @@ fn translateStructured(builder: *Builder, program: *const instruction.Program, g
     const selection_merge_labels = try builder.allocator.alloc(u32, graph.selections.items.len);
     defer builder.allocator.free(selection_merge_labels);
     for (selection_merge_labels) |*label| label.* = builder.id();
+    // A conditional whose paths both terminate has no real post-dominator,
+    // yet SPIR-V still requires an OpSelectionMerge target. Give those headers
+    // an unreachable synthetic merge rather than discarding the branch and
+    // linearly executing both paths.
+    const terminal_merge_labels = try builder.allocator.alloc(u32, graph.blocks.items.len);
+    defer builder.allocator.free(terminal_merge_labels);
+    @memset(terminal_merge_labels, 0);
+    for (graph.blocks.items) |block| {
+        const last_index: usize = block.first_instruction + block.instruction_count - 1;
+        const last = program.instructions.items[last_index];
+        if (!last.opcode.isBranch() or last.opcode == .s_branch or
+            structuredSelectionIndex(graph, block.index) != null)
+        {
+            continue;
+        }
+        if (directBranchCondition(last.opcode) == null) return Error.UnsupportedControlFlow;
+        terminal_merge_labels[block.index] = builder.id();
+    }
     const dominators = try buildDominators(builder, graph);
     defer builder.allocator.free(dominators);
     const states = try builder.allocator.alloc(State, graph.blocks.items.len);
@@ -4508,19 +4740,47 @@ fn translateStructured(builder: *Builder, program: *const instruction.Program, g
                 target,
             )}); // OpBranch
         } else if (last.opcode.isBranch()) {
-            const selection_index = structuredSelectionIndex(graph, block.index) orelse return Error.UnsupportedControlFlow;
-            const selection = graph.selections.items[selection_index];
-            var condition = try structuredCondition(builder, selection.condition);
-            if (!selection.branch_when) {
+            const selection_index = structuredSelectionIndex(graph, block.index);
+            const branch_info = if (selection_index) |index| blk: {
+                const selection = graph.selections.items[index];
+                break :blk .{
+                    selection.condition,
+                    selection.branch_when,
+                    selection.branch_successor,
+                    selection.fallthrough_successor,
+                    selection_merge_labels[index],
+                };
+            } else blk: {
+                const condition_info = directBranchCondition(last.opcode) orelse return Error.UnsupportedControlFlow;
+                const target = graph.blockForPc(last.branch_target) orelse return Error.UnsupportedControlFlow;
+                if (block.index + 1 >= graph.blocks.items.len or terminal_merge_labels[block.index] == 0) {
+                    return Error.UnsupportedControlFlow;
+                }
+                break :blk .{
+                    condition_info[0],
+                    condition_info[1],
+                    target,
+                    block.index + 1,
+                    terminal_merge_labels[block.index],
+                };
+            };
+            var condition = try structuredCondition(builder, branch_info[0]);
+            if (!branch_info[1]) {
                 const inverted = builder.id();
                 try builder.emit(&builder.body, 168, &.{ builder.bool_type, inverted, condition }); // OpLogicalNot
                 condition = inverted;
             }
-            try builder.emit(&builder.body, 247, &.{ selection_merge_labels[selection_index], 0 }); // OpSelectionMerge
+            try builder.emit(&builder.body, 247, &.{ branch_info[4], 0 }); // OpSelectionMerge
             try builder.emit(&builder.body, 250, &.{
                 condition,
-                structuredEdgeLabel(graph, dominators, labels, selection_merge_labels, block.index, selection.branch_successor),
-                structuredEdgeLabel(graph, dominators, labels, selection_merge_labels, block.index, selection.fallthrough_successor),
+                if (selection_index != null)
+                    structuredEdgeLabel(graph, dominators, labels, selection_merge_labels, block.index, branch_info[2])
+                else
+                    labels[branch_info[2]],
+                if (selection_index != null)
+                    structuredEdgeLabel(graph, dominators, labels, selection_merge_labels, block.index, branch_info[3])
+                else
+                    labels[branch_info[3]],
             });
         } else if (block.index + 1 < graph.blocks.items.len) {
             try builder.emit(&builder.body, 249, &.{structuredEdgeLabel(
@@ -4534,6 +4794,11 @@ fn translateStructured(builder: *Builder, program: *const instruction.Program, g
         } else {
             return Error.UnsupportedControlFlow;
         }
+    }
+    for (terminal_merge_labels) |label| {
+        if (label == 0) continue;
+        try builder.emit(&builder.body, 248, &.{label}); // OpLabel
+        try builder.emit(&builder.body, 255, &.{}); // OpUnreachable
     }
 }
 
@@ -4639,7 +4904,11 @@ pub fn translate(allocator: std.mem.Allocator, program: *const instruction.Progr
         for (program.instructions.items) |inst| try lowerDiagnosed(&builder, inst);
         try builder.emit(&builder.body, 253, &.{});
     } else {
-        translateStructured(&builder, program, &graph) catch |err| {
+        const structured_result = if (graph.back_edge_count == 0)
+            translateStructured(&builder, program, &graph)
+        else
+            translateStructuredLoops(&builder, program, &graph);
+        structured_result catch |err| {
             // Structured CF is incomplete. Fall back to a straight-line pass
             // that skips branches so vertex/pixel programs still produce SPIR-V
             // during bring-up (wrong for divergent paths, enough for a frame).
@@ -6473,6 +6742,31 @@ test "forward scalar selection lowers with a structured merge and register phi" 
     try std.testing.expect(containsOpcode(module.words, 245)); // OpPhi
 }
 
+test "terminal conditional paths use an unreachable synthetic merge" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .opcode = .s_cmp_eq_u32,
+        .src0 = .{ .kind = .integer_inline_constant, .value = 1 },
+        .src1 = .{ .kind = .integer_inline_constant, .value = 1 },
+        .src_count = 2,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 4,
+        .opcode = .s_cbranch_scc0,
+        .branch_target = 12,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 8, .opcode = .s_endpgm });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 12, .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 247)); // OpSelectionMerge
+    try std.testing.expect(containsOpcode(module.words, 255)); // OpUnreachable
+    try std.testing.expect(!module.used_control_flow_fallback);
+}
+
 test "scalar unsigned add and addc lower carry through SCC" {
     const decoder = @import("decoder.zig");
     const code = [_]u32{
@@ -6620,6 +6914,33 @@ test "back edges use the linear fallback until loop structuring is implemented" 
     defer module.deinit(std.testing.allocator);
     try std.testing.expect(!containsOpcode(module.words, 246)); // OpLoopMerge
     try std.testing.expect(containsOpcode(module.words, 253)); // OpReturn
+}
+
+test "nested natural loops lower with structured loop merges" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    const s0 = operand.Operand{ .kind = .sgpr, .reg = 0 };
+    const s1 = operand.Operand{ .kind = .sgpr, .reg = 1 };
+    const zero = operand.Operand{ .kind = .integer_inline_constant, .value = 0 };
+    const one = operand.Operand{ .kind = .integer_inline_constant, .value = 1 };
+    const two = operand.Operand{ .kind = .integer_inline_constant, .value = 2 };
+    const three = operand.Operand{ .kind = .integer_inline_constant, .value = 3 };
+    try program.instructions.append(std.testing.allocator, .{ .pc = 0, .opcode = .s_mov_b32, .dst = s0, .src0 = zero, .src_count = 1 });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 4, .opcode = .s_cmp_lt_i32, .src0 = s0, .src1 = two, .src_count = 2 });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 8, .opcode = .s_cbranch_scc0, .branch_target = 40 });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 12, .opcode = .s_mov_b32, .dst = s1, .src0 = zero, .src_count = 1 });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 16, .opcode = .s_cmp_lt_i32, .src0 = s1, .src1 = three, .src_count = 2 });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 20, .opcode = .s_cbranch_scc0, .branch_target = 32 });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 24, .opcode = .s_add_i32, .dst = s1, .src0 = s1, .src1 = one, .src_count = 2 });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 28, .opcode = .s_branch, .branch_target = 16 });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 32, .opcode = .s_add_i32, .dst = s0, .src0 = s0, .src1 = one, .src_count = 2 });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 36, .opcode = .s_branch, .branch_target = 4 });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 40, .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 246)); // OpLoopMerge
+    try std.testing.expect(!module.used_control_flow_fallback);
 }
 
 test "partial structured lowering restarts a clean linear builder" {

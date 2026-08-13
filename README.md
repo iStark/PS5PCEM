@@ -81,6 +81,16 @@ If you would like to support continued PS5PCEM development, you can do so on
   bounded host implementations, avoiding multi-second general shader paths
   during the movie. This is an intro-video milestone; a repeatable menu or
   gameplay frame is not claimed yet.
+- The Precinct now plays both observed intro movies with synchronized video and
+  audio, leaves the movie pipeline, renders its complete 1920×1080 title scene,
+  and reaches the `PLAY GAME` menu and readable `NEW GAME` confirmation. Natural
+  scalar loops and terminal shader branches lower to structured SPIR-V, so the
+  title's artwork and UI text no longer disappear. Fixed-function
+  `EliminateFastClear`, `FmaskDecompress`, and `DccDecompress` packets preserve
+  the canonical resident Vulkan image instead of executing their dummy pixel
+  shader as an ordinary draw; this removes the full-screen white overwrite that
+  previously hid the finished scene. Gameplay beyond the menu has not yet been
+  validated.
 - Mighty Morphin Power Rangers: Rita's Rewind now resolves its Fiber, Pad,
   offline NP, AGC 1.1, and AGC driver imports, then sustains the title's real
   1920×1080 graphics and audio loop. Native Windows fibers preserve suspended
@@ -167,12 +177,13 @@ target and carried through the 1920×1080 CRT/post-processing chain. The strict
 CRT-composite compatibility path removes the former full-screen static while
 preserving the title's pixel-art presentation.*
 
-![The Precinct Kwalee video frame rendered by PS5PCEM](docs/images/precinct-kwalee.png)
+![The Precinct title menu rendered by PS5PCEM](docs/images/precinct-title-menu.png)
 
-*A decoded 3840x2160 H.264 frame from The Precinct's Kwalee intro, converted by
-the guest pixel shader from the NV12 planes returned by SceAvPlayer and
-presented through the normal Vulkan VideoOut path. Audio from the same media is
-delivered as synchronized 48 kHz stereo PCM.*
+*The Precinct's live 1920×1080 title menu and `NEW GAME` confirmation, composed
+by the guest graphics and compute passes after both SceAvPlayer intro movies.
+Structured shader control flow restores the UI text, while fixed-function DCC
+decompression no longer executes its constant-white helper shader over the
+completed scene.*
 
 ![Tetris Effect first guest-rendered particle frame](docs/images/tetris-effect-first-render.png)
 
@@ -194,7 +205,7 @@ the repository contains none of that content.
 | **Pistol Whip** | Maps the native PS VR2 plugin and Burst module, then starts loading Unity asset archives | Headset, tracking, controller, and host OpenXR support are intentionally deferred |
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
 | **Tetris Effect: Connected** | Completes the Unreal bootstrap and a measured startup frame with 595 guest draws and 63 compute dispatches, including typed 2D/3D storage images, `64×64×64 RGBA16_FLOAT` volumes, layered post-process targets, `RGBA32_FLOAT` exposure surfaces, a `10_10_10_2_UNORM` lookup target, and the mixed image/LDS prepass. Ordered AGC completion acknowledgement removes the intermittent retirement race, and the latest unattended run advanced through 49 VideoOut cycles. Most post-bootstrap cycles measured about 3.3–3.8 seconds on the current RTX 3070 Ti host. The first generated `0xe060`-byte material pixel shader is now decoded within its exact AGC allocation instead of the old fixed instruction ceiling | The latest verified visible output is still the recognizable 1920×1080 HDR particle target shown above. The exact registered 3840×2160 VideoOut target remains black, so presentation falls back to a converted `R11G11B10_FLOAT` intermediate. NGG/fetch-shader continuations, exact layered rendering, final scanout aliasing/tonemapping, one oversized guest-buffer descriptor, and performance remain incomplete; neither a menu nor gameplay is claimed |
-| **The Precinct** | Links the complete six-image guest graph, defers and starts Unity plug-ins through `sceKernelLoadStartModule`, enters Unity, indexes its audio assets, and plays both observed intro movies through the new SceAvPlayer path. The title receives synchronized 3840×2160 NV12 video and 48 kHz stereo PCM; its guest YUV conversion shader produces the recognizable Kwalee frame above. Post-video graphics continue through seven draws and nine dispatches per frame, with warmed-up frames around 20–22 ms on the current RTX 3070 Ti test host | The post-video scene source is still incorrect: draw 1 receives a sparse/corrupted pixel strip, draw 2 copies it to the scanout, and later UI draws do not restore a recognizable scene. Gameplay is not claimed yet |
+| **The Precinct** | Links the complete six-image guest graph, starts Unity plug-ins through `sceKernelLoadStartModule`, indexes its audio assets, and plays both observed intro movies as synchronized 3840×2160 NV12 video and 48 kHz stereo PCM. It then renders the complete 1920×1080 title artwork, opens `PLAY GAME`, and displays the readable `NEW GAME` confirmation shown above. A full 16-byte local-time conversion result prevents the former post-video clock loop; structured natural loops and terminal selections restore UI shaders; metadata CB modes no longer paint their helper export over the resident scene. The observed title frame completes 10 draws and 10 dispatches in about 70 ms, while the open menu/confirmation uses 19 draws and 11 dispatches at roughly 137–152 ms on the current RTX 3070 Ti host | Menu interaction beyond the confirmation and gameplay have not yet been validated. General compressed DCC/FMASK expansion, the remaining shader/control-flow cases, and synchronous GPU/resource costs still need work |
 | **Jets 'n' Guns 2** | Resolves title content through `/app0`, completes AGC resource registration, and sustains the full graphics/compute/VideoOut loop. Targetless final passes are preserved through flip, while dynamic SGPR data and descriptor-sized buffer bounds keep streamed sprite batches on stable Vulkan pipelines. `START GAME` now passes the loading screen and reaches the recognizable 3840×2160 tutorial gameplay shown above; the unattended run remained live beyond flip 300. Firmware-default mutex compatibility preserves the CRT's recursive `trylock` guard without leaking recursion into the audio workers' blocking slow path | The cold transition into the first dense gameplay scene still takes roughly 30–40 seconds on the current RTX 3070 Ti host. Once loaded, observed 227–256-draw frames take about 0.6–1.6 seconds, dominated by synchronous Vulkan submission, resource staging, and first-use work; broad input and in-game audio compatibility still need longer validation |
 | **Asterix & Obelix: Slap Them All!** | Maps the Unity/PSN plug-in graph, passes GameUpdate, trophy, entitlement, WebApi, and player-review bootstrap calls, accepts four-byte-aligned AGC shader headers, and reaches repeated 1920×1080 frames. SceAvPlayer returns the ATL intro as correctly decoded NV12 frames, while matched image-copy, planar-conversion, fullscreen-blit, and color-resolve paths keep the observed movie pipeline moving without its former multi-second shader compilation/dispatch blockers | The decoded source is recognizable, but final compositor scaling/presentation still needs validation and no repeatable menu or gameplay frame is claimed yet |
 | **Mighty Morphin Power Rangers: Rita's Rewind** | Resolves the observed Fiber, Pad, offline NP, AGC 1.1, and AGC driver imports, enters a stable 1920×1080 graphics/audio loop, and renders the animated publisher sequence, title menu, and post-menu scene shown above. Native cooperative fibers retain suspended guest stacks, `scePadGetHandle` supplies a readable primary controller, and exact `V_SAD_U32`, `V_MUL_HI_I32`, and `V_CVT_FLR_I32_F32` lowering removes the diagnostic shader fallback. Holding `Cross` advances through the title prompt, and the observed intro remains smooth at roughly 13–20 ms per frame on the current RTX 3070 Ti host | The exact guest CRT composite still produces static on the current host, so a strict shader-signature fallback performs the observed 4× RGBA8 scene scale before downstream post-processing. Dense post-menu frames can contain roughly 255 draws and currently take about 470 ms, dominated by repeated guest-buffer staging; broad gameplay and input compatibility are not claimed yet |
@@ -867,8 +878,10 @@ The remaining stages are:
 2. Add stencil, multiple render targets, MSAA, texture component swizzles,
    the remaining compressed DCC/FMASK states, HTILE Z-range/HiZ handling, and
    CMASK states coupled to MSAA/FMASK.
-3. Complete structured loops, VCC/EXEC divergence, formats, mip/layer views,
-   explicit-LOD operands, and the remaining image operations seen in captures.
+3. Extend the current structured natural-loop and terminal-selection lowering
+   to irreducible control flow, complete VCC/EXEC divergence, and cover the
+   remaining formats, mip/layer views, explicit-LOD operands, and image
+   operations seen in captures.
 4. Continue reducing first-use texture and synchronous dispatch work, and
    validate state and resource invalidation against longer title captures.
 
@@ -2093,11 +2106,16 @@ scheduler and Vulkan backend. Observed startup work now includes:
   FFmpeg for container/H.264/AAC decoding, and returns double-buffered NV12 plus
   PCM from title-owned allocations. The Precinct plays both observed intro
   movies with synchronized sound; its guest YUV shader converts the 4K planes
-  and the normal VideoOut path presents a recognizable Kwalee logo. After the
-  movies, the title settles at roughly 20–22 ms per frame on the current test
-  host. The remaining visual fault begins before the compositor: the first
-  post-video draw receives a sparse/corrupted scene source, which is then copied
-  faithfully to the display target.
+  and the normal VideoOut path presents the movies. A PS5-compatible 16-byte
+  timezone result from `sceKernelConvertLocaltimeToUtc` then lets Unity leave
+  its post-video clock loop. The title's natural scalar loops and conditional
+  paths with two terminal arms lower as structured SPIR-V, restoring its title
+  art and menu text. `CB_COLOR_CONTROL` modes 2, 5, and 6 are consumed as
+  fixed-function metadata operations instead of ordinary colour draws; because
+  resident Vulkan attachments are already expanded, preserving the image is
+  the correct host operation and prevents the DCC helper's constant-white
+  export from erasing the scene before its compute copy. The title now reaches
+  the repeatable `PLAY GAME` menu and `NEW GAME` confirmation shown above.
 - Asterix & Obelix exercises the corresponding 1920×1080 Unity movie path.
   Exact shader-shape matching handles its full-surface compute copies and
   indexed fullscreen sample blits without compiling large general pipelines;
