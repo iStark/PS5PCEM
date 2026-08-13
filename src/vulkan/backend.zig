@@ -131,6 +131,9 @@ pub const Options = struct {
     /// Disabled by default because a 4K target costs roughly 32 MiB of PCIe
     /// traffic and a queue synchronization.
     capture_first_graphics_frame: bool = false,
+    /// Expensive per-draw readback and PPM capture for one selected guest
+    /// frame. Kept opt-in because a busy 4K frame can transfer several GiB.
+    trace_graphics_frame: ?u64 = null,
     /// Replaces translated guest pixel shaders with an opaque diagnostic
     /// colour while retaining the guest target and pipeline state.
     force_probe_fragment: bool = false,
@@ -1473,6 +1476,7 @@ pub const Renderer = struct {
     validation_enabled: bool,
     graphics_probe_enabled: bool,
     capture_first_graphics_frame: bool,
+    trace_graphics_frame: ?u64,
     force_probe_fragment: bool,
     force_probe_fragment_texture: bool,
     force_probe_fragment_parameter: bool,
@@ -1595,6 +1599,11 @@ pub const Renderer = struct {
     last_draw_error: ?anyerror = null,
     last_sync_error: ?anyerror = null,
     last_flip_error: ?anyerror = null,
+
+    fn traceCurrentGraphicsFrame(self: *const Renderer) bool {
+        const requested = self.trace_graphics_frame orelse return false;
+        return self.flip_callbacks +% 1 == requested;
+    }
 
     pub fn init(allocator: std.mem.Allocator, options: Options) (Error || std.mem.Allocator.Error)!Renderer {
         const wants_presentation = options.native_window != null;
@@ -1871,6 +1880,7 @@ pub const Renderer = struct {
             .validation_enabled = validation_enabled,
             .graphics_probe_enabled = options.enable_graphics_probe,
             .capture_first_graphics_frame = options.capture_first_graphics_frame,
+            .trace_graphics_frame = options.trace_graphics_frame,
             .force_probe_fragment = options.force_probe_fragment,
             .force_probe_fragment_texture = options.force_probe_fragment_texture,
             .force_probe_fragment_parameter = options.force_probe_fragment_parameter,
@@ -2690,7 +2700,7 @@ pub const Renderer = struct {
             );
         };
         defer resources.deinit(self);
-        if (self.flip_callbacks == 240) {
+        if (self.traceCurrentGraphicsFrame()) {
             std.debug.print(
                 "[vulkan dcb] traced compute resources dispatch={d} program=0x{x} buffers={d} sampled={d} storage_images={d}\n",
                 .{
@@ -6981,7 +6991,7 @@ pub const Renderer = struct {
         const fragment_address = gpu.resources.ShaderStage.pixel.programAddress(state) orelse {
             return Error.MissingGraphicsProgram;
         };
-        if (self.flip_callbacks == 240) {
+        if (self.traceCurrentGraphicsFrame()) {
             std.debug.print(
                 "[vulkan dcb] draw trace next_flip={d} draw={d} target=0x{x} VS=0x{x} PS=0x{x} indices={any} vertices={d} viewport={d}x{d} scissor={d},{d}+{d}x{d} discard={d} write=0x{x} blend={d}\n",
                 .{
@@ -7098,7 +7108,7 @@ pub const Renderer = struct {
             probe_parameter_mask
         else
             fragment_parameter_mask;
-        const trace_interface = self.flip_callbacks == 240;
+        const trace_interface = self.traceCurrentGraphicsFrame();
         if (trace_interface or
             (self.reported_interface_pairs < 2 and
                 (self.last_interface_vertex_address != vertex_address or
@@ -7149,7 +7159,7 @@ pub const Renderer = struct {
             vertex_analysis,
         );
         self.frame_profile.graphics_resource_ns +|= elapsedHostNanoseconds(resource_started);
-        if (self.flip_callbacks == 240) {
+        if (self.traceCurrentGraphicsFrame()) {
             for (graphics_resources.mappings[0..graphics_resources.mapping_count]) |mapping| {
                 const sampled = graphics_resources.descriptors[@intCast(mapping.descriptor_index)];
                 std.debug.print(
@@ -7599,7 +7609,7 @@ pub const Renderer = struct {
         };
         self.frame_profile.shader_translate_ns +|= elapsedHostNanoseconds(fragment_translate_started);
         defer fragment_module.deinit(self.allocator);
-        if (self.flip_callbacks == 240 and fragment_module.used_control_flow_fallback) {
+        if (self.traceCurrentGraphicsFrame() and fragment_module.used_control_flow_fallback) {
             std.debug.print("[vulkan dcb] traced fragment program 0x{x} uses linear control-flow fallback\n", .{fragment_address});
         }
         var texture_probe_module: ?rdna2.spirv.Module = null;
@@ -7663,7 +7673,7 @@ pub const Renderer = struct {
                 self.frame_profile.shader_translate_ns +|= elapsedHostNanoseconds(vertex_translate_started);
                 var vertex_module = vertex_module_owned;
                 defer vertex_module.deinit(self.allocator);
-                if (self.flip_callbacks == 240 and vertex_module.used_control_flow_fallback) {
+                if (self.traceCurrentGraphicsFrame() and vertex_module.used_control_flow_fallback) {
                     std.debug.print("[vulkan dcb] traced vertex program 0x{x} uses linear control-flow fallback\n", .{vertex_address});
                 }
                 if (log_verbose_gpu) std.debug.print(
@@ -7689,7 +7699,7 @@ pub const Renderer = struct {
                     false,
                     draw,
                 );
-                if (self.flip_callbacks == 240) {
+                if (self.traceCurrentGraphicsFrame()) {
                     if (self.latest_render_target_index) |target_index| {
                         try self.materializeRenderTarget(target_index);
                         const captured_target = self.render_targets.items[target_index].target;
@@ -10378,7 +10388,7 @@ pub const Renderer = struct {
             self.last_dispatch_error = null;
             return true;
         }
-        if (self.flip_callbacks == 240) {
+        if (self.traceCurrentGraphicsFrame()) {
             std.debug.print(
                 "[vulkan dcb] dispatch trace next_flip={d} dispatch={d} program=0x{x} dimensions={d}x{d}x{d} groups={d}x{d}x{d} local={d}x{d}x{d} initiator=0x{x}\n",
                 .{
@@ -13510,6 +13520,7 @@ test "Vulkan version packing matches the registry layout" {
 
 test "graphics probe is opt-in and carries standalone shader modules" {
     try std.testing.expect(!(Options{}).enable_graphics_probe);
+    try std.testing.expectEqual(@as(?u64, null), (Options{}).trace_graphics_frame);
     try std.testing.expectEqual(@as(u32, 0x0723_0203), graphics_probe_vertex_spirv[0]);
     try std.testing.expectEqual(@as(u32, 0x0723_0203), graphics_probe_fragment_spirv[0]);
     try std.testing.expect(graphics_probe_vertex_spirv.len > 32);

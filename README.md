@@ -62,15 +62,17 @@ If you would like to support continued PS5PCEM development, you can do so on
   from roughly 208–240 ms to 22–65 ms in the current startup capture; first-use
   texture uploads remain scene-dependent.
 - Jets 'n' Guns 2 now renders its animated 3840×2160 title screen, complete main
-  menu, and options UI instead of a black framebuffer. The complete ordered
-  final pass without an explicit color target is retained until VideoOut supplies
-  the scanout target.
+  menu, loading screen, and tutorial gameplay instead of a black framebuffer.
+  The complete ordered final pass without an explicit color target is retained
+  until VideoOut supplies the scanout target.
   Recovered graphics SGPR values and live storage-buffer bounds are supplied as
-  runtime data, so changing sprite batches no longer generate dozens of new
+  runtime data, so changing sprite batches no longer generates dozens of new
   vertex pipelines per frame. After warm-up, pipeline misses fall to zero and
   the observed 53-draw startup frames take roughly 113–124 ms on the current
   RTX 3070 Ti test host, down from approximately 1–1.8 seconds before the
-  specialization fix.
+  specialization fix. Firmware-default mutex handling now distinguishes the
+  CRT's nested `trylock` guard from a duplicated blocking slow-path lock, so the
+  decoder/output threads no longer deadlock when `START GAME` joins them.
 - Asterix & Obelix: Slap Them All! now completes its Unity and PSN plug-in
   bootstrap, creates AGC shaders from four-byte-aligned headers, and reaches
   repeated 1920×1080 VideoOut frames. Its ATL intro is decoded by SceAvPlayer
@@ -144,12 +146,12 @@ sampled-texture, render-target, and Vulkan presentation paths. Texture alpha,
 component swizzles, and sRGB sampling now preserve the title's intended color
 balance.*
 
-![Jets 'n' Guns 2 main menu rendered by PS5PCEM](docs/images/jets-n-guns-2.png)
+![Jets 'n' Guns 2 tutorial gameplay rendered by PS5PCEM](docs/images/jets-n-guns-2.png)
 
-*A live 3840×2160 Jets 'n' Guns 2 title/menu frame produced by the guest
-multi-draw, sampled-texture, persistent-render-target, and VideoOut paths. This
-is an in-title rendering milestone rather than a gameplay claim: selecting
-`NEW GAME` currently stops the graphics loop before a playable scene appears.*
+*A live 3840×2160 Jets 'n' Guns 2 tutorial frame reached through `START GAME`
+and the title's loading screen. The ship, HUD, layered level art, lighting, and
+text are produced by the guest multi-draw, sampled-texture,
+persistent-render-target, compute, and VideoOut paths.*
 
 ![Mighty Morphin Power Rangers: Rita's Rewind intro rendered by PS5PCEM](docs/images/ritas-rewind-intro.png)
 
@@ -193,7 +195,7 @@ the repository contains none of that content.
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
 | **Tetris Effect: Connected** | Completes the Unreal bootstrap and a measured startup frame with 595 guest draws and 63 compute dispatches, including typed 2D/3D storage images, `64×64×64 RGBA16_FLOAT` volumes, layered post-process targets, `RGBA32_FLOAT` exposure surfaces, a `10_10_10_2_UNORM` lookup target, and the mixed image/LDS prepass. Ordered AGC completion acknowledgement removes the intermittent retirement race, and the latest unattended run advanced through 49 VideoOut cycles. Most post-bootstrap cycles measured about 3.3–3.8 seconds on the current RTX 3070 Ti host. The first generated `0xe060`-byte material pixel shader is now decoded within its exact AGC allocation instead of the old fixed instruction ceiling | The latest verified visible output is still the recognizable 1920×1080 HDR particle target shown above. The exact registered 3840×2160 VideoOut target remains black, so presentation falls back to a converted `R11G11B10_FLOAT` intermediate. NGG/fetch-shader continuations, exact layered rendering, final scanout aliasing/tonemapping, one oversized guest-buffer descriptor, and performance remain incomplete; neither a menu nor gameplay is claimed |
 | **The Precinct** | Links the complete six-image guest graph, defers and starts Unity plug-ins through `sceKernelLoadStartModule`, enters Unity, indexes its audio assets, and plays both observed intro movies through the new SceAvPlayer path. The title receives synchronized 3840×2160 NV12 video and 48 kHz stereo PCM; its guest YUV conversion shader produces the recognizable Kwalee frame above. Post-video graphics continue through seven draws and nine dispatches per frame, with warmed-up frames around 20–22 ms on the current RTX 3070 Ti test host | The post-video scene source is still incorrect: draw 1 receives a sparse/corrupted pixel strip, draw 2 copies it to the scanout, and later UI draws do not restore a recognizable scene. Gameplay is not claimed yet |
-| **Jets 'n' Guns 2** | Resolves title content through `/app0`, completes AGC resource registration, and sustains the full graphics/compute/VideoOut loop. Targetless final passes are preserved through flip, while dynamic SGPR data and descriptor-sized buffer bounds keep streamed sprite batches on stable Vulkan pipelines. The title now renders the recognizable 3840×2160 title screen, main menu, and options UI shown above; warmed 53-draw startup frames measure roughly 113–124 ms on the current RTX 3070 Ti host with zero pipeline misses after warm-up | A manual `Cross` reaches the main menu without the automatic `Options` pulse, but selecting `NEW GAME` currently stops further flips after the audio decode/output loops exit. A playable scene and working in-game audio are therefore not claimed yet |
+| **Jets 'n' Guns 2** | Resolves title content through `/app0`, completes AGC resource registration, and sustains the full graphics/compute/VideoOut loop. Targetless final passes are preserved through flip, while dynamic SGPR data and descriptor-sized buffer bounds keep streamed sprite batches on stable Vulkan pipelines. `START GAME` now passes the loading screen and reaches the recognizable 3840×2160 tutorial gameplay shown above; the unattended run remained live beyond flip 300. Firmware-default mutex compatibility preserves the CRT's recursive `trylock` guard without leaking recursion into the audio workers' blocking slow path | The cold transition into the first dense gameplay scene still takes roughly 30–40 seconds on the current RTX 3070 Ti host. Once loaded, observed 227–256-draw frames take about 0.6–1.6 seconds, dominated by synchronous Vulkan submission, resource staging, and first-use work; broad input and in-game audio compatibility still need longer validation |
 | **Asterix & Obelix: Slap Them All!** | Maps the Unity/PSN plug-in graph, passes GameUpdate, trophy, entitlement, WebApi, and player-review bootstrap calls, accepts four-byte-aligned AGC shader headers, and reaches repeated 1920×1080 frames. SceAvPlayer returns the ATL intro as correctly decoded NV12 frames, while matched image-copy, planar-conversion, fullscreen-blit, and color-resolve paths keep the observed movie pipeline moving without its former multi-second shader compilation/dispatch blockers | The decoded source is recognizable, but final compositor scaling/presentation still needs validation and no repeatable menu or gameplay frame is claimed yet |
 | **Mighty Morphin Power Rangers: Rita's Rewind** | Resolves the observed Fiber, Pad, offline NP, AGC 1.1, and AGC driver imports, enters a stable 1920×1080 graphics/audio loop, and renders the animated publisher sequence, title menu, and post-menu scene shown above. Native cooperative fibers retain suspended guest stacks, `scePadGetHandle` supplies a readable primary controller, and exact `V_SAD_U32`, `V_MUL_HI_I32`, and `V_CVT_FLR_I32_F32` lowering removes the diagnostic shader fallback. Holding `Cross` advances through the title prompt, and the observed intro remains smooth at roughly 13–20 ms per frame on the current RTX 3070 Ti host | The exact guest CRT composite still produces static on the current host, so a strict shader-signature fallback performs the observed 4× RGBA8 scene scale before downstream post-processing. Dense post-menu frames can contain roughly 255 draws and currently take about 470 ms, dominated by repeated guest-buffer staging; broad gameplay and input compatibility are not claimed yet |
 
@@ -338,9 +340,12 @@ replaces the guest fragment shader with a fixed-color diagnostic, and
 `PS5_SKIP_COMPUTE=1` skips guest compute dispatches to shorten pipeline tests.
 `PS5_COMPUTE_TRANSLATE_ONLY=1` goes further through resource recovery and SPIR-V
 translation but stops before Vulkan pipeline creation and dispatch. It is useful
-for separating translation/binding failures from GPU execution faults. All three
-diagnostic switches deliberately change rendering and are not compatibility or
-correctness modes.
+for separating translation/binding failures from GPU execution faults.
+`PS5_TRACE_GRAPHICS_FRAME=<flip>` performs an expensive readback and writes a
+PPM after every draw of one selected frame; it is opt-in because a dense 4K
+frame can otherwise transfer several GiB and appear to freeze the title. These
+diagnostic switches deliberately change rendering or timing and are not
+compatibility or correctness modes.
 
 For a native optimized build, install Zig 0.16 and use a current Vulkan driver:
 
@@ -2144,7 +2149,26 @@ the exact Gen5 version-10 defaults exposed, the title emits the required state;
 the renderer then retains all targetless draws in order until VideoOut identifies
 the 3840×2160 scanout allocation. Recovered graphics scalars and live descriptor
 bounds are runtime data, so warmed 53-draw frames reuse the same Vulkan pipelines
-and render the title screen, main menu, and options UI shown above.
+and render the title screen, main menu, loading screen, and tutorial gameplay
+shown above.
+
+The former `START GAME` freeze was a synchronization deadlock. A
+firmware-default mutex was treated as fully recursive for a Gen5 CRT guard, but
+the same compatibility rule let `AudioOutBgM` accumulate more than a thousand
+blocking self-locks. `AudioDecBgM` then waited for that mutex while
+`AudioOutBgM` waited for it at a two-party barrier and the main thread joined the
+output worker. Default recursive `trylock` depth is now retained only for the CRT
+guard; a duplicated blocking slow-path lock is coalesced into its existing
+ownership. The unattended input path subsequently passed `START GAME`, displayed
+the loading frame, entered the tutorial, and continued beyond flip 300.
+
+The first dense gameplay scene remains a performance boundary rather than a
+deadlock. A cold transition currently spends roughly 30–40 seconds compiling and
+submitting its first large batch on the RTX 3070 Ti test host; later observed
+227–256-draw frames take approximately 0.6–1.6 seconds. A previously hard-coded
+per-draw trace made this substantially worse by reading back about 6.7 GiB from
+one 4K frame. That capture is now disabled during normal execution and available
+only through `PS5_TRACE_GRAPHICS_FRAME`.
 
 Tetris Effect: Connected exercises the same expanded Unreal path without a VR
 plugin. It now reaches the first recognizable particle scene through the real

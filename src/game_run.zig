@@ -386,6 +386,11 @@ fn run(init: std.process.Init) !bool {
     const show_fps = init.minimal.environ.containsUnempty(allocator, "PS5_SHOW_FPS") catch false;
     const enable_vulkan_validation = init.minimal.environ.containsUnempty(allocator, "PS5_VULKAN_VALIDATION") catch false;
     const capture_first_graphics_frame = init.minimal.environ.containsUnempty(allocator, "PS5_CAPTURE_FIRST_FRAME") catch false;
+    const trace_graphics_frame: ?u64 = if (init.minimal.environ.getAlloc(allocator, "PS5_TRACE_GRAPHICS_FRAME")) |text| parse: {
+        defer allocator.free(text);
+        const value = std.mem.trim(u8, text, " \t\r\n");
+        break :parse std.fmt.parseInt(u64, value, 10) catch null;
+    } else |_| null;
     const force_probe_fragment = init.minimal.environ.containsUnempty(allocator, "PS5_PROBE_FRAGMENT_COLOR") catch false;
     const force_probe_fragment_texture = init.minimal.environ.containsUnempty(allocator, "PS5_PROBE_FRAGMENT_TEXTURE") catch false;
     const force_probe_fragment_parameter = init.minimal.environ.containsUnempty(allocator, "PS5_PROBE_FRAGMENT_PARAMETER") catch false;
@@ -407,6 +412,7 @@ fn run(init: std.process.Init) !bool {
         renderer = vulkan.Renderer.init(allocator, .{
             .enable_validation = enable_vulkan_validation,
             .capture_first_graphics_frame = capture_first_graphics_frame,
+            .trace_graphics_frame = trace_graphics_frame,
             .force_probe_fragment = force_probe_fragment,
             .force_probe_fragment_texture = force_probe_fragment_texture,
             .force_probe_fragment_parameter = force_probe_fragment_parameter,

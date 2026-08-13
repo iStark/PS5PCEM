@@ -735,17 +735,23 @@ fn currentThread() Error!u64 {
     return if (thread_id == 0) error.InvalidArgument else thread_id;
 }
 
-/// Gen5's CRT initializes the process-wide static-initializer guard with a
-/// null attribute, then recursively enters that guard while constructing
-/// nested function-local statics.  The wrapper ignores the raw lock status and
-/// always performs a matching unlock, so surfacing EDEADLK corrupts its guard
-/// ownership.  Preserve strict error-checking for an explicitly supplied type
-/// 1 attribute; only the firmware-default forms need compatible recursion.
-fn mutexSupportsRecursion(object: *const Mutex) bool {
-    return object.kind == 2 or switch (object.origin) {
+fn mutexUsesDefaultCompatibility(object: *const Mutex) bool {
+    return switch (object.origin) {
         .explicit_default, .static_zero => true,
         .explicit_attr, .static_adaptive => false,
     };
+}
+
+/// Gen5's CRT initializes the process-wide static-initializer guard with a
+/// null attribute, then recursively try-locks that guard while constructing
+/// nested function-local statics.  Its wrapper always performs a matching
+/// unlock, so the compatibility try-lock must retain the recursion depth.
+/// A repeated blocking lock on a firmware-default mutex is different: Gen5's
+/// guest fast path can leave the HLE owner already established when its slow
+/// path is entered.  Coalesce that duplicate below instead of accumulating a
+/// recursion count which can keep the mutex owned after the caller is done.
+fn mutexTracksRecursiveLock(object: *const Mutex, try_only: bool) bool {
+    return object.kind == 2 or (try_only and mutexUsesDefaultCompatibility(object));
 }
 
 fn readMutexAttr(raw: ?*const MutexAttrHandle) ?MutexAttr {
@@ -785,13 +791,28 @@ fn mutexLockCore(
             if (!object.reported_self_lock and trace.isLive()) {
                 object.reported_self_lock = true;
                 std.debug.print(
-                    "[kernel sync] mutex self-lock outer=0x{x} object=0x{x} kind={d} origin={s} recursion={d}\n",
-                    .{ @intFromPtr(handle), @intFromPtr(object), object.kind, @tagName(object.origin), object.recursion },
+                    "[kernel sync] mutex self-lock outer=0x{x} object=0x{x} thread=0x{x} operation={s} kind={d} origin={s} recursion={d}\n",
+                    .{
+                        @intFromPtr(handle),
+                        @intFromPtr(object),
+                        thread_id,
+                        if (try_only) "trylock" else "lock",
+                        object.kind,
+                        @tagName(object.origin),
+                        object.recursion,
+                    },
                 );
             }
-            if (mutexSupportsRecursion(object)) {
+            if (mutexTracksRecursiveLock(object, try_only)) {
                 if (object.recursion == std.math.maxInt(u32)) return error.ResourceLimit;
                 object.recursion += 1;
+                if (registered_waiter) object.waiters -= 1;
+                return;
+            }
+            if (mutexUsesDefaultCompatibility(object)) {
+                // The ordinary Gen5 mutex wrapper may reach the imported slow
+                // path after its guest-side fast path has already established
+                // ownership.  This is one logical acquisition, not recursion.
                 if (registered_waiter) object.waiters -= 1;
                 return;
             }
@@ -844,7 +865,7 @@ fn mutexUnlockCore(outer: ?*MutexHandle) Error!void {
         object.state_lock.unlock();
         return error.PermissionDenied;
     }
-    if (mutexSupportsRecursion(object) and object.recursion > 1) {
+    if ((object.kind == 2 or mutexUsesDefaultCompatibility(object)) and object.recursion > 1) {
         object.recursion -= 1;
         object.state_lock.unlock();
         return;
@@ -1840,6 +1861,27 @@ test "default mutexes keep nested Gen5 CRT guard locks balanced" {
     try testing.expectEqual(errno.ok, scePthreadMutexTrylock(&mutex));
     try testing.expectEqual(@as(u32, 2), mutex.?.recursion);
     try testing.expectEqual(errno.ok, scePthreadMutexUnlock(&mutex));
+    try testing.expectEqual(errno.ok, scePthreadMutexUnlock(&mutex));
+    try testing.expectEqual(errno.ok, scePthreadMutexDestroy(&mutex));
+}
+
+test "default blocking self-lock does not accumulate recursion" {
+    var context = TestContext{};
+    try context.init();
+    defer context.deinit();
+    const thread = try context.thread_manager.prepareInitialThread("default-slow-path");
+    defer context.thread_manager.releaseInitialThread(thread.handle) catch {};
+    try context.thread_manager.enter(thread.handle);
+    defer context.thread_manager.leave();
+
+    var mutex: MutexHandle = null;
+    try testing.expectEqual(errno.ok, scePthreadMutexInit(&mutex, null, null));
+    try testing.expectEqual(errno.ok, scePthreadMutexLock(&mutex));
+    try testing.expectEqual(errno.ok, scePthreadMutexLock(&mutex));
+    try testing.expectEqual(@as(u32, 1), mutex.?.recursion);
+    try testing.expectEqual(errno.ok, scePthreadMutexUnlock(&mutex));
+    try testing.expectEqual(@as(u64, 0), mutex.?.owner);
+    try testing.expectEqual(errno.ok, scePthreadMutexLock(&mutex));
     try testing.expectEqual(errno.ok, scePthreadMutexUnlock(&mutex));
     try testing.expectEqual(errno.ok, scePthreadMutexDestroy(&mutex));
 }
