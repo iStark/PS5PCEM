@@ -115,36 +115,21 @@ If you would like to support continued PS5PCEM development, you can do so on
 - Unreal Engine titles can mount multi-gigabyte PAKs, initialize ICU, load
   cooked configuration and shader archives, and emit real AGC acquire, release,
   wait, event, DMA, indirect-register, draw and flip packets. Tetris Effect:
-  Connected reaches repeated graphics/compute submissions and VideoOut flips;
-  its compact typed image-clear dispatches now update guest render-target and
-  depth memory, including a dual 1024×1024 `RGBA32_FLOAT` clear, while its
-  bounded buffer-to-volume uploads populate 3D images. General compute
-  `image_load`/`image_store` now use individually typed Vulkan 2D and 3D storage
-  images, including mixed `R11G11B10_FLOAT`, `RGBA8_UNORM`, and `RGBA16_FLOAT`
-  bindings, with checked volume detile/upload and readback/retile. Sampled-image
-  paths recover T# and S# values at the exact MIMG instruction and bind separate
-  combined 2D/3D descriptor arrays. Fragment shaders can mix ordinary 2D images
-  with 3D `10_10_10_2_UNORM` lookup volumes, while compute lowers the observed
-  2D `image_sample_lz` with explicit LOD 0 and NSA coordinates. Unnormalized
-  guest samplers are represented with Vulkan-compliant clamp, filter, and LOD
-  state. LDS
-  is allocated from `COMPUTE_PGM_RSRC2`, and the common DS read/write, paired,
-  subword, atomic, and barrier operations lower to SPIR-V Workgroup memory.
-  Final compositor draws that omit color-buffer registers are now retained for
-  the following VideoOut flip, which supplies the scanout target. The observed
-  2,401-instruction fragment shader now translates to structured SPIR-V, passes
-  validation, compiles on the host driver, and writes the full 3840×2160
-  scanout. The first repeatable guest framebuffer is no longer black, but it is
-  still a uniform light gray rather than a recognizable scene. The former LDS,
-  storage-image-format, late V# binding, compute sample, and NSA image-store
-  blockers are translated through the complete observed 176-instruction
-  prepass. A translation-only diagnostic produces 5,421 SPIR-V words for that
-  program. Normal execution now completes both `15×9×8` dispatches, the
-  `16×16×16` four-binding `RGBA16_FLOAT` storage-volume pass, and the mixed
-  four-image fragment setup containing a `32×32×32` sampled volume. The host
-  driver accepts the resulting pipeline without a validation, fence, or GPU
-  fault. Recognizable scene output is still blocked by unsupported graphics
-  opcodes, DCC color-target state, and incomplete NGG export semantics.
+  Connected now completes a measured startup frame containing 595 guest draws
+  and 63 compute dispatches without a rejected draw, shader-lowering failure,
+  validation error, fence failure, or GPU fault. Typed 2D/3D storage images,
+  bounded LDS/DS workgroup memory, `image_load`/`image_store`, sampled-image
+  LOD/offset and gather forms, scalar bitfield operations, `V_LDEXP_F32`, and
+  vertex-stage image fetches cover the observed startup shaders. Vulkan color
+  attachments now include native `R11G11B10_FLOAT`, `10_10_10_2_UNORM`,
+  `RGBA16_FLOAT`, and `RGBA32_FLOAT` paths; layered post-process targets use a
+  documented first-slice approximation until layered rendering is implemented.
+  The second VideoOut cycle produces the particle scene shown below from a
+  visible 1920×1080 HDR render target. This is the first recognizable guest
+  graphics milestone, not a menu or gameplay claim: the registered 3840×2160
+  scanout remains black, and one measured startup frame took about 471 seconds
+  on the current test host because draws and compute work are still submitted
+  synchronously.
 
 ### Screenshot
 
@@ -183,9 +168,13 @@ the guest pixel shader from the NV12 planes returned by SceAvPlayer and
 presented through the normal Vulkan VideoOut path. Audio from the same media is
 delivered as synchronized 48 kHz stereo PCM.*
 
-*The current Tetris Effect capture is not presented as gameplay: it is a
-uniform light-gray first guest framebuffer. A title screenshot will be added
-when the emulator produces recognizable scene content.*
+![Tetris Effect first guest-rendered particle frame](docs/images/tetris-effect-first-render.png)
+
+*The first recognizable Tetris Effect render produced by the title's startup
+graph: 595 guest draws and 63 compute dispatches complete without a rejected
+draw. This 1920×1080 `R11G11B10_FLOAT` intermediate is converted for display
+because the registered 3840×2160 VideoOut target is still black. It is an early
+particle-scene milestone, not a title-screen or gameplay claim.*
 
 ### Observed title milestones
 
@@ -198,7 +187,7 @@ the repository contains none of that content.
 | **Terminator 2D: No Fate** | Reaches gameplay with correct color reproduction and clean title-provided backgrounds, characters, HUD elements, and textures; publisher logo screens and menus now match the console capture; warmed-up startup frames measure 22–65 ms on the current test host | First-use texture staging, multiple render targets, and the remaining compression metadata are incomplete |
 | **Pistol Whip** | Maps the native PS VR2 plugin and Burst module, then starts loading Unity asset archives | Headset, tracking, controller, and host OpenXR support are intentionally deferred |
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
-| **Tetris Effect: Connected** | Completes Unreal filesystem/config bootstrap, typed UAV clears, both `15×9×8` dispatches, and a general `16×16×16` storage-image dispatch with four 3D bindings backed by two `64×64×64 RGBA16_FLOAT` volumes. Its mixed fragment setup stages three 2D images plus a `32×32×32 10_10_10_2_UNORM` volume, emits separate SPIR-V 2D/3D sampled-image types, and creates the Vulkan graphics pipeline without the former sampled-image or NVIDIA GPU fault. The complete 176-instruction mixed-image/LDS prepass also includes compute `image_sample_lz` at PC `0x29c` and NSA `image_store` at PC `0x440` | The first repeatable guest framebuffer remains uniform light gray rather than a recognizable scene. Unsupported graphics opcodes, DCC color-target state, incomplete NGG export semantics, very slow synchronous startup compute, an intermittent early guest `libc` null fault, and host placement of the 512 GiB sparse reservation remain active limits |
+| **Tetris Effect: Connected** | Completes the Unreal bootstrap and a measured startup frame with 595 guest draws and 63 compute dispatches, including typed 2D/3D storage images, `64×64×64 RGBA16_FLOAT` volumes, layered post-process targets, `RGBA32_FLOAT` exposure surfaces, a `10_10_10_2_UNORM` lookup target, and the mixed image/LDS prepass. No draw, shader lowering, validation, fence, or GPU failure occurs, and the latest visible 1920×1080 HDR target contains the recognizable particle scene shown above | The exact registered 3840×2160 VideoOut target remains black, so presentation currently falls back to a converted `R11G11B10_FLOAT` intermediate. NGG/fetch-shader continuations, exact layered rendering, final scanout aliasing/tonemapping, and performance remain incomplete; the measured frame took about 471 seconds on the current test host, and neither a menu nor gameplay is claimed |
 | **The Precinct** | Links the complete six-image guest graph, defers and starts Unity plug-ins through `sceKernelLoadStartModule`, enters Unity, indexes its audio assets, and plays both observed intro movies through the new SceAvPlayer path. The title receives synchronized 3840×2160 NV12 video and 48 kHz stereo PCM; its guest YUV conversion shader produces the recognizable Kwalee frame above. Post-video graphics continue through seven draws and nine dispatches per frame, with warmed-up frames around 20–22 ms on the current RTX 3070 Ti test host | The post-video scene source is still incorrect: draw 1 receives a sparse/corrupted pixel strip, draw 2 copies it to the scanout, and later UI draws do not restore a recognizable scene. Gameplay is not claimed yet |
 | **Jets 'n' Guns 2** | Resolves title content through `/app0`, completes AGC resource registration, and sustains the full graphics/compute/VideoOut loop. Targetless final passes are preserved through flip, while dynamic SGPR data and descriptor-sized buffer bounds keep streamed sprite batches on stable Vulkan pipelines. The title now renders the recognizable 3840×2160 title screen, main menu, and options UI shown above; warmed 53-draw startup frames measure roughly 113–124 ms on the current RTX 3070 Ti host with zero pipeline misses after warm-up | A manual `Cross` reaches the main menu without the automatic `Options` pulse, but selecting `NEW GAME` currently stops further flips after the audio decode/output loops exit. A playable scene and working in-game audio are therefore not claimed yet |
 | **Asterix & Obelix: Slap Them All!** | Maps the Unity/PSN plug-in graph, passes GameUpdate, trophy, entitlement, WebApi, and player-review bootstrap calls, accepts four-byte-aligned AGC shader headers, and reaches repeated 1920×1080 frames. SceAvPlayer returns the ATL intro as correctly decoded NV12 frames, while matched image-copy, planar-conversion, fullscreen-blit, and color-resolve paths keep the observed movie pipeline moving without its former multi-second shader compilation/dispatch blockers | The decoded source is recognizable, but final compositor scaling/presentation still needs validation and no repeatable menu or gameplay frame is claimed yet |
@@ -468,8 +457,10 @@ modifiers. The native VOP3 table includes unsigned sum-of-absolute-differences
 it in the address/index arithmetic of its vertex shaders. Signed high-word
 multiplication (`V_MUL_HI_I32`) uses the exact two's-complement correction over
 the unsigned 64-bit product, and `V_CVT_FLR_I32_F32` applies GLSL `Floor` before
-the signed conversion. Rita's Rewind exercises both operations in its CRT
-fragment shader. Acyclic scalar
+the signed conversion. `V_LDEXP_F32` maps to GLSL `Ldexp`, while `S_BFM_B32`,
+`S_BFE_U32`, and paired `S_BFE_U64` preserve the scalar field widths and packed
+offsets used by Tetris Effect. Rita's Rewind exercises the former operations in
+its CRT fragment shader. Acyclic scalar
 selections become structured
 `OpSelectionMerge`/`OpBranchConditional` regions and register values crossing
 their joins use hierarchical `OpPhi` state merging. The Tetris Effect
@@ -507,15 +498,18 @@ matching inputs, and fragment `EXP MRT0` to color location zero. Hardware-only
 M0 setup and EXEC restoration from unavailable pixel-prolog SGPRs are tolerated
 without inventing guest data. Fragment EXEC/VCC predicates use the subgroup
 local invocation index rather than a compute-only builtin. The current MIMG
-path lowers normalized 2D and 3D `image_sample` through dimension-specific
-combined sampled-image descriptor arrays for fragment programs. Compute
-programs additionally support
-the observed `image_sample_lz` form with explicit LOD 0, including NSA
-coordinates and per-instruction recovery of reused T#/S# SGPRs. Sampled-image
-staging detiles 2D surfaces and thick 3D volumes, including `RGBA8_UNORM`,
-`R11G11B10_FLOAT`, `RGBA16_FLOAT`, and `10_10_10_2_UNORM`, into matching Vulkan
-formats. Resource dimension and depth are part of the cache key so 2D/3D
-aliases cannot reuse an incompatible image view.
+path lowers normalized 2D and 3D `image_sample`, level-zero samples with packed
+offsets, and the observed four-result `image_gather4` form through
+dimension-specific combined sampled-image descriptor arrays. Vertex and
+fragment `image_load` use an explicit-LOD texel fetch when the guest supplies
+integer 2D coordinates. Compute programs additionally support the observed
+`image_sample_lz` forms with explicit LOD 0, including NSA coordinates and
+per-instruction recovery of reused T#/S# SGPRs. Sampled-image staging detiles 2D
+surfaces and thick 3D volumes, including `R32_FLOAT`, `RGBA16_UNORM`,
+`RGBA8_UNORM`, `R11G11B10_FLOAT`, `RGBA16_FLOAT`, `RGBA32_FLOAT`, and
+`10_10_10_2_UNORM`, into matching Vulkan formats. Resource dimension and depth
+are part of the cache key so 2D/3D aliases cannot reuse an incompatible image
+view.
 Compressed/masked exports, additional MRT targets, non-trivial image operands,
 and the remaining graphics system VGPRs are still incomplete.
 
@@ -660,9 +654,9 @@ set.
    DPP subgroup lowering, VOP3 modifiers plus the remaining opcode tables.
 2. Structure back edges with loop merges and lower VCC/EXEC lane-mask changes
    through the divergence-aware SSA boundary.
-3. Extend image and LDS lowering to sampled/array/mip/MSAA and remaining DS
-   forms, then finish masked/multiple exports and the remaining system VGPRs
-   against captured shader-resource and stage-interface metadata.
+3. Extend image lowering to array/mip/MSAA, partial-mask store, compare-gather,
+   and image-atomic forms; finish the remaining DS operations, masked/multiple
+   exports, and system VGPRs against captured resource and stage metadata.
 
 ---
 
@@ -963,9 +957,11 @@ detiling walks macro-block rows and reuses their local offset table instead of
 recomputing checked coordinates for every texel. Thick render-target volumes use
 the shared 3D texture layout and upload all depth slices into a Vulkan 3D image.
 MIMG lowering supports normalized two-coordinate 2D and three-coordinate 3D
-fragment `image_sample`, plus compute `image_sample_lz` with explicit LOD 0;
-array/cube dimensions, mips, component swizzles, and additional sampling operands
-remain incomplete.
+sampling, explicit level-zero samples with packed offsets, the observed
+four-result gather, and vertex/fragment 2D texel fetches. Compute
+`image_sample_lz` retains explicit LOD 0 and NSA coordinates. Array/cube
+dimensions, mip chains, compare-gather variants, and the remaining sampling
+operands remain incomplete.
 
 Each draw submission completes through its fence before the executor reaches a
 PM4 synchronization callback. `ACQUIRE_MEM`, `RELEASE_MEM`, `WRITE_DATA`, and
@@ -2124,72 +2120,44 @@ bounds are runtime data, so warmed 53-draw frames reuse the same Vulkan pipeline
 and render the title screen, main menu, and options UI shown above.
 
 Tetris Effect: Connected exercises the same expanded Unreal path without a VR
-plugin. It reaches a repeated graphics/compute loop and the second measured
-VideoOut frame contains 6 draws and 63 dispatches without the previous
-host-side `memcpy` access violation. Its final compositor can legally omit CB
-descriptors and rely on the following VideoOut flip to name the scanout
-allocation. The renderer keeps the complete ordered targetless pass, snapshots
-each draw's graphics state, and resolves a bounded 32-bit color target from the
-registered display address, dimensions, pitch, and tiling mode at that flip.
-An all-ones AGC screen-scissor register is treated as the unset sentinel rather
-than as an empty rectangle, so this path uses the complete 3840×2160 extent.
-Its compact 8- and 11-instruction typed clears now execute for `R8_UINT`,
-`R32_UINT`, `RGBA8_UNORM`, `RGBA8_UINT`, and `RGBA16_FLOAT`, including inverse
-storage swizzles and tiled render-target/depth addressing. The exact observed
-18-instruction dual-store kernel also clears two 1024×1024 `RGBA32_FLOAT`
-render targets (2,097,152 texels total); inactive metadata pointers are accepted,
-while actual DCC/FMASK compression, non-fast-clear HTILE range states, and CMASK
-states beyond the supported single-sample clear/expanded pair remain rejected. Its observed
-32-instruction 3D upload program now copies `R8_UINT→RGBA8_UINT` and
-`R16_UINT→R16_UINT` volumes with the shader's bounds, strides, base coordinates,
-and linear/tiled target layout. A measured startup frame consequently completes
-all four volume uploads (two 1×1×1 and two 16×16×16) without a rejected compute
-dispatch. Synchronous AGC backend time beyond a 100 ms allowance per submit is
-excluded from the guest process clock, preventing the false
-`GameThread timed out waiting for RenderThread` watchdog that previously ended
-this slow host run at `eboot.bin+0x16af4ef` without stalling clocks in titles
-that issue many ordinary submissions per frame.
-The deferred compositor fragment program decodes to 2,401 instructions, 131
-basic blocks, and 76 forward selections. Dominator-ordered selection regions
-and hierarchical register `OpPhi` merging produce valid structured SPIR-V; the
-module passes `spirv-val`, compiles on the NVIDIA test driver, and submits with
-a fullscreen input mapping for the still-unimplemented NGG export stage. The
-draw writes all 8,294,400 pixels of the scanout, so
-`UnsupportedScalarSource`, a zero-sized scissor, and host pipeline compilation
-are no longer the immediate rendering boundary. LDS now uses bounded SPIR-V
-Workgroup memory with DS paired/subword/atomic lowering, and the 20-instruction
-`image_load`/`image_store` path has a real typed Vulkan storage-image pipeline
-with detile/retile writeback. Late and nested compute V# chains are recovered
-from their SMEM producers; in the observed startup, both `15×9×8` volume
-dispatches that previously failed at the final `buffer_atomic_swap` translate.
-The 176-instruction `30×34×1` prepass resolves mixed
-`R11G11B10_FLOAT`/`RGBA8_UNORM` images, lowers compute `image_sample_lz` at PC
-`0x29c`, consumes its NSA coordinate, then lowers the NSA `image_store` at PC
-`0x440`. Normal execution also reaches the general `16×16×16` storage-image
-program: four 3D T# bindings alias two `64×64×64 RGBA16_FLOAT` volumes and pass
-through upload, Vulkan writes, readback, and retile without a fence or GPU fault.
-The following fragment setup mixes three 2D textures with one
-`32×32×32 10_10_10_2_UNORM` lookup volume. Separate SPIR-V Dim2D/Dim3D combined
-descriptor arrays preserve the mixed shader interface, and the NVIDIA driver
-accepts the resulting graphics pipeline. The former `FenceWaitFailed`/
-`nvlddmkm` boundary is therefore no longer current.
+plugin. It now reaches the first recognizable particle scene through the real
+guest render graph. In the measured second VideoOut cycle, all 595 draws and 63
+compute dispatches complete without a rejected draw, shader-lowering failure,
+validation error, fence failure, or GPU fault. The renderer retains targetless
+final passes until VideoOut supplies the registered display geometry, treats an
+all-ones screen scissor as the unset sentinel, and preserves resident targets
+across the complete 3840×2160 post-processing chain.
 
-The last repeatable framebuffer remains uniform light gray rather than a
-recognizable title image. DCC-backed color state is still rejected in an early
-draw, and later vertex/fragment programs expose unsupported opcodes and
-incomplete NGG export behavior. A separate nondeterministic startup issue can
-fault in the guest `libc.prx` initializer on a null read before any GPU work; a
-fresh second launch has repeatedly passed that point. A measured full-compute
-second frame takes roughly 336 host seconds on the current test machine, with
-most time spent in synchronous compute emulation. The opt-in
-`PS5_SKIP_COMPUTE=1` bring-up mode reaches the same framebuffer in about
-44 seconds and must not be treated as correct execution. Its 3840×2160 display
-buffers register with the expected pitch. A measured loading run held private
-memory near 2.2–2.3 GiB instead of retaining a geometric chain of arena-backed
-temporary buffers past 9 GiB; the remaining working-set growth tracks newly
-touched guest asset pages. A separate startup risk remains: placement of the
-title's 512 GiB sparse virtual reservation can fail when the Windows process
-layout leaves no suitable hole.
+The startup workload exercises typed clears and copies for `R8_UINT`,
+`R16_UINT`, `R32_UINT`, `RGBA8_UNORM`, `RGBA8_UINT`, `RGBA16_UNORM`,
+`RGBA16_FLOAT`, and `RGBA32_FLOAT`; mixed 2D/3D sampled and storage images;
+`64×64×64` post-process volumes; and bounded LDS with DS paired, subword,
+atomic, and barrier operations. Scalar `S_BFM_B32`, `S_BFE_U32`, and
+`S_BFE_U64`, vector `V_LDEXP_F32`, level-zero offset sampling, four-result
+gathers, and vertex-stage `image_load` cover the newly observed shader forms.
+The complete 176-instruction image/LDS prepass and the 2,401-instruction
+compositor both translate to accepted SPIR-V rather than falling back or being
+discarded.
+
+The color path now maps native `R11G11B10_FLOAT`, `RGBA16_FLOAT`,
+`RGBA32_FLOAT`, and standard-order `10_10_10_2_UNORM` attachments. Small array
+targets use their requested base slice as a documented approximation until
+layered Vulkan rendering is exposed; this keeps the observed luminance, bloom,
+and exposure passes alive without pretending that all slices were rendered.
+DCC fast clears preserve native texel widths, and packed `R11G11B10_FLOAT`
+readback is converted to RGBA8 for diagnostic presentation.
+
+The registered 3840×2160 VideoOut allocation is still opaque black at the
+second flip. The screenshot above therefore comes from the newest visible
+1920×1080 `R11G11B10_FLOAT` intermediate, not from the final scanout. The main
+remaining correctness work is the NGG/fetch-shader continuation that ends its
+attribute prolog with `S_SETPC_B64`, exact layered rendering, and the final
+scanout alias/tonemap path. Performance is also far from interactive: the
+measured frame took about 471 seconds, with roughly 231 seconds in draws and
+232 seconds in compute across 799 synchronous submissions. The driver created
+28 graphics pipelines in about 515 ms, so pipeline compilation is no longer
+the dominant cost. A 512 GiB sparse guest reservation can still fail if the
+Windows process layout leaves no suitable virtual-address hole.
 
 ## Error codes
 

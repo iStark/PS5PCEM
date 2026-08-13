@@ -369,6 +369,7 @@ const Builder = struct {
     float_type: u32,
     bool_type: u32,
     vector3_bits_type: u32 = 0,
+    vector2_signed_type: u32 = 0,
     vector3_type: u32 = 0,
     vector4_type: u32 = 0,
     main_function: u32,
@@ -401,6 +402,7 @@ const Builder = struct {
     fragment_extent: [2]u32,
     vector2_type: u32 = 0,
     vector2_bits_type: u32 = 0,
+    sampled_image_image_types: [2]u32 = @splat(0),
     sampled_image_types: [2]u32 = @splat(0),
     sampled_image_arrays: [2]u32 = @splat(0),
     sampled_image_pointer_types: [2]u32 = @splat(0),
@@ -654,7 +656,7 @@ const Builder = struct {
             }
         }
         if (options.sampled_images.len != 0) {
-            if ((options.stage != .fragment and options.stage != .compute) or
+            if ((options.stage != .vertex and options.stage != .fragment and options.stage != .compute) or
                 options.descriptor_array_length == 0)
             {
                 return Error.InvalidStorageBinding;
@@ -697,6 +699,7 @@ const Builder = struct {
                     try self.emit(&self.declarations, 23, &.{ self.vector3_type, self.float_type, dimensions }); // OpTypeVector
                 }
                 const image_type = self.id();
+                self.sampled_image_image_types[dimension_index] = image_type;
                 self.sampled_image_types[dimension_index] = self.id();
                 const descriptor_array = self.id();
                 const array_pointer = self.id();
@@ -1094,6 +1097,21 @@ const Builder = struct {
             result,
             try self.constant(.float32, @bitCast(@as(f32, 1.0))),
             divisor,
+        });
+        try self.destination(inst.dst, .{ .id = result, .value_type = .float32 });
+    }
+
+    fn ldexpFloat(self: *Builder, inst: instruction.Instruction) Error!void {
+        const value = try self.source(inst.src0, .float32);
+        const exponent = try self.source(inst.src1, .sint32);
+        const result = self.id();
+        try self.emit(&self.body, 12, &.{ // GLSL.std.450 Ldexp
+            self.float_type,
+            result,
+            self.ensureGlslStd450(),
+            53,
+            value,
+            exponent,
         });
         try self.destination(inst.dst, .{ .id = result, .value_type = .float32 });
     }
@@ -1501,39 +1519,24 @@ const Builder = struct {
         const width = try self.andBits(width_raw, 31);
         const shifted = self.id();
         try self.emit(&self.body, 194, &.{ self.bits_type, shifted, value, offset }); // OpShiftRightLogical
-        // mask = width == 0 ? 0xffffffff : (1 << width) - 1
+        // V_BFE uses a separate five-bit width; a zero-width field is zero.
         const one = try self.constant(.bits32, 1);
         const shifted_one = self.id();
         try self.emit(&self.body, 196, &.{ self.bits_type, shifted_one, one, width }); // OpShiftLeftLogical
-        const mask_from_width = self.id();
-        try self.emit(&self.body, 130, &.{ self.bits_type, mask_from_width, shifted_one, one }); // OpISub
-        const full_mask = try self.constant(.bits32, 0xffff_ffff);
-        const width_is_zero = self.id();
-        try self.emit(&self.body, 170, &.{ // OpIEqual
-            self.bool_type,
-            width_is_zero,
-            width,
-            try self.constant(.bits32, 0),
-        });
         const mask = self.id();
-        try self.emit(&self.body, 169, &.{ // OpSelect
-            self.bits_type,
-            mask,
-            width_is_zero,
-            full_mask,
-            mask_from_width,
-        });
+        try self.emit(&self.body, 130, &.{ self.bits_type, mask, shifted_one, one }); // OpISub
         const extracted = self.id();
         try self.emit(&self.body, 199, &.{ self.bits_type, extracted, shifted, mask }); // OpBitwiseAnd
         if (signed_field) {
-            // Sign-extend: (extracted << (32-width)) >>a (32-width); width 0 keeps value.
-            const shift_amount = self.id();
+            // Sign-extend: (extracted << ((32-width)&31)) >>a the same amount.
+            const raw_shift_amount = self.id();
             try self.emit(&self.body, 130, &.{ // OpISub
                 self.bits_type,
-                shift_amount,
+                raw_shift_amount,
                 try self.constant(.bits32, 32),
                 width,
             });
+            const shift_amount = try self.andBits(raw_shift_amount, 31);
             const up = self.id();
             try self.emit(&self.body, 196, &.{ self.bits_type, up, extracted, shift_amount }); // OpShiftLeftLogical
             const signed_up = self.id();
@@ -1542,15 +1545,7 @@ const Builder = struct {
             try self.emit(&self.body, 195, &.{ self.signed_type, down, signed_up, shift_amount }); // OpShiftRightArithmetic
             const as_bits = self.id();
             try self.emit(&self.body, 114, &.{ self.bits_type, as_bits, down }); // OpBitcast
-            const result = self.id();
-            try self.emit(&self.body, 169, &.{ // OpSelect
-                self.bits_type,
-                result,
-                width_is_zero,
-                extracted,
-                as_bits,
-            });
-            try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+            try self.destination(inst.dst, .{ .id = as_bits, .value_type = .bits32 });
             return;
         }
         try self.destination(inst.dst, .{ .id = extracted, .value_type = .bits32 });
@@ -1689,6 +1684,157 @@ const Builder = struct {
         }
     }
 
+    fn bitfieldMask(self: *Builder, inst: instruction.Instruction) Error!void {
+        // S_BFM_B32 creates a run of src0 low bits and then shifts it by src1.
+        // RDNA masks both operands to five bits; keeping the two shifts separate
+        // also gives the required truncation when the field crosses bit 31.
+        const count_raw = try self.source(inst.src0, .bits32);
+        const offset_raw = try self.source(inst.src1, .bits32);
+        const count = try self.andBits(count_raw, 31);
+        const offset = try self.andBits(offset_raw, 31);
+        const one = try self.constant(.bits32, 1);
+        const shifted_one = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, shifted_one, one, count }); // OpShiftLeftLogical
+        const low_mask = self.id();
+        try self.emit(&self.body, 130, &.{ self.bits_type, low_mask, shifted_one, one }); // OpISub
+        const result = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, result, low_mask, offset }); // OpShiftLeftLogical
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
+    fn scalarBitfieldExtract(self: *Builder, inst: instruction.Instruction) Error!void {
+        // SOP2 packs OFFSET in bits 4:0 and WIDTH in bits 22:16 of src1.
+        // Unlike V_BFE, there is no third source operand.
+        const value = try self.source(inst.src0, .bits32);
+        const field = try self.source(inst.src1, .bits32);
+        const offset = try self.andBits(field, 31);
+        const shifted_field = self.id();
+        try self.emit(&self.body, 194, &.{
+            self.bits_type,
+            shifted_field,
+            field,
+            try self.constant(.bits32, 16),
+        }); // OpShiftRightLogical
+        const width = try self.andBits(shifted_field, 0x7f);
+        const result = self.id();
+        try self.emit(&self.body, 203, &.{ self.bits_type, result, value, offset, width }); // OpBitFieldUExtract
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
+    fn shiftRightLogical64(self: *Builder, value: [2]u32, offset: u32) Error![2]u32 {
+        const within_dword = try self.andBits(offset, 31);
+        const offset_lt_32 = self.id();
+        try self.emit(&self.body, 176, &.{
+            self.bool_type,
+            offset_lt_32,
+            offset,
+            try self.constant(.bits32, 32),
+        }); // OpULessThan
+        const offset_is_zero = self.id();
+        try self.emit(&self.body, 170, &.{
+            self.bool_type,
+            offset_is_zero,
+            offset,
+            try self.constant(.bits32, 0),
+        }); // OpIEqual
+        const low_right = self.id();
+        try self.emit(&self.body, 194, &.{ self.bits_type, low_right, value[0], within_dword });
+        const high_right = self.id();
+        try self.emit(&self.body, 194, &.{ self.bits_type, high_right, value[1], within_dword });
+        const raw_carry_shift = self.id();
+        try self.emit(&self.body, 130, &.{
+            self.bits_type,
+            raw_carry_shift,
+            try self.constant(.bits32, 32),
+            within_dword,
+        });
+        const carry_shift = try self.andBits(raw_carry_shift, 31);
+        const carry = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, carry, value[1], carry_shift });
+        const merged_low = self.id();
+        try self.emit(&self.body, 197, &.{ self.bits_type, merged_low, low_right, carry });
+        const below_32_low = self.id();
+        try self.emit(&self.body, 169, &.{
+            self.bits_type,
+            below_32_low,
+            offset_is_zero,
+            low_right,
+            merged_low,
+        });
+        const zero = try self.constant(.bits32, 0);
+        const result_low = self.id();
+        try self.emit(&self.body, 169, &.{
+            self.bits_type,
+            result_low,
+            offset_lt_32,
+            below_32_low,
+            high_right,
+        });
+        const result_high = self.id();
+        try self.emit(&self.body, 169, &.{
+            self.bits_type,
+            result_high,
+            offset_lt_32,
+            high_right,
+            zero,
+        });
+        return .{ result_low, result_high };
+    }
+
+    fn rightAlignedMask64(self: *Builder, count: u32) Error![2]u32 {
+        const thirty_two = try self.constant(.bits32, 32);
+        const count_lt_32 = self.id();
+        try self.emit(&self.body, 176, &.{ self.bool_type, count_lt_32, count, thirty_two }); // OpULessThan
+        const count_gt_32 = self.id();
+        try self.emit(&self.body, 172, &.{ self.bool_type, count_gt_32, count, thirty_two }); // OpUGreaterThan
+        const low_count = self.id();
+        try self.emit(&self.body, 169, &.{ self.bits_type, low_count, count_lt_32, count, thirty_two });
+        const high_base = self.id();
+        try self.emit(&self.body, 130, &.{ self.bits_type, high_base, count, thirty_two });
+        const zero = try self.constant(.bits32, 0);
+        const high_count = self.id();
+        try self.emit(&self.body, 169, &.{ self.bits_type, high_count, count_gt_32, high_base, zero });
+        const full = try self.constant(.bits32, 0xffff_ffff);
+        const low = self.id();
+        try self.emit(&self.body, 201, &.{ self.bits_type, low, zero, full, zero, low_count }); // OpBitFieldInsert
+        const high = self.id();
+        try self.emit(&self.body, 201, &.{ self.bits_type, high, zero, full, zero, high_count });
+        return .{ low, high };
+    }
+
+    fn scalarBitfieldExtract64(self: *Builder, inst: instruction.Instruction) Error!void {
+        const value = try self.sourcePair(inst.src0);
+        const field = try self.source(inst.src1, .bits32);
+        const offset = try self.andBits(field, 63);
+        const shifted_field = self.id();
+        try self.emit(&self.body, 194, &.{
+            self.bits_type,
+            shifted_field,
+            field,
+            try self.constant(.bits32, 16),
+        });
+        const raw_count = try self.andBits(shifted_field, 0x7f);
+        const available = self.id();
+        try self.emit(&self.body, 130, &.{
+            self.bits_type,
+            available,
+            try self.constant(.bits32, 64),
+            offset,
+        });
+        const use_raw_count = self.id();
+        try self.emit(&self.body, 176, &.{ self.bool_type, use_raw_count, raw_count, available });
+        const count = self.id();
+        try self.emit(&self.body, 169, &.{ self.bits_type, count, use_raw_count, raw_count, available });
+        const shifted = try self.shiftRightLogical64(value, offset);
+        const mask = try self.rightAlignedMask64(count);
+        var result: [2]u32 = undefined;
+        for (0..2) |index| {
+            result[index] = self.id();
+            try self.emit(&self.body, 199, &.{ self.bits_type, result[index], shifted[index], mask[index] });
+        }
+        try self.destinationPair(inst.dst, result);
+    }
+
     fn integerToFloat(self: *Builder, inst: instruction.Instruction, signed: bool) Error!void {
         const source_type: ValueType = if (signed) .sint32 else .bits32;
         const source_id = try self.source(inst.src0, source_type);
@@ -1772,6 +1918,22 @@ const Builder = struct {
             try self.emit(&self.declarations, 23, &.{ self.vector2_type, self.float_type, 2 }); // OpTypeVector
         }
         return self.vector2_type;
+    }
+
+    fn ensureSignedVec2(self: *Builder) Error!u32 {
+        if (self.vector2_signed_type == 0) {
+            self.vector2_signed_type = self.id();
+            try self.emit(&self.declarations, 23, &.{ self.vector2_signed_type, self.signed_type, 2 }); // OpTypeVector
+        }
+        return self.vector2_signed_type;
+    }
+
+    fn ensureBitsVec2(self: *Builder) Error!u32 {
+        if (self.vector2_bits_type == 0) {
+            self.vector2_bits_type = self.id();
+            try self.emit(&self.declarations, 23, &.{ self.vector2_bits_type, self.bits_type, 2 }); // OpTypeVector
+        }
+        return self.vector2_bits_type;
     }
 
     /// Ensure GLSL.std.450 is imported; assemble() places OpExtInstImport
@@ -1982,8 +2144,64 @@ const Builder = struct {
         };
     }
 
+    fn sampledImageFetch(self: *Builder, inst: instruction.Instruction) Error!void {
+        if ((self.stage != .vertex and self.stage != .fragment) or inst.opcode_id != 0 or
+            inst.image_dimension != .dim_2d or inst.image_address_components != 2 or
+            inst.data_mask == 0 or inst.src0.kind != .vgpr or
+            inst.src1.kind != .sgpr or inst.src2.kind != .sgpr)
+        {
+            return Error.UnsupportedOpcode;
+        }
+        const binding = self.sampledImageBinding(inst.src1.reg, inst.src2.reg, inst.pc) orelse
+            return Error.InvalidStorageBinding;
+        if (binding.dimension != .two_d or self.sampled_image_arrays[0] == 0 or
+            self.sampled_image_image_types[0] == 0)
+        {
+            return Error.InvalidStorageBinding;
+        }
+
+        const x = try self.source(try imageAddressOperand(inst, 0), .bits32);
+        const y = try self.source(try imageAddressOperand(inst, 1), .bits32);
+        const coordinates = self.id();
+        try self.emit(&self.body, 80, &.{ try self.ensureBitsVec2(), coordinates, x, y }); // OpCompositeConstruct
+        const pointer = self.id();
+        try self.emit(&self.body, 65, &.{
+            self.sampled_image_pointer_types[0],
+            pointer,
+            self.sampled_image_arrays[0],
+            try self.constant(.bits32, binding.descriptor_index),
+        });
+        const sampled_image = self.id();
+        try self.emit(&self.body, 61, &.{ self.sampled_image_types[0], sampled_image, pointer });
+        const image = self.id();
+        try self.emit(&self.body, 100, &.{ self.sampled_image_image_types[0], image, sampled_image }); // OpImage
+        const texel = self.id();
+        try self.emit(&self.body, 95, &.{
+            self.vector4_type,
+            texel,
+            image,
+            coordinates,
+            0x2, // ImageOperands Lod
+            try self.constant(.bits32, 0),
+        }); // OpImageFetch
+
+        var destination_index: u32 = 0;
+        for (0..4) |component| {
+            const bit = @as(u4, 1) << @intCast(component);
+            if (inst.data_mask & bit == 0) continue;
+            const value = self.id();
+            try self.emit(&self.body, 81, &.{ self.float_type, value, texel, @intCast(component) });
+            try self.destination(
+                try consecutiveRegister(inst.dst, destination_index),
+                .{ .id = value, .value_type = .float32 },
+            );
+            destination_index += 1;
+        }
+    }
+
     fn imageLoad(self: *Builder, inst: instruction.Instruction) Error!void {
-        if (self.stage != .compute or inst.opcode_id != 0 or
+        if (self.stage != .compute) return self.sampledImageFetch(inst);
+        if (inst.opcode_id != 0 or
             (inst.image_dimension != .dim_2d and inst.image_dimension != .dim_3d) or
             (inst.image_address_components != 2 and inst.image_address_components != 3) or
             inst.data_mask == 0 or
@@ -2153,6 +2371,9 @@ const Builder = struct {
         const level_zero = inst.opcode_id == 0x27 and
             inst.image_sample_flags.level_zero and
             flags == (@as(u16, 1) << 5);
+        const level_zero_offset = inst.opcode_id == 0x37 and
+            inst.image_sample_flags.level_zero and inst.image_sample_flags.offset and
+            flags == ((@as(u16, 1) << 5) | (@as(u16, 1) << 4));
         const image_dimension: SampledImageDimension = switch (inst.image_dimension) {
             .dim_2d => .two_d,
             .dim_3d => .three_d,
@@ -2162,9 +2383,9 @@ const Builder = struct {
         const coordinate_components: u8 = if (image_dimension == .three_d) 3 else 2;
         if ((self.stage != .fragment and self.stage != .compute) or
             self.sampled_image_arrays[dimension_index] == 0 or
-            (!implicit_lod and !level_zero) or
-            (self.stage == .compute and !level_zero) or
-            inst.image_address_components != coordinate_components or
+            (!implicit_lod and !level_zero and !level_zero_offset) or
+            (self.stage == .compute and !level_zero and !level_zero_offset) or
+            inst.image_address_components != coordinate_components + @as(u8, @intFromBool(level_zero_offset)) or
             inst.data_mask == 0)
         {
             return Error.UnsupportedOpcode;
@@ -2177,12 +2398,13 @@ const Builder = struct {
         };
         if (binding.dimension != image_dimension) return Error.InvalidStorageBinding;
         // Coordinates now come from the real VS PARAM -> PS VINTRP interface.
-        const raw_x = try self.source(try imageAddressOperand(inst, 0), .float32);
-        const raw_y = try self.source(try imageAddressOperand(inst, 1), .float32);
+        const coordinate_base: u32 = @intFromBool(level_zero_offset);
+        const raw_x = try self.source(try imageAddressOperand(inst, coordinate_base), .float32);
+        const raw_y = try self.source(try imageAddressOperand(inst, coordinate_base + 1), .float32);
         const coordinate_x, const coordinate_y = try self.sampleCoordinates(raw_x, raw_y);
         const coordinates = self.id();
         if (image_dimension == .three_d) {
-            const coordinate_z = try self.source(try imageAddressOperand(inst, 2), .float32);
+            const coordinate_z = try self.source(try imageAddressOperand(inst, coordinate_base + 2), .float32);
             try self.emit(&self.body, 80, &.{ self.vector3_type, coordinates, coordinate_x, coordinate_y, coordinate_z });
         } else {
             try self.emit(&self.body, 80, &.{ self.vector2_type, coordinates, coordinate_x, coordinate_y });
@@ -2197,7 +2419,18 @@ const Builder = struct {
         const sampled_image = self.id();
         try self.emit(&self.body, 61, &.{ self.sampled_image_types[dimension_index], sampled_image, pointer });
         const sampled = self.id();
-        if (level_zero) {
+        if (level_zero_offset) {
+            const offset = try self.imageTexelOffset(inst);
+            try self.emit(&self.body, 88, &.{
+                self.vector4_type,
+                sampled,
+                sampled_image,
+                coordinates,
+                0x12, // ImageOperands Lod | Offset
+                try self.constant(.float32, @bitCast(@as(f32, 0))),
+                offset,
+            }); // OpImageSampleExplicitLod
+        } else if (level_zero) {
             // Compute shaders have no implicit derivatives. GFX10's
             // image_sample_lz names mip zero explicitly, which maps directly to
             // an explicit SPIR-V Lod operand and is valid in every shader stage.
@@ -2224,6 +2457,89 @@ const Builder = struct {
                 .{ .id = value, .value_type = .float32 },
             );
             destination_index += 1;
+        }
+    }
+
+    fn imageTexelOffset(self: *Builder, inst: instruction.Instruction) Error!u32 {
+        const packed_bits = try self.source(try imageAddressOperand(inst, 0), .bits32);
+        const packed_signed = try self.convert(.{ .id = packed_bits, .value_type = .bits32 }, .sint32);
+        const bit_zero = try self.constant(.sint32, 0);
+        const bit_eight = try self.constant(.sint32, 8);
+        const six = try self.constant(.sint32, 6);
+        const offset_x = self.id();
+        const offset_y = self.id();
+        try self.emit(&self.body, 202, &.{ self.signed_type, offset_x, packed_signed, bit_zero, six }); // OpBitFieldSExtract
+        try self.emit(&self.body, 202, &.{ self.signed_type, offset_y, packed_signed, bit_eight, six });
+        const offset = self.id();
+        try self.emit(&self.body, 80, &.{ try self.ensureSignedVec2(), offset, offset_x, offset_y });
+        return offset;
+    }
+
+    fn gatherImage(self: *Builder, inst: instruction.Instruction) Error!void {
+        const flags: u16 = @bitCast(inst.image_sample_flags);
+        const supported_flags = (@as(u16, 1) << 5) | (@as(u16, 1) << 4);
+        if (self.stage != .fragment or inst.image_dimension != .dim_2d or
+            !inst.image_sample_flags.level_zero or inst.image_sample_flags.compare or
+            flags & ~supported_flags != 0 or inst.data_mask == 0 or
+            inst.image_address_components != 2 + @as(u8, @intFromBool(inst.image_sample_flags.offset)))
+        {
+            return Error.UnsupportedOpcode;
+        }
+        if (inst.src0.kind != .vgpr or inst.src1.kind != .sgpr or inst.src2.kind != .sgpr) {
+            return Error.UnsupportedBufferAddressing;
+        }
+        const binding = self.sampledImageBinding(inst.src1.reg, inst.src2.reg, inst.pc) orelse
+            return Error.InvalidStorageBinding;
+        if (binding.dimension != .two_d or self.sampled_image_arrays[0] == 0) {
+            return Error.InvalidStorageBinding;
+        }
+
+        const coordinate_base: u32 = @intFromBool(inst.image_sample_flags.offset);
+        const raw_x = try self.source(try imageAddressOperand(inst, coordinate_base), .float32);
+        const raw_y = try self.source(try imageAddressOperand(inst, coordinate_base + 1), .float32);
+        const coordinates = self.id();
+        try self.emit(&self.body, 80, &.{ self.vector2_type, coordinates, raw_x, raw_y }); // OpCompositeConstruct
+
+        const pointer = self.id();
+        try self.emit(&self.body, 65, &.{
+            self.sampled_image_pointer_types[0],
+            pointer,
+            self.sampled_image_arrays[0],
+            try self.constant(.bits32, binding.descriptor_index),
+        });
+        const sampled_image = self.id();
+        try self.emit(&self.body, 61, &.{ self.sampled_image_types[0], sampled_image, pointer });
+
+        const component: u32 = @ctz(inst.data_mask);
+        const gathered = self.id();
+        if (inst.image_sample_flags.offset) {
+            const offset = try self.imageTexelOffset(inst);
+            try self.emit(&self.body, 96, &.{
+                self.vector4_type,
+                gathered,
+                sampled_image,
+                coordinates,
+                try self.constant(.bits32, component),
+                0x10, // ImageOperands Offset
+                offset,
+            }); // OpImageGather
+        } else {
+            try self.emit(&self.body, 96, &.{
+                self.vector4_type,
+                gathered,
+                sampled_image,
+                coordinates,
+                try self.constant(.bits32, component),
+            }); // OpImageGather
+        }
+
+        for (0..4) |index| {
+            const value = self.id();
+            try self.emit(&self.body, 81, &.{ self.float_type, value, gathered, @intCast(index) }); // OpCompositeExtract
+            try self.destination(
+                try consecutiveRegister(inst.dst, @intCast(index)),
+                .{ .id = value, .value_type = .float32 },
+            );
         }
     }
 
@@ -3407,12 +3723,13 @@ const Builder = struct {
             .s_lshl2_add_u32 => try self.fixedShiftLeftAdd(inst, 2),
             .s_lshl3_add_u32 => try self.fixedShiftLeftAdd(inst, 3),
             .s_lshl4_add_u32 => try self.fixedShiftLeftAdd(inst, 4),
-            // Bitfield extract: dst = (src0 >> (src1 & 31)) & mask(src2 & 31).
-            // Width 0 means a full 32-bit field on GCN/RDNA.
-            .s_bfe_u32, .v_bfe_u32 => try self.bitfieldExtract(inst, false),
+            // Bitfield mask: dst = (((1 << (src0 & 31)) - 1) << (src1 & 31)).
+            .s_bfm_b32 => try self.bitfieldMask(inst),
+            // Scalar BFE packs offset/width in src1; vector BFE uses src1/src2.
+            .s_bfe_u32 => try self.scalarBitfieldExtract(inst),
+            .v_bfe_u32 => try self.bitfieldExtract(inst, false),
             .v_bfe_i32 => try self.bitfieldExtract(inst, true),
-            // 64-bit bitfield extract: keep the low dword of src0 for now.
-            .s_bfe_u64 => try self.unary(inst, 83, .bits32),
+            .s_bfe_u64 => try self.scalarBitfieldExtract64(inst),
             // Ternary packing helpers used heavily by Unity compute kernels.
             .v_and_or_b32 => try self.andOr(inst),
             .v_bfi_b32 => try self.bitfieldInsert(inst),
@@ -3441,6 +3758,7 @@ const Builder = struct {
             .v_max_i32 => try self.glslBinary(inst, 42, .sint32), // SMax
             .v_min3_f32, .v_max3_f32, .v_med3_f32 => try self.minMax3Float(inst, inst.opcode),
             .v_rcp_f32 => try self.reciprocalFloat(inst),
+            .v_ldexp_f32 => try self.ldexpFloat(inst),
             .v_rndne_f32 => try self.glslFloatUnary(inst, 2), // RoundEven
             .v_trunc_f32 => try self.glslFloatUnary(inst, 3),
             .v_floor_f32 => try self.glslFloatUnary(inst, 8),
@@ -3598,6 +3916,7 @@ const Builder = struct {
             .image_load => try self.imageLoad(inst),
             .image_store => try self.imageStore(inst),
             .image_sample => try self.sampleImage(inst),
+            .image_gather4 => try self.gatherImage(inst),
             .exp => try self.exportValue(inst),
             else => return Error.UnsupportedOpcode,
         }
@@ -3605,11 +3924,17 @@ const Builder = struct {
 };
 
 fn lowerDiagnosed(builder: *Builder, inst: instruction.Instruction) Error!void {
-    // The backend reports a translation failure once per program/stage and
-    // includes a bounded disassembly there. Printing here emitted the same
-    // failed instruction for every draw and could dominate a title's frame
-    // time while it was already using the probe fallback.
-    try builder.lower(inst);
+    builder.lower(inst) catch |err| {
+        // A program-level error name is not enough to distinguish a missing
+        // opcode from a supported opcode whose particular encoding or stage is
+        // not implemented. Shader analyses are cached, so this is emitted once
+        // for the failed translation rather than once for every draw.
+        std.debug.print(
+            "[spirv] lowering failed pc=0x{x} opcode={s} id=0x{x}: {s}\n",
+            .{ inst.pc, @tagName(inst.opcode), inst.opcode_id, @errorName(err) },
+        );
+        return err;
+    };
 }
 
 fn appendInstruction(allocator: std.mem.Allocator, words: *std.ArrayList(u32), opcode: u16, args: []const u32) Error!void {
@@ -4235,6 +4560,25 @@ test "float transcendental VOP1 operations use explicit SPIR-V math" {
     try std.testing.expect(containsOpcode(module.words, 136)); // OpFDiv
 }
 
+test "VOP3 ldexp lowers the Tetris tone-mapping instruction" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        (@as(u32, 0x3f) << 25) | (@as(u32, 11) << 17) | (@as(u32, 1) << 9) | 255, // v_mov_b32 v11, literal
+        0x3f80_0000,
+        0xd762_011e,
+        0x0001_850b,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    try std.testing.expectEqual(isa.Opcode.v_ldexp_f32, program.instructions.items[1].opcode);
+    try std.testing.expectEqual(@as(i32, -2), program.instructions.items[1].src1.signed_val);
+
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?u32, 53), firstInstructionOperand(module.words, 12, 3));
+}
+
 test "literal MAD conversions and min-max lower explicitly" {
     var program = instruction.Program{ .code = &.{}, .instructions = .empty };
     defer program.deinit(std.testing.allocator);
@@ -4371,6 +4715,59 @@ test "bitfield insert lowers to mask select operations" {
     try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 199)); // OpBitwiseAnd
     try std.testing.expectEqual(@as(usize, 1), countOpcode(module.words, 200)); // OpNot
     try std.testing.expectEqual(@as(usize, 1), countOpcode(module.words, 197)); // OpBitwiseOr
+}
+
+test "scalar bitfield mask lowers the Tetris shader instruction" {
+    const decoder = @import("decoder.zig");
+    // s_bfm_b32 vcc_lo, 8, 22; s_endpgm
+    const code = [_]u32{ 0x926a_9688, 0xbf81_0000 };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    try std.testing.expectEqual(isa.Opcode.s_bfm_b32, program.instructions.items[0].opcode);
+
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 199)); // OpBitwiseAnd
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 196)); // OpShiftLeftLogical
+    try std.testing.expectEqual(@as(usize, 1), countOpcode(module.words, 130)); // OpISub
+}
+
+test "scalar bitfield extract unpacks its SOP2 control operand" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .s_bfe_u32,
+        .dst = .{ .kind = .sgpr, .reg = 0 },
+        .src0 = .{ .kind = .literal_constant, .value = 0xf000_0000 },
+        .src1 = .{ .kind = .literal_constant, .value = 0x8_0018 },
+        .src_count = 2,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), countOpcode(module.words, 194)); // OpShiftRightLogical
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 199)); // OpBitwiseAnd
+    try std.testing.expectEqual(@as(usize, 1), countOpcode(module.words, 203)); // OpBitFieldUExtract
+}
+
+test "64-bit scalar bitfield extract writes both result dwords" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .s_bfe_u64,
+        .dst = .{ .kind = .sgpr, .reg = 2 },
+        .src0 = .{ .kind = .sgpr, .reg = 0 },
+        .src1 = .{ .kind = .literal_constant, .value = 0x20_0018 },
+        .src_count = 2,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 201)); // mask halves
+    try std.testing.expect(countOpcode(module.words, 169) >= 5); // selects for shift/count halves
+    try std.testing.expect(countOpcode(module.words, 199) >= 5); // masks plus extraction
 }
 
 test "vector comparison writes VCC for a following conditional mask" {
@@ -4985,6 +5382,77 @@ test "fragment image sample supports a three-dimensional descriptor" {
     try std.testing.expectEqual(@as(usize, 4), countOpcode(module.words, 81)); // RGBA extracts
 }
 
+test "fragment gather4 level zero writes four texels and preserves a packed offset" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        // v0 contains packed signed six-bit offsets x=-1, y=-1.
+        (@as(u32, 0x3f) << 25) | (@as(u32, 0) << 17) | (@as(u32, 0x01) << 9) | 255,
+        0x0000_3f3f,
+        (@as(u32, 0x3f) << 25) | (@as(u32, 14) << 17) | (@as(u32, 0x01) << 9) | 255,
+        0x3f00_0000,
+        (@as(u32, 0x3f) << 25) | (@as(u32, 15) << 17) | (@as(u32, 0x01) << 9) | 255,
+        0x3f00_0000,
+        0xf15c_080a, // image_gather4_lz_o dim:2d dmask:w v[4:7], v0, NSA v14/v15
+        0x0040_0400,
+        0x0000_0f0e,
+        0xf800_080f, // exp mrt0, v4, v5, v6, v7 done
+        0x0706_0504,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    const images = [_]SampledImageBinding{.{
+        .resource_sgpr = 0,
+        .sampler_sgpr = 8,
+        .descriptor_index = 0,
+        .instruction_pc = 0x18,
+    }};
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .fragment,
+        .sampled_images = &images,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expect(containsOpcode(module.words, 96)); // OpImageGather
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 202)); // signed X/Y offset extraction
+    try std.testing.expectEqual(@as(usize, 4), countOpcode(module.words, 81)); // four gathered texels
+}
+
+test "fragment sample level zero accepts a packed texel offset before NSA coordinates" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        (@as(u32, 0x3f) << 25) | (@as(u32, 0) << 17) | (@as(u32, 0x01) << 9) | 255,
+        0x0000_3f3f, // v0 = packed offset x=-1, y=-1
+        (@as(u32, 0x3f) << 25) | (@as(u32, 14) << 17) | (@as(u32, 0x01) << 9) | 255,
+        0x3f00_0000,
+        (@as(u32, 0x3f) << 25) | (@as(u32, 15) << 17) | (@as(u32, 0x01) << 9) | 255,
+        0x3f00_0000,
+        0xf0dc_080a,
+        0x0040_1100,
+        0x0000_0f0e,
+        0xf800_080f,
+        0x1413_1211,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    const images = [_]SampledImageBinding{.{
+        .resource_sgpr = 0,
+        .sampler_sgpr = 8,
+        .descriptor_index = 0,
+        .instruction_pc = 0x18,
+    }};
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .fragment,
+        .sampled_images = &images,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expect(containsOpcode(module.words, 88)); // OpImageSampleExplicitLod
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 202));
+    try std.testing.expectEqual(@as(usize, 1), countOpcode(module.words, 81)); // dmask:w
+}
+
 test "compute image sample level zero uses explicit lod" {
     const decoder = @import("decoder.zig");
     const code = [_]u32{
@@ -5015,6 +5483,38 @@ test "compute image sample level zero uses explicit lod" {
     try std.testing.expect((firstInstructionOperand(module.words, 88, 0) orelse 0) != 0); // vec4 result type
     try std.testing.expect(!containsOpcode(module.words, 87)); // no derivative-dependent implicit LOD
     try std.testing.expectEqual(@as(usize, 1), countOpcode(module.words, 81)); // dmask:x extract
+}
+
+test "vertex image load fetches an integer texel through a sampled descriptor" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        (@as(u32, 0x3f) << 25) | (@as(u32, 0) << 17) | (@as(u32, 0x01) << 9) | 255,
+        12,
+        (@as(u32, 0x3f) << 25) | (@as(u32, 1) << 17) | (@as(u32, 0x01) << 9) | 255,
+        7,
+        0xf000_0108, // image_load dim:2d dmask:x v6, v[0:1], T#s8
+        0x0002_0600,
+        0xf800_080f,
+        0x0908_0706,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    const images = [_]SampledImageBinding{.{
+        .resource_sgpr = 8,
+        .sampler_sgpr = 0,
+        .descriptor_index = 0,
+        .instruction_pc = 0x10,
+    }};
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .vertex,
+        .sampled_images = &images,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expect(containsOpcode(module.words, 100)); // OpImage
+    try std.testing.expect(containsOpcode(module.words, 95)); // OpImageFetch
+    try std.testing.expectEqual(@as(usize, 1), countOpcode(module.words, 81));
 }
 
 test "compute image load and NSA store use independently typed storage image bindings" {

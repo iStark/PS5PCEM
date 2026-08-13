@@ -808,12 +808,30 @@ const GraphicsShaderFailure = struct {
 
 fn colorTargetFormat(descriptor: gpu.resources.ColorTarget) ?ColorTargetFormat {
     return switch (descriptor.format) {
+        // DATA_FORMAT_10_11_11 + NUMBER_FORMAT_FLOAT. The sampled-image side
+        // exposes the same allocation as unified format 36.
+        6 => if (descriptor.number_type == 7)
+            .{ .vulkan = vk.format_b10g11r11_ufloat_pack32, .bytes_per_texel = 4 }
+        else
+            null,
+        // DATA_FORMAT_10_10_10_2 + NUMBER_FORMAT_UNORM in the standard
+        // component order maps directly to Vulkan's packed attachment format.
+        9 => if (descriptor.number_type == 0 and descriptor.component_swap == 0)
+            .{ .vulkan = vk.format_a2b10g10r10_unorm_pack32, .bytes_per_texel = 4 }
+        else
+            null,
         // DATA_FORMAT_8_8_8_8. Preserve the existing UNORM attachment path
         // for the number-type variants titles have already exercised.
         10 => .{ .vulkan = vk.format_r8g8b8a8_unorm, .bytes_per_texel = 4 },
         // DATA_FORMAT_16_16_16_16 + NUMBER_FORMAT_FLOAT.
         12 => if (descriptor.number_type == 7)
             .{ .vulkan = vk.format_r16g16b16a16_sfloat, .bytes_per_texel = 8 }
+        else
+            null,
+        // DATA_FORMAT_32_32_32_32 + NUMBER_FORMAT_FLOAT. Unity uses this for
+        // tiny exposure/luminance render targets that feed the final tonemap.
+        14 => if (descriptor.number_type == 7)
+            .{ .vulkan = vk.format_r32g32b32a32_sfloat, .bytes_per_texel = 16 }
         else
             null,
         else => null,
@@ -851,6 +869,14 @@ fn hostColorTargetDescriptor(descriptor: gpu.resources.ColorTarget) gpu.resource
     host.fragments_log2 = 0;
     host.fmask_compression = false;
     host.fmask_address = 0;
+    // A Vulkan 2D attachment represents one selected slice. Until layered
+    // rendering/geometry-stage exports are exposed, retain the guest base
+    // slice but narrow an array view to that slice instead of rejecting the
+    // whole draw. This keeps Unity's small RGBA16F luminance/bloom MRT passes
+    // alive and preserves the correct physical source offset on readback.
+    if (host.last_array_slice > host.base_array_slice) {
+        host.last_array_slice = host.base_array_slice;
+    }
     return host;
 }
 
@@ -1307,7 +1333,7 @@ fn canReuseStorageMapping(attribute_specific: bool, previous: ?u32, current: u32
 
 fn shouldDumpProgressFrame(flip: u64) bool {
     return switch (flip) {
-        8, 16, 32, 64, 96, 128 => true,
+        2, 8, 16, 32, 64, 96, 128 => true,
         else => false,
     };
 }
@@ -1598,7 +1624,7 @@ pub const Renderer = struct {
             .binding = 1,
             .descriptor_type = vk.descriptor_type_combined_image_sampler,
             .descriptor_count = maximum_storage_descriptors,
-            .stage_flags = vk.shader_stage_fragment_bit | vk.shader_stage_compute_bit,
+            .stage_flags = vk.shader_stage_vertex_bit | vk.shader_stage_fragment_bit | vk.shader_stage_compute_bit,
         };
         var descriptor_bindings: [4 + maximum_storage_images]vk.DescriptorSetLayoutBinding = undefined;
         descriptor_bindings[0] = storage_binding;
@@ -1621,7 +1647,7 @@ pub const Renderer = struct {
             .binding = sampled_image_3d_descriptor_binding,
             .descriptor_type = vk.descriptor_type_combined_image_sampler,
             .descriptor_count = maximum_storage_descriptors,
-            .stage_flags = vk.shader_stage_fragment_bit | vk.shader_stage_compute_bit,
+            .stage_flags = vk.shader_stage_vertex_bit | vk.shader_stage_fragment_bit | vk.shader_stage_compute_bit,
         };
         const descriptor_layout_info = vk.DescriptorSetLayoutCreateInfo{
             .binding_count = descriptor_bindings.len,
@@ -3916,7 +3942,7 @@ pub const Renderer = struct {
         }
 
         for (analysis.program.instructions.items) |inst| {
-            if (inst.opcode != .image_sample) continue;
+            if (inst.opcode != .image_sample and inst.opcode != .image_gather4) continue;
             if (inst.src1.kind != .sgpr or inst.src2.kind != .sgpr) {
                 if (log_verbose_gpu) std.debug.print(
                     "[vulkan dcb] sampled image pc=0x{x}: T# is {s}, S# is {s}\n",
@@ -6742,8 +6768,16 @@ pub const Renderer = struct {
             reader,
             fragment_analysis,
         );
-        self.frame_profile.graphics_resource_ns +|= elapsedHostNanoseconds(resource_started);
         defer graphics_resources.deinit(self);
+        const fragment_mapping_count = graphics_resources.mapping_count;
+        const fragment_image_count = graphics_resources.image_count;
+        try self.appendGraphicsResources(
+            &graphics_resources,
+            &vertex_bindings,
+            reader,
+            vertex_analysis,
+        );
+        self.frame_profile.graphics_resource_ns +|= elapsedHostNanoseconds(resource_started);
         if (self.flip_callbacks == 240) {
             for (graphics_resources.mappings[0..graphics_resources.mapping_count]) |mapping| {
                 const sampled = graphics_resources.descriptors[@intCast(mapping.descriptor_index)];
@@ -6826,7 +6860,7 @@ pub const Renderer = struct {
         // T#/S# descriptor payloads select host descriptor-array elements;
         // they are not shader constants. Specializing their changing guest
         // addresses creates a new Vulkan pipeline for every streamed texture.
-        for (graphics_resources.mappings[0..graphics_resources.mapping_count]) |mapping| {
+        for (graphics_resources.mappings[0..fragment_mapping_count]) |mapping| {
             fragment_scalar_count = removeScalarRegisterRange(
                 &fragment_scalar_regs,
                 fragment_scalar_count,
@@ -6877,7 +6911,7 @@ pub const Renderer = struct {
         // draws. This Unity pass has a complete four-vertex guest VS; its
         // constants contain the required 1920/2048 U scale, so it must not be
         // replaced by the procedural fallback triangle.
-        const planar_video_pass = graphics_resources.image_count == 2 and
+        const planar_video_pass = fragment_image_count == 2 and
             graphics_resources.descriptors[0].tile_mode.isLinear() and
             graphics_resources.descriptors[0].unified_format == 1 and
             // AvPlayer exposes the visible width separately from the NV12
@@ -6918,11 +6952,11 @@ pub const Renderer = struct {
             );
             return;
         }
-        if (graphics_resources.image_count == 2 and
+        if (fragment_image_count == 2 and
             draw.index_count != null and draw.index_count.? == 6 and
             matchesCrtComposite(fragment_analysis.program.instructions.items))
         {
-            for (graphics_resources.descriptors[0..graphics_resources.image_count]) |source| {
+            for (graphics_resources.descriptors[0..fragment_image_count]) |source| {
                 if (try self.emulateIntegerScaledSampleBlit(memory, target, source)) {
                     if (!self.reported_crt_composite_fallback) {
                         self.reported_crt_composite_fallback = true;
@@ -6942,7 +6976,7 @@ pub const Renderer = struct {
                 }
             }
         }
-        if (graphics_resources.image_count == 1 and
+        if (fragment_image_count == 1 and
             draw.index_count != null and draw.index_count.? == 6 and
             matchesFullscreenSampleBlit(fragment_analysis.program.instructions.items))
         {
@@ -7112,14 +7146,14 @@ pub const Renderer = struct {
                 "[vulkan dcb] fragment resources program=0x{x} sampled={d} storage={d} scalars={d} loads={d} params=0x{x}\n",
                 .{
                     fragment_address,
-                    graphics_resources.mapping_count,
+                    fragment_mapping_count,
                     fragment_storage.mapping_count,
                     fragment_scalar_count,
                     fragment_scalar.load_count,
                     paired_parameter_mask,
                 },
             );
-            for (graphics_resources.mappings[0..graphics_resources.mapping_count]) |mapping| {
+            for (graphics_resources.mappings[0..fragment_mapping_count]) |mapping| {
                 const sampled_descriptor = graphics_resources.descriptors[@intCast(mapping.descriptor_index)];
                 std.debug.print(
                     "  image T#s{d} S#s{d} slot={d} addr=0x{x} {d}x{d} pitch={d} fmt={d} tile={s}\n",
@@ -7163,7 +7197,7 @@ pub const Renderer = struct {
                 .{ graphics_resources.descriptors[0].width, target.descriptor.height }
             else
                 .{ target.descriptor.width, target.descriptor.height },
-            .sampled_images = graphics_resources.mappings[0..graphics_resources.mapping_count],
+            .sampled_images = graphics_resources.mappings[0..fragment_mapping_count],
             .storage_buffers = fragment_storage.mappings[0..fragment_storage.mapping_count],
             .parameter_mask = paired_parameter_mask,
             .fragment_input_controls = &fragment_input_controls,
@@ -7199,7 +7233,7 @@ pub const Renderer = struct {
         }
         var texture_probe_module: ?rdna2.spirv.Module = null;
         defer if (texture_probe_module) |*module| module.deinit(self.allocator);
-        if (self.force_probe_fragment_texture and graphics_resources.mapping_count != 0) {
+        if (self.force_probe_fragment_texture and fragment_mapping_count != 0) {
             texture_probe_module = try buildTextureProbeFragmentSpirv(
                 self.allocator,
                 graphics_resources.mappings[0],
@@ -7213,7 +7247,7 @@ pub const Renderer = struct {
         }
         var ui_probe_module: ?rdna2.spirv.Module = null;
         defer if (ui_probe_module) |*module| module.deinit(self.allocator);
-        if (self.force_probe_fragment_ui and graphics_resources.mapping_count != 0) {
+        if (self.force_probe_fragment_ui and fragment_mapping_count != 0) {
             ui_probe_module = try buildUiProbeFragmentSpirv(
                 self.allocator,
                 graphics_resources.mappings[0],
@@ -7251,6 +7285,7 @@ pub const Renderer = struct {
                 } else null,
                 .specialized_scalar_prefix_end = vertex_scalar_end,
                 .storage_buffers = vertex_storage.mappings[0..vertex_storage.mapping_count],
+                .sampled_images = graphics_resources.mappings[fragment_mapping_count..graphics_resources.mapping_count],
                 .descriptor_array_length = maximum_storage_descriptors,
             })) |vertex_module_owned| {
                 self.frame_profile.shader_translate_ns +|= elapsedHostNanoseconds(vertex_translate_started);
@@ -7776,8 +7811,21 @@ pub const Renderer = struct {
     ) anyerror!GraphicsResources {
         var result = GraphicsResources{};
         errdefer result.deinit(self);
+        try self.appendGraphicsResources(&result, bindings, reader, analysis);
+        return result;
+    }
+
+    fn appendGraphicsResources(
+        self: *Renderer,
+        result: *GraphicsResources,
+        bindings: *const gpu.ShaderBindings,
+        reader: gpu.ShaderMemoryReader,
+        analysis: *const gpu.ShaderAnalysis,
+    ) anyerror!void {
+        const stage_mapping_start = result.mapping_count;
         for (analysis.program.instructions.items) |inst| {
-            if (inst.opcode != .image_sample) continue;
+            const image_fetch = inst.opcode == .image_load;
+            if (!image_fetch and inst.opcode != .image_sample and inst.opcode != .image_gather4) continue;
             if (inst.src1.kind != .sgpr or inst.src2.kind != .sgpr) {
                 if (log_verbose_gpu) std.debug.print(
                     "[vulkan dcb] image_sample resource kinds t#={s} s#={s}\n",
@@ -7786,8 +7834,10 @@ pub const Renderer = struct {
                 return Error.UnsupportedSampledImage;
             }
             var existing = false;
-            for (result.mappings[0..result.mapping_count]) |mapping| {
-                if (mapping.resource_sgpr == inst.src1.reg and mapping.sampler_sgpr == inst.src2.reg) {
+            for (result.mappings[stage_mapping_start..result.mapping_count]) |mapping| {
+                if (!image_fetch and mapping.instruction_pc == null and
+                    mapping.resource_sgpr == inst.src1.reg and mapping.sampler_sgpr == inst.src2.reg)
+                {
                     existing = true;
                     break;
                 }
@@ -7799,11 +7849,11 @@ pub const Renderer = struct {
             // sampler; advancing both slots per T#/S# pair incorrectly asks
             // for sampler 1 even though both instructions name sampler 0.
             const image_slot = graphicsSrtImageSlot(
-                result.mappings[0..result.mapping_count],
+                result.mappings[stage_mapping_start..result.mapping_count],
                 inst.src1.reg,
             );
             const sampler_slot = graphicsSrtSamplerSlot(
-                result.mappings[0..result.mapping_count],
+                result.mappings[stage_mapping_start..result.mapping_count],
                 inst.src2.reg,
             );
             // Graphics programs load T#/S# through scalar prologs just like
@@ -7830,21 +7880,24 @@ pub const Renderer = struct {
                 );
                 return Error.UnsupportedSampledImage;
             };
-            const sampler_descriptor = (try resolveComputeSamplerDescriptor(
-                bindings,
-                reader,
-                analysis,
-                &sampled_scalar,
-                inst.src2.reg,
-                inst.pc,
-                sampler_slot,
-            )) orelse {
-                std.debug.print(
-                    "[vulkan dcb] sampler missing for s{d}\n",
-                    .{inst.src2.reg},
-                );
-                return Error.UnsupportedSampledImage;
-            };
+            const sampler_descriptor: gpu.resources.SamplerDescriptor = if (image_fetch)
+                std.mem.zeroes(gpu.resources.SamplerDescriptor)
+            else
+                (try resolveComputeSamplerDescriptor(
+                    bindings,
+                    reader,
+                    analysis,
+                    &sampled_scalar,
+                    inst.src2.reg,
+                    inst.pc,
+                    sampler_slot,
+                )) orelse {
+                    std.debug.print(
+                        "[vulkan dcb] sampler missing for s{d}\n",
+                        .{inst.src2.reg},
+                    );
+                    return Error.UnsupportedSampledImage;
+                };
             const descriptor_index: u32 = @intCast(result.mapping_count);
             const image = self.stageSampledImage(image_descriptor, sampler_descriptor, descriptor_index) catch |err| {
                 std.debug.print(
@@ -7877,17 +7930,17 @@ pub const Renderer = struct {
                 return err;
             };
             result.images[result.image_count] = image;
-            result.descriptors[result.image_count] = image_descriptor;
+            result.descriptors[descriptor_index] = image_descriptor;
             result.image_count += 1;
             result.mappings[result.mapping_count] = .{
                 .resource_sgpr = inst.src1.reg,
                 .sampler_sgpr = inst.src2.reg,
                 .descriptor_index = descriptor_index,
                 .dimension = if (image_descriptor.image_type == .color_3d) .three_d else .two_d,
+                .instruction_pc = if (image_fetch) inst.pc else null,
             };
             result.mapping_count += 1;
         }
-        return result;
     }
 
     fn createBuffer(self: *Renderer, size: vk.DeviceSize, usage: vk.Flags, properties: vk.Flags) Error!OwnedBuffer {
@@ -9023,6 +9076,71 @@ pub const Renderer = struct {
     /// processor, or left them untouched. Showing them is what the console
     /// does, and it is closer to the truth than showing a colour of our
     /// choosing would be.
+    fn latestAliasedDisplayTarget(self: *Renderer, buffer: DisplayBuffer) ?usize {
+        var selected: ?usize = null;
+        var selected_sequence: u64 = 0;
+        for (self.render_targets.items, 0..) |target, index| {
+            if (!target.initialized or
+                target.target.descriptor.width != buffer.width or
+                target.target.descriptor.height != buffer.height or
+                target.target.format.bytes_per_texel != 4)
+            {
+                continue;
+            }
+            if (selected == null or target.last_used_sequence > selected_sequence) {
+                selected = index;
+                selected_sequence = target.last_used_sequence;
+            }
+        }
+        return selected;
+    }
+
+    fn latestVisibleCompletedFrame(self: *Renderer, buffer: DisplayBuffer) ?usize {
+        var matching_rgba: ?usize = null;
+        var matching_rgba_sequence: u64 = 0;
+        var matching: ?usize = null;
+        var matching_sequence: u64 = 0;
+        var fallback: ?usize = null;
+        var fallback_area: u64 = 0;
+        var fallback_sequence: u64 = 0;
+        for (self.completed_frames.items, 0..) |frame, index| {
+            if (frame.pixels.items.len == 0 or countNonblackRgb(frame.pixels.items) == 0) continue;
+            const format = if (frame.target) |target| target.format.vulkan else vk.format_r8g8b8a8_unorm;
+            if (format != vk.format_r8g8b8a8_unorm and format != vk.format_b10g11r11_ufloat_pack32) continue;
+            const area = @as(u64, frame.width) * frame.height;
+            if (fallback == null or area > fallback_area or
+                (area == fallback_area and frame.sequence > fallback_sequence))
+            {
+                fallback = index;
+                fallback_area = area;
+                fallback_sequence = frame.sequence;
+            }
+            if (frame.width != buffer.width or frame.height != buffer.height) continue;
+            if (frame.target != null and
+                frame.target.?.format.vulkan == vk.format_r8g8b8a8_unorm and
+                (matching_rgba == null or frame.sequence > matching_rgba_sequence))
+            {
+                matching_rgba = index;
+                matching_rgba_sequence = frame.sequence;
+            }
+            if (matching == null or frame.sequence > matching_sequence) {
+                matching = index;
+                matching_sequence = frame.sequence;
+            }
+        }
+        return matching_rgba orelse matching orelse fallback;
+    }
+
+    fn presentationPixels(self: *Renderer, frame: *const CachedFrame) ?[]const u8 {
+        const target = frame.target orelse return frame.pixels.items;
+        if (target.format.vulkan == vk.format_r8g8b8a8_unorm) return frame.pixels.items;
+        if (target.format.vulkan != vk.format_b10g11r11_ufloat_pack32) return null;
+        const byte_count = @as(usize, frame.width) * frame.height * 4;
+        self.guest_frame_scratch.resize(self.allocator, byte_count) catch return null;
+        convertR11G11B10ToRgba8(frame.pixels.items, self.guest_frame_scratch.items);
+        return self.guest_frame_scratch.items;
+    }
+
     fn presentGuestBuffer(self: *Renderer, buffer: DisplayBuffer, flip: gpu.state.Flip) bool {
         const sink = self.presentation_sink orelse return true;
         if (buffer.width == 0 or buffer.height == 0) return false;
@@ -9045,28 +9163,60 @@ pub const Renderer = struct {
         // Prefer last GPU writeback when the display slot is still cleared /
         // not yet filled by the title (common while multi-draw is stuck after
         // the first completed frame).
-        const guest_nz = countNonzeroRgba(self.guest_frame_scratch.items);
+        // Alpha alone does not make a scanout visibly populated. VideoOut
+        // buffers are commonly cleared to opaque black before the GPU alias is
+        // rendered, so count RGB here instead of treating A=255 as content.
+        const guest_nz = countNonblackRgb(self.guest_frame_scratch.items);
         if (guest_nz == 0) {
-            if (self.latest_frame_index) |idx| {
-                if (idx < self.completed_frames.items.len) {
-                    const cached = &self.completed_frames.items[idx];
-                    if (cached.pixels.items.len != 0 and countNonzeroRgba(cached.pixels.items) != 0) {
-                        self.maybeDumpProgressFrame(
-                            cached.pixels.items,
-                            cached.width,
-                            cached.height,
-                            cached.width * 4,
+            // Some titles register a CPU-visible VideoOut alias while their CB
+            // descriptors name a separate GPU mapping of the same framebuffer.
+            // An exact-address lookup cannot connect those VAs. The most recent
+            // full-size attachment is the GPU side of that alias; blitting it
+            // directly also preserves packed HDR-to-swapchain conversion.
+            if (self.window_presentation != null) {
+                if (self.latestAliasedDisplayTarget(buffer)) |target_index| {
+                    const target = self.render_targets.items[target_index];
+                    self.blitRenderTargetToSwapchain(target_index) catch |err| {
+                        self.last_flip_error = err;
+                        return false;
+                    };
+                    if (self.flip_callbacks <= 8 or log_verbose_gpu) {
+                        std.debug.print(
+                            "[vulkan dcb] presenting aliased display target @0x{x} for @0x{x} sequence={d} fmt={d}\n",
+                            .{
+                                target.target.descriptor.address,
+                                buffer.address,
+                                target.last_used_sequence,
+                                target.target.descriptor.format,
+                            },
                         );
-                        return sink.present(sink.context, .{
-                            .pixels = cached.pixels.items,
-                            .width = cached.width,
-                            .height = cached.height,
-                            .row_pitch_bytes = cached.width * 4,
-                            .guest_address = cached.guest_address,
-                            .flip = flip,
-                        });
                     }
+                    return true;
                 }
+            }
+            if (self.latestVisibleCompletedFrame(buffer)) |idx| {
+                const cached = &self.completed_frames.items[idx];
+                const pixels = self.presentationPixels(cached) orelse return false;
+                if (self.flip_callbacks <= 8 or log_verbose_gpu) {
+                    std.debug.print(
+                        "[vulkan dcb] presenting visible completed target @0x{x} for @0x{x} sequence={d} {d}x{d}\n",
+                        .{ cached.guest_address, buffer.address, cached.sequence, cached.width, cached.height },
+                    );
+                }
+                self.maybeDumpProgressFrame(
+                    pixels,
+                    cached.width,
+                    cached.height,
+                    cached.width * 4,
+                );
+                return sink.present(sink.context, .{
+                    .pixels = pixels,
+                    .width = cached.width,
+                    .height = cached.height,
+                    .row_pitch_bytes = cached.width * 4,
+                    .guest_address = cached.guest_address,
+                    .flip = flip,
+                });
             }
         }
 
@@ -9261,6 +9411,10 @@ pub const Renderer = struct {
         const self = fromContext(context);
         self.flip_callbacks += 1;
         defer self.reportFrameProfile();
+        // Persist newly compiled driver pipelines at the first real frame.
+        // Guest shutdown is not guaranteed to unwind through Renderer.deinit,
+        // so saving only there made every diagnostic relaunch compile again.
+        defer if (self.flip_callbacks == 2) savePipelineCacheBytes(self);
         // Content probes only hold within the frame they were taken in.
         defer self.texture_probe_count = 0;
         if (log_verbose_gpu) std.debug.print(
@@ -9277,6 +9431,21 @@ pub const Renderer = struct {
                 self.last_flip_error = Error.MissingPresentedFrame;
                 return false;
             };
+            if (self.flip_callbacks <= 8) {
+                std.debug.print(
+                    "[vulkan dcb] flip #{d} requests @0x{x} {d}x{d} pitch={d} tile={d} completed={d} resident={d}\n",
+                    .{
+                        self.flip_callbacks,
+                        requested.?.address,
+                        requested.?.width,
+                        requested.?.height,
+                        requested.?.pitch_in_pixels,
+                        requested.?.tiling_mode,
+                        self.completed_frames.items.len,
+                        self.render_targets.items.len,
+                    },
+                );
+            }
             self.resolvePendingTargetlessDraw(requested.?);
             // Until the merged Unity quad path can compose the decoded movie
             // into its older camera target, present the newest proven video
@@ -9310,10 +9479,17 @@ pub const Renderer = struct {
             // normal materialization path so the PPM is the frame that was
             // actually presented, not stale guest memory.
             if (self.window_presentation != null and
+                self.flip_callbacks > 8 and
                 !shouldDumpProgressFrame(self.flip_callbacks))
             {
                 for (self.render_targets.items, 0..) |target, target_index| {
                     if (target.target.descriptor.address != requested.?.address or !target.initialized) continue;
+                    if (self.flip_callbacks <= 8) {
+                        std.debug.print(
+                            "[vulkan dcb] flip #{d} direct resident target slot={d} generation={d} fmt={d}\n",
+                            .{ self.flip_callbacks, target_index, target.gpu_generation, target.target.descriptor.format },
+                        );
+                    }
                     self.blitRenderTargetToSwapchain(target_index) catch |err| {
                         self.last_flip_error = err;
                         return false;
@@ -9343,7 +9519,7 @@ pub const Renderer = struct {
             selected_index = self.latest_frame_index;
         }
 
-        const frame_index = selected_index orelse {
+        var frame_index = selected_index orelse {
             // A flip naming a buffer nothing has rendered into is not an error.
             // A title shows its first buffer before it draws anything, and
             // hardware displays whatever that buffer holds. Refusing here is
@@ -9361,20 +9537,39 @@ pub const Renderer = struct {
             self.last_flip_error = Error.MissingPresentedFrame;
             return false;
         };
+        if (requested) |buffer| {
+            const selected = &self.completed_frames.items[frame_index];
+            if (countNonblackRgb(selected.pixels.items) == 0) {
+                if (self.latestVisibleCompletedFrame(buffer)) |visible_index| {
+                    frame_index = visible_index;
+                    const visible = &self.completed_frames.items[visible_index];
+                    if (self.flip_callbacks <= 8 or log_verbose_gpu) {
+                        std.debug.print(
+                            "[vulkan dcb] replacing black exact target @0x{x} with visible target @0x{x} sequence={d} {d}x{d}\n",
+                            .{ buffer.address, visible.guest_address, visible.sequence, visible.width, visible.height },
+                        );
+                    }
+                }
+            }
+        }
         const cached = &self.completed_frames.items[frame_index];
         if (cached.pixels.items.len == 0) {
             self.last_flip_error = Error.MissingPresentedFrame;
             return false;
         }
+        const pixels = self.presentationPixels(cached) orelse {
+            self.last_flip_error = Error.MissingPresentedFrame;
+            return false;
+        };
         self.maybeDumpProgressFrame(
-            cached.pixels.items,
+            pixels,
             cached.width,
             cached.height,
             cached.width * 4,
         );
         if (self.presentation_sink) |sink| {
             if (!sink.present(sink.context, .{
-                .pixels = cached.pixels.items,
+                .pixels = pixels,
                 .width = cached.width,
                 .height = cached.height,
                 .row_pitch_bytes = cached.width * 4,
@@ -10519,6 +10714,47 @@ fn countNonzeroRgba(linear: []const u8) u32 {
     return nonzero;
 }
 
+fn countNonblackRgb(linear: []const u8) u32 {
+    var nonblack: u32 = 0;
+    var i: usize = 0;
+    while (i + 3 < linear.len) : (i += 4) {
+        if (linear[i] != 0 or linear[i + 1] != 0 or linear[i + 2] != 0) nonblack += 1;
+    }
+    return nonblack;
+}
+
+fn decodeUnsignedMiniFloat(raw: u32, width: u5) f32 {
+    const mantissa_bits: u5 = width - 5;
+    const mantissa_mask = (@as(u32, 1) << mantissa_bits) - 1;
+    const mantissa = raw & mantissa_mask;
+    const exponent = (raw >> mantissa_bits) & 0x1f;
+    if (exponent == 0) {
+        const scale: f32 = if (mantissa_bits == 6) 1.0 / 1_048_576.0 else 1.0 / 524_288.0;
+        return @as(f32, @floatFromInt(mantissa)) * scale;
+    }
+    if (exponent == 0x1f) return std.math.inf(f32);
+    const bits = ((exponent + 112) << 23) | (mantissa << (23 - mantissa_bits));
+    return @bitCast(bits);
+}
+
+fn linearFloatToUnorm8(value: f32) u8 {
+    if (!std.math.isFinite(value)) return 255;
+    const clamped = std.math.clamp(value, 0.0, 1.0);
+    return @intFromFloat(clamped * 255.0 + 0.5);
+}
+
+fn convertR11G11B10ToRgba8(source: []const u8, destination: []u8) void {
+    if (source.len != destination.len or source.len % 4 != 0) return;
+    var offset: usize = 0;
+    while (offset < source.len) : (offset += 4) {
+        const word = std.mem.readInt(u32, source[offset..][0..4], .little);
+        destination[offset] = linearFloatToUnorm8(decodeUnsignedMiniFloat(word & 0x7ff, 11));
+        destination[offset + 1] = linearFloatToUnorm8(decodeUnsignedMiniFloat((word >> 11) & 0x7ff, 11));
+        destination[offset + 2] = linearFloatToUnorm8(decodeUnsignedMiniFloat((word >> 22) & 0x3ff, 10));
+        destination[offset + 3] = 255;
+    }
+}
+
 fn containsNonzeroByte(bytes: []const u8) bool {
     var offset: usize = 0;
     while (offset + 8 <= bytes.len) : (offset += 8) {
@@ -10579,10 +10815,13 @@ fn sampledImageFormat(unified_format: u16, force_srgb: bool) ?u32 {
         15 => vk.format_r8g8_snorm,
         18 => vk.format_r8g8_uint,
         19 => vk.format_r8g8_sint,
+        22 => vk.format_r32_sfloat,
         36 => vk.format_b10g11r11_ufloat_pack32,
         50 => vk.format_a2b10g10r10_unorm_pack32,
         56 => if (force_srgb) vk.format_r8g8b8a8_srgb else vk.format_r8g8b8a8_unorm,
+        65 => vk.format_r16g16b16a16_unorm,
         71 => vk.format_r16g16b16a16_sfloat,
+        77 => vk.format_r32g32b32a32_sfloat,
         130 => vk.format_r8g8b8a8_srgb,
         169 => if (force_srgb) vk.format_bc1_rgba_srgb_block else vk.format_bc1_rgba_unorm_block,
         170 => vk.format_bc1_rgba_srgb_block,
@@ -10625,8 +10864,8 @@ fn storageImageBytesPerTexel(unified_format: u16) u8 {
     return switch (unified_format) {
         1...6 => 1,
         7...19 => 2,
-        20, 36, 50, 56, 60, 130 => 4,
-        71 => 8,
+        20, 22, 36, 50, 56, 60, 130 => 4,
+        62...71 => 8,
         77 => 16,
         169, 170 => 8,
         171...182 => 16,
@@ -12675,6 +12914,46 @@ test "RGBA16F color targets and DCC clears preserve native half-float texels" {
     try std.testing.expect(colorDccClearTexel(0xff, descriptor) == null);
 }
 
+test "R11G11B10 float color targets use the matching packed Vulkan format" {
+    var descriptor = std.mem.zeroes(gpu.resources.ColorTarget);
+    descriptor.format = 6;
+    descriptor.number_type = 7;
+
+    const format = colorTargetFormat(descriptor).?;
+    try std.testing.expectEqual(vk.format_b10g11r11_ufloat_pack32, format.vulkan);
+    try std.testing.expectEqual(@as(u8, 4), format.bytes_per_texel);
+
+    descriptor.number_type = 0;
+    try std.testing.expect(colorTargetFormat(descriptor) == null);
+}
+
+test "10-10-10-2 UNORM color targets use the matching packed Vulkan format" {
+    var descriptor = std.mem.zeroes(gpu.resources.ColorTarget);
+    descriptor.format = 9;
+    descriptor.number_type = 0;
+    descriptor.component_swap = 0;
+
+    const format = colorTargetFormat(descriptor).?;
+    try std.testing.expectEqual(vk.format_a2b10g10r10_unorm_pack32, format.vulkan);
+    try std.testing.expectEqual(@as(u8, 4), format.bytes_per_texel);
+
+    descriptor.number_type = 7;
+    try std.testing.expect(colorTargetFormat(descriptor) == null);
+}
+
+test "RGBA32F color targets use the matching Vulkan format" {
+    var descriptor = std.mem.zeroes(gpu.resources.ColorTarget);
+    descriptor.format = 14;
+    descriptor.number_type = 7;
+
+    const format = colorTargetFormat(descriptor).?;
+    try std.testing.expectEqual(vk.format_r32g32b32a32_sfloat, format.vulkan);
+    try std.testing.expectEqual(@as(u8, 16), format.bytes_per_texel);
+
+    descriptor.number_type = 0;
+    try std.testing.expect(colorTargetFormat(descriptor) == null);
+}
+
 test "MSAA color targets retain their allocation while using one host sample" {
     var descriptor = std.mem.zeroes(gpu.resources.ColorTarget);
     descriptor.address = 0x1234_0000;
@@ -12686,6 +12965,8 @@ test "MSAA color targets retain their allocation while using one host sample" {
     descriptor.fragments_log2 = 1;
     descriptor.fmask_compression = true;
     descriptor.fmask_address = 0x5678_0000;
+    descriptor.base_array_slice = 3;
+    descriptor.last_array_slice = 8;
 
     const host = hostColorTargetDescriptor(descriptor);
     try std.testing.expectEqual(descriptor.address, host.address);
@@ -12695,6 +12976,8 @@ test "MSAA color targets retain their allocation while using one host sample" {
     try std.testing.expectEqual(@as(u8, 0), host.fragments_log2);
     try std.testing.expect(!host.fmask_compression);
     try std.testing.expectEqual(@as(u64, 0), host.fmask_address);
+    try std.testing.expectEqual(@as(u16, 3), host.base_array_slice);
+    try std.testing.expectEqual(@as(u16, 3), host.last_array_slice);
 }
 
 test "CMASK clear and expanded nibbles materialize only the selected 8x8 blocks" {
@@ -12861,6 +13144,9 @@ test "dual image clear matcher requires the complete bounded kernel" {
 test "sampled image views honor sRGB and destination selectors" {
     try std.testing.expectEqual(vk.format_r8_unorm, sampledImageFormat(1, false).?);
     try std.testing.expectEqual(vk.format_r8g8_unorm, sampledImageFormat(14, false).?);
+    try std.testing.expectEqual(vk.format_r32_sfloat, sampledImageFormat(22, false).?);
+    try std.testing.expectEqual(vk.format_r32_sfloat, sampledImageFormat(22, true).?);
+    try std.testing.expectEqual(@as(u8, 4), storageImageBytesPerTexel(22));
     try std.testing.expectEqual(vk.format_b10g11r11_ufloat_pack32, sampledImageFormat(36, false).?);
     try std.testing.expectEqual(vk.format_b10g11r11_ufloat_pack32, sampledImageFormat(36, true).?);
     try std.testing.expectEqual(vk.format_a2b10g10r10_unorm_pack32, sampledImageFormat(50, false).?);
@@ -12868,8 +13154,14 @@ test "sampled image views honor sRGB and destination selectors" {
     try std.testing.expectEqual(@as(u8, 4), storageImageBytesPerTexel(50));
     try std.testing.expectEqual(vk.format_r8g8b8a8_unorm, sampledImageFormat(56, false).?);
     try std.testing.expectEqual(vk.format_r8g8b8a8_srgb, sampledImageFormat(56, true).?);
+    try std.testing.expectEqual(vk.format_r16g16b16a16_unorm, sampledImageFormat(65, false).?);
+    try std.testing.expectEqual(vk.format_r16g16b16a16_unorm, sampledImageFormat(65, true).?);
+    try std.testing.expectEqual(@as(u8, 8), storageImageBytesPerTexel(65));
     try std.testing.expectEqual(vk.format_r16g16b16a16_sfloat, sampledImageFormat(71, false).?);
     try std.testing.expectEqual(vk.format_r16g16b16a16_sfloat, sampledImageFormat(71, true).?);
+    try std.testing.expectEqual(vk.format_r32g32b32a32_sfloat, sampledImageFormat(77, false).?);
+    try std.testing.expectEqual(vk.format_r32g32b32a32_sfloat, sampledImageFormat(77, true).?);
+    try std.testing.expectEqual(@as(u8, 16), storageImageBytesPerTexel(77));
     try std.testing.expectEqual(vk.format_r8g8b8a8_srgb, sampledImageFormat(130, false).?);
     try std.testing.expectEqual(vk.format_bc3_unorm_block, sampledImageFormat(173, false).?);
     try std.testing.expectEqual(vk.format_bc3_srgb_block, sampledImageFormat(173, true).?);
@@ -12950,6 +13242,7 @@ test "compute resources retain temporal scalar load specializations" {
 }
 
 test "progress dumps select bounded presentation checkpoints" {
+    try std.testing.expect(shouldDumpProgressFrame(2));
     try std.testing.expect(shouldDumpProgressFrame(8));
     try std.testing.expect(shouldDumpProgressFrame(64));
     try std.testing.expect(shouldDumpProgressFrame(128));
@@ -12964,8 +13257,22 @@ test "RGBA occupancy preserves black alpha and destination alpha is explicit" {
         5, 0, 0, 31,
     };
     try std.testing.expectEqual(@as(u32, 2), countNonzeroRgba(&pixels));
+    try std.testing.expectEqual(@as(u32, 1), countNonblackRgb(&pixels));
     forceDestinationAlphaOne(&pixels);
     try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255 }, &.{ pixels[3], pixels[7], pixels[11] });
+}
+
+test "R11G11B10 float presentation conversion preserves RGB channels" {
+    const red_one: u32 = 15 << 6;
+    const green_one: u32 = (15 << 6) << 11;
+    const blue_one: u32 = (15 << 5) << 22;
+    const source_words = [_]u32{ 0, red_one, green_one, blue_one };
+    var rgba: [16]u8 = undefined;
+    convertR11G11B10ToRgba8(std.mem.asBytes(&source_words), &rgba);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, rgba[0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, rgba[4..8]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, rgba[8..12]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, rgba[12..16]);
 }
 
 test "typed image clear texels use the descriptor number format" {

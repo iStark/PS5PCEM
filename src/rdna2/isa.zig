@@ -261,6 +261,7 @@ pub const Opcode = enum {
     v_floor_f32,
     v_exp_f32,
     v_log_f32,
+    v_ldexp_f32,
     v_rcp_f32,
     v_rsq_f32,
     v_sqrt_f32,

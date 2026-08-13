@@ -293,7 +293,7 @@ pub fn decodeMimg(pc: u32, code: []const u32, word_index: u32) Error!Instruction
     };
     inst.setRawWords(code, word_index, word_count);
     inst.data_mask = @intCast((word0 >> 8) & 0xf);
-    inst.data_words = @max(1, bitCount4(inst.data_mask));
+    inst.data_words = if (op == .image_gather4) 4 else @max(1, bitCount4(inst.data_mask));
     inst.globally_coherent = (word0 >> 13) & 1 != 0;
     inst.system_coherent = (word0 >> 25) & 1 != 0;
     inst.image_sample_flags.a16 = (word1 >> 30) & 1 != 0;
@@ -303,10 +303,38 @@ pub fn decodeMimg(pc: u32, code: []const u32, word_index: u32) Error!Instruction
             0x24 => inst.image_sample_flags.lod = true,
             0x25 => inst.image_sample_flags.bias = true,
             0x27 => inst.image_sample_flags.level_zero = true,
+            0x37 => {
+                inst.image_sample_flags.level_zero = true;
+                inst.image_sample_flags.offset = true;
+            },
+            else => {},
+        }
+    } else if (op == .image_gather4) {
+        switch (id) {
+            0x47 => inst.image_sample_flags.level_zero = true,
+            0x48 => inst.image_sample_flags.compare = true,
+            0x4f => {
+                inst.image_sample_flags.compare = true;
+                inst.image_sample_flags.level_zero = true;
+            },
+            0x57 => {
+                inst.image_sample_flags.level_zero = true;
+                inst.image_sample_flags.offset = true;
+            },
+            0x58 => {
+                inst.image_sample_flags.compare = true;
+                inst.image_sample_flags.offset = true;
+            },
+            0x5f => {
+                inst.image_sample_flags.compare = true;
+                inst.image_sample_flags.level_zero = true;
+                inst.image_sample_flags.offset = true;
+            },
+            0x61 => inst.image_sample_flags.gather_horizontal = true,
             else => {},
         }
     }
-    inst.image_address_components = switch (inst.image_dimension) {
+    const coordinate_components: u8 = switch (inst.image_dimension) {
         .dim_1d => 1,
         .dim_2d => 2,
         .dim_3d, .dim_2d_array, .dim_2d_array_alt => 3,
@@ -314,6 +342,13 @@ pub fn decodeMimg(pc: u32, code: []const u32, word_index: u32) Error!Instruction
         .dim_2d_msaa => 3,
         .dim_2d_msaa_array => 4,
     };
+    inst.image_address_components = coordinate_components;
+    if (op == .image_sample) {
+        inst.image_address_components += @intFromBool(inst.image_sample_flags.offset);
+    } else if (op == .image_gather4) {
+        inst.image_address_components += @intFromBool(inst.image_sample_flags.offset);
+        inst.image_address_components += @intFromBool(inst.image_sample_flags.compare);
+    }
     for (0..@as(usize, nsa) * 4) |i| {
         inst.image_nsa_address[i] = @truncate(code[word_index + 2 + i / 4] >> @intCast((i % 4) * 8));
     }
@@ -367,6 +402,38 @@ test "MIMG NSA words are retained in the instruction length" {
     try std.testing.expectEqual(@as(u32, 4), inst.word_count);
     try std.testing.expectEqual(@as(u8, 1), inst.image_nsa_address[0]);
     try std.testing.expectEqual(@as(u8, 8), inst.image_nsa_address[7]);
+}
+
+test "MIMG gather retains result width and offset address layout" {
+    const code = [_]u32{
+        0xf15c_080a, // image_gather4_lz_o, dim:2d, dmask:w, one NSA word
+        0x0040_0400, // v[4:7], v0, T#s0, S#s8
+        0x0000_0f0e, // coordinates v14, v15
+    };
+    const inst = try decodeMimg(0, &code, 0);
+    try std.testing.expectEqual(isa.Opcode.image_gather4, inst.opcode);
+    try std.testing.expect(inst.image_sample_flags.level_zero);
+    try std.testing.expect(inst.image_sample_flags.offset);
+    try std.testing.expectEqual(@as(u8, 3), inst.image_address_components);
+    try std.testing.expectEqual(@as(u8, 4), inst.data_words);
+    try std.testing.expectEqual(@as(u8, 14), inst.image_nsa_address[0]);
+    try std.testing.expectEqual(@as(u8, 15), inst.image_nsa_address[1]);
+}
+
+test "MIMG sample level-zero offset keeps packed offset before NSA coordinates" {
+    const code = [_]u32{
+        0xf0dc_080a, // image_sample_lz_o, dim:2d, dmask:w, one NSA word
+        0x0040_1100, // v17, v0, T#s0, S#s8
+        0x0000_0f0e, // coordinates v14, v15
+    };
+    const inst = try decodeMimg(0, &code, 0);
+    try std.testing.expectEqual(isa.Opcode.image_sample, inst.opcode);
+    try std.testing.expect(inst.image_sample_flags.level_zero);
+    try std.testing.expect(inst.image_sample_flags.offset);
+    try std.testing.expectEqual(@as(u8, 3), inst.image_address_components);
+    try std.testing.expectEqual(@as(u8, 1), inst.data_words);
+    try std.testing.expectEqual(@as(u8, 14), inst.image_nsa_address[0]);
+    try std.testing.expectEqual(@as(u8, 15), inst.image_nsa_address[1]);
 }
 
 test "DS offsets use byte units required by paired operations" {

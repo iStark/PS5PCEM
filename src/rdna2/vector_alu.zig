@@ -429,6 +429,7 @@ fn nativeVop3Opcode(id: u32) isa.Opcode {
         0x372 => .v_or3_b32,
         0x360 => .v_readlane_b32,
         0x361 => .v_writelane_b32,
+        0x362 => .v_ldexp_f32,
         // RDNA2's ordered min/max encodings.  LLVM exposes the same opcode
         // numbers as V_MINIMUM/V_MAXIMUM on newer targets; PS5 shaders use
         // them for finite clamp bounds in export programs.
@@ -469,7 +470,7 @@ pub fn decodeVop3(pc: u32, code: []const u32, word_index: u32) Error!Instruction
         3
     else if (id >= 0x180 and id <= 0x1ff)
         1
-    else if (id <= 0x13f or id == 0x365 or id == 0x366)
+    else if (id <= 0x13f or id == 0x362 or id == 0x365 or id == 0x366)
         2
     else
         3;
@@ -611,6 +612,16 @@ test "native VOP3 ordered float min max use two sources" {
     const maximum = try decodeVop3(8, &.{ 0xd766_0009, 0x0001_00c1 }, 0);
     try std.testing.expectEqual(isa.Opcode.v_max_f32, maximum.opcode);
     try std.testing.expectEqual(@as(u32, 2), maximum.src_count);
+}
+
+test "native VOP3 ldexp uses a float value and signed exponent" {
+    const inst = try decodeVop3(0x4e8, &.{ 0xd762_011e, 0x0001_850b }, 0);
+    try std.testing.expectEqual(isa.Opcode.v_ldexp_f32, inst.opcode);
+    try std.testing.expectEqual(@as(u32, 2), inst.src_count);
+    try std.testing.expectEqual(isa.OperandKind.vgpr, inst.src0.kind);
+    try std.testing.expectEqual(@as(u32, 11), inst.src0.reg);
+    try std.testing.expect(inst.src0.absolute);
+    try std.testing.expectEqual(@as(i32, -2), inst.src1.signed_val);
 }
 
 test "truncated VOP3 is rejected" {
