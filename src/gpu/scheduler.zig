@@ -92,6 +92,31 @@ pub const Scheduler = struct {
         return self.queueForConst(kind).pending.items.len;
     }
 
+    /// Mirrors an explicit label write into the active submission's retained
+    /// indirect-buffer snapshot. Command arenas may place synchronization
+    /// labels beside PM4 packets; reading only the immutable snapshot after a
+    /// host-side recovery write would otherwise observe the old label forever.
+    pub fn mirrorActiveWrite(
+        self: *Scheduler,
+        kind: QueueKind,
+        address: u64,
+        bytes: []const u8,
+    ) bool {
+        const queue = self.queueFor(kind);
+        const active = if (queue.active) |*submission| submission else return false;
+        const requested_end = std.math.add(u64, address, bytes.len) catch return false;
+        for (active.snapshots.items) |*snapshot| {
+            if (address < snapshot.address) continue;
+            const destination = std.mem.sliceAsBytes(snapshot.words);
+            const snapshot_end = std.math.add(u64, snapshot.address, destination.len) catch continue;
+            if (requested_end > snapshot_end) continue;
+            const offset: usize = @intCast(address - snapshot.address);
+            @memcpy(destination[offset..][0..bytes.len], bytes);
+            return true;
+        }
+        return false;
+    }
+
     /// Owns a copy immediately: AGC may recycle the caller's command arena as
     /// soon as submit returns, while a blocked queue must retain its root DCB
     /// and every indirect command/register buffer reachable from it.
@@ -187,7 +212,13 @@ pub const Scheduler = struct {
         errdefer submission.deinit(self.allocator);
 
         var active_addresses: [executor.maximum_stream_depth]u64 = undefined;
-        try self.snapshotStream(&submission, submission.words, 0, &active_addresses);
+        try self.snapshotStream(
+            &submission,
+            submission.words,
+            @intFromPtr(stream.ptr),
+            0,
+            &active_addresses,
+        );
         return submission;
     }
 
@@ -195,11 +226,28 @@ pub const Scheduler = struct {
         self: *Scheduler,
         submission: *Submission,
         stream: []const u32,
+        stream_address: u64,
         depth: usize,
         active_addresses: *[executor.maximum_stream_depth]u64,
     ) Error!void {
         var walker = pm4.Walker.init(stream);
-        while (try walker.next()) |packet| {
+        while (true) {
+            const packet = walker.next() catch |err| {
+                const offset = @min(walker.index, stream.len);
+                const header = if (offset < stream.len) stream[offset] else 0;
+                std.debug.print(
+                    "[gpu scheduler] {s} stream @0x{x} stopped at {d}/{d} header=0x{x:0>8}: {s}\n",
+                    .{
+                        if (depth == 0) "root" else "indirect",
+                        stream_address,
+                        offset,
+                        stream.len,
+                        header,
+                        @errorName(err),
+                    },
+                );
+                return err;
+            } orelse break;
             if (pm4.indirectRegisterSpaceOf(packet.opcode) != null and packet.body.len == 4) {
                 const address = (@as(u64, packet.body[1]) << 32) | (packet.body[0] & 0xffff_fffc);
                 const count: usize = packet.body[3] & 0x3fff;
@@ -254,7 +302,7 @@ pub const Scheduler = struct {
 
         const child = try self.captureWords(submission, address, word_count);
         active_addresses[depth] = address;
-        try self.snapshotStream(submission, child, depth + 1, active_addresses);
+        try self.snapshotStream(submission, child, address, depth + 1, active_addresses);
     }
 
     fn captureWords(
@@ -544,4 +592,43 @@ test "an unsatisfied queue remains blocked without mutating its label" {
     try testing.expectEqual(@as(usize, 1), retry.blocked_checks);
     try testing.expect(scheduler.isBlocked(.graphics));
     try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, host.memory[0x40..0x44], .little));
+}
+
+test "a label inside an indirect snapshot can be updated before resume" {
+    var host = FakeBackend{};
+    const label_address = 0x1128;
+    const child = [_]u32{
+        customCommand(pm4.custom.wait_mem_32, 6),
+        label_address,
+        0,
+        0xffff_ffff,
+        1,
+        0x13,
+        1,
+        command(pm4.event_write, 1),
+        0x20,
+        command(pm4.nop, 1),
+        0,
+    };
+    host.putWords(0x1100, &child);
+    const graphics = [_]u32{
+        command(pm4.indirect_buffer, 3), 0x1100, 0, 0x0f20_0000 | child.len,
+    };
+
+    var scheduler = Scheduler.init(testing.allocator, host.interface());
+    defer scheduler.deinit();
+
+    _ = try scheduler.submit(.graphics, &graphics);
+    try testing.expect(scheduler.isBlocked(.graphics));
+
+    var payload: [4]u8 = undefined;
+    std.mem.writeInt(u32, &payload, 1, .little);
+    try testing.expect(FakeBackend.vtable.write(&host, label_address, &payload));
+    // The retained child still has the original zero until the scheduler is
+    // told that this synchronization label, unlike PM4 itself, is mutable.
+    try testing.expect((try scheduler.pump()).blocked_checks != 0);
+    try testing.expect(scheduler.mirrorActiveWrite(.graphics, label_address, &payload));
+    try testing.expectEqual(@as(usize, 1), (try scheduler.pump()).completed_submissions);
+    try testing.expect(!scheduler.isBlocked(.graphics));
+    try testing.expectEqualSlices(u8, &.{0x20}, host.events[0..host.event_count]);
 }

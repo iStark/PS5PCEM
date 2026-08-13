@@ -155,6 +155,47 @@ fn reportRelocation(
     }
 }
 
+/// Prints a bounded view of a pointer retained in the guest registers at a
+/// fault. Error and assertion paths commonly pass either a text message or a
+/// small object containing one to libc before trapping. Keeping the probe in
+/// the runner means the bytes are captured before process teardown unmaps the
+/// allocation that explains the failure.
+fn reportGuestPointer(
+    writer: *std.Io.Writer,
+    address_space: anytype,
+    label: []const u8,
+    address: u64,
+) !void {
+    if (address < 0x1_0000) return;
+    const mapping = address_space.query(address, false) orelse return;
+    if (!mapping.protection.read or address >= mapping.end()) return;
+
+    const available = mapping.end() - address;
+    const byte_count: usize = @intCast(@min(available, 96));
+    if (byte_count == 0) return;
+    var bytes: [96]u8 = undefined;
+    address_space.read(address, bytes[0..byte_count]) catch return;
+
+    const mapping_name = std.mem.sliceTo(&mapping.name, 0);
+    try writer.print("  {s}@0x{x} mapping={s}", .{ label, address, @tagName(mapping.kind) });
+    if (mapping_name.len != 0) try writer.print(" name={s}", .{mapping_name});
+    try writer.print(" range=0x{x}..0x{x}\n", .{ mapping.address, mapping.end() });
+
+    var row: usize = 0;
+    while (row < byte_count) : (row += 16) {
+        const end = @min(row + 16, byte_count);
+        try writer.print("    +0x{x:0>2}:", .{row});
+        for (bytes[row..end]) |byte| try writer.print(" {x:0>2}", .{byte});
+        var padding = end;
+        while (padding < row + 16) : (padding += 1) try writer.writeAll("   ");
+        try writer.writeAll("  |");
+        for (bytes[row..end]) |byte| {
+            try writer.writeByte(if (byte >= 0x20 and byte < 0x7f) byte else '.');
+        }
+        try writer.writeAll("|\n");
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     if (!try run(init)) std.process.exit(1);
 }
@@ -466,12 +507,14 @@ fn run(init: std.process.Init) !bool {
                     fault.info.registers.rsp,
                 },
             );
-            var stack_words: [8]u64 = undefined;
+            var stack_words: [64]u64 = undefined;
             if (emu.address_space.?.read(fault.info.registers.rsp, std.mem.sliceAsBytes(&stack_words))) |_| {
                 try stderr.writeAll("  stack:");
-                for (stack_words) |word| try stderr.print(" 0x{x}", .{word});
+                for (stack_words[0..8]) |word| try stderr.print(" 0x{x}", .{word});
                 try stderr.writeByte('\n');
-                for (stack_words[0..3]) |return_address| {
+                var reported_callers: usize = 0;
+                for (stack_words) |return_address| {
+                    if (reported_callers == 12) break;
                     for (graph.nodes.items) |*node| {
                         const image = &node.mapped.?;
                         if (return_address < image.load_bias + 16) continue;
@@ -487,6 +530,7 @@ fn run(init: std.process.Init) !bool {
                             const target: u64 = @intCast(@as(i64, @intCast(next_instruction)) + displacement);
                             try reportRelocation(stderr, allocator, node, target);
                         }
+                        reported_callers += 1;
                         break;
                     }
                 }
@@ -503,6 +547,12 @@ fn run(init: std.process.Init) !bool {
                     fault.info.registers.rbp,
                 },
             );
+            const fault_registers = fault.info.registers;
+            try reportGuestPointer(stderr, &emu.address_space.?, "rax", fault_registers.rax);
+            try reportGuestPointer(stderr, &emu.address_space.?, "rcx", fault_registers.rcx);
+            try reportGuestPointer(stderr, &emu.address_space.?, "rsi", fault_registers.rsi);
+            try reportGuestPointer(stderr, &emu.address_space.?, "rdi", fault_registers.rdi);
+            try reportGuestPointer(stderr, &emu.address_space.?, "rbp", fault_registers.rbp);
             const code_start = fault.info.instruction_address -| 16;
             var code: [32]u8 = undefined;
             if (emu.address_space.?.read(code_start, &code)) |_| {

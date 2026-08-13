@@ -467,7 +467,7 @@ fn drainPendingTails() void {
         const outcome = agc_submit.submitDeviceStream(suffix);
         if (log_verbose_gpu) std.debug.print("[gc submit] tail catch-up submitDeviceStream.accepted={s}\n", .{if (outcome.accepted) "true" else "false"});
         if (outcome.accepted) {
-            _ = event_queue_mod.triggerAllGraphicsEvents(slot.queue);
+            _ = event_queue_mod.triggerGraphicsEvent(0, slot.queue);
             if (committed.len >= slot.capacity_words or committed.len >= 64) {
                 // Fully (or substantially) drained — drop the pending slot.
                 clearPendingTail(slot.address);
@@ -574,7 +574,7 @@ fn answerGraphicsSubmit(request: Request, payload: u64) bool {
     if (ran == 0) return false;
     // /dev/gc path does not go through sceAgcDriverSubmit*; still need IRQs.
     const event_queue = @import("kernel_event_queue.zig");
-    _ = event_queue.triggerAllGraphicsEvents(0);
+    _ = event_queue.triggerGraphicsEvent(0, 0);
     submission.result = 0;
     return true;
 }
@@ -698,10 +698,10 @@ fn answerGraphicsQueueSubmit(request: Request, payload: u64) bool {
                 .{ draws, dispatches, flips, releases },
             );
         }
-        // Execute the committed prefix *now* and wake graphics waiters so the
-        // producer can finish encoding into the same ring.
+        // Execute the committed prefix now. Completion is published once for
+        // the whole queue submission below, after every descriptor and any
+        // suffix that became visible while it was executing.
         if (!agc_submit.submitDeviceStream(stream).accepted) return false;
-        _ = event_queue_mod.triggerAllGraphicsEvents(submission.queue);
         _ = event_queue_mod.triggerVideoOutVblank();
         if (video_out_mod.lastFlipArgument()) |arg| {
             _ = event_queue_mod.triggerVideoOutFlip(arg);
@@ -730,7 +730,6 @@ fn answerGraphicsQueueSubmit(request: Request, payload: u64) bool {
                     .{ suffix.len, address, again.len, word_count },
                 );
                 if (!agc_submit.submitDeviceStream(suffix).accepted) return false;
-                _ = event_queue_mod.triggerAllGraphicsEvents(submission.queue);
                 executed = again.len;
                 if (executed >= 256) break;
             }
@@ -746,7 +745,7 @@ fn answerGraphicsQueueSubmit(request: Request, payload: u64) bool {
     // Catch up any earlier short IBs that the producer has since filled.
     drainPendingTails();
 
-    _ = event_queue_mod.triggerAllGraphicsEvents(submission.queue);
+    _ = event_queue_mod.triggerGraphicsEvent(0, submission.queue);
     submission.result = 0;
     return true;
 }

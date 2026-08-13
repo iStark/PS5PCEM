@@ -29,7 +29,14 @@ const rwlock_magic: u64 = 0x5054_5257_4c4f_434b;
 const rwlock_attr_magic: u64 = 0x5054_5257_4154_5452;
 const barrier_magic: u64 = 0x5054_4241_5252_4945;
 
-const wake_all = std.math.maxInt(usize);
+// AGC completion delivery is asynchronous with the guest driver's retirement
+// queue. Expose a monotonic acknowledgement edge so the submit side can retry
+// an interrupt which the guest consumed before publishing the matching node.
+var agc_interrupt_cond_sequence: std.atomic.Value(u64) = .init(0);
+
+pub fn agcInterruptCondSequence() u64 {
+    return agc_interrupt_cond_sequence.load(.acquire);
+}
 
 const Lock = struct {
     inner: std.atomic.Mutex = .unlocked,
@@ -88,6 +95,11 @@ const Cond = struct {
     waiters: usize = 0,
     sequence: u64 = 1,
     clock_id: i32 = 0,
+    last_waiter: u64 = 0,
+    last_signaller: u64 = 0,
+    signal_count: u64 = 0,
+    zero_waiter_signals: u64 = 0,
+    broadcast_count: u64 = 0,
 };
 
 const CondAttr = struct {
@@ -129,6 +141,32 @@ const Barrier = struct {
     arrived: u32 = 0,
     waiters: usize = 0,
     generation: u64 = 1,
+};
+
+/// Snapshot of a synchronization object addressed by a scheduler wait key.
+/// This is intentionally read-only diagnostic state: the CPU dispatcher uses
+/// it to distinguish a condition that has simply gone idle from a mutex or
+/// rwlock whose recorded owner can no longer make progress.
+pub const WaitKeyInfo = struct {
+    pub const Kind = enum { mutex, condition, rwlock, barrier };
+
+    kind: Kind,
+    sequence: u64,
+    waiters: usize = 0,
+    owner: u64 = 0,
+    recursion: u32 = 0,
+    clock_id: i32 = 0,
+    writer: u64 = 0,
+    readers: u32 = 0,
+    waiting_readers: usize = 0,
+    waiting_writers: usize = 0,
+    arrived: u32 = 0,
+    threshold: u32 = 0,
+    last_waiter: u64 = 0,
+    last_signaller: u64 = 0,
+    signal_count: u64 = 0,
+    zero_waiter_signals: u64 = 0,
+    broadcast_count: u64 = 0,
 };
 
 pub const Error = error{
@@ -282,6 +320,11 @@ pub const Manager = struct {
             existing.waiters = 0;
             existing.sequence +%= 1;
             existing.clock_id = if (attr) |value| value.clock_id else 0;
+            existing.last_waiter = 0;
+            existing.last_signaller = 0;
+            existing.signal_count = 0;
+            existing.zero_waiter_signals = 0;
+            existing.broadcast_count = 0;
             return;
         }
         const object = try self.allocator.create(Cond);
@@ -544,6 +587,72 @@ pub fn attachManager(new_manager: ?*Manager) void {
 
 fn activeManager() ?*Manager {
     return attached_manager.load(.acquire);
+}
+
+/// Resolves the opaque key passed to `threading.waitCurrent` back to its
+/// host-owned synchronization record. Manager-before-state is the same lock
+/// order used by the object entry points, so taking a snapshot cannot invert
+/// the synchronization path being inspected.
+pub fn describeWaitKey(key: u64) ?WaitKeyInfo {
+    const manager = activeManager() orelse return null;
+    manager.lock.lock();
+    defer manager.lock.unlock();
+
+    for (manager.mutexes.items) |object| {
+        if (@intFromPtr(object) != key) continue;
+        object.state_lock.lock();
+        defer object.state_lock.unlock();
+        return .{
+            .kind = .mutex,
+            .sequence = object.sequence,
+            .waiters = object.waiters,
+            .owner = object.owner,
+            .recursion = object.recursion,
+        };
+    }
+    for (manager.conditions.items) |object| {
+        if (@intFromPtr(object) != key) continue;
+        object.state_lock.lock();
+        defer object.state_lock.unlock();
+        return .{
+            .kind = .condition,
+            .sequence = object.sequence,
+            .waiters = object.waiters,
+            .clock_id = object.clock_id,
+            .last_waiter = object.last_waiter,
+            .last_signaller = object.last_signaller,
+            .signal_count = object.signal_count,
+            .zero_waiter_signals = object.zero_waiter_signals,
+            .broadcast_count = object.broadcast_count,
+        };
+    }
+    for (manager.rwlocks.items) |object| {
+        if (@intFromPtr(object) != key) continue;
+        object.state_lock.lock();
+        defer object.state_lock.unlock();
+        return .{
+            .kind = .rwlock,
+            .sequence = object.sequence,
+            .waiters = object.waiting_readers + object.waiting_writers,
+            .writer = object.writer,
+            .readers = object.reader_count,
+            .waiting_readers = object.waiting_readers,
+            .waiting_writers = object.waiting_writers,
+        };
+    }
+    for (manager.barriers.items) |object| {
+        if (@intFromPtr(object) != key) continue;
+        object.state_lock.lock();
+        defer object.state_lock.unlock();
+        return .{
+            .kind = .barrier,
+            .sequence = object.generation,
+            .waiters = object.waiters,
+            .arrived = object.arrived,
+            .threshold = object.threshold,
+        };
+    }
+    return null;
 }
 
 fn findPointer(comptime T: type, objects: []const *T, handle: ?*T) ?*T {
@@ -970,6 +1079,7 @@ fn condWaitCore(
     const observed_sequence = cond.sequence;
     const clock_id = cond.clock_id;
     cond.waiters += 1;
+    cond.last_waiter = thread_id;
     // This reservation prevents mutex destruction while the condition waiter
     // is between the atomic unlock and mandatory reacquisition.
     mutex.waiters += 1;
@@ -1000,7 +1110,7 @@ fn condWaitCore(
         };
         cond.state_lock.lock();
         const signalled = cond.sequence != observed_sequence;
-        if (signalled or wait_result == .timed_out) {
+        if (signalled or wait_result == .timed_out or wait_result == .awoken) {
             cond.waiters -= 1;
             timed_out = !signalled and wait_result == .timed_out;
             cond.state_lock.unlock();
@@ -1020,12 +1130,25 @@ fn condSignalCore(cond_outer: ?*CondHandle, broadcast: bool) Error!void {
     const object = try manager.lockCond(handle);
     const sequence = advanceSequence(&object.sequence);
     const waiters = object.waiters;
+    object.last_signaller = threading.currentThreadId();
+    const thread_name_storage = threading.currentThreadName();
+    const thread_name = std.mem.sliceTo(&thread_name_storage, 0);
+    if (std.mem.eql(u8, thread_name, "AgcInterruptThread")) {
+        _ = agc_interrupt_cond_sequence.fetchAdd(1, .release);
+        std.debug.print(
+            "[agc interrupt] cond {s} key=0x{x} sequence={d} waiters={d}\n",
+            .{ if (broadcast) "broadcast" else "signal", @intFromPtr(object), sequence, waiters },
+        );
+    }
+    object.signal_count +|= 1;
+    if (waiters == 0) object.zero_waiter_signals +|= 1;
+    if (broadcast) object.broadcast_count +|= 1;
     object.state_lock.unlock();
     if (waiters != 0) {
         threading.wakeWaiters(
             @intFromPtr(object),
             sequence,
-            if (broadcast) wake_all else 1,
+            if (broadcast) waiters else 1,
         );
     }
 }
@@ -1286,7 +1409,7 @@ fn rwlockUnlockCore(outer: ?*RwlockHandle) Error!void {
     const sequence = advanceSequence(&object.sequence);
     const waiters = object.waiting_readers + object.waiting_writers;
     object.state_lock.unlock();
-    if (waiters != 0) threading.wakeWaiters(@intFromPtr(object), sequence, wake_all);
+    if (waiters != 0) threading.wakeWaiters(@intFromPtr(object), sequence, waiters);
 }
 
 pub fn scePthreadRwlockInit(
@@ -1501,7 +1624,7 @@ pub fn scePthreadBarrierWait(barrier: ?*BarrierHandle) callconv(abi.guest) i32 {
         const generation = advanceSequence(&object.generation);
         const waiters = object.waiters;
         object.state_lock.unlock();
-        if (waiters != 0) threading.wakeWaiters(@intFromPtr(object), generation, wake_all);
+        if (waiters != 0) threading.wakeWaiters(@intFromPtr(object), generation, waiters);
         return -1;
     }
 

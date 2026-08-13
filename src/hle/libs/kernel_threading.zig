@@ -432,6 +432,14 @@ pub const Manager = struct {
         return if (current_guest_thread == 0) null else @ptrFromInt(current_guest_thread);
     }
 
+    pub fn currentName(self: *Manager) [32]u8 {
+        if (current_guest_thread == 0) return @splat(0);
+        self.lock.lock();
+        defer self.lock.unlock();
+        const record = self.findRecordLocked(current_guest_thread) orelse return @splat(0);
+        return record.name;
+    }
+
     /// Returns the immutable execution context for the current host worker's
     /// guest thread. The record remains owned by the manager; callers receive
     /// a value copy so no manager lock crosses an HLE call boundary.
@@ -1001,6 +1009,37 @@ pub const Manager = struct {
 };
 
 threadlocal var current_guest_thread: u64 = 0;
+
+const WaitDiagnostic = struct {
+    key: u64 = 0,
+    sequence: u64 = 0,
+    repeats: u32 = 0,
+
+    fn observe(self: *WaitDiagnostic, manager: *Manager, request: WaitRequest) void {
+        if (self.key == request.key and self.sequence == request.observed_sequence) {
+            self.repeats +|= 1;
+        } else {
+            self.* = .{ .key = request.key, .sequence = request.observed_sequence, .repeats = 1 };
+        }
+        if (self.repeats != 100_000) return;
+        const name_storage = manager.currentName();
+        const name = std.mem.sliceTo(&name_storage, 0);
+        std.debug.print(
+            "[cpu wait] repeated key=0x{x} sequence={d} thread=0x{x}/{s} relative_us={?d} deadline_ns={?d} clock={d}\n",
+            .{
+                request.key,
+                request.observed_sequence,
+                current_guest_thread,
+                name,
+                request.timeout_microseconds,
+                request.absolute_deadline_ns,
+                request.clock_id,
+            },
+        );
+    }
+};
+
+threadlocal var wait_diagnostic: WaitDiagnostic = .{};
 var attached_manager: ?*Manager = null;
 var attach_lock: Lock = .{};
 
@@ -1015,6 +1054,14 @@ fn activeManager() ?*Manager {
     attach_lock.lock();
     defer attach_lock.unlock();
     return attached_manager;
+}
+
+/// Name of the guest thread currently executing on this host worker.
+/// Diagnostics in sibling HLE subsystems use the value copy without retaining
+/// a thread-manager record or lock.
+pub fn currentThreadName() [32]u8 {
+    const manager = activeManager() orelse return @splat(0);
+    return manager.currentName();
 }
 
 /// Guest pthread identity used by synchronization objects for ownership.
@@ -1034,6 +1081,7 @@ pub fn currentErrnoAddress() ?u64 {
 
 pub fn waitCurrent(request: WaitRequest) Error!WaitResult {
     const active_manager = activeManager() orelse return error.NotAttached;
+    wait_diagnostic.observe(active_manager, request);
     return active_manager.wait(request);
 }
 

@@ -14,7 +14,7 @@ const loader = @import("loader");
 const hle = @import("hle");
 
 const usage =
-    \\module-info <module> [provider.prx ...] [--names <list>]
+    \\module-info <module> [provider.prx ...] [--names <list>] [--bytes <vaddr> <count>]
     \\
     \\Prints a bare ELF or decrypted PS5 SELF module's identity, dependencies,
     \\and imports, marking which ones the firmware emulation or optional guest
@@ -22,6 +22,7 @@ const usage =
     \\
     \\--names takes a file of candidate symbol names, one per line, and recovers
     \\the published name of every import whose identifier one of them hashes to.
+    \\--bytes prints a bounded virtual range from the decrypted ELF/SELF image.
     \\
 ;
 
@@ -132,6 +133,8 @@ pub fn main(init: std.process.Init) !void {
     var providers: std.ArrayList([]const u8) = .empty;
     defer providers.deinit(arena);
     var names_path: ?[]const u8 = null;
+    var bytes_address: ?u64 = null;
+    var bytes_count: usize = 0;
     var index: usize = 2;
     while (index < args.len) : (index += 1) {
         if (std.mem.eql(u8, args[index], "--names")) {
@@ -142,6 +145,16 @@ pub fn main(init: std.process.Init) !void {
             }
             names_path = args[index + 1];
             index += 1;
+        } else if (std.mem.eql(u8, args[index], "--bytes")) {
+            if (index + 2 >= args.len) {
+                try stderr.writeAll(usage);
+                try stderr.flush();
+                return error.InvalidUsage;
+            }
+            bytes_address = std.fmt.parseInt(u64, args[index + 1], 0) catch return error.InvalidUsage;
+            bytes_count = std.fmt.parseInt(usize, args[index + 2], 0) catch return error.InvalidUsage;
+            if (bytes_count == 0 or bytes_count > 4096) return error.InvalidUsage;
+            index += 2;
         } else {
             try providers.append(arena, args[index]);
         }
@@ -250,6 +263,26 @@ pub fn main(init: std.process.Init) !void {
             @as(u8, if (f.writable) 'w' else '-'),
             @as(u8, if (f.executable) 'x' else '-'),
         });
+    }
+
+    if (bytes_address) |address| {
+        const code = image.virtualRange(address, bytes_count) catch |err| {
+            try stderr.print("cannot read virtual range 0x{x}+0x{x}: {s}\n", .{ address, bytes_count, @errorName(err) });
+            try stderr.flush();
+            return err;
+        };
+        try out.print("\nbytes 0x{x}+0x{x}\n", .{ address, code.len });
+        var offset: usize = 0;
+        while (offset < code.len) : (offset += 16) {
+            const line = code[offset..@min(offset + 16, code.len)];
+            try out.print("  {x:0>12} ", .{address + offset});
+            for (line) |byte| try out.print(" {x:0>2}", .{byte});
+            var padding = line.len;
+            while (padding < 16) : (padding += 1) try out.writeAll("   ");
+            try out.writeAll("  |");
+            for (line) |byte| try out.writeByte(if (byte >= 0x20 and byte < 0x7f) byte else '.');
+            try out.writeAll("|\n");
+        }
     }
 
     if (info.needed_modules.items.len != 0) {

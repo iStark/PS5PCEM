@@ -502,6 +502,10 @@ fn vblankTickerMain() void {
         // Producer may finish filling a short-kicked ring IB between submits;
         // re-scan remembered tails each refresh so multi-draw DCBs land.
         kernel_ioctl.drainPendingTailsPublic();
+        // A batch's last AGC submission has no following Submit* call to drain
+        // its deferred completion. Publish it from this independent host tick
+        // after the short post-submit ring-bookkeeping grace period.
+        agc_submit.pumpCompletionNotifications();
     }
 }
 
@@ -1002,7 +1006,6 @@ fn saveDataUmount(_: u32, mount_point: u64) callconv(abi.guest) i32 {
     return errno.ok;
 }
 
-
 /// The block-shaped save API.
 ///
 /// It is the other half of saved games: instead of writing files through a
@@ -1187,11 +1190,8 @@ fn reserveAgcDwords(buffer: ?*AgcCommandBuffer, dword_count: usize) ?[*]u32 {
     const byte_count = dword_count * @sizeOf(u32);
     if (cursor_address > top_address or top_address - cursor_address < byte_count) return null;
     state.cursor_up = cursor + dword_count;
+    agc_submit.trackGraphicsCommandAllocation(cursor_address, dword_count);
     return cursor;
-}
-
-fn reserveAgcCommand(buffer: ?*AgcCommandBuffer) ?[*]u32 {
-    return reserveAgcDwords(buffer, 16);
 }
 
 fn pm4Header(opcode: u8, body_words: usize) u32 {
@@ -1202,19 +1202,10 @@ fn pm4Header(opcode: u8, body_words: usize) u32 {
 }
 
 fn writeAgcPacket(buffer: ?*AgcCommandBuffer, opcode: u8, body: []const u32) ?[*]u32 {
-    const cursor = reserveAgcCommand(buffer) orelse return null;
+    if (body.len == 0) return null;
+    const cursor = reserveAgcDwords(buffer, body.len + 1) orelse return null;
     cursor[0] = pm4Header(opcode, body.len);
-    @memcpy(cursor[1 .. 1 + body.len], body);
-
-    const used = 1 + body.len;
-    const remaining = 16 - used;
-    if (remaining != 0) {
-        // Specialised writers keep the old fixed footprint until all matching
-        // GetSize entry points have their exact retail widths.
-        std.debug.assert(remaining >= 2);
-        cursor[used] = pm4Header(gpu.pm4.nop, remaining - 1);
-        @memset(cursor[used + 1 .. 16], 0);
-    }
+    @memcpy(cursor[1 .. body.len + 1], body);
     return cursor;
 }
 
@@ -1227,17 +1218,10 @@ fn writeExactAgcPacket(buffer: ?*AgcCommandBuffer, opcode: u8, body: []const u32
 }
 
 fn writeAgcCustomPacket(buffer: ?*AgcCommandBuffer, code: u6, body: []const u32) ?[*]u32 {
-    const cursor = reserveAgcCommand(buffer) orelse return null;
+    if (body.len == 0) return null;
+    const cursor = reserveAgcDwords(buffer, body.len + 1) orelse return null;
     cursor[0] = pm4Header(gpu.pm4.nop, body.len) | (@as(u32, code) << 2);
-    @memcpy(cursor[1 .. 1 + body.len], body);
-
-    const used = 1 + body.len;
-    const remaining = 16 - used;
-    if (remaining != 0) {
-        std.debug.assert(remaining >= 2);
-        cursor[used] = pm4Header(gpu.pm4.nop, remaining - 1);
-        @memset(cursor[used + 1 .. 16], 0);
-    }
+    @memcpy(cursor[1 .. body.len + 1], body);
     return cursor;
 }
 
@@ -1260,20 +1244,34 @@ fn agcReleaseMem(
     interrupt: u64,
     interrupt_context_id: u64,
 ) callconv(abi.guest) ?[*]u32 {
-    if (destination > 1 or data_selection > 5 or gds_offset != 0 or gds_size > 2 or interrupt > 3) {
+    if (destination > 1 or data_selection > 5 or gds_offset != 0 or gds_size > 2 or interrupt > 4) {
         return null;
     }
+    var packet_gcr_control: u32 = @truncate(gcr_control);
+    packet_gcr_control &= 0x0fff;
+    if (packet_gcr_control & 0x300 == 0x100) packet_gcr_control |= 0x200;
+    var packet_address = destination_address;
+    var packet_data = data;
+    if ((interrupt & 0x7) == 4) {
+        packet_address = 0;
+        packet_data = 0;
+    } else if ((data_selection & 0x7) == 5) {
+        packet_data = (gds_offset & 0xffff) | ((gds_size & 0xffff) << 16);
+    }
+    const packet_action: u32 = @as(u32, @truncate(action)) & 0x3f;
+    const event_index: u32 = if (action >= 0x2f) 6 else 5;
     const body = [_]u32{
-        @as(u32, @truncate(action)) |
-            ((@as(u32, @truncate(gcr_control)) & 0x0fff) << 12) |
+        packet_action |
+            (event_index << 8) |
+            (packet_gcr_control << 12) |
             ((@as(u32, @truncate(cache_policy)) & 0x3) << 25),
         ((@as(u32, @truncate(destination)) & 0x3) << 16) |
             ((@as(u32, @truncate(interrupt)) & 0x7) << 24) |
             ((@as(u32, @truncate(data_selection)) & 0x7) << 29),
-        @truncate(destination_address),
-        @truncate(destination_address >> 32),
-        @truncate(data),
-        @truncate(data >> 32),
+        @as(u32, @truncate(packet_address)) & 0xffff_fffc,
+        @truncate(packet_address >> 32),
+        @truncate(packet_data),
+        @truncate(packet_data >> 32),
         @as(u32, @truncate(interrupt_context_id)) & 0x07ff_ffff,
     };
     return writeAgcCustomPacket(buffer, gpu.pm4.custom.release_mem, &body);
@@ -1954,7 +1952,6 @@ fn agcSuspendPoint() callconv(abi.guest) i32 {
     // mid-encode after ACQUIRE_MEM while SuspendPoint spins on a stale view.
     kernel_ioctl.drainPendingTailsPublic();
     agc_submit.pumpQueues();
-    _ = kernel_event_queue.triggerAllGraphicsEvents(0);
     // ~1 ms: enough to free a core without under-pacing a 60 Hz flip loop.
     _ = kernel_threading.sceKernelUsleep(1_000);
     return errno.ok;
@@ -2437,7 +2434,7 @@ test "bootstrap AGC commands are one walkable PM4 NOP" {
 }
 
 test "bootstrap AGC release publishes a walkable custom fence packet" {
-    var words: [16]u32 = @splat(0xdead_beef);
+    var words: [8]u32 = @splat(0xdead_beef);
     var command_buffer = AgcCommandBuffer{
         .bottom = words[0..].ptr,
         .top = words[0..].ptr + words.len,
@@ -2472,12 +2469,11 @@ test "bootstrap AGC release publishes a walkable custom fence packet" {
     try std.testing.expectEqual(@as(u32, @truncate(address >> 32)), release.body[3]);
     try std.testing.expectEqual(@as(u32, @truncate(data)), release.body[4]);
     try std.testing.expectEqual(@as(u32, @truncate(data >> 32)), release.body[5]);
-    try std.testing.expectEqual(gpu.pm4.nop, (try walker.next()).?.opcode);
     try std.testing.expect((try walker.next()) == null);
 }
 
 test "bootstrap AGC wait packet keeps its copied address patchable" {
-    var words: [16]u32 = @splat(0xdead_beef);
+    var words: [7]u32 = @splat(0xdead_beef);
     var command_buffer = AgcCommandBuffer{
         .bottom = words[0..].ptr,
         .top = words[0..].ptr + words.len,
@@ -2498,7 +2494,7 @@ test "bootstrap AGC wait packet keeps its copied address patchable" {
     try std.testing.expectEqual(@as(u32, @truncate(patched_address >> 32)), wait.body[1]);
     try std.testing.expectEqual(@as(u32, 0xffff_ffff), wait.body[2]);
     try std.testing.expectEqual(@as(u32, 1), wait.body[3]);
-    try std.testing.expectEqual(gpu.pm4.nop, (try walker.next()).?.opcode);
+    try std.testing.expect((try walker.next()) == null);
 }
 
 test "bootstrap AGC emits event acquire and patchable DMA packets" {
@@ -2513,7 +2509,7 @@ test "bootstrap AGC emits event acquire and patchable DMA packets" {
         .reserved_dwords = 0,
     };
     try std.testing.expect(agcEventWrite(&command_buffer, 16, 0) != null);
-    try std.testing.expect(agcDmaData(
+    const dma_command = agcDmaData(
         &command_buffer,
         0,
         3,
@@ -2526,36 +2522,34 @@ test "bootstrap AGC emits event acquire and patchable DMA packets" {
         1,
         1,
         0,
-    ) != null);
+    ).?;
     try std.testing.expect(agcAcquireMem(&command_buffer, 1, 0, 0x9000, 0, 0x20, 40) != null);
 
-    var walker = gpu.pm4.Walker.init(&words);
+    const used = (@intFromPtr(command_buffer.cursor_up.?) - @intFromPtr(words[0..].ptr)) / @sizeOf(u32);
+    var walker = gpu.pm4.Walker.init(words[0..used]);
     const event = (try walker.next()).?;
     try std.testing.expectEqual(gpu.pm4.event_write, event.opcode);
     try std.testing.expectEqual(@as(u32, 0x410), event.body[0]);
-    try std.testing.expectEqual(gpu.pm4.nop, (try walker.next()).?.opcode);
 
     const dma = (try walker.next()).?;
     try std.testing.expectEqual(gpu.pm4.dma_data, dma.opcode);
-    const dma_address = @intFromPtr(&words[16]);
+    const dma_address = @intFromPtr(dma_command);
     try std.testing.expectEqual(errno.ok, agcDmaDataPatchDestination(dma_address, 0x1234_5678_9abc_def0));
     try std.testing.expectEqual(errno.ok, agcDmaDataPatchSource(dma_address, 0xfedc_ba98_7654_3210));
     try std.testing.expectEqual(@as(u32, 0x9abc_def0), dma.body[3]);
     try std.testing.expectEqual(@as(u32, 0x1234_5678), dma.body[4]);
     try std.testing.expectEqual(@as(u32, 0x7654_3210), dma.body[1]);
     try std.testing.expectEqual(@as(u32, 0xfedc_ba98), dma.body[2]);
-    try std.testing.expectEqual(gpu.pm4.nop, (try walker.next()).?.opcode);
 
     const acquire = (try walker.next()).?;
     try std.testing.expectEqual(gpu.pm4.custom.acquire_mem, gpu.pm4.customCode(acquire).?);
     try std.testing.expectEqual(@as(u32, 0x8000_0000), acquire.body[0]);
     try std.testing.expectEqual(@as(u32, 1), acquire.body[5]);
     try std.testing.expectEqual(@as(u32, 0x9000), acquire.body[6]);
-    try std.testing.expectEqual(gpu.pm4.nop, (try walker.next()).?.opcode);
     try std.testing.expect((try walker.next()) == null);
 }
 
-test "bootstrap AGC emits dispatch draw and instance packets in fixed slots" {
+test "bootstrap AGC emits exact dispatch draw and instance packets" {
     var words: [48]u32 = @splat(0xdead_beef);
     var command_buffer = AgcCommandBuffer{
         .bottom = words[0..].ptr,
@@ -2569,23 +2563,20 @@ test "bootstrap AGC emits dispatch draw and instance packets in fixed slots" {
     try std.testing.expect(agcDispatch(&command_buffer, 3, 5, 7, 0, 0) != null);
     try std.testing.expect(agcDrawIndex(&command_buffer, 6, 0x1234_5600, 0x4000_0000, 0, 0) != null);
     try std.testing.expect(agcSetNumInstances(&command_buffer, 2, 0, 0, 0, 0) != null);
-    try std.testing.expectEqual(words[0..].ptr + words.len, command_buffer.cursor_up.?);
+    try std.testing.expectEqual(words[0..].ptr + 13, command_buffer.cursor_up.?);
 
-    var walker = gpu.pm4.Walker.init(&words);
+    var walker = gpu.pm4.Walker.init(words[0..13]);
     const dispatch = (try walker.next()).?;
     try std.testing.expectEqual(gpu.pm4.dispatch_direct, dispatch.opcode);
     try std.testing.expectEqualSlices(u32, &.{ 3, 5, 7, 0x41 }, dispatch.body);
-    try std.testing.expectEqual(gpu.pm4.nop, (try walker.next()).?.opcode);
 
     const draw = (try walker.next()).?;
     try std.testing.expectEqual(gpu.pm4.draw_index_2, draw.opcode);
     try std.testing.expectEqualSlices(u32, &.{ 6, 0x1234_5600, 0, 6, 0 }, draw.body);
-    try std.testing.expectEqual(gpu.pm4.nop, (try walker.next()).?.opcode);
 
     const instances = (try walker.next()).?;
     try std.testing.expectEqual(gpu.pm4.num_instances, instances.opcode);
     try std.testing.expectEqualSlices(u32, &.{2}, instances.body);
-    try std.testing.expectEqual(gpu.pm4.nop, (try walker.next()).?.opcode);
     try std.testing.expect((try walker.next()) == null);
 }
 
@@ -2649,7 +2640,7 @@ test "bootstrap AGC emits indexed-buffer state and offset draw packets" {
     try std.testing.expect((try walker.next()) == null);
 }
 
-test "bootstrap AGC emits native indirect register packets in fixed slots" {
+test "bootstrap AGC emits exact native indirect register packets" {
     var words: [48]u32 = @splat(0xdead_beef);
     var command_buffer = AgcCommandBuffer{
         .bottom = words[0..].ptr,
@@ -2664,15 +2655,13 @@ test "bootstrap AGC emits native indirect register packets in fixed slots" {
     try std.testing.expect(agcSetCxRegistersIndirect(&command_buffer, address, 7, 0, 0, 0) != null);
     try std.testing.expect(agcSetShRegistersIndirect(&command_buffer, address + 8, 11, 0, 0, 0) != null);
     try std.testing.expect(agcSetUcRegistersIndirect(&command_buffer, address + 16, 3, 0, 0, 0) != null);
+    try std.testing.expectEqual(words[0..].ptr + 15, command_buffer.cursor_up.?);
 
-    var walker = gpu.pm4.Walker.init(words[0..]);
+    var walker = gpu.pm4.Walker.init(words[0..15]);
     const expected = [_]u8{
         gpu.pm4.set_context_reg_indirect,
-        gpu.pm4.nop,
         gpu.pm4.set_sh_reg_indirect,
-        gpu.pm4.nop,
         gpu.pm4.set_uconfig_reg_indirect,
-        gpu.pm4.nop,
     };
     for (expected) |opcode| try std.testing.expectEqual(opcode, (try walker.next()).?.opcode);
     try std.testing.expect((try walker.next()) == null);
@@ -2722,7 +2711,7 @@ test "bootstrap AGC patches native indirect register packets" {
 }
 
 test "bootstrap AGC emits a backend-visible flip packet" {
-    var words: [16]u32 = @splat(0xdead_beef);
+    var words: [6]u32 = @splat(0xdead_beef);
     var command_buffer = AgcCommandBuffer{
         .bottom = words[0..].ptr,
         .top = words[0..].ptr + words.len,
@@ -2746,7 +2735,6 @@ test "bootstrap AGC emits a backend-visible flip packet" {
         0x89ab_cdef,
         0x0123_4567,
     }, flip.body);
-    try std.testing.expectEqual(gpu.pm4.nop, (try walker.next()).?.opcode);
     try std.testing.expect((try walker.next()) == null);
 }
 

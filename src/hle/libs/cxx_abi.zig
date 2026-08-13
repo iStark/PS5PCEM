@@ -57,8 +57,13 @@ fn guardAcquireCore(guard: *u64, owner: std.Thread.Id) i32 {
         }
         if (pendingIndex(address)) |index| {
             if (pending_guards[index].owner == owner) {
+                // A recursive initializer cannot wait for itself. Returning
+                // zero is worse: it tells the caller that the object is fully
+                // constructed, and UE immediately dereferences its still-null
+                // singleton. Let the inner invocation perform the
+                // initialization; its release also completes the outer guard.
                 pending_lock.unlock();
-                return 0;
+                return 1;
             }
             pending_lock.unlock();
             std.Thread.yield() catch {};
@@ -120,13 +125,13 @@ pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!voi
     try db.addLibrary(gpa, library, module, &exports);
 }
 
-test "a recursive guard acquire does not wait on its owner" {
+test "a recursive guard acquire lets the inner initializer finish" {
     var guard: u64 = 0;
     const owner = std.Thread.getCurrentId();
 
     try std.testing.expectEqual(@as(i32, 1), guardAcquireCore(&guard, owner));
     try std.testing.expectEqual(pending, guard);
-    try std.testing.expectEqual(@as(i32, 0), guardAcquireCore(&guard, owner));
+    try std.testing.expectEqual(@as(i32, 1), guardAcquireCore(&guard, owner));
 
     guardCompleteCore(&guard, initialized);
     try std.testing.expectEqual(@as(i32, 0), guardAcquireCore(&guard, owner));

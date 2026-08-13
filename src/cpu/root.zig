@@ -16,10 +16,71 @@ const memory = @import("memory");
 const hle = @import("hle");
 const x86_64_compat = @import("x86_64_compat.zig");
 const threading = hle.libs.kernel_threading;
+const kernel_sync = hle.libs.kernel_sync;
 
-const key_state_capacity: usize = 256;
-const events_per_key: usize = 16;
+/// Unreal creates synchronization objects for every task-graph worker, render
+/// resource and async service. Keeping only 256 lifetime keys made the table
+/// saturate during Tetris Effect startup; the old global fallback then treated
+/// every wait as signalled and turned RenderThread parking into a hot poll.
+/// Open addressing keeps this larger lifetime table cheap on the HLE hot path.
+const key_state_capacity: usize = 16 * 1024;
+const key_state_mask: usize = key_state_capacity - 1;
 const wake_all = std.math.maxInt(usize);
+
+const WaitRepeatDiagnostic = struct {
+    key: u64 = 0,
+    sequence: u64 = 0,
+    repeats: u32 = 0,
+
+    fn observe(self: *WaitRepeatDiagnostic, request: threading.WaitRequest) bool {
+        if (self.key == request.key and self.sequence == request.observed_sequence) {
+            self.repeats +|= 1;
+        } else {
+            self.* = .{
+                .key = request.key,
+                .sequence = request.observed_sequence,
+                .repeats = 1,
+            };
+        }
+        return self.repeats == 1_000;
+    }
+};
+
+threadlocal var wait_repeat_diagnostic: WaitRepeatDiagnostic = .{};
+
+fn printWaitKeyInfo(key: u64) void {
+    const info = kernel_sync.describeWaitKey(key) orelse {
+        std.debug.print("[cpu wait] key state untracked key=0x{x}\n", .{key});
+        return;
+    };
+    std.debug.print(
+        "[cpu wait] key state key=0x{x} kind={s} current_sequence={d} waiters={d} owner=0x{x} recursion={d} writer=0x{x} readers={d} waiting_readers={d} waiting_writers={d} arrived={d}/{d} clock={d} last_waiter=0x{x} last_signaller=0x{x} signals={d} zero_waiter={d} broadcasts={d}\n",
+        .{
+            key,
+            @tagName(info.kind),
+            info.sequence,
+            info.waiters,
+            info.owner,
+            info.recursion,
+            info.writer,
+            info.readers,
+            info.waiting_readers,
+            info.waiting_writers,
+            info.arrived,
+            info.threshold,
+            info.clock_id,
+            info.last_waiter,
+            info.last_signaller,
+            info.signal_count,
+            info.zero_waiter_signals,
+            info.broadcast_count,
+        },
+    );
+}
+
+comptime {
+    std.debug.assert(std.math.isPowerOfTwo(key_state_capacity));
+}
 
 const Lock = struct {
     inner: std.atomic.Mutex = .unlocked,
@@ -216,6 +277,10 @@ pub var null_memory_store_recoveries: std.atomic.Value(u64) = .init(0);
 pub var null_call_recoveries: std.atomic.Value(u64) = .init(0);
 /// How many times a null base register was redirected to the synthetic stub object.
 pub var null_base_redirect_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many optional linked-list pointer loads from an unmapped guest page were
+/// converted to null. Some UE subsystems leave a stale terminal node behind;
+/// their generated code immediately null-tests the loaded payload.
+pub var optional_pointer_load_recoveries: std.atomic.Value(u64) = .init(0);
 /// First native access violation declined by the guest exception bridge.
 ///
 /// Host faults normally disappear into Windows with only process exit code
@@ -705,6 +770,23 @@ const WindowsX64Machine = struct {
                 return exception_continue_execution;
             }
         }
+        // UE's bounded linked-list walkers use this exact terminal-node shape:
+        //   mov rax, [rdx+8] ; test rax, rax ; je missing
+        // A stale node can point at a released guest page even though the value
+        // is optional. Preserve the program's explicit null path without
+        // broadening recovery to arbitrary wild-pointer reads.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            tryEmulateUnmappedOptionalPointerLoad(context, record.ExceptionInformation[1]))
+        {
+            _ = optional_pointer_load_recoveries.fetchAdd(1, .monotonic);
+            std.debug.print(
+                "[cpu] recovered optional pointer load @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip - 4, record.ExceptionInformation[1], optional_pointer_load_recoveries.load(.monotonic) },
+            );
+            return exception_continue_execution;
+        }
         // Discard stores into the first page (null object field writes).
         if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
             record.NumberParameters >= 2 and
@@ -1023,6 +1105,26 @@ const WindowsX64Machine = struct {
         return true;
     }
 
+    fn tryEmulateUnmappedOptionalPointerLoad(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        if (!isGuestAddress(memory_address) or memory_address < memory.page_size) return false;
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const pattern = [_]u8{
+            0x48, 0x8b, 0x42, 0x08, // mov rax, qword ptr [rdx+8]
+            0x48, 0x85, 0xc0, // test rax, rax
+            0x74, // je rel8
+        };
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        if (context.Rdx +% 8 != memory_address) return false;
+        context.Rax = 0;
+        context.Rip += 4;
+        return true;
+    }
+
     /// Discards integer stores into the first page and steps past the instruction.
     fn tryEmulateNullMemoryStore(context: *std.os.windows.CONTEXT, memory_address: u64) bool {
         if (memory_address == 0 or memory_address >= lost_base_window) return false;
@@ -1242,6 +1344,24 @@ test "null base recovery decodes VEX2 and VEX3 memory operands" {
     }
 }
 
+test "an unmapped optional linked-list payload follows its null branch" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{ 0x48, 0x8b, 0x42, 0x08, 0x48, 0x85, 0xc0, 0x74, 0x09 };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rax = 0xfeed_face;
+        context.Rdx = 0x1_0078_5a4d;
+        try std.testing.expect(WindowsX64Machine.tryEmulateUnmappedOptionalPointerLoad(
+            &context,
+            context.Rdx + 8,
+        ));
+        try std.testing.expectEqual(@as(u64, 0), context.Rax);
+        try std.testing.expectEqual(@intFromPtr(&code) + 4, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 extern fn ps5NativeCallWindowsX64(
     frame: *NativeCallFrame,
     entry_point: u64,
@@ -1356,17 +1476,12 @@ comptime {
     );
 }
 
-const WakeEvent = struct {
-    sequence: u64 = 0,
-    remaining: usize = 0,
-};
-
 const KeyState = struct {
     used: bool = false,
     key: u64 = 0,
+    wake_epoch: u32 align(@alignOf(u32)) = 1,
     latest_sequence: u64 = 0,
-    broadcast_sequence: u64 = 0,
-    events: [events_per_key]WakeEvent = [_]WakeEvent{.{}} ** events_per_key,
+    pending_wakes: usize = 0,
 };
 
 const Worker = struct {
@@ -1440,7 +1555,7 @@ pub const Dispatcher = struct {
         self.lock.lock();
         self.shutting_down = true;
         self.lock.unlock();
-        self.publishWake();
+        self.publishAllKeyWakes();
 
         // Do not call bridge code under the dispatcher lock. An interrupt may
         // synchronously unwind through HLE and finish the same worker.
@@ -1707,10 +1822,74 @@ pub const Dispatcher = struct {
         request: threading.WaitRequest,
     ) threading.BackendError!threading.WaitResult {
         const self = fromContext(raw) orelse return error.Unsupported;
+        const current_name_storage = self.manager.currentName();
+        const current_name = std.mem.sliceTo(&current_name_storage, 0);
+        const main_long_wait = std.mem.eql(u8, current_name, "eboot-main") and
+            request.absolute_deadline_ns == null and
+            (request.timeout_microseconds == null or
+                request.timeout_microseconds.? >= std.time.us_per_s);
+        if (main_long_wait) {
+            std.debug.print(
+                "[cpu wait] main wait key=0x{x} sequence={d} host={d} relative_us={?d} deadline_ns={?d} clock={d}\n",
+                .{
+                    request.key,
+                    request.observed_sequence,
+                    std.Thread.getCurrentId(),
+                    request.timeout_microseconds,
+                    request.absolute_deadline_ns,
+                    request.clock_id,
+                },
+            );
+            printWaitKeyInfo(request.key);
+        }
+        if (wait_repeat_diagnostic.observe(request)) {
+            std.debug.print(
+                "[cpu wait] repeated 1000 times key=0x{x} sequence={d} thread=0x{x}/{s} host={d} relative_us={?d} deadline_ns={?d} clock={d}\n",
+                .{
+                    request.key,
+                    request.observed_sequence,
+                    threading.currentThreadId(),
+                    current_name,
+                    std.Thread.getCurrentId(),
+                    request.timeout_microseconds,
+                    request.absolute_deadline_ns,
+                    request.clock_id,
+                },
+            );
+            printWaitKeyInfo(request.key);
+        }
         const timeout = makeTimeout(self.io, request);
         const deadline = timeout.toTimestamp(self.io);
+        // An absent relative timeout is only indefinite when there is no
+        // absolute deadline either. Treating every absolute pthread deadline
+        // as an indefinite wait rounds millisecond frame timers up to the
+        // five-second watchdog interval and intermittently starves the game
+        // thread between submissions.
+        const monitor_wait = request.absolute_deadline_ns == null and
+            (request.timeout_microseconds == null or
+                request.timeout_microseconds.? >= 10 * std.time.us_per_s);
+        const scheduler_watchdog = std.mem.startsWith(u8, current_name, "TaskGraphThread") or
+            std.mem.eql(u8, current_name, "RenderThread 1") or
+            std.mem.eql(u8, current_name, "RHIThread");
+        const monitored_timeout: std.Io.Timeout = .{ .duration = .{
+            .clock = .awake,
+            .raw = .fromSeconds(5),
+        } };
+        var wait_attempts: u32 = 0;
 
         while (true) {
+            wait_attempts +|= 1;
+            if (wait_attempts == 100_000) std.debug.print(
+                "[cpu wait] futex churn key=0x{x} sequence={d} thread=0x{x} relative_us={?d} deadline_ns={?d} clock={d}\n",
+                .{
+                    request.key,
+                    request.observed_sequence,
+                    threading.currentThreadId(),
+                    request.timeout_microseconds,
+                    request.absolute_deadline_ns,
+                    request.clock_id,
+                },
+            );
             self.lock.lock();
             if (self.shutting_down) {
                 self.lock.unlock();
@@ -1720,15 +1899,49 @@ pub const Dispatcher = struct {
                 self.lock.unlock();
                 return .awoken;
             }
-            const epoch = @atomicLoad(u32, &self.wake_epoch, .acquire);
+            const key_state = self.findOrCreateKeyLocked(request.key) orelse {
+                self.lock.unlock();
+                return .awoken;
+            };
+            const epoch = @atomicLoad(u32, &key_state.wake_epoch, .acquire);
             self.lock.unlock();
 
             if (deadline) |end| {
                 const now = std.Io.Clock.Timestamp.now(self.io, end.clock);
                 if (std.Io.Clock.Timestamp.compare(end, .lte, now)) return .timed_out;
             }
-            self.io.futexWaitTimeout(u32, &self.wake_epoch, epoch, timeout) catch
+            self.io.futexWaitTimeout(
+                u32,
+                &key_state.wake_epoch,
+                epoch,
+                if (monitor_wait) monitored_timeout else timeout,
+            ) catch
                 return error.WaitFailed;
+            if (monitor_wait and wait_attempts == 2) {
+                if (scheduler_watchdog) {
+                    const name_storage = self.manager.currentName();
+                    std.debug.print(
+                        "[cpu wait] watchdog spurious wake after 10s key=0x{x} sequence={d} thread=0x{x}/{s} host={d} relative_us={?d} deadline_ns={?d} clock={d}\n",
+                        .{
+                            request.key,
+                            request.observed_sequence,
+                            threading.currentThreadId(),
+                            std.mem.sliceTo(&name_storage, 0),
+                            std.Thread.getCurrentId(),
+                            request.timeout_microseconds,
+                            request.absolute_deadline_ns,
+                            request.clock_id,
+                        },
+                    );
+                    printWaitKeyInfo(request.key);
+                }
+                // POSIX condition waits are explicitly allowed to wake
+                // spuriously. Returning here gives guest schedulers a chance
+                // to re-check a ready predicate after a lost notification;
+                // mutexes, rwlocks and event queues already loop on their
+                // concrete state and therefore simply park again.
+                return .awoken;
+            }
         }
     }
 
@@ -1740,9 +1953,21 @@ pub const Dispatcher = struct {
     ) void {
         const self = fromContext(raw) orelse return;
         self.lock.lock();
-        if (!self.shutting_down) self.recordWakeLocked(key, sequence, maximum_waiters);
+        const key_state = if (!self.shutting_down)
+            self.recordWakeLocked(key, sequence, maximum_waiters)
+        else
+            null;
+        if (key_state) |state| {
+            _ = @atomicRmw(u32, &state.wake_epoch, .Add, 1, .release);
+        }
         self.lock.unlock();
-        self.publishWake();
+        if (key_state) |state| {
+            const wake_count: u32 = if (maximum_waiters == wake_all)
+                std.math.maxInt(u32)
+            else
+                @intCast(@min(maximum_waiters, std.math.maxInt(u32)));
+            self.io.futexWake(u32, &state.wake_epoch, wake_count);
+        }
     }
 
     fn call(raw: ?*anyopaque, guest_call: threading.GuestCall) threading.BackendError!u64 {
@@ -1879,36 +2104,45 @@ pub const Dispatcher = struct {
     }
 
     fn findKeyLocked(self: *Dispatcher, key: u64) ?*KeyState {
-        for (self.key_states) |*state| {
-            if (state.used and state.key == key) return state;
+        const first = keyStateIndex(key);
+        for (0..self.key_states.len) |probe| {
+            const state = &self.key_states[(first + probe) & key_state_mask];
+            if (!state.used) return null;
+            if (state.key == key) return state;
         }
         return null;
     }
 
     fn findOrCreateKeyLocked(self: *Dispatcher, key: u64) ?*KeyState {
-        if (self.findKeyLocked(key)) |state| return state;
-        for (self.key_states) |*state| {
-            if (state.used) continue;
+        const first = keyStateIndex(key);
+        for (0..self.key_states.len) |probe| {
+            const state = &self.key_states[(first + probe) & key_state_mask];
+            if (state.used) {
+                if (state.key == key) return state;
+                continue;
+            }
             state.* = .{ .used = true, .key = key };
             return state;
         }
-        self.saturated_keys = true;
+        if (!self.saturated_keys) {
+            self.saturated_keys = true;
+            std.debug.print(
+                "[cpu] synchronization key table saturated at {d} entries; new keys use polling fallback\n",
+                .{self.key_states.len},
+            );
+        }
         return null;
     }
 
     fn consumeWakeLocked(self: *Dispatcher, request: threading.WaitRequest) bool {
         // Saturation degrades to polling rather than risking a permanent lost
-        // wakeup when a title creates more synchronization keys than expected.
-        if (self.saturated_keys) return true;
+        // wakeup for the one unknown key. Known keys retain normal blocking;
+        // one exhausted slot must never disable scheduling process-wide.
         const state = self.findOrCreateKeyLocked(request.key) orelse return true;
-        if (sequenceAfter(state.broadcast_sequence, request.observed_sequence)) return true;
-        for (&state.events) |*event| {
-            if (event.remaining == 0 or
-                !sequenceAfter(event.sequence, request.observed_sequence)) continue;
-            event.remaining -= 1;
-            return true;
-        }
-        return false;
+        if (state.pending_wakes == 0 or
+            !sequenceAfter(state.latest_sequence, request.observed_sequence)) return false;
+        state.pending_wakes -= 1;
+        return true;
     }
 
     fn recordWakeLocked(
@@ -1916,39 +2150,25 @@ pub const Dispatcher = struct {
         key: u64,
         sequence: u64,
         maximum_waiters: usize,
-    ) void {
-        if (maximum_waiters == 0) return;
-        const state = self.findOrCreateKeyLocked(key) orelse return;
+    ) ?*KeyState {
+        if (maximum_waiters == 0) return null;
+        const state = self.findOrCreateKeyLocked(key) orelse return null;
         state.latest_sequence = sequence;
-        if (maximum_waiters == wake_all) {
-            state.broadcast_sequence = sequence;
-            @memset(&state.events, .{});
-            return;
-        }
-
-        for (&state.events) |*event| {
-            if (event.remaining != 0 and event.sequence == sequence) {
-                event.remaining +|= maximum_waiters;
-                return;
-            }
-        }
-        for (&state.events) |*event| {
-            if (event.remaining != 0) continue;
-            event.* = .{ .sequence = sequence, .remaining = maximum_waiters };
-            return;
-        }
-
-        // More than `events_per_key` unconsumed signals means the exact waiter
-        // cardinality is unavailable. A broadcast is the only safe fallback:
-        // over-waking is recoverable because HLE rechecks object state, while a
-        // dropped wake can deadlock the process.
-        state.broadcast_sequence = sequence;
-        @memset(&state.events, .{});
+        state.pending_wakes +|= maximum_waiters;
+        return state;
     }
 
     fn publishWake(self: *Dispatcher) void {
         _ = @atomicRmw(u32, &self.wake_epoch, .Add, 1, .release);
         self.io.futexWake(u32, &self.wake_epoch, std.math.maxInt(u32));
+    }
+
+    fn publishAllKeyWakes(self: *Dispatcher) void {
+        for (self.key_states) |*state| {
+            if (!state.used) continue;
+            _ = @atomicRmw(u32, &state.wake_epoch, .Add, 1, .release);
+            self.io.futexWake(u32, &state.wake_epoch, std.math.maxInt(u32));
+        }
     }
 };
 
@@ -1963,6 +2183,15 @@ fn sequenceAfter(candidate: u64, observed: u64) bool {
     return candidate -% observed < (@as(u64, 1) << 63);
 }
 
+fn keyStateIndex(key: u64) usize {
+    var mixed = key ^ (key >> 33);
+    mixed *%= 0xff51_afd7_ed55_8ccd;
+    mixed ^= mixed >> 33;
+    mixed *%= 0xc4ce_b9fe_1a85_ec53;
+    mixed ^= mixed >> 33;
+    return @intCast(mixed & @as(u64, key_state_mask));
+}
+
 fn guestClock(clock_id: i32) std.Io.Clock {
     return switch (clock_id) {
         0, 9, 10, 13 => .real,
@@ -1972,9 +2201,13 @@ fn guestClock(clock_id: i32) std.Io.Clock {
 
 fn makeTimeout(io: std.Io, request: threading.WaitRequest) std.Io.Timeout {
     if (request.absolute_deadline_ns) |nanoseconds| {
+        const host_nanoseconds = if (guestClock(request.clock_id) == .awake)
+            hle.libs.kernel_runtime.hostMonotonicDeadline(nanoseconds)
+        else
+            nanoseconds;
         return .{ .deadline = .{
             .clock = guestClock(request.clock_id),
-            .raw = .fromNanoseconds(@intCast(nanoseconds)),
+            .raw = .fromNanoseconds(@intCast(host_nanoseconds)),
         } };
     }
     if (request.timeout_microseconds) |microseconds| {
@@ -2151,6 +2384,42 @@ test "new waiters do not consume stale signal tokens" {
             .timeout_microseconds = 0,
         }),
     );
+}
+
+test "key-table saturation does not turn known waits into polling" {
+    var context = TestContext{};
+    try context.init();
+    defer context.deinit();
+
+    const key: u64 = 0x3456_7000;
+    _ = context.dispatcher.findOrCreateKeyLocked(key) orelse return error.TestUnexpectedResult;
+    context.dispatcher.saturated_keys = true;
+    try testing.expect(!context.dispatcher.consumeWakeLocked(.{
+        .key = key,
+        .observed_sequence = 1,
+    }));
+    _ = context.dispatcher.recordWakeLocked(key, 2, 1);
+    try testing.expect(context.dispatcher.consumeWakeLocked(.{
+        .key = key,
+        .observed_sequence = 1,
+    }));
+}
+
+test "broadcast wake tokens are limited to current waiters" {
+    var context = TestContext{};
+    try context.init();
+    defer context.deinit();
+
+    const key: u64 = 0x4567_8000;
+    _ = context.dispatcher.recordWakeLocked(key, 2, 3);
+    for (0..3) |_| try testing.expect(context.dispatcher.consumeWakeLocked(.{
+        .key = key,
+        .observed_sequence = 1,
+    }));
+    try testing.expect(!context.dispatcher.consumeWakeLocked(.{
+        .key = key,
+        .observed_sequence = 1,
+    }));
 }
 
 test "native bridge installs FS, SysV arguments, and the guest stack" {

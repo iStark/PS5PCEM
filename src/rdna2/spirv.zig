@@ -66,15 +66,18 @@ pub const SampledImageBinding = struct {
 pub const SampledImageDimension = enum {
     two_d,
     three_d,
+    cube,
 };
 
 pub const sampled_image_2d_descriptor_binding: u32 = 1;
 pub const sampled_image_3d_descriptor_binding: u32 = 11;
+pub const sampled_image_cube_descriptor_binding: u32 = 12;
 
 fn sampledImageDimensionIndex(dimension: SampledImageDimension) usize {
     return switch (dimension) {
         .two_d => 0,
         .three_d => 1,
+        .cube => 2,
     };
 }
 
@@ -97,6 +100,7 @@ pub const StorageImageDimension = enum(u8) {
 
 pub const StorageImageFormat = enum(u16) {
     r8_uint = 5,
+    r16_unorm = 7,
     r16_uint = 11,
     r32_uint = 20,
     r11g11b10_float = 36,
@@ -132,6 +136,17 @@ pub const ComputeInputs = struct {
     local_invocation_id_components: u2 = 0,
 };
 
+/// One export reconstructed from the LDS record written by a PS5 NGG export
+/// program.  On that ABI `S_SETPC_B64 s[6:7]` enters a hardware epilogue which
+/// reads the record and performs the ordinary POS/PARAM exports.  Vulkan has
+/// no equivalent hidden continuation, so the backend describes the recovered
+/// sources and the translator emits the export at the terminal SETPC.
+pub const NggLdsExport = struct {
+    target: u6,
+    enable: u4,
+    sources: [4]operand.Operand,
+};
+
 pub const Options = struct {
     stage: Stage,
     local_size: [3]u32 = .{ 1, 1, 1 },
@@ -152,6 +167,10 @@ pub const Options = struct {
     /// Amount of per-workgroup LDS made available by COMPUTE_PGM_RSRC2. DS
     /// instructions address it in bytes; the SPIR-V declaration is a u32 array.
     workgroup_memory_size_bytes: u32 = 0,
+    /// POS/PARAM values encoded in a terminal NGG LDS record. When present,
+    /// vertex-stage DS writes are only the transport for the hardware epilogue
+    /// and are replaced by these explicit Vulkan stage outputs.
+    ngg_lds_exports: []const NggLdsExport = &.{},
     /// PARAM locations exported by a vertex shader, or raw VINTRP ATTR slots
     /// consumed by a fragment shader. `fragment_input_controls` maps the latter
     /// onto the former before declaring the Vulkan interface.
@@ -337,7 +356,7 @@ const WorkgroupAccess = struct {
 fn storageImageValueType(format: StorageImageFormat) ValueType {
     return switch (format) {
         .r8_uint, .r16_uint, .r32_uint, .rgba8_uint => .bits32,
-        .r11g11b10_float, .rgba8_unorm, .rgba16_float, .rgba32_float => .float32,
+        .r16_unorm, .r11g11b10_float, .rgba8_unorm, .rgba16_float, .rgba32_float => .float32,
     };
 }
 
@@ -347,6 +366,7 @@ fn storageImageSpirvFormat(format: StorageImageFormat) u32 {
         .rgba16_float => 2, // Rgba16f
         .rgba8_unorm => 4, // Rgba8
         .r11g11b10_float => 8, // R11fG11fB10f
+        .r16_unorm => 14, // R16
         .rgba8_uint => 32, // Rgba8ui
         .r32_uint => 33, // R32ui
         .r16_uint => 38, // R16ui
@@ -387,6 +407,7 @@ const Builder = struct {
     storage_bindings: []const StorageBufferBinding,
     sampled_bindings: []const SampledImageBinding,
     storage_image_bindings: []const StorageImageBinding,
+    ngg_lds_exports: []const NggLdsExport,
     storage_array: u32 = 0,
     storage_word_pointer_type: u32 = 0,
     storage_block_pointer_type: u32 = 0,
@@ -402,10 +423,10 @@ const Builder = struct {
     fragment_extent: [2]u32,
     vector2_type: u32 = 0,
     vector2_bits_type: u32 = 0,
-    sampled_image_image_types: [2]u32 = @splat(0),
-    sampled_image_types: [2]u32 = @splat(0),
-    sampled_image_arrays: [2]u32 = @splat(0),
-    sampled_image_pointer_types: [2]u32 = @splat(0),
+    sampled_image_image_types: [3]u32 = @splat(0),
+    sampled_image_types: [3]u32 = @splat(0),
+    sampled_image_arrays: [3]u32 = @splat(0),
+    sampled_image_pointer_types: [3]u32 = @splat(0),
     storage_image_types: [8]u32 = @splat(0),
     storage_image_vector_types: [8]u32 = @splat(0),
     storage_image_variables: [8]u32 = @splat(0),
@@ -442,6 +463,7 @@ const Builder = struct {
             .storage_bindings = options.storage_buffers,
             .sampled_bindings = options.sampled_images,
             .storage_image_bindings = options.storage_images,
+            .ngg_lds_exports = options.ngg_lds_exports,
             .compute_inputs = options.compute_inputs,
             .local_size = options.local_size,
             .fragment_extent = options.fragment_extent,
@@ -661,7 +683,7 @@ const Builder = struct {
             {
                 return Error.InvalidStorageBinding;
             }
-            var sampled_dimensions: [2]bool = @splat(false);
+            var sampled_dimensions: [3]bool = @splat(false);
             for (options.sampled_images, 0..) |binding, index| {
                 if (binding.resource_sgpr >= 128 or binding.sampler_sgpr >= 128 or
                     binding.descriptor_index >= options.descriptor_array_length)
@@ -686,15 +708,25 @@ const Builder = struct {
             for (sampled_dimensions, 0..) |present, dimension_index| {
                 if (!present) continue;
                 const dimensions: u32 = if (dimension_index == 0) 2 else 3;
-                const spirv_dimension: u32 = if (dimension_index == 0) 1 else 3;
-                const descriptor_binding = if (dimension_index == 0)
-                    sampled_image_2d_descriptor_binding
-                else
-                    sampled_image_3d_descriptor_binding;
+                // SPIR-V Dim values are 1=2D, 2=3D and 3=Cube. Keeping
+                // volume and cube descriptors distinct is required because
+                // Vulkan image-view compatibility follows the declared Dim.
+                const spirv_dimension: u32 = switch (dimension_index) {
+                    0 => 1,
+                    1 => 2,
+                    2 => 3,
+                    else => unreachable,
+                };
+                const descriptor_binding = switch (dimension_index) {
+                    0 => sampled_image_2d_descriptor_binding,
+                    1 => sampled_image_3d_descriptor_binding,
+                    2 => sampled_image_cube_descriptor_binding,
+                    else => unreachable,
+                };
                 if (dimension_index == 0 and self.vector2_type == 0) {
                     self.vector2_type = self.id();
                     try self.emit(&self.declarations, 23, &.{ self.vector2_type, self.float_type, dimensions }); // OpTypeVector
-                } else if (dimension_index == 1 and self.vector3_type == 0) {
+                } else if (dimension_index != 0 and self.vector3_type == 0) {
                     self.vector3_type = self.id();
                     try self.emit(&self.declarations, 23, &.{ self.vector3_type, self.float_type, dimensions }); // OpTypeVector
                 }
@@ -768,7 +800,7 @@ const Builder = struct {
                 try self.emit(&self.declarations, 25, &.{
                     image_type,
                     component_type,
-                    if (binding.dimension == .three_d) 3 else 1, // Dim3D / Dim2D
+                    if (binding.dimension == .three_d) 2 else 1, // Dim3D / Dim2D
                     0, // not depth
                     0, // not arrayed
                     0, // not multisampled
@@ -1058,6 +1090,22 @@ const Builder = struct {
         try self.destination(inst.dst, .{ .id = result, .value_type = value_type });
     }
 
+    fn scalarMinMax(
+        self: *Builder,
+        inst: instruction.Instruction,
+        extended_opcode: u32,
+        value_type: ValueType,
+        compare_opcode: u16,
+    ) Error!void {
+        const a = try self.source(inst.src0, value_type);
+        const b = try self.source(inst.src1, value_type);
+        const result = try self.glslBinaryValue(extended_opcode, value_type, a, b);
+        try self.destination(inst.dst, .{ .id = result, .value_type = value_type });
+        self.scc = self.id();
+        // GCN scalar MIN/MAX sets SCC when src0 wins the strict comparison.
+        try self.emit(&self.body, compare_opcode, &.{ self.bool_type, self.scc, a, b });
+    }
+
     fn glslBinaryValue(self: *Builder, opcode: u32, value_type: ValueType, a: u32, b: u32) Error!u32 {
         const result = self.id();
         try self.emit(&self.body, 12, &.{ // OpExtInst
@@ -1083,6 +1131,105 @@ const Builder = struct {
                 const high = try self.glslBinaryValue(40, .float32, a, b);
                 const upper_low = try self.glslBinaryValue(37, .float32, high, c);
                 break :blk try self.glslBinaryValue(40, .float32, low, upper_low);
+            },
+            else => unreachable,
+        };
+        try self.destination(inst.dst, .{ .id = result, .value_type = .float32 });
+    }
+
+    fn floatNegateValue(self: *Builder, value: u32) Error!u32 {
+        const result = self.id();
+        try self.emit(&self.body, 127, &.{ self.float_type, result, value }); // OpFNegate
+        return result;
+    }
+
+    fn floatMultiplyValue(self: *Builder, a: u32, b: u32) Error!u32 {
+        const result = self.id();
+        try self.emit(&self.body, 133, &.{ self.float_type, result, a, b }); // OpFMul
+        return result;
+    }
+
+    fn floatCompareValue(self: *Builder, opcode: u16, a: u32, b: u32) Error!u32 {
+        const result = self.id();
+        try self.emit(&self.body, opcode, &.{ self.bool_type, result, a, b });
+        return result;
+    }
+
+    fn logicalAndValue(self: *Builder, a: u32, b: u32) Error!u32 {
+        const result = self.id();
+        try self.emit(&self.body, 167, &.{ self.bool_type, result, a, b }); // OpLogicalAnd
+        return result;
+    }
+
+    fn selectFloatValue(self: *Builder, condition: u32, true_value: u32, false_value: u32) Error!u32 {
+        const result = self.id();
+        try self.emit(&self.body, 169, &.{ // OpSelect
+            self.float_type,
+            result,
+            condition,
+            true_value,
+            false_value,
+        });
+        return result;
+    }
+
+    fn cubeFloat(self: *Builder, inst: instruction.Instruction) Error!void {
+        const x = try self.source(inst.src0, .float32);
+        const y = try self.source(inst.src1, .float32);
+        const z = try self.source(inst.src2, .float32);
+        const glsl = self.ensureGlslStd450();
+
+        const ax = self.id();
+        try self.emit(&self.body, 12, &.{ self.float_type, ax, glsl, 4, x }); // FAbs
+        const ay = self.id();
+        try self.emit(&self.body, 12, &.{ self.float_type, ay, glsl, 4, y });
+        const az = self.id();
+        try self.emit(&self.body, 12, &.{ self.float_type, az, glsl, 4, z });
+
+        const z_ge_x = try self.floatCompareValue(190, az, ax); // OpFOrdGreaterThanEqual
+        const z_ge_y = try self.floatCompareValue(190, az, ay);
+        const z_face = try self.logicalAndValue(z_ge_x, z_ge_y);
+        const y_face = try self.floatCompareValue(190, ay, ax);
+        const zero = try self.constant(.float32, 0);
+        const x_neg = try self.floatCompareValue(184, x, zero); // OpFOrdLessThan
+        const y_neg = try self.floatCompareValue(184, y, zero);
+        const z_neg = try self.floatCompareValue(184, z, zero);
+
+        const result = switch (inst.opcode) {
+            .v_cubeid_f32 => blk: {
+                const one = try self.constant(.float32, @bitCast(@as(f32, 1.0)));
+                const two = try self.constant(.float32, @bitCast(@as(f32, 2.0)));
+                const three = try self.constant(.float32, @bitCast(@as(f32, 3.0)));
+                const four = try self.constant(.float32, @bitCast(@as(f32, 4.0)));
+                const five = try self.constant(.float32, @bitCast(@as(f32, 5.0)));
+                const x_id = try self.selectFloatValue(x_neg, one, zero);
+                const y_id = try self.selectFloatValue(y_neg, three, two);
+                const z_id = try self.selectFloatValue(z_neg, five, four);
+                const xy_id = try self.selectFloatValue(y_face, y_id, x_id);
+                break :blk try self.selectFloatValue(z_face, z_id, xy_id);
+            },
+            .v_cubesc_f32 => blk: {
+                const neg_z = try self.floatNegateValue(z);
+                const neg_x = try self.floatNegateValue(x);
+                const x_sc = try self.selectFloatValue(x_neg, z, neg_z);
+                const z_sc = try self.selectFloatValue(z_neg, neg_x, x);
+                const xy_sc = try self.selectFloatValue(y_face, x, x_sc);
+                break :blk try self.selectFloatValue(z_face, z_sc, xy_sc);
+            },
+            .v_cubetc_f32 => blk: {
+                const neg_z = try self.floatNegateValue(z);
+                const neg_y = try self.floatNegateValue(y);
+                const y_tc = try self.selectFloatValue(y_neg, neg_z, z);
+                const xy_tc = try self.selectFloatValue(y_face, y_tc, neg_y);
+                break :blk try self.selectFloatValue(z_face, neg_y, xy_tc);
+            },
+            .v_cubema_f32 => blk: {
+                const two = try self.constant(.float32, @bitCast(@as(f32, 2.0)));
+                const x_ma = try self.floatMultiplyValue(x, two);
+                const y_ma = try self.floatMultiplyValue(y, two);
+                const z_ma = try self.floatMultiplyValue(z, two);
+                const xy_ma = try self.selectFloatValue(y_face, y_ma, x_ma);
+                break :blk try self.selectFloatValue(z_face, z_ma, xy_ma);
             },
             else => unreachable,
         };
@@ -2047,6 +2194,22 @@ const Builder = struct {
         try self.emit(&self.body, 62, &.{ output, vector }); // OpStore
     }
 
+    fn exportNggLdsRecord(self: *Builder) Error!void {
+        if (self.stage != .vertex or self.ngg_lds_exports.len == 0) return;
+        for (self.ngg_lds_exports) |record| {
+            try self.exportValue(.{
+                .opcode = .exp,
+                .export_target = record.target,
+                .export_enable = record.enable,
+                .src0 = record.sources[0],
+                .src1 = record.sources[1],
+                .src2 = record.sources[2],
+                .src3 = record.sources[3],
+                .src_count = 4,
+            });
+        }
+    }
+
     fn storageBinding(self: *const Builder, resource_sgpr: u32, instruction_pc: u32) ?StorageBufferBinding {
         for (self.storage_bindings) |binding| {
             if (binding.resource_sgpr == resource_sgpr and
@@ -2145,7 +2308,7 @@ const Builder = struct {
     }
 
     fn sampledImageFetch(self: *Builder, inst: instruction.Instruction) Error!void {
-        if ((self.stage != .vertex and self.stage != .fragment) or inst.opcode_id != 0 or
+        if ((self.stage != .vertex and self.stage != .fragment and self.stage != .compute) or inst.opcode_id != 0 or
             inst.image_dimension != .dim_2d or inst.image_address_components != 2 or
             inst.data_mask == 0 or inst.src0.kind != .vgpr or
             inst.src1.kind != .sgpr or inst.src2.kind != .sgpr)
@@ -2209,7 +2372,8 @@ const Builder = struct {
         {
             return Error.UnsupportedOpcode;
         }
-        const binding = self.storageImageBinding(inst.src1.reg) orelse return Error.InvalidStorageBinding;
+        const binding = self.storageImageBinding(inst.src1.reg) orelse
+            return self.sampledImageFetch(inst);
         if ((binding.dimension == .three_d) != (inst.image_dimension == .dim_3d)) {
             return Error.InvalidStorageBinding;
         }
@@ -2374,18 +2538,27 @@ const Builder = struct {
         const level_zero_offset = inst.opcode_id == 0x37 and
             inst.image_sample_flags.level_zero and inst.image_sample_flags.offset and
             flags == ((@as(u16, 1) << 5) | (@as(u16, 1) << 4));
+        const explicit_lod = inst.opcode_id == 0x24 and
+            inst.image_sample_flags.lod and flags == (@as(u16, 1) << 0);
+        const biased_lod = inst.opcode_id == 0x25 and
+            inst.image_sample_flags.bias and flags == (@as(u16, 1) << 1);
         const image_dimension: SampledImageDimension = switch (inst.image_dimension) {
             .dim_2d => .two_d,
             .dim_3d => .three_d,
+            // GFX10 DIM=3 is Cube. The historical enum name predates the
+            // sampled-image implementation and is retained for ABI stability.
+            .dim_2d_array => .cube,
             else => return Error.UnsupportedOpcode,
         };
         const dimension_index = sampledImageDimensionIndex(image_dimension);
-        const coordinate_components: u8 = if (image_dimension == .three_d) 3 else 2;
-        if ((self.stage != .fragment and self.stage != .compute) or
+        const coordinate_components: u8 = if (image_dimension == .two_d) 2 else 3;
+        if ((self.stage != .vertex and self.stage != .fragment and self.stage != .compute) or
             self.sampled_image_arrays[dimension_index] == 0 or
-            (!implicit_lod and !level_zero and !level_zero_offset) or
-            (self.stage == .compute and !level_zero and !level_zero_offset) or
-            inst.image_address_components != coordinate_components + @as(u8, @intFromBool(level_zero_offset)) or
+            (!implicit_lod and !level_zero and !level_zero_offset and !explicit_lod and !biased_lod) or
+            ((self.stage == .vertex or self.stage == .compute) and
+                !level_zero and !level_zero_offset and !explicit_lod) or
+            inst.image_address_components != coordinate_components +
+                @as(u8, @intFromBool(level_zero_offset or explicit_lod or biased_lod)) or
             inst.data_mask == 0)
         {
             return Error.UnsupportedOpcode;
@@ -2403,7 +2576,7 @@ const Builder = struct {
         const raw_y = try self.source(try imageAddressOperand(inst, coordinate_base + 1), .float32);
         const coordinate_x, const coordinate_y = try self.sampleCoordinates(raw_x, raw_y);
         const coordinates = self.id();
-        if (image_dimension == .three_d) {
+        if (image_dimension != .two_d) {
             const coordinate_z = try self.source(try imageAddressOperand(inst, coordinate_base + 2), .float32);
             try self.emit(&self.body, 80, &.{ self.vector3_type, coordinates, coordinate_x, coordinate_y, coordinate_z });
         } else {
@@ -2430,18 +2603,32 @@ const Builder = struct {
                 try self.constant(.float32, @bitCast(@as(f32, 0))),
                 offset,
             }); // OpImageSampleExplicitLod
-        } else if (level_zero) {
+        } else if (level_zero or explicit_lod) {
             // Compute shaders have no implicit derivatives. GFX10's
             // image_sample_lz names mip zero explicitly, which maps directly to
             // an explicit SPIR-V Lod operand and is valid in every shader stage.
+            const lod = if (explicit_lod)
+                try self.source(try imageAddressOperand(inst, coordinate_components), .float32)
+            else
+                try self.constant(.float32, @bitCast(@as(f32, 0)));
             try self.emit(&self.body, 88, &.{
                 self.vector4_type,
                 sampled,
                 sampled_image,
                 coordinates,
                 0x2, // ImageOperands Lod
-                try self.constant(.float32, @bitCast(@as(f32, 0))),
+                lod,
             }); // OpImageSampleExplicitLod
+        } else if (biased_lod) {
+            const bias = try self.source(try imageAddressOperand(inst, coordinate_components), .float32);
+            try self.emit(&self.body, 87, &.{
+                self.vector4_type,
+                sampled,
+                sampled_image,
+                coordinates,
+                0x1, // ImageOperands Bias
+                bias,
+            }); // OpImageSampleImplicitLod
         } else {
             try self.emit(&self.body, 87, &.{ self.vector4_type, sampled, sampled_image, coordinates }); // OpImageSampleImplicitLod
         }
@@ -3685,7 +3872,8 @@ const Builder = struct {
             .s_nop, .s_waitcnt, .s_inst_prefetch, .s_sendmsg, .s_sleep, .s_ttrace_data, .v_nop, .s_endpgm, .s_code_end, .s_wqm_b64 => {},
             .s_barrier => try self.controlBarrier(),
             // Branches are handled by structured CF or skipped in the linear fallback.
-            .s_branch, .s_cbranch_scc0, .s_cbranch_scc1, .s_cbranch_vccz, .s_cbranch_vccnz, .s_cbranch_execz, .s_cbranch_execnz, .s_setpc_b64 => {},
+            .s_branch, .s_cbranch_scc0, .s_cbranch_scc1, .s_cbranch_vccz, .s_cbranch_vccnz, .s_cbranch_execz, .s_cbranch_execnz => {},
+            .s_setpc_b64 => try self.exportNggLdsRecord(),
             .s_mov_b32, .s_movk_i32, .v_mov_b32 => try self.unary(inst, 83, .bits32), // OpCopyObject
             .v_readfirstlane_b32 => try self.readFirstLane(inst),
             .s_mov_b64 => try self.mov64(inst),
@@ -3749,8 +3937,13 @@ const Builder = struct {
             .v_mul_u32_u24 => try self.multiply24(inst, false),
             .v_mad_f32, .v_madmk_f32, .v_madak_f32 => try self.madFloat(inst),
             .v_fma_f32 => try self.fmaFloat(inst),
+            .v_cubeid_f32, .v_cubesc_f32, .v_cubetc_f32, .v_cubema_f32 => try self.cubeFloat(inst),
             .v_mac_f32 => try self.macFloat(inst),
             .v_min_f32 => try self.glslBinary(inst, 37, .float32), // FMin
+            .s_min_u32 => try self.scalarMinMax(inst, 38, .bits32, 176), // UMin, OpULessThan
+            .s_min_i32 => try self.scalarMinMax(inst, 39, .sint32, 177), // SMin, OpSLessThan
+            .s_max_u32 => try self.scalarMinMax(inst, 41, .bits32, 172), // UMax, OpUGreaterThan
+            .s_max_i32 => try self.scalarMinMax(inst, 42, .sint32, 173), // SMax, OpSGreaterThan
             .v_min_u32 => try self.glslBinary(inst, 38, .bits32), // UMin
             .v_min_i32 => try self.glslBinary(inst, 39, .sint32), // SMin
             .v_max_f32 => try self.glslBinary(inst, 40, .float32), // FMax
@@ -3890,11 +4083,11 @@ const Builder = struct {
             .buffer_atomic_and => try self.bufferAtomic(inst, 240), // OpAtomicAnd
             .buffer_atomic_or => try self.bufferAtomic(inst, 241), // OpAtomicOr
             .buffer_atomic_xor => try self.bufferAtomic(inst, 242), // OpAtomicXor
-            .ds_write_b32 => try self.dsWriteWords(inst, 1),
-            .ds_write2_b32 => try self.dsWritePair(inst),
-            .ds_write_b64 => try self.dsWriteWords(inst, 2),
-            .ds_write_b96 => try self.dsWriteWords(inst, 3),
-            .ds_write_b128 => try self.dsWriteWords(inst, 4),
+            .ds_write_b32 => if (self.stage != .vertex or self.ngg_lds_exports.len == 0) try self.dsWriteWords(inst, 1),
+            .ds_write2_b32 => if (self.stage != .vertex or self.ngg_lds_exports.len == 0) try self.dsWritePair(inst),
+            .ds_write_b64 => if (self.stage != .vertex or self.ngg_lds_exports.len == 0) try self.dsWriteWords(inst, 2),
+            .ds_write_b96 => if (self.stage != .vertex or self.ngg_lds_exports.len == 0) try self.dsWriteWords(inst, 3),
+            .ds_write_b128 => if (self.stage != .vertex or self.ngg_lds_exports.len == 0) try self.dsWriteWords(inst, 4),
             .ds_read_b32 => try self.dsReadWords(inst, 1),
             .ds_read2_b32 => try self.dsReadPair(inst),
             .ds_read_b64 => try self.dsReadWords(inst, 2),
@@ -4301,6 +4494,9 @@ fn translateStructured(builder: *Builder, program: *const instruction.Program, g
 
         if (last.opcode.isProgramEnd()) {
             try builder.emit(&builder.body, 253, &.{}); // OpReturn
+        } else if (last.opcode == .s_setpc_b64) {
+            try builder.exportNggLdsRecord();
+            try builder.emit(&builder.body, 253, &.{}); // hardware NGG continuation becomes the stage return
         } else if (last.opcode == .s_branch) {
             const target = graph.blockForPc(last.branch_target) orelse return Error.UnsupportedControlFlow;
             try builder.emit(&builder.body, 249, &.{structuredEdgeLabel(
@@ -4410,6 +4606,11 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
 /// semantics are not implemented; it never emits a placeholder guest shader.
 pub fn translate(allocator: std.mem.Allocator, program: *const instruction.Program, options: Options) Error!Module {
     var effective = options;
+    for (effective.ngg_lds_exports) |ngg_export| {
+        if (effective.stage == .vertex and ngg_export.target >= 0x20 and ngg_export.target < 0x40) {
+            effective.parameter_mask |= @as(u32, 1) << @intCast(ngg_export.target - 0x20);
+        }
+    }
     for (program.instructions.items) |candidate| {
         if (candidate.dst.kind == .exec_lo) effective.uses_execution_mask = true;
         switch (effective.stage) {
@@ -4579,6 +4780,35 @@ test "VOP3 ldexp lowers the Tetris tone-mapping instruction" {
     try std.testing.expectEqual(@as(?u32, 53), firstInstructionOperand(module.words, 12, 3));
 }
 
+test "VOP3 cube coordinate operations lower the Tetris environment shader" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    inline for ([_]isa.Opcode{
+        .v_cubeid_f32,
+        .v_cubesc_f32,
+        .v_cubetc_f32,
+        .v_cubema_f32,
+    }, 0..) |opcode, index| {
+        try program.instructions.append(std.testing.allocator, .{
+            .opcode = opcode,
+            .dst = .{ .kind = .vgpr, .reg = @intCast(index + 3) },
+            .src0 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, 1.0)) },
+            .src1 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, 2.0)) },
+            .src2 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, 3.0)) },
+            .src_count = 3,
+        });
+    }
+    try program.instructions.append(std.testing.allocator, .{ .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 190)); // OpFOrdGreaterThanEqual
+    try std.testing.expect(containsOpcode(module.words, 184)); // OpFOrdLessThan
+    try std.testing.expect(containsOpcode(module.words, 167)); // OpLogicalAnd
+    try std.testing.expect(containsOpcode(module.words, 169)); // OpSelect
+    try std.testing.expect(containsOpcode(module.words, 133)); // OpFMul
+}
+
 test "literal MAD conversions and min-max lower explicitly" {
     var program = instruction.Program{ .code = &.{}, .instructions = .empty };
     defer program.deinit(std.testing.allocator);
@@ -4610,6 +4840,29 @@ test "literal MAD conversions and min-max lower explicitly" {
     try std.testing.expect(containsOpcode(module.words, 129)); // OpFAdd
     try std.testing.expect(containsOpcode(module.words, 109)); // OpConvertFToU
     try std.testing.expect(containsOpcode(module.words, 12)); // UMin via OpExtInst
+}
+
+test "scalar integer min-max lower and update SCC" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    for ([_]isa.Opcode{ .s_min_u32, .s_max_u32, .s_min_i32, .s_max_i32 }, 0..) |opcode, index| {
+        try program.instructions.append(std.testing.allocator, .{
+            .opcode = opcode,
+            .dst = .{ .kind = .sgpr, .reg = @intCast(index) },
+            .src0 = .{ .kind = .integer_inline_constant, .value = 7, .signed_val = 7 },
+            .src1 = .{ .kind = .integer_inline_constant, .value = 11, .signed_val = 11 },
+            .src_count = 2,
+        });
+    }
+    try program.instructions.append(std.testing.allocator, .{ .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .compute });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 4), countOpcode(module.words, 12)); // GLSL min/max
+    try std.testing.expect(containsOpcode(module.words, 176)); // OpULessThan
+    try std.testing.expect(containsOpcode(module.words, 172)); // OpUGreaterThan
+    try std.testing.expect(containsOpcode(module.words, 177)); // OpSLessThan
+    try std.testing.expect(containsOpcode(module.words, 173)); // OpSGreaterThan
 }
 
 test "signed high multiply and floor conversion lower explicitly" {
@@ -5377,9 +5630,65 @@ test "fragment image sample supports a three-dimensional descriptor" {
     });
     defer module.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(u32, 3), firstInstructionOperand(module.words, 25, 2)); // Dim3D
+    try std.testing.expectEqual(@as(u32, 2), firstInstructionOperand(module.words, 25, 2)); // Dim3D
     try std.testing.expect(containsOpcode(module.words, 87)); // OpImageSampleImplicitLod
     try std.testing.expectEqual(@as(usize, 4), countOpcode(module.words, 81)); // RGBA extracts
+}
+
+test "fragment image sample supports a cube descriptor" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xf080_0f18, // image_sample dim:cube dmask:xyzw v2, v[0:2], s[0:7], s[8:11]
+        0x0040_0200,
+        0xf800_080f, // exp mrt0, v2, v3, v4, v5 done
+        0x0504_0302,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    const images = [_]SampledImageBinding{.{
+        .resource_sgpr = 0,
+        .sampler_sgpr = 8,
+        .descriptor_index = 0,
+        .dimension = .cube,
+    }};
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .fragment,
+        .sampled_images = &images,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 3), firstInstructionOperand(module.words, 25, 2)); // DimCube
+    try std.testing.expect(containsOpcode(module.words, 87)); // OpImageSampleImplicitLod
+    try std.testing.expectEqual(@as(usize, 4), countOpcode(module.words, 81));
+}
+
+test "fragment cube image sample accepts an explicit LOD address" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xf090_071a, // image_sample_l dim:cube dmask:xyz v0, v[32:35], T#s8, S#s60
+        0x01e2_0020,
+        0x0023_2221,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 4), program.instructions.items[0].image_address_components);
+    const images = [_]SampledImageBinding{.{
+        .resource_sgpr = 8,
+        .sampler_sgpr = 60,
+        .descriptor_index = 0,
+        .dimension = .cube,
+    }};
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .fragment,
+        .sampled_images = &images,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 3), firstInstructionOperand(module.words, 25, 2)); // DimCube
+    try std.testing.expect(containsOpcode(module.words, 88)); // OpImageSampleExplicitLod
+    try std.testing.expect(!containsOpcode(module.words, 87));
 }
 
 test "fragment gather4 level zero writes four texels and preserves a packed offset" {
@@ -5485,6 +5794,33 @@ test "compute image sample level zero uses explicit lod" {
     try std.testing.expectEqual(@as(usize, 1), countOpcode(module.words, 81)); // dmask:x extract
 }
 
+test "vertex image sample level zero uses explicit lod" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xf09c_0f08, // image_sample_lz dim:2d dmask:xyzw v2, v[0:1], s[0:7], s[8:11]
+        0x0040_0200,
+        0xf800_080f,
+        0x0504_0302,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    const images = [_]SampledImageBinding{.{
+        .resource_sgpr = 0,
+        .sampler_sgpr = 8,
+        .descriptor_index = 0,
+    }};
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .vertex,
+        .sampled_images = &images,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expect(containsOpcode(module.words, 88)); // OpImageSampleExplicitLod
+    try std.testing.expect(!containsOpcode(module.words, 87));
+    try std.testing.expectEqual(@as(usize, 4), countOpcode(module.words, 81));
+}
+
 test "vertex image load fetches an integer texel through a sampled descriptor" {
     const decoder = @import("decoder.zig");
     const code = [_]u32{
@@ -5515,6 +5851,32 @@ test "vertex image load fetches an integer texel through a sampled descriptor" {
     try std.testing.expect(containsOpcode(module.words, 100)); // OpImage
     try std.testing.expect(containsOpcode(module.words, 95)); // OpImageFetch
     try std.testing.expectEqual(@as(usize, 1), countOpcode(module.words, 81));
+}
+
+test "compute image load can fetch a compressed read-only sampled descriptor" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xf000_0f08, // image_load dim:2d dmask:xyzw v0, v[0:1], s[0:7]
+        0x0000_0000,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    const images = [_]SampledImageBinding{.{
+        .resource_sgpr = 0,
+        .sampler_sgpr = 0,
+        .descriptor_index = 0,
+        .instruction_pc = 0,
+    }};
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .sampled_images = &images,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expect(containsOpcode(module.words, 100)); // OpImage
+    try std.testing.expect(containsOpcode(module.words, 95)); // OpImageFetch
+    try std.testing.expect(!containsOpcode(module.words, 98)); // no storage OpImageRead
 }
 
 test "compute image load and NSA store use independently typed storage image bindings" {
@@ -5566,6 +5928,30 @@ test "compute image store accepts a one-slice 2D array opcode" {
     try std.testing.expect(containsOpcode(module.words, 99)); // OpImageWrite
 }
 
+test "compute image store declares an R16 UNORM storage image" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xf020_0f28, // image_store dim:2d_array dmask:xyzw v0, v[4:6], s[16:23]
+        0x0004_0004,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    const images = [_]StorageImageBinding{.{
+        .resource_sgpr = 16,
+        .descriptor_index = 0,
+        .format = .r16_unorm,
+    }};
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .storage_images = &images,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 14), firstInstructionOperand(module.words, 25, 7)); // ImageFormatR16
+    try std.testing.expect(containsOpcode(module.words, 99)); // OpImageWrite
+}
+
 test "compute image load and store support three-dimensional storage images" {
     const decoder = @import("decoder.zig");
     const code = [_]u32{
@@ -5589,7 +5975,7 @@ test "compute image load and store support three-dimensional storage images" {
     });
     defer module.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(u32, 3), firstInstructionOperand(module.words, 25, 2)); // Dim3D
+    try std.testing.expectEqual(@as(u32, 2), firstInstructionOperand(module.words, 25, 2)); // Dim3D
     try std.testing.expect(containsOpcode(module.words, 98)); // OpImageRead
     try std.testing.expect(containsOpcode(module.words, 99)); // OpImageWrite
 }

@@ -16,10 +16,9 @@
 //! that nothing can walk. A no-operation says what is true: a command occupied
 //! this much room and did nothing, and everything after it still parses.
 //!
-//! The patch entry points are accepted and change nothing. They exist to edit a
-//! field of a command already written — an address that was not known when the
-//! command was built. Editing a no-operation is harmless, and refusing would
-//! stop a title that is doing something perfectly ordinary.
+//! Most placeholder patch entry points are accepted and change nothing. Patch
+//! operations for commands that are executed by the emulator, however, must
+//! preserve their real fields; release-memory fences are one such command.
 
 const std = @import("std");
 const abi = @import("../abi.zig");
@@ -29,6 +28,9 @@ const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const event_queue = @import("kernel_event_queue.zig");
 const kernel_memory = @import("kernel_memory.zig");
+
+var eop_patch_reports: u32 = 0;
+var wait_patch_reports: u32 = 0;
 
 /// The cursor a title keeps over its command buffer.
 ///
@@ -105,6 +107,160 @@ pub fn writeCommand(
 /// there is no field whose value would change anything, and a title doing this
 /// is doing something ordinary that there is no reason to stop.
 pub fn patchCommand(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
+fn releasePacket(command_address: u64) ?*[8]u32 {
+    if (command_address == 0 or
+        !kernel_memory.isGuestRangeAccessible(command_address, 8 * @sizeOf(u32))) return null;
+    const words: *[8]u32 = @ptrFromInt(command_address);
+    const header = words[0];
+    if ((header >> 30) != 3) return null;
+    const opcode: u8 = @truncate(header >> 8);
+    if (opcode == gpu.pm4.release_mem) return words;
+    if (opcode != gpu.pm4.nop or
+        @as(u6, @truncate(header >> 2)) != gpu.pm4.custom.release_mem) return null;
+    return words;
+}
+
+const WaitPacket = struct {
+    words: [*]u32,
+    is_64_bit: bool,
+};
+
+fn waitPacket(command_address: u64) ?WaitPacket {
+    if (command_address == 0 or
+        !kernel_memory.isGuestRangeAccessible(command_address, 3 * @sizeOf(u32))) return null;
+    const words: [*]u32 = @ptrFromInt(command_address);
+    const header = words[0];
+    if ((header >> 30) != 3 or @as(u8, @truncate(header >> 8)) != gpu.pm4.nop) return null;
+
+    const code: u6 = @truncate(header >> 2);
+    const is_64_bit = switch (code) {
+        gpu.pm4.custom.wait_mem_32 => false,
+        gpu.pm4.custom.wait_mem_64 => true,
+        else => return null,
+    };
+    const word_count: usize = if (is_64_bit) 9 else 7;
+    if (!kernel_memory.isGuestRangeAccessible(command_address, word_count * @sizeOf(u32))) return null;
+    return .{ .words = words, .is_64_bit = is_64_bit };
+}
+
+/// Moves a custom 32/64-bit WAIT_REG_MEM packet to a new watched label.
+pub fn patchWaitRegMemAddress(command_address: u64, address: u64) callconv(abi.guest) i32 {
+    const packet = waitPacket(command_address) orelse return errno.KernelError.einval.raw();
+    const alignment_mask: u32 = if (packet.is_64_bit) 0xffff_fff8 else 0xffff_fffc;
+    packet.words[1] = @as(u32, @truncate(address)) & alignment_mask;
+    packet.words[2] = @as(u32, @truncate(address >> 32)) & 0x0003_ffff;
+    if (wait_patch_reports < 16) {
+        std.debug.print(
+            "[agc wait patch] cmd=0x{x} width={d} address=0x{x}\n",
+            .{ command_address, if (packet.is_64_bit) @as(u32, 64) else 32, address },
+        );
+        wait_patch_reports += 1;
+    }
+    return errno.ok;
+}
+
+/// Replaces the value a custom WAIT_REG_MEM packet compares against.
+pub fn patchWaitRegMemReference(command_address: u64, reference: u64) callconv(abi.guest) i32 {
+    const packet = waitPacket(command_address) orelse return errno.KernelError.einval.raw();
+    if (packet.is_64_bit) {
+        packet.words[5] = @truncate(reference);
+        packet.words[6] = @truncate(reference >> 32);
+    } else {
+        packet.words[4] = @truncate(reference);
+    }
+    return errno.ok;
+}
+
+/// Replaces only the three comparison-function bits, retaining wait operation
+/// and cache-policy fields packed alongside them.
+pub fn patchWaitRegMemCompareFunction(command_address: u64, compare_function: u32) callconv(abi.guest) i32 {
+    if (compare_function > 7) return errno.KernelError.einval.raw();
+    const packet = waitPacket(command_address) orelse return errno.KernelError.einval.raw();
+    const control_index: usize = if (packet.is_64_bit) 7 else 5;
+    packet.words[control_index] = (packet.words[control_index] & ~@as(u32, 0x7)) | compare_function;
+    return errno.ok;
+}
+
+fn eventWriteEopPacket(command_address: u64) ?*[6]u32 {
+    if (command_address == 0 or
+        !kernel_memory.isGuestRangeAccessible(command_address, 6 * @sizeOf(u32))) return null;
+    const words: *[6]u32 = @ptrFromInt(command_address);
+    const header = words[0];
+    if ((header >> 30) != 3 or @as(u8, @truncate(header >> 8)) != gpu.pm4.event_write_eop) return null;
+    return words;
+}
+
+/// Moves either a Gen5 RELEASE_MEM or legacy EVENT_WRITE_EOP completion label.
+pub fn patchQueueEndOfPipeAddress(command_address: u64, address: u64) callconv(abi.guest) i32 {
+    if (releasePacket(command_address)) |words| {
+        words[3] = @truncate(address);
+        words[4] = @truncate(address >> 32);
+    } else if (eventWriteEopPacket(command_address)) |words| {
+        words[2] = @truncate(address);
+        words[3] = (words[3] & 0xffff_0000) | (@as(u32, @truncate(address >> 32)) & 0xffff);
+    } else {
+        return errno.KernelError.einval.raw();
+    }
+    if (eop_patch_reports < 16) {
+        std.debug.print("[agc eop patch] cmd=0x{x} address=0x{x}\n", .{ command_address, address });
+        eop_patch_reports += 1;
+    }
+    return errno.ok;
+}
+
+/// Patches the coherency control in the first RELEASE_MEM control word.
+pub fn patchQueueEndOfPipeGcr(command_address: u64, gcr_control: u32) callconv(abi.guest) i32 {
+    const words = releasePacket(command_address) orelse return errno.KernelError.einval.raw();
+    var packet_gcr = gcr_control & 0x0fff;
+    // GL2 writeback implies the companion invalidate bit on Gen5.
+    if (packet_gcr & 0x300 == 0x100) packet_gcr |= 0x200;
+    words[1] = (words[1] & ~@as(u32, 0x00ff_f000)) | (packet_gcr << 12);
+    return errno.ok;
+}
+
+/// Patches a Core-ring fence payload. The AGC patch context is a monotonic
+/// segment generation; the packet stores that generation in the payload's high
+/// byte while retaining the caller-provided low 24 bits.
+pub fn patchQueueEndOfPipeData(
+    command_address: u64,
+    context_id: u32,
+    data_selection: u32,
+    data: u64,
+) callconv(abi.guest) i32 {
+    if (releasePacket(command_address)) |words| {
+        var packet_data = data;
+        if (@as(u8, @truncate(words[0] >> 8)) == gpu.pm4.nop and
+            context_id > 1 and data_selection == 1)
+        {
+            packet_data = (@as(u64, context_id - 2) << 24) | (data & 0x00ff_ffff);
+        }
+        if (eop_patch_reports < 16) {
+            std.debug.print(
+                "[agc eop patch] cmd=0x{x} context={d} selection={d} data=0x{x}->0x{x}\n",
+                .{ command_address, context_id, data_selection, data, packet_data },
+            );
+            eop_patch_reports += 1;
+        }
+        words[5] = @truncate(packet_data);
+        words[6] = @truncate(packet_data >> 32);
+    } else if (eventWriteEopPacket(command_address)) |words| {
+        words[4] = @truncate(data);
+        words[5] = @truncate(data >> 32);
+    } else {
+        return errno.KernelError.einval.raw();
+    }
+    return errno.ok;
+}
+
+/// Selects the RELEASE_MEM destination type without disturbing its interrupt
+/// selector or payload mode.
+pub fn patchQueueEndOfPipeType(command_address: u64, destination: u32) callconv(abi.guest) i32 {
+    if (destination > 3) return errno.KernelError.einval.raw();
+    const words = releasePacket(command_address) orelse return errno.KernelError.einval.raw();
+    words[2] = (words[2] & ~@as(u32, 0x0003_0000)) | (destination << 16);
     return errno.ok;
 }
 
@@ -340,6 +496,59 @@ test "the size a title is told matches what a write consumes" {
     _ = writeCommand(&buffer, 0, 0, 0, 0, 0);
     const consumed = (@intFromPtr(buffer.cursor_up.?) - before) / @sizeOf(u32);
     try testing.expectEqual(@as(usize, announced), consumed);
+}
+
+test "AGC wait patches update address reference and comparison in place" {
+    const wait32_header = (@as(u32, 3) << 30) |
+        (@as(u32, 5) << 16) |
+        (@as(u32, gpu.pm4.nop) << 8) |
+        (@as(u32, gpu.pm4.custom.wait_mem_32) << 2);
+    var wait32 = [_]u32{ wait32_header, 0, 0, 0xffff_ffff, 1, 0x0200_0113, 4 };
+    const address32: u64 = 0x0002_1234_5678_9abf;
+    try testing.expectEqual(errno.ok, patchWaitRegMemAddress(@intFromPtr(&wait32), address32));
+    try testing.expectEqual(errno.ok, patchWaitRegMemReference(@intFromPtr(&wait32), 0xfedc_ba98));
+    try testing.expectEqual(errno.ok, patchWaitRegMemCompareFunction(@intFromPtr(&wait32), 6));
+    try testing.expectEqual(@as(u32, 0x5678_9abc), wait32[1]);
+    try testing.expectEqual(@as(u32, 0x0002_1234), wait32[2]);
+    try testing.expectEqual(@as(u32, 0xfedc_ba98), wait32[4]);
+    try testing.expectEqual(@as(u32, 0x0200_0116), wait32[5]);
+
+    const wait64_header = (@as(u32, 3) << 30) |
+        (@as(u32, 7) << 16) |
+        (@as(u32, gpu.pm4.nop) << 8) |
+        (@as(u32, gpu.pm4.custom.wait_mem_64) << 2);
+    var wait64 = [_]u32{ wait64_header, 0, 0, 0xffff_ffff, 0xffff_ffff, 0, 0, 0x13, 4 };
+    const reference64: u64 = 0x0123_4567_89ab_cdef;
+    try testing.expectEqual(errno.ok, patchWaitRegMemReference(@intFromPtr(&wait64), reference64));
+    try testing.expectEqual(@as(u32, 0x89ab_cdef), wait64[5]);
+    try testing.expectEqual(@as(u32, 0x0123_4567), wait64[6]);
+}
+
+test "AGC EOP address and data patches support release and legacy packets" {
+    const release_header = (@as(u32, 3) << 30) |
+        (@as(u32, 6) << 16) |
+        (@as(u32, gpu.pm4.release_mem) << 8);
+    var release = [_]u32{ release_header, 0, 0, 0, 0, 0, 0, 0 };
+    const release_address: u64 = 0x0001_2468_ace0_1000;
+    const release_data: u64 = 0x1234_5678_9abc_def0;
+    try testing.expectEqual(errno.ok, patchQueueEndOfPipeAddress(@intFromPtr(&release), release_address));
+    try testing.expectEqual(errno.ok, patchQueueEndOfPipeData(@intFromPtr(&release), 0, 1, release_data));
+    try testing.expectEqual(@as(u32, 0xace0_1000), release[3]);
+    try testing.expectEqual(@as(u32, 0x0001_2468), release[4]);
+    try testing.expectEqual(@as(u32, 0x9abc_def0), release[5]);
+    try testing.expectEqual(@as(u32, 0x1234_5678), release[6]);
+
+    const event_header = (@as(u32, 3) << 30) |
+        (@as(u32, 4) << 16) |
+        (@as(u32, gpu.pm4.event_write_eop) << 8);
+    var event = [_]u32{ event_header, 0, 0, 0xabcd_0000, 0, 0 };
+    const event_address: u64 = 0x0000_9876_5432_1000;
+    try testing.expectEqual(errno.ok, patchQueueEndOfPipeAddress(@intFromPtr(&event), event_address));
+    try testing.expectEqual(errno.ok, patchQueueEndOfPipeData(@intFromPtr(&event), 0, 1, release_data));
+    try testing.expectEqual(@as(u32, 0x5432_1000), event[2]);
+    try testing.expectEqual(@as(u32, 0xabcd_9876), event[3]);
+    try testing.expectEqual(@as(u32, 0x9abc_def0), event[4]);
+    try testing.expectEqual(@as(u32, 0x1234_5678), event[5]);
 }
 
 test "Rita's Rewind AGC 1.1 imports resolve" {

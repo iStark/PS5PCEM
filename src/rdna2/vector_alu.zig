@@ -406,6 +406,10 @@ pub fn decodeVopc(pc: u32, code: []const u32, word_index: u32) Error!Instruction
 fn nativeVop3Opcode(id: u32) isa.Opcode {
     return switch (id) {
         0x141 => .v_mad_f32,
+        0x144 => .v_cubeid_f32,
+        0x145 => .v_cubesc_f32,
+        0x146 => .v_cubetc_f32,
+        0x147 => .v_cubema_f32,
         0x148 => .v_bfe_u32,
         0x149 => .v_bfe_i32,
         0x14a => .v_bfi_b32,
@@ -575,6 +579,28 @@ test "native VOP3 shift-add opcode uses three sources" {
     try std.testing.expectEqual(@as(i32, 6), inst.src1.signed_val);
     try std.testing.expectEqual(isa.OperandKind.vgpr, inst.src2.kind);
     try std.testing.expectEqual(@as(u32, 0), inst.src2.reg);
+}
+
+test "native VOP3 cube coordinate opcodes use three sources" {
+    inline for ([_]isa.Opcode{
+        .v_cubeid_f32,
+        .v_cubesc_f32,
+        .v_cubetc_f32,
+        .v_cubema_f32,
+    }, 0..) |expected, index| {
+        const id: u32 = 0x144 + index;
+        const code = [_]u32{
+            0xd000_0007 | (id << 16),
+            256 | (@as(u32, 257) << 9) | (@as(u32, 258) << 18),
+        };
+        const inst = try decodeVop3(@intCast(index * 8), &code, 0);
+        try std.testing.expectEqual(expected, inst.opcode);
+        try std.testing.expectEqual(@as(u8, 3), inst.src_count);
+        try std.testing.expectEqual(@as(u32, 0), inst.src0.reg);
+        try std.testing.expectEqual(@as(u32, 1), inst.src1.reg);
+        try std.testing.expectEqual(@as(u32, 2), inst.src2.reg);
+        try std.testing.expectEqual(@as(u32, 7), inst.dst.reg);
+    }
 }
 
 test "native VOP3 unsigned SAD opcode uses three sources" {

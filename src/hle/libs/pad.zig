@@ -20,10 +20,10 @@ const error_device_not_connected: i32 = @bitCast(@as(u32, 0x8092_0007));
 const primary_handle: i32 = 1;
 /// SCE_PAD_BUTTON_CROSS — used for auto-confirm during headless bring-up.
 const button_cross: u32 = 0x4000;
-/// SCE_PAD_BUTTON_OPTIONS — often used for pause/menu / "press start".
-const button_options: u32 = 0x0008;
-/// Press Cross (+ Options pulse) so splash/attract loops that wait for confirm
-/// can advance without a physical controller.
+/// Press Cross so splash/attract loops that wait for confirmation can advance
+/// without a physical controller. Options is deliberately not synthesized:
+/// once a title reaches interactive rendering it commonly means pause or opens
+/// a settings page, and a single pulse can leave an unattended run parked.
 const auto_cross_period_us: u64 = 1_000_000;
 const auto_cross_hold_us: u64 = 250_000;
 
@@ -145,8 +145,6 @@ fn fillPadData(output: *PadData) void {
         const phase = now_us % auto_cross_period_us;
         if (phase < auto_cross_hold_us) {
             output.buttons |= button_cross;
-            // Brief Options with every other pulse (title/menu / "press start").
-            if ((now_us / auto_cross_period_us) % 2 == 0) output.buttons |= button_options;
         }
     }
 }

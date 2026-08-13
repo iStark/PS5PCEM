@@ -98,11 +98,13 @@ pub fn mode() Mode {
 
 pub fn read() State {
     const selected = mode();
-    if (selected == .automatic) return .{};
-
     var state = State{ .connected = true };
-    if (selected == .controller or selected == .hybrid) mergeController(&state);
-    if (selected == .keyboard or selected == .hybrid) mergeKeyboard(&state, mapping());
+    // Direct game-run sessions keep the unattended Cross pulse in libScePad,
+    // but must still accept an explicit key or a physical controller. Some
+    // title prompts stop their render loop while waiting, so a short pulse
+    // that happened just before the prompt cannot be recovered otherwise.
+    if (selected == .automatic or selected == .controller or selected == .hybrid) mergeController(&state);
+    if (selected == .automatic or selected == .keyboard or selected == .hybrid) mergeKeyboard(&state, mapping());
     return state;
 }
 

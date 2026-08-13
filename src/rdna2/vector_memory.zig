@@ -345,6 +345,8 @@ pub fn decodeMimg(pc: u32, code: []const u32, word_index: u32) Error!Instruction
     inst.image_address_components = coordinate_components;
     if (op == .image_sample) {
         inst.image_address_components += @intFromBool(inst.image_sample_flags.offset);
+        inst.image_address_components += @intFromBool(inst.image_sample_flags.lod);
+        inst.image_address_components += @intFromBool(inst.image_sample_flags.bias);
     } else if (op == .image_gather4) {
         inst.image_address_components += @intFromBool(inst.image_sample_flags.offset);
         inst.image_address_components += @intFromBool(inst.image_sample_flags.compare);
@@ -434,6 +436,20 @@ test "MIMG sample level-zero offset keeps packed offset before NSA coordinates" 
     try std.testing.expectEqual(@as(u8, 1), inst.data_words);
     try std.testing.expectEqual(@as(u8, 14), inst.image_nsa_address[0]);
     try std.testing.expectEqual(@as(u8, 15), inst.image_nsa_address[1]);
+}
+
+test "MIMG explicit LOD sample counts its LOD address after cube coordinates" {
+    const code = [_]u32{ 0xf090_071a, 0x01e2_0020, 0x0023_2221 };
+    const inst = try decodeMimg(0x41c, &code, 0);
+    try std.testing.expectEqual(isa.Opcode.image_sample, inst.opcode);
+    try std.testing.expectEqual(@as(u32, 0x24), inst.opcode_id);
+    try std.testing.expect(inst.image_sample_flags.lod);
+    try std.testing.expectEqual(isa.ImageDimension.dim_2d_array, inst.image_dimension);
+    try std.testing.expectEqual(@as(u8, 4), inst.image_address_components);
+    try std.testing.expectEqual(@as(u32, 32), inst.src0.reg);
+    try std.testing.expectEqual(@as(u32, 8), inst.src1.reg);
+    try std.testing.expectEqual(@as(u32, 60), inst.src2.reg);
+    try std.testing.expectEqual(@as(u8, 35), inst.image_nsa_address[2]);
 }
 
 test "DS offsets use byte units required by paired operations" {

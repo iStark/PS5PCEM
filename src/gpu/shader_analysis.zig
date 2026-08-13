@@ -15,6 +15,7 @@ pub const SpirvStorageImageBinding = rdna2.spirv.StorageImageBinding;
 pub const SpirvStorageImageFormat = rdna2.spirv.StorageImageFormat;
 pub const SpirvScalarRegister = rdna2.spirv.ScalarRegister;
 pub const SpirvComputeInputs = rdna2.spirv.ComputeInputs;
+pub const SpirvNggLdsExport = rdna2.spirv.NggLdsExport;
 pub const Operand = rdna2.Operand;
 pub const OperandKind = rdna2.OperandKind;
 pub const Instruction = rdna2.Instruction;
@@ -113,7 +114,16 @@ pub const Analysis = struct {
     }
 };
 
-fn readNextWord(reader: shaders.MemoryReader, address: u64, code: *std.ArrayList(u32), allocator: std.mem.Allocator) Error!void {
+fn readNextWord(
+    reader: shaders.MemoryReader,
+    address: u64,
+    code: *std.ArrayList(u32),
+    allocator: std.mem.Allocator,
+    word_limit: ?usize,
+) Error!void {
+    if (word_limit) |limit| {
+        if (code.items.len >= limit) return Error.MissingEndProgram;
+    }
     const byte_offset = std.math.mul(u64, code.items.len, 4) catch return Error.AddressOverflow;
     const word_address = std.math.add(u64, address, byte_offset) catch return Error.AddressOverflow;
     try code.append(allocator, try reader.readU32(word_address));
@@ -128,6 +138,36 @@ pub fn decode(
     address: u64,
     instruction_limit: usize,
 ) Error!Analysis {
+    return decodeImpl(allocator, reader, address, instruction_limit, null);
+}
+
+/// Decodes a program without ever reading beyond the AGC shader allocation.
+/// `shader_size_bytes` includes the instruction stream and any trailing AGC
+/// metadata; normal end markers stop before that metadata is interpreted.
+pub fn decodeBounded(
+    allocator: std.mem.Allocator,
+    reader: shaders.MemoryReader,
+    address: u64,
+    instruction_limit: usize,
+    shader_size_bytes: usize,
+) Error!Analysis {
+    if (shader_size_bytes < @sizeOf(u32)) return Error.EmptyProgram;
+    return decodeImpl(
+        allocator,
+        reader,
+        address,
+        instruction_limit,
+        shader_size_bytes / @sizeOf(u32),
+    );
+}
+
+fn decodeImpl(
+    allocator: std.mem.Allocator,
+    reader: shaders.MemoryReader,
+    address: u64,
+    instruction_limit: usize,
+    word_limit: ?usize,
+) Error!Analysis {
     var code: std.ArrayList(u32) = .empty;
     errdefer code.deinit(allocator);
     var instructions: std.ArrayList(rdna2.Instruction) = .empty;
@@ -137,12 +177,12 @@ pub fn decode(
 
     var word_index: u32 = 0;
     while (instructions.items.len < instruction_limit) {
-        while (code.items.len <= word_index) try readNextWord(reader, address, &code, allocator);
+        while (code.items.len <= word_index) try readNextWord(reader, address, &code, allocator, word_limit);
         const pc = word_index * 4;
         const inst = retry: while (true) {
             break :retry rdna2.decodeInstruction(pc, code.items, word_index) catch |err| switch (err) {
                 error.TruncatedInstruction, error.MissingLiteralConstant => {
-                    try readNextWord(reader, address, &code, allocator);
+                    try readNextWord(reader, address, &code, allocator, word_limit);
                     continue;
                 },
                 else => {
@@ -158,7 +198,20 @@ pub fn decode(
         word_index += inst.word_count;
         if (inst.opcode.isBranch()) try branch_targets.put(allocator, inst.branch_target, {});
         if (inst.opcode.isProgramEnd() and !branch_targets.contains(word_index * 4)) break;
-    } else return Error.InstructionLimitExceeded;
+    } else {
+        std.debug.print(
+            "[gpu shader] instruction limit program=0x{x} instructions={d} words={d} pc=0x{x} first=0x{x:0>8} last=0x{x:0>8}\n",
+            .{
+                address,
+                instructions.items.len,
+                code.items.len,
+                word_index * 4,
+                if (code.items.len != 0) code.items[0] else 0,
+                if (code.items.len != 0) code.items[code.items.len - 1] else 0,
+            },
+        );
+        return Error.InstructionLimitExceeded;
+    }
 
     var program = rdna2.Program{ .code = code.items, .instructions = instructions };
     errdefer program.deinit(allocator);
@@ -224,5 +277,15 @@ test "analysis enforces its instruction safety limit" {
     try std.testing.expectError(
         Error.InstructionLimitExceeded,
         decode(std.testing.allocator, memory.reader(), 0, 2),
+    );
+}
+
+test "bounded analysis stops before reading beyond AGC shader size" {
+    var memory = TestMemory{};
+    memory.word(0, 0xbf80_0000); // s_nop, with no end marker in the allocation
+    memory.word(4, 0xbf81_0000); // outside the declared four-byte program
+    try std.testing.expectError(
+        Error.MissingEndProgram,
+        decodeBounded(std.testing.allocator, memory.reader(), 0, 16, 4),
     );
 }

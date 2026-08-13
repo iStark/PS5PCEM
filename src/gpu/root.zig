@@ -39,6 +39,7 @@ pub const ShaderSpirvSampledImageBinding = shader_analysis.SpirvSampledImageBind
 pub const ShaderSpirvStorageImageBinding = shader_analysis.SpirvStorageImageBinding;
 pub const ShaderSpirvStorageImageFormat = shader_analysis.SpirvStorageImageFormat;
 pub const ShaderSpirvScalarRegister = shader_analysis.SpirvScalarRegister;
+pub const ShaderSpirvNggLdsExport = shader_analysis.SpirvNggLdsExport;
 pub const ShaderOperand = shader_analysis.Operand;
 pub const ShaderOperandKind = shader_analysis.OperandKind;
 pub const ShaderInstruction = shader_analysis.Instruction;

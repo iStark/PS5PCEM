@@ -116,20 +116,24 @@ If you would like to support continued PS5PCEM development, you can do so on
   cooked configuration and shader archives, and emit real AGC acquire, release,
   wait, event, DMA, indirect-register, draw and flip packets. Tetris Effect:
   Connected now completes a measured startup frame containing 595 guest draws
-  and 63 compute dispatches without a rejected draw, shader-lowering failure,
-  validation error, fence failure, or GPU fault. Typed 2D/3D storage images,
+  and 63 compute dispatches without a shader-lowering, validation, fence, or GPU
+  failure. Typed 2D/3D storage images,
   bounded LDS/DS workgroup memory, `image_load`/`image_store`, sampled-image
-  LOD/offset and gather forms, scalar bitfield operations, `V_LDEXP_F32`, and
-  vertex-stage image fetches cover the observed startup shaders. Vulkan color
-  attachments now include native `R11G11B10_FLOAT`, `10_10_10_2_UNORM`,
-  `RGBA16_FLOAT`, and `RGBA32_FLOAT` paths; layered post-process targets use a
-  documented first-slice approximation until layered rendering is implemented.
-  The second VideoOut cycle produces the particle scene shown below from a
-  visible 1920×1080 HDR render target. This is the first recognizable guest
-  graphics milestone, not a menu or gameplay claim: the registered 3840×2160
-  scanout remains black, and one measured startup frame took about 471 seconds
-  on the current test host because draws and compute work are still submitted
-  synchronously.
+  LOD/bias/offset and gather forms, cube coordinates and sampling, scalar
+  bitfield operations, `V_LDEXP_F32`, and vertex-stage image fetches cover the
+  observed startup shaders. Read-only compressed compute `image_load` uses a
+  sampled BC view because Vulkan cannot expose BC images as storage images.
+  Vulkan color and sampled-image formats now also preserve `R16_UNORM`,
+  `R16_UINT`, and `RGBA8_UINT` typing. AGC completions remain ordered until the
+  guest interrupt thread acknowledges its retirement condition, preventing the
+  event-before-node race that previously stopped rendering at a nondeterministic
+  flip. An unattended measured run advanced through 49 VideoOut cycles, with
+  most post-bootstrap cycles taking about 3.3–3.8 seconds on the current test
+  host. The next observed `0xe060`-byte generated pixel shader is now decoded
+  within its exact AGC `shader_size` instead of hitting the old 4,096-instruction
+  limit. The particle scene below remains the latest verified visible result;
+  this is not yet a menu or gameplay claim, and synchronous GPU work is still
+  much slower than real time.
 
 ### Screenshot
 
@@ -187,7 +191,7 @@ the repository contains none of that content.
 | **Terminator 2D: No Fate** | Reaches gameplay with correct color reproduction and clean title-provided backgrounds, characters, HUD elements, and textures; publisher logo screens and menus now match the console capture; warmed-up startup frames measure 22–65 ms on the current test host | First-use texture staging, multiple render targets, and the remaining compression metadata are incomplete |
 | **Pistol Whip** | Maps the native PS VR2 plugin and Burst module, then starts loading Unity asset archives | Headset, tracking, controller, and host OpenXR support are intentionally deferred |
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
-| **Tetris Effect: Connected** | Completes the Unreal bootstrap and a measured startup frame with 595 guest draws and 63 compute dispatches, including typed 2D/3D storage images, `64×64×64 RGBA16_FLOAT` volumes, layered post-process targets, `RGBA32_FLOAT` exposure surfaces, a `10_10_10_2_UNORM` lookup target, and the mixed image/LDS prepass. No draw, shader lowering, validation, fence, or GPU failure occurs, and the latest visible 1920×1080 HDR target contains the recognizable particle scene shown above | The exact registered 3840×2160 VideoOut target remains black, so presentation currently falls back to a converted `R11G11B10_FLOAT` intermediate. NGG/fetch-shader continuations, exact layered rendering, final scanout aliasing/tonemapping, and performance remain incomplete; the measured frame took about 471 seconds on the current test host, and neither a menu nor gameplay is claimed |
+| **Tetris Effect: Connected** | Completes the Unreal bootstrap and a measured startup frame with 595 guest draws and 63 compute dispatches, including typed 2D/3D storage images, `64×64×64 RGBA16_FLOAT` volumes, layered post-process targets, `RGBA32_FLOAT` exposure surfaces, a `10_10_10_2_UNORM` lookup target, and the mixed image/LDS prepass. Ordered AGC completion acknowledgement removes the intermittent retirement race, and the latest unattended run advanced through 49 VideoOut cycles. Most post-bootstrap cycles measured about 3.3–3.8 seconds on the current RTX 3070 Ti host. The first generated `0xe060`-byte material pixel shader is now decoded within its exact AGC allocation instead of the old fixed instruction ceiling | The latest verified visible output is still the recognizable 1920×1080 HDR particle target shown above. The exact registered 3840×2160 VideoOut target remains black, so presentation falls back to a converted `R11G11B10_FLOAT` intermediate. NGG/fetch-shader continuations, exact layered rendering, final scanout aliasing/tonemapping, one oversized guest-buffer descriptor, and performance remain incomplete; neither a menu nor gameplay is claimed |
 | **The Precinct** | Links the complete six-image guest graph, defers and starts Unity plug-ins through `sceKernelLoadStartModule`, enters Unity, indexes its audio assets, and plays both observed intro movies through the new SceAvPlayer path. The title receives synchronized 3840×2160 NV12 video and 48 kHz stereo PCM; its guest YUV conversion shader produces the recognizable Kwalee frame above. Post-video graphics continue through seven draws and nine dispatches per frame, with warmed-up frames around 20–22 ms on the current RTX 3070 Ti test host | The post-video scene source is still incorrect: draw 1 receives a sparse/corrupted pixel strip, draw 2 copies it to the scanout, and later UI draws do not restore a recognizable scene. Gameplay is not claimed yet |
 | **Jets 'n' Guns 2** | Resolves title content through `/app0`, completes AGC resource registration, and sustains the full graphics/compute/VideoOut loop. Targetless final passes are preserved through flip, while dynamic SGPR data and descriptor-sized buffer bounds keep streamed sprite batches on stable Vulkan pipelines. The title now renders the recognizable 3840×2160 title screen, main menu, and options UI shown above; warmed 53-draw startup frames measure roughly 113–124 ms on the current RTX 3070 Ti host with zero pipeline misses after warm-up | A manual `Cross` reaches the main menu without the automatic `Options` pulse, but selecting `NEW GAME` currently stops further flips after the audio decode/output loops exit. A playable scene and working in-game audio are therefore not claimed yet |
 | **Asterix & Obelix: Slap Them All!** | Maps the Unity/PSN plug-in graph, passes GameUpdate, trophy, entitlement, WebApi, and player-review bootstrap calls, accepts four-byte-aligned AGC shader headers, and reaches repeated 1920×1080 frames. SceAvPlayer returns the ATL intro as correctly decoded NV12 frames, while matched image-copy, planar-conversion, fullscreen-blit, and color-resolve paths keep the observed movie pipeline moving without its former multi-second shader compilation/dispatch blockers | The decoded source is recognizable, but final compositor scaling/presentation still needs validation and no repeatable menu or gameplay frame is claimed yet |
@@ -489,8 +493,11 @@ unsigned byte/short reads, the common 32-bit integer/bitwise atomics,
 mix `R8_UINT`, `R16_UINT`, `R32_UINT`, `R11G11B10_FLOAT`, `RGBA8_UNORM`,
 `RGBA8_UINT`, `RGBA16_FLOAT`, and `RGBA32_FLOAT` without optional
 read/write-without-format device features. Both consecutive and NSA coordinate
-VGPR encodings are accepted for 2D and 3D loads/stores. Array, mip, MSAA,
-partial-mask store, and image-atomic forms remain explicit future work.
+VGPR encodings are accepted for 2D and 3D loads/stores, and the observed
+single-slice 2D-array store uses the same typed path. A read-only BC image load
+is fetched through a sampled descriptor because Vulkan does not permit block-
+compressed storage images. General multi-layer arrays, mip, MSAA, partial-mask
+store, and image-atomic forms remain explicit future work.
 
 Graphics modules connect vertex `EXP POS0` to `BuiltIn Position`, vertex
 `PARAM0..31` exports to Vulkan locations, fragment VINTRP instructions to the
@@ -498,15 +505,16 @@ matching inputs, and fragment `EXP MRT0` to color location zero. Hardware-only
 M0 setup and EXEC restoration from unavailable pixel-prolog SGPRs are tolerated
 without inventing guest data. Fragment EXEC/VCC predicates use the subgroup
 local invocation index rather than a compute-only builtin. The current MIMG
-path lowers normalized 2D and 3D `image_sample`, level-zero samples with packed
-offsets, and the observed four-result `image_gather4` form through
-dimension-specific combined sampled-image descriptor arrays. Vertex and
-fragment `image_load` use an explicit-LOD texel fetch when the guest supplies
-integer 2D coordinates. Compute programs additionally support the observed
-`image_sample_lz` forms with explicit LOD 0, including NSA coordinates and
-per-instruction recovery of reused T#/S# SGPRs. Sampled-image staging detiles 2D
-surfaces and thick 3D volumes, including `R32_FLOAT`, `RGBA16_UNORM`,
-`RGBA8_UNORM`, `R11G11B10_FLOAT`, `RGBA16_FLOAT`, `RGBA32_FLOAT`, and
+path lowers normalized 2D/3D/cube `image_sample`, explicit LOD and bias,
+level-zero samples with packed offsets, and the observed four-result
+`image_gather4` form through dimension-specific combined sampled-image
+descriptor arrays. Vertex and fragment `image_load` use an explicit-LOD texel
+fetch when the guest supplies integer 2D coordinates. Compute programs
+additionally support the observed `image_sample_lz` forms with explicit LOD 0,
+including NSA coordinates and per-instruction recovery of reused T#/S# SGPRs.
+Sampled-image staging detiles 2D surfaces and thick 3D volumes, including
+`R32_FLOAT`, `RGBA16_UNORM`, `RGBA8_UNORM`, `RGBA8_UINT`, `R16_UNORM`,
+`R16_UINT`, `R11G11B10_FLOAT`, `RGBA16_FLOAT`, `RGBA32_FLOAT`, and
 `10_10_10_2_UNORM`, into matching Vulkan formats. Resource dimension and depth
 are part of the cache key so 2D/3D aliases cannot reuse an incompatible image
 view.
@@ -751,10 +759,14 @@ vertex tables, ready for the shader translator to consume.
 
 [`gpu.shader_analysis`](src/gpu/shader_analysis.zig) incrementally reads only
 the guest words required by the RDNA2 decoder, including literals and MIMG NSA
-words. It owns the decoded program, validated CFG and typed IR as one diagnostic
-snapshot. Live submission tracing reports words, instructions, blocks, edges
-and opaque IR nodes, then attempts SPIR-V lowering for vertex, pixel and compute
-stages and records either the module size or the exact blocking semantic.
+words. When a relocated AGC header is available, decoding is bounded by its
+exact `shader_size`, so large generated material shaders can exceed the
+headerless 4,096-instruction safety ceiling without reading embedded metadata
+or the next allocation as code. It owns the decoded program, validated CFG and
+typed IR as one diagnostic snapshot. Live submission tracing reports words,
+instructions, blocks, edges and opaque IR nodes, then attempts SPIR-V lowering
+for vertex, pixel and compute stages and records either the module size or the
+exact blocking semantic.
 
 [`gpu.tiling`](src/gpu/tiling.zig) is the API-neutral bridge from those guest
 resources to host staging memory. It implements the exact GFX10 address XORs
@@ -1907,11 +1919,15 @@ packets are not clipped or reinterpreted as that marker.
 The AGC driver's event-queue API now registers and deletes graphics filter
 `-14`, decodes event type and context ID from the fields used by that filter,
 and retains the caller's user data. A graphics completion is published under ID
-zero; a compute completion uses its queue owner as both ID and context. Work
-that drains during submission is signalled immediately. A command buffer that
-remains blocked on `WAIT_REG_MEM` is deliberately not signalled early; tracking
-the originating owner across a later cross-queue resume is the next asynchronous
-completion extension.
+zero; a compute completion uses its queue owner as both ID and context. Release
+edges collected while a DCB is executing enter an asynchronous FIFO only after
+the complete scheduler pass returns. The FIFO retains its head until
+`AgcInterruptThread` signals a retirement condition and retries an edge that was
+consumed before the guest published its matching ring node. The completion
+worker and host ticker share a serialized drain path, so concurrent pumps cannot
+deliver or remove the same head twice. A command buffer that remains blocked on
+`WAIT_REG_MEM` is deliberately not signalled early; tracking the originating
+owner across a later cross-queue resume remains a future extension.
 
 Successful `sceAgcCreateShader` calls also retain the association between each
 published GPU program address and its relocated AGC header. At draw/dispatch
@@ -2121,23 +2137,31 @@ and render the title screen, main menu, and options UI shown above.
 
 Tetris Effect: Connected exercises the same expanded Unreal path without a VR
 plugin. It now reaches the first recognizable particle scene through the real
-guest render graph. In the measured second VideoOut cycle, all 595 draws and 63
-compute dispatches complete without a rejected draw, shader-lowering failure,
-validation error, fence failure, or GPU fault. The renderer retains targetless
-final passes until VideoOut supplies the registered display geometry, treats an
-all-ones screen scissor as the unset sentinel, and preserves resident targets
-across the complete 3840×2160 post-processing chain.
+guest render graph. In the measured startup frame, all 595 draws and 63 compute
+dispatches complete without a rejected draw, shader-lowering failure,
+validation error, fence failure, or GPU fault. Ordered AGC completion delivery
+now retains each release edge until the guest interrupt thread acknowledges its
+retirement condition, including the event-before-ring-node race. The latest
+unattended run advances through 49 VideoOut cycles instead of stopping at a
+nondeterministic early flip. The renderer retains targetless final passes until
+VideoOut supplies the registered display geometry, treats an all-ones screen
+scissor as the unset sentinel, and preserves resident targets across the
+3840×2160 post-processing chain.
 
 The startup workload exercises typed clears and copies for `R8_UINT`,
 `R16_UINT`, `R32_UINT`, `RGBA8_UNORM`, `RGBA8_UINT`, `RGBA16_UNORM`,
 `RGBA16_FLOAT`, and `RGBA32_FLOAT`; mixed 2D/3D sampled and storage images;
 `64×64×64` post-process volumes; and bounded LDS with DS paired, subword,
 atomic, and barrier operations. Scalar `S_BFM_B32`, `S_BFE_U32`, and
-`S_BFE_U64`, vector `V_LDEXP_F32`, level-zero offset sampling, four-result
-gathers, and vertex-stage `image_load` cover the newly observed shader forms.
+`S_BFE_U64`, vector `V_LDEXP_F32`, explicit sample LOD/bias, level-zero offset
+sampling, cube coordinates, four-result gathers, and vertex-stage `image_load`
+cover the newly observed shader forms. Read-only BC compute loads use sampled
+views because Vulkan cannot bind block-compressed formats as storage images.
 The complete 176-instruction image/LDS prepass and the 2,401-instruction
 compositor both translate to accepted SPIR-V rather than falling back or being
-discarded.
+discarded. Generated shaders larger than the headerless 4,096-instruction
+safety ceiling are decoded within the exact `shader_size` recorded by their AGC
+allocation, stopping before embedded metadata or the following allocation.
 
 The color path now maps native `R11G11B10_FLOAT`, `RGBA16_FLOAT`,
 `RGBA32_FLOAT`, and standard-order `10_10_10_2_UNORM` attachments. Small array
@@ -2152,12 +2176,15 @@ second flip. The screenshot above therefore comes from the newest visible
 1920×1080 `R11G11B10_FLOAT` intermediate, not from the final scanout. The main
 remaining correctness work is the NGG/fetch-shader continuation that ends its
 attribute prolog with `S_SETPC_B64`, exact layered rendering, and the final
-scanout alias/tonemap path. Performance is also far from interactive: the
-measured frame took about 471 seconds, with roughly 231 seconds in draws and
-232 seconds in compute across 799 synchronous submissions. The driver created
-28 graphics pipelines in about 515 ms, so pipeline compilation is no longer
-the dominant cost. A 512 GiB sparse guest reservation can still fail if the
-Windows process layout leaves no suitable virtual-address hole.
+scanout alias/tonemap path. One oversized guest-buffer descriptor also remains
+unresolved. Performance is still not interactive, but the old 471-second
+startup-frame measurement no longer describes the current renderer: most
+post-bootstrap cycles in the latest run take about 3.3–3.8 seconds on the test
+RTX 3070 Ti, with occasional heavier cycles around 6.6 seconds. Synchronous GPU
+work, resource staging, and submission count remain the dominant optimization
+targets. A 512 GiB sparse guest reservation can still fail if the Windows
+process layout leaves no suitable virtual-address hole. The particle scene is
+the latest verified visible result; neither the menu nor gameplay is claimed.
 
 ## Error codes
 
@@ -2179,10 +2206,10 @@ from leaking into host code where nothing would check it.
    depth/stencil, atomic, and compressed-surface forms; retain exact UAV fast
    paths only where they reduce synchronous startup work without changing
    semantics.
-3. Extend compute sampling beyond `image_sample_lz` to explicit LOD/bias,
-   mip/layer and array/cube forms, finish the NGG export path, and
-   cover the remaining indirect descriptor variants that still leave the
-   deferred compositor with incomplete inputs.
+3. Extend image sampling and storage to the remaining mip, layer, array, MSAA,
+   partial-mask, atomic, and compressed-surface forms; finish the NGG export
+   path and cover the remaining indirect descriptor variants that still leave
+   the deferred compositor with incomplete inputs.
 4. Move the remaining first-use texture conversion and synchronous compute work
    off the frame-critical path without changing guest-visible synchronization.
 5. Keep the guest process in a stable long-running flip/submit loop and close

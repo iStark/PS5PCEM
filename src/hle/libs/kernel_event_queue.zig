@@ -79,12 +79,16 @@ const Lock = struct {
 var lock: Lock = .{};
 var queues: [maximum_queues]Queue = [_]Queue{.{}} ** maximum_queues;
 var next_handle: i64 = 1;
+var graphics_delivery_reports: u32 = 0;
+var graphics_registration_reports: u32 = 0;
 
 pub fn reset() void {
     lock.lock();
     defer lock.unlock();
     queues = [_]Queue{.{}} ** maximum_queues;
     next_handle = 1;
+    graphics_delivery_reports = 0;
+    graphics_registration_reports = 0;
 }
 
 fn findQueue(handle: i64) ?*Queue {
@@ -200,6 +204,7 @@ const RegistrationOptions = struct {
     deadline_microseconds: ?u64 = null,
     period_microseconds: ?u64 = null,
     user_data: u64 = 0,
+    replace_existing: bool = false,
 };
 
 fn addRegistration(handle: i64, id: i32, options: RegistrationOptions) i32 {
@@ -210,6 +215,29 @@ fn addRegistration(handle: i64, id: i32, options: RegistrationOptions) i32 {
 
     for (&queue.registrations) |*registration| {
         if (registration.active and registration.ident == ident and registration.filter == options.filter) {
+            if (options.replace_existing) {
+                registration.edge = options.edge;
+                registration.deadline_microseconds = options.deadline_microseconds;
+                registration.period_microseconds = options.period_microseconds;
+                registration.user_data = options.user_data;
+                // EV_ADD modifies an existing kevent. Events already queued for
+                // that registration must expose the new callback token too.
+                for (0..queue.pending_count) |pending_offset| {
+                    const pending_index = (queue.pending_head + pending_offset) % maximum_events;
+                    const pending = &queue.pending[pending_index];
+                    if (pending.ident == ident and pending.filter == options.filter) {
+                        pending.user_data = options.user_data;
+                    }
+                }
+                if (options.filter == graphics_filter and graphics_registration_reports < 32) {
+                    std.debug.print(
+                        "[agc registration] update handle={d} ident=0x{x} udata=0x{x}\n",
+                        .{ handle, ident, options.user_data },
+                    );
+                    graphics_registration_reports += 1;
+                }
+                return errno.ok;
+            }
             return KernelError.eexist.raw();
         }
     }
@@ -224,6 +252,13 @@ fn addRegistration(handle: i64, id: i32, options: RegistrationOptions) i32 {
             .period_microseconds = options.period_microseconds,
             .user_data = options.user_data,
         };
+        if (options.filter == graphics_filter and graphics_registration_reports < 32) {
+            std.debug.print(
+                "[agc registration] add handle={d} ident=0x{x} udata=0x{x}\n",
+                .{ handle, ident, options.user_data },
+            );
+            graphics_registration_reports += 1;
+        }
         return errno.ok;
     }
     return KernelError.enospc.raw();
@@ -353,6 +388,46 @@ fn triggerUserEvent(handle: i64, id: i32, user_data: u64) callconv(abi.guest) i3
     return errno.ok;
 }
 
+/// Raises one registered user event on every equeue that owns it.
+///
+/// AGC EOP interrupts have a kernel-wide companion event (ident 0x1800), so
+/// the command processor does not know the driver's private equeue handle.
+pub fn triggerUserEventForAll(id: i32, data: i64) usize {
+    var wake_handles: [maximum_queues]i64 = undefined;
+    var wake_sequences: [maximum_queues]u64 = undefined;
+    var wake_count: usize = 0;
+    const ident: u64 = @bitCast(@as(i64, id));
+
+    lock.lock();
+    for (&queues) |*queue| {
+        if (!queue.active or queue.pending_count == maximum_events) continue;
+        const registration = for (queue.registrations) |candidate| {
+            if (candidate.active and candidate.ident == ident and candidate.filter == user_filter) {
+                break candidate;
+            }
+        } else continue;
+        const index = (queue.pending_head + queue.pending_count) % maximum_events;
+        queue.pending[index] = .{
+            .ident = ident,
+            .filter = user_filter,
+            .flags = event_add | event_clear,
+            .data = data,
+            .user_data = registration.user_data,
+        };
+        queue.pending_count += 1;
+        queue.sequence +%= 1;
+        wake_handles[wake_count] = queue.handle;
+        wake_sequences[wake_count] = queue.sequence;
+        wake_count += 1;
+    }
+    lock.unlock();
+
+    for (wake_handles[0..wake_count], wake_sequences[0..wake_count]) |handle, sequence| {
+        threading.wakeWaiters(waitKey(handle), sequence, 1);
+    }
+    return wake_count;
+}
+
 /// Registers the VideoOut flip edge used by display-worker event queues.
 pub fn addVideoOutFlipEvent(handle: i64, user_data: u64) i32 {
     return addRegistration(handle, @intCast(video_out_flip_ident), .{
@@ -448,6 +523,7 @@ pub fn addGraphicsEvent(handle: i64, id: i32, user_data: u64) i32 {
         .edge = true,
         .filter = graphics_filter,
         .user_data = user_data,
+        .replace_existing = true,
     });
 }
 
@@ -494,12 +570,30 @@ fn triggerGraphicsEventsMatching(id: i32, context_id: u32, any_id: bool) usize {
             if (!candidate.active or candidate.filter != graphics_filter) continue;
             if (!any_id and candidate.ident != ident) continue;
             if (queue.pending_count == maximum_events) break;
+            const event_ident = if (any_id) candidate.ident else ident;
+            var event_fflags: u32 = 1;
+            // The graphics filter exposes the number of queued edges through
+            // fflags. AGC's interrupt worker uses that count to retire the same
+            // number of ring submissions. Preserve the count when rendering
+            // takes long enough for several completions to accumulate.
+            var pending_offset = queue.pending_count;
+            while (pending_offset != 0) {
+                pending_offset -= 1;
+                const pending_index = (queue.pending_head + pending_offset) % maximum_events;
+                const pending = queue.pending[pending_index];
+                if (pending.filter == graphics_filter and pending.ident == event_ident) {
+                    event_fflags = pending.fflags +| 1;
+                    break;
+                }
+            }
             const index = (queue.pending_head + queue.pending_count) % maximum_events;
             queue.pending[index] = .{
-                .ident = if (any_id) candidate.ident else ident,
+                .ident = event_ident,
                 .filter = graphics_filter,
-                .flags = event_clear,
-                .fflags = 1,
+                // Graphics events have their own reset callback on the real
+                // driver and are registered without EV_CLEAR in the ABI data.
+                .flags = 0,
+                .fflags = event_fflags,
                 .data = context_id,
                 .user_data = candidate.user_data,
             };
@@ -583,6 +677,25 @@ fn dequeue(
     const count = @min(capacity, queue.pending_count);
     for (0..count) |index| {
         output[index] = queue.pending[queue.pending_head];
+        if ((output[index].filter == graphics_filter or
+            (output[index].filter == user_filter and output[index].ident == 0x1800)) and
+            graphics_delivery_reports < 256)
+        {
+            std.debug.print(
+                "[agc event] handle={d} filter={d} ident=0x{x} data=0x{x} fflags={d} sequence={d} pending={d} thread=0x{x}\n",
+                .{
+                    handle,
+                    output[index].filter,
+                    output[index].ident,
+                    @as(u64, @bitCast(output[index].data)),
+                    output[index].fflags,
+                    queue.sequence,
+                    queue.pending_count,
+                    threading.currentThreadId(),
+                },
+            );
+            graphics_delivery_reports += 1;
+        }
         queue.pending[queue.pending_head] = .{};
         queue.pending_head = (queue.pending_head + 1) % maximum_events;
     }
@@ -806,9 +919,46 @@ test "graphics completion events match the registered queue identifier" {
     try std.testing.expectEqual(errno.ok, waitEqueue(handle, &event, 1, &count, &timeout));
     try std.testing.expectEqual(@as(i16, graphics_filter), event[0].filter);
     try std.testing.expectEqual(@as(u64, 0x21), event[0].ident);
-    try std.testing.expectEqual(@as(u16, event_clear), event[0].flags);
+    try std.testing.expectEqual(@as(u16, 0), event[0].flags);
     try std.testing.expectEqual(@as(u32, 1), event[0].fflags);
     try std.testing.expectEqual(@as(i64, 9), event[0].data);
     try std.testing.expectEqual(@as(u64, 0xcafe), event[0].user_data);
     try std.testing.expectEqual(errno.ok, deleteGraphicsEvent(handle, 0x21));
+}
+
+test "queued graphics completions retain their accumulated interrupt count" {
+    reset();
+    var handle: i64 = 0;
+    try std.testing.expectEqual(errno.ok, createEqueue(&handle, "graphics-fflags"));
+    defer _ = deleteEqueue(handle);
+    try std.testing.expectEqual(errno.ok, addGraphicsEvent(handle, 0, 0));
+    try std.testing.expectEqual(@as(usize, 1), triggerGraphicsEvent(0, 10));
+    try std.testing.expectEqual(@as(usize, 1), triggerGraphicsEvent(0, 11));
+    try std.testing.expectEqual(@as(usize, 1), triggerGraphicsEvent(0, 12));
+
+    var events: [3]Event = @splat(.{});
+    var count: i32 = 0;
+    var timeout: u32 = 0;
+    try std.testing.expectEqual(errno.ok, waitEqueue(handle, &events, events.len, &count, &timeout));
+    try std.testing.expectEqual(@as(i32, 3), count);
+    try std.testing.expectEqual(@as(u32, 1), events[0].fflags);
+    try std.testing.expectEqual(@as(u32, 2), events[1].fflags);
+    try std.testing.expectEqual(@as(u32, 3), events[2].fflags);
+}
+
+test "re-adding a graphics event updates its callback token" {
+    reset();
+    var handle: i64 = 0;
+    try std.testing.expectEqual(errno.ok, createEqueue(&handle, "graphics-update"));
+    defer _ = deleteEqueue(handle);
+    try std.testing.expectEqual(errno.ok, addGraphicsEvent(handle, 0, 0x1111));
+    try std.testing.expectEqual(@as(usize, 1), triggerGraphicsEvent(0, 7));
+    try std.testing.expectEqual(errno.ok, addGraphicsEvent(handle, 0, 0x2222));
+
+    var event: [1]Event = .{.{}};
+    var count: i32 = 0;
+    var timeout: u32 = 0;
+    try std.testing.expectEqual(errno.ok, waitEqueue(handle, &event, 1, &count, &timeout));
+    try std.testing.expectEqual(@as(i32, 1), count);
+    try std.testing.expectEqual(@as(u64, 0x2222), event[0].user_data);
 }

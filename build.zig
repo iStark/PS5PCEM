@@ -270,7 +270,11 @@ pub fn build(b: *std.Build) void {
         game_run.root_module.linkSystemLibrary("setupapi", .{});
         game_run.root_module.linkSystemLibrary("hid", .{});
     }
-    b.installArtifact(game_run);
+    const install_game_run = b.addInstallArtifact(game_run, .{});
+    b.getInstallStep().dependOn(&install_game_run.step);
+
+    const build_game_run_step = b.step("build-game-run", "Build only the PS5 title runner");
+    build_game_run_step.dependOn(&install_game_run.step);
 
     const game_run_cmd = b.addRunArtifact(game_run);
     game_run_cmd.step.dependOn(b.getInstallStep());

@@ -1506,6 +1506,55 @@ fn effectiveProcessNanoseconds(now: i96, started: i96, excluded: u64, active_sta
     return elapsed -| total_excluded;
 }
 
+/// Guest monotonic clocks share the same latency correction as process time,
+/// but keep the host clock's epoch. Engines use clock_gettime(CLOCK_MONOTONIC)
+/// for RenderThread watchdogs; exposing minutes spent synchronously translating
+/// a GPU submission makes those watchdogs diagnose an emulator stall as a game
+/// stall. Realtime remains untouched because calendar time must not pause.
+fn effectiveMonotonicNanoseconds(now: i96, excluded: u64, active_start: u64) u64 {
+    const current = nonnegativeNanoseconds(now);
+    var total_excluded = excluded;
+    total_excluded +|= excessHostNanoseconds(active_start, current);
+    return current -| total_excluded;
+}
+
+fn guestMonotonicNanoseconds() u64 {
+    while (true) {
+        const before = process_clock_sequence.load(.acquire);
+        if (before & 1 != 0) {
+            std.atomic.spinLoopHint();
+            continue;
+        }
+        const excluded = excluded_host_nanoseconds.load(.monotonic);
+        const active_start = active_host_exclusion_start.load(.monotonic);
+        const now = clockNanoseconds(1);
+        if (before == process_clock_sequence.load(.acquire)) {
+            return effectiveMonotonicNanoseconds(now, excluded, active_start);
+        }
+    }
+}
+
+/// Converts a deadline obtained from the latency-corrected guest monotonic
+/// clock back to the host awake-clock epoch used by the scheduler futex. The
+/// pair must use the same exclusion snapshot or a corrected absolute timeout
+/// would appear to have expired immediately on the host.
+pub fn hostMonotonicDeadline(guest_deadline_ns: u64) u64 {
+    while (true) {
+        const before = process_clock_sequence.load(.acquire);
+        if (before & 1 != 0) {
+            std.atomic.spinLoopHint();
+            continue;
+        }
+        var excluded = excluded_host_nanoseconds.load(.monotonic);
+        const active_start = active_host_exclusion_start.load(.monotonic);
+        const now = nonnegativeNanoseconds(clockNanoseconds(1));
+        excluded +|= excessHostNanoseconds(active_start, now);
+        if (before == process_clock_sequence.load(.acquire)) {
+            return guest_deadline_ns +| excluded;
+        }
+    }
+}
+
 fn processNanoseconds() u64 {
     while (true) {
         const before = process_clock_sequence.load(.acquire);
@@ -1529,7 +1578,10 @@ fn writeTimespec(clock_id: i32, output: ?*Timespec, kernel_errors: bool) i32 {
         setErrno(errno.Posix.einval);
         break :blk -1;
     };
-    const nanoseconds = clockNanoseconds(clock_id);
+    const nanoseconds: i96 = if (clock_id == 0)
+        clockNanoseconds(0)
+    else
+        guestMonotonicNanoseconds();
     value.seconds = @intCast(@divTrunc(nanoseconds, std.time.ns_per_s));
     value.nanoseconds = @intCast(@mod(nanoseconds, std.time.ns_per_s));
     return errno.ok;
@@ -1947,6 +1999,10 @@ test "host time exclusions preserve normal submits and hide only excess latency"
     );
     try std.testing.expectEqual(@as(u64, 0), excessHostNanoseconds(1000 * ms, 1100 * ms));
     try std.testing.expectEqual(@as(u64, 50 * ms), excessHostNanoseconds(1000 * ms, 1150 * ms));
+    try std.testing.expectEqual(
+        @as(u64, 1175 * ms),
+        effectiveMonotonicNanoseconds(1250 * ms, 25 * ms, 1100 * ms),
+    );
 }
 
 test "Unity scripting allocator uses the application heap memalign callback" {

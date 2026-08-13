@@ -220,7 +220,21 @@ pub const DcbExecutor = struct {
             }
             if (resumes_child) return Error.InvalidContinuation;
 
-            const outcome = try self.executePacket(packet, result);
+            const outcome = self.executePacket(packet, result) catch |err| {
+                std.debug.print(
+                    "[gpu executor] packet rejected depth={d} stream=0x{x} word={d}/{d} header=0x{x:0>8} op={s}: {s}\n",
+                    .{
+                        depth,
+                        descriptor.address,
+                        packet_word,
+                        stream.len,
+                        packet.header,
+                        packet.name() orelse "unknown",
+                        @errorName(err),
+                    },
+                );
+                return err;
+            };
             if (outcome == .blocked) {
                 setContinuationFrame(result, depth, descriptor, packet_word);
                 return true;
