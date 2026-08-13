@@ -448,6 +448,15 @@ pub fn attachedSaveDataRoot() ?std.Io.Dir {
 var savedata_home: ?std.Io.Dir = null;
 var title_identifier_storage: [savedata.maximum_slot_name]u8 = undefined;
 var title_identifier_length: usize = 0;
+/// The slot `/savedata0` currently resolves to. The descriptive parameters
+/// belong to it rather than to the files inside, so they are addressed by name
+/// rather than through the mount.
+var mounted_slot_storage: [savedata.maximum_slot_name]u8 = undefined;
+var mounted_slot_length: usize = 0;
+
+pub fn mountedSaveDataSlot() []const u8 {
+    return mounted_slot_storage[0..mounted_slot_length];
+}
 
 pub fn attachSaveDataHome(directory: std.Io.Dir, title_id: []const u8) void {
     table_lock.lock();
@@ -467,7 +476,9 @@ pub fn titleIdentifier() []const u8 {
 /// to be made: a title probing for a save it has never written expects to be
 /// told so, and inventing an empty slot would have it load a save that was
 /// never there.
-pub fn mountSaveDataSlot(slot: []const u8, may_create: bool) Error!bool {
+pub const SaveDataMountOutcome = enum { missing, existed, created };
+
+pub fn mountSaveDataSlot(slot: []const u8, may_create: bool) Error!SaveDataMountOutcome {
     const io = active_io orelse return Error.NotAttached;
     const home = savedata_home orelse return Error.NotAttached;
 
@@ -480,13 +491,15 @@ pub fn mountSaveDataSlot(slot: []const u8, may_create: bool) Error!bool {
     const relative = savedata.joinPath(&path_storage, &.{ safe_title, safe_slot }) orelse
         return Error.InvalidArgument;
 
+    var created = false;
     const directory = home.openDir(io, relative, .{ .iterate = true }) catch |err| blk: {
         switch (err) {
             error.FileNotFound, error.NotDir, error.BadPathName => {},
             else => return Error.IoFailed,
         }
-        if (!may_create) return false;
+        if (!may_create) return .missing;
         home.createDirPath(io, relative) catch return Error.IoFailed;
+        created = true;
         break :blk home.openDir(io, relative, .{ .iterate = true }) catch return Error.IoFailed;
     };
 
@@ -494,7 +507,9 @@ pub fn mountSaveDataSlot(slot: []const u8, may_create: bool) Error!bool {
     defer table_lock.unlock();
     if (savedata_root) |previous| previous.close(io);
     savedata_root = directory;
-    return true;
+    mounted_slot_length = @min(safe_slot.len, mounted_slot_storage.len);
+    @memcpy(mounted_slot_storage[0..mounted_slot_length], safe_slot[0..mounted_slot_length]);
+    return if (created) .created else .existed;
 }
 
 /// Fills a buffer from the title's memory-backed save, leaving it untouched
@@ -535,6 +550,80 @@ fn saveDataMemoryPath(storage: *[maximum_path]u8) ?[]const u8 {
     });
 }
 
+/// Names of the slots the running title has written.
+///
+/// A title finds its saves by asking for this list, not by opening a path it
+/// already knows: which slots exist is precisely what it does not know. Leaving
+/// it unanswered made a title with a save on disk behave as though it had none.
+pub fn listSaveDataSlots(names: [][savedata.maximum_slot_name]u8) usize {
+    const io = active_io orelse return 0;
+    const home = savedata_home orelse return 0;
+
+    var identifier_storage: [savedata.maximum_slot_name]u8 = undefined;
+    const safe_title = savedata.sanitizeName(titleIdentifier(), &identifier_storage);
+    var directory = home.openDir(io, safe_title, .{ .iterate = true }) catch return 0;
+    defer directory.close(io);
+
+    var found: usize = 0;
+    var iterator = directory.iterate();
+    while (iterator.next(io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        if (entry.name.len == 0 or entry.name[0] == '.') continue;
+        // The blob behind the memory-backed API is not a save slot; a title
+        // offered it as one would try to mount it and find nothing it wrote.
+        if (std.mem.eql(u8, entry.name, savedata.memory_directory)) continue;
+        if (found == names.len) break;
+        const length = @min(entry.name.len, savedata.maximum_slot_name - 1);
+        @memset(&names[found], 0);
+        @memcpy(names[found][0..length], entry.name[0..length]);
+        found += 1;
+    }
+    return found;
+}
+
+/// Reads the descriptive parameters a slot recorded for itself.
+pub fn readSaveDataParameters(slot: []const u8, storage: []u8) ?[]const u8 {
+    const io = active_io orelse return null;
+    const home = savedata_home orelse return null;
+    var identifier_storage: [savedata.maximum_slot_name]u8 = undefined;
+    const safe_title = savedata.sanitizeName(titleIdentifier(), &identifier_storage);
+    var slot_storage: [savedata.maximum_slot_name]u8 = undefined;
+    const safe_slot = savedata.sanitizeName(slot, &slot_storage);
+    var path_storage: [maximum_path]u8 = undefined;
+    const relative = savedata.joinPath(&path_storage, &.{
+        safe_title,
+        safe_slot,
+        savedata.metadata_directory,
+        savedata.parameter_file,
+    }) orelse return null;
+    return home.readFile(io, relative, storage) catch null;
+}
+
+/// Stores the descriptive parameters of a slot.
+pub fn writeSaveDataParameters(slot: []const u8, contents: []const u8) Error!void {
+    const io = active_io orelse return Error.NotAttached;
+    const home = savedata_home orelse return Error.NotAttached;
+    var identifier_storage: [savedata.maximum_slot_name]u8 = undefined;
+    const safe_title = savedata.sanitizeName(titleIdentifier(), &identifier_storage);
+    var slot_storage: [savedata.maximum_slot_name]u8 = undefined;
+    const safe_slot = savedata.sanitizeName(slot, &slot_storage);
+
+    var directory_storage: [maximum_path]u8 = undefined;
+    const directory = savedata.joinPath(&directory_storage, &.{
+        safe_title,
+        safe_slot,
+        savedata.metadata_directory,
+    }) orelse return Error.InvalidArgument;
+    home.createDirPath(io, directory) catch return Error.IoFailed;
+
+    var path_storage: [maximum_path]u8 = undefined;
+    const relative = savedata.joinPath(&path_storage, &.{ directory, savedata.parameter_file }) orelse
+        return Error.InvalidArgument;
+    const file = home.createFile(io, relative, .{ .truncate = true }) catch return Error.IoFailed;
+    defer file.close(io);
+    file.writeStreamingAll(io, contents) catch return Error.IoFailed;
+}
+
 /// Stops `/savedata0` resolving. The files themselves are already on disk.
 pub fn unmountSaveData() void {
     table_lock.lock();
@@ -543,6 +632,7 @@ pub fn unmountSaveData() void {
         if (active_io) |io| directory.close(io);
     }
     savedata_root = null;
+    mounted_slot_length = 0;
 }
 
 /// Closes everything still open and detaches the mount.
@@ -1118,7 +1208,10 @@ pub fn stat(path: []const u8, out: *Stat) Error!void {
     }
 
     const io = active_io orelse return Error.NotAttached;
-    const directory = root orelse return Error.NotAttached;
+    // Saves resolve against their own root. Asking the title's directory about
+    // a save path finds nothing, which is how a title checking whether its save
+    // exists was told it did not.
+    const directory = rootFor(mountOf(path)) orelse return Error.NotAttached;
 
     var relative_storage: [maximum_path]u8 = undefined;
     const relative = normalizedMountRelative(path, &relative_storage) orelse return Error.NotFound;

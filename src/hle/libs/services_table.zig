@@ -476,7 +476,6 @@ pub const savedatadialog_native_exports = [_]symbols.Export{
 
 pub const savedata_native_exports = [_]symbols.Export{
     .{ .name = "sceSaveDataDelete", .function = trace.wrap("sceSaveDataDelete", &services.absent), .expect_id = "S1GkePI17zQ" },
-    .{ .name = "sceSaveDataDirNameSearch", .function = trace.wrap("sceSaveDataDirNameSearch", &services.absent), .expect_id = "dyIhnXq-0SM" },
     .{ .name = "sceSaveDataGetMountInfo", .function = trace.wrap("sceSaveDataGetMountInfo", &services.absent), .expect_id = "65VH0Qaaz6s" },
     .{ .name = "sceSaveDataSaveIcon", .function = trace.wrap("sceSaveDataSaveIcon", &services.absent), .expect_id = "c88Yy54Mx0w" },
     .{ .name = "sceSaveDataSetParam", .function = trace.wrap("sceSaveDataSetParam", &services.absent), .expect_id = "85zul--eGXs" },
@@ -490,7 +489,6 @@ pub const savedata_native_exports = [_]symbols.Export{
     .{ .name = "sceSaveDataTransferringMountPs4", .function = trace.wrap("sceSaveDataTransferringMountPs4", &services.absent), .expect_id = "RjMlsR8EXrw" },
     .{ .name = "sceSaveDataSaveIconByPath", .function = trace.wrap("sceSaveDataSaveIconByPath", &services.absent), .expect_id = "Z7z6HXWORJY" },
     .{ .name = "sceSaveDataBackup", .function = trace.wrap("sceSaveDataBackup", &services.absent), .expect_id = "z1JA8-iJt3k" },
-    .{ .name = "sceSaveDataGetParam", .function = trace.wrap("sceSaveDataGetParam", &services.absent), .expect_id = "XgvSuIdnMlw" },
     .{ .name = "sceSaveDataLoadIcon", .function = trace.wrap("sceSaveDataLoadIcon", &services.absent), .expect_id = "cGjO3wM3V28" },
     .{ .name = "sceSaveDataGetEventResult", .function = trace.wrap("sceSaveDataGetEventResult", &services.saveDataNoEvent), .expect_id = "j8xKtiFj0SY" },
     .{ .name = "sceSaveDataDeleteTransactionResource", .function = trace.wrap("sceSaveDataDeleteTransactionResource", &services.accept), .expect_id = "lJUQuaKqoKY" },

@@ -297,6 +297,17 @@ one place writing is allowed. The block-shaped save API is backed by a separate
 per-title blob under `sce_sdmemory`, loaded when the title reserves it and
 written when the title asks for it to be synchronized.
 
+Reading a save back matters as much as writing one. A title asks whether its
+save exists before it opens it, and that question is answered by the metadata
+path rather than by opening the file, so a save mount that resolved only opens
+against its own root still reported every save missing. Jets 'n' Guns 2 showed
+this exactly: it rewrote its profile from scratch on every run instead of
+loading it, because each existence check said the file was not there. Listing
+the slots a title has written is answered too, since a title does not know which
+of its saves exist and has no other way to find out, and a mount reports whether
+it opened an existing save or made a new one — always claiming the latter has a
+title treat its own progress as absent.
+
 XInput cannot enumerate Sony's controllers at all: it reports only
 Xbox-compatible devices, so a pad plugged straight into the host is invisible to
 it and appears connected only when a translation layer puts a virtual Xbox pad

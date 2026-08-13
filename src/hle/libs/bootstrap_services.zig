@@ -964,16 +964,20 @@ fn saveDataMount3(request_address: u64, result: ?*SaveDataMountResult) callconv(
     const slot = readSlotName(request.directory_name, &slot_storage) orelse return invalid_argument;
     const may_create = request.mount_mode & save_data_mount_create_bits != 0;
 
-    const mounted = filesystem.mountSaveDataSlot(slot, may_create) catch {
+    const outcome = filesystem.mountSaveDataSlot(slot, may_create) catch {
         return errno.KernelError.eio.raw();
     };
-    if (!mounted) return save_data_error_not_found;
+    if (outcome == .missing) return save_data_error_not_found;
 
     output.* = .{
         .mount_point = [_]u8{0} ** 16,
         .required_blocks = 0,
         .unused = 0,
-        .mount_status = 1,
+        // A title reads this to learn whether it is looking at a save it wrote
+        // before or at an empty one just made for it. Always claiming the
+        // latter made a game overwrite its own profile on every run instead of
+        // loading it.
+        .mount_status = if (outcome == .created) 1 else 0,
         .reserved = [_]u8{0} ** 28,
         .padding = 0,
     };
@@ -1116,6 +1120,165 @@ fn saveDataSyncMemory(_: u64) callconv(abi.guest) i32 {
     return errno.ok;
 }
 
+
+/// The answer `sceSaveDataDirNameSearch` fills in.
+///
+/// The caller supplies the array the names go into and says how long it is; the
+/// reply says how many slots exist and how many of them fitted.
+const SaveDataDirNameSearchResult = extern struct {
+    hit_count: u32,
+    reserved: u32,
+    names: u64,
+    name_capacity: u32,
+    set_count: u32,
+};
+
+/// Lists the slots the running title has written.
+///
+/// A title does not know which of its saves exist; asking is how it finds out.
+/// Refusing the question made a title with a save already on disk behave as
+/// though it had never written one.
+fn saveDataDirNameSearch(_: u64, result_address: u64) callconv(abi.guest) i32 {
+    if (result_address == 0 or
+        !kernel_memory.isGuestRangeAccessible(result_address, @sizeOf(SaveDataDirNameSearchResult)))
+    {
+        return invalid_argument;
+    }
+    const result: *SaveDataDirNameSearchResult = @ptrFromInt(result_address);
+
+    var names: [maximum_listed_slots][savedata.maximum_slot_name]u8 = undefined;
+    const found = filesystem.listSaveDataSlots(&names);
+    result.hit_count = @intCast(found);
+
+    // A caller may ask only how many there are, passing no array for them.
+    if (result.names == 0 or result.name_capacity == 0) {
+        result.set_count = 0;
+        return errno.ok;
+    }
+    const capacity = @min(@as(usize, result.name_capacity), found);
+    const bytes = capacity * savedata.maximum_slot_name;
+    if (bytes != 0 and !kernel_memory.isGuestRangeAccessible(result.names, bytes)) {
+        return errno.KernelError.efault.raw();
+    }
+    const destination: [*]u8 = @ptrFromInt(result.names);
+    for (0..capacity) |index| {
+        @memcpy(destination[index * savedata.maximum_slot_name ..][0..savedata.maximum_slot_name], &names[index]);
+    }
+    result.set_count = @intCast(capacity);
+    return errno.ok;
+}
+
+/// How many slots one search will report. A title with more saves than this has
+/// written more than a single query is expected to carry.
+const maximum_listed_slots = 64;
+
+/// The descriptive parameters of a slot, in the order the API numbers them.
+const save_data_param_title: u32 = 0;
+const save_data_param_subtitle: u32 = 1;
+const save_data_param_detail: u32 = 2;
+const save_data_param_user: u32 = 3;
+
+/// Reads one descriptive parameter of a mounted slot.
+fn saveDataGetParam(
+    _: u64,
+    parameter: u32,
+    value_address: u64,
+    size: u64,
+    written_address: u64,
+) callconv(abi.guest) i32 {
+    if (value_address == 0 or size == 0) return invalid_argument;
+    if (!kernel_memory.isGuestRangeAccessible(value_address, @intCast(size))) {
+        return errno.KernelError.efault.raw();
+    }
+
+    var storage: [1024]u8 = undefined;
+    const text = filesystem.readSaveDataParameters(filesystem.mountedSaveDataSlot(), &storage) orelse "";
+    const decoded = savedata.decodeParameters(text);
+    const value = switch (parameter) {
+        save_data_param_title => decoded.title,
+        save_data_param_subtitle => decoded.subtitle,
+        save_data_param_detail => decoded.detail,
+        save_data_param_user => {
+            if (size < @sizeOf(u32)) return invalid_argument;
+            @as(*u32, @ptrFromInt(value_address)).* = decoded.user_parameter;
+            reportParameterLength(written_address, @sizeOf(u32));
+            return errno.ok;
+        },
+        else => return invalid_argument,
+    };
+
+    const destination: [*]u8 = @ptrFromInt(value_address);
+    const length = @min(value.len, @as(usize, @intCast(size)) - 1);
+    @memcpy(destination[0..length], value[0..length]);
+    destination[length] = 0;
+    reportParameterLength(written_address, length);
+    return errno.ok;
+}
+
+fn reportParameterLength(address: u64, length: usize) void {
+    if (address == 0 or !kernel_memory.isGuestRangeAccessible(address, @sizeOf(u64))) return;
+    @as(*u64, @ptrFromInt(address)).* = length;
+}
+
+/// Records the descriptive parameters a title attaches to the mounted slot.
+fn saveDataSetParam(
+    _: u64,
+    parameter: u32,
+    value_address: u64,
+    size: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    if (value_address == 0 or size == 0) return invalid_argument;
+    if (!kernel_memory.isGuestRangeAccessible(value_address, @intCast(size))) {
+        return errno.KernelError.efault.raw();
+    }
+    const slot = filesystem.mountedSaveDataSlot();
+    if (slot.len == 0) return invalid_argument;
+
+    var storage: [1024]u8 = undefined;
+    const existing = filesystem.readSaveDataParameters(slot, &storage) orelse "";
+    var decoded = savedata.decodeParameters(existing);
+    // The decoded values point into `storage`, which the encode below reuses;
+    // copy the ones that are being kept before that happens.
+    var kept: [768]u8 = undefined;
+    var kept_length: usize = 0;
+    const title = retainValue(&kept, &kept_length, decoded.title);
+    const subtitle = retainValue(&kept, &kept_length, decoded.subtitle);
+    const detail = retainValue(&kept, &kept_length, decoded.detail);
+    decoded = .{
+        .title = title,
+        .subtitle = subtitle,
+        .detail = detail,
+        .user_parameter = decoded.user_parameter,
+    };
+
+    const source: [*]const u8 = @ptrFromInt(value_address);
+    switch (parameter) {
+        save_data_param_title => decoded.title = savedata.boundedName(source[0..@intCast(size)]),
+        save_data_param_subtitle => decoded.subtitle = savedata.boundedName(source[0..@intCast(size)]),
+        save_data_param_detail => decoded.detail = savedata.boundedName(source[0..@intCast(size)]),
+        save_data_param_user => {
+            if (size < @sizeOf(u32)) return invalid_argument;
+            decoded.user_parameter = @as(*const u32, @ptrFromInt(value_address)).*;
+        },
+        else => return invalid_argument,
+    }
+
+    var encoded_storage: [1024]u8 = undefined;
+    const encoded = savedata.encodeParameters(&encoded_storage, decoded) orelse return invalid_argument;
+    filesystem.writeSaveDataParameters(slot, encoded) catch return errno.KernelError.eio.raw();
+    return errno.ok;
+}
+
+/// Copies a value out of a buffer that is about to be reused.
+fn retainValue(storage: []u8, length: *usize, value: []const u8) []const u8 {
+    if (value.len == 0 or length.* + value.len > storage.len) return "";
+    const start = length.*;
+    @memcpy(storage[start..][0..value.len], value);
+    length.* += value.len;
+    return storage[start..][0..value.len];
+}
+
 const app_content_exports = [_]symbols.Export{
     .{ .name = "sceAppContentAddcontMount", .function = trace.wrap("sceAppContentAddcontMount", &success), .expect_id = "VANhIWcqYak" },
     .{ .name = "sceAppContentAddcontUnmount", .function = trace.wrap("sceAppContentAddcontUnmount", &success), .expect_id = "3rHWaV-1KC4" },
@@ -1161,6 +1324,9 @@ const save_data_exports = [_]symbols.Export{
     .{ .name = "sceSaveDataPrepare", .function = trace.wrap("sceSaveDataPrepare", &saveDataTwoPointers), .expect_id = "sDCBrmc61XU" },
     .{ .name = "sceSaveDataCommit", .function = trace.wrap("sceSaveDataCommit", &saveDataOnePointer), .expect_id = "ie7qhZ4X0Cc" },
     .{ .name = "sceSaveDataUmount2", .function = trace.wrap("sceSaveDataUmount2", &saveDataUmount), .expect_id = "uW4vfTwMQVo" },
+    .{ .name = "sceSaveDataDirNameSearch", .function = trace.wrap("sceSaveDataDirNameSearch", &saveDataDirNameSearch), .expect_id = "dyIhnXq-0SM" },
+    .{ .name = "sceSaveDataGetParam", .function = trace.wrap("sceSaveDataGetParam", &saveDataGetParam), .expect_id = "XgvSuIdnMlw" },
+    .{ .name = "sceSaveDataSetParam", .function = trace.wrap("sceSaveDataSetParam", &saveDataSetParam), .expect_id = "85zul--eGXs" },
 };
 
 const sysmodule_bootstrap_exports = [_]symbols.Export{
