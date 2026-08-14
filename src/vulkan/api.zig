@@ -180,14 +180,33 @@ pub const format_r8g8_snorm: u32 = 17;
 pub const format_r8g8_uint: u32 = 20;
 pub const format_r8g8_sint: u32 = 21;
 pub const format_r16_unorm: u32 = 70;
+pub const format_r16_snorm: u32 = 71;
 pub const format_r16_uint: u32 = 74;
+pub const format_r16_sint: u32 = 75;
+pub const format_r16_sfloat: u32 = 76;
+pub const format_r16g16_unorm: u32 = 77;
+pub const format_r16g16_snorm: u32 = 78;
+pub const format_r16g16_uint: u32 = 81;
+pub const format_r16g16_sint: u32 = 82;
+pub const format_r16g16_sfloat: u32 = 83;
 pub const format_r32_uint: u32 = 98;
+pub const format_r32_sint: u32 = 99;
 pub const format_r32_sfloat: u32 = 100;
+pub const format_r32g32_uint: u32 = 101;
+pub const format_r32g32_sint: u32 = 102;
+pub const format_r32g32_sfloat: u32 = 103;
 pub const format_r8g8b8a8_unorm: u32 = 37;
+pub const format_r8g8b8a8_snorm: u32 = 38;
 pub const format_r8g8b8a8_uint: u32 = 41;
+pub const format_r8g8b8a8_sint: u32 = 42;
 pub const format_r8g8b8a8_srgb: u32 = 43;
 pub const format_r16g16b16a16_unorm: u32 = 91;
+pub const format_r16g16b16a16_snorm: u32 = 92;
+pub const format_r16g16b16a16_uint: u32 = 95;
+pub const format_r16g16b16a16_sint: u32 = 96;
 pub const format_r16g16b16a16_sfloat: u32 = 97;
+pub const format_r32g32b32a32_uint: u32 = 107;
+pub const format_r32g32b32a32_sint: u32 = 108;
 pub const format_r32g32b32a32_sfloat: u32 = 109;
 pub const format_b10g11r11_ufloat_pack32: u32 = 122;
 pub const format_a2b10g10r10_unorm_pack32: u32 = 64;
@@ -221,6 +240,8 @@ pub const image_type_3d: u32 = 2;
 pub const image_view_type_2d: u32 = 1;
 pub const image_view_type_3d: u32 = 2;
 pub const image_view_type_cube: u32 = 3;
+pub const image_view_type_2d_array: u32 = 5;
+pub const image_create_mutable_format_bit: Flags = 0x08;
 pub const image_create_cube_compatible_bit: Flags = 0x10;
 pub const image_tiling_optimal: u32 = 0;
 pub const sample_count_1_bit: Flags = 1;
@@ -309,6 +330,15 @@ pub const DeviceQueueCreateInfo = extern struct {
     queue_count: u32,
     queue_priorities: [*]const f32,
 };
+
+/// Vulkan 1.0 core device features are a packed array of 55 VkBool32 values.
+/// Keeping the ABI representation flat lets this minimal binding enable only
+/// the features used by generated shaders without importing the SDK headers.
+pub const PhysicalDeviceFeatures = extern struct {
+    values: [55]Bool32 = [_]Bool32{0} ** 55,
+};
+
+pub const feature_shader_storage_image_extended_formats: usize = 29;
 
 pub const DeviceCreateInfo = extern struct {
     s_type: u32 = structure_type_device_create_info,
@@ -914,6 +944,7 @@ pub const PfnCreateInstance = *const fn (*const InstanceCreateInfo, ?*const anyo
 pub const PfnDestroyInstance = *const fn (Instance, ?*const anyopaque) callconv(call) void;
 pub const PfnEnumeratePhysicalDevices = *const fn (Instance, *u32, ?[*]PhysicalDevice) callconv(call) Result;
 pub const PfnGetPhysicalDeviceProperties = *const fn (PhysicalDevice, *anyopaque) callconv(call) void;
+pub const PfnGetPhysicalDeviceFeatures = *const fn (PhysicalDevice, *PhysicalDeviceFeatures) callconv(call) void;
 pub const PfnGetPhysicalDeviceQueueFamilyProperties = *const fn (PhysicalDevice, *u32, ?[*]QueueFamilyProperties) callconv(call) void;
 pub const PfnGetPhysicalDeviceMemoryProperties = *const fn (PhysicalDevice, *PhysicalDeviceMemoryProperties) callconv(call) void;
 pub const PfnCreateDevice = *const fn (PhysicalDevice, *const DeviceCreateInfo, ?*const anyopaque, *?Device) callconv(call) Result;

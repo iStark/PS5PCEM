@@ -24,6 +24,7 @@ fn vop1Opcode(id: u32) isa.Opcode {
         0x0b => .v_cvt_f32_f16,
         0x0c => .v_cvt_rpi_i32_f32,
         0x0d => .v_cvt_flr_i32_f32,
+        0x0e => .v_cvt_off_f32_i4,
         0x11 => .v_cvt_f32_ubyte0,
         0x12 => .v_cvt_f32_ubyte1,
         0x13 => .v_cvt_f32_ubyte2,

@@ -26,6 +26,7 @@ const kernel_sync = hle.libs.kernel_sync;
 const key_state_capacity: usize = 16 * 1024;
 const key_state_mask: usize = key_state_capacity - 1;
 const wake_all = std.math.maxInt(usize);
+const pending_exception_capacity: usize = 512;
 
 const WaitRepeatDiagnostic = struct {
     key: u64 = 0,
@@ -47,6 +48,7 @@ const WaitRepeatDiagnostic = struct {
 };
 
 threadlocal var wait_repeat_diagnostic: WaitRepeatDiagnostic = .{};
+threadlocal var delivering_guest_exception = false;
 
 fn printWaitKeyInfo(key: u64) void {
     const info = kernel_sync.describeWaitKey(key) orelse {
@@ -93,6 +95,60 @@ const Lock = struct {
         self.inner.unlock();
     }
 };
+
+/// Parks on a dispatcher epoch without inheriting cancellation from Zig's
+/// threaded-I/O task. Guest pthreads are ordinary host threads, but the
+/// threaded I/O backend keeps cancellation state per worker; a reused worker
+/// can therefore make `futexWaitTimeout` return `error.Canceled` immediately.
+/// Reporting that as ENOSYS breaks otherwise valid kernel semaphores during
+/// scene loading. Windows already exposes the uncancelable primitive that the
+/// threaded backend ultimately models, so use it directly here.
+fn waitOnEpoch(
+    io: std.Io,
+    epoch: *align(@alignOf(u32)) const u32,
+    expected: u32,
+    timeout: std.Io.Timeout,
+) void {
+    if (comptime builtin.os.tag == .windows) {
+        var relative: std.os.windows.LARGE_INTEGER = undefined;
+        const timeout_pointer: ?*const std.os.windows.LARGE_INTEGER = if (timeout.toDurationFromNow(io)) |duration| blk: {
+            const nanoseconds = @max(duration.raw.nanoseconds, 1);
+            const ticks_100ns: u96 = @intCast(@divTrunc(nanoseconds + 99, 100));
+            const bounded: i64 = @intCast(@min(ticks_100ns, @as(u96, std.math.maxInt(i64))));
+            relative = -bounded;
+            break :blk &relative;
+        } else null;
+        const status = std.os.windows.ntdll.RtlWaitOnAddress(
+            epoch,
+            &expected,
+            @sizeOf(u32),
+            timeout_pointer,
+        );
+        // A timeout, APC, or alert is a permitted spurious wake. The caller
+        // re-checks both the object generation and its absolute deadline.
+        _ = status;
+        return;
+    }
+
+    // Cancellation is not an object failure. Treat it like any other spurious
+    // futex wake so a host runtime detail cannot escape as guest ENOSYS.
+    io.futexWaitTimeout(u32, epoch, expected, timeout) catch {};
+}
+
+fn wakeEpoch(io: std.Io, epoch: *align(@alignOf(u32)) const u32, maximum_waiters: u32) void {
+    if (maximum_waiters == 0) return;
+    if (comptime builtin.os.tag == .windows) {
+        if (maximum_waiters == 1) {
+            std.os.windows.ntdll.RtlWakeAddressSingle(epoch);
+        } else {
+            // Extra wakeups are harmless: waiters still consume the bounded
+            // generation tokens under the dispatcher lock before proceeding.
+            std.os.windows.ntdll.RtlWakeAddressAll(epoch);
+        }
+        return;
+    }
+    io.futexWake(u32, epoch, maximum_waiters);
+}
 
 pub const ExecutionError = error{
     Unsupported,
@@ -1484,6 +1540,12 @@ const KeyState = struct {
     pending_wakes: usize = 0,
 };
 
+const PendingException = struct {
+    target_thread: u64 = 0,
+    handler: u64 = 0,
+    exception_type: i32 = 0,
+};
+
 const Worker = struct {
     dispatcher: *Dispatcher,
     request: threading.StartRequest,
@@ -1516,6 +1578,8 @@ pub const Dispatcher = struct {
     bridge: Bridge = undefined,
     workers: std.ArrayList(*Worker) = .empty,
     key_states: []KeyState = &.{},
+    pending_exceptions: [pending_exception_capacity]PendingException =
+        [_]PendingException{.{}} ** pending_exception_capacity,
     lock: Lock = .{},
     wake_epoch: u32 align(@alignOf(u32)) = 1,
     saturated_keys: bool = false,
@@ -1601,6 +1665,7 @@ pub const Dispatcher = struct {
             .wait_fn = &wait,
             .wake_fn = &wake,
             .call_fn = &call,
+            .raise_exception_fn = &raiseGuestException,
             .request_exit_fn = &requestExit,
         };
     }
@@ -1782,12 +1847,19 @@ pub const Dispatcher = struct {
         self.reapDetachedFinished();
     }
 
-    fn yield(_: ?*anyopaque) void {
+    fn yield(raw: ?*anyopaque) void {
+        if (fromContext(raw)) |self| {
+            _ = self.deliverPendingGuestException() catch |err| std.debug.print(
+                "[cpu] guest exception delivery at yield failed: {s}\n",
+                .{@errorName(err)},
+            );
+        }
         std.Thread.yield() catch {};
     }
 
     fn sleep(raw: ?*anyopaque, microseconds: u64) threading.BackendError!void {
         const self = fromContext(raw) orelse return error.Unsupported;
+        _ = try self.deliverPendingGuestException();
         const duration = std.Io.Clock.Duration{
             .clock = .awake,
             .raw = .fromNanoseconds(@as(i96, microseconds) * std.time.ns_per_us),
@@ -1808,13 +1880,23 @@ pub const Dispatcher = struct {
         // usleep needs here: a private, relative, non-alertable deadline.
         if (builtin.os.tag == .windows) {
             const maximum_us: u64 = @intCast(std.math.maxInt(i64) / 10);
-            const bounded_us: i64 = @intCast(@min(microseconds, maximum_us));
-            const interval: std.os.windows.LARGE_INTEGER = -bounded_us * 10;
-            const status = std.os.windows.ntdll.NtDelayExecution(.FALSE, &interval);
-            if (status != .SUCCESS and status != .TIMEOUT) return error.WaitFailed;
+            var remaining_us = @min(microseconds, maximum_us);
+            while (remaining_us != 0) {
+                // Guest signals must interrupt long sleeps so Unity can stop
+                // every worker for GC. Keep NtDelayExecution non-alertable —
+                // Windows and Zig use alert state internally — and poll at a
+                // bounded interval instead.
+                const slice_us: i64 = @intCast(@min(remaining_us, 10 * std.time.us_per_ms));
+                const interval: std.os.windows.LARGE_INTEGER = -slice_us * 10;
+                const status = std.os.windows.ntdll.NtDelayExecution(.FALSE, &interval);
+                if (status != .SUCCESS and status != .TIMEOUT) return error.WaitFailed;
+                if (try self.deliverPendingGuestException()) return;
+                remaining_us -= @intCast(slice_us);
+            }
             return;
         }
         duration.sleep(self.io) catch return error.WaitFailed;
+        _ = try self.deliverPendingGuestException();
     }
 
     fn wait(
@@ -1822,6 +1904,7 @@ pub const Dispatcher = struct {
         request: threading.WaitRequest,
     ) threading.BackendError!threading.WaitResult {
         const self = fromContext(raw) orelse return error.Unsupported;
+        _ = try self.deliverPendingGuestException();
         const current_name_storage = self.manager.currentName();
         const current_name = std.mem.sliceTo(&current_name_storage, 0);
         const main_long_wait = std.mem.eql(u8, current_name, "eboot-main") and
@@ -1878,6 +1961,7 @@ pub const Dispatcher = struct {
         var wait_attempts: u32 = 0;
 
         while (true) {
+            _ = try self.deliverPendingGuestException();
             wait_attempts +|= 1;
             if (wait_attempts == 100_000) std.debug.print(
                 "[cpu wait] futex churn key=0x{x} sequence={d} thread=0x{x} relative_us={?d} deadline_ns={?d} clock={d}\n",
@@ -1910,13 +1994,12 @@ pub const Dispatcher = struct {
                 const now = std.Io.Clock.Timestamp.now(self.io, end.clock);
                 if (std.Io.Clock.Timestamp.compare(end, .lte, now)) return .timed_out;
             }
-            self.io.futexWaitTimeout(
-                u32,
+            waitOnEpoch(
+                self.io,
                 &key_state.wake_epoch,
                 epoch,
                 if (monitor_wait) monitored_timeout else timeout,
-            ) catch
-                return error.WaitFailed;
+            );
             if (monitor_wait and wait_attempts == 2) {
                 if (scheduler_watchdog) {
                     const name_storage = self.manager.currentName();
@@ -1966,8 +2049,97 @@ pub const Dispatcher = struct {
                 std.math.maxInt(u32)
             else
                 @intCast(@min(maximum_waiters, std.math.maxInt(u32)));
-            self.io.futexWake(u32, &state.wake_epoch, wake_count);
+            wakeEpoch(self.io, &state.wake_epoch, wake_count);
         }
+    }
+
+    fn raiseGuestException(
+        raw: ?*anyopaque,
+        target_thread: u64,
+        handler: u64,
+        exception_type: i32,
+    ) threading.BackendError!void {
+        const self = fromContext(raw) orelse return error.Unsupported;
+        if (target_thread == 0 or handler == 0) return error.ThreadNotFound;
+
+        self.lock.lock();
+        if (self.shutting_down) {
+            self.lock.unlock();
+            return error.WaitFailed;
+        }
+        var free: ?*PendingException = null;
+        for (&self.pending_exceptions) |*pending| {
+            if (pending.target_thread == target_thread) {
+                // One process signal is enough until the target reaches a safe
+                // delivery point. Unity never needs duplicate SIGUSR1 entries.
+                pending.handler = handler;
+                pending.exception_type = exception_type;
+                self.lock.unlock();
+                self.publishAllKeyWakes();
+                return;
+            }
+            if (pending.target_thread == 0 and free == null) free = pending;
+        }
+        const slot = free orelse {
+            self.lock.unlock();
+            return error.WaitFailed;
+        };
+        slot.* = .{
+            .target_thread = target_thread,
+            .handler = handler,
+            .exception_type = exception_type,
+        };
+        self.lock.unlock();
+
+        // A target already parked in RtlWaitOnAddress must return to the
+        // dispatcher before it can run the callback on its own guest stack.
+        self.publishAllKeyWakes();
+    }
+
+    fn takePendingGuestException(self: *Dispatcher, target_thread: u64) ?PendingException {
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (&self.pending_exceptions) |*pending| {
+            if (pending.target_thread != target_thread) continue;
+            const result = pending.*;
+            pending.* = .{};
+            return result;
+        }
+        return null;
+    }
+
+    fn deliverPendingGuestException(self: *Dispatcher) threading.BackendError!bool {
+        if (delivering_guest_exception) return false;
+        const active = active_execution orelse return false;
+        if (active.dispatcher != self) return false;
+        const pending = self.takePendingGuestException(active.thread_handle) orelse return false;
+
+        // Orbis ucontext_t places its amd64 mcontext at +0x40. A conservative
+        // stack pointer keeps all live roots visible even though delivery
+        // happens at an HLE safe point rather than at an arbitrary instruction.
+        var context: [0x500]u8 align(16) = [_]u8{0} ** 0x500;
+        const mcontext: usize = 0x40;
+        const stack_pointer = @intFromPtr(&context);
+        std.mem.writeInt(u64, context[mcontext + 0x48 ..][0..8], stack_pointer, .little); // RBP
+        std.mem.writeInt(u64, context[mcontext + 0xb8 ..][0..8], stack_pointer, .little); // RSP
+        std.mem.writeInt(u64, context[mcontext + 0xc8 ..][0..8], 0x480, .little); // mcontext size
+        std.mem.writeInt(u64, context[mcontext + 0x440 ..][0..8], active.context.fs_base, .little);
+
+        delivering_guest_exception = true;
+        defer delivering_guest_exception = false;
+        _ = call(self, .{
+            .entry_point = pending.handler,
+            .thread_handle = active.thread_handle,
+            .arguments = .{ @bitCast(@as(i64, pending.exception_type)), @intFromPtr(&context), 0, 0, 0, 0 },
+            .argument_count = 2,
+        }) catch |err| {
+            std.debug.print(
+                "[cpu] guest exception delivery failed target=0x{x} type={d} handler=0x{x}: {s}\n",
+                .{ active.thread_handle, pending.exception_type, pending.handler, @errorName(err) },
+            );
+            return error.CallFailed;
+        };
+        return true;
     }
 
     fn call(raw: ?*anyopaque, guest_call: threading.GuestCall) threading.BackendError!u64 {
@@ -2160,14 +2332,14 @@ pub const Dispatcher = struct {
 
     fn publishWake(self: *Dispatcher) void {
         _ = @atomicRmw(u32, &self.wake_epoch, .Add, 1, .release);
-        self.io.futexWake(u32, &self.wake_epoch, std.math.maxInt(u32));
+        wakeEpoch(self.io, &self.wake_epoch, std.math.maxInt(u32));
     }
 
     fn publishAllKeyWakes(self: *Dispatcher) void {
         for (self.key_states) |*state| {
             if (!state.used) continue;
             _ = @atomicRmw(u32, &state.wake_epoch, .Add, 1, .release);
-            self.io.futexWake(u32, &state.wake_epoch, std.math.maxInt(u32));
+            wakeEpoch(self.io, &state.wake_epoch, std.math.maxInt(u32));
         }
     }
 };

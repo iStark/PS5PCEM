@@ -66,6 +66,7 @@ pub const Error = error{
     PipelineLayoutCreationFailed,
     ComputePipelineCreationFailed,
     GraphicsPipelineCreationFailed,
+    NvidiaCompilerGuardActive,
     ImageCreationFailed,
     ImageViewCreationFailed,
     RenderPassCreationFailed,
@@ -87,7 +88,6 @@ pub const Error = error{
     GuestBufferNotStaged,
     InvalidStorageDescriptor,
     MissingStorageDescriptor,
-    ComputePipelineCacheFull,
     GraphicsPipelineCacheFull,
     MissingComputeProgram,
     MissingGraphicsProgram,
@@ -104,6 +104,7 @@ pub const Error = error{
     PresentationRejected,
     UnsupportedSampledImage,
     UnsupportedStorageImage,
+    StorageImageCapacityExceeded,
     SamplerCreationFailed,
     UnsupportedPresentationPlatform,
     SurfaceCreationFailed,
@@ -154,6 +155,11 @@ pub const Options = struct {
     /// submitting them to Vulkan. This isolates translation and binding gaps
     /// from GPU execution faults while preserving later command processing.
     translate_compute_only: bool = false,
+    /// Diagnostic device override for systems with both discrete and integrated
+    /// Vulkan adapters.
+    prefer_integrated_gpu: bool = false,
+    /// Writes NVIDIA-guarded compute modules to `out` for offline validation.
+    dump_compute_spirv: bool = false,
     /// Optional Win32 output window. Supplying it enables the required surface
     /// and swapchain extensions and constrains device selection to a queue that
     /// can present to this exact surface.
@@ -333,6 +339,7 @@ const InstanceFunctions = struct {
     destroy_instance: vk.PfnDestroyInstance,
     enumerate_physical_devices: vk.PfnEnumeratePhysicalDevices,
     get_physical_device_properties: vk.PfnGetPhysicalDeviceProperties,
+    get_physical_device_features: vk.PfnGetPhysicalDeviceFeatures,
     get_queue_family_properties: vk.PfnGetPhysicalDeviceQueueFamilyProperties,
     get_memory_properties: vk.PfnGetPhysicalDeviceMemoryProperties,
     create_device: vk.PfnCreateDevice,
@@ -343,6 +350,7 @@ const InstanceFunctions = struct {
             .destroy_instance = try loader.instance(instance_handle, vk.PfnDestroyInstance, "vkDestroyInstance"),
             .enumerate_physical_devices = try loader.instance(instance_handle, vk.PfnEnumeratePhysicalDevices, "vkEnumeratePhysicalDevices"),
             .get_physical_device_properties = try loader.instance(instance_handle, vk.PfnGetPhysicalDeviceProperties, "vkGetPhysicalDeviceProperties"),
+            .get_physical_device_features = try loader.instance(instance_handle, vk.PfnGetPhysicalDeviceFeatures, "vkGetPhysicalDeviceFeatures"),
             .get_queue_family_properties = try loader.instance(instance_handle, vk.PfnGetPhysicalDeviceQueueFamilyProperties, "vkGetPhysicalDeviceQueueFamilyProperties"),
             .get_memory_properties = try loader.instance(instance_handle, vk.PfnGetPhysicalDeviceMemoryProperties, "vkGetPhysicalDeviceMemoryProperties"),
             .create_device = try loader.instance(instance_handle, vk.PfnCreateDevice, "vkCreateDevice"),
@@ -556,10 +564,12 @@ const OwnedImage = struct {
 // moved its ring buffers on, while still covering every descriptor in a draw.
 const maximum_guest_buffers = maximum_storage_descriptors;
 pub const maximum_storage_descriptors = 64;
-const maximum_storage_images = 8;
+const maximum_storage_images = rdna2.spirv.maximum_storage_images;
 const dynamic_scalar_descriptor_binding = 2 + maximum_storage_images;
 const sampled_image_3d_descriptor_binding = dynamic_scalar_descriptor_binding + 1;
 const sampled_image_cube_descriptor_binding = dynamic_scalar_descriptor_binding + 2;
+const sampled_image_2d_array_descriptor_binding = dynamic_scalar_descriptor_binding + 3;
+const gds_descriptor_binding = sampled_image_2d_array_descriptor_binding + 1;
 const dynamic_scalar_words_per_stage = gpu.scalar_provenance.maximum_scalar_specializations;
 const dynamic_scalar_buffer_words = dynamic_scalar_words_per_stage * 2;
 const dynamic_scalar_buffer_bytes = dynamic_scalar_buffer_words * @sizeOf(u32);
@@ -600,6 +610,22 @@ const maximum_completed_frames = 16;
 const maximum_render_targets = 64;
 const maximum_depth_targets = 16;
 const maximum_sampled_images = 32;
+// Descriptor arrays are limited per shader, but the cross-draw texture cache
+// must cover a complete modern frame. The Precinct references roughly sixty
+// stable images per frame; tying cache capacity to the 32 descriptor slots
+// evicted a 64 MiB static texture before its next use and uploaded it again on
+// every flip.
+const maximum_cached_sampled_images = 64;
+/// Storage images form long compute chains in modern Unity render graphs. A
+/// dispatch may write one image only for the next dispatch to read it; keeping
+/// those images resident avoids a GPU -> tiled guest memory -> GPU round trip
+/// at every edge of the graph.
+const maximum_cached_storage_images = 64;
+/// Counts linear image bytes (the cache also owns one transfer allocation per
+/// image). The limit is soft while every resident entry is in use by the same
+/// dispatch, so a legal 32-image descriptor set is never rejected solely by
+/// the cache budget.
+const maximum_cached_storage_image_bytes = 512 * 1024 * 1024;
 /// One DCC key byte covers this many bytes of the compressed colour surface.
 const dcc_block_bytes = 256;
 /// Bounds the key read for a fast-clear probe; covers surfaces up to 1 GiB.
@@ -670,6 +696,7 @@ const ComputePipelineEntry = struct {
     words: []u32,
     shader: vk.ShaderModule,
     pipeline: vk.Pipeline,
+    last_used_sequence: u64,
 };
 
 const GraphicsPipelineEntry = struct {
@@ -825,8 +852,15 @@ fn colorTargetFormat(descriptor: gpu.resources.ColorTarget) ?ColorTargetFormat {
         // DATA_FORMAT_16 + NUMBER_FORMAT_UINT. Unreal uses this as a full-size
         // integer render target before reading the same allocation through an
         // IMG_DATA_FORMAT_16_UINT texture descriptor.
-        2 => if (descriptor.number_type == 4)
-            .{ .vulkan = vk.format_r16_uint, .bytes_per_texel = 2 }
+        2 => switch (descriptor.number_type) {
+            4 => .{ .vulkan = vk.format_r16_uint, .bytes_per_texel = 2 },
+            7 => .{ .vulkan = vk.format_r16_sfloat, .bytes_per_texel = 2 },
+            else => null,
+        },
+        // DATA_FORMAT_16_16 + NUMBER_FORMAT_FLOAT. The Precinct uses this
+        // full-resolution two-channel target in the first world frame.
+        5 => if (descriptor.number_type == 7)
+            .{ .vulkan = vk.format_r16g16_sfloat, .bytes_per_texel = 4 }
         else
             null,
         // DATA_FORMAT_10_11_11 + NUMBER_FORMAT_FLOAT. The sampled-image side
@@ -872,6 +906,11 @@ fn depthTargetFormat(descriptor: gpu.resources.DepthTarget) ?u32 {
         3 => vk.format_d32_sfloat,
         else => null,
     };
+}
+
+fn depthSampledFormatCompatible(depth_format: u32, sampled_format: u32) bool {
+    return (depth_format == vk.format_d16_unorm and sampled_format == vk.format_r16_unorm) or
+        (depth_format == vk.format_d32_sfloat and sampled_format == vk.format_r32_sfloat);
 }
 
 /// The guest depth-compare selector and Vulkan's `VkCompareOp` enumerate the
@@ -1000,6 +1039,9 @@ const CachedDepthTarget = struct {
     view: vk.ImageView,
     /// False until the image has been transitioned out of `undefined`.
     initialized: bool = false,
+    /// Depth written by rasterization may be consumed by a later compute or
+    /// fragment pass without first being materialized into guest memory.
+    shader_read_layout: bool = false,
     last_used_sequence: u64 = 0,
 };
 
@@ -1223,6 +1265,7 @@ const PreparedSampledImage = struct {
     sampler: vk.Sampler,
     owns_view: bool = false,
     owns_sampler: bool = false,
+    storage_cache_index: ?usize = null,
 };
 
 const SampledStagingLayout = union(enum) {
@@ -1301,6 +1344,23 @@ const PreparedStorageImage = struct {
     allocation_bytes: usize,
     staging_bytes: usize,
     writable: bool,
+    cache_index: usize,
+};
+
+const CachedStorageImage = struct {
+    descriptor: gpu.ImageDescriptor,
+    subresource: gpu.TextureSubresourceLayout,
+    image: OwnedImage,
+    view: vk.ImageView,
+    transfer: OwnedBuffer,
+    allocation_bytes: usize,
+    staging_bytes: usize,
+    last_used_sequence: u64,
+    guest_content_hash: u64 = 0,
+    guest_content_hash_valid: bool = false,
+    gpu_dirty: bool = false,
+    in_use: bool = false,
+    valid: bool = true,
 };
 
 const GraphicsResources = struct {
@@ -1336,7 +1396,10 @@ const ComputeResources = struct {
     specialized_scalar_prefix_end: u32 = 0,
     storage_images: [maximum_storage_images]PreparedStorageImage = undefined,
     storage_image_count: usize = 0,
-    storage_image_mappings: [maximum_storage_images]gpu.ShaderSpirvStorageImageBinding = undefined,
+    // One resident image may be loaded into the same T# SGPR range at several
+    // instruction PCs. Keep physical Vulkan images bounded separately from the
+    // larger PC-specific mapping table used by generated Unity kernels.
+    storage_image_mappings: [maximum_storage_descriptors]gpu.ShaderSpirvStorageImageBinding = undefined,
     storage_image_mapping_count: usize = 0,
     sampled_images: [maximum_storage_descriptors]PreparedSampledImage = undefined,
     sampled_image_count: usize = 0,
@@ -1364,13 +1427,6 @@ const ComputeResources = struct {
         return null;
     }
 
-    fn storageImageMappingForSgpr(self: *const ComputeResources, resource_sgpr: u32) ?u32 {
-        for (self.storage_image_mappings[0..self.storage_image_mapping_count]) |mapping| {
-            if (mapping.resource_sgpr == resource_sgpr) return mapping.descriptor_index;
-        }
-        return null;
-    }
-
     fn sampledImageMappingForInstruction(
         self: *const ComputeResources,
         resource_sgpr: u32,
@@ -1390,9 +1446,7 @@ const ComputeResources = struct {
 
     fn deinit(self: *ComputeResources, renderer: *Renderer) void {
         for (self.storage_images[0..self.storage_image_count]) |image| {
-            renderer.device_functions.destroy_image_view(renderer.device, image.view, null);
-            renderer.destroyImage(image.image);
-            renderer.destroyBuffer(image.transfer);
+            renderer.releaseStorageImage(image.cache_index);
         }
         self.storage_image_count = 0;
         self.storage_image_mapping_count = 0;
@@ -1401,6 +1455,7 @@ const ComputeResources = struct {
         for (self.sampled_images[0..self.sampled_image_count]) |image| {
             if (image.owns_view) renderer.device_functions.destroy_image_view(renderer.device, image.view, null);
             if (image.owns_sampler) renderer.device_functions.destroy_sampler(renderer.device, image.sampler, null);
+            if (image.storage_cache_index) |cache_index| renderer.releaseStorageImage(cache_index);
         }
         self.sampled_image_count = 0;
         self.sampled_image_mapping_count = 0;
@@ -1409,6 +1464,46 @@ const ComputeResources = struct {
 
 fn canReuseStorageMapping(attribute_specific: bool, previous: ?u32, current: u32) bool {
     return !attribute_specific and previous != null and previous.? == current;
+}
+
+fn isNvidiaCompilerUnsafeDeformationKernel(
+    analysis: *const gpu.ShaderAnalysis,
+    group_count: [3]u32,
+    resources: *const ComputeResources,
+) bool {
+    if (!std.mem.eql(u32, &group_count, &.{ 127, 1, 1 })) return false;
+    if (analysis.program.instructions.items.len != 90 or resources.mapping_count != 5) return false;
+    if (resources.sampled_image_mapping_count != 0 or resources.storage_image_mapping_count != 0) return false;
+
+    const instructions = analysis.program.instructions.items;
+    const signature = [_]u32{ 0xbfa0_0003, 0xd746_0000, 0xf408_0406, 0xbf8c_c07f };
+    for (signature, 0..) |word, index| {
+        if (instructions[index].word != word) return false;
+    }
+
+    const expected_sgprs = [_]u32{ 16, 4, 0, 8, 12 };
+    const expected_sizes = [_]usize{ 0x10, 0x1f960, 0x4ef70, 0x600, 0x4ef70 };
+    for (resources.mappings[0..5], 0..) |mapping, index| {
+        if (mapping.resource_sgpr != expected_sgprs[index] or mapping.descriptor_index != index) return false;
+        if (resources.sizes[index] != expected_sizes[index]) return false;
+        if (resources.writable[index] != (index == 4)) return false;
+    }
+    return true;
+}
+
+fn dumpComputeSpirv(allocator: std.mem.Allocator, program_address: u64, words: []const u32) void {
+    var path_buffer: [96]u8 = undefined;
+    const path = std.fmt.bufPrintZ(
+        &path_buffer,
+        "out\\compute-0x{x}.spv",
+        .{program_address},
+    ) catch return;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const file = std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true }) catch return;
+    defer file.close(io);
+    file.writePositionalAll(io, std.mem.sliceAsBytes(words), 0) catch {};
 }
 
 fn shouldDumpProgressFrame(flip: u64) bool {
@@ -1420,13 +1515,19 @@ fn shouldDumpProgressFrame(flip: u64) bool {
 
 fn sampledImageDimensionForInstruction(
     dimension: rdna2.isa.ImageDimension,
+    image_type: gpu.resources.ImageType,
 ) ?rdna2.spirv.SampledImageDimension {
+    // GFX10's DIM is a requested coordinate form; the T# resource type is the
+    // authoritative view kind. Unity emits DIM=5 for both real 2D arrays and
+    // 3D lookup volumes, so refine the ambiguous form after materializing T#.
+    if (image_type == .color_3d) return .three_d;
     return switch (dimension) {
         .dim_2d => .two_d,
         .dim_3d => .three_d,
         // GFX10 MIMG DIM=3 denotes a cubemap. The decoder's historical enum
         // label is kept to avoid changing the instruction representation.
         .dim_2d_array => .cube,
+        .dim_2d_array_alt => .two_d_array,
         else => null,
     };
 }
@@ -1464,6 +1565,7 @@ pub const Renderer = struct {
     descriptor_set: vk.DescriptorSet,
     dynamic_scalar_buffer: ?OwnedBuffer = null,
     dynamic_scalar_mapping: ?[*]u32 = null,
+    gds_buffer: ?OwnedBuffer = null,
     /// All current submissions complete before returning, so one fence can be
     /// reset and reused instead of allocating a kernel object per draw.
     one_shot_fence: vk.Fence = 0,
@@ -1483,6 +1585,7 @@ pub const Renderer = struct {
     force_probe_fragment_ui: bool,
     skip_compute_dispatches: bool,
     translate_compute_only: bool,
+    dump_compute_spirv: bool,
     guest_memory: ?GuestMemory = null,
     /// Holds a display buffer read straight out of guest memory, for a flip
     /// that names a buffer nothing was rendered into.
@@ -1491,8 +1594,12 @@ pub const Renderer = struct {
     guest_buffer_sequence: u64 = 0,
     gds_storage: std.ArrayList(u8) = .empty,
     compute_pipelines: std.ArrayList(ComputePipelineEntry) = .empty,
+    compute_pipeline_sequence: u64 = 0,
     graphics_pipelines: std.ArrayList(GraphicsPipelineEntry) = .empty,
     sampled_image_cache: std.ArrayList(CachedSampledImage) = .empty,
+    storage_image_cache: std.ArrayList(CachedStorageImage) = .empty,
+    storage_image_cache_bytes: usize = 0,
+    storage_image_sequence: u64 = 0,
     /// Decoded shader programs, held across draws. Its capacity is reserved
     /// once so entries never move: callers hold `*const Analysis` into it for
     /// the length of a draw.
@@ -1514,6 +1621,7 @@ pub const Renderer = struct {
     depth_targets: std.ArrayList(CachedDepthTarget) = .empty,
     depth_target_sequence: u64 = 0,
     reported_depth_attachment: bool = false,
+    reported_unbacked_depth_sample: bool = false,
     htile_targets: std.ArrayList(CachedHtileTarget) = .empty,
     htile_target_sequence: u64 = 0,
     latest_render_target_index: ?usize = null,
@@ -1558,6 +1666,11 @@ pub const Renderer = struct {
     emulated_buffer_clear_dispatches: u64 = 0,
     emulated_image_store_dispatches: u64 = 0,
     emulated_image_copy_dispatches: u64 = 0,
+    emulated_nvidia_deformation_dispatches: u64 = 0,
+    skipped_nvidia_compute_pipelines: u64 = 0,
+    skipped_nvidia_graphics_pipelines: u64 = 0,
+    nvidia_compute_compiler_guard_active: bool = false,
+    nvidia_graphics_compiler_guard_budget: u32 = 0,
     video_surface_addresses: [8]u64 = @splat(0),
     video_surface_count: usize = 0,
     video_surface_last_flip: u64 = 0,
@@ -1669,6 +1782,7 @@ pub const Renderer = struct {
             &instance_functions,
             surface,
             if (surface_functions) |*functions| functions else null,
+            options.prefer_integrated_gpu,
         );
         const queue_priority: f32 = 1.0;
         const queue_info = vk.DeviceQueueCreateInfo{
@@ -1677,11 +1791,18 @@ pub const Renderer = struct {
             .queue_priorities = @ptrCast(&queue_priority),
         };
         const device_extension_names = [_][*:0]const u8{"VK_KHR_swapchain"};
+        var supported_features = vk.PhysicalDeviceFeatures{};
+        instance_functions.get_physical_device_features(candidate.physical_device, &supported_features);
+        var enabled_features = vk.PhysicalDeviceFeatures{};
+        if (supported_features.values[vk.feature_shader_storage_image_extended_formats] != 0) {
+            enabled_features.values[vk.feature_shader_storage_image_extended_formats] = vk.true_value;
+        }
         const device_info = vk.DeviceCreateInfo{
             .queue_create_info_count = 1,
             .queue_create_infos = @ptrCast(&queue_info),
             .enabled_extension_count = if (wants_presentation) device_extension_names.len else 0,
             .enabled_extension_names = if (wants_presentation) &device_extension_names else null,
+            .enabled_features = &enabled_features,
         };
         var maybe_device: ?vk.Device = null;
         if (instance_functions.create_device(candidate.physical_device, &device_info, null, &maybe_device) != vk.success) {
@@ -1726,7 +1847,7 @@ pub const Renderer = struct {
             .descriptor_count = maximum_storage_descriptors,
             .stage_flags = vk.shader_stage_vertex_bit | vk.shader_stage_fragment_bit | vk.shader_stage_compute_bit,
         };
-        var descriptor_bindings: [5 + maximum_storage_images]vk.DescriptorSetLayoutBinding = undefined;
+        var descriptor_bindings: [7 + maximum_storage_images]vk.DescriptorSetLayoutBinding = undefined;
         descriptor_bindings[0] = storage_binding;
         descriptor_bindings[1] = sampled_image_binding;
         for (0..maximum_storage_images) |index| {
@@ -1755,6 +1876,18 @@ pub const Renderer = struct {
             .descriptor_count = maximum_storage_descriptors,
             .stage_flags = vk.shader_stage_vertex_bit | vk.shader_stage_fragment_bit | vk.shader_stage_compute_bit,
         };
+        descriptor_bindings[5 + maximum_storage_images] = .{
+            .binding = sampled_image_2d_array_descriptor_binding,
+            .descriptor_type = vk.descriptor_type_combined_image_sampler,
+            .descriptor_count = maximum_storage_descriptors,
+            .stage_flags = vk.shader_stage_vertex_bit | vk.shader_stage_fragment_bit | vk.shader_stage_compute_bit,
+        };
+        descriptor_bindings[6 + maximum_storage_images] = .{
+            .binding = gds_descriptor_binding,
+            .descriptor_type = vk.descriptor_type_storage_buffer,
+            .descriptor_count = 1,
+            .stage_flags = vk.shader_stage_compute_bit,
+        };
         const descriptor_layout_info = vk.DescriptorSetLayoutCreateInfo{
             .binding_count = descriptor_bindings.len,
             .bindings = &descriptor_bindings,
@@ -1767,11 +1900,11 @@ pub const Renderer = struct {
 
         const pool_size = vk.DescriptorPoolSize{
             .descriptor_type = vk.descriptor_type_storage_buffer,
-            .descriptor_count = maximum_storage_descriptors + 1,
+            .descriptor_count = maximum_storage_descriptors + 2,
         };
         const image_pool_size = vk.DescriptorPoolSize{
             .descriptor_type = vk.descriptor_type_combined_image_sampler,
-            .descriptor_count = maximum_storage_descriptors * 3,
+            .descriptor_count = maximum_storage_descriptors * 4,
         };
         const storage_image_pool_size = vk.DescriptorPoolSize{
             .descriptor_type = vk.descriptor_type_storage_image,
@@ -1887,6 +2020,7 @@ pub const Renderer = struct {
             .force_probe_fragment_ui = options.force_probe_fragment_ui,
             .skip_compute_dispatches = options.skip_compute_dispatches,
             .translate_compute_only = options.translate_compute_only,
+            .dump_compute_spirv = options.dump_compute_spirv,
             .window_presentation = window_presentation,
         };
         renderer.dynamic_scalar_buffer = try renderer.createBuffer(
@@ -1938,6 +2072,17 @@ pub const Renderer = struct {
             .buffer_info = @ptrCast(&scalar_buffer_info),
         };
         device_functions.update_descriptor_sets(device, 1, @ptrCast(&scalar_write), 0, null);
+        try renderer.gds_storage.resize(allocator, 64 * 1024);
+        errdefer renderer.gds_storage.deinit(allocator);
+        @memset(renderer.gds_storage.items, 0);
+        renderer.gds_buffer = try renderer.createBuffer(
+            renderer.gds_storage.items.len,
+            vk.buffer_usage_storage_buffer_bit,
+            vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+        );
+        errdefer renderer.destroyBuffer(renderer.gds_buffer.?);
+        try renderer.writeMapped(renderer.gds_buffer.?, renderer.gds_storage.items);
+        renderer.updateGdsDescriptor(renderer.gds_buffer.?);
         return renderer;
     }
 
@@ -1955,6 +2100,13 @@ pub const Renderer = struct {
             self.destroyImage(image.image);
         }
         self.sampled_image_cache.deinit(self.allocator);
+        for (self.storage_image_cache.items) |image| {
+            if (!image.valid) continue;
+            self.device_functions.destroy_image_view(self.device, image.view, null);
+            self.destroyImage(image.image);
+            self.destroyBuffer(image.transfer);
+        }
+        self.storage_image_cache.deinit(self.allocator);
         for (self.compute_pipelines.items) |entry| {
             self.device_functions.destroy_pipeline(self.device, entry.pipeline, null);
             self.device_functions.destroy_shader_module(self.device, entry.shader, null);
@@ -1980,6 +2132,7 @@ pub const Renderer = struct {
             if (self.dynamic_scalar_mapping != null) self.device_functions.unmap_memory(self.device, buffer.memory);
             self.destroyBuffer(buffer);
         }
+        if (self.gds_buffer) |buffer| self.destroyBuffer(buffer);
         if (self.one_shot_fence != 0) self.device_functions.destroy_fence(self.device, self.one_shot_fence, null);
         self.gds_storage.deinit(self.allocator);
         // Persist compiled pipelines for the next run before the cache handle
@@ -2453,6 +2606,7 @@ pub const Renderer = struct {
         const entry = &self.guest_buffers.items[entry_index.?];
         entry.last_used_sequence = self.guest_buffer_sequence;
         if (!entry.gpu_dirty) {
+            try self.flushGuestStorageImageRange(guest_address, size);
             var mapped: ?*anyopaque = null;
             if (self.device_functions.map_memory(self.device, entry.device_local.memory, 0, size, 0, &mapped) != vk.success) {
                 return Error.MemoryMapFailed;
@@ -2602,6 +2756,17 @@ pub const Renderer = struct {
             self.frame_profile.compute_emulation_ns +|= elapsedHostNanoseconds(emulation_started);
             return report;
         }
+        if (try self.tryEmulateGdsReadback(
+            memory,
+            state,
+            analysis,
+            system_registers,
+            local_size,
+            group_count,
+        )) |report| {
+            self.frame_profile.compute_emulation_ns +|= elapsedHostNanoseconds(emulation_started);
+            return report;
+        }
         if (try self.tryEmulateBufferCopy(
             memory,
             state,
@@ -2671,6 +2836,8 @@ pub const Renderer = struct {
             return report;
         }
         self.frame_profile.compute_emulation_ns +|= elapsedHostNanoseconds(emulation_started);
+        const uses_gds = programUsesGds(analysis);
+        if (uses_gds) try self.uploadGdsStorage();
         if (!analysis.hasExternalEffects()) {
             self.elided_dispatches += 1;
             std.debug.print(
@@ -2690,14 +2857,31 @@ pub const Renderer = struct {
         var resources = blk: {
             const resource_started = hostTimestampNs();
             defer self.frame_profile.compute_resource_ns +|= elapsedHostNanoseconds(resource_started);
-            break :blk try self.prepareComputeResources(
+            break :blk self.prepareComputeResources(
                 &bindings,
                 reader,
                 analysis,
                 &scalar,
                 specialized_scalar_prefix_end,
                 null,
-            );
+            ) catch |err| {
+                // Keep NVIDIA's command stream alive if a future kernel exceeds
+                // the fixed physical descriptor budget. Unsupported formats
+                // and malformed guest descriptors remain hard errors.
+                if (err == Error.StorageImageCapacityExceeded and self.device_info.vendor_id == 0x10de) {
+                    self.elided_dispatches += 1;
+                    std.debug.print(
+                        "[vulkan dcb] elided NVIDIA storage-image-capacity kernel program=0x{x} instructions={d}\n",
+                        .{ program_address, analysis.program.instructions.items.len },
+                    );
+                    return .{
+                        .pipeline_cache_hit = false,
+                        .group_count = group_count,
+                        .spirv_words = 0,
+                    };
+                }
+                return err;
+            };
         };
         defer resources.deinit(self);
         if (self.traceCurrentGraphicsFrame()) {
@@ -2812,12 +2996,21 @@ pub const Renderer = struct {
             .sampled_images = resources.sampled_image_mappings[0..resources.sampled_image_mapping_count],
             .storage_images = resources.storage_image_mappings[0..resources.storage_image_mapping_count],
             .scalar_registers = resources.scalar_registers[0..resources.scalar_count],
+            // Compute user-data values change on nearly every dispatch in
+            // modern Unity titles.  Keep the module shape stable and source
+            // those values from the persistently mapped scalar buffer instead
+            // of baking them into a new SPIR-V module/pipeline every frame.
+            .dynamic_scalar_binding = if (resources.scalar_count != 0) .{
+                .binding = dynamic_scalar_descriptor_binding,
+                .value_base = 0,
+            } else null,
             .compute_inputs = .{
                 .workgroup_id_sgprs = system_registers.workgroup_id_sgprs,
                 .threadgroup_size_sgpr = system_registers.threadgroup_size_sgpr,
                 .local_invocation_id_components = system_registers.local_invocation_id_components,
             },
             .workgroup_memory_size_bytes = computeLdsSizeBytes(state),
+            .gds_storage = uses_gds,
             .descriptor_array_length = maximum_storage_descriptors,
             .specialized_scalar_prefix_end = resources.specialized_scalar_prefix_end,
         }) catch |err| {
@@ -2873,6 +3066,56 @@ pub const Renderer = struct {
         };
         self.frame_profile.compute_translate_ns +|= elapsedHostNanoseconds(translate_started);
         defer module.deinit(self.allocator);
+        if (self.device_info.vendor_id == 0x10de and
+            isNvidiaCompilerUnsafeDeformationKernel(analysis, group_count, &resources))
+        {
+            // nvgpucomp64.dll faults while compiling this Unity/Burst
+            // deformation kernel, consistently near the end of The Precinct's
+            // long scene load. Preserve useful geometry with the undeformed
+            // input stream and retain the exact module for offline diagnosis.
+            dumpComputeSpirv(self.allocator, program_address, module.words);
+            try self.copyResidentGuestStorage(
+                resources.addresses[2],
+                resources.addresses[4],
+                resources.sizes[2],
+            );
+            self.emulated_nvidia_deformation_dispatches += 1;
+            self.nvidia_compute_compiler_guard_active = true;
+            self.nvidia_graphics_compiler_guard_budget = @max(
+                self.nvidia_graphics_compiler_guard_budget,
+                1,
+            );
+            std.debug.print(
+                "[vulkan dcb] emulated NVIDIA-unsafe deformation kernel program=0x{x} bytes=0x{x} (#{d})\n",
+                .{ program_address, resources.sizes[2], self.emulated_nvidia_deformation_dispatches },
+            );
+            return .{
+                .pipeline_cache_hit = false,
+                .group_count = group_count,
+                .spirv_words = module.words.len,
+            };
+        }
+        if (self.nvidia_compute_compiler_guard_active and !self.hasComputePipeline(module.words)) {
+            // Once the reproducibly fatal Burst kernel appears, NVIDIA's
+            // compiler also faults on the next newly discovered pipeline in
+            // the same scene bootstrap. Continue dispatching every already-
+            // compiled kernel, but keep subsequent misses out of the poisoned
+            // compiler session and preserve same-sized outputs where possible.
+            dumpComputeSpirv(self.allocator, program_address, module.words);
+            const copied_outputs = try self.copyResidentFallbackOutputs(&resources);
+            self.skipped_nvidia_compute_pipelines += 1;
+            if (self.skipped_nvidia_compute_pipelines <= 16 or log_verbose_gpu) {
+                std.debug.print(
+                    "[vulkan dcb] guarded new NVIDIA compute pipeline program=0x{x} outputs_copied={d} (#{d})\n",
+                    .{ program_address, copied_outputs, self.skipped_nvidia_compute_pipelines },
+                );
+            }
+            return .{
+                .pipeline_cache_hit = false,
+                .group_count = group_count,
+                .spirv_words = module.words.len,
+            };
+        }
         if (self.translate_compute_only) {
             std.debug.print(
                 "[vulkan dcb] compute translated only: program=0x{x} spirv_words={d} groups={d}x{d}x{d}\n",
@@ -2890,9 +3133,12 @@ pub const Renderer = struct {
                 .spirv_words = module.words.len,
             };
         }
+        if (self.dump_compute_spirv) dumpComputeSpirv(self.allocator, program_address, module.words);
+        try self.writeComputeScalarValues(resources.scalar_registers[0..resources.scalar_count]);
         const submit_started = hostTimestampNs();
         const report = try self.dispatchSpirv(module.words, group_count);
         self.frame_profile.compute_submit_ns +|= elapsedHostNanoseconds(submit_started);
+        if (uses_gds) try self.downloadGdsStorage();
         try self.commitComputeWrites(memory, &resources);
         try self.commitStorageImages(memory, &resources);
         return report;
@@ -2989,6 +3235,121 @@ pub const Renderer = struct {
         if (log_verbose_gpu) std.debug.print(
             "[vulkan dcb] emulated GDS initialization: {d} writes, value=0x{x}\n",
             .{ writes, fill_value },
+        );
+        return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
+    }
+
+    /// Executes the matching system kernel which gathers selected GDS dwords
+    /// into a guest buffer. GDS already has persistent host backing for DMA and
+    /// the initialization kernel above; running this tiny transfer on the CPU
+    /// keeps all three producers/consumers coherent without exposing a second,
+    /// unsynchronised Vulkan copy of the same 64 KiB address space.
+    fn tryEmulateGdsReadback(
+        self: *Renderer,
+        memory: GuestMemory,
+        state: *const gpu.State,
+        analysis: *const gpu.ShaderAnalysis,
+        system: gpu.resources.ComputeSystemRegisters,
+        local_size: [3]u32,
+        group_count: [3]u32,
+    ) anyerror!?DispatchReport {
+        const inst = analysis.program.instructions.items;
+        if (inst.len != 16 or
+            inst[0].opcode != .s_inst_prefetch or
+            inst[1].opcode != .v_lshl_add_u32 or
+            inst[2].opcode != .s_buffer_load_dword or
+            inst[3].opcode != .s_waitcnt or
+            inst[4].opcode != .v_cmpx_gt_u32 or
+            inst[5].opcode != .s_cbranch_execz or
+            inst[6].opcode != .buffer_load_format_x or
+            inst[7].opcode != .s_buffer_load_dword or
+            inst[8].opcode != .s_waitcnt or
+            inst[9].opcode != .v_add_nc_u32 or
+            inst[10].opcode != .s_bfm_b32 or
+            inst[11].opcode != .s_waitcnt or
+            inst[12].opcode != .ds_read_b32 or
+            inst[13].opcode != .s_waitcnt or
+            inst[14].opcode != .buffer_store_dword or
+            inst[15].opcode != .s_endpgm)
+        {
+            return null;
+        }
+        if (local_size[0] != 64 or local_size[1] != 1 or local_size[2] != 1 or
+            group_count[1] != 1 or group_count[2] != 1 or
+            system.workgroup_id_sgprs[0] != 12 or
+            system.workgroup_id_sgprs[1] != null or system.workgroup_id_sgprs[2] != null or
+            system.local_invocation_id_components != 1)
+        {
+            return null;
+        }
+        if (!registerOperand(inst[1].dst, .vgpr, 1) or
+            !registerOperand(inst[1].src0, .sgpr, 12) or
+            inst[1].src1.kind != .integer_inline_constant or inst[1].src1.value != 6 or
+            !registerOperand(inst[1].src2, .vgpr, 0) or
+            inst[2].dst.kind != .vcc_lo or !registerOperand(inst[2].src0, .sgpr, 8) or inst[2].memory_offset != 0 or
+            inst[4].dst.kind != .exec_lo or inst[4].src0.kind != .vcc_lo or !registerOperand(inst[4].src1, .vgpr, 1) or
+            !registerOperand(inst[6].dst, .vgpr, 0) or !registerOperand(inst[6].src0, .vgpr, 1) or
+            !registerOperand(inst[6].src1, .sgpr, 0) or !inst[6].index_enable or inst[6].offset_enable or
+            inst[7].dst.kind != .vcc_lo or !registerOperand(inst[7].src0, .sgpr, 8) or inst[7].memory_offset != 8 or
+            !registerOperand(inst[9].dst, .vgpr, 1) or inst[9].src0.kind != .vcc_lo or !registerOperand(inst[9].src1, .vgpr, 1) or
+            inst[10].dst.kind != .m0 or inst[10].src0.value != 2 or inst[10].src1.value != 14 or
+            !inst[12].gds or !registerOperand(inst[12].dst, .vgpr, 0) or !registerOperand(inst[12].src0, .vgpr, 0) or
+            !registerOperand(inst[14].dst, .vgpr, 0) or !registerOperand(inst[14].src0, .vgpr, 1) or
+            !registerOperand(inst[14].src1, .sgpr, 4) or inst[14].index_enable or !inst[14].offset_enable)
+        {
+            return null;
+        }
+
+        const addresses = try descriptorFromComputeUserData(state, 0);
+        const destination = try descriptorFromComputeUserData(state, 4);
+        const control = try descriptorFromComputeUserData(state, 8);
+        if (addresses.address == 0 or addresses.stride != 4 or addresses.swizzle_enabled or
+            addresses.add_thread_id or addresses.out_of_bounds_select != 0 or
+            addresses.unified_format != 20 or addresses.dst_select[0] != 4 or
+            destination.address == 0 or destination.swizzle_enabled or destination.add_thread_id or
+            control.address == 0 or control.size_bytes < 12)
+        {
+            return null;
+        }
+
+        try self.flushPendingGuestWrite(control.address, 12);
+        const element_count = try readGuestU32(memory, control.address);
+        const destination_offset = try readGuestU32(memory, control.address + 8);
+        const dispatched = std.math.mul(u64, group_count[0], local_size[0]) catch return Error.GuestBufferTooLarge;
+        const source_records = addresses.size_bytes / addresses.stride;
+        const writes: usize = @intCast(@min(@as(u64, element_count), @min(dispatched, source_records)));
+        if (writes != 0) {
+            const source_bytes = std.math.mul(usize, writes, addresses.stride) catch return Error.GuestBufferTooLarge;
+            try self.flushPendingGuestWrite(addresses.address, source_bytes);
+        }
+        if (!self.ensureGdsStorage()) return Error.MemoryAllocationFailed;
+
+        var address_bytes: [4]u8 = undefined;
+        var value_bytes: [4]u8 = undefined;
+        for (0..writes) |index| {
+            const source_address = addresses.address + @as(u64, @intCast(index)) * addresses.stride;
+            if (!memory.read(memory.context, source_address, &address_bytes)) return Error.GuestMemoryReadFailed;
+            const gds_address: usize = @intCast(std.mem.readInt(u32, &address_bytes, .little) & ~@as(u32, 3));
+            if (gds_address > self.gds_storage.items.len or 4 > self.gds_storage.items.len - gds_address) {
+                return Error.InvalidStorageDescriptor;
+            }
+            @memcpy(&value_bytes, self.gds_storage.items[gds_address..][0..4]);
+
+            // The store uses OFFEN rather than IDXEN, so the lane number is a
+            // byte offset exactly as on GFX10 (the common one-element path is
+            // naturally aligned).
+            const byte_offset = std.math.add(u64, destination_offset, index) catch return Error.GuestBufferTooLarge;
+            if (byte_offset > destination.size_bytes or 4 > destination.size_bytes - byte_offset) {
+                return Error.InvalidStorageDescriptor;
+            }
+            const destination_address = destination.address + byte_offset;
+            try self.flushPendingGuestWrite(destination_address, 4);
+            if (!memory.write(memory.context, destination_address, &value_bytes)) return Error.GuestMemoryWriteFailed;
+        }
+        self.emulated_gds_dispatches += 1;
+        if (log_verbose_gpu) std.debug.print(
+            "[vulkan dcb] emulated GDS readback: {d} reads, destination_offset=0x{x}\n",
+            .{ writes, destination_offset },
         );
         return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
     }
@@ -4081,7 +4442,14 @@ pub const Renderer = struct {
         for (analysis.program.instructions.items) |inst| {
             const writable = switch (inst.opcode) {
                 .image_load => false,
-                .image_store => true,
+                .image_store,
+                .image_atomic_add,
+                .image_atomic_umin,
+                .image_atomic_umax,
+                .image_atomic_and,
+                .image_atomic_or,
+                .image_atomic_xor,
+                => true,
                 else => continue,
             };
             if (inst.src1.kind != .sgpr) {
@@ -4092,18 +4460,21 @@ pub const Renderer = struct {
                 return Error.UnsupportedStorageImage;
             }
             const resource_sgpr = inst.src1.reg;
-            if (result.storageImageMappingForSgpr(resource_sgpr)) |descriptor_index| {
-                if (writable) result.storage_images[descriptor_index].writable = true;
-                continue;
-            }
-            if (result.storage_image_mapping_count >= maximum_storage_images) {
-                return Error.UnsupportedStorageImage;
-            }
+            // Compute kernels commonly populate T# SGPRs with SMEM after the
+            // scalar specialization prefix. Resolve the state at this image
+            // instruction; using the entry snapshot bound late destinations
+            // to an unrelated fallback slot (notably a 2D image for a 3D
+            // image_store in The Precinct's volume kernel).
+            const image_scalar = gpu.scalar_provenance.evaluateResourceStateUntil(
+                reader,
+                bindings,
+                inst.pc,
+            );
             const descriptor = (try resolveComputeImageDescriptor(
                 bindings,
                 reader,
                 analysis,
-                scalar,
+                &image_scalar,
                 resource_sgpr,
                 result.storage_image_mapping_count,
             )) orelse {
@@ -4147,7 +4518,10 @@ pub const Renderer = struct {
                     existing.descriptor.depth_or_layers == descriptor.depth_or_layers and
                     existing.descriptor.unified_format == descriptor.unified_format and
                     existing.descriptor.tile_mode == descriptor.tile_mode and
-                    existing.descriptor.image_type == descriptor.image_type)
+                    existing.descriptor.image_type == descriptor.image_type and
+                    existing.descriptor.viewBaseLevel() == descriptor.viewBaseLevel() and
+                    existing.descriptor.viewMipLevels() == descriptor.viewMipLevels() and
+                    existing.descriptor.base_array == descriptor.base_array)
                 {
                     if (writable) existing.writable = true;
                     descriptor_index = @intCast(index);
@@ -4156,7 +4530,11 @@ pub const Renderer = struct {
             }
             if (descriptor_index == null) {
                 if (result.storage_image_count >= maximum_storage_images) {
-                    return Error.UnsupportedStorageImage;
+                    std.debug.print(
+                        "[vulkan dcb] storage image pc=0x{x}: physical image table exhausted ({d})\n",
+                        .{ inst.pc, maximum_storage_images },
+                    );
+                    return Error.StorageImageCapacityExceeded;
                 }
                 const index: u32 = @intCast(result.storage_image_count);
                 result.storage_images[result.storage_image_count] = self.stageStorageImage(
@@ -4192,9 +4570,37 @@ pub const Renderer = struct {
                 result.storage_image_count += 1;
                 descriptor_index = index;
             }
+
+            // The first descriptor occupying an SGPR range is a generic
+            // mapping. If later SMEM replaces that range, retain the generic
+            // mapping for the original uses and attach an exact PC mapping to
+            // the new state. This avoids both descriptor explosion for the
+            // common repeated-image case and binding a late image atomic to an
+            // unrelated texture loaded into the same s[0:7].
+            var instruction_pc: ?u32 = null;
+            for (result.storage_image_mappings[0..result.storage_image_mapping_count]) |mapping| {
+                if (mapping.resource_sgpr != resource_sgpr) continue;
+                if (mapping.descriptor_index == descriptor_index.?) {
+                    if (writable) result.storage_images[descriptor_index.?].writable = true;
+                    if (mapping.instruction_pc == null or mapping.instruction_pc.? == inst.pc) {
+                        descriptor_index = null;
+                        break;
+                    }
+                }
+                if (mapping.instruction_pc == null) instruction_pc = inst.pc;
+            }
+            if (descriptor_index == null) continue;
+            if (result.storage_image_mapping_count >= maximum_storage_descriptors) {
+                std.debug.print(
+                    "[vulkan dcb] storage image pc=0x{x}: mapping table exhausted ({d})\n",
+                    .{ inst.pc, maximum_storage_descriptors },
+                );
+                return Error.UnsupportedStorageImage;
+            }
             result.storage_image_mappings[result.storage_image_mapping_count] = .{
                 .resource_sgpr = resource_sgpr,
                 .descriptor_index = descriptor_index.?,
+                .instruction_pc = instruction_pc,
                 .format = format.spirv,
                 .dimension = if (descriptor.image_type == .color_3d) .three_d else .two_d,
                 .dst_select = descriptor.dst_select,
@@ -4206,7 +4612,7 @@ pub const Renderer = struct {
             const image_fetch = inst.opcode == .image_load;
             if (!image_fetch and inst.opcode != .image_sample and inst.opcode != .image_gather4) continue;
             if (inst.src1.kind != .sgpr or inst.src2.kind != .sgpr) {
-                if (log_verbose_gpu) std.debug.print(
+                std.debug.print(
                     "[vulkan dcb] sampled image pc=0x{x}: T# is {s}, S# is {s}\n",
                     .{ inst.pc, @tagName(inst.src1.kind), @tagName(inst.src2.kind) },
                 );
@@ -4234,7 +4640,7 @@ pub const Renderer = struct {
                 inst.pc,
                 descriptor_slot,
             )) orelse {
-                if (log_verbose_gpu) std.debug.print(
+                std.debug.print(
                     "[vulkan dcb] sampled image pc=0x{x}: T# s{d}:s{d} unresolved\n",
                     .{ inst.pc, resource_sgpr, resource_sgpr + 7 },
                 );
@@ -4261,14 +4667,17 @@ pub const Renderer = struct {
                     inst.pc,
                     descriptor_slot,
                 )) orelse {
-                    if (log_verbose_gpu) std.debug.print(
+                    std.debug.print(
                         "[vulkan dcb] sampled image pc=0x{x}: S# s{d}:s{d} unresolved\n",
                         .{ inst.pc, sampler_sgpr, sampler_sgpr + 3 },
                     );
                     return Error.UnsupportedSampledImage;
                 };
-            const sampled_dimension = sampledImageDimensionForInstruction(inst.image_dimension) orelse {
-                if (log_verbose_gpu) std.debug.print(
+            const sampled_dimension = sampledImageDimensionForInstruction(
+                inst.image_dimension,
+                image_descriptor.image_type,
+            ) orelse {
+                std.debug.print(
                     "[vulkan dcb] sampled image pc=0x{x}: unsupported DIM {s}\n",
                     .{ inst.pc, @tagName(inst.image_dimension) },
                 );
@@ -4281,17 +4690,9 @@ pub const Renderer = struct {
                 descriptor_index,
                 sampled_dimension,
             ) catch |err| {
-                if (log_verbose_gpu) std.debug.print(
-                    "[vulkan dcb] sampled image pc=0x{x}: stage failed {s} addr=0x{x} {d}x{d} fmt={d} type={s}\n",
-                    .{
-                        inst.pc,
-                        @errorName(err),
-                        image_descriptor.address,
-                        image_descriptor.width,
-                        image_descriptor.height,
-                        image_descriptor.unified_format,
-                        @tagName(image_descriptor.image_type),
-                    },
+                std.debug.print(
+                    "[vulkan dcb] sampled image pc=0x{x}: stage failed {s} dim={s} addr=0x{x} {d}x{d}x{d} pitch={d} fmt={d} type={s} tile={s} levels={d}..{d}\n",
+                    .{ inst.pc, @errorName(err), @tagName(sampled_dimension), image_descriptor.address, image_descriptor.width, image_descriptor.height, image_descriptor.depth_or_layers, image_descriptor.pitch, image_descriptor.unified_format, @tagName(image_descriptor.image_type), @tagName(image_descriptor.tile_mode), image_descriptor.base_level, image_descriptor.last_level },
                 );
                 return err;
             };
@@ -4330,16 +4731,78 @@ pub const Renderer = struct {
         }
     }
 
-    fn getComputePipeline(self: *Renderer, words: []const u32) (Error || std.mem.Allocator.Error)!PipelineLookup {
+    fn copyResidentGuestStorage(
+        self: *Renderer,
+        source_address: u64,
+        target_address: u64,
+        size: usize,
+    ) Error!void {
+        const source_index = for (self.guest_buffers.items, 0..) |entry, index| {
+            if (entry.guest_address == source_address and entry.size == size) break index;
+        } else return Error.GuestBufferNotStaged;
+        const target_index = for (self.guest_buffers.items, 0..) |entry, index| {
+            if (entry.guest_address == target_address and entry.size == size) break index;
+        } else return Error.GuestBufferNotStaged;
+        if (source_index == target_index) return;
+
+        const source = self.guest_buffers.items[source_index].device_local;
+        const target = self.guest_buffers.items[target_index].device_local;
+        var source_mapping: ?*anyopaque = null;
+        if (self.device_functions.map_memory(self.device, source.memory, 0, size, 0, &source_mapping) != vk.success) {
+            return Error.MemoryMapFailed;
+        }
+        defer self.device_functions.unmap_memory(self.device, source.memory);
+        var target_mapping: ?*anyopaque = null;
+        if (self.device_functions.map_memory(self.device, target.memory, 0, size, 0, &target_mapping) != vk.success) {
+            return Error.MemoryMapFailed;
+        }
+        defer self.device_functions.unmap_memory(self.device, target.memory);
+
+        const source_bytes: [*]const u8 = @ptrCast(source_mapping orelse return Error.MemoryMapFailed);
+        const target_bytes: [*]u8 = @ptrCast(target_mapping orelse return Error.MemoryMapFailed);
+        @memcpy(target_bytes[0..size], source_bytes[0..size]);
+        self.guest_buffers.items[target_index].gpu_dirty = true;
+    }
+
+    fn copyResidentFallbackOutputs(self: *Renderer, resources: *const ComputeResources) Error!usize {
+        var copied: usize = 0;
+        for (resources.writable, 0..) |writable, target_index| {
+            if (!writable or !resources.occupied[target_index]) continue;
+            const size = resources.sizes[target_index];
+            if (size == 0) continue;
+            for (resources.occupied, 0..) |occupied, source_index| {
+                if (!occupied or resources.writable[source_index] or resources.sizes[source_index] != size) continue;
+                try self.copyResidentGuestStorage(
+                    resources.addresses[source_index],
+                    resources.addresses[target_index],
+                    size,
+                );
+                copied += 1;
+                break;
+            }
+        }
+        return copied;
+    }
+
+    fn hasComputePipeline(self: *const Renderer, words: []const u32) bool {
         const hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(words));
         for (self.compute_pipelines.items) |entry| {
+            if (entry.hash == hash and std.mem.eql(u32, entry.words, words)) return true;
+        }
+        return false;
+    }
+
+    fn getComputePipeline(self: *Renderer, words: []const u32) (Error || std.mem.Allocator.Error)!PipelineLookup {
+        self.compute_pipeline_sequence +%= 1;
+        const hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(words));
+        for (self.compute_pipelines.items) |*entry| {
             if (entry.hash == hash and std.mem.eql(u32, entry.words, words)) {
                 self.pipeline_cache_hits += 1;
                 self.frame_profile.compute_pipeline_hits += 1;
+                entry.last_used_sequence = self.compute_pipeline_sequence;
                 return .{ .pipeline = entry.pipeline, .cache_hit = true };
             }
         }
-        if (self.compute_pipelines.items.len >= maximum_compute_pipelines) return Error.ComputePipelineCacheFull;
 
         const build_started = hostTimestampNs();
         defer self.frame_profile.compute_pipeline_build_ns +|= elapsedHostNanoseconds(build_started);
@@ -4347,6 +4810,70 @@ pub const Renderer = struct {
         errdefer self.allocator.free(owned_words);
         const shader = try self.createShader(words);
         errdefer self.device_functions.destroy_shader_module(self.device, shader, null);
+        const stage = vk.PipelineShaderStageCreateInfo{
+            .stage = vk.shader_stage_compute_bit,
+            .module = shader,
+            .name = "main",
+        };
+        const pipeline_info = vk.ComputePipelineCreateInfo{
+            .stage = stage,
+            .layout = self.compute_pipeline_layout,
+        };
+        var pipeline: vk.Pipeline = 0;
+        // Our bounded LRU owns translated-module lifetime.  Avoid mirroring
+        // its evicted tail into the opaque driver cache as scene bootstrap can
+        // still discover thousands of distinct guest kernels.  Application-
+        // level hits remain available through compute_pipelines above.
+        if (self.device_functions.create_compute_pipelines(
+            self.device,
+            0,
+            1,
+            @ptrCast(&pipeline_info),
+            null,
+            @ptrCast(&pipeline),
+        ) != vk.success) return Error.ComputePipelineCreationFailed;
+        errdefer self.device_functions.destroy_pipeline(self.device, pipeline, null);
+        const replacement = ComputePipelineEntry{
+            .hash = hash,
+            .words = owned_words,
+            .shader = shader,
+            .pipeline = pipeline,
+            .last_used_sequence = self.compute_pipeline_sequence,
+        };
+        if (self.compute_pipelines.items.len < maximum_compute_pipelines) {
+            try self.compute_pipelines.append(self.allocator, replacement);
+        } else {
+            // Dispatch submissions are fenced before returning, so no cached
+            // pipeline remains in flight here. Recycle the coldest specialized
+            // variant instead of dropping a required compute dispatch.
+            var oldest_index: usize = 0;
+            var oldest_sequence = self.compute_pipelines.items[0].last_used_sequence;
+            for (self.compute_pipelines.items[1..], 1..) |entry, index| {
+                if (entry.last_used_sequence >= oldest_sequence) continue;
+                oldest_index = index;
+                oldest_sequence = entry.last_used_sequence;
+            }
+            const evicted = self.compute_pipelines.items[oldest_index];
+            self.device_functions.destroy_pipeline(self.device, evicted.pipeline, null);
+            self.device_functions.destroy_shader_module(self.device, evicted.shader, null);
+            self.allocator.free(evicted.words);
+            self.compute_pipelines.items[oldest_index] = replacement;
+        }
+        self.pipeline_cache_misses += 1;
+        self.frame_profile.compute_pipeline_misses += 1;
+        return .{ .pipeline = pipeline, .cache_hit = false };
+    }
+
+    /// Compiles one already-translated compute module against the live device.
+    ///
+    /// This deliberately stops before descriptor allocation or dispatch.  It is
+    /// a small offline reproducer for driver compiler failures: game-run can
+    /// dump a module at the point of failure and vulkan-smoke can then exercise
+    /// precisely that vkCreateComputePipelines call without replaying a title.
+    pub fn probeComputeSpirv(self: *Renderer, words: []const u32) Error!void {
+        const shader = try self.createShader(words);
+        defer self.device_functions.destroy_shader_module(self.device, shader, null);
+
         const stage = vk.PipelineShaderStageCreateInfo{
             .stage = vk.shader_stage_compute_bit,
             .module = shader,
@@ -4365,16 +4892,7 @@ pub const Renderer = struct {
             null,
             @ptrCast(&pipeline),
         ) != vk.success) return Error.ComputePipelineCreationFailed;
-        errdefer self.device_functions.destroy_pipeline(self.device, pipeline, null);
-        try self.compute_pipelines.append(self.allocator, .{
-            .hash = hash,
-            .words = owned_words,
-            .shader = shader,
-            .pipeline = pipeline,
-        });
-        self.pipeline_cache_misses += 1;
-        self.frame_profile.compute_pipeline_misses += 1;
-        return .{ .pipeline = pipeline, .cache_hit = false };
+        self.device_functions.destroy_pipeline(self.device, pipeline, null);
     }
 
     pub fn smokeTest(self: *Renderer) Error!SmokeReport {
@@ -4575,6 +5093,8 @@ pub const Renderer = struct {
 
         const old_layout: u32 = if (first_use)
             vk.image_layout_undefined
+        else if (cached.shader_read_layout)
+            vk.image_layout_shader_read_only_optimal
         else
             vk.image_layout_depth_stencil_attachment_optimal;
         const target_layout: u32 = if (clearing)
@@ -4583,7 +5103,12 @@ pub const Renderer = struct {
             vk.image_layout_depth_stencil_attachment_optimal;
 
         const to_target = vk.ImageMemoryBarrier{
-            .source_access_mask = if (first_use) 0 else vk.access_depth_stencil_attachment_write_bit,
+            .source_access_mask = if (first_use)
+                0
+            else if (cached.shader_read_layout)
+                vk.access_shader_read_bit
+            else
+                vk.access_depth_stencil_attachment_write_bit,
             .destination_access_mask = if (clearing)
                 vk.access_transfer_write_bit
             else
@@ -4595,7 +5120,12 @@ pub const Renderer = struct {
         };
         self.device_functions.cmd_pipeline_barrier(
             command_buffer,
-            if (first_use) vk.pipeline_stage_top_of_pipe_bit else vk.pipeline_stage_late_fragment_tests_bit,
+            if (first_use)
+                vk.pipeline_stage_top_of_pipe_bit
+            else if (cached.shader_read_layout)
+                vk.pipeline_stage_vertex_shader_bit | vk.pipeline_stage_fragment_shader_bit | vk.pipeline_stage_compute_shader_bit
+            else
+                vk.pipeline_stage_late_fragment_tests_bit,
             if (clearing) vk.pipeline_stage_transfer_bit else vk.pipeline_stage_early_fragment_tests_bit,
             0,
             0,
@@ -4606,6 +5136,7 @@ pub const Renderer = struct {
             @ptrCast(&to_target),
         );
         cached.initialized = true;
+        cached.shader_read_layout = false;
         if (!clearing) return;
 
         const clear = vk.ClearDepthStencilValue{
@@ -5082,6 +5613,22 @@ pub const Renderer = struct {
                 return entry.pipeline;
             }
         }
+        if (self.nvidia_graphics_compiler_guard_budget != 0) {
+            self.nvidia_graphics_compiler_guard_budget -= 1;
+            self.skipped_nvidia_graphics_pipelines += 1;
+            if (self.skipped_nvidia_graphics_pipelines <= 16 or log_verbose_gpu) {
+                std.debug.print(
+                    "[vulkan dcb] guarded transient NVIDIA graphics pipeline vs_words={d} ps_words={d} remaining={d} (#{d})\n",
+                    .{
+                        vertex_words.len,
+                        fragment_words.len,
+                        self.nvidia_graphics_compiler_guard_budget,
+                        self.skipped_nvidia_graphics_pipelines,
+                    },
+                );
+            }
+            return Error.NvidiaCompilerGuardActive;
+        }
         const owned_vertex = try self.allocator.dupe(u32, vertex_words);
         errdefer self.allocator.free(owned_vertex);
         const owned_fragment = try self.allocator.dupe(u32, fragment_words);
@@ -5527,9 +6074,13 @@ pub const Renderer = struct {
 
     fn createCachedRenderTarget(self: *Renderer, target: GuestColorTarget) anyerror!CachedRenderTarget {
         const frame_bytes = try colorTargetFrameBytes(target);
-        const image = try self.createImage(
+        const image = try self.createImageWithExtent(
             target.descriptor.width,
             target.descriptor.height,
+            1,
+            1,
+            vk.image_type_2d,
+            vk.image_create_mutable_format_bit,
             target.format.vulkan,
             vk.image_usage_color_attachment_bit |
                 vk.image_usage_transfer_src_bit |
@@ -5672,7 +6223,7 @@ pub const Renderer = struct {
                 cached.target.descriptor.address != descriptor.address or
                 cached.target.descriptor.width != descriptor.width or
                 cached.target.descriptor.height != descriptor.height or
-                cached.target.format.vulkan != image_format)
+                !sampledViewFormatCompatible(cached.target.format.vulkan, image_format))
             {
                 continue;
             }
@@ -5683,6 +6234,80 @@ pub const Renderer = struct {
                 .format = image_format,
                 .components = components,
                 .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+            };
+            var view: vk.ImageView = 0;
+            if (self.device_functions.create_image_view(self.device, &view_info, null, &view) != vk.success) {
+                return Error.ImageViewCreationFailed;
+            }
+            errdefer self.device_functions.destroy_image_view(self.device, view, null);
+            const sampler = try self.createGuestSampler(sampler_descriptor);
+            errdefer self.device_functions.destroy_sampler(self.device, sampler, null);
+            self.updateSampledImageDescriptor(descriptor_index, view, sampler, .two_d);
+            return .{
+                .image = cached.image,
+                .view = view,
+                .sampler = sampler,
+                .owns_view = true,
+                .owns_sampler = true,
+            };
+        }
+        return null;
+    }
+
+    fn transitionDepthTargetToShaderRead(self: *Renderer, index: usize) anyerror!void {
+        if (index >= self.depth_targets.items.len) return Error.MissingPresentedFrame;
+        const snapshot = self.depth_targets.items[index];
+        if (!snapshot.initialized or snapshot.shader_read_layout) return;
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        const barrier = vk.ImageMemoryBarrier{
+            .source_access_mask = vk.access_depth_stencil_attachment_write_bit,
+            .destination_access_mask = vk.access_shader_read_bit,
+            .old_layout = vk.image_layout_depth_stencil_attachment_optimal,
+            .new_layout = vk.image_layout_shader_read_only_optimal,
+            .image = snapshot.image.handle,
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_depth_bit },
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_early_fragment_tests_bit | vk.pipeline_stage_late_fragment_tests_bit,
+            vk.pipeline_stage_vertex_shader_bit | vk.pipeline_stage_fragment_shader_bit | vk.pipeline_stage_compute_shader_bit,
+            0,
+            0,
+            null,
+            0,
+            null,
+            1,
+            @ptrCast(&barrier),
+        );
+        try self.submitOneShot(command_buffer);
+        self.depth_targets.items[index].shader_read_layout = true;
+    }
+
+    fn stageResidentDepthTarget(
+        self: *Renderer,
+        descriptor: gpu.resources.ImageDescriptor,
+        sampler_descriptor: gpu.resources.SamplerDescriptor,
+        image_format: u32,
+        descriptor_index: u32,
+    ) anyerror!?PreparedSampledImage {
+        if (descriptor.tile_mode != .depth) return null;
+        for (self.depth_targets.items, 0..) |cached, index| {
+            if (!cached.initialized or
+                cached.target.address != descriptor.address or
+                cached.target.width != descriptor.width or
+                cached.target.height != descriptor.height or
+                !depthSampledFormatCompatible(cached.target.format, image_format))
+            {
+                continue;
+            }
+            try self.transitionDepthTargetToShaderRead(index);
+            const components = try sampledImageComponents(descriptor.dst_select);
+            const view_info = vk.ImageViewCreateInfo{
+                .image = cached.image.handle,
+                .format = cached.target.format,
+                .components = components,
+                .subresource_range = .{ .aspect_mask = vk.image_aspect_depth_bit },
             };
             var view: vk.ImageView = 0;
             if (self.device_functions.create_image_view(self.device, &view_info, null, &view) != vk.success) {
@@ -5733,7 +6358,7 @@ pub const Renderer = struct {
             target.width,
             target.height,
             target.format,
-            vk.image_usage_depth_stencil_attachment_bit | vk.image_usage_transfer_dst_bit,
+            vk.image_usage_depth_stencil_attachment_bit | vk.image_usage_transfer_dst_bit | vk.image_usage_sampled_bit,
         );
         errdefer self.destroyImage(image);
 
@@ -6149,6 +6774,7 @@ pub const Renderer = struct {
         var initial_upload: ?OwnedBuffer = null;
         defer if (initial_upload) |buffer| self.destroyBuffer(buffer);
         if (!cached_snapshot.initialized) {
+            try self.flushPendingGuestWrite(target.descriptor.address, frame_bytes);
             const frame = try self.allocator.alloc(u8, frame_bytes);
             defer self.allocator.free(frame);
             const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
@@ -6841,6 +7467,7 @@ pub const Renderer = struct {
     /// Publishes only the deferred writeback for one guest address, used
     /// before guest memory at that address is staged or read.
     fn flushPendingGuestWrite(self: *Renderer, address: u64, visible_bytes: usize) anyerror!void {
+        try self.flushGuestStorageImageRange(address, visible_bytes);
         try self.flushGuestStorageRange(address, visible_bytes);
         _ = try self.materializeRenderTargetAt(address);
         _ = try self.materializeHtileTargetAt(address, visible_bytes);
@@ -7280,6 +7907,7 @@ pub const Renderer = struct {
             );
             break :blk ComputeResources{};
         };
+        defer vertex_storage.deinit(self);
         // V# payloads are runtime descriptor data, not shader constants.  The
         // resource preparation above has already decoded them and assigned
         // stable host descriptor slots.  Leaving their guest addresses in the
@@ -7507,6 +8135,7 @@ pub const Renderer = struct {
             );
             break :blk ComputeResources{};
         };
+        defer fragment_storage.deinit(self);
         // Unity PS loads color scales and matrices through s_buffer. Identity
         // constants are only a fallback for a genuinely missing V#: once the
         // constant buffer is staged, specializing those destinations would
@@ -8287,7 +8916,10 @@ pub const Renderer = struct {
                     );
                     return Error.UnsupportedSampledImage;
                 };
-            const sampled_dimension = sampledImageDimensionForInstruction(inst.image_dimension) orelse {
+            const sampled_dimension = sampledImageDimensionForInstruction(
+                inst.image_dimension,
+                image_descriptor.image_type,
+            ) orelse {
                 std.debug.print(
                     "[vulkan dcb] sampled image pc=0x{x}: unsupported DIM {s}\n",
                     .{ inst.pc, @tagName(inst.image_dimension) },
@@ -8439,6 +9071,38 @@ pub const Renderer = struct {
         self.device_functions.update_descriptor_sets(self.device, 1, @ptrCast(&write), 0, null);
     }
 
+    fn updateGdsDescriptor(self: *Renderer, buffer: OwnedBuffer) void {
+        std.debug.assert(gds_descriptor_binding == rdna2.spirv.gds_descriptor_binding);
+        const buffer_info = vk.DescriptorBufferInfo{
+            .buffer = buffer.handle,
+            .offset = 0,
+            .range = buffer.size,
+        };
+        const write = vk.WriteDescriptorSet{
+            .destination_set = self.descriptor_set,
+            .destination_binding = gds_descriptor_binding,
+            .destination_array_element = 0,
+            .descriptor_count = 1,
+            .descriptor_type = vk.descriptor_type_storage_buffer,
+            .buffer_info = @ptrCast(&buffer_info),
+        };
+        self.device_functions.update_descriptor_sets(self.device, 1, @ptrCast(&write), 0, null);
+        self.active_descriptor_set = self.descriptor_set;
+    }
+
+    fn uploadGdsStorage(self: *Renderer) Error!void {
+        const buffer = self.gds_buffer orelse return Error.InvalidStorageDescriptor;
+        if (!self.ensureGdsStorage()) return Error.MemoryAllocationFailed;
+        try self.writeMapped(buffer, self.gds_storage.items);
+        self.updateGdsDescriptor(buffer);
+    }
+
+    fn downloadGdsStorage(self: *Renderer) Error!void {
+        const buffer = self.gds_buffer orelse return Error.InvalidStorageDescriptor;
+        if (!self.ensureGdsStorage()) return Error.MemoryAllocationFailed;
+        try self.readMapped(buffer, self.gds_storage.items);
+    }
+
     fn updateSampledImageDescriptor(
         self: *Renderer,
         descriptor_index: u32,
@@ -8446,10 +9110,27 @@ pub const Renderer = struct {
         sampler: vk.Sampler,
         dimension: rdna2.spirv.SampledImageDimension,
     ) void {
+        self.updateSampledImageDescriptorLayout(
+            descriptor_index,
+            view,
+            sampler,
+            dimension,
+            vk.image_layout_shader_read_only_optimal,
+        );
+    }
+
+    fn updateSampledImageDescriptorLayout(
+        self: *Renderer,
+        descriptor_index: u32,
+        view: vk.ImageView,
+        sampler: vk.Sampler,
+        dimension: rdna2.spirv.SampledImageDimension,
+        image_layout: u32,
+    ) void {
         const image_info = vk.DescriptorImageInfo{
             .sampler = sampler,
             .image_view = view,
-            .image_layout = vk.image_layout_shader_read_only_optimal,
+            .image_layout = image_layout,
         };
         const write = vk.WriteDescriptorSet{
             .destination_set = self.descriptor_set,
@@ -8457,6 +9138,7 @@ pub const Renderer = struct {
                 .two_d => rdna2.spirv.sampled_image_2d_descriptor_binding,
                 .three_d => sampled_image_3d_descriptor_binding,
                 .cube => sampled_image_cube_descriptor_binding,
+                .two_d_array => sampled_image_2d_array_descriptor_binding,
             },
             .destination_array_element = descriptor_index,
             .descriptor_count = 1,
@@ -8486,89 +9168,230 @@ pub const Renderer = struct {
         self.active_descriptor_set = self.descriptor_set;
     }
 
-    fn stageStorageImage(
+    fn sameStorageImageDescriptor(a: gpu.ImageDescriptor, b: gpu.ImageDescriptor) bool {
+        return a.address == b.address and
+            a.width == b.width and
+            a.height == b.height and
+            a.depth_or_layers == b.depth_or_layers and
+            a.unified_format == b.unified_format and
+            a.tile_mode == b.tile_mode and
+            a.image_type == b.image_type and
+            a.viewBaseLevel() == b.viewBaseLevel() and
+            a.viewMipLevels() == b.viewMipLevels() and
+            a.base_array == b.base_array;
+    }
+
+    fn releaseStorageImage(self: *Renderer, cache_index: usize) void {
+        if (cache_index >= self.storage_image_cache.items.len) return;
+        const cached = &self.storage_image_cache.items[cache_index];
+        if (cached.valid) cached.in_use = false;
+    }
+
+    fn destroyCachedStorageImage(self: *Renderer, cache_index: usize) void {
+        if (cache_index >= self.storage_image_cache.items.len) return;
+        const cached = &self.storage_image_cache.items[cache_index];
+        if (!cached.valid) return;
+        self.device_functions.destroy_image_view(self.device, cached.view, null);
+        self.destroyImage(cached.image);
+        self.destroyBuffer(cached.transfer);
+        self.storage_image_cache_bytes -|= cached.staging_bytes;
+        cached.valid = false;
+        cached.in_use = false;
+        cached.gpu_dirty = false;
+    }
+
+    fn flushCachedStorageImage(
         self: *Renderer,
-        descriptor: gpu.ImageDescriptor,
-        descriptor_index: u32,
-        writable: bool,
-    ) anyerror!PreparedStorageImage {
-        const is_3d = descriptor.image_type == .color_3d;
-        const is_single_layer_2d = (descriptor.image_type == .color_2d or
-            descriptor.image_type == .color_2d_array) and descriptor.depth_or_layers == 1;
-        if ((!is_3d and !is_single_layer_2d) or descriptor.samplesLog2() != 0 or
-            descriptor.viewBaseLevel() != 0 or descriptor.viewMipLevels() != 1 or
-            descriptor.dcc_enabled or
-            descriptor.cmask_fast_clear or descriptor.fmask_compression)
-        {
-            return Error.UnsupportedStorageImage;
-        }
-        const format = storageImageFormat(descriptor.unified_format) orelse
-            return Error.UnsupportedStorageImage;
-        const texture = gpu.TextureLayout.fromImage(descriptor) catch return Error.UnsupportedStorageImage;
-        const subresource = texture.subresource(0, 0, 1) catch return Error.UnsupportedStorageImage;
-        const staging_bytes_u64 = subresource.stagingBytes() catch return Error.UnsupportedStorageImage;
-        if (staging_bytes_u64 == 0 or staging_bytes_u64 > maximum_frame_bytes or
-            texture.required_source_bytes == 0 or texture.required_source_bytes > maximum_frame_bytes or
-            subresource.block.bytes_per_element != storageImageBytesPerTexel(descriptor.unified_format))
-        {
-            return Error.UnsupportedStorageImage;
-        }
-        const staging_bytes = std.math.cast(usize, staging_bytes_u64) orelse return Error.UnsupportedStorageImage;
-        const allocation_bytes = std.math.cast(usize, texture.required_source_bytes) orelse
-            return Error.UnsupportedStorageImage;
-        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
-        try self.flushPendingGuestWrite(descriptor.address, allocation_bytes);
-
-        const allocation = try self.allocator.alloc(u8, allocation_bytes);
-        defer self.allocator.free(allocation);
-        if (!memory.read(memory.context, descriptor.address, allocation)) return Error.GuestMemoryReadFailed;
-        const linear = try self.allocator.alloc(u8, staging_bytes);
-        defer self.allocator.free(linear);
-        try subresource.detile(allocation, linear);
-
-        const transfer = try self.createBuffer(
-            staging_bytes,
-            vk.buffer_usage_transfer_src_bit | vk.buffer_usage_transfer_dst_bit,
-            vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
-        );
-        errdefer self.destroyBuffer(transfer);
-        try self.writeMapped(transfer, linear);
-        const image = try self.createImageWithExtent(
-            descriptor.width,
-            descriptor.height,
-            descriptor.depth_or_layers,
-            1,
-            if (is_3d) vk.image_type_3d else vk.image_type_2d,
-            0,
-            format.vulkan,
-            vk.image_usage_transfer_src_bit | vk.image_usage_transfer_dst_bit | vk.image_usage_storage_bit,
-        );
-        errdefer self.destroyImage(image);
-        const view_info = vk.ImageViewCreateInfo{
-            .image = image.handle,
-            .view_type = if (is_3d) vk.image_view_type_3d else vk.image_view_type_2d,
-            .format = format.vulkan,
-            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-        };
-        var view: vk.ImageView = 0;
-        if (self.device_functions.create_image_view(self.device, &view_info, null, &view) != vk.success) {
-            return Error.ImageViewCreationFailed;
-        }
-        errdefer self.device_functions.destroy_image_view(self.device, view, null);
+        memory: GuestMemory,
+        cache_index: usize,
+    ) (Error || std.mem.Allocator.Error)!void {
+        if (cache_index >= self.storage_image_cache.items.len) return;
+        const snapshot = self.storage_image_cache.items[cache_index];
+        if (!snapshot.valid or !snapshot.gpu_dirty) return;
 
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
-        const upload_barrier = vk.ImageMemoryBarrier{
-            .source_access_mask = 0,
-            .destination_access_mask = vk.access_transfer_write_bit,
-            .old_layout = vk.image_layout_undefined,
-            .new_layout = vk.image_layout_transfer_dst_optimal,
-            .image = image.handle,
+        const to_transfer = vk.ImageMemoryBarrier{
+            .source_access_mask = vk.access_shader_read_bit | vk.access_shader_write_bit,
+            .destination_access_mask = vk.access_transfer_read_bit,
+            .old_layout = vk.image_layout_general,
+            .new_layout = vk.image_layout_transfer_src_optimal,
+            .image = snapshot.image.handle,
             .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
         };
         self.device_functions.cmd_pipeline_barrier(
             command_buffer,
-            vk.pipeline_stage_top_of_pipe_bit,
+            vk.pipeline_stage_compute_shader_bit,
+            vk.pipeline_stage_transfer_bit,
+            0,
+            0,
+            null,
+            0,
+            null,
+            1,
+            @ptrCast(&to_transfer),
+        );
+        const copy = vk.BufferImageCopy{
+            .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+            .image_extent = .{
+                .width = snapshot.subresource.width,
+                .height = snapshot.subresource.height,
+                .depth = snapshot.subresource.depth_or_layers,
+            },
+        };
+        self.device_functions.cmd_copy_image_to_buffer(
+            command_buffer,
+            snapshot.image.handle,
+            vk.image_layout_transfer_src_optimal,
+            snapshot.transfer.handle,
+            1,
+            @ptrCast(&copy),
+        );
+        const host_barrier = vk.BufferMemoryBarrier{
+            .source_access_mask = vk.access_transfer_write_bit,
+            .destination_access_mask = vk.access_host_read_bit,
+            .buffer = snapshot.transfer.handle,
+            .offset = 0,
+            .size = snapshot.transfer.size,
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_transfer_bit,
+            vk.pipeline_stage_host_bit,
+            0,
+            0,
+            null,
+            1,
+            @ptrCast(&host_barrier),
+            0,
+            null,
+        );
+        const back_to_compute = vk.ImageMemoryBarrier{
+            .source_access_mask = vk.access_transfer_read_bit,
+            .destination_access_mask = vk.access_shader_read_bit | vk.access_shader_write_bit,
+            .old_layout = vk.image_layout_transfer_src_optimal,
+            .new_layout = vk.image_layout_general,
+            .image = snapshot.image.handle,
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_transfer_bit,
+            vk.pipeline_stage_compute_shader_bit,
+            0,
+            0,
+            null,
+            0,
+            null,
+            1,
+            @ptrCast(&back_to_compute),
+        );
+        try self.submitOneShot(command_buffer);
+
+        const linear = try self.allocator.alloc(u8, snapshot.staging_bytes);
+        defer self.allocator.free(linear);
+        try self.readMapped(snapshot.transfer, linear);
+        const allocation = try self.allocator.alloc(u8, snapshot.allocation_bytes);
+        defer self.allocator.free(allocation);
+        if (!memory.read(memory.context, snapshot.descriptor.address, allocation)) {
+            return Error.GuestMemoryReadFailed;
+        }
+        snapshot.subresource.tile(linear, allocation) catch return Error.UnsupportedStorageImage;
+        if (!memory.write(memory.context, snapshot.descriptor.address, allocation)) {
+            return Error.GuestMemoryWriteFailed;
+        }
+        const cached = &self.storage_image_cache.items[cache_index];
+        cached.guest_content_hash = std.hash.Wyhash.hash(0, allocation);
+        cached.guest_content_hash_valid = true;
+        cached.gpu_dirty = false;
+        self.frame_profile.readback_bytes +%= snapshot.staging_bytes;
+        self.frame_profile.storage_readback_bytes +%= snapshot.staging_bytes;
+    }
+
+    fn flushGuestStorageImageRange(
+        self: *Renderer,
+        address: u64,
+        _: usize,
+    ) (Error || std.mem.Allocator.Error)!void {
+        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        for (self.storage_image_cache.items, 0..) |cached, index| {
+            if (!cached.valid or !cached.gpu_dirty) continue;
+            // Match the buffer cache's visibility rule: command-processor
+            // accesses to labels inside a generously-sized resource do not
+            // force the entire image back to the CPU. Real resource consumers
+            // name the allocation base.
+            if (address != cached.descriptor.address) continue;
+            try self.flushCachedStorageImage(memory, index);
+        }
+    }
+
+    fn storageImageCacheSlot(
+        self: *Renderer,
+        memory: GuestMemory,
+        staging_bytes: usize,
+    ) (Error || std.mem.Allocator.Error)!usize {
+        while (true) {
+            var has_free_slot = false;
+            for (self.storage_image_cache.items) |cached| {
+                if (!cached.valid) {
+                    has_free_slot = true;
+                    break;
+                }
+            }
+            const over_byte_budget = self.storage_image_cache_bytes +| staging_bytes >
+                maximum_cached_storage_image_bytes;
+            const needs_count_slot = !has_free_slot and
+                self.storage_image_cache.items.len >= maximum_cached_storage_images;
+            if (!over_byte_budget and !needs_count_slot) break;
+
+            var victim_index: ?usize = null;
+            var oldest_sequence: u64 = std.math.maxInt(u64);
+            for (self.storage_image_cache.items, 0..) |cached, index| {
+                if (!cached.valid or cached.in_use or cached.last_used_sequence >= oldest_sequence) continue;
+                victim_index = index;
+                oldest_sequence = cached.last_used_sequence;
+            }
+            const victim = victim_index orelse break;
+            try self.flushCachedStorageImage(memory, victim);
+            self.destroyCachedStorageImage(victim);
+        }
+
+        for (self.storage_image_cache.items, 0..) |cached, index| {
+            if (!cached.valid) return index;
+        }
+        if (self.storage_image_cache.items.len >= maximum_cached_storage_images) {
+            return Error.StorageImageCapacityExceeded;
+        }
+        try self.storage_image_cache.append(self.allocator, undefined);
+        return self.storage_image_cache.items.len - 1;
+    }
+
+    fn uploadCachedStorageImage(
+        self: *Renderer,
+        cache_index: usize,
+        linear: []const u8,
+        initial: bool,
+    ) (Error || std.mem.Allocator.Error)!void {
+        const snapshot = self.storage_image_cache.items[cache_index];
+        if (!snapshot.valid or linear.len != snapshot.staging_bytes) return Error.UnsupportedStorageImage;
+        try self.writeMapped(snapshot.transfer, linear);
+
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        const upload_barrier = vk.ImageMemoryBarrier{
+            .source_access_mask = if (initial)
+                0
+            else
+                vk.access_shader_read_bit | vk.access_shader_write_bit,
+            .destination_access_mask = vk.access_transfer_write_bit,
+            .old_layout = if (initial) vk.image_layout_undefined else vk.image_layout_general,
+            .new_layout = vk.image_layout_transfer_dst_optimal,
+            .image = snapshot.image.handle,
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            if (initial) vk.pipeline_stage_top_of_pipe_bit else vk.pipeline_stage_compute_shader_bit,
             vk.pipeline_stage_transfer_bit,
             0,
             0,
@@ -8581,15 +9404,15 @@ pub const Renderer = struct {
         const copy = vk.BufferImageCopy{
             .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
             .image_extent = .{
-                .width = descriptor.width,
-                .height = descriptor.height,
-                .depth = descriptor.depth_or_layers,
+                .width = snapshot.subresource.width,
+                .height = snapshot.subresource.height,
+                .depth = snapshot.subresource.depth_or_layers,
             },
         };
         self.device_functions.cmd_copy_buffer_to_image(
             command_buffer,
-            transfer.handle,
-            image.handle,
+            snapshot.transfer.handle,
+            snapshot.image.handle,
             vk.image_layout_transfer_dst_optimal,
             1,
             @ptrCast(&copy),
@@ -8599,7 +9422,7 @@ pub const Renderer = struct {
             .destination_access_mask = vk.access_shader_read_bit | vk.access_shader_write_bit,
             .old_layout = vk.image_layout_transfer_dst_optimal,
             .new_layout = vk.image_layout_general,
-            .image = image.handle,
+            .image = snapshot.image.handle,
             .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
         };
         self.device_functions.cmd_pipeline_barrier(
@@ -8615,9 +9438,182 @@ pub const Renderer = struct {
             @ptrCast(&shader_barrier),
         );
         try self.submitOneShot(command_buffer);
+        self.frame_profile.upload_bytes +%= linear.len;
+        self.frame_profile.texture_upload_bytes +%= linear.len;
+    }
+
+    fn stageStorageImage(
+        self: *Renderer,
+        descriptor: gpu.ImageDescriptor,
+        descriptor_index: u32,
+        writable: bool,
+    ) anyerror!PreparedStorageImage {
+        const is_3d = descriptor.image_type == .color_3d;
+        const is_single_layer_2d = (descriptor.image_type == .color_2d or
+            descriptor.image_type == .color_2d_array) and descriptor.depth_or_layers == 1;
+        if ((!is_3d and !is_single_layer_2d) or descriptor.samplesLog2() != 0 or
+            descriptor.viewMipLevels() != 1 or
+            descriptor.dcc_enabled or
+            descriptor.cmask_fast_clear or descriptor.fmask_compression)
+        {
+            return Error.UnsupportedStorageImage;
+        }
+        const format = storageImageFormat(descriptor.unified_format) orelse
+            return Error.UnsupportedStorageImage;
+        const texture = gpu.TextureLayout.fromImage(descriptor) catch return Error.UnsupportedStorageImage;
+        const subresource = texture.subresource(
+            descriptor.viewBaseLevel(),
+            0,
+            1,
+        ) catch return Error.UnsupportedStorageImage;
+        const staging_bytes_u64 = subresource.stagingBytes() catch return Error.UnsupportedStorageImage;
+        if (staging_bytes_u64 == 0 or staging_bytes_u64 > maximum_frame_bytes or
+            texture.required_source_bytes == 0 or texture.required_source_bytes > maximum_frame_bytes or
+            subresource.block.bytes_per_element != storageImageBytesPerTexel(descriptor.unified_format))
+        {
+            return Error.UnsupportedStorageImage;
+        }
+        const staging_bytes = std.math.cast(usize, staging_bytes_u64) orelse return Error.UnsupportedStorageImage;
+        const allocation_bytes = std.math.cast(usize, texture.required_source_bytes) orelse
+            return Error.UnsupportedStorageImage;
+        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+
+        self.storage_image_sequence +%= 1;
+        var matching_index: ?usize = null;
+        for (self.storage_image_cache.items, 0..) |cached, index| {
+            if (!cached.valid or cached.in_use or !sameStorageImageDescriptor(cached.descriptor, descriptor)) continue;
+            matching_index = index;
+            if (!cached.gpu_dirty) break;
+
+            // This image is the output of an earlier dispatch and guest memory
+            // deliberately still contains the older tiled copy. Keep the GPU
+            // version authoritative for the next pass in the compute chain.
+            const resident = &self.storage_image_cache.items[index];
+            resident.in_use = true;
+            resident.last_used_sequence = self.storage_image_sequence;
+            self.updateStorageImageDescriptor(descriptor_index, resident.view);
+            self.frame_profile.resident_storage_bytes +%= resident.staging_bytes;
+            return .{
+                .descriptor = descriptor,
+                .subresource = resident.subresource,
+                .image = resident.image,
+                .view = resident.view,
+                .transfer = resident.transfer,
+                .allocation_bytes = resident.allocation_bytes,
+                .staging_bytes = resident.staging_bytes,
+                .writable = writable,
+                .cache_index = index,
+            };
+        }
+
+        try self.flushPendingGuestWrite(descriptor.address, allocation_bytes);
+
+        const allocation = try self.allocator.alloc(u8, allocation_bytes);
+        defer self.allocator.free(allocation);
+        if (!memory.read(memory.context, descriptor.address, allocation)) return Error.GuestMemoryReadFailed;
+        const guest_content_hash = std.hash.Wyhash.hash(0, allocation);
+
+        if (matching_index) |index| {
+            const cached = &self.storage_image_cache.items[index];
+            cached.last_used_sequence = self.storage_image_sequence;
+            if (cached.guest_content_hash_valid and cached.guest_content_hash == guest_content_hash) {
+                cached.in_use = true;
+                errdefer cached.in_use = false;
+                self.updateStorageImageDescriptor(descriptor_index, cached.view);
+                self.frame_profile.resident_storage_bytes +%= cached.staging_bytes;
+                return .{
+                    .descriptor = descriptor,
+                    .subresource = cached.subresource,
+                    .image = cached.image,
+                    .view = cached.view,
+                    .transfer = cached.transfer,
+                    .allocation_bytes = cached.allocation_bytes,
+                    .staging_bytes = cached.staging_bytes,
+                    .writable = writable,
+                    .cache_index = index,
+                };
+            }
+        }
+        const linear = try self.allocator.alloc(u8, staging_bytes);
+        defer self.allocator.free(linear);
+        try subresource.detile(allocation, linear);
+
+        if (matching_index) |index| {
+            const cached = &self.storage_image_cache.items[index];
+            cached.in_use = true;
+            errdefer cached.in_use = false;
+            try self.uploadCachedStorageImage(index, linear, false);
+            cached.guest_content_hash = guest_content_hash;
+            cached.guest_content_hash_valid = true;
+            self.updateStorageImageDescriptor(descriptor_index, cached.view);
+            return .{
+                .descriptor = descriptor,
+                .subresource = cached.subresource,
+                .image = cached.image,
+                .view = cached.view,
+                .transfer = cached.transfer,
+                .allocation_bytes = cached.allocation_bytes,
+                .staging_bytes = cached.staging_bytes,
+                .writable = writable,
+                .cache_index = index,
+            };
+        }
+
+        var cache_owns_resources = false;
+        const transfer = try self.createBuffer(
+            staging_bytes,
+            vk.buffer_usage_transfer_src_bit | vk.buffer_usage_transfer_dst_bit,
+            vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+        );
+        errdefer if (!cache_owns_resources) self.destroyBuffer(transfer);
+        const image = try self.createImageWithExtent(
+            subresource.width,
+            subresource.height,
+            subresource.depth_or_layers,
+            1,
+            if (is_3d) vk.image_type_3d else vk.image_type_2d,
+            if (descriptor.unified_format == 56 or descriptor.unified_format == 130)
+                vk.image_create_mutable_format_bit
+            else
+                0,
+            format.vulkan,
+            vk.image_usage_transfer_src_bit | vk.image_usage_transfer_dst_bit |
+                vk.image_usage_storage_bit | vk.image_usage_sampled_bit,
+        );
+        errdefer if (!cache_owns_resources) self.destroyImage(image);
+        const view_info = vk.ImageViewCreateInfo{
+            .image = image.handle,
+            .view_type = if (is_3d) vk.image_view_type_3d else vk.image_view_type_2d,
+            .format = format.vulkan,
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        var view: vk.ImageView = 0;
+        if (self.device_functions.create_image_view(self.device, &view_info, null, &view) != vk.success) {
+            return Error.ImageViewCreationFailed;
+        }
+        errdefer if (!cache_owns_resources) self.device_functions.destroy_image_view(self.device, view, null);
+
+        const cache_index = try self.storageImageCacheSlot(memory, staging_bytes);
+        self.storage_image_cache.items[cache_index] = .{
+            .descriptor = descriptor,
+            .subresource = subresource,
+            .image = image,
+            .view = view,
+            .transfer = transfer,
+            .allocation_bytes = allocation_bytes,
+            .staging_bytes = staging_bytes,
+            .last_used_sequence = self.storage_image_sequence,
+            .guest_content_hash = guest_content_hash,
+            .guest_content_hash_valid = true,
+            .in_use = true,
+        };
+        self.storage_image_cache_bytes +|= staging_bytes;
+        cache_owns_resources = true;
+        // Ownership has moved into the cache. If the upload fails, tear down
+        // that cache slot exactly once instead of running the local errdefers.
+        errdefer self.destroyCachedStorageImage(cache_index);
+        try self.uploadCachedStorageImage(cache_index, linear, true);
         self.updateStorageImageDescriptor(descriptor_index, view);
-        self.frame_profile.upload_bytes +%= staging_bytes;
-        self.frame_profile.texture_upload_bytes +%= staging_bytes;
         return .{
             .descriptor = descriptor,
             .subresource = subresource,
@@ -8627,67 +9623,79 @@ pub const Renderer = struct {
             .allocation_bytes = allocation_bytes,
             .staging_bytes = staging_bytes,
             .writable = writable,
+            .cache_index = cache_index,
         };
     }
 
     fn commitStorageImages(self: *Renderer, memory: GuestMemory, resources: *const ComputeResources) anyerror!void {
+        _ = memory;
         for (resources.storage_images[0..resources.storage_image_count]) |prepared| {
             if (!prepared.writable) continue;
-            const command_buffer = try self.beginOneShot();
-            defer self.releaseOneShot(command_buffer);
-            const transfer_barrier = vk.ImageMemoryBarrier{
-                .source_access_mask = vk.access_shader_write_bit,
-                .destination_access_mask = vk.access_transfer_read_bit,
-                .old_layout = vk.image_layout_general,
-                .new_layout = vk.image_layout_transfer_src_optimal,
-                .image = prepared.image.handle,
+            if (prepared.cache_index >= self.storage_image_cache.items.len) return Error.UnsupportedStorageImage;
+            const cached = &self.storage_image_cache.items[prepared.cache_index];
+            if (!cached.valid) return Error.UnsupportedStorageImage;
+            cached.gpu_dirty = true;
+        }
+    }
+
+    /// Samples a compute output directly from its resident Vulkan image.  A
+    /// CPU readback followed by a detile and re-upload is both redundant and
+    /// especially expensive for Unity's 4K intermediate surfaces.
+    fn stageResidentStorageImage(
+        self: *Renderer,
+        descriptor: gpu.resources.ImageDescriptor,
+        sampler_descriptor: gpu.resources.SamplerDescriptor,
+        image_format: u32,
+        descriptor_index: u32,
+        dimension: rdna2.spirv.SampledImageDimension,
+    ) anyerror!?PreparedSampledImage {
+        if (dimension != .two_d and dimension != .three_d) return null;
+        for (self.storage_image_cache.items, 0..) |*cached, index| {
+            if (!cached.valid or (!cached.gpu_dirty and !cached.in_use) or
+                !sameStorageImageDescriptor(cached.descriptor, descriptor))
+            {
+                continue;
+            }
+            const storage_format = storageImageFormat(cached.descriptor.unified_format) orelse continue;
+            if (!sampledViewFormatCompatible(storage_format.vulkan, image_format)) continue;
+
+            const components = try sampledImageComponents(descriptor.dst_select);
+            const view_info = vk.ImageViewCreateInfo{
+                .image = cached.image.handle,
+                .view_type = if (dimension == .three_d) vk.image_view_type_3d else vk.image_view_type_2d,
+                .format = image_format,
+                .components = components,
                 .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
             };
-            self.device_functions.cmd_pipeline_barrier(
-                command_buffer,
-                vk.pipeline_stage_compute_shader_bit,
-                vk.pipeline_stage_transfer_bit,
-                0,
-                0,
-                null,
-                0,
-                null,
-                1,
-                @ptrCast(&transfer_barrier),
-            );
-            const copy = vk.BufferImageCopy{
-                .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
-                .image_extent = .{
-                    .width = prepared.descriptor.width,
-                    .height = prepared.descriptor.height,
-                    .depth = prepared.descriptor.depth_or_layers,
-                },
-            };
-            self.device_functions.cmd_copy_image_to_buffer(
-                command_buffer,
-                prepared.image.handle,
-                vk.image_layout_transfer_src_optimal,
-                prepared.transfer.handle,
-                1,
-                @ptrCast(&copy),
-            );
-            try self.submitOneShot(command_buffer);
+            var view: vk.ImageView = 0;
+            if (self.device_functions.create_image_view(self.device, &view_info, null, &view) != vk.success) {
+                return Error.ImageViewCreationFailed;
+            }
+            errdefer self.device_functions.destroy_image_view(self.device, view, null);
+            const sampler = try self.createGuestSampler(sampler_descriptor);
+            errdefer self.device_functions.destroy_sampler(self.device, sampler, null);
 
-            const linear = try self.allocator.alloc(u8, prepared.staging_bytes);
-            defer self.allocator.free(linear);
-            try self.readMapped(prepared.transfer, linear);
-            const allocation = try self.allocator.alloc(u8, prepared.allocation_bytes);
-            defer self.allocator.free(allocation);
-            if (!memory.read(memory.context, prepared.descriptor.address, allocation)) {
-                return Error.GuestMemoryReadFailed;
-            }
-            try prepared.subresource.tile(linear, allocation);
-            if (!memory.write(memory.context, prepared.descriptor.address, allocation)) {
-                return Error.GuestMemoryWriteFailed;
-            }
-            self.frame_profile.readback_bytes +%= prepared.staging_bytes;
-            self.frame_profile.storage_readback_bytes +%= prepared.staging_bytes;
+            self.storage_image_sequence +%= 1;
+            cached.in_use = true;
+            cached.last_used_sequence = self.storage_image_sequence;
+            self.frame_profile.resident_storage_bytes +%= cached.staging_bytes;
+            self.updateSampledImageDescriptorLayout(
+                descriptor_index,
+                view,
+                sampler,
+                dimension,
+                vk.image_layout_general,
+            );
+            return .{
+                .image = cached.image,
+                .view = view,
+                .sampler = sampler,
+                .owns_view = true,
+                .owns_sampler = true,
+                .storage_cache_index = index,
+            };
         }
+        return null;
     }
 
     fn stageSampledImage(
@@ -8701,26 +9709,34 @@ pub const Renderer = struct {
             descriptor.unified_format,
             sampler_descriptor.force_srgb,
         ) orelse {
-            if (log_verbose_gpu) std.debug.print(
-                "[vulkan dcb] unsupported sampled image format {d}\n",
-                .{descriptor.unified_format},
-            );
+            std.debug.print("[vulkan dcb] unsupported sampled image format {d}\n", .{descriptor.unified_format});
             return Error.UnsupportedSampledImage;
         };
         const bytes_per_texel = storageImageBytesPerTexel(descriptor.unified_format);
         const is_3d = dimension == .three_d;
         const is_cube = dimension == .cube;
+        const is_2d_array = dimension == .two_d_array;
         const compatible_type = switch (dimension) {
             .two_d => descriptor.image_type == .color_2d or descriptor.image_type == .cube,
             .three_d => descriptor.image_type == .color_3d,
             .cube => descriptor.image_type == .cube,
+            .two_d_array => descriptor.image_type == .color_2d_array or descriptor.image_type == .cube,
         };
         if (!compatible_type) {
-            if (log_verbose_gpu) std.debug.print(
+            std.debug.print(
                 "[vulkan dcb] sampled image type {s} is incompatible with {s}\n",
                 .{ @tagName(descriptor.image_type), @tagName(dimension) },
             );
             return Error.UnsupportedSampledImage;
+        }
+        if (try self.stageResidentStorageImage(
+            descriptor,
+            sampler_descriptor,
+            image_format,
+            descriptor_index,
+            dimension,
+        )) |resident| {
+            return resident;
         }
         // Compressed metadata is not decoded yet. In particular, it must never
         // be interpreted as color pixels: DCC/CMASK are control data, not an
@@ -8731,6 +9747,16 @@ pub const Renderer = struct {
                 .{descriptor.metadata_address},
             );
         }
+        if (dimension == .two_d and descriptor.image_type == .color_2d) {
+            if (try self.stageResidentDepthTarget(
+                descriptor,
+                sampler_descriptor,
+                image_format,
+                descriptor_index,
+            )) |resident| {
+                return resident;
+            }
+        }
         const layout = try SampledStagingLayout.fromImage(descriptor);
         const staging_bytes_u64 = try layout.stagingBytes();
         const available_layers = layout.depthOrLayers();
@@ -8738,15 +9764,16 @@ pub const Renderer = struct {
             .two_d => if (descriptor.image_type == .cube) available_layers >= 1 else available_layers == 1,
             .three_d => available_layers >= 1,
             .cube => available_layers >= 6,
+            .two_d_array => available_layers >= 1,
         };
         if (!valid_layers or
             layout.bytesPerElement() != bytes_per_texel or staging_bytes_u64 == 0 or
             staging_bytes_u64 > maximum_frame_bytes or layout.requiredSourceBytes() == 0 or
             layout.requiredSourceBytes() > maximum_frame_bytes)
         {
-            if (log_verbose_gpu) std.debug.print(
-                "[vulkan dcb] sampled image layout rejected depth/layers={d} bpp={d} stage=0x{x} source=0x{x}\n",
-                .{ layout.depthOrLayers(), layout.bytesPerElement(), staging_bytes_u64, layout.requiredSourceBytes() },
+            std.debug.print(
+                "[vulkan dcb] sampled image layout rejected depth/layers={d} bpp={d} expected_bpp={d} stage=0x{x} source=0x{x}\n",
+                .{ layout.depthOrLayers(), layout.bytesPerElement(), bytes_per_texel, staging_bytes_u64, layout.requiredSourceBytes() },
             );
             return Error.UnsupportedSampledImage;
         }
@@ -8826,8 +9853,13 @@ pub const Renderer = struct {
         const linear = try self.allocator.alloc(u8, byte_count);
         defer self.allocator.free(linear);
         const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
+        var source_available = true;
         if (layout.isLinear()) {
-            try layout.stage(reader, descriptor.address, linear);
+            layout.stage(reader, descriptor.address, linear) catch |err| {
+                if (err != Error.GuestMemoryReadFailed or descriptor.tile_mode != .depth) return err;
+                source_available = false;
+                fillUnbackedDepthSample(descriptor.unified_format, linear);
+            };
         } else {
             // Layout.stage performs one checked guest-memory callback per
             // texel. A 4096×4096 RGBA texture therefore issued 16.7 million
@@ -8835,8 +9867,20 @@ pub const Renderer = struct {
             // allocation once, then detile the host slice without callbacks.
             const tiled = try self.allocator.alloc(u8, probe_span);
             defer self.allocator.free(tiled);
-            if (!memory.read(memory.context, descriptor.address, tiled)) return Error.GuestMemoryReadFailed;
-            try layout.detile(tiled, linear);
+            if (!memory.read(memory.context, descriptor.address, tiled)) {
+                if (descriptor.tile_mode != .depth) return Error.GuestMemoryReadFailed;
+                source_available = false;
+                fillUnbackedDepthSample(descriptor.unified_format, linear);
+            } else {
+                try layout.detile(tiled, linear);
+            }
+        }
+        if (!source_available and !self.reported_unbacked_depth_sample) {
+            self.reported_unbacked_depth_sample = true;
+            std.debug.print(
+                "[vulkan dcb] unbacked depth sample @0x{x} {d}x{d} fmt={d}; binding far-depth fallback\n",
+                .{ descriptor.address, descriptor.width, descriptor.height, descriptor.unified_format },
+            );
         }
         if (self.traceCurrentGraphicsFrame() and bytes_per_texel == 4 and
             descriptor.depth_or_layers == 1)
@@ -8967,7 +10011,12 @@ pub const Renderer = struct {
         // Unreal fallback descriptors are typed as cube while a DIM=2D
         // instruction samples only the first 1x1 face; keep that legal by
         // exposing one layer in that case, while true DIM=Cube gets six.
-        const upload_layers: u32 = if (is_cube) 6 else 1;
+        const upload_layers: u32 = if (is_cube)
+            6
+        else if (is_2d_array)
+            descriptor.depth_or_layers
+        else
+            1;
         const upload = try self.createBuffer(
             byte_count,
             vk.buffer_usage_transfer_src_bit,
@@ -9064,6 +10113,7 @@ pub const Renderer = struct {
                 .two_d => vk.image_view_type_2d,
                 .three_d => vk.image_view_type_3d,
                 .cube => vk.image_view_type_cube,
+                .two_d_array => vk.image_view_type_2d_array,
             },
             .format = image_format,
             .components = components,
@@ -9107,7 +10157,7 @@ pub const Renderer = struct {
             _ = self.sampled_image_cache.orderedRemove(stale_index);
         }
 
-        if (self.sampled_image_cache.items.len >= maximum_sampled_images) {
+        if (self.sampled_image_cache.items.len >= maximum_cached_sampled_images) {
             var oldest_idx: usize = 0;
             var oldest_frame: u64 = std.math.maxInt(u64);
             for (self.sampled_image_cache.items, 0..) |item, idx| {
@@ -9243,6 +10293,15 @@ pub const Renderer = struct {
         for (fragment, 0..) |scalar, index| words[dynamic_scalar_words_per_stage + index] = scalar.value;
     }
 
+    fn writeComputeScalarValues(
+        self: *Renderer,
+        scalars: []const gpu.ShaderSpirvScalarRegister,
+    ) Error!void {
+        if (scalars.len > dynamic_scalar_words_per_stage) return Error.InvalidStorageDescriptor;
+        const words = self.dynamic_scalar_mapping orelse return Error.InvalidStorageDescriptor;
+        for (scalars, 0..) |scalar, index| words[index] = scalar.value;
+    }
+
     fn expectMapped(self: *Renderer, buffer: OwnedBuffer, expected: []const u8) Error!void {
         var mapped: ?*anyopaque = null;
         if (self.device_functions.map_memory(self.device, buffer.memory, 0, expected.len, 0, &mapped) != vk.success) {
@@ -9299,6 +10358,7 @@ pub const Renderer = struct {
 
     fn dcbRead(context: ?*anyopaque, address: u64, bytes: []u8) bool {
         const self = fromContext(context);
+        self.flushGuestStorageImageRange(address, bytes.len) catch return false;
         self.flushGuestStorageRange(address, bytes.len) catch return false;
         _ = self.materializeHtileTargetAt(address, bytes.len) catch return false;
         const memory = self.guest_memory orelse return false;
@@ -9337,6 +10397,7 @@ pub const Renderer = struct {
 
     fn dcbWrite(context: ?*anyopaque, address: u64, bytes: []const u8) bool {
         const self = fromContext(context);
+        self.flushGuestStorageImageRange(address, bytes.len) catch return false;
         self.flushGuestStorageRange(address, bytes.len) catch return false;
         self.prepareCmaskWrite(address, bytes.len) catch return false;
         self.prepareHtileWrite(address, bytes.len);
@@ -9755,8 +10816,12 @@ pub const Renderer = struct {
             interval_ns >= std.time.ns_per_s or
             profile.fence_wait_ns >= std.time.ns_per_s;
         if (should_print) {
+            var resident_storage_images: usize = 0;
+            for (self.storage_image_cache.items) |cached| {
+                resident_storage_images += @intFromBool(cached.valid);
+            }
             std.debug.print(
-                "[gpu frame] flip={d} frame_ms={d} draws={d}/{d}ms dispatches={d}/{d}ms submits={d} fence_wait_us={d} upload_kib={d}(buf={d},rt={d},tex={d},idx={d}) resident_kib={d} readback_kib={d}(buf={d},rt={d}) storage_ms={d}+{d} target_ms={d} rt_hit={d} rt_miss={d} buf_cache={d} tex_cache={d}\n",
+                "[gpu frame] flip={d} frame_ms={d} draws={d}/{d}ms dispatches={d}/{d}ms submits={d} fence_wait_us={d} upload_kib={d}(buf={d},rt={d},tex={d},idx={d}) resident_kib={d} readback_kib={d}(buf={d},rt={d}) storage_ms={d}+{d} target_ms={d} rt_hit={d} rt_miss={d} buf_cache={d} tex_cache={d} simg_cache={d}/{d}MiB\n",
                 .{
                     self.flip_callbacks,
                     interval_ns / std.time.ns_per_ms,
@@ -9782,10 +10847,12 @@ pub const Renderer = struct {
                     profile.render_target_misses,
                     self.guest_buffers.items.len,
                     self.sampled_image_cache.items.len,
+                    resident_storage_images,
+                    self.storage_image_cache_bytes / (1024 * 1024),
                 },
             );
             std.debug.print(
-                "[gpu shaders] flip={d} pso_hit={d} pso_miss={d}/{d}ms cpso={d}/{d}/{d}ms compute_ms={d}/{d}/{d}/{d} pso_cache={d} miss_match(state/vs/ps)={d}/{d}/{d} sa_hit={d} sa_miss={d}/{d}ms prov_ms={d} xlat_ms={d} res_ms={d} probe_ms={d} target_create_ms={d}/{d}\n",
+                "[gpu shaders] flip={d} pso_hit={d} pso_miss={d}/{d}ms cpso={d}/{d}/{d}ms compute_ms={d}/{d}/{d}/{d} pso_cache={d} cpso_cache={d} miss_match(state/vs/ps)={d}/{d}/{d} sa_hit={d} sa_miss={d}/{d}ms prov_ms={d} xlat_ms={d} res_ms={d} probe_ms={d} target_create_ms={d}/{d}\n",
                 .{
                     self.flip_callbacks,
                     profile.graphics_pipeline_hits,
@@ -9799,6 +10866,7 @@ pub const Renderer = struct {
                     profile.compute_translate_ns / std.time.ns_per_ms,
                     profile.compute_submit_ns / std.time.ns_per_ms,
                     self.graphics_pipelines.items.len,
+                    self.compute_pipelines.items.len,
                     profile.graphics_pipeline_miss_state_match,
                     profile.graphics_pipeline_miss_vertex_match,
                     profile.graphics_pipeline_miss_fragment_match,
@@ -10382,14 +11450,69 @@ pub const Renderer = struct {
             self.last_dispatch_error = null;
             return true;
         }
-        if (packet.opcode != gpu.pm4.dispatch_direct) {
+        var dispatch_dimensions: [3]u32 = undefined;
+        var initiator: u32 = 0;
+        if (packet.opcode == gpu.pm4.dispatch_direct) {
+            if (packet.body.len < 3) {
+                self.last_dispatch_error = Error.InvalidDispatchPacket;
+                std.debug.print("[vulkan dcb] dispatch rejected: {s}\n", .{@errorName(Error.InvalidDispatchPacket)});
+                return false;
+            }
+            dispatch_dimensions = .{ packet.body[0], packet.body[1], packet.body[2] };
+            initiator = if (packet.body.len >= 4) packet.body[3] else 0;
+        } else if (packet.opcode == gpu.pm4.dispatch_indirect) {
+            const address = if (packet.body.len == 2) blk: {
+                if (state.dispatch_indirect_args_base_address == 0) {
+                    self.last_dispatch_error = Error.UnsupportedIndirectDispatch;
+                    std.debug.print("[vulkan dcb] dispatch rejected: {s} (missing SET_BASE)\n", .{@errorName(Error.UnsupportedIndirectDispatch)});
+                    return false;
+                }
+                initiator = packet.body[1];
+                break :blk std.math.add(
+                    u64,
+                    state.dispatch_indirect_args_base_address,
+                    packet.body[0],
+                ) catch {
+                    self.last_dispatch_error = Error.InvalidDispatchPacket;
+                    return false;
+                };
+            } else if (packet.body.len == 3) blk: {
+                initiator = packet.body[2];
+                break :blk (@as(u64, packet.body[1]) << 32) | packet.body[0];
+            } else {
+                self.last_dispatch_error = Error.InvalidDispatchPacket;
+                std.debug.print("[vulkan dcb] dispatch rejected: {s}\n", .{@errorName(Error.InvalidDispatchPacket)});
+                return false;
+            };
+            self.flushPendingGuestWrite(address, 12) catch |err| {
+                self.last_dispatch_error = err;
+                std.debug.print("[vulkan dcb] indirect dispatch args rejected: {s} addr=0x{x}\n", .{ @errorName(err), address });
+                return false;
+            };
+            const memory = self.guest_memory orelse {
+                self.last_dispatch_error = Error.GuestMemoryUnavailable;
+                return false;
+            };
+            var bytes: [12]u8 = undefined;
+            if (!memory.read(memory.context, address, &bytes)) {
+                self.last_dispatch_error = Error.GuestMemoryReadFailed;
+                std.debug.print("[vulkan dcb] indirect dispatch args unreadable addr=0x{x}\n", .{address});
+                return false;
+            }
+            inline for (0..3) |index| {
+                dispatch_dimensions[index] = std.mem.readInt(
+                    u32,
+                    bytes[index * 4 ..][0..4],
+                    .little,
+                );
+            }
+            if (log_verbose_gpu) std.debug.print(
+                "[vulkan dcb] indirect dispatch args @0x{x}: {d}x{d}x{d} initiator=0x{x}\n",
+                .{ address, dispatch_dimensions[0], dispatch_dimensions[1], dispatch_dimensions[2], initiator },
+            );
+        } else {
             self.last_dispatch_error = Error.UnsupportedIndirectDispatch;
             std.debug.print("[vulkan dcb] dispatch rejected: {s}\n", .{@errorName(Error.UnsupportedIndirectDispatch)});
-            return false;
-        }
-        if (packet.body.len < 3) {
-            self.last_dispatch_error = Error.InvalidDispatchPacket;
-            std.debug.print("[vulkan dcb] dispatch rejected: {s}\n", .{@errorName(Error.InvalidDispatchPacket)});
             return false;
         }
         const program_address = gpu.resources.ShaderStage.compute.programAddress(state) orelse {
@@ -10404,9 +11527,9 @@ pub const Renderer = struct {
                 "[vulkan dcb] dispatch skipped: {s} groups={d}x{d}x{d} pgm={?x}/{?x} rsrc={?x}/{?x}\n",
                 .{
                     @errorName(Error.MissingComputeProgram),
-                    packet.body[0],
-                    packet.body[1],
-                    packet.body[2],
+                    dispatch_dimensions[0],
+                    dispatch_dimensions[1],
+                    dispatch_dimensions[2],
                     state.readRegister(.shader, 0x20c),
                     state.readRegister(.shader, 0x20d),
                     state.readRegister(.shader, 0x212),
@@ -10420,8 +11543,6 @@ pub const Renderer = struct {
             computeLocalSize(state, 0x208),
             computeLocalSize(state, 0x209),
         };
-        const dispatch_dimensions = [3]u32{ packet.body[0], packet.body[1], packet.body[2] };
-        const initiator = if (packet.body.len >= 4) packet.body[3] else 0;
         const group_count = dispatchGroupCounts(dispatch_dimensions, local_size, initiator);
         if (group_count[0] == 0 or group_count[1] == 0 or group_count[2] == 0) {
             self.last_dispatch_error = null;
@@ -10434,9 +11555,9 @@ pub const Renderer = struct {
                     self.flip_callbacks + 1,
                     self.frame_profile.dispatches,
                     program_address,
-                    packet.body[0],
-                    packet.body[1],
-                    packet.body[2],
+                    dispatch_dimensions[0],
+                    dispatch_dimensions[1],
+                    dispatch_dimensions[2],
                     group_count[0],
                     group_count[1],
                     group_count[2],
@@ -10473,9 +11594,9 @@ pub const Renderer = struct {
                     if (soft) "skipped" else "rejected",
                     @errorName(err),
                     program_address,
-                    packet.body[0],
-                    packet.body[1],
-                    packet.body[2],
+                    group_count[0],
+                    group_count[1],
+                    group_count[2],
                 },
             );
             return soft;
@@ -10485,9 +11606,9 @@ pub const Renderer = struct {
         if (log_verbose_gpu) std.debug.print(
             "[vulkan dcb] dispatch ok: groups={d}x{d}x{d} local={d}x{d}x{d} (#{d})\n",
             .{
-                packet.body[0],
-                packet.body[1],
-                packet.body[2],
+                group_count[0],
+                group_count[1],
+                group_count[2],
                 local_size[0],
                 local_size[1],
                 local_size[2],
@@ -11497,6 +12618,36 @@ fn containsNonzeroByte(bytes: []const u8) bool {
     return false;
 }
 
+/// A T# may name optional GPU-only depth memory on a control-flow path that is
+/// inactive for the current dispatch. Static resource discovery still has to
+/// bind a legal image for that instruction. Far depth is the conservative
+/// value: it does not spuriously occlude geometry if the branch becomes live.
+fn fillUnbackedDepthSample(unified_format: u16, bytes: []u8) void {
+    switch (unified_format) {
+        7 => @memset(bytes, 0xff), // R16_UNORM depth 1.0
+        22 => {
+            const far_depth = std.mem.nativeToLittle(u32, @bitCast(@as(f32, 1.0)));
+            var offset: usize = 0;
+            while (offset + @sizeOf(u32) <= bytes.len) : (offset += @sizeOf(u32)) {
+                @memcpy(bytes[offset..][0..@sizeOf(u32)], std.mem.asBytes(&far_depth));
+            }
+            if (offset < bytes.len) @memset(bytes[offset..], 0);
+        },
+        else => @memset(bytes, 0),
+    }
+}
+
+test "unbacked depth samples initialize to far depth" {
+    var d16: [4]u8 = undefined;
+    fillUnbackedDepthSample(7, &d16);
+    try std.testing.expectEqualSlices(u8, &.{ 0xff, 0xff, 0xff, 0xff }, &d16);
+
+    var d32: [8]u8 = undefined;
+    fillUnbackedDepthSample(22, &d32);
+    try std.testing.expectEqual(@as(u32, 0x3f80_0000), std.mem.readInt(u32, d32[0..4], .little));
+    try std.testing.expectEqual(@as(u32, 0x3f80_0000), std.mem.readInt(u32, d32[4..8], .little));
+}
+
 test "nonzero byte probe covers word chunks and tails" {
     const zeroes = [_]u8{0} ** 17;
     try std.testing.expect(!containsNonzeroByte(&zeroes));
@@ -11542,9 +12693,27 @@ fn isBlockCompressedUnifiedFormat(unified_format: u16) bool {
     return unified_format >= 169 and unified_format <= 182;
 }
 
+fn programUsesGds(analysis: *const gpu.ShaderAnalysis) bool {
+    for (analysis.program.instructions.items) |inst| {
+        if (inst.family == .ds and inst.gds) return true;
+    }
+    return false;
+}
+
 fn programStoresImageResource(analysis: *const gpu.ShaderAnalysis, resource_sgpr: u32) bool {
     for (analysis.program.instructions.items) |inst| {
-        if (inst.opcode == .image_store and inst.src1.kind == .sgpr and inst.src1.reg == resource_sgpr) {
+        const writes = switch (inst.opcode) {
+            .image_store,
+            .image_atomic_add,
+            .image_atomic_umin,
+            .image_atomic_umax,
+            .image_atomic_and,
+            .image_atomic_or,
+            .image_atomic_xor,
+            => true,
+            else => false,
+        };
+        if (writes and inst.src1.kind == .sgpr and inst.src1.reg == resource_sgpr) {
             return true;
         }
     }
@@ -11559,11 +12728,14 @@ fn sampledImageFormat(unified_format: u16, force_srgb: bool) ?u32 {
         6 => vk.format_r8_sint,
         7 => vk.format_r16_unorm,
         11 => vk.format_r16_uint,
+        13 => vk.format_r16_sfloat,
         14 => vk.format_r8g8_unorm,
         15 => vk.format_r8g8_snorm,
         18 => vk.format_r8g8_uint,
         19 => vk.format_r8g8_sint,
         22 => vk.format_r32_sfloat,
+        29 => vk.format_r16g16_sfloat,
+        64 => vk.format_r32g32_sfloat,
         36 => vk.format_b10g11r11_ufloat_pack32,
         50 => vk.format_a2b10g10r10_unorm_pack32,
         56 => if (force_srgb) vk.format_r8g8b8a8_srgb else vk.format_r8g8b8a8_unorm,
@@ -11590,6 +12762,12 @@ fn sampledImageFormat(unified_format: u16, force_srgb: bool) ?u32 {
     };
 }
 
+fn sampledViewFormatCompatible(image_format: u32, view_format: u32) bool {
+    if (image_format == view_format) return true;
+    return (image_format == vk.format_r8g8b8a8_unorm and view_format == vk.format_r8g8b8a8_srgb) or
+        (image_format == vk.format_r8g8b8a8_srgb and view_format == vk.format_r8g8b8a8_unorm);
+}
+
 const StorageImageFormat = struct {
     spirv: gpu.ShaderSpirvStorageImageFormat,
     vulkan: u32,
@@ -11597,15 +12775,48 @@ const StorageImageFormat = struct {
 
 fn storageImageFormat(unified_format: u16) ?StorageImageFormat {
     return switch (unified_format) {
+        1 => .{ .spirv = .r8_unorm, .vulkan = vk.format_r8_unorm },
+        2 => .{ .spirv = .r8_snorm, .vulkan = vk.format_r8_snorm },
         5 => .{ .spirv = .r8_uint, .vulkan = vk.format_r8_uint },
+        6 => .{ .spirv = .r8_sint, .vulkan = vk.format_r8_sint },
         7 => .{ .spirv = .r16_unorm, .vulkan = vk.format_r16_unorm },
+        8 => .{ .spirv = .r16_snorm, .vulkan = vk.format_r16_snorm },
         11 => .{ .spirv = .r16_uint, .vulkan = vk.format_r16_uint },
+        12 => .{ .spirv = .r16_sint, .vulkan = vk.format_r16_sint },
+        13 => .{ .spirv = .r16_float, .vulkan = vk.format_r16_sfloat },
+        14 => .{ .spirv = .rg8_unorm, .vulkan = vk.format_r8g8_unorm },
+        15 => .{ .spirv = .rg8_snorm, .vulkan = vk.format_r8g8_snorm },
+        18 => .{ .spirv = .rg8_uint, .vulkan = vk.format_r8g8_uint },
+        19 => .{ .spirv = .rg8_sint, .vulkan = vk.format_r8g8_sint },
         20 => .{ .spirv = .r32_uint, .vulkan = vk.format_r32_uint },
+        21 => .{ .spirv = .r32_sint, .vulkan = vk.format_r32_sint },
+        22 => .{ .spirv = .r32_float, .vulkan = vk.format_r32_sfloat },
+        23 => .{ .spirv = .rg16_unorm, .vulkan = vk.format_r16g16_unorm },
+        24 => .{ .spirv = .rg16_snorm, .vulkan = vk.format_r16g16_snorm },
+        27 => .{ .spirv = .rg16_uint, .vulkan = vk.format_r16g16_uint },
+        28 => .{ .spirv = .rg16_sint, .vulkan = vk.format_r16g16_sint },
+        29 => .{ .spirv = .rg16_float, .vulkan = vk.format_r16g16_sfloat },
         36 => .{ .spirv = .r11g11b10_float, .vulkan = vk.format_b10g11r11_ufloat_pack32 },
+        50 => .{ .spirv = .rgb10a2_unorm, .vulkan = vk.format_a2b10g10r10_unorm_pack32 },
         56 => .{ .spirv = .rgba8_unorm, .vulkan = vk.format_r8g8b8a8_unorm },
+        57 => .{ .spirv = .rgba8_snorm, .vulkan = vk.format_r8g8b8a8_snorm },
         60 => .{ .spirv = .rgba8_uint, .vulkan = vk.format_r8g8b8a8_uint },
+        61 => .{ .spirv = .rgba8_sint, .vulkan = vk.format_r8g8b8a8_sint },
+        62 => .{ .spirv = .rg32_uint, .vulkan = vk.format_r32g32_uint },
+        63 => .{ .spirv = .rg32_sint, .vulkan = vk.format_r32g32_sint },
+        64 => .{ .spirv = .rg32_float, .vulkan = vk.format_r32g32_sfloat },
+        65 => .{ .spirv = .rgba16_unorm, .vulkan = vk.format_r16g16b16a16_unorm },
+        66 => .{ .spirv = .rgba16_snorm, .vulkan = vk.format_r16g16b16a16_snorm },
+        69 => .{ .spirv = .rgba16_uint, .vulkan = vk.format_r16g16b16a16_uint },
+        70 => .{ .spirv = .rgba16_sint, .vulkan = vk.format_r16g16b16a16_sint },
         71 => .{ .spirv = .rgba16_float, .vulkan = vk.format_r16g16b16a16_sfloat },
+        75 => .{ .spirv = .rgba32_uint, .vulkan = vk.format_r32g32b32a32_uint },
+        76 => .{ .spirv = .rgba32_sint, .vulkan = vk.format_r32g32b32a32_sint },
         77 => .{ .spirv = .rgba32_float, .vulkan = vk.format_r32g32b32a32_sfloat },
+        // Storage operations bypass sRGB transfer conversion. Vulkan does not
+        // permit an sRGB storage-image view, so expose the identical four-byte
+        // memory representation through its UNORM-compatible format.
+        130 => .{ .spirv = .rgba8_unorm, .vulkan = vk.format_r8g8b8a8_unorm },
         else => null,
     };
 }
@@ -11614,9 +12825,9 @@ fn storageImageBytesPerTexel(unified_format: u16) u8 {
     return switch (unified_format) {
         1...6 => 1,
         7...19 => 2,
-        20, 22, 36, 50, 56, 60, 130 => 4,
+        20...29, 36, 50, 56...61, 130 => 4,
         62...71 => 8,
-        77 => 16,
+        75...77 => 16,
         169, 170 => 8,
         171...182 => 16,
         else => 0,
@@ -12998,6 +14209,7 @@ fn choosePhysicalDevice(
     functions: *const InstanceFunctions,
     surface: vk.Surface,
     surface_functions: ?*const SurfaceFunctions,
+    prefer_integrated_gpu: bool,
 ) (Error || std.mem.Allocator.Error)!Candidate {
     var count: u32 = 0;
     if (functions.enumerate_physical_devices(instance_handle, &count, null) != vk.success or count == 0) {
@@ -13048,11 +14260,7 @@ fn choosePhysicalDevice(
         };
         @memcpy(info.name_bytes[0..name_length], name_source[0..name_length]);
         info.name_length = @intCast(name_length);
-        const score: u32 = switch (device_type) {
-            vk.physical_device_type_discrete_gpu => 300,
-            vk.physical_device_type_integrated_gpu => 200,
-            else => 100,
-        };
+        const score = physicalDeviceScore(device_type, prefer_integrated_gpu);
         if (best == null or score > best.?.score) {
             best = .{
                 .physical_device = physical_device,
@@ -13063,6 +14271,19 @@ fn choosePhysicalDevice(
         }
     }
     return best orelse Error.NoCompatiblePhysicalDevice;
+}
+
+fn physicalDeviceScore(device_type: u32, prefer_integrated_gpu: bool) u32 {
+    if (prefer_integrated_gpu) return switch (device_type) {
+        vk.physical_device_type_integrated_gpu => 400,
+        vk.physical_device_type_discrete_gpu => 300,
+        else => 100,
+    };
+    return switch (device_type) {
+        vk.physical_device_type_discrete_gpu => 300,
+        vk.physical_device_type_integrated_gpu => 200,
+        else => 100,
+    };
 }
 
 fn findMemoryTypeIn(properties: vk.PhysicalDeviceMemoryProperties, supported_bits: u32, required: vk.Flags) ?u32 {
@@ -13685,6 +14906,111 @@ test "R16 UNORM storage images use the matching typed Vulkan format" {
     try std.testing.expectEqual(@as(u8, 2), storageImageBytesPerTexel(7));
 }
 
+test "R8 UNORM storage images use the matching typed Vulkan format" {
+    const format = storageImageFormat(1).?;
+    try std.testing.expectEqual(gpu.ShaderSpirvStorageImageFormat.r8_unorm, format.spirv);
+    try std.testing.expectEqual(vk.format_r8_unorm, format.vulkan);
+    try std.testing.expectEqual(@as(u8, 1), storageImageBytesPerTexel(1));
+}
+
+test "one and two channel 8-bit storage images keep their numeric class" {
+    const cases = [_]struct {
+        unified: u16,
+        spirv: gpu.ShaderSpirvStorageImageFormat,
+        vulkan: u32,
+        bytes: u8,
+    }{
+        .{ .unified = 2, .spirv = .r8_snorm, .vulkan = vk.format_r8_snorm, .bytes = 1 },
+        .{ .unified = 5, .spirv = .r8_uint, .vulkan = vk.format_r8_uint, .bytes = 1 },
+        .{ .unified = 6, .spirv = .r8_sint, .vulkan = vk.format_r8_sint, .bytes = 1 },
+        .{ .unified = 14, .spirv = .rg8_unorm, .vulkan = vk.format_r8g8_unorm, .bytes = 2 },
+        .{ .unified = 15, .spirv = .rg8_snorm, .vulkan = vk.format_r8g8_snorm, .bytes = 2 },
+        .{ .unified = 18, .spirv = .rg8_uint, .vulkan = vk.format_r8g8_uint, .bytes = 2 },
+        .{ .unified = 19, .spirv = .rg8_sint, .vulkan = vk.format_r8g8_sint, .bytes = 2 },
+    };
+    for (cases) |case| {
+        const format = storageImageFormat(case.unified).?;
+        try std.testing.expectEqual(case.spirv, format.spirv);
+        try std.testing.expectEqual(case.vulkan, format.vulkan);
+        try std.testing.expectEqual(case.bytes, storageImageBytesPerTexel(case.unified));
+    }
+}
+
+test "R32 float and sRGB storage images use Vulkan-compatible typed formats" {
+    const scalar = storageImageFormat(22).?;
+    try std.testing.expectEqual(gpu.ShaderSpirvStorageImageFormat.r32_float, scalar.spirv);
+    try std.testing.expectEqual(vk.format_r32_sfloat, scalar.vulkan);
+
+    const srgb = storageImageFormat(130).?;
+    try std.testing.expectEqual(gpu.ShaderSpirvStorageImageFormat.rgba8_unorm, srgb.spirv);
+    try std.testing.expectEqual(vk.format_r8g8b8a8_unorm, srgb.vulkan);
+}
+
+test "resident RGBA8 images accept matching UNORM and sRGB sampled views" {
+    try std.testing.expect(sampledViewFormatCompatible(
+        vk.format_r8g8b8a8_unorm,
+        vk.format_r8g8b8a8_srgb,
+    ));
+    try std.testing.expect(sampledViewFormatCompatible(
+        vk.format_r8g8b8a8_srgb,
+        vk.format_r8g8b8a8_unorm,
+    ));
+    try std.testing.expect(sampledViewFormatCompatible(vk.format_r16_sfloat, vk.format_r16_sfloat));
+    try std.testing.expect(!sampledViewFormatCompatible(vk.format_r16_sfloat, vk.format_r16_unorm));
+}
+
+test "RGB10A2 UNORM storage images preserve packed color semantics" {
+    const storage = storageImageFormat(50).?;
+    try std.testing.expectEqual(gpu.ShaderSpirvStorageImageFormat.rgb10a2_unorm, storage.spirv);
+    try std.testing.expectEqual(vk.format_a2b10g10r10_unorm_pack32, storage.vulkan);
+    try std.testing.expectEqual(@as(u8, 4), storageImageBytesPerTexel(50));
+}
+
+test "R32 signed storage images keep signed integer semantics" {
+    const scalar = storageImageFormat(21).?;
+    try std.testing.expectEqual(gpu.ShaderSpirvStorageImageFormat.r32_sint, scalar.spirv);
+    try std.testing.expectEqual(vk.format_r32_sint, scalar.vulkan);
+    try std.testing.expectEqual(@as(u8, 4), storageImageBytesPerTexel(21));
+}
+
+test "R16 float images preserve their scalar type" {
+    const storage = storageImageFormat(13).?;
+    try std.testing.expectEqual(gpu.ShaderSpirvStorageImageFormat.r16_float, storage.spirv);
+    try std.testing.expectEqual(vk.format_r16_sfloat, storage.vulkan);
+    try std.testing.expectEqual(@as(?u32, vk.format_r16_sfloat), sampledImageFormat(13, false));
+}
+
+test "R16G16 float images preserve their two-channel type" {
+    const storage = storageImageFormat(29).?;
+    try std.testing.expectEqual(gpu.ShaderSpirvStorageImageFormat.rg16_float, storage.spirv);
+    try std.testing.expectEqual(vk.format_r16g16_sfloat, storage.vulkan);
+    try std.testing.expectEqual(@as(u8, 4), storageImageBytesPerTexel(29));
+    try std.testing.expectEqual(@as(?u32, vk.format_r16g16_sfloat), sampledImageFormat(29, false));
+}
+
+test "wide storage images retain channel count and numeric class" {
+    const cases = [_]struct {
+        unified: u16,
+        spirv: gpu.ShaderSpirvStorageImageFormat,
+        vulkan: u32,
+        bytes: u8,
+    }{
+        .{ .unified = 64, .spirv = .rg32_float, .vulkan = vk.format_r32g32_sfloat, .bytes = 8 },
+        .{ .unified = 65, .spirv = .rgba16_unorm, .vulkan = vk.format_r16g16b16a16_unorm, .bytes = 8 },
+        .{ .unified = 69, .spirv = .rgba16_uint, .vulkan = vk.format_r16g16b16a16_uint, .bytes = 8 },
+        .{ .unified = 70, .spirv = .rgba16_sint, .vulkan = vk.format_r16g16b16a16_sint, .bytes = 8 },
+        .{ .unified = 75, .spirv = .rgba32_uint, .vulkan = vk.format_r32g32b32a32_uint, .bytes = 16 },
+        .{ .unified = 76, .spirv = .rgba32_sint, .vulkan = vk.format_r32g32b32a32_sint, .bytes = 16 },
+    };
+    for (cases) |case| {
+        const format = storageImageFormat(case.unified).?;
+        try std.testing.expectEqual(case.spirv, format.spirv);
+        try std.testing.expectEqual(case.vulkan, format.vulkan);
+        try std.testing.expectEqual(case.bytes, storageImageBytesPerTexel(case.unified));
+    }
+    try std.testing.expectEqual(@as(?u32, vk.format_r32g32_sfloat), sampledImageFormat(64, false));
+}
+
 test "R16 and RGBA8 integer sampled images preserve their typed formats" {
     try std.testing.expectEqual(@as(?u32, vk.format_r16_unorm), sampledImageFormat(7, false));
     try std.testing.expectEqual(@as(?u32, vk.format_r16_uint), sampledImageFormat(11, false));
@@ -13699,6 +15025,24 @@ test "R16 UINT color targets use the matching integer attachment format" {
     const format = colorTargetFormat(descriptor).?;
     try std.testing.expectEqual(vk.format_r16_uint, format.vulkan);
     try std.testing.expectEqual(@as(u8, 2), format.bytes_per_texel);
+
+    descriptor.number_type = 7;
+    const float_format = colorTargetFormat(descriptor).?;
+    try std.testing.expectEqual(vk.format_r16_sfloat, float_format.vulkan);
+    try std.testing.expectEqual(@as(u8, 2), float_format.bytes_per_texel);
+
+    descriptor.number_type = 0;
+    try std.testing.expect(colorTargetFormat(descriptor) == null);
+}
+
+test "RG16F color targets use the matching two-channel attachment format" {
+    var descriptor = std.mem.zeroes(gpu.resources.ColorTarget);
+    descriptor.format = 5;
+    descriptor.number_type = 7;
+
+    const format = colorTargetFormat(descriptor).?;
+    try std.testing.expectEqual(vk.format_r16g16_sfloat, format.vulkan);
+    try std.testing.expectEqual(@as(u8, 4), format.bytes_per_texel);
 
     descriptor.number_type = 0;
     try std.testing.expect(colorTargetFormat(descriptor) == null);
@@ -13729,6 +15073,17 @@ test "RGBA32F color targets use the matching Vulkan format" {
 
     descriptor.number_type = 0;
     try std.testing.expect(colorTargetFormat(descriptor) == null);
+}
+
+test "ambiguous sampled DIM follows the descriptor image type" {
+    try std.testing.expectEqual(
+        rdna2.spirv.SampledImageDimension.three_d,
+        sampledImageDimensionForInstruction(.dim_2d_array_alt, .color_3d).?,
+    );
+    try std.testing.expectEqual(
+        rdna2.spirv.SampledImageDimension.two_d_array,
+        sampledImageDimensionForInstruction(.dim_2d_array_alt, .color_2d_array).?,
+    );
 }
 
 test "MSAA color targets retain their allocation while using one host sample" {
@@ -14224,6 +15579,24 @@ test "depth attachment formats follow the stored precision" {
     // a nearby one, which would silently change which fragments survive.
     descriptor.format = 2;
     try std.testing.expectEqual(@as(?u32, null), depthTargetFormat(descriptor));
+}
+
+test "depth attachments can be sampled through matching scalar formats" {
+    try std.testing.expect(depthSampledFormatCompatible(vk.format_d16_unorm, vk.format_r16_unorm));
+    try std.testing.expect(depthSampledFormatCompatible(vk.format_d32_sfloat, vk.format_r32_sfloat));
+    try std.testing.expect(!depthSampledFormatCompatible(vk.format_d32_sfloat, vk.format_r16_unorm));
+    try std.testing.expect(!depthSampledFormatCompatible(vk.format_r32_sfloat, vk.format_r32_sfloat));
+}
+
+test "integrated Vulkan device preference reverses the default adapter order" {
+    try std.testing.expect(
+        physicalDeviceScore(vk.physical_device_type_discrete_gpu, false) >
+            physicalDeviceScore(vk.physical_device_type_integrated_gpu, false),
+    );
+    try std.testing.expect(
+        physicalDeviceScore(vk.physical_device_type_integrated_gpu, true) >
+            physicalDeviceScore(vk.physical_device_type_discrete_gpu, true),
+    );
 }
 
 test "guest depth compare selectors map onto the host operations" {

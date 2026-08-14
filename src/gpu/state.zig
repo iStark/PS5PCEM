@@ -146,6 +146,8 @@ pub const State = struct {
     instance_count: u32 = 1,
     index_base_address: u64 = 0,
     index_buffer_size: u32 = 0,
+    draw_indirect_args_base_address: u64 = 0,
+    dispatch_indirect_args_base_address: u64 = 0,
     /// 0 = u16, 1 = u32, 2 = u8 (VGT_INDEX_TYPE).
     index_type: u2 = 0,
 
@@ -178,6 +180,8 @@ pub const State = struct {
         self.instance_count = 1;
         self.index_base_address = 0;
         self.index_buffer_size = 0;
+        self.draw_indirect_args_base_address = 0;
+        self.dispatch_indirect_args_base_address = 0;
         self.index_type = 0;
     }
 };
@@ -210,4 +214,6 @@ test "clearing register state does not erase submission statistics" {
     try testing.expectEqual(@as(u32, 1), gpu_state.instance_count);
     try testing.expectEqual(@as(u64, 0), gpu_state.index_base_address);
     try testing.expectEqual(@as(u32, 0), gpu_state.index_buffer_size);
+    try testing.expectEqual(@as(u64, 0), gpu_state.draw_indirect_args_base_address);
+    try testing.expectEqual(@as(u64, 0), gpu_state.dispatch_indirect_args_base_address);
 }

@@ -392,6 +392,24 @@ pub fn main(init: std.process.Init) !void {
 
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_graphics_probe = true });
     defer renderer.deinit();
+    const args = try init.minimal.args.toSlice(allocator);
+    if (args.len == 3 and std.mem.eql(u8, args[1], "--probe-spv")) {
+        const bytes = try std.Io.Dir.cwd().readFileAllocOptions(
+            init.io,
+            args[2],
+            allocator,
+            .limited(16 * 1024 * 1024),
+            .of(u32),
+            null,
+        );
+        if (bytes.len % @sizeOf(u32) != 0) return error.MisalignedSpirv;
+        try renderer.probeComputeSpirv(std.mem.bytesAsSlice(u32, bytes));
+        std.debug.print("compute SPIR-V pipeline compiled: {s} ({d} words)\n", .{
+            args[2],
+            bytes.len / @sizeOf(u32),
+        });
+        return;
+    }
     var guest = GuestMemory{};
     const backend = renderer.dcbBackend(guest.interface());
     if (init.minimal.environ.containsUnempty(allocator, "PS5_IMAGE_SMOKE_ONLY") catch false) {

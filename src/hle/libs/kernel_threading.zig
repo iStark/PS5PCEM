@@ -130,6 +130,7 @@ pub const Backend = struct {
     wait_fn: ?*const fn (?*anyopaque, WaitRequest) BackendError!WaitResult = null,
     wake_fn: ?*const fn (?*anyopaque, u64, u64, usize) void = null,
     call_fn: ?*const fn (?*anyopaque, GuestCall) BackendError!u64 = null,
+    raise_exception_fn: ?*const fn (?*anyopaque, u64, u64, i32) BackendError!void = null,
     request_exit_fn: ?*const fn (?*anyopaque, u64, u64) void = null,
 
     fn start(self: Backend, request: StartRequest) BackendError!void {
@@ -760,6 +761,23 @@ pub const Manager = struct {
         _ = try self.callGuestResult(entry_point, arguments);
     }
 
+    /// Schedules a process exception callback on the target guest pthread.
+    /// The execution backend owns delivery because only it can preserve the
+    /// target's TLS, stack and native-thread identity.
+    pub fn raiseGuestException(
+        self: *Manager,
+        target_thread: u64,
+        handler: u64,
+        exception_type: i32,
+    ) Error!void {
+        self.lock.lock();
+        const backend = self.backend;
+        self.lock.unlock();
+        const active_backend = backend orelse return error.ExecutorUnavailable;
+        const raise_fn = active_backend.raise_exception_fn orelse return error.ExecutorUnavailable;
+        return raise_fn(active_backend.context, target_thread, handler, exception_type);
+    }
+
     pub fn keyCreate(self: *Manager, out_key: *u32, destructor: u64) Error!void {
         self.lock.lock();
         defer self.lock.unlock();
@@ -1096,6 +1114,11 @@ pub fn wakeWaiters(key: u64, sequence: u64, maximum_waiters: usize) void {
 pub fn callGuestCurrent(entry_point: u64, arguments: []const u64) Error!u64 {
     const active_manager = activeManager() orelse return error.NotAttached;
     return active_manager.callGuestResult(entry_point, arguments);
+}
+
+pub fn raiseGuestException(target_thread: u64, handler: u64, exception_type: i32) Error!void {
+    const active_manager = activeManager() orelse return error.NotAttached;
+    return active_manager.raiseGuestException(target_thread, handler, exception_type);
 }
 
 fn alignForward(value: u64, alignment: u64) Error!u64 {

@@ -68,7 +68,6 @@ var process_arguments = [_]?[*:0]const u8{ process_argument_zero, null };
 var program_name: ?[*:0]const u8 = process_argument_zero;
 threadlocal var fallback_errno: i32 = 0;
 threadlocal var rtld_atexit_count: u32 = 0;
-threadlocal var undelivered_exception_waits: u8 = 0;
 
 /// Set when the launcher is done with guest execution (contained fault, clean
 /// exit). Hot firmware paths that would otherwise spin forever — guest stdout
@@ -188,7 +187,6 @@ fn resetKernelObjects() void {
     @memset(&exception_handlers, 0);
     next_event_flag_handle = 1;
     next_semaphore_handle = 1;
-    undelivered_exception_waits = 0;
 }
 
 /// Reports what a parked thread is actually looking at.
@@ -549,15 +547,8 @@ fn removeExceptionHandler(
     return 0;
 }
 
-/// Records a process exception request that the direct native bridge cannot
-/// yet deliver to a different guest pthread.
-///
-/// A real kernel interrupts the target, runs the installed handler there, and
-/// resumes its register context. The current bridge deliberately cannot fake
-/// that by calling on the raiser's stack: Unity's stop-the-world callback would
-/// publish roots for the wrong thread. Marking this one handshake lets the
-/// raiser's following semaphore wait report ENOSYS, which is the title's
-/// existing fallback path, while unrelated semaphores retain real semantics.
+/// Delivers process exceptions through the CPU backend so Unity's stop-the-
+/// world handler runs with the target pthread's TLS and stack identity.
 fn raiseException(
     target_thread: u64,
     signal: i32,
@@ -570,14 +561,13 @@ fn raiseException(
         return KernelError.einval.raw();
     }
     kernel_object_lock.lock();
-    const installed = exception_handlers[@intCast(signal)] != 0;
+    const handler = exception_handlers[@intCast(signal)];
     kernel_object_lock.unlock();
-    if (installed and target_thread != threading.currentThreadId()) {
-        // Unity's stop/resume handshake uses the pair of zero-count
-        // semaphores created beside its exception handler. Neither side can be
-        // completed without running that handler on the target pthread.
-        undelivered_exception_waits = 2;
-    }
+    if (handler == 0) return 0;
+    threading.raiseGuestException(target_thread, handler, signal) catch |err| return switch (err) {
+        error.ThreadNotFound => KernelError.esrch.raw(),
+        else => KernelError.ebusy.raw(),
+    };
     return 0;
 }
 
@@ -869,10 +859,6 @@ fn waitSemaphore(
     _: u64,
     _: u64,
 ) callconv(abi.guest) i32 {
-    if (undelivered_exception_waits != 0) {
-        undelivered_exception_waits -= 1;
-        return KernelError.enosys.raw();
-    }
     const requested_timeout: ?u64 = if (timeout) |value| blk: {
         if (!memory_api.isGuestRangeAccessible(@intFromPtr(value), @sizeOf(u32))) {
             return KernelError.efault.raw();
@@ -2182,16 +2168,6 @@ test "kernel event flags and semaphores retain and consume their state" {
     try testing.expectEqual(
         @as(i32, 0),
         createSemaphore(&semaphore_handle, semaphore_name.ptr, 0, 2, 3, 0),
-    );
-    try testing.expectEqual(@as(i32, 0), installExceptionHandler(30, 0x1234, 0, 0, 0, 0));
-    try testing.expectEqual(@as(i32, 0), raiseException(0x5678, 30, 0, 0, 0, 0));
-    try testing.expectEqual(
-        KernelError.enosys.raw(),
-        waitSemaphore(semaphore_handle, 1, null, 0, 0, 0),
-    );
-    try testing.expectEqual(
-        KernelError.enosys.raw(),
-        waitSemaphore(semaphore_handle, 1, null, 0, 0, 0),
     );
     try testing.expectEqual(@as(i32, 0), pollSemaphore(semaphore_handle, 1, 0, 0, 0, 0));
     try testing.expectEqual(@as(i32, 0), waitSemaphore(semaphore_handle, 1, null, 0, 0, 0));

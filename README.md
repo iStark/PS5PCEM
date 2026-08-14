@@ -36,11 +36,13 @@ If you would like to support continued PS5PCEM development, you can do so on
 - Guest vertex and pixel shaders can render sampled textures using AGC vertex
   tables, per-instruction V# mappings, `VertexIndex`, PARAM exports, and
   fragment interpolation.
-- Persistent render targets, large writable storage buffers, and bounded texture
-  and pipeline caches keep frame resources on the GPU across draws and reduce
-  redundant queue submits, uploads, and readbacks. A bound depth allocation
-  becomes a resident attachment, so guest depth testing and depth writes reach
-  the rasterizer; stencil and multi-sample depth do not yet.
+- Persistent render targets, large writable storage buffers, resident storage
+  images, and bounded texture and pipeline caches keep frame resources on the
+  GPU across draws and dispatches. Compute chains can pass typed 2D, array, and
+  3D images directly to later sampled or storage bindings without an intervening
+  guest-memory round trip. A bound depth allocation becomes a resident
+  attachment and can be sampled by a later pass, so guest depth testing and
+  depth writes reach the rasterizer; stencil and multi-sample depth do not yet.
 - Long-running title execution uses a freeing, thread-safe allocator, and
   aligned Windows direct-memory ranges share 64 KiB section views. Temporary
   uploads/readbacks and 16 KiB guest pages therefore no longer accumulate as
@@ -48,6 +50,10 @@ If you would like to support continued PS5PCEM development, you can do so on
 - Graphics and compute queues retain recursively referenced indirect command
   buffers and register lists, so an AGC arena can be recycled while a real
   `WAIT_REG_MEM` continuation remains blocked and later resumes in place.
+- Windows guest-thread waits use an uncancelable address wait, and process
+  exceptions are delivered at a safe point on the requested guest pthread with
+  its own TLS and stack identity. Unity stop-the-world handshakes therefore no
+  longer depend on a synthetic semaphore failure to make progress.
 - Title plugins can be mapped explicitly before execution; later
   `sceKernelLoadStartModule` calls receive stable handles and
   `sceKernelDlsym` resolves readable export names inside the selected PRX.
@@ -89,8 +95,10 @@ If you would like to support continued PS5PCEM development, you can do so on
   `EliminateFastClear`, `FmaskDecompress`, and `DccDecompress` packets preserve
   the canonical resident Vulkan image instead of executing their dummy pixel
   shader as an ordinary draw; this removes the full-screen white overwrite that
-  previously hid the finished scene. Gameplay beyond the menu has not yet been
-  validated.
+  previously hid the finished scene. Holding `Triangle` now starts `NEW GAME`;
+  the cold world transition completes, reaches the `Cross` prompt, and renders
+  the first observed in-engine gameplay scene. Initial shader and pipeline
+  compilation remains slow, and broader gameplay has not yet been validated.
 - Mighty Morphin Power Rangers: Rita's Rewind now resolves its Fiber, Pad,
   offline NP, AGC 1.1, and AGC driver imports, then sustains the title's real
   1920×1080 graphics and audio loop. Native Windows fibers preserve suspended
@@ -183,7 +191,8 @@ preserving the title's pixel-art presentation.*
 by the guest graphics and compute passes after both SceAvPlayer intro movies.
 Structured shader control flow restores the UI text, while fixed-function DCC
 decompression no longer executes its constant-white helper shader over the
-completed scene.*
+completed scene. This capture predates the now-verified transition into the
+first in-engine gameplay scene.*
 
 ![Tetris Effect first guest-rendered particle frame](docs/images/tetris-effect-first-render.png)
 
@@ -205,7 +214,7 @@ the repository contains none of that content.
 | **Pistol Whip** | Maps the native PS VR2 plugin and Burst module, then starts loading Unity asset archives | Headset, tracking, controller, and host OpenXR support are intentionally deferred |
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
 | **Tetris Effect: Connected** | Completes the Unreal bootstrap and a measured startup frame with 595 guest draws and 63 compute dispatches, including typed 2D/3D storage images, `64×64×64 RGBA16_FLOAT` volumes, layered post-process targets, `RGBA32_FLOAT` exposure surfaces, a `10_10_10_2_UNORM` lookup target, and the mixed image/LDS prepass. Ordered AGC completion acknowledgement removes the intermittent retirement race, and the latest unattended run advanced through 49 VideoOut cycles. Most post-bootstrap cycles measured about 3.3–3.8 seconds on the current RTX 3070 Ti host. The first generated `0xe060`-byte material pixel shader is now decoded within its exact AGC allocation instead of the old fixed instruction ceiling | The latest verified visible output is still the recognizable 1920×1080 HDR particle target shown above. The exact registered 3840×2160 VideoOut target remains black, so presentation falls back to a converted `R11G11B10_FLOAT` intermediate. NGG/fetch-shader continuations, exact layered rendering, final scanout aliasing/tonemapping, one oversized guest-buffer descriptor, and performance remain incomplete; neither a menu nor gameplay is claimed |
-| **The Precinct** | Links the complete six-image guest graph, starts Unity plug-ins through `sceKernelLoadStartModule`, indexes its audio assets, and plays both observed intro movies as synchronized 3840×2160 NV12 video and 48 kHz stereo PCM. It then renders the complete 1920×1080 title artwork, opens `PLAY GAME`, and displays the readable `NEW GAME` confirmation shown above. A full 16-byte local-time conversion result prevents the former post-video clock loop; structured natural loops and terminal selections restore UI shaders; metadata CB modes no longer paint their helper export over the resident scene. The observed title frame completes 10 draws and 10 dispatches in about 70 ms, while the open menu/confirmation uses 19 draws and 11 dispatches at roughly 137–152 ms on the current RTX 3070 Ti host | Menu interaction beyond the confirmation and gameplay have not yet been validated. General compressed DCC/FMASK expansion, the remaining shader/control-flow cases, and synchronous GPU/resource costs still need work |
+| **The Precinct** | Links the complete six-image guest graph, starts Unity plug-ins through `sceKernelLoadStartModule`, indexes its audio assets, and plays both observed intro movies as synchronized 3840×2160 NV12 video and 48 kHz stereo PCM. It renders the complete 1920×1080 title artwork, opens `PLAY GAME`, and displays the readable `NEW GAME` confirmation shown above. Holding `Triangle` now enters the cold world load; the transition eventually reaches the `Cross` prompt and produces the first verified in-engine gameplay image. Target-thread exception delivery completes Unity's stop-the-world handshake, resident typed storage images preserve its compute graph, and dynamic compute scalars prevent runtime SGPR values from generating a new Vulkan pipeline every frame | The first world transition still takes several minutes on the current RTX 3070 Ti test host because first-use shader translation, NVIDIA pipeline compilation, synchronous submission, and resource staging remain expensive. An exact NVIDIA compiler guard substitutes the observed deformation output and suppresses one transient graphics pipeline after the failing compute signature; broad gameplay, input, and visual correctness are not yet claimed |
 | **Jets 'n' Guns 2** | Resolves title content through `/app0`, completes AGC resource registration, and sustains the full graphics/compute/VideoOut loop. Targetless final passes are preserved through flip, while dynamic SGPR data and descriptor-sized buffer bounds keep streamed sprite batches on stable Vulkan pipelines. `START GAME` now passes the loading screen and reaches the recognizable 3840×2160 tutorial gameplay shown above; the unattended run remained live beyond flip 300. Firmware-default mutex compatibility preserves the CRT's recursive `trylock` guard without leaking recursion into the audio workers' blocking slow path | The cold transition into the first dense gameplay scene still takes roughly 30–40 seconds on the current RTX 3070 Ti host. Once loaded, observed 227–256-draw frames take about 0.6–1.6 seconds, dominated by synchronous Vulkan submission, resource staging, and first-use work; broad input and in-game audio compatibility still need longer validation |
 | **Asterix & Obelix: Slap Them All!** | Maps the Unity/PSN plug-in graph, passes GameUpdate, trophy, entitlement, WebApi, and player-review bootstrap calls, accepts four-byte-aligned AGC shader headers, and reaches repeated 1920×1080 frames. SceAvPlayer returns the ATL intro as correctly decoded NV12 frames, while matched image-copy, planar-conversion, fullscreen-blit, and color-resolve paths keep the observed movie pipeline moving without its former multi-second shader compilation/dispatch blockers | The decoded source is recognizable, but final compositor scaling/presentation still needs validation and no repeatable menu or gameplay frame is claimed yet |
 | **Mighty Morphin Power Rangers: Rita's Rewind** | Resolves the observed Fiber, Pad, offline NP, AGC 1.1, and AGC driver imports, enters a stable 1920×1080 graphics/audio loop, and renders the animated publisher sequence, title menu, and post-menu scene shown above. Native cooperative fibers retain suspended guest stacks, `scePadGetHandle` supplies a readable primary controller, and exact `V_SAD_U32`, `V_MUL_HI_I32`, and `V_CVT_FLR_I32_F32` lowering removes the diagnostic shader fallback. Holding `Cross` advances through the title prompt, and the observed intro remains smooth at roughly 13–20 ms per frame on the current RTX 3070 Ti host | The exact guest CRT composite still produces static on the current host, so a strict shader-signature fallback performs the observed 4× RGBA8 scene scale before downstream post-processing. Dense post-menu frames can contain roughly 255 draws and currently take about 470 ms, dominated by repeated guest-buffer staging; broad gameplay and input compatibility are not claimed yet |
@@ -246,6 +255,7 @@ zig build game-run    -- eboot.bin     # load, initialize, and enter the title
 zig build game-run    -- --app0 full/game patched/eboot.bin # use full content with a patched executable
 zig build launcher                      # open the native Windows launcher
 zig build vulkan-smoke                 # run the headless compute/graphics probe
+zig build vulkan-smoke -- --probe-spv out/compute-0xADDRESS.spv # compile a saved compute module
 zig build vulkan-window-smoke          # present a diagnostic frame through a Win32 swapchain
 ```
 
@@ -352,6 +362,11 @@ replaces the guest fragment shader with a fixed-color diagnostic, and
 `PS5_COMPUTE_TRANSLATE_ONLY=1` goes further through resource recovery and SPIR-V
 translation but stops before Vulkan pipeline creation and dispatch. It is useful
 for separating translation/binding failures from GPU execution faults.
+`PS5_DUMP_COMPUTE_SPIRV=1` saves newly translated compute modules under `out`,
+where `vulkan-smoke --probe-spv` can compile one in a clean Vulkan session.
+`PS5_VULKAN_PREFER_INTEGRATED=1` selects an integrated adapter ahead of a
+discrete GPU on multi-adapter systems, which is useful for separating a
+vendor-driver failure from guest shader translation.
 `PS5_TRACE_GRAPHICS_FRAME=<flip>` performs an expensive readback and writes a
 PPM after every draw of one selected frame; it is opt-in because a dense 4K
 frame can otherwise transfer several GiB and appear to freeze the title. These
@@ -2116,6 +2131,20 @@ scheduler and Vulkan backend. Observed startup work now includes:
   the correct host operation and prevents the DCC helper's constant-white
   export from erasing the scene before its compute copy. The title now reaches
   the repeatable `PLAY GAME` menu and `NEW GAME` confirmation shown above.
+  Holding `Triangle` begins the world transition; target-pthread exception
+  delivery and uncancelable Windows waits let Unity finish its stop-the-world
+  synchronization instead of escaping through a fabricated semaphore error.
+  Resident storage-image caching keeps the scene's compute products on the GPU,
+  while expanded signed, integer, normalized, half-float, array, 3D, depth, LDS,
+  and GDS bindings cover the newly observed kernels. Compute SGPR values now
+  arrive through a dynamic scalar buffer, so changing runtime constants reuse
+  the same SPIR-V module and Vulkan pipeline. On the current NVIDIA host, one
+  exactly matched Burst deformation kernel can fault `nvgpucomp64.dll` late in
+  the load; the bounded guard preserves its undeformed source geometry, retains
+  the module for offline `vulkan-smoke --probe-spv` diagnosis, and suppresses
+  only the immediately following transient graphics pipeline. The observed cold
+  run subsequently reaches the `Cross` prompt and renders its first in-engine
+  gameplay image, although the transition is still measured in minutes.
 - Asterix & Obelix exercises the corresponding 1920×1080 Unity movie path.
   Exact shader-shape matching handles its full-surface compute copies and
   indexed fullscreen sample blits without compiling large general pipelines;

@@ -250,6 +250,7 @@ pub const Opcode = enum {
     v_cvt_i16_f16,
     v_cvt_rpi_i32_f32,
     v_cvt_flr_i32_f32,
+    v_cvt_off_f32_i4,
     v_cvt_f32_ubyte0,
     v_cvt_f32_ubyte1,
     v_cvt_f32_ubyte2,
@@ -498,6 +499,9 @@ pub const Opcode = enum {
     ds_read_sbyte,
     ds_read_ushort,
     ds_read_sshort,
+    ds_write_addtid_b32,
+    ds_read_addtid_b32,
+    ds_append,
 
     // Images and exports.
     image_load,

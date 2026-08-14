@@ -397,6 +397,8 @@ fn run(init: std.process.Init) !bool {
     const force_probe_fragment_ui = init.minimal.environ.containsUnempty(allocator, "PS5_PROBE_FRAGMENT_UI") catch false;
     const skip_compute_dispatches = init.minimal.environ.containsUnempty(allocator, "PS5_SKIP_COMPUTE") catch false;
     const translate_compute_only = init.minimal.environ.containsUnempty(allocator, "PS5_COMPUTE_TRANSLATE_ONLY") catch false;
+    const prefer_integrated_gpu = init.minimal.environ.containsUnempty(allocator, "PS5_VULKAN_PREFER_INTEGRATED") catch false;
+    const dump_compute_spirv = init.minimal.environ.containsUnempty(allocator, "PS5_DUMP_COMPUTE_SPIRV") catch false;
     if (builtin.os.tag == .windows and !force_headless) live_gpu: {
         host_window.init(1280, 720) catch |err| {
             try stderr.print("live Vulkan window unavailable: {s}; continuing headless\n", .{@errorName(err)});
@@ -419,6 +421,8 @@ fn run(init: std.process.Init) !bool {
             .force_probe_fragment_ui = force_probe_fragment_ui,
             .skip_compute_dispatches = skip_compute_dispatches,
             .translate_compute_only = translate_compute_only,
+            .prefer_integrated_gpu = prefer_integrated_gpu,
+            .dump_compute_spirv = dump_compute_spirv,
             .native_window = .{
                 .instance = native.instance,
                 .window = native.window,

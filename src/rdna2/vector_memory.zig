@@ -201,8 +201,11 @@ fn dsInfo(id: u32) ?MemoryInfo {
         0x3a => .{ .opcode = .ds_read_ubyte, .bits = 8 },
         0x3b => .{ .opcode = .ds_read_sshort, .bits = 16, .signed = true },
         0x3c => .{ .opcode = .ds_read_ushort, .bits = 16 },
+        0x3e => .{ .opcode = .ds_append },
         0x4d => .{ .opcode = .ds_write_b64, .words = 2 },
         0x76 => .{ .opcode = .ds_read_b64, .words = 2 },
+        0xb0 => .{ .opcode = .ds_write_addtid_b32 },
+        0xb1 => .{ .opcode = .ds_read_addtid_b32 },
         0xde => .{ .opcode = .ds_write_b96, .words = 3 },
         0xdf => .{ .opcode = .ds_write_b128, .words = 4 },
         0xfe => .{ .opcode = .ds_read_b96, .words = 3 },
@@ -244,6 +247,8 @@ pub fn decodeDs(pc: u32, code: []const u32, word_index: u32) Error!Instruction {
     inst.src_count = switch (id) {
         0x0e, 0x0f => 3,
         0x0d, 0x00, 0x01, 0x05...0x0b => 2,
+        0xb0 => 1,
+        0xb1, 0x3e => 0,
         else => 1,
     };
     return inst;
@@ -469,6 +474,25 @@ test "DS offsets use byte units required by paired operations" {
     const write = try decodeDs(0, &single, 0);
     try std.testing.expectEqual(isa.Opcode.ds_write_b32, write.opcode);
     try std.testing.expectEqual(@as(i32, 0x1234), write.memory_offset);
+}
+
+test "DS addtid scratch and append opcodes decode explicitly" {
+    const write_code = [_]u32{ 0xdac0_0100, 0x0000_0700 };
+    const write = try decodeDs(0, &write_code, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_write_addtid_b32, write.opcode);
+    try std.testing.expectEqual(@as(i32, 0x100), write.memory_offset);
+    try std.testing.expectEqual(@as(u32, 7), write.src1.reg);
+
+    const read_code = [_]u32{ 0xdac4_0000, 0x0800_0000 };
+    const read = try decodeDs(8, &read_code, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_read_addtid_b32, read.opcode);
+    try std.testing.expectEqual(@as(u32, 8), read.dst.reg);
+
+    const append_code = [_]u32{ 0xd8fa_0004, 0x0300_0000 };
+    const append = try decodeDs(16, &append_code, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_append, append.opcode);
+    try std.testing.expect(append.gds);
+    try std.testing.expectEqual(@as(u32, 3), append.dst.reg);
 }
 
 test "truncated EXP is rejected" {

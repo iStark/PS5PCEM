@@ -423,6 +423,17 @@ pub const DcbExecutor = struct {
             self.state.clearRegisters();
             return .complete;
         }
+        if (packet.opcode == pm4.set_base) {
+            if (packet.body.len != 3 or packet.body[0] & 0xf != 1) return Error.InvalidPacket;
+            const address = (@as(u64, packet.body[2] & 0xffff) << 32) |
+                (packet.body[1] & 0xffff_fff8);
+            if (packet.compute) {
+                self.state.dispatch_indirect_args_base_address = address;
+            } else {
+                self.state.draw_indirect_args_base_address = address;
+            }
+            return .complete;
+        }
         if (packet.opcode == pm4.num_instances) {
             if (packet.body.len < 1) return Error.InvalidPacket;
             self.state.instance_count = @max(packet.body[0], 1);
@@ -1078,6 +1089,21 @@ test "indexed offset draw retains index buffer state for the backend" {
     try testing.expectEqual(@as(u2, 0), state.index_type);
     try testing.expectEqual(@as(usize, 1), result.draws);
     try testing.expectEqual(@as(usize, 1), host.draws);
+}
+
+test "SET_BASE retains separate draw and dispatch indirect argument addresses" {
+    var host = FakeBackend{};
+    const stream = [_]u32{
+        command(pm4.set_base, 3),     1, 0x2345_6780, 0x0000_1234,
+        command(pm4.set_base, 3) | 2, 1, 0x9abc_def8, 0x0000_5678,
+    };
+    var state = gpu_state.State{};
+    var executor = DcbExecutor{ .state = &state, .backend = host.interface() };
+    const result = try executor.execute(&stream);
+
+    try testing.expectEqual(Status.complete, result.status);
+    try testing.expectEqual(@as(u64, 0x1234_2345_6780), state.draw_indirect_args_base_address);
+    try testing.expectEqual(@as(u64, 0x5678_9abc_def8), state.dispatch_indirect_args_base_address);
 }
 
 test "Gen5 indirect lists skip untracked extension registers" {
