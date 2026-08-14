@@ -411,6 +411,7 @@ const posix_exports = [_]symbols.Export{
     .{ .name = "recvmsg", .function = trace.wrap("recvmsg", &posixMessageOperation), .expect_id = "hI7oVeOluPM" },
     .{ .name = "inet_ntop", .function = trace.wrap("inet_ntop", &posixInetNtop), .expect_id = "5jRCs2axtr4" },
     .{ .name = "select", .function = trace.wrap("select", &posixSelect), .expect_id = "T8fER+tIGgk" },
+    .{ .name = "libScePosix:w5IHyvahg-o", .function = trace.wrap("libScePosix:w5IHyvahg-o", &success), .id_override = "w5IHyvahg-o" },
 };
 
 // Deterministic random data ------------------------------------------------
@@ -1119,7 +1120,6 @@ fn saveDataSyncMemory(_: u64) callconv(abi.guest) i32 {
     filesystem.writeSaveDataMemory(blob) catch return errno.KernelError.eio.raw();
     return errno.ok;
 }
-
 
 /// The answer `sceSaveDataDirNameSearch` fills in.
 ///

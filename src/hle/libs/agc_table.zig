@@ -172,7 +172,7 @@ pub const driver_exports = [_]symbols.Export{
     .{ .name = "sceAgcDriverSetValidationErrorOutputFrequency", .function = trace.wrap("sceAgcDriverSetValidationErrorOutputFrequency", &agc.accept), .expect_id = "8F5j7U-Bq6s" },
     .{ .name = "sceAgcDriverIsTraceInProgress", .function = trace.wrap("sceAgcDriverIsTraceInProgress", &agc.switchedOff), .expect_id = "+TN0oRTBxJQ" },
     .{ .name = "sceAgcDriverGetShaderDebuggingStatus", .function = trace.wrap("sceAgcDriverGetShaderDebuggingStatus", &agc.switchedOff), .expect_id = "rJUyMrDdxJg" },
-    .{ .name = "sceAgcDriverRegisterWorkloadStream", .function = trace.wrap("sceAgcDriverRegisterWorkloadStream", &agc.refuse), .expect_id = "3AyTaWcF-H8" },
+    .{ .name = "sceAgcDriverRegisterWorkloadStream", .function = trace.wrap("sceAgcDriverRegisterWorkloadStream", &agc.accept), .expect_id = "3AyTaWcF-H8" },
     .{ .name = "sceAgcDriverUnregisterWorkloadStream", .function = trace.wrap("sceAgcDriverUnregisterWorkloadStream", &agc.accept), .expect_id = "n5ElQVYsU1A" },
     .{ .name = "sceAgcDriverQueryResourceRegistrationUserMemoryRequirements", .function = trace.wrap("sceAgcDriverQueryResourceRegistrationUserMemoryRequirements", &agc.driverQueryResourceRegistrationUserMemoryRequirements), .expect_id = "AOLcoIkQDgM" },
     .{ .name = "sceAgcDriverInitResourceRegistration", .function = trace.wrap("sceAgcDriverInitResourceRegistration", &agc.driverInitResourceRegistration), .expect_id = "F0Y42t-3e18" },

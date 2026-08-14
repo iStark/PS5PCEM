@@ -766,6 +766,43 @@ fn initEx(init_data: ?*const anyopaque, handle: ?*?*anyopaque) callconv(abi.gues
     return errno.ok;
 }
 
+/// Creates a player through the original pointer-returning ABI.
+///
+/// The legacy initialization record contains the same callback groups as the
+/// extended one, without its leading size word and priority block.
+pub fn init(init_data: ?*const anyopaque) callconv(abi.guest) ?*anyopaque {
+    const init_address = if (init_data) |data| @intFromPtr(data) else return null;
+    if (!kernel_memory.isGuestRangeAccessible(init_address, 120)) return null;
+
+    const player = allocatePlayer() orelse return null;
+    player.memory_object = readGuestU64(init_address);
+    player.allocate = readGuestU64(init_address + 8);
+    player.deallocate = readGuestU64(init_address + 16);
+    player.allocate_texture = readGuestU64(init_address + 24);
+    player.deallocate_texture = readGuestU64(init_address + 32);
+    player.file_object = readGuestU64(init_address + 40);
+    player.file_open = readGuestU64(init_address + 48);
+    player.file_close = readGuestU64(init_address + 56);
+    player.file_read_offset = readGuestU64(init_address + 64);
+    player.file_size = readGuestU64(init_address + 72);
+    player.event_object = readGuestU64(init_address + 80);
+    player.event_callback = readGuestU64(init_address + 88);
+    player.auto_start = @as(*const u8, @ptrFromInt(init_address + 108)).* != 0;
+    std.debug.print(
+        "[avplayer] Init ffmpeg auto_start={any} alloc=0x{x}/0x{x} file=0x{x}/0x{x}/0x{x} event=0x{x}\n",
+        .{
+            player.auto_start,
+            player.allocate_texture,
+            player.allocate,
+            player.file_open,
+            player.file_read_offset,
+            player.file_size,
+            player.event_callback,
+        },
+    );
+    return &player.token;
+}
+
 fn postInit(handle: ?*anyopaque, post_data: ?*const anyopaque) callconv(abi.guest) i32 {
     const player = playerForHandle(handle) orelse return av_error_invalid_params;
     if (post_data) |data| {
@@ -786,9 +823,6 @@ fn addSourceEx(
     source_details: ?*const anyopaque,
 ) callconv(abi.guest) i32 {
     const player = playerForHandle(handle) orelse return av_error_invalid_params;
-    const io = lockStreams(player) orelse return av_error_operation_failed;
-    defer unlockStreams(player, io);
-    if (!player.initialized) return av_error_invalid_params;
     if (uri_type != 0) return av_error_invalid_params;
     const details_address = if (source_details) |details| @intFromPtr(details) else return av_error_invalid_params;
     if (!kernel_memory.isGuestRangeAccessible(details_address, 16)) return av_error_invalid_params;
@@ -801,53 +835,88 @@ fn addSourceEx(
     }
 
     const guest_path: [*]const u8 = @ptrFromInt(path_address);
-    var normalized: [filesystem.maximum_path]u8 = undefined;
-    const relative = filesystem.mountRelative(guest_path[0..path_length], &normalized) orelse {
-        return av_error_invalid_params;
-    };
-    stopDecoders(player);
-    releaseGuestBuffers(player);
-    releaseTemporarySource(player);
-    @memcpy(player.source_path[0..relative.len], relative);
-    player.source_path_length = relative.len;
-    if (player.file_open != 0 or player.file_read_offset != 0 or player.file_size != 0) {
-        materializeCallbackSource(player, guest_path[0..path_length]) catch |err| {
-            std.debug.print(
-                "[avplayer] custom file source '{s}' failed: {s}; using host path\n",
-                .{ relative, @errorName(err) },
-            );
+    return addSourcePath(player, guest_path[0..path_length]);
+}
+
+/// Adds a null-terminated filename through the original AvPlayer ABI.
+pub fn addSource(handle: ?*anyopaque, filename: ?*const u8) callconv(abi.guest) i32 {
+    const player = playerForHandle(handle) orelse return av_error_invalid_params;
+    const path_address = if (filename) |path| @intFromPtr(path) else return av_error_invalid_params;
+
+    var path_length: usize = 0;
+    while (path_length < filesystem.maximum_path) : (path_length += 1) {
+        const address = path_address + path_length;
+        if (!kernel_memory.isGuestRangeAccessible(address, 1)) return av_error_invalid_params;
+        if (@as(*const u8, @ptrFromInt(address)).* == 0) break;
+    }
+    if (path_length == 0 or path_length == filesystem.maximum_path) return av_error_invalid_params;
+
+    const guest_path: [*]const u8 = @ptrFromInt(path_address);
+    return addSourcePath(player, guest_path[0..path_length]);
+}
+
+fn addSourcePath(player: *Player, guest_path: []const u8) i32 {
+    const auto_start = prepare: {
+        const io = lockStreams(player) orelse return av_error_operation_failed;
+        defer unlockStreams(player, io);
+        if (!player.initialized) return av_error_invalid_params;
+
+        var normalized: [filesystem.maximum_path]u8 = undefined;
+        const relative = filesystem.mountRelative(guest_path, &normalized) orelse {
+            return av_error_invalid_params;
         };
-    }
-    player.source_ready = true;
-    player.end_of_stream = false;
-    player.video_end_of_stream = false;
-    player.audio_end_of_stream = false;
-    player.seek_video_frame_pending = false;
-    player.seek_time_ms = 0;
-    player.video_decode_start_ms = 0;
-    player.playback_ceiling_ms.store(unbounded_playback_ms, .release);
-    if (!probeVideoGeometry(player)) {
-        std.debug.print("[avplayer] ffprobe video geometry unavailable; using {d}x{d}\n", .{
-            player.video_visible_width,
-            player.video_visible_height,
-        });
-    }
-    player.duration_ms = probeDurationMs(player) orelse 0;
-    std.debug.print(
-        "[avplayer] source '{s}' duration={d}ms video={d}x{d} pitch={d} bytes={d} (FFmpeg NV12 + PCM16)\n",
-        .{
-            relative,
-            player.duration_ms,
-            player.video_width,
-            player.video_height,
-            player.video_pitch,
-            player.video_frame_bytes,
-        },
-    );
+        stopDecoders(player);
+        releaseGuestBuffers(player);
+        releaseTemporarySource(player);
+        @memcpy(player.source_path[0..relative.len], relative);
+        player.source_path_length = relative.len;
+        if (player.file_open != 0 or player.file_read_offset != 0 or player.file_size != 0) {
+            materializeCallbackSource(player, guest_path) catch |err| {
+                std.debug.print(
+                    "[avplayer] custom file source '{s}' failed: {s}; using host path\n",
+                    .{ relative, @errorName(err) },
+                );
+            };
+        }
+        player.source_ready = true;
+        player.end_of_stream = false;
+        player.video_end_of_stream = false;
+        player.audio_end_of_stream = false;
+        player.seek_video_frame_pending = false;
+        player.seek_time_ms = 0;
+        player.video_decode_start_ms = 0;
+        player.playback_ceiling_ms.store(unbounded_playback_ms, .release);
+        if (!probeVideoGeometry(player)) {
+            std.debug.print("[avplayer] ffprobe video geometry unavailable; using {d}x{d}\n", .{
+                player.video_visible_width,
+                player.video_visible_height,
+            });
+        }
+        player.duration_ms = probeDurationMs(player) orelse 0;
+        std.debug.print(
+            "[avplayer] source '{s}' duration={d}ms video={d}x{d} pitch={d} bytes={d} (FFmpeg NV12 + PCM16)\n",
+            .{
+                relative,
+                player.duration_ms,
+                player.video_width,
+                player.video_height,
+                player.video_pitch,
+                player.video_frame_bytes,
+            },
+        );
+        break :prepare player.auto_start;
+    };
+
+    // Guest callbacks are allowed to call back into AvPlayer immediately.
+    // Announcing READY while holding the stream mutex deadlocks a callback
+    // that responds with sceAvPlayerStart.
     emitEvent(player, event_state_ready);
-    // `start` takes the same stream locks. Auto-start is uncommon, but handle
-    // it inline so the callback cannot deadlock on a non-recursive mutex.
-    if (player.auto_start) return startLocked(player);
+    if (auto_start) {
+        const io = lockStreams(player) orelse return av_error_operation_failed;
+        defer unlockStreams(player, io);
+        // A READY callback may already have started playback.
+        if (!player.started) return startLocked(player);
+    }
     return errno.ok;
 }
 

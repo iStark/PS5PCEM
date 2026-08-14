@@ -15,7 +15,8 @@ Vulkan.
 ## Support the project
 
 If you would like to support continued PS5PCEM development, you can do so on
-[Boosty](https://boosty.to/ps5pcem).
+[Boosty](https://boosty.to/ps5pcem) or
+[Patreon](https://www.patreon.com/c/PS5PCEM).
 
 ## Current status
 
@@ -95,6 +96,15 @@ If you would like to support continued PS5PCEM development, you can do so on
   bounded host implementations, avoiding multi-second general shader paths
   during the movie. This is an intro-video milestone; a repeatable menu or
   gameplay frame is not claimed yet.
+- Jurassic Park Classic Games Collection now resolves the observed Font,
+  FontFt, JPEG, Pad, VideoOut, Posix, and AGC driver imports, completes its
+  Unity bootstrap, and reaches a stable visible 3840×2160 intro frame. Both the
+  original and extended SceAvPlayer ABIs open the title's MP4 assets through
+  FFmpeg. The matched movie pass accepts either NV12 plane order, recovers the
+  decoder's padded row pitch, scales the 1920×1080 source into the scanout
+  target, and retains the last valid image while Unity changes clips instead of
+  presenting a cleared decoder surface as solid green. This is an intro-video
+  milestone; no menu or gameplay compatibility is claimed yet.
 - The Precinct now plays both observed intro movies with synchronized video and
   audio, leaves the movie pipeline, renders its complete 1920×1080 title scene,
   and reaches the `PLAY GAME` menu and readable `NEW GAME` confirmation. Natural
@@ -202,6 +212,14 @@ decompression no longer executes its constant-white helper shader over the
 completed scene. This capture predates the now-verified transition into the
 first in-engine gameplay scene.*
 
+![Jurassic Park Classic Games Collection intro rendered by PS5PCEM](docs/images/jurassic-park-intro.png)
+
+*A live Jurassic Park Classic Games Collection intro frame presented from the
+title's 1920×1080 NV12 movie surface through its 3840×2160 VideoOut target. The
+legacy SceAvPlayer path, padded decoder pitch, Y/UV conversion, render-target
+selection, and Vulkan scanout all run in the observed title process; this is an
+intro milestone rather than a menu or gameplay claim.*
+
 ![Tetris Effect first guest-rendered particle frame](docs/images/tetris-effect-first-render.png)
 
 *The first recognizable Tetris Effect render produced by the title's startup
@@ -225,6 +243,7 @@ the repository contains none of that content.
 | **The Precinct** | Links the complete six-image guest graph, starts Unity plug-ins through `sceKernelLoadStartModule`, indexes its audio assets, and plays both observed intro movies as synchronized 3840×2160 NV12 video and 48 kHz stereo PCM. It renders the complete 1920×1080 title artwork, opens `PLAY GAME`, and displays the readable `NEW GAME` confirmation shown above. Holding `Triangle` now enters the cold world load; the transition eventually reaches the `Cross` prompt and produces the first verified in-engine gameplay image. Target-thread exception delivery completes Unity's stop-the-world handshake, resident typed storage images preserve its compute graph, and dynamic compute scalars prevent runtime SGPR values from generating a new Vulkan pipeline every frame | The first world transition still takes several minutes on the current RTX 3070 Ti test host because first-use shader translation, NVIDIA pipeline compilation, synchronous submission, and resource staging remain expensive. An exact NVIDIA compiler guard substitutes the observed deformation output and suppresses one transient graphics pipeline after the failing compute signature; broad gameplay, input, and visual correctness are not yet claimed |
 | **Jets 'n' Guns 2** | Resolves title content through `/app0`, completes AGC resource registration, and sustains the full graphics/compute/VideoOut loop. Targetless final passes are preserved through flip, while dynamic SGPR data and descriptor-sized buffer bounds keep streamed sprite batches on stable Vulkan pipelines. `START GAME` now passes the loading screen and reaches the recognizable 3840×2160 tutorial gameplay shown above; the unattended run remained live beyond flip 300. Firmware-default mutex compatibility preserves the CRT's recursive `trylock` guard without leaking recursion into the audio workers' blocking slow path | The cold transition into the first dense gameplay scene still takes roughly 30–40 seconds on the current RTX 3070 Ti host. Once loaded, observed 227–256-draw frames take about 0.6–1.6 seconds, dominated by synchronous Vulkan submission, resource staging, and first-use work; broad input and in-game audio compatibility still need longer validation |
 | **Asterix & Obelix: Slap Them All!** | Maps the Unity/PSN plug-in graph, passes GameUpdate, trophy, entitlement, WebApi, and player-review bootstrap calls, accepts four-byte-aligned AGC shader headers, and reaches repeated 1920×1080 frames. SceAvPlayer returns the ATL intro as correctly decoded NV12 frames, while matched image-copy, planar-conversion, fullscreen-blit, and color-resolve paths keep the observed movie pipeline moving without its former multi-second shader compilation/dispatch blockers | The decoded source is recognizable, but final compositor scaling/presentation still needs validation and no repeatable menu or gameplay frame is claimed yet |
+| **Jurassic Park Classic Games Collection** | Resolves the observed firmware graph, enters Unity, opens the splash and intro MP4 assets through both SceAvPlayer ABIs, and presents the recognizable Jurassic gate intro shown above through the title's 3840×2160 VideoOut buffers. The matched NV12 path accepts UV/Y descriptor order, derives the 2048-byte decoder pitch from the plane layout, performs the observed 2× conversion, and rejects cleared all-zero surfaces during clip changes | This is a repeatable intro-video milestone. The general sampled-image/NGG composition path still needs work, and neither a menu nor gameplay is claimed |
 | **Mighty Morphin Power Rangers: Rita's Rewind** | Resolves the observed Fiber, Pad, offline NP, AGC 1.1, and AGC driver imports, enters a stable 1920×1080 graphics/audio loop, and renders the animated publisher sequence, title menu, and post-menu scene shown above. Native cooperative fibers retain suspended guest stacks, `scePadGetHandle` supplies a readable primary controller, and exact `V_SAD_U32`, `V_MUL_HI_I32`, and `V_CVT_FLR_I32_F32` lowering removes the diagnostic shader fallback. Holding `Cross` advances through the title prompt, and the observed intro remains smooth at roughly 13–20 ms per frame on the current RTX 3070 Ti host | The exact guest CRT composite still produces static on the current host, so a strict shader-signature fallback performs the observed 4× RGBA8 scene scale before downstream post-processing. Dense post-menu frames can contain roughly 255 draws and currently take about 470 ms, dominated by repeated guest-buffer staging; broad gameplay and input compatibility are not claimed yet |
 
 ## Components

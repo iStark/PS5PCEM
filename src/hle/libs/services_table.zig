@@ -8,6 +8,7 @@
 
 const services = @import("services.zig");
 const av_player = @import("av_player.zig");
+const font = @import("font.zig");
 const platform_services = @import("platform_services.zig");
 const playgo = @import("playgo.zig");
 const trace = @import("../trace.zig");
@@ -113,12 +114,12 @@ pub const audiodec_exports = [_]symbols.Export{
 };
 
 pub const avplayer_exports = [_]symbols.Export{
-    .{ .name = "sceAvPlayerAddSource", .function = trace.wrap("sceAvPlayerAddSource", &services.absent), .expect_id = "KMcEa+rHsIo" },
+    .{ .name = "sceAvPlayerAddSource", .function = trace.wrap("sceAvPlayerAddSource", &av_player.addSource), .expect_id = "KMcEa+rHsIo" },
     .{ .name = "sceAvPlayerCurrentTime", .function = trace.wrap("sceAvPlayerCurrentTime", &av_player.currentTime), .expect_id = "wwM99gjFf1Y" },
     .{ .name = "sceAvPlayerSetTrickSpeed", .function = trace.wrap("sceAvPlayerSetTrickSpeed", &av_player.setTrickSpeed), .expect_id = "av8Z++94rs0" },
     .{ .name = "sceAvPlayerGetStreamInfo", .function = trace.wrap("sceAvPlayerGetStreamInfo", &av_player.getStreamInfo), .expect_id = "d8FcbzfAdQw" },
     .{ .name = "sceAvPlayerDisableStream", .function = trace.wrap("sceAvPlayerDisableStream", &av_player.disableStream), .expect_id = "BOVKAzRmuTQ" },
-    .{ .name = "sceAvPlayerInit", .function = trace.wrap("sceAvPlayerInit", &services.absent), .expect_id = "aS66RI0gGgo" },
+    .{ .name = "sceAvPlayerInit", .function = trace.wrap("sceAvPlayerInit", &av_player.init), .expect_id = "aS66RI0gGgo" },
 };
 
 pub const coredump_exports = [_]symbols.Export{
@@ -204,6 +205,8 @@ pub const hmd2_exports = [_]symbols.Export{
     .{ .name = "sceHmd2Terminate", .function = trace.wrap("sceHmd2Terminate", &services.noDevice), .expect_id = "QU2M1pPNbaY" },
     .{ .name = "sceHmd2GazeGetResult", .function = trace.wrap("sceHmd2GazeGetResult", &services.noDevice), .expect_id = "lAoFUedcfqA" },
     .{ .name = "sceHmd2GazeGetResultForFoveatedRendering", .function = trace.wrap("sceHmd2GazeGetResultForFoveatedRendering", &services.noDevice), .expect_id = "retc+-uRMhk" },
+    .{ .name = "libSceHmd2:uv0Ae+jCeWY", .function = trace.wrap("libSceHmd2:uv0Ae+jCeWY", &services.noDevice), .id_override = "uv0Ae+jCeWY" },
+    .{ .name = "libSceHmd2:JWBl3Uq6q8k", .function = trace.wrap("libSceHmd2:JWBl3Uq6q8k", &services.noDevice), .id_override = "JWBl3Uq6q8k" },
 };
 
 pub const http_exports = [_]symbols.Export{
@@ -420,6 +423,20 @@ pub const pad_exports = [_]symbols.Export{
     .{ .name = "scePadVrControllerSetTriggerEffect", .function = trace.wrap("scePadVrControllerSetTriggerEffect", &services.noDevice), .expect_id = "6Cdc9bbjrRY" },
     .{ .name = "scePadVrControllerSetVibrationMode", .function = trace.wrap("scePadVrControllerSetVibrationMode", &services.noDevice), .expect_id = "Wf6-PNCyY20" },
     .{ .name = "scePadVrControllerSetVibration", .function = trace.wrap("scePadVrControllerSetVibration", &services.noDevice), .expect_id = "DGCwN1Lmmys" },
+    .{ .name = "libScePad:306mCg0ibh8", .function = trace.wrap("libScePad:306mCg0ibh8", &services.accept), .id_override = "306mCg0ibh8" },
+};
+
+pub const jpegdec_exports = [_]symbols.Export{
+    .{ .name = "sceJpegDecParseHeader", .function = trace.wrap("sceJpegDecParseHeader", &services.accept), .expect_id = "LSinoSQH790" },
+    .{ .name = "sceJpegDecQueryMemorySize", .function = trace.wrap("sceJpegDecQueryMemorySize", &services.accept), .expect_id = "uNAUmANZMEw" },
+    .{ .name = "sceJpegDecCreate", .function = trace.wrap("sceJpegDecCreate", &services.accept), .expect_id = "JPh3Zgg0Zwc" },
+    .{ .name = "sceJpegDecDecode", .function = trace.wrap("sceJpegDecDecode", &services.absent), .expect_id = "1kzQRoWEgSA" },
+    .{ .name = "sceJpegDecDelete", .function = trace.wrap("sceJpegDecDelete", &services.accept), .expect_id = "Hwh11+m5KoI" },
+};
+
+pub const convert_keycode_exports = [_]symbols.Export{
+    .{ .name = "libSceConvertKeycode:mUuUOWI-C+0", .function = trace.wrap("libSceConvertKeycode:mUuUOWI-C+0", &services.accept), .id_override = "mUuUOWI-C+0" },
+    .{ .name = "sceConvertKeycodeGetVirtualKeycode", .function = trace.wrap("sceConvertKeycodeGetVirtualKeycode", &services.accept), .expect_id = "vIsoJsLvvlM" },
 };
 
 pub const razorcpu_exports = [_]symbols.Export{
@@ -504,6 +521,8 @@ pub const share_exports = [_]symbols.Export{
 pub const videoout_exports = [_]symbols.Export{
     // Flip/vblank live in bootstrap_services; only keep the remaining stubs here.
     .{ .name = "sceVideoOutInitializeOutputOptions", .function = trace.wrap("sceVideoOutInitializeOutputOptions", &services.absent), .expect_id = "+I4K03i3EL0" },
+    .{ .name = "libSceVideoOut:T0ynQY3mH-0", .function = trace.wrap("libSceVideoOut:T0ynQY3mH-0", &services.accept), .id_override = "T0ynQY3mH-0" },
+    .{ .name = "libSceVideoOut:WkYtyOg30do", .function = trace.wrap("libSceVideoOut:WkYtyOg30do", &services.accept), .id_override = "WkYtyOg30do" },
 };
 
 pub const voiceqos_exports = [_]symbols.Export{
@@ -628,10 +647,13 @@ pub const all = [_]Table{
     .{ .library = "libSceErrorDialog", .module = "libSceErrorDialog", .exports = &errordialog_exports },
     .{ .library = "libSceGameLiveStreaming", .module = "libSceGameLiveStreaming", .exports = &gamelivestreaming_exports },
     .{ .library = "libSceGameUpdate", .module = "libSceGameUpdate", .exports = &gameupdate_exports },
+    .{ .library = "libSceFont", .module = "libSceFont", .exports = &font.exports },
+    .{ .library = "libSceFontFt", .module = "libSceFontFt", .exports = &font.ft_exports },
     .{ .library = "libSceHmd2", .module = "libSceHmd2", .exports = &hmd2_exports },
     .{ .library = "libSceHttp", .module = "libSceHttp", .exports = &http_exports },
     .{ .library = "libSceImeDialog", .module = "libSceImeDialog", .exports = &imedialog_exports },
     .{ .library = "libSceJson2", .module = "libSceJson", .exports = &json2_exports },
+    .{ .library = "libSceJpegDec", .module = "libSceJpegDec", .exports = &jpegdec_exports },
     .{ .library = "libSceNet", .module = "libSceNet", .exports = &net_exports },
     .{ .library = "libSceNgs2", .module = "libSceNgs2", .exports = &ngs2_exports },
     .{ .library = "libSceNpAuth", .module = "libSceNpAuth", .exports = &npauth_exports },
@@ -654,6 +676,7 @@ pub const all = [_]Table{
     .{ .library = "libSceVideoOut", .module = "libSceVideoOut", .exports = &videoout_exports },
     .{ .library = "libSceVideodec2", .module = "libSceVideodec2", .exports = &videodec2_exports },
     .{ .library = "libSceVoiceQoS", .module = "libSceVoiceQoS", .exports = &voiceqos_exports },
+    .{ .library = "libSceConvertKeycode", .module = "libSceConvertKeycode", .exports = &convert_keycode_exports },
     .{ .library = "libSceVrTracker2", .module = "libSceVrTracker2", .exports = &vrtracker2_exports },
     .{ .library = "libSceWebBrowserDialog", .module = "libSceWebBrowserDialog", .exports = &webbrowserdialog_exports },
 

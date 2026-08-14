@@ -7927,32 +7927,40 @@ pub const Renderer = struct {
         // draws. This Unity pass has a complete four-vertex guest VS; its
         // constants contain the required 1920/2048 U scale, so it must not be
         // replaced by the procedural fallback triangle.
-        const planar_video_pass = fragment_image_count == 2 and
-            graphics_resources.descriptors[0].tile_mode.isLinear() and
-            graphics_resources.descriptors[0].unified_format == 1 and
-            // AvPlayer exposes the visible width separately from the NV12
-            // allocation pitch. Unity consequently describes the luma plane
-            // as 2048 wide for a 1920-pixel movie. Accept that right-hand
-            // padding here; requiring exact equality silently disabled the
-            // canonical fullscreen VS and left the video pass black.
-            graphics_resources.descriptors[0].width >= descriptor.width and
-            graphics_resources.descriptors[0].width - descriptor.width < 256 and
-            graphics_resources.descriptors[0].pitch == graphics_resources.descriptors[0].width and
-            graphics_resources.descriptors[0].height == descriptor.height and
-            graphics_resources.descriptors[1].tile_mode.isLinear() and
-            graphics_resources.descriptors[1].unified_format == 14 and
-            graphics_resources.descriptors[1].width * 2 == graphics_resources.descriptors[0].width and
-            graphics_resources.descriptors[1].height * 2 == descriptor.height;
+        var planar_luma: ?gpu.ImageDescriptor = null;
+        var planar_chroma: ?gpu.ImageDescriptor = null;
+        if (fragment_image_count == 2) {
+            for (graphics_resources.descriptors[0..fragment_image_count]) |sampled| {
+                if (!sampled.tile_mode.isLinear()) continue;
+                if (sampled.unified_format == 1) planar_luma = sampled;
+                if (sampled.unified_format == 14) planar_chroma = sampled;
+            }
+        }
+        const planar_video_pass = if (planar_luma != null and planar_chroma != null) blk: {
+            const luma = planar_luma.?;
+            const chroma = planar_chroma.?;
+            if (luma.width == 0 or luma.height == 0 or
+                chroma.width * 2 != luma.width or chroma.height * 2 != luma.height or
+                descriptor.width < luma.width or descriptor.height < luma.height or
+                descriptor.width % luma.width != 0 or descriptor.height % luma.height != 0)
+            {
+                break :blk false;
+            }
+            const horizontal_scale = descriptor.width / luma.width;
+            const vertical_scale = descriptor.height / luma.height;
+            break :blk horizontal_scale == vertical_scale and horizontal_scale <= 4;
+        } else false;
         if (planar_video_pass and !self.reported_planar_video_pass) {
+            const luma = planar_luma.?;
             std.debug.print(
                 "[vulkan dcb] planar video pass target=0x{x} {d}x{d} luma={d}x{d}/pitch={d}\n",
                 .{
                     descriptor.address,
                     descriptor.width,
                     descriptor.height,
-                    graphics_resources.descriptors[0].width,
-                    graphics_resources.descriptors[0].height,
-                    graphics_resources.descriptors[0].pitch,
+                    luma.width,
+                    luma.height,
+                    luma.pitch,
                 },
             );
             self.reported_planar_video_pass = true;
@@ -7963,8 +7971,8 @@ pub const Renderer = struct {
             try self.emulatePlanarVideoPass(
                 memory,
                 target,
-                graphics_resources.descriptors[0],
-                graphics_resources.descriptors[1],
+                planar_luma.?,
+                planar_chroma.?,
             );
             return;
         }
@@ -8512,15 +8520,36 @@ pub const Renderer = struct {
         }
         const width: usize = target.descriptor.width;
         const height: usize = target.descriptor.height;
-        const luma_pitch: usize = luma.pitch;
-        const chroma_pitch = std.math.mul(usize, chroma.pitch, 2) catch
+        const source_width: usize = luma.width;
+        const source_height: usize = luma.height;
+        var luma_pitch: usize = luma.pitch;
+        // AvPlayer allocates one contiguous NV12 image using the decoder pitch
+        // (2048 for a 1920-wide movie), while Unity's plane views retain only
+        // the visible width. The UV base therefore gives the authoritative row
+        // pitch whenever the two planes are adjacent.
+        if (chroma.address > luma.address and source_height != 0) {
+            const plane_bytes = chroma.address - luma.address;
+            if (plane_bytes % source_height == 0) {
+                const inferred_pitch = std.math.cast(usize, plane_bytes / source_height) orelse
+                    return Error.GuestBufferTooLarge;
+                if (inferred_pitch >= source_width and inferred_pitch - source_width < 512) {
+                    luma_pitch = inferred_pitch;
+                }
+            }
+        }
+        var chroma_pitch = std.math.mul(usize, chroma.pitch, 2) catch
             return Error.GuestBufferTooLarge;
-        if (width == 0 or height == 0 or luma_pitch < width or
-            chroma_pitch < width or chroma.height * 2 != height)
+        if (luma_pitch > chroma_pitch and chroma.width * 2 == luma.width) {
+            chroma_pitch = luma_pitch;
+        }
+        if (width == 0 or height == 0 or source_width == 0 or source_height == 0 or
+            width < source_width or height < source_height or
+            luma_pitch < source_width or chroma_pitch < source_width or
+            chroma.height * 2 != source_height)
         {
             return Error.UnsupportedSampledImage;
         }
-        const luma_bytes = std.math.mul(usize, luma_pitch, height) catch
+        const luma_bytes = std.math.mul(usize, luma_pitch, source_height) catch
             return Error.GuestBufferTooLarge;
         const chroma_bytes = std.math.mul(usize, chroma_pitch, chroma.height) catch
             return Error.GuestBufferTooLarge;
@@ -8545,14 +8574,21 @@ pub const Renderer = struct {
         {
             return Error.GuestMemoryReadFailed;
         }
+        // Unity keeps submitting the video material while AvPlayer changes
+        // clips. Its freshly cleared decoder texture is all zeroes; converting
+        // that as limited-range NV12 produces a solid #009a00 frame. Retain the
+        // last valid uploaded movie surface until a decoder publishes data.
+        if (!containsNonzeroByte(y_plane) and !containsNonzeroByte(uv_plane)) return;
 
         for (0..height) |y| {
-            const y_row = y * luma_pitch;
-            const uv_row = (y / 2) * chroma_pitch;
+            const source_y = y * source_height / height;
+            const y_row = source_y * luma_pitch;
+            const uv_row = (source_y / 2) * chroma_pitch;
             const rgba_row = y * width * 4;
             for (0..width) |x| {
-                const c = @max(@as(i32, y_plane[y_row + x]) - 16, 0);
-                const uv = uv_row + (x / 2) * 2;
+                const source_x = x * source_width / width;
+                const c = @max(@as(i32, y_plane[y_row + source_x]) - 16, 0);
+                const uv = uv_row + (source_x / 2) * 2;
                 const u = @as(i32, uv_plane[uv]) - 128;
                 const v = @as(i32, uv_plane[uv + 1]) - 128;
                 const r = std.math.clamp((298 * c + 409 * v + 128) >> 8, 0, 255);
@@ -11031,14 +11067,16 @@ pub const Renderer = struct {
                 self.flip_callbacks > 8 and
                 !shouldDumpProgressFrame(self.flip_callbacks))
             {
+                var direct_index: ?usize = null;
+                var direct_sequence: u64 = 0;
                 for (self.render_targets.items, 0..) |target, target_index| {
                     if (target.target.descriptor.address != requested.?.address or !target.initialized) continue;
-                    if (self.flip_callbacks <= 8) {
-                        std.debug.print(
-                            "[vulkan dcb] flip #{d} direct resident target slot={d} generation={d} fmt={d}\n",
-                            .{ self.flip_callbacks, target_index, target.gpu_generation, target.target.descriptor.format },
-                        );
+                    if (direct_index == null or target.last_used_sequence > direct_sequence) {
+                        direct_index = target_index;
+                        direct_sequence = target.last_used_sequence;
                     }
+                }
+                if (direct_index) |target_index| {
                     self.blitRenderTargetToSwapchain(target_index) catch |err| {
                         self.last_flip_error = err;
                         return false;
