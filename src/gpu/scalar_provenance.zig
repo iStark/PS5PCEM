@@ -499,6 +499,85 @@ fn executeScalar(result: *Evaluation, program_address: u64, inst: rdna2.Instruct
     if (value) |known| write(result, inst.dst, known, combined_sources, inst.pc) else invalidateDestination(result, inst.dst, 1);
 }
 
+/// The 64-bit reading of a source operand.
+///
+/// A register pair is the obvious case, but a 64-bit operation is equally free
+/// to name a constant, and each constant class widens differently: an integer
+/// inline constant carries its sign into the upper word, a literal occupies
+/// only the lower one, and a float inline constant denotes the double it names
+/// rather than the single its 32-bit encoding holds. Treating every constant
+/// source as unknown — as refusing to widen them amounts to — loses whole
+/// descriptors, because a sampler assembled from immediates in registers is
+/// built entirely out of operations of this shape.
+fn wideSource(
+    result: *const Evaluation,
+    operand: rdna2.Operand,
+    low: ScalarValue,
+) ?struct { value: u64, sources: Sources } {
+    switch (operand.kind) {
+        .sgpr, .vcc_lo, .vcc_hi, .exec_lo, .exec_hi, .m0 => {
+            const index = scalarRegisterIndex(operand) orelse return null;
+            if (index + 1 >= maximum_scalar_registers) return null;
+            const high = result.registers[index + 1];
+            if (!high.known) return null;
+            return .{
+                .value = @as(u64, low.value) | (@as(u64, high.value) << 32),
+                .sources = Sources.merge(low.sources, high.sources),
+            };
+        },
+        .integer_inline_constant => {
+            const signed: i64 = @as(i32, @bitCast(operand.value));
+            return .{ .value = @bitCast(signed), .sources = low.sources };
+        },
+        .literal_constant => return .{ .value = operand.value, .sources = low.sources },
+        .float_inline_constant => return .{
+            .value = @bitCast(@as(f64, operand.float_val)),
+            .sources = low.sources,
+        },
+        .null => return .{ .value = 0, .sources = low.sources },
+        else => return null,
+    }
+}
+
+fn bitfieldMask64(width: u64, offset: u64) u64 {
+    const bits: u6 = @truncate(width & 63);
+    const shift: u6 = @truncate(offset & 63);
+    const mask = (@as(u64, 1) << bits) - 1;
+    return mask << shift;
+}
+
+fn bitfieldExtractUnsigned64(value: u64, control: u64) u64 {
+    const offset: u6 = @truncate(control & 63);
+    const width: u32 = @truncate((control >> 16) & 0x7f);
+    if (width == 0) return 0;
+    if (width >= 64) return value >> offset;
+    const bits: u6 = @truncate(width);
+    return (value >> offset) & ((@as(u64, 1) << bits) - 1);
+}
+
+/// Each bit of the low word placed into both bits of its own pair.
+fn bitReplicate64(value: u64) u64 {
+    var replicated: u64 = 0;
+    var index: u6 = 0;
+    while (index < 32) : (index += 1) {
+        if (value & (@as(u64, 1) << index) == 0) continue;
+        replicated |= @as(u64, 0b11) << @as(u6, @truncate(@as(u32, index) * 2));
+    }
+    return replicated;
+}
+
+/// Whole-quad mode: any live lane in a group of four makes all four live.
+fn wholeQuadMode64(value: u64) u64 {
+    var expanded: u64 = 0;
+    var group: u6 = 0;
+    while (group < 16) : (group += 1) {
+        const shift: u6 = @truncate(@as(u32, group) * 4);
+        if (value & (@as(u64, 0xf) << shift) == 0) continue;
+        expanded |= @as(u64, 0xf) << shift;
+    }
+    return expanded;
+}
+
 fn executeScalar64(
     result: *Evaluation,
     inst: rdna2.Instruction,
@@ -507,32 +586,24 @@ fn executeScalar64(
     sources: Sources,
     scc: ?bool,
 ) void {
-    if (inst.src0.kind != .sgpr or inst.src0.reg + 1 >= maximum_scalar_registers or
-        inst.dst.kind != .sgpr or inst.dst.reg + 1 >= maximum_scalar_registers)
-    {
+    if (inst.dst.kind != .sgpr or inst.dst.reg + 1 >= maximum_scalar_registers) {
         invalidateDestination(result, inst.dst, 2);
         return;
     }
-    const a_hi = result.registers[inst.src0.reg + 1];
-    if (!a_hi.known) {
+    const wide_a = wideSource(result, inst.src0, a) orelse {
         invalidateDestination(result, inst.dst, 2);
         return;
-    }
-    var all_sources = Sources.merge(sources, a_hi.sources);
-    const av = @as(u64, a.value) | (@as(u64, a_hi.value) << 32);
+    };
+    var all_sources = Sources.merge(sources, wide_a.sources);
+    const av = wide_a.value;
     var bv: u64 = 0;
     if (b) |low| {
-        if (inst.src1.kind != .sgpr or inst.src1.reg + 1 >= maximum_scalar_registers) {
+        const wide_b = wideSource(result, inst.src1, low) orelse {
             invalidateDestination(result, inst.dst, 2);
             return;
-        }
-        const high = result.registers[inst.src1.reg + 1];
-        if (!high.known) {
-            invalidateDestination(result, inst.dst, 2);
-            return;
-        }
-        bv = @as(u64, low.value) | (@as(u64, high.value) << 32);
-        all_sources = Sources.merge(all_sources, high.sources);
+        };
+        bv = wide_b.value;
+        all_sources = Sources.merge(all_sources, wide_b.sources);
     }
     const value: ?u64 = switch (inst.opcode) {
         .s_mov_b64 => av,
@@ -551,6 +622,10 @@ fn executeScalar64(
         .s_xnor_b64 => ~(av ^ bv),
         .s_lshl_b64 => av << @truncate(bv & 63),
         .s_lshr_b64 => av >> @truncate(bv & 63),
+        .s_bfm_b64 => bitfieldMask64(av, bv),
+        .s_bfe_u64 => bitfieldExtractUnsigned64(av, bv),
+        .s_bitreplicate_b64_b32 => bitReplicate64(av),
+        .s_wqm_b64 => wholeQuadMode64(av),
         else => null,
     };
     if (value) |known| {
@@ -873,4 +948,50 @@ test "descriptor BFE comparison drives conditional select" {
 
     try std.testing.expectEqual(true, scc.?);
     try std.testing.expectEqual(@as(u32, 0x0004_022c), result.register(7).?.value);
+}
+
+test "a sampler assembled from immediates resolves to its descriptor words" {
+    // The exact prolog a Jurassic Park fragment program uses to build its S#
+    // in registers instead of loading one: a bitfield mask giving the LOD
+    // clamp, then the filter word as a literal. Both name constants, and a
+    // 64-bit operation reading a constant is the shape that used to leave
+    // every one of these four words unknown.
+    var result = Evaluation{};
+    var scc: ?bool = null;
+    executeScalar(&result, 0, .{
+        .pc = 0x8,
+        .opcode = .s_bfm_b64,
+        .dst = .{ .kind = .sgpr, .reg = 12 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 0xc },
+        .src1 = .{ .kind = .integer_inline_constant, .value = 0x2c },
+        .src_count = 2,
+    }, &scc);
+    executeScalar(&result, 0, .{
+        .pc = 0xc,
+        .opcode = .s_mov_b64,
+        .dst = .{ .kind = .sgpr, .reg = 14 },
+        .src0 = .{ .kind = .literal_constant, .value = 0x0950_0000 },
+        .src_count = 1,
+    }, &scc);
+
+    // ((1 << 12) - 1) << 44, so the run of bits lands wholly in the high word.
+    try std.testing.expectEqual(@as(u32, 0), result.register(12).?.value);
+    try std.testing.expectEqual(@as(u32, 0x00ff_f000), result.register(13).?.value);
+    // A literal fills the low word only; the high word is zero, not a sign.
+    try std.testing.expectEqual(@as(u32, 0x0950_0000), result.register(14).?.value);
+    try std.testing.expectEqual(@as(u32, 0), result.register(15).?.value);
+}
+
+test "an integer inline constant carries its sign into a 64-bit result" {
+    var result = Evaluation{};
+    var scc: ?bool = null;
+    executeScalar(&result, 0, .{
+        .pc = 0x0,
+        .opcode = .s_mov_b64,
+        .dst = .{ .kind = .sgpr, .reg = 2 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 0xffff_ffff },
+        .src_count = 1,
+    }, &scc);
+    try std.testing.expectEqual(@as(u32, 0xffff_ffff), result.register(2).?.value);
+    try std.testing.expectEqual(@as(u32, 0xffff_ffff), result.register(3).?.value);
 }

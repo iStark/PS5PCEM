@@ -2148,6 +2148,60 @@ const Builder = struct {
         return .{ result_low, result_high };
     }
 
+    fn shiftLeftLogical64(self: *Builder, value: [2]u32, offset: u32) Error![2]u32 {
+        const within_dword = try self.andBits(offset, 31);
+        const offset_lt_32 = self.id();
+        try self.emit(&self.body, 176, &.{
+            self.bool_type,
+            offset_lt_32,
+            offset,
+            try self.constant(.bits32, 32),
+        }); // OpULessThan
+        const offset_is_zero = self.id();
+        try self.emit(&self.body, 170, &.{
+            self.bool_type,
+            offset_is_zero,
+            offset,
+            try self.constant(.bits32, 0),
+        }); // OpIEqual
+        const low_left = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, low_left, value[0], within_dword });
+        const high_left = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, high_left, value[1], within_dword });
+        const raw_carry_shift = self.id();
+        try self.emit(&self.body, 130, &.{
+            self.bits_type,
+            raw_carry_shift,
+            try self.constant(.bits32, 32),
+            within_dword,
+        });
+        const carry_shift = try self.andBits(raw_carry_shift, 31);
+        const carry = self.id();
+        try self.emit(&self.body, 194, &.{ self.bits_type, carry, value[0], carry_shift });
+        const merged_high = self.id();
+        try self.emit(&self.body, 197, &.{ self.bits_type, merged_high, high_left, carry });
+        const below_32_high = self.id();
+        try self.emit(&self.body, 169, &.{
+            self.bits_type,
+            below_32_high,
+            offset_is_zero,
+            high_left,
+            merged_high,
+        });
+        const zero = try self.constant(.bits32, 0);
+        const result_low = self.id();
+        try self.emit(&self.body, 169, &.{ self.bits_type, result_low, offset_lt_32, low_left, zero });
+        const result_high = self.id();
+        try self.emit(&self.body, 169, &.{
+            self.bits_type,
+            result_high,
+            offset_lt_32,
+            below_32_high,
+            low_left,
+        });
+        return .{ result_low, result_high };
+    }
+
     fn rightAlignedMask64(self: *Builder, count: u32) Error![2]u32 {
         const thirty_two = try self.constant(.bits32, 32);
         const count_lt_32 = self.id();
@@ -2167,6 +2221,39 @@ const Builder = struct {
         const high = self.id();
         try self.emit(&self.body, 201, &.{ self.bits_type, high, zero, full, zero, high_count });
         return .{ low, high };
+    }
+
+    /// S_BFM_B64: a run of `src0` low bits, shifted up by `src1`.
+    ///
+    /// A shader that builds a resource descriptor out of immediates rather
+    /// than loading one reaches this instruction, so leaving it untranslated
+    /// costs the whole program rather than one value.
+    fn bitfieldMask64(self: *Builder, inst: instruction.Instruction) Error!void {
+        const count_raw = try self.source(inst.src0, .bits32);
+        const offset_raw = try self.source(inst.src1, .bits32);
+        const count = try self.andBits(count_raw, 63);
+        const offset = try self.andBits(offset_raw, 63);
+        const mask = try self.rightAlignedMask64(count);
+        const result = try self.shiftLeftLogical64(mask, offset);
+        try self.destinationPair(inst.dst, result);
+    }
+
+    fn shiftLeft64(self: *Builder, inst: instruction.Instruction) Error!void {
+        const value = try self.sourcePair(inst.src0);
+        const raw_offset = try self.source(inst.src1, .bits32);
+        const offset = try self.andBits(raw_offset, 63);
+        const result = try self.shiftLeftLogical64(value, offset);
+        try self.destinationPair(inst.dst, result);
+        try self.updateSccFromPair(result);
+    }
+
+    fn shiftRight64(self: *Builder, inst: instruction.Instruction) Error!void {
+        const value = try self.sourcePair(inst.src0);
+        const raw_offset = try self.source(inst.src1, .bits32);
+        const offset = try self.andBits(raw_offset, 63);
+        const result = try self.shiftRightLogical64(value, offset);
+        try self.destinationPair(inst.dst, result);
+        try self.updateSccFromPair(result);
     }
 
     fn scalarBitfieldExtract64(self: *Builder, inst: instruction.Instruction) Error!void {
@@ -2207,6 +2294,30 @@ const Builder = struct {
         const source_id = try self.source(inst.src0, source_type);
         const result = self.id();
         try self.emit(&self.body, if (signed) 111 else 112, &.{ self.float_type, result, source_id });
+        try self.destination(inst.dst, .{ .id = result, .value_type = .float32 });
+    }
+
+    /// V_CVT_F32_UBYTE<n>: one byte of a packed dword as a float.
+    ///
+    /// Vertex colours and other normalized attributes arrive packed four to a
+    /// dword, and this is how a shader takes them apart. All four selectors
+    /// belong together — a program that unpacks a colour uses every one of
+    /// them, so supporting only some translates none of them.
+    fn unsignedByteToFloat(self: *Builder, inst: instruction.Instruction, byte_index: u5) Error!void {
+        const packed_value = try self.source(inst.src0, .bits32);
+        const shifted = if (byte_index == 0) packed_value else blk: {
+            const result = self.id();
+            try self.emit(&self.body, 194, &.{
+                self.bits_type,
+                result,
+                packed_value,
+                try self.constant(.bits32, @as(u32, byte_index) * 8),
+            }); // OpShiftRightLogical
+            break :blk result;
+        };
+        const byte_value = try self.andBits(shifted, 0xff);
+        const result = self.id();
+        try self.emit(&self.body, 112, &.{ self.float_type, result, byte_value }); // OpConvertUToF
         try self.destination(inst.dst, .{ .id = result, .value_type = .float32 });
     }
 
@@ -4368,6 +4479,10 @@ const Builder = struct {
             .v_cvt_i32_f32 => try self.floatToInteger(inst, true),
             .v_cvt_u32_f32 => try self.floatToInteger(inst, false),
             .v_cvt_flr_i32_f32 => try self.floatFloorToSignedInteger(inst),
+            .v_cvt_f32_ubyte0 => try self.unsignedByteToFloat(inst, 0),
+            .v_cvt_f32_ubyte1 => try self.unsignedByteToFloat(inst, 1),
+            .v_cvt_f32_ubyte2 => try self.unsignedByteToFloat(inst, 2),
+            .v_cvt_f32_ubyte3 => try self.unsignedByteToFloat(inst, 3),
             .v_cvt_off_f32_i4 => try self.i4ToOffsetFloat(inst),
             // Pack two f32 → two f16 in one dword (Unity PS export path).
             .v_cvt_pkrtz_f16_f32 => try self.packHalf2x16(inst),
@@ -4389,6 +4504,9 @@ const Builder = struct {
             .v_bfe_u32 => try self.bitfieldExtract(inst, false),
             .v_bfe_i32 => try self.bitfieldExtract(inst, true),
             .s_bfe_u64 => try self.scalarBitfieldExtract64(inst),
+            .s_bfm_b64 => try self.bitfieldMask64(inst),
+            .s_lshl_b64 => try self.shiftLeft64(inst),
+            .s_lshr_b64 => try self.shiftRight64(inst),
             // Ternary packing helpers used heavily by Unity compute kernels.
             .v_and_or_b32 => try self.andOr(inst),
             .v_bfi_b32 => try self.bitfieldInsert(inst),

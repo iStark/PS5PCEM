@@ -51,6 +51,11 @@ const audio_buffer_count = 8;
 const playback_frame_ms: u64 = (1000 + video_fps - 1) / video_fps;
 const unbounded_playback_ms: u64 = std.math.maxInt(u64);
 
+/// How far past its own duration a presentation may run before it is declared
+/// finished. A few frames, so that a source whose duration rounds down against
+/// the frame grid still delivers its last frames.
+const playback_end_grace_ms: u64 = 4 * playback_frame_ms;
+
 const pipe_buffer_bytes = 64 * 1024;
 const callback_read_bytes = 1024 * 1024;
 const maximum_callback_source_bytes: u64 = 4 * 1024 * 1024 * 1024;
@@ -401,6 +406,32 @@ fn finishStream(player: *Player, video: bool) void {
         player.audio_end_of_stream = true;
     }
     if (!player.video_end_of_stream or !player.audio_end_of_stream) return;
+    player.end_of_stream = true;
+    player.started = false;
+    emitEvent(player, event_state_stop);
+}
+
+/// End a presentation whose clock has passed the duration of its source.
+///
+/// A stream only reports its own end when the title reads it to exhaustion,
+/// and a title is free to read one stream and ignore the other: playing a
+/// movie for its pictures while its own mixer owns the sound is ordinary.
+/// Waiting for every stream to report EOF therefore leaves such a player
+/// active forever, and a title that advances when playback stops never
+/// advances. The duration is known from the source itself, so the clock
+/// passing it is the answer that does not depend on which streams were read.
+///
+/// While a stream is still delivering, the reported position is bounded by the
+/// frames actually handed over, so this cannot cut a slow playback short: the
+/// clock only runs free once a stream has genuinely ended.
+fn expirePlayback(player: *Player) void {
+    if (!player.started or player.end_of_stream) return;
+    if (player.looping or player.paused) return;
+    if (player.duration_ms == 0) return;
+    if (playbackPositionMs(player) < player.duration_ms +| playback_end_grace_ms) return;
+    stopDecoders(player);
+    player.video_end_of_stream = true;
+    player.audio_end_of_stream = true;
     player.end_of_stream = true;
     player.started = false;
     emitEvent(player, event_state_stop);
@@ -1254,6 +1285,7 @@ fn isActive(handle: ?*anyopaque) callconv(abi.guest) u8 {
     const io = lockStreams(player) orelse return 0;
     defer unlockStreams(player, io);
     if (!player.initialized) return 0;
+    expirePlayback(player);
     return if (player.started and !player.end_of_stream) 1 else 0;
 }
 
@@ -1358,3 +1390,57 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceAvPlayerClose", .function = trace.wrap("sceAvPlayerClose", &close), .expect_id = "NkJwDzKmIlw" },
     .{ .name = "sceAvPlayerSetLogCallback", .function = trace.wrap("sceAvPlayerSetLogCallback", &success), .expect_id = "eBTreZ84JFY" },
 };
+
+test "a presentation ends when its clock passes the source duration" {
+    // A title that takes only the pictures from a movie never drains the
+    // audio stream, so the audio side never reports its own end. The clock
+    // running past the duration has to be enough on its own.
+    var player = Player{
+        .initialized = true,
+        .source_ready = true,
+        .started = true,
+        .duration_ms = 3_170,
+        .end_of_stream = false,
+        .video_end_of_stream = true,
+        .audio_end_of_stream = false,
+    };
+    player.playback_ceiling_ms.store(unbounded_playback_ms, .release);
+
+    // A stopped clock reads as the seek position, which stands in here for
+    // how far playback has reached.
+    player.seek_time_ms = 1_000;
+    expirePlayback(&player);
+    try std.testing.expect(player.started);
+    try std.testing.expect(!player.end_of_stream);
+
+    player.seek_time_ms = 4_000;
+    expirePlayback(&player);
+    try std.testing.expect(!player.started);
+    try std.testing.expect(player.end_of_stream);
+    try std.testing.expect(player.audio_end_of_stream);
+}
+
+test "a looping presentation and one of unknown length never expire" {
+    var looping = Player{
+        .initialized = true,
+        .source_ready = true,
+        .started = true,
+        .looping = true,
+        .duration_ms = 3_170,
+        .end_of_stream = false,
+        .seek_time_ms = 9_000,
+    };
+    expirePlayback(&looping);
+    try std.testing.expect(looping.started);
+
+    var unbounded = Player{
+        .initialized = true,
+        .source_ready = true,
+        .started = true,
+        .duration_ms = 0,
+        .end_of_stream = false,
+        .seek_time_ms = 9_000,
+    };
+    expirePlayback(&unbounded);
+    try std.testing.expect(unbounded.started);
+}

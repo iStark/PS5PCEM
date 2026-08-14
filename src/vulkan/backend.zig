@@ -10278,7 +10278,15 @@ pub const Renderer = struct {
             .command_buffer_count = 1,
             .command_buffers = @ptrCast(&command_buffer),
         };
-        if (self.device_functions.queue_submit(self.queue, 1, @ptrCast(&submit_info), fence) != vk.success) {
+        const submit_result = self.device_functions.queue_submit(self.queue, 1, @ptrCast(&submit_info), fence);
+        if (submit_result != vk.success) {
+            // A submission is refused for a handful of very different reasons —
+            // a lost device among them — and they call for different answers,
+            // so record which one it was rather than only that one occurred.
+            std.debug.print(
+                "[vulkan dcb] queue submit failed: result={d} flip={d}\n",
+                .{ submit_result, self.flip_callbacks },
+            );
             return Error.QueueSubmissionFailed;
         }
         self.frame_profile.submits += 1;
@@ -10995,6 +11003,13 @@ pub const Renderer = struct {
     fn dcbFlip(context: ?*anyopaque, flip: gpu.state.Flip) bool {
         const self = fromContext(context);
         self.flip_callbacks += 1;
+        // A rejected flip stops the command queue, and everything that fails
+        // afterwards fails because of it. Name the cause here; the executor
+        // that reports the stop only sees that the backend said no.
+        defer if (self.last_flip_error) |err| std.debug.print(
+            "[vulkan dcb] flip #{d} rejected: {s}\n",
+            .{ self.flip_callbacks, @errorName(err) },
+        );
         defer self.reportFrameProfile();
         // Persist newly compiled driver pipelines at the first real frame.
         // Guest shutdown is not guaranteed to unwind through Renderer.deinit,

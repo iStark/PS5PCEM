@@ -3,6 +3,7 @@ zig-out/
 zig-out-*/
 zig-pkg/
 out/
+run-logs/
 *.bin
 *.elf
 savedata/
