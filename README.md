@@ -36,6 +36,14 @@ If you would like to support continued PS5PCEM development, you can do so on
 - Guest vertex and pixel shaders can render sampled textures using AGC vertex
   tables, per-instruction V# mappings, `VertexIndex`, PARAM exports, and
   fragment interpolation.
+- Three-dimensional scenes now reach the screen rather than only flat composited
+  output. Merged NGG vertex programs translate, a bound depth allocation is a
+  real attachment that later passes can also sample, and compute stages exchange
+  typed 2D, array and 3D images between themselves. Fifty-six host formats are
+  reachable, spanning the BC1–BC7 blocks, signed and unsigned integer and
+  normalized channels, R16/RG16, half-float and `RGBA32_FLOAT`. What is still
+  missing is named where it belongs: one colour attachment per pass, no stencil,
+  no multi-sampling, and only the base mip of a chain.
 - Persistent render targets, large writable storage buffers, resident storage
   images, and bounded texture and pipeline caches keep frame resources on the
   GPU across draws and dispatches. Compute chains can pass typed 2D, array, and
@@ -888,17 +896,21 @@ matching guest address, and publishes the frame through an API-neutral sink.
 
 The remaining stages are:
 
-1. Cache stable translated graphics modules and resource layouts across draws,
-   leaving only runtime scalar values and descriptor updates on the hot path.
-2. Add stencil, multiple render targets, MSAA, texture component swizzles,
-   the remaining compressed DCC/FMASK states, HTILE Z-range/HiZ handling, and
-   CMASK states coupled to MSAA/FMASK.
-3. Extend the current structured natural-loop and terminal-selection lowering
+1. Add multiple render targets. The command-stream side already decodes all
+   eight colour slots and their per-slot blend and write masks; only the Vulkan
+   attachment path and the pixel shader's exports beyond target zero are still
+   single-target, which is what deferred shading needs.
+2. Add stencil, MSAA, mip and layer views, texture component swizzles, the
+   remaining compressed DCC/FMASK states, HTILE Z-range/HiZ handling, and CMASK
+   states coupled to MSAA/FMASK.
+3. Finish indirect drawing. `SET_BASE` already records the argument base and
+   indirect dispatches execute; the indirect draw packet bodies are the
+   remaining half.
+4. Extend the current structured natural-loop and terminal-selection lowering
    to irreducible control flow, complete VCC/EXEC divergence, and cover the
-   remaining formats, mip/layer views, explicit-LOD operands, and image
-   operations seen in captures.
-4. Continue reducing first-use texture and synchronous dispatch work, and
-   validate state and resource invalidation against longer title captures.
+   remaining explicit-LOD operands and image operations seen in captures.
+5. Continue reducing first-use texture work and the per-draw submission cost,
+   and validate state and resource invalidation against longer title captures.
 
 The live path is now connected end to end: AGC DCB submission executes against
 the Vulkan backend, VideoOut registration identifies the requested display
@@ -926,7 +938,7 @@ memory-type selection, one descriptor layout with 64 storage buffers, separate
 64-entry 2D and 3D combined sampled-image arrays, typed storage images, and a persistently mapped dynamic
 scalar buffer, its pool, persistent guest render targets, and
 image/view/sampler/render-pass/framebuffer creation. It also owns bounded
-compute and LRU graphics-pipeline caches plus a 32-entry sampled-image LRU. The
+LRU compute and graphics-pipeline caches plus a 32-entry sampled-image LRU. The
 Vulkan-driver cache is persisted as
 `vulkan_pipeline_cache.bin` between runs; invalid, unreadable, or oversized
 cache data simply falls back to an empty driver cache, so it can only affect
@@ -2026,9 +2038,9 @@ scheduler and Vulkan backend. Observed startup work now includes:
   coherent allocations across dispatches. Small synchronization payloads and
   explicitly consumed prefixes are still published immediately, preserving the
   guest-visible ordering contract.
-- Sampled images use a 32-entry content-aware LRU, and the graphics-pipeline
-  cache recycles its least-recently-used entry instead of dropping later draws
-  after reaching its fixed capacity. Colour attachments now recycle on the same
+- Sampled images use a 32-entry content-aware LRU, and both the graphics- and
+  compute-pipeline caches recycle their least-recently-used entry instead of
+  dropping later work after reaching their fixed capacity. Colour attachments now recycle on the same
   terms. Refusing them once the bound was reached froze the cache on whichever
   allocations it happened to see first, so a scene working through more
   attachments than the bound had its later draws dropped and never recovered:
@@ -2036,6 +2048,22 @@ scheduler and Vulkan backend. Observed startup work now includes:
   which eighteen still found a target. A recycled attachment owes its contents
   to the guest, so it is published before it goes away and a later sample or
   flip still reads what was drawn into it.
+- Scalar values a shader reads at runtime no longer become part of it. Both the
+  graphics and compute paths bind them, so a title that changes a transform or a
+  tint between draws reuses one pipeline instead of generating another: the
+  observed Terminator 2D scene holds five graphics pipelines where it once
+  accumulated thousands, and the driver's own on-disk cache becomes useful
+  because the same module is presented again rather than a new one.
+- Local and global data share are carried further, including the append and
+  thread-id-relative `DS` operations, alongside the added `V_CVT_OFF_F32_I4` and
+  the further `image_load`, `image_store` and `image_sample` forms observed in
+  captures.
+- `SET_BASE` is decoded, so the base an indirect draw or dispatch measures its
+  arguments from is known. Indirect dispatches execute against it; indirect
+  draws still need their packet bodies decoded.
+- `vulkan-smoke --probe-spv` reports what the translator produced for a given
+  program, which is how a module the host compiler rejects is separated from one
+  the translator built wrongly.
 - Compact per-frame profiling replaces high-frequency default logging; verbose
   resource probes remain opt-in through `log_verbose_gpu`. A second profile line
   reports pipeline and shader-analysis cache behaviour alongside the time spent
@@ -2109,9 +2137,13 @@ scheduler and Vulkan backend. Observed startup work now includes:
   depth attachments and are rebuilt only when the depth allocation changes. The
   attachment is cleared on first use, because a title that enables the test
   before its own clear would otherwise compare against undefined contents.
-  Stencil translation, importing tiled guest depth, and multi-sample depth
-  (which would need a multi-sample colour attachment to resolve against) are
-  not part of this path.
+  A later pass that samples the same allocation is bound to the resident
+  attachment rather than to a staged copy, so a depth-of-field or fog pass reads
+  what the geometry actually wrote; the sampled view uses the single-channel
+  format matching the stored precision. Stencil translation, importing tiled
+  guest depth written outside the renderer, and multi-sample depth (which would
+  need a multi-sample colour attachment to resolve against) are not part of this
+  path.
 - `SetFlip` and equeue delivery use VideoOut filter `-13`; flip status fills
   process-time fields and event data retains the guest flip argument.
 - Indexed draws can emit AGC `SetIndexSize` as a real `INDEX_TYPE` packet, and
