@@ -272,6 +272,16 @@ Eleven modules cover the independent subsystems and their end-to-end composition
 | **`diag`** | Attributes guest addresses to modules and explains contained faults |
 | **`runtime`** | Composes memory, loader, HLE, and the optional CPU execution path |
 
+A build defaults to `ReleaseSafe` rather than `Debug`. An emulator interprets
+guest instructions, translates guest shaders and converts guest pixels once per
+frame, so an unoptimized build is not a slower version of the same program but
+one that cannot keep up: converting a single movie frame costs six times more
+under `Debug`, and a title's startup measured 7.7 seconds against 2.1. Safety
+checks are kept, because everything here reads data the emulator did not
+produce and a checked failure explains far more than undefined behaviour.
+`-Doptimize=Debug` selects the unoptimized build when a debugger needs it, and
+`-Doptimize=ReleaseFast` drops the checks for roughly another six per cent.
+
 None of them depends on anything beyond the Zig standard library. The tooling
 cross-compiles to Windows, Linux, and macOS. Direct guest execution currently
 requires Windows x86-64; the other targets still build the inspection and HLE
@@ -2139,6 +2149,16 @@ scheduler and Vulkan backend. Observed startup work now includes:
   resource probes remain opt-in through `log_verbose_gpu`. A second profile line
   reports pipeline and shader-analysis cache behaviour alongside the time spent
   in scalar provenance, SPIR-V translation, and sampled-resource preparation.
+- Playing a movie no longer costs more than decoding it. Three separate habits
+  were paying for the same pixels several times over: the nearest conversion ran
+  once per destination pixel although neighbouring destination pixels take the
+  same source pixel, the frame was magnified on the host and every copy was then
+  sent across the bus, and each frame allocated and returned tens of megabytes of
+  host and device memory to do it. Now each source pixel is converted once, the
+  GPU performs the magnification — for a whole-number ratio its blit selects
+  exactly the pixel the host loop selected — and the working buffers are
+  retained. On the observed 1920×1080 movie filling a 3840×2160 target this took
+  a frame from 233 ms to 15 ms, and the transfer from 32 MiB to 8 MiB.
 - Decoded shader programs are held across draws instead of being walked out of
   guest memory and lowered to IR for every one, and a sampled source is content
   probed at most once per frame rather than once per draw that binds it. On a

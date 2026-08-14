@@ -5,7 +5,20 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    // An emulator interprets guest instructions, translates guest shaders and
+    // converts guest pixels, and it does all of that per frame. An unoptimized
+    // build of that work is not a slower version of the same program, it is a
+    // program that cannot keep up: a movie frame costs six times more to
+    // convert under `Debug` than under a release mode, which is the difference
+    // between playing an intro and waiting through it. Safety is kept, because
+    // everything here decodes data the emulator did not produce and a checked
+    // failure says far more than undefined behaviour; `-Doptimize=Debug` is
+    // still one flag away when a debugger needs it.
+    const optimize = b.option(
+        std.builtin.OptimizeMode,
+        "optimize",
+        "Prioritize performance, safety, or binary size",
+    ) orelse .ReleaseSafe;
     const libatrac9 = b.dependency("libatrac9", .{});
     const minimp3 = b.dependency("minimp3", .{});
 

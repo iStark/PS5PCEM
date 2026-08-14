@@ -1193,6 +1193,7 @@ const FrameProfile = struct {
     index_upload_bytes: u64 = 0,
     draw_ns: u64 = 0,
     dispatch_ns: u64 = 0,
+    flip_ns: u64 = 0,
     storage_stage_ns: u64 = 0,
     storage_commit_ns: u64 = 0,
     target_materialize_ns: u64 = 0,
@@ -1590,6 +1591,25 @@ pub const Renderer = struct {
     /// Holds a display buffer read straight out of guest memory, for a flip
     /// that names a buffer nothing was rendered into.
     guest_frame_scratch: std.ArrayList(u8) = .empty,
+    // A movie converts a new frame every time one is presented, and its three
+    // working buffers are large and identically sized from one frame to the
+    // next. Holding them costs the size of one frame and saves faulting in
+    // tens of megabytes again for every frame of every movie.
+    movie_luma_scratch: std.ArrayList(u8) = .empty,
+    movie_chroma_scratch: std.ArrayList(u8) = .empty,
+    movie_rgba_scratch: std.ArrayList(u8) = .empty,
+    /// Host-visible staging for a whole colour target, retained across frames.
+    ///
+    /// A frame's worth of pixels is tens of megabytes, and allocating device
+    /// memory that size, mapping it and giving it back again is expensive
+    /// enough to matter when it happens for every frame a movie plays. The
+    /// buffer only ever grows, to the largest frame yet staged.
+    linear_upload_buffer: ?OwnedBuffer = null,
+    /// A movie frame at its own size, kept so the GPU can magnify it.
+    magnify_source_image: ?OwnedImage = null,
+    magnify_source_width: u32 = 0,
+    magnify_source_height: u32 = 0,
+    magnify_source_format: u32 = 0,
     guest_buffers: std.ArrayList(GuestBufferEntry) = .empty,
     guest_buffer_sequence: u64 = 0,
     gds_storage: std.ArrayList(u8) = .empty,
@@ -2124,10 +2144,15 @@ pub const Renderer = struct {
         for (self.completed_frames.items) |*frame| frame.pixels.deinit(self.allocator);
         self.completed_frames.deinit(self.allocator);
         self.guest_frame_scratch.deinit(self.allocator);
+        self.movie_luma_scratch.deinit(self.allocator);
+        self.movie_chroma_scratch.deinit(self.allocator);
+        self.movie_rgba_scratch.deinit(self.allocator);
         for (self.guest_buffers.items) |entry| {
             self.destroyBuffer(entry.device_local);
         }
         self.guest_buffers.deinit(self.allocator);
+        if (self.linear_upload_buffer) |buffer| self.destroyBuffer(buffer);
+        if (self.magnify_source_image) |image| self.destroyImage(image);
         if (self.dynamic_scalar_buffer) |buffer| {
             if (self.dynamic_scalar_mapping != null) self.device_functions.unmap_memory(self.device, buffer.memory);
             self.destroyBuffer(buffer);
@@ -8553,7 +8578,16 @@ pub const Renderer = struct {
             return Error.GuestBufferTooLarge;
         const chroma_bytes = std.math.mul(usize, chroma_pitch, chroma.height) catch
             return Error.GuestBufferTooLarge;
-        const rgba_bytes = std.math.mul(usize, width, height) catch
+        // Convert at the size the movie actually has whenever the target is an
+        // exact whole-number magnification of it, and let the GPU repeat the
+        // pixels. Anything else keeps the host loop, which handles a ratio the
+        // blit's own rounding would not reproduce.
+        const magnify_on_gpu = source_width != 0 and source_height != 0 and
+            width % source_width == 0 and height % source_height == 0 and
+            (width != source_width or height != source_height);
+        const convert_width = if (magnify_on_gpu) source_width else width;
+        const convert_height = if (magnify_on_gpu) source_height else height;
+        const rgba_bytes = std.math.mul(usize, convert_width, convert_height) catch
             return Error.GuestBufferTooLarge;
         const frame_bytes = std.math.mul(usize, rgba_bytes, 4) catch
             return Error.GuestBufferTooLarge;
@@ -8563,12 +8597,12 @@ pub const Renderer = struct {
             return Error.GuestBufferTooLarge;
         }
 
-        const y_plane = try self.allocator.alloc(u8, luma_bytes);
-        defer self.allocator.free(y_plane);
-        const uv_plane = try self.allocator.alloc(u8, chroma_bytes);
-        defer self.allocator.free(uv_plane);
-        const rgba = try self.allocator.alloc(u8, frame_bytes);
-        defer self.allocator.free(rgba);
+        try self.movie_luma_scratch.resize(self.allocator, luma_bytes);
+        try self.movie_chroma_scratch.resize(self.allocator, chroma_bytes);
+        try self.movie_rgba_scratch.resize(self.allocator, frame_bytes);
+        const y_plane = self.movie_luma_scratch.items;
+        const uv_plane = self.movie_chroma_scratch.items;
+        const rgba = self.movie_rgba_scratch.items;
         if (!memory.read(memory.context, luma.address, y_plane) or
             !memory.read(memory.context, chroma.address, uv_plane))
         {
@@ -8580,29 +8614,66 @@ pub const Renderer = struct {
         // last valid uploaded movie surface until a decoder publishes data.
         if (!containsNonzeroByte(y_plane) and !containsNonzeroByte(uv_plane)) return;
 
-        for (0..height) |y| {
-            const source_y = y * source_height / height;
+        // The conversion is nearest-sampled, so a destination pixel takes the
+        // colour of exactly one source pixel and neighbouring destination
+        // pixels routinely take the same one: a 1920×1080 movie filling a
+        // 3840×2160 target repeats every source pixel four times. Converting
+        // per destination pixel therefore did the arithmetic four times over,
+        // once for every copy, and that arithmetic was nearly the whole cost
+        // of playing a movie. Convert each source pixel once instead and
+        // repeat the result: rows magnified from an already converted row are
+        // copied whole, and within a row each source column fills its whole
+        // run of destination columns.
+        const row_bytes = convert_width * 4;
+        var converted_source_y: ?usize = null;
+        var converted_row_start: usize = 0;
+        for (0..convert_height) |y| {
+            const source_y = y * source_height / convert_height;
+            const rgba_row = y * row_bytes;
+            if (converted_source_y) |already| {
+                if (already == source_y) {
+                    @memcpy(
+                        rgba[rgba_row..][0..row_bytes],
+                        rgba[converted_row_start..][0..row_bytes],
+                    );
+                    continue;
+                }
+            }
             const y_row = source_y * luma_pitch;
             const uv_row = (source_y / 2) * chroma_pitch;
-            const rgba_row = y * width * 4;
-            for (0..width) |x| {
-                const source_x = x * source_width / width;
+            var x: usize = 0;
+            while (x < convert_width) {
+                const source_x = x * source_width / convert_width;
                 const c = @max(@as(i32, y_plane[y_row + source_x]) - 16, 0);
                 const uv = uv_row + (source_x / 2) * 2;
                 const u = @as(i32, uv_plane[uv]) - 128;
                 const v = @as(i32, uv_plane[uv + 1]) - 128;
-                const r = std.math.clamp((298 * c + 409 * v + 128) >> 8, 0, 255);
-                const g = std.math.clamp((298 * c - 100 * u - 208 * v + 128) >> 8, 0, 255);
-                const b = std.math.clamp((298 * c + 516 * u + 128) >> 8, 0, 255);
-                const pixel = rgba_row + x * 4;
-                rgba[pixel] = @intCast(r);
-                rgba[pixel + 1] = @intCast(g);
-                rgba[pixel + 2] = @intCast(b);
-                rgba[pixel + 3] = 255;
+                const texel = [4]u8{
+                    @intCast(std.math.clamp((298 * c + 409 * v + 128) >> 8, 0, 255)),
+                    @intCast(std.math.clamp((298 * c - 100 * u - 208 * v + 128) >> 8, 0, 255)),
+                    @intCast(std.math.clamp((298 * c + 516 * u + 128) >> 8, 0, 255)),
+                    255,
+                };
+                // The first destination column that reaches the next source
+                // column ends this run.
+                const run_end = @min(
+                    convert_width,
+                    ((source_x + 1) * convert_width + source_width - 1) / source_width,
+                );
+                while (x < run_end) : (x += 1) {
+                    rgba[rgba_row + x * 4 ..][0..4].* = texel;
+                }
             }
+            converted_source_y = source_y;
+            converted_row_start = rgba_row;
         }
 
-        self.latest_video_render_target_index = try self.uploadLinearColorTarget(target, rgba);
+        self.latest_video_render_target_index = try self.uploadColorTargetFromSource(
+            target,
+            rgba,
+            @intCast(convert_width),
+            @intCast(convert_height),
+        );
     }
 
     /// Bypass Unity's identity sampled-image present pass. Its guest quad is
@@ -8727,25 +8798,158 @@ pub const Renderer = struct {
         return true;
     }
 
+    fn acquireLinearUploadBuffer(self: *Renderer, byte_count: usize) anyerror!OwnedBuffer {
+        if (self.linear_upload_buffer) |buffer| {
+            if (buffer.size >= byte_count) return buffer;
+            self.destroyBuffer(buffer);
+            self.linear_upload_buffer = null;
+        }
+        const buffer = try self.createBuffer(
+            byte_count,
+            vk.buffer_usage_transfer_src_bit,
+            vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+        );
+        self.linear_upload_buffer = buffer;
+        return buffer;
+    }
+
+    fn acquireMagnifySourceImage(
+        self: *Renderer,
+        width: u32,
+        height: u32,
+        format: u32,
+    ) anyerror!OwnedImage {
+        if (self.magnify_source_image) |image| {
+            if (self.magnify_source_width == width and
+                self.magnify_source_height == height and
+                self.magnify_source_format == format)
+            {
+                return image;
+            }
+            self.destroyImage(image);
+            self.magnify_source_image = null;
+        }
+        const image = try self.createImage(
+            width,
+            height,
+            format,
+            vk.image_usage_transfer_dst_bit | vk.image_usage_transfer_src_bit,
+        );
+        self.magnify_source_image = image;
+        self.magnify_source_width = width;
+        self.magnify_source_height = height;
+        self.magnify_source_format = format;
+        return image;
+    }
+
     fn uploadLinearColorTarget(
         self: *Renderer,
         target: GuestColorTarget,
         rgba: []const u8,
     ) anyerror!usize {
-        const frame_bytes = try colorTargetFrameBytes(target);
-        if (rgba.len != frame_bytes) return Error.UnsupportedGraphicsState;
+        return self.uploadColorTargetFromSource(
+            target,
+            rgba,
+            target.descriptor.width,
+            target.descriptor.height,
+        );
+    }
+
+    /// Fill a colour target from host pixels, magnifying on the GPU when the
+    /// source is smaller than the target.
+    ///
+    /// Magnifying on the host writes the same pixel once per copy and then
+    /// sends every copy across the bus, which for a 1920x1080 movie in a
+    /// 3840x2160 target is four times the stores and four times the transfer
+    /// carrying no additional information. A blit replicates it on the GPU
+    /// instead, and for an integer magnification it selects exactly the source
+    /// pixel a nearest host loop would have selected.
+    fn uploadColorTargetFromSource(
+        self: *Renderer,
+        target: GuestColorTarget,
+        rgba: []const u8,
+        source_width: u32,
+        source_height: u32,
+    ) anyerror!usize {
+        const source_bytes = std.math.mul(
+            usize,
+            std.math.mul(usize, source_width, source_height) catch return Error.GuestBufferTooLarge,
+            4,
+        ) catch return Error.GuestBufferTooLarge;
+        if (rgba.len != source_bytes) return Error.UnsupportedGraphicsState;
+        const magnifying = source_width != target.descriptor.width or
+            source_height != target.descriptor.height;
+        if (magnifying and (source_width == 0 or source_height == 0 or
+            source_width > target.descriptor.width or
+            source_height > target.descriptor.height))
+        {
+            return Error.UnsupportedGraphicsState;
+        }
         const target_index = try self.acquireRenderTarget(target);
         const snapshot = self.render_targets.items[target_index];
-        const upload = try self.createBuffer(
-            frame_bytes,
-            vk.buffer_usage_transfer_src_bit,
-            vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
-        );
-        defer self.destroyBuffer(upload);
+        const upload = try self.acquireLinearUploadBuffer(source_bytes);
         try self.writeMapped(upload, rgba);
+        const staging: ?OwnedImage = if (magnifying)
+            try self.acquireMagnifySourceImage(source_width, source_height, target.format.vulkan)
+        else
+            null;
 
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
+        if (staging) |image| {
+            const to_transfer_destination = vk.ImageMemoryBarrier{
+                .source_access_mask = 0,
+                .destination_access_mask = vk.access_transfer_write_bit,
+                .old_layout = vk.image_layout_undefined,
+                .new_layout = vk.image_layout_transfer_dst_optimal,
+                .image = image.handle,
+                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+            };
+            self.device_functions.cmd_pipeline_barrier(
+                command_buffer,
+                vk.pipeline_stage_top_of_pipe_bit,
+                vk.pipeline_stage_transfer_bit,
+                0,
+                0,
+                null,
+                0,
+                null,
+                1,
+                @ptrCast(&to_transfer_destination),
+            );
+            const staging_copy = vk.BufferImageCopy{
+                .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+                .image_extent = .{ .width = source_width, .height = source_height, .depth = 1 },
+            };
+            self.device_functions.cmd_copy_buffer_to_image(
+                command_buffer,
+                upload.handle,
+                image.handle,
+                vk.image_layout_transfer_dst_optimal,
+                1,
+                @ptrCast(&staging_copy),
+            );
+            const to_transfer_source = vk.ImageMemoryBarrier{
+                .source_access_mask = vk.access_transfer_write_bit,
+                .destination_access_mask = vk.access_transfer_read_bit,
+                .old_layout = vk.image_layout_transfer_dst_optimal,
+                .new_layout = vk.image_layout_transfer_src_optimal,
+                .image = image.handle,
+                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+            };
+            self.device_functions.cmd_pipeline_barrier(
+                command_buffer,
+                vk.pipeline_stage_transfer_bit,
+                vk.pipeline_stage_transfer_bit,
+                0,
+                0,
+                null,
+                0,
+                null,
+                1,
+                @ptrCast(&to_transfer_source),
+            );
+        }
         const source_stage: vk.Flags = if (!snapshot.initialized)
             vk.pipeline_stage_top_of_pipe_bit
         else if (snapshot.shader_read_layout)
@@ -8782,22 +8986,51 @@ pub const Renderer = struct {
             1,
             @ptrCast(&to_transfer),
         );
-        const copy = vk.BufferImageCopy{
-            .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
-            .image_extent = .{
-                .width = target.descriptor.width,
-                .height = target.descriptor.height,
-                .depth = 1,
-            },
-        };
-        self.device_functions.cmd_copy_buffer_to_image(
-            command_buffer,
-            upload.handle,
-            snapshot.image.handle,
-            vk.image_layout_transfer_dst_optimal,
-            1,
-            @ptrCast(&copy),
-        );
+        if (staging) |image| {
+            const blit = vk.ImageBlit{
+                .source_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+                .source_offsets = .{
+                    .{ .x = 0, .y = 0, .z = 0 },
+                    .{ .x = @intCast(source_width), .y = @intCast(source_height), .z = 1 },
+                },
+                .destination_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+                .destination_offsets = .{
+                    .{ .x = 0, .y = 0, .z = 0 },
+                    .{
+                        .x = @intCast(target.descriptor.width),
+                        .y = @intCast(target.descriptor.height),
+                        .z = 1,
+                    },
+                },
+            };
+            self.device_functions.cmd_blit_image(
+                command_buffer,
+                image.handle,
+                vk.image_layout_transfer_src_optimal,
+                snapshot.image.handle,
+                vk.image_layout_transfer_dst_optimal,
+                1,
+                @ptrCast(&blit),
+                vk.filter_nearest,
+            );
+        } else {
+            const copy = vk.BufferImageCopy{
+                .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+                .image_extent = .{
+                    .width = target.descriptor.width,
+                    .height = target.descriptor.height,
+                    .depth = 1,
+                },
+            };
+            self.device_functions.cmd_copy_buffer_to_image(
+                command_buffer,
+                upload.handle,
+                snapshot.image.handle,
+                vk.image_layout_transfer_dst_optimal,
+                1,
+                @ptrCast(&copy),
+            );
+        }
         const to_attachment = vk.ImageMemoryBarrier{
             .source_access_mask = vk.access_transfer_write_bit,
             .destination_access_mask = vk.access_color_attachment_read_bit | vk.access_color_attachment_write_bit,
@@ -8820,8 +9053,8 @@ pub const Renderer = struct {
         );
         try self.submitOneShot(command_buffer);
 
-        self.frame_profile.upload_bytes +%= frame_bytes;
-        self.frame_profile.texture_upload_bytes +%= frame_bytes;
+        self.frame_profile.upload_bytes +%= source_bytes;
+        self.frame_profile.texture_upload_bytes +%= source_bytes;
         self.render_target_sequence +%= 1;
         const cached = &self.render_targets.items[target_index];
         cached.initialized = true;
@@ -10865,7 +11098,7 @@ pub const Renderer = struct {
                 resident_storage_images += @intFromBool(cached.valid);
             }
             std.debug.print(
-                "[gpu frame] flip={d} frame_ms={d} draws={d}/{d}ms dispatches={d}/{d}ms submits={d} fence_wait_us={d} upload_kib={d}(buf={d},rt={d},tex={d},idx={d}) resident_kib={d} readback_kib={d}(buf={d},rt={d}) storage_ms={d}+{d} target_ms={d} rt_hit={d} rt_miss={d} buf_cache={d} tex_cache={d} simg_cache={d}/{d}MiB\n",
+                "[gpu frame] flip={d} frame_ms={d} draws={d}/{d}ms dispatches={d}/{d}ms flip={d}ms submits={d} fence_wait_us={d} upload_kib={d}(buf={d},rt={d},tex={d},idx={d}) resident_kib={d} readback_kib={d}(buf={d},rt={d}) storage_ms={d}+{d} target_ms={d} rt_hit={d} rt_miss={d} buf_cache={d} tex_cache={d} simg_cache={d}/{d}MiB\n",
                 .{
                     self.flip_callbacks,
                     interval_ns / std.time.ns_per_ms,
@@ -10873,6 +11106,7 @@ pub const Renderer = struct {
                     profile.draw_ns / std.time.ns_per_ms,
                     profile.dispatches,
                     profile.dispatch_ns / std.time.ns_per_ms,
+                    profile.flip_ns / std.time.ns_per_ms,
                     profile.submits,
                     profile.fence_wait_ns / std.time.ns_per_us,
                     profile.upload_bytes / 1024,
@@ -11003,6 +11237,7 @@ pub const Renderer = struct {
     fn dcbFlip(context: ?*anyopaque, flip: gpu.state.Flip) bool {
         const self = fromContext(context);
         self.flip_callbacks += 1;
+        const flip_started = hostTimestampNs();
         // A rejected flip stops the command queue, and everything that fails
         // afterwards fails because of it. Name the cause here; the executor
         // that reports the stop only sees that the backend said no.
@@ -11011,6 +11246,9 @@ pub const Renderer = struct {
             .{ self.flip_callbacks, @errorName(err) },
         );
         defer self.reportFrameProfile();
+        // Declared after the report so that it runs before it: the time this
+        // flip spends belongs to the frame being reported, not the next one.
+        defer self.frame_profile.flip_ns +|= elapsedHostNanoseconds(flip_started);
         // Persist newly compiled driver pipelines at the first real frame.
         // Guest shutdown is not guaranteed to unwind through Renderer.deinit,
         // so saving only there made every diagnostic relaunch compile again.
