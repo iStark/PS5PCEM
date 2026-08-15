@@ -117,6 +117,23 @@ pub fn evaluateResourceStateUntil(
     return evaluate(reader, bindings, end_pc, true, null);
 }
 
+/// Recovers descriptor state before one instruction, from a shader the backend
+/// has already decoded.
+///
+/// A kernel resolves a descriptor once per instruction that names it, and each
+/// resolution walks the program from its start. Doing that from guest memory
+/// re-reads and re-decodes every earlier instruction every time, so a kernel
+/// with seventy resource references pays for its own prolog seventy times. The
+/// decoded program removes the fetch and the decode; the walk itself remains.
+pub fn evaluateDecodedResourceStateUntil(
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    instructions: []const rdna2.Instruction,
+    end_pc: u32,
+) Evaluation {
+    return evaluate(reader, bindings, end_pc, true, instructions);
+}
+
 /// Evaluates only the straight scalar region ending before `end_pc`. This is
 /// the dispatch-specialization entry point: later scalar writes must not alter
 /// descriptors captured for the first vector-memory instruction.

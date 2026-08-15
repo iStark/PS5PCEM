@@ -1198,6 +1198,9 @@ const FrameProfile = struct {
     storage_commit_ns: u64 = 0,
     target_materialize_ns: u64 = 0,
     resident_storage_bytes: u64 = 0,
+    texture_hits: u64 = 0,
+    texture_misses: u64 = 0,
+    texture_evictions: u64 = 0,
     render_target_hits: u64 = 0,
     render_target_misses: u64 = 0,
     graphics_pipeline_hits: u64 = 0,
@@ -4330,9 +4333,10 @@ pub const Renderer = struct {
             // reuse the same SGPR quartet for several SMEM-loaded V# values;
             // a final whole-program snapshot (or the first mapping for that
             // SGPR) is not authoritative for a later MUBUF operation.
-            const instruction_scalar = gpu.scalar_provenance.evaluateResourceStateUntil(
+            const instruction_scalar = gpu.scalar_provenance.evaluateDecodedResourceStateUntil(
                 reader,
                 bindings,
+                analysis.program.instructions.items,
                 inst.pc,
             );
             // The instruction-local scalar state is authoritative. Attribute
@@ -4490,9 +4494,10 @@ pub const Renderer = struct {
             // instruction; using the entry snapshot bound late destinations
             // to an unrelated fallback slot (notably a 2D image for a 3D
             // image_store in The Precinct's volume kernel).
-            const image_scalar = gpu.scalar_provenance.evaluateResourceStateUntil(
+            const image_scalar = gpu.scalar_provenance.evaluateDecodedResourceStateUntil(
                 reader,
                 bindings,
+                analysis.program.instructions.items,
                 inst.pc,
             );
             const descriptor = (try resolveComputeImageDescriptor(
@@ -4651,9 +4656,10 @@ pub const Renderer = struct {
             }
 
             const descriptor_slot = result.sampled_image_mapping_count;
-            const sampled_scalar = gpu.scalar_provenance.evaluateResourceStateUntil(
+            const sampled_scalar = gpu.scalar_provenance.evaluateDecodedResourceStateUntil(
                 reader,
                 bindings,
+                analysis.program.instructions.items,
                 inst.pc,
             );
             const image_descriptor = (try resolveComputeSampledImageDescriptor(
@@ -9147,9 +9153,10 @@ pub const Renderer = struct {
             // compute programs. Recover the state at this particular sample;
             // the fallback slots still cover shaders that reference only SRT
             // metadata and have no executable scalar producer.
-            const sampled_scalar = gpu.scalar_provenance.evaluateResourceStateUntil(
+            const sampled_scalar = gpu.scalar_provenance.evaluateDecodedResourceStateUntil(
                 reader,
                 bindings,
+                analysis.program.instructions.items,
                 inst.pc,
             );
             const image_descriptor = (try resolveComputeSampledImageDescriptor(
@@ -10102,6 +10109,7 @@ pub const Renderer = struct {
             var item = &self.sampled_image_cache.items[idx];
             item.last_used_frame = self.frame_sequence;
             self.texture_cache_hits += 1;
+            self.frame_profile.texture_hits +|= 1;
             if (self.texture_cache_hits == 1) {
                 std.debug.print("[vulkan dcb] texture cache hit: first time! addr=0x{x} hash={x}\n", .{ descriptor.address, content_hash });
             }
@@ -10109,6 +10117,7 @@ pub const Renderer = struct {
             return .{ .image = item.image, .view = item.view, .sampler = item.sampler };
         }
         self.texture_cache_misses += 1;
+        self.frame_profile.texture_misses +|= 1;
         if (self.texture_cache_misses == 1) {
             std.debug.print("[vulkan dcb] texture cache miss: first @0x{x} hash={x}\n", .{ descriptor.address, content_hash });
         }
@@ -10435,6 +10444,7 @@ pub const Renderer = struct {
                     oldest_idx = idx;
                 }
             }
+            self.frame_profile.texture_evictions +|= 1;
             const evicted = self.sampled_image_cache.items[oldest_idx];
             self.device_functions.destroy_image_view(self.device, evicted.view, null);
             self.device_functions.destroy_sampler(self.device, evicted.sampler, null);
@@ -11098,7 +11108,7 @@ pub const Renderer = struct {
                 resident_storage_images += @intFromBool(cached.valid);
             }
             std.debug.print(
-                "[gpu frame] flip={d} frame_ms={d} draws={d}/{d}ms dispatches={d}/{d}ms flip={d}ms submits={d} fence_wait_us={d} upload_kib={d}(buf={d},rt={d},tex={d},idx={d}) resident_kib={d} readback_kib={d}(buf={d},rt={d}) storage_ms={d}+{d} target_ms={d} rt_hit={d} rt_miss={d} buf_cache={d} tex_cache={d} simg_cache={d}/{d}MiB\n",
+                "[gpu frame] flip={d} frame_ms={d} draws={d}/{d}ms dispatches={d}/{d}ms flip={d}ms submits={d} fence_wait_us={d} upload_kib={d}(buf={d},rt={d},tex={d},idx={d}) resident_kib={d} readback_kib={d}(buf={d},rt={d}) storage_ms={d}+{d} target_ms={d} rt_hit={d} rt_miss={d} tex_hit={d} tex_miss={d} tex_evict={d} buf_cache={d} tex_cache={d} simg_cache={d}/{d}MiB\n",
                 .{
                     self.flip_callbacks,
                     interval_ns / std.time.ns_per_ms,
@@ -11123,6 +11133,9 @@ pub const Renderer = struct {
                     profile.target_materialize_ns / std.time.ns_per_ms,
                     profile.render_target_hits,
                     profile.render_target_misses,
+                    profile.texture_hits,
+                    profile.texture_misses,
+                    profile.texture_evictions,
                     self.guest_buffers.items.len,
                     self.sampled_image_cache.items.len,
                     resident_storage_images,
