@@ -304,10 +304,19 @@ pub fn decodeMimg(pc: u32, code: []const u32, word_index: u32) Error!Instruction
     inst.image_sample_flags.a16 = (word1 >> 30) & 1 != 0;
     if (op == .image_sample) {
         switch (id) {
-            0x20 => {},
+            0x20, 0x21, 0x22, 0x23 => {},
             0x24 => inst.image_sample_flags.lod = true,
             0x25 => inst.image_sample_flags.bias = true,
             0x27 => inst.image_sample_flags.level_zero = true,
+            0x28, 0x29 => inst.image_sample_flags.compare = true,
+            0x2c => {
+                inst.image_sample_flags.compare = true;
+                inst.image_sample_flags.lod = true;
+            },
+            0x2f => {
+                inst.image_sample_flags.compare = true;
+                inst.image_sample_flags.level_zero = true;
+            },
             0x37 => {
                 inst.image_sample_flags.level_zero = true;
                 inst.image_sample_flags.offset = true;

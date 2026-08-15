@@ -66,7 +66,6 @@ pub const Error = error{
     PipelineLayoutCreationFailed,
     ComputePipelineCreationFailed,
     GraphicsPipelineCreationFailed,
-    NvidiaCompilerGuardActive,
     ImageCreationFailed,
     ImageViewCreationFailed,
     RenderPassCreationFailed,
@@ -160,6 +159,11 @@ pub const Options = struct {
     prefer_integrated_gpu: bool = false,
     /// Writes NVIDIA-guarded compute modules to `out` for offline validation.
     dump_compute_spirv: bool = false,
+    /// Writes translated guest graphics modules to `out` for offline validation.
+    dump_graphics_spirv: bool = false,
+    /// Extends automatic PPM checkpoints beyond the small startup set. This is
+    /// diagnostic I/O and remains opt-in for normal game runs.
+    capture_extended_progress_frames: bool = false,
     /// Optional Win32 output window. Supplying it enables the required surface
     /// and swapchain extensions and constrains device selection to a queue that
     /// can present to this exact surface.
@@ -611,11 +615,10 @@ const maximum_render_targets = 64;
 const maximum_depth_targets = 16;
 const maximum_sampled_images = 32;
 // Descriptor arrays are limited per shader, but the cross-draw texture cache
-// must cover a complete modern frame. The Precinct references roughly sixty
-// stable images per frame; tying cache capacity to the 32 descriptor slots
-// evicted a 64 MiB static texture before its next use and uploaded it again on
-// every flip.
-const maximum_cached_sampled_images = 64;
+// must cover a complete modern frame. Tying cache capacity to the 32 live
+// descriptor slots evicts large static textures before their next use and
+// uploads them again on every flip.
+const maximum_cached_sampled_images = 1024;
 /// Storage images form long compute chains in modern Unity render graphs. A
 /// dispatch may write one image only for the next dispatch to read it; keeping
 /// those images resident avoids a GPU -> tiled guest memory -> GPU round trip
@@ -857,8 +860,8 @@ fn colorTargetFormat(descriptor: gpu.resources.ColorTarget) ?ColorTargetFormat {
             7 => .{ .vulkan = vk.format_r16_sfloat, .bytes_per_texel = 2 },
             else => null,
         },
-        // DATA_FORMAT_16_16 + NUMBER_FORMAT_FLOAT. The Precinct uses this
-        // full-resolution two-channel target in the first world frame.
+        // DATA_FORMAT_16_16 + NUMBER_FORMAT_FLOAT. Modern deferred renderers use
+        // this for full-resolution two-channel intermediate targets.
         5 => if (descriptor.number_type == 7)
             .{ .vulkan = vk.format_r16g16_sfloat, .bytes_per_texel = 4 }
         else
@@ -1470,31 +1473,6 @@ fn canReuseStorageMapping(attribute_specific: bool, previous: ?u32, current: u32
     return !attribute_specific and previous != null and previous.? == current;
 }
 
-fn isNvidiaCompilerUnsafeDeformationKernel(
-    analysis: *const gpu.ShaderAnalysis,
-    group_count: [3]u32,
-    resources: *const ComputeResources,
-) bool {
-    if (!std.mem.eql(u32, &group_count, &.{ 127, 1, 1 })) return false;
-    if (analysis.program.instructions.items.len != 90 or resources.mapping_count != 5) return false;
-    if (resources.sampled_image_mapping_count != 0 or resources.storage_image_mapping_count != 0) return false;
-
-    const instructions = analysis.program.instructions.items;
-    const signature = [_]u32{ 0xbfa0_0003, 0xd746_0000, 0xf408_0406, 0xbf8c_c07f };
-    for (signature, 0..) |word, index| {
-        if (instructions[index].word != word) return false;
-    }
-
-    const expected_sgprs = [_]u32{ 16, 4, 0, 8, 12 };
-    const expected_sizes = [_]usize{ 0x10, 0x1f960, 0x4ef70, 0x600, 0x4ef70 };
-    for (resources.mappings[0..5], 0..) |mapping, index| {
-        if (mapping.resource_sgpr != expected_sgprs[index] or mapping.descriptor_index != index) return false;
-        if (resources.sizes[index] != expected_sizes[index]) return false;
-        if (resources.writable[index] != (index == 4)) return false;
-    }
-    return true;
-}
-
 fn dumpComputeSpirv(allocator: std.mem.Allocator, program_address: u64, words: []const u32) void {
     var path_buffer: [96]u8 = undefined;
     const path = std.fmt.bufPrintZ(
@@ -1510,10 +1488,31 @@ fn dumpComputeSpirv(allocator: std.mem.Allocator, program_address: u64, words: [
     file.writePositionalAll(io, std.mem.sliceAsBytes(words), 0) catch {};
 }
 
-fn shouldDumpProgressFrame(flip: u64) bool {
+fn dumpGraphicsSpirv(
+    allocator: std.mem.Allocator,
+    stage: []const u8,
+    program_address: u64,
+    words: []const u32,
+) void {
+    var path_buffer: [96]u8 = undefined;
+    const path = std.fmt.bufPrintZ(
+        &path_buffer,
+        "out\\graphics-{s}-0x{x}.spv",
+        .{ stage, program_address },
+    ) catch return;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const file = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true }) catch return;
+    defer file.close(io);
+    file.writePositionalAll(io, std.mem.sliceAsBytes(words), 0) catch {};
+}
+
+fn shouldDumpProgressFrame(flip: u64, extended: bool) bool {
     return switch (flip) {
         2, 8, 16, 32, 64, 96, 128 => true,
-        else => false,
+        256, 512, 768, 1024, 1152, 1200, 1216, 1280, 1536, 2048 => extended,
+        else => extended and flip >= 800 and flip % 64 == 0,
     };
 }
 
@@ -1590,6 +1589,8 @@ pub const Renderer = struct {
     skip_compute_dispatches: bool,
     translate_compute_only: bool,
     dump_compute_spirv: bool,
+    dump_graphics_spirv: bool,
+    capture_extended_progress_frames: bool,
     guest_memory: ?GuestMemory = null,
     /// Holds a display buffer read straight out of guest memory, for a flip
     /// that names a buffer nothing was rendered into.
@@ -1645,6 +1646,7 @@ pub const Renderer = struct {
     depth_target_sequence: u64 = 0,
     reported_depth_attachment: bool = false,
     reported_unbacked_depth_sample: bool = false,
+    reported_resident_rt_sample: bool = false,
     htile_targets: std.ArrayList(CachedHtileTarget) = .empty,
     htile_target_sequence: u64 = 0,
     latest_render_target_index: ?usize = null,
@@ -1689,11 +1691,6 @@ pub const Renderer = struct {
     emulated_buffer_clear_dispatches: u64 = 0,
     emulated_image_store_dispatches: u64 = 0,
     emulated_image_copy_dispatches: u64 = 0,
-    emulated_nvidia_deformation_dispatches: u64 = 0,
-    skipped_nvidia_compute_pipelines: u64 = 0,
-    skipped_nvidia_graphics_pipelines: u64 = 0,
-    nvidia_compute_compiler_guard_active: bool = false,
-    nvidia_graphics_compiler_guard_budget: u32 = 0,
     video_surface_addresses: [8]u64 = @splat(0),
     video_surface_count: usize = 0,
     video_surface_last_flip: u64 = 0,
@@ -2044,6 +2041,8 @@ pub const Renderer = struct {
             .skip_compute_dispatches = options.skip_compute_dispatches,
             .translate_compute_only = options.translate_compute_only,
             .dump_compute_spirv = options.dump_compute_spirv,
+            .dump_graphics_spirv = options.dump_graphics_spirv,
+            .capture_extended_progress_frames = options.capture_extended_progress_frames,
             .window_presentation = window_presentation,
         };
         renderer.dynamic_scalar_buffer = try renderer.createBuffer(
@@ -3094,56 +3093,6 @@ pub const Renderer = struct {
         };
         self.frame_profile.compute_translate_ns +|= elapsedHostNanoseconds(translate_started);
         defer module.deinit(self.allocator);
-        if (self.device_info.vendor_id == 0x10de and
-            isNvidiaCompilerUnsafeDeformationKernel(analysis, group_count, &resources))
-        {
-            // nvgpucomp64.dll faults while compiling this Unity/Burst
-            // deformation kernel, consistently near the end of The Precinct's
-            // long scene load. Preserve useful geometry with the undeformed
-            // input stream and retain the exact module for offline diagnosis.
-            dumpComputeSpirv(self.allocator, program_address, module.words);
-            try self.copyResidentGuestStorage(
-                resources.addresses[2],
-                resources.addresses[4],
-                resources.sizes[2],
-            );
-            self.emulated_nvidia_deformation_dispatches += 1;
-            self.nvidia_compute_compiler_guard_active = true;
-            self.nvidia_graphics_compiler_guard_budget = @max(
-                self.nvidia_graphics_compiler_guard_budget,
-                1,
-            );
-            std.debug.print(
-                "[vulkan dcb] emulated NVIDIA-unsafe deformation kernel program=0x{x} bytes=0x{x} (#{d})\n",
-                .{ program_address, resources.sizes[2], self.emulated_nvidia_deformation_dispatches },
-            );
-            return .{
-                .pipeline_cache_hit = false,
-                .group_count = group_count,
-                .spirv_words = module.words.len,
-            };
-        }
-        if (self.nvidia_compute_compiler_guard_active and !self.hasComputePipeline(module.words)) {
-            // Once the reproducibly fatal Burst kernel appears, NVIDIA's
-            // compiler also faults on the next newly discovered pipeline in
-            // the same scene bootstrap. Continue dispatching every already-
-            // compiled kernel, but keep subsequent misses out of the poisoned
-            // compiler session and preserve same-sized outputs where possible.
-            dumpComputeSpirv(self.allocator, program_address, module.words);
-            const copied_outputs = try self.copyResidentFallbackOutputs(&resources);
-            self.skipped_nvidia_compute_pipelines += 1;
-            if (self.skipped_nvidia_compute_pipelines <= 16 or log_verbose_gpu) {
-                std.debug.print(
-                    "[vulkan dcb] guarded new NVIDIA compute pipeline program=0x{x} outputs_copied={d} (#{d})\n",
-                    .{ program_address, copied_outputs, self.skipped_nvidia_compute_pipelines },
-                );
-            }
-            return .{
-                .pipeline_cache_hit = false,
-                .group_count = group_count,
-                .spirv_words = module.words.len,
-            };
-        }
         if (self.translate_compute_only) {
             std.debug.print(
                 "[vulkan dcb] compute translated only: program=0x{x} spirv_words={d} groups={d}x{d}x{d}\n",
@@ -4493,7 +4442,7 @@ pub const Renderer = struct {
             // scalar specialization prefix. Resolve the state at this image
             // instruction; using the entry snapshot bound late destinations
             // to an unrelated fallback slot (notably a 2D image for a 3D
-            // image_store in The Precinct's volume kernel).
+            // image_store in large volume-processing kernels).
             const image_scalar = gpu.scalar_provenance.evaluateDecodedResourceStateUntil(
                 reader,
                 bindings,
@@ -4762,67 +4711,6 @@ pub const Renderer = struct {
         }
     }
 
-    fn copyResidentGuestStorage(
-        self: *Renderer,
-        source_address: u64,
-        target_address: u64,
-        size: usize,
-    ) Error!void {
-        const source_index = for (self.guest_buffers.items, 0..) |entry, index| {
-            if (entry.guest_address == source_address and entry.size == size) break index;
-        } else return Error.GuestBufferNotStaged;
-        const target_index = for (self.guest_buffers.items, 0..) |entry, index| {
-            if (entry.guest_address == target_address and entry.size == size) break index;
-        } else return Error.GuestBufferNotStaged;
-        if (source_index == target_index) return;
-
-        const source = self.guest_buffers.items[source_index].device_local;
-        const target = self.guest_buffers.items[target_index].device_local;
-        var source_mapping: ?*anyopaque = null;
-        if (self.device_functions.map_memory(self.device, source.memory, 0, size, 0, &source_mapping) != vk.success) {
-            return Error.MemoryMapFailed;
-        }
-        defer self.device_functions.unmap_memory(self.device, source.memory);
-        var target_mapping: ?*anyopaque = null;
-        if (self.device_functions.map_memory(self.device, target.memory, 0, size, 0, &target_mapping) != vk.success) {
-            return Error.MemoryMapFailed;
-        }
-        defer self.device_functions.unmap_memory(self.device, target.memory);
-
-        const source_bytes: [*]const u8 = @ptrCast(source_mapping orelse return Error.MemoryMapFailed);
-        const target_bytes: [*]u8 = @ptrCast(target_mapping orelse return Error.MemoryMapFailed);
-        @memcpy(target_bytes[0..size], source_bytes[0..size]);
-        self.guest_buffers.items[target_index].gpu_dirty = true;
-    }
-
-    fn copyResidentFallbackOutputs(self: *Renderer, resources: *const ComputeResources) Error!usize {
-        var copied: usize = 0;
-        for (resources.writable, 0..) |writable, target_index| {
-            if (!writable or !resources.occupied[target_index]) continue;
-            const size = resources.sizes[target_index];
-            if (size == 0) continue;
-            for (resources.occupied, 0..) |occupied, source_index| {
-                if (!occupied or resources.writable[source_index] or resources.sizes[source_index] != size) continue;
-                try self.copyResidentGuestStorage(
-                    resources.addresses[source_index],
-                    resources.addresses[target_index],
-                    size,
-                );
-                copied += 1;
-                break;
-            }
-        }
-        return copied;
-    }
-
-    fn hasComputePipeline(self: *const Renderer, words: []const u32) bool {
-        const hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(words));
-        for (self.compute_pipelines.items) |entry| {
-            if (entry.hash == hash and std.mem.eql(u32, entry.words, words)) return true;
-        }
-        return false;
-    }
-
     fn getComputePipeline(self: *Renderer, words: []const u32) (Error || std.mem.Allocator.Error)!PipelineLookup {
         self.compute_pipeline_sequence +%= 1;
         const hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(words));
@@ -4917,7 +4805,7 @@ pub const Renderer = struct {
         var pipeline: vk.Pipeline = 0;
         if (self.device_functions.create_compute_pipelines(
             self.device,
-            self.driver_pipeline_cache,
+            0,
             1,
             @ptrCast(&pipeline_info),
             null,
@@ -5644,22 +5532,6 @@ pub const Renderer = struct {
                 return entry.pipeline;
             }
         }
-        if (self.nvidia_graphics_compiler_guard_budget != 0) {
-            self.nvidia_graphics_compiler_guard_budget -= 1;
-            self.skipped_nvidia_graphics_pipelines += 1;
-            if (self.skipped_nvidia_graphics_pipelines <= 16 or log_verbose_gpu) {
-                std.debug.print(
-                    "[vulkan dcb] guarded transient NVIDIA graphics pipeline vs_words={d} ps_words={d} remaining={d} (#{d})\n",
-                    .{
-                        vertex_words.len,
-                        fragment_words.len,
-                        self.nvidia_graphics_compiler_guard_budget,
-                        self.skipped_nvidia_graphics_pipelines,
-                    },
-                );
-            }
-            return Error.NvidiaCompilerGuardActive;
-        }
         const owned_vertex = try self.allocator.dupe(u32, vertex_words);
         errdefer self.allocator.free(owned_vertex);
         const owned_fragment = try self.allocator.dupe(u32, fragment_words);
@@ -6242,47 +6114,77 @@ pub const Renderer = struct {
         self.render_targets.items[index].shader_read_layout = false;
     }
 
+    fn findResidentRenderTargetIndex(
+        self: *Renderer,
+        descriptor: gpu.resources.ImageDescriptor,
+        image_format: u32,
+    ) ?usize {
+        for (self.render_targets.items, 0..) |cached, index| {
+            // A VkImageView cannot start at an arbitrary byte inside another
+            // image allocation. Reuse only a render target that describes the
+            // same image exactly; overlap and equal texel size are insufficient
+            // proof and can silently sample an unrelated attachment.
+            if (cached.initialized and
+                cached.target.descriptor.address == descriptor.address and
+                cached.target.descriptor.width == descriptor.width and
+                cached.target.descriptor.height == descriptor.height and
+                sampledViewFormatCompatible(cached.target.format.vulkan, image_format))
+            {
+                return index;
+            }
+        }
+        return null;
+    }
+
     fn stageResidentRenderTarget(
         self: *Renderer,
         descriptor: gpu.resources.ImageDescriptor,
         sampler_descriptor: gpu.resources.SamplerDescriptor,
         image_format: u32,
         descriptor_index: u32,
+        dimension: rdna2.spirv.SampledImageDimension,
     ) anyerror!?PreparedSampledImage {
-        for (self.render_targets.items, 0..) |cached, index| {
-            if (!cached.initialized or
-                cached.target.descriptor.address != descriptor.address or
-                cached.target.descriptor.width != descriptor.width or
-                cached.target.descriptor.height != descriptor.height or
-                !sampledViewFormatCompatible(cached.target.format.vulkan, image_format))
-            {
-                continue;
-            }
-            try self.transitionRenderTargetToShaderRead(index);
-            const components = try sampledImageComponents(descriptor.dst_select);
-            const view_info = vk.ImageViewCreateInfo{
-                .image = cached.image.handle,
-                .format = image_format,
-                .components = components,
-                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-            };
-            var view: vk.ImageView = 0;
-            if (self.device_functions.create_image_view(self.device, &view_info, null, &view) != vk.success) {
-                return Error.ImageViewCreationFailed;
-            }
-            errdefer self.device_functions.destroy_image_view(self.device, view, null);
-            const sampler = try self.createGuestSampler(sampler_descriptor);
-            errdefer self.device_functions.destroy_sampler(self.device, sampler, null);
-            self.updateSampledImageDescriptor(descriptor_index, view, sampler, .two_d);
-            return .{
-                .image = cached.image,
-                .view = view,
-                .sampler = sampler,
-                .owns_view = true,
-                .owns_sampler = true,
-            };
+        const index = self.findResidentRenderTargetIndex(descriptor, image_format) orelse return null;
+        const cached = self.render_targets.items[index];
+        try self.transitionRenderTargetToShaderRead(index);
+        const components = try sampledImageComponents(descriptor.dst_select);
+        const view_info = vk.ImageViewCreateInfo{
+            .image = cached.image.handle,
+            .view_type = if (dimension == .two_d_array) vk.image_view_type_2d_array else vk.image_view_type_2d,
+            .format = image_format,
+            .components = components,
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        var view: vk.ImageView = 0;
+        if (self.device_functions.create_image_view(self.device, &view_info, null, &view) != vk.success) {
+            return Error.ImageViewCreationFailed;
         }
-        return null;
+        errdefer self.device_functions.destroy_image_view(self.device, view, null);
+        const sampler = try self.createGuestSampler(sampler_descriptor);
+        errdefer self.device_functions.destroy_sampler(self.device, sampler, null);
+        self.updateSampledImageDescriptor(descriptor_index, view, sampler, dimension);
+        if (!self.reported_resident_rt_sample) {
+            self.reported_resident_rt_sample = true;
+            std.debug.print(
+                "[vulkan dcb] resident render-target sample @0x{x} {d}x{d} fmt={d} -> gpu @0x{x} {d}x{d}\n",
+                .{
+                    descriptor.address,
+                    descriptor.width,
+                    descriptor.height,
+                    descriptor.unified_format,
+                    cached.target.descriptor.address,
+                    cached.target.descriptor.width,
+                    cached.target.descriptor.height,
+                },
+            );
+        }
+        return .{
+            .image = cached.image,
+            .view = view,
+            .sampler = sampler,
+            .owns_view = true,
+            .owns_sampler = true,
+        };
     }
 
     fn transitionDepthTargetToShaderRead(self: *Renderer, index: usize) anyerror!void {
@@ -7580,7 +7482,7 @@ pub const Renderer = struct {
             (render_state.depth_control.test_enabled or
                 render_state.depth_control.write_enabled or
                 render_state.depth_control.clear_enabled);
-        const depth_plane: ?GuestDepthTarget = if (depth_wanted)
+        var depth_plane: ?GuestDepthTarget = if (depth_wanted)
             if (render_state.depth_target) |bound| guestDepthTarget(bound) else null
         else
             null;
@@ -7614,6 +7516,22 @@ pub const Renderer = struct {
         }
         const target = try guestColorTarget(guest_descriptor);
         const descriptor = target.descriptor;
+        if (depth_plane) |plane| {
+            // Vulkan framebuffers cannot be wider or taller than any of their
+            // attachments. Guest command streams commonly leave a tiny stale
+            // DB allocation bound across fullscreen colour/UI passes; pairing
+            // that allocation with the new colour target is invalid and can
+            // surface as VK_ERROR_DEVICE_LOST during the draw.
+            if (plane.width < descriptor.width or plane.height < descriptor.height) {
+                if (log_verbose_gpu or self.traceCurrentGraphicsFrame()) {
+                    std.debug.print(
+                        "[vulkan dcb] ignoring undersized depth attachment @0x{x} {d}x{d} for color {d}x{d}\n",
+                        .{ plane.address, plane.width, plane.height, descriptor.width, descriptor.height },
+                    );
+                }
+                depth_plane = null;
+            }
+        }
         // The persistent target path resolves uniform DCC and CMASK-only
         // clear/expanded blocks during its initial upload. FMASK and other
         // compressed states still fall back to raw tiles rather than blocking
@@ -8284,6 +8202,9 @@ pub const Renderer = struct {
         };
         self.frame_profile.shader_translate_ns +|= elapsedHostNanoseconds(fragment_translate_started);
         defer fragment_module.deinit(self.allocator);
+        if (self.dump_graphics_spirv) {
+            dumpGraphicsSpirv(self.allocator, "ps", fragment_address, fragment_module.words);
+        }
         if (self.traceCurrentGraphicsFrame() and fragment_module.used_control_flow_fallback) {
             std.debug.print("[vulkan dcb] traced fragment program 0x{x} uses linear control-flow fallback\n", .{fragment_address});
         }
@@ -8348,6 +8269,9 @@ pub const Renderer = struct {
                 self.frame_profile.shader_translate_ns +|= elapsedHostNanoseconds(vertex_translate_started);
                 var vertex_module = vertex_module_owned;
                 defer vertex_module.deinit(self.allocator);
+                if (self.dump_graphics_spirv) {
+                    dumpGraphicsSpirv(self.allocator, "vs", vertex_address, vertex_module.words);
+                }
                 if (self.traceCurrentGraphicsFrame() and vertex_module.used_control_flow_fallback) {
                     std.debug.print("[vulkan dcb] traced vertex program 0x{x} uses linear control-flow fallback\n", .{vertex_address});
                 }
@@ -10014,6 +9938,21 @@ pub const Renderer = struct {
         )) |resident| {
             return resident;
         }
+        // Bind a colour target that is already on the GPU before any guest
+        // layout or memory check. The sampled descriptor often disagrees with
+        // the draw-time size or format, and the allocation itself is not in
+        // CPU-visible memory — both used to fall through to a failed readback.
+        if (dimension == .two_d or dimension == .two_d_array) {
+            if (try self.stageResidentRenderTarget(
+                descriptor,
+                sampler_descriptor,
+                image_format,
+                descriptor_index,
+                dimension,
+            )) |resident| {
+                return resident;
+            }
+        }
         // Compressed metadata is not decoded yet. In particular, it must never
         // be interpreted as color pixels: DCC/CMASK are control data, not an
         // alternate image payload.
@@ -10052,16 +9991,6 @@ pub const Renderer = struct {
                 .{ layout.depthOrLayers(), layout.bytesPerElement(), bytes_per_texel, staging_bytes_u64, layout.requiredSourceBytes() },
             );
             return Error.UnsupportedSampledImage;
-        }
-        if (dimension == .two_d and descriptor.image_type == .color_2d) {
-            if (try self.stageResidentRenderTarget(
-                descriptor,
-                sampler_descriptor,
-                image_format,
-                descriptor_index,
-            )) |resident| {
-                return resident;
-            }
         }
         const byte_count = std.math.cast(usize, staging_bytes_u64) orelse return Error.UnsupportedSampledImage;
         const probe_span = std.math.cast(usize, layout.requiredSourceBytes()) orelse 0;
@@ -11068,7 +10997,7 @@ pub const Renderer = struct {
         row_pitch_bytes: u32,
     ) void {
         if (row_pitch_bytes != width * 4) return;
-        if (shouldDumpProgressFrame(self.flip_callbacks)) {
+        if (shouldDumpProgressFrame(self.flip_callbacks, self.capture_extended_progress_frames)) {
             var path_buffer: [64]u8 = undefined;
             const path: ?[:0]u8 = std.fmt.bufPrintZ(
                 &path_buffer,
@@ -11265,7 +11194,9 @@ pub const Renderer = struct {
         // Persist newly compiled driver pipelines at the first real frame.
         // Guest shutdown is not guaranteed to unwind through Renderer.deinit,
         // so saving only there made every diagnostic relaunch compile again.
-        defer if (self.flip_callbacks == 2) savePipelineCacheBytes(self);
+        defer if (self.flip_callbacks == 2 or
+            (self.flip_callbacks >= 64 and self.flip_callbacks % 128 == 0))
+            savePipelineCacheBytes(self);
         // Content probes only hold within the frame they were taken in.
         defer self.texture_probe_count = 0;
         if (log_verbose_gpu) std.debug.print(
@@ -11331,7 +11262,7 @@ pub const Renderer = struct {
             // actually presented, not stale guest memory.
             if (self.window_presentation != null and
                 self.flip_callbacks > 8 and
-                !shouldDumpProgressFrame(self.flip_callbacks))
+                !shouldDumpProgressFrame(self.flip_callbacks, self.capture_extended_progress_frames))
             {
                 var direct_index: ?usize = null;
                 var direct_sequence: u64 = 0;
@@ -15678,12 +15609,14 @@ test "compute resources retain temporal scalar load specializations" {
 }
 
 test "progress dumps select bounded presentation checkpoints" {
-    try std.testing.expect(shouldDumpProgressFrame(2));
-    try std.testing.expect(shouldDumpProgressFrame(8));
-    try std.testing.expect(shouldDumpProgressFrame(64));
-    try std.testing.expect(shouldDumpProgressFrame(128));
-    try std.testing.expect(!shouldDumpProgressFrame(7));
-    try std.testing.expect(!shouldDumpProgressFrame(129));
+    try std.testing.expect(shouldDumpProgressFrame(2, false));
+    try std.testing.expect(shouldDumpProgressFrame(8, false));
+    try std.testing.expect(shouldDumpProgressFrame(64, false));
+    try std.testing.expect(shouldDumpProgressFrame(128, false));
+    try std.testing.expect(!shouldDumpProgressFrame(7, false));
+    try std.testing.expect(!shouldDumpProgressFrame(129, false));
+    try std.testing.expect(!shouldDumpProgressFrame(512, false));
+    try std.testing.expect(shouldDumpProgressFrame(512, true));
 }
 
 test "RGBA occupancy preserves black alpha and destination alpha is explicit" {

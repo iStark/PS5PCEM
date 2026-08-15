@@ -20,12 +20,37 @@ const error_device_not_connected: i32 = @bitCast(@as(u32, 0x8092_0007));
 const primary_handle: i32 = 1;
 /// SCE_PAD_BUTTON_CROSS — used for auto-confirm during headless bring-up.
 const button_cross: u32 = 0x4000;
+/// SCE_PAD_BUTTON_TRIANGLE — some confirmation prompts require a hold, not a tap.
+const button_triangle: u32 = 0x1000;
 /// Press Cross so splash/attract loops that wait for confirmation can advance
 /// without a physical controller. Options is deliberately not synthesized:
 /// once a title reaches interactive rendering it commonly means pause or opens
 /// a settings page, and a single pulse can leave an unattended run parked.
 const auto_cross_period_us: u64 = 1_000_000;
 const auto_cross_hold_us: u64 = 250_000;
+const delayed_cross_period_us: u64 = 4_000_000;
+const delayed_cross_hold_us: u64 = 2_000_000;
+/// After the world has loaded, frames last many seconds. A 2 s pulse is
+/// shorter than one frame and never produces a rising edge on the
+/// post-load "press Cross" prompt.
+const auto_cross_late_start_us: u64 = auto_triangle_start_us + auto_triangle_hold_us;
+const auto_cross_late_period_us: u64 = 35 * std.time.us_per_s;
+const auto_cross_late_hold_us: u64 = 25 * std.time.us_per_s;
+/// Leave the pad idle until the title's START prompt is up. A button that is
+/// already held when the prompt appears never produces the rising edge Unity
+/// menus wait for.
+const auto_cross_start_us: u64 = 40 * std.time.us_per_s;
+/// After the initial confirmations, hold Triangle for menus that require it.
+const auto_triangle_start_us: u64 = 90 * std.time.us_per_s;
+const auto_triangle_hold_us: u64 = 180 * std.time.us_per_s;
+var auto_input_origin_us: std.atomic.Value(u64) = .init(0);
+
+pub const AutomaticProfile = enum(u8) {
+    default,
+    delayed_triangle_hold,
+};
+
+var automatic_profile: std.atomic.Value(u8) = .init(@intFromEnum(AutomaticProfile.default));
 
 const PadData = extern struct {
     buttons: u32 = 0,
@@ -83,7 +108,30 @@ pub fn reset() void {
     initialized.store(0, .release);
     open.store(0, .release);
     motion_sensor_enabled.store(0, .release);
+    auto_input_origin_us.store(0, .release);
+    automatic_profile.store(@intFromEnum(AutomaticProfile.default), .release);
     host_input.reset();
+}
+
+pub fn setAutomaticProfile(profile: AutomaticProfile) void {
+    automatic_profile.store(@intFromEnum(profile), .release);
+    auto_input_origin_us.store(0, .release);
+}
+
+fn autoInputElapsedUs() u64 {
+    const now_ns = kernel_runtime.realTimeNanoseconds();
+    const now_us: u64 = if (now_ns > 0)
+        @intCast(@divTrunc(now_ns, std.time.ns_per_us))
+    else
+        kernel_runtime.processTimeMicroseconds();
+    const origin = auto_input_origin_us.load(.monotonic);
+    if (origin == 0) {
+        if (auto_input_origin_us.cmpxchgStrong(0, now_us, .monotonic, .monotonic) == null) {
+            return 0;
+        }
+        return now_us -| auto_input_origin_us.load(.monotonic);
+    }
+    return now_us -| origin;
 }
 
 fn validHandle(handle: i32) bool {
@@ -140,12 +188,31 @@ fn fillPadData(output: *PadData) void {
     // Direct CLI runs retain the automatic bring-up pulse. The launcher always
     // selects an explicit mode, so physical input is never mixed with it.
     if (host_input.mode() != .automatic) return;
-    const now_us = kernel_runtime.processTimeMicroseconds();
-    if (now_us > 500_000) {
-        const phase = now_us % auto_cross_period_us;
-        if (phase < auto_cross_hold_us) {
+    const profile: AutomaticProfile = @enumFromInt(automatic_profile.load(.acquire));
+    if (profile == .default) {
+        const now_us = kernel_runtime.processTimeMicroseconds();
+        if (now_us > 500_000) {
+            const phase = now_us % auto_cross_period_us;
+            if (phase < auto_cross_hold_us) output.buttons |= button_cross;
+        }
+        return;
+    }
+    const now_us = autoInputElapsedUs();
+    if (now_us >= auto_cross_late_start_us) {
+        const phase = (now_us - auto_cross_late_start_us) % auto_cross_late_period_us;
+        if (phase < auto_cross_late_hold_us) {
             output.buttons |= button_cross;
         }
+    } else if (now_us >= auto_cross_start_us) {
+        const phase = (now_us - auto_cross_start_us) % delayed_cross_period_us;
+        if (phase < delayed_cross_hold_us) {
+            output.buttons |= button_cross;
+        }
+    }
+    if (now_us >= auto_triangle_start_us and
+        now_us < auto_triangle_start_us + auto_triangle_hold_us)
+    {
+        output.buttons |= button_triangle;
     }
 }
 

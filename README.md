@@ -111,8 +111,14 @@ If you would like to support continued PS5PCEM development, you can do so on
   and mixes its own sound, so the audio stream was never read to its end and a
   player that waited for every stream to finish stayed active forever. A
   sampler the shader assembles in registers rather than loading, and the
-  instructions that assemble it, are the rest of what the menu needed. No
-  gameplay compatibility is claimed yet.
+  instructions that assemble it, are the rest of what the menu needed. The
+  alternate `IMAGE_SAMPLE_A` encoding now follows the same gradient-free sample
+  semantics instead of rejecting the fragment program. Fullscreen passes also
+  discard a stale undersized depth attachment before framebuffer creation; this
+  removes the NVIDIA device loss that appeared when the newly translated draw
+  first ran. A regression run completed more than 1,200 flips and reproduced
+  the illuminated gate scene without a failed submission. No gameplay
+  compatibility is claimed yet.
 - The Precinct now plays both observed intro movies with synchronized video and
   audio, leaves the movie pipeline, renders its complete 1920×1080 title scene,
   and reaches the `PLAY GAME` menu and readable `NEW GAME` confirmation. Natural
@@ -225,8 +231,9 @@ first in-engine gameplay scene.*
 *A live Jurassic Park Classic Games Collection intro frame presented from the
 title's 1920×1080 NV12 movie surface through its 3840×2160 VideoOut target. The
 legacy SceAvPlayer path, padded decoder pitch, Y/UV conversion, render-target
-selection, and Vulkan scanout all run in the observed title process; this is an
-intro milestone rather than a menu or gameplay claim.*
+selection, and Vulkan scanout all run in the observed title process. The same
+scene is now reproduced after enabling the title's alternate image-sample
+encoding and rejecting its stale 1×1 depth attachment; gameplay is not claimed.*
 
 ![Tetris Effect first guest-rendered particle frame](docs/images/tetris-effect-first-render.png)
 
@@ -248,10 +255,10 @@ the repository contains none of that content.
 | **Pistol Whip** | Maps the native PS VR2 plugin and Burst module, then starts loading Unity asset archives | Headset, tracking, controller, and host OpenXR support are intentionally deferred |
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
 | **Tetris Effect: Connected** | Completes the Unreal bootstrap and a measured startup frame with 595 guest draws and 63 compute dispatches, including typed 2D/3D storage images, `64×64×64 RGBA16_FLOAT` volumes, layered post-process targets, `RGBA32_FLOAT` exposure surfaces, a `10_10_10_2_UNORM` lookup target, and the mixed image/LDS prepass. Ordered AGC completion acknowledgement removes the intermittent retirement race, and the latest unattended run advanced through 49 VideoOut cycles. Most post-bootstrap cycles measured about 3.3–3.8 seconds on the current RTX 3070 Ti host. The first generated `0xe060`-byte material pixel shader is now decoded within its exact AGC allocation instead of the old fixed instruction ceiling | The latest verified visible output is still the recognizable 1920×1080 HDR particle target shown above. The exact registered 3840×2160 VideoOut target remains black, so presentation falls back to a converted `R11G11B10_FLOAT` intermediate. NGG/fetch-shader continuations, exact layered rendering, final scanout aliasing/tonemapping, one oversized guest-buffer descriptor, and performance remain incomplete; neither a menu nor gameplay is claimed |
-| **The Precinct** | Links the complete six-image guest graph, starts Unity plug-ins through `sceKernelLoadStartModule`, indexes its audio assets, and plays both observed intro movies as synchronized 3840×2160 NV12 video and 48 kHz stereo PCM. It renders the complete 1920×1080 title artwork, opens `PLAY GAME`, and displays the readable `NEW GAME` confirmation shown above. Holding `Triangle` now enters the cold world load; the transition eventually reaches the `Cross` prompt and produces the first verified in-engine gameplay image. Target-thread exception delivery completes Unity's stop-the-world handshake, resident typed storage images preserve its compute graph, and dynamic compute scalars prevent runtime SGPR values from generating a new Vulkan pipeline every frame. Its world-load frame measures 2.1 s where it measured 5.1 s, after descriptor recovery stopped replaying each kernel's prolog once per resource it names | The first world transition still takes several minutes on the current RTX 3070 Ti test host because first-use shader translation, NVIDIA pipeline compilation, synchronous submission, and resource staging remain expensive. An exact NVIDIA compiler guard substitutes the observed deformation output and suppresses one transient graphics pipeline after the failing compute signature; broad gameplay, input, and visual correctness are not yet claimed |
+| **The Precinct** | Links the complete six-image guest graph, starts Unity plug-ins through `sceKernelLoadStartModule`, indexes its audio assets, and plays both observed intro movies as synchronized 3840×2160 NV12 video and 48 kHz stereo PCM. It renders the complete 1920×1080 title artwork, opens `PLAY GAME`, and displays the readable `NEW GAME` confirmation shown above. Holding `Triangle` enters the cold world load; an earlier guarded run reached the `Cross` prompt and produced the first verified in-engine gameplay image. Target-thread exception delivery completes Unity's stop-the-world handshake, resident typed storage images preserve its compute graph, and dynamic compute scalars prevent runtime SGPR values from generating a new Vulkan pipeline every frame. Its world-load frame measures 2.1 s where it measured 5.1 s, after descriptor recovery stopped replaying each kernel's prolog once per resource it names | The first world transition still takes several minutes on the current RTX 3070 Ti test host because first-use shader translation, NVIDIA pipeline compilation, synchronous submission, and resource staging remain expensive. The former title- and shader-signature-specific NVIDIA compiler guard has been removed in favor of the general shader path, so the transition needs a fresh end-to-end validation before current gameplay compatibility is claimed |
 | **Jets 'n' Guns 2** | Resolves title content through `/app0`, completes AGC resource registration, and sustains the full graphics/compute/VideoOut loop. Targetless final passes are preserved through flip, while dynamic SGPR data and descriptor-sized buffer bounds keep streamed sprite batches on stable Vulkan pipelines. `START GAME` now passes the loading screen and reaches the recognizable 3840×2160 tutorial gameplay shown above; the unattended run remained live beyond flip 300. Firmware-default mutex compatibility preserves the CRT's recursive `trylock` guard without leaking recursion into the audio workers' blocking slow path | The cold transition into the first dense gameplay scene still takes roughly 30–40 seconds on the current RTX 3070 Ti host. Once loaded, observed 227–256-draw frames take about 0.6–1.6 seconds, dominated by synchronous Vulkan submission, resource staging, and first-use work; broad input and in-game audio compatibility still need longer validation |
 | **Asterix & Obelix: Slap Them All!** | Maps the Unity/PSN plug-in graph, passes GameUpdate, trophy, entitlement, WebApi, and player-review bootstrap calls, accepts four-byte-aligned AGC shader headers, and reaches repeated 1920×1080 frames. SceAvPlayer returns the ATL intro as correctly decoded NV12 frames, while matched image-copy, planar-conversion, fullscreen-blit, and color-resolve paths keep the observed movie pipeline moving without its former multi-second shader compilation/dispatch blockers | The decoded source is recognizable, but final compositor scaling/presentation still needs validation and no repeatable menu or gameplay frame is claimed yet |
-| **Jurassic Park Classic Games Collection** | Resolves the observed firmware graph, enters Unity, opens the splash and intro MP4 assets through both SceAvPlayer ABIs, and presents the recognizable Jurassic gate intro shown above through the title's 3840×2160 VideoOut buffers. The matched NV12 path accepts UV/Y descriptor order, derives the 2048-byte decoder pitch from the plane layout, performs the observed 2× conversion, and rejects cleared all-zero surfaces during clip changes. It now leaves the intro as well: the splash and intro clips play in sequence with sound, and the title reaches its menu and holds it, measuring 25–38 ms per frame on the current test host | Gameplay is not claimed. One fragment program stays untranslated on purpose, because translating it loses the Vulkan device; the control-flow lowering it depends on is the open question |
+| **Jurassic Park Classic Games Collection** | Resolves the observed firmware graph, enters Unity, opens the splash and intro MP4 assets through both SceAvPlayer ABIs, and presents the recognizable Jurassic gate intro shown above through the title's 3840×2160 VideoOut buffers. The matched NV12 path accepts UV/Y descriptor order, derives the 2048-byte decoder pitch from the plane layout, performs the observed 2× conversion, and rejects cleared all-zero surfaces during clip changes. It leaves the intro as well: the splash and intro clips play in sequence with sound, and the title reaches its menu and holds it at interactive rates. The alternate `IMAGE_SAMPLE_A` fragment encoding now translates and executes; a general attachment-extent check prevents stale 1×1 depth state from invalidating the 3840×2160 framebuffer. The latest regression run remained submission-clean beyond flip 1,200 and reproduced the illuminated gate scene | Gameplay is not claimed. Remaining shader operations, broader menu interaction, and a longer play-session regression still need validation |
 | **Mighty Morphin Power Rangers: Rita's Rewind** | Resolves the observed Fiber, Pad, offline NP, AGC 1.1, and AGC driver imports, enters a stable 1920×1080 graphics/audio loop, and renders the animated publisher sequence, title menu, and post-menu scene shown above. Native cooperative fibers retain suspended guest stacks, `scePadGetHandle` supplies a readable primary controller, and exact `V_SAD_U32`, `V_MUL_HI_I32`, and `V_CVT_FLR_I32_F32` lowering removes the diagnostic shader fallback. Holding `Cross` advances through the title prompt, and the observed intro remains smooth at roughly 13–20 ms per frame on the current RTX 3070 Ti host | The exact guest CRT composite still produces static on the current host, so a strict shader-signature fallback performs the observed 4× RGBA8 scene scale before downstream post-processing. Dense post-menu frames can contain roughly 255 draws and currently take about 470 ms, dominated by repeated guest-buffer staging; broad gameplay and input compatibility are not claimed yet |
 
 ## Components
@@ -595,7 +602,10 @@ local invocation index rather than a compute-only builtin. The current MIMG
 path lowers normalized 2D/3D/cube `image_sample`, explicit LOD and bias,
 level-zero samples with packed offsets, and the observed four-result
 `image_gather4` form through dimension-specific combined sampled-image
-descriptor arrays. Vertex and fragment `image_load` use an explicit-LOD texel
+descriptor arrays. The alternate opcodes 0x80 above the gradient forms retain
+the same operand layout; in particular `IMAGE_SAMPLE_A` is accepted as the
+gradient-free `IMAGE_SAMPLE` alias used by Jurassic Park. Vertex and fragment
+`image_load` use an explicit-LOD texel
 fetch when the guest supplies integer 2D coordinates. Compute programs
 additionally support the observed `image_sample_lz` forms with explicit LOD 0,
 including NSA coordinates and per-instruction recovery of reused T#/S# SGPRs.
@@ -945,17 +955,10 @@ The remaining stages are:
    remaining half.
 4. Extend the current structured natural-loop and terminal-selection lowering
    to irreducible control flow, complete VCC/EXEC divergence, and cover the
-   remaining explicit-LOD operands and image operations seen in captures. One
-   observed program measures how far this has to go. The sampling opcodes
-   repeat 0x80 higher for half-precision gradients, and for the gradient-free
-   forms both encodings name one operation over one operand list, which a
-   Jurassic Park fragment program relies on. Accepting the higher encoding
-   lets that program translate, and running it loses the Vulkan device
-   reproducibly. The sample is not the cause — replacing it with a constant
-   loses the device just the same — and the guest code holds no loop at all,
-   only forward branches, which points at what the lowering makes of them.
-   Until that is answered the higher encoding stays rejected, because
-   accepting it costs the title its menu.
+   remaining explicit-LOD operands and image operations seen in captures. The
+   alternate gradient-free image-sample encoding is now accepted; its former
+   Jurassic Park device loss was an invalid framebuffer pairing caused by a
+   stale undersized depth attachment, not shader control flow.
 5. Continue reducing first-use texture work and the per-draw submission cost,
    and validate state and resource invalidation against longer title captures.
 
@@ -985,7 +988,7 @@ memory-type selection, one descriptor layout with 64 storage buffers, separate
 64-entry 2D and 3D combined sampled-image arrays, typed storage images, and a persistently mapped dynamic
 scalar buffer, its pool, persistent guest render targets, and
 image/view/sampler/render-pass/framebuffer creation. It also owns bounded
-LRU compute and graphics-pipeline caches plus a 32-entry sampled-image LRU. The
+LRU compute and graphics-pipeline caches plus a 1,024-entry sampled-image LRU. The
 Vulkan-driver cache is persisted as
 `vulkan_pipeline_cache.bin` between runs; invalid, unreadable, or oversized
 cache data simply falls back to an empty driver cache, so it can only affect
@@ -2238,7 +2241,10 @@ scheduler and Vulkan backend. Observed startup work now includes:
   functions in the same order, so the field transfers unchanged. Depth is
   attached only when the title both binds a usable allocation and asks for the
   test, the write, or a clear; a render pass and framebuffer pair the colour and
-  depth attachments and are rebuilt only when the depth allocation changes. The
+  depth attachments and are rebuilt only when the depth allocation changes.
+  A stale depth allocation smaller than the colour target is ignored because
+  Vulkan requires every attachment to cover the framebuffer extent; this keeps
+  fullscreen colour and UI passes valid when a title leaves 1×1 DB state bound. The
   attachment is cleared on first use, because a title that enables the test
   before its own clear would otherwise compare against undefined contents.
   A later pass that samples the same allocation is bound to the resident
@@ -2274,13 +2280,12 @@ scheduler and Vulkan backend. Observed startup work now includes:
   while expanded signed, integer, normalized, half-float, array, 3D, depth, LDS,
   and GDS bindings cover the newly observed kernels. Compute SGPR values now
   arrive through a dynamic scalar buffer, so changing runtime constants reuse
-  the same SPIR-V module and Vulkan pipeline. On the current NVIDIA host, one
-  exactly matched Burst deformation kernel can fault `nvgpucomp64.dll` late in
-  the load; the bounded guard preserves its undeformed source geometry, retains
-  the module for offline `vulkan-smoke --probe-spv` diagnosis, and suppresses
-  only the immediately following transient graphics pipeline. The observed cold
-  run subsequently reaches the `Cross` prompt and renders its first in-engine
-  gameplay image, although the transition is still measured in minutes.
+  the same SPIR-V module and Vulkan pipeline. An earlier bounded workaround for
+  one NVIDIA compiler failure produced the first in-engine gameplay capture,
+  but that title- and shader-signature-specific guard is no longer part of the
+  general path. A fresh unguarded cold run is therefore required before the
+  gameplay milestone is considered current; the transition remains measured in
+  minutes.
 - Asterix & Obelix exercises the corresponding 1920×1080 Unity movie path.
   Exact shader-shape matching handles its full-surface compute copies and
   indexed fullscreen sample blits without compiling large general pipelines;

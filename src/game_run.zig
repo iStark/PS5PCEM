@@ -306,6 +306,18 @@ fn run(init: std.process.Init) !bool {
     runtime.firmware.filesystem.attach(io, content);
     defer runtime.firmware.filesystem.detach();
 
+    // Keep unattended input generic and explicitly selectable. A delayed hold
+    // is useful for menus that require a sustained Triangle press, but silently
+    // choosing it from a product ID would make controller behaviour title code.
+    const automatic_triangle_hold = init.minimal.environ.containsUnempty(
+        allocator,
+        "PS5_AUTO_HOLD_TRIANGLE",
+    ) catch false;
+    runtime.firmware.libs.pad.setAutomaticProfile(if (automatic_triangle_hold)
+        .delayed_triangle_hold
+    else
+        .default);
+
     var saves = openSaveDataHome(io, content) catch null;
     defer if (saves) |*directory| directory.close(io);
     defer runtime.firmware.filesystem.unmountSaveData();
@@ -399,6 +411,11 @@ fn run(init: std.process.Init) !bool {
     const translate_compute_only = init.minimal.environ.containsUnempty(allocator, "PS5_COMPUTE_TRANSLATE_ONLY") catch false;
     const prefer_integrated_gpu = init.minimal.environ.containsUnempty(allocator, "PS5_VULKAN_PREFER_INTEGRATED") catch false;
     const dump_compute_spirv = init.minimal.environ.containsUnempty(allocator, "PS5_DUMP_COMPUTE_SPIRV") catch false;
+    const dump_graphics_spirv = init.minimal.environ.containsUnempty(allocator, "PS5_DUMP_GRAPHICS_SPIRV") catch false;
+    const capture_extended_progress_frames = init.minimal.environ.containsUnempty(
+        allocator,
+        "PS5_CAPTURE_PROGRESS_FRAMES",
+    ) catch false;
     if (builtin.os.tag == .windows and !force_headless) live_gpu: {
         host_window.init(1280, 720) catch |err| {
             try stderr.print("live Vulkan window unavailable: {s}; continuing headless\n", .{@errorName(err)});
@@ -423,6 +440,8 @@ fn run(init: std.process.Init) !bool {
             .translate_compute_only = translate_compute_only,
             .prefer_integrated_gpu = prefer_integrated_gpu,
             .dump_compute_spirv = dump_compute_spirv,
+            .dump_graphics_spirv = dump_graphics_spirv,
+            .capture_extended_progress_frames = capture_extended_progress_frames,
             .native_window = .{
                 .instance = native.instance,
                 .window = native.window,

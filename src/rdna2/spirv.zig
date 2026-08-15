@@ -196,9 +196,12 @@ pub const Options = struct {
     vertex_index_vgpr: ?u8 = null,
     storage_buffers: []const StorageBufferBinding = &.{},
     /// Whether the program narrows the execution mask, and so needs to know
-    /// which lane it is running as. Decided from the program by `translate`,
-    /// because the input has to be declared before the body that reads it.
+    /// which stores are active. Decided from the program by `translate`.
     uses_execution_mask: bool = false,
+    /// Whether an instruction actually reads the current lane identity. Keep
+    /// this separate from EXEC bookkeeping: graphics shaders commonly restore
+    /// EXEC before an export, but an export does not need a subgroup input.
+    uses_lane_identity: bool = false,
     sampled_images: []const SampledImageBinding = &.{},
     storage_images: []const StorageImageBinding = &.{},
     /// Amount of per-workgroup LDS made available by COMPUTE_PGM_RSRC2. DS
@@ -792,13 +795,13 @@ const Builder = struct {
             try self.emit(&self.declarations, 32, &.{ self.storage_word_pointer_type, 12, self.bits_type });
             try self.emit(&self.declarations, 32, &.{ self.storage_block_pointer_type, 12, storage_block });
             try self.emit(&self.declarations, 59, &.{ storage_array_pointer, self.storage_array, 12 }); // OpVariable
-
-            var needs_thread_id = false;
+        }
+        {
+            var needs_thread_id = options.uses_lane_identity;
             for (options.storage_buffers) |binding| {
                 needs_thread_id = needs_thread_id or binding.add_thread_id;
             }
-            needs_thread_id = needs_thread_id or options.uses_execution_mask;
-            if (needs_thread_id) {
+            if (needs_thread_id and self.local_invocation_index == 0) {
                 const input_uint_pointer = self.id();
                 self.local_invocation_index = self.id();
                 const invocation_builtin: u32 = if (options.stage == .compute) 29 else 41;
@@ -2954,18 +2957,17 @@ const Builder = struct {
     }
 
     fn sampleImage(self: *Builder, inst: instruction.Instruction) Error!void {
-        const flags: u16 = @bitCast(inst.image_sample_flags);
-        const implicit_lod = inst.opcode_id == 0x20 and flags == 0;
-        const level_zero = inst.opcode_id == 0x27 and
-            inst.image_sample_flags.level_zero and
-            flags == (@as(u16, 1) << 5);
-        const level_zero_offset = inst.opcode_id == 0x37 and
-            inst.image_sample_flags.level_zero and inst.image_sample_flags.offset and
-            flags == ((@as(u16, 1) << 5) | (@as(u16, 1) << 4));
-        const explicit_lod = inst.opcode_id == 0x24 and
-            inst.image_sample_flags.lod and flags == (@as(u16, 1) << 0);
-        const biased_lod = inst.opcode_id == 0x25 and
-            inst.image_sample_flags.bias and flags == (@as(u16, 1) << 1);
+        // Opcode 0x20 is IMAGE_SAMPLE; 0x21/0x22/0x23 add clamp or explicit
+        // derivatives. Screen-space implicit LOD is a correct host fallback
+        // for those extra operands. 0x2f is IMAGE_SAMPLE_C_LZ: ignore the
+        // depth-compare and sample mip 0 so the shader still translates.
+        const implicit_lod = !inst.image_sample_flags.lod and
+            !inst.image_sample_flags.bias and
+            !inst.image_sample_flags.level_zero;
+        const level_zero = inst.image_sample_flags.level_zero and !inst.image_sample_flags.offset;
+        const level_zero_offset = inst.image_sample_flags.level_zero and inst.image_sample_flags.offset;
+        const explicit_lod = inst.image_sample_flags.lod;
+        const biased_lod = inst.image_sample_flags.bias;
         const requested_dimension: SampledImageDimension = switch (inst.image_dimension) {
             .dim_2d => .two_d,
             .dim_3d => .three_d,
@@ -3593,6 +3595,41 @@ const Builder = struct {
             try self.constant(.bits32, 3), // ScopeSubgroup
             source_value,
         }); // OpGroupNonUniformBroadcastFirst
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
+    fn readLane(self: *Builder, inst: instruction.Instruction) Error!void {
+        const source_value = try self.source(inst.src0, .bits32);
+        const lane = try self.source(inst.src1, .bits32);
+        const result = self.id();
+        try self.emit(&self.body, 345, &.{
+            self.bits_type,
+            result,
+            try self.constant(.bits32, 3), // ScopeSubgroup
+            source_value,
+            lane,
+        }); // OpGroupNonUniformShuffle
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
+    fn writeLane(self: *Builder, inst: instruction.Instruction) Error!void {
+        const value = try self.source(inst.src0, .bits32);
+        const lane = try self.source(inst.src1, .bits32);
+        const current = if (registerIndex(inst.dst)) |index|
+            try self.registerBits(index, 0)
+        else
+            try self.constant(.bits32, 0);
+        if (self.local_invocation_index == 0) {
+            try self.destination(inst.dst, .{ .id = value, .value_type = .bits32 });
+            return;
+        }
+        const invocation = self.id();
+        try self.emit(&self.body, 61, &.{ self.bits_type, invocation, self.local_invocation_index }); // OpLoad
+        const lane_id = try self.andBits(invocation, 63);
+        const matches = self.id();
+        try self.emit(&self.body, 170, &.{ self.bool_type, matches, lane_id, lane }); // OpIEqual
+        const result = self.id();
+        try self.emit(&self.body, 169, &.{ self.bits_type, result, matches, value, current }); // OpSelect
         try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
     }
 
@@ -4457,6 +4494,8 @@ const Builder = struct {
             .s_setpc_b64 => try self.exportNggLdsRecord(),
             .s_mov_b32, .s_movk_i32, .v_mov_b32 => try self.unary(inst, 83, .bits32), // OpCopyObject
             .v_readfirstlane_b32 => try self.readFirstLane(inst),
+            .v_readlane_b32 => try self.readLane(inst),
+            .v_writelane_b32 => try self.writeLane(inst),
             .s_mov_b64 => try self.mov64(inst),
             .s_getpc_b64 => try self.getPcFallback(inst),
             .s_not_b64 => try self.not64(inst),
@@ -5449,11 +5488,45 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     };
 }
 
+fn opcodeUsesWritePredicate(opcode: isa.Opcode) bool {
+    return switch (opcode) {
+        .buffer_store_byte,
+        .buffer_store_short,
+        .buffer_store_dword,
+        .buffer_store_dwordx2,
+        .buffer_store_dwordx3,
+        .buffer_store_dwordx4,
+        .buffer_store_format_x,
+        .buffer_store_format_xy,
+        .buffer_store_format_xyz,
+        .buffer_store_format_xyzw,
+        .ds_write_b32,
+        .ds_write2_b32,
+        .ds_write_b64,
+        .ds_write_b96,
+        .ds_write_b128,
+        .ds_write_addtid_b32,
+        .ds_append,
+        .ds_add_u32,
+        .ds_sub_u32,
+        .ds_min_i32,
+        .ds_min_u32,
+        .ds_max_i32,
+        .ds_max_u32,
+        .ds_and_b32,
+        .ds_or_b32,
+        .ds_xor_b32,
+        => true,
+        else => false,
+    };
+}
+
 /// Translates the executable ALU/SDWA subset and forward scalar selections.
 /// The writer fails explicitly for operations or control-flow shapes whose
 /// semantics are not implemented; it never emits a placeholder guest shader.
 pub fn translate(allocator: std.mem.Allocator, program: *const instruction.Program, options: Options) Error!Module {
     var effective = options;
+    var has_predicated_write = false;
     for (effective.ngg_lds_exports) |ngg_export| {
         if (effective.stage == .vertex and ngg_export.target >= 0x20 and ngg_export.target < 0x40) {
             effective.parameter_mask |= @as(u32, 1) << @intCast(ngg_export.target - 0x20);
@@ -5461,6 +5534,10 @@ pub fn translate(allocator: std.mem.Allocator, program: *const instruction.Progr
     }
     for (program.instructions.items) |candidate| {
         if (candidate.dst.kind == .exec_lo) effective.uses_execution_mask = true;
+        if (candidate.opcode == .v_writelane_b32 or candidate.opcode == .v_readlane_b32) {
+            effective.uses_lane_identity = true;
+        }
+        has_predicated_write = has_predicated_write or opcodeUsesWritePredicate(candidate.opcode);
         // Some system compute kernels use LDS while COMPUTE_PGM_RSRC2 reports
         // LDS_SIZE=0.  Hardware still exposes a small default LDS window to
         // these kernels (and they program M0 with their effective bound).
@@ -5495,6 +5572,8 @@ pub fn translate(allocator: std.mem.Allocator, program: *const instruction.Progr
             .compute => {},
         }
     }
+    effective.uses_lane_identity = effective.uses_lane_identity or
+        (effective.uses_execution_mask and has_predicated_write);
     var builder = try Builder.init(allocator, effective);
     var builder_alive = true;
     defer if (builder_alive) builder.deinit();
@@ -7888,4 +7967,58 @@ test "full destination SDWA lowers source extraction before vector ALU" {
     defer module.deinit(std.testing.allocator);
     try std.testing.expect(containsOpcode(module.words, 199)); // OpBitwiseAnd
     try std.testing.expect(containsOpcode(module.words, 129)); // OpFAdd
+}
+
+test "v_writelane_b32 selects the current lane" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .opcode = .v_writelane_b32,
+        .dst = .{ .kind = .vgpr, .reg = 0 },
+        .src0 = .{ .kind = .sgpr, .reg = 0 },
+        .src1 = .{ .kind = .sgpr, .reg = 1 },
+        .src_count = 2,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 8, .opcode = .s_endpgm });
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .local_size = .{ 64, 1, 1 },
+        .scalar_registers = &.{
+            .{ .register = 0, .value = 1 },
+            .{ .register = 1, .value = 0 },
+        },
+    });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 169)); // OpSelect
+    try std.testing.expect(containsOpcode(module.words, 170)); // OpIEqual
+}
+
+test "image_sample with derivatives lowers as implicit lod" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .family = .mimg,
+        .opcode = .image_sample,
+        .opcode_id = 0x22,
+        .dst = .{ .kind = .vgpr, .reg = 2 },
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src1 = .{ .kind = .sgpr, .reg = 0 },
+        .src2 = .{ .kind = .sgpr, .reg = 8 },
+        .src_count = 3,
+        .image_dimension = .dim_2d,
+        .image_address_components = 2,
+        .data_mask = 0xf,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 8, .opcode = .s_endpgm });
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .fragment,
+        .sampled_images = &.{
+            .{ .resource_sgpr = 0, .sampler_sgpr = 8, .descriptor_index = 0, .instruction_pc = 0, .dimension = .two_d },
+        },
+        .descriptor_array_length = 8,
+    });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 87)); // OpImageSampleImplicitLod
 }

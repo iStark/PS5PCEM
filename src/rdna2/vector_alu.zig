@@ -475,7 +475,7 @@ pub fn decodeVop3(pc: u32, code: []const u32, word_index: u32) Error!Instruction
         3
     else if (id >= 0x180 and id <= 0x1ff)
         1
-    else if (id <= 0x13f or id == 0x362 or id == 0x365 or id == 0x366)
+    else if (id <= 0x13f or id == 0x360 or id == 0x361 or id == 0x362 or id == 0x365 or id == 0x366)
         2
     else
         3;

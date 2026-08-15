@@ -20,6 +20,7 @@ const apr = @import("../apr.zig");
 const filesystem = @import("../filesystem.zig");
 const memory_api = @import("kernel_memory.zig");
 const threading = @import("kernel_threading.zig");
+const host_memory = @import("memory");
 
 const KernelError = errno.KernelError;
 
@@ -97,6 +98,16 @@ var gpo_state: std.atomic.Value(u32) = .init(0);
 const sync_address_capacity: usize = 1024;
 const sync_address_mask: usize = sync_address_capacity - 1;
 const sync_address_self_heal_us: u64 = 100 * std.time.us_per_ms;
+/// How often a parked address-wait re-reads guest memory.
+///
+/// The producer often stores a new counter and never calls the matching wake
+/// export. A 100 ms self-heal then becomes the only resume path and a frame
+/// that issues hundreds of job batches stalls for tens of seconds. A short
+/// poll notices the store directly; an explicit wake still pre-empts it.
+const sync_address_poll_us: u64 = 250;
+const sync_address_log_limit: u32 = 16;
+var sync_wait_log_count = std.atomic.Value(u32).init(0);
+var sync_wake_log_count = std.atomic.Value(u32).init(0);
 
 comptime {
     std.debug.assert(std.math.isPowerOfTwo(sync_address_capacity));
@@ -456,29 +467,129 @@ fn aprWaitCommandBuffer(identifier: u32) callconv(abi.guest) i32 {
     return 0;
 }
 
+fn looksLikeGuestSyncAddress(value: u64) bool {
+    return value >= 0x1_0000;
+}
+
+fn syncCompareBytes(size: u64) usize {
+    return switch (size) {
+        1, 2, 4, 8 => @intCast(size),
+        else => 4,
+    };
+}
+
+fn readGuestSyncWord(address: u64, size: u64) ?u64 {
+    const bytes = syncCompareBytes(size);
+    if (!memory_api.isGuestRangeAccessible(address, bytes)) return null;
+    // Firmware tests and early attach leave the guest address space unset;
+    // the accessibility check then accepts any non-null pointer. Confirm the
+    // host page is actually committed before touching it.
+    if (!host_memory.isHostRangeReadable(address, bytes)) return null;
+    var value: u64 = 0;
+    const source: [*]const u8 = @ptrFromInt(address);
+    @memcpy(std.mem.asBytes(&value)[0..bytes], source[0..bytes]);
+    return value;
+}
+
+fn syncWordMask(size: u64) u64 {
+    const bits = syncCompareBytes(size) * 8;
+    if (bits >= 64) return std.math.maxInt(u64);
+    return (@as(u64, 1) << @intCast(bits)) - 1;
+}
+
+/// Whether the guest still wants to stay parked on this address.
+///
+/// The wait export is a futex: it sleeps only while the word still holds the
+/// value the caller observed. Titles also write a new counter and omit the
+/// matching wake, so a store itself must release the waiter. `expected` is
+/// either that observed value or a pointer to it; both forms appear.
+fn syncAddressStillMatches(address: u64, expected: u64, size: u64, observed: ?u64) bool {
+    const actual = readGuestSyncWord(address, size) orelse return true;
+    if (observed) |word| {
+        if (actual != word) return false;
+    }
+    const immediate = expected & syncWordMask(size);
+    if (actual == immediate) return true;
+    if (looksLikeGuestSyncAddress(expected)) {
+        if (readGuestSyncWord(expected, size)) |wanted| return actual == wanted;
+    }
+    return false;
+}
+
+fn logSyncAddressCall(kind: []const u8, address: u64, a: u64, b: u64, c: u64, d: u64, word: ?u64) void {
+    const counter = if (kind[0] == 'w' and kind[1] == 'a')
+        &sync_wait_log_count
+    else
+        &sync_wake_log_count;
+    const seen = counter.fetchAdd(1, .monotonic);
+    if (seen >= sync_address_log_limit) return;
+    if (word) |value| {
+        std.debug.print(
+            "[sync] {s} #{d} addr=0x{x} a1=0x{x} a2=0x{x} a3=0x{x} a4=0x{x} word=0x{x}\n",
+            .{ kind, seen + 1, address, a, b, c, d, value },
+        );
+    } else {
+        std.debug.print(
+            "[sync] {s} #{d} addr=0x{x} a1=0x{x} a2=0x{x} a3=0x{x} a4=0x{x} word=<unreadable>\n",
+            .{ kind, seen + 1, address, a, b, c, d },
+        );
+    }
+}
+
 /// Parks a guest worker on an address until a matching wake is published.
 ///
 /// Unity uses this as a futex-style primitive in its job system. Returning an
 /// error makes every worker retry immediately and produces millions of firmware
-/// calls without allowing the producer thread to run. A bounded deadline is a
-/// safety net for a genuinely missed wake; callers already re-check their own
-/// condition after every successful or spurious wakeup.
+/// calls without allowing the producer thread to run. The wait is a compare
+/// against the word at `address`: if it no longer holds the observed value the
+/// caller is already satisfied. An explicit wake still releases immediately;
+/// a store to the same word is enough when the producer never calls wake.
 fn syncOnAddressWait(
-    address: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-    _: u64,
+    address_or_op: u64,
+    expected_or_address: u64,
+    value_or_size: u64,
+    size_or_timeout: u64,
+    timeout_or_flags: u64,
+    flags: u64,
 ) callconv(abi.guest) i32 {
+    const unified = !looksLikeGuestSyncAddress(address_or_op) and
+        looksLikeGuestSyncAddress(expected_or_address);
+    const address = if (unified) expected_or_address else address_or_op;
+    const expected = if (unified) value_or_size else expected_or_address;
+    const size = if (unified) size_or_timeout else value_or_size;
+    const timeout = if (unified) timeout_or_flags else size_or_timeout;
+    _ = flags;
     if (address == 0) return KernelError.einval.raw();
     announceSyncAddress("wait", address);
+    const observed = readGuestSyncWord(address, size);
+    logSyncAddressCall("wait", address, expected, size, timeout, timeout_or_flags, observed);
+    if (!syncAddressStillMatches(address, expected, size, null)) return 0;
+
+    const known_size = size == 1 or size == 2 or size == 4 or size == 8;
+    if (timeout == 0 and known_size) return 0;
+
     const generation = syncAddressGeneration(address, false);
-    _ = threading.waitCurrent(.{
-        .key = address,
-        .observed_sequence = generation,
-        .timeout_microseconds = sync_address_self_heal_us,
-    }) catch return KernelError.enosys.raw();
+    const total_us: u64 = if (timeout != 0 and timeout <= 10 * std.time.us_per_s)
+        timeout
+    else
+        sync_address_self_heal_us;
+    const started = processTimeMicroseconds();
+    const deadline = started +| total_us;
+    while (syncAddressStillMatches(address, expected, size, observed)) {
+        const now = processTimeMicroseconds();
+        const remaining = deadline -| now;
+        if (remaining == 0) break;
+        const slice = @min(remaining, sync_address_poll_us);
+        const wait_result = threading.waitCurrent(.{
+            .key = address,
+            .observed_sequence = generation,
+            .timeout_microseconds = slice,
+        }) catch return KernelError.enosys.raw();
+        if (wait_result == .awoken) break;
+        // A frozen process clock (tests, or a wait that consumed the whole
+        // remaining budget) must not spin forever on the same deadline.
+        if (slice >= remaining or processTimeMicroseconds() <= now) break;
+    }
     return 0;
 }
 
@@ -491,19 +602,24 @@ pub fn wakeSyncAddress(address: u64, maximum_waiters: usize) void {
 
 /// Releases workers parked by `syncOnAddressWait` on the same address.
 fn syncOnAddressWake(
-    address: u64,
-    requested_waiters: u64,
-    _: u64,
+    address_or_op: u64,
+    count_or_address: u64,
+    count_or_unused: u64,
     _: u64,
     _: u64,
     _: u64,
 ) callconv(abi.guest) i32 {
+    const unified = !looksLikeGuestSyncAddress(address_or_op) and
+        looksLikeGuestSyncAddress(count_or_address);
+    const address = if (unified) count_or_address else address_or_op;
+    const requested_waiters = if (unified) count_or_unused else count_or_address;
     if (address == 0) return KernelError.einval.raw();
     const maximum_waiters: usize = if (requested_waiters == 0 or
         requested_waiters >= std.math.maxInt(u32))
         std.math.maxInt(usize)
     else
         @intCast(requested_waiters);
+    logSyncAddressCall("wake", address, requested_waiters, count_or_unused, 0, 0, readGuestSyncWord(address, 4));
     wakeSyncAddress(address, maximum_waiters);
     return 0;
 }
@@ -2124,7 +2240,7 @@ test "address waits park by generation and matching wakes advance it" {
     try testing.expectEqual(@as(i32, 0), syncOnAddressWait(address, 0, 0, 0, 0, 0));
     try testing.expectEqual(address, backend.wait_request.?.key);
     try testing.expectEqual(@as(u64, 1), backend.wait_request.?.observed_sequence);
-    try testing.expectEqual(sync_address_self_heal_us, backend.wait_request.?.timeout_microseconds.?);
+    try testing.expectEqual(sync_address_poll_us, backend.wait_request.?.timeout_microseconds.?);
 
     try testing.expectEqual(@as(i32, 0), syncOnAddressWake(address, 1, 0, 0, 0, 0));
     try testing.expectEqual(address, backend.wake_key);
@@ -2135,6 +2251,34 @@ test "address waits park by generation and matching wakes advance it" {
     try testing.expectEqual(@as(u64, 2), backend.wait_request.?.observed_sequence);
     try testing.expectEqual(@as(i32, 0), syncOnAddressWake(address, 0, 0, 0, 0, 0));
     try testing.expectEqual(std.math.maxInt(usize), backend.wake_count);
+}
+
+test "address wait returns immediately when the guest word already changed" {
+    const testing = std.testing;
+    const memory = @import("memory");
+    const loader = @import("loader");
+
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    var tls_registry = loader.TlsRegistry{};
+    defer tls_registry.deinit(testing.allocator);
+    var thread_manager = threading.Manager{};
+    thread_manager.init(testing.allocator, &address_space, &tls_registry);
+    defer thread_manager.deinit();
+    var backend = SyncAddressTestBackend{};
+    thread_manager.setBackend(backend.backend());
+    threading.attachManager(&thread_manager);
+    defer threading.attachManager(null);
+    resetSyncAddresses();
+
+    var word: u32 = 7;
+    const address: u64 = @intFromPtr(&word);
+    try testing.expectEqual(@as(i32, 0), syncOnAddressWait(address, 3, 4, 1_000_000, 0, 0));
+    try testing.expect(backend.wait_request == null);
+
+    word = 3;
+    try testing.expectEqual(@as(i32, 0), syncOnAddressWait(address, 3, 4, 0, 0, 0));
+    try testing.expect(backend.wait_request == null);
 }
 
 test "kernel event flags and semaphores retain and consume their state" {
