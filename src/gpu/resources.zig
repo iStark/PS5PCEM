@@ -360,6 +360,9 @@ pub const RasterState = struct {
     depth_bias_front: bool = false,
     depth_bias_back: bool = false,
     rasterizer_discard: bool = false,
+    /// PA_CL_CLIP_CNTL.DX_CLIP_SPACE_DEF selects a Z clip range of 0..W.
+    /// With the bit clear, guest positions use the OpenGL-style -W..W range.
+    zero_to_one_depth: bool = false,
 };
 
 pub const BlendControl = struct {
@@ -686,6 +689,7 @@ pub fn decodeRasterState(state: *const gpu_state.State) RasterState {
         .depth_bias_front = mode & (1 << 11) != 0,
         .depth_bias_back = mode & (1 << 12) != 0,
         .rasterizer_discard = clip & (1 << 22) != 0,
+        .zero_to_one_depth = clip & (1 << 19) != 0,
     };
 }
 
@@ -981,7 +985,7 @@ test "render state decodes PS5 color and depth target extensions" {
     }
     try state.writeRegister(.context, 0x1e0, 4 | (5 << 8) | (1 << 30));
     try state.writeRegister(.context, 0x202, (1 << 4) | (0xcc << 16));
-    try state.writeRegister(.context, 0x204, 0);
+    try state.writeRegister(.context, 0x204, 1 << 19);
     try state.writeRegister(.context, 0x205, 2 | 4);
 
     const depth_address: u64 = 0x0012_3456_7800;
@@ -1031,6 +1035,7 @@ test "render state decodes PS5 color and depth target extensions" {
     try testing.expectEqual(@as(u16, 1060), render.scissor.?.bottom);
     try testing.expect(render.raster.cull_back);
     try testing.expect(render.raster.clockwise_front_face);
+    try testing.expect(render.raster.zero_to_one_depth);
     try testing.expect(render.blends[0].enabled);
     try testing.expectEqual(@as(u5, 4), render.blends[0].color_source);
     try testing.expectEqual(@as(u5, 5), render.blends[0].color_destination);

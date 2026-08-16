@@ -194,6 +194,9 @@ pub const Options = struct {
     /// shader starts. Other graphics system values remain explicit future
     /// stage-interface work rather than silently receiving zero.
     vertex_index_vgpr: ?u8 = null,
+    /// Converts a guest -W..W position export to Vulkan's 0..W clip-depth
+    /// convention. Leave clear when PA_CL_CLIP_CNTL selects DX clip space.
+    convert_negative_one_to_one_depth: bool = false,
     storage_buffers: []const StorageBufferBinding = &.{},
     /// Whether the program narrows the execution mask, and so needs to know
     /// which stores are active. Decided from the program by `translate`.
@@ -492,6 +495,7 @@ const Builder = struct {
     label: u32,
     stage: Stage,
     vertex_index_vgpr: ?u8,
+    convert_negative_one_to_one_depth: bool,
     vertex_index_input: u32 = 0,
     instance_index_input: u32 = 0,
     position_output: u32 = 0,
@@ -578,6 +582,7 @@ const Builder = struct {
             .label = 0,
             .stage = options.stage,
             .vertex_index_vgpr = options.vertex_index_vgpr,
+            .convert_negative_one_to_one_depth = options.convert_negative_one_to_one_depth,
             .storage_bindings = options.storage_buffers,
             .sampled_bindings = options.sampled_images,
             .storage_image_bindings = options.storage_images,
@@ -2550,8 +2555,24 @@ const Builder = struct {
             try self.emit(&self.body, 169, &.{ self.float_type, w_fixed, w_is_zero, one, w }); // OpSelect
             out_w = w_fixed;
         }
+        var out_z = z;
+        if (is_position and self.convert_negative_one_to_one_depth) {
+            // Vulkan clips Z to 0..W. The guest's OpenGL-style convention
+            // clips to -W..W, so preserve its NDC depth with
+            // z_vk = 0.5 * (z_guest + w).
+            const sum = self.id();
+            try self.emit(&self.body, 129, &.{ self.float_type, sum, z, out_w }); // OpFAdd
+            const converted = self.id();
+            try self.emit(&self.body, 133, &.{
+                self.float_type,
+                converted,
+                sum,
+                try self.constant(.float32, @bitCast(@as(f32, 0.5))),
+            }); // OpFMul
+            out_z = converted;
+        }
         const vector = self.id();
-        try self.emit(&self.body, 80, &.{ self.vector4_type, vector, x, y, z, out_w }); // OpCompositeConstruct
+        try self.emit(&self.body, 80, &.{ self.vector4_type, vector, x, y, out_z, out_w }); // OpCompositeConstruct
         try self.emit(&self.body, 62, &.{ output, vector }); // OpStore
     }
 
@@ -6247,6 +6268,15 @@ test "vertex system value and position export lower to a stage interface" {
     try std.testing.expect(containsOpcode(module.words, 112)); // OpConvertUToF
     try std.testing.expect(containsOpcode(module.words, 80)); // OpCompositeConstruct
     try std.testing.expect(containsOpcode(module.words, 62)); // OpStore Position
+
+    var converted = try translate(std.testing.allocator, &program, .{
+        .stage = .vertex,
+        .vertex_index_vgpr = 0,
+        .convert_negative_one_to_one_depth = true,
+    });
+    defer converted.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(converted.words, 129)); // OpFAdd z + w
+    try std.testing.expect(containsOpcode(converted.words, 133)); // OpFMul by 0.5
 }
 
 test "merged NGG vertex prolog reaches its position export" {

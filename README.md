@@ -818,6 +818,10 @@ to it.
 The same snapshot now decodes viewport transforms, viewport/screen scissor
 intersection, cull/front-face/polygon state, per-target blend controls and color
 control, so a renderer does not need to interpret raw context-register offsets.
+It also reads which depth-clip convention the title selected, because the two
+conventions disagree about what a position means rather than about how it is
+drawn: a guest clipping Z to `-W..W` places the near plane where Vulkan, which
+clips to `0..W`, places the middle of the scene.
 Snapshots allocate nothing and do not duplicate mutable GPU state: partial PM4
 writes remain in the register banks and are interpreted only when work consumes
 them.
@@ -2152,6 +2156,13 @@ scheduler and Vulkan backend. Observed startup work now includes:
   resource probes remain opt-in through `log_verbose_gpu`. A second profile line
   reports pipeline and shader-analysis cache behaviour alongside the time spent
   in scalar provenance, SPIR-V translation, and sampled-resource preparation.
+- A vertex program that assumes the `-W..W` depth range keeps its geometry.
+  Vulkan clips Z to `0..W`, so a position exported for the other convention has
+  everything in front of the halfway point clipped away and everything behind it
+  compressed — the near half of a scene simply missing rather than misplaced.
+  The clip-space selector in `PA_CL_CLIP_CNTL` says which convention a title
+  chose, and a program that chose the wider one now has its exported depth
+  mapped into Vulkan's range instead of being taken literally.
 - A kernel no longer pays for its own prolog once per resource it names. A
   descriptor is recovered by replaying the scalar program up to the instruction
   that uses it, and replaying it from guest memory re-read and re-decoded every

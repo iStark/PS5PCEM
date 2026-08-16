@@ -8241,7 +8241,6 @@ pub const Renderer = struct {
             module.words
         else
             fragment_module.words;
-
         // Procedural draws deliberately have no V# mappings: fullscreen NGG
         // programs synthesize their rectangle from the system vertex index.
         // Attempt every guest VS unless the paired pixel shader explicitly
@@ -8255,6 +8254,7 @@ pub const Renderer = struct {
                 // The PS5 NGG/export ABI supplies S_NGG_VERTEX_INDEX in v5;
                 // ordinary VS programs retain the legacy v0 convention.
                 .vertex_index_vgpr = if (vertex_stage == .export_shader) 5 else 0,
+                .convert_negative_one_to_one_depth = !render_state.raster.zero_to_one_depth,
                 .scalar_registers = vertex_scalar_regs[0..vertex_scalar_count],
                 .dynamic_scalar_binding = if (vertex_scalar_count != 0) .{
                     .binding = dynamic_scalar_descriptor_binding,
