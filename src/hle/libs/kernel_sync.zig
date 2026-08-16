@@ -81,6 +81,19 @@ const Mutex = struct {
     sequence: u64 = 1,
     origin: MutexOrigin = .static_zero,
     reported_self_lock: bool = false,
+    /// Set when an unlock left waiters behind, so the mutex belongs to one of
+    /// them rather than to whoever asks next.
+    ///
+    /// Releasing the mutex and letting everyone race for it again lets the
+    /// thread that just released it win, because it is the one already
+    /// running. A thread that locks and unlocks in a loop then holds the mutex
+    /// in practice however long a waiter has been queued, and the waiter makes
+    /// no progress at all: one observed title left its main thread parked here
+    /// nine hundred times while a worker cycled the same lock, so its decoded
+    /// video frames were never handed to the renderer while its audio, on
+    /// another thread, played normally. Reserving the mutex for the waiters
+    /// that already exist makes the queue mean something.
+    handoff: bool = false,
 };
 
 const MutexAttr = struct {
@@ -781,9 +794,15 @@ fn mutexLockCore(
     var registered_waiter = false;
 
     while (true) {
-        if (object.owner == 0) {
+        // A free mutex reserved for its existing waiters is not available to a
+        // thread arriving now. `trylock` is exempt: POSIX lets it fail only
+        // when the mutex is held, and a title is entitled to that answer.
+        const reserved = object.handoff and object.waiters != 0 and
+            !registered_waiter and !try_only;
+        if (object.owner == 0 and !reserved) {
             object.owner = thread_id;
             object.recursion = 1;
+            object.handoff = false;
             if (registered_waiter) object.waiters -= 1;
             return;
         }
@@ -842,12 +861,14 @@ fn mutexLockCore(
             // reported a failure. Recheck ownership before surfacing it.
             if (object.sequence != sequence) continue;
             object.waiters -= 1;
+            if (object.waiters == 0) object.handoff = false;
             return err;
         };
         object.state_lock.lock();
         state_locked = true;
         if (wait_result == .timed_out and object.sequence == sequence) {
             object.waiters -= 1;
+            if (object.waiters == 0) object.handoff = false;
             return error.TimedOut;
         }
     }
@@ -872,8 +893,9 @@ fn mutexUnlockCore(outer: ?*MutexHandle) Error!void {
     }
     object.owner = 0;
     object.recursion = 0;
-    const sequence = advanceSequence(&object.sequence);
     const wake = object.waiters != 0;
+    object.handoff = wake;
+    const sequence = advanceSequence(&object.sequence);
     object.state_lock.unlock();
     if (wake) threading.wakeWaiters(@intFromPtr(object), sequence, 1);
 }
