@@ -2156,6 +2156,23 @@ scheduler and Vulkan backend. Observed startup work now includes:
   resource probes remain opt-in through `log_verbose_gpu`. A second profile line
   reports pipeline and shader-analysis cache behaviour alongside the time spent
   in scalar provenance, SPIR-V translation, and sampled-resource preparation.
+- A colour target is the memory it occupies, not every register describing how
+  that memory is read. A title routinely binds one allocation twice — a
+  different channel swap, a forced destination alpha, a pitch left implied
+  rather than stated — and giving each binding its own host image handed one
+  guest allocation two of them. The frame then split across the pair: what the
+  scene pass drew was invisible to the pass that presented it, which reads as a
+  black screen with a command stream that looks perfectly healthy behind it.
+  Registers that change interpretation without changing storage no longer make
+  a different target, while the host format and every field that changes the
+  bytes still do.
+- A mutex released with waiters queued is handed to one of them rather than
+  thrown open to whoever asks next. Releasing it and letting everyone race
+  again lets the thread that just released it win, because it is the one still
+  running, so a thread that locks and unlocks in a loop holds the mutex in
+  practice however long a waiter has been queued. One title left its main
+  thread parked there nine hundred times in a run while a worker cycled the
+  same lock.
 - A vertex program that assumes the `-W..W` depth range keeps its geometry.
   Vulkan clips Z to `0..W`, so a position exported for the other convention has
   everything in front of the halfway point clipped away and everything behind it

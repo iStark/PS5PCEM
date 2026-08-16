@@ -5586,15 +5586,28 @@ pub const Renderer = struct {
         return bytes;
     }
 
+    /// Whether two bound colour targets are the same surface.
+    ///
+    /// A target is the memory it occupies, not every register that describes
+    /// how that memory is read. One allocation is routinely bound twice with a
+    /// different channel swap, a forced destination alpha, or a pitch left
+    /// implied rather than stated, and treating each binding as its own
+    /// surface gives one guest allocation two host images. A frame then splits
+    /// across them: whatever the scene pass drew is invisible to the pass that
+    /// presents, which reads as a black screen behind a command stream that
+    /// looks perfectly healthy. Registers that change interpretation without
+    /// changing storage therefore do not make a different target — the host
+    /// format, which is what interpretation actually reaches, is still
+    /// compared, as is every field that changes the bytes.
     fn sameRenderTarget(a: GuestColorTarget, b: GuestColorTarget) bool {
+        // A pitch of zero is the width restated, so it names the same rows.
+        const same_pitch = a.descriptor.pitch == b.descriptor.pitch or
+            a.descriptor.pitch == 0 or b.descriptor.pitch == 0;
         return a.descriptor.address == b.descriptor.address and
             a.descriptor.width == b.descriptor.width and
             a.descriptor.height == b.descriptor.height and
-            a.descriptor.pitch == b.descriptor.pitch and
+            same_pitch and
             a.descriptor.format == b.descriptor.format and
-            a.descriptor.number_type == b.descriptor.number_type and
-            a.descriptor.component_swap == b.descriptor.component_swap and
-            a.descriptor.force_destination_alpha_one == b.descriptor.force_destination_alpha_one and
             a.descriptor.tile_mode == b.descriptor.tile_mode and
             a.descriptor.samples_log2 == b.descriptor.samples_log2 and
             a.descriptor.fragments_log2 == b.descriptor.fragments_log2 and
