@@ -8347,11 +8347,24 @@ pub const Renderer = struct {
                 .{ target.descriptor.width, target.descriptor.height },
             );
         }
+        var i420_module: ?rdna2.spirv.Module = null;
+        defer if (i420_module) |*module| module.deinit(self.allocator);
+        if (planar_video) |video| {
+            if (video.chroma_v != null) {
+                i420_module = try buildI420FragmentSpirv(
+                    self.allocator,
+                    graphics_resources.mappings[0..fragment_mapping_count],
+                    .{ video.luma.width, target.descriptor.height },
+                );
+            }
+        }
         const fragment_words = if (self.force_probe_fragment)
             graphics_probe_fragment_spirv[0..]
         else if (texture_probe_module) |module|
             module.words
         else if (parameter_probe_module) |module|
+            module.words
+        else if (i420_module) |module|
             module.words
         else if (ui_probe_module) |module|
             module.words
@@ -15133,6 +15146,91 @@ fn buildUiProbeFragmentSpirv(
         .fragment_extent = fragment_extent,
         .sampled_images = &sampled,
         .parameter_mask = 3,
+        .infer_fragment_parameter_mask = false,
+    });
+}
+
+/// Samples the three decoder-owned I420 planes already staged for the guest
+/// draw and exports ordinary float RGBA. Keeping the conversion on the GPU
+/// preserves the decoder's top-to-bottom plane convention without racing a
+/// second CPU read of its live allocations.
+fn buildI420FragmentSpirv(
+    allocator: std.mem.Allocator,
+    bindings: []const rdna2.spirv.SampledImageBinding,
+    fragment_extent: [2]u32,
+) !rdna2.spirv.Module {
+    if (bindings.len != 3) return Error.UnsupportedSampledImage;
+    const vgpr = struct {
+        fn at(reg: u32) rdna2.Operand {
+            return .{ .kind = .vgpr, .reg = reg };
+        }
+    }.at;
+    const sgpr = struct {
+        fn at(reg: u32) rdna2.Operand {
+            return .{ .kind = .sgpr, .reg = reg };
+        }
+    }.at;
+    const uint = struct {
+        fn value(bits: u32) rdna2.Operand {
+            return .{ .kind = .integer_inline_constant, .value = bits, .signed_val = @intCast(bits) };
+        }
+    }.value;
+    const float = struct {
+        fn value(number: f32) rdna2.Operand {
+            return .{ .kind = .literal_constant, .value = @bitCast(number) };
+        }
+    }.value;
+
+    var program = rdna2.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(allocator);
+    try program.instructions.appendSlice(allocator, &.{
+        .{ .pc = 0, .family = .vintrp, .opcode = .v_interp_mov_f32, .dst = vgpr(0), .src0 = uint(0), .src1 = uint(0), .src2 = uint(0), .src_count = 3 },
+        .{ .pc = 4, .family = .vintrp, .opcode = .v_interp_mov_f32, .dst = vgpr(1), .src0 = uint(1), .src1 = uint(0), .src2 = uint(1), .src_count = 3 },
+    });
+    var next_pc: u32 = 8;
+    for (bindings, 0..) |binding, index| {
+        const sample_pc = binding.instruction_pc orelse next_pc;
+        try program.instructions.append(allocator, .{
+            .pc = sample_pc,
+            .family = .mimg,
+            .opcode_id = 0x20,
+            .opcode = .image_sample,
+            .dst = vgpr(@intCast(2 + index)),
+            .src0 = vgpr(0),
+            .src1 = sgpr(binding.resource_sgpr),
+            .src2 = sgpr(binding.sampler_sgpr),
+            .src_count = 3,
+            .data_mask = 1,
+            .image_dimension = .dim_2d,
+            .image_address_components = 2,
+        });
+        next_pc = @max(next_pc, sample_pc + 8);
+    }
+
+    // Limited-range BT.601 conversion, matching the constants and plane order
+    // in the title's pixel shader: Y in v2, U in v3, V in v4.
+    try program.instructions.appendSlice(allocator, &.{
+        .{ .pc = next_pc, .opcode = .v_mul_f32, .dst = vgpr(5), .src0 = vgpr(2), .src1 = float(1.164_383_5), .src_count = 2 },
+        .{ .pc = next_pc + 4, .opcode = .v_mul_f32, .dst = vgpr(6), .src0 = vgpr(4), .src1 = float(1.596_027_1), .src_count = 2 },
+        .{ .pc = next_pc + 8, .opcode = .v_add_f32, .dst = vgpr(6), .src0 = vgpr(6), .src1 = vgpr(5), .src_count = 2 },
+        .{ .pc = next_pc + 12, .opcode = .v_add_f32, .dst = vgpr(6), .src0 = vgpr(6), .src1 = float(-0.870_785_2), .src_count = 2 },
+        .{ .pc = next_pc + 16, .opcode = .v_mul_f32, .dst = vgpr(7), .src0 = vgpr(3), .src1 = float(-0.391_762_3), .src_count = 2 },
+        .{ .pc = next_pc + 20, .opcode = .v_add_f32, .dst = vgpr(7), .src0 = vgpr(7), .src1 = vgpr(5), .src_count = 2 },
+        .{ .pc = next_pc + 24, .opcode = .v_mul_f32, .dst = vgpr(8), .src0 = vgpr(4), .src1 = float(-0.812_968_3), .src_count = 2 },
+        .{ .pc = next_pc + 28, .opcode = .v_add_f32, .dst = vgpr(7), .src0 = vgpr(7), .src1 = vgpr(8), .src_count = 2 },
+        .{ .pc = next_pc + 32, .opcode = .v_add_f32, .dst = vgpr(7), .src0 = vgpr(7), .src1 = float(0.529_593_8), .src_count = 2 },
+        .{ .pc = next_pc + 36, .opcode = .v_mul_f32, .dst = vgpr(9), .src0 = vgpr(3), .src1 = float(2.017_232_2), .src_count = 2 },
+        .{ .pc = next_pc + 40, .opcode = .v_add_f32, .dst = vgpr(9), .src0 = vgpr(9), .src1 = vgpr(5), .src_count = 2 },
+        .{ .pc = next_pc + 44, .opcode = .v_add_f32, .dst = vgpr(9), .src0 = vgpr(9), .src1 = float(-1.081_390_7), .src_count = 2 },
+        .{ .pc = next_pc + 48, .opcode = .v_mov_b32, .dst = vgpr(10), .src0 = float(1.0), .src_count = 1 },
+        .{ .pc = next_pc + 52, .family = .exp, .opcode = .exp, .export_target = 0, .export_enable = 0xf, .export_done = true, .src0 = vgpr(6), .src1 = vgpr(7), .src2 = vgpr(9), .src3 = vgpr(10), .src_count = 4 },
+        .{ .pc = next_pc + 60, .family = .sopp, .opcode = .s_endpgm },
+    });
+    return rdna2.translateSpirv(allocator, &program, .{
+        .stage = .fragment,
+        .fragment_extent = fragment_extent,
+        .sampled_images = bindings,
+        .parameter_mask = 1,
         .infer_fragment_parameter_mask = false,
     });
 }
