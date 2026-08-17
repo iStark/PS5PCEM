@@ -678,7 +678,10 @@ test "a viewport scissor with only the offset flag is an AGC reset placeholder" 
 
 pub fn decodeRasterState(state: *const gpu_state.State) RasterState {
     const mode = context(state, 0x205) orelse 0;
-    const clip = context(state, 0x204) orelse 0;
+    // A fresh AGC command context can omit PA_CL_CLIP_CNTL altogether. In that
+    // case no guest choice of the wider -W..W range exists to convert, and the
+    // console's ordinary 0..W convention is the safe effective default.
+    const clip = context(state, 0x204) orelse 1 << 19;
     return .{
         .cull_front = mode & 1 != 0,
         .cull_back = mode & 2 != 0,
@@ -691,6 +694,14 @@ pub fn decodeRasterState(state: *const gpu_state.State) RasterState {
         .rasterizer_discard = clip & (1 << 22) != 0,
         .zero_to_one_depth = clip & (1 << 19) != 0,
     };
+}
+
+test "an unwritten depth-clip selector keeps the console zero-to-one default" {
+    var state = gpu_state.State{};
+    try std.testing.expect(decodeRasterState(&state).zero_to_one_depth);
+
+    try state.writeRegister(.context, 0x204, 0);
+    try std.testing.expect(!decodeRasterState(&state).zero_to_one_depth);
 }
 
 pub fn decodeBlendControls(state: *const gpu_state.State) [color_target_count]BlendControl {

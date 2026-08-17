@@ -19,6 +19,7 @@ pub const DeviceSize = u64;
 
 pub const success: Result = 0;
 pub const not_ready: Result = 1;
+pub const timeout: Result = 2;
 pub const incomplete: Result = 5;
 pub const true_value: Bool32 = 1;
 pub const whole_size: DeviceSize = ~@as(DeviceSize, 0);
