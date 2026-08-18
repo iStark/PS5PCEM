@@ -2156,6 +2156,19 @@ scheduler and Vulkan backend. Observed startup work now includes:
   resource probes remain opt-in through `log_verbose_gpu`. A second profile line
   reports pipeline and shader-analysis cache behaviour alongside the time spent
   in scalar provenance, SPIR-V translation, and sampled-resource preparation.
+- `sce::Json` parses and holds documents instead of answering nothing. Every
+  entry point in that library used to report an absence or an empty success, so
+  a title reading its own configuration received a document with no members
+  however well formed the text was. The entry points are C++ member functions,
+  each receiving the title's own object as its first argument, and that object
+  is left untouched: writing into it would mean assuming a layout that cannot
+  be verified from here. Each live object is identified by its address and the
+  document it stands for is held on this side, which is why construction, copy
+  construction, assignment and destruction are honoured rather than accepted
+  and ignored — a copy that did nothing would leave two names for one document
+  and free it twice. The grammar is the standard's, down to `\u` escapes and
+  the surrogate pairs carrying anything above the basic plane, and text the
+  grammar rejects is refused rather than half read.
 - `sceRtcParseRFC3339` and `sceRtcFormatRFC3339` convert between RTC ticks and
   the date-and-time strings save metadata and network services exchange. The
   grammar is fixed by the standard, so the parser accepts exactly what the
