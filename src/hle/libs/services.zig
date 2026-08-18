@@ -72,6 +72,49 @@ pub fn accept(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest
 
 const game_update_error_not_initialized: i32 = @bitCast(@as(u32, 0x8041_2801));
 const game_update_error_invalid_argument: i32 = @bitCast(@as(u32, 0x8041_2803));
+const disc_map_error_invalid_argument: i32 = @bitCast(@as(u32, 0x8093_0002));
+
+/// How a connection status block is reported: the whole documented extent,
+/// not just its first word.
+const remoteplay_status_bytes: usize = 0x10;
+
+/// Reports whether a streaming session is attached, which it never is.
+///
+/// The block is cleared in full before the state is written. Filling only the
+/// first word left the rest of the title's structure holding whatever the
+/// memory held before, and a field it happens to read from there is read as a
+/// session detail rather than as the leftover it is.
+pub fn remoteplayGetConnectionStatus(_: i32, status: ?*[remoteplay_status_bytes]u8) callconv(abi.guest) i32 {
+    const output = status orelse return errno.ok;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(output), remoteplay_status_bytes)) {
+        return errno.ok;
+    }
+    @memset(output, 0);
+    return errno.ok;
+}
+
+/// Answers whether a byte range of a title's own file is already on the
+/// drive rather than still on a disc.
+///
+/// Everything here is installed locally, so nothing is ever waiting behind a
+/// disc read and the answer is always yes. A title asks this to decide
+/// whether to stream a resource now or defer it, so the answer it gets is one
+/// it can act on rather than a refusal.
+pub fn discMapIsRequestOnHDD(
+    path: ?[*:0]const u8,
+    _: u64,
+    _: u64,
+    result: ?*u32,
+) callconv(abi.guest) i32 {
+    if (path == null) return disc_map_error_invalid_argument;
+    const output = result orelse return disc_map_error_invalid_argument;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(output), @sizeOf(u32))) {
+        return disc_map_error_invalid_argument;
+    }
+    output.* = 1;
+    return errno.ok;
+}
+
 const game_update_error_invalid_size: i32 = @bitCast(@as(u32, 0x8041_2804));
 const game_update_error_request_not_found: i32 = @bitCast(@as(u32, 0x8041_2805));
 
@@ -481,4 +524,27 @@ test "every service entry point registers under its published identifier" {
     try register(&db, testing.allocator);
     try testing.expectEqual(count(), db.count());
     try testing.expect(count() > 300);
+}
+
+test "a streaming session reports itself absent across its whole block" {
+    // The block is the title's, and every byte of it must describe the
+    // session rather than whatever the memory held before.
+    var status: [remoteplay_status_bytes]u8 = @splat(0xa7);
+    try testing.expectEqual(errno.ok, remoteplayGetConnectionStatus(0, &status));
+    for (status) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    try testing.expectEqual(errno.ok, remoteplayGetConnectionStatus(0, null));
+}
+
+test "installed content is answered as being on the drive" {
+    var on_drive: u32 = 0;
+    try testing.expectEqual(errno.ok, discMapIsRequestOnHDD("/app0/data.pak", 0, 4096, &on_drive));
+    try testing.expectEqual(@as(u32, 1), on_drive);
+
+    // A question with nowhere to put the answer is refused rather than
+    // reported as answered.
+    try testing.expectEqual(
+        disc_map_error_invalid_argument,
+        discMapIsRequestOnHDD("/app0/data.pak", 0, 4096, null),
+    );
+    try testing.expectEqual(disc_map_error_invalid_argument, discMapIsRequestOnHDD(null, 0, 0, &on_drive));
 }

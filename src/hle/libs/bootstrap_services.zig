@@ -10,6 +10,7 @@ const builtin = @import("builtin");
 const abi = @import("../abi.zig");
 const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
+const services = @import("services.zig");
 const symbols = @import("../symbols.zig");
 const kernel_runtime = @import("kernel_runtime.zig");
 const kernel_threading = @import("kernel_threading.zig");
@@ -1298,7 +1299,7 @@ const np_manager_exports = [_]symbols.Export{
 
 const remoteplay_exports = [_]symbols.Export{
     .{ .name = "sceRemoteplayInitialize", .function = trace.wrap("sceRemoteplayInitialize", &success), .expect_id = "k1SwgkMSOM8" },
-    .{ .name = "sceRemoteplayGetConnectionStatus", .function = trace.wrap("sceRemoteplayGetConnectionStatus", &outputZero32), .expect_id = "g3PNjYKWqnQ" },
+    .{ .name = "sceRemoteplayGetConnectionStatus", .function = trace.wrap("sceRemoteplayGetConnectionStatus", &services.remoteplayGetConnectionStatus), .expect_id = "g3PNjYKWqnQ" },
     .{ .name = "sceRemoteplayTerminate", .function = trace.wrap("sceRemoteplayTerminate", &success), .expect_id = "BOwybKVa3Do" },
 };
 

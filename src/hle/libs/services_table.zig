@@ -634,6 +634,69 @@ pub const rtc_extra_exports = [_]symbols.Export{
     .{ .name = "sceRtcFormatRFC3339", .function = trace.wrap("sceRtcFormatRFC3339", &platform_services.rtcFormatRFC3339), .expect_id = "WJ3rqFwymew" },
 };
 
+
+/// Content capture and broadcast.
+///
+/// There is no capture hardware behind this, and the calls a title makes here
+/// state a policy or set up a subsystem rather than ask for a result: it says
+/// whether capturing its screen is allowed, hands over a title for the clip,
+/// and registers to hear about clips that will never be produced. Accepting
+/// those is truthful — the policy is recorded and honoured by there being no
+/// capture at all — while a refusal would read as the subsystem being broken.
+const share_extra_exports = [_]symbols.Export{
+    .{ .name = "sceSharePlayInitialize", .function = trace.wrap("sceSharePlayInitialize", &services.accept), .expect_id = "isruqthpYcw" },
+    .{ .name = "sceShareRegisterContentEventCallback", .function = trace.wrap("sceShareRegisterContentEventCallback", &services.accept), .expect_id = "Sygnk9dr5WQ" },
+    .{ .name = "sceShareUnregisterContentEventCallback", .function = trace.wrap("sceShareUnregisterContentEventCallback", &services.accept), .expect_id = "KnsfHKmZqFA" },
+    .{ .name = "sceShareSetContentParam", .function = trace.wrap("sceShareSetContentParam", &services.accept), .expect_id = "7QZtURYnXG4" },
+};
+
+/// Where a title's own data physically sits.
+///
+/// Everything is installed locally, so a range is never waiting behind a disc.
+const disc_map_exports = [_]symbols.Export{
+    .{ .name = "sceDiscMapIsRequestOnHDD", .function = trace.wrap("sceDiscMapIsRequestOnHDD", &services.discMapIsRequestOnHDD), .expect_id = "lbQKqsERhtE" },
+    // Two entry points whose published names are unknown. The identifier is
+    // what a title binds against, so it is given directly rather than derived
+    // from a placeholder that would hash to something else entirely.
+    .{ .name = "sceDiscMapUncataloguedRequest", .function = trace.wrap("sceDiscMapUncataloguedRequest", &services.accept), .id_override = "fJgP+wqifno" },
+    .{ .name = "sceDiscMapUncataloguedQuery", .function = trace.wrap("sceDiscMapUncataloguedQuery", &services.accept), .id_override = "IoKMOKcLDlc" },
+};
+
+/// Exporting captured content off the console, which nothing here can do.
+/// Initialisation still succeeds so that a title can carry on and discover
+/// that at the point it actually tries to export something.
+const content_export_exports = [_]symbols.Export{
+    .{ .name = "sceContentExportInit2", .function = trace.wrap("sceContentExportInit2", &services.accept), .expect_id = "0GnN4QCgIfs" },
+};
+
+/// Batched audio convolution work.
+///
+/// A batch is started and then waited on for a completion that this side
+/// cannot produce, so reporting it unavailable is the only answer a title can
+/// act on: told the batch had started, it would wait for a result forever.
+const acm_extra_exports = [_]symbols.Export{
+    .{ .name = "sceAcmBatchInitialize", .function = trace.wrap("sceAcmBatchInitialize", &services.absent), .expect_id = "WeZOIm8+8WI" },
+    .{ .name = "sceAcmBatchInitializeLite", .function = trace.wrap("sceAcmBatchInitializeLite", &services.absent), .expect_id = "Mk1xvQXIdkk" },
+    .{ .name = "sceAcmBatchJobNotification", .function = trace.wrap("sceAcmBatchJobNotification", &services.absent), .expect_id = "r7z5YQFZo+U" },
+    .{ .name = "sceAcmBatchProcess", .function = trace.wrap("sceAcmBatchProcess", &services.absent), .expect_id = "uqDIauipRbo" },
+    .{ .name = "sceAcmBatchStart", .function = trace.wrap("sceAcmBatchStart", &services.absent), .expect_id = "A5NXCXK5Gfc" },
+    .{ .name = "sceAcmBatchStartBuffer", .function = trace.wrap("sceAcmBatchStartBuffer", &services.absent), .expect_id = "tW9W+CAG4FE" },
+    .{ .name = "sceAcmBatchStartMultiple", .function = trace.wrap("sceAcmBatchStartMultiple", &services.absent), .expect_id = "S3BPrjCfZ90" },
+};
+
+/// A dispatch-packet builder for a hardware block this host does not have.
+/// Every call asks for a packet or a size to allocate for one, so there is
+/// nothing truthful to return and the library reports itself unavailable.
+const psml_exports = [_]symbols.Export{
+    .{ .name = "scePsmlMfsrInit", .function = trace.wrap("scePsmlMfsrInit", &services.absent), .expect_id = "3WVD91e12ZQ" },
+    .{ .name = "scePsmlMfsrCreateSharedResources", .function = trace.wrap("scePsmlMfsrCreateSharedResources", &services.absent), .expect_id = "eWoKNeB6V-k" },
+    .{ .name = "scePsmlMfsrGetSharedResourcesInitRequirement", .function = trace.wrap("scePsmlMfsrGetSharedResourcesInitRequirement", &services.absent), .expect_id = "+2KpvixvL6E" },
+    .{ .name = "scePsmlMfsrGetDispatchMfsrPacketSizeInDwords", .function = trace.wrap("scePsmlMfsrGetDispatchMfsrPacketSizeInDwords", &services.absent), .expect_id = "AHalTX9wFZY" },
+    .{ .name = "scePsmlMfsrGetDispatchMfsrPacket900", .function = trace.wrap("scePsmlMfsrGetDispatchMfsrPacket900", &services.absent), .expect_id = "RUNLFro+qok" },
+    .{ .name = "scePsmlMfsrGetDispatchMfsrPacket1000", .function = trace.wrap("scePsmlMfsrGetDispatchMfsrPacket1000", &services.absent), .expect_id = "s2psNHUIdjk" },
+    .{ .name = "scePsmlMfsrGetDispatchMfsrPacket1100", .function = trace.wrap("scePsmlMfsrGetDispatchMfsrPacket1100", &services.absent), .expect_id = "94iBp3KvIuI" },
+};
+
 pub const Table = struct { library: []const u8, module: []const u8, exports: []const symbols.Export };
 
 pub const all = [_]Table{
@@ -686,4 +749,9 @@ pub const all = [_]Table{
     .{ .library = "libSceJson2", .module = "libSceJson", .exports = &json2_extra_exports },
     .{ .library = "libSceNpWebApi2", .module = "libSceNpWebApi2", .exports = &npwebapi2_extra_exports },
     .{ .library = "libSceRtc", .module = "libSceRtc", .exports = &rtc_extra_exports },
+    .{ .library = "libSceShare", .module = "libSceShare", .exports = &share_extra_exports },
+    .{ .library = "libSceDiscMap", .module = "libSceDiscMap", .exports = &disc_map_exports },
+    .{ .library = "libSceContentExport", .module = "libSceContentExport", .exports = &content_export_exports },
+    .{ .library = "libSceAcm", .module = "libSceAcm", .exports = &acm_extra_exports },
+    .{ .library = "libScePsml", .module = "libScePsml", .exports = &psml_exports },
 };
