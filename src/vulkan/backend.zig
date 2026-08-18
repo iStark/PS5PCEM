@@ -748,6 +748,11 @@ const GraphicsPipelineState = extern struct {
     depth_test_enable: u32,
     depth_write_enable: u32,
     depth_compare_operation: u32,
+    /// Non-zero when the draw is a rectangle list and the pipeline carries the
+    /// stage that completes its missing corner. Both this and the varyings
+    /// that stage forwards belong in the key, because they change the pipeline.
+    rectangle_completion: u32,
+    rectangle_parameter_mask: u32,
 
     fn default(width: u32, height: u32) GraphicsPipelineState {
         return .{
@@ -755,6 +760,8 @@ const GraphicsPipelineState = extern struct {
             .height = height,
             .color_attachment_format = vk.format_r8g8b8a8_unorm,
             .topology = vk.primitive_topology_triangle_list,
+            .rectangle_completion = 0,
+            .rectangle_parameter_mask = 0,
             .viewport_x_bits = @bitCast(@as(f32, 0)),
             .viewport_y_bits = @bitCast(@as(f32, 0)),
             .viewport_width_bits = @bitCast(@as(f32, @floatFromInt(width))),
@@ -1671,6 +1678,7 @@ pub const Renderer = struct {
     memory_properties: vk.PhysicalDeviceMemoryProperties,
     loader_api_version: u32,
     device_info: DeviceInfo,
+    geometry_shaders_available: bool,
     validation_enabled: bool,
     graphics_probe_enabled: bool,
     capture_first_graphics_frame: bool,
@@ -1910,6 +1918,13 @@ pub const Renderer = struct {
         if (supported_features.values[vk.feature_shader_storage_image_extended_formats] != 0) {
             enabled_features.values[vk.feature_shader_storage_image_extended_formats] = vk.true_value;
         }
+        // A rectangle list needs a stage that sees the whole primitive, so
+        // that the corner it leaves out can be completed from the three it
+        // gives. Without the feature those draws keep their single triangle.
+        const geometry_shaders = supported_features.values[vk.feature_geometry_shader] != 0;
+        if (geometry_shaders) {
+            enabled_features.values[vk.feature_geometry_shader] = vk.true_value;
+        }
         const device_info = vk.DeviceCreateInfo{
             .queue_create_info_count = 1,
             .queue_create_infos = @ptrCast(&queue_info),
@@ -2123,6 +2138,7 @@ pub const Renderer = struct {
             .memory_properties = memory_properties,
             .loader_api_version = loader_api_version,
             .device_info = candidate.info,
+            .geometry_shaders_available = geometry_shaders,
             .validation_enabled = validation_enabled,
             .graphics_probe_enabled = options.enable_graphics_probe,
             .capture_first_graphics_frame = options.capture_first_graphics_frame,
@@ -5401,10 +5417,24 @@ pub const Renderer = struct {
         defer self.device_functions.destroy_shader_module(self.device, vertex, null);
         const fragment = try self.createShader(fragment_words);
         defer self.device_functions.destroy_shader_module(self.device, fragment, null);
-        const stages = [_]vk.PipelineShaderStageCreateInfo{
+        var geometry: vk.ShaderModule = 0;
+        defer if (geometry != 0) self.device_functions.destroy_shader_module(self.device, geometry, null);
+        if (pipeline_state.rectangle_completion != 0) {
+            const geometry_words = buildRectangleListGeometrySpirv(
+                self.allocator,
+                pipeline_state.rectangle_parameter_mask,
+            ) catch return Error.ShaderModuleCreationFailed;
+            defer self.allocator.free(geometry_words);
+            if (self.dump_graphics_spirv) dumpGraphicsSpirv(self.allocator, "gs", pipeline_state.rectangle_parameter_mask, geometry_words);
+            geometry = try self.createShader(geometry_words);
+        }
+        var stage_storage = [_]vk.PipelineShaderStageCreateInfo{
             .{ .stage = vk.shader_stage_vertex_bit, .module = vertex, .name = "main" },
+            .{ .stage = vk.shader_stage_geometry_bit, .module = geometry, .name = "main" },
             .{ .stage = vk.shader_stage_fragment_bit, .module = fragment, .name = "main" },
         };
+        if (geometry == 0) stage_storage[1] = stage_storage[2];
+        const stages = stage_storage[0 .. if (geometry == 0) 2 else 3];
         const vertex_input = vk.PipelineVertexInputStateCreateInfo{};
         const input_assembly = vk.PipelineInputAssemblyStateCreateInfo{
             .topology = pipeline_state.topology,
@@ -5453,8 +5483,8 @@ pub const Renderer = struct {
             .depth_compare_operation = pipeline_state.depth_compare_operation,
         };
         const info = vk.GraphicsPipelineCreateInfo{
-            .stage_count = stages.len,
-            .stages = &stages,
+            .stage_count = @intCast(stages.len),
+            .stages = stages.ptr,
             .vertex_input_state = &vertex_input,
             .input_assembly_state = &input_assembly,
             .viewport_state = &viewport_state,
@@ -8419,6 +8449,17 @@ pub const Renderer = struct {
                         vertex_storage.mapping_count,
                     },
                 );
+                // A rectangle list gives three corners and expects the
+                // fourth to follow from them, which only a stage that sees the
+                // whole primitive can supply.
+                if (self.geometry_shaders_available and draw.index_count == null and
+                    draw.vertex_count == 3 and
+                    (render_state.primitive_type == 7 or render_state.primitive_type == 17))
+                {
+                    pipeline_state.topology = vk.primitive_topology_triangle_list;
+                    pipeline_state.rectangle_completion = 1;
+                    pipeline_state.rectangle_parameter_mask = paired_parameter_mask;
+                }
                 try self.drawGraphicsShaders(
                     vertex_module.words,
                     fragment_words,
@@ -15233,6 +15274,188 @@ fn buildI420FragmentSpirv(
         .parameter_mask = 1,
         .infer_fragment_parameter_mask = false,
     });
+}
+
+fn appendSpirvInstruction(
+    allocator: std.mem.Allocator,
+    words: *std.ArrayList(u32),
+    opcode: u16,
+    operands: []const u32,
+) !void {
+    const length: u32 = @intCast(operands.len + 1);
+    try words.append(allocator, (length << 16) | opcode);
+    try words.appendSlice(allocator, operands);
+}
+
+/// Builds a geometry shader that completes a rectangle list into a rectangle.
+///
+/// A rectangle list hands the hardware three corners and expects the fourth to
+/// follow from them. That is something no vertex program can supply: the
+/// missing corner is `v1 + v2 - v0`, a function of the other two vertices, and
+/// a vertex program sees only its own. Emitting the three corners alone draws
+/// one triangle and leaves the opposite half of the rectangle unshaded, which
+/// on a full-screen pass is a picture cut in half along its diagonal. A
+/// geometry stage is handed the whole primitive, so it can complete the corner
+/// — and completes every varying by the same rule that completes the position,
+/// which is what makes the added corner belong to the same surface.
+fn buildRectangleListGeometrySpirv(
+    allocator: std.mem.Allocator,
+    parameter_mask: u32,
+) ![]u32 {
+    var capabilities: std.ArrayList(u32) = .empty;
+    defer capabilities.deinit(allocator);
+    var entry: std.ArrayList(u32) = .empty;
+    defer entry.deinit(allocator);
+    var modes: std.ArrayList(u32) = .empty;
+    defer modes.deinit(allocator);
+    var annotations: std.ArrayList(u32) = .empty;
+    defer annotations.deinit(allocator);
+    var declarations: std.ArrayList(u32) = .empty;
+    defer declarations.deinit(allocator);
+    var body: std.ArrayList(u32) = .empty;
+    defer body.deinit(allocator);
+
+    const type_void: u32 = 1;
+    const type_function: u32 = 2;
+    const type_float: u32 = 3;
+    const type_vector4: u32 = 4;
+    const type_uint: u32 = 5;
+    const constant_three: u32 = 6;
+    const type_array: u32 = 7;
+    const pointer_input_array: u32 = 8;
+    const pointer_input_vector: u32 = 9;
+    const pointer_output_vector: u32 = 10;
+    const constant_zero: u32 = 11;
+    const constant_one: u32 = 12;
+    const constant_two: u32 = 13;
+    const position_input: u32 = 14;
+    const position_output: u32 = 15;
+    var next_id: u32 = 16;
+
+    var parameter_input: [32]u32 = @splat(0);
+    var parameter_output: [32]u32 = @splat(0);
+    for (0..32) |location| {
+        if (parameter_mask & (@as(u32, 1) << @intCast(location)) == 0) continue;
+        parameter_input[location] = next_id;
+        parameter_output[location] = next_id + 1;
+        next_id += 2;
+    }
+    const main_function = next_id;
+    const main_label = next_id + 1;
+    next_id += 2;
+
+    try appendSpirvInstruction(allocator, &capabilities, 17, &.{1}); // Shader
+    try appendSpirvInstruction(allocator, &capabilities, 17, &.{2}); // Geometry
+
+    // The entry point lists every interface variable the stage touches.
+    var interface: std.ArrayList(u32) = .empty;
+    defer interface.deinit(allocator);
+    try interface.appendSlice(allocator, &.{ position_input, position_output });
+    for (0..32) |location| {
+        if (parameter_input[location] == 0) continue;
+        try interface.appendSlice(allocator, &.{ parameter_input[location], parameter_output[location] });
+    }
+    var entry_operands: std.ArrayList(u32) = .empty;
+    defer entry_operands.deinit(allocator);
+    try entry_operands.appendSlice(allocator, &.{ 3, main_function, 0x6e69_616d, 0 }); // Geometry, "main"
+    try entry_operands.appendSlice(allocator, interface.items);
+    try appendSpirvInstruction(allocator, &entry, 15, entry_operands.items);
+
+    try appendSpirvInstruction(allocator, &modes, 16, &.{ main_function, 22 }); // Triangles
+    try appendSpirvInstruction(allocator, &modes, 16, &.{ main_function, 0, 1 }); // Invocations 1
+    try appendSpirvInstruction(allocator, &modes, 16, &.{ main_function, 29 }); // OutputTriangleStrip
+    try appendSpirvInstruction(allocator, &modes, 16, &.{ main_function, 26, 4 }); // OutputVertices 4
+
+    try appendSpirvInstruction(allocator, &annotations, 71, &.{ position_input, 11, 0 }); // BuiltIn Position
+    try appendSpirvInstruction(allocator, &annotations, 71, &.{ position_output, 11, 0 });
+    for (0..32) |location| {
+        if (parameter_input[location] == 0) continue;
+        try appendSpirvInstruction(allocator, &annotations, 71, &.{ parameter_input[location], 30, @intCast(location) });
+        try appendSpirvInstruction(allocator, &annotations, 71, &.{ parameter_output[location], 30, @intCast(location) });
+    }
+
+    try appendSpirvInstruction(allocator, &declarations, 19, &.{type_void});
+    try appendSpirvInstruction(allocator, &declarations, 33, &.{ type_function, type_void });
+    try appendSpirvInstruction(allocator, &declarations, 22, &.{ type_float, 32 });
+    try appendSpirvInstruction(allocator, &declarations, 23, &.{ type_vector4, type_float, 4 });
+    try appendSpirvInstruction(allocator, &declarations, 21, &.{ type_uint, 32, 0 });
+    try appendSpirvInstruction(allocator, &declarations, 43, &.{ type_uint, constant_three, 3 });
+    try appendSpirvInstruction(allocator, &declarations, 28, &.{ type_array, type_vector4, constant_three });
+    try appendSpirvInstruction(allocator, &declarations, 32, &.{ pointer_input_array, 1, type_array });
+    try appendSpirvInstruction(allocator, &declarations, 32, &.{ pointer_input_vector, 1, type_vector4 });
+    try appendSpirvInstruction(allocator, &declarations, 32, &.{ pointer_output_vector, 3, type_vector4 });
+    try appendSpirvInstruction(allocator, &declarations, 43, &.{ type_uint, constant_zero, 0 });
+    try appendSpirvInstruction(allocator, &declarations, 43, &.{ type_uint, constant_one, 1 });
+    try appendSpirvInstruction(allocator, &declarations, 43, &.{ type_uint, constant_two, 2 });
+    try appendSpirvInstruction(allocator, &declarations, 59, &.{ pointer_input_array, position_input, 1 });
+    try appendSpirvInstruction(allocator, &declarations, 59, &.{ pointer_output_vector, position_output, 3 });
+    for (0..32) |location| {
+        if (parameter_input[location] == 0) continue;
+        try appendSpirvInstruction(allocator, &declarations, 59, &.{ pointer_input_array, parameter_input[location], 1 });
+        try appendSpirvInstruction(allocator, &declarations, 59, &.{ pointer_output_vector, parameter_output[location], 3 });
+    }
+
+    try appendSpirvInstruction(allocator, &body, 54, &.{ type_void, main_function, 0, type_function });
+    try appendSpirvInstruction(allocator, &body, 248, &.{main_label});
+
+    const corner_constants = [_]u32{ constant_zero, constant_one, constant_two };
+    for (0..4) |corner| {
+        var pair_index: usize = 0;
+        while (pair_index < 33) : (pair_index += 1) {
+            const input_variable = if (pair_index == 0) position_input else parameter_input[pair_index - 1];
+            const output_variable = if (pair_index == 0) position_output else parameter_output[pair_index - 1];
+            if (input_variable == 0) continue;
+            var value: u32 = 0;
+            if (corner < 3) {
+                const chain = next_id;
+                next_id += 1;
+                try appendSpirvInstruction(allocator, &body, 65, &.{
+                    pointer_input_vector, chain, input_variable, corner_constants[corner],
+                });
+                value = next_id;
+                next_id += 1;
+                try appendSpirvInstruction(allocator, &body, 61, &.{ type_vector4, value, chain });
+            } else {
+                // The corner a rectangle list leaves out. The three it gives
+                // are adjacent corners, so the fourth completes the
+                // parallelogram opposite the last of them: v0 + v1 - v2.
+                var loaded: [3]u32 = @splat(0);
+                for (0..3) |index| {
+                    const chain = next_id;
+                    next_id += 1;
+                    try appendSpirvInstruction(allocator, &body, 65, &.{
+                        pointer_input_vector, chain, input_variable, corner_constants[index],
+                    });
+                    loaded[index] = next_id;
+                    next_id += 1;
+                    try appendSpirvInstruction(allocator, &body, 61, &.{ type_vector4, loaded[index], chain });
+                }
+                const sum = next_id;
+                next_id += 1;
+                try appendSpirvInstruction(allocator, &body, 129, &.{ type_vector4, sum, loaded[0], loaded[1] });
+                value = next_id;
+                next_id += 1;
+                try appendSpirvInstruction(allocator, &body, 131, &.{ type_vector4, value, sum, loaded[2] });
+            }
+            try appendSpirvInstruction(allocator, &body, 62, &.{ output_variable, value });
+        }
+        try appendSpirvInstruction(allocator, &body, 218, &.{}); // OpEmitVertex
+    }
+    try appendSpirvInstruction(allocator, &body, 219, &.{}); // OpEndPrimitive
+    try appendSpirvInstruction(allocator, &body, 253, &.{}); // OpReturn
+    try appendSpirvInstruction(allocator, &body, 56, &.{}); // OpFunctionEnd
+
+    var words: std.ArrayList(u32) = .empty;
+    errdefer words.deinit(allocator);
+    try words.appendSlice(allocator, &.{ 0x0723_0203, 0x0001_0500, 0x0050_4300, next_id, 0 });
+    try words.appendSlice(allocator, capabilities.items);
+    try appendSpirvInstruction(allocator, &words, 14, &.{ 0, 1 }); // Logical GLSL450
+    try words.appendSlice(allocator, entry.items);
+    try words.appendSlice(allocator, modes.items);
+    try words.appendSlice(allocator, annotations.items);
+    try words.appendSlice(allocator, declarations.items);
+    try words.appendSlice(allocator, body.items);
+    return words.toOwnedSlice(allocator);
 }
 
 fn buildFullscreenProbeVertexSpirv(

@@ -2156,6 +2156,32 @@ scheduler and Vulkan backend. Observed startup work now includes:
   resource probes remain opt-in through `log_verbose_gpu`. A second profile line
   reports pipeline and shader-analysis cache behaviour alongside the time spent
   in scalar provenance, SPIR-V translation, and sampled-resource preparation.
+- A rectangle list is completed into the rectangle it describes. The primitive
+  hands the hardware three corners and expects the fourth to follow from them,
+  which no vertex program can supply: the missing corner is a function of the
+  other vertices and a vertex program sees only its own. A generated geometry
+  stage is handed the whole primitive, so it emits the fourth corner and
+  completes every varying by the rule that completes the position. The stage is
+  built only for the draws that need it and carried in the pipeline key, and it
+  is validated as SPIR-V rather than trusted: the first attempt was accepted by
+  the driver and quietly produced nothing, because a float subtraction had been
+  written with the integer opcode. Its effect on the observed titles has not
+  been demonstrated — the diagonal half-image it was written for survives it —
+  so it stands as correct handling of the primitive rather than as a fix for
+  that.
+- Content capture, disc mapping, content export, batched audio convolution and
+  the packet builder for a hardware block this host lacks are all answered.
+  Which answer each gets follows one rule: a call that sets a subsystem up or
+  states a policy succeeds, because there is no result to go looking for; a
+  call that would produce a result reports the real negative state where there
+  is one — a streaming session that is not attached, content that is on the
+  drive rather than behind a disc — and otherwise reports itself unavailable,
+  because a batch that never completes would leave a title waiting forever for
+  a result it was told to expect.
+- A connection status is cleared across the whole block a title hands over.
+  Filling only its first word left the rest holding whatever the memory held
+  before, and a field read from there reads as a session detail rather than as
+  the leftover it is.
 - The text-entry library is answered in full: the session form beside the
   dialog form, the parameter block a title blanks before filling it in, the
   text, caret and geometry it sets on its own field, the keyboard mode, and

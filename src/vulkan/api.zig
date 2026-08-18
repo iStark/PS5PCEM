@@ -141,6 +141,7 @@ pub const memory_property_device_local_bit: Flags = 0x0000_0001;
 pub const pipeline_bind_point_compute: u32 = 1;
 pub const pipeline_bind_point_graphics: u32 = 0;
 pub const shader_stage_vertex_bit: Flags = 0x0000_0001;
+pub const shader_stage_geometry_bit: Flags = 0x0000_0008;
 pub const shader_stage_fragment_bit: Flags = 0x0000_0010;
 pub const shader_stage_compute_bit: Flags = 0x0000_0020;
 pub const pipeline_stage_transfer_bit: Flags = 0x0000_1000;
@@ -339,6 +340,7 @@ pub const PhysicalDeviceFeatures = extern struct {
     values: [55]Bool32 = [_]Bool32{0} ** 55,
 };
 
+pub const feature_geometry_shader: usize = 4;
 pub const feature_shader_storage_image_extended_formats: usize = 29;
 
 pub const DeviceCreateInfo = extern struct {
