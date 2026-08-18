@@ -337,6 +337,99 @@ fn imeDialogGetResult(result: ?*[8]u8) callconv(abi.guest) i32 {
 /// there is nobody here to type — so the honest answer is that nothing is
 /// covered. Naming a plausible-looking panel instead would push the title's
 /// own interface aside to make room for a keyboard that never appears.
+/// Size of `SceImeParam`, which `sceImeParamInit` is asked to blank.
+const ime_param_bytes: usize = 0x60;
+/// Size of the panel position-and-form description.
+const ime_position_and_form_bytes: usize = 0x1c;
+
+var ime_session_open: std.atomic.Value(u32) = .init(0);
+
+fn imeWritableRange(address: u64, size: usize) bool {
+    return address != 0 and kernel_memory.isGuestRangeAccessible(address, size);
+}
+
+/// Reports the panel size for the keyboard, which covers nothing.
+///
+/// Shared by the dialog and the session forms of the question, because both
+/// describe the same keyboard and this one is never drawn.
+fn writeEmptyPanelSize(width: ?*u32, height: ?*u32) i32 {
+    const width_output = width orelse return ime_error_invalid_address;
+    const height_output = height orelse return ime_error_invalid_address;
+    if (!imeWritableRange(@intFromPtr(width_output), @sizeOf(u32)) or
+        !imeWritableRange(@intFromPtr(height_output), @sizeOf(u32)))
+    {
+        return ime_error_invalid_address;
+    }
+    width_output.* = 0;
+    height_output.* = 0;
+    return errno.ok;
+}
+
+pub fn imeGetPanelSize(_: ?*const anyopaque, width: ?*u32, height: ?*u32) callconv(abi.guest) i32 {
+    return writeEmptyPanelSize(width, height);
+}
+
+pub fn imeDialogGetPanelSize(_: ?*const anyopaque, width: ?*u32, height: ?*u32) callconv(abi.guest) i32 {
+    return writeEmptyPanelSize(width, height);
+}
+
+/// Describes where the panel sits and how it is shaped. With no panel there
+/// is nothing to place, so every field is left at zero rather than at a
+/// position a title would lay itself out around.
+pub fn imeDialogGetPanelPositionAndForm(form: ?*[ime_position_and_form_bytes]u8) callconv(abi.guest) i32 {
+    const output = form orelse return ime_error_invalid_address;
+    if (!imeWritableRange(@intFromPtr(output), ime_position_and_form_bytes)) {
+        return ime_error_invalid_address;
+    }
+    @memset(output, 0);
+    return errno.ok;
+}
+
+/// Blanks a parameter block before a title fills in the fields it cares
+/// about. The block is the title's, so it is only written once its whole
+/// extent is known to be there.
+pub fn imeParamInit(param: ?*[ime_param_bytes]u8) callconv(abi.guest) void {
+    const output = param orelse return;
+    if (!imeWritableRange(@intFromPtr(output), ime_param_bytes)) return;
+    @memset(output, 0);
+}
+
+/// Opens a text-entry session without a dialog.
+///
+/// The session is accepted and remembered so that closing it is meaningful,
+/// but nothing is presented: there is nobody here to type, and a title that
+/// opens one receives the events it would receive from a keyboard left alone.
+pub fn imeOpen(_: ?*const anyopaque, _: ?*const anyopaque) callconv(abi.guest) i32 {
+    ime_session_open.store(1, .release);
+    return errno.ok;
+}
+
+pub fn imeClose() callconv(abi.guest) i32 {
+    ime_session_open.store(0, .release);
+    return errno.ok;
+}
+
+/// Accepts text, caret and geometry a title sets on its own field.
+///
+/// These describe what the title has already drawn, so there is nothing for
+/// this side to do with them; refusing would tell the title its own display
+/// is invalid, which it is not.
+pub fn imeSetText(_: ?[*]const u16, _: u32) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
+pub fn imeSetCaret(_: ?*const anyopaque) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
+pub fn imeSetTextGeometry(_: u32, _: ?*const anyopaque) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
+pub fn imeKeyboardSetMode(_: i32, _: u32) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
 pub fn imeDialogGetPanelSizeExtended(
     _: ?*const anyopaque,
     _: ?*const anyopaque,
@@ -391,6 +484,8 @@ const ime_dialog_exports = [_]symbols.Export{
     .{ .name = "sceImeDialogGetStatus", .function = trace.wrap("sceImeDialogGetStatus", &imeDialogGetStatus), .expect_id = "IADmD4tScBY" },
     .{ .name = "sceImeDialogGetResult", .function = trace.wrap("sceImeDialogGetResult", &imeDialogGetResult), .expect_id = "x01jxu+vxlc" },
     .{ .name = "sceImeDialogTerm", .function = trace.wrap("sceImeDialogTerm", &imeDialogTerm), .expect_id = "gyTyVn+bXMw" },
+    .{ .name = "sceImeDialogGetPanelSize", .function = trace.wrap("sceImeDialogGetPanelSize", &imeDialogGetPanelSize), .expect_id = "wqsJvRXwl58" },
+    .{ .name = "sceImeDialogGetPanelPositionAndForm", .function = trace.wrap("sceImeDialogGetPanelPositionAndForm", &imeDialogGetPanelPositionAndForm), .expect_id = "8jqzzPioYl8" },
 };
 
 const ime_exports = [_]symbols.Export{
@@ -399,6 +494,14 @@ const ime_exports = [_]symbols.Export{
     .{ .name = "sceImeKeyboardGetResourceId", .function = trace.wrap("sceImeKeyboardGetResourceId", &keyboardGetResourceId), .expect_id = "dKadqZFgKKQ" },
     .{ .name = "sceImeKeyboardGetInfo", .function = trace.wrap("sceImeKeyboardGetInfo", &keyboardGetInfo), .expect_id = "VkqLPArfFdc" },
     .{ .name = "sceImeUpdate", .function = trace.wrap("sceImeUpdate", &imeUpdate), .expect_id = "-4GCfYdNF1s" },
+    .{ .name = "sceImeOpen", .function = trace.wrap("sceImeOpen", &imeOpen), .expect_id = "RPydv-Jr1bc" },
+    .{ .name = "sceImeClose", .function = trace.wrap("sceImeClose", &imeClose), .expect_id = "TmVP8LzcFcY" },
+    .{ .name = "sceImeParamInit", .function = trace.wrap("sceImeParamInit", &imeParamInit), .expect_id = "WmYDzdC4EHI" },
+    .{ .name = "sceImeSetText", .function = trace.wrap("sceImeSetText", &imeSetText), .expect_id = "ieCNrVrzKd4" },
+    .{ .name = "sceImeSetCaret", .function = trace.wrap("sceImeSetCaret", &imeSetCaret), .expect_id = "WLxUN2WMim8" },
+    .{ .name = "sceImeSetTextGeometry", .function = trace.wrap("sceImeSetTextGeometry", &imeSetTextGeometry), .expect_id = "TXYHFRuL8UY" },
+    .{ .name = "sceImeGetPanelSize", .function = trace.wrap("sceImeGetPanelSize", &imeGetPanelSize), .expect_id = "ziPDcIjO0Vk" },
+    .{ .name = "sceImeKeyboardSetMode", .function = trace.wrap("sceImeKeyboardSetMode", &imeKeyboardSetMode), .expect_id = "ua+13Hk9kKs" },
 };
 
 pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {
@@ -465,4 +568,34 @@ test "the keyboard panel covers nothing and refuses a bad destination" {
         ime_error_invalid_address,
         imeDialogGetPanelSizeExtended(null, null, &width, null),
     );
+}
+
+test "the text-entry session opens, closes and covers no screen" {
+    var width: u32 = 0xdead;
+    var height: u32 = 0xbeef;
+    try std.testing.expectEqual(errno.ok, imeGetPanelSize(null, &width, &height));
+    try std.testing.expectEqual(@as(u32, 0), width);
+    try std.testing.expectEqual(@as(u32, 0), height);
+    try std.testing.expectEqual(errno.ok, imeDialogGetPanelSize(null, &width, &height));
+    try std.testing.expectEqual(ime_error_invalid_address, imeGetPanelSize(null, null, &height));
+
+    var form: [ime_position_and_form_bytes]u8 = @splat(0xcc);
+    try std.testing.expectEqual(errno.ok, imeDialogGetPanelPositionAndForm(&form));
+    for (form) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    try std.testing.expectEqual(ime_error_invalid_address, imeDialogGetPanelPositionAndForm(null));
+
+    // A parameter block is blanked in full, so a title reads its own fields
+    // and not whatever the memory held before.
+    var param: [ime_param_bytes]u8 = @splat(0xa5);
+    imeParamInit(&param);
+    for (param) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+
+    try std.testing.expectEqual(errno.ok, imeOpen(null, null));
+    try std.testing.expectEqual(@as(u32, 1), ime_session_open.load(.acquire));
+    try std.testing.expectEqual(errno.ok, imeSetText(null, 0));
+    try std.testing.expectEqual(errno.ok, imeSetCaret(null));
+    try std.testing.expectEqual(errno.ok, imeSetTextGeometry(0, null));
+    try std.testing.expectEqual(errno.ok, imeKeyboardSetMode(0, 0));
+    try std.testing.expectEqual(errno.ok, imeClose());
+    try std.testing.expectEqual(@as(u32, 0), ime_session_open.load(.acquire));
 }

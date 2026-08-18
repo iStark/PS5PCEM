@@ -2156,6 +2156,14 @@ scheduler and Vulkan backend. Observed startup work now includes:
   resource probes remain opt-in through `log_verbose_gpu`. A second profile line
   reports pipeline and shader-analysis cache behaviour alongside the time spent
   in scalar provenance, SPIR-V translation, and sampled-resource preparation.
+- The text-entry library is answered in full: the session form beside the
+  dialog form, the parameter block a title blanks before filling it in, the
+  text, caret and geometry it sets on its own field, the keyboard mode, and
+  both ways of asking what the panel covers. Nothing is presented, because
+  there is nobody here to type, so a title receives what it would receive from
+  a keyboard left alone rather than a refusal it cannot act on. What a title
+  hands over describing its own display is accepted rather than rejected: that
+  display is its own and is not wrong.
 - The on-screen keyboard reports the screen it covers, which is none of it.
   A title asks for the panel size to lay its own text field out around the
   keyboard; this dialog never presents one, because it completes as soon as it
