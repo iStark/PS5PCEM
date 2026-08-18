@@ -2156,6 +2156,13 @@ scheduler and Vulkan backend. Observed startup work now includes:
   resource probes remain opt-in through `log_verbose_gpu`. A second profile line
   reports pipeline and shader-analysis cache behaviour alongside the time spent
   in scalar provenance, SPIR-V translation, and sampled-resource preparation.
+- The on-screen keyboard reports the screen it covers, which is none of it.
+  A title asks for the panel size to lay its own text field out around the
+  keyboard; this dialog never presents one, because it completes as soon as it
+  is opened and there is nobody here to type. Naming a plausible-looking panel
+  would push the title's interface aside to make room for a keyboard that never
+  appears, so the answer matches the dialog's actual behaviour. That completes
+  the library: every entry point six of the observed titles import is answered.
 - `sce::Json` parses and holds documents instead of answering nothing. Every
   entry point in that library used to report an absence or an empty success, so
   a title reading its own configuration received a document with no members

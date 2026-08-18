@@ -8,6 +8,7 @@
 
 const services = @import("services.zig");
 const json = @import("json.zig");
+const dialogs = @import("dialogs.zig");
 const av_player = @import("av_player.zig");
 const font = @import("font.zig");
 const platform_services = @import("platform_services.zig");
@@ -235,7 +236,7 @@ pub const http_exports = [_]symbols.Export{
 };
 
 pub const imedialog_exports = [_]symbols.Export{
-    .{ .name = "sceImeDialogGetPanelSizeExtended", .function = trace.wrap("sceImeDialogGetPanelSizeExtended", &services.absent), .expect_id = "CRD+jSErEJQ" },
+    .{ .name = "sceImeDialogGetPanelSizeExtended", .function = trace.wrap("sceImeDialogGetPanelSizeExtended", &dialogs.imeDialogGetPanelSizeExtended), .expect_id = "CRD+jSErEJQ" },
 };
 
 pub const json2_exports = [_]symbols.Export{

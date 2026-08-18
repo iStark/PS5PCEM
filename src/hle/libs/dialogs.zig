@@ -11,6 +11,7 @@ const std = @import("std");
 const abi = @import("../abi.zig");
 const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
+const kernel_memory = @import("kernel_memory.zig");
 const symbols = @import("../symbols.zig");
 
 const status_none: i32 = 0;
@@ -329,6 +330,31 @@ fn imeDialogGetResult(result: ?*[8]u8) callconv(abi.guest) i32 {
     return errno.ok;
 }
 
+/// Reports how much of the screen the on-screen keyboard would cover.
+///
+/// A title asks this to lay its own text field out around the panel. This
+/// dialog never presents one — it completes as soon as it is opened, because
+/// there is nobody here to type — so the honest answer is that nothing is
+/// covered. Naming a plausible-looking panel instead would push the title's
+/// own interface aside to make room for a keyboard that never appears.
+pub fn imeDialogGetPanelSizeExtended(
+    _: ?*const anyopaque,
+    _: ?*const anyopaque,
+    width: ?*u32,
+    height: ?*u32,
+) callconv(abi.guest) i32 {
+    const width_output = width orelse return ime_error_invalid_address;
+    const height_output = height orelse return ime_error_invalid_address;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(width_output), @sizeOf(u32)) or
+        !kernel_memory.isGuestRangeAccessible(@intFromPtr(height_output), @sizeOf(u32)))
+    {
+        return ime_error_invalid_address;
+    }
+    width_output.* = 0;
+    height_output.* = 0;
+    return errno.ok;
+}
+
 fn imeDialogTerm() callconv(abi.guest) i32 {
     ime_dialog_status.store(status_none, .release);
     return errno.ok;
@@ -421,4 +447,22 @@ test "dialog libraries register the title import surface" {
     try std.testing.expect(db.findById("x01jxu+vxlc", .function) != null);
     try std.testing.expect(db.findById("-4GCfYdNF1s", .function) != null);
     try std.testing.expect(db.findById("UtXl-tmi7iw", .function) != null);
+}
+
+test "the keyboard panel covers nothing and refuses a bad destination" {
+    var width: u32 = 0xdead;
+    var height: u32 = 0xbeef;
+    try std.testing.expectEqual(errno.ok, imeDialogGetPanelSizeExtended(null, null, &width, &height));
+    try std.testing.expectEqual(@as(u32, 0), width);
+    try std.testing.expectEqual(@as(u32, 0), height);
+
+    // A missing destination is refused rather than written past.
+    try std.testing.expectEqual(
+        ime_error_invalid_address,
+        imeDialogGetPanelSizeExtended(null, null, null, &height),
+    );
+    try std.testing.expectEqual(
+        ime_error_invalid_address,
+        imeDialogGetPanelSizeExtended(null, null, &width, null),
+    );
 }
