@@ -7,6 +7,7 @@
 //! services.zig, where it can be read without a thousand lines in the way.
 
 const services = @import("services.zig");
+const json = @import("json.zig");
 const av_player = @import("av_player.zig");
 const font = @import("font.zig");
 const platform_services = @import("platform_services.zig");
@@ -238,20 +239,20 @@ pub const imedialog_exports = [_]symbols.Export{
 };
 
 pub const json2_exports = [_]symbols.Export{
-    .{ .name = "_ZN3sce4Json6ObjectC1Ev", .function = trace.wrap("_ZN3sce4Json6ObjectC1Ev", &services.absent), .expect_id = "OJPTonqdg0I" },
-    .{ .name = "_ZN3sce4Json6StringC1EPKc", .function = trace.wrap("_ZN3sce4Json6StringC1EPKc", &services.absent), .expect_id = "9KUZFjI1IxA" },
+    .{ .name = "_ZN3sce4Json6ObjectC1Ev", .function = trace.wrap("_ZN3sce4Json6ObjectC1Ev", &json.objectConstruct), .expect_id = "OJPTonqdg0I" },
+    .{ .name = "_ZN3sce4Json6StringC1EPKc", .function = trace.wrap("_ZN3sce4Json6StringC1EPKc", &json.stringConstructFromText), .expect_id = "9KUZFjI1IxA" },
     .{ .name = "_ZN3sce4Json5ValueC1ERKNS0_6StringE", .function = trace.wrap("_ZN3sce4Json5ValueC1ERKNS0_6StringE", &services.absent), .expect_id = "sZIoMRGO+jk" },
-    .{ .name = "_ZN3sce4Json6ObjectixERKNS0_6StringE", .function = trace.wrap("_ZN3sce4Json6ObjectixERKNS0_6StringE", &services.absent), .expect_id = "ERuf9y0DY84" },
-    .{ .name = "_ZN3sce4Json5ValueaSERKS1_", .function = trace.wrap("_ZN3sce4Json5ValueaSERKS1_", &services.absent), .expect_id = "4zrm6VrgIAw" },
-    .{ .name = "_ZN3sce4Json6StringD1Ev", .function = trace.wrap("_ZN3sce4Json6StringD1Ev", &services.absent), .expect_id = "cG1VE2HMl6c" },
-    .{ .name = "_ZN3sce4Json5ValueD1Ev", .function = trace.wrap("_ZN3sce4Json5ValueD1Ev", &services.absent), .expect_id = "WTtYf+cNnXI" },
-    .{ .name = "_ZN3sce4Json6ObjectC1ERKS1_", .function = trace.wrap("_ZN3sce4Json6ObjectC1ERKS1_", &services.absent), .expect_id = "a+W7HHlwpBs" },
-    .{ .name = "_ZN3sce4Json6ObjectD1Ev", .function = trace.wrap("_ZN3sce4Json6ObjectD1Ev", &services.absent), .expect_id = "5JmzZt8twAo" },
-    .{ .name = "_ZN3sce4Json5ValueC1Ev", .function = trace.wrap("_ZN3sce4Json5ValueC1Ev", &services.absent), .expect_id = "qBMjqyBn3OM" },
-    .{ .name = "_ZN3sce4Json6Parser5parseERNS0_5ValueEPKcm", .function = trace.wrap("_ZN3sce4Json6Parser5parseERNS0_5ValueEPKcm", &services.absent), .expect_id = "S5JxQnoGF3E" },
-    .{ .name = "_ZNK3sce4Json5ValueixEPKc", .function = trace.wrap("_ZNK3sce4Json5ValueixEPKc", &services.absent), .expect_id = "HwDt5lD9Bfo" },
-    .{ .name = "_ZNK3sce4Json5Value9getStringEv", .function = trace.wrap("_ZNK3sce4Json5Value9getStringEv", &services.absent), .expect_id = "epJ6x2LV0kU" },
-    .{ .name = "_ZNK3sce4Json6String5c_strEv", .function = trace.wrap("_ZNK3sce4Json6String5c_strEv", &services.absent), .expect_id = "L1KAkYWml-M" },
+    .{ .name = "_ZN3sce4Json6ObjectixERKNS0_6StringE", .function = trace.wrap("_ZN3sce4Json6ObjectixERKNS0_6StringE", &json.objectSubscript), .expect_id = "ERuf9y0DY84" },
+    .{ .name = "_ZN3sce4Json5ValueaSERKS1_", .function = trace.wrap("_ZN3sce4Json5ValueaSERKS1_", &json.valueCopyAssign), .expect_id = "4zrm6VrgIAw" },
+    .{ .name = "_ZN3sce4Json6StringD1Ev", .function = trace.wrap("_ZN3sce4Json6StringD1Ev", &json.stringDestruct), .expect_id = "cG1VE2HMl6c" },
+    .{ .name = "_ZN3sce4Json5ValueD1Ev", .function = trace.wrap("_ZN3sce4Json5ValueD1Ev", &json.valueDestruct), .expect_id = "WTtYf+cNnXI" },
+    .{ .name = "_ZN3sce4Json6ObjectC1ERKS1_", .function = trace.wrap("_ZN3sce4Json6ObjectC1ERKS1_", &json.objectCopyConstruct), .expect_id = "a+W7HHlwpBs" },
+    .{ .name = "_ZN3sce4Json6ObjectD1Ev", .function = trace.wrap("_ZN3sce4Json6ObjectD1Ev", &json.objectDestruct), .expect_id = "5JmzZt8twAo" },
+    .{ .name = "_ZN3sce4Json5ValueC1Ev", .function = trace.wrap("_ZN3sce4Json5ValueC1Ev", &json.valueConstruct), .expect_id = "qBMjqyBn3OM" },
+    .{ .name = "_ZN3sce4Json6Parser5parseERNS0_5ValueEPKcm", .function = trace.wrap("_ZN3sce4Json6Parser5parseERNS0_5ValueEPKcm", &json.parserParse), .expect_id = "S5JxQnoGF3E" },
+    .{ .name = "_ZNK3sce4Json5ValueixEPKc", .function = trace.wrap("_ZNK3sce4Json5ValueixEPKc", &json.valueSubscriptName), .expect_id = "HwDt5lD9Bfo" },
+    .{ .name = "_ZNK3sce4Json5Value9getStringEv", .function = trace.wrap("_ZNK3sce4Json5Value9getStringEv", &json.valueGetString), .expect_id = "epJ6x2LV0kU" },
+    .{ .name = "_ZNK3sce4Json6String5c_strEv", .function = trace.wrap("_ZNK3sce4Json6String5c_strEv", &json.stringCStr), .expect_id = "L1KAkYWml-M" },
     // JSON's process-wide bootstrap owns no guest-visible result handles. The
     // offline CppWebApi module still initializes it before deciding that no
     // network service is available, so returning ENOSYS here aborts the whole
@@ -597,30 +598,30 @@ pub const json2_extra_exports = [_]symbols.Export{
     .{ .name = "_ZN3sce4Json5Value3setERKNS0_6ObjectE", .function = trace.wrap("_ZN3sce4Json5Value3setERKNS0_6ObjectE", &services.absent), .expect_id = "dFCphqnd+a4" },
     .{ .name = "_ZN3sce4Json5ValueC1El", .function = trace.wrap("_ZN3sce4Json5ValueC1El", &services.absent), .expect_id = "0lLK8+kDqmE" },
     .{ .name = "_ZN3sce4Json5ValueC1ERKNS0_5ArrayE", .function = trace.wrap("_ZN3sce4Json5ValueC1ERKNS0_5ArrayE", &services.absent), .expect_id = "iZeYfOxtMRg" },
-    .{ .name = "_ZNK3sce4Json5Value7getRealEv", .function = trace.wrap("_ZNK3sce4Json5Value7getRealEv", &services.absent), .expect_id = "3qrge7L-AU4" },
+    .{ .name = "_ZNK3sce4Json5Value7getRealEv", .function = trace.wrap("_ZNK3sce4Json5Value7getRealEv", &json.valueGetReal), .expect_id = "3qrge7L-AU4" },
     .{ .name = "_ZN3sce4Json5ValueC1ERKNS0_6ObjectE", .function = trace.wrap("_ZN3sce4Json5ValueC1ERKNS0_6ObjectE", &services.absent), .expect_id = "3xUXnmUkXfo" },
     .{ .name = "_ZN3sce4Json5ValueC1EPKc", .function = trace.wrap("_ZN3sce4Json5ValueC1EPKc", &services.absent), .expect_id = "b9V6fmppLXY" },
     .{ .name = "_ZNK3sce4Json5Array4backEv", .function = trace.wrap("_ZNK3sce4Json5Array4backEv", &services.absent), .expect_id = "bAM9Qwofus0" },
     .{ .name = "_ZN3sce4Json5ArrayC1Ev", .function = trace.wrap("_ZN3sce4Json5ArrayC1Ev", &services.absent), .expect_id = "JP-PtKMiI1E" },
     .{ .name = "_ZN3sce4Json5ArrayD1Ev", .function = trace.wrap("_ZN3sce4Json5ArrayD1Ev", &services.absent), .expect_id = "HJ8GpRT1aiw" },
     .{ .name = "_ZN3sce4Json6StringaSERKS1_", .function = trace.wrap("_ZN3sce4Json6StringaSERKS1_", &services.absent), .expect_id = "cn9svYGWKDQ" },
-    .{ .name = "_ZNK3sce4Json5Value10getIntegerEv", .function = trace.wrap("_ZNK3sce4Json5Value10getIntegerEv", &services.absent), .expect_id = "DIxvoy7Ngvk" },
-    .{ .name = "_ZNK3sce4Json6String6lengthEv", .function = trace.wrap("_ZNK3sce4Json6String6lengthEv", &services.absent), .expect_id = "EUH+EmT-v9E" },
+    .{ .name = "_ZNK3sce4Json5Value10getIntegerEv", .function = trace.wrap("_ZNK3sce4Json5Value10getIntegerEv", &json.valueGetInteger), .expect_id = "DIxvoy7Ngvk" },
+    .{ .name = "_ZNK3sce4Json6String6lengthEv", .function = trace.wrap("_ZNK3sce4Json6String6lengthEv", &json.stringLength), .expect_id = "EUH+EmT-v9E" },
     .{ .name = "_ZN3sce4Json5Value3setENS0_9ValueTypeE", .function = trace.wrap("_ZN3sce4Json5Value3setENS0_9ValueTypeE", &services.absent), .expect_id = "IKQimvG9Wqs" },
     .{ .name = "_ZNK3sce4Json5Value9getObjectEv", .function = trace.wrap("_ZNK3sce4Json5Value9getObjectEv", &services.absent), .expect_id = "IlsmvBtMkak" },
     .{ .name = "_ZN3sce4Json5Value10referArrayEv", .function = trace.wrap("_ZN3sce4Json5Value10referArrayEv", &services.absent), .expect_id = "nM5XqdeXFPw" },
     .{ .name = "_ZN3sce4Json6Object5clearEv", .function = trace.wrap("_ZN3sce4Json6Object5clearEv", &services.absent), .expect_id = "oH8aBmLU+fc" },
     .{ .name = "_ZNK3sce4Json5Value8getArrayEv", .function = trace.wrap("_ZNK3sce4Json5Value8getArrayEv", &services.absent), .expect_id = "ONT8As5R1ug" },
-    .{ .name = "_ZN3sce4Json6StringC1Ev", .function = trace.wrap("_ZN3sce4Json6StringC1Ev", &services.absent), .expect_id = "qSmqLXXCPas" },
+    .{ .name = "_ZN3sce4Json6StringC1Ev", .function = trace.wrap("_ZN3sce4Json6StringC1Ev", &json.stringConstructEmpty), .expect_id = "qSmqLXXCPas" },
     .{ .name = "_ZN3sce4Json5Value9serializeERNS0_6StringE", .function = trace.wrap("_ZN3sce4Json5Value9serializeERNS0_6StringE", &services.absent), .expect_id = "R7FDWtcN6f8" },
-    .{ .name = "_ZNK3sce4Json5Array4sizeEv", .function = trace.wrap("_ZNK3sce4Json5Array4sizeEv", &services.absent), .expect_id = "rQGJeNjOuUk" },
-    .{ .name = "_ZNK3sce4Json5Value7getTypeEv", .function = trace.wrap("_ZNK3sce4Json5Value7getTypeEv", &services.absent), .expect_id = "SHtAad20YYM" },
+    .{ .name = "_ZNK3sce4Json5Array4sizeEv", .function = trace.wrap("_ZNK3sce4Json5Array4sizeEv", &json.arraySize), .expect_id = "rQGJeNjOuUk" },
+    .{ .name = "_ZNK3sce4Json5Value7getTypeEv", .function = trace.wrap("_ZNK3sce4Json5Value7getTypeEv", &json.valueGetType), .expect_id = "SHtAad20YYM" },
     .{ .name = "_ZN3sce4Json5ValueC1Ed", .function = trace.wrap("_ZN3sce4Json5ValueC1Ed", &services.absent), .expect_id = "sOmU4vnx3s0" },
     .{ .name = "_ZN3sce4Json5ValueC1Eb", .function = trace.wrap("_ZN3sce4Json5ValueC1Eb", &services.absent), .expect_id = "UeuWT+yNdCQ" },
     .{ .name = "_ZN3sce4Json6ObjectaSERKS1_", .function = trace.wrap("_ZN3sce4Json6ObjectaSERKS1_", &services.absent), .expect_id = "urOpESTBZmo" },
-    .{ .name = "_ZNK3sce4Json5ValueixEm", .function = trace.wrap("_ZNK3sce4Json5ValueixEm", &services.absent), .expect_id = "XlWbvieLj2M" },
+    .{ .name = "_ZNK3sce4Json5ValueixEm", .function = trace.wrap("_ZNK3sce4Json5ValueixEm", &json.valueSubscriptIndex), .expect_id = "XlWbvieLj2M" },
     .{ .name = "_ZN3sce4Json5Array9push_backERKNS0_5ValueE", .function = trace.wrap("_ZN3sce4Json5Array9push_backERKNS0_5ValueE", &services.absent), .expect_id = "zQtLRTqceMY" },
-    .{ .name = "_ZNK3sce4Json5Value10getBooleanEv", .function = trace.wrap("_ZNK3sce4Json5Value10getBooleanEv", &services.absent), .expect_id = "zTwZdI8AZ5Y" },
+    .{ .name = "_ZNK3sce4Json5Value10getBooleanEv", .function = trace.wrap("_ZNK3sce4Json5Value10getBooleanEv", &json.valueGetBoolean), .expect_id = "zTwZdI8AZ5Y" },
 };
 
 pub const npwebapi2_extra_exports = [_]symbols.Export{
