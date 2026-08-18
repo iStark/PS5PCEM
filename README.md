@@ -2156,6 +2156,12 @@ scheduler and Vulkan backend. Observed startup work now includes:
   resource probes remain opt-in through `log_verbose_gpu`. A second profile line
   reports pipeline and shader-analysis cache behaviour alongside the time spent
   in scalar provenance, SPIR-V translation, and sampled-resource preparation.
+- `sceRtcParseRFC3339` and `sceRtcFormatRFC3339` convert between RTC ticks and
+  the date-and-time strings save metadata and network services exchange. The
+  grammar is fixed by the standard, so the parser accepts exactly what the
+  standard allows and refuses the rest rather than guessing: a malformed date
+  is an error, not an approximate instant. A zone offset moves the instant and
+  not the reading, so a tick is always UTC however the text was written.
 - A colour target is the memory it occupies, not every register describing how
   that memory is read. A title routinely binds one allocation twice — a
   different channel swap, a forced destination alpha, a pitch left implied

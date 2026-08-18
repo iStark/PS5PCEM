@@ -190,6 +190,168 @@ fn tickFromRtcDateTime(value: RtcDateTime) ?u64 {
     return @intCast(tick);
 }
 
+/// Longest string the RFC 3339 formatter can produce, including its
+/// terminator: a full date and time with a numeric zone offset.
+const rfc3339_maximum_length: usize = 26;
+
+fn twoDigits(text: []const u8) ?u32 {
+    if (text.len < 2) return null;
+    if (!std.ascii.isDigit(text[0]) or !std.ascii.isDigit(text[1])) return null;
+    return (@as(u32, text[0] - '0') * 10) + (text[1] - '0');
+}
+
+fn fourDigits(text: []const u8) ?u32 {
+    if (text.len < 4) return null;
+    var value: u32 = 0;
+    for (text[0..4]) |digit| {
+        if (!std.ascii.isDigit(digit)) return null;
+        value = value * 10 + (digit - '0');
+    }
+    return value;
+}
+
+const ParsedRfc3339 = struct {
+    date_time: RtcDateTime,
+    offset_minutes: i32,
+};
+
+/// Reads one RFC 3339 date and time, with the zone it was written in.
+///
+/// The grammar is fixed by the standard, so this accepts exactly what the
+/// standard allows and nothing more: a full date, a `T` or `t` separator, a
+/// time, an optional fractional second of any length, and either `Z` for UTC
+/// or a signed hour-and-minute offset. Anything else is a malformed value
+/// rather than something to guess at.
+fn parseRfc3339(text: []const u8) ?ParsedRfc3339 {
+    if (text.len < 20) return null;
+    const year = fourDigits(text[0..]) orelse return null;
+    if (text[4] != '-') return null;
+    const month = twoDigits(text[5..]) orelse return null;
+    if (text[7] != '-') return null;
+    const day = twoDigits(text[8..]) orelse return null;
+    if (text[10] != 'T' and text[10] != 't' and text[10] != ' ') return null;
+    const hour = twoDigits(text[11..]) orelse return null;
+    if (text[13] != ':') return null;
+    const minute = twoDigits(text[14..]) orelse return null;
+    if (text[16] != ':') return null;
+    const second = twoDigits(text[17..]) orelse return null;
+
+    var index: usize = 19;
+    var microsecond: u32 = 0;
+    if (index < text.len and text[index] == '.') {
+        index += 1;
+        var scale: u32 = 100_000;
+        var digits: usize = 0;
+        while (index < text.len and std.ascii.isDigit(text[index])) : (index += 1) {
+            // Beyond microsecond resolution the remaining digits are read and
+            // discarded: they are well formed, they simply cannot be kept.
+            if (scale != 0) {
+                microsecond += @as(u32, text[index] - '0') * scale;
+                scale /= 10;
+            }
+            digits += 1;
+        }
+        if (digits == 0) return null;
+    }
+
+    if (index >= text.len) return null;
+    var offset_minutes: i32 = 0;
+    switch (text[index]) {
+        'Z', 'z' => index += 1,
+        '+', '-' => {
+            const negative = text[index] == '-';
+            index += 1;
+            const offset_hour = twoDigits(text[index..]) orelse return null;
+            index += 2;
+            if (index >= text.len or text[index] != ':') return null;
+            index += 1;
+            const offset_minute = twoDigits(text[index..]) orelse return null;
+            index += 2;
+            if (offset_hour > 23 or offset_minute > 59) return null;
+            const magnitude: i32 = @intCast(offset_hour * 60 + offset_minute);
+            offset_minutes = if (negative) -magnitude else magnitude;
+        },
+        else => return null,
+    }
+    if (index != text.len) return null;
+
+    const value = RtcDateTime{
+        .year = std.math.cast(u16, year) orelse return null,
+        .month = std.math.cast(u16, month) orelse return null,
+        .day = std.math.cast(u16, day) orelse return null,
+        .hour = std.math.cast(u16, hour) orelse return null,
+        .minute = std.math.cast(u16, minute) orelse return null,
+        .second = std.math.cast(u16, second) orelse return null,
+        .microsecond = microsecond,
+    };
+    if (!validRtcDateTime(value)) return null;
+    return .{ .date_time = value, .offset_minutes = offset_minutes };
+}
+
+/// Converts a tick to the calendar reading seen at a given zone offset.
+fn shiftedDateTime(tick: u64, offset_minutes: i32) ?RtcDateTime {
+    const shifted: i128 = @as(i128, tick) +
+        @as(i128, offset_minutes) * @as(i128, std.time.us_per_min);
+    if (shifted < 0 or shifted > std.math.maxInt(u64)) return null;
+    return rtcDateTimeFromTick(@intCast(shifted));
+}
+
+pub fn rtcFormatRFC3339(
+    output: ?[*]u8,
+    tick_pointer: ?*const u64,
+    time_zone_minutes: i32,
+) callconv(abi.guest) i32 {
+    const destination = output orelse return rtc_error_invalid_pointer;
+    const source = tick_pointer orelse return rtc_error_invalid_pointer;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(destination), rfc3339_maximum_length) or
+        !kernel_memory.isGuestRangeAccessible(@intFromPtr(source), @sizeOf(u64)))
+    {
+        return gen2_error_memory_fault;
+    }
+    if (time_zone_minutes < -23 * 60 or time_zone_minutes > 23 * 60) return rtc_error_invalid_value;
+    const local = shiftedDateTime(source.*, time_zone_minutes) orelse return rtc_error_invalid_value;
+
+    var buffer: [rfc3339_maximum_length]u8 = @splat(0);
+    const text = if (time_zone_minutes == 0)
+        std.fmt.bufPrint(&buffer, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+            local.year, local.month, local.day, local.hour, local.minute, local.second,
+        }) catch return rtc_error_invalid_value
+    else text: {
+        const negative = time_zone_minutes < 0;
+        const magnitude: u32 = @intCast(if (negative) -time_zone_minutes else time_zone_minutes);
+        break :text std.fmt.bufPrint(
+            &buffer,
+            "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}{c}{d:0>2}:{d:0>2}",
+            .{
+                local.year,       local.month, local.day,
+                local.hour,       local.minute, local.second,
+                @as(u8, if (negative) '-' else '+'),
+                magnitude / 60,   magnitude % 60,
+            },
+        ) catch return rtc_error_invalid_value;
+    };
+    @memcpy(destination[0..text.len], text);
+    destination[text.len] = 0;
+    return errno.ok;
+}
+
+pub fn rtcParseRFC3339(tick_pointer: ?*u64, text_pointer: ?[*:0]const u8) callconv(abi.guest) i32 {
+    const destination = tick_pointer orelse return rtc_error_invalid_pointer;
+    const source = text_pointer orelse return rtc_error_invalid_pointer;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(destination), @sizeOf(u64))) {
+        return gen2_error_memory_fault;
+    }
+    const text = std.mem.sliceTo(source, 0);
+    const parsed = parseRfc3339(text) orelse return rtc_error_invalid_value;
+    const local_tick = tickFromRtcDateTime(parsed.date_time) orelse return rtc_error_invalid_value;
+    // The string carries the zone it was written in; the tick is always UTC.
+    const utc: i128 = @as(i128, local_tick) -
+        @as(i128, parsed.offset_minutes) * @as(i128, std.time.us_per_min);
+    if (utc < 0 or utc > std.math.maxInt(u64)) return rtc_error_invalid_value;
+    destination.* = @intCast(utc);
+    return errno.ok;
+}
+
 fn checkedRtcOutput(output: ?*RtcDateTime) ?*RtcDateTime {
     const destination = output orelse return null;
     if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(destination), @sizeOf(RtcDateTime))) return null;
@@ -355,4 +517,46 @@ test "temporary data mount returns a zero-terminated mount point" {
     try std.testing.expectEqualStrings("/temp0", std.mem.sliceTo(&mount_point, 0));
     try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 9), mount_point[7..]);
     try std.testing.expectEqual(errno.KernelError.einval.raw(), temporaryDataMount2(0, null));
+}
+
+test "RFC 3339 text and RTC ticks convert in both directions" {
+    // 2024-02-29T12:34:56.789012Z — a leap day, so the calendar arithmetic is
+    // exercised rather than assumed.
+    const parsed = parseRfc3339("2024-02-29T12:34:56.789012Z") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u16, 2024), parsed.date_time.year);
+    try std.testing.expectEqual(@as(u16, 2), parsed.date_time.month);
+    try std.testing.expectEqual(@as(u16, 29), parsed.date_time.day);
+    try std.testing.expectEqual(@as(u16, 12), parsed.date_time.hour);
+    try std.testing.expectEqual(@as(u32, 789_012), parsed.date_time.microsecond);
+    try std.testing.expectEqual(@as(i32, 0), parsed.offset_minutes);
+
+    // A zone offset moves the instant, not the reading: both spellings below
+    // name the same moment.
+    const utc = parseRfc3339("2024-02-29T12:00:00Z") orelse return error.TestUnexpectedResult;
+    const shifted = parseRfc3339("2024-02-29T14:30:00+02:30") orelse return error.TestUnexpectedResult;
+    const utc_tick = tickFromRtcDateTime(utc.date_time) orelse return error.TestUnexpectedResult;
+    const shifted_tick = tickFromRtcDateTime(shifted.date_time) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(
+        @as(i128, utc_tick),
+        @as(i128, shifted_tick) - @as(i128, shifted.offset_minutes) * std.time.us_per_min,
+    );
+
+    // Round trip through the formatter, which writes UTC as `Z`.
+    var tick: u64 = utc_tick;
+    var text: [rfc3339_maximum_length]u8 = @splat(0xaa);
+    try std.testing.expectEqual(errno.ok, rtcFormatRFC3339(&text, &tick, 0));
+    try std.testing.expectEqualStrings("2024-02-29T12:00:00Z", std.mem.sliceTo(&text, 0));
+
+    // And with an offset, which shifts the printed reading and names itself.
+    try std.testing.expectEqual(errno.ok, rtcFormatRFC3339(&text, &tick, -90));
+    try std.testing.expectEqualStrings("2024-02-29T10:30:00-01:30", std.mem.sliceTo(&text, 0));
+}
+
+test "malformed RFC 3339 text is refused rather than guessed at" {
+    try std.testing.expect(parseRfc3339("2024-02-30T00:00:00Z") == null); // no such day
+    try std.testing.expect(parseRfc3339("2024-02-29T12:00:00") == null); // no zone
+    try std.testing.expect(parseRfc3339("2024-02-29 12:00:00Z extra") == null); // trailing text
+    try std.testing.expect(parseRfc3339("2024-02-29T12:00:00.Z") == null); // empty fraction
+    try std.testing.expect(parseRfc3339("2024-02-29T12:00:00+2:00") == null); // short offset
+    try std.testing.expect(parseRfc3339("") == null);
 }

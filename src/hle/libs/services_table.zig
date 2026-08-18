@@ -628,8 +628,8 @@ pub const npwebapi2_extra_exports = [_]symbols.Export{
 };
 
 pub const rtc_extra_exports = [_]symbols.Export{
-    .{ .name = "sceRtcParseRFC3339", .function = trace.wrap("sceRtcParseRFC3339", &services.absent), .expect_id = "99bMGglFW3I" },
-    .{ .name = "sceRtcFormatRFC3339", .function = trace.wrap("sceRtcFormatRFC3339", &services.absent), .expect_id = "WJ3rqFwymew" },
+    .{ .name = "sceRtcParseRFC3339", .function = trace.wrap("sceRtcParseRFC3339", &platform_services.rtcParseRFC3339), .expect_id = "99bMGglFW3I" },
+    .{ .name = "sceRtcFormatRFC3339", .function = trace.wrap("sceRtcFormatRFC3339", &platform_services.rtcFormatRFC3339), .expect_id = "WJ3rqFwymew" },
 };
 
 pub const Table = struct { library: []const u8, module: []const u8, exports: []const symbols.Export };
