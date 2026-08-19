@@ -449,6 +449,7 @@ const DeviceFunctions = struct {
     cmd_copy_image_to_buffer: vk.PfnCmdCopyImageToBuffer,
     cmd_copy_buffer_to_image: vk.PfnCmdCopyBufferToImage,
     cmd_blit_image: vk.PfnCmdBlitImage,
+    cmd_resolve_image: vk.PfnCmdResolveImage,
     cmd_pipeline_barrier: vk.PfnCmdPipelineBarrier,
 
     fn load(get_proc: vk.PfnGetDeviceProcAddr, device: vk.Device) Error!DeviceFunctions {
@@ -518,6 +519,7 @@ const DeviceFunctions = struct {
             .cmd_copy_image_to_buffer = try deviceProc(get_proc, device, vk.PfnCmdCopyImageToBuffer, "vkCmdCopyImageToBuffer"),
             .cmd_copy_buffer_to_image = try deviceProc(get_proc, device, vk.PfnCmdCopyBufferToImage, "vkCmdCopyBufferToImage"),
             .cmd_blit_image = try deviceProc(get_proc, device, vk.PfnCmdBlitImage, "vkCmdBlitImage"),
+            .cmd_resolve_image = try deviceProc(get_proc, device, vk.PfnCmdResolveImage, "vkCmdResolveImage"),
             .cmd_pipeline_barrier = try deviceProc(get_proc, device, vk.PfnCmdPipelineBarrier, "vkCmdPipelineBarrier"),
         };
     }
@@ -753,6 +755,24 @@ const GraphicsPipelineState = extern struct {
     /// that stage forwards belong in the key, because they change the pipeline.
     rectangle_completion: u32,
     rectangle_parameter_mask: u32,
+    /// Vulkan sample-count flag for the pass. Colour and depth attachments of
+    /// one draw share this value.
+    rasterization_samples: u32,
+    stencil_test_enable: u32,
+    stencil_front_fail: u32,
+    stencil_front_pass: u32,
+    stencil_front_depth_fail: u32,
+    stencil_front_compare: u32,
+    stencil_front_compare_mask: u32,
+    stencil_front_write_mask: u32,
+    stencil_front_reference: u32,
+    stencil_back_fail: u32,
+    stencil_back_pass: u32,
+    stencil_back_depth_fail: u32,
+    stencil_back_compare: u32,
+    stencil_back_compare_mask: u32,
+    stencil_back_write_mask: u32,
+    stencil_back_reference: u32,
 
     fn default(width: u32, height: u32) GraphicsPipelineState {
         return .{
@@ -787,6 +807,22 @@ const GraphicsPipelineState = extern struct {
             .depth_test_enable = 0,
             .depth_write_enable = 0,
             .depth_compare_operation = 0,
+            .rasterization_samples = vk.sample_count_1_bit,
+            .stencil_test_enable = 0,
+            .stencil_front_fail = 0,
+            .stencil_front_pass = 0,
+            .stencil_front_depth_fail = 0,
+            .stencil_front_compare = 0,
+            .stencil_front_compare_mask = 0,
+            .stencil_front_write_mask = 0,
+            .stencil_front_reference = 0,
+            .stencil_back_fail = 0,
+            .stencil_back_pass = 0,
+            .stencil_back_depth_fail = 0,
+            .stencil_back_compare = 0,
+            .stencil_back_compare_mask = 0,
+            .stencil_back_write_mask = 0,
+            .stencil_back_reference = 0,
         };
     }
 };
@@ -907,21 +943,35 @@ fn colorTargetFormat(descriptor: gpu.resources.ColorTarget) ?ColorTargetFormat {
 /// The Vulkan attachment format for a guest depth plane.
 ///
 /// DB_Z_INFO.FORMAT names the stored precision: 1 is sixteen-bit unorm and 3 is
-/// thirty-two bit float. Both have a direct Vulkan counterpart, so nothing is
-/// approximated here; formats outside that pair are left unsupported instead of
-/// being forced into a nearby one, because silently changing depth precision
-/// changes which fragments a title keeps.
+/// thirty-two bit float. When an S8 stencil plane is bound the host uses a
+/// packed depth+stencil format. D16+S8 is stored as D24_UNORM_S8 because that
+/// pair is the one desktop devices actually expose as an attachment.
 fn depthTargetFormat(descriptor: gpu.resources.DepthTarget) ?u32 {
+    const has_stencil = descriptor.stencil_format == 1 and
+        (descriptor.stencil_read_address != 0 or descriptor.stencil_write_address != 0);
     return switch (descriptor.format) {
-        1 => vk.format_d16_unorm,
-        3 => vk.format_d32_sfloat,
+        1 => if (has_stencil) vk.format_d24_unorm_s8_uint else vk.format_d16_unorm,
+        3 => if (has_stencil) vk.format_d32_sfloat_s8_uint else vk.format_d32_sfloat,
         else => null,
     };
 }
 
+fn depthAttachmentHasStencil(format: u32) bool {
+    return format == vk.format_d24_unorm_s8_uint or format == vk.format_d32_sfloat_s8_uint;
+}
+
+fn depthAttachmentAspect(format: u32) vk.Flags {
+    return if (depthAttachmentHasStencil(format))
+        vk.image_aspect_depth_bit | vk.image_aspect_stencil_bit
+    else
+        vk.image_aspect_depth_bit;
+}
+
 fn depthSampledFormatCompatible(depth_format: u32, sampled_format: u32) bool {
-    return (depth_format == vk.format_d16_unorm and sampled_format == vk.format_r16_unorm) or
-        (depth_format == vk.format_d32_sfloat and sampled_format == vk.format_r32_sfloat);
+    const depth16 = depth_format == vk.format_d16_unorm or depth_format == vk.format_d24_unorm_s8_uint;
+    const depth32 = depth_format == vk.format_d32_sfloat or depth_format == vk.format_d32_sfloat_s8_uint;
+    return (depth16 and sampled_format == vk.format_r16_unorm) or
+        (depth32 and sampled_format == vk.format_r32_sfloat);
 }
 
 /// The guest depth-compare selector and Vulkan's `VkCompareOp` enumerate the
@@ -930,14 +980,50 @@ fn depthCompareOperation(function: u8) u32 {
     return @as(u32, function & 0x7);
 }
 
-/// The first host implementation keeps one color value per pixel.  Preserve
-/// the guest allocation and fixed-function resolve semantics while rendering
-/// an MSAA target as a single-sample attachment; a later CB resolve copies the
-/// resulting pixels to its single-sample destination.
+/// Guest sample/fragment encodings are log2 of 1/2/4/8. The matching Vulkan
+/// sample-count flag is the same power of two.
+fn rasterSampleCount(samples_log2: u8) ?u32 {
+    return switch (samples_log2) {
+        0 => vk.sample_count_1_bit,
+        1 => vk.sample_count_2_bit,
+        2 => vk.sample_count_4_bit,
+        3 => vk.sample_count_8_bit,
+        else => null,
+    };
+}
+
+fn colorTargetSamplesLog2(descriptor: gpu.resources.ColorTarget) ?u8 {
+    if (descriptor.samples_log2 > 3 or descriptor.fragments_log2 > 3) return null;
+    if (descriptor.samples_log2 != descriptor.fragments_log2) return null;
+    return descriptor.fragments_log2;
+}
+
+/// Guest stencil operations that Vulkan can express. Ones, bitwise AND/OR,
+/// and NAND/NOR/XNOR have no host counterpart and stay as keep so a title
+/// that never hits them still draws.
+fn hostStencilOperation(operation: u8, write_mask: u8, op_value: u8) u32 {
+    if (write_mask == 0) return vk.stencil_op_keep;
+    return switch (operation) {
+        0 => vk.stencil_op_keep,
+        1 => vk.stencil_op_zero,
+        3, 4 => vk.stencil_op_replace,
+        5 => vk.stencil_op_increment_and_clamp,
+        6 => vk.stencil_op_decrement_and_clamp,
+        7 => vk.stencil_op_invert,
+        8 => vk.stencil_op_increment_and_wrap,
+        9 => vk.stencil_op_decrement_and_wrap,
+        0xc => if ((write_mask & ~op_value) == 0)
+            vk.stencil_op_invert
+        else
+            vk.stencil_op_keep,
+        else => vk.stencil_op_keep,
+    };
+}
+
+/// FMASK is still ignored. Sample and fragment counts stay on the
+/// descriptor so the host image can match the guest attachment.
 fn hostColorTargetDescriptor(descriptor: gpu.resources.ColorTarget) gpu.resources.ColorTarget {
     var host = descriptor;
-    host.samples_log2 = 0;
-    host.fragments_log2 = 0;
     host.fmask_compression = false;
     host.fmask_address = 0;
     // A Vulkan 2D attachment represents one selected slice. Until layered
@@ -952,12 +1038,15 @@ fn hostColorTargetDescriptor(descriptor: gpu.resources.ColorTarget) gpu.resource
 }
 
 fn guestColorTarget(descriptor_: gpu.resources.ColorTarget) anyerror!GuestColorTarget {
-    if (descriptor_.samples_log2 > 3 or descriptor_.fragments_log2 > descriptor_.samples_log2) {
-        return Error.UnsupportedColorTarget;
-    }
+    _ = colorTargetSamplesLog2(descriptor_) orelse return Error.UnsupportedColorTarget;
     const descriptor = hostColorTargetDescriptor(descriptor_);
     const format = colorTargetFormat(descriptor) orelse return Error.UnsupportedColorTarget;
-    const layout = try gpu.SurfaceLayout.fromColorTarget(descriptor);
+    // CPU tiling still names one sample per pixel. The host image carries the
+    // real sample count; this layout is only identity and 1x staging size.
+    var layout_descriptor = descriptor;
+    layout_descriptor.samples_log2 = 0;
+    layout_descriptor.fragments_log2 = 0;
+    const layout = try gpu.SurfaceLayout.fromColorTarget(layout_descriptor);
     if (layout.layers != 1 or layout.block.bytes_per_element != format.bytes_per_texel) {
         return Error.UnsupportedColorTarget;
     }
@@ -1010,10 +1099,10 @@ const CachedRenderTarget = struct {
 /// A guest depth allocation reduced to what a Vulkan attachment needs.
 ///
 /// The guest describes depth as a base allocation plus an optional separate
-/// stencil allocation and an HTILE metadata surface. Only the depth plane is
-/// represented here: stencil has no translation yet, and HTILE is resolved into
-/// the base allocation by the existing metadata path rather than being handed to
-/// the rasterizer.
+/// stencil allocation and an HTILE metadata surface. Stencil rides in a
+/// packed depth+stencil host format when the guest binds an S8 plane. HTILE
+/// is still resolved into the base allocations by the metadata path rather
+/// than being handed to the rasterizer.
 const GuestDepthTarget = struct {
     address: u64,
     width: u32,
@@ -1024,16 +1113,26 @@ const GuestDepthTarget = struct {
     tile_mode: gpu.resources.TileMode,
     base_array_slice: u16,
     mip_level: u8,
+    samples_log2: u8 = 0,
+    has_stencil: bool = false,
     clear_depth: f32,
+    clear_stencil: u8 = 0,
 
     fn sameAllocation(self: GuestDepthTarget, other: GuestDepthTarget) bool {
         return self.address == other.address and
             self.width == other.width and
             self.height == other.height and
             self.guest_format == other.guest_format and
+            self.format == other.format and
             self.tile_mode == other.tile_mode and
             self.base_array_slice == other.base_array_slice and
-            self.mip_level == other.mip_level;
+            self.mip_level == other.mip_level and
+            self.samples_log2 == other.samples_log2 and
+            self.has_stencil == other.has_stencil;
+    }
+
+    fn aspectMask(self: GuestDepthTarget) vk.Flags {
+        return depthAttachmentAspect(self.format);
     }
 };
 
@@ -5074,9 +5173,15 @@ pub const Renderer = struct {
         };
     }
 
-    fn createGraphicsRenderPass(self: *Renderer, format: u32, preserve_color: bool) Error!vk.RenderPass {
+    fn createGraphicsRenderPass(
+        self: *Renderer,
+        format: u32,
+        preserve_color: bool,
+        samples: u32,
+    ) Error!vk.RenderPass {
         const attachment = vk.AttachmentDescription{
             .format = format,
+            .samples = samples,
             .load_operation = if (preserve_color) vk.attachment_load_op_load else vk.attachment_load_op_clear,
             .store_operation = vk.attachment_store_op_store,
             .initial_layout = if (preserve_color) vk.image_layout_color_attachment_optimal else vk.image_layout_undefined,
@@ -5119,7 +5224,7 @@ pub const Renderer = struct {
         const cached = &self.depth_targets.items[depth_index];
         const first_use = !cached.initialized;
         const clearing = clear_requested or first_use;
-        const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_depth_bit };
+        const range = vk.ImageSubresourceRange{ .aspect_mask = cached.target.aspectMask() };
 
         const old_layout: u32 = if (first_use)
             vk.image_layout_undefined
@@ -5171,7 +5276,7 @@ pub const Renderer = struct {
 
         const clear = vk.ClearDepthStencilValue{
             .depth = std.math.clamp(cached.target.clear_depth, 0, 1),
-            .stencil = 0,
+            .stencil = cached.target.clear_stencil,
         };
         self.device_functions.cmd_clear_depth_stencil_image(
             command_buffer,
@@ -5215,10 +5320,20 @@ pub const Renderer = struct {
         color_format: u32,
         depth_format: u32,
         preserve_color: bool,
+        samples: u32,
     ) Error!vk.RenderPass {
+        const stencil_load = if (depthAttachmentHasStencil(depth_format))
+            vk.attachment_load_op_load
+        else
+            vk.attachment_load_op_dont_care;
+        const stencil_store = if (depthAttachmentHasStencil(depth_format))
+            vk.attachment_store_op_store
+        else
+            vk.attachment_store_op_dont_care;
         const attachments = [2]vk.AttachmentDescription{
             .{
                 .format = color_format,
+                .samples = samples,
                 .load_operation = if (preserve_color) vk.attachment_load_op_load else vk.attachment_load_op_clear,
                 .store_operation = vk.attachment_store_op_store,
                 .initial_layout = if (preserve_color) vk.image_layout_color_attachment_optimal else vk.image_layout_undefined,
@@ -5226,8 +5341,11 @@ pub const Renderer = struct {
             },
             .{
                 .format = depth_format,
+                .samples = samples,
                 .load_operation = vk.attachment_load_op_load,
                 .store_operation = vk.attachment_store_op_store,
+                .stencil_load_operation = stencil_load,
+                .stencil_store_operation = stencil_store,
                 .initial_layout = vk.image_layout_depth_stencil_attachment_optimal,
                 .final_layout = vk.image_layout_depth_stencil_attachment_optimal,
             },
@@ -5277,10 +5395,13 @@ pub const Renderer = struct {
 
         const color_format = colorTargetFormat(color.target.descriptor) orelse
             return Error.UnsupportedColorTarget;
+        const samples = rasterSampleCount(color.target.descriptor.fragments_log2) orelse
+            return Error.UnsupportedColorTarget;
         const render_pass = try self.createDepthGraphicsRenderPass(
             color_format.vulkan,
             depth.target.format,
             true,
+            samples,
         );
         errdefer self.device_functions.destroy_render_pass(self.device, render_pass, null);
 
@@ -5462,7 +5583,9 @@ pub const Renderer = struct {
             .cull_mode = pipeline_state.cull_mode,
             .front_face = pipeline_state.front_face,
         };
-        const multisample = vk.PipelineMultisampleStateCreateInfo{};
+        const multisample = vk.PipelineMultisampleStateCreateInfo{
+            .rasterization_samples = pipeline_state.rasterization_samples,
+        };
         const blend_attachment = vk.PipelineColorBlendAttachmentState{
             .blend_enable = pipeline_state.blend_enable,
             .source_color_blend_factor = pipeline_state.source_color_blend_factor,
@@ -5481,6 +5604,25 @@ pub const Renderer = struct {
             .depth_test_enable = pipeline_state.depth_test_enable,
             .depth_write_enable = pipeline_state.depth_write_enable,
             .depth_compare_operation = pipeline_state.depth_compare_operation,
+            .stencil_test_enable = pipeline_state.stencil_test_enable,
+            .front = .{
+                .fail_operation = pipeline_state.stencil_front_fail,
+                .pass_operation = pipeline_state.stencil_front_pass,
+                .depth_fail_operation = pipeline_state.stencil_front_depth_fail,
+                .compare_operation = pipeline_state.stencil_front_compare,
+                .compare_mask = pipeline_state.stencil_front_compare_mask,
+                .write_mask = pipeline_state.stencil_front_write_mask,
+                .reference = pipeline_state.stencil_front_reference,
+            },
+            .back = .{
+                .fail_operation = pipeline_state.stencil_back_fail,
+                .pass_operation = pipeline_state.stencil_back_pass,
+                .depth_fail_operation = pipeline_state.stencil_back_depth_fail,
+                .compare_operation = pipeline_state.stencil_back_compare,
+                .compare_mask = pipeline_state.stencil_back_compare_mask,
+                .write_mask = pipeline_state.stencil_back_write_mask,
+                .reference = pipeline_state.stencil_back_reference,
+            },
         };
         const info = vk.GraphicsPipelineCreateInfo{
             .stage_count = @intCast(stages.len),
@@ -6115,6 +6257,8 @@ pub const Renderer = struct {
 
     fn createCachedRenderTarget(self: *Renderer, target: GuestColorTarget) anyerror!CachedRenderTarget {
         const frame_bytes = try colorTargetFrameBytes(target);
+        const samples = rasterSampleCount(target.descriptor.fragments_log2) orelse
+            return Error.UnsupportedColorTarget;
         const image = try self.createImageWithExtent(
             target.descriptor.width,
             target.descriptor.height,
@@ -6127,6 +6271,7 @@ pub const Renderer = struct {
                 vk.image_usage_transfer_src_bit |
                 vk.image_usage_transfer_dst_bit |
                 vk.image_usage_sampled_bit,
+            samples,
         );
         errdefer self.destroyImage(image);
 
@@ -6141,7 +6286,7 @@ pub const Renderer = struct {
         }
         errdefer self.device_functions.destroy_image_view(self.device, view, null);
 
-        const render_pass = try self.createGraphicsRenderPass(target.format.vulkan, true);
+        const render_pass = try self.createGraphicsRenderPass(target.format.vulkan, true, samples);
         errdefer self.device_functions.destroy_render_pass(self.device, render_pass, null);
         const framebuffer_info = vk.FramebufferCreateInfo{
             .render_pass = render_pass,
@@ -6263,6 +6408,7 @@ pub const Renderer = struct {
             // same image exactly; overlap and equal texel size are insufficient
             // proof and can silently sample an unrelated attachment.
             if (cached.initialized and
+                cached.target.descriptor.fragments_log2 == 0 and
                 cached.target.descriptor.address == descriptor.address and
                 cached.target.descriptor.width == descriptor.width and
                 cached.target.descriptor.height == descriptor.height and
@@ -6407,10 +6553,9 @@ pub const Renderer = struct {
         else
             descriptor.read_address;
         if (address == 0 or descriptor.width == 0 or descriptor.height == 0) return null;
-        // Multi-sample depth would have to resolve against a multi-sample colour
-        // attachment, and the colour path is still single-sample.
-        if (descriptor.samples_log2 != 0) return null;
+        if (rasterSampleCount(descriptor.samples_log2) == null) return null;
         const format = depthTargetFormat(descriptor) orelse return null;
+        const has_stencil = depthAttachmentHasStencil(format);
         return .{
             .address = address,
             .width = descriptor.width,
@@ -6420,23 +6565,33 @@ pub const Renderer = struct {
             .tile_mode = descriptor.tile_mode,
             .base_array_slice = descriptor.base_array_slice,
             .mip_level = descriptor.mip_level,
+            .samples_log2 = descriptor.samples_log2,
+            .has_stencil = has_stencil,
             .clear_depth = descriptor.clear_depth,
+            .clear_stencil = descriptor.clear_stencil,
         };
     }
 
     fn createCachedDepthTarget(self: *Renderer, target: GuestDepthTarget) anyerror!CachedDepthTarget {
-        const image = try self.createImage(
+        const samples = rasterSampleCount(target.samples_log2) orelse
+            return Error.UnsupportedGraphicsState;
+        const image = try self.createImageWithExtent(
             target.width,
             target.height,
+            1,
+            1,
+            vk.image_type_2d,
+            0,
             target.format,
             vk.image_usage_depth_stencil_attachment_bit | vk.image_usage_transfer_dst_bit | vk.image_usage_sampled_bit,
+            samples,
         );
         errdefer self.destroyImage(image);
 
         const view_info = vk.ImageViewCreateInfo{
             .image = image.handle,
             .format = target.format,
-            .subresource_range = .{ .aspect_mask = vk.image_aspect_depth_bit },
+            .subresource_range = .{ .aspect_mask = target.aspectMask() },
         };
         var view: vk.ImageView = 0;
         if (self.device_functions.create_image_view(self.device, &view_info, null, &view) != vk.success) {
@@ -6452,6 +6607,7 @@ pub const Renderer = struct {
             // The clear value lives in its own register and moves without the
             // allocation changing; keep the newest one for the next clear.
             cached.target.clear_depth = target.clear_depth;
+            cached.target.clear_stencil = target.clear_stencil;
             self.depth_target_sequence +%= 1;
             cached.last_used_sequence = self.depth_target_sequence;
             return index;
@@ -6596,6 +6752,9 @@ pub const Renderer = struct {
         if (index >= self.render_targets.items.len) return Error.MissingPresentedFrame;
         const snapshot = self.render_targets.items[index];
         if (!snapshot.initialized) return;
+        // Multisampled attachments cannot be copied to a linear buffer. The
+        // guest resolve packet publishes the 1x destination instead.
+        if (snapshot.target.descriptor.fragments_log2 != 0) return;
         if (snapshot.gpu_generation == snapshot.host_generation) {
             try self.transitionRenderTargetToColorAttachment(index);
             return;
@@ -6756,10 +6915,7 @@ pub const Renderer = struct {
     }
 
     /// CB_COLOR_CONTROL.MODE=RESOLVE uses slot 0 as the multisampled source and
-    /// slot 1 as the single-sample destination.  Until Vulkan MSAA attachments
-    /// are exposed, normal draws retain one representative sample; publishing
-    /// that resident image under the resolve destination preserves the fixed-
-    /// function data flow used by Unity before its final fullscreen blit.
+    /// slot 1 as the single-sample destination.
     fn resolveColorTargets(self: *Renderer, render_state: gpu.resources.RenderState) anyerror!bool {
         if (render_state.color_control.mode != 3) return false;
         const source_descriptor = render_state.color_targets[0] orelse return false;
@@ -6775,6 +6931,157 @@ pub const Renderer = struct {
             return Error.UnsupportedColorTarget;
         }
 
+        const source_samples = colorTargetSamplesLog2(source.descriptor) orelse
+            return Error.UnsupportedColorTarget;
+        const destination_samples = colorTargetSamplesLog2(destination.descriptor) orelse
+            return Error.UnsupportedColorTarget;
+        if (destination_samples != 0) return Error.UnsupportedColorTarget;
+
+        if (source_samples == 0) {
+            return self.resolveSingleSampleColorTarget(source, destination);
+        }
+
+        const source_index = try self.acquireRenderTarget(source);
+        try self.transitionRenderTargetToColorAttachment(source_index);
+        if (!self.render_targets.items[source_index].initialized) return false;
+        const destination_index = try self.acquireRenderTarget(destination);
+        try self.transitionRenderTargetToColorAttachment(destination_index);
+
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        const source_image = self.render_targets.items[source_index].image.handle;
+        const destination_image = self.render_targets.items[destination_index].image.handle;
+        const source_from = if (self.render_targets.items[source_index].shader_read_layout)
+            vk.image_layout_shader_read_only_optimal
+        else
+            vk.image_layout_color_attachment_optimal;
+        const destination_from: u32 = if (!self.render_targets.items[destination_index].initialized)
+            vk.image_layout_undefined
+        else if (self.render_targets.items[destination_index].shader_read_layout)
+            vk.image_layout_shader_read_only_optimal
+        else
+            vk.image_layout_color_attachment_optimal;
+        const to_transfer = [2]vk.ImageMemoryBarrier{
+            .{
+                .source_access_mask = if (self.render_targets.items[source_index].shader_read_layout)
+                    vk.access_shader_read_bit
+                else
+                    vk.access_color_attachment_write_bit,
+                .destination_access_mask = vk.access_transfer_read_bit,
+                .old_layout = source_from,
+                .new_layout = vk.image_layout_transfer_src_optimal,
+                .image = source_image,
+                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+            },
+            .{
+                .source_access_mask = if (!self.render_targets.items[destination_index].initialized)
+                    0
+                else if (self.render_targets.items[destination_index].shader_read_layout)
+                    vk.access_shader_read_bit
+                else
+                    vk.access_color_attachment_write_bit,
+                .destination_access_mask = vk.access_transfer_write_bit,
+                .old_layout = destination_from,
+                .new_layout = vk.image_layout_transfer_dst_optimal,
+                .image = destination_image,
+                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+            },
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_color_attachment_output_bit | vk.pipeline_stage_fragment_shader_bit,
+            vk.pipeline_stage_transfer_bit,
+            0,
+            0,
+            null,
+            0,
+            null,
+            2,
+            @ptrCast(&to_transfer),
+        );
+        const region = vk.ImageResolve{
+            .source_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+            .destination_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+            .extent = .{
+                .width = source.descriptor.width,
+                .height = source.descriptor.height,
+                .depth = 1,
+            },
+        };
+        self.device_functions.cmd_resolve_image(
+            command_buffer,
+            source_image,
+            vk.image_layout_transfer_src_optimal,
+            destination_image,
+            vk.image_layout_transfer_dst_optimal,
+            1,
+            @ptrCast(&region),
+        );
+        const to_attachment = [2]vk.ImageMemoryBarrier{
+            .{
+                .source_access_mask = vk.access_transfer_read_bit,
+                .destination_access_mask = vk.access_color_attachment_read_bit |
+                    vk.access_color_attachment_write_bit,
+                .old_layout = vk.image_layout_transfer_src_optimal,
+                .new_layout = vk.image_layout_color_attachment_optimal,
+                .image = source_image,
+                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+            },
+            .{
+                .source_access_mask = vk.access_transfer_write_bit,
+                .destination_access_mask = vk.access_color_attachment_read_bit |
+                    vk.access_color_attachment_write_bit |
+                    vk.access_shader_read_bit,
+                .old_layout = vk.image_layout_transfer_dst_optimal,
+                .new_layout = vk.image_layout_color_attachment_optimal,
+                .image = destination_image,
+                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+            },
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_transfer_bit,
+            vk.pipeline_stage_color_attachment_output_bit | vk.pipeline_stage_fragment_shader_bit,
+            0,
+            0,
+            null,
+            0,
+            null,
+            2,
+            @ptrCast(&to_attachment),
+        );
+        try self.submitOneShot(command_buffer);
+
+        self.render_target_sequence +%= 1;
+        const dest = &self.render_targets.items[destination_index];
+        dest.initialized = true;
+        dest.shader_read_layout = false;
+        dest.gpu_generation +%= 1;
+        dest.last_used_sequence = self.render_target_sequence;
+        self.render_targets.items[source_index].shader_read_layout = false;
+        self.render_targets.items[source_index].last_used_sequence = self.render_target_sequence;
+
+        if (self.reported_color_resolves < 4 or log_verbose_gpu) {
+            self.reported_color_resolves += 1;
+            std.debug.print(
+                "[vulkan dcb] color resolve 0x{x} -> 0x{x} {d}x{d} samples={d}\n",
+                .{
+                    source.descriptor.address,
+                    destination.descriptor.address,
+                    destination.descriptor.width,
+                    destination.descriptor.height,
+                    source.descriptor.fragments_log2,
+                },
+            );
+        }
+        return true;
+    }
+
+    fn resolveSingleSampleColorTarget(
+        self: *Renderer,
+        source: GuestColorTarget,
+        destination: GuestColorTarget,
+    ) anyerror!bool {
         var source_index: ?usize = null;
         for (self.render_targets.items, 0..) |cached, index| {
             if (cached.target.descriptor.address != source.descriptor.address or
@@ -6808,27 +7115,11 @@ pub const Renderer = struct {
         defer self.allocator.free(pixels);
         try self.recordGuestColorTarget(destination, pixels);
 
-        // A destination retained from an earlier frame must not shadow the new
-        // deferred resolve when it is immediately sampled as a texture.
         for (self.render_targets.items) |*cached| {
             if (cached.target.descriptor.address != destination.descriptor.address) continue;
             cached.initialized = false;
             cached.gpu_generation = 0;
             cached.host_generation = 0;
-        }
-
-        if (self.reported_color_resolves < 4 or log_verbose_gpu) {
-            self.reported_color_resolves += 1;
-            std.debug.print(
-                "[vulkan dcb] color resolve approximated 0x{x} -> 0x{x} {d}x{d} samples={d}\n",
-                .{
-                    source.descriptor.address,
-                    destination.descriptor.address,
-                    destination.descriptor.width,
-                    destination.descriptor.height,
-                    source_descriptor.samples_log2,
-                },
-            );
         }
         return true;
     }
@@ -6858,7 +7149,8 @@ pub const Renderer = struct {
 
         var initial_upload: ?OwnedBuffer = null;
         defer if (initial_upload) |buffer| self.destroyBuffer(buffer);
-        if (!cached_snapshot.initialized) {
+        const multisampled = target.descriptor.fragments_log2 != 0;
+        if (!cached_snapshot.initialized and !multisampled) {
             try self.flushPendingGuestWrite(target.descriptor.address, frame_bytes);
             const frame = try self.allocator.alloc(u8, frame_bytes);
             defer self.allocator.free(frame);
@@ -6985,6 +7277,28 @@ pub const Renderer = struct {
             self.device_functions.cmd_pipeline_barrier(
                 command_buffer,
                 vk.pipeline_stage_transfer_bit,
+                vk.pipeline_stage_color_attachment_output_bit,
+                0,
+                0,
+                null,
+                0,
+                null,
+                1,
+                @ptrCast(&to_attachment),
+            );
+        } else if (!cached_snapshot.initialized) {
+            const to_attachment = vk.ImageMemoryBarrier{
+                .source_access_mask = 0,
+                .destination_access_mask = vk.access_color_attachment_read_bit |
+                    vk.access_color_attachment_write_bit,
+                .old_layout = vk.image_layout_undefined,
+                .new_layout = vk.image_layout_color_attachment_optimal,
+                .image = cached_snapshot.image.handle,
+                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+            };
+            self.device_functions.cmd_pipeline_barrier(
+                command_buffer,
+                vk.pipeline_stage_top_of_pipe_bit,
                 vk.pipeline_stage_color_attachment_output_bit,
                 0,
                 0,
@@ -7130,7 +7444,11 @@ pub const Renderer = struct {
         }
         defer self.device_functions.destroy_image_view(self.device, view, null);
 
-        const render_pass = try self.createGraphicsRenderPass(vk.format_r8g8b8a8_unorm, guest_target != null);
+        const render_pass = try self.createGraphicsRenderPass(
+            vk.format_r8g8b8a8_unorm,
+            guest_target != null,
+            vk.sample_count_1_bit,
+        );
         defer self.device_functions.destroy_render_pass(self.device, render_pass, null);
         const framebuffer_info = vk.FramebufferCreateInfo{
             .render_pass = render_pass,
@@ -7633,7 +7951,9 @@ pub const Renderer = struct {
         const depth_wanted = target_override == null and
             (render_state.depth_control.test_enabled or
                 render_state.depth_control.write_enabled or
-                render_state.depth_control.clear_enabled);
+                render_state.depth_control.clear_enabled or
+                render_state.depth_control.stencil_enabled or
+                render_state.depth_control.stencil_clear_enabled);
         var depth_plane: ?GuestDepthTarget = if (depth_wanted)
             if (render_state.depth_target) |bound| guestDepthTarget(bound) else null
         else
@@ -7660,14 +7980,10 @@ pub const Renderer = struct {
             }
         }
         const guest_descriptor = target_descriptor orelse return Error.MissingColorTarget;
-        if (guest_descriptor.samples_log2 != 0 or guest_descriptor.fragments_log2 != 0) {
-            if (log_verbose_gpu) std.debug.print(
-                "[vulkan dcb] approximating MSAA color target samples={d} frags={d} with one host sample\n",
-                .{ guest_descriptor.samples_log2, guest_descriptor.fragments_log2 },
-            );
-        }
         const target = try guestColorTarget(guest_descriptor);
         const descriptor = target.descriptor;
+        const color_samples = colorTargetSamplesLog2(descriptor) orelse
+            return Error.UnsupportedColorTarget;
         if (depth_plane) |plane| {
             // Vulkan framebuffers cannot be wider or taller than any of their
             // attachments. Guest command streams commonly leave a tiny stale
@@ -7679,6 +7995,14 @@ pub const Renderer = struct {
                     std.debug.print(
                         "[vulkan dcb] ignoring undersized depth attachment @0x{x} {d}x{d} for color {d}x{d}\n",
                         .{ plane.address, plane.width, plane.height, descriptor.width, descriptor.height },
+                    );
+                }
+                depth_plane = null;
+            } else if (plane.samples_log2 != color_samples) {
+                if (log_verbose_gpu or self.traceCurrentGraphicsFrame()) {
+                    std.debug.print(
+                        "[vulkan dcb] ignoring depth attachment with unmatched samples depth={d} color={d}\n",
+                        .{ plane.samples_log2, color_samples },
                     );
                 }
                 depth_plane = null;
@@ -7706,12 +8030,76 @@ pub const Renderer = struct {
         var pipeline_state = try guestGraphicsState(&render_state, descriptor);
         pipeline_state.color_attachment_format = target.format.vulkan;
         pipeline_state.topology = guestPrimitiveTopology(render_state.primitive_type, draw);
+        pipeline_state.rasterization_samples = rasterSampleCount(color_samples) orelse
+            return Error.UnsupportedColorTarget;
         if (depth_plane) |plane| {
             pipeline_state.depth_attachment_format = plane.format;
             pipeline_state.depth_test_enable = @intFromBool(render_state.depth_control.test_enabled);
             pipeline_state.depth_write_enable = @intFromBool(render_state.depth_control.write_enabled);
             pipeline_state.depth_compare_operation =
                 depthCompareOperation(render_state.depth_control.compare_function);
+            const stencil_active = plane.has_stencil and render_state.depth_control.stencil_enabled;
+            pipeline_state.stencil_test_enable = @intFromBool(stencil_active);
+            if (stencil_active) {
+                const front_write: u8 = if (render_state.depth_control.stencil_clear_enabled)
+                    0
+                else
+                    render_state.stencil.front.write_mask;
+                const back_write: u8 = if (render_state.depth_control.stencil_clear_enabled)
+                    0
+                else
+                    render_state.stencil.back.write_mask;
+                pipeline_state.stencil_front_fail = hostStencilOperation(
+                    render_state.stencil.front.fail,
+                    front_write,
+                    render_state.stencil.front.op_value,
+                );
+                pipeline_state.stencil_front_pass = hostStencilOperation(
+                    render_state.stencil.front.pass,
+                    front_write,
+                    render_state.stencil.front.op_value,
+                );
+                pipeline_state.stencil_front_depth_fail = hostStencilOperation(
+                    render_state.stencil.front.depth_fail,
+                    front_write,
+                    render_state.stencil.front.op_value,
+                );
+                pipeline_state.stencil_front_compare =
+                    depthCompareOperation(render_state.depth_control.stencil_compare);
+                pipeline_state.stencil_front_compare_mask = render_state.stencil.front.compare_mask;
+                pipeline_state.stencil_front_write_mask = front_write;
+                pipeline_state.stencil_front_reference = render_state.stencil.front.reference;
+                if (render_state.depth_control.backface_enabled) {
+                    pipeline_state.stencil_back_fail = hostStencilOperation(
+                        render_state.stencil.back.fail,
+                        back_write,
+                        render_state.stencil.back.op_value,
+                    );
+                    pipeline_state.stencil_back_pass = hostStencilOperation(
+                        render_state.stencil.back.pass,
+                        back_write,
+                        render_state.stencil.back.op_value,
+                    );
+                    pipeline_state.stencil_back_depth_fail = hostStencilOperation(
+                        render_state.stencil.back.depth_fail,
+                        back_write,
+                        render_state.stencil.back.op_value,
+                    );
+                    pipeline_state.stencil_back_compare =
+                        depthCompareOperation(render_state.depth_control.stencil_compare_back);
+                    pipeline_state.stencil_back_compare_mask = render_state.stencil.back.compare_mask;
+                    pipeline_state.stencil_back_write_mask = back_write;
+                    pipeline_state.stencil_back_reference = render_state.stencil.back.reference;
+                } else {
+                    pipeline_state.stencil_back_fail = pipeline_state.stencil_front_fail;
+                    pipeline_state.stencil_back_pass = pipeline_state.stencil_front_pass;
+                    pipeline_state.stencil_back_depth_fail = pipeline_state.stencil_front_depth_fail;
+                    pipeline_state.stencil_back_compare = pipeline_state.stencil_front_compare;
+                    pipeline_state.stencil_back_compare_mask = pipeline_state.stencil_front_compare_mask;
+                    pipeline_state.stencil_back_write_mask = pipeline_state.stencil_front_write_mask;
+                    pipeline_state.stencil_back_reference = pipeline_state.stencil_front_reference;
+                }
+            }
         }
         const vertex_address = vertex_stage.programAddress(state) orelse {
             return Error.MissingGraphicsProgram;
@@ -8468,7 +8856,8 @@ pub const Renderer = struct {
                     pipeline_state,
                     target,
                     depth_plane,
-                    render_state.depth_control.clear_enabled,
+                    render_state.depth_control.clear_enabled or
+                        render_state.depth_control.stencil_clear_enabled,
                     graphics_resources.mapping_count != 0 or
                         vertex_storage.mapping_count != 0 or
                         fragment_storage.mapping_count != 0,
@@ -8584,7 +8973,8 @@ pub const Renderer = struct {
                 probe_pipeline_state,
                 target,
                 depth_plane,
-                render_state.depth_control.clear_enabled,
+                render_state.depth_control.clear_enabled or
+                    render_state.depth_control.stencil_clear_enabled,
                 graphics_resources.mapping_count != 0 or fragment_storage.mapping_count != 0,
                 false,
                 .{ .vertex_count = 4, .instance_count = 1 },
@@ -8637,7 +9027,8 @@ pub const Renderer = struct {
             pipeline_state,
             target,
             depth_plane,
-            render_state.depth_control.clear_enabled,
+            render_state.depth_control.clear_enabled or
+                render_state.depth_control.stencil_clear_enabled,
             graphics_resources.mapping_count != 0 or fragment_storage.mapping_count != 0,
             false,
             .{ .vertex_count = 3, .instance_count = 1 },
@@ -9460,6 +9851,7 @@ pub const Renderer = struct {
         flags: vk.Flags,
         format: u32,
         usage: vk.Flags,
+        samples: vk.Flags,
     ) Error!OwnedImage {
         const create_info = vk.ImageCreateInfo{
             .flags = flags,
@@ -9467,6 +9859,7 @@ pub const Renderer = struct {
             .format = format,
             .extent = .{ .width = width, .height = height, .depth = depth },
             .array_layers = array_layers,
+            .samples = samples,
             .usage = usage,
         };
         var handle: vk.Image = 0;
@@ -9495,7 +9888,17 @@ pub const Renderer = struct {
     }
 
     fn createImage(self: *Renderer, width: u32, height: u32, format: u32, usage: vk.Flags) Error!OwnedImage {
-        return self.createImageWithExtent(width, height, 1, 1, vk.image_type_2d, 0, format, usage);
+        return self.createImageWithExtent(
+            width,
+            height,
+            1,
+            1,
+            vk.image_type_2d,
+            0,
+            format,
+            usage,
+            vk.sample_count_1_bit,
+        );
     }
 
     fn updateStorageDescriptor(self: *Renderer, descriptor_index: u32, buffer: OwnedBuffer) void {
@@ -10023,6 +10426,7 @@ pub const Renderer = struct {
             format.vulkan,
             vk.image_usage_transfer_src_bit | vk.image_usage_transfer_dst_bit |
                 vk.image_usage_storage_bit | vk.image_usage_sampled_bit,
+            vk.sample_count_1_bit,
         );
         errdefer if (!cache_owns_resources) self.destroyImage(image);
         const view_info = vk.ImageViewCreateInfo{
@@ -10484,6 +10888,7 @@ pub const Renderer = struct {
             if (is_cube) vk.image_create_cube_compatible_bit else 0,
             image_format,
             vk.image_usage_transfer_dst_bit | vk.image_usage_sampled_bit,
+            vk.sample_count_1_bit,
         );
         errdefer self.destroyImage(image);
 
@@ -15951,7 +16356,7 @@ test "ambiguous sampled DIM follows the descriptor image type" {
     );
 }
 
-test "MSAA color targets retain their allocation while using one host sample" {
+test "MSAA color targets keep their sample count and drop FMASK" {
     var descriptor = std.mem.zeroes(gpu.resources.ColorTarget);
     descriptor.address = 0x1234_0000;
     descriptor.width = 1920;
@@ -15959,7 +16364,7 @@ test "MSAA color targets retain their allocation while using one host sample" {
     descriptor.format = 10;
     descriptor.tile_mode = .render_target;
     descriptor.samples_log2 = 2;
-    descriptor.fragments_log2 = 1;
+    descriptor.fragments_log2 = 2;
     descriptor.fmask_compression = true;
     descriptor.fmask_address = 0x5678_0000;
     descriptor.base_array_slice = 3;
@@ -15969,8 +16374,8 @@ test "MSAA color targets retain their allocation while using one host sample" {
     try std.testing.expectEqual(descriptor.address, host.address);
     try std.testing.expectEqual(descriptor.width, host.width);
     try std.testing.expectEqual(descriptor.height, host.height);
-    try std.testing.expectEqual(@as(u8, 0), host.samples_log2);
-    try std.testing.expectEqual(@as(u8, 0), host.fragments_log2);
+    try std.testing.expectEqual(@as(u8, 2), host.samples_log2);
+    try std.testing.expectEqual(@as(u8, 2), host.fragments_log2);
     try std.testing.expect(!host.fmask_compression);
     try std.testing.expectEqual(@as(u64, 0), host.fmask_address);
     try std.testing.expectEqual(@as(u16, 3), host.base_array_slice);
@@ -16477,7 +16882,7 @@ test "guest depth compare selectors map onto the host operations" {
     }
 }
 
-test "a depth attachment is refused when it cannot back a single-sample pass" {
+test "a depth attachment keeps its sample count and packed stencil format" {
     var descriptor = std.mem.zeroes(gpu.resources.DepthTarget);
     descriptor.format = 3;
     descriptor.width = 1920;
@@ -16487,12 +16892,32 @@ test "a depth attachment is refused when it cannot back a single-sample pass" {
     const plane = Renderer.guestDepthTarget(descriptor) orelse return error.TestFailed;
     try std.testing.expectEqual(@as(u64, 0x2000), plane.address);
     try std.testing.expectEqual(vk.format_d32_sfloat, plane.format);
+    try std.testing.expectEqual(@as(u8, 0), plane.samples_log2);
+    try std.testing.expect(!plane.has_stencil);
 
-    // Multi-sample depth would have to resolve against a multi-sample colour
-    // attachment, which the colour path does not create.
     var multisample = descriptor;
     multisample.samples_log2 = 2;
-    try std.testing.expect(Renderer.guestDepthTarget(multisample) == null);
+    const msaa = Renderer.guestDepthTarget(multisample) orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(u8, 2), msaa.samples_log2);
+    try std.testing.expectEqual(vk.format_d32_sfloat, msaa.format);
+
+    var with_stencil = descriptor;
+    with_stencil.stencil_format = 1;
+    with_stencil.stencil_read_address = 0x4000;
+    const packed_plane = Renderer.guestDepthTarget(with_stencil) orelse return error.TestFailed;
+    try std.testing.expect(packed_plane.has_stencil);
+    try std.testing.expectEqual(vk.format_d32_sfloat_s8_uint, packed_plane.format);
+
+    var depth16 = descriptor;
+    depth16.format = 1;
+    depth16.stencil_format = 1;
+    depth16.stencil_read_address = 0x4000;
+    const packed16 = Renderer.guestDepthTarget(depth16) orelse return error.TestFailed;
+    try std.testing.expectEqual(vk.format_d24_unorm_s8_uint, packed16.format);
+
+    var rejected = descriptor;
+    rejected.samples_log2 = 4;
+    try std.testing.expect(Renderer.guestDepthTarget(rejected) == null);
 
     // Read-only bindings still name the allocation through the read address.
     var read_only = descriptor;
@@ -16500,6 +16925,33 @@ test "a depth attachment is refused when it cannot back a single-sample pass" {
     read_only.read_address = 0x3000;
     const fallback = Renderer.guestDepthTarget(read_only) orelse return error.TestFailed;
     try std.testing.expectEqual(@as(u64, 0x3000), fallback.address);
+}
+
+test "guest stencil operations map to the host set the rasterizer can run" {
+    try std.testing.expectEqual(vk.stencil_op_keep, hostStencilOperation(0, 0xff, 0));
+    try std.testing.expectEqual(vk.stencil_op_zero, hostStencilOperation(1, 0xff, 0));
+    try std.testing.expectEqual(vk.stencil_op_replace, hostStencilOperation(3, 0xff, 0));
+    try std.testing.expectEqual(vk.stencil_op_replace, hostStencilOperation(4, 0xff, 0xaa));
+    try std.testing.expectEqual(vk.stencil_op_increment_and_clamp, hostStencilOperation(5, 0xff, 0));
+    try std.testing.expectEqual(vk.stencil_op_decrement_and_clamp, hostStencilOperation(6, 0xff, 0));
+    try std.testing.expectEqual(vk.stencil_op_invert, hostStencilOperation(7, 0xff, 0));
+    try std.testing.expectEqual(vk.stencil_op_increment_and_wrap, hostStencilOperation(8, 0xff, 0));
+    try std.testing.expectEqual(vk.stencil_op_decrement_and_wrap, hostStencilOperation(9, 0xff, 0));
+    try std.testing.expectEqual(vk.stencil_op_invert, hostStencilOperation(0xc, 0x0f, 0x0f));
+    try std.testing.expectEqual(vk.stencil_op_keep, hostStencilOperation(0xc, 0xff, 0x0f));
+    try std.testing.expectEqual(vk.stencil_op_keep, hostStencilOperation(5, 0, 0));
+}
+
+test "color attachments keep matching sample and fragment counts" {
+    var descriptor = std.mem.zeroes(gpu.resources.ColorTarget);
+    descriptor.samples_log2 = 2;
+    descriptor.fragments_log2 = 2;
+    try std.testing.expectEqual(@as(u8, 2), colorTargetSamplesLog2(descriptor).?);
+    try std.testing.expectEqual(vk.sample_count_4_bit, rasterSampleCount(2).?);
+
+    descriptor.fragments_log2 = 1;
+    try std.testing.expect(colorTargetSamplesLog2(descriptor) == null);
+    try std.testing.expect(rasterSampleCount(4) == null);
 }
 
 test "depth allocations compare by surface, not by clear value" {

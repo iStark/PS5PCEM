@@ -290,7 +290,28 @@ pub const DepthControl = struct {
     write_enabled: bool,
     compare_function: u8,
     clear_enabled: bool,
+    stencil_enabled: bool = false,
     stencil_clear_enabled: bool,
+    backface_enabled: bool = false,
+    stencil_compare: u8 = 0,
+    stencil_compare_back: u8 = 0,
+};
+
+/// One face of the guest stencil unit. The encoded operations are the
+/// hardware values; the host maps them when it builds a pipeline.
+pub const StencilFace = struct {
+    fail: u8 = 0,
+    pass: u8 = 0,
+    depth_fail: u8 = 0,
+    compare_mask: u8 = 0,
+    write_mask: u8 = 0,
+    reference: u8 = 0,
+    op_value: u8 = 0,
+};
+
+pub const StencilState = struct {
+    front: StencilFace = .{},
+    back: StencilFace = .{},
 };
 
 pub const DepthTarget = struct {
@@ -400,6 +421,7 @@ pub const RenderState = struct {
     active_color_count: u8 = 0,
     target_mask: u32 = std.math.maxInt(u32),
     depth_control: DepthControl,
+    stencil: StencilState = .{},
     depth_target: ?DepthTarget,
     viewport: ?ViewportTransform,
     scissor: ?Scissor,
@@ -558,6 +580,7 @@ pub fn decodeRenderState(state: *const gpu_state.State) RenderState {
     var result = RenderState{
         .target_mask = target_mask,
         .depth_control = decodeDepthControl(state),
+        .stencil = decodeStencilState(state),
         .depth_target = decodeDepthTarget(state),
         .viewport = decodeViewport(state, 0),
         .scissor = decodeScissor(state, 0),
@@ -792,7 +815,38 @@ pub fn decodeDepthControl(state: *const gpu_state.State) DepthControl {
         .write_enabled = depth & (1 << 2) != 0,
         .compare_function = @truncate((depth >> 4) & 0x7),
         .clear_enabled = render & 1 != 0,
+        .stencil_enabled = depth & 1 != 0,
         .stencil_clear_enabled = render & 2 != 0,
+        .backface_enabled = depth & (1 << 7) != 0,
+        .stencil_compare = @truncate((depth >> 8) & 0x7),
+        .stencil_compare_back = @truncate((depth >> 20) & 0x7),
+    };
+}
+
+pub fn decodeStencilState(state: *const gpu_state.State) StencilState {
+    const control = context(state, 0x10b) orelse 0;
+    const front_mask = context(state, 0x10c) orelse 0;
+    const back_mask = context(state, 0x10d) orelse 0;
+    const front: StencilFace = .{
+        .fail = @truncate(control & 0xf),
+        .pass = @truncate((control >> 4) & 0xf),
+        .depth_fail = @truncate((control >> 8) & 0xf),
+        .compare_mask = @truncate((front_mask >> 8) & 0xff),
+        .write_mask = @truncate((front_mask >> 16) & 0xff),
+        .reference = @truncate(front_mask & 0xff),
+        .op_value = @truncate((front_mask >> 24) & 0xff),
+    };
+    return .{
+        .front = front,
+        .back = .{
+            .fail = @truncate((control >> 12) & 0xf),
+            .pass = @truncate((control >> 16) & 0xf),
+            .depth_fail = @truncate((control >> 20) & 0xf),
+            .compare_mask = @truncate((back_mask >> 8) & 0xff),
+            .write_mask = @truncate((back_mask >> 16) & 0xff),
+            .reference = @truncate(back_mask & 0xff),
+            .op_value = @truncate((back_mask >> 24) & 0xff),
+        },
     };
 }
 
@@ -1012,7 +1066,11 @@ test "render state decodes PS5 color and depth target extensions" {
     try state.writeRegister(.context, 0x01a, @truncate(depth_address >> 40));
     try state.writeRegister(.context, 0x01c, @truncate(depth_address >> 40));
     try state.writeRegister(.context, 0x2af, 1 << 18);
-    try state.writeRegister(.context, 0x200, 2 | 4 | (3 << 4));
+    try state.writeRegister(.context, 0x200, 1 | 2 | 4 | (3 << 4) | (1 << 7) | (4 << 8) | (1 << 20));
+    try state.writeRegister(.context, 0x00a, 0x7f);
+    try state.writeRegister(.context, 0x10b, 1 | (5 << 4) | (6 << 8) | (1 << 12) | (3 << 16) | (7 << 20));
+    try state.writeRegister(.context, 0x10c, 0xaa | (0xf0 << 8) | (0x0f << 16) | (0x55 << 24));
+    try state.writeRegister(.context, 0x10d, 0x11 | (0x22 << 8) | (0x33 << 16) | (0x44 << 24));
 
     const render = decodeRenderState(&state);
     const color = render.color_targets[0].?;
@@ -1040,6 +1098,25 @@ test "render state decodes PS5 color and depth target extensions" {
     try testing.expect(depth.tile_stencil_disabled);
     try testing.expect(render.depth_control.test_enabled);
     try testing.expect(render.depth_control.write_enabled);
+    try testing.expect(render.depth_control.stencil_enabled);
+    try testing.expect(render.depth_control.backface_enabled);
+    try testing.expectEqual(@as(u8, 4), render.depth_control.stencil_compare);
+    try testing.expectEqual(@as(u8, 1), render.depth_control.stencil_compare_back);
+    try testing.expectEqual(@as(u8, 0x7f), depth.clear_stencil);
+    try testing.expectEqual(@as(u8, 1), render.stencil.front.fail);
+    try testing.expectEqual(@as(u8, 5), render.stencil.front.pass);
+    try testing.expectEqual(@as(u8, 6), render.stencil.front.depth_fail);
+    try testing.expectEqual(@as(u8, 0xaa), render.stencil.front.reference);
+    try testing.expectEqual(@as(u8, 0xf0), render.stencil.front.compare_mask);
+    try testing.expectEqual(@as(u8, 0x0f), render.stencil.front.write_mask);
+    try testing.expectEqual(@as(u8, 0x55), render.stencil.front.op_value);
+    try testing.expectEqual(@as(u8, 1), render.stencil.back.fail);
+    try testing.expectEqual(@as(u8, 3), render.stencil.back.pass);
+    try testing.expectEqual(@as(u8, 7), render.stencil.back.depth_fail);
+    try testing.expectEqual(@as(u8, 0x11), render.stencil.back.reference);
+    try testing.expectEqual(@as(u8, 0x22), render.stencil.back.compare_mask);
+    try testing.expectEqual(@as(u8, 0x33), render.stencil.back.write_mask);
+    try testing.expectEqual(@as(u8, 0x44), render.stencil.back.op_value);
     try testing.expectEqual(@as(f32, 960), render.viewport.?.x_scale);
     try testing.expectEqual(@as(f32, 540), render.viewport.?.y_offset);
     try testing.expectEqual(@as(u16, 10), render.scissor.?.left);

@@ -247,6 +247,17 @@ pub const image_create_mutable_format_bit: Flags = 0x08;
 pub const image_create_cube_compatible_bit: Flags = 0x10;
 pub const image_tiling_optimal: u32 = 0;
 pub const sample_count_1_bit: Flags = 1;
+pub const sample_count_2_bit: Flags = 2;
+pub const sample_count_4_bit: Flags = 4;
+pub const sample_count_8_bit: Flags = 8;
+pub const stencil_op_keep: u32 = 0;
+pub const stencil_op_zero: u32 = 1;
+pub const stencil_op_replace: u32 = 2;
+pub const stencil_op_increment_and_clamp: u32 = 3;
+pub const stencil_op_decrement_and_clamp: u32 = 4;
+pub const stencil_op_invert: u32 = 5;
+pub const stencil_op_increment_and_wrap: u32 = 6;
+pub const stencil_op_decrement_and_wrap: u32 = 7;
 pub const image_layout_undefined: u32 = 0;
 pub const image_layout_general: u32 = 1;
 pub const image_layout_color_attachment_optimal: u32 = 2;
@@ -760,9 +771,6 @@ pub const PipelineColorBlendStateCreateInfo = extern struct {
     blend_constants: [4]f32 = .{ 0, 0, 0, 0 },
 };
 
-/// Stencil is not translated yet; the struct exists because the depth state it
-/// belongs to cannot be described without it, and zeroed operations keep the
-/// stencil test inert when it is disabled.
 pub const StencilOperationState = extern struct {
     fail_operation: u32 = 0,
     pass_operation: u32 = 0,
@@ -936,6 +944,14 @@ pub const ImageBlit = extern struct {
     destination_offsets: [2]Offset3D,
 };
 
+pub const ImageResolve = extern struct {
+    source_subresource: ImageSubresourceLayers,
+    source_offset: Offset3D = .{ .x = 0, .y = 0, .z = 0 },
+    destination_subresource: ImageSubresourceLayers,
+    destination_offset: Offset3D = .{ .x = 0, .y = 0, .z = 0 },
+    extent: Extent3D,
+};
+
 pub const PfnVoidFunction = ?*const anyopaque;
 pub const PfnGetInstanceProcAddr = *const fn (?Instance, [*:0]const u8) callconv(call) PfnVoidFunction;
 pub const PfnGetDeviceProcAddr = *const fn (Device, [*:0]const u8) callconv(call) PfnVoidFunction;
@@ -1023,6 +1039,7 @@ pub const PfnCmdCopyBuffer = *const fn (CommandBuffer, Buffer, Buffer, u32, [*]c
 pub const PfnCmdCopyImageToBuffer = *const fn (CommandBuffer, Image, u32, Buffer, u32, [*]const BufferImageCopy) callconv(call) void;
 pub const PfnCmdCopyBufferToImage = *const fn (CommandBuffer, Buffer, Image, u32, u32, [*]const BufferImageCopy) callconv(call) void;
 pub const PfnCmdBlitImage = *const fn (CommandBuffer, Image, u32, Image, u32, u32, [*]const ImageBlit, u32) callconv(call) void;
+pub const PfnCmdResolveImage = *const fn (CommandBuffer, Image, u32, Image, u32, u32, [*]const ImageResolve) callconv(call) void;
 pub const PfnCmdPipelineBarrier = *const fn (CommandBuffer, Flags, Flags, Flags, u32, ?*const anyopaque, u32, ?[*]const BufferMemoryBarrier, u32, ?*const anyopaque) callconv(call) void;
 pub const PfnCreateSwapchainKHR = *const fn (Device, *const SwapchainCreateInfoKHR, ?*const anyopaque, *Swapchain) callconv(call) Result;
 pub const PfnDestroySwapchainKHR = *const fn (Device, Swapchain, ?*const anyopaque) callconv(call) void;

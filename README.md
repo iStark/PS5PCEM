@@ -43,15 +43,18 @@ If you would like to support continued PS5PCEM development, you can do so on
   typed 2D, array and 3D images between themselves. Fifty-six host formats are
   reachable, spanning the BC1–BC7 blocks, signed and unsigned integer and
   normalized channels, R16/RG16, half-float and `RGBA32_FLOAT`. What is still
-  missing is named where it belongs: one colour attachment per pass, no stencil,
-  no multi-sampling, and only the base mip of a chain.
+  missing is named where it belongs: one colour attachment per pass and only the
+  base mip of a chain. Bound stencil planes become packed depth+stencil
+  attachments with the guest compare and update operations, and matching
+  colour/depth sample counts 2/4/8 stay on the host image through a later
+  resolve.
 - Persistent render targets, large writable storage buffers, resident storage
   images, and bounded texture and pipeline caches keep frame resources on the
   GPU across draws and dispatches. Compute chains can pass typed 2D, array, and
   3D images directly to later sampled or storage bindings without an intervening
   guest-memory round trip. A bound depth allocation becomes a resident
-  attachment and can be sampled by a later pass, so guest depth testing and
-  depth writes reach the rasterizer; stencil and multi-sample depth do not yet.
+  attachment and can be sampled by a later pass, so guest depth testing,
+  depth writes, stencil test/write, and multi-sample depth reach the rasterizer.
 - Long-running title execution uses a freeing, thread-safe allocator, and
   aligned Windows direct-memory ranges share 64 KiB section views. Temporary
   uploads/readbacks and 16 KiB guest pages therefore no longer accumulate as
@@ -951,9 +954,9 @@ The remaining stages are:
    eight colour slots and their per-slot blend and write masks; only the Vulkan
    attachment path and the pixel shader's exports beyond target zero are still
    single-target, which is what deferred shading needs.
-2. Add stencil, MSAA, mip and layer views, texture component swizzles, the
-   remaining compressed DCC/FMASK states, HTILE Z-range/HiZ handling, and CMASK
-   states coupled to MSAA/FMASK.
+2. Add mip and layer views, texture component swizzles, the remaining
+   compressed DCC/FMASK states, HTILE Z-range/HiZ handling, and CMASK
+   states coupled to FMASK.
 3. Finish indirect drawing. `SET_BASE` already records the argument base and
    indirect dispatches execute; the indirect draw packet bodies are the
    remaining half.
@@ -2338,10 +2341,10 @@ scheduler and Vulkan backend. Observed startup work now includes:
   A later pass that samples the same allocation is bound to the resident
   attachment rather than to a staged copy, so a depth-of-field or fog pass reads
   what the geometry actually wrote; the sampled view uses the single-channel
-  format matching the stored precision. Stencil translation, importing tiled
-  guest depth written outside the renderer, and multi-sample depth (which would
-  need a multi-sample colour attachment to resolve against) are not part of this
-  path.
+  format matching the stored precision. Importing tiled guest depth written
+  outside the renderer is still outside this path. A bound S8 plane becomes a
+  packed depth+stencil attachment, and a matching multi-sample colour target
+  keeps the same sample count through resolve.
 - `SetFlip` and equeue delivery use VideoOut filter `-13`; flip status fills
   process-time fields and event data retains the guest flip argument.
 - Indexed draws can emit AGC `SetIndexSize` as a real `INDEX_TYPE` packet, and
