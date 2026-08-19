@@ -43,7 +43,7 @@ If you would like to support continued PS5PCEM development, you can do so on
   typed 2D, array and 3D images between themselves. Fifty-six host formats are
   reachable, spanning the BC1–BC7 blocks, signed and unsigned integer and
   normalized channels, R16/RG16, half-float and `RGBA32_FLOAT`. What is still
-  missing is named where it belongs: one colour attachment per pass and only the
+  missing is named where it belongs: only the
   base mip of a chain. Bound stencil planes become packed depth+stencil
   attachments with the guest compare and update operations, and matching
   colour/depth sample counts 2/4/8 stay on the host image through a later
@@ -254,7 +254,7 @@ the repository contains none of that content.
 
 | Title | Observed milestone | Current limit |
 |---|---|---|
-| **Terminator 2D: No Fate** | Reaches gameplay with correct color reproduction and clean title-provided backgrounds, characters, HUD elements, and textures; publisher logo screens and menus now match the console capture; warmed-up startup frames measure 22–65 ms on the current test host | First-use texture staging, multiple render targets, and the remaining compression metadata are incomplete |
+| **Terminator 2D: No Fate** | Reaches gameplay with correct color reproduction and clean title-provided backgrounds, characters, HUD elements, and textures; publisher logo screens and menus now match the console capture; warmed-up startup frames measure 22–65 ms on the current test host | First-use texture staging and the remaining compression metadata are incomplete |
 | **Pistol Whip** | Maps the native PS VR2 plugin and Burst module, then starts loading Unity asset archives | Headset, tracking, controller, and host OpenXR support are intentionally deferred |
 | **Propagation: Paradise Hotel** | Mounts the 8.8 GiB UE PAK, completes ICU/config bootstrap, opens the cooked Global shader archive, creates AGC shaders, and submits the first DCB | This milestone predates the new synchronization packet constructors and needs a fresh run; VR presentation still has no host headset bridge |
 | **Tetris Effect: Connected** | Completes the Unreal bootstrap and a measured startup frame with 595 guest draws and 63 compute dispatches, including typed 2D/3D storage images, `64×64×64 RGBA16_FLOAT` volumes, layered post-process targets, `RGBA32_FLOAT` exposure surfaces, a `10_10_10_2_UNORM` lookup target, and the mixed image/LDS prepass. Ordered AGC completion acknowledgement removes the intermittent retirement race, and the latest unattended run advanced through 49 VideoOut cycles. Most post-bootstrap cycles measured about 3.3–3.8 seconds on the current RTX 3070 Ti host. The first generated `0xe060`-byte material pixel shader is now decoded within its exact AGC allocation instead of the old fixed instruction ceiling | The latest verified visible output is still the recognizable 1920×1080 HDR particle target shown above. The exact registered 3840×2160 VideoOut target remains black, so presentation falls back to a converted `R11G11B10_FLOAT` intermediate. NGG/fetch-shader continuations, exact layered rendering, final scanout aliasing/tonemapping, one oversized guest-buffer descriptor, and performance remain incomplete; neither a menu nor gameplay is claimed |
@@ -598,7 +598,9 @@ store, and image-atomic forms remain explicit future work.
 
 Graphics modules connect vertex `EXP POS0` to `BuiltIn Position`, vertex
 `PARAM0..31` exports to Vulkan locations, fragment VINTRP instructions to the
-matching inputs, and fragment `EXP MRT0` to color location zero. Hardware-only
+matching inputs, and fragment `EXP MRT0..7` to colour locations 0..7. Hardware
+CB slot *n* is Vulkan colour attachment *n*; unused slots stay unused rather
+than compacting the locations. Hardware-only
 M0 setup and EXEC restoration from unavailable pixel-prolog SGPRs are tolerated
 without inventing guest data. Fragment EXEC/VCC predicates use the subgroup
 local invocation index rather than a compute-only builtin. The current MIMG
@@ -618,7 +620,7 @@ Sampled-image staging detiles 2D surfaces and thick 3D volumes, including
 `10_10_10_2_UNORM`, into matching Vulkan formats. Resource dimension and depth
 are part of the cache key so 2D/3D aliases cannot reuse an incompatible image
 view.
-Compressed/masked exports, additional MRT targets, non-trivial image operands,
+Compressed/masked exports, non-trivial image operands,
 and the remaining graphics system VGPRs are still incomplete.
 
 ## Building
@@ -950,23 +952,19 @@ matching guest address, and publishes the frame through an API-neutral sink.
 
 The remaining stages are:
 
-1. Add multiple render targets. The command-stream side already decodes all
-   eight colour slots and their per-slot blend and write masks; only the Vulkan
-   attachment path and the pixel shader's exports beyond target zero are still
-   single-target, which is what deferred shading needs.
-2. Add mip and layer views, texture component swizzles, the remaining
+1. Add mip and layer views, texture component swizzles, the remaining
    compressed DCC/FMASK states, HTILE Z-range/HiZ handling, and CMASK
    states coupled to FMASK.
-3. Finish indirect drawing. `SET_BASE` already records the argument base and
+2. Finish indirect drawing. `SET_BASE` already records the argument base and
    indirect dispatches execute; the indirect draw packet bodies are the
    remaining half.
-4. Extend the current structured natural-loop and terminal-selection lowering
+3. Extend the current structured natural-loop and terminal-selection lowering
    to irreducible control flow, complete VCC/EXEC divergence, and cover the
    remaining explicit-LOD operands and image operations seen in captures. The
    alternate gradient-free image-sample encoding is now accepted; its former
    Jurassic Park device loss was an invalid framebuffer pairing caused by a
    stale undersized depth attachment, not shader control flow.
-5. Continue reducing first-use texture work and the per-draw submission cost,
+4. Continue reducing first-use texture work and the per-draw submission cost,
    and validate state and resource invalidation against longer title captures.
 
 The live path is now connected end to end: AGC DCB submission executes against
@@ -2283,8 +2281,7 @@ scheduler and Vulkan backend. Observed startup work now includes:
   table seed attribute V#s and run the guest export program.
 - Later progress captures show title-provided logos, HUD elements, characters,
   and scene textures rather than only the initial presentation surface.
-  Depth/MRT composition, compression metadata, and some layouts can still
-  produce visible corruption.
+  Compression metadata and some layouts can still produce visible corruption.
 - A vertex program is translated as what it is on this generation: the ES half
   of a merged NGG wave. Its vertex id arrives in V5 and its instance id in V8,
   which is what the usual `v_cndmask v0, v8, v5, s8` prolog selects between;

@@ -1011,6 +1011,36 @@ test "sampler descriptors normalize fixed-point lod values" {
     try testing.expectEqual(@as(u8, 2), descriptor.border_color_type);
 }
 
+test "render state keeps two active colour slots" {
+    var state = gpu_state.State{};
+    const slot0: u64 = 0x00ab_cdef_1200;
+    const slot1: u64 = 0x00ab_cdef_5600;
+    try state.writeRegister(.context, 0x318, @truncate(slot0 >> 8));
+    try state.writeRegister(.context, 0x31c, (10 << 2));
+    try state.writeRegister(.context, 0x390, @truncate(slot0 >> 40));
+    try state.writeRegister(.context, 0x3b0, (127 << 14) | 127);
+    try state.writeRegister(.context, 0x3b8, 5 | (0x1b << 14));
+    try state.writeRegister(.context, 0x327, @truncate(slot1 >> 8));
+    try state.writeRegister(.context, 0x32b, (10 << 2));
+    try state.writeRegister(.context, 0x391, @truncate(slot1 >> 40));
+    try state.writeRegister(.context, 0x3b1, (127 << 14) | 127);
+    try state.writeRegister(.context, 0x3b9, 5 | (0x1b << 14));
+    try state.writeRegister(.context, 0x08e, 0x0000_00ff);
+    try state.writeRegister(.context, 0x1e0, 1 << 30);
+    try state.writeRegister(.context, 0x1e1, (4) | (5 << 8) | (1 << 30));
+
+    const render = decodeRenderState(&state);
+    try testing.expectEqual(@as(u8, 2), render.color_count);
+    try testing.expectEqual(@as(u8, 2), render.active_color_count);
+    try testing.expectEqual(slot0, render.color_targets[0].?.address);
+    try testing.expectEqual(slot1, render.color_targets[1].?.address);
+    try testing.expectEqual(@as(u8, 0), render.color_targets[0].?.slot);
+    try testing.expectEqual(@as(u8, 1), render.color_targets[1].?.slot);
+    try testing.expect(render.blends[0].enabled);
+    try testing.expect(render.blends[1].enabled);
+    try testing.expectEqual(@as(u5, 4), render.blends[1].color_source);
+}
+
 test "color control identifies fixed-function metadata operations" {
     for (0..8) |raw_mode| {
         const control = ColorControl{ .mode = @intCast(raw_mode) };

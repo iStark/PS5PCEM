@@ -230,6 +230,9 @@ pub const Options = struct {
     /// backend that knows the paired VS interface can disable that inference
     /// and supply only locations the vertex stage actually exports.
     infer_fragment_parameter_mask: bool = true,
+    /// Fragment EXP MRT0..7 bits. Empty leaves Location 0 declared so a
+    /// pixel program that never exports still has a legal colour output.
+    color_export_mask: u8 = 0,
     scalar_registers: []const ScalarRegister = &.{},
     dynamic_scalar_binding: ?DynamicScalarBinding = null,
     compute_inputs: ?ComputeInputs = null,
@@ -499,7 +502,7 @@ const Builder = struct {
     vertex_index_input: u32 = 0,
     instance_index_input: u32 = 0,
     position_output: u32 = 0,
-    color_output: u32 = 0,
+    color_outputs: [8]u32 = @splat(0),
     parameter_variables: [32]u32 = @splat(0),
     /// BuiltIn FragCoord (float4) for fragment UV fallback when PARAM interps
     /// are not yet wired from the vertex stage.
@@ -686,11 +689,17 @@ const Builder = struct {
             .fragment => {
                 self.vector4_type = self.id();
                 const output_pointer = self.id();
-                self.color_output = self.id();
-                try self.emit(&self.annotations, 71, &.{ self.color_output, 30, 0 }); // Location 0
                 try self.emit(&self.declarations, 23, &.{ self.vector4_type, self.float_type, 4 }); // OpTypeVector
                 try self.emit(&self.declarations, 32, &.{ output_pointer, 3, self.vector4_type }); // ptr Output
-                try self.emit(&self.declarations, 59, &.{ output_pointer, self.color_output, 3 }); // OpVariable
+                var color_mask = options.color_export_mask;
+                if (color_mask == 0) color_mask = 1;
+                for (0..self.color_outputs.len) |slot| {
+                    if (color_mask & (@as(u8, 1) << @intCast(slot)) == 0) continue;
+                    const variable = self.id();
+                    self.color_outputs[slot] = variable;
+                    try self.emit(&self.annotations, 71, &.{ variable, 30, @intCast(slot) }); // Location
+                    try self.emit(&self.declarations, 59, &.{ output_pointer, variable, 3 }); // OpVariable
+                }
                 // FragCoord for UV fallback (BuiltIn 15).
                 const frag_ptr = self.id();
                 self.frag_coord_input = self.id();
@@ -2488,7 +2497,10 @@ const Builder = struct {
                 self.parameter_variables[inst.export_target - 0x20]
             else
                 0,
-            .fragment => if (inst.export_target == 0) self.color_output else 0,
+            .fragment => if (inst.export_target < self.color_outputs.len)
+                self.color_outputs[inst.export_target]
+            else
+                0,
             .compute => 0,
         };
         if (output == 0) {
@@ -5488,7 +5500,9 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     if (builder.instance_index_input != 0) try entry_point.append(allocator, builder.instance_index_input);
     if (builder.frag_coord_input != 0) try entry_point.append(allocator, builder.frag_coord_input);
     if (builder.position_output != 0) try entry_point.append(allocator, builder.position_output);
-    if (builder.color_output != 0) try entry_point.append(allocator, builder.color_output);
+    for (builder.color_outputs) |color_output| {
+        if (color_output != 0) try entry_point.append(allocator, color_output);
+    }
     for (builder.parameter_variables) |variable| {
         if (variable != 0) try entry_point.append(allocator, variable);
     }
@@ -5582,13 +5596,18 @@ pub fn translate(allocator: std.mem.Allocator, program: *const instruction.Progr
             .vertex => if (candidate.opcode == .exp and candidate.export_target >= 0x20) {
                 effective.parameter_mask |= @as(u32, 1) << @intCast(candidate.export_target - 0x20);
             },
-            .fragment => if (effective.infer_fragment_parameter_mask) switch (candidate.opcode) {
-                .v_interp_p1_f32, .v_interp_p2_f32, .v_interp_mov_f32 => {
-                    if (candidate.src1.kind == .integer_inline_constant and candidate.src1.value < 32) {
-                        effective.parameter_mask |= @as(u32, 1) << @intCast(candidate.src1.value);
-                    }
-                },
-                else => {},
+            .fragment => {
+                if (candidate.opcode == .exp and candidate.export_target < 8) {
+                    effective.color_export_mask |= @as(u8, 1) << @intCast(candidate.export_target);
+                }
+                if (effective.infer_fragment_parameter_mask) switch (candidate.opcode) {
+                    .v_interp_p1_f32, .v_interp_p2_f32, .v_interp_mov_f32 => {
+                        if (candidate.src1.kind == .integer_inline_constant and candidate.src1.value < 32) {
+                            effective.parameter_mask |= @as(u32, 1) << @intCast(candidate.src1.value);
+                        }
+                    },
+                    else => {},
+                };
             },
             .compute => {},
         }
@@ -6561,6 +6580,39 @@ test "fragment MRT0 export lowers to location zero" {
     try std.testing.expect(containsOpcode(module.words, 80)); // OpCompositeConstruct
     try std.testing.expect(containsOpcode(module.words, 62)); // OpStore MRT0
     try std.testing.expectEqual(@as(u32, 4), @intFromEnum(Stage.fragment));
+}
+
+test "fragment MRT0 and MRT1 export distinct color locations" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .exp,
+        .export_target = 0,
+        .export_enable = 0xf,
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src1 = .{ .kind = .vgpr, .reg = 1 },
+        .src2 = .{ .kind = .vgpr, .reg = 2 },
+        .src3 = .{ .kind = .vgpr, .reg = 3 },
+        .src_count = 4,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .exp,
+        .export_target = 1,
+        .export_enable = 0xf,
+        .export_done = true,
+        .src0 = .{ .kind = .vgpr, .reg = 4 },
+        .src1 = .{ .kind = .vgpr, .reg = 5 },
+        .src2 = .{ .kind = .vgpr, .reg = 6 },
+        .src3 = .{ .kind = .vgpr, .reg = 7 },
+        .src_count = 4,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 62)); // OpStore MRT0 and MRT1
+    try std.testing.expectEqual(@as(usize, 3), countOpcode(module.words, 71)); // FragCoord + Location 0 + Location 1
 }
 
 test "fragment EXEC restore from an unavailable hardware SGPR is a no-op" {

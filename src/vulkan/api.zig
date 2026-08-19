@@ -24,6 +24,7 @@ pub const incomplete: Result = 5;
 pub const true_value: Bool32 = 1;
 pub const whole_size: DeviceSize = ~@as(DeviceSize, 0);
 pub const queue_family_ignored: u32 = ~@as(u32, 0);
+pub const attachment_unused: u32 = ~@as(u32, 0);
 
 pub const api_version_1_2 = makeApiVersion(0, 1, 2, 0);
 

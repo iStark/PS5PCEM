@@ -615,6 +615,7 @@ const maximum_completed_frames = 16;
 // those targets resident and lets the existing direct sampled-target path bind
 // the same Vulkan image for the next pass.
 const maximum_render_targets = 64;
+const maximum_color_passes = 16;
 const maximum_depth_targets = 16;
 const maximum_sampled_images = 32;
 // Descriptor arrays are limited per shader, but the cross-draw texture cache
@@ -720,7 +721,8 @@ const GraphicsPipelineEntry = struct {
 const GraphicsPipelineState = extern struct {
     width: u32,
     height: u32,
-    color_attachment_format: u32,
+    color_attachment_count: u32,
+    color_attachment_formats: [gpu.resources.color_target_count]u32,
     topology: u32,
     viewport_x_bits: u32,
     viewport_y_bits: u32,
@@ -735,14 +737,14 @@ const GraphicsPipelineState = extern struct {
     cull_mode: u32,
     front_face: u32,
     rasterizer_discard: u32,
-    color_write_mask: u32,
-    blend_enable: u32,
-    source_color_blend_factor: u32,
-    destination_color_blend_factor: u32,
-    color_blend_operation: u32,
-    source_alpha_blend_factor: u32,
-    destination_alpha_blend_factor: u32,
-    alpha_blend_operation: u32,
+    color_write_masks: [gpu.resources.color_target_count]u32,
+    blend_enables: [gpu.resources.color_target_count]u32,
+    source_color_blend_factors: [gpu.resources.color_target_count]u32,
+    destination_color_blend_factors: [gpu.resources.color_target_count]u32,
+    color_blend_operations: [gpu.resources.color_target_count]u32,
+    source_alpha_blend_factors: [gpu.resources.color_target_count]u32,
+    destination_alpha_blend_factors: [gpu.resources.color_target_count]u32,
+    alpha_blend_operations: [gpu.resources.color_target_count]u32,
     /// Zero when the draw has no depth attachment. A pipeline is only
     /// compatible with a render pass that agrees about depth, so this belongs
     /// in the cache key.
@@ -778,7 +780,8 @@ const GraphicsPipelineState = extern struct {
         return .{
             .width = width,
             .height = height,
-            .color_attachment_format = vk.format_r8g8b8a8_unorm,
+            .color_attachment_count = 1,
+            .color_attachment_formats = .{ vk.format_r8g8b8a8_unorm, 0, 0, 0, 0, 0, 0, 0 },
             .topology = vk.primitive_topology_triangle_list,
             .rectangle_completion = 0,
             .rectangle_parameter_mask = 0,
@@ -795,14 +798,14 @@ const GraphicsPipelineState = extern struct {
             .cull_mode = 0,
             .front_face = 1,
             .rasterizer_discard = 0,
-            .color_write_mask = vk.color_component_rgba_bits,
-            .blend_enable = 0,
-            .source_color_blend_factor = 0,
-            .destination_color_blend_factor = 0,
-            .color_blend_operation = 0,
-            .source_alpha_blend_factor = 0,
-            .destination_alpha_blend_factor = 0,
-            .alpha_blend_operation = 0,
+            .color_write_masks = .{ vk.color_component_rgba_bits, 0, 0, 0, 0, 0, 0, 0 },
+            .blend_enables = @splat(0),
+            .source_color_blend_factors = @splat(0),
+            .destination_color_blend_factors = @splat(0),
+            .color_blend_operations = @splat(0),
+            .source_alpha_blend_factors = @splat(0),
+            .destination_alpha_blend_factors = @splat(0),
+            .alpha_blend_operations = @splat(0),
             .depth_attachment_format = 0,
             .depth_test_enable = 0,
             .depth_write_enable = 0,
@@ -1166,6 +1169,21 @@ const DepthPass = struct {
     depth_format: u32,
     render_pass: vk.RenderPass,
     framebuffer: vk.Framebuffer,
+};
+
+/// A render pass and framebuffer for more than one colour slot.
+///
+/// Hardware CB slot *n* is Vulkan colour attachment *n*. Unused slots between
+/// 0 and the highest bound target stay as `ATTACHMENT_UNUSED` so fragment
+/// Location *n* still names the matching CB.
+const ColorPass = struct {
+    color_views: [gpu.resources.color_target_count]vk.ImageView = @splat(0),
+    color_count: u8,
+    depth_view: vk.ImageView = 0,
+    depth_format: u32 = 0,
+    render_pass: vk.RenderPass,
+    framebuffer: vk.Framebuffer,
+    last_used_sequence: u64 = 0,
 };
 
 const CmaskSeed = struct {
@@ -1842,6 +1860,9 @@ pub const Renderer = struct {
     graphics_probe_colored_pixels: u32 = 0,
     graphics_probe_frame: [graphics_probe_bytes]u8 = @splat(0),
     render_targets: std.ArrayList(CachedRenderTarget) = .empty,
+    color_passes: std.ArrayList(ColorPass) = .empty,
+    color_pass_sequence: u64 = 0,
+    reported_mrt_draw: bool = false,
     depth_targets: std.ArrayList(CachedDepthTarget) = .empty,
     depth_target_sequence: u64 = 0,
     reported_depth_attachment: bool = false,
@@ -2319,6 +2340,8 @@ pub const Renderer = struct {
     pub fn deinit(self: *Renderer) void {
         _ = self.device_functions.device_wait_idle(self.device);
         self.pending_targetless_draws.deinit(self.allocator);
+        for (self.color_passes.items) |pass| self.destroyColorPass(pass);
+        self.color_passes.deinit(self.allocator);
         for (self.render_targets.items) |target| self.destroyCachedRenderTarget(target);
         self.render_targets.deinit(self.allocator);
         for (self.depth_targets.items) |target| self.destroyCachedDepthTarget(target);
@@ -5179,25 +5202,84 @@ pub const Renderer = struct {
         preserve_color: bool,
         samples: u32,
     ) Error!vk.RenderPass {
-        const attachment = vk.AttachmentDescription{
-            .format = format,
-            .samples = samples,
-            .load_operation = if (preserve_color) vk.attachment_load_op_load else vk.attachment_load_op_clear,
-            .store_operation = vk.attachment_store_op_store,
-            .initial_layout = if (preserve_color) vk.image_layout_color_attachment_optimal else vk.image_layout_undefined,
-            .final_layout = vk.image_layout_color_attachment_optimal,
-        };
-        const reference = vk.AttachmentReference{
-            .attachment = 0,
-            .layout = vk.image_layout_color_attachment_optimal,
-        };
+        return self.createColorRenderPass(&.{format}, 0, preserve_color, samples);
+    }
+
+    /// Colour attachments occupy hardware slots 0..N-1. A zero format is a
+    /// hole: the subpass names `ATTACHMENT_UNUSED` so Location *i* still
+    /// matches CB *i* without a dummy image.
+    fn createColorRenderPass(
+        self: *Renderer,
+        color_formats: []const u32,
+        depth_format: u32,
+        preserve_color: bool,
+        samples: u32,
+    ) Error!vk.RenderPass {
+        if (color_formats.len == 0 or color_formats.len > gpu.resources.color_target_count) {
+            return Error.UnsupportedGraphicsState;
+        }
+        var attachments: [gpu.resources.color_target_count + 1]vk.AttachmentDescription = undefined;
+        var color_refs: [gpu.resources.color_target_count]vk.AttachmentReference = undefined;
+        var attachment_count: u32 = 0;
+        for (color_formats, 0..) |format, slot| {
+            if (format == 0) {
+                color_refs[slot] = .{
+                    .attachment = vk.attachment_unused,
+                    .layout = vk.image_layout_color_attachment_optimal,
+                };
+                continue;
+            }
+            attachments[attachment_count] = .{
+                .format = format,
+                .samples = samples,
+                .load_operation = if (preserve_color) vk.attachment_load_op_load else vk.attachment_load_op_clear,
+                .store_operation = vk.attachment_store_op_store,
+                .initial_layout = if (preserve_color)
+                    vk.image_layout_color_attachment_optimal
+                else
+                    vk.image_layout_undefined,
+                .final_layout = vk.image_layout_color_attachment_optimal,
+            };
+            color_refs[slot] = .{
+                .attachment = attachment_count,
+                .layout = vk.image_layout_color_attachment_optimal,
+            };
+            attachment_count += 1;
+        }
+        var depth_ref: vk.AttachmentReference = undefined;
+        if (depth_format != 0) {
+            const has_stencil = depthAttachmentHasStencil(depth_format);
+            attachments[attachment_count] = .{
+                .format = depth_format,
+                .samples = samples,
+                .load_operation = vk.attachment_load_op_load,
+                .store_operation = vk.attachment_store_op_store,
+                .stencil_load_operation = if (has_stencil)
+                    vk.attachment_load_op_load
+                else
+                    vk.attachment_load_op_dont_care,
+                .stencil_store_operation = if (has_stencil)
+                    vk.attachment_store_op_store
+                else
+                    vk.attachment_store_op_dont_care,
+                .initial_layout = vk.image_layout_depth_stencil_attachment_optimal,
+                .final_layout = vk.image_layout_depth_stencil_attachment_optimal,
+            };
+            depth_ref = .{
+                .attachment = attachment_count,
+                .layout = vk.image_layout_depth_stencil_attachment_optimal,
+            };
+            attachment_count += 1;
+        }
+        if (attachment_count == 0) return Error.UnsupportedGraphicsState;
         const subpass = vk.SubpassDescription{
-            .color_attachment_count = 1,
-            .color_attachments = @ptrCast(&reference),
+            .color_attachment_count = @intCast(color_formats.len),
+            .color_attachments = &color_refs,
+            .depth_stencil_attachment = if (depth_format != 0) &depth_ref else null,
         };
         const info = vk.RenderPassCreateInfo{
-            .attachment_count = 1,
-            .attachments = @ptrCast(&attachment),
+            .attachment_count = attachment_count,
+            .attachments = &attachments,
             .subpass_count = 1,
             .subpasses = @ptrCast(&subpass),
         };
@@ -5322,58 +5404,7 @@ pub const Renderer = struct {
         preserve_color: bool,
         samples: u32,
     ) Error!vk.RenderPass {
-        const stencil_load = if (depthAttachmentHasStencil(depth_format))
-            vk.attachment_load_op_load
-        else
-            vk.attachment_load_op_dont_care;
-        const stencil_store = if (depthAttachmentHasStencil(depth_format))
-            vk.attachment_store_op_store
-        else
-            vk.attachment_store_op_dont_care;
-        const attachments = [2]vk.AttachmentDescription{
-            .{
-                .format = color_format,
-                .samples = samples,
-                .load_operation = if (preserve_color) vk.attachment_load_op_load else vk.attachment_load_op_clear,
-                .store_operation = vk.attachment_store_op_store,
-                .initial_layout = if (preserve_color) vk.image_layout_color_attachment_optimal else vk.image_layout_undefined,
-                .final_layout = vk.image_layout_color_attachment_optimal,
-            },
-            .{
-                .format = depth_format,
-                .samples = samples,
-                .load_operation = vk.attachment_load_op_load,
-                .store_operation = vk.attachment_store_op_store,
-                .stencil_load_operation = stencil_load,
-                .stencil_store_operation = stencil_store,
-                .initial_layout = vk.image_layout_depth_stencil_attachment_optimal,
-                .final_layout = vk.image_layout_depth_stencil_attachment_optimal,
-            },
-        };
-        const color_reference = vk.AttachmentReference{
-            .attachment = 0,
-            .layout = vk.image_layout_color_attachment_optimal,
-        };
-        const depth_reference = vk.AttachmentReference{
-            .attachment = 1,
-            .layout = vk.image_layout_depth_stencil_attachment_optimal,
-        };
-        const subpass = vk.SubpassDescription{
-            .color_attachment_count = 1,
-            .color_attachments = @ptrCast(&color_reference),
-            .depth_stencil_attachment = &depth_reference,
-        };
-        const info = vk.RenderPassCreateInfo{
-            .attachment_count = attachments.len,
-            .attachments = &attachments,
-            .subpass_count = 1,
-            .subpasses = @ptrCast(&subpass),
-        };
-        var render_pass: vk.RenderPass = 0;
-        if (self.device_functions.create_render_pass(self.device, &info, null, &render_pass) != vk.success) {
-            return Error.RenderPassCreationFailed;
-        }
-        return render_pass;
+        return self.createColorRenderPass(&.{color_format}, depth_format, preserve_color, samples);
     }
 
     /// The colour target's framebuffer paired with one depth attachment,
@@ -5427,6 +5458,170 @@ pub const Renderer = struct {
         return pass;
     }
 
+    fn colorPassMatches(
+        pass: ColorPass,
+        color_views: [gpu.resources.color_target_count]vk.ImageView,
+        color_count: u8,
+        depth_view: vk.ImageView,
+        depth_format: u32,
+    ) bool {
+        if (pass.color_count != color_count or
+            pass.depth_view != depth_view or
+            pass.depth_format != depth_format)
+        {
+            return false;
+        }
+        return std.mem.eql(vk.ImageView, &pass.color_views, &color_views);
+    }
+
+    fn destroyColorPass(self: *Renderer, pass: ColorPass) void {
+        self.device_functions.destroy_framebuffer(self.device, pass.framebuffer, null);
+        self.device_functions.destroy_render_pass(self.device, pass.render_pass, null);
+    }
+
+    fn evictColorPass(self: *Renderer) void {
+        if (self.color_passes.items.len == 0) return;
+        var oldest_index: usize = 0;
+        var oldest_sequence = self.color_passes.items[0].last_used_sequence;
+        for (self.color_passes.items[1..], 1..) |entry, index| {
+            if (entry.last_used_sequence >= oldest_sequence) continue;
+            oldest_index = index;
+            oldest_sequence = entry.last_used_sequence;
+        }
+        self.destroyColorPass(self.color_passes.items[oldest_index]);
+        _ = self.color_passes.swapRemove(oldest_index);
+    }
+
+    fn invalidateColorPasses(self: *Renderer, view: vk.ImageView) void {
+        var index: usize = 0;
+        while (index < self.color_passes.items.len) {
+            const pass = self.color_passes.items[index];
+            var referenced = pass.depth_view == view;
+            if (!referenced) {
+                for (pass.color_views) |color_view| {
+                    if (color_view == view) {
+                        referenced = true;
+                        break;
+                    }
+                }
+            }
+            if (!referenced) {
+                index += 1;
+                continue;
+            }
+            self.destroyColorPass(pass);
+            _ = self.color_passes.swapRemove(index);
+        }
+    }
+
+    fn acquireColorPass(
+        self: *Renderer,
+        color_views: [gpu.resources.color_target_count]vk.ImageView,
+        color_formats: [gpu.resources.color_target_count]u32,
+        color_count: u8,
+        depth_view: vk.ImageView,
+        depth_format: u32,
+        samples: u32,
+        width: u32,
+        height: u32,
+    ) anyerror!ColorPass {
+        self.color_pass_sequence +%= 1;
+        for (self.color_passes.items) |*existing| {
+            if (!colorPassMatches(existing.*, color_views, color_count, depth_view, depth_format)) continue;
+            existing.last_used_sequence = self.color_pass_sequence;
+            return existing.*;
+        }
+
+        const render_pass = try self.createColorRenderPass(
+            color_formats[0..color_count],
+            depth_format,
+            true,
+            samples,
+        );
+        errdefer self.device_functions.destroy_render_pass(self.device, render_pass, null);
+
+        var views: [gpu.resources.color_target_count + 1]vk.ImageView = undefined;
+        var view_count: u32 = 0;
+        for (color_formats[0..color_count], color_views[0..color_count]) |format, view| {
+            if (format == 0) continue;
+            views[view_count] = view;
+            view_count += 1;
+        }
+        if (depth_view != 0) {
+            views[view_count] = depth_view;
+            view_count += 1;
+        }
+        if (view_count == 0) return Error.UnsupportedGraphicsState;
+        const framebuffer_info = vk.FramebufferCreateInfo{
+            .render_pass = render_pass,
+            .attachment_count = view_count,
+            .attachments = &views,
+            .width = width,
+            .height = height,
+        };
+        var framebuffer: vk.Framebuffer = 0;
+        if (self.device_functions.create_framebuffer(self.device, &framebuffer_info, null, &framebuffer) != vk.success) {
+            return Error.FramebufferCreationFailed;
+        }
+        const pass = ColorPass{
+            .color_views = color_views,
+            .color_count = color_count,
+            .depth_view = depth_view,
+            .depth_format = depth_format,
+            .render_pass = render_pass,
+            .framebuffer = framebuffer,
+            .last_used_sequence = self.color_pass_sequence,
+        };
+        if (self.color_passes.items.len >= maximum_color_passes) self.evictColorPass();
+        try self.color_passes.append(self.allocator, pass);
+        return pass;
+    }
+
+    fn applyColorAttachmentState(
+        result: *GraphicsPipelineState,
+        render: *const gpu.RenderState,
+        colors: []const GuestColorTarget,
+    ) Error!void {
+        result.color_attachment_count = 1;
+        result.color_attachment_formats = @splat(0);
+        result.color_write_masks = @splat(0);
+        result.blend_enables = @splat(0);
+        result.source_color_blend_factors = @splat(0);
+        result.destination_color_blend_factors = @splat(0);
+        result.color_blend_operations = @splat(0);
+        result.source_alpha_blend_factors = @splat(0);
+        result.destination_alpha_blend_factors = @splat(0);
+        result.alpha_blend_operations = @splat(0);
+
+        var highest: u32 = 0;
+        for (colors) |color| {
+            const slot = color.descriptor.slot;
+            if (slot >= gpu.resources.color_target_count) continue;
+            highest = @max(highest, slot);
+            result.color_attachment_formats[slot] = color.format.vulkan;
+            result.color_write_masks[slot] = color.descriptor.write_mask;
+            const blend = render.blends[slot];
+            result.blend_enables[slot] = @intFromBool(blend.enabled);
+            if (!blend.enabled) continue;
+            result.source_color_blend_factors[slot] = try vulkanBlendFactor(blend.color_source);
+            result.destination_color_blend_factors[slot] = try vulkanBlendFactor(blend.color_destination);
+            result.color_blend_operations[slot] = try vulkanBlendOperation(blend.color_operation);
+            result.source_alpha_blend_factors[slot] = if (blend.separate_alpha)
+                try vulkanBlendFactor(blend.alpha_source)
+            else
+                result.source_color_blend_factors[slot];
+            result.destination_alpha_blend_factors[slot] = if (blend.separate_alpha)
+                try vulkanBlendFactor(blend.alpha_destination)
+            else
+                result.destination_color_blend_factors[slot];
+            result.alpha_blend_operations[slot] = if (blend.separate_alpha)
+                try vulkanBlendOperation(blend.alpha_operation)
+            else
+                result.color_blend_operations[slot];
+        }
+        result.color_attachment_count = highest + 1;
+    }
+
     fn guestGraphicsState(render: *const gpu.RenderState, target: gpu.resources.ColorTarget) Error!GraphicsPipelineState {
         var result = GraphicsPipelineState.default(target.width, target.height);
         if (render.viewport) |viewport| {
@@ -5471,27 +5666,6 @@ pub const Renderer = struct {
         result.cull_mode = 0;
         result.front_face = if (render.raster.clockwise_front_face) 0 else 1;
         result.rasterizer_discard = @intFromBool(render.raster.rasterizer_discard);
-        result.color_write_mask = target.write_mask;
-
-        const blend = render.blends[target.slot];
-        result.blend_enable = @intFromBool(blend.enabled);
-        if (blend.enabled) {
-            result.source_color_blend_factor = try vulkanBlendFactor(blend.color_source);
-            result.destination_color_blend_factor = try vulkanBlendFactor(blend.color_destination);
-            result.color_blend_operation = try vulkanBlendOperation(blend.color_operation);
-            result.source_alpha_blend_factor = if (blend.separate_alpha)
-                try vulkanBlendFactor(blend.alpha_source)
-            else
-                result.source_color_blend_factor;
-            result.destination_alpha_blend_factor = if (blend.separate_alpha)
-                try vulkanBlendFactor(blend.alpha_destination)
-            else
-                result.destination_color_blend_factor;
-            result.alpha_blend_operation = if (blend.separate_alpha)
-                try vulkanBlendOperation(blend.alpha_operation)
-            else
-                result.color_blend_operation;
-        }
         return result;
     }
 
@@ -5586,19 +5760,24 @@ pub const Renderer = struct {
         const multisample = vk.PipelineMultisampleStateCreateInfo{
             .rasterization_samples = pipeline_state.rasterization_samples,
         };
-        const blend_attachment = vk.PipelineColorBlendAttachmentState{
-            .blend_enable = pipeline_state.blend_enable,
-            .source_color_blend_factor = pipeline_state.source_color_blend_factor,
-            .destination_color_blend_factor = pipeline_state.destination_color_blend_factor,
-            .color_blend_operation = pipeline_state.color_blend_operation,
-            .source_alpha_blend_factor = pipeline_state.source_alpha_blend_factor,
-            .destination_alpha_blend_factor = pipeline_state.destination_alpha_blend_factor,
-            .alpha_blend_operation = pipeline_state.alpha_blend_operation,
-            .color_write_mask = pipeline_state.color_write_mask,
-        };
+        var blend_attachments: [gpu.resources.color_target_count]vk.PipelineColorBlendAttachmentState = undefined;
+        const blend_count = @min(pipeline_state.color_attachment_count, gpu.resources.color_target_count);
+        if (blend_count == 0) return Error.UnsupportedGraphicsState;
+        for (0..blend_count) |slot| {
+            blend_attachments[slot] = .{
+                .blend_enable = pipeline_state.blend_enables[slot],
+                .source_color_blend_factor = pipeline_state.source_color_blend_factors[slot],
+                .destination_color_blend_factor = pipeline_state.destination_color_blend_factors[slot],
+                .color_blend_operation = pipeline_state.color_blend_operations[slot],
+                .source_alpha_blend_factor = pipeline_state.source_alpha_blend_factors[slot],
+                .destination_alpha_blend_factor = pipeline_state.destination_alpha_blend_factors[slot],
+                .alpha_blend_operation = pipeline_state.alpha_blend_operations[slot],
+                .color_write_mask = pipeline_state.color_write_masks[slot],
+            };
+        }
         const color_blend = vk.PipelineColorBlendStateCreateInfo{
-            .attachment_count = 1,
-            .attachments = @ptrCast(&blend_attachment),
+            .attachment_count = @intCast(blend_count),
+            .attachments = &blend_attachments,
         };
         const depth_stencil = vk.PipelineDepthStencilStateCreateInfo{
             .depth_test_enable = pipeline_state.depth_test_enable,
@@ -6318,6 +6497,7 @@ pub const Renderer = struct {
     }
 
     fn destroyCachedRenderTarget(self: *Renderer, target: CachedRenderTarget) void {
+        self.invalidateColorPasses(target.view);
         self.destroyDepthPass(target.depth_pass);
         self.device_functions.destroy_framebuffer(self.device, target.framebuffer, null);
         self.device_functions.destroy_render_pass(self.device, target.render_pass, null);
@@ -6649,6 +6829,7 @@ pub const Renderer = struct {
     /// Drops any colour framebuffer still paired with a depth view that is
     /// about to be destroyed.
     fn invalidateDepthPasses(self: *Renderer, view: vk.ImageView) void {
+        self.invalidateColorPasses(view);
         for (self.render_targets.items) |*cached| {
             const pass = cached.depth_pass orelse continue;
             if (pass.depth_view != view) continue;
@@ -7132,13 +7313,23 @@ pub const Renderer = struct {
         fragment_scalars: []const gpu.ShaderSpirvScalarRegister,
         pipeline_state: GraphicsPipelineState,
         target: GuestColorTarget,
+        extra_colors: []const GuestColorTarget,
         depth: ?GuestDepthTarget,
         depth_clear_requested: bool,
         bind_graphics_descriptors: bool,
         draw: GuestDraw,
     ) anyerror!void {
+        const pinned_sequence = std.math.maxInt(u64);
         const target_index = try self.acquireRenderTarget(target);
         try self.transitionRenderTargetToColorAttachment(target_index);
+        self.render_targets.items[target_index].last_used_sequence = pinned_sequence;
+        var extra_indices: [gpu.resources.color_target_count - 1]usize = undefined;
+        for (extra_colors, 0..) |extra, extra_index| {
+            const index = try self.acquireRenderTarget(extra);
+            try self.transitionRenderTargetToColorAttachment(index);
+            self.render_targets.items[index].last_used_sequence = pinned_sequence;
+            extra_indices[extra_index] = index;
+        }
         const cached_snapshot = self.render_targets.items[target_index];
         const frame_bytes = try colorTargetFrameBytes(target);
         const report_checkpoints = !self.reported_first_graphics_draw_checkpoints;
@@ -7197,27 +7388,88 @@ pub const Renderer = struct {
             .{ vertex_words.len, fragment_words.len },
         );
         if (report_checkpoints) std.debug.print(
-            "[vulkan dcb] first graphics draw: viewport={d}x{d} scissor={d}x{d} discard={d} write=0x{x} blend={d}\n",
+            "[vulkan dcb] first graphics draw: viewport={d}x{d} scissor={d}x{d} discard={d} colors={d} write=0x{x} blend={d}\n",
             .{
                 @as(f32, @bitCast(pipeline_state.viewport_width_bits)),
                 @as(f32, @bitCast(pipeline_state.viewport_height_bits)),
                 pipeline_state.scissor_width,
                 pipeline_state.scissor_height,
                 pipeline_state.rasterizer_discard,
-                pipeline_state.color_write_mask,
-                pipeline_state.blend_enable,
+                pipeline_state.color_attachment_count,
+                pipeline_state.color_write_masks[0],
+                pipeline_state.blend_enables[0],
             },
         );
+        var extra_uploads: [gpu.resources.color_target_count - 1]?OwnedBuffer = @splat(null);
+        defer for (extra_uploads) |buffer| if (buffer) |owned| self.destroyBuffer(owned);
+        for (extra_colors, extra_indices[0..extra_colors.len], 0..) |extra, extra_index, upload_index| {
+            const extra_cached = self.render_targets.items[extra_index];
+            if (extra_cached.initialized or extra.descriptor.fragments_log2 != 0) continue;
+            const extra_bytes = try colorTargetFrameBytes(extra);
+            try self.flushPendingGuestWrite(extra.descriptor.address, extra_bytes);
+            const frame = try self.allocator.alloc(u8, extra_bytes);
+            defer self.allocator.free(frame);
+            const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+            const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
+            try self.stageInitialColorTarget(extra, reader, frame);
+            extra_uploads[upload_index] = try self.createBuffer(
+                extra_bytes,
+                vk.buffer_usage_transfer_src_bit,
+                vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+            );
+            try self.writeMapped(extra_uploads[upload_index].?, frame);
+            self.frame_profile.upload_bytes += extra_bytes;
+            self.frame_profile.target_upload_bytes += extra_bytes;
+        }
         // A depth attachment changes the render pass a pipeline must be
         // compatible with, so it has to be resolved before the pipeline is
         // looked up rather than at the point the pass begins.
         const depth_index: ?usize = if (depth) |plane| try self.acquireDepthTarget(plane) else null;
-        const depth_pass: ?DepthPass = if (depth_index) |index|
-            try self.acquireDepthPass(target_index, index)
+        const multi_color = pipeline_state.color_attachment_count > 1;
+        var color_pass: ?ColorPass = null;
+        const depth_pass: ?DepthPass = if (!multi_color) blk: {
+            break :blk if (depth_index) |index|
+                try self.acquireDepthPass(target_index, index)
+            else
+                null;
+        } else blk: {
+            var color_views: [gpu.resources.color_target_count]vk.ImageView = @splat(0);
+            var color_formats: [gpu.resources.color_target_count]u32 = @splat(0);
+            color_views[target.descriptor.slot] = self.render_targets.items[target_index].view;
+            color_formats[target.descriptor.slot] = target.format.vulkan;
+            for (extra_colors, extra_indices[0..extra_colors.len]) |extra, extra_index| {
+                color_views[extra.descriptor.slot] = self.render_targets.items[extra_index].view;
+                color_formats[extra.descriptor.slot] = extra.format.vulkan;
+            }
+            const depth_view: vk.ImageView = if (depth_index) |index|
+                self.depth_targets.items[index].view
+            else
+                0;
+            const depth_format: u32 = if (depth) |plane| plane.format else 0;
+            color_pass = try self.acquireColorPass(
+                color_views,
+                color_formats,
+                @intCast(pipeline_state.color_attachment_count),
+                depth_view,
+                depth_format,
+                pipeline_state.rasterization_samples,
+                pipeline_state.width,
+                pipeline_state.height,
+            );
+            break :blk null;
+        };
+        const pass_handle = if (color_pass) |pass|
+            pass.render_pass
+        else if (depth_pass) |pass|
+            pass.render_pass
         else
-            null;
-        const pass_handle = if (depth_pass) |pass| pass.render_pass else cached_snapshot.render_pass;
-        const framebuffer_handle = if (depth_pass) |pass| pass.framebuffer else cached_snapshot.framebuffer;
+            cached_snapshot.render_pass;
+        const framebuffer_handle = if (color_pass) |pass|
+            pass.framebuffer
+        else if (depth_pass) |pass|
+            pass.framebuffer
+        else
+            cached_snapshot.framebuffer;
         const pipeline = try self.getGraphicsPipeline(
             pass_handle,
             pipeline_state,
@@ -7310,6 +7562,91 @@ pub const Renderer = struct {
             );
         }
 
+        for (extra_colors, extra_indices[0..extra_colors.len], extra_uploads[0..extra_colors.len]) |extra, extra_index, extra_upload| {
+            const extra_cached = self.render_targets.items[extra_index];
+            if (extra_upload) |upload| {
+                const to_transfer = vk.ImageMemoryBarrier{
+                    .source_access_mask = 0,
+                    .destination_access_mask = vk.access_transfer_write_bit,
+                    .old_layout = vk.image_layout_undefined,
+                    .new_layout = vk.image_layout_transfer_dst_optimal,
+                    .image = extra_cached.image.handle,
+                    .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+                };
+                self.device_functions.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk.pipeline_stage_top_of_pipe_bit,
+                    vk.pipeline_stage_transfer_bit,
+                    0,
+                    0,
+                    null,
+                    0,
+                    null,
+                    1,
+                    @ptrCast(&to_transfer),
+                );
+                const upload_copy = vk.BufferImageCopy{
+                    .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+                    .image_extent = .{
+                        .width = extra.descriptor.width,
+                        .height = extra.descriptor.height,
+                        .depth = 1,
+                    },
+                };
+                self.device_functions.cmd_copy_buffer_to_image(
+                    command_buffer,
+                    upload.handle,
+                    extra_cached.image.handle,
+                    vk.image_layout_transfer_dst_optimal,
+                    1,
+                    @ptrCast(&upload_copy),
+                );
+                const to_attachment = vk.ImageMemoryBarrier{
+                    .source_access_mask = vk.access_transfer_write_bit,
+                    .destination_access_mask = vk.access_color_attachment_read_bit |
+                        vk.access_color_attachment_write_bit,
+                    .old_layout = vk.image_layout_transfer_dst_optimal,
+                    .new_layout = vk.image_layout_color_attachment_optimal,
+                    .image = extra_cached.image.handle,
+                    .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+                };
+                self.device_functions.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk.pipeline_stage_transfer_bit,
+                    vk.pipeline_stage_color_attachment_output_bit,
+                    0,
+                    0,
+                    null,
+                    0,
+                    null,
+                    1,
+                    @ptrCast(&to_attachment),
+                );
+            } else if (!extra_cached.initialized) {
+                const to_attachment = vk.ImageMemoryBarrier{
+                    .source_access_mask = 0,
+                    .destination_access_mask = vk.access_color_attachment_read_bit |
+                        vk.access_color_attachment_write_bit,
+                    .old_layout = vk.image_layout_undefined,
+                    .new_layout = vk.image_layout_color_attachment_optimal,
+                    .image = extra_cached.image.handle,
+                    .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+                };
+                self.device_functions.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk.pipeline_stage_top_of_pipe_bit,
+                    vk.pipeline_stage_color_attachment_output_bit,
+                    0,
+                    0,
+                    null,
+                    0,
+                    null,
+                    1,
+                    @ptrCast(&to_attachment),
+                );
+            }
+        }
+
         if (depth_index) |index| {
             self.prepareDepthAttachment(command_buffer, index, depth_clear_requested);
         }
@@ -7363,6 +7700,13 @@ pub const Renderer = struct {
         cached.initialized = true;
         cached.gpu_generation +%= 1;
         cached.last_used_sequence = self.render_target_sequence;
+        for (extra_indices[0..extra_colors.len]) |extra_index| {
+            self.render_target_sequence +%= 1;
+            const extra_cached = &self.render_targets.items[extra_index];
+            extra_cached.initialized = true;
+            extra_cached.gpu_generation +%= 1;
+            extra_cached.last_used_sequence = self.render_target_sequence;
+        }
         self.latest_render_target_index = target_index;
         if (report_checkpoints and self.capture_first_graphics_frame) {
             try self.materializeRenderTarget(target_index);
@@ -7381,6 +7725,7 @@ pub const Renderer = struct {
         fragment_scalars: []const gpu.ShaderSpirvScalarRegister,
         pipeline_state: GraphicsPipelineState,
         guest_target: ?GuestColorTarget,
+        extra_colors: []const GuestColorTarget,
         depth: ?GuestDepthTarget,
         depth_clear_requested: bool,
         bind_graphics_descriptors: bool,
@@ -7395,6 +7740,7 @@ pub const Renderer = struct {
                 fragment_scalars,
                 pipeline_state,
                 target,
+                extra_colors,
                 depth,
                 depth_clear_requested,
                 bind_graphics_descriptors,
@@ -7891,6 +8237,7 @@ pub const Renderer = struct {
             &.{},
             GraphicsPipelineState.default(graphics_probe_width, graphics_probe_height),
             null,
+            &.{},
             null,
             false,
             false,
@@ -7926,10 +8273,9 @@ pub const Renderer = struct {
             );
             self.reported_first_scissor_state = true;
         }
-        // The current Vulkan attachment path still renders colour target 0
-        // only. Preserve depth resource semantics meanwhile: exact HTILE fast
-        // clears are materialized into the base depth/stencil allocations so
-        // later CPU or texture reads never observe stale tiles.
+        // Exact HTILE fast clears are materialized into the base
+        // depth/stencil allocations so later CPU or texture reads never
+        // observe stale tiles.
         if (render_state.depth_target) |depth| {
             self.resolveHtileTarget(depth) catch |err| {
                 if (log_verbose_gpu) std.debug.print(
@@ -7941,8 +8287,7 @@ pub const Renderer = struct {
         // Depth is attached only when the guest both binds a usable allocation
         // and asks for the test or the write. A title that leaves stale DB
         // registers bound while drawing its UI would otherwise pay for an
-        // attachment nothing reads. Multi-MRT output is still ignored: the
-        // attachment path carries one colour target.
+        // attachment nothing reads.
         // A targetless packet is replayed later as a VideoOut compositor pass.
         // Its captured DB registers can already belong to the following
         // offscreen phase (Tetris aliases the sampled 4K color source through
@@ -7958,29 +8303,76 @@ pub const Renderer = struct {
             if (render_state.depth_target) |bound| guestDepthTarget(bound) else null
         else
             null;
-        if (target_override == null and render_state.active_color_count != 1) {
-            if (log_verbose_gpu) std.debug.print(
-                "[vulkan dcb] draw: ignoring extra colour targets (colors={d})\n",
-                .{render_state.active_color_count},
-            );
-        }
         if (depth_wanted and depth_plane == null) {
             if (log_verbose_gpu) std.debug.print(
                 "[vulkan dcb] draw: depth requested but not representable (bound={any})\n",
                 .{render_state.depth_target != null},
             );
         }
-        var target_descriptor = target_override;
-        if (target_descriptor == null) {
+        var bound_colors: [gpu.resources.color_target_count]GuestColorTarget = undefined;
+        var bound_color_count: usize = 0;
+        if (target_override) |override| {
+            bound_colors[0] = try guestColorTarget(override);
+            bound_color_count = 1;
+        } else {
             for (render_state.color_targets) |candidate| {
-                const target = candidate orelse continue;
-                if (!target.isActive()) continue;
-                target_descriptor = target;
-                break;
+                const descriptor = candidate orelse continue;
+                if (!descriptor.isActive()) continue;
+                const color = guestColorTarget(descriptor) catch |err| {
+                    if (log_verbose_gpu) std.debug.print(
+                        "[vulkan dcb] draw: skipping colour slot {d}: {s}\n",
+                        .{ descriptor.slot, @errorName(err) },
+                    );
+                    continue;
+                };
+                if (bound_color_count != 0) {
+                    const primary = bound_colors[0];
+                    if (color.descriptor.width != primary.descriptor.width or
+                        color.descriptor.height != primary.descriptor.height)
+                    {
+                        if (log_verbose_gpu or self.traceCurrentGraphicsFrame()) {
+                            std.debug.print(
+                                "[vulkan dcb] ignoring mismatched colour slot {d} {d}x{d} for {d}x{d}\n",
+                                .{
+                                    color.descriptor.slot,
+                                    color.descriptor.width,
+                                    color.descriptor.height,
+                                    primary.descriptor.width,
+                                    primary.descriptor.height,
+                                },
+                            );
+                        }
+                        continue;
+                    }
+                    const extra_samples = colorTargetSamplesLog2(color.descriptor) orelse continue;
+                    const primary_samples = colorTargetSamplesLog2(primary.descriptor) orelse continue;
+                    if (extra_samples != primary_samples) {
+                        if (log_verbose_gpu or self.traceCurrentGraphicsFrame()) {
+                            std.debug.print(
+                                "[vulkan dcb] ignoring colour slot {d} with unmatched samples extra={d} primary={d}\n",
+                                .{ color.descriptor.slot, extra_samples, primary_samples },
+                            );
+                        }
+                        continue;
+                    }
+                    var duplicate = color.descriptor.address == primary.descriptor.address;
+                    if (!duplicate) {
+                        for (bound_colors[1..bound_color_count]) |bound| {
+                            if (bound.descriptor.address == color.descriptor.address) {
+                                duplicate = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (duplicate) continue;
+                }
+                bound_colors[bound_color_count] = color;
+                bound_color_count += 1;
             }
         }
-        const guest_descriptor = target_descriptor orelse return Error.MissingColorTarget;
-        const target = try guestColorTarget(guest_descriptor);
+        if (bound_color_count == 0) return Error.MissingColorTarget;
+        const target = bound_colors[0];
+        const extra_colors = bound_colors[1..bound_color_count];
         const descriptor = target.descriptor;
         const color_samples = colorTargetSamplesLog2(descriptor) orelse
             return Error.UnsupportedColorTarget;
@@ -8028,7 +8420,7 @@ pub const Renderer = struct {
             .{ descriptor.format, descriptor.number_type, target.format.vulkan, target.format.bytes_per_texel },
         );
         var pipeline_state = try guestGraphicsState(&render_state, descriptor);
-        pipeline_state.color_attachment_format = target.format.vulkan;
+        try applyColorAttachmentState(&pipeline_state, &render_state, bound_colors[0..bound_color_count]);
         pipeline_state.topology = guestPrimitiveTopology(render_state.primitive_type, draw);
         pipeline_state.rasterization_samples = rasterSampleCount(color_samples) orelse
             return Error.UnsupportedColorTarget;
@@ -8101,6 +8493,23 @@ pub const Renderer = struct {
                 }
             }
         }
+        if (bound_color_count > 1 and !self.reported_mrt_draw) {
+            self.reported_mrt_draw = true;
+            std.debug.print("[vulkan dcb] multiple colour targets:", .{});
+            for (bound_colors[0..bound_color_count]) |color| {
+                std.debug.print(
+                    " slot{d}@0x{x} {d}x{d} vk={d}",
+                    .{
+                        color.descriptor.slot,
+                        color.descriptor.address,
+                        color.descriptor.width,
+                        color.descriptor.height,
+                        color.format.vulkan,
+                    },
+                );
+            }
+            std.debug.print("\n", .{});
+        }
         const vertex_address = vertex_stage.programAddress(state) orelse {
             return Error.MissingGraphicsProgram;
         };
@@ -8125,8 +8534,8 @@ pub const Renderer = struct {
                     pipeline_state.scissor_width,
                     pipeline_state.scissor_height,
                     pipeline_state.rasterizer_discard,
-                    pipeline_state.color_write_mask,
-                    pipeline_state.blend_enable,
+                    pipeline_state.color_write_masks[0],
+                    pipeline_state.blend_enables[0],
                     render_state.color_control.mode,
                     render_state.target_mask,
                     state.readRegister(.context, 0x204),
@@ -8167,6 +8576,12 @@ pub const Renderer = struct {
         var fragment_attribute_mask: u32 = 0;
         var fragment_attribute_components: [32]u4 = @splat(0);
         for (fragment_analysis.program.instructions.items) |inst| {
+            if (inst.opcode == .exp and inst.export_target < gpu.resources.color_target_count) {
+                const needed = @as(u32, inst.export_target) + 1;
+                if (needed > pipeline_state.color_attachment_count) {
+                    pipeline_state.color_attachment_count = needed;
+                }
+            }
             switch (inst.opcode) {
                 .v_interp_p1_f32, .v_interp_p2_f32, .v_interp_mov_f32 => {
                     if (inst.src1.kind == .integer_inline_constant and inst.src1.value < 32) {
@@ -8855,6 +9270,7 @@ pub const Renderer = struct {
                     fragment_scalar_regs[0..fragment_scalar_count],
                     pipeline_state,
                     target,
+                    extra_colors,
                     depth_plane,
                     render_state.depth_control.clear_enabled or
                         render_state.depth_control.stencil_clear_enabled,
@@ -8972,6 +9388,7 @@ pub const Renderer = struct {
                 fragment_scalar_regs[0..fragment_scalar_count],
                 probe_pipeline_state,
                 target,
+                extra_colors,
                 depth_plane,
                 render_state.depth_control.clear_enabled or
                     render_state.depth_control.stencil_clear_enabled,
@@ -9026,6 +9443,7 @@ pub const Renderer = struct {
             fragment_scalar_regs[0..fragment_scalar_count],
             pipeline_state,
             target,
+            extra_colors,
             depth_plane,
             render_state.depth_control.clear_enabled or
                 render_state.depth_control.stencil_clear_enabled,
