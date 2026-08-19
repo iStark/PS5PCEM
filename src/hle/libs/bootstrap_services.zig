@@ -127,8 +127,12 @@ fn amprAprCommandBufferDestructor(address: u64) callconv(abi.guest) void {
 }
 
 fn amprCommandBufferGetType(address: u64) callconv(abi.guest) u64 {
-    _ = address;
-    return 0;
+    const map = apr.mapActive(address) catch return 0;
+    const cursor = apr.gatherScatterCursor(address) catch return 0;
+    var bits: u64 = 0;
+    if (cursor != null) bits |= ampr_type_gather_scatter_valid;
+    if (map) bits |= ampr_type_map_active;
+    return bits;
 }
 
 fn amprCommandBufferGetSize(address: u64) callconv(abi.guest) u64 {
@@ -220,6 +224,454 @@ fn amprMeasureCommandSizeWriteKernelEventQueue(
     _: u64,
 ) callconv(abi.guest) u64 {
     return 0x30;
+}
+
+const ampr_opcode_gather: u32 = 0x18;
+const ampr_opcode_scatter: u32 = 0x19;
+const ampr_opcode_gather_scatter: u32 = 0x1a;
+const ampr_scatter_record_size: u32 = 0x0c;
+const ampr_reset_gather_scatter_size: u32 = 0x04;
+
+fn amprGatherRecordSize(file_offset: u64) u32 {
+    return if (file_offset > 0x3ffff) 0x0c else 0x08;
+}
+
+fn amprGatherScatterRecordSize(file_offset: u64) u32 {
+    return if (file_offset >> 32 != 0) 0x14 else 0x10;
+}
+
+fn amprInvalidMeasure() u64 {
+    return @bitCast(@as(i64, errno.KernelError.einval.raw()));
+}
+
+fn amprReserveRecord(address: u64, record_size: u32) apr.Error!u64 {
+    if (!kernel_memory.isGuestRangeAccessible(address, ampr_command_buffer_header_size)) {
+        return error.InvalidCommandBuffer;
+    }
+    const info = try apr.commandBufferInfo(address);
+    if (info.storage_address == 0 or info.write_offset > info.storage_size or
+        record_size > info.storage_size - info.write_offset)
+    {
+        return error.InvalidCommandBuffer;
+    }
+    const record_address = std.math.add(u64, info.storage_address, info.write_offset) catch
+        return error.InvalidCommandBuffer;
+    if (!kernel_memory.isGuestRangeAccessible(record_address, record_size)) {
+        return error.InvalidCommandBuffer;
+    }
+    return record_address;
+}
+
+fn amprWriteOpcodeRecord(record_address: u64, record_size: u32, opcode: u32) void {
+    const record: [*]u8 = @ptrFromInt(record_address);
+    @memset(record[0..record_size], 0);
+    writeGuestU32(record_address + 0x00, opcode);
+}
+
+fn amprAprCommandBufferReadFileGather(
+    address: u64,
+    _: u64,
+    _: u64,
+    size: u64,
+    file_offset: u64,
+) callconv(abi.guest) i32 {
+    if (size == 0 or size > apr.maximum_read_bytes or file_offset >= apr.maximum_file_offset) {
+        return errno.KernelError.einval.raw();
+    }
+    const cursor = (apr.gatherScatterCursor(address) catch |err| return aprError(err)) orelse
+        return errno.KernelError.einval.raw();
+    if (!kernel_memory.isGuestRangeAccessible(cursor.destination, size)) {
+        return errno.KernelError.efault.raw();
+    }
+    const record_size = amprGatherRecordSize(file_offset);
+    const record_address = amprReserveRecord(address, record_size) catch |err| return aprError(err);
+    apr.appendReadRecord(address, .{
+        .file_identifier = cursor.file_identifier,
+        .destination = cursor.destination,
+        .size = @intCast(size),
+        .file_offset = file_offset,
+    }, record_size) catch |err| return aprError(err);
+    amprWriteOpcodeRecord(record_address, record_size, ampr_opcode_gather);
+    return errno.ok;
+}
+
+fn amprAprCommandBufferReadFileScatter(
+    address: u64,
+    _: u64,
+    _: u64,
+    destination: u64,
+    size: u64,
+) callconv(abi.guest) i32 {
+    if (size == 0 or size > apr.maximum_read_bytes or destination == 0) {
+        return errno.KernelError.einval.raw();
+    }
+    if (!kernel_memory.isGuestRangeAccessible(destination, size)) {
+        return errno.KernelError.efault.raw();
+    }
+    const cursor = (apr.gatherScatterCursor(address) catch |err| return aprError(err)) orelse
+        return errno.KernelError.einval.raw();
+    if (cursor.file_offset >= apr.maximum_file_offset) return errno.KernelError.einval.raw();
+    const record_address = amprReserveRecord(address, ampr_scatter_record_size) catch |err|
+        return aprError(err);
+    apr.appendReadRecord(address, .{
+        .file_identifier = cursor.file_identifier,
+        .destination = destination,
+        .size = @intCast(size),
+        .file_offset = cursor.file_offset,
+    }, ampr_scatter_record_size) catch |err| return aprError(err);
+    amprWriteOpcodeRecord(record_address, ampr_scatter_record_size, ampr_opcode_scatter);
+    return errno.ok;
+}
+
+fn amprAprCommandBufferReadFileGatherScatter(
+    address: u64,
+    _: u64,
+    _: u64,
+    destination: u64,
+    size: u64,
+    file_offset: u64,
+) callconv(abi.guest) i32 {
+    if (size == 0 or size > apr.maximum_read_bytes or destination == 0 or
+        file_offset >= apr.maximum_file_offset)
+    {
+        return errno.KernelError.einval.raw();
+    }
+    if (!kernel_memory.isGuestRangeAccessible(destination, size)) {
+        return errno.KernelError.efault.raw();
+    }
+    const cursor = (apr.gatherScatterCursor(address) catch |err| return aprError(err)) orelse
+        return errno.KernelError.einval.raw();
+    const record_size = amprGatherScatterRecordSize(file_offset);
+    const record_address = amprReserveRecord(address, record_size) catch |err| return aprError(err);
+    apr.appendReadRecord(address, .{
+        .file_identifier = cursor.file_identifier,
+        .destination = destination,
+        .size = @intCast(size),
+        .file_offset = file_offset,
+    }, record_size) catch |err| return aprError(err);
+    amprWriteOpcodeRecord(record_address, record_size, ampr_opcode_gather_scatter);
+    return errno.ok;
+}
+
+fn amprAprCommandBufferResetGatherScatterState(
+    address: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    const record_address = amprReserveRecord(address, ampr_reset_gather_scatter_size) catch |err|
+        return aprError(err);
+    apr.appendRecordBytes(address, ampr_reset_gather_scatter_size) catch |err| return aprError(err);
+    apr.clearGatherScatterCursor(address) catch |err| return aprError(err);
+    amprWriteOpcodeRecord(record_address, ampr_reset_gather_scatter_size, 0);
+    return errno.ok;
+}
+
+fn amprMeasureCommandSizeReadFileGather(size: u64, file_offset: u64) callconv(abi.guest) u64 {
+    if (size == 0 or size > apr.maximum_read_bytes or file_offset >= apr.maximum_file_offset) {
+        return amprInvalidMeasure();
+    }
+    return amprGatherRecordSize(file_offset);
+}
+
+fn amprMeasureCommandSizeReadFileScatter(destination: u64, size: u64) callconv(abi.guest) u64 {
+    if (destination == 0 or size == 0 or size > apr.maximum_read_bytes) {
+        return amprInvalidMeasure();
+    }
+    return ampr_scatter_record_size;
+}
+
+fn amprMeasureCommandSizeReadFileGatherScatter(
+    destination: u64,
+    size: u64,
+    file_offset: u64,
+) callconv(abi.guest) u64 {
+    if (destination == 0 or size == 0 or size > apr.maximum_read_bytes or
+        file_offset >= apr.maximum_file_offset)
+    {
+        return amprInvalidMeasure();
+    }
+    return amprGatherScatterRecordSize(file_offset);
+}
+
+fn amprMeasureCommandSizeResetGatherScatterState(
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) u64 {
+    return ampr_reset_gather_scatter_size;
+}
+
+const ampr_opcode_write_address: u32 = 3;
+const ampr_fixed_record_size: u32 = 0x20;
+const ampr_map_begin_record_size: u32 = 0x0c;
+const ampr_map_direct_begin_record_size: u32 = 0x10;
+const ampr_map_end_record_size: u32 = 0x04;
+const ampr_map_page_size: u64 = 0x4000;
+const ampr_maximum_nop_words: u32 = 16;
+const ampr_type_gather_scatter_valid: u64 = 0x0001_0000;
+const ampr_type_map_active: u64 = 0x0002_0000;
+
+fn amprAlignUp4(value: u64) u64 {
+    return (value + 3) & ~@as(u64, 3);
+}
+
+fn amprGuestCStringBytes(text: ?[*:0]const u8) usize {
+    const pointer = text orelse return 0;
+    const address = @intFromPtr(pointer);
+    var index: usize = 0;
+    while (index < 256) : (index += 1) {
+        if (!kernel_memory.isGuestRangeAccessible(address + index, 1)) break;
+        if (pointer[index] == 0) return index + 1;
+    }
+    return index;
+}
+
+fn amprMarkerRecordSize(text: ?[*:0]const u8, with_color: bool) u32 {
+    const header: u64 = if (with_color) 8 else 4;
+    return @intCast(amprAlignUp4(header + amprGuestCStringBytes(text)));
+}
+
+fn amprAppendNop(address: u64, record_size: u64) i32 {
+    if (record_size == 0 or record_size > std.math.maxInt(u32)) return errno.KernelError.einval.raw();
+    const size: u32 = @intCast(record_size);
+    const record_address = amprReserveRecord(address, size) catch |err| return aprError(err);
+    apr.appendRecordBytes(address, size) catch |err| return aprError(err);
+    amprWriteOpcodeRecord(record_address, size, 0);
+    return errno.ok;
+}
+
+fn amprAppendWriteAddress(address: u64, destination: u64, value: u64) i32 {
+    if (destination == 0) return errno.KernelError.einval.raw();
+    if (!kernel_memory.isGuestRangeAccessible(destination, 8)) return errno.KernelError.efault.raw();
+    const record_address = amprReserveRecord(address, ampr_fixed_record_size) catch |err|
+        return aprError(err);
+    apr.appendWrite(address, .{ .destination = destination, .value = value }, ampr_fixed_record_size) catch |err|
+        return aprError(err);
+    const record: [*]u8 = @ptrFromInt(record_address);
+    @memset(record[0..ampr_fixed_record_size], 0);
+    writeGuestU32(record_address + 0x00, ampr_opcode_write_address);
+    writeGuestU64(record_address + 0x08, destination);
+    writeGuestU64(record_address + 0x10, value);
+    return errno.ok;
+}
+
+fn amprMapArgsValid(va: u64, size: u64) bool {
+    return va != 0 and size != 0 and
+        va & (ampr_map_page_size - 1) == 0 and
+        size & (ampr_map_page_size - 1) == 0 and
+        va +% size >= va;
+}
+
+fn amprCommandBufferNop(address: u64, word_count: u32) callconv(abi.guest) i32 {
+    if (word_count == 0 or word_count > ampr_maximum_nop_words) return errno.KernelError.einval.raw();
+    return amprAppendNop(address, @as(u64, word_count) * 4);
+}
+
+fn amprCommandBufferNopWithData(address: u64, word_count: u32, _: ?*const u32) callconv(abi.guest) i32 {
+    if (word_count > ampr_maximum_nop_words - 1) return errno.KernelError.einval.raw();
+    return amprAppendNop(address, (@as(u64, word_count) + 1) * 4);
+}
+
+fn amprCommandBufferConstructNop(
+    address: u64,
+    _: u32,
+    _: ?*const anyopaque,
+    bytes: u32,
+    _: ?*const u32,
+) callconv(abi.guest) i32 {
+    return amprAppendNop(address, @as(u64, 4) + bytes);
+}
+
+fn amprCommandBufferConstructMarker(
+    address: u64,
+    _: u32,
+    text: ?[*:0]const u8,
+    color: ?*const u32,
+) callconv(abi.guest) i32 {
+    return amprAppendNop(address, amprMarkerRecordSize(text, color != null));
+}
+
+fn amprCommandBufferSetMarker(address: u64, text: ?[*:0]const u8) callconv(abi.guest) i32 {
+    return amprAppendNop(address, amprMarkerRecordSize(text, false));
+}
+
+fn amprCommandBufferSetMarkerWithColor(address: u64, text: ?[*:0]const u8, _: u32) callconv(abi.guest) i32 {
+    return amprAppendNop(address, amprMarkerRecordSize(text, true));
+}
+
+fn amprCommandBufferPushMarker(address: u64, text: ?[*:0]const u8) callconv(abi.guest) i32 {
+    return amprAppendNop(address, amprMarkerRecordSize(text, false));
+}
+
+fn amprCommandBufferPushMarkerWithColor(address: u64, text: ?[*:0]const u8, _: u32) callconv(abi.guest) i32 {
+    return amprAppendNop(address, amprMarkerRecordSize(text, true));
+}
+
+fn amprCommandBufferPopMarker(address: u64) callconv(abi.guest) i32 {
+    return amprAppendNop(address, 4);
+}
+
+fn amprCommandBufferWaitOnAddress(
+    address: u64,
+    _: ?*volatile u64,
+    _: u64,
+    _: u8,
+    _: u8,
+) callconv(abi.guest) i32 {
+    return amprAppendNop(address, ampr_fixed_record_size);
+}
+
+fn amprCommandBufferWaitOnCounter(
+    address: u64,
+    _: u8,
+    _: u8,
+    _: u64,
+    _: u8,
+    _: u8,
+    _: u64,
+    _: u8,
+) callconv(abi.guest) i32 {
+    return amprAppendNop(address, ampr_fixed_record_size);
+}
+
+fn amprCommandBufferWriteAddress(
+    address: u64,
+    destination: ?*volatile u64,
+    value: u64,
+    _: u32,
+) callconv(abi.guest) i32 {
+    const target = destination orelse return errno.KernelError.einval.raw();
+    return amprAppendWriteAddress(address, @intFromPtr(target), value);
+}
+
+fn amprCommandBufferWriteAddressFromTimeCounter(
+    address: u64,
+    destination: ?*volatile u64,
+    _: u32,
+) callconv(abi.guest) i32 {
+    const target = destination orelse return errno.KernelError.einval.raw();
+    return amprAppendWriteAddress(address, @intFromPtr(target), 0);
+}
+
+fn amprCommandBufferWriteAddressFromCounter(
+    address: u64,
+    destination: ?*volatile u64,
+    _: u8,
+    _: u32,
+) callconv(abi.guest) i32 {
+    const target = destination orelse return errno.KernelError.einval.raw();
+    return amprAppendWriteAddress(address, @intFromPtr(target), 0);
+}
+
+fn amprCommandBufferWriteAddressFromCounterPair(
+    address: u64,
+    destination: ?*volatile u64,
+    _: u8,
+    _: u32,
+) callconv(abi.guest) i32 {
+    const target = destination orelse return errno.KernelError.einval.raw();
+    return amprAppendWriteAddress(address, @intFromPtr(target), 0);
+}
+
+fn amprCommandBufferWriteCounter(
+    address: u64,
+    _: u8,
+    _: u8,
+    _: u64,
+    _: u8,
+    _: u32,
+) callconv(abi.guest) i32 {
+    return amprAppendNop(address, ampr_fixed_record_size);
+}
+
+fn amprAprCommandBufferMapBegin(
+    address: u64,
+    va: u64,
+    size: u64,
+    _: i32,
+    _: i32,
+) callconv(abi.guest) i32 {
+    if (!amprMapArgsValid(va, size)) return errno.KernelError.einval.raw();
+    const status = amprAppendNop(address, ampr_map_begin_record_size);
+    if (status != errno.ok) return status;
+    apr.setMapActive(address, true) catch |err| return aprError(err);
+    return errno.ok;
+}
+
+fn amprAprCommandBufferMapDirectBegin(
+    address: u64,
+    va: u64,
+    dmem_offset: u64,
+    size: u64,
+    _: i32,
+    _: i32,
+) callconv(abi.guest) i32 {
+    if (!amprMapArgsValid(va, size) or dmem_offset & (ampr_map_page_size - 1) != 0) {
+        return errno.KernelError.einval.raw();
+    }
+    const status = amprAppendNop(address, ampr_map_direct_begin_record_size);
+    if (status != errno.ok) return status;
+    apr.setMapActive(address, true) catch |err| return aprError(err);
+    return errno.ok;
+}
+
+fn amprAprCommandBufferMapEnd(address: u64) callconv(abi.guest) i32 {
+    const active = apr.mapActive(address) catch |err| return aprError(err);
+    if (!active) return errno.KernelError.eperm.raw();
+    const status = amprAppendNop(address, ampr_map_end_record_size);
+    if (status != errno.ok) return status;
+    apr.setMapActive(address, false) catch |err| return aprError(err);
+    return errno.ok;
+}
+
+fn amprMeasureCommandSizeFixed32(
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) u64 {
+    return ampr_fixed_record_size;
+}
+
+fn amprMeasureCommandSizeNop(word_count: u32) callconv(abi.guest) u64 {
+    if (word_count == 0) return 4;
+    return amprAlignUp4(@as(u64, word_count) * 4);
+}
+
+fn amprMeasureCommandSizeNopWithData(word_count: u32, _: ?*const u32) callconv(abi.guest) u64 {
+    return amprAlignUp4((@as(u64, word_count) + 1) * 4);
+}
+
+fn amprMeasureCommandSizeSetMarker(text: ?[*:0]const u8) callconv(abi.guest) u64 {
+    return amprMarkerRecordSize(text, false);
+}
+
+fn amprMeasureCommandSizeSetMarkerWithColor(text: ?[*:0]const u8, _: u32) callconv(abi.guest) u64 {
+    return amprMarkerRecordSize(text, true);
+}
+
+fn amprMeasureCommandSizePopMarker() callconv(abi.guest) u64 {
+    return 4;
+}
+
+fn amprMeasureCommandSizeMapBegin(va: u64, size: u64, _: i32, _: i32) callconv(abi.guest) u64 {
+    if (!amprMapArgsValid(va, size)) return amprInvalidMeasure();
+    return ampr_map_begin_record_size;
+}
+
+fn amprMeasureCommandSizeMapDirectBegin(
+    va: u64,
+    dmem_offset: u64,
+    size: u64,
+    _: i32,
+    _: i32,
+) callconv(abi.guest) u64 {
+    if (!amprMapArgsValid(va, size) or dmem_offset & (ampr_map_page_size - 1) != 0) {
+        return amprInvalidMeasure();
+    }
+    return ampr_map_direct_begin_record_size;
 }
 
 fn amprCommandBufferWriteKernelEventQueue(
@@ -2546,9 +2998,53 @@ const ampr_exports = [_]symbols.Export{
     .{ .name = "sceAmprCommandBufferGetNumCommands", .function = trace.wrap("sceAmprCommandBufferGetNumCommands", &amprCommandBufferGetNumCommands), .expect_id = "gzndltBEzWc" },
     .{ .name = "sceAmprCommandBufferGetCurrentOffset", .function = trace.wrap("sceAmprCommandBufferGetCurrentOffset", &amprCommandBufferGetCurrentOffset), .expect_id = "GnxKOHEawhk" },
     .{ .name = "sceAmprAprCommandBufferReadFile", .function = trace.wrap("sceAmprAprCommandBufferReadFile", &amprAprCommandBufferReadFile), .expect_id = "mQ16-QdKv7k" },
+    .{ .name = "sceAmprAprCommandBufferReadFileGather", .function = trace.wrap("sceAmprAprCommandBufferReadFileGather", &amprAprCommandBufferReadFileGather), .expect_id = "mZSbNJVJpV8" },
+    .{ .name = "sceAmprAprCommandBufferReadFileScatter", .function = trace.wrap("sceAmprAprCommandBufferReadFileScatter", &amprAprCommandBufferReadFileScatter), .expect_id = "Jg-AgkdJHkk" },
+    .{ .name = "sceAmprAprCommandBufferReadFileGatherScatter", .function = trace.wrap("sceAmprAprCommandBufferReadFileGatherScatter", &amprAprCommandBufferReadFileGatherScatter), .expect_id = "BVmR1H8l+XI" },
+    .{ .name = "sceAmprAprCommandBufferResetGatherScatterState", .function = trace.wrap("sceAmprAprCommandBufferResetGatherScatterState", &amprAprCommandBufferResetGatherScatterState), .expect_id = "YPxkUDhgoNI" },
     .{ .name = "sceAmprMeasureCommandSizeReadFile", .function = trace.wrap("sceAmprMeasureCommandSizeReadFile", &amprMeasureCommandSizeReadFile), .expect_id = "vWU-odnS+fU" },
+    .{ .name = "sceAmprMeasureCommandSizeReadFileGather", .function = trace.wrap("sceAmprMeasureCommandSizeReadFileGather", &amprMeasureCommandSizeReadFileGather), .expect_id = "qesF88X4DRg" },
+    .{ .name = "sceAmprMeasureCommandSizeReadFileScatter", .function = trace.wrap("sceAmprMeasureCommandSizeReadFileScatter", &amprMeasureCommandSizeReadFileScatter), .expect_id = "7nXGDGMXSqo" },
+    .{ .name = "sceAmprMeasureCommandSizeReadFileGatherScatter", .function = trace.wrap("sceAmprMeasureCommandSizeReadFileGatherScatter", &amprMeasureCommandSizeReadFileGatherScatter), .expect_id = "DXmgc5op8Yw" },
+    .{ .name = "sceAmprMeasureCommandSizeResetGatherScatterState", .function = trace.wrap("sceAmprMeasureCommandSizeResetGatherScatterState", &amprMeasureCommandSizeResetGatherScatterState), .expect_id = "rddQYXM0CjM" },
     .{ .name = "sceAmprMeasureCommandSizeWriteKernelEventQueue_04_00", .function = trace.wrap("sceAmprMeasureCommandSizeWriteKernelEventQueue_04_00", &amprMeasureCommandSizeWriteKernelEventQueue), .expect_id = "sSAUCCU1dv4" },
     .{ .name = "sceAmprCommandBufferWriteKernelEventQueue_04_00", .function = trace.wrap("sceAmprCommandBufferWriteKernelEventQueue_04_00", &amprCommandBufferWriteKernelEventQueue), .expect_id = "H896Pt-yB4I" },
+    .{ .name = "sceAmprCommandBufferWaitOnAddress_04_00", .function = trace.wrap("sceAmprCommandBufferWaitOnAddress_04_00", &amprCommandBufferWaitOnAddress), .expect_id = "DLfoNxTFNVk" },
+    .{ .name = "sceAmprCommandBufferWaitOnCounter_04_00", .function = trace.wrap("sceAmprCommandBufferWaitOnCounter_04_00", &amprCommandBufferWaitOnCounter), .expect_id = "cQb8Zr8Q0Y0" },
+    .{ .name = "sceAmprCommandBufferWriteAddress_04_00", .function = trace.wrap("sceAmprCommandBufferWriteAddress_04_00", &amprCommandBufferWriteAddress), .expect_id = "j0+3uJMxYJY" },
+    .{ .name = "sceAmprCommandBufferWriteAddressFromTimeCounter_04_00", .function = trace.wrap("sceAmprCommandBufferWriteAddressFromTimeCounter_04_00", &amprCommandBufferWriteAddressFromTimeCounter), .expect_id = "bt3LHR9xjK4" },
+    .{ .name = "sceAmprCommandBufferWriteAddressFromCounter_04_00", .function = trace.wrap("sceAmprCommandBufferWriteAddressFromCounter_04_00", &amprCommandBufferWriteAddressFromCounter), .expect_id = "t4ExS+SwLjs" },
+    .{ .name = "sceAmprCommandBufferWriteAddressFromCounterPair_04_00", .function = trace.wrap("sceAmprCommandBufferWriteAddressFromCounterPair_04_00", &amprCommandBufferWriteAddressFromCounterPair), .expect_id = "enZm-6GjWqw" },
+    .{ .name = "sceAmprCommandBufferWriteCounter_04_00", .function = trace.wrap("sceAmprCommandBufferWriteCounter_04_00", &amprCommandBufferWriteCounter), .expect_id = "jK+yuYCI7MA" },
+    .{ .name = "sceAmprCommandBufferConstructNop", .function = trace.wrap("sceAmprCommandBufferConstructNop", &amprCommandBufferConstructNop), .expect_id = "GmOguNIsuKk" },
+    .{ .name = "sceAmprCommandBufferNop", .function = trace.wrap("sceAmprCommandBufferNop", &amprCommandBufferNop), .expect_id = "tNn5WBkta60" },
+    .{ .name = "sceAmprCommandBufferNopWithData", .function = trace.wrap("sceAmprCommandBufferNopWithData", &amprCommandBufferNopWithData), .expect_id = "pFQ9UHpO52s" },
+    .{ .name = "sceAmprCommandBufferConstructMarker", .function = trace.wrap("sceAmprCommandBufferConstructMarker", &amprCommandBufferConstructMarker), .expect_id = "4UkZbYKVF7c" },
+    .{ .name = "sceAmprCommandBufferSetMarkerWithColor", .function = trace.wrap("sceAmprCommandBufferSetMarkerWithColor", &amprCommandBufferSetMarkerWithColor), .expect_id = "sWbST0oQKsc" },
+    .{ .name = "sceAmprCommandBufferSetMarker", .function = trace.wrap("sceAmprCommandBufferSetMarker", &amprCommandBufferSetMarker), .expect_id = "4quckD2y7Pg" },
+    .{ .name = "sceAmprCommandBufferPushMarkerWithColor", .function = trace.wrap("sceAmprCommandBufferPushMarkerWithColor", &amprCommandBufferPushMarkerWithColor), .expect_id = "f12ObAMEi9A" },
+    .{ .name = "sceAmprCommandBufferPushMarker", .function = trace.wrap("sceAmprCommandBufferPushMarker", &amprCommandBufferPushMarker), .expect_id = "dXPaz65HNmk" },
+    .{ .name = "sceAmprCommandBufferPopMarker", .function = trace.wrap("sceAmprCommandBufferPopMarker", &amprCommandBufferPopMarker), .expect_id = "mv0O8Zg0woU" },
+    .{ .name = "sceAmprAprCommandBufferMapBegin", .function = trace.wrap("sceAmprAprCommandBufferMapBegin", &amprAprCommandBufferMapBegin), .expect_id = "Eul7AGEpjLo" },
+    .{ .name = "sceAmprAprCommandBufferMapDirectBegin", .function = trace.wrap("sceAmprAprCommandBufferMapDirectBegin", &amprAprCommandBufferMapDirectBegin), .expect_id = "bFEs0Gs6D2A" },
+    .{ .name = "sceAmprAprCommandBufferMapEnd", .function = trace.wrap("sceAmprAprCommandBufferMapEnd", &amprAprCommandBufferMapEnd), .expect_id = "X169CE6G3Y4" },
+    .{ .name = "sceAmprMeasureCommandSizeWaitOnAddress_04_00", .function = trace.wrap("sceAmprMeasureCommandSizeWaitOnAddress_04_00", &amprMeasureCommandSizeFixed32), .expect_id = "0BMj1hgG+kE" },
+    .{ .name = "sceAmprMeasureCommandSizeWaitOnCounter_04_00", .function = trace.wrap("sceAmprMeasureCommandSizeWaitOnCounter_04_00", &amprMeasureCommandSizeFixed32), .expect_id = "ClnsFLLLcss" },
+    .{ .name = "sceAmprMeasureCommandSizeWriteAddress_04_00", .function = trace.wrap("sceAmprMeasureCommandSizeWriteAddress_04_00", &amprMeasureCommandSizeFixed32), .expect_id = "4fgtGfXDrFc" },
+    .{ .name = "sceAmprMeasureCommandSizeWriteAddressFromTimeCounter_04_00", .function = trace.wrap("sceAmprMeasureCommandSizeWriteAddressFromTimeCounter_04_00", &amprMeasureCommandSizeFixed32), .expect_id = "gAtc79UTt5E" },
+    .{ .name = "sceAmprMeasureCommandSizeWriteAddressFromCounter_04_00", .function = trace.wrap("sceAmprMeasureCommandSizeWriteAddressFromCounter_04_00", &amprMeasureCommandSizeFixed32), .expect_id = "JYd9g9L+TmE" },
+    .{ .name = "sceAmprMeasureCommandSizeWriteAddressFromCounterPair_04_00", .function = trace.wrap("sceAmprMeasureCommandSizeWriteAddressFromCounterPair_04_00", &amprMeasureCommandSizeFixed32), .expect_id = "2Hw8gjMdwSY" },
+    .{ .name = "sceAmprMeasureCommandSizeWriteCounter_04_00", .function = trace.wrap("sceAmprMeasureCommandSizeWriteCounter_04_00", &amprMeasureCommandSizeFixed32), .expect_id = "I-Qm+MEso5c" },
+    .{ .name = "sceAmprMeasureCommandSizeNop", .function = trace.wrap("sceAmprMeasureCommandSizeNop", &amprMeasureCommandSizeNop), .expect_id = "NNIZ-FMyz3M" },
+    .{ .name = "sceAmprMeasureCommandSizeNopWithData", .function = trace.wrap("sceAmprMeasureCommandSizeNopWithData", &amprMeasureCommandSizeNopWithData), .expect_id = "Xp85BP3+BBI" },
+    .{ .name = "sceAmprMeasureCommandSizeMapBegin", .function = trace.wrap("sceAmprMeasureCommandSizeMapBegin", &amprMeasureCommandSizeMapBegin), .expect_id = "kdFImtTD0hc" },
+    .{ .name = "sceAmprMeasureCommandSizeMapDirectBegin", .function = trace.wrap("sceAmprMeasureCommandSizeMapDirectBegin", &amprMeasureCommandSizeMapDirectBegin), .expect_id = "qvbdJc7bG+s" },
+    .{ .name = "sceAmprMeasureCommandSizeMapEnd", .function = trace.wrap("sceAmprMeasureCommandSizeMapEnd", &amprMeasureCommandSizePopMarker), .expect_id = "iwTNhyaemnw" },
+    .{ .name = "sceAmprMeasureCommandSizeSetMarkerWithColor", .function = trace.wrap("sceAmprMeasureCommandSizeSetMarkerWithColor", &amprMeasureCommandSizeSetMarkerWithColor), .expect_id = "tmfr97+ED5I" },
+    .{ .name = "sceAmprMeasureCommandSizeSetMarker", .function = trace.wrap("sceAmprMeasureCommandSizeSetMarker", &amprMeasureCommandSizeSetMarker), .expect_id = "VGkEj4d6-Kg" },
+    .{ .name = "sceAmprMeasureCommandSizePushMarkerWithColor", .function = trace.wrap("sceAmprMeasureCommandSizePushMarkerWithColor", &amprMeasureCommandSizeSetMarkerWithColor), .expect_id = "3OfeY4pzDV0" },
+    .{ .name = "sceAmprMeasureCommandSizePushMarker", .function = trace.wrap("sceAmprMeasureCommandSizePushMarker", &amprMeasureCommandSizeSetMarker), .expect_id = "0RdLmAh7WVo" },
+    .{ .name = "sceAmprMeasureCommandSizePopMarker", .function = trace.wrap("sceAmprMeasureCommandSizePopMarker", &amprMeasureCommandSizePopMarker), .expect_id = "pbnNnahE8vk" },
 };
 
 pub fn reset() void {
@@ -3144,4 +3640,129 @@ test "bootstrap service libraries register the title link surface" {
     try std.testing.expect(db.findById("PI7jIZj4pcE", .function) != null);
     try std.testing.expect(db.findById("YUeqkyT7mEQ", .function) != null);
     try std.testing.expect(db.findByName("sceAgcDcbDrawIndexOffset", .function) != null);
+    try std.testing.expect(db.findById("mZSbNJVJpV8", .function) != null);
+    try std.testing.expect(db.findById("Jg-AgkdJHkk", .function) != null);
+    try std.testing.expect(db.findById("BVmR1H8l+XI", .function) != null);
+    try std.testing.expect(db.findById("YPxkUDhgoNI", .function) != null);
+    try std.testing.expect(db.findById("DLfoNxTFNVk", .function) != null);
+    try std.testing.expect(db.findById("j0+3uJMxYJY", .function) != null);
+    try std.testing.expect(db.findById("Eul7AGEpjLo", .function) != null);
+    try std.testing.expect(db.findById("4quckD2y7Pg", .function) != null);
+}
+
+test "AMPR gather and scatter sizes match the recorded command stream" {
+    try std.testing.expectEqual(@as(u64, 0x08), amprMeasureCommandSizeReadFileGather(16, 0));
+    try std.testing.expectEqual(@as(u64, 0x0c), amprMeasureCommandSizeReadFileGather(16, 0x40000));
+    try std.testing.expectEqual(@as(u64, 0x0c), amprMeasureCommandSizeReadFileScatter(1, 16));
+    try std.testing.expectEqual(@as(u64, 0x10), amprMeasureCommandSizeReadFileGatherScatter(1, 16, 0));
+    try std.testing.expectEqual(@as(u64, 0x14), amprMeasureCommandSizeReadFileGatherScatter(1, 16, 1 << 32));
+    try std.testing.expectEqual(@as(u64, 0x04), amprMeasureCommandSizeResetGatherScatterState(0, 0, 0));
+    try std.testing.expect(amprMeasureCommandSizeReadFileGather(0, 0) != 0x08);
+}
+
+test "AMPR gather and scatter continue a recorded file read" {
+    apr.reset();
+    defer apr.reset();
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const io = std.testing.io;
+    const file = try temporary.dir.createFile(io, "stream.bin", .{});
+    try file.writeStreamingAll(io, "abcdefghijkl");
+    file.close(io);
+    filesystem.attach(io, temporary.dir);
+    defer filesystem.detach();
+
+    var header: [ampr_command_buffer_header_size]u8 align(8) = @splat(0);
+    var storage: [0x100]u8 align(4) = @splat(0);
+    const address = @intFromPtr(&header);
+    try std.testing.expectEqual(errno.ok, amprCommandBufferConstructor(address));
+    try std.testing.expectEqual(
+        errno.ok,
+        amprCommandBufferSetBuffer(address, @intFromPtr(&storage), storage.len),
+    );
+    const resolved = try apr.resolve("/app0/stream.bin");
+    var destination: [12]u8 = undefined;
+    try std.testing.expectEqual(errno.ok, amprAprCommandBufferReadFile(
+        address,
+        0,
+        0,
+        resolved.identifier,
+        @intFromPtr(&destination),
+        4,
+        0,
+    ));
+    try std.testing.expectEqual(errno.ok, amprAprCommandBufferReadFileGather(address, 0, 0, 4, 4));
+    try std.testing.expectEqual(errno.ok, amprAprCommandBufferReadFileScatter(
+        address,
+        0,
+        0,
+        @intFromPtr(&destination) + 8,
+        4,
+    ));
+    _ = try apr.submitCommandBuffer(address);
+    try std.testing.expectEqualStrings("abcdefghijkl", &destination);
+    try std.testing.expectEqual(@as(u64, 0x30 + 0x08 + 0x0c), amprCommandBufferGetCurrentOffset(address));
+    try std.testing.expectEqual(errno.ok, amprAprCommandBufferResetGatherScatterState(address, 0, 0));
+    try std.testing.expectEqual(
+        errno.KernelError.einval.raw(),
+        amprAprCommandBufferReadFileGather(address, 0, 0, 4, 0),
+    );
+}
+
+test "AMPR map wait write and markers record the measured sizes" {
+    apr.reset();
+    defer apr.reset();
+    var header: [ampr_command_buffer_header_size]u8 align(8) = @splat(0);
+    var storage: [0x200]u8 align(4) = @splat(0);
+    const address = @intFromPtr(&header);
+    try std.testing.expectEqual(errno.ok, amprCommandBufferConstructor(address));
+    try std.testing.expectEqual(
+        errno.ok,
+        amprCommandBufferSetBuffer(address, @intFromPtr(&storage), storage.len),
+    );
+
+    try std.testing.expectEqual(@as(u64, 0x20), amprMeasureCommandSizeFixed32(0, 0, 0, 0, 0, 0));
+    try std.testing.expectEqual(@as(u64, 4), amprMeasureCommandSizeNop(0));
+    try std.testing.expectEqual(@as(u64, 12), amprMeasureCommandSizeNop(3));
+    try std.testing.expectEqual(@as(u64, 8), amprMeasureCommandSizeSetMarker("hi"));
+    try std.testing.expectEqual(@as(u64, 12), amprMeasureCommandSizeSetMarkerWithColor("hi", 0));
+    try std.testing.expectEqual(@as(u64, 4), amprMeasureCommandSizePopMarker());
+    try std.testing.expectEqual(@as(u64, 0x0c), amprMeasureCommandSizeMapBegin(0x10000, 0x4000, 0, 0));
+    try std.testing.expect(amprMeasureCommandSizeMapBegin(1, 0x4000, 0, 0) != 0x0c);
+    try std.testing.expectEqual(@as(u64, 0x10), amprMeasureCommandSizeMapDirectBegin(0x10000, 0, 0x4000, 0, 0));
+    try std.testing.expect(amprMeasureCommandSizeMapDirectBegin(0x10000, 1, 0x4000, 0, 0) != 0x10);
+
+    try std.testing.expectEqual(errno.KernelError.einval.raw(), amprAprCommandBufferMapBegin(address, 1, 0x4000, 0, 0));
+    try std.testing.expectEqual(
+        errno.KernelError.einval.raw(),
+        amprAprCommandBufferMapDirectBegin(address, 0x10000, 1, 0x4000, 0, 0),
+    );
+    try std.testing.expectEqual(errno.KernelError.eperm.raw(), amprAprCommandBufferMapEnd(address));
+    try std.testing.expectEqual(@as(u64, 0), amprCommandBufferGetType(address));
+    try std.testing.expectEqual(errno.ok, amprAprCommandBufferMapBegin(address, 0x10000, 0x4000, 0, 0));
+    try std.testing.expectEqual(ampr_type_map_active, amprCommandBufferGetType(address));
+    try std.testing.expectEqual(errno.ok, amprAprCommandBufferMapEnd(address));
+    try std.testing.expectEqual(@as(u64, 0), amprCommandBufferGetType(address));
+    try std.testing.expectEqual(errno.KernelError.eperm.raw(), amprAprCommandBufferMapEnd(address));
+    try std.testing.expectEqual(errno.ok, amprAprCommandBufferMapDirectBegin(address, 0x10000, 0, 0x4000, 0, 0));
+    try std.testing.expectEqual(ampr_type_map_active, amprCommandBufferGetType(address));
+    try std.testing.expectEqual(errno.ok, amprAprCommandBufferMapEnd(address));
+
+    try std.testing.expectEqual(errno.KernelError.einval.raw(), amprCommandBufferNop(address, 0));
+    try std.testing.expectEqual(errno.KernelError.einval.raw(), amprCommandBufferNop(address, 17));
+    try std.testing.expectEqual(errno.KernelError.einval.raw(), amprCommandBufferWriteAddress(address, null, 1, 0));
+
+    var label: u64 = 0;
+    try std.testing.expectEqual(errno.ok, amprCommandBufferWriteAddress(address, &label, 0x55aa_55aa_55aa_55aa, 0));
+    try std.testing.expectEqual(errno.ok, amprCommandBufferWaitOnAddress(address, &label, 0, 0, 0));
+    try std.testing.expectEqual(errno.ok, amprCommandBufferWriteCounter(address, 0, 0, 0, 0, 0));
+    try std.testing.expectEqual(errno.ok, amprCommandBufferSetMarker(address, "draw"));
+    try std.testing.expectEqual(errno.ok, amprCommandBufferPopMarker(address));
+    try std.testing.expectEqual(errno.ok, amprCommandBufferNop(address, 1));
+    try std.testing.expectEqual(
+        @as(u64, 0x0c + 0x04 + 0x10 + 0x04 + 0x20 + 0x20 + 0x20 + 0x0c + 0x04 + 0x04),
+        amprCommandBufferGetCurrentOffset(address),
+    );
+    _ = try apr.submitCommandBuffer(address);
+    try std.testing.expectEqual(@as(u64, 0x55aa_55aa_55aa_55aa), label);
 }

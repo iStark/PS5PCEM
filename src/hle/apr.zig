@@ -16,6 +16,7 @@ pub const maximum_files: usize = 256;
 pub const maximum_path: usize = 1024;
 pub const maximum_command_buffers: usize = 32;
 pub const maximum_reads_per_buffer: usize = 32;
+pub const maximum_writes_per_buffer: usize = 32;
 pub const maximum_completions_per_buffer: usize = 32;
 pub const maximum_submissions: usize = 64;
 pub const maximum_read_bytes: usize = 4 * 1024 * 1024 * 1024;
@@ -66,11 +67,24 @@ pub const CommandBufferInfo = struct {
     command_count: usize,
 };
 
+/// Next destination and file offset after a recorded read. Gather reuses the
+/// destination, scatter reuses the offset, and both keep the file identifier.
+pub const GatherScatterCursor = struct {
+    file_identifier: u32,
+    destination: u64,
+    file_offset: u64,
+};
+
 pub const CompletionCommand = struct {
     queue_handle: i64,
     ident: u64,
     completion_token: u64,
     user_data: u64,
+};
+
+pub const WriteCommand = struct {
+    destination: u64,
+    value: u64,
 };
 
 pub const CompletionSink = *const fn (CompletionCommand) bool;
@@ -80,10 +94,16 @@ const CommandBuffer = struct {
     address: u64 = 0,
     storage_address: u64 = 0,
     storage_size: usize = 0,
+    record_bytes: usize = 0,
+    command_count: usize = 0,
     reads: [maximum_reads_per_buffer]ReadCommand = undefined,
     read_count: usize = 0,
     completions: [maximum_completions_per_buffer]CompletionCommand = undefined,
     completion_count: usize = 0,
+    writes: [maximum_writes_per_buffer]WriteCommand = undefined,
+    write_count: usize = 0,
+    cursor: ?GatherScatterCursor = null,
+    map_active: bool = false,
 };
 
 const Submission = struct {
@@ -221,6 +241,11 @@ pub fn resetCommandBuffer(address: u64) Error!void {
     const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
     buffer.read_count = 0;
     buffer.completion_count = 0;
+    buffer.write_count = 0;
+    buffer.record_bytes = 0;
+    buffer.command_count = 0;
+    buffer.cursor = null;
+    buffer.map_active = false;
 }
 
 pub fn commandBufferInfo(address: u64) Error!CommandBufferInfo {
@@ -230,24 +255,67 @@ pub fn commandBufferInfo(address: u64) Error!CommandBufferInfo {
     return .{
         .storage_address = buffer.storage_address,
         .storage_size = buffer.storage_size,
-        .write_offset = (buffer.read_count + buffer.completion_count) * 0x30,
-        .command_count = buffer.read_count + buffer.completion_count,
+        .write_offset = buffer.record_bytes,
+        .command_count = buffer.command_count,
     };
 }
 
+pub fn gatherScatterCursor(address: u64) Error!?GatherScatterCursor {
+    lock.lock();
+    defer lock.unlock();
+    const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
+    return buffer.cursor;
+}
+
+pub fn clearGatherScatterCursor(address: u64) Error!void {
+    lock.lock();
+    defer lock.unlock();
+    const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
+    buffer.cursor = null;
+}
+
+pub fn appendRecordBytes(address: u64, record_bytes: usize) Error!void {
+    if (record_bytes == 0) return error.InvalidCommandBuffer;
+    lock.lock();
+    defer lock.unlock();
+    const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
+    const next = std.math.add(usize, buffer.record_bytes, record_bytes) catch return error.InvalidCommandBuffer;
+    if (buffer.storage_size != 0 and next > buffer.storage_size) return error.InvalidCommandBuffer;
+    buffer.record_bytes = next;
+    buffer.command_count += 1;
+}
+
 pub fn appendRead(address: u64, command: ReadCommand) Error!void {
+    return appendReadRecord(address, command, 0x30);
+}
+
+pub fn appendReadRecord(address: u64, command: ReadCommand, record_bytes: usize) Error!void {
     if (command.destination == 0 or command.size == 0 or command.size > maximum_read_bytes or
-        command.file_offset >= maximum_file_offset)
+        command.file_offset >= maximum_file_offset or record_bytes == 0)
     {
         return error.InvalidRead;
     }
+    const next_destination = std.math.add(u64, command.destination, command.size) catch
+        return error.InvalidRead;
+    const next_offset = std.math.add(u64, command.file_offset, command.size) catch
+        return error.InvalidRead;
     lock.lock();
     defer lock.unlock();
     const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
     if (buffer.read_count >= buffer.reads.len) return error.TooManyCommands;
     if (findFileLocked(command.file_identifier) == null) return error.UnknownFile;
+    const next_bytes = std.math.add(usize, buffer.record_bytes, record_bytes) catch
+        return error.InvalidCommandBuffer;
+    if (buffer.storage_size != 0 and next_bytes > buffer.storage_size) return error.InvalidCommandBuffer;
     buffer.reads[buffer.read_count] = command;
     buffer.read_count += 1;
+    buffer.record_bytes = next_bytes;
+    buffer.command_count += 1;
+    buffer.cursor = .{
+        .file_identifier = command.file_identifier,
+        .destination = next_destination,
+        .file_offset = next_offset,
+    };
 }
 
 pub fn appendCompletion(address: u64, command: CompletionCommand) Error!void {
@@ -255,12 +323,47 @@ pub fn appendCompletion(address: u64, command: CompletionCommand) Error!void {
     defer lock.unlock();
     const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
     if (buffer.completion_count >= buffer.completions.len) return error.TooManyCommands;
+    const next_bytes = std.math.add(usize, buffer.record_bytes, 0x30) catch
+        return error.InvalidCommandBuffer;
+    if (buffer.storage_size != 0 and next_bytes > buffer.storage_size) return error.InvalidCommandBuffer;
     buffer.completions[buffer.completion_count] = command;
     buffer.completion_count += 1;
+    buffer.record_bytes = next_bytes;
+    buffer.command_count += 1;
+}
+
+pub fn appendWrite(address: u64, command: WriteCommand, record_bytes: usize) Error!void {
+    if (command.destination == 0 or record_bytes == 0) return error.InvalidCommandBuffer;
+    lock.lock();
+    defer lock.unlock();
+    const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
+    if (buffer.write_count >= buffer.writes.len) return error.TooManyCommands;
+    const next_bytes = std.math.add(usize, buffer.record_bytes, record_bytes) catch
+        return error.InvalidCommandBuffer;
+    if (buffer.storage_size != 0 and next_bytes > buffer.storage_size) return error.InvalidCommandBuffer;
+    buffer.writes[buffer.write_count] = command;
+    buffer.write_count += 1;
+    buffer.record_bytes = next_bytes;
+    buffer.command_count += 1;
+}
+
+pub fn setMapActive(address: u64, active: bool) Error!void {
+    lock.lock();
+    defer lock.unlock();
+    const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
+    buffer.map_active = active;
+}
+
+pub fn mapActive(address: u64) Error!bool {
+    lock.lock();
+    defer lock.unlock();
+    const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
+    return buffer.map_active;
 }
 
 pub fn submitCommandBuffer(address: u64) Error!u32 {
     var pending: [maximum_reads_per_buffer]ReadCommand = undefined;
+    var pending_writes: [maximum_writes_per_buffer]WriteCommand = undefined;
     var pending_completions: [maximum_completions_per_buffer]CompletionCommand = undefined;
     var sink: ?CompletionSink = null;
     const counts = blk: {
@@ -268,16 +371,22 @@ pub fn submitCommandBuffer(address: u64) Error!u32 {
         defer lock.unlock();
         const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
         @memcpy(pending[0..buffer.read_count], buffer.reads[0..buffer.read_count]);
+        @memcpy(pending_writes[0..buffer.write_count], buffer.writes[0..buffer.write_count]);
         @memcpy(pending_completions[0..buffer.completion_count], buffer.completions[0..buffer.completion_count]);
         sink = completion_sink;
-        break :blk .{ buffer.read_count, buffer.completion_count };
+        break :blk .{ buffer.read_count, buffer.write_count, buffer.completion_count };
     };
     for (pending[0..counts[0]]) |command| {
         if (!memory.isGuestRangeAccessible(command.destination, command.size)) return error.InvalidRead;
         const destination: [*]u8 = @ptrFromInt(command.destination);
         _ = try read(command.file_identifier, command.file_offset, destination[0..command.size]);
     }
-    for (pending_completions[0..counts[1]]) |command| {
+    for (pending_writes[0..counts[1]]) |command| {
+        if (!memory.isGuestRangeAccessible(command.destination, 8)) return error.InvalidRead;
+        const destination: *[8]u8 = @ptrFromInt(command.destination);
+        std.mem.writeInt(u64, destination, command.value, .little);
+    }
+    for (pending_completions[0..counts[2]]) |command| {
         const callback = sink orelse return error.IoFailed;
         if (!callback(command)) return error.IoFailed;
     }
@@ -396,4 +505,62 @@ test "APR reads honor file offsets and allow a short read at EOF" {
     try std.testing.expectEqualStrings("payload", destination[0..7]);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0xaa, 0xaa, 0xaa }, destination[7..]);
     try waitCommandBuffer(submission);
+}
+
+test "a recorded read advances the gather-scatter cursor" {
+    reset();
+    defer reset();
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const io = std.testing.io;
+    const file = try temporary.dir.createFile(io, "chunks.bin", .{});
+    try file.writeStreamingAll(io, "abcdefghijkl");
+    file.close(io);
+    filesystem.attach(io, temporary.dir);
+    defer filesystem.detach();
+
+    const resolved = try resolve("/app0/chunks.bin");
+    var destination: [12]u8 = undefined;
+    try constructCommandBuffer(0x5000);
+    try setCommandBufferStorage(0x5000, 0x6000, 0x10000);
+    try appendRead(0x5000, .{
+        .file_identifier = resolved.identifier,
+        .destination = @intFromPtr(&destination),
+        .size = 4,
+        .file_offset = 0,
+    });
+    const after_first = (try gatherScatterCursor(0x5000)).?;
+    try std.testing.expectEqual(resolved.identifier, after_first.file_identifier);
+    try std.testing.expectEqual(@intFromPtr(&destination) + 4, after_first.destination);
+    try std.testing.expectEqual(@as(u64, 4), after_first.file_offset);
+
+    try appendReadRecord(0x5000, .{
+        .file_identifier = after_first.file_identifier,
+        .destination = after_first.destination,
+        .size = 4,
+        .file_offset = 4,
+    }, 0x08);
+    try appendReadRecord(0x5000, .{
+        .file_identifier = resolved.identifier,
+        .destination = @intFromPtr(&destination) + 8,
+        .size = 4,
+        .file_offset = 8,
+    }, 0x0c);
+    _ = try submitCommandBuffer(0x5000);
+    try std.testing.expectEqualStrings("abcdefghijkl", &destination);
+
+    try clearGatherScatterCursor(0x5000);
+    try std.testing.expect((try gatherScatterCursor(0x5000)) == null);
+    try std.testing.expectEqual(@as(usize, 0x30 + 0x08 + 0x0c), (try commandBufferInfo(0x5000)).write_offset);
+}
+
+test "a recorded AMPR write publishes its value on submit" {
+    reset();
+    defer reset();
+    var label: u64 = 0x1111_2222_3333_4444;
+    try constructCommandBuffer(0x7000);
+    try setCommandBufferStorage(0x7000, 0x8000, 0x10000);
+    try appendWrite(0x7000, .{ .destination = @intFromPtr(&label), .value = 0xaaaa_bbbb_cccc_dddd }, 0x20);
+    _ = try submitCommandBuffer(0x7000);
+    try std.testing.expectEqual(@as(u64, 0xaaaa_bbbb_cccc_dddd), label);
 }

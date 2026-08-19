@@ -1734,9 +1734,12 @@ clocks, tick conversion, resolution, leap-year, and day-of-week results.
 
 The APR/AMPR path now owns a read-only file registry and complete command-buffer
 lifecycle: it resolves guest paths to stable IDs and sizes, records reads with
-their 64-bit file offsets, submits them synchronously into checked guest memory,
-permits the short read expected at EOF, and delivers completion through the
-registered AMPR event queue. A failed path resolution writes the ABI-defined
+their 64-bit file offsets, continues a recorded file through gather/scatter
+commands that reuse the next destination or offset, records map begin/end,
+wait-on-address/counter, write-address/counter, and marker/nop packets at their
+measured sizes, publishes write-address values on submit, submits reads
+synchronously into checked guest memory, permits the short read expected at EOF,
+and delivers completion through the registered AMPR event queue. A failed path resolution writes the ABI-defined
 sentinels (`id = 0xffffffff`, `size = 0`, and the failing index), allowing an
 engine to take its loose-file fallback without treating uninitialized memory as
 a multi-gigabyte allocation. Malformed headers, oversized transfers and invalid
