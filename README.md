@@ -887,7 +887,9 @@ pattern-21 addressing: one dword per 8×8 region in a 32 KiB, 1024×512-pixel
 metadata block.
 
 Every `SubresourceLayout` exposes one checked `sourceByteOffset` consumed by CPU
-tile/detile, direct `MemoryReader` staging and the future compute path. Its
+tile/detile, direct `MemoryReader` staging and the Vulkan compute detile pass.
+First-use uploads of large 4-byte standard 256 B/4 KiB/64 KiB (and linear)
+surfaces detile on the GPU; other families keep the CPU path. Its
 pointer-free `ComputeDetileKey` plus 84-byte `ComputeDetileParams` carry block,
 tail, pitch, slice, sample and 64-bit buffer-offset data with a stable all-u32
 layout suitable for SPIR-V scalar constants. Buffer, image, BC-block,
@@ -952,9 +954,10 @@ matching guest address, and publishes the frame through an API-neutral sink.
 
 The remaining stages are:
 
-1. Add mip and layer views, texture component swizzles, the remaining
+1. Add remaining layer views, texture component swizzles, the remaining
    compressed DCC/FMASK states, HTILE Z-range/HiZ handling, and CMASK
-   states coupled to FMASK.
+   states coupled to FMASK. First-use sampled uploads now detile the T#
+   mip range into a Vulkan image whose mip 0 is the view's base level.
 2. Finish indirect drawing. `SET_BASE` already records the argument base and
    indirect dispatches execute; the indirect draw packet bodies are the
    remaining half.
@@ -964,8 +967,9 @@ The remaining stages are:
    alternate gradient-free image-sample encoding is now accepted; its former
    Jurassic Park device loss was an invalid framebuffer pairing caused by a
    stale undersized depth attachment, not shader control flow.
-4. Continue reducing first-use texture work and the per-draw submission cost,
-   and validate state and resource invalidation against longer title captures.
+4. Continue reducing first-use texture work and the per-draw submission cost
+   for the remaining uncompressed layer and metadata paths, and validate state
+   and resource invalidation against longer title captures.
 
 The live path is now connected end to end: AGC DCB submission executes against
 the Vulkan backend, VideoOut registration identifies the requested display

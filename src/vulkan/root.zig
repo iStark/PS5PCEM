@@ -5,6 +5,7 @@
 
 pub const api = @import("api.zig");
 pub const backend = @import("backend.zig");
+pub const detile_spirv = @import("detile_spirv.zig");
 
 pub const Error = backend.Error;
 pub const Options = backend.Options;
@@ -27,4 +28,5 @@ pub const graphics_probe_height = backend.graphics_probe_height;
 test {
     _ = api;
     _ = backend;
+    _ = detile_spirv;
 }

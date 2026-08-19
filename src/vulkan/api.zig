@@ -603,6 +603,12 @@ pub const PipelineLayoutCreateInfo = extern struct {
     push_constant_ranges: ?*const anyopaque = null,
 };
 
+pub const PushConstantRange = extern struct {
+    stage_flags: Flags,
+    offset: u32,
+    size: u32,
+};
+
 pub const PipelineShaderStageCreateInfo = extern struct {
     s_type: u32 = structure_type_pipeline_shader_stage_create_info,
     p_next: ?*const anyopaque = null,
@@ -1042,6 +1048,7 @@ pub const PfnCmdCopyBufferToImage = *const fn (CommandBuffer, Buffer, Image, u32
 pub const PfnCmdBlitImage = *const fn (CommandBuffer, Image, u32, Image, u32, u32, [*]const ImageBlit, u32) callconv(call) void;
 pub const PfnCmdResolveImage = *const fn (CommandBuffer, Image, u32, Image, u32, u32, [*]const ImageResolve) callconv(call) void;
 pub const PfnCmdPipelineBarrier = *const fn (CommandBuffer, Flags, Flags, Flags, u32, ?*const anyopaque, u32, ?[*]const BufferMemoryBarrier, u32, ?*const anyopaque) callconv(call) void;
+pub const PfnCmdPushConstants = *const fn (CommandBuffer, PipelineLayout, Flags, u32, u32, *const anyopaque) callconv(call) void;
 pub const PfnCreateSwapchainKHR = *const fn (Device, *const SwapchainCreateInfoKHR, ?*const anyopaque, *Swapchain) callconv(call) Result;
 pub const PfnDestroySwapchainKHR = *const fn (Device, Swapchain, ?*const anyopaque) callconv(call) void;
 pub const PfnGetSwapchainImagesKHR = *const fn (Device, Swapchain, *u32, ?[*]Image) callconv(call) Result;

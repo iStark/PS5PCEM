@@ -1686,12 +1686,116 @@ pub const SubresourceLayout = struct {
                 .surface_z = self.first_slice,
                 .tail_x = self.tail_x,
                 .tail_y = self.tail_y,
-                .flags = (@as(u32, @intFromEnum(self.kind)) << 24) |
-                    (@as(u32, @intFromBool(self.in_tail)) << 16),
+                .flags = encodeComputeFlags(self),
             },
         };
     }
 };
+
+fn encodeComputeFlags(self: SubresourceLayout) u32 {
+    const bpp_log2 = std.math.log2_int(u8, self.block.bytes_per_element);
+    return (@as(u32, @intFromEnum(self.kind)) << 24) |
+        (@as(u32, @intFromBool(self.in_tail)) << 16) |
+        (@as(u32, @intFromEnum(self.block.family)) << 8) |
+        (@as(u32, bpp_log2) << 4) |
+        self.block.samples_log2;
+}
+
+pub fn computeFamily(params: ComputeDetileParams) BlockFamily {
+    return @enumFromInt(@as(u8, @truncate(params.flags >> 8)));
+}
+
+pub fn computeElementBytes(params: ComputeDetileParams) u8 {
+    return @as(u8, 1) << @intCast((params.flags >> 4) & 0xf);
+}
+
+/// Same byte address `sourceByteOffset` would return, expressed only with the
+/// pointer-free constants a compute shader sees.
+pub fn computeSourceOffset(params: ComputeDetileParams, x: u32, y: u32, z: u32, sample: u32) u64 {
+    const family = computeFamily(params);
+    const bpp = computeElementBytes(params);
+    const samples_log2: u8 = @truncate(params.flags & 0xf);
+    const kind: TextureKind = @enumFromInt(@as(u8, @truncate(params.flags >> 24)));
+    const source_base = (@as(u64, params.source_offset_hi) << 32) | params.source_offset_lo;
+    if (family == .linear) {
+        const row = @as(u64, y) * @as(u64, params.blocks_per_row) * bpp;
+        return source_base + @as(u64, z) * params.source_slice_bytes + row + @as(u64, x) * bpp;
+    }
+
+    const sx = x + params.tail_x;
+    const sy = y + params.tail_y;
+    const block_x = if (params.block_width == 0) 0 else sx / params.block_width;
+    const block_y = if (params.block_height == 0) 0 else sy / params.block_height;
+    const block_index = @as(u64, block_y) * params.blocks_per_row + block_x;
+    var slice_term: u64 = 0;
+    var swizzle_z: u32 = 0;
+    if (kind == .array_2d) {
+        slice_term = @as(u64, z) * params.source_slice_bytes;
+        if (family == .depth_64kb or family == .render_target_64kb) {
+            swizzle_z = params.surface_z + z;
+        }
+    } else {
+        const block_z = if (params.block_depth == 0) 0 else z / params.block_depth;
+        slice_term = @as(u64, block_z) * params.source_slice_bytes;
+        swizzle_z = if (params.block_depth <= 1) z else z % params.block_depth;
+    }
+    const local_x = if (family == .depth_64kb or family == .render_target_64kb)
+        sx
+    else if (params.block_width == 0)
+        0
+    else
+        sx % params.block_width;
+    const local_y = if (family == .depth_64kb or family == .render_target_64kb)
+        sy
+    else if (params.block_height == 0)
+        0
+    else
+        sy % params.block_height;
+    const local = swizzleLocalOffset(family, local_x, local_y, swizzle_z, sample, bpp, samples_log2);
+    return source_base + slice_term + block_index * params.block_bytes + local;
+}
+
+pub fn computeDestinationOffset(params: ComputeDetileParams, x: u32, y: u32, z: u32, sample: u32) u64 {
+    const dest_base = (@as(u64, params.destination_offset_hi) << 32) | params.destination_offset_lo;
+    const bpp = computeElementBytes(params);
+    const texel = (@as(u64, z) * params.height + y) * params.width + x;
+    return dest_base + (texel * params.samples + sample) * bpp;
+}
+
+pub fn computeDetileSupported(params: ComputeDetileParams) bool {
+    if (params.samples != 1) return false;
+    const bpp = computeElementBytes(params);
+    if (bpp != 4) return false;
+    const kind: TextureKind = @enumFromInt(@as(u8, @truncate(params.flags >> 24)));
+    if (kind != .array_2d) return false;
+    return switch (computeFamily(params)) {
+        .linear, .standard_256b, .standard_4kb, .standard_64kb => true,
+        else => false,
+    };
+}
+
+fn swizzleLocalOffset(
+    family: BlockFamily,
+    x: u32,
+    y: u32,
+    z: u32,
+    sample: u32,
+    bpp: u8,
+    samples_log2: u8,
+) u32 {
+    return switch (family) {
+        .linear => 0,
+        .standard_256b => standard4kOffset(x, y, bpp) & 0xff,
+        .standard_4kb => standard4kOffset(x, y, bpp),
+        .standard_4kb_3d => standard4k3dOffset(x, y, z, bpp),
+        .standard_64kb => standard64kOffset(x, y, bpp),
+        .standard_64kb_3d => standard64k3dOffset(x, y, z, bpp),
+        .partially_resident => prt64kOffset(x, y, bpp),
+        .partially_resident_3d => prt64k3dOffset(x, y, z, bpp),
+        .depth_64kb => rbPlus64kOffset(.depth, x, y, z, sample, bpp, samples_log2),
+        .render_target_64kb => rbPlus64kOffset(.render_target, x, y, z, sample, bpp, samples_log2),
+    };
+}
 
 /// Shader specialization key. Runtime dimensions stay in `ComputeDetileParams`.
 pub const ComputeDetileKey = extern struct {
@@ -1701,9 +1805,9 @@ pub const ComputeDetileKey = extern struct {
     reserved: u8 = 0,
 };
 
-/// API-neutral, pointer-free constants consumed by the future Vulkan compute
-/// detiler. All fields are 32-bit so the struct has the same byte layout in
-/// Zig, scalar-layout SPIR-V, and capture/replay diagnostics.
+/// API-neutral, pointer-free constants consumed by the Vulkan compute detiler.
+/// All fields are 32-bit so the struct has the same byte layout in Zig,
+/// scalar-layout SPIR-V, and capture/replay diagnostics.
 pub const ComputeDetileParams = extern struct {
     source_offset_lo: u32,
     source_offset_hi: u32,
@@ -2885,6 +2989,21 @@ test "3D and MSAA equations visit every element in one block exactly once" {
     }
 }
 
+test "a sampled mip view detiles each requested level from one allocation" {
+    const layout = try TextureLayout.init(.{
+        .tile_mode = .standard_64kb,
+        .width = 64,
+        .height = 64,
+        .mip_levels = 6,
+    }, 4);
+    try testing.expectEqual(@as(u8, 6), layout.mip_levels);
+    const base = try layout.subresource(0, 0, 1);
+    const mip = try layout.subresource(2, 0, 1);
+    try testing.expectEqual(@as(u32, 64), base.width);
+    try testing.expectEqual(@as(u32, 16), mip.width);
+    try testing.expect(base.width > mip.width);
+}
+
 test "mip tail volume and MSAA subresources share one CPU address contract" {
     const descriptions = [_]Texture{
         .{ .tile_mode = .standard_64kb, .width = 129, .height = 73, .depth_or_layers = 2, .first_slice = 1, .mip_levels = 8 },
@@ -2944,4 +3063,29 @@ test "compute detile constants are compact stable POD derived from the CPU view"
         try add(@as(u64, 0x1_2345_6000), try add(try multiply(layout.source_layer_bytes, 3), view.level_offset)),
         encoded_source,
     );
+    try testing.expect(computeDetileSupported(plan.params));
+    const relative = try view.computePlan(0, 0);
+    try testing.expectEqual(try view.sourceByteOffset(3, 5, 1, 0), computeSourceOffset(relative.params, 3, 5, 1, 0));
+    try testing.expectEqual(try view.stagingByteOffset(3, 5, 1, 0), computeDestinationOffset(relative.params, 3, 5, 1, 0));
+}
+
+test "compute source offsets match CPU detile for standard 64 KiB textures" {
+    const layout = try TextureLayout.init(.{
+        .tile_mode = .standard_64kb,
+        .width = 64,
+        .height = 64,
+        .mip_levels = 4,
+    }, 4);
+    const view = try layout.subresource(1, 0, 1);
+    const plan = try view.computePlan(0, 0);
+    var y: u32 = 0;
+    while (y < view.height) : (y += 5) {
+        var x: u32 = 0;
+        while (x < view.width) : (x += 7) {
+            try testing.expectEqual(
+                try view.sourceByteOffset(x, y, 0, 0),
+                computeSourceOffset(plan.params, x, y, 0, 0),
+            );
+        }
+    }
 }

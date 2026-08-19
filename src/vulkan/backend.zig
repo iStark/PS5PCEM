@@ -17,6 +17,7 @@ const rdna2 = @import("rdna2");
 const builtin = @import("builtin");
 const gpu = @import("gpu");
 const vk = @import("api.zig");
+const detile_spirv = @import("detile_spirv.zig");
 
 /// Set to true to enable verbose per-frame GPU debug logging.
 /// Disable for performance — each print is a blocking I/O syscall.
@@ -451,6 +452,7 @@ const DeviceFunctions = struct {
     cmd_blit_image: vk.PfnCmdBlitImage,
     cmd_resolve_image: vk.PfnCmdResolveImage,
     cmd_pipeline_barrier: vk.PfnCmdPipelineBarrier,
+    cmd_push_constants: vk.PfnCmdPushConstants,
 
     fn load(get_proc: vk.PfnGetDeviceProcAddr, device: vk.Device) Error!DeviceFunctions {
         return .{
@@ -521,6 +523,7 @@ const DeviceFunctions = struct {
             .cmd_blit_image = try deviceProc(get_proc, device, vk.PfnCmdBlitImage, "vkCmdBlitImage"),
             .cmd_resolve_image = try deviceProc(get_proc, device, vk.PfnCmdResolveImage, "vkCmdResolveImage"),
             .cmd_pipeline_barrier = try deviceProc(get_proc, device, vk.PfnCmdPipelineBarrier, "vkCmdPipelineBarrier"),
+            .cmd_push_constants = try deviceProc(get_proc, device, vk.PfnCmdPushConstants, "vkCmdPushConstants"),
         };
     }
 };
@@ -1467,6 +1470,90 @@ const SampledStagingLayout = union(enum) {
     }
 };
 
+/// First-use sampled upload of one T# view: the guest mip range packed into a
+/// Vulkan image whose mip 0 is the view's base level.
+const SampledViewPlan = struct {
+    texture: gpu.TextureLayout,
+    base_level: u8,
+    level_count: u8,
+    first_layer: u32,
+    layer_count: u32,
+    texel_width: u32,
+    texel_height: u32,
+    texel_depth: u32,
+    volume: bool,
+
+    fn fromDescriptor(
+        descriptor: gpu.resources.ImageDescriptor,
+        dimension: rdna2.spirv.SampledImageDimension,
+    ) ?SampledViewPlan {
+        if (descriptor.samplesLog2() != 0) return null;
+        const wants_chain = descriptor.viewBaseLevel() != 0 or
+            descriptor.viewMipLevels() > 1 or
+            (descriptor.extended and descriptor.resourceMipLevels() > 1);
+        if (!wants_chain) return null;
+        const texture = gpu.TextureLayout.fromImage(descriptor) catch return null;
+        const base_level = descriptor.viewBaseLevel();
+        if (base_level >= texture.mip_levels) return null;
+        var level_count = descriptor.viewMipLevels();
+        const remaining = texture.mip_levels - base_level;
+        if (level_count == 0 or level_count > remaining) level_count = remaining;
+        const available_layers = texture.layers;
+        const layer_count: u32 = switch (dimension) {
+            .two_d => 1,
+            .three_d => 1,
+            .cube => if (available_layers >= 6) 6 else return null,
+            .two_d_array => available_layers,
+        };
+        if (dimension != .three_d and (layer_count == 0 or layer_count > available_layers)) return null;
+        return .{
+            .texture = texture,
+            .base_level = base_level,
+            .level_count = level_count,
+            .first_layer = 0,
+            .layer_count = layer_count,
+            .texel_width = shiftTexels(descriptor.width, base_level),
+            .texel_height = shiftTexels(descriptor.height, base_level),
+            .texel_depth = if (dimension == .three_d)
+                shiftTexels(descriptor.depth_or_layers, base_level)
+            else
+                1,
+            .volume = dimension == .three_d,
+        };
+    }
+
+    fn view(self: SampledViewPlan, level_index: u8) anyerror!gpu.TextureSubresourceLayout {
+        return self.texture.subresource(
+            self.base_level + level_index,
+            self.first_layer,
+            if (self.volume) 1 else self.layer_count,
+        );
+    }
+
+    fn stagingBytes(self: SampledViewPlan) anyerror!u64 {
+        var total: u64 = 0;
+        var index: u8 = 0;
+        while (index < self.level_count) : (index += 1) {
+            const packed_bytes = try (try self.view(index)).stagingBytes();
+            total += std.mem.alignForward(u64, packed_bytes, 16);
+        }
+        return total;
+    }
+
+    fn mipTexels(self: SampledViewPlan, level_index: u8) struct { u32, u32, u32 } {
+        return .{
+            shiftTexels(self.texel_width, level_index),
+            shiftTexels(self.texel_height, level_index),
+            if (self.volume) shiftTexels(self.texel_depth, level_index) else 1,
+        };
+    }
+};
+
+fn shiftTexels(value: u32, level: u8) u32 {
+    if (level >= 31) return 1;
+    return @max(value >> @as(u5, @intCast(level)), 1);
+}
+
 const PreparedStorageImage = struct {
     descriptor: gpu.ImageDescriptor,
     subresource: gpu.TextureSubresourceLayout,
@@ -1760,6 +1847,9 @@ const CachedSampledImage = struct {
     image_type: u8,
     dimension: rdna2.spirv.SampledImageDimension,
     tile_mode: u8,
+    base_level: u8,
+    last_level: u8,
+    mip_levels: u8,
     state_hash: u64,
     source_generation: u64,
     content_hash: u64,
@@ -1791,6 +1881,12 @@ pub const Renderer = struct {
     one_shot_fence: vk.Fence = 0,
     one_shot_command_buffer: ?vk.CommandBuffer = null,
     compute_pipeline_layout: vk.PipelineLayout,
+    detile_set_layout: vk.DescriptorSetLayout = 0,
+    detile_pool: vk.DescriptorPool = 0,
+    detile_set: vk.DescriptorSet = 0,
+    detile_pipeline_layout: vk.PipelineLayout = 0,
+    detile_pipeline: vk.Pipeline = 0,
+    detile_shader: vk.ShaderModule = 0,
     driver_pipeline_cache: vk.PipelineCache,
     memory_properties: vk.PhysicalDeviceMemoryProperties,
     loader_api_version: u32,
@@ -2334,6 +2430,9 @@ pub const Renderer = struct {
         errdefer renderer.destroyBuffer(renderer.gds_buffer.?);
         try renderer.writeMapped(renderer.gds_buffer.?, renderer.gds_storage.items);
         renderer.updateGdsDescriptor(renderer.gds_buffer.?);
+        renderer.createDetilePass() catch |err| {
+            std.debug.print("[vulkan] compute detile unavailable: {s}\n", .{@errorName(err)});
+        };
         return renderer;
     }
 
@@ -2397,6 +2496,11 @@ pub const Renderer = struct {
         // is destroyed.
         savePipelineCacheBytes(self);
         self.device_functions.destroy_pipeline_cache(self.device, self.driver_pipeline_cache, null);
+        if (self.detile_pipeline != 0) self.device_functions.destroy_pipeline(self.device, self.detile_pipeline, null);
+        if (self.detile_shader != 0) self.device_functions.destroy_shader_module(self.device, self.detile_shader, null);
+        if (self.detile_pipeline_layout != 0) self.device_functions.destroy_pipeline_layout(self.device, self.detile_pipeline_layout, null);
+        if (self.detile_pool != 0) self.device_functions.destroy_descriptor_pool(self.device, self.detile_pool, null);
+        if (self.detile_set_layout != 0) self.device_functions.destroy_descriptor_set_layout(self.device, self.detile_set_layout, null);
         self.device_functions.destroy_pipeline_layout(self.device, self.compute_pipeline_layout, null);
         self.device_functions.destroy_descriptor_pool(self.device, self.descriptor_pool, null);
         self.device_functions.destroy_descriptor_set_layout(self.device, self.descriptor_set_layout, null);
@@ -6451,6 +6555,7 @@ pub const Renderer = struct {
                 vk.image_usage_transfer_dst_bit |
                 vk.image_usage_sampled_bit,
             samples,
+            1,
         );
         errdefer self.destroyImage(image);
 
@@ -6765,6 +6870,7 @@ pub const Renderer = struct {
             target.format,
             vk.image_usage_depth_stencil_attachment_bit | vk.image_usage_transfer_dst_bit | vk.image_usage_sampled_bit,
             samples,
+            1,
         );
         errdefer self.destroyImage(image);
 
@@ -10270,12 +10376,14 @@ pub const Renderer = struct {
         format: u32,
         usage: vk.Flags,
         samples: vk.Flags,
+        mip_levels: u32,
     ) Error!OwnedImage {
         const create_info = vk.ImageCreateInfo{
             .flags = flags,
             .image_type = image_type,
             .format = format,
             .extent = .{ .width = width, .height = height, .depth = depth },
+            .mip_levels = @max(mip_levels, 1),
             .array_layers = array_layers,
             .samples = samples,
             .usage = usage,
@@ -10316,6 +10424,7 @@ pub const Renderer = struct {
             format,
             usage,
             vk.sample_count_1_bit,
+            1,
         );
     }
 
@@ -10845,6 +10954,7 @@ pub const Renderer = struct {
             vk.image_usage_transfer_src_bit | vk.image_usage_transfer_dst_bit |
                 vk.image_usage_storage_bit | vk.image_usage_sampled_bit,
             vk.sample_count_1_bit,
+            1,
         );
         errdefer if (!cache_owns_resources) self.destroyImage(image);
         const view_info = vk.ImageViewCreateInfo{
@@ -11038,28 +11148,55 @@ pub const Renderer = struct {
                 return resident;
             }
         }
-        const layout = try SampledStagingLayout.fromImage(descriptor);
-        const staging_bytes_u64 = try layout.stagingBytes();
-        const available_layers = layout.depthOrLayers();
-        const valid_layers = switch (dimension) {
+        const mip_plan = SampledViewPlan.fromDescriptor(descriptor, dimension);
+        const layout: ?SampledStagingLayout = if (mip_plan == null)
+            try SampledStagingLayout.fromImage(descriptor)
+        else
+            null;
+        const staging_bytes_u64 = if (mip_plan) |plan|
+            try plan.stagingBytes()
+        else
+            try layout.?.stagingBytes();
+        const source_bytes = if (mip_plan) |plan|
+            plan.texture.required_source_bytes
+        else
+            layout.?.requiredSourceBytes();
+        const bytes_per_element = if (mip_plan) |plan|
+            plan.texture.block.bytes_per_element
+        else
+            layout.?.bytesPerElement();
+        const available_layers = if (mip_plan) |plan|
+            plan.layer_count
+        else
+            layout.?.depthOrLayers();
+        const valid_layers = if (mip_plan != null)
+            true
+        else switch (dimension) {
             .two_d => if (descriptor.image_type == .cube) available_layers >= 1 else available_layers == 1,
             .three_d => available_layers >= 1,
             .cube => available_layers >= 6,
             .two_d_array => available_layers >= 1,
         };
         if (!valid_layers or
-            layout.bytesPerElement() != bytes_per_texel or staging_bytes_u64 == 0 or
-            staging_bytes_u64 > maximum_frame_bytes or layout.requiredSourceBytes() == 0 or
-            layout.requiredSourceBytes() > maximum_frame_bytes)
+            bytes_per_element != bytes_per_texel or staging_bytes_u64 == 0 or
+            staging_bytes_u64 > maximum_frame_bytes or source_bytes == 0 or
+            source_bytes > maximum_frame_bytes)
         {
             std.debug.print(
-                "[vulkan dcb] sampled image layout rejected depth/layers={d} bpp={d} expected_bpp={d} stage=0x{x} source=0x{x}\n",
-                .{ layout.depthOrLayers(), layout.bytesPerElement(), bytes_per_texel, staging_bytes_u64, layout.requiredSourceBytes() },
+                "[vulkan dcb] sampled image layout rejected depth/layers={d} bpp={d} expected_bpp={d} stage=0x{x} source=0x{x} mips={d}\n",
+                .{
+                    available_layers,
+                    bytes_per_element,
+                    bytes_per_texel,
+                    staging_bytes_u64,
+                    source_bytes,
+                    if (mip_plan) |plan| plan.level_count else 1,
+                },
             );
             return Error.UnsupportedSampledImage;
         }
         const byte_count = std.math.cast(usize, staging_bytes_u64) orelse return Error.UnsupportedSampledImage;
-        const probe_span = std.math.cast(usize, layout.requiredSourceBytes()) orelse 0;
+        const probe_span = std.math.cast(usize, source_bytes) orelse 0;
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
 
         // A rendered target sampled as a texture must see the rendered frame:
@@ -11091,6 +11228,9 @@ pub const Renderer = struct {
                 item.image_type == @intFromEnum(descriptor.image_type) and
                 item.dimension == dimension and
                 item.tile_mode == @intFromEnum(descriptor.tile_mode) and
+                item.base_level == descriptor.base_level and
+                item.last_level == descriptor.last_level and
+                item.mip_levels == (if (mip_plan) |plan| plan.level_count else 1) and
                 item.state_hash == state_hash and
                 item.source_generation == source_generation and
                 item.content_hash == content_hash)
@@ -11127,8 +11267,29 @@ pub const Renderer = struct {
         defer self.allocator.free(linear);
         const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
         var source_available = true;
-        if (layout.isLinear()) {
-            layout.stage(reader, descriptor.address, linear) catch |err| {
+        if (mip_plan) |plan| {
+            @memset(linear, 0);
+            const tiled = try self.allocator.alloc(u8, probe_span);
+            defer self.allocator.free(tiled);
+            if (!memory.read(memory.context, descriptor.address, tiled)) {
+                if (descriptor.tile_mode != .depth) return Error.GuestMemoryReadFailed;
+                source_available = false;
+                fillUnbackedDepthSample(descriptor.unified_format, linear);
+            } else if (self.computeDetileBuffer(plan, tiled, byte_count) catch null) |gpu_linear| {
+                defer self.destroyBuffer(gpu_linear);
+                try self.readMapped(gpu_linear, linear);
+            } else {
+                var cursor: usize = 0;
+                var level_index: u8 = 0;
+                while (level_index < plan.level_count) : (level_index += 1) {
+                    const level = try plan.view(level_index);
+                    const packed_bytes: usize = @intCast(try level.stagingBytes());
+                    try level.detile(tiled, linear[cursor..][0..packed_bytes]);
+                    cursor += std.mem.alignForward(usize, packed_bytes, 16);
+                }
+            }
+        } else if (layout.?.isLinear()) {
+            layout.?.stage(reader, descriptor.address, linear) catch |err| {
                 if (err != Error.GuestMemoryReadFailed or descriptor.tile_mode != .depth) return err;
                 source_available = false;
                 fillUnbackedDepthSample(descriptor.unified_format, linear);
@@ -11145,7 +11306,7 @@ pub const Renderer = struct {
                 source_available = false;
                 fillUnbackedDepthSample(descriptor.unified_format, linear);
             } else {
-                try layout.detile(tiled, linear);
+                try layout.?.detile(tiled, linear);
             }
         }
         if (!source_available and !self.reported_unbacked_depth_sample) {
@@ -11186,7 +11347,7 @@ pub const Renderer = struct {
         // Probe several points in the guest surface: tiled data may put the
         // first texels far from the base while the head of the allocation is
         // still zero (clear/padding).
-        const raw_probe_span = std.math.cast(usize, layout.requiredSourceBytes()) orelse 0;
+        const raw_probe_span = probe_span;
         var raw_nonzero: u32 = 0;
         var raw_probe_hits: u32 = 0;
         if (raw_probe_span != 0) {
@@ -11209,13 +11370,15 @@ pub const Renderer = struct {
             }
         }
         if (log_verbose_gpu or self.texture_cache_misses <= 4) std.debug.print(
-            "[vulkan dcb] staged sample {d}x{d}x{d} tile={s} addr=0x{x} nonzero_texels={d}/{d} raw_probe_nz={d} hits={d} first_rgba=({d},{d},{d},{d})\n",
+            "[vulkan dcb] staged sample {d}x{d}x{d} tile={s} addr=0x{x} mips={d} base={d} nonzero_texels={d}/{d} raw_probe_nz={d} hits={d} first_rgba=({d},{d},{d},{d})\n",
             .{
                 descriptor.width,
                 descriptor.height,
                 descriptor.depth_or_layers,
                 @tagName(descriptor.tile_mode),
                 descriptor.address,
+                if (mip_plan) |plan| plan.level_count else 1,
+                if (mip_plan) |plan| plan.base_level else 0,
                 nonzero,
                 if (byte_count >= @as(usize, bytes_per_texel))
                     byte_count / @as(usize, bytes_per_texel)
@@ -11284,12 +11447,23 @@ pub const Renderer = struct {
         // Unreal fallback descriptors are typed as cube while a DIM=2D
         // instruction samples only the first 1x1 face; keep that legal by
         // exposing one layer in that case, while true DIM=Cube gets six.
-        const upload_layers: u32 = if (is_cube)
+        const upload_layers: u32 = if (mip_plan) |plan|
+            plan.layer_count
+        else if (is_cube)
             6
         else if (is_2d_array)
             descriptor.depth_or_layers
         else
             1;
+        const image_width = if (mip_plan) |plan| plan.texel_width else descriptor.width;
+        const image_height = if (mip_plan) |plan| plan.texel_height else descriptor.height;
+        const image_depth = if (mip_plan) |plan|
+            plan.texel_depth
+        else if (is_3d)
+            descriptor.depth_or_layers
+        else
+            1;
+        const mip_levels: u32 = if (mip_plan) |plan| plan.level_count else 1;
         const upload = try self.createBuffer(
             byte_count,
             vk.buffer_usage_transfer_src_bit,
@@ -11298,15 +11472,16 @@ pub const Renderer = struct {
         defer self.destroyBuffer(upload);
         try self.writeMapped(upload, linear);
         const image = try self.createImageWithExtent(
-            descriptor.width,
-            descriptor.height,
-            if (is_3d) descriptor.depth_or_layers else 1,
+            image_width,
+            image_height,
+            image_depth,
             upload_layers,
             if (is_3d) vk.image_type_3d else vk.image_type_2d,
             if (is_cube) vk.image_create_cube_compatible_bit else 0,
             image_format,
             vk.image_usage_transfer_dst_bit | vk.image_usage_sampled_bit,
             vk.sample_count_1_bit,
+            mip_levels,
         );
         errdefer self.destroyImage(image);
 
@@ -11320,6 +11495,7 @@ pub const Renderer = struct {
             .image = image.handle,
             .subresource_range = .{
                 .aspect_mask = vk.image_aspect_color_bit,
+                .level_count = mip_levels,
                 .layer_count = upload_layers,
             },
         };
@@ -11335,24 +11511,51 @@ pub const Renderer = struct {
             1,
             @ptrCast(&upload_barrier),
         );
-        const copy = vk.BufferImageCopy{
-            .image_subresource = .{
-                .aspect_mask = vk.image_aspect_color_bit,
-                .layer_count = upload_layers,
-            },
-            .image_extent = .{
-                .width = descriptor.width,
-                .height = descriptor.height,
-                .depth = if (is_3d) descriptor.depth_or_layers else 1,
-            },
-        };
+        var copies: [16]vk.BufferImageCopy = undefined;
+        var copy_count: u32 = 0;
+        if (mip_plan) |plan| {
+            var cursor: u64 = 0;
+            var level_index: u8 = 0;
+            while (level_index < plan.level_count) : (level_index += 1) {
+                const packed_bytes = try (try plan.view(level_index)).stagingBytes();
+                const extent = plan.mipTexels(level_index);
+                copies[copy_count] = .{
+                    .buffer_offset = cursor,
+                    .image_subresource = .{
+                        .aspect_mask = vk.image_aspect_color_bit,
+                        .mip_level = level_index,
+                        .layer_count = upload_layers,
+                    },
+                    .image_extent = .{
+                        .width = extent[0],
+                        .height = extent[1],
+                        .depth = extent[2],
+                    },
+                };
+                copy_count += 1;
+                cursor += std.mem.alignForward(u64, packed_bytes, 16);
+            }
+        } else {
+            copies[0] = .{
+                .image_subresource = .{
+                    .aspect_mask = vk.image_aspect_color_bit,
+                    .layer_count = upload_layers,
+                },
+                .image_extent = .{
+                    .width = image_width,
+                    .height = image_height,
+                    .depth = image_depth,
+                },
+            };
+            copy_count = 1;
+        }
         self.device_functions.cmd_copy_buffer_to_image(
             command_buffer,
             upload.handle,
             image.handle,
             vk.image_layout_transfer_dst_optimal,
-            1,
-            @ptrCast(&copy),
+            copy_count,
+            @ptrCast(&copies),
         );
         const shader_barrier = vk.ImageMemoryBarrier{
             .source_access_mask = vk.access_transfer_write_bit,
@@ -11362,6 +11565,7 @@ pub const Renderer = struct {
             .image = image.handle,
             .subresource_range = .{
                 .aspect_mask = vk.image_aspect_color_bit,
+                .level_count = mip_levels,
                 .layer_count = upload_layers,
             },
         };
@@ -11393,6 +11597,7 @@ pub const Renderer = struct {
             .components = components,
             .subresource_range = .{
                 .aspect_mask = vk.image_aspect_color_bit,
+                .level_count = mip_levels,
                 .layer_count = upload_layers,
             },
         };
@@ -11421,6 +11626,8 @@ pub const Renderer = struct {
                 stale.image_type != @intFromEnum(descriptor.image_type) or
                 stale.dimension != dimension or
                 stale.tile_mode != @intFromEnum(descriptor.tile_mode) or
+                stale.base_level != descriptor.base_level or
+                stale.last_level != descriptor.last_level or
                 stale.state_hash != state_hash)
             {
                 continue;
@@ -11456,6 +11663,9 @@ pub const Renderer = struct {
             .image_type = @intFromEnum(descriptor.image_type),
             .dimension = dimension,
             .tile_mode = @intFromEnum(descriptor.tile_mode),
+            .base_level = descriptor.base_level,
+            .last_level = descriptor.last_level,
+            .mip_levels = @intCast(mip_levels),
             .state_hash = state_hash,
             .source_generation = source_generation,
             .content_hash = content_hash,
@@ -11607,6 +11817,207 @@ pub const Renderer = struct {
 
     fn createSmokeShader(self: *Renderer) Error!vk.ShaderModule {
         return self.createShader(&smoke_compute_spirv);
+    }
+
+    fn createDetilePass(self: *Renderer) (Error || std.mem.Allocator.Error)!void {
+        const src_binding = vk.DescriptorSetLayoutBinding{
+            .binding = 0,
+            .descriptor_type = vk.descriptor_type_storage_buffer,
+            .descriptor_count = 1,
+            .stage_flags = vk.shader_stage_compute_bit,
+        };
+        const dst_binding = vk.DescriptorSetLayoutBinding{
+            .binding = 1,
+            .descriptor_type = vk.descriptor_type_storage_buffer,
+            .descriptor_count = 1,
+            .stage_flags = vk.shader_stage_compute_bit,
+        };
+        const bindings = [_]vk.DescriptorSetLayoutBinding{ src_binding, dst_binding };
+        const layout_info = vk.DescriptorSetLayoutCreateInfo{
+            .binding_count = bindings.len,
+            .bindings = &bindings,
+        };
+        if (self.device_functions.create_descriptor_set_layout(
+            self.device,
+            &layout_info,
+            null,
+            &self.detile_set_layout,
+        ) != vk.success) return Error.DescriptorSetLayoutCreationFailed;
+        errdefer self.device_functions.destroy_descriptor_set_layout(self.device, self.detile_set_layout, null);
+
+        const pool_size = vk.DescriptorPoolSize{
+            .descriptor_type = vk.descriptor_type_storage_buffer,
+            .descriptor_count = 2,
+        };
+        const pool_info = vk.DescriptorPoolCreateInfo{
+            .max_sets = 1,
+            .pool_size_count = 1,
+            .pool_sizes = @ptrCast(&pool_size),
+        };
+        if (self.device_functions.create_descriptor_pool(self.device, &pool_info, null, &self.detile_pool) != vk.success) {
+            return Error.DescriptorPoolCreationFailed;
+        }
+        errdefer self.device_functions.destroy_descriptor_pool(self.device, self.detile_pool, null);
+
+        const allocate_info = vk.DescriptorSetAllocateInfo{
+            .descriptor_pool = self.detile_pool,
+            .descriptor_set_count = 1,
+            .set_layouts = @ptrCast(&self.detile_set_layout),
+        };
+        if (self.device_functions.allocate_descriptor_sets(self.device, &allocate_info, @ptrCast(&self.detile_set)) != vk.success) {
+            return Error.DescriptorSetAllocationFailed;
+        }
+
+        const push = vk.PushConstantRange{
+            .stage_flags = vk.shader_stage_compute_bit,
+            .offset = 0,
+            .size = @sizeOf(gpu.ComputeDetileParams),
+        };
+        const pipeline_layout_info = vk.PipelineLayoutCreateInfo{
+            .set_layout_count = 1,
+            .set_layouts = @ptrCast(&self.detile_set_layout),
+            .push_constant_range_count = 1,
+            .push_constant_ranges = @ptrCast(&push),
+        };
+        if (self.device_functions.create_pipeline_layout(
+            self.device,
+            &pipeline_layout_info,
+            null,
+            &self.detile_pipeline_layout,
+        ) != vk.success) return Error.PipelineLayoutCreationFailed;
+        errdefer self.device_functions.destroy_pipeline_layout(self.device, self.detile_pipeline_layout, null);
+
+        const words = try detile_spirv.build(self.allocator);
+        defer self.allocator.free(words);
+        self.detile_shader = try self.createShader(words);
+        errdefer self.device_functions.destroy_shader_module(self.device, self.detile_shader, null);
+        const stage = vk.PipelineShaderStageCreateInfo{
+            .stage = vk.shader_stage_compute_bit,
+            .module = self.detile_shader,
+            .name = "main",
+        };
+        const pipeline_info = vk.ComputePipelineCreateInfo{
+            .stage = stage,
+            .layout = self.detile_pipeline_layout,
+        };
+        if (self.device_functions.create_compute_pipelines(
+            self.device,
+            self.driver_pipeline_cache,
+            1,
+            @ptrCast(&pipeline_info),
+            null,
+            @ptrCast(&self.detile_pipeline),
+        ) != vk.success) return Error.ComputePipelineCreationFailed;
+    }
+
+    fn computeDetileBuffer(
+        self: *Renderer,
+        plan: SampledViewPlan,
+        tiled: []const u8,
+        linear_bytes: usize,
+    ) (Error || std.mem.Allocator.Error)!?OwnedBuffer {
+        if (self.detile_pipeline == 0 or tiled.len == 0 or linear_bytes < 32 * 1024) return null;
+        var params_ok = true;
+        var level_index: u8 = 0;
+        while (level_index < plan.level_count) : (level_index += 1) {
+            const view = try plan.view(level_index);
+            const detile = try view.computePlan(0, 0);
+            if (!gpu.computeDetileSupported(detile.params)) {
+                params_ok = false;
+                break;
+            }
+        }
+        if (!params_ok) return null;
+
+        const src = try self.createBuffer(
+            tiled.len,
+            vk.buffer_usage_storage_buffer_bit,
+            vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+        );
+        defer self.destroyBuffer(src);
+        try self.writeMapped(src, tiled);
+        const dst = try self.createBuffer(
+            linear_bytes,
+            vk.buffer_usage_storage_buffer_bit | vk.buffer_usage_transfer_src_bit,
+            vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+        );
+        errdefer self.destroyBuffer(dst);
+
+        const src_info = vk.DescriptorBufferInfo{ .buffer = src.handle, .offset = 0, .range = src.size };
+        const dst_info = vk.DescriptorBufferInfo{ .buffer = dst.handle, .offset = 0, .range = dst.size };
+        const writes = [_]vk.WriteDescriptorSet{
+            .{
+                .destination_set = self.detile_set,
+                .destination_binding = 0,
+                .destination_array_element = 0,
+                .descriptor_count = 1,
+                .descriptor_type = vk.descriptor_type_storage_buffer,
+                .buffer_info = @ptrCast(&src_info),
+            },
+            .{
+                .destination_set = self.detile_set,
+                .destination_binding = 1,
+                .destination_array_element = 0,
+                .descriptor_count = 1,
+                .descriptor_type = vk.descriptor_type_storage_buffer,
+                .buffer_info = @ptrCast(&dst_info),
+            },
+        };
+        self.device_functions.update_descriptor_sets(self.device, writes.len, &writes, 0, null);
+
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        self.device_functions.cmd_bind_pipeline(command_buffer, vk.pipeline_bind_point_compute, self.detile_pipeline);
+        self.device_functions.cmd_bind_descriptor_sets(
+            command_buffer,
+            vk.pipeline_bind_point_compute,
+            self.detile_pipeline_layout,
+            0,
+            1,
+            @ptrCast(&self.detile_set),
+            0,
+            null,
+        );
+        var cursor: u64 = 0;
+        level_index = 0;
+        while (level_index < plan.level_count) : (level_index += 1) {
+            const view = try plan.view(level_index);
+            var detile = try view.computePlan(0, cursor);
+            self.device_functions.cmd_push_constants(
+                command_buffer,
+                self.detile_pipeline_layout,
+                vk.shader_stage_compute_bit,
+                0,
+                @sizeOf(gpu.ComputeDetileParams),
+                @ptrCast(&detile.params),
+            );
+            const groups_x = @max((view.width + 7) / 8, 1);
+            const groups_y = @max((view.height + 7) / 8, 1);
+            const groups_z = @max(view.depth_or_layers, 1);
+            self.device_functions.cmd_dispatch(command_buffer, groups_x, groups_y, groups_z);
+            cursor += std.mem.alignForward(u64, try view.stagingBytes(), 16);
+        }
+        const barrier = vk.BufferMemoryBarrier{
+            .source_access_mask = vk.access_shader_write_bit,
+            .destination_access_mask = vk.access_transfer_read_bit,
+            .buffer = dst.handle,
+            .offset = 0,
+            .size = dst.size,
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_compute_shader_bit,
+            vk.pipeline_stage_transfer_bit,
+            0,
+            0,
+            null,
+            1,
+            @ptrCast(&barrier),
+            0,
+            null,
+        );
+        try self.submitOneShot(command_buffer);
+        return dst;
     }
 
     fn createShader(self: *Renderer, words: []const u32) Error!vk.ShaderModule {
@@ -14331,6 +14742,10 @@ fn sampledImageStateHash(
 ) u64 {
     const words = [_]u32{
         descriptor.unified_format,
+        @as(u32, descriptor.base_level) |
+            (@as(u32, descriptor.last_level) << 8) |
+            (@as(u32, descriptor.max_mip) << 16) |
+            (@as(u32, @intFromBool(descriptor.extended)) << 24),
         @as(u32, descriptor.dst_select[0]) |
             (@as(u32, descriptor.dst_select[1]) << 8) |
             (@as(u32, descriptor.dst_select[2]) << 16) |
@@ -17011,6 +17426,58 @@ test "sampled image views honor sRGB and destination selectors" {
     try std.testing.expectEqual(vk.component_swizzle_r, blue_one_red_zero.b);
     try std.testing.expectEqual(vk.component_swizzle_zero, blue_one_red_zero.a);
     try std.testing.expectError(Error.UnsupportedSampledImage, sampledImageComponents(.{ 2, 5, 6, 7 }));
+}
+
+test "first-use sampled views cover the T# mip range" {
+    var descriptor = gpu.resources.ImageDescriptor{
+        .address = 0x2000_0000,
+        .width = 64,
+        .height = 64,
+        .depth_or_layers = 1,
+        .pitch = 64,
+        .unified_format = 56,
+        .tile_mode = .linear,
+        .image_type = .color_2d,
+        .dst_select = .{ 4, 5, 6, 7 },
+        .base_level = 0,
+        .last_level = 0,
+        .base_array = 0,
+        .array_pitch = 0,
+        .max_mip = 0,
+        .min_lod = 0,
+        .min_lod_warning = 0,
+        .bc_swizzle = 0,
+        .metadata_address = 0,
+        .dcc_enabled = false,
+        .cmask_fast_clear = false,
+        .fmask_compression = false,
+        .cmask_address = 0,
+        .fmask_address = 0,
+        .dcc_address = 0,
+        .descriptor_flags = 0,
+        .extended = true,
+    };
+
+    try std.testing.expect(SampledViewPlan.fromDescriptor(descriptor, .two_d) == null);
+
+    descriptor.max_mip = 5;
+    descriptor.base_level = 1;
+    descriptor.last_level = 3;
+    const plan = SampledViewPlan.fromDescriptor(descriptor, .two_d) orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(u8, 1), plan.base_level);
+    try std.testing.expectEqual(@as(u8, 3), plan.level_count);
+    try std.testing.expectEqual(@as(u32, 32), plan.texel_width);
+    try std.testing.expectEqual(@as(u32, 32), plan.texel_height);
+    try std.testing.expectEqual(@as(u32, 1), plan.layer_count);
+    const mip0 = try plan.view(0);
+    const mip1 = try plan.view(1);
+    try std.testing.expectEqual(@as(u32, 32), mip0.width);
+    try std.testing.expectEqual(@as(u32, 16), mip1.width);
+    try std.testing.expect(mip0.width > mip1.width);
+    const extent1 = plan.mipTexels(1);
+    try std.testing.expectEqual(@as(u32, 16), extent1[0]);
+    try std.testing.expectEqual(@as(u32, 16), extent1[1]);
+    try std.testing.expect((try plan.stagingBytes()) >= try mip0.stagingBytes());
 }
 
 test "unnormalized guest samplers satisfy Vulkan restrictions" {
