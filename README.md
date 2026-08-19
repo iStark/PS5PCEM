@@ -161,8 +161,8 @@ If you would like to support continued PS5PCEM development, you can do so on
 - NGS2 now preserves system/rack/voice lifecycles, parses RIFF/WAVE geometry,
   applies play/pause/resume/stop/kill events, reports 32-bit voice-state flags,
   and paces silent render grains instead of spinning a host core. The legacy
-  `libSceAudiodec` lifecycle also performs real ATRAC9 and MP3 decoding; NGS2
-  voice mixing and M4AAC decoding are still incomplete.
+  `libSceAudiodec` lifecycle also performs real ATRAC9, MP3, and MPEG-4 AAC
+  decoding; NGS2 voice mixing is still incomplete.
 - AGC resource registration now reports deterministic backing-memory
   requirements and retains owner handles instead of leaving output sizes
   uninitialized. This prevents otherwise valid titles from turning stack data
@@ -1780,12 +1780,13 @@ actual NGS2 voice synthesis and mixing remain incomplete. AJM owns state per
 codec instance and performs real ATRAC9 (`codec 1`) and MP3 (`codec 0`) decoding
 for contiguous and split-buffer jobs. Initialize, codec-info, gapless, stream
 byte counts, decoded-frame counts, and total sample sidebands are preserved.
-ATRAC9 output supports signed 16-bit, signed 32-bit, float, and planar layouts;
-M4AAC remains unsupported and is rejected instead of being reported as
-successful silent PCM. The legacy `libSceAudiodec` path now implements library
-init/term, checked decoder create/delete/reset, codec metadata, and real ATRAC9
-and MP3 decode through the shared codec backend. Its M4AAC branch remains a
-bounded silent compatibility path rather than a decoder. FSB-backed fallback
+ATRAC9 output supports signed 16-bit, signed 32-bit, float, and planar layouts.
+MPEG-4 AAC (`codec 2`) decodes ADTS, raw, and SAF jobs through FAAD2, and Opus
+(`codec 24`) decodes packets through libopus; unknown AJM codecs are still
+rejected instead of being reported as successful silent PCM. The legacy
+`libSceAudiodec` path implements library init/term, checked decoder
+create/delete/reset, codec metadata, and real ATRAC9, MP3, and MPEG-4 AAC
+decode through the shared codec backend. FSB-backed fallback
 previews are resampled to the 48 kHz host mix, use short de-click envelopes,
 and drain once. Direct fallback mixing is disabled by default because replaying
 a clip beside the title's real AudioOut/AJM mix is heard as echo; it remains

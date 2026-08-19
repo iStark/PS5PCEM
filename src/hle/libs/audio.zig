@@ -1457,9 +1457,10 @@ fn fillAudiodecInfo(ctrl: *AudiodecCtrl, instance: *const LegacyAudiodec) void {
         },
         audiodec_type_m4aac => {
             const output: *AudiodecM4aacInfo = @ptrCast(@alignCast(ctrl.bsi_info.?));
-            output.sample_rate = instance.sample_rate;
-            output.channels = instance.channels;
-            output.heaac = 0;
+            const info = instance.decoder.codecInfo();
+            output.sample_rate = if (info.sample_rate != 0) info.sample_rate else instance.sample_rate;
+            output.channels = if (info.channels != 0) info.channels else instance.channels;
+            output.heaac = info.heaac;
             output.result = 0;
         },
         else => {},
@@ -1526,8 +1527,25 @@ fn audiodecCreateDecoder(ctrl: ?*AudiodecCtrl, codec_type: u32) callconv(abi.gue
                 instance.word_length = parameter.word_length;
                 instance.channels = @min(if (parameter.maximum_channels == 0) 2 else parameter.maximum_channels, 8);
                 instance.sample_rate = audiodecSampleRate(parameter.sample_rate_index);
-                instance.frame_bytes = 4608;
-                instance.frame_samples = 2048;
+                instance.frame_bytes = 2048;
+                instance.frame_samples = 1024;
+                const flags = (audiodecFlags(parameter.word_length) orelse 0) |
+                    instance.channels |
+                    (if (parameter.enable_heaac != 0) @as(u64, 1) << 32 else 0);
+                instance.decoder = ajm_codec.Decoder.create(ajm_codec.codec_m4aac, flags) catch
+                    return audiodec_error_argument;
+                var init_bytes: [8]u8 = undefined;
+                std.mem.writeInt(u32, init_bytes[0..4], parameter.config_number, .little);
+                std.mem.writeInt(u32, init_bytes[4..8], parameter.sample_rate_index, .little);
+                const initialized = instance.decoder.initialize(&init_bytes);
+                if (initialized.result != 0) {
+                    instance.decoder.deinit();
+                    return audiodec_error_argument;
+                }
+                const info = instance.decoder.codecInfo();
+                if (info.channels != 0) instance.channels = info.channels;
+                if (info.sample_rate != 0) instance.sample_rate = info.sample_rate;
+                if (info.frame_samples != 0) instance.frame_samples = info.frame_samples;
             },
             else => unreachable,
         }
@@ -1567,23 +1585,14 @@ fn audiodecDecode(handle: i32, ctrl: ?*AudiodecCtrl) callconv(abi.guest) i32 {
     const input = au.address.?[0..au.data_size];
     const output = pcm.address.?[0..pcm.data_size];
 
-    if (instance.codec_type == audiodec_type_m4aac) {
-        const word_bytes = audiodecWordBytes(instance.word_length).?;
-        const wanted = @as(usize, instance.frame_samples) * instance.channels * word_bytes;
-        const produced = @min(output.len, wanted);
-        @memset(output[0..produced], 0);
-        pcm.data_size = @intCast(produced);
-        au.data_size = @min(au.data_size, instance.frame_bytes);
-    } else {
-        const report = instance.decoder.decode(input, output);
-        au.data_size = @intCast(report.consumed);
-        pcm.data_size = @intCast(report.produced);
-        if (report.frames == 0 and report.consumed == 0) return audiodec_error_argument;
-        const info = instance.decoder.codecInfo();
-        if (info.channels != 0) instance.channels = info.channels;
-        if (info.sample_rate != 0) instance.sample_rate = info.sample_rate;
-        if (info.frame_samples != 0) instance.frame_samples = info.frame_samples;
-    }
+    const report = instance.decoder.decode(input, output);
+    au.data_size = @intCast(report.consumed);
+    pcm.data_size = @intCast(report.produced);
+    if (report.frames == 0 and report.consumed == 0) return audiodec_error_argument;
+    const info = instance.decoder.codecInfo();
+    if (info.channels != 0) instance.channels = info.channels;
+    if (info.sample_rate != 0) instance.sample_rate = info.sample_rate;
+    if (info.frame_samples != 0) instance.frame_samples = info.frame_samples;
     fillAudiodecInfo(control, instance);
     return errno.ok;
 }
@@ -1717,7 +1726,7 @@ fn ajmFinalize(context: u32) callconv(abi.guest) i32 {
 fn ajmModuleRegister(context: u32, codec: u32, reserved: i64) callconv(abi.guest) i32 {
     if (reserved != 0) return ajm_error_invalid_parameter;
     const context_index = ajmContextIndex(context) orelse return ajm_error_invalid_context;
-    if (codec != ajm_codec.codec_mp3 and codec != ajm_codec.codec_atrac9) return ajm_error_codec_not_supported;
+    if (!ajm_codec.isSupported(codec)) return ajm_error_codec_not_supported;
     ajm_mutex.lock();
     defer ajm_mutex.unlock();
     if (!ajm_contexts[context_index]) return ajm_error_invalid_context;
@@ -1738,7 +1747,7 @@ fn ajmModuleUnregister(context: u32, codec: u32) callconv(abi.guest) i32 {
 fn ajmInstanceCreate(context: u32, codec: u32, flags: u64, instance: ?*u32) callconv(abi.guest) i32 {
     const output = instance orelse return ajm_error_invalid_parameter;
     const context_index = ajmContextIndex(context) orelse return ajm_error_invalid_context;
-    if (codec != ajm_codec.codec_mp3 and codec != ajm_codec.codec_atrac9) return ajm_error_codec_not_supported;
+    if (!ajm_codec.isSupported(codec)) return ajm_error_codec_not_supported;
     ajm_mutex.lock();
     defer ajm_mutex.unlock();
     if (!ajm_contexts[context_index]) return ajm_error_invalid_context;
@@ -1751,7 +1760,7 @@ fn ajmInstanceCreate(context: u32, codec: u32, flags: u64, instance: ?*u32) call
         output.* = id;
         std.debug.print(
             "[audio ajm] instance={d} codec={s} flags=0x{x} format={d} channels={d}\n",
-            .{ id, if (codec == ajm_codec.codec_atrac9) "atrac9" else "mp3", flags, (flags >> 7) & 7, (flags >> 3) & 0xf },
+            .{ id, ajm_codec.codecName(codec), flags, (flags >> 7) & 7, flags & 0x7f },
         );
         return errno.ok;
     }
@@ -1872,6 +1881,11 @@ fn ajmBatchJobGetCodecInfo(info: ?*AjmBatchInfo, instance: u32, result: ?[*]u8, 
                 output[15] = @truncate((header >> 3) & 1);
                 output[16] = @truncate((header >> 2) & 1);
                 output[17] = @truncate(header & 3);
+            } else if (candidate.codec == ajm_codec.codec_m4aac and output_size >= 16) {
+                std.mem.writeInt(u32, output[8..12], codec_info.heaac, .little);
+                std.mem.writeInt(u32, output[12..16], 0, .little);
+            } else if (candidate.codec == ajm_codec.codec_opus and output_size >= 12) {
+                std.mem.writeInt(u32, output[8..12], codec_info.frames_per_packet, .little);
             }
         }
     }
@@ -2221,6 +2235,21 @@ test "AJM executes an MP3 decode job and reports actual PCM" {
     try std.testing.expectEqualSlices(u8, frame[0..4], codec_info[8..12]);
     try std.testing.expectEqual(@as(u8, 0), codec_info[12]);
     try std.testing.expectEqual(@as(u8, 1), codec_info[13]);
+}
+
+test "AJM accepts MPEG-4 AAC and Opus instances" {
+    reset();
+    var context: u32 = 0;
+    try std.testing.expectEqual(errno.ok, ajmInitialize(0, &context));
+    try std.testing.expectEqual(errno.ok, ajmModuleRegister(context, ajm_codec.codec_m4aac, 0));
+    try std.testing.expectEqual(errno.ok, ajmModuleRegister(context, ajm_codec.codec_opus, 0));
+    var aac: u32 = 0;
+    var opus: u32 = 0;
+    try std.testing.expectEqual(errno.ok, ajmInstanceCreate(context, ajm_codec.codec_m4aac, 2, &aac));
+    try std.testing.expectEqual(errno.ok, ajmInstanceCreate(context, ajm_codec.codec_opus, 2, &opus));
+    try std.testing.expect(aac != 0);
+    try std.testing.expect(opus != 0);
+    try std.testing.expectEqual(ajm_error_codec_not_supported, ajmModuleRegister(context, 3, 0));
 }
 
 test "AJM split decode joins input and scatters actual output" {

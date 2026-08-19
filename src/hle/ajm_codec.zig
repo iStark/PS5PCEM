@@ -4,18 +4,35 @@
 //! Stateful host decoders behind the guest AJM job ABI.
 //!
 //! ATRAC9 is decoded by the pinned MIT LibAtrac9 dependency. MP3 is decoded by
-//! minimp3 (CC0). This file deliberately owns codec state and byte accounting;
-//! the guest-facing library only validates handles and marshals sparse buffers.
+//! minimp3 (CC0). MPEG-4 AAC uses FAAD2 and Opus uses libopus. This file owns
+//! codec state and byte accounting; the guest-facing library only validates
+//! handles and marshals sparse buffers.
 
 const std = @import("std");
 
 const c = @cImport({
+    @cDefine("NEAACDECAPI", "");
+    @cDefine("FAAD2_VERSION", "2.11.2");
     @cInclude("libatrac9.h");
     @cInclude("minimp3.h");
+    @cInclude("neaacdec.h");
+    @cInclude("opus.h");
 });
 
 pub const codec_mp3: u32 = 0;
 pub const codec_atrac9: u32 = 1;
+pub const codec_m4aac: u32 = 2;
+pub const codec_opus: u32 = 24;
+
+pub const aac_config_adts: u32 = 1;
+pub const aac_config_raw: u32 = 2;
+pub const aac_config_saf: u32 = 3;
+
+const aac_sbr_flag: u64 = 1 << 32;
+const aac_nondelay_flag: u64 = 1 << 33;
+
+const opus_default_frame_samples: u32 = 960;
+const opus_maximum_frame_samples: u32 = 5760;
 
 pub const result_not_initialized: i32 = 0x0000_0001;
 pub const result_invalid_data: i32 = 0x0000_0002;
@@ -46,7 +63,26 @@ pub const CodecInfo = struct {
     frames_in_superframe: u32 = 0,
     next_frame_size: u32 = 0,
     mp3_header: u32 = 0,
+    heaac: u32 = 0,
+    frames_per_packet: u32 = 0,
 };
+
+pub fn isSupported(codec: u32) bool {
+    return switch (codec) {
+        codec_mp3, codec_atrac9, codec_m4aac, codec_opus => true,
+        else => false,
+    };
+}
+
+pub fn codecName(codec: u32) []const u8 {
+    return switch (codec) {
+        codec_mp3 => "mp3",
+        codec_atrac9 => "atrac9",
+        codec_m4aac => "aac",
+        codec_opus => "opus",
+        else => "unknown",
+    };
+}
 
 const SampleEncoding = enum(u2) {
     signed16 = 0,
@@ -78,6 +114,24 @@ pub const Decoder = struct {
     mp3_header: u32 = 0,
     mp3_frame_samples: u32 = 0,
 
+    aac_handle: ?*anyopaque = null,
+    aac_opened: bool = false,
+    aac_config: u32 = aac_config_adts,
+    aac_freq_index: u32 = 3,
+    aac_skip_frames: u32 = 0,
+    aac_channels: u32 = 0,
+    aac_sample_rate: u32 = 0,
+    aac_bitrate: u32 = 0,
+    aac_frame_samples: u32 = 0,
+    aac_heaac: u32 = 0,
+
+    opus_decoder: ?*c.OpusDecoder = null,
+    opus_channels: u32 = 0,
+    opus_sample_rate: u32 = 0,
+    opus_mapping_family: u32 = 0,
+    opus_frames_per_packet: u32 = 1,
+    opus_initialized: bool = false,
+
     gapless_total: u64 = 0,
     gapless_remaining: u64 = 0,
     gapless_skip: u32 = 0,
@@ -92,12 +146,21 @@ pub const Decoder = struct {
             2 => .float32,
             else => return Error.UnsupportedCodec,
         };
+        if (!isSupported(codec)) return Error.UnsupportedCodec;
         var self = Decoder{ .codec = codec, .flags = flags, .encoding = encoding };
         switch (codec) {
             codec_atrac9 => {
                 self.at9_handle = c.Atrac9GetHandle() orelse return Error.OutOfMemory;
             },
             codec_mp3 => c.mp3dec_init(&self.mp3_state),
+            codec_m4aac => {
+                self.aac_channels = flagChannelCount(flags);
+                self.aac_sample_rate = 48_000;
+            },
+            codec_opus => {
+                self.opus_channels = flagChannelCount(flags);
+                self.opus_sample_rate = 48_000;
+            },
             else => return Error.UnsupportedCodec,
         }
         return self;
@@ -107,6 +170,8 @@ pub const Decoder = struct {
         if (self.at9_handle) |handle| c.Atrac9ReleaseHandle(handle);
         self.at9_handle = null;
         self.at9_initialized = false;
+        self.closeAac();
+        self.destroyOpus();
     }
 
     pub fn reset(self: *Decoder) void {
@@ -130,6 +195,16 @@ pub const Decoder = struct {
                 self.mp3_header = 0;
                 self.mp3_frame_samples = 0;
             },
+            codec_m4aac => {
+                self.closeAac();
+                self.aac_skip_frames = if (self.flags & aac_nondelay_flag != 0) 0 else 2;
+                self.aac_bitrate = 0;
+                self.aac_frame_samples = 0;
+                self.aac_heaac = 0;
+            },
+            codec_opus => {
+                self.opus_frames_per_packet = 1;
+            },
             else => {},
         }
     }
@@ -139,6 +214,8 @@ pub const Decoder = struct {
         return switch (self.codec) {
             codec_atrac9 => self.initializeAtrac9(parameters),
             codec_mp3 => .{},
+            codec_m4aac => self.initializeAac(parameters),
+            codec_opus => self.initializeOpus(parameters),
             else => .{ .result = result_unsupported_flag },
         };
     }
@@ -180,6 +257,8 @@ pub const Decoder = struct {
         var report = switch (self.codec) {
             codec_atrac9 => self.decodeAtrac9(bounded_input, output),
             codec_mp3 => self.decodeMp3(bounded_input, output),
+            codec_m4aac => self.decodeAac(bounded_input, output),
+            codec_opus => self.decodeOpus(bounded_input, output),
             else => Report{ .result = result_unsupported_flag },
         };
         report.total_samples = self.total_samples;
@@ -206,6 +285,19 @@ pub const Decoder = struct {
                 .bitrate = self.mp3_bitrate,
                 .frame_samples = self.mp3_frame_samples,
                 .mp3_header = self.mp3_header,
+            },
+            codec_m4aac => .{
+                .channels = self.aac_channels,
+                .sample_rate = self.aac_sample_rate,
+                .bitrate = self.aac_bitrate,
+                .frame_samples = self.aac_frame_samples,
+                .heaac = self.aac_heaac,
+            },
+            codec_opus => .{
+                .channels = self.opus_channels,
+                .sample_rate = self.opus_sample_rate,
+                .frame_samples = opus_default_frame_samples,
+                .frames_per_packet = self.opus_frames_per_packet,
             },
             else => .{},
         };
@@ -369,6 +461,226 @@ pub const Decoder = struct {
         return report;
     }
 
+    fn flagChannelCount(flags: u64) u32 {
+        const count: u32 = @truncate(flags & 0x7f);
+        return if (count == 0) 2 else @min(count, 8);
+    }
+
+    fn closeAac(self: *Decoder) void {
+        if (self.aac_handle) |handle| c.NeAACDecClose(handle);
+        self.aac_handle = null;
+        self.aac_opened = false;
+    }
+
+    fn destroyOpus(self: *Decoder) void {
+        if (self.opus_decoder) |decoder| c.opus_decoder_destroy(decoder);
+        self.opus_decoder = null;
+        self.opus_initialized = false;
+    }
+
+    fn aacRates() [12]u32 {
+        return .{ 96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025, 8_000 };
+    }
+
+    fn initializeAac(self: *Decoder, parameters: []const u8) Report {
+        if (parameters.len < 8) return .{ .result = result_invalid_parameter };
+        const config = std.mem.readInt(u32, parameters[0..4], .little);
+        const freq_index = std.mem.readInt(u32, parameters[4..8], .little);
+        if (config < aac_config_adts or config > aac_config_saf) return .{ .result = result_invalid_parameter };
+        if (config == aac_config_raw and freq_index > 11) return .{ .result = result_invalid_parameter };
+
+        self.closeAac();
+        const handle = c.NeAACDecOpen() orelse return .{ .result = result_codec_fatal };
+        self.aac_handle = handle;
+        if (c.NeAACDecGetCurrentConfiguration(handle)) |cfg| {
+            cfg.*.outputFormat = switch (self.encoding) {
+                .signed16 => c.FAAD_FMT_16BIT,
+                .signed32 => c.FAAD_FMT_32BIT,
+                .float32 => c.FAAD_FMT_FLOAT,
+            };
+            cfg.*.dontUpSampleImplicitSBR = if (self.flags & aac_sbr_flag != 0) 0 else 1;
+            _ = c.NeAACDecSetConfiguration(handle, cfg);
+        }
+
+        self.aac_config = config;
+        self.aac_freq_index = freq_index;
+        self.aac_skip_frames = if (self.flags & aac_nondelay_flag != 0) 0 else 2;
+        if (config == aac_config_raw) {
+            const rates = aacRates();
+            const channel_config: u32 = @min(self.aac_channels, 7);
+            var extra = [_]u8{
+                @truncate((@as(u32, 2) << 3) | (freq_index >> 1)),
+                @truncate(((freq_index & 1) << 7) | (channel_config << 3)),
+            };
+            var sample_rate: c_ulong = 0;
+            var channels: u8 = 0;
+            const status = c.NeAACDecInit2(handle, &extra, extra.len, &sample_rate, &channels);
+            if (status != 0) {
+                self.closeAac();
+                return .{ .result = result_codec_fatal, .internal_result = status };
+            }
+            self.aac_opened = true;
+            if (channels != 0) self.aac_channels = channels;
+            if (sample_rate != 0) self.aac_sample_rate = @intCast(sample_rate) else self.aac_sample_rate = rates[freq_index];
+        } else {
+            self.aac_sample_rate = aacRates()[@min(freq_index, 11)];
+        }
+        return .{};
+    }
+
+    fn ensureAacOpened(self: *Decoder, input: []const u8) Report {
+        if (self.aac_opened) return .{};
+        const handle = self.aac_handle orelse return .{ .result = result_not_initialized };
+        if (input.len == 0) return .{ .result = result_partial_input };
+        var sample_rate: c_ulong = 0;
+        var channels: u8 = 0;
+        const consumed = c.NeAACDecInit(handle, @ptrCast(@constCast(input.ptr)), @intCast(input.len), &sample_rate, &channels);
+        if (consumed < 0) return .{ .result = result_codec_fatal, .internal_result = consumed };
+        self.aac_opened = true;
+        if (channels != 0) self.aac_channels = channels;
+        if (sample_rate != 0) self.aac_sample_rate = @intCast(sample_rate);
+        return .{ .consumed = @intCast(consumed) };
+    }
+
+    fn decodeAac(self: *Decoder, input: []const u8, output: []u8) Report {
+        var report = Report{};
+        if (self.aac_handle == null) return .{ .result = result_not_initialized };
+        const opened = self.ensureAacOpened(input);
+        if (opened.result != 0) return opened;
+        report.consumed = opened.consumed;
+        const handle = self.aac_handle orelse return .{ .result = result_not_initialized };
+
+        while (report.consumed < input.len) {
+            var frame_info: c.NeAACDecFrameInfo = std.mem.zeroes(c.NeAACDecFrameInfo);
+            const remain = input[report.consumed..];
+            const decoded = c.NeAACDecDecode(
+                handle,
+                &frame_info,
+                @ptrCast(@constCast(remain.ptr)),
+                @intCast(remain.len),
+            );
+            if (frame_info.@"error" != 0) {
+                report.result |= result_invalid_data;
+                report.internal_result = frame_info.@"error";
+                break;
+            }
+            if (frame_info.bytesconsumed == 0) {
+                report.result |= result_partial_input;
+                break;
+            }
+            report.consumed += frame_info.bytesconsumed;
+            if (decoded == null or frame_info.samples == 0 or frame_info.channels == 0) continue;
+            if (self.aac_skip_frames != 0) {
+                self.aac_skip_frames -= 1;
+                continue;
+            }
+
+            const channels: u32 = frame_info.channels;
+            const frame_samples: u32 = @intCast(frame_info.samples / channels);
+            self.aac_channels = channels;
+            if (frame_info.samplerate != 0) self.aac_sample_rate = frame_info.samplerate;
+            self.aac_frame_samples = frame_samples;
+            self.aac_heaac = if (frame_info.sbr != 0 or frame_info.ps != 0) 1 else 0;
+            if (frame_info.samplerate != 0 and frame_samples != 0) {
+                const bits = remain.len * 8;
+                self.aac_bitrate = @intCast(@divTrunc(bits * frame_info.samplerate, frame_samples));
+            }
+
+            const pcm: [*]const u8 = @ptrCast(decoded);
+            const pcm_bytes = pcm[0 .. @as(usize, frame_info.samples) * self.sampleBytes()];
+            const selected = self.selectedFrames(frame_samples);
+            const selected_bytes = @as(usize, selected.count) * channels * self.sampleBytes();
+            if (selected_bytes > output.len - report.produced) {
+                report.result |= result_not_enough_room;
+                break;
+            }
+            if (selected.count != 0) {
+                const start = @as(usize, selected.skip) * channels * self.sampleBytes();
+                @memcpy(output[report.produced..][0..selected_bytes], pcm_bytes[start..][0..selected_bytes]);
+                report.produced += selected_bytes;
+            }
+            report.frames += 1;
+            self.commitFrames(selected);
+        }
+        return report;
+    }
+
+    fn initializeOpus(self: *Decoder, parameters: []const u8) Report {
+        if (parameters.len < 12) return .{ .result = result_invalid_parameter };
+        const channels = std.mem.readInt(u32, parameters[0..4], .little);
+        const sample_rate = std.mem.readInt(u32, parameters[4..8], .little);
+        const mapping_family = std.mem.readInt(u32, parameters[8..12], .little);
+        if (channels == 0 or channels > 8 or sample_rate == 0) return .{ .result = result_invalid_parameter };
+        if (mapping_family != 0 and channels > 2) return .{ .result = result_invalid_parameter };
+
+        self.destroyOpus();
+        var status: c_int = 0;
+        const decoder = c.opus_decoder_create(@intCast(sample_rate), @intCast(channels), &status);
+        if (decoder == null or status != c.OPUS_OK) {
+            return .{ .result = result_codec_fatal, .internal_result = status };
+        }
+        self.opus_decoder = decoder;
+        self.opus_channels = channels;
+        self.opus_sample_rate = sample_rate;
+        self.opus_mapping_family = mapping_family;
+        self.opus_frames_per_packet = 1;
+        self.opus_initialized = true;
+        return .{};
+    }
+
+    fn decodeOpus(self: *Decoder, input: []const u8, output: []u8) Report {
+        if (!self.opus_initialized) return .{ .result = result_not_initialized };
+        const decoder = self.opus_decoder orelse return .{ .result = result_not_initialized };
+        if (input.len == 0) return .{ .result = result_partial_input };
+        if (input.len > std.math.maxInt(c_int)) return .{ .result = result_invalid_parameter };
+
+        var pcm: [opus_maximum_frame_samples * 8]i16 align(16) = undefined;
+        const max_samples: c_int = @intCast(pcm.len / self.opus_channels);
+        const decoded = c.opus_decode(
+            decoder,
+            input.ptr,
+            @intCast(input.len),
+            &pcm,
+            max_samples,
+            0,
+        );
+        if (decoded < 0) return .{ .result = result_invalid_data, .internal_result = decoded };
+
+        const frame_samples: u32 = @intCast(decoded);
+        const selected = self.selectedFrames(frame_samples);
+        const selected_values = @as(usize, selected.count) * self.opus_channels;
+        const selected_bytes = selected_values * self.sampleBytes();
+        if (selected_bytes > output.len) return .{
+            .result = result_not_enough_room,
+            .consumed = input.len,
+            .frames = 1,
+        };
+
+        const source_start = @as(usize, selected.skip) * self.opus_channels;
+        self.writePcm16(pcm[source_start..][0..selected_values], output[0..selected_bytes]);
+        self.commitFrames(selected);
+        self.opus_frames_per_packet = 1;
+        return .{
+            .consumed = input.len,
+            .produced = selected_bytes,
+            .frames = 1,
+        };
+    }
+
+    fn writePcm16(self: *const Decoder, samples: []const i16, output: []u8) void {
+        switch (self.encoding) {
+            .signed16 => @memcpy(output, std.mem.sliceAsBytes(samples)),
+            .signed32 => for (samples, 0..) |sample, index| {
+                const expanded: i32 = @as(i32, sample) * 65_536;
+                std.mem.writeInt(i32, output[index * 4 ..][0..4], expanded, .little);
+            },
+            .float32 => for (samples, 0..) |sample, index| {
+                const value = @as(f32, @floatFromInt(sample)) / 32768.0;
+                std.mem.writeInt(u32, output[index * 4 ..][0..4], @bitCast(value), .little);
+            },
+        }
+    }
+
     fn writeMp3Samples(self: *const Decoder, samples: []const c.mp3d_sample_t, output: []u8) void {
         switch (self.encoding) {
             .signed16 => @memcpy(output, std.mem.sliceAsBytes(samples)),
@@ -514,4 +826,57 @@ test "mono MP3 accepts an exact one-frame output buffer" {
     try std.testing.expectEqual(@as(i32, 0), report.result);
     try std.testing.expectEqual(@as(usize, output.len), report.produced);
     try std.testing.expectEqual(@as(u32, 1), decoder.codecInfo().channels);
+}
+
+test "unknown AJM codecs stay unsupported" {
+    try std.testing.expectError(Error.UnsupportedCodec, Decoder.create(3, 1));
+    try std.testing.expectError(Error.UnsupportedCodec, Decoder.create(14, 1));
+    try std.testing.expect(isSupported(codec_m4aac));
+    try std.testing.expect(isSupported(codec_opus));
+}
+
+test "MPEG-4 AAC ADTS decodes a real stereo frame" {
+    const adts = [_]u8{
+        0xff, 0xf1, 0x4c, 0x80, 0x03, 0xdf, 0xfc, 0xde, 0x02, 0x00, 0x4c, 0x61, 0x76, 0x63, 0x36,
+        0x32, 0x2e, 0x32, 0x38, 0x2e, 0x31, 0x30, 0x31, 0x00, 0x42, 0x20, 0x08, 0xc1, 0x18, 0x38,
+        0xff, 0xf1, 0x4c, 0x80, 0x01, 0xbf, 0xfc, 0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c, 0xff, 0xf1,
+        0x4c, 0x80, 0x01, 0xbf, 0xfc, 0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c, 0xff, 0xf1, 0x4c, 0x80,
+        0x01, 0xbf, 0xfc, 0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c,
+    };
+    var parameters: [8]u8 = undefined;
+    std.mem.writeInt(u32, parameters[0..4], aac_config_adts, .little);
+    std.mem.writeInt(u32, parameters[4..8], 3, .little);
+
+    var decoder = try Decoder.create(codec_m4aac, 2 | (0 << 7));
+    defer decoder.deinit();
+    try std.testing.expectEqual(@as(i32, 0), decoder.initialize(&parameters).result);
+
+    var output: [8 * 1024]u8 = undefined;
+    const report = decoder.decode(&adts, &output);
+    try std.testing.expectEqual(@as(i32, 0), report.result);
+    try std.testing.expect(report.consumed != 0);
+    try std.testing.expect(report.produced != 0);
+    try std.testing.expectEqual(@as(u32, 2), decoder.codecInfo().channels);
+    try std.testing.expectEqual(@as(u32, 48_000), decoder.codecInfo().sample_rate);
+}
+
+test "Opus initialize and decode a concealed packet" {
+    var parameters: [12]u8 = undefined;
+    std.mem.writeInt(u32, parameters[0..4], 2, .little);
+    std.mem.writeInt(u32, parameters[4..8], 48_000, .little);
+    std.mem.writeInt(u32, parameters[8..12], 0, .little);
+
+    var decoder = try Decoder.create(codec_opus, 2);
+    defer decoder.deinit();
+    try std.testing.expectEqual(@as(i32, 0), decoder.initialize(&parameters).result);
+
+    const packet = [_]u8{0xfc};
+    var output: [960 * 2 * 2]u8 = undefined;
+    const report = decoder.decode(&packet, &output);
+    try std.testing.expectEqual(@as(i32, 0), report.result);
+    try std.testing.expectEqual(@as(usize, packet.len), report.consumed);
+    try std.testing.expectEqual(@as(usize, output.len), report.produced);
+    try std.testing.expectEqual(@as(u32, 1), report.frames);
+    try std.testing.expectEqual(@as(u32, 2), decoder.codecInfo().channels);
+    try std.testing.expectEqual(@as(u32, 48_000), decoder.codecInfo().sample_rate);
 }
