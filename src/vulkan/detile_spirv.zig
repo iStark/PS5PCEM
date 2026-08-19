@@ -7,17 +7,20 @@ const std = @import("std");
 
 const storage_uniform: u32 = 2;
 const storage_input: u32 = 1;
-const storage_push: u32 = 8;
+const storage_push: u32 = 9;
 const storage_function: u32 = 7;
 const param_members: u32 = 21;
 
 const Builder = struct {
     gpa: std.mem.Allocator,
     words: std.ArrayList(u32) = .empty,
+    function_words: std.ArrayList(u32) = .empty,
+    emitting_function: bool = false,
     next_id: u32 = 1,
 
     fn deinit(self: *Builder) void {
         self.words.deinit(self.gpa);
+        self.function_words.deinit(self.gpa);
     }
 
     fn id(self: *Builder) u32 {
@@ -28,8 +31,9 @@ const Builder = struct {
 
     fn emit(self: *Builder, opcode: u16, operands: []const u32) std.mem.Allocator.Error!void {
         const count: u16 = @intCast(1 + operands.len);
-        try self.words.append(self.gpa, @as(u32, count) << 16 | opcode);
-        try self.words.appendSlice(self.gpa, operands);
+        const destination = if (self.emitting_function) &self.function_words else &self.words;
+        try destination.append(self.gpa, @as(u32, count) << 16 | opcode);
+        try destination.appendSlice(self.gpa, operands);
     }
 
     fn emitString(self: *Builder, opcode: u16, prefix: []const u32, text: []const u8) std.mem.Allocator.Error!void {
@@ -64,6 +68,9 @@ const Builder = struct {
 
     fn constant(self: *Builder, ty: u32, value: u32) std.mem.Allocator.Error!u32 {
         const result = self.id();
+        const was_emitting_function = self.emitting_function;
+        self.emitting_function = false;
+        defer self.emitting_function = was_emitting_function;
         try self.emit(43, &.{ ty, result, value });
         return result;
     }
@@ -90,41 +97,30 @@ pub fn build(gpa: std.mem.Allocator) std.mem.Allocator.Error![]u32 {
     try b.emit(17, &.{1}); // Capability Shader
     try b.emit(14, &.{ 0, 1 }); // Logical GLSL450
 
-    const void_ty = try b.tyVoid();
-    const bool_ty = try b.tyBool();
-    const uint_ty = try b.tyInt();
+    // Allocate every module-scope ID up front so instructions can be emitted
+    // in SPIR-V's required logical layout order.
+    const void_ty = b.id();
+    const bool_ty = b.id();
+    const uint_ty = b.id();
     const uvec3_ty = b.id();
-    try b.emit(23, &.{ uvec3_ty, uint_ty, 3 });
     const runtime_ty = b.id();
-    try b.emit(29, &.{ runtime_ty, uint_ty });
     const ssbo_ty = b.id();
-    try b.emit(30, &.{ ssbo_ty, runtime_ty });
     const params_ty = b.id();
-    var members: [param_members + 1]u32 = undefined;
-    members[0] = params_ty;
-    for (members[1..]) |*slot| slot.* = uint_ty;
-    try b.emit(30, &members);
-    const ptr_fn_uint = b.id();
-    try b.emit(32, &.{ ptr_fn_uint, storage_function, uint_ty });
+    const ptr_push_uint = b.id();
     const ptr_uni_uint = b.id();
-    try b.emit(32, &.{ ptr_uni_uint, storage_uniform, uint_ty });
     const ptr_ssbo = b.id();
-    try b.emit(32, &.{ ptr_ssbo, storage_uniform, ssbo_ty });
     const ptr_params = b.id();
-    try b.emit(32, &.{ ptr_params, storage_push, params_ty });
     const ptr_uvec3 = b.id();
-    try b.emit(32, &.{ ptr_uvec3, storage_input, uvec3_ty });
     const fn_ty = b.id();
-    try b.emit(33, &.{ fn_ty, void_ty });
-
     const src_var = b.id();
     const dst_var = b.id();
     const params_var = b.id();
     const gid_var = b.id();
     const main_fn = b.id();
 
-    // Names / decorations have to appear before types in a spec-perfect module,
-    // but Vulkan loaders accept decorations after types as long as IDs exist.
+    try b.emit(15, &.{ 5, main_fn, 0x6e69616d, 0, gid_var }); // EntryPoint "main"
+    try b.emit(16, &.{ main_fn, 17, 8, 8, 1 }); // LocalSize 8 8 1
+
     try b.emit(71, &.{ runtime_ty, 6, 4 }); // ArrayStride 4
     try b.emit(71, &.{ ssbo_ty, 3 }); // BufferBlock
     try b.emit(72, &.{ ssbo_ty, 0, 35, 0 }); // member Offset 0
@@ -140,8 +136,22 @@ pub fn build(gpa: std.mem.Allocator) std.mem.Allocator.Error![]u32 {
     }
     try b.emit(71, &.{ gid_var, 11, 28 }); // BuiltIn GlobalInvocationId
 
-    try b.emit(15, &.{ 5, main_fn, 0x6e69616d, 0, gid_var }); // EntryPoint "main"
-    try b.emit(16, &.{ main_fn, 17, 8, 8, 1 }); // LocalSize 8 8 1
+    try b.emit(19, &.{void_ty});
+    try b.emit(20, &.{bool_ty});
+    try b.emit(21, &.{ uint_ty, 32, 0 });
+    try b.emit(23, &.{ uvec3_ty, uint_ty, 3 });
+    try b.emit(29, &.{ runtime_ty, uint_ty });
+    try b.emit(30, &.{ ssbo_ty, runtime_ty });
+    var members: [param_members + 1]u32 = undefined;
+    members[0] = params_ty;
+    for (members[1..]) |*slot| slot.* = uint_ty;
+    try b.emit(30, &members);
+    try b.emit(32, &.{ ptr_push_uint, storage_push, uint_ty });
+    try b.emit(32, &.{ ptr_uni_uint, storage_uniform, uint_ty });
+    try b.emit(32, &.{ ptr_ssbo, storage_uniform, ssbo_ty });
+    try b.emit(32, &.{ ptr_params, storage_push, params_ty });
+    try b.emit(32, &.{ ptr_uvec3, storage_input, uvec3_ty });
+    try b.emit(33, &.{ fn_ty, void_ty });
 
     try b.emit(59, &.{ ptr_ssbo, src_var, storage_uniform });
     try b.emit(59, &.{ ptr_ssbo, dst_var, storage_uniform });
@@ -151,11 +161,10 @@ pub fn build(gpa: std.mem.Allocator) std.mem.Allocator.Error![]u32 {
     const c0 = try b.constant(uint_ty, 0);
     const c1 = try b.constant(uint_ty, 1);
     const c2 = try b.constant(uint_ty, 2);
-    const c3 = try b.constant(uint_ty, 3);
     const c4 = try b.constant(uint_ty, 4);
     const c8 = try b.constant(uint_ty, 8);
-    const c16 = try b.constant(uint_ty, 16);
 
+    b.emitting_function = true;
     try b.emit(54, &.{ void_ty, main_fn, 0, fn_ty });
     const entry = b.id();
     try b.emit(248, &.{entry});
@@ -169,12 +178,12 @@ pub fn build(gpa: std.mem.Allocator) std.mem.Allocator.Error![]u32 {
     try b.emit(81, &.{ uint_ty, y, gid, 1 });
     try b.emit(81, &.{ uint_ty, z, gid, 2 });
 
-    const width = try loadParam(&b, uint_ty, ptr_fn_uint, params_var, 4);
-    const height = try loadParam(&b, uint_ty, ptr_fn_uint, params_var, 5);
-    const depth = try loadParam(&b, uint_ty, ptr_fn_uint, params_var, 6);
-    const oob_x = try b.bin(177, bool_ty, x, width);
-    const oob_y = try b.bin(177, bool_ty, y, height);
-    const oob_z = try b.bin(177, bool_ty, z, depth);
+    const width = try loadParam(&b, uint_ty, ptr_push_uint, params_var, 4);
+    const height = try loadParam(&b, uint_ty, ptr_push_uint, params_var, 5);
+    const depth = try loadParam(&b, uint_ty, ptr_push_uint, params_var, 6);
+    const oob_x = try b.bin(174, bool_ty, x, width); // UGreaterThanEqual
+    const oob_y = try b.bin(174, bool_ty, y, height);
+    const oob_z = try b.bin(174, bool_ty, z, depth);
     const oob_xy = try b.bin(166, bool_ty, oob_x, oob_y);
     const oob = try b.bin(166, bool_ty, oob_xy, oob_z);
     const merge = b.id();
@@ -183,19 +192,19 @@ pub fn build(gpa: std.mem.Allocator) std.mem.Allocator.Error![]u32 {
     try b.emit(250, &.{ oob, merge, body });
     try b.emit(248, &.{body});
 
-    const src_lo = try loadParam(&b, uint_ty, ptr_fn_uint, params_var, 0);
-    const dst_lo = try loadParam(&b, uint_ty, ptr_fn_uint, params_var, 2);
-    const flags = try loadParam(&b, uint_ty, ptr_fn_uint, params_var, 20);
+    const src_lo = try loadParam(&b, uint_ty, ptr_push_uint, params_var, 0);
+    const dst_lo = try loadParam(&b, uint_ty, ptr_push_uint, params_var, 2);
+    const flags = try loadParam(&b, uint_ty, ptr_push_uint, params_var, 20);
     const bpp_log = try b.bin(199, uint_ty, try b.bin(194, uint_ty, flags, c4), try b.constant(uint_ty, 0xf));
     const bpp = try b.bin(196, uint_ty, c1, bpp_log);
     const family = try b.bin(199, uint_ty, try b.bin(194, uint_ty, flags, c8), try b.constant(uint_ty, 0xff));
-    const tail_x = try loadParam(&b, uint_ty, ptr_fn_uint, params_var, 18);
-    const tail_y = try loadParam(&b, uint_ty, ptr_fn_uint, params_var, 19);
-    const block_w = try loadParam(&b, uint_ty, ptr_fn_uint, params_var, 10);
-    const block_h = try loadParam(&b, uint_ty, ptr_fn_uint, params_var, 11);
-    const block_bytes = try loadParam(&b, uint_ty, ptr_fn_uint, params_var, 13);
-    const blocks_per_row = try loadParam(&b, uint_ty, ptr_fn_uint, params_var, 14);
-    const source_slice = try loadParam(&b, uint_ty, ptr_fn_uint, params_var, 16);
+    const tail_x = try loadParam(&b, uint_ty, ptr_push_uint, params_var, 18);
+    const tail_y = try loadParam(&b, uint_ty, ptr_push_uint, params_var, 19);
+    const block_w = try loadParam(&b, uint_ty, ptr_push_uint, params_var, 10);
+    const block_h = try loadParam(&b, uint_ty, ptr_push_uint, params_var, 11);
+    const block_bytes = try loadParam(&b, uint_ty, ptr_push_uint, params_var, 13);
+    const blocks_per_row = try loadParam(&b, uint_ty, ptr_push_uint, params_var, 14);
+    const source_slice = try loadParam(&b, uint_ty, ptr_push_uint, params_var, 16);
     const sx = try b.bin(128, uint_ty, x, tail_x);
     const sy = try b.bin(128, uint_ty, y, tail_y);
     const block_x = try b.bin(134, uint_ty, sx, block_w);
@@ -223,13 +232,20 @@ pub fn build(gpa: std.mem.Allocator) std.mem.Allocator.Error![]u32 {
     const src_word = try b.bin(134, uint_ty, src_byte, c4);
     const dst_word = try b.bin(134, uint_ty, dest_byte, c4);
 
-    try copyWords(&b, uint_ty, bool_ty, ptr_uni_uint, src_var, dst_var, src_word, dst_word, bpp, c0, c1, c2, c3, c8, c16);
+    // computeDetileSupported currently admits only four-byte elements. Keep
+    // the shader to one dword per invocation so the last texel cannot read or
+    // write beyond either storage buffer.
+    try storeLoaded(&b, uint_ty, ptr_uni_uint, src_var, dst_var, src_word, dst_word, c0);
 
     try b.emit(249, &.{merge});
     try b.emit(248, &.{merge});
     try b.emit(253, &.{});
     try b.emit(56, &.{});
 
+    b.emitting_function = false;
+    try b.words.appendSlice(gpa, b.function_words.items);
+    b.function_words.deinit(gpa);
+    b.function_words = .empty;
     b.words.items[3] = b.next_id;
     return try b.words.toOwnedSlice(gpa);
 }
@@ -241,31 +257,6 @@ fn loadParam(b: *Builder, uint_ty: u32, ptr_ty: u32, params: u32, index: u32) st
     const value = b.id();
     try b.emit(61, &.{ uint_ty, value, ptr });
     return value;
-}
-
-fn copyWords(
-    b: *Builder,
-    uint_ty: u32,
-    bool_ty: u32,
-    ptr_ty: u32,
-    src_var: u32,
-    dst_var: u32,
-    src_word: u32,
-    dst_word: u32,
-    bpp: u32,
-    c0: u32,
-    c1: u32,
-    c2: u32,
-    c3: u32,
-    c8: u32,
-    c16: u32,
-) std.mem.Allocator.Error!void {
-    try storeLoaded(b, uint_ty, ptr_ty, src_var, dst_var, src_word, dst_word, c0);
-    const ge8 = try b.bin(177, bool_ty, bpp, c8);
-    try storeIf(b, uint_ty, bool_ty, ptr_ty, src_var, dst_var, src_word, dst_word, c1, ge8, c0);
-    const ge16 = try b.bin(177, bool_ty, bpp, c16);
-    try storeIf(b, uint_ty, bool_ty, ptr_ty, src_var, dst_var, src_word, dst_word, c2, ge16, c0);
-    try storeIf(b, uint_ty, bool_ty, ptr_ty, src_var, dst_var, src_word, dst_word, c3, ge16, c0);
 }
 
 fn storeLoaded(
@@ -290,34 +281,6 @@ fn storeLoaded(
     const dst_ptr = b.id();
     try b.emit(65, &.{ ptr_ty, dst_ptr, dst_var, c0, dst_index });
     try b.emit(62, &.{ dst_ptr, value });
-}
-
-fn storeIf(
-    b: *Builder,
-    uint_ty: u32,
-    bool_ty: u32,
-    ptr_ty: u32,
-    src_var: u32,
-    dst_var: u32,
-    src_word: u32,
-    dst_word: u32,
-    extra: u32,
-    cond: u32,
-    c0: u32,
-) std.mem.Allocator.Error!void {
-    _ = bool_ty;
-    const src_index = try b.bin(128, uint_ty, src_word, extra);
-    const dst_index = try b.bin(128, uint_ty, dst_word, extra);
-    const src_ptr = b.id();
-    try b.emit(65, &.{ ptr_ty, src_ptr, src_var, c0, src_index });
-    const src_val = b.id();
-    try b.emit(61, &.{ uint_ty, src_val, src_ptr });
-    const dst_ptr = b.id();
-    try b.emit(65, &.{ ptr_ty, dst_ptr, dst_var, c0, dst_index });
-    const dst_val = b.id();
-    try b.emit(61, &.{ uint_ty, dst_val, dst_ptr });
-    const picked = try b.sel(uint_ty, cond, src_val, dst_val);
-    try b.emit(62, &.{ dst_ptr, picked });
 }
 
 fn xor4k4(b: *Builder, uint_ty: u32, x: u32, y: u32) std.mem.Allocator.Error!u32 {
@@ -355,10 +318,57 @@ fn xorShiftAnd(b: *Builder, uint_ty: u32, acc: u32, value: u32, shift: u32, mask
     return b.bin(198, uint_ty, acc, try shiftAnd(b, uint_ty, value, shift, mask));
 }
 
-test "detile SPIR-V is a well-formed compute module" {
+test "detile SPIR-V keeps Vulkan storage classes and logical layout" {
     const words = try build(std.testing.allocator);
     defer std.testing.allocator.free(words);
     try std.testing.expect(words.len > 20);
     try std.testing.expectEqual(@as(u32, 0x0723_0203), words[0]);
     try std.testing.expect(words[3] > 8);
+
+    var offset: usize = 5;
+    var in_function = false;
+    var saw_entry_point = false;
+    var saw_annotations = false;
+    var saw_types = false;
+    var saw_push_pointer = false;
+    var saw_push_variable = false;
+    var bounds_checks: u32 = 0;
+    while (offset < words.len) {
+        const instruction = words[offset];
+        const word_count: usize = @intCast(instruction >> 16);
+        const opcode: u16 = @truncate(instruction);
+        try std.testing.expect(word_count != 0 and offset + word_count <= words.len);
+        switch (opcode) {
+            15 => { // OpEntryPoint
+                try std.testing.expect(!saw_annotations and !saw_types);
+                saw_entry_point = true;
+            },
+            71, 72 => { // OpDecorate / OpMemberDecorate
+                try std.testing.expect(saw_entry_point and !saw_types and !in_function);
+                saw_annotations = true;
+            },
+            19, 20, 21, 23, 29, 30, 32, 33 => { // Type declarations
+                try std.testing.expect(saw_annotations and !in_function);
+                saw_types = true;
+                if (opcode == 32 and words[offset + 2] == storage_push) saw_push_pointer = true;
+            },
+            43 => try std.testing.expect(!in_function), // OpConstant
+            54 => { // OpFunction
+                try std.testing.expect(saw_types and !in_function);
+                in_function = true;
+            },
+            56 => in_function = false, // OpFunctionEnd
+            59 => { // OpVariable
+                if (!in_function and words[offset + 3] == storage_push) saw_push_variable = true;
+            },
+            174 => bounds_checks += 1, // OpUGreaterThanEqual
+            177 => return error.SignedBoundsCheck,
+            else => {},
+        }
+        offset += word_count;
+    }
+    try std.testing.expectEqual(words.len, offset);
+    try std.testing.expect(!in_function);
+    try std.testing.expect(saw_push_pointer and saw_push_variable);
+    try std.testing.expectEqual(@as(u32, 3), bounds_checks);
 }

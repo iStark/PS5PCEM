@@ -1522,7 +1522,7 @@ const SampledViewPlan = struct {
         };
     }
 
-    fn view(self: SampledViewPlan, level_index: u8) anyerror!gpu.TextureSubresourceLayout {
+    fn view(self: SampledViewPlan, level_index: u8) gpu.tiling.Error!gpu.TextureSubresourceLayout {
         return self.texture.subresource(
             self.base_level + level_index,
             self.first_layer,
@@ -1530,7 +1530,7 @@ const SampledViewPlan = struct {
         );
     }
 
-    fn stagingBytes(self: SampledViewPlan) anyerror!u64 {
+    fn stagingBytes(self: SampledViewPlan) gpu.tiling.Error!u64 {
         var total: u64 = 0;
         var index: u8 = 0;
         while (index < self.level_count) : (index += 1) {
@@ -5833,7 +5833,7 @@ pub const Renderer = struct {
             .{ .stage = vk.shader_stage_fragment_bit, .module = fragment, .name = "main" },
         };
         if (geometry == 0) stage_storage[1] = stage_storage[2];
-        const stages = stage_storage[0 .. if (geometry == 0) 2 else 3];
+        const stages = stage_storage[0..if (geometry == 0) 2 else 3];
         const vertex_input = vk.PipelineVertexInputStateCreateInfo{};
         const input_assembly = vk.PipelineInputAssemblyStateCreateInfo{
             .topology = pipeline_state.topology,
@@ -11915,7 +11915,7 @@ pub const Renderer = struct {
         plan: SampledViewPlan,
         tiled: []const u8,
         linear_bytes: usize,
-    ) (Error || std.mem.Allocator.Error)!?OwnedBuffer {
+    ) (Error || std.mem.Allocator.Error || gpu.tiling.Error)!?OwnedBuffer {
         if (self.detile_pipeline == 0 or tiled.len == 0 or linear_bytes < 32 * 1024) return null;
         var params_ok = true;
         var level_index: u8 = 0;
