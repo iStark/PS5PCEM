@@ -50,6 +50,7 @@ pub const libs = struct {
     pub const pad = @import("libs/pad.zig");
     pub const sysmodule = @import("libs/sysmodule.zig");
     pub const system_service = @import("libs/system_service.zig");
+    pub const ult = @import("libs/ult.zig");
     pub const user_service = @import("libs/user_service.zig");
 };
 
@@ -89,6 +90,7 @@ pub fn registerAll(db: *Database, gpa: @import("std").mem.Allocator) symbols.Err
     try libs.pad.register(db, gpa);
     try libs.sysmodule.register(db, gpa);
     try libs.system_service.register(db, gpa);
+    try libs.ult.register(db, gpa);
     try libs.user_service.register(db, gpa);
 }
 
@@ -132,5 +134,6 @@ test {
     _ = libs.pad;
     _ = libs.sysmodule;
     _ = libs.system_service;
+    _ = libs.ult;
     _ = libs.user_service;
 }

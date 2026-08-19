@@ -1714,6 +1714,14 @@ stack required for safe native switching. `sceFiberGetSelf`, finalization,
 cross-thread ownership checks, and runtime reset are implemented; this backend
 is intentionally limited to the Windows native-execution target.
 
+**`libSceUlt` — user-level threads** ([src/hle/libs/ult.zig](src/hle/libs/ult.zig))
+
+`sceUltInitialize` and `sceUltFinalize` succeed so a title's job system can
+start. Runtimes, waiting-queue and queue-data pools, mutexes, semaphores, and
+queues keep host-side state keyed by the firmware objects the title allocated.
+ULTs are started through the existing pthread path. Work-area size queries
+return the aligned byte counts those creates expect.
+
 Kernel user-edge event queues retain registrations and pending event payloads,
 and their waits use the same sequence-aware dispatcher contract as pthread
 synchronization. VideoOut filter `-13` and graphics filter `-14` use that same
@@ -1768,7 +1776,8 @@ RGBA images into checked guest RGBA/BGRA buffers, including scanline filters
 and palette transparency. Adam7 input is recognized but not decoded yet.
 
 AudioOut, AudioIn, and AudioOut2 expose paced ports, queues, speaker metadata,
-and atomic multi-port `sceAudioOutOutputs` batches. NGS2 supplies stable
+`sceAudioOut2PortGetState` connected-primary reports, and atomic multi-port
+`sceAudioOutOutputs` batches. NGS2 supplies stable
 system/rack/voice handles with checked parent lifetimes, parses ordinary
 RIFF/WAVE geometry, walks bounded linked voice-parameter lists, applies
 play/pause/resume/stop/kill events on render, reports exact 32-bit state flags,

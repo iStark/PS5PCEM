@@ -5,7 +5,8 @@
 //!
 //! AudioOut and AudioIn preserve port lifetimes, validate the common ABI, and
 //! pace producer/consumer calls without touching a host sound device. AudioOut2
-//! does the same for its context/port queue model. AJM executes ATRAC9 and MP3
+//! does the same for its context/port queue model and reports a connected
+//! primary port from `sceAudioOut2PortGetState`. AJM executes ATRAC9 and MP3
 //! decode jobs through stateful host codec instances.
 
 const std = @import("std");
@@ -585,6 +586,7 @@ const AudioObject = struct {
     parent: u64 = 0,
     queue_depth: u32 = 0,
     grains: u32 = 0,
+    data_format: u32 = 0,
 };
 
 const maximum_audio_objects = 512;
@@ -596,7 +598,12 @@ fn allocateAudioObject(kind: AudioObjectKind, parent: u64, queue_depth: u32, gra
     defer audio_object_mutex.unlock();
     for (&audio_objects, 0..) |*object, index| {
         if (object.kind != .none) continue;
-        object.* = .{ .kind = kind, .parent = parent, .queue_depth = queue_depth, .grains = grains };
+        object.* = .{
+            .kind = kind,
+            .parent = parent,
+            .queue_depth = queue_depth,
+            .grains = grains,
+        };
         return index + 1;
     }
     return null;
@@ -684,9 +691,36 @@ fn audioOut2ContextGetQueueLevel(context: u64, queue_level: ?*u32, available: ?*
 }
 
 fn audioOut2PortCreate(context: u64, parameters: ?*const AudioOut2PortParam, port: ?*u64) callconv(abi.guest) i32 {
-    if (audioObject(context, .context) == null or parameters == null or port == null) return audio_out2_error_invalid_parameter;
+    const input = parameters orelse return audio_out2_error_invalid_parameter;
+    if (audioObject(context, .context) == null or port == null) return audio_out2_error_invalid_parameter;
     const handle = allocateAudioObject(.port, context, 0, 0) orelse return audio_out2_error_port_full;
+    audio_object_mutex.lock();
+    audio_objects[@intCast(handle - 1)].data_format = input.data_format;
+    audio_object_mutex.unlock();
     port.?.* = handle;
+    return errno.ok;
+}
+
+fn audioOut2PortChannels(data_format: u32) u8 {
+    const encoded: u8 = @truncate(data_format >> 8);
+    if (encoded == 0) return 2;
+    return @min(encoded, 16);
+}
+
+/// Fixed 0x20-byte connected-primary state. Titles allocate that header next
+/// to other AudioOut2 parameter blocks; writing past it overwrites them.
+const audio_out2_port_state_bytes: usize = 0x20;
+
+fn audioOut2PortGetState(port: u64, state: ?*[audio_out2_port_state_bytes]u8) callconv(abi.guest) i32 {
+    const output = state orelse return audio_out2_error_invalid_parameter;
+    @memset(output, 0);
+    var channels: u8 = 2;
+    if (audioObject(port, .port)) |object| {
+        channels = audioOut2PortChannels(object.data_format);
+    }
+    std.mem.writeInt(u16, output[0x00..0x02], 1, .little);
+    output[0x02] = channels;
+    std.mem.writeInt(i16, output[0x04..0x06], -1, .little);
     return errno.ok;
 }
 
@@ -729,6 +763,7 @@ const audio_out2_exports = [_]symbols.Export{
     .{ .name = "sceAudioOut2ContextPush", .function = trace.wrap("sceAudioOut2ContextPush", &audioOut2ContextPush), .expect_id = "aII9h5nli9U" },
     .{ .name = "sceAudioOut2ContextGetQueueLevel", .function = trace.wrap("sceAudioOut2ContextGetQueueLevel", &audioOut2ContextGetQueueLevel), .expect_id = "R7d0F1g2qsU" },
     .{ .name = "sceAudioOut2PortCreate", .function = trace.wrap("sceAudioOut2PortCreate", &audioOut2PortCreate), .expect_id = "JK2wamZPzwM" },
+    .{ .name = "sceAudioOut2PortGetState", .function = trace.wrap("sceAudioOut2PortGetState", &audioOut2PortGetState), .expect_id = "gatEUKG+Ea4" },
     .{ .name = "sceAudioOut2PortDestroy", .function = trace.wrap("sceAudioOut2PortDestroy", &audioOut2PortDestroy), .expect_id = "cd+Rtw+D1x8" },
     .{ .name = "sceAudioOut2PortSetAttributes", .function = trace.wrap("sceAudioOut2PortSetAttributes", &audioOut2PortSetAttributes), .expect_id = "8XTArSPyWHk" },
     .{ .name = "sceAudioOut2UserCreate", .function = trace.wrap("sceAudioOut2UserCreate", &audioOut2UserCreate), .expect_id = "xywYcRB7nbQ" },
@@ -2148,6 +2183,24 @@ test "AudioOut2 context defaults and handles are deterministic" {
     var available: u32 = 0;
     try std.testing.expectEqual(errno.ok, audioOut2ContextGetQueueLevel(context, null, &available));
     try std.testing.expectEqual(@as(u32, 4), available);
+    var port: u64 = 0;
+    const port_parameters = AudioOut2PortParam{
+        .port_type = 0,
+        .padding = 0,
+        .data_format = 8 << 8,
+        .sampling_frequency = 48_000,
+        .flags = 0,
+        .user_handle = 0,
+        .reserved = [_]u32{0} ** 10,
+    };
+    try std.testing.expectEqual(errno.ok, audioOut2PortCreate(context, &port_parameters, &port));
+    var state: [audio_out2_port_state_bytes]u8 = @splat(0xab);
+    try std.testing.expectEqual(errno.ok, audioOut2PortGetState(port, &state));
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, state[0x00..0x02], .little));
+    try std.testing.expectEqual(@as(u8, 8), state[0x02]);
+    try std.testing.expectEqual(@as(i16, -1), std.mem.readInt(i16, state[0x04..0x06], .little));
+    try std.testing.expectEqual(@as(u8, 0), state[0x10]);
+    try std.testing.expectEqual(audio_out2_error_invalid_parameter, audioOut2PortGetState(port, null));
 }
 
 test "NGS2 derives one bounded float32 render grain from all buses" {
@@ -2292,5 +2345,6 @@ test "audio libraries register the title import surface" {
     try register(&db, std.testing.allocator);
     try std.testing.expect(db.findById("QOQtbeDqsT4", .function) != null);
     try std.testing.expect(db.findById("aII9h5nli9U", .function) != null);
+    try std.testing.expect(db.findById("gatEUKG+Ea4", .function) != null);
     try std.testing.expect(db.findById("39WxhR-ePew", .function) != null);
 }

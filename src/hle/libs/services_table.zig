@@ -99,10 +99,6 @@ pub const ampr_exports = [_]symbols.Export{
     .{ .name = "sceAmprMeasureCommandSizePopMarker", .function = trace.wrap("sceAmprMeasureCommandSizePopMarker", &services.absent), .expect_id = "pbnNnahE8vk" },
 };
 
-pub const audioout2_exports = [_]symbols.Export{
-    .{ .name = "sceAudioOut2PortGetState", .function = trace.wrap("sceAudioOut2PortGetState", &services.absent), .expect_id = "gatEUKG+Ea4" },
-};
-
 pub const audiodec_exports = [_]symbols.Export{
     // Codec type 1 (ATRAC9) is optional for this title's playback path. Keep
     // the library lifecycle coherent so it can create a decoder when audio is
@@ -705,7 +701,6 @@ pub const all = [_]Table{
     .{ .library = "libSceAjm", .module = "libSceAjm", .exports = &ajm_exports },
     .{ .library = "libSceAmpr", .module = "libSceAmpr", .exports = &ampr_exports },
     .{ .library = "libSceAudiodec", .module = "libSceAudiodec", .exports = &audiodec_exports },
-    .{ .library = "libSceAudioOut2", .module = "libSceAudioOut", .exports = &audioout2_exports },
     .{ .library = "libSceAvPlayer", .module = "libSceAvPlayer", .exports = &avplayer_exports },
     .{ .library = "libSceCamera2", .module = "libSceCamera", .exports = &camera2_exports },
     .{ .library = "libSceCoredump", .module = "libkernel", .exports = &coredump_exports },
