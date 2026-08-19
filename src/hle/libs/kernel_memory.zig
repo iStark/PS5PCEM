@@ -354,6 +354,35 @@ pub fn deinit() void {
     guest_address_space = null;
 }
 
+/// Direct-memory helpers for AMPR AMM command execution. They reuse the guest
+/// entry points so pool accounting and AddressSpace placement stay in one place.
+pub fn hostAllocateDirectMemory(
+    search_start: u64,
+    search_end: u64,
+    len: u64,
+    alignment: u64,
+    memory_type: i32,
+    out_start: *u64,
+) i32 {
+    return sceKernelAllocateDirectMemory(
+        search_start,
+        search_end,
+        len,
+        alignment,
+        memory_type,
+        out_start,
+    );
+}
+
+pub fn hostMapDirectMemoryFixed(va: u64, len: u64, protection_bits: i32, physical: u64) i32 {
+    var address = va;
+    return sceKernelMapDirectMemory(&address, len, protection_bits, map_fixed, physical, page_size);
+}
+
+pub fn hostUnmap(va: u64, len: u64) i32 {
+    return sceKernelMunmap(va, len);
+}
+
 // ---------------------------------------------------------------------------
 // Guest entry points
 // ---------------------------------------------------------------------------

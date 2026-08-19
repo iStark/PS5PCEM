@@ -27,6 +27,7 @@ const gpu = @import("gpu");
 const apr = @import("../apr.zig");
 const filesystem = @import("../filesystem.zig");
 const video_out = @import("../video_out.zig");
+const guest_memory = @import("memory");
 
 const invalid_argument = errno.KernelError.einval.raw();
 const ampr_command_buffer_header_size: u64 = 0x28;
@@ -42,7 +43,8 @@ fn aprError(err: apr.Error) i32 {
         error.FileNotFound, error.UnknownFile => errno.KernelError.enoent.raw(),
         error.FileTableFull, error.CommandBufferTableFull, error.SubmissionTableFull => errno.KernelError.enomem.raw(),
         error.IoFailed => errno.KernelError.eio.raw(),
-        error.InvalidPath, error.InvalidCommandBuffer, error.TooManyCommands, error.InvalidRead, error.UnknownSubmission => errno.KernelError.einval.raw(),
+        error.InvalidPath, error.InvalidCommandBuffer, error.TooManyCommands, error.InvalidRead, error.UnknownSubmission, error.MappingFailed => errno.KernelError.einval.raw(),
+        error.OutOfDirectMemory => errno.KernelError.eagain.raw(),
     };
 }
 
@@ -622,6 +624,278 @@ fn amprAprCommandBufferMapEnd(address: u64) callconv(abi.guest) i32 {
     if (status != errno.ok) return status;
     apr.setMapActive(address, false) catch |err| return aprError(err);
     return errno.ok;
+}
+
+const amm_map_record_size: u32 = 0x20;
+const amm_map_direct_record_size: u32 = 0x30;
+const amm_unmap_record_size: u32 = 0x20;
+const amm_usage_direct: i32 = 0;
+const amm_usage_auto: i32 = 1;
+const amm_va_start: u64 = 0x10_0000_0000;
+const amm_va_size: u64 = 0x10_0000_0000;
+const amm_prot_cpu_read: i32 = 0x01;
+const amm_prot_cpu_write: i32 = 0x02;
+const amm_prot_cpu_exec: i32 = 0x04;
+const amm_prot_gpu_read: i32 = 0x10;
+const amm_prot_gpu_write: i32 = 0x20;
+const amm_prot_ampr_read: i32 = 0x40;
+const amm_prot_ampr_write: i32 = 0x80;
+const amm_prot_acp_read: i32 = 0x100;
+const amm_prot_acp_write: i32 = 0x200;
+
+const AmmUsageStats = extern struct {
+    size_in_bytes: u64 = 0,
+    num_page_table_pool_entries: u16 = 0,
+    snapshot_allocated_entries: u16 = 0,
+    high_watermark_allocated_entries: u16 = 0,
+    reserved1: u16 = 0,
+    ring_idle_flags: u32 = 0,
+};
+
+comptime {
+    if (@sizeOf(AmmUsageStats) != 0x18) @compileError("AMM usage stats must be 24 bytes");
+}
+
+fn normalizeAmmProtection(prot: i32) i32 {
+    const cpu_gpu = amm_prot_cpu_read | amm_prot_cpu_write | amm_prot_cpu_exec |
+        amm_prot_gpu_read | amm_prot_gpu_write;
+    var bits = prot & cpu_gpu;
+    if (prot & amm_prot_ampr_read != 0) bits |= amm_prot_cpu_read;
+    if (prot & amm_prot_ampr_write != 0) bits |= amm_prot_cpu_read | amm_prot_cpu_write;
+    if (prot & amm_prot_acp_read != 0) bits |= amm_prot_cpu_read;
+    if (prot & amm_prot_acp_write != 0) bits |= amm_prot_cpu_read | amm_prot_cpu_write;
+    return bits;
+}
+
+fn amprAppendAmmMap(address: u64, command: apr.AmmMapCommand, record_size: u32) i32 {
+    const record_address = amprReserveRecord(address, record_size) catch |err| return aprError(err);
+    apr.appendAmmMap(address, command, record_size) catch |err| return aprError(err);
+    amprWriteOpcodeRecord(record_address, record_size, 0);
+    return errno.ok;
+}
+
+fn amprAmmCommandBufferConstructor(address: u64) callconv(abi.guest) i32 {
+    return amprCommandBufferConstructor(address);
+}
+
+fn amprAmmCommandBufferDestructor(address: u64) callconv(abi.guest) void {
+    amprCommandBufferDestructor(address);
+}
+
+fn amprAmmCommandBufferMap(
+    address: u64,
+    va: u64,
+    size: u64,
+    memory_type: i32,
+    prot: i32,
+) callconv(abi.guest) i32 {
+    if (!amprMapArgsValid(va, size)) return errno.KernelError.einval.raw();
+    return amprAppendAmmMap(address, .{
+        .kind = .map_auto,
+        .va = va,
+        .size = size,
+        .memory_type = memory_type,
+        .protection = normalizeAmmProtection(prot),
+    }, amm_map_record_size);
+}
+
+fn amprAmmCommandBufferMapWithGpuMaskId(
+    address: u64,
+    va: u64,
+    size: u64,
+    memory_type: i32,
+    prot: i32,
+    _: u8,
+) callconv(abi.guest) i32 {
+    return amprAmmCommandBufferMap(address, va, size, memory_type, prot);
+}
+
+fn amprAmmCommandBufferMapDirect(
+    address: u64,
+    va: u64,
+    dmem_offset: u64,
+    size: u64,
+    memory_type: i32,
+    prot: i32,
+) callconv(abi.guest) i32 {
+    if (!amprMapArgsValid(va, size) or dmem_offset & (ampr_map_page_size - 1) != 0) {
+        return errno.KernelError.einval.raw();
+    }
+    return amprAppendAmmMap(address, .{
+        .kind = .map_direct,
+        .va = va,
+        .dmem_offset = dmem_offset,
+        .size = size,
+        .memory_type = memory_type,
+        .protection = normalizeAmmProtection(prot),
+    }, amm_map_direct_record_size);
+}
+
+fn amprAmmCommandBufferMapDirectWithGpuMaskId(
+    address: u64,
+    va: u64,
+    dmem_offset: u64,
+    size: u64,
+    memory_type: i32,
+    prot: i32,
+    _: u8,
+) callconv(abi.guest) i32 {
+    return amprAmmCommandBufferMapDirect(address, va, dmem_offset, size, memory_type, prot);
+}
+
+fn amprAmmCommandBufferUnmap(address: u64, va: u64, size: u64) callconv(abi.guest) i32 {
+    if (!amprMapArgsValid(va, size)) return errno.KernelError.einval.raw();
+    return amprAppendAmmMap(address, .{
+        .kind = .unmap,
+        .va = va,
+        .size = size,
+    }, amm_unmap_record_size);
+}
+
+fn amprAmmGiveDirectMemory(
+    search_start: i64,
+    search_end: i64,
+    size: u64,
+    alignment: u64,
+    usage: i32,
+    dmem_offset: ?*i64,
+) callconv(abi.guest) i32 {
+    const output = dmem_offset orelse return errno.KernelError.einval.raw();
+    if (size == 0 or (usage != amm_usage_direct and usage != amm_usage_auto)) {
+        return errno.KernelError.einval.raw();
+    }
+    if (search_start < 0 or search_end < 0) return errno.KernelError.einval.raw();
+    var allocated: u64 = 0;
+    const status = kernel_memory.hostAllocateDirectMemory(
+        @intCast(search_start),
+        @intCast(search_end),
+        size,
+        alignment,
+        0,
+        &allocated,
+    );
+    if (status != errno.ok) return status;
+    output.* = @intCast(allocated);
+    if (usage == amm_usage_auto) {
+        apr.giveAutoPool(allocated, size) catch |err| return aprError(err);
+    }
+    return errno.ok;
+}
+
+fn amprAmmGetVirtualAddressRanges(
+    va_start: ?*u64,
+    va_end: ?*u64,
+    multimap_va_start: ?*u64,
+    multimap_va_end: ?*u64,
+) callconv(abi.guest) void {
+    if (va_start) |out| out.* = amm_va_start;
+    if (va_end) |out| out.* = amm_va_start + amm_va_size;
+    if (multimap_va_start) |out| out.* = amm_va_start + amm_va_size / 2;
+    if (multimap_va_end) |out| out.* = amm_va_start + amm_va_size;
+}
+
+fn amprAmmGetUsageStatsData(stats: ?*AmmUsageStats) callconv(abi.guest) i32 {
+    const output = stats orelse return errno.KernelError.einval.raw();
+    if (output.size_in_bytes > @sizeOf(AmmUsageStats)) return errno.KernelError.einval.raw();
+    const address = @intFromPtr(output);
+    if (!kernel_memory.isGuestRangeAccessible(address, output.size_in_bytes)) {
+        return errno.KernelError.efault.raw();
+    }
+    var filled = AmmUsageStats{
+        .size_in_bytes = output.size_in_bytes,
+        .num_page_table_pool_entries = 512,
+        .ring_idle_flags = 0x7,
+    };
+    const bytes = output.size_in_bytes;
+    if (bytes == 0) return errno.ok;
+    const source: [*]const u8 = @ptrCast(&filled);
+    const dest: [*]u8 = @ptrFromInt(address);
+    @memcpy(dest[0..bytes], source[0..bytes]);
+    return errno.ok;
+}
+
+fn amprAmmSetPageTablePoolOccupancyNotificationThreshold(_: u32) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
+fn amprAmmSubmitCommandBuffer(address: u64, _: u32, _: u32) callconv(abi.guest) i32 {
+    if (address == 0) return errno.KernelError.einval.raw();
+    _ = apr.submitCommandBuffer(address) catch |err| return aprError(err);
+    return errno.ok;
+}
+
+fn amprAmmSubmitCommandBufferAndGetId(
+    address: u64,
+    _: u32,
+    _: u32,
+    out_identifier: ?*u32,
+) callconv(abi.guest) i32 {
+    const output = out_identifier orelse return errno.KernelError.einval.raw();
+    if (address == 0) return errno.KernelError.einval.raw();
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(output), @sizeOf(u32))) {
+        return errno.KernelError.efault.raw();
+    }
+    output.* = apr.submitCommandBuffer(address) catch |err| return aprError(err);
+    return errno.ok;
+}
+
+fn amprAmmSubmitCommandBufferAndGetResult(
+    address: u64,
+    _: u32,
+    _: u32,
+    result: ?*u64,
+    out_identifier: ?*u32,
+) callconv(abi.guest) i32 {
+    if (address == 0) return errno.KernelError.einval.raw();
+    const identifier = apr.submitCommandBuffer(address) catch |err| return aprError(err);
+    if (result) |output| {
+        if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(output), 8)) {
+            return errno.KernelError.efault.raw();
+        }
+        output.* = 0;
+    }
+    if (out_identifier) |output| {
+        if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(output), @sizeOf(u32))) {
+            return errno.KernelError.efault.raw();
+        }
+        output.* = identifier;
+    }
+    return errno.ok;
+}
+
+fn amprAmmWaitCommandBufferCompletion(identifier: u32) callconv(abi.guest) i32 {
+    apr.waitCommandBuffer(identifier) catch |err| return switch (err) {
+        error.UnknownSubmission => errno.KernelError.esrch.raw(),
+        else => aprError(err),
+    };
+    return errno.ok;
+}
+
+fn amprMeasureAmmCommandSizeMap(_: u64, _: u64, _: i32, _: i32) callconv(abi.guest) i64 {
+    return amm_map_record_size;
+}
+
+fn amprMeasureAmmCommandSizeMapWithGpuMaskId(_: u64, _: u64, _: i32, _: i32, _: u8) callconv(abi.guest) i64 {
+    return amm_map_record_size;
+}
+
+fn amprMeasureAmmCommandSizeMapDirect(_: u64, _: u64, _: u64, _: i32, _: i32) callconv(abi.guest) i64 {
+    return amm_map_direct_record_size;
+}
+
+fn amprMeasureAmmCommandSizeMapDirectWithGpuMaskId(
+    _: u64,
+    _: u64,
+    _: u64,
+    _: i32,
+    _: i32,
+    _: u8,
+) callconv(abi.guest) i64 {
+    return amm_map_direct_record_size;
+}
+
+fn amprMeasureAmmCommandSizeUnmap(_: u64, _: u64) callconv(abi.guest) i64 {
+    return amm_unmap_record_size;
 }
 
 fn amprMeasureCommandSizeFixed32(
@@ -3045,6 +3319,26 @@ const ampr_exports = [_]symbols.Export{
     .{ .name = "sceAmprMeasureCommandSizePushMarkerWithColor", .function = trace.wrap("sceAmprMeasureCommandSizePushMarkerWithColor", &amprMeasureCommandSizeSetMarkerWithColor), .expect_id = "3OfeY4pzDV0" },
     .{ .name = "sceAmprMeasureCommandSizePushMarker", .function = trace.wrap("sceAmprMeasureCommandSizePushMarker", &amprMeasureCommandSizeSetMarker), .expect_id = "0RdLmAh7WVo" },
     .{ .name = "sceAmprMeasureCommandSizePopMarker", .function = trace.wrap("sceAmprMeasureCommandSizePopMarker", &amprMeasureCommandSizePopMarker), .expect_id = "pbnNnahE8vk" },
+    .{ .name = "sceAmprAmmMeasureAmmCommandSizeMap", .function = trace.wrap("sceAmprAmmMeasureAmmCommandSizeMap", &amprMeasureAmmCommandSizeMap), .expect_id = "6hbai6KIXkk" },
+    .{ .name = "sceAmprAmmMeasureAmmCommandSizeMapWithGpuMaskId", .function = trace.wrap("sceAmprAmmMeasureAmmCommandSizeMapWithGpuMaskId", &amprMeasureAmmCommandSizeMapWithGpuMaskId), .expect_id = "m+fYyX8oFqw" },
+    .{ .name = "sceAmprAmmMeasureAmmCommandSizeMapDirect", .function = trace.wrap("sceAmprAmmMeasureAmmCommandSizeMapDirect", &amprMeasureAmmCommandSizeMapDirect), .expect_id = "ZFDZoN9IbVU" },
+    .{ .name = "sceAmprAmmMeasureAmmCommandSizeMapDirectWithGpuMaskId", .function = trace.wrap("sceAmprAmmMeasureAmmCommandSizeMapDirectWithGpuMaskId", &amprMeasureAmmCommandSizeMapDirectWithGpuMaskId), .expect_id = "KUjtdPZJo5I" },
+    .{ .name = "sceAmprAmmMeasureAmmCommandSizeUnmap", .function = trace.wrap("sceAmprAmmMeasureAmmCommandSizeUnmap", &amprMeasureAmmCommandSizeUnmap), .expect_id = "Ayg6PIon2wA" },
+    .{ .name = "sceAmprAmmGiveDirectMemory", .function = trace.wrap("sceAmprAmmGiveDirectMemory", &amprAmmGiveDirectMemory), .expect_id = "Q07J7XpvhrU" },
+    .{ .name = "sceAmprAmmGetVirtualAddressRanges", .function = trace.wrap("sceAmprAmmGetVirtualAddressRanges", &amprAmmGetVirtualAddressRanges), .expect_id = "wkQR9+xTFKY" },
+    .{ .name = "sceAmprAmmGetUsageStatsData", .function = trace.wrap("sceAmprAmmGetUsageStatsData", &amprAmmGetUsageStatsData), .expect_id = "KqiWXLgCVe0" },
+    .{ .name = "sceAmprAmmSetPageTablePoolOccupancyNotificationThreshold", .function = trace.wrap("sceAmprAmmSetPageTablePoolOccupancyNotificationThreshold", &amprAmmSetPageTablePoolOccupancyNotificationThreshold), .expect_id = "touqMEt6qXQ" },
+    .{ .name = "sceAmprAmmCommandBufferConstructor", .function = trace.wrap("sceAmprAmmCommandBufferConstructor", &amprAmmCommandBufferConstructor), .expect_id = "EDq5bqCqYpA" },
+    .{ .name = "sceAmprAmmCommandBufferDestructor", .function = trace.wrap("sceAmprAmmCommandBufferDestructor", &amprAmmCommandBufferDestructor), .expect_id = "pvUFDOHilnE" },
+    .{ .name = "sceAmprAmmCommandBufferMap", .function = trace.wrap("sceAmprAmmCommandBufferMap", &amprAmmCommandBufferMap), .expect_id = "JEVYGhDc97M" },
+    .{ .name = "sceAmprAmmCommandBufferMapWithGpuMaskId", .function = trace.wrap("sceAmprAmmCommandBufferMapWithGpuMaskId", &amprAmmCommandBufferMapWithGpuMaskId), .expect_id = "ojBkmG7+CgE" },
+    .{ .name = "sceAmprAmmCommandBufferMapDirect", .function = trace.wrap("sceAmprAmmCommandBufferMapDirect", &amprAmmCommandBufferMapDirect), .expect_id = "8TBE+9XCZbI" },
+    .{ .name = "sceAmprAmmCommandBufferMapDirectWithGpuMaskId", .function = trace.wrap("sceAmprAmmCommandBufferMapDirectWithGpuMaskId", &amprAmmCommandBufferMapDirectWithGpuMaskId), .expect_id = "kOfZlhbVAkc" },
+    .{ .name = "sceAmprAmmCommandBufferUnmap", .function = trace.wrap("sceAmprAmmCommandBufferUnmap", &amprAmmCommandBufferUnmap), .expect_id = "M-VFI2DJWQA" },
+    .{ .name = "sceAmprAmmSubmitCommandBuffer", .function = trace.wrap("sceAmprAmmSubmitCommandBuffer", &amprAmmSubmitCommandBuffer), .expect_id = "lwS-7y3jcBI" },
+    .{ .name = "sceAmprAmmSubmitCommandBuffer3", .function = trace.wrap("sceAmprAmmSubmitCommandBuffer3", &amprAmmSubmitCommandBufferAndGetId), .expect_id = "NnKhlMJtIsI" },
+    .{ .name = "sceAmprAmmSubmitCommandBuffer2", .function = trace.wrap("sceAmprAmmSubmitCommandBuffer2", &amprAmmSubmitCommandBufferAndGetResult), .expect_id = "OJf3vCckPAM" },
+    .{ .name = "sceAmprAmmWaitCommandBufferCompletion", .function = trace.wrap("sceAmprAmmWaitCommandBufferCompletion", &amprAmmWaitCommandBufferCompletion), .expect_id = "HXymib4T8gc" },
 };
 
 pub fn reset() void {
@@ -3648,6 +3942,10 @@ test "bootstrap service libraries register the title link surface" {
     try std.testing.expect(db.findById("j0+3uJMxYJY", .function) != null);
     try std.testing.expect(db.findById("Eul7AGEpjLo", .function) != null);
     try std.testing.expect(db.findById("4quckD2y7Pg", .function) != null);
+    try std.testing.expect(db.findById("JEVYGhDc97M", .function) != null);
+    try std.testing.expect(db.findById("8TBE+9XCZbI", .function) != null);
+    try std.testing.expect(db.findById("M-VFI2DJWQA", .function) != null);
+    try std.testing.expect(db.findById("Q07J7XpvhrU", .function) != null);
 }
 
 test "AMPR gather and scatter sizes match the recorded command stream" {
@@ -3765,4 +4063,95 @@ test "AMPR map wait write and markers record the measured sizes" {
     );
     _ = try apr.submitCommandBuffer(address);
     try std.testing.expectEqual(@as(u64, 0x55aa_55aa_55aa_55aa), label);
+}
+
+test "AMM map and unmap commit direct memory at the requested VA" {
+    apr.reset();
+    defer apr.reset();
+
+    var address_space = try guest_memory.AddressSpace.initWithDirectMemory(
+        std.testing.allocator,
+        16 * kernel_memory.page_size,
+    );
+    defer address_space.deinit();
+    kernel_memory.init(std.testing.allocator);
+    defer kernel_memory.deinit();
+    kernel_memory.attachAddressSpace(&address_space);
+
+    try std.testing.expectEqual(@as(i64, amm_map_record_size), amprMeasureAmmCommandSizeMap(0, 0, 0, 0));
+    try std.testing.expectEqual(@as(i64, amm_map_direct_record_size), amprMeasureAmmCommandSizeMapDirect(0, 0, 0, 0, 0));
+    try std.testing.expectEqual(@as(i64, amm_unmap_record_size), amprMeasureAmmCommandSizeUnmap(0, 0));
+
+    var va_start: u64 = 0;
+    var va_end: u64 = 0;
+    amprAmmGetVirtualAddressRanges(&va_start, &va_end, null, null);
+    try std.testing.expectEqual(amm_va_start, va_start);
+    try std.testing.expectEqual(amm_va_start + amm_va_size, va_end);
+
+    var stats = AmmUsageStats{ .size_in_bytes = @sizeOf(AmmUsageStats) };
+    try std.testing.expectEqual(errno.ok, amprAmmGetUsageStatsData(&stats));
+    try std.testing.expectEqual(@as(u16, 512), stats.num_page_table_pool_entries);
+    try std.testing.expectEqual(@as(u32, 0x7), stats.ring_idle_flags);
+
+    const map_size = kernel_memory.page_size;
+    const va = guest_memory.user.start;
+    try address_space.reserveFixed(va, map_size * 2);
+
+    var dmem: i64 = -1;
+    try std.testing.expectEqual(
+        errno.ok,
+        amprAmmGiveDirectMemory(0, @intCast(kernel_memory.direct_memory_size), map_size, map_size, amm_usage_direct, &dmem),
+    );
+    try std.testing.expect(dmem >= 0);
+
+    var header: [ampr_command_buffer_header_size]u8 align(8) = @splat(0);
+    var storage: [0x80]u8 align(4) = @splat(0);
+    const address = @intFromPtr(&header);
+    try std.testing.expectEqual(errno.ok, amprAmmCommandBufferConstructor(address));
+    try std.testing.expectEqual(
+        errno.ok,
+        amprCommandBufferSetBuffer(address, @intFromPtr(&storage), storage.len),
+    );
+    try std.testing.expectEqual(
+        errno.KernelError.einval.raw(),
+        amprAmmCommandBufferMapDirect(address, 1, @intCast(dmem), map_size, 0, 0),
+    );
+    try std.testing.expectEqual(
+        errno.ok,
+        amprAmmCommandBufferMapDirect(
+            address,
+            va,
+            @intCast(dmem),
+            map_size,
+            0,
+            amm_prot_ampr_read | amm_prot_ampr_write,
+        ),
+    );
+    try std.testing.expectEqual(@as(u64, amm_map_direct_record_size), amprCommandBufferGetCurrentOffset(address));
+    try std.testing.expectEqual(errno.ok, amprAmmSubmitCommandBuffer(address, 0, 0));
+    try std.testing.expect(address_space.isMapped(va, map_size));
+
+    const mapped: *u64 = @ptrFromInt(va);
+    mapped.* = 0x1122_3344_5566_7788;
+    try std.testing.expectEqual(@as(u64, 0x1122_3344_5566_7788), mapped.*);
+
+    try std.testing.expectEqual(errno.ok, amprCommandBufferReset(address));
+    try std.testing.expectEqual(errno.ok, amprAmmCommandBufferUnmap(address, va, map_size));
+    var submission: u32 = 0;
+    try std.testing.expectEqual(errno.ok, amprAmmSubmitCommandBufferAndGetId(address, 0, 0, &submission));
+    try std.testing.expect(submission != 0);
+    try std.testing.expectEqual(errno.ok, amprAmmWaitCommandBufferCompletion(submission));
+    try std.testing.expect(!address_space.isMapped(va, map_size));
+
+    try std.testing.expectEqual(errno.ok, amprCommandBufferReset(address));
+    try std.testing.expectEqual(
+        errno.ok,
+        amprAmmGiveDirectMemory(0, @intCast(kernel_memory.direct_memory_size), map_size, map_size, amm_usage_auto, &dmem),
+    );
+    try std.testing.expectEqual(
+        errno.ok,
+        amprAmmCommandBufferMap(address, va + map_size, map_size, 0, amm_prot_ampr_read | amm_prot_ampr_write),
+    );
+    try std.testing.expectEqual(errno.ok, amprAmmSubmitCommandBuffer(address, 0, 0));
+    try std.testing.expect(address_space.isMapped(va + map_size, map_size));
 }

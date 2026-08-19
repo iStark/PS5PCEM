@@ -11,6 +11,7 @@
 const std = @import("std");
 const filesystem = @import("filesystem.zig");
 const memory = @import("libs/kernel_memory.zig");
+const errno = @import("errno.zig");
 
 pub const maximum_files: usize = 256;
 pub const maximum_path: usize = 1024;
@@ -18,9 +19,13 @@ pub const maximum_command_buffers: usize = 32;
 pub const maximum_reads_per_buffer: usize = 32;
 pub const maximum_writes_per_buffer: usize = 32;
 pub const maximum_completions_per_buffer: usize = 32;
+pub const maximum_maps_per_buffer: usize = 32;
+pub const maximum_ops_per_buffer: usize = 128;
+pub const maximum_auto_pool: usize = 8;
 pub const maximum_submissions: usize = 64;
 pub const maximum_read_bytes: usize = 4 * 1024 * 1024 * 1024;
 pub const maximum_file_offset: u64 = 0x0000_0100_0000_0000;
+pub const amm_page_size: u64 = 0x4000;
 
 pub const Error = error{
     InvalidPath,
@@ -34,6 +39,8 @@ pub const Error = error{
     InvalidRead,
     SubmissionTableFull,
     UnknownSubmission,
+    OutOfDirectMemory,
+    MappingFailed,
 };
 
 pub const ResolvedFile = struct {
@@ -87,6 +94,34 @@ pub const WriteCommand = struct {
     value: u64,
 };
 
+pub const AmmKind = enum {
+    map_auto,
+    map_direct,
+    unmap,
+};
+
+pub const AmmMapCommand = struct {
+    kind: AmmKind,
+    va: u64,
+    dmem_offset: u64 = 0,
+    size: u64,
+    memory_type: i32 = 0,
+    protection: i32 = 0,
+};
+
+const OpKind = enum { read, write, completion, map };
+
+const Op = struct {
+    kind: OpKind,
+    index: u8,
+};
+
+const AutoPoolRange = struct {
+    start: u64 = 0,
+    size: u64 = 0,
+    used: u64 = 0,
+};
+
 pub const CompletionSink = *const fn (CompletionCommand) bool;
 
 const CommandBuffer = struct {
@@ -102,6 +137,10 @@ const CommandBuffer = struct {
     completion_count: usize = 0,
     writes: [maximum_writes_per_buffer]WriteCommand = undefined,
     write_count: usize = 0,
+    maps: [maximum_maps_per_buffer]AmmMapCommand = undefined,
+    map_count: usize = 0,
+    ops: [maximum_ops_per_buffer]Op = undefined,
+    op_count: usize = 0,
     cursor: ?GatherScatterCursor = null,
     map_active: bool = false,
 };
@@ -131,6 +170,8 @@ var command_buffers: [maximum_command_buffers]CommandBuffer = [_]CommandBuffer{.
 var submissions: [maximum_submissions]Submission = [_]Submission{.{}} ** maximum_submissions;
 var next_submission_identifier: u32 = 1;
 var completion_sink: ?CompletionSink = null;
+var auto_pool: [maximum_auto_pool]AutoPoolRange = [_]AutoPoolRange{.{}} ** maximum_auto_pool;
+var auto_pool_count: usize = 0;
 
 pub fn attachCompletionSink(sink: ?CompletionSink) void {
     lock.lock();
@@ -146,6 +187,8 @@ pub fn reset() void {
     command_buffers = [_]CommandBuffer{.{}} ** maximum_command_buffers;
     submissions = [_]Submission{.{}} ** maximum_submissions;
     next_submission_identifier = 1;
+    auto_pool = [_]AutoPoolRange{.{}} ** maximum_auto_pool;
+    auto_pool_count = 0;
 }
 
 pub fn resolve(path: []const u8) Error!ResolvedFile {
@@ -242,6 +285,8 @@ pub fn resetCommandBuffer(address: u64) Error!void {
     buffer.read_count = 0;
     buffer.completion_count = 0;
     buffer.write_count = 0;
+    buffer.map_count = 0;
+    buffer.op_count = 0;
     buffer.record_bytes = 0;
     buffer.command_count = 0;
     buffer.cursor = null;
@@ -307,6 +352,7 @@ pub fn appendReadRecord(address: u64, command: ReadCommand, record_bytes: usize)
     const next_bytes = std.math.add(usize, buffer.record_bytes, record_bytes) catch
         return error.InvalidCommandBuffer;
     if (buffer.storage_size != 0 and next_bytes > buffer.storage_size) return error.InvalidCommandBuffer;
+    try pushOpLocked(buffer, .read, buffer.read_count);
     buffer.reads[buffer.read_count] = command;
     buffer.read_count += 1;
     buffer.record_bytes = next_bytes;
@@ -326,6 +372,7 @@ pub fn appendCompletion(address: u64, command: CompletionCommand) Error!void {
     const next_bytes = std.math.add(usize, buffer.record_bytes, 0x30) catch
         return error.InvalidCommandBuffer;
     if (buffer.storage_size != 0 and next_bytes > buffer.storage_size) return error.InvalidCommandBuffer;
+    try pushOpLocked(buffer, .completion, buffer.completion_count);
     buffer.completions[buffer.completion_count] = command;
     buffer.completion_count += 1;
     buffer.record_bytes = next_bytes;
@@ -341,10 +388,43 @@ pub fn appendWrite(address: u64, command: WriteCommand, record_bytes: usize) Err
     const next_bytes = std.math.add(usize, buffer.record_bytes, record_bytes) catch
         return error.InvalidCommandBuffer;
     if (buffer.storage_size != 0 and next_bytes > buffer.storage_size) return error.InvalidCommandBuffer;
+    try pushOpLocked(buffer, .write, buffer.write_count);
     buffer.writes[buffer.write_count] = command;
     buffer.write_count += 1;
     buffer.record_bytes = next_bytes;
     buffer.command_count += 1;
+}
+
+pub fn appendAmmMap(address: u64, command: AmmMapCommand, record_bytes: usize) Error!void {
+    if (command.va == 0 or command.size == 0 or record_bytes == 0) return error.InvalidCommandBuffer;
+    if (command.va & (amm_page_size - 1) != 0 or command.size & (amm_page_size - 1) != 0) {
+        return error.InvalidCommandBuffer;
+    }
+    _ = std.math.add(u64, command.va, command.size) catch return error.InvalidCommandBuffer;
+    if (command.kind == .map_direct and command.dmem_offset & (amm_page_size - 1) != 0) {
+        return error.InvalidCommandBuffer;
+    }
+    lock.lock();
+    defer lock.unlock();
+    const buffer = findCommandBufferLocked(address) orelse return error.InvalidCommandBuffer;
+    if (buffer.map_count >= buffer.maps.len) return error.TooManyCommands;
+    const next_bytes = std.math.add(usize, buffer.record_bytes, record_bytes) catch
+        return error.InvalidCommandBuffer;
+    if (buffer.storage_size != 0 and next_bytes > buffer.storage_size) return error.InvalidCommandBuffer;
+    try pushOpLocked(buffer, .map, buffer.map_count);
+    buffer.maps[buffer.map_count] = command;
+    buffer.map_count += 1;
+    buffer.record_bytes = next_bytes;
+    buffer.command_count += 1;
+}
+
+pub fn giveAutoPool(start: u64, size: u64) Error!void {
+    if (size == 0 or size & (amm_page_size - 1) != 0) return error.InvalidCommandBuffer;
+    lock.lock();
+    defer lock.unlock();
+    if (auto_pool_count >= auto_pool.len) return error.OutOfDirectMemory;
+    auto_pool[auto_pool_count] = .{ .start = start, .size = size, .used = 0 };
+    auto_pool_count += 1;
 }
 
 pub fn setMapActive(address: u64, active: bool) Error!void {
@@ -365,6 +445,8 @@ pub fn submitCommandBuffer(address: u64) Error!u32 {
     var pending: [maximum_reads_per_buffer]ReadCommand = undefined;
     var pending_writes: [maximum_writes_per_buffer]WriteCommand = undefined;
     var pending_completions: [maximum_completions_per_buffer]CompletionCommand = undefined;
+    var pending_maps: [maximum_maps_per_buffer]AmmMapCommand = undefined;
+    var pending_ops: [maximum_ops_per_buffer]Op = undefined;
     var sink: ?CompletionSink = null;
     const counts = blk: {
         lock.lock();
@@ -373,22 +455,29 @@ pub fn submitCommandBuffer(address: u64) Error!u32 {
         @memcpy(pending[0..buffer.read_count], buffer.reads[0..buffer.read_count]);
         @memcpy(pending_writes[0..buffer.write_count], buffer.writes[0..buffer.write_count]);
         @memcpy(pending_completions[0..buffer.completion_count], buffer.completions[0..buffer.completion_count]);
+        @memcpy(pending_maps[0..buffer.map_count], buffer.maps[0..buffer.map_count]);
+        @memcpy(pending_ops[0..buffer.op_count], buffer.ops[0..buffer.op_count]);
+        for (pending_maps[0..buffer.map_count]) |*command| {
+            if (command.kind != .map_auto) continue;
+            command.dmem_offset = takeAutoLocked(command.size, command.memory_type) orelse
+                return error.OutOfDirectMemory;
+        }
         sink = completion_sink;
-        break :blk .{ buffer.read_count, buffer.write_count, buffer.completion_count };
+        break :blk .{
+            buffer.read_count,
+            buffer.write_count,
+            buffer.completion_count,
+            buffer.map_count,
+            buffer.op_count,
+        };
     };
-    for (pending[0..counts[0]]) |command| {
-        if (!memory.isGuestRangeAccessible(command.destination, command.size)) return error.InvalidRead;
-        const destination: [*]u8 = @ptrFromInt(command.destination);
-        _ = try read(command.file_identifier, command.file_offset, destination[0..command.size]);
-    }
-    for (pending_writes[0..counts[1]]) |command| {
-        if (!memory.isGuestRangeAccessible(command.destination, 8)) return error.InvalidRead;
-        const destination: *[8]u8 = @ptrFromInt(command.destination);
-        std.mem.writeInt(u64, destination, command.value, .little);
-    }
-    for (pending_completions[0..counts[2]]) |command| {
-        const callback = sink orelse return error.IoFailed;
-        if (!callback(command)) return error.IoFailed;
+    for (pending_ops[0..counts[4]]) |op| {
+        switch (op.kind) {
+            .read => try applyRead(pending[op.index]),
+            .write => try applyWrite(pending_writes[op.index]),
+            .completion => try applyCompletion(pending_completions[op.index], sink),
+            .map => try applyAmmMap(pending_maps[op.index]),
+        }
     }
 
     lock.lock();
@@ -414,6 +503,60 @@ pub fn waitCommandBuffer(identifier: u32) Error!void {
         return;
     }
     return error.UnknownSubmission;
+}
+
+fn pushOpLocked(buffer: *CommandBuffer, kind: OpKind, index: usize) Error!void {
+    if (buffer.op_count >= buffer.ops.len) return error.TooManyCommands;
+    buffer.ops[buffer.op_count] = .{ .kind = kind, .index = @intCast(index) };
+    buffer.op_count += 1;
+}
+
+fn takeAutoLocked(size: u64, memory_type: i32) ?u64 {
+    for (auto_pool[0..auto_pool_count]) |*range| {
+        const used = (range.used + (amm_page_size - 1)) & ~(amm_page_size - 1);
+        if (used <= range.size and size <= range.size - used) {
+            const offset = range.start + used;
+            range.used = used + size;
+            return offset;
+        }
+    }
+    var allocated: u64 = 0;
+    if (memory.hostAllocateDirectMemory(0, memory.direct_memory_size, size, amm_page_size, memory_type, &allocated) != errno.ok) {
+        return null;
+    }
+    return allocated;
+}
+
+fn applyRead(command: ReadCommand) Error!void {
+    if (!memory.isGuestRangeAccessible(command.destination, command.size)) return error.InvalidRead;
+    const destination: [*]u8 = @ptrFromInt(command.destination);
+    _ = try read(command.file_identifier, command.file_offset, destination[0..command.size]);
+}
+
+fn applyWrite(command: WriteCommand) Error!void {
+    if (!memory.isGuestRangeAccessible(command.destination, 8)) return error.InvalidRead;
+    const destination: *[8]u8 = @ptrFromInt(command.destination);
+    std.mem.writeInt(u64, destination, command.value, .little);
+}
+
+fn applyCompletion(command: CompletionCommand, sink: ?CompletionSink) Error!void {
+    const callback = sink orelse return error.IoFailed;
+    if (!callback(command)) return error.IoFailed;
+}
+
+fn applyAmmMap(command: AmmMapCommand) Error!void {
+    const status = switch (command.kind) {
+        .unmap => memory.hostUnmap(command.va, command.size),
+        .map_auto, .map_direct => memory.hostMapDirectMemoryFixed(
+            command.va,
+            command.size,
+            command.protection,
+            command.dmem_offset,
+        ),
+    };
+    if (status == errno.ok) return;
+    if (status == errno.KernelError.eagain.raw()) return error.OutOfDirectMemory;
+    return error.MappingFailed;
 }
 
 fn findCommandBufferLocked(address: u64) ?*CommandBuffer {

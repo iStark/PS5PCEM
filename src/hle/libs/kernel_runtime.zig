@@ -434,7 +434,8 @@ fn aprKernelError(err: apr.Error) i32 {
         error.FileNotFound, error.UnknownFile => KernelError.enoent.raw(),
         error.FileTableFull, error.CommandBufferTableFull, error.SubmissionTableFull => KernelError.enomem.raw(),
         error.IoFailed => KernelError.eio.raw(),
-        error.InvalidPath, error.InvalidCommandBuffer, error.TooManyCommands, error.InvalidRead, error.UnknownSubmission => KernelError.einval.raw(),
+        error.InvalidPath, error.InvalidCommandBuffer, error.TooManyCommands, error.InvalidRead, error.UnknownSubmission, error.MappingFailed => KernelError.einval.raw(),
+        error.OutOfDirectMemory => KernelError.eagain.raw(),
     };
 }
 
