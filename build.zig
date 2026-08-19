@@ -185,7 +185,6 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
-    opus_lib.root_module.addIncludePath(b.path("src/hle/codecs/opus"));
     opus_lib.root_module.addIncludePath(libopus.path("include"));
     opus_lib.root_module.addIncludePath(libopus.path("celt"));
     opus_lib.root_module.addIncludePath(libopus.path("silk"));
@@ -327,8 +326,14 @@ pub fn build(b: *std.Build) void {
         .flags = &.{
             "-std=c99",
             "-O2",
-            "-DHAVE_CONFIG_H=1",
             "-DOPUS_BUILD=1",
+            "-DUSE_ALLOCA=1",
+            "-DHAVE_LRINT=1",
+            "-DHAVE_LRINTF=1",
+            "-DHAVE_STDINT_H=1",
+            "-DVAR_ARRAYS=1",
+            "-DFLOATING_POINT=1",
+            "-DPACKAGE_VERSION=\"1.5.2\"",
         },
     });
     hle.linkLibrary(opus_lib);
