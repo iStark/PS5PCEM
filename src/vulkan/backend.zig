@@ -2210,7 +2210,9 @@ pub const Renderer = struct {
             .binding = dynamic_scalar_descriptor_binding,
             .descriptor_type = vk.descriptor_type_storage_buffer,
             .descriptor_count = 1,
-            .stage_flags = vk.shader_stage_vertex_bit | vk.shader_stage_fragment_bit,
+            .stage_flags = vk.shader_stage_vertex_bit |
+                vk.shader_stage_fragment_bit |
+                vk.shader_stage_compute_bit,
         };
         descriptor_bindings[3 + maximum_storage_images] = .{
             .binding = sampled_image_3d_descriptor_binding,
@@ -2729,7 +2731,13 @@ pub const Renderer = struct {
         if (target_index >= self.render_targets.items.len) return Error.MissingPresentedFrame;
         try self.transitionRenderTargetToColorAttachment(target_index);
         const target = self.render_targets.items[target_index];
-        if (!target.initialized) return Error.MissingPresentedFrame;
+        // Vulkan transfer/blit commands cannot read a multisampled image.
+        // Such an attachment needs an explicit guest resolve before it can be
+        // scanned out; treating it as presentable only records an invalid host
+        // command and, previously, stopped the guest queue at R_FLIP.
+        if (!target.initialized or target.target.descriptor.fragments_log2 != 0) {
+            return Error.MissingPresentedFrame;
+        }
         const presentation = &(self.window_presentation orelse return Error.PresentationRejected);
 
         if (self.device_functions.reset_fences(self.device, 1, @ptrCast(&presentation.acquire_fence)) != vk.success) {
@@ -6976,6 +6984,9 @@ pub const Renderer = struct {
         if (self.latest_render_target_index) |latest| {
             if (latest == oldest_index) self.latest_render_target_index = null;
         }
+        if (self.latest_video_render_target_index) |latest| {
+            if (latest == oldest_index) self.latest_video_render_target_index = null;
+        }
         return oldest_index;
     }
 
@@ -9795,6 +9806,7 @@ pub const Renderer = struct {
         if ((target.format.vulkan != vk.format_r8g8b8a8_unorm and
             target.format.vulkan != vk.format_r8g8b8a8_srgb) or
             target.format.bytes_per_texel != 4 or source.unified_format != 56 or
+            target.descriptor.fragments_log2 != 0 or
             source.width != target.descriptor.width or
             source.height != target.descriptor.height or
             source.samplesLog2() != 0 or source.dcc_enabled or
@@ -12395,6 +12407,9 @@ pub const Renderer = struct {
         flip: gpu.state.Flip,
     ) anyerror!bool {
         if (target_index >= self.render_targets.items.len) return false;
+        // materializeRenderTarget intentionally skips multisampled attachments:
+        // only a resolve can turn one into a presentable single-sample frame.
+        if (self.render_targets.items[target_index].target.descriptor.fragments_log2 != 0) return false;
         try self.materializeRenderTarget(target_index);
         const target = self.render_targets.items[target_index].target;
         var selected: ?usize = null;
@@ -12705,17 +12720,27 @@ pub const Renderer = struct {
         }
     }
 
+    /// Host presentation is asynchronous from the guest's point of view. A
+    /// missing/stale host frame or a swapchain failure drops that display frame
+    /// but must still complete R_FLIP; returning false here wedges the guest GPU
+    /// queue before it can produce the next frame.
     fn dcbFlip(context: ?*anyopaque, flip: gpu.state.Flip) bool {
         const self = fromContext(context);
+        if (!self.tryPresentFlip(flip)) {
+            self.present_dropped +%= 1;
+            if (self.last_flip_error) |err| {
+                std.debug.print(
+                    "[vulkan dcb] flip #{d} presentation skipped: {s}\n",
+                    .{ self.flip_callbacks, @errorName(err) },
+                );
+            }
+        }
+        return true;
+    }
+
+    fn tryPresentFlip(self: *Renderer, flip: gpu.state.Flip) bool {
         self.flip_callbacks += 1;
         const flip_started = hostTimestampNs();
-        // A rejected flip stops the command queue, and everything that fails
-        // afterwards fails because of it. Name the cause here; the executor
-        // that reports the stop only sees that the backend said no.
-        defer if (self.last_flip_error) |err| std.debug.print(
-            "[vulkan dcb] flip #{d} rejected: {s}\n",
-            .{ self.flip_callbacks, @errorName(err) },
-        );
         defer self.reportFrameProfile();
         // Declared after the report so that it runs before it: the time this
         // flip spends belongs to the frame being reported, not the next one.
@@ -13051,7 +13076,7 @@ pub const Renderer = struct {
         return null;
     }
 
-    fn resolveIndirectDrawCount(self: *Renderer, spec: gpu.pm4.IndirectDrawSpec) Error!u32 {
+    fn resolveIndirectDrawCount(self: *Renderer, spec: gpu.pm4.IndirectDrawSpec) anyerror!u32 {
         var count = spec.count;
         if (spec.count_from_memory) {
             if (spec.count_address == 0) return Error.UnsupportedDrawPacket;
@@ -13068,7 +13093,7 @@ pub const Renderer = struct {
         state: *const gpu.State,
         spec: gpu.pm4.IndirectDrawSpec,
         index: u32,
-    ) Error!GuestDraw {
+    ) anyerror!GuestDraw {
         const arg_bytes = gpu.pm4.indirectDrawArgBytes(spec.indexed);
         if (spec.stride < arg_bytes) return Error.UnsupportedDrawPacket;
         if (state.draw_indirect_args_base_address == 0) return Error.UnsupportedDrawPacket;

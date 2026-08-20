@@ -5411,6 +5411,14 @@ fn translateStructured(builder: *Builder, program: *const instruction.Program, g
     defer builder.allocator.free(labels);
     labels[0] = builder.label;
     for (labels[1..]) |*label| label.* = builder.id();
+    // Instruction lowering may introduce internal selection blocks for bounds
+    // checks and EXEC-predicated stores. The block left open afterwards is not
+    // necessarily the guest block's entry label, so OpPhi cannot name `labels`
+    // as its predecessor. Route every guest block through a canonical exit and
+    // use those labels for all state-merge parents.
+    const exit_labels = try builder.allocator.alloc(u32, graph.blocks.items.len);
+    defer builder.allocator.free(exit_labels);
+    for (exit_labels) |*label| label.* = builder.id();
     // SPIR-V forbids two selection headers from naming the same merge block.
     // Acyclic guest shaders commonly produce if/else-if ladders whose immediate
     // post-dominator is shared. Give every header a synthetic merge and chain
@@ -5473,7 +5481,7 @@ fn translateStructured(builder: *Builder, program: *const instruction.Program, g
                     const owner = structuredSelectionForEdge(graph, dominators, edge.from, block.index) orelse continue;
                     if (owner != index or !states[edge.from].valid) continue;
                     try merge_incoming.append(builder.allocator, states[edge.from]);
-                    try merge_parents.append(builder.allocator, labels[edge.from]);
+                    try merge_parents.append(builder.allocator, exit_labels[edge.from]);
                 }
                 for (graph.selections.items, 0..) |candidate, child_index| {
                     if (candidate.merge != block.index) continue;
@@ -5502,7 +5510,7 @@ fn translateStructured(builder: *Builder, program: *const instruction.Program, g
                     structuredSelectionForEdge(graph, dominators, edge.from, block.index) != null) continue;
                 if (!states[edge.from].valid) return Error.UnsupportedControlFlow;
                 try block_incoming.append(builder.allocator, states[edge.from]);
-                try block_parents.append(builder.allocator, labels[edge.from]);
+                try block_parents.append(builder.allocator, exit_labels[edge.from]);
             }
             for (graph.selections.items, 0..) |selection, selection_index| {
                 if (selection.merge != block.index or
@@ -5514,7 +5522,7 @@ fn translateStructured(builder: *Builder, program: *const instruction.Program, g
             incoming = try mergeIncomingStates(builder, block_incoming.items, block_parents.items);
         } else {
             try builder.emit(&builder.body, 248, &.{labels[block.index]}); // OpLabel
-            incoming = try mergeState(builder, graph, states, labels, block.index);
+            incoming = try mergeState(builder, graph, states, exit_labels, block.index);
         }
         builder.restore(incoming);
         if (block.index == 0) try builder.initializeStageInputs();
@@ -5527,6 +5535,8 @@ fn translateStructured(builder: *Builder, program: *const instruction.Program, g
             try lowerDiagnosed(builder, inst);
         }
         states[block.index] = builder.snapshot();
+        try builder.emit(&builder.body, 249, &.{exit_labels[block.index]}); // OpBranch
+        try builder.emit(&builder.body, 248, &.{exit_labels[block.index]}); // OpLabel
 
         if (last.opcode.isProgramEnd()) {
             try builder.emit(&builder.body, 253, &.{}); // OpReturn
@@ -5828,6 +5838,64 @@ fn containsOpcode(words: []const u32, wanted: u16) bool {
         index += count;
     }
     return false;
+}
+
+fn expectPhiParentsArePredecessors(words: []const u32) !void {
+    const Edge = struct { source: u32, target: u32 };
+    const PhiParent = struct { block: u32, parent: u32 };
+    var edges: std.ArrayList(Edge) = .empty;
+    defer edges.deinit(std.testing.allocator);
+    var phi_parents: std.ArrayList(PhiParent) = .empty;
+    defer phi_parents.deinit(std.testing.allocator);
+
+    var current_label: u32 = 0;
+    var index: usize = 5;
+    while (index < words.len) {
+        const first = words[index];
+        const word_count: usize = first >> 16;
+        try std.testing.expect(word_count != 0 and index + word_count <= words.len);
+        const opcode: u16 = @truncate(first);
+        switch (opcode) {
+            248 => current_label = words[index + 1], // OpLabel
+            249 => try edges.append(std.testing.allocator, .{ // OpBranch
+                .source = current_label,
+                .target = words[index + 1],
+            }),
+            250 => { // OpBranchConditional
+                try edges.append(std.testing.allocator, .{ .source = current_label, .target = words[index + 2] });
+                try edges.append(std.testing.allocator, .{ .source = current_label, .target = words[index + 3] });
+            },
+            251 => { // OpSwitch
+                try edges.append(std.testing.allocator, .{ .source = current_label, .target = words[index + 2] });
+                var target_index = index + 4;
+                while (target_index < index + word_count) : (target_index += 2) {
+                    try edges.append(std.testing.allocator, .{ .source = current_label, .target = words[target_index] });
+                }
+            },
+            245 => { // OpPhi
+                var parent_index = index + 4;
+                while (parent_index < index + word_count) : (parent_index += 2) {
+                    try phi_parents.append(std.testing.allocator, .{
+                        .block = current_label,
+                        .parent = words[parent_index],
+                    });
+                }
+            },
+            else => {},
+        }
+        index += word_count;
+    }
+
+    for (phi_parents.items) |phi| {
+        var found = false;
+        for (edges.items) |edge| {
+            if (edge.source == phi.parent and edge.target == phi.block) {
+                found = true;
+                break;
+            }
+        }
+        try std.testing.expect(found);
+    }
 }
 
 fn countOpcode(words: []const u32, wanted: u16) usize {
@@ -8088,6 +8156,70 @@ test "compute EXECZ selection uses the per-lane predicate" {
     try std.testing.expect(containsOpcode(module.words, 250)); // OpBranchConditional
     try std.testing.expect(!module.used_control_flow_fallback);
     try std.testing.expect(!module.used_dispatcher);
+}
+
+test "structured merge phi names canonical exit after a guarded store" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .family = .vop1,
+        .opcode = .v_mov_b32,
+        .dst = .{ .kind = .vgpr, .reg = 0 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 0 },
+        .src_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 4,
+        .family = .vopc,
+        .opcode = .v_cmpx_gt_u32,
+        .dst = .{ .kind = .exec_lo },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 2, .signed_val = 2 },
+        .src1 = .{ .kind = .integer_inline_constant, .value = 1, .signed_val = 1 },
+        .src_count = 2,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 8,
+        .family = .sopp,
+        .opcode = .s_cbranch_execz,
+        .branch_target = 24,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 12,
+        .family = .vop1,
+        .opcode = .v_mov_b32,
+        .dst = .{ .kind = .vgpr, .reg = 0 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 1, .signed_val = 1 },
+        .src_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 16,
+        .word_count = 2,
+        .family = .mubuf,
+        .opcode = .buffer_store_dword,
+        .dst = .{ .kind = .vgpr, .reg = 0 },
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src1 = .{ .kind = .sgpr, .reg = 4 },
+        .src2 = .{ .kind = .integer_inline_constant, .value = 0 },
+        .src_count = 3,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 24,
+        .family = .sopp,
+        .opcode = .s_endpgm,
+    });
+    const storage = [_]StorageBufferBinding{.{
+        .resource_sgpr = 4,
+        .descriptor_index = 0,
+        .extent_bytes = 16,
+    }};
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .storage_buffers = &storage,
+    });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 245)); // OpPhi
+    try expectPhiParentsArePredecessors(module.words);
 }
 
 test "structured entry block retains specialized scalar inputs" {
