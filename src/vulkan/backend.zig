@@ -12795,13 +12795,29 @@ pub const Renderer = struct {
                 if (video_index < self.render_targets.items.len and
                     self.render_targets.items[video_index].initialized)
                 {
-                    const presented = self.presentResidentTarget(video_index, flip) catch |err| {
-                        self.last_flip_error = err;
-                        return false;
-                    };
-                    if (!presented) {
-                        self.last_flip_error = Error.PresentationRejected;
-                        return false;
+                    // The active decoded-video surface is already a resident
+                    // Vulkan image. Present it directly instead of reading a
+                    // full 1080p frame into host RAM only for the window sink
+                    // to upload those same pixels into the swapchain again.
+                    // Keep the materialized path solely for requested PPM
+                    // checkpoints, where CPU-visible pixels are required.
+                    if (shouldDumpProgressFrame(
+                        self.flip_callbacks,
+                        self.capture_extended_progress_frames,
+                    )) {
+                        const presented = self.presentResidentTarget(video_index, flip) catch |err| {
+                            self.last_flip_error = err;
+                            return false;
+                        };
+                        if (!presented) {
+                            self.last_flip_error = Error.PresentationRejected;
+                            return false;
+                        }
+                    } else {
+                        self.blitRenderTargetToSwapchain(video_index) catch |err| {
+                            self.last_flip_error = err;
+                            return false;
+                        };
                     }
                     if (self.flip_callbacks <= 24 or log_verbose_gpu) {
                         std.debug.print(
