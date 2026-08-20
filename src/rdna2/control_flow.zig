@@ -56,6 +56,9 @@ pub const Graph = struct {
     edges: std.ArrayList(Edge) = .empty,
     selections: std.ArrayList(Selection) = .empty,
     back_edge_count: u32 = 0,
+    /// True when a back edge's target does not dominate its source. Structured
+    /// loop lowering cannot name a unique header for that cycle.
+    irreducible: bool = false,
 
     pub fn deinit(self: *Graph, allocator: std.mem.Allocator) void {
         self.blocks.deinit(allocator);
@@ -289,7 +292,17 @@ pub fn build(allocator: std.mem.Allocator, program: *const instruction.Program) 
         }
     }
     try buildSelections(allocator, &graph);
+    graph.irreducible = try graphHasIrreducibleCycle(allocator, &graph);
     return graph;
+}
+
+fn graphHasIrreducibleCycle(allocator: std.mem.Allocator, graph: *const Graph) Error!bool {
+    if (graph.back_edge_count == 0 or graph.blocks.items.len == 0) return false;
+    for (graph.edges.items) |edge| {
+        if (edge.to > edge.from) continue;
+        if (try canReachWithout(allocator, graph, 0, edge.from, edge.to)) return true;
+    }
+    return false;
 }
 
 test "conditional branch creates target and fallthrough edges" {
@@ -342,4 +355,39 @@ test "back edges are recorded separately from structured selections" {
     defer graph.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 1), graph.back_edge_count);
     try std.testing.expectEqual(@as(usize, 0), graph.selections.items.len);
+    try std.testing.expect(!graph.irreducible);
+}
+
+test "a cycle entered from two predecessors is irreducible" {
+    var instructions: std.ArrayList(instruction.Instruction) = .empty;
+    defer instructions.deinit(std.testing.allocator);
+    try instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .opcode = .s_cbranch_scc0,
+        .branch_target = 8,
+    });
+    try instructions.append(std.testing.allocator, .{
+        .pc = 4,
+        .opcode = .s_branch,
+        .branch_target = 12,
+    });
+    try instructions.append(std.testing.allocator, .{
+        .pc = 8,
+        .opcode = .s_branch,
+        .branch_target = 12,
+    });
+    try instructions.append(std.testing.allocator, .{
+        .pc = 12,
+        .opcode = .s_cbranch_scc0,
+        .branch_target = 4,
+    });
+    try instructions.append(std.testing.allocator, .{
+        .pc = 16,
+        .opcode = .s_endpgm,
+    });
+    const program = instruction.Program{ .code = &.{}, .instructions = instructions };
+    var graph = try build(std.testing.allocator, &program);
+    defer graph.deinit(std.testing.allocator);
+    try std.testing.expect(graph.back_edge_count >= 1);
+    try std.testing.expect(graph.irreducible);
 }

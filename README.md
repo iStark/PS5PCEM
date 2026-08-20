@@ -566,9 +566,11 @@ selections become structured
 `OpSelectionMerge`/`OpBranchConditional` regions and register values crossing
 their joins use hierarchical `OpPhi` state merging. The Tetris Effect
 compositor exercises this path with 2,401 instructions, 131 basic blocks, and
-76 selections. Unsupported loop and irreducible shapes can still take a
-documented linear diagnostic pass which skips branches; it keeps a frame
-observable but is not correct for divergent paths.
+76 selections. Natural loops lower with `OpLoopMerge`. Irreducible cycles and
+other unstructured graphs become a block-index dispatcher (`OpLoopMerge` plus
+`OpSwitch`) that preserves VCC/EXEC per-lane predicates instead of skipping
+branches. The linear diagnostic pass remains only when even that shape cannot
+be represented.
 
 Executable MUBUF lowering covers byte/short/dword scalar and vector transfers
 plus the ten common 32-bit buffer atomics; `glc` atomics preserve their returned
@@ -762,8 +764,8 @@ set.
 
 1. Validate family/opcode fields against a captured shader corpus and finish
    DPP subgroup lowering, VOP3 modifiers plus the remaining opcode tables.
-2. Structure back edges with loop merges and lower VCC/EXEC lane-mask changes
-   through the divergence-aware SSA boundary.
+2. Natural loops already lower with loop merges. Irreducible CFGs and VCC/EXEC
+   lane predicates now go through the dispatcher rather than a linear skip.
 3. Extend image lowering to array/mip/MSAA, partial-mask store, compare-gather,
    and image-atomic forms; finish the remaining DS operations, masked/multiple
    exports, and system VGPRs against captured resource and stage metadata.
@@ -963,12 +965,12 @@ The remaining stages are:
    `DRAW_INDEX_INDIRECT` / the `*_MULTI` forms read the same argument records
    and issue host draws. Remaining graphics work is layers, metadata, and
    first-use cost.
-3. Extend the current structured natural-loop and terminal-selection lowering
-   to irreducible control flow, complete VCC/EXEC divergence, and cover the
-   remaining explicit-LOD operands and image operations seen in captures. The
-   alternate gradient-free image-sample encoding is now accepted; its former
-   Jurassic Park device loss was an invalid framebuffer pairing caused by a
-   stale undersized depth attachment, not shader control flow.
+3. Cover the remaining explicit-LOD operands and image operations seen in
+   captures. Irreducible control flow and VCC/EXEC per-lane predicates now
+   lower through a dispatcher; the former Jurassic Park device loss was an
+   invalid framebuffer pairing caused by a stale undersized depth attachment,
+   not shader control flow. The alternate gradient-free image-sample encoding
+   is already accepted.
 4. Continue reducing first-use texture work and the per-draw submission cost
    for the remaining uncompressed layer and metadata paths, and validate state
    and resource invalidation against longer title captures.
