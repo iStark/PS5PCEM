@@ -7332,8 +7332,7 @@ pub const Renderer = struct {
             .{
                 .source_access_mask = vk.access_transfer_write_bit,
                 .destination_access_mask = vk.access_color_attachment_read_bit |
-                    vk.access_color_attachment_write_bit |
-                    vk.access_shader_read_bit,
+                    vk.access_color_attachment_write_bit,
                 .old_layout = vk.image_layout_transfer_dst_optimal,
                 .new_layout = vk.image_layout_color_attachment_optimal,
                 .image = destination_image,
@@ -7397,6 +7396,7 @@ pub const Renderer = struct {
             break;
         }
         const index = source_index orelse return Error.MissingPresentedFrame;
+        if (try self.blitResidentColorTarget(index, destination)) |_| return true;
         try self.materializeRenderTarget(index);
 
         var resolved_index: ?usize = null;
@@ -7424,6 +7424,186 @@ pub const Renderer = struct {
             cached.host_generation = 0;
         }
         return true;
+    }
+
+    /// Copies an exact single-sample colour attachment entirely on the GPU.
+    /// Both guest resolves and Unity's identity compositor use this shape;
+    /// materializing the source and immediately uploading identical bytes to
+    /// another attachment is an avoidable full-frame device/host round trip.
+    fn blitResidentColorTarget(
+        self: *Renderer,
+        source_index: usize,
+        destination: GuestColorTarget,
+    ) anyerror!?usize {
+        if (source_index >= self.render_targets.items.len) return null;
+        const initial_source = self.render_targets.items[source_index];
+        if (!initial_source.initialized or
+            initial_source.target.descriptor.fragments_log2 != 0 or
+            destination.descriptor.fragments_log2 != 0 or
+            initial_source.target.descriptor.address == destination.descriptor.address or
+            initial_source.target.descriptor.width != destination.descriptor.width or
+            initial_source.target.descriptor.height != destination.descriptor.height or
+            initial_source.target.format.vulkan != destination.format.vulkan)
+        {
+            return null;
+        }
+
+        // Make the source ineligible for LRU eviction while acquiring a cache
+        // slot for a destination which may not have been seen before.
+        self.render_target_sequence +%= 1;
+        self.render_targets.items[source_index].last_used_sequence = self.render_target_sequence;
+        const destination_index = try self.acquireRenderTarget(destination);
+        if (destination_index == source_index) return destination_index;
+
+        const source = self.render_targets.items[source_index];
+        const dest = self.render_targets.items[destination_index];
+        // A cache eviction during destination acquisition must never leave us
+        // recording a transfer from the replacement image in the old slot.
+        if (!source.initialized or source.image.handle != initial_source.image.handle) return null;
+
+        const source_from: u32 = if (source.shader_read_layout)
+            vk.image_layout_shader_read_only_optimal
+        else
+            vk.image_layout_color_attachment_optimal;
+        const destination_from: u32 = if (!dest.initialized)
+            vk.image_layout_undefined
+        else if (dest.shader_read_layout)
+            vk.image_layout_shader_read_only_optimal
+        else
+            vk.image_layout_color_attachment_optimal;
+        const shader_stages = vk.pipeline_stage_vertex_shader_bit |
+            vk.pipeline_stage_fragment_shader_bit |
+            vk.pipeline_stage_compute_shader_bit;
+        const source_stage: vk.Flags = if (source.shader_read_layout)
+            shader_stages
+        else
+            vk.pipeline_stage_color_attachment_output_bit;
+        const destination_stage: vk.Flags = if (!dest.initialized)
+            vk.pipeline_stage_top_of_pipe_bit
+        else if (dest.shader_read_layout)
+            shader_stages
+        else
+            vk.pipeline_stage_color_attachment_output_bit;
+
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        const to_transfer = [2]vk.ImageMemoryBarrier{
+            .{
+                .source_access_mask = if (source.shader_read_layout)
+                    vk.access_shader_read_bit
+                else
+                    vk.access_color_attachment_read_bit | vk.access_color_attachment_write_bit,
+                .destination_access_mask = vk.access_transfer_read_bit,
+                .old_layout = source_from,
+                .new_layout = vk.image_layout_transfer_src_optimal,
+                .image = source.image.handle,
+                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+            },
+            .{
+                .source_access_mask = if (!dest.initialized)
+                    0
+                else if (dest.shader_read_layout)
+                    vk.access_shader_read_bit
+                else
+                    vk.access_color_attachment_read_bit | vk.access_color_attachment_write_bit,
+                .destination_access_mask = vk.access_transfer_write_bit,
+                .old_layout = destination_from,
+                .new_layout = vk.image_layout_transfer_dst_optimal,
+                .image = dest.image.handle,
+                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+            },
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            source_stage | destination_stage,
+            vk.pipeline_stage_transfer_bit,
+            0,
+            0,
+            null,
+            0,
+            null,
+            to_transfer.len,
+            @ptrCast(&to_transfer),
+        );
+        const blit = vk.ImageBlit{
+            .source_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+            .source_offsets = .{
+                .{ .x = 0, .y = 0, .z = 0 },
+                .{
+                    .x = @intCast(source.target.descriptor.width),
+                    .y = @intCast(source.target.descriptor.height),
+                    .z = 1,
+                },
+            },
+            .destination_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+            .destination_offsets = .{
+                .{ .x = 0, .y = 0, .z = 0 },
+                .{
+                    .x = @intCast(destination.descriptor.width),
+                    .y = @intCast(destination.descriptor.height),
+                    .z = 1,
+                },
+            },
+        };
+        self.device_functions.cmd_blit_image(
+            command_buffer,
+            source.image.handle,
+            vk.image_layout_transfer_src_optimal,
+            dest.image.handle,
+            vk.image_layout_transfer_dst_optimal,
+            1,
+            @ptrCast(&blit),
+            vk.filter_nearest,
+        );
+        const from_transfer = [2]vk.ImageMemoryBarrier{
+            .{
+                .source_access_mask = vk.access_transfer_read_bit,
+                .destination_access_mask = if (source.shader_read_layout)
+                    vk.access_shader_read_bit
+                else
+                    vk.access_color_attachment_read_bit | vk.access_color_attachment_write_bit,
+                .old_layout = vk.image_layout_transfer_src_optimal,
+                .new_layout = source_from,
+                .image = source.image.handle,
+                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+            },
+            .{
+                .source_access_mask = vk.access_transfer_write_bit,
+                .destination_access_mask = vk.access_color_attachment_read_bit |
+                    vk.access_color_attachment_write_bit |
+                    vk.access_shader_read_bit,
+                .old_layout = vk.image_layout_transfer_dst_optimal,
+                .new_layout = vk.image_layout_color_attachment_optimal,
+                .image = dest.image.handle,
+                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+            },
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_transfer_bit,
+            source_stage | vk.pipeline_stage_color_attachment_output_bit,
+            0,
+            0,
+            null,
+            0,
+            null,
+            from_transfer.len,
+            @ptrCast(&from_transfer),
+        );
+        try self.submitOneShot(command_buffer);
+
+        self.render_target_sequence +%= 1;
+        const cached_destination = &self.render_targets.items[destination_index];
+        cached_destination.initialized = true;
+        cached_destination.shader_read_layout = false;
+        cached_destination.gpu_generation +%= 1;
+        cached_destination.last_used_sequence = self.render_target_sequence;
+        self.render_targets.items[source_index].last_used_sequence = self.render_target_sequence;
+        self.latest_render_target_index = destination_index;
+        for (self.completed_frames.items) |*frame| {
+            if (frame.guest_address == destination.descriptor.address) frame.needs_writeback = false;
+        }
+        return destination_index;
     }
 
     fn drawPersistentGraphicsShaders(
@@ -8990,19 +9170,11 @@ pub const Renderer = struct {
             }
             self.markVideoSurface(target.descriptor.address);
             self.video_surface_last_flip = self.flip_callbacks;
-            if (video.chroma_v == null) {
-                // Keep the established CPU fallback for the two-plane NV12
-                // path. Its planes are one contiguous, stable guest image.
-                try self.emulatePlanarVideoPass(memory, target, video);
-                return;
-            }
-
-            // Rita's Rewind exposes three separately updated I420 planes. A
-            // CPU reread can race the decoder and produce striped frames, but
-            // prepareGraphicsResources has already captured a coherent Vulkan
-            // image for each plane. Pair those images and the guest YUV pixel
-            // shader with a procedural fullscreen triangle: its guest NGG VS
-            // currently exports only half of the rectangle as a diagonal.
+            // The decoder planes have already been staged as Vulkan sampled
+            // images. Convert NV12/I420 in a fragment shader instead of
+            // reading them back, expanding RGBA on the CPU, and uploading a
+            // full 1080p target. A procedural fullscreen triangle also avoids
+            // the guest NGG VS currently exporting only half the rectangle.
             probe_parameter_mask = 3;
             fragment_input_controls[0] = 0;
             fragment_input_controls[1] = 1;
@@ -9280,6 +9452,15 @@ pub const Renderer = struct {
                 );
                 dumpShaderHead(fragment_analysis, 16);
                 dumpScalarRegisters(fragment_scalar_regs[0..fragment_scalar_count]);
+            }
+            // NV12 has a slower CPU implementation which remains useful for
+            // an as-yet unsupported guest pixel shader. Normal playback takes
+            // the translated GPU path above and never enters this fallback.
+            if (planar_video) |video| {
+                if (video.chroma_v == null) {
+                    try self.emulatePlanarVideoPass(memory, target, video);
+                    return;
+                }
             }
             return err;
         };
@@ -9813,6 +9994,25 @@ pub const Renderer = struct {
             source.cmask_fast_clear or source.fmask_compression)
         {
             return false;
+        }
+        // Resource preparation has already associated the sampled descriptor
+        // with an exact resident render target. Copy that image directly into
+        // the scanout attachment and keep the CPU detile/upload path only for
+        // guest-memory sources which have no resident Vulkan image.
+        if (self.findResidentRenderTargetIndex(source, target.format.vulkan)) |source_index| {
+            if (try self.blitResidentColorTarget(source_index, target)) |target_index| {
+                if (self.isVideoSurface(source.address)) {
+                    self.markVideoSurface(target.descriptor.address);
+                    self.latest_video_render_target_index = target_index;
+                }
+                if (log_verbose_gpu or self.flip_callbacks < 24) {
+                    std.debug.print(
+                        "[vulkan dcb] resident fullscreen sample blit: 0x{x} -> 0x{x} {d}x{d}\n",
+                        .{ source.address, target.descriptor.address, source.width, source.height },
+                    );
+                }
+                return true;
+            }
         }
         const layout = gpu.SurfaceLayout.fromImage(source) catch return false;
         const allocation_bytes = std.math.cast(usize, layout.required_source_bytes) orelse
