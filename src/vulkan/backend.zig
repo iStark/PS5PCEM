@@ -1104,6 +1104,9 @@ const CachedRenderTarget = struct {
     gpu_generation: u64 = 0,
     host_generation: u64 = 0,
     last_used_sequence: u64 = 0,
+    /// The matched guest compositor uses a negative-height viewport. Keep its
+    /// attachment resident and apply that orientation only at scanout/readback.
+    scanout_flip_vertical: bool = false,
 };
 
 /// A guest depth allocation reduced to what a Vulkan attachment needs.
@@ -2797,8 +2800,16 @@ pub const Renderer = struct {
         const blit = vk.ImageBlit{
             .source_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
             .source_offsets = .{
-                .{ .x = 0, .y = 0, .z = 0 },
-                .{ .x = @intCast(target.target.descriptor.width), .y = @intCast(target.target.descriptor.height), .z = 1 },
+                .{
+                    .x = 0,
+                    .y = if (target.scanout_flip_vertical) @intCast(target.target.descriptor.height) else 0,
+                    .z = 0,
+                },
+                .{
+                    .x = @intCast(target.target.descriptor.width),
+                    .y = if (target.scanout_flip_vertical) 0 else @intCast(target.target.descriptor.height),
+                    .z = 1,
+                },
             },
             .destination_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
             .destination_offsets = .{
@@ -7013,7 +7024,10 @@ pub const Renderer = struct {
                 try self.flushPendingGuestWrite(cached_snapshot.target.descriptor.address, visible_bytes);
             }
             const cached = &self.render_targets.items[index];
-            if (metadata_changed) cached.initialized = false;
+            if (metadata_changed) {
+                cached.initialized = false;
+                cached.scanout_flip_vertical = false;
+            }
             // Clear registers can change without changing the allocation.
             // Keep the newest descriptor for a subsequent metadata resolve.
             cached.target = target;
@@ -7156,6 +7170,9 @@ pub const Renderer = struct {
         try self.readMapped(snapshot.readback, frame);
         self.frame_profile.readback_bytes += frame_bytes;
         self.frame_profile.target_readback_bytes += frame_bytes;
+        if (snapshot.scanout_flip_vertical and snapshot.target.format.bytes_per_texel == 4) {
+            flipRgba8Rows(frame, snapshot.target.descriptor.width, snapshot.target.descriptor.height);
+        }
         if (snapshot.target.descriptor.force_destination_alpha_one) {
             forceColorTargetAlphaOne(frame, snapshot.target.format);
         }
@@ -7396,7 +7413,7 @@ pub const Renderer = struct {
             break;
         }
         const index = source_index orelse return Error.MissingPresentedFrame;
-        if (try self.blitResidentColorTarget(index, destination)) |_| return true;
+        if (try self.blitResidentColorTarget(index, destination, false)) |_| return true;
         try self.materializeRenderTarget(index);
 
         var resolved_index: ?usize = null;
@@ -7434,6 +7451,7 @@ pub const Renderer = struct {
         self: *Renderer,
         source_index: usize,
         destination: GuestColorTarget,
+        flip_vertical: bool,
     ) anyerror!?usize {
         if (source_index >= self.render_targets.items.len) return null;
         const initial_source = self.render_targets.items[source_index];
@@ -7598,6 +7616,7 @@ pub const Renderer = struct {
         cached_destination.shader_read_layout = false;
         cached_destination.gpu_generation +%= 1;
         cached_destination.last_used_sequence = self.render_target_sequence;
+        if (flip_vertical) cached_destination.scanout_flip_vertical = true;
         self.render_targets.items[source_index].last_used_sequence = self.render_target_sequence;
         self.latest_render_target_index = destination_index;
         for (self.completed_frames.items) |*frame| {
@@ -9208,10 +9227,12 @@ pub const Renderer = struct {
             draw.index_count != null and draw.index_count.? == 6 and
             matchesFullscreenSampleBlit(fragment_analysis.program.instructions.items))
         {
+            const viewport_height: f32 = @bitCast(pipeline_state.viewport_height_bits);
             if (try self.emulateFullscreenSampleBlit(
                 memory,
                 target,
                 graphics_resources.descriptors[0],
+                viewport_height < 0,
             )) return;
         }
         if (fragment_attribute_mask == 1 and vertex_storage.mapping_count == 0) {
@@ -9983,6 +10004,7 @@ pub const Renderer = struct {
         memory: GuestMemory,
         target: GuestColorTarget,
         source: gpu.ImageDescriptor,
+        flip_vertical: bool,
     ) anyerror!bool {
         if ((target.format.vulkan != vk.format_r8g8b8a8_unorm and
             target.format.vulkan != vk.format_r8g8b8a8_srgb) or
@@ -10000,15 +10022,15 @@ pub const Renderer = struct {
         // the scanout attachment and keep the CPU detile/upload path only for
         // guest-memory sources which have no resident Vulkan image.
         if (self.findResidentRenderTargetIndex(source, target.format.vulkan)) |source_index| {
-            if (try self.blitResidentColorTarget(source_index, target)) |target_index| {
+            if (try self.blitResidentColorTarget(source_index, target, flip_vertical)) |target_index| {
                 if (self.isVideoSurface(source.address)) {
                     self.markVideoSurface(target.descriptor.address);
                     self.latest_video_render_target_index = target_index;
                 }
                 if (log_verbose_gpu or self.flip_callbacks < 24) {
                     std.debug.print(
-                        "[vulkan dcb] resident fullscreen sample blit: 0x{x} -> 0x{x} {d}x{d}\n",
-                        .{ source.address, target.descriptor.address, source.width, source.height },
+                        "[vulkan dcb] resident fullscreen sample blit: 0x{x} -> 0x{x} {d}x{d} vflip={any}\n",
+                        .{ source.address, target.descriptor.address, source.width, source.height, flip_vertical },
                     );
                 }
                 return true;
@@ -10037,15 +10059,17 @@ pub const Renderer = struct {
             return Error.GuestMemoryReadFailed;
         }
         try layout.detile(allocation, rgba);
+        if (flip_vertical) flipRgba8Rows(rgba, source.width, source.height);
         const target_index = try self.uploadLinearColorTarget(target, rgba);
+        self.render_targets.items[target_index].scanout_flip_vertical = false;
         if (self.isVideoSurface(source.address)) {
             self.markVideoSurface(target.descriptor.address);
             self.latest_video_render_target_index = target_index;
         }
         if (log_verbose_gpu or self.flip_callbacks < 24) {
             std.debug.print(
-                "[vulkan dcb] emulated fullscreen sample blit: 0x{x} -> 0x{x} {d}x{d}\n",
-                .{ source.address, target.descriptor.address, source.width, source.height },
+                "[vulkan dcb] emulated fullscreen sample blit: 0x{x} -> 0x{x} {d}x{d} vflip={any}\n",
+                .{ source.address, target.descriptor.address, source.width, source.height, flip_vertical },
             );
         }
         return true;
@@ -12432,6 +12456,7 @@ pub const Renderer = struct {
             cached.initialized = false;
             cached.gpu_generation = 0;
             cached.host_generation = 0;
+            cached.scanout_flip_vertical = false;
         }
         for (self.completed_frames.items) |*cached| {
             const target = cached.target orelse continue;
@@ -13967,6 +13992,22 @@ fn scaleRgba8Nearest(
         for (1..scale) |repeat_y| {
             const row = destination[(first_destination_y + repeat_y) * destination_row_bytes ..][0..destination_row_bytes];
             @memcpy(row, first_row);
+        }
+    }
+}
+
+fn flipRgba8Rows(pixels: []u8, width: u32, height: u32) void {
+    const row_bytes = @as(usize, width) * 4;
+    const row_count: usize = height;
+    std.debug.assert(pixels.len == row_bytes * row_count);
+    for (0..row_count / 2) |top| {
+        const bottom = row_count - 1 - top;
+        for (0..row_bytes) |column| {
+            std.mem.swap(
+                u8,
+                &pixels[top * row_bytes + column],
+                &pixels[bottom * row_bytes + column],
+            );
         }
     }
 }
@@ -17898,6 +17939,20 @@ test "compute resources retain temporal scalar load specializations" {
         resources.scalar_registers.len,
     );
     try std.testing.expect(resources.scalar_registers.len > gpu.scalar_provenance.maximum_scalar_registers);
+}
+
+test "fullscreen blit row flip preserves pixels and reverses vertical order" {
+    var pixels = [_]u8{
+        1, 2,  3,  4,
+        5, 6,  7,  8,
+        9, 10, 11, 12,
+    };
+    flipRgba8Rows(&pixels, 1, 3);
+    try std.testing.expectEqualSlices(u8, &.{
+        9, 10, 11, 12,
+        5, 6,  7,  8,
+        1, 2,  3,  4,
+    }, &pixels);
 }
 
 test "progress dumps select bounded presentation checkpoints" {
