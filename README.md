@@ -94,11 +94,17 @@ If you would like to support continued PS5PCEM development, you can do so on
 - Asterix & Obelix: Slap Them All! now completes its Unity and PSN plug-in
   bootstrap, creates AGC shaders from four-byte-aligned headers, and reaches
   repeated 1920×1080 VideoOut frames. Its ATL intro is decoded by SceAvPlayer
-  into title-owned NV12 surfaces. The observed full-image compute copy,
-  fullscreen sample blit, planar YUV conversion, and color-resolve passes have
-  bounded host implementations, avoiding multi-second general shader paths
-  during the movie. This is an intro-video milestone; a repeatable menu or
-  gameplay frame is not claimed yet.
+  into title-owned NV12 surfaces. Synchronous AGC completion now advances the
+  driver's paired CPU retirement label, removing the Unity graphics worker's
+  three-second watchdog spin on every frame. Resident fullscreen copies remain
+  on the GPU, and the translated guest pixel shader converts the staged NV12
+  planes directly into the Vulkan render target instead of expanding and
+  transferring a full RGBA frame through host memory. The observed cadence on
+  the current RTX 3070 Ti host fell from roughly 3.1 seconds to 240–250 ms per
+  frame. The final Unity compositor now retains the guest negative-height
+  viewport as scanout orientation, so the scene and UI are no longer vertically
+  inverted. A 540-flip validation run remained submission-clean and reached the
+  repeatable gameplay frame shown below.
 - Jurassic Park Classic Games Collection now resolves the observed Font,
   FontFt, JPEG, Pad, VideoOut, Posix, and AGC driver imports, completes its
   Unity bootstrap, and reaches a stable visible 3840×2160 intro frame. Both the
@@ -206,6 +212,14 @@ and the title's loading screen. The ship, HUD, layered level art, lighting, and
 text are produced by the guest multi-draw, sampled-texture,
 persistent-render-target, compute, and VideoOut paths.*
 
+![Asterix & Obelix: Slap Them All! gameplay rendered by PS5PCEM](docs/images/asterix-obelix-gameplay.png)
+
+*A live 1920×1080 Asterix & Obelix: Slap Them All! gameplay frame captured at
+flip 512. The scene, characters, HUD, and prompt come from the title's guest
+draws. The final fullscreen compositor remains GPU-resident, while scanout
+preserves the guest viewport's vertical orientation without a per-frame
+host-memory round trip.*
+
 ![Mighty Morphin Power Rangers: Rita's Rewind intro rendered by PS5PCEM](docs/images/ritas-rewind-intro.png)
 
 *A live 1920×1080 Rita's Rewind publisher/title intro frame produced by the
@@ -260,7 +274,7 @@ the repository contains none of that content.
 | **Tetris Effect: Connected** | Completes the Unreal bootstrap and a measured startup frame with 595 guest draws and 63 compute dispatches, including typed 2D/3D storage images, `64×64×64 RGBA16_FLOAT` volumes, layered post-process targets, `RGBA32_FLOAT` exposure surfaces, a `10_10_10_2_UNORM` lookup target, and the mixed image/LDS prepass. Ordered AGC completion acknowledgement removes the intermittent retirement race, and the latest unattended run advanced through 49 VideoOut cycles. Most post-bootstrap cycles measured about 3.3–3.8 seconds on the current RTX 3070 Ti host. The first generated `0xe060`-byte material pixel shader is now decoded within its exact AGC allocation instead of the old fixed instruction ceiling | The latest verified visible output is still the recognizable 1920×1080 HDR particle target shown above. The exact registered 3840×2160 VideoOut target remains black, so presentation falls back to a converted `R11G11B10_FLOAT` intermediate. NGG/fetch-shader continuations, exact layered rendering, final scanout aliasing/tonemapping, one oversized guest-buffer descriptor, and performance remain incomplete; neither a menu nor gameplay is claimed |
 | **The Precinct** | Links the complete six-image guest graph, starts Unity plug-ins through `sceKernelLoadStartModule`, indexes its audio assets, and plays both observed intro movies as synchronized 3840×2160 NV12 video and 48 kHz stereo PCM. It renders the complete 1920×1080 title artwork, opens `PLAY GAME`, and displays the readable `NEW GAME` confirmation shown above. Holding `Triangle` enters the cold world load; an earlier guarded run reached the `Cross` prompt and produced the first verified in-engine gameplay image. Target-thread exception delivery completes Unity's stop-the-world handshake, resident typed storage images preserve its compute graph, and dynamic compute scalars prevent runtime SGPR values from generating a new Vulkan pipeline every frame. Its world-load frame measures 2.1 s where it measured 5.1 s, after descriptor recovery stopped replaying each kernel's prolog once per resource it names | The first world transition still takes several minutes on the current RTX 3070 Ti test host because first-use shader translation, NVIDIA pipeline compilation, synchronous submission, and resource staging remain expensive. The former title- and shader-signature-specific NVIDIA compiler guard has been removed in favor of the general shader path, so the transition needs a fresh end-to-end validation before current gameplay compatibility is claimed |
 | **Jets 'n' Guns 2** | Resolves title content through `/app0`, completes AGC resource registration, and sustains the full graphics/compute/VideoOut loop. Targetless final passes are preserved through flip, while dynamic SGPR data and descriptor-sized buffer bounds keep streamed sprite batches on stable Vulkan pipelines. `START GAME` now passes the loading screen and reaches the recognizable 3840×2160 tutorial gameplay shown above; the unattended run remained live beyond flip 300. Firmware-default mutex compatibility preserves the CRT's recursive `trylock` guard without leaking recursion into the audio workers' blocking slow path | The cold transition into the first dense gameplay scene still takes roughly 30–40 seconds on the current RTX 3070 Ti host. Once loaded, observed 227–256-draw frames take about 0.6–1.6 seconds, dominated by synchronous Vulkan submission, resource staging, and first-use work; broad input and in-game audio compatibility still need longer validation |
-| **Asterix & Obelix: Slap Them All!** | Maps the Unity/PSN plug-in graph, passes GameUpdate, trophy, entitlement, WebApi, and player-review bootstrap calls, accepts four-byte-aligned AGC shader headers, and reaches repeated 1920×1080 frames. SceAvPlayer returns the ATL intro as correctly decoded NV12 frames, while matched image-copy, planar-conversion, fullscreen-blit, and color-resolve paths keep the observed movie pipeline moving without its former multi-second shader compilation/dispatch blockers | The decoded source is recognizable, but final compositor scaling/presentation still needs validation and no repeatable menu or gameplay frame is claimed yet |
+| **Asterix & Obelix: Slap Them All!** | Maps the Unity/PSN plug-in graph, passes GameUpdate, trophy, entitlement, WebApi, and player-review bootstrap calls, accepts four-byte-aligned AGC shader headers, and reaches repeatable 1920×1080 gameplay. SceAvPlayer returns the ATL intro as correctly decoded NV12 frames; the translated guest pixel shader converts the staged planes on the GPU, resident fullscreen copies avoid the former GPU→CPU→GPU round trip, and synchronous AGC retirement removes the three-second Unity polling timeout. Scanout orientation now follows the final compositor's negative-height viewport, keeping gameplay and UI upright. The latest 540-flip run remained submission-clean and reproduced the gameplay frame shown above at roughly 240–250 ms per frame on the current RTX 3070 Ti host | Gameplay is verified through the opening forest scene. Guest frame pacing, synchronous Vulkan submission, broader input coverage, audio, and longer play-session stability remain performance and compatibility targets |
 | **Jurassic Park Classic Games Collection** | Resolves the observed firmware graph, enters Unity, opens the splash and intro MP4 assets through both SceAvPlayer ABIs, and presents the recognizable Jurassic gate intro shown above through the title's 3840×2160 VideoOut buffers. The matched NV12 path accepts UV/Y descriptor order, derives the 2048-byte decoder pitch from the plane layout, performs the observed 2× conversion, and rejects cleared all-zero surfaces during clip changes. It leaves the intro as well: the splash and intro clips play in sequence with sound, and the title reaches its menu and holds it at interactive rates. The alternate `IMAGE_SAMPLE_A` fragment encoding now translates and executes; a general attachment-extent check prevents stale 1×1 depth state from invalidating the 3840×2160 framebuffer. The latest regression run remained submission-clean beyond flip 1,200 and reproduced the illuminated gate scene | Gameplay is not claimed. Remaining shader operations, broader menu interaction, and a longer play-session regression still need validation |
 | **Mighty Morphin Power Rangers: Rita's Rewind** | Resolves the observed Fiber, Pad, offline NP, AGC 1.1, and AGC driver imports, enters a stable 1920×1080 graphics/audio loop, and renders the animated publisher sequence, title menu, and post-menu scene shown above. Native cooperative fibers retain suspended guest stacks, `scePadGetHandle` supplies a readable primary controller, and exact `V_SAD_U32`, `V_MUL_HI_I32`, and `V_CVT_FLR_I32_F32` lowering removes the diagnostic shader fallback. Holding `Cross` advances through the title prompt, and the observed intro remains smooth at roughly 13–20 ms per frame on the current RTX 3070 Ti host | The exact guest CRT composite still produces static on the current host, so a strict shader-signature fallback performs the observed 4× RGBA8 scene scale before downstream post-processing. Dense post-menu frames can contain roughly 255 draws and currently take about 470 ms, dominated by repeated guest-buffer staging; broad gameplay and input compatibility are not claimed yet |
 
@@ -2405,7 +2419,11 @@ scheduler and Vulkan backend. Observed startup work now includes:
   persistent RGBA target, and the observed color resolve preserves the result
   through the final VideoOut copies. These paths validate dimensions, formats,
   descriptors, dispatch geometry, and instruction shape before taking the fast
-  path; unmatched work continues through normal shader translation.
+  path; unmatched work continues through normal shader translation. The matched
+  final compositor also carries its negative-height viewport into scanout
+  metadata. Vulkan presents that resident attachment with the corresponding
+  vertical orientation, and diagnostic materialization applies the same row
+  order, keeping both the live window and captured gameplay upright.
 - The writable `/devlog/app/debug.log` console path is redirected to
   `out/guest-debug.log` without making `/app0` writable. Unity diagnostics can
   therefore survive startup failures while title content retains its read-only
