@@ -81,6 +81,7 @@ var compact_release_reports: u32 = 0;
 var submission_reports: u32 = 0;
 var interrupt_release_reports: u32 = 0;
 var release_delivery_reports: u32 = 0;
+var retirement_bridge_reports: u32 = 0;
 
 const maximum_submission_aliases = 256;
 const SubmissionAlias = struct {
@@ -734,6 +735,89 @@ fn triggerReleaseInterrupt(value: gpu.state.ReleaseMem) void {
     enqueueCompletion(.{ .kind = .release, .context_id = value.interrupt_context_id });
 }
 
+/// Some AGC runtimes keep a CPU retirement label immediately before their
+/// hardware EOP label. The real interrupt handler advances the former after
+/// observing the latter. Our renderer completes a submitted DCB synchronously,
+/// but the approximate interrupt path does not know this private driver
+/// structure, leaving the CPU label at zero. Unity then busy-polls it for the
+/// full three-second watchdog timeout before every frame.
+///
+/// Recognize the observed self-describing layout conservatively and publish
+/// the driver's issued sequence. This is valid for the synchronous backend:
+/// the submitting guest thread cannot regain control until the whole stream
+/// has completed. Unrelated release labels fail the signature, pointer,
+/// padding, and bounded-sequence checks and remain untouched.
+fn synchronousRetirementValue(
+    release_address: u64,
+    release_data: u64,
+    signature: u64,
+    retirement_address: u64,
+    issued: u64,
+    reserved: u64,
+    completed: u64,
+    retired: u64,
+) ?u64 {
+    if (release_address < 0x40 or release_address & 0xf != 0) return null;
+    // All fields must share the release label's mapped guest page. This also
+    // keeps the prefix probes from crossing into an unrelated/unmapped page.
+    if (release_address & 0xfff < 0x40) return null;
+    if (signature != 0x0000_0002_0000_0000) return null;
+    if (retirement_address != release_address - 0x40) return null;
+    if (reserved != 0 or completed != release_data) return null;
+    if (issued < release_data or issued - release_data > 0x100) return null;
+    if (retired >= issued) return null;
+    return issued;
+}
+
+fn publishSynchronousRetirement(value: gpu.state.ReleaseMem) void {
+    if (value.data_selection != 2 or
+        value.address < 0x40 or
+        value.address & 0xf != 0 or
+        value.address & 0xfff < 0x40)
+    {
+        return;
+    }
+
+    // [signature, retirement pointer, issued, reserved, hardware completed]
+    var state: [5 * @sizeOf(u64)]u8 = undefined;
+    if (!readGuestMemory(null, value.address - 0x20, &state)) return;
+    const signature = std.mem.readInt(u64, state[0..8], .little);
+    const retirement_address = std.mem.readInt(u64, state[8..16], .little);
+    const issued = std.mem.readInt(u64, state[16..24], .little);
+    const reserved = std.mem.readInt(u64, state[24..32], .little);
+    const completed = std.mem.readInt(u64, state[32..40], .little);
+    if (signature != 0x0000_0002_0000_0000 or
+        retirement_address != value.address - 0x40 or reserved != 0)
+    {
+        return;
+    }
+
+    var retired_bytes: [8]u8 = undefined;
+    if (!readGuestMemory(null, retirement_address, &retired_bytes)) return;
+    const retired = std.mem.readInt(u64, &retired_bytes, .little);
+    const publish = synchronousRetirementValue(
+        value.address,
+        value.data,
+        signature,
+        retirement_address,
+        issued,
+        reserved,
+        completed,
+        retired,
+    ) orelse return;
+
+    std.mem.writeInt(u64, &retired_bytes, publish, .little);
+    if (!writeGuestMemory(null, retirement_address, &retired_bytes)) return;
+    kernel_runtime.wakeSyncAddress(retirement_address, std.math.maxInt(usize));
+    if (retirement_bridge_reports < 8) {
+        std.debug.print(
+            "[agc retirement] hardware=0x{x}/0x{x} cpu=0x{x} 0x{x}->0x{x}\n",
+            .{ value.address, completed, retirement_address, retired, publish },
+        );
+        retirement_bridge_reports += 1;
+    }
+}
+
 fn backendRelease(_: ?*anyopaque, value: gpu.state.ReleaseMem) bool {
     if (compact_release_reports < 64) {
         if (resolveSubmissionAlias(value.address, switch (value.data_selection) {
@@ -798,7 +882,10 @@ fn backendRelease(_: ?*anyopaque, value: gpu.state.ReleaseMem) bool {
             // The EOP edge is observable only after its preceding Vulkan work
             // and release-label write. Waking before callback completion lets
             // the driver consume the event while the old fence is still set.
-            if (accepted) triggerReleaseInterrupt(value);
+            if (accepted) {
+                publishSynchronousRetirement(value);
+                triggerReleaseInterrupt(value);
+            }
             return accepted;
         }
     }
@@ -829,6 +916,7 @@ fn backendRelease(_: ?*anyopaque, value: gpu.state.ReleaseMem) bool {
         else => true,
     };
     if (ok) {
+        publishSynchronousRetirement(value);
         kernel_runtime.wakeSyncAddress(value.address, std.math.maxInt(usize));
         triggerReleaseInterrupt(value);
     }
@@ -958,6 +1046,7 @@ pub fn reset() void {
     submission_reports = 0;
     interrupt_release_reports = 0;
     release_delivery_reports = 0;
+    retirement_bridge_reports = 0;
     submission_alias_lock.lock();
     submission_aliases = [_]SubmissionAlias{.{}} ** submission_aliases.len;
     next_submission_alias = 0;
@@ -1738,6 +1827,70 @@ test "compact GPU label address resolves into submitted CPU arena" {
     var observed: u32 = 0;
     try testing.expect(readGuestMemory(null, gpu_address, std.mem.asBytes(&observed)));
     try testing.expectEqual(value, observed);
+}
+
+test "synchronous AGC completion advances a paired CPU retirement label" {
+    const release_address: u64 = 0x2008_a2a50;
+    try testing.expectEqual(@as(?u64, 88), synchronousRetirementValue(
+        release_address,
+        84,
+        0x0000_0002_0000_0000,
+        release_address - 0x40,
+        88,
+        0,
+        84,
+        0,
+    ));
+    try testing.expect(synchronousRetirementValue(
+        release_address,
+        84,
+        0x0000_0002_0000_0000,
+        release_address - 0x40,
+        88,
+        0,
+        84,
+        88,
+    ) == null);
+    try testing.expect(synchronousRetirementValue(
+        release_address,
+        84,
+        0x0000_0002_0000_0000,
+        release_address - 0x38,
+        88,
+        0,
+        84,
+        0,
+    ) == null);
+    try testing.expect(synchronousRetirementValue(
+        release_address,
+        84,
+        0,
+        release_address - 0x40,
+        88,
+        0,
+        84,
+        0,
+    ) == null);
+    try testing.expect(synchronousRetirementValue(
+        release_address,
+        84,
+        0x0000_0002_0000_0000,
+        release_address - 0x40,
+        84 + 0x101,
+        0,
+        84,
+        0,
+    ) == null);
+    try testing.expect(synchronousRetirementValue(
+        0x2008_a2010,
+        84,
+        0x0000_0002_0000_0000,
+        0x2008_a1fd0,
+        88,
+        0,
+        84,
+        0,
+    ) == null);
 }
 
 test "an empty submission is not a failure" {
