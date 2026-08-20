@@ -2542,6 +2542,30 @@ fn agcSetNumInstances(
     return writeAgcPacket(buffer, gpu.pm4.num_instances, &body);
 }
 
+fn agcSetBaseIndirectArgs(
+    buffer: ?*AgcCommandBuffer,
+    shader_type: u32,
+    address: u64,
+) callconv(abi.guest) ?[*]u32 {
+    return agc.setBaseIndirectArgs(@ptrCast(buffer), shader_type, address);
+}
+
+fn agcDrawIndirect(
+    buffer: ?*AgcCommandBuffer,
+    data_offset: u32,
+    modifier: u64,
+) callconv(abi.guest) ?[*]u32 {
+    return agc.drawIndirect(@ptrCast(buffer), data_offset, modifier);
+}
+
+fn agcDrawIndexIndirect(
+    buffer: ?*AgcCommandBuffer,
+    data_offset: u32,
+    modifier: u64,
+) callconv(abi.guest) ?[*]u32 {
+    return agc.drawIndexIndirect(@ptrCast(buffer), data_offset, modifier);
+}
+
 fn agcSetIndexSize(
     buffer: ?*AgcCommandBuffer,
     index_size: u32,
@@ -3228,12 +3252,12 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcDcbDrawIndexAutoGetSize", .function = trace.wrap("sceAgcDcbDrawIndexAutoGetSize", &agcDrawIndexAutoGetSize), .expect_id = "WrdP9Zxx3lQ" },
     .{ .name = "sceAgcDcbDrawIndexOffset", .function = trace.wrap("sceAgcDcbDrawIndexOffset", &agcDrawIndexOffset), .expect_id = "B+aG9DUnTKA" },
     .{ .name = "sceAgcDcbDrawIndexOffsetGetSize", .function = trace.wrap("sceAgcDcbDrawIndexOffsetGetSize", &agcDrawIndexOffsetGetSize), .expect_id = "qMlfB1ZhMDc" },
-    .{ .name = "sceAgcDcbDrawIndexIndirect", .function = trace.wrap("sceAgcDcbDrawIndexIndirect", &agcCommand), .expect_id = "t1vNu082-jM" },
-    .{ .name = "sceAgcDcbDrawIndirect", .function = trace.wrap("sceAgcDcbDrawIndirect", &agcCommand), .expect_id = "1q1titRBL6o" },
+    .{ .name = "sceAgcDcbDrawIndexIndirect", .function = trace.wrap("sceAgcDcbDrawIndexIndirect", &agcDrawIndexIndirect), .expect_id = "t1vNu082-jM" },
+    .{ .name = "sceAgcDcbDrawIndirect", .function = trace.wrap("sceAgcDcbDrawIndirect", &agcDrawIndirect), .expect_id = "1q1titRBL6o" },
     .{ .name = "sceAgcDcbDispatchIndirect", .function = trace.wrap("sceAgcDcbDispatchIndirect", &agcCommand), .expect_id = "CtB+A9-VxO0" },
     .{ .name = "sceAgcDcbSetNumInstances", .function = trace.wrap("sceAgcDcbSetNumInstances", &agcSetNumInstances), .expect_id = "tSBxhAPyytQ" },
     .{ .name = "sceAgcDcbStallCommandBufferParser", .function = trace.wrap("sceAgcDcbStallCommandBufferParser", &agcCommand), .expect_id = "u2T2DiA5hRI" },
-    .{ .name = "sceAgcDcbSetBaseIndirectArgs", .function = trace.wrap("sceAgcDcbSetBaseIndirectArgs", &agcCommand), .expect_id = "RmaJwLtc8rY" },
+    .{ .name = "sceAgcDcbSetBaseIndirectArgs", .function = trace.wrap("sceAgcDcbSetBaseIndirectArgs", &agcSetBaseIndirectArgs), .expect_id = "RmaJwLtc8rY" },
     .{ .name = "sceAgcDcbSetShRegistersIndirect", .function = trace.wrap("sceAgcDcbSetShRegistersIndirect", &agcSetShRegistersIndirect), .expect_id = "-HOOCn0JY48" },
     .{ .name = "sceAgcDcbSetUcRegistersIndirect", .function = trace.wrap("sceAgcDcbSetUcRegistersIndirect", &agcSetUcRegistersIndirect), .expect_id = "hvUfkUIQcOE" },
     .{ .name = "sceAgcDcbSetCxRegistersIndirect", .function = trace.wrap("sceAgcDcbSetCxRegistersIndirect", &agcSetCxRegistersIndirect), .expect_id = "ZvwO9euwYzc" },
@@ -3594,6 +3618,45 @@ test "bootstrap AGC emits indexed-buffer state and offset draw packets" {
     const draw = (try walker.next()).?;
     try std.testing.expectEqual(gpu.pm4.draw_index_offset_2, draw.opcode);
     try std.testing.expectEqualSlices(u32, &.{ 12, 5, 12, 0 }, draw.body);
+    try std.testing.expect((try walker.next()) == null);
+}
+
+test "bootstrap AGC emits set-base and indirect draw packets" {
+    var words: [14]u32 = @splat(0xdead_beef);
+    var command_buffer = AgcCommandBuffer{
+        .bottom = words[0..].ptr,
+        .top = words[0..].ptr + words.len,
+        .cursor_up = words[0..].ptr,
+        .cursor_down = null,
+        .callback = null,
+        .user_data = null,
+        .reserved_dwords = 0,
+    };
+    try std.testing.expectEqual(@as(u32, 16), agc.setBaseDrawIndirectArgsGetSize());
+    try std.testing.expectEqual(@as(u32, 20), agc.drawIndirectGetSize());
+    try std.testing.expectEqual(@as(u32, 40), agc.drawIndexIndirectMultiGetSize());
+    try std.testing.expect(agcSetBaseIndirectArgs(&command_buffer, 0, 0x1234_5678_9abc_def0) != null);
+    try std.testing.expect(agcDrawIndirect(&command_buffer, 0x40, 0) != null);
+    try std.testing.expect(agcDrawIndexIndirect(&command_buffer, 0x80, 0) != null);
+    try std.testing.expectEqual(words[0..].ptr + words.len, command_buffer.cursor_up.?);
+
+    var walker = gpu.pm4.Walker.init(&words);
+    const base = (try walker.next()).?;
+    try std.testing.expectEqual(gpu.pm4.set_base, base.opcode);
+    try std.testing.expect(!base.compute);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 0x9abc_def0, 0x1234_5678 }, base.body);
+
+    const draw = (try walker.next()).?;
+    try std.testing.expectEqual(gpu.pm4.draw_indirect, draw.opcode);
+    const draw_spec = gpu.pm4.decodeIndirectDrawSpec(draw).?;
+    try std.testing.expect(!draw_spec.indexed);
+    try std.testing.expectEqual(@as(u32, 0x40), draw_spec.data_offset);
+
+    const indexed = (try walker.next()).?;
+    try std.testing.expectEqual(gpu.pm4.draw_index_indirect, indexed.opcode);
+    const indexed_spec = gpu.pm4.decodeIndirectDrawSpec(indexed).?;
+    try std.testing.expect(indexed_spec.indexed);
+    try std.testing.expectEqual(@as(u32, 0x80), indexed_spec.data_offset);
     try std.testing.expect((try walker.next()) == null);
 }
 

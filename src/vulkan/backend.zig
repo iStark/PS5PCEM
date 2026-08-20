@@ -849,6 +849,10 @@ const GuestDraw = struct {
     /// Non-indexed `DRAW_INDEX_AUTO` path (diagnostic triangle is count 3).
     vertex_count: u32 = 3,
     instance_count: u32 = 1,
+    first_vertex: u32 = 0,
+    first_instance: u32 = 0,
+    /// Signed base-vertex applied to an indexed draw.
+    vertex_offset: i32 = 0,
     /// When set, issue `vkCmdDrawIndexed` from guest memory at `index_address`.
     index_count: ?u32 = null,
     index_address: u64 = 0,
@@ -7789,10 +7793,23 @@ pub const Renderer = struct {
                     0,
                     if (draw.index_uint32) vk.index_type_uint32 else vk.index_type_uint16,
                 );
-                self.device_functions.cmd_draw_indexed(command_buffer, index_count, draw.instance_count, 0, 0, 0);
+                self.device_functions.cmd_draw_indexed(
+                    command_buffer,
+                    index_count,
+                    draw.instance_count,
+                    0,
+                    draw.vertex_offset,
+                    draw.first_instance,
+                );
             }
         } else if (draw.vertex_count != 0) {
-            self.device_functions.cmd_draw(command_buffer, draw.vertex_count, draw.instance_count, 0, 0);
+            self.device_functions.cmd_draw(
+                command_buffer,
+                draw.vertex_count,
+                draw.instance_count,
+                draw.first_vertex,
+                draw.first_instance,
+            );
         }
         self.device_functions.cmd_end_render_pass(command_buffer);
         try self.submitOneShot(command_buffer);
@@ -8039,8 +8056,8 @@ pub const Renderer = struct {
                     index_count,
                     draw.instance_count,
                     0,
-                    0,
-                    0,
+                    draw.vertex_offset,
+                    draw.first_instance,
                 );
             }
         } else if (draw.vertex_count != 0) {
@@ -8048,8 +8065,8 @@ pub const Renderer = struct {
                 command_buffer,
                 draw.vertex_count,
                 draw.instance_count,
-                0,
-                0,
+                draw.first_vertex,
+                draw.first_instance,
             );
         }
         self.device_functions.cmd_end_render_pass(command_buffer);
@@ -13011,6 +13028,119 @@ pub const Renderer = struct {
         return false;
     }
 
+    fn decodeDirectGuestDraw(packet: gpu.pm4.Packet, state: *const gpu.State) ?GuestDraw {
+        // AGC's DRAW_INDEX_2 body is max_size, index_va_lo/hi, index_count,
+        // draw_initiator — the same layout bootstrap services emit. AUTO is the
+        // non-indexed count form used by the diagnostic triangle probe.
+        if (packet.opcode == gpu.pm4.draw_index_auto and packet.body.len >= 1)
+            return .{ .vertex_count = packet.body[0] };
+        if (packet.opcode == gpu.pm4.draw_index_2 and packet.body.len >= 5)
+            return .{
+                .index_count = packet.body[3],
+                .index_address = (@as(u64, packet.body[2]) << 32) | packet.body[1],
+                // AGC index streams are 16-bit by default; 32-bit shows up as
+                // INDEX_TYPE later and is not tracked in GPU state yet.
+                .index_uint32 = false,
+            };
+        if (packet.opcode == gpu.pm4.draw_index_offset_2 and packet.body.len >= 4)
+            return .{
+                .index_count = packet.body[2],
+                .index_address = state.index_base_address +| (@as(u64, packet.body[1]) * gpu.pm4.indexElementBytes(state.index_type)),
+                .index_uint32 = state.index_type == 1,
+            };
+        return null;
+    }
+
+    fn resolveIndirectDrawCount(self: *Renderer, spec: gpu.pm4.IndirectDrawSpec) Error!u32 {
+        var count = spec.count;
+        if (spec.count_from_memory) {
+            if (spec.count_address == 0) return Error.UnsupportedDrawPacket;
+            try self.flushPendingGuestWrite(spec.count_address, 4);
+            const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+            count = try readGuestU32(memory, spec.count_address);
+            if (spec.count != 0) count = @min(count, spec.count);
+        }
+        return @min(count, gpu.pm4.maximum_indirect_draw_count);
+    }
+
+    fn readIndirectGuestDraw(
+        self: *Renderer,
+        state: *const gpu.State,
+        spec: gpu.pm4.IndirectDrawSpec,
+        index: u32,
+    ) Error!GuestDraw {
+        const arg_bytes = gpu.pm4.indirectDrawArgBytes(spec.indexed);
+        if (spec.stride < arg_bytes) return Error.UnsupportedDrawPacket;
+        if (state.draw_indirect_args_base_address == 0) return Error.UnsupportedDrawPacket;
+        const address = std.math.add(
+            u64,
+            state.draw_indirect_args_base_address,
+            spec.data_offset,
+        ) catch return Error.UnsupportedDrawPacket;
+        const record = std.math.add(
+            u64,
+            address,
+            @as(u64, spec.stride) * index,
+        ) catch return Error.UnsupportedDrawPacket;
+        try self.flushPendingGuestWrite(record, arg_bytes);
+        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        if (spec.indexed) {
+            var bytes: [@sizeOf(gpu.pm4.DrawIndexedIndirectArgs)]u8 = undefined;
+            if (!memory.read(memory.context, record, &bytes)) return Error.GuestMemoryReadFailed;
+            const args = gpu.pm4.parseDrawIndexedIndirectArgs(&bytes);
+            var index_count = args.index_count;
+            if (state.index_buffer_size != 0) index_count = @min(index_count, state.index_buffer_size);
+            return .{
+                .vertex_count = 0,
+                .instance_count = args.instance_count,
+                .first_instance = args.start_instance,
+                .vertex_offset = args.base_vertex,
+                .index_count = index_count,
+                .index_address = state.index_base_address +| (@as(u64, args.start_index) * gpu.pm4.indexElementBytes(state.index_type)),
+                .index_uint32 = state.index_type == 1,
+            };
+        }
+        var bytes: [@sizeOf(gpu.pm4.DrawIndirectArgs)]u8 = undefined;
+        if (!memory.read(memory.context, record, &bytes)) return Error.GuestMemoryReadFailed;
+        const args = gpu.pm4.parseDrawIndirectArgs(&bytes);
+        return .{
+            .vertex_count = args.vertex_count,
+            .instance_count = args.instance_count,
+            .first_vertex = args.start_vertex,
+            .first_instance = args.start_instance,
+        };
+    }
+
+    fn reportGuestDrawFailure(self: *Renderer, state: *const gpu.State, err: anyerror) void {
+        if (!self.shouldReportDrawError(err)) return;
+        std.debug.print("[vulkan dcb] draw rejected: {s}\n", .{@errorName(err)});
+        if (err != Error.UnsupportedColorTarget) return;
+        const rejected_state = gpu.resources.decodeRenderState(state);
+        for (rejected_state.color_targets) |candidate| {
+            const target = candidate orelse continue;
+            if (!target.isActive()) continue;
+            std.debug.print(
+                "[vulkan dcb] rejected target slot={d} addr=0x{x} {d}x{d} pitch={d} fmt={d} num={d} swap={d} tile={s} samples={d} frags={d} dcc={any} cmask={any} fmask={any}\n",
+                .{
+                    target.slot,
+                    target.address,
+                    target.width,
+                    target.height,
+                    target.pitch,
+                    target.format,
+                    target.number_type,
+                    target.component_swap,
+                    @tagName(target.tile_mode),
+                    target.samples_log2,
+                    target.fragments_log2,
+                    target.dcc_enabled,
+                    target.cmask_fast_clear,
+                    target.fmask_compression,
+                },
+            );
+        }
+    }
+
     fn dcbDraw(context: ?*anyopaque, state: *const gpu.State, packet: gpu.pm4.Packet) bool {
         const self = fromContext(context);
         const profile_started = hostTimestampNs();
@@ -13036,38 +13166,48 @@ pub const Renderer = struct {
         );
         if (!has_vertex and !has_fragment and !self.graphics_probe_enabled) return true;
 
-        // AGC's DRAW_INDEX_2 body is max_size, index_va_lo/hi, index_count,
-        // draw_initiator — the same layout bootstrap services emit. AUTO is the
-        // non-indexed count form used by the diagnostic triangle probe.
-        const draw: GuestDraw = if (packet.opcode == gpu.pm4.draw_index_auto and packet.body.len >= 1)
-            .{ .vertex_count = packet.body[0] }
-        else if (packet.opcode == gpu.pm4.draw_index_2 and packet.body.len >= 5)
-            .{
-                .index_count = packet.body[3],
-                .index_address = (@as(u64, packet.body[2]) << 32) | packet.body[1],
-                // AGC index streams are 16-bit by default; 32-bit shows up as
-                // INDEX_TYPE later and is not tracked in GPU state yet.
-                .index_uint32 = false,
-            }
-        else if (packet.opcode == gpu.pm4.draw_index_offset_2 and packet.body.len >= 4)
-            .{
-                .index_count = packet.body[2],
-                .index_address = state.index_base_address +| (@as(u64, packet.body[1]) * switch (state.index_type) {
-                    0 => @as(u64, 2),
-                    1 => @as(u64, 4),
-                    2 => @as(u64, 1),
-                    3 => @as(u64, 2),
-                }),
-                .index_uint32 = state.index_type == 1,
-            }
-        else {
+        const direct = decodeDirectGuestDraw(packet, state);
+        var indirect_spec: gpu.pm4.IndirectDrawSpec = undefined;
+        const uses_indirect = if (direct == null) blk: {
+            indirect_spec = gpu.pm4.decodeIndirectDrawSpec(packet) orelse {
+                self.last_draw_error = Error.UnsupportedDrawPacket;
+                std.debug.print(
+                    "[vulkan dcb] draw rejected: {s} (opcode=0x{x}, body={d})\n",
+                    .{ @errorName(Error.UnsupportedDrawPacket), packet.opcode, packet.body.len },
+                );
+                return false;
+            };
+            break :blk true;
+        } else false;
+        if (uses_indirect and state.draw_indirect_args_base_address == 0) {
             self.last_draw_error = Error.UnsupportedDrawPacket;
             std.debug.print(
-                "[vulkan dcb] draw rejected: {s} (opcode=0x{x}, body={d})\n",
-                .{ @errorName(Error.UnsupportedDrawPacket), packet.opcode, packet.body.len },
+                "[vulkan dcb] draw rejected: {s} (opcode=0x{x}, missing SET_BASE)\n",
+                .{ @errorName(Error.UnsupportedDrawPacket), packet.opcode },
             );
             return false;
-        };
+        }
+        const draw_count: u32 = if (uses_indirect) self.resolveIndirectDrawCount(indirect_spec) catch |err| {
+            self.last_draw_error = err;
+            std.debug.print(
+                "[vulkan dcb] draw rejected: {s} (opcode=0x{x}, missing SET_BASE={any})\n",
+                .{ @errorName(err), packet.opcode, state.draw_indirect_args_base_address == 0 },
+            );
+            return false;
+        } else 1;
+        if (draw_count == 0) return true;
+        if (uses_indirect and (log_verbose_gpu or self.translated_draws == 0)) {
+            std.debug.print(
+                "[vulkan dcb] indirect draw opcode=0x{x} args=0x{x} off=0x{x} count={d} indexed={any}\n",
+                .{
+                    packet.opcode,
+                    state.draw_indirect_args_base_address,
+                    indirect_spec.data_offset,
+                    draw_count,
+                    indirect_spec.indexed,
+                },
+            );
+        }
 
         // Vertex-only or pixel-only draws show up in pre-passes before both
         // stages are bound. Rejecting them aborts the DCB; accepting as a no-op
@@ -13124,56 +13264,47 @@ pub const Renderer = struct {
                     return true;
                 }
             }
-            if (render_state.active_color_count == 0) {
-                self.appendPendingTargetlessDraw(state, draw, vertex_stage.?);
-                return true;
-            }
-            // Targetless draws are final scanout/compositor work whose color
-            // geometry is supplied by VideoOut. Later offscreen draws in the
-            // same DCB do not invalidate them, so retain the ordered pass until
-            // the flip resolves it against the registered display buffer.
-            self.drawGuestGraphics(state, draw, vertex_stage.?, null) catch |err| {
-                self.last_draw_error = err;
-                if (self.shouldReportDrawError(err)) {
-                    std.debug.print("[vulkan dcb] draw rejected: {s}\n", .{@errorName(err)});
-                    if (err == Error.UnsupportedColorTarget) {
-                        const rejected_state = gpu.resources.decodeRenderState(state);
-                        for (rejected_state.color_targets) |candidate| {
-                            const target = candidate orelse continue;
-                            if (!target.isActive()) continue;
-                            std.debug.print(
-                                "[vulkan dcb] rejected target slot={d} addr=0x{x} {d}x{d} pitch={d} fmt={d} num={d} swap={d} tile={s} samples={d} frags={d} dcc={any} cmask={any} fmask={any}\n",
-                                .{
-                                    target.slot,
-                                    target.address,
-                                    target.width,
-                                    target.height,
-                                    target.pitch,
-                                    target.format,
-                                    target.number_type,
-                                    target.component_swap,
-                                    @tagName(target.tile_mode),
-                                    target.samples_log2,
-                                    target.fragments_log2,
-                                    target.dcc_enabled,
-                                    target.cmask_fast_clear,
-                                    target.fmask_compression,
-                                },
-                            );
-                        }
-                    }
+            const targetless = render_state.active_color_count == 0;
+            var index: u32 = 0;
+            while (index < draw_count) : (index += 1) {
+                const draw = if (direct) |decoded|
+                    decoded
+                else
+                    self.readIndirectGuestDraw(state, indirect_spec, index) catch |err| {
+                        self.last_draw_error = err;
+                        std.debug.print(
+                            "[vulkan dcb] indirect draw args rejected: {s} base=0x{x} off=0x{x} index={d}\n",
+                            .{ @errorName(err), state.draw_indirect_args_base_address, indirect_spec.data_offset, index },
+                        );
+                        return false;
+                    };
+                if (targetless) {
+                    self.appendPendingTargetlessDraw(state, draw, vertex_stage.?);
+                    continue;
                 }
-                // Soft-skip shader/state gaps so one incomplete draw does not
-                // kill the DCB before a later flip.
-                return true;
-            };
+                // Targetless draws are final scanout/compositor work whose color
+                // geometry is supplied by VideoOut. Later offscreen draws in the
+                // same DCB do not invalidate them, so retain the ordered pass until
+                // the flip resolves it against the registered display buffer.
+                self.drawGuestGraphics(state, draw, vertex_stage.?, null) catch |err| {
+                    self.last_draw_error = err;
+                    self.reportGuestDrawFailure(state, err);
+                    // Soft-skip shader/state gaps so one incomplete draw does not
+                    // kill the DCB before a later flip.
+                    return true;
+                };
+                self.guest_graphics_draws += 1;
+                self.translated_draws += 1;
+            }
+            if (targetless) return true;
         } else self.drawGraphicsProbe() catch |err| {
             self.last_draw_error = err;
             std.debug.print("[vulkan dcb] graphics probe rejected: {s}\n", .{@errorName(err)});
             return false;
         };
-        if (has_vertex) self.guest_graphics_draws += 1;
-        self.translated_draws += 1;
+        if (!has_vertex) {
+            self.translated_draws += 1;
+        }
         self.last_draw_error = null;
         if (log_verbose_gpu) std.debug.print(
             "[vulkan dcb] draw ok: {s} (#{d})\n",

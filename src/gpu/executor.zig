@@ -1106,6 +1106,24 @@ test "SET_BASE retains separate draw and dispatch indirect argument addresses" {
     try testing.expectEqual(@as(u64, 0x5678_9abc_def8), state.dispatch_indirect_args_base_address);
 }
 
+test "indirect draw packets reach the backend after SET_BASE" {
+    var host = FakeBackend{};
+    const stream = [_]u32{
+        command(pm4.set_base, 3),           1, 0x1000, 0,
+        command(pm4.draw_indirect, 4),      0x40, 0, 0, 2,
+        command(pm4.draw_index_indirect, 4), 0x80, 0, 0, 2,
+        command(pm4.draw_indirect_multi, 9), 0, 0, 0, 0, 2, 0, 0, 16, 2,
+    };
+    var state = gpu_state.State{};
+    var executor = DcbExecutor{ .state = &state, .backend = host.interface() };
+    const result = try executor.execute(&stream);
+
+    try testing.expectEqual(Status.complete, result.status);
+    try testing.expectEqual(@as(u64, 0x1000), state.draw_indirect_args_base_address);
+    try testing.expectEqual(@as(usize, 3), result.draws);
+    try testing.expectEqual(@as(usize, 3), host.draws);
+}
+
 test "Gen5 indirect lists skip untracked extension registers" {
     var host = FakeBackend{};
     std.mem.writeInt(u32, host.memory[0..4], 0x400, .little);

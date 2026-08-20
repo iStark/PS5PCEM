@@ -28,6 +28,7 @@ const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const event_queue = @import("kernel_event_queue.zig");
 const kernel_memory = @import("kernel_memory.zig");
+const agc_submit = @import("agc_submit.zig");
 
 var eop_patch_reports: u32 = 0;
 var wait_patch_reports: u32 = 0;
@@ -99,6 +100,191 @@ pub fn writeCommand(
     _: u64,
 ) callconv(abi.guest) ?[*]u32 {
     return appendNop(buffer, command_words);
+}
+
+fn reserveDwords(state: ?*CommandBuffer, words: u32) ?[*]u32 {
+    const buffer = state orelse return null;
+    if (words == 0) return null;
+    const cursor = buffer.cursor_up orelse buffer.bottom orelse return null;
+    const top = buffer.top orelse return null;
+    const at = @intFromPtr(cursor);
+    const end = @intFromPtr(top);
+    const needed = @as(usize, words) * @sizeOf(u32);
+    if (at > end or end - at < needed) return null;
+    buffer.cursor_up = cursor + words;
+    agc_submit.trackGraphicsCommandAllocation(at, words);
+    return cursor;
+}
+
+fn writePacket(state: ?*CommandBuffer, opcode: u8, header_bits: u32, body: []const u32) ?[*]u32 {
+    if (body.len == 0) return null;
+    const cursor = reserveDwords(state, @intCast(body.len + 1)) orelse return null;
+    cursor[0] = (@as(u32, 3) << 30) |
+        (@as(u32, @intCast(body.len - 1)) << 16) |
+        (@as(u32, opcode) << 8) |
+        header_bits;
+    @memcpy(cursor[1 .. body.len + 1], body);
+    return cursor;
+}
+
+fn indirectPatchOffsets(modifier: u64, indexed: bool) u64 {
+    const low: u32 = @truncate(modifier);
+    const stage = low >> 29;
+    const sgpr_base: u32 = 0x8c + @as(u32, if (stage == 3 or stage == 5) 0x80 else 0);
+    var base_vertex: u64 = 0x280;
+    if (low & 1 != 0) base_vertex = sgpr_base + ((low >> 9) & 0x1f);
+    var start_instance: u64 = 0x280;
+    if (low & 4 != 0) start_instance = sgpr_base + ((low >> 19) & 0x1f);
+    if (indexed and (low & 2) != 0) {
+        base_vertex |= @as(u64, sgpr_base + ((low >> 14) & 0x1f)) << 16;
+        base_vertex |= @as(u64, 1) << 59;
+    }
+    return base_vertex | (start_instance << 32);
+}
+
+fn indirectDrawInitiator(modifier: u64) u32 {
+    if (modifier & (@as(u64, 1) << 32) != 0) return 2;
+    return (@as(u32, @truncate(modifier >> 3)) & 0x20) | 2;
+}
+
+fn emitIndirectDraw(
+    buffer: ?*CommandBuffer,
+    opcode: u8,
+    data_offset: u32,
+    modifier: u64,
+    indexed: bool,
+) ?[*]u32 {
+    const patch = indirectPatchOffsets(modifier, indexed);
+    const body = [_]u32{
+        data_offset,
+        @truncate(patch),
+        @truncate(patch >> 32),
+        indirectDrawInitiator(modifier),
+    };
+    return writePacket(buffer, opcode, 0, &body);
+}
+
+fn emitIndirectDrawMulti(
+    buffer: ?*CommandBuffer,
+    opcode: u8,
+    data_offset: u32,
+    count_indirect: u32,
+    max_count_or_count: u32,
+    count_address: u64,
+    stride_in_bytes: u32,
+    modifier: u64,
+    indexed: bool,
+) ?[*]u32 {
+    if (count_indirect & ~@as(u32, 1) != 0) return null;
+    const default_stride = gpu.pm4.indirectDrawArgBytes(indexed);
+    const stride = if (stride_in_bytes == 0) default_stride else stride_in_bytes;
+    const patch = indirectPatchOffsets(modifier, indexed);
+    const aligned_count = if (count_indirect == 0) 0 else count_address & ~@as(u64, 3);
+    const body = [_]u32{
+        data_offset,
+        @truncate(patch),
+        @truncate(patch >> 32),
+        count_indirect << 30,
+        max_count_or_count,
+        @truncate(aligned_count),
+        @truncate(aligned_count >> 32),
+        stride,
+        indirectDrawInitiator(modifier),
+    };
+    return writePacket(buffer, opcode, 0, &body);
+}
+
+pub fn setBaseIndirectArgs(
+    buffer: ?*CommandBuffer,
+    shader_type: u32,
+    address: u64,
+) callconv(abi.guest) ?[*]u32 {
+    const body = [_]u32{
+        1,
+        @as(u32, @truncate(address)) & ~@as(u32, 7),
+        @truncate(address >> 32),
+    };
+    return writePacket(buffer, gpu.pm4.set_base, (shader_type & 1) << 1, &body);
+}
+
+pub fn setBaseDrawIndirectArgsGetSize() callconv(abi.guest) u32 {
+    return 4 * @sizeOf(u32);
+}
+
+pub fn drawIndirect(
+    buffer: ?*CommandBuffer,
+    data_offset: u32,
+    modifier: u64,
+) callconv(abi.guest) ?[*]u32 {
+    return emitIndirectDraw(buffer, gpu.pm4.draw_indirect, data_offset, modifier, false);
+}
+
+pub fn drawIndexIndirect(
+    buffer: ?*CommandBuffer,
+    data_offset: u32,
+    modifier: u64,
+) callconv(abi.guest) ?[*]u32 {
+    return emitIndirectDraw(buffer, gpu.pm4.draw_index_indirect, data_offset, modifier, true);
+}
+
+pub fn drawIndirectGetSize() callconv(abi.guest) u32 {
+    return 5 * @sizeOf(u32);
+}
+
+pub fn drawIndexIndirectGetSize() callconv(abi.guest) u32 {
+    return 5 * @sizeOf(u32);
+}
+
+pub fn drawIndirectMulti(
+    buffer: ?*CommandBuffer,
+    data_offset: u32,
+    count_indirect: u32,
+    max_count_or_count: u32,
+    count_address: u64,
+    stride_in_bytes: u32,
+    modifier: u64,
+) callconv(abi.guest) ?[*]u32 {
+    return emitIndirectDrawMulti(
+        buffer,
+        gpu.pm4.draw_indirect_multi,
+        data_offset,
+        count_indirect,
+        max_count_or_count,
+        count_address,
+        stride_in_bytes,
+        modifier,
+        false,
+    );
+}
+
+pub fn drawIndexIndirectMulti(
+    buffer: ?*CommandBuffer,
+    data_offset: u32,
+    count_indirect: u32,
+    max_count_or_count: u32,
+    count_address: u64,
+    stride_in_bytes: u32,
+    modifier: u64,
+) callconv(abi.guest) ?[*]u32 {
+    return emitIndirectDrawMulti(
+        buffer,
+        gpu.pm4.draw_index_indirect_multi,
+        data_offset,
+        count_indirect,
+        max_count_or_count,
+        count_address,
+        stride_in_bytes,
+        modifier,
+        true,
+    );
+}
+
+pub fn drawIndirectMultiGetSize() callconv(abi.guest) u32 {
+    return 10 * @sizeOf(u32);
+}
+
+pub fn drawIndexIndirectMultiGetSize() callconv(abi.guest) u32 {
+    return 10 * @sizeOf(u32);
 }
 
 /// Edits a field of a command already written.
@@ -625,4 +811,24 @@ test "graphics exports register under published identifiers" {
     try testing.expectEqual(exports.len + driver_exports.len, db.count());
     try testing.expect(db.findByName("sceAgcDcbDrawIndexIndirectMulti", .function) != null);
     try testing.expect(db.findByName("sceAgcDriverSubmitMultiAcbs", .function) != null);
+}
+
+test "indirect multi draw occupies ten words with a selectable count address" {
+    var storage: [10]u32 = @splat(0xdead_beef);
+    var buffer = fixture(&storage);
+    try testing.expectEqual(@as(u32, 40), drawIndexIndirectMultiGetSize());
+    try testing.expect(drawIndexIndirectMulti(&buffer, 0x20, 1, 4, 0x2000, 24, 0) != null);
+    try testing.expectEqual(storage[0..].ptr + storage.len, buffer.cursor_up.?);
+
+    var walker = gpu.pm4.Walker.init(&storage);
+    const packet = (try walker.next()).?;
+    try testing.expectEqual(gpu.pm4.draw_index_indirect_multi, packet.opcode);
+    const spec = gpu.pm4.decodeIndirectDrawSpec(packet).?;
+    try testing.expect(spec.indexed);
+    try testing.expect(spec.count_from_memory);
+    try testing.expectEqual(@as(u32, 0x20), spec.data_offset);
+    try testing.expectEqual(@as(u32, 4), spec.count);
+    try testing.expectEqual(@as(u64, 0x2000), spec.count_address);
+    try testing.expectEqual(@as(u32, 24), spec.stride);
+    try testing.expect((try walker.next()) == null);
 }

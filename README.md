@@ -958,9 +958,11 @@ The remaining stages are:
    compressed DCC/FMASK states, HTILE Z-range/HiZ handling, and CMASK
    states coupled to FMASK. First-use sampled uploads now detile the T#
    mip range into a Vulkan image whose mip 0 is the view's base level.
-2. Finish indirect drawing. `SET_BASE` already records the argument base and
-   indirect dispatches execute; the indirect draw packet bodies are the
-   remaining half.
+2. Indirect drawing now executes. `SET_BASE` records the argument base,
+   indirect dispatches already ran against it, and `DRAW_INDIRECT` /
+   `DRAW_INDEX_INDIRECT` / the `*_MULTI` forms read the same argument records
+   and issue host draws. Remaining graphics work is layers, metadata, and
+   first-use cost.
 3. Extend the current structured natural-loop and terminal-selection lowering
    to irreducible control flow, complete VCC/EXEC divergence, and cover the
    remaining explicit-LOD operands and image operations seen in captures. The
@@ -2161,8 +2163,10 @@ scheduler and Vulkan backend. Observed startup work now includes:
   unpacks a colour uses every one of them and supporting some translated
   none of them.
 - `SET_BASE` is decoded, so the base an indirect draw or dispatch measures its
-  arguments from is known. Indirect dispatches execute against it; indirect
-  draws still need their packet bodies decoded.
+  arguments from is known. Indirect dispatches and the four indirect draw
+  packets execute against that base: counts, instance ranges, and index
+  starts are read from the argument records, and a multi packet issues each
+  record in order.
 - `vulkan-smoke --probe-spv` reports what the translator produced for a given
   program, which is how a module the host compiler rejects is separated from one
   the translator built wrongly.

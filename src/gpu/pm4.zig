@@ -359,6 +359,114 @@ pub fn isDispatch(opcode: u8) bool {
     return opcode == dispatch_direct or opcode == dispatch_indirect;
 }
 
+/// Whether this command reads draw counts from an argument buffer named by
+/// `SET_BASE` rather than from the packet itself.
+pub fn isIndirectDraw(opcode: u8) bool {
+    return switch (opcode) {
+        draw_indirect, draw_index_indirect, draw_indirect_multi, draw_index_indirect_multi => true,
+        else => false,
+    };
+}
+
+/// One non-indexed `DRAW_INDIRECT` argument record.
+pub const DrawIndirectArgs = extern struct {
+    vertex_count: u32 = 0,
+    instance_count: u32 = 0,
+    start_vertex: u32 = 0,
+    start_instance: u32 = 0,
+};
+
+/// One indexed `DRAW_INDEX_INDIRECT` argument record.
+pub const DrawIndexedIndirectArgs = extern struct {
+    index_count: u32 = 0,
+    instance_count: u32 = 0,
+    start_index: u32 = 0,
+    base_vertex: i32 = 0,
+    start_instance: u32 = 0,
+};
+
+pub const draw_indirect_args_bytes: u32 = @sizeOf(DrawIndirectArgs);
+pub const draw_indexed_indirect_args_bytes: u32 = @sizeOf(DrawIndexedIndirectArgs);
+/// Hardware and titles can name many records; a host loop still has to stop.
+pub const maximum_indirect_draw_count: u32 = 4096;
+
+/// What an indirect draw packet names before any argument record is read.
+pub const IndirectDrawSpec = struct {
+    data_offset: u32 = 0,
+    indexed: bool = false,
+    count: u32 = 1,
+    count_from_memory: bool = false,
+    count_address: u64 = 0,
+    stride: u32 = draw_indirect_args_bytes,
+};
+
+pub fn indirectDrawArgBytes(indexed: bool) u32 {
+    return if (indexed) draw_indexed_indirect_args_bytes else draw_indirect_args_bytes;
+}
+
+pub fn indexElementBytes(encoded: u2) u64 {
+    return switch (encoded) {
+        0, 3 => 2,
+        1 => 4,
+        2 => 1,
+    };
+}
+
+pub fn parseDrawIndirectArgs(bytes: *const [@sizeOf(DrawIndirectArgs)]u8) DrawIndirectArgs {
+    return .{
+        .vertex_count = std.mem.readInt(u32, bytes[0..4], .little),
+        .instance_count = std.mem.readInt(u32, bytes[4..8], .little),
+        .start_vertex = std.mem.readInt(u32, bytes[8..12], .little),
+        .start_instance = std.mem.readInt(u32, bytes[12..16], .little),
+    };
+}
+
+pub fn parseDrawIndexedIndirectArgs(
+    bytes: *const [@sizeOf(DrawIndexedIndirectArgs)]u8,
+) DrawIndexedIndirectArgs {
+    return .{
+        .index_count = std.mem.readInt(u32, bytes[0..4], .little),
+        .instance_count = std.mem.readInt(u32, bytes[4..8], .little),
+        .start_index = std.mem.readInt(u32, bytes[8..12], .little),
+        .base_vertex = @bitCast(std.mem.readInt(u32, bytes[12..16], .little)),
+        .start_instance = std.mem.readInt(u32, bytes[16..20], .little),
+    };
+}
+
+/// Recovers the argument-buffer reference from a draw packet body.
+///
+/// Single draws occupy four body words: byte offset, two unused patch words,
+/// and the initiator. Multi draws occupy nine: the same prefix, a count
+/// selector, a max/count, a 64-bit count address, a stride, and the initiator.
+pub fn decodeIndirectDrawSpec(packet: Packet) ?IndirectDrawSpec {
+    const indexed = switch (packet.opcode) {
+        draw_index_indirect, draw_index_indirect_multi => true,
+        draw_indirect, draw_indirect_multi => false,
+        else => return null,
+    };
+    const default_stride = indirectDrawArgBytes(indexed);
+    if (packet.opcode == draw_indirect or packet.opcode == draw_index_indirect) {
+        if (packet.body.len < 1) return null;
+        return .{
+            .data_offset = packet.body[0],
+            .indexed = indexed,
+            .count = 1,
+            .count_from_memory = false,
+            .count_address = 0,
+            .stride = default_stride,
+        };
+    }
+    if (packet.body.len < 9) return null;
+    return .{
+        .data_offset = packet.body[0],
+        .indexed = indexed,
+        .count = packet.body[4],
+        .count_from_memory = (packet.body[3] >> 30) & 1 != 0,
+        .count_address = (@as(u64, packet.body[6]) << 32) | packet.body[5],
+        .stride = packet.body[7],
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Registers
 
@@ -706,4 +814,71 @@ test "every named opcode round-trips through its own constant" {
     try testing.expectEqualStrings("RELEASE_MEM", opcodeName(0x49).?);
     try testing.expectEqualStrings("INDIRECT_BUFFER", opcodeName(0x3f).?);
     try testing.expect(opcodeName(0x14) == null);
+}
+
+test "indirect draw packets recover their argument-buffer reference" {
+    const single = [_]u32{ command(draw_indirect, 4), 0x40, 0, 0, 2 };
+    var single_walker = Walker.init(&single);
+    const single_spec = decodeIndirectDrawSpec((try single_walker.next()).?).?;
+    try testing.expect(!single_spec.indexed);
+    try testing.expectEqual(@as(u32, 0x40), single_spec.data_offset);
+    try testing.expectEqual(@as(u32, 1), single_spec.count);
+    try testing.expectEqual(draw_indirect_args_bytes, single_spec.stride);
+
+    const indexed = [_]u32{ command(draw_index_indirect, 4), 0x80, 0, 0, 2 };
+    var indexed_walker = Walker.init(&indexed);
+    const indexed_spec = decodeIndirectDrawSpec((try indexed_walker.next()).?).?;
+    try testing.expect(indexed_spec.indexed);
+    try testing.expectEqual(draw_indexed_indirect_args_bytes, indexed_spec.stride);
+
+    const multi = [_]u32{
+        command(draw_index_indirect_multi, 9),
+        0x20,
+        0,
+        0,
+        1 << 30,
+        8,
+        0x1000,
+        0,
+        24,
+        2,
+    };
+    var multi_walker = Walker.init(&multi);
+    const multi_spec = decodeIndirectDrawSpec((try multi_walker.next()).?).?;
+    try testing.expect(multi_spec.indexed);
+    try testing.expect(multi_spec.count_from_memory);
+    try testing.expectEqual(@as(u32, 0x20), multi_spec.data_offset);
+    try testing.expectEqual(@as(u32, 8), multi_spec.count);
+    try testing.expectEqual(@as(u64, 0x1000), multi_spec.count_address);
+    try testing.expectEqual(@as(u32, 24), multi_spec.stride);
+    try testing.expect(isIndirectDraw(draw_indirect_multi));
+    try testing.expect(!isIndirectDraw(draw_index_2));
+}
+
+test "indirect draw argument records keep their field order" {
+    var non_indexed: [@sizeOf(DrawIndirectArgs)]u8 = undefined;
+    std.mem.writeInt(u32, non_indexed[0..4], 12, .little);
+    std.mem.writeInt(u32, non_indexed[4..8], 3, .little);
+    std.mem.writeInt(u32, non_indexed[8..12], 4, .little);
+    std.mem.writeInt(u32, non_indexed[12..16], 7, .little);
+    const draw = parseDrawIndirectArgs(&non_indexed);
+    try testing.expectEqual(@as(u32, 12), draw.vertex_count);
+    try testing.expectEqual(@as(u32, 3), draw.instance_count);
+    try testing.expectEqual(@as(u32, 4), draw.start_vertex);
+    try testing.expectEqual(@as(u32, 7), draw.start_instance);
+
+    var indexed: [@sizeOf(DrawIndexedIndirectArgs)]u8 = undefined;
+    std.mem.writeInt(u32, indexed[0..4], 9, .little);
+    std.mem.writeInt(u32, indexed[4..8], 2, .little);
+    std.mem.writeInt(u32, indexed[8..12], 5, .little);
+    std.mem.writeInt(u32, indexed[12..16], @bitCast(@as(i32, -3)), .little);
+    std.mem.writeInt(u32, indexed[16..20], 1, .little);
+    const indexed_draw = parseDrawIndexedIndirectArgs(&indexed);
+    try testing.expectEqual(@as(u32, 9), indexed_draw.index_count);
+    try testing.expectEqual(@as(u32, 2), indexed_draw.instance_count);
+    try testing.expectEqual(@as(u32, 5), indexed_draw.start_index);
+    try testing.expectEqual(@as(i32, -3), indexed_draw.base_vertex);
+    try testing.expectEqual(@as(u32, 1), indexed_draw.start_instance);
+    try testing.expectEqual(@as(u64, 2), indexElementBytes(0));
+    try testing.expectEqual(@as(u64, 4), indexElementBytes(1));
 }
