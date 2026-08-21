@@ -300,6 +300,9 @@ fn runStorageImageCopyKernel(
         });
         return err;
     };
+    // The synthetic stream has no RELEASE_MEM packet before the host reads
+    // guest memory. Publish the resident storage-image result explicitly.
+    try renderer.flushPendingGuestWrites();
     for (0..height) |y| {
         for (0..width * 4) |byte| {
             const source_byte = guest.bytes[source + y * row_pitch_bytes + byte];
@@ -754,6 +757,10 @@ pub fn main(init: std.process.Init) !void {
     try state.writeRegister(.context, 0x205, 0);
     _ = try executor.execute(&draw_stream);
     _ = try executor.execute(&draw_stream);
+    // Direct executor smoke streams have no RELEASE_MEM/flip boundary between
+    // these draws and the host assertion. Materialize explicitly: production
+    // command streams reach the same fence through their ordering packets.
+    try renderer.flushPendingGuestWrites();
     if (renderer.draw_callbacks != 3 or renderer.translated_draws != 3 or renderer.guest_graphics_draws != 2) {
         return error.InvalidGuestGraphicsDrawResult;
     }
@@ -820,8 +827,12 @@ pub fn main(init: std.process.Init) !void {
     guest.word(fragment_pc + 4, 0x0504_0302);
     guest.word(fragment_pc + 8, 0xbf81_0000);
     _ = try executor.execute(&draw_stream);
+    try renderer.flushPendingGuestWrites();
+    // The first two resident draws materialize as one latest-target writeback;
+    // the textured draw adds the second. Per-draw synchronous submission used
+    // to produce three redundant guest copies here.
     if (renderer.guest_graphics_draws != 3 or renderer.translated_draws != 4 or
-        renderer.graphics_pipeline_cache_misses != 3 or renderer.guest_color_target_writes != 3 or
+        renderer.graphics_pipeline_cache_misses != 3 or renderer.guest_color_target_writes != 2 or
         renderer.sampled_image_uploads != 1)
     {
         return error.InvalidTexturedGraphicsDrawResult;
