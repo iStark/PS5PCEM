@@ -126,9 +126,12 @@ const maximum_pending_completions = 4096;
 // call has returned. Keep the first notification asynchronous, then retain the
 // FIFO head until AgcInterruptThread signals one of the driver's retirement
 // conditions. If the event was consumed before the node existed, reissue it;
-// a fixed delay alone only changes how often that race occurs.
-const completion_latency_ns = 250 * std.time.ns_per_ms;
-const completion_retry_ns = 250 * std.time.ns_per_ms;
+// a fixed delay alone only changes how often that race occurs. One 60 Hz
+// display interval is enough for the submitting thread to publish the node and
+// keeps fast command streams from outrunning 60 Hz VideoOut/media clocks; a
+// quarter-second interval artificially caps otherwise completed frames at 4 Hz.
+const completion_latency_ns = 16 * std.time.ns_per_ms;
+const completion_retry_ns = 16 * std.time.ns_per_ms;
 var completion_lock = ExecutionLock{};
 var completion_drain_lock = ExecutionLock{};
 var pending_completions: [maximum_pending_completions]PendingCompletion = undefined;
@@ -176,6 +179,23 @@ fn ensureCompletionWorker() void {
 
 fn enqueueCompletion(completion: PendingCompletion) void {
     completion_lock.lock();
+    const ready_after_ns = kernel_runtime.processTimeCounter() +|
+        @as(u64, completion_latency_ns);
+    // An interrupt handler scans every completed retirement node for its
+    // queue/context. If another synchronous submit finishes while that same
+    // edge is pending, retain one FIFO entry but arm it again: this neither
+    // loses the newer edge nor lets equivalent completions grow without bound
+    // while a second guest handler is slow to acknowledge the first.
+    for (0..pending_completion_count) |offset| {
+        const index = (pending_completion_head + offset) % pending_completions.len;
+        const pending = &pending_completions[index];
+        if (pending.kind != completion.kind or pending.context_id != completion.context_id) continue;
+        pending.ready_after_ns = ready_after_ns;
+        pending.delivered = false;
+        completion_lock.unlock();
+        ensureCompletionWorker();
+        return;
+    }
     if (pending_completion_count == pending_completions.len) {
         if (dropped_completion_reports < 8) {
             std.debug.print("[agc delivery] completion FIFO full; dropping {s}\n", .{@tagName(completion.kind)});
@@ -186,8 +206,7 @@ fn enqueueCompletion(completion: PendingCompletion) void {
     }
     const tail = (pending_completion_head + pending_completion_count) % pending_completions.len;
     var deferred = completion;
-    deferred.ready_after_ns = kernel_runtime.processTimeCounter() +|
-        @as(u64, completion_latency_ns);
+    deferred.ready_after_ns = ready_after_ns;
     pending_completions[tail] = deferred;
     pending_completion_count += 1;
     completion_lock.unlock();
@@ -207,6 +226,16 @@ fn finishCompletionBatch() void {
         enqueueCompletion(.{ .kind = .release, .context_id = context_id });
     }
     batched_release_count = 0;
+}
+
+fn recordUniqueReleaseContext(storage: []u32, count: *usize, context_id: u32) bool {
+    for (storage[0..count.*]) |existing| {
+        if (existing == context_id) return true;
+    }
+    if (count.* == storage.len) return false;
+    storage[count.*] = context_id;
+    count.* += 1;
+    return true;
 }
 
 fn deliverCompletion(completion: PendingCompletion) usize {
@@ -727,10 +756,16 @@ fn triggerAgcUserInterrupt() void {
 
 fn triggerReleaseInterrupt(value: gpu.state.ReleaseMem) void {
     if (value.interrupt != 1 and value.interrupt != 2 and value.interrupt != 4) return;
-    if (completion_batch_active and batched_release_count < batched_release_contexts.len) {
-        batched_release_contexts[batched_release_count] = value.interrupt_context_id;
-        batched_release_count += 1;
-        return;
+    if (completion_batch_active) {
+        // One interrupt handler pass retires every completed node in its ring.
+        // Unity emits many RELEASE_MEM packets with the same context in one DCB;
+        // queueing all of them only floods the host FIFO before the guest gets a
+        // scheduling turn, without exposing any additional completion state.
+        if (recordUniqueReleaseContext(
+            &batched_release_contexts,
+            &batched_release_count,
+            value.interrupt_context_id,
+        )) return;
     }
     enqueueCompletion(.{ .kind = .release, .context_id = value.interrupt_context_id });
 }
@@ -1827,6 +1862,33 @@ test "compact GPU label address resolves into submitted CPU arena" {
     var observed: u32 = 0;
     try testing.expect(readGuestMemory(null, gpu_address, std.mem.asBytes(&observed)));
     try testing.expectEqual(value, observed);
+}
+
+test "one completion batch coalesces duplicate release contexts" {
+    var contexts: [2]u32 = undefined;
+    var count: usize = 0;
+    try testing.expect(recordUniqueReleaseContext(&contexts, &count, 7));
+    try testing.expect(recordUniqueReleaseContext(&contexts, &count, 7));
+    try testing.expect(recordUniqueReleaseContext(&contexts, &count, 9));
+    try testing.expect(!recordUniqueReleaseContext(&contexts, &count, 11));
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expectEqualSlices(u32, &.{ 7, 9 }, &contexts);
+}
+
+test "pending completion FIFO rearms an equivalent edge" {
+    reset();
+    defer reset();
+
+    enqueueCompletion(.{ .kind = .release, .context_id = 3 });
+    try testing.expectEqual(@as(usize, 1), pending_completion_count);
+    pending_completions[pending_completion_head].delivered = true;
+
+    enqueueCompletion(.{ .kind = .release, .context_id = 3 });
+    try testing.expectEqual(@as(usize, 1), pending_completion_count);
+    try testing.expect(!pending_completions[pending_completion_head].delivered);
+
+    enqueueCompletion(.{ .kind = .dcb, .context_id = 0 });
+    try testing.expectEqual(@as(usize, 2), pending_completion_count);
 }
 
 test "synchronous AGC completion advances a paired CPU retirement label" {
