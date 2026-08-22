@@ -648,7 +648,12 @@ const maximum_staged_buffer_bytes = 128 * 1024 * 1024;
 /// them over PCIe after every dispatch serializes work that remains resident
 /// on the console; keep those allocations authoritative until an actual guest
 /// or resource read needs their bytes.
-const deferred_storage_write_min_bytes = 1024 * 1024;
+// Large UAV outputs are normally consumed by later GPU work. Keeping them
+// resident avoids a device -> guest -> device round trip on every frame while
+// smaller control/label buffers retain eager CPU visibility. Cat Quest III's
+// recurring generated-geometry buffer is 640 KiB, so a 1 MiB cutoff missed
+// the dominant transfer despite already having exact-address readback paths.
+const deferred_storage_write_min_bytes = 256 * 1024;
 const maximum_frame_bytes = 128 * 1024 * 1024;
 const maximum_completed_frames = 16;
 // Unreal's post-processing graph keeps dozens of transient color attachments
@@ -1860,11 +1865,15 @@ fn dumpGraphicsSpirv(
     file.writePositionalAll(io, std.mem.sliceAsBytes(words), 0) catch {};
 }
 
-fn shouldDumpProgressFrame(flip: u64, extended: bool) bool {
+fn shouldDumpProgressFrame(flip: u64, enabled: bool) bool {
+    // PPM capture forces a GPU-to-CPU materialization and writes roughly
+    // width * height * 3 bytes synchronously. Keep every checkpoint opt-in so
+    // a normal 4K run does not spend its startup producing diagnostic files.
+    if (!enabled) return false;
     return switch (flip) {
         2, 8, 16, 32, 64, 96, 128 => true,
-        256, 512, 768, 1024, 1152, 1200, 1216, 1280, 1536, 2048 => extended,
-        else => extended and flip >= 800 and flip % 64 == 0,
+        256, 512, 768, 1024, 1152, 1200, 1216, 1280, 1536, 2048 => true,
+        else => flip >= 800 and flip % 64 == 0,
     };
 }
 
@@ -18304,14 +18313,16 @@ test "fullscreen sample blit accepts quad and procedural triangle geometry" {
     try std.testing.expect(!hasFullscreenSampleBlitGeometry(.{ .vertex_count = 3, .instance_count = 2 }));
 }
 
-test "progress dumps select bounded presentation checkpoints" {
-    try std.testing.expect(shouldDumpProgressFrame(2, false));
-    try std.testing.expect(shouldDumpProgressFrame(8, false));
-    try std.testing.expect(shouldDumpProgressFrame(64, false));
-    try std.testing.expect(shouldDumpProgressFrame(128, false));
+test "progress dumps are opt in and select presentation checkpoints" {
+    try std.testing.expect(!shouldDumpProgressFrame(2, false));
+    try std.testing.expect(!shouldDumpProgressFrame(8, false));
+    try std.testing.expect(!shouldDumpProgressFrame(64, false));
+    try std.testing.expect(!shouldDumpProgressFrame(128, false));
     try std.testing.expect(!shouldDumpProgressFrame(7, false));
     try std.testing.expect(!shouldDumpProgressFrame(129, false));
     try std.testing.expect(!shouldDumpProgressFrame(512, false));
+    try std.testing.expect(shouldDumpProgressFrame(2, true));
+    try std.testing.expect(shouldDumpProgressFrame(128, true));
     try std.testing.expect(shouldDumpProgressFrame(512, true));
 }
 
