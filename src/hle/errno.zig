@@ -98,6 +98,7 @@ pub const KernelError = enum(i32) {
     etimedout = @bitCast(kernel_error_base | 60),
     enametoolong = @bitCast(kernel_error_base | 63),
     enosys = @bitCast(kernel_error_base | 78),
+    ecanceled = @bitCast(kernel_error_base | 85),
 
     /// The status as the guest observes it.
     pub fn raw(self: KernelError) i32 {

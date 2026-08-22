@@ -148,6 +148,7 @@ const maximum_event_flags: usize = 64;
 // free while matching the scale expected by a full process rather than a
 // bootstrap-only workload.
 const maximum_semaphores: usize = 1024;
+const maximum_semaphore_waiters: usize = 1024;
 const event_flag_key_prefix: u64 = 0x4556_0000_0000_0000;
 const semaphore_key_prefix: u64 = 0x5345_0000_0000_0000;
 
@@ -160,18 +161,79 @@ const EventFlag = struct {
 
 const Semaphore = struct {
     handle: u32 = 0,
+    name: [32]u8 = @splat(0),
+    attributes: u32 = 0,
     count: i32 = 0,
     initial_count: i32 = 0,
     maximum_count: i32 = 0,
     sequence: u64 = 1,
     waiters: u32 = 0,
+    creator: u64 = 0,
+    creator_name: [32]u8 = @splat(0),
+    last_waiter: u64 = 0,
+    last_waiter_name: [32]u8 = @splat(0),
+    last_signaller: u64 = 0,
+    last_signaller_host: u32 = 0,
+    last_signaller_name: [32]u8 = @splat(0),
+    last_needed_count: i32 = 0,
+    wait_calls: u64 = 0,
+    signal_calls: u64 = 0,
+    deleted: bool = false,
+};
+
+const SemaphoreWaitResult = enum(u8) {
+    pending,
+    granted,
+    canceled,
+    deleted,
+};
+
+/// One persistent scheduler key per slot prevents stale wake tokens from one
+/// wait being consumed by a later user of that slot. The sequence is retained
+/// and advanced across reuse; all other fields are cleared on release.
+const SemaphoreWaiter = struct {
+    occupied: bool = false,
+    semaphore_handle: u32 = 0,
+    thread_id: u64 = 0,
+    needed_count: i32 = 0,
+    priority: i32 = threading.default_priority,
+    order: u64 = 0,
+    sequence: u64 = 1,
+    result: SemaphoreWaitResult = .pending,
+    wake_pending: bool = false,
+};
+
+/// Snapshot used by the CPU wait watchdog. Kernel semaphores use synthetic
+/// scheduler keys rather than object addresses, so kernel_sync cannot describe
+/// them and previously reported the most important AGC waits as "untracked".
+pub const SemaphoreWaitInfo = struct {
+    handle: u32,
+    name: [32]u8,
+    count: i32,
+    initial_count: i32,
+    maximum_count: i32,
+    sequence: u64,
+    waiters: u32,
+    creator: u64,
+    creator_name: [32]u8,
+    last_waiter: u64,
+    last_waiter_name: [32]u8,
+    last_signaller: u64,
+    last_signaller_host: u32,
+    last_signaller_name: [32]u8,
+    last_needed_count: i32,
+    wait_calls: u64,
+    signal_calls: u64,
 };
 
 var kernel_object_lock = SyncAddressLock{};
 var event_flags: [maximum_event_flags]EventFlag = [_]EventFlag{.{}} ** maximum_event_flags;
 var semaphores: [maximum_semaphores]Semaphore = [_]Semaphore{.{}} ** maximum_semaphores;
+var semaphore_waiters: [maximum_semaphore_waiters]SemaphoreWaiter =
+    [_]SemaphoreWaiter{.{}} ** maximum_semaphore_waiters;
 var next_event_flag_handle: u64 = 1;
 var next_semaphore_handle: u32 = 1;
+var next_semaphore_wait_order: u64 = 1;
 var exception_handlers: [128]u64 = [_]u64{0} ** 128;
 
 fn findEventFlag(handle: u64) ?*EventFlag {
@@ -184,10 +246,179 @@ fn findSemaphore(handle: u32) ?*Semaphore {
     return null;
 }
 
+pub fn describeSemaphoreWaitKey(key: u64) ?SemaphoreWaitInfo {
+    if (key & 0xffff_ffff_0000_0000 != semaphore_key_prefix) return null;
+    const raw_slot = key & 0xffff_ffff;
+    if (raw_slot == 0 or raw_slot > maximum_semaphore_waiters) return null;
+
+    kernel_object_lock.lock();
+    defer kernel_object_lock.unlock();
+    const waiter = &semaphore_waiters[@intCast(raw_slot - 1)];
+    if (!waiter.occupied) return null;
+    const object = findSemaphore(waiter.semaphore_handle) orelse return null;
+    return .{
+        .handle = object.handle,
+        .name = object.name,
+        .count = object.count,
+        .initial_count = object.initial_count,
+        .maximum_count = object.maximum_count,
+        .sequence = object.sequence,
+        .waiters = object.waiters,
+        .creator = object.creator,
+        .creator_name = object.creator_name,
+        .last_waiter = object.last_waiter,
+        .last_waiter_name = object.last_waiter_name,
+        .last_signaller = object.last_signaller,
+        .last_signaller_host = object.last_signaller_host,
+        .last_signaller_name = object.last_signaller_name,
+        .last_needed_count = object.last_needed_count,
+        .wait_calls = object.wait_calls,
+        .signal_calls = object.signal_calls,
+    };
+}
+
+fn copyGuestSemaphoreName(name: ?[*:0]const u8) [32]u8 {
+    var result: [32]u8 = @splat(0);
+    const source = name orelse return result;
+    const base = @intFromPtr(source);
+    for (result[0 .. result.len - 1], 0..) |*destination, index| {
+        const address = std.math.add(u64, base, index) catch return result;
+        if (!memory_api.isGuestRangeAccessible(address, 1)) return result;
+        const byte = source[index];
+        if (byte == 0) break;
+        destination.* = byte;
+    }
+    return result;
+}
+
 fn advanceObjectSequence(sequence: *u64) u64 {
     sequence.* +%= 1;
     if (sequence.* == 0) sequence.* = 1;
     return sequence.*;
+}
+
+fn semaphoreWaitKey(index: usize) u64 {
+    return semaphore_key_prefix | @as(u64, @intCast(index + 1));
+}
+
+fn allocateSemaphoreWaiterLocked(
+    handle: u32,
+    thread_id: u64,
+    needed_count: i32,
+    priority: i32,
+) ?usize {
+    for (&semaphore_waiters, 0..) |*waiter, index| {
+        if (waiter.occupied) continue;
+        const next_sequence = advanceObjectSequence(&waiter.sequence);
+        const order = next_semaphore_wait_order;
+        next_semaphore_wait_order +%= 1;
+        if (next_semaphore_wait_order == 0) next_semaphore_wait_order = 1;
+        waiter.* = .{
+            .occupied = true,
+            .semaphore_handle = handle,
+            .thread_id = thread_id,
+            .needed_count = needed_count,
+            .priority = priority,
+            .order = order,
+            .sequence = next_sequence,
+        };
+        return index;
+    }
+    return null;
+}
+
+fn releaseSemaphoreWaiterLocked(index: usize) void {
+    const sequence = semaphore_waiters[index].sequence;
+    semaphore_waiters[index] = .{ .sequence = sequence };
+}
+
+fn finishSemaphoreWaiterLocked(object: *Semaphore, index: usize) SemaphoreWaitResult {
+    const result = semaphore_waiters[index].result;
+    releaseSemaphoreWaiterLocked(index);
+    object.waiters -= 1;
+    if (object.deleted and object.waiters == 0) object.* = .{};
+    return result;
+}
+
+fn semaphoreWaitResultCode(result: SemaphoreWaitResult) i32 {
+    return switch (result) {
+        .granted => 0,
+        .canceled => KernelError.ecanceled.raw(),
+        .deleted => KernelError.eacces.raw(),
+        .pending => KernelError.eio.raw(),
+    };
+}
+
+fn waiterPrecedes(candidate: *const SemaphoreWaiter, current: *const SemaphoreWaiter, fifo: bool) bool {
+    if (!fifo and candidate.priority != current.priority) return candidate.priority < current.priority;
+    return candidate.order < current.order;
+}
+
+/// Reserve available tokens for already-blocked waiters while the semaphore is
+/// locked. A thread arriving after Signal can therefore never steal a token
+/// from a waiter that the signal was meant to release.
+fn grantSemaphoreWaitersLocked(object: *Semaphore) void {
+    while (true) {
+        var selected: ?usize = null;
+        for (&semaphore_waiters, 0..) |*waiter, index| {
+            if (!waiter.occupied or waiter.semaphore_handle != object.handle or
+                waiter.result != .pending or waiter.needed_count > object.count)
+            {
+                continue;
+            }
+            if (selected == null or waiterPrecedes(
+                waiter,
+                &semaphore_waiters[selected.?],
+                object.attributes == 1,
+            )) selected = index;
+        }
+        const index = selected orelse return;
+        const waiter = &semaphore_waiters[index];
+        object.count -= waiter.needed_count;
+        waiter.result = .granted;
+        waiter.wake_pending = true;
+        _ = advanceObjectSequence(&waiter.sequence);
+    }
+}
+
+fn completeSemaphoreWaitersLocked(handle: u32, result: SemaphoreWaitResult) void {
+    for (&semaphore_waiters) |*waiter| {
+        if (!waiter.occupied or waiter.semaphore_handle != handle or waiter.result != .pending) continue;
+        waiter.result = result;
+        waiter.wake_pending = true;
+        _ = advanceObjectSequence(&waiter.sequence);
+    }
+}
+
+fn pendingSemaphoreWaiterCountLocked(handle: u32) u32 {
+    var count: u32 = 0;
+    for (&semaphore_waiters) |*waiter| {
+        if (waiter.occupied and waiter.semaphore_handle == handle and waiter.result == .pending) {
+            count += 1;
+        }
+    }
+    return count;
+}
+
+/// Wake exact waiter keys outside the kernel-object lock. The result is already
+/// committed, so a waiter that reaches its predicate before this scan simply
+/// removes its slot and needs no notification.
+fn flushSemaphoreWakes(handle: u32) void {
+    while (true) {
+        kernel_object_lock.lock();
+        var selected: ?usize = null;
+        var sequence: u64 = 0;
+        for (&semaphore_waiters, 0..) |*waiter, index| {
+            if (!waiter.occupied or waiter.semaphore_handle != handle or !waiter.wake_pending) continue;
+            waiter.wake_pending = false;
+            selected = index;
+            sequence = waiter.sequence;
+            break;
+        }
+        kernel_object_lock.unlock();
+        const index = selected orelse return;
+        threading.wakeWaiters(semaphoreWaitKey(index), sequence, 1);
+    }
 }
 
 fn resetKernelObjects() void {
@@ -195,9 +426,11 @@ fn resetKernelObjects() void {
     defer kernel_object_lock.unlock();
     @memset(&event_flags, .{});
     @memset(&semaphores, .{});
+    @memset(&semaphore_waiters, .{});
     @memset(&exception_handlers, 0);
     next_event_flag_handle = 1;
     next_semaphore_handle = 1;
+    next_semaphore_wait_order = 1;
 }
 
 /// Reports what a parked thread is actually looking at.
@@ -949,6 +1182,9 @@ fn createSemaphore(
         return KernelError.efault.raw();
     }
 
+    const object_name = copyGuestSemaphoreName(name);
+    const creator = threading.currentThreadId();
+    const creator_name = threading.currentThreadName();
     kernel_object_lock.lock();
     defer kernel_object_lock.unlock();
     for (&semaphores) |*object| {
@@ -958,9 +1194,13 @@ fn createSemaphore(
         if (next_semaphore_handle == 0) next_semaphore_handle = 1;
         object.* = .{
             .handle = handle,
+            .name = object_name,
+            .attributes = attributes,
             .count = initial_count,
             .initial_count = initial_count,
             .maximum_count = maximum_count,
+            .creator = creator,
+            .creator_name = creator_name,
         };
         destination.* = handle;
         return 0;
@@ -983,37 +1223,70 @@ fn waitSemaphore(
         break :blk value.*;
     } else null;
 
-    var registered_waiter = false;
+    const waiter = threading.currentThreadId();
+    const waiter_name = threading.currentThreadName();
+    const waiter_priority = threading.currentThreadPriority();
+    var waiter_index: ?usize = null;
     while (true) {
         kernel_object_lock.lock();
         const object = findSemaphore(handle) orelse {
+            if (waiter_index) |index| releaseSemaphoreWaiterLocked(index);
             kernel_object_lock.unlock();
             return KernelError.enoent.raw();
         };
         if (needed_count < 1 or needed_count > object.maximum_count) {
+            if (waiter_index) |index| _ = finishSemaphoreWaiterLocked(object, index);
             kernel_object_lock.unlock();
             return KernelError.einval.raw();
         }
-        if (object.count >= needed_count) {
+        if (waiter_index) |index| {
+            const result = semaphore_waiters[index].result;
+            if (result != .pending) {
+                const completed = finishSemaphoreWaiterLocked(object, index);
+                kernel_object_lock.unlock();
+                return semaphoreWaitResultCode(completed);
+            }
+        } else if (object.deleted) {
+            kernel_object_lock.unlock();
+            return KernelError.eacces.raw();
+        } else if (object.count >= needed_count) {
             object.count -= needed_count;
-            if (registered_waiter) object.waiters -= 1;
             kernel_object_lock.unlock();
             return 0;
-        }
-        if (!registered_waiter) {
+        } else {
+            const index = allocateSemaphoreWaiterLocked(
+                handle,
+                waiter,
+                needed_count,
+                waiter_priority,
+            ) orelse {
+                kernel_object_lock.unlock();
+                return KernelError.enfile.raw();
+            };
+            waiter_index = index;
             object.waiters += 1;
-            registered_waiter = true;
+            object.last_waiter = waiter;
+            object.last_waiter_name = waiter_name;
+            object.last_needed_count = needed_count;
+            object.wait_calls +|= 1;
         }
-        const observed = object.sequence;
+        const index = waiter_index.?;
+        const observed = semaphore_waiters[index].sequence;
         kernel_object_lock.unlock();
 
         const wait_result = threading.waitCurrent(.{
-            .key = semaphore_key_prefix | handle,
+            .key = semaphoreWaitKey(index),
             .observed_sequence = observed,
             .timeout_microseconds = requested_timeout,
         }) catch {
             kernel_object_lock.lock();
-            if (findSemaphore(handle)) |current| current.waiters -= 1;
+            if (findSemaphore(handle)) |current| {
+                if (semaphore_waiters[index].occupied) {
+                    _ = finishSemaphoreWaiterLocked(current, index);
+                }
+            } else if (semaphore_waiters[index].occupied) {
+                releaseSemaphoreWaiterLocked(index);
+            }
             kernel_object_lock.unlock();
             return KernelError.enosys.raw();
         };
@@ -1021,14 +1294,17 @@ fn waitSemaphore(
 
         kernel_object_lock.lock();
         const current = findSemaphore(handle) orelse {
+            if (semaphore_waiters[index].occupied) releaseSemaphoreWaiterLocked(index);
             kernel_object_lock.unlock();
             return KernelError.enoent.raw();
         };
-        if (current.sequence != observed) {
+        const result = semaphore_waiters[index].result;
+        if (result != .pending) {
+            const completed = finishSemaphoreWaiterLocked(current, index);
             kernel_object_lock.unlock();
-            continue;
+            return semaphoreWaitResultCode(completed);
         }
-        current.waiters -= 1;
+        _ = finishSemaphoreWaiterLocked(current, index);
         kernel_object_lock.unlock();
         if (timeout) |value| value.* = 0;
         return KernelError.etimedout.raw();
@@ -1046,6 +1322,7 @@ fn pollSemaphore(
     kernel_object_lock.lock();
     defer kernel_object_lock.unlock();
     const object = findSemaphore(handle) orelse return KernelError.enoent.raw();
+    if (object.deleted) return KernelError.ebusy.raw();
     if (needed_count < 1 or needed_count > object.maximum_count) return KernelError.einval.raw();
     if (object.count < needed_count) return KernelError.ebusy.raw();
     object.count -= needed_count;
@@ -1060,19 +1337,29 @@ fn signalSemaphore(
     _: u64,
     _: u64,
 ) callconv(abi.guest) i32 {
+    const signaller = threading.currentThreadId();
+    const signaller_host = std.Thread.getCurrentId();
+    const signaller_name = threading.currentThreadName();
     kernel_object_lock.lock();
     const object = findSemaphore(handle) orelse {
         kernel_object_lock.unlock();
         return KernelError.enoent.raw();
     };
-    if (signal_count <= 0 or object.count > object.maximum_count - signal_count) {
+    if (object.deleted or signal_count <= 0 or signal_count > object.maximum_count or
+        object.count > object.maximum_count - signal_count)
+    {
         kernel_object_lock.unlock();
         return KernelError.einval.raw();
     }
     object.count += signal_count;
-    const sequence = advanceObjectSequence(&object.sequence);
+    grantSemaphoreWaitersLocked(object);
+    object.last_signaller = signaller;
+    object.last_signaller_host = signaller_host;
+    object.last_signaller_name = signaller_name;
+    object.signal_calls +|= 1;
+    _ = advanceObjectSequence(&object.sequence);
     kernel_object_lock.unlock();
-    threading.wakeWaiters(semaphore_key_prefix | handle, sequence, @intCast(signal_count));
+    flushSemaphoreWakes(handle);
     return 0;
 }
 
@@ -1094,15 +1381,16 @@ fn cancelSemaphore(
         kernel_object_lock.unlock();
         return KernelError.enoent.raw();
     };
-    if (set_count > object.maximum_count) {
+    if (object.deleted or set_count > object.maximum_count) {
         kernel_object_lock.unlock();
         return KernelError.einval.raw();
     }
-    if (waiter_count) |output| output.* = object.waiters;
+    if (waiter_count) |output| output.* = pendingSemaphoreWaiterCountLocked(handle);
     object.count = if (set_count < 0) object.initial_count else set_count;
-    const sequence = advanceObjectSequence(&object.sequence);
+    completeSemaphoreWaitersLocked(handle, .canceled);
+    _ = advanceObjectSequence(&object.sequence);
     kernel_object_lock.unlock();
-    threading.wakeWaiters(semaphore_key_prefix | handle, sequence, std.math.maxInt(usize));
+    flushSemaphoreWakes(handle);
     return 0;
 }
 
@@ -1119,10 +1407,16 @@ fn deleteSemaphore(
         kernel_object_lock.unlock();
         return KernelError.enoent.raw();
     };
-    const sequence = advanceObjectSequence(&object.sequence);
-    object.handle = 0;
+    if (object.deleted) {
+        kernel_object_lock.unlock();
+        return KernelError.enoent.raw();
+    }
+    object.deleted = true;
+    completeSemaphoreWaitersLocked(handle, .deleted);
+    _ = advanceObjectSequence(&object.sequence);
+    if (object.waiters == 0) object.* = .{};
     kernel_object_lock.unlock();
-    threading.wakeWaiters(semaphore_key_prefix | handle, sequence, std.math.maxInt(usize));
+    flushSemaphoreWakes(handle);
     return 0;
 }
 
@@ -2218,6 +2512,64 @@ const SyncAddressTestBackend = struct {
     }
 };
 
+const SemaphoreTestAction = enum { signal, cancel, delete };
+
+const SemaphoreTestBackend = struct {
+    handle: u32 = 0,
+    action: SemaphoreTestAction = .signal,
+    wait_request: ?threading.WaitRequest = null,
+    wake_key: u64 = 0,
+    wake_sequence: u64 = 0,
+    wake_count: usize = 0,
+    poll_after_signal: i32 = 0,
+
+    fn start(_: ?*anyopaque, _: threading.StartRequest) threading.BackendError!void {
+        return error.Unsupported;
+    }
+
+    fn wait(
+        raw: ?*anyopaque,
+        request: threading.WaitRequest,
+    ) threading.BackendError!threading.WaitResult {
+        const self: *SemaphoreTestBackend = @ptrCast(@alignCast(raw.?));
+        self.wait_request = request;
+        switch (self.action) {
+            .signal => {
+                if (signalSemaphore(self.handle, 1, 0, 0, 0, 0) != 0) return error.WaitFailed;
+                self.poll_after_signal = pollSemaphore(self.handle, 1, 0, 0, 0, 0);
+            },
+            .cancel => {
+                if (cancelSemaphore(self.handle, 0, null, 0, 0, 0) != 0) return error.WaitFailed;
+            },
+            .delete => {
+                if (deleteSemaphore(self.handle, 0, 0, 0, 0, 0) != 0) return error.WaitFailed;
+            },
+        }
+        return .awoken;
+    }
+
+    fn wake(
+        raw: ?*anyopaque,
+        key: u64,
+        sequence: u64,
+        maximum_waiters: usize,
+    ) void {
+        const self: *SemaphoreTestBackend = @ptrCast(@alignCast(raw.?));
+        self.wake_key = key;
+        self.wake_sequence = sequence;
+        self.wake_count = maximum_waiters;
+    }
+
+    fn backend(self: *SemaphoreTestBackend) threading.Backend {
+        return .{
+            .context = self,
+            .start_fn = &start,
+            .wait_fn = &wait,
+            .wake_fn = &wake,
+        };
+    }
+};
+
 test "address waits park by generation and matching wakes advance it" {
     const testing = std.testing;
     const memory = @import("memory");
@@ -2323,4 +2675,58 @@ test "kernel event flags and semaphores retain and consume their state" {
     try testing.expectEqual(@as(i32, 0), signalSemaphore(semaphore_handle, 2, 0, 0, 0, 0));
     try testing.expectEqual(@as(i32, 0), pollSemaphore(semaphore_handle, 2, 0, 0, 0, 0));
     try testing.expectEqual(@as(i32, 0), deleteSemaphore(semaphore_handle, 0, 0, 0, 0, 0));
+}
+
+test "semaphore signal reserves a token for the already blocked waiter" {
+    const testing = std.testing;
+    resetKernelObjects();
+
+    var thread_manager = threading.Manager{};
+    var backend = SemaphoreTestBackend{};
+    thread_manager.setBackend(backend.backend());
+    threading.attachManager(&thread_manager);
+    defer threading.attachManager(null);
+
+    const name: [:0]const u8 = "reserved-token";
+    try testing.expectEqual(@as(i32, 0), createSemaphore(&backend.handle, name.ptr, 1, 0, 1, 0));
+    try testing.expectEqual(@as(i32, 0), waitSemaphore(backend.handle, 1, null, 0, 0, 0));
+
+    // Signal committed the only token to this waiter before waking it. A new
+    // poll racing in from the backend cannot consume that reserved grant.
+    try testing.expectEqual(KernelError.ebusy.raw(), backend.poll_after_signal);
+    try testing.expect(backend.wait_request != null);
+    try testing.expectEqual(backend.wait_request.?.key, backend.wake_key);
+    try testing.expectEqual(@as(usize, 1), backend.wake_count);
+    try testing.expect(backend.wake_sequence != 0);
+}
+
+test "semaphore cancel and delete complete blocked waiters explicitly" {
+    const testing = std.testing;
+    resetKernelObjects();
+
+    var thread_manager = threading.Manager{};
+    var backend = SemaphoreTestBackend{ .action = .cancel };
+    thread_manager.setBackend(backend.backend());
+    threading.attachManager(&thread_manager);
+    defer threading.attachManager(null);
+
+    const cancel_name: [:0]const u8 = "cancel-wait";
+    try testing.expectEqual(@as(i32, 0), createSemaphore(&backend.handle, cancel_name.ptr, 0, 0, 1, 0));
+    try testing.expectEqual(
+        KernelError.ecanceled.raw(),
+        waitSemaphore(backend.handle, 1, null, 0, 0, 0),
+    );
+
+    backend = .{ .action = .delete };
+    thread_manager.setBackend(backend.backend());
+    const delete_name: [:0]const u8 = "delete-wait";
+    try testing.expectEqual(@as(i32, 0), createSemaphore(&backend.handle, delete_name.ptr, 0, 0, 1, 0));
+    try testing.expectEqual(
+        KernelError.eacces.raw(),
+        waitSemaphore(backend.handle, 1, null, 0, 0, 0),
+    );
+    try testing.expectEqual(
+        KernelError.enoent.raw(),
+        pollSemaphore(backend.handle, 1, 0, 0, 0, 0),
+    );
 }

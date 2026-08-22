@@ -1087,6 +1087,13 @@ pub fn currentThreadId() u64 {
     return current_guest_thread;
 }
 
+/// Scheduling priority used by priority-ordered kernel wait queues.
+pub fn currentThreadPriority() i32 {
+    const manager = activeManager() orelse return default_priority;
+    const scheduling = manager.readScheduling(manager.current()) orelse return default_priority;
+    return scheduling.priority;
+}
+
 pub fn resolveCurrentTls(module_id: u64, offset: u64) ?u64 {
     const active_manager = activeManager() orelse return null;
     return active_manager.resolveCurrentTls(module_id, offset);
