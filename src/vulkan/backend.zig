@@ -9335,7 +9335,7 @@ pub const Renderer = struct {
             }
         }
         if (fragment_image_count == 1 and
-            draw.index_count != null and draw.index_count.? == 6 and
+            hasFullscreenSampleBlitGeometry(draw) and
             matchesFullscreenSampleBlit(fragment_analysis.program.instructions.items))
         {
             const viewport_height: f32 = @bitCast(pipeline_state.viewport_height_bits);
@@ -14363,6 +14363,15 @@ fn matchesFullscreenSampleBlit(inst: anytype) bool {
     return samples == 1 and color_exports == 1;
 }
 
+/// Unity emits the same identity compositor as either an indexed quad or a
+/// procedural full-screen triangle. Resource/extent checks in the emulation
+/// path keep the three-vertex form from matching ordinary textured geometry.
+fn hasFullscreenSampleBlitGeometry(draw: GuestDraw) bool {
+    if (draw.instance_count != 1) return false;
+    if (draw.index_count) |count| return count == 6;
+    return draw.vertex_count == 3;
+}
+
 fn matchesWholeImageCopy(inst: anytype) bool {
     if (inst.len != 22) return false;
     const expected = [_]gpu.ShaderOpcode{
@@ -18286,6 +18295,13 @@ test "fullscreen blit row flip preserves pixels and reverses vertical order" {
         5, 6,  7,  8,
         1, 2,  3,  4,
     }, &pixels);
+}
+
+test "fullscreen sample blit accepts quad and procedural triangle geometry" {
+    try std.testing.expect(hasFullscreenSampleBlitGeometry(.{ .index_count = 6 }));
+    try std.testing.expect(hasFullscreenSampleBlitGeometry(.{ .vertex_count = 3 }));
+    try std.testing.expect(!hasFullscreenSampleBlitGeometry(.{ .vertex_count = 4 }));
+    try std.testing.expect(!hasFullscreenSampleBlitGeometry(.{ .vertex_count = 3, .instance_count = 2 }));
 }
 
 test "progress dumps select bounded presentation checkpoints" {
