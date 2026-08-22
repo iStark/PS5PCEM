@@ -82,8 +82,11 @@ var submission_reports: u32 = 0;
 var interrupt_release_reports: u32 = 0;
 var release_delivery_reports: u32 = 0;
 var retirement_bridge_reports: u32 = 0;
+var submission_header_write_reports: u32 = 0;
+var unsafe_island_reports: u32 = 0;
 
 const maximum_submission_aliases = 256;
+const submission_allocation_header_bytes: u64 = 0x10;
 const SubmissionAlias = struct {
     cpu_address: u64 = 0,
     byte_length: u64 = 0,
@@ -413,6 +416,35 @@ fn resolveSubmissionAlias(address: u64, byte_length: usize) ?u64 {
     return null;
 }
 
+const SubmissionHeaderCollision = struct {
+    arena_address: u64,
+    target_address: u64,
+};
+
+/// Command buffers passed by the guest begin immediately after the allocator's
+/// 16-byte block header. A malformed packet recovered from descriptor data must
+/// never be allowed to publish a fence into that header: doing so corrupts the
+/// block size and makes the later guest free walk an effectively random VA.
+fn findSubmissionHeaderCollision(address: u64, byte_length: usize) ?SubmissionHeaderCollision {
+    if (byte_length == 0) return null;
+    const write_end = std.math.add(u64, address, byte_length) catch return null;
+
+    submission_alias_lock.lock();
+    defer submission_alias_lock.unlock();
+    var age: usize = 0;
+    while (age < submission_aliases.len) : (age += 1) {
+        const index = (next_submission_alias + submission_aliases.len - 1 - age) %
+            submission_aliases.len;
+        const alias = submission_aliases[index];
+        if (alias.byte_length == 0 or alias.cpu_address < submission_allocation_header_bytes) continue;
+        const header_start = alias.cpu_address - submission_allocation_header_bytes;
+        if (address < alias.cpu_address and write_end > header_start) {
+            return .{ .arena_address = alias.cpu_address, .target_address = address };
+        }
+    }
+    return null;
+}
+
 pub fn readGuestMemory(_: ?*anyopaque, address: u64, bytes: []u8) bool {
     if (video_out.readLabelMemory(address, bytes)) return true;
     // Prefer a known AGC arena alias. Compact GPU VAs live in the broad guest
@@ -426,6 +458,19 @@ pub fn readGuestMemory(_: ?*anyopaque, address: u64, bytes: []u8) bool {
 
 pub fn writeGuestMemory(_: ?*anyopaque, address: u64, bytes: []const u8) bool {
     if (video_out.writeLabelMemory(address, bytes)) return true;
+    if (findSubmissionHeaderCollision(address, bytes.len)) |collision| {
+        if (submission_header_write_reports < 32) {
+            var payload: u64 = 0;
+            const shown = @min(bytes.len, @sizeOf(u64));
+            @memcpy(std.mem.asBytes(&payload)[0..shown], bytes[0..shown]);
+            std.debug.print(
+                "[agc guard] rejected GPU write into DCB allocation header: target=0x{x}+{d} data=0x{x} arena=0x{x}\n",
+                .{ collision.target_address, bytes.len, payload, collision.arena_address },
+            );
+            submission_header_write_reports += 1;
+        }
+        return false;
+    }
     const resolved = resolveSubmissionAlias(address, bytes.len) orelse
         if (memory.isGuestRangeAccessible(address, bytes.len)) address else return false;
     const destination: [*]u8 = @ptrFromInt(resolved);
@@ -1082,6 +1127,8 @@ pub fn reset() void {
     interrupt_release_reports = 0;
     release_delivery_reports = 0;
     retirement_bridge_reports = 0;
+    submission_header_write_reports = 0;
+    unsafe_island_reports = 0;
     submission_alias_lock.lock();
     submission_aliases = [_]SubmissionAlias{.{}} ** submission_aliases.len;
     next_submission_alias = 0;
@@ -1225,6 +1272,75 @@ const SubmittedSegment = struct {
     releases: usize,
 };
 
+fn overlapsSubmissionAllocationHeader(stream: []const u32, address: u64, byte_length: u64) bool {
+    if (stream.len == 0 or byte_length == 0) return false;
+    const arena_address: u64 = @intFromPtr(stream.ptr);
+    if (arena_address < submission_allocation_header_bytes) return false;
+    const header_start = arena_address - submission_allocation_header_bytes;
+    const write_end = std.math.add(u64, address, byte_length) catch return false;
+    return address < arena_address and write_end > header_start;
+}
+
+/// Returns the target when a packet decoded from an allocation's data area
+/// would overwrite the allocator metadata immediately before that allocation.
+fn packetWritesSubmissionAllocationHeader(stream: []const u32, packet: gpu.pm4.Packet) ?u64 {
+    if (packet.kind != .command) return null;
+    const body = packet.body;
+    const custom = gpu.pm4.customCode(packet);
+
+    if (packet.opcode == gpu.pm4.release_mem or
+        (custom != null and custom.? == gpu.pm4.custom.release_mem))
+    {
+        if (body.len < 7) return null;
+        const destination = (body[1] >> 16) & 0x3;
+        const selection = (body[1] >> 29) & 0x7;
+        if (destination != 0 and destination != 1) return null;
+        const byte_length: u64 = switch (selection) {
+            1 => 4,
+            2, 3, 4 => 8,
+            else => return null,
+        };
+        const address = (@as(u64, body[3]) << 32) | body[2];
+        return if (overlapsSubmissionAllocationHeader(stream, address, byte_length)) address else null;
+    }
+
+    if (packet.opcode == gpu.pm4.write_data or
+        (custom != null and custom.? == gpu.pm4.custom.write_data))
+    {
+        if (body.len < 3) return null;
+        const standard = packet.opcode == gpu.pm4.write_data;
+        const control = body[0];
+        const destination: u8 = if (standard)
+            @truncate(((control >> 30) & 0x1) | ((control >> 7) & 0x1e))
+        else
+            @truncate(control);
+        if (destination != 1 and destination != 2 and destination != 4 and destination != 5) return null;
+        const address = (@as(u64, body[2]) << 32) | (body[1] & 0xffff_fffc);
+        const increments = if (standard) control & (1 << 16) == 0 else @as(u8, @truncate(control >> 16)) == 0;
+        const byte_length: u64 = if (increments)
+            std.math.mul(u64, body.len - 3, @sizeOf(u32)) catch return null
+        else
+            @sizeOf(u32);
+        return if (overlapsSubmissionAllocationHeader(stream, address, byte_length)) address else null;
+    }
+
+    if (packet.opcode == gpu.pm4.dma_data or
+        (custom != null and custom.? == gpu.pm4.custom.dma_data))
+    {
+        if (body.len != 6) return null;
+        const control = body[0];
+        const control2 = body[5];
+        const destination = ((control >> 20) & 3) |
+            ((control2 >> 25) & 4) | ((control2 >> 26) & 8);
+        if (destination != 0 and destination != 3) return null;
+        const address = (@as(u64, body[4]) << 32) | body[3];
+        const byte_length: u64 = control2 & 0x03ff_ffff;
+        return if (overlapsSubmissionAllocationHeader(stream, address, byte_length)) address else null;
+    }
+
+    return null;
+}
+
 /// Finds the next command island inside a mixed AGC arena.
 ///
 /// Core command buffers do not merely have an upward prefix and one downward
@@ -1247,6 +1363,16 @@ fn nextSubmittedCommandSegment(stream: []const u32, search_start: usize) ?Submit
         while (true) {
             const packet = walker.next() catch break orelse break;
             if (packet.kind != .command and packet.kind != .filler) {
+                break;
+            }
+            if (packetWritesSubmissionAllocationHeader(stream, packet)) |target| {
+                if (unsafe_island_reports < 32) {
+                    std.debug.print(
+                        "[dcb guard] rejected command island targeting allocation header: target=0x{x} arena=0x{x} opcode=0x{x}\n",
+                        .{ target, @intFromPtr(stream.ptr), packet.opcode },
+                    );
+                    unsafe_island_reports += 1;
+                }
                 break;
             }
             packets += 1;
@@ -1813,6 +1939,28 @@ test "submitted DCB retains release-terminated command islands" {
     try testing.expectEqual(stream.len, suffix.end);
 }
 
+test "submitted DCB rejects a command island that writes its allocation header" {
+    var stream = [_]u32{
+        command(gpu.pm4.clear_state, 1),                                       0,
+        0,                                                                     0,
+        0,                                                                     0,
+        command(gpu.pm4.nop, 1),                                               0,
+        command(gpu.pm4.nop, 1),                                               0,
+        command(gpu.pm4.nop, 1),                                               0,
+        command(gpu.pm4.nop, 7) | (@as(u32, gpu.pm4.custom.release_mem) << 2), 0x28,
+        (@as(u32, 1) << 29) | (@as(u32, 1) << 16),                             0,
+        0,                                                                     0x1234_5678,
+        0,                                                                     0,
+    };
+    const target = @intFromPtr(&stream) - 8;
+    stream[15] = @truncate(target);
+    stream[16] = @truncate(target >> 32);
+
+    const prefix = submittedCommandPrefix(&stream);
+    try testing.expectEqual(@as(usize, 2), prefix.len);
+    try testing.expect(nextSubmittedCommandSegment(&stream, prefix.len) == null);
+}
+
 test "submitted DCB retains Type-2 alignment filler" {
     const stream = [_]u32{
         command(gpu.pm4.clear_state, 1), 0,
@@ -1862,6 +2010,24 @@ test "compact GPU label address resolves into submitted CPU arena" {
     var observed: u32 = 0;
     try testing.expect(readGuestMemory(null, gpu_address, std.mem.asBytes(&observed)));
     try testing.expectEqual(value, observed);
+}
+
+test "GPU writes cannot overwrite a submitted allocation header" {
+    reset();
+    defer reset();
+    var allocation: [20]u32 = @splat(0);
+    const arena = allocation[4..];
+    rememberSubmissionAlias(arena);
+
+    allocation[2] = 0xfeed_beef;
+    const value: u64 = 0x1122_3344_5566_7788;
+    try testing.expect(!writeGuestMemory(
+        null,
+        @intFromPtr(&allocation[2]),
+        std.mem.asBytes(&value),
+    ));
+    try testing.expectEqual(@as(u32, 0xfeed_beef), allocation[2]);
+    try testing.expectEqual(@as(u32, 0), allocation[3]);
 }
 
 test "one completion batch coalesces duplicate release contexts" {
