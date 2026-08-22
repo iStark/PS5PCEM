@@ -51,6 +51,36 @@ threadlocal var wait_repeat_diagnostic: WaitRepeatDiagnostic = .{};
 threadlocal var delivering_guest_exception = false;
 
 fn printWaitKeyInfo(key: u64) void {
+    if (hle.libs.kernel_runtime.describeSemaphoreWaitKey(key)) |info| {
+        const name = std.mem.sliceTo(&info.name, 0);
+        const creator_name = std.mem.sliceTo(&info.creator_name, 0);
+        const waiter_name = std.mem.sliceTo(&info.last_waiter_name, 0);
+        const signaller_name = std.mem.sliceTo(&info.last_signaller_name, 0);
+        std.debug.print(
+            "[cpu wait] semaphore key=0x{x} handle=0x{x} name={s} count={d}/{d} initial={d} sequence={d} waiters={d} needed={d} creator=0x{x}/{s} last_waiter=0x{x}/{s} last_signaller=0x{x}/{s} host={d} calls={d}/{d}\n",
+            .{
+                key,
+                info.handle,
+                name,
+                info.count,
+                info.maximum_count,
+                info.initial_count,
+                info.sequence,
+                info.waiters,
+                info.last_needed_count,
+                info.creator,
+                creator_name,
+                info.last_waiter,
+                waiter_name,
+                info.last_signaller,
+                signaller_name,
+                info.last_signaller_host,
+                info.wait_calls,
+                info.signal_calls,
+            },
+        );
+        return;
+    }
     const info = kernel_sync.describeWaitKey(key) orelse {
         std.debug.print("[cpu wait] key state untracked key=0x{x}\n", .{key});
         return;
@@ -337,6 +367,47 @@ pub var null_base_redirect_recoveries: std.atomic.Value(u64) = .init(0);
 /// converted to null. Some UE subsystems leave a stale terminal node behind;
 /// their generated code immediately null-tests the loaded payload.
 pub var optional_pointer_load_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many missing linked-list next pointers were converted to the loop's
+/// explicit sentinel. Unity emits a sentinel comparison after the load; the
+/// generic null-object stub otherwise turns a null terminal node into a hot
+/// loop, while allocator poison otherwise terminates the guest thread.
+pub var sentinel_pointer_load_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many non-canonical dangling shared references were omitted while Unity
+/// copied worker state. The copied field is optional at cleanup, so null is the
+/// only safe value when the supposed refcount pointer is actually tagged data.
+pub var invalid_shared_reference_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many stale optional hash-map pointers followed the null-map branch
+/// already encoded by Unity's worker-state lookup.
+pub var invalid_optional_map_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many table lookups through packed non-pointer data returned the leaf
+/// helper's preloaded 0x7fff fallback.
+pub var invalid_packed_table_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many unmapped allocator-table candidates followed Unity's existing
+/// fallback-allocator branch instead of calling a vtable through null.
+pub var missing_allocator_candidate_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many absent small-address keys were supplied as zero to Unity's hash
+/// insertion helper instead of becoming a fake stub pointer or crossing the
+/// first-page recovery boundary.
+pub var near_null_hash_key_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many missing 16-byte metadata entries were treated as empty while a
+/// generated bit-mask builder scanned its bounded array.
+pub var sparse_metadata_load_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many oversized Unity metadata scans were rebuilt from the 16 records
+/// that physically belong to their fixed-size table.
+pub var oversized_metadata_scan_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many hash-table bucket probes against an absent backing pointer returned
+/// the table's own -1 (empty) marker.
+pub var empty_hash_bucket_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many AGC argument validators returned their preloaded error after an
+/// unmapped command-buffer pointer reached the encoded type-byte probe.
+pub var invalid_agc_pointer_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many Unity command buffers with an absolute pointer in their allocator
+/// size field were leaked instead of letting the allocator unlink outside the
+/// guest address space and terminate the graphics worker.
+pub var corrupt_allocator_free_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many corrupt Unity frame-slot indices were reset to the renderer's
+/// explicit inactive slot before their scaled address reached unmapped memory.
+pub var invalid_frame_slot_recoveries: std.atomic.Value(u64) = .init(0);
 /// First native access violation declined by the guest exception bridge.
 ///
 /// Host faults normally disappear into Windows with only process exit code
@@ -794,6 +865,93 @@ const WindowsX64Machine = struct {
             );
             return exception_continue_execution;
         }
+        // Unity walks sentinel-terminated lists with
+        //   mov rcx,[rcx+8]; inc eax; cmp rcx,rdx; jne loop
+        // A missing terminal link is semantically the sentinel in this shape.
+        // Redirecting RCX to the generic stub instead reloads zero on every
+        // iteration and spins forever at the same instruction.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            tryEmulateNullSentinelPointerLoad(context, record.ExceptionInformation[1]))
+        {
+            _ = sentinel_pointer_load_recoveries.fetchAdd(1, .monotonic);
+            const count = sentinel_pointer_load_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] recovered missing sentinel link @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip - 4, record.ExceptionInformation[1], count },
+            );
+            return exception_continue_execution;
+        }
+        // Unity copies an optional shared worker-state reference and then
+        // increments its refcount. A stale field can contain tagged payload
+        // data whose low 48 bits merely resemble a guest pointer. Preserve the
+        // exact function's own null cleanup path instead of mutating that data.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            tryDropInvalidSharedReference(context, record.ExceptionInformation[1]))
+        {
+            _ = invalid_shared_reference_recoveries.fetchAdd(1, .monotonic);
+            const count = invalid_shared_reference_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] omitted invalid shared reference @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip - 4, record.ExceptionInformation[1], count },
+            );
+            return exception_continue_execution;
+        }
+        // The worker-state lookup explicitly branches around an optional null
+        // hash map. A dangling non-canonical value in that same field is also
+        // an absent map; take the existing empty-result branch before reading
+        // its mask or backing array.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            trySkipInvalidOptionalMap(context, record.ExceptionInformation[1]))
+        {
+            _ = invalid_optional_map_recoveries.fetchAdd(1, .monotonic);
+            const count = invalid_optional_map_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] skipped invalid optional map @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip - 0xc1, record.ExceptionInformation[1], count },
+            );
+            return exception_continue_execution;
+        }
+        // This leaf table lookup preloads AX with 0x7fff and returns it when the
+        // requested index is outside the inline table. If its supposed table
+        // pointer is actually packed payload data, the same fallback is the
+        // only bounded result and the function can return without touching it.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            tryReturnInvalidPackedTableFallback(context, record.ExceptionInformation[1]))
+        {
+            _ = invalid_packed_table_recoveries.fetchAdd(1, .monotonic);
+            const count = invalid_packed_table_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] returned packed-table fallback @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip - 0x19, record.ExceptionInformation[1], count },
+            );
+            return exception_continue_execution;
+        }
+        // A streamed job can reach Unity's map insertion with an absent key
+        // pointer plus its per-record offset. The helper immediately hashes the
+        // loaded qword. Use its natural zero key for this exact instruction
+        // sequence; the generic pointer-load recovery would insert the shared
+        // stub, and the offset eventually crosses 0x1000 into an unhandled AV.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            tryEmulateNearNullHashKeyLoad(context, record.ExceptionInformation[1]))
+        {
+            _ = near_null_hash_key_recoveries.fetchAdd(1, .monotonic);
+            const count = near_null_hash_key_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] recovered absent hash key @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip - 3, record.ExceptionInformation[1], count },
+            );
+            return exception_continue_execution;
+        }
         // For non-compare field access, rewrite the null base to a synthetic
         // stub object and retry the instruction so ALU/SSE/mov see real memory.
         // Pure address 0 (no field displacement) stays a contained guest fault
@@ -840,6 +998,152 @@ const WindowsX64Machine = struct {
             std.debug.print(
                 "[cpu] recovered optional pointer load @rip=0x{x} addr=0x{x} (#{d})\n",
                 .{ context.Rip - 4, record.ExceptionInformation[1], optional_pointer_load_recoveries.load(.monotonic) },
+            );
+            return exception_continue_execution;
+        }
+        // Unity can compute an allocator-table index before validating the
+        // category which supplied it. An unmapped entry must follow the same
+        // fallback-allocator path used when no candidate accepts the pointer;
+        // merely supplying zero would call the candidate vtable through null.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            trySkipUnmappedAllocatorCandidate(context, record.ExceptionInformation[1]))
+        {
+            _ = missing_allocator_candidate_recoveries.fetchAdd(1, .monotonic);
+            std.debug.print(
+                "[cpu] skipped unmapped allocator candidate @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip - 0xf2, record.ExceptionInformation[1], missing_allocator_candidate_recoveries.load(.monotonic) },
+            );
+            return exception_continue_execution;
+        }
+        // Unity stores 16 metadata records per group and keeps the last occupied
+        // record as a signed index. A corrupted positive index makes the tight
+        // 16-byte scan run through unrelated guest memory until a Job.Worker
+        // faults, while audio and the remaining workers keep running. Rebuild
+        // the index and mask from the table's actual 16 records, then advance
+        // through the function's existing outer-group path.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0)
+        {
+            const corrupt_last_index = context.R12 -% 1;
+            const group = context.Rsi;
+            if (tryRepairOversizedSparseMetadataScan(context, record.ExceptionInformation[1])) {
+                _ = oversized_metadata_scan_recoveries.fetchAdd(1, .monotonic);
+                const count = oversized_metadata_scan_recoveries.load(.monotonic);
+                if (count <= 8 or count % 256 == 0) std.debug.print(
+                    "[cpu] rebuilt oversized Unity metadata scan group={d} last=0x{x} @rip=0x{x} addr=0x{x} (#{d})\n",
+                    .{ group, corrupt_last_index, context.Rip, record.ExceptionInformation[1], count },
+                );
+                return exception_continue_execution;
+            }
+        }
+        // A bounded metadata scan combines a word and a dword from each
+        // 16-byte record only to decide whether to set one mask bit. A stale
+        // optional backing range means "empty record" for this exact probe;
+        // skip both loads together so the second one cannot fault separately.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            tryEmulateUnmappedSparseMetadataLoad(context, record.ExceptionInformation[1]))
+        {
+            _ = sparse_metadata_load_recoveries.fetchAdd(1, .monotonic);
+            const count = sparse_metadata_load_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] recovered empty metadata entry @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip - 6, record.ExceptionInformation[1], count },
+            );
+            return exception_continue_execution;
+        }
+        // Unity's empty hash-table representation can retain -1 as its backing
+        // pointer. The lookup's first bucket value is immediately compared to
+        // the same -1 empty marker; supply it directly for this exact probe so
+        // the generated missing-entry branch is taken.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            tryEmulateEmptyHashBucketLoad(context, record.ExceptionInformation[1]))
+        {
+            _ = empty_hash_bucket_recoveries.fetchAdd(1, .monotonic);
+            const count = empty_hash_bucket_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] recovered empty hash bucket @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip - 4, record.ExceptionInformation[1], count },
+            );
+            return exception_continue_execution;
+        }
+        // AGC's command-buffer validator preloads its invalid-argument result,
+        // checks the optional DCB/ACB pointer's type byte, and returns that
+        // result on mismatch. An unmapped guest pointer must take the same
+        // bounded error return instead of terminating the Unity job worker.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            tryRejectUnmappedAgcBuffer(context, record.ExceptionInformation[1]))
+        {
+            _ = invalid_agc_pointer_recoveries.fetchAdd(1, .monotonic);
+            const count = invalid_agc_pointer_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] rejected unmapped AGC buffer @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip - 0x20, record.ExceptionInformation[1], count },
+            );
+            return exception_continue_execution;
+        }
+        // Unity keeps the current renderer frame in a three-entry array and
+        // reserves index 3 for an explicit inactive slot. Streamed scene work
+        // can observe a stale pointer-sized value in the 32-bit index field;
+        // scaling it by the 16-byte slot size writes far into unmapped guest VA
+        // and kills a Job.Worker, leaving the main thread waiting forever.
+        // Repair only this exact generated store and retry it against Unity's
+        // own inactive slot.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 1 and
+            tryRepairInvalidFrameSlot(context, record.ExceptionInformation[1]))
+        {
+            _ = invalid_frame_slot_recoveries.fetchAdd(1, .monotonic);
+            const count = invalid_frame_slot_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] reset invalid Unity frame slot @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip, record.ExceptionInformation[1], count },
+            );
+            return exception_continue_execution;
+        }
+        // A smaller corrupt index can make the marker store above land in some
+        // other committed part of the renderer object. The first observable AV
+        // then occurs when cleanup treats packed data from that false slot as a
+        // reference-counted pointer. Rebind the exact cleanup sequence to the
+        // inactive slot and let Unity reload/decrement its real reference.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 1 and
+            tryRepairInvalidFrameSlotReference(context, record.ExceptionInformation[1]))
+        {
+            _ = invalid_frame_slot_recoveries.fetchAdd(1, .monotonic);
+            const count = invalid_frame_slot_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] rebound invalid Unity frame reference @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip + 9, record.ExceptionInformation[1], count },
+            );
+            return exception_continue_execution;
+        }
+        // A streamed command buffer can arrive at Unity's dynamic-heap free
+        // path with an absolute guest pointer in its size/offset header. The
+        // generated unlink adds that value to the buffer address and writes
+        // outside every guest range. Abandon this exact free at its epilogue;
+        // leaking the already-corrupt buffer is safer than corrupting the heap
+        // or killing UnityGfxDeviceWorker.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 1 and
+            tryDropCorruptAllocatorFree(context, record.ExceptionInformation[1]))
+        {
+            _ = corrupt_allocator_free_recoveries.fetchAdd(1, .monotonic);
+            const count = corrupt_allocator_free_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] dropped corrupt allocator free @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip - 0x17d, record.ExceptionInformation[1], count },
             );
             return exception_continue_execution;
         }
@@ -950,6 +1254,60 @@ const WindowsX64Machine = struct {
             fault.memory_address = record.ExceptionInformation[1];
         }
         frame.fault = fault;
+        const fault_code: [*]const u8 = @ptrFromInt(fault.instruction_address);
+        std.debug.print(
+            "[cpu] contained guest fault thread=0x{x} kind={s} rip=0x{x} exception=0x{x} target=0x{x} access={s} " ++
+                "rax=0x{x} rbx=0x{x} rcx=0x{x} rdx=0x{x} rsi=0x{x} rdi=0x{x} " ++
+                "rbp=0x{x} rsp=0x{x} r8=0x{x} r9=0x{x} r10=0x{x} r11=0x{x} " ++
+                "r12=0x{x} r13=0x{x} r14=0x{x} r15=0x{x}\n",
+            .{
+                frame.thread_handle,
+                @tagName(fault.kind),
+                fault.instruction_address,
+                @intFromPtr(record.ExceptionAddress),
+                fault.memory_address,
+                @tagName(fault.access),
+                fault.registers.rax,
+                fault.registers.rbx,
+                fault.registers.rcx,
+                fault.registers.rdx,
+                fault.registers.rsi,
+                fault.registers.rdi,
+                fault.registers.rbp,
+                fault.registers.rsp,
+                fault.registers.r8,
+                fault.registers.r9,
+                fault.registers.r10,
+                fault.registers.r11,
+                fault.registers.r12,
+                fault.registers.r13,
+                fault.registers.r14,
+                fault.registers.r15,
+            },
+        );
+        std.debug.print(
+            "[cpu] fault code=" ++
+                "{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}" ++
+                "{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}\n",
+            .{
+                fault_code[0],
+                fault_code[1],
+                fault_code[2],
+                fault_code[3],
+                fault_code[4],
+                fault_code[5],
+                fault_code[6],
+                fault_code[7],
+                fault_code[8],
+                fault_code[9],
+                fault_code[10],
+                fault_code[11],
+                fault_code[12],
+                fault_code[13],
+                fault_code[14],
+                fault_code[15],
+            },
+        );
 
         // Returning CONTINUE_EXECUTION makes Windows restore this edited
         // context. The assembly escape does not touch the potentially damaged
@@ -1181,6 +1539,574 @@ const WindowsX64Machine = struct {
         return true;
     }
 
+    fn tryEmulateNullSentinelPointerLoad(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const null_link = memory_address == 8 and context.Rcx == 0;
+        // Windows reports a non-canonical x64 effective address as -1 in the
+        // access-violation record. Unity uses an allocator poison value for the
+        // same absent terminal link after streamed objects are reclaimed.
+        const poisoned_link = memory_address == std.math.maxInt(u64) and
+            context.Rcx != 0 and
+            !isCanonicalX64Address(context.Rcx);
+        // Streamed list nodes can also retain a canonical poison value outside
+        // committed guest memory. Unlike Windows' -1 report for a non-canonical
+        // address, this AV preserves the exact base+8 effective address. The
+        // numeric value can still fall inside a reserved console VA window, so
+        // the access violation itself establishes that the page is absent.
+        const stale_link = context.Rcx != 0 and
+            isCanonicalX64Address(context.Rcx) and
+            isGuestAddress(context.Rdx) and
+            memory_address == context.Rcx +% 8;
+        if ((!null_link and !poisoned_link and !stale_link) or context.Rdx == 0) return false;
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const pattern = [_]u8{
+            0x48, 0x8b, 0x49, 0x08, // mov rcx, qword ptr [rcx+8]
+            0xff, 0xc0, // inc eax
+            0x48, 0x39, 0xd1, // cmp rcx, rdx
+            0x75, 0xf5, // jne back to the load
+        };
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        context.Rcx = context.Rdx;
+        context.Rip += 4;
+        return true;
+    }
+
+    fn tryDropInvalidSharedReference(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const pointer_mask: u64 = 0x0000_ffff_ffff_ffff;
+        if (memory_address != std.math.maxInt(u64) or
+            isCanonicalX64Address(context.Rax) or
+            !isGuestAddress(context.Rax & pointer_mask))
+        {
+            return false;
+        }
+        const source_address = context.Rdx +% 0x4e20;
+        const destination_address = context.Rdi +% 0x4e20;
+        if (!memory.isHostRangeReadable(source_address, @sizeOf(u64)) or
+            !memory.isHostRangeWritable(destination_address, @sizeOf(u64)))
+        {
+            return false;
+        }
+        const source: *const u64 = @ptrFromInt(source_address);
+        const destination: *u64 = @ptrFromInt(destination_address);
+        if (source.* != context.Rax or destination.* != context.Rax) return false;
+
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const pattern = [_]u8{
+            0xf0, 0xff, 0x40, 0x18, // lock inc dword ptr [rax+0x18]
+            0x48, 0x8b, 0x42, 0x08, // mov rax,qword ptr [rdx+8]
+            0x48, 0x89, 0x47, 0x08, // mov qword ptr [rdi+8],rax
+            0x8b, 0x82, 0x04, 0x4e, 0x00, 0x00, // mov eax,[rdx+0x4e04]
+        };
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        destination.* = 0;
+        context.Rax = 0;
+        context.Rip += 4;
+        return true;
+    }
+
+    fn trySkipInvalidOptionalMap(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const empty_branch_offset: u64 = 0xc1;
+        if (memory_address != std.math.maxInt(u64) or
+            isCanonicalX64Address(context.Rcx))
+        {
+            return false;
+        }
+        const map_field_address = context.R10 +% 0x5dd8;
+        if (!memory.isHostRangeReadable(map_field_address, @sizeOf(u64))) return false;
+        const map_field: *const u64 = @ptrFromInt(map_field_address);
+        if (map_field.* != context.Rcx) return false;
+
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const pattern = [_]u8{
+            0x44, 0x8b, 0x51, 0x08, // mov r10d,dword ptr [rcx+8]
+            0x44, 0x69, 0xdf, 0xb5, 0xfd, 0x97, 0x54, // imul r11d,edi,0x5497fdb5
+            0x4c, 0x8b, 0x31, // mov r14,qword ptr [rcx]
+            0x44, 0x89, 0xd6, // mov esi,r10d
+            0x44, 0x21, 0xde, // and esi,r11d
+            0x41, 0x83, 0xe3, 0xfc, // and r11d,-4
+        };
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        const empty_branch = [_]u8{
+            0x4c, 0x89, 0xe3, // mov rbx,r12
+            0x45, 0x31, 0xe4, // xor r12d,r12d
+        };
+        for (empty_branch, 0..) |byte, index| {
+            if (code[empty_branch_offset + index] != byte) return false;
+        }
+        context.Rip += empty_branch_offset;
+        return true;
+    }
+
+    fn tryReturnInvalidPackedTableFallback(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const return_offset: u64 = 0x19;
+        if (memory_address != std.math.maxInt(u64) or
+            isCanonicalX64Address(context.Rdi) or
+            context.Rax & 0xffff != 0x7fff or
+            @as(u32, @truncate(context.Rcx)) != @as(u32, @truncate(context.Rsi)))
+        {
+            return false;
+        }
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const pattern = [_]u8{
+            0x0f, 0xb7, 0x74, 0x4f, 0x2e, // movzx esi,word ptr [rdi+rcx*2+0x2e]
+            0x39, 0xd6, // cmp esi,edx
+            0x76, 0x10, // jbe fallback return
+            0x48, 0x8b, 0x44, 0xcf, 0x08, // mov rax,[rdi+rcx*8+8]
+            0x89, 0xd1, // mov ecx,edx
+            0x0f, 0xb7, 0x04, 0x48, // movzx eax,word ptr [rax+rcx*2]
+            0x25, 0xff, 0x7f, 0x00, 0x00, // and eax,0x7fff
+            0xc3, // ret
+        };
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        context.Rip += return_offset;
+        return true;
+    }
+
+    fn tryEmulateNearNullHashKeyLoad(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const near_null_limit: u64 = 0x1_0000;
+        if (memory_address >= near_null_limit or context.Rdx != memory_address) return false;
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const pattern = [_]u8{
+            0x4c, 0x8b, 0x0a, // mov r9, qword ptr [rdx]
+            0x45, 0x69, 0xe1, 0xb5, 0xfd, 0x97, 0x54, // imul r12d,r9d,0x5497fdb5
+            0x45, 0x89, 0xe2, // mov r10d,r12d
+            0x45, 0x21, 0xf4, // and r12d,r14d
+        };
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        context.R9 = 0;
+        context.Rip += 3;
+        return true;
+    }
+
+    fn trySkipUnmappedAllocatorCandidate(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const fallback_offset: u64 = 0xf2;
+        if (!isGuestAddress(memory_address) or memory_address < memory.page_size) return false;
+        const expected = context.R15 +% (context.Rax *% 8) +% 0x19f0;
+        if (expected != memory_address) return false;
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const pattern = [_]u8{
+            0x4d, 0x8b, 0xac, 0xc7, 0xf0, 0x19, 0x00, 0x00, // mov r13,[r15+rax*8+0x19f0]
+            0xb8, 0x00, 0x00, 0x00, 0x00, // mov eax,0
+            0x49, 0x81, 0xfd, 0x01, 0x02, 0x00, 0x00, // cmp r13,0x201
+            0x4c, 0x0f, 0x42, 0xe8, // cmovb r13,rax
+        };
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        const fallback_pattern = [_]u8{
+            0x4c, 0x89, 0xff, // mov rdi,r15
+            0x48, 0x89, 0xde, // mov rsi,rbx
+            0xe8, 0x26, 0x01, 0x00, 0x00, // call fallback allocator lookup
+        };
+        for (fallback_pattern, 0..) |byte, index| {
+            if (code[fallback_offset + index] != byte) return false;
+        }
+        context.Rip += fallback_offset;
+        return true;
+    }
+
+    fn tryEmulateUnmappedSparseMetadataLoad(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        if (!isGuestAddress(memory_address) or memory_address != context.Rax) return false;
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const pattern = [_]u8{
+            0x0f, 0xb7, 0x18, // movzx ebx,word ptr [rax]
+            0x8b, 0x78, 0xfc, // mov edi,dword ptr [rax-4]
+            0x48, 0x09, 0xdf, // or rdi,rbx
+            0x74, 0xe3, // je next record
+        };
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        context.Rbx = 0;
+        context.Rdi = 0;
+        context.Rip += 6;
+        return true;
+    }
+
+    fn tryRepairOversizedSparseMetadataScan(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const group_count: u64 = 7;
+        const record_count: usize = 16;
+        const record_stride: u64 = 0x10;
+        const group_stride: u64 = 0x100;
+        const table_base_offset: u64 = 0x3f04;
+        const mask_base_offset: u64 = 0x4d00;
+        const last_index_base_offset: u64 = 0x4d1c;
+        const outer_loop_offset: u64 = 0x110;
+        const scan_setup_offset: u64 = 0x40;
+
+        if (context.Rsi == 0 or context.Rsi >= group_count or
+            context.R12 <= record_count or context.Rcx < record_count or
+            memory_address != context.Rax)
+        {
+            return false;
+        }
+
+        const fault_offset = std.math.mul(u64, context.Rcx, record_stride) catch return false;
+        const expected_fault = std.math.add(u64, context.R9, fault_offset) catch return false;
+        if (memory_address != expected_fault) return false;
+
+        const group_table_offset = std.math.mul(u64, context.Rsi, group_stride) catch return false;
+        const expected_table = std.math.add(
+            u64,
+            context.R15,
+            table_base_offset + group_table_offset,
+        ) catch return false;
+        if (context.R9 != expected_table) return false;
+
+        const group_field_offset = std.math.mul(u64, context.Rsi, @sizeOf(u32)) catch return false;
+        const mask_address = std.math.add(
+            u64,
+            context.R15,
+            mask_base_offset + group_field_offset,
+        ) catch return false;
+        const last_index_address = std.math.add(
+            u64,
+            context.R15,
+            last_index_base_offset + group_field_offset,
+        ) catch return false;
+        const readable_start = context.R9 -% @sizeOf(u32);
+        const readable_bytes = record_count * record_stride - @sizeOf(u32) + @sizeOf(u16);
+        if (!memory.isHostRangeReadable(readable_start, readable_bytes) or
+            !memory.isHostRangeReadable(last_index_address, @sizeOf(u32)) or
+            !memory.isHostRangeWritable(last_index_address, @sizeOf(u32)) or
+            !memory.isHostRangeWritable(mask_address, @sizeOf(u32)))
+        {
+            return false;
+        }
+        const stored_last_index: *u32 = @ptrFromInt(last_index_address);
+        if (stored_last_index.* <= record_count - 1 or
+            stored_last_index.* != @as(u32, @truncate(context.R12 - 1)))
+        {
+            return false;
+        }
+
+        if (context.Rip < outer_loop_offset or context.Rip < scan_setup_offset) return false;
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const scan_pattern = [_]u8{
+            0x0f, 0xb7, 0x18, // movzx ebx,word ptr [rax]
+            0x8b, 0x78, 0xfc, // mov edi,dword ptr [rax-4]
+            0x48, 0x09, 0xdf, // or rdi,rbx
+            0x74, 0xe5, // je next record
+            0x0f, 0xab, 0xca, // bts edx,ecx
+            0x41, 0x89, // mov [r15+rsi*4+0x4d00],edx
+        };
+        for (scan_pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        const setup_code: [*]const u8 = @ptrFromInt(context.Rip - scan_setup_offset);
+        const setup_pattern = [_]u8{
+            0x41, 0xc7, 0x84, 0xb7, 0x00, 0x4d, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, // mov dword ptr [r15+rsi*4+0x4d00],0
+            0x45, 0x8b, 0xa4, 0xb7, 0x1c, 0x4d, 0x00, 0x00, // mov r12d,[...+0x4d1c]
+            0x45, 0x85, 0xe4, // test r12d,r12d
+            0x0f, 0x88, 0x13, 0xff, 0xff, 0xff, // js outer loop
+            0x49, 0xff, 0xc4, // inc r12
+            0x4c, 0x89, 0xc8, // mov rax,r9
+            0x31, 0xd2, // xor edx,edx
+            0x31, 0xc9, // xor ecx,ecx
+            0xeb, 0x17, // jmp scan
+        };
+        for (setup_pattern, 0..) |byte, index| {
+            if (setup_code[index] != byte) return false;
+        }
+        const outer_code: [*]const u8 = @ptrFromInt(context.Rip - outer_loop_offset);
+        const outer_pattern = [_]u8{
+            0x48, 0xff, 0xc6, // inc rsi
+            0x49, 0x81, 0xc2, 0x00, 0x02, 0x00, 0x00, // add r10,0x200
+            0x49, 0x81, 0xc3, 0x00, 0x02, 0x00, 0x00, // add r11,0x200
+            0x49, 0x81, 0xc1, 0x00, 0x01, 0x00, 0x00, // add r9,0x100
+            0x48, 0x83, 0xfe, 0x07, // cmp rsi,7
+        };
+        for (outer_pattern, 0..) |byte, index| {
+            if (outer_code[index] != byte) return false;
+        }
+
+        var mask: u32 = 0;
+        var repaired_last_index: u32 = std.math.maxInt(u32);
+        for (0..record_count) |index| {
+            const record_address = context.R9 + @as(u64, index) * record_stride;
+            const flags: *const u32 = @ptrFromInt(record_address - @sizeOf(u32));
+            const tag: *const u16 = @ptrFromInt(record_address);
+            if (flags.* == 0 and tag.* == 0) continue;
+            mask |= @as(u32, 1) << @intCast(index);
+            repaired_last_index = @intCast(index);
+        }
+
+        const stored_mask: *u32 = @ptrFromInt(mask_address);
+        stored_mask.* = mask;
+        stored_last_index.* = repaired_last_index;
+        context.Rdx = mask;
+        context.R12 = if (repaired_last_index == std.math.maxInt(u32)) 0 else repaired_last_index + 1;
+        context.Rip -= outer_loop_offset;
+        return true;
+    }
+
+    fn tryEmulateEmptyHashBucketLoad(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        if (memory_address != std.math.maxInt(u64) and !isGuestAddress(memory_address)) return false;
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const r14_pattern = [_]u8{
+            0x41, 0x8b, 0x14, 0x06, // mov edx,dword ptr [r14+rax]
+            0x44, 0x39, 0xda, // cmp edx,r11d
+            0x75, 0x09, // jne empty check
+            0x4c, 0x01, 0xf0, // add rax,r14
+            0x48, 0x39, 0x78, 0x08, // cmp [rax+8],rdi
+            0x74, 0x54, // je found
+            0x83, 0xfa, 0xff, // cmp edx,-1
+            0x74, 0x46, // je missing
+        };
+        if (memory_address == context.R14 +% context.Rax) {
+            var matches = true;
+            for (r14_pattern, 0..) |byte, index| {
+                if (code[index] != byte) {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches) {
+                context.Rdx = 0xffff_ffff;
+                context.Rip += 4;
+                return true;
+            }
+        }
+
+        const rcx_pattern = [_]u8{
+            0x42, 0x8b, 0x04, 0x19, // mov eax,dword ptr [rcx+r11]
+            0x44, 0x39, 0xf8, // cmp eax,r15d
+            0x75, 0x0a, // jne empty check
+            0x4a, 0x8d, 0x3c, 0x19, // lea rdi,[rcx+r11]
+            0x4c, 0x39, 0x77, 0x08, // cmp [rdi+8],r14
+            0x74, 0x4b, // je found
+            0x83, 0xf8, 0xff, // cmp eax,-1
+            0x74, 0x3d, // je missing
+        };
+        if (memory_address != context.Rcx +% context.R11) return false;
+        for (rcx_pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        context.Rax = 0xffff_ffff;
+        context.Rip += 4;
+        return true;
+    }
+
+    fn tryRejectUnmappedAgcBuffer(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        if (context.Rax != 0x8a6c_000a or
+            !isGuestAddress(context.Rsi) or
+            memory_address != context.Rsi +% 0x5a)
+        {
+            return false;
+        }
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const pattern = [_]u8{
+            0x80, 0x7e, 0x5a, 0x02, // cmp byte ptr [rsi+0x5a],2
+            0xb8, 0x08, 0x00, 0x6c, 0x8a, // mov eax,0x8a6c0008
+            0x75, 0x15, // jne error return
+            0x48, 0x85, 0xd2, // test rdx,rdx
+            0x74, 0x0b, // je submit
+            0x80, 0x7a, 0x5a, 0x01, // cmp byte ptr [rdx+0x5a],1
+            0xb8, 0x08, 0x00, 0x6c, 0x8a, // mov eax,0x8a6c0008
+            0x75, 0x05, // jne error return
+            0xe9, 0x27, 0x3b, 0x68, 0x01, // jmp submit implementation
+            0xc3, // error return
+        };
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        context.Rip += 0x20;
+        return true;
+    }
+
+    fn tryDropCorruptAllocatorFree(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const epilogue_offset: u64 = 0x17d;
+        if (!isGuestAddress(context.Rax) or
+            !isGuestAddress(context.Rsi) or
+            isGuestAddress(memory_address) or
+            context.Rax +% context.Rsi != memory_address or
+            context.Rbx != context.Rsi -% 0x10 or
+            context.Rbp != context.Rsp +% 0x10)
+        {
+            return false;
+        }
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const pattern = [_]u8{
+            0x48, 0x89, 0x1c, 0x30, // mov qword ptr [rax+rsi],rbx
+            0x80, 0x4c, 0x30, 0x08, 0x02, // or byte ptr [rax+rsi+8],2
+            0x48, 0x8b, 0x46, 0xf8, // mov rax,qword ptr [rsi-8]
+            0x48, 0x89, 0xc1, // mov rcx,rax
+        };
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        const epilogue = [_]u8{
+            0x5b, // pop rbx
+            0x41, 0x5e, // pop r14
+            0x5d, // pop rbp
+            0xc3, // ret
+        };
+        for (epilogue, 0..) |byte, index| {
+            if (code[epilogue_offset + index] != byte) return false;
+        }
+        context.Rip += epilogue_offset;
+        return true;
+    }
+
+    fn tryRepairInvalidFrameSlot(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const index_offset: u64 = 0x7410;
+        const inactive_slot_offset: u64 = 0x7628;
+        const indexed_slot_offset: u64 = 0x7638;
+        const slot_stride: u64 = 16;
+        const inactive_index: u32 = 3;
+
+        if (!isGuestAddress(context.R13) or
+            context.Rdi != context.R13 or
+            context.Rax > std.math.maxInt(u32) or
+            context.Rax <= inactive_index)
+        {
+            return false;
+        }
+        const expected_address = context.R13 +% context.Rax *% slot_stride +% indexed_slot_offset;
+        if (context.R14 != expected_address or memory_address != expected_address) return false;
+
+        const index_address = context.R13 +% index_offset;
+        const inactive_slot = context.R13 +% inactive_slot_offset;
+        if (!memory.isHostRangeReadable(index_address, @sizeOf(u32)) or
+            !memory.isHostRangeWritable(index_address, @sizeOf(u32)) or
+            !memory.isHostRangeWritable(inactive_slot, @sizeOf(u32)))
+        {
+            return false;
+        }
+        const index: *u32 = @ptrFromInt(index_address);
+        if (index.* != @as(u32, @truncate(context.Rax))) return false;
+
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const pattern = [_]u8{
+            0x41, 0xc7, 0x06, 0x01, 0x00, 0x00, 0x00, // mov dword ptr [r14],1
+            0x48, 0x8b, 0x7b, 0x50, // mov rdi,qword ptr [rbx+0x50]
+            0x48, 0x83, 0xc3, 0x50, // add rbx,0x50
+            0x48, 0x83, 0xc7, 0x48, // add rdi,0x48
+        };
+        for (pattern, 0..) |byte, pattern_index| {
+            if (code[pattern_index] != byte) return false;
+        }
+
+        index.* = inactive_index;
+        context.Rax = inactive_index;
+        context.R14 = inactive_slot;
+        return true;
+    }
+
+    fn tryRepairInvalidFrameSlotReference(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const index_offset: u64 = 0x7410;
+        const inactive_slot_offset: u64 = 0x7628;
+        const indexed_slot_offset: u64 = 0x7638;
+        const slot_stride: u64 = 16;
+        const inactive_index: u32 = 3;
+        const reload_offset: u64 = 9;
+
+        if (!isGuestAddress(context.R13) or
+            context.Rsi == 0 or
+            memory_address != context.Rsi +% 0x28)
+        {
+            return false;
+        }
+
+        const index_address = context.R13 +% index_offset;
+        const inactive_slot = context.R13 +% inactive_slot_offset;
+        if (!memory.isHostRangeReadable(index_address, @sizeOf(u32)) or
+            !memory.isHostRangeWritable(index_address, @sizeOf(u32)) or
+            !memory.isHostRangeWritable(inactive_slot, @sizeOf(u32)) or
+            !memory.isHostRangeReadable(inactive_slot + 8, @sizeOf(u64)))
+        {
+            return false;
+        }
+        const index: *u32 = @ptrFromInt(index_address);
+        if (index.* <= inactive_index) return false;
+        const expected_slot = context.R13 +% @as(u64, index.*) *% slot_stride +% indexed_slot_offset;
+        if (context.R14 != expected_slot or
+            !memory.isHostRangeReadable(expected_slot + 8, @sizeOf(u64)))
+        {
+            return false;
+        }
+        const false_reference: *const u64 = @ptrFromInt(expected_slot + 8);
+        if (false_reference.* != context.Rsi) return false;
+
+        const inactive_reference: *const u64 = @ptrFromInt(inactive_slot + 8);
+        if (inactive_reference.* != 0 and
+            (!isGuestAddress(inactive_reference.*) or
+                !memory.isHostRangeWritable(inactive_reference.* +% 0x28, @sizeOf(u32))))
+        {
+            return false;
+        }
+
+        const reload_code: [*]const u8 = @ptrFromInt(context.Rip -% reload_offset);
+        const pattern = [_]u8{
+            0x49, 0x8b, 0x76, 0x08, // mov rsi,qword ptr [r14+8]
+            0x48, 0x85, 0xf6, // test rsi,rsi
+            0x74, 0x54, // je epilogue
+            0xf0, 0xff, 0x4e, 0x28, // lock dec dword ptr [rsi+0x28]
+            0x75, 0x46, // jne clear slot
+            0x48, 0x8b, 0x3d, 0xfb, 0xfd, 0xd1, 0x00, // mov rdi,qword ptr [rip+...]
+            0x48, 0x85, 0xff, // test rdi,rdi
+        };
+        for (pattern, 0..) |byte, pattern_index| {
+            if (reload_code[pattern_index] != byte) return false;
+        }
+
+        index.* = inactive_index;
+        const inactive_marker: *u32 = @ptrFromInt(inactive_slot);
+        inactive_marker.* = 1;
+        context.R14 = inactive_slot;
+        context.Rip -= reload_offset;
+        return true;
+    }
+
     /// Discards integer stores into the first page and steps past the instruction.
     fn tryEmulateNullMemoryStore(context: *std.os.windows.CONTEXT, memory_address: u64) bool {
         if (memory_address == 0 or memory_address >= lost_base_window) return false;
@@ -1338,6 +2264,12 @@ fn isGuestAddress(address: u64) bool {
     return false;
 }
 
+fn isCanonicalX64Address(address: u64) bool {
+    const sign = (address >> 47) & 1;
+    const upper = address >> 48;
+    return if (sign == 0) upper == 0 else upper == 0xffff;
+}
+
 /// Whether an instruction pointer looks like a jump through a null pointer.
 ///
 /// The whole first page counts, not just zero: a null vtable slot or a callback
@@ -1413,6 +2345,509 @@ test "an unmapped optional linked-list payload follows its null branch" {
         ));
         try std.testing.expectEqual(@as(u64, 0), context.Rax);
         try std.testing.expectEqual(@intFromPtr(&code) + 4, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "a null list link reaches the loop sentinel instead of spinning" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{ 0x48, 0x8b, 0x49, 0x08, 0xff, 0xc0, 0x48, 0x39, 0xd1, 0x75, 0xf5 };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rcx = 0;
+        context.Rdx = 0x1234_5678;
+        try std.testing.expect(WindowsX64Machine.tryEmulateNullSentinelPointerLoad(&context, 8));
+        try std.testing.expectEqual(context.Rdx, context.Rcx);
+        try std.testing.expectEqual(@intFromPtr(&code) + 4, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "a poisoned list link reaches the loop sentinel instead of faulting" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{ 0x48, 0x8b, 0x49, 0x08, 0xff, 0xc0, 0x48, 0x39, 0xd1, 0x75, 0xf5 };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rcx = 0xc0de_c0de_cafe_ba00;
+        context.Rdx = 0x1234_5678;
+        try std.testing.expect(WindowsX64Machine.tryEmulateNullSentinelPointerLoad(
+            &context,
+            std.math.maxInt(u64),
+        ));
+        try std.testing.expectEqual(context.Rdx, context.Rcx);
+        try std.testing.expectEqual(@intFromPtr(&code) + 4, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "an out-of-range stale list link reaches its guest sentinel" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{ 0x48, 0x8b, 0x49, 0x08, 0xff, 0xc0, 0x48, 0x39, 0xd1, 0x75, 0xf5 };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rcx = 0xf000_0008e;
+        context.Rdx = memory.system_managed.start + 0x20_000;
+        try std.testing.expect(WindowsX64Machine.tryEmulateNullSentinelPointerLoad(
+            &context,
+            0xf000_00096,
+        ));
+        try std.testing.expectEqual(context.Rdx, context.Rcx);
+        try std.testing.expectEqual(@intFromPtr(&code) + 4, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "a tagged dangling shared reference becomes optional null" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{
+            0xf0, 0xff, 0x40, 0x18,
+            0x48, 0x8b, 0x42, 0x08,
+            0x48, 0x89, 0x47, 0x08,
+            0x8b, 0x82, 0x04, 0x4e,
+            0x00, 0x00,
+        };
+        const guest_pointer = memory.system_managed.start + 0x20_000;
+        const tagged_pointer = guest_pointer | (@as(u64, 0x3c) << 48);
+        var source_field = tagged_pointer;
+        var destination_field = tagged_pointer;
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rax = tagged_pointer;
+        context.Rdx = @intFromPtr(&source_field) - 0x4e20;
+        context.Rdi = @intFromPtr(&destination_field) - 0x4e20;
+        try std.testing.expect(WindowsX64Machine.tryDropInvalidSharedReference(
+            &context,
+            std.math.maxInt(u64),
+        ));
+        try std.testing.expectEqual(@as(u64, 0), destination_field);
+        try std.testing.expectEqual(@as(u64, 0), context.Rax);
+        try std.testing.expectEqual(@intFromPtr(&code) + 4, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "a dangling optional map follows the exact empty-map branch" {
+    if (can_use_native_bridge) {
+        var code: [0xc7]u8 = @splat(0);
+        const pattern = [_]u8{
+            0x44, 0x8b, 0x51, 0x08,
+            0x44, 0x69, 0xdf, 0xb5,
+            0xfd, 0x97, 0x54, 0x4c,
+            0x8b, 0x31, 0x44, 0x89,
+            0xd6, 0x44, 0x21, 0xde,
+            0x41, 0x83, 0xe3, 0xfc,
+        };
+        @memcpy(code[0..pattern.len], &pattern);
+        const empty_branch = [_]u8{ 0x4c, 0x89, 0xe3, 0x45, 0x31, 0xe4 };
+        @memcpy(code[0xc1..][0..empty_branch.len], &empty_branch);
+
+        var map_field: u64 = 0xbe01_e8c6_863f_2b45;
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rcx = map_field;
+        context.R10 = @intFromPtr(&map_field) - 0x5dd8;
+        try std.testing.expect(WindowsX64Machine.trySkipInvalidOptionalMap(
+            &context,
+            std.math.maxInt(u64),
+        ));
+        try std.testing.expectEqual(@intFromPtr(&code) + 0xc1, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "packed table data returns the leaf lookup fallback" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{
+            0x0f, 0xb7, 0x74, 0x4f, 0x2e,
+            0x39, 0xd6, 0x76, 0x10, 0x48,
+            0x8b, 0x44, 0xcf, 0x08, 0x89,
+            0xd1, 0x0f, 0xb7, 0x04, 0x48,
+            0x25, 0xff, 0x7f, 0x00, 0x00,
+            0xc3,
+        };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rax = 0x20206_7fff;
+        context.Rdi = 0x0004_a3ac_0000_0054;
+        context.Rsi = 3;
+        context.Rcx = 3;
+        try std.testing.expect(WindowsX64Machine.tryReturnInvalidPackedTableFallback(
+            &context,
+            std.math.maxInt(u64),
+        ));
+        try std.testing.expectEqual(@intFromPtr(&code) + 0x19, context.Rip);
+        try std.testing.expectEqual(@as(u64, 0x20206_7fff), context.Rax);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "a near-null hash key uses zero across the first-page boundary" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{
+            0x4c, 0x8b, 0x0a,
+            0x45, 0x69, 0xe1,
+            0xb5, 0xfd, 0x97,
+            0x54, 0x45, 0x89,
+            0xe2, 0x45, 0x21,
+            0xf4,
+        };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rdx = 0x1004;
+        context.R9 = 0xfeed_face;
+        try std.testing.expect(WindowsX64Machine.tryEmulateNearNullHashKeyLoad(&context, 0x1004));
+        try std.testing.expectEqual(@as(u64, 0), context.R9);
+        try std.testing.expectEqual(@intFromPtr(&code) + 3, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "an unmapped allocator candidate follows the existing fallback lookup" {
+    if (can_use_native_bridge) {
+        var code: [0xfd]u8 = @splat(0);
+        const pattern = [_]u8{
+            0x4d, 0x8b, 0xac, 0xc7, 0xf0, 0x19, 0x00, 0x00,
+            0xb8, 0x00, 0x00, 0x00, 0x00, 0x49, 0x81, 0xfd,
+            0x01, 0x02, 0x00, 0x00, 0x4c, 0x0f, 0x42, 0xe8,
+        };
+        @memcpy(code[0..pattern.len], &pattern);
+        const fallback_pattern = [_]u8{
+            0x4c, 0x89, 0xff,
+            0x48, 0x89, 0xde,
+            0xe8, 0x26, 0x01,
+            0x00, 0x00,
+        };
+        @memcpy(code[0xf2..][0..fallback_pattern.len], &fallback_pattern);
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rax = 0x20;
+        context.R15 = memory.system_managed.start + 0x20_000;
+        context.R13 = 0xfeed_face;
+        const address = context.R15 + context.Rax * 8 + 0x19f0;
+        try std.testing.expect(WindowsX64Machine.trySkipUnmappedAllocatorCandidate(&context, address));
+        try std.testing.expectEqual(@as(u64, 0xfeed_face), context.R13);
+        try std.testing.expectEqual(@intFromPtr(&code) + 0xf2, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "an unmapped sparse metadata record leaves its mask bit clear" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{
+            0x0f, 0xb7, 0x18,
+            0x8b, 0x78, 0xfc,
+            0x48, 0x09, 0xdf,
+            0x74, 0xe3,
+        };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rax = memory.system_managed.start + 0x20_000;
+        context.Rbx = 0xfeed;
+        context.Rdi = 0xbeef;
+        try std.testing.expect(WindowsX64Machine.tryEmulateUnmappedSparseMetadataLoad(
+            &context,
+            context.Rax,
+        ));
+        try std.testing.expectEqual(@as(u64, 0), context.Rbx);
+        try std.testing.expectEqual(@as(u64, 0), context.Rdi);
+        try std.testing.expectEqual(@intFromPtr(&code) + 6, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "an oversized sparse metadata scan is rebuilt from its fixed table" {
+    if (can_use_native_bridge) {
+        var object: [0x6000]u8 align(16) = @splat(0);
+        const object_address = @intFromPtr(&object);
+        const group: u64 = 3;
+        const table_address = object_address + 0x3f04 + group * 0x100;
+        const mask_address = object_address + 0x4d00 + group * @sizeOf(u32);
+        const last_index_address = object_address + 0x4d1c + group * @sizeOf(u32);
+        const corrupt_last_index: u32 = 0x0f67_9e5c;
+
+        const first_flags: *u32 = @ptrFromInt(table_address - @sizeOf(u32));
+        const sixth_tag: *u16 = @ptrFromInt(table_address + 5 * 0x10);
+        const last_flags: *u32 = @ptrFromInt(table_address + 15 * 0x10 - @sizeOf(u32));
+        first_flags.* = 1;
+        sixth_tag.* = 2;
+        last_flags.* = 3;
+        const stored_mask: *u32 = @ptrFromInt(mask_address);
+        const stored_last_index: *u32 = @ptrFromInt(last_index_address);
+        stored_mask.* = std.math.maxInt(u32);
+        stored_last_index.* = corrupt_last_index;
+
+        var code: [0x120]u8 = @splat(0);
+        const outer_pattern = [_]u8{
+            0x48, 0xff, 0xc6,
+            0x49, 0x81, 0xc2,
+            0x00, 0x02, 0x00,
+            0x00, 0x49, 0x81,
+            0xc3, 0x00, 0x02,
+            0x00, 0x00, 0x49,
+            0x81, 0xc1, 0x00,
+            0x01, 0x00, 0x00,
+            0x48, 0x83, 0xfe,
+            0x07,
+        };
+        @memcpy(code[0..outer_pattern.len], &outer_pattern);
+        const setup_pattern = [_]u8{
+            0x41, 0xc7, 0x84, 0xb7, 0x00, 0x4d, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x45, 0x8b, 0xa4, 0xb7,
+            0x1c, 0x4d, 0x00, 0x00, 0x45, 0x85, 0xe4, 0x0f,
+            0x88, 0x13, 0xff, 0xff, 0xff, 0x49, 0xff, 0xc4,
+            0x4c, 0x89, 0xc8, 0x31, 0xd2, 0x31, 0xc9, 0xeb,
+            0x17,
+        };
+        @memcpy(code[0xd0..][0..setup_pattern.len], &setup_pattern);
+        const scan_pattern = [_]u8{
+            0x0f, 0xb7, 0x18,
+            0x8b, 0x78, 0xfc,
+            0x48, 0x09, 0xdf,
+            0x74, 0xe5, 0x0f,
+            0xab, 0xca, 0x41,
+            0x89,
+        };
+        @memcpy(code[0x110..][0..scan_pattern.len], &scan_pattern);
+
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code) + 0x110;
+        context.R15 = object_address;
+        context.Rsi = group;
+        context.R9 = table_address;
+        context.Rcx = 0x20;
+        context.Rax = table_address + context.Rcx * 0x10;
+        context.R12 = @as(u64, corrupt_last_index) + 1;
+        context.Rdx = std.math.maxInt(u64);
+
+        try std.testing.expect(WindowsX64Machine.tryRepairOversizedSparseMetadataScan(
+            &context,
+            context.Rax,
+        ));
+        const expected_mask = (@as(u32, 1) << 0) | (@as(u32, 1) << 5) | (@as(u32, 1) << 15);
+        try std.testing.expectEqual(expected_mask, stored_mask.*);
+        try std.testing.expectEqual(@as(u32, 15), stored_last_index.*);
+        try std.testing.expectEqual(@as(u64, expected_mask), context.Rdx);
+        try std.testing.expectEqual(@as(u64, 16), context.R12);
+        try std.testing.expectEqual(@intFromPtr(&code), context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "an absent hash backing returns its empty bucket marker" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{
+            0x41, 0x8b, 0x14, 0x06,
+            0x44, 0x39, 0xda, 0x75,
+            0x09, 0x4c, 0x01, 0xf0,
+            0x48, 0x39, 0x78, 0x08,
+            0x74, 0x54, 0x83, 0xfa,
+            0xff, 0x74, 0x46,
+        };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rax = 0;
+        context.R14 = std.math.maxInt(u64);
+        try std.testing.expect(WindowsX64Machine.tryEmulateEmptyHashBucketLoad(
+            &context,
+            std.math.maxInt(u64),
+        ));
+        try std.testing.expectEqual(@as(u64, 0xffff_ffff), context.Rdx);
+        try std.testing.expectEqual(@intFromPtr(&code) + 4, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "an unmapped alternate hash backing returns its empty bucket marker" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{
+            0x42, 0x8b, 0x04, 0x19,
+            0x44, 0x39, 0xf8, 0x75,
+            0x0a, 0x4a, 0x8d, 0x3c,
+            0x19, 0x4c, 0x39, 0x77,
+            0x08, 0x74, 0x4b, 0x83,
+            0xf8, 0xff, 0x74, 0x3d,
+        };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rcx = memory.user.start + 0x20_001;
+        context.R11 = 0x40;
+        context.Rax = 0xfeed_face;
+        try std.testing.expect(WindowsX64Machine.tryEmulateEmptyHashBucketLoad(
+            &context,
+            context.Rcx + context.R11,
+        ));
+        try std.testing.expectEqual(@as(u64, 0xffff_ffff), context.Rax);
+        try std.testing.expectEqual(@intFromPtr(&code) + 4, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "an unmapped AGC buffer returns the validator's encoded error" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{
+            0x80, 0x7e, 0x5a, 0x02,
+            0xb8, 0x08, 0x00, 0x6c,
+            0x8a, 0x75, 0x15, 0x48,
+            0x85, 0xd2, 0x74, 0x0b,
+            0x80, 0x7a, 0x5a, 0x01,
+            0xb8, 0x08, 0x00, 0x6c,
+            0x8a, 0x75, 0x05, 0xe9,
+            0x27, 0x3b, 0x68, 0x01,
+            0xc3,
+        };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rax = 0x8a6c_000a;
+        context.Rsi = memory.system_reserved.start + 0x100;
+        try std.testing.expect(WindowsX64Machine.tryRejectUnmappedAgcBuffer(
+            &context,
+            context.Rsi + 0x5a,
+        ));
+        try std.testing.expectEqual(@as(u64, 0x8a6c_000a), context.Rax);
+        try std.testing.expectEqual(@intFromPtr(&code) + 0x20, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "an invalid Unity frame index retries through its inactive slot" {
+    if (can_use_native_bridge) {
+        var address_space = try memory.AddressSpace.init(std.testing.allocator);
+        defer address_space.deinit();
+
+        const object_address = memory.system_managed.start + 0x20_000;
+        try address_space.mapFixed(
+            object_address,
+            memory.page_size * 2,
+            .read_write,
+            .private,
+            null,
+        );
+
+        const code = [_]u8{
+            0x41, 0xc7, 0x06, 0x01, 0x00, 0x00, 0x00,
+            0x48, 0x8b, 0x7b, 0x50, 0x48, 0x83, 0xc3,
+            0x50, 0x48, 0x83, 0xc7, 0x48,
+        };
+        const invalid_index: u32 = 0x27d7_de90;
+        const index_address = object_address + 0x7410;
+        const inactive_slot = object_address + 0x7628;
+        try address_space.writeInt(u32, index_address, invalid_index);
+
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rax = invalid_index;
+        context.Rdi = object_address;
+        context.R13 = object_address;
+        context.R14 = object_address + @as(u64, invalid_index) * 16 + 0x7638;
+        try std.testing.expect(WindowsX64Machine.tryRepairInvalidFrameSlot(
+            &context,
+            context.R14,
+        ));
+        const stored_index: *const u32 = @ptrFromInt(index_address);
+        try std.testing.expectEqual(@as(u32, 3), stored_index.*);
+        try std.testing.expectEqual(@as(u64, 3), context.Rax);
+        try std.testing.expectEqual(inactive_slot, context.R14);
+        try std.testing.expectEqual(@intFromPtr(&code), context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "a mapped false Unity frame slot rebinds cleanup to the inactive slot" {
+    if (can_use_native_bridge) {
+        var address_space = try memory.AddressSpace.init(std.testing.allocator);
+        defer address_space.deinit();
+
+        const object_address = memory.system_managed.start + 0x20_000;
+        try address_space.mapFixed(
+            object_address,
+            memory.page_size * 4,
+            .read_write,
+            .private,
+            null,
+        );
+
+        const code = [_]u8{
+            0x49, 0x8b, 0x76, 0x08,
+            0x48, 0x85, 0xf6, 0x74,
+            0x54, 0xf0, 0xff, 0x4e,
+            0x28, 0x75, 0x46, 0x48,
+            0x8b, 0x3d, 0xfb, 0xfd,
+            0xd1, 0x00, 0x48, 0x85,
+            0xff,
+        };
+        const invalid_index: u32 = 0x242;
+        const invalid_reference: u64 = 0x4_0000_01c5;
+        const index_address = object_address + 0x7410;
+        const inactive_slot = object_address + 0x7628;
+        const false_slot = object_address + @as(u64, invalid_index) * 16 + 0x7638;
+        const valid_reference = object_address + 0xb000;
+        try address_space.writeInt(u32, index_address, invalid_index);
+        try address_space.writeInt(u64, false_slot + 8, invalid_reference);
+        try address_space.writeInt(u64, inactive_slot + 8, valid_reference);
+        try address_space.writeInt(u32, valid_reference + 0x28, 1);
+
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code) + 9;
+        context.R13 = object_address;
+        context.R14 = false_slot;
+        context.Rsi = invalid_reference;
+        try std.testing.expect(WindowsX64Machine.tryRepairInvalidFrameSlotReference(
+            &context,
+            invalid_reference + 0x28,
+        ));
+
+        const stored_index: *const u32 = @ptrFromInt(index_address);
+        const inactive_marker: *const u32 = @ptrFromInt(inactive_slot);
+        try std.testing.expectEqual(@as(u32, 3), stored_index.*);
+        try std.testing.expectEqual(@as(u32, 1), inactive_marker.*);
+        try std.testing.expectEqual(inactive_slot, context.R14);
+        try std.testing.expectEqual(@intFromPtr(&code), context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "a corrupt allocator header abandons the exact command-buffer free" {
+    if (can_use_native_bridge) {
+        var code: [0x182]u8 = @splat(0);
+        const pattern = [_]u8{
+            0x48, 0x89, 0x1c, 0x30,
+            0x80, 0x4c, 0x30, 0x08,
+            0x02, 0x48, 0x8b, 0x46,
+            0xf8, 0x48, 0x89, 0xc1,
+        };
+        @memcpy(code[0..pattern.len], &pattern);
+        const epilogue = [_]u8{ 0x5b, 0x41, 0x5e, 0x5d, 0xc3 };
+        @memcpy(code[0x17d..][0..epilogue.len], &epilogue);
+
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rax = memory.user.end - 0x20_000;
+        context.Rsi = memory.system_managed.start;
+        context.Rbx = context.Rsi - 0x10;
+        context.Rsp = 0x1000;
+        context.Rbp = context.Rsp + 0x10;
+        const address = context.Rax + context.Rsi;
+        try std.testing.expect(WindowsX64Machine.tryDropCorruptAllocatorFree(
+            &context,
+            address,
+        ));
+        try std.testing.expectEqual(@intFromPtr(&code) + 0x17d, context.Rip);
     } else {
         return error.SkipZigTest;
     }
@@ -2179,11 +3614,15 @@ pub const Dispatcher = struct {
     fn workerMain(worker: *Worker) void {
         const self = worker.dispatcher;
         const handle: threading.ThreadHandle = @ptrFromInt(worker.request.thread_handle);
+        const worker_name = std.mem.sliceTo(&worker.request.name, 0);
         var result: u64 = 0;
         var failed = false;
+        var failure: ?anyerror = null;
+        var exit_requested = false;
 
-        self.manager.enter(handle) catch {
+        self.manager.enter(handle) catch |err| {
             failed = true;
+            failure = err;
         };
         if (!failed) {
             active_execution = .{
@@ -2210,22 +3649,39 @@ pub const Dispatcher = struct {
                     break :blk active_execution.?.exit_result;
                 }
                 failed = true;
+                failure = err;
                 break :blk 0;
             };
+            exit_requested = active_execution.?.exit_requested;
             if (active_execution.?.exit_requested) {
                 result = active_execution.?.exit_result;
             } else if (!failed) {
-                self.manager.runSpecificDestructors() catch {
+                self.manager.runSpecificDestructors() catch |err| {
                     failed = true;
+                    failure = err;
                 };
             }
             active_execution = null;
             self.manager.leave();
         }
 
-        self.manager.complete(handle, result) catch {
+        self.manager.complete(handle, result) catch |err| {
             failed = true;
+            failure = err;
         };
+        if (failed or std.mem.eql(u8, worker_name, "UnityGfxDeviceWorker")) {
+            std.debug.print(
+                "[cpu thread] finished guest=0x{x} host={d} name={s} result=0x{x} exit_requested={any} failure={s}\n",
+                .{
+                    worker.request.thread_handle,
+                    std.Thread.getCurrentId(),
+                    worker_name,
+                    result,
+                    exit_requested,
+                    if (failure) |err| @errorName(err) else "none",
+                },
+            );
+        }
         self.lock.lock();
         worker.result = result;
         worker.execution_failed = failed;
