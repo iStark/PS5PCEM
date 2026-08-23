@@ -1090,6 +1090,26 @@ const WindowsX64Machine = struct {
             );
             return exception_continue_execution;
         }
+        // The same corrupt command-buffer header can fault one level earlier:
+        // Unity's allocator unlink helper masks the supposed relative size and
+        // adds it to the block. When that field contains an absolute guest
+        // pointer, the sum leaves guest VA before the adjacent free-list node
+        // can be inspected. This helper is a leaf, so take its exact RET path
+        // instead of terminating the sole UnityGfxDeviceWorker while an
+        // asynchronous scene is waiting at 90 percent.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            tryDropCorruptAllocatorUnlink(context, record.ExceptionInformation[1]))
+        {
+            _ = corrupt_allocator_free_recoveries.fetchAdd(1, .monotonic);
+            const count = corrupt_allocator_free_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] dropped corrupt allocator unlink @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip - 0xce, record.ExceptionInformation[1], count },
+            );
+            return exception_continue_execution;
+        }
         // Unity keeps the current renderer frame in a three-entry array and
         // reserves index 3 for an explicit inactive slot. Streamed scene work
         // can observe a stale pointer-sized value in the 32-bit index field;
@@ -1991,6 +2011,33 @@ const WindowsX64Machine = struct {
         return true;
     }
 
+    fn tryDropCorruptAllocatorUnlink(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const epilogue_offset: u64 = 0xce;
+        if (!isGuestAddress(context.Rsi) or
+            !isGuestAddress(context.Rdx) or
+            isGuestAddress(memory_address) or
+            context.Rax != context.Rsi or
+            context.Rsi +% context.Rdx +% 0x10 != memory_address)
+        {
+            return false;
+        }
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const pattern = [_]u8{
+            0x48, 0x8b, 0x4c, 0x16, 0x10, // mov rcx,qword ptr [rsi+rdx+0x10]
+            0xf6, 0xc1, 0x01, // test cl,1
+            0x0f, 0x84, 0xc0, 0x00, 0x00, 0x00, // je non-coalescing return
+        };
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        if (code[epilogue_offset] != 0xc3) return false;
+        context.Rip += epilogue_offset;
+        return true;
+    }
+
     fn tryRepairInvalidFrameSlot(
         context: *std.os.windows.CONTEXT,
         memory_address: u64,
@@ -2848,6 +2895,33 @@ test "a corrupt allocator header abandons the exact command-buffer free" {
             address,
         ));
         try std.testing.expectEqual(@intFromPtr(&code) + 0x17d, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "an absolute allocator size abandons the exact free-list unlink" {
+    if (can_use_native_bridge) {
+        var code: [0xcf]u8 = @splat(0);
+        const pattern = [_]u8{
+            0x48, 0x8b, 0x4c, 0x16, 0x10,
+            0xf6, 0xc1, 0x01, 0x0f, 0x84,
+            0xc0, 0x00, 0x00, 0x00,
+        };
+        @memcpy(code[0..pattern.len], &pattern);
+        code[0xce] = 0xc3;
+
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rsi = memory.system_managed.start + 0x20_000;
+        context.Rdx = memory.user.end - 0x20_000;
+        context.Rax = context.Rsi;
+        const address = context.Rsi +% context.Rdx +% 0x10;
+        try std.testing.expect(WindowsX64Machine.tryDropCorruptAllocatorUnlink(
+            &context,
+            address,
+        ));
+        try std.testing.expectEqual(@intFromPtr(&code) + 0xce, context.Rip);
     } else {
         return error.SkipZigTest;
     }

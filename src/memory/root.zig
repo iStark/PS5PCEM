@@ -25,6 +25,7 @@ const windows_page_noaccess: u32 = 0x01;
 const windows_page_readonly: u32 = 0x02;
 const windows_page_readwrite: u32 = 0x04;
 const windows_page_writecopy: u32 = 0x08;
+const windows_page_execute: u32 = 0x10;
 const windows_page_execute_read: u32 = 0x20;
 const windows_page_execute_readwrite: u32 = 0x40;
 const windows_page_execute_writecopy: u32 = 0x80;
@@ -103,7 +104,7 @@ fn windowsAllocationRange(address: u64) Error!Range {
     return .{ .start = allocation_start, .end = cursor };
 }
 
-const HostPermission = enum { read, write };
+const HostPermission = enum { read, write, execute };
 
 fn windowsRangeAccessible(address: u64, size: u64, required: HostPermission) bool {
     if (builtin.os.tag != .windows or address == 0 or size == 0) return false;
@@ -119,6 +120,8 @@ fn windowsRangeAccessible(address: u64, size: u64, required: HostPermission) boo
                 windows_page_writecopy | windows_page_execute_read |
                 windows_page_execute_readwrite | windows_page_execute_writecopy) != 0,
             .write => protection & (windows_page_readwrite | windows_page_writecopy |
+                windows_page_execute_readwrite | windows_page_execute_writecopy) != 0,
+            .execute => protection & (windows_page_execute | windows_page_execute_read |
                 windows_page_execute_readwrite | windows_page_execute_writecopy) != 0,
         };
         if (!allowed) return false;
@@ -139,6 +142,14 @@ pub fn isHostRangeReadable(address: u64, size: u64) bool {
 
 pub fn isHostRangeWritable(address: u64, size: u64) bool {
     return windowsRangeAccessible(address, size, .write);
+}
+
+/// Checks that a native return address belongs to committed executable code.
+/// This is intentionally stricter than readability: an exception unwinder can
+/// encounter host bridge frames, but must not mistake an arbitrary host heap
+/// pointer for one of those frames.
+pub fn isHostRangeExecutable(address: u64, size: u64) bool {
+    return windowsRangeAccessible(address, size, .execute);
 }
 
 /// Guest mappings are aligned to the hardware's 16 KiB page size.

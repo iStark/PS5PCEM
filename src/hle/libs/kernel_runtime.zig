@@ -97,14 +97,15 @@ var gpo_state: std.atomic.Value(u32) = .init(0);
 /// lookup bounded without turning every wait into a linear scan.
 const sync_address_capacity: usize = 1024;
 const sync_address_mask: usize = sync_address_capacity - 1;
-const sync_address_self_heal_us: u64 = 100 * std.time.us_per_ms;
 /// How often a parked address-wait re-reads guest memory.
 ///
 /// The producer often stores a new counter and never calls the matching wake
-/// export. A 100 ms self-heal then becomes the only resume path and a frame
-/// that issues hundreds of job batches stalls for tens of seconds. A short
-/// poll notices the store directly; an explicit wake still pre-empts it.
-const sync_address_poll_us: u64 = 250;
+/// export. A periodic poll notices the store directly; an explicit wake still
+/// pre-empts it. Ten milliseconds matches the reference implementation and
+/// avoids waking roughly one hundred idle Unity workers four thousand times a
+/// second. The slice is internal and is never exposed to the guest as a
+/// spurious successful return.
+const sync_address_poll_us: u64 = 10 * std.time.us_per_ms;
 const sync_address_log_limit: u32 = 16;
 var sync_wait_log_count = std.atomic.Value(u32).init(0);
 var sync_wake_log_count = std.atomic.Value(u32).init(0);
@@ -480,8 +481,8 @@ fn syncAddressGeneration(address: u64, advance: bool) u64 {
 
     // Saturation degrades to a shared generation but remains race-safe: the
     // scheduler key is still the guest address, so a wake cannot release a
-    // waiter on a different address. The bounded wait below prevents a missed
-    // wake from becoming permanent.
+    // waiter on a different address. Polling the compared word also prevents a
+    // producer store without a matching wake from being missed.
     if (advance) {
         sync_fallback_generation +%= 1;
         if (sync_fallback_generation == 0) sync_fallback_generation = 1;
@@ -701,10 +702,6 @@ fn aprWaitCommandBuffer(identifier: u32) callconv(abi.guest) i32 {
     return 0;
 }
 
-fn looksLikeGuestSyncAddress(value: u64) bool {
-    return value >= 0x1_0000;
-}
-
 fn syncCompareBytes(size: u64) usize {
     return switch (size) {
         1, 2, 4, 8 => @intCast(size),
@@ -731,27 +728,13 @@ fn syncWordMask(size: u64) u64 {
     return (@as(u64, 1) << @intCast(bits)) - 1;
 }
 
-/// Whether the guest still wants to stay parked on this address.
-///
-/// The wait export is a futex: it sleeps only while the word still holds the
-/// value the caller observed. Titles also write a new counter and omit the
-/// matching wake, so a store itself must release the waiter. `expected` is
-/// either that observed value or a pointer to it; both forms appear.
-fn syncAddressStillMatches(address: u64, expected: u64, size: u64, observed: ?u64) bool {
-    const actual = readGuestSyncWord(address, size) orelse return true;
-    if (observed) |word| {
-        if (actual != word) return false;
-    }
-    const immediate = expected & syncWordMask(size);
-    if (actual == immediate) return true;
-    if (looksLikeGuestSyncAddress(expected)) {
-        if (readGuestSyncWord(expected, size)) |wanted| return actual == wanted;
-    }
-    return false;
+fn syncAddressStillMatches(address: u64, expected: u64, size: u64) ?bool {
+    const actual = readGuestSyncWord(address, size) orelse return null;
+    return actual == expected & syncWordMask(size);
 }
 
 fn logSyncAddressCall(kind: []const u8, address: u64, a: u64, b: u64, c: u64, d: u64, word: ?u64) void {
-    const counter = if (kind[0] == 'w' and kind[1] == 'a')
+    const counter = if (std.mem.eql(u8, kind, "wait"))
         &sync_wait_log_count
     else
         &sync_wake_log_count;
@@ -770,61 +753,78 @@ fn logSyncAddressCall(kind: []const u8, address: u64, a: u64, b: u64, c: u64, d:
     }
 }
 
-/// Parks a guest worker on an address until a matching wake is published.
-///
-/// Unity uses this as a futex-style primitive in its job system. Returning an
-/// error makes every worker retry immediately and produces millions of firmware
-/// calls without allowing the producer thread to run. The wait is a compare
-/// against the word at `address`: if it no longer holds the observed value the
-/// caller is already satisfied. An explicit wake still releases immediately;
-/// a store to the same word is enough when the producer never calls wake.
-fn syncOnAddressWait(
-    address_or_op: u64,
-    expected_or_address: u64,
-    value_or_size: u64,
-    size_or_timeout: u64,
-    timeout_or_flags: u64,
-    flags: u64,
-) callconv(abi.guest) i32 {
-    const unified = !looksLikeGuestSyncAddress(address_or_op) and
-        looksLikeGuestSyncAddress(expected_or_address);
-    const address = if (unified) expected_or_address else address_or_op;
-    const expected = if (unified) value_or_size else expected_or_address;
-    const size = if (unified) size_or_timeout else value_or_size;
-    const timeout = if (unified) timeout_or_flags else size_or_timeout;
-    _ = flags;
-    if (address == 0) return KernelError.einval.raw();
-    announceSyncAddress("wait", address);
-    const observed = readGuestSyncWord(address, size);
-    logSyncAddressCall("wait", address, expected, size, timeout, timeout_or_flags, observed);
-    if (!syncAddressStillMatches(address, expected, size, null)) return 0;
+/// Implements the typed PS5 futex-style wait shared by the public 32-bit alias
+/// and the explicit Wait32/Wait64 exports. `timeout_address` points to a
+/// microsecond value; null means an indefinite wait.
+fn syncOnAddressWaitTyped(address: u64, expected: u64, timeout_address: u64, size: u64) i32 {
+    const alignment = syncCompareBytes(size);
+    if (address == 0 or address & (alignment - 1) != 0) return KernelError.einval.raw();
 
-    const known_size = size == 1 or size == 2 or size == 4 or size == 8;
-    if (timeout == 0 and known_size) return 0;
-
-    const generation = syncAddressGeneration(address, false);
-    const total_us: u64 = if (timeout != 0 and timeout <= 10 * std.time.us_per_s)
-        timeout
+    const timeout_us: ?u64 = if (timeout_address == 0)
+        null
     else
-        sync_address_self_heal_us;
+        readGuestSyncWord(timeout_address, @sizeOf(u32)) orelse return KernelError.efault.raw();
+
+    // Capture the generation before comparing. A wake that races between the
+    // compare and the backend park then has a newer sequence and is consumed
+    // immediately instead of being lost.
+    const generation = syncAddressGeneration(address, false);
+    const observed = readGuestSyncWord(address, size) orelse return KernelError.efault.raw();
+    announceSyncAddress("wait", address);
+    logSyncAddressCall("wait", address, expected, timeout_address, size, timeout_us orelse 0, observed);
+    if (observed != expected & syncWordMask(size)) return 0;
+    if (timeout_us == 0) return KernelError.etimedout.raw();
+
     const started = processTimeMicroseconds();
-    const deadline = started +| total_us;
-    while (syncAddressStillMatches(address, expected, size, observed)) {
+    const deadline = if (timeout_us) |timeout| started +| timeout else 0;
+    while (syncAddressStillMatches(address, expected, size) orelse return KernelError.efault.raw()) {
+        if (guest_stop_requested.load(.acquire)) return 0;
         const now = processTimeMicroseconds();
-        const remaining = deadline -| now;
-        if (remaining == 0) break;
+        const remaining = if (timeout_us != null) deadline -| now else sync_address_poll_us;
+        if (timeout_us != null and remaining == 0) return KernelError.etimedout.raw();
         const slice = @min(remaining, sync_address_poll_us);
         const wait_result = threading.waitCurrent(.{
             .key = address,
             .observed_sequence = generation,
             .timeout_microseconds = slice,
         }) catch return KernelError.enosys.raw();
-        if (wait_result == .awoken) break;
-        // A frozen process clock (tests, or a wait that consumed the whole
-        // remaining budget) must not spin forever on the same deadline.
-        if (slice >= remaining or processTimeMicroseconds() <= now) break;
+        if (wait_result == .awoken) return 0;
+        if (timeout_us != null and active_io == null) return KernelError.etimedout.raw();
     }
     return 0;
+}
+
+fn syncOnAddressWait(
+    address: u64,
+    expected: u64,
+    timeout_address: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    return syncOnAddressWaitTyped(address, expected, timeout_address, @sizeOf(u32));
+}
+
+fn syncOnAddressWait32(
+    address: u64,
+    expected: u64,
+    timeout_address: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    return syncOnAddressWaitTyped(address, expected, timeout_address, @sizeOf(u32));
+}
+
+fn syncOnAddressWait64(
+    address: u64,
+    expected: u64,
+    timeout_address: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    return syncOnAddressWaitTyped(address, expected, timeout_address, @sizeOf(u64));
 }
 
 /// Releases workers parked by `syncOnAddressWait` on the same address.
@@ -836,24 +836,20 @@ pub fn wakeSyncAddress(address: u64, maximum_waiters: usize) void {
 
 /// Releases workers parked by `syncOnAddressWait` on the same address.
 fn syncOnAddressWake(
-    address_or_op: u64,
-    count_or_address: u64,
-    count_or_unused: u64,
+    address: u64,
+    count_raw: u64,
+    _: u64,
     _: u64,
     _: u64,
     _: u64,
 ) callconv(abi.guest) i32 {
-    const unified = !looksLikeGuestSyncAddress(address_or_op) and
-        looksLikeGuestSyncAddress(count_or_address);
-    const address = if (unified) count_or_address else address_or_op;
-    const requested_waiters = if (unified) count_or_unused else count_or_address;
-    if (address == 0) return KernelError.einval.raw();
-    const maximum_waiters: usize = if (requested_waiters == 0 or
-        requested_waiters >= std.math.maxInt(u32))
-        std.math.maxInt(usize)
-    else
-        @intCast(requested_waiters);
-    logSyncAddressCall("wake", address, requested_waiters, count_or_unused, 0, 0, readGuestSyncWord(address, 4));
+    const requested_waiters: i32 = @bitCast(@as(u32, @truncate(count_raw)));
+    if (address == 0 or address & (@alignOf(u32) - 1) != 0 or requested_waiters < 0) {
+        return KernelError.einval.raw();
+    }
+    logSyncAddressCall("wake", address, @bitCast(@as(i64, requested_waiters)), 0, 0, 0, readGuestSyncWord(address, 4));
+    if (requested_waiters == 0) return 0;
+    const maximum_waiters: usize = @intCast(requested_waiters);
     wakeSyncAddress(address, maximum_waiters);
     return 0;
 }
@@ -1657,7 +1653,7 @@ fn stopUnloadModule(
 /// `flags` selects the record variant; only the two documented forms exist, and
 /// anything above them is rejected after clearing the record so a guest cannot
 /// read stale stack contents as a result.
-fn getModuleInfoForUnwind(
+pub fn getModuleInfoForUnwind(
     address: u64,
     flags: i32,
     info: ?*unwind.Info,
@@ -1671,8 +1667,21 @@ fn getModuleInfoForUnwind(
     // Filling a record it believes to be smaller would write past its buffer.
     if (out.size < @sizeOf(unwind.Info)) return KernelError.einval.raw();
 
-    const owner = unwind.find(address) orelse return KernelError.esrch.raw();
-    unwind.describe(owner, out);
+    if (unwind.find(address)) |owner| {
+        unwind.describe(owner, out);
+        return errno.ok;
+    }
+
+    // Native HLE calls sit directly on the same x64 stack as guest code. A
+    // throw made under one therefore reaches a host return PC after the last
+    // guest frame. Confirm both that it lies outside every console window and
+    // that VirtualQuery marks it executable before reporting a terminal bridge
+    // segment; unknown guest PCs must retain ESRCH rather than being hidden.
+    for (host_memory.guest_ranges) |range| {
+        if (range.contains(address, 1)) return KernelError.esrch.raw();
+    }
+    if (!host_memory.isHostRangeExecutable(address, 1)) return KernelError.esrch.raw();
+    unwind.describeHostBoundary(address, out);
     return errno.ok;
 }
 
@@ -2244,8 +2253,8 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceKernelStopUnloadModule", .function = trace.wrap("sceKernelStopUnloadModule", &stopUnloadModule), .expect_id = "QKd0qM58Qes" },
     .{ .name = "sceKernelGetProcessTimeCounter", .function = trace.wrap("sceKernelGetProcessTimeCounter", &getProcessTimeCounter), .expect_id = "fgxnMeTNUtY" },
     .{ .name = "sceKernelGetProcessTimeCounterFrequency", .function = trace.wrap("sceKernelGetProcessTimeCounterFrequency", &getProcessTimeCounterFrequency), .expect_id = "BNowx2l588E" },
-    .{ .name = "unknown_libkernel_B2n8aDorSH4", .function = trace.wrap("unknown_libkernel_B2n8aDorSH4", &kernelUnsupported), .id_override = "B2n8aDorSH4" },
-    .{ .name = "unknown_libkernel_PZQhiiLXRFs", .function = trace.wrap("unknown_libkernel_PZQhiiLXRFs", &kernelUnsupported), .id_override = "PZQhiiLXRFs" },
+    .{ .name = "sceKernelSyncOnAddressWait32", .function = trace.wrap("sceKernelSyncOnAddressWait32", &syncOnAddressWait32), .expect_id = "B2n8aDorSH4" },
+    .{ .name = "sceKernelSyncOnAddressWait64", .function = trace.wrap("sceKernelSyncOnAddressWait64", &syncOnAddressWait64), .expect_id = "PZQhiiLXRFs" },
     .{ .name = "sceKernelSyncOnAddressWake", .function = trace.wrap("sceKernelSyncOnAddressWake", &syncOnAddressWake), .expect_id = "q2y-wDIVWZA" },
     .{ .name = "sceKernelSyncOnAddressWait", .function = trace.wrap("sceKernelSyncOnAddressWait", &syncOnAddressWait), .expect_id = "Hc4CaR6JBL0" },
     .{ .name = "sceKernelIsTrinityMode", .function = trace.wrap("sceKernelIsTrinityMode", &isTrinityMode), .expect_id = "tU5e3f9gSiU" },
@@ -2384,6 +2393,8 @@ test "runtime compatibility exports include libc bootstrap data and private NIDs
     try std.testing.expect(db.findByName("__progname", .object) != null);
     try std.testing.expect(db.findByName("__tls_get_addr", .function) != null);
     try std.testing.expect(db.findById("B2n8aDorSH4", .function) != null);
+    try std.testing.expect(db.findByName("sceKernelSyncOnAddressWait32", .function) != null);
+    try std.testing.expect(db.findByName("sceKernelSyncOnAddressWait64", .function) != null);
     try std.testing.expect(db.findByName("sceKernelSyncOnAddressWait", .function) != null);
     try std.testing.expect(db.findByName("sceKernelSyncOnAddressWake", .function) != null);
 }
@@ -2473,6 +2484,7 @@ test "Unity scripting allocator uses the application heap memalign callback" {
 
 const SyncAddressTestBackend = struct {
     wait_request: ?threading.WaitRequest = null,
+    wait_result: threading.WaitResult = .awoken,
     wake_key: u64 = 0,
     wake_sequence: u64 = 0,
     wake_count: usize = 0,
@@ -2487,7 +2499,7 @@ const SyncAddressTestBackend = struct {
     ) threading.BackendError!threading.WaitResult {
         const self: *SyncAddressTestBackend = @ptrCast(@alignCast(raw.?));
         self.wait_request = request;
-        return .timed_out;
+        return self.wait_result;
     }
 
     fn wake(
@@ -2588,7 +2600,8 @@ test "address waits park by generation and matching wakes advance it" {
     defer threading.attachManager(null);
     resetSyncAddresses();
 
-    const address: u64 = 0x1234_0000;
+    var word: u32 = 0;
+    const address: u64 = @intFromPtr(&word);
     try testing.expectEqual(KernelError.einval.raw(), syncOnAddressWait(0, 0, 0, 0, 0, 0));
     try testing.expectEqual(@as(i32, 0), syncOnAddressWait(address, 0, 0, 0, 0, 0));
     try testing.expectEqual(address, backend.wait_request.?.key);
@@ -2603,10 +2616,11 @@ test "address waits park by generation and matching wakes advance it" {
     try testing.expectEqual(@as(i32, 0), syncOnAddressWait(address, 0, 0, 0, 0, 0));
     try testing.expectEqual(@as(u64, 2), backend.wait_request.?.observed_sequence);
     try testing.expectEqual(@as(i32, 0), syncOnAddressWake(address, 0, 0, 0, 0, 0));
-    try testing.expectEqual(std.math.maxInt(usize), backend.wake_count);
+    try testing.expectEqual(@as(usize, 1), backend.wake_count);
+    try testing.expectEqual(KernelError.einval.raw(), syncOnAddressWake(address, std.math.maxInt(u64), 0, 0, 0, 0));
 }
 
-test "address wait returns immediately when the guest word already changed" {
+test "typed address waits compare values and honor timeout pointers" {
     const testing = std.testing;
     const memory = @import("memory");
     const loader = @import("loader");
@@ -2626,11 +2640,23 @@ test "address wait returns immediately when the guest word already changed" {
 
     var word: u32 = 7;
     const address: u64 = @intFromPtr(&word);
-    try testing.expectEqual(@as(i32, 0), syncOnAddressWait(address, 3, 4, 1_000_000, 0, 0));
+    var timeout_us: u32 = 1_000_000;
+    try testing.expectEqual(@as(i32, 0), syncOnAddressWait(address, 3, @intFromPtr(&timeout_us), 0, 0, 0));
     try testing.expect(backend.wait_request == null);
 
     word = 3;
-    try testing.expectEqual(@as(i32, 0), syncOnAddressWait(address, 3, 4, 0, 0, 0));
+    timeout_us = 0;
+    try testing.expectEqual(KernelError.etimedout.raw(), syncOnAddressWait(address, 3, @intFromPtr(&timeout_us), 0, 0, 0));
+    try testing.expect(backend.wait_request == null);
+
+    timeout_us = 1_000;
+    backend.wait_result = .timed_out;
+    try testing.expectEqual(KernelError.etimedout.raw(), syncOnAddressWait32(address, 3, @intFromPtr(&timeout_us), 0, 0, 0));
+    try testing.expectEqual(@as(u64, timeout_us), backend.wait_request.?.timeout_microseconds.?);
+
+    var word64: u64 = 0x1_0000_0000;
+    backend.wait_request = null;
+    try testing.expectEqual(@as(i32, 0), syncOnAddressWait64(@intFromPtr(&word64), 0, 0, 0, 0, 0));
     try testing.expect(backend.wait_request == null);
 }
 

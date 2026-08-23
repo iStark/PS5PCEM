@@ -1620,6 +1620,42 @@ fn outputZero64(_: i32, output: ?*u64) callconv(abi.guest) i32 {
     return errno.ok;
 }
 
+/// Presents a stable local NP profile. Unity's PlayStation integration treats
+/// a successful query with an empty account as a transient state and may keep
+/// retrying its startup flow indefinitely.
+const np_state_signed_in: u32 = 2;
+const np_reachability_unavailable: u32 = 0;
+
+fn npGetAccountId(user_id: i32, output: ?*u64) callconv(abi.guest) i32 {
+    if (user_id == -1) return invalid_argument;
+    const account_id = output orelse return invalid_argument;
+    account_id.* = 1;
+    return errno.ok;
+}
+
+fn npGetAccountCountry(user_id: i32, output: ?*[4]u8) callconv(abi.guest) i32 {
+    if (user_id == -1) return invalid_argument;
+    const country = output orelse return invalid_argument;
+    country.* = .{ 'U', 'S', 0, 0 };
+    return errno.ok;
+}
+
+fn npGetState(_: i32, output: ?*u32) callconv(abi.guest) i32 {
+    const state = output orelse return invalid_argument;
+    // The local account remains signed in even when PSN itself is unreachable.
+    // Reporting SIGNED_OUT makes Unity's PSN integration wait for a login event
+    // which an offline emulator can never deliver.
+    state.* = np_state_signed_in;
+    return errno.ok;
+}
+
+fn npGetReachabilityState(user_id: i32, output: ?*u32) callconv(abi.guest) i32 {
+    if (user_id == -1) return invalid_argument;
+    const state = output orelse return invalid_argument;
+    state.* = np_reachability_unavailable;
+    return errno.ok;
+}
+
 fn availableSpace(_: u32, output: ?*u64) callconv(abi.guest) i32 {
     const value = output orelse return invalid_argument;
     value.* = 1024 * 1024;
@@ -2017,10 +2053,10 @@ const app_content_exports = [_]symbols.Export{
 };
 
 const np_manager_exports = [_]symbols.Export{
-    .{ .name = "sceNpGetAccountIdA", .function = trace.wrap("sceNpGetAccountIdA", &outputZero64), .expect_id = "rbknaUjpqWo" },
-    .{ .name = "sceNpGetAccountCountryA", .function = trace.wrap("sceNpGetAccountCountryA", &outputZero32), .expect_id = "JT+t00a3TxA" },
-    .{ .name = "sceNpGetState", .function = trace.wrap("sceNpGetState", &outputZero32), .expect_id = "eQH7nWPcAgc" },
-    .{ .name = "sceNpGetNpReachabilityState", .function = trace.wrap("sceNpGetNpReachabilityState", &outputZero32), .expect_id = "e-ZuhGEoeC4" },
+    .{ .name = "sceNpGetAccountIdA", .function = trace.wrap("sceNpGetAccountIdA", &npGetAccountId), .expect_id = "rbknaUjpqWo" },
+    .{ .name = "sceNpGetAccountCountryA", .function = trace.wrap("sceNpGetAccountCountryA", &npGetAccountCountry), .expect_id = "JT+t00a3TxA" },
+    .{ .name = "sceNpGetState", .function = trace.wrap("sceNpGetState", &npGetState), .expect_id = "eQH7nWPcAgc" },
+    .{ .name = "sceNpGetNpReachabilityState", .function = trace.wrap("sceNpGetNpReachabilityState", &npGetReachabilityState), .expect_id = "e-ZuhGEoeC4" },
 };
 
 const remoteplay_exports = [_]symbols.Export{
@@ -3987,6 +4023,27 @@ test "fuse shader halves patches ES program and keeps front header lookup" {
         @as(?u64, front_address),
         agc_shader_registry.find(front_code_address),
     );
+}
+
+test "NP manager exposes a consistent local offline profile" {
+    var account_id: u64 = 0;
+    var country: [4]u8 = @splat(0);
+    var state: u32 = 0;
+    var reachability: u32 = 1;
+
+    try std.testing.expectEqual(errno.ok, npGetAccountId(1, &account_id));
+    try std.testing.expectEqual(@as(u64, 1), account_id);
+    try std.testing.expectEqual(errno.ok, npGetAccountCountry(1, &country));
+    try std.testing.expectEqualSlices(u8, &.{ 'U', 'S', 0, 0 }, &country);
+    try std.testing.expectEqual(errno.ok, npGetState(1, &state));
+    try std.testing.expectEqual(np_state_signed_in, state);
+    try std.testing.expectEqual(errno.ok, npGetReachabilityState(1, &reachability));
+    try std.testing.expectEqual(np_reachability_unavailable, reachability);
+
+    try std.testing.expectEqual(invalid_argument, npGetAccountId(1, null));
+    try std.testing.expectEqual(invalid_argument, npGetAccountCountry(-1, &country));
+    try std.testing.expectEqual(invalid_argument, npGetState(1, null));
+    try std.testing.expectEqual(invalid_argument, npGetReachabilityState(-1, &reachability));
 }
 
 test "bootstrap service libraries register the title link surface" {

@@ -572,6 +572,18 @@ pub fn listSaveDataSlots(names: [][savedata.maximum_slot_name]u8) usize {
         // The blob behind the memory-backed API is not a save slot; a title
         // offered it as one would try to mount it and find nothing it wrote.
         if (std.mem.eql(u8, entry.name, savedata.memory_directory)) continue;
+
+        // Save-data writes are a transaction on the console. A process killed
+        // while creating a slot must therefore leave no slot for the next run
+        // to discover. The host backing currently exposes writes immediately,
+        // so reject directories which contain only metadata or empty staging
+        // files. Otherwise a title can find the half-written slot, fail while
+        // opening its missing payload, and wait forever for a load callback.
+        var slot_directory = directory.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+        const has_payload = saveDataDirectoryHasPayload(slot_directory, io, true, 0);
+        slot_directory.close(io);
+        if (!has_payload) continue;
+
         if (found == names.len) break;
         const length = @min(entry.name.len, savedata.maximum_slot_name - 1);
         @memset(&names[found], 0);
@@ -579,6 +591,45 @@ pub fn listSaveDataSlots(names: [][savedata.maximum_slot_name]u8) usize {
         found += 1;
     }
     return found;
+}
+
+const maximum_save_data_directory_depth = 32;
+
+/// Whether a slot contains at least one byte of title-owned payload.
+///
+/// `sce_sys` contains only firmware metadata and cannot make an interrupted
+/// write into a loadable save. Payloads may be nested, so inspect child
+/// directories too while retaining a hard recursion bound for hostile trees.
+fn saveDataDirectoryHasPayload(
+    directory: std.Io.Dir,
+    io: std.Io,
+    skip_metadata: bool,
+    depth: usize,
+) bool {
+    if (depth == maximum_save_data_directory_depth) return false;
+
+    var iterator = directory.iterate();
+    while (iterator.next(io) catch null) |entry| {
+        if (skip_metadata and
+            std.ascii.eqlIgnoreCase(entry.name, savedata.metadata_directory)) continue;
+
+        switch (entry.kind) {
+            .file => {
+                const file = directory.openFile(io, entry.name, .{}) catch continue;
+                const length = file.length(io) catch 0;
+                file.close(io);
+                if (length != 0) return true;
+            },
+            .directory => {
+                var child = directory.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+                const has_payload = saveDataDirectoryHasPayload(child, io, false, depth + 1);
+                child.close(io);
+                if (has_payload) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
 }
 
 /// Reads the descriptive parameters a slot recorded for itself.
@@ -1461,6 +1512,38 @@ const Fixture = struct {
         self.tmp.cleanup();
     }
 };
+
+test "save-data search hides interrupted slots without payload" {
+    var fixture = try Fixture.init("title data");
+    defer fixture.deinit();
+
+    attachSaveDataHome(fixture.tmp.dir, "PPSA15065");
+    defer {
+        savedata_home = null;
+        title_identifier_length = 0;
+    }
+
+    try fixture.tmp.dir.createDirPath(testing.io, "PPSA15065/incomplete/sce_sys");
+    try fixture.tmp.dir.writeFile(testing.io, .{
+        .sub_path = "PPSA15065/incomplete/path.txt",
+        .data = "",
+    });
+    try fixture.tmp.dir.writeFile(testing.io, .{
+        .sub_path = "PPSA15065/incomplete/sce_sys/param.txt",
+        .data = "title metadata",
+    });
+
+    try fixture.tmp.dir.createDirPath(testing.io, "PPSA15065/complete/data");
+    try fixture.tmp.dir.writeFile(testing.io, .{
+        .sub_path = "PPSA15065/complete/data/progress.bin",
+        .data = "progress",
+    });
+
+    var names: [4][savedata.maximum_slot_name]u8 = undefined;
+    const found = listSaveDataSlots(&names);
+    try testing.expectEqual(@as(usize, 1), found);
+    try testing.expectEqualStrings("complete", std.mem.sliceTo(&names[0], 0));
+}
 
 test "a title reads its own content through the mount" {
     var fixture = try Fixture.init("0123456789");

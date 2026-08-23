@@ -8,17 +8,7 @@ const abi = @import("../abi.zig");
 const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
-
-fn getModuleInfoForUnwind(
-    _: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-) callconv(abi.guest) i32 {
-    return errno.KernelError.enoent.raw();
-}
+const kernel_runtime = @import("kernel_runtime.zig");
 
 fn loadModule(_: u32) callconv(abi.guest) i32 {
     // Built-in system modules are represented by their registered HLE exports;
@@ -36,23 +26,31 @@ fn loadModuleInternal(_: u64, _: u64, _: u64) callconv(abi.guest) i32 {
     return errno.ok;
 }
 
-pub const exports = [_]symbols.Export{ .{
-    .name = "sceSysmoduleLoadModuleInternal",
-    .function = trace.wrap("sceSysmoduleLoadModuleInternal", &loadModuleInternal),
-    .expect_id = "39iV5E1HoCk",
-}, .{
-    .name = "sceSysmoduleLoadModuleByNameInternal",
-    .function = trace.wrap("sceSysmoduleLoadModuleByNameInternal", &loadModuleInternal),
-    .expect_id = "CU8m+Qs+HN4",
-}, .{
-    .name = "sceSysmoduleGetModuleInfoForUnwind",
-    .function = trace.wrap("sceSysmoduleGetModuleInfoForUnwind", &getModuleInfoForUnwind),
-    .expect_id = "4fU5yvOkVG4",
-}, .{
-    .name = "sceSysmoduleLoadModule",
-    .function = trace.wrap("sceSysmoduleLoadModule", &loadModule),
-    .expect_id = "g8cM39EUZ6o",
-} };
+pub const exports = [_]symbols.Export{
+    .{
+        .name = "sceSysmoduleLoadModuleInternal",
+        .function = trace.wrap("sceSysmoduleLoadModuleInternal", &loadModuleInternal),
+        .expect_id = "39iV5E1HoCk",
+    },
+    .{
+        .name = "sceSysmoduleLoadModuleByNameInternal",
+        .function = trace.wrap("sceSysmoduleLoadModuleByNameInternal", &loadModuleInternal),
+        .expect_id = "CU8m+Qs+HN4",
+    },
+    .{
+        .name = "sceSysmoduleGetModuleInfoForUnwind",
+        // The sysmodule and kernel entry points are two names for the same firmware
+        // query. Keeping a separate fallback here made valid IL2CPP addresses look
+        // unmapped even though the loader had already published their unwind data.
+        .function = trace.wrap("sceSysmoduleGetModuleInfoForUnwind", &kernel_runtime.getModuleInfoForUnwind),
+        .expect_id = "4fU5yvOkVG4",
+    },
+    .{
+        .name = "sceSysmoduleLoadModule",
+        .function = trace.wrap("sceSysmoduleLoadModule", &loadModule),
+        .expect_id = "g8cM39EUZ6o",
+    },
+};
 
 pub const library = symbols.Library{ .name = "libSceSysmodule", .version = 1 };
 pub const module = symbols.Module{

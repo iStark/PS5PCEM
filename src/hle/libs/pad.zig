@@ -145,7 +145,12 @@ fn padInit() callconv(abi.guest) i32 {
 
 fn padOpen(user_id: i32, port_type: i32, index: i32, parameter: ?*const anyopaque) callconv(abi.guest) i32 {
     if (initialized.load(.acquire) == 0) return error_not_initialized;
-    if (user_id != user_service.primary_user_id or port_type != 0 or index != 0 or parameter != null) {
+    // PS5 titles use port type 2 for the login user's special controller port
+    // (Cat Quest III does this during input bootstrap). It is the same physical
+    // primary pad as the standard type-0 port from the emulator's perspective.
+    if (user_id != user_service.primary_user_id or
+        (port_type != 0 and port_type != 2) or index != 0 or parameter != null)
+    {
         return error_device_not_connected;
     }
     open.store(1, .release);
@@ -286,7 +291,9 @@ fn acceptPointerState(handle: i32, parameter: ?*const anyopaque) callconv(abi.gu
 }
 
 fn setVibrationMode(handle: i32, _: i32) callconv(abi.guest) i32 {
-    return if (validHandle(handle)) errno.ok else error_invalid_handle;
+    // Games also use this as a global feature toggle with the sentinel handle
+    // -1. The platform accepts that form even when no controller is open.
+    return if (handle == -1 or validHandle(handle)) errno.ok else error_invalid_handle;
 }
 
 fn getTriggerEffectState(handle: i32, output: ?*[8]u8) callconv(abi.guest) i32 {
@@ -341,6 +348,22 @@ test "pad opens for the primary user and reports neutral connected data" {
     try std.testing.expectEqual(@as(u8, 128), data[0].left_stick_x);
     try std.testing.expectEqual(@as(u8, 1), data[0].connected);
     try std.testing.expectEqual(errno.ok, padClose(handle));
+}
+
+test "pad opens the primary user's PS5 special controller port" {
+    reset();
+    try std.testing.expectEqual(errno.ok, padInit());
+    try std.testing.expectEqual(primary_handle, padOpen(user_service.primary_user_id, 2, 0, null));
+
+    var data: [1]PadData = .{.{}};
+    try std.testing.expectEqual(@as(i32, 1), padRead(primary_handle, &data, 1));
+    try std.testing.expectEqual(@as(u8, 1), data[0].connected);
+}
+
+test "vibration mode accepts the global sentinel handle" {
+    reset();
+    try std.testing.expectEqual(errno.ok, setVibrationMode(-1, 1));
+    try std.testing.expectEqual(error_invalid_handle, setVibrationMode(99, 1));
 }
 
 test "pad get handle exposes the system-managed primary controller" {

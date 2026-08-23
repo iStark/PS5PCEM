@@ -97,6 +97,22 @@ pub fn describe(module: *const Module, info: *Info) void {
     info.segment_size = module.end - module.start;
 }
 
+/// Describes the native bridge frame where a guest stack walk must stop.
+///
+/// Guest code calls HLE through native functions, so an exception raised while
+/// one is active eventually reaches a return address in the emulator itself.
+/// There is deliberately no unwind table for that boundary: reporting the
+/// containing segment lets libc end the guest walk cleanly instead of treating
+/// the host PC as a missing guest module and raising another exception.
+pub fn describeHostBoundary(address: u64, info: *Info) void {
+    const segment_size: u64 = 0x10_0000;
+    info.* = .{};
+    const name = "PS5PCEMHostBoundary";
+    @memcpy(info.name[0..name.len], name);
+    info.segment_address = address & ~(segment_size - 1);
+    info.segment_size = segment_size;
+}
+
 /// Reads the address of the unwind records out of an index header.
 ///
 /// The header stores the pointer in a DWARF encoding chosen by the compiler.
@@ -182,6 +198,17 @@ test "an over-long name is truncated and stays terminated" {
     // The guest reads this as a C string, so the terminator has to survive.
     try testing.expectEqual(@as(usize, 255), std.mem.sliceTo(&info.name, 0).len);
     try testing.expectEqual(@as(u8, 0), info.name[255]);
+}
+
+test "a native bridge boundary has no guest unwind tables" {
+    var info = Info{};
+    describeHostBoundary(0x7ff6_4d53_e622, &info);
+
+    try testing.expectEqualStrings("PS5PCEMHostBoundary", std.mem.sliceTo(&info.name, 0));
+    try testing.expectEqual(@as(u64, 0x7ff6_4d50_0000), info.segment_address);
+    try testing.expectEqual(@as(u64, 0x10_0000), info.segment_size);
+    try testing.expectEqual(@as(u64, 0), info.eh_frame_header);
+    try testing.expectEqual(@as(u64, 0), info.eh_frame);
 }
 
 var decode_source: []const u8 = &.{};
