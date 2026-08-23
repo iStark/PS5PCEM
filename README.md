@@ -117,7 +117,12 @@ If you would like to support continued PS5PCEM development, you can do so on
   The matched resident-copy path now accepts both one-instance forms while
   retaining the existing shader, resource, format, and full-extent checks, so
   the compositor's negative-height viewport reaches scanout without matching
-  ordinary textured triangles.
+  ordinary textured triangles. Startup save discovery also hides interrupted
+  slots that contain only firmware metadata or empty staging files. A
+  reproduced `path.txt`-only settings slot previously made the title fail on a
+  missing `Data.dat` and wait forever after its 13-draw startup frame; it now
+  completes the search without mounting that incomplete slot and continues
+  presenting frames.
 - Jurassic Park Classic Games Collection now resolves the observed Font,
   FontFt, JPEG, Pad, VideoOut, Posix, and AGC driver imports, completes its
   Unity bootstrap, and reaches a stable visible 3840×2160 intro frame. Both the
@@ -2459,7 +2464,13 @@ scheduler and Vulkan backend. Observed startup work now includes:
   fragment-shader, resource, format, and full-extent checks still gate the
   resident-copy fast path. Its negative-height viewport therefore reaches the
   scanout-orientation metadata, fixing the vertically inverted startup splash
-  without treating ordinary textured triangles as full-surface copies.
+  without treating ordinary textured triangles as full-surface copies. Save
+  directory enumeration now requires at least one byte of title-owned payload
+  outside `sce_sys`. This restores the transaction visibility expected from
+  the platform when a prior run was interrupted after creating metadata and an
+  empty file, rather than advertising that partial directory as a loadable
+  slot and leaving Unity's asynchronous `FileOps` flow without a completion
+  callback.
 - The writable `/devlog/app/debug.log` console path is redirected to
   `out/guest-debug.log` without making `/app0` writable. Unity diagnostics can
   therefore survive startup failures while title content retains its read-only
