@@ -38,13 +38,15 @@ If you would like to support continued PS5PCEM development, you can do so on
   tables, per-instruction V# mappings, `VertexIndex`, PARAM exports, and
   fragment interpolation.
 - Three-dimensional scenes now reach the screen rather than only flat composited
-  output. Merged NGG vertex programs translate, a bound depth allocation is a
-  real attachment that later passes can also sample, and compute stages exchange
-  typed 2D, array and 3D images between themselves. Fifty-six host formats are
-  reachable, spanning the BC1–BC7 blocks, signed and unsigned integer and
-  normalized channels, R16/RG16, half-float and `RGBA32_FLOAT`. What is still
-  missing is named where it belongs: only the
-  base mip of a chain. Bound stencil planes become packed depth+stencil
+  output. Merged NGG vertex programs translate, including fetch-shader
+  continuations that end their attribute prolog with `S_SETPC_B64`. A bound
+  depth allocation is a real attachment that later passes can also sample, and
+  compute stages exchange typed 2D, array and 3D images between themselves.
+  Fifty-six host formats are reachable, spanning the BC1–BC7 blocks, signed and
+  unsigned integer and normalized channels, R16/RG16, half-float and
+  `RGBA32_FLOAT`. Sampled T# views detile their mip range, including a non-zero
+  base level; GPU compute detile covers 4/8/16-byte 2D and 3D standard/PRT
+  surfaces, while RB+ and MSAA still fall back to the CPU. Bound stencil planes become packed depth+stencil
   attachments with the guest compare and update operations, and matching
   colour/depth sample counts 2/4/8 stay on the host image through a later
   resolve.
@@ -999,11 +1001,12 @@ The remaining stages are:
    and issue host draws. Remaining graphics work is layers, metadata, and
    first-use cost.
 3. Cover the remaining explicit-LOD operands and image operations seen in
-   captures. Irreducible control flow and VCC/EXEC per-lane predicates now
-   lower through a dispatcher; the former Jurassic Park device loss was an
-   invalid framebuffer pairing caused by a stale undersized depth attachment,
-   not shader control flow. The alternate gradient-free image-sample encoding
-   is already accepted.
+   captures. `IMAGE_SAMPLE_D` now supplies SPIR-V Grad, 1D samples a height-1
+   2D view, and DPP `quad_perm` shuffles inside the quad. Irreducible control
+   flow and VCC/EXEC per-lane predicates lower through a dispatcher; the
+   former Jurassic Park device loss was an invalid framebuffer pairing caused
+   by a stale undersized depth attachment, not shader control flow. The
+   alternate gradient-free image-sample encoding is already accepted.
 4. Continue reducing first-use texture work and the per-draw submission cost
    for the remaining uncompressed layer and metadata paths, and validate state
    and resource invalidation against longer title captures.
@@ -2573,11 +2576,13 @@ readback is converted to RGBA8 for diagnostic presentation.
 
 The registered 3840×2160 VideoOut allocation is still opaque black at the
 second flip. The screenshot above therefore comes from the newest visible
-1920×1080 `R11G11B10_FLOAT` intermediate, not from the final scanout. The main
-remaining correctness work is the NGG/fetch-shader continuation that ends its
-attribute prolog with `S_SETPC_B64`, exact layered rendering, and the final
-scanout alias/tonemap path. One oversized guest-buffer descriptor also remains
-unresolved. Performance is still not interactive, but the old 471-second
+1920×1080 `R11G11B10_FLOAT` intermediate, not from the final scanout. NGG
+fetch-shader programs that end their attribute prolog with `S_SETPC_B64` now
+continue: PC-relative `S_GETPC_B64`/`S_ADD` jumps are CFG edges, and an AGC
+fetch shader inlines at a non-`s6` SETPC while `s[6:7]` remains the hardware
+exporter. The main remaining correctness work is exact layered rendering and
+the final scanout alias/tonemap path. One oversized guest-buffer descriptor
+also remains unresolved. Performance is still not interactive, but the old 471-second
 startup-frame measurement no longer describes the current renderer: most
 post-bootstrap cycles in the latest run take about 3.3–3.8 seconds on the test
 RTX 3070 Ti, with occasional heavier cycles around 6.6 seconds. Synchronous GPU
@@ -2606,10 +2611,11 @@ from leaking into host code where nothing would check it.
    depth/stencil, atomic, and compressed-surface forms; retain exact UAV fast
    paths only where they reduce synchronous startup work without changing
    semantics.
-3. Extend image sampling and storage to the remaining mip, layer, array, MSAA,
-   partial-mask, atomic, and compressed-surface forms; finish the NGG export
-   path and cover the remaining indirect descriptor variants that still leave
-   the deferred compositor with incomplete inputs.
+3. Extend image sampling and storage to the remaining layer, array, MSAA,
+   partial-mask, atomic, and compressed-surface forms, and cover the remaining
+   indirect descriptor variants that still leave the deferred compositor with
+   incomplete inputs. NGG fetch-shader `S_SETPC_B64` continuations and the
+   sampled T# mip range now lower.
 4. Move the remaining first-use texture conversion and synchronous compute work
    off the frame-critical path without changing guest-visible synchronization.
 5. Keep the guest process in a stable long-running flip/submit loop and close
