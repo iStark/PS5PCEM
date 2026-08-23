@@ -1461,9 +1461,11 @@ const SampledStagingLayout = union(enum) {
     subresource: gpu.TextureSubresourceLayout,
 
     fn fromImage(descriptor: gpu.resources.ImageDescriptor) anyerror!SampledStagingLayout {
-        if (descriptor.image_type == .color_3d) {
+        const base_level = descriptor.viewBaseLevel();
+        if (descriptor.image_type == .color_3d or base_level != 0) {
             const texture = try gpu.TextureLayout.fromImage(descriptor);
-            return .{ .subresource = try texture.base() };
+            const layers: u32 = if (descriptor.image_type == .color_3d) 1 else texture.layers;
+            return .{ .subresource = try texture.subresource(base_level, 0, layers) };
         }
         return .{ .surface = try gpu.SurfaceLayout.fromImage(descriptor) };
     }
@@ -1886,6 +1888,7 @@ fn sampledImageDimensionForInstruction(
     // 3D lookup volumes, so refine the ambiguous form after materializing T#.
     if (image_type == .color_3d) return .three_d;
     return switch (dimension) {
+        .dim_1d => .two_d,
         .dim_2d => .two_d,
         .dim_3d => .three_d,
         // GFX10 MIMG DIM=3 denotes a cubemap. The decoder's historical enum
@@ -3358,6 +3361,7 @@ pub const Renderer = struct {
                 &bindings,
                 reader,
                 analysis,
+                analysis.program.instructions.items,
                 &scalar,
                 specialized_scalar_prefix_end,
                 null,
@@ -4637,6 +4641,7 @@ pub const Renderer = struct {
         bindings: *const gpu.ShaderBindings,
         reader: gpu.ShaderMemoryReader,
         analysis: *const gpu.ShaderAnalysis,
+        instructions: []const gpu.ShaderInstruction,
         scalar: *const gpu.ScalarEvaluation,
         specialized_scalar_prefix_end: u32,
         reserved_resources: ?*const ComputeResources,
@@ -4687,7 +4692,7 @@ pub const Renderer = struct {
             result.sizes[descriptor_index] = size;
         }
 
-        for (analysis.program.instructions.items) |inst| {
+        for (instructions) |inst| {
             const is_store = switch (inst.opcode) {
                 .buffer_load_ubyte,
                 .buffer_load_sbyte,
@@ -4755,7 +4760,7 @@ pub const Renderer = struct {
             const instruction_scalar = gpu.scalar_provenance.evaluateDecodedResourceStateUntil(
                 reader,
                 bindings,
-                analysis.program.instructions.items,
+                instructions,
                 inst.pc,
             );
             // The instruction-local scalar state is authoritative. Attribute
@@ -4887,7 +4892,7 @@ pub const Renderer = struct {
             if (is_store) result.writable[descriptor_index] = true;
         }
 
-        for (analysis.program.instructions.items) |inst| {
+        for (instructions) |inst| {
             const writable = switch (inst.opcode) {
                 .image_load => false,
                 .image_store,
@@ -4916,7 +4921,7 @@ pub const Renderer = struct {
             const image_scalar = gpu.scalar_provenance.evaluateDecodedResourceStateUntil(
                 reader,
                 bindings,
-                analysis.program.instructions.items,
+                instructions,
                 inst.pc,
             );
             const descriptor = (try resolveComputeImageDescriptor(
@@ -5057,7 +5062,7 @@ pub const Renderer = struct {
             result.storage_image_mapping_count += 1;
         }
 
-        for (analysis.program.instructions.items) |inst| {
+        for (instructions) |inst| {
             const image_fetch = inst.opcode == .image_load;
             if (!image_fetch and inst.opcode != .image_sample and inst.opcode != .image_gather4) continue;
             if (inst.src1.kind != .sgpr or inst.src2.kind != .sgpr) {
@@ -5078,7 +5083,7 @@ pub const Renderer = struct {
             const sampled_scalar = gpu.scalar_provenance.evaluateDecodedResourceStateUntil(
                 reader,
                 bindings,
-                analysis.program.instructions.items,
+                instructions,
                 inst.pc,
             );
             const image_descriptor = (try resolveComputeSampledImageDescriptor(
@@ -9017,9 +9022,28 @@ pub const Renderer = struct {
             traceShaderAnalysisFailure(reader, .pixel, fragment_address, fragment_header, err);
             return err;
         };
+        const vertex_bindings = try gpu.ShaderBindings.capture(state, vertex_stage, vertex_header, reader);
+        const fragment_bindings = try gpu.ShaderBindings.capture(state, .pixel, fragment_header, reader);
+        var vertex_instruction_storage: std.ArrayList(gpu.ShaderInstruction) = .empty;
+        defer vertex_instruction_storage.deinit(self.allocator);
+        var vertex_instructions = vertex_analysis.program.instructions.items;
+        if (vertex_bindings.direct_pointers.fetch_shader) |fetch_address| {
+            if (fetch_address != 0 and fetch_address != vertex_address) {
+                if (self.analyzedProgram(reader, fetch_address, null)) |fetch_analysis| {
+                    if (gpu.shader_analysis.inlineFetchShader(
+                        self.allocator,
+                        vertex_analysis.program.instructions.items,
+                        fetch_analysis.program.instructions.items,
+                        &vertex_instruction_storage,
+                    ) catch false) {
+                        vertex_instructions = vertex_instruction_storage.items;
+                    }
+                } else |_| {}
+            }
+        }
         var vertex_export_mask: u64 = 0;
         var vertex_parameter_mask: u32 = 0;
-        for (vertex_analysis.program.instructions.items) |inst| {
+        for (vertex_instructions) |inst| {
             if (inst.opcode != .exp) continue;
             vertex_export_mask |= @as(u64, 1) << inst.export_target;
             if (inst.export_target >= 0x20) {
@@ -9069,7 +9093,7 @@ pub const Renderer = struct {
 
         var ngg_lds_exports: [33]gpu.ShaderSpirvNggLdsExport = undefined;
         const ngg_lds_export_count = inferNggLdsExports(
-            vertex_analysis,
+            vertex_instructions,
             &parameter_components,
             &ngg_lds_exports,
         );
@@ -9133,8 +9157,6 @@ pub const Renderer = struct {
                 .{ vertex_address, @tagName(vertex_stage) },
             );
         }
-        const vertex_bindings = try gpu.ShaderBindings.capture(state, vertex_stage, vertex_header, reader);
-        const fragment_bindings = try gpu.ShaderBindings.capture(state, .pixel, fragment_header, reader);
         const resource_started = hostTimestampNs();
         var graphics_resources = try self.prepareGraphicsResources(
             &fragment_bindings,
@@ -9178,7 +9200,7 @@ pub const Renderer = struct {
         const vertex_scalar = gpu.scalar_provenance.evaluateDecodedResourceState(
             reader,
             &vertex_bindings,
-            vertex_analysis.program.instructions.items,
+            vertex_instructions,
         );
         self.frame_profile.scalar_provenance_ns +|= elapsedHostNanoseconds(vertex_provenance_started);
         const vertex_scalar_end: u32 = 0x0010_0000;
@@ -9208,7 +9230,7 @@ pub const Renderer = struct {
         vertex_scalar_count = seedVertexBufferScalars(
             &vertex_bindings,
             reader,
-            vertex_analysis,
+            vertex_instructions,
             &vertex_scalar_regs,
             vertex_scalar_count,
             &vertex_scalar_mut,
@@ -9255,6 +9277,7 @@ pub const Renderer = struct {
             &vertex_bindings,
             reader,
             vertex_analysis,
+            vertex_instructions,
             &vertex_scalar_mut,
             vertex_scalar_end,
             null,
@@ -9478,6 +9501,7 @@ pub const Renderer = struct {
             &fragment_bindings,
             reader,
             fragment_analysis,
+            fragment_analysis.program.instructions.items,
             &fragment_scalar_mut,
             fragment_scalar_end,
             &vertex_storage,
@@ -9674,7 +9698,14 @@ pub const Renderer = struct {
                 clip & (1 << 19) == 0
             else
                 false;
-            if (vertex_analysis.translateSpirv(self.allocator, .{
+            const vertex_program = if (vertex_instruction_storage.items.len != 0)
+                rdna2.Program{
+                    .code = vertex_analysis.program.code,
+                    .instructions = vertex_instruction_storage,
+                }
+            else
+                vertex_analysis.program;
+            if (rdna2.translateSpirv(self.allocator, &vertex_program, .{
                 .stage = .vertex,
                 // The PS5 NGG/export ABI supplies S_NGG_VERTEX_INDEX in v5;
                 // ordinary VS programs retain the legacy v0 convention.
@@ -11480,7 +11511,8 @@ pub const Renderer = struct {
         const is_cube = dimension == .cube;
         const is_2d_array = dimension == .two_d_array;
         const compatible_type = switch (dimension) {
-            .two_d => descriptor.image_type == .color_2d or descriptor.image_type == .cube,
+            .two_d => descriptor.image_type == .color_2d or descriptor.image_type == .cube or
+                descriptor.image_type == .color_1d,
             .three_d => descriptor.image_type == .color_3d,
             .cube => descriptor.image_type == .cube,
             .two_d_array => descriptor.image_type == .color_2d_array or descriptor.image_type == .cube,
@@ -14887,7 +14919,7 @@ fn recordNggLdsWord(
 }
 
 fn shaderOperandConstantBefore(
-    analysis: *const gpu.ShaderAnalysis,
+    instructions: []const gpu.ShaderInstruction,
     before_index: usize,
     source: gpu.ShaderOperand,
 ) ?u32 {
@@ -14899,7 +14931,7 @@ fn shaderOperandConstantBefore(
     var index = before_index;
     while (index != 0) {
         index -= 1;
-        const inst = analysis.program.instructions.items[index];
+        const inst = instructions[index];
         if (inst.dst.kind != .vgpr or inst.dst.reg != source.reg) continue;
         if (inst.opcode == .v_mov_b32) return switch (inst.src0.kind) {
             .integer_inline_constant, .literal_constant, .float_inline_constant, .null => inst.src0.value,
@@ -14915,11 +14947,10 @@ fn shaderOperandConstantBefore(
 /// next, POS.zw after them, and a final primitive bookkeeping dword. The
 /// terminal `S_SETPC_B64 s[6:7]` invokes the hardware exporter for that record.
 fn inferNggLdsExports(
-    analysis: *const gpu.ShaderAnalysis,
+    instructions: []const gpu.ShaderInstruction,
     parameter_components: *const [32]u4,
     output: *[33]gpu.ShaderSpirvNggLdsExport,
 ) usize {
-    const instructions = analysis.program.instructions.items;
     var terminal_index: ?usize = null;
     for (instructions, 0..) |inst, index| {
         if (inst.opcode == .s_setpc_b64 and inst.src0.kind == .sgpr and inst.src0.reg == 6) {
@@ -14974,8 +15005,8 @@ fn inferNggLdsExports(
     var word_index: usize = 2;
     while (word_index + 1 < words.len) : (word_index += 1) {
         if (!words[word_index].present or !words[word_index + 1].present) continue;
-        const z = shaderOperandConstantBefore(analysis, terminal, words[word_index].source) orelse continue;
-        const w = shaderOperandConstantBefore(analysis, terminal, words[word_index + 1].source) orelse continue;
+        const z = shaderOperandConstantBefore(instructions, terminal, words[word_index].source) orelse continue;
+        const w = shaderOperandConstantBefore(instructions, terminal, words[word_index + 1].source) orelse continue;
         if (z == @as(u32, @bitCast(@as(f32, 0))) and w == @as(u32, @bitCast(@as(f32, 1)))) {
             position_zw = word_index;
             break;
@@ -16605,7 +16636,7 @@ fn resolveComputeBufferDescriptor(
 fn seedVertexBufferScalars(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
-    analysis: *const gpu.ShaderAnalysis,
+    instructions: []const gpu.ShaderInstruction,
     out: []gpu.ShaderSpirvScalarRegister,
     count: usize,
     evaluation: ?*gpu.ScalarEvaluation,
@@ -16636,7 +16667,7 @@ fn seedVertexBufferScalars(
     // Collect unique resource SGPRs referenced by MUBUF loads, in program order.
     var resource_sgprs: [16]u32 = undefined;
     var resource_count: usize = 0;
-    for (analysis.program.instructions.items) |inst| {
+    for (instructions) |inst| {
         const is_load = switch (inst.opcode) {
             .buffer_load_ubyte,
             .buffer_load_sbyte,
@@ -17950,6 +17981,10 @@ test "ambiguous sampled DIM follows the descriptor image type" {
     try std.testing.expectEqual(
         rdna2.spirv.SampledImageDimension.two_d_array,
         sampledImageDimensionForInstruction(.dim_2d_array_alt, .color_2d_array).?,
+    );
+    try std.testing.expectEqual(
+        rdna2.spirv.SampledImageDimension.two_d,
+        sampledImageDimensionForInstruction(.dim_1d, .color_1d).?,
     );
 }
 

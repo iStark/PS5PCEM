@@ -54,6 +54,8 @@ fn mubufInfo(id: u32) ?MemoryInfo {
         0x39 => .{ .opcode = .buffer_atomic_and },
         0x3a => .{ .opcode = .buffer_atomic_or },
         0x3b => .{ .opcode = .buffer_atomic_xor },
+        0x3f => .{ .opcode = .buffer_atomic_fmin },
+        0x40 => .{ .opcode = .buffer_atomic_fmax },
         else => null,
     };
 }
@@ -194,16 +196,39 @@ fn dsInfo(id: u32) ?MemoryInfo {
         0x0a => .{ .opcode = .ds_or_b32 },
         0x0b => .{ .opcode = .ds_xor_b32 },
         0x0d => .{ .opcode = .ds_write_b32 },
-        0x0e, 0x0f => .{ .opcode = .ds_write2_b32, .words = 2 },
+        0x0e => .{ .opcode = .ds_write2_b32, .words = 2 },
+        0x0f => .{ .opcode = .ds_write2st64_b32, .words = 2 },
+        0x12 => .{ .opcode = .ds_min_f32 },
+        0x13 => .{ .opcode = .ds_max_f32 },
+        0x1e => .{ .opcode = .ds_write_b8, .bits = 8 },
+        0x1f => .{ .opcode = .ds_write_b16, .bits = 16 },
+        0x20 => .{ .opcode = .ds_add_rtn_u32 },
+        0x21 => .{ .opcode = .ds_sub_rtn_u32 },
+        0x25 => .{ .opcode = .ds_min_rtn_i32 },
+        0x26 => .{ .opcode = .ds_max_rtn_i32 },
+        0x27 => .{ .opcode = .ds_min_rtn_u32 },
+        0x28 => .{ .opcode = .ds_max_rtn_u32 },
+        0x29 => .{ .opcode = .ds_and_rtn_b32 },
+        0x2a => .{ .opcode = .ds_or_rtn_b32 },
+        0x2b => .{ .opcode = .ds_xor_rtn_b32 },
+        0x2d => .{ .opcode = .ds_wrxchg_rtn_b32 },
+        0x35 => .{ .opcode = .ds_swizzle_b32 },
         0x36 => .{ .opcode = .ds_read_b32 },
-        0x37, 0x38 => .{ .opcode = .ds_read2_b32, .words = 2 },
+        0x37 => .{ .opcode = .ds_read2_b32, .words = 2 },
+        0x38 => .{ .opcode = .ds_read2st64_b32, .words = 2 },
         0x39 => .{ .opcode = .ds_read_sbyte, .bits = 8, .signed = true },
         0x3a => .{ .opcode = .ds_read_ubyte, .bits = 8 },
         0x3b => .{ .opcode = .ds_read_sshort, .bits = 16, .signed = true },
         0x3c => .{ .opcode = .ds_read_ushort, .bits = 16 },
+        0x3d => .{ .opcode = .ds_consume },
         0x3e => .{ .opcode = .ds_append },
         0x4d => .{ .opcode = .ds_write_b64, .words = 2 },
+        0x4e => .{ .opcode = .ds_write2_b64, .words = 4 },
+        0x4f => .{ .opcode = .ds_write2st64_b64, .words = 4 },
         0x76 => .{ .opcode = .ds_read_b64, .words = 2 },
+        0x77 => .{ .opcode = .ds_read2_b64, .words = 4 },
+        0x78 => .{ .opcode = .ds_read2st64_b64, .words = 4 },
+        0xa6 => .{ .opcode = .ds_read_u16_d16, .bits = 16 },
         0xb0 => .{ .opcode = .ds_write_addtid_b32 },
         0xb1 => .{ .opcode = .ds_read_addtid_b32 },
         0xde => .{ .opcode = .ds_write_b96, .words = 3 },
@@ -228,11 +253,11 @@ pub fn decodeDs(pc: u32, code: []const u32, word_index: u32) Error!Instruction {
     inst.memory_offset = @intCast(offset0 | (offset1 << 8));
     inst.secondary_memory_offset = 0;
     switch (id) {
-        0x0e, 0x37 => {
+        0x0e, 0x37, 0x4e, 0x77 => {
             inst.memory_offset = @intCast(offset0 * 4);
             inst.secondary_memory_offset = @intCast(offset1 * 4);
         },
-        0x0f, 0x38 => {
+        0x0f, 0x38, 0x4f, 0x78 => {
             inst.memory_offset = @intCast(offset0 * 256);
             inst.secondary_memory_offset = @intCast(offset1 * 256);
         },
@@ -245,10 +270,10 @@ pub fn decodeDs(pc: u32, code: []const u32, word_index: u32) Error!Instruction {
     inst.src1 = try operand.decodeVectorGpr((word1 >> 8) & 0xff);
     inst.src2 = try operand.decodeVectorGpr((word1 >> 16) & 0xff);
     inst.src_count = switch (id) {
-        0x0e, 0x0f => 3,
-        0x0d, 0x00, 0x01, 0x05...0x0b => 2,
+        0x0e, 0x0f, 0x4e, 0x4f => 3,
+        0x0d, 0x00, 0x01, 0x05...0x0b, 0x12, 0x13, 0x1e, 0x1f, 0x20, 0x21, 0x25...0x2b, 0x2d => 2,
         0xb0 => 1,
-        0xb1, 0x3e => 0,
+        0xb1, 0x3d, 0x3e => 0,
         else => 1,
     };
     return inst;
@@ -300,28 +325,27 @@ pub fn decodeMimg(pc: u32, code: []const u32, word_index: u32) Error!Instruction
     inst.data_mask = @intCast((word0 >> 8) & 0xf);
     inst.data_words = if (op == .image_gather4) 4 else @max(1, bitCount4(inst.data_mask));
     inst.globally_coherent = (word0 >> 13) & 1 != 0;
+    inst.image_r128 = (word0 >> 15) & 1 != 0;
     inst.system_coherent = (word0 >> 25) & 1 != 0;
     inst.image_sample_flags.a16 = (word1 >> 30) & 1 != 0;
     if (op == .image_sample) {
-        switch (id) {
-            0x20, 0x21, 0x22, 0x23 => {},
-            0x24 => inst.image_sample_flags.lod = true,
-            0x25 => inst.image_sample_flags.bias = true,
-            0x27 => inst.image_sample_flags.level_zero = true,
-            0x28, 0x29 => inst.image_sample_flags.compare = true,
-            0x2c => {
-                inst.image_sample_flags.compare = true;
-                inst.image_sample_flags.lod = true;
-            },
-            0x2f => {
-                inst.image_sample_flags.compare = true;
-                inst.image_sample_flags.level_zero = true;
-            },
-            0x37 => {
-                inst.image_sample_flags.level_zero = true;
-                inst.image_sample_flags.offset = true;
-            },
-            else => {},
+        if (id >= 0x20 and id <= 0x3f or (id >= 0xa0 and id <= 0xbe)) {
+            const encoded = if (id >= 0xa0) id - 0x80 else id;
+            const nibble: u32 = encoded & 7;
+            inst.image_sample_flags.lod_clamp = nibble == 1 or nibble == 3 or nibble == 6;
+            inst.image_sample_flags.derivative = nibble == 2 or nibble == 3;
+            inst.image_sample_flags.lod = nibble == 4;
+            inst.image_sample_flags.bias = nibble == 5 or nibble == 6;
+            inst.image_sample_flags.level_zero = nibble == 7;
+            inst.image_sample_flags.compare = encoded & 0x08 != 0;
+            inst.image_sample_flags.offset = encoded & 0x10 != 0;
+            inst.image_sample_flags.adjust = id >= 0xa0;
+        } else if (id >= 0x68 and id <= 0x6f) {
+            inst.image_sample_flags.derivative = true;
+            inst.image_sample_flags.coherent_derivative = true;
+            inst.image_sample_flags.lod_clamp = id & 1 != 0;
+            inst.image_sample_flags.compare = id & 2 != 0;
+            inst.image_sample_flags.offset = id & 4 != 0;
         }
     } else if (op == .image_gather4) {
         switch (id) {
@@ -359,8 +383,16 @@ pub fn decodeMimg(pc: u32, code: []const u32, word_index: u32) Error!Instruction
     inst.image_address_components = coordinate_components;
     if (op == .image_sample) {
         inst.image_address_components += @intFromBool(inst.image_sample_flags.offset);
+        inst.image_address_components += @intFromBool(inst.image_sample_flags.compare);
         inst.image_address_components += @intFromBool(inst.image_sample_flags.lod);
         inst.image_address_components += @intFromBool(inst.image_sample_flags.bias);
+        if (inst.image_sample_flags.derivative) {
+            inst.image_address_components += switch (inst.image_dimension) {
+                .dim_1d, .dim_1d_array => 2,
+                .dim_3d => 6,
+                else => 4,
+            };
+        }
     } else if (op == .image_gather4) {
         inst.image_address_components += @intFromBool(inst.image_sample_flags.offset);
         inst.image_address_components += @intFromBool(inst.image_sample_flags.compare);
@@ -452,6 +484,29 @@ test "MIMG sample level-zero offset keeps packed offset before NSA coordinates" 
     try std.testing.expectEqual(@as(u8, 15), inst.image_nsa_address[1]);
 }
 
+test "MIMG sample_c_lz counts the compare address" {
+    const inst = try decodeMimg(0, &.{ 0xf0bc_0f08, 0x0040_0200 }, 0);
+    try std.testing.expectEqual(isa.Opcode.image_sample, inst.opcode);
+    try std.testing.expect(inst.image_sample_flags.compare);
+    try std.testing.expect(inst.image_sample_flags.level_zero);
+    try std.testing.expectEqual(@as(u8, 3), inst.image_address_components);
+}
+
+test "MIMG SAMPLE_D counts explicit derivative addresses" {
+    const inst = try decodeMimg(0, &.{ 0xf088_0f08, 0x0040_0200 }, 0);
+    try std.testing.expectEqual(isa.Opcode.image_sample, inst.opcode);
+    try std.testing.expect(inst.image_sample_flags.derivative);
+    try std.testing.expectEqual(isa.ImageDimension.dim_2d, inst.image_dimension);
+    try std.testing.expectEqual(@as(u8, 6), inst.image_address_components);
+}
+
+test "MIMG 1D sample counts a single coordinate" {
+    const inst = try decodeMimg(0, &.{ 0xf080_0f00, 0x0040_0200 }, 0);
+    try std.testing.expectEqual(isa.Opcode.image_sample, inst.opcode);
+    try std.testing.expectEqual(isa.ImageDimension.dim_1d, inst.image_dimension);
+    try std.testing.expectEqual(@as(u8, 1), inst.image_address_components);
+}
+
 test "MIMG explicit LOD sample counts its LOD address after cube coordinates" {
     const code = [_]u32{ 0xf090_071a, 0x01e2_0020, 0x0023_2221 };
     const inst = try decodeMimg(0x41c, &code, 0);
@@ -502,6 +557,28 @@ test "DS addtid scratch and append opcodes decode explicitly" {
     try std.testing.expectEqual(isa.Opcode.ds_append, append.opcode);
     try std.testing.expect(append.gds);
     try std.testing.expectEqual(@as(u32, 3), append.dst.reg);
+}
+
+test "DS swizzle consume and 64-bit pair encodings decode" {
+    const swizzle = try decodeDs(0, &.{ (@as(u32, 0x35) << 18), 0x0100_0004 }, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_swizzle_b32, swizzle.opcode);
+    const consume = try decodeDs(0, &.{ (@as(u32, 0x3d) << 18), 0x0800_0000 }, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_consume, consume.opcode);
+    const write2st = try decodeDs(0, &.{ (@as(u32, 0x0f) << 18) | (@as(u32, 2) << 8) | 1, 0x0002_0104 }, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_write2st64_b32, write2st.opcode);
+    try std.testing.expectEqual(@as(i32, 256), write2st.memory_offset);
+    try std.testing.expectEqual(@as(i32, 512), write2st.secondary_memory_offset);
+}
+
+test "MIMG r128 flag is taken from the first encoding word" {
+    const code = [_]u32{ (@as(u32, 0x20) << 18) | (1 << 15), 0 };
+    const inst = try decodeMimg(0, &code, 0);
+    try std.testing.expect(inst.image_r128);
+}
+
+test "MUBUF floating-point atomics decode" {
+    const fmin = try decodeMubuf(0, &.{ (@as(u32, 0x3f) << 18), 0 }, 0);
+    try std.testing.expectEqual(isa.Opcode.buffer_atomic_fmin, fmin.opcode);
 }
 
 test "truncated EXP is rejected" {

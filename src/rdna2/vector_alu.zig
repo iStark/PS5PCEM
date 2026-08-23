@@ -36,7 +36,8 @@ fn vop1Opcode(id: u32) isa.Opcode {
         0x24 => .v_floor_f32,
         0x25 => .v_exp_f32,
         0x27 => .v_log_f32,
-        0x2a, 0x2b => .v_rcp_f32,
+        0x2a => .v_rcp_f32,
+        0x2b => .v_rcp_iflag_f32,
         0x2e => .v_rsq_f32,
         0x33 => .v_sqrt_f32,
         0x35 => .v_sin_f32,
@@ -45,6 +46,10 @@ fn vop1Opcode(id: u32) isa.Opcode {
         0x38 => .v_bfrev_b32,
         0x39 => .v_ffbh_u32,
         0x3a => .v_ffbl_b32,
+        0x3f => .v_frexp_exp_i32_f32,
+        0x40 => .v_frexp_mant_f32,
+        0x42 => .v_movreld_b32,
+        0x43 => .v_movrels_b32,
         0x50 => .v_cvt_f16_u16,
         0x51 => .v_cvt_f16_i16,
         0x52 => .v_cvt_u16_f16,
@@ -98,6 +103,7 @@ fn vop2Opcode(id: u32) isa.Opcode {
         0x26 => .v_sub_nc_u32,
         0x27 => .v_subrev_nc_u32,
         0x28 => .v_addc_u32,
+        0x2a => .v_subrev_co_ci_u32,
         0x2f => .v_cvt_pkrtz_f16_f32,
         0x32 => .v_add_f16,
         0x33 => .v_sub_f16,
@@ -108,6 +114,7 @@ fn vop2Opcode(id: u32) isa.Opcode {
         0x38 => .v_fmaak_f16,
         0x39 => .v_max_f16,
         0x3a => .v_min_f16,
+        0x3c => .v_pk_fmac_f16,
         else => .unsupported,
     };
 }
@@ -146,30 +153,66 @@ fn vopcOpcode(id: u32) isa.Opcode {
         0x1d => .v_cmpx_neq_f32,
         0x1e => .v_cmpx_nlt_f32,
         0x1f => .v_cmpx_tru_f32,
+        0x80 => .v_cmp_f_i32,
         0x81 => .v_cmp_lt_i32,
         0x82 => .v_cmp_eq_i32,
         0x83 => .v_cmp_le_i32,
         0x84 => .v_cmp_gt_i32,
         0x85 => .v_cmp_ne_i32,
         0x86 => .v_cmp_ge_i32,
+        0x87 => .v_cmp_t_i32,
+        0x88 => .v_cmp_class_f32,
+        0x89 => .v_cmp_lt_i16,
+        0x8a => .v_cmp_eq_i16,
+        0x8b => .v_cmp_le_i16,
+        0x8c => .v_cmp_gt_i16,
+        0x8d => .v_cmp_ne_i16,
+        0x8e => .v_cmp_ge_i16,
         0x91 => .v_cmpx_lt_i32,
         0x92 => .v_cmpx_eq_i32,
         0x93 => .v_cmpx_le_i32,
         0x94 => .v_cmpx_gt_i32,
         0x95 => .v_cmpx_ne_i32,
         0x96 => .v_cmpx_ge_i32,
+        0xa2 => .v_cmp_eq_i64,
+        0xa9 => .v_cmp_lt_u16,
+        0xaa => .v_cmp_eq_u16,
+        0xab => .v_cmp_le_u16,
+        0xac => .v_cmp_gt_u16,
+        0xad => .v_cmp_ne_u16,
+        0xae => .v_cmp_ge_u16,
+        0xb5 => .v_cmpx_ne_i64,
+        0xc0 => .v_cmp_f_u32,
         0xc1 => .v_cmp_lt_u32,
         0xc2 => .v_cmp_eq_u32,
         0xc3 => .v_cmp_le_u32,
         0xc4 => .v_cmp_gt_u32,
         0xc5 => .v_cmp_ne_u32,
         0xc6 => .v_cmp_ge_u32,
+        0xc7 => .v_cmp_t_u32,
+        0xc9 => .v_cmp_lt_f16,
+        0xca => .v_cmp_eq_f16,
+        0xcb => .v_cmp_le_f16,
+        0xcc => .v_cmp_gt_f16,
+        0xcd => .v_cmp_lg_f16,
+        0xce => .v_cmp_ge_f16,
         0xd1 => .v_cmpx_lt_u32,
         0xd2 => .v_cmpx_eq_u32,
         0xd3 => .v_cmpx_le_u32,
         0xd4 => .v_cmpx_gt_u32,
         0xd5 => .v_cmpx_ne_u32,
         0xd6 => .v_cmpx_ge_u32,
+        0xd9 => .v_cmpx_lt_f16,
+        0xda => .v_cmpx_eq_f16,
+        0xdb => .v_cmpx_le_f16,
+        0xdc => .v_cmpx_gt_f16,
+        0xde => .v_cmpx_ge_f16,
+        0xe4 => .v_cmp_gt_u64,
+        0xe5 => .v_cmp_ne_u64,
+        0xed => .v_cmp_neq_f16,
+        0xf5 => .v_cmpx_ne_u64,
+        0xfd => .v_cmpx_neq_f16,
+        0xfe => .v_cmpx_nlt_f16,
         else => .unsupported,
     };
 }
@@ -204,6 +247,15 @@ fn isCompareExec(op: isa.Opcode) bool {
         .v_cmpx_gt_u32,
         .v_cmpx_ne_u32,
         .v_cmpx_ge_u32,
+        .v_cmpx_lt_f16,
+        .v_cmpx_eq_f16,
+        .v_cmpx_le_f16,
+        .v_cmpx_gt_f16,
+        .v_cmpx_ge_f16,
+        .v_cmpx_neq_f16,
+        .v_cmpx_nlt_f16,
+        .v_cmpx_ne_i64,
+        .v_cmpx_ne_u64,
         => true,
         else => false,
     };
@@ -333,7 +385,7 @@ fn finalizeVop2(inst: *Instruction) void {
             inst.src2 = .{ .kind = .literal_constant };
             inst.src_count = 3;
         },
-        .v_addc_u32 => {
+        .v_addc_u32, .v_subrev_co_ci_u32 => {
             inst.dst2.kind = .vcc_lo;
             inst.src2.kind = .vcc_lo;
             inst.src_count = 3;
@@ -407,6 +459,8 @@ pub fn decodeVopc(pc: u32, code: []const u32, word_index: u32) Error!Instruction
 fn nativeVop3Opcode(id: u32) isa.Opcode {
     return switch (id) {
         0x141 => .v_mad_f32,
+        0x142 => .v_mad_i32_i24,
+        0x143 => .v_mad_u32_u24,
         0x144 => .v_cubeid_f32,
         0x145 => .v_cubesc_f32,
         0x146 => .v_cubetc_f32,
@@ -416,14 +470,23 @@ fn nativeVop3Opcode(id: u32) isa.Opcode {
         0x14a => .v_bfi_b32,
         0x14b => .v_fma_f32,
         0x14e => .v_alignbit_b32,
+        0x14f => .v_alignbyte_b32,
         0x151 => .v_min3_f32,
+        0x152 => .v_min3_i32,
+        0x153 => .v_min3_u32,
         0x154 => .v_max3_f32,
+        0x155 => .v_max3_i32,
+        0x156 => .v_max3_u32,
         0x157 => .v_med3_f32,
+        0x158 => .v_med3_i32,
+        0x159 => .v_med3_u32,
         0x169 => .v_mul_lo_u32,
         0x16a => .v_mul_hi_u32,
         0x16b => .v_mul_lo_i32,
         0x16c => .v_mul_hi_i32,
         0x15d => .v_sad_u32,
+        0x15e => .v_cvt_pk_u8_f32,
+        0x176 => .v_mad_u64_u32,
         0x178 => .v_xor3_b32,
         0x345 => .v_xad_u32,
         0x346 => .v_lshl_add_u32,
@@ -434,12 +497,42 @@ fn nativeVop3Opcode(id: u32) isa.Opcode {
         0x372 => .v_or3_b32,
         0x360 => .v_readlane_b32,
         0x361 => .v_writelane_b32,
+        0x2ff => .v_lshlrev_b64,
+        0x300 => .v_lshrrev_b64,
+        0x303 => .v_add_nc_u16,
+        0x304 => .v_sub_nc_u16,
+        0x307 => .v_lshrrev_b16,
+        0x308 => .v_ashrrev_i16,
+        0x309 => .v_max_u16,
+        0x30a => .v_max_i16,
+        0x30b => .v_min_u16,
+        0x30c => .v_min_i16,
+        0x30d => .v_add_nc_i16,
+        0x30e => .v_sub_nc_i16,
+        0x30f => .v_add_i32,
+        0x310 => .v_sub_i32,
+        0x311 => .v_pack_b32_f16,
+        0x314 => .v_lshlrev_b16,
+        0x319 => .v_subrev_i32,
+        0x34b => .v_fma_f16,
+        0x351 => .v_min3_f16,
+        0x354 => .v_max3_f16,
+        0x357 => .v_med3_f16,
+        0x358 => .v_med3_i16,
         0x362 => .v_ldexp_f32,
+        0x363 => .v_bfm_b32,
+        0x364 => .v_bcnt_u32_b32,
         // RDNA2's ordered min/max encodings.  LLVM exposes the same opcode
         // numbers as V_MINIMUM/V_MAXIMUM on newer targets; PS5 shaders use
         // them for finite clamp bounds in export programs.
         0x365 => .v_min_f32,
         0x366 => .v_max_f32,
+        0x368 => .v_cvt_pknorm_i16_f32,
+        0x369 => .v_cvt_pknorm_u16_f32,
+        0x36a => .v_cvt_pk_u16_u32,
+        0x36b => .v_cvt_pk_i16_i32,
+        0x377 => .v_permlane16_b32,
+        0x378 => .v_permlanex16_b32,
         else => .unsupported,
     };
 }
@@ -466,22 +559,15 @@ pub fn decodeVop3(pc: u32, code: []const u32, word_index: u32) Error!Instruction
     } else {
         inst.dst = try operand.decodeVectorGpr(word0 & 0xff);
     }
-    if (op == .v_addc_u32) {
+    if (op == .v_addc_u32 or op == .v_subrev_co_ci_u32) {
         // VOP3B repurposes the ABS field as a seven-bit scalar destination.
         inst.dst2 = try operand.decodeScalarDestination((word0 >> 8) & 0x7f);
     }
     inst.src0 = try operand.decodeScalarSource(word1 & 0x1ff);
-    inst.src_count = if (op == .v_addc_u32 or op == .v_cndmask_b32)
-        3
-    else if (id >= 0x180 and id <= 0x1ff)
-        1
-    else if (id <= 0x13f or id == 0x360 or id == 0x361 or id == 0x362 or id == 0x365 or id == 0x366)
-        2
-    else
-        3;
+    inst.src_count = vop3SourceCount(op, id);
     if (inst.src_count >= 2) inst.src1 = try operand.decodeScalarSource((word1 >> 9) & 0x1ff);
     if (inst.src_count >= 3) inst.src2 = try operand.decodeScalarSource((word1 >> 18) & 0x1ff);
-    const abs = if (op == .v_addc_u32) 0 else (word0 >> 8) & 7;
+    const abs = if (op == .v_addc_u32 or op == .v_subrev_co_ci_u32) 0 else (word0 >> 8) & 7;
     const neg = (word1 >> 29) & 7;
     const sources = [_]*operand.Operand{ &inst.src0, &inst.src1, &inst.src2 };
     for (sources, 0..) |src, i| {
@@ -496,19 +582,77 @@ pub fn decodeVop3(pc: u32, code: []const u32, word_index: u32) Error!Instruction
     return inst;
 }
 
+fn vop3SourceCount(op: isa.Opcode, id: u32) u32 {
+    return switch (op) {
+        .v_addc_u32, .v_subrev_co_ci_u32, .v_cndmask_b32, .v_mad_u64_u32 => 3,
+        .v_readlane_b32,
+        .v_writelane_b32,
+        .v_ldexp_f32,
+        .v_lshlrev_b64,
+        .v_lshrrev_b64,
+        .v_add_nc_u16,
+        .v_sub_nc_u16,
+        .v_lshrrev_b16,
+        .v_ashrrev_i16,
+        .v_max_u16,
+        .v_max_i16,
+        .v_min_u16,
+        .v_min_i16,
+        .v_add_nc_i16,
+        .v_sub_nc_i16,
+        .v_add_i32,
+        .v_sub_i32,
+        .v_pack_b32_f16,
+        .v_lshlrev_b16,
+        .v_subrev_i32,
+        .v_bfm_b32,
+        .v_bcnt_u32_b32,
+        .v_cvt_pknorm_i16_f32,
+        .v_cvt_pknorm_u16_f32,
+        .v_cvt_pk_u16_u32,
+        .v_cvt_pk_i16_i32,
+        => 2,
+        else => if (id >= 0x180 and id <= 0x1ff)
+            1
+        else if (id <= 0x13f or id == 0x365 or id == 0x366)
+            2
+        else
+            3,
+    };
+}
+
 fn vop3pOpcode(id: u32) isa.Opcode {
     return switch (id) {
+        0x00 => .v_pk_mad_i16,
+        0x01 => .v_pk_mul_lo_u16,
         0x02 => .v_pk_add_i16,
         0x03 => .v_pk_sub_i16,
+        0x04 => .v_pk_lshlrev_b16,
+        0x05 => .v_pk_lshrrev_b16,
+        0x06 => .v_pk_ashrrev_i16,
+        0x07 => .v_pk_max_i16,
+        0x08 => .v_pk_min_i16,
+        0x09 => .v_pk_mad_u16,
         0x0a => .v_pk_add_u16,
         0x0b => .v_pk_sub_u16,
+        0x0c => .v_pk_max_u16,
+        0x0d => .v_pk_min_u16,
         0x0e => .v_pk_fma_f16,
         0x0f => .v_pk_add_f16,
         0x10 => .v_pk_mul_f16,
+        0x11 => .v_pk_min_f16,
+        0x12 => .v_pk_max_f16,
         0x20 => .v_fma_f32,
         0x21 => .v_mad_mixlo_f16,
         0x22 => .v_mad_mixhi_f16,
         else => .unsupported,
+    };
+}
+
+fn vop3pSourceCount(op: isa.Opcode) u32 {
+    return switch (op) {
+        .v_pk_mad_i16, .v_pk_mad_u16, .v_pk_fma_f16, .v_fma_f32, .v_mad_mixlo_f16, .v_mad_mixhi_f16 => 3,
+        else => 2,
     };
 }
 
@@ -522,9 +666,21 @@ pub fn decodeVop3p(pc: u32, code: []const u32, word_index: u32) Error!Instructio
     inst.dst = try operand.decodeVectorGpr(word0 & 0xff);
     inst.src0 = try operand.decodeScalarSource(word1 & 0x1ff);
     inst.src1 = try operand.decodeScalarSource((word1 >> 9) & 0x1ff);
-    inst.src2 = try operand.decodeScalarSource((word1 >> 18) & 0x1ff);
-    inst.src_count = 3;
+    inst.src_count = vop3pSourceCount(inst.opcode);
+    if (inst.src_count >= 3) inst.src2 = try operand.decodeScalarSource((word1 >> 18) & 0x1ff);
     inst.dst.clamp = (word0 >> 15) & 1 != 0;
+    const op_sel = (word0 >> 11) & 7;
+    const op_sel_hi = ((word1 >> 27) & 3) | (((word0 >> 14) & 1) << 2);
+    const neg = (word1 >> 29) & 7;
+    const neg_hi = (word0 >> 8) & 7;
+    const sources = [_]*operand.Operand{ &inst.src0, &inst.src1, &inst.src2 };
+    for (sources, 0..) |src, i| {
+        if (i >= inst.src_count) break;
+        src.op_sel = (op_sel >> @intCast(i)) & 1 != 0;
+        src.op_sel_hi = (op_sel_hi >> @intCast(i)) & 1 != 0;
+        src.negate = (neg >> @intCast(i)) & 1 != 0;
+        src.negate_hi = (neg_hi >> @intCast(i)) & 1 != 0;
+    }
     if (inst.opcode == .unsupported) inst.unsupported_reason = "VOP3P opcode is not implemented";
     try inst.readLiteralOperands(code, word_index);
     return inst;
@@ -766,4 +922,30 @@ test "VOP2 mad literal operands keep their three-source order" {
     try std.testing.expectEqual(@as(u32, 0x3f00_0000), inst.src1.value);
     try std.testing.expectEqual(@as(u32, 4), inst.src2.reg);
     try std.testing.expectEqual(@as(u32, 2), inst.word_count);
+}
+
+test "VOP1 frexp and relative-move encodings decode" {
+    const frexp = try decodeVop1(0, &.{(@as(u32, 0x3f) << 25) | (@as(u32, 1) << 17) | (@as(u32, 0x3f) << 9) | 256}, 0);
+    try std.testing.expectEqual(isa.Opcode.v_frexp_exp_i32_f32, frexp.opcode);
+    const movreld = try decodeVop1(0, &.{(@as(u32, 0x3f) << 25) | (@as(u32, 2) << 17) | (@as(u32, 0x42) << 9) | 256}, 0);
+    try std.testing.expectEqual(isa.Opcode.v_movreld_b32, movreld.opcode);
+}
+
+test "VOP3 packed-norm and 16-bit native encodings decode" {
+    const pknorm = try decodeVop3(0, &.{ 0xd768_0003, 0x0002_0100 }, 0);
+    try std.testing.expectEqual(isa.Opcode.v_cvt_pknorm_i16_f32, pknorm.opcode);
+    try std.testing.expectEqual(@as(u32, 2), pknorm.src_count);
+    const add16 = try decodeVop3(0, &.{ 0xd703_0004, 0x0002_0100 }, 0);
+    try std.testing.expectEqual(isa.Opcode.v_add_nc_u16, add16.opcode);
+    try std.testing.expectEqual(@as(u32, 2), add16.src_count);
+}
+
+test "VOP3P packed add retains lane selectors" {
+    const word0 = (@as(u32, 0x0f) << 16) | (1 << 11) | 3;
+    const word1 = @as(u32, 4) | (@as(u32, 5) << 9) | (1 << 28);
+    const inst = try decodeVop3p(0, &.{ word0, word1 }, 0);
+    try std.testing.expectEqual(isa.Opcode.v_pk_add_f16, inst.opcode);
+    try std.testing.expectEqual(@as(u32, 2), inst.src_count);
+    try std.testing.expect(inst.src0.op_sel);
+    try std.testing.expect(inst.src1.op_sel_hi);
 }

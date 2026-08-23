@@ -654,6 +654,9 @@ pub const Layout = struct {
     height: u32,
     layers: u32,
     first_slice: u32,
+    /// Extra guest bytes from the allocation origin to this view, used when
+    /// staging a non-zero mip through the 2D layout.
+    source_base_offset: u64 = 0,
     row_pitch_elements: u32,
     blocks_per_row: u32,
     blocks_per_column: u32,
@@ -707,16 +710,28 @@ pub const Layout = struct {
         if (image.image_type == .color_2d_msaa or image.image_type == .color_2d_msaa_array) {
             return Error.UnsupportedMultisample;
         }
-        // Staging only the top level is sufficient for a one-mip Vulkan view.
-        // The lower levels follow it in guest memory and do not affect the
-        // base-level tile layout. Non-zero base views still need explicit mip
-        // offset calculation and remain unsupported.
-        if (image.base_level != 0) return Error.UnsupportedMipChain;
-
         const element = elementLayoutForUnifiedFormat(image.unified_format) orelse
             return Error.UnsupportedFormat;
+        if (image.viewBaseLevel() != 0) {
+            const texture = try TextureLayout.fromImage(image);
+            const view = try texture.subresource(image.viewBaseLevel(), 0, texture.layers);
+            if (view.kind != .array_2d or view.in_tail) return Error.UnsupportedMipChain;
+            var layout = try init(.{
+                .tile_mode = image.tile_mode,
+                .width = view.width,
+                .height = view.height,
+                .layers = view.depth_or_layers,
+                .first_slice = view.first_slice,
+                .row_pitch_elements = view.padded_width,
+            }, element.bytes);
+            layout.source_base_offset = view.level_offset;
+            layout.source_slice_bytes = view.source_layer_bytes;
+            layout.required_source_bytes = view.required_source_bytes;
+            return layout;
+        }
+
         const width = try texelsToElements(image.width, element.texels_wide);
-        const height = try texelsToElements(image.height, element.texels_high);
+        const height = try texelsToElements(@max(image.height, 1), element.texels_high);
         var pitch = try texelsToElements(@max(image.pitch, image.width), element.texels_wide);
         if (image.tile_mode.isLinear()) {
             pitch = try alignForward(pitch, @max(@as(u32, 1), 256 / @as(u32, element.bytes)));
@@ -790,7 +805,7 @@ pub const Layout = struct {
             return Error.CoordinateOutOfRange;
         }
         const physical_slice = try addU32(self.first_slice, layer);
-        const slice_base = try multiply(self.source_slice_bytes, physical_slice);
+        const slice_base = try add(try multiply(self.source_slice_bytes, physical_slice), self.source_base_offset);
         if (self.block.tile_mode.isLinear()) {
             const row = try multiply3(y, self.row_pitch_elements, self.block.bytes_per_element);
             const column = try multiply(x, self.block.bytes_per_element);
@@ -1765,11 +1780,11 @@ pub fn computeDestinationOffset(params: ComputeDetileParams, x: u32, y: u32, z: 
 pub fn computeDetileSupported(params: ComputeDetileParams) bool {
     if (params.samples != 1) return false;
     const bpp = computeElementBytes(params);
-    if (bpp != 4) return false;
+    if (bpp != 4 and bpp != 8 and bpp != 16) return false;
     const kind: TextureKind = @enumFromInt(@as(u8, @truncate(params.flags >> 24)));
-    if (kind != .array_2d) return false;
     return switch (computeFamily(params)) {
-        .linear, .standard_256b, .standard_4kb, .standard_64kb => true,
+        .linear, .standard_256b, .standard_4kb, .standard_64kb, .partially_resident => kind == .array_2d,
+        .standard_4kb_3d, .standard_64kb_3d, .partially_resident_3d => kind == .volume_3d,
         else => false,
     };
 }
@@ -3067,6 +3082,68 @@ test "compute detile constants are compact stable POD derived from the CPU view"
     const relative = try view.computePlan(0, 0);
     try testing.expectEqual(try view.sourceByteOffset(3, 5, 1, 0), computeSourceOffset(relative.params, 3, 5, 1, 0));
     try testing.expectEqual(try view.stagingByteOffset(3, 5, 1, 0), computeDestinationOffset(relative.params, 3, 5, 1, 0));
+}
+
+test "fromImage stages a non-zero 2D mip from the allocation origin" {
+    const image = resources.ImageDescriptor{
+        .address = 0x2000_0000,
+        .width = 256,
+        .height = 256,
+        .depth_or_layers = 1,
+        .pitch = 256,
+        .unified_format = 56,
+        .tile_mode = .linear,
+        .image_type = .color_2d,
+        .dst_select = .{ 4, 5, 6, 7 },
+        .base_level = 1,
+        .last_level = 1,
+        .base_array = 0,
+        .array_pitch = 0,
+        .max_mip = 8,
+        .min_lod = 0,
+        .min_lod_warning = 0,
+        .bc_swizzle = 0,
+        .metadata_address = 0,
+        .dcc_enabled = false,
+        .cmask_fast_clear = false,
+        .fmask_compression = false,
+        .cmask_address = 0,
+        .fmask_address = 0,
+        .dcc_address = 0,
+        .descriptor_flags = 0,
+        .extended = true,
+    };
+    const layout = try Layout.fromImage(image);
+    try testing.expectEqual(@as(u32, 128), layout.width);
+    try testing.expectEqual(@as(u32, 128), layout.height);
+    try testing.expect(layout.source_base_offset != 0);
+    const texture = try TextureLayout.fromImage(image);
+    const view = try texture.subresource(1, 0, 1);
+    try testing.expectEqual(view.level_offset, layout.source_base_offset);
+    try testing.expectEqual(try view.sourceByteOffset(3, 5, 0, 0), try layout.sourceByteOffset(3, 5, 0));
+}
+
+test "compute detile admits 8-byte 2D and 4-byte 3D standard families" {
+    const wide = try TextureLayout.init(.{
+        .tile_mode = .standard_64kb,
+        .width = 64,
+        .height = 64,
+    }, 8);
+    try testing.expect(computeDetileSupported((try (try wide.base()).computePlan(0, 0)).params));
+
+    const volume = try TextureLayout.init(.{
+        .tile_mode = .standard_64kb,
+        .kind = .volume_3d,
+        .width = 32,
+        .height = 32,
+        .depth_or_layers = 16,
+    }, 4);
+    const volume_plan = try (try volume.base()).computePlan(0, 0);
+    try testing.expect(computeDetileSupported(volume_plan.params));
+    try testing.expectEqual(
+        try (try volume.base()).sourceByteOffset(3, 5, 2, 0),
+        computeSourceOffset(volume_plan.params, 3, 5, 2, 0),
+    );
 }
 
 test "compute source offsets match CPU detile for standard 64 KiB textures" {

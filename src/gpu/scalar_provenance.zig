@@ -168,6 +168,7 @@ fn evaluate(
 
     var scc: ?bool = null;
     var pc: u32 = 0;
+    var setpc_follows: u8 = 0;
     while (result.instruction_count < maximum_instructions) {
         result.stop_pc = pc;
         if (end_pc) |end| {
@@ -250,6 +251,13 @@ fn evaluate(
                 return result;
             },
             .s_setpc_b64 => {
+                if (setpc_follows < 8) {
+                    if (setpcDestinationPc(&result, bindings.program_address, inst)) |dest_pc| {
+                        setpc_follows += 1;
+                        pc = dest_pc;
+                        continue;
+                    }
+                }
                 result.stop_reason = .branch;
                 return result;
             },
@@ -409,6 +417,16 @@ fn executeSmem(
     return true;
 }
 
+fn setpcDestinationPc(result: *const Evaluation, program_address: u64, inst: rdna2.Instruction) ?u32 {
+    const low = source(result, inst.src0) orelse return null;
+    const wide = wideSource(result, inst.src0, low) orelse return null;
+    const dest = wide.value & address_mask;
+    if (dest < program_address or dest % 4 != 0) return null;
+    const relative = dest - program_address;
+    if (relative > 256 * 1024) return null;
+    return @truncate(relative);
+}
+
 fn executeScalar(result: *Evaluation, program_address: u64, inst: rdna2.Instruction, scc: *?bool) void {
     if (inst.opcode == .s_getpc_b64 and inst.dst.kind == .sgpr and inst.dst.reg + 1 < maximum_scalar_registers) {
         const address = program_address + inst.pc + 4;
@@ -442,6 +460,16 @@ fn executeScalar(result: *Evaluation, program_address: u64, inst: rdna2.Instruct
         executeScalar64(result, inst, a, b, combined_sources, scc.*);
         return;
     }
+    if (inst.opcode == .s_ff1_i32_b64) {
+        const wide = wideSource(result, inst.src0, a) orelse {
+            invalidateDestination(result, inst.dst, 1);
+            return;
+        };
+        const value: u32 = if (wide.value == 0) 0xffff_ffff else @truncate(@ctz(wide.value));
+        write(result, inst.dst, value, Sources.merge(combined_sources, wide.sources), inst.pc);
+        return;
+    }
+
     const bv = if (b) |value| value.value else 0;
     const value: ?u32 = switch (inst.opcode) {
         .s_mov_b32, .s_movk_i32 => a.value,
@@ -490,6 +518,11 @@ fn executeScalar(result: *Evaluation, program_address: u64, inst: rdna2.Instruct
         else
             null,
         .s_bfe_u32 => bitfieldExtractUnsigned32(a.value, bv),
+        .s_bfe_i32 => bitfieldExtractSigned32(a.value, bv),
+        .s_bfm_b32 => bitfieldMask32(a.value, bv),
+        .s_pack_ll_b32_b16 => (a.value & 0xffff) | (bv << 16),
+        .s_pack_lh_b32_b16 => (a.value & 0xffff) | (bv & 0xffff_0000),
+        .s_pack_hh_b32_b16 => (a.value >> 16) | (bv & 0xffff_0000),
         .s_and_b32 => a.value & bv,
         .s_or_b32 => a.value | bv,
         .s_xor_b32 => a.value ^ bv,
@@ -642,7 +675,7 @@ fn executeScalar64(
         .s_bfm_b64 => bitfieldMask64(av, bv),
         .s_bfe_u64 => bitfieldExtractUnsigned64(av, bv),
         .s_bitreplicate_b64_b32 => bitReplicate64(av),
-        .s_wqm_b64 => wholeQuadMode64(av),
+        .s_wqm_b64, .s_quadmask_b64 => wholeQuadMode64(av),
         else => null,
     };
     if (value) |known| {
@@ -675,6 +708,25 @@ fn bitfieldExtractUnsigned32(value: u32, control: u32) u32 {
     if (width == 32) return value;
     const shift_width: u5 = @intCast(width);
     return (value >> offset) & ((@as(u32, 1) << shift_width) - 1);
+}
+
+fn bitfieldExtractSigned32(value: u32, control: u32) u32 {
+    const offset: u5 = @intCast(control & 0x1f);
+    const encoded_width: u32 = (control >> 16) & 0x7f;
+    const width: u6 = @intCast(@min(encoded_width, 32 - @as(u32, offset)));
+    if (width == 0) return 0;
+    const extracted = bitfieldExtractUnsigned32(value, control);
+    if (width == 32) return extracted;
+    const sign_shift: u5 = @intCast(width - 1);
+    if (extracted & (@as(u32, 1) << sign_shift) == 0) return extracted;
+    return extracted | ~((@as(u32, 1) << @intCast(width)) - 1);
+}
+
+fn bitfieldMask32(width: u32, offset: u32) u32 {
+    const bits: u5 = @truncate(width & 31);
+    const shift: u5 = @truncate(offset & 31);
+    const mask = (@as(u32, 1) << bits) - 1;
+    return mask << shift;
 }
 
 fn write(result: *Evaluation, destination: rdna2.Operand, value: u32, sources: Sources, pc: u32) void {
@@ -719,6 +771,7 @@ fn destinationWords(opcode: rdna2.Opcode) u8 {
         .s_bfm_b64,
         .s_bfe_u64,
         .s_bitreplicate_b64_b32,
+        .s_quadmask_b64,
         => 2,
         else => 1,
     };
@@ -726,7 +779,7 @@ fn destinationWords(opcode: rdna2.Opcode) u8 {
 
 fn isComparison(opcode: rdna2.Opcode) bool {
     return switch (opcode) {
-        .s_cmp_eq_i32, .s_cmp_lg_i32, .s_cmp_gt_i32, .s_cmp_ge_i32, .s_cmp_lt_i32, .s_cmp_le_i32, .s_cmp_eq_u32, .s_cmp_lg_u32, .s_cmp_gt_u32, .s_cmp_ge_u32, .s_cmp_lt_u32, .s_cmp_le_u32 => true,
+        .s_cmp_eq_i32, .s_cmp_lg_i32, .s_cmp_gt_i32, .s_cmp_ge_i32, .s_cmp_lt_i32, .s_cmp_le_i32, .s_cmp_eq_u32, .s_cmp_lg_u32, .s_cmp_gt_u32, .s_cmp_ge_u32, .s_cmp_lt_u32, .s_cmp_le_u32, .s_cmp_eq_u64, .s_cmp_lg_u64 => true,
         else => false,
     };
 }
@@ -1011,4 +1064,137 @@ test "an integer inline constant carries its sign into a 64-bit result" {
     }, &scc);
     try std.testing.expectEqual(@as(u32, 0xffff_ffff), result.register(2).?.value);
     try std.testing.expectEqual(@as(u32, 0xffff_ffff), result.register(3).?.value);
+}
+
+test "pack bitfield and 64-bit scan stay known through the scalar prefix" {
+    var result = Evaluation{};
+    var scc: ?bool = null;
+    result.registers[0] = .{ .known = true, .value = 0xaaaa_1111, .sources = .{ .immediate = true } };
+    result.registers[1] = .{ .known = true, .value = 0xbbbb_2222, .sources = .{ .immediate = true } };
+    executeScalar(&result, 0, .{
+        .pc = 0x0,
+        .opcode = .s_pack_ll_b32_b16,
+        .dst = .{ .kind = .sgpr, .reg = 2 },
+        .src0 = .{ .kind = .sgpr, .reg = 0 },
+        .src1 = .{ .kind = .sgpr, .reg = 1 },
+        .src_count = 2,
+    }, &scc);
+    executeScalar(&result, 0, .{
+        .pc = 0x4,
+        .opcode = .s_pack_lh_b32_b16,
+        .dst = .{ .kind = .sgpr, .reg = 3 },
+        .src0 = .{ .kind = .sgpr, .reg = 0 },
+        .src1 = .{ .kind = .sgpr, .reg = 1 },
+        .src_count = 2,
+    }, &scc);
+    executeScalar(&result, 0, .{
+        .pc = 0x8,
+        .opcode = .s_pack_hh_b32_b16,
+        .dst = .{ .kind = .sgpr, .reg = 4 },
+        .src0 = .{ .kind = .sgpr, .reg = 0 },
+        .src1 = .{ .kind = .sgpr, .reg = 1 },
+        .src_count = 2,
+    }, &scc);
+    try std.testing.expectEqual(@as(u32, 0x2222_1111), result.register(2).?.value);
+    try std.testing.expectEqual(@as(u32, 0xbbbb_1111), result.register(3).?.value);
+    try std.testing.expectEqual(@as(u32, 0xbbbb_aaaa), result.register(4).?.value);
+
+    executeScalar(&result, 0, .{
+        .pc = 0xc,
+        .opcode = .s_bfm_b32,
+        .dst = .{ .kind = .sgpr, .reg = 5 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 8 },
+        .src1 = .{ .kind = .integer_inline_constant, .value = 4 },
+        .src_count = 2,
+    }, &scc);
+    try std.testing.expectEqual(@as(u32, 0x0000_0ff0), result.register(5).?.value);
+
+    result.registers[6] = .{ .known = true, .value = 0x0000_000f, .sources = .{ .immediate = true } };
+    executeScalar(&result, 0, .{
+        .pc = 0x10,
+        .opcode = .s_bfe_i32,
+        .dst = .{ .kind = .sgpr, .reg = 7 },
+        .src0 = .{ .kind = .sgpr, .reg = 6 },
+        .src1 = .{ .kind = .literal_constant, .value = 0x0004_0000 },
+        .src_count = 2,
+    }, &scc);
+    try std.testing.expectEqual(@as(u32, 0xffff_ffff), result.register(7).?.value);
+
+    result.registers[8] = .{ .known = true, .value = 0, .sources = .{ .immediate = true } };
+    result.registers[9] = .{ .known = true, .value = 1, .sources = .{ .immediate = true } };
+    executeScalar(&result, 0, .{
+        .pc = 0x18,
+        .opcode = .s_ff1_i32_b64,
+        .dst = .{ .kind = .sgpr, .reg = 10 },
+        .src0 = .{ .kind = .sgpr, .reg = 8 },
+        .src_count = 1,
+    }, &scc);
+    try std.testing.expectEqual(@as(u32, 32), result.register(10).?.value);
+
+    result.registers[12] = .{ .known = true, .value = 0x0000_0001, .sources = .{ .immediate = true } };
+    result.registers[13] = .{ .known = true, .value = 0, .sources = .{ .immediate = true } };
+    executeScalar(&result, 0, .{
+        .pc = 0x1c,
+        .opcode = .s_quadmask_b64,
+        .dst = .{ .kind = .sgpr, .reg = 14 },
+        .src0 = .{ .kind = .sgpr, .reg = 12 },
+        .src_count = 1,
+    }, &scc);
+    try std.testing.expectEqual(@as(u32, 0x0000_000f), result.register(14).?.value);
+    try std.testing.expectEqual(@as(u32, 0), result.register(15).?.value);
+
+    result.registers[16] = .{ .known = true, .value = 0x0000_0005, .sources = .{ .immediate = true } };
+    result.registers[17] = .{ .known = true, .value = 0, .sources = .{ .immediate = true } };
+    executeScalar(&result, 0, .{
+        .pc = 0x20,
+        .opcode = .s_bitreplicate_b64_b32,
+        .dst = .{ .kind = .sgpr, .reg = 18 },
+        .src0 = .{ .kind = .sgpr, .reg = 16 },
+        .src_count = 1,
+    }, &scc);
+    try std.testing.expectEqual(@as(u32, 0x0000_0033), result.register(18).?.value);
+    try std.testing.expectEqual(@as(u32, 0), result.register(19).?.value);
+}
+
+test "scalar provenance follows a GETPC SETPC continuation" {
+    var storage = [_]u8{0} ** 0x40;
+    var memory = TestMemory{ .base = 0x1000, .bytes = &storage };
+    const program: u64 = 0x1000;
+    const instructions = [_]rdna2.Instruction{
+        .{
+            .pc = 0,
+            .opcode = .s_getpc_b64,
+            .dst = .{ .kind = .sgpr, .reg = 0 },
+            .word_count = 1,
+        },
+        .{
+            .pc = 4,
+            .opcode = .s_add_u32,
+            .dst = .{ .kind = .sgpr, .reg = 0 },
+            .src0 = .{ .kind = .sgpr, .reg = 0 },
+            .src1 = .{ .kind = .integer_inline_constant, .value = 8 },
+            .src_count = 2,
+            .word_count = 1,
+        },
+        .{
+            .pc = 8,
+            .opcode = .s_setpc_b64,
+            .src0 = .{ .kind = .sgpr, .reg = 0 },
+            .src_count = 1,
+            .word_count = 1,
+        },
+        .{
+            .pc = 12,
+            .opcode = .s_mov_b32,
+            .dst = .{ .kind = .sgpr, .reg = 2 },
+            .src0 = .{ .kind = .integer_inline_constant, .value = 1 },
+            .src_count = 1,
+            .word_count = 1,
+        },
+        .{ .pc = 16, .opcode = .s_endpgm, .word_count = 1 },
+    };
+    const bindings = testBindings(program, 0x1200);
+    const result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
+    try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 1), result.register(2).?.value);
 }

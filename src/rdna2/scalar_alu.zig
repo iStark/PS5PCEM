@@ -43,7 +43,9 @@ const sop1_table = buildTable(256, &.{
     .{ 0x0f, .s_bcnt1_i32_b32 },
     .{ 0x10, .s_bcnt1_i32_b64 },
     .{ 0x13, .s_ff1_i32_b32 },
+    .{ 0x14, .s_ff1_i32_b64 },
     .{ 0x16, .s_flbit_i32_b64 },
+    .{ 0x2d, .s_quadmask_b64 },
     .{ 0x1b, .s_bitset0_b32 },
     .{ 0x1d, .s_bitset1_b32 },
     .{ 0x1f, .s_getpc_b64 },
@@ -76,7 +78,8 @@ const sop2_table = buildTable(128, &.{
     .{ 0x20, .s_lshr_b32 },        .{ 0x21, .s_lshr_b64 },
     .{ 0x22, .s_ashr_i32 },        .{ 0x24, .s_bfm_b32 },
     .{ 0x25, .s_bfm_b64 },         .{ 0x26, .s_mul_i32 },
-    .{ 0x27, .s_bfe_u32 },         .{ 0x29, .s_bfe_u64 },
+    .{ 0x27, .s_bfe_u32 },         .{ 0x28, .s_bfe_i32 },
+    .{ 0x29, .s_bfe_u64 },
     .{ 0x2e, .s_lshl1_add_u32 },   .{ 0x2f, .s_lshl2_add_u32 },
     .{ 0x30, .s_lshl3_add_u32 },   .{ 0x31, .s_lshl4_add_u32 },
     .{ 0x32, .s_pack_ll_b32_b16 }, .{ 0x33, .s_pack_lh_b32_b16 },
@@ -91,7 +94,7 @@ const sopc_table = buildTable(128, &.{
     .{ 0x08, .s_cmp_gt_u32 },  .{ 0x09, .s_cmp_ge_u32 },
     .{ 0x0a, .s_cmp_lt_u32 },  .{ 0x0b, .s_cmp_le_u32 },
     .{ 0x0c, .s_bitcmp0_b32 }, .{ 0x0d, .s_bitcmp1_b32 },
-    .{ 0x13, .s_cmp_lg_u64 },
+    .{ 0x12, .s_cmp_eq_u64 },  .{ 0x13, .s_cmp_lg_u64 },
 });
 
 const sopk_table = buildTable(32, &.{
@@ -115,9 +118,9 @@ const sopp_table = buildTable(128, &.{
     .{ 0x07, .s_cbranch_vccnz },  .{ 0x08, .s_cbranch_execz },
     .{ 0x09, .s_cbranch_execnz }, .{ 0x0a, .s_barrier },
     .{ 0x0c, .s_waitcnt },        .{ 0x0e, .s_sleep },
-    .{ 0x10, .s_sendmsg },        .{ 0x16, .s_ttrace_data },
-    .{ 0x1f, .s_code_end },
-    .{ 0x20, .s_inst_prefetch },
+    .{ 0x10, .s_sendmsg },        .{ 0x12, .s_trap },
+    .{ 0x16, .s_ttrace_data },    .{ 0x1f, .s_code_end },
+    .{ 0x20, .s_inst_prefetch },  .{ 0x23, .s_waitcnt_depctr },
 });
 
 comptime {
@@ -398,4 +401,19 @@ test "s_branch resolves its target relative to the next instruction" {
     try std.testing.expectEqual(@as(i32, -8), inst.branch_offset);
     try std.testing.expectEqual(@as(u32, 4), inst.branch_target);
     try std.testing.expect(inst.opcode.isBranch());
+}
+
+test "scalar opcode table covers RDNA2 encodings previously left unsupported" {
+    const ff1 = try decodeSop1(0, &.{0xbe80_1400}, 0);
+    try std.testing.expectEqual(Opcode.s_ff1_i32_b64, ff1.opcode);
+    const quadmask = try decodeSop1(0, &.{0xbe80_2d00}, 0);
+    try std.testing.expectEqual(Opcode.s_quadmask_b64, quadmask.opcode);
+    const bfe = try decodeSop2(0, &.{0x1400_0001}, 0);
+    try std.testing.expectEqual(Opcode.s_bfe_i32, bfe.opcode);
+    const cmp64 = try decodeSopc(0, &.{0xbf12_0001}, 0);
+    try std.testing.expectEqual(Opcode.s_cmp_eq_u64, cmp64.opcode);
+    const trap = try decodeSopp(0, &.{0xbf92_0000}, 0);
+    try std.testing.expectEqual(Opcode.s_trap, trap.opcode);
+    const depctr = try decodeSopp(0, &.{0xbfa3_0000}, 0);
+    try std.testing.expectEqual(Opcode.s_waitcnt_depctr, depctr.opcode);
 }

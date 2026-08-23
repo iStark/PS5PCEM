@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const isa = @import("isa.zig");
+const operand = @import("operand.zig");
 const instruction = @import("instruction.zig");
 
 pub const Error = std.mem.Allocator.Error || error{InvalidBranchTarget};
@@ -84,6 +85,76 @@ pub const Graph = struct {
 fn instructionIndexAtPc(program: *const instruction.Program, pc: u32) ?usize {
     for (program.instructions.items, 0..) |inst, index| {
         if (inst.pc == pc) return index;
+    }
+    return null;
+}
+
+fn instructionEndPc(inst: instruction.Instruction) u32 {
+    return inst.pc + inst.word_count * 4;
+}
+
+fn immediateOperand(value: operand.Operand) ?u32 {
+    return switch (value.kind) {
+        .integer_inline_constant, .literal_constant, .float_inline_constant => value.value,
+        .null => 0,
+        else => null,
+    };
+}
+
+fn addImmediate(inst: instruction.Instruction, pc_reg: u32) ?struct { opcode: isa.Opcode, imm: u32 } {
+    const is_add = inst.opcode == .s_add_u32 or inst.opcode == .s_add_i32;
+    const is_sub = inst.opcode == .s_sub_u32 or inst.opcode == .s_sub_i32;
+    if (!is_add and !is_sub) return null;
+    const src0_pc = inst.src0.kind == .sgpr and inst.src0.reg == pc_reg;
+    const src1_pc = inst.src1.kind == .sgpr and inst.src1.reg == pc_reg;
+    if (src0_pc == src1_pc) return null;
+    const imm = immediateOperand(if (src0_pc) inst.src1 else inst.src0) orelse return null;
+    return .{ .opcode = inst.opcode, .imm = imm };
+}
+
+/// Resolves `s_getpc_b64` / add-or-sub / `s_setpc_b64` to a shader-relative PC.
+///
+/// Fetch and NGG prologs jump this way to the rest of the same allocation.
+/// `s[6:7]` hardware exporters and external fetch-shader pointers return null
+/// and stay terminators.
+pub fn resolveSetpcTarget(program: *const instruction.Program, setpc_index: usize) ?u32 {
+    const instructions = program.instructions.items;
+    if (setpc_index >= instructions.len) return null;
+    const setpc = instructions[setpc_index];
+    if (setpc.opcode != .s_setpc_b64 or setpc.src0.kind != .sgpr) return null;
+    const pc_reg = setpc.src0.reg;
+
+    var index = setpc_index;
+    if (index >= 1) {
+        const prev = instructions[index - 1];
+        if (prev.opcode == .s_addc_u32 and prev.dst.kind == .sgpr and prev.dst.reg == pc_reg + 1) {
+            const carry = immediateOperand(prev.src0) orelse immediateOperand(prev.src1);
+            if (carry == 0) index -= 1;
+        }
+    }
+
+    if (index >= 2) {
+        const arith = instructions[index - 1];
+        const getpc = instructions[index - 2];
+        if (getpc.opcode == .s_getpc_b64 and getpc.dst.kind == .sgpr and getpc.dst.reg == pc_reg and
+            arith.dst.kind == .sgpr and arith.dst.reg == pc_reg)
+        {
+            if (addImmediate(arith, pc_reg)) |delta| {
+                const base = instructionEndPc(getpc);
+                const target = switch (delta.opcode) {
+                    .s_add_u32, .s_add_i32 => base +% delta.imm,
+                    else => base -% delta.imm,
+                };
+                return target & ~@as(u32, 3);
+            }
+        }
+    }
+
+    if (index >= 1) {
+        const getpc = instructions[index - 1];
+        if (getpc.opcode == .s_getpc_b64 and getpc.dst.kind == .sgpr and getpc.dst.reg == pc_reg) {
+            return instructionEndPc(getpc);
+        }
     }
     return null;
 }
@@ -243,6 +314,13 @@ pub fn build(allocator: std.mem.Allocator, program: *const instruction.Program) 
                 return Error.InvalidBranchTarget;
             leaders[target] = true;
             if (index + 1 < count) leaders[index + 1] = true;
+        } else if (inst.opcode == .s_setpc_b64) {
+            if (resolveSetpcTarget(program, index)) |target| {
+                if (instructionIndexAtPc(program, target)) |target_index| {
+                    leaders[target_index] = true;
+                }
+            }
+            if (index + 1 < count) leaders[index + 1] = true;
         } else if (inst.opcode.isProgramEnd() and index + 1 < count) {
             leaders[index + 1] = true;
         }
@@ -267,7 +345,20 @@ pub fn build(allocator: std.mem.Allocator, program: *const instruction.Program) 
     for (graph.blocks.items, 0..) |block, block_index| {
         const last_index = block.first_instruction + block.instruction_count - 1;
         const last = program.instructions.items[last_index];
-        if (last.opcode.isProgramEnd() or last.opcode == .s_setpc_b64) continue;
+        if (last.opcode.isProgramEnd()) continue;
+        if (last.opcode == .s_setpc_b64) {
+            if (resolveSetpcTarget(program, last_index)) |target| {
+                if (graph.blockForPc(target)) |dest| {
+                    try graph.edges.append(allocator, .{
+                        .from = @intCast(block_index),
+                        .to = dest,
+                        .kind = .branch,
+                    });
+                    if (dest <= block_index) graph.back_edge_count += 1;
+                }
+            }
+            continue;
+        }
 
         if (last.opcode.isBranch()) {
             const target = graph.blockForPc(last.branch_target) orelse return Error.InvalidBranchTarget;
@@ -356,6 +447,77 @@ test "back edges are recorded separately from structured selections" {
     try std.testing.expectEqual(@as(u32, 1), graph.back_edge_count);
     try std.testing.expectEqual(@as(usize, 0), graph.selections.items.len);
     try std.testing.expect(!graph.irreducible);
+}
+
+test "GETPC plus add SETPC is an intra-program jump" {
+    var instructions: std.ArrayList(instruction.Instruction) = .empty;
+    defer instructions.deinit(std.testing.allocator);
+    try instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .opcode = .s_getpc_b64,
+        .dst = .{ .kind = .sgpr, .reg = 0 },
+        .word_count = 1,
+    });
+    try instructions.append(std.testing.allocator, .{
+        .pc = 4,
+        .opcode = .s_add_u32,
+        .dst = .{ .kind = .sgpr, .reg = 0 },
+        .src0 = .{ .kind = .sgpr, .reg = 0 },
+        .src1 = .{ .kind = .integer_inline_constant, .value = 8 },
+        .src_count = 2,
+        .word_count = 1,
+    });
+    try instructions.append(std.testing.allocator, .{
+        .pc = 8,
+        .opcode = .s_setpc_b64,
+        .src0 = .{ .kind = .sgpr, .reg = 0 },
+        .src_count = 1,
+        .word_count = 1,
+    });
+    try instructions.append(std.testing.allocator, .{
+        .pc = 12,
+        .opcode = .s_mov_b32,
+        .dst = .{ .kind = .sgpr, .reg = 2 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 1 },
+        .src_count = 1,
+        .word_count = 1,
+    });
+    try instructions.append(std.testing.allocator, .{
+        .pc = 16,
+        .opcode = .s_endpgm,
+        .word_count = 1,
+    });
+    const program = instruction.Program{ .code = &.{}, .instructions = instructions };
+    try std.testing.expectEqual(@as(?u32, 12), resolveSetpcTarget(&program, 2));
+    var graph = try build(std.testing.allocator, &program);
+    defer graph.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), graph.blocks.items.len);
+    try std.testing.expectEqual(@as(u32, 12), graph.blocks.items[1].start_pc);
+    try std.testing.expectEqual(@as(usize, 1), graph.edges.items.len);
+    try std.testing.expectEqual(EdgeKind.branch, graph.edges.items[0].kind);
+    try std.testing.expectEqual(@as(u32, 1), graph.edges.items[0].to);
+}
+
+test "hardware NGG SETPC s6 stays a terminator" {
+    var instructions: std.ArrayList(instruction.Instruction) = .empty;
+    defer instructions.deinit(std.testing.allocator);
+    try instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .opcode = .s_setpc_b64,
+        .src0 = .{ .kind = .sgpr, .reg = 6 },
+        .src_count = 1,
+        .word_count = 1,
+    });
+    try instructions.append(std.testing.allocator, .{
+        .pc = 4,
+        .opcode = .s_endpgm,
+        .word_count = 1,
+    });
+    const program = instruction.Program{ .code = &.{}, .instructions = instructions };
+    try std.testing.expectEqual(@as(?u32, null), resolveSetpcTarget(&program, 0));
+    var graph = try build(std.testing.allocator, &program);
+    defer graph.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), graph.edges.items.len);
 }
 
 test "a cycle entered from two predecessors is irreducible" {

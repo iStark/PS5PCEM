@@ -554,6 +554,7 @@ const Builder = struct {
     gds_word_pointer_type: u32 = 0,
     /// GLSL.std.450 extended instruction set (PackHalf2x16, etc.). 0 = unused.
     glsl_std_450: u32 = 0,
+    uses_image_query: bool = false,
     scalar_specializations: []const ScalarRegister,
     dynamic_scalar_binding: ?DynamicScalarBinding,
     scalar_buffer: u32 = 0,
@@ -1170,8 +1171,27 @@ const Builder = struct {
             const scope = try self.constant(.bits32, 3); // Subgroup scope
             var shuffled = self.id();
             if (op.dpp_ctrl <= 0x0ff) { // quad_perm
-                // TODO: exact quad perm using shift/and lane math + Shuffle
-                shuffled = raw;
+                const lane = try self.currentLaneId();
+                const quad_lane = try self.andBits(lane, 3);
+                const quad_base = try self.andBits(lane, 0xffff_fffc);
+                const lane_shift = self.id();
+                try self.emit(&self.body, 196, &.{
+                    self.bits_type,
+                    lane_shift,
+                    quad_lane,
+                    try self.constant(.bits32, 1),
+                }); // OpShiftLeftLogical: quad_lane * 2
+                const shifted_ctrl = self.id();
+                try self.emit(&self.body, 194, &.{
+                    self.bits_type,
+                    shifted_ctrl,
+                    try self.constant(.bits32, op.dpp_ctrl),
+                    lane_shift,
+                }); // OpShiftRightLogical
+                const select = try self.andBits(shifted_ctrl, 3);
+                const dest_lane = self.id();
+                try self.emit(&self.body, 197, &.{ self.bits_type, dest_lane, quad_base, select }); // OpBitwiseOr
+                try self.emit(&self.body, 345, &.{ self.bits_type, shuffled, scope, raw, dest_lane }); // OpGroupNonUniformShuffle
             } else if (op.dpp_ctrl >= 0x101 and op.dpp_ctrl <= 0x10f) { // row_shl
                 const delta = try self.constant(.bits32, op.dpp_ctrl - 0x100);
                 try self.emit(&self.body, 347, &.{ self.bits_type, shuffled, scope, raw, delta }); // OpGroupNonUniformShuffleUp
@@ -1640,6 +1660,35 @@ const Builder = struct {
         try self.vectorConditionDestination(inst, result);
     }
 
+    fn vectorComparisonF16(self: *Builder, inst: instruction.Instruction, opcode: u16) Error!void {
+        const a = try self.unpackF16Low(try self.source(inst.src0, .bits32));
+        const b = try self.unpackF16Low(try self.source(inst.src1, .bits32));
+        const result = self.id();
+        try self.emit(&self.body, opcode, &.{ self.bool_type, result, a, b });
+        try self.vectorConditionDestination(inst, result);
+    }
+
+    fn vectorComparisonI16(self: *Builder, inst: instruction.Instruction, opcode: u16, signed: bool) Error!void {
+        const mask = try self.constant(.bits32, 0xffff);
+        const a_bits = try self.andBits(try self.source(inst.src0, .bits32), 0xffff);
+        const b_bits = try self.andBits(try self.source(inst.src1, .bits32), 0xffff);
+        const a = if (signed) try self.signExtend16(a_bits) else a_bits;
+        const b = if (signed) try self.signExtend16(b_bits) else b_bits;
+        _ = mask;
+        const result = self.id();
+        try self.emit(&self.body, opcode, &.{ self.bool_type, result, a, b });
+        try self.vectorConditionDestination(inst, result);
+    }
+
+    fn signExtend16(self: *Builder, value: u32) Error!u32 {
+        const shifted = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, shifted, value, try self.constant(.bits32, 16) });
+        const as_signed = try self.convert(.{ .id = shifted, .value_type = .bits32 }, .sint32);
+        const extended = self.id();
+        try self.emit(&self.body, 195, &.{ self.signed_type, extended, as_signed, try self.constant(.sint32, 16) });
+        return extended;
+    }
+
     fn vectorConstantComparison(self: *Builder, inst: instruction.Instruction, truth: bool) Error!void {
         const zero = try self.constant(.bits32, 0);
         const result = self.id();
@@ -1737,18 +1786,1343 @@ const Builder = struct {
     /// word produced by V_CMP becomes that invocation's structured-branch
     /// condition. Keeping both halves also preserves the guest SGPR snapshot
     /// used by the later `s_mov_b64 exec, saved` reconvergence sequence.
-    fn andSaveExec64(self: *Builder, inst: instruction.Instruction) Error!void {
+    const SaveExecMode = enum { and_mask, or_not, not_and };
+
+    fn combineExecWord(self: *Builder, mode: SaveExecMode, previous: u32, predicate: u32) Error!u32 {
+        return switch (mode) {
+            .and_mask => blk: {
+                const result = self.id();
+                try self.emit(&self.body, 199, &.{ self.bits_type, result, previous, predicate });
+                break :blk result;
+            },
+            .or_not => blk: {
+                const inverted = self.id();
+                try self.emit(&self.body, 200, &.{ self.bits_type, inverted, predicate });
+                const result = self.id();
+                try self.emit(&self.body, 197, &.{ self.bits_type, result, previous, inverted });
+                break :blk result;
+            },
+            .not_and => blk: {
+                const inverted = self.id();
+                try self.emit(&self.body, 200, &.{ self.bits_type, inverted, previous });
+                const result = self.id();
+                try self.emit(&self.body, 199, &.{ self.bits_type, result, inverted, predicate });
+                break :blk result;
+            },
+        };
+    }
+
+    fn saveExec(self: *Builder, inst: instruction.Instruction, mode: SaveExecMode) Error!void {
         const previous = try self.sourcePair(.{ .kind = .exec_lo });
         const predicate = try self.sourcePair(inst.src0);
-        var active: [2]u32 = undefined;
-        for (0..2) |index| {
-            active[index] = self.id();
-            try self.emit(&self.body, 199, &.{ self.bits_type, active[index], previous[index], predicate[index] }); // OpBitwiseAnd
-        }
+        const active = [2]u32{
+            try self.combineExecWord(mode, previous[0], predicate[0]),
+            try self.combineExecWord(mode, previous[1], predicate[1]),
+        };
         try self.destinationPair(inst.dst, previous);
         try self.destinationPair(.{ .kind = .exec_lo }, active);
         self.exec_mask = active;
         try self.updateSccFromPair(active);
+    }
+
+    fn saveExec32(self: *Builder, inst: instruction.Instruction, mode: SaveExecMode) Error!void {
+        const previous = try self.source(.{ .kind = .exec_lo }, .bits32);
+        const predicate = try self.source(inst.src0, .bits32);
+        const active = try self.combineExecWord(mode, previous, predicate);
+        try self.destination(inst.dst, .{ .id = previous, .value_type = .bits32 });
+        try self.destination(.{ .kind = .exec_lo }, .{ .id = active, .value_type = .bits32 });
+        const high = if (self.exec_mask) |mask| mask[1] else try self.constant(.bits32, 0);
+        self.exec_mask = .{ active, high };
+        try self.updateSccFromPair(.{ active, high });
+    }
+
+    fn bitwise32(self: *Builder, inst: instruction.Instruction, opcode: isa.Opcode) Error!void {
+        const a = try self.source(inst.src0, .bits32);
+        var right = try self.source(inst.src1, .bits32);
+        if (opcode == .s_andn2_b32 or opcode == .s_orn2_b32) {
+            const inverted = self.id();
+            try self.emit(&self.body, 200, &.{ self.bits_type, inverted, right });
+            right = inverted;
+        }
+        const spirv_op: u16 = switch (opcode) {
+            .s_andn2_b32, .s_nand_b32 => 199,
+            .s_orn2_b32, .s_nor_b32 => 197,
+            .s_xnor_b32 => 198,
+            else => unreachable,
+        };
+        const combined = self.id();
+        try self.emit(&self.body, spirv_op, &.{ self.bits_type, combined, a, right });
+        const result = if (opcode == .s_nand_b32 or opcode == .s_nor_b32 or opcode == .s_xnor_b32) blk: {
+            const inverted = self.id();
+            try self.emit(&self.body, 200, &.{ self.bits_type, inverted, combined });
+            break :blk inverted;
+        } else combined;
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
+    fn packHalves(self: *Builder, inst: instruction.Instruction, src0_high: bool, src1_high: bool) Error!void {
+        var low = try self.source(inst.src0, .bits32);
+        var high = try self.source(inst.src1, .bits32);
+        if (src0_high) low = try self.shiftRightBits(low, 16);
+        if (!src1_high) high = try self.andBits(high, 0xffff);
+        low = try self.andBits(low, 0xffff);
+        if (!src1_high) {
+            const shifted = self.id();
+            try self.emit(&self.body, 196, &.{ self.bits_type, shifted, high, try self.constant(.bits32, 16) });
+            high = shifted;
+        } else {
+            high = try self.andBits(high, 0xffff_0000);
+        }
+        const result = self.id();
+        try self.emit(&self.body, 197, &.{ self.bits_type, result, low, high });
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
+    fn absSigned(self: *Builder, inst: instruction.Instruction) Error!void {
+        const value = try self.source(inst.src0, .sint32);
+        const result = self.id();
+        try self.emit(&self.body, 12, &.{ self.signed_type, result, self.ensureGlslStd450(), 5, value });
+        try self.destination(inst.dst, .{ .id = result, .value_type = .sint32 });
+    }
+
+    fn scalarBitfieldExtractSigned(self: *Builder, inst: instruction.Instruction) Error!void {
+        const value = try self.source(inst.src0, .sint32);
+        const field = try self.source(inst.src1, .bits32);
+        const offset_bits = try self.andBits(field, 31);
+        const shifted_field = self.id();
+        try self.emit(&self.body, 194, &.{
+            self.bits_type,
+            shifted_field,
+            field,
+            try self.constant(.bits32, 16),
+        }); // OpShiftRightLogical
+        const width_bits = try self.andBits(shifted_field, 0x7f);
+        const offset = try self.convert(.{ .id = offset_bits, .value_type = .bits32 }, .sint32);
+        const width = try self.convert(.{ .id = width_bits, .value_type = .bits32 }, .sint32);
+        const result = self.id();
+        try self.emit(&self.body, 202, &.{ self.signed_type, result, value, offset, width }); // OpBitFieldSExtract
+        try self.destination(inst.dst, .{ .id = result, .value_type = .sint32 });
+    }
+
+    fn unpackF16Low(self: *Builder, bits: u32) Error!u32 {
+        const vector_type = try self.ensureFloatVec2();
+        const pair = self.id();
+        try self.emit(&self.body, 12, &.{
+            vector_type,
+            pair,
+            self.ensureGlslStd450(),
+            62,
+            bits,
+        });
+        const low = self.id();
+        try self.emit(&self.body, 81, &.{ self.float_type, low, pair, 0 });
+        return low;
+    }
+
+    fn packF16Low(self: *Builder, value: u32) Error!u32 {
+        const vector_type = try self.ensureFloatVec2();
+        const zero = try self.constant(.float32, 0);
+        const pair = self.id();
+        try self.emit(&self.body, 80, &.{ vector_type, pair, value, zero });
+        const result = self.id();
+        try self.emit(&self.body, 12, &.{
+            self.bits_type,
+            result,
+            self.ensureGlslStd450(),
+            58,
+            pair,
+        });
+        return result;
+    }
+
+    fn binaryF16(self: *Builder, inst: instruction.Instruction, opcode: u16, reverse: bool) Error!void {
+        const a_bits = try self.source(if (reverse) inst.src1 else inst.src0, .bits32);
+        const b_bits = try self.source(if (reverse) inst.src0 else inst.src1, .bits32);
+        const a = try self.unpackF16Low(a_bits);
+        const b = try self.unpackF16Low(b_bits);
+        const result = self.id();
+        try self.emit(&self.body, opcode, &.{ self.float_type, result, a, b });
+        try self.destination(inst.dst, .{ .id = try self.packF16Low(result), .value_type = .bits32 });
+    }
+
+    fn glslBinaryF16(self: *Builder, inst: instruction.Instruction, opcode: u32) Error!void {
+        const a = try self.unpackF16Low(try self.source(inst.src0, .bits32));
+        const b = try self.unpackF16Low(try self.source(inst.src1, .bits32));
+        const result = try self.glslBinaryValue(opcode, .float32, a, b);
+        try self.destination(inst.dst, .{ .id = try self.packF16Low(result), .value_type = .bits32 });
+    }
+
+    fn packedBinaryF16(self: *Builder, inst: instruction.Instruction, opcode: u16) Error!void {
+        const a_bits = try self.source(inst.src0, .bits32);
+        const b_bits = try self.source(inst.src1, .bits32);
+        const vector_type = try self.ensureFloatVec2();
+        const a = self.id();
+        try self.emit(&self.body, 12, &.{ vector_type, a, self.ensureGlslStd450(), 62, a_bits });
+        const b = self.id();
+        try self.emit(&self.body, 12, &.{ vector_type, b, self.ensureGlslStd450(), 62, b_bits });
+        const result = self.id();
+        try self.emit(&self.body, opcode, &.{ vector_type, result, a, b });
+        const packed_bits = self.id();
+        try self.emit(&self.body, 12, &.{ self.bits_type, packed_bits, self.ensureGlslStd450(), 58, result });
+        try self.destination(inst.dst, .{ .id = packed_bits, .value_type = .bits32 });
+    }
+
+    fn packedFmaF16(self: *Builder, inst: instruction.Instruction) Error!void {
+        const a_bits = try self.source(inst.src0, .bits32);
+        const b_bits = try self.source(inst.src1, .bits32);
+        const c_bits = try self.source(inst.src2, .bits32);
+        const vector_type = try self.ensureFloatVec2();
+        const a = self.id();
+        try self.emit(&self.body, 12, &.{ vector_type, a, self.ensureGlslStd450(), 62, a_bits });
+        const b = self.id();
+        try self.emit(&self.body, 12, &.{ vector_type, b, self.ensureGlslStd450(), 62, b_bits });
+        const c = self.id();
+        try self.emit(&self.body, 12, &.{ vector_type, c, self.ensureGlslStd450(), 62, c_bits });
+        const product = self.id();
+        try self.emit(&self.body, 133, &.{ vector_type, product, a, b });
+        const result = self.id();
+        try self.emit(&self.body, 129, &.{ vector_type, result, product, c });
+        const packed_bits = self.id();
+        try self.emit(&self.body, 12, &.{ self.bits_type, packed_bits, self.ensureGlslStd450(), 58, result });
+        try self.destination(inst.dst, .{ .id = packed_bits, .value_type = .bits32 });
+    }
+
+    fn convertF16ToF32(self: *Builder, inst: instruction.Instruction) Error!void {
+        const bits = try self.source(inst.src0, .bits32);
+        try self.destination(inst.dst, .{ .id = try self.unpackF16Low(bits), .value_type = .float32 });
+    }
+
+    fn convertF32ToF16(self: *Builder, inst: instruction.Instruction) Error!void {
+        const value = try self.source(inst.src0, .float32);
+        try self.destination(inst.dst, .{ .id = try self.packF16Low(value), .value_type = .bits32 });
+    }
+
+    fn unpackF16Pair(self: *Builder, bits: u32) Error![2]u32 {
+        const vector_type = try self.ensureFloatVec2();
+        const pair = self.id();
+        try self.emit(&self.body, 12, &.{ vector_type, pair, self.ensureGlslStd450(), 62, bits });
+        const lo = self.id();
+        const hi = self.id();
+        try self.emit(&self.body, 81, &.{ self.float_type, lo, pair, 0 });
+        try self.emit(&self.body, 81, &.{ self.float_type, hi, pair, 1 });
+        return .{ lo, hi };
+    }
+
+    fn packF16Pair(self: *Builder, lo: u32, hi: u32) Error!u32 {
+        const vector_type = try self.ensureFloatVec2();
+        const pair = self.id();
+        try self.emit(&self.body, 80, &.{ vector_type, pair, lo, hi });
+        const result = self.id();
+        try self.emit(&self.body, 12, &.{ self.bits_type, result, self.ensureGlslStd450(), 58, pair });
+        return result;
+    }
+
+    fn glslFloatUnaryValue(self: *Builder, opcode: u32, value: u32) Error!u32 {
+        const result = self.id();
+        try self.emit(&self.body, 12, &.{ self.float_type, result, self.ensureGlslStd450(), opcode, value });
+        return result;
+    }
+
+    fn unaryF16(self: *Builder, inst: instruction.Instruction, glsl_opcode: u32) Error!void {
+        const value = try self.unpackF16Low(try self.source(inst.src0, .bits32));
+        const result = try self.glslFloatUnaryValue(glsl_opcode, value);
+        try self.destination(inst.dst, .{ .id = try self.packF16Low(result), .value_type = .bits32 });
+    }
+
+    fn reciprocalF16(self: *Builder, inst: instruction.Instruction) Error!void {
+        const value = try self.unpackF16Low(try self.source(inst.src0, .bits32));
+        const result = self.id();
+        try self.emit(&self.body, 136, &.{
+            self.float_type,
+            result,
+            try self.constant(.float32, @bitCast(@as(f32, 1.0))),
+            value,
+        });
+        try self.destination(inst.dst, .{ .id = try self.packF16Low(result), .value_type = .bits32 });
+    }
+
+    fn fmaF16(self: *Builder, inst: instruction.Instruction) Error!void {
+        const a = try self.unpackF16Low(try self.source(inst.src0, .bits32));
+        const b = try self.unpackF16Low(try self.source(inst.src1, .bits32));
+        const c = try self.unpackF16Low(try self.source(inst.src2, .bits32));
+        const result = self.id();
+        try self.emit(&self.body, 12, &.{ self.float_type, result, self.ensureGlslStd450(), 50, a, b, c });
+        try self.destination(inst.dst, .{ .id = try self.packF16Low(result), .value_type = .bits32 });
+    }
+
+    fn fmacF16(self: *Builder, inst: instruction.Instruction) Error!void {
+        const a = try self.unpackF16Low(try self.source(inst.src0, .bits32));
+        const b = try self.unpackF16Low(try self.source(inst.src1, .bits32));
+        const acc = try self.unpackF16Low(try self.source(inst.dst, .bits32));
+        const product = self.id();
+        try self.emit(&self.body, 133, &.{ self.float_type, product, a, b });
+        const result = self.id();
+        try self.emit(&self.body, 129, &.{ self.float_type, result, product, acc });
+        try self.destination(inst.dst, .{ .id = try self.packF16Low(result), .value_type = .bits32 });
+    }
+
+    fn packedFmacF16(self: *Builder, inst: instruction.Instruction) Error!void {
+        const a = try self.unpackF16Pair(try self.source(inst.src0, .bits32));
+        const b = try self.unpackF16Pair(try self.source(inst.src1, .bits32));
+        const acc = try self.unpackF16Pair(try self.source(inst.dst, .bits32));
+        const lo_p = self.id();
+        const hi_p = self.id();
+        try self.emit(&self.body, 133, &.{ self.float_type, lo_p, a[0], b[0] });
+        try self.emit(&self.body, 133, &.{ self.float_type, hi_p, a[1], b[1] });
+        const lo = self.id();
+        const hi = self.id();
+        try self.emit(&self.body, 129, &.{ self.float_type, lo, lo_p, acc[0] });
+        try self.emit(&self.body, 129, &.{ self.float_type, hi, hi_p, acc[1] });
+        try self.destination(inst.dst, .{ .id = try self.packF16Pair(lo, hi), .value_type = .bits32 });
+    }
+
+    fn packedGlslF16(self: *Builder, inst: instruction.Instruction, opcode: u32) Error!void {
+        const a = try self.unpackF16Pair(try self.source(inst.src0, .bits32));
+        const b = try self.unpackF16Pair(try self.source(inst.src1, .bits32));
+        try self.destination(inst.dst, .{
+            .id = try self.packF16Pair(
+                try self.glslBinaryValue(opcode, .float32, a[0], b[0]),
+                try self.glslBinaryValue(opcode, .float32, a[1], b[1]),
+            ),
+            .value_type = .bits32,
+        });
+    }
+
+    fn mixSourceF32(self: *Builder, op: operand.Operand) Error!u32 {
+        if (op.op_sel) {
+            const bits = try self.source(op, .bits32);
+            const pair = try self.unpackF16Pair(bits);
+            return if (op.op_sel_hi) pair[1] else pair[0];
+        }
+        return self.source(op, .float32);
+    }
+
+    fn insertF16Half(self: *Builder, current: u32, value: u32, high: bool) Error!u32 {
+        const packed_half = try self.packF16Low(value);
+        if (high) {
+            const shifted = self.id();
+            try self.emit(&self.body, 196, &.{ self.bits_type, shifted, packed_half, try self.constant(.bits32, 16) });
+            const preserved = try self.andBits(current, 0xffff);
+            const result = self.id();
+            try self.emit(&self.body, 197, &.{ self.bits_type, result, preserved, shifted });
+            return result;
+        }
+        const preserved = try self.andBits(current, 0xffff_0000);
+        const low = try self.andBits(packed_half, 0xffff);
+        const result = self.id();
+        try self.emit(&self.body, 197, &.{ self.bits_type, result, preserved, low });
+        return result;
+    }
+
+    fn madMixF16(self: *Builder, inst: instruction.Instruction, high: bool) Error!void {
+        const a = try self.mixSourceF32(inst.src0);
+        const b = try self.mixSourceF32(inst.src1);
+        const c = try self.mixSourceF32(inst.src2);
+        const result = self.id();
+        try self.emit(&self.body, 12, &.{ self.float_type, result, self.ensureGlslStd450(), 50, a, b, c });
+        const current = try self.source(inst.dst, .bits32);
+        try self.destination(inst.dst, .{ .id = try self.insertF16Half(current, result, high), .value_type = .bits32 });
+    }
+
+    fn halfU16(self: *Builder, bits: u32, high: bool) Error!u32 {
+        return if (high) self.shiftRightBits(bits, 16) else self.andBits(bits, 0xffff);
+    }
+
+    fn packU16Pair(self: *Builder, lo: u32, hi: u32) Error!u32 {
+        const low = try self.andBits(lo, 0xffff);
+        const shifted = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, shifted, try self.andBits(hi, 0xffff), try self.constant(.bits32, 16) });
+        const result = self.id();
+        try self.emit(&self.body, 197, &.{ self.bits_type, result, low, shifted });
+        return result;
+    }
+
+    fn packedIntegerBinary(self: *Builder, inst: instruction.Instruction, opcode: u16, signed: bool, reverse: bool) Error!void {
+        const a_bits = try self.source(if (reverse) inst.src1 else inst.src0, .bits32);
+        const b_bits = try self.source(if (reverse) inst.src0 else inst.src1, .bits32);
+        var lo_a = try self.halfU16(a_bits, false);
+        var lo_b = try self.halfU16(b_bits, false);
+        var hi_a = try self.halfU16(a_bits, true);
+        var hi_b = try self.halfU16(b_bits, true);
+        const ty: ValueType = if (signed) .sint32 else .bits32;
+        if (signed) {
+            lo_a = try self.signExtend16(lo_a);
+            lo_b = try self.signExtend16(lo_b);
+            hi_a = try self.signExtend16(hi_a);
+            hi_b = try self.signExtend16(hi_b);
+        }
+        const lo = self.id();
+        const hi = self.id();
+        try self.emit(&self.body, opcode, &.{ self.typeId(ty), lo, lo_a, lo_b });
+        try self.emit(&self.body, opcode, &.{ self.typeId(ty), hi, hi_a, hi_b });
+        try self.destination(inst.dst, .{ .id = try self.packU16Pair(lo, hi), .value_type = .bits32 });
+    }
+
+    fn packedIntegerGlsl(self: *Builder, inst: instruction.Instruction, opcode: u32, signed: bool) Error!void {
+        const a_bits = try self.source(inst.src0, .bits32);
+        const b_bits = try self.source(inst.src1, .bits32);
+        var lo_a = try self.halfU16(a_bits, false);
+        var lo_b = try self.halfU16(b_bits, false);
+        var hi_a = try self.halfU16(a_bits, true);
+        var hi_b = try self.halfU16(b_bits, true);
+        const ty: ValueType = if (signed) .sint32 else .bits32;
+        if (signed) {
+            lo_a = try self.signExtend16(lo_a);
+            lo_b = try self.signExtend16(lo_b);
+            hi_a = try self.signExtend16(hi_a);
+            hi_b = try self.signExtend16(hi_b);
+        }
+        try self.destination(inst.dst, .{
+            .id = try self.packU16Pair(
+                try self.glslBinaryValue(opcode, ty, lo_a, lo_b),
+                try self.glslBinaryValue(opcode, ty, hi_a, hi_b),
+            ),
+            .value_type = .bits32,
+        });
+    }
+
+    fn packedIntegerMad(self: *Builder, inst: instruction.Instruction, signed: bool) Error!void {
+        const a_bits = try self.source(inst.src0, .bits32);
+        const b_bits = try self.source(inst.src1, .bits32);
+        const c_bits = try self.source(inst.src2, .bits32);
+        const ty: ValueType = if (signed) .sint32 else .bits32;
+        var halves: [2]u32 = undefined;
+        for (0..2) |index| {
+            const high = index == 1;
+            var a = try self.halfU16(a_bits, high);
+            var b = try self.halfU16(b_bits, high);
+            var c = try self.halfU16(c_bits, high);
+            if (signed) {
+                a = try self.signExtend16(a);
+                b = try self.signExtend16(b);
+                c = try self.signExtend16(c);
+            }
+            const product = self.id();
+            try self.emit(&self.body, 132, &.{ self.typeId(ty), product, a, b });
+            const sum = self.id();
+            try self.emit(&self.body, 128, &.{ self.typeId(ty), sum, product, c });
+            halves[index] = sum;
+        }
+        try self.destination(inst.dst, .{ .id = try self.packU16Pair(halves[0], halves[1]), .value_type = .bits32 });
+    }
+
+    fn integer16Binary(self: *Builder, inst: instruction.Instruction, opcode: u16, signed: bool, reverse: bool) Error!void {
+        var a = try self.halfU16(try self.source(if (reverse) inst.src1 else inst.src0, .bits32), false);
+        var b = try self.halfU16(try self.source(if (reverse) inst.src0 else inst.src1, .bits32), false);
+        const ty: ValueType = if (signed) .sint32 else .bits32;
+        if (signed) {
+            a = try self.signExtend16(a);
+            b = try self.signExtend16(b);
+        }
+        const result = self.id();
+        try self.emit(&self.body, opcode, &.{ self.typeId(ty), result, a, b });
+        const current = try self.source(inst.dst, .bits32);
+        const preserved = try self.andBits(current, 0xffff_0000);
+        const low = try self.andBits(result, 0xffff);
+        const combined = self.id();
+        try self.emit(&self.body, 197, &.{ self.bits_type, combined, preserved, low });
+        try self.destination(inst.dst, .{ .id = combined, .value_type = .bits32 });
+    }
+
+    fn integer16Glsl(self: *Builder, inst: instruction.Instruction, opcode: u32, signed: bool) Error!void {
+        var a = try self.halfU16(try self.source(inst.src0, .bits32), false);
+        var b = try self.halfU16(try self.source(inst.src1, .bits32), false);
+        const ty: ValueType = if (signed) .sint32 else .bits32;
+        if (signed) {
+            a = try self.signExtend16(a);
+            b = try self.signExtend16(b);
+        }
+        const result = try self.glslBinaryValue(opcode, ty, a, b);
+        const current = try self.source(inst.dst, .bits32);
+        const preserved = try self.andBits(current, 0xffff_0000);
+        const low = try self.andBits(result, 0xffff);
+        const combined = self.id();
+        try self.emit(&self.body, 197, &.{ self.bits_type, combined, preserved, low });
+        try self.destination(inst.dst, .{ .id = combined, .value_type = .bits32 });
+    }
+
+    fn currentLaneId(self: *Builder) Error!u32 {
+        if (self.local_invocation_index == 0) return self.constant(.bits32, 0);
+        const invocation = self.id();
+        try self.emit(&self.body, 61, &.{ self.bits_type, invocation, self.local_invocation_index });
+        return self.andBits(invocation, 63);
+    }
+
+    fn permlane(self: *Builder, inst: instruction.Instruction, exchange: bool) Error!void {
+        const value = try self.source(inst.src0, .bits32);
+        const lane = try self.currentLaneId();
+        const in_high = self.id();
+        try self.emit(&self.body, 172, &.{ self.bool_type, in_high, lane, try self.constant(.bits32, 15) });
+        const select = self.id();
+        try self.emit(&self.body, 169, &.{
+            self.bits_type,
+            select,
+            in_high,
+            try self.source(inst.src2, .bits32),
+            try self.source(inst.src1, .bits32),
+        });
+        const group = try self.andBits(lane, 0xffff_fff0);
+        const index_base = if (exchange) blk: {
+            const flipped = self.id();
+            try self.emit(&self.body, 198, &.{ self.bits_type, flipped, group, try self.constant(.bits32, 16) });
+            break :blk flipped;
+        } else group;
+        const dest_lane = self.id();
+        try self.emit(&self.body, 197, &.{ self.bits_type, dest_lane, index_base, try self.andBits(select, 15) });
+        const result = self.id();
+        try self.emit(&self.body, 345, &.{
+            self.bits_type,
+            result,
+            try self.constant(.bits32, 3),
+            value,
+            dest_lane,
+        });
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
+    fn maskedBitCount(self: *Builder, inst: instruction.Instruction, high_half: bool) Error!void {
+        const bits = try self.source(inst.src0, .bits32);
+        const addend = try self.source(inst.src1, .bits32);
+        const lane = try self.currentLaneId();
+        const relative = if (high_half) blk: {
+            const shifted = self.id();
+            try self.emit(&self.body, 130, &.{ self.bits_type, shifted, lane, try self.constant(.bits32, 32) });
+            break :blk shifted;
+        } else lane;
+        const one = try self.constant(.bits32, 1);
+        const shifted = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, shifted, one, relative });
+        const mask = self.id();
+        try self.emit(&self.body, 130, &.{ self.bits_type, mask, shifted, one });
+        const in_range = self.id();
+        try self.emit(&self.body, 176, &.{
+            self.bool_type,
+            in_range,
+            relative,
+            try self.constant(.bits32, 32),
+        });
+        const selected_mask = self.id();
+        try self.emit(&self.body, 169, &.{ self.bits_type, selected_mask, in_range, mask, try self.constant(.bits32, 0) });
+        const masked = self.id();
+        try self.emit(&self.body, 199, &.{ self.bits_type, masked, bits, selected_mask });
+        const count = self.id();
+        try self.emit(&self.body, 205, &.{ self.bits_type, count, masked });
+        const result = self.id();
+        try self.emit(&self.body, 128, &.{ self.bits_type, result, count, addend });
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
+    fn popCountAdd(self: *Builder, inst: instruction.Instruction) Error!void {
+        const bits = try self.source(inst.src0, .bits32);
+        const addend = try self.source(inst.src1, .bits32);
+        const count = self.id();
+        try self.emit(&self.body, 205, &.{ self.bits_type, count, bits });
+        const result = self.id();
+        try self.emit(&self.body, 128, &.{ self.bits_type, result, count, addend });
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
+    fn findFirstBit(self: *Builder, inst: instruction.Instruction, from_high: bool) Error!void {
+        const bits = try self.source(inst.src0, .bits32);
+        const result = self.id();
+        try self.emit(&self.body, 12, &.{
+            self.signed_type,
+            result,
+            self.ensureGlslStd450(),
+            if (from_high) @as(u32, 75) else 73,
+            bits,
+        });
+        try self.destination(inst.dst, .{ .id = result, .value_type = .sint32 });
+    }
+
+    fn findFirstBit64(self: *Builder, inst: instruction.Instruction, from_high: bool) Error!void {
+        const pair = try self.sourcePair(inst.src0);
+        const zero = try self.constant(.bits32, 0);
+        const minus_one = try self.constant(.sint32, 0xffff_ffff);
+        const thirty_two = try self.constant(.sint32, 32);
+        const low_zero = self.id();
+        const high_zero = self.id();
+        try self.emit(&self.body, 170, &.{ self.bool_type, low_zero, pair[0], zero });
+        try self.emit(&self.body, 170, &.{ self.bool_type, high_zero, pair[1], zero });
+        const both_zero = self.id();
+        try self.emit(&self.body, 167, &.{ self.bool_type, both_zero, low_zero, high_zero });
+        const glsl = self.ensureGlslStd450();
+        const op: u32 = if (from_high) 75 else 73;
+        const low_pos = self.id();
+        const high_pos = self.id();
+        try self.emit(&self.body, 12, &.{ self.signed_type, low_pos, glsl, op, pair[0] });
+        try self.emit(&self.body, 12, &.{ self.signed_type, high_pos, glsl, op, pair[1] });
+        const result = if (from_high) blk: {
+            const thirty_one = try self.constant(.sint32, 31);
+            const from_top_high = self.id();
+            try self.emit(&self.body, 130, &.{ self.signed_type, from_top_high, thirty_one, high_pos });
+            const from_top_low = self.id();
+            try self.emit(&self.body, 130, &.{ self.signed_type, from_top_low, try self.constant(.sint32, 63), low_pos });
+            const chosen = self.id();
+            try self.emit(&self.body, 169, &.{ self.signed_type, chosen, high_zero, from_top_low, from_top_high });
+            break :blk chosen;
+        } else blk: {
+            const high_adjusted = self.id();
+            try self.emit(&self.body, 128, &.{ self.signed_type, high_adjusted, high_pos, thirty_two });
+            const chosen = self.id();
+            try self.emit(&self.body, 169, &.{ self.signed_type, chosen, low_zero, high_adjusted, low_pos });
+            break :blk chosen;
+        };
+        const final_result = self.id();
+        try self.emit(&self.body, 169, &.{ self.signed_type, final_result, both_zero, minus_one, result });
+        try self.destination(inst.dst, .{ .id = final_result, .value_type = .sint32 });
+    }
+
+    fn scalarPopCount64(self: *Builder, inst: instruction.Instruction) Error!void {
+        const pair = try self.sourcePair(inst.src0);
+        const low = self.id();
+        const high = self.id();
+        try self.emit(&self.body, 205, &.{ self.bits_type, low, pair[0] });
+        try self.emit(&self.body, 205, &.{ self.bits_type, high, pair[1] });
+        const result = self.id();
+        try self.emit(&self.body, 128, &.{ self.bits_type, result, low, high });
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
+    fn smearNibbleGroups(self: *Builder, bits: u32) Error!u32 {
+        const shift1 = self.id();
+        try self.emit(&self.body, 194, &.{ self.bits_type, shift1, bits, try self.constant(.bits32, 1) });
+        const any1 = self.id();
+        try self.emit(&self.body, 197, &.{ self.bits_type, any1, bits, shift1 });
+        const shift2 = self.id();
+        try self.emit(&self.body, 194, &.{ self.bits_type, shift2, any1, try self.constant(.bits32, 2) });
+        const any2 = self.id();
+        try self.emit(&self.body, 197, &.{ self.bits_type, any2, any1, shift2 });
+        const groups = try self.andBits(any2, 0x1111_1111);
+        const smeared = self.id();
+        try self.emit(&self.body, 132, &.{ self.bits_type, smeared, groups, try self.constant(.bits32, 0xf) });
+        return smeared;
+    }
+
+    fn wholeQuadMask64(self: *Builder, inst: instruction.Instruction) Error!void {
+        const pair = try self.sourcePair(inst.src0);
+        try self.destinationPair(inst.dst, .{
+            try self.smearNibbleGroups(pair[0]),
+            try self.smearNibbleGroups(pair[1]),
+        });
+    }
+
+    fn vectorCompareClassF32(self: *Builder, inst: instruction.Instruction) Error!void {
+        const value = try self.source(inst.src0, .float32);
+        const class_mask = try self.source(inst.src1, .bits32);
+        const bits = try self.convert(.{ .id = value, .value_type = .float32 }, .bits32);
+        const exponent = try self.andBits(try self.shiftRightBits(bits, 23), 0xff);
+        const mantissa = try self.andBits(bits, 0x7f_ffff);
+        const sign = try self.shiftRightBits(bits, 31);
+        const zero = try self.constant(.bits32, 0);
+        const exp_255 = try self.constant(.bits32, 255);
+        const exp_is_zero = self.id();
+        const exp_is_255 = self.id();
+        const mant_is_zero = self.id();
+        try self.emit(&self.body, 170, &.{ self.bool_type, exp_is_zero, exponent, zero });
+        try self.emit(&self.body, 170, &.{ self.bool_type, exp_is_255, exponent, exp_255 });
+        try self.emit(&self.body, 170, &.{ self.bool_type, mant_is_zero, mantissa, zero });
+        const mant_nonzero = self.id();
+        try self.emit(&self.body, 171, &.{ self.bool_type, mant_nonzero, mantissa, zero });
+        const is_nan = self.id();
+        try self.emit(&self.body, 167, &.{ self.bool_type, is_nan, exp_is_255, mant_nonzero });
+        const quiet_bit = try self.andBits(try self.shiftRightBits(mantissa, 22), 1);
+        const is_qnan_bit = self.id();
+        try self.emit(&self.body, 171, &.{ self.bool_type, is_qnan_bit, quiet_bit, zero });
+        const is_qnan = self.id();
+        const is_snan = self.id();
+        try self.emit(&self.body, 167, &.{ self.bool_type, is_qnan, is_nan, is_qnan_bit });
+        const not_qnan = self.id();
+        try self.emit(&self.body, 168, &.{ self.bool_type, not_qnan, is_qnan_bit });
+        try self.emit(&self.body, 167, &.{ self.bool_type, is_snan, is_nan, not_qnan });
+        const is_inf = self.id();
+        try self.emit(&self.body, 167, &.{ self.bool_type, is_inf, exp_is_255, mant_is_zero });
+        const is_zero = self.id();
+        try self.emit(&self.body, 167, &.{ self.bool_type, is_zero, exp_is_zero, mant_is_zero });
+        const is_denorm = self.id();
+        try self.emit(&self.body, 167, &.{ self.bool_type, is_denorm, exp_is_zero, mant_nonzero });
+        const not_special_exp = self.id();
+        const not_zero_exp = self.id();
+        try self.emit(&self.body, 168, &.{ self.bool_type, not_special_exp, exp_is_255 });
+        try self.emit(&self.body, 168, &.{ self.bool_type, not_zero_exp, exp_is_zero });
+        const is_normal = self.id();
+        try self.emit(&self.body, 167, &.{ self.bool_type, is_normal, not_special_exp, not_zero_exp });
+        const is_neg = self.id();
+        try self.emit(&self.body, 171, &.{ self.bool_type, is_neg, sign, zero });
+        const is_pos = self.id();
+        try self.emit(&self.body, 168, &.{ self.bool_type, is_pos, is_neg });
+        const classes = [_]struct { cond: u32, bit: u32 }{
+            .{ .cond = is_snan, .bit = 0 },
+            .{ .cond = is_qnan, .bit = 1 },
+            .{ .cond = is_inf, .bit = 2 },
+            .{ .cond = is_normal, .bit = 3 },
+            .{ .cond = is_denorm, .bit = 4 },
+            .{ .cond = is_zero, .bit = 5 },
+            .{ .cond = is_zero, .bit = 6 },
+            .{ .cond = is_denorm, .bit = 7 },
+            .{ .cond = is_normal, .bit = 8 },
+            .{ .cond = is_inf, .bit = 9 },
+        };
+        var matched = try self.constant(.bits32, 0);
+        for (classes, 0..) |entry, index| {
+            const signed = index == 2 or index == 3 or index == 4 or index == 5;
+            const polarity = if (signed) is_neg else if (index >= 6) is_pos else try self.constantBool(true);
+            const kind = self.id();
+            try self.emit(&self.body, 167, &.{ self.bool_type, kind, entry.cond, polarity });
+            const bit = try self.andBits(try self.shiftRightBits(class_mask, entry.bit), 1);
+            const bit_set = self.id();
+            try self.emit(&self.body, 171, &.{ self.bool_type, bit_set, bit, zero });
+            const hit = self.id();
+            try self.emit(&self.body, 167, &.{ self.bool_type, hit, kind, bit_set });
+            const next = self.id();
+            try self.emit(&self.body, 169, &.{
+                self.bits_type,
+                next,
+                hit,
+                try self.constant(.bits32, 1),
+                matched,
+            });
+            matched = next;
+        }
+        const condition = self.id();
+        try self.emit(&self.body, 171, &.{ self.bool_type, condition, matched, zero });
+        try self.vectorConditionDestination(inst, condition);
+    }
+
+    fn constantBool(self: *Builder, value: bool) Error!u32 {
+        const result = self.id();
+        const zero = try self.constant(.bits32, 0);
+        try self.emit(&self.body, if (value) 170 else 171, &.{ self.bool_type, result, zero, zero });
+        return result;
+    }
+
+    const Cmp64 = enum { eq, ne, gt_u };
+
+    fn vectorComparison64(self: *Builder, inst: instruction.Instruction, kind: Cmp64) Error!void {
+        const a = try self.sourcePair(inst.src0);
+        const b = try self.sourcePair(inst.src1);
+        const lo_eq = self.id();
+        const hi_eq = self.id();
+        try self.emit(&self.body, 170, &.{ self.bool_type, lo_eq, a[0], b[0] });
+        try self.emit(&self.body, 170, &.{ self.bool_type, hi_eq, a[1], b[1] });
+        const equal = self.id();
+        try self.emit(&self.body, 167, &.{ self.bool_type, equal, lo_eq, hi_eq });
+        const condition = switch (kind) {
+            .eq => equal,
+            .ne => blk: {
+                const ne = self.id();
+                try self.emit(&self.body, 168, &.{ self.bool_type, ne, equal });
+                break :blk ne;
+            },
+            .gt_u => blk: {
+                const hi_gt = self.id();
+                try self.emit(&self.body, 172, &.{ self.bool_type, hi_gt, a[1], b[1] });
+                const lo_gt = self.id();
+                try self.emit(&self.body, 172, &.{ self.bool_type, lo_gt, a[0], b[0] });
+                const hi_eq_and_lo_gt = self.id();
+                try self.emit(&self.body, 167, &.{ self.bool_type, hi_eq_and_lo_gt, hi_eq, lo_gt });
+                const gt = self.id();
+                try self.emit(&self.body, 166, &.{ self.bool_type, gt, hi_gt, hi_eq_and_lo_gt });
+                break :blk gt;
+            },
+        };
+        try self.vectorConditionDestination(inst, condition);
+    }
+
+    fn bufferAtomicFloat(self: *Builder, inst: instruction.Instruction, is_min: bool) Error!void {
+        if (!try self.hasBufferStorage(inst)) {
+            if (inst.globally_coherent) {
+                try self.destination(inst.dst, .{
+                    .id = try self.constant(.bits32, 0),
+                    .value_type = .bits32,
+                });
+            }
+            return;
+        }
+        const value_bits = try self.source(inst.dst, .bits32);
+        const value = try self.convert(.{ .id = value_bits, .value_type = .bits32 }, .float32);
+        const pointer = try self.bufferWordPointer(try self.bufferAddress(inst), 0);
+        const scope = try self.constant(.bits32, 1);
+        const semantics = try self.constant(.bits32, 0);
+        const original = self.id();
+        try self.emit(&self.body, 227, &.{ self.bits_type, original, pointer, scope, semantics }); // OpAtomicLoad
+        const current = try self.convert(.{ .id = original, .value_type = .bits32 }, .float32);
+        const selected = try self.glslBinaryValue(if (is_min) 37 else 40, .float32, current, value);
+        const desired = try self.convert(.{ .id = selected, .value_type = .float32 }, .bits32);
+        try self.emit(&self.body, 228, &.{ pointer, scope, semantics, desired }); // OpAtomicStore
+        if (inst.globally_coherent) {
+            try self.destination(inst.dst, .{ .id = original, .value_type = .bits32 });
+        }
+        try self.emit(&self.body, 225, &.{
+            try self.constant(.bits32, 1),
+            try self.constant(.bits32, 0x48),
+        });
+    }
+
+    fn alignBit(self: *Builder, inst: instruction.Instruction, byte_shift: bool) Error!void {
+        const high = try self.source(inst.src0, .bits32);
+        const low = try self.source(inst.src1, .bits32);
+        var shift = try self.source(inst.src2, .bits32);
+        if (byte_shift) {
+            shift = try self.andBits(shift, 3);
+            const scaled = self.id();
+            try self.emit(&self.body, 196, &.{ self.bits_type, scaled, shift, try self.constant(.bits32, 3) });
+            shift = scaled;
+        } else {
+            shift = try self.andBits(shift, 31);
+        }
+        const low_part = self.id();
+        try self.emit(&self.body, 194, &.{ self.bits_type, low_part, low, shift });
+        const left_amount = self.id();
+        try self.emit(&self.body, 130, &.{ self.bits_type, left_amount, try self.constant(.bits32, 32), shift });
+        const high_part = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, high_part, high, left_amount });
+        const shifted = self.id();
+        try self.emit(&self.body, 197, &.{ self.bits_type, shifted, low_part, high_part });
+        const zero_shift = self.id();
+        try self.emit(&self.body, 170, &.{ self.bool_type, zero_shift, shift, try self.constant(.bits32, 0) });
+        const result = self.id();
+        try self.emit(&self.body, 169, &.{ self.bits_type, result, zero_shift, low, shifted });
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
+    fn minMax3Integer(self: *Builder, inst: instruction.Instruction, opcode: isa.Opcode) Error!void {
+        const signed = opcode == .v_min3_i32 or opcode == .v_max3_i32 or opcode == .v_med3_i32 or opcode == .v_med3_i16;
+        const ty: ValueType = if (signed) .sint32 else .bits32;
+        const min_op: u32 = if (signed) 39 else 38;
+        const max_op: u32 = if (signed) 42 else 41;
+        const a = try self.source(inst.src0, ty);
+        const b = try self.source(inst.src1, ty);
+        const c = try self.source(inst.src2, ty);
+        const result = switch (opcode) {
+            .v_min3_i32, .v_min3_u32 => try self.glslBinaryValue(min_op, ty, try self.glslBinaryValue(min_op, ty, a, b), c),
+            .v_max3_i32, .v_max3_u32 => try self.glslBinaryValue(max_op, ty, try self.glslBinaryValue(max_op, ty, a, b), c),
+            else => blk: {
+                const low = try self.glslBinaryValue(min_op, ty, a, b);
+                const high = try self.glslBinaryValue(max_op, ty, a, b);
+                const upper_low = try self.glslBinaryValue(min_op, ty, high, c);
+                break :blk try self.glslBinaryValue(max_op, ty, low, upper_low);
+            },
+        };
+        try self.destination(inst.dst, .{ .id = result, .value_type = ty });
+    }
+
+    fn packConvert(self: *Builder, inst: instruction.Instruction, kind: enum { u16, i16, unorm, snorm }) Error!void {
+        const a = try self.source(inst.src0, if (kind == .u16 or kind == .i16) .bits32 else .float32);
+        const b = try self.source(inst.src1, if (kind == .u16 or kind == .i16) .bits32 else .float32);
+        const lo: u32, const hi: u32 = switch (kind) {
+            .u16 => .{ a, b },
+            .i16 => .{ a, b },
+            .unorm => .{
+                try self.floatToUnorm16(a),
+                try self.floatToUnorm16(b),
+            },
+            .snorm => .{
+                try self.floatToSnorm16(a),
+                try self.floatToSnorm16(b),
+            },
+        };
+        try self.destination(inst.dst, .{ .id = try self.packU16Pair(lo, hi), .value_type = .bits32 });
+    }
+
+    fn floatToUnorm16(self: *Builder, value: u32) Error!u32 {
+        const clamped = try self.glslBinaryValue(40, .float32, value, try self.constant(.float32, 0));
+        const one = try self.constant(.float32, @bitCast(@as(f32, 1.0)));
+        const saturated = try self.glslBinaryValue(37, .float32, clamped, one);
+        const scaled = self.id();
+        try self.emit(&self.body, 133, &.{ self.float_type, scaled, saturated, try self.constant(.float32, @bitCast(@as(f32, 65535.0))) });
+        const rounded = try self.glslFloatUnaryValue(2, scaled);
+        const as_uint = self.id();
+        try self.emit(&self.body, 109, &.{ self.bits_type, as_uint, rounded });
+        return as_uint;
+    }
+
+    fn floatToSnorm16(self: *Builder, value: u32) Error!u32 {
+        const neg_one = try self.constant(.float32, @bitCast(@as(f32, -1.0)));
+        const one = try self.constant(.float32, @bitCast(@as(f32, 1.0)));
+        const low = try self.glslBinaryValue(40, .float32, value, neg_one);
+        const saturated = try self.glslBinaryValue(37, .float32, low, one);
+        const scaled = self.id();
+        try self.emit(&self.body, 133, &.{ self.float_type, scaled, saturated, try self.constant(.float32, @bitCast(@as(f32, 32767.0))) });
+        const rounded = try self.glslFloatUnaryValue(2, scaled);
+        const as_int = self.id();
+        try self.emit(&self.body, 110, &.{ self.signed_type, as_int, rounded });
+        return as_int;
+    }
+
+    fn packU8Float(self: *Builder, inst: instruction.Instruction) Error!void {
+        const value = try self.source(inst.src0, .float32);
+        const slot = try self.andBits(try self.source(inst.src1, .bits32), 3);
+        const current = try self.source(inst.dst, .bits32);
+        const unorm = try self.floatToUnorm16(value);
+        const byte = try self.andBits(unorm, 0xff);
+        const shift = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, shift, slot, try self.constant(.bits32, 3) });
+        const inserted = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, inserted, byte, shift });
+        const mask = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, mask, try self.constant(.bits32, 0xff), shift });
+        const inverse = self.id();
+        try self.emit(&self.body, 200, &.{ self.bits_type, inverse, mask });
+        const preserved = self.id();
+        try self.emit(&self.body, 199, &.{ self.bits_type, preserved, current, inverse });
+        const result = self.id();
+        try self.emit(&self.body, 197, &.{ self.bits_type, result, preserved, inserted });
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
+    fn convertHalfInteger(self: *Builder, inst: instruction.Instruction, to_float: bool, signed: bool) Error!void {
+        if (to_float) {
+            var bits = try self.halfU16(try self.source(inst.src0, .bits32), false);
+            if (signed) bits = try self.signExtend16(bits);
+            const converted = self.id();
+            try self.emit(&self.body, if (signed) 111 else 112, &.{ self.float_type, converted, bits });
+            try self.destination(inst.dst, .{ .id = try self.packF16Low(converted), .value_type = .bits32 });
+        } else {
+            const value = try self.unpackF16Low(try self.source(inst.src0, .bits32));
+            const converted = self.id();
+            try self.emit(&self.body, if (signed) 110 else 109, &.{ self.typeId(if (signed) .sint32 else .bits32), converted, value });
+            try self.destination(inst.dst, .{ .id = converted, .value_type = if (signed) .sint32 else .bits32 });
+        }
+    }
+
+    fn roundToSigned(self: *Builder, inst: instruction.Instruction) Error!void {
+        const value = try self.source(inst.src0, .float32);
+        const rounded = try self.glslFloatUnaryValue(2, value);
+        const result = self.id();
+        try self.emit(&self.body, 110, &.{ self.signed_type, result, rounded });
+        try self.destination(inst.dst, .{ .id = result, .value_type = .sint32 });
+    }
+
+    fn frexpMantissa(self: *Builder, inst: instruction.Instruction) Error!void {
+        const value = try self.source(inst.src0, .float32);
+        const abs = try self.glslFloatUnaryValue(4, value);
+        const log2 = try self.glslFloatUnaryValue(30, abs);
+        const exponent = try self.glslFloatUnaryValue(8, log2);
+        const scale = try self.glslFloatUnaryValue(29, exponent);
+        const mantissa = self.id();
+        try self.emit(&self.body, 136, &.{ self.float_type, mantissa, value, scale });
+        const zero = try self.constant(.float32, 0);
+        const is_zero = self.id();
+        try self.emit(&self.body, 180, &.{ self.bool_type, is_zero, value, zero });
+        const result = self.id();
+        try self.emit(&self.body, 169, &.{ self.float_type, result, is_zero, zero, mantissa });
+        try self.destination(inst.dst, .{ .id = result, .value_type = .float32 });
+    }
+
+    fn frexpExponent(self: *Builder, inst: instruction.Instruction) Error!void {
+        const value = try self.source(inst.src0, .float32);
+        const abs = try self.glslFloatUnaryValue(4, value);
+        const log2 = try self.glslFloatUnaryValue(30, abs);
+        const exponent = try self.glslFloatUnaryValue(8, log2);
+        const plus_one = self.id();
+        try self.emit(&self.body, 129, &.{ self.float_type, plus_one, exponent, try self.constant(.float32, @bitCast(@as(f32, 1.0))) });
+        const as_int = self.id();
+        try self.emit(&self.body, 110, &.{ self.signed_type, as_int, plus_one });
+        const zero = try self.constant(.float32, 0);
+        const is_zero = self.id();
+        try self.emit(&self.body, 180, &.{ self.bool_type, is_zero, value, zero });
+        const result = self.id();
+        try self.emit(&self.body, 169, &.{ self.signed_type, result, is_zero, try self.constant(.sint32, 0), as_int });
+        try self.destination(inst.dst, .{ .id = result, .value_type = .sint32 });
+    }
+
+    fn dot2PackedF16(self: *Builder, inst: instruction.Instruction) Error!void {
+        const a = try self.unpackF16Pair(try self.source(inst.src0, .bits32));
+        const b = try self.unpackF16Pair(try self.source(inst.src1, .bits32));
+        const acc = try self.source(inst.dst, .float32);
+        const p0 = self.id();
+        const p1 = self.id();
+        try self.emit(&self.body, 133, &.{ self.float_type, p0, a[0], b[0] });
+        try self.emit(&self.body, 133, &.{ self.float_type, p1, a[1], b[1] });
+        const sum = self.id();
+        try self.emit(&self.body, 129, &.{ self.float_type, sum, p0, p1 });
+        const result = self.id();
+        try self.emit(&self.body, 129, &.{ self.float_type, result, sum, acc });
+        try self.destination(inst.dst, .{ .id = result, .value_type = .float32 });
+    }
+
+    fn shift64(self: *Builder, inst: instruction.Instruction, arithmetic: bool) Error!void {
+        const value = try self.sourcePair(inst.src1);
+        const amount = try self.andBits(try self.source(inst.src0, .bits32), 63);
+        const low = self.id();
+        try self.emit(&self.body, 194, &.{ self.bits_type, low, value[0], amount });
+        const high_shift = self.id();
+        try self.emit(&self.body, if (arithmetic) @as(u16, 195) else 194, &.{
+            if (arithmetic) self.signed_type else self.bits_type,
+            high_shift,
+            value[1],
+            amount,
+        });
+        const cross_amount = self.id();
+        try self.emit(&self.body, 130, &.{ self.bits_type, cross_amount, try self.constant(.bits32, 32), amount });
+        const cross = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, cross, value[1], cross_amount });
+        const combined_low = self.id();
+        try self.emit(&self.body, 197, &.{ self.bits_type, combined_low, low, cross });
+        const ge_32 = self.id();
+        try self.emit(&self.body, 174, &.{ self.bool_type, ge_32, amount, try self.constant(.bits32, 32) });
+        const low_result = self.id();
+        try self.emit(&self.body, 169, &.{ self.bits_type, low_result, ge_32, high_shift, combined_low });
+        const zero = try self.constant(.bits32, 0);
+        const high_result = self.id();
+        try self.emit(&self.body, 169, &.{ self.bits_type, high_result, ge_32, zero, high_shift });
+        try self.destinationPair(inst.dst, .{ low_result, high_result });
+    }
+
+    fn shiftLeft64Vector(self: *Builder, inst: instruction.Instruction) Error!void {
+        const value = try self.sourcePair(inst.src1);
+        const amount = try self.andBits(try self.source(inst.src0, .bits32), 63);
+        const high = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, high, value[1], amount });
+        const low = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, low, value[0], amount });
+        const cross_amount = self.id();
+        try self.emit(&self.body, 130, &.{ self.bits_type, cross_amount, try self.constant(.bits32, 32), amount });
+        const cross = self.id();
+        try self.emit(&self.body, 194, &.{ self.bits_type, cross, value[0], cross_amount });
+        const combined_high = self.id();
+        try self.emit(&self.body, 197, &.{ self.bits_type, combined_high, high, cross });
+        const ge_32 = self.id();
+        try self.emit(&self.body, 174, &.{ self.bool_type, ge_32, amount, try self.constant(.bits32, 32) });
+        const high_result = self.id();
+        try self.emit(&self.body, 169, &.{ self.bits_type, high_result, ge_32, low, combined_high });
+        const zero = try self.constant(.bits32, 0);
+        const low_result = self.id();
+        try self.emit(&self.body, 169, &.{ self.bits_type, low_result, ge_32, zero, low });
+        try self.destinationPair(inst.dst, .{ low_result, high_result });
+    }
+
+    fn mad24(self: *Builder, inst: instruction.Instruction, signed: bool) Error!void {
+        var a = try self.source(inst.src0, if (signed) .sint32 else .bits32);
+        var b = try self.source(inst.src1, if (signed) .sint32 else .bits32);
+        const c = try self.source(inst.src2, if (signed) .sint32 else .bits32);
+        if (signed) {
+            const shift = try self.constant(.bits32, 8);
+            const a_shifted = self.id();
+            try self.emit(&self.body, 196, &.{ self.signed_type, a_shifted, a, shift });
+            a = self.id();
+            try self.emit(&self.body, 195, &.{ self.signed_type, a, a_shifted, shift });
+            const b_shifted = self.id();
+            try self.emit(&self.body, 196, &.{ self.signed_type, b_shifted, b, shift });
+            b = self.id();
+            try self.emit(&self.body, 195, &.{ self.signed_type, b, b_shifted, shift });
+        } else {
+            a = try self.andBits(a, 0x00ff_ffff);
+            b = try self.andBits(b, 0x00ff_ffff);
+        }
+        const ty: ValueType = if (signed) .sint32 else .bits32;
+        const product_id = self.id();
+        try self.emit(&self.body, 132, &.{ self.typeId(ty), product_id, a, b });
+        const result = self.id();
+        try self.emit(&self.body, 128, &.{ self.typeId(ty), result, product_id, c });
+        try self.destination(inst.dst, .{ .id = result, .value_type = ty });
+    }
+
+    fn madU64U32(self: *Builder, inst: instruction.Instruction) Error!void {
+        const a = try self.source(inst.src0, .bits32);
+        const b = try self.source(inst.src1, .bits32);
+        const add_low = try self.source(inst.src2, .bits32);
+        const add_high = try self.source(try consecutiveRegister(inst.src2, 1), .bits32);
+        const low_product = try self.multiplyBits(a, b);
+        const high_product = try self.multiplyHighUnsignedBits(a, b);
+        const low = try self.addBits(low_product, add_low);
+        const carry = self.id();
+        try self.emit(&self.body, 176, &.{ self.bool_type, carry, low, low_product });
+        const carry_bits = self.id();
+        try self.emit(&self.body, 169, &.{
+            self.bits_type,
+            carry_bits,
+            carry,
+            try self.constant(.bits32, 1),
+            try self.constant(.bits32, 0),
+        });
+        const high = try self.addBits(try self.addBits(high_product, add_high), carry_bits);
+        try self.destinationPair(inst.dst, .{ low, high });
+    }
+
+    fn vectorSubBorrow(self: *Builder, inst: instruction.Instruction) Error!void {
+        var first = inst.src0;
+        var second = inst.src1;
+        first.absolute = false;
+        first.negate = false;
+        second.absolute = false;
+        second.negate = false;
+        const a = try self.source(first, .bits32);
+        const b = try self.source(second, .bits32);
+        const borrow_source = if (inst.src2.kind == .unknown)
+            try self.source(.{ .kind = .vcc_lo }, .bits32)
+        else
+            try self.source(inst.src2, .bits32);
+        const borrow = try self.andBits(borrow_source, 1);
+        const partial = self.id();
+        try self.emit(&self.body, 130, &.{ self.bits_type, partial, b, a });
+        const partial_borrow = self.id();
+        try self.emit(&self.body, 176, &.{ self.bool_type, partial_borrow, b, a });
+        const result = self.id();
+        try self.emit(&self.body, 130, &.{ self.bits_type, result, partial, borrow });
+        const extra_borrow = self.id();
+        try self.emit(&self.body, 176, &.{ self.bool_type, extra_borrow, partial, borrow });
+        const borrow_out = self.id();
+        try self.emit(&self.body, 166, &.{ self.bool_type, borrow_out, partial_borrow, extra_borrow });
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+        var carry_inst = inst;
+        carry_inst.dst = inst.dst2;
+        try self.vectorConditionDestination(carry_inst, borrow_out);
+    }
+
+    fn xnor32(self: *Builder, inst: instruction.Instruction) Error!void {
+        const a = try self.source(inst.src0, .bits32);
+        const b = try self.source(inst.src1, .bits32);
+        const xored = self.id();
+        try self.emit(&self.body, 198, &.{ self.bits_type, xored, a, b });
+        const result = self.id();
+        try self.emit(&self.body, 200, &.{ self.bits_type, result, xored });
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
+    fn scalarPopCount(self: *Builder, inst: instruction.Instruction) Error!void {
+        const bits = try self.source(inst.src0, .bits32);
+        const result = self.id();
+        try self.emit(&self.body, 205, &.{ self.bits_type, result, bits });
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
+    fn bitSet(self: *Builder, inst: instruction.Instruction, set: bool) Error!void {
+        const bit = try self.andBits(try self.source(inst.src0, .bits32), 31);
+        const one = try self.constant(.bits32, 1);
+        const mask = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, mask, one, bit });
+        const current = try self.source(inst.dst, .bits32);
+        const result = self.id();
+        if (set) {
+            try self.emit(&self.body, 197, &.{ self.bits_type, result, current, mask });
+        } else {
+            const inverse = self.id();
+            try self.emit(&self.body, 200, &.{ self.bits_type, inverse, mask });
+            try self.emit(&self.body, 199, &.{ self.bits_type, result, current, inverse });
+        }
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
+    fn bitReplicate(self: *Builder, inst: instruction.Instruction) Error!void {
+        const bits = try self.source(inst.src0, .bits32);
+        var low = try self.constant(.bits32, 0);
+        var high = try self.constant(.bits32, 0);
+        var index: u32 = 0;
+        while (index < 32) : (index += 1) {
+            const bit = try self.andBits(try self.shiftRightBits(bits, index), 1);
+            const pair = self.id();
+            try self.emit(&self.body, 132, &.{ self.bits_type, pair, bit, try self.constant(.bits32, 3) });
+            const shifted = self.id();
+            const dest_shift = (index % 16) * 2;
+            try self.emit(&self.body, 196, &.{ self.bits_type, shifted, pair, try self.constant(.bits32, dest_shift) });
+            if (index < 16) {
+                const next = self.id();
+                try self.emit(&self.body, 197, &.{ self.bits_type, next, low, shifted });
+                low = next;
+            } else {
+                const next = self.id();
+                try self.emit(&self.body, 197, &.{ self.bits_type, next, high, shifted });
+                high = next;
+            }
+        }
+        try self.destinationPair(inst.dst, .{ low, high });
+    }
+
+    fn scalarCompare64(self: *Builder, inst: instruction.Instruction, equal: bool) Error!void {
+        const a = try self.sourcePair(inst.src0);
+        const b = try self.sourcePair(inst.src1);
+        const lo = self.id();
+        const hi = self.id();
+        try self.emit(&self.body, 170, &.{ self.bool_type, lo, a[0], b[0] });
+        try self.emit(&self.body, 170, &.{ self.bool_type, hi, a[1], b[1] });
+        const both = self.id();
+        try self.emit(&self.body, 167, &.{ self.bool_type, both, lo, hi });
+        if (equal) {
+            self.scc = both;
+        } else {
+            const ne = self.id();
+            try self.emit(&self.body, 168, &.{ self.bool_type, ne, both });
+            self.scc = ne;
+        }
+    }
+
+    fn dsSwizzle(self: *Builder, inst: instruction.Instruction) Error!void {
+        const value = try self.source(inst.src0, .bits32);
+        const pattern: u32 = @bitCast(inst.memory_offset);
+        if (pattern & 0x8000 != 0) {
+            try self.destination(inst.dst, .{ .id = value, .value_type = .bits32 });
+            return;
+        }
+        const lane = try self.currentLaneId();
+        const and_mask = try self.constant(.bits32, (pattern >> 10) & 0x1f);
+        const or_mask = try self.constant(.bits32, (pattern >> 5) & 0x1f);
+        const xor_mask = try self.constant(.bits32, pattern & 0x1f);
+        const masked = self.id();
+        try self.emit(&self.body, 199, &.{ self.bits_type, masked, lane, and_mask });
+        const ored = self.id();
+        try self.emit(&self.body, 197, &.{ self.bits_type, ored, masked, or_mask });
+        const dest_lane = self.id();
+        try self.emit(&self.body, 198, &.{ self.bits_type, dest_lane, ored, xor_mask });
+        const result = self.id();
+        try self.emit(&self.body, 345, &.{
+            self.bits_type,
+            result,
+            try self.constant(.bits32, 3),
+            value,
+            dest_lane,
+        });
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
+    fn imageGetResinfo(self: *Builder, inst: instruction.Instruction) Error!void {
+        self.uses_image_query = true;
+        if (inst.src1.kind != .sgpr or inst.data_mask == 0) return Error.UnsupportedOpcode;
+        const lod = if (inst.src0.kind == .vgpr)
+            try self.source(try imageAddressOperand(inst, 0), .bits32)
+        else
+            try self.constant(.bits32, 0);
+
+        var width = try self.constant(.bits32, 1);
+        var height = try self.constant(.bits32, 1);
+        var depth = try self.constant(.bits32, 1);
+        var levels = try self.constant(.bits32, 1);
+
+        if (inst.src2.kind == .sgpr) {
+            if (self.sampledImageBinding(inst.src1.reg, inst.src2.reg, inst.pc)) |binding| {
+                const dim = sampledImageDimensionIndex(binding.dimension);
+                if (self.sampled_image_arrays[dim] != 0 and self.sampled_image_image_types[dim] != 0) {
+                    const pointer = self.id();
+                    try self.emit(&self.body, 65, &.{
+                        self.sampled_image_pointer_types[dim],
+                        pointer,
+                        self.sampled_image_arrays[dim],
+                        try self.constant(.bits32, binding.descriptor_index),
+                    });
+                    const sampled = self.id();
+                    try self.emit(&self.body, 61, &.{ self.sampled_image_types[dim], sampled, pointer });
+                    const image = self.id();
+                    try self.emit(&self.body, 100, &.{ self.sampled_image_image_types[dim], image, sampled });
+                    const size_type: u32 = if (binding.dimension == .two_d)
+                        try self.ensureBitsVec2()
+                    else
+                        self.vector3_bits_type;
+                    if (size_type != 0) {
+                        const size = self.id();
+                        try self.emit(&self.body, 107, &.{ size_type, size, image, lod });
+                        width = self.id();
+                        try self.emit(&self.body, 81, &.{ self.bits_type, width, size, 0 });
+                        height = self.id();
+                        try self.emit(&self.body, 81, &.{ self.bits_type, height, size, 1 });
+                        if (binding.dimension != .two_d and self.vector3_bits_type != 0) {
+                            depth = self.id();
+                            try self.emit(&self.body, 81, &.{ self.bits_type, depth, size, 2 });
+                        }
+                    }
+                    levels = self.id();
+                    try self.emit(&self.body, 106, &.{ self.bits_type, levels, image });
+                }
+            }
+        } else if (self.storageImageBinding(inst.src1.reg, inst.pc)) |binding| {
+            const image = try self.loadStorageImage(binding);
+            const size_type: u32 = if (binding.dimension == .two_d)
+                try self.ensureBitsVec2()
+            else
+                self.vector3_bits_type;
+            if (size_type != 0) {
+                const size = self.id();
+                try self.emit(&self.body, 104, &.{ size_type, size, image });
+                width = self.id();
+                try self.emit(&self.body, 81, &.{ self.bits_type, width, size, 0 });
+                height = self.id();
+                try self.emit(&self.body, 81, &.{ self.bits_type, height, size, 1 });
+                if (binding.dimension == .three_d and self.vector3_bits_type != 0) {
+                    depth = self.id();
+                    try self.emit(&self.body, 81, &.{ self.bits_type, depth, size, 2 });
+                }
+            }
+        }
+
+        const components = [_]u32{ width, height, depth, levels };
+        var destination_index: u32 = 0;
+        for (components, 0..) |value, component| {
+            const bit = @as(u4, 1) << @intCast(component);
+            if (inst.data_mask & bit == 0) continue;
+            try self.destination(
+                try consecutiveRegister(inst.dst, destination_index),
+                .{ .id = value, .value_type = .bits32 },
+            );
+            destination_index += 1;
+        }
+    }
+
+    fn imageGetLod(self: *Builder, inst: instruction.Instruction) Error!void {
+        self.uses_image_query = true;
+        if (self.stage != .fragment or inst.src0.kind != .vgpr or inst.src1.kind != .sgpr or
+            inst.src2.kind != .sgpr or inst.data_mask == 0)
+        {
+            var destination_index: u32 = 0;
+            for (0..4) |component| {
+                const bit = @as(u4, 1) << @intCast(component);
+                if (inst.data_mask & bit == 0) continue;
+                try self.destination(
+                    try consecutiveRegister(inst.dst, destination_index),
+                    .{ .id = try self.constant(.float32, 0), .value_type = .float32 },
+                );
+                destination_index += 1;
+            }
+            return;
+        }
+        const binding = self.sampledImageBinding(inst.src1.reg, inst.src2.reg, inst.pc) orelse {
+            return Error.InvalidStorageBinding;
+        };
+        const dim = sampledImageDimensionIndex(binding.dimension);
+        const x = try self.source(try imageAddressOperand(inst, 0), .float32);
+        const y = try self.source(try imageAddressOperand(inst, 1), .float32);
+        const coordinates = self.id();
+        if (binding.dimension == .two_d) {
+            try self.emit(&self.body, 80, &.{ try self.ensureFloatVec2(), coordinates, x, y });
+        } else {
+            if (self.vector3_type == 0) {
+                var destination_index: u32 = 0;
+                for (0..2) |component| {
+                    const bit = @as(u4, 1) << @intCast(component);
+                    if (inst.data_mask & bit == 0) continue;
+                    try self.destination(
+                        try consecutiveRegister(inst.dst, destination_index),
+                        .{ .id = try self.constant(.float32, 0), .value_type = .float32 },
+                    );
+                    destination_index += 1;
+                }
+                return;
+            }
+            const z = try self.source(try imageAddressOperand(inst, 2), .float32);
+            try self.emit(&self.body, 80, &.{ self.vector3_type, coordinates, x, y, z });
+        }
+        const pointer = self.id();
+        try self.emit(&self.body, 65, &.{
+            self.sampled_image_pointer_types[dim],
+            pointer,
+            self.sampled_image_arrays[dim],
+            try self.constant(.bits32, binding.descriptor_index),
+        });
+        const sampled = self.id();
+        try self.emit(&self.body, 61, &.{ self.sampled_image_types[dim], sampled, pointer });
+        const lod = self.id();
+        try self.emit(&self.body, 103, &.{ try self.ensureFloatVec2(), lod, sampled, coordinates });
+        var destination_index: u32 = 0;
+        for (0..2) |component| {
+            const bit = @as(u4, 1) << @intCast(component);
+            if (inst.data_mask & bit == 0) continue;
+            const value = self.id();
+            try self.emit(&self.body, 81, &.{ self.float_type, value, lod, @intCast(component) });
+            try self.destination(
+                try consecutiveRegister(inst.dst, destination_index),
+                .{ .id = value, .value_type = .float32 },
+            );
+            destination_index += 1;
+        }
     }
 
     fn not64(self: *Builder, inst: instruction.Instruction) Error!void {
@@ -2781,9 +4155,9 @@ const Builder = struct {
 
     fn imageLoad(self: *Builder, inst: instruction.Instruction) Error!void {
         if (self.stage != .compute) return self.sampledImageFetch(inst);
-        if (inst.opcode_id != 0 or
+        if ((inst.opcode_id != 0 and inst.opcode_id != 1) or
             (inst.image_dimension != .dim_2d and inst.image_dimension != .dim_3d) or
-            (inst.image_address_components != 2 and inst.image_address_components != 3) or
+            (inst.image_address_components < 2 or inst.image_address_components > 4) or
             inst.data_mask == 0 or
             inst.src0.kind != .vgpr or inst.src1.kind != .sgpr)
         {
@@ -2828,7 +4202,7 @@ const Builder = struct {
 
     fn imageStore(self: *Builder, inst: instruction.Instruction) Error!void {
         if (self.stage != .compute or
-            inst.opcode_id != 8 or
+            (inst.opcode_id != 8 and inst.opcode_id != 9) or
             (inst.image_dimension != .dim_2d and inst.image_dimension != .dim_3d and
                 inst.image_dimension != .dim_2d_array_alt) or
             (inst.image_address_components != 2 and inst.image_address_components != 3) or
@@ -3002,19 +4376,22 @@ const Builder = struct {
     }
 
     fn sampleImage(self: *Builder, inst: instruction.Instruction) Error!void {
-        // Opcode 0x20 is IMAGE_SAMPLE; 0x21/0x22/0x23 add clamp or explicit
-        // derivatives. Screen-space implicit LOD is a correct host fallback
-        // for those extra operands. 0x2f is IMAGE_SAMPLE_C_LZ: ignore the
-        // depth-compare and sample mip 0 so the shader still translates.
+        // Opcode 0x20 is IMAGE_SAMPLE. 0x22 is IMAGE_SAMPLE_D: explicit
+        // derivatives from VGPRs, lowered with SPIR-V Grad. 1D samples a
+        // height-1 2D view so the host descriptor set stays 2D-only.
+        const explicit_grad = inst.image_sample_flags.derivative;
         const implicit_lod = !inst.image_sample_flags.lod and
             !inst.image_sample_flags.bias and
-            !inst.image_sample_flags.level_zero;
+            !inst.image_sample_flags.level_zero and
+            !explicit_grad;
         const level_zero = inst.image_sample_flags.level_zero and !inst.image_sample_flags.offset;
         const level_zero_offset = inst.image_sample_flags.level_zero and inst.image_sample_flags.offset;
         const explicit_lod = inst.image_sample_flags.lod;
         const biased_lod = inst.image_sample_flags.bias;
+        const compare = inst.image_sample_flags.compare;
+        const one_dimensional = inst.image_dimension == .dim_1d;
         const requested_dimension: SampledImageDimension = switch (inst.image_dimension) {
-            .dim_2d => .two_d,
+            .dim_1d, .dim_2d => .two_d,
             .dim_3d => .three_d,
             // GFX10 DIM=3 is Cube. The historical enum name predates the
             // sampled-image implementation and is retained for ABI stability.
@@ -3034,30 +4411,43 @@ const Builder = struct {
         else
             requested_dimension;
         const dimension_index = sampledImageDimensionIndex(image_dimension);
-        const coordinate_components: u8 = if (image_dimension == .two_d) 2 else 3;
+        const coordinate_components: u8 = if (one_dimensional) 1 else if (image_dimension == .two_d) 2 else 3;
+        const gradient_components: u8 = if (!explicit_grad) 0 else switch (inst.image_dimension) {
+            .dim_1d, .dim_1d_array => 2,
+            .dim_3d => 6,
+            else => 4,
+        };
+        const extra_components: u8 = @intFromBool(inst.image_sample_flags.offset) +
+            @intFromBool(compare) +
+            @intFromBool(explicit_lod or biased_lod) +
+            gradient_components;
         if ((self.stage != .vertex and self.stage != .fragment and self.stage != .compute) or
             self.sampled_image_arrays[dimension_index] == 0 or
-            (!implicit_lod and !level_zero and !level_zero_offset and !explicit_lod and !biased_lod) or
+            (!implicit_lod and !level_zero and !level_zero_offset and !explicit_lod and !biased_lod and !explicit_grad) or
             ((self.stage == .vertex or self.stage == .compute) and
-                !level_zero and !level_zero_offset and !explicit_lod) or
-            inst.image_address_components != coordinate_components +
-                @as(u8, @intFromBool(level_zero_offset or explicit_lod or biased_lod)) or
+                !level_zero and !level_zero_offset and !explicit_lod and !explicit_grad) or
+            inst.image_address_components != coordinate_components + extra_components or
             inst.data_mask == 0)
         {
             return Error.UnsupportedOpcode;
         }
         if (binding.dimension != image_dimension) return Error.InvalidStorageBinding;
         // Coordinates now come from the real VS PARAM -> PS VINTRP interface.
-        const coordinate_base: u32 = @intFromBool(level_zero_offset);
+        const coordinate_base: u32 = @intFromBool(inst.image_sample_flags.offset);
         const raw_x = try self.source(try imageAddressOperand(inst, coordinate_base), .float32);
-        const raw_y = try self.source(try imageAddressOperand(inst, coordinate_base + 1), .float32);
-        const coordinate_x, const coordinate_y = try self.sampleCoordinates(raw_x, raw_y);
         const coordinates = self.id();
-        if (image_dimension != .two_d) {
-            const coordinate_z = try self.source(try imageAddressOperand(inst, coordinate_base + 2), .float32);
-            try self.emit(&self.body, 80, &.{ self.vector3_type, coordinates, coordinate_x, coordinate_y, coordinate_z });
+        if (one_dimensional) {
+            const coordinate_y = try self.constant(.float32, @bitCast(@as(f32, 0.5)));
+            try self.emit(&self.body, 80, &.{ self.vector2_type, coordinates, raw_x, coordinate_y });
         } else {
-            try self.emit(&self.body, 80, &.{ self.vector2_type, coordinates, coordinate_x, coordinate_y });
+            const raw_y = try self.source(try imageAddressOperand(inst, coordinate_base + 1), .float32);
+            const coordinate_x, const coordinate_y = try self.sampleCoordinates(raw_x, raw_y);
+            if (image_dimension != .two_d) {
+                const coordinate_z = try self.source(try imageAddressOperand(inst, coordinate_base + 2), .float32);
+                try self.emit(&self.body, 80, &.{ self.vector3_type, coordinates, coordinate_x, coordinate_y, coordinate_z });
+            } else {
+                try self.emit(&self.body, 80, &.{ self.vector2_type, coordinates, coordinate_x, coordinate_y });
+            }
         }
         const pointer = self.id();
         try self.emit(&self.body, 65, &.{
@@ -3068,16 +4458,101 @@ const Builder = struct {
         });
         const sampled_image = self.id();
         try self.emit(&self.body, 61, &.{ self.sampled_image_types[dimension_index], sampled_image, pointer });
+        const gradient_base = coordinate_base + coordinate_components;
+        const dref_index = gradient_base + gradient_components;
+        const lod_index = dref_index + @intFromBool(compare);
         const sampled = self.id();
-        if (level_zero_offset) {
+        if (compare) {
+            const dref = try self.source(try imageAddressOperand(inst, dref_index), .float32);
+            if (level_zero or explicit_lod or inst.image_sample_flags.offset) {
+                const lod = if (explicit_lod)
+                    try self.source(try imageAddressOperand(inst, lod_index), .float32)
+                else
+                    try self.constant(.float32, @bitCast(@as(f32, 0)));
+                if (inst.image_sample_flags.offset) {
+                    const offset = try self.imageTexelOffset(inst);
+                    try self.emit(&self.body, 90, &.{
+                        self.float_type,
+                        sampled,
+                        sampled_image,
+                        coordinates,
+                        dref,
+                        0x12,
+                        lod,
+                        offset,
+                    }); // OpImageSampleDrefExplicitLod
+                } else {
+                    try self.emit(&self.body, 90, &.{
+                        self.float_type,
+                        sampled,
+                        sampled_image,
+                        coordinates,
+                        dref,
+                        0x2,
+                        lod,
+                    }); // OpImageSampleDrefExplicitLod
+                }
+            } else if (biased_lod) {
+                const bias = try self.source(try imageAddressOperand(inst, lod_index), .float32);
+                try self.emit(&self.body, 89, &.{
+                    self.float_type,
+                    sampled,
+                    sampled_image,
+                    coordinates,
+                    dref,
+                    0x1,
+                    bias,
+                }); // OpImageSampleDrefImplicitLod
+            } else if (explicit_grad) {
+                const dx, const dy = try self.sampleExplicitGradients(inst, image_dimension, one_dimensional, gradient_base);
+                try self.emit(&self.body, 90, &.{
+                    self.float_type,
+                    sampled,
+                    sampled_image,
+                    coordinates,
+                    dref,
+                    0x4, // ImageOperands Grad
+                    dx,
+                    dy,
+                }); // OpImageSampleDrefExplicitLod
+            } else {
+                try self.emit(&self.body, 89, &.{
+                    self.float_type,
+                    sampled,
+                    sampled_image,
+                    coordinates,
+                    dref,
+                }); // OpImageSampleDrefImplicitLod
+            }
+            var destination_index: u32 = 0;
+            for (0..4) |component| {
+                const bit = @as(u4, 1) << @intCast(component);
+                if (inst.data_mask & bit == 0) continue;
+                const value = if (destination_index == 0)
+                    sampled
+                else
+                    try self.constant(.float32, 0);
+                try self.destination(
+                    try consecutiveRegister(inst.dst, destination_index),
+                    .{ .id = value, .value_type = .float32 },
+                );
+                destination_index += 1;
+            }
+            return;
+        }
+        if (level_zero_offset or (inst.image_sample_flags.offset and (level_zero or explicit_lod))) {
             const offset = try self.imageTexelOffset(inst);
+            const lod = if (explicit_lod)
+                try self.source(try imageAddressOperand(inst, lod_index), .float32)
+            else
+                try self.constant(.float32, @bitCast(@as(f32, 0)));
             try self.emit(&self.body, 88, &.{
                 self.vector4_type,
                 sampled,
                 sampled_image,
                 coordinates,
                 0x12, // ImageOperands Lod | Offset
-                try self.constant(.float32, @bitCast(@as(f32, 0))),
+                lod,
                 offset,
             }); // OpImageSampleExplicitLod
         } else if (level_zero or explicit_lod) {
@@ -3085,7 +4560,7 @@ const Builder = struct {
             // image_sample_lz names mip zero explicitly, which maps directly to
             // an explicit SPIR-V Lod operand and is valid in every shader stage.
             const lod = if (explicit_lod)
-                try self.source(try imageAddressOperand(inst, coordinate_components), .float32)
+                try self.source(try imageAddressOperand(inst, lod_index), .float32)
             else
                 try self.constant(.float32, @bitCast(@as(f32, 0)));
             try self.emit(&self.body, 88, &.{
@@ -3097,7 +4572,7 @@ const Builder = struct {
                 lod,
             }); // OpImageSampleExplicitLod
         } else if (biased_lod) {
-            const bias = try self.source(try imageAddressOperand(inst, coordinate_components), .float32);
+            const bias = try self.source(try imageAddressOperand(inst, lod_index), .float32);
             try self.emit(&self.body, 87, &.{
                 self.vector4_type,
                 sampled,
@@ -3105,6 +4580,41 @@ const Builder = struct {
                 coordinates,
                 0x1, // ImageOperands Bias
                 bias,
+            }); // OpImageSampleImplicitLod
+        } else if (explicit_grad) {
+            const dx, const dy = try self.sampleExplicitGradients(inst, image_dimension, one_dimensional, gradient_base);
+            if (inst.image_sample_flags.offset) {
+                const offset = try self.imageTexelOffset(inst);
+                try self.emit(&self.body, 88, &.{
+                    self.vector4_type,
+                    sampled,
+                    sampled_image,
+                    coordinates,
+                    0x14, // ImageOperands Grad | Offset
+                    dx,
+                    dy,
+                    offset,
+                }); // OpImageSampleExplicitLod
+            } else {
+                try self.emit(&self.body, 88, &.{
+                    self.vector4_type,
+                    sampled,
+                    sampled_image,
+                    coordinates,
+                    0x4, // ImageOperands Grad
+                    dx,
+                    dy,
+                }); // OpImageSampleExplicitLod
+            }
+        } else if (inst.image_sample_flags.offset) {
+            const offset = try self.imageTexelOffset(inst);
+            try self.emit(&self.body, 87, &.{
+                self.vector4_type,
+                sampled,
+                sampled_image,
+                coordinates,
+                0x10, // ImageOperands Offset
+                offset,
             }); // OpImageSampleImplicitLod
         } else {
             try self.emit(&self.body, 87, &.{ self.vector4_type, sampled, sampled_image, coordinates }); // OpImageSampleImplicitLod
@@ -3122,6 +4632,52 @@ const Builder = struct {
             );
             destination_index += 1;
         }
+    }
+
+    fn sampleExplicitGradients(
+        self: *Builder,
+        inst: instruction.Instruction,
+        image_dimension: SampledImageDimension,
+        one_dimensional: bool,
+        gradient_base: u32,
+    ) Error![2]u32 {
+        const zero = try self.constant(.float32, @bitCast(@as(f32, 0)));
+        if (one_dimensional) {
+            const dudx = try self.source(try imageAddressOperand(inst, gradient_base), .float32);
+            const dudy = try self.source(try imageAddressOperand(inst, gradient_base + 1), .float32);
+            const dx = self.id();
+            const dy = self.id();
+            try self.emit(&self.body, 80, &.{ self.vector2_type, dx, dudx, zero });
+            try self.emit(&self.body, 80, &.{ self.vector2_type, dy, dudy, zero });
+            return .{ dx, dy };
+        }
+        const dudx = try self.source(try imageAddressOperand(inst, gradient_base), .float32);
+        const dvdx = try self.source(try imageAddressOperand(inst, gradient_base + 1), .float32);
+        if (image_dimension == .three_d) {
+            const dwdx = try self.source(try imageAddressOperand(inst, gradient_base + 2), .float32);
+            const dudy = try self.source(try imageAddressOperand(inst, gradient_base + 3), .float32);
+            const dvdy = try self.source(try imageAddressOperand(inst, gradient_base + 4), .float32);
+            const dwdy = try self.source(try imageAddressOperand(inst, gradient_base + 5), .float32);
+            const dx = self.id();
+            const dy = self.id();
+            try self.emit(&self.body, 80, &.{ self.vector3_type, dx, dudx, dvdx, dwdx });
+            try self.emit(&self.body, 80, &.{ self.vector3_type, dy, dudy, dvdy, dwdy });
+            return .{ dx, dy };
+        }
+        const dudy = try self.source(try imageAddressOperand(inst, gradient_base + 2), .float32);
+        const dvdy = try self.source(try imageAddressOperand(inst, gradient_base + 3), .float32);
+        if (image_dimension == .two_d) {
+            const dx = self.id();
+            const dy = self.id();
+            try self.emit(&self.body, 80, &.{ self.vector2_type, dx, dudx, dvdx });
+            try self.emit(&self.body, 80, &.{ self.vector2_type, dy, dudy, dvdy });
+            return .{ dx, dy };
+        }
+        const dx = self.id();
+        const dy = self.id();
+        try self.emit(&self.body, 80, &.{ self.vector3_type, dx, dudx, dvdx, zero });
+        try self.emit(&self.body, 80, &.{ self.vector3_type, dy, dudy, dvdy, zero });
+        return .{ dx, dy };
     }
 
     fn imageTexelOffset(self: *Builder, inst: instruction.Instruction) Error!u32 {
@@ -3142,10 +4698,14 @@ const Builder = struct {
     fn gatherImage(self: *Builder, inst: instruction.Instruction) Error!void {
         const flags: u16 = @bitCast(inst.image_sample_flags);
         const supported_flags = (@as(u16, 1) << 5) | (@as(u16, 1) << 4);
+        const compare = inst.image_sample_flags.compare;
+        const supported_with_compare = supported_flags | (@as(u16, 1) << 3);
         if (self.stage != .fragment or inst.image_dimension != .dim_2d or
-            !inst.image_sample_flags.level_zero or inst.image_sample_flags.compare or
-            flags & ~supported_flags != 0 or inst.data_mask == 0 or
-            inst.image_address_components != 2 + @as(u8, @intFromBool(inst.image_sample_flags.offset)))
+            !inst.image_sample_flags.level_zero or
+            flags & ~(if (compare) supported_with_compare else supported_flags) != 0 or
+            inst.data_mask == 0 or
+            inst.image_address_components != 2 + @as(u8, @intFromBool(inst.image_sample_flags.offset)) +
+                @as(u8, @intFromBool(compare)))
         {
             return Error.UnsupportedOpcode;
         }
@@ -3176,7 +4736,30 @@ const Builder = struct {
 
         const component: u32 = @ctz(inst.data_mask);
         const gathered = self.id();
-        if (inst.image_sample_flags.offset) {
+        const dref_index = coordinate_base + 2;
+        if (compare) {
+            const dref = try self.source(try imageAddressOperand(inst, dref_index), .float32);
+            if (inst.image_sample_flags.offset) {
+                const offset = try self.imageTexelOffset(inst);
+                try self.emit(&self.body, 97, &.{
+                    self.vector4_type,
+                    gathered,
+                    sampled_image,
+                    coordinates,
+                    dref,
+                    0x10,
+                    offset,
+                }); // OpImageDrefGather
+            } else {
+                try self.emit(&self.body, 97, &.{
+                    self.vector4_type,
+                    gathered,
+                    sampled_image,
+                    coordinates,
+                    dref,
+                }); // OpImageDrefGather
+            }
+        } else if (inst.image_sample_flags.offset) {
             const offset = try self.imageTexelOffset(inst);
             try self.emit(&self.body, 96, &.{
                 self.vector4_type,
@@ -4013,6 +5596,35 @@ const Builder = struct {
         }
     }
 
+    fn asBufferFromFlat(inst: instruction.Instruction) instruction.Instruction {
+        var buffer = inst;
+        buffer.index_enable = true;
+        buffer.offset_enable = false;
+        const offset: u32 = @bitCast(inst.memory_offset);
+        buffer.src2 = .{
+            .kind = .integer_inline_constant,
+            .value = offset,
+            .signed_val = inst.memory_offset,
+        };
+        return buffer;
+    }
+
+    fn flatLoadWords(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
+        try self.bufferLoadWords(asBufferFromFlat(inst), count);
+    }
+
+    fn flatStoreWords(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
+        try self.bufferStoreWords(asBufferFromFlat(inst), count);
+    }
+
+    fn flatLoadSubword(self: *Builder, inst: instruction.Instruction, width: u8, signed: bool) Error!void {
+        try self.bufferLoadSubword(asBufferFromFlat(inst), width, signed);
+    }
+
+    fn flatStoreSubword(self: *Builder, inst: instruction.Instruction, width: u8) Error!void {
+        try self.bufferStoreSubword(asBufferFromFlat(inst), width);
+    }
+
     fn bufferAtomic(self: *Builder, inst: instruction.Instruction, opcode: u16) Error!void {
         if (!try self.hasBufferStorage(inst)) {
             if (inst.globally_coherent) {
@@ -4504,6 +6116,14 @@ const Builder = struct {
             .v_cmpx_gt_u32 => .v_cmp_gt_u32,
             .v_cmpx_ne_u32 => .v_cmp_ne_u32,
             .v_cmpx_ge_u32 => .v_cmp_ge_u32,
+            .v_cmpx_lt_f16 => .v_cmp_lt_f16,
+            .v_cmpx_eq_f16 => .v_cmp_eq_f16,
+            .v_cmpx_le_f16 => .v_cmp_le_f16,
+            .v_cmpx_gt_f16 => .v_cmp_gt_f16,
+            .v_cmpx_ge_f16 => .v_cmp_ge_f16,
+            .v_cmpx_neq_f16 => .v_cmp_neq_f16,
+            .v_cmpx_nlt_f16 => .v_cmp_ge_f16,
+            .v_cmpx_ne_i64, .v_cmpx_ne_u64 => .v_cmp_ne_u64,
             else => null,
         };
     }
@@ -4529,7 +6149,8 @@ const Builder = struct {
         if (try self.lowerExecutionMask(inst)) return;
         if (try self.lowerSpecializedScalarDestination(inst)) return;
         switch (inst.opcode) {
-            .s_nop, .s_waitcnt, .s_inst_prefetch, .s_sendmsg, .s_sleep, .s_ttrace_data, .v_nop, .s_endpgm, .s_code_end, .s_wqm_b64 => {},
+            .s_nop, .s_waitcnt, .s_waitcnt_depctr, .s_inst_prefetch, .s_sendmsg, .s_trap, .s_sleep, .s_ttrace_data, .s_setreg_b32, .v_nop, .s_endpgm, .s_code_end, .s_wqm_b64 => {},
+            .s_quadmask_b64 => try self.wholeQuadMask64(inst),
             .s_barrier => try self.controlBarrier(),
             // Branches are handled by structured CF or skipped in the linear fallback.
             .s_branch, .s_cbranch_scc0, .s_cbranch_scc1, .s_cbranch_vccz, .s_cbranch_vccnz, .s_cbranch_execz, .s_cbranch_execnz => {},
@@ -4538,6 +6159,9 @@ const Builder = struct {
             .v_readfirstlane_b32 => try self.readFirstLane(inst),
             .v_readlane_b32 => try self.readLane(inst),
             .v_writelane_b32 => try self.writeLane(inst),
+            .v_permlane16_b32 => try self.permlane(inst, false),
+            .v_permlanex16_b32 => try self.permlane(inst, true),
+            .v_movreld_b32, .v_movrels_b32 => try self.unary(inst, 83, .bits32),
             .s_mov_b64 => try self.mov64(inst),
             .s_getpc_b64 => try self.getPcFallback(inst),
             .s_not_b64 => try self.not64(inst),
@@ -4552,7 +6176,11 @@ const Builder = struct {
             => try self.bitwise64(inst, inst.opcode),
             .s_cselect_b32 => try self.cselect32(inst),
             .s_cselect_b64 => try self.cselect64(inst),
-            .s_and_saveexec_b64 => try self.andSaveExec64(inst),
+            .s_and_saveexec_b64 => try self.saveExec(inst, .and_mask),
+            .s_and_saveexec_b32 => try self.saveExec32(inst, .and_mask),
+            .s_orn2_saveexec_b64 => try self.saveExec(inst, .or_not),
+            .s_andn1_saveexec_b64 => try self.saveExec(inst, .not_and),
+            .s_andn1_saveexec_b32 => try self.saveExec32(inst, .not_and),
             .v_cndmask_b32 => try self.cndmask(inst),
             .v_interp_p1_f32, .v_interp_p2_f32, .v_interp_mov_f32 => try self.interpolateParameter(inst),
             .v_cvt_f32_i32 => try self.integerToFloat(inst, true),
@@ -4566,10 +6194,23 @@ const Builder = struct {
             .v_cvt_f32_ubyte3 => try self.unsignedByteToFloat(inst, 3),
             .v_cvt_off_f32_i4 => try self.i4ToOffsetFloat(inst),
             // Pack two f32 → two f16 in one dword (Unity PS export path).
-            .v_cvt_pkrtz_f16_f32 => try self.packHalf2x16(inst),
+            .v_cvt_pkrtz_f16_f32, .v_pack_b32_f16 => try self.packHalf2x16(inst),
+            .v_cvt_pk_u16_u32 => try self.packConvert(inst, .u16),
+            .v_cvt_pk_i16_i32 => try self.packConvert(inst, .i16),
+            .v_cvt_pknorm_u16_f32 => try self.packConvert(inst, .unorm),
+            .v_cvt_pknorm_i16_f32 => try self.packConvert(inst, .snorm),
+            .v_cvt_pk_u8_f32 => try self.packU8Float(inst),
+            .v_cvt_f16_u16 => try self.convertHalfInteger(inst, true, false),
+            .v_cvt_f16_i16 => try self.convertHalfInteger(inst, true, true),
+            .v_cvt_u16_f16 => try self.convertHalfInteger(inst, false, false),
+            .v_cvt_i16_f16 => try self.convertHalfInteger(inst, false, true),
+            .v_cvt_rpi_i32_f32 => try self.roundToSigned(inst),
+            .v_frexp_mant_f32 => try self.frexpMantissa(inst),
+            .v_frexp_exp_i32_f32 => try self.frexpExponent(inst),
             .s_add_u32 => try self.scalarAddUnsigned(inst, false),
             .s_addc_u32 => try self.scalarAddUnsigned(inst, true),
             .v_addc_u32 => try self.vectorAddCarry(inst),
+            .v_subrev_co_ci_u32 => try self.vectorSubBorrow(inst),
             .s_add_i32, .v_add_nc_u32 => try self.binary(inst, 128, .bits32, false), // OpIAdd
             .v_lshl_add_u32 => try self.shiftLeftAdd(inst),
             // dst = (src0 + src1) << (src2 & 31)
@@ -4579,7 +6220,7 @@ const Builder = struct {
             .s_lshl3_add_u32 => try self.fixedShiftLeftAdd(inst, 3),
             .s_lshl4_add_u32 => try self.fixedShiftLeftAdd(inst, 4),
             // Bitfield mask: dst = (((1 << (src0 & 31)) - 1) << (src1 & 31)).
-            .s_bfm_b32 => try self.bitfieldMask(inst),
+            .s_bfm_b32, .v_bfm_b32 => try self.bitfieldMask(inst),
             // Scalar BFE packs offset/width in src1; vector BFE uses src1/src2.
             .s_bfe_u32 => try self.scalarBitfieldExtract(inst),
             .v_bfe_u32 => try self.bitfieldExtract(inst, false),
@@ -4606,7 +6247,12 @@ const Builder = struct {
             .v_mul_i32_i24 => try self.multiply24(inst, true),
             .v_mul_u32_u24 => try self.multiply24(inst, false),
             .v_mad_f32, .v_madmk_f32, .v_madak_f32 => try self.madFloat(inst),
+            .v_mad_i32_i24 => try self.mad24(inst, true),
+            .v_mad_u32_u24 => try self.mad24(inst, false),
+            .v_mad_u64_u32 => try self.madU64U32(inst),
             .v_fma_f32 => try self.fmaFloat(inst),
+            .v_fma_f16 => try self.fmaF16(inst),
+            .v_dot2c_f32_f16 => try self.dot2PackedF16(inst),
             .v_cubeid_f32, .v_cubesc_f32, .v_cubetc_f32, .v_cubema_f32 => try self.cubeFloat(inst),
             .v_mac_f32 => try self.macFloat(inst),
             .v_min_f32 => try self.glslBinary(inst, 37, .float32), // FMin
@@ -4620,7 +6266,87 @@ const Builder = struct {
             .v_max_u32 => try self.glslBinary(inst, 41, .bits32), // UMax
             .v_max_i32 => try self.glslBinary(inst, 42, .sint32), // SMax
             .v_min3_f32, .v_max3_f32, .v_med3_f32 => try self.minMax3Float(inst, inst.opcode),
-            .v_rcp_f32 => try self.reciprocalFloat(inst),
+            .v_min3_i32, .v_min3_u32, .v_max3_i32, .v_max3_u32, .v_med3_i32, .v_med3_u32, .v_med3_i16 => try self.minMax3Integer(inst, inst.opcode),
+            .v_min3_f16 => try self.glslBinaryF16(inst, 37),
+            .v_max3_f16 => try self.glslBinaryF16(inst, 40),
+            .v_med3_f16 => try self.glslBinaryF16(inst, 40),
+            .v_rcp_f32, .v_rcp_iflag_f32 => try self.reciprocalFloat(inst),
+            .v_add_f16 => try self.binaryF16(inst, 129, false),
+            .v_sub_f16 => try self.binaryF16(inst, 131, false),
+            .v_subrev_f16 => try self.binaryF16(inst, 131, true),
+            .v_mul_f16 => try self.binaryF16(inst, 133, false),
+            .v_max_f16 => try self.glslBinaryF16(inst, 40),
+            .v_min_f16 => try self.glslBinaryF16(inst, 37),
+            .v_pk_add_f16 => try self.packedBinaryF16(inst, 129),
+            .v_pk_mul_f16 => try self.packedBinaryF16(inst, 133),
+            .v_pk_fma_f16 => try self.packedFmaF16(inst),
+            .v_pk_min_f16 => try self.packedGlslF16(inst, 37),
+            .v_pk_max_f16 => try self.packedGlslF16(inst, 40),
+            .v_pk_fmac_f16 => try self.packedFmacF16(inst),
+            .v_pk_add_i16 => try self.packedIntegerBinary(inst, 128, true, false),
+            .v_pk_sub_i16 => try self.packedIntegerBinary(inst, 130, true, false),
+            .v_pk_add_u16 => try self.packedIntegerBinary(inst, 128, false, false),
+            .v_pk_sub_u16 => try self.packedIntegerBinary(inst, 130, false, false),
+            .v_pk_mul_lo_u16 => try self.packedIntegerBinary(inst, 132, false, false),
+            .v_pk_lshlrev_b16 => try self.packedIntegerBinary(inst, 196, false, true),
+            .v_pk_lshrrev_b16 => try self.packedIntegerBinary(inst, 194, false, true),
+            .v_pk_ashrrev_i16 => try self.packedIntegerBinary(inst, 195, true, true),
+            .v_pk_max_i16 => try self.packedIntegerGlsl(inst, 42, true),
+            .v_pk_min_i16 => try self.packedIntegerGlsl(inst, 39, true),
+            .v_pk_max_u16 => try self.packedIntegerGlsl(inst, 41, false),
+            .v_pk_min_u16 => try self.packedIntegerGlsl(inst, 38, false),
+            .v_pk_mad_i16 => try self.packedIntegerMad(inst, true),
+            .v_pk_mad_u16 => try self.packedIntegerMad(inst, false),
+            .v_fmac_f16 => try self.fmacF16(inst),
+            .v_fmamk_f16, .v_fmaak_f16 => try self.fmaF16(inst),
+            .v_mad_mixlo_f16 => try self.madMixF16(inst, false),
+            .v_mad_mixhi_f16 => try self.madMixF16(inst, true),
+            .v_rcp_f16 => try self.reciprocalF16(inst),
+            .v_rsq_f16 => try self.unaryF16(inst, 32),
+            .v_sqrt_f16 => try self.unaryF16(inst, 31),
+            .v_log_f16 => try self.unaryF16(inst, 30),
+            .v_exp_f16 => try self.unaryF16(inst, 29),
+            .v_floor_f16 => try self.unaryF16(inst, 8),
+            .v_ceil_f16 => try self.unaryF16(inst, 9),
+            .v_trunc_f16 => try self.unaryF16(inst, 3),
+            .v_rndne_f16 => try self.unaryF16(inst, 2),
+            .v_add_nc_u16 => try self.integer16Binary(inst, 128, false, false),
+            .v_sub_nc_u16 => try self.integer16Binary(inst, 130, false, false),
+            .v_add_nc_i16 => try self.integer16Binary(inst, 128, true, false),
+            .v_sub_nc_i16 => try self.integer16Binary(inst, 130, true, false),
+            .v_lshlrev_b16 => try self.integer16Binary(inst, 196, false, true),
+            .v_lshrrev_b16 => try self.integer16Binary(inst, 194, false, true),
+            .v_ashrrev_i16 => try self.integer16Binary(inst, 195, true, true),
+            .v_max_u16 => try self.integer16Glsl(inst, 41, false),
+            .v_max_i16 => try self.integer16Glsl(inst, 42, true),
+            .v_min_u16 => try self.integer16Glsl(inst, 38, false),
+            .v_min_i16 => try self.integer16Glsl(inst, 39, true),
+            .v_lshlrev_b64 => try self.shiftLeft64Vector(inst),
+            .v_lshrrev_b64 => try self.shift64(inst, false),
+            .v_cvt_f32_f16 => try self.convertF16ToF32(inst),
+            .v_cvt_f16_f32 => try self.convertF32ToF16(inst),
+            .v_ffbh_u32 => try self.findFirstBit(inst, true),
+            .v_ffbl_b32 => try self.findFirstBit(inst, false),
+            .s_ff1_i32_b32 => try self.findFirstBit(inst, false),
+            .s_ff1_i32_b64 => try self.findFirstBit64(inst, false),
+            .s_flbit_i32_b64 => try self.findFirstBit64(inst, true),
+            .s_bcnt1_i32_b32 => try self.scalarPopCount(inst),
+            .s_bcnt1_i32_b64 => try self.scalarPopCount64(inst),
+            .s_bitset0_b32 => try self.bitSet(inst, false),
+            .s_bitset1_b32 => try self.bitSet(inst, true),
+            .s_bitreplicate_b64_b32 => try self.bitReplicate(inst),
+            .s_cmp_eq_u64 => try self.scalarCompare64(inst, true),
+            .s_cmp_lg_u64 => try self.scalarCompare64(inst, false),
+            .v_bcnt_u32_b32 => try self.popCountAdd(inst),
+            .v_mbcnt_lo_u32_b32 => try self.maskedBitCount(inst, false),
+            .v_mbcnt_hi_u32_b32 => try self.maskedBitCount(inst, true),
+            .v_alignbit_b32 => try self.alignBit(inst, false),
+            .v_alignbyte_b32 => try self.alignBit(inst, true),
+            .v_xnor_b32 => try self.xnor32(inst),
+            .v_mul_lo_i32 => try self.binary(inst, 132, .bits32, false),
+            .v_add_i32 => try self.binary(inst, 128, .bits32, false),
+            .v_sub_i32 => try self.binary(inst, 130, .bits32, false),
+            .v_subrev_i32 => try self.binary(inst, 130, .bits32, true),
             .v_ldexp_f32 => try self.ldexpFloat(inst),
             .v_rndne_f32 => try self.glslFloatUnary(inst, 2), // RoundEven
             .v_trunc_f32 => try self.glslFloatUnary(inst, 3),
@@ -4645,6 +6371,13 @@ const Builder = struct {
             .s_and_b32, .v_and_b32 => try self.binary(inst, 199, .bits32, false),
             .s_or_b32, .v_or_b32 => try self.binary(inst, 197, .bits32, false),
             .s_xor_b32, .v_xor_b32 => try self.binary(inst, 198, .bits32, false),
+            .s_andn2_b32, .s_orn2_b32, .s_nand_b32, .s_nor_b32, .s_xnor_b32 => try self.bitwise32(inst, inst.opcode),
+            .s_pack_ll_b32_b16 => try self.packHalves(inst, false, false),
+            .s_pack_lh_b32_b16 => try self.packHalves(inst, false, true),
+            .s_pack_hh_b32_b16 => try self.packHalves(inst, true, true),
+            .s_abs_i32 => try self.absSigned(inst),
+            .s_bfe_i32 => try self.scalarBitfieldExtractSigned(inst),
+            .s_mulk_i32 => try self.binary(inst, 132, .bits32, false),
             .s_not_b32, .v_not_b32 => try self.unary(inst, 200, .bits32), // OpNot
             .s_brev_b32, .v_bfrev_b32 => try self.unary(inst, 204, .bits32), // OpBitReverse
             .s_cmp_eq_i32, .s_cmp_eq_u32 => try self.comparison(inst, 170, .bits32), // OpIEqual
@@ -4687,6 +6420,31 @@ const Builder = struct {
             .v_cmp_gt_u32 => try self.vectorComparison(inst, 172, .bits32),
             .v_cmp_ne_u32 => try self.vectorComparison(inst, 171, .bits32),
             .v_cmp_ge_u32 => try self.vectorComparison(inst, 174, .bits32),
+            .v_cmp_f_i32, .v_cmp_f_u32 => try self.vectorConstantComparison(inst, false),
+            .v_cmp_t_i32, .v_cmp_t_u32 => try self.vectorConstantComparison(inst, true),
+            .v_cmp_lt_f16 => try self.vectorComparisonF16(inst, 184),
+            .v_cmp_eq_f16 => try self.vectorComparisonF16(inst, 180),
+            .v_cmp_le_f16 => try self.vectorComparisonF16(inst, 188),
+            .v_cmp_gt_f16 => try self.vectorComparisonF16(inst, 186),
+            .v_cmp_lg_f16 => try self.vectorComparisonF16(inst, 182),
+            .v_cmp_ge_f16 => try self.vectorComparisonF16(inst, 190),
+            .v_cmp_neq_f16 => try self.vectorComparisonF16(inst, 183),
+            .v_cmp_lt_i16 => try self.vectorComparisonI16(inst, 177, true),
+            .v_cmp_eq_i16 => try self.vectorComparisonI16(inst, 170, true),
+            .v_cmp_le_i16 => try self.vectorComparisonI16(inst, 179, true),
+            .v_cmp_gt_i16 => try self.vectorComparisonI16(inst, 173, true),
+            .v_cmp_ne_i16 => try self.vectorComparisonI16(inst, 171, true),
+            .v_cmp_ge_i16 => try self.vectorComparisonI16(inst, 175, true),
+            .v_cmp_lt_u16 => try self.vectorComparisonI16(inst, 176, false),
+            .v_cmp_eq_u16 => try self.vectorComparisonI16(inst, 170, false),
+            .v_cmp_le_u16 => try self.vectorComparisonI16(inst, 178, false),
+            .v_cmp_gt_u16 => try self.vectorComparisonI16(inst, 172, false),
+            .v_cmp_ne_u16 => try self.vectorComparisonI16(inst, 171, false),
+            .v_cmp_ge_u16 => try self.vectorComparisonI16(inst, 174, false),
+            .v_cmp_class_f32 => try self.vectorCompareClassF32(inst),
+            .v_cmp_eq_i64 => try self.vectorComparison64(inst, .eq),
+            .v_cmp_ne_u64 => try self.vectorComparison64(inst, .ne),
+            .v_cmp_gt_u64 => try self.vectorComparison64(inst, .gt_u),
             .buffer_load_ubyte => try self.bufferLoadSubword(inst, 8, false),
             .buffer_load_sbyte => try self.bufferLoadSubword(inst, 8, true),
             .buffer_load_ushort => try self.bufferLoadSubword(inst, 16, false),
@@ -4735,15 +6493,19 @@ const Builder = struct {
             .buffer_store_short => try self.bufferStoreSubword(inst, 16),
             .buffer_store_dword,
             .buffer_store_format_x,
+            .tbuffer_store_format_x,
             => try self.bufferStoreWords(inst, 1),
             .buffer_store_dwordx2,
             .buffer_store_format_xy,
+            .tbuffer_store_format_xy,
             => try self.bufferStoreWords(inst, 2),
             .buffer_store_dwordx3,
             .buffer_store_format_xyz,
+            .tbuffer_store_format_xyz,
             => try self.bufferStoreWords(inst, 3),
             .buffer_store_dwordx4,
             .buffer_store_format_xyzw,
+            .tbuffer_store_format_xyzw,
             => try self.bufferStoreWords(inst, 4),
             .buffer_atomic_swap => try self.bufferAtomic(inst, 229), // OpAtomicExchange
             .buffer_atomic_add => try self.bufferAtomic(inst, 234), // OpAtomicIAdd
@@ -4755,6 +6517,8 @@ const Builder = struct {
             .buffer_atomic_and => try self.bufferAtomic(inst, 240), // OpAtomicAnd
             .buffer_atomic_or => try self.bufferAtomic(inst, 241), // OpAtomicOr
             .buffer_atomic_xor => try self.bufferAtomic(inst, 242), // OpAtomicXor
+            .buffer_atomic_fmin => try self.bufferAtomicFloat(inst, true),
+            .buffer_atomic_fmax => try self.bufferAtomicFloat(inst, false),
             .ds_write_b32 => if (self.stage != .vertex or self.ngg_lds_exports.len == 0) try self.dsWriteWords(inst, 1),
             .ds_write2_b32 => if (self.stage != .vertex or self.ngg_lds_exports.len == 0) try self.dsWritePair(inst),
             .ds_write_b64 => if (self.stage != .vertex or self.ngg_lds_exports.len == 0) try self.dsWriteWords(inst, 2),
@@ -4772,17 +6536,34 @@ const Builder = struct {
             .ds_write_addtid_b32 => try self.dsWriteAddtid(inst),
             .ds_read_addtid_b32 => try self.dsReadAddtid(inst),
             .ds_append => try self.dsAppend(inst),
-            .ds_add_u32 => try self.dsAtomic(inst, 234),
-            .ds_sub_u32 => try self.dsAtomic(inst, 235),
-            .ds_min_i32 => try self.dsAtomic(inst, 236),
-            .ds_min_u32 => try self.dsAtomic(inst, 237),
-            .ds_max_i32 => try self.dsAtomic(inst, 238),
-            .ds_max_u32 => try self.dsAtomic(inst, 239),
-            .ds_and_b32 => try self.dsAtomic(inst, 240),
-            .ds_or_b32 => try self.dsAtomic(inst, 241),
-            .ds_xor_b32 => try self.dsAtomic(inst, 242),
-            .image_load => try self.imageLoad(inst),
-            .image_store => try self.imageStore(inst),
+            .ds_add_u32, .ds_add_rtn_u32 => try self.dsAtomic(inst, 234),
+            .ds_sub_u32, .ds_sub_rtn_u32 => try self.dsAtomic(inst, 235),
+            .ds_min_i32, .ds_min_rtn_i32 => try self.dsAtomic(inst, 236),
+            .ds_min_u32, .ds_min_rtn_u32 => try self.dsAtomic(inst, 237),
+            .ds_max_i32, .ds_max_rtn_i32 => try self.dsAtomic(inst, 238),
+            .ds_max_u32, .ds_max_rtn_u32 => try self.dsAtomic(inst, 239),
+            .ds_and_b32, .ds_and_rtn_b32 => try self.dsAtomic(inst, 240),
+            .ds_or_b32, .ds_or_rtn_b32 => try self.dsAtomic(inst, 241),
+            .ds_xor_b32, .ds_xor_rtn_b32 => try self.dsAtomic(inst, 242),
+            .ds_write2st64_b32 => if (self.stage != .vertex or self.ngg_lds_exports.len == 0) try self.dsWritePair(inst),
+            .ds_read2st64_b32 => try self.dsReadPair(inst),
+            .ds_consume => try self.dsAppend(inst),
+            .flat_load_ubyte => try self.flatLoadSubword(inst, 8, false),
+            .flat_load_sbyte => try self.flatLoadSubword(inst, 8, true),
+            .flat_load_ushort => try self.flatLoadSubword(inst, 16, false),
+            .flat_load_sshort => try self.flatLoadSubword(inst, 16, true),
+            .flat_load_dword => try self.flatLoadWords(inst, 1),
+            .flat_load_dwordx2 => try self.flatLoadWords(inst, 2),
+            .flat_load_dwordx3 => try self.flatLoadWords(inst, 3),
+            .flat_load_dwordx4 => try self.flatLoadWords(inst, 4),
+            .flat_store_byte => try self.flatStoreSubword(inst, 8),
+            .flat_store_short => try self.flatStoreSubword(inst, 16),
+            .flat_store_dword => try self.flatStoreWords(inst, 1),
+            .flat_store_dwordx2 => try self.flatStoreWords(inst, 2),
+            .flat_store_dwordx3 => try self.flatStoreWords(inst, 3),
+            .flat_store_dwordx4 => try self.flatStoreWords(inst, 4),
+            .image_load, .image_load_mip => try self.imageLoad(inst),
+            .image_store, .image_store_mip => try self.imageStore(inst),
             .image_atomic_add => try self.imageAtomic(inst, 234),
             .image_atomic_umin => try self.imageAtomic(inst, 237),
             .image_atomic_umax => try self.imageAtomic(inst, 239),
@@ -4791,6 +6572,19 @@ const Builder = struct {
             .image_atomic_xor => try self.imageAtomic(inst, 242),
             .image_sample => try self.sampleImage(inst),
             .image_gather4 => try self.gatherImage(inst),
+            .image_get_resinfo => try self.imageGetResinfo(inst),
+            .image_get_lod => try self.imageGetLod(inst),
+            .ds_swizzle_b32 => try self.dsSwizzle(inst),
+            .ds_write_b8 => if (self.stage != .vertex or self.ngg_lds_exports.len == 0) try self.dsWriteWords(inst, 1),
+            .ds_write_b16 => if (self.stage != .vertex or self.ngg_lds_exports.len == 0) try self.dsWriteWords(inst, 1),
+            .ds_read_u16_d16 => try self.dsReadSubword(inst, 16, false),
+            .ds_write2_b64 => if (self.stage != .vertex or self.ngg_lds_exports.len == 0) try self.dsWritePair(inst),
+            .ds_write2st64_b64 => if (self.stage != .vertex or self.ngg_lds_exports.len == 0) try self.dsWritePair(inst),
+            .ds_read2_b64 => try self.dsReadPair(inst),
+            .ds_read2st64_b64 => try self.dsReadPair(inst),
+            .ds_min_f32 => try self.dsAtomic(inst, 236),
+            .ds_max_f32 => try self.dsAtomic(inst, 238),
+            .ds_wrxchg_rtn_b32 => try self.dsAtomic(inst, 229),
             .exp => try self.exportValue(inst),
             else => return Error.UnsupportedOpcode,
         }
@@ -5092,6 +6886,13 @@ fn structuredSelectionParent(
     return parent;
 }
 
+fn setpcSuccessor(graph: *const control_flow.Graph, block_index: u32) ?u32 {
+    for (graph.edges.items) |edge| {
+        if (edge.from == block_index) return edge.to;
+    }
+    return null;
+}
+
 fn markMutableOperand(marked: *[384]bool, op: operand.Operand) void {
     const first = Builder.registerIndex(op) orelse return;
     // Memory instructions name the first word of a descriptor, coordinate or
@@ -5241,8 +7042,12 @@ fn translateStructuredLoops(builder: *Builder, program: *const instruction.Progr
         if (last.opcode.isProgramEnd()) {
             try builder.emit(&builder.body, 253, &.{}); // OpReturn
         } else if (last.opcode == .s_setpc_b64) {
-            try builder.exportNggLdsRecord();
-            try builder.emit(&builder.body, 253, &.{});
+            if (setpcSuccessor(graph, block.index)) |target| {
+                try builder.emit(&builder.body, 249, &.{labels[target]});
+            } else {
+                try builder.exportNggLdsRecord();
+                try builder.emit(&builder.body, 253, &.{});
+            }
         } else if (last.opcode == .s_branch) {
             try storeMutableControlState(builder);
             const target = graph.blockForPc(last.branch_target) orelse return Error.UnsupportedControlFlow;
@@ -5382,8 +7187,12 @@ fn translateDispatcher(builder: *Builder, program: *const instruction.Program, g
         if (last.opcode.isProgramEnd()) {
             try emitDispatchJump(builder, after, dispatch_sentinel);
         } else if (last.opcode == .s_setpc_b64) {
-            try builder.exportNggLdsRecord();
-            try emitDispatchJump(builder, after, dispatch_sentinel);
+            if (setpcSuccessor(graph, block.index)) |target| {
+                try emitDispatchJump(builder, after, target);
+            } else {
+                try builder.exportNggLdsRecord();
+                try emitDispatchJump(builder, after, dispatch_sentinel);
+            }
         } else if (last.opcode == .s_branch) {
             const target = graph.blockForPc(last.branch_target) orelse return Error.UnsupportedControlFlow;
             try emitDispatchJump(builder, after, target);
@@ -5541,8 +7350,19 @@ fn translateStructured(builder: *Builder, program: *const instruction.Program, g
         if (last.opcode.isProgramEnd()) {
             try builder.emit(&builder.body, 253, &.{}); // OpReturn
         } else if (last.opcode == .s_setpc_b64) {
-            try builder.exportNggLdsRecord();
-            try builder.emit(&builder.body, 253, &.{}); // hardware NGG continuation becomes the stage return
+            if (setpcSuccessor(graph, block.index)) |target| {
+                try builder.emit(&builder.body, 249, &.{structuredEdgeLabel(
+                    graph,
+                    dominators,
+                    labels,
+                    selection_merge_labels,
+                    block.index,
+                    target,
+                )});
+            } else {
+                try builder.exportNggLdsRecord();
+                try builder.emit(&builder.body, 253, &.{}); // hardware NGG continuation becomes the stage return
+            }
         } else if (last.opcode == .s_branch) {
             const target = graph.blockForPc(last.branch_target) orelse return Error.UnsupportedControlFlow;
             try builder.emit(&builder.body, 249, &.{structuredEdgeLabel(
@@ -5629,6 +7449,9 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     try appendInstruction(allocator, &words, 17, &.{1}); // OpCapability Shader
     try appendInstruction(allocator, &words, 17, &.{61}); // OpCapability GroupNonUniform
     try appendInstruction(allocator, &words, 17, &.{64}); // OpCapability GroupNonUniformShuffle
+    if (builder.uses_image_query) {
+        try appendInstruction(allocator, &words, 17, &.{50}); // OpCapability ImageQuery
+    }
     for (options.storage_images) |binding| {
         if (!storageImageNeedsExtendedFormats(binding.format)) continue;
         try appendInstruction(allocator, &words, 17, &.{49}); // OpCapability StorageImageExtendedFormats
@@ -5737,7 +7560,12 @@ pub fn translate(allocator: std.mem.Allocator, program: *const instruction.Progr
     }
     for (program.instructions.items) |candidate| {
         if (candidate.dst.kind == .exec_lo) effective.uses_execution_mask = true;
-        if (candidate.opcode == .v_writelane_b32 or candidate.opcode == .v_readlane_b32) {
+        if (candidate.opcode == .v_writelane_b32 or candidate.opcode == .v_readlane_b32 or
+            candidate.opcode == .v_permlane16_b32 or candidate.opcode == .v_permlanex16_b32 or
+            candidate.opcode == .v_mbcnt_lo_u32_b32 or candidate.opcode == .v_mbcnt_hi_u32_b32 or
+            candidate.opcode == .ds_swizzle_b32 or
+            candidate.src0.dpp or candidate.src1.dpp or candidate.src2.dpp)
+        {
             effective.uses_lane_identity = true;
         }
         has_predicated_write = has_predicated_write or opcodeUsesWritePredicate(candidate.opcode);
@@ -6454,6 +8282,163 @@ test "instruction prefetch is a translation no-op" {
     try std.testing.expect(containsOpcode(module.words, 253)); // OpReturn
 }
 
+test "trap waitcnt-depctr and packed f16 add lower" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xbf92_0000, // s_trap
+        0xbfa3_0000, // s_waitcnt_depctr
+        0xcc0f_0002, // v_pk_add_f16 v2, s0, s1
+        0x0002_0000,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .compute });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 129)); // OpFAdd on unpacked f16 pair
+    try std.testing.expect(containsOpcode(module.words, 253));
+}
+
+test "permlane mix and image resinfo lower" {
+    const decoder = @import("decoder.zig");
+    const permlane_code = [_]u32{
+        0xd777_0001, // v_permlane16_b32 v1, v0, s0, s1
+        0x0002_0000,
+        0xbf81_0000,
+    };
+    var permlane_program = try decoder.decodeProgram(std.testing.allocator, &permlane_code);
+    defer permlane_program.deinit(std.testing.allocator);
+    var permlane_module = try translate(std.testing.allocator, &permlane_program, .{ .stage = .compute });
+    defer permlane_module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(permlane_module.words, 345)); // OpGroupNonUniformShuffle
+
+    const resinfo_code = [_]u32{
+        0xf038_0f00, // image_get_resinfo dim:2d dmask:xyzw
+        0x0040_0000,
+        0xbf81_0000,
+    };
+    var resinfo_program = try decoder.decodeProgram(std.testing.allocator, &resinfo_code);
+    defer resinfo_program.deinit(std.testing.allocator);
+    const images = [_]SampledImageBinding{.{
+        .resource_sgpr = 0,
+        .sampler_sgpr = 8,
+        .descriptor_index = 0,
+    }};
+    var resinfo_module = try translate(std.testing.allocator, &resinfo_program, .{
+        .stage = .compute,
+        .sampled_images = &images,
+    });
+    defer resinfo_module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(resinfo_module.words, 50) or containsOpcode(resinfo_module.words, 107));
+}
+
+test "packed integer add and mad mix lower" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xcc02_0002, // v_pk_add_i16 v2, s0, s1
+        0x0002_0000,
+        0xcc21_0003, // v_mad_mixlo_f16 v3, s0, s1, s2
+        0x0004_0200,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .compute });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 128)); // OpIAdd
+    try std.testing.expect(containsOpcode(module.words, 12)); // GLSL Fma / pack
+}
+
+test "64-bit bit scan popcount and quad mask lower" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xbe80_1400, // s_ff1_i32_b64 s0, s0
+        0xbe80_1600, // s_flbit_i32_b64 s0, s0
+        0xbe80_1000, // s_bcnt1_i32_b64 s0, s0
+        0xbe80_2d00, // s_quadmask_b64 s0, s0
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .compute });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 205)); // OpBitCount
+    try std.testing.expect(containsOpcode(module.words, 12)); // FindILsb / FindUMsb
+}
+
+test "vector class compare and 64-bit equality lower" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .v_cmp_class_f32,
+        .dst = .{ .kind = .vcc_lo },
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src1 = .{ .kind = .vgpr, .reg = 1 },
+        .src_count = 2,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .v_cmp_eq_i64,
+        .dst = .{ .kind = .vcc_lo },
+        .src0 = .{ .kind = .vgpr, .reg = 2 },
+        .src1 = .{ .kind = .vgpr, .reg = 4 },
+        .src_count = 2,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .opcode = .s_endpgm });
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .compute });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 170)); // OpIEqual
+}
+
+test "fragment depth-compare sample uses Dref explicit lod" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xf0bc_0f08, // image_sample_c_lz dim:2d dmask:xyzw
+        0x0040_0200,
+        0xf800_080f,
+        0x0504_0302,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    try std.testing.expect(program.instructions.items[0].image_sample_flags.compare);
+    try std.testing.expect(program.instructions.items[0].image_sample_flags.level_zero);
+    const images = [_]SampledImageBinding{.{
+        .resource_sgpr = 0,
+        .sampler_sgpr = 8,
+        .descriptor_index = 0,
+    }};
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .fragment,
+        .sampled_images = &images,
+    });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 90)); // OpImageSampleDrefExplicitLod
+}
+
+test "buffer float atomics lower through atomic load and store" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .opcode = .buffer_atomic_fmin,
+        .family = .mubuf,
+        .dst = .{ .kind = .vgpr, .reg = 0 },
+        .src0 = .{ .kind = .vgpr, .reg = 1 },
+        .src1 = .{ .kind = .sgpr, .reg = 4 },
+        .src2 = .{ .kind = .integer_inline_constant, .value = 0 },
+        .src_count = 3,
+        .globally_coherent = true,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .opcode = .s_endpgm });
+    const storage = [_]StorageBufferBinding{.{ .resource_sgpr = 4, .descriptor_index = 0, .extent_bytes = 16 }};
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .storage_buffers = &storage,
+    });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 227)); // OpAtomicLoad
+    try std.testing.expect(containsOpcode(module.words, 228)); // OpAtomicStore
+}
+
 test "native vector shift-add masks its shift and adds the third source" {
     const decoder = @import("decoder.zig");
     const code = [_]u32{
@@ -6524,6 +8509,63 @@ test "vertex system value and position export lower to a stage interface" {
     defer converted.deinit(std.testing.allocator);
     try std.testing.expect(containsOpcode(converted.words, 129)); // OpFAdd z + w
     try std.testing.expect(containsOpcode(converted.words, 133)); // OpFMul by 0.5
+}
+
+test "GETPC SETPC continuation still exports position" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .opcode = .s_getpc_b64,
+        .dst = .{ .kind = .sgpr, .reg = 0 },
+        .word_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 4,
+        .opcode = .s_add_u32,
+        .dst = .{ .kind = .sgpr, .reg = 0 },
+        .src0 = .{ .kind = .sgpr, .reg = 0 },
+        .src1 = .{ .kind = .integer_inline_constant, .value = 8 },
+        .src_count = 2,
+        .word_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 8,
+        .opcode = .s_setpc_b64,
+        .src0 = .{ .kind = .sgpr, .reg = 0 },
+        .src_count = 1,
+        .word_count = 1,
+    });
+    inline for (.{ 0, 1, 2, 3 }) |component| {
+        try program.instructions.append(std.testing.allocator, .{
+            .pc = 12 + component * 4,
+            .opcode = .v_cvt_f32_i32,
+            .dst = .{ .kind = .vgpr, .reg = component },
+            .src0 = .{ .kind = .vgpr, .reg = 5 },
+            .src_count = 1,
+            .word_count = 1,
+        });
+    }
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 28,
+        .opcode = .exp,
+        .export_target = 0x0c,
+        .export_enable = 0xf,
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src1 = .{ .kind = .vgpr, .reg = 1 },
+        .src2 = .{ .kind = .vgpr, .reg = 2 },
+        .src3 = .{ .kind = .vgpr, .reg = 3 },
+        .src_count = 4,
+        .word_count = 2,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 36, .opcode = .s_endpgm, .word_count = 1 });
+
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .vertex,
+        .vertex_index_vgpr = 0,
+    });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), countOpcode(module.words, 62)); // OpStore Position
 }
 
 test "merged NGG vertex prolog reaches its position export" {
@@ -8417,7 +10459,7 @@ test "v_writelane_b32 selects the current lane" {
     try std.testing.expect(containsOpcode(module.words, 170)); // OpIEqual
 }
 
-test "image_sample with derivatives lowers as implicit lod" {
+test "image_sample_d lowers explicit derivatives" {
     var program = instruction.Program{ .code = &.{}, .instructions = .empty };
     defer program.deinit(std.testing.allocator);
     try program.instructions.append(std.testing.allocator, .{
@@ -8431,7 +10473,8 @@ test "image_sample with derivatives lowers as implicit lod" {
         .src2 = .{ .kind = .sgpr, .reg = 8 },
         .src_count = 3,
         .image_dimension = .dim_2d,
-        .image_address_components = 2,
+        .image_address_components = 6,
+        .image_sample_flags = .{ .derivative = true },
         .data_mask = 0xf,
     });
     try program.instructions.append(std.testing.allocator, .{ .pc = 8, .opcode = .s_endpgm });
@@ -8443,5 +10486,53 @@ test "image_sample with derivatives lowers as implicit lod" {
         .descriptor_array_length = 8,
     });
     defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 88)); // OpImageSampleExplicitLod
+    try std.testing.expect(!containsOpcode(module.words, 87)); // not implicit LOD
+}
+
+test "1D image sample uses a height-1 2D descriptor" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .family = .mimg,
+        .opcode = .image_sample,
+        .opcode_id = 0x20,
+        .dst = .{ .kind = .vgpr, .reg = 2 },
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src1 = .{ .kind = .sgpr, .reg = 0 },
+        .src2 = .{ .kind = .sgpr, .reg = 8 },
+        .src_count = 3,
+        .image_dimension = .dim_1d,
+        .image_address_components = 1,
+        .data_mask = 0xf,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 8, .opcode = .s_endpgm });
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .fragment,
+        .sampled_images = &.{
+            .{ .resource_sgpr = 0, .sampler_sgpr = 8, .descriptor_index = 0, .instruction_pc = 0, .dimension = .two_d },
+        },
+        .descriptor_array_length = 8,
+    });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 1), firstInstructionOperand(module.words, 25, 2)); // Dim2D
     try std.testing.expect(containsOpcode(module.words, 87)); // OpImageSampleImplicitLod
+}
+
+test "DPP quad_perm shuffles from the selected lane of the quad" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .family = .vop1,
+        .opcode = .v_mov_b32,
+        .dst = .{ .kind = .vgpr, .reg = 1 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 1, .dpp = true, .dpp_ctrl = 0x1b },
+        .src_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 8, .opcode = .s_endpgm });
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 345)); // OpGroupNonUniformShuffle
 }

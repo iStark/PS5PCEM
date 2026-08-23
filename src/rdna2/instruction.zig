@@ -74,6 +74,8 @@ pub const Instruction = struct {
     image_nsa_address: [12]u8 = [_]u8{0} ** 12,
     image_dimension: isa.ImageDimension = .dim_2d,
     image_sample_flags: isa.ImageSampleFlags = .{},
+    /// MIMG r128: the T# occupies eight SGPRs instead of four.
+    image_r128: bool = false,
     memory_segment: u2 = 0,
     data_signed: bool = false,
     typed: bool = false,

@@ -221,6 +221,49 @@ fn decodeImpl(
     return .{ .code = code, .program = program, .graph = graph, .module = module };
 }
 
+fn isHardwareNggSetpc(inst: rdna2.Instruction) bool {
+    return inst.opcode == .s_setpc_b64 and inst.src0.kind == .sgpr and inst.src0.reg == 6;
+}
+
+fn isProgramTerminator(inst: rdna2.Instruction) bool {
+    return inst.opcode.isProgramEnd();
+}
+
+/// Replaces a non-s6 `S_SETPC_B64` with the fetch-shader body, dropping the
+/// fetch shader's own returning SETPC so execution falls into the VS
+/// continuation. Fetch shaders are typically straight-line attribute loads.
+pub fn inlineFetchShader(
+    allocator: std.mem.Allocator,
+    vertex: []const rdna2.Instruction,
+    fetch: []const rdna2.Instruction,
+    out: *std.ArrayList(rdna2.Instruction),
+) Error!bool {
+    if (fetch.len == 0) return false;
+    var setpc_index: ?usize = null;
+    for (vertex, 0..) |inst, index| {
+        if (inst.opcode != .s_setpc_b64 or isHardwareNggSetpc(inst)) continue;
+        setpc_index = index;
+    }
+    const splice = setpc_index orelse return false;
+
+    var fetch_len = fetch.len;
+    if (fetch_len != 0 and fetch[fetch_len - 1].opcode == .s_setpc_b64) fetch_len -= 1;
+    if (fetch_len != 0 and isProgramTerminator(fetch[fetch_len - 1])) fetch_len -= 1;
+    if (fetch_len == 0) return false;
+
+    const fetch_base: u32 = 0x4000_0000;
+    try out.ensureTotalCapacity(allocator, vertex.len + fetch_len);
+    try out.appendSlice(allocator, vertex[0..splice]);
+    for (fetch[0..fetch_len]) |inst| {
+        var relocated = inst;
+        relocated.pc = fetch_base +% inst.pc;
+        if (relocated.opcode.isBranch()) relocated.branch_target = fetch_base +% inst.branch_target;
+        try out.append(allocator, relocated);
+    }
+    try out.appendSlice(allocator, vertex[splice + 1 ..]);
+    return true;
+}
+
 const TestMemory = struct {
     bytes: [64]u8 = @splat(0),
 
@@ -278,6 +321,65 @@ test "analysis enforces its instruction safety limit" {
         Error.InstructionLimitExceeded,
         decode(std.testing.allocator, memory.reader(), 0, 2),
     );
+}
+
+test "fetch shader body replaces a non-s6 SETPC" {
+    const vs = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_nop, .word_count = 1 },
+        .{
+            .pc = 4,
+            .opcode = .s_setpc_b64,
+            .src0 = .{ .kind = .sgpr, .reg = 0 },
+            .src_count = 1,
+            .word_count = 1,
+        },
+        .{ .pc = 8, .opcode = .s_endpgm, .word_count = 1 },
+    };
+    const fetch = [_]rdna2.Instruction{
+        .{
+            .pc = 0,
+            .opcode = .buffer_load_format_xyzw,
+            .dst = .{ .kind = .vgpr, .reg = 0 },
+            .src1 = .{ .kind = .sgpr, .reg = 4 },
+            .src_count = 2,
+            .word_count = 2,
+        },
+        .{
+            .pc = 8,
+            .opcode = .s_setpc_b64,
+            .src0 = .{ .kind = .sgpr, .reg = 2 },
+            .src_count = 1,
+            .word_count = 1,
+        },
+    };
+    var out: std.ArrayList(rdna2.Instruction) = .empty;
+    defer out.deinit(std.testing.allocator);
+    try std.testing.expect(try inlineFetchShader(std.testing.allocator, &vs, &fetch, &out));
+    try std.testing.expectEqual(@as(usize, 3), out.items.len);
+    try std.testing.expectEqual(rdna2.Opcode.s_nop, out.items[0].opcode);
+    try std.testing.expectEqual(rdna2.Opcode.buffer_load_format_xyzw, out.items[1].opcode);
+    try std.testing.expectEqual(rdna2.Opcode.s_endpgm, out.items[2].opcode);
+    try std.testing.expectEqual(@as(u32, 0x4000_0000), out.items[1].pc);
+}
+
+test "hardware NGG SETPC is not replaced by a fetch shader" {
+    const vs = [_]rdna2.Instruction{
+        .{
+            .pc = 0,
+            .opcode = .s_setpc_b64,
+            .src0 = .{ .kind = .sgpr, .reg = 6 },
+            .src_count = 1,
+            .word_count = 1,
+        },
+        .{ .pc = 4, .opcode = .s_endpgm, .word_count = 1 },
+    };
+    const fetch = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_nop, .word_count = 1 },
+        .{ .pc = 4, .opcode = .s_endpgm, .word_count = 1 },
+    };
+    var out: std.ArrayList(rdna2.Instruction) = .empty;
+    defer out.deinit(std.testing.allocator);
+    try std.testing.expect(!(try inlineFetchShader(std.testing.allocator, &vs, &fetch, &out)));
 }
 
 test "bounded analysis stops before reading beyond AGC shader size" {
