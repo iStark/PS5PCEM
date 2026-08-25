@@ -51,7 +51,7 @@ pub const Analysis = struct {
     /// ends. LDS-only writes are deliberately excluded because that storage
     /// dies with the dispatch unless another instruction exports it.
     pub fn hasExternalEffects(self: *const Analysis) bool {
-        for (self.program.instructions.items) |inst| {
+        for (self.module.instructions.items) |inst| {
             if (inst.family == .ds and inst.gds) return true;
             switch (inst.opcode) {
                 .buffer_store_format_x,
@@ -110,7 +110,7 @@ pub const Analysis = struct {
         allocator: std.mem.Allocator,
         options: SpirvOptions,
     ) rdna2.spirv.Error!rdna2.spirv.Module {
-        return rdna2.translateSpirv(allocator, &self.program, options);
+        return rdna2.translateIrSpirv(allocator, &self.module, options);
     }
 };
 

@@ -10,6 +10,14 @@ const instruction = @import("instruction.zig");
 
 pub const ValueType = enum { bits32, uint32, sint32, float32, mask64, none };
 
+pub const PipelineStage = enum {
+    decoded,
+    typed,
+    validated,
+    optimized,
+    legalized,
+};
+
 pub const Operation = enum {
     nop,
     move,
@@ -29,6 +37,7 @@ pub const Operation = enum {
     image,
     interpolation,
     export_value,
+    synchronization,
     end,
     opaque_instruction,
 };
@@ -59,19 +68,84 @@ pub const Node = struct {
     sources: instruction.Sources,
     branch_target: u32,
     memory_access: ?MemoryAccess,
+    reachable: bool = false,
+    side_effect: bool = false,
+    /// Safe no-op removed from the program presented to a backend. Nodes stay
+    /// in the module so diagnostics retain a one-to-one decoded-PC view.
+    elided: bool = false,
+};
+
+pub const BasicBlock = struct {
+    first_node: u32,
+    node_count: u32,
+    start_pc: u32,
+    successors: [2]u32 = @splat(std.math.maxInt(u32)),
+    successor_count: u8 = 0,
+    reachable: bool = false,
+};
+
+pub const ValidationReport = struct {
+    instruction_count: u32 = 0,
+    block_count: u32 = 0,
+    opaque_instruction_count: u32 = 0,
+    duplicate_pc_count: u32 = 0,
+    unordered_pc_count: u32 = 0,
+    invalid_branch_target_count: u32 = 0,
+    unreachable_instruction_count: u32 = 0,
+
+    pub fn structurallyValid(self: ValidationReport) bool {
+        return self.duplicate_pc_count == 0 and
+            self.unordered_pc_count == 0 and
+            self.invalid_branch_target_count == 0;
+    }
+};
+
+pub const OptimizationReport = struct {
+    elided_nops: u32 = 0,
 };
 
 pub const Module = struct {
+    /// Decoded semantic payload owned by the IR. Keeping this copy makes the
+    /// backend consume the pipeline product rather than reaching around it to
+    /// the decoder's `Program`.
+    instructions: std.ArrayList(instruction.Instruction) = .empty,
     nodes: std.ArrayList(Node) = .empty,
+    blocks: std.ArrayList(BasicBlock) = .empty,
+    stage: PipelineStage = .decoded,
+    validation: ValidationReport = .{},
+    optimization: OptimizationReport = .{},
 
     pub fn deinit(self: *Module, allocator: std.mem.Allocator) void {
+        self.instructions.deinit(allocator);
         self.nodes.deinit(allocator);
+        self.blocks.deinit(allocator);
+        self.* = undefined;
+    }
+
+    /// Builds the instruction stream consumed by a code-generation backend.
+    /// Only proven no-ops are omitted; decoded PCs and branch targets remain
+    /// unchanged, so control-flow lowering has the same address domain.
+    pub fn emissionProgram(
+        self: *const Module,
+        allocator: std.mem.Allocator,
+    ) std.mem.Allocator.Error!instruction.Program {
+        var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+        errdefer program.deinit(allocator);
+        try program.instructions.ensureTotalCapacity(
+            allocator,
+            self.instructions.items.len -| self.optimization.elided_nops,
+        );
+        for (self.instructions.items, self.nodes.items) |inst, node| {
+            if (!node.elided) program.instructions.appendAssumeCapacity(inst);
+        }
+        return program;
     }
 };
 
 fn classify(inst: instruction.Instruction) struct { Operation, ValueType } {
     return switch (inst.opcode) {
-        .s_nop, .s_waitcnt, .s_barrier, .s_inst_prefetch, .v_nop => .{ .nop, .none },
+        .s_nop, .s_inst_prefetch, .v_nop => .{ .nop, .none },
+        .s_waitcnt, .s_waitcnt_depctr, .s_barrier => .{ .synchronization, .none },
         .s_mov_b32, .v_mov_b32 => .{ .move, .bits32 },
         .s_add_u32, .s_add_i32, .v_add_nc_u32, .v_addc_u32 => .{ .integer_add, .uint32 },
         .v_lshl_add_u32 => .{ .shift_left_add, .uint32 },
@@ -207,9 +281,179 @@ fn classify(inst: instruction.Instruction) struct { Operation, ValueType } {
     };
 }
 
+fn operationHasSideEffect(operation: Operation) bool {
+    return switch (operation) {
+        .branch,
+        .branch_conditional,
+        .memory,
+        .image,
+        .export_value,
+        .synchronization,
+        .end,
+        .opaque_instruction,
+        => true,
+        else => false,
+    };
+}
+
+fn instructionIndexAtPc(module: *const Module, pc: u32) ?usize {
+    for (module.nodes.items, 0..) |node, index| {
+        if (node.pc == pc) return index;
+    }
+    return null;
+}
+
+fn blockIndexAtPc(module: *const Module, pc: u32) ?u32 {
+    for (module.blocks.items, 0..) |block, index| {
+        if (block.start_pc == pc) return @intCast(index);
+    }
+    return null;
+}
+
+fn appendSuccessor(block: *BasicBlock, successor: ?u32) void {
+    const value = successor orelse return;
+    for (block.successors[0..block.successor_count]) |existing| {
+        if (existing == value) return;
+    }
+    if (block.successor_count == block.successors.len) return;
+    block.successors[block.successor_count] = value;
+    block.successor_count += 1;
+}
+
+/// Validates decoded-PC topology, builds basic blocks and marks reachability.
+/// Unsupported opcodes are diagnostics, not structural errors: a backend may
+/// support more of the ISA than the common optimizer understands.
+pub fn validate(allocator: std.mem.Allocator, module: *Module) std.mem.Allocator.Error!void {
+    module.validation = .{ .instruction_count = @intCast(module.nodes.items.len) };
+    module.blocks.clearRetainingCapacity();
+    for (module.nodes.items) |*node| node.reachable = false;
+    if (module.nodes.items.len == 0) {
+        module.stage = .validated;
+        return;
+    }
+
+    const leaders = try allocator.alloc(bool, module.nodes.items.len);
+    defer allocator.free(leaders);
+    @memset(leaders, false);
+    leaders[0] = true;
+
+    for (module.nodes.items, 0..) |node, index| {
+        if (node.operation == .opaque_instruction) module.validation.opaque_instruction_count += 1;
+        if (index != 0) {
+            const previous_pc = module.nodes.items[index - 1].pc;
+            if (node.pc == previous_pc) {
+                module.validation.duplicate_pc_count += 1;
+            } else if (node.pc < previous_pc) {
+                module.validation.unordered_pc_count += 1;
+            }
+        }
+        if (node.operation == .branch or node.operation == .branch_conditional) {
+            if (instructionIndexAtPc(module, node.branch_target)) |target_index| {
+                leaders[target_index] = true;
+            } else {
+                module.validation.invalid_branch_target_count += 1;
+            }
+            if (index + 1 < leaders.len) leaders[index + 1] = true;
+        } else if (node.operation == .end and index + 1 < leaders.len) {
+            leaders[index + 1] = true;
+        }
+    }
+
+    var first: usize = 0;
+    var index: usize = 1;
+    while (index <= leaders.len) : (index += 1) {
+        if (index != leaders.len and !leaders[index]) continue;
+        try module.blocks.append(allocator, .{
+            .first_node = @intCast(first),
+            .node_count = @intCast(index - first),
+            .start_pc = module.nodes.items[first].pc,
+        });
+        first = index;
+    }
+
+    for (module.blocks.items, 0..) |*block, block_index| {
+        const last_node_index = @as(usize, block.first_node) + block.node_count - 1;
+        const last = module.nodes.items[last_node_index];
+        const fallthrough: ?u32 = if (block_index + 1 < module.blocks.items.len)
+            @intCast(block_index + 1)
+        else
+            null;
+        switch (last.operation) {
+            .branch => appendSuccessor(block, blockIndexAtPc(module, last.branch_target)),
+            .branch_conditional => {
+                appendSuccessor(block, blockIndexAtPc(module, last.branch_target));
+                appendSuccessor(block, fallthrough);
+            },
+            .end => {},
+            else => appendSuccessor(block, fallthrough),
+        }
+    }
+
+    var worklist: std.ArrayList(u32) = .empty;
+    defer worklist.deinit(allocator);
+    try worklist.append(allocator, 0);
+    module.blocks.items[0].reachable = true;
+    var cursor: usize = 0;
+    while (cursor < worklist.items.len) : (cursor += 1) {
+        const block = module.blocks.items[worklist.items[cursor]];
+        for (block.successors[0..block.successor_count]) |successor| {
+            if (module.blocks.items[successor].reachable) continue;
+            module.blocks.items[successor].reachable = true;
+            try worklist.append(allocator, successor);
+        }
+    }
+    for (module.blocks.items) |block| {
+        const first_node: usize = @intCast(block.first_node);
+        const end_node = first_node + block.node_count;
+        for (module.nodes.items[first_node..end_node]) |*node| node.reachable = block.reachable;
+    }
+    for (module.nodes.items) |node| {
+        if (!node.reachable) module.validation.unreachable_instruction_count += 1;
+    }
+    module.validation.block_count = @intCast(module.blocks.items.len);
+    module.stage = .validated;
+}
+
+fn isBlockLeader(module: *const Module, node_index: usize) bool {
+    for (module.blocks.items) |block| {
+        if (block.first_node == node_index) return true;
+    }
+    return false;
+}
+
+/// Conservative IR optimization. Only decoded no-ops which are not branch
+/// destinations are elided; side effects and unreachable code are retained
+/// until a later SSA-based data-flow pass can prove them dead.
+pub fn optimize(module: *Module) void {
+    module.optimization = .{};
+    for (module.nodes.items, 0..) |*node, index| {
+        node.elided = false;
+        if (isBlockLeader(module, index)) continue;
+        if (node.opcode != .s_nop and node.opcode != .v_nop) continue;
+        node.elided = true;
+        module.optimization.elided_nops += 1;
+    }
+    module.stage = .optimized;
+}
+
+/// Final API-neutral legalization boundary. All current values already use
+/// backend-portable scalar types; keeping this as an explicit pass gives new
+/// 16/64-bit operations one well-defined place to be widened or split.
+pub fn legalize(module: *Module) void {
+    module.stage = .legalized;
+}
+
+pub fn runPipeline(allocator: std.mem.Allocator, module: *Module) std.mem.Allocator.Error!void {
+    module.stage = .typed;
+    try validate(allocator, module);
+    optimize(module);
+    legalize(module);
+}
+
 pub fn lower(allocator: std.mem.Allocator, program: *const instruction.Program) std.mem.Allocator.Error!Module {
     var module = Module{};
     errdefer module.deinit(allocator);
+    try module.instructions.appendSlice(allocator, program.instructions.items);
     try module.nodes.ensureTotalCapacity(allocator, program.instructions.items.len);
     for (program.instructions.items) |inst| {
         const kind = classify(inst);
@@ -222,6 +466,7 @@ pub fn lower(allocator: std.mem.Allocator, program: *const instruction.Program) 
             .dst2 = inst.dst2,
             .sources = inst.sources(),
             .branch_target = inst.branch_target,
+            .side_effect = operationHasSideEffect(kind[0]),
             .memory_access = if (kind[0] == .memory) .{
                 .byte_offset = inst.memory_offset,
                 .data_words = inst.data_words,
@@ -236,6 +481,7 @@ pub fn lower(allocator: std.mem.Allocator, program: *const instruction.Program) 
             } else null,
         });
     }
+    try runPipeline(allocator, &module);
     return module;
 }
 
@@ -288,4 +534,46 @@ test "vector arithmetic lowers to typed API-neutral nodes" {
     try std.testing.expectEqual(Operation.float_add, module.nodes.items[0].operation);
     try std.testing.expectEqual(ValueType.float32, module.nodes.items[0].value_type);
     try std.testing.expectEqual(Operation.end, module.nodes.items[1].operation);
+}
+
+test "IR pipeline builds CFG reachability and validates branch targets" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .opcode = .s_branch,
+        .branch_target = 8,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 4,
+        .opcode = .s_mov_b32,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 8,
+        .opcode = .s_endpgm,
+    });
+    var module = try lower(std.testing.allocator, &program);
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(PipelineStage.legalized, module.stage);
+    try std.testing.expect(module.validation.structurallyValid());
+    try std.testing.expectEqual(@as(u32, 3), module.validation.block_count);
+    try std.testing.expect(!module.nodes.items[1].reachable);
+    try std.testing.expectEqual(@as(u32, 1), module.validation.unreachable_instruction_count);
+}
+
+test "IR optimization elides only non-leader no-ops for emission" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{ .pc = 0, .opcode = .s_mov_b32 });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 4, .opcode = .s_nop });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 8, .opcode = .s_endpgm });
+    var module = try lower(std.testing.allocator, &program);
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 1), module.optimization.elided_nops);
+    var emission = try module.emissionProgram(std.testing.allocator);
+    defer emission.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), emission.instructions.items.len);
+    try std.testing.expectEqual(isa.Opcode.s_endpgm, emission.instructions.items[1].opcode);
 }

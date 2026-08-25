@@ -8,6 +8,7 @@ const isa = @import("isa.zig");
 const operand = @import("operand.zig");
 const instruction = @import("instruction.zig");
 const control_flow = @import("control_flow.zig");
+const shader_ir = @import("ir.zig");
 
 pub const Stage = enum(u32) {
     vertex = 0,
@@ -233,6 +234,10 @@ pub const Options = struct {
     /// Fragment EXP MRT0..7 bits. Empty leaves Location 0 declared so a
     /// pixel program that never exports still has a legal colour output.
     color_export_mask: u8 = 0,
+    /// Selects the logical guest EXP component written to every physical
+    /// Vulkan attachment component. Two bits per component; 0xe4 is RGBA.
+    /// CB_COLOR_INFO.COMP_SWAP supplies one mapping for each active MRT.
+    color_export_mappings: [8]u8 = @splat(0xe4),
     scalar_registers: []const ScalarRegister = &.{},
     dynamic_scalar_binding: ?DynamicScalarBinding = null,
     compute_inputs: ?ComputeInputs = null,
@@ -254,6 +259,7 @@ pub const Error = std.mem.Allocator.Error || control_flow.Error || error{
     InvalidStorageBinding,
     UnsupportedBufferAddressing,
     InvalidStageInterface,
+    InvalidIrStage,
 };
 
 pub const Module = struct {
@@ -477,6 +483,20 @@ fn storageImageNeedsExtendedFormats(format: StorageImageFormat) bool {
     };
 }
 
+/// A render-target component mapping names the logical shader component for
+/// each physical attachment component. Keeping this transformation in the
+/// fragment epilogue lets one resident VkImage retain the guest byte layout
+/// even when later draws bind the allocation with another COMP_SWAP value.
+fn remapColorExportComponents(components: [4]u32, mapping: u8) [4]u32 {
+    var result: [4]u32 = undefined;
+    for (&result, 0..) |*component, physical| {
+        const shift: u3 = @intCast(physical * 2);
+        const logical: u2 = @truncate(mapping >> shift);
+        component.* = components[logical];
+    }
+    return result;
+}
+
 const Builder = struct {
     allocator: std.mem.Allocator,
     annotations: std.ArrayList(u32) = .empty,
@@ -506,6 +526,7 @@ const Builder = struct {
     instance_index_input: u32 = 0,
     position_output: u32 = 0,
     color_outputs: [8]u32 = @splat(0),
+    color_export_mappings: [8]u8,
     parameter_variables: [32]u32 = @splat(0),
     /// BuiltIn FragCoord (float4) for fragment UV fallback when PARAM interps
     /// are not yet wired from the vertex stage.
@@ -592,6 +613,7 @@ const Builder = struct {
             .stage = options.stage,
             .vertex_index_vgpr = options.vertex_index_vgpr,
             .convert_negative_one_to_one_depth = options.convert_negative_one_to_one_depth,
+            .color_export_mappings = options.color_export_mappings,
             .storage_bindings = options.storage_buffers,
             .sampled_bindings = options.sampled_images,
             .storage_image_bindings = options.storage_images,
@@ -3969,8 +3991,22 @@ const Builder = struct {
             }); // OpFMul
             out_z = converted;
         }
+        var components = [4]u32{ x, y, out_z, out_w };
+        if (self.stage == .fragment and inst.export_target < self.color_export_mappings.len) {
+            components = remapColorExportComponents(
+                components,
+                self.color_export_mappings[inst.export_target],
+            );
+        }
         const vector = self.id();
-        try self.emit(&self.body, 80, &.{ self.vector4_type, vector, x, y, out_z, out_w }); // OpCompositeConstruct
+        try self.emit(&self.body, 80, &.{
+            self.vector4_type,
+            vector,
+            components[0],
+            components[1],
+            components[2],
+            components[3],
+        }); // OpCompositeConstruct
         try self.emit(&self.body, 62, &.{ output, vector }); // OpStore
     }
 
@@ -7550,6 +7586,20 @@ fn opcodeUsesWritePredicate(opcode: isa.Opcode) bool {
 /// Translates the executable ALU/SDWA subset and forward scalar selections.
 /// The writer fails explicitly for operations or control-flow shapes whose
 /// semantics are not implemented; it never emits a placeholder guest shader.
+pub fn translateIr(
+    allocator: std.mem.Allocator,
+    module: *const shader_ir.Module,
+    options: Options,
+) Error!Module {
+    if (module.stage != .legalized) return Error.InvalidIrStage;
+    var program = try module.emissionProgram(allocator);
+    defer program.deinit(allocator);
+    return translate(allocator, &program, options);
+}
+
+/// Low-level SPIR-V backend entry point. Runtime callers normally arrive via
+/// `translateIr`; this form remains public for backend unit tests and tools
+/// which deliberately construct decoded instructions by hand.
 pub fn translate(allocator: std.mem.Allocator, program: *const instruction.Program, options: Options) Error!Module {
     var effective = options;
     var has_predicated_write = false;
@@ -7770,6 +7820,28 @@ test "straight-line vector ALU translates to a SPIR-V function" {
     try std.testing.expectEqual(@as(u32, 0x0001_0500), module.words[1]);
     try std.testing.expect(containsOpcode(module.words, 129)); // OpFAdd
     try std.testing.expect(containsOpcode(module.words, 253)); // OpReturn
+}
+
+test "typed IR pipeline feeds SPIR-V emission" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        (@as(u32, 0x3f) << 25) | (@as(u32, 1) << 9) | 255,
+        0x3f80_0000,
+        (@as(u32, 3) << 25) | (@as(u32, 1) << 17) | 256,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var ir_module = try shader_ir.lower(std.testing.allocator, &program);
+    defer ir_module.deinit(std.testing.allocator);
+    var module = try translateIr(
+        std.testing.allocator,
+        &ir_module,
+        .{ .stage = .compute, .local_size = .{ 8, 1, 1 } },
+    );
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expectEqual(shader_ir.PipelineStage.legalized, ir_module.stage);
+    try std.testing.expect(containsOpcode(module.words, 129)); // OpFAdd
 }
 
 test "VOP1 signed I4 interpolation offset converts to fractional float" {
@@ -10535,4 +10607,17 @@ test "DPP quad_perm shuffles from the selected lane of the quad" {
     var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
     defer module.deinit(std.testing.allocator);
     try std.testing.expect(containsOpcode(module.words, 345)); // OpGroupNonUniformShuffle
+}
+
+test "fragment color export mapping selects logical channels for physical storage" {
+    const rgba = [4]u32{ 10, 20, 30, 40 };
+    try std.testing.expectEqual(rgba, remapColorExportComponents(rgba, 0xe4));
+    try std.testing.expectEqual(
+        [4]u32{ 30, 20, 10, 40 },
+        remapColorExportComponents(rgba, 0xc6),
+    );
+    try std.testing.expectEqual(
+        [4]u32{ 40, 30, 20, 10 },
+        remapColorExportComponents(rgba, 0x1b),
+    );
 }
