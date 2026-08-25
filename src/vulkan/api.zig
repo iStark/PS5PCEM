@@ -56,6 +56,7 @@ pub const CommandPool = u64;
 pub const Buffer = u64;
 pub const DeviceMemory = u64;
 pub const Fence = u64;
+pub const Semaphore = u64;
 pub const ShaderModule = u64;
 pub const PipelineLayout = u64;
 pub const Pipeline = u64;
@@ -79,6 +80,7 @@ pub const structure_type_submit_info: u32 = 4;
 pub const structure_type_memory_allocate_info: u32 = 5;
 pub const structure_type_mapped_memory_range: u32 = 6;
 pub const structure_type_fence_create_info: u32 = 8;
+pub const structure_type_semaphore_create_info: u32 = 9;
 pub const structure_type_buffer_create_info: u32 = 12;
 pub const structure_type_image_create_info: u32 = 14;
 pub const structure_type_image_view_create_info: u32 = 15;
@@ -111,6 +113,13 @@ pub const structure_type_image_memory_barrier: u32 = 45;
 pub const structure_type_swapchain_create_info_khr: u32 = 1_000_001_000;
 pub const structure_type_present_info_khr: u32 = 1_000_001_001;
 pub const structure_type_win32_surface_create_info_khr: u32 = 1_000_009_000;
+pub const structure_type_physical_device_features_2: u32 = 1_000_059_000;
+pub const structure_type_descriptor_set_layout_binding_flags_create_info: u32 = 1_000_161_000;
+pub const structure_type_physical_device_descriptor_indexing_features: u32 = 1_000_161_001;
+pub const structure_type_physical_device_timeline_semaphore_features: u32 = 1_000_207_000;
+pub const structure_type_semaphore_type_create_info: u32 = 1_000_207_002;
+pub const structure_type_timeline_semaphore_submit_info: u32 = 1_000_207_003;
+pub const structure_type_semaphore_wait_info: u32 = 1_000_207_004;
 
 pub const queue_graphics_bit: Flags = 0x0000_0001;
 pub const queue_compute_bit: Flags = 0x0000_0002;
@@ -353,7 +362,45 @@ pub const PhysicalDeviceFeatures = extern struct {
 };
 
 pub const feature_geometry_shader: usize = 4;
+pub const feature_fragment_stores_and_atomics: usize = 26;
 pub const feature_shader_storage_image_extended_formats: usize = 29;
+
+pub const PhysicalDeviceFeatures2 = extern struct {
+    s_type: u32 = structure_type_physical_device_features_2,
+    p_next: ?*anyopaque = null,
+    features: PhysicalDeviceFeatures = .{},
+};
+
+pub const PhysicalDeviceTimelineSemaphoreFeatures = extern struct {
+    s_type: u32 = structure_type_physical_device_timeline_semaphore_features,
+    p_next: ?*anyopaque = null,
+    timeline_semaphore: Bool32 = 0,
+};
+
+pub const PhysicalDeviceDescriptorIndexingFeatures = extern struct {
+    s_type: u32 = structure_type_physical_device_descriptor_indexing_features,
+    p_next: ?*anyopaque = null,
+    shader_input_attachment_array_dynamic_indexing: Bool32 = 0,
+    shader_uniform_texel_buffer_array_dynamic_indexing: Bool32 = 0,
+    shader_storage_texel_buffer_array_dynamic_indexing: Bool32 = 0,
+    shader_uniform_buffer_array_non_uniform_indexing: Bool32 = 0,
+    shader_sampled_image_array_non_uniform_indexing: Bool32 = 0,
+    shader_storage_buffer_array_non_uniform_indexing: Bool32 = 0,
+    shader_storage_image_array_non_uniform_indexing: Bool32 = 0,
+    shader_input_attachment_array_non_uniform_indexing: Bool32 = 0,
+    shader_uniform_texel_buffer_array_non_uniform_indexing: Bool32 = 0,
+    shader_storage_texel_buffer_array_non_uniform_indexing: Bool32 = 0,
+    descriptor_binding_uniform_buffer_update_after_bind: Bool32 = 0,
+    descriptor_binding_sampled_image_update_after_bind: Bool32 = 0,
+    descriptor_binding_storage_image_update_after_bind: Bool32 = 0,
+    descriptor_binding_storage_buffer_update_after_bind: Bool32 = 0,
+    descriptor_binding_uniform_texel_buffer_update_after_bind: Bool32 = 0,
+    descriptor_binding_storage_texel_buffer_update_after_bind: Bool32 = 0,
+    descriptor_binding_update_unused_while_pending: Bool32 = 0,
+    descriptor_binding_partially_bound: Bool32 = 0,
+    descriptor_binding_variable_descriptor_count: Bool32 = 0,
+    runtime_descriptor_array: Bool32 = 0,
+};
 
 pub const DeviceCreateInfo = extern struct {
     s_type: u32 = structure_type_device_create_info,
@@ -406,6 +453,37 @@ pub const FenceCreateInfo = extern struct {
     s_type: u32 = structure_type_fence_create_info,
     p_next: ?*const anyopaque = null,
     flags: Flags = 0,
+};
+
+pub const SemaphoreTypeCreateInfo = extern struct {
+    s_type: u32 = structure_type_semaphore_type_create_info,
+    p_next: ?*const anyopaque = null,
+    semaphore_type: u32 = 1,
+    initial_value: u64 = 0,
+};
+
+pub const SemaphoreCreateInfo = extern struct {
+    s_type: u32 = structure_type_semaphore_create_info,
+    p_next: ?*const anyopaque = null,
+    flags: Flags = 0,
+};
+
+pub const TimelineSemaphoreSubmitInfo = extern struct {
+    s_type: u32 = structure_type_timeline_semaphore_submit_info,
+    p_next: ?*const anyopaque = null,
+    wait_semaphore_value_count: u32 = 0,
+    wait_semaphore_values: ?[*]const u64 = null,
+    signal_semaphore_value_count: u32 = 0,
+    signal_semaphore_values: ?[*]const u64 = null,
+};
+
+pub const SemaphoreWaitInfo = extern struct {
+    s_type: u32 = structure_type_semaphore_wait_info,
+    p_next: ?*const anyopaque = null,
+    flags: Flags = 0,
+    semaphore_count: u32,
+    semaphores: [*]const Semaphore,
+    values: [*]const u64,
 };
 
 pub const BufferCreateInfo = extern struct {
@@ -516,6 +594,15 @@ pub const DescriptorSetLayoutBinding = extern struct {
     stage_flags: Flags,
     immutable_samplers: ?[*]const u64 = null,
 };
+
+pub const DescriptorSetLayoutBindingFlagsCreateInfo = extern struct {
+    s_type: u32 = structure_type_descriptor_set_layout_binding_flags_create_info,
+    p_next: ?*const anyopaque = null,
+    binding_count: u32,
+    binding_flags: [*]const Flags,
+};
+
+pub const descriptor_binding_partially_bound_bit: Flags = 0x0000_0004;
 
 pub const DescriptorSetLayoutCreateInfo = extern struct {
     s_type: u32 = structure_type_descriptor_set_layout_create_info,
@@ -971,6 +1058,7 @@ pub const PfnDestroyInstance = *const fn (Instance, ?*const anyopaque) callconv(
 pub const PfnEnumeratePhysicalDevices = *const fn (Instance, *u32, ?[*]PhysicalDevice) callconv(call) Result;
 pub const PfnGetPhysicalDeviceProperties = *const fn (PhysicalDevice, *anyopaque) callconv(call) void;
 pub const PfnGetPhysicalDeviceFeatures = *const fn (PhysicalDevice, *PhysicalDeviceFeatures) callconv(call) void;
+pub const PfnGetPhysicalDeviceFeatures2 = *const fn (PhysicalDevice, *PhysicalDeviceFeatures2) callconv(call) void;
 pub const PfnGetPhysicalDeviceQueueFamilyProperties = *const fn (PhysicalDevice, *u32, ?[*]QueueFamilyProperties) callconv(call) void;
 pub const PfnGetPhysicalDeviceMemoryProperties = *const fn (PhysicalDevice, *PhysicalDeviceMemoryProperties) callconv(call) void;
 pub const PfnCreateDevice = *const fn (PhysicalDevice, *const DeviceCreateInfo, ?*const anyopaque, *?Device) callconv(call) Result;
@@ -1016,6 +1104,10 @@ pub const PfnCreatePipelineCache = *const fn (Device, *const PipelineCacheCreate
 pub const PfnDestroyPipelineCache = *const fn (Device, PipelineCache, ?*const anyopaque) callconv(call) void;
 pub const PfnGetPipelineCacheData = *const fn (Device, PipelineCache, *usize, ?*anyopaque) callconv(call) Result;
 pub const PfnResetFences = *const fn (Device, u32, [*]const Fence) callconv(call) Result;
+pub const PfnCreateSemaphore = *const fn (Device, *const SemaphoreCreateInfo, ?*const anyopaque, *Semaphore) callconv(call) Result;
+pub const PfnDestroySemaphore = *const fn (Device, Semaphore, ?*const anyopaque) callconv(call) void;
+pub const PfnGetSemaphoreCounterValue = *const fn (Device, Semaphore, *u64) callconv(call) Result;
+pub const PfnWaitSemaphores = *const fn (Device, *const SemaphoreWaitInfo, u64) callconv(call) Result;
 pub const PfnCreateDescriptorSetLayout = *const fn (Device, *const DescriptorSetLayoutCreateInfo, ?*const anyopaque, *DescriptorSetLayout) callconv(call) Result;
 pub const PfnDestroyDescriptorSetLayout = *const fn (Device, DescriptorSetLayout, ?*const anyopaque) callconv(call) void;
 pub const PfnCreateDescriptorPool = *const fn (Device, *const DescriptorPoolCreateInfo, ?*const anyopaque, *DescriptorPool) callconv(call) Result;

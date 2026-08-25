@@ -346,6 +346,9 @@ comptime {
 
 threadlocal var active_native_frame: ?*NativeCallFrame = null;
 threadlocal var handling_native_fault = false;
+/// AddressSpace's page tracker must also see writes made by guest-created host
+/// workers which are not currently inside NativeBridge.execute's TLS frame.
+var gpu_tracking_address_space: std.atomic.Value(usize) = .init(0);
 
 /// How many times the host dropped a guest thread pointer and it was put back.
 ///
@@ -485,6 +488,7 @@ pub const NativeBridge = struct {
             .fault_handler_handle = fault_handler_handle,
             .initialized = true,
         };
+        gpu_tracking_address_space.store(@intFromPtr(address_space), .release);
     }
 
     pub fn deinit(self: *NativeBridge) void {
@@ -493,6 +497,9 @@ pub const NativeBridge = struct {
         std.debug.assert(self.active_frames.items.len == 0);
         self.active_frames.deinit(self.allocator);
         self.lock.unlock();
+        if (gpu_tracking_address_space.load(.acquire) == @intFromPtr(self.address_space)) {
+            gpu_tracking_address_space.store(0, .release);
+        }
         if (self.fault_handler_handle) |handle| {
             NativeMachine.removeFaultHandler(handle);
         }
@@ -830,11 +837,24 @@ const WindowsX64Machine = struct {
     fn handleGuestException(
         exception: *std.os.windows.EXCEPTION_POINTERS,
     ) callconv(.winapi) c_long {
-        const frame = active_native_frame orelse
-            return std.os.windows.EXCEPTION_CONTINUE_SEARCH;
-
         const record = exception.ExceptionRecord;
         const context = exception.ContextRecord;
+
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 1)
+        {
+            const space_address = gpu_tracking_address_space.load(.acquire);
+            if (space_address != 0) {
+                const space: *memory.AddressSpace = @ptrFromInt(space_address);
+                if (space.handleGpuTrackedWriteFault(record.ExceptionInformation[1])) {
+                    return exception_continue_execution;
+                }
+            }
+        }
+
+        const frame = active_native_frame orelse
+            return std.os.windows.EXCEPTION_CONTINUE_SEARCH;
 
         // Checked before anything else, including the reentrancy guard: a lost
         // thread pointer is not a fault to report but a host condition to

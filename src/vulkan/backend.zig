@@ -18,6 +18,7 @@ const builtin = @import("builtin");
 const gpu = @import("gpu");
 const vk = @import("api.zig");
 const detile_spirv = @import("detile_spirv.zig");
+const image_alias = @import("image_alias.zig");
 
 /// Set to true to enable verbose per-frame GPU debug logging.
 /// Disable for performance — each print is a blocking I/O syscall.
@@ -77,6 +78,10 @@ pub const Error = error{
     DescriptorSetAllocationFailed,
     FenceCreationFailed,
     FenceResetFailed,
+    TimelineSemaphoreUnavailable,
+    TimelineSemaphoreCreationFailed,
+    TimelineSemaphoreQueryFailed,
+    TimelineSemaphoreWaitFailed,
     QueueSubmissionFailed,
     FenceWaitFailed,
     DeviceWaitFailed,
@@ -277,6 +282,14 @@ pub const GuestMemory = struct {
     context: ?*anyopaque,
     read: *const fn (?*anyopaque, u64, []u8) bool,
     write: *const fn (?*anyopaque, u64, []const u8) bool,
+    /// Arms write tracking for the guest pages backing this GPU read and
+    /// returns their combined generation. A later CPU/native write changes
+    /// the generation before making the page writable again.
+    track_gpu_read: ?*const fn (?*anyopaque, u64, usize) u64 = null,
+    /// Returns the generation of an already tracked range without changing
+    /// host page protection. Zero means the range is not tracked.
+    gpu_generation: ?*const fn (?*anyopaque, u64, usize) u64 = null,
+    tracking_page_size: usize = 16 * 1024,
     /// Optional AGC registry lookup. A renderer embedding can expose relocated
     /// shader headers without coupling the API-neutral GPU module back to HLE.
     shader_header: ?*const fn (?*anyopaque, u64) ?u64 = null,
@@ -346,6 +359,7 @@ const InstanceFunctions = struct {
     enumerate_physical_devices: vk.PfnEnumeratePhysicalDevices,
     get_physical_device_properties: vk.PfnGetPhysicalDeviceProperties,
     get_physical_device_features: vk.PfnGetPhysicalDeviceFeatures,
+    get_physical_device_features_2: vk.PfnGetPhysicalDeviceFeatures2,
     get_queue_family_properties: vk.PfnGetPhysicalDeviceQueueFamilyProperties,
     get_memory_properties: vk.PfnGetPhysicalDeviceMemoryProperties,
     create_device: vk.PfnCreateDevice,
@@ -357,6 +371,7 @@ const InstanceFunctions = struct {
             .enumerate_physical_devices = try loader.instance(instance_handle, vk.PfnEnumeratePhysicalDevices, "vkEnumeratePhysicalDevices"),
             .get_physical_device_properties = try loader.instance(instance_handle, vk.PfnGetPhysicalDeviceProperties, "vkGetPhysicalDeviceProperties"),
             .get_physical_device_features = try loader.instance(instance_handle, vk.PfnGetPhysicalDeviceFeatures, "vkGetPhysicalDeviceFeatures"),
+            .get_physical_device_features_2 = try loader.instance(instance_handle, vk.PfnGetPhysicalDeviceFeatures2, "vkGetPhysicalDeviceFeatures2"),
             .get_queue_family_properties = try loader.instance(instance_handle, vk.PfnGetPhysicalDeviceQueueFamilyProperties, "vkGetPhysicalDeviceQueueFamilyProperties"),
             .get_memory_properties = try loader.instance(instance_handle, vk.PfnGetPhysicalDeviceMemoryProperties, "vkGetPhysicalDeviceMemoryProperties"),
             .create_device = try loader.instance(instance_handle, vk.PfnCreateDevice, "vkCreateDevice"),
@@ -400,6 +415,10 @@ const DeviceFunctions = struct {
     destroy_fence: vk.PfnDestroyFence,
     wait_for_fences: vk.PfnWaitForFences,
     reset_fences: vk.PfnResetFences,
+    create_semaphore: vk.PfnCreateSemaphore,
+    destroy_semaphore: vk.PfnDestroySemaphore,
+    get_semaphore_counter_value: vk.PfnGetSemaphoreCounterValue,
+    wait_semaphores: vk.PfnWaitSemaphores,
     create_buffer: vk.PfnCreateBuffer,
     destroy_buffer: vk.PfnDestroyBuffer,
     get_buffer_memory_requirements: vk.PfnGetBufferMemoryRequirements,
@@ -471,6 +490,10 @@ const DeviceFunctions = struct {
             .destroy_fence = try deviceProc(get_proc, device, vk.PfnDestroyFence, "vkDestroyFence"),
             .wait_for_fences = try deviceProc(get_proc, device, vk.PfnWaitForFences, "vkWaitForFences"),
             .reset_fences = try deviceProc(get_proc, device, vk.PfnResetFences, "vkResetFences"),
+            .create_semaphore = try deviceProc(get_proc, device, vk.PfnCreateSemaphore, "vkCreateSemaphore"),
+            .destroy_semaphore = try deviceProc(get_proc, device, vk.PfnDestroySemaphore, "vkDestroySemaphore"),
+            .get_semaphore_counter_value = try deviceProc(get_proc, device, vk.PfnGetSemaphoreCounterValue, "vkGetSemaphoreCounterValue"),
+            .wait_semaphores = try deviceProc(get_proc, device, vk.PfnWaitSemaphores, "vkWaitSemaphores"),
             .create_buffer = try deviceProc(get_proc, device, vk.PfnCreateBuffer, "vkCreateBuffer"),
             .destroy_buffer = try deviceProc(get_proc, device, vk.PfnDestroyBuffer, "vkDestroyBuffer"),
             .get_buffer_memory_requirements = try deviceProc(get_proc, device, vk.PfnGetBufferMemoryRequirements, "vkGetBufferMemoryRequirements"),
@@ -575,6 +598,12 @@ const DrawUploadSlice = struct {
     size: vk.DeviceSize,
 };
 
+const DrawUploadCacheEntry = struct {
+    guest_address: u64,
+    size: usize,
+    upload: DrawUploadSlice,
+};
+
 const DeferredVulkanObject = union(enum) {
     buffer: OwnedBuffer,
     image: OwnedImage,
@@ -586,6 +615,13 @@ const DeferredVulkanObject = union(enum) {
     shader_module: vk.ShaderModule,
     storage_image_release: usize,
 };
+
+const DeferredVulkanObjectEntry = struct {
+    retire_tick: u64,
+    object: DeferredVulkanObject,
+};
+
+const command_buffer_pending_tick = std.math.maxInt(u64);
 
 // Guest vertex/constant ranges are highly transient. A bounded LRU avoids
 // keeping hundreds of individual Vulkan allocations alive after the title has
@@ -609,11 +645,14 @@ const dynamic_scalar_buffer_bytes = dynamic_scalar_buffer_words * @sizeOf(u32);
 const maximum_frame_descriptor_sets = 256;
 const descriptor_scalar_stride = std.mem.alignForward(usize, dynamic_scalar_buffer_bytes, 256);
 const descriptor_scalar_ring_bytes = descriptor_scalar_stride * maximum_frame_descriptor_sets;
+const gds_slot_bytes = 64 * 1024;
+const gds_ring_bytes = gds_slot_bytes * maximum_frame_descriptor_sets;
 /// Read-only vertex/constant ranges are copied into one persistently mapped
 /// per-frame arena. It snapshots guest data for queued draws without creating
 /// and freeing one Vulkan allocation per binding.
 const draw_upload_ring_bytes = 128 * 1024 * 1024;
 const draw_upload_alignment = 256;
+const maximum_async_command_buffers = 256;
 const maximum_storage_mappings = 1024;
 
 fn reserveAlignedRange(cursor: *usize, capacity: usize, bytes: usize, alignment: usize) ?usize {
@@ -744,6 +783,9 @@ const GuestBufferEntry = struct {
     device_local: OwnedBuffer,
     last_used_sequence: u64,
     gpu_dirty: bool = false,
+    /// Ordered fingerprint of the 16 KiB guest pages copied into device_local.
+    /// Zero selects the legacy upload path when tracking is unavailable.
+    page_generation: u64 = 0,
 };
 
 const ComputePipelineEntry = struct {
@@ -971,9 +1013,10 @@ fn colorTargetFormat(descriptor: gpu.resources.ColorTarget) ?ColorTargetFormat {
             .{ .vulkan = vk.format_b10g11r11_ufloat_pack32, .bytes_per_texel = 4 }
         else
             null,
-        // DATA_FORMAT_10_10_10_2 + NUMBER_FORMAT_UNORM in the standard
-        // component order maps directly to Vulkan's packed attachment format.
-        9 => if (descriptor.number_type == 0 and descriptor.component_swap == 0)
+        // DATA_FORMAT_10_10_10_2 + NUMBER_FORMAT_UNORM. COMP_SWAP is handled
+        // in the fragment export epilogue while the packed byte layout stays
+        // resident in one host image.
+        9 => if (descriptor.number_type == 0)
             .{ .vulkan = vk.format_a2b10g10r10_unorm_pack32, .bytes_per_texel = 4 }
         else
             null,
@@ -993,6 +1036,43 @@ fn colorTargetFormat(descriptor: gpu.resources.ColorTarget) ?ColorTargetFormat {
             null,
         else => null,
     };
+}
+
+const color_export_identity: u8 = 0xe4;
+
+fn colorTargetComponentCount(format: u8) ?usize {
+    return switch (format) {
+        2 => 1,
+        5 => 2,
+        6 => 3,
+        9, 10, 12, 14 => 4,
+        else => null,
+    };
+}
+
+/// CB_COLOR_INFO.COMP_SWAP selects the logical fragment export placed in each
+/// physical surface component. Unused selectors complete a permutation so the
+/// same mapping can also translate CB_TARGET_MASK into Vulkan write-mask bits.
+fn colorTargetExportMapping(descriptor: gpu.resources.ColorTarget) u8 {
+    const component_count = colorTargetComponentCount(descriptor.format) orelse
+        return color_export_identity;
+    const mappings = [4][4]u8{
+        .{ 0xe4, 0xe4, 0xe4, 0xe4 },
+        .{ 0xe1, 0x6c, 0xb4, 0xc6 },
+        .{ 0xc6, 0xe1, 0xc6, 0x1b },
+        .{ 0x27, 0x63, 0x87, 0x93 },
+    };
+    return mappings[descriptor.component_swap][component_count - 1];
+}
+
+fn mapColorWriteMask(logical_mask: u8, mapping: u8) u32 {
+    var physical_mask: u32 = 0;
+    for (0..4) |physical| {
+        const shift: u3 = @intCast(physical * 2);
+        const logical: u2 = @truncate(mapping >> shift);
+        physical_mask |= @as(u32, (logical_mask >> logical) & 1) << @intCast(physical);
+    }
+    return physical_mask;
 }
 
 /// The Vulkan attachment format for a guest depth plane.
@@ -1137,6 +1217,7 @@ fn displayColorTarget(buffer: DisplayBuffer) ?gpu.resources.ColorTarget {
 /// every pixel through the CPU after each draw, which both destroyed
 /// multi-pass composition and serialized the host GPU.
 const CachedRenderTarget = struct {
+    alias_token: image_alias.Token,
     target: GuestColorTarget,
     image: OwnedImage,
     view: vk.ImageView,
@@ -1163,6 +1244,7 @@ const CachedRenderTarget = struct {
 /// than being handed to the rasterizer.
 const GuestDepthTarget = struct {
     address: u64,
+    allocation_bytes: u64,
     width: u32,
     height: u32,
     /// DB_Z_INFO.FORMAT, kept so a re-decode of the same registers matches.
@@ -1178,6 +1260,7 @@ const GuestDepthTarget = struct {
 
     fn sameAllocation(self: GuestDepthTarget, other: GuestDepthTarget) bool {
         return self.address == other.address and
+            self.allocation_bytes == other.allocation_bytes and
             self.width == other.width and
             self.height == other.height and
             self.guest_format == other.guest_format and
@@ -1202,6 +1285,7 @@ const GuestDepthTarget = struct {
 /// onwards; importing tiled guest depth would add a conversion this path does
 /// not need yet.
 const CachedDepthTarget = struct {
+    alias_token: image_alias.Token,
     target: GuestDepthTarget,
     image: OwnedImage,
     view: vk.ImageView,
@@ -1622,6 +1706,7 @@ const PreparedStorageImage = struct {
 };
 
 const CachedStorageImage = struct {
+    alias_token: image_alias.Token,
     descriptor: gpu.ImageDescriptor,
     subresource: gpu.TextureSubresourceLayout,
     image: OwnedImage,
@@ -1632,6 +1717,7 @@ const CachedStorageImage = struct {
     last_used_sequence: u64,
     guest_content_hash: u64 = 0,
     guest_content_hash_valid: bool = false,
+    guest_page_generation: u64 = 0,
     gpu_dirty: bool = false,
     in_use: bool = false,
     valid: bool = true,
@@ -1900,6 +1986,7 @@ fn sampledImageDimensionForInstruction(
 }
 
 const CachedSampledImage = struct {
+    alias_token: image_alias.Token,
     guest_address: u64,
     width: u32,
     height: u32,
@@ -1919,6 +2006,51 @@ const CachedSampledImage = struct {
     last_used_frame: u64,
 };
 
+fn aliasRange(address: u64, byte_count: anytype) image_alias.Range {
+    return .{ .address = address, .size = @intCast(byte_count) };
+}
+
+fn colorTargetAliasSignature(target: GuestColorTarget) image_alias.Signature {
+    return .{
+        .format = target.format.vulkan,
+        .width = target.descriptor.width,
+        .height = target.descriptor.height,
+        .tile_mode = @intFromEnum(target.descriptor.tile_mode),
+        .samples_log2 = target.descriptor.fragments_log2,
+    };
+}
+
+fn depthTargetAliasSignature(target: GuestDepthTarget) image_alias.Signature {
+    return .{
+        .format = target.format,
+        .width = target.width,
+        .height = target.height,
+        .tile_mode = @intFromEnum(target.tile_mode),
+        .samples_log2 = target.samples_log2,
+        .aspect = if (target.has_stencil) .depth_stencil else .depth,
+    };
+}
+
+fn descriptorAliasSignature(
+    descriptor: gpu.ImageDescriptor,
+    image_format: u32,
+    mip_levels: u8,
+) image_alias.Signature {
+    return .{
+        .format = image_format,
+        .width = descriptor.width,
+        .height = descriptor.height,
+        .depth = if (descriptor.image_type == .color_3d) descriptor.depth_or_layers else 1,
+        .mip_levels = mip_levels,
+        .layers = if (descriptor.image_type == .color_3d)
+            1
+        else
+            @intCast(@min(descriptor.depth_or_layers, std.math.maxInt(u16))),
+        .tile_mode = @intFromEnum(descriptor.tile_mode),
+        .samples_log2 = descriptor.samplesLog2(),
+    };
+}
+
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
     loader: Loader,
@@ -1930,27 +2062,40 @@ pub const Renderer = struct {
     queue: vk.Queue,
     queue_family_index: u32,
     command_pool: vk.CommandPool,
+    timeline_semaphore: vk.Semaphore,
+    submitted_tick: u64 = 0,
+    completed_tick: u64 = 0,
     descriptor_set_layout: vk.DescriptorSetLayout,
     descriptor_pool: vk.DescriptorPool,
     descriptor_sets: []vk.DescriptorSet,
     descriptor_set: vk.DescriptorSet,
-    descriptor_slots_used: usize = 0,
+    descriptor_cursor: usize = 0,
+    descriptor_slot_ticks: [maximum_frame_descriptor_sets]u64 = @splat(0),
+    pending_descriptor_slots: std.ArrayList(usize) = .empty,
+    current_descriptor_slot: ?usize = null,
     dynamic_scalar_buffer: ?OwnedBuffer = null,
     dynamic_scalar_mapping_base: ?[*]u32 = null,
     dynamic_scalar_mapping: ?[*]u32 = null,
     draw_upload_buffer: ?OwnedBuffer = null,
     draw_upload_mapping: ?[*]u8 = null,
     draw_upload_offset: usize = 0,
+    /// Exact guest ranges already snapshotted into the current draw arena.
+    /// Command-processor writes and dispatches close the batch before they can
+    /// invalidate these entries, so later draws may safely reuse each slice.
+    draw_upload_cache: std.ArrayList(DrawUploadCacheEntry) = .empty,
     gds_buffer: ?OwnedBuffer = null,
     /// Commands recorded by the current guest frame. Graphics work appends to
     /// this ring and reaches the Vulkan queue as one ordered submission at a
     /// guest release/flip instead of one submit-and-wait per draw.
     frame_command_buffers: std.ArrayList(vk.CommandBuffer) = .empty,
-    frame_command_count: usize = 0,
+    command_buffer_ticks: std.ArrayList(u64) = .empty,
+    pending_command_buffers: std.ArrayList(vk.CommandBuffer) = .empty,
+    pending_command_slots: std.ArrayList(usize) = .empty,
     recording_command_buffer: ?vk.CommandBuffer = null,
+    recording_command_slot: ?usize = null,
     draw_batch_active: bool = false,
-    deferred_vulkan_objects: std.ArrayList(DeferredVulkanObject) = .empty,
-    one_shot_fence: vk.Fence = 0,
+    draw_uploads_enabled: bool = false,
+    deferred_vulkan_objects: std.ArrayList(DeferredVulkanObjectEntry) = .empty,
     compute_pipeline_layout: vk.PipelineLayout,
     detile_set_layout: vk.DescriptorSetLayout = 0,
     detile_pool: vk.DescriptorPool = 0,
@@ -2005,6 +2150,9 @@ pub const Renderer = struct {
     compute_pipelines: std.ArrayList(ComputePipelineEntry) = .empty,
     compute_pipeline_sequence: u64 = 0,
     graphics_pipelines: std.ArrayList(GraphicsPipelineEntry) = .empty,
+    /// Coherency domain shared by all Vulkan image caches. Separately-created
+    /// host images which overlap in guest memory observe the same generation.
+    image_aliases: image_alias.Manager = .{},
     sampled_image_cache: std.ArrayList(CachedSampledImage) = .empty,
     storage_image_cache: std.ArrayList(CachedStorageImage) = .empty,
     storage_image_cache_bytes: usize = 0,
@@ -2199,11 +2347,21 @@ pub const Renderer = struct {
             .queue_priorities = @ptrCast(&queue_priority),
         };
         const device_extension_names = [_][*:0]const u8{"VK_KHR_swapchain"};
-        var supported_features = vk.PhysicalDeviceFeatures{};
-        instance_functions.get_physical_device_features(candidate.physical_device, &supported_features);
+        var descriptor_indexing_support = vk.PhysicalDeviceDescriptorIndexingFeatures{};
+        var timeline_support = vk.PhysicalDeviceTimelineSemaphoreFeatures{
+            .p_next = &descriptor_indexing_support,
+        };
+        var supported_features_2 = vk.PhysicalDeviceFeatures2{ .p_next = &timeline_support };
+        instance_functions.get_physical_device_features_2(candidate.physical_device, &supported_features_2);
+        if (timeline_support.timeline_semaphore == 0) return Error.TimelineSemaphoreUnavailable;
+        const descriptor_partially_bound = descriptor_indexing_support.descriptor_binding_partially_bound != 0;
+        const supported_features = supported_features_2.features;
         var enabled_features = vk.PhysicalDeviceFeatures{};
         if (supported_features.values[vk.feature_shader_storage_image_extended_formats] != 0) {
             enabled_features.values[vk.feature_shader_storage_image_extended_formats] = vk.true_value;
+        }
+        if (supported_features.values[vk.feature_fragment_stores_and_atomics] != 0) {
+            enabled_features.values[vk.feature_fragment_stores_and_atomics] = vk.true_value;
         }
         // A rectangle list needs a stage that sees the whole primitive, so
         // that the corner it leaves out can be completed from the three it
@@ -2212,7 +2370,15 @@ pub const Renderer = struct {
         if (geometry_shaders) {
             enabled_features.values[vk.feature_geometry_shader] = vk.true_value;
         }
+        var descriptor_indexing_enable = vk.PhysicalDeviceDescriptorIndexingFeatures{
+            .descriptor_binding_partially_bound = if (descriptor_partially_bound) vk.true_value else 0,
+        };
+        var timeline_enable = vk.PhysicalDeviceTimelineSemaphoreFeatures{
+            .p_next = if (descriptor_partially_bound) &descriptor_indexing_enable else null,
+            .timeline_semaphore = vk.true_value,
+        };
         const device_info = vk.DeviceCreateInfo{
+            .p_next = &timeline_enable,
             .queue_create_info_count = 1,
             .queue_create_infos = @ptrCast(&queue_info),
             .enabled_extension_count = if (wants_presentation) device_extension_names.len else 0,
@@ -2234,6 +2400,14 @@ pub const Renderer = struct {
         var maybe_queue: ?vk.Queue = null;
         device_functions.get_device_queue(device, candidate.queue_family_index, 0, &maybe_queue);
         const queue = maybe_queue orelse return Error.QueueUnavailable;
+
+        const semaphore_type = vk.SemaphoreTypeCreateInfo{};
+        const semaphore_info = vk.SemaphoreCreateInfo{ .p_next = &semaphore_type };
+        var timeline_semaphore: vk.Semaphore = 0;
+        if (device_functions.create_semaphore(device, &semaphore_info, null, &timeline_semaphore) != vk.success) {
+            return Error.TimelineSemaphoreCreationFailed;
+        }
+        errdefer device_functions.destroy_semaphore(device, timeline_semaphore, null);
 
         const pool_info = vk.CommandPoolCreateInfo{
             .flags = vk.command_pool_create_transient_bit | vk.command_pool_create_reset_command_buffer_bit,
@@ -2305,7 +2479,16 @@ pub const Renderer = struct {
             .descriptor_count = 1,
             .stage_flags = vk.shader_stage_compute_bit,
         };
+        var descriptor_binding_flags: [descriptor_bindings.len]vk.Flags = @splat(0);
+        if (descriptor_partially_bound) {
+            @memset(&descriptor_binding_flags, vk.descriptor_binding_partially_bound_bit);
+        }
+        const descriptor_binding_flags_info = vk.DescriptorSetLayoutBindingFlagsCreateInfo{
+            .binding_count = descriptor_binding_flags.len,
+            .binding_flags = &descriptor_binding_flags,
+        };
         const descriptor_layout_info = vk.DescriptorSetLayoutCreateInfo{
+            .p_next = if (descriptor_partially_bound) &descriptor_binding_flags_info else null,
             .binding_count = descriptor_bindings.len,
             .bindings = &descriptor_bindings,
         };
@@ -2423,6 +2606,7 @@ pub const Renderer = struct {
             .queue = queue,
             .queue_family_index = candidate.queue_family_index,
             .command_pool = command_pool,
+            .timeline_semaphore = timeline_semaphore,
             .descriptor_set_layout = descriptor_set_layout,
             .descriptor_pool = descriptor_pool,
             .descriptor_sets = descriptor_sets,
@@ -2485,11 +2669,6 @@ pub const Renderer = struct {
         renderer.draw_upload_mapping = @ptrCast(draw_upload_mapping orelse return Error.MemoryMapFailed);
         errdefer device_functions.unmap_memory(device, renderer.draw_upload_buffer.?.memory);
 
-        const one_shot_fence_info = vk.FenceCreateInfo{};
-        if (device_functions.create_fence(device, &one_shot_fence_info, null, &renderer.one_shot_fence) != vk.success) {
-            return Error.FenceCreationFailed;
-        }
-        errdefer device_functions.destroy_fence(device, renderer.one_shot_fence, null);
         for (descriptor_sets, 0..) |set, slot| {
             const scalar_buffer_info = vk.DescriptorBufferInfo{
                 .buffer = renderer.dynamic_scalar_buffer.?.handle,
@@ -2510,7 +2689,7 @@ pub const Renderer = struct {
         errdefer renderer.gds_storage.deinit(allocator);
         @memset(renderer.gds_storage.items, 0);
         renderer.gds_buffer = try renderer.createBuffer(
-            renderer.gds_storage.items.len,
+            gds_ring_bytes,
             vk.buffer_usage_storage_buffer_bit,
             vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
         );
@@ -2526,6 +2705,7 @@ pub const Renderer = struct {
     pub fn deinit(self: *Renderer) void {
         self.finishDrawBatch() catch {};
         _ = self.device_functions.device_wait_idle(self.device);
+        self.completed_tick = self.submitted_tick;
         self.destroyDeferredVulkanObjects();
         self.pending_targetless_draws.deinit(self.allocator);
         for (self.color_passes.items) |pass| self.destroyColorPass(pass);
@@ -2549,6 +2729,7 @@ pub const Renderer = struct {
             self.destroyBuffer(image.transfer);
         }
         self.storage_image_cache.deinit(self.allocator);
+        self.image_aliases.deinit(self.allocator);
         for (self.compute_pipelines.items) |entry| {
             self.device_functions.destroy_pipeline(self.device, entry.pipeline, null);
             self.device_functions.destroy_shader_module(self.device, entry.shader, null);
@@ -2573,6 +2754,7 @@ pub const Renderer = struct {
             self.destroyBuffer(entry.device_local);
         }
         self.guest_buffers.deinit(self.allocator);
+        self.draw_upload_cache.deinit(self.allocator);
         if (self.linear_upload_buffer) |buffer| self.destroyBuffer(buffer);
         if (self.magnify_source_image) |image| self.destroyImage(image);
         if (self.draw_upload_buffer) |buffer| {
@@ -2584,7 +2766,6 @@ pub const Renderer = struct {
             self.destroyBuffer(buffer);
         }
         if (self.gds_buffer) |buffer| self.destroyBuffer(buffer);
-        if (self.one_shot_fence != 0) self.device_functions.destroy_fence(self.device, self.one_shot_fence, null);
         self.gds_storage.deinit(self.allocator);
         // Persist compiled pipelines for the next run before the cache handle
         // is destroyed.
@@ -2597,6 +2778,10 @@ pub const Renderer = struct {
         if (self.detile_set_layout != 0) self.device_functions.destroy_descriptor_set_layout(self.device, self.detile_set_layout, null);
         self.device_functions.destroy_pipeline_layout(self.device, self.compute_pipeline_layout, null);
         self.frame_command_buffers.deinit(self.allocator);
+        self.command_buffer_ticks.deinit(self.allocator);
+        self.pending_command_buffers.deinit(self.allocator);
+        self.pending_command_slots.deinit(self.allocator);
+        self.pending_descriptor_slots.deinit(self.allocator);
         self.deferred_vulkan_objects.deinit(self.allocator);
         self.allocator.free(self.descriptor_sets);
         self.device_functions.destroy_descriptor_pool(self.device, self.descriptor_pool, null);
@@ -2610,6 +2795,7 @@ pub const Renderer = struct {
             self.device_functions.destroy_fence(self.device, presentation.acquire_fence, null);
             presentation.surface_functions.destroy_surface(self.instance_handle, presentation.surface, null);
         }
+        self.device_functions.destroy_semaphore(self.device, self.timeline_semaphore, null);
         self.device_functions.destroy_device(self.device, null);
         self.instance_functions.destroy_instance(self.instance_handle, null);
         self.loader.deinit();
@@ -2980,6 +3166,7 @@ pub const Renderer = struct {
         self.guest_buffer_sequence +%= 1;
 
         var entry_index: ?usize = null;
+        var recycled_entry = false;
         for (self.guest_buffers.items, 0..) |entry, index| {
             if (entry.guest_address == guest_address and entry.size == size) {
                 entry_index = index;
@@ -3071,7 +3258,9 @@ pub const Renderer = struct {
                 victim.size = size;
                 victim.last_used_sequence = self.guest_buffer_sequence;
                 victim.gpu_dirty = false;
+                victim.page_generation = 0;
                 entry_index = victim_index;
+                recycled_entry = true;
             }
             self.buffer_cache_misses += 1;
         } else {
@@ -3082,7 +3271,84 @@ pub const Renderer = struct {
         entry.last_used_sequence = self.guest_buffer_sequence;
         if (!entry.gpu_dirty) {
             try self.flushGuestStorageImageRange(guest_address, size);
-            if (self.draw_batch_active) {
+            const tracked_generation = if (memory.track_gpu_read) |track|
+                track(memory.context, guest_address, size)
+            else
+                0;
+            if (tracked_generation != 0 and (!self.draw_uploads_enabled or cache_hit)) {
+                if (entry.page_generation != tracked_generation) {
+                    // The backing buffer may still be read by an older timeline
+                    // tick. Changed pages are uncommon; wait only on that path,
+                    // while unchanged draws bind the persistent copy directly.
+                    if (cache_hit or recycled_entry) try self.waitForSubmittedWork();
+                    var mapped: ?*anyopaque = null;
+                    if (self.device_functions.map_memory(self.device, entry.device_local.memory, 0, size, 0, &mapped) != vk.success) {
+                        return Error.MemoryMapFailed;
+                    }
+                    defer self.device_functions.unmap_memory(self.device, entry.device_local.memory);
+                    const destination: [*]u8 = @ptrCast(mapped orelse return Error.MemoryMapFailed);
+                    entry.page_generation = 0;
+                    var observed_generation = tracked_generation;
+                    var attempt: usize = 0;
+                    while (true) : (attempt += 1) {
+                        if (!memory.read(memory.context, guest_address, destination[0..size])) {
+                            return Error.GuestMemoryReadFailed;
+                        }
+                        self.frame_profile.upload_bytes +%= size;
+                        self.frame_profile.storage_upload_bytes +%= size;
+                        self.buffer_uploads += 1;
+                        const after = if (memory.gpu_generation) |generation|
+                            generation(memory.context, guest_address, size)
+                        else
+                            observed_generation;
+                        if (after == observed_generation) {
+                            entry.page_generation = observed_generation;
+                            break;
+                        }
+                        if (attempt >= 1) {
+                            // A continuously written range is still usable as a
+                            // snapshot, but do not cache it as current.
+                            entry.page_generation = 0;
+                            break;
+                        }
+                        observed_generation = if (memory.track_gpu_read) |track|
+                            track(memory.context, guest_address, size)
+                        else
+                            0;
+                        if (observed_generation == 0) break;
+                    }
+                } else {
+                    self.frame_profile.resident_storage_bytes +%= size;
+                }
+                self.updateStorageDescriptor(descriptor_index, entry.device_local);
+                self.active_descriptor_set = self.descriptor_set;
+                return .{
+                    .buffer = entry.device_local.handle,
+                    .descriptor_set = self.descriptor_set,
+                    .descriptor_index = descriptor_index,
+                    .size = entry.size,
+                    .allocation_cache_hit = cache_hit,
+                };
+            }
+            if (self.draw_uploads_enabled) {
+                for (self.draw_upload_cache.items) |cached| {
+                    if (cached.guest_address != guest_address or cached.size != size) continue;
+                    self.frame_profile.resident_storage_bytes +%= size;
+                    self.updateStorageDescriptorRange(
+                        descriptor_index,
+                        cached.upload.buffer,
+                        cached.upload.offset,
+                        cached.upload.size,
+                    );
+                    self.active_descriptor_set = self.descriptor_set;
+                    return .{
+                        .buffer = cached.upload.buffer,
+                        .descriptor_set = self.descriptor_set,
+                        .descriptor_index = descriptor_index,
+                        .size = size,
+                        .allocation_cache_hit = true,
+                    };
+                }
                 const upload = try self.allocateDrawUpload(size);
                 const mapping = self.draw_upload_mapping orelse return Error.MemoryMapFailed;
                 const destination = mapping[@intCast(upload.offset)..][0..size];
@@ -3092,6 +3358,11 @@ pub const Renderer = struct {
                 self.frame_profile.upload_bytes +%= size;
                 self.frame_profile.storage_upload_bytes +%= size;
                 self.buffer_uploads += 1;
+                try self.draw_upload_cache.append(self.allocator, .{
+                    .guest_address = guest_address,
+                    .size = size,
+                    .upload = upload,
+                });
                 self.updateStorageDescriptorRange(
                     descriptor_index,
                     upload.buffer,
@@ -3158,7 +3429,13 @@ pub const Renderer = struct {
         if (!memory.write(memory.context, entry.guest_address, bytes)) return Error.GuestMemoryWriteFailed;
         self.frame_profile.readback_bytes +%= size;
         self.frame_profile.storage_readback_bytes +%= size;
-        if (size == entry_size) entry.gpu_dirty = false;
+        if (size == entry_size) {
+            entry.gpu_dirty = false;
+            entry.page_generation = if (memory.gpu_generation) |generation|
+                generation(memory.context, entry.guest_address, entry_size)
+            else
+                0;
+        }
     }
 
     fn flushGuestStorageBuffer(self: *Renderer, index: usize) (Error || std.mem.Allocator.Error)!void {
@@ -4214,6 +4491,7 @@ pub const Renderer = struct {
         cached.initialized = true;
         cached.shader_read_layout = false;
         cached.gpu_generation +%= 1;
+        _ = self.image_aliases.markWrite(cached.alias_token);
         cached.last_used_sequence = self.render_target_sequence;
         self.latest_render_target_index = target_index;
         for (self.completed_frames.items) |*frame| {
@@ -5841,7 +6119,10 @@ pub const Renderer = struct {
             if (slot >= gpu.resources.color_target_count) continue;
             highest = @max(highest, slot);
             result.color_attachment_formats[slot] = color.format.vulkan;
-            result.color_write_masks[slot] = color.descriptor.write_mask;
+            result.color_write_masks[slot] = mapColorWriteMask(
+                color.descriptor.write_mask,
+                colorTargetExportMapping(color.descriptor),
+            );
             const blend = render.blends[slot];
             result.blend_enables[slot] = @intFromBool(blend.enabled);
             if (!blend.enabled) continue;
@@ -6728,7 +7009,14 @@ pub const Renderer = struct {
             vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
         );
         errdefer self.destroyBuffer(readback);
+        const alias_token = try self.image_aliases.register(
+            self.allocator,
+            .color_target,
+            aliasRange(target.descriptor.address, target.layout.required_source_bytes),
+            colorTargetAliasSignature(target),
+        );
         return .{
+            .alias_token = alias_token,
             .target = target,
             .image = image,
             .view = view,
@@ -6739,6 +7027,7 @@ pub const Renderer = struct {
     }
 
     fn destroyCachedRenderTarget(self: *Renderer, target: CachedRenderTarget) void {
+        self.image_aliases.unregister(target.alias_token);
         self.invalidateColorPasses(target.view);
         self.destroyDepthPass(target.depth_pass);
         self.destroyFramebuffer(target.framebuffer);
@@ -6755,6 +7044,7 @@ pub const Renderer = struct {
     }
 
     fn destroyCachedDepthTarget(self: *Renderer, target: CachedDepthTarget) void {
+        self.image_aliases.unregister(target.alias_token);
         self.destroyImageView(target.view);
         self.destroyImage(target.image);
     }
@@ -6977,9 +7267,26 @@ pub const Renderer = struct {
         if (address == 0 or descriptor.width == 0 or descriptor.height == 0) return null;
         if (rasterSampleCount(descriptor.samples_log2) == null) return null;
         const format = depthTargetFormat(descriptor) orelse return null;
+        const depth_bytes_per_sample: u64 = if (descriptor.format == 1) 2 else 4;
+        const texel_count = std.math.mul(u64, descriptor.width, descriptor.height) catch return null;
+        const sample_count = @as(u64, 1) << @intCast(descriptor.samples_log2);
+        const fallback_bytes = std.math.mul(
+            u64,
+            std.math.mul(u64, texel_count, depth_bytes_per_sample) catch return null,
+            sample_count,
+        ) catch return null;
+        // Some legal MSAA register combinations are not importable by the
+        // current texture detiler yet. Alias tracking still needs a safe byte
+        // interval, so fall back to the unpadded texel footprint instead of
+        // rejecting an attachment the raster path itself supports.
+        const allocation_bytes = if (gpu.TextureLayout.fromDepthTarget(descriptor)) |layout|
+            layout.required_source_bytes
+        else |_|
+            fallback_bytes;
         const has_stencil = depthAttachmentHasStencil(format);
         return .{
             .address = address,
+            .allocation_bytes = allocation_bytes,
             .width = descriptor.width,
             .height = descriptor.height,
             .guest_format = descriptor.format,
@@ -7020,7 +7327,14 @@ pub const Renderer = struct {
         if (self.device_functions.create_image_view(self.device, &view_info, null, &view) != vk.success) {
             return Error.ImageViewCreationFailed;
         }
-        return .{ .target = target, .image = image, .view = view };
+        errdefer self.destroyImageView(view);
+        const alias_token = try self.image_aliases.register(
+            self.allocator,
+            .depth_target,
+            aliasRange(target.address, target.allocation_bytes),
+            depthTargetAliasSignature(target),
+        );
+        return .{ .alias_token = alias_token, .target = target, .image = image, .view = view };
     }
 
     fn acquireDepthTarget(self: *Renderer, target: GuestDepthTarget) anyerror!usize {
@@ -7489,6 +7803,7 @@ pub const Renderer = struct {
         dest.initialized = true;
         dest.shader_read_layout = false;
         dest.gpu_generation +%= 1;
+        _ = self.image_aliases.markWrite(dest.alias_token);
         dest.last_used_sequence = self.render_target_sequence;
         self.render_targets.items[source_index].shader_read_layout = false;
         self.render_targets.items[source_index].last_used_sequence = self.render_target_sequence;
@@ -7729,6 +8044,7 @@ pub const Renderer = struct {
         cached_destination.initialized = true;
         cached_destination.shader_read_layout = false;
         cached_destination.gpu_generation +%= 1;
+        _ = self.image_aliases.markWrite(cached_destination.alias_token);
         cached_destination.last_used_sequence = self.render_target_sequence;
         if (flip_vertical) cached_destination.scanout_flip_vertical = true;
         self.render_targets.items[source_index].last_used_sequence = self.render_target_sequence;
@@ -8143,13 +8459,19 @@ pub const Renderer = struct {
         const cached = &self.render_targets.items[target_index];
         cached.initialized = true;
         cached.gpu_generation +%= 1;
+        _ = self.image_aliases.markWrite(cached.alias_token);
         cached.last_used_sequence = self.render_target_sequence;
         for (extra_indices[0..extra_colors.len]) |extra_index| {
             self.render_target_sequence +%= 1;
             const extra_cached = &self.render_targets.items[extra_index];
             extra_cached.initialized = true;
             extra_cached.gpu_generation +%= 1;
+            _ = self.image_aliases.markWrite(extra_cached.alias_token);
             extra_cached.last_used_sequence = self.render_target_sequence;
+        }
+        if (depth_index) |index| {
+            const depth_cached = &self.depth_targets.items[index];
+            _ = self.image_aliases.markWrite(depth_cached.alias_token);
         }
         self.latest_render_target_index = target_index;
         if (report_checkpoints and self.capture_first_graphics_frame) {
@@ -8669,9 +8991,37 @@ pub const Renderer = struct {
         }
     }
 
+    /// Publishes dirty image writers whose allocation intersects a resource
+    /// about to be reconstructed from guest memory. Exact base-address tests
+    /// miss mip/subresource views and reinterpretations that start inside the
+    /// same allocation; the common alias registry supplies the byte-range
+    /// relation for every image cache.
+    fn flushAliasedImageWrites(self: *Renderer, address: u64, visible_bytes: usize) anyerror!void {
+        const requested = aliasRange(address, visible_bytes);
+        if (!requested.valid()) return;
+        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        for (self.storage_image_cache.items, 0..) |cached, index| {
+            if (!cached.valid or !cached.gpu_dirty or
+                !self.image_aliases.tokenOverlaps(cached.alias_token, requested))
+            {
+                continue;
+            }
+            try self.flushCachedStorageImage(memory, index);
+        }
+        for (self.render_targets.items, 0..) |cached, index| {
+            if (!cached.initialized or cached.gpu_generation == cached.host_generation or
+                !self.image_aliases.tokenOverlaps(cached.alias_token, requested))
+            {
+                continue;
+            }
+            try self.materializeRenderTarget(index);
+        }
+    }
+
     /// Publishes only the deferred writeback for one guest address, used
     /// before guest memory at that address is staged or read.
     fn flushPendingGuestWrite(self: *Renderer, address: u64, visible_bytes: usize) anyerror!void {
+        try self.flushAliasedImageWrites(address, visible_bytes);
         try self.flushGuestStorageImageRange(address, visible_bytes);
         try self.flushGuestStorageRange(address, visible_bytes);
         _ = try self.materializeRenderTargetAt(address);
@@ -9580,6 +9930,13 @@ pub const Renderer = struct {
             dumpShaderHead(fragment_analysis, fragment_analysis.program.instructions.items.len);
         }
 
+        var color_export_mappings: [gpu.resources.color_target_count]u8 =
+            @splat(color_export_identity);
+        color_export_mappings[target.descriptor.slot] = colorTargetExportMapping(target.descriptor);
+        for (extra_colors) |extra| {
+            color_export_mappings[extra.descriptor.slot] = colorTargetExportMapping(extra.descriptor);
+        }
+
         const fragment_translate_started = hostTimestampNs();
         var fragment_module = fragment_analysis.translateSpirv(self.allocator, .{
             .stage = .fragment,
@@ -9596,6 +9953,7 @@ pub const Renderer = struct {
             .parameter_mask = paired_parameter_mask,
             .fragment_input_controls = &fragment_input_controls,
             .infer_fragment_parameter_mask = false,
+            .color_export_mappings = color_export_mappings,
             .descriptor_array_length = maximum_storage_descriptors,
             .scalar_registers = fragment_scalar_regs[0..fragment_scalar_count],
             .dynamic_scalar_binding = if (fragment_scalar_count != 0) .{
@@ -9705,7 +10063,7 @@ pub const Renderer = struct {
                 }
             else
                 vertex_analysis.program;
-            if (rdna2.translateSpirv(self.allocator, &vertex_program, .{
+            if (rdna2.translateProgramSpirv(self.allocator, &vertex_program, .{
                 .stage = .vertex,
                 // The PS5 NGG/export ABI supplies S_NGG_VERTEX_INDEX in v5;
                 // ordinary VS programs retain the legacy v0 convention.
@@ -10553,6 +10911,7 @@ pub const Renderer = struct {
         cached.initialized = true;
         cached.shader_read_layout = false;
         cached.gpu_generation +%= 1;
+        _ = self.image_aliases.markWrite(cached.alias_token);
         cached.last_used_sequence = self.render_target_sequence;
         self.latest_render_target_index = target_index;
         for (self.completed_frames.items) |*frame| {
@@ -10861,10 +11220,11 @@ pub const Renderer = struct {
 
     fn updateGdsDescriptor(self: *Renderer, buffer: OwnedBuffer) void {
         std.debug.assert(gds_descriptor_binding == rdna2.spirv.gds_descriptor_binding);
+        const slot = self.current_descriptor_slot orelse 0;
         const buffer_info = vk.DescriptorBufferInfo{
             .buffer = buffer.handle,
-            .offset = 0,
-            .range = buffer.size,
+            .offset = slot * gds_slot_bytes,
+            .range = gds_slot_bytes,
         };
         const write = vk.WriteDescriptorSet{
             .destination_set = self.descriptor_set,
@@ -10881,14 +11241,16 @@ pub const Renderer = struct {
     fn uploadGdsStorage(self: *Renderer) Error!void {
         const buffer = self.gds_buffer orelse return Error.InvalidStorageDescriptor;
         if (!self.ensureGdsStorage()) return Error.MemoryAllocationFailed;
-        try self.writeMapped(buffer, self.gds_storage.items);
+        const slot = self.current_descriptor_slot orelse 0;
+        try self.writeMappedAt(buffer, slot * gds_slot_bytes, self.gds_storage.items);
         self.updateGdsDescriptor(buffer);
     }
 
     fn downloadGdsStorage(self: *Renderer) Error!void {
         const buffer = self.gds_buffer orelse return Error.InvalidStorageDescriptor;
         if (!self.ensureGdsStorage()) return Error.MemoryAllocationFailed;
-        try self.readMapped(buffer, self.gds_storage.items);
+        const slot = self.current_descriptor_slot orelse 0;
+        try self.readMappedAt(buffer, slot * gds_slot_bytes, self.gds_storage.items);
     }
 
     fn updateSampledImageDescriptor(
@@ -10972,7 +11334,7 @@ pub const Renderer = struct {
     fn releaseStorageImage(self: *Renderer, cache_index: usize) void {
         if (cache_index >= self.storage_image_cache.items.len) return;
         if (!self.storage_image_cache.items[cache_index].valid) return;
-        if (self.frame_command_count != 0 or self.recording_command_buffer != null) {
+        if (self.pending_command_buffers.items.len != 0 or self.recording_command_buffer != null) {
             self.deferVulkanObject(.{ .storage_image_release = cache_index });
         } else {
             self.storage_image_cache.items[cache_index].in_use = false;
@@ -10983,6 +11345,7 @@ pub const Renderer = struct {
         if (cache_index >= self.storage_image_cache.items.len) return;
         const cached = &self.storage_image_cache.items[cache_index];
         if (!cached.valid) return;
+        self.image_aliases.unregister(cached.alias_token);
         self.destroyImageView(cached.view);
         self.destroyImage(cached.image);
         self.destroyBuffer(cached.transfer);
@@ -11095,6 +11458,10 @@ pub const Renderer = struct {
         const cached = &self.storage_image_cache.items[cache_index];
         cached.guest_content_hash = std.hash.Wyhash.hash(0, allocation);
         cached.guest_content_hash_valid = true;
+        cached.guest_page_generation = if (memory.gpu_generation) |generation|
+            generation(memory.context, snapshot.descriptor.address, snapshot.allocation_bytes)
+        else
+            0;
         cached.gpu_dirty = false;
         self.frame_profile.readback_bytes +%= snapshot.staging_bytes;
         self.frame_profile.storage_readback_bytes +%= snapshot.staging_bytes;
@@ -11166,6 +11533,7 @@ pub const Renderer = struct {
     ) (Error || std.mem.Allocator.Error)!void {
         const snapshot = self.storage_image_cache.items[cache_index];
         if (!snapshot.valid or linear.len != snapshot.staging_bytes) return Error.UnsupportedStorageImage;
+        if (!initial) try self.waitForSubmittedWork();
         try self.writeMapped(snapshot.transfer, linear);
 
         const command_buffer = try self.beginOneShot();
@@ -11300,15 +11668,48 @@ pub const Renderer = struct {
 
         try self.flushPendingGuestWrite(descriptor.address, allocation_bytes);
 
+        const guest_page_generation = if (memory.track_gpu_read) |track|
+            track(memory.context, descriptor.address, allocation_bytes)
+        else
+            0;
+        if (matching_index) |index| {
+            const cached = &self.storage_image_cache.items[index];
+            cached.last_used_sequence = self.storage_image_sequence;
+            if (guest_page_generation != 0 and
+                cached.guest_page_generation == guest_page_generation)
+            {
+                cached.in_use = true;
+                errdefer cached.in_use = false;
+                self.updateStorageImageDescriptor(descriptor_index, cached.view);
+                self.frame_profile.resident_storage_bytes +%= cached.staging_bytes;
+                return .{
+                    .descriptor = descriptor,
+                    .subresource = cached.subresource,
+                    .image = cached.image,
+                    .view = cached.view,
+                    .transfer = cached.transfer,
+                    .allocation_bytes = cached.allocation_bytes,
+                    .staging_bytes = cached.staging_bytes,
+                    .writable = writable,
+                    .cache_index = index,
+                };
+            }
+        }
+
         const allocation = try self.allocator.alloc(u8, allocation_bytes);
         defer self.allocator.free(allocation);
         if (!memory.read(memory.context, descriptor.address, allocation)) return Error.GuestMemoryReadFailed;
-        const guest_content_hash = std.hash.Wyhash.hash(0, allocation);
+        const guest_content_hash = if (guest_page_generation == 0)
+            std.hash.Wyhash.hash(0, allocation)
+        else
+            0;
 
         if (matching_index) |index| {
             const cached = &self.storage_image_cache.items[index];
             cached.last_used_sequence = self.storage_image_sequence;
-            if (cached.guest_content_hash_valid and cached.guest_content_hash == guest_content_hash) {
+            if (guest_page_generation == 0 and
+                cached.guest_content_hash_valid and cached.guest_content_hash == guest_content_hash)
+            {
                 cached.in_use = true;
                 errdefer cached.in_use = false;
                 self.updateStorageImageDescriptor(descriptor_index, cached.view);
@@ -11337,6 +11738,7 @@ pub const Renderer = struct {
             try self.uploadCachedStorageImage(index, linear, false);
             cached.guest_content_hash = guest_content_hash;
             cached.guest_content_hash_valid = true;
+            cached.guest_page_generation = guest_page_generation;
             self.updateStorageImageDescriptor(descriptor_index, cached.view);
             return .{
                 .descriptor = descriptor,
@@ -11387,8 +11789,17 @@ pub const Renderer = struct {
         }
         errdefer if (!cache_owns_resources) self.destroyImageView(view);
 
+        const alias_token = try self.image_aliases.register(
+            self.allocator,
+            .storage_image,
+            aliasRange(descriptor.address, allocation_bytes),
+            descriptorAliasSignature(descriptor, format.vulkan, 1),
+        );
+        errdefer self.image_aliases.unregister(alias_token);
+
         const cache_index = try self.storageImageCacheSlot(memory, staging_bytes);
         self.storage_image_cache.items[cache_index] = .{
+            .alias_token = alias_token,
             .descriptor = descriptor,
             .subresource = subresource,
             .image = image,
@@ -11399,6 +11810,7 @@ pub const Renderer = struct {
             .last_used_sequence = self.storage_image_sequence,
             .guest_content_hash = guest_content_hash,
             .guest_content_hash_valid = true,
+            .guest_page_generation = guest_page_generation,
             .in_use = true,
         };
         self.storage_image_cache_bytes +|= staging_bytes;
@@ -11429,6 +11841,7 @@ pub const Renderer = struct {
             const cached = &self.storage_image_cache.items[prepared.cache_index];
             if (!cached.valid) return Error.UnsupportedStorageImage;
             cached.gpu_dirty = true;
+            _ = self.image_aliases.markWrite(cached.alias_token);
         }
     }
 
@@ -11630,13 +12043,24 @@ pub const Renderer = struct {
         };
 
         const state_hash = sampledImageStateHash(descriptor, sampler_descriptor);
-        const source_generation = self.sampledSourceGeneration(descriptor.address);
-        const content_hash = self.probeSampledSource(
-            memory,
-            descriptor.address,
-            probe_span,
-            source_generation,
-        );
+        const resident_generation = self.sampledSourceGeneration(descriptor.address, probe_span);
+        const page_generation = if (memory.track_gpu_read) |track|
+            track(memory.context, descriptor.address, probe_span)
+        else
+            0;
+        const source_generation = combineSourceGenerations(resident_generation, page_generation);
+        // Page generations make an O(number of pages) byte hash on every frame
+        // unnecessary. Keep the hash fallback for standalone/smoke memory
+        // providers which do not expose write tracking.
+        const content_hash = if (page_generation != 0)
+            0
+        else
+            self.probeSampledSource(
+                memory,
+                descriptor.address,
+                probe_span,
+                source_generation,
+            );
 
         var cache_hit_idx: ?usize = null;
         for (self.sampled_image_cache.items, 0..) |*item, idx| {
@@ -12054,6 +12478,7 @@ pub const Renderer = struct {
             self.destroyImageView(stale.view);
             self.destroySampler(stale.sampler);
             self.destroyImage(stale.image);
+            self.image_aliases.unregister(stale.alias_token);
             _ = self.sampled_image_cache.orderedRemove(stale_index);
         }
 
@@ -12071,10 +12496,19 @@ pub const Renderer = struct {
             self.destroyImageView(evicted.view);
             self.destroySampler(evicted.sampler);
             self.destroyImage(evicted.image);
+            self.image_aliases.unregister(evicted.alias_token);
             _ = self.sampled_image_cache.orderedRemove(oldest_idx);
         }
 
-        self.sampled_image_cache.append(self.allocator, .{
+        const alias_token = try self.image_aliases.register(
+            self.allocator,
+            .sampled_image,
+            aliasRange(descriptor.address, probe_span),
+            descriptorAliasSignature(descriptor, image_format, @intCast(mip_levels)),
+        );
+        errdefer self.image_aliases.unregister(alias_token);
+        try self.sampled_image_cache.append(self.allocator, .{
+            .alias_token = alias_token,
             .guest_address = descriptor.address,
             .width = descriptor.width,
             .height = descriptor.height,
@@ -12092,19 +12526,25 @@ pub const Renderer = struct {
             .view = view,
             .sampler = sampler,
             .last_used_frame = self.frame_sequence,
-        }) catch {};
+        });
 
         return .{ .image = image, .view = view, .sampler = sampler };
     }
 
-    fn sampledSourceGeneration(self: *const Renderer, address: u64) u64 {
-        for (self.render_targets.items) |cached| {
-            if (cached.target.descriptor.address == address) return cached.gpu_generation;
-        }
+    fn sampledSourceGeneration(self: *const Renderer, address: u64, visible_bytes: usize) u64 {
+        var generation = self.image_aliases.generationForRange(aliasRange(address, visible_bytes));
         for (self.completed_frames.items) |cached| {
-            if (cached.guest_address == address) return cached.sequence;
+            if (cached.guest_address == address) generation = @max(generation, cached.sequence);
         }
-        return 0;
+        return generation;
+    }
+
+    fn combineSourceGenerations(resident: u64, pages: u64) u64 {
+        if (pages == 0) return resident;
+        var combined = pages ^ std.math.rotl(u64, resident, 23) ^ 0x9e37_79b9_7f4a_7c15;
+        combined *%= 0xbf58_476d_1ce4_e5b9;
+        combined ^= combined >> 31;
+        return if (combined == 0) 1 else combined;
     }
 
     fn createGuestSampler(self: *Renderer, descriptor: gpu.resources.SamplerDescriptor) Error!vk.Sampler {
@@ -12116,8 +12556,70 @@ pub const Renderer = struct {
         return sampler;
     }
 
-    fn ensureFrameCommandBuffer(self: *Renderer) (Error || std.mem.Allocator.Error)!void {
-        if (self.frame_command_count < self.frame_command_buffers.items.len) return;
+    fn refreshGpuProgress(self: *Renderer) Error!void {
+        var completed: u64 = 0;
+        if (self.device_functions.get_semaphore_counter_value(
+            self.device,
+            self.timeline_semaphore,
+            &completed,
+        ) != vk.success) return Error.TimelineSemaphoreQueryFailed;
+        self.completed_tick = @max(self.completed_tick, completed);
+        self.destroyDeferredVulkanObjects();
+    }
+
+    fn waitForTick(self: *Renderer, tick: u64) Error!void {
+        if (tick == 0) return;
+        try self.refreshGpuProgress();
+        if (tick <= self.completed_tick) return;
+        const semaphores = [_]vk.Semaphore{self.timeline_semaphore};
+        const values = [_]u64{tick};
+        const wait_info = vk.SemaphoreWaitInfo{
+            .semaphore_count = 1,
+            .semaphores = &semaphores,
+            .values = &values,
+        };
+        const wait_started = hostTimestampNs();
+        if (self.device_functions.wait_semaphores(
+            self.device,
+            &wait_info,
+            std.math.maxInt(u64),
+        ) != vk.success) return Error.TimelineSemaphoreWaitFailed;
+        const wait_finished = hostTimestampNs();
+        if (wait_finished >= wait_started) {
+            self.frame_profile.fence_wait_ns +%= wait_finished - wait_started;
+        }
+        self.completed_tick = @max(self.completed_tick, tick);
+        self.destroyDeferredVulkanObjects();
+    }
+
+    fn waitForSubmittedWork(self: *Renderer) Error!void {
+        try self.flushQueuedCommands();
+        try self.waitForTick(self.submitted_tick);
+    }
+
+    fn reusableCommandBuffer(self: *Renderer) ?usize {
+        for (self.command_buffer_ticks.items, 0..) |tick, index| {
+            if (tick != command_buffer_pending_tick and tick <= self.completed_tick) return index;
+        }
+        return null;
+    }
+
+    fn ensureFrameCommandBuffer(self: *Renderer) (Error || std.mem.Allocator.Error)!usize {
+        try self.refreshGpuProgress();
+        if (self.reusableCommandBuffer()) |index| return index;
+        if (self.frame_command_buffers.items.len >= maximum_async_command_buffers) {
+            // A pathological batch can fill the pool before reaching a guest
+            // synchronization packet. Submit it, then recycle the oldest slot
+            // only when its timeline tick completes.
+            try self.flushQueuedCommands();
+            var oldest_tick: u64 = std.math.maxInt(u64);
+            for (self.command_buffer_ticks.items) |tick| {
+                if (tick != command_buffer_pending_tick) oldest_tick = @min(oldest_tick, tick);
+            }
+            if (oldest_tick != std.math.maxInt(u64)) try self.waitForTick(oldest_tick);
+            if (self.reusableCommandBuffer()) |index| return index;
+            return Error.CommandBufferAllocationFailed;
+        }
         var buffers: [32]vk.CommandBuffer = undefined;
         const allocate_info = vk.CommandBufferAllocateInfo{
             .command_pool = self.command_pool,
@@ -12129,6 +12631,7 @@ pub const Renderer = struct {
             &allocate_info,
             &buffers,
         ) != vk.success) return Error.CommandBufferAllocationFailed;
+        const first = self.frame_command_buffers.items.len;
         self.frame_command_buffers.appendSlice(self.allocator, &buffers) catch |err| {
             self.device_functions.free_command_buffers(
                 self.device,
@@ -12138,12 +12641,23 @@ pub const Renderer = struct {
             );
             return err;
         };
+        self.command_buffer_ticks.appendNTimes(self.allocator, 0, buffers.len) catch |err| {
+            self.frame_command_buffers.shrinkRetainingCapacity(first);
+            self.device_functions.free_command_buffers(
+                self.device,
+                self.command_pool,
+                buffers.len,
+                &buffers,
+            );
+            return err;
+        };
+        return first;
     }
 
     fn beginOneShot(self: *Renderer) (Error || std.mem.Allocator.Error)!vk.CommandBuffer {
         if (self.recording_command_buffer != null) return Error.CommandBufferBeginFailed;
-        try self.ensureFrameCommandBuffer();
-        const command_buffer = self.frame_command_buffers.items[self.frame_command_count];
+        const slot = try self.ensureFrameCommandBuffer();
+        const command_buffer = self.frame_command_buffers.items[slot];
         if (self.device_functions.reset_command_buffer(command_buffer, 0) != vk.success) {
             return Error.CommandBufferResetFailed;
         }
@@ -12152,6 +12666,8 @@ pub const Renderer = struct {
             return Error.CommandBufferBeginFailed;
         }
         self.recording_command_buffer = command_buffer;
+        self.recording_command_slot = slot;
+        self.command_buffer_ticks.items[slot] = command_buffer_pending_tick;
         return command_buffer;
     }
 
@@ -12163,7 +12679,9 @@ pub const Renderer = struct {
             self.recording_command_buffer.? == command_buffer)
         {
             _ = self.device_functions.reset_command_buffer(command_buffer, 0);
+            if (self.recording_command_slot) |slot| self.command_buffer_ticks.items[slot] = 0;
             self.recording_command_buffer = null;
+            self.recording_command_slot = null;
         }
         for (self.frame_command_buffers.items) |owned| {
             if (owned == command_buffer) return;
@@ -12178,8 +12696,29 @@ pub const Renderer = struct {
             return Error.CommandBufferEndFailed;
         }
         if (self.device_functions.end_command_buffer(command_buffer) != vk.success) return Error.CommandBufferEndFailed;
+        const slot = self.recording_command_slot orelse return Error.CommandBufferEndFailed;
         self.recording_command_buffer = null;
-        self.frame_command_count += 1;
+        self.recording_command_slot = null;
+        errdefer {
+            _ = self.device_functions.reset_command_buffer(command_buffer, 0);
+            self.command_buffer_ticks.items[slot] = 0;
+        }
+        try self.pending_command_buffers.append(self.allocator, command_buffer);
+        errdefer _ = self.pending_command_buffers.pop();
+        try self.pending_command_slots.append(self.allocator, slot);
+        errdefer _ = self.pending_command_slots.pop();
+        if (self.draw_batch_active) {
+            if (self.current_descriptor_slot) |descriptor_slot| {
+                var found = false;
+                for (self.pending_descriptor_slots.items) |pending| {
+                    if (pending == descriptor_slot) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) try self.pending_descriptor_slots.append(self.allocator, descriptor_slot);
+            }
+        }
         self.frame_profile.command_buffers += 1;
         if (self.draw_batch_active) return;
         try self.flushQueuedCommands();
@@ -12187,21 +12726,27 @@ pub const Renderer = struct {
 
     fn flushQueuedCommands(self: *Renderer) Error!void {
         if (self.recording_command_buffer != null) return Error.CommandBufferEndFailed;
-        if (self.frame_command_count == 0) {
-            self.destroyDeferredVulkanObjects();
+        if (self.pending_command_buffers.items.len == 0) {
+            try self.refreshGpuProgress();
             return;
         }
-        const fence = self.one_shot_fence;
-        if (fence == 0) return Error.FenceCreationFailed;
-        if (self.device_functions.reset_fences(self.device, 1, @ptrCast(&fence)) != vk.success) {
-            return Error.FenceResetFailed;
-        }
-        const commands = self.frame_command_buffers.items[0..self.frame_command_count];
-        const submit_info = vk.SubmitInfo{
-            .command_buffer_count = @intCast(commands.len),
-            .command_buffers = commands.ptr,
+        std.debug.assert(self.pending_command_buffers.items.len == self.pending_command_slots.items.len);
+        const signal_tick = self.submitted_tick +% 1;
+        if (signal_tick == 0) return Error.QueueSubmissionFailed;
+        const signal_values = [_]u64{signal_tick};
+        const timeline_info = vk.TimelineSemaphoreSubmitInfo{
+            .signal_semaphore_value_count = 1,
+            .signal_semaphore_values = &signal_values,
         };
-        const submit_result = self.device_functions.queue_submit(self.queue, 1, @ptrCast(&submit_info), fence);
+        const signal_semaphores = [_]vk.Semaphore{self.timeline_semaphore};
+        const submit_info = vk.SubmitInfo{
+            .p_next = &timeline_info,
+            .command_buffer_count = @intCast(self.pending_command_buffers.items.len),
+            .command_buffers = self.pending_command_buffers.items.ptr,
+            .signal_semaphore_count = 1,
+            .signal_semaphores = &signal_semaphores,
+        };
+        const submit_result = self.device_functions.queue_submit(self.queue, 1, @ptrCast(&submit_info), 0);
         if (submit_result != vk.success) {
             // A submission is refused for a handful of very different reasons —
             // a lost device among them — and they call for different answers,
@@ -12212,33 +12757,81 @@ pub const Renderer = struct {
             );
             return Error.QueueSubmissionFailed;
         }
-        self.frame_profile.submits += 1;
-        const wait_started = hostTimestampNs();
-        if (self.device_functions.wait_for_fences(self.device, 1, @ptrCast(&fence), vk.true_value, ~@as(u64, 0)) != vk.success) {
-            return Error.FenceWaitFailed;
+        self.submitted_tick = signal_tick;
+        for (self.pending_command_slots.items) |slot| {
+            self.command_buffer_ticks.items[slot] = signal_tick;
         }
-        const wait_finished = hostTimestampNs();
-        if (wait_finished >= wait_started) self.frame_profile.fence_wait_ns +%= wait_finished - wait_started;
-        self.frame_command_count = 0;
-        self.destroyDeferredVulkanObjects();
+        for (self.pending_descriptor_slots.items) |slot| {
+            self.descriptor_slot_ticks[slot] = signal_tick;
+        }
+        self.pending_command_buffers.clearRetainingCapacity();
+        self.pending_command_slots.clearRetainingCapacity();
+        self.pending_descriptor_slots.clearRetainingCapacity();
+        self.draw_upload_cache.clearRetainingCapacity();
+        self.frame_profile.submits += 1;
+        try self.refreshGpuProgress();
     }
 
     fn resetDrawRings(self: *Renderer) void {
-        self.descriptor_slots_used = 0;
-        self.draw_upload_offset = 0;
+        self.draw_upload_cache.clearRetainingCapacity();
         self.descriptor_set = self.descriptor_sets[0];
         self.active_descriptor_set = null;
         self.dynamic_scalar_mapping = self.dynamic_scalar_mapping_base;
     }
 
-    fn beginFrameDraw(self: *Renderer) (Error || std.mem.Allocator.Error)!void {
-        if (self.descriptor_slots_used == self.descriptor_sets.len) {
-            try self.flushQueuedCommands();
-            self.resetDrawRings();
+    fn beginDescriptorBatch(
+        self: *Renderer,
+        allow_draw_uploads: bool,
+    ) (Error || std.mem.Allocator.Error)!void {
+        try self.refreshGpuProgress();
+        // A soft-skipped draw/dispatch may have reserved a descriptor set
+        // without recording a command buffer. Return only that unused slot;
+        // submitted slots are present in pending_descriptor_slots and keep
+        // their timeline ownership.
+        if (self.current_descriptor_slot) |current| {
+            var pending = false;
+            for (self.pending_descriptor_slots.items) |slot| {
+                if (slot == current) {
+                    pending = true;
+                    break;
+                }
+            }
+            if (!pending and self.descriptor_slot_ticks[current] == command_buffer_pending_tick) {
+                self.descriptor_slot_ticks[current] = 0;
+            }
         }
+        var selected: ?usize = null;
+        var searched: usize = 0;
+        while (searched < self.descriptor_sets.len) : (searched += 1) {
+            const slot = (self.descriptor_cursor + searched) % self.descriptor_sets.len;
+            const tick = self.descriptor_slot_ticks[slot];
+            if (tick != command_buffer_pending_tick and tick <= self.completed_tick) {
+                selected = slot;
+                break;
+            }
+        }
+        if (selected == null) {
+            try self.flushQueuedCommands();
+            var oldest_tick: u64 = std.math.maxInt(u64);
+            for (self.descriptor_slot_ticks) |tick| {
+                if (tick != command_buffer_pending_tick) oldest_tick = @min(oldest_tick, tick);
+            }
+            if (oldest_tick != std.math.maxInt(u64)) try self.waitForTick(oldest_tick);
+            searched = 0;
+            while (searched < self.descriptor_sets.len) : (searched += 1) {
+                const slot = (self.descriptor_cursor + searched) % self.descriptor_sets.len;
+                if (self.descriptor_slot_ticks[slot] <= self.completed_tick) {
+                    selected = slot;
+                    break;
+                }
+            }
+        }
+        const slot = selected orelse return Error.DescriptorSetAllocationFailed;
         self.draw_batch_active = true;
-        const slot = self.descriptor_slots_used;
-        self.descriptor_slots_used += 1;
+        self.draw_uploads_enabled = allow_draw_uploads;
+        self.current_descriptor_slot = slot;
+        self.descriptor_slot_ticks[slot] = command_buffer_pending_tick;
+        self.descriptor_cursor = (slot + 1) % self.descriptor_sets.len;
         self.descriptor_set = self.descriptor_sets[slot];
         self.active_descriptor_set = null;
         const base = self.dynamic_scalar_mapping_base orelse return Error.InvalidStorageDescriptor;
@@ -12247,31 +12840,66 @@ pub const Renderer = struct {
         @memset(self.dynamic_scalar_mapping.?[0..dynamic_scalar_buffer_words], 0);
     }
 
+    fn beginFrameDraw(self: *Renderer) (Error || std.mem.Allocator.Error)!void {
+        return self.beginDescriptorBatch(true);
+    }
+
+    fn beginComputeDispatch(self: *Renderer) (Error || std.mem.Allocator.Error)!void {
+        return self.beginDescriptorBatch(false);
+    }
+
     fn finishDrawBatch(self: *Renderer) Error!void {
         try self.flushQueuedCommands();
         self.draw_batch_active = false;
+        self.draw_uploads_enabled = false;
+        if (self.current_descriptor_slot) |slot| {
+            if (self.descriptor_slot_ticks[slot] == command_buffer_pending_tick) {
+                self.descriptor_slot_ticks[slot] = 0;
+            }
+        }
+        self.current_descriptor_slot = null;
         self.resetDrawRings();
     }
 
     fn allocateDrawUpload(self: *Renderer, bytes: usize) Error!DrawUploadSlice {
-        const offset = reserveAlignedRange(
+        var offset = reserveAlignedRange(
             &self.draw_upload_offset,
             draw_upload_ring_bytes,
             bytes,
             draw_upload_alignment,
-        ) orelse return Error.GuestBufferTooLarge;
+        );
+        if (offset == null) {
+            if (bytes > draw_upload_ring_bytes) return Error.GuestBufferTooLarge;
+            try self.waitForSubmittedWork();
+            self.draw_upload_offset = 0;
+            self.draw_upload_cache.clearRetainingCapacity();
+            offset = reserveAlignedRange(
+                &self.draw_upload_offset,
+                draw_upload_ring_bytes,
+                bytes,
+                draw_upload_alignment,
+            );
+        }
         const buffer = self.draw_upload_buffer orelse return Error.InvalidStorageDescriptor;
-        return .{ .buffer = buffer.handle, .offset = offset, .size = bytes };
+        return .{ .buffer = buffer.handle, .offset = offset orelse return Error.GuestBufferTooLarge, .size = bytes };
     }
 
     fn deferVulkanObject(self: *Renderer, object: DeferredVulkanObject) void {
-        if (self.frame_command_count == 0 and self.recording_command_buffer == null) {
+        const retire_tick = if (self.pending_command_buffers.items.len != 0 or
+            self.recording_command_buffer != null)
+            self.submitted_tick +% 1
+        else
+            self.submitted_tick;
+        if (retire_tick == 0 or retire_tick <= self.completed_tick) {
             self.destroyVulkanObject(object);
             return;
         }
         // Leaking one transient object on host OOM is safer than destroying an
         // object still referenced by a recorded Vulkan command.
-        self.deferred_vulkan_objects.append(self.allocator, object) catch {};
+        self.deferred_vulkan_objects.append(self.allocator, .{
+            .retire_tick = retire_tick,
+            .object = object,
+        }) catch {};
     }
 
     fn destroyVulkanObject(self: *Renderer, object: DeferredVulkanObject) void {
@@ -12299,8 +12927,16 @@ pub const Renderer = struct {
     }
 
     fn destroyDeferredVulkanObjects(self: *Renderer) void {
-        for (self.deferred_vulkan_objects.items) |object| self.destroyVulkanObject(object);
-        self.deferred_vulkan_objects.clearRetainingCapacity();
+        var index: usize = 0;
+        while (index < self.deferred_vulkan_objects.items.len) {
+            const entry = self.deferred_vulkan_objects.items[index];
+            if (entry.retire_tick > self.completed_tick) {
+                index += 1;
+                continue;
+            }
+            self.destroyVulkanObject(entry.object);
+            _ = self.deferred_vulkan_objects.swapRemove(index);
+        }
     }
 
     fn destroyBuffer(self: *Renderer, buffer: OwnedBuffer) void {
@@ -12340,8 +12976,12 @@ pub const Renderer = struct {
     }
 
     fn writeMapped(self: *Renderer, buffer: OwnedBuffer, bytes: []const u8) Error!void {
+        return self.writeMappedAt(buffer, 0, bytes);
+    }
+
+    fn writeMappedAt(self: *Renderer, buffer: OwnedBuffer, offset: vk.DeviceSize, bytes: []const u8) Error!void {
         var mapped: ?*anyopaque = null;
-        if (self.device_functions.map_memory(self.device, buffer.memory, 0, bytes.len, 0, &mapped) != vk.success) {
+        if (self.device_functions.map_memory(self.device, buffer.memory, offset, bytes.len, 0, &mapped) != vk.success) {
             return Error.MemoryMapFailed;
         }
         defer self.device_functions.unmap_memory(self.device, buffer.memory);
@@ -12374,7 +13014,7 @@ pub const Renderer = struct {
     }
 
     fn expectMapped(self: *Renderer, buffer: OwnedBuffer, expected: []const u8) Error!void {
-        try self.flushQueuedCommands();
+        try self.waitForSubmittedWork();
         var mapped: ?*anyopaque = null;
         if (self.device_functions.map_memory(self.device, buffer.memory, 0, expected.len, 0, &mapped) != vk.success) {
             return Error.MemoryMapFailed;
@@ -12385,9 +13025,13 @@ pub const Renderer = struct {
     }
 
     fn readMapped(self: *Renderer, buffer: OwnedBuffer, destination: []u8) Error!void {
-        try self.flushQueuedCommands();
+        return self.readMappedAt(buffer, 0, destination);
+    }
+
+    fn readMappedAt(self: *Renderer, buffer: OwnedBuffer, offset: vk.DeviceSize, destination: []u8) Error!void {
+        try self.waitForSubmittedWork();
         var mapped: ?*anyopaque = null;
-        if (self.device_functions.map_memory(self.device, buffer.memory, 0, destination.len, 0, &mapped) != vk.success) {
+        if (self.device_functions.map_memory(self.device, buffer.memory, offset, destination.len, 0, &mapped) != vk.success) {
             return Error.MemoryMapFailed;
         }
         defer self.device_functions.unmap_memory(self.device, buffer.memory);
@@ -12639,6 +13283,14 @@ pub const Renderer = struct {
             );
             return false;
         };
+        self.waitForSubmittedWork() catch |err| {
+            self.last_sync_error = err;
+            std.debug.print(
+                "[vulkan dcb] {s} timeline wait failed: {s}\n",
+                .{ operation, @errorName(err) },
+            );
+            return false;
+        };
         self.last_sync_error = null;
         return true;
     }
@@ -12709,6 +13361,11 @@ pub const Renderer = struct {
         self.finishDrawBatch() catch |err| {
             self.last_sync_error = err;
             std.debug.print("[vulkan dcb] release batch failed: {s}\n", .{@errorName(err)});
+            return false;
+        };
+        self.waitForSubmittedWork() catch |err| {
+            self.last_sync_error = err;
+            std.debug.print("[vulkan dcb] release timeline wait failed: {s}\n", .{@errorName(err)});
             return false;
         };
         // The queued work has completed, but a release normally exposes
@@ -14094,6 +14751,11 @@ pub const Renderer = struct {
                 },
             );
         }
+        self.beginComputeDispatch() catch |err| {
+            self.last_dispatch_error = err;
+            std.debug.print("[vulkan dcb] dispatch descriptor slot failed: {s}\n", .{@errorName(err)});
+            return false;
+        };
         _ = self.dispatchRdna2State(
             state,
             local_size,
@@ -17960,6 +18622,39 @@ test "10-10-10-2 UNORM color targets use the matching packed Vulkan format" {
     try std.testing.expect(colorTargetFormat(descriptor) == null);
 }
 
+test "color target component swap maps exports and logical write masks" {
+    var descriptor = std.mem.zeroes(gpu.resources.ColorTarget);
+    descriptor.format = 10;
+
+    descriptor.component_swap = 0;
+    try std.testing.expectEqual(@as(u8, 0xe4), colorTargetExportMapping(descriptor));
+    try std.testing.expectEqual(@as(u32, 0x1), mapColorWriteMask(0x1, colorTargetExportMapping(descriptor)));
+
+    descriptor.component_swap = 1;
+    try std.testing.expectEqual(@as(u8, 0xc6), colorTargetExportMapping(descriptor));
+    try std.testing.expectEqual(@as(u32, 0x4), mapColorWriteMask(0x1, colorTargetExportMapping(descriptor)));
+    try std.testing.expectEqual(@as(u32, 0x1), mapColorWriteMask(0x4, colorTargetExportMapping(descriptor)));
+
+    descriptor.component_swap = 2;
+    try std.testing.expectEqual(@as(u8, 0x1b), colorTargetExportMapping(descriptor));
+    try std.testing.expectEqual(@as(u32, 0x8), mapColorWriteMask(0x1, colorTargetExportMapping(descriptor)));
+
+    descriptor.component_swap = 3;
+    try std.testing.expectEqual(@as(u8, 0x93), colorTargetExportMapping(descriptor));
+}
+
+test "packed UNORM target accepts component swap through the export mapping" {
+    var descriptor = std.mem.zeroes(gpu.resources.ColorTarget);
+    descriptor.format = 9;
+    descriptor.number_type = 0;
+    descriptor.component_swap = 1;
+    try std.testing.expectEqual(
+        vk.format_a2b10g10r10_unorm_pack32,
+        colorTargetFormat(descriptor).?.vulkan,
+    );
+    try std.testing.expectEqual(@as(u8, 0xc6), colorTargetExportMapping(descriptor));
+}
+
 test "RGBA32F color targets use the matching Vulkan format" {
     var descriptor = std.mem.zeroes(gpu.resources.ColorTarget);
     descriptor.format = 14;
@@ -18674,6 +19369,7 @@ test "color attachments keep matching sample and fragment counts" {
 test "depth allocations compare by surface, not by clear value" {
     const base = GuestDepthTarget{
         .address = 0x4000,
+        .allocation_bytes = 1280 * 720 * 4,
         .width = 1280,
         .height = 720,
         .guest_format = 3,

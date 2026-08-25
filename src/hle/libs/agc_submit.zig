@@ -32,6 +32,7 @@ const trace = @import("../trace.zig");
 const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const memory = @import("kernel_memory.zig");
+const guest_address_space = @import("memory");
 const shader_registry = @import("agc_shader_registry.zig");
 const event_queue = @import("kernel_event_queue.zig");
 const kernel_sync = @import("kernel_sync.zig");
@@ -416,6 +417,15 @@ fn resolveSubmissionAlias(address: u64, byte_length: usize) ?u64 {
     return null;
 }
 
+fn resolveGuestMemoryAddress(address: u64, byte_length: usize) ?u64 {
+    return resolveSubmissionAlias(address, byte_length) orelse
+        if (memory.isGuestRangeAccessible(address, byte_length)) address else null;
+}
+
+fn addressSpaceFromContext(context: ?*anyopaque) ?*guest_address_space.AddressSpace {
+    return @ptrCast(@alignCast(context orelse return null));
+}
+
 const SubmissionHeaderCollision = struct {
     arena_address: u64,
     target_address: u64,
@@ -449,14 +459,13 @@ pub fn readGuestMemory(_: ?*anyopaque, address: u64, bytes: []u8) bool {
     if (video_out.readLabelMemory(address, bytes)) return true;
     // Prefer a known AGC arena alias. Compact GPU VAs live in the broad guest
     // reservation too, but do not necessarily have committed CPU pages there.
-    const resolved = resolveSubmissionAlias(address, bytes.len) orelse
-        if (memory.isGuestRangeAccessible(address, bytes.len)) address else return false;
+    const resolved = resolveGuestMemoryAddress(address, bytes.len) orelse return false;
     const source: [*]const u8 = @ptrFromInt(resolved);
     @memcpy(bytes, source[0..bytes.len]);
     return true;
 }
 
-pub fn writeGuestMemory(_: ?*anyopaque, address: u64, bytes: []const u8) bool {
+pub fn writeGuestMemory(context: ?*anyopaque, address: u64, bytes: []const u8) bool {
     if (video_out.writeLabelMemory(address, bytes)) return true;
     if (findSubmissionHeaderCollision(address, bytes.len)) |collision| {
         if (submission_header_write_reports < 32) {
@@ -471,12 +480,24 @@ pub fn writeGuestMemory(_: ?*anyopaque, address: u64, bytes: []const u8) bool {
         }
         return false;
     }
-    const resolved = resolveSubmissionAlias(address, bytes.len) orelse
-        if (memory.isGuestRangeAccessible(address, bytes.len)) address else return false;
+    const resolved = resolveGuestMemoryAddress(address, bytes.len) orelse return false;
+    if (addressSpaceFromContext(context)) |space| space.notifyGuestWrite(resolved, bytes.len);
     const destination: [*]u8 = @ptrFromInt(resolved);
     @memcpy(destination[0..bytes.len], bytes);
     if (resolved != address) kernel_runtime.wakeSyncAddress(resolved, std.math.maxInt(usize));
     return true;
+}
+
+pub fn trackGpuRead(context: ?*anyopaque, address: u64, size: usize) u64 {
+    const space = addressSpaceFromContext(context) orelse return 0;
+    const resolved = resolveGuestMemoryAddress(address, size) orelse return 0;
+    return space.trackGpuRead(resolved, size) catch 0;
+}
+
+pub fn gpuGeneration(context: ?*anyopaque, address: u64, size: usize) u64 {
+    const space = addressSpaceFromContext(context) orelse return 0;
+    const resolved = resolveGuestMemoryAddress(address, size) orelse return 0;
+    return space.gpuGeneration(resolved, size);
 }
 
 var shader_header_miss_logged: bool = false;

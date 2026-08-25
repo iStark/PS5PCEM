@@ -466,11 +466,14 @@ fn run(init: std.process.Init) !bool {
             .context = null,
             .resolve = resolveVideoOutBuffer,
         });
+        emu.address_space.?.enableGpuMemoryTracking();
         const guest_memory = vulkan.GuestMemory{
-            .context = null,
+            .context = &emu.address_space.?,
             .read = runtime.firmware.libs.agc_submit.readGuestMemory,
             .write = runtime.firmware.libs.agc_submit.writeGuestMemory,
             .shader_header = runtime.firmware.libs.agc_submit.findShaderHeader,
+            .track_gpu_read = runtime.firmware.libs.agc_submit.trackGpuRead,
+            .gpu_generation = runtime.firmware.libs.agc_submit.gpuGeneration,
         };
         runtime.firmware.libs.agc_submit.attachBackend(renderer.dcbBackend(guest_memory));
         try out.print("  Vulkan  {s} ({d}x{d} VideoOut window)\n", .{

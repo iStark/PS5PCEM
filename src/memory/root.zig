@@ -321,6 +321,33 @@ const Lock = struct {
     }
 };
 
+const TrackedGpuPage = struct {
+    generation: u64,
+    restore_protection: Protection,
+    armed: bool = false,
+};
+
+/// CPU-write watch state for memory which has been consumed by the GPU.  The
+/// guest uses 16 KiB pages, so the tracker deliberately has the same
+/// granularity instead of hashing whole textures and buffers every draw.
+const GpuPageTracker = struct {
+    pages: std.AutoHashMapUnmanaged(u64, TrackedGpuPage) = .empty,
+    lock: Lock = .{},
+    generation_counter: u64 = 1,
+    enabled: bool = false,
+
+    fn nextGeneration(self: *GpuPageTracker) u64 {
+        self.generation_counter +%= 1;
+        if (self.generation_counter == 0) self.generation_counter = 1;
+        return self.generation_counter;
+    }
+
+    fn deinit(self: *GpuPageTracker, allocator: std.mem.Allocator) void {
+        self.pages.deinit(allocator);
+        self.* = .{};
+    }
+};
+
 /// Owns all guest-address reservations in one host process.
 ///
 /// There must be at most one live instance per process. Creating a second one
@@ -334,6 +361,7 @@ pub const AddressSpace = struct {
     reservations: std.ArrayList(Range) = .empty,
     direct_backing: ?SharedBacking = null,
     mutex: Lock = .{},
+    gpu_tracker: GpuPageTracker = .{},
 
     pub fn init(allocator: std.mem.Allocator) Error!AddressSpace {
         if (@sizeOf(usize) != @sizeOf(u64)) return Error.UnsupportedHost;
@@ -366,6 +394,7 @@ pub const AddressSpace = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        self.gpu_tracker.deinit(self.allocator);
         self.discardMappingsLocked();
         self.releaseReservations();
         if (self.direct_backing) |*backing| backing.deinit();
@@ -483,6 +512,8 @@ pub const AddressSpace = struct {
 
         if (!self.coversCommittedLocked(address, size)) return Error.RangeNotMapped;
 
+        self.invalidateGpuTrackingLocked(address, size);
+
         var replacement: std.ArrayList(Mapping) = .empty;
         errdefer replacement.deinit(self.allocator);
         try replacement.ensureTotalCapacity(self.allocator, self.mappings.items.len + 2);
@@ -511,6 +542,8 @@ pub const AddressSpace = struct {
         defer self.mutex.unlock();
 
         if (!self.coversLocked(address, size, null)) return Error.RangeNotMapped;
+
+        self.invalidateGpuTrackingLocked(address, size);
 
         var replacement: std.ArrayList(Mapping) = .empty;
         errdefer replacement.deinit(self.allocator);
@@ -705,6 +738,10 @@ pub const AddressSpace = struct {
         if (bytes.len == 0) return;
         const size: u64 = @intCast(bytes.len);
 
+        // A tracked writable page is host-read-only until its first CPU write.
+        // Disarm it before taking the mapping lock and before memcpy touches it.
+        self.notifyGuestWrite(address, bytes.len);
+
         self.mutex.lock();
         defer self.mutex.unlock();
         if (!self.coversWithProtectionLocked(address, size, .write)) {
@@ -713,6 +750,126 @@ pub const AddressSpace = struct {
 
         const destination: [*]u8 = @ptrFromInt(address);
         @memcpy(destination[0..bytes.len], bytes);
+    }
+
+    /// Enables page-generation tracking. It is kept opt-in because loader and
+    /// unit-test address spaces do not need the write-fault machinery.
+    pub fn enableGpuMemoryTracking(self: *AddressSpace) void {
+        self.gpu_tracker.lock.lock();
+        defer self.gpu_tracker.lock.unlock();
+        self.gpu_tracker.enabled = true;
+    }
+
+    /// Marks every guest page in a GPU source range as observed and makes
+    /// writable pages read-only at the host level. The first subsequent CPU
+    /// write is caught by the native fault handler, restores the logical guest
+    /// protection, and advances that page's generation.
+    pub fn trackGpuRead(self: *AddressSpace, address: u64, size: usize) Error!u64 {
+        if (size == 0) return 0;
+        const byte_size: u64 = @intCast(size);
+        const range_end = std.math.add(u64, address, byte_size) catch return Error.InvalidSize;
+        const first_page = address & ~(page_size - 1);
+        const end_page = alignForward(range_end, page_size) orelse return Error.InvalidSize;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!self.coversWithProtectionLocked(address, byte_size, .read)) return Error.ProtectionDenied;
+
+        const tracker = &self.gpu_tracker;
+        tracker.lock.lock();
+        defer tracker.lock.unlock();
+        if (!tracker.enabled) return 0;
+
+        var fingerprint: u64 = 0xcbf2_9ce4_8422_2325;
+        var page = first_page;
+        while (page < end_page) : (page += page_size) {
+            const mapping = self.mappingForPageLocked(page) orelse return Error.RangeNotMapped;
+            const result = try tracker.pages.getOrPut(self.allocator, page);
+            if (!result.found_existing) {
+                result.value_ptr.* = .{
+                    .generation = tracker.nextGeneration(),
+                    .restore_protection = mapping.protection,
+                };
+            } else {
+                result.value_ptr.restore_protection = mapping.protection;
+            }
+            if (mapping.protection.write and !result.value_ptr.armed) {
+                var watched = mapping.protection;
+                watched.read = true;
+                watched.write = false;
+                try hostProtect(page, page_size, watched);
+                result.value_ptr.armed = true;
+            }
+            fingerprint ^= page;
+            fingerprint *%= 0x100_0000_01b3;
+            fingerprint ^= result.value_ptr.generation;
+            fingerprint *%= 0x100_0000_01b3;
+        }
+        return if (fingerprint == 0) 1 else fingerprint;
+    }
+
+    /// Returns the current ordered generation fingerprint, or zero when the
+    /// range has not yet been registered as a GPU source.
+    pub fn gpuGeneration(self: *AddressSpace, address: u64, size: usize) u64 {
+        if (size == 0) return 0;
+        const range_end = std.math.add(u64, address, @as(u64, @intCast(size))) catch return 0;
+        const first_page = address & ~(page_size - 1);
+        const end_page = alignForward(range_end, page_size) orelse return 0;
+        const tracker = &self.gpu_tracker;
+        tracker.lock.lock();
+        defer tracker.lock.unlock();
+        if (!tracker.enabled) return 0;
+
+        var fingerprint: u64 = 0xcbf2_9ce4_8422_2325;
+        var page = first_page;
+        while (page < end_page) : (page += page_size) {
+            const tracked = tracker.pages.get(page) orelse return 0;
+            fingerprint ^= page;
+            fingerprint *%= 0x100_0000_01b3;
+            fingerprint ^= tracked.generation;
+            fingerprint *%= 0x100_0000_01b3;
+        }
+        return if (fingerprint == 0) 1 else fingerprint;
+    }
+
+    /// Invalidates tracked pages before an emulator/HLE write. Native guest
+    /// writes take the exception path below instead.
+    pub fn notifyGuestWrite(self: *AddressSpace, address: u64, size: usize) void {
+        if (size == 0) return;
+        const range_end = std.math.add(u64, address, @as(u64, @intCast(size))) catch return;
+        const first_page = address & ~(page_size - 1);
+        const end_page = alignForward(range_end, page_size) orelse return;
+        const tracker = &self.gpu_tracker;
+        tracker.lock.lock();
+        defer tracker.lock.unlock();
+        if (!tracker.enabled) return;
+
+        var page = first_page;
+        while (page < end_page) : (page += page_size) {
+            const tracked = tracker.pages.getPtr(page) orelse continue;
+            if (tracked.armed) {
+                hostProtect(page, page_size, tracked.restore_protection) catch continue;
+                tracked.armed = false;
+            }
+            tracked.generation = tracker.nextGeneration();
+        }
+    }
+
+    /// Handles the first native CPU store after a GPU observation. This path is
+    /// deliberately allocation-free because Windows calls it from a vectored
+    /// exception handler on arbitrary guest worker threads.
+    pub fn handleGpuTrackedWriteFault(self: *AddressSpace, fault_address: u64) bool {
+        const page = fault_address & ~(page_size - 1);
+        const tracker = &self.gpu_tracker;
+        tracker.lock.lock();
+        defer tracker.lock.unlock();
+        if (!tracker.enabled) return false;
+        const tracked = tracker.pages.getPtr(page) orelse return false;
+        if (!tracked.armed or !tracked.restore_protection.write) return false;
+        hostProtect(page, page_size, tracked.restore_protection) catch return false;
+        tracked.armed = false;
+        tracked.generation = tracker.nextGeneration();
+        return true;
     }
 
     /// Copies from guest memory only when the entire source is mapped and
@@ -1075,6 +1232,34 @@ pub const AddressSpace = struct {
             if (cursor == end) return true;
         }
         return false;
+    }
+
+    fn mappingForPageLocked(self: *const AddressSpace, page: u64) ?Mapping {
+        for (self.mappings.items) |mapping| {
+            if (mapping.kind == .reserved) continue;
+            if (page >= mapping.address and page_size <= mapping.end() - page) return mapping;
+        }
+        return null;
+    }
+
+    /// Caller owns the mapping mutex. Removing the entry prevents a later
+    /// mapping at the same VA from inheriting a stale cache generation.
+    fn invalidateGpuTrackingLocked(self: *AddressSpace, address: u64, size: u64) void {
+        if (!self.gpu_tracker.enabled or size == 0) return;
+        const range_end = std.math.add(u64, address, size) catch return;
+        const first_page = address & ~(page_size - 1);
+        const end_page = alignForward(range_end, page_size) orelse return;
+        const tracker = &self.gpu_tracker;
+        tracker.lock.lock();
+        defer tracker.lock.unlock();
+
+        var page = first_page;
+        while (page < end_page) : (page += page_size) {
+            const removed = tracker.pages.fetchRemove(page) orelse continue;
+            if (removed.value.armed) {
+                hostProtect(page, page_size, removed.value.restore_protection) catch {};
+            }
+        }
     }
 
     const RequiredPermission = enum { read, write };
@@ -1758,6 +1943,34 @@ test "fixed pages are identity mapped, protected, and decommitted" {
     try testing.expectError(Error.ProtectionDenied, space.write(address, "x"));
     try space.unmap(address, page_size);
     try testing.expect(!space.isMapped(address, page_size));
+}
+
+test "GPU page tracker advances generations on HLE and native writes" {
+    var space = try AddressSpace.init(testing.allocator);
+    defer space.deinit();
+
+    const address = system_managed.start;
+    try space.mapFixed(address, 2 * page_size, .read_write, .private, null);
+    try space.write(address, "initial");
+    space.enableGpuMemoryTracking();
+
+    const first = try space.trackGpuRead(address, @intCast(2 * page_size));
+    try testing.expect(first != 0);
+    try testing.expectEqual(first, space.gpuGeneration(address, @intCast(2 * page_size)));
+
+    try space.write(address + 8, "changed");
+    const after_hle_write = space.gpuGeneration(address, @intCast(2 * page_size));
+    try testing.expect(after_hle_write != 0 and after_hle_write != first);
+
+    _ = try space.trackGpuRead(address, @intCast(2 * page_size));
+    try testing.expect(space.handleGpuTrackedWriteFault(address + page_size + 4));
+    const after_native_write = space.gpuGeneration(address, @intCast(2 * page_size));
+    try testing.expect(after_native_write != after_hle_write);
+    const native_pointer: *u8 = @ptrFromInt(address + page_size + 4);
+    native_pointer.* = 0xa5;
+
+    try space.unmap(address, 2 * page_size);
+    try testing.expectEqual(@as(u64, 0), space.gpuGeneration(address, @intCast(2 * page_size)));
 }
 
 test "automatic mappings use aligned first fit in the requested area" {
