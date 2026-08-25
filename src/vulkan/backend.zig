@@ -187,6 +187,10 @@ pub const Options = struct {
     /// their transient resources by timeline tick. Compatibility mode waits
     /// for each submitted tick before continuing.
     enable_timeline_scheduler: bool = false,
+    /// Keeps even small compute outputs GPU-authoritative until an exact guest
+    /// consumer requests them. The compatibility default eagerly publishes
+    /// small control buffers after dispatch.
+    defer_small_storage_writes: bool = false,
     /// Imports and writes back single-sample guest depth/stencil allocations.
     enable_depth_transfer: bool = false,
     /// Enables read-only barrier elision and compatible aspect merging in the
@@ -2262,6 +2266,7 @@ pub const Renderer = struct {
     async_pipeline_compilation_enabled: bool,
     canonical_image_aliases_enabled: bool,
     timeline_scheduler_enabled: bool,
+    defer_small_storage_writes_enabled: bool,
     depth_transfer_enabled: bool,
     image_state_optimization_enabled: bool,
     guest_memory: ?GuestMemory = null,
@@ -2779,6 +2784,7 @@ pub const Renderer = struct {
             .async_pipeline_compilation_enabled = options.enable_async_pipeline_compilation,
             .canonical_image_aliases_enabled = options.enable_canonical_image_aliases,
             .timeline_scheduler_enabled = options.enable_timeline_scheduler,
+            .defer_small_storage_writes_enabled = options.defer_small_storage_writes,
             .depth_transfer_enabled = options.enable_depth_transfer,
             .image_state_optimization_enabled = options.enable_image_state_optimization,
             .window_presentation = window_presentation,
@@ -5560,7 +5566,9 @@ pub const Renderer = struct {
         defer self.frame_profile.storage_commit_ns +|= elapsedHostNanoseconds(profile_started);
         for (resources.writable, 0..) |writable, index| {
             if (!writable) continue;
-            if (resources.sizes[index] >= deferred_storage_write_min_bytes) {
+            if (self.defer_small_storage_writes_enabled or
+                resources.sizes[index] >= deferred_storage_write_min_bytes)
+            {
                 for (self.guest_buffers.items) |*entry| {
                     if (entry.guest_address != resources.addresses[index] or
                         entry.size != resources.sizes[index]) continue;

@@ -42,6 +42,15 @@ fn openSaveDataHome(io: std.Io, content: std.Io.Dir) !std.Io.Dir {
 }
 
 const save_data_home = "savedata";
+const terminator_2d_title_id = "PPSA25872";
+
+/// Compatibility stays the global default, while profiles enable only paths
+/// which have passed isolated title A/B and visual runs. Terminator benefits
+/// from queue-ordered batches in flight and GPU-resident compute outputs; page
+/// tracking and the other experimental paths remain disabled.
+fn titleUsesTerminatorGpuProfile(title_identifier: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(title_identifier, terminator_2d_title_id);
+}
 
 /// Reads the product code a title publishes in its own parameter document.
 fn readTitleIdentifier(io: std.Io, content: std.Io.Dir, storage: []u8) ?[]const u8 {
@@ -322,6 +331,9 @@ fn run(init: std.process.Init) !bool {
     defer if (saves) |*directory| directory.close(io);
     defer runtime.firmware.filesystem.unmountSaveData();
 
+    var title_identifier_storage: [runtime.firmware.savedata.maximum_slot_name]u8 = undefined;
+    const title_identifier = readTitleIdentifier(io, content, &title_identifier_storage) orelse "";
+
     // A contained fault prints the retained calls afterwards, but a process
     // that dies outright takes the buffer with it. This is the escape hatch for
     // those, and it is far too noisy for anything else.
@@ -432,8 +444,25 @@ fn run(init: std.process.Init) !bool {
         (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_DEPTH_TRANSFER") catch false);
     const enable_image_state_optimization = enable_gpu_experimental or
         (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_IMAGE_STATE_OPT") catch false);
-    const enable_timeline_scheduler = enable_gpu_experimental or
-        (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_TIMELINE_SCHEDULER") catch false);
+    const use_terminator_gpu_profile = titleUsesTerminatorGpuProfile(title_identifier);
+    const force_synchronous_submits = init.minimal.environ.containsUnempty(
+        allocator,
+        "PS5_GPU_SYNC_SUBMITS",
+    ) catch false;
+    const enable_title_timeline_scheduler = use_terminator_gpu_profile and
+        !force_synchronous_submits;
+    const enable_timeline_scheduler = !force_synchronous_submits and
+        (enable_gpu_experimental or enable_title_timeline_scheduler or
+            (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_TIMELINE_SCHEDULER") catch false));
+    const force_eager_storage_writes = init.minimal.environ.containsUnempty(
+        allocator,
+        "PS5_GPU_EAGER_STORAGE_WRITES",
+    ) catch false;
+    const enable_title_deferred_storage_writes = use_terminator_gpu_profile and
+        !force_eager_storage_writes;
+    const defer_small_storage_writes = !force_eager_storage_writes and
+        (enable_gpu_experimental or enable_title_deferred_storage_writes or
+            (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_DEFER_STORAGE_WRITES") catch false));
     const enable_gpu_page_tracker = enable_gpu_experimental or
         (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_PAGE_TRACKER") catch false);
     if (builtin.os.tag == .windows and !force_headless) live_gpu: {
@@ -467,6 +496,7 @@ fn run(init: std.process.Init) !bool {
             .enable_async_pipeline_compilation = enable_async_pipelines,
             .enable_canonical_image_aliases = enable_canonical_aliases,
             .enable_timeline_scheduler = enable_timeline_scheduler,
+            .defer_small_storage_writes = defer_small_storage_writes,
             .enable_depth_transfer = enable_depth_transfer,
             .enable_image_state_optimization = enable_image_state_optimization,
             .native_window = .{
@@ -516,7 +546,7 @@ fn run(init: std.process.Init) !bool {
             native.height,
         });
         try out.print(
-            "  GPU flags ir={d} ssa={d} async_pso={d} aliases={d} depth_io={d} image_state_opt={d} timeline={d} page_tracker={d}\n",
+            "  GPU flags ir={d} ssa={d} async_pso={d} aliases={d} depth_io={d} image_state_opt={d} timeline={d} timeline_auto={d} defer_storage={d} defer_storage_auto={d} page_tracker={d}\n",
             .{
                 @intFromBool(enable_shader_ir),
                 @intFromBool(enable_shader_ssa),
@@ -525,6 +555,9 @@ fn run(init: std.process.Init) !bool {
                 @intFromBool(enable_depth_transfer),
                 @intFromBool(enable_image_state_optimization),
                 @intFromBool(enable_timeline_scheduler),
+                @intFromBool(enable_title_timeline_scheduler),
+                @intFromBool(defer_small_storage_writes),
+                @intFromBool(enable_title_deferred_storage_writes),
                 @intFromBool(enable_gpu_page_tracker),
             },
         );

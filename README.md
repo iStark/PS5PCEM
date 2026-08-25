@@ -504,8 +504,14 @@ effective value so a captured report is self-describing:
 | `PS5_GPU_DEPTH_TRANSFER=1` | single-sample guest depth/stencil import and writeback |
 | `PS5_GPU_IMAGE_STATE_OPT=1` | read-only barrier elision and compatible aspect merging |
 | `PS5_GPU_TIMELINE_SCHEDULER=1` | multiple in-flight submissions retired by timeline tick |
+| `PS5_GPU_DEFER_STORAGE_WRITES=1` | GPU-authoritative small compute outputs until an exact CPU consumer |
 | `PS5_GPU_PAGE_TRACKER=1` | 16 KiB guest-page generations backed by CPU write faults |
-| `PS5_GPU_EXPERIMENTAL=1` | enables all eight paths together |
+| `PS5_GPU_EXPERIMENTAL=1` | enables all nine paths together |
+
+`PPSA25872` automatically enables the timeline scheduler and deferred small
+storage writeback after measured title-specific A/B passes. Set
+`PS5_GPU_SYNC_SUBMITS=1` and `PS5_GPU_EAGER_STORAGE_WRITES=1` to force the two
+conservative paths when comparing performance or diagnosing a driver issue.
 
 Enable only one variable when isolating a regression, then remove it before the
 next run. For example:
