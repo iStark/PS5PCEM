@@ -19,10 +19,11 @@
 </div>
 
 > [!IMPORTANT]
-> PS5PCEM is an early development project, not a finished general-purpose
-> emulator. Rendering, synchronization, firmware coverage, performance, and
-> title compatibility are incomplete. Use only software and system files that
-> you are legally allowed to access.
+> PS5PCEM is an experimental emulator under active development. A growing number
+> of tested titles reach gameplay, and several are already playable, but
+> compatibility, performance, graphics, audio, and stability still vary by title
+> and hardware. Use only game content and system files that you are legally
+> entitled to use. See the [current compatibility status](docs/project-status.md).
 
 ## Launcher
 
