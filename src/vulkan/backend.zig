@@ -173,6 +173,25 @@ pub const Options = struct {
     /// Extends automatic PPM checkpoints beyond the small startup set. This is
     /// diagnostic I/O and remains opt-in for normal game runs.
     capture_extended_progress_frames: bool = false,
+    /// Emits runtime shaders through the typed RDNA2 IR. When disabled the
+    /// decoded-instruction SPIR-V backend remains the executable path.
+    enable_shader_ir: bool = false,
+    /// Experimental shader SSA/constant-fold/DCE emission. Disabled for live
+    /// titles until implicit RDNA2 register effects are fully represented.
+    enable_shader_ssa_optimization: bool = false,
+    /// Runs first-use Vulkan pipeline creation on the compiler worker.
+    enable_async_pipeline_compilation: bool = false,
+    /// Tracks overlapping image caches and selects one canonical writer.
+    enable_canonical_image_aliases: bool = false,
+    /// Allows multiple Vulkan submissions to remain in flight and retires
+    /// their transient resources by timeline tick. Compatibility mode waits
+    /// for each submitted tick before continuing.
+    enable_timeline_scheduler: bool = false,
+    /// Imports and writes back single-sample guest depth/stencil allocations.
+    enable_depth_transfer: bool = false,
+    /// Enables read-only barrier elision and compatible aspect merging in the
+    /// subresource image-state tracker. The default keeps conservative hazards.
+    enable_image_state_optimization: bool = false,
     /// Optional Win32 output window. Supplying it enables the required surface
     /// and swapchain extensions and constrains device selection to a queue that
     /// can present to this exact surface.
@@ -2238,6 +2257,13 @@ pub const Renderer = struct {
     dump_compute_spirv: bool,
     dump_graphics_spirv: bool,
     capture_extended_progress_frames: bool,
+    shader_ir_enabled: bool,
+    shader_ssa_optimization_enabled: bool,
+    async_pipeline_compilation_enabled: bool,
+    canonical_image_aliases_enabled: bool,
+    timeline_scheduler_enabled: bool,
+    depth_transfer_enabled: bool,
+    image_state_optimization_enabled: bool,
     guest_memory: ?GuestMemory = null,
     /// Holds a display buffer read straight out of guest memory, for a flip
     /// that names a buffer nothing was rendered into.
@@ -2748,8 +2774,18 @@ pub const Renderer = struct {
             .dump_compute_spirv = options.dump_compute_spirv,
             .dump_graphics_spirv = options.dump_graphics_spirv,
             .capture_extended_progress_frames = options.capture_extended_progress_frames,
+            .shader_ir_enabled = options.enable_shader_ir,
+            .shader_ssa_optimization_enabled = options.enable_shader_ssa_optimization,
+            .async_pipeline_compilation_enabled = options.enable_async_pipeline_compilation,
+            .canonical_image_aliases_enabled = options.enable_canonical_image_aliases,
+            .timeline_scheduler_enabled = options.enable_timeline_scheduler,
+            .depth_transfer_enabled = options.enable_depth_transfer,
+            .image_state_optimization_enabled = options.enable_image_state_optimization,
             .window_presentation = window_presentation,
         };
+        renderer.image_aliases.enabled = options.enable_canonical_image_aliases;
+        renderer.image_aliases.canonical_authority_enabled = options.enable_canonical_image_aliases;
+        renderer.image_states.optimize_barriers = options.enable_image_state_optimization;
         renderer.dynamic_scalar_buffer = try renderer.createBuffer(
             descriptor_scalar_ring_bytes,
             vk.buffer_usage_storage_buffer_bit,
@@ -5558,15 +5594,20 @@ pub const Renderer = struct {
             .renderer = self,
             .words = words,
         };
-        self.pipeline_compile_queue.submit(&work.job);
+        const asynchronous = self.async_pipeline_compilation_enabled;
+        if (asynchronous) {
+            self.pipeline_compile_queue.submit(&work.job);
+        } else {
+            ComputePipelineCompileJob.run(&work.job);
+        }
         const owned_words = self.allocator.dupe(u32, words) catch |err| {
-            work.job.wait();
+            if (asynchronous) work.job.wait();
             if (work.pipeline != 0) self.device_functions.destroy_pipeline(self.device, work.pipeline, null);
             if (work.shader != 0) self.device_functions.destroy_shader_module(self.device, work.shader, null);
             return err;
         };
         errdefer self.allocator.free(owned_words);
-        work.job.wait();
+        if (asynchronous) work.job.wait();
         if (work.failure) |failure| return failure;
         const shader = work.shader;
         const pipeline = work.pipeline;
@@ -6402,19 +6443,27 @@ pub const Renderer = struct {
         const started = hostTimestampNs();
         const byte_limit = shaderProgramByteLimit(reader, header_address, address);
         var analysis = if (byte_limit) |shader_bytes|
-            try gpu.shader_analysis.decodeBounded(
+            try gpu.shader_analysis.decodeBoundedWithOptions(
                 self.allocator,
                 reader,
                 address,
                 @min(maximum_shader_instructions, shader_bytes / @sizeOf(u32)),
                 shader_bytes,
+                .{
+                    .enable_typed_ir = self.shader_ir_enabled,
+                    .enable_ssa_optimization = self.shader_ssa_optimization_enabled,
+                },
             )
         else
-            try gpu.shader_analysis.decode(
+            try gpu.shader_analysis.decodeWithOptions(
                 self.allocator,
                 reader,
                 address,
                 headerless_shader_instruction_limit,
+                .{
+                    .enable_typed_ir = self.shader_ir_enabled,
+                    .enable_ssa_optimization = self.shader_ssa_optimization_enabled,
+                },
             );
         errdefer analysis.deinit(self.allocator);
         self.frame_profile.shader_analysis_ns +|= elapsedHostNanoseconds(started);
@@ -6522,7 +6571,7 @@ pub const Renderer = struct {
             .vertex_words = vertex_words,
             .fragment_words = fragment_words,
         };
-        const asynchronous = pipeline_state.rectangle_completion == 0;
+        const asynchronous = self.async_pipeline_compilation_enabled and pipeline_state.rectangle_completion == 0;
         if (asynchronous) self.pipeline_compile_queue.submit(&work.job);
         const owned_vertex = self.allocator.dupe(u32, vertex_words) catch |err| {
             if (asynchronous) {
@@ -7394,12 +7443,15 @@ pub const Renderer = struct {
             return Error.ImageViewCreationFailed;
         }
         errdefer self.destroyImageView(view);
-        const readback: ?OwnedBuffer = if (depthTransferPlan(target)) |plan|
-            try self.createBuffer(
-                plan.total_bytes,
-                vk.buffer_usage_transfer_src_bit | vk.buffer_usage_transfer_dst_bit,
-                vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
-            )
+        const readback: ?OwnedBuffer = if (self.depth_transfer_enabled)
+            if (depthTransferPlan(target)) |plan|
+                try self.createBuffer(
+                    plan.total_bytes,
+                    vk.buffer_usage_transfer_src_bit | vk.buffer_usage_transfer_dst_bit,
+                    vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+                )
+            else
+                null
         else
             null;
         errdefer if (readback) |buffer| self.destroyBuffer(buffer);
@@ -7441,6 +7493,7 @@ pub const Renderer = struct {
     /// Vulkan attachment. Unsupported multisample layouts retain the legacy
     /// first-use clear path instead of pretending stale host contents are valid.
     fn importDepthTarget(self: *Renderer, index: usize) anyerror!bool {
+        if (!self.depth_transfer_enabled) return false;
         if (index >= self.depth_targets.items.len) return false;
         const snapshot = self.depth_targets.items[index];
         const plan = depthTransferPlan(snapshot.target) orelse return false;
@@ -7560,6 +7613,7 @@ pub const Renderer = struct {
     /// eviction boundary. The attachment remains resident and returns to its
     /// render layout, matching the colour/storage cache policy.
     fn materializeDepthTarget(self: *Renderer, index: usize) anyerror!void {
+        if (!self.depth_transfer_enabled) return;
         if (index >= self.depth_targets.items.len) return;
         const snapshot = self.depth_targets.items[index];
         if (!snapshot.initialized or snapshot.gpu_generation == snapshot.host_generation) return;
@@ -7681,7 +7735,7 @@ pub const Renderer = struct {
         if (self.depth_targets.items.len < maximum_depth_targets) {
             try self.depth_targets.append(self.allocator, cached);
             const index = self.depth_targets.items.len - 1;
-            _ = try self.importDepthTarget(index);
+            if (self.depth_transfer_enabled) _ = try self.importDepthTarget(index);
             if (!self.reported_depth_attachment) {
                 self.reported_depth_attachment = true;
                 std.debug.print(
@@ -7706,7 +7760,7 @@ pub const Renderer = struct {
         self.invalidateDepthPasses(victim.view);
         self.destroyCachedDepthTarget(victim.*);
         victim.* = cached;
-        _ = try self.importDepthTarget(oldest_index);
+        if (self.depth_transfer_enabled) _ = try self.importDepthTarget(oldest_index);
         return oldest_index;
     }
 
@@ -9081,6 +9135,7 @@ pub const Renderer = struct {
     /// same allocation; the common alias registry supplies the byte-range
     /// relation for every image cache.
     fn flushAliasedImageWrites(self: *Renderer, address: u64, visible_bytes: usize) anyerror!void {
+        if (!self.canonical_image_aliases_enabled) return;
         const requested = aliasRange(address, visible_bytes);
         if (!requested.valid()) return;
         const authority = self.image_aliases.authorityForRange(requested);
@@ -10162,7 +10217,7 @@ pub const Renderer = struct {
                 }
             else
                 vertex_analysis.program;
-            if (rdna2.translateProgramSpirv(self.allocator, &vertex_program, .{
+            if (rdna2.translateProgramSpirvWithPipelineOptions(self.allocator, &vertex_program, .{
                 .stage = .vertex,
                 // The PS5 NGG/export ABI supplies S_NGG_VERTEX_INDEX in v5;
                 // ordinary VS programs retain the legacy v0 convention.
@@ -10178,6 +10233,9 @@ pub const Renderer = struct {
                 .sampled_images = graphics_resources.mappings[fragment_mapping_count..graphics_resources.mapping_count],
                 .ngg_lds_exports = ngg_lds_exports[0..ngg_lds_export_count],
                 .descriptor_array_length = maximum_storage_descriptors,
+            }, .{
+                .enable_typed_ir = self.shader_ir_enabled,
+                .enable_ssa_optimization = self.shader_ssa_optimization_enabled,
             })) |vertex_module_owned| {
                 self.frame_profile.shader_translate_ns +|= elapsedHostNanoseconds(vertex_translate_started);
                 var vertex_module = vertex_module_owned;
@@ -12750,7 +12808,11 @@ pub const Renderer = struct {
         self.pending_descriptor_slots.clearRetainingCapacity();
         self.draw_upload_cache.clearRetainingCapacity();
         self.frame_profile.submits += 1;
-        try self.refreshGpuProgress();
+        if (self.timeline_scheduler_enabled) {
+            try self.refreshGpuProgress();
+        } else {
+            try self.waitForTick(signal_tick);
+        }
     }
 
     fn resetDrawRings(self: *Renderer) void {

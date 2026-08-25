@@ -57,35 +57,34 @@ If you would like to support continued PS5PCEM development, you can do so on
   guest-memory round trip. A bound depth allocation becomes a resident
   attachment and can be sampled by a later pass, so guest depth testing,
   depth writes, stencil test/write, and multi-sample depth reach the rasterizer.
-- Vulkan work is submitted asynchronously in ordered batches and retires
-  through a timeline semaphore. Command buffers, descriptor slots, staging
-  ranges, and deferred Vulkan objects carry the timeline tick that owns them;
-  the CPU waits only at a real readback, guest synchronization boundary, or
-  exhausted reusable-resource ring rather than after every draw or dispatch.
-- Compute and graphics shader-module/pipeline misses run through an on-demand
-  FIFO compiler worker. The worker is idle-free when the queue drains,
+- Vulkan work uses ordered batches and timeline-tagged lifetime tracking. The
+  default compatibility profile waits for each submitted batch; the opt-in
+  timeline scheduler allows multiple batches to remain in flight and waits
+  only at a real readback, guest synchronization boundary, or exhausted
+  reusable-resource ring.
+- Compute and graphics shader-module/pipeline misses can run through an opt-in
+  on-demand FIFO compiler worker. The worker is idle-free when the queue drains,
   serializes access to the shared Vulkan driver cache, and overlaps compilation
   with preparation of the emulator's bounded LRU cache entries.
 - Guest image allocations share one range-based alias registry across colour
   and separate depth/stencil targets, storage images, and sampled textures. It
-  records the canonical writer and each representation's resident generation,
+  can record the canonical writer and each representation's resident generation,
   chooses direct resolves only for identical storage signatures, and routes
   reinterpretations or partial overlaps through current guest memory.
 - Vulkan image layout/access state is tracked per aspect, mip, and array layer.
   Color/depth attachments, sampled and storage images, transfers, resolves, and
-  readbacks now derive barriers from the preceding subresource use; same-layout
-  writes retain a hazard while repeated read-only use emits no redundant barrier.
-- Runtime shaders now pass through a common typed IR pipeline before SPIR-V:
+  readbacks derive barriers from the preceding subresource use. Its opt-in
+  optimization merges compatible aspects and removes redundant read-only barriers.
+- Runtime shaders can pass through a common typed IR pipeline before SPIR-V:
   lowering records operands and memory metadata, validation builds basic blocks
-  and reachability, SSA construction adds phi values and def-use edges,
-  propagation folds constants, and iterative DCE removes safe dead vector
-  definitions without deleting branch-target PCs. SPIR-V consumes a legalized
-  backend view directly rather than reconstructing a decoded program.
+  and reachability. The default live path emits from decoded instructions;
+  `PS5_GPU_SHADER_IR=1` selects legalized IR and `PS5_GPU_SSA=1` additionally
+  constructs phi/def-use state, folds constants, and runs iterative DCE.
 - Long-running title execution uses a freeing, thread-safe allocator, and
   aligned Windows direct-memory ranges share 64 KiB section views. Temporary
   uploads/readbacks and 16 KiB guest pages therefore no longer accumulate as
   an ever-growing host commit charge.
-- GPU source caches track those 16 KiB guest pages by generation. Tracked
+- The opt-in GPU page tracker tracks 16 KiB guest pages by generation. Tracked
   writable pages are armed read-only; the first native CPU store is handled as
   an invalidation fault, restores the guest protection, and advances the page
   generation. Unchanged buffers and textures can therefore remain resident
@@ -334,10 +333,10 @@ Eleven modules cover the independent subsystems and their end-to-end composition
 
 | Module | What it does |
 |---|---|
-| **`memory`** | Reserves fixed guest ranges, manages sparse mappings and permissions, and tracks 16 KiB GPU-source page generations |
-| **`rdna2`** | Decodes RDNA2 machine code and runs CFG validation, SSA/def-use optimization, legalization, and direct IR-to-SPIR-V emission |
+| **`memory`** | Reserves fixed guest ranges, manages sparse mappings and permissions, and provides opt-in 16 KiB GPU-source page generations |
+| **`rdna2`** | Decodes RDNA2 machine code and provides optional CFG/SSA optimization, legalization, and direct IR-to-SPIR-V emission |
 | **`gpu`** | Decodes, snapshots, schedules, and executes the stateful part of submitted GPU command streams |
-| **`vulkan`** | Owns the host Vulkan device, timeline-scheduled submissions, image-alias coherency, caches, and renderer boundary |
+| **`vulkan`** | Owns the host Vulkan device and provides gated timeline scheduling, image-alias coherency, caches, and the renderer boundary |
 | **`window`** | Owns the native host window and its platform message loop |
 | **`input`** | Reads Sony pads over HID, falls back to XInput, polls the host keyboard, and applies launcher remapping profiles |
 | **`loader`** | Reads, maps, and relocates bare ELF64 and decrypted PS5 SELF module images |
@@ -491,6 +490,37 @@ PPM after every draw of one selected frame; it is opt-in because a dense 4K
 frame can otherwise transfer several GiB and appear to freeze the title. These
 diagnostic switches deliberately change rendering or timing and are not
 compatibility or correctness modes.
+
+New GPU architecture paths are independently gated for title A/B testing. They
+are disabled in ordinary `game-run` launches; the startup log prints every
+effective value so a captured report is self-describing:
+
+| Variable | Experimental path |
+|---|---|
+| `PS5_GPU_SHADER_IR=1` | typed RDNA2 IR as the executable SPIR-V input |
+| `PS5_GPU_SSA=1` | SSA construction, constant folding, and shader DCE |
+| `PS5_GPU_ASYNC_PIPELINES=1` | FIFO worker for first-use pipeline compilation |
+| `PS5_GPU_CANONICAL_ALIASES=1` | shared generations and canonical writers for overlapping image caches |
+| `PS5_GPU_DEPTH_TRANSFER=1` | single-sample guest depth/stencil import and writeback |
+| `PS5_GPU_IMAGE_STATE_OPT=1` | read-only barrier elision and compatible aspect merging |
+| `PS5_GPU_TIMELINE_SCHEDULER=1` | multiple in-flight submissions retired by timeline tick |
+| `PS5_GPU_PAGE_TRACKER=1` | 16 KiB guest-page generations backed by CPU write faults |
+| `PS5_GPU_EXPERIMENTAL=1` | enables all eight paths together |
+
+Enable only one variable when isolating a regression, then remove it before the
+next run. For example:
+
+```powershell
+$env:PS5_CAPTURE_FIRST_FRAME = "1"
+$env:PS5_GPU_SSA = "1"
+.\zig-out\bin\game-run.exe "X:\path\to\title\eboot.bin"
+Remove-Item Env:PS5_GPU_SSA
+```
+
+The compatibility run with none of these variables set is the required
+baseline. A title-specific result is not promoted to the default until its
+captured frame, steady-state frame time, target readback volume, and Vulkan
+smoke result all match or improve on that baseline.
 
 For a native optimized build, install Zig 0.16 and use a current Vulkan driver:
 
@@ -1069,14 +1099,14 @@ compute. Validation is requested for debug builds when
 `VK_LAYER_KHRONOS_validation` is installed and otherwise disabled cleanly.
 
 The renderer owns instance/device lifetime, the selected queue, a transient
-command pool with reusable frame command buffers and one timeline semaphore,
+command pool with reusable frame command buffers and one lifetime timeline semaphore,
 host/device memory-type selection, one descriptor layout with 64 storage
 buffers, separate 64-entry 2D and 3D combined sampled-image arrays, typed
 storage images, a 256-set descriptor/scalar ring, a persistently mapped 128 MiB
 read-only/index upload arena, its pool, persistent guest render targets, and
 image/view/sampler/render-pass/framebuffer creation. It also owns bounded
 LRU compute and graphics-pipeline caches plus a 1,024-entry sampled-image LRU.
-First-use compute and graphics pipelines are created by
+When `PS5_GPU_ASYNC_PIPELINES=1`, first-use compute and graphics pipelines are created by
 [`vulkan.pipeline_compiler`](src/vulkan/pipeline_compiler.zig), an on-demand
 single-worker FIFO which serializes the shared driver cache and falls back to a
 correct inline drain if the host cannot create a thread. The Vulkan-driver
@@ -1092,33 +1122,34 @@ range. Small buffers retain eager visibility. This removes the former
 multi-megabyte upload/readback cycle from every dispatch while keeping cache and
 descriptor-set growth bounded.
 
-Guest-memory cache identity is generation-based when the embedding exposes the
-page tracker. The first GPU observation arms each writable 16 KiB guest page as
+Guest-memory cache identity is generation-based when the embedding enables
+`PS5_GPU_PAGE_TRACKER=1`. The first GPU observation then arms each writable
+16 KiB guest page as
 host-read-only. A native guest write fault or checked HLE write restores its
 logical protection and advances the page generation, so a stable buffer or
 texture reuses its resident Vulkan copy without a complete byte hash. Uploads
 verify the generation again after copying; a range modified concurrently is
 accepted only as a snapshot and is not cached as current.
 
-Graphics draws record without a queue wait until a real guest ordering packet,
-compute/readback dependency, or VideoOut flip closes the batch. Each draw binds
+Graphics draws record until a real guest ordering packet, compute/readback
+dependency, or VideoOut flip closes the batch. Each draw binds
 an immutable descriptor set and scalar slice; read-only guest buffers and index
 data receive aligned snapshots in the mapped frame arena. Vulkan objects used
 by recorded commands carry the batch's retirement tick. A submit signals the
-timeline semaphore once for every command-buffer prefix in that batch; command
-buffers, descriptor sets, storage-image leases, and deferred objects are reused
-only after that tick completes. When a bounded ring fills, the renderer waits
-for its oldest owning tick rather than draining the complete device. This
-preserves command-processor ordering while avoiding the former submit-and-wait
-cycle on almost every draw.
+timeline semaphore once for every command-buffer prefix in that batch.
+Compatibility mode immediately waits for the submitted tick;
+`PS5_GPU_TIMELINE_SCHEDULER=1` instead reuses command buffers, descriptor sets,
+storage-image leases, and deferred objects only after their owning tick has
+completed, waiting for the oldest tick when a bounded ring fills.
 
 `dcbBackend` adapts checked guest reads and writes plus synchronization,
 draw/dispatch and flip callbacks to [`gpu.executor`](src/gpu/executor.zig)
 without adding a Vulkan dependency to the command processor. A direct compute
 packet resolves `COMPUTE_PGM`, reads
-`COMPUTE_NUM_THREAD_X/Y/Z`, incrementally decodes guest code, lowers it through
-the typed IR validation/SSA/optimization/legalization pipeline, emits SPIR-V 1.5,
-creates or reuses its compute pipeline, binds the active storage set and
+`COMPUTE_NUM_THREAD_X/Y/Z`, incrementally decodes guest code, and emits SPIR-V
+1.5 from decoded instructions. `PS5_GPU_SHADER_IR=1` routes emission through
+typed validation/legalization; `PS5_GPU_SSA=1` additionally enables SSA. The
+backend then creates or reuses its compute pipeline, binds the active storage set and
 dispatches the packet's XYZ group counts. Errors remain
 visible in diagnostics, but missing compute state and selected resource or
 translation gaps skip only that dispatch instead of stopping the complete
@@ -1158,7 +1189,9 @@ storage signature, required generation, resident generation, and canonical
 authority. Writes advance a monotonic generation across all overlapping ranges,
 not only exact base-address matches. Compatible equal-range storage can resolve
 directly; format reinterpretations and partial overlaps publish the dirty
-authority and rebuild from guest memory. Depth and stencil allocations receive
+authority and rebuild from guest memory. Canonical writer selection requires
+`PS5_GPU_CANONICAL_ALIASES=1`; compatibility mode materializes all overlapping
+dirty writers. Depth and stencil allocations receive
 separate alias tokens even when Vulkan packs them into one attachment.
 
 [`vulkan.image_state`](src/vulkan/image_state.zig) tracks layout, access mask,
@@ -1166,9 +1199,11 @@ pipeline stages, aspect, mip, and layer for every persistent host image. Barrier
 planning is transactional: an undersized output buffer cannot partially commit
 state. Repeated read-only use in one layout is free, while read/write and
 write/write reuse preserves a Vulkan memory dependency even without a layout
-change. Persistent colour/depth targets, sampled textures, and storage images
-all use this path; swapchain and short-lived diagnostic images retain their
-local presentation barriers.
+change. Barrier elision and aspect merging require
+`PS5_GPU_IMAGE_STATE_OPT=1`; compatibility mode retains conservative hazards.
+Persistent colour/depth targets, sampled textures, and storage images all use
+this path; swapchain and short-lived diagnostic images retain their local
+presentation barriers.
 
 Recovered vertex and fragment SGPR values are read from the mapped scalar buffer
 at draw time instead of becoming SPIR-V constants. Storage-buffer shaders query
@@ -1213,8 +1248,10 @@ four-result gather, and vertex/fragment 2D texel fetches. Compute
 dimensions, mip chains, compare-gather variants, and the remaining sampling
 operands remain incomplete.
 
-Draw and dispatch batches continue asynchronously until a PM4 synchronization,
-readback, cache-reuse, or presentation dependency needs their timeline tick.
+With `PS5_GPU_TIMELINE_SCHEDULER=1`, draw and dispatch batches continue
+asynchronously until a PM4 synchronization, readback, cache-reuse, or
+presentation dependency needs their timeline tick. Compatibility mode waits
+after each ordered batch.
 `ACQUIRE_MEM`, `RELEASE_MEM`, `WRITE_DATA`, and events consequently wait for
 ordered submitted work without a device-idle drain or materializing unrelated
 render targets and storage buffers. Exact-address consumers publish only the
@@ -2482,7 +2519,7 @@ scheduler and Vulkan backend. Observed startup work now includes:
   A stale depth allocation smaller than the colour target is ignored because
   Vulkan requires every attachment to cover the framebuffer extent; this keeps
   fullscreen colour and UI passes valid when a title leaves 1×1 DB state bound. The
-  Single-sample `Z_16`/`Z_32_FLOAT` and optional S8 planes are detiled and
+  With `PS5_GPU_DEPTH_TRANSFER=1`, single-sample `Z_16`/`Z_32_FLOAT` and optional S8 planes are detiled and
   imported on first use. `D24_UNORM_S8` expands guest Z16 to the host depth
   aspect without losing its normalized endpoints; depth and stencil copy as
   separate Vulkan aspects. An explicit guest clear still supersedes imported

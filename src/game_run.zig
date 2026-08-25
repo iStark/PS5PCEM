@@ -416,6 +416,26 @@ fn run(init: std.process.Init) !bool {
         allocator,
         "PS5_CAPTURE_PROGRESS_FRAMES",
     ) catch false;
+    const enable_gpu_experimental = init.minimal.environ.containsUnempty(
+        allocator,
+        "PS5_GPU_EXPERIMENTAL",
+    ) catch false;
+    const enable_shader_ssa = enable_gpu_experimental or
+        (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_SSA") catch false);
+    const enable_shader_ir = enable_gpu_experimental or enable_shader_ssa or
+        (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_SHADER_IR") catch false);
+    const enable_async_pipelines = enable_gpu_experimental or
+        (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_ASYNC_PIPELINES") catch false);
+    const enable_canonical_aliases = enable_gpu_experimental or
+        (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_CANONICAL_ALIASES") catch false);
+    const enable_depth_transfer = enable_gpu_experimental or
+        (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_DEPTH_TRANSFER") catch false);
+    const enable_image_state_optimization = enable_gpu_experimental or
+        (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_IMAGE_STATE_OPT") catch false);
+    const enable_timeline_scheduler = enable_gpu_experimental or
+        (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_TIMELINE_SCHEDULER") catch false);
+    const enable_gpu_page_tracker = enable_gpu_experimental or
+        (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_PAGE_TRACKER") catch false);
     if (builtin.os.tag == .windows and !force_headless) live_gpu: {
         host_window.init(1280, 720) catch |err| {
             try stderr.print("live Vulkan window unavailable: {s}; continuing headless\n", .{@errorName(err)});
@@ -442,6 +462,13 @@ fn run(init: std.process.Init) !bool {
             .dump_compute_spirv = dump_compute_spirv,
             .dump_graphics_spirv = dump_graphics_spirv,
             .capture_extended_progress_frames = capture_extended_progress_frames,
+            .enable_shader_ir = enable_shader_ir,
+            .enable_shader_ssa_optimization = enable_shader_ssa,
+            .enable_async_pipeline_compilation = enable_async_pipelines,
+            .enable_canonical_image_aliases = enable_canonical_aliases,
+            .enable_timeline_scheduler = enable_timeline_scheduler,
+            .enable_depth_transfer = enable_depth_transfer,
+            .enable_image_state_optimization = enable_image_state_optimization,
             .native_window = .{
                 .instance = native.instance,
                 .window = native.window,
@@ -466,14 +493,21 @@ fn run(init: std.process.Init) !bool {
             .context = null,
             .resolve = resolveVideoOutBuffer,
         });
-        emu.address_space.?.enableGpuMemoryTracking();
+        const address_space = &emu.address_space.?;
+        if (enable_gpu_page_tracker) address_space.enableGpuMemoryTracking();
         const guest_memory = vulkan.GuestMemory{
-            .context = &emu.address_space.?,
+            .context = if (enable_gpu_page_tracker) address_space else null,
             .read = runtime.firmware.libs.agc_submit.readGuestMemory,
             .write = runtime.firmware.libs.agc_submit.writeGuestMemory,
             .shader_header = runtime.firmware.libs.agc_submit.findShaderHeader,
-            .track_gpu_read = runtime.firmware.libs.agc_submit.trackGpuRead,
-            .gpu_generation = runtime.firmware.libs.agc_submit.gpuGeneration,
+            .track_gpu_read = if (enable_gpu_page_tracker)
+                runtime.firmware.libs.agc_submit.trackGpuRead
+            else
+                null,
+            .gpu_generation = if (enable_gpu_page_tracker)
+                runtime.firmware.libs.agc_submit.gpuGeneration
+            else
+                null,
         };
         runtime.firmware.libs.agc_submit.attachBackend(renderer.dcbBackend(guest_memory));
         try out.print("  Vulkan  {s} ({d}x{d} VideoOut window)\n", .{
@@ -481,6 +515,19 @@ fn run(init: std.process.Init) !bool {
             native.width,
             native.height,
         });
+        try out.print(
+            "  GPU flags ir={d} ssa={d} async_pso={d} aliases={d} depth_io={d} image_state_opt={d} timeline={d} page_tracker={d}\n",
+            .{
+                @intFromBool(enable_shader_ir),
+                @intFromBool(enable_shader_ssa),
+                @intFromBool(enable_async_pipelines),
+                @intFromBool(enable_canonical_aliases),
+                @intFromBool(enable_depth_transfer),
+                @intFromBool(enable_image_state_optimization),
+                @intFromBool(enable_timeline_scheduler),
+                @intFromBool(enable_gpu_page_tracker),
+            },
+        );
     }
 
     try emu.enableNativeCpuDispatcher(io);

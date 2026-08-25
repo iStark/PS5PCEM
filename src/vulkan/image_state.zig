@@ -134,6 +134,7 @@ pub const Transition = struct {
 
 pub const Tracker = struct {
     cells: std.ArrayList(Cell) = .empty,
+    optimize_barriers: bool = true,
 
     pub fn deinit(self: *Tracker, allocator: std.mem.Allocator) void {
         self.cells.deinit(allocator);
@@ -228,15 +229,17 @@ pub const Tracker = struct {
             const previous = cell.usage;
             // Read-after-read in the same layout is already ordered. Any write
             // retains a memory dependency even when no layout change is needed.
-            if (previous.eql(next) and previous.readOnly()) continue;
+            if (self.optimize_barriers and previous.eql(next) and previous.readOnly()) continue;
             var grouped = false;
-            for (self.cells.items[0..cell_index]) |earlier| {
-                if (earlier.image == image and range.aspect_mask & earlier.aspect != 0 and
-                    earlier.mip_level == cell.mip_level and earlier.array_layer == cell.array_layer and
-                    earlier.usage.eql(previous) and !(earlier.usage.eql(next) and earlier.usage.readOnly()))
-                {
-                    grouped = true;
-                    break;
+            if (self.optimize_barriers) {
+                for (self.cells.items[0..cell_index]) |earlier| {
+                    if (earlier.image == image and range.aspect_mask & earlier.aspect != 0 and
+                        earlier.mip_level == cell.mip_level and earlier.array_layer == cell.array_layer and
+                        earlier.usage.eql(previous) and !(earlier.usage.eql(next) and earlier.usage.readOnly()))
+                    {
+                        grouped = true;
+                        break;
+                    }
                 }
             }
             if (!grouped) required += 1;
@@ -255,23 +258,25 @@ pub const Tracker = struct {
                 continue;
             }
             const previous = cell.usage;
-            if (previous.eql(next) and previous.readOnly()) continue;
+            if (self.optimize_barriers and previous.eql(next) and previous.readOnly()) continue;
             var merged = false;
-            for (output[0..count]) |*existing| {
-                const barrier = &existing.barrier;
-                if (existing.source_stages != previous.stages or
-                    existing.destination_stages != next.stages or
-                    barrier.source_access_mask != previous.access or
-                    barrier.destination_access_mask != next.access or
-                    barrier.old_layout != previous.layout or barrier.new_layout != next.layout or
-                    barrier.subresource_range.base_mip_level != cell.mip_level or
-                    barrier.subresource_range.base_array_layer != cell.array_layer)
-                {
-                    continue;
+            if (self.optimize_barriers) {
+                for (output[0..count]) |*existing| {
+                    const barrier = &existing.barrier;
+                    if (existing.source_stages != previous.stages or
+                        existing.destination_stages != next.stages or
+                        barrier.source_access_mask != previous.access or
+                        barrier.destination_access_mask != next.access or
+                        barrier.old_layout != previous.layout or barrier.new_layout != next.layout or
+                        barrier.subresource_range.base_mip_level != cell.mip_level or
+                        barrier.subresource_range.base_array_layer != cell.array_layer)
+                    {
+                        continue;
+                    }
+                    barrier.subresource_range.aspect_mask |= cell.aspect;
+                    merged = true;
+                    break;
                 }
-                barrier.subresource_range.aspect_mask |= cell.aspect;
-                merged = true;
-                break;
             }
             if (merged) {
                 cell.usage = next;
@@ -375,6 +380,27 @@ test "same-layout read-only reuse needs no barrier" {
             .aspect_mask = vk.image_aspect_depth_bit | vk.image_aspect_stencil_bit,
         }, shader_read_usage, &transitions),
     );
+}
+
+test "conservative mode retains read hazards and separate aspects" {
+    var tracker = Tracker{ .optimize_barriers = false };
+    defer tracker.deinit(std.testing.allocator);
+    try tracker.registerImage(std.testing.allocator, 15, .{
+        .aspect_mask = vk.image_aspect_depth_bit | vk.image_aspect_stencil_bit,
+    });
+    var transitions: [4]Transition = undefined;
+    const range = SubresourceRange{
+        .aspect_mask = vk.image_aspect_depth_bit | vk.image_aspect_stencil_bit,
+    };
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        try tracker.transition(15, range, shader_read_usage, &transitions),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        try tracker.transition(15, range, shader_read_usage, &transitions),
+    );
+    try std.testing.expectEqual(vk.image_layout_shader_read_only_optimal, transitions[0].barrier.old_layout);
 }
 
 test "capacity failure does not partially commit subresource state" {

@@ -32,6 +32,7 @@ pub const formatProgram = disasm.formatProgram;
 pub const formatInstruction = disasm.formatInstruction;
 pub const buildControlFlow = control_flow.build;
 pub const lowerIr = ir.lower;
+pub const lowerIrWithOptions = ir.lowerWithOptions;
 pub const translateIrSpirv = spirv.translateIr;
 pub const translateIrBackendSpirv = spirv.translateBackend;
 /// Compatibility name for the low-level decoded-instruction backend.
@@ -44,7 +45,19 @@ pub fn translateProgramSpirv(
     program: *const Program,
     options: spirv.Options,
 ) spirv.Error!spirv.Module {
-    var module = try ir.lower(allocator, program);
+    return translateProgramSpirvWithPipelineOptions(allocator, program, options, .{});
+}
+
+pub fn translateProgramSpirvWithPipelineOptions(
+    allocator: std.mem.Allocator,
+    program: *const Program,
+    options: spirv.Options,
+    pipeline_options: ir.PipelineOptions,
+) spirv.Error!spirv.Module {
+    if (!pipeline_options.enable_typed_ir) {
+        return spirv.translate(allocator, program, options);
+    }
+    var module = try ir.lowerWithOptions(allocator, program, pipeline_options);
     defer module.deinit(allocator);
     return spirv.translateIr(allocator, &module, options);
 }

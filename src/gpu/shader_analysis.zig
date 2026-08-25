@@ -31,6 +31,7 @@ pub const Analysis = struct {
     program: rdna2.Program,
     graph: rdna2.control_flow.Graph,
     module: rdna2.ir.Module,
+    pipeline_options: rdna2.ir.PipelineOptions = .{},
 
     pub fn deinit(self: *Analysis, allocator: std.mem.Allocator) void {
         self.module.deinit(allocator);
@@ -51,7 +52,11 @@ pub const Analysis = struct {
     /// ends. LDS-only writes are deliberately excluded because that storage
     /// dies with the dispatch unless another instruction exports it.
     pub fn hasExternalEffects(self: *const Analysis) bool {
-        for (self.module.instructions.items) |inst| {
+        const instructions = if (self.pipeline_options.enable_typed_ir)
+            self.module.instructions.items
+        else
+            self.program.instructions.items;
+        for (instructions) |inst| {
             if (inst.family == .ds and inst.gds) return true;
             switch (inst.opcode) {
                 .buffer_store_format_x,
@@ -110,6 +115,9 @@ pub const Analysis = struct {
         allocator: std.mem.Allocator,
         options: SpirvOptions,
     ) rdna2.spirv.Error!rdna2.spirv.Module {
+        if (!self.pipeline_options.enable_typed_ir) {
+            return rdna2.translateSpirv(allocator, &self.program, options);
+        }
         return rdna2.translateIrSpirv(allocator, &self.module, options);
     }
 };
@@ -138,7 +146,17 @@ pub fn decode(
     address: u64,
     instruction_limit: usize,
 ) Error!Analysis {
-    return decodeImpl(allocator, reader, address, instruction_limit, null);
+    return decodeWithOptions(allocator, reader, address, instruction_limit, .{});
+}
+
+pub fn decodeWithOptions(
+    allocator: std.mem.Allocator,
+    reader: shaders.MemoryReader,
+    address: u64,
+    instruction_limit: usize,
+    pipeline_options: rdna2.ir.PipelineOptions,
+) Error!Analysis {
+    return decodeImpl(allocator, reader, address, instruction_limit, null, pipeline_options);
 }
 
 /// Decodes a program without ever reading beyond the AGC shader allocation.
@@ -151,6 +169,24 @@ pub fn decodeBounded(
     instruction_limit: usize,
     shader_size_bytes: usize,
 ) Error!Analysis {
+    return decodeBoundedWithOptions(
+        allocator,
+        reader,
+        address,
+        instruction_limit,
+        shader_size_bytes,
+        .{},
+    );
+}
+
+pub fn decodeBoundedWithOptions(
+    allocator: std.mem.Allocator,
+    reader: shaders.MemoryReader,
+    address: u64,
+    instruction_limit: usize,
+    shader_size_bytes: usize,
+    pipeline_options: rdna2.ir.PipelineOptions,
+) Error!Analysis {
     if (shader_size_bytes < @sizeOf(u32)) return Error.EmptyProgram;
     return decodeImpl(
         allocator,
@@ -158,6 +194,7 @@ pub fn decodeBounded(
         address,
         instruction_limit,
         shader_size_bytes / @sizeOf(u32),
+        pipeline_options,
     );
 }
 
@@ -167,6 +204,7 @@ fn decodeImpl(
     address: u64,
     instruction_limit: usize,
     word_limit: ?usize,
+    pipeline_options: rdna2.ir.PipelineOptions,
 ) Error!Analysis {
     var code: std.ArrayList(u32) = .empty;
     errdefer code.deinit(allocator);
@@ -217,8 +255,14 @@ fn decodeImpl(
     errdefer program.deinit(allocator);
     var graph = try rdna2.buildControlFlow(allocator, &program);
     errdefer graph.deinit(allocator);
-    const module = try rdna2.lowerIr(allocator, &program);
-    return .{ .code = code, .program = program, .graph = graph, .module = module };
+    const module = try rdna2.lowerIrWithOptions(allocator, &program, pipeline_options);
+    return .{
+        .code = code,
+        .program = program,
+        .graph = graph,
+        .module = module,
+        .pipeline_options = pipeline_options,
+    };
 }
 
 fn isHardwareNggSetpc(inst: rdna2.Instruction) bool {

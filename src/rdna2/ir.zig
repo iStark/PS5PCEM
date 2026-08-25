@@ -18,6 +18,16 @@ pub const PipelineStage = enum {
     legalized,
 };
 
+pub const PipelineOptions = struct {
+    /// Emits SPIR-V from the typed IR rather than the decoded instruction
+    /// stream. Runtime compatibility profiles may keep building the IR for
+    /// diagnostics while bypassing it for executable shader generation.
+    enable_typed_ir: bool = true,
+    /// SSA construction and dead-definition elimination remain experimental
+    /// until every implicit RDNA2 VGPR/VCC/EXEC dependency is represented.
+    enable_ssa_optimization: bool = true,
+};
+
 pub const Operation = enum {
     nop,
     move,
@@ -879,6 +889,29 @@ pub fn optimize(allocator: std.mem.Allocator, module: *Module) std.mem.Allocator
     module.stage = .optimized;
 }
 
+/// Compatibility optimizer used by the live renderer unless SSA is opted in.
+/// It preserves the pre-SSA emission contract: only non-target NOPs disappear,
+/// while every value-producing instruction remains visible to the backend.
+fn optimizeConservative(allocator: std.mem.Allocator, module: *Module) std.mem.Allocator.Error!void {
+    module.optimization = .{};
+    for (module.nodes.items, 0..) |*node, index| {
+        node.elided = false;
+        if (isBlockLeader(module, index)) continue;
+        if (node.opcode != .s_nop and node.opcode != .v_nop) continue;
+        node.elided = true;
+        module.optimization.elided_nops += 1;
+    }
+    module.backend_instructions.clearRetainingCapacity();
+    try module.backend_instructions.ensureTotalCapacity(
+        allocator,
+        module.instructions.items.len -| module.optimization.elided_nops,
+    );
+    for (module.instructions.items, module.nodes.items) |inst, node| {
+        if (!node.elided) module.backend_instructions.appendAssumeCapacity(inst);
+    }
+    module.stage = .optimized;
+}
+
 /// Final API-neutral legalization boundary. All current values already use
 /// backend-portable scalar types; keeping this as an explicit pass gives new
 /// 16/64-bit operations one well-defined place to be widened or split.
@@ -887,14 +920,34 @@ pub fn legalize(module: *Module) void {
 }
 
 pub fn runPipeline(allocator: std.mem.Allocator, module: *Module) std.mem.Allocator.Error!void {
+    return runPipelineWithOptions(allocator, module, .{});
+}
+
+pub fn runPipelineWithOptions(
+    allocator: std.mem.Allocator,
+    module: *Module,
+    options: PipelineOptions,
+) std.mem.Allocator.Error!void {
     module.stage = .typed;
     try validate(allocator, module);
-    try buildSsa(allocator, module);
-    try optimize(allocator, module);
+    if (options.enable_ssa_optimization) {
+        try buildSsa(allocator, module);
+        try optimize(allocator, module);
+    } else {
+        try optimizeConservative(allocator, module);
+    }
     legalize(module);
 }
 
 pub fn lower(allocator: std.mem.Allocator, program: *const instruction.Program) std.mem.Allocator.Error!Module {
+    return lowerWithOptions(allocator, program, .{});
+}
+
+pub fn lowerWithOptions(
+    allocator: std.mem.Allocator,
+    program: *const instruction.Program,
+    options: PipelineOptions,
+) std.mem.Allocator.Error!Module {
     var module = Module{};
     errdefer module.deinit(allocator);
     try module.instructions.appendSlice(allocator, program.instructions.items);
@@ -925,7 +978,7 @@ pub fn lower(allocator: std.mem.Allocator, program: *const instruction.Program) 
             } else null,
         });
     }
-    try runPipeline(allocator, &module);
+    try runPipelineWithOptions(allocator, &module, options);
     return module;
 }
 
@@ -1049,6 +1102,38 @@ test "SSA propagates constants and removes a dead vector definition" {
     try std.testing.expectEqual(@as(u32, 2), module.optimization.constant_folds);
     try std.testing.expectEqual(@as(u32, 1), module.optimization.dead_instructions);
     try std.testing.expect(module.nodes.items[1].elided);
+}
+
+test "conservative pipeline retains value-producing instructions" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .opcode = .v_mov_b32,
+        .dst = .{ .kind = .vgpr, .reg = 0 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 4 },
+        .src_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 4,
+        .opcode = .v_add_nc_u32,
+        .dst = .{ .kind = .vgpr, .reg = 1 },
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src1 = .{ .kind = .integer_inline_constant, .value = 7 },
+        .src_count = 2,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 8, .opcode = .s_endpgm });
+    var module = try lowerWithOptions(
+        std.testing.allocator,
+        &program,
+        .{ .enable_ssa_optimization = false },
+    );
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), module.ssa_instructions.items.len);
+    try std.testing.expectEqual(@as(u32, 0), module.optimization.dead_instructions);
+    try std.testing.expectEqual(@as(usize, 3), module.backend_instructions.items.len);
+    try std.testing.expect(!module.nodes.items[1].elided);
 }
 
 test "SSA inserts a phi at a register merge and records def-use edges" {

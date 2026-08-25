@@ -96,6 +96,8 @@ pub const Manager = struct {
     entries: std.ArrayList(Entry) = .empty,
     next_token: Token = 1,
     next_generation: u64 = 1,
+    enabled: bool = true,
+    canonical_authority_enabled: bool = true,
 
     pub fn deinit(self: *Manager, allocator: std.mem.Allocator) void {
         self.entries.deinit(allocator);
@@ -120,7 +122,7 @@ pub const Manager = struct {
             .signature = signature,
             .generation = inherited.generation,
             .resident_generation = 0,
-            .authority = inherited.authority,
+            .authority = if (self.canonical_authority_enabled) inherited.authority else 0,
         });
         return token;
     }
@@ -163,14 +165,17 @@ pub const Manager = struct {
     }
 
     pub fn generationForToken(self: *const Manager, token: Token) u64 {
+        if (!self.enabled) return 0;
         return if (self.entry(token)) |candidate| candidate.generation else 0;
     }
 
     pub fn generationForRange(self: *const Manager, range: Range) u64 {
+        if (!self.enabled) return 0;
         return self.newestForRange(range).generation;
     }
 
     pub fn authorityForRange(self: *const Manager, range: Range) Token {
+        if (!self.enabled or !self.canonical_authority_enabled) return 0;
         return self.newestForRange(range).authority;
     }
 
@@ -195,6 +200,7 @@ pub const Manager = struct {
     /// Makes the writer authoritative and invalidates every overlapping cached
     /// representation, including aliases whose base addresses differ.
     pub fn markWrite(self: *Manager, token: Token) u64 {
+        if (!self.enabled) return 0;
         const writer = self.entry(token) orelse return 0;
         const generation = self.next_generation;
         self.next_generation +%= 1;
@@ -202,7 +208,7 @@ pub const Manager = struct {
         for (self.entries.items) |*candidate| {
             if (!candidate.range.overlaps(writer.range)) continue;
             candidate.generation = generation;
-            candidate.authority = token;
+            candidate.authority = if (self.canonical_authority_enabled) token else 0;
             if (candidate.token == token) candidate.resident_generation = generation;
         }
         return generation;
@@ -211,6 +217,7 @@ pub const Manager = struct {
     /// Records that a representation has imported the current canonical
     /// content, either by a direct Vulkan copy/resolve or from guest memory.
     pub fn markSynchronized(self: *Manager, token: Token) bool {
+        if (!self.enabled) return false;
         for (self.entries.items) |*candidate| {
             if (candidate.token != token) continue;
             candidate.resident_generation = candidate.generation;
@@ -224,9 +231,13 @@ pub const Manager = struct {
     /// same storage; reinterpretations and partial overlaps go through guest
     /// memory so tiling/format conversion remains explicit.
     pub fn resolve(self: *const Manager, token: Token) ?Resolve {
+        if (!self.enabled) return null;
         const destination = self.entry(token) orelse return null;
         if (destination.resident_generation == destination.generation) return null;
-        const source = self.entry(destination.authority);
+        const source = if (self.canonical_authority_enabled)
+            self.entry(destination.authority)
+        else
+            null;
         return .{
             .source = if (source != null) destination.authority else 0,
             .destination = token,
@@ -241,6 +252,7 @@ pub const Manager = struct {
     /// Makes guest memory an up-to-date canonical backing store for all
     /// overlapping views without discarding still-resident Vulkan copies.
     pub fn publishGuest(self: *Manager, range: Range) void {
+        if (!self.enabled) return;
         for (self.entries.items) |*candidate| {
             if (candidate.range.overlaps(range)) candidate.authority = 0;
         }
@@ -366,4 +378,45 @@ test "reinterpretation resolves through guest canonical memory" {
     try std.testing.expect(!manager.resolve(sampled).?.direct);
     manager.publishGuest(.{ .address = 0xa000, .size = 0x4000 });
     try std.testing.expectEqual(@as(Token, 0), manager.resolve(sampled).?.source);
+}
+
+test "disabled canonical authority retains compatibility flush semantics" {
+    var manager = Manager{ .canonical_authority_enabled = false };
+    defer manager.deinit(std.testing.allocator);
+    const writer = try manager.register(
+        std.testing.allocator,
+        .color_target,
+        .{ .address = 0xb000, .size = 0x4000 },
+        test_signature,
+    );
+    const sampled = try manager.register(
+        std.testing.allocator,
+        .sampled_image,
+        .{ .address = 0xb000, .size = 0x4000 },
+        test_signature,
+    );
+    _ = manager.markWrite(writer);
+    try std.testing.expectEqual(
+        @as(Token, 0),
+        manager.authorityForRange(.{ .address = 0xb000, .size = 0x4000 }),
+    );
+    const plan = manager.resolve(sampled).?;
+    try std.testing.expectEqual(@as(Token, 0), plan.source);
+    try std.testing.expect(!plan.direct);
+}
+
+test "disabled manager preserves inert registration tokens" {
+    var manager = Manager{ .enabled = false };
+    defer manager.deinit(std.testing.allocator);
+    const token = try manager.register(
+        std.testing.allocator,
+        .sampled_image,
+        .{ .address = 0xc000, .size = 0x4000 },
+        test_signature,
+    );
+    try std.testing.expect(token != 0);
+    try std.testing.expectEqual(@as(u64, 0), manager.markWrite(token));
+    try std.testing.expectEqual(@as(u64, 0), manager.generationForToken(token));
+    try std.testing.expect(manager.resolve(token) == null);
+    manager.unregister(token);
 }
