@@ -164,6 +164,7 @@ var regular_font: Win32.Font = null;
 var medium_font: Win32.Font = null;
 var title_font: Win32.Font = null;
 var small_font: Win32.Font = null;
+var application_icon: Win32.Icon = null;
 
 fn tr(phrase: Phrase) []const u8 {
     return switch (language) {
@@ -471,6 +472,7 @@ pub fn main(_: std.process.Init) !void {
     defer destroyFonts();
 
     const instance = Win32.GetModuleHandleW(null) orelse return error.WindowCreationFailed;
+    application_icon = Win32.LoadIconW(instance, Win32.app_icon_resource);
     const class = Win32.WndClassExW{
         .size = @sizeOf(Win32.WndClassExW),
         .style = Win32.class_redraw,
@@ -478,12 +480,12 @@ pub fn main(_: std.process.Init) !void {
         .class_extra = 0,
         .window_extra = 0,
         .instance = instance,
-        .icon = Win32.LoadIconW(instance, null),
+        .icon = application_icon,
         .cursor = Win32.LoadCursorW(null, Win32.arrow_cursor),
         .background = null,
         .menu_name = null,
         .class_name = w("PS5PCEM_LAUNCHER"),
-        .small_icon = null,
+        .small_icon = application_icon,
     };
     if (Win32.RegisterClassExW(&class) == 0 and Win32.GetLastError() != Win32.error_class_already_exists) {
         return error.WindowCreationFailed;
@@ -869,8 +871,7 @@ fn paint(window: Win32.Window) void {
 }
 
 fn drawBrand(dc: Win32.DeviceContext) void {
-    roundFill(dc, .{ .left = 24, .top = 28, .right = 68, .bottom = 72 }, 14, 0x00ff9c3d);
-    text(dc, w("P5"), -1, .{ .left = 34, .top = 39, .right = 64, .bottom = 64 }, 0x00181510, medium_font, Win32.dt_left);
+    _ = Win32.DrawIconEx(dc, 24, 28, application_icon, 44, 44, 0, null, Win32.di_normal);
     text(dc, w("PS5PCEM"), -1, .{ .left = 80, .top = 31, .right = 216, .bottom = 56 }, 0x00f4f0ea, title_font, Win32.dt_left);
     text(dc, w("LAUNCHER · PREVIEW"), -1, .{ .left = 80, .top = 57, .right = 216, .bottom = 76 }, 0x009b9088, small_font, Win32.dt_left);
 }
@@ -2112,6 +2113,7 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     // IDC_HAND is an odd numeric identifier passed in a pointer slot, so it
     // cannot carry the alignment a real UTF-16 string would.
     const hand_cursor: [*:0]align(1) const u16 = @ptrFromInt(32649);
+    const app_icon_resource: [*:0]align(1) const u16 = @ptrFromInt(1);
     const wm_key_down: u32 = 0x0100;
     const wm_left_button_up: u32 = 0x0202;
     const tme_leave: u32 = 0x0000_0002;
@@ -2122,6 +2124,7 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     const dt_word_break: u32 = 0x0010;
     const dt_no_prefix: u32 = 0x0800;
     const dt_end_ellipsis: u32 = 0x8000;
+    const di_normal: u32 = 0x0003;
     const null_pen: i32 = 8;
     const arrow_cursor: [*:0]const u16 = @ptrFromInt(32512);
     const NativePoint = extern struct { x: i32 = 0, y: i32 = 0 };
@@ -2196,12 +2199,13 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     extern "kernel32" fn ReadFile(Handle, [*]u8, u32, ?*u32, ?*anyopaque) callconv(.winapi) i32;
     extern "user32" fn GetCursorPos(*NativePoint) callconv(.winapi) i32;
     extern "user32" fn ScreenToClient(Window, *NativePoint) callconv(.winapi) i32;
-    extern "user32" fn LoadIconW(Instance, ?[*:0]const u16) callconv(.winapi) Icon;
+    extern "user32" fn LoadIconW(Instance, ?[*:0]align(1) const u16) callconv(.winapi) Icon;
     extern "user32" fn BeginPaint(Window, *PaintStruct) callconv(.winapi) DeviceContext;
     extern "user32" fn EndPaint(Window, *const PaintStruct) callconv(.winapi) i32;
     extern "user32" fn GetClientRect(Window, *NativeRect) callconv(.winapi) i32;
     extern "user32" fn FillRect(DeviceContext, *const NativeRect, Brush) callconv(.winapi) i32;
     extern "user32" fn DrawTextW(DeviceContext, [*]const u16, i32, *NativeRect, u32) callconv(.winapi) i32;
+    extern "user32" fn DrawIconEx(DeviceContext, i32, i32, Icon, i32, i32, u32, Brush, u32) callconv(.winapi) i32;
     extern "user32" fn InvalidateRect(Window, ?*const NativeRect, i32) callconv(.winapi) i32;
     extern "user32" fn SetProcessDpiAwarenessContext(?*anyopaque) callconv(.winapi) i32;
     extern "user32" fn MapVirtualKeyW(code: u32, map_type: u32) callconv(.winapi) u32;

@@ -516,6 +516,10 @@ pub fn build(b: *std.Build) void {
         // Sony pads are read straight from HID; XInput never enumerates them.
         game_run.root_module.linkSystemLibrary("setupapi", .{});
         game_run.root_module.linkSystemLibrary("hid", .{});
+        game_run.root_module.addWin32ResourceFile(.{
+            .file = b.path("assets/windows/ps5pcem-runner.rc"),
+            .include_paths = &.{b.path("assets/windows")},
+        });
     }
     const install_game_run = b.addInstallArtifact(game_run, .{});
     b.getInstallStep().dependOn(&install_game_run.step);
@@ -544,6 +548,10 @@ pub fn build(b: *std.Build) void {
             }),
         });
         native_launcher.subsystem = .windows;
+        native_launcher.root_module.addWin32ResourceFile(.{
+            .file = b.path("assets/windows/ps5pcem-launcher.rc"),
+            .include_paths = &.{b.path("assets/windows")},
+        });
         inline for (&.{ "user32", "gdi32", "shell32", "ole32", "dwmapi", "setupapi", "hid" }) |library| {
             native_launcher.root_module.linkSystemLibrary(library, .{});
         }
