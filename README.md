@@ -400,7 +400,9 @@ finished title open forever.
 The recommended Windows entry point is `zig-out\bin\ps5pcem.exe` (or
 `zig build launcher`). The launcher remembers up to eight recently selected
 game directories, reads each title from `sce_sys/param.json`, and uses
-`sce_sys/icon0.png` as its library cover. It also persists sound state,
+`sce_sys/icon0.png` as its library cover. Hovering a card reveals a small remove
+button which forgets only that library entry; installed content and saves are
+never deleted. It also persists sound state,
 FPS-counter preference, input mode, keyboard bindings, and interface language
 in `ps5pcem.ini` next to the executable. English is the default; Russian,
 German, and French are available from Settings. It looks for `eboot.bin` in the

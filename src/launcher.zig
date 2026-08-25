@@ -97,6 +97,7 @@ const Phrase = enum {
     status_runner_missing,
     status_launch_failed,
     status_launched,
+    status_game_removed,
 };
 
 const Rect = struct {
@@ -147,6 +148,9 @@ const RecentGame = struct {
 };
 var recent_games: [maximum_recent_games]RecentGame = @splat(.{});
 var recent_game_count: usize = 0;
+var hovered_recent_game: ?usize = null;
+var hovered_recent_remove = false;
+var tracking_mouse_leave = false;
 /// The product code the selected title publishes about itself. Saves are keyed
 /// by it, so without one there is no directory to show.
 var title_identifier: [32]u16 = @splat(0);
@@ -233,6 +237,7 @@ fn tr(phrase: Phrase) []const u8 {
             .status_runner_missing => "game-run.exe was not found · run zig build first",
             .status_launch_failed => "Could not start game-run.exe",
             .status_launched => "Game launched in a separate process",
+            .status_game_removed => "Game removed from the library",
         },
         .russian => switch (phrase) {
             .nav_library => "Библиотека",
@@ -304,6 +309,7 @@ fn tr(phrase: Phrase) []const u8 {
             .status_runner_missing => "Не найден game-run.exe · сначала выполните zig build",
             .status_launch_failed => "Не удалось запустить game-run.exe",
             .status_launched => "Игра запущена в отдельном процессе",
+            .status_game_removed => "Игра удалена из библиотеки",
         },
         .german => switch (phrase) {
             .nav_library => "Bibliothek",
@@ -375,6 +381,7 @@ fn tr(phrase: Phrase) []const u8 {
             .status_runner_missing => "game-run.exe fehlt · zuerst zig build ausführen",
             .status_launch_failed => "game-run.exe konnte nicht gestartet werden",
             .status_launched => "Spiel in einem separaten Prozess gestartet",
+            .status_game_removed => "Spiel aus der Bibliothek entfernt",
         },
         .french => switch (phrase) {
             .nav_library => "Bibliothèque",
@@ -446,6 +453,7 @@ fn tr(phrase: Phrase) []const u8 {
             .status_runner_missing => "game-run.exe est introuvable · exécutez d'abord zig build",
             .status_launch_failed => "Impossible de lancer game-run.exe",
             .status_launched => "Jeu lancé dans un processus séparé",
+            .status_game_removed => "Jeu retiré de la bibliothèque",
         },
     };
 }
@@ -554,6 +562,36 @@ fn windowProcedure(
             _ = Win32.InvalidateRect(window, null, 0);
             return 0;
         },
+        Win32.wm_mouse_move => {
+            const x: i32 = @as(i16, @bitCast(@as(u16, @truncate(@as(usize, @bitCast(long_parameter))))));
+            const y: i32 = @as(i16, @bitCast(@as(u16, @truncate(@as(usize, @bitCast(long_parameter)) >> 16))));
+            const next_game = if (current_page == .library) recentGameAt(x, y) else null;
+            const next_remove = if (next_game) |index| recentRemoveRect(index).contains(x, y) else false;
+            if (next_game != hovered_recent_game or next_remove != hovered_recent_remove) {
+                hovered_recent_game = next_game;
+                hovered_recent_remove = next_remove;
+                _ = Win32.InvalidateRect(window, null, 0);
+            }
+            if (!tracking_mouse_leave) {
+                var tracking = Win32.TrackMouseEventData{
+                    .size = @sizeOf(Win32.TrackMouseEventData),
+                    .flags = Win32.tme_leave,
+                    .window = window,
+                    .hover_time = 0,
+                };
+                tracking_mouse_leave = Win32.TrackMouseEvent(&tracking) != 0;
+            }
+            return 0;
+        },
+        Win32.wm_mouse_leave => {
+            tracking_mouse_leave = false;
+            if (hovered_recent_game != null or hovered_recent_remove) {
+                hovered_recent_game = null;
+                hovered_recent_remove = false;
+                _ = Win32.InvalidateRect(window, null, 0);
+            }
+            return 0;
+        },
         Win32.wm_set_cursor => {
             // Only the client area; the frame keeps the cursors Windows gives
             // it for sizing and the system menu.
@@ -626,9 +664,26 @@ fn libraryGameRect(index: usize) Rect {
     return .{ .left = left, .top = top, .right = left + 188, .bottom = top + 178 };
 }
 
+fn recentRemoveRect(index: usize) Rect {
+    const game = libraryGameRect(index);
+    return .{
+        .left = game.right - 34,
+        .top = game.top + 8,
+        .right = game.right - 8,
+        .bottom = game.top + 34,
+    };
+}
+
 fn recentGameAt(x: i32, y: i32) ?usize {
     for (0..recent_game_count) |index| {
         if (libraryGameRect(index).contains(x, y)) return index;
+    }
+    return null;
+}
+
+fn recentRemoveAt(x: i32, y: i32) ?usize {
+    for (0..recent_game_count) |index| {
+        if (recentRemoveRect(index).contains(x, y)) return index;
     }
     return null;
 }
@@ -711,6 +766,10 @@ fn handleClick(window: Win32.Window, x: i32, y: i32) void {
             4 => openBoosty(window),
             else => openGithub(window),
         }
+        if (current_page != .library) {
+            hovered_recent_game = null;
+            hovered_recent_remove = false;
+        }
     } else switch (current_page) {
         .library => handleLibraryClick(window, x, y),
         .input => handleInputClick(x, y),
@@ -721,6 +780,10 @@ fn handleClick(window: Win32.Window, x: i32, y: i32) void {
 }
 
 fn handleLibraryClick(window: Win32.Window, x: i32, y: i32) void {
+    if (recentRemoveAt(x, y)) |index| {
+        removeRecentGame(index);
+        return;
+    }
     if (recentGameAt(x, y)) |index| {
         selectRecentGame(index);
         return;
@@ -876,6 +939,11 @@ fn drawLibraryGame(dc: Win32.DeviceContext, game: RecentGame, index: usize) void
         text(dc, &game.title, @intCast(game.title_length), .{ .left = rectangle.left + 10, .top = rectangle.top + 151, .right = rectangle.right - 10, .bottom = rectangle.bottom - 6 }, 0x00f4f0ea, small_font, Win32.dt_center | Win32.dt_end_ellipsis);
     } else {
         text(dc, &game.identifier, @intCast(game.identifier_length), .{ .left = rectangle.left + 10, .top = rectangle.top + 151, .right = rectangle.right - 10, .bottom = rectangle.bottom - 6 }, 0x00a39890, small_font, Win32.dt_center | Win32.dt_end_ellipsis);
+    }
+    if (hovered_recent_game == index) {
+        const remove = recentRemoveRect(index);
+        roundFill(dc, remove, 13, if (hovered_recent_remove) 0x004848d8 else 0x00403934);
+        text(dc, w("×"), -1, .{ .left = remove.left, .top = remove.top + 2, .right = remove.right, .bottom = remove.bottom }, 0x00f4f0ea, medium_font, Win32.dt_center);
     }
 }
 
@@ -1367,6 +1435,35 @@ fn destroyRecentGames() void {
         if (game.icon != null) _ = Win32.DeleteObject(game.icon);
     }
     recent_game_count = 0;
+}
+
+/// Removes only the launcher's reference. The installed game and every save
+/// remain untouched on disk.
+fn removeRecentGame(index: usize) void {
+    if (index >= recent_game_count) return;
+    const removed_selected = sameFolder(
+        recent_games[index].folder[0..recent_games[index].folder_length],
+        game_folder[0..game_folder_length],
+    );
+    if (recent_games[index].icon != null) _ = Win32.DeleteObject(recent_games[index].icon);
+
+    var cursor = index;
+    while (cursor + 1 < recent_game_count) : (cursor += 1) {
+        recent_games[cursor] = recent_games[cursor + 1];
+    }
+    recent_game_count -= 1;
+    recent_games[recent_game_count] = .{};
+    hovered_recent_game = null;
+    hovered_recent_remove = false;
+    saveRecentGames();
+
+    if (removed_selected) {
+        @memset(&game_folder, 0);
+        game_folder_length = 0;
+        refreshTitleIdentifier();
+        saveSettings();
+    }
+    setStatusPhrase(.status_game_removed, false);
 }
 
 fn selectRecentGame(index: usize) void {
@@ -1931,6 +2028,12 @@ const Win32 = if (builtin.os.tag == .windows) struct {
         point: Point,
         private: u32,
     };
+    const TrackMouseEventData = extern struct {
+        size: u32,
+        flags: u32,
+        window: Window,
+        hover_time: u32,
+    };
     const PaintStruct = extern struct {
         dc: DeviceContext,
         erase: i32,
@@ -2001,6 +2104,8 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     const wm_close: u32 = 0x0010;
     const wm_erase_background: u32 = 0x0014;
     const wm_timer: u32 = 0x0113;
+    const wm_mouse_move: u32 = 0x0200;
+    const wm_mouse_leave: u32 = 0x02a3;
     const wm_device_change: u32 = 0x0219;
     const hit_test_client: u16 = 1;
     const wm_set_cursor: u32 = 0x0020;
@@ -2009,6 +2114,7 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     const hand_cursor: [*:0]align(1) const u16 = @ptrFromInt(32649);
     const wm_key_down: u32 = 0x0100;
     const wm_left_button_up: u32 = 0x0202;
+    const tme_leave: u32 = 0x0000_0002;
     const transparent: i32 = 1;
     const dt_left: u32 = 0x0000;
     const dt_center: u32 = 0x0001;
@@ -2082,6 +2188,7 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     extern "user32" fn AdjustWindowRect(*NativeRect, u32, i32) callconv(.winapi) i32;
     extern "user32" fn SetTimer(Window, usize, u32, ?*anyopaque) callconv(.winapi) usize;
     extern "user32" fn KillTimer(Window, usize) callconv(.winapi) i32;
+    extern "user32" fn TrackMouseEvent(*TrackMouseEventData) callconv(.winapi) i32;
     extern "kernel32" fn FindFirstFileW([*:0]const u16, *FindData) callconv(.winapi) *anyopaque;
     extern "kernel32" fn FindNextFileW(*anyopaque, *FindData) callconv(.winapi) i32;
     extern "kernel32" fn FindClose(*anyopaque) callconv(.winapi) i32;
