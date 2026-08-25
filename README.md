@@ -28,9 +28,10 @@ If you would like to support continued PS5PCEM development, you can do so on
   allocation and file callbacks.
 - Titles can save. A mounted slot becomes a writable `/savedata0`, so a game
   stores its progress through the ordinary file API and finds it again on the
-  next run; the launcher lists what each title has written.
-- A native Windows launcher selects a title directory, persists sound and input
-  profiles, and starts `game-run` with controller, keyboard, or hybrid controls.
+  next run; the launcher groups every local slot by title ID.
+- A native Windows launcher maintains a recent-game library with installed cover
+  art, persists sound and input profiles, and starts `game-run` with controller,
+  keyboard, or hybrid controls.
   Sony's own pads are read directly over HID, so a DualSense or DualShock 4
   works without a translation layer; the launcher reports which one it found and
   can drive its motors and light bar as a check.
@@ -371,6 +372,7 @@ zig build pm4-dump    -- capture.bin   # decode a captured GPU command stream
 zig build graph-info  -- eboot.bin     # map and relocate the reachable PRX graph
 zig build game-run    -- eboot.bin     # load, initialize, and enter the title
 zig build game-run    -- --app0 full/game patched/eboot.bin # use full content with a patched executable
+zig build build-launcher               # install only the native Windows launcher
 zig build launcher                      # open the native Windows launcher
 zig build vulkan-smoke                 # run the headless compute/graphics probe
 zig build vulkan-smoke -- --probe-spv out/compute-0xADDRESS.spv # compile a saved compute module
@@ -396,13 +398,16 @@ non-audio guest worker is still running; audio-only leftovers do not keep a
 finished title open forever.
 
 The recommended Windows entry point is `zig-out\bin\ps5pcem.exe` (or
-`zig build launcher`). The launcher remembers the selected game directory,
-sound state, FPS-counter preference, input mode, keyboard bindings, and
-interface language in
-`ps5pcem.ini` next to the executable. English is the default; Russian, German,
-and French are available from Settings. It looks for `eboot.bin` in the
+`zig build launcher`). The launcher remembers up to eight recently selected
+game directories, reads each title from `sce_sys/param.json`, and uses
+`sce_sys/icon0.png` as its library cover. It also persists sound state,
+FPS-counter preference, input mode, keyboard bindings, and interface language
+in `ps5pcem.ini` next to the executable. English is the default; Russian,
+German, and French are available from Settings. It looks for `eboot.bin` in the
 selected directory and its common `decrypted` subdirectory, then starts the
 sibling `game-run.exe` with the full content directory mounted as `/app0`.
+`zig build launcher` installs only the launcher and `game-run` dependencies
+before starting the installed executable; it does not rebuild unrelated tools.
 The optional counter updates the measured guest flip rate once per second in
 the Vulkan game-window title. Direct command-line runs can enable it with
 `PS5_SHOW_FPS=1`.
@@ -416,7 +421,7 @@ Alt plus the arrow keys controls the right stick. The launcher passes these pref
 `PS5_AUDIO_DISABLED`, so direct CLI and automated runs keep their previous
 behaviour unless those variables are set.
 
-Saved games are kept beside the emulator in `savedata/<titleId>/<slot>/`, keyed
+Saved games are kept at the emulator home in `savedata/<titleId>/<slot>/`, keyed
 by the product code the title publishes about itself. That is deliberate: a
 title's installation is read-only, can sit on removable media and is replaced
 wholesale when it is patched, so a save must outlive all three, and keying by
@@ -428,6 +433,12 @@ let two distinct names collapse onto one and overwrite each other's saves. A
 name that cannot be a directory at all falls back to a fixed one instead of
 failing the mount, because losing the save is worse than putting it somewhere
 predictable.
+
+Development launchers under `zig-out/bin` resolve emulator home back to the
+repository root, while a packaged launcher uses its own directory. Direct CLI
+and launcher starts therefore share one save, log, and cache root. The Saves
+page scans every title directory and groups the visible slots by title ID,
+rather than appearing empty merely because a different library tile is selected.
 
 A mount resolves the slot and points `/savedata0` at it; the title's own files
 are then written through the ordinary file API. Mounting a slot that does not
@@ -490,6 +501,11 @@ PPM after every draw of one selected frame; it is opt-in because a dense 4K
 frame can otherwise transfer several GiB and appear to freeze the title. These
 diagnostic switches deliberately change rendering or timing and are not
 compatibility or correctness modes.
+
+`PS5_CPU_WAIT_DIAGNOSTICS=1` restores the verbose repeated-wait, futex-churn,
+and scheduler-watchdog reports used during CPU synchronization debugging. They
+are disabled during normal play because several parked engine workers printing
+to the same console can themselves introduce frame and audio stalls.
 
 New GPU architecture paths are independently gated for title A/B testing. They
 are disabled in ordinary `game-run` launches; the startup log prints every
@@ -1927,10 +1943,9 @@ Language-mask and to-do-list queries describe the same already-installed local
 package. This lets an offline title mount complete local content without
 pretending a download service or remote entitlement exists.
 
-SaveData now exposes transaction-resource creation, `/savedata0` mount results,
-prepare/commit/unmount calls, and the immediate headless dialog lifecycle. These
-are compatibility objects only: persistent writable save storage is not yet
-implemented. Camera2 consistently reports no attached camera, while Universal
+SaveData exposes transaction-resource creation, persistent writable `/savedata0`
+mounts, slot search, prepare/commit/unmount calls, and the immediate headless
+dialog lifecycle. Camera2 consistently reports no attached camera, while Universal
 Data System contexts, handles, events, and property calls form an offline
 telemetry sink. RTC conversion also includes `sceRtcGetTime_t`.
 
@@ -1952,7 +1967,15 @@ and palette transparency. Adam7 input is recognized but not decoded yet.
 
 AudioOut, AudioIn, and AudioOut2 expose paced ports, queues, speaker metadata,
 `sceAudioOut2PortGetState` connected-primary reports, and atomic multi-port
-`sceAudioOutOutputs` batches. NGS2 supplies stable
+`sceAudioOutOutputs` batches. A batch validates all ports but submits and paces
+its one host-audible quantum only once; silent controller and auxiliary ports no
+longer multiply the duration of the call. The WinMM device pre-rolls real PCM,
+uses a one-millisecond host timer period, and re-primes after an underrun with a
+short de-click fade. The ordinary reserve starts at 42 ms and grows in four-buffer
+steps, up to about 170 ms, only when the running title actually starves the host
+device. The measured `PPSA25872` profile starts at 128 ms because its mixer
+producer can pause for roughly 100–120 ms during startup and scene work, without
+imposing that initial latency on other titles. NGS2 supplies stable
 system/rack/voice handles with checked parent lifetimes, parses ordinary
 RIFF/WAVE geometry, walks bounded linked voice-parameter lists, applies
 play/pause/resume/stop/kill events on render, reports exact 32-bit state flags,

@@ -547,10 +547,18 @@ pub fn build(b: *std.Build) void {
         inline for (&.{ "user32", "gdi32", "shell32", "ole32", "dwmapi", "setupapi", "hid" }) |library| {
             native_launcher.root_module.linkSystemLibrary(library, .{});
         }
-        b.installArtifact(native_launcher);
+        const install_native_launcher = b.addInstallArtifact(native_launcher, .{});
+        b.getInstallStep().dependOn(&install_native_launcher.step);
 
-        const launcher_cmd = b.addRunArtifact(native_launcher);
-        launcher_cmd.step.dependOn(b.getInstallStep());
+        const build_launcher_step = b.step("build-launcher", "Build only the native PS5PCEM launcher");
+        build_launcher_step.dependOn(&install_native_launcher.step);
+
+        // Run the installed copy: it resolves game-run.exe beside itself. The
+        // old addRunArtifact path executed from Zig's cache and depended on the
+        // entire install graph, rebuilding unrelated inspection tools.
+        const launcher_cmd = b.addSystemCommand(&.{b.getInstallPath(.bin, "ps5pcem.exe")});
+        launcher_cmd.step.dependOn(&install_native_launcher.step);
+        launcher_cmd.step.dependOn(&install_game_run.step);
         const launcher_step = b.step("launcher", "Open the PS5PCEM launcher");
         launcher_step.dependOn(&launcher_cmd.step);
         launcher = native_launcher;

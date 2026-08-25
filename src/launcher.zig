@@ -135,6 +135,18 @@ var mapping = mapping_defaults;
 var capture_mapping: ?usize = null;
 var game_folder: [1024]u16 = [_]u16{0} ** 1024;
 var game_folder_length: usize = 0;
+const maximum_recent_games = 8;
+const RecentGame = struct {
+    folder: [1024]u16 = @splat(0),
+    folder_length: usize = 0,
+    title: [128]u16 = @splat(0),
+    title_length: usize = 0,
+    identifier: [32]u16 = @splat(0),
+    identifier_length: usize = 0,
+    icon: Win32.Bitmap = null,
+};
+var recent_games: [maximum_recent_games]RecentGame = @splat(.{});
+var recent_game_count: usize = 0;
 /// The product code the selected title publishes about itself. Saves are keyed
 /// by it, so without one there is no directory to show.
 var title_identifier: [32]u16 = @splat(0);
@@ -158,7 +170,7 @@ fn tr(phrase: Phrase) []const u8 {
             .project => "PROJECT",
             .support_boosty => "Support on Boosty  ↗",
             .library_heading => "Game library",
-            .library_subtitle => "Choose a local folder containing a decrypted copy of your game",
+            .library_subtitle => "Previously selected games stay here with their local artwork",
             .folder_label => "GAME FOLDER",
             .folder_prompt => "Select the directory that contains eboot.bin",
             .folder_empty => "No folder selected",
@@ -198,16 +210,11 @@ fn tr(phrase: Phrase) []const u8 {
             .compatibility_text => "PS5PCEM is at an early stage. Not every title boots yet; advanced DualSense features, native PS5 keyboard/mouse and controller-to-keyboard conversion still need more HLE support.",
             .author => "Author: Artur Strazewicz · GitHub: iStark/PS5PCEM",
             .browse_dialog => "Choose the folder containing a decrypted PS5 game",
-            .nav_saves => "Saves"
-            ,
-            .saves_heading => "Saved games"
-            ,
-            .saves_subtitle => "What the selected title has written. Saves live beside the emulator and survive reinstalling the game."
-            ,
-            .saves_empty => "This title has not written a save yet"
-            ,
-            .saves_open_folder => "Open folder"
-            ,
+            .nav_saves => "Saves",
+            .saves_heading => "Saved games",
+            .saves_subtitle => "All local save slots, grouped by title ID and kept beside the emulator.",
+            .saves_empty => "No local saved games were found",
+            .saves_open_folder => "Open folder",
             .pad_test => "Test",
             .pad_test_unavailable => "Controller cannot be driven",
             .pad_searching => "Searching for a controller",
@@ -234,7 +241,7 @@ fn tr(phrase: Phrase) []const u8 {
             .project => "ПРОЕКТ",
             .support_boosty => "Поддержать на Boosty  ↗",
             .library_heading => "Игровая библиотека",
-            .library_subtitle => "Выберите локальную папку с расшифрованной копией игры",
+            .library_subtitle => "Ранее выбранные игры остаются здесь вместе с локальными обложками",
             .folder_label => "ПАПКА С ИГРОЙ",
             .folder_prompt => "Укажите каталог, в котором находится eboot.bin",
             .folder_empty => "Папка пока не выбрана",
@@ -274,16 +281,11 @@ fn tr(phrase: Phrase) []const u8 {
             .compatibility_text => "PS5PCEM находится на ранней стадии. Не все игры загружаются; функции DualSense, нативные PS5-клавиатура/мышь и преобразование геймпада в клавиши требуют дальнейшей HLE-поддержки.",
             .author => "Автор: Artur Strazewicz · GitHub: iStark/PS5PCEM",
             .browse_dialog => "Выберите папку с расшифрованной игрой PS5",
-            .nav_saves => "Сохранения"
-            ,
-            .saves_heading => "Сохранения"
-            ,
-            .saves_subtitle => "Что записала выбранная игра. Сохранения лежат рядом с эмулятором и переживают переустановку игры."
-            ,
-            .saves_empty => "Эта игра ещё ничего не сохраняла"
-            ,
-            .saves_open_folder => "Открыть папку"
-            ,
+            .nav_saves => "Сохранения",
+            .saves_heading => "Сохранения",
+            .saves_subtitle => "Все локальные сохранения по Title ID, хранящиеся рядом с эмулятором.",
+            .saves_empty => "Локальные сохранения не найдены",
+            .saves_open_folder => "Открыть папку",
             .pad_test => "Тест",
             .pad_test_unavailable => "Контроллер недоступен для управления",
             .pad_searching => "Поиск контроллера",
@@ -310,7 +312,7 @@ fn tr(phrase: Phrase) []const u8 {
             .project => "PROJEKT",
             .support_boosty => "Auf Boosty unterstützen  ↗",
             .library_heading => "Spielebibliothek",
-            .library_subtitle => "Wähle einen lokalen Ordner mit einer entschlüsselten Spielkopie",
+            .library_subtitle => "Früher ausgewählte Spiele bleiben mit lokalem Artwork in der Bibliothek",
             .folder_label => "SPIELORDNER",
             .folder_prompt => "Wähle das Verzeichnis mit eboot.bin",
             .folder_empty => "Noch kein Ordner ausgewählt",
@@ -352,8 +354,8 @@ fn tr(phrase: Phrase) []const u8 {
             .browse_dialog => "Ordner mit dem entschlüsselten PS5-Spiel wählen",
             .nav_saves => "Speicherstände",
             .saves_heading => "Speicherstände",
-            .saves_subtitle => "Was der gewählte Titel geschrieben hat. Speicherstände liegen neben dem Emulator.",
-            .saves_empty => "Dieser Titel hat noch nichts gespeichert",
+            .saves_subtitle => "Alle lokalen Speicherstände, nach Titel-ID gruppiert und neben dem Emulator abgelegt.",
+            .saves_empty => "Keine lokalen Speicherstände gefunden",
             .saves_open_folder => "Ordner öffnen",
             .pad_test => "Test",
             .pad_test_unavailable => "Controller nicht ansteuerbar",
@@ -381,7 +383,7 @@ fn tr(phrase: Phrase) []const u8 {
             .project => "PROJET",
             .support_boosty => "Soutenir sur Boosty  ↗",
             .library_heading => "Bibliothèque de jeux",
-            .library_subtitle => "Choisissez un dossier local contenant une copie déchiffrée du jeu",
+            .library_subtitle => "Les jeux déjà sélectionnés restent ici avec leur illustration locale",
             .folder_label => "DOSSIER DU JEU",
             .folder_prompt => "Sélectionnez le répertoire contenant eboot.bin",
             .folder_empty => "Aucun dossier sélectionné",
@@ -423,8 +425,8 @@ fn tr(phrase: Phrase) []const u8 {
             .browse_dialog => "Choisissez le dossier du jeu PS5 déchiffré",
             .nav_saves => "Sauvegardes",
             .saves_heading => "Sauvegardes",
-            .saves_subtitle => "Ce que le titre sélectionné a écrit. Les sauvegardes résident à côté de l’émulateur.",
-            .saves_empty => "Ce titre n’a encore rien sauvegardé",
+            .saves_subtitle => "Toutes les sauvegardes locales, regroupées par identifiant et stockées près de l’émulateur.",
+            .saves_empty => "Aucune sauvegarde locale trouvée",
             .saves_open_folder => "Ouvrir le dossier",
             .pad_test => "Test",
             .pad_test_unavailable => "Manette non pilotable",
@@ -456,6 +458,7 @@ pub fn main(_: std.process.Init) !void {
 
     initializeIniPath();
     loadSettings();
+    defer destroyRecentGames();
     createFonts();
     defer destroyFonts();
 
@@ -612,12 +615,23 @@ const nav_rects = [_]Rect{
     .{ .left = 20, .top = 680, .right = 202, .bottom = 724 },
 };
 
-const library_rects = [_]Rect{
-    .{ .left = 846, .top = 235, .right = 1086, .bottom = 283 },
-    .{ .left = 812, .top = 646, .right = 1086, .bottom = 700 },
-    .{ .left = 282, .top = 415, .right = 528, .bottom = 535 },
-    .{ .left = 550, .top = 415, .right = 1086, .bottom = 535 },
-};
+const library_browse_rect = Rect{ .left = 282, .top = 646, .right = 548, .bottom = 700 };
+const library_launch_rect = Rect{ .left = 812, .top = 646, .right = 1086, .bottom = 700 };
+
+fn libraryGameRect(index: usize) Rect {
+    const column: i32 = @intCast(index % 4);
+    const row: i32 = @intCast(index / 4);
+    const left = 282 + column * 201;
+    const top = 142 + row * 190;
+    return .{ .left = left, .top = top, .right = left + 188, .bottom = top + 178 };
+}
+
+fn recentGameAt(x: i32, y: i32) ?usize {
+    for (0..recent_game_count) |index| {
+        if (libraryGameRect(index).contains(x, y)) return index;
+    }
+    return null;
+}
 
 /// Sits beside the presence indicator on the input page.
 const pad_test_rect = Rect{ .left = 946, .top = 250, .right = 1086, .bottom = 278 };
@@ -667,7 +681,9 @@ fn indexOfRect(rects: []const Rect, x: i32, y: i32) ?usize {
 fn clickableAt(x: i32, y: i32) bool {
     if (indexOfRect(&nav_rects, x, y) != null) return true;
     return switch (current_page) {
-        .library => indexOfRect(&library_rects, x, y) != null,
+        .library => recentGameAt(x, y) != null or
+            library_browse_rect.contains(x, y) or
+            library_launch_rect.contains(x, y),
         .input => blk: {
             if (pad_presence.connected and pad_test_rect.contains(x, y)) break :blk true;
             if (indexOfRect(&input_mode_rects, x, y) != null) break :blk true;
@@ -705,17 +721,12 @@ fn handleClick(window: Win32.Window, x: i32, y: i32) void {
 }
 
 fn handleLibraryClick(window: Win32.Window, x: i32, y: i32) void {
-    const index = indexOfRect(&library_rects, x, y) orelse return;
-    switch (index) {
-        0 => chooseGameFolder(window),
-        1 => launchGame(window),
-        2 => {
-            sound_enabled = !sound_enabled;
-            saveSettings();
-            setStatusPhrase(if (sound_enabled) .status_sound_on else .status_sound_off, false);
-        },
-        else => current_page = .input,
+    if (recentGameAt(x, y)) |index| {
+        selectRecentGame(index);
+        return;
     }
+    if (library_browse_rect.contains(x, y)) chooseGameFolder(window);
+    if (library_launch_rect.contains(x, y)) launchGame(window);
 }
 
 fn handleInputClick(x: i32, y: i32) void {
@@ -822,34 +833,50 @@ fn drawNavItem(dc: Win32.DeviceContext, page: Page, top: i32, label: Phrase, com
 fn drawLibrary(dc: Win32.DeviceContext) void {
     pageHeading(dc, .library_heading, .library_subtitle);
 
-    card(dc, .{ .left = 282, .top = 158, .right = 1086, .bottom = 332 });
-    localizedText(dc, .folder_label, .{ .left = 310, .top = 183, .right = 600, .bottom = 205 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
-    localizedText(dc, .folder_prompt, .{ .left = 310, .top = 211, .right = 800, .bottom = 238 }, 0x00f4f0ea, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
-    roundFill(dc, .{ .left = 310, .top = 249, .right = 824, .bottom = 289 }, 9, 0x00201915);
-    if (game_folder_length == 0) {
-        localizedText(dc, .folder_empty, .{ .left = 326, .top = 260, .right = 808, .bottom = 283 }, 0x007e746d, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    if (recent_game_count == 0) {
+        card(dc, .{ .left = 282, .top = 158, .right = 1086, .bottom = 510 });
+        localizedText(dc, .folder_prompt, .{ .left = 330, .top = 300, .right = 1038, .bottom = 332 }, 0x00f4f0ea, title_font, Win32.dt_center | Win32.dt_end_ellipsis);
+        localizedText(dc, .folder_empty, .{ .left = 330, .top = 350, .right = 1038, .bottom = 376 }, 0x008b817a, regular_font, Win32.dt_center | Win32.dt_end_ellipsis);
     } else {
-        text(dc, &game_folder, @intCast(game_folder_length), .{ .left = 326, .top = 260, .right = 808, .bottom = 283 }, 0x00d8d0c9, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
+        for (recent_games[0..recent_game_count], 0..) |game, index| {
+            drawLibraryGame(dc, game, index);
+        }
     }
-    button(dc, .{ .left = 846, .top = 249, .right = 1058, .bottom = 289 }, .choose_folder, false);
-    localizedText(dc, .legal_notice, .{ .left = 310, .top = 302, .right = 1048, .bottom = 322 }, 0x007e746d, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
 
-    card(dc, .{ .left = 282, .top = 365, .right = 528, .bottom = 535 });
-    localizedText(dc, .sound, .{ .left = 306, .top = 389, .right = 410, .bottom = 410 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
-    localizedText(dc, if (sound_enabled) .enabled else .disabled, .{ .left = 306, .top = 423, .right = 435, .bottom = 450 }, 0x00f4f0ea, medium_font, Win32.dt_left);
-    drawToggle(dc, 442, 420, sound_enabled);
-    localizedText(dc, .sound_timing, .{ .left = 306, .top = 470, .right = 498, .bottom = 522 }, 0x008b817a, small_font, Win32.dt_left | Win32.dt_word_break);
+    card(dc, .{ .left = 282, .top = 536, .right = 1086, .bottom = 622 });
+    localizedText(dc, .folder_label, .{ .left = 306, .top = 552, .right = 520, .bottom = 572 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    if (game_folder_length == 0) {
+        localizedText(dc, .folder_empty, .{ .left = 306, .top = 582, .right = 1058, .bottom = 607 }, 0x007e746d, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    } else {
+        text(dc, &game_folder, @intCast(game_folder_length), .{ .left = 306, .top = 580, .right = 1058, .bottom = 607 }, 0x00d8d0c9, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    }
 
-    card(dc, .{ .left = 550, .top = 365, .right = 1086, .bottom = 535 });
-    localizedText(dc, .controls, .{ .left = 576, .top = 389, .right = 760, .bottom = 410 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
-    localizedText(dc, inputModeTitle(), .{ .left = 576, .top = 422, .right = 970, .bottom = 450 }, 0x00f4f0ea, medium_font, Win32.dt_left);
-    localizedText(dc, inputModeDescription(), .{ .left = 576, .top = 462, .right = 1010, .bottom = 493 }, 0x008b817a, regular_font, Win32.dt_left);
-    localizedText(dc, .configure_layout, .{ .left = 576, .top = 502, .right = 850, .bottom = 525 }, 0x00ffac64, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    button(dc, library_browse_rect, .choose_folder, false);
+    localizedText(dc, .legal_notice, .{ .left = 566, .top = 666, .right = 794, .bottom = 688 }, 0x007e746d, small_font, Win32.dt_center | Win32.dt_end_ellipsis);
+    button(dc, library_launch_rect, .launch_game, game_folder_length == 0);
+}
 
-    roundFill(dc, .{ .left = 282, .top = 564, .right = 1086, .bottom = 616 }, 10, 0x00251f1b);
-    roundFill(dc, .{ .left = 300, .top = 581, .right = 309, .bottom = 590 }, 5, 0x0068d391);
-    localizedText(dc, .core_ready, .{ .left = 323, .top = 577, .right = 760, .bottom = 602 }, 0x00bbb2aa, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
-    button(dc, .{ .left = 812, .top = 646, .right = 1086, .bottom = 700 }, .launch_game, game_folder_length == 0);
+fn drawLibraryGame(dc: Win32.DeviceContext, game: RecentGame, index: usize) void {
+    const rectangle = libraryGameRect(index);
+    const selected = sameFolder(game.folder[0..game.folder_length], game_folder[0..game_folder_length]);
+    roundFill(dc, rectangle, 12, if (selected) 0x0049362b else 0x00251f1b);
+    const artwork = Rect{
+        .left = rectangle.left + 26,
+        .top = rectangle.top + 10,
+        .right = rectangle.right - 26,
+        .bottom = rectangle.top + 146,
+    };
+    if (game.icon) |icon| {
+        drawBitmap(dc, icon, artwork);
+    } else {
+        roundFill(dc, artwork, 10, 0x00352c27);
+        text(dc, w("PS5"), -1, .{ .left = artwork.left, .top = artwork.top + 52, .right = artwork.right, .bottom = artwork.bottom }, 0x00ffac64, title_font, Win32.dt_center);
+    }
+    if (game.title_length != 0) {
+        text(dc, &game.title, @intCast(game.title_length), .{ .left = rectangle.left + 10, .top = rectangle.top + 151, .right = rectangle.right - 10, .bottom = rectangle.bottom - 6 }, 0x00f4f0ea, small_font, Win32.dt_center | Win32.dt_end_ellipsis);
+    } else {
+        text(dc, &game.identifier, @intCast(game.identifier_length), .{ .left = rectangle.left + 10, .top = rectangle.top + 151, .right = rectangle.right - 10, .bottom = rectangle.bottom - 6 }, 0x00a39890, small_font, Win32.dt_center | Win32.dt_end_ellipsis);
+    }
 }
 
 fn drawInput(dc: Win32.DeviceContext) void {
@@ -945,13 +972,15 @@ fn deviceColour(red: u8, green: u8, blue: u8) u32 {
 }
 
 /// Opens the host directory holding the selected title's saves.
-const saves_open_rect = Rect{ .left = 880, .top = 148, .right = 1086, .bottom = 180 };
+const saves_open_rect = Rect{ .left = 880, .top = 148, .right = 1086, .bottom = 190 };
 
 /// How many slots the page will list. A title with more has written more saves
 /// than a launcher page can usefully show at once.
 const maximum_listed_saves = 12;
 
 const SaveSlot = struct {
+    title_id: [32]u16 = @splat(0),
+    title_id_length: usize = 0,
     name: [64]u16 = @splat(0),
     name_length: usize = 0,
     detail: [96]u16 = @splat(0),
@@ -962,31 +991,38 @@ var save_slots: [maximum_listed_saves]SaveSlot = @splat(.{});
 var save_slot_count: usize = 0;
 var save_scan_done = false;
 
-/// Rescans on the next paint. Called when the selected title changes, because
-/// the list belongs to that title rather than to the launcher.
+/// Rescans on the next paint. A selection change moves that title's slots to
+/// the front while retaining saves from the rest of the library.
 fn invalidateSaves() void {
     save_scan_done = false;
 }
 
-/// Builds the host path of the save root for the selected title.
-///
-/// Returns nothing when no title is selected or it publishes no identifier:
-/// without one there is no directory to look in, and guessing would show
-/// another game's saves.
+/// Builds the selected title's save path, or the all-title root when there is
+/// no current title. The Saves page can therefore remain useful on startup.
 fn saveDirectoryPath(output: *[1024]u16) usize {
-    if (title_identifier_length == 0) return 0;
-    var length = siblingDirectory(output);
+    var length = saveRootDirectoryPath(output);
     if (length == 0) return 0;
-    const parts = [_][*:0]const u16{ w("savedata"), w("\\") };
-    for (parts) |part| {
-        const part_length = wideLength(part);
-        if (length + part_length >= output.len) return 0;
-        @memcpy(output[length..][0..part_length], part[0..part_length]);
-        length += part_length;
+    if (title_identifier_length == 0) {
+        return length;
     }
+    if (length + 1 >= output.len) return 0;
+    output[length] = '\\';
+    length += 1;
     if (length + title_identifier_length >= output.len) return 0;
     @memcpy(output[length..][0..title_identifier_length], title_identifier[0..title_identifier_length]);
     length += title_identifier_length;
+    output[length] = 0;
+    return length;
+}
+
+fn saveRootDirectoryPath(output: *[1024]u16) usize {
+    var length = emulatorHomeDirectory(output);
+    if (length == 0) return 0;
+    const savedata = w("savedata");
+    const savedata_length = wideLength(savedata);
+    if (length + savedata_length >= output.len) return 0;
+    @memcpy(output[length..][0..savedata_length], savedata[0..savedata_length]);
+    length += savedata_length;
     output[length] = 0;
     return length;
 }
@@ -999,23 +1035,64 @@ fn siblingDirectory(output: *[1024]u16) usize {
     return length;
 }
 
-/// Lists the slots the selected title has written.
+/// Development builds live in `<root>/zig-out/bin`, while packaged builds put
+/// the launcher directly in their root. Normalize both to the directory which
+/// owns `savedata`, logs and the Vulkan driver cache.
+fn emulatorHomeDirectory(output: *[1024]u16) usize {
+    var length = siblingDirectory(output);
+    if (length == 0) return 0;
+    const development_tail = w("zig-out\\bin\\");
+    const tail_length = wideLength(development_tail);
+    if (length >= tail_length and
+        sameFolder(output[length - tail_length .. length], development_tail[0..tail_length]))
+    {
+        length -= tail_length;
+        output[length] = 0;
+    }
+    return length;
+}
+
+/// Lists every local title's slots, with the selected title first.
 fn scanSaves() void {
     save_slot_count = 0;
     save_scan_done = true;
 
-    var path: [1024]u16 = undefined;
-    const length = saveDirectoryPath(&path);
-    if (length == 0) return;
+    var root: [1024]u16 = @splat(0);
+    var root_length = emulatorHomeDirectory(&root);
+    if (root_length == 0) return;
+    const savedata = w("savedata");
+    const savedata_length = wideLength(savedata);
+    if (root_length + savedata_length >= root.len) return;
+    @memcpy(root[root_length..][0..savedata_length], savedata[0..savedata_length]);
+    root_length += savedata_length;
+    root[root_length] = 0;
+
+    // Put the selected title first, then continue through every other title
+    // root. The Saves page is a library browser, so selecting a game without a
+    // save must not make existing saves from all other games disappear.
+    if (title_identifier_length != 0) {
+        var selected: [1024]u16 = root;
+        var selected_length = root_length;
+        if (selected_length + 1 + title_identifier_length < selected.len) {
+            selected[selected_length] = '\\';
+            selected_length += 1;
+            @memcpy(selected[selected_length..][0..title_identifier_length], title_identifier[0..title_identifier_length]);
+            selected_length += title_identifier_length;
+            selected[selected_length] = 0;
+            scanTitleSaveSlots(&selected, selected_length, title_identifier[0..title_identifier_length]);
+        }
+    }
+
     // FindFirstFileW wants a pattern rather than a directory.
     const pattern = w("\\*");
     const pattern_length = wideLength(pattern);
-    if (length + pattern_length >= path.len) return;
-    @memcpy(path[length..][0..pattern_length], pattern[0..pattern_length]);
-    path[length + pattern_length] = 0;
+    var search: [1024]u16 = root;
+    if (root_length + pattern_length >= search.len) return;
+    @memcpy(search[root_length..][0..pattern_length], pattern[0..pattern_length]);
+    search[root_length + pattern_length] = 0;
 
     var found: Win32.FindData = undefined;
-    const handle = Win32.FindFirstFileW(@ptrCast(&path), &found);
+    const handle = Win32.FindFirstFileW(@ptrCast(&search), &found);
     if (@intFromPtr(handle) == Win32.invalid_handle) return;
     defer _ = Win32.FindClose(handle);
 
@@ -1023,16 +1100,51 @@ fn scanSaves() void {
         const is_directory = found.attributes & Win32.file_attribute_directory != 0;
         const name_length = wideLength(@ptrCast(&found.name));
         const skip = !is_directory or name_length == 0 or found.name[0] == '.';
-        if (!skip and save_slot_count < save_slots.len) {
+        const is_selected = title_identifier_length != 0 and
+            sameFolder(found.name[0..name_length], title_identifier[0..title_identifier_length]);
+        if (!skip and !is_selected and save_slot_count < save_slots.len) {
+            var title_root: [1024]u16 = root;
+            var length = root_length;
+            if (length + 1 + name_length < title_root.len) {
+                title_root[length] = '\\';
+                length += 1;
+                @memcpy(title_root[length..][0..name_length], found.name[0..name_length]);
+                length += name_length;
+                title_root[length] = 0;
+                scanTitleSaveSlots(&title_root, length, found.name[0..name_length]);
+            }
+        }
+        if (Win32.FindNextFileW(handle, &found) == 0) break;
+    }
+}
+
+fn scanTitleSaveSlots(root: *[1024]u16, root_length: usize, title_id: []const u16) void {
+    const pattern = w("\\*");
+    const pattern_length = wideLength(pattern);
+    if (root_length + pattern_length >= root.len) return;
+    @memcpy(root[root_length..][0..pattern_length], pattern[0..pattern_length]);
+    root[root_length + pattern_length] = 0;
+
+    var found: Win32.FindData = undefined;
+    const handle = Win32.FindFirstFileW(@ptrCast(root), &found);
+    if (@intFromPtr(handle) == Win32.invalid_handle) return;
+    defer _ = Win32.FindClose(handle);
+    while (true) {
+        const is_directory = found.attributes & Win32.file_attribute_directory != 0;
+        const name_length = wideLength(@ptrCast(&found.name));
+        if (is_directory and name_length != 0 and found.name[0] != '.' and save_slot_count < save_slots.len) {
             var slot = SaveSlot{};
+            slot.title_id_length = @min(title_id.len, slot.title_id.len - 1);
+            @memcpy(slot.title_id[0..slot.title_id_length], title_id[0..slot.title_id_length]);
             slot.name_length = @min(name_length, slot.name.len - 1);
             @memcpy(slot.name[0..slot.name_length], found.name[0..slot.name_length]);
-            slot.detail_length = describeSlot(&path, length, found.name[0..name_length], &slot.detail);
+            slot.detail_length = describeSlot(root, root_length, found.name[0..name_length], &slot.detail);
             save_slots[save_slot_count] = slot;
             save_slot_count += 1;
         }
         if (Win32.FindNextFileW(handle, &found) == 0) break;
     }
+    root[root_length] = 0;
 }
 
 /// Reads the title a slot recorded for itself, falling back to its size.
@@ -1109,6 +1221,166 @@ fn readSmallFile(path: [*:0]const u16, buffer: []u8) ?[]const u8 {
     return buffer[0..read];
 }
 
+fn sameFolder(first: []const u16, second: []const u16) bool {
+    if (first.len == 0 or first.len != second.len) return false;
+    return Win32.CompareStringOrdinal(first.ptr, @intCast(first.len), second.ptr, @intCast(second.len), 1) == Win32.cstr_equal;
+}
+
+fn childPath(output: *[1024]u16, folder: []const u16, comptime suffix: []const u8) usize {
+    if (folder.len >= output.len) return 0;
+    @memcpy(output[0..folder.len], folder);
+    var converted: [128]u16 = undefined;
+    const suffix_length = std.unicode.utf8ToUtf16Le(&converted, suffix) catch return 0;
+    if (folder.len + suffix_length >= output.len) return 0;
+    @memcpy(output[folder.len..][0..suffix_length], converted[0..suffix_length]);
+    const length = folder.len + suffix_length;
+    output[length] = 0;
+    return length;
+}
+
+fn loadGameIcon(folder: []const u16) Win32.Bitmap {
+    var path: [1024]u16 = @splat(0);
+    if (childPath(&path, folder, "\\sce_sys\\icon0.png") == 0) return null;
+    if (Win32.GetFileAttributesW(@ptrCast(&path)) == Win32.invalid_file_attributes) return null;
+
+    var factory: ?*Win32.ShellItemImageFactory = null;
+    if (Win32.SHCreateItemFromParsingName(
+        @ptrCast(&path),
+        null,
+        &Win32.iid_shell_item_image_factory,
+        &factory,
+    ) < 0) return null;
+    const image_factory = factory orelse return null;
+    defer _ = image_factory.vtable.release(image_factory);
+
+    var bitmap: Win32.Bitmap = null;
+    if (image_factory.vtable.get_image(
+        image_factory,
+        .{ .cx = 136, .cy = 136 },
+        Win32.siigbf_resize_to_fit,
+        &bitmap,
+    ) < 0) return null;
+    return bitmap;
+}
+
+fn fallbackFolderTitle(folder: []const u16, output: *[128]u16) usize {
+    var start = folder.len;
+    while (start > 0 and folder[start - 1] != '\\' and folder[start - 1] != '/') : (start -= 1) {}
+    const length = @min(folder.len - start, output.len - 1);
+    @memcpy(output[0..length], folder[start..][0..length]);
+    output[length] = 0;
+    return length;
+}
+
+fn loadRecentGame(folder: []const u16) ?RecentGame {
+    if (folder.len == 0 or folder.len >= 1024) return null;
+    var game = RecentGame{};
+    @memcpy(game.folder[0..folder.len], folder);
+    game.folder_length = folder.len;
+
+    var path: [1024]u16 = @splat(0);
+    if (childPath(&path, folder, "\\sce_sys\\param.json") != 0) {
+        var document: [8192]u8 = undefined;
+        if (readSmallFile(@ptrCast(&path), &document)) |bytes| {
+            if (jsonStringValue(bytes, "\"titleName\"")) |value| {
+                game.title_length = std.unicode.utf8ToUtf16Le(&game.title, value) catch 0;
+                game.title[game.title_length] = 0;
+            }
+            if (jsonStringValue(bytes, "\"titleId\"")) |value| {
+                game.identifier_length = std.unicode.utf8ToUtf16Le(&game.identifier, value) catch 0;
+                game.identifier[game.identifier_length] = 0;
+            }
+        }
+    }
+    if (game.title_length == 0) game.title_length = fallbackFolderTitle(folder, &game.title);
+    game.icon = loadGameIcon(folder);
+    return game;
+}
+
+fn recentKey(index: usize, output: *[32]u16) void {
+    var utf8: [32]u8 = undefined;
+    var stream = std.Io.Writer.fixed(&utf8);
+    stream.print("path_{d}", .{index}) catch return;
+    const converted = std.unicode.utf8ToUtf16Le(output, stream.buffered()) catch return;
+    output[converted] = 0;
+}
+
+fn saveRecentGames() void {
+    if (ini_path_length == 0) return;
+    for (0..maximum_recent_games) |index| {
+        var key: [32]u16 = @splat(0);
+        recentKey(index, &key);
+        const value: ?[*:0]const u16 = if (index < recent_game_count)
+            @ptrCast(&recent_games[index].folder)
+        else
+            null;
+        _ = Win32.WritePrivateProfileStringW(w("recent"), @ptrCast(&key), value, @ptrCast(&ini_path));
+    }
+}
+
+fn rememberGameFolder(folder: []const u16, persist: bool) void {
+    const candidate = loadRecentGame(folder) orelse return;
+    var existing: ?usize = null;
+    for (recent_games[0..recent_game_count], 0..) |game, index| {
+        if (sameFolder(game.folder[0..game.folder_length], folder)) {
+            existing = index;
+            break;
+        }
+    }
+
+    if (existing) |index| {
+        if (recent_games[index].icon != null) _ = Win32.DeleteObject(recent_games[index].icon);
+        var cursor = index;
+        while (cursor > 0) : (cursor -= 1) recent_games[cursor] = recent_games[cursor - 1];
+    } else {
+        if (recent_game_count == maximum_recent_games) {
+            if (recent_games[maximum_recent_games - 1].icon != null) {
+                _ = Win32.DeleteObject(recent_games[maximum_recent_games - 1].icon);
+            }
+        } else {
+            recent_game_count += 1;
+        }
+        var cursor = recent_game_count - 1;
+        while (cursor > 0) : (cursor -= 1) recent_games[cursor] = recent_games[cursor - 1];
+    }
+    recent_games[0] = candidate;
+    if (persist) saveRecentGames();
+}
+
+fn loadRecentGames() void {
+    if (ini_path_length == 0) return;
+    for (0..maximum_recent_games) |index| {
+        var key: [32]u16 = @splat(0);
+        recentKey(index, &key);
+        var folder: [1024]u16 = @splat(0);
+        const length = Win32.GetPrivateProfileStringW(w("recent"), @ptrCast(&key), w(""), &folder, folder.len, @ptrCast(&ini_path));
+        if (length == 0) continue;
+        const game = loadRecentGame(folder[0..length]) orelse continue;
+        if (recent_game_count == maximum_recent_games) break;
+        recent_games[recent_game_count] = game;
+        recent_game_count += 1;
+    }
+}
+
+fn destroyRecentGames() void {
+    for (recent_games[0..recent_game_count]) |game| {
+        if (game.icon != null) _ = Win32.DeleteObject(game.icon);
+    }
+    recent_game_count = 0;
+}
+
+fn selectRecentGame(index: usize) void {
+    if (index >= recent_game_count) return;
+    const selected = recent_games[index];
+    @memset(&game_folder, 0);
+    @memcpy(game_folder[0..selected.folder_length], selected.folder[0..selected.folder_length]);
+    game_folder_length = selected.folder_length;
+    refreshTitleIdentifier();
+    rememberGameFolder(game_folder[0..game_folder_length], true);
+    saveSettings();
+    setStatusPhrase(.status_folder_selected, false);
+}
+
 /// Reads the selected title's product code out of the document it ships.
 ///
 /// The launcher needs the same identifier the emulator keys saves by; deriving
@@ -1159,8 +1431,12 @@ fn jsonStringValue(document: []const u8, quoted_key: []const u8) ?[]const u8 {
 fn handleSavesClick(window: Win32.Window, x: i32, y: i32) void {
     if (!saves_open_rect.contains(x, y)) return;
     var path: [1024]u16 = undefined;
-    const length = saveDirectoryPath(&path);
+    var length = saveDirectoryPath(&path);
     if (length == 0) return;
+    if (Win32.GetFileAttributesW(@ptrCast(&path)) == Win32.invalid_file_attributes) {
+        length = saveRootDirectoryPath(&path);
+        if (length == 0 or Win32.GetFileAttributesW(@ptrCast(&path)) == Win32.invalid_file_attributes) return;
+    }
     _ = Win32.ShellExecuteW(window, w("open"), @ptrCast(&path), null, null, Win32.show_normal);
 }
 
@@ -1168,7 +1444,7 @@ fn drawSaves(dc: Win32.DeviceContext) void {
     pageHeading(dc, .saves_heading, .saves_subtitle);
     if (!save_scan_done) scanSaves();
 
-    button(dc, saves_open_rect, .saves_open_folder, title_identifier_length == 0);
+    button(dc, saves_open_rect, .saves_open_folder, false);
 
     if (save_slot_count == 0) {
         card(dc, .{ .left = 282, .top = 200, .right = 1086, .bottom = 268 });
@@ -1180,9 +1456,10 @@ fn drawSaves(dc: Win32.DeviceContext) void {
         const top = 200 + @as(i32, @intCast(index)) * 44;
         if (top > 660) break;
         roundFill(dc, .{ .left = 282, .top = top, .right = 1086, .bottom = top + 38 }, 8, 0x00251f1b);
-        text(dc, &slot.name, @intCast(slot.name_length), .{ .left = 300, .top = top + 9, .right = 560, .bottom = top + 32 }, 0x00f4f0ea, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
+        text(dc, &slot.title_id, @intCast(slot.title_id_length), .{ .left = 300, .top = top + 10, .right = 410, .bottom = top + 32 }, 0x00ffac64, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
+        text(dc, &slot.name, @intCast(slot.name_length), .{ .left = 425, .top = top + 9, .right = 675, .bottom = top + 32 }, 0x00f4f0ea, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
         if (slot.detail_length != 0) {
-            text(dc, &slot.detail, @intCast(slot.detail_length), .{ .left = 580, .top = top + 10, .right = 1066, .bottom = top + 32 }, 0x009b9088, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
+            text(dc, &slot.detail, @intCast(slot.detail_length), .{ .left = 690, .top = top + 10, .right = 1066, .bottom = top + 32 }, 0x009b9088, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
         }
     }
 }
@@ -1277,6 +1554,27 @@ fn roundFill(dc: Win32.DeviceContext, rectangle: Rect, radius: i32, color: u32) 
     _ = Win32.SelectObject(dc, old_pen);
 }
 
+fn drawBitmap(dc: Win32.DeviceContext, bitmap: Win32.Bitmap, rectangle: Rect) void {
+    const memory_dc = Win32.CreateCompatibleDC(dc) orelse return;
+    defer _ = Win32.DeleteDC(memory_dc);
+    const previous = Win32.SelectObject(memory_dc, bitmap);
+    _ = Win32.SetStretchBltMode(dc, Win32.halftone);
+    _ = Win32.StretchBlt(
+        dc,
+        rectangle.left,
+        rectangle.top,
+        rectangle.right - rectangle.left,
+        rectangle.bottom - rectangle.top,
+        memory_dc,
+        0,
+        0,
+        136,
+        136,
+        Win32.source_copy,
+    );
+    _ = Win32.SelectObject(memory_dc, previous);
+}
+
 fn text(
     dc: Win32.DeviceContext,
     value: [*]const u16,
@@ -1324,6 +1622,7 @@ fn chooseGameFolder(owner: Win32.Window) void {
     if (Win32.SHGetPathFromIDListW(item, &game_folder) == 0) return;
     game_folder_length = wideLength(@ptrCast(&game_folder));
     refreshTitleIdentifier();
+    rememberGameFolder(game_folder[0..game_folder_length], true);
     saveSettings();
     setStatusPhrase(.status_folder_selected, false);
 }
@@ -1368,6 +1667,11 @@ fn launchGame(owner: Win32.Window) void {
 
     var startup = Win32.StartupInfoW{ .size = @sizeOf(Win32.StartupInfoW) };
     var process: Win32.ProcessInformation = undefined;
+    var emulator_home: [1024]u16 = @splat(0);
+    if (emulatorHomeDirectory(&emulator_home) == 0) {
+        setStatusPhrase(.status_launch_failed, true);
+        return;
+    }
     if (Win32.CreateProcessW(
         @ptrCast(&runner),
         @ptrCast(&command),
@@ -1376,7 +1680,7 @@ fn launchGame(owner: Win32.Window) void {
         0,
         Win32.create_new_console,
         null,
-        @ptrCast(&game_folder),
+        @ptrCast(&emulator_home),
         &startup,
         &process,
     ) == 0) {
@@ -1385,6 +1689,7 @@ fn launchGame(owner: Win32.Window) void {
     }
     _ = Win32.CloseHandle(process.thread);
     _ = Win32.CloseHandle(process.process);
+    rememberGameFolder(game_folder[0..game_folder_length], true);
     setStatusPhrase(.status_launched, false);
     _ = Win32.ShowWindow(owner, Win32.show_minimized);
 }
@@ -1487,8 +1792,10 @@ fn siblingExecutable(comptime name: []const u8, output: *[1024]u16) usize {
 
 fn loadSettings() void {
     if (ini_path_length == 0) return;
+    loadRecentGames();
     game_folder_length = Win32.GetPrivateProfileStringW(w("launcher"), w("game_folder"), w(""), &game_folder, game_folder.len, @ptrCast(&ini_path));
     refreshTitleIdentifier();
+    if (game_folder_length != 0) rememberGameFolder(game_folder[0..game_folder_length], true);
     sound_enabled = Win32.GetPrivateProfileIntW(w("launcher"), w("sound"), 1, @ptrCast(&ini_path)) != 0;
     show_fps = Win32.GetPrivateProfileIntW(w("launcher"), w("show_fps"), 0, @ptrCast(&ini_path)) != 0;
     const mode_value = Win32.GetPrivateProfileIntW(w("launcher"), w("input_mode"), 2, @ptrCast(&ini_path));
@@ -1591,12 +1898,29 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     const Cursor = ?*anyopaque;
     const Brush = ?*anyopaque;
     const Font = ?*anyopaque;
+    const Bitmap = ?*anyopaque;
     const DeviceContext = ?*anyopaque;
     const Menu = ?*anyopaque;
     const Object = ?*anyopaque;
     const Handle = ?*anyopaque;
 
     const Point = extern struct { x: i32, y: i32 };
+    const Size = extern struct { cx: i32, cy: i32 };
+    const Guid = extern struct {
+        data1: u32,
+        data2: u16,
+        data3: u16,
+        data4: [8]u8,
+    };
+    const ShellItemImageFactory = extern struct {
+        vtable: *const ShellItemImageFactoryVTable,
+    };
+    const ShellItemImageFactoryVTable = extern struct {
+        query_interface: *const anyopaque,
+        add_ref: *const anyopaque,
+        release: *const fn (*ShellItemImageFactory) callconv(.winapi) u32,
+        get_image: *const fn (*ShellItemImageFactory, Size, u32, *Bitmap) callconv(.winapi) i32,
+    };
     const NativeRect = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
     const Message = extern struct {
         window: Window,
@@ -1719,6 +2043,16 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     const coinit_apartment_threaded: u32 = 0x0002;
     const invalid_file_attributes: u32 = 0xffff_ffff;
     const create_new_console: u32 = 0x0000_0010;
+    const cstr_equal: i32 = 2;
+    const siigbf_resize_to_fit: u32 = 0;
+    const halftone: i32 = 4;
+    const source_copy: u32 = 0x00cc_0020;
+    const iid_shell_item_image_factory = Guid{
+        .data1 = 0xbcc1_8b79,
+        .data2 = 0xba16,
+        .data3 = 0x442f,
+        .data4 = .{ 0x80, 0xc4, 0x8a, 0x59, 0xc3, 0x0c, 0x46, 0x3b },
+    };
     const dpi_awareness_per_monitor_v2: ?*anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(isize, -4))));
 
     extern "kernel32" fn GetModuleHandleW(name: ?[*:0]const u16) callconv(.winapi) Instance;
@@ -1728,6 +2062,7 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     extern "kernel32" fn SetEnvironmentVariableW(name: [*:0]const u16, value: ?[*:0]const u16) callconv(.winapi) i32;
     extern "kernel32" fn CreateProcessW(application: ?[*:0]const u16, command: ?[*:0]u16, process_attributes: ?*anyopaque, thread_attributes: ?*anyopaque, inherit: i32, flags: u32, environment: ?*anyopaque, directory: ?[*:0]const u16, startup: *StartupInfoW, process: *ProcessInformation) callconv(.winapi) i32;
     extern "kernel32" fn CloseHandle(handle: Handle) callconv(.winapi) i32;
+    extern "kernel32" fn CompareStringOrdinal([*]const u16, i32, [*]const u16, i32, i32) callconv(.winapi) i32;
     extern "kernel32" fn GetPrivateProfileStringW(section: [*:0]const u16, key: [*:0]const u16, default: [*:0]const u16, output: [*]u16, size: u32, file: [*:0]const u16) callconv(.winapi) u32;
     extern "kernel32" fn GetPrivateProfileIntW(section: [*:0]const u16, key: [*:0]const u16, default: u32, file: [*:0]const u16) callconv(.winapi) u32;
     extern "kernel32" fn WritePrivateProfileStringW(section: [*:0]const u16, key: [*:0]const u16, value: ?[*:0]const u16, file: [*:0]const u16) callconv(.winapi) i32;
@@ -1766,6 +2101,10 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     extern "user32" fn GetKeyNameTextW(long_parameter: i32, output: [*]u16, size: i32) callconv(.winapi) i32;
 
     extern "gdi32" fn CreateSolidBrush(color: u32) callconv(.winapi) Brush;
+    extern "gdi32" fn CreateCompatibleDC(DeviceContext) callconv(.winapi) DeviceContext;
+    extern "gdi32" fn DeleteDC(DeviceContext) callconv(.winapi) i32;
+    extern "gdi32" fn SetStretchBltMode(DeviceContext, i32) callconv(.winapi) i32;
+    extern "gdi32" fn StretchBlt(DeviceContext, i32, i32, i32, i32, DeviceContext, i32, i32, i32, i32, u32) callconv(.winapi) i32;
     extern "gdi32" fn DeleteObject(Object) callconv(.winapi) i32;
     extern "gdi32" fn SelectObject(DeviceContext, Object) callconv(.winapi) Object;
     extern "gdi32" fn GetStockObject(i32) callconv(.winapi) Object;
@@ -1775,6 +2114,7 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     extern "gdi32" fn CreateFontW(i32, i32, i32, i32, i32, u32, u32, u32, u32, u32, u32, u32, u32, [*:0]const u16) callconv(.winapi) Font;
 
     extern "shell32" fn SHBrowseForFolderW(*BrowseInfoW) callconv(.winapi) ?*anyopaque;
+    extern "shell32" fn SHCreateItemFromParsingName([*:0]const u16, ?*anyopaque, *const Guid, *?*ShellItemImageFactory) callconv(.winapi) i32;
     extern "shell32" fn SHGetPathFromIDListW(?*anyopaque, [*]u16) callconv(.winapi) i32;
     extern "shell32" fn ShellExecuteW(Window, ?[*:0]const u16, [*:0]const u16, ?[*:0]const u16, ?[*:0]const u16, i32) callconv(.winapi) Handle;
     extern "ole32" fn CoInitializeEx(?*anyopaque, u32) callconv(.winapi) i32;
