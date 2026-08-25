@@ -102,59 +102,6 @@ pub const ValidationReport = struct {
 
 pub const OptimizationReport = struct {
     elided_nops: u32 = 0,
-    constant_folds: u32 = 0,
-    dead_instructions: u32 = 0,
-};
-
-pub const ValueId = u32;
-pub const invalid_value = std.math.maxInt(ValueId);
-
-pub const ValueKind = enum { initial, constant, instruction, phi };
-
-pub const SsaValue = struct {
-    kind: ValueKind,
-    value_type: ValueType,
-    definition: u32 = std.math.maxInt(u32),
-    constant_bits: ?u32 = null,
-    use_count: u32 = 0,
-};
-
-pub const SsaInstruction = struct {
-    node: u32,
-    inputs: [96]ValueId = @splat(invalid_value),
-    input_count: u8 = 0,
-    outputs: [2]ValueId = @splat(invalid_value),
-    output_count: u8 = 0,
-    removed: bool = false,
-};
-
-pub const Phi = struct {
-    block: u32,
-    register: u16,
-    output: ValueId,
-    first_input: u32,
-    input_count: u32,
-};
-
-pub const PhiInput = struct {
-    predecessor: u32,
-    value: ValueId,
-};
-
-pub const Use = struct {
-    value: ValueId,
-    user: u32,
-    operand_index: u8,
-    phi: bool = false,
-};
-
-pub const BackendView = struct {
-    instructions: []const instruction.Instruction,
-    nodes: []const Node,
-    blocks: []const BasicBlock,
-    values: []const SsaValue,
-    ssa_instructions: []const SsaInstruction,
-    phis: []const Phi,
 };
 
 pub const Module = struct {
@@ -162,28 +109,16 @@ pub const Module = struct {
     /// backend consume the pipeline product rather than reaching around it to
     /// the decoder's `Program`.
     instructions: std.ArrayList(instruction.Instruction) = .empty,
-    backend_instructions: std.ArrayList(instruction.Instruction) = .empty,
     nodes: std.ArrayList(Node) = .empty,
     blocks: std.ArrayList(BasicBlock) = .empty,
-    values: std.ArrayList(SsaValue) = .empty,
-    ssa_instructions: std.ArrayList(SsaInstruction) = .empty,
-    phis: std.ArrayList(Phi) = .empty,
-    phi_inputs: std.ArrayList(PhiInput) = .empty,
-    uses: std.ArrayList(Use) = .empty,
     stage: PipelineStage = .decoded,
     validation: ValidationReport = .{},
     optimization: OptimizationReport = .{},
 
     pub fn deinit(self: *Module, allocator: std.mem.Allocator) void {
         self.instructions.deinit(allocator);
-        self.backend_instructions.deinit(allocator);
         self.nodes.deinit(allocator);
         self.blocks.deinit(allocator);
-        self.values.deinit(allocator);
-        self.ssa_instructions.deinit(allocator);
-        self.phis.deinit(allocator);
-        self.phi_inputs.deinit(allocator);
-        self.uses.deinit(allocator);
         self.* = undefined;
     }
 
@@ -196,22 +131,14 @@ pub const Module = struct {
     ) std.mem.Allocator.Error!instruction.Program {
         var program = instruction.Program{ .code = &.{}, .instructions = .empty };
         errdefer program.deinit(allocator);
-        try program.instructions.appendSlice(allocator, self.backend_instructions.items);
+        try program.instructions.ensureTotalCapacity(
+            allocator,
+            self.instructions.items.len -| self.optimization.elided_nops,
+        );
+        for (self.instructions.items, self.nodes.items) |inst, node| {
+            if (!node.elided) program.instructions.appendAssumeCapacity(inst);
+        }
         return program;
-    }
-
-    /// Stable backend contract: code generators consume the legalized module
-    /// and its optimized instruction view without reconstructing a decoder
-    /// `Program` or reopening encoded shader words.
-    pub fn backendView(self: *const Module) BackendView {
-        return .{
-            .instructions = self.backend_instructions.items,
-            .nodes = self.nodes.items,
-            .blocks = self.blocks.items,
-            .values = self.values.items,
-            .ssa_instructions = self.ssa_instructions.items,
-            .phis = self.phis.items,
-        };
     }
 };
 
@@ -494,296 +421,10 @@ fn isBlockLeader(module: *const Module, node_index: usize) bool {
     return false;
 }
 
-const register_slot_count = 416;
-
-fn registerSlot(op: operand.Operand) ?u16 {
-    return switch (op.kind) {
-        .sgpr => if (op.reg < 128) @intCast(op.reg) else null,
-        .vgpr => if (op.reg < 256) @intCast(128 + op.reg) else null,
-        .ttmp => if (op.reg < 16) @intCast(384 + op.reg) else null,
-        .vcc_lo, .vcc_z => 400,
-        .vcc_hi => 401,
-        .exec_lo, .exec_z => 402,
-        .exec_hi => 403,
-        .scc => 404,
-        .m0 => 405,
-        .flat_scratch_base_lo => 406,
-        .flat_scratch_base_hi => 407,
-        .shared_base => 408,
-        .shared_limit => 409,
-        .private_base => 410,
-        .private_limit => 411,
-        .pops_exiting_wave_id => 412,
-        else => null,
-    };
-}
-
-fn constantOperand(op: operand.Operand) bool {
-    return switch (op.kind) {
-        .integer_inline_constant, .float_inline_constant, .literal_constant, .null => true,
-        else => false,
-    };
-}
-
-const Predecessors = std.ArrayList(u32);
-
-const SsaBuilder = struct {
-    allocator: std.mem.Allocator,
-    module: *Module,
-    predecessors: []Predecessors,
-    entry_definitions: []ValueId,
-    local_definitions: []ValueId,
-    initial_values: [register_slot_count]ValueId = @splat(invalid_value),
-
-    fn definitionIndex(block: usize, slot: u16) usize {
-        return block * register_slot_count + slot;
-    }
-
-    fn appendValue(self: *SsaBuilder, value: SsaValue) std.mem.Allocator.Error!ValueId {
-        const id: ValueId = @intCast(self.module.values.items.len);
-        try self.module.values.append(self.allocator, value);
-        return id;
-    }
-
-    fn initialValue(self: *SsaBuilder, slot: u16) std.mem.Allocator.Error!ValueId {
-        if (self.initial_values[slot] != invalid_value) return self.initial_values[slot];
-        const value = try self.appendValue(.{ .kind = .initial, .value_type = .bits32, .definition = slot });
-        self.initial_values[slot] = value;
-        return value;
-    }
-
-    fn readExit(self: *SsaBuilder, block: u32, slot: u16) std.mem.Allocator.Error!ValueId {
-        const index = definitionIndex(block, slot);
-        if (self.local_definitions[index] != invalid_value) return self.local_definitions[index];
-        return self.readEntry(block, slot);
-    }
-
-    fn readEntry(self: *SsaBuilder, block: u32, slot: u16) std.mem.Allocator.Error!ValueId {
-        const index = definitionIndex(block, slot);
-        if (self.entry_definitions[index] != invalid_value) return self.entry_definitions[index];
-        const incoming = self.predecessors[block].items;
-        if (block == 0 or incoming.len == 0) {
-            const value = try self.initialValue(slot);
-            self.entry_definitions[index] = value;
-            return value;
-        }
-        if (incoming.len == 1) {
-            const value = try self.readExit(incoming[0], slot);
-            self.entry_definitions[index] = value;
-            return value;
-        }
-
-        // Publish the phi output before following back edges. This is the
-        // sealed-block SSA construction rule which makes natural loops finite.
-        const output = try self.appendValue(.{ .kind = .phi, .value_type = .bits32 });
-        self.entry_definitions[index] = output;
-        const values = try self.allocator.alloc(ValueId, incoming.len);
-        defer self.allocator.free(values);
-        for (incoming, 0..) |predecessor, input_index| {
-            values[input_index] = try self.readExit(predecessor, slot);
-        }
-        const first_input: u32 = @intCast(self.module.phi_inputs.items.len);
-        for (incoming, values) |predecessor, value| {
-            try self.module.phi_inputs.append(self.allocator, .{ .predecessor = predecessor, .value = value });
-        }
-        const phi_index: u32 = @intCast(self.module.phis.items.len);
-        try self.module.phis.append(self.allocator, .{
-            .block = block,
-            .register = slot,
-            .output = output,
-            .first_input = first_input,
-            .input_count = @intCast(values.len),
-        });
-        self.module.values.items[output].definition = phi_index;
-        return output;
-    }
-
-    fn valueForOperand(self: *SsaBuilder, block: u32, current: []ValueId, op: operand.Operand) std.mem.Allocator.Error!ValueId {
-        if (constantOperand(op)) {
-            return self.appendValue(.{
-                .kind = .constant,
-                .value_type = .bits32,
-                .constant_bits = if (op.kind == .null) 0 else op.value,
-            });
-        }
-        const slot = registerSlot(op) orelse return self.appendValue(.{ .kind = .initial, .value_type = .bits32 });
-        if (current[slot] == invalid_value) current[slot] = try self.readEntry(block, slot);
-        return current[slot];
-    }
-};
-
-fn operandHasModifiers(op: operand.Operand) bool {
-    return op.negate or op.absolute or op.clamp or op.dpp or op.op_sel or op.op_sel_hi or
-        op.negate_hi or op.omod != 0 or op.sdwa_sel != 6;
-}
-
-fn foldNode(node: Node, inputs: []const u32) ?u32 {
-    if (inputs.len == 0) return null;
-    for (node.sources.slice()) |source| if (operandHasModifiers(source)) return null;
-    return switch (node.operation) {
-        .move => inputs[0],
-        .integer_add => if (inputs.len >= 2) inputs[0] +% inputs[1] else null,
-        .integer_subtract => if (inputs.len >= 2)
-            if (node.opcode == .v_subrev_nc_u32) inputs[1] -% inputs[0] else inputs[0] -% inputs[1]
-        else
-            null,
-        .bit_and => if (inputs.len >= 2) inputs[0] & inputs[1] else null,
-        .bit_or => if (inputs.len >= 2) inputs[0] | inputs[1] else null,
-        .bit_xor => if (inputs.len >= 2) inputs[0] ^ inputs[1] else null,
-        .float_add => if (inputs.len >= 2) @bitCast(@as(f32, @bitCast(inputs[0])) + @as(f32, @bitCast(inputs[1]))) else null,
-        .float_subtract => if (inputs.len >= 2) @bitCast(@as(f32, @bitCast(inputs[0])) - @as(f32, @bitCast(inputs[1]))) else null,
-        .float_multiply => if (inputs.len >= 2) @bitCast(@as(f32, @bitCast(inputs[0])) * @as(f32, @bitCast(inputs[1]))) else null,
-        else => null,
-    };
-}
-
-fn buildSsa(allocator: std.mem.Allocator, module: *Module) std.mem.Allocator.Error!void {
-    module.values.clearRetainingCapacity();
-    module.ssa_instructions.clearRetainingCapacity();
-    module.phis.clearRetainingCapacity();
-    module.phi_inputs.clearRetainingCapacity();
-    module.uses.clearRetainingCapacity();
-    try module.ssa_instructions.ensureTotalCapacity(allocator, module.nodes.items.len);
-    for (module.nodes.items, 0..) |_, node_index| {
-        module.ssa_instructions.appendAssumeCapacity(.{ .node = @intCast(node_index) });
-    }
-
-    const predecessors = try allocator.alloc(Predecessors, module.blocks.items.len);
-    defer {
-        for (predecessors) |*list| list.deinit(allocator);
-        allocator.free(predecessors);
-    }
-    for (predecessors) |*list| list.* = .empty;
-    for (module.blocks.items, 0..) |block, block_index| {
-        for (block.successors[0..block.successor_count]) |successor| {
-            try predecessors[successor].append(allocator, @intCast(block_index));
-        }
-    }
-    const definition_count = module.blocks.items.len * register_slot_count;
-    const entry_definitions = try allocator.alloc(ValueId, definition_count);
-    defer allocator.free(entry_definitions);
-    const local_definitions = try allocator.alloc(ValueId, definition_count);
-    defer allocator.free(local_definitions);
-    @memset(entry_definitions, invalid_value);
-    @memset(local_definitions, invalid_value);
-
-    var builder = SsaBuilder{
-        .allocator = allocator,
-        .module = module,
-        .predecessors = predecessors,
-        .entry_definitions = entry_definitions,
-        .local_definitions = local_definitions,
-    };
-
-    // Allocate every explicit definition first so loop back edges can refer to
-    // the final value of a block that has not yet been visited for uses.
-    for (module.blocks.items, 0..) |block, block_index| {
-        const first: usize = block.first_node;
-        const end = first + block.node_count;
-        for (module.nodes.items[first..end], first..) |node, node_index| {
-            const destinations = [_]operand.Operand{ node.dst, node.dst2 };
-            for (destinations) |destination| {
-                const slot = registerSlot(destination) orelse continue;
-                const value = try builder.appendValue(.{
-                    .kind = .instruction,
-                    .value_type = if (node.value_type == .none) .bits32 else node.value_type,
-                    .definition = @intCast(node_index),
-                });
-                const ssa = &module.ssa_instructions.items[node_index];
-                if (ssa.output_count < ssa.outputs.len) {
-                    ssa.outputs[ssa.output_count] = value;
-                    ssa.output_count += 1;
-                }
-                local_definitions[SsaBuilder.definitionIndex(block_index, slot)] = value;
-            }
-        }
-    }
-
-    for (module.blocks.items, 0..) |block, block_index| {
-        var current: [register_slot_count]ValueId = @splat(invalid_value);
-        const first: usize = block.first_node;
-        const end = first + block.node_count;
-        for (module.nodes.items[first..end], first..) |node, node_index| {
-            const sources = node.sources;
-            const ssa = &module.ssa_instructions.items[node_index];
-            const tuple_operation = node.operation == .memory or node.operation == .image;
-            var input_operands: [5]operand.Operand = undefined;
-            var input_operand_count: usize = 0;
-            if (tuple_operation and registerSlot(node.dst) != null) {
-                input_operands[input_operand_count] = node.dst;
-                input_operand_count += 1;
-            }
-            for (sources.slice()) |source| {
-                input_operands[input_operand_count] = source;
-                input_operand_count += 1;
-            }
-            for (input_operands[0..input_operand_count], 0..) |source, source_index| {
-                const source_slot = registerSlot(source);
-                const window: u32 = if (tuple_operation and source_slot != null) 16 else 1;
-                for (0..window) |offset| {
-                    var expanded = source;
-                    if (source_slot != null) {
-                        expanded.reg +%= @intCast(offset);
-                        if (registerSlot(expanded) == null) break;
-                    }
-                    if (ssa.input_count == ssa.inputs.len) break;
-                    const value = try builder.valueForOperand(@intCast(block_index), &current, expanded);
-                    ssa.inputs[ssa.input_count] = value;
-                    ssa.input_count += 1;
-                    try module.uses.append(allocator, .{
-                        .value = value,
-                        .user = @intCast(node_index),
-                        .operand_index = @intCast(@min(source_index, std.math.maxInt(u8))),
-                    });
-                    module.values.items[value].use_count += 1;
-                }
-            }
-            const destinations = [_]operand.Operand{ node.dst, node.dst2 };
-            var output_index: usize = 0;
-            for (destinations) |destination| {
-                const slot = registerSlot(destination) orelse continue;
-                current[slot] = ssa.outputs[output_index];
-                output_index += 1;
-            }
-        }
-    }
-    for (module.phis.items, 0..) |phi, phi_index| {
-        const first: usize = phi.first_input;
-        const end = first + phi.input_count;
-        for (module.phi_inputs.items[first..end], 0..) |input, input_index| {
-            try module.uses.append(allocator, .{
-                .value = input.value,
-                .user = @intCast(phi_index),
-                .operand_index = @intCast(@min(input_index, std.math.maxInt(u8))),
-                .phi = true,
-            });
-            module.values.items[input.value].use_count += 1;
-        }
-    }
-}
-
-fn dceEligible(node: Node) bool {
-    if (node.side_effect or node.dst.kind != .vgpr) return false;
-    return switch (node.operation) {
-        .move,
-        .integer_add,
-        .integer_subtract,
-        .shift_left_add,
-        .float_add,
-        .float_subtract,
-        .float_multiply,
-        .bit_and,
-        .bit_or,
-        .bit_xor,
-        => true,
-        else => false,
-    };
-}
-
-/// SSA constant propagation and iterative dead-definition elimination. Branch
-/// leaders retain their decoded PC even when their value is dead, preserving
-/// the guest address domain used by control-flow lowering.
-pub fn optimize(allocator: std.mem.Allocator, module: *Module) std.mem.Allocator.Error!void {
+/// Conservative IR optimization. Only decoded no-ops which are not branch
+/// destinations are elided; side effects and unreachable code are retained
+/// until a later SSA-based data-flow pass can prove them dead.
+pub fn optimize(module: *Module) void {
     module.optimization = .{};
     for (module.nodes.items, 0..) |*node, index| {
         node.elided = false;
@@ -791,90 +432,6 @@ pub fn optimize(allocator: std.mem.Allocator, module: *Module) std.mem.Allocator
         if (node.opcode != .s_nop and node.opcode != .v_nop) continue;
         node.elided = true;
         module.optimization.elided_nops += 1;
-    }
-
-    var changed = true;
-    while (changed) {
-        changed = false;
-        for (module.phis.items) |phi| {
-            const output = &module.values.items[phi.output];
-            if (output.constant_bits != null) continue;
-            const first: usize = phi.first_input;
-            const end = first + phi.input_count;
-            var common: ?u32 = null;
-            for (module.phi_inputs.items[first..end]) |input| {
-                const bits = module.values.items[input.value].constant_bits orelse {
-                    common = null;
-                    break;
-                };
-                if (common) |expected| {
-                    if (expected != bits) {
-                        common = null;
-                        break;
-                    }
-                } else common = bits;
-            }
-            if (common) |bits| {
-                output.constant_bits = bits;
-                changed = true;
-            }
-        }
-        for (module.ssa_instructions.items) |ssa| {
-            if (ssa.output_count == 0) continue;
-            var inputs: [96]u32 = undefined;
-            var all_constant = true;
-            for (ssa.inputs[0..ssa.input_count], 0..) |value, index| {
-                inputs[index] = module.values.items[value].constant_bits orelse {
-                    all_constant = false;
-                    break;
-                };
-            }
-            if (!all_constant) continue;
-            const bits = foldNode(module.nodes.items[ssa.node], inputs[0..ssa.input_count]) orelse continue;
-            var newly_folded = false;
-            for (ssa.outputs[0..ssa.output_count]) |output_id| {
-                const output = &module.values.items[output_id];
-                if (output.constant_bits == null) {
-                    output.constant_bits = bits;
-                    newly_folded = true;
-                }
-            }
-            if (newly_folded) {
-                module.optimization.constant_folds += 1;
-                changed = true;
-            }
-        }
-    }
-
-    changed = true;
-    while (changed) {
-        changed = false;
-        for (module.ssa_instructions.items) |*ssa| {
-            if (ssa.removed or ssa.output_count == 0 or isBlockLeader(module, ssa.node)) continue;
-            const node = &module.nodes.items[ssa.node];
-            if (node.elided or !dceEligible(node.*)) continue;
-            var unused = true;
-            for (ssa.outputs[0..ssa.output_count]) |output| {
-                if (module.values.items[output].use_count != 0) unused = false;
-            }
-            if (!unused) continue;
-            ssa.removed = true;
-            node.elided = true;
-            module.optimization.dead_instructions += 1;
-            for (ssa.inputs[0..ssa.input_count]) |input| {
-                module.values.items[input].use_count -|= 1;
-            }
-            changed = true;
-        }
-    }
-
-    module.backend_instructions.clearRetainingCapacity();
-    try module.backend_instructions.ensureTotalCapacity(
-        allocator,
-        module.instructions.items.len -| module.optimization.elided_nops -| module.optimization.dead_instructions,
-    );
-    for (module.instructions.items, module.nodes.items) |inst, node| {
-        if (!node.elided) module.backend_instructions.appendAssumeCapacity(inst);
     }
     module.stage = .optimized;
 }
@@ -889,8 +446,7 @@ pub fn legalize(module: *Module) void {
 pub fn runPipeline(allocator: std.mem.Allocator, module: *Module) std.mem.Allocator.Error!void {
     module.stage = .typed;
     try validate(allocator, module);
-    try buildSsa(allocator, module);
-    try optimize(allocator, module);
+    optimize(module);
     legalize(module);
 }
 
@@ -1020,83 +576,4 @@ test "IR optimization elides only non-leader no-ops for emission" {
     defer emission.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), emission.instructions.items.len);
     try std.testing.expectEqual(isa.Opcode.s_endpgm, emission.instructions.items[1].opcode);
-}
-
-test "SSA propagates constants and removes a dead vector definition" {
-    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
-    defer program.deinit(std.testing.allocator);
-    try program.instructions.append(std.testing.allocator, .{
-        .pc = 0,
-        .opcode = .v_mov_b32,
-        .dst = .{ .kind = .vgpr, .reg = 0 },
-        .src0 = .{ .kind = .integer_inline_constant, .value = 4 },
-        .src_count = 1,
-    });
-    try program.instructions.append(std.testing.allocator, .{
-        .pc = 4,
-        .opcode = .v_add_nc_u32,
-        .dst = .{ .kind = .vgpr, .reg = 1 },
-        .src0 = .{ .kind = .vgpr, .reg = 0 },
-        .src1 = .{ .kind = .integer_inline_constant, .value = 7 },
-        .src_count = 2,
-    });
-    try program.instructions.append(std.testing.allocator, .{ .pc = 8, .opcode = .s_endpgm });
-    var module = try lower(std.testing.allocator, &program);
-    defer module.deinit(std.testing.allocator);
-
-    const add = module.ssa_instructions.items[1];
-    try std.testing.expectEqual(@as(?u32, 11), module.values.items[add.outputs[0]].constant_bits);
-    try std.testing.expectEqual(@as(u32, 2), module.optimization.constant_folds);
-    try std.testing.expectEqual(@as(u32, 1), module.optimization.dead_instructions);
-    try std.testing.expect(module.nodes.items[1].elided);
-}
-
-test "SSA inserts a phi at a register merge and records def-use edges" {
-    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
-    defer program.deinit(std.testing.allocator);
-    try program.instructions.append(std.testing.allocator, .{
-        .pc = 0,
-        .opcode = .s_cbranch_scc1,
-        .branch_target = 12,
-    });
-    try program.instructions.append(std.testing.allocator, .{
-        .pc = 4,
-        .opcode = .v_mov_b32,
-        .dst = .{ .kind = .vgpr, .reg = 0 },
-        .src0 = .{ .kind = .integer_inline_constant, .value = 1 },
-        .src_count = 1,
-    });
-    try program.instructions.append(std.testing.allocator, .{
-        .pc = 8,
-        .opcode = .s_branch,
-        .branch_target = 16,
-    });
-    try program.instructions.append(std.testing.allocator, .{
-        .pc = 12,
-        .opcode = .v_mov_b32,
-        .dst = .{ .kind = .vgpr, .reg = 0 },
-        .src0 = .{ .kind = .integer_inline_constant, .value = 2 },
-        .src_count = 1,
-    });
-    try program.instructions.append(std.testing.allocator, .{
-        .pc = 16,
-        .opcode = .v_add_nc_u32,
-        .dst = .{ .kind = .vgpr, .reg = 1 },
-        .src0 = .{ .kind = .vgpr, .reg = 0 },
-        .src1 = .{ .kind = .integer_inline_constant, .value = 3 },
-        .src_count = 2,
-    });
-    try program.instructions.append(std.testing.allocator, .{ .pc = 20, .opcode = .s_endpgm });
-    var module = try lower(std.testing.allocator, &program);
-    defer module.deinit(std.testing.allocator);
-
-    var merged: ?Phi = null;
-    for (module.phis.items) |phi| if (phi.register == 128) {
-        merged = phi;
-        break;
-    };
-    try std.testing.expect(merged != null);
-    try std.testing.expectEqual(@as(u32, 2), merged.?.input_count);
-    try std.testing.expect(module.values.items[merged.?.output].use_count != 0);
-    try std.testing.expect(module.uses.items.len >= 4);
 }

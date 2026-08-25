@@ -7,8 +7,6 @@ pub const api = @import("api.zig");
 pub const backend = @import("backend.zig");
 pub const detile_spirv = @import("detile_spirv.zig");
 pub const image_alias = @import("image_alias.zig");
-pub const image_state = @import("image_state.zig");
-pub const pipeline_compiler = @import("pipeline_compiler.zig");
 
 pub const Error = backend.Error;
 pub const Options = backend.Options;
@@ -33,6 +31,4 @@ test {
     _ = backend;
     _ = detile_spirv;
     _ = image_alias;
-    _ = image_state;
-    _ = pipeline_compiler;
 }

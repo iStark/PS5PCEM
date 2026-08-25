@@ -62,25 +62,16 @@ If you would like to support continued PS5PCEM development, you can do so on
   ranges, and deferred Vulkan objects carry the timeline tick that owns them;
   the CPU waits only at a real readback, guest synchronization boundary, or
   exhausted reusable-resource ring rather than after every draw or dispatch.
-- Compute and graphics shader-module/pipeline misses run through an on-demand
-  FIFO compiler worker. The worker is idle-free when the queue drains,
-  serializes access to the shared Vulkan driver cache, and overlaps compilation
-  with preparation of the emulator's bounded LRU cache entries.
 - Guest image allocations share one range-based alias registry across colour
-  and separate depth/stencil targets, storage images, and sampled textures. It
-  records the canonical writer and each representation's resident generation,
-  chooses direct resolves only for identical storage signatures, and routes
-  reinterpretations or partial overlaps through current guest memory.
-- Vulkan image layout/access state is tracked per aspect, mip, and array layer.
-  Color/depth attachments, sampled and storage images, transfers, resolves, and
-  readbacks now derive barriers from the preceding subresource use; same-layout
-  writes retain a hazard while repeated read-only use emits no redundant barrier.
+  and depth targets, storage images, and sampled textures. A GPU write advances
+  the generation of every overlapping representation, including views with a
+  different base address, and dirty writers are materialized before an
+  incompatible alias is rebuilt from guest memory.
 - Runtime shaders now pass through a common typed IR pipeline before SPIR-V:
   lowering records operands and memory metadata, validation builds basic blocks
-  and reachability, SSA construction adds phi values and def-use edges,
-  propagation folds constants, and iterative DCE removes safe dead vector
-  definitions without deleting branch-target PCs. SPIR-V consumes a legalized
-  backend view directly rather than reconstructing a decoded program.
+  and reachability, conservative optimization removes safe non-target NOPs,
+  and legalization forms the explicit backend boundary. Compute, fragment, and
+  guest vertex translation all consume that pipeline product.
 - Long-running title execution uses a freeing, thread-safe allocator, and
   aligned Windows direct-memory ranges share 64 KiB section views. Temporary
   uploads/readbacks and 16 KiB guest pages therefore no longer accumulate as
@@ -335,7 +326,7 @@ Eleven modules cover the independent subsystems and their end-to-end composition
 | Module | What it does |
 |---|---|
 | **`memory`** | Reserves fixed guest ranges, manages sparse mappings and permissions, and tracks 16 KiB GPU-source page generations |
-| **`rdna2`** | Decodes RDNA2 machine code and runs CFG validation, SSA/def-use optimization, legalization, and direct IR-to-SPIR-V emission |
+| **`rdna2`** | Decodes RDNA2 machine code and runs typed IR validation, optimization, legalization, and SPIR-V emission |
 | **`gpu`** | Decodes, snapshots, schedules, and executes the stateful part of submitted GPU command streams |
 | **`vulkan`** | Owns the host Vulkan device, timeline-scheduled submissions, image-alias coherency, caches, and renderer boundary |
 | **`window`** | Owns the native host window and its platform message loop |
@@ -835,9 +826,9 @@ set.
 
 1. Validate family/opcode fields against a captured shader corpus and finish
    DPP subgroup lowering, VOP3 modifiers plus the remaining opcode tables.
-2. Extend SSA legalization from the current 32-bit scalar/vector core to packed
-   16/64-bit values and make more implicit VCC/EXEC effects explicit without
-   weakening the conservative tuple dependencies used by memory/image ops.
+2. Extend the typed IR with SSA def-use chains, constant propagation, and dead
+   value elimination while retaining the current conservative PC/branch model
+   for irreducible VCC/EXEC control flow.
 3. Extend image lowering to array/mip/MSAA, partial-mask store, compare-gather,
    and image-atomic forms; finish the remaining DS operations, masked/multiple
    exports, and system VGPRs against captured resource and stage metadata.
@@ -1075,12 +1066,8 @@ buffers, separate 64-entry 2D and 3D combined sampled-image arrays, typed
 storage images, a 256-set descriptor/scalar ring, a persistently mapped 128 MiB
 read-only/index upload arena, its pool, persistent guest render targets, and
 image/view/sampler/render-pass/framebuffer creation. It also owns bounded
-LRU compute and graphics-pipeline caches plus a 1,024-entry sampled-image LRU.
-First-use compute and graphics pipelines are created by
-[`vulkan.pipeline_compiler`](src/vulkan/pipeline_compiler.zig), an on-demand
-single-worker FIFO which serializes the shared driver cache and falls back to a
-correct inline drain if the host cannot create a thread. The Vulkan-driver
-cache is persisted as
+LRU compute and graphics-pipeline caches plus a 1,024-entry sampled-image LRU. The
+Vulkan-driver cache is persisted as
 `vulkan_pipeline_cache.bin` between runs; invalid, unreadable, or oversized
 cache data simply falls back to an empty driver cache, so it can only affect
 startup compilation time, never correctness.
@@ -1117,7 +1104,7 @@ draw/dispatch and flip callbacks to [`gpu.executor`](src/gpu/executor.zig)
 without adding a Vulkan dependency to the command processor. A direct compute
 packet resolves `COMPUTE_PGM`, reads
 `COMPUTE_NUM_THREAD_X/Y/Z`, incrementally decodes guest code, lowers it through
-the typed IR validation/SSA/optimization/legalization pipeline, emits SPIR-V 1.5,
+the typed IR validation/optimization/legalization pipeline, emits SPIR-V 1.5,
 creates or reuses its compute pipeline, binds the active storage set and
 dispatches the packet's XYZ group counts. Errors remain
 visible in diagnostics, but missing compute state and selected resource or
@@ -1153,22 +1140,12 @@ program fails explicitly.
 
 [`vulkan.image_alias`](src/vulkan/image_alias.zig) is the common coherency
 registry for colour targets, depth targets, storage images, and uploaded sampled
-images. Every cached representation has a stable token, guest byte range,
-storage signature, required generation, resident generation, and canonical
-authority. Writes advance a monotonic generation across all overlapping ranges,
-not only exact base-address matches. Compatible equal-range storage can resolve
-directly; format reinterpretations and partial overlaps publish the dirty
-authority and rebuild from guest memory. Depth and stencil allocations receive
-separate alias tokens even when Vulkan packs them into one attachment.
-
-[`vulkan.image_state`](src/vulkan/image_state.zig) tracks layout, access mask,
-pipeline stages, aspect, mip, and layer for every persistent host image. Barrier
-planning is transactional: an undersized output buffer cannot partially commit
-state. Repeated read-only use in one layout is free, while read/write and
-write/write reuse preserves a Vulkan memory dependency even without a layout
-change. Persistent colour/depth targets, sampled textures, and storage images
-all use this path; swapchain and short-lived diagnostic images retain their
-local presentation barriers.
+images. Every cached representation has a stable token, guest byte range, and
+storage signature. Writes advance a monotonic generation across all overlapping
+ranges, not only exact base-address matches. Sampled cache keys include that
+generation, and fallback staging first publishes dirty overlapping render or
+storage images, preventing two independently created `VkImage`s from silently
+representing different contents of the same guest allocation.
 
 Recovered vertex and fragment SGPR values are read from the mapped scalar buffer
 at draw time instead of becoming SPIR-V constants. Storage-buffer shaders query
@@ -2482,20 +2459,15 @@ scheduler and Vulkan backend. Observed startup work now includes:
   A stale depth allocation smaller than the colour target is ignored because
   Vulkan requires every attachment to cover the framebuffer extent; this keeps
   fullscreen colour and UI passes valid when a title leaves 1×1 DB state bound. The
-  Single-sample `Z_16`/`Z_32_FLOAT` and optional S8 planes are detiled and
-  imported on first use. `D24_UNORM_S8` expands guest Z16 to the host depth
-  aspect without losing its normalized endpoints; depth and stencil copy as
-  separate Vulkan aspects. An explicit guest clear still supersedes imported
-  contents, while an unsupported MSAA import retains the safe first-use clear.
+  attachment is cleared on first use, because a title that enables the test
+  before its own clear would otherwise compare against undefined contents.
   A later pass that samples the same allocation is bound to the resident
   attachment rather than to a staged copy, so a depth-of-field or fog pass reads
   what the geometry actually wrote; the sampled view uses the single-channel
-  format matching the stored precision. Dirty single-sample depth and stencil
-  are copied to a host-visible transfer buffer and tiled back only at a guest
-  visibility or eviction boundary. A bound S8 plane becomes a packed
-  depth+stencil attachment, and a matching multi-sample colour target keeps the
-  same sample count through resolve; multisample depth import/readback remains
-  follow-up work.
+  format matching the stored precision. Importing tiled guest depth written
+  outside the renderer is still outside this path. A bound S8 plane becomes a
+  packed depth+stencil attachment, and a matching multi-sample colour target
+  keeps the same sample count through resolve.
 - `SetFlip` and equeue delivery use VideoOut filter `-13`; flip status fills
   process-time fields and event data retains the guest flip argument.
 - Indexed draws can emit AGC `SetIndexSize` as a real `INDEX_TYPE` packet, and

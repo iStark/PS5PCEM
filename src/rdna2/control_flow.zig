@@ -82,8 +82,8 @@ pub const Graph = struct {
     }
 };
 
-fn instructionIndexAtPc(instructions: []const instruction.Instruction, pc: u32) ?usize {
-    for (instructions, 0..) |inst, index| {
+fn instructionIndexAtPc(program: *const instruction.Program, pc: u32) ?usize {
+    for (program.instructions.items, 0..) |inst, index| {
         if (inst.pc == pc) return index;
     }
     return null;
@@ -118,10 +118,7 @@ fn addImmediate(inst: instruction.Instruction, pc_reg: u32) ?struct { opcode: is
 /// `s[6:7]` hardware exporters and external fetch-shader pointers return null
 /// and stay terminators.
 pub fn resolveSetpcTarget(program: *const instruction.Program, setpc_index: usize) ?u32 {
-    return resolveSetpcTargetInstructions(program.instructions.items, setpc_index);
-}
-
-pub fn resolveSetpcTargetInstructions(instructions: []const instruction.Instruction, setpc_index: usize) ?u32 {
+    const instructions = program.instructions.items;
     if (setpc_index >= instructions.len) return null;
     const setpc = instructions[setpc_index];
     if (setpc.opcode != .s_setpc_b64 or setpc.src0.kind != .sgpr) return null;
@@ -301,11 +298,7 @@ fn buildSelections(allocator: std.mem.Allocator, graph: *Graph) Error!void {
 /// Splits a decoded program at entry, direct branch targets and instructions
 /// following terminators, then materializes direct branch/fallthrough edges.
 pub fn build(allocator: std.mem.Allocator, program: *const instruction.Program) Error!Graph {
-    return buildInstructions(allocator, program.instructions.items);
-}
-
-pub fn buildInstructions(allocator: std.mem.Allocator, instructions: []const instruction.Instruction) Error!Graph {
-    const count = instructions.len;
+    const count = program.instructions.items.len;
     var graph = Graph{};
     errdefer graph.deinit(allocator);
     if (count == 0) return graph;
@@ -315,15 +308,15 @@ pub fn buildInstructions(allocator: std.mem.Allocator, instructions: []const ins
     @memset(leaders, false);
     leaders[0] = true;
 
-    for (instructions, 0..) |inst, index| {
+    for (program.instructions.items, 0..) |inst, index| {
         if (inst.opcode.isBranch()) {
-            const target = instructionIndexAtPc(instructions, inst.branch_target) orelse
+            const target = instructionIndexAtPc(program, inst.branch_target) orelse
                 return Error.InvalidBranchTarget;
             leaders[target] = true;
             if (index + 1 < count) leaders[index + 1] = true;
         } else if (inst.opcode == .s_setpc_b64) {
-            if (resolveSetpcTargetInstructions(instructions, index)) |target| {
-                if (instructionIndexAtPc(instructions, target)) |target_index| {
+            if (resolveSetpcTarget(program, index)) |target| {
+                if (instructionIndexAtPc(program, target)) |target_index| {
                     leaders[target_index] = true;
                 }
             }
@@ -337,8 +330,8 @@ pub fn buildInstructions(allocator: std.mem.Allocator, instructions: []const ins
     while (start < count) {
         var end = start + 1;
         while (end < count and !leaders[end]) : (end += 1) {}
-        const first = instructions[start];
-        const last = instructions[end - 1];
+        const first = program.instructions.items[start];
+        const last = program.instructions.items[end - 1];
         try graph.blocks.append(allocator, .{
             .index = @intCast(graph.blocks.items.len),
             .start_pc = first.pc,
@@ -351,10 +344,10 @@ pub fn buildInstructions(allocator: std.mem.Allocator, instructions: []const ins
 
     for (graph.blocks.items, 0..) |block, block_index| {
         const last_index = block.first_instruction + block.instruction_count - 1;
-        const last = instructions[last_index];
+        const last = program.instructions.items[last_index];
         if (last.opcode.isProgramEnd()) continue;
         if (last.opcode == .s_setpc_b64) {
-            if (resolveSetpcTargetInstructions(instructions, last_index)) |target| {
+            if (resolveSetpcTarget(program, last_index)) |target| {
                 if (graph.blockForPc(target)) |dest| {
                     try graph.edges.append(allocator, .{
                         .from = @intCast(block_index),

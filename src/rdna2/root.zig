@@ -33,12 +33,11 @@ pub const formatInstruction = disasm.formatInstruction;
 pub const buildControlFlow = control_flow.build;
 pub const lowerIr = ir.lower;
 pub const translateIrSpirv = spirv.translateIr;
-pub const translateIrBackendSpirv = spirv.translateBackend;
 /// Compatibility name for the low-level decoded-instruction backend.
 pub const translateSpirv = spirv.translate;
 
 /// Complete runtime path for a transient decoded program: typed lowering,
-/// validation, SSA optimization, legalization and SPIR-V emission.
+/// validation, conservative optimization, legalization and SPIR-V emission.
 pub fn translateProgramSpirv(
     allocator: std.mem.Allocator,
     program: *const Program,

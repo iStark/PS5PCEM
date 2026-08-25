@@ -6939,9 +6939,9 @@ fn markMutableOperand(marked: *[384]bool, op: operand.Operand) void {
     @memset(marked[first..end], true);
 }
 
-fn configureMutableLoopState(builder: *Builder, instructions: []const instruction.Instruction) Error!void {
+fn configureMutableLoopState(builder: *Builder, program: *const instruction.Program) Error!void {
     var marked: [384]bool = @splat(false);
-    for (instructions) |inst| {
+    for (program.instructions.items) |inst| {
         markMutableOperand(&marked, inst.dst);
         markMutableOperand(&marked, inst.dst2);
         const sources = inst.sources();
@@ -7030,7 +7030,7 @@ fn storeMutableControlState(builder: *Builder) Error!void {
 /// RDNA programs seen in Unity post-processing use canonical nested loops: a
 /// conditional header, one latch/back edge and the header's other successor as
 /// the merge. SPIR-V requires those edges to be declared with OpLoopMerge.
-fn translateStructuredLoops(builder: *Builder, instructions: []const instruction.Instruction, graph: *const control_flow.Graph) Error!void {
+fn translateStructuredLoops(builder: *Builder, program: *const instruction.Program, graph: *const control_flow.Graph) Error!void {
     if (graph.back_edge_count == 0) return Error.UnsupportedControlFlow;
     const block_count = graph.blocks.items.len;
     const none = std.math.maxInt(u32);
@@ -7057,7 +7057,7 @@ fn translateStructuredLoops(builder: *Builder, instructions: []const instruction
         if (loop_merges[selection.header] == none) return Error.UnsupportedControlFlow;
     }
 
-    try configureMutableLoopState(builder, instructions);
+    try configureMutableLoopState(builder, program);
     const labels = try builder.allocator.alloc(u32, block_count);
     defer builder.allocator.free(labels);
     for (labels) |*label| label.* = builder.id();
@@ -7069,8 +7069,8 @@ fn translateStructuredLoops(builder: *Builder, instructions: []const instruction
 
         const first: usize = block.first_instruction;
         const end: usize = first + block.instruction_count;
-        const last = instructions[end - 1];
-        for (instructions[first..end]) |inst| {
+        const last = program.instructions.items[end - 1];
+        for (program.instructions.items[first..end]) |inst| {
             if (inst.opcode.isBranch() or inst.opcode.isProgramEnd() or inst.opcode == .s_setpc_b64) continue;
             try lowerDiagnosed(builder, inst);
         }
@@ -7166,9 +7166,9 @@ fn emitDispatchConditional(
 /// Each guest block is a switch case. The next block index lives in a
 /// function-local variable, so back edges, shared merges and VCC/EXEC
 /// divergence do not have to form a reducible loop tree.
-fn translateDispatcher(builder: *Builder, instructions: []const instruction.Instruction, graph: *const control_flow.Graph) Error!void {
+fn translateDispatcher(builder: *Builder, program: *const instruction.Program, graph: *const control_flow.Graph) Error!void {
     if (graph.blocks.items.len == 0) return Error.UnsupportedControlFlow;
-    try configureMutableLoopState(builder, instructions);
+    try configureMutableLoopState(builder, program);
     builder.dispatch_pc_pointer = builder.id();
     const header = builder.id();
     const select = builder.id();
@@ -7215,8 +7215,8 @@ fn translateDispatcher(builder: *Builder, instructions: []const instruction.Inst
         try loadMutableControlState(builder);
         const first: usize = block.first_instruction;
         const end: usize = first + block.instruction_count;
-        const last = instructions[end - 1];
-        for (instructions[first..end]) |inst| {
+        const last = program.instructions.items[end - 1];
+        for (program.instructions.items[first..end]) |inst| {
             if (inst.opcode.isBranch() or inst.opcode.isProgramEnd() or inst.opcode == .s_setpc_b64) continue;
             try lowerDiagnosed(builder, inst);
         }
@@ -7250,7 +7250,7 @@ fn translateDispatcher(builder: *Builder, instructions: []const instruction.Inst
     builder.used_dispatcher = true;
 }
 
-fn translateStructured(builder: *Builder, instructions: []const instruction.Instruction, graph: *const control_flow.Graph) Error!void {
+fn translateStructured(builder: *Builder, program: *const instruction.Program, graph: *const control_flow.Graph) Error!void {
     if (graph.back_edge_count != 0) return Error.UnsupportedControlFlow;
     const labels = try builder.allocator.alloc(u32, graph.blocks.items.len);
     defer builder.allocator.free(labels);
@@ -7280,7 +7280,7 @@ fn translateStructured(builder: *Builder, instructions: []const instruction.Inst
     @memset(terminal_merge_labels, 0);
     for (graph.blocks.items) |block| {
         const last_index: usize = block.first_instruction + block.instruction_count - 1;
-        const last = instructions[last_index];
+        const last = program.instructions.items[last_index];
         if (!last.opcode.isBranch() or last.opcode == .s_branch or
             structuredSelectionIndex(graph, block.index) != null)
         {
@@ -7374,8 +7374,8 @@ fn translateStructured(builder: *Builder, instructions: []const instruction.Inst
 
         const first: usize = block.first_instruction;
         const end: usize = first + block.instruction_count;
-        const last = instructions[end - 1];
-        for (instructions[first..end]) |inst| {
+        const last = program.instructions.items[end - 1];
+        for (program.instructions.items[first..end]) |inst| {
             if (inst.opcode.isBranch() or inst.opcode.isProgramEnd() or inst.opcode == .s_setpc_b64) continue;
             try lowerDiagnosed(builder, inst);
         }
@@ -7592,29 +7592,15 @@ pub fn translateIr(
     options: Options,
 ) Error!Module {
     if (module.stage != .legalized) return Error.InvalidIrStage;
-    return translateBackend(allocator, module.backendView(), options);
-}
-
-pub fn translateBackend(
-    allocator: std.mem.Allocator,
-    view: shader_ir.BackendView,
-    options: Options,
-) Error!Module {
-    return translateInstructions(allocator, view.instructions, options);
+    var program = try module.emissionProgram(allocator);
+    defer program.deinit(allocator);
+    return translate(allocator, &program, options);
 }
 
 /// Low-level SPIR-V backend entry point. Runtime callers normally arrive via
 /// `translateIr`; this form remains public for backend unit tests and tools
 /// which deliberately construct decoded instructions by hand.
 pub fn translate(allocator: std.mem.Allocator, program: *const instruction.Program, options: Options) Error!Module {
-    return translateInstructions(allocator, program.instructions.items, options);
-}
-
-fn translateInstructions(
-    allocator: std.mem.Allocator,
-    instructions: []const instruction.Instruction,
-    options: Options,
-) Error!Module {
     var effective = options;
     var has_predicated_write = false;
     for (effective.ngg_lds_exports) |ngg_export| {
@@ -7622,7 +7608,7 @@ fn translateInstructions(
             effective.parameter_mask |= @as(u32, 1) << @intCast(ngg_export.target - 0x20);
         }
     }
-    for (instructions) |candidate| {
+    for (program.instructions.items) |candidate| {
         if (candidate.dst.kind == .exec_lo) effective.uses_execution_mask = true;
         if (candidate.opcode == .v_writelane_b32 or candidate.opcode == .v_readlane_b32 or
             candidate.opcode == .v_permlane16_b32 or candidate.opcode == .v_permlanex16_b32 or
@@ -7677,18 +7663,18 @@ fn translateInstructions(
     var builder = try Builder.init(allocator, effective);
     var builder_alive = true;
     defer if (builder_alive) builder.deinit();
-    var graph = try control_flow.buildInstructions(allocator, instructions);
+    var graph = try control_flow.build(allocator, program);
     defer graph.deinit(allocator);
     if (graph.blocks.items.len == 1) {
         try builder.emit(&builder.body, 248, &.{builder.label});
         try builder.initializeStageInputs();
-        for (instructions) |inst| try lowerDiagnosed(&builder, inst);
+        for (program.instructions.items) |inst| try lowerDiagnosed(&builder, inst);
         try builder.emit(&builder.body, 253, &.{});
     } else {
         const structured_result = if (graph.back_edge_count == 0)
-            translateStructured(&builder, instructions, &graph)
+            translateStructured(&builder, program, &graph)
         else
-            translateStructuredLoops(&builder, instructions, &graph);
+            translateStructuredLoops(&builder, program, &graph);
         structured_result catch |err| {
             if (err != Error.UnsupportedControlFlow) return err;
             // Structured lowering may already have created labels before
@@ -7699,7 +7685,7 @@ fn translateInstructions(
             builder_alive = false;
             builder = try Builder.init(allocator, effective);
             builder_alive = true;
-            translateDispatcher(&builder, instructions, &graph) catch |dispatch_err| {
+            translateDispatcher(&builder, program, &graph) catch |dispatch_err| {
                 if (dispatch_err != Error.UnsupportedControlFlow) return dispatch_err;
                 if (!effective.allow_control_flow_fallback) return err;
                 builder.deinit();
@@ -7709,7 +7695,7 @@ fn translateInstructions(
                 builder.used_control_flow_fallback = true;
                 try builder.emit(&builder.body, 248, &.{builder.label});
                 try builder.initializeStageInputs();
-                for (instructions) |inst| {
+                for (program.instructions.items) |inst| {
                     if (inst.opcode.isBranch()) continue;
                     try lowerDiagnosed(&builder, inst);
                 }
@@ -7855,9 +7841,7 @@ test "typed IR pipeline feeds SPIR-V emission" {
     );
     defer module.deinit(std.testing.allocator);
     try std.testing.expectEqual(shader_ir.PipelineStage.legalized, ir_module.stage);
-    try std.testing.expect(ir_module.optimization.constant_folds >= 2);
-    try std.testing.expect(ir_module.optimization.dead_instructions >= 1);
-    try std.testing.expect(!containsOpcode(module.words, 129)); // dead OpFAdd
+    try std.testing.expect(containsOpcode(module.words, 129)); // OpFAdd
 }
 
 test "VOP1 signed I4 interpolation offset converts to fractional float" {
