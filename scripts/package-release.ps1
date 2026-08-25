@@ -4,6 +4,7 @@ param(
     [ValidateSet("ReleaseSafe", "ReleaseFast")]
     [string] $Optimize = "ReleaseFast",
     [switch] $SkipBuild,
+    [string] $BinaryDir = "",
     [string] $CertificateThumbprint = "",
     [string] $TimestampServer = "http://timestamp.digicert.com",
     [string] $InnoCompiler = "",
@@ -33,6 +34,13 @@ if ($prereleaseSeparator -ge 0) {
 }
 $numericVersion = "{0}.{1}.{2}.{3}" -f $versionMajor, $versionMinor, $versionPatch, $versionRevision
 $distRoot = [IO.Path]::GetFullPath((Join-Path $repoRoot "dist"))
+$binaryRoot = if ([string]::IsNullOrWhiteSpace($BinaryDir)) {
+    [IO.Path]::GetFullPath((Join-Path $repoRoot "zig-out\bin"))
+} elseif ([IO.Path]::IsPathRooted($BinaryDir)) {
+    [IO.Path]::GetFullPath($BinaryDir)
+} else {
+    [IO.Path]::GetFullPath((Join-Path $repoRoot $BinaryDir))
+}
 $stageName = "PS5PCEM-$Version-windows-x64-portable"
 $stageRoot = [IO.Path]::GetFullPath((Join-Path $distRoot $stageName))
 
@@ -109,15 +117,15 @@ try {
     New-Item -ItemType Directory -Path $stageRoot | Out-Null
 
     $releaseFiles = @(
-        @{ Source = "zig-out\bin\ps5pcem.exe"; Destination = "ps5pcem.exe" },
-        @{ Source = "zig-out\bin\game-run.exe"; Destination = "game-run.exe" },
+        @{ Source = (Join-Path $binaryRoot "ps5pcem.exe"); Destination = "ps5pcem.exe" },
+        @{ Source = (Join-Path $binaryRoot "game-run.exe"); Destination = "game-run.exe" },
         @{ Source = "README.md"; Destination = "README.md" },
         @{ Source = "LICENSE"; Destination = "LICENSE" },
         @{ Source = "VERSION"; Destination = "VERSION" },
         @{ Source = "assets\branding\ps5pcem-icon-256.png"; Destination = "ps5pcem-icon.png" }
     )
     foreach ($entry in $releaseFiles) {
-        $source = Join-Path $repoRoot $entry.Source
+        $source = if ([IO.Path]::IsPathRooted($entry.Source)) { $entry.Source } else { Join-Path $repoRoot $entry.Source }
         if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
             throw "Required release file is missing: $source"
         }
