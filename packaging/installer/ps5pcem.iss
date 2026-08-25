@@ -62,6 +62,8 @@ Source: "{#SourceDir}\README-PORTABLE.txt"; DestDir: "{app}"; Flags: ignoreversi
 Source: "{#SourceDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\VERSION"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\ps5pcem-icon.png"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\docs\*"; DestDir: "{app}\docs"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceDir}\assets\branding\*"; DestDir: "{app}\assets\branding"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\PS5PCEM"; Filename: "{app}\ps5pcem.exe"; WorkingDir: "{app}"

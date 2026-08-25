@@ -132,6 +132,12 @@ try {
         Copy-Item -LiteralPath $source -Destination (Join-Path $stageRoot $entry.Destination)
     }
 
+    $stageDocs = Join-Path $stageRoot "docs"
+    Copy-Item -LiteralPath (Join-Path $repoRoot "docs") -Destination $stageDocs -Recurse
+    $stageBranding = Join-Path $stageRoot "assets\branding"
+    New-Item -ItemType Directory -Path $stageBranding -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $repoRoot "assets\branding\ps5pcem-icon-256.png") -Destination $stageBranding
+
     $portableReadme = @"
 PS5PCEM $Version - Windows x64 prototype
 
