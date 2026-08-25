@@ -44,7 +44,7 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "GitHub CLI is not authenticated. Run: gh auth login"
     }
-    if ((git status --porcelain).Length -ne 0) {
+    if (@(git status --porcelain).Count -ne 0) {
         throw "The working tree must be clean before publishing."
     }
     if ((git branch --show-current).Trim() -ne "main") {
