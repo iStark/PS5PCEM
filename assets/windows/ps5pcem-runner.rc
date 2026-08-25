@@ -3,8 +3,8 @@
 1 ICON "ps5pcem.ico"
 
 1 VERSIONINFO
-FILEVERSION 0,3,0,1
-PRODUCTVERSION 0,3,0,1
+FILEVERSION 0,3,0,2
+PRODUCTVERSION 0,3,0,2
 FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
 #ifdef _DEBUG
 FILEFLAGS VS_FF_DEBUG
@@ -21,12 +21,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "PS5PCEM Project\0"
             VALUE "FileDescription", "PS5PCEM Game Runner\0"
-            VALUE "FileVersion", "0.3.0-alpha.1\0"
+            VALUE "FileVersion", "0.3.0-alpha.2\0"
             VALUE "InternalName", "game-run\0"
             VALUE "LegalCopyright", "Copyright (C) 2026 Artur Strazewicz\0"
             VALUE "OriginalFilename", "game-run.exe\0"
             VALUE "ProductName", "PS5PCEM\0"
-            VALUE "ProductVersion", "0.3.0-alpha.1\0"
+            VALUE "ProductVersion", "0.3.0-alpha.2\0"
         END
     END
     BLOCK "VarFileInfo"

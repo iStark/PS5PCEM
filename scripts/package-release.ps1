@@ -20,7 +20,18 @@ if ([string]::IsNullOrWhiteSpace($Version)) {
 if ($Version -notmatch '^(?<major>\d+)\.(?<minor>\d+)\.(?<patch>\d+)(?:-[0-9A-Za-z.-]+)?$') {
     throw "Invalid release version: $Version"
 }
-$numericVersion = "{0}.{1}.{2}.1" -f $Matches.major, $Matches.minor, $Matches.patch
+$versionMajor = $Matches.major
+$versionMinor = $Matches.minor
+$versionPatch = $Matches.patch
+$versionRevision = 0
+$prereleaseSeparator = $Version.IndexOf('-')
+if ($prereleaseSeparator -ge 0) {
+    $prerelease = $Version.Substring($prereleaseSeparator + 1)
+    if ($prerelease -match '(?:^|\.)(?<revision>\d+)$') {
+        $versionRevision = [int] $Matches.revision
+    }
+}
+$numericVersion = "{0}.{1}.{2}.{3}" -f $versionMajor, $versionMinor, $versionPatch, $versionRevision
 $distRoot = [IO.Path]::GetFullPath((Join-Path $repoRoot "dist"))
 $stageName = "PS5PCEM-$Version-windows-x64-portable"
 $stageRoot = [IO.Path]::GetFullPath((Join-Path $distRoot $stageName))

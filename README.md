@@ -24,11 +24,13 @@ If you would like to support continued PS5PCEM development, you can do so on
 
 ## Prototype downloads
 
-The first packaged prototype is `0.3.0-alpha.1` for Windows x64:
+The latest packaged prototype is `0.3.0-alpha.2` for Windows x64. It restores
+game cover art by decoding each title's local PNG directly instead of relying on
+Windows file associations and the shell thumbnail cache.
 
-- [Portable ZIP](https://github.com/iStark/PS5PCEM/releases/download/v0.3.0-alpha.1/PS5PCEM-0.3.0-alpha.1-windows-x64-portable.zip)
-- [Per-user installer](https://github.com/iStark/PS5PCEM/releases/download/v0.3.0-alpha.1/PS5PCEM-0.3.0-alpha.1-windows-x64-setup.exe)
-- [SHA-256 checksums](https://github.com/iStark/PS5PCEM/releases/download/v0.3.0-alpha.1/SHA256SUMS.txt)
+- [Portable ZIP](https://github.com/iStark/PS5PCEM/releases/download/v0.3.0-alpha.2/PS5PCEM-0.3.0-alpha.2-windows-x64-portable.zip)
+- [Per-user installer](https://github.com/iStark/PS5PCEM/releases/download/v0.3.0-alpha.2/PS5PCEM-0.3.0-alpha.2-windows-x64-setup.exe)
+- [SHA-256 checksums](https://github.com/iStark/PS5PCEM/releases/download/v0.3.0-alpha.2/SHA256SUMS.txt)
 
 This is an early compatibility build. It includes no games, firmware, keys, or
 console system software.
