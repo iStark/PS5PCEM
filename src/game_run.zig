@@ -43,6 +43,7 @@ fn openSaveDataHome(io: std.Io, content: std.Io.Dir) !std.Io.Dir {
 
 const save_data_home = "savedata";
 const terminator_2d_title_id = "PPSA25872";
+const terminator_audio_latency_ms: u16 = 128;
 
 /// Compatibility stays the global default, while profiles enable only paths
 /// which have passed isolated title A/B and visual runs. Terminator benefits
@@ -408,6 +409,10 @@ fn run(init: std.process.Init) !bool {
 
     const force_headless = init.minimal.environ.containsUnempty(allocator, "PS5_HEADLESS") catch false;
     const show_fps = init.minimal.environ.containsUnempty(allocator, "PS5_SHOW_FPS") catch false;
+    const enable_cpu_wait_diagnostics = init.minimal.environ.containsUnempty(
+        allocator,
+        "PS5_CPU_WAIT_DIAGNOSTICS",
+    ) catch false;
     const enable_vulkan_validation = init.minimal.environ.containsUnempty(allocator, "PS5_VULKAN_VALIDATION") catch false;
     const capture_first_graphics_frame = init.minimal.environ.containsUnempty(allocator, "PS5_CAPTURE_FIRST_FRAME") catch false;
     const trace_graphics_frame: ?u64 = if (init.minimal.environ.getAlloc(allocator, "PS5_TRACE_GRAPHICS_FRAME")) |text| parse: {
@@ -445,6 +450,10 @@ fn run(init: std.process.Init) !bool {
     const enable_image_state_optimization = enable_gpu_experimental or
         (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_IMAGE_STATE_OPT") catch false);
     const use_terminator_gpu_profile = titleUsesTerminatorGpuProfile(title_identifier);
+    runtime.firmware.libs.audio.setHostTargetLatencyMilliseconds(if (use_terminator_gpu_profile)
+        terminator_audio_latency_ms
+    else
+        runtime.firmware.libs.audio.default_host_target_latency_ms);
     const force_synchronous_submits = init.minimal.environ.containsUnempty(
         allocator,
         "PS5_GPU_SYNC_SUBMITS",
@@ -564,6 +573,7 @@ fn run(init: std.process.Init) !bool {
     }
 
     try emu.enableNativeCpuDispatcher(io);
+    emu.setCpuWaitDiagnostics(enable_cpu_wait_diagnostics);
     const prepared = try emu.prepareInitialThread("eboot-main");
     defer emu.releaseInitialThread(prepared.handle) catch {};
 

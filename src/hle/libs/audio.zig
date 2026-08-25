@@ -25,6 +25,8 @@ const audio_fs = @import("../audio_fs.zig");
 const ajm_codec = @import("../ajm_codec.zig");
 const filesystem = @import("../filesystem.zig");
 
+pub const default_host_target_latency_ms = audio_device.default_target_latency_ms;
+
 const audio_out_error_invalid_port: i32 = @bitCast(@as(u32, 0x8026_0003));
 const audio_out_error_invalid_pointer: i32 = @bitCast(@as(u32, 0x8026_0004));
 const audio_out_error_port_full: i32 = @bitCast(@as(u32, 0x8026_0005));
@@ -130,6 +132,14 @@ const LegacyPort = struct {
 var device: audio_device.Device = .{};
 var device_owner: i32 = -1;
 var device_mutex: std.Io.Mutex = .init;
+var host_target_latency_ms = std.atomic.Value(u16).init(audio_device.default_target_latency_ms);
+
+/// Selects the host jitter reserve before a title opens its primary port.
+/// A per-title profile can tolerate measured mixer gaps without imposing that
+/// latency on every other game.
+pub fn setHostTargetLatencyMilliseconds(milliseconds: u16) void {
+    host_target_latency_ms.store(@max(milliseconds, 1), .release);
+}
 
 fn lockDevice() ?std.Io {
     const io = filesystem.attachedIo() orelse return null;
@@ -163,6 +173,7 @@ fn claimDevice(handle: i32, port: LegacyPort) bool {
         .channels = port.channels,
         .format = port.samples,
         .frames = port.frames,
+        .target_latency_ms = host_target_latency_ms.load(.acquire),
     }) catch |err| {
         std.debug.print(
             "[audio] host device open failed handle={d} {d}Hz ch={d} fmt={s} frames={d}: {s}\n",
@@ -172,8 +183,8 @@ fn claimDevice(handle: i32, port: LegacyPort) bool {
     };
     device_owner = handle;
     std.debug.print(
-        "[audio] host device open ok handle={d} {d}Hz ch={d} fmt={s} frames={d}\n",
-        .{ handle, port.frequency, port.channels, @tagName(port.samples), port.frames },
+        "[audio] host device open ok handle={d} {d}Hz ch={d} fmt={s} frames={d} queue={d}\n",
+        .{ handle, port.frequency, port.channels, @tagName(port.samples), port.frames, device.queueCapacity() },
     );
     return true;
 }
@@ -374,12 +385,12 @@ fn fillTestTone(port: LegacyPort, dest: []u8) void {
     audio_test_tone_phase = phase;
 }
 
-fn audioOutOutput(handle: i32, data: ?*const anyopaque) callconv(abi.guest) i32 {
+fn audioOutOutputImpl(handle: i32, data: ?*const anyopaque, fallback_pacing: bool) i32 {
     const port = legacyPort(handle, .output) orelse return audio_out_error_invalid_port;
     // A null buffer is a legal drain/pacing request (and is used by JnG2 when
     // stopping its BGM output thread), not an invalid guest pointer.
     const samples = data orelse {
-        pace(port.frames, port.frequency);
+        if (fallback_pacing) pace(port.frames, port.frequency);
         return errno.ok;
     };
 
@@ -423,7 +434,7 @@ fn audioOutOutput(handle: i32, data: ?*const anyopaque) callconv(abi.guest) i32 
                 }
             }
             const io = lockDevice() orelse {
-                pace(port.frames, port.frequency);
+                if (fallback_pacing) pace(port.frames, port.frequency);
                 return errno.ok;
             };
             const play_result = if (device_owner == handle)
@@ -454,8 +465,12 @@ fn audioOutOutput(handle: i32, data: ?*const anyopaque) callconv(abi.guest) i32 
         }
     }
 
-    pace(port.frames, port.frequency);
+    if (fallback_pacing) pace(port.frames, port.frequency);
     return errno.ok;
+}
+
+fn audioOutOutput(handle: i32, data: ?*const anyopaque) callconv(abi.guest) i32 {
+    return audioOutOutputImpl(handle, data, true);
 }
 
 const AudioOutOutputParam = extern struct {
@@ -475,11 +490,17 @@ fn audioOutOutputs(parameters: ?[*]const AudioOutOutputParam, count: u32) callco
     // Validate the complete batch before submitting its first buffer. A bad
     // later descriptor must not leave the host device with a partial batch.
     var frames: ?u32 = null;
+    var frequency: u32 = 0;
+    var audible_entry: ?AudioOutOutputParam = null;
     for (list[0..count], 0..) |entry, index| {
         const port = legacyPort(entry.handle, .output) orelse return audio_out_error_invalid_port;
         if (frames) |expected| {
             if (port.frames != expected) return audio_out_error_invalid_size;
-        } else frames = port.frames;
+        } else {
+            frames = port.frames;
+            frequency = port.frequency;
+        }
+        if (port.audible) audible_entry = entry;
         for (list[0..index]) |previous| {
             if (previous.handle == entry.handle) return audio_out_error_invalid_port;
         }
@@ -489,15 +510,18 @@ fn audioOutOutputs(parameters: ?[*]const AudioOutOutputParam, count: u32) callco
         }
     }
 
-    for (list[0..count]) |entry| {
-        if (entry.data == 0) {
-            const port = legacyPort(entry.handle, .output) orelse return audio_out_error_invalid_port;
-            pace(port.frames, port.frequency);
-            continue;
-        }
-        const status = audioOutOutput(entry.handle, @ptrFromInt(entry.data));
-        if (status != errno.ok) return status;
+    // All ports in one call describe the same audio quantum. Submitting or
+    // sleeping once is therefore the whole batch contract; pacing every silent
+    // auxiliary port in sequence multiplies 5.3 ms by the port count and drains
+    // the audible queue between otherwise timely mixer calls.
+    if (audible_entry) |entry| {
+        return audioOutOutputImpl(
+            entry.handle,
+            if (entry.data == 0) null else @ptrFromInt(entry.data),
+            true,
+        );
     }
+    pace(frames.?, frequency);
     return errno.ok;
 }
 
@@ -2146,6 +2170,7 @@ pub fn reset() void {
     audio_test_tone_phase = 0;
     audio_test_tone_enabled = null;
     audio_disabled = null;
+    host_target_latency_ms.store(audio_device.default_target_latency_ms, .release);
 }
 
 pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {

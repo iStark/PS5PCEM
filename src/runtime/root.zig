@@ -195,6 +195,11 @@ pub const Runtime = struct {
         self.native_cpu_bridge.deinit();
     }
 
+    /// Keeps high-volume wait diagnostics opt-in for interactive title runs.
+    pub fn setCpuWaitDiagnostics(self: *Runtime, enabled: bool) void {
+        self.cpu_dispatcher.setWaitDiagnostics(enabled);
+    }
+
     /// Live pthreads created by the guest, excluding the process bootstrap.
     pub fn liveGuestThreadCount(self: *Runtime) usize {
         if (!self.initialized) return 0;

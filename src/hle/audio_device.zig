@@ -51,6 +51,9 @@ pub const Config = struct {
     format: SampleFormat,
     /// Samples per channel in one buffer.
     frames: u32,
+    /// Real PCM held before playback begins. Higher values absorb producer
+    /// jitter at the cost of matching host-output latency.
+    target_latency_ms: u16 = default_target_latency_ms,
 
     pub fn bytesPerFrame(self: Config) u32 {
         return @as(u32, self.channels) * self.format.bytes();
@@ -61,14 +64,23 @@ pub const Config = struct {
     }
 };
 
-/// How many buffers are in flight at once.
-///
-/// One is not enough: the device would run dry between the moment it finishes a
-/// buffer and the moment the title hands over the next, which is audible as a
-/// click every buffer. Eight cover about 43 ms at the common 256/48 kHz setup.
-/// That absorbs Windows scheduling jitter and short shader-compilation stalls
-/// without building a perceptible delay behind the picture.
-const queue_depth = 8;
+/// The ordinary profile remains near the old 8 × 256-frame reserve. A measured
+/// title profile can request more without increasing latency for every game.
+pub const default_target_latency_ms: u16 = 42;
+const maximum_queue_depth = 32;
+const adaptive_queue_step = 4;
+
+fn queueDepth(config: Config) usize {
+    const buffer_time_units = @as(u64, config.frames) * std.time.ms_per_s;
+    if (buffer_time_units == 0 or config.frequency == 0) return 2;
+    const target_time_units = @as(u64, @max(config.target_latency_ms, 1)) * config.frequency;
+    const requested = (target_time_units + buffer_time_units - 1) / buffer_time_units;
+    return @intCast(std.math.clamp(requested, 2, maximum_queue_depth));
+}
+
+fn grownQueueDepth(current: usize, prepared: usize) usize {
+    return @min(current +| adaptive_queue_step, prepared);
+}
 
 /// The largest buffer that can be played, as channels x bytes x frames.
 ///
@@ -122,8 +134,16 @@ extern "winmm" fn waveOutUnprepareHeader(handle: ?*anyopaque, header: *WAVEHDR, 
 extern "winmm" fn waveOutWrite(handle: ?*anyopaque, header: *WAVEHDR, size: u32) callconv(.winapi) u32;
 extern "winmm" fn waveOutReset(handle: ?*anyopaque) callconv(.winapi) u32;
 extern "winmm" fn waveOutClose(handle: ?*anyopaque) callconv(.winapi) u32;
+extern "winmm" fn timeBeginPeriod(period_ms: u32) callconv(.winapi) u32;
+extern "winmm" fn timeEndPeriod(period_ms: u32) callconv(.winapi) u32;
 extern "kernel32" fn Sleep(milliseconds: u32) callconv(.winapi) void;
 extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+extern "kernel32" fn GetCurrentThread() callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn SetThreadPriority(thread: ?*anyopaque, priority: i32) callconv(.winapi) i32;
+
+const time_period_ms: u32 = 1;
+const thread_priority_highest: i32 = 2;
+threadlocal var playback_thread_boosted = false;
 
 /// One open sound output.
 ///
@@ -135,19 +155,28 @@ extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
 /// Module scope rather than inside `Device`: they are a third of a megabyte,
 /// and there is one device, so carrying them in a value callers might place on
 /// a stack buys nothing and risks a great deal.
-var buffers: [queue_depth][maximum_buffer_bytes]u8 align(16) = undefined;
+var buffers: [maximum_queue_depth][maximum_buffer_bytes]u8 align(16) = undefined;
 
 pub const Device = struct {
     handle: ?*anyopaque = null,
     config: Config = .{ .frequency = 0, .channels = 0, .format = .signed16, .frames = 0 },
-    headers: [queue_depth]WAVEHDR = @splat(.{ .lpData = null, .dwBufferLength = 0 }),
+    headers: [maximum_queue_depth]WAVEHDR = @splat(.{ .lpData = null, .dwBufferLength = 0 }),
     prepared: usize = 0,
+    active_depth: usize = 0,
     next: usize = 0,
     submitted: u64 = 0,
     underruns: u64 = 0,
+    staged: usize = 0,
+    primed: bool = false,
+    fade_next_buffer: bool = false,
+    precise_timer_active: bool = false,
 
     pub fn isOpen(self: *const Device) bool {
         return self.handle != null;
+    }
+
+    pub fn queueCapacity(self: *const Device) usize {
+        return self.active_depth;
     }
 
     pub fn open(self: *Device, config: Config) Error!void {
@@ -183,11 +212,22 @@ pub const Device = struct {
         self.handle = handle;
         self.config = config;
         self.prepared = 0;
+        self.active_depth = queueDepth(config);
         self.next = 0;
         self.submitted = 0;
         self.underruns = 0;
+        self.staged = 0;
+        self.primed = false;
+        self.fade_next_buffer = false;
+        // `play` polls a completed wave header in one-millisecond slices. On a
+        // host still using the legacy 15.6 ms timer quantum, Sleep(1) can consume
+        // three 256-frame buffers and create the underrun it is waiting to avoid.
+        self.precise_timer_active = timeBeginPeriod(time_period_ms) == mmsyserr_noerror;
 
         const length: u32 = @intCast(config.bufferBytes());
+        // Prepare the bounded maximum once. Inactive headers remain completed,
+        // so an underrun can grow the jitter reserve without reopening the
+        // device or doing driver allocation on the title's mixer thread.
         for (&self.headers, 0..) |*header, index| {
             header.* = .{ .lpData = &buffers[index], .dwBufferLength = length };
             if (waveOutPrepareHeader(handle, header, @sizeOf(WAVEHDR)) != mmsyserr_noerror) {
@@ -213,24 +253,33 @@ pub const Device = struct {
         if (samples.len == 0) return;
         if (comptime !supported) return Error.Unsupported;
 
-        const slot = self.next;
-        const header = &self.headers[slot];
-        var recovering_from_underrun = false;
+        // AudioOut is called by the title's dedicated mixer thread. Keep that
+        // thread runnable when a driver compiler or a burst of Unity workers is
+        // active; the boost does not apply to rendering or general guest work.
+        if (!playback_thread_boosted) {
+            playback_thread_boosted = SetThreadPriority(GetCurrentThread(), thread_priority_highest) != 0;
+        }
 
-        // Once the queue has been primed, finding every header completed means
-        // the host device ran dry between producer calls. Report this separately
-        // from playback errors so renderer/scheduler regressions are visible.
-        if (self.submitted >= queue_depth and self.queuedBufferCount() == 0) {
+        // Once playback has been primed, finding every header completed means
+        // the host device really ran dry between producer calls. Re-enter
+        // pre-roll so recovery has a real jitter reserve instead of repeatedly
+        // feeding one late 5 ms block at a time.
+        if (self.primed and self.queuedBufferCount() == 0) {
             self.underruns +%= 1;
-            recovering_from_underrun = true;
+            self.primed = false;
+            self.staged = 0;
+            self.fade_next_buffer = true;
+            self.active_depth = grownQueueDepth(self.active_depth, self.prepared);
             if (self.underruns <= 3 or std.math.isPowerOfTwo(self.underruns)) {
                 std.debug.print(
-                    "[audio] host underrun #{d} ({d} queued buffers, {d} frames each)\n",
-                    .{ self.underruns, queue_depth, self.config.frames },
+                    "[audio] host underrun #{d} (pre-roll {d}/{d} buffers, {d} frames each)\n",
+                    .{ self.underruns, self.active_depth, self.prepared, self.config.frames },
                 );
             }
         }
 
+        const slot = self.next;
+        const header = &self.headers[slot];
         // A buffer still playing is exactly the back-pressure wanted. Waiting a
         // fraction of a buffer keeps the check cheap without adding a delay of
         // its own.
@@ -241,16 +290,38 @@ pub const Device = struct {
         // fixed at open: a prepared header is pinned to its buffer, and pointing
         // it somewhere else afterwards is not something the device permits.
         @memcpy(buffers[slot][0..samples.len], samples);
-        if (recovering_from_underrun) self.fadeInAfterUnderrun(buffers[slot][0..samples.len]);
-        header.dwBufferLength = @intCast(samples.len);
-        header.dwFlags &= ~header_done;
-        self.next = (slot + 1) % queue_depth;
-
-        if (waveOutWrite(handle, header, @sizeOf(WAVEHDR)) != mmsyserr_noerror) {
-            header.dwFlags |= header_done;
-            return Error.DeviceUnavailable;
+        if (self.fade_next_buffer) {
+            self.fadeInAfterUnderrun(buffers[slot][0..samples.len]);
+            self.fade_next_buffer = false;
         }
+        header.dwBufferLength = @intCast(samples.len);
+        self.next = (slot + 1) % self.active_depth;
+
+        if (!self.primed) {
+            self.staged += 1;
+            if (self.staged < self.active_depth) return;
+
+            const first = (self.next + self.active_depth - self.staged) % self.active_depth;
+            for (0..self.staged) |offset| {
+                const staged_slot = (first + offset) % self.prepared;
+                try self.submitSlot(handle, staged_slot);
+            }
+            self.submitted +%= self.staged;
+            self.staged = 0;
+            self.primed = true;
+            return;
+        }
+
+        try self.submitSlot(handle, slot);
         self.submitted +%= 1;
+    }
+
+    fn submitSlot(self: *Device, handle: ?*anyopaque, slot: usize) Error!void {
+        const header = &self.headers[slot];
+        header.dwFlags &= ~header_done;
+        if (waveOutWrite(handle, header, @sizeOf(WAVEHDR)) == mmsyserr_noerror) return;
+        header.dwFlags |= header_done;
+        return Error.DeviceUnavailable;
     }
 
     fn queuedBufferCount(self: *const Device) usize {
@@ -313,11 +384,17 @@ pub const Device = struct {
                 _ = waveOutUnprepareHeader(handle, header, @sizeOf(WAVEHDR));
             }
             _ = waveOutClose(handle);
+            if (self.precise_timer_active) _ = timeEndPeriod(time_period_ms);
         }
         self.handle = null;
         self.prepared = 0;
+        self.active_depth = 0;
         self.next = 0;
         self.submitted = 0;
+        self.staged = 0;
+        self.primed = false;
+        self.fade_next_buffer = false;
+        self.precise_timer_active = false;
     }
 };
 
@@ -341,6 +418,24 @@ test "a frame is as wide as its channels and sample size" {
     const surround32 = Config{ .frequency = 48000, .channels = 8, .format = .float32, .frames = 256 };
     try testing.expectEqual(@as(u32, 32), surround32.bytesPerFrame());
     try testing.expectEqual(@as(u64, 8192), surround32.bufferBytes());
+}
+
+test "latency target becomes a bounded whole-buffer jitter reserve" {
+    const ordinary = Config{ .frequency = 48_000, .channels = 2, .format = .float32, .frames = 256 };
+    try testing.expectEqual(@as(usize, 8), queueDepth(ordinary));
+
+    var tolerant = ordinary;
+    tolerant.target_latency_ms = 128;
+    try testing.expectEqual(@as(usize, 24), queueDepth(tolerant));
+
+    tolerant.target_latency_ms = std.math.maxInt(u16);
+    try testing.expectEqual(@as(usize, maximum_queue_depth), queueDepth(tolerant));
+}
+
+test "repeated underruns grow only the active jitter reserve" {
+    try testing.expectEqual(@as(usize, 12), grownQueueDepth(8, maximum_queue_depth));
+    try testing.expectEqual(@as(usize, maximum_queue_depth), grownQueueDepth(30, maximum_queue_depth));
+    try testing.expectEqual(@as(usize, maximum_queue_depth), grownQueueDepth(maximum_queue_depth, maximum_queue_depth));
 }
 
 test "a buffer larger than the reserve is declined, not truncated" {
@@ -441,7 +536,7 @@ test "the wait between checks is a fraction of a buffer and never zero" {
 
 test "queued buffer accounting observes completed headers" {
     var device = Device{};
-    device.prepared = queue_depth;
+    device.prepared = 8;
     for (&device.headers) |*header| header.dwFlags = header_done;
     try testing.expectEqual(@as(usize, 0), device.queuedBufferCount());
     device.headers[1].dwFlags &= ~header_done;

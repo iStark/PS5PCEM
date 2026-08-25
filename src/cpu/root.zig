@@ -3113,6 +3113,7 @@ pub const Dispatcher = struct {
     wake_epoch: u32 align(@alignOf(u32)) = 1,
     saturated_keys: bool = false,
     shutting_down: bool = false,
+    wait_diagnostics_enabled: bool = false,
     initialized: bool = false,
 
     /// Initializes a stable, caller-owned dispatcher and attaches its pthread
@@ -3137,6 +3138,13 @@ pub const Dispatcher = struct {
             .initialized = true,
         };
         manager.setBackend(self.backend());
+    }
+
+    /// Enables deliberately noisy scheduler diagnostics for a title run.
+    /// Normal gameplay keeps them off: many parked engine workers can reach a
+    /// diagnostic threshold together and serialize on the host console.
+    pub fn setWaitDiagnostics(self: *Dispatcher, enabled: bool) void {
+        self.wait_diagnostics_enabled = enabled;
     }
 
     /// Stops accepting work, requests every bridge execution to unwind, then
@@ -3436,7 +3444,8 @@ pub const Dispatcher = struct {
         _ = try self.deliverPendingGuestException();
         const current_name_storage = self.manager.currentName();
         const current_name = std.mem.sliceTo(&current_name_storage, 0);
-        const main_long_wait = std.mem.eql(u8, current_name, "eboot-main") and
+        const main_long_wait = self.wait_diagnostics_enabled and
+            std.mem.eql(u8, current_name, "eboot-main") and
             request.absolute_deadline_ns == null and
             (request.timeout_microseconds == null or
                 request.timeout_microseconds.? >= std.time.us_per_s);
@@ -3454,7 +3463,7 @@ pub const Dispatcher = struct {
             );
             printWaitKeyInfo(request.key);
         }
-        if (wait_repeat_diagnostic.observe(request)) {
+        if (self.wait_diagnostics_enabled and wait_repeat_diagnostic.observe(request)) {
             std.debug.print(
                 "[cpu wait] repeated 1000 times key=0x{x} sequence={d} thread=0x{x}/{s} host={d} relative_us={?d} deadline_ns={?d} clock={d}\n",
                 .{
@@ -3492,7 +3501,7 @@ pub const Dispatcher = struct {
         while (true) {
             _ = try self.deliverPendingGuestException();
             wait_attempts +|= 1;
-            if (wait_attempts == 100_000) std.debug.print(
+            if (self.wait_diagnostics_enabled and wait_attempts == 100_000) std.debug.print(
                 "[cpu wait] futex churn key=0x{x} sequence={d} thread=0x{x} relative_us={?d} deadline_ns={?d} clock={d}\n",
                 .{
                     request.key,
@@ -3530,7 +3539,7 @@ pub const Dispatcher = struct {
                 if (monitor_wait) monitored_timeout else timeout,
             );
             if (monitor_wait and wait_attempts == 2) {
-                if (scheduler_watchdog) {
+                if (self.wait_diagnostics_enabled and scheduler_watchdog) {
                     const name_storage = self.manager.currentName();
                     std.debug.print(
                         "[cpu wait] watchdog spurious wake after 10s key=0x{x} sequence={d} thread=0x{x}/{s} host={d} relative_us={?d} deadline_ns={?d} clock={d}\n",
