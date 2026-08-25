@@ -1,5 +1,9 @@
 # PS5PCEM
 
+<p align="center">
+  <img src="assets/branding/ps5pcem-icon-256.png" width="160" height="160" alt="PS5PCEM application icon">
+</p>
+
 PS5PCEM is an experimental PlayStation 5 emulator and interoperability research
 project written in Zig. It can load decrypted PS5 executables, run selected
 x86-64 guest code directly on Windows, execute AGC command streams, translate a
@@ -17,6 +21,17 @@ Vulkan.
 If you would like to support continued PS5PCEM development, you can do so on
 [Boosty](https://boosty.to/ps5pcem) or
 [Patreon](https://www.patreon.com/c/PS5PCEM).
+
+## Prototype downloads
+
+The first packaged prototype is `0.3.0-alpha.1` for Windows x64:
+
+- [Portable ZIP](https://github.com/iStark/PS5PCEM/releases/download/v0.3.0-alpha.1/PS5PCEM-0.3.0-alpha.1-windows-x64-portable.zip)
+- [Per-user installer](https://github.com/iStark/PS5PCEM/releases/download/v0.3.0-alpha.1/PS5PCEM-0.3.0-alpha.1-windows-x64-setup.exe)
+- [SHA-256 checksums](https://github.com/iStark/PS5PCEM/releases/download/v0.3.0-alpha.1/SHA256SUMS.txt)
+
+This is an early compatibility build. It includes no games, firmware, keys, or
+console system software.
 
 ## Current status
 
@@ -769,6 +784,24 @@ zig build -Dtarget=x86_64-macos      -Doptimize=ReleaseFast
 zig build -Dtarget=aarch64-macos     -Doptimize=ReleaseFast
 zig build -Dtarget=x86_64-windows    -Doptimize=ReleaseFast
 ```
+
+Windows release packages use Inno Setup 6. A local unsigned package may be
+built for verification, but the publishing script rejects it:
+
+```powershell
+# Local packaging test only
+.\scripts\package-release.ps1 -AllowUnsigned
+
+# Public package: signs both applications and the installer with SHA-256
+.\scripts\package-release.ps1 -CertificateThumbprint "YOUR_CODE_SIGNING_CERT_THUMBPRINT"
+
+# Push main/tag and create the GitHub prerelease from the verified artifacts
+.\scripts\publish-release.ps1
+```
+
+The portable archive and installer contain only `ps5pcem.exe`, `game-run.exe`,
+documentation, licensing, version, and branding files. Generated settings,
+caches, and savedata are intentionally not packaged.
 
 ## Usage
 

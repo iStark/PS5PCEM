@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Artur Strazewicz
 .{
     .name = .rdna2,
-    .version = "0.3.0",
+    .version = "0.3.0-alpha.1",
     .fingerprint = 0x70cc9aa6f444796,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
