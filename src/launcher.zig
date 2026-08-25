@@ -165,6 +165,7 @@ var medium_font: Win32.Font = null;
 var title_font: Win32.Font = null;
 var small_font: Win32.Font = null;
 var application_icon: Win32.Icon = null;
+var gdiplus_ready = false;
 
 fn tr(phrase: Phrase) []const u8 {
     return switch (language) {
@@ -464,6 +465,14 @@ pub fn main(_: std.process.Init) !void {
     _ = Win32.SetProcessDpiAwarenessContext(Win32.dpi_awareness_per_monitor_v2);
     _ = Win32.CoInitializeEx(null, Win32.coinit_apartment_threaded);
     defer Win32.CoUninitialize();
+
+    var gdiplus_token: usize = 0;
+    const gdiplus_input = Win32.GdiplusStartupInput{};
+    gdiplus_ready = Win32.GdiplusStartup(&gdiplus_token, &gdiplus_input, null) == 0;
+    defer if (gdiplus_ready) {
+        Win32.GdiplusShutdown(gdiplus_token);
+        gdiplus_ready = false;
+    };
 
     initializeIniPath();
     loadSettings();
@@ -1308,27 +1317,25 @@ fn childPath(output: *[1024]u16, folder: []const u16, comptime suffix: []const u
 }
 
 fn loadGameIcon(folder: []const u16) Win32.Bitmap {
+    if (!gdiplus_ready) return null;
     var path: [1024]u16 = @splat(0);
     if (childPath(&path, folder, "\\sce_sys\\icon0.png") == 0) return null;
     if (Win32.GetFileAttributesW(@ptrCast(&path)) == Win32.invalid_file_attributes) return null;
 
-    var factory: ?*Win32.ShellItemImageFactory = null;
-    if (Win32.SHCreateItemFromParsingName(
-        @ptrCast(&path),
-        null,
-        &Win32.iid_shell_item_image_factory,
-        &factory,
-    ) < 0) return null;
-    const image_factory = factory orelse return null;
-    defer _ = image_factory.vtable.release(image_factory);
+    var source: Win32.GdiPlusImage = null;
+    if (Win32.GdipCreateBitmapFromFile(@ptrCast(&path), &source) != 0) return null;
+    const source_image = source orelse return null;
+    defer _ = Win32.GdipDisposeImage(source_image);
 
+    var thumbnail: Win32.GdiPlusImage = null;
+    if (Win32.GdipGetImageThumbnail(source_image, 136, 136, &thumbnail, null, null) != 0) return null;
+    const thumbnail_image = thumbnail orelse return null;
+    defer _ = Win32.GdipDisposeImage(thumbnail_image);
+
+    // The card uses an opaque GDI blit. Flatten transparent PNG pixels against
+    // its background while GDI+ still understands the source alpha channel.
     var bitmap: Win32.Bitmap = null;
-    if (image_factory.vtable.get_image(
-        image_factory,
-        .{ .cx = 136, .cy = 136 },
-        Win32.siigbf_resize_to_fit,
-        &bitmap,
-    ) < 0) return null;
+    if (Win32.GdipCreateHBITMAPFromBitmap(thumbnail_image, &bitmap, 0xff1b1f25) != 0) return null;
     return bitmap;
 }
 
@@ -2003,21 +2010,12 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     const Handle = ?*anyopaque;
 
     const Point = extern struct { x: i32, y: i32 };
-    const Size = extern struct { cx: i32, cy: i32 };
-    const Guid = extern struct {
-        data1: u32,
-        data2: u16,
-        data3: u16,
-        data4: [8]u8,
-    };
-    const ShellItemImageFactory = extern struct {
-        vtable: *const ShellItemImageFactoryVTable,
-    };
-    const ShellItemImageFactoryVTable = extern struct {
-        query_interface: *const anyopaque,
-        add_ref: *const anyopaque,
-        release: *const fn (*ShellItemImageFactory) callconv(.winapi) u32,
-        get_image: *const fn (*ShellItemImageFactory, Size, u32, *Bitmap) callconv(.winapi) i32,
+    const GdiPlusImage = ?*anyopaque;
+    const GdiplusStartupInput = extern struct {
+        version: u32 = 1,
+        debug_event_callback: ?*const anyopaque = null,
+        suppress_background_thread: i32 = 0,
+        suppress_external_codecs: i32 = 0,
     };
     const NativeRect = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
     const Message = extern struct {
@@ -2153,15 +2151,8 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     const invalid_file_attributes: u32 = 0xffff_ffff;
     const create_new_console: u32 = 0x0000_0010;
     const cstr_equal: i32 = 2;
-    const siigbf_resize_to_fit: u32 = 0;
     const halftone: i32 = 4;
     const source_copy: u32 = 0x00cc_0020;
-    const iid_shell_item_image_factory = Guid{
-        .data1 = 0xbcc1_8b79,
-        .data2 = 0xba16,
-        .data3 = 0x442f,
-        .data4 = .{ 0x80, 0xc4, 0x8a, 0x59, 0xc3, 0x0c, 0x46, 0x3b },
-    };
     const dpi_awareness_per_monitor_v2: ?*anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(isize, -4))));
 
     extern "kernel32" fn GetModuleHandleW(name: ?[*:0]const u16) callconv(.winapi) Instance;
@@ -2224,8 +2215,14 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     extern "gdi32" fn SetTextColor(DeviceContext, u32) callconv(.winapi) u32;
     extern "gdi32" fn CreateFontW(i32, i32, i32, i32, i32, u32, u32, u32, u32, u32, u32, u32, u32, [*:0]const u16) callconv(.winapi) Font;
 
+    extern "gdiplus" fn GdiplusStartup(*usize, *const GdiplusStartupInput, ?*anyopaque) callconv(.winapi) i32;
+    extern "gdiplus" fn GdiplusShutdown(usize) callconv(.winapi) void;
+    extern "gdiplus" fn GdipCreateBitmapFromFile([*:0]const u16, *GdiPlusImage) callconv(.winapi) i32;
+    extern "gdiplus" fn GdipGetImageThumbnail(GdiPlusImage, u32, u32, *GdiPlusImage, ?*const anyopaque, ?*anyopaque) callconv(.winapi) i32;
+    extern "gdiplus" fn GdipCreateHBITMAPFromBitmap(GdiPlusImage, *Bitmap, u32) callconv(.winapi) i32;
+    extern "gdiplus" fn GdipDisposeImage(GdiPlusImage) callconv(.winapi) i32;
+
     extern "shell32" fn SHBrowseForFolderW(*BrowseInfoW) callconv(.winapi) ?*anyopaque;
-    extern "shell32" fn SHCreateItemFromParsingName([*:0]const u16, ?*anyopaque, *const Guid, *?*ShellItemImageFactory) callconv(.winapi) i32;
     extern "shell32" fn SHGetPathFromIDListW(?*anyopaque, [*]u16) callconv(.winapi) i32;
     extern "shell32" fn ShellExecuteW(Window, ?[*:0]const u16, [*:0]const u16, ?[*:0]const u16, ?[*:0]const u16, i32) callconv(.winapi) Handle;
     extern "ole32" fn CoInitializeEx(?*anyopaque, u32) callconv(.winapi) i32;

@@ -552,7 +552,7 @@ pub fn build(b: *std.Build) void {
             .file = b.path("assets/windows/ps5pcem-launcher.rc"),
             .include_paths = &.{b.path("assets/windows")},
         });
-        inline for (&.{ "user32", "gdi32", "shell32", "ole32", "dwmapi", "setupapi", "hid" }) |library| {
+        inline for (&.{ "user32", "gdi32", "gdiplus", "shell32", "ole32", "dwmapi", "setupapi", "hid" }) |library| {
             native_launcher.root_module.linkSystemLibrary(library, .{});
         }
         const install_native_launcher = b.addInstallArtifact(native_launcher, .{});
