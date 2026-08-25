@@ -57,10 +57,30 @@ If you would like to support continued PS5PCEM development, you can do so on
   guest-memory round trip. A bound depth allocation becomes a resident
   attachment and can be sampled by a later pass, so guest depth testing,
   depth writes, stencil test/write, and multi-sample depth reach the rasterizer.
+- Vulkan work is submitted asynchronously in ordered batches and retires
+  through a timeline semaphore. Command buffers, descriptor slots, staging
+  ranges, and deferred Vulkan objects carry the timeline tick that owns them;
+  the CPU waits only at a real readback, guest synchronization boundary, or
+  exhausted reusable-resource ring rather than after every draw or dispatch.
+- Guest image allocations share one range-based alias registry across colour
+  and depth targets, storage images, and sampled textures. A GPU write advances
+  the generation of every overlapping representation, including views with a
+  different base address, and dirty writers are materialized before an
+  incompatible alias is rebuilt from guest memory.
+- Runtime shaders now pass through a common typed IR pipeline before SPIR-V:
+  lowering records operands and memory metadata, validation builds basic blocks
+  and reachability, conservative optimization removes safe non-target NOPs,
+  and legalization forms the explicit backend boundary. Compute, fragment, and
+  guest vertex translation all consume that pipeline product.
 - Long-running title execution uses a freeing, thread-safe allocator, and
   aligned Windows direct-memory ranges share 64 KiB section views. Temporary
   uploads/readbacks and 16 KiB guest pages therefore no longer accumulate as
   an ever-growing host commit charge.
+- GPU source caches track those 16 KiB guest pages by generation. Tracked
+  writable pages are armed read-only; the first native CPU store is handled as
+  an invalidation fault, restores the guest protection, and advances the page
+  generation. Unchanged buffers and textures can therefore remain resident
+  without hashing or uploading their complete payload every frame.
 - Graphics and compute queues retain recursively referenced indirect command
   buffers and register lists, so an AGC arena can be recycled while a real
   `WAIT_REG_MEM` continuation remains blocked and later resumes in place.
@@ -305,10 +325,10 @@ Eleven modules cover the independent subsystems and their end-to-end composition
 
 | Module | What it does |
 |---|---|
-| **`memory`** | Reserves and manages fixed guest ranges, sparse mappings, host permissions, and identity-mapped access checks |
-| **`rdna2`** | Decodes and disassembles RDNA2 shader machine code |
+| **`memory`** | Reserves fixed guest ranges, manages sparse mappings and permissions, and tracks 16 KiB GPU-source page generations |
+| **`rdna2`** | Decodes RDNA2 machine code and runs typed IR validation, optimization, legalization, and SPIR-V emission |
 | **`gpu`** | Decodes, snapshots, schedules, and executes the stateful part of submitted GPU command streams |
-| **`vulkan`** | Owns the host Vulkan device, queues, command submission and renderer boundary |
+| **`vulkan`** | Owns the host Vulkan device, timeline-scheduled submissions, image-alias coherency, caches, and renderer boundary |
 | **`window`** | Owns the native host window and its platform message loop |
 | **`input`** | Reads Sony pads over HID, falls back to XInput, polls the host keyboard, and applies launcher remapping profiles |
 | **`loader`** | Reads, maps, and relocates bare ELF64 and decrypted PS5 SELF module images |
@@ -584,9 +604,16 @@ sign extension, source/output modifiers, DPP lane control and row/bank masks.
 terminators, validates that every direct target begins an instruction and emits
 typed branch/fallthrough edges with SCC/VCC/EXEC predicate domains. It discovers
 forward selection merges, derives a dominator hierarchy for nested and shared
-merge regions, and records backward edges separately. `ir.zig` supplies the
-API-neutral typed boundary for ALU, memory, image, interpolation and export
-work. The SPIR-V 1.5 writer translates 32-bit move,
+merge regions, and records backward edges separately. `ir.zig` now owns the
+runtime program passed to a backend instead of serving only as a side analysis.
+Its explicit typed, validated, optimized, and legalized stages retain ALU,
+memory, image, interpolation, export, synchronization, source operands, branch
+targets, side effects, and memory-access metadata. IR validation builds its own
+basic-block successor graph and reachability report; the current conservative
+optimizer removes only non-leader scalar/vector NOPs, preserving every PC and
+branch destination needed by control-flow emission. Compute, fragment, and
+ordinary or fetch-inlined vertex programs all reach the SPIR-V backend through
+this IR boundary. The SPIR-V 1.5 writer translates 32-bit move,
 integer/bitwise/floating-point ALU, SDWA extraction, and the supported DPP/VOP3
 modifiers. The native VOP3 table includes unsigned sum-of-absolute-differences
 (`V_SAD_U32`), lowered exactly as `abs(src0 - src1) + src2`; Rita's Rewind uses
@@ -766,7 +793,7 @@ yourself; `formatInstruction` and `formatProgram` write text to any
 | [src/rdna2/vector_memory.zig](src/rdna2/vector_memory.zig) | Buffer, typed, flat, LDS, image and export decoding |
 | [src/rdna2/decoder.zig](src/rdna2/decoder.zig) | Dispatch, parsing a program to `s_endpgm` |
 | [src/rdna2/control_flow.zig](src/rdna2/control_flow.zig) | Basic blocks and validated CFG edges |
-| [src/rdna2/ir.zig](src/rdna2/ir.zig) | Typed API-neutral shader IR boundary |
+| [src/rdna2/ir.zig](src/rdna2/ir.zig) | Typed nodes, CFG validation, reachability, optimization, and backend legalization |
 | [src/rdna2/spirv.zig](src/rdna2/spirv.zig) | Deterministic SPIR-V 1.5 module writer |
 | [src/rdna2/disasm.zig](src/rdna2/disasm.zig) | Textual output |
 | [src/main.zig](src/main.zig) | Command-line front end |
@@ -799,8 +826,9 @@ set.
 
 1. Validate family/opcode fields against a captured shader corpus and finish
    DPP subgroup lowering, VOP3 modifiers plus the remaining opcode tables.
-2. Natural loops already lower with loop merges. Irreducible CFGs and VCC/EXEC
-   lane predicates now go through the dispatcher rather than a linear skip.
+2. Extend the typed IR with SSA def-use chains, constant propagation, and dead
+   value elimination while retaining the current conservative PC/branch model
+   for irreducible VCC/EXEC control flow.
 3. Extend image lowering to array/mip/MSAA, partial-mask store, compare-gather,
    and image-atomic forms; finish the remaining DS operations, masked/multiple
    exports, and system VGPRs against captured resource and stage metadata.
@@ -1032,7 +1060,7 @@ compute. Validation is requested for debug builds when
 `VK_LAYER_KHRONOS_validation` is installed and otherwise disabled cleanly.
 
 The renderer owns instance/device lifetime, the selected queue, a transient
-command pool with reusable frame command buffers and one completion fence,
+command pool with reusable frame command buffers and one timeline semaphore,
 host/device memory-type selection, one descriptor layout with 64 storage
 buffers, separate 64-entry 2D and 3D combined sampled-image arrays, typed
 storage images, a 256-set descriptor/scalar ring, a persistently mapped 128 MiB
@@ -1051,22 +1079,34 @@ range. Small buffers retain eager visibility. This removes the former
 multi-megabyte upload/readback cycle from every dispatch while keeping cache and
 descriptor-set growth bounded.
 
+Guest-memory cache identity is generation-based when the embedding exposes the
+page tracker. The first GPU observation arms each writable 16 KiB guest page as
+host-read-only. A native guest write fault or checked HLE write restores its
+logical protection and advances the page generation, so a stable buffer or
+texture reuses its resident Vulkan copy without a complete byte hash. Uploads
+verify the generation again after copying; a range modified concurrently is
+accepted only as a snapshot and is not cached as current.
+
 Graphics draws record without a queue wait until a real guest ordering packet,
 compute/readback dependency, or VideoOut flip closes the batch. Each draw binds
 an immutable descriptor set and scalar slice; read-only guest buffers and index
 data receive aligned snapshots in the mapped frame arena. Vulkan objects used
-by recorded commands retire only after the shared fence signals. When the
-256-set ring wraps, the renderer submits the completed prefix before reusing
-its state. This preserves command-processor ordering while avoiding the former
-submit-and-wait cycle on almost every draw.
+by recorded commands carry the batch's retirement tick. A submit signals the
+timeline semaphore once for every command-buffer prefix in that batch; command
+buffers, descriptor sets, storage-image leases, and deferred objects are reused
+only after that tick completes. When a bounded ring fills, the renderer waits
+for its oldest owning tick rather than draining the complete device. This
+preserves command-processor ordering while avoiding the former submit-and-wait
+cycle on almost every draw.
 
 `dcbBackend` adapts checked guest reads and writes plus synchronization,
 draw/dispatch and flip callbacks to [`gpu.executor`](src/gpu/executor.zig)
 without adding a Vulkan dependency to the command processor. A direct compute
 packet resolves `COMPUTE_PGM`, reads
-`COMPUTE_NUM_THREAD_X/Y/Z`, incrementally decodes guest code, translates the
-supported shader to SPIR-V 1.5, creates or reuses its compute pipeline, binds the
-active storage set and dispatches the packet's XYZ group counts. Errors remain
+`COMPUTE_NUM_THREAD_X/Y/Z`, incrementally decodes guest code, lowers it through
+the typed IR validation/optimization/legalization pipeline, emits SPIR-V 1.5,
+creates or reuses its compute pipeline, binds the active storage set and
+dispatches the packet's XYZ group counts. Errors remain
 visible in diagnostics, but missing compute state and selected resource or
 translation gaps skip only that dispatch instead of stopping the complete
 command queue. Before general translation, exact compact AGC UAV-clear kernels
@@ -1097,6 +1137,16 @@ back before a matching sampled-image upload or display read, at `SetFlip`, and
 at CPU-visible PM4 synchronization points. This preserves guest-visible ordering
 while avoiding a full-frame readback after every draw. A half-bound graphics
 program fails explicitly.
+
+[`vulkan.image_alias`](src/vulkan/image_alias.zig) is the common coherency
+registry for colour targets, depth targets, storage images, and uploaded sampled
+images. Every cached representation has a stable token, guest byte range, and
+storage signature. Writes advance a monotonic generation across all overlapping
+ranges, not only exact base-address matches. Sampled cache keys include that
+generation, and fallback staging first publishes dirty overlapping render or
+storage images, preventing two independently created `VkImage`s from silently
+representing different contents of the same guest allocation.
+
 Recovered vertex and fragment SGPR values are read from the mapped scalar buffer
 at draw time instead of becoming SPIR-V constants. Storage-buffer shaders query
 the descriptor's live word count with `OpArrayLength`, so changing streamed
@@ -1140,11 +1190,13 @@ four-result gather, and vertex/fragment 2D texel fetches. Compute
 dimensions, mip chains, compare-gather variants, and the remaining sampling
 operands remain incomplete.
 
-Each draw submission completes through its fence before the executor reaches a
-PM4 synchronization callback. `ACQUIRE_MEM`, `RELEASE_MEM`, `WRITE_DATA`, and
-events consequently do not add a device-idle wait or materialize unrelated
+Draw and dispatch batches continue asynchronously until a PM4 synchronization,
+readback, cache-reuse, or presentation dependency needs their timeline tick.
+`ACQUIRE_MEM`, `RELEASE_MEM`, `WRITE_DATA`, and events consequently wait for
+ordered submitted work without a device-idle drain or materializing unrelated
 render targets and storage buffers. Exact-address consumers publish only the
-resource range they actually need. The executor remains responsible
+resource range they actually need, while image reconstruction additionally
+publishes dirty partial-range aliases. The executor remains responsible
 for deciding whether `WAIT_REG_MEM` is satisfied and preserving its
 continuation. `RELEASE_MEM` immediate 32/64-bit values and clock/counter
 selections publish their exact-width result only after Vulkan work completes;
@@ -1179,9 +1231,10 @@ so machines without a Vulkan runtime can still build and test every module. The
 probe creates a valid compute shader module and pipeline, dispatches it, copies
 known words from coherent host staging through a device-local storage buffer
 into coherent readback memory, inserts the required host/transfer barriers,
-waits on a fence and compares every byte. It then submits synthetic RDNA2
-programs through the real DCB executor. The first program's `s_load_dwordx8`
-fetches two V# descriptors from a guest table, `buffer_load/store_dwordx4`
+waits on the submitted timeline tick and compares every byte. It then submits
+synthetic RDNA2 programs through the real DCB executor. The first program's
+`s_load_dwordx8` fetches two V# descriptors from a guest table,
+`buffer_load/store_dwordx4`
 copies four dwords between descriptor-array elements, subword operations verify
 unsigned and signed extension plus byte/short RMW, and a non-zero
 `idxen+offen` access uses the decoded V# stride. A second four-invocation
@@ -1218,10 +1271,10 @@ $env:PS5_IMAGE_SMOKE_ONLY='1'; zig build vulkan-smoke
 ```
 
 ```text
-Vulkan 1.4.321: NVIDIA GeForce RTX 3070 Ti
+Vulkan 1.4.357: NVIDIA GeForce RTX 3070 Ti
 device API 1.4.329, queue family 0, validation off
 headless smoke passed: 1 compute dispatch, 64 staging bytes copied and verified
-translated RDNA2 passed: 6 dispatches, pipelines 3/3 miss/hit, buffers 6/6 miss/hit
+translated RDNA2 passed: 8 dispatches, pipelines 5/3 miss/hit, buffers 8/6 miss/hit
 graphics DCB probe passed: 1 diagnostic + 3 guest draws, pipelines 3/1 miss/hit
 guest RDNA2 frame passed: 1152 colored pixels in 64x64 RGBA8 target
 sampled image passed: 1 guest texture upload
@@ -1230,11 +1283,9 @@ PM4 synchronization + SetFlip passed: 1 presented frame
 ```
 
 The isolated image command above passes both the NSA storage writeback and
-compute sampled-image checks on the current Vulkan test host. The complete probe
-currently advances through its translated compute
-coverage and then stops later at `InvalidGuestColorTargetWriteback` in the
-synthetic graphics section; that renderer regression is separate from the
-storage-image copy result.
+compute sampled-image checks on the current Vulkan test host. The complete
+probe also passes its translated compute, guest graphics, render-target
+writeback, sampled/storage image, PM4 synchronization, and `SetFlip` coverage.
 
 The explicit window probe exercises the same swapchain sink used by live
 VideoOut and keeps a generated frame visible for two seconds:
