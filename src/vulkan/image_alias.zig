@@ -73,6 +73,23 @@ pub const Entry = struct {
     /// Last content epoch observed by this representation or any overlapping
     /// representation. Cached readers compare this with their upload epoch.
     generation: u64,
+    /// Content epoch physically present in this particular host image.
+    resident_generation: u64,
+    /// Representation that most recently produced the bytes. Token zero means
+    /// guest memory is the canonical source after an explicit writeback.
+    authority: Token,
+};
+
+pub const Resolve = struct {
+    source: Token,
+    destination: Token,
+    generation: u64,
+    direct: bool,
+};
+
+const Newest = struct {
+    generation: u64,
+    authority: Token,
 };
 
 pub const Manager = struct {
@@ -95,13 +112,15 @@ pub const Manager = struct {
         const token = self.next_token;
         self.next_token +%= 1;
         if (self.next_token == 0) self.next_token = 1;
-        const inherited_generation = self.generationForRange(range);
+        const inherited = self.newestForRange(range);
         try self.entries.append(allocator, .{
             .token = token,
             .kind = kind,
             .range = range,
             .signature = signature,
-            .generation = inherited_generation,
+            .generation = inherited.generation,
+            .resident_generation = 0,
+            .authority = inherited.authority,
         });
         return token;
     }
@@ -110,6 +129,13 @@ pub const Manager = struct {
         for (self.entries.items, 0..) |candidate, index| {
             if (candidate.token != token) continue;
             _ = self.entries.swapRemove(index);
+            for (self.entries.items) |*dependent| {
+                if (dependent.authority != token) continue;
+                dependent.authority = self.residentAuthority(
+                    dependent.range,
+                    dependent.generation,
+                );
+            }
             return;
         }
     }
@@ -141,11 +167,29 @@ pub const Manager = struct {
     }
 
     pub fn generationForRange(self: *const Manager, range: Range) u64 {
-        var result: u64 = 0;
+        return self.newestForRange(range).generation;
+    }
+
+    pub fn authorityForRange(self: *const Manager, range: Range) Token {
+        return self.newestForRange(range).authority;
+    }
+
+    fn newestForRange(self: *const Manager, range: Range) Newest {
+        var result = Newest{ .generation = 0, .authority = 0 };
         for (self.entries.items) |candidate| {
-            if (candidate.range.overlaps(range)) result = @max(result, candidate.generation);
+            if (!candidate.range.overlaps(range) or candidate.generation < result.generation) continue;
+            result = .{ .generation = candidate.generation, .authority = candidate.authority };
         }
         return result;
+    }
+
+    fn residentAuthority(self: *const Manager, range: Range, generation: u64) Token {
+        for (self.entries.items) |candidate| {
+            if (candidate.range.overlaps(range) and candidate.resident_generation == generation) {
+                return candidate.token;
+            }
+        }
+        return 0;
     }
 
     /// Makes the writer authoritative and invalidates every overlapping cached
@@ -156,9 +200,50 @@ pub const Manager = struct {
         self.next_generation +%= 1;
         if (self.next_generation == 0) self.next_generation = 1;
         for (self.entries.items) |*candidate| {
-            if (candidate.range.overlaps(writer.range)) candidate.generation = generation;
+            if (!candidate.range.overlaps(writer.range)) continue;
+            candidate.generation = generation;
+            candidate.authority = token;
+            if (candidate.token == token) candidate.resident_generation = generation;
         }
         return generation;
+    }
+
+    /// Records that a representation has imported the current canonical
+    /// content, either by a direct Vulkan copy/resolve or from guest memory.
+    pub fn markSynchronized(self: *Manager, token: Token) bool {
+        for (self.entries.items) |*candidate| {
+            if (candidate.token != token) continue;
+            candidate.resident_generation = candidate.generation;
+            return true;
+        }
+        return false;
+    }
+
+    /// Chooses the cheapest legal synchronization for a stale representation.
+    /// `direct` is true only when source and destination describe exactly the
+    /// same storage; reinterpretations and partial overlaps go through guest
+    /// memory so tiling/format conversion remains explicit.
+    pub fn resolve(self: *const Manager, token: Token) ?Resolve {
+        const destination = self.entry(token) orelse return null;
+        if (destination.resident_generation == destination.generation) return null;
+        const source = self.entry(destination.authority);
+        return .{
+            .source = if (source != null) destination.authority else 0,
+            .destination = token,
+            .generation = destination.generation,
+            .direct = if (source) |canonical|
+                canonical.range.eql(destination.range) and canonical.signature.eql(destination.signature)
+            else
+                false,
+        };
+    }
+
+    /// Makes guest memory an up-to-date canonical backing store for all
+    /// overlapping views without discarding still-resident Vulkan copies.
+    pub fn publishGuest(self: *Manager, range: Range) void {
+        for (self.entries.items) |*candidate| {
+            if (candidate.range.overlaps(range)) candidate.authority = 0;
+        }
     }
 };
 
@@ -235,4 +320,50 @@ test "compatibility requires the same range and storage signature" {
     ));
     manager.unregister(token);
     try std.testing.expect(manager.entry(token) == null);
+}
+
+test "canonical writer produces a direct resolve for compatible storage" {
+    var manager = Manager{};
+    defer manager.deinit(std.testing.allocator);
+    const color = try manager.register(
+        std.testing.allocator,
+        .color_target,
+        .{ .address = 0x9000, .size = 0x4000 },
+        test_signature,
+    );
+    const sampled = try manager.register(
+        std.testing.allocator,
+        .sampled_image,
+        .{ .address = 0x9000, .size = 0x4000 },
+        test_signature,
+    );
+    _ = manager.markWrite(color);
+    const plan = manager.resolve(sampled).?;
+    try std.testing.expectEqual(color, plan.source);
+    try std.testing.expect(plan.direct);
+    try std.testing.expect(manager.markSynchronized(sampled));
+    try std.testing.expect(manager.resolve(sampled) == null);
+}
+
+test "reinterpretation resolves through guest canonical memory" {
+    var manager = Manager{};
+    defer manager.deinit(std.testing.allocator);
+    const writer = try manager.register(
+        std.testing.allocator,
+        .storage_image,
+        .{ .address = 0xa000, .size = 0x4000 },
+        test_signature,
+    );
+    var reinterpreted = test_signature;
+    reinterpreted.format = 44;
+    const sampled = try manager.register(
+        std.testing.allocator,
+        .sampled_image,
+        .{ .address = 0xa000, .size = 0x4000 },
+        reinterpreted,
+    );
+    _ = manager.markWrite(writer);
+    try std.testing.expect(!manager.resolve(sampled).?.direct);
+    manager.publishGuest(.{ .address = 0xa000, .size = 0x4000 });
+    try std.testing.expectEqual(@as(Token, 0), manager.resolve(sampled).?.source);
 }

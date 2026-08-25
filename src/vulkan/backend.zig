@@ -19,6 +19,8 @@ const gpu = @import("gpu");
 const vk = @import("api.zig");
 const detile_spirv = @import("detile_spirv.zig");
 const image_alias = @import("image_alias.zig");
+const image_state = @import("image_state.zig");
+const pipeline_compiler = @import("pipeline_compiler.zig");
 
 /// Set to true to enable verbose per-frame GPU debug logging.
 /// Disable for performance — each print is a blocking I/O syscall.
@@ -920,6 +922,68 @@ const GraphicsPipelineState = extern struct {
     }
 };
 
+const ComputePipelineCompileJob = struct {
+    job: pipeline_compiler.Job = .{ .run = run },
+    renderer: *Renderer,
+    words: []const u32,
+    shader: vk.ShaderModule = 0,
+    pipeline: vk.Pipeline = 0,
+    failure: ?Error = null,
+
+    fn run(base: *pipeline_compiler.Job) void {
+        const work: *@This() = @fieldParentPtr("job", base);
+        work.shader = work.renderer.createShader(work.words) catch |err| {
+            work.failure = err;
+            return;
+        };
+        const stage = vk.PipelineShaderStageCreateInfo{
+            .stage = vk.shader_stage_compute_bit,
+            .module = work.shader,
+            .name = "main",
+        };
+        const info = vk.ComputePipelineCreateInfo{
+            .stage = stage,
+            .layout = work.renderer.compute_pipeline_layout,
+        };
+        if (work.renderer.device_functions.create_compute_pipelines(
+            work.renderer.device,
+            0,
+            1,
+            @ptrCast(&info),
+            null,
+            @ptrCast(&work.pipeline),
+        ) != vk.success) {
+            work.renderer.device_functions.destroy_shader_module(work.renderer.device, work.shader, null);
+            work.shader = 0;
+            work.failure = Error.ComputePipelineCreationFailed;
+        }
+    }
+};
+
+const GraphicsPipelineCompileJob = struct {
+    job: pipeline_compiler.Job = .{ .run = run },
+    renderer: *Renderer,
+    render_pass: vk.RenderPass,
+    state: GraphicsPipelineState,
+    vertex_words: []const u32,
+    fragment_words: []const u32,
+    pipeline: vk.Pipeline = 0,
+    failure: ?Error = null,
+
+    fn run(base: *pipeline_compiler.Job) void {
+        const work: *@This() = @fieldParentPtr("job", base);
+        work.pipeline = work.renderer.createGraphicsPipeline(
+            work.render_pass,
+            work.state,
+            work.vertex_words,
+            work.fragment_words,
+        ) catch |err| {
+            work.failure = err;
+            return;
+        };
+    }
+};
+
 const ColorTargetFormat = struct {
     vulkan: u32,
     bytes_per_texel: u8,
@@ -1102,6 +1166,54 @@ fn depthAttachmentAspect(format: u32) vk.Flags {
         vk.image_aspect_depth_bit;
 }
 
+const DepthTransferPlan = struct {
+    depth_bytes: usize,
+    stencil_offset: usize,
+    stencil_bytes: usize,
+    total_bytes: usize,
+};
+
+fn depthTransferPlan(target: GuestDepthTarget) ?DepthTransferPlan {
+    if (target.samples_log2 != 0) return null;
+    const texels = std.math.mul(usize, target.width, target.height) catch return null;
+    const depth_bpp: usize = switch (target.format) {
+        vk.format_d16_unorm => 2,
+        vk.format_d24_unorm_s8_uint, vk.format_d32_sfloat, vk.format_d32_sfloat_s8_uint => 4,
+        else => return null,
+    };
+    const depth_bytes = std.math.mul(usize, texels, depth_bpp) catch return null;
+    const stencil_offset = std.mem.alignForward(usize, depth_bytes, 4);
+    const stencil_bytes = if (target.has_stencil) texels else 0;
+    const total_bytes = std.math.add(usize, stencil_offset, stencil_bytes) catch return null;
+    if (total_bytes == 0 or total_bytes > maximum_frame_bytes) return null;
+    return .{
+        .depth_bytes = depth_bytes,
+        .stencil_offset = stencil_offset,
+        .stencil_bytes = stencil_bytes,
+        .total_bytes = total_bytes,
+    };
+}
+
+fn expandDepth16To24(source: []const u8, destination: []u8) bool {
+    if (source.len % 2 != 0 or destination.len != source.len * 2) return false;
+    for (0..source.len / 2) |index| {
+        const value = std.mem.readInt(u16, source[index * 2 ..][0..2], .little);
+        const expanded: u32 = @intCast((@as(u64, value) * 0x00ff_ffff + 0x7fff) / 0xffff);
+        std.mem.writeInt(u32, destination[index * 4 ..][0..4], expanded, .little);
+    }
+    return true;
+}
+
+fn compactDepth24To16(source: []const u8, destination: []u8) bool {
+    if (source.len % 4 != 0 or destination.len * 2 != source.len) return false;
+    for (0..source.len / 4) |index| {
+        const value = std.mem.readInt(u32, source[index * 4 ..][0..4], .little) & 0x00ff_ffff;
+        const compact: u16 = @intCast((@as(u64, value) * 0xffff + 0x007f_ffff) / 0x00ff_ffff);
+        std.mem.writeInt(u16, destination[index * 2 ..][0..2], compact, .little);
+    }
+    return true;
+}
+
 fn depthSampledFormatCompatible(depth_format: u32, sampled_format: u32) bool {
     const depth16 = depth_format == vk.format_d16_unorm or depth_format == vk.format_d24_unorm_s8_uint;
     const depth32 = depth_format == vk.format_d32_sfloat or depth_format == vk.format_d32_sfloat_s8_uint;
@@ -1243,8 +1355,11 @@ const CachedRenderTarget = struct {
 /// is still resolved into the base allocations by the metadata path rather
 /// than being handed to the rasterizer.
 const GuestDepthTarget = struct {
+    descriptor: gpu.resources.DepthTarget = std.mem.zeroes(gpu.resources.DepthTarget),
     address: u64,
     allocation_bytes: u64,
+    stencil_address: u64 = 0,
+    stencil_allocation_bytes: u64 = 0,
     width: u32,
     height: u32,
     /// DB_Z_INFO.FORMAT, kept so a re-decode of the same registers matches.
@@ -1261,6 +1376,8 @@ const GuestDepthTarget = struct {
     fn sameAllocation(self: GuestDepthTarget, other: GuestDepthTarget) bool {
         return self.address == other.address and
             self.allocation_bytes == other.allocation_bytes and
+            self.stencil_address == other.stencil_address and
+            self.stencil_allocation_bytes == other.stencil_allocation_bytes and
             self.width == other.width and
             self.height == other.height and
             self.guest_format == other.guest_format and
@@ -1279,21 +1396,20 @@ const GuestDepthTarget = struct {
 
 /// One guest depth allocation kept resident as a Vulkan attachment.
 ///
-/// The image is not staged from guest memory and is never read back. A title
-/// establishes depth by clearing it and then testing against what its own draws
-/// wrote, so the contents only have to be consistent from the first clear
-/// onwards; importing tiled guest depth would add a conversion this path does
-/// not need yet.
 const CachedDepthTarget = struct {
     alias_token: image_alias.Token,
+    stencil_alias_token: ?image_alias.Token = null,
     target: GuestDepthTarget,
     image: OwnedImage,
     view: vk.ImageView,
+    readback: ?OwnedBuffer = null,
     /// False until the image has been transitioned out of `undefined`.
     initialized: bool = false,
     /// Depth written by rasterization may be consumed by a later compute or
     /// fragment pass without first being materialized into guest memory.
     shader_read_layout: bool = false,
+    gpu_generation: u64 = 0,
+    host_generation: u64 = 0,
     last_used_sequence: u64 = 0,
 };
 
@@ -2104,6 +2220,7 @@ pub const Renderer = struct {
     detile_pipeline: vk.Pipeline = 0,
     detile_shader: vk.ShaderModule = 0,
     driver_pipeline_cache: vk.PipelineCache,
+    pipeline_compile_queue: pipeline_compiler.Queue = .{},
     memory_properties: vk.PhysicalDeviceMemoryProperties,
     loader_api_version: u32,
     device_info: DeviceInfo,
@@ -2153,6 +2270,7 @@ pub const Renderer = struct {
     /// Coherency domain shared by all Vulkan image caches. Separately-created
     /// host images which overlap in guest memory observe the same generation.
     image_aliases: image_alias.Manager = .{},
+    image_states: image_state.Tracker = .{},
     sampled_image_cache: std.ArrayList(CachedSampledImage) = .empty,
     storage_image_cache: std.ArrayList(CachedStorageImage) = .empty,
     storage_image_cache_bytes: usize = 0,
@@ -2703,6 +2821,7 @@ pub const Renderer = struct {
     }
 
     pub fn deinit(self: *Renderer) void {
+        self.pipeline_compile_queue.waitIdle();
         self.finishDrawBatch() catch {};
         _ = self.device_functions.device_wait_idle(self.device);
         self.completed_tick = self.submitted_tick;
@@ -2730,6 +2849,7 @@ pub const Renderer = struct {
         }
         self.storage_image_cache.deinit(self.allocator);
         self.image_aliases.deinit(self.allocator);
+        self.image_states.deinit(self.allocator);
         for (self.compute_pipelines.items) |entry| {
             self.device_functions.destroy_pipeline(self.device, entry.pipeline, null);
             self.device_functions.destroy_shader_module(self.device, entry.shader, null);
@@ -4410,41 +4530,11 @@ pub const Renderer = struct {
 
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
-        const source_stage: vk.Flags = if (!snapshot.initialized)
-            vk.pipeline_stage_top_of_pipe_bit
-        else if (snapshot.shader_read_layout)
-            vk.pipeline_stage_vertex_shader_bit | vk.pipeline_stage_fragment_shader_bit | vk.pipeline_stage_compute_shader_bit
-        else
-            vk.pipeline_stage_color_attachment_output_bit;
-        const to_transfer = vk.ImageMemoryBarrier{
-            .source_access_mask = if (!snapshot.initialized)
-                0
-            else if (snapshot.shader_read_layout)
-                vk.access_shader_read_bit
-            else
-                vk.access_color_attachment_read_bit | vk.access_color_attachment_write_bit,
-            .destination_access_mask = vk.access_transfer_write_bit,
-            .old_layout = if (!snapshot.initialized)
-                vk.image_layout_undefined
-            else if (snapshot.shader_read_layout)
-                vk.image_layout_shader_read_only_optimal
-            else
-                vk.image_layout_color_attachment_optimal,
-            .new_layout = vk.image_layout_transfer_dst_optimal,
-            .image = snapshot.image.handle,
-            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-        };
-        self.device_functions.cmd_pipeline_barrier(
+        try self.transitionTrackedImage(
             command_buffer,
-            source_stage,
-            vk.pipeline_stage_transfer_bit,
-            0,
-            0,
-            null,
-            0,
-            null,
-            1,
-            @ptrCast(&to_transfer),
+            snapshot.image.handle,
+            .{ .aspect_mask = vk.image_aspect_color_bit },
+            image_state.transfer_destination_usage,
         );
         var bytes: [4]u8 = undefined;
         std.mem.writeInt(u32, &bytes, packed_value, .little);
@@ -4464,25 +4554,11 @@ pub const Renderer = struct {
             1,
             @ptrCast(&range),
         );
-        const to_attachment = vk.ImageMemoryBarrier{
-            .source_access_mask = vk.access_transfer_write_bit,
-            .destination_access_mask = vk.access_color_attachment_read_bit | vk.access_color_attachment_write_bit,
-            .old_layout = vk.image_layout_transfer_dst_optimal,
-            .new_layout = vk.image_layout_color_attachment_optimal,
-            .image = snapshot.image.handle,
-            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-        };
-        self.device_functions.cmd_pipeline_barrier(
+        try self.transitionTrackedImage(
             command_buffer,
-            vk.pipeline_stage_transfer_bit,
-            vk.pipeline_stage_color_attachment_output_bit,
-            0,
-            0,
-            null,
-            0,
-            null,
-            1,
-            @ptrCast(&to_attachment),
+            snapshot.image.handle,
+            .{ .aspect_mask = vk.image_aspect_color_bit },
+            image_state.color_attachment_usage,
         );
         try self.submitOneShot(command_buffer);
 
@@ -5478,33 +5554,24 @@ pub const Renderer = struct {
 
         const build_started = hostTimestampNs();
         defer self.frame_profile.compute_pipeline_build_ns +|= elapsedHostNanoseconds(build_started);
-        const owned_words = try self.allocator.dupe(u32, words);
+        var work = ComputePipelineCompileJob{
+            .renderer = self,
+            .words = words,
+        };
+        self.pipeline_compile_queue.submit(&work.job);
+        const owned_words = self.allocator.dupe(u32, words) catch |err| {
+            work.job.wait();
+            if (work.pipeline != 0) self.device_functions.destroy_pipeline(self.device, work.pipeline, null);
+            if (work.shader != 0) self.device_functions.destroy_shader_module(self.device, work.shader, null);
+            return err;
+        };
         errdefer self.allocator.free(owned_words);
-        const shader = try self.createShader(words);
-        errdefer self.destroyShaderModule(shader);
-        const stage = vk.PipelineShaderStageCreateInfo{
-            .stage = vk.shader_stage_compute_bit,
-            .module = shader,
-            .name = "main",
-        };
-        const pipeline_info = vk.ComputePipelineCreateInfo{
-            .stage = stage,
-            .layout = self.compute_pipeline_layout,
-        };
-        var pipeline: vk.Pipeline = 0;
-        // Our bounded LRU owns translated-module lifetime.  Avoid mirroring
-        // its evicted tail into the opaque driver cache as scene bootstrap can
-        // still discover thousands of distinct guest kernels.  Application-
-        // level hits remain available through compute_pipelines above.
-        if (self.device_functions.create_compute_pipelines(
-            self.device,
-            0,
-            1,
-            @ptrCast(&pipeline_info),
-            null,
-            @ptrCast(&pipeline),
-        ) != vk.success) return Error.ComputePipelineCreationFailed;
+        work.job.wait();
+        if (work.failure) |failure| return failure;
+        const shader = work.shader;
+        const pipeline = work.pipeline;
         errdefer self.destroyPipeline(pipeline);
+        errdefer self.destroyShaderModule(shader);
         const replacement = ComputePipelineEntry{
             .hash = hash,
             .words = owned_words,
@@ -5822,55 +5889,16 @@ pub const Renderer = struct {
         command_buffer: vk.CommandBuffer,
         depth_index: usize,
         clear_requested: bool,
-    ) void {
+    ) Error!void {
         const cached = &self.depth_targets.items[depth_index];
         const first_use = !cached.initialized;
         const clearing = clear_requested or first_use;
         const range = vk.ImageSubresourceRange{ .aspect_mask = cached.target.aspectMask() };
-
-        const old_layout: u32 = if (first_use)
-            vk.image_layout_undefined
-        else if (cached.shader_read_layout)
-            vk.image_layout_shader_read_only_optimal
-        else
-            vk.image_layout_depth_stencil_attachment_optimal;
-        const target_layout: u32 = if (clearing)
-            vk.image_layout_transfer_dst_optimal
-        else
-            vk.image_layout_depth_stencil_attachment_optimal;
-
-        const to_target = vk.ImageMemoryBarrier{
-            .source_access_mask = if (first_use)
-                0
-            else if (cached.shader_read_layout)
-                vk.access_shader_read_bit
-            else
-                vk.access_depth_stencil_attachment_write_bit,
-            .destination_access_mask = if (clearing)
-                vk.access_transfer_write_bit
-            else
-                vk.access_depth_stencil_attachment_read_bit | vk.access_depth_stencil_attachment_write_bit,
-            .old_layout = old_layout,
-            .new_layout = target_layout,
-            .image = cached.image.handle,
-            .subresource_range = range,
-        };
-        self.device_functions.cmd_pipeline_barrier(
+        try self.transitionTrackedImage(
             command_buffer,
-            if (first_use)
-                vk.pipeline_stage_top_of_pipe_bit
-            else if (cached.shader_read_layout)
-                vk.pipeline_stage_vertex_shader_bit | vk.pipeline_stage_fragment_shader_bit | vk.pipeline_stage_compute_shader_bit
-            else
-                vk.pipeline_stage_late_fragment_tests_bit,
-            if (clearing) vk.pipeline_stage_transfer_bit else vk.pipeline_stage_early_fragment_tests_bit,
-            0,
-            0,
-            null,
-            0,
-            null,
-            1,
-            @ptrCast(&to_target),
+            cached.image.handle,
+            range,
+            if (clearing) image_state.transfer_destination_usage else image_state.depth_attachment_usage,
         );
         cached.initialized = true;
         cached.shader_read_layout = false;
@@ -5888,26 +5916,11 @@ pub const Renderer = struct {
             1,
             @ptrCast(&range),
         );
-        const to_attachment = vk.ImageMemoryBarrier{
-            .source_access_mask = vk.access_transfer_write_bit,
-            .destination_access_mask = vk.access_depth_stencil_attachment_read_bit |
-                vk.access_depth_stencil_attachment_write_bit,
-            .old_layout = vk.image_layout_transfer_dst_optimal,
-            .new_layout = vk.image_layout_depth_stencil_attachment_optimal,
-            .image = cached.image.handle,
-            .subresource_range = range,
-        };
-        self.device_functions.cmd_pipeline_barrier(
+        try self.transitionTrackedImage(
             command_buffer,
-            vk.pipeline_stage_transfer_bit,
-            vk.pipeline_stage_early_fragment_tests_bit,
-            0,
-            0,
-            null,
-            0,
-            null,
-            1,
-            @ptrCast(&to_attachment),
+            cached.image.handle,
+            range,
+            image_state.depth_attachment_usage,
         );
     }
 
@@ -6232,11 +6245,11 @@ pub const Renderer = struct {
         fragment_words: []const u32,
     ) Error!vk.Pipeline {
         const vertex = try self.createShader(vertex_words);
-        defer self.destroyShaderModule(vertex);
+        defer self.device_functions.destroy_shader_module(self.device, vertex, null);
         const fragment = try self.createShader(fragment_words);
-        defer self.destroyShaderModule(fragment);
+        defer self.device_functions.destroy_shader_module(self.device, fragment, null);
         var geometry: vk.ShaderModule = 0;
-        defer if (geometry != 0) self.destroyShaderModule(geometry);
+        defer if (geometry != 0) self.device_functions.destroy_shader_module(self.device, geometry, null);
         if (pipeline_state.rectangle_completion != 0) {
             const geometry_words = buildRectangleListGeometrySpirv(
                 self.allocator,
@@ -6501,12 +6514,37 @@ pub const Renderer = struct {
                 return entry.pipeline;
             }
         }
-        const owned_vertex = try self.allocator.dupe(u32, vertex_words);
-        errdefer self.allocator.free(owned_vertex);
-        const owned_fragment = try self.allocator.dupe(u32, fragment_words);
-        errdefer self.allocator.free(owned_fragment);
         const build_started = hostTimestampNs();
-        const pipeline = try self.createGraphicsPipeline(render_pass, pipeline_state, vertex_words, fragment_words);
+        var work = GraphicsPipelineCompileJob{
+            .renderer = self,
+            .render_pass = render_pass,
+            .state = pipeline_state,
+            .vertex_words = vertex_words,
+            .fragment_words = fragment_words,
+        };
+        const asynchronous = pipeline_state.rectangle_completion == 0;
+        if (asynchronous) self.pipeline_compile_queue.submit(&work.job);
+        const owned_vertex = self.allocator.dupe(u32, vertex_words) catch |err| {
+            if (asynchronous) {
+                work.job.wait();
+                if (work.pipeline != 0) self.device_functions.destroy_pipeline(self.device, work.pipeline, null);
+            }
+            return err;
+        };
+        errdefer self.allocator.free(owned_vertex);
+        const owned_fragment = self.allocator.dupe(u32, fragment_words) catch |err| {
+            if (asynchronous) {
+                work.job.wait();
+                if (work.pipeline != 0) self.device_functions.destroy_pipeline(self.device, work.pipeline, null);
+            }
+            return err;
+        };
+        errdefer self.allocator.free(owned_fragment);
+        const pipeline = if (asynchronous) blk: {
+            work.job.wait();
+            if (work.failure) |failure| return failure;
+            break :blk work.pipeline;
+        } else try self.createGraphicsPipeline(render_pass, pipeline_state, vertex_words, fragment_words);
         self.frame_profile.graphics_pipeline_build_ns +|= elapsedHostNanoseconds(build_started);
         errdefer self.destroyPipeline(pipeline);
         const replacement = GraphicsPipelineEntry{
@@ -6956,6 +6994,53 @@ pub const Renderer = struct {
         return false;
     }
 
+    fn registerTrackedImage(
+        self: *Renderer,
+        image: vk.Image,
+        aspect_mask: vk.Flags,
+        mip_levels: u32,
+        array_layers: u32,
+    ) image_state.Error!void {
+        return self.image_states.registerImage(self.allocator, image, .{
+            .aspect_mask = aspect_mask,
+            .level_count = mip_levels,
+            .layer_count = array_layers,
+        });
+    }
+
+    /// Emits the exact per-aspect/mip/layer barriers required by the tracked
+    /// prior usage. Queue recording is serialized, so committing tracker state
+    /// here mirrors the order in which Vulkan will execute the commands.
+    fn transitionTrackedImage(
+        self: *Renderer,
+        command_buffer: vk.CommandBuffer,
+        image: vk.Image,
+        range: vk.ImageSubresourceRange,
+        usage: image_state.Usage,
+    ) Error!void {
+        var transitions: [256]image_state.Transition = undefined;
+        const count = self.image_states.transition(
+            image,
+            image_state.SubresourceRange.fromVulkan(range),
+            usage,
+            &transitions,
+        ) catch return Error.UnsupportedGraphicsState;
+        for (transitions[0..count]) |*transition| {
+            self.device_functions.cmd_pipeline_barrier(
+                command_buffer,
+                transition.source_stages,
+                transition.destination_stages,
+                0,
+                0,
+                null,
+                0,
+                null,
+                1,
+                @ptrCast(&transition.barrier),
+            );
+        }
+    }
+
     fn createCachedRenderTarget(self: *Renderer, target: GuestColorTarget) anyerror!CachedRenderTarget {
         const frame_bytes = try colorTargetFrameBytes(target);
         const samples = rasterSampleCount(target.descriptor.fragments_log2) orelse
@@ -6976,6 +7061,8 @@ pub const Renderer = struct {
             1,
         );
         errdefer self.destroyImage(image);
+        try self.registerTrackedImage(image.handle, vk.image_aspect_color_bit, 1, 1);
+        errdefer self.image_states.forgetImage(image.handle);
 
         const view_info = vk.ImageViewCreateInfo{
             .image = image.handle,
@@ -7028,6 +7115,7 @@ pub const Renderer = struct {
 
     fn destroyCachedRenderTarget(self: *Renderer, target: CachedRenderTarget) void {
         self.image_aliases.unregister(target.alias_token);
+        self.image_states.forgetImage(target.image.handle);
         self.invalidateColorPasses(target.view);
         self.destroyDepthPass(target.depth_pass);
         self.destroyFramebuffer(target.framebuffer);
@@ -7045,7 +7133,10 @@ pub const Renderer = struct {
 
     fn destroyCachedDepthTarget(self: *Renderer, target: CachedDepthTarget) void {
         self.image_aliases.unregister(target.alias_token);
+        if (target.stencil_alias_token) |token| self.image_aliases.unregister(token);
+        self.image_states.forgetImage(target.image.handle);
         self.destroyImageView(target.view);
+        if (target.readback) |buffer| self.destroyBuffer(buffer);
         self.destroyImage(target.image);
     }
 
@@ -7055,25 +7146,11 @@ pub const Renderer = struct {
         if (!snapshot.initialized or snapshot.shader_read_layout) return;
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
-        const barrier = vk.ImageMemoryBarrier{
-            .source_access_mask = vk.access_color_attachment_write_bit,
-            .destination_access_mask = vk.access_shader_read_bit,
-            .old_layout = vk.image_layout_color_attachment_optimal,
-            .new_layout = vk.image_layout_shader_read_only_optimal,
-            .image = snapshot.image.handle,
-            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-        };
-        self.device_functions.cmd_pipeline_barrier(
+        try self.transitionTrackedImage(
             command_buffer,
-            vk.pipeline_stage_color_attachment_output_bit,
-            vk.pipeline_stage_vertex_shader_bit | vk.pipeline_stage_fragment_shader_bit | vk.pipeline_stage_compute_shader_bit,
-            0,
-            0,
-            null,
-            0,
-            null,
-            1,
-            @ptrCast(&barrier),
+            snapshot.image.handle,
+            .{ .aspect_mask = vk.image_aspect_color_bit },
+            image_state.shader_read_usage,
         );
         try self.submitOneShot(command_buffer);
         self.render_targets.items[index].shader_read_layout = true;
@@ -7085,25 +7162,11 @@ pub const Renderer = struct {
         if (!snapshot.initialized or !snapshot.shader_read_layout) return;
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
-        const barrier = vk.ImageMemoryBarrier{
-            .source_access_mask = vk.access_shader_read_bit,
-            .destination_access_mask = vk.access_color_attachment_read_bit | vk.access_color_attachment_write_bit,
-            .old_layout = vk.image_layout_shader_read_only_optimal,
-            .new_layout = vk.image_layout_color_attachment_optimal,
-            .image = snapshot.image.handle,
-            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-        };
-        self.device_functions.cmd_pipeline_barrier(
+        try self.transitionTrackedImage(
             command_buffer,
-            vk.pipeline_stage_vertex_shader_bit | vk.pipeline_stage_fragment_shader_bit | vk.pipeline_stage_compute_shader_bit,
-            vk.pipeline_stage_color_attachment_output_bit,
-            0,
-            0,
-            null,
-            0,
-            null,
-            1,
-            @ptrCast(&barrier),
+            snapshot.image.handle,
+            .{ .aspect_mask = vk.image_aspect_color_bit },
+            image_state.color_attachment_usage,
         );
         try self.submitOneShot(command_buffer);
         self.render_targets.items[index].shader_read_layout = false;
@@ -7189,25 +7252,11 @@ pub const Renderer = struct {
         if (!snapshot.initialized or snapshot.shader_read_layout) return;
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
-        const barrier = vk.ImageMemoryBarrier{
-            .source_access_mask = vk.access_depth_stencil_attachment_write_bit,
-            .destination_access_mask = vk.access_shader_read_bit,
-            .old_layout = vk.image_layout_depth_stencil_attachment_optimal,
-            .new_layout = vk.image_layout_shader_read_only_optimal,
-            .image = snapshot.image.handle,
-            .subresource_range = .{ .aspect_mask = vk.image_aspect_depth_bit },
-        };
-        self.device_functions.cmd_pipeline_barrier(
+        try self.transitionTrackedImage(
             command_buffer,
-            vk.pipeline_stage_early_fragment_tests_bit | vk.pipeline_stage_late_fragment_tests_bit,
-            vk.pipeline_stage_vertex_shader_bit | vk.pipeline_stage_fragment_shader_bit | vk.pipeline_stage_compute_shader_bit,
-            0,
-            0,
-            null,
-            0,
-            null,
-            1,
-            @ptrCast(&barrier),
+            snapshot.image.handle,
+            .{ .aspect_mask = snapshot.target.aspectMask() },
+            image_state.shader_read_usage,
         );
         try self.submitOneShot(command_buffer);
         self.depth_targets.items[index].shader_read_layout = true;
@@ -7284,9 +7333,23 @@ pub const Renderer = struct {
         else |_|
             fallback_bytes;
         const has_stencil = depthAttachmentHasStencil(format);
+        const stencil_address = if (descriptor.stencil_write_address != 0)
+            descriptor.stencil_write_address
+        else
+            descriptor.stencil_read_address;
+        const stencil_allocation_bytes = if (has_stencil and stencil_address != 0)
+            if (gpu.TextureLayout.fromStencilTarget(descriptor)) |layout|
+                layout.required_source_bytes
+            else |_|
+                0
+        else
+            0;
         return .{
+            .descriptor = descriptor,
             .address = address,
             .allocation_bytes = allocation_bytes,
+            .stencil_address = stencil_address,
+            .stencil_allocation_bytes = stencil_allocation_bytes,
             .width = descriptor.width,
             .height = descriptor.height,
             .guest_format = descriptor.format,
@@ -7312,11 +7375,14 @@ pub const Renderer = struct {
             vk.image_type_2d,
             0,
             target.format,
-            vk.image_usage_depth_stencil_attachment_bit | vk.image_usage_transfer_dst_bit | vk.image_usage_sampled_bit,
+            vk.image_usage_depth_stencil_attachment_bit | vk.image_usage_transfer_src_bit |
+                vk.image_usage_transfer_dst_bit | vk.image_usage_sampled_bit,
             samples,
             1,
         );
         errdefer self.destroyImage(image);
+        try self.registerTrackedImage(image.handle, target.aspectMask(), 1, 1);
+        errdefer self.image_states.forgetImage(image.handle);
 
         const view_info = vk.ImageViewCreateInfo{
             .image = image.handle,
@@ -7328,13 +7394,270 @@ pub const Renderer = struct {
             return Error.ImageViewCreationFailed;
         }
         errdefer self.destroyImageView(view);
+        const readback: ?OwnedBuffer = if (depthTransferPlan(target)) |plan|
+            try self.createBuffer(
+                plan.total_bytes,
+                vk.buffer_usage_transfer_src_bit | vk.buffer_usage_transfer_dst_bit,
+                vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+            )
+        else
+            null;
+        errdefer if (readback) |buffer| self.destroyBuffer(buffer);
         const alias_token = try self.image_aliases.register(
             self.allocator,
             .depth_target,
             aliasRange(target.address, target.allocation_bytes),
             depthTargetAliasSignature(target),
         );
-        return .{ .alias_token = alias_token, .target = target, .image = image, .view = view };
+        errdefer self.image_aliases.unregister(alias_token);
+        const stencil_alias_token = if (target.stencil_address != 0 and target.stencil_allocation_bytes != 0)
+            try self.image_aliases.register(
+                self.allocator,
+                .depth_target,
+                aliasRange(target.stencil_address, target.stencil_allocation_bytes),
+                depthTargetAliasSignature(target),
+            )
+        else
+            null;
+        return .{
+            .alias_token = alias_token,
+            .stencil_alias_token = stencil_alias_token,
+            .target = target,
+            .image = image,
+            .view = view,
+            .readback = readback,
+        };
+    }
+
+    fn depthSubresource(target: GuestDepthTarget, stencil: bool) anyerror!gpu.TextureSubresourceLayout {
+        const texture = if (stencil)
+            try gpu.TextureLayout.fromStencilTarget(target.descriptor)
+        else
+            try gpu.TextureLayout.fromDepthTarget(target.descriptor);
+        return texture.subresource(target.mip_level, 0, 1);
+    }
+
+    /// Imports the guest depth and optional stencil planes into their packed
+    /// Vulkan attachment. Unsupported multisample layouts retain the legacy
+    /// first-use clear path instead of pretending stale host contents are valid.
+    fn importDepthTarget(self: *Renderer, index: usize) anyerror!bool {
+        if (index >= self.depth_targets.items.len) return false;
+        const snapshot = self.depth_targets.items[index];
+        const plan = depthTransferPlan(snapshot.target) orelse return false;
+        const transfer = snapshot.readback orelse return false;
+        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
+        const depth_layout = try depthSubresource(snapshot.target, false);
+        const guest_depth_bytes = std.math.cast(usize, try depth_layout.stagingBytes()) orelse
+            return Error.UnsupportedGraphicsState;
+        var transfer_bytes = try self.allocator.alloc(u8, plan.total_bytes);
+        defer self.allocator.free(transfer_bytes);
+        @memset(transfer_bytes, 0);
+        const guest_depth = try self.allocator.alloc(u8, guest_depth_bytes);
+        defer self.allocator.free(guest_depth);
+        const depth_read_address = if (snapshot.target.descriptor.read_address != 0)
+            snapshot.target.descriptor.read_address
+        else
+            snapshot.target.address;
+        try depth_layout.stage(reader, depth_read_address, guest_depth);
+        if (snapshot.target.format == vk.format_d24_unorm_s8_uint) {
+            if (!expandDepth16To24(guest_depth, transfer_bytes[0..plan.depth_bytes])) {
+                return Error.UnsupportedGraphicsState;
+            }
+        } else {
+            if (guest_depth.len != plan.depth_bytes) return Error.UnsupportedGraphicsState;
+            @memcpy(transfer_bytes[0..plan.depth_bytes], guest_depth);
+        }
+
+        if (snapshot.target.has_stencil) {
+            if (snapshot.target.stencil_address == 0 or plan.stencil_bytes == 0) return false;
+            const stencil_layout = try depthSubresource(snapshot.target, true);
+            const stencil_bytes = std.math.cast(usize, try stencil_layout.stagingBytes()) orelse
+                return Error.UnsupportedGraphicsState;
+            if (stencil_bytes != plan.stencil_bytes) return Error.UnsupportedGraphicsState;
+            try stencil_layout.stage(
+                reader,
+                if (snapshot.target.descriptor.stencil_read_address != 0)
+                    snapshot.target.descriptor.stencil_read_address
+                else
+                    snapshot.target.stencil_address,
+                transfer_bytes[plan.stencil_offset..][0..plan.stencil_bytes],
+            );
+        }
+        try self.writeMapped(transfer, transfer_bytes);
+
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        try self.transitionTrackedImage(
+            command_buffer,
+            snapshot.image.handle,
+            .{ .aspect_mask = snapshot.target.aspectMask() },
+            image_state.transfer_destination_usage,
+        );
+        var copies: [2]vk.BufferImageCopy = undefined;
+        copies[0] = .{
+            .image_subresource = .{ .aspect_mask = vk.image_aspect_depth_bit },
+            .image_extent = .{ .width = snapshot.target.width, .height = snapshot.target.height, .depth = 1 },
+        };
+        var copy_count: u32 = 1;
+        if (snapshot.target.has_stencil) {
+            copies[1] = .{
+                .buffer_offset = plan.stencil_offset,
+                .image_subresource = .{ .aspect_mask = vk.image_aspect_stencil_bit },
+                .image_extent = .{ .width = snapshot.target.width, .height = snapshot.target.height, .depth = 1 },
+            };
+            copy_count = 2;
+        }
+        self.device_functions.cmd_copy_buffer_to_image(
+            command_buffer,
+            transfer.handle,
+            snapshot.image.handle,
+            vk.image_layout_transfer_dst_optimal,
+            copy_count,
+            @ptrCast(&copies),
+        );
+        try self.transitionTrackedImage(
+            command_buffer,
+            snapshot.image.handle,
+            .{ .aspect_mask = snapshot.target.aspectMask() },
+            image_state.depth_attachment_usage,
+        );
+        try self.submitOneShot(command_buffer);
+        const cached = &self.depth_targets.items[index];
+        cached.initialized = true;
+        cached.shader_read_layout = false;
+        _ = self.image_aliases.markSynchronized(cached.alias_token);
+        if (cached.stencil_alias_token) |token| _ = self.image_aliases.markSynchronized(token);
+        self.frame_profile.upload_bytes +|= plan.total_bytes;
+        self.frame_profile.target_upload_bytes +|= plan.total_bytes;
+        return true;
+    }
+
+    fn writeDepthPlane(
+        self: *Renderer,
+        memory: GuestMemory,
+        target: GuestDepthTarget,
+        stencil: bool,
+        linear: []const u8,
+    ) anyerror!void {
+        const layout = try depthSubresource(target, stencil);
+        const allocation_bytes = std.math.cast(usize, layout.required_source_bytes) orelse
+            return Error.UnsupportedGraphicsState;
+        if (allocation_bytes == 0 or allocation_bytes > maximum_frame_bytes) {
+            return Error.UnsupportedGraphicsState;
+        }
+        const allocation = try self.allocator.alloc(u8, allocation_bytes);
+        defer self.allocator.free(allocation);
+        const address = if (stencil) target.stencil_address else target.address;
+        if (address == 0 or !memory.read(memory.context, address, allocation)) {
+            return Error.GuestMemoryReadFailed;
+        }
+        try layout.tile(linear, allocation);
+        if (!memory.write(memory.context, address, allocation)) return Error.GuestMemoryWriteFailed;
+    }
+
+    /// Publishes a resident depth/stencil writer only at a guest-visibility or
+    /// eviction boundary. The attachment remains resident and returns to its
+    /// render layout, matching the colour/storage cache policy.
+    fn materializeDepthTarget(self: *Renderer, index: usize) anyerror!void {
+        if (index >= self.depth_targets.items.len) return;
+        const snapshot = self.depth_targets.items[index];
+        if (!snapshot.initialized or snapshot.gpu_generation == snapshot.host_generation) return;
+        const plan = depthTransferPlan(snapshot.target) orelse return;
+        const transfer = snapshot.readback orelse return;
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        try self.transitionTrackedImage(
+            command_buffer,
+            snapshot.image.handle,
+            .{ .aspect_mask = snapshot.target.aspectMask() },
+            image_state.transfer_source_usage,
+        );
+        var copies: [2]vk.BufferImageCopy = undefined;
+        copies[0] = .{
+            .image_subresource = .{ .aspect_mask = vk.image_aspect_depth_bit },
+            .image_extent = .{ .width = snapshot.target.width, .height = snapshot.target.height, .depth = 1 },
+        };
+        var copy_count: u32 = 1;
+        if (snapshot.target.has_stencil) {
+            copies[1] = .{
+                .buffer_offset = plan.stencil_offset,
+                .image_subresource = .{ .aspect_mask = vk.image_aspect_stencil_bit },
+                .image_extent = .{ .width = snapshot.target.width, .height = snapshot.target.height, .depth = 1 },
+            };
+            copy_count = 2;
+        }
+        self.device_functions.cmd_copy_image_to_buffer(
+            command_buffer,
+            snapshot.image.handle,
+            vk.image_layout_transfer_src_optimal,
+            transfer.handle,
+            copy_count,
+            @ptrCast(&copies),
+        );
+        const host_barrier = vk.BufferMemoryBarrier{
+            .source_access_mask = vk.access_transfer_write_bit,
+            .destination_access_mask = vk.access_host_read_bit,
+            .buffer = transfer.handle,
+            .offset = 0,
+            .size = transfer.size,
+        };
+        self.device_functions.cmd_pipeline_barrier(
+            command_buffer,
+            vk.pipeline_stage_transfer_bit,
+            vk.pipeline_stage_host_bit,
+            0,
+            0,
+            null,
+            1,
+            @ptrCast(&host_barrier),
+            0,
+            null,
+        );
+        try self.transitionTrackedImage(
+            command_buffer,
+            snapshot.image.handle,
+            .{ .aspect_mask = snapshot.target.aspectMask() },
+            image_state.depth_attachment_usage,
+        );
+        try self.submitOneShot(command_buffer);
+
+        const bytes = try self.allocator.alloc(u8, plan.total_bytes);
+        defer self.allocator.free(bytes);
+        try self.readMapped(transfer, bytes);
+        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        const depth_layout = try depthSubresource(snapshot.target, false);
+        const guest_depth_bytes = std.math.cast(usize, try depth_layout.stagingBytes()) orelse
+            return Error.UnsupportedGraphicsState;
+        if (snapshot.target.format == vk.format_d24_unorm_s8_uint) {
+            const guest_depth = try self.allocator.alloc(u8, guest_depth_bytes);
+            defer self.allocator.free(guest_depth);
+            if (!compactDepth24To16(bytes[0..plan.depth_bytes], guest_depth)) {
+                return Error.UnsupportedGraphicsState;
+            }
+            try self.writeDepthPlane(memory, snapshot.target, false, guest_depth);
+        } else {
+            if (guest_depth_bytes != plan.depth_bytes) return Error.UnsupportedGraphicsState;
+            try self.writeDepthPlane(memory, snapshot.target, false, bytes[0..plan.depth_bytes]);
+        }
+        if (snapshot.target.has_stencil and snapshot.target.stencil_address != 0) {
+            try self.writeDepthPlane(
+                memory,
+                snapshot.target,
+                true,
+                bytes[plan.stencil_offset..][0..plan.stencil_bytes],
+            );
+        }
+        const cached = &self.depth_targets.items[index];
+        cached.host_generation = snapshot.gpu_generation;
+        cached.shader_read_layout = false;
+        self.image_aliases.publishGuest(aliasRange(snapshot.target.address, snapshot.target.allocation_bytes));
+        if (snapshot.target.stencil_address != 0) self.image_aliases.publishGuest(aliasRange(
+            snapshot.target.stencil_address,
+            snapshot.target.stencil_allocation_bytes,
+        ));
+        self.frame_profile.readback_bytes +|= plan.total_bytes;
+        self.frame_profile.target_readback_bytes +|= plan.total_bytes;
     }
 
     fn acquireDepthTarget(self: *Renderer, target: GuestDepthTarget) anyerror!usize {
@@ -7357,6 +7680,8 @@ pub const Renderer = struct {
         cached.last_used_sequence = self.depth_target_sequence;
         if (self.depth_targets.items.len < maximum_depth_targets) {
             try self.depth_targets.append(self.allocator, cached);
+            const index = self.depth_targets.items.len - 1;
+            _ = try self.importDepthTarget(index);
             if (!self.reported_depth_attachment) {
                 self.reported_depth_attachment = true;
                 std.debug.print(
@@ -7364,7 +7689,7 @@ pub const Renderer = struct {
                     .{ target.address, target.width, target.height, target.guest_format },
                 );
             }
-            return self.depth_targets.items.len - 1;
+            return index;
         }
 
         // Every draw is fenced before it returns, so the least-recently-used
@@ -7376,10 +7701,12 @@ pub const Renderer = struct {
             oldest_index = index;
             oldest_sequence = entry.last_used_sequence;
         }
+        try self.materializeDepthTarget(oldest_index);
         const victim = &self.depth_targets.items[oldest_index];
         self.invalidateDepthPasses(victim.view);
         self.destroyCachedDepthTarget(victim.*);
         victim.* = cached;
+        _ = try self.importDepthTarget(oldest_index);
         return oldest_index;
     }
 
@@ -7507,34 +7834,11 @@ pub const Renderer = struct {
 
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
-        const to_transfer = vk.ImageMemoryBarrier{
-            .source_access_mask = if (snapshot.shader_read_layout)
-                vk.access_shader_read_bit
-            else
-                vk.access_color_attachment_write_bit,
-            .destination_access_mask = vk.access_transfer_read_bit,
-            .old_layout = if (snapshot.shader_read_layout)
-                vk.image_layout_shader_read_only_optimal
-            else
-                vk.image_layout_color_attachment_optimal,
-            .new_layout = vk.image_layout_transfer_src_optimal,
-            .image = snapshot.image.handle,
-            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-        };
-        self.device_functions.cmd_pipeline_barrier(
+        try self.transitionTrackedImage(
             command_buffer,
-            if (snapshot.shader_read_layout)
-                vk.pipeline_stage_vertex_shader_bit | vk.pipeline_stage_fragment_shader_bit | vk.pipeline_stage_compute_shader_bit
-            else
-                vk.pipeline_stage_color_attachment_output_bit,
-            vk.pipeline_stage_transfer_bit,
-            0,
-            0,
-            null,
-            0,
-            null,
-            1,
-            @ptrCast(&to_transfer),
+            snapshot.image.handle,
+            .{ .aspect_mask = vk.image_aspect_color_bit },
+            image_state.transfer_source_usage,
         );
         const copy = vk.BufferImageCopy{
             .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
@@ -7571,25 +7875,11 @@ pub const Renderer = struct {
             0,
             null,
         );
-        const back_to_attachment = vk.ImageMemoryBarrier{
-            .source_access_mask = vk.access_transfer_read_bit,
-            .destination_access_mask = vk.access_color_attachment_read_bit | vk.access_color_attachment_write_bit,
-            .old_layout = vk.image_layout_transfer_src_optimal,
-            .new_layout = vk.image_layout_color_attachment_optimal,
-            .image = snapshot.image.handle,
-            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-        };
-        self.device_functions.cmd_pipeline_barrier(
+        try self.transitionTrackedImage(
             command_buffer,
-            vk.pipeline_stage_transfer_bit,
-            vk.pipeline_stage_color_attachment_output_bit,
-            0,
-            0,
-            null,
-            0,
-            null,
-            1,
-            @ptrCast(&back_to_attachment),
+            snapshot.image.handle,
+            .{ .aspect_mask = vk.image_aspect_color_bit },
+            image_state.color_attachment_usage,
         );
         try self.submitOneShot(command_buffer);
 
@@ -7698,53 +7988,17 @@ pub const Renderer = struct {
         defer self.releaseOneShot(command_buffer);
         const source_image = self.render_targets.items[source_index].image.handle;
         const destination_image = self.render_targets.items[destination_index].image.handle;
-        const source_from = if (self.render_targets.items[source_index].shader_read_layout)
-            vk.image_layout_shader_read_only_optimal
-        else
-            vk.image_layout_color_attachment_optimal;
-        const destination_from: u32 = if (!self.render_targets.items[destination_index].initialized)
-            vk.image_layout_undefined
-        else if (self.render_targets.items[destination_index].shader_read_layout)
-            vk.image_layout_shader_read_only_optimal
-        else
-            vk.image_layout_color_attachment_optimal;
-        const to_transfer = [2]vk.ImageMemoryBarrier{
-            .{
-                .source_access_mask = if (self.render_targets.items[source_index].shader_read_layout)
-                    vk.access_shader_read_bit
-                else
-                    vk.access_color_attachment_write_bit,
-                .destination_access_mask = vk.access_transfer_read_bit,
-                .old_layout = source_from,
-                .new_layout = vk.image_layout_transfer_src_optimal,
-                .image = source_image,
-                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-            },
-            .{
-                .source_access_mask = if (!self.render_targets.items[destination_index].initialized)
-                    0
-                else if (self.render_targets.items[destination_index].shader_read_layout)
-                    vk.access_shader_read_bit
-                else
-                    vk.access_color_attachment_write_bit,
-                .destination_access_mask = vk.access_transfer_write_bit,
-                .old_layout = destination_from,
-                .new_layout = vk.image_layout_transfer_dst_optimal,
-                .image = destination_image,
-                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-            },
-        };
-        self.device_functions.cmd_pipeline_barrier(
+        try self.transitionTrackedImage(
             command_buffer,
-            vk.pipeline_stage_color_attachment_output_bit | vk.pipeline_stage_fragment_shader_bit,
-            vk.pipeline_stage_transfer_bit,
-            0,
-            0,
-            null,
-            0,
-            null,
-            2,
-            @ptrCast(&to_transfer),
+            source_image,
+            .{ .aspect_mask = vk.image_aspect_color_bit },
+            image_state.transfer_source_usage,
+        );
+        try self.transitionTrackedImage(
+            command_buffer,
+            destination_image,
+            .{ .aspect_mask = vk.image_aspect_color_bit },
+            image_state.transfer_destination_usage,
         );
         const region = vk.ImageResolve{
             .source_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
@@ -7764,37 +8018,17 @@ pub const Renderer = struct {
             1,
             @ptrCast(&region),
         );
-        const to_attachment = [2]vk.ImageMemoryBarrier{
-            .{
-                .source_access_mask = vk.access_transfer_read_bit,
-                .destination_access_mask = vk.access_color_attachment_read_bit |
-                    vk.access_color_attachment_write_bit,
-                .old_layout = vk.image_layout_transfer_src_optimal,
-                .new_layout = vk.image_layout_color_attachment_optimal,
-                .image = source_image,
-                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-            },
-            .{
-                .source_access_mask = vk.access_transfer_write_bit,
-                .destination_access_mask = vk.access_color_attachment_read_bit |
-                    vk.access_color_attachment_write_bit,
-                .old_layout = vk.image_layout_transfer_dst_optimal,
-                .new_layout = vk.image_layout_color_attachment_optimal,
-                .image = destination_image,
-                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-            },
-        };
-        self.device_functions.cmd_pipeline_barrier(
+        try self.transitionTrackedImage(
             command_buffer,
-            vk.pipeline_stage_transfer_bit,
-            vk.pipeline_stage_color_attachment_output_bit | vk.pipeline_stage_fragment_shader_bit,
-            0,
-            0,
-            null,
-            0,
-            null,
-            2,
-            @ptrCast(&to_attachment),
+            source_image,
+            .{ .aspect_mask = vk.image_aspect_color_bit },
+            image_state.color_attachment_usage,
+        );
+        try self.transitionTrackedImage(
+            command_buffer,
+            destination_image,
+            .{ .aspect_mask = vk.image_aspect_color_bit },
+            image_state.color_attachment_usage,
         );
         try self.submitOneShot(command_buffer);
 
@@ -7908,69 +8142,19 @@ pub const Renderer = struct {
         // recording a transfer from the replacement image in the old slot.
         if (!source.initialized or source.image.handle != initial_source.image.handle) return null;
 
-        const source_from: u32 = if (source.shader_read_layout)
-            vk.image_layout_shader_read_only_optimal
-        else
-            vk.image_layout_color_attachment_optimal;
-        const destination_from: u32 = if (!dest.initialized)
-            vk.image_layout_undefined
-        else if (dest.shader_read_layout)
-            vk.image_layout_shader_read_only_optimal
-        else
-            vk.image_layout_color_attachment_optimal;
-        const shader_stages = vk.pipeline_stage_vertex_shader_bit |
-            vk.pipeline_stage_fragment_shader_bit |
-            vk.pipeline_stage_compute_shader_bit;
-        const source_stage: vk.Flags = if (source.shader_read_layout)
-            shader_stages
-        else
-            vk.pipeline_stage_color_attachment_output_bit;
-        const destination_stage: vk.Flags = if (!dest.initialized)
-            vk.pipeline_stage_top_of_pipe_bit
-        else if (dest.shader_read_layout)
-            shader_stages
-        else
-            vk.pipeline_stage_color_attachment_output_bit;
-
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
-        const to_transfer = [2]vk.ImageMemoryBarrier{
-            .{
-                .source_access_mask = if (source.shader_read_layout)
-                    vk.access_shader_read_bit
-                else
-                    vk.access_color_attachment_read_bit | vk.access_color_attachment_write_bit,
-                .destination_access_mask = vk.access_transfer_read_bit,
-                .old_layout = source_from,
-                .new_layout = vk.image_layout_transfer_src_optimal,
-                .image = source.image.handle,
-                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-            },
-            .{
-                .source_access_mask = if (!dest.initialized)
-                    0
-                else if (dest.shader_read_layout)
-                    vk.access_shader_read_bit
-                else
-                    vk.access_color_attachment_read_bit | vk.access_color_attachment_write_bit,
-                .destination_access_mask = vk.access_transfer_write_bit,
-                .old_layout = destination_from,
-                .new_layout = vk.image_layout_transfer_dst_optimal,
-                .image = dest.image.handle,
-                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-            },
-        };
-        self.device_functions.cmd_pipeline_barrier(
+        try self.transitionTrackedImage(
             command_buffer,
-            source_stage | destination_stage,
-            vk.pipeline_stage_transfer_bit,
-            0,
-            0,
-            null,
-            0,
-            null,
-            to_transfer.len,
-            @ptrCast(&to_transfer),
+            source.image.handle,
+            .{ .aspect_mask = vk.image_aspect_color_bit },
+            image_state.transfer_source_usage,
+        );
+        try self.transitionTrackedImage(
+            command_buffer,
+            dest.image.handle,
+            .{ .aspect_mask = vk.image_aspect_color_bit },
+            image_state.transfer_destination_usage,
         );
         const blit = vk.ImageBlit{
             .source_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
@@ -8002,40 +8186,17 @@ pub const Renderer = struct {
             @ptrCast(&blit),
             vk.filter_nearest,
         );
-        const from_transfer = [2]vk.ImageMemoryBarrier{
-            .{
-                .source_access_mask = vk.access_transfer_read_bit,
-                .destination_access_mask = if (source.shader_read_layout)
-                    vk.access_shader_read_bit
-                else
-                    vk.access_color_attachment_read_bit | vk.access_color_attachment_write_bit,
-                .old_layout = vk.image_layout_transfer_src_optimal,
-                .new_layout = source_from,
-                .image = source.image.handle,
-                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-            },
-            .{
-                .source_access_mask = vk.access_transfer_write_bit,
-                .destination_access_mask = vk.access_color_attachment_read_bit |
-                    vk.access_color_attachment_write_bit |
-                    vk.access_shader_read_bit,
-                .old_layout = vk.image_layout_transfer_dst_optimal,
-                .new_layout = vk.image_layout_color_attachment_optimal,
-                .image = dest.image.handle,
-                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-            },
-        };
-        self.device_functions.cmd_pipeline_barrier(
+        try self.transitionTrackedImage(
             command_buffer,
-            vk.pipeline_stage_transfer_bit,
-            source_stage | vk.pipeline_stage_color_attachment_output_bit,
-            0,
-            0,
-            null,
-            0,
-            null,
-            from_transfer.len,
-            @ptrCast(&from_transfer),
+            source.image.handle,
+            .{ .aspect_mask = vk.image_aspect_color_bit },
+            if (source.shader_read_layout) image_state.shader_read_usage else image_state.color_attachment_usage,
+        );
+        try self.transitionTrackedImage(
+            command_buffer,
+            dest.image.handle,
+            .{ .aspect_mask = vk.image_aspect_color_bit },
+            image_state.color_attachment_usage,
         );
         try self.submitOneShot(command_buffer);
 
@@ -8229,25 +8390,11 @@ pub const Renderer = struct {
         defer self.releaseOneShot(command_buffer);
 
         if (initial_upload) |upload| {
-            const to_transfer = vk.ImageMemoryBarrier{
-                .source_access_mask = 0,
-                .destination_access_mask = vk.access_transfer_write_bit,
-                .old_layout = vk.image_layout_undefined,
-                .new_layout = vk.image_layout_transfer_dst_optimal,
-                .image = cached_snapshot.image.handle,
-                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-            };
-            self.device_functions.cmd_pipeline_barrier(
+            try self.transitionTrackedImage(
                 command_buffer,
-                vk.pipeline_stage_top_of_pipe_bit,
-                vk.pipeline_stage_transfer_bit,
-                0,
-                0,
-                null,
-                0,
-                null,
-                1,
-                @ptrCast(&to_transfer),
+                cached_snapshot.image.handle,
+                .{ .aspect_mask = vk.image_aspect_color_bit },
+                image_state.transfer_destination_usage,
             );
             const upload_copy = vk.BufferImageCopy{
                 .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
@@ -8265,72 +8412,29 @@ pub const Renderer = struct {
                 1,
                 @ptrCast(&upload_copy),
             );
-            const to_attachment = vk.ImageMemoryBarrier{
-                .source_access_mask = vk.access_transfer_write_bit,
-                .destination_access_mask = vk.access_color_attachment_read_bit | vk.access_color_attachment_write_bit,
-                .old_layout = vk.image_layout_transfer_dst_optimal,
-                .new_layout = vk.image_layout_color_attachment_optimal,
-                .image = cached_snapshot.image.handle,
-                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-            };
-            self.device_functions.cmd_pipeline_barrier(
+            try self.transitionTrackedImage(
                 command_buffer,
-                vk.pipeline_stage_transfer_bit,
-                vk.pipeline_stage_color_attachment_output_bit,
-                0,
-                0,
-                null,
-                0,
-                null,
-                1,
-                @ptrCast(&to_attachment),
+                cached_snapshot.image.handle,
+                .{ .aspect_mask = vk.image_aspect_color_bit },
+                image_state.color_attachment_usage,
             );
         } else if (!cached_snapshot.initialized) {
-            const to_attachment = vk.ImageMemoryBarrier{
-                .source_access_mask = 0,
-                .destination_access_mask = vk.access_color_attachment_read_bit |
-                    vk.access_color_attachment_write_bit,
-                .old_layout = vk.image_layout_undefined,
-                .new_layout = vk.image_layout_color_attachment_optimal,
-                .image = cached_snapshot.image.handle,
-                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-            };
-            self.device_functions.cmd_pipeline_barrier(
+            try self.transitionTrackedImage(
                 command_buffer,
-                vk.pipeline_stage_top_of_pipe_bit,
-                vk.pipeline_stage_color_attachment_output_bit,
-                0,
-                0,
-                null,
-                0,
-                null,
-                1,
-                @ptrCast(&to_attachment),
+                cached_snapshot.image.handle,
+                .{ .aspect_mask = vk.image_aspect_color_bit },
+                image_state.color_attachment_usage,
             );
         }
 
         for (extra_colors, extra_indices[0..extra_colors.len], extra_uploads[0..extra_colors.len]) |extra, extra_index, extra_upload| {
             const extra_cached = self.render_targets.items[extra_index];
             if (extra_upload) |upload| {
-                const to_transfer = vk.ImageMemoryBarrier{
-                    .source_access_mask = 0,
-                    .destination_access_mask = vk.access_transfer_write_bit,
-                    .old_layout = vk.image_layout_undefined,
-                    .new_layout = vk.image_layout_transfer_dst_optimal,
-                    .image = extra_cached.image.handle,
-                    .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-                };
-                self.device_functions.cmd_pipeline_barrier(
+                try self.transitionTrackedImage(
                     command_buffer,
-                    vk.pipeline_stage_top_of_pipe_bit,
-                    vk.pipeline_stage_transfer_bit,
-                    0,
-                    0,
-                    null,
-                    0,
-                    null,
-                    1,
-                    @ptrCast(&to_transfer),
+                    extra_cached.image.handle,
+                    .{ .aspect_mask = vk.image_aspect_color_bit },
+                    image_state.transfer_destination_usage,
                 );
                 const upload_copy = vk.BufferImageCopy{
                     .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
@@ -8348,54 +8452,24 @@ pub const Renderer = struct {
                     1,
                     @ptrCast(&upload_copy),
                 );
-                const to_attachment = vk.ImageMemoryBarrier{
-                    .source_access_mask = vk.access_transfer_write_bit,
-                    .destination_access_mask = vk.access_color_attachment_read_bit |
-                        vk.access_color_attachment_write_bit,
-                    .old_layout = vk.image_layout_transfer_dst_optimal,
-                    .new_layout = vk.image_layout_color_attachment_optimal,
-                    .image = extra_cached.image.handle,
-                    .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-                };
-                self.device_functions.cmd_pipeline_barrier(
+                try self.transitionTrackedImage(
                     command_buffer,
-                    vk.pipeline_stage_transfer_bit,
-                    vk.pipeline_stage_color_attachment_output_bit,
-                    0,
-                    0,
-                    null,
-                    0,
-                    null,
-                    1,
-                    @ptrCast(&to_attachment),
+                    extra_cached.image.handle,
+                    .{ .aspect_mask = vk.image_aspect_color_bit },
+                    image_state.color_attachment_usage,
                 );
             } else if (!extra_cached.initialized) {
-                const to_attachment = vk.ImageMemoryBarrier{
-                    .source_access_mask = 0,
-                    .destination_access_mask = vk.access_color_attachment_read_bit |
-                        vk.access_color_attachment_write_bit,
-                    .old_layout = vk.image_layout_undefined,
-                    .new_layout = vk.image_layout_color_attachment_optimal,
-                    .image = extra_cached.image.handle,
-                    .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-                };
-                self.device_functions.cmd_pipeline_barrier(
+                try self.transitionTrackedImage(
                     command_buffer,
-                    vk.pipeline_stage_top_of_pipe_bit,
-                    vk.pipeline_stage_color_attachment_output_bit,
-                    0,
-                    0,
-                    null,
-                    0,
-                    null,
-                    1,
-                    @ptrCast(&to_attachment),
+                    extra_cached.image.handle,
+                    .{ .aspect_mask = vk.image_aspect_color_bit },
+                    image_state.color_attachment_usage,
                 );
             }
         }
 
         if (depth_index) |index| {
-            self.prepareDepthAttachment(command_buffer, index, depth_clear_requested);
+            try self.prepareDepthAttachment(command_buffer, index, depth_clear_requested);
         }
         const begin_info = vk.RenderPassBeginInfo{
             .render_pass = pass_handle,
@@ -8471,7 +8545,9 @@ pub const Renderer = struct {
         }
         if (depth_index) |index| {
             const depth_cached = &self.depth_targets.items[index];
+            depth_cached.gpu_generation +%= 1;
             _ = self.image_aliases.markWrite(depth_cached.alias_token);
+            if (depth_cached.stencil_alias_token) |token| _ = self.image_aliases.markWrite(token);
         }
         self.latest_render_target_index = target_index;
         if (report_checkpoints and self.capture_first_graphics_frame) {
@@ -8876,6 +8952,10 @@ pub const Renderer = struct {
         try target.layout.tile(frame, tiled);
         if (!memory.write(memory.context, target.descriptor.address, tiled)) return Error.GuestMemoryWriteFailed;
         try self.commitExpandedCmask(target);
+        self.image_aliases.publishGuest(aliasRange(
+            target.descriptor.address,
+            target.layout.required_source_bytes,
+        ));
         self.guest_color_target_writes += 1;
     }
 
@@ -8983,6 +9063,10 @@ pub const Renderer = struct {
         while (target_index < self.render_targets.items.len) : (target_index += 1) {
             try self.materializeRenderTarget(target_index);
         }
+        var depth_index: usize = 0;
+        while (depth_index < self.depth_targets.items.len) : (depth_index += 1) {
+            try self.materializeDepthTarget(depth_index);
+        }
         for (self.completed_frames.items) |*cached| {
             if (!cached.needs_writeback) continue;
             const target = cached.target orelse continue;
@@ -8999,9 +9083,11 @@ pub const Renderer = struct {
     fn flushAliasedImageWrites(self: *Renderer, address: u64, visible_bytes: usize) anyerror!void {
         const requested = aliasRange(address, visible_bytes);
         if (!requested.valid()) return;
+        const authority = self.image_aliases.authorityForRange(requested);
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
         for (self.storage_image_cache.items, 0..) |cached, index| {
             if (!cached.valid or !cached.gpu_dirty or
+                (authority != 0 and cached.alias_token != authority) or
                 !self.image_aliases.tokenOverlaps(cached.alias_token, requested))
             {
                 continue;
@@ -9010,11 +9096,24 @@ pub const Renderer = struct {
         }
         for (self.render_targets.items, 0..) |cached, index| {
             if (!cached.initialized or cached.gpu_generation == cached.host_generation or
+                (authority != 0 and cached.alias_token != authority) or
                 !self.image_aliases.tokenOverlaps(cached.alias_token, requested))
             {
                 continue;
             }
             try self.materializeRenderTarget(index);
+        }
+        for (self.depth_targets.items, 0..) |cached, index| {
+            if (!cached.initialized or cached.gpu_generation == cached.host_generation) continue;
+            const authoritative = authority == 0 or cached.alias_token == authority or
+                (cached.stencil_alias_token != null and cached.stencil_alias_token.? == authority);
+            if (!authoritative) continue;
+            const depth_overlap = self.image_aliases.tokenOverlaps(cached.alias_token, requested);
+            const stencil_overlap = if (cached.stencil_alias_token) |token|
+                self.image_aliases.tokenOverlaps(token, requested)
+            else
+                false;
+            if (depth_overlap or stencil_overlap) try self.materializeDepthTarget(index);
         }
     }
 
@@ -10801,41 +10900,11 @@ pub const Renderer = struct {
                 @ptrCast(&to_transfer_source),
             );
         }
-        const source_stage: vk.Flags = if (!snapshot.initialized)
-            vk.pipeline_stage_top_of_pipe_bit
-        else if (snapshot.shader_read_layout)
-            vk.pipeline_stage_vertex_shader_bit | vk.pipeline_stage_fragment_shader_bit | vk.pipeline_stage_compute_shader_bit
-        else
-            vk.pipeline_stage_color_attachment_output_bit;
-        const to_transfer = vk.ImageMemoryBarrier{
-            .source_access_mask = if (!snapshot.initialized)
-                0
-            else if (snapshot.shader_read_layout)
-                vk.access_shader_read_bit
-            else
-                vk.access_color_attachment_read_bit | vk.access_color_attachment_write_bit,
-            .destination_access_mask = vk.access_transfer_write_bit,
-            .old_layout = if (!snapshot.initialized)
-                vk.image_layout_undefined
-            else if (snapshot.shader_read_layout)
-                vk.image_layout_shader_read_only_optimal
-            else
-                vk.image_layout_color_attachment_optimal,
-            .new_layout = vk.image_layout_transfer_dst_optimal,
-            .image = snapshot.image.handle,
-            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-        };
-        self.device_functions.cmd_pipeline_barrier(
+        try self.transitionTrackedImage(
             command_buffer,
-            source_stage,
-            vk.pipeline_stage_transfer_bit,
-            0,
-            0,
-            null,
-            0,
-            null,
-            1,
-            @ptrCast(&to_transfer),
+            snapshot.image.handle,
+            .{ .aspect_mask = vk.image_aspect_color_bit },
+            image_state.transfer_destination_usage,
         );
         if (staging) |image| {
             const blit = vk.ImageBlit{
@@ -10882,25 +10951,11 @@ pub const Renderer = struct {
                 @ptrCast(&copy),
             );
         }
-        const to_attachment = vk.ImageMemoryBarrier{
-            .source_access_mask = vk.access_transfer_write_bit,
-            .destination_access_mask = vk.access_color_attachment_read_bit | vk.access_color_attachment_write_bit,
-            .old_layout = vk.image_layout_transfer_dst_optimal,
-            .new_layout = vk.image_layout_color_attachment_optimal,
-            .image = snapshot.image.handle,
-            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-        };
-        self.device_functions.cmd_pipeline_barrier(
+        try self.transitionTrackedImage(
             command_buffer,
-            vk.pipeline_stage_transfer_bit,
-            vk.pipeline_stage_color_attachment_output_bit,
-            0,
-            0,
-            null,
-            0,
-            null,
-            1,
-            @ptrCast(&to_attachment),
+            snapshot.image.handle,
+            .{ .aspect_mask = vk.image_aspect_color_bit },
+            image_state.color_attachment_usage,
         );
         try self.submitOneShot(command_buffer);
 
@@ -11346,6 +11401,7 @@ pub const Renderer = struct {
         const cached = &self.storage_image_cache.items[cache_index];
         if (!cached.valid) return;
         self.image_aliases.unregister(cached.alias_token);
+        self.image_states.forgetImage(cached.image.handle);
         self.destroyImageView(cached.view);
         self.destroyImage(cached.image);
         self.destroyBuffer(cached.transfer);
@@ -11366,25 +11422,11 @@ pub const Renderer = struct {
 
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
-        const to_transfer = vk.ImageMemoryBarrier{
-            .source_access_mask = vk.access_shader_read_bit | vk.access_shader_write_bit,
-            .destination_access_mask = vk.access_transfer_read_bit,
-            .old_layout = vk.image_layout_general,
-            .new_layout = vk.image_layout_transfer_src_optimal,
-            .image = snapshot.image.handle,
-            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-        };
-        self.device_functions.cmd_pipeline_barrier(
+        try self.transitionTrackedImage(
             command_buffer,
-            vk.pipeline_stage_compute_shader_bit,
-            vk.pipeline_stage_transfer_bit,
-            0,
-            0,
-            null,
-            0,
-            null,
-            1,
-            @ptrCast(&to_transfer),
+            snapshot.image.handle,
+            .{ .aspect_mask = vk.image_aspect_color_bit },
+            image_state.transfer_source_usage,
         );
         const copy = vk.BufferImageCopy{
             .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
@@ -11421,25 +11463,11 @@ pub const Renderer = struct {
             0,
             null,
         );
-        const back_to_compute = vk.ImageMemoryBarrier{
-            .source_access_mask = vk.access_transfer_read_bit,
-            .destination_access_mask = vk.access_shader_read_bit | vk.access_shader_write_bit,
-            .old_layout = vk.image_layout_transfer_src_optimal,
-            .new_layout = vk.image_layout_general,
-            .image = snapshot.image.handle,
-            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-        };
-        self.device_functions.cmd_pipeline_barrier(
+        try self.transitionTrackedImage(
             command_buffer,
-            vk.pipeline_stage_transfer_bit,
-            vk.pipeline_stage_compute_shader_bit,
-            0,
-            0,
-            null,
-            0,
-            null,
-            1,
-            @ptrCast(&back_to_compute),
+            snapshot.image.handle,
+            .{ .aspect_mask = vk.image_aspect_color_bit },
+            image_state.storage_usage,
         );
         try self.submitOneShot(command_buffer);
 
@@ -11463,6 +11491,10 @@ pub const Renderer = struct {
         else
             0;
         cached.gpu_dirty = false;
+        self.image_aliases.publishGuest(aliasRange(
+            snapshot.descriptor.address,
+            snapshot.allocation_bytes,
+        ));
         self.frame_profile.readback_bytes +%= snapshot.staging_bytes;
         self.frame_profile.storage_readback_bytes +%= snapshot.staging_bytes;
     }
@@ -11538,28 +11570,11 @@ pub const Renderer = struct {
 
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
-        const upload_barrier = vk.ImageMemoryBarrier{
-            .source_access_mask = if (initial)
-                0
-            else
-                vk.access_shader_read_bit | vk.access_shader_write_bit,
-            .destination_access_mask = vk.access_transfer_write_bit,
-            .old_layout = if (initial) vk.image_layout_undefined else vk.image_layout_general,
-            .new_layout = vk.image_layout_transfer_dst_optimal,
-            .image = snapshot.image.handle,
-            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-        };
-        self.device_functions.cmd_pipeline_barrier(
+        try self.transitionTrackedImage(
             command_buffer,
-            if (initial) vk.pipeline_stage_top_of_pipe_bit else vk.pipeline_stage_compute_shader_bit,
-            vk.pipeline_stage_transfer_bit,
-            0,
-            0,
-            null,
-            0,
-            null,
-            1,
-            @ptrCast(&upload_barrier),
+            snapshot.image.handle,
+            .{ .aspect_mask = vk.image_aspect_color_bit },
+            image_state.transfer_destination_usage,
         );
         const copy = vk.BufferImageCopy{
             .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
@@ -11577,27 +11592,14 @@ pub const Renderer = struct {
             1,
             @ptrCast(&copy),
         );
-        const shader_barrier = vk.ImageMemoryBarrier{
-            .source_access_mask = vk.access_transfer_write_bit,
-            .destination_access_mask = vk.access_shader_read_bit | vk.access_shader_write_bit,
-            .old_layout = vk.image_layout_transfer_dst_optimal,
-            .new_layout = vk.image_layout_general,
-            .image = snapshot.image.handle,
-            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-        };
-        self.device_functions.cmd_pipeline_barrier(
+        try self.transitionTrackedImage(
             command_buffer,
-            vk.pipeline_stage_transfer_bit,
-            vk.pipeline_stage_compute_shader_bit,
-            0,
-            0,
-            null,
-            0,
-            null,
-            1,
-            @ptrCast(&shader_barrier),
+            snapshot.image.handle,
+            .{ .aspect_mask = vk.image_aspect_color_bit },
+            image_state.storage_usage,
         );
         try self.submitOneShot(command_buffer);
+        _ = self.image_aliases.markSynchronized(snapshot.alias_token);
         self.frame_profile.upload_bytes +%= linear.len;
         self.frame_profile.texture_upload_bytes +%= linear.len;
     }
@@ -11777,6 +11779,8 @@ pub const Renderer = struct {
             1,
         );
         errdefer if (!cache_owns_resources) self.destroyImage(image);
+        try self.registerTrackedImage(image.handle, vk.image_aspect_color_bit, 1, 1);
+        errdefer if (!cache_owns_resources) self.image_states.forgetImage(image.handle);
         const view_info = vk.ImageViewCreateInfo{
             .image = image.handle,
             .view_type = if (is_3d) vk.image_view_type_3d else vk.image_view_type_2d,
@@ -12327,32 +12331,20 @@ pub const Renderer = struct {
             mip_levels,
         );
         errdefer self.destroyImage(image);
+        try self.registerTrackedImage(image.handle, vk.image_aspect_color_bit, mip_levels, upload_layers);
+        errdefer self.image_states.forgetImage(image.handle);
 
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
-        const upload_barrier = vk.ImageMemoryBarrier{
-            .source_access_mask = 0,
-            .destination_access_mask = vk.access_transfer_write_bit,
-            .old_layout = vk.image_layout_undefined,
-            .new_layout = vk.image_layout_transfer_dst_optimal,
-            .image = image.handle,
-            .subresource_range = .{
+        try self.transitionTrackedImage(
+            command_buffer,
+            image.handle,
+            .{
                 .aspect_mask = vk.image_aspect_color_bit,
                 .level_count = mip_levels,
                 .layer_count = upload_layers,
             },
-        };
-        self.device_functions.cmd_pipeline_barrier(
-            command_buffer,
-            vk.pipeline_stage_top_of_pipe_bit,
-            vk.pipeline_stage_transfer_bit,
-            0,
-            0,
-            null,
-            0,
-            null,
-            1,
-            @ptrCast(&upload_barrier),
+            image_state.transfer_destination_usage,
         );
         var copies: [16]vk.BufferImageCopy = undefined;
         var copy_count: u32 = 0;
@@ -12400,29 +12392,15 @@ pub const Renderer = struct {
             copy_count,
             @ptrCast(&copies),
         );
-        const shader_barrier = vk.ImageMemoryBarrier{
-            .source_access_mask = vk.access_transfer_write_bit,
-            .destination_access_mask = vk.access_shader_read_bit,
-            .old_layout = vk.image_layout_transfer_dst_optimal,
-            .new_layout = vk.image_layout_shader_read_only_optimal,
-            .image = image.handle,
-            .subresource_range = .{
+        try self.transitionTrackedImage(
+            command_buffer,
+            image.handle,
+            .{
                 .aspect_mask = vk.image_aspect_color_bit,
                 .level_count = mip_levels,
                 .layer_count = upload_layers,
             },
-        };
-        self.device_functions.cmd_pipeline_barrier(
-            command_buffer,
-            vk.pipeline_stage_transfer_bit,
-            vk.pipeline_stage_vertex_shader_bit | vk.pipeline_stage_fragment_shader_bit | vk.pipeline_stage_compute_shader_bit,
-            0,
-            0,
-            null,
-            0,
-            null,
-            1,
-            @ptrCast(&shader_barrier),
+            image_state.shader_read_usage,
         );
         try self.submitOneShot(command_buffer);
         self.frame_profile.upload_bytes +%= byte_count;
@@ -12477,6 +12455,7 @@ pub const Renderer = struct {
             }
             self.destroyImageView(stale.view);
             self.destroySampler(stale.sampler);
+            self.image_states.forgetImage(stale.image.handle);
             self.destroyImage(stale.image);
             self.image_aliases.unregister(stale.alias_token);
             _ = self.sampled_image_cache.orderedRemove(stale_index);
@@ -12495,6 +12474,7 @@ pub const Renderer = struct {
             const evicted = self.sampled_image_cache.items[oldest_idx];
             self.destroyImageView(evicted.view);
             self.destroySampler(evicted.sampler);
+            self.image_states.forgetImage(evicted.image.handle);
             self.destroyImage(evicted.image);
             self.image_aliases.unregister(evicted.alias_token);
             _ = self.sampled_image_cache.orderedRemove(oldest_idx);
@@ -12507,6 +12487,7 @@ pub const Renderer = struct {
             descriptorAliasSignature(descriptor, image_format, @intCast(mip_levels)),
         );
         errdefer self.image_aliases.unregister(alias_token);
+        _ = self.image_aliases.markSynchronized(alias_token);
         try self.sampled_image_cache.append(self.allocator, .{
             .alias_token = alias_token,
             .guest_address = descriptor.address,
@@ -19327,6 +19308,38 @@ test "a depth attachment keeps its sample count and packed stencil format" {
     read_only.read_address = 0x3000;
     const fallback = Renderer.guestDepthTarget(read_only) orelse return error.TestFailed;
     try std.testing.expectEqual(@as(u64, 0x3000), fallback.address);
+}
+
+test "D16 guest depth round-trips through packed D24 transfer words" {
+    const guest = [_]u8{ 0, 0, 0, 0x80, 0xff, 0xff };
+    var transfer_words: [12]u8 = undefined;
+    try std.testing.expect(expandDepth16To24(&guest, &transfer_words));
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, transfer_words[0..4], .little));
+    try std.testing.expectEqual(@as(u32, 0x00ff_ffff), std.mem.readInt(u32, transfer_words[8..12], .little));
+    var restored: [6]u8 = undefined;
+    try std.testing.expect(compactDepth24To16(&transfer_words, &restored));
+    try std.testing.expectEqualSlices(u8, &guest, &restored);
+}
+
+test "depth transfer plan separates and aligns a stencil plane" {
+    const target = GuestDepthTarget{
+        .address = 0x1000,
+        .allocation_bytes = 64,
+        .width = 3,
+        .height = 2,
+        .guest_format = 1,
+        .format = vk.format_d24_unorm_s8_uint,
+        .tile_mode = .linear,
+        .base_array_slice = 0,
+        .mip_level = 0,
+        .has_stencil = true,
+        .clear_depth = 1,
+    };
+    const plan = depthTransferPlan(target).?;
+    try std.testing.expectEqual(@as(usize, 24), plan.depth_bytes);
+    try std.testing.expectEqual(@as(usize, 24), plan.stencil_offset);
+    try std.testing.expectEqual(@as(usize, 6), plan.stencil_bytes);
+    try std.testing.expectEqual(@as(usize, 30), plan.total_bytes);
 }
 
 test "frame upload ring aligns snapshots and rejects overflow" {
