@@ -35,6 +35,14 @@ Windows file associations and the shell thumbnail cache.
 This is an early compatibility build. It includes no games, firmware, keys, or
 console system software.
 
+## Launcher preview
+
+<p align="center">
+  <img src="docs/images/launcher-library.png" alt="PS5PCEM launcher showing the recent-game library">
+</p>
+
+<p align="center"><em>Game content and artwork are loaded from the user's local files and are not included with PS5PCEM.</em></p>
+
 ## Current status
 
 - Native guest execution is available on Windows x86-64; inspection, decoding,
