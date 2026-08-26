@@ -458,20 +458,20 @@ fn run(init: std.process.Init) !bool {
         allocator,
         "PS5_GPU_SYNC_SUBMITS",
     ) catch false;
-    const enable_title_timeline_scheduler = use_terminator_gpu_profile and
-        !force_synchronous_submits;
-    const enable_timeline_scheduler = !force_synchronous_submits and
-        (enable_gpu_experimental or enable_title_timeline_scheduler or
-            (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_TIMELINE_SCHEDULER") catch false));
+    // Keep independent GPU batches in flight by default. Guest-visible
+    // RELEASE/WAIT packets still synchronize explicitly; this only removes
+    // unconditional host waits between otherwise ordered Vulkan submissions.
+    const enable_timeline_scheduler = !force_synchronous_submits;
+    const enable_automatic_timeline_scheduler = enable_timeline_scheduler;
     const force_eager_storage_writes = init.minimal.environ.containsUnempty(
         allocator,
         "PS5_GPU_EAGER_STORAGE_WRITES",
     ) catch false;
-    const enable_title_deferred_storage_writes = use_terminator_gpu_profile and
-        !force_eager_storage_writes;
-    const defer_small_storage_writes = !force_eager_storage_writes and
-        (enable_gpu_experimental or enable_title_deferred_storage_writes or
-            (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_DEFER_STORAGE_WRITES") catch false));
+    // Small compute outputs stay resident until an exact guest-memory consumer
+    // requests them. The read path already materializes matching ranges; eager
+    // writeback otherwise forces one submit/fence/readback for every dispatch.
+    const defer_small_storage_writes = !force_eager_storage_writes;
+    const enable_automatic_deferred_storage_writes = defer_small_storage_writes;
     const enable_gpu_page_tracker = enable_gpu_experimental or
         (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_PAGE_TRACKER") catch false);
     if (builtin.os.tag == .windows and !force_headless) live_gpu: {
@@ -564,9 +564,9 @@ fn run(init: std.process.Init) !bool {
                 @intFromBool(enable_depth_transfer),
                 @intFromBool(enable_image_state_optimization),
                 @intFromBool(enable_timeline_scheduler),
-                @intFromBool(enable_title_timeline_scheduler),
+                @intFromBool(enable_automatic_timeline_scheduler),
                 @intFromBool(defer_small_storage_writes),
-                @intFromBool(enable_title_deferred_storage_writes),
+                @intFromBool(enable_automatic_deferred_storage_writes),
                 @intFromBool(enable_gpu_page_tracker),
             },
         );

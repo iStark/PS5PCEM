@@ -665,9 +665,10 @@ const dynamic_scalar_buffer_bytes = dynamic_scalar_buffer_words * @sizeOf(u32);
 /// Descriptor contents are consumed when the queued command executes, not
 /// when it is recorded. Give every graphics draw its own set and scalar slice
 /// so a later draw can prepare state while the earlier commands remain queued.
-/// Larger frames are split only when this ring wraps; Asterix fits in one pass,
-/// while draw-heavy titles still reduce hundreds of waits to a few batches.
-const maximum_frame_descriptor_sets = 256;
+/// Larger frames are split only when this ring wraps. Keep enough slots for
+/// draw-heavy 2D titles such as Jets 'n' Guns 2, which regularly exceeds 256
+/// draws in one guest frame.
+const maximum_frame_descriptor_sets = 512;
 const descriptor_scalar_stride = std.mem.alignForward(usize, dynamic_scalar_buffer_bytes, 256);
 const descriptor_scalar_ring_bytes = descriptor_scalar_stride * maximum_frame_descriptor_sets;
 const gds_slot_bytes = 64 * 1024;
@@ -677,7 +678,7 @@ const gds_ring_bytes = gds_slot_bytes * maximum_frame_descriptor_sets;
 /// and freeing one Vulkan allocation per binding.
 const draw_upload_ring_bytes = 128 * 1024 * 1024;
 const draw_upload_alignment = 256;
-const maximum_async_command_buffers = 256;
+const maximum_async_command_buffers = 512;
 const maximum_storage_mappings = 1024;
 
 fn reserveAlignedRange(cursor: *usize, capacity: usize, bytes: usize, alignment: usize) ?usize {
@@ -13400,7 +13401,13 @@ pub const Renderer = struct {
     fn dcbAcquire(context: ?*anyopaque, _: gpu.state.AcquireMem) bool {
         const self = fromContext(context);
         self.acquire_callbacks += 1;
-        return self.synchronizeDrawBatch("acquire");
+        // ACQUIRE_MEM orders and invalidates GPU caches. The Vulkan work is
+        // recorded into one ordered queue and resource accesses emit their own
+        // barriers, so turning every acquire into a host fence wait is both
+        // redundant and catastrophically expensive for titles that emit one
+        // after every draw.
+        self.last_sync_error = null;
+        return true;
     }
 
     fn dcbRelease(context: ?*anyopaque, release: gpu.state.ReleaseMem) bool {
@@ -13474,9 +13481,12 @@ pub const Renderer = struct {
         const self = fromContext(context);
         self.wait_callbacks += 1;
         // The command processor has already performed the checked label read.
-        // A false result blocks the DCB; accepting the callback preserves that
-        // continuation rather than turning a normal wait into a backend error.
-        return self.synchronizeDrawBatch("wait");
+        // Once it is satisfied, Vulkan queue ordering is enough to continue;
+        // forcing all earlier device work through a host fence here turns a
+        // GPU-side dependency into a CPU/GPU round trip. RELEASE_MEM and exact
+        // readbacks remain the points that publish device work to the host.
+        self.last_sync_error = null;
+        return true;
     }
 
     fn dcbWriteData(context: ?*anyopaque, info: gpu.state.WriteData, values: []const u32) bool {
@@ -13602,13 +13612,17 @@ pub const Renderer = struct {
         return true;
     }
 
-    fn dcbEvent(context: ?*anyopaque, _: gpu.state.EventWrite) bool {
+    fn dcbEvent(context: ?*anyopaque, event: gpu.state.EventWrite) bool {
         const self = fromContext(context);
         self.event_callbacks += 1;
-        // EVENT_WRITE is also used as a DCB completion boundary without a
-        // RELEASE_MEM packet. Leaving its preceding draw only recorded wedges
-        // titles which wait for that event before producing the next flip.
-        return self.synchronizeDrawBatch("event");
+        // The common one-dword EVENT_WRITE only flushes/invalidate GPU caches;
+        // it does not publish memory to the CPU. Preserve it as an in-queue
+        // ordering point instead of submitting and waiting after every draw.
+        // Addressed events can carry a guest-visible completion payload and
+        // remain a conservative host synchronization boundary.
+        if (event.address != null) return self.synchronizeDrawBatch("addressed event");
+        self.last_sync_error = null;
+        return true;
     }
 
     /// Shows a display buffer straight out of guest memory.
@@ -14655,14 +14669,11 @@ pub const Renderer = struct {
 
     fn dcbDispatch(context: ?*anyopaque, state: *const gpu.State, packet: gpu.pm4.Packet) bool {
         const self = fromContext(context);
-        // Compute writeback is currently consumed by the CPU immediately
-        // after dispatch. Close the preceding graphics batch before entering
-        // that synchronous path; a later draw starts a fresh descriptor ring.
-        self.finishDrawBatch() catch |err| {
-            self.last_dispatch_error = err;
-            std.debug.print("[vulkan dcb] pre-dispatch batch failed: {s}\n", .{@errorName(err)});
-            return false;
-        };
+        // Graphics and compute command buffers share one ordered Vulkan queue.
+        // Keep them in the same batch; exact compute readback paths synchronize
+        // themselves when the CPU truly consumes an output. Splitting here made
+        // alternating compute/draw workloads submit once per dispatch and also
+        // discarded the per-frame upload cache on every split.
         const profile_started = hostTimestampNs();
         defer self.frame_profile.dispatch_ns +|= elapsedHostNanoseconds(profile_started);
         self.dispatch_callbacks += 1;
