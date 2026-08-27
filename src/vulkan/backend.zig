@@ -4711,38 +4711,61 @@ pub const Renderer = struct {
         const height: u32 = @intCast(@min(@as(u64, subresource.height), dispatched_height));
         const depth = @min(subresource.depth_or_layers, group_count[2]);
 
-        // Preserve untouched texels, apply the tiled offsets against one host
-        // copy, then publish the allocation once. Calling GuestMemory.write
-        // for every texel made a single 3840x2160 clear cross the checked
-        // memory boundary more than eight million times.
-        const allocation_bytes = std.math.cast(usize, subresource.required_source_bytes) orelse
-            return Error.GuestBufferTooLarge;
-        if (allocation_bytes == 0 or allocation_bytes > maximum_frame_bytes) return null;
-        const allocation = try self.allocator.alloc(u8, allocation_bytes);
-        defer self.allocator.free(allocation);
-        if (!memory.read(memory.context, descriptor.address, allocation))
-            return Error.GuestMemoryReadFailed;
+        const full_clear = width == subresource.width and height == subresource.height and
+            depth == subresource.depth_or_layers;
+        const clear_range = if (full_clear) try contiguousWholeImageClearRange(subresource) else null;
+        if (clear_range) |range| {
+            const bytes = try self.allocator.alloc(u8, range.length);
+            defer self.allocator.free(bytes);
+            fillRepeatedPattern(bytes, texel.bytes[0..texel.length]);
+            const write_address = try std.math.add(u64, descriptor.address, range.offset);
+            if (!memory.write(memory.context, write_address, bytes)) return Error.GuestMemoryWriteFailed;
+            self.invalidateDmaDestination(write_address, bytes.len);
+        } else {
+            // Preserve untouched texels, apply the tiled offsets against one
+            // host copy, then publish the allocation once. Calling
+            // GuestMemory.write for every texel made large clears cross the
+            // checked memory boundary millions of times.
+            const allocation_bytes = std.math.cast(usize, subresource.required_source_bytes) orelse
+                return Error.GuestBufferTooLarge;
+            if (allocation_bytes == 0 or allocation_bytes > maximum_frame_bytes) return null;
+            const allocation = try self.allocator.alloc(u8, allocation_bytes);
+            defer self.allocator.free(allocation);
+            const overwrites_allocation = full_clear and
+                try wholeImageClearCoversAllocation(allocation.len, subresource);
+            if (!overwrites_allocation and
+                !memory.read(memory.context, descriptor.address, allocation))
+            {
+                return Error.GuestMemoryReadFailed;
+            }
 
-        var writes: u64 = 0;
-        for (0..depth) |z_index| {
-            const z: u32 = @intCast(z_index);
-            for (0..height) |y_index| {
-                const y: u32 = @intCast(y_index);
-                for (0..width) |x_index| {
-                    const x: u32 = @intCast(x_index);
-                    const offset_u64 = try subresource.sourceByteOffset(x, y, z, 0);
-                    const offset = std.math.cast(usize, offset_u64) orelse
-                        return Error.GuestBufferTooLarge;
-                    if (offset > allocation.len or texel.length > allocation.len - offset)
-                        return Error.GuestBufferTooLarge;
-                    @memcpy(allocation[offset..][0..texel.length], texel.bytes[0..texel.length]);
-                    writes += 1;
+            const block_clear = full_clear and try fillWholeImageBlocks(
+                allocation,
+                subresource,
+                texel.bytes[0..texel.length],
+            );
+            if (!block_clear) {
+                for (0..depth) |z_index| {
+                    const z: u32 = @intCast(z_index);
+                    for (0..height) |y_index| {
+                        const y: u32 = @intCast(y_index);
+                        for (0..width) |x_index| {
+                            const x: u32 = @intCast(x_index);
+                            const offset_u64 = try subresource.sourceByteOffset(x, y, z, 0);
+                            const offset = std.math.cast(usize, offset_u64) orelse
+                                return Error.GuestBufferTooLarge;
+                            if (offset > allocation.len or texel.length > allocation.len - offset)
+                                return Error.GuestBufferTooLarge;
+                            @memcpy(allocation[offset..][0..texel.length], texel.bytes[0..texel.length]);
+                        }
+                    }
                 }
             }
+            if (!memory.write(memory.context, descriptor.address, allocation))
+                return Error.GuestMemoryWriteFailed;
+            self.invalidateDmaDestination(descriptor.address, allocation_bytes);
         }
-        if (!memory.write(memory.context, descriptor.address, allocation))
-            return Error.GuestMemoryWriteFailed;
-        self.invalidateDmaDestination(descriptor.address, allocation_bytes);
+        const writes: u64 = @as(u64, width) * height * depth;
 
         self.emulated_image_store_dispatches += 1;
         if (log_verbose_gpu or self.emulated_image_store_dispatches <= 4) {
@@ -4832,10 +4855,18 @@ pub const Renderer = struct {
 
         self.emulated_image_store_dispatches += 1;
         std.debug.print(
-            "[vulkan dcb] emulated dual image clear: {d}+{d} texels fmt={d}/{d} tile={s}/{s} (#{d})\n",
+            "[vulkan dcb] emulated dual image clear: {d}+{d} texels {d}x{d}/{d}x{d} padded={d}x{d}/{d}x{d} fmt={d}/{d} tile={s}/{s} (#{d})\n",
             .{
                 first_writes,
                 second_writes,
+                first_clear.subresource.width,
+                first_clear.subresource.height,
+                second_clear.subresource.width,
+                second_clear.subresource.height,
+                first_clear.subresource.padded_width,
+                first_clear.subresource.padded_height,
+                second_clear.subresource.padded_width,
+                second_clear.subresource.padded_height,
                 first.unified_format,
                 second.unified_format,
                 @tagName(first.tile_mode),
@@ -4886,25 +4917,46 @@ pub const Renderer = struct {
         memory: GuestMemory,
         clear: WholeImageClear,
     ) anyerror!u64 {
+        if (try contiguousWholeImageClearRange(clear.subresource)) |range| {
+            const bytes = try self.allocator.alloc(u8, range.length);
+            defer self.allocator.free(bytes);
+            fillRepeatedPattern(bytes, clear.texel.bytes[0..clear.texel.length]);
+            const write_address = try std.math.add(u64, clear.descriptor.address, range.offset);
+            if (!memory.write(memory.context, write_address, bytes)) return Error.GuestMemoryWriteFailed;
+            self.invalidateDmaDestination(write_address, bytes.len);
+            return @as(u64, clear.subresource.width) * clear.subresource.height;
+        }
+
         const allocation = try self.allocator.alloc(u8, clear.allocation_bytes);
         defer self.allocator.free(allocation);
-        if (!memory.read(memory.context, clear.descriptor.address, allocation)) return Error.GuestMemoryReadFailed;
-        for (0..clear.subresource.height) |y_index| {
-            const y: u32 = @intCast(y_index);
-            for (0..clear.subresource.width) |x_index| {
-                const x: u32 = @intCast(x_index);
-                const offset_u64 = try clear.subresource.sourceByteOffset(x, y, 0, 0);
-                const offset = std.math.cast(usize, offset_u64) orelse return Error.GuestBufferTooLarge;
-                if (offset > allocation.len or clear.texel.length > allocation.len - offset) {
-                    return Error.GuestBufferTooLarge;
+        if (!try wholeImageClearCoversAllocation(allocation.len, clear.subresource) and
+            !memory.read(memory.context, clear.descriptor.address, allocation))
+        {
+            return Error.GuestMemoryReadFailed;
+        }
+        if (!try fillWholeImageBlocks(
+            allocation,
+            clear.subresource,
+            clear.texel.bytes[0..clear.texel.length],
+        )) {
+            for (0..clear.subresource.height) |y_index| {
+                const y: u32 = @intCast(y_index);
+                for (0..clear.subresource.width) |x_index| {
+                    const x: u32 = @intCast(x_index);
+                    const offset_u64 = try clear.subresource.sourceByteOffset(x, y, 0, 0);
+                    const offset = std.math.cast(usize, offset_u64) orelse return Error.GuestBufferTooLarge;
+                    if (offset > allocation.len or clear.texel.length > allocation.len - offset) {
+                        return Error.GuestBufferTooLarge;
+                    }
+                    @memcpy(
+                        allocation[offset..][0..clear.texel.length],
+                        clear.texel.bytes[0..clear.texel.length],
+                    );
                 }
-                @memcpy(
-                    allocation[offset..][0..clear.texel.length],
-                    clear.texel.bytes[0..clear.texel.length],
-                );
             }
         }
         if (!memory.write(memory.context, clear.descriptor.address, allocation)) return Error.GuestMemoryWriteFailed;
+        self.invalidateDmaDestination(clear.descriptor.address, allocation.len);
         return @as(u64, clear.subresource.width) * clear.subresource.height;
     }
 
@@ -15395,6 +15447,144 @@ const WholeImageClear = struct {
     allocation_bytes: usize,
 };
 
+fn fillRepeatedPattern(destination: []u8, pattern: []const u8) void {
+    std.debug.assert(pattern.len != 0);
+    if (destination.len == 0) return;
+
+    const seed_bytes = @min(destination.len, pattern.len);
+    @memcpy(destination[0..seed_bytes], pattern[0..seed_bytes]);
+    var initialized = seed_bytes;
+    while (initialized < destination.len) {
+        const copy_bytes = @min(initialized, destination.len - initialized);
+        @memcpy(destination[initialized..][0..copy_bytes], destination[0..copy_bytes]);
+        initialized += copy_bytes;
+    }
+}
+
+fn fillWholeImageBlocks(
+    allocation: []u8,
+    subresource: gpu.TextureSubresourceLayout,
+    texel: []const u8,
+) !bool {
+    if (texel.len == 0 or texel.len != subresource.block.bytes_per_element or
+        subresource.depth_or_layers != 1 or subresource.samples() != 1)
+    {
+        return false;
+    }
+
+    if (try wholeImageClearCoversAllocation(allocation.len, subresource)) {
+        fillRepeatedPattern(allocation, texel);
+        return true;
+    }
+
+    if (subresource.block.family == .linear) {
+        const row_bytes_u64 = try std.math.mul(u64, subresource.width, texel.len);
+        const row_bytes = std.math.cast(usize, row_bytes_u64) orelse return false;
+        for (0..subresource.height) |y_index| {
+            const offset_u64 = try subresource.sourceByteOffset(0, @intCast(y_index), 0, 0);
+            const offset = std.math.cast(usize, offset_u64) orelse return false;
+            if (offset > allocation.len or row_bytes > allocation.len - offset) return false;
+            fillRepeatedPattern(allocation[offset..][0..row_bytes], texel);
+        }
+        return true;
+    }
+
+    if (subresource.in_tail or subresource.tail_x != 0 or subresource.tail_y != 0) {
+        return false;
+    }
+    const logical_blocks_wide = subresource.width / subresource.block.width;
+    const logical_blocks_high = subresource.height / subresource.block.height;
+    const physical_blocks_wide = subresource.padded_width / subresource.block.width;
+    if (physical_blocks_wide < logical_blocks_wide) return false;
+
+    const slice_base_u64 = try std.math.mul(u64, subresource.source_layer_bytes, subresource.first_slice);
+    const allocation_base_u64 = try std.math.add(u64, slice_base_u64, subresource.level_offset);
+    const allocation_base = std.math.cast(usize, allocation_base_u64) orelse return false;
+    const block_bytes: usize = subresource.block.bytes;
+    for (0..logical_blocks_high) |block_y| {
+        for (0..logical_blocks_wide) |block_x| {
+            const block_index = try std.math.add(
+                usize,
+                try std.math.mul(usize, block_y, physical_blocks_wide),
+                block_x,
+            );
+            const offset = try std.math.add(
+                usize,
+                allocation_base,
+                try std.math.mul(usize, block_index, block_bytes),
+            );
+            if (offset > allocation.len or block_bytes > allocation.len - offset) return false;
+            fillRepeatedPattern(allocation[offset..][0..block_bytes], texel);
+        }
+    }
+
+    const full_block_width = logical_blocks_wide * subresource.block.width;
+    const full_block_height = logical_blocks_high * subresource.block.height;
+    for (0..subresource.height) |y_index| {
+        for (full_block_width..subresource.width) |x_index| {
+            const offset_u64 = try subresource.sourceByteOffset(
+                @intCast(x_index),
+                @intCast(y_index),
+                0,
+                0,
+            );
+            const offset = std.math.cast(usize, offset_u64) orelse return false;
+            if (offset > allocation.len or texel.len > allocation.len - offset) return false;
+            @memcpy(allocation[offset..][0..texel.len], texel);
+        }
+    }
+    for (full_block_height..subresource.height) |y_index| {
+        for (0..full_block_width) |x_index| {
+            const offset_u64 = try subresource.sourceByteOffset(
+                @intCast(x_index),
+                @intCast(y_index),
+                0,
+                0,
+            );
+            const offset = std.math.cast(usize, offset_u64) orelse return false;
+            if (offset > allocation.len or texel.len > allocation.len - offset) return false;
+            @memcpy(allocation[offset..][0..texel.len], texel);
+        }
+    }
+    return true;
+}
+
+fn wholeImageClearCoversAllocation(
+    allocation_bytes: usize,
+    subresource: gpu.TextureSubresourceLayout,
+) !bool {
+    return subresource.level_offset == 0 and subresource.first_slice == 0 and
+        subresource.depth_or_layers == 1 and subresource.samples() == 1 and
+        try subresource.stagingBytes() == allocation_bytes;
+}
+
+const ContiguousImageClearRange = struct {
+    offset: u64,
+    length: usize,
+};
+
+fn contiguousWholeImageClearRange(
+    subresource: gpu.TextureSubresourceLayout,
+) !?ContiguousImageClearRange {
+    if (subresource.depth_or_layers != 1 or subresource.samples() != 1 or
+        subresource.in_tail or subresource.tail_x != 0 or subresource.tail_y != 0 or
+        subresource.width != subresource.padded_width or
+        subresource.height != subresource.padded_height)
+    {
+        return null;
+    }
+    const offset = try std.math.add(
+        u64,
+        try std.math.mul(u64, subresource.source_layer_bytes, subresource.first_slice),
+        subresource.level_offset,
+    );
+    const length_u64 = try subresource.stagingBytes();
+    const end = try std.math.add(u64, offset, length_u64);
+    if (length_u64 == 0 or end > subresource.required_source_bytes) return null;
+    const length = std.math.cast(usize, length_u64) orelse return null;
+    return .{ .offset = offset, .length = length };
+}
+
 fn planWholeImageClear(
     descriptor: gpu.ImageDescriptor,
     values: [4]u32,
@@ -19238,9 +19428,72 @@ test "whole image clear plans are bounded and reject partial dispatches" {
     ).?;
     try std.testing.expectEqual(@as(u8, 16), clear.texel.length);
     try std.testing.expect(clear.allocation_bytes <= 256 * 1024 * 1024);
+    const clear_range = (try contiguousWholeImageClearRange(clear.subresource)).?;
+    try std.testing.expectEqual(@as(u64, 0), clear_range.offset);
+    try std.testing.expectEqual(@as(usize, 64 * 64 * 16), clear_range.length);
     try std.testing.expect(planWholeImageClear(image, .{ 0, 0, 0, 0 }, 0xf, 63, 64) == null);
     image.dcc_enabled = true;
     try std.testing.expect(planWholeImageClear(image, .{ 0, 0, 0, 0 }, 0xf, 64, 64) == null);
+
+    image.dcc_enabled = false;
+    image.tile_mode = .render_target;
+    image.width = 1;
+    image.height = 1;
+    image.pitch = 1;
+    const prototype = try gpu.TextureLayout.fromImage(image);
+    image.width = prototype.block.width + 1;
+    image.height = prototype.block.height + 1;
+    image.pitch = prototype.block.width * 3;
+    const tiled = planWholeImageClear(
+        image,
+        .{ 0x0102_0304, 0x1112_1314, 0x2122_2324, 0x3132_3334 },
+        0xf,
+        image.width,
+        image.height,
+    ).?;
+    try std.testing.expect((try contiguousWholeImageClearRange(tiled.subresource)) == null);
+    const allocation = try std.testing.allocator.alloc(u8, tiled.allocation_bytes);
+    defer std.testing.allocator.free(allocation);
+    @memset(allocation, 0xaa);
+    try std.testing.expect(try fillWholeImageBlocks(
+        allocation,
+        tiled.subresource,
+        tiled.texel.bytes[0..tiled.texel.length],
+    ));
+    for (0..image.height) |y_index| {
+        for (0..image.width) |x_index| {
+            const offset: usize = @intCast(try tiled.subresource.sourceByteOffset(
+                @intCast(x_index),
+                @intCast(y_index),
+                0,
+                0,
+            ));
+            try std.testing.expectEqualSlices(
+                u8,
+                tiled.texel.bytes[0..tiled.texel.length],
+                allocation[offset..][0..tiled.texel.length],
+            );
+        }
+    }
+    const padding_block: usize = @intCast(tiled.subresource.level_offset + tiled.subresource.block.bytes * 2);
+    try std.testing.expect(padding_block < allocation.len);
+    try std.testing.expectEqual(@as(u8, 0xaa), allocation[padding_block]);
+}
+
+test "repeated-pattern fill handles partial final patterns" {
+    var bytes: [19]u8 = undefined;
+    fillRepeatedPattern(&bytes, &.{ 0x10, 0x20, 0x30, 0x40 });
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{
+            0x10, 0x20, 0x30, 0x40,
+            0x10, 0x20, 0x30, 0x40,
+            0x10, 0x20, 0x30, 0x40,
+            0x10, 0x20, 0x30, 0x40,
+            0x10, 0x20, 0x30,
+        },
+        &bytes,
+    );
 }
 
 test "volume upload source index uses x y and z record strides" {
