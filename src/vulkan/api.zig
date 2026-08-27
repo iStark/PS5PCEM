@@ -363,6 +363,7 @@ pub const PhysicalDeviceFeatures = extern struct {
 
 pub const feature_geometry_shader: usize = 4;
 pub const feature_fragment_stores_and_atomics: usize = 26;
+pub const feature_shader_image_gather_extended: usize = 28;
 pub const feature_shader_storage_image_extended_formats: usize = 29;
 
 pub const PhysicalDeviceFeatures2 = extern struct {

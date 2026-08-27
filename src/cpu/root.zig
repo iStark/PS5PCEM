@@ -408,6 +408,9 @@ pub var invalid_agc_pointer_recoveries: std.atomic.Value(u64) = .init(0);
 /// size field were leaked instead of letting the allocator unlink outside the
 /// guest address space and terminate the graphics worker.
 pub var corrupt_allocator_free_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many non-canonical Unreal small-allocation free-list heads used the
+/// allocator's existing slow fallback instead of being dereferenced.
+pub var invalid_allocator_head_recoveries: std.atomic.Value(u64) = .init(0);
 /// How many corrupt Unity frame-slot indices were reset to the renderer's
 /// explicit inactive slot before their scaled address reached unmapped memory.
 pub var invalid_frame_slot_recoveries: std.atomic.Value(u64) = .init(0);
@@ -588,6 +591,7 @@ pub const NativeBridge = struct {
                 .thread_handle = request.thread_handle,
                 .info = frame.fault,
             });
+            reportFaultAddressSpace(self.address_space, frame.fault);
             return error.GuestFault;
         }
         if (@atomicLoad(u32, &frame.interrupted, .acquire) != 0) {
@@ -688,6 +692,69 @@ pub const NativeBridge = struct {
         return mapping.kind != .reserved and mapping.protection.execute;
     }
 };
+
+fn reportFaultAddressSpace(address_space: *memory.AddressSpace, fault: FaultInfo) void {
+    if (fault.kind != .access_violation or fault.memory_address == 0) return;
+    const address = fault.memory_address;
+    if (address_space.query(address, false)) |mapping| {
+        std.debug.print(
+            "[cpu fault map] target=0x{x} mapping=0x{x}-0x{x} kind={s} protection=r{d}w{d}x{d} bits=0x{x} name={s}\n",
+            .{
+                address,
+                mapping.address,
+                mapping.end(),
+                @tagName(mapping.kind),
+                @intFromBool(mapping.protection.read),
+                @intFromBool(mapping.protection.write),
+                @intFromBool(mapping.protection.execute),
+                @as(u32, @bitCast(mapping.protection_bits)),
+                std.mem.sliceTo(&mapping.name, 0),
+            },
+        );
+    } else {
+        const previous = if (address > 0) address_space.query(address - 1, false) else null;
+        const next = address_space.query(address, true);
+        std.debug.print(
+            "[cpu fault map] target=0x{x} unmapped previous_end=0x{x} next_start=0x{x}\n",
+            .{
+                address,
+                if (previous) |mapping| mapping.end() else 0,
+                if (next) |mapping| mapping.address else 0,
+            },
+        );
+    }
+    reportFaultBytes(address_space, "r10", fault.registers.r10);
+    reportFaultBytes(address_space, "r10+15000", fault.registers.r10 +| 0x1_5000);
+    reportFaultBytes(address_space, "rax", fault.registers.rax);
+    reportFaultBytes(address_space, "r13", fault.registers.r13);
+    reportFaultBytes(address_space, "r12", fault.registers.r12);
+    reportFaultBytes(address_space, "rbx-8", fault.registers.rbx -| 8);
+    reportFaultBytes(address_space, "r9", fault.registers.r9);
+    reportFaultBytes(address_space, "rsp", fault.registers.rsp);
+    reportFaultBytes(address_space, "rbp", fault.registers.rbp);
+    reportFaultBytes(address_space, "rsi", fault.registers.rsi);
+    reportFaultBytes(address_space, "rdi", fault.registers.rdi);
+    if (memory.isHostRangeReadable(fault.registers.r13, 4) and
+        memory.isHostRangeReadable(fault.registers.r9, 4))
+    {
+        const header_bytes: *const [4]u8 = @ptrFromInt(fault.registers.r13);
+        const stride_bytes: *const [4]u8 = @ptrFromInt(fault.registers.r9);
+        const header = std.mem.readInt(u32, header_bytes, .little);
+        const stride = std.mem.readInt(u32, stride_bytes, .little);
+        const slot_offset = @as(u64, header >> 18) * stride;
+        reportFaultBytes(address_space, "slab-slot", fault.registers.r10 +| slot_offset);
+    }
+}
+
+fn reportFaultBytes(address_space: *memory.AddressSpace, label: []const u8, address: u64) void {
+    _ = address_space;
+    if (!memory.isHostRangeReadable(address, 32)) return;
+    var bytes: [32]u8 = undefined;
+    const source: [*]const u8 = @ptrFromInt(address);
+    @memcpy(&bytes, source[0..bytes.len]);
+    const hex = std.fmt.bytesToHex(bytes, .lower);
+    std.debug.print("[cpu fault bytes] {s}@0x{x}={s}\n", .{ label, address, &hex });
+}
 
 fn resolveStackPointer(request: ExecuteRequest) ?u64 {
     const address = request.stack_address;
@@ -900,6 +967,24 @@ const WindowsX64Machine = struct {
             if (count <= 8 or count % 256 == 0) std.debug.print(
                 "[cpu] recovered missing sentinel link @rip=0x{x} addr=0x{x} (#{d})\n",
                 .{ context.Rip - 4, record.ExceptionInformation[1], count },
+            );
+            return exception_continue_execution;
+        }
+        // Unreal's small-allocation fast path pops an intrusive free-list head
+        // after decrementing the bucket count. If packed payload has replaced
+        // that pointer, discard the inconsistent head/count pair and take the
+        // allocator's already-encoded slow path; retaining the bad head would
+        // make the slow path immediately dereference it a second time.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            tryFallbackInvalidAllocatorHead(context, record.ExceptionInformation[1]))
+        {
+            _ = invalid_allocator_head_recoveries.fetchAdd(1, .monotonic);
+            const count = invalid_allocator_head_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] bypassed invalid Unreal allocator head @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip - 0x14, record.ExceptionInformation[1], count },
             );
             return exception_continue_execution;
         }
@@ -1563,7 +1648,17 @@ const WindowsX64Machine = struct {
         context: *std.os.windows.CONTEXT,
         memory_address: u64,
     ) bool {
-        if (!isGuestAddress(memory_address) or memory_address < memory.page_size) return false;
+        const effective_address = context.Rdx +% 8;
+        const unmapped_guest_address = isGuestAddress(memory_address) and
+            memory_address >= memory.page_size and
+            effective_address == memory_address;
+        // Windows reports every non-canonical x64 effective address as -1.
+        // Allocator poison can reach the same optional-list load as an ordinary
+        // unmapped guest pointer, so classify it from the base register instead.
+        const poisoned_address = memory_address == std.math.maxInt(u64) and
+            context.Rdx != 0 and
+            !isCanonicalX64Address(context.Rdx);
+        if (!unmapped_guest_address and !poisoned_address) return false;
         const code: [*]const u8 = @ptrFromInt(context.Rip);
         const pattern = [_]u8{
             0x48, 0x8b, 0x42, 0x08, // mov rax, qword ptr [rdx+8]
@@ -1573,7 +1668,6 @@ const WindowsX64Machine = struct {
         for (pattern, 0..) |byte, index| {
             if (code[index] != byte) return false;
         }
-        if (context.Rdx +% 8 != memory_address) return false;
         context.Rax = 0;
         context.Rip += 4;
         return true;
@@ -1612,6 +1706,68 @@ const WindowsX64Machine = struct {
         }
         context.Rcx = context.Rdx;
         context.Rip += 4;
+        return true;
+    }
+
+    fn tryFallbackInvalidAllocatorHead(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const fallback_offset: u64 = 0x14;
+        const noncanonical_head = memory_address == std.math.maxInt(u64) and
+            context.Rcx != 0 and !isCanonicalX64Address(context.Rcx);
+        const unmapped_canonical_head = context.Rcx != 0 and
+            isCanonicalX64Address(context.Rcx) and
+            memory_address == context.Rcx and
+            !memory.isHostRangeReadable(context.Rcx, @sizeOf(u64));
+        if ((!noncanonical_head and !unmapped_canonical_head) or
+            context.Rbx > 0x2_0000 or context.R14 > 0x10 or
+            context.Rdx > 0x1fe0 or context.Rdx & 0x1f != 0 or
+            !isGuestAddress(context.Rax) or
+            context.Rsi != context.Rax +% context.Rdx or
+            !isGuestAddress(context.Rsi) or
+            !memory.isHostRangeReadable(context.Rsi, 12) or
+            !memory.isHostRangeWritable(context.Rsi, 12))
+        {
+            return false;
+        }
+
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const pop_pattern = [_]u8{
+            0x48, 0x8b, 0x01, // mov rax,[rcx]
+            0x48, 0x89, 0x06, // mov [rsi],rax
+            0x48, 0x89, 0xc8, // mov rax,rcx
+            0x48, 0x83, 0xc4, 0x08, // add rsp,8
+            0x5b, // pop rbx
+            0x41, 0x5e, // pop r14
+            0x41, 0x5f, // pop r15
+            0x5d, // pop rbp
+            0xc3, // ret
+        };
+        for (pop_pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        const fallback_pattern = [_]u8{
+            0x4c, 0x89, 0xff, // mov rdi,r15
+            0x48, 0x89, 0xde, // mov rsi,rbx
+            0x44, 0x89, 0xf2, // mov edx,r14d
+            0x48, 0x83, 0xc4, 0x08, // add rsp,8
+            0x5b, // pop rbx
+            0x41, 0x5e, // pop r14
+            0x41, 0x5f, // pop r15
+            0x5d, // pop rbp
+            0xe9, // jmp slow allocator
+        };
+        for (fallback_pattern, 0..) |byte, index| {
+            if (code[fallback_offset + index] != byte) return false;
+        }
+
+        const bucket_head: *u64 = @ptrFromInt(context.Rsi);
+        if (bucket_head.* != context.Rcx) return false;
+        const bucket_count: *u32 = @ptrFromInt(context.Rsi + 8);
+        bucket_head.* = 0;
+        bucket_count.* = 0;
+        context.Rip += fallback_offset;
         return true;
     }
 
@@ -2412,6 +2568,16 @@ test "an unmapped optional linked-list payload follows its null branch" {
         ));
         try std.testing.expectEqual(@as(u64, 0), context.Rax);
         try std.testing.expectEqual(@intFromPtr(&code) + 4, context.Rip);
+
+        context.Rip = @intFromPtr(&code);
+        context.Rax = 0xfeed_face;
+        context.Rdx = 0xaaaa_aaaa_aaaa_aaaa;
+        try std.testing.expect(WindowsX64Machine.tryEmulateUnmappedOptionalPointerLoad(
+            &context,
+            std.math.maxInt(u64),
+        ));
+        try std.testing.expectEqual(@as(u64, 0), context.Rax);
+        try std.testing.expectEqual(@intFromPtr(&code) + 4, context.Rip);
     } else {
         return error.SkipZigTest;
     }
@@ -2785,6 +2951,76 @@ test "an unmapped AGC buffer returns the validator's encoded error" {
         ));
         try std.testing.expectEqual(@as(u64, 0x8a6c_000a), context.Rax);
         try std.testing.expectEqual(@intFromPtr(&code) + 0x20, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "a non-canonical Unreal allocator head takes the slow allocation path" {
+    if (can_use_native_bridge) {
+        var address_space = try memory.AddressSpace.init(std.testing.allocator);
+        defer address_space.deinit();
+
+        const allocator = memory.system_managed.start + 0x20_000;
+        try address_space.mapFixed(
+            allocator,
+            memory.page_size,
+            .read_write,
+            .private,
+            null,
+        );
+        const bucket_offset: u64 = 0x40;
+        const bucket = allocator + bucket_offset;
+        const invalid_head: u64 = 0x3f80_0000_0000_0000;
+        try address_space.writeInt(u64, bucket, invalid_head);
+        try address_space.writeInt(u32, bucket + 8, 4);
+
+        const code = [_]u8{
+            0x48, 0x8b, 0x01,
+            0x48, 0x89, 0x06,
+            0x48, 0x89, 0xc8,
+            0x48, 0x83, 0xc4,
+            0x08, 0x5b, 0x41,
+            0x5e, 0x41, 0x5f,
+            0x5d, 0xc3, 0x4c,
+            0x89, 0xff, 0x48,
+            0x89, 0xde, 0x44,
+            0x89, 0xf2, 0x48,
+            0x83, 0xc4, 0x08,
+            0x5b, 0x41, 0x5e,
+            0x41, 0x5f, 0x5d,
+            0xe9,
+        };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rax = allocator;
+        context.Rbx = 0x1700;
+        context.Rcx = invalid_head;
+        context.Rdx = bucket_offset;
+        context.Rsi = bucket;
+        context.R14 = 4;
+        context.R15 = memory.system_managed.start + 0x100;
+
+        try std.testing.expect(WindowsX64Machine.tryFallbackInvalidAllocatorHead(
+            &context,
+            std.math.maxInt(u64),
+        ));
+        try std.testing.expectEqual(@intFromPtr(&code) + 0x14, context.Rip);
+        try std.testing.expectEqual(@as(u32, 0), @as(*const u32, @ptrFromInt(bucket + 8)).*);
+        try std.testing.expectEqual(@as(u64, 0), @as(*const u64, @ptrFromInt(bucket)).*);
+
+        const canonical_invalid_head: u64 = 0x3f80_0000;
+        try address_space.writeInt(u64, bucket, canonical_invalid_head);
+        try address_space.writeInt(u32, bucket + 8, 7);
+        context.Rip = @intFromPtr(&code);
+        context.Rcx = canonical_invalid_head;
+        try std.testing.expect(WindowsX64Machine.tryFallbackInvalidAllocatorHead(
+            &context,
+            canonical_invalid_head,
+        ));
+        try std.testing.expectEqual(@intFromPtr(&code) + 0x14, context.Rip);
+        try std.testing.expectEqual(@as(u32, 0), @as(*const u32, @ptrFromInt(bucket + 8)).*);
+        try std.testing.expectEqual(@as(u64, 0), @as(*const u64, @ptrFromInt(bucket)).*);
     } else {
         return error.SkipZigTest;
     }

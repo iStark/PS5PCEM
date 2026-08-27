@@ -740,8 +740,29 @@ fn mapFlexibleMemory(
             return KernelError.einval.raw();
         }
 
-        if (address_space.isMapped(requested_address, len)) {
+        const occupied = address_space.isMapped(requested_address, len);
+        if (occupied) {
             if (map_flags & map_no_overwrite != 0) return KernelError.enomem.raw();
+
+            // A fixed flexible mapping is also how runtimes commit blocks
+            // inside a much larger virtual reservation.  Replacing a slice by
+            // unmapping it first loses the Windows placeholder which owns the
+            // reservation; commit it in place, exactly as direct memory does.
+            if (address_space.mapInReservation(
+                requested_address,
+                len,
+                protection,
+                .flexible,
+                null,
+            )) |_| {
+                break :fixed requested_address;
+            } else |err| switch (err) {
+                // The occupied range is committed rather than reserved. Keep
+                // MAP_FIXED replacement semantics for that case.
+                error.RangeNotMapped => {},
+                else => return mapAddressSpaceError(err),
+            }
+
             address_space.unmap(requested_address, len) catch |err|
                 return mapAddressSpaceError(err);
         }
@@ -2126,6 +2147,49 @@ test "large unhinted reservation is placed in the user window" {
     try testing.expect(arena >= memory.user.start);
     try testing.expectEqual(@as(u64, 0), arena % 0x20_0000);
     try testing.expect(arena + 0x80_0000_0000 <= memory.user.end);
+}
+
+test "fixed flexible memory commits a slice without consuming its reservation" {
+    var address_space = try memory.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+
+    init(testing.allocator);
+    defer deinit();
+    attachAddressSpace(&address_space);
+
+    const reservation_size = 4 * page_size;
+    var reservation: u64 = memory.user.start;
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelReserveVirtualRange(&reservation, reservation_size, 0, page_size),
+    );
+
+    const mapped_address = reservation + page_size;
+    var mapped = mapped_address;
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelMapFlexibleMemory(
+            &mapped,
+            2 * page_size,
+            prot_cpu_read | prot_cpu_write,
+            map_fixed,
+        ),
+    );
+    try testing.expectEqual(mapped_address, mapped);
+    try testing.expect(address_space.isMappedAs(mapped, 2 * page_size, .flexible));
+    try testing.expectEqual(
+        memory.MappingKind.reserved,
+        address_space.query(reservation, false).?.kind,
+    );
+    try testing.expectEqual(
+        memory.MappingKind.reserved,
+        address_space.query(reservation + 3 * page_size, false).?.kind,
+    );
+
+    try address_space.write(mapped, "committed");
+    var bytes: [9]u8 = undefined;
+    try address_space.read(mapped, &bytes);
+    try testing.expectEqualStrings("committed", &bytes);
 }
 
 test "a query reports what a range is and whether it is committed" {

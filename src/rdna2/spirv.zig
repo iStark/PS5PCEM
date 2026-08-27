@@ -576,6 +576,7 @@ const Builder = struct {
     /// GLSL.std.450 extended instruction set (PackHalf2x16, etc.). 0 = unused.
     glsl_std_450: u32 = 0,
     uses_image_query: bool = false,
+    uses_image_gather_extended: bool = false,
     scalar_specializations: []const ScalarRegister,
     dynamic_scalar_binding: ?DynamicScalarBinding,
     scalar_buffer: u32 = 0,
@@ -3329,11 +3330,11 @@ const Builder = struct {
             const up = self.id();
             try self.emit(&self.body, 196, &.{ self.bits_type, up, extracted, shift_amount }); // OpShiftLeftLogical
             const signed_up = self.id();
-            try self.emit(&self.body, 114, &.{ self.signed_type, signed_up, up }); // OpBitcast
+            try self.emit(&self.body, 124, &.{ self.signed_type, signed_up, up }); // OpBitcast
             const down = self.id();
             try self.emit(&self.body, 195, &.{ self.signed_type, down, signed_up, shift_amount }); // OpShiftRightArithmetic
             const as_bits = self.id();
-            try self.emit(&self.body, 114, &.{ self.bits_type, as_bits, down }); // OpBitcast
+            try self.emit(&self.body, 124, &.{ self.bits_type, as_bits, down }); // OpBitcast
             try self.destination(inst.dst, .{ .id = as_bits, .value_type = .bits32 });
             return;
         }
@@ -4753,6 +4754,7 @@ const Builder = struct {
         if (binding.dimension != .two_d or self.sampled_image_arrays[0] == 0) {
             return Error.InvalidStorageBinding;
         }
+        self.uses_image_gather_extended = self.uses_image_gather_extended or inst.image_sample_flags.offset;
 
         const coordinate_base: u32 = @intFromBool(inst.image_sample_flags.offset);
         const raw_x = try self.source(try imageAddressOperand(inst, coordinate_base), .float32);
@@ -6668,6 +6670,33 @@ fn emitPhi(
     return result;
 }
 
+fn labelBranchesTo(words: []const u32, source: u32, target: u32) bool {
+    var current_label: u32 = 0;
+    var index: usize = 0;
+    while (index < words.len) {
+        const first = words[index];
+        const word_count: usize = first >> 16;
+        if (word_count == 0 or index + word_count > words.len) return false;
+        const opcode: u16 = @truncate(first);
+        switch (opcode) {
+            248 => current_label = words[index + 1], // OpLabel
+            249 => if (current_label == source and words[index + 1] == target) return true, // OpBranch
+            250 => if (current_label == source and
+                (words[index + 2] == target or words[index + 3] == target)) return true, // OpBranchConditional
+            251 => if (current_label == source) { // OpSwitch
+                if (words[index + 2] == target) return true;
+                var target_index = index + 4;
+                while (target_index < index + word_count) : (target_index += 2) {
+                    if (words[target_index] == target) return true;
+                }
+            },
+            else => {},
+        }
+        index += word_count;
+    }
+    return false;
+}
+
 fn falseCondition(builder: *Builder) Error!u32 {
     const result = builder.id();
     try builder.emit(&builder.body, 170, &.{
@@ -6726,12 +6755,42 @@ fn directBranchCondition(opcode: isa.Opcode) ?struct { control_flow.Condition, b
     };
 }
 
-fn mergeIncomingStates(builder: *Builder, incoming: []const State, parent_labels: []const u32) Error!State {
+fn mergeIncomingStates(
+    builder: *Builder,
+    merge_label: u32,
+    incoming: []const State,
+    parent_labels: []const u32,
+) Error!State {
     if (incoming.len == 0 or incoming.len != parent_labels.len) return Error.UnsupportedControlFlow;
     for (incoming) |state| {
         if (!state.valid) return Error.UnsupportedControlFlow;
     }
-    if (incoming.len == 1) return incoming[0];
+
+    // Structuring redirects guest edges through synthetic selection merges.
+    // The guest CFG can therefore name a state whose canonical exit no longer
+    // branches directly to this SPIR-V block. OpPhi requires exactly one input
+    // per real predecessor; retaining the stale guest edge produces invalid
+    // modules and can crash a native driver compiler.
+    var predecessor_indices: std.ArrayList(usize) = .empty;
+    defer predecessor_indices.deinit(builder.allocator);
+    for (parent_labels, 0..) |parent, incoming_index| {
+        var duplicate = false;
+        for (parent_labels[0..incoming_index]) |previous_parent| {
+            if (previous_parent == parent) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        // Dropping a state here would make later branches enter or leave a
+        // selection construct illegally. Retry the whole graph through the
+        // block-index dispatcher, whose loop/switch shape accepts arbitrary
+        // guest edges while keeping every generated SPIR-V edge structured.
+        if (!labelBranchesTo(builder.body.items, parent, merge_label)) return Error.UnsupportedControlFlow;
+        try predecessor_indices.append(builder.allocator, incoming_index);
+    }
+    if (predecessor_indices.items.len == 0) return Error.UnsupportedControlFlow;
+    if (predecessor_indices.items.len == 1) return incoming[predecessor_indices.items[0]];
 
     var merged = State{ .valid = true };
     var values: std.ArrayList(Value) = .empty;
@@ -6745,12 +6804,13 @@ fn mergeIncomingStates(builder: *Builder, incoming: []const State, parent_labels
         var missing = false;
         var differs = false;
         var first = Value{};
-        for (incoming, 0..) |state, index| {
+        for (predecessor_indices.items, 0..) |incoming_index, index| {
+            const state = incoming[incoming_index];
             const value = state.registers[reg];
             if (value.id == 0) missing = true;
             if (index == 0) first = value else if (value.id != first.id) differs = true;
             try values.append(builder.allocator, value);
-            try parents.append(builder.allocator, parent_labels[index]);
+            try parents.append(builder.allocator, parent_labels[incoming_index]);
         }
         if (missing) continue;
         merged.registers[reg] = if (!differs)
@@ -6764,12 +6824,13 @@ fn mergeIncomingStates(builder: *Builder, incoming: []const State, parent_labels
     var missing_scc = false;
     var different_scc = false;
     var first_scc: u32 = 0;
-    for (incoming, 0..) |state, index| {
+    for (predecessor_indices.items, 0..) |incoming_index, index| {
+        const state = incoming[incoming_index];
         const id = state.scc;
         if (id == 0) missing_scc = true;
         if (index == 0) first_scc = id else if (id != first_scc) different_scc = true;
         try values.append(builder.allocator, .{ .id = id, .value_type = .bits32 });
-        try parents.append(builder.allocator, parent_labels[index]);
+        try parents.append(builder.allocator, parent_labels[incoming_index]);
     }
     if (!missing_scc) {
         merged.scc = if (!different_scc)
@@ -6783,12 +6844,13 @@ fn mergeIncomingStates(builder: *Builder, incoming: []const State, parent_labels
     var missing_carry = false;
     var different_carry = false;
     var first_carry: u32 = 0;
-    for (incoming, 0..) |state, index| {
+    for (predecessor_indices.items, 0..) |incoming_index, index| {
+        const state = incoming[incoming_index];
         const id = state.arithmetic_carry;
         if (id == 0) missing_carry = true;
         if (index == 0) first_carry = id else if (id != first_carry) different_carry = true;
         try values.append(builder.allocator, .{ .id = id, .value_type = .bits32 });
-        try parents.append(builder.allocator, parent_labels[index]);
+        try parents.append(builder.allocator, parent_labels[incoming_index]);
     }
     if (!missing_carry) {
         merged.arithmetic_carry = if (!different_carry)
@@ -6805,6 +6867,7 @@ fn mergeState(
     states: []const State,
     labels: []const u32,
     block: u32,
+    merge_label: u32,
 ) Error!State {
     // Builder initialization owns the ABI inputs: specialized USER_DATA,
     // descriptors and any stage-provided registers. Starting the entry block
@@ -6822,7 +6885,7 @@ fn mergeState(
         try incoming.append(builder.allocator, states[edge.from]);
         try parents.append(builder.allocator, labels[edge.from]);
     }
-    return mergeIncomingStates(builder, incoming.items, parents.items);
+    return mergeIncomingStates(builder, merge_label, incoming.items, parents.items);
 }
 
 fn buildDominators(builder: *Builder, graph: *const control_flow.Graph) Error![]bool {
@@ -7335,7 +7398,12 @@ fn translateStructured(builder: *Builder, instructions: []const instruction.Inst
                     try merge_incoming.append(builder.allocator, selection_states[child_index]);
                     try merge_parents.append(builder.allocator, selection_merge_labels[child_index]);
                 }
-                const merged = try mergeIncomingStates(builder, merge_incoming.items, merge_parents.items);
+                const merged = try mergeIncomingStates(
+                    builder,
+                    selection_merge_labels[index],
+                    merge_incoming.items,
+                    merge_parents.items,
+                );
                 builder.restore(merged);
                 selection_states[index] = merged;
                 const parent_label = if (structuredSelectionParent(graph, dominators, index)) |parent|
@@ -7364,10 +7432,22 @@ fn translateStructured(builder: *Builder, instructions: []const instruction.Inst
                 try block_incoming.append(builder.allocator, selection_states[selection_index]);
                 try block_parents.append(builder.allocator, selection_merge_labels[selection_index]);
             }
-            incoming = try mergeIncomingStates(builder, block_incoming.items, block_parents.items);
+            incoming = try mergeIncomingStates(
+                builder,
+                labels[block.index],
+                block_incoming.items,
+                block_parents.items,
+            );
         } else {
             try builder.emit(&builder.body, 248, &.{labels[block.index]}); // OpLabel
-            incoming = try mergeState(builder, graph, states, exit_labels, block.index);
+            incoming = try mergeState(
+                builder,
+                graph,
+                states,
+                exit_labels,
+                block.index,
+                labels[block.index],
+            );
         }
         builder.restore(incoming);
         if (block.index == 0) try builder.initializeStageInputs();
@@ -7487,6 +7567,9 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     try appendInstruction(allocator, &words, 17, &.{64}); // OpCapability GroupNonUniformShuffle
     if (builder.uses_image_query) {
         try appendInstruction(allocator, &words, 17, &.{50}); // OpCapability ImageQuery
+    }
+    if (builder.uses_image_gather_extended) {
+        try appendInstruction(allocator, &words, 17, &.{25}); // OpCapability ImageGatherExtended
     }
     for (options.storage_images) |binding| {
         if (!storageImageNeedsExtendedFormats(binding.format)) continue;
@@ -7728,6 +7811,18 @@ fn containsOpcode(words: []const u32, wanted: u16) bool {
         const count = first >> 16;
         if (count == 0) return false;
         index += count;
+    }
+    return false;
+}
+
+fn containsOpcodeWithFirstOperand(words: []const u32, wanted: u16, wanted_operand: u32) bool {
+    var index: usize = 5;
+    while (index < words.len) {
+        const first = words[index];
+        const word_count: usize = first >> 16;
+        if (word_count < 2 or index + word_count > words.len) return false;
+        if (@as(u16, @truncate(first)) == wanted and words[index + 1] == wanted_operand) return true;
+        index += word_count;
     }
     return false;
 }
@@ -9201,6 +9296,7 @@ test "fragment gather4 level zero writes four texels and preserves a packed offs
     defer module.deinit(std.testing.allocator);
 
     try std.testing.expect(containsOpcode(module.words, 96)); // OpImageGather
+    try std.testing.expect(containsOpcodeWithFirstOperand(module.words, 17, 25)); // ImageGatherExtended
     try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 202)); // signed X/Y offset extraction
     try std.testing.expectEqual(@as(usize, 4), countOpcode(module.words, 81)); // four gathered texels
 }
@@ -10349,6 +10445,73 @@ test "structured merge phi names canonical exit after a guarded store" {
     });
     defer module.deinit(std.testing.allocator);
     try std.testing.expect(containsOpcode(module.words, 245)); // OpPhi
+    try expectPhiParentsArePredecessors(module.words);
+}
+
+test "terminal nested selection contributes only real merge predecessors" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .family = .vop1,
+        .opcode = .v_mov_b32,
+        .dst = .{ .kind = .vgpr, .reg = 0 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 2, .signed_val = 2 },
+        .src_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 4,
+        .family = .vopc,
+        .opcode = .v_cmp_neq_f32,
+        .dst = .{ .kind = .vcc_lo },
+        .src0 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, 1.0)) },
+        .src1 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, 0.0)) },
+        .src_count = 2,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 8,
+        .family = .sopp,
+        .opcode = .s_cbranch_vccnz,
+        .branch_target = 28,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 12,
+        .family = .vop1,
+        .opcode = .v_mov_b32,
+        .dst = .{ .kind = .vgpr, .reg = 0 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 3, .signed_val = 3 },
+        .src_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 16,
+        .family = .vopc,
+        .opcode = .v_cmp_neq_f32,
+        .dst = .{ .kind = .vcc_lo },
+        .src0 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, 1.0)) },
+        .src1 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, 0.0)) },
+        .src_count = 2,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 20,
+        .family = .sopp,
+        .opcode = .s_cbranch_vccnz,
+        .branch_target = 28,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 24, .family = .sopp, .opcode = .s_endpgm });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 28,
+        .family = .vop2,
+        .opcode = .v_add_f32,
+        .dst = .{ .kind = .vgpr, .reg = 1 },
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src1 = .{ .kind = .float_inline_constant, .value = @bitCast(@as(f32, 1.0)) },
+        .src_count = 2,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 32, .family = .sopp, .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(module.used_dispatcher);
     try expectPhiParentsArePredecessors(module.words);
 }
 

@@ -2513,6 +2513,9 @@ pub const Renderer = struct {
         if (supported_features.values[vk.feature_fragment_stores_and_atomics] != 0) {
             enabled_features.values[vk.feature_fragment_stores_and_atomics] = vk.true_value;
         }
+        if (supported_features.values[vk.feature_shader_image_gather_extended] != 0) {
+            enabled_features.values[vk.feature_shader_image_gather_extended] = vk.true_value;
+        }
         // A rectangle list needs a stage that sees the whole primitive, so
         // that the corner it leaves out can be completed from the three it
         // gives. Without the feature those draws keep their single triangle.

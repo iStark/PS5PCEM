@@ -325,7 +325,8 @@ pub fn main(init: std.process.Init) !void {
         // The two are routinely spelled differently — a library ending in a
         // version digit usually lives in a module without it — and a report
         // showing only one leaves that difference invisible.
-        try out.print("  {s} {s}  {s}/{s}  {s}  {s}", .{
+        try out.print("  0x{x:0>12}  {s} {s}  {s}/{s}  {s}  {s}", .{
+            imp.target_offset,
             status.mark(),
             imp.id,
             imp.module orelse imp.module_code,

@@ -43,6 +43,7 @@ fn openSaveDataHome(io: std.Io, content: std.Io.Dir) !std.Io.Dir {
 
 const save_data_home = "savedata";
 const terminator_2d_title_id = "PPSA25872";
+const tetris_effect_connected_title_id = "PPSA07923";
 const terminator_audio_latency_ms: u16 = 128;
 
 /// Compatibility stays the global default, while profiles enable only paths
@@ -51,6 +52,19 @@ const terminator_audio_latency_ms: u16 = 128;
 /// tracking and the other experimental paths remain disabled.
 fn titleUsesTerminatorGpuProfile(title_identifier: []const u8) bool {
     return std.ascii.eqlIgnoreCase(title_identifier, terminator_2d_title_id);
+}
+
+/// Tetris Effect consumes small compute/storage results from the CPU. Deferring
+/// their writeback can expose stale allocator/work data and corrupt MallocBinned3,
+/// so keep the validated eager path scoped to this title.
+fn titleNeedsEagerStorageWrites(title_identifier: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(title_identifier, tetris_effect_connected_title_id);
+}
+
+test "Tetris Effect profile materializes storage writes eagerly" {
+    try std.testing.expect(titleNeedsEagerStorageWrites("PPSA07923"));
+    try std.testing.expect(titleNeedsEagerStorageWrites("ppsa07923"));
+    try std.testing.expect(!titleNeedsEagerStorageWrites("PPSA25872"));
 }
 
 /// Reads the product code a title publishes in its own parameter document.
@@ -463,10 +477,11 @@ fn run(init: std.process.Init) !bool {
     // unconditional host waits between otherwise ordered Vulkan submissions.
     const enable_timeline_scheduler = !force_synchronous_submits;
     const enable_automatic_timeline_scheduler = enable_timeline_scheduler;
-    const force_eager_storage_writes = init.minimal.environ.containsUnempty(
-        allocator,
-        "PS5_GPU_EAGER_STORAGE_WRITES",
-    ) catch false;
+    const force_eager_storage_writes = titleNeedsEagerStorageWrites(title_identifier) or
+        (init.minimal.environ.containsUnempty(
+            allocator,
+            "PS5_GPU_EAGER_STORAGE_WRITES",
+        ) catch false);
     // Small compute outputs stay resident until an exact guest-memory consumer
     // requests them. The read path already materializes matching ranges; eager
     // writeback otherwise forces one submit/fence/readback for every dispatch.
