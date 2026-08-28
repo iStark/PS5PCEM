@@ -56,6 +56,13 @@ const Queue = struct {
     state: gpu_state.State = .{},
     active: ?Submission = null,
     pending: std.ArrayList(Submission) = .empty,
+    forced_read: ?ForcedRead = null,
+};
+
+const ForcedRead = struct {
+    address: u64,
+    length: u8,
+    bytes: [8]u8 = @splat(0),
 };
 
 pub const Scheduler = struct {
@@ -117,6 +124,34 @@ pub const Scheduler = struct {
         return false;
     }
 
+    /// Satisfies exactly one re-poll of the active WAIT_REG_MEM without
+    /// changing guest memory. This is used when the watched address overlaps
+    /// protected allocator metadata and publishing the synthetic recovery
+    /// value would corrupt the guest heap.
+    pub fn softSatisfyActiveWait(
+        self: *Scheduler,
+        kind: QueueKind,
+        wait: gpu_state.WaitRegMem,
+    ) bool {
+        if (!wait.memory_space) return false;
+        const queue = self.queueFor(kind);
+        const active = queue.active orelse return false;
+        if (active.continuation == null) return false;
+        const blocked = queue.state.blocked_wait orelse return false;
+        if (!std.meta.eql(blocked, wait)) return false;
+
+        var forced = ForcedRead{ .address = wait.address, .length = switch (wait.width) {
+            .bits_32 => 4,
+            .bits_64 => 8,
+        } };
+        switch (wait.width) {
+            .bits_32 => std.mem.writeInt(u32, forced.bytes[0..4], @truncate(wait.reference), .little),
+            .bits_64 => std.mem.writeInt(u64, &forced.bytes, wait.reference, .little),
+        }
+        queue.forced_read = forced;
+        return true;
+    }
+
     /// Owns a copy immediately: AGC may recycle the caller's command arena as
     /// soon as submit returns, while a blocked queue must retain its root DCB
     /// and every indirect command/register buffer reachable from it.
@@ -167,9 +202,12 @@ pub const Scheduler = struct {
         }
 
         const active = &queue.active.?;
+        const forced_read = queue.forced_read;
+        queue.forced_read = null;
         var snapshot_backend = SnapshotBackend{
             .original = self.backend,
             .snapshots = active.snapshots.items,
+            .forced_read = forced_read,
         };
         var snapshot_vtable = snapshot_backend.makeVtable();
         var dcb_executor = executor.DcbExecutor{
@@ -353,6 +391,7 @@ pub const Scheduler = struct {
 const SnapshotBackend = struct {
     original: executor.Backend,
     snapshots: []const Snapshot,
+    forced_read: ?ForcedRead,
 
     fn from(context: ?*anyopaque) *SnapshotBackend {
         return @ptrCast(@alignCast(context.?));
@@ -376,6 +415,12 @@ const SnapshotBackend = struct {
 
     fn read(context: ?*anyopaque, address: u64, bytes: []u8) bool {
         const self = from(context);
+        if (self.forced_read) |forced| {
+            if (address == forced.address and bytes.len == forced.length) {
+                @memcpy(bytes, forced.bytes[0..forced.length]);
+                return true;
+            }
+        }
         for (self.snapshots) |snapshot| {
             if (address < snapshot.address) continue;
             const source = std.mem.sliceAsBytes(snapshot.words);
@@ -591,6 +636,29 @@ test "an unsatisfied queue remains blocked without mutating its label" {
     try testing.expectEqual(@as(usize, 0), retry.completed_submissions);
     try testing.expectEqual(@as(usize, 1), retry.blocked_checks);
     try testing.expect(scheduler.isBlocked(.graphics));
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, host.memory[0x40..0x44], .little));
+}
+
+test "a protected wait can be soft-satisfied without mutating guest memory" {
+    var host = FakeBackend{};
+    const wait_stream = [_]u32{
+        customCommand(pm4.custom.wait_mem_32, 6),
+        0x1040,
+        0,
+        0xffff_ffff,
+        9,
+        0x13,
+        1,
+    };
+    var scheduler = Scheduler.init(testing.allocator, host.interface());
+    defer scheduler.deinit();
+
+    _ = try scheduler.submit(.graphics, &wait_stream);
+    try testing.expect(scheduler.isBlocked(.graphics));
+    const wait = scheduler.state(.graphics).blocked_wait.?;
+    try testing.expect(scheduler.softSatisfyActiveWait(.graphics, wait));
+    try testing.expectEqual(@as(usize, 1), (try scheduler.pump()).completed_submissions);
+    try testing.expect(!scheduler.isBlocked(.graphics));
     try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, host.memory[0x40..0x44], .little));
 }
 

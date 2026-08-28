@@ -1362,6 +1362,133 @@ fn packetWritesSubmissionAllocationHeader(stream: []const u32, packet: gpu.pm4.P
     return null;
 }
 
+const PacketMemoryRead = struct {
+    address: u64,
+    byte_length: usize,
+};
+
+/// Extracts the memory operand of a WAIT packet without executing it. Command
+/// islands are discovered heuristically inside arenas that also contain
+/// descriptor data, so a structurally valid packet is not sufficient proof
+/// that the surrounding words are executable PM4.
+fn packetWaitMemoryRead(packet: gpu.pm4.Packet) ?PacketMemoryRead {
+    if (packet.kind != .command) return null;
+    const body = packet.body;
+    if (packet.opcode == gpu.pm4.wait_reg_mem) {
+        if (body.len < 6 or body[0] & (1 << 4) == 0) return null;
+        return .{
+            .address = (@as(u64, body[2]) << 32) | (body[1] & 0xffff_fffc),
+            .byte_length = @sizeOf(u32),
+        };
+    }
+
+    const custom = gpu.pm4.customCode(packet) orelse return null;
+    if (custom == gpu.pm4.custom.wait_mem_64) {
+        if (body.len < 8) return null;
+        return .{
+            .address = (@as(u64, body[1]) << 32) | (body[0] & 0xffff_fff8),
+            .byte_length = @sizeOf(u64),
+        };
+    }
+    if (custom != gpu.pm4.custom.wait_mem_32) return null;
+    if (body.len < 5) return null;
+    return .{
+        .address = (@as(u64, body[1]) << 32) | (body[0] & 0xffff_fffc),
+        .byte_length = @sizeOf(u32),
+    };
+}
+
+/// Descriptor words occasionally form a structurally walkable Type-3 packet.
+/// Reject packet shapes which the executor itself cannot accept before using
+/// a RELEASE_MEM elsewhere in those words as evidence for a command island.
+fn packetHasPlausibleIslandShape(packet: gpu.pm4.Packet) bool {
+    if (packet.kind == .filler) return true;
+    if (packet.kind != .command) return false;
+    const body = packet.body;
+
+    if (gpu.pm4.registerSpaceOf(packet.opcode) != null) return body.len >= 1;
+    if (gpu.pm4.indirectRegisterSpaceOf(packet.opcode) != null) return body.len == 4;
+
+    switch (packet.opcode) {
+        gpu.pm4.set_base => return body.len == 3 and body[0] & 0xf == 1,
+        gpu.pm4.index_base => return body.len == 2,
+        gpu.pm4.index_buffer_size => return body.len == 1,
+        gpu.pm4.num_instances, gpu.pm4.index_type => return body.len >= 1,
+        gpu.pm4.acquire_mem => return body.len >= 6,
+        gpu.pm4.release_mem => return body.len >= 7,
+        gpu.pm4.wait_reg_mem => return body.len >= 6,
+        gpu.pm4.write_data => return body.len >= 3,
+        gpu.pm4.dma_data => return body.len == 6,
+        gpu.pm4.indirect_buffer => return body.len == 3 or body.len == 13,
+        gpu.pm4.event_write => {
+            if (body.len < 1) return false;
+            const event_type: u8 = @truncate(body[0] & 0x3f);
+            return (event_type & 0x3e) != 0x38 or body.len >= 3;
+        },
+        else => {},
+    }
+
+    const custom = gpu.pm4.customCode(packet) orelse return true;
+    return switch (custom) {
+        gpu.pm4.custom.acquire_mem => body.len >= 7,
+        gpu.pm4.custom.release_mem => body.len >= 7,
+        gpu.pm4.custom.context_regs_indirect,
+        gpu.pm4.custom.sh_regs_indirect,
+        gpu.pm4.custom.uconfig_regs_indirect,
+        => body.len >= 3,
+        gpu.pm4.custom.wait_mem_32 => body.len >= 5,
+        gpu.pm4.custom.wait_mem_64 => body.len >= 8,
+        gpu.pm4.custom.write_data => body.len >= 3,
+        gpu.pm4.custom.flip => body.len >= 5,
+        else => true,
+    };
+}
+
+fn unreadableIndirectTarget(address: u64, word_count: usize) ?u64 {
+    if (address == 0 or word_count == 0) return null;
+    const byte_count = std.math.mul(usize, word_count, @sizeOf(u32)) catch return address;
+    return if (resolveGuestMemoryAddress(address, byte_count) == null) address else null;
+}
+
+/// Returns an indirect command/register-list address which snapshotting would
+/// fail to read. A real island cannot depend on a target that is already
+/// unmapped at submission time; descriptor data can easily invent one.
+fn packetUnreadableIndirectTarget(packet: gpu.pm4.Packet) ?u64 {
+    if (packet.kind != .command) return null;
+    const body = packet.body;
+
+    if (gpu.pm4.indirectRegisterSpaceOf(packet.opcode) != null and body.len == 4) {
+        const address = (@as(u64, body[1]) << 32) | (body[0] & 0xffff_fffc);
+        const count: usize = body[3] & 0x3fff;
+        return unreadableIndirectTarget(address, std.math.mul(usize, count, 2) catch return address);
+    }
+
+    if (gpu.pm4.customCode(packet)) |custom| {
+        const indirect_registers = custom == gpu.pm4.custom.context_regs_indirect or
+            custom == gpu.pm4.custom.sh_regs_indirect or
+            custom == gpu.pm4.custom.uconfig_regs_indirect;
+        if (indirect_registers and body.len >= 3) {
+            const address = (@as(u64, body[2]) << 32) | (body[1] & 0xffff_fffc);
+            const count: usize = body[0] & 0x3fff;
+            return unreadableIndirectTarget(address, std.math.mul(usize, count, 2) catch return address);
+        }
+    }
+
+    if (packet.opcode != gpu.pm4.indirect_buffer) return null;
+    if (body.len == 3) {
+        const address = (@as(u64, body[1]) << 32) | body[0];
+        const count: usize = body[2] & 0x000f_ffff;
+        return unreadableIndirectTarget(address, count);
+    }
+    if (body.len != 13) return null;
+    const then_address = (@as(u64, body[8]) << 32) | body[7];
+    const then_count: usize = body[9] & 0x000f_ffff;
+    if (unreadableIndirectTarget(then_address, then_count)) |address| return address;
+    const else_address = (@as(u64, body[11]) << 32) | body[10];
+    const else_count: usize = body[12] & 0x000f_ffff;
+    return unreadableIndirectTarget(else_address, else_count);
+}
+
 /// Finds the next command island inside a mixed AGC arena.
 ///
 /// Core command buffers do not merely have an upward prefix and one downward
@@ -1386,6 +1513,31 @@ fn nextSubmittedCommandSegment(stream: []const u32, search_start: usize) ?Submit
             if (packet.kind != .command and packet.kind != .filler) {
                 break;
             }
+            if (!packetHasPlausibleIslandShape(packet)) {
+                if (unsafe_island_reports < 32) {
+                    std.debug.print(
+                        "[dcb guard] rejected command island with invalid {s} packet shape: header=0x{x:0>8} body={d} arena=0x{x}\n",
+                        .{
+                            packet.name() orelse "unknown",
+                            packet.header,
+                            packet.body.len,
+                            @intFromPtr(stream.ptr),
+                        },
+                    );
+                    unsafe_island_reports += 1;
+                }
+                break;
+            }
+            if (packetUnreadableIndirectTarget(packet)) |target| {
+                if (unsafe_island_reports < 32) {
+                    std.debug.print(
+                        "[dcb guard] rejected command island with unreadable indirect target: target=0x{x} arena=0x{x}\n",
+                        .{ target, @intFromPtr(stream.ptr) },
+                    );
+                    unsafe_island_reports += 1;
+                }
+                break;
+            }
             if (packetWritesSubmissionAllocationHeader(stream, packet)) |target| {
                 if (unsafe_island_reports < 32) {
                     std.debug.print(
@@ -1395,6 +1547,31 @@ fn nextSubmittedCommandSegment(stream: []const u32, search_start: usize) ?Submit
                     unsafe_island_reports += 1;
                 }
                 break;
+            }
+            if (packetWaitMemoryRead(packet)) |read| {
+                var readable: [@sizeOf(u64)]u8 = undefined;
+                const protected = overlapsSubmissionAllocationHeader(
+                    stream,
+                    read.address,
+                    read.byte_length,
+                );
+                const mapped = !protected and
+                    readGuestMemory(null, read.address, readable[0..read.byte_length]);
+                if (!mapped) {
+                    if (unsafe_island_reports < 32) {
+                        std.debug.print(
+                            "[dcb guard] rejected command island with {s} wait: target=0x{x}+{d} arena=0x{x}\n",
+                            .{
+                                if (protected) "protected" else "unreadable",
+                                read.address,
+                                read.byte_length,
+                                @intFromPtr(stream.ptr),
+                            },
+                        );
+                        unsafe_island_reports += 1;
+                    }
+                    break;
+                }
             }
             packets += 1;
             end = walker.index;
@@ -1669,6 +1846,17 @@ fn forceSatisfyWait(queue_kind: gpu.QueueKind, wait: gpu.state.WaitRegMem) bool 
             break :blk &bytes;
         },
     };
+    if (findSubmissionHeaderCollision(wait.address, payload.len)) |collision| {
+        const recovered = submission_scheduler.softSatisfyActiveWait(queue_kind, wait);
+        if (recovered and submission_header_write_reports < 32) {
+            std.debug.print(
+                "[agc wait] soft-satisfied protected header wait: target=0x{x}+{d} arena=0x{x} ref=0x{x}\n",
+                .{ collision.target_address, payload.len, collision.arena_address, wait.reference },
+            );
+            submission_header_write_reports += 1;
+        }
+        return recovered;
+    }
     const ok = writeGuestMemory(null, wait.address, payload);
     if (ok) {
         // Indirect command buffers are snapshotted at submit time. Unreal can
@@ -1980,6 +2168,83 @@ test "submitted DCB rejects a command island that writes its allocation header" 
     const prefix = submittedCommandPrefix(&stream);
     try testing.expectEqual(@as(usize, 2), prefix.len);
     try testing.expect(nextSubmittedCommandSegment(&stream, prefix.len) == null);
+}
+
+test "submitted DCB rejects command islands with unsafe memory waits" {
+    const wait_header = command(gpu.pm4.nop, 6) |
+        (@as(u32, gpu.pm4.custom.wait_mem_32) << 2);
+    const release_header = command(gpu.pm4.nop, 7) |
+        (@as(u32, gpu.pm4.custom.release_mem) << 2);
+    var protected_stream = [_]u32{
+        command(gpu.pm4.clear_state, 1), 0,
+        0,                               0,
+        0,                               0,
+        command(gpu.pm4.nop, 1),         0,
+        command(gpu.pm4.nop, 1),         0,
+        command(gpu.pm4.nop, 1),         0,
+        wait_header,                     0,
+        0,                               0xffff_ffff,
+        1,                               3,
+        0,                               release_header,
+        0x28,                            (@as(u32, 1) << 29) | (@as(u32, 1) << 16),
+        0x1000,                          0,
+        1,                               0,
+        0,
+    };
+    const protected_target = @intFromPtr(&protected_stream) - 4;
+    protected_stream[13] = @truncate(protected_target);
+    protected_stream[14] = @truncate(protected_target >> 32);
+
+    const prefix = submittedCommandPrefix(&protected_stream);
+    try testing.expectEqual(@as(usize, 2), prefix.len);
+    try testing.expect(nextSubmittedCommandSegment(&protected_stream, prefix.len) == null);
+
+    var unreadable_stream = protected_stream;
+    unreadable_stream[13] = 0xffff_fffc;
+    unreadable_stream[14] = 0xffff_ffff;
+    try testing.expect(nextSubmittedCommandSegment(&unreadable_stream, prefix.len) == null);
+}
+
+test "submitted DCB rejects semantically invalid command islands" {
+    const release_header = command(gpu.pm4.nop, 7) |
+        (@as(u32, gpu.pm4.custom.release_mem) << 2);
+    const invalid_dma_stream = [_]u32{
+        command(gpu.pm4.clear_state, 1),           0,
+        0,                                         0,
+        0,                                         0,
+        command(gpu.pm4.dma_data, 5),              0,
+        0,                                         0,
+        0,                                         0,
+        command(gpu.pm4.nop, 1),                   0,
+        command(gpu.pm4.nop, 1),                   0,
+        release_header,                            0x28,
+        (@as(u32, 1) << 29) | (@as(u32, 1) << 16), 0x1000,
+        0,                                         1,
+        0,                                         0,
+    };
+    const dma_prefix = submittedCommandPrefix(&invalid_dma_stream);
+    try testing.expectEqual(@as(usize, 2), dma_prefix.len);
+    try testing.expect(nextSubmittedCommandSegment(&invalid_dma_stream, dma_prefix.len) == null);
+
+    const unreadable_indirect_stream = [_]u32{
+        command(gpu.pm4.clear_state, 1),           0,
+        0,                                         0,
+        0,                                         0,
+        command(gpu.pm4.indirect_buffer, 3),       0xffff_fffc,
+        0xffff_ffff,                               4,
+        command(gpu.pm4.nop, 1),                   0,
+        command(gpu.pm4.nop, 1),                   0,
+        release_header,                            0x28,
+        (@as(u32, 1) << 29) | (@as(u32, 1) << 16), 0x1000,
+        0,                                         1,
+        0,                                         0,
+    };
+    const indirect_prefix = submittedCommandPrefix(&unreadable_indirect_stream);
+    try testing.expectEqual(@as(usize, 2), indirect_prefix.len);
+    try testing.expect(nextSubmittedCommandSegment(
+        &unreadable_indirect_stream,
+        indirect_prefix.len,
+    ) == null);
 }
 
 test "submitted DCB retains Type-2 alignment filler" {
