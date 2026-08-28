@@ -680,7 +680,7 @@ fn dequeue(
         output[index] = queue.pending[queue.pending_head];
         if ((output[index].filter == graphics_filter or
             (output[index].filter == user_filter and output[index].ident == 0x1800)) and
-            graphics_delivery_reports < 1024)
+            graphics_delivery_reports < 64)
         {
             std.debug.print(
                 "[agc event] handle={d} filter={d} ident=0x{x} data=0x{x} fflags={d} sequence={d} pending={d} thread=0x{x}\n",

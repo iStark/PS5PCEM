@@ -2727,8 +2727,8 @@ pub const Renderer = struct {
     frame_profile: FrameProfile = .{},
     last_flip_profile_ns: u64 = 0,
     reported_shader_failures: [64]?GraphicsShaderFailure = @splat(null),
-    reported_vertex_resource_programs: [16]u64 = @splat(0),
-    reported_fragment_resource_programs: [16]u64 = @splat(0),
+    reported_vertex_resource_programs: [4]u64 = @splat(0),
+    reported_fragment_resource_programs: [4]u64 = @splat(0),
     last_interface_vertex_address: u64 = 0,
     last_interface_fragment_address: u64 = 0,
     reported_interface_pairs: u8 = 0,
@@ -2742,7 +2742,7 @@ pub const Renderer = struct {
     reported_first_scissor_state: bool = false,
     reported_draw_errors: [16]?anyerror = @splat(null),
     reported_compute_shader_failures: [32]?ComputeShaderFailure = @splat(null),
-    reported_compute_resource_programs: [32]u64 = @splat(0),
+    reported_compute_resource_programs: [8]u64 = @splat(0),
     last_dispatch_error: ?anyerror = null,
     last_draw_error: ?anyerror = null,
     last_sync_error: ?anyerror = null,
@@ -4271,8 +4271,10 @@ pub const Renderer = struct {
                     },
                 );
             }
-            dumpScalarRegisters(resources.scalar_registers[0..resources.scalar_count]);
-            dumpShaderHead(analysis, 48);
+            if (log_verbose_gpu) {
+                dumpScalarRegisters(resources.scalar_registers[0..resources.scalar_count]);
+                dumpShaderHead(analysis, 48);
+            }
         }
         const translate_started = hostTimestampNs();
         var module = analysis.translateSpirv(self.allocator, .{
@@ -5196,26 +5198,28 @@ pub const Renderer = struct {
         const second_writes = try self.applyWholeImageClear(memory, second_clear);
 
         self.emulated_image_store_dispatches += 1;
-        std.debug.print(
-            "[vulkan dcb] emulated dual image clear: {d}+{d} texels {d}x{d}/{d}x{d} padded={d}x{d}/{d}x{d} fmt={d}/{d} tile={s}/{s} (#{d})\n",
-            .{
-                first_writes,
-                second_writes,
-                first_clear.subresource.width,
-                first_clear.subresource.height,
-                second_clear.subresource.width,
-                second_clear.subresource.height,
-                first_clear.subresource.padded_width,
-                first_clear.subresource.padded_height,
-                second_clear.subresource.padded_width,
-                second_clear.subresource.padded_height,
-                first.unified_format,
-                second.unified_format,
-                @tagName(first.tile_mode),
-                @tagName(second.tile_mode),
-                self.emulated_image_store_dispatches,
-            },
-        );
+        if (log_verbose_gpu or self.emulated_image_store_dispatches <= 4) {
+            std.debug.print(
+                "[vulkan dcb] emulated dual image clear: {d}+{d} texels {d}x{d}/{d}x{d} padded={d}x{d}/{d}x{d} fmt={d}/{d} tile={s}/{s} (#{d})\n",
+                .{
+                    first_writes,
+                    second_writes,
+                    first_clear.subresource.width,
+                    first_clear.subresource.height,
+                    second_clear.subresource.width,
+                    second_clear.subresource.height,
+                    first_clear.subresource.padded_width,
+                    first_clear.subresource.padded_height,
+                    second_clear.subresource.padded_width,
+                    second_clear.subresource.padded_height,
+                    first.unified_format,
+                    second.unified_format,
+                    @tagName(first.tile_mode),
+                    @tagName(second.tile_mode),
+                    self.emulated_image_store_dispatches,
+                },
+            );
+        }
         return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
     }
 
@@ -10529,8 +10533,10 @@ pub const Renderer = struct {
                     std.debug.print("\n", .{});
                 } else |_| {}
             }
-            dumpWideScalarLoads(vertex_scalar_regs[0..vertex_scalar_count]);
-            dumpShaderHead(vertex_analysis, vertex_analysis.program.instructions.items.len);
+            if (log_verbose_gpu) {
+                dumpWideScalarLoads(vertex_scalar_regs[0..vertex_scalar_count]);
+                dumpShaderHead(vertex_analysis, vertex_analysis.program.instructions.items.len);
+            }
         }
         if (self.traceCurrentGraphicsFrame()) {
             std.debug.print(
@@ -10668,8 +10674,10 @@ pub const Renderer = struct {
                     },
                 );
             }
-            dumpScalarRegisters(fragment_scalar_regs[0..fragment_scalar_count]);
-            dumpShaderHead(fragment_analysis, fragment_analysis.program.instructions.items.len);
+            if (log_verbose_gpu) {
+                dumpScalarRegisters(fragment_scalar_regs[0..fragment_scalar_count]);
+                dumpShaderHead(fragment_analysis, fragment_analysis.program.instructions.items.len);
+            }
         }
 
         var color_export_mappings: [gpu.resources.color_target_count]u8 =
@@ -15548,7 +15556,7 @@ pub const Renderer = struct {
         const vertex_stage = graphicsVertexStage(state);
         const has_vertex = vertex_stage != null;
         const has_fragment = gpu.resources.ShaderStage.pixel.programAddress(state) != null;
-        const trace_stall = self.flip_callbacks == 5;
+        const trace_stall = log_verbose_gpu and self.flip_callbacks == 5;
         if (trace_stall) std.debug.print(
             "[vulkan stall] begin draw={d} opcode=0x{x} vs={?x} ps={?x}\n",
             .{
@@ -15759,7 +15767,7 @@ pub const Renderer = struct {
         defer self.frame_profile.dispatch_ns +|= elapsedHostNanoseconds(profile_started);
         self.dispatch_callbacks += 1;
         self.frame_profile.dispatches += 1;
-        const trace_stall = self.flip_callbacks == 5;
+        const trace_stall = log_verbose_gpu and self.flip_callbacks == 5;
         if (trace_stall) std.debug.print(
             "[vulkan stall] begin dispatch={d} opcode=0x{x} program={?x}\n",
             .{

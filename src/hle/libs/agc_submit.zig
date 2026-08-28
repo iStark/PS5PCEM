@@ -255,7 +255,7 @@ fn deliverCompletion(completion: PendingCompletion) usize {
         },
         .release => {
             const triggered = event_queue.triggerOneGraphicsEventPerQueue(completion.context_id);
-            if (release_delivery_reports < 512) {
+            if (release_delivery_reports < 64) {
                 std.debug.print(
                     "[agc delivery] interrupt context={d} queues={d}\n",
                     .{ completion.context_id, triggered },
@@ -936,7 +936,7 @@ fn backendRelease(_: ?*anyopaque, value: gpu.state.ReleaseMem) bool {
     if (installed_backend) |backend| {
         if (backend.vtable.release) |callback| {
             const accepted = callback(backend.context, value);
-            if (reports_interrupt and interrupt_release_reports < 512) {
+            if (reports_interrupt and interrupt_release_reports < 64) {
                 var new_label: [8]u8 = [_]u8{0} ** 8;
                 const new_label_valid = label_size != 0 and
                     readGuestMemory(null, value.address, new_label[0..label_size]);
@@ -1838,7 +1838,7 @@ fn executeSubmittedLocked(label: []const u8, stream: []const u32) SubmitOutcome 
             .{report.completed_submissions},
         );
     }
-    if (submission_reports < 512) {
+    if (submission_reports < 64) {
         const state = submission_scheduler.state(kind);
         if (state.release_count != release_count_before) {
             const release = state.last_release.?;
@@ -2043,7 +2043,7 @@ fn driverCompletionLabel(
     if (!readGuestMemory(null, completion_label, &label_bytes)) return null;
     const label_value = std.mem.readInt(u64, &label_bytes, .little);
     if (label_value == 0) return null;
-    if (driver_completion_chain_reports < 256) {
+    if (driver_completion_chain_reports < 32) {
         std.debug.print(
             "[agc submit] private node=0x{x} stream=0x{x}/{d} type={d} label=0x{x}/0x{x}\n",
             .{ node, node_stream, node_words, node_type, completion_label, label_value },

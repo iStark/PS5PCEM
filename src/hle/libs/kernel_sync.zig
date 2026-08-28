@@ -1155,11 +1155,13 @@ fn condSignalCore(cond_outer: ?*CondHandle, broadcast: bool) Error!void {
     const thread_name_storage = threading.currentThreadName();
     const thread_name = std.mem.sliceTo(&thread_name_storage, 0);
     if (std.mem.eql(u8, thread_name, "AgcInterruptThread")) {
-        _ = agc_interrupt_cond_sequence.fetchAdd(1, .release);
-        std.debug.print(
-            "[agc interrupt] cond {s} key=0x{x} sequence={d} waiters={d}\n",
-            .{ if (broadcast) "broadcast" else "signal", @intFromPtr(object), sequence, waiters },
-        );
+        const interrupt_sequence = agc_interrupt_cond_sequence.fetchAdd(1, .release) + 1;
+        if (interrupt_sequence <= 64) {
+            std.debug.print(
+                "[agc interrupt] cond {s} key=0x{x} sequence={d} waiters={d}\n",
+                .{ if (broadcast) "broadcast" else "signal", @intFromPtr(object), sequence, waiters },
+            );
+        }
     }
     object.signal_count +|= 1;
     if (waiters == 0) object.zero_waiter_signals +|= 1;
