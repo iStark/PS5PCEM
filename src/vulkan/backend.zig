@@ -10882,7 +10882,7 @@ pub const Renderer = struct {
                     self.allocator,
                     vertex_storage.mappings[0..vertex_storage.mapping_count],
                     unity_ui_position.?,
-                    unity_ui_uv.?,
+                    unity_ui_record.?,
                     unity_ui_color.?,
                 )
             else
@@ -19173,7 +19173,7 @@ fn buildUnityUiVertexSpirv(
     allocator: std.mem.Allocator,
     storage: []const gpu.ShaderSpirvStorageBufferBinding,
     position: gpu.ShaderSpirvStorageBufferBinding,
-    uv: gpu.ShaderSpirvStorageBufferBinding,
+    record: gpu.ShaderSpirvStorageBufferBinding,
     color: gpu.ShaderSpirvStorageBufferBinding,
 ) !rdna2.spirv.Module {
     const vgpr = struct {
@@ -19196,7 +19196,11 @@ fn buildUnityUiVertexSpirv(
     defer program.deinit(allocator);
     try program.instructions.appendSlice(allocator, &.{
         .{ .pc = position.instruction_pc.?, .opcode = .buffer_load_format_xy, .dst = vgpr(9), .src0 = vgpr(5), .src1 = sgpr(position.resource_sgpr), .src2 = .{ .kind = .null }, .src_count = 3, .index_enable = true },
-        .{ .pc = uv.instruction_pc.?, .opcode = .buffer_load_format_xy, .dst = vgpr(11), .src0 = vgpr(5), .src1 = sgpr(uv.resource_sgpr), .src2 = .{ .kind = .null }, .src_count = 3, .index_enable = true },
+        // Byte 16 contains only the quad-local 0..1 corner coordinate. The
+        // four-float record at byte 0 carries the already resolved atlas UV;
+        // using the local coordinate samples the complete font atlas once per
+        // glyph and reduces every character to the same dots and stripes.
+        .{ .pc = record.instruction_pc.?, .opcode = .buffer_load_format_xyzw, .dst = vgpr(11), .src0 = vgpr(5), .src1 = sgpr(record.resource_sgpr), .src2 = .{ .kind = .null }, .src_count = 3, .index_enable = true },
         .{ .pc = color.instruction_pc.?, .opcode = .buffer_load_format_xyzw, .dst = vgpr(4), .src0 = vgpr(5), .src1 = sgpr(color.resource_sgpr), .src2 = .{ .kind = .null }, .src_count = 3, .index_enable = true },
 
         // The traced matrix is the standard 3840x2160 pixel-space projection.
