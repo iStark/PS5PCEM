@@ -614,7 +614,7 @@ fn enter(comptime name: []const u8, arguments: []const u64, caller: usize) void 
         if (index != 0) std.debug.print(", ", .{});
         std.debug.print("0x{x}", .{value});
     }
-    std.debug.print(")\n", .{});
+    std.debug.print(") caller=0x{x}\n", .{caller});
 }
 
 /// Records a completed call and passes its result through.

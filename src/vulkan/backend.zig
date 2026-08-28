@@ -1057,6 +1057,44 @@ fn guestPrimitiveTopology(primitive_type: u32, draw: GuestDraw) u32 {
     };
 }
 
+/// Prospero RECT_LIST auto draws describe one logical rectangle with counts
+/// 1/3/4. The NGG/export shader uses the system vertex index to synthesize the
+/// missing corner, so the host must actually invoke it four times. Completing
+/// a fourth corner after the VS loses guest-computed position and UV logic.
+fn expandRectangleListDraw(primitive_type: u32, draw: GuestDraw) GuestDraw {
+    if (draw.index_count != null) return draw;
+    var expanded = draw;
+    if (primitive_type == 7 and
+        (draw.vertex_count == 1 or draw.vertex_count == 3 or draw.vertex_count == 4))
+    {
+        expanded.vertex_count = 4;
+    } else if (primitive_type == 17 and draw.vertex_count == 3) {
+        expanded.vertex_count = 4;
+    }
+    return expanded;
+}
+
+fn rectangleCompletionMode(
+    vertex_stage: gpu.resources.ShaderStage,
+    primitive_type: u32,
+    draw: GuestDraw,
+    fullscreen_corner: bool,
+) u32 {
+    // Unity's merged NGG path sometimes submits three indexed corners as an
+    // ordinary TRI_LIST even though the hardware is expected to complete the
+    // rectangle. The resource-backed corner check is deliberately performed
+    // by the caller; mode 2 completes the corner opposite v0.
+    if (fullscreen_corner and vertex_stage == .export_shader and
+        primitive_type == 4 and draw.index_count == 3)
+    {
+        return 2;
+    }
+    if (primitive_type == 7 or primitive_type == 17) {
+        return @intFromBool(draw.index_count == null and draw.vertex_count == 3);
+    }
+    return 0;
+}
+
 /// Some graphics passes omit CB registers because the following VideoOut flip
 /// names the scanout allocation. Preserve every draw and its complete state so
 /// the pass can be replayed in order once that allocation is known.
@@ -1502,14 +1540,16 @@ const HtileResolveStats = struct {
 const TextureProbe = struct {
     address: u64 = 0,
     span: usize = 0,
+    page_generation: u64 = 0,
     source_generation: u64 = 0,
     hash: u64 = 0,
+    hash_valid: bool = false,
     valid: bool = false,
 };
 
 /// Distinct sampled sources remembered per frame. A title binding more than
 /// this many in one frame simply re-probes the ones that fall out.
-const maximum_texture_probes = 32;
+const maximum_texture_probes = 256;
 
 /// Whether guest memory still holds the words a program was decoded from.
 fn programWordsMatch(reader: gpu.ShaderMemoryReader, address: u64, words: []const u32) bool {
@@ -1630,6 +1670,10 @@ const FrameProfile = struct {
     scalar_provenance_ns: u64 = 0,
     shader_translate_ns: u64 = 0,
     graphics_resource_ns: u64 = 0,
+    sampled_stage_ns: u64 = 0,
+    sampled_flush_ns: u64 = 0,
+    sampled_generation_ns: u64 = 0,
+    sampled_lookup_ns: u64 = 0,
     texture_probe_ns: u64 = 0,
     render_target_create_ns: u64 = 0,
     depth_target_create_ns: u64 = 0,
@@ -1842,7 +1886,8 @@ const PreparedStorageImage = struct {
     allocation_bytes: usize,
     staging_bytes: usize,
     writable: bool,
-    cache_index: usize,
+    cache_index: ?usize = null,
+    render_target_index: ?usize = null,
 };
 
 const CachedStorageImage = struct {
@@ -2038,7 +2083,10 @@ const ComputeResources = struct {
 
     fn deinit(self: *ComputeResources, renderer: *Renderer) void {
         for (self.storage_images[0..self.storage_image_count]) |image| {
-            renderer.releaseStorageImage(image.cache_index);
+            if (image.cache_index) |cache_index| renderer.releaseStorageImage(cache_index);
+            if (image.render_target_index) |target_index| {
+                renderer.transitionRenderTargetToColorAttachment(target_index) catch {};
+            }
         }
         self.storage_image_count = 0;
         self.storage_image_mapping_count = 0;
@@ -2054,8 +2102,261 @@ const ComputeResources = struct {
     }
 };
 
+fn isFullscreenCornerTriangle(
+    reader: gpu.ShaderMemoryReader,
+    resources: *const ComputeResources,
+    draw: GuestDraw,
+) bool {
+    if (draw.index_count == null or draw.index_count.? != 3 or draw.index_address == 0) return false;
+
+    var indices: [3]u32 = undefined;
+    const index_stride: u64 = if (draw.index_uint32) 4 else 2;
+    for (&indices, 0..) |*index, element| {
+        const index_address = draw.index_address + @as(u64, @intCast(element)) * index_stride;
+        index.* = if (draw.index_uint32)
+            reader.readU32(index_address) catch return false
+        else
+            reader.readU16(index_address) catch return false;
+    }
+
+    for (resources.mappings[0..resources.mapping_count]) |mapping| {
+        if (!mapping.use_vertex_index or mapping.unified_format != 77 or mapping.stride < 16) continue;
+        const source_offset = mapping.soffset_value orelse 0;
+        if (source_offset != 0) continue;
+        const slot: usize = @intCast(mapping.descriptor_index);
+        var corners: [3][4]f32 = undefined;
+        var valid = true;
+        for (indices, 0..) |index, corner| {
+            const byte_offset = std.math.mul(u64, index, mapping.stride) catch {
+                valid = false;
+                break;
+            };
+            if (byte_offset + 16 > @as(u64, @intCast(resources.sizes[slot]))) {
+                valid = false;
+                break;
+            }
+            var words: [4]u32 = undefined;
+            reader.readWords(resources.addresses[slot] + byte_offset, &words) catch {
+                valid = false;
+                break;
+            };
+            for (&corners[corner], words) |*component, word| component.* = @bitCast(word);
+        }
+        if (!valid) continue;
+
+        for (corners) |corner| {
+            if (@abs(@abs(corner[0]) - 1.0) > 0.0001 or
+                @abs(@abs(corner[1]) - 1.0) > 0.0001 or
+                @abs(corner[2]) > 0.0001 or @abs(corner[3] - 1.0) > 0.0001)
+            {
+                valid = false;
+                break;
+            }
+        }
+        if (!valid) continue;
+        // Mode 2 reconstructs v3 = v1 + v2 - v0. Require v0 to be the
+        // shared corner and v1/v2 to be the diagonal pair so that equation is
+        // exactly the missing fourth clip-space corner.
+        const first_adjacent = corners[0][0] == corners[1][0] or corners[0][1] == corners[1][1];
+        const second_adjacent = corners[0][0] == corners[2][0] or corners[0][1] == corners[2][1];
+        const others_diagonal = corners[1][0] != corners[2][0] and corners[1][1] != corners[2][1];
+        if (first_adjacent and second_adjacent and others_diagonal) return true;
+    }
+    return false;
+}
+
+const DrawVertexRange = struct {
+    minimum: i64,
+    maximum: i64,
+};
+
+/// Return the effective Vulkan VertexIndex range for this draw. AGC attribute
+/// tables also describe small per-draw lookup buffers; those buffers must keep
+/// the guest-computed MUBUF index instead of being indexed by a mesh index that
+/// lies outside their descriptor.
+fn drawVertexRange(reader: gpu.ShaderMemoryReader, draw: GuestDraw) ?DrawVertexRange {
+    if (draw.index_count) |count| {
+        if (count == 0 or draw.index_address == 0) return null;
+        const stride: u64 = if (draw.index_uint32) 4 else 2;
+        var minimum: u32 = std.math.maxInt(u32);
+        var maximum: u32 = 0;
+        var element: u32 = 0;
+        while (element < count) : (element += 1) {
+            const byte_offset = std.math.mul(u64, element, stride) catch return null;
+            const index = if (draw.index_uint32)
+                reader.readU32(draw.index_address + byte_offset) catch return null
+            else
+                reader.readU16(draw.index_address + byte_offset) catch return null;
+            minimum = @min(minimum, index);
+            maximum = @max(maximum, index);
+        }
+        return .{
+            .minimum = @as(i64, minimum) + draw.vertex_offset,
+            .maximum = @as(i64, maximum) + draw.vertex_offset,
+        };
+    }
+    if (draw.vertex_count == 0) return null;
+    return .{
+        .minimum = draw.first_vertex,
+        .maximum = @as(i64, draw.first_vertex) + draw.vertex_count - 1,
+    };
+}
+
+fn validateVertexIndexMappings(
+    reader: gpu.ShaderMemoryReader,
+    resources: *ComputeResources,
+    draw: GuestDraw,
+) void {
+    const range = drawVertexRange(reader, draw) orelse return;
+    for (resources.mappings[0..resources.mapping_count]) |*mapping| {
+        if (!mapping.use_vertex_index or mapping.stride == 0) continue;
+        if (range.minimum < 0 or range.maximum < range.minimum) {
+            mapping.use_vertex_index = false;
+            continue;
+        }
+        const required = std.math.mul(
+            u64,
+            @as(u64, @intCast(range.maximum)) + 1,
+            mapping.stride,
+        ) catch {
+            mapping.use_vertex_index = false;
+            continue;
+        };
+        const extent = mapping.extent_bytes orelse continue;
+        if (required > extent) {
+            // This is a lookup/indirection buffer from the same AGC attribute
+            // table, not a record array indexed by the draw's mesh indices.
+            mapping.use_vertex_index = false;
+        }
+    }
+}
+
 fn canReuseStorageMapping(attribute_specific: bool, previous: ?u32, current: u32) bool {
     return !attribute_specific and previous != null and previous.? == current;
+}
+
+/// AGC's attribute table uses the sparse VertexAttribFormat numbering while a
+/// live V# uses the compact BufferFormat enum. Converting here lets a shader
+/// fetch be paired with the right table entry even when fetch order differs
+/// from semantic/location order.
+fn vertexAttributeBufferFormat(format: u16) u16 {
+    return switch (format) {
+        0 => 0,
+        4 => 1,
+        8 => 2,
+        12 => 3,
+        16 => 4,
+        20 => 5,
+        24 => 6,
+        28 => 7,
+        32 => 8,
+        36 => 9,
+        40 => 10,
+        44 => 11,
+        48 => 12,
+        52 => 13,
+        57 => 14,
+        61 => 15,
+        65 => 16,
+        69 => 17,
+        73 => 18,
+        77 => 19,
+        80 => 20,
+        84 => 21,
+        88 => 22,
+        93 => 23,
+        97 => 24,
+        101 => 25,
+        105 => 26,
+        109 => 27,
+        113 => 28,
+        117 => 29,
+        122 => 30,
+        126 => 31,
+        130 => 32,
+        134 => 33,
+        138 => 34,
+        142 => 35,
+        146 => 36,
+        150 => 37,
+        154 => 38,
+        158 => 39,
+        162 => 40,
+        166 => 41,
+        170 => 42,
+        174 => 43,
+        179 => 44,
+        183 => 45,
+        187 => 46,
+        191 => 47,
+        195 => 48,
+        199 => 49,
+        203 => 50,
+        207 => 51,
+        211 => 52,
+        215 => 53,
+        219 => 54,
+        223 => 55,
+        227 => 56,
+        231 => 57,
+        235 => 58,
+        239 => 59,
+        243 => 60,
+        247 => 61,
+        249 => 62,
+        253 => 63,
+        257 => 64,
+        263 => 65,
+        267 => 66,
+        271 => 67,
+        275 => 68,
+        279 => 69,
+        283 => 70,
+        287 => 71,
+        290 => 72,
+        294 => 73,
+        298 => 74,
+        303 => 75,
+        307 => 76,
+        311 => 77,
+        else => format,
+    };
+}
+
+const maximum_vertex_attributes = 32;
+
+fn matchVertexAttribute(
+    table: *const gpu.VertexBindings,
+    used: *[maximum_vertex_attributes]bool,
+    descriptor: gpu.BufferDescriptor,
+) ?gpu.VertexAttribute {
+    var best_index: ?usize = null;
+    var best_score: u8 = 0;
+    for (table.slice(), 0..) |attribute, index| {
+        if (used[index] or attribute.buffer.address != descriptor.address) continue;
+        var score: u8 = 1;
+        if (attribute.buffer.stride == descriptor.stride) score += 2;
+        if (vertexAttributeBufferFormat(attribute.attribute_format) == descriptor.unified_format) score += 4;
+        if (best_index == null or score > best_score) {
+            best_index = index;
+            best_score = score;
+        }
+    }
+    const index = best_index orelse return null;
+    used[index] = true;
+    return table.attributes[index];
+}
+
+fn takeNextVertexAttribute(
+    table: *const gpu.VertexBindings,
+    used: *[maximum_vertex_attributes]bool,
+) ?gpu.VertexAttribute {
+    for (table.slice(), 0..) |attribute, index| {
+        if (used[index]) continue;
+        used[index] = true;
+        return attribute;
+    }
+    return null;
 }
 
 fn dumpComputeSpirv(allocator: std.mem.Allocator, program_address: u64, words: []const u32) void {
@@ -2109,10 +2410,16 @@ fn sampledImageDimensionForInstruction(
     dimension: rdna2.isa.ImageDimension,
     image_type: gpu.resources.ImageType,
 ) ?rdna2.spirv.SampledImageDimension {
-    // GFX10's DIM is a requested coordinate form; the T# resource type is the
-    // authoritative view kind. Unity emits DIM=5 for both real 2D arrays and
-    // 3D lookup volumes, so refine the ambiguous form after materializing T#.
-    if (image_type == .color_3d) return .three_d;
+    // GFX10's DIM selects the coordinate payload while the T# resource type is
+    // the authoritative view kind. Unity uses three-coordinate MIMG forms for
+    // both volumes and ordinary 2D render targets; Vulkan requires the view
+    // dimension to match the descriptor, so refine it after materializing T#.
+    switch (image_type) {
+        .color_3d => return .three_d,
+        .color_2d_array => return .two_d_array,
+        .color_1d, .color_2d => return .two_d,
+        else => {},
+    }
     return switch (dimension) {
         .dim_1d => .two_d,
         .dim_2d => .two_d,
@@ -2144,6 +2451,20 @@ const CachedSampledImage = struct {
     view: vk.ImageView,
     sampler: vk.Sampler,
     last_used_frame: u64,
+};
+
+const CachedResidentImageView = struct {
+    image: vk.Image,
+    view_type: u32,
+    format: u32,
+    components: vk.ComponentMapping,
+    aspect_mask: vk.Flags,
+    view: vk.ImageView,
+};
+
+const CachedResidentSampler = struct {
+    descriptor: gpu.resources.SamplerDescriptor,
+    sampler: vk.Sampler,
 };
 
 fn aliasRange(address: u64, byte_count: anytype) image_alias.Range {
@@ -2304,6 +2625,8 @@ pub const Renderer = struct {
     image_aliases: image_alias.Manager = .{},
     image_states: image_state.Tracker = .{},
     sampled_image_cache: std.ArrayList(CachedSampledImage) = .empty,
+    resident_image_views: std.ArrayList(CachedResidentImageView) = .empty,
+    resident_samplers: std.ArrayList(CachedResidentSampler) = .empty,
     storage_image_cache: std.ArrayList(CachedStorageImage) = .empty,
     storage_image_cache_bytes: usize = 0,
     storage_image_sequence: u64 = 0,
@@ -2333,6 +2656,8 @@ pub const Renderer = struct {
     reported_depth_attachment: bool = false,
     reported_unbacked_depth_sample: bool = false,
     reported_resident_rt_sample: bool = false,
+    reported_tone_map_fallback: bool = false,
+    reported_ui_composite: bool = false,
     htile_targets: std.ArrayList(CachedHtileTarget) = .empty,
     htile_target_sequence: u64 = 0,
     latest_render_target_index: ?usize = null,
@@ -2381,6 +2706,10 @@ pub const Renderer = struct {
     video_surface_count: usize = 0,
     video_surface_last_flip: u64 = 0,
     latest_video_render_target_index: ?usize = null,
+    /// The RGBA scene feeding a deferred HDR composite that is not translated
+    /// faithfully yet.  Remembering the resident input lets presentation use
+    /// the intact scene after all of the frame's draws have completed.
+    deferred_composite_ui_address: ?u64 = null,
     emulated_volume_copies: u64 = 0,
     reported_dual_image_clear_fallback: bool = false,
     reported_fast_clear_seeds: u32 = 0,
@@ -2507,6 +2836,9 @@ pub const Renderer = struct {
         const descriptor_partially_bound = descriptor_indexing_support.descriptor_binding_partially_bound != 0;
         const supported_features = supported_features_2.features;
         var enabled_features = vk.PhysicalDeviceFeatures{};
+        if (supported_features.values[vk.feature_robust_buffer_access] != 0) {
+            enabled_features.values[vk.feature_robust_buffer_access] = vk.true_value;
+        }
         if (supported_features.values[vk.feature_shader_storage_image_extended_formats] != 0) {
             enabled_features.values[vk.feature_shader_storage_image_extended_formats] = vk.true_value;
         }
@@ -2876,6 +3208,16 @@ pub const Renderer = struct {
         for (self.color_passes.items) |pass| self.destroyColorPass(pass);
         self.color_passes.deinit(self.allocator);
         self.color_passes = .empty;
+        for (self.resident_image_views.items) |cached| {
+            self.device_functions.destroy_image_view(self.device, cached.view, null);
+        }
+        self.resident_image_views.deinit(self.allocator);
+        self.resident_image_views = .empty;
+        for (self.resident_samplers.items) |cached| {
+            self.device_functions.destroy_sampler(self.device, cached.sampler, null);
+        }
+        self.resident_samplers.deinit(self.allocator);
+        self.resident_samplers = .empty;
         for (self.render_targets.items) |target| self.destroyCachedRenderTarget(target);
         self.render_targets.deinit(self.allocator);
         for (self.depth_targets.items) |target| self.destroyCachedDepthTarget(target);
@@ -5117,7 +5459,7 @@ pub const Renderer = struct {
             (gpu.VertexBindings.capture(bindings, reader) catch null)
         else
             null;
-        var vertex_attribute_index: usize = 0;
+        var used_vertex_attributes: [maximum_vertex_attributes]bool = @splat(false);
         result.scalar_count = collectScalarLoadSpecializations(scalar, &result.scalar_registers);
         result.scalar_count = mergeUserDataScalars(
             bindings,
@@ -5196,15 +5538,14 @@ pub const Renderer = struct {
                 return Error.MissingStorageDescriptor;
             }
             const resource_sgpr = resource_operand.reg;
-            var vertex_attribute: ?gpu.VertexAttribute = null;
-            if (bindings.stage != .compute and inst.family != .smem and !is_store) {
-                if (vertex_table) |table| {
-                    if (vertex_attribute_index < table.attribute_count) {
-                        vertex_attribute = table.attributes[vertex_attribute_index];
-                        vertex_attribute_index += 1;
-                    }
-                }
-            }
+            const formatted_vertex_fetch = is_vertex_stage and inst.family != .smem and !is_store and switch (inst.opcode) {
+                .buffer_load_format_x,
+                .buffer_load_format_xy,
+                .buffer_load_format_xyz,
+                .buffer_load_format_xyzw,
+                => true,
+                else => false,
+            };
             // Resolve the descriptor at the instruction itself. Shader prologs
             // reuse the same SGPR quartet for several SMEM-loaded V# values;
             // a final whole-program snapshot (or the first mapping for that
@@ -5223,7 +5564,7 @@ pub const Renderer = struct {
             // V# descriptors and leaves every texture lookup at one corner.
             // Keep the table entry only as a fallback for shaders whose V#
             // producer cannot yet be reconstructed.
-            const descriptor = try resolveComputeBufferDescriptor(
+            const resolved_descriptor = try resolveComputeBufferDescriptor(
                 bindings,
                 reader,
                 analysis,
@@ -5231,7 +5572,20 @@ pub const Renderer = struct {
                 &instruction_scalar,
                 resource_sgpr,
                 inst.pc,
-            ) orelse (if (vertex_attribute) |attribute|
+            );
+            const vertex_attribute: ?gpu.VertexAttribute = if (resolved_descriptor) |resolved|
+                if (vertex_table) |*table|
+                    matchVertexAttribute(table, &used_vertex_attributes, resolved)
+                else
+                    null
+            else if (formatted_vertex_fetch)
+                if (vertex_table) |*table|
+                    takeNextVertexAttribute(table, &used_vertex_attributes)
+                else
+                    null
+            else
+                null;
+            const descriptor = resolved_descriptor orelse (if (vertex_attribute) |attribute|
                 takePlausibleBufferDescriptor(attribute.buffer)
             else
                 null) orelse {
@@ -5333,8 +5687,18 @@ pub const Renderer = struct {
                 .swizzled = descriptor.swizzle_enabled,
                 .index_stride = descriptor.index_stride,
                 .add_thread_id = descriptor.add_thread_id,
+                // AGC's vertex table supplies the element separately and its
+                // V# may leave DST_SEL at zero. Those zero selectors are not
+                // an instruction to replace every fetched component with 0;
+                // formatted vertex fetches use their natural XYZW order. The
+                // recovered V# format remains authoritative because AGC's
+                // attribute-format numbering is not uniformly identical to
+                // the RDNA unified-format enum (values above 182 are common).
                 .unified_format = descriptor.unified_format,
-                .dst_select = descriptor.dst_select,
+                .dst_select = if (vertex_attribute != null or formatted_vertex_fetch)
+                    .{ 4, 5, 6, 7 }
+                else
+                    descriptor.dst_select,
                 // The descriptor already says how far the buffer goes, so the
                 // shader can be held to it instead of being trusted to stay
                 // inside on its own.
@@ -5591,6 +5955,7 @@ pub const Renderer = struct {
                 return Error.UnsupportedSampledImage;
             };
             const descriptor_index: u32 = @intCast(descriptor_slot);
+            const sampled_started = hostTimestampNs();
             const image = self.stageSampledImage(
                 image_descriptor,
                 sampler_descriptor,
@@ -5603,6 +5968,7 @@ pub const Renderer = struct {
                 );
                 return err;
             };
+            self.frame_profile.sampled_stage_ns +|= elapsedHostNanoseconds(sampled_started);
             result.sampled_images[result.sampled_image_count] = image;
             result.sampled_image_count += 1;
             result.sampled_image_mappings[result.sampled_image_mapping_count] = .{
@@ -6359,6 +6725,7 @@ pub const Renderer = struct {
             const geometry_words = buildRectangleListGeometrySpirv(
                 self.allocator,
                 pipeline_state.rectangle_parameter_mask,
+                pipeline_state.rectangle_completion,
             ) catch return Error.ShaderModuleCreationFailed;
             defer self.allocator.free(geometry_words);
             if (self.dump_graphics_spirv) dumpGraphicsSpirv(self.allocator, "gs", pipeline_state.rectangle_parameter_mask, geometry_words);
@@ -6570,7 +6937,7 @@ pub const Renderer = struct {
     ) u64 {
         for (self.texture_probes[0..self.texture_probe_count]) |probe| {
             if (!probe.valid or probe.address != address or probe.span != span) continue;
-            if (probe.source_generation != source_generation) break;
+            if (!probe.hash_valid or probe.source_generation != source_generation) break;
             return probe.hash;
         }
         const started = hostTimestampNs();
@@ -6582,6 +6949,7 @@ pub const Renderer = struct {
             .span = span,
             .source_generation = source_generation,
             .hash = hash,
+            .hash_valid = true,
             .valid = true,
         };
         for (self.texture_probes[0..self.texture_probe_count]) |*probe| {
@@ -6594,6 +6962,47 @@ pub const Renderer = struct {
             self.texture_probe_count += 1;
         }
         return hash;
+    }
+
+    /// Page tracking walks every guest page in a sampled allocation. A frame
+    /// may bind the same 32 MiB texture hundreds of times, while guest writes
+    /// are serialized through dcbWrite and reset this table. Query each range
+    /// once per frame instead of repeating the full walk for every draw.
+    fn sampledPageGeneration(self: *Renderer, memory: GuestMemory, address: u64, span: usize) u64 {
+        for (self.texture_probes[0..self.texture_probe_count]) |probe| {
+            if (probe.valid and probe.address == address and probe.span == span) {
+                return probe.page_generation;
+            }
+        }
+        const generation = if (memory.track_gpu_read) |track|
+            track(memory.context, address, span)
+        else
+            0;
+        const entry = TextureProbe{
+            .address = address,
+            .span = span,
+            .page_generation = generation,
+            .valid = true,
+        };
+        if (self.texture_probe_count < self.texture_probes.len) {
+            self.texture_probes[self.texture_probe_count] = entry;
+            self.texture_probe_count += 1;
+        }
+        return generation;
+    }
+
+    fn invalidateTextureProbes(self: *Renderer, address: u64, span: usize) void {
+        var index: usize = 0;
+        while (index < self.texture_probe_count) {
+            const probe = self.texture_probes[index];
+            if (!probe.valid or !byteRangesOverlap(address, span, probe.address, probe.span)) {
+                index += 1;
+                continue;
+            }
+            self.texture_probe_count -= 1;
+            self.texture_probes[index] = self.texture_probes[self.texture_probe_count];
+            self.texture_probes[self.texture_probe_count] = .{};
+        }
     }
 
     fn getGraphicsPipeline(
@@ -7169,7 +7578,8 @@ pub const Renderer = struct {
             vk.image_usage_color_attachment_bit |
                 vk.image_usage_transfer_src_bit |
                 vk.image_usage_transfer_dst_bit |
-                vk.image_usage_sampled_bit,
+                vk.image_usage_sampled_bit |
+                vk.image_usage_storage_bit,
             samples,
             1,
         );
@@ -7229,6 +7639,7 @@ pub const Renderer = struct {
     fn destroyCachedRenderTarget(self: *Renderer, target: CachedRenderTarget) void {
         self.image_aliases.unregister(target.alias_token);
         self.image_states.forgetImage(target.image.handle);
+        self.invalidateResidentImageViews(target.image.handle);
         self.invalidateColorPasses(target.view);
         self.destroyDepthPass(target.depth_pass);
         self.destroyFramebuffer(target.framebuffer);
@@ -7248,6 +7659,7 @@ pub const Renderer = struct {
         self.image_aliases.unregister(target.alias_token);
         if (target.stencil_alias_token) |token| self.image_aliases.unregister(token);
         self.image_states.forgetImage(target.image.handle);
+        self.invalidateResidentImageViews(target.image.handle);
         self.destroyImageView(target.view);
         if (target.readback) |buffer| self.destroyBuffer(buffer);
         self.destroyImage(target.image);
@@ -7285,6 +7697,24 @@ pub const Renderer = struct {
         self.render_targets.items[index].shader_read_layout = false;
     }
 
+    fn transitionRenderTargetToStorage(self: *Renderer, index: usize) anyerror!void {
+        if (index >= self.render_targets.items.len) return Error.MissingPresentedFrame;
+        const snapshot = self.render_targets.items[index];
+        if (!snapshot.initialized) return Error.MissingPresentedFrame;
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        try self.transitionTrackedImage(
+            command_buffer,
+            snapshot.image.handle,
+            .{ .aspect_mask = vk.image_aspect_color_bit },
+            image_state.storage_usage,
+        );
+        try self.submitOneShot(command_buffer);
+        // Reuse the existing non-attachment marker so the normal return path
+        // transitions GENERAL back to COLOR_ATTACHMENT_OPTIMAL.
+        self.render_targets.items[index].shader_read_layout = true;
+    }
+
     fn findResidentRenderTargetIndex(
         self: *Renderer,
         descriptor: gpu.resources.ImageDescriptor,
@@ -7320,20 +7750,14 @@ pub const Renderer = struct {
         const cached = self.render_targets.items[index];
         try self.transitionRenderTargetToShaderRead(index);
         const components = try sampledImageComponents(descriptor.dst_select);
-        const view_info = vk.ImageViewCreateInfo{
-            .image = cached.image.handle,
-            .view_type = if (dimension == .two_d_array) vk.image_view_type_2d_array else vk.image_view_type_2d,
-            .format = image_format,
-            .components = components,
-            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-        };
-        var view: vk.ImageView = 0;
-        if (self.device_functions.create_image_view(self.device, &view_info, null, &view) != vk.success) {
-            return Error.ImageViewCreationFailed;
-        }
-        errdefer self.destroyImageView(view);
-        const sampler = try self.createGuestSampler(sampler_descriptor);
-        errdefer self.destroySampler(sampler);
+        const view = try self.residentImageView(
+            cached.image.handle,
+            if (dimension == .two_d_array) vk.image_view_type_2d_array else vk.image_view_type_2d,
+            image_format,
+            components,
+            vk.image_aspect_color_bit,
+        );
+        const sampler = try self.residentSampler(sampler_descriptor);
         self.updateSampledImageDescriptor(descriptor_index, view, sampler, dimension);
         if (!self.reported_resident_rt_sample) {
             self.reported_resident_rt_sample = true;
@@ -7354,8 +7778,8 @@ pub const Renderer = struct {
             .image = cached.image,
             .view = view,
             .sampler = sampler,
-            .owns_view = true,
-            .owns_sampler = true,
+            .owns_view = false,
+            .owns_sampler = false,
         };
     }
 
@@ -7394,26 +7818,21 @@ pub const Renderer = struct {
             }
             try self.transitionDepthTargetToShaderRead(index);
             const components = try sampledImageComponents(descriptor.dst_select);
-            const view_info = vk.ImageViewCreateInfo{
-                .image = cached.image.handle,
-                .format = cached.target.format,
-                .components = components,
-                .subresource_range = .{ .aspect_mask = vk.image_aspect_depth_bit },
-            };
-            var view: vk.ImageView = 0;
-            if (self.device_functions.create_image_view(self.device, &view_info, null, &view) != vk.success) {
-                return Error.ImageViewCreationFailed;
-            }
-            errdefer self.destroyImageView(view);
-            const sampler = try self.createGuestSampler(sampler_descriptor);
-            errdefer self.destroySampler(sampler);
+            const view = try self.residentImageView(
+                cached.image.handle,
+                vk.image_view_type_2d,
+                cached.target.format,
+                components,
+                vk.image_aspect_depth_bit,
+            );
+            const sampler = try self.residentSampler(sampler_descriptor);
             self.updateSampledImageDescriptor(descriptor_index, view, sampler, .two_d);
             return .{
                 .image = cached.image,
                 .view = view,
                 .sampler = sampler,
-                .owns_view = true,
-                .owns_sampler = true,
+                .owns_view = false,
+                .owns_sampler = false,
             };
         }
         return null;
@@ -7892,15 +8311,14 @@ pub const Renderer = struct {
                     },
                 );
             }
-            if (metadata_changed and cached_snapshot.initialized) {
-                const visible_bytes = try colorTargetFrameBytes(cached_snapshot.target);
-                try self.flushPendingGuestWrite(cached_snapshot.target.descriptor.address, visible_bytes);
-            }
             const cached = &self.render_targets.items[index];
-            if (metadata_changed) {
-                cached.initialized = false;
-                cached.scanout_flip_vertical = false;
-            }
+            // DCC/CMASK register bindings describe how guest memory would be
+            // interpreted, but a resident VkImage already contains the
+            // decompressed colour result. Merely rebinding metadata must not
+            // force that image through guest memory and upload it again. An
+            // actual metadata write still invalidates the target through
+            // prepareCmaskWrite/alias tracking.
+            if (metadata_changed) cached.scanout_flip_vertical = false;
             // Clear registers can change without changing the allocation.
             // Keep the newest descriptor for a subsequent metadata resolve.
             cached.target = target;
@@ -8241,8 +8659,7 @@ pub const Renderer = struct {
             destination.descriptor.fragments_log2 != 0 or
             initial_source.target.descriptor.address == destination.descriptor.address or
             initial_source.target.descriptor.width != destination.descriptor.width or
-            initial_source.target.descriptor.height != destination.descriptor.height or
-            initial_source.target.format.vulkan != destination.format.vulkan)
+            initial_source.target.descriptor.height != destination.descriptor.height)
         {
             return null;
         }
@@ -9774,23 +10191,23 @@ pub const Renderer = struct {
         const vertex_scalar_end: u32 = 0x0010_0000;
         var vertex_scalar_regs: [gpu.scalar_provenance.maximum_scalar_specializations]gpu.ShaderSpirvScalarRegister = undefined;
         var vertex_scalar_count = collectScalarLoadSpecializations(&vertex_scalar, &vertex_scalar_regs);
-        // NGG/export programs often address USER_DATA as s0.. even when the
-        // capture table records scalar_user_data_base=8 for the ES bank. Seed
-        // the raw USER_DATA window at s0 so s3.. are not left undefined.
         vertex_scalar_count = mergeUserDataScalars(
             &vertex_bindings,
-            0,
+            vertex_bindings.scalar_user_data_base,
             &vertex_scalar_regs,
             vertex_scalar_count,
         );
-        // Also seed at the hardware base (s8 for export_shader).
-        if (vertex_bindings.scalar_user_data_base != 0) {
-            vertex_scalar_count = mergeUserDataScalars(
-                &vertex_bindings,
-                vertex_bindings.scalar_user_data_base,
-                &vertex_scalar_regs,
-                vertex_scalar_count,
-            );
+        if (vertex_stage == .export_shader and vertex_scalar_count < vertex_scalar_regs.len) {
+            // GFX10 merged shaders reserve s0:s7 for SPI inputs. Unity's NGG
+            // prolog reads the active ES/GS lane counts from the low two bytes
+            // of s3 before it touches USER_DATA at s8. Vulkan invokes exactly
+            // the live vertices, so a full 64/64 wave is the stable equivalent;
+            // copying USER_DATA[3] here corrupts EXEC and collapses geometry.
+            vertex_scalar_regs[vertex_scalar_count] = .{
+                .register = 3,
+                .value = 0x0000_4040,
+            };
+            vertex_scalar_count += 1;
         }
         // Recover attribute V#s from the AGC vertex buffer table into the SGPRs
         // the VS MUBUF instructions name (typically s4 for Unity NGG).
@@ -9857,6 +10274,7 @@ pub const Renderer = struct {
             break :blk ComputeResources{};
         };
         defer vertex_storage.deinit(self);
+        validateVertexIndexMappings(reader, &vertex_storage, draw);
         // V# payloads are runtime descriptor data, not shader constants.  The
         // resource preparation above has already decoded them and assigned
         // stable host descriptor slots.  Leaving their guest addresses in the
@@ -9933,6 +10351,60 @@ pub const Renderer = struct {
                     return;
                 }
             }
+        }
+        const fullscreen_corner = vertex_stage == .export_shader and
+            render_state.primitive_type == 4 and
+            isFullscreenCornerTriangle(reader, &vertex_storage, draw);
+        // Tetris keeps the composited UI layer immediately below its packed
+        // HDR scene allocation.  Until the title's large deferred-composite
+        // pixel program is translated exactly, preserve the already rendered
+        // RGBA layer instead of feeding its malformed HDR result into the
+        // final tone mapper.
+        if (fragment_mapping_count == 4 and paired_parameter_mask == 0xf and
+            target.descriptor.width == 3840 and target.descriptor.height == 2160)
+        {
+            const scene = graphics_resources.descriptors[0];
+            if (scene.unified_format == 36 and scene.address >= 0x200_0000) {
+                var ui_layer = scene;
+                ui_layer.address -= 0x200_0000;
+                ui_layer.unified_format = 56;
+                if (!self.reported_ui_composite) {
+                    if (self.deferred_composite_ui_address != ui_layer.address) {
+                        std.debug.print(
+                            "[vulkan dcb] deferred-composite presentation anchor @0x{x}\n",
+                            .{ui_layer.address},
+                        );
+                    }
+                    self.deferred_composite_ui_address = ui_layer.address;
+                }
+                if (self.findResidentRenderTargetIndex(ui_layer, vk.format_r8g8b8a8_unorm)) |source_index| {
+                    if (try self.blitResidentColorTarget(source_index, target, false) != null) {
+                        if (self.flip_callbacks < 24 or log_verbose_gpu) {
+                            std.debug.print(
+                                "[vulkan dcb] preserved Tetris UI layer: 0x{x} -> 0x{x}\n",
+                                .{ ui_layer.address, target.descriptor.address },
+                            );
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+        // A four-PARAM full-screen pass is not necessarily a copy. Tetris uses
+        // this shape for its five-texture tone-map/composite shader. Bypassing
+        // it with a copy of descriptor zero discards the UI and post-processing
+        // inputs, so only take the copy fast path for the single-image cases
+        // below.
+        if (fragment_image_count == 1 and fullscreen_corner and
+            target.descriptor.width == 3840 and target.descriptor.height == 2160 and
+            try self.emulateFullscreenSampleBlit(
+                memory,
+                target,
+                graphics_resources.descriptors[0],
+                false,
+            ))
+        {
+            return;
         }
         if (fragment_image_count == 1 and
             hasFullscreenSampleBlitGeometry(draw) and
@@ -10013,7 +10485,7 @@ pub const Renderer = struct {
             for (vertex_storage.mappings[0..vertex_storage.mapping_count]) |mapping| {
                 const slot: usize = @intCast(mapping.descriptor_index);
                 std.debug.print(
-                    "  pc={any} V#s{d} slot={d} addr=0x{x} size=0x{x} stride={d} fmt={d} dst={any} soffset={any} vertex_index={any}\n",
+                    "  pc={any} V#s{d} slot={d} addr=0x{x} size=0x{x} stride={d} fmt={d} dst={any} soffset={any} vertex_attribute={any}\n",
                     .{
                         mapping.instruction_pc,
                         mapping.resource_sgpr,
@@ -10059,6 +10531,58 @@ pub const Renderer = struct {
             }
             dumpWideScalarLoads(vertex_scalar_regs[0..vertex_scalar_count]);
             dumpShaderHead(vertex_analysis, vertex_analysis.program.instructions.items.len);
+        }
+        if (self.traceCurrentGraphicsFrame()) {
+            std.debug.print(
+                "[vulkan dcb] traced vertex resources draw={d} stage={s} program=0x{x} mappings={d} index=0x{x}/{?d} index32={any} base={d} first={d} instances={d}\n",
+                .{
+                    self.frame_profile.draws,
+                    @tagName(vertex_stage),
+                    vertex_address,
+                    vertex_storage.mapping_count,
+                    draw.index_address,
+                    draw.index_count,
+                    draw.index_uint32,
+                    draw.vertex_offset,
+                    draw.first_vertex,
+                    draw.instance_count,
+                },
+            );
+            for (vertex_storage.mappings[0..vertex_storage.mapping_count]) |mapping| {
+                const slot: usize = @intCast(mapping.descriptor_index);
+                std.debug.print(
+                    "  trace V#s{d} slot={d} addr=0x{x} size=0x{x} stride={d} fmt={d} dst={any} soffset={any} attr={any}\n",
+                    .{
+                        mapping.resource_sgpr,
+                        mapping.descriptor_index,
+                        vertex_storage.addresses[slot],
+                        vertex_storage.sizes[slot],
+                        mapping.stride,
+                        mapping.unified_format,
+                        mapping.dst_select,
+                        mapping.soffset_value,
+                        mapping.use_vertex_index,
+                    },
+                );
+            }
+            if (draw.index_address != 0 and draw.index_count != null and draw.index_count.? != 0) {
+                var index_bytes: [32]u8 = undefined;
+                if (reader.read(draw.index_address, &index_bytes)) |_| {
+                    std.debug.print("  trace indices", .{});
+                    if (draw.index_uint32) {
+                        var offset: usize = 0;
+                        while (offset < index_bytes.len) : (offset += 4) {
+                            std.debug.print(" {d}", .{std.mem.readInt(u32, index_bytes[offset..][0..4], .little)});
+                        }
+                    } else {
+                        var offset: usize = 0;
+                        while (offset < index_bytes.len) : (offset += 2) {
+                            std.debug.print(" {d}", .{std.mem.readInt(u16, index_bytes[offset..][0..2], .little)});
+                        }
+                    }
+                    std.debug.print("\n", .{});
+                } else |_| {}
+            }
         }
 
         // Pixel shaders use MUBUF/TBUFFER for constant and structured data as
@@ -10215,12 +10739,27 @@ pub const Renderer = struct {
         }
         var texture_probe_module: ?rdna2.spirv.Module = null;
         defer if (texture_probe_module) |*module| module.deinit(self.allocator);
-        if (self.force_probe_fragment_texture and fragment_mapping_count != 0) {
+        const screen_space_tone_map = fragment_mapping_count == 4 and
+            paired_parameter_mask == 0xf and
+            target.descriptor.width == 3840 and target.descriptor.height == 2160;
+        if ((self.force_probe_fragment_texture or screen_space_tone_map) and
+            fragment_mapping_count != 0)
+        {
+            const tone_mapping_index: usize = 0;
+            const tone_mapping = graphics_resources.mappings[tone_mapping_index];
             texture_probe_module = try buildTextureProbeFragmentSpirv(
                 self.allocator,
-                graphics_resources.mappings[0],
+                tone_mapping,
                 .{ target.descriptor.width, target.descriptor.height },
+                if (screen_space_tone_map) 0 else 2,
             );
+            if (screen_space_tone_map and !self.reported_tone_map_fallback) {
+                self.reported_tone_map_fallback = true;
+                std.debug.print(
+                    "[vulkan dcb] using screen-space sampled fallback for unsupported 4K tone mapper program=0x{x}\n",
+                    .{fragment_address},
+                );
+            }
         }
         var parameter_probe_module: ?rdna2.spirv.Module = null;
         defer if (parameter_probe_module) |*module| module.deinit(self.allocator);
@@ -10236,6 +10775,61 @@ pub const Renderer = struct {
                 .{ target.descriptor.width, target.descriptor.height },
             );
         }
+        var unity_ui_position: ?gpu.ShaderSpirvStorageBufferBinding = null;
+        var unity_ui_uv: ?gpu.ShaderSpirvStorageBufferBinding = null;
+        var unity_ui_color: ?gpu.ShaderSpirvStorageBufferBinding = null;
+        var unity_ui_record: ?gpu.ShaderSpirvStorageBufferBinding = null;
+        for (vertex_storage.mappings[0..vertex_storage.mapping_count]) |mapping| {
+            if (mapping.stride != 40 or mapping.instruction_pc == null) continue;
+            // Unity's interleaved UI record stores normalized texture UV at
+            // byte 16 and pixel-space position at byte 24. Both attributes
+            // use the same 32_32_FLOAT format, so matching them in shader
+            // fetch order silently swaps the values: 0..1 is then projected
+            // as a screen position and every primitive collapses at a corner.
+            if (mapping.soffset_value == 16 and mapping.unified_format == 64) {
+                unity_ui_uv = mapping;
+            } else if (mapping.soffset_value == 24 and mapping.unified_format == 64) {
+                unity_ui_position = mapping;
+            } else if (mapping.soffset_value == 32 and mapping.unified_format == 56) {
+                unity_ui_color = mapping;
+            } else if (mapping.soffset_value == 0 and mapping.unified_format == 77) {
+                unity_ui_record = mapping;
+            }
+        }
+        // The guest sometimes declares the 2000-line UI viewport through a
+        // 2160-line backing image. Match the complete Unity fetch signature,
+        // not only that unstable allocation height; the four instruction PCs
+        // and five-binding layout distinguish it from the other 4K passes.
+        const unity_ui_extent = target.descriptor.width == 3840 and
+            (target.descriptor.height == 2000 or target.descriptor.height == 2160);
+        const unity_ui_fallback = unity_ui_extent and
+            vertex_stage == .export_shader and
+            paired_parameter_mask == 0x3 and
+            fragment_mapping_count == 1 and
+            vertex_storage.mapping_count == 5 and
+            unity_ui_position != null and unity_ui_uv != null and unity_ui_color != null and unity_ui_record != null and
+            unity_ui_uv.?.instruction_pc.? == 264 and
+            unity_ui_record.?.instruction_pc.? == 428 and
+            unity_ui_position.?.instruction_pc.? == 528 and
+            unity_ui_color.?.instruction_pc.? == 608 and
+            unity_ui_position.?.descriptor_index == unity_ui_uv.?.descriptor_index and
+            unity_ui_position.?.descriptor_index == unity_ui_color.?.descriptor_index and
+            unity_ui_position.?.descriptor_index == unity_ui_record.?.descriptor_index;
+        var unity_ui_fragment_module: ?rdna2.spirv.Module = null;
+        defer if (unity_ui_fragment_module) |*module| module.deinit(self.allocator);
+        if (unity_ui_fallback) {
+            unity_ui_fragment_module = try buildUnityUiFragmentSpirv(
+                self.allocator,
+                graphics_resources.mappings[0],
+                .{ target.descriptor.width, target.descriptor.height },
+                if (graphics_resources.descriptors[0].unified_format == 1) blk: {
+                    for (graphics_resources.descriptors[0].dst_select, 0..) |selector, component| {
+                        if (selector == 4) break :blk @as(u32, @intCast(component));
+                    }
+                    break :blk @as(u32, 0);
+                } else null,
+            );
+        }
         var i420_module: ?rdna2.spirv.Module = null;
         defer if (i420_module) |*module| module.deinit(self.allocator);
         if (planar_video) |video| {
@@ -10249,6 +10843,8 @@ pub const Renderer = struct {
         }
         const fragment_words = if (self.force_probe_fragment)
             graphics_probe_fragment_spirv[0..]
+        else if (unity_ui_fragment_module) |module|
+            module.words
         else if (texture_probe_module) |module|
             module.words
         else if (parameter_probe_module) |module|
@@ -10281,26 +10877,39 @@ pub const Renderer = struct {
                 }
             else
                 vertex_analysis.program;
-            if (rdna2.translateProgramSpirvWithPipelineOptions(self.allocator, &vertex_program, .{
-                .stage = .vertex,
-                // The PS5 NGG/export ABI supplies S_NGG_VERTEX_INDEX in v5;
-                // ordinary VS programs retain the legacy v0 convention.
-                .vertex_index_vgpr = if (vertex_stage == .export_shader) 5 else 0,
-                .convert_negative_one_to_one_depth = convert_guest_depth,
-                .scalar_registers = vertex_scalar_regs[0..vertex_scalar_count],
-                .dynamic_scalar_binding = if (vertex_scalar_count != 0) .{
-                    .binding = dynamic_scalar_descriptor_binding,
-                    .value_base = 0,
-                } else null,
-                .specialized_scalar_prefix_end = vertex_scalar_end,
-                .storage_buffers = vertex_storage.mappings[0..vertex_storage.mapping_count],
-                .sampled_images = graphics_resources.mappings[fragment_mapping_count..graphics_resources.mapping_count],
-                .ngg_lds_exports = ngg_lds_exports[0..ngg_lds_export_count],
-                .descriptor_array_length = maximum_storage_descriptors,
-            }, .{
-                .enable_typed_ir = self.shader_ir_enabled,
-                .enable_ssa_optimization = self.shader_ssa_optimization_enabled,
-            })) |vertex_module_owned| {
+            const vertex_module_result = if (unity_ui_fallback)
+                buildUnityUiVertexSpirv(
+                    self.allocator,
+                    vertex_storage.mappings[0..vertex_storage.mapping_count],
+                    unity_ui_position.?,
+                    unity_ui_uv.?,
+                    unity_ui_color.?,
+                )
+            else
+                rdna2.translateProgramSpirvWithPipelineOptions(self.allocator, &vertex_program, .{
+                    .stage = .vertex,
+                    // The PS5 NGG/export ABI supplies S_NGG_VERTEX_INDEX in v5;
+                    // ordinary VS programs retain the legacy v0 convention.
+                    // Prospero's merged graphics ABI supplies the vertex id in v5
+                    // for both ordinary and export/NGG programs. Some shaders use
+                    // v0 as a temporary before their attribute-fetch prolog.
+                    .vertex_index_vgpr = 5,
+                    .convert_negative_one_to_one_depth = convert_guest_depth,
+                    .scalar_registers = vertex_scalar_regs[0..vertex_scalar_count],
+                    .dynamic_scalar_binding = if (vertex_scalar_count != 0) .{
+                        .binding = dynamic_scalar_descriptor_binding,
+                        .value_base = 0,
+                    } else null,
+                    .specialized_scalar_prefix_end = vertex_scalar_end,
+                    .storage_buffers = vertex_storage.mappings[0..vertex_storage.mapping_count],
+                    .sampled_images = graphics_resources.mappings[fragment_mapping_count..graphics_resources.mapping_count],
+                    .ngg_lds_exports = ngg_lds_exports[0..ngg_lds_export_count],
+                    .descriptor_array_length = maximum_storage_descriptors,
+                }, .{
+                    .enable_typed_ir = self.shader_ir_enabled,
+                    .enable_ssa_optimization = self.shader_ssa_optimization_enabled,
+                });
+            if (vertex_module_result) |vertex_module_owned| {
                 self.frame_profile.shader_translate_ns +|= elapsedHostNanoseconds(vertex_translate_started);
                 var vertex_module = vertex_module_owned;
                 defer vertex_module.deinit(self.allocator);
@@ -10309,6 +10918,13 @@ pub const Renderer = struct {
                 }
                 if (self.traceCurrentGraphicsFrame() and vertex_module.used_control_flow_fallback) {
                     std.debug.print("[vulkan dcb] traced vertex program 0x{x} uses linear control-flow fallback\n", .{vertex_address});
+                }
+                if (unity_ui_fallback and !self.reported_ui_composite) {
+                    self.reported_ui_composite = true;
+                    std.debug.print(
+                        "[vulkan dcb] using direct Unity UI vertex/texture fallback @0x{x} {d}x{d}\n",
+                        .{ target.descriptor.address, target.descriptor.width, target.descriptor.height },
+                    );
                 }
                 if (log_verbose_gpu) std.debug.print(
                     "[vulkan dcb] using guest VS + guest PS; sampled={d} idx={any} storage={d}\n",
@@ -10321,12 +10937,15 @@ pub const Renderer = struct {
                 // A rectangle list gives three corners and expects the
                 // fourth to follow from them, which only a stage that sees the
                 // whole primitive can supply.
-                if (self.geometry_shaders_available and draw.index_count == null and
-                    draw.vertex_count == 3 and
-                    (render_state.primitive_type == 7 or render_state.primitive_type == 17))
-                {
+                const rectangle_completion = rectangleCompletionMode(
+                    vertex_stage,
+                    render_state.primitive_type,
+                    draw,
+                    fullscreen_corner,
+                );
+                if (self.geometry_shaders_available and rectangle_completion != 0) {
                     pipeline_state.topology = vk.primitive_topology_triangle_list;
-                    pipeline_state.rectangle_completion = 1;
+                    pipeline_state.rectangle_completion = rectangle_completion;
                     pipeline_state.rectangle_parameter_mask = paired_parameter_mask;
                 }
                 try self.drawGraphicsShaders(
@@ -10346,6 +10965,14 @@ pub const Renderer = struct {
                     false,
                     draw,
                 );
+                if (unity_ui_fallback) {
+                    // The deferred HDR composite fallback presents its intact
+                    // scene input because the guest composite shader is not
+                    // faithful yet. Once the UI layer itself is translated,
+                    // prefer that most recent target so menus are not hidden
+                    // behind the earlier scene-only presentation anchor.
+                    self.deferred_composite_ui_address = target.descriptor.address;
+                }
                 if (self.traceCurrentGraphicsFrame()) {
                     if (self.latest_render_target_index) |target_index| {
                         try self.materializeRenderTarget(target_index);
@@ -10369,14 +10996,23 @@ pub const Renderer = struct {
                                 .{ self.flip_callbacks + 1, self.frame_profile.draws },
                             ) catch break;
                             if (captured_target.format.bytes_per_texel == 4) {
-                                dumpFramePpm(
-                                    trace_path.ptr,
-                                    captured.width,
-                                    captured.height,
-                                    captured.pixels.items,
-                                );
+                                if (captured_target.format.vulkan == vk.format_b10g11r11_ufloat_pack32) {
+                                    dumpR11G11B10FrameThumbnailPpm(
+                                        trace_path.ptr,
+                                        captured.width,
+                                        captured.height,
+                                        captured.pixels.items,
+                                    );
+                                } else {
+                                    dumpFrameThumbnailPpm(
+                                        trace_path.ptr,
+                                        captured.width,
+                                        captured.height,
+                                        captured.pixels.items,
+                                    );
+                                }
                             } else if (captured_target.format.bytes_per_texel == 8) {
-                                dumpRgba16FloatFramePpm(
+                                dumpRgba16FloatFrameThumbnailPpm(
                                     trace_path.ptr,
                                     captured.width,
                                     captured.height,
@@ -10738,7 +11374,8 @@ pub const Renderer = struct {
     ) anyerror!bool {
         if ((target.format.vulkan != vk.format_r8g8b8a8_unorm and
             target.format.vulkan != vk.format_r8g8b8a8_srgb) or
-            target.format.bytes_per_texel != 4 or source.unified_format != 56 or
+            target.format.bytes_per_texel != 4 or
+            (source.unified_format != 36 and source.unified_format != 56) or
             target.descriptor.fragments_log2 != 0 or
             source.width != target.descriptor.width or
             source.height != target.descriptor.height or
@@ -10751,7 +11388,8 @@ pub const Renderer = struct {
         // with an exact resident render target. Copy that image directly into
         // the scanout attachment and keep the CPU detile/upload path only for
         // guest-memory sources which have no resident Vulkan image.
-        if (self.findResidentRenderTargetIndex(source, target.format.vulkan)) |source_index| {
+        const source_format = sampledImageFormat(source.unified_format, false) orelse return false;
+        if (self.findResidentRenderTargetIndex(source, source_format)) |source_index| {
             if (try self.blitResidentColorTarget(source_index, target, flip_vertical)) |target_index| {
                 if (self.isVideoSurface(source.address)) {
                     self.markVideoSurface(target.descriptor.address);
@@ -10766,6 +11404,10 @@ pub const Renderer = struct {
                 return true;
             }
         }
+        // The CPU fallback below currently detiles ordinary RGBA8. Packed HDR
+        // sources are handled by the resident Vulkan blit above, which also
+        // performs the format conversion into the scanout-compatible target.
+        if (source.unified_format != 56) return false;
         const layout = gpu.SurfaceLayout.fromImage(source) catch return false;
         const allocation_bytes = std.math.cast(usize, layout.required_source_bytes) orelse
             return Error.GuestBufferTooLarge;
@@ -11226,6 +11868,7 @@ pub const Renderer = struct {
                 return Error.UnsupportedSampledImage;
             };
             const descriptor_index: u32 = @intCast(result.mapping_count);
+            const sampled_started = hostTimestampNs();
             const image = self.stageSampledImage(
                 image_descriptor,
                 sampler_descriptor,
@@ -11263,6 +11906,7 @@ pub const Renderer = struct {
                 );
                 return err;
             };
+            self.frame_profile.sampled_stage_ns +|= elapsedHostNanoseconds(sampled_started);
             result.images[result.image_count] = image;
             result.descriptors[descriptor_index] = image_descriptor;
             result.image_count += 1;
@@ -11524,6 +12168,7 @@ pub const Renderer = struct {
         if (!cached.valid) return;
         self.image_aliases.unregister(cached.alias_token);
         self.image_states.forgetImage(cached.image.handle);
+        self.invalidateResidentImageViews(cached.image.handle);
         self.destroyImageView(cached.view);
         self.destroyImage(cached.image);
         self.destroyBuffer(cached.transfer);
@@ -11762,6 +12407,39 @@ pub const Renderer = struct {
             return Error.UnsupportedStorageImage;
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
 
+        // Compute post-processing frequently rebinds an exact colour target
+        // as an uncompressed image_load/image_store resource. The VkImage was
+        // created with STORAGE usage, so keep the hand-off entirely on the GPU
+        // instead of materializing tiled guest bytes and immediately uploading
+        // them into an equivalent storage image.
+        if (is_single_layer_2d) {
+            for (self.render_targets.items, 0..) |cached, target_index| {
+                if (!cached.initialized or
+                    cached.target.descriptor.fragments_log2 != 0 or
+                    cached.target.descriptor.address != descriptor.address or
+                    cached.target.descriptor.width != descriptor.width or
+                    cached.target.descriptor.height != descriptor.height or
+                    cached.target.format.vulkan != format.vulkan)
+                {
+                    continue;
+                }
+                try self.transitionRenderTargetToStorage(target_index);
+                self.updateStorageImageDescriptor(descriptor_index, cached.view);
+                self.frame_profile.resident_storage_bytes +%= staging_bytes;
+                return .{
+                    .descriptor = descriptor,
+                    .subresource = subresource,
+                    .image = cached.image,
+                    .view = cached.view,
+                    .transfer = undefined,
+                    .allocation_bytes = allocation_bytes,
+                    .staging_bytes = staging_bytes,
+                    .writable = writable,
+                    .render_target_index = target_index,
+                };
+            }
+        }
+
         self.storage_image_sequence +%= 1;
         var matching_index: ?usize = null;
         for (self.storage_image_cache.items, 0..) |cached, index| {
@@ -11963,8 +12641,19 @@ pub const Renderer = struct {
         _ = memory;
         for (resources.storage_images[0..resources.storage_image_count]) |prepared| {
             if (!prepared.writable) continue;
-            if (prepared.cache_index >= self.storage_image_cache.items.len) return Error.UnsupportedStorageImage;
-            const cached = &self.storage_image_cache.items[prepared.cache_index];
+            if (prepared.render_target_index) |target_index| {
+                if (target_index >= self.render_targets.items.len) return Error.UnsupportedStorageImage;
+                self.render_target_sequence +%= 1;
+                const target = &self.render_targets.items[target_index];
+                target.initialized = true;
+                target.gpu_generation +%= 1;
+                target.last_used_sequence = self.render_target_sequence;
+                _ = self.image_aliases.markWrite(target.alias_token);
+                continue;
+            }
+            const cache_index = prepared.cache_index orelse return Error.UnsupportedStorageImage;
+            if (cache_index >= self.storage_image_cache.items.len) return Error.UnsupportedStorageImage;
+            const cached = &self.storage_image_cache.items[cache_index];
             if (!cached.valid) return Error.UnsupportedStorageImage;
             cached.gpu_dirty = true;
             _ = self.image_aliases.markWrite(cached.alias_token);
@@ -11993,20 +12682,14 @@ pub const Renderer = struct {
             if (!sampledViewFormatCompatible(storage_format.vulkan, image_format)) continue;
 
             const components = try sampledImageComponents(descriptor.dst_select);
-            const view_info = vk.ImageViewCreateInfo{
-                .image = cached.image.handle,
-                .view_type = if (dimension == .three_d) vk.image_view_type_3d else vk.image_view_type_2d,
-                .format = image_format,
-                .components = components,
-                .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
-            };
-            var view: vk.ImageView = 0;
-            if (self.device_functions.create_image_view(self.device, &view_info, null, &view) != vk.success) {
-                return Error.ImageViewCreationFailed;
-            }
-            errdefer self.destroyImageView(view);
-            const sampler = try self.createGuestSampler(sampler_descriptor);
-            errdefer self.destroySampler(sampler);
+            const view = try self.residentImageView(
+                cached.image.handle,
+                if (dimension == .three_d) vk.image_view_type_3d else vk.image_view_type_2d,
+                image_format,
+                components,
+                vk.image_aspect_color_bit,
+            );
+            const sampler = try self.residentSampler(sampler_descriptor);
 
             self.storage_image_sequence +%= 1;
             cached.in_use = true;
@@ -12023,8 +12706,8 @@ pub const Renderer = struct {
                 .image = cached.image,
                 .view = view,
                 .sampler = sampler,
-                .owns_view = true,
-                .owns_sampler = true,
+                .owns_view = false,
+                .owns_sampler = false,
                 .storage_cache_index = index,
             };
         }
@@ -12156,10 +12839,69 @@ pub const Renderer = struct {
         const byte_count = std.math.cast(usize, staging_bytes_u64) orelse return Error.UnsupportedSampledImage;
         const probe_span = std.math.cast(usize, source_bytes) orelse 0;
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        const state_hash = sampledImageStateHash(descriptor, sampler_descriptor);
+
+        // The overwhelmingly common path is an unchanged cached texture. Its
+        // alias generation covers GPU writers and its page generation covers
+        // CPU writers, so matching both proves that no deferred writer needs
+        // publication. Check that proof before the much more expensive alias
+        // authority/overlap walk in flushPendingGuestWrite.
+        const early_resident_generation = self.sampledSourceGeneration(
+            descriptor.address,
+            probe_span,
+        );
+        const early_page_generation = self.sampledPageGeneration(
+            memory,
+            descriptor.address,
+            probe_span,
+        );
+        const early_source_generation = combineSourceGenerations(
+            early_resident_generation,
+            early_page_generation,
+        );
+        // Some guest-memory providers do not expose page generations. In that
+        // case the distributed content probe is the CPU-write proof, while the
+        // alias generation above still rejects any deferred GPU writer. This
+        // is cheap (at most 128 cache lines, once per source per frame) and is
+        // still far less work than walking and synchronizing every image alias
+        // for every descriptor binding.
+        const early_content_hash = if (early_page_generation != 0)
+            0
+        else
+            self.probeSampledSource(
+                memory,
+                descriptor.address,
+                probe_span,
+                early_source_generation,
+            );
+        for (self.sampled_image_cache.items) |*item| {
+            if (item.guest_address != descriptor.address or
+                item.width != descriptor.width or
+                item.height != descriptor.height or
+                item.depth != descriptor.depth_or_layers or
+                item.image_type != @intFromEnum(descriptor.image_type) or
+                item.dimension != dimension or
+                item.tile_mode != @intFromEnum(descriptor.tile_mode) or
+                item.base_level != descriptor.base_level or
+                item.last_level != descriptor.last_level or
+                item.mip_levels != (if (mip_plan) |plan| plan.level_count else 1) or
+                item.state_hash != state_hash or
+                item.source_generation != early_source_generation or
+                item.content_hash != early_content_hash)
+            {
+                continue;
+            }
+            item.last_used_frame = self.frame_sequence;
+            self.texture_cache_hits += 1;
+            self.frame_profile.texture_hits +|= 1;
+            self.updateSampledImageDescriptor(descriptor_index, item.view, item.sampler, dimension);
+            return .{ .image = item.image, .view = item.view, .sampler = item.sampler };
+        }
 
         // A rendered target sampled as a texture must see the rendered frame:
         // publish its deferred writeback before hashing or staging guest bytes,
         // otherwise the cache would bind stale contents.
+        const flush_started = hostTimestampNs();
         self.flushPendingGuestWrite(descriptor.address, probe_span) catch |err| {
             if (log_verbose_gpu) std.debug.print(
                 "[vulkan dcb] sampled image writeback flush failed: {s} addr=0x{x}\n",
@@ -12167,13 +12909,19 @@ pub const Renderer = struct {
             );
             return err;
         };
+        self.frame_profile.sampled_flush_ns +|= elapsedHostNanoseconds(flush_started);
+        // A flush may have published GPU bytes into guest pages and advanced
+        // their generation. Drop the pre-flush probe before building the cache
+        // key for the uploaded image.
+        self.invalidateTextureProbes(descriptor.address, probe_span);
 
-        const state_hash = sampledImageStateHash(descriptor, sampler_descriptor);
+        const generation_started = hostTimestampNs();
         const resident_generation = self.sampledSourceGeneration(descriptor.address, probe_span);
-        const page_generation = if (memory.track_gpu_read) |track|
-            track(memory.context, descriptor.address, probe_span)
-        else
-            0;
+        const page_generation = self.sampledPageGeneration(
+            memory,
+            descriptor.address,
+            probe_span,
+        );
         const source_generation = combineSourceGenerations(resident_generation, page_generation);
         // Page generations make an O(number of pages) byte hash on every frame
         // unnecessary. Keep the hash fallback for standalone/smoke memory
@@ -12187,7 +12935,9 @@ pub const Renderer = struct {
                 probe_span,
                 source_generation,
             );
+        self.frame_profile.sampled_generation_ns +|= elapsedHostNanoseconds(generation_started);
 
+        const lookup_started = hostTimestampNs();
         var cache_hit_idx: ?usize = null;
         for (self.sampled_image_cache.items, 0..) |*item, idx| {
             if (item.guest_address == descriptor.address and
@@ -12208,6 +12958,7 @@ pub const Renderer = struct {
                 break;
             }
         }
+        self.frame_profile.sampled_lookup_ns +|= elapsedHostNanoseconds(lookup_started);
 
         if (cache_hit_idx) |idx| {
             var item = &self.sampled_image_cache.items[idx];
@@ -12285,7 +13036,7 @@ pub const Renderer = struct {
                 .{ descriptor.address, descriptor.width, descriptor.height, descriptor.unified_format },
             );
         }
-        if (self.traceCurrentGraphicsFrame() and bytes_per_texel == 4 and
+        if (false and self.traceCurrentGraphicsFrame() and bytes_per_texel == 4 and
             descriptor.depth_or_layers == 1)
         {
             var trace_path_buffer: [112]u8 = undefined;
@@ -12657,6 +13408,71 @@ pub const Renderer = struct {
             return Error.SamplerCreationFailed;
         }
         return sampler;
+    }
+
+    fn residentSampler(self: *Renderer, descriptor: gpu.resources.SamplerDescriptor) anyerror!vk.Sampler {
+        for (self.resident_samplers.items) |cached| {
+            if (std.meta.eql(cached.descriptor, descriptor)) return cached.sampler;
+        }
+        const sampler = try self.createGuestSampler(descriptor);
+        errdefer self.device_functions.destroy_sampler(self.device, sampler, null);
+        try self.resident_samplers.append(self.allocator, .{
+            .descriptor = descriptor,
+            .sampler = sampler,
+        });
+        return sampler;
+    }
+
+    fn residentImageView(
+        self: *Renderer,
+        image: vk.Image,
+        view_type: u32,
+        format: u32,
+        components: vk.ComponentMapping,
+        aspect_mask: vk.Flags,
+    ) anyerror!vk.ImageView {
+        for (self.resident_image_views.items) |cached| {
+            if (cached.image == image and cached.view_type == view_type and
+                cached.format == format and cached.aspect_mask == aspect_mask and
+                std.meta.eql(cached.components, components))
+            {
+                return cached.view;
+            }
+        }
+        const info = vk.ImageViewCreateInfo{
+            .image = image,
+            .view_type = view_type,
+            .format = format,
+            .components = components,
+            .subresource_range = .{ .aspect_mask = aspect_mask },
+        };
+        var view: vk.ImageView = 0;
+        if (self.device_functions.create_image_view(self.device, &info, null, &view) != vk.success) {
+            return Error.ImageViewCreationFailed;
+        }
+        errdefer self.device_functions.destroy_image_view(self.device, view, null);
+        try self.resident_image_views.append(self.allocator, .{
+            .image = image,
+            .view_type = view_type,
+            .format = format,
+            .components = components,
+            .aspect_mask = aspect_mask,
+            .view = view,
+        });
+        return view;
+    }
+
+    fn invalidateResidentImageViews(self: *Renderer, image: vk.Image) void {
+        var index: usize = 0;
+        while (index < self.resident_image_views.items.len) {
+            const cached = self.resident_image_views.items[index];
+            if (cached.image != image) {
+                index += 1;
+                continue;
+            }
+            self.destroyImageView(cached.view);
+            _ = self.resident_image_views.swapRemove(index);
+        }
     }
 
     fn refreshGpuProgress(self: *Renderer) Error!void {
@@ -13445,6 +14261,9 @@ pub const Renderer = struct {
     fn dcbWrite(context: ?*anyopaque, address: u64, bytes: []const u8) bool {
         const self = fromContext(context);
         if (!self.synchronizeDrawBatch("write")) return false;
+        // A guest write can invalidate a page-generation result cached by an
+        // earlier draw in this frame; unrelated fence/label writes cannot.
+        self.invalidateTextureProbes(address, bytes.len);
         self.flushGuestStorageImageRange(address, bytes.len) catch return false;
         self.flushGuestStorageRange(address, bytes.len) catch return false;
         self.prepareCmaskWrite(address, bytes.len) catch return false;
@@ -13910,6 +14729,98 @@ pub const Renderer = struct {
         }
     }
 
+    /// Captures only the most recently used full-size resident attachments at
+    /// one opt-in progress checkpoint. This is substantially cheaper than the
+    /// per-draw graphics trace on a frame containing hundreds of draws and
+    /// reveals the real compositor output when VideoOut still names a black
+    /// alias.
+    fn dumpRecentResidentTargets(self: *Renderer) void {
+        const maximum_candidates = 16;
+        var candidates: [maximum_candidates]usize = undefined;
+        var sequences: [maximum_candidates]u64 = undefined;
+        var candidate_count: usize = 0;
+
+        for (self.render_targets.items, 0..) |cached, target_index| {
+            const descriptor = cached.target.descriptor;
+            if (!cached.initialized or descriptor.fragments_log2 != 0 or
+                descriptor.width < 640 or descriptor.height < 360 or
+                (cached.target.format.bytes_per_texel != 4 and
+                    cached.target.format.bytes_per_texel != 8))
+            {
+                continue;
+            }
+
+            var insert_at: usize = 0;
+            while (insert_at < candidate_count and
+                sequences[insert_at] >= cached.last_used_sequence) : (insert_at += 1)
+            {}
+            if (insert_at >= maximum_candidates) continue;
+            const move_end = @min(candidate_count, maximum_candidates - 1);
+            var move_at = move_end;
+            while (move_at > insert_at) : (move_at -= 1) {
+                candidates[move_at] = candidates[move_at - 1];
+                sequences[move_at] = sequences[move_at - 1];
+            }
+            candidates[insert_at] = target_index;
+            sequences[insert_at] = cached.last_used_sequence;
+            candidate_count = @min(candidate_count + 1, maximum_candidates);
+        }
+
+        for (candidates[0..candidate_count], 0..) |target_index, rank| {
+            self.materializeRenderTarget(target_index) catch |err| {
+                std.debug.print(
+                    "[vulkan resident] rank={d} materialize failed: {s}\n",
+                    .{ rank, @errorName(err) },
+                );
+                continue;
+            };
+            const target = self.render_targets.items[target_index].target;
+            var selected: ?*const CachedFrame = null;
+            var selected_sequence: u64 = 0;
+            for (self.completed_frames.items) |*frame| {
+                const frame_target = frame.target orelse continue;
+                if (!sameRenderTarget(frame_target, target) or
+                    (selected != null and frame.sequence <= selected_sequence))
+                {
+                    continue;
+                }
+                selected = frame;
+                selected_sequence = frame.sequence;
+            }
+            const frame = selected orelse continue;
+            var path_buffer: [192]u8 = undefined;
+            const path = std.fmt.bufPrintZ(
+                &path_buffer,
+                "out\\resident-frame-{d:0>4}-rank-{d:0>2}-0x{x}-{d}x{d}-fmt-{d}.ppm",
+                .{
+                    self.flip_callbacks,
+                    rank,
+                    target.descriptor.address,
+                    frame.width,
+                    frame.height,
+                    target.descriptor.format,
+                },
+            ) catch continue;
+            if (target.format.bytes_per_texel == 4) {
+                dumpFramePpm(path.ptr, frame.width, frame.height, frame.pixels.items);
+            } else {
+                dumpRgba16FloatFramePpm(path.ptr, frame.width, frame.height, frame.pixels.items);
+            }
+            std.debug.print(
+                "[vulkan resident] rank={d} sequence={d} @0x{x} {d}x{d} fmt={d} bytes={d}\n",
+                .{
+                    rank,
+                    selected_sequence,
+                    target.descriptor.address,
+                    frame.width,
+                    frame.height,
+                    target.descriptor.format,
+                    frame.pixels.items.len,
+                },
+            );
+        }
+    }
+
     fn reportFrameProfile(self: *Renderer) void {
         const profile = self.frame_profile;
         const now = hostTimestampNs();
@@ -13969,7 +14880,7 @@ pub const Renderer = struct {
                 },
             );
             std.debug.print(
-                "[gpu shaders] flip={d} pso_hit={d} pso_miss={d}/{d}ms cpso={d}/{d}/{d}ms compute_ms={d}/{d}/{d}/{d} pso_cache={d} cpso_cache={d} miss_match(state/vs/ps)={d}/{d}/{d} sa_hit={d} sa_miss={d}/{d}ms prov_ms={d} xlat_ms={d} res_ms={d} probe_ms={d} target_create_ms={d}/{d}\n",
+                "[gpu shaders] flip={d} pso_hit={d} pso_miss={d}/{d}ms cpso={d}/{d}/{d}ms compute_ms={d}/{d}/{d}/{d} pso_cache={d} cpso_cache={d} miss_match(state/vs/ps)={d}/{d}/{d} sa_hit={d} sa_miss={d}/{d}ms prov_ms={d} xlat_ms={d} res_ms={d} sampled_ms={d}/{d}/{d}/{d} probe_ms={d} target_create_ms={d}/{d}\n",
                 .{
                     self.flip_callbacks,
                     profile.graphics_pipeline_hits,
@@ -13993,6 +14904,10 @@ pub const Renderer = struct {
                     profile.scalar_provenance_ns / std.time.ns_per_ms,
                     profile.shader_translate_ns / std.time.ns_per_ms,
                     profile.graphics_resource_ns / std.time.ns_per_ms,
+                    profile.sampled_stage_ns / std.time.ns_per_ms,
+                    profile.sampled_flush_ns / std.time.ns_per_ms,
+                    profile.sampled_generation_ns / std.time.ns_per_ms,
+                    profile.sampled_lookup_ns / std.time.ns_per_ms,
                     profile.texture_probe_ns / std.time.ns_per_ms,
                     profile.render_target_create_ns / std.time.ns_per_ms,
                     profile.depth_target_create_ns / std.time.ns_per_ms,
@@ -14143,6 +15058,69 @@ pub const Renderer = struct {
                 self.last_flip_error = err;
                 return false;
             };
+            if (self.capture_extended_progress_frames and
+                (self.flip_callbacks == 64 or self.flip_callbacks == 96 or
+                    self.flip_callbacks == 128))
+            {
+                self.dumpRecentResidentTargets();
+            }
+            // The deferred-composite input can be produced after the pass that
+            // first identifies it, so the draw-time fast path above may not see
+            // it yet.  Resolve it after the whole DCB batch, when the intact
+            // resident RGBA scene is guaranteed to be available.
+            if (self.window_presentation != null) {
+                // The guest renders this UI target only when its contents
+                // change, then keeps flipping an unresolved composite buffer.
+                // Retain the last structurally recognised layer until a newer
+                // UI draw replaces the anchor; expiring it after a few flips
+                // turns an otherwise static menu black again.
+                if (self.deferred_composite_ui_address != null) {
+                    const ui_address = self.deferred_composite_ui_address.?;
+                    var ui_index: ?usize = null;
+                    var ui_sequence: u64 = 0;
+                    for (self.render_targets.items, 0..) |candidate, candidate_index| {
+                        if (!candidate.initialized or
+                            candidate.target.descriptor.address != ui_address)
+                        {
+                            continue;
+                        }
+                        if (ui_index == null or candidate.last_used_sequence > ui_sequence) {
+                            ui_index = candidate_index;
+                            ui_sequence = candidate.last_used_sequence;
+                        }
+                    }
+                    if (ui_index) |target_index| {
+                        const presented = if (shouldDumpProgressFrame(
+                            self.flip_callbacks,
+                            self.capture_extended_progress_frames,
+                        ))
+                            self.presentResidentTarget(target_index, flip) catch |err| {
+                                self.last_flip_error = err;
+                                return false;
+                            }
+                        else blk: {
+                            self.blitRenderTargetToSwapchain(target_index) catch |err| {
+                                self.last_flip_error = err;
+                                return false;
+                            };
+                            break :blk true;
+                        };
+                        if (!presented) {
+                            self.last_flip_error = Error.PresentationRejected;
+                            return false;
+                        }
+                        if (self.flip_callbacks <= 24 or self.flip_callbacks == 64 or log_verbose_gpu) {
+                            std.debug.print(
+                                "[vulkan dcb] presenting preserved deferred-composite layer @0x{x}\n",
+                                .{ui_address},
+                            );
+                        }
+                        self.presented_frames += 1;
+                        self.last_flip_error = null;
+                        return true;
+                    }
+                }
+            }
             // Until the merged Unity quad path can compose the decoded movie
             // into its older camera target, present the newest proven video
             // surface directly. The override expires as soon as planar video
@@ -14441,18 +15419,29 @@ pub const Renderer = struct {
         // AGC's DRAW_INDEX_2 body is max_size, index_va_lo/hi, index_count,
         // draw_initiator — the same layout bootstrap services emit. AUTO is the
         // non-indexed count form used by the diagnostic triangle probe.
+        const index_offset_bits = state.readRegister(.uconfig, 0x24a) orelse 0; // GE_INDX_OFFSET
         if (packet.opcode == gpu.pm4.draw_index_auto and packet.body.len >= 1)
-            return .{ .vertex_count = packet.body[0] };
+            return .{
+                .vertex_count = packet.body[0],
+                .instance_count = state.instance_count,
+                .first_vertex = index_offset_bits,
+            };
         if (packet.opcode == gpu.pm4.draw_index_2 and packet.body.len >= 5)
             return .{
+                .instance_count = state.instance_count,
+                .vertex_offset = @bitCast(index_offset_bits),
                 .index_count = packet.body[3],
                 .index_address = (@as(u64, packet.body[2]) << 32) | packet.body[1],
-                // AGC index streams are 16-bit by default; 32-bit shows up as
-                // INDEX_TYPE later and is not tracked in GPU state yet.
-                .index_uint32 = false,
+                // INDEX_TYPE is persistent command-processor state and applies
+                // to both address forms. Treating every embedded-address draw
+                // as u16 splits a u32 stream such as 0,1,2 into
+                // 0,0,1,0,2,0 and collapses half of the guest geometry.
+                .index_uint32 = state.index_type == 1,
             };
         if (packet.opcode == gpu.pm4.draw_index_offset_2 and packet.body.len >= 4)
             return .{
+                .instance_count = state.instance_count,
+                .vertex_offset = @bitCast(index_offset_bits),
                 .index_count = packet.body[2],
                 .index_address = state.index_base_address +| (@as(u64, packet.body[1]) * gpu.pm4.indexElementBytes(state.index_type)),
                 .index_uint32 = state.index_type == 1,
@@ -14676,7 +15665,7 @@ pub const Renderer = struct {
             const targetless = render_state.active_color_count == 0;
             var index: u32 = 0;
             while (index < draw_count) : (index += 1) {
-                const draw = if (direct) |decoded|
+                const decoded_draw = if (direct) |decoded|
                     decoded
                 else
                     self.readIndirectGuestDraw(state, indirect_spec, index) catch |err| {
@@ -14687,6 +15676,37 @@ pub const Renderer = struct {
                         );
                         return false;
                     };
+                const draw = expandRectangleListDraw(render_state.primitive_type, decoded_draw);
+                if (self.capture_extended_progress_frames and self.flip_callbacks == 63) {
+                    var target_address: u64 = 0;
+                    var target_width: u32 = 0;
+                    var target_height: u32 = 0;
+                    for (render_state.color_targets) |candidate| {
+                        const color = candidate orelse continue;
+                        if (!color.isActive()) continue;
+                        target_address = color.address;
+                        target_width = color.width;
+                        target_height = color.height;
+                        break;
+                    }
+                    std.debug.print(
+                        "[vulkan geometry] draw={d} primitive={d} vertices={d}->{d} instances={d} indices={?d} index32={any} base_vertex={d} index_va=0x{x} target=0x{x}/{d}x{d}\n",
+                        .{
+                            self.frame_profile.draws,
+                            render_state.primitive_type,
+                            decoded_draw.vertex_count,
+                            draw.vertex_count,
+                            draw.instance_count,
+                            draw.index_count,
+                            draw.index_uint32,
+                            draw.vertex_offset,
+                            draw.index_address,
+                            target_address,
+                            target_width,
+                            target_height,
+                        },
+                    );
+                }
                 if (targetless) {
                     self.appendPendingTargetlessDraw(state, draw, vertex_stage.?);
                     continue;
@@ -14697,6 +15717,12 @@ pub const Renderer = struct {
                 // the flip resolves it against the registered display buffer.
                 self.drawGuestGraphics(state, draw, vertex_stage.?, null) catch |err| {
                     self.last_draw_error = err;
+                    if (self.traceCurrentGraphicsFrame()) {
+                        std.debug.print(
+                            "[vulkan dcb] traced draw failed draw={d}: {s}\n",
+                            .{ self.frame_profile.draws, @errorName(err) },
+                        );
+                    }
                     self.reportGuestDrawFailure(state, err);
                     // Soft-skip shader/state gaps so one incomplete draw does not
                     // kill the DCB before a later flip.
@@ -15929,7 +16955,23 @@ fn inferNggLdsExports(
             break;
         }
     }
-    const zw = position_zw orelse return 0;
+    // Scene vertices have dynamic clip-space Z/W, so the constant 0/1 marker
+    // used by fullscreen passes is not available. The ABI is otherwise fully
+    // determined by the pixel shader's live PARAM components: POS.xy, those
+    // packed PARAM words, then POS.zw. Use that boundary when both words were
+    // recovered from the terminal LDS record.
+    var expected_zw: usize = 2;
+    for (parameter_components) |component_mask| {
+        expected_zw += @popCount(component_mask);
+    }
+    const zw = position_zw orelse blk: {
+        if (expected_zw + 1 >= words.len or
+            !words[expected_zw].present or !words[expected_zw + 1].present)
+        {
+            return 0;
+        }
+        break :blk expected_zw;
+    };
 
     output[0] = .{
         .target = 0x0c,
@@ -17115,6 +18157,106 @@ fn dumpFramePpm(path: [*:0]const u8, width: u32, height: u32, rgba: []const u8) 
     std.debug.print("[vulkan dcb] dumped {s} ({d}x{d})\n", .{ path, width, height });
 }
 
+/// Small per-draw diagnostic capture. Full 4K PPMs make a single busy frame
+/// several GiB; nearest-neighbour thumbnails retain the first corrupt draw
+/// while keeping the trace practical.
+fn dumpFrameThumbnailPpm(path: [*:0]const u8, width: u32, height: u32, rgba: []const u8) void {
+    const divisor: u32 = 8;
+    const output_width = @max(@as(u32, 1), width / divisor);
+    const output_height = @max(@as(u32, 1), height / divisor);
+    if (rgba.len < @as(usize, width) * @as(usize, height) * 4) return;
+    const output = std.heap.page_allocator.alloc(
+        u8,
+        @as(usize, output_width) * @as(usize, output_height) * 4,
+    ) catch return;
+    defer std.heap.page_allocator.free(output);
+    for (0..output_height) |y| {
+        for (0..output_width) |x| {
+            const source_x = @min(width - 1, @as(u32, @intCast(x)) * divisor);
+            const source_y = @min(height - 1, @as(u32, @intCast(y)) * divisor);
+            const source = (@as(usize, source_y) * width + source_x) * 4;
+            const destination = (y * output_width + x) * 4;
+            @memcpy(output[destination..][0..4], rgba[source..][0..4]);
+        }
+    }
+    dumpFramePpm(path, output_width, output_height, output);
+}
+
+fn dumpR11G11B10FrameThumbnailPpm(
+    path: [*:0]const u8,
+    width: u32,
+    height: u32,
+    source_packed: []const u8,
+) void {
+    const divisor: u32 = 8;
+    const output_width = @max(@as(u32, 1), width / divisor);
+    const output_height = @max(@as(u32, 1), height / divisor);
+    if (source_packed.len < @as(usize, width) * @as(usize, height) * 4) return;
+    const output = std.heap.page_allocator.alloc(
+        u8,
+        @as(usize, output_width) * @as(usize, output_height) * 4,
+    ) catch return;
+    defer std.heap.page_allocator.free(output);
+    for (0..output_height) |y| {
+        for (0..output_width) |x| {
+            const source_x = @min(width - 1, @as(u32, @intCast(x)) * divisor);
+            const source_y = @min(height - 1, @as(u32, @intCast(y)) * divisor);
+            const source = (@as(usize, source_y) * width + source_x) * 4;
+            const word = std.mem.readInt(u32, source_packed[source..][0..4], .little);
+            const destination = (y * output_width + x) * 4;
+            const linear = [3]f32{
+                decodeUnsignedMiniFloat(word & 0x7ff, 11),
+                decodeUnsignedMiniFloat((word >> 11) & 0x7ff, 11),
+                decodeUnsignedMiniFloat((word >> 22) & 0x3ff, 10),
+            };
+            for (linear, 0..) |value, component| {
+                const mapped = if (std.math.isFinite(value) and value > 0)
+                    value / (1.0 + value)
+                else
+                    0;
+                output[destination + component] = @intFromFloat(@round(@min(mapped, 1.0) * 255.0));
+            }
+            output[destination + 3] = 255;
+        }
+    }
+    dumpFramePpm(path, output_width, output_height, output);
+}
+
+fn dumpRgba16FloatFrameThumbnailPpm(
+    path: [*:0]const u8,
+    width: u32,
+    height: u32,
+    rgba16: []const u8,
+) void {
+    const divisor: u32 = 8;
+    const output_width = @max(@as(u32, 1), width / divisor);
+    const output_height = @max(@as(u32, 1), height / divisor);
+    if (rgba16.len < @as(usize, width) * @as(usize, height) * 8) return;
+    const output = std.heap.page_allocator.alloc(
+        u8,
+        @as(usize, output_width) * @as(usize, output_height) * 4,
+    ) catch return;
+    defer std.heap.page_allocator.free(output);
+    for (0..output_height) |y| {
+        for (0..output_width) |x| {
+            const source_x = @min(width - 1, @as(u32, @intCast(x)) * divisor);
+            const source_y = @min(height - 1, @as(u32, @intCast(y)) * divisor);
+            const source = (@as(usize, source_y) * width + source_x) * 8;
+            const destination = (y * output_width + x) * 4;
+            for (0..3) |component| {
+                const bits = std.mem.readInt(u16, rgba16[source + component * 2 ..][0..2], .little);
+                const half: f16 = @bitCast(bits);
+                var value: f32 = @floatCast(half);
+                if (!std.math.isFinite(value) or value <= 0) value = 0;
+                const mapped = value / (1.0 + value);
+                output[destination + component] = @intFromFloat(@round(@min(mapped, 1.0) * 255.0));
+            }
+            output[destination + 3] = 255;
+        }
+    }
+    dumpFramePpm(path, output_width, output_height, output);
+}
+
 /// Converts a linear RGBA16F attachment to an inspectable RGBA8 PPM. This is
 /// used only by the targeted draw tracer; a simple Reinhard curve keeps HDR
 /// highlights visible without letting a few large values wash out the frame.
@@ -18020,10 +19162,141 @@ fn buildParameterProbeFragmentSpirv(allocator: std.mem.Allocator) !rdna2.spirv.M
     });
 }
 
+/// Unity's Prospero UI export shader is a merged ES/GS program. Its long
+/// hardware prolog selects vertex/instance indices through wave EXEC state
+/// before issuing four ordinary interleaved attribute loads. Vulkan already
+/// supplies one invocation per final indexed vertex, so replaying that wave
+/// prolog can reject every invocation even though the attribute descriptors
+/// themselves are complete. Lower the equivalent final vertex operation for
+/// the narrow, structurally recognised UI layout instead.
+fn buildUnityUiVertexSpirv(
+    allocator: std.mem.Allocator,
+    storage: []const gpu.ShaderSpirvStorageBufferBinding,
+    position: gpu.ShaderSpirvStorageBufferBinding,
+    uv: gpu.ShaderSpirvStorageBufferBinding,
+    color: gpu.ShaderSpirvStorageBufferBinding,
+) !rdna2.spirv.Module {
+    const vgpr = struct {
+        fn at(reg: u32) rdna2.Operand {
+            return .{ .kind = .vgpr, .reg = reg };
+        }
+    }.at;
+    const sgpr = struct {
+        fn at(reg: u32) rdna2.Operand {
+            return .{ .kind = .sgpr, .reg = reg };
+        }
+    }.at;
+    const float = struct {
+        fn value(number: f32) rdna2.Operand {
+            return .{ .kind = .literal_constant, .value = @bitCast(number) };
+        }
+    }.value;
+
+    var program = rdna2.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(allocator);
+    try program.instructions.appendSlice(allocator, &.{
+        .{ .pc = position.instruction_pc.?, .opcode = .buffer_load_format_xy, .dst = vgpr(9), .src0 = vgpr(5), .src1 = sgpr(position.resource_sgpr), .src2 = .{ .kind = .null }, .src_count = 3, .index_enable = true },
+        .{ .pc = uv.instruction_pc.?, .opcode = .buffer_load_format_xy, .dst = vgpr(11), .src0 = vgpr(5), .src1 = sgpr(uv.resource_sgpr), .src2 = .{ .kind = .null }, .src_count = 3, .index_enable = true },
+        .{ .pc = color.instruction_pc.?, .opcode = .buffer_load_format_xyzw, .dst = vgpr(4), .src0 = vgpr(5), .src1 = sgpr(color.resource_sgpr), .src2 = .{ .kind = .null }, .src_count = 3, .index_enable = true },
+
+        // The traced matrix is the standard 3840x2160 pixel-space projection.
+        // Spell it directly here: the producer-tagged SGPR values only become
+        // live after SMEM operations which this reduced program omits.
+        .{ .pc = 0x300, .opcode = .v_mad_f32, .dst = vgpr(17), .src0 = float(1.0 / 1920.0), .src1 = vgpr(9), .src2 = float(-1.0), .src_count = 3 },
+        .{ .pc = 0x308, .opcode = .v_mad_f32, .dst = vgpr(15), .src0 = float(-1.0 / 1080.0), .src1 = vgpr(10), .src2 = float(1.0), .src_count = 3 },
+        .{ .pc = 0x310, .opcode = .v_mov_b32, .dst = vgpr(8), .src0 = float(0.5), .src_count = 1 },
+        .{ .pc = 0x314, .opcode = .v_mov_b32, .dst = vgpr(16), .src0 = float(1.0), .src_count = 1 },
+        .{ .pc = 0x318, .opcode = .exp, .export_target = 0x0c, .export_enable = 0xf, .src0 = vgpr(17), .src1 = vgpr(15), .src2 = vgpr(8), .src3 = vgpr(16), .src_count = 4 },
+
+        // Present a simple, direct interface to the matching fallback PS.
+        .{ .pc = 0x320, .opcode = .exp, .export_target = 0x20, .export_enable = 0xf, .src0 = vgpr(11), .src1 = vgpr(12), .src2 = float(0), .src3 = float(1), .src_count = 4 },
+        .{ .pc = 0x328, .opcode = .exp, .export_target = 0x21, .export_enable = 0xf, .src0 = vgpr(4), .src1 = vgpr(5), .src2 = vgpr(6), .src3 = vgpr(7), .src_count = 4 },
+        .{ .pc = 0x330, .opcode = .s_endpgm },
+    });
+    return rdna2.translateSpirv(allocator, &program, .{
+        .stage = .vertex,
+        .vertex_index_vgpr = 5,
+        .storage_buffers = storage,
+        .parameter_mask = 0x3,
+        .descriptor_array_length = maximum_storage_descriptors,
+    });
+}
+
+fn buildUnityUiFragmentSpirv(
+    allocator: std.mem.Allocator,
+    binding: rdna2.spirv.SampledImageBinding,
+    fragment_extent: [2]u32,
+    single_channel_mask_component: ?u32,
+) !rdna2.spirv.Module {
+    const vgpr = struct {
+        fn at(reg: u32) rdna2.Operand {
+            return .{ .kind = .vgpr, .reg = reg };
+        }
+    }.at;
+    const sgpr = struct {
+        fn at(reg: u32) rdna2.Operand {
+            return .{ .kind = .sgpr, .reg = reg };
+        }
+    }.at;
+    const uint = struct {
+        fn value(bits: u32) rdna2.Operand {
+            return .{ .kind = .integer_inline_constant, .value = bits, .signed_val = @intCast(bits) };
+        }
+    }.value;
+    const sample_pc = binding.instruction_pc orelse 0x40;
+
+    var program = rdna2.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(allocator);
+    try program.instructions.appendSlice(allocator, &.{
+        .{ .pc = 0, .opcode = .v_interp_mov_f32, .dst = vgpr(0), .src0 = uint(0), .src1 = uint(0), .src2 = uint(0), .src_count = 3 },
+        .{ .pc = 4, .opcode = .v_interp_mov_f32, .dst = vgpr(1), .src0 = uint(1), .src1 = uint(0), .src2 = uint(1), .src_count = 3 },
+        .{ .pc = 8, .opcode = .v_interp_mov_f32, .dst = vgpr(4), .src0 = uint(0), .src1 = uint(1), .src2 = uint(0), .src_count = 3 },
+        .{ .pc = 12, .opcode = .v_interp_mov_f32, .dst = vgpr(5), .src0 = uint(1), .src1 = uint(1), .src2 = uint(1), .src_count = 3 },
+        .{ .pc = 16, .opcode = .v_interp_mov_f32, .dst = vgpr(6), .src0 = uint(2), .src1 = uint(1), .src2 = uint(2), .src_count = 3 },
+        .{ .pc = 20, .opcode = .v_interp_mov_f32, .dst = vgpr(7), .src0 = uint(3), .src1 = uint(1), .src2 = uint(3), .src_count = 3 },
+        .{ .pc = sample_pc, .opcode_id = 0x20, .opcode = .image_sample, .dst = vgpr(8), .src0 = vgpr(0), .src1 = sgpr(binding.resource_sgpr), .src2 = sgpr(binding.sampler_sgpr), .src_count = 3, .data_mask = 0xf, .image_dimension = .dim_2d, .image_address_components = 2 },
+    });
+    if (single_channel_mask_component) |coverage_component| {
+        // Unity font atlases are R8 coverage textures. Vulkan supplies the
+        // guest-selected channels through the image-view swizzle. Textures
+        // commonly select {0,0,0,R}, so the physical R coverage arrives in A
+        // rather than the sampled vector's first component. Preserve the
+        // vertex colour and multiply alpha by whichever component selects R.
+        try program.instructions.appendSlice(allocator, &.{
+            .{ .pc = sample_pc + 8, .opcode = .v_mov_b32, .dst = vgpr(12), .src0 = vgpr(8 + coverage_component), .src_count = 1 },
+            .{ .pc = sample_pc + 12, .opcode = .v_mov_b32, .dst = vgpr(8), .src0 = vgpr(4), .src_count = 1 },
+            .{ .pc = sample_pc + 16, .opcode = .v_mov_b32, .dst = vgpr(9), .src0 = vgpr(5), .src_count = 1 },
+            .{ .pc = sample_pc + 20, .opcode = .v_mov_b32, .dst = vgpr(10), .src0 = vgpr(6), .src_count = 1 },
+            .{ .pc = sample_pc + 24, .opcode = .v_mul_f32, .dst = vgpr(11), .src0 = vgpr(7), .src1 = vgpr(12), .src_count = 2 },
+        });
+    } else {
+        try program.instructions.appendSlice(allocator, &.{
+            .{ .pc = sample_pc + 8, .opcode = .v_mul_f32, .dst = vgpr(8), .src0 = vgpr(8), .src1 = vgpr(4), .src_count = 2 },
+            .{ .pc = sample_pc + 12, .opcode = .v_mul_f32, .dst = vgpr(9), .src0 = vgpr(9), .src1 = vgpr(5), .src_count = 2 },
+            .{ .pc = sample_pc + 16, .opcode = .v_mul_f32, .dst = vgpr(10), .src0 = vgpr(10), .src1 = vgpr(6), .src_count = 2 },
+            .{ .pc = sample_pc + 20, .opcode = .v_mul_f32, .dst = vgpr(11), .src0 = vgpr(11), .src1 = vgpr(7), .src_count = 2 },
+        });
+    }
+    try program.instructions.appendSlice(allocator, &.{
+        .{ .pc = sample_pc + 28, .opcode = .exp, .export_target = 0, .export_enable = 0xf, .export_done = true, .src0 = vgpr(8), .src1 = vgpr(9), .src2 = vgpr(10), .src3 = vgpr(11), .src_count = 4 },
+        .{ .pc = sample_pc + 36, .opcode = .s_endpgm },
+    });
+    const sampled = [_]rdna2.spirv.SampledImageBinding{binding};
+    return rdna2.translateSpirv(allocator, &program, .{
+        .stage = .fragment,
+        .fragment_extent = fragment_extent,
+        .sampled_images = &sampled,
+        .parameter_mask = 0x3,
+        .infer_fragment_parameter_mask = false,
+        .descriptor_array_length = maximum_storage_descriptors,
+    });
+}
+
 fn buildTextureProbeFragmentSpirv(
     allocator: std.mem.Allocator,
     binding: rdna2.spirv.SampledImageBinding,
     fragment_extent: [2]u32,
+    parameter_mask: u32,
 ) !rdna2.spirv.Module {
     const vgpr = struct {
         fn at(reg: u32) rdna2.Operand {
@@ -18071,7 +19344,7 @@ fn buildTextureProbeFragmentSpirv(
         .stage = .fragment,
         .fragment_extent = fragment_extent,
         .sampled_images = &sampled,
-        .parameter_mask = 2,
+        .parameter_mask = parameter_mask,
         .infer_fragment_parameter_mask = false,
     });
 }
@@ -18101,9 +19374,7 @@ fn buildUiProbeFragmentSpirv(
     var program = rdna2.Program{ .code = &.{}, .instructions = .empty };
     defer program.deinit(allocator);
     try program.instructions.appendSlice(allocator, &.{
-        // The traced Unity UI shader uses PARAM0.xy as UV and PARAM1 as its
-        // per-vertex colour. Keep the output uncompressed to avoid losing the
-        // sampled alpha in the packed-half export used by this shader family.
+        // Diagnostic copy of the first sampled image using PARAM0.xy.
         .{ .pc = 0, .family = .vintrp, .opcode = .v_interp_mov_f32, .dst = vgpr(0), .src0 = uint(0), .src1 = uint(0), .src2 = uint(0), .src_count = 3 },
         .{ .pc = 4, .family = .vintrp, .opcode = .v_interp_mov_f32, .dst = vgpr(1), .src0 = uint(1), .src1 = uint(0), .src2 = uint(1), .src_count = 3 },
         .{
@@ -18120,23 +19391,15 @@ fn buildUiProbeFragmentSpirv(
             .image_dimension = .dim_2d,
             .image_address_components = 2,
         },
-        .{ .pc = sample_pc + 8, .family = .vintrp, .opcode = .v_interp_mov_f32, .dst = vgpr(6), .src0 = uint(0), .src1 = uint(1), .src2 = uint(0), .src_count = 3 },
-        .{ .pc = sample_pc + 12, .family = .vintrp, .opcode = .v_interp_mov_f32, .dst = vgpr(7), .src0 = uint(1), .src1 = uint(1), .src2 = uint(1), .src_count = 3 },
-        .{ .pc = sample_pc + 16, .family = .vintrp, .opcode = .v_interp_mov_f32, .dst = vgpr(8), .src0 = uint(2), .src1 = uint(1), .src2 = uint(2), .src_count = 3 },
-        .{ .pc = sample_pc + 20, .family = .vintrp, .opcode = .v_interp_mov_f32, .dst = vgpr(9), .src0 = uint(3), .src1 = uint(1), .src2 = uint(3), .src_count = 3 },
-        .{ .pc = sample_pc + 24, .opcode = .v_mul_f32, .dst = vgpr(2), .src0 = vgpr(2), .src1 = vgpr(6), .src_count = 2 },
-        .{ .pc = sample_pc + 28, .opcode = .v_mul_f32, .dst = vgpr(3), .src0 = vgpr(3), .src1 = vgpr(7), .src_count = 2 },
-        .{ .pc = sample_pc + 32, .opcode = .v_mul_f32, .dst = vgpr(4), .src0 = vgpr(4), .src1 = vgpr(8), .src_count = 2 },
-        .{ .pc = sample_pc + 36, .opcode = .v_mul_f32, .dst = vgpr(5), .src0 = vgpr(5), .src1 = vgpr(9), .src_count = 2 },
-        .{ .pc = sample_pc + 40, .family = .exp, .opcode = .exp, .export_target = 0, .export_enable = 0xf, .export_done = true, .src0 = vgpr(2), .src1 = vgpr(3), .src2 = vgpr(4), .src3 = vgpr(5), .src_count = 4 },
-        .{ .pc = sample_pc + 48, .family = .sopp, .opcode = .s_endpgm },
+        .{ .pc = sample_pc + 8, .family = .exp, .opcode = .exp, .export_target = 0, .export_enable = 0xf, .export_done = true, .src0 = vgpr(2), .src1 = vgpr(3), .src2 = vgpr(4), .src3 = vgpr(5), .src_count = 4 },
+        .{ .pc = sample_pc + 16, .family = .sopp, .opcode = .s_endpgm },
     });
     const sampled = [_]rdna2.spirv.SampledImageBinding{binding};
     return rdna2.translateSpirv(allocator, &program, .{
         .stage = .fragment,
         .fragment_extent = fragment_extent,
         .sampled_images = &sampled,
-        .parameter_mask = 3,
+        .parameter_mask = 1,
         .infer_fragment_parameter_mask = false,
     });
 }
@@ -18251,6 +19514,7 @@ fn appendSpirvInstruction(
 fn buildRectangleListGeometrySpirv(
     allocator: std.mem.Allocator,
     parameter_mask: u32,
+    completion_mode: u32,
 ) ![]u32 {
     var capabilities: std.ArrayList(u32) = .empty;
     defer capabilities.deinit(allocator);
@@ -18366,9 +19630,11 @@ fn buildRectangleListGeometrySpirv(
                 next_id += 1;
                 try appendSpirvInstruction(allocator, &body, 61, &.{ type_vector4, value, chain });
             } else {
-                // The corner a rectangle list leaves out. The three it gives
-                // are adjacent corners, so the fourth completes the
-                // parallelogram opposite the last of them: v0 + v1 - v2.
+                // The corner a rectangle list leaves out. Native RECT_LIST
+                // packets omit the corner opposite v2 (v0 + v1 - v2). Merged
+                // NGG TRI_LIST export packets used by fullscreen passes give
+                // v0 as the shared corner and omit its opposite instead
+                // (v1 + v2 - v0).
                 var loaded: [3]u32 = @splat(0);
                 for (0..3) |index| {
                     const chain = next_id;
@@ -18382,10 +19648,23 @@ fn buildRectangleListGeometrySpirv(
                 }
                 const sum = next_id;
                 next_id += 1;
-                try appendSpirvInstruction(allocator, &body, 129, &.{ type_vector4, sum, loaded[0], loaded[1] });
+                const first: usize = if (completion_mode == 2) 1 else 0;
+                const second: usize = if (completion_mode == 2) 2 else 1;
+                const opposite: usize = if (completion_mode == 2) 0 else 2;
+                try appendSpirvInstruction(allocator, &body, 129, &.{
+                    type_vector4,
+                    sum,
+                    loaded[first],
+                    loaded[second],
+                });
                 value = next_id;
                 next_id += 1;
-                try appendSpirvInstruction(allocator, &body, 131, &.{ type_vector4, value, sum, loaded[2] });
+                try appendSpirvInstruction(allocator, &body, 131, &.{
+                    type_vector4,
+                    value,
+                    sum,
+                    loaded[opposite],
+                });
             }
             try appendSpirvInstruction(allocator, &body, 62, &.{ output_variable, value });
         }
@@ -18571,6 +19850,41 @@ test "CRT composite matcher is narrow and rejects an incomplete signature" {
     try std.testing.expect(matchesCrtComposite(&instructions));
     instructions[1].opcode = .v_mul_hi_u32;
     try std.testing.expect(!matchesCrtComposite(&instructions));
+}
+
+test "NGG LDS export inference accepts dynamic clip depth" {
+    const reg = struct {
+        fn make(kind: gpu.ShaderOperandKind, index: u32) gpu.ShaderOperand {
+            return .{ .kind = kind, .reg = index };
+        }
+    }.make;
+    var instructions = [_]gpu.ShaderInstruction{.{}} ** 3;
+    instructions[0] = .{
+        .opcode = .ds_write_b128,
+        .src0 = reg(.vgpr, 0),
+        .src1 = reg(.vgpr, 10),
+        .memory_offset = 0,
+    };
+    instructions[1] = .{
+        .opcode = .ds_write_b96,
+        .src0 = reg(.vgpr, 0),
+        .src1 = reg(.vgpr, 14),
+        .memory_offset = 16,
+    };
+    instructions[2] = .{
+        .opcode = .s_setpc_b64,
+        .src0 = reg(.sgpr, 6),
+    };
+    var parameter_components: [32]u4 = @splat(0);
+    parameter_components[0] = 0x7;
+    var exports: [33]gpu.ShaderSpirvNggLdsExport = undefined;
+    const count = inferNggLdsExports(&instructions, &parameter_components, &exports);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqual(@as(u32, 10), exports[0].sources[0].reg);
+    try std.testing.expectEqual(@as(u32, 11), exports[0].sources[1].reg);
+    try std.testing.expectEqual(@as(u32, 15), exports[0].sources[2].reg);
+    try std.testing.expectEqual(@as(u32, 16), exports[0].sources[3].reg);
+    try std.testing.expectEqual(@as(u8, 0x7), exports[1].enable);
 }
 
 test "RGBA8 integer scaling preserves every source pixel" {
@@ -18935,6 +20249,10 @@ test "ambiguous sampled DIM follows the descriptor image type" {
     try std.testing.expectEqual(
         rdna2.spirv.SampledImageDimension.two_d,
         sampledImageDimensionForInstruction(.dim_1d, .color_1d).?,
+    );
+    try std.testing.expectEqual(
+        rdna2.spirv.SampledImageDimension.two_d,
+        sampledImageDimensionForInstruction(.dim_3d, .color_2d).?,
     );
 }
 
@@ -19559,6 +20877,58 @@ test "NGG auto rectangle uses a triangle strip topology" {
         vk.primitive_topology_triangle_list,
         guestPrimitiveTopology(4, .{ .vertex_count = 3 }),
     );
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        rectangleCompletionMode(.export_shader, 4, .{ .index_count = 3 }, false),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        rectangleCompletionMode(.vertex, 4, .{ .index_count = 3 }, false),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        rectangleCompletionMode(.vertex, 17, .{ .vertex_count = 3 }, false),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 2),
+        rectangleCompletionMode(.export_shader, 4, .{ .index_count = 3 }, true),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        rectangleCompletionMode(.vertex, 4, .{ .index_count = 3 }, true),
+    );
+
+    const ngg = expandRectangleListDraw(7, .{ .vertex_count = 3, .first_vertex = 9 });
+    try std.testing.expectEqual(@as(u32, 4), ngg.vertex_count);
+    try std.testing.expectEqual(@as(u32, 9), ngg.first_vertex);
+    const legacy = expandRectangleListDraw(17, .{ .vertex_count = 3 });
+    try std.testing.expectEqual(@as(u32, 4), legacy.vertex_count);
+    const indexed = expandRectangleListDraw(7, .{ .vertex_count = 3, .index_count = 3 });
+    try std.testing.expectEqual(@as(u32, 3), indexed.vertex_count);
+}
+
+test "direct indexed draw honors persistent index type" {
+    const body = [_]u32{ 0xffff, 0x1234_5000, 0x20, 6, 0 };
+    const packet = gpu.pm4.Packet{
+        .kind = .command,
+        .opcode = gpu.pm4.draw_index_2,
+        .header = 0,
+        .body = &body,
+    };
+    var state = gpu.State{};
+    state.instance_count = 5;
+    try state.writeRegister(.uconfig, 0x24a, @bitCast(@as(i32, -7)));
+
+    const u16_draw = Renderer.decodeDirectGuestDraw(packet, &state).?;
+    try std.testing.expect(!u16_draw.index_uint32);
+    try std.testing.expectEqual(@as(u32, 5), u16_draw.instance_count);
+    try std.testing.expectEqual(@as(i32, -7), u16_draw.vertex_offset);
+    try std.testing.expectEqual(@as(u64, 0x20_1234_5000), u16_draw.index_address);
+    try std.testing.expectEqual(@as(?u32, 6), u16_draw.index_count);
+
+    state.index_type = 1;
+    const u32_draw = Renderer.decodeDirectGuestDraw(packet, &state).?;
+    try std.testing.expect(u32_draw.index_uint32);
 }
 
 test "depth attachment formats follow the stored precision" {

@@ -70,6 +70,24 @@ pub fn accept(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest
     return errno.ok;
 }
 
+/// Returns the stable local identity that accompanies the offline NP account.
+///
+/// `sceNpGetState` and `sceNpGetAccountIdA` report a signed-in local user. An
+/// ENOSYS response here makes that profile internally inconsistent and leaves
+/// Unreal's platform bootstrap waiting for an identity transition that will
+/// never arrive. `SceNpOnlineId` is 16 data bytes followed by a terminator and
+/// three reserved bytes.
+pub fn npGetOnlineId(user_id: i32, output: ?*[20]u8) callconv(abi.guest) i32 {
+    if (user_id == -1) return errno.KernelError.einval.raw();
+    const online_id = output orelse return errno.KernelError.einval.raw();
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(online_id), 20)) {
+        return errno.KernelError.einval.raw();
+    }
+    @memset(online_id, 0);
+    @memcpy(online_id[0..7], "PS5PCEM");
+    return errno.ok;
+}
+
 const game_update_error_not_initialized: i32 = @bitCast(@as(u32, 0x8041_2801));
 const game_update_error_invalid_argument: i32 = @bitCast(@as(u32, 0x8041_2803));
 const disc_map_error_invalid_argument: i32 = @bitCast(@as(u32, 0x8093_0002));
@@ -285,6 +303,56 @@ pub fn npTrophy2CreateHandle(output: ?*i32) callconv(abi.guest) i32 {
     return writeServiceHandle(output, &np_trophy_next_handle);
 }
 
+const NpTrophy2GameDetails = extern struct {
+    num_groups: u32 = 0,
+    num_trophies: u32 = 0,
+    num_platinum: u32 = 0,
+    num_gold: u32 = 0,
+    num_silver: u32 = 0,
+    num_bronze: u32 = 0,
+    title: [128]u8 = [_]u8{0} ** 128,
+};
+
+const NpTrophy2GameData = extern struct {
+    unlocked_trophies: u32 = 0,
+    unlocked_platinum: u32 = 0,
+    unlocked_gold: u32 = 0,
+    unlocked_silver: u32 = 0,
+    unlocked_bronze: u32 = 0,
+    progress_percentage: u32 = 0,
+};
+
+comptime {
+    if (@sizeOf(NpTrophy2GameDetails) != 152) @compileError("SceNpTrophy2GameDetails ABI size mismatch");
+    if (@sizeOf(NpTrophy2GameData) != 24) @compileError("SceNpTrophy2GameData ABI size mismatch");
+}
+
+/// Trophy metadata remains available to an offline local user. Returning
+/// ENOSYS after successfully creating and registering the context leaves
+/// Unreal's trophy bootstrap waiting for a result that will never arrive.
+pub fn npTrophy2GetGameInfo(
+    context: i32,
+    handle: i32,
+    details: ?*NpTrophy2GameDetails,
+    data: ?*NpTrophy2GameData,
+) callconv(abi.guest) i32 {
+    if (context <= 0 or handle <= 0) return errno.KernelError.einval.raw();
+    if (details) |output| {
+        if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(output), @sizeOf(NpTrophy2GameDetails))) {
+            return errno.KernelError.efault.raw();
+        }
+        output.* = .{};
+        @memcpy(output.title[0..7], "PS5PCEM");
+    }
+    if (data) |output| {
+        if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(output), @sizeOf(NpTrophy2GameData))) {
+            return errno.KernelError.efault.raw();
+        }
+        output.* = .{};
+    }
+    return errno.ok;
+}
+
 pub fn npWebApi2PushEventCreateHandle(library_context: i32) callconv(abi.guest) i32 {
     if (library_context <= 0) return errno.KernelError.einval.raw();
     return np_webapi_next_push_handle.fetchAdd(1, .acq_rel);
@@ -453,6 +521,25 @@ test "an absent service reports absence rather than success" {
     try testing.expect(offline(0, 0, 0, 0, 0, 0) < 0);
     try testing.expect(noDevice(0, 0, 0, 0, 0, 0) < 0);
     try testing.expectEqual(errno.ok, accept(0, 0, 0, 0, 0, 0));
+}
+
+test "offline NP profile exposes a stable online id" {
+    var online_id: [20]u8 = @splat(0xa5);
+    try testing.expectEqual(errno.ok, npGetOnlineId(0x1000_0000, &online_id));
+    try testing.expectEqualSlices(u8, "PS5PCEM", online_id[0..7]);
+    try testing.expectEqualSlices(u8, &([_]u8{0} ** 13), online_id[7..]);
+    try testing.expectEqual(errno.KernelError.einval.raw(), npGetOnlineId(-1, &online_id));
+    try testing.expectEqual(errno.KernelError.einval.raw(), npGetOnlineId(0x1000_0000, null));
+}
+
+test "offline trophy profile returns initialized game metadata" {
+    var details: NpTrophy2GameDetails = undefined;
+    var data: NpTrophy2GameData = undefined;
+    try testing.expectEqual(errno.ok, npTrophy2GetGameInfo(1, 1, &details, &data));
+    try testing.expectEqualSlices(u8, "PS5PCEM", details.title[0..7]);
+    try testing.expectEqual(@as(u32, 0), details.num_trophies);
+    try testing.expectEqual(@as(u32, 0), data.progress_percentage);
+    try testing.expectEqual(errno.KernelError.einval.raw(), npTrophy2GetGameInfo(0, 1, &details, &data));
 }
 
 test "the refusal sits outside every library's own numbering" {

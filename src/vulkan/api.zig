@@ -361,6 +361,7 @@ pub const PhysicalDeviceFeatures = extern struct {
     values: [55]Bool32 = [_]Bool32{0} ** 55,
 };
 
+pub const feature_robust_buffer_access: usize = 0;
 pub const feature_geometry_shader: usize = 4;
 pub const feature_fragment_stores_and_atomics: usize = 26;
 pub const feature_shader_image_gather_extended: usize = 28;

@@ -30,8 +30,8 @@ const rwlock_attr_magic: u64 = 0x5054_5257_4154_5452;
 const barrier_magic: u64 = 0x5054_4241_5252_4945;
 
 // AGC completion delivery is asynchronous with the guest driver's retirement
-// queue. Expose a monotonic acknowledgement edge so the submit side can retry
-// an interrupt which the guest consumed before publishing the matching node.
+// queue. Expose only the retirement broadcast as an acknowledgement edge so
+// the submit side can retry an interrupt consumed before its ring node exists.
 var agc_interrupt_cond_sequence: std.atomic.Value(u64) = .init(0);
 
 pub fn agcInterruptCondSequence() u64 {

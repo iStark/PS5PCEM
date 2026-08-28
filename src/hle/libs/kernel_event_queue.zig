@@ -546,17 +546,29 @@ pub fn deleteGraphicsEvent(handle: i64, id: i32) i32 {
 
 /// Publishes a completed graphics/compute submission to every matching equeue.
 pub fn triggerGraphicsEvent(id: i32, context_id: u32) usize {
-    return triggerGraphicsEventsMatching(id, context_id, false);
+    return triggerGraphicsEventsMatching(id, context_id, false, false);
 }
 
 /// Wakes every active graphics registration (any id). Bring-up uses this when
 /// the real interrupt id is still approximate so WaitEqueue(graphics) cannot
 /// park forever after the first frame.
 pub fn triggerAllGraphicsEvents(context_id: u32) usize {
-    return triggerGraphicsEventsMatching(0, context_id, true);
+    return triggerGraphicsEventsMatching(0, context_id, true, false);
 }
 
-fn triggerGraphicsEventsMatching(id: i32, context_id: u32, any_id: bool) usize {
+/// Raises exactly one graphics registration on each equeue, matching the AGC
+/// RELEASE_MEM interrupt fan-out. A driver can register several graphics ids
+/// on one queue, but one hardware EOP is still only one interrupt edge.
+pub fn triggerOneGraphicsEventPerQueue(context_id: u32) usize {
+    return triggerGraphicsEventsMatching(0, context_id, true, true);
+}
+
+fn triggerGraphicsEventsMatching(
+    id: i32,
+    context_id: u32,
+    any_id: bool,
+    one_per_queue: bool,
+) usize {
     var wake_handles: [maximum_queues]i64 = undefined;
     var wake_sequences: [maximum_queues]u64 = undefined;
     var wake_count: usize = 0;
@@ -571,21 +583,6 @@ fn triggerGraphicsEventsMatching(id: i32, context_id: u32, any_id: bool) usize {
             if (!any_id and candidate.ident != ident) continue;
             if (queue.pending_count == maximum_events) break;
             const event_ident = if (any_id) candidate.ident else ident;
-            var event_fflags: u32 = 1;
-            // The graphics filter exposes the number of queued edges through
-            // fflags. AGC's interrupt worker uses that count to retire the same
-            // number of ring submissions. Preserve the count when rendering
-            // takes long enough for several completions to accumulate.
-            var pending_offset = queue.pending_count;
-            while (pending_offset != 0) {
-                pending_offset -= 1;
-                const pending_index = (queue.pending_head + pending_offset) % maximum_events;
-                const pending = queue.pending[pending_index];
-                if (pending.filter == graphics_filter and pending.ident == event_ident) {
-                    event_fflags = pending.fflags +| 1;
-                    break;
-                }
-            }
             const index = (queue.pending_head + queue.pending_count) % maximum_events;
             queue.pending[index] = .{
                 .ident = event_ident,
@@ -593,7 +590,10 @@ fn triggerGraphicsEventsMatching(id: i32, context_id: u32, any_id: bool) usize {
                 // Graphics events have their own reset callback on the real
                 // driver and are registered without EV_CLEAR in the ABI data.
                 .flags = 0,
-                .fflags = event_fflags,
+                // Each queued entry is one interrupt. Encoding the queue depth
+                // here makes the guest retire that many nodes for every entry
+                // and eventually walks beyond its published completion ring.
+                .fflags = 1,
                 .data = context_id,
                 .user_data = candidate.user_data,
             };
@@ -603,6 +603,7 @@ fn triggerGraphicsEventsMatching(id: i32, context_id: u32, any_id: bool) usize {
             wake_sequences[wake_count] = queue.sequence;
             wake_count += 1;
             if (wake_count == maximum_queues) break;
+            if (one_per_queue) break;
         }
     }
     lock.unlock();
@@ -679,7 +680,7 @@ fn dequeue(
         output[index] = queue.pending[queue.pending_head];
         if ((output[index].filter == graphics_filter or
             (output[index].filter == user_filter and output[index].ident == 0x1800)) and
-            graphics_delivery_reports < 256)
+            graphics_delivery_reports < 1024)
         {
             std.debug.print(
                 "[agc event] handle={d} filter={d} ident=0x{x} data=0x{x} fflags={d} sequence={d} pending={d} thread=0x{x}\n",
@@ -926,7 +927,7 @@ test "graphics completion events match the registered queue identifier" {
     try std.testing.expectEqual(errno.ok, deleteGraphicsEvent(handle, 0x21));
 }
 
-test "queued graphics completions retain their accumulated interrupt count" {
+test "queued graphics completions each represent one interrupt" {
     reset();
     var handle: i64 = 0;
     try std.testing.expectEqual(errno.ok, createEqueue(&handle, "graphics-fflags"));
@@ -942,8 +943,25 @@ test "queued graphics completions retain their accumulated interrupt count" {
     try std.testing.expectEqual(errno.ok, waitEqueue(handle, &events, events.len, &count, &timeout));
     try std.testing.expectEqual(@as(i32, 3), count);
     try std.testing.expectEqual(@as(u32, 1), events[0].fflags);
-    try std.testing.expectEqual(@as(u32, 2), events[1].fflags);
-    try std.testing.expectEqual(@as(u32, 3), events[2].fflags);
+    try std.testing.expectEqual(@as(u32, 1), events[1].fflags);
+    try std.testing.expectEqual(@as(u32, 1), events[2].fflags);
+}
+
+test "one graphics EOP wakes one registration per queue" {
+    reset();
+    var handle: i64 = 0;
+    try std.testing.expectEqual(errno.ok, createEqueue(&handle, "graphics-one-per-queue"));
+    defer _ = deleteEqueue(handle);
+    try std.testing.expectEqual(errno.ok, addGraphicsEvent(handle, 0, 0));
+    try std.testing.expectEqual(errno.ok, addGraphicsEvent(handle, 0x20, 0));
+    try std.testing.expectEqual(@as(usize, 1), triggerOneGraphicsEventPerQueue(7));
+
+    var events: [2]Event = @splat(.{});
+    var count: i32 = 0;
+    var timeout: u32 = 0;
+    try std.testing.expectEqual(errno.ok, waitEqueue(handle, &events, events.len, &count, &timeout));
+    try std.testing.expectEqual(@as(i32, 1), count);
+    try std.testing.expectEqual(@as(i64, 7), events[0].data);
 }
 
 test "re-adding a graphics event updates its callback token" {

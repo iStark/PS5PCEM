@@ -14,7 +14,7 @@ const loader = @import("loader");
 const hle = @import("hle");
 
 const usage =
-    \\module-info <module> [provider.prx ...] [--names <list>] [--bytes <vaddr> <count>]
+    \\module-info <module> [provider.prx ...] [--names <list>] [--bytes <vaddr> <count>] [--rip-xrefs <vaddr>] [--reloc <vaddr>]
     \\
     \\Prints a bare ELF or decrypted PS5 SELF module's identity, dependencies,
     \\and imports, marking which ones the firmware emulation or optional guest
@@ -23,6 +23,9 @@ const usage =
     \\--names takes a file of candidate symbol names, one per line, and recovers
     \\the published name of every import whose identifier one of them hashes to.
     \\--bytes prints a bounded virtual range from the decrypted ELF/SELF image.
+    \\--rip-xrefs finds executable x86-64 RIP-relative displacement fields
+    \\whose effective address can resolve to the requested virtual address.
+    \\--reloc prints every relocation whose target is the requested virtual address.
     \\
 ;
 
@@ -135,6 +138,8 @@ pub fn main(init: std.process.Init) !void {
     var names_path: ?[]const u8 = null;
     var bytes_address: ?u64 = null;
     var bytes_count: usize = 0;
+    var rip_xref_target: ?u64 = null;
+    var relocation_target: ?u64 = null;
     var index: usize = 2;
     while (index < args.len) : (index += 1) {
         if (std.mem.eql(u8, args[index], "--names")) {
@@ -155,6 +160,24 @@ pub fn main(init: std.process.Init) !void {
             bytes_count = std.fmt.parseInt(usize, args[index + 2], 0) catch return error.InvalidUsage;
             if (bytes_count == 0 or bytes_count > 4096) return error.InvalidUsage;
             index += 2;
+        } else if (std.mem.eql(u8, args[index], "--rip-xrefs")) {
+            if (index + 1 >= args.len) {
+                try stderr.writeAll(usage);
+                try stderr.flush();
+                return error.InvalidUsage;
+            }
+            rip_xref_target = std.fmt.parseInt(u64, args[index + 1], 0) catch
+                return error.InvalidUsage;
+            index += 1;
+        } else if (std.mem.eql(u8, args[index], "--reloc")) {
+            if (index + 1 >= args.len) {
+                try stderr.writeAll(usage);
+                try stderr.flush();
+                return error.InvalidUsage;
+            }
+            relocation_target = std.fmt.parseInt(u64, args[index + 1], 0) catch
+                return error.InvalidUsage;
+            index += 1;
         } else {
             try providers.append(arena, args[index]);
         }
@@ -283,6 +306,139 @@ pub fn main(init: std.process.Init) !void {
             for (line) |byte| try out.writeByte(if (byte >= 0x20 and byte < 0x7f) byte else '.');
             try out.writeAll("|\n");
         }
+    }
+
+    if (rip_xref_target) |target| {
+        try out.print("\nRIP-relative candidates for 0x{x}\n", .{target});
+        var match_count: usize = 0;
+        for (loads) |ph| {
+            if (!ph.segmentFlags().executable or ph.filesz < @sizeOf(i32)) continue;
+            const code = image.virtualRange(ph.vaddr, @intCast(ph.filesz)) catch continue;
+            for (0..code.len - (@sizeOf(i32) - 1)) |field_offset| {
+                const displacement = std.mem.readInt(i32, code[field_offset..][0..4], .little);
+                const field_end = @as(i128, ph.vaddr) + field_offset + @sizeOf(i32);
+                for (0..9) |trailing_bytes| {
+                    const resolved = field_end + trailing_bytes + displacement;
+                    if (resolved != target) continue;
+                    const context_start = field_offset -| 8;
+                    const context_end = @min(field_offset + 12, code.len);
+                    try out.print(
+                        "  field=0x{x} trailing={d} bytes=",
+                        .{ ph.vaddr + field_offset, trailing_bytes },
+                    );
+                    for (code[context_start..context_end]) |byte| {
+                        try out.print("{x:0>2}", .{byte});
+                    }
+                    try out.writeByte('\n');
+                    match_count += 1;
+                    if (match_count == 256) break;
+                }
+                if (match_count == 256) break;
+            }
+            if (match_count == 256) break;
+        }
+        try out.print("  {d} candidates\n", .{match_count});
+    }
+
+    if (relocation_target) |target| {
+        try out.print("\nrelocations for 0x{x}\n", .{target});
+        if (try image.dynamicData()) |dynamic_bytes| {
+            const entries = std.mem.bytesAsSlice(loader.dynamic.Entry, dynamic_bytes);
+            for (entries, 0..) |entry, dynamic_index| {
+                try out.print(
+                    "  dynamic[{d}] tag={d} value=0x{x}\n",
+                    .{ dynamic_index, entry.tag, entry.value },
+                );
+                if (entry.dynamicTag() == .null) break;
+            }
+        }
+        const symbol_bytes = try info.tableData(image, info.symtab_offset, info.symtab_size);
+        const symbol_table = try loader.symbols.Table.init(symbol_bytes);
+        const strings = try info.tableData(image, info.strtab_offset, info.strtab_size);
+        for (symbol_table.entries, 0..) |symbol, symbol_index| {
+            if (symbol.value != target) continue;
+            var name: []const u8 = "<invalid>";
+            if (symbol.name < strings.len) {
+                const tail = strings[symbol.name..];
+                if (std.mem.indexOfScalar(u8, tail, 0)) |end| name = tail[0..end];
+            }
+            try out.print(
+                "  symbol[{d}] value=0x{x} name={s} defined={} binding={s} type={s}\n",
+                .{
+                    symbol_index,
+                    symbol.value,
+                    name,
+                    symbol.isDefined(),
+                    @tagName(symbol.binding()),
+                    @tagName(symbol.symbolType()),
+                },
+            );
+        }
+        var raw_match_count: usize = 0;
+        if (target <= std.math.maxInt(u32)) {
+            const target32: u32 = @intCast(target);
+            for (loads) |ph| {
+                if (ph.filesz < @sizeOf(u32)) continue;
+                const data = image.virtualRange(ph.vaddr, @intCast(ph.filesz)) catch continue;
+                for (0..data.len - (@sizeOf(u32) - 1)) |data_offset| {
+                    if (std.mem.readInt(u32, data[data_offset..][0..4], .little) != target32) continue;
+                    try out.print("  raw32 vaddr=0x{x}\n", .{ph.vaddr + data_offset});
+                    raw_match_count += 1;
+                    if (raw_match_count == 256) break;
+                }
+                if (raw_match_count == 256) break;
+            }
+        }
+        try out.print("  {d} raw address matches\n", .{raw_match_count});
+        var match_count: usize = 0;
+        const tables = [_]struct {
+            bytes: []const u8,
+            kind: loader.relocations.TableKind,
+        }{
+            .{
+                .bytes = try info.tableData(image, info.rela_offset, info.rela_size),
+                .kind = .general,
+            },
+            .{
+                .bytes = try info.tableData(image, info.jmprel_offset, info.jmprel_size),
+                .kind = .plt,
+            },
+        };
+        for (tables) |table_data| {
+            if (table_data.bytes.len == 0) continue;
+            const table = try loader.relocations.Table.init(table_data.bytes, table_data.kind);
+            for (table.entries, 0..) |rela, rela_index| {
+                const addend_address: ?u64 = if (rela.relocationType() == .relative and rela.addend >= 0)
+                    @intCast(rela.addend)
+                else
+                    null;
+                const near_target = if (rela.offset >= target)
+                    rela.offset - target <= 0x40
+                else
+                    target - rela.offset <= 0x40;
+                if (!near_target and addend_address != target) continue;
+                try out.print(
+                    "  {s}[{d}] offset=0x{x} type={s} symbol={d} addend={d} (0x{x}) relation={s}\n",
+                    .{
+                        @tagName(table_data.kind),
+                        rela_index,
+                        rela.offset,
+                        @tagName(rela.relocationType()),
+                        rela.symbolIndex(),
+                        rela.addend,
+                        @as(u64, @bitCast(rela.addend)),
+                        if (rela.offset == target)
+                            "target"
+                        else if (addend_address == target)
+                            "value"
+                        else
+                            "near",
+                    },
+                );
+                match_count += 1;
+            }
+        }
+        try out.print("  {d} matches\n", .{match_count});
     }
 
     if (info.needed_modules.items.len != 0) {

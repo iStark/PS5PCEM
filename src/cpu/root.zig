@@ -414,6 +414,13 @@ pub var invalid_allocator_head_recoveries: std.atomic.Value(u64) = .init(0);
 /// How many corrupt Unity frame-slot indices were reset to the renderer's
 /// explicit inactive slot before their scaled address reached unmapped memory.
 pub var invalid_frame_slot_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many corrupt terminal links were dropped from the guest AGC interrupt
+/// registration list.  The recovery is tied to the exact list-walk machine
+/// code and preserves that routine's existing end-of-list path.
+pub var corrupt_agc_interrupt_list_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many stale nodes in the companion AGC cleanup list followed that
+/// routine's existing null-tail exit instead of terminating CleanupThread.
+pub var corrupt_agc_cleanup_list_recoveries: std.atomic.Value(u64) = .init(0);
 /// First native access violation declined by the guest exception bridge.
 ///
 /// Host faults normally disappear into Windows with only process exit code
@@ -934,6 +941,44 @@ const WindowsX64Machine = struct {
             _ = fs_base_restorations.fetchAdd(1, .monotonic);
             return exception_continue_execution;
         }
+        // The title's AgcInterruptThread removes registrations from an
+        // intrusive list. A stale terminal link can contain event payload data
+        // instead of another node; follow the routine's own end-of-list exit
+        // for this exact generated loop instead of terminating the only
+        // interrupt thread and leaving the renderer waiting forever.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0)
+        {
+            const corrupt_node = context.Rcx;
+            if (tryDropCorruptAgcInterruptListTail(context, record.ExceptionInformation[1])) {
+                _ = corrupt_agc_interrupt_list_recoveries.fetchAdd(1, .monotonic);
+                const count = corrupt_agc_interrupt_list_recoveries.load(.monotonic);
+                if (count <= 8 or count % 256 == 0) std.debug.print(
+                    "[cpu] dropped corrupt AGC interrupt-list tail @rip=0x{x} node=0x{x} (#{d})\n",
+                    .{ context.Rip - 0x1c, corrupt_node, count },
+                );
+                return exception_continue_execution;
+            }
+        }
+        // AgcCleanupThread walks the same registration chain with a distinct
+        // generated loop. Treat an unreadable candidate as its tested null
+        // tail, preserving the normal cleanup epilogue at the branch target.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0)
+        {
+            const corrupt_node = context.R13;
+            if (tryDropCorruptAgcCleanupListTail(context, record.ExceptionInformation[1])) {
+                _ = corrupt_agc_cleanup_list_recoveries.fetchAdd(1, .monotonic);
+                const count = corrupt_agc_cleanup_list_recoveries.load(.monotonic);
+                if (count <= 8 or count % 256 == 0) std.debug.print(
+                    "[cpu] dropped corrupt AGC cleanup-list tail @rip=0x{x} node=0x{x} (#{d})\n",
+                    .{ context.Rip - 0x64, corrupt_node, count },
+                );
+                return exception_continue_execution;
+            }
+        }
         // IL2CPP/Unity often does `cmp byte/dword [obj+0x20], 0` / `je null_path`
         // after a flip. Handle compares *before* base redirect: redirecting the
         // base to a self-pointer stub makes `[stub+0x20]` look non-null and the
@@ -1280,10 +1325,31 @@ const WindowsX64Machine = struct {
             const fault_rip = context.Rip;
             if (tryEmulateNullMemoryStore(context, record.ExceptionInformation[1])) {
                 _ = null_memory_store_recoveries.fetchAdd(1, .monotonic);
-                std.debug.print(
-                    "[cpu] recovered null-memory store @rip=0x{x} addr=0x{x} (#{d})\n",
-                    .{ fault_rip, record.ExceptionInformation[1], null_memory_store_recoveries.load(.monotonic) },
-                );
+                const count = null_memory_store_recoveries.load(.monotonic);
+                if (count <= 8 or count % 256 == 0) {
+                    var return_address: u64 = 0;
+                    if (frame.owner != null and
+                        memory.isHostRangeReadable(context.Rsp, @sizeOf(u64)))
+                    {
+                        return_address = @as(*align(1) const u64, @ptrFromInt(context.Rsp)).*;
+                    }
+                    std.debug.print(
+                        "[cpu] recovered null-memory store @rip=0x{x} addr=0x{x} ret=0x{x} rax=0x{x} rcx=0x{x} rdx=0x{x} rsi=0x{x} rdi=0x{x} r14=0x{x} r15=0x{x} (#{d})\n",
+                        .{
+                            fault_rip,
+                            record.ExceptionInformation[1],
+                            return_address,
+                            context.Rax,
+                            context.Rcx,
+                            context.Rdx,
+                            context.Rsi,
+                            context.Rdi,
+                            context.R14,
+                            context.R15,
+                            count,
+                        },
+                    );
+                }
                 return exception_continue_execution;
             }
         }
@@ -2330,10 +2396,87 @@ const WindowsX64Machine = struct {
         return true;
     }
 
-    /// Discards integer stores into the first page and steps past the instruction.
-    fn tryEmulateNullMemoryStore(context: *std.os.windows.CONTEXT, memory_address: u64) bool {
-        if (memory_address == 0 or memory_address >= lost_base_window) return false;
+    /// Finishes the exact AGC registration-list walk whose terminal link was
+    /// observed to contain packed event data. At the faulting CMP, RCX is the
+    /// candidate node. Advancing by the whole loop tail reaches the routine's
+    /// normal cleanup block at the same address as a null next pointer.
+    fn tryDropCorruptAgcInterruptListTail(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const pattern = [_]u8{
+            0x83, 0x79, 0x48, 0x01, // cmp dword ptr [rcx+0x48],1
+            0x74, 0xe4, // je previous-node path
+            0x48, 0x8b, 0x71, 0x20, // mov rsi,qword ptr [rcx+0x20]
+            0x48, 0x2b, 0x31, // sub rsi,qword ptr [rcx]
+            0x48, 0x01, 0xf0, // add rax,rsi
+            0x48, 0x89, 0x02, // mov qword ptr [rdx],rax
+            0x48, 0x8b, 0x49, 0x40, // mov rcx,qword ptr [rcx+0x40]
+            0x48, 0x85, 0xc9, // test rcx,rcx
+            0x75, 0xe4, // jne loop
+        };
+
+        const exact_field = memory_address == context.Rcx +% 0x48;
+        const poisoned_field = memory_address == std.math.maxInt(u64) and
+            !isCanonicalX64Address(context.Rcx);
+        if (!exact_field and !poisoned_field) return false;
         const code: [*]const u8 = @ptrFromInt(context.Rip);
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+
+        context.Rcx = 0;
+        context.Rip += pattern.len;
+        return true;
+    }
+
+    fn tryDropCorruptAgcCleanupListTail(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        if (memory_address != context.R13 +% 0x48) return false;
+        const before: [*]const u8 = @ptrFromInt(context.Rip -% 9);
+        const prefix = [_]u8{
+            0x4d, 0x8b, 0x6d, 0x40, // mov r13,qword ptr [r13+0x40]
+            0x4d, 0x85, 0xed, // test r13,r13
+            0x74, 0x64, // je normal cleanup
+        };
+        for (prefix, 0..) |byte, index| {
+            if (before[index] != byte) return false;
+        }
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const pattern = [_]u8{
+            0x41, 0x83, 0x7d, 0x48, 0x00, // cmp dword ptr [r13+0x48],0
+            0x75, 0xf0, // jne next node
+            0x4d, 0x8b, 0x75, 0x00, // mov r14,qword ptr [r13]
+            0x4d, 0x63, 0x3c, 0x24, // movsxd r15,dword ptr [r12]
+            0x41, 0x8d, 0x5f, 0x01, // lea ebx,[r15+1]
+            0x41, 0x89, 0x1c, 0x24, // mov dword ptr [r12],ebx
+        };
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        context.R13 = 0;
+        context.Rip += 0x64;
+        return true;
+    }
+
+    /// Discards scalar and vector stores into the first page and steps past the instruction.
+    fn tryEmulateNullMemoryStore(context: *std.os.windows.CONTEXT, memory_address: u64) bool {
+        if (memory_address >= lost_base_window) return false;
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        // C5 xx 11 /r and C5 xx 7F /r are the two-byte-VEX store forms of
+        // VMOVUPS/VMOVUPD/VMOVSS/VMOVSD and VMOVDQA/VMOVDQU. Unreal uses them
+        // while zero-initializing optional renderer buffers for which the
+        // scalar path below already discards first-page writes.
+        if (code[0] == 0xc5 and (code[2] == 0x11 or code[2] == 0x7f)) {
+            const modrm = code[3];
+            const mem_len = modrmMemoryOperandLength(modrm, code[4..]) orelse return false;
+            const length = 4 + mem_len;
+            if (length > 15) return false;
+            context.Rip += length;
+            return true;
+        }
         var offset: usize = 0;
         if (code[0] & 0xf0 == 0x40) offset = 1;
         const opcode = code[offset];
@@ -2514,6 +2657,44 @@ test "a null instruction pointer is treated as guest control flow" {
     try std.testing.expect(isGuestAddress(memory.system_managed.start));
 }
 
+test "integer stores at exact null are discarded" {
+    if (can_use_native_bridge) {
+        // mov qword ptr [rax], rdi
+        const code = [_]u8{ 0x48, 0x89, 0x38 };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        try std.testing.expect(WindowsX64Machine.tryEmulateNullMemoryStore(&context, 0));
+        try std.testing.expectEqual(@intFromPtr(&code) + code.len, context.Rip);
+
+        context.Rip = @intFromPtr(&code);
+        try std.testing.expect(!WindowsX64Machine.tryEmulateNullMemoryStore(
+            &context,
+            WindowsX64Machine.lost_base_window,
+        ));
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "VEX vector stores into the first page are discarded" {
+    if (can_use_native_bridge) {
+        // vmovups ymmword ptr [rax], ymm0
+        const code = [_]u8{ 0xc5, 0xfc, 0x11, 0x00 };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        try testing.expect(WindowsX64Machine.tryEmulateNullMemoryStore(&context, 0));
+        try testing.expectEqual(@intFromPtr(&code) + code.len, context.Rip);
+
+        // vmovdqu xmmword ptr [rdi], xmm0
+        const unaligned_integer = [_]u8{ 0xc5, 0xfa, 0x7f, 0x07 };
+        context.Rip = @intFromPtr(&unaligned_integer);
+        try testing.expect(WindowsX64Machine.tryEmulateNullMemoryStore(&context, 0));
+        try testing.expectEqual(@intFromPtr(&unaligned_integer) + unaligned_integer.len, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "a dropped thread pointer is repaired, a null dereference is not" {
     const shouldRestore = WindowsX64Machine.shouldRestoreFsBase;
 
@@ -2611,6 +2792,57 @@ test "a poisoned list link reaches the loop sentinel instead of faulting" {
         ));
         try std.testing.expectEqual(context.Rdx, context.Rcx);
         try std.testing.expectEqual(@intFromPtr(&code) + 4, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "a corrupt AGC interrupt registration tail reaches normal cleanup" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{
+            0x83, 0x79, 0x48, 0x01,
+            0x74, 0xe4, 0x48, 0x8b,
+            0x71, 0x20, 0x48, 0x2b,
+            0x31, 0x48, 0x01, 0xf0,
+            0x48, 0x89, 0x02, 0x48,
+            0x8b, 0x49, 0x40, 0x48,
+            0x85, 0xc9, 0x75, 0xe4,
+        };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rcx = 0xc005_5000_0000_0000;
+        try std.testing.expect(WindowsX64Machine.tryDropCorruptAgcInterruptListTail(
+            &context,
+            std.math.maxInt(u64),
+        ));
+        try std.testing.expectEqual(@as(u64, 0), context.Rcx);
+        try std.testing.expectEqual(@intFromPtr(&code) + code.len, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "a corrupt AGC cleanup registration tail reaches its null exit" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{
+            0x4d, 0x8b, 0x6d, 0x40,
+            0x4d, 0x85, 0xed, 0x74,
+            0x64, 0x41, 0x83, 0x7d,
+            0x48, 0x00, 0x75, 0xf0,
+            0x4d, 0x8b, 0x75, 0x00,
+            0x4d, 0x63, 0x3c, 0x24,
+            0x41, 0x8d, 0x5f, 0x01,
+            0x41, 0x89, 0x1c, 0x24,
+        };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code) + 9;
+        context.R13 = 0xc00e_1000;
+        try std.testing.expect(WindowsX64Machine.tryDropCorruptAgcCleanupListTail(
+            &context,
+            context.R13 + 0x48,
+        ));
+        try std.testing.expectEqual(@as(u64, 0), context.R13);
+        try std.testing.expectEqual(@intFromPtr(&code) + 9 + 0x64, context.Rip);
     } else {
         return error.SkipZigTest;
     }

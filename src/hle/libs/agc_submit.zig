@@ -35,7 +35,6 @@ const memory = @import("kernel_memory.zig");
 const guest_address_space = @import("memory");
 const shader_registry = @import("agc_shader_registry.zig");
 const event_queue = @import("kernel_event_queue.zig");
-const kernel_sync = @import("kernel_sync.zig");
 const video_out = @import("../video_out.zig");
 const kernel_runtime = @import("kernel_runtime.zig");
 
@@ -83,7 +82,11 @@ var submission_reports: u32 = 0;
 var interrupt_release_reports: u32 = 0;
 var release_delivery_reports: u32 = 0;
 var retirement_bridge_reports: u32 = 0;
+var driver_completion_reports: u32 = 0;
+var driver_completion_chain_reports: u32 = 0;
+var driver_completion_miss_reports: u32 = 0;
 var submission_header_write_reports: u32 = 0;
+var unmapped_wait_reports: u32 = 0;
 var unsafe_island_reports: u32 = 0;
 
 const maximum_submission_aliases = 256;
@@ -107,6 +110,7 @@ var pending_graphics_segment = PendingGraphicsSegment{};
 var pending_graphics_reports: u32 = 0;
 
 const CompletionKind = enum {
+    driver_label,
     release,
     dcb,
     acb,
@@ -115,27 +119,20 @@ const CompletionKind = enum {
 const PendingCompletion = struct {
     kind: CompletionKind,
     context_id: u32 = 0,
+    address: u64 = 0,
     ready_after_ns: u64 = 0,
-    ack_sequence: u64 = 0,
-    delivered: bool = false,
 };
 
-/// GPU completion is asynchronous with respect to sceAgcDriverSubmit*. The
-/// guest records its ring entry only after that call returns, so delivering an
-/// event from inside the synchronous host renderer races ahead of the record
-/// and eventually exhausts the ring. Keep completions ordered and publish them
-/// on the next driver boundary / suspend point instead.
+/// GPU completion is asynchronous with respect to sceAgcDriverSubmit*. Keep
+/// completion edges ordered and publish them off the synchronous renderer's
+/// command-processor stack.
 const maximum_pending_completions = 4096;
-// The submitting guest thread records its retirement node only after the HLE
-// call has returned. Keep the first notification asynchronous, then retain the
-// FIFO head until AgcInterruptThread signals one of the driver's retirement
-// conditions. If the event was consumed before the node existed, reissue it;
-// a fixed delay alone only changes how often that race occurs. One 60 Hz
-// display interval is enough for the submitting thread to publish the node and
-// keeps fast command streams from outrunning 60 Hz VideoOut/media clocks; a
-// quarter-second interval artificially caps otherwise completed frames at 4 Hz.
-const completion_latency_ns = 16 * std.time.ns_per_ms;
-const completion_retry_ns = 16 * std.time.ns_per_ms;
+// The guest queues its retirement record immediately before entering Submit*.
+// Publish shortly after the synchronous renderer has returned from the packet,
+// while keeping delivery off the command-processor stack. A long grace period
+// lets several frames' retirement records accumulate and makes the retail AGC
+// worker consume a burst of stale ring edges at mode changes.
+const completion_latency_ns = 5 * std.time.ns_per_ms;
 var completion_lock = ExecutionLock{};
 var completion_drain_lock = ExecutionLock{};
 var pending_completions: [maximum_pending_completions]PendingCompletion = undefined;
@@ -151,6 +148,7 @@ var completion_worker_started: std.atomic.Value(bool) = .init(false);
 // by execution_lock; collect release edges there and arm them only when the
 // complete scheduler pass has finished.
 var completion_batch_active: bool = false;
+var batched_driver_completion_label: u64 = 0;
 var batched_release_contexts: [maximum_pending_completions]u32 = undefined;
 var batched_release_count: usize = 0;
 
@@ -185,21 +183,8 @@ fn enqueueCompletion(completion: PendingCompletion) void {
     completion_lock.lock();
     const ready_after_ns = kernel_runtime.processTimeCounter() +|
         @as(u64, completion_latency_ns);
-    // An interrupt handler scans every completed retirement node for its
-    // queue/context. If another synchronous submit finishes while that same
-    // edge is pending, retain one FIFO entry but arm it again: this neither
-    // loses the newer edge nor lets equivalent completions grow without bound
-    // while a second guest handler is slow to acknowledge the first.
-    for (0..pending_completion_count) |offset| {
-        const index = (pending_completion_head + offset) % pending_completions.len;
-        const pending = &pending_completions[index];
-        if (pending.kind != completion.kind or pending.context_id != completion.context_id) continue;
-        pending.ready_after_ns = ready_after_ns;
-        pending.delivered = false;
-        completion_lock.unlock();
-        ensureCompletionWorker();
-        return;
-    }
+    // Each public submit owns one retirement edge. Preserve FIFO order and do
+    // not merge equivalent queue identifiers across separate submissions.
     if (pending_completion_count == pending_completions.len) {
         if (dropped_completion_reports < 8) {
             std.debug.print("[agc delivery] completion FIFO full; dropping {s}\n", .{@tagName(completion.kind)});
@@ -220,15 +205,35 @@ fn enqueueCompletion(completion: PendingCompletion) void {
 fn beginCompletionBatch() void {
     std.debug.assert(!completion_batch_active);
     completion_batch_active = true;
+    batched_driver_completion_label = 0;
     batched_release_count = 0;
 }
 
 fn finishCompletionBatch() void {
     std.debug.assert(completion_batch_active);
     completion_batch_active = false;
-    for (batched_release_contexts[0..batched_release_count]) |context_id| {
-        enqueueCompletion(.{ .kind = .release, .context_id = context_id });
+    if (batched_release_count != 0) {
+        // RELEASE_MEM has already published its label by this point. Wake the
+        // matching event in the same completion boundary: delaying it by even
+        // one worker tick lets the submit thread observe label=0, recycle the
+        // retirement node, and leaves AgcInterruptThread with a stale list.
+        if (batched_driver_completion_label != 0) {
+            publishDriverCompletionLabel(batched_driver_completion_label);
+        }
+        for (batched_release_contexts[0..batched_release_count]) |context_id| {
+            _ = deliverCompletion(.{ .kind = .release, .context_id = context_id });
+        }
+    } else if (batched_driver_completion_label != 0) {
+        enqueueCompletion(.{ .kind = .driver_label, .address = batched_driver_completion_label });
     }
+    batched_driver_completion_label = 0;
+    batched_release_count = 0;
+}
+
+fn discardCompletionBatch() void {
+    std.debug.assert(completion_batch_active);
+    completion_batch_active = false;
+    batched_driver_completion_label = 0;
     batched_release_count = 0;
 }
 
@@ -244,27 +249,22 @@ fn recordUniqueReleaseContext(storage: []u32, count: *usize, context_id: u32) bo
 
 fn deliverCompletion(completion: PendingCompletion) usize {
     return switch (completion.kind) {
+        .driver_label => {
+            publishDriverCompletionLabel(completion.address);
+            return 0;
+        },
         .release => {
-            const queued_graphics = event_queue.triggerGraphicsEvent(0, completion.context_id);
-            // Current PS5 AGC registers its direct EOP edge as 0x20. Older
-            // SDK/reference implementations use 0x40, so publish to either
-            // registration when present rather than silently dropping the
-            // title's second completion class.
-            const direct_eop_ps5 = event_queue.triggerGraphicsEvent(0x20, completion.context_id);
-            const direct_eop_legacy = event_queue.triggerGraphicsEvent(0x40, completion.context_id);
-            if (release_delivery_reports < 64) {
+            const triggered = event_queue.triggerOneGraphicsEventPerQueue(completion.context_id);
+            if (release_delivery_reports < 512) {
                 std.debug.print(
-                    "[agc delivery] interrupt context={d} graphics={d} eop={d}\n",
-                    .{ completion.context_id, queued_graphics, direct_eop_ps5 + direct_eop_legacy },
+                    "[agc delivery] interrupt context={d} queues={d}\n",
+                    .{ completion.context_id, triggered },
                 );
                 release_delivery_reports += 1;
             }
-            return queued_graphics + direct_eop_ps5 + direct_eop_legacy;
+            return triggered;
         },
-        .dcb => {
-            return event_queue.triggerGraphicsEvent(0, 0) +
-                event_queue.triggerGraphicsEvent(0x40, 0);
-        },
+        .dcb => event_queue.triggerGraphicsEvent(0, completion.context_id),
         .acb => event_queue.triggerUserEventForAll(
             0x1800,
             @bitCast(kernel_runtime.processTimeCounter()),
@@ -277,48 +277,22 @@ fn drainCompletionNotifications() void {
     // Only one may observe/deliver the retained FIFO head at a time.
     completion_drain_lock.lock();
     defer completion_drain_lock.unlock();
-    while (true) {
-        completion_lock.lock();
-        if (pending_completion_count == 0) {
-            completion_lock.unlock();
-            return;
-        }
-        const completion = &pending_completions[pending_completion_head];
-        // Returning from Submit* is not enough by itself: another guest thread
-        // can enter SuspendPoint before the submitting thread has recorded its
-        // completion-ring entry. A real GPU cannot interrupt in that window.
-        // Preserve FIFO order and leave a short scheduling interval for that
-        // post-submit bookkeeping before publishing the event.
-        const now = kernel_runtime.processTimeCounter();
-        if (completion.delivered) {
-            const acknowledged = kernel_sync.agcInterruptCondSequence() != completion.ack_sequence;
-            if (acknowledged) {
-                pending_completion_head = (pending_completion_head + 1) % pending_completions.len;
-                pending_completion_count -= 1;
-                completion_lock.unlock();
-                continue;
-            }
-        }
-        if (now < completion.ready_after_ns) {
-            completion_lock.unlock();
-            return;
-        }
-        completion.delivered = true;
-        completion.ack_sequence = kernel_sync.agcInterruptCondSequence();
-        completion.ready_after_ns = now +| @as(u64, completion_retry_ns);
-        const delivery = completion.*;
+    completion_lock.lock();
+    const now = kernel_runtime.processTimeCounter();
+    if (pending_completion_count == 0 or
+        now < pending_completions[pending_completion_head].ready_after_ns)
+    {
         completion_lock.unlock();
-        const triggered = deliverCompletion(delivery);
-        if (triggered != 0) return;
-
-        // No queue had a matching registration. There can be no guest-side
-        // acknowledgement for this edge, and retaining it would block every
-        // later completion in the FIFO.
-        completion_lock.lock();
-        pending_completion_head = (pending_completion_head + 1) % pending_completions.len;
-        pending_completion_count -= 1;
-        completion_lock.unlock();
+        return;
     }
+    const delivery = pending_completions[pending_completion_head];
+    pending_completion_head = (pending_completion_head + 1) % pending_completions.len;
+    pending_completion_count -= 1;
+    completion_lock.unlock();
+
+    // One completion per worker tick keeps guest-visible ordering while the
+    // event queue itself preserves every distinct hardware edge.
+    _ = deliverCompletion(delivery);
 }
 
 /// Publishes GPU completions whose asynchronous grace period has elapsed.
@@ -467,7 +441,16 @@ pub fn readGuestMemory(_: ?*anyopaque, address: u64, bytes: []u8) bool {
 
 pub fn writeGuestMemory(context: ?*anyopaque, address: u64, bytes: []const u8) bool {
     if (video_out.writeLabelMemory(address, bytes)) return true;
-    if (findSubmissionHeaderCollision(address, bytes.len)) |collision| {
+    // Fence/write-data packets only publish one or two words. Reject those
+    // narrow writes when descriptor data has been mistaken for PM4. A real
+    // DMA clear may intentionally recycle an arena after the command processor
+    // has fetched it; streams execute from scheduler-owned snapshots, so a
+    // broad write which merely spans an old header is safe and must complete.
+    const header_collision = if (bytes.len <= submission_allocation_header_bytes)
+        findSubmissionHeaderCollision(address, bytes.len)
+    else
+        null;
+    if (header_collision) |collision| {
         if (submission_header_write_reports < 32) {
             var payload: u64 = 0;
             const shown = @min(bytes.len, @sizeOf(u64));
@@ -824,9 +807,8 @@ fn triggerReleaseInterrupt(value: gpu.state.ReleaseMem) void {
     if (value.interrupt != 1 and value.interrupt != 2 and value.interrupt != 4) return;
     if (completion_batch_active) {
         // One interrupt handler pass retires every completed node in its ring.
-        // Unity emits many RELEASE_MEM packets with the same context in one DCB;
-        // queueing all of them only floods the host FIFO before the guest gets a
-        // scheduling turn, without exposing any additional completion state.
+        // Coalesce the many release packets emitted under one submission and
+        // context into the single edge owned by that public submit.
         if (recordUniqueReleaseContext(
             &batched_release_contexts,
             &batched_release_count,
@@ -954,7 +936,7 @@ fn backendRelease(_: ?*anyopaque, value: gpu.state.ReleaseMem) bool {
     if (installed_backend) |backend| {
         if (backend.vtable.release) |callback| {
             const accepted = callback(backend.context, value);
-            if (reports_interrupt and interrupt_release_reports < 64) {
+            if (reports_interrupt and interrupt_release_reports < 512) {
                 var new_label: [8]u8 = [_]u8{0} ** 8;
                 const new_label_valid = label_size != 0 and
                     readGuestMemory(null, value.address, new_label[0..label_size]);
@@ -1148,6 +1130,9 @@ pub fn reset() void {
     interrupt_release_reports = 0;
     release_delivery_reports = 0;
     retirement_bridge_reports = 0;
+    driver_completion_reports = 0;
+    driver_completion_chain_reports = 0;
+    driver_completion_miss_reports = 0;
     submission_header_write_reports = 0;
     unsafe_island_reports = 0;
     submission_alias_lock.lock();
@@ -1164,6 +1149,7 @@ pub fn reset() void {
     dropped_completion_reports = 0;
     completion_lock.unlock();
     completion_batch_active = false;
+    batched_driver_completion_label = 0;
     batched_release_count = 0;
 }
 
@@ -1283,6 +1269,35 @@ fn submittedCommandPrefix(stream: []const u32) []const u32 {
         const packet = walker.next() catch return stream[0..offset];
         const value = packet orelse return stream;
         if (value.kind != .command and value.kind != .filler) return stream[0..offset];
+        if (packetWaitMemoryRead(value)) |read| {
+            var bytes: [@sizeOf(u64)]u8 = undefined;
+            // A real CPU-visible fence must already name readable storage when
+            // the DCB is submitted. Descriptor tails can accidentally decode
+            // as WAIT_REG_MEM, commonly losing the upper address dword of a
+            // nearby label. Letting that false packet reach the scheduler
+            // leaves every later frame parked behind an address which can
+            // never be published.
+            if (!readGuestMemory(null, read.address, bytes[0..read.byte_length])) {
+                if (unsafe_island_reports < 32) {
+                    std.debug.print(
+                        "[dcb guard] trimmed command prefix before unreadable wait: target=0x{x}+{d} arena=0x{x}\n",
+                        .{ read.address, read.byte_length, @intFromPtr(stream.ptr) },
+                    );
+                    unsafe_island_reports += 1;
+                }
+                return stream[0..offset];
+            }
+        }
+        if (packetWritesSubmissionAllocationHeader(stream, value)) |target| {
+            if (unsafe_island_reports < 32) {
+                std.debug.print(
+                    "[dcb guard] trimmed command prefix before allocation-header write: target=0x{x} arena=0x{x} opcode=0x{x}\n",
+                    .{ target, @intFromPtr(stream.ptr), value.opcode },
+                );
+                unsafe_island_reports += 1;
+            }
+            return stream[0..offset];
+        }
     }
 }
 
@@ -1414,6 +1429,16 @@ fn packetHasPlausibleIslandShape(packet: gpu.pm4.Packet) bool {
         gpu.pm4.index_base => return body.len == 2,
         gpu.pm4.index_buffer_size => return body.len == 1,
         gpu.pm4.num_instances, gpu.pm4.index_type => return body.len >= 1,
+        // Command islands are found inside allocations which also contain
+        // descriptor tables. Three arbitrary descriptor words can otherwise
+        // look exactly like DISPATCH_DIRECT and poison persistent compute
+        // state. GCN exposes at most 16-bit workgroup counts per dimension for
+        // this path; a larger count is descriptor data, not executable PM4.
+        gpu.pm4.dispatch_direct => return (body.len == 3 or body.len == 4) and
+            body[0] <= std.math.maxInt(u16) and
+            body[1] <= std.math.maxInt(u16) and
+            body[2] <= std.math.maxInt(u16),
+        gpu.pm4.dispatch_indirect => return body.len == 2 or body.len == 3,
         gpu.pm4.acquire_mem => return body.len >= 6,
         gpu.pm4.release_mem => return body.len >= 7,
         gpu.pm4.wait_reg_mem => return body.len >= 6,
@@ -1599,57 +1624,56 @@ fn nextSubmittedCommandSegment(stream: []const u32, search_start: usize) ?Submit
     return null;
 }
 
-fn executeAcceptedStream(label: []const u8, stream: []const u32) SubmitOutcome {
+fn executeAcceptedStream(
+    label: []const u8,
+    stream: []const u32,
+    driver_completion_label: ?u64,
+) SubmitOutcome {
     rememberSubmissionAlias(stream);
     const commands = submittedCommandPrefix(stream);
-    if (commands.len == 0) return .{};
 
-    var segment_count: usize = 0;
-    var segment_words: usize = 0;
-    var scan = commands.len;
-    while (nextSubmittedCommandSegment(stream, scan)) |segment| {
-        segment_count += 1;
-        segment_words += segment.end - segment.start;
-        scan = segment.end;
-    }
     if (commands.len != stream.len) {
         if (trace.isLive() or trimmed_submission_reports < 8) {
-            if (segment_count != 0) {
-                std.debug.print(
-                    "[{s}] split command arena: prefix={d}, islands={d}/{d}, data={d}/{d} dwords @0x{x}\n",
-                    .{
-                        label,
-                        commands.len,
-                        segment_count,
-                        segment_words,
-                        stream.len - commands.len - segment_words,
-                        stream.len,
-                        @intFromPtr(stream.ptr),
-                    },
-                );
-            } else {
-                std.debug.print(
-                    "[{s}] trimmed trailing allocation data: {d}/{d} dwords @0x{x}\n",
-                    .{ label, commands.len, stream.len, @intFromPtr(stream.ptr) },
-                );
-            }
+            std.debug.print(
+                "[{s}] trimmed trailing allocation data: {d}/{d} dwords @0x{x}\n",
+                .{ label, commands.len, stream.len, @intFromPtr(stream.ptr) },
+            );
         }
         trimmed_submission_reports +|= 1;
     }
-    var outcome = executeSubmitted(label, commands);
-    outcome.queued_interrupt = hasQueuedInterrupt(commands);
 
-    scan = commands.len;
-    while (nextSubmittedCommandSegment(stream, scan)) |segment| {
-        const island = stream[segment.start..segment.end];
-        const island_outcome = executeSubmitted(label, island);
-        outcome.accepted = outcome.accepted and island_outcome.accepted;
-        outcome.completed = island_outcome.completed;
-        outcome.queued_interrupt = outcome.queued_interrupt or hasQueuedInterrupt(island);
-        scan = segment.end;
+    // A public SubmitDcb owns one guest retirement node even when its arena is
+    // split into several executable islands. Keep all islands under one host
+    // scheduler/completion batch so the first slow island cannot publish an
+    // interrupt while later islands are still executing inside the same HLE
+    // call. The deferred event is armed only after the complete arena drains.
+    execution_lock.lock();
+    defer execution_lock.unlock();
+    beginCompletionBatch();
+    defer finishCompletionBatch();
+
+    // Descriptor tables can contain accidental Type-3 bit patterns. Executing
+    // heuristically discovered "islands" after the first non-command word is
+    // unsafe: Unity transition allocations contain long descriptor runs which
+    // resemble hundreds of WAIT_REG_MEM packets. Hardware receives only the
+    // command cursor, so retain the proven contiguous prefix and treat an empty
+    // prefix as a completed no-op.
+    var outcome: SubmitOutcome = .{ .accepted = true, .completed = true };
+    if (commands.len != 0) {
+        const prefix_outcome = executeSubmittedLocked(label, commands);
+        // The public AGC call has already accepted a completely walkable PM4
+        // prefix. A renderer that cannot yet implement one packet treats that
+        // packet as a GPU no-op; it must not hold the driver's retirement node
+        // forever and wedge every later frame behind it.
+        outcome.completed = prefix_outcome.accepted and prefix_outcome.completed;
+        outcome.queued_interrupt = hasQueuedInterrupt(commands);
     }
+
     if (std.mem.eql(u8, label, "dcb") and outcome.accepted) {
         armPendingGraphicsSegment(stream);
+    }
+    if (outcome.accepted) {
+        batched_driver_completion_label = driver_completion_label orelse 0;
     }
     return outcome;
 }
@@ -1682,16 +1706,26 @@ fn flushPendingGraphicsSegment() void {
         pending_graphics_reports += 1;
     }
     rememberSubmissionAlias(commands);
-    var outcome = executeSubmitted("dcb", commands);
-    outcome.queued_interrupt = hasQueuedInterrupt(commands);
-    publishDcbCompletion(outcome);
+    // This is work appended to the preceding public DCB, not another guest
+    // submission. Execute its labels and Vulkan commands, but do not turn a
+    // second RELEASE_MEM in the same allocation into another retirement edge:
+    // the guest queued only one completion record for the public call.
+    execution_lock.lock();
+    beginCompletionBatch();
+    const outcome = executeSubmittedLocked("dcb", commands);
+    discardCompletionBatch();
+    execution_lock.unlock();
+    // These words are an appended continuation of the preceding guest DCB,
+    // not a second SubmitDcb call. The driver has no separate retirement node
+    // for them. Publishing the continuation's explicit EOP here advances the
+    // interrupt worker past the next real record and eventually deadlocks RHI.
     if (outcome.accepted) armPendingGraphicsSegment(commands);
 }
 
 pub fn submitDeviceStream(stream: []const u32) SubmitOutcome {
     drainCompletionNotifications();
     announce("dcb", stream);
-    return executeAcceptedStream("dcb", stream);
+    return executeAcceptedStream("dcb", stream, null);
 }
 
 /// Advance both queues and soft-satisfy any permanent WAIT_REG_MEM heads.
@@ -1728,6 +1762,15 @@ fn executeSubmitted(label: []const u8, stream: []const u32) SubmitOutcome {
     defer execution_lock.unlock();
     beginCompletionBatch();
     defer finishCompletionBatch();
+
+    return executeSubmittedLocked(label, stream);
+}
+
+/// Executes one already-snapshotted stream while its caller owns the command
+/// processor and completion batch. Public AGC arenas can invoke this more than
+/// once without exposing an interrupt between their prefix and command islands.
+fn executeSubmittedLocked(label: []const u8, stream: []const u32) SubmitOutcome {
+    std.debug.assert(completion_batch_active);
     var host_time = kernel_runtime.beginHostTimeExclusion();
     defer host_time.end();
 
@@ -1795,7 +1838,7 @@ fn executeSubmitted(label: []const u8, stream: []const u32) SubmitOutcome {
             .{report.completed_submissions},
         );
     }
-    if (submission_reports < 64) {
+    if (submission_reports < 512) {
         const state = submission_scheduler.state(kind);
         if (state.release_count != release_count_before) {
             const release = state.last_release.?;
@@ -1864,17 +1907,31 @@ fn forceSatisfyWait(queue_kind: gpu.QueueKind, wait: gpu.state.WaitRegMem) bool 
         // recovery write into the active snapshot before the next re-poll.
         _ = submission_scheduler.mirrorActiveWrite(queue_kind, wait.address, payload);
         kernel_runtime.wakeSyncAddress(wait.address, std.math.maxInt(usize));
+        return true;
     }
-    return ok;
+    // GPU-only labels and malformed tails recovered from mixed command/data
+    // arenas have no CPU mapping. Leaving either at the queue head blocks every
+    // later frame even though the owning submission has already completed.
+    // Satisfy exactly one scheduler re-poll without publishing the synthetic
+    // value into arbitrary guest memory.
+    const recovered = submission_scheduler.softSatisfyActiveWait(queue_kind, wait);
+    if (recovered and unmapped_wait_reports < 32) {
+        std.debug.print(
+            "[agc wait] soft-satisfied unmapped wait: target=0x{x}+{d} ref=0x{x}\n",
+            .{ wait.address, payload.len, wait.reference },
+        );
+        unmapped_wait_reports += 1;
+    }
+    return recovered;
 }
 
-fn acceptSubmitted(label: []const u8, stream: []const u32) SubmitOutcome {
+fn acceptSubmitted(label: []const u8, stream: []const u32, driver_completion_label: ?u64) SubmitOutcome {
     const commands = if (std.mem.eql(u8, label, "dcb"))
         dcbWithCompletionPrelude(stream)
     else
         stream;
     announce(label, commands);
-    return executeAcceptedStream(label, commands);
+    return executeAcceptedStream(label, commands, driver_completion_label);
 }
 
 /// Includes the driver-owned EOP packet placed immediately before a DCB.
@@ -1937,19 +1994,81 @@ fn streamOf(address: ?[*]const u32, word_count: u32) ?[]const u32 {
 }
 
 /// Reads one submission descriptor and reports it.
-fn submitOne(label: []const u8, descriptor: ?*const Submission) SubmitOutcome {
+fn submitOne(
+    label: []const u8,
+    descriptor: ?*const Submission,
+    driver_completion_label: ?u64,
+) SubmitOutcome {
     const submission = descriptor orelse return .{};
     const stream = streamOf(submission.address, submission.word_count) orelse return .{};
-    return acceptSubmitted(label, stream);
+    return acceptSubmitted(label, stream, driver_completion_label);
 }
 
-/// A graphics submission without an explicit RELEASE_MEM interrupt still
-/// raises the EOP registrations when the command processor drains it. AGC's
-/// user interrupt belongs to compute completion only; emitting it for a DCB
-/// advances the guest cleanup ring independently of the graphics fence.
-fn publishDcbCompletion(outcome: SubmitOutcome) void {
-    if (!outcome.accepted or outcome.queued_interrupt) return;
-    enqueueCompletion(.{ .kind = .dcb });
+/// Finds the SDK-private retirement label associated with the descriptor that
+/// is currently on AgcSubmitThread's guest stack.
+///
+/// The public descriptor contains only address/count. This SDK's wrapper builds
+/// it at rbp-0x20 while its caller retains the matching work node at rbp-0x40,
+/// which makes the private pointer descriptor+0x50. The node carries the label
+/// which hardware Submit clears even when the title's PM4 has no RELEASE_MEM
+/// for it. Validate every redundant field before using this private layout so
+/// other SDK versions simply fall back to packet-owned completions.
+fn driverCompletionLabel(
+    descriptor: *const Submission,
+    submission: Submission,
+    queue_type: u32,
+) ?u64 {
+    const descriptor_address = @intFromPtr(descriptor);
+    const node_slot = descriptor_address +| 0x50;
+    var node_bytes: [8]u8 = undefined;
+    if (!readGuestMemory(null, node_slot, &node_bytes)) return null;
+    const node = std.mem.readInt(u64, &node_bytes, .little);
+    if (node == 0 or !memory.isGuestRangeAccessible(node, 0x98)) return null;
+
+    var fields: [0x98]u8 = undefined;
+    if (!readGuestMemory(null, node, &fields)) return null;
+    const node_stream = std.mem.readInt(u64, fields[0x08..0x10], .little);
+    const node_words = std.mem.readInt(u32, fields[0x10..0x14], .little);
+    const node_type = std.mem.readInt(u32, fields[0x90..0x94], .little);
+    const completion_label = std.mem.readInt(u64, fields[0x20..0x28], .little);
+    if (node_stream != @intFromPtr(submission.address) or
+        node_words != submission.word_count or node_type != queue_type or
+        completion_label == 0 or
+        !memory.isGuestRangeAccessible(completion_label, @sizeOf(u64)))
+    {
+        return null;
+    }
+
+    var label_bytes: [8]u8 = undefined;
+    if (!readGuestMemory(null, completion_label, &label_bytes)) return null;
+    const label_value = std.mem.readInt(u64, &label_bytes, .little);
+    if (label_value == 0) return null;
+    if (driver_completion_chain_reports < 256) {
+        std.debug.print(
+            "[agc submit] private node=0x{x} stream=0x{x}/{d} type={d} label=0x{x}/0x{x}\n",
+            .{ node, node_stream, node_words, node_type, completion_label, label_value },
+        );
+        driver_completion_chain_reports += 1;
+    }
+    return completion_label;
+}
+
+fn publishDriverCompletionLabel(target: u64) void {
+    var previous: [8]u8 = undefined;
+    if (!readGuestMemory(null, target, &previous)) return;
+    const old = std.mem.readInt(u64, &previous, .little);
+    if (old == 0) return;
+
+    const completed: [8]u8 = @splat(0);
+    if (!writeGuestMemory(null, target, &completed)) return;
+    kernel_runtime.wakeSyncAddress(target, std.math.maxInt(usize));
+    if (driver_completion_reports < 32) {
+        std.debug.print(
+            "[agc submit] completed driver-owned label 0x{x}: 0x{x}->0\n",
+            .{ target, old },
+        );
+        driver_completion_reports += 1;
+    }
 }
 
 /// Compute completion uses the shared AGC user interrupt. Queue identifiers
@@ -1960,13 +2079,20 @@ fn publishAcbCompletion(outcome: SubmitOutcome) void {
     enqueueCompletion(.{ .kind = .acb });
 }
 
+/// A public graphics submission without an explicit interrupt still needs the
+/// same AGC completion fanout that an interrupting RELEASE_MEM would publish.
+fn publishDcbCompletion(outcome: SubmitOutcome) void {
+    if (!outcome.accepted or outcome.queued_interrupt) return;
+    enqueueCompletion(.{ .kind = .dcb });
+}
+
 /// Graphics work, described by one descriptor.
 fn submitDcb(descriptor: ?*const Submission) callconv(abi.guest) i32 {
     drainCompletionNotifications();
-    // The graphics queue completion interrupt is registered under ident zero.
-    // Other graphics-filter registrations (notably EOP ident 0x40) represent
-    // different hardware events and must not be woken by every submission.
-    publishDcbCompletion(submitOne("dcb", descriptor));
+    const submission = if (descriptor) |value| value.* else return errno.ok;
+    const completion_label = driverCompletionLabel(descriptor.?, submission, 0);
+    const outcome = submitOne("dcb", descriptor, completion_label);
+    publishDcbCompletion(outcome);
     return errno.ok;
 }
 
@@ -1975,8 +2101,10 @@ fn submitAcb(_: u32, descriptor: ?*const Submission) callconv(abi.guest) i32 {
     drainCompletionNotifications();
     const submission = descriptor orelse return errno.ok;
     const stream = streamOf(submission.address, submission.word_count) orelse return errno.ok;
+    const completion_label = driverCompletionLabel(submission, submission.*, 1);
     flushPendingGraphicsSegment();
-    publishAcbCompletion(acceptSubmitted("acb", stream));
+    const outcome = acceptSubmitted("acb", stream, completion_label);
+    publishAcbCompletion(outcome);
     return errno.ok;
 }
 
@@ -1997,7 +2125,7 @@ fn submitMultiDcbs(
 
     for (0..count) |index| {
         const stream = streamOf(buffers[index], sizes[index]) orelse continue;
-        publishDcbCompletion(acceptSubmitted("dcb", stream));
+        publishDcbCompletion(acceptSubmitted("dcb", stream, null));
     }
     return errno.ok;
 }
@@ -2016,7 +2144,7 @@ pub fn submitMultiAcbs(
     for (0..count) |index| {
         const stream = streamOf(buffers[index], sizes[index]) orelse continue;
         flushPendingGraphicsSegment();
-        publishAcbCompletion(acceptSubmitted("acb", stream));
+        publishAcbCompletion(acceptSubmitted("acb", stream, null));
     }
     return errno.ok;
 }
@@ -2025,7 +2153,7 @@ pub fn submitMultiAcbs(
 fn submitCommandBuffer(_: u32, address: ?[*]const u32, word_count: u32) callconv(abi.guest) i32 {
     drainCompletionNotifications();
     const stream = streamOf(address, word_count) orelse return errno.ok;
-    publishDcbCompletion(acceptSubmitted("dcb", stream));
+    publishDcbCompletion(acceptSubmitted("dcb", stream, null));
     return errno.ok;
 }
 
@@ -2170,6 +2298,41 @@ test "submitted DCB rejects a command island that writes its allocation header" 
     try testing.expect(nextSubmittedCommandSegment(&stream, prefix.len) == null);
 }
 
+test "submitted DCB trims a contiguous prefix before an allocation header write" {
+    var stream = [_]u32{
+        command(gpu.pm4.clear_state, 1),                                       0,
+        command(gpu.pm4.nop, 7) | (@as(u32, gpu.pm4.custom.release_mem) << 2), 0x28,
+        (@as(u32, 1) << 29) | (@as(u32, 1) << 16),                             0,
+        0,                                                                     1,
+        0,                                                                     0,
+        command(gpu.pm4.clear_state, 1),                                       0,
+    };
+    const target = @intFromPtr(&stream) - 8;
+    stream[5] = @truncate(target);
+    stream[6] = @truncate(target >> 32);
+
+    const prefix = submittedCommandPrefix(&stream);
+    try testing.expectEqual(@as(usize, 2), prefix.len);
+    try testing.expectEqualSlices(u32, stream[0..2], prefix);
+}
+
+test "submitted DCB trims a contiguous prefix before an unreadable memory wait" {
+    const stream = [_]u32{
+        command(gpu.pm4.clear_state, 1),  0,
+        command(gpu.pm4.wait_reg_mem, 6),
+        // Equal, memory space, address 0xffff_ffff_ffff_fffc.
+        3 | (@as(u32, 1) << 4),
+        0xffff_fffc,                      0xffff_ffff,
+        1,                                0xffff_ffff,
+        0,                                command(gpu.pm4.clear_state, 1),
+        0,
+    };
+
+    const prefix = submittedCommandPrefix(&stream);
+    try testing.expectEqual(@as(usize, 2), prefix.len);
+    try testing.expectEqualSlices(u32, stream[0..2], prefix);
+}
+
 test "submitted DCB rejects command islands with unsafe memory waits" {
     const wait_header = command(gpu.pm4.nop, 6) |
         (@as(u32, gpu.pm4.custom.wait_mem_32) << 2);
@@ -2245,6 +2408,26 @@ test "submitted DCB rejects semantically invalid command islands" {
         &unreadable_indirect_stream,
         indirect_prefix.len,
     ) == null);
+
+    const impossible_dispatch_stream = [_]u32{
+        command(gpu.pm4.clear_state, 1),           0,
+        0,                                         0,
+        0,                                         0,
+        command(gpu.pm4.dispatch_direct, 3),       17_547_264,
+        1_116_209_152,                             1_007_192_201,
+        command(gpu.pm4.nop, 1),                   0,
+        command(gpu.pm4.nop, 1),                   0,
+        release_header,                            0x28,
+        (@as(u32, 1) << 29) | (@as(u32, 1) << 16), 0x1000,
+        0,                                         1,
+        0,                                         0,
+    };
+    const dispatch_prefix = submittedCommandPrefix(&impossible_dispatch_stream);
+    try testing.expectEqual(@as(usize, 2), dispatch_prefix.len);
+    try testing.expect(nextSubmittedCommandSegment(
+        &impossible_dispatch_stream,
+        dispatch_prefix.len,
+    ) == null);
 }
 
 test "submitted DCB retains Type-2 alignment filler" {
@@ -2274,6 +2457,18 @@ test "queued release interrupt suppresses submit fallback event" {
     };
     try testing.expect(!hasQueuedInterrupt(&no_interrupt));
     try testing.expect(hasQueuedInterrupt(&queued_interrupt));
+}
+
+test "public DCB publishes exactly one completion class" {
+    reset();
+    defer reset();
+
+    publishDcbCompletion(.{ .accepted = true, .queued_interrupt = true });
+    try testing.expectEqual(@as(usize, 0), pending_completion_count);
+
+    publishDcbCompletion(.{ .accepted = true, .queued_interrupt = false });
+    try testing.expectEqual(@as(usize, 1), pending_completion_count);
+    try testing.expectEqual(CompletionKind.dcb, pending_completions[pending_completion_head].kind);
 }
 
 test "compact GPU label address resolves into submitted CPU arena" {
@@ -2316,6 +2511,23 @@ test "GPU writes cannot overwrite a submitted allocation header" {
     try testing.expectEqual(@as(u32, 0), allocation[3]);
 }
 
+test "bulk DMA writes may span a snapshotted submission header" {
+    reset();
+    defer reset();
+    var allocation: [40]u32 = @splat(0xff);
+    const arena = allocation[20..];
+    rememberSubmissionAlias(arena);
+
+    var clear: [24 * @sizeOf(u32)]u8 = @splat(0);
+    try testing.expect(writeGuestMemory(
+        null,
+        @intFromPtr(&allocation[0]),
+        &clear,
+    ));
+    try testing.expectEqual(@as(u32, 0), allocation[16]);
+    try testing.expectEqual(@as(u32, 0), allocation[19]);
+}
+
 test "one completion batch coalesces duplicate release contexts" {
     var contexts: [2]u32 = undefined;
     var count: usize = 0;
@@ -2327,20 +2539,21 @@ test "one completion batch coalesces duplicate release contexts" {
     try testing.expectEqualSlices(u32, &.{ 7, 9 }, &contexts);
 }
 
-test "pending completion FIFO rearms an equivalent edge" {
+test "pending completion FIFO preserves equivalent submit edges" {
     reset();
     defer reset();
 
     enqueueCompletion(.{ .kind = .release, .context_id = 3 });
     try testing.expectEqual(@as(usize, 1), pending_completion_count);
-    pending_completions[pending_completion_head].delivered = true;
 
     enqueueCompletion(.{ .kind = .release, .context_id = 3 });
-    try testing.expectEqual(@as(usize, 1), pending_completion_count);
-    try testing.expect(!pending_completions[pending_completion_head].delivered);
-
-    enqueueCompletion(.{ .kind = .dcb, .context_id = 0 });
     try testing.expectEqual(@as(usize, 2), pending_completion_count);
+
+    enqueueCompletion(.{ .kind = .acb, .context_id = 0 });
+    try testing.expectEqual(@as(usize, 3), pending_completion_count);
+    try testing.expectEqual(CompletionKind.release, pending_completions[pending_completion_head].kind);
+    const second = (pending_completion_head + 1) % pending_completions.len;
+    try testing.expectEqual(CompletionKind.release, pending_completions[second].kind);
 }
 
 test "synchronous AGC completion advances a paired CPU retirement label" {

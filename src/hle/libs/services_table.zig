@@ -276,7 +276,7 @@ pub const npmanager_exports = [_]symbols.Export{
     .{ .name = "sceNpCheckPremium", .function = trace.wrap("sceNpCheckPremium", &services.offline), .expect_id = "O80NrhUOPGY" },
     .{ .name = "sceNpDeleteRequest", .function = trace.wrap("sceNpDeleteRequest", &services.offline), .expect_id = "S7QTn72PrDw" },
     .{ .name = "sceNpGetUserIdByAccountId", .function = trace.wrap("sceNpGetUserIdByAccountId", &services.offline), .expect_id = "VgYczPGB5ss" },
-    .{ .name = "sceNpGetOnlineId", .function = trace.wrap("sceNpGetOnlineId", &services.offline), .expect_id = "XDncXQIJUSk" },
+    .{ .name = "sceNpGetOnlineId", .function = trace.wrap("sceNpGetOnlineId", &services.npGetOnlineId), .expect_id = "XDncXQIJUSk" },
     // Registration itself is local and succeeds on an offline console.  No
     // callback is delivered until the NP state changes, which cannot happen in
     // the emulator's stable offline profile.
@@ -303,7 +303,7 @@ pub const nptrophy2_exports = [_]symbols.Export{
     .{ .name = "sceNpTrophy2RegisterContext", .function = trace.wrap("sceNpTrophy2RegisterContext", &services.accept), .expect_id = "bIDov3wBu5Q" },
     .{ .name = "sceNpTrophy2DestroyContext", .function = trace.wrap("sceNpTrophy2DestroyContext", &services.accept), .expect_id = "sysY2FHYff4" },
     .{ .name = "sceNpTrophy2DestroyHandle", .function = trace.wrap("sceNpTrophy2DestroyHandle", &services.accept), .expect_id = "d8P11CI40KE" },
-    .{ .name = "sceNpTrophy2GetGameInfo", .function = trace.wrap("sceNpTrophy2GetGameInfo", &services.offline), .expect_id = "4IzqhhUQ3nk" },
+    .{ .name = "sceNpTrophy2GetGameInfo", .function = trace.wrap("sceNpTrophy2GetGameInfo", &services.npTrophy2GetGameInfo), .expect_id = "4IzqhhUQ3nk" },
     .{ .name = "sceNpTrophy2GetTrophyInfoArray", .function = trace.wrap("sceNpTrophy2GetTrophyInfoArray", &services.offline), .expect_id = "y3zHpdZO6ME" },
     .{ .name = "sceNpTrophy2RegisterUnlockCallback", .function = trace.wrap("sceNpTrophy2RegisterUnlockCallback", &services.accept), .expect_id = "sUXGfNMalIo" },
     .{ .name = "sceNpTrophy2UnregisterUnlockCallback", .function = trace.wrap("sceNpTrophy2UnregisterUnlockCallback", &services.accept), .expect_id = "wVqxM58sIKs" },
@@ -571,7 +571,6 @@ pub const rtc_extra_exports = [_]symbols.Export{
     .{ .name = "sceRtcParseRFC3339", .function = trace.wrap("sceRtcParseRFC3339", &platform_services.rtcParseRFC3339), .expect_id = "99bMGglFW3I" },
     .{ .name = "sceRtcFormatRFC3339", .function = trace.wrap("sceRtcFormatRFC3339", &platform_services.rtcFormatRFC3339), .expect_id = "WJ3rqFwymew" },
 };
-
 
 /// Content capture and broadcast.
 ///

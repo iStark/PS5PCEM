@@ -30,9 +30,9 @@ pub const StorageBufferBinding = struct {
     /// prologs reuse (and overwrite) the same SOFFSET SGPR between position and
     /// UV loads even when both attributes share one interleaved allocation.
     soffset_value: ?u32 = null,
-    /// This mapping came from the AGC vertex-attribute table. NGG prologs may
-    /// copy the hardware vertex id into v0, v3, or another temporary before
-    /// MUBUF; Vulkan's VertexIndex is the authoritative per-vertex index.
+    /// This mapping came from the AGC vertex-attribute table. It is retained
+    /// for backend diagnostics and rectangle recognition; the MUBUF index is
+    /// still the value computed by the guest prolog.
     use_vertex_index: bool = false,
     stride: u32 = 0,
     swizzled: bool = false,
@@ -1664,11 +1664,16 @@ const Builder = struct {
     }
 
     fn vectorConditionDestination(self: *Builder, inst: instruction.Instruction, condition: u32) Error!void {
+        var active_condition = condition;
+        if (try self.laneEnabled()) |enabled| {
+            active_condition = self.id();
+            try self.emit(&self.body, 167, &.{ self.bool_type, active_condition, enabled, condition }); // OpLogicalAnd
+        }
         const mask = self.id();
         try self.emit(&self.body, 169, &.{ // OpSelect
             self.bits_type,
             mask,
-            condition,
+            active_condition,
             try self.constant(.bits32, 0xffff_ffff),
             try self.constant(.bits32, 0),
         });
@@ -3430,21 +3435,35 @@ const Builder = struct {
                 self.registers[128 + vgpr] = .{ .id = zero, .value_type = .bits32 };
             }
         }
+        if (self.stage == .vertex) {
+            // EXP is masked by EXEC on RDNA. Give every Vulkan output a
+            // deterministic dormant value so a later export from a disabled
+            // lane can preserve it instead of exposing an undefined vertex.
+            const zero_float = try self.constant(.float32, @bitCast(@as(f32, 0)));
+            const zero_vector = self.id();
+            try self.emit(&self.body, 80, &.{
+                self.vector4_type,
+                zero_vector,
+                zero_float,
+                zero_float,
+                zero_float,
+                zero_float,
+            }); // OpCompositeConstruct
+            try self.emit(&self.body, 62, &.{ self.position_output, zero_vector });
+            for (self.parameter_variables) |variable| {
+                if (variable != 0) try self.emit(&self.body, 62, &.{ variable, zero_vector });
+            }
+        }
         if (self.vertex_index_input != 0) {
             const result = self.id();
             try self.emit(&self.body, 61, &.{ self.signed_type, result, self.vertex_index_input }); // OpLoad
             const vgpr = self.vertex_index_vgpr orelse return Error.InvalidStageInterface;
             self.registers[128 + @as(usize, vgpr)] = .{ .id = result, .value_type = .sint32 };
 
-            // The hardware VGPRs of a merged NGG wave. The ES half receives its
-            // vertex id in V5 and its instance id in V8, and a vertex prolog
-            // reads them directly: the usual `v_cndmask v0, v8, v5, s8` picks
-            // one of the two as the attribute-fetch index. Seeding only the
-            // configured fetch VGPR left both at zero, so a program that
-            // computes its position from V5 — a procedural full-screen
-            // triangle, for one — placed every vertex at the same corner.
-            self.registers[128 + 5] = .{ .id = result, .value_type = .sint32 };
-            if (self.instance_index_input != 0) {
+            // The merged NGG/export ABI receives the vertex and instance ids
+            // in v5/v8. An ordinary VS uses v0 and may use v5 as a temporary,
+            // so only seed the extra ABI registers for an export shader.
+            if (vgpr == 5 and self.instance_index_input != 0) {
                 const instance = self.id();
                 try self.emit(&self.body, 61, &.{ self.signed_type, instance, self.instance_index_input }); // OpLoad
                 self.registers[128 + 8] = .{ .id = instance, .value_type = .sint32 };
@@ -3850,6 +3869,14 @@ const Builder = struct {
         return self.vector2_bits_type;
     }
 
+    fn ensureBitsVec3(self: *Builder) Error!u32 {
+        if (self.vector3_bits_type == 0) {
+            self.vector3_bits_type = self.id();
+            try self.emit(&self.declarations, 23, &.{ self.vector3_bits_type, self.bits_type, 3 }); // OpTypeVector
+        }
+        return self.vector3_bits_type;
+    }
+
     /// SPIR-V requires structurally identical scalar/vector types to be
     /// declared only once. Storage-image descriptors frequently use the same
     /// texel component type at many bindings, so share their vec4 declaration
@@ -3966,16 +3993,11 @@ const Builder = struct {
             else
                 zero,
         };
-        // If W is exactly 0 (failed constant-buffer row), force W=1 so
-        // clip-space positions stay finite and rasterizable.
-        var out_w = w;
-        if (is_position) {
-            const w_is_zero = self.id();
-            try self.emit(&self.body, 180, &.{ self.bool_type, w_is_zero, w, zero }); // OpFOrdEqual
-            const w_fixed = self.id();
-            try self.emit(&self.body, 169, &.{ self.float_type, w_fixed, w_is_zero, one, w }); // OpSelect
-            out_w = w_fixed;
-        }
+        // Preserve an explicitly exported W=0. The guest uses it to reject
+        // inactive NGG/instanced vertices during homogeneous clipping;
+        // replacing it with one turns those dormant records into enormous
+        // screen-covering triangles.
+        const out_w = w;
         var out_z = z;
         if (is_position and self.convert_negative_one_to_one_depth) {
             // Vulkan clips Z to 0..W. The guest's OpenGL-style convention
@@ -4008,7 +4030,15 @@ const Builder = struct {
             components[2],
             components[3],
         }); // OpCompositeConstruct
-        try self.emit(&self.body, 62, &.{ output, vector }); // OpStore
+        if (try self.laneEnabled()) |enabled| {
+            const current = self.id();
+            try self.emit(&self.body, 61, &.{ self.vector4_type, current, output }); // OpLoad
+            const selected = self.id();
+            try self.emit(&self.body, 169, &.{ self.vector4_type, selected, enabled, vector, current }); // OpSelect
+            try self.emit(&self.body, 62, &.{ output, selected }); // OpStore
+        } else {
+            try self.emit(&self.body, 62, &.{ output, vector }); // OpStore
+        }
     }
 
     fn exportNggLdsRecord(self: *Builder) Error!void {
@@ -4137,7 +4167,8 @@ const Builder = struct {
 
     fn sampledImageFetch(self: *Builder, inst: instruction.Instruction) Error!void {
         if ((self.stage != .vertex and self.stage != .fragment and self.stage != .compute) or inst.opcode_id != 0 or
-            inst.image_dimension != .dim_2d or inst.image_address_components != 2 or
+            (inst.image_dimension != .dim_2d and inst.image_dimension != .dim_3d) or
+            (inst.image_address_components != 2 and inst.image_address_components != 3) or
             inst.data_mask == 0 or inst.src0.kind != .vgpr or
             inst.src1.kind != .sgpr or inst.src2.kind != .sgpr)
         {
@@ -4145,8 +4176,9 @@ const Builder = struct {
         }
         const binding = self.sampledImageBinding(inst.src1.reg, inst.src2.reg, inst.pc) orelse
             return Error.InvalidStorageBinding;
-        if (binding.dimension != .two_d or self.sampled_image_arrays[0] == 0 or
-            self.sampled_image_image_types[0] == 0)
+        const dimension_index = sampledImageDimensionIndex(binding.dimension);
+        if (self.sampled_image_arrays[dimension_index] == 0 or
+            self.sampled_image_image_types[dimension_index] == 0)
         {
             return Error.InvalidStorageBinding;
         }
@@ -4154,18 +4186,24 @@ const Builder = struct {
         const x = try self.source(try imageAddressOperand(inst, 0), .bits32);
         const y = try self.source(try imageAddressOperand(inst, 1), .bits32);
         const coordinates = self.id();
-        try self.emit(&self.body, 80, &.{ try self.ensureBitsVec2(), coordinates, x, y }); // OpCompositeConstruct
+        if (binding.dimension == .two_d) {
+            try self.emit(&self.body, 80, &.{ try self.ensureBitsVec2(), coordinates, x, y }); // OpCompositeConstruct
+        } else {
+            if (inst.image_address_components < 3) return Error.UnsupportedOpcode;
+            const z = try self.source(try imageAddressOperand(inst, 2), .bits32);
+            try self.emit(&self.body, 80, &.{ try self.ensureBitsVec3(), coordinates, x, y, z }); // OpCompositeConstruct
+        }
         const pointer = self.id();
         try self.emit(&self.body, 65, &.{
-            self.sampled_image_pointer_types[0],
+            self.sampled_image_pointer_types[dimension_index],
             pointer,
-            self.sampled_image_arrays[0],
+            self.sampled_image_arrays[dimension_index],
             try self.constant(.bits32, binding.descriptor_index),
         });
         const sampled_image = self.id();
-        try self.emit(&self.body, 61, &.{ self.sampled_image_types[0], sampled_image, pointer });
+        try self.emit(&self.body, 61, &.{ self.sampled_image_types[dimension_index], sampled_image, pointer });
         const image = self.id();
-        try self.emit(&self.body, 100, &.{ self.sampled_image_image_types[0], image, sampled_image }); // OpImage
+        try self.emit(&self.body, 100, &.{ self.sampled_image_image_types[dimension_index], image, sampled_image }); // OpImage
         const texel = self.id();
         try self.emit(&self.body, 95, &.{
             self.vector4_type,
@@ -4202,9 +4240,9 @@ const Builder = struct {
         }
         const binding = self.storageImageBinding(inst.src1.reg, inst.pc) orelse
             return self.sampledImageFetch(inst);
-        if ((binding.dimension == .three_d) != (inst.image_dimension == .dim_3d)) {
-            return Error.InvalidStorageBinding;
-        }
+        // DIM describes how many address VGPRs the instruction carries. T# is
+        // authoritative for the image view; a 2D binding may legally consume
+        // the first two coordinates of a three-coordinate instruction.
         const descriptor_index: usize = @intCast(binding.descriptor_index);
         const value_type = storageImageValueType(binding.format);
         const vector_type = self.storage_image_vector_types[descriptor_index];
@@ -4249,9 +4287,6 @@ const Builder = struct {
             return Error.UnsupportedOpcode;
         }
         const binding = self.storageImageBinding(inst.src1.reg, inst.pc) orelse return Error.InvalidStorageBinding;
-        if ((binding.dimension == .three_d) != (inst.image_dimension == .dim_3d)) {
-            return Error.InvalidStorageBinding;
-        }
         const descriptor_index: usize = @intCast(binding.descriptor_index);
         const value_type = storageImageValueType(binding.format);
         const vector_type = self.storage_image_vector_types[descriptor_index];
@@ -4306,9 +4341,7 @@ const Builder = struct {
             return Error.InvalidStorageBinding;
         // SPIR-V storage-image atomics are defined for single-component
         // 32-bit integer images. Other typed formats need a buffer alias.
-        if (binding.format != .r32_uint or
-            (binding.dimension == .three_d) != (inst.image_dimension == .dim_3d))
-        {
+        if (binding.format != .r32_uint) {
             return Error.InvalidStorageBinding;
         }
         const descriptor_index: usize = @intCast(binding.descriptor_index);
@@ -4442,13 +4475,14 @@ const Builder = struct {
         const binding = self.sampledImageBinding(inst.src1.reg, inst.src2.reg, inst.pc) orelse {
             return Error.InvalidStorageBinding;
         };
-        const image_dimension = if (inst.image_dimension == .dim_2d_array_alt and
-            (binding.dimension == .three_d or binding.dimension == .two_d_array))
-            binding.dimension
-        else
-            requested_dimension;
+        const image_dimension = binding.dimension;
         const dimension_index = sampledImageDimensionIndex(image_dimension);
-        const coordinate_components: u8 = if (one_dimensional) 1 else if (image_dimension == .two_d) 2 else 3;
+        const instruction_coordinate_components: u8 = if (one_dimensional)
+            1
+        else if (requested_dimension == .two_d)
+            2
+        else
+            3;
         const gradient_components: u8 = if (!explicit_grad) 0 else switch (inst.image_dimension) {
             .dim_1d, .dim_1d_array => 2,
             .dim_3d => 6,
@@ -4463,12 +4497,13 @@ const Builder = struct {
             (!implicit_lod and !level_zero and !level_zero_offset and !explicit_lod and !biased_lod and !explicit_grad) or
             ((self.stage == .vertex or self.stage == .compute) and
                 !level_zero and !level_zero_offset and !explicit_lod and !explicit_grad) or
-            inst.image_address_components != coordinate_components + extra_components or
+            inst.image_address_components != instruction_coordinate_components + extra_components or
             inst.data_mask == 0)
         {
             return Error.UnsupportedOpcode;
         }
-        if (binding.dimension != image_dimension) return Error.InvalidStorageBinding;
+        // Extra operands follow the coordinate payload encoded by DIM, even
+        // when the bound view consumes fewer coordinates.
         // Coordinates now come from the real VS PARAM -> PS VINTRP interface.
         const coordinate_base: u32 = @intFromBool(inst.image_sample_flags.offset);
         const raw_x = try self.source(try imageAddressOperand(inst, coordinate_base), .float32);
@@ -4495,7 +4530,7 @@ const Builder = struct {
         });
         const sampled_image = self.id();
         try self.emit(&self.body, 61, &.{ self.sampled_image_types[dimension_index], sampled_image, pointer });
-        const gradient_base = coordinate_base + coordinate_components;
+        const gradient_base = coordinate_base + instruction_coordinate_components;
         const dref_index = gradient_base + gradient_components;
         const lod_index = dref_index + @intFromBool(compare);
         const sampled = self.id();
@@ -5310,22 +5345,17 @@ const Builder = struct {
             return Error.InvalidStorageBinding;
         };
 
-        // NGG/export VS programs often clobber the VertexIndex VGPR (v0) with
-        // v_cndmask before the attribute MUBUF. Prefer the system VertexIndex
-        // whenever the load still *names* that VGPR as its index so every
-        // vertex does not alias record 0 and collapse to a zero-area draw.
-        var index = if (inst.index_enable) blk: {
-            if (self.stage == .vertex and self.vertex_index_input != 0 and
-                (binding.use_vertex_index or
-                    (inst.src0.kind == .vgpr and self.vertex_index_vgpr != null and
-                        inst.src0.reg == self.vertex_index_vgpr.?)))
-            {
-                const loaded = self.id();
-                try self.emit(&self.body, 61, &.{ self.signed_type, loaded, self.vertex_index_input }); // OpLoad
-                break :blk try self.convert(.{ .id = loaded, .value_type = .sint32 }, .bits32);
-            }
-            break :blk try self.source(inst.src0, .bits32);
-        } else try self.constant(.bits32, 0);
+        // Attribute-table provenance describes the V# and format, not the
+        // final index. Merged vertex prologs may select VertexIndex or
+        // InstanceIndex into a temporary for each individual MUBUF. Replacing
+        // that temporary with the Vulkan built-in makes per-instance lookup
+        // buffers advance once per vertex and tears a single primitive across
+        // unrelated object records. The ABI seed in `vertex_index_vgpr` lets
+        // the guest instructions compute the authoritative index themselves.
+        var index = if (inst.index_enable)
+            try self.source(inst.src0, .bits32)
+        else
+            try self.constant(.bits32, 0);
         if (binding.add_thread_id) {
             if (self.local_invocation_index == 0) return Error.UnsupportedBufferAddressing;
             const invocation = self.id();
@@ -5519,6 +5549,23 @@ const Builder = struct {
     /// every lane enabled and needs no test.
     fn laneEnabled(self: *Builder) Error!?u32 {
         const mask = self.exec_mask orelse return null;
+
+        // A Vulkan graphics invocation already represents one live guest
+        // lane.  The scalar EXEC pair carried through the translated program
+        // is therefore a boolean for that invocation, not a mask to index by
+        // Vulkan's unrelated subgroup-local id.  Treating a restored EXEC=1
+        // as "only subgroup lane zero" discarded 31 out of every 32 vertices
+        // and produced the characteristic screen-spanning triangles.  Compute
+        // still models a complete guest wave and needs the per-lane lookup
+        // below.
+        if (self.stage != .compute) {
+            // Vector comparisons lower to a per-invocation predicate in the
+            // low word. The high word is only retained so scalar save/restore
+            // sequences still have a complete guest register pair; treating
+            // it as a second predicate can keep a lane alive after CMPX has
+            // cleared the low word.
+            return @as(?u32, try self.isNonZero(mask[0]));
+        }
         if (self.local_invocation_index == 0) return Error.UnsupportedControlFlow;
         if (self.lane_predicate_mask) |cached_mask| {
             if (cached_mask[0] == mask[0] and cached_mask[1] == mask[1]) return self.lane_predicate;
@@ -8932,6 +8979,77 @@ test "one V# SGPR can select different buffers at different instruction PCs" {
     try std.testing.expect(countOpcode(module.words, 65) >= 2); // OpAccessChain
 }
 
+test "attribute provenance preserves a guest-selected MUBUF index" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.appendSlice(std.testing.allocator, &.{
+        .{
+            .pc = 0,
+            .opcode = .v_mov_b32,
+            .dst = .{ .kind = .vgpr, .reg = 0 },
+            // A merged prolog can select InstanceIndex into this temporary.
+            .src0 = .{ .kind = .vgpr, .reg = 8 },
+            .src_count = 1,
+        },
+        .{
+            .pc = 4,
+            .family = .mubuf,
+            .opcode = .buffer_load_dword,
+            .dst = .{ .kind = .vgpr, .reg = 1 },
+            .src0 = .{ .kind = .vgpr, .reg = 0 },
+            .src1 = .{ .kind = .sgpr, .reg = 4 },
+            .src2 = .{ .kind = .integer_inline_constant, .value = 0 },
+            .src_count = 3,
+            .index_enable = true,
+        },
+        .{ .pc = 8, .opcode = .s_endpgm },
+    });
+    const storage = [_]StorageBufferBinding{.{
+        .resource_sgpr = 4,
+        .descriptor_index = 0,
+        .use_vertex_index = true,
+        .stride = 4,
+        .extent_bytes = 16,
+    }};
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .vertex,
+        .vertex_index_vgpr = 5,
+        .storage_buffers = &storage,
+        .descriptor_array_length = 1,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    var vertex_index_variable: u32 = 0;
+    var word: usize = 5;
+    while (word < module.words.len) {
+        const word_count: usize = module.words[word] >> 16;
+        const opcode: u16 = @truncate(module.words[word]);
+        if (opcode == 71 and word_count >= 4 and
+            module.words[word + 2] == 11 and module.words[word + 3] == 42)
+        {
+            vertex_index_variable = module.words[word + 1];
+            break;
+        }
+        word += word_count;
+    }
+    try std.testing.expect(vertex_index_variable != 0);
+
+    var builtin_loads: usize = 0;
+    word = 5;
+    while (word < module.words.len) {
+        const word_count: usize = module.words[word] >> 16;
+        const opcode: u16 = @truncate(module.words[word]);
+        if (opcode == 61 and word_count >= 4 and
+            module.words[word + 3] == vertex_index_variable)
+        {
+            builtin_loads += 1;
+        }
+        word += word_count;
+    }
+    // Exactly the ABI seed into v5. The MUBUF itself must read v0.
+    try std.testing.expectEqual(@as(usize, 1), builtin_loads);
+}
+
 fn testSop1(opcode: u8, destination: u8, source: u9) u32 {
     return 0xbe80_0000 | (@as(u32, destination) << 16) | (@as(u32, opcode) << 8) | source;
 }
@@ -9154,6 +9272,31 @@ test "fragment image sample supports a three-dimensional descriptor" {
     try std.testing.expectEqual(@as(u32, 2), firstInstructionOperand(module.words, 25, 2)); // Dim3D
     try std.testing.expect(containsOpcode(module.words, 87)); // OpImageSampleImplicitLod
     try std.testing.expectEqual(@as(usize, 4), countOpcode(module.words, 81)); // RGBA extracts
+}
+
+test "three-coordinate image sample follows a two-dimensional descriptor" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xf080_0f10, // image_sample dim:3d dmask:xyzw v2, v[0:2], s[0:7], s[8:11]
+        0x0040_0200,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    const images = [_]SampledImageBinding{.{
+        .resource_sgpr = 0,
+        .sampler_sgpr = 8,
+        .descriptor_index = 0,
+        .dimension = .two_d,
+    }};
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .fragment,
+        .sampled_images = &images,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 1), firstInstructionOperand(module.words, 25, 2)); // Dim2D
+    try std.testing.expect(containsOpcode(module.words, 87));
 }
 
 test "ambiguous DIM5 sample follows the materialized 3D descriptor" {
@@ -9427,6 +9570,35 @@ test "vertex image load fetches an integer texel through a sampled descriptor" {
     try std.testing.expectEqual(@as(usize, 1), countOpcode(module.words, 81));
 }
 
+test "fragment image load fetches a three-dimensional sampled descriptor" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xf000_0f12, // image_load dim:3d dmask:xyzw v4, NSA v[4,6,5], T#s0
+        0x0000_0404,
+        0x0000_0506,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    const images = [_]SampledImageBinding{.{
+        .resource_sgpr = 0,
+        .sampler_sgpr = 0,
+        .descriptor_index = 0,
+        .dimension = .three_d,
+        .instruction_pc = 0,
+    }};
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .fragment,
+        .sampled_images = &images,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), firstInstructionOperand(module.words, 25, 2)); // Dim3D
+    try std.testing.expect(containsOpcode(module.words, 100)); // OpImage
+    try std.testing.expect(containsOpcode(module.words, 95)); // OpImageFetch
+    try std.testing.expectEqual(@as(usize, 4), countOpcode(module.words, 81));
+}
+
 test "compute image load can fetch a compressed read-only sampled descriptor" {
     const decoder = @import("decoder.zig");
     const code = [_]u32{
@@ -9478,6 +9650,39 @@ test "compute image load and NSA store use independently typed storage image bin
     try std.testing.expect(containsOpcode(module.words, 98)); // OpImageRead
     try std.testing.expect(containsOpcode(module.words, 99)); // OpImageWrite
     try std.testing.expectEqual(@as(usize, 2), countOpcode(module.words, 23)); // uint2 coords + one shared float4 texel type
+}
+
+test "three-coordinate image load follows a two-dimensional storage descriptor" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .family = .mimg,
+        .opcode = .image_load,
+        .opcode_id = 0,
+        .dst = .{ .kind = .vgpr, .reg = 4 },
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src1 = .{ .kind = .sgpr, .reg = 0 },
+        .src_count = 2,
+        .image_dimension = .dim_3d,
+        .image_address_components = 3,
+        .data_mask = 0xf,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 8, .opcode = .s_endpgm });
+    const images = [_]StorageImageBinding{.{
+        .resource_sgpr = 0,
+        .descriptor_index = 0,
+        .format = .rgba32_float,
+        .dimension = .two_d,
+    }};
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .storage_images = &images,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expect(containsOpcode(module.words, 98)); // OpImageRead
+    try std.testing.expectEqual(@as(usize, 1), countOpcode(module.words, 23)); // uint2 coordinates
 }
 
 test "compute image store accepts a one-slice 2D array opcode" {
