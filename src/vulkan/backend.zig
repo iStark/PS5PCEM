@@ -161,8 +161,8 @@ pub const Options = struct {
     skip_compute_dispatches: bool = false,
     /// Diagnostic fast path for UI/input bring-up. One complete frame out of
     /// every sixteen is rendered while command processing and guest logic keep
-    /// advancing. This remains opt-in because skipped render-to-texture work
-    /// can leave intermediate frames visually incomplete.
+    /// advancing. Full rendering resumes at the bounded handoff so gameplay
+    /// does not keep dropping its render-to-texture work.
     sparse_graphics_draws: bool = false,
     /// Translates guest compute programs and prepares their resources without
     /// submitting them to Vulkan. This isolates translation and binding gaps
@@ -2412,10 +2412,15 @@ fn shouldDumpProgressFrame(flip: u64, enabled: bool) bool {
 }
 
 const maximum_sparse_deferred_ui_age: u64 = 256;
+const sparse_graphics_handoff_flip: u64 = 1536;
 
 fn shouldPresentDeferredCompositeUi(sparse: bool, flip: u64, last_ui_flip: u64) bool {
     if (!sparse) return true;
     return flip -| last_ui_flip <= maximum_sparse_deferred_ui_age;
+}
+
+fn shouldElideSparseGraphics(sparse: bool, flip: u64) bool {
+    return sparse and flip >= 80 and flip < sparse_graphics_handoff_flip and flip % 16 != 0;
 }
 
 fn sampledImageDimensionForInstruction(
@@ -15584,10 +15589,7 @@ pub const Renderer = struct {
         defer self.frame_profile.draw_ns +|= elapsedHostNanoseconds(profile_started);
         self.draw_callbacks += 1;
         self.frame_profile.draws += 1;
-        if (self.sparse_graphics_draws and
-            self.flip_callbacks >= 80 and
-            self.flip_callbacks % 16 != 0)
-        {
+        if (shouldElideSparseGraphics(self.sparse_graphics_draws, self.flip_callbacks)) {
             self.last_draw_error = null;
             return true;
         }
@@ -20684,6 +20686,15 @@ test "sparse presentation retires a deferred UI layer after its scene is gone" {
     try std.testing.expect(shouldPresentDeferredCompositeUi(true, 512, 256));
     try std.testing.expect(!shouldPresentDeferredCompositeUi(true, 513, 256));
     try std.testing.expect(shouldPresentDeferredCompositeUi(true, 12, 20));
+}
+
+test "sparse graphics resumes complete frames at the gameplay handoff" {
+    try std.testing.expect(!shouldElideSparseGraphics(false, 81));
+    try std.testing.expect(!shouldElideSparseGraphics(true, 79));
+    try std.testing.expect(!shouldElideSparseGraphics(true, 80));
+    try std.testing.expect(shouldElideSparseGraphics(true, 81));
+    try std.testing.expect(shouldElideSparseGraphics(true, sparse_graphics_handoff_flip - 1));
+    try std.testing.expect(!shouldElideSparseGraphics(true, sparse_graphics_handoff_flip));
 }
 
 test "RGBA occupancy preserves black alpha and destination alpha is explicit" {
