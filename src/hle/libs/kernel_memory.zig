@@ -530,6 +530,26 @@ fn sceKernelMapDirectMemory(
     physical_address: u64,
     alignment: u64,
 ) callconv(abi.guest) i32 {
+    return mapDirectMemory(
+        out_address,
+        len,
+        protection_bits,
+        flags,
+        physical_address,
+        alignment,
+        null,
+    );
+}
+
+fn mapDirectMemory(
+    out_address: ?*u64,
+    len: u64,
+    protection_bits: i32,
+    flags: i32,
+    physical_address: u64,
+    alignment: u64,
+    untracked_memory_type: ?i32,
+) i32 {
     if (len == 0 or len % page_size != 0) return KernelError.einval.raw();
     if (physical_address % page_size != 0) return KernelError.einval.raw();
     const effective_alignment = @max(alignment, page_size);
@@ -539,8 +559,15 @@ fn sceKernelMapDirectMemory(
     pool_lock.lock();
     defer pool_lock.unlock();
 
-    const reservation = pool.findContainingRange(physical_address, len) orelse
-        return KernelError.einval.raw();
+    const memory_type: i32 = if (pool.findContainingRange(physical_address, len)) |reservation|
+        @intFromEnum(reservation.memory_type)
+    else untracked: {
+        const fallback = untracked_memory_type orelse return KernelError.einval.raw();
+        if (physical_address > pool.size or len > pool.size - physical_address) {
+            return KernelError.einval.raw();
+        }
+        break :untracked fallback;
+    };
     const output = out_address orelse return KernelError.efault.raw();
     const address_space = guest_address_space orelse return KernelError.enosys.raw();
     const protection = decodeProtection(protection_bits) orelse return KernelError.einval.raw();
@@ -605,7 +632,7 @@ fn sceKernelMapDirectMemory(
 
     address_space.setMetadata(mapped_address, len, .{
         .protection_bits = protection_bits,
-        .memory_type = @intFromEnum(reservation.memory_type),
+        .memory_type = memory_type,
         .name = "direct",
     }) catch |err| {
         address_space.unmap(mapped_address, len) catch {};
@@ -1057,7 +1084,8 @@ fn batchMapCore(
         }
         const operation: BatchOperation = @enumFromInt(entry.operation);
         const protection_bits: i32 = entry.protection;
-        const result = switch (operation) {
+        const requested_start = entry.start;
+        var result = switch (operation) {
             .map_direct => sceKernelMapDirectMemory(
                 &entry.start,
                 entry.length,
@@ -1080,7 +1108,81 @@ fn batchMapCore(
                 "batch",
             ),
         };
+        // The graphics driver owns some physical ranges through its main
+        // direct-memory arena even after the fine-grained allocation tracker
+        // has released or split their bookkeeping nodes. BatchMap is the
+        // driver's commit boundary, so accept an otherwise-valid in-pool
+        // direct mapping and retain the entry's hardware memory type.
+        if (result == KernelError.einval.raw() and operation == .map_direct) {
+            result = mapDirectMemory(
+                &entry.start,
+                entry.length,
+                protection_bits,
+                flags,
+                entry.offset,
+                0,
+                entry.memory_type,
+            );
+            if (result == errno.ok) {
+                std.debug.print(
+                    "[batch map {d}] accepted in-pool direct range absent from allocation tracker: offset=0x{x}+0x{x}\n",
+                    .{ index, entry.offset, entry.length },
+                );
+            }
+        }
+        // A zero start cannot name a fixed mapping. Some Unreal allocator paths
+        // retain that sentinel when asking BatchMap to choose the virtual
+        // address, even though the original entry point supplies MAP_FIXED.
+        // Retry only that otherwise-impossible combination as a chosen-address
+        // map; nonzero fixed mappings keep their strict replacement semantics.
+        if (result == KernelError.einval.raw() and
+            requested_start == 0 and
+            flags & map_fixed != 0 and
+            (operation == .map_direct or operation == .map_flexible))
+        {
+            const choose_address_flags = flags & ~map_fixed;
+            result = switch (operation) {
+                .map_direct => mapDirectMemory(
+                    &entry.start,
+                    entry.length,
+                    protection_bits,
+                    choose_address_flags,
+                    entry.offset,
+                    0,
+                    entry.memory_type,
+                ),
+                .map_flexible => mapFlexibleMemory(
+                    &entry.start,
+                    entry.length,
+                    protection_bits,
+                    choose_address_flags,
+                    "batch",
+                ),
+                else => unreachable,
+            };
+            if (result == errno.ok) {
+                std.debug.print(
+                    "[batch map {d}] selected address 0x{x} for zero-start {s} mapping\n",
+                    .{ index, entry.start, @tagName(operation) },
+                );
+            }
+        }
         if (result != errno.ok) {
+            std.debug.print(
+                "[batch map {d}] failed result=0x{x} op={s} start=0x{x}->0x{x} offset=0x{x} length=0x{x} prot=0x{x} type=0x{x} flags=0x{x}\n",
+                .{
+                    index,
+                    @as(u32, @bitCast(result)),
+                    @tagName(operation),
+                    requested_start,
+                    entry.start,
+                    entry.offset,
+                    entry.length,
+                    entry.protection,
+                    entry.memory_type,
+                    @as(u32, @bitCast(flags)),
+                },
+            );
             if (processed_pointer) |output| output.* = processed;
             return result;
         }
@@ -1926,6 +2028,79 @@ test "direct memory maps at an exact guest address" {
     try testing.expectEqual(errno.ok, sceKernelMunmap(virtual_address, page_size));
     try testing.expectEqual(errno.ok, sceKernelMunmap(alias, page_size));
     try testing.expectEqual(errno.ok, sceKernelReleaseDirectMemory(start, page_size));
+}
+
+test "batch map chooses an address for a zero-start direct entry" {
+    var address_space = try memory.AddressSpace.initWithDirectMemory(
+        testing.allocator,
+        direct_memory_size,
+    );
+    defer address_space.deinit();
+
+    init(testing.allocator);
+    defer deinit();
+    attachAddressSpace(&address_space);
+
+    var physical: u64 = 0;
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelAllocateDirectMemory(0, direct_memory_size, page_size, page_size, 0, &physical),
+    );
+    var entry = BatchMapEntry{
+        .start = 0,
+        .offset = physical,
+        .length = page_size,
+        .protection = prot_cpu_read | prot_cpu_write,
+        .memory_type = 0,
+        .reserved = 0,
+        .operation = @intFromEnum(BatchOperation.map_direct),
+    };
+    var processed: i32 = -1;
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelBatchMap(@ptrCast(&entry), 1, &processed),
+    );
+    try testing.expectEqual(@as(i32, 1), processed);
+    try testing.expect(entry.start != 0);
+    try testing.expect(address_space.isMappedAs(entry.start, page_size, .direct_memory));
+    try testing.expectEqual(errno.ok, sceKernelMunmap(entry.start, page_size));
+    try testing.expectEqual(errno.ok, sceKernelReleaseDirectMemory(physical, page_size));
+}
+
+test "batch map accepts a valid in-pool direct range missing from the tracker" {
+    var address_space = try memory.AddressSpace.initWithDirectMemory(
+        testing.allocator,
+        direct_memory_size,
+    );
+    defer address_space.deinit();
+
+    init(testing.allocator);
+    defer deinit();
+    attachAddressSpace(&address_space);
+
+    const virtual_address = memory.user.start;
+    try address_space.reserveFixed(virtual_address, page_size);
+    var entry = BatchMapEntry{
+        .start = virtual_address,
+        .offset = 8 * page_size,
+        .length = page_size,
+        .protection = prot_cpu_read | prot_cpu_write | prot_gpu_read | prot_gpu_write,
+        .memory_type = 12,
+        .reserved = 0,
+        .operation = @intFromEnum(BatchOperation.map_direct),
+    };
+    var processed: i32 = -1;
+    try testing.expectEqual(errno.ok, sceKernelBatchMap(@ptrCast(&entry), 1, &processed));
+    try testing.expectEqual(@as(i32, 1), processed);
+
+    var info = VirtualQueryInfo{};
+    try testing.expectEqual(
+        errno.ok,
+        sceKernelVirtualQuery(entry.start, 0, &info, @sizeOf(VirtualQueryInfo)),
+    );
+    try testing.expectEqual(@as(i32, 12), info.memory_type);
+    try testing.expectEqual(entry.offset, info.offset);
+    try testing.expectEqual(errno.ok, sceKernelMunmap(entry.start, entry.length));
 }
 
 test "direct memory preserves a graphics device-window address without MAP_FIXED" {

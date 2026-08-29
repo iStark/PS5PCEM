@@ -20,6 +20,7 @@ const error_device_not_connected: i32 = @bitCast(@as(u32, 0x8092_0007));
 const primary_handle: i32 = 1;
 /// SCE_PAD_BUTTON_CROSS — used for auto-confirm during headless bring-up.
 const button_cross: u32 = 0x4000;
+const button_down: u32 = 0x0040;
 /// SCE_PAD_BUTTON_TRIANGLE — some confirmation prompts require a hold, not a tap.
 const button_triangle: u32 = 0x1000;
 /// Press Cross so splash/attract loops that wait for confirmation can advance
@@ -43,11 +44,14 @@ const auto_cross_start_us: u64 = 40 * std.time.us_per_s;
 /// After the initial confirmations, hold Triangle for menus that require it.
 const auto_triangle_start_us: u64 = 90 * std.time.us_per_s;
 const auto_triangle_hold_us: u64 = 180 * std.time.us_per_s;
+const rapid_down_period_us: u64 = 16 * std.time.us_per_s;
+const rapid_down_hold_us: u64 = 15 * std.time.us_per_s;
 var auto_input_origin_us: std.atomic.Value(u64) = .init(0);
 
 pub const AutomaticProfile = enum(u8) {
     default,
     delayed_triangle_hold,
+    rapid_down,
 };
 
 var automatic_profile: std.atomic.Value(u8) = .init(@intFromEnum(AutomaticProfile.default));
@@ -138,6 +142,10 @@ fn validHandle(handle: i32) bool {
     return handle == primary_handle and open.load(.acquire) != 0;
 }
 
+fn rapidDownStick(elapsed_us: u64) u8 {
+    return if (elapsed_us % rapid_down_period_us < rapid_down_hold_us) 255 else 128;
+}
+
 fn padInit() callconv(abi.guest) i32 {
     initialized.store(1, .release);
     return errno.ok;
@@ -194,11 +202,22 @@ fn fillPadData(output: *PadData) void {
     // selects an explicit mode, so physical input is never mixed with it.
     if (host_input.mode() != .automatic) return;
     const profile: AutomaticProfile = @enumFromInt(automatic_profile.load(.acquire));
-    if (profile == .default) {
+    if (profile == .default or profile == .rapid_down) {
         const now_us = kernel_runtime.processTimeMicroseconds();
         if (now_us > 500_000) {
             const phase = now_us % auto_cross_period_us;
             if (phase < auto_cross_hold_us) output.buttons |= button_cross;
+        }
+        // Some UI screens only repeat navigation once per rendered frame. In
+        // bring-up runs a frame can take several seconds, so a host key pulse
+        // can be missed completely. Use wall-clock intervals rather than a
+        // read counter because a title can query scePadReadState several times
+        // inside one UI frame.
+        if (profile == .rapid_down) {
+            const down = rapidDownStick(autoInputElapsedUs());
+            output.left_stick_y = down;
+            output.right_stick_y = down;
+            if (down == 255) output.buttons |= button_down;
         }
         return;
     }
@@ -375,6 +394,14 @@ test "pad get handle exposes the system-managed primary controller" {
     var data: [1]PadData = .{.{}};
     try std.testing.expectEqual(@as(i32, 1), padRead(handle, &data, 1));
     try std.testing.expectEqual(@as(u8, 1), data[0].connected);
+}
+
+test "rapid down profile has a long hold and a neutral edge" {
+    try std.testing.expectEqual(@as(u8, 255), rapidDownStick(0));
+    try std.testing.expectEqual(@as(u8, 255), rapidDownStick(rapid_down_hold_us - 1));
+    try std.testing.expectEqual(@as(u8, 128), rapidDownStick(rapid_down_hold_us));
+    try std.testing.expectEqual(@as(u8, 128), rapidDownStick(rapid_down_period_us - 1));
+    try std.testing.expectEqual(@as(u8, 255), rapidDownStick(rapid_down_period_us));
 }
 
 test "pad exports include the PS5 remote-controller query" {

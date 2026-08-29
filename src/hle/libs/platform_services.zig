@@ -19,6 +19,22 @@ const gen2_error_memory_fault: i32 = @bitCast(@as(u32, 0x8002_0101));
 const net_ctl_error_invalid_address: i32 = @bitCast(@as(u32, 0x8041_2107));
 const net_ctl_error_not_connected: i32 = @bitCast(@as(u32, 0x8041_2108));
 
+/// Optional host-clock displacement for deterministic title bring-up.  The
+/// default remains the real host date; game-run exposes this only through an
+/// explicit environment variable so ordinary sessions cannot silently acquire
+/// a surprising calendar.
+var rtc_day_offset = std.atomic.Value(i32).init(0);
+
+pub fn setRtcDayOffset(days: i32) void {
+    rtc_day_offset.store(days, .release);
+}
+
+fn adjustedRealTimeNanoseconds() i96 {
+    const now = kernel_runtime.realTimeNanoseconds();
+    const delta = @as(i96, rtc_day_offset.load(.acquire)) * std.time.ns_per_day;
+    return @max(@as(i96, 0), now + delta);
+}
+
 pub const RtcDateTime = extern struct {
     year: u16,
     month: u16,
@@ -103,7 +119,7 @@ fn netCtlGetInfo(_: i32, output: ?*[256]u8) callconv(abi.guest) i32 {
 fn rtcGetCurrentTick(output: ?*u64) callconv(abi.guest) i32 {
     const value = output orelse return errno.KernelError.einval.raw();
     const unix_microseconds = @divTrunc(
-        kernel_runtime.realTimeNanoseconds(),
+        adjustedRealTimeNanoseconds(),
         std.time.ns_per_us,
     );
     value.* = @intCast(@max(@as(i96, 0), rtc_unix_epoch_microseconds + unix_microseconds));
@@ -323,10 +339,9 @@ pub fn rtcFormatRFC3339(
             &buffer,
             "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}{c}{d:0>2}:{d:0>2}",
             .{
-                local.year,       local.month, local.day,
-                local.hour,       local.minute, local.second,
-                @as(u8, if (negative) '-' else '+'),
-                magnitude / 60,   magnitude % 60,
+                local.year,                          local.month,    local.day,
+                local.hour,                          local.minute,   local.second,
+                @as(u8, if (negative) '-' else '+'), magnitude / 60, magnitude % 60,
             },
         ) catch return rtc_error_invalid_value;
     };
@@ -361,7 +376,7 @@ fn checkedRtcOutput(output: ?*RtcDateTime) ?*RtcDateTime {
 pub fn rtcGetCurrentClockLocalTime(output: ?*RtcDateTime) callconv(abi.guest) i32 {
     const destination = output orelse return rtc_error_invalid_pointer;
     if (checkedRtcOutput(destination) == null) return gen2_error_memory_fault;
-    const unix_nanoseconds = @max(@as(i96, 0), kernel_runtime.realTimeNanoseconds());
+    const unix_nanoseconds = adjustedRealTimeNanoseconds();
     const unix_microseconds: u64 = @intCast(@divTrunc(unix_nanoseconds, std.time.ns_per_us));
     destination.* = rtcDateTimeFromTick(@intCast(rtc_unix_epoch_microseconds + unix_microseconds)) orelse
         return rtc_error_invalid_value;

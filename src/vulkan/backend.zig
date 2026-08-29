@@ -159,6 +159,11 @@ pub const Options = struct {
     /// Diagnostic fast path for graphics bring-up. Command processing and
     /// draws continue, but guest compute dispatches are not submitted.
     skip_compute_dispatches: bool = false,
+    /// Diagnostic fast path for UI/input bring-up. One complete frame out of
+    /// every sixteen is rendered while command processing and guest logic keep
+    /// advancing. This remains opt-in because skipped render-to-texture work
+    /// can leave intermediate frames visually incomplete.
+    sparse_graphics_draws: bool = false,
     /// Translates guest compute programs and prepares their resources without
     /// submitting them to Vulkan. This isolates translation and binding gaps
     /// from GPU execution faults while preserving later command processing.
@@ -2406,6 +2411,13 @@ fn shouldDumpProgressFrame(flip: u64, enabled: bool) bool {
     };
 }
 
+const maximum_sparse_deferred_ui_age: u64 = 256;
+
+fn shouldPresentDeferredCompositeUi(sparse: bool, flip: u64, last_ui_flip: u64) bool {
+    if (!sparse) return true;
+    return flip -| last_ui_flip <= maximum_sparse_deferred_ui_age;
+}
+
 fn sampledImageDimensionForInstruction(
     dimension: rdna2.isa.ImageDimension,
     image_type: gpu.resources.ImageType,
@@ -2579,6 +2591,7 @@ pub const Renderer = struct {
     force_probe_fragment_parameter: bool,
     force_probe_fragment_ui: bool,
     skip_compute_dispatches: bool,
+    sparse_graphics_draws: bool,
     translate_compute_only: bool,
     dump_compute_spirv: bool,
     dump_graphics_spirv: bool,
@@ -2710,6 +2723,10 @@ pub const Renderer = struct {
     /// faithfully yet.  Remembering the resident input lets presentation use
     /// the intact scene after all of the frame's draws have completed.
     deferred_composite_ui_address: ?u64 = null,
+    /// Sparse bring-up runs can cross several Unity scenes while an old UI
+    /// target remains resident.  Remember when the anchor was last proven so
+    /// a settings page cannot cover gameplay forever after its scene exits.
+    deferred_composite_ui_last_flip: u64 = 0,
     emulated_volume_copies: u64 = 0,
     reported_dual_image_clear_fallback: bool = false,
     reported_fast_clear_seeds: u32 = 0,
@@ -3111,6 +3128,7 @@ pub const Renderer = struct {
             .force_probe_fragment_parameter = options.force_probe_fragment_parameter,
             .force_probe_fragment_ui = options.force_probe_fragment_ui,
             .skip_compute_dispatches = options.skip_compute_dispatches,
+            .sparse_graphics_draws = options.sparse_graphics_draws,
             .translate_compute_only = options.translate_compute_only,
             .dump_compute_spirv = options.dump_compute_spirv,
             .dump_graphics_spirv = options.dump_graphics_spirv,
@@ -10380,6 +10398,7 @@ pub const Renderer = struct {
                         );
                     }
                     self.deferred_composite_ui_address = ui_layer.address;
+                    self.deferred_composite_ui_last_flip = self.flip_callbacks;
                 }
                 if (self.findResidentRenderTargetIndex(ui_layer, vk.format_r8g8b8a8_unorm)) |source_index| {
                     if (try self.blitResidentColorTarget(source_index, target, false) != null) {
@@ -10980,6 +10999,7 @@ pub const Renderer = struct {
                     // prefer that most recent target so menus are not hidden
                     // behind the earlier scene-only presentation anchor.
                     self.deferred_composite_ui_address = target.descriptor.address;
+                    self.deferred_composite_ui_last_flip = self.flip_callbacks;
                 }
                 if (self.traceCurrentGraphicsFrame()) {
                     if (self.latest_render_target_index) |target_index| {
@@ -15082,7 +15102,18 @@ pub const Renderer = struct {
                 // Retain the last structurally recognised layer until a newer
                 // UI draw replaces the anchor; expiring it after a few flips
                 // turns an otherwise static menu black again.
-                if (self.deferred_composite_ui_address != null) {
+                // A normal rendering run retains static menus indefinitely.
+                // The explicit sparse bring-up mode advances through scenes
+                // much faster than it refreshes their UI targets, so retire an
+                // anchor that has survived many flips without another
+                // structurally recognised UI draw. Otherwise Tetris keeps its
+                // Gameplay settings page over the Marathon scene and game.
+                const deferred_ui_is_current = shouldPresentDeferredCompositeUi(
+                    self.sparse_graphics_draws,
+                    self.flip_callbacks,
+                    self.deferred_composite_ui_last_flip,
+                );
+                if (self.deferred_composite_ui_address != null and deferred_ui_is_current) {
                     const ui_address = self.deferred_composite_ui_address.?;
                     var ui_index: ?usize = null;
                     var ui_sequence: u64 = 0;
@@ -15553,6 +15584,13 @@ pub const Renderer = struct {
         defer self.frame_profile.draw_ns +|= elapsedHostNanoseconds(profile_started);
         self.draw_callbacks += 1;
         self.frame_profile.draws += 1;
+        if (self.sparse_graphics_draws and
+            self.flip_callbacks >= 80 and
+            self.flip_callbacks % 16 != 0)
+        {
+            self.last_draw_error = null;
+            return true;
+        }
         const vertex_stage = graphicsVertexStage(state);
         const has_vertex = vertex_stage != null;
         const has_fragment = gpu.resources.ShaderStage.pixel.programAddress(state) != null;
@@ -20639,6 +20677,13 @@ test "progress dumps are opt in and select presentation checkpoints" {
     try std.testing.expect(shouldDumpProgressFrame(2, true));
     try std.testing.expect(shouldDumpProgressFrame(128, true));
     try std.testing.expect(shouldDumpProgressFrame(512, true));
+}
+
+test "sparse presentation retires a deferred UI layer after its scene is gone" {
+    try std.testing.expect(shouldPresentDeferredCompositeUi(false, 10_000, 1));
+    try std.testing.expect(shouldPresentDeferredCompositeUi(true, 512, 256));
+    try std.testing.expect(!shouldPresentDeferredCompositeUi(true, 513, 256));
+    try std.testing.expect(shouldPresentDeferredCompositeUi(true, 12, 20));
 }
 
 test "RGBA occupancy preserves black alpha and destination alpha is explicit" {

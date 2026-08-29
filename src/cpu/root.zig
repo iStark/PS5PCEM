@@ -2416,6 +2416,22 @@ const WindowsX64Machine = struct {
             0x75, 0xe4, // jne loop
         };
 
+        // A sentinel immediately below a committed guest mapping can make the
+        // first `[rcx+0x48]` probe land on a mapped page even though the node
+        // base is unmapped. In that case the same loop faults later at `[rcx]`;
+        // match the remaining tail and take the identical normal cleanup exit.
+        const base_fault_offset = 10;
+        const partial_node = context.Rcx != 0 and memory_address == context.Rcx;
+        if (partial_node) {
+            const code: [*]const u8 = @ptrFromInt(context.Rip);
+            for (pattern[base_fault_offset..], 0..) |byte, index| {
+                if (code[index] != byte) return false;
+            }
+            context.Rcx = 0;
+            context.Rip += pattern.len - base_fault_offset;
+            return true;
+        }
+
         const exact_field = memory_address == context.Rcx +% 0x48;
         const poisoned_field = memory_address == std.math.maxInt(u64) and
             !isCanonicalX64Address(context.Rcx);
@@ -2434,7 +2450,14 @@ const WindowsX64Machine = struct {
         context: *std.os.windows.CONTEXT,
         memory_address: u64,
     ) bool {
-        if (memory_address != context.R13 +% 0x48) return false;
+        const exact_field = memory_address == context.R13 +% 0x48;
+        // Windows reports an access to a non-canonical x64 pointer as
+        // `0xffffffffffffffff`, rather than preserving the effective address.
+        // Packed AGC event data can leak into this second registration walk in
+        // exactly the same way as the interrupt-list loop handled above.
+        const poisoned_field = memory_address == std.math.maxInt(u64) and
+            !isCanonicalX64Address(context.R13);
+        if (!exact_field and !poisoned_field) return false;
         const before: [*]const u8 = @ptrFromInt(context.Rip -% 9);
         const prefix = [_]u8{
             0x4d, 0x8b, 0x6d, 0x40, // mov r13,qword ptr [r13+0x40]
@@ -2822,6 +2845,29 @@ test "a corrupt AGC interrupt registration tail reaches normal cleanup" {
     }
 }
 
+test "a partially mapped AGC interrupt sentinel reaches normal cleanup" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{
+            0x48, 0x2b, 0x31, 0x48,
+            0x01, 0xf0, 0x48, 0x89,
+            0x02, 0x48, 0x8b, 0x49,
+            0x40, 0x48, 0x85, 0xc9,
+            0x75, 0xe4,
+        };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rcx = memory.system_managed.start - 1;
+        try std.testing.expect(WindowsX64Machine.tryDropCorruptAgcInterruptListTail(
+            &context,
+            context.Rcx,
+        ));
+        try std.testing.expectEqual(@as(u64, 0), context.Rcx);
+        try std.testing.expectEqual(@intFromPtr(&code) + code.len, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "a corrupt AGC cleanup registration tail reaches its null exit" {
     if (can_use_native_bridge) {
         const code = [_]u8{
@@ -2840,6 +2886,32 @@ test "a corrupt AGC cleanup registration tail reaches its null exit" {
         try std.testing.expect(WindowsX64Machine.tryDropCorruptAgcCleanupListTail(
             &context,
             context.R13 + 0x48,
+        ));
+        try std.testing.expectEqual(@as(u64, 0), context.R13);
+        try std.testing.expectEqual(@intFromPtr(&code) + 9 + 0x64, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "a packed AGC cleanup link reaches its null exit" {
+    if (can_use_native_bridge) {
+        const code = [_]u8{
+            0x4d, 0x8b, 0x6d, 0x40,
+            0x4d, 0x85, 0xed, 0x74,
+            0x64, 0x41, 0x83, 0x7d,
+            0x48, 0x00, 0x75, 0xf0,
+            0x4d, 0x8b, 0x75, 0x00,
+            0x4d, 0x63, 0x3c, 0x24,
+            0x41, 0x8d, 0x5f, 0x01,
+            0x41, 0x89, 0x1c, 0x24,
+        };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code) + 9;
+        context.R13 = 0x0023_0022_0021_0020;
+        try std.testing.expect(WindowsX64Machine.tryDropCorruptAgcCleanupListTail(
+            &context,
+            std.math.maxInt(u64),
         ));
         try std.testing.expectEqual(@as(u64, 0), context.R13);
         try std.testing.expectEqual(@intFromPtr(&code) + 9 + 0x64, context.Rip);

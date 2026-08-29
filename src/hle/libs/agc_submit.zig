@@ -1263,12 +1263,31 @@ fn hasQueuedInterrupt(stream: []const u32) bool {
 /// Stopping there also preserves a terminal RELEASE_MEM that precedes the
 /// trailing data, so the title receives its completion interrupt/fence.
 fn submittedCommandPrefix(stream: []const u32) []const u32 {
+    return submittedCommandPrefixForArena(stream, @intFromPtr(stream.ptr));
+}
+
+/// Validates an immutable copy of a guest allocation while retaining the
+/// original arena address for allocator-header guards. The retail AGC worker
+/// can recycle a DCB from another guest thread as soon as Submit begins; a
+/// walk of the live slice followed by a later scheduler copy can otherwise
+/// turn a proven packet boundary into a truncated root stream.
+fn submittedCommandPrefixForArena(stream: []const u32, arena_address: u64) []const u32 {
     var walker = gpu.pm4.Walker.init(stream);
     while (true) {
         const offset = walker.index;
         const packet = walker.next() catch return stream[0..offset];
         const value = packet orelse return stream;
         if (value.kind != .command and value.kind != .filler) return stream[0..offset];
+        if (packetUnreadableIndirectTarget(value)) |target| {
+            if (unsafe_island_reports < 32) {
+                std.debug.print(
+                    "[dcb guard] trimmed command prefix before unreadable indirect target: target=0x{x} arena=0x{x}\n",
+                    .{ target, arena_address },
+                );
+                unsafe_island_reports += 1;
+            }
+            return stream[0..offset];
+        }
         if (packetWaitMemoryRead(value)) |read| {
             var bytes: [@sizeOf(u64)]u8 = undefined;
             // A real CPU-visible fence must already name readable storage when
@@ -1281,18 +1300,18 @@ fn submittedCommandPrefix(stream: []const u32) []const u32 {
                 if (unsafe_island_reports < 32) {
                     std.debug.print(
                         "[dcb guard] trimmed command prefix before unreadable wait: target=0x{x}+{d} arena=0x{x}\n",
-                        .{ read.address, read.byte_length, @intFromPtr(stream.ptr) },
+                        .{ read.address, read.byte_length, arena_address },
                     );
                     unsafe_island_reports += 1;
                 }
                 return stream[0..offset];
             }
         }
-        if (packetWritesSubmissionAllocationHeader(stream, value)) |target| {
+        if (packetWritesSubmissionAllocationHeaderAt(arena_address, value)) |target| {
             if (unsafe_island_reports < 32) {
                 std.debug.print(
                     "[dcb guard] trimmed command prefix before allocation-header write: target=0x{x} arena=0x{x} opcode=0x{x}\n",
-                    .{ target, @intFromPtr(stream.ptr), value.opcode },
+                    .{ target, arena_address, value.opcode },
                 );
                 unsafe_island_reports += 1;
             }
@@ -1308,18 +1327,27 @@ const SubmittedSegment = struct {
     releases: usize,
 };
 
-fn overlapsSubmissionAllocationHeader(stream: []const u32, address: u64, byte_length: u64) bool {
-    if (stream.len == 0 or byte_length == 0) return false;
-    const arena_address: u64 = @intFromPtr(stream.ptr);
+fn overlapsSubmissionAllocationHeaderAt(arena_address: u64, address: u64, byte_length: u64) bool {
+    if (arena_address == 0 or byte_length == 0) return false;
     if (arena_address < submission_allocation_header_bytes) return false;
     const header_start = arena_address - submission_allocation_header_bytes;
     const write_end = std.math.add(u64, address, byte_length) catch return false;
     return address < arena_address and write_end > header_start;
 }
 
+fn overlapsSubmissionAllocationHeader(stream: []const u32, address: u64, byte_length: u64) bool {
+    if (stream.len == 0) return false;
+    return overlapsSubmissionAllocationHeaderAt(@intFromPtr(stream.ptr), address, byte_length);
+}
+
 /// Returns the target when a packet decoded from an allocation's data area
 /// would overwrite the allocator metadata immediately before that allocation.
 fn packetWritesSubmissionAllocationHeader(stream: []const u32, packet: gpu.pm4.Packet) ?u64 {
+    if (stream.len == 0) return null;
+    return packetWritesSubmissionAllocationHeaderAt(@intFromPtr(stream.ptr), packet);
+}
+
+fn packetWritesSubmissionAllocationHeaderAt(arena_address: u64, packet: gpu.pm4.Packet) ?u64 {
     if (packet.kind != .command) return null;
     const body = packet.body;
     const custom = gpu.pm4.customCode(packet);
@@ -1337,7 +1365,7 @@ fn packetWritesSubmissionAllocationHeader(stream: []const u32, packet: gpu.pm4.P
             else => return null,
         };
         const address = (@as(u64, body[3]) << 32) | body[2];
-        return if (overlapsSubmissionAllocationHeader(stream, address, byte_length)) address else null;
+        return if (overlapsSubmissionAllocationHeaderAt(arena_address, address, byte_length)) address else null;
     }
 
     if (packet.opcode == gpu.pm4.write_data or
@@ -1357,7 +1385,7 @@ fn packetWritesSubmissionAllocationHeader(stream: []const u32, packet: gpu.pm4.P
             std.math.mul(u64, body.len - 3, @sizeOf(u32)) catch return null
         else
             @sizeOf(u32);
-        return if (overlapsSubmissionAllocationHeader(stream, address, byte_length)) address else null;
+        return if (overlapsSubmissionAllocationHeaderAt(arena_address, address, byte_length)) address else null;
     }
 
     if (packet.opcode == gpu.pm4.dma_data or
@@ -1371,7 +1399,7 @@ fn packetWritesSubmissionAllocationHeader(stream: []const u32, packet: gpu.pm4.P
         if (destination != 0 and destination != 3) return null;
         const address = (@as(u64, body[4]) << 32) | body[3];
         const byte_length: u64 = control2 & 0x03ff_ffff;
-        return if (overlapsSubmissionAllocationHeader(stream, address, byte_length)) address else null;
+        return if (overlapsSubmissionAllocationHeaderAt(arena_address, address, byte_length)) address else null;
     }
 
     return null;
@@ -1630,7 +1658,17 @@ fn executeAcceptedStream(
     driver_completion_label: ?u64,
 ) SubmitOutcome {
     rememberSubmissionAlias(stream);
-    const commands = submittedCommandPrefix(stream);
+    // Freeze the caller-owned allocation before validating it. AGC command
+    // arenas are shared with producer threads and may be recycled while this
+    // HLE call is waiting for the serialized command processor. Validating the
+    // live words and copying them later allowed a Type-0 descriptor tail to
+    // replace the final packet and reach the executor as a truncated root.
+    const snapshot = std.heap.page_allocator.dupe(u32, stream) catch {
+        std.debug.print("[{s}] could not snapshot {d}-word submission; accepting as no-op\n", .{ label, stream.len });
+        return .{ .accepted = true, .completed = true };
+    };
+    defer std.heap.page_allocator.free(snapshot);
+    const commands = submittedCommandPrefixForArena(snapshot, @intFromPtr(stream.ptr));
 
     if (commands.len != stream.len) {
         if (trace.isLive() or trimmed_submission_reports < 8) {
@@ -1696,7 +1734,9 @@ fn flushPendingGraphicsSegment() void {
 
     const pointer: [*]const u32 = @ptrFromInt(start);
     const available = pointer[0..@intCast(byte_length / @sizeOf(u32))];
-    const commands = submittedCommandPrefix(available);
+    const snapshot = std.heap.page_allocator.dupe(u32, available) catch return;
+    defer std.heap.page_allocator.free(snapshot);
+    const commands = submittedCommandPrefixForArena(snapshot, start);
     if (commands.len == 0) return;
     if (pending_graphics_reports < 32) {
         std.debug.print(
@@ -1705,7 +1745,8 @@ fn flushPendingGraphicsSegment() void {
         );
         pending_graphics_reports += 1;
     }
-    rememberSubmissionAlias(commands);
+    const original_commands = available[0..commands.len];
+    rememberSubmissionAlias(original_commands);
     // This is work appended to the preceding public DCB, not another guest
     // submission. Execute its labels and Vulkan commands, but do not turn a
     // second RELEASE_MEM in the same allocation into another retirement edge:
@@ -1719,7 +1760,7 @@ fn flushPendingGraphicsSegment() void {
     // not a second SubmitDcb call. The driver has no separate retirement node
     // for them. Publishing the continuation's explicit EOP here advances the
     // interrupt worker past the next real record and eventually deadlocks RHI.
-    if (outcome.accepted) armPendingGraphicsSegment(commands);
+    if (outcome.accepted) armPendingGraphicsSegment(original_commands);
 }
 
 pub fn submitDeviceStream(stream: []const u32) SubmitOutcome {
@@ -1863,8 +1904,38 @@ fn executeSubmittedLocked(label: []const u8, stream: []const u32) SubmitOutcome 
     return .{ .accepted = true, .completed = completed };
 }
 
-/// Writes the WAIT_REG_MEM reference into the watched location so a re-poll
-/// succeeds. Register-space waits update the scheduler's tracked registers.
+/// Chooses a value which actually satisfies the packet's masked comparison.
+/// Writing the reference itself only works for equality/inclusive waits.
+fn satisfyingWaitValue(wait: gpu.state.WaitRegMem) ?u64 {
+    const width_mask: u64 = switch (wait.width) {
+        .bits_32 => std.math.maxInt(u32),
+        .bits_64 => std.math.maxInt(u64),
+    };
+    const mask = wait.mask & width_mask;
+    var candidate: u64 = switch (wait.compare_function) {
+        0 => 0,
+        1, 2 => 0,
+        3 => wait.reference,
+        4 => 0,
+        5, 6 => mask,
+        else => 0,
+    };
+    if (wait.compare_function == 4 and
+        !gpu.executor.compareWait(candidate, wait.reference, wait.mask, wait.compare_function))
+    {
+        if (mask == 0) return null;
+        const lowest_mask_bit = mask & (~mask +% 1);
+        candidate = (wait.reference & mask) ^ lowest_mask_bit;
+    }
+    candidate &= width_mask;
+    return if (gpu.executor.compareWait(
+        candidate,
+        wait.reference,
+        wait.mask,
+        wait.compare_function,
+    )) candidate else null;
+}
+
 fn forceSatisfyWait(queue_kind: gpu.QueueKind, wait: gpu.state.WaitRegMem) bool {
     if (!wait.memory_space) {
         // Absolute config/context register index — write into both queues' state.
@@ -1878,23 +1949,34 @@ fn forceSatisfyWait(queue_kind: gpu.QueueKind, wait: gpu.state.WaitRegMem) bool 
         // Without a reliable register map, leave register waits alone.
         return false;
     }
+    const forced_value = satisfyingWaitValue(wait) orelse {
+        const bypassed = submission_scheduler.bypassImpossibleActiveWait(queue_kind, wait);
+        if (bypassed and unmapped_wait_reports < 32) {
+            std.debug.print(
+                "[agc wait] bypassed impossible retained wait: target=0x{x} ref=0x{x} mask=0x{x} compare={d}\n",
+                .{ wait.address, wait.reference, wait.mask, wait.compare_function },
+            );
+            unmapped_wait_reports += 1;
+        }
+        return bypassed;
+    };
     var bytes: [8]u8 = undefined;
     const payload: []const u8 = switch (wait.width) {
         .bits_32 => blk: {
-            std.mem.writeInt(u32, bytes[0..4], @truncate(wait.reference), .little);
+            std.mem.writeInt(u32, bytes[0..4], @truncate(forced_value), .little);
             break :blk bytes[0..4];
         },
         .bits_64 => blk: {
-            std.mem.writeInt(u64, &bytes, wait.reference, .little);
+            std.mem.writeInt(u64, &bytes, forced_value, .little);
             break :blk &bytes;
         },
     };
     if (findSubmissionHeaderCollision(wait.address, payload.len)) |collision| {
-        const recovered = submission_scheduler.softSatisfyActiveWait(queue_kind, wait);
+        const recovered = submission_scheduler.softSatisfyActiveWait(queue_kind, wait, forced_value);
         if (recovered and submission_header_write_reports < 32) {
             std.debug.print(
                 "[agc wait] soft-satisfied protected header wait: target=0x{x}+{d} arena=0x{x} ref=0x{x}\n",
-                .{ collision.target_address, payload.len, collision.arena_address, wait.reference },
+                .{ collision.target_address, payload.len, collision.arena_address, forced_value },
             );
             submission_header_write_reports += 1;
         }
@@ -1914,11 +1996,11 @@ fn forceSatisfyWait(queue_kind: gpu.QueueKind, wait: gpu.state.WaitRegMem) bool 
     // later frame even though the owning submission has already completed.
     // Satisfy exactly one scheduler re-poll without publishing the synthetic
     // value into arbitrary guest memory.
-    const recovered = submission_scheduler.softSatisfyActiveWait(queue_kind, wait);
+    const recovered = submission_scheduler.softSatisfyActiveWait(queue_kind, wait, forced_value);
     if (recovered and unmapped_wait_reports < 32) {
         std.debug.print(
             "[agc wait] soft-satisfied unmapped wait: target=0x{x}+{d} ref=0x{x}\n",
-            .{ wait.address, payload.len, wait.reference },
+            .{ wait.address, payload.len, forced_value },
         );
         unmapped_wait_reports += 1;
     }
@@ -2437,6 +2519,60 @@ test "submitted DCB retains Type-2 alignment filler" {
         1,
     };
     try testing.expectEqual(stream.len, submittedCommandPrefix(&stream).len);
+}
+
+test "immutable submitted snapshot survives guest arena recycling" {
+    var guest_stream = [_]u32{
+        command(gpu.pm4.clear_state, 1), 0,
+        command(gpu.pm4.nop, 1),         0,
+    };
+    const arena_address: u64 = @intFromPtr(&guest_stream);
+    const snapshot = guest_stream;
+
+    // This is the same failure shape observed in Tetris: a descriptor word
+    // replaces a once-valid packet header after the submit path has inspected
+    // the live arena. The frozen copy must remain wholly walkable.
+    guest_stream[2] = 0x37c9_6e98;
+    try testing.expectEqual(@as(usize, 2), submittedCommandPrefix(&guest_stream).len);
+    try testing.expectEqual(
+        snapshot.len,
+        submittedCommandPrefixForArena(&snapshot, arena_address).len,
+    );
+}
+
+test "submitted DCB trims an unreadable indirect register list" {
+    const stream = [_]u32{
+        command(gpu.pm4.clear_state, 1),              0,
+        command(gpu.pm4.set_uconfig_reg_indirect, 4), 0xffff_fffc,
+        0xffff_ffff,                                  0,
+        1,                                            command(gpu.pm4.nop, 1),
+        0,
+    };
+    try testing.expectEqual(@as(usize, 2), submittedCommandPrefix(&stream).len);
+}
+
+test "wait recovery chooses a value matching every comparison family" {
+    var wait = gpu.state.WaitRegMem{
+        .width = .bits_32,
+        .memory_space = true,
+        .address = 0x1000,
+        .mask = 0xff,
+        .reference = 9,
+        .compare_function = 1,
+        .operation = 0,
+        .poll_interval = 0,
+        .standard_packet = true,
+    };
+    try testing.expectEqual(@as(?u64, 0), satisfyingWaitValue(wait));
+    wait.compare_function = 4;
+    wait.reference = 0;
+    try testing.expectEqual(@as(?u64, 1), satisfyingWaitValue(wait));
+    wait.compare_function = 6;
+    wait.reference = 9;
+    try testing.expectEqual(@as(?u64, 0xff), satisfyingWaitValue(wait));
+    wait.compare_function = 3;
+    wait.reference = 0x100;
+    try testing.expectEqual(@as(?u64, null), satisfyingWaitValue(wait));
 }
 
 test "queued release interrupt suppresses submit fallback event" {

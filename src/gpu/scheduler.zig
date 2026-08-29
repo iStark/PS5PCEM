@@ -132,6 +132,7 @@ pub const Scheduler = struct {
         self: *Scheduler,
         kind: QueueKind,
         wait: gpu_state.WaitRegMem,
+        forced_value: u64,
     ) bool {
         if (!wait.memory_space) return false;
         const queue = self.queueFor(kind);
@@ -145,10 +146,61 @@ pub const Scheduler = struct {
             .bits_64 => 8,
         } };
         switch (wait.width) {
-            .bits_32 => std.mem.writeInt(u32, forced.bytes[0..4], @truncate(wait.reference), .little),
-            .bits_64 => std.mem.writeInt(u64, &forced.bytes, wait.reference, .little),
+            .bits_32 => std.mem.writeInt(u32, forced.bytes[0..4], @truncate(forced_value), .little),
+            .bits_64 => std.mem.writeInt(u64, &forced.bytes, forced_value, .little),
         }
         queue.forced_read = forced;
+        return true;
+    }
+
+    /// Rewrites the active retained WAIT_REG_MEM comparison to "always" so
+    /// the next resume advances past it. This is reserved for comparisons for
+    /// which no bit pattern can satisfy the encoded mask/reference pair: a
+    /// real producer cannot unblock those, and they arise when recycled DCB
+    /// allocation data is decoded as a trailing wait packet.
+    pub fn bypassImpossibleActiveWait(
+        self: *Scheduler,
+        kind: QueueKind,
+        wait: gpu_state.WaitRegMem,
+    ) bool {
+        const queue = self.queueFor(kind);
+        const active = if (queue.active) |*submission| submission else return false;
+        const resume_path = active.continuation orelse return false;
+        const blocked = queue.state.blocked_wait orelse return false;
+        if (!std.meta.eql(blocked, wait) or resume_path.frame_count == 0) return false;
+
+        const frame = resume_path.frames[resume_path.frame_count - 1];
+        const words: []u32 = if (frame.address == 0) blk: {
+            if (frame.word_count != active.words.len) return false;
+            break :blk active.words;
+        } else snapshot: {
+            for (active.snapshots.items) |candidate| {
+                if (candidate.address != frame.address or candidate.words.len != frame.word_count) continue;
+                break :snapshot candidate.words;
+            }
+            return false;
+        };
+        if (frame.resume_word >= words.len) return false;
+
+        var walker = pm4.Walker.init(words);
+        walker.index = frame.resume_word;
+        const packet = (walker.next() catch return false) orelse return false;
+        if (packet.kind != .command) return false;
+        const body_start = frame.resume_word + 1;
+        const control_word: usize = if (packet.opcode == pm4.wait_reg_mem) standard: {
+            if (packet.body.len < 6) return false;
+            break :standard body_start;
+        } else if (pm4.customCode(packet)) |code| custom: {
+            if (code == pm4.custom.wait_mem_64) {
+                if (packet.body.len < 8) return false;
+                break :custom body_start + 6;
+            }
+            if (code != pm4.custom.wait_mem_32) return false;
+            if (packet.body.len == 5) break :custom body_start + 3;
+            if (packet.body.len < 6) return false;
+            break :custom body_start + 4;
+        } else return false;
+        words[control_word] &= ~@as(u32, 0x7);
         return true;
     }
 
@@ -656,10 +708,36 @@ test "a protected wait can be soft-satisfied without mutating guest memory" {
     _ = try scheduler.submit(.graphics, &wait_stream);
     try testing.expect(scheduler.isBlocked(.graphics));
     const wait = scheduler.state(.graphics).blocked_wait.?;
-    try testing.expect(scheduler.softSatisfyActiveWait(.graphics, wait));
+    try testing.expect(scheduler.softSatisfyActiveWait(.graphics, wait, wait.reference));
     try testing.expectEqual(@as(usize, 1), (try scheduler.pump()).completed_submissions);
     try testing.expect(!scheduler.isBlocked(.graphics));
     try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, host.memory[0x40..0x44], .little));
+}
+
+test "an impossible retained wait can be bypassed without mutating guest memory" {
+    var host = FakeBackend{};
+    const wait_stream = [_]u32{
+        customCommand(pm4.custom.wait_mem_32, 6),
+        0x1040,
+        0,
+        0,
+        1,
+        0x13,
+        1,
+        command(pm4.event_write, 1),
+        0x20,
+    };
+    var scheduler = Scheduler.init(testing.allocator, host.interface());
+    defer scheduler.deinit();
+
+    _ = try scheduler.submit(.graphics, &wait_stream);
+    try testing.expect(scheduler.isBlocked(.graphics));
+    const wait = scheduler.state(.graphics).blocked_wait.?;
+    try testing.expect(scheduler.bypassImpossibleActiveWait(.graphics, wait));
+    try testing.expectEqual(@as(usize, 1), (try scheduler.pump()).completed_submissions);
+    try testing.expect(!scheduler.isBlocked(.graphics));
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, host.memory[0x40..0x44], .little));
+    try testing.expectEqualSlices(u8, &.{0x20}, host.events[0..host.event_count]);
 }
 
 test "a label inside an indirect snapshot can be updated before resume" {

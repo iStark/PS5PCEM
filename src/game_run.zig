@@ -330,6 +330,20 @@ fn run(init: std.process.Init) !bool {
     runtime.firmware.filesystem.attach(io, content);
     defer runtime.firmware.filesystem.detach();
 
+    const rtc_day_offset: i32 = if (init.minimal.environ.getAlloc(
+        allocator,
+        "PS5_RTC_DAY_OFFSET",
+    )) |text| parse: {
+        defer allocator.free(text);
+        const request = std.mem.trim(u8, text, " \t\r\n");
+        break :parse std.fmt.parseInt(i32, request, 10) catch 0;
+    } else |_| 0;
+    runtime.firmware.libs.platform_services.setRtcDayOffset(rtc_day_offset);
+    defer runtime.firmware.libs.platform_services.setRtcDayOffset(0);
+    if (rtc_day_offset != 0) {
+        try out.print("  RTC day offset {d}\n", .{rtc_day_offset});
+    }
+
     // Keep unattended input generic and explicitly selectable. A delayed hold
     // is useful for menus that require a sustained Triangle press, but silently
     // choosing it from a product ID would make controller behaviour title code.
@@ -337,11 +351,16 @@ fn run(init: std.process.Init) !bool {
         allocator,
         "PS5_AUTO_HOLD_TRIANGLE",
     ) catch false;
-    runtime.firmware.libs.pad.setAutomaticProfile(if (automatic_triangle_hold)
+    const automatic_rapid_down = init.minimal.environ.containsUnempty(
+        allocator,
+        "PS5_AUTO_RAPID_DOWN",
+    ) catch false;
+    runtime.firmware.libs.pad.setAutomaticProfile(if (automatic_rapid_down)
+        .rapid_down
+    else if (automatic_triangle_hold)
         .delayed_triangle_hold
     else
         .default);
-
     var saves = openSaveDataHome(io, content) catch null;
     defer if (saves) |*directory| directory.close(io);
     defer runtime.firmware.filesystem.unmountSaveData();
@@ -439,6 +458,7 @@ fn run(init: std.process.Init) !bool {
     const force_probe_fragment_parameter = init.minimal.environ.containsUnempty(allocator, "PS5_PROBE_FRAGMENT_PARAMETER") catch false;
     const force_probe_fragment_ui = init.minimal.environ.containsUnempty(allocator, "PS5_PROBE_FRAGMENT_UI") catch false;
     const skip_compute_dispatches = init.minimal.environ.containsUnempty(allocator, "PS5_SKIP_COMPUTE") catch false;
+    const sparse_graphics_draws = init.minimal.environ.containsUnempty(allocator, "PS5_SPARSE_GRAPHICS") catch false;
     const translate_compute_only = init.minimal.environ.containsUnempty(allocator, "PS5_COMPUTE_TRANSLATE_ONLY") catch false;
     const prefer_integrated_gpu = init.minimal.environ.containsUnempty(allocator, "PS5_VULKAN_PREFER_INTEGRATED") catch false;
     const dump_compute_spirv = init.minimal.environ.containsUnempty(allocator, "PS5_DUMP_COMPUTE_SPIRV") catch false;
@@ -510,6 +530,7 @@ fn run(init: std.process.Init) !bool {
             .force_probe_fragment_parameter = force_probe_fragment_parameter,
             .force_probe_fragment_ui = force_probe_fragment_ui,
             .skip_compute_dispatches = skip_compute_dispatches,
+            .sparse_graphics_draws = sparse_graphics_draws,
             .translate_compute_only = translate_compute_only,
             .prefer_integrated_gpu = prefer_integrated_gpu,
             .dump_compute_spirv = dump_compute_spirv,
