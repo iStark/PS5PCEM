@@ -1672,9 +1672,15 @@ const FrameProfile = struct {
     shader_analysis_hits: u64 = 0,
     shader_analysis_misses: u64 = 0,
     shader_analysis_ns: u64 = 0,
+    shader_validation_ns: u64 = 0,
     scalar_provenance_ns: u64 = 0,
     shader_translate_ns: u64 = 0,
     graphics_resource_ns: u64 = 0,
+    graphics_storage_ns: u64 = 0,
+    graphics_setup_ns: u64 = 0,
+    graphics_pipeline_lookup_ns: u64 = 0,
+    graphics_scalar_upload_ns: u64 = 0,
+    graphics_record_ns: u64 = 0,
     sampled_stage_ns: u64 = 0,
     sampled_flush_ns: u64 = 0,
     sampled_generation_ns: u64 = 0,
@@ -1724,6 +1730,7 @@ const PreparedSampledImage = struct {
     image: OwnedImage,
     view: vk.ImageView,
     sampler: vk.Sampler,
+    descriptor_layout: u32 = vk.image_layout_shader_read_only_optimal,
     owns_view: bool = false,
     owns_sampler: bool = false,
     storage_cache_index: ?usize = null,
@@ -1924,6 +1931,7 @@ const GraphicsResources = struct {
         for (self.images[0..self.image_count]) |image| {
             if (image.owns_view) renderer.destroyImageView(image.view);
             if (image.owns_sampler) renderer.destroySampler(image.sampler);
+            if (image.storage_cache_index) |cache_index| renderer.releaseStorageImage(cache_index);
         }
         self.* = undefined;
     }
@@ -5513,6 +5521,37 @@ pub const Renderer = struct {
             result.sizes[descriptor_index] = size;
         }
 
+        // Resource descriptors are often loaded into the same SGPR window at
+        // several points in a shader. Capture all instruction-local states in
+        // one scalar execution instead of replaying the whole prolog for every
+        // MUBUF/MIMG instruction (quadratic on large Unreal shaders).
+        var scalar_checkpoint_count: usize = 0;
+        for (instructions) |inst| {
+            if (needsResourceScalarCheckpoint(inst)) scalar_checkpoint_count += 1;
+        }
+        const scalar_checkpoint_pcs = try self.allocator.alloc(u32, scalar_checkpoint_count);
+        defer self.allocator.free(scalar_checkpoint_pcs);
+        const scalar_checkpoint_registers = try self.allocator.alloc(
+            gpu.scalar_provenance.ScalarRegisters,
+            scalar_checkpoint_count,
+        );
+        defer self.allocator.free(scalar_checkpoint_registers);
+        var scalar_checkpoint_index: usize = 0;
+        for (instructions) |inst| {
+            if (!needsResourceScalarCheckpoint(inst)) continue;
+            scalar_checkpoint_pcs[scalar_checkpoint_index] = inst.pc;
+            scalar_checkpoint_index += 1;
+        }
+        if (scalar_checkpoint_count != 0) {
+            _ = gpu.scalar_provenance.evaluateDecodedResourceStateAtCheckpoints(
+                reader,
+                bindings,
+                instructions,
+                scalar_checkpoint_pcs,
+                scalar_checkpoint_registers,
+            );
+        }
+
         for (instructions) |inst| {
             const is_store = switch (inst.opcode) {
                 .buffer_load_ubyte,
@@ -5577,12 +5616,13 @@ pub const Renderer = struct {
             // reuse the same SGPR quartet for several SMEM-loaded V# values;
             // a final whole-program snapshot (or the first mapping for that
             // SGPR) is not authoritative for a later MUBUF operation.
-            const instruction_scalar = gpu.scalar_provenance.evaluateDecodedResourceStateUntil(
-                reader,
-                bindings,
-                instructions,
-                inst.pc,
-            );
+            const instruction_scalar = gpu.ScalarEvaluation{
+                .registers = scalarRegistersAtCheckpoint(
+                    scalar_checkpoint_pcs,
+                    scalar_checkpoint_registers,
+                    inst.pc,
+                ).*,
+            };
             // The instruction-local scalar state is authoritative. Attribute
             // tables are ordered by semantic/location, while shader fetches
             // are free to consume those attributes in a different order. In
@@ -5761,12 +5801,13 @@ pub const Renderer = struct {
             // instruction; using the entry snapshot bound late destinations
             // to an unrelated fallback slot (notably a 2D image for a 3D
             // image_store in large volume-processing kernels).
-            const image_scalar = gpu.scalar_provenance.evaluateDecodedResourceStateUntil(
-                reader,
-                bindings,
-                instructions,
-                inst.pc,
-            );
+            const image_scalar = gpu.ScalarEvaluation{
+                .registers = scalarRegistersAtCheckpoint(
+                    scalar_checkpoint_pcs,
+                    scalar_checkpoint_registers,
+                    inst.pc,
+                ).*,
+            };
             const descriptor = (try resolveComputeImageDescriptor(
                 bindings,
                 reader,
@@ -5923,12 +5964,13 @@ pub const Renderer = struct {
             }
 
             const descriptor_slot = result.sampled_image_mapping_count;
-            const sampled_scalar = gpu.scalar_provenance.evaluateDecodedResourceStateUntil(
-                reader,
-                bindings,
-                instructions,
-                inst.pc,
-            );
+            const sampled_scalar = gpu.ScalarEvaluation{
+                .registers = scalarRegistersAtCheckpoint(
+                    scalar_checkpoint_pcs,
+                    scalar_checkpoint_registers,
+                    inst.pc,
+                ).*,
+            };
             const image_descriptor = (try resolveComputeSampledImageDescriptor(
                 bindings,
                 reader,
@@ -6007,6 +6049,10 @@ pub const Renderer = struct {
             };
             result.sampled_image_mapping_count += 1;
         }
+        self.updateSampledImageDescriptors(
+            result.sampled_images[0..result.sampled_image_count],
+            result.sampled_image_mappings[0..result.sampled_image_mapping_count],
+        );
         return result;
     }
 
@@ -6889,7 +6935,10 @@ pub const Renderer = struct {
         var stale_index: ?usize = null;
         for (self.analyzed_programs.items, 0..) |*entry, index| {
             if (entry.address != address) continue;
-            if (programWordsMatch(reader, address, entry.analysis.code.items)) {
+            const validation_started = hostTimestampNs();
+            const matches = programWordsMatch(reader, address, entry.analysis.code.items);
+            self.frame_profile.shader_validation_ns +|= elapsedHostNanoseconds(validation_started);
+            if (matches) {
                 entry.last_used_sequence = self.analyzed_program_sequence;
                 self.frame_profile.shader_analysis_hits += 1;
                 return &entry.analysis;
@@ -7770,7 +7819,6 @@ pub const Renderer = struct {
         descriptor: gpu.resources.ImageDescriptor,
         sampler_descriptor: gpu.resources.SamplerDescriptor,
         image_format: u32,
-        descriptor_index: u32,
         dimension: rdna2.spirv.SampledImageDimension,
     ) anyerror!?PreparedSampledImage {
         const index = self.findResidentRenderTargetIndex(descriptor, image_format) orelse return null;
@@ -7785,7 +7833,6 @@ pub const Renderer = struct {
             vk.image_aspect_color_bit,
         );
         const sampler = try self.residentSampler(sampler_descriptor);
-        self.updateSampledImageDescriptor(descriptor_index, view, sampler, dimension);
         if (!self.reported_resident_rt_sample) {
             self.reported_resident_rt_sample = true;
             std.debug.print(
@@ -7831,7 +7878,6 @@ pub const Renderer = struct {
         descriptor: gpu.resources.ImageDescriptor,
         sampler_descriptor: gpu.resources.SamplerDescriptor,
         image_format: u32,
-        descriptor_index: u32,
     ) anyerror!?PreparedSampledImage {
         if (descriptor.tile_mode != .depth) return null;
         for (self.depth_targets.items, 0..) |cached, index| {
@@ -7853,7 +7899,6 @@ pub const Renderer = struct {
                 vk.image_aspect_depth_bit,
             );
             const sampler = try self.residentSampler(sampler_descriptor);
-            self.updateSampledImageDescriptor(descriptor_index, view, sampler, .two_d);
             return .{
                 .image = cached.image,
                 .view = view,
@@ -8792,6 +8837,7 @@ pub const Renderer = struct {
         bind_graphics_descriptors: bool,
         draw: GuestDraw,
     ) anyerror!void {
+        const setup_started = hostTimestampNs();
         const pinned_sequence = std.math.maxInt(u64);
         const target_index = try self.acquireRenderTarget(target);
         try self.transitionRenderTargetToColorAttachment(target_index);
@@ -8940,14 +8986,20 @@ pub const Renderer = struct {
             pass.framebuffer
         else
             cached_snapshot.framebuffer;
+        self.frame_profile.graphics_setup_ns +|= elapsedHostNanoseconds(setup_started);
+        const pipeline_lookup_started = hostTimestampNs();
         const pipeline = try self.getGraphicsPipeline(
             pass_handle,
             pipeline_state,
             vertex_words,
             fragment_words,
         );
+        self.frame_profile.graphics_pipeline_lookup_ns +|= elapsedHostNanoseconds(pipeline_lookup_started);
+        const scalar_upload_started = hostTimestampNs();
         try self.writeGraphicsScalarValues(vertex_scalars, fragment_scalars);
+        self.frame_profile.graphics_scalar_upload_ns +|= elapsedHostNanoseconds(scalar_upload_started);
         if (report_checkpoints) std.debug.print("[vulkan dcb] first graphics draw: pipeline ready\n", .{});
+        const record_started = hostTimestampNs();
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
 
@@ -9086,6 +9138,7 @@ pub const Renderer = struct {
         }
         self.device_functions.cmd_end_render_pass(command_buffer);
         try self.submitOneShot(command_buffer);
+        self.frame_profile.graphics_record_ns +|= elapsedHostNanoseconds(record_started);
         if (report_checkpoints) {
             std.debug.print("[vulkan dcb] first graphics draw: submitted\n", .{});
             self.reported_first_graphics_draw_checkpoints = true;
@@ -10184,6 +10237,10 @@ pub const Renderer = struct {
             reader,
             vertex_analysis,
         );
+        self.updateSampledImageDescriptors(
+            graphics_resources.images[0..graphics_resources.image_count],
+            graphics_resources.mappings[0..graphics_resources.mapping_count],
+        );
         self.frame_profile.graphics_resource_ns +|= elapsedHostNanoseconds(resource_started);
         if (self.traceCurrentGraphicsFrame()) {
             for (graphics_resources.mappings[0..graphics_resources.mapping_count]) |mapping| {
@@ -10285,6 +10342,7 @@ pub const Renderer = struct {
         // Attribute / constant buffer MUBUF in the vertex program needs the
         // same storage-descriptor array as compute. Missing V#s are non-fatal:
         // translate without storage and skip MUBUF rather than abort the draw.
+        const vertex_storage_started = hostTimestampNs();
         var vertex_storage = self.prepareComputeResources(
             &vertex_bindings,
             reader,
@@ -10300,6 +10358,7 @@ pub const Renderer = struct {
             );
             break :blk ComputeResources{};
         };
+        self.frame_profile.graphics_storage_ns +|= elapsedHostNanoseconds(vertex_storage_started);
         defer vertex_storage.deinit(self);
         validateVertexIndexMappings(reader, &vertex_storage, draw);
         // V# payloads are runtime descriptor data, not shader constants.  The
@@ -10619,6 +10678,7 @@ pub const Renderer = struct {
         // well as sampled images.  Keep their descriptor slots disjoint from
         // the vertex resources already staged for this draw.
         var fragment_scalar_mut = fragment_scalar;
+        const fragment_storage_started = hostTimestampNs();
         var fragment_storage = self.prepareComputeResources(
             &fragment_bindings,
             reader,
@@ -10634,6 +10694,7 @@ pub const Renderer = struct {
             );
             break :blk ComputeResources{};
         };
+        self.frame_profile.graphics_storage_ns +|= elapsedHostNanoseconds(fragment_storage_started);
         defer fragment_storage.deinit(self);
         // Unity PS loads color scales and matrices through s_buffer. Identity
         // constants are only a fallback for a genuinely missing V#: once the
@@ -11814,7 +11875,35 @@ pub const Renderer = struct {
         analysis: *const gpu.ShaderAnalysis,
     ) anyerror!void {
         const stage_mapping_start = result.mapping_count;
-        for (analysis.program.instructions.items) |inst| {
+        const instructions = analysis.program.instructions.items;
+        var scalar_checkpoint_count: usize = 0;
+        for (instructions) |inst| {
+            if (needsSampledScalarCheckpoint(inst)) scalar_checkpoint_count += 1;
+        }
+        const scalar_checkpoint_pcs = try self.allocator.alloc(u32, scalar_checkpoint_count);
+        defer self.allocator.free(scalar_checkpoint_pcs);
+        const scalar_checkpoint_registers = try self.allocator.alloc(
+            gpu.scalar_provenance.ScalarRegisters,
+            scalar_checkpoint_count,
+        );
+        defer self.allocator.free(scalar_checkpoint_registers);
+        var scalar_checkpoint_index: usize = 0;
+        for (instructions) |inst| {
+            if (!needsSampledScalarCheckpoint(inst)) continue;
+            scalar_checkpoint_pcs[scalar_checkpoint_index] = inst.pc;
+            scalar_checkpoint_index += 1;
+        }
+        if (scalar_checkpoint_count != 0) {
+            _ = gpu.scalar_provenance.evaluateDecodedResourceStateAtCheckpoints(
+                reader,
+                bindings,
+                instructions,
+                scalar_checkpoint_pcs,
+                scalar_checkpoint_registers,
+            );
+        }
+
+        for (instructions) |inst| {
             const image_fetch = inst.opcode == .image_load;
             if (!image_fetch and inst.opcode != .image_sample and inst.opcode != .image_gather4) continue;
             if (inst.src1.kind != .sgpr or inst.src2.kind != .sgpr) {
@@ -11851,12 +11940,13 @@ pub const Renderer = struct {
             // compute programs. Recover the state at this particular sample;
             // the fallback slots still cover shaders that reference only SRT
             // metadata and have no executable scalar producer.
-            const sampled_scalar = gpu.scalar_provenance.evaluateDecodedResourceStateUntil(
-                reader,
-                bindings,
-                analysis.program.instructions.items,
-                inst.pc,
-            );
+            const sampled_scalar = gpu.ScalarEvaluation{
+                .registers = scalarRegistersAtCheckpoint(
+                    scalar_checkpoint_pcs,
+                    scalar_checkpoint_registers,
+                    inst.pc,
+                ).*,
+            };
             const image_descriptor = (try resolveComputeSampledImageDescriptor(
                 bindings,
                 reader,
@@ -12107,50 +12197,49 @@ pub const Renderer = struct {
         try self.readMappedAt(buffer, slot * gds_slot_bytes, self.gds_storage.items);
     }
 
-    fn updateSampledImageDescriptor(
+    /// Publish all sampled-image bindings for one draw/dispatch in a single
+    /// driver call. Unity commonly binds six or more images per draw; issuing
+    /// one vkUpdateDescriptorSets call for every binding made descriptor setup
+    /// the largest CPU cost in a Tetris frame even when every texture hit its
+    /// resident cache.
+    fn updateSampledImageDescriptors(
         self: *Renderer,
-        descriptor_index: u32,
-        view: vk.ImageView,
-        sampler: vk.Sampler,
-        dimension: rdna2.spirv.SampledImageDimension,
+        images: []const PreparedSampledImage,
+        mappings: []const gpu.ShaderSpirvSampledImageBinding,
     ) void {
-        self.updateSampledImageDescriptorLayout(
-            descriptor_index,
-            view,
-            sampler,
-            dimension,
-            vk.image_layout_shader_read_only_optimal,
+        std.debug.assert(images.len == mappings.len);
+        std.debug.assert(images.len <= maximum_storage_descriptors);
+        if (images.len == 0) return;
+        var image_infos: [maximum_storage_descriptors]vk.DescriptorImageInfo = undefined;
+        var writes: [maximum_storage_descriptors]vk.WriteDescriptorSet = undefined;
+        for (images, mappings, 0..) |prepared, mapping, index| {
+            image_infos[index] = .{
+                .sampler = prepared.sampler,
+                .image_view = prepared.view,
+                .image_layout = prepared.descriptor_layout,
+            };
+            writes[index] = .{
+                .destination_set = self.descriptor_set,
+                .destination_binding = switch (mapping.dimension) {
+                    .two_d => rdna2.spirv.sampled_image_2d_descriptor_binding,
+                    .three_d => sampled_image_3d_descriptor_binding,
+                    .cube => sampled_image_cube_descriptor_binding,
+                    .two_d_array => sampled_image_2d_array_descriptor_binding,
+                },
+                .destination_array_element = mapping.descriptor_index,
+                .descriptor_count = 1,
+                .descriptor_type = vk.descriptor_type_combined_image_sampler,
+                .image_info = @ptrCast(&image_infos[index]),
+                .buffer_info = null,
+            };
+        }
+        self.device_functions.update_descriptor_sets(
+            self.device,
+            @intCast(images.len),
+            @ptrCast(&writes),
+            0,
+            null,
         );
-    }
-
-    fn updateSampledImageDescriptorLayout(
-        self: *Renderer,
-        descriptor_index: u32,
-        view: vk.ImageView,
-        sampler: vk.Sampler,
-        dimension: rdna2.spirv.SampledImageDimension,
-        image_layout: u32,
-    ) void {
-        const image_info = vk.DescriptorImageInfo{
-            .sampler = sampler,
-            .image_view = view,
-            .image_layout = image_layout,
-        };
-        const write = vk.WriteDescriptorSet{
-            .destination_set = self.descriptor_set,
-            .destination_binding = switch (dimension) {
-                .two_d => rdna2.spirv.sampled_image_2d_descriptor_binding,
-                .three_d => sampled_image_3d_descriptor_binding,
-                .cube => sampled_image_cube_descriptor_binding,
-                .two_d_array => sampled_image_2d_array_descriptor_binding,
-            },
-            .destination_array_element = descriptor_index,
-            .descriptor_count = 1,
-            .descriptor_type = vk.descriptor_type_combined_image_sampler,
-            .image_info = @ptrCast(&image_info),
-            .buffer_info = null,
-        };
-        self.device_functions.update_descriptor_sets(self.device, 1, @ptrCast(&write), 0, null);
         self.active_descriptor_set = self.descriptor_set;
     }
 
@@ -12701,7 +12790,6 @@ pub const Renderer = struct {
         descriptor: gpu.resources.ImageDescriptor,
         sampler_descriptor: gpu.resources.SamplerDescriptor,
         image_format: u32,
-        descriptor_index: u32,
         dimension: rdna2.spirv.SampledImageDimension,
     ) anyerror!?PreparedSampledImage {
         if (dimension != .two_d and dimension != .three_d) return null;
@@ -12728,17 +12816,11 @@ pub const Renderer = struct {
             cached.in_use = true;
             cached.last_used_sequence = self.storage_image_sequence;
             self.frame_profile.resident_storage_bytes +%= cached.staging_bytes;
-            self.updateSampledImageDescriptorLayout(
-                descriptor_index,
-                view,
-                sampler,
-                dimension,
-                vk.image_layout_general,
-            );
             return .{
                 .image = cached.image,
                 .view = view,
                 .sampler = sampler,
+                .descriptor_layout = vk.image_layout_general,
                 .owns_view = false,
                 .owns_sampler = false,
                 .storage_cache_index = index,
@@ -12751,7 +12833,7 @@ pub const Renderer = struct {
         self: *Renderer,
         descriptor: gpu.resources.ImageDescriptor,
         sampler_descriptor: gpu.resources.SamplerDescriptor,
-        descriptor_index: u32,
+        trace_descriptor_index: u32,
         dimension: rdna2.spirv.SampledImageDimension,
     ) anyerror!PreparedSampledImage {
         const image_format = sampledImageFormat(
@@ -12783,7 +12865,6 @@ pub const Renderer = struct {
             descriptor,
             sampler_descriptor,
             image_format,
-            descriptor_index,
             dimension,
         )) |resident| {
             return resident;
@@ -12797,7 +12878,6 @@ pub const Renderer = struct {
                 descriptor,
                 sampler_descriptor,
                 image_format,
-                descriptor_index,
                 dimension,
             )) |resident| {
                 return resident;
@@ -12817,7 +12897,6 @@ pub const Renderer = struct {
                 descriptor,
                 sampler_descriptor,
                 image_format,
-                descriptor_index,
             )) |resident| {
                 return resident;
             }
@@ -12927,7 +13006,6 @@ pub const Renderer = struct {
             item.last_used_frame = self.frame_sequence;
             self.texture_cache_hits += 1;
             self.frame_profile.texture_hits +|= 1;
-            self.updateSampledImageDescriptor(descriptor_index, item.view, item.sampler, dimension);
             return .{ .image = item.image, .view = item.view, .sampler = item.sampler };
         }
 
@@ -13001,7 +13079,6 @@ pub const Renderer = struct {
             if (self.texture_cache_hits == 1) {
                 std.debug.print("[vulkan dcb] texture cache hit: first time! addr=0x{x} hash={x}\n", .{ descriptor.address, content_hash });
             }
-            self.updateSampledImageDescriptor(descriptor_index, item.view, item.sampler, dimension);
             return .{ .image = item.image, .view = item.view, .sampler = item.sampler };
         }
         self.texture_cache_misses += 1;
@@ -13076,7 +13153,7 @@ pub const Renderer = struct {
             const trace_path = std.fmt.bufPrintZ(
                 &trace_path_buffer,
                 "out\\trace-frame-{d:0>4}-draw-{d}-sample-{d}.ppm",
-                .{ self.flip_callbacks + 1, self.frame_profile.draws, descriptor_index },
+                .{ self.flip_callbacks + 1, self.frame_profile.draws, trace_descriptor_index },
             ) catch null;
             if (trace_path) |path| dumpFramePpm(path.ptr, descriptor.width, descriptor.height, linear);
         }
@@ -13335,7 +13412,6 @@ pub const Renderer = struct {
         errdefer self.destroyImageView(view);
         const sampler = try self.createGuestSampler(sampler_descriptor);
         errdefer self.destroySampler(sampler);
-        self.updateSampledImageDescriptor(descriptor_index, view, sampler, dimension);
         self.sampled_image_uploads += 1;
 
         // A streamed/video texture keeps one allocation per guest surface, not
@@ -14944,6 +15020,18 @@ pub const Renderer = struct {
                     profile.texture_probe_ns / std.time.ns_per_ms,
                     profile.render_target_create_ns / std.time.ns_per_ms,
                     profile.depth_target_create_ns / std.time.ns_per_ms,
+                },
+            );
+            std.debug.print(
+                "[gpu draw] flip={d} shader_check_ms={d} storage_ms={d} setup_ms={d} pipeline_lookup_ms={d} scalar_upload_ms={d} record_ms={d}\n",
+                .{
+                    self.flip_callbacks,
+                    profile.shader_validation_ns / std.time.ns_per_ms,
+                    profile.graphics_storage_ns / std.time.ns_per_ms,
+                    profile.graphics_setup_ns / std.time.ns_per_ms,
+                    profile.graphics_pipeline_lookup_ns / std.time.ns_per_ms,
+                    profile.graphics_scalar_upload_ns / std.time.ns_per_ms,
+                    profile.graphics_record_ns / std.time.ns_per_ms,
                 },
             );
         }
@@ -18459,6 +18547,86 @@ fn inlineSamplerDescriptorOrNull(
     sampler_sgpr: u32,
 ) anyerror!?gpu.resources.SamplerDescriptor {
     return try bindings.inlineSamplerDescriptor(sampler_sgpr);
+}
+
+fn needsResourceScalarCheckpoint(inst: gpu.ShaderInstruction) bool {
+    return switch (inst.opcode) {
+        .buffer_load_ubyte,
+        .buffer_load_sbyte,
+        .buffer_load_ushort,
+        .buffer_load_sshort,
+        .buffer_load_dword,
+        .buffer_load_dwordx2,
+        .buffer_load_dwordx3,
+        .buffer_load_dwordx4,
+        .buffer_load_format_x,
+        .buffer_load_format_xy,
+        .buffer_load_format_xyz,
+        .buffer_load_format_xyzw,
+        .s_buffer_load_dword,
+        .s_buffer_load_dwordx2,
+        .s_buffer_load_dwordx4,
+        .s_buffer_load_dwordx8,
+        .s_buffer_load_dwordx16,
+        .buffer_store_byte,
+        .buffer_store_short,
+        .buffer_store_dword,
+        .buffer_store_dwordx2,
+        .buffer_store_dwordx3,
+        .buffer_store_dwordx4,
+        .buffer_store_format_x,
+        .buffer_store_format_xy,
+        .buffer_store_format_xyz,
+        .buffer_store_format_xyzw,
+        .buffer_atomic_swap,
+        .buffer_atomic_add,
+        .buffer_atomic_sub,
+        .buffer_atomic_smin,
+        .buffer_atomic_umin,
+        .buffer_atomic_smax,
+        .buffer_atomic_umax,
+        .buffer_atomic_and,
+        .buffer_atomic_or,
+        .buffer_atomic_xor,
+        .image_load,
+        .image_store,
+        .image_atomic_add,
+        .image_atomic_umin,
+        .image_atomic_umax,
+        .image_atomic_and,
+        .image_atomic_or,
+        .image_atomic_xor,
+        .image_sample,
+        .image_gather4,
+        => true,
+        else => false,
+    };
+}
+
+fn needsSampledScalarCheckpoint(inst: gpu.ShaderInstruction) bool {
+    return inst.opcode == .image_load or
+        inst.opcode == .image_sample or
+        inst.opcode == .image_gather4;
+}
+
+fn scalarRegistersAtCheckpoint(
+    pcs: []const u32,
+    snapshots: []const gpu.scalar_provenance.ScalarRegisters,
+    pc: u32,
+) *const gpu.scalar_provenance.ScalarRegisters {
+    std.debug.assert(pcs.len == snapshots.len);
+    var low: usize = 0;
+    var high = pcs.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        if (pcs[middle] < pc) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    std.debug.assert(low < pcs.len and pcs[low] == pc);
+    return &snapshots[low];
 }
 
 fn resolveComputeSampledImageDescriptor(

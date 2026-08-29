@@ -40,6 +40,8 @@ pub const ScalarValue = struct {
     producer_pc: u32 = 0,
 };
 
+pub const ScalarRegisters = [maximum_scalar_registers]ScalarValue;
+
 pub const ScalarLoad = struct {
     pc: u32,
     address: u64,
@@ -65,7 +67,7 @@ pub const StopReason = enum {
 };
 
 pub const Evaluation = struct {
-    registers: [maximum_scalar_registers]ScalarValue = [_]ScalarValue{.{}} ** maximum_scalar_registers,
+    registers: ScalarRegisters = [_]ScalarValue{.{}} ** maximum_scalar_registers,
     loads: [maximum_loads]ScalarLoad = undefined,
     load_count: usize = 0,
     instruction_count: u32 = 0,
@@ -83,7 +85,7 @@ pub const Evaluation = struct {
 };
 
 pub fn evaluatePrefix(reader: shaders.MemoryReader, bindings: *const shaders.StageBindings) Evaluation {
-    return evaluate(reader, bindings, null, false, null);
+    return evaluate(reader, bindings, null, false, null, null);
 }
 
 /// Evaluates scalar resource setup past lane-mask branches. EXEC/VCC branches
@@ -92,7 +94,7 @@ pub fn evaluatePrefix(reader: shaders.MemoryReader, bindings: *const shaders.Sta
 /// path. Following that path recovers late V#/T# loads without changing the
 /// strict prefix evaluator used for shader specialization.
 pub fn evaluateResourceState(reader: shaders.MemoryReader, bindings: *const shaders.StageBindings) Evaluation {
-    return evaluate(reader, bindings, null, true, null);
+    return evaluate(reader, bindings, null, true, null, null);
 }
 
 /// Evaluates resource state using a shader which the backend has already
@@ -103,7 +105,46 @@ pub fn evaluateDecodedResourceState(
     bindings: *const shaders.StageBindings,
     instructions: []const rdna2.Instruction,
 ) Evaluation {
-    return evaluate(reader, bindings, null, true, instructions);
+    return evaluate(reader, bindings, null, true, instructions, null);
+}
+
+const RegisterCheckpointCollector = struct {
+    pcs: []const u32,
+    snapshots: []ScalarRegisters,
+    next: usize = 0,
+
+    fn captureBefore(self: *RegisterCheckpointCollector, evaluation: *const Evaluation, pc: u32) void {
+        while (self.next < self.pcs.len and self.pcs[self.next] <= pc) : (self.next += 1) {
+            self.snapshots[self.next] = evaluation.registers;
+        }
+    }
+
+    fn finish(self: *RegisterCheckpointCollector, evaluation: *const Evaluation) void {
+        while (self.next < self.pcs.len) : (self.next += 1) {
+            self.snapshots[self.next] = evaluation.registers;
+        }
+    }
+};
+
+/// Evaluates one decoded scalar program and captures its register state before
+/// every requested resource instruction. `checkpoint_pcs` must be sorted.
+/// This replaces the former O(resources * instructions) draw-time walk with a
+/// single pass while preserving SGPR reuse between descriptor loads.
+pub fn evaluateDecodedResourceStateAtCheckpoints(
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    instructions: []const rdna2.Instruction,
+    checkpoint_pcs: []const u32,
+    snapshots: []ScalarRegisters,
+) Evaluation {
+    std.debug.assert(checkpoint_pcs.len == snapshots.len);
+    var collector = RegisterCheckpointCollector{
+        .pcs = checkpoint_pcs,
+        .snapshots = snapshots,
+    };
+    const result = evaluate(reader, bindings, null, true, instructions, &collector);
+    collector.finish(&result);
+    return result;
 }
 
 /// Recovers descriptor state immediately before one vector-memory instruction.
@@ -114,7 +155,7 @@ pub fn evaluateResourceStateUntil(
     bindings: *const shaders.StageBindings,
     end_pc: u32,
 ) Evaluation {
-    return evaluate(reader, bindings, end_pc, true, null);
+    return evaluate(reader, bindings, end_pc, true, null, null);
 }
 
 /// Recovers descriptor state before one instruction, from a shader the backend
@@ -131,7 +172,7 @@ pub fn evaluateDecodedResourceStateUntil(
     instructions: []const rdna2.Instruction,
     end_pc: u32,
 ) Evaluation {
-    return evaluate(reader, bindings, end_pc, true, instructions);
+    return evaluate(reader, bindings, end_pc, true, instructions, null);
 }
 
 /// Evaluates only the straight scalar region ending before `end_pc`. This is
@@ -142,7 +183,7 @@ pub fn evaluatePrefixUntil(
     bindings: *const shaders.StageBindings,
     end_pc: u32,
 ) Evaluation {
-    return evaluate(reader, bindings, end_pc, false, null);
+    return evaluate(reader, bindings, end_pc, false, null, null);
 }
 
 fn evaluate(
@@ -151,6 +192,7 @@ fn evaluate(
     end_pc: ?u32,
     follow_lane_mask_fallthrough: bool,
     decoded_instructions: ?[]const rdna2.Instruction,
+    checkpoint_collector: ?*RegisterCheckpointCollector,
 ) Evaluation {
     var result = Evaluation{};
     const scalar_base: usize = bindings.scalar_user_data_base;
@@ -171,6 +213,7 @@ fn evaluate(
     var setpc_follows: u8 = 0;
     while (result.instruction_count < maximum_instructions) {
         result.stop_pc = pc;
+        if (checkpoint_collector) |collector| collector.captureBefore(&result, pc);
         if (end_pc) |end| {
             if (pc >= end) {
                 result.stop_reason = .prefix_complete;
@@ -923,6 +966,47 @@ test "bounded scalar prefix does not observe later shader writes" {
     try std.testing.expectEqual(StopReason.prefix_complete, result.stop_reason);
     try std.testing.expectEqual(@as(u32, 1), result.register(2).?.value);
     try std.testing.expectEqual(@as(u32, 4), result.stop_pc);
+}
+
+test "one-pass resource checkpoints preserve instruction-local SGPR state" {
+    var storage = [_]u8{0} ** 0x20;
+    var memory = TestMemory{ .base = 0x3800, .bytes = &storage };
+    const instructions = [_]rdna2.Instruction{
+        .{
+            .pc = 0,
+            .opcode = .s_mov_b32,
+            .dst = .{ .kind = .sgpr, .reg = 2 },
+            .src0 = .{ .kind = .integer_inline_constant, .value = 1 },
+            .src_count = 1,
+            .word_count = 1,
+        },
+        .{
+            .pc = 4,
+            .opcode = .s_mov_b32,
+            .dst = .{ .kind = .sgpr, .reg = 2 },
+            .src0 = .{ .kind = .integer_inline_constant, .value = 2 },
+            .src_count = 1,
+            .word_count = 1,
+        },
+        .{ .pc = 8, .opcode = .s_endpgm, .word_count = 1 },
+    };
+    const bindings = testBindings(0x3800, 0x1234);
+    const checkpoint_pcs = [_]u32{ 4, 8 };
+    var snapshots: [checkpoint_pcs.len]ScalarRegisters = undefined;
+    _ = evaluateDecodedResourceStateAtCheckpoints(
+        memory.reader(),
+        &bindings,
+        &instructions,
+        &checkpoint_pcs,
+        &snapshots,
+    );
+
+    try std.testing.expectEqual(@as(u32, 1), snapshots[0][2].value);
+    try std.testing.expectEqual(@as(u32, 2), snapshots[1][2].value);
+    const first = evaluateDecodedResourceStateUntil(memory.reader(), &bindings, &instructions, 4);
+    const second = evaluateDecodedResourceStateUntil(memory.reader(), &bindings, &instructions, 8);
+    try std.testing.expectEqual(first.registers[2], snapshots[0][2]);
+    try std.testing.expectEqual(second.registers[2], snapshots[1][2]);
 }
 
 test "resource evaluation follows the active-lane branch path" {
