@@ -1195,13 +1195,27 @@ pub fn scePthreadCreate(
     const entry_point = if (entry) |pointer| @intFromPtr(pointer) else 0;
     const argument_value = if (argument) |pointer| @intFromPtr(pointer) else 0;
     const active_manager = activeManager() orelse return KernelError.enosys.raw();
+    const attributes = selectedAttr(attr);
     active_manager.create(
         output,
-        selectedAttr(attr),
+        attributes,
         entry_point,
         argument_value,
         cName(name),
-    ) catch |err| return kernelStatus(err);
+    ) catch |err| {
+        std.debug.print(
+            "[pthread] create failed: {s} entry=0x{x} stack=0x{x}+0x{x} guard=0x{x} name={s}\n",
+            .{
+                @errorName(err),
+                entry_point,
+                attributes.stack_address,
+                attributes.stack_size,
+                attributes.guard_size,
+                cName(name),
+            },
+        );
+        return kernelStatus(err);
+    };
     return errno.ok;
 }
 

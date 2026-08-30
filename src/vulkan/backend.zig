@@ -2647,6 +2647,10 @@ pub const Renderer = struct {
     graphics_probe_enabled: bool,
     capture_first_graphics_frame: bool,
     trace_graphics_frame: ?u64,
+    /// `PS5_TRACE_GRAPHICS_FRAME=0` arms a one-shot trace 120 flips after the
+    /// first fullscreen planar-video pass. The first composite is known-good;
+    /// the delayed trace catches the menu/logo update which corrupts it later.
+    auto_trace_graphics_frame: ?u64 = null,
     force_probe_fragment: bool,
     force_probe_fragment_texture: bool,
     force_probe_fragment_parameter: bool,
@@ -2735,6 +2739,7 @@ pub const Renderer = struct {
     reported_resident_rt_sample: bool = false,
     reported_tone_map_fallback: bool = false,
     reported_ui_composite: bool = false,
+    reported_rgb10_menu_postprocess_fallback: bool = false,
     htile_targets: std.ArrayList(CachedHtileTarget) = .empty,
     htile_target_sequence: u64 = 0,
     latest_render_target_index: ?usize = null,
@@ -2835,7 +2840,11 @@ pub const Renderer = struct {
 
     fn traceCurrentGraphicsFrame(self: *const Renderer) bool {
         const requested = self.trace_graphics_frame orelse return false;
-        return self.flip_callbacks +% 1 == requested;
+        const target = if (requested == 0)
+            self.auto_trace_graphics_frame orelse return false
+        else
+            requested;
+        return self.flip_callbacks +% 1 == target;
     }
 
     pub fn init(allocator: std.mem.Allocator, options: Options) (Error || std.mem.Allocator.Error)!Renderer {
@@ -10705,6 +10714,13 @@ pub const Renderer = struct {
                 self.reported_planar_video_pass = true;
             }
             if (video.fills_target) {
+                if (self.trace_graphics_frame == 0 and self.auto_trace_graphics_frame == null) {
+                    self.auto_trace_graphics_frame = self.flip_callbacks +% 121;
+                    std.debug.print(
+                        "[vulkan dcb] armed delayed video/UI composite trace at flip {d}\n",
+                        .{self.auto_trace_graphics_frame.?},
+                    );
+                }
                 self.markVideoSurface(target.descriptor.address);
                 self.video_surface_last_flip = self.flip_callbacks;
                 // Fullscreen decoder planes use a procedural rectangle. An
@@ -10743,6 +10759,49 @@ pub const Renderer = struct {
         const fullscreen_corner = vertex_stage == .export_shader and
             render_state.primitive_type == 4 and
             isFullscreenCornerTriangle(reader, &vertex_storage, draw);
+        if (self.traceCurrentGraphicsFrame() and fragment_image_count == 1 and
+            graphics_resources.descriptors[0].unified_format == 50 and
+            target.format.vulkan == vk.format_a2b10g10r10_unorm_pack32 and
+            hasFullscreenSampleBlitGeometry(draw))
+        {
+            std.debug.print(
+                "[vulkan dcb] traced 10-bit fullscreen PS=0x{x} instructions={d}\n",
+                .{ fragment_address, fragment_analysis.program.instructions.items.len },
+            );
+            dumpShaderHead(fragment_analysis, 96);
+        }
+        // REANIMAL applies two multi-tap blur passes and one final curve pass
+        // to the already complete 10-bit menu image. Their guest full-screen
+        // vertex program currently collapses the quad into a magnified strip,
+        // destroying the correctly rendered video, logo and UI underneath.
+        // Preserve that resident image for these exact pixel-program shapes;
+        // the UI remains interactive while the missing blur is preferable to
+        // an unreadable frame.
+        if (fragment_image_count == 1 and pipeline_state.blend_enables[0] == 0 and
+            hasFullscreenSampleBlitGeometry(draw) and
+            matchesRgb10MenuPostProcess(fragment_analysis.program.instructions.items) and
+            try self.emulateFullscreenSampleBlit(
+                memory,
+                target,
+                graphics_resources.descriptors[0],
+                false,
+            ))
+        {
+            // This target now contains the complete menu, not merely the
+            // earlier camera/video layer.  Make it the presentation anchor so
+            // a stale alternating scanout buffer cannot hide the logo behind
+            // a black deferred-composite surface.
+            self.deferred_composite_ui_address = target.descriptor.address;
+            self.deferred_composite_ui_last_flip = self.flip_callbacks;
+            if (!self.reported_rgb10_menu_postprocess_fallback) {
+                self.reported_rgb10_menu_postprocess_fallback = true;
+                std.debug.print(
+                    "[vulkan dcb] preserving complete RGB10 menu across malformed post-process\n",
+                    .{},
+                );
+            }
+            return;
+        }
         // Tetris keeps the composited UI layer immediately below its packed
         // HDR scene allocation.  Until the title's large deferred-composite
         // pixel program is translated exactly, preserve the already rendered
@@ -11208,8 +11267,20 @@ pub const Renderer = struct {
         var unity_ui_uv: ?gpu.ShaderSpirvStorageBufferBinding = null;
         var unity_ui_color: ?gpu.ShaderSpirvStorageBufferBinding = null;
         var unity_ui_record: ?gpu.ShaderSpirvStorageBufferBinding = null;
+        var unity_ui_matrix: ?gpu.ShaderSpirvStorageBufferBinding = null;
+        var unity_ui_extended_color: ?gpu.ShaderSpirvStorageBufferBinding = null;
         for (vertex_storage.mappings[0..vertex_storage.mapping_count]) |mapping| {
-            if (mapping.stride != 40 or mapping.instruction_pc == null) continue;
+            if (mapping.instruction_pc == null and mapping.stride == 16 and
+                mapping.unified_format == 77 and (mapping.extent_bytes orelse 0) >= 64)
+            {
+                unity_ui_matrix = mapping;
+                continue;
+            }
+            if ((mapping.stride != 40 and mapping.stride != 44) or
+                mapping.instruction_pc == null)
+            {
+                continue;
+            }
             // Unity's interleaved UI record stores normalized texture UV at
             // byte 16 and pixel-space position at byte 24. Both attributes
             // use the same 32_32_FLOAT format, so matching them in shader
@@ -11223,6 +11294,10 @@ pub const Renderer = struct {
                 unity_ui_color = mapping;
             } else if (mapping.soffset_value == 0 and mapping.unified_format == 77) {
                 unity_ui_record = mapping;
+            } else if (mapping.stride == 44 and mapping.soffset_value == 36 and
+                mapping.unified_format == 56)
+            {
+                unity_ui_extended_color = mapping;
             }
         }
         var unity_sprite_matrix: ?gpu.ShaderSpirvStorageBufferBinding = null;
@@ -11258,22 +11333,32 @@ pub const Renderer = struct {
             fragment_address == 0x48c200 and fragment_mapping_count == 1 and
             graphics_resources.descriptors[0].width == 256 and
             graphics_resources.descriptors[0].height == 240;
-        // The guest sometimes declares the 2000-line UI viewport through a
-        // 2160-line backing image. Match the complete Unity fetch signature,
-        // not only that unstable allocation height; the four instruction PCs
-        // and five-binding layout distinguish it from the other 4K passes.
-        const unity_ui_extent = target.descriptor.width == 3840 and
-            (target.descriptor.height == 2000 or target.descriptor.height == 2160);
-        const unity_ui_fallback = unity_ui_extent and
-            vertex_stage == .export_shader and
-            paired_parameter_mask == 0x3 and
-            fragment_mapping_count == 1 and
-            vertex_storage.mapping_count == 5 and
-            unity_ui_position != null and unity_ui_uv != null and unity_ui_color != null and unity_ui_record != null and
+        // Two Unity renderer revisions use the same UI record with either 40
+        // bytes (one packed colour) or 44 bytes (an additional packed value).
+        // REANIMAL uses the latter for both its 4K logo/menu quads and the
+        // narrow intermediate text targets. Match every producer PC so this
+        // direct path cannot absorb unrelated 44-byte mesh layouts.
+        const unity_ui_legacy = vertex_storage.mapping_count == 5 and
+            unity_ui_matrix != null and unity_ui_position != null and
+            unity_ui_uv != null and unity_ui_color != null and unity_ui_record != null and
+            unity_ui_uv.?.stride == 40 and
             unity_ui_uv.?.instruction_pc.? == 264 and
             unity_ui_record.?.instruction_pc.? == 428 and
             unity_ui_position.?.instruction_pc.? == 528 and
-            unity_ui_color.?.instruction_pc.? == 608 and
+            unity_ui_color.?.instruction_pc.? == 608;
+        const unity_ui_extended = vertex_storage.mapping_count == 6 and
+            unity_ui_matrix != null and unity_ui_position != null and
+            unity_ui_uv != null and unity_ui_color != null and unity_ui_record != null and
+            unity_ui_extended_color != null and unity_ui_uv.?.stride == 44 and
+            unity_ui_uv.?.instruction_pc.? == 324 and
+            unity_ui_record.?.instruction_pc.? == 460 and
+            unity_ui_position.?.instruction_pc.? == 560 and
+            unity_ui_color.?.instruction_pc.? == 648 and
+            unity_ui_extended_color.?.instruction_pc.? == 744;
+        const unity_ui_fallback = vertex_stage == .export_shader and
+            paired_parameter_mask == 0x3 and
+            fragment_mapping_count == 1 and
+            (unity_ui_legacy or unity_ui_extended) and
             unity_ui_position.?.descriptor_index == unity_ui_uv.?.descriptor_index and
             unity_ui_position.?.descriptor_index == unity_ui_color.?.descriptor_index and
             unity_ui_position.?.descriptor_index == unity_ui_record.?.descriptor_index;
@@ -11400,6 +11485,8 @@ pub const Renderer = struct {
                     unity_ui_position.?,
                     unity_ui_record.?,
                     unity_ui_color.?,
+                    readUnityUiProjection(reader, &vertex_storage, unity_ui_matrix.?) orelse
+                        .{ 1.0 / 1920.0, -1.0 / 1080.0, -1.0, 1.0 },
                 )
             else if (centered_retro_framebuffer)
                 buildFullscreenProbeVertexSpirv(
@@ -11536,6 +11623,13 @@ pub const Renderer = struct {
                                         captured.height,
                                         captured.pixels.items,
                                     );
+                                } else if (captured_target.format.vulkan == vk.format_a2b10g10r10_unorm_pack32) {
+                                    dumpA2B10G10R10FrameThumbnailPpm(
+                                        trace_path.ptr,
+                                        captured.width,
+                                        captured.height,
+                                        captured.pixels.items,
+                                    );
                                 } else {
                                     dumpFrameThumbnailPpm(
                                         trace_path.ptr,
@@ -11647,7 +11741,14 @@ pub const Renderer = struct {
                     const captured_target = self.render_targets.items[target_index].target;
                     for (self.completed_frames.items) |captured| {
                         if (captured.guest_address != captured_target.descriptor.address) continue;
-                        if (captured_target.format.bytes_per_texel == 4) {
+                        if (captured_target.format.vulkan == vk.format_a2b10g10r10_unorm_pack32) {
+                            dumpA2B10G10R10FramePpm(
+                                "out\\first-video-pass.ppm",
+                                captured.width,
+                                captured.height,
+                                captured.pixels.items,
+                            );
+                        } else if (captured_target.format.bytes_per_texel == 4) {
                             dumpFramePpm(
                                 "out\\first-video-pass.ppm",
                                 captured.width,
@@ -11907,9 +12008,11 @@ pub const Renderer = struct {
         flip_vertical: bool,
     ) anyerror!bool {
         if ((target.format.vulkan != vk.format_r8g8b8a8_unorm and
-            target.format.vulkan != vk.format_r8g8b8a8_srgb) or
+            target.format.vulkan != vk.format_r8g8b8a8_srgb and
+            target.format.vulkan != vk.format_a2b10g10r10_unorm_pack32) or
             target.format.bytes_per_texel != 4 or
-            (source.unified_format != 36 and source.unified_format != 56) or
+            (source.unified_format != 36 and source.unified_format != 50 and
+                source.unified_format != 56) or
             target.descriptor.fragments_log2 != 0 or
             source.width != target.descriptor.width or
             source.height != target.descriptor.height or
@@ -15114,10 +15217,18 @@ pub const Renderer = struct {
     fn presentationPixels(self: *Renderer, frame: *const CachedFrame) ?[]const u8 {
         const target = frame.target orelse return frame.pixels.items;
         if (target.format.vulkan == vk.format_r8g8b8a8_unorm) return frame.pixels.items;
-        if (target.format.vulkan != vk.format_b10g11r11_ufloat_pack32) return null;
+        if (target.format.vulkan != vk.format_b10g11r11_ufloat_pack32 and
+            target.format.vulkan != vk.format_a2b10g10r10_unorm_pack32)
+        {
+            return null;
+        }
         const byte_count = @as(usize, frame.width) * frame.height * 4;
         self.guest_frame_scratch.resize(self.allocator, byte_count) catch return null;
-        convertR11G11B10ToRgba8(frame.pixels.items, self.guest_frame_scratch.items);
+        if (target.format.vulkan == vk.format_b10g11r11_ufloat_pack32) {
+            convertR11G11B10ToRgba8(frame.pixels.items, self.guest_frame_scratch.items);
+        } else {
+            convertA2B10G10R10ToRgba8(frame.pixels.items, self.guest_frame_scratch.items);
+        }
         return self.guest_frame_scratch.items;
     }
 
@@ -15350,7 +15461,9 @@ pub const Renderer = struct {
                     target.descriptor.format,
                 },
             ) catch continue;
-            if (target.format.bytes_per_texel == 4) {
+            if (target.format.vulkan == vk.format_a2b10g10r10_unorm_pack32) {
+                dumpA2B10G10R10FramePpm(path.ptr, frame.width, frame.height, frame.pixels.items);
+            } else if (target.format.bytes_per_texel == 4) {
                 dumpFramePpm(path.ptr, frame.width, frame.height, frame.pixels.items);
             } else {
                 dumpRgba16FloatFramePpm(path.ptr, frame.width, frame.height, frame.pixels.items);
@@ -15683,10 +15796,21 @@ pub const Renderer = struct {
                         }
                     }
                     if (ui_index) |target_index| {
-                        const presented = if (shouldDumpProgressFrame(
-                            self.flip_callbacks,
-                            self.capture_extended_progress_frames,
-                        ))
+                        const resident_format = self.render_targets.items[target_index].target.format.vulkan;
+                        const needs_synchronized_scanout =
+                            self.reported_rgb10_menu_postprocess_fallback or
+                            resident_format == vk.format_a2b10g10r10_unorm_pack32 or
+                            resident_format == vk.format_b10g11r11_ufloat_pack32;
+                        // Transfer blits of REANIMAL's packed 10-bit menu are
+                        // accepted by the driver but produce an all-black
+                        // swapchain image on NVIDIA.  The materialized path
+                        // performs the explicit, already tested RGBA8
+                        // conversion before handing pixels to the window.
+                        const presented = if (needs_synchronized_scanout or
+                            shouldDumpProgressFrame(
+                                self.flip_callbacks,
+                                self.capture_extended_progress_frames,
+                            ))
                             self.presentResidentTarget(target_index, flip) catch |err| {
                                 self.last_flip_error = err;
                                 return false;
@@ -16846,6 +16970,28 @@ fn matchesFullscreenSampleBlit(inst: anytype) bool {
     return samples == 1 and color_exports == 1;
 }
 
+fn matchesRgb10MenuPostProcess(inst: anytype) bool {
+    if (inst.len != 70 and inst.len != 108) return false;
+    if (inst[0].opcode != .s_inst_prefetch or
+        inst[inst.len - 1].opcode != .s_endpgm)
+    {
+        return false;
+    }
+    var samples: u32 = 0;
+    var color_exports: u32 = 0;
+    for (inst) |candidate| {
+        if (candidate.opcode == .image_sample) samples += 1;
+        if (candidate.opcode == .image_store) return false;
+        if (candidate.opcode == .exp and candidate.export_target == 0) {
+            if (!candidate.export_done) return false;
+            color_exports += 1;
+        }
+    }
+    return color_exports == 1 and
+        ((inst.len == 70 and samples == 1) or
+            (inst.len == 108 and samples >= 7 and samples <= 12));
+}
+
 /// Unity emits the same identity compositor as either an indexed quad or a
 /// procedural full-screen triangle. Resource/extent checks in the emulation
 /// path keep the three-vertex form from matching ordinary textured geometry.
@@ -17752,6 +17898,18 @@ fn convertR11G11B10ToRgba8(source: []const u8, destination: []u8) void {
         destination[offset + 1] = linearFloatToUnorm8(decodeUnsignedMiniFloat((word >> 11) & 0x7ff, 11));
         destination[offset + 2] = linearFloatToUnorm8(decodeUnsignedMiniFloat((word >> 22) & 0x3ff, 10));
         destination[offset + 3] = 255;
+    }
+}
+
+fn convertA2B10G10R10ToRgba8(source: []const u8, destination: []u8) void {
+    if (source.len != destination.len or source.len % 4 != 0) return;
+    var offset: usize = 0;
+    while (offset < source.len) : (offset += 4) {
+        const word = std.mem.readInt(u32, source[offset..][0..4], .little);
+        destination[offset] = @intCast(((word & 0x3ff) * 255 + 511) / 1023);
+        destination[offset + 1] = @intCast((((word >> 10) & 0x3ff) * 255 + 511) / 1023);
+        destination[offset + 2] = @intCast((((word >> 20) & 0x3ff) * 255 + 511) / 1023);
+        destination[offset + 3] = @intCast((((word >> 30) & 0x3) * 255 + 1) / 3);
     }
 }
 
@@ -18854,6 +19012,20 @@ fn dumpFramePpm(path: [*:0]const u8, width: u32, height: u32, rgba: []const u8) 
     std.debug.print("[vulkan dcb] dumped {s} ({d}x{d})\n", .{ path, width, height });
 }
 
+fn dumpA2B10G10R10FramePpm(
+    path: [*:0]const u8,
+    width: u32,
+    height: u32,
+    source_packed: []const u8,
+) void {
+    const byte_count = @as(usize, width) * @as(usize, height) * 4;
+    if (width == 0 or height == 0 or source_packed.len < byte_count) return;
+    const rgba = std.heap.page_allocator.alloc(u8, byte_count) catch return;
+    defer std.heap.page_allocator.free(rgba);
+    convertA2B10G10R10ToRgba8(source_packed[0..byte_count], rgba);
+    dumpFramePpm(path, width, height, rgba);
+}
+
 /// Small per-draw diagnostic capture. Full 4K PPMs make a single busy frame
 /// several GiB; nearest-neighbour thumbnails retain the first corrupt draw
 /// while keeping the trace practical.
@@ -18914,6 +19086,37 @@ fn dumpR11G11B10FrameThumbnailPpm(
                 output[destination + component] = @intFromFloat(@round(@min(mapped, 1.0) * 255.0));
             }
             output[destination + 3] = 255;
+        }
+    }
+    dumpFramePpm(path, output_width, output_height, output);
+}
+
+fn dumpA2B10G10R10FrameThumbnailPpm(
+    path: [*:0]const u8,
+    width: u32,
+    height: u32,
+    source_packed: []const u8,
+) void {
+    const divisor: u32 = 8;
+    const output_width = @max(@as(u32, 1), width / divisor);
+    const output_height = @max(@as(u32, 1), height / divisor);
+    if (source_packed.len < @as(usize, width) * @as(usize, height) * 4) return;
+    const output = std.heap.page_allocator.alloc(
+        u8,
+        @as(usize, output_width) * @as(usize, output_height) * 4,
+    ) catch return;
+    defer std.heap.page_allocator.free(output);
+    for (0..output_height) |y| {
+        for (0..output_width) |x| {
+            const source_x = @min(width - 1, @as(u32, @intCast(x)) * divisor);
+            const source_y = @min(height - 1, @as(u32, @intCast(y)) * divisor);
+            const source = (@as(usize, source_y) * width + source_x) * 4;
+            const word = std.mem.readInt(u32, source_packed[source..][0..4], .little);
+            const destination = (y * output_width + x) * 4;
+            output[destination] = @intCast(((word & 0x3ff) * 255 + 511) / 1023);
+            output[destination + 1] = @intCast((((word >> 10) & 0x3ff) * 255 + 511) / 1023);
+            output[destination + 2] = @intCast((((word >> 20) & 0x3ff) * 255 + 511) / 1023);
+            output[destination + 3] = @intCast((((word >> 30) & 0x3) * 255 + 1) / 3);
         }
     }
     dumpFramePpm(path, output_width, output_height, output);
@@ -20026,12 +20229,35 @@ fn buildUnitySpriteVertexSpirv(
 /// prolog can reject every invocation even though the attribute descriptors
 /// themselves are complete. Lower the equivalent final vertex operation for
 /// the narrow, structurally recognised UI layout instead.
+fn readUnityUiProjection(
+    reader: gpu.ShaderMemoryReader,
+    resources: *const ComputeResources,
+    matrix: gpu.ShaderSpirvStorageBufferBinding,
+) ?[4]f32 {
+    const slot: usize = @intCast(matrix.descriptor_index);
+    if (slot >= resources.sizes.len or resources.sizes[slot] < 64) return null;
+    var words: [16]u32 = undefined;
+    reader.readWords(resources.addresses[slot], &words) catch return null;
+    const projection = [4]f32{
+        @bitCast(words[0]),
+        @bitCast(words[5]),
+        @bitCast(words[12]),
+        @bitCast(words[13]),
+    };
+    for (projection) |component| {
+        if (!std.math.isFinite(component)) return null;
+    }
+    if (projection[0] == 0 or projection[1] == 0) return null;
+    return projection;
+}
+
 fn buildUnityUiVertexSpirv(
     allocator: std.mem.Allocator,
     storage: []const gpu.ShaderSpirvStorageBufferBinding,
     position: gpu.ShaderSpirvStorageBufferBinding,
     record: gpu.ShaderSpirvStorageBufferBinding,
     color: gpu.ShaderSpirvStorageBufferBinding,
+    projection: [4]f32,
 ) !rdna2.spirv.Module {
     const vgpr = struct {
         fn at(reg: u32) rdna2.Operand {
@@ -20060,11 +20286,12 @@ fn buildUnityUiVertexSpirv(
         .{ .pc = record.instruction_pc.?, .opcode = .buffer_load_format_xyzw, .dst = vgpr(11), .src0 = vgpr(5), .src1 = sgpr(record.resource_sgpr), .src2 = .{ .kind = .null }, .src_count = 3, .index_enable = true },
         .{ .pc = color.instruction_pc.?, .opcode = .buffer_load_format_xyzw, .dst = vgpr(4), .src0 = vgpr(5), .src1 = sgpr(color.resource_sgpr), .src2 = .{ .kind = .null }, .src_count = 3, .index_enable = true },
 
-        // The traced matrix is the standard 3840x2160 pixel-space projection.
-        // Spell it directly here: the producer-tagged SGPR values only become
-        // live after SMEM operations which this reduced program omits.
-        .{ .pc = 0x300, .opcode = .v_mad_f32, .dst = vgpr(17), .src0 = float(1.0 / 1920.0), .src1 = vgpr(9), .src2 = float(-1.0), .src_count = 3 },
-        .{ .pc = 0x308, .opcode = .v_mad_f32, .dst = vgpr(15), .src0 = float(-1.0 / 1080.0), .src1 = vgpr(10), .src2 = float(1.0), .src_count = 3 },
+        // The reduced program omits the guest SMEM matrix loads, so specialize
+        // the four affine terms read from the draw's constant buffer. This is
+        // the ordinary 3840x2160 projection for direct UI and also preserves
+        // the crop/translation used by narrow intermediate text targets.
+        .{ .pc = 0x300, .opcode = .v_mad_f32, .dst = vgpr(17), .src0 = float(projection[0]), .src1 = vgpr(9), .src2 = float(projection[2]), .src_count = 3 },
+        .{ .pc = 0x308, .opcode = .v_mad_f32, .dst = vgpr(15), .src0 = float(projection[1]), .src1 = vgpr(10), .src2 = float(projection[3]), .src_count = 3 },
         .{ .pc = 0x310, .opcode = .v_mov_b32, .dst = vgpr(8), .src0 = float(0.5), .src_count = 1 },
         .{ .pc = 0x314, .opcode = .v_mov_b32, .dst = vgpr(16), .src0 = float(1.0), .src_count = 1 },
         .{ .pc = 0x318, .opcode = .exp, .export_target = 0x0c, .export_enable = 0xf, .src0 = vgpr(17), .src1 = vgpr(15), .src2 = vgpr(8), .src3 = vgpr(16), .src_count = 4 },
@@ -21625,6 +21852,23 @@ test "R11G11B10 float presentation conversion preserves RGB channels" {
     try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, rgba[4..8]);
     try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0, 255 }, rgba[8..12]);
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, rgba[12..16]);
+}
+
+test "A2B10G10R10 UNORM presentation conversion preserves RGBA channels" {
+    const source_words = [_]u32{
+        0,
+        0x3ff,
+        0x3ff << 10,
+        0x3ff << 20,
+        0x3 << 30,
+    };
+    var rgba: [20]u8 = undefined;
+    convertA2B10G10R10ToRgba8(std.mem.asBytes(&source_words), &rgba);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, rgba[0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 0 }, rgba[4..8]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0, 0 }, rgba[8..12]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 0 }, rgba[12..16]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, rgba[16..20]);
 }
 
 test "typed image clear texels use the descriptor number format" {

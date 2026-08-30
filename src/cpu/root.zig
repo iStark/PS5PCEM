@@ -412,6 +412,9 @@ pub var invalid_agc_pointer_recoveries: std.atomic.Value(u64) = .init(0);
 /// size field were leaked instead of letting the allocator unlink outside the
 /// guest address space and terminate the graphics worker.
 pub var corrupt_allocator_free_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many invalid Unreal free-list nodes were discarded before their
+/// out-of-range address could replace an otherwise valid bucket head.
+pub var invalid_allocator_insert_recoveries: std.atomic.Value(u64) = .init(0);
 /// How many non-canonical Unreal small-allocation free-list heads used the
 /// allocator's existing slow fallback instead of being dereferenced.
 pub var invalid_allocator_head_recoveries: std.atomic.Value(u64) = .init(0);
@@ -473,6 +476,11 @@ fn ensureNullObjectStub() u64 {
         while (offset + 8 <= 0x100) : (offset += 8) {
             std.mem.writeInt(u64, null_object_stub[offset..][0..8], base, .little);
         }
+        // REANIMAL's optional callback at object field +0xb8 is invoked
+        // directly. A self-pointer here made the guest execute this writable
+        // stub page and raised a host DEP violation. Point that exact callback
+        // field at the executable zero-return thunk instead.
+        std.mem.writeInt(u64, null_object_stub[0xb8..][0..8], ret_thunk, .little);
         null_object_stub_ready = true;
     }
     return @intFromPtr(&null_object_stub);
@@ -1144,9 +1152,10 @@ const WindowsX64Machine = struct {
             tryRedirectNullBaseRegister(context, record.ExceptionInformation[1]))
         {
             _ = null_base_redirect_recoveries.fetchAdd(1, .monotonic);
-            std.debug.print(
+            const count = null_base_redirect_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
                 "[cpu] redirected null base -> stub @rip=0x{x} addr=0x{x} (#{d})\n",
-                .{ context.Rip, record.ExceptionInformation[1], null_base_redirect_recoveries.load(.monotonic) },
+                .{ context.Rip, record.ExceptionInformation[1], count },
             );
             return exception_continue_execution;
         }
@@ -1291,6 +1300,24 @@ const WindowsX64Machine = struct {
             );
             return exception_continue_execution;
         }
+        // Unreal can also derive a new free-list node from a packed size value.
+        // The generated insertion clears that node and then installs it as the
+        // bucket head. If the derived address is not committed, keep the
+        // bucket empty and skip only those three exact stores; publishing the
+        // bad head makes every later allocation fault at the same address.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 1 and
+            tryDropInvalidAllocatorInsert(context, record.ExceptionInformation[1]))
+        {
+            _ = invalid_allocator_insert_recoveries.fetchAdd(1, .monotonic);
+            const count = invalid_allocator_insert_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] dropped invalid allocator insert @rip=0x{x} addr=0x{x} (#{d})\n",
+                .{ context.Rip - 0xf, record.ExceptionInformation[1], count },
+            );
+            return exception_continue_execution;
+        }
         // Unity keeps the current renderer frame in a three-entry array and
         // reserves index 3 for an explicit inactive slot. Streamed scene work
         // can observe a stale pointer-sized value in the 32-bit index field;
@@ -1398,6 +1425,22 @@ const WindowsX64Machine = struct {
                 );
                 return exception_continue_execution;
             }
+        }
+        // A later indirect call can target the synthetic object's data base
+        // rather than one of the executable vtable slots. Treat execution of
+        // that exact private address as the same optional null call and return
+        // zero; no arbitrary host DEP violation is made recoverable here.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and record.ExceptionInformation[0] == 8 and
+            tryEmulateSyntheticStubCallReturn(context))
+        {
+            _ = null_call_recoveries.fetchAdd(1, .monotonic);
+            const count = null_call_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] recovered synthetic-stub call -> 0x{x} (#{d})\n",
+                .{ context.Rip, count },
+            );
+            return exception_continue_execution;
         }
 
         if (handling_native_fault) return std.os.windows.EXCEPTION_CONTINUE_SEARCH;
@@ -2312,6 +2355,33 @@ const WindowsX64Machine = struct {
         return true;
     }
 
+    fn tryDropInvalidAllocatorInsert(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        const pattern = [_]u8{
+            0x49, 0x89, 0x45, 0x00, // mov qword ptr [r13],rax
+            0x49, 0xc7, 0x45, 0x08, 0x00, 0x00, 0x00, 0x00, // mov qword ptr [r13+8],0
+            0x4c, 0x89, 0x2b, // mov qword ptr [rbx],r13
+        };
+        if (memory_address != context.R13 or context.R13 == 0 or
+            context.Rbp != context.Rsp +% 0x70 or
+            !isGuestAddress(context.Rbx) or
+            !memory.isHostRangeWritable(context.Rbx, 12) or
+            memory.isHostRangeWritable(context.R13, 16))
+        {
+            return false;
+        }
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        for (pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        @as(*align(1) u64, @ptrFromInt(context.Rbx)).* = 0;
+        @as(*align(1) u32, @ptrFromInt(context.Rbx + 8)).* = 0;
+        context.Rip += pattern.len;
+        return true;
+    }
+
     fn tryDropCorruptAllocatorUnlink(
         context: *std.os.windows.CONTEXT,
         memory_address: u64,
@@ -2595,6 +2665,22 @@ const WindowsX64Machine = struct {
         return true;
     }
 
+    fn tryEmulateSyntheticStubCallReturn(context: *std.os.windows.CONTEXT) bool {
+        if (context.Rip != ensureNullObjectStub()) return false;
+        const rsp = context.Rsp;
+        if (rsp < 8 or rsp > std.math.maxInt(u64) - 8 or
+            !memory.isHostRangeReadable(rsp, @sizeOf(u64)))
+        {
+            return false;
+        }
+        const return_address = @as(*align(1) const u64, @ptrFromInt(rsp)).*;
+        if (!isGuestAddress(return_address)) return false;
+        context.Rax = 0;
+        context.Rsp = rsp + 8;
+        context.Rip = return_address;
+        return true;
+    }
+
     /// Bytes following ModRM for a memory operand (SIB + displacement), or null
     /// when the form is register-only / unsupported.
     fn modrmMemoryOperandLength(modrm: u8, after_modrm: [*]const u8) ?usize {
@@ -2834,6 +2920,28 @@ test "synthetic null object covers large Unreal virtual tables" {
         .little,
     );
     try std.testing.expectEqual(@as(u64, @intFromPtr(&nullObjectReturnThunk)), target);
+    try std.testing.expectEqual(
+        @as(u64, @intFromPtr(&nullObjectReturnThunk)),
+        std.mem.readInt(u64, null_object_stub[0xb8..][0..8], .little),
+    );
+}
+
+test "execution of the synthetic null object returns through the guest stack" {
+    if (can_use_native_bridge) {
+        const return_address = memory.system_managed.start + 0x1234;
+        var stack = [1]u64{return_address};
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = ensureNullObjectStub();
+        context.Rsp = @intFromPtr(&stack);
+        context.Rax = 0xffff_ffff_ffff_ffff;
+
+        try std.testing.expect(WindowsX64Machine.tryEmulateSyntheticStubCallReturn(&context));
+        try std.testing.expectEqual(return_address, context.Rip);
+        try std.testing.expectEqual(@as(u64, @intFromPtr(&stack) + 8), context.Rsp);
+        try std.testing.expectEqual(@as(u64, 0), context.Rax);
+    } else {
+        return error.SkipZigTest;
+    }
 }
 
 test "an unmapped optional linked-list payload follows its null branch" {
@@ -3560,6 +3668,49 @@ test "a corrupt allocator header abandons the exact command-buffer free" {
             address,
         ));
         try std.testing.expectEqual(@intFromPtr(&code) + 0x17d, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "an invalid allocator insert leaves the bucket empty" {
+    if (can_use_native_bridge) {
+        var address_space = try memory.AddressSpace.init(std.testing.allocator);
+        defer address_space.deinit();
+
+        const bucket = memory.system_managed.start + 0x20_000;
+        try address_space.mapFixed(
+            bucket,
+            memory.page_size,
+            .read_write,
+            .private,
+            null,
+        );
+        try address_space.writeInt(u64, bucket, memory.system_managed.start + 0x40_000);
+        try address_space.writeInt(u32, bucket + 8, 9);
+        const code = [_]u8{
+            0x49, 0x89, 0x45, 0x00,
+            0x49, 0xc7, 0x45, 0x08,
+            0x00, 0x00, 0x00, 0x00,
+            0x4c, 0x89, 0x2b,
+        };
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        // The invalid node can carry a non-null next pointer. It is still
+        // unsafe to insert when the node itself is outside writable memory.
+        context.Rax = memory.system_managed.start + 0x60_000;
+        context.Rbx = bucket;
+        context.R13 = memory.system_managed.start + 0x40_000;
+        context.Rsp = 0x1000;
+        context.Rbp = context.Rsp + 0x70;
+
+        try std.testing.expect(WindowsX64Machine.tryDropInvalidAllocatorInsert(
+            &context,
+            context.R13,
+        ));
+        try std.testing.expectEqual(@intFromPtr(&code) + code.len, context.Rip);
+        try std.testing.expectEqual(@as(u64, 0), @as(*const u64, @ptrFromInt(bucket)).*);
+        try std.testing.expectEqual(@as(u32, 0), @as(*const u32, @ptrFromInt(bucket + 8)).*);
     } else {
         return error.SkipZigTest;
     }

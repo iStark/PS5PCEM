@@ -1858,6 +1858,16 @@ fn hostPrepareMappingPlaceholders(
 ) Error!void {
     if (builtin.os.tag != .windows) return;
 
+    // Recycled thread stacks and TLS blocks normally already sit inside one
+    // sufficiently large placeholder.  Splitting that allocation directly is
+    // both cheaper and more reliable than trying to coalesce the entire free
+    // interval, whose metadata boundary can span unrelated placeholder
+    // allocations after many short-lived threads have come and gone.
+    const existing = try windowsAllocationRange(address);
+    if (existing.start <= address and address + size <= existing.end) {
+        return hostSplitWithinPlaceholder(existing, address, size, view_size);
+    }
+
     try hostCoalescePlaceholder(free);
     if (address > free.start) try hostSplitPlaceholder(free.start, address - free.start);
 
