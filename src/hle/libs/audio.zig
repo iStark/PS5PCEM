@@ -105,8 +105,8 @@ fn pace(frames: u32, frequency: u32) void {
 /// half of the table it falls in.
 fn formatSamples(format: u32) ?audio_device.SampleFormat {
     return switch (format & 0xff) {
-        0, 1, 2 => .signed16,
-        3, 4, 5, 6, 7 => .float32,
+        0, 1, 2, 6 => .signed16,
+        3, 4, 5, 7 => .float32,
         else => null,
     };
 }
@@ -2756,6 +2756,13 @@ pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!voi
     try db.addLibrary(gpa, .{ .name = "libSceAudiodec", .version = 1 }, .{ .name = "libSceAudiodec" }, &audiodec_exports);
     try db.addLibrary(gpa, .{ .name = "libSceNgs2", .version = 1 }, .{ .name = "libSceNgs2" }, &ngs2_exports);
     try db.addLibrary(gpa, .{ .name = "libSceAjm", .version = 1 }, .{ .name = "libSceAjm" }, &ajm_exports);
+}
+
+test "legacy AudioOut formats distinguish standard 8-channel integer and float PCM" {
+    try std.testing.expectEqual(@as(?u8, 8), formatChannels(6));
+    try std.testing.expectEqual(audio_device.SampleFormat.signed16, formatSamples(6).?);
+    try std.testing.expectEqual(@as(?u8, 8), formatChannels(7));
+    try std.testing.expectEqual(audio_device.SampleFormat.float32, formatSamples(7).?);
 }
 
 test "headless AudioOut preserves port lifecycle" {

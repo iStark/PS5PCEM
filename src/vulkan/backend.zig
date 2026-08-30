@@ -1943,6 +1943,7 @@ const PlanarVideoPass = struct {
     chroma_v: ?gpu.ImageDescriptor,
     source_width: u32,
     source_height: u32,
+    fills_target: bool,
 
     fn layoutName(self: PlanarVideoPass) []const u8 {
         return if (self.chroma_v == null) "NV12" else "I420";
@@ -2023,10 +2024,22 @@ fn recognizePlanarVideoPass(
                 .chroma_v = chroma_v,
                 .source_width = visible_width,
                 .source_height = luma.height,
+                .fills_target = true,
             };
         }
     }
-    return null;
+    // Decoder planes can also be placed inside a Unity UI quad (game preview
+    // videos use 540x360 inside a 3840x2160 target). The plane signature is
+    // still unambiguous, but that draw must retain its guest vertex geometry
+    // instead of being replaced by the fullscreen probe rectangle.
+    return .{
+        .luma = luma,
+        .chroma_u = chroma_u,
+        .chroma_v = chroma_v,
+        .source_width = luma.width,
+        .source_height = luma.height,
+        .fills_target = false,
+    };
 }
 
 const PipelineLookup = struct {
@@ -4106,6 +4119,7 @@ pub const Renderer = struct {
             return report;
         }
         if (try self.tryEmulatePackedColorBufferClear(
+            memory,
             state,
             analysis,
             system_registers,
@@ -4302,7 +4316,7 @@ pub const Renderer = struct {
                     },
                 );
             }
-            if (log_verbose_gpu) {
+            if (log_verbose_gpu or self.dump_compute_spirv) {
                 dumpScalarRegisters(resources.scalar_registers[0..resources.scalar_count]);
                 dumpShaderHead(analysis, 48);
             }
@@ -4867,6 +4881,7 @@ pub const Renderer = struct {
     /// kernel and clear the resident attachment directly instead.
     fn tryEmulatePackedColorBufferClear(
         self: *Renderer,
+        memory: GuestMemory,
         state: *const gpu.State,
         analysis: *const gpu.ShaderAnalysis,
         system: gpu.resources.ComputeSystemRegisters,
@@ -4926,28 +4941,87 @@ pub const Renderer = struct {
             if ((state.readRegister(.shader, register) orelse return null) != packed_value) return null;
         }
 
+        var target_index: ?usize = null;
         const render = gpu.resources.decodeRenderState(state);
-        const target_descriptor = for (render.color_targets) |maybe_target| {
+        for (render.color_targets) |maybe_target| {
             const candidate = maybe_target orelse continue;
-            if (candidate.isActive() and candidate.address == descriptor.address) break candidate;
-        } else return null;
-        if (target_descriptor.dcc_enabled or target_descriptor.cmask_fast_clear or
-            target_descriptor.fmask_compression or target_descriptor.samples_log2 != 0 or
-            target_descriptor.fragments_log2 != 0)
-        {
-            return null;
+            if (!candidate.isActive() or candidate.address != descriptor.address or
+                candidate.dcc_enabled or candidate.cmask_fast_clear or
+                candidate.fmask_compression or candidate.samples_log2 != 0 or
+                candidate.fragments_log2 != 0)
+            {
+                continue;
+            }
+            const format = colorTargetFormat(candidate) orelse continue;
+            if (format.vulkan != vk.format_r8g8b8a8_unorm or format.bytes_per_texel != 4) continue;
+            const layout = gpu.SurfaceLayout.fromColorTarget(candidate) catch continue;
+            if (layout.required_source_bytes != descriptor.size_bytes or layout.layers != 1) continue;
+            target_index = try self.acquireRenderTarget(.{
+                .descriptor = candidate,
+                .layout = layout,
+                .format = format,
+            });
+            break;
         }
-        const format = colorTargetFormat(target_descriptor) orelse return null;
-        if (format.vulkan != vk.format_r8g8b8a8_unorm or format.bytes_per_texel != 4) return null;
-        const layout = try gpu.SurfaceLayout.fromColorTarget(target_descriptor);
-        if (layout.required_source_bytes != descriptor.size_bytes or layout.layers != 1) return null;
-        const target = GuestColorTarget{
-            .descriptor = target_descriptor,
-            .layout = layout,
-            .format = format,
-        };
-        const target_index = try self.acquireRenderTarget(target);
-        const snapshot = self.render_targets.items[target_index];
+
+        // Compute clears often run before graphics rebinds this frame's
+        // VideoOut attachment. Reuse an exact resident allocation from an
+        // earlier frame instead of missing the fast path due to register state.
+        if (target_index == null) {
+            var newest_sequence: u64 = 0;
+            for (self.render_targets.items, 0..) |cached, index| {
+                if (cached.target.descriptor.address != descriptor.address or
+                    cached.target.format.vulkan != vk.format_r8g8b8a8_unorm or
+                    cached.target.format.bytes_per_texel != 4 or
+                    cached.target.layout.required_source_bytes != descriptor.size_bytes or
+                    cached.target.layout.layers != 1 or
+                    cached.target.descriptor.dcc_enabled or
+                    cached.target.descriptor.cmask_fast_clear or
+                    cached.target.descriptor.fmask_compression or
+                    cached.target.descriptor.samples_log2 != 0 or
+                    cached.target.descriptor.fragments_log2 != 0 or
+                    (target_index != null and cached.last_used_sequence <= newest_sequence))
+                {
+                    continue;
+                }
+                target_index = index;
+                newest_sequence = cached.last_used_sequence;
+            }
+        }
+
+        // The first clear of each swapchain buffer precedes creation of its
+        // resident attachment. Publish the identical repeated 16-byte pattern
+        // to guest memory once; subsequent clears remain entirely on the GPU.
+        if (target_index == null) {
+            const byte_count = std.math.cast(usize, descriptor.size_bytes) orelse
+                return Error.GuestBufferTooLarge;
+            if (byte_count == 0 or byte_count > maximum_frame_bytes or byte_count & 0xf != 0) return null;
+            try self.flushPendingGuestWrite(descriptor.address, byte_count);
+            const bytes = try self.allocator.alloc(u8, byte_count);
+            defer self.allocator.free(bytes);
+            var pattern: [16]u8 = undefined;
+            inline for (0..4) |index| {
+                const value = state.readRegister(.shader, 0x244 + index) orelse return null;
+                std.mem.writeInt(u32, pattern[index * 4 ..][0..4], value, .little);
+            }
+            var offset: usize = 0;
+            while (offset < bytes.len) : (offset += pattern.len) {
+                @memcpy(bytes[offset..][0..pattern.len], &pattern);
+            }
+            if (!memory.write(memory.context, descriptor.address, bytes)) return Error.GuestMemoryWriteFailed;
+            self.invalidateDmaDestination(descriptor.address, byte_count);
+            self.emulated_buffer_clear_dispatches += 1;
+            if (log_verbose_gpu or self.emulated_buffer_clear_dispatches <= 4) {
+                std.debug.print(
+                    "[vulkan dcb] emulated packed buffer fill: addr=0x{x} value=0x{x} bytes=0x{x} records={d} (#{d})\n",
+                    .{ descriptor.address, packed_value, descriptor.size_bytes, descriptor.record_count, self.emulated_buffer_clear_dispatches },
+                );
+            }
+            return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
+        }
+
+        const resolved_target_index = target_index.?;
+        const snapshot = self.render_targets.items[resolved_target_index];
 
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
@@ -4984,13 +5058,13 @@ pub const Renderer = struct {
         try self.submitOneShot(command_buffer);
 
         self.render_target_sequence +%= 1;
-        const cached = &self.render_targets.items[target_index];
+        const cached = &self.render_targets.items[resolved_target_index];
         cached.initialized = true;
         cached.shader_read_layout = false;
         cached.gpu_generation +%= 1;
         _ = self.image_aliases.markWrite(cached.alias_token);
         cached.last_used_sequence = self.render_target_sequence;
-        self.latest_render_target_index = target_index;
+        self.latest_render_target_index = resolved_target_index;
         for (self.completed_frames.items) |*frame| {
             if (frame.guest_address == descriptor.address) frame.needs_writeback = false;
         }
@@ -10383,7 +10457,7 @@ pub const Renderer = struct {
             descriptor.height,
             graphics_resources.descriptors[0..fragment_image_count],
         );
-        const planar_video_pass = planar_video != null;
+        const planar_video_pass = if (planar_video) |video| video.fills_target else false;
         if (planar_video) |video| {
             if (!self.reported_planar_video_pass) {
                 std.debug.print(
@@ -10402,17 +10476,17 @@ pub const Renderer = struct {
                 );
                 self.reported_planar_video_pass = true;
             }
-            self.markVideoSurface(target.descriptor.address);
-            self.video_surface_last_flip = self.flip_callbacks;
-            // The decoder planes have already been staged as Vulkan sampled
-            // images. Convert NV12/I420 in a fragment shader instead of
-            // reading them back, expanding RGBA on the CPU, and uploading a
-            // full 1080p target. A procedural fullscreen triangle also avoids
-            // the guest NGG VS currently exporting only half the rectangle.
-            probe_parameter_mask = 3;
-            fragment_input_controls[0] = 0;
-            fragment_input_controls[1] = 1;
-            paired_parameter_mask = 3;
+            if (video.fills_target) {
+                self.markVideoSurface(target.descriptor.address);
+                self.video_surface_last_flip = self.flip_callbacks;
+                // Fullscreen decoder planes use a procedural rectangle. An
+                // embedded movie keeps the Unity quad and its placement
+                // matrix, while sharing the same NV12/I420 fragment path.
+                probe_parameter_mask = 3;
+                fragment_input_controls[0] = 0;
+                fragment_input_controls[1] = 1;
+                paired_parameter_mask = 3;
+            }
         }
         if (fragment_image_count == 2 and
             draw.index_count != null and draw.index_count.? == 6 and
@@ -10653,6 +10727,40 @@ pub const Renderer = struct {
                         mapping.use_vertex_index,
                     },
                 );
+                if (mapping.use_vertex_index and mapping.stride != 0) {
+                    const record_words = @min(@as(usize, mapping.stride / @sizeOf(u32)), 10);
+                    var vertex: u32 = 0;
+                    while (vertex < 4) : (vertex += 1) {
+                        var words: [10]u32 = undefined;
+                        const record_address = vertex_storage.addresses[slot] +
+                            @as(u64, vertex) * mapping.stride;
+                        if (reader.readWords(record_address, words[0..record_words])) |_| {
+                            std.debug.print("    trace vertex {d}", .{vertex});
+                            for (words[0..record_words]) |word| {
+                                std.debug.print(" {x:0>8}/{d:.3}", .{ word, @as(f32, @bitCast(word)) });
+                            }
+                            std.debug.print("\n", .{});
+                        } else |_| {}
+                    }
+                } else if (mapping.extent_bytes != null) {
+                    const word_count: usize = @intCast(@min(mapping.extent_bytes.? / @sizeOf(u32), 20));
+                    std.debug.print("    trace constants", .{});
+                    var word_index: usize = 0;
+                    while (word_index < word_count) {
+                        var words: [8]u32 = undefined;
+                        const chunk_count = @min(words.len, word_count - word_index);
+                        if (reader.readWords(
+                            vertex_storage.addresses[slot] + @as(u64, word_index * @sizeOf(u32)),
+                            words[0..chunk_count],
+                        )) |_| {
+                            for (words[0..chunk_count]) |word| {
+                                std.debug.print(" {x:0>8}", .{word});
+                            }
+                        } else |_| break;
+                        word_index += chunk_count;
+                    }
+                    std.debug.print("\n", .{});
+                }
             }
             if (draw.index_address != 0 and draw.index_count != null and draw.index_count.? != 0) {
                 var index_bytes: [32]u8 = undefined;
@@ -10889,6 +10997,39 @@ pub const Renderer = struct {
                 unity_ui_record = mapping;
             }
         }
+        var unity_sprite_matrix: ?gpu.ShaderSpirvStorageBufferBinding = null;
+        var unity_sprite_position: ?gpu.ShaderSpirvStorageBufferBinding = null;
+        var unity_sprite_uv: ?gpu.ShaderSpirvStorageBufferBinding = null;
+        var unity_sprite_color: ?gpu.ShaderSpirvStorageBufferBinding = null;
+        for (vertex_storage.mappings[0..vertex_storage.mapping_count]) |mapping| {
+            if (mapping.instruction_pc == null and mapping.stride == 16 and
+                mapping.unified_format == 77 and (mapping.extent_bytes orelse 0) >= 80)
+            {
+                unity_sprite_matrix = mapping;
+            } else if (mapping.stride == 32 and mapping.soffset_value == 0 and
+                mapping.unified_format == 74 and mapping.instruction_pc == 240)
+            {
+                unity_sprite_position = mapping;
+            } else if (mapping.stride == 32 and mapping.soffset_value == 24 and
+                mapping.unified_format == 64 and mapping.instruction_pc == 404)
+            {
+                unity_sprite_uv = mapping;
+            } else if (mapping.stride == 32 and mapping.soffset_value == 12 and
+                mapping.unified_format == 74 and mapping.instruction_pc == 484)
+            {
+                unity_sprite_color = mapping;
+            }
+        }
+        const unity_sprite_fallback = target.descriptor.width == 3840 and
+            target.descriptor.height == 2160 and vertex_stage == .export_shader and
+            vertex_address == 0x48c400 and paired_parameter_mask == 0x3 and
+            vertex_storage.mapping_count == 4 and unity_sprite_matrix != null and
+            unity_sprite_position != null and unity_sprite_uv != null and
+            unity_sprite_color != null;
+        const centered_retro_framebuffer = unity_sprite_fallback and
+            fragment_address == 0x48c200 and fragment_mapping_count == 1 and
+            graphics_resources.descriptors[0].width == 256 and
+            graphics_resources.descriptors[0].height == 240;
         // The guest sometimes declares the 2000-line UI viewport through a
         // 2160-line backing image. Match the complete Unity fetch signature,
         // not only that unstable allocation height; the four instruction PCs
@@ -10910,7 +11051,9 @@ pub const Renderer = struct {
             unity_ui_position.?.descriptor_index == unity_ui_record.?.descriptor_index;
         var unity_ui_fragment_module: ?rdna2.spirv.Module = null;
         defer if (unity_ui_fragment_module) |*module| module.deinit(self.allocator);
-        if (unity_ui_fallback) {
+        if (unity_ui_fallback or (unity_sprite_fallback and fragment_address == 0x48c200 and
+            fragment_mapping_count == 1))
+        {
             unity_ui_fragment_module = try buildUnityUiFragmentSpirv(
                 self.allocator,
                 graphics_resources.mappings[0],
@@ -10923,10 +11066,35 @@ pub const Renderer = struct {
                 } else null,
             );
         }
+        var nv12_module: ?rdna2.spirv.Module = null;
+        defer if (nv12_module) |*module| module.deinit(self.allocator);
         var i420_module: ?rdna2.spirv.Module = null;
         defer if (i420_module) |*module| module.deinit(self.allocator);
         if (planar_video) |video| {
-            if (video.chroma_v != null) {
+            if (video.chroma_v == null) {
+                var ordered_bindings: [2]rdna2.spirv.SampledImageBinding = undefined;
+                var found_luma = false;
+                var found_chroma = false;
+                for (graphics_resources.mappings[0..fragment_mapping_count]) |binding| {
+                    const image = graphics_resources.descriptors[@intCast(binding.descriptor_index)];
+                    if (image.address == video.luma.address) {
+                        ordered_bindings[0] = binding;
+                        ordered_bindings[0].instruction_pc = 8;
+                        found_luma = true;
+                    } else if (image.address == video.chroma_u.address) {
+                        ordered_bindings[1] = binding;
+                        ordered_bindings[1].instruction_pc = 16;
+                        found_chroma = true;
+                    }
+                }
+                if (found_luma and found_chroma) {
+                    nv12_module = try buildNv12FragmentSpirv(
+                        self.allocator,
+                        &ordered_bindings,
+                        .{ video.luma.width, target.descriptor.height },
+                    );
+                }
+            } else {
                 i420_module = try buildI420FragmentSpirv(
                     self.allocator,
                     graphics_resources.mappings[0..fragment_mapping_count],
@@ -10941,6 +11109,8 @@ pub const Renderer = struct {
         else if (texture_probe_module) |module|
             module.words
         else if (parameter_probe_module) |module|
+            module.words
+        else if (nv12_module) |module|
             module.words
         else if (i420_module) |module|
             module.words
@@ -10977,6 +11147,22 @@ pub const Renderer = struct {
                     unity_ui_position.?,
                     unity_ui_record.?,
                     unity_ui_color.?,
+                )
+            else if (centered_retro_framebuffer)
+                buildFullscreenProbeVertexSpirv(
+                    self.allocator,
+                    true,
+                    1.0,
+                    (@as(f32, @floatFromInt(graphics_resources.descriptors[0].width)) /
+                        @as(f32, @floatFromInt(graphics_resources.descriptors[0].height))) /
+                        (@as(f32, @floatFromInt(target.descriptor.width)) /
+                            @as(f32, @floatFromInt(target.descriptor.height))),
+                )
+            else if (unity_sprite_fallback)
+                buildUnitySpriteVertexSpirv(
+                    self.allocator,
+                    vertex_storage.mappings[0..vertex_storage.mapping_count],
+                    unity_sprite_matrix.?,
                 )
             else
                 rdna2.translateProgramSpirvWithPipelineOptions(self.allocator, &vertex_program, .{
@@ -11172,6 +11358,7 @@ pub const Renderer = struct {
                     @as(f32, @floatFromInt(video.source_width)) / @as(f32, @floatFromInt(video.luma.width))
                 else
                     1.0,
+                1.0,
             );
             defer probe_vertex_module.deinit(self.allocator);
             var probe_pipeline_state = pipeline_state;
@@ -17303,6 +17490,7 @@ test "planar video recognizes padded I420 and NV12 decoder surfaces" {
 
     const padded = recognizePlanarVideoPass(1920, 1080, &i420_planes).?;
     try std.testing.expectEqualStrings("I420", padded.layoutName());
+    try std.testing.expect(padded.fills_target);
     try std.testing.expectEqual(@as(u32, 1920), padded.source_width);
     try std.testing.expectEqual(@as(u64, i420_planes[1].address), padded.chroma_u.address);
     try std.testing.expectEqual(@as(u64, i420_planes[2].address), padded.chroma_v.?.address);
@@ -17312,6 +17500,7 @@ test "planar video recognizes padded I420 and NV12 decoder surfaces" {
     const nv12_pass = recognizePlanarVideoPass(1920, 1080, &nv12).?;
     try std.testing.expectEqualStrings("NV12", nv12_pass.layoutName());
     try std.testing.expect(nv12_pass.chroma_v == null);
+    try std.testing.expect(nv12_pass.fills_target);
 
     i420_planes[0].width = 1344;
     i420_planes[0].height = 720;
@@ -17335,7 +17524,9 @@ test "planar video recognizes padded I420 and NV12 decoder surfaces" {
     i420_planes[2].width = 1088;
     i420_planes[2].height = 540;
     i420_planes[2].pitch = 1088;
-    try std.testing.expect(recognizePlanarVideoPass(1920, 1080, &i420_planes) == null);
+    const embedded = recognizePlanarVideoPass(1920, 1080, &i420_planes).?;
+    try std.testing.expect(!embedded.fills_target);
+    try std.testing.expectEqual(@as(u32, 2176), embedded.source_width);
 }
 
 /// A T# may name optional GPU-only depth memory on a control-flow path that is
@@ -19378,6 +19569,86 @@ fn buildParameterProbeFragmentSpirv(allocator: std.mem.Allocator) !rdna2.spirv.M
     });
 }
 
+/// Unity's ordinary sprite export shader consumes a unit quad, a per-draw
+/// row-major object-to-clip matrix, RGB colour and UV. The merged guest prolog
+/// currently loses its vertex-index seed before the formatted fetches, which
+/// collapses the primitive. Replaying the final, data-driven operation keeps
+/// the fallback independent of any particular sprite position or size.
+fn buildUnitySpriteVertexSpirv(
+    allocator: std.mem.Allocator,
+    storage: []const gpu.ShaderSpirvStorageBufferBinding,
+    matrix: gpu.ShaderSpirvStorageBufferBinding,
+) !rdna2.spirv.Module {
+    const vgpr = struct {
+        fn at(reg: u32) rdna2.Operand {
+            return .{ .kind = .vgpr, .reg = reg };
+        }
+    }.at;
+    const sgpr = struct {
+        fn at(reg: u32) rdna2.Operand {
+            return .{ .kind = .sgpr, .reg = reg };
+        }
+    }.at;
+    const float = struct {
+        fn value(number: f32) rdna2.Operand {
+            return .{ .kind = .literal_constant, .value = @bitCast(number) };
+        }
+    }.value;
+
+    var program = rdna2.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(allocator);
+    try program.instructions.appendSlice(allocator, &.{
+        // The matched vertex allocation is an immutable unit quad. Produce
+        // its position and UV directly from VertexIndex so none of the broken
+        // merged attribute prolog survives in this reduced program.
+        .{ .pc = 0, .opcode = .v_and_b32, .dst = vgpr(8), .src0 = vgpr(5), .src1 = .{ .kind = .integer_inline_constant, .value = 1, .signed_val = 1 }, .src_count = 2 },
+        .{ .pc = 4, .opcode = .v_lshrrev_b32, .dst = vgpr(9), .src0 = .{ .kind = .integer_inline_constant, .value = 1, .signed_val = 1 }, .src1 = vgpr(5), .src_count = 2 },
+        .{ .pc = 8, .opcode = .v_cvt_f32_u32, .dst = vgpr(8), .src0 = vgpr(8), .src_count = 1 },
+        .{ .pc = 12, .opcode = .v_cvt_f32_u32, .dst = vgpr(9), .src0 = vgpr(9), .src_count = 1 },
+        .{ .pc = 16, .opcode = .v_mov_b32, .dst = vgpr(10), .src0 = float(0), .src_count = 1 },
+        .{ .pc = 20, .opcode = .v_mov_b32, .dst = vgpr(12), .src0 = vgpr(8), .src_count = 1 },
+        .{ .pc = 24, .opcode = .v_mov_b32, .dst = vgpr(13), .src0 = vgpr(9), .src_count = 1 },
+        .{ .pc = 28, .opcode = .v_mov_b32, .dst = vgpr(4), .src0 = float(1), .src_count = 1 },
+        .{ .pc = 32, .opcode = .v_mov_b32, .dst = vgpr(5), .src0 = float(1), .src_count = 1 },
+        .{ .pc = 36, .opcode = .v_mov_b32, .dst = vgpr(6), .src0 = float(1), .src_count = 1 },
+        .{ .pc = 40, .opcode = .v_mov_b32, .dst = vgpr(7), .src0 = float(1), .src_count = 1 },
+
+        // PCs deliberately do not alias the two instruction-qualified V#s
+        // that also use s8; storageBinding then selects the unqualified
+        // per-draw constant buffer. Each load is one row of the matrix.
+        .{ .pc = 0x700, .opcode = .buffer_load_format_xyzw, .dst = vgpr(16), .src0 = .{ .kind = .null }, .src1 = sgpr(matrix.resource_sgpr), .src2 = .{ .kind = .null }, .src_count = 3, .memory_offset = 0 },
+        .{ .pc = 0x708, .opcode = .buffer_load_format_xyzw, .dst = vgpr(20), .src0 = .{ .kind = .null }, .src1 = sgpr(matrix.resource_sgpr), .src2 = .{ .kind = .null }, .src_count = 3, .memory_offset = 16 },
+        .{ .pc = 0x710, .opcode = .buffer_load_format_xyzw, .dst = vgpr(24), .src0 = .{ .kind = .null }, .src1 = sgpr(matrix.resource_sgpr), .src2 = .{ .kind = .null }, .src_count = 3, .memory_offset = 32 },
+        .{ .pc = 0x718, .opcode = .buffer_load_format_xyzw, .dst = vgpr(28), .src0 = .{ .kind = .null }, .src1 = sgpr(matrix.resource_sgpr), .src2 = .{ .kind = .null }, .src_count = 3, .memory_offset = 48 },
+
+        // Row-vector multiplication: clip = float4(position, 1) * matrix.
+        .{ .pc = 0x720, .opcode = .v_mad_f32, .dst = vgpr(32), .src0 = vgpr(8), .src1 = vgpr(16), .src2 = vgpr(28), .src_count = 3 },
+        .{ .pc = 0x724, .opcode = .v_mad_f32, .dst = vgpr(32), .src0 = vgpr(9), .src1 = vgpr(20), .src2 = vgpr(32), .src_count = 3 },
+        .{ .pc = 0x728, .opcode = .v_mad_f32, .dst = vgpr(32), .src0 = vgpr(10), .src1 = vgpr(24), .src2 = vgpr(32), .src_count = 3 },
+        .{ .pc = 0x72c, .opcode = .v_mad_f32, .dst = vgpr(33), .src0 = vgpr(8), .src1 = vgpr(17), .src2 = vgpr(29), .src_count = 3 },
+        .{ .pc = 0x730, .opcode = .v_mad_f32, .dst = vgpr(33), .src0 = vgpr(9), .src1 = vgpr(21), .src2 = vgpr(33), .src_count = 3 },
+        .{ .pc = 0x734, .opcode = .v_mad_f32, .dst = vgpr(33), .src0 = vgpr(10), .src1 = vgpr(25), .src2 = vgpr(33), .src_count = 3 },
+        .{ .pc = 0x738, .opcode = .v_mad_f32, .dst = vgpr(34), .src0 = vgpr(8), .src1 = vgpr(18), .src2 = vgpr(30), .src_count = 3 },
+        .{ .pc = 0x73c, .opcode = .v_mad_f32, .dst = vgpr(34), .src0 = vgpr(9), .src1 = vgpr(22), .src2 = vgpr(34), .src_count = 3 },
+        .{ .pc = 0x740, .opcode = .v_mad_f32, .dst = vgpr(34), .src0 = vgpr(10), .src1 = vgpr(26), .src2 = vgpr(34), .src_count = 3 },
+        .{ .pc = 0x744, .opcode = .v_mad_f32, .dst = vgpr(35), .src0 = vgpr(8), .src1 = vgpr(19), .src2 = vgpr(31), .src_count = 3 },
+        .{ .pc = 0x748, .opcode = .v_mad_f32, .dst = vgpr(35), .src0 = vgpr(9), .src1 = vgpr(23), .src2 = vgpr(35), .src_count = 3 },
+        .{ .pc = 0x74c, .opcode = .v_mad_f32, .dst = vgpr(35), .src0 = vgpr(10), .src1 = vgpr(27), .src2 = vgpr(35), .src_count = 3 },
+
+        .{ .pc = 0x750, .opcode = .exp, .export_target = 0x0c, .export_enable = 0xf, .src0 = vgpr(32), .src1 = vgpr(33), .src2 = vgpr(34), .src3 = vgpr(35), .src_count = 4 },
+        .{ .pc = 0x758, .opcode = .exp, .export_target = 0x20, .export_enable = 0xf, .src0 = vgpr(12), .src1 = vgpr(13), .src2 = float(0), .src3 = float(1), .src_count = 4 },
+        .{ .pc = 0x760, .opcode = .exp, .export_target = 0x21, .export_enable = 0xf, .src0 = vgpr(4), .src1 = vgpr(5), .src2 = vgpr(6), .src3 = vgpr(7), .src_count = 4 },
+        .{ .pc = 0x768, .opcode = .s_endpgm },
+    });
+    return rdna2.translateSpirv(allocator, &program, .{
+        .stage = .vertex,
+        .vertex_index_vgpr = 5,
+        .storage_buffers = storage,
+        .parameter_mask = 0x3,
+        .descriptor_array_length = maximum_storage_descriptors,
+    });
+}
+
 /// Unity's Prospero UI export shader is a merged ES/GS program. Its long
 /// hardware prolog selects vertex/instance indices through wave EXEC state
 /// before issuing four ordinary interleaved attribute loads. Vulkan already
@@ -19709,6 +19980,98 @@ fn buildI420FragmentSpirv(
     });
 }
 
+/// Samples the decoder's luma plane and interleaved UV plane and exports an
+/// ordinary RGBA colour. Some guest NV12 shaders currently translate without
+/// an error but produce an all-zero export; matching the already validated
+/// plane layout here keeps video on the GPU while avoiding a CPU readback and
+/// full-frame RGBA upload.
+fn buildNv12FragmentSpirv(
+    allocator: std.mem.Allocator,
+    bindings: []const rdna2.spirv.SampledImageBinding,
+    fragment_extent: [2]u32,
+) !rdna2.spirv.Module {
+    if (bindings.len != 2) return Error.UnsupportedSampledImage;
+    const vgpr = struct {
+        fn at(reg: u32) rdna2.Operand {
+            return .{ .kind = .vgpr, .reg = reg };
+        }
+    }.at;
+    const sgpr = struct {
+        fn at(reg: u32) rdna2.Operand {
+            return .{ .kind = .sgpr, .reg = reg };
+        }
+    }.at;
+    const uint = struct {
+        fn value(bits: u32) rdna2.Operand {
+            return .{ .kind = .integer_inline_constant, .value = bits, .signed_val = @intCast(bits) };
+        }
+    }.value;
+    const float = struct {
+        fn value(number: f32) rdna2.Operand {
+            return .{ .kind = .literal_constant, .value = @bitCast(number) };
+        }
+    }.value;
+
+    var program = rdna2.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(allocator);
+    try program.instructions.appendSlice(allocator, &.{
+        .{ .pc = 0, .family = .vintrp, .opcode = .v_interp_mov_f32, .dst = vgpr(0), .src0 = uint(0), .src1 = uint(0), .src2 = uint(0), .src_count = 3 },
+        .{ .pc = 4, .family = .vintrp, .opcode = .v_interp_mov_f32, .dst = vgpr(1), .src0 = uint(1), .src1 = uint(0), .src2 = uint(1), .src_count = 3 },
+        .{
+            .pc = 8,
+            .family = .mimg,
+            .opcode_id = 0x20,
+            .opcode = .image_sample,
+            .dst = vgpr(2),
+            .src0 = vgpr(0),
+            .src1 = sgpr(bindings[0].resource_sgpr),
+            .src2 = sgpr(bindings[0].sampler_sgpr),
+            .src_count = 3,
+            .data_mask = 1,
+            .image_dimension = .dim_2d,
+            .image_address_components = 2,
+        },
+        .{
+            .pc = 16,
+            .family = .mimg,
+            .opcode_id = 0x20,
+            .opcode = .image_sample,
+            .dst = vgpr(3),
+            .src0 = vgpr(0),
+            .src1 = sgpr(bindings[1].resource_sgpr),
+            .src2 = sgpr(bindings[1].sampler_sgpr),
+            .src_count = 3,
+            .data_mask = 3,
+            .image_dimension = .dim_2d,
+            .image_address_components = 2,
+        },
+        // Limited-range BT.601. The interleaved sample writes U to v3 and V
+        // to v4, matching the three-plane conversion immediately above.
+        .{ .pc = 24, .opcode = .v_mul_f32, .dst = vgpr(5), .src0 = vgpr(2), .src1 = float(1.164_383_5), .src_count = 2 },
+        .{ .pc = 28, .opcode = .v_mul_f32, .dst = vgpr(6), .src0 = vgpr(4), .src1 = float(1.596_027_1), .src_count = 2 },
+        .{ .pc = 32, .opcode = .v_add_f32, .dst = vgpr(6), .src0 = vgpr(6), .src1 = vgpr(5), .src_count = 2 },
+        .{ .pc = 36, .opcode = .v_add_f32, .dst = vgpr(6), .src0 = vgpr(6), .src1 = float(-0.870_785_2), .src_count = 2 },
+        .{ .pc = 40, .opcode = .v_mul_f32, .dst = vgpr(7), .src0 = vgpr(3), .src1 = float(-0.391_762_3), .src_count = 2 },
+        .{ .pc = 44, .opcode = .v_add_f32, .dst = vgpr(7), .src0 = vgpr(7), .src1 = vgpr(5), .src_count = 2 },
+        .{ .pc = 48, .opcode = .v_mul_f32, .dst = vgpr(8), .src0 = vgpr(4), .src1 = float(-0.812_968_3), .src_count = 2 },
+        .{ .pc = 52, .opcode = .v_add_f32, .dst = vgpr(7), .src0 = vgpr(7), .src1 = vgpr(8), .src_count = 2 },
+        .{ .pc = 56, .opcode = .v_add_f32, .dst = vgpr(7), .src0 = vgpr(7), .src1 = float(0.529_593_8), .src_count = 2 },
+        .{ .pc = 60, .opcode = .v_mul_f32, .dst = vgpr(9), .src0 = vgpr(3), .src1 = float(2.017_232_2), .src_count = 2 },
+        .{ .pc = 64, .opcode = .v_add_f32, .dst = vgpr(9), .src0 = vgpr(9), .src1 = vgpr(5), .src_count = 2 },
+        .{ .pc = 68, .opcode = .v_add_f32, .dst = vgpr(9), .src0 = vgpr(9), .src1 = float(-1.081_390_7), .src_count = 2 },
+        .{ .pc = 72, .opcode = .v_mov_b32, .dst = vgpr(10), .src0 = float(1.0), .src_count = 1 },
+        .{ .pc = 76, .family = .exp, .opcode = .exp, .export_target = 0, .export_enable = 0xf, .export_done = true, .src0 = vgpr(6), .src1 = vgpr(7), .src2 = vgpr(9), .src3 = vgpr(10), .src_count = 4 },
+        .{ .pc = 84, .family = .sopp, .opcode = .s_endpgm },
+    });
+    return rdna2.translateSpirv(allocator, &program, .{
+        .stage = .fragment,
+        .fragment_extent = fragment_extent,
+        .sampled_images = bindings,
+        .parameter_mask = 1,
+        .infer_fragment_parameter_mask = false,
+    });
+}
+
 fn appendSpirvInstruction(
     allocator: std.mem.Allocator,
     words: *std.ArrayList(u32),
@@ -19911,6 +20274,7 @@ fn buildFullscreenProbeVertexSpirv(
     allocator: std.mem.Allocator,
     flip_v: bool,
     u_scale: f32,
+    clip_x_scale: f32,
 ) !rdna2.spirv.Module {
     const vgpr = struct {
         fn at(reg: u32) rdna2.Operand {
@@ -19943,17 +20307,18 @@ fn buildFullscreenProbeVertexSpirv(
         .{ .pc = 12, .opcode = .v_cvt_f32_u32, .dst = vgpr(3), .src0 = vgpr(1), .src_count = 1 },
         .{ .pc = 16, .opcode = .v_cvt_f32_u32, .dst = vgpr(4), .src0 = vgpr(2), .src_count = 1 },
         .{ .pc = 20, .opcode = .v_sub_f32, .dst = vgpr(1), .src0 = vgpr(3), .src1 = float(1.0), .src_count = 2 },
-        .{ .pc = 24, .opcode = .v_sub_f32, .dst = vgpr(2), .src0 = vgpr(4), .src1 = float(1.0), .src_count = 2 },
-        .{ .pc = 28, .opcode = .v_mul_f32, .dst = vgpr(3), .src0 = vgpr(3), .src1 = float(0.5), .src_count = 2 },
-        .{ .pc = 32, .opcode = .v_mul_f32, .dst = vgpr(4), .src0 = vgpr(4), .src1 = float(0.5), .src_count = 2 },
-        .{ .pc = 36, .opcode = .v_mov_b32, .dst = vgpr(5), .src0 = float(0.0), .src_count = 1 },
-        .{ .pc = 40, .opcode = .v_mov_b32, .dst = vgpr(6), .src0 = float(1.0), .src_count = 1 },
-        .{ .pc = 44, .opcode = .v_sub_f32, .dst = vgpr(7), .src0 = float(1.0), .src1 = vgpr(4), .src_count = 2 },
-        .{ .pc = 48, .opcode = .v_mul_f32, .dst = vgpr(3), .src0 = vgpr(3), .src1 = float(u_scale), .src_count = 2 },
-        .{ .pc = 52, .family = .exp, .opcode = .exp, .export_target = 0x0c, .export_enable = 0xf, .src0 = vgpr(1), .src1 = vgpr(2), .src2 = vgpr(5), .src3 = vgpr(6), .src_count = 4 },
-        .{ .pc = 60, .family = .exp, .opcode = .exp, .export_target = 0x20, .export_enable = 0xf, .src0 = vgpr(3), .src1 = if (flip_v) vgpr(7) else vgpr(4), .src2 = vgpr(5), .src3 = vgpr(6), .src_count = 4 },
-        .{ .pc = 68, .family = .exp, .opcode = .exp, .export_target = 0x21, .export_enable = 0xf, .export_done = true, .src0 = vgpr(6), .src1 = vgpr(6), .src2 = vgpr(6), .src3 = vgpr(6), .src_count = 4 },
-        .{ .pc = 76, .family = .sopp, .opcode = .s_endpgm },
+        .{ .pc = 24, .opcode = .v_mul_f32, .dst = vgpr(1), .src0 = vgpr(1), .src1 = float(clip_x_scale), .src_count = 2 },
+        .{ .pc = 28, .opcode = .v_sub_f32, .dst = vgpr(2), .src0 = vgpr(4), .src1 = float(1.0), .src_count = 2 },
+        .{ .pc = 32, .opcode = .v_mul_f32, .dst = vgpr(3), .src0 = vgpr(3), .src1 = float(0.5), .src_count = 2 },
+        .{ .pc = 36, .opcode = .v_mul_f32, .dst = vgpr(4), .src0 = vgpr(4), .src1 = float(0.5), .src_count = 2 },
+        .{ .pc = 40, .opcode = .v_mov_b32, .dst = vgpr(5), .src0 = float(0.0), .src_count = 1 },
+        .{ .pc = 44, .opcode = .v_mov_b32, .dst = vgpr(6), .src0 = float(1.0), .src_count = 1 },
+        .{ .pc = 48, .opcode = .v_sub_f32, .dst = vgpr(7), .src0 = float(1.0), .src1 = vgpr(4), .src_count = 2 },
+        .{ .pc = 52, .opcode = .v_mul_f32, .dst = vgpr(3), .src0 = vgpr(3), .src1 = float(u_scale), .src_count = 2 },
+        .{ .pc = 56, .family = .exp, .opcode = .exp, .export_target = 0x0c, .export_enable = 0xf, .src0 = vgpr(1), .src1 = vgpr(2), .src2 = vgpr(5), .src3 = vgpr(6), .src_count = 4 },
+        .{ .pc = 64, .family = .exp, .opcode = .exp, .export_target = 0x20, .export_enable = 0xf, .src0 = vgpr(3), .src1 = if (flip_v) vgpr(7) else vgpr(4), .src2 = vgpr(5), .src3 = vgpr(6), .src_count = 4 },
+        .{ .pc = 72, .family = .exp, .opcode = .exp, .export_target = 0x21, .export_enable = 0xf, .export_done = true, .src0 = vgpr(6), .src1 = vgpr(6), .src2 = vgpr(6), .src3 = vgpr(6), .src_count = 4 },
+        .{ .pc = 80, .family = .sopp, .opcode = .s_endpgm },
     });
     return rdna2.translateSpirv(allocator, &program, .{
         .stage = .vertex,

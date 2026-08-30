@@ -121,6 +121,89 @@ const callback_null: u32 = 0;
 const header_done: u32 = 0x0000_0001;
 const mmsyserr_noerror: u32 = 0;
 
+fn makeWaveFormat(config: Config) WAVEFORMATEX {
+    const block_align: u16 = @intCast(config.bytesPerFrame());
+    return .{
+        .wFormatTag = switch (config.format) {
+            .signed16 => format_pcm,
+            .float32 => format_ieee_float,
+        },
+        .nChannels = config.channels,
+        .nSamplesPerSec = config.frequency,
+        .nAvgBytesPerSec = config.frequency * block_align,
+        .nBlockAlign = block_align,
+        .wBitsPerSample = config.format.bytes() * 8,
+        .cbSize = 0,
+    };
+}
+
+fn passthroughSamples(_: Config, source: []const u8, destination: []u8) usize {
+    const length = @min(source.len, destination.len);
+    @memcpy(destination[0..length], source[0..length]);
+    return length;
+}
+
+fn normalizedSample(config: Config, source: []const u8, frame: usize, channel: usize) f32 {
+    if (channel >= config.channels) return 0;
+    const sample_index = frame * @as(usize, config.channels) + channel;
+    return switch (config.format) {
+        .signed16 => blk: {
+            const offset = sample_index * @sizeOf(i16);
+            if (offset + @sizeOf(i16) > source.len) break :blk 0;
+            const sample = std.mem.readInt(i16, source[offset..][0..2], .little);
+            break :blk @as(f32, @floatFromInt(sample)) / 32768.0;
+        },
+        .float32 => blk: {
+            const offset = sample_index * @sizeOf(f32);
+            if (offset + @sizeOf(f32) > source.len) break :blk 0;
+            const sample: f32 = @bitCast(std.mem.readInt(u32, source[offset..][0..4], .little));
+            break :blk if (std.math.isFinite(sample)) sample else 0;
+        },
+    };
+}
+
+fn signed16Sample(sample: f32) i16 {
+    const clipped = std.math.clamp(sample, -1.0, 1.0);
+    return @intFromFloat(clipped * 32767.0);
+}
+
+/// Converts the console's interleaved mono/stereo/7.1 mix to the baseline host
+/// format. The first two channels retain unity gain; centre, LFE, side and rear
+/// channels are folded in with conventional attenuation and then saturated.
+fn convertToStereoSigned16(config: Config, source: []const u8, destination: []u8) usize {
+    const source_frame_bytes = config.bytesPerFrame();
+    if (source_frame_bytes == 0) return 0;
+    const frames = @min(
+        @as(usize, config.frames),
+        @min(source.len / source_frame_bytes, destination.len / (2 * @sizeOf(i16))),
+    );
+    const surround_gain: f32 = 0.70710677;
+    const lfe_gain: f32 = 0.5;
+    for (0..frames) |frame| {
+        var left = normalizedSample(config, source, frame, 0);
+        var right = if (config.channels == 1) left else normalizedSample(config, source, frame, 1);
+        if (config.channels > 2) {
+            const center = normalizedSample(config, source, frame, 2) * surround_gain;
+            left += center;
+            right += center;
+        }
+        if (config.channels > 3) {
+            const lfe = normalizedSample(config, source, frame, 3) * lfe_gain;
+            left += lfe;
+            right += lfe;
+        }
+        if (config.channels > 4) left += normalizedSample(config, source, frame, 4) * surround_gain;
+        if (config.channels > 5) right += normalizedSample(config, source, frame, 5) * surround_gain;
+        if (config.channels > 6) left += normalizedSample(config, source, frame, 6) * surround_gain;
+        if (config.channels > 7) right += normalizedSample(config, source, frame, 7) * surround_gain;
+
+        const offset = frame * 2 * @sizeOf(i16);
+        std.mem.writeInt(i16, destination[offset..][0..2], signed16Sample(left), .little);
+        std.mem.writeInt(i16, destination[offset + 2 ..][0..2], signed16Sample(right), .little);
+    }
+    return frames * 2 * @sizeOf(i16);
+}
+
 extern "winmm" fn waveOutOpen(
     out_handle: *?*anyopaque,
     device_id: u32,
@@ -159,7 +242,11 @@ var buffers: [maximum_queue_depth][maximum_buffer_bytes]u8 align(16) = undefined
 
 pub const Device = struct {
     handle: ?*anyopaque = null,
+    /// Guest PCM shape and the shape accepted by the Windows endpoint. They
+    /// differ when a surround/float stream is converted to universal stereo
+    /// PCM before submission.
     config: Config = .{ .frequency = 0, .channels = 0, .format = .signed16, .frames = 0 },
+    output_config: Config = .{ .frequency = 0, .channels = 0, .format = .signed16, .frames = 0 },
     headers: [maximum_queue_depth]WAVEHDR = @splat(.{ .lpData = null, .dwBufferLength = 0 }),
     prepared: usize = 0,
     active_depth: usize = 0,
@@ -189,28 +276,32 @@ pub const Device = struct {
             return Error.DeviceUnavailable;
         }
 
-        const block_align: u16 = @intCast(config.bytesPerFrame());
-        const wave_format = WAVEFORMATEX{
-            .wFormatTag = switch (config.format) {
-                .signed16 => format_pcm,
-                .float32 => format_ieee_float,
-            },
-            .nChannels = config.channels,
-            .nSamplesPerSec = config.frequency,
-            .nAvgBytesPerSec = config.frequency * block_align,
-            .nBlockAlign = block_align,
-            .wBitsPerSample = config.format.bytes() * 8,
-            .cbSize = 0,
-        };
-
+        var output_config = config;
+        var wave_format = makeWaveFormat(output_config);
         var handle: ?*anyopaque = null;
         if (waveOutOpen(&handle, wave_mapper, &wave_format, 0, 0, callback_null) != mmsyserr_noerror) {
-            return Error.DeviceUnavailable;
+            // Consumer Windows endpoints are consistently required to accept
+            // 16-bit stereo PCM, while their legacy waveOut adapters often
+            // reject an otherwise valid 7.1 float stream. Preserve the guest
+            // contract and downmix at the queue boundary when the exact format
+            // is unavailable.
+            if (config.channels == 2 and config.format == .signed16) return Error.DeviceUnavailable;
+            output_config.channels = 2;
+            output_config.format = .signed16;
+            wave_format = makeWaveFormat(output_config);
+            if (waveOutOpen(&handle, wave_mapper, &wave_format, 0, 0, callback_null) != mmsyserr_noerror) {
+                return Error.DeviceUnavailable;
+            }
+            std.debug.print(
+                "[audio] host converts {d}ch {s} to stereo signed16\n",
+                .{ config.channels, @tagName(config.format) },
+            );
         }
         errdefer _ = waveOutClose(handle);
 
         self.handle = handle;
         self.config = config;
+        self.output_config = output_config;
         self.prepared = 0;
         self.active_depth = queueDepth(config);
         self.next = 0;
@@ -224,7 +315,7 @@ pub const Device = struct {
         // three 256-frame buffers and create the underrun it is waiting to avoid.
         self.precise_timer_active = timeBeginPeriod(time_period_ms) == mmsyserr_noerror;
 
-        const length: u32 = @intCast(config.bufferBytes());
+        const length: u32 = @intCast(output_config.bufferBytes());
         // Prepare the bounded maximum once. Inactive headers remain completed,
         // so an underrun can grow the jitter reserve without reopening the
         // device or doing driver allocation on the title's mixer thread.
@@ -289,12 +380,16 @@ pub const Device = struct {
         // Into the buffer this header was prepared against. The pairing is
         // fixed at open: a prepared header is pinned to its buffer, and pointing
         // it somewhere else afterwards is not something the device permits.
-        @memcpy(buffers[slot][0..samples.len], samples);
+        const output_length = if (self.output_config.channels == self.config.channels and
+            self.output_config.format == self.config.format)
+            passthroughSamples(self.config, samples, &buffers[slot])
+        else
+            convertToStereoSigned16(self.config, samples, &buffers[slot]);
         if (self.fade_next_buffer) {
-            self.fadeInAfterUnderrun(buffers[slot][0..samples.len]);
+            self.fadeInAfterUnderrun(buffers[slot][0..output_length]);
             self.fade_next_buffer = false;
         }
-        header.dwBufferLength = @intCast(samples.len);
+        header.dwBufferLength = @intCast(output_length);
         self.next = (slot + 1) % self.active_depth;
 
         if (!self.primed) {
@@ -336,17 +431,18 @@ pub const Device = struct {
     /// underrun is detected. Ramp the recovered buffer in over 2 ms so an
     /// arbitrary non-zero first sample cannot turn recovery into another click.
     fn fadeInAfterUnderrun(self: *const Device, bytes: []u8) void {
-        const bytes_per_frame = self.config.bytesPerFrame();
+        const output = if (self.output_config.frequency != 0) self.output_config else self.config;
+        const bytes_per_frame = output.bytesPerFrame();
         if (bytes_per_frame == 0) return;
         const available_frames = bytes.len / bytes_per_frame;
-        const fade_frames = @min(available_frames, @as(usize, self.config.frequency / 500));
+        const fade_frames = @min(available_frames, @as(usize, output.frequency / 500));
         if (fade_frames < 2) return;
         const denominator: f32 = @floatFromInt(fade_frames - 1);
         for (0..fade_frames) |frame| {
             const gain = @as(f32, @floatFromInt(frame)) / denominator;
-            for (0..self.config.channels) |channel| {
-                const sample_index = frame * self.config.channels + channel;
-                switch (self.config.format) {
+            for (0..output.channels) |channel| {
+                const sample_index = frame * output.channels + channel;
+                switch (output.format) {
                     .signed16 => {
                         const offset = sample_index * 2;
                         const sample = std.mem.readInt(i16, bytes[offset..][0..2], .little);
@@ -418,6 +514,23 @@ test "a frame is as wide as its channels and sample size" {
     const surround32 = Config{ .frequency = 48000, .channels = 8, .format = .float32, .frames = 256 };
     try testing.expectEqual(@as(u32, 32), surround32.bytesPerFrame());
     try testing.expectEqual(@as(u64, 8192), surround32.bufferBytes());
+}
+
+test "7.1 float fallback preserves fronts and folds centre into stereo PCM" {
+    const config = Config{ .frequency = 48_000, .channels = 8, .format = .float32, .frames = 2 };
+    var samples: [16]f32 = @splat(0);
+    samples[0] = 0.25;
+    samples[1] = -0.25;
+    samples[8 + 2] = 0.5;
+    var output: [2 * 2 * @sizeOf(i16)]u8 = @splat(0);
+    const bytes = convertToStereoSigned16(config, std.mem.sliceAsBytes(&samples), &output);
+    try testing.expectEqual(output.len, bytes);
+    try testing.expectEqual(@as(i16, 8191), std.mem.readInt(i16, output[0..2], .little));
+    try testing.expectEqual(@as(i16, -8191), std.mem.readInt(i16, output[2..4], .little));
+    const centre_left = std.mem.readInt(i16, output[4..6], .little);
+    const centre_right = std.mem.readInt(i16, output[6..8], .little);
+    try testing.expectEqual(centre_left, centre_right);
+    try testing.expect(centre_left > 11_000 and centre_left < 12_000);
 }
 
 test "latency target becomes a bounded whole-buffer jitter reserve" {
