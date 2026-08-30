@@ -1566,6 +1566,7 @@ const HtileResolveStats = struct {
 const TextureProbe = struct {
     address: u64 = 0,
     span: usize = 0,
+    full_content: bool = false,
     page_generation: u64 = 0,
     source_generation: u64 = 0,
     hash: u64 = 0,
@@ -7321,26 +7322,30 @@ pub const Renderer = struct {
         address: u64,
         span: usize,
         source_generation: u64,
+        full_content: bool,
     ) u64 {
         for (self.texture_probes[0..self.texture_probe_count]) |probe| {
-            if (!probe.valid or probe.address != address or probe.span != span) continue;
+            if (!probe.valid or probe.address != address or probe.span != span or
+                probe.full_content != full_content) continue;
             if (!probe.hash_valid or probe.source_generation != source_generation) break;
             return probe.hash;
         }
         const started = hostTimestampNs();
-        const hash = hashGuestMemoryRange(memory, address, span);
+        const hash = hashGuestMemoryRange(memory, address, span, full_content);
         self.frame_profile.texture_probe_ns +|= elapsedHostNanoseconds(started);
 
         const entry = TextureProbe{
             .address = address,
             .span = span,
+            .full_content = full_content,
             .source_generation = source_generation,
             .hash = hash,
             .hash_valid = true,
             .valid = true,
         };
         for (self.texture_probes[0..self.texture_probe_count]) |*probe| {
-            if (probe.address != address or probe.span != span) continue;
+            if (probe.address != address or probe.span != span or
+                probe.full_content != full_content) continue;
             probe.* = entry;
             return hash;
         }
@@ -13495,6 +13500,13 @@ pub const Renderer = struct {
         const probe_span = std.math.cast(usize, source_bytes) orelse 0;
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
         const state_hash = sampledImageStateHash(descriptor, sampler_descriptor);
+        // Unity grows this R8 font atlas a few glyphs at a time. Without page
+        // tracking, the normal sparse content probe can miss those localized
+        // writes and retain a Vulkan image whose newly allocated rectangles
+        // are still black. One MiB is small enough to hash once per frame.
+        const full_content_probe = descriptor.unified_format == 1 and
+            descriptor.width == 1024 and descriptor.height == 1024 and
+            probe_span <= 2 * 1024 * 1024;
 
         // The overwhelmingly common path is an unchanged cached texture. Its
         // alias generation covers GPU writers and its page generation covers
@@ -13528,6 +13540,7 @@ pub const Renderer = struct {
                 descriptor.address,
                 probe_span,
                 early_source_generation,
+                full_content_probe,
             );
         for (self.sampled_image_cache.items) |*item| {
             if (item.guest_address != descriptor.address or
@@ -13588,6 +13601,7 @@ pub const Renderer = struct {
                 descriptor.address,
                 probe_span,
                 source_generation,
+                full_content_probe,
             );
         self.frame_profile.sampled_generation_ns +|= elapsedHostNanoseconds(generation_started);
 
@@ -18044,9 +18058,25 @@ test "nonzero byte probe covers word chunks and tails" {
     try std.testing.expect(containsNonzeroByte(&tail_nonzero));
 }
 
-fn hashGuestMemoryRange(memory: GuestMemory, address: u64, span: usize) u64 {
+fn hashGuestMemoryRange(memory: GuestMemory, address: u64, span: usize, full_content: bool) u64 {
     var hash: u64 = 14695981039346656037;
     if (span == 0) return hash;
+
+    if (full_content) {
+        const full_chunk_size: usize = 4096;
+        var offset: usize = 0;
+        while (offset < span) {
+            var chunk: [full_chunk_size]u8 = undefined;
+            const readable = @min(chunk.len, span - offset);
+            if (!memory.read(memory.context, address + offset, chunk[0..readable])) break;
+            for (chunk[0..readable]) |byte| {
+                hash ^= byte;
+                hash *%= 1099511628211;
+            }
+            offset += readable;
+        }
+        return hash;
+    }
 
     // Hash a distributed set of cache lines rather than only the first few
     // kilobytes. GPU render-target generations cover exact host writes; these
