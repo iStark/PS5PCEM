@@ -190,6 +190,7 @@ fn amprAprCommandBufferReadFile(
         .destination = destination,
         .size = @intCast(size),
         .file_offset = file_offset,
+        .bytes_read_address = record_address + 0x20,
     }) catch |err| return aprError(err);
     const record: [*]u8 = @ptrFromInt(record_address);
     @memset(record[0..ampr_read_file_record_size], 0);
@@ -953,8 +954,7 @@ fn amprCommandBufferWriteKernelEventQueue(
     queue_handle: i64,
     ident: u64,
     completion_token: u64,
-    _: u64,
-    _: u64,
+    user_data: u64,
 ) callconv(abi.guest) i32 {
     if (!kernel_memory.isGuestRangeAccessible(address, ampr_command_buffer_header_size)) {
         return errno.KernelError.efault.raw();
@@ -975,7 +975,7 @@ fn amprCommandBufferWriteKernelEventQueue(
         .queue_handle = queue_handle,
         .ident = ident,
         .completion_token = completion_token,
-        .user_data = 0,
+        .user_data = user_data,
     }) catch |err| return aprError(err);
 
     const record: [*]u8 = @ptrFromInt(record_address);
@@ -984,7 +984,7 @@ fn amprCommandBufferWriteKernelEventQueue(
     @as(*i16, @ptrFromInt(record_address + 0x04)).* = kernel_event_queue.ampr_filter;
     writeGuestU64(record_address + 0x08, @bitCast(queue_handle));
     writeGuestU64(record_address + 0x10, ident);
-    writeGuestU64(record_address + 0x18, 0);
+    writeGuestU64(record_address + 0x18, user_data);
     writeGuestU64(record_address + 0x20, completion_token);
     return errno.ok;
 }
@@ -1703,6 +1703,15 @@ const SaveDataMountRequest = extern struct {
     padding: u32,
 };
 
+const SaveDataTransferringMountRequest = extern struct {
+    user_id: i32,
+    padding: u32,
+    title_id: u64,
+    directory_name: u64,
+    fingerprint: u64,
+    reserved: [32]u8,
+};
+
 /// Mount-mode bits that say the title accepts a slot being made for it.
 ///
 /// A title probing for an existing save mounts read-only and expects to be told
@@ -1741,6 +1750,37 @@ fn saveDataMount3(request_address: u64, result: ?*SaveDataMountResult) callconv(
         // before or at an empty one just made for it. Always claiming the
         // latter made a game overwrite its own profile on every run instead of
         // loading it.
+        .mount_status = if (outcome == .created) 1 else 0,
+        .reserved = [_]u8{0} ** 28,
+        .padding = 0,
+    };
+    @memcpy(output.mount_point[0.."/savedata0".len], "/savedata0");
+    return errno.ok;
+}
+
+fn saveDataTransferringMount(
+    request_address: u64,
+    result: ?*SaveDataMountResult,
+) callconv(abi.guest) i32 {
+    const output = result orelse return invalid_argument;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(output), @sizeOf(SaveDataMountResult))) {
+        return errno.KernelError.efault.raw();
+    }
+    if (request_address == 0 or
+        !kernel_memory.isGuestRangeAccessible(request_address, @sizeOf(SaveDataTransferringMountRequest)))
+    {
+        return invalid_argument;
+    }
+    const request: *const SaveDataTransferringMountRequest = @ptrFromInt(request_address);
+    var slot_storage: [savedata.maximum_slot_name]u8 = undefined;
+    const slot = readSlotName(request.directory_name, &slot_storage) orelse return invalid_argument;
+    const outcome = filesystem.mountSaveDataSlot(slot, true) catch return errno.KernelError.eio.raw();
+    if (outcome == .missing) return save_data_error_not_found;
+
+    output.* = .{
+        .mount_point = [_]u8{0} ** 16,
+        .required_blocks = 0,
+        .unused = 0,
         .mount_status = if (outcome == .created) 1 else 0,
         .reserved = [_]u8{0} ** 28,
         .padding = 0,
@@ -2084,6 +2124,7 @@ const save_data_exports = [_]symbols.Export{
     .{ .name = "sceSaveDataCreateTransactionResource", .function = trace.wrap("sceSaveDataCreateTransactionResource", &saveDataCreateTransactionResource), .expect_id = "gjRZNnw0JPE" },
     .{ .name = "sceSaveDataDeleteTransactionResource", .function = trace.wrap("sceSaveDataDeleteTransactionResource", &success), .expect_id = "lJUQuaKqoKY" },
     .{ .name = "sceSaveDataMount3", .function = trace.wrap("sceSaveDataMount3", &saveDataMount3), .expect_id = "ZP4e7rlzOUk" },
+    .{ .name = "sceSaveDataTransferringMount", .function = trace.wrap("sceSaveDataTransferringMount", &saveDataTransferringMount), .expect_id = "WAzWTZm1H+I" },
     .{ .name = "sceSaveDataPrepare", .function = trace.wrap("sceSaveDataPrepare", &saveDataTwoPointers), .expect_id = "sDCBrmc61XU" },
     .{ .name = "sceSaveDataCommit", .function = trace.wrap("sceSaveDataCommit", &saveDataOnePointer), .expect_id = "ie7qhZ4X0Cc" },
     .{ .name = "sceSaveDataUmount2", .function = trace.wrap("sceSaveDataUmount2", &saveDataUmount), .expect_id = "uW4vfTwMQVo" },
@@ -4076,6 +4117,37 @@ test "AMPR gather and scatter sizes match the recorded command stream" {
     try std.testing.expectEqual(@as(u64, 0x14), amprMeasureCommandSizeReadFileGatherScatter(1, 16, 1 << 32));
     try std.testing.expectEqual(@as(u64, 0x04), amprMeasureCommandSizeResetGatherScatterState(0, 0, 0));
     try std.testing.expect(amprMeasureCommandSizeReadFileGather(0, 0) != 0x08);
+}
+
+test "AMPR kernel event records retain completion user data" {
+    apr.reset();
+    defer apr.reset();
+    var header: [ampr_command_buffer_header_size]u8 align(8) = @splat(0);
+    var storage: [0x100]u8 align(8) = @splat(0);
+    const address = @intFromPtr(&header);
+    try std.testing.expectEqual(errno.ok, amprCommandBufferConstructor(address));
+    try std.testing.expectEqual(
+        errno.ok,
+        amprCommandBufferSetBuffer(address, @intFromPtr(&storage), storage.len),
+    );
+    try std.testing.expectEqual(
+        errno.ok,
+        amprCommandBufferWriteKernelEventQueue(
+            address,
+            7,
+            0x1111_2222_3333_4444,
+            0x5555_6666_7777_8888,
+            0x9999_aaaa_bbbb_cccc,
+        ),
+    );
+
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, storage[0x00..0x04], .little));
+    try std.testing.expectEqual(kernel_event_queue.ampr_filter, std.mem.readInt(i16, storage[0x04..0x06], .little));
+    try std.testing.expectEqual(@as(u64, 7), std.mem.readInt(u64, storage[0x08..0x10], .little));
+    try std.testing.expectEqual(@as(u64, 0x1111_2222_3333_4444), std.mem.readInt(u64, storage[0x10..0x18], .little));
+    try std.testing.expectEqual(@as(u64, 0x9999_aaaa_bbbb_cccc), std.mem.readInt(u64, storage[0x18..0x20], .little));
+    try std.testing.expectEqual(@as(u64, 0x5555_6666_7777_8888), std.mem.readInt(u64, storage[0x20..0x28], .little));
+    try std.testing.expectEqual(@as(u64, 0x30), amprCommandBufferGetCurrentOffset(address));
 }
 
 test "AMPR gather and scatter continue a recorded file read" {

@@ -754,6 +754,15 @@ fn mutexTracksRecursiveLock(object: *const Mutex, try_only: bool) bool {
     return object.kind == 2 or (try_only and mutexUsesDefaultCompatibility(object));
 }
 
+/// Gen5's adaptive wrapper can enter the imported slow path after its inline
+/// fast path has already completed the same logical acquisition. Firmware
+/// treats that duplicate blocking call as idempotent; counting it recursively
+/// would require an unlock the guest never issues, while reporting EDEADLK
+/// makes Unreal spin and retry forever.
+fn mutexCoalescesBlockingSelfLock(object: *const Mutex, try_only: bool) bool {
+    return !try_only and (object.kind == 4 or mutexUsesDefaultCompatibility(object));
+}
+
 fn readMutexAttr(raw: ?*const MutexAttrHandle) ?MutexAttr {
     const outer = raw orelse return null;
     const manager = activeManager() orelse return null;
@@ -809,10 +818,10 @@ fn mutexLockCore(
                 if (registered_waiter) object.waiters -= 1;
                 return;
             }
-            if (mutexUsesDefaultCompatibility(object)) {
-                // The ordinary Gen5 mutex wrapper may reach the imported slow
-                // path after its guest-side fast path has already established
-                // ownership.  This is one logical acquisition, not recursion.
+            if (mutexCoalescesBlockingSelfLock(object, try_only)) {
+                // The Gen5 mutex wrapper may reach the imported slow path after
+                // its guest-side fast path has already established ownership.
+                // This is one logical acquisition, not recursion.
                 if (registered_waiter) object.waiters -= 1;
                 return;
             }
@@ -1926,6 +1935,30 @@ test "static adaptive mutex initializer preserves its ABI type" {
     try testing.expectEqual(MutexOrigin.static_adaptive, mutex.*.?.origin);
     try testing.expectEqual(errno.ok, scePthreadMutexUnlock(mutex));
     try testing.expectEqual(errno.ok, scePthreadMutexDestroy(mutex));
+}
+
+test "adaptive blocking slow-path acquisition is idempotent" {
+    var context = TestContext{};
+    try context.init();
+    defer context.deinit();
+    const thread = try context.thread_manager.prepareInitialThread("adaptive-slow-path");
+    defer context.thread_manager.releaseInitialThread(thread.handle) catch {};
+    try context.thread_manager.enter(thread.handle);
+    defer context.thread_manager.leave();
+
+    var attr: MutexAttrHandle = null;
+    try testing.expectEqual(errno.ok, scePthreadMutexattrInit(&attr));
+    try testing.expectEqual(errno.ok, scePthreadMutexattrSettype(&attr, 4));
+    var mutex: MutexHandle = null;
+    try testing.expectEqual(errno.ok, scePthreadMutexInit(&mutex, &attr, null));
+    try testing.expectEqual(errno.ok, scePthreadMutexLock(&mutex));
+    try testing.expectEqual(errno.ok, scePthreadMutexLock(&mutex));
+    try testing.expectEqual(@as(u32, 1), mutex.?.recursion);
+    try testing.expectEqual(KernelError.ebusy.raw(), scePthreadMutexTrylock(&mutex));
+    try testing.expectEqual(errno.ok, scePthreadMutexUnlock(&mutex));
+    try testing.expectEqual(@as(u64, 0), mutex.?.owner);
+    try testing.expectEqual(errno.ok, scePthreadMutexDestroy(&mutex));
+    try testing.expectEqual(errno.ok, scePthreadMutexattrDestroy(&attr));
 }
 
 test "re-initializing a live object succeeds and resets its state" {

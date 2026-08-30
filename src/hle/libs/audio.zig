@@ -780,6 +780,16 @@ fn audioOut2ContextAdvance(context: u64) callconv(abi.guest) i32 {
     return if (audioObject(context, .context) != null) errno.ok else audio_out2_error_invalid_parameter;
 }
 
+fn audioOut2ContextSetAttributes(
+    context: u64,
+    attributes: ?*const anyopaque,
+    count: u32,
+) callconv(abi.guest) i32 {
+    if (audioObject(context, .context) == null) return audio_out2_error_invalid_parameter;
+    if (count != 0 and attributes == null) return audio_out2_error_invalid_parameter;
+    return errno.ok;
+}
+
 fn audioOut2ContextPush(context: u64, blocking: u32) callconv(abi.guest) i32 {
     const object = audioObject(context, .context) orelse return audio_out2_error_invalid_parameter;
     if (blocking != 0) pace(object.grains, 48_000);
@@ -856,12 +866,19 @@ fn audioOut2GetSpeakerInfo(output: ?*[0x20]u8, _: u32) callconv(abi.guest) i32 {
     return errno.ok;
 }
 
+fn audioOut2Set3DLatency(_: u32, _: u32, _: u32) callconv(abi.guest) i32 {
+    // Latency selection only configures console routing. The host mixer keeps
+    // its own bounded target and does not need a synthetic device here.
+    return errno.ok;
+}
+
 const audio_out2_exports = [_]symbols.Export{
     .{ .name = "sceAudioOut2Initialize", .function = trace.wrap("sceAudioOut2Initialize", &audioOut2Initialize), .expect_id = "g2tViFIohHE" },
     .{ .name = "sceAudioOut2ContextResetParam", .function = trace.wrap("sceAudioOut2ContextResetParam", &audioOut2ContextResetParam), .expect_id = "t5YrizufpQc" },
     .{ .name = "sceAudioOut2ContextQueryMemory", .function = trace.wrap("sceAudioOut2ContextQueryMemory", &audioOut2ContextQueryMemory), .expect_id = "pDmme7Bgm6E" },
     .{ .name = "sceAudioOut2ContextCreate", .function = trace.wrap("sceAudioOut2ContextCreate", &audioOut2ContextCreate), .expect_id = "0x6o1VVAYSY" },
     .{ .name = "sceAudioOut2ContextDestroy", .function = trace.wrap("sceAudioOut2ContextDestroy", &audioOut2ContextDestroy), .expect_id = "on6ZH7Abo10" },
+    .{ .name = "sceAudioOut2ContextSetAttributes", .function = trace.wrap("sceAudioOut2ContextSetAttributes", &audioOut2ContextSetAttributes), .expect_id = "4dq2rblWlg0" },
     .{ .name = "sceAudioOut2ContextAdvance", .function = trace.wrap("sceAudioOut2ContextAdvance", &audioOut2ContextAdvance), .expect_id = "PE2zHMqLSHs" },
     .{ .name = "sceAudioOut2ContextPush", .function = trace.wrap("sceAudioOut2ContextPush", &audioOut2ContextPush), .expect_id = "aII9h5nli9U" },
     .{ .name = "sceAudioOut2ContextGetQueueLevel", .function = trace.wrap("sceAudioOut2ContextGetQueueLevel", &audioOut2ContextGetQueueLevel), .expect_id = "R7d0F1g2qsU" },
@@ -872,6 +889,7 @@ const audio_out2_exports = [_]symbols.Export{
     .{ .name = "sceAudioOut2UserCreate", .function = trace.wrap("sceAudioOut2UserCreate", &audioOut2UserCreate), .expect_id = "xywYcRB7nbQ" },
     .{ .name = "sceAudioOut2UserDestroy", .function = trace.wrap("sceAudioOut2UserDestroy", &audioOut2UserDestroy), .expect_id = "IaZXJ9M79uo" },
     .{ .name = "sceAudioOut2GetSpeakerInfo", .function = trace.wrap("sceAudioOut2GetSpeakerInfo", &audioOut2GetSpeakerInfo), .expect_id = "DImz2Ft9E2g" },
+    .{ .name = "sceAudioOut2Set3DLatency", .function = trace.wrap("sceAudioOut2Set3DLatency", &audioOut2Set3DLatency), .expect_id = "TViD1EZXkNI" },
 };
 
 // libSceNgs2 ---------------------------------------------------------------
@@ -2240,6 +2258,105 @@ const audiodec_exports = [_]symbols.Export{
     .{ .name = "sceAudiodecCreateDecoder", .function = trace.wrap("sceAudiodecCreateDecoder", &audiodecCreateDecoder), .expect_id = "O3f1sLMWRvs" },
 };
 
+// libSceAcm ---------------------------------------------------------------
+
+const AcmBatchInfo = extern struct {
+    buffer: ?[*]u8 = null,
+    offset: usize = 0,
+    size: usize = 0,
+};
+
+const AcmBatchError = extern struct {
+    reserved: [8]u32 = [_]u32{0} ** 8,
+};
+
+const maximum_acm_contexts = 32;
+var acm_mutex: Lock = .{};
+var acm_contexts: [maximum_acm_contexts]bool = [_]bool{false} ** maximum_acm_contexts;
+var next_acm_batch = std.atomic.Value(u32).init(1);
+
+fn acmContextIndex(context: u32) ?usize {
+    if (context == 0 or context > maximum_acm_contexts) return null;
+    return context - 1;
+}
+
+fn isAcmContext(context: u32) bool {
+    const index = acmContextIndex(context) orelse return false;
+    acm_mutex.lock();
+    defer acm_mutex.unlock();
+    return acm_contexts[index];
+}
+
+fn acmContextCreate(context: ?*u32) callconv(abi.guest) i32 {
+    const output = context orelse return errno.KernelError.einval.raw();
+    acm_mutex.lock();
+    defer acm_mutex.unlock();
+    for (&acm_contexts, 0..) |*active, index| {
+        if (active.*) continue;
+        active.* = true;
+        output.* = @intCast(index + 1);
+        return errno.ok;
+    }
+    return errno.KernelError.enomem.raw();
+}
+
+fn acmContextDestroy(context: u32) callconv(abi.guest) i32 {
+    const index = acmContextIndex(context) orelse return errno.KernelError.einval.raw();
+    acm_mutex.lock();
+    defer acm_mutex.unlock();
+    if (!acm_contexts[index]) return errno.KernelError.einval.raw();
+    acm_contexts[index] = false;
+    return errno.ok;
+}
+
+fn acmBatchStartBuffers(
+    context: u32,
+    info_count: u32,
+    infos: ?[*]const ?*const AcmBatchInfo,
+    batch_error: ?*AcmBatchError,
+    batch: ?*u32,
+) callconv(abi.guest) i32 {
+    if (!isAcmContext(context) or (info_count != 0 and infos == null)) return errno.KernelError.einval.raw();
+    const output = batch orelse return errno.KernelError.einval.raw();
+    if (batch_error) |failure| failure.* = .{};
+    output.* = next_acm_batch.fetchAdd(1, .monotonic);
+    return errno.ok;
+}
+
+fn acmBatchWait(context: u32, _: u32, _: u32) callconv(abi.guest) i32 {
+    return if (isAcmContext(context)) errno.ok else errno.KernelError.einval.raw();
+}
+
+fn acmAdvanceBatch(info: ?*AcmBatchInfo, amount: usize) i32 {
+    const batch = info orelse return errno.ok;
+    if (batch.buffer != null and batch.size != 0) {
+        batch.offset = @min(batch.size, std.math.add(usize, batch.offset, amount) catch std.math.maxInt(usize));
+    }
+    return errno.ok;
+}
+
+fn acmConvReverbSharedInput(info: ?*AcmBatchInfo, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return acmAdvanceBatch(info, 1024);
+}
+
+fn acmFft(info: ?*AcmBatchInfo, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return acmAdvanceBatch(info, 256);
+}
+
+fn acmPanner(info: ?*AcmBatchInfo, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return acmAdvanceBatch(info, 512);
+}
+
+const acm_exports = [_]symbols.Export{
+    .{ .name = "sceAcmContextCreate", .function = trace.wrap("sceAcmContextCreate", &acmContextCreate), .expect_id = "ZIXln2K3XMk" },
+    .{ .name = "sceAcmContextDestroy", .function = trace.wrap("sceAcmContextDestroy", &acmContextDestroy), .expect_id = "jBgBjAj02R8" },
+    .{ .name = "sceAcmBatchStartBuffers", .function = trace.wrap("sceAcmBatchStartBuffers", &acmBatchStartBuffers), .expect_id = "8fe55ktlNVo" },
+    .{ .name = "sceAcmBatchWait", .function = trace.wrap("sceAcmBatchWait", &acmBatchWait), .expect_id = "RLN3gRlXJLE" },
+    .{ .name = "sceAcm_ConvReverb_SharedInput", .function = trace.wrap("sceAcm_ConvReverb_SharedInput", &acmConvReverbSharedInput), .expect_id = "u70oWo92SYQ" },
+    .{ .name = "sceAcm_FFT", .function = trace.wrap("sceAcm_FFT", &acmFft), .expect_id = "KovqaFbmtsM" },
+    .{ .name = "sceAcm_Panner", .function = trace.wrap("sceAcm_Panner", &acmPanner), .expect_id = "LA4RCNKnFjg" },
+};
+
 // libSceAjm ---------------------------------------------------------------
 
 const AjmBatchInfo = extern struct {
@@ -2320,7 +2437,10 @@ fn findAjmInstanceLocked(instance: u32) ?*AjmInstance {
 }
 
 fn ajmInitialize(reserved: i64, context: ?*u32) callconv(abi.guest) i32 {
-    if (reserved != 0) return ajm_error_invalid_parameter;
+    // Newer Prospero middleware passes generation/feature bits here even
+    // though older SDK headers called the field reserved. Real firmware (and
+    // Kyty's compatible implementation) accepts those bits.
+    _ = reserved;
     const output = context orelse return ajm_error_invalid_parameter;
     ajm_mutex.lock();
     defer ajm_mutex.unlock();
@@ -2713,6 +2833,11 @@ pub fn reset() void {
     audiodec_instances = [_]LegacyAudiodec{.{}} ** maximum_audiodec_instances;
     audiodec_mutex.unlock();
 
+    acm_mutex.lock();
+    acm_contexts = [_]bool{false} ** maximum_acm_contexts;
+    acm_mutex.unlock();
+    next_acm_batch.store(1, .monotonic);
+
     ajm_mutex.lock();
     for (&ajm_instances) |*instance| if (instance.active) instance.decoder.deinit();
     ajm_contexts = [_]bool{false} ** maximum_ajm_contexts;
@@ -2754,6 +2879,7 @@ pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!voi
     try db.addLibrary(gpa, .{ .name = "libSceAudioIn", .version = 1 }, .{ .name = "libSceAudioIn" }, &audio_in_exports);
     try db.addLibrary(gpa, .{ .name = "libSceAudioOut2", .version = 1 }, .{ .name = "libSceAudioOut" }, &audio_out2_exports);
     try db.addLibrary(gpa, .{ .name = "libSceAudiodec", .version = 1 }, .{ .name = "libSceAudiodec" }, &audiodec_exports);
+    try db.addLibrary(gpa, .{ .name = "libSceAcm", .version = 1 }, .{ .name = "libSceAcm" }, &acm_exports);
     try db.addLibrary(gpa, .{ .name = "libSceNgs2", .version = 1 }, .{ .name = "libSceNgs2" }, &ngs2_exports);
     try db.addLibrary(gpa, .{ .name = "libSceAjm", .version = 1 }, .{ .name = "libSceAjm" }, &ajm_exports);
 }

@@ -375,6 +375,10 @@ pub var optional_pointer_load_recoveries: std.atomic.Value(u64) = .init(0);
 /// generic null-object stub otherwise turns a null terminal node into a hot
 /// loop, while allocator poison otherwise terminates the guest thread.
 pub var sentinel_pointer_load_recoveries: std.atomic.Value(u64) = .init(0);
+/// How many dequeued Unreal work nodes with an absent payload took the queue
+/// routine's existing null-item cleanup path. The node itself has already been
+/// removed at this point; dereferencing its null payload only kills the worker.
+pub var null_queued_work_item_recoveries: std.atomic.Value(u64) = .init(0);
 /// How many non-canonical dangling shared references were omitted while Unity
 /// copied worker state. The copied field is optional at cleanup, so null is the
 /// only safe value when the supposed refcount pointer is actually tagged data.
@@ -435,19 +439,28 @@ var declined_host_access_violations: std.atomic.Value(u64) = .init(0);
 var null_object_stub: [4096]u8 align(16) = undefined;
 var null_object_stub_ready: bool = false;
 
+const null_object_vtable_offset: usize = 0x100;
+
+fn nullObjectReturnThunk() callconv(hle.abi.guest) u64 {
+    return 0;
+}
+
 fn ensureNullObjectStub() u64 {
     if (!null_object_stub_ready) {
         const base: u64 = @intFromPtr(&null_object_stub);
         @memset(&null_object_stub, 0);
-        // Fake vtable at +0x100: every slot points at the RET sled so accidental
-        // virtual calls return instead of faulting.
-        const ret_thunk = base + 0x300;
-        var offset: usize = 0x100;
-        while (offset + 8 <= 0x300) : (offset += 8) {
+        // Fake vtable at +0x100: every slot points at executable code so
+        // accidental virtual calls return zero instead of faulting. Unreal interfaces can have
+        // several hundred virtual entries (REANIMAL reaches slot +0x3f0), so
+        // keep the table large. The old RET sled lived in writable `.data` and
+        // DEP correctly rejected calls into it.
+        const ret_thunk: u64 = @intFromPtr(&nullObjectReturnThunk);
+        var offset: usize = null_object_vtable_offset;
+        while (offset + 8 <= null_object_stub.len) : (offset += 8) {
             std.mem.writeInt(u64, null_object_stub[offset..][0..8], ret_thunk, .little);
         }
         // [0] = vtable pointer (common C++/IL2CPP layout).
-        std.mem.writeInt(u64, null_object_stub[0..8], base + 0x100, .little);
+        std.mem.writeInt(u64, null_object_stub[0..8], base + null_object_vtable_offset, .little);
         // Leave body fields at +0x08..+0xF8 as zero. Unity/IL2CPP null checks
         // are often `cmp [obj+0x10/0x20], 0` / `je null_path`. A self-pointer
         // here made the check pass and the title followed a "ready" path with a
@@ -460,7 +473,6 @@ fn ensureNullObjectStub() u64 {
         while (offset + 8 <= 0x100) : (offset += 8) {
             std.mem.writeInt(u64, null_object_stub[offset..][0..8], base, .little);
         }
-        @memset(null_object_stub[0x300..], 0xc3); // RET
         null_object_stub_ready = true;
     }
     return @intFromPtr(&null_object_stub);
@@ -939,6 +951,25 @@ const WindowsX64Machine = struct {
         {
             writeFsBase(frame.guest_fs_base);
             _ = fs_base_restorations.fetchAdd(1, .monotonic);
+            return exception_continue_execution;
+        }
+        // Unreal's async work queue can retain a node whose shared payload was
+        // cleared by another worker. The pop routine has already unlinked and
+        // freed that node before it calls the payload vtable, but contains a
+        // normal null cleanup path later in the same function. Follow that
+        // path for this exact instruction/epilogue pair instead of fabricating
+        // an object or terminating the render worker.
+        if (record.ExceptionCode == std.os.windows.EXCEPTION_ACCESS_VIOLATION and
+            record.NumberParameters >= 2 and
+            record.ExceptionInformation[0] == 0 and
+            trySkipNullQueuedWorkItem(context, record.ExceptionInformation[1]))
+        {
+            _ = null_queued_work_item_recoveries.fetchAdd(1, .monotonic);
+            const count = null_queued_work_item_recoveries.load(.monotonic);
+            if (count <= 8 or count % 256 == 0) std.debug.print(
+                "[cpu] skipped null queued work item @rip=0x{x} (#{d})\n",
+                .{ context.Rip - 0xb0, count },
+            );
             return exception_continue_execution;
         }
         // The title's AgcInterruptThread removes registrations from an
@@ -1772,6 +1803,34 @@ const WindowsX64Machine = struct {
         }
         context.Rcx = context.Rdx;
         context.Rip += 4;
+        return true;
+    }
+
+    fn trySkipNullQueuedWorkItem(
+        context: *std.os.windows.CONTEXT,
+        memory_address: u64,
+    ) bool {
+        if (memory_address != 0 or context.Rbx != 0) return false;
+        const code: [*]const u8 = @ptrFromInt(context.Rip);
+        const dispatch_pattern = [_]u8{
+            0x48, 0x8b, 0x03, // mov rax,qword ptr [rbx]
+            0xff, 0x50, 0x28, // call qword ptr [rax+0x28]
+            0x85, 0xc0, // test eax,eax
+            0x74, 0x0d, // je alternate work method
+            0x41, 0x83, 0x7e, 0x40, 0x00, // cmp dword ptr [r14+0x40],0
+        };
+        for (dispatch_pattern, 0..) |byte, index| {
+            if (code[index] != byte) return false;
+        }
+        const cleanup_offset: usize = 0xb0;
+        const cleanup_pattern = [_]u8{
+            0x48, 0x85, 0xdb, // test rbx,rbx
+            0x74, 0x09, // je function epilogue
+        };
+        for (cleanup_pattern, 0..) |byte, index| {
+            if (code[cleanup_offset + index] != byte) return false;
+        }
+        context.Rip += cleanup_offset;
         return true;
     }
 
@@ -2759,6 +2818,24 @@ test "null base recovery decodes VEX2 and VEX3 memory operands" {
     }
 }
 
+test "synthetic null object covers large Unreal virtual tables" {
+    const base = ensureNullObjectStub();
+    const vtable = std.mem.readInt(
+        u64,
+        null_object_stub[0..@sizeOf(u64)],
+        .little,
+    );
+    try std.testing.expectEqual(base + null_object_vtable_offset, vtable);
+
+    const large_slot = null_object_vtable_offset + 0x3f0;
+    const target = std.mem.readInt(
+        u64,
+        null_object_stub[large_slot..][0..@sizeOf(u64)],
+        .little,
+    );
+    try std.testing.expectEqual(@as(u64, @intFromPtr(&nullObjectReturnThunk)), target);
+}
+
 test "an unmapped optional linked-list payload follows its null branch" {
     if (can_use_native_bridge) {
         const code = [_]u8{ 0x48, 0x8b, 0x42, 0x08, 0x48, 0x85, 0xc0, 0x74, 0x09 };
@@ -2815,6 +2892,34 @@ test "a poisoned list link reaches the loop sentinel instead of faulting" {
         ));
         try std.testing.expectEqual(context.Rdx, context.Rcx);
         try std.testing.expectEqual(@intFromPtr(&code) + 4, context.Rip);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "a dequeued null work payload follows the queue cleanup path" {
+    if (can_use_native_bridge) {
+        var code: [0xb5]u8 = @splat(0xcc);
+        const dispatch_pattern = [_]u8{
+            0x48, 0x8b, 0x03,
+            0xff, 0x50, 0x28,
+            0x85, 0xc0, 0x74,
+            0x0d, 0x41, 0x83,
+            0x7e, 0x40, 0x00,
+        };
+        @memcpy(code[0..dispatch_pattern.len], &dispatch_pattern);
+        const cleanup_pattern = [_]u8{ 0x48, 0x85, 0xdb, 0x74, 0x09 };
+        @memcpy(code[0xb0..][0..cleanup_pattern.len], &cleanup_pattern);
+
+        var context = std.mem.zeroes(std.os.windows.CONTEXT);
+        context.Rip = @intFromPtr(&code);
+        context.Rbx = 0;
+        try std.testing.expect(WindowsX64Machine.trySkipNullQueuedWorkItem(&context, 0));
+        try std.testing.expectEqual(@intFromPtr(&code) + 0xb0, context.Rip);
+
+        context.Rip = @intFromPtr(&code);
+        context.Rbx = 0x1234;
+        try std.testing.expect(!WindowsX64Machine.trySkipNullQueuedWorkItem(&context, 0));
     } else {
         return error.SkipZigTest;
     }

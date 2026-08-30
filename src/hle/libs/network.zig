@@ -45,6 +45,7 @@ const HandleKind = enum(u8) {
     epoll,
     ssl_context,
     http_context,
+    http_template,
     http2_context,
     http2_template,
     http2_cookie_box,
@@ -58,6 +59,8 @@ const Handle = struct {
     kind: HandleKind = .none,
     parent: i32 = 0,
     send_result: i32 = http2_error_before_send,
+    async_result: i32 = http2_error_before_send,
+    async_event: i32 = 0,
 };
 
 const maximum_handles = 256;
@@ -430,6 +433,28 @@ fn httpTerm(id: i32) callconv(abi.guest) i32 {
     return if (releaseTree(id, .http_context)) errno.ok else http_error_invalid_id;
 }
 
+fn httpCreateTemplate(context_id: i32, user_agent: ?[*:0]const u8, _: i32, _: i32) callconv(abi.guest) i32 {
+    if (!isHandle(context_id, .http_context)) return http_error_invalid_id;
+    if (user_agent == null) return http_error_invalid_value;
+    return allocateHandle(.http_template, context_id) orelse http_error_out_of_memory;
+}
+
+fn httpDeleteTemplate(id: i32) callconv(abi.guest) i32 {
+    return if (releaseTree(id, .http_template)) errno.ok else http_error_invalid_id;
+}
+
+/// Optional HTTP transport is deliberately unavailable, but middleware still
+/// imports its construction calls before it can choose the offline path.
+fn httpCreateTransportObject(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return http_error_invalid_id;
+}
+
+/// Configuration and cleanup calls do not manufacture host networking state.
+/// Accepting them lets an SDK unwind a partially initialized offline context.
+fn httpAcceptOption(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
 fn validScheme(text: []const u8) bool {
     if (text.len == 0 or !std.ascii.isAlphabetic(text[0])) return false;
     for (text[1..]) |c| {
@@ -565,7 +590,15 @@ fn httpUriParse(
 const http_exports = [_]symbols.Export{
     .{ .name = "sceHttpInit", .function = trace.wrap("sceHttpInit", &httpInit), .expect_id = "A9cVMUtEp4Y" },
     .{ .name = "sceHttpTerm", .function = trace.wrap("sceHttpTerm", &httpTerm), .expect_id = "Ik-KpLTlf7Q" },
+    .{ .name = "sceHttpCreateTemplate", .function = trace.wrap("sceHttpCreateTemplate", &httpCreateTemplate), .expect_id = "0gYjPTR-6cY" },
+    .{ .name = "sceHttpDeleteTemplate", .function = trace.wrap("sceHttpDeleteTemplate", &httpDeleteTemplate), .expect_id = "4I8vEpuEhZ8" },
     .{ .name = "sceHttpUriParse", .function = trace.wrap("sceHttpUriParse", &httpUriParse), .expect_id = "IWalAn-guFs" },
+    .{ .name = "sceHttpCreateConnection", .function = trace.wrap("sceHttpCreateConnection", &httpCreateTransportObject), .expect_id = "Kiwv9r4IZCc" },
+    .{ .name = "sceHttpCreateRequest", .function = trace.wrap("sceHttpCreateRequest", &httpCreateTransportObject), .expect_id = "tsGVru3hCe8" },
+    .{ .name = "sceHttpSetChunkedTransferEnabled", .function = trace.wrap("sceHttpSetChunkedTransferEnabled", &httpAcceptOption), .expect_id = "PDxS48xGQLs" },
+    .{ .name = "sceHttpUnsetEpoll", .function = trace.wrap("sceHttpUnsetEpoll", &httpAcceptOption), .expect_id = "59tL1AQBb8U" },
+    .{ .name = "sceHttpsSetSslCallback", .function = trace.wrap("sceHttpsSetSslCallback", &httpAcceptOption), .expect_id = "htyBOoWeS58" },
+    .{ .name = "sceHttpsUnloadCert", .function = trace.wrap("sceHttpsUnloadCert", &httpAcceptOption), .expect_id = "zXqcE0fizz0" },
 };
 
 // libSceHttp2 ---------------------------------------------------------------
@@ -632,6 +665,55 @@ fn http2SendRequest(id: i32, data: ?*const anyopaque, size: usize) callconv(abi.
     return http2_error_timeout;
 }
 
+fn http2SendRequestAsync(
+    id: i32,
+    data: ?*const anyopaque,
+    size: usize,
+    _: ?*anyopaque,
+    _: ?*anyopaque,
+) callconv(abi.guest) i32 {
+    if (data == null and size != 0) return http2_error_null_pointer;
+    const index = handleIndex(id) orelse return http2_error_invalid_id;
+    handle_mutex.lock();
+    defer handle_mutex.unlock();
+    if (handles[index].kind != .http2_request) return http2_error_invalid_id;
+    const handle = &handles[index];
+    handle.send_result = http2_error_timeout;
+    handle.async_result = http2_error_timeout;
+    handle.async_event = 0;
+    return errno.ok;
+}
+
+const Http2AsyncResult = extern struct {
+    event_type: i32,
+    request_id: i32,
+    result: i32,
+    padding: u32,
+    reserved: u64,
+};
+
+fn http2WaitAsync(
+    id: i32,
+    result: ?*Http2AsyncResult,
+    _: ?*u32,
+    _: ?*anyopaque,
+) callconv(abi.guest) i32 {
+    const output = result orelse return http2_error_null_pointer;
+    const index = handleIndex(id) orelse return http2_error_invalid_id;
+    handle_mutex.lock();
+    defer handle_mutex.unlock();
+    if (handles[index].kind != .http2_request) return http2_error_invalid_id;
+    const handle = &handles[index];
+    output.* = .{
+        .event_type = handle.async_event,
+        .request_id = id,
+        .result = handle.async_result,
+        .padding = 0,
+        .reserved = 0,
+    };
+    return errno.ok;
+}
+
 fn http2GetStatusCode(id: i32, output: ?*i32) callconv(abi.guest) i32 {
     const status = output orelse return http2_error_null_pointer;
     status.* = 0;
@@ -657,6 +739,24 @@ fn http2GetAllHeaders(id: i32, header: ?*?[*]u8, size: ?*usize) callconv(abi.gue
 fn http2ReadData(id: i32, data: ?*anyopaque, size: usize) callconv(abi.guest) i32 {
     if (data == null and size != 0) return http2_error_null_pointer;
     return requestResult(id) orelse http2_error_invalid_id;
+}
+
+fn http2ReadDataAsync(
+    id: i32,
+    data: ?*anyopaque,
+    size: usize,
+    _: ?*anyopaque,
+    _: ?*anyopaque,
+) callconv(abi.guest) i32 {
+    if (data == null and size != 0) return http2_error_null_pointer;
+    const index = handleIndex(id) orelse return http2_error_invalid_id;
+    handle_mutex.lock();
+    defer handle_mutex.unlock();
+    if (handles[index].kind != .http2_request) return http2_error_invalid_id;
+    const handle = &handles[index];
+    handle.async_result = handle.send_result;
+    handle.async_event = 1;
+    return errno.ok;
 }
 
 fn http2DeleteRequest(id: i32) callconv(abi.guest) i32 {
@@ -690,6 +790,10 @@ const http2_exports = [_]symbols.Export{
     .{ .name = "sceHttp2GetStatusCode", .function = trace.wrap("sceHttp2GetStatusCode", &http2GetStatusCode), .expect_id = "9XYJwCf3lEA" },
     .{ .name = "sceHttp2GetAllResponseHeaders", .function = trace.wrap("sceHttp2GetAllResponseHeaders", &http2GetAllHeaders), .expect_id = "-rdXUi2XW90" },
     .{ .name = "sceHttp2ReadData", .function = trace.wrap("sceHttp2ReadData", &http2ReadData), .expect_id = "QygCNNmbGss" },
+    .{ .name = "sceHttp2SendRequestAsync", .function = trace.wrap("sceHttp2SendRequestAsync", &http2SendRequestAsync), .expect_id = "A+NVAFu4eCg" },
+    .{ .name = "sceHttp2WaitAsync", .function = trace.wrap("sceHttp2WaitAsync", &http2WaitAsync), .expect_id = "MOp-AUhdfi8" },
+    .{ .name = "sceHttp2ReadDataAsync", .function = trace.wrap("sceHttp2ReadDataAsync", &http2ReadDataAsync), .expect_id = "bGN-6zbo7ms" },
+    .{ .name = "sceHttp2SetResolveTimeOut", .function = trace.wrap("sceHttp2SetResolveTimeOut", &http2RequestOption), .expect_id = "ACjtE27aErY" },
 };
 
 // libSceNpWebApi2 -----------------------------------------------------------
@@ -840,6 +944,17 @@ test "HTTP URI parsing remains available while transport is offline" {
     try std.testing.expect(required != 0);
 }
 
+test "HTTP templates retain an offline local lifecycle" {
+    reset();
+    const context = httpInit(1, 1, 4096);
+    try std.testing.expect(context > 0);
+    const template = httpCreateTemplate(context, "PS5PCEM", 1, 0);
+    try std.testing.expect(template > 0);
+    try std.testing.expectEqual(errno.ok, httpDeleteTemplate(template));
+    try std.testing.expectEqual(http_error_invalid_id, httpDeleteTemplate(template));
+    try std.testing.expectEqual(errno.ok, httpTerm(context));
+}
+
 test "HTTP2 send reports an offline timeout after successful setup" {
     reset();
     const context = http2Init(1, 1, 4096, 4);
@@ -859,4 +974,14 @@ test "network families register the title import surface" {
     try std.testing.expect(db.findById("IWalAn-guFs", .function) != null);
     try std.testing.expect(db.findById("IZ-qjhRqvjk", .function) != null);
     try std.testing.expect(db.findById("lQOCF84lvzw", .function) != null);
+    inline for (&.{
+        "Kiwv9r4IZCc",
+        "tsGVru3hCe8",
+        "PDxS48xGQLs",
+        "59tL1AQBb8U",
+        "htyBOoWeS58",
+        "zXqcE0fizz0",
+    }) |id| {
+        try std.testing.expect(db.findById(id, .function) != null);
+    }
 }

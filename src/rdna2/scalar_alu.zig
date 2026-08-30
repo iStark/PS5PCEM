@@ -79,11 +79,11 @@ const sop2_table = buildTable(128, &.{
     .{ 0x22, .s_ashr_i32 },        .{ 0x24, .s_bfm_b32 },
     .{ 0x25, .s_bfm_b64 },         .{ 0x26, .s_mul_i32 },
     .{ 0x27, .s_bfe_u32 },         .{ 0x28, .s_bfe_i32 },
-    .{ 0x29, .s_bfe_u64 },
-    .{ 0x2e, .s_lshl1_add_u32 },   .{ 0x2f, .s_lshl2_add_u32 },
-    .{ 0x30, .s_lshl3_add_u32 },   .{ 0x31, .s_lshl4_add_u32 },
-    .{ 0x32, .s_pack_ll_b32_b16 }, .{ 0x33, .s_pack_lh_b32_b16 },
-    .{ 0x34, .s_pack_hh_b32_b16 }, .{ 0x35, .s_mul_hi_u32 },
+    .{ 0x29, .s_bfe_u64 },         .{ 0x2e, .s_lshl1_add_u32 },
+    .{ 0x2f, .s_lshl2_add_u32 },   .{ 0x30, .s_lshl3_add_u32 },
+    .{ 0x31, .s_lshl4_add_u32 },   .{ 0x32, .s_pack_ll_b32_b16 },
+    .{ 0x33, .s_pack_lh_b32_b16 }, .{ 0x34, .s_pack_hh_b32_b16 },
+    .{ 0x35, .s_mul_hi_u32 },
 });
 
 const sopc_table = buildTable(128, &.{
@@ -112,15 +112,17 @@ const sopk_table = buildTable(32, &.{
 });
 
 const sopp_table = buildTable(128, &.{
-    .{ 0x00, .s_nop },            .{ 0x01, .s_endpgm },
-    .{ 0x02, .s_branch },         .{ 0x04, .s_cbranch_scc0 },
-    .{ 0x05, .s_cbranch_scc1 },   .{ 0x06, .s_cbranch_vccz },
-    .{ 0x07, .s_cbranch_vccnz },  .{ 0x08, .s_cbranch_execz },
-    .{ 0x09, .s_cbranch_execnz }, .{ 0x0a, .s_barrier },
-    .{ 0x0c, .s_waitcnt },        .{ 0x0e, .s_sleep },
-    .{ 0x10, .s_sendmsg },        .{ 0x12, .s_trap },
-    .{ 0x16, .s_ttrace_data },    .{ 0x1f, .s_code_end },
-    .{ 0x20, .s_inst_prefetch },  .{ 0x23, .s_waitcnt_depctr },
+    .{ 0x00, .s_nop },                      .{ 0x01, .s_endpgm },
+    .{ 0x02, .s_branch },                   .{ 0x04, .s_cbranch_scc0 },
+    .{ 0x05, .s_cbranch_scc1 },             .{ 0x06, .s_cbranch_vccz },
+    .{ 0x07, .s_cbranch_vccnz },            .{ 0x08, .s_cbranch_execz },
+    .{ 0x09, .s_cbranch_execnz },           .{ 0x0a, .s_barrier },
+    .{ 0x0c, .s_waitcnt },                  .{ 0x0e, .s_sleep },
+    .{ 0x10, .s_sendmsg },                  .{ 0x12, .s_trap },
+    .{ 0x16, .s_ttrace_data },              .{ 0x17, .s_cbranch_cdbgsys },
+    .{ 0x18, .s_cbranch_cdbguser },         .{ 0x19, .s_cbranch_cdbgsys_or_user },
+    .{ 0x1a, .s_cbranch_cdbgsys_and_user }, .{ 0x1f, .s_code_end },
+    .{ 0x20, .s_inst_prefetch },            .{ 0x23, .s_waitcnt_depctr },
 });
 
 comptime {
@@ -359,6 +361,16 @@ test "s_mov_b32 s0, s1" {
     try std.testing.expectEqual(isa.OperandKind.sgpr, inst.dst.kind);
     try std.testing.expectEqual(@as(u32, 1), inst.src0.reg);
     try std.testing.expectEqual(@as(u32, 1), inst.word_count);
+}
+
+test "conditional debug branches decode without enabling host debug state" {
+    const code = [_]u32{0xbf97_0118};
+    const inst = try decodeSopp(0x568, &code, 0);
+    try std.testing.expectEqual(Opcode.s_cbranch_cdbgsys, inst.opcode);
+    try std.testing.expectEqual(@as(u32, 0x9cc), inst.branch_target);
+    // The emulator never enables the hardware conditional-debug bits, so this
+    // opcode deliberately remains a fallthrough rather than a CFG branch.
+    try std.testing.expect(!inst.opcode.isBranch());
 }
 
 test "s_mov_b32 with a literal occupies two words" {

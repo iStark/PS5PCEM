@@ -30,6 +30,7 @@ var message_mode: std.atomic.Value(i32) = .init(0);
 var browser_status: std.atomic.Value(i32) = .init(status_none);
 var ime_dialog_status: std.atomic.Value(i32) = .init(status_none);
 var signin_dialog_status: std.atomic.Value(i32) = .init(status_none);
+var playgo_dialog_status: std.atomic.Value(i32) = .init(status_none);
 var save_dialog_status: std.atomic.Value(i32) = .init(status_none);
 var save_dialog_mode: std.atomic.Value(i32) = .init(0);
 var save_dialog_user_data: std.atomic.Value(u64) = .init(0);
@@ -42,6 +43,7 @@ pub fn reset() void {
     browser_status.store(status_none, .release);
     ime_dialog_status.store(status_none, .release);
     signin_dialog_status.store(status_none, .release);
+    playgo_dialog_status.store(status_none, .release);
     save_dialog_status.store(status_none, .release);
     save_dialog_mode.store(0, .release);
     save_dialog_user_data.store(0, .release);
@@ -185,6 +187,23 @@ fn signinDialogUpdateStatus() callconv(abi.guest) i32 {
     return signin_dialog_status.load(.acquire);
 }
 
+fn signinDialogClose() callconv(abi.guest) i32 {
+    if (signin_dialog_status.load(.acquire) == status_none) {
+        return @bitCast(@as(u32, 0x8135_0001));
+    }
+    signin_dialog_status.store(status_finished, .release);
+    return errno.ok;
+}
+
+fn signinDialogGetResult(result: ?*[16]u8) callconv(abi.guest) i32 {
+    const output = result orelse return @bitCast(@as(u32, 0x8135_0003));
+    @memset(output, 0);
+    // No platform sign-in UI exists. Report the documented user-cancelled
+    // outcome so middleware takes its offline path instead of waiting.
+    std.mem.writeInt(i32, output[0..4], 1, .little);
+    return errno.ok;
+}
+
 fn signinDialogTerminate() callconv(abi.guest) i32 {
     signin_dialog_status.store(status_none, .release);
     return errno.ok;
@@ -195,6 +214,55 @@ const signin_dialog_exports = [_]symbols.Export{
     .{ .name = "sceSigninDialogInitialize", .function = trace.wrap("sceSigninDialogInitialize", &signinDialogInitialize), .expect_id = "mlYGfmqE3fQ" },
     .{ .name = "sceSigninDialogOpen", .function = trace.wrap("sceSigninDialogOpen", &signinDialogOpen), .expect_id = "JlpJVoRWv7U" },
     .{ .name = "sceSigninDialogTerminate", .function = trace.wrap("sceSigninDialogTerminate", &signinDialogTerminate), .expect_id = "LXlmS6PvJdU" },
+    .{ .name = "sceSigninDialogClose", .function = trace.wrap("sceSigninDialogClose", &signinDialogClose), .expect_id = "M3OkENHcyiU" },
+    .{ .name = "sceSigninDialogGetResult", .function = trace.wrap("sceSigninDialogGetResult", &signinDialogGetResult), .expect_id = "nqG7rqnYw1U" },
+};
+
+// PlayGo dialog ------------------------------------------------------------
+
+fn playGoDialogInitialize() callconv(abi.guest) i32 {
+    playgo_dialog_status.store(status_initialized, .release);
+    return errno.ok;
+}
+
+fn playGoDialogOpen(_: ?*const anyopaque) callconv(abi.guest) i32 {
+    if (playgo_dialog_status.load(.acquire) == status_none) {
+        playgo_dialog_status.store(status_initialized, .release);
+    }
+    // All package chunks are local, so the progress dialog has no work to
+    // display and completes in the same poll cycle.
+    playgo_dialog_status.store(status_finished, .release);
+    return errno.ok;
+}
+
+fn playGoDialogStatus() callconv(abi.guest) i32 {
+    return playgo_dialog_status.load(.acquire);
+}
+
+fn playGoDialogGetResult(result: ?*[16]u8) callconv(abi.guest) i32 {
+    const output = result orelse return msg_error_argument_null;
+    @memset(output, 0);
+    return errno.ok;
+}
+
+fn playGoDialogClose() callconv(abi.guest) i32 {
+    playgo_dialog_status.store(status_finished, .release);
+    return errno.ok;
+}
+
+fn playGoDialogTerminate() callconv(abi.guest) i32 {
+    playgo_dialog_status.store(status_none, .release);
+    return errno.ok;
+}
+
+const playgo_dialog_exports = [_]symbols.Export{
+    .{ .name = "scePlayGoDialogInitialize", .function = trace.wrap("scePlayGoDialogInitialize", &playGoDialogInitialize), .expect_id = "fECamTJKpsM" },
+    .{ .name = "scePlayGoDialogOpen", .function = trace.wrap("scePlayGoDialogOpen", &playGoDialogOpen), .expect_id = "kHd72ukqbxw" },
+    .{ .name = "scePlayGoDialogUpdateStatus", .function = trace.wrap("scePlayGoDialogUpdateStatus", &playGoDialogStatus), .expect_id = "Yb60K7BST48" },
+    .{ .name = "scePlayGoDialogGetStatus", .function = trace.wrap("scePlayGoDialogGetStatus", &playGoDialogStatus), .expect_id = "NOAMxY2EGS0" },
+    .{ .name = "scePlayGoDialogGetResult", .function = trace.wrap("scePlayGoDialogGetResult", &playGoDialogGetResult), .expect_id = "wx9TDplJKB4" },
+    .{ .name = "scePlayGoDialogClose", .function = trace.wrap("scePlayGoDialogClose", &playGoDialogClose), .expect_id = "fbigNQiZpm0" },
+    .{ .name = "scePlayGoDialogTerminate", .function = trace.wrap("scePlayGoDialogTerminate", &playGoDialogTerminate), .expect_id = "okgIGdr5Iz0" },
 };
 
 // Player-review dialog ------------------------------------------------------
@@ -509,6 +577,7 @@ pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!voi
     try db.addLibrary(gpa, .{ .name = "libSceMsgDialog.native" }, .{ .name = "libSceMsgDialog" }, &message_dialog_exports);
     try db.addLibrary(gpa, .{ .name = "libSceWebBrowserDialog" }, .{ .name = "libSceWebBrowserDialog" }, &browser_dialog_exports);
     try db.addLibrary(gpa, .{ .name = "libSceSigninDialog" }, .{ .name = "libSceSigninDialog" }, &signin_dialog_exports);
+    try db.addLibrary(gpa, .{ .name = "libScePlayGoDialog" }, .{ .name = "libScePlayGoDialog" }, &playgo_dialog_exports);
     try db.addLibrary(gpa, .{ .name = "libSceCdlgPlayerReview" }, .{ .name = "libSceCdlgPlayerReview" }, &player_review_dialog_exports);
     try db.addLibrary(gpa, .{ .name = "libSceSaveDataDialog.native" }, .{ .name = "libSceSaveDataDialog" }, &save_dialog_exports);
     try db.addLibrary(gpa, .{ .name = "libSceImeDialog" }, .{ .name = "libSceImeDialog" }, &ime_dialog_exports);
@@ -550,6 +619,8 @@ test "dialog libraries register the title import surface" {
     try std.testing.expect(db.findById("x01jxu+vxlc", .function) != null);
     try std.testing.expect(db.findById("-4GCfYdNF1s", .function) != null);
     try std.testing.expect(db.findById("UtXl-tmi7iw", .function) != null);
+    try std.testing.expect(db.findById("wx9TDplJKB4", .function) != null);
+    try std.testing.expect(db.findById("nqG7rqnYw1U", .function) != null);
 }
 
 test "the keyboard panel covers nothing and refuses a bad destination" {

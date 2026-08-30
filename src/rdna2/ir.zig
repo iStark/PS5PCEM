@@ -227,7 +227,14 @@ pub const Module = struct {
 
 fn classify(inst: instruction.Instruction) struct { Operation, ValueType } {
     return switch (inst.opcode) {
-        .s_nop, .s_inst_prefetch, .v_nop => .{ .nop, .none },
+        .s_nop,
+        .s_inst_prefetch,
+        .s_cbranch_cdbgsys,
+        .s_cbranch_cdbguser,
+        .s_cbranch_cdbgsys_or_user,
+        .s_cbranch_cdbgsys_and_user,
+        .v_nop,
+        => .{ .nop, .none },
         .s_waitcnt, .s_waitcnt_depctr, .s_barrier => .{ .synchronization, .none },
         .s_mov_b32, .v_mov_b32 => .{ .move, .bits32 },
         .s_add_u32, .s_add_i32, .v_add_nc_u32, .v_addc_u32 => .{ .integer_add, .uint32 },

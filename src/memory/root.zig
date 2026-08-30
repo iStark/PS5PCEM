@@ -485,6 +485,71 @@ pub const AddressSpace = struct {
         return address;
     }
 
+    /// Records a very large semantic reservation even when small host-owned
+    /// allocations split the architectural window. Windows can place its main
+    /// thread stack or process heap near the middle of the sub-terabyte PS5
+    /// user range, leaving two ~470 GiB placeholders and making a 512 GiB
+    /// virtual-only request fail despite almost the whole window being free.
+    ///
+    /// Concrete mappings remain strict: `mapInReservation` below accepts a
+    /// subrange only when that exact subrange belongs to one host placeholder.
+    /// Thus an unreachable host hole can live under reservation metadata, but
+    /// guest pages can never replace or overwrite it.
+    pub fn reserveSpanningHostHoles(
+        self: *AddressSpace,
+        area: Area,
+        hint: u64,
+        size: u64,
+        alignment: u64,
+    ) Error!u64 {
+        if (size == 0 or !isAligned(size, page_size)) return Error.InvalidSize;
+        const effective_alignment = @max(alignment, page_size);
+        if (!std.math.isPowerOfTwo(effective_alignment)) return Error.InvalidAlignment;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const window = area.range();
+        const search_start = if (hint == 0) window.start else @max(hint, window.start);
+        const address = self.findLogicalFreeLocked(
+            window,
+            search_start,
+            size,
+            effective_alignment,
+        ) orelse return Error.AddressUnavailable;
+        try self.mappings.ensureUnusedCapacity(self.allocator, 1);
+        const index = self.insertionIndex(address);
+        self.mappings.insertAssumeCapacity(index, .{
+            .address = address,
+            .size = size,
+            .protection = .none,
+            .kind = .reserved,
+            .protection_bits = 0,
+            .name = namedMapping("anon"),
+        });
+        return address;
+    }
+
+    /// Prints the host-owned pieces of one guest window. This is deliberately
+    /// only a failure-path diagnostic: Windows ASLR can place an allocation in
+    /// the console's sub-terabyte window before AddressSpace is initialized,
+    /// and the resulting hole is otherwise invisible in a guest ENOMEM.
+    pub fn announceOwnedRanges(self: *AddressSpace, area: Area) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const window = area.range();
+        for (self.reservations.items) |reservation| {
+            const start = @max(window.start, reservation.start);
+            const end = @min(window.end, reservation.end);
+            if (start >= end) continue;
+            std.debug.print(
+                "[memory owned] area={s} start=0x{x} end=0x{x} size=0x{x}\n",
+                .{ @tagName(area), start, end, end - start },
+            );
+        }
+    }
+
     /// Changes permissions over a fully mapped range. Mapping metadata is split
     /// where necessary so later queries retain page-accurate protection.
     pub fn protect(
@@ -1008,11 +1073,22 @@ pub const AddressSpace = struct {
             true,
         );
 
-        // The placeholder to re-split is the reservation's own extent, not the
-        // surrounding free space.
-        const placeholder = Range{ .start = reservation.address, .end = reservation.end() };
+        const spans_host_holes = !self.ownsLocked(reservation.address, reservation.size);
+        // A normal reservation was isolated as one exact placeholder. A huge
+        // semantic reservation can span small host holes; for that case carve
+        // only within the real owned/free placeholder containing this concrete
+        // mapping and never touch the host allocation in the hole.
+        const placeholder = if (spans_host_holes)
+            self.hostFreeRangeIgnoringReservationsLocked(address, size) orelse
+                return Error.AddressUnavailable
+        else
+            Range{ .start = reservation.address, .end = reservation.end() };
         const host_view_size = hostMappingViewSize(kind, address, size, backing_offset);
-        try hostSplitWithinPlaceholder(placeholder, address, size, host_view_size);
+        if (spans_host_holes) {
+            try hostPrepareMappingPlaceholders(placeholder, address, size, host_view_size);
+        } else {
+            try hostSplitWithinPlaceholder(placeholder, address, size, host_view_size);
+        }
         errdefer hostCoalescePlaceholder(placeholder) catch {};
 
         if (kind == .direct_memory) {
@@ -1056,7 +1132,16 @@ pub const AddressSpace = struct {
         if (self.overlapsLocked(address, size)) return Error.AddressUnavailable;
         try self.mappings.ensureUnusedCapacity(self.allocator, 1);
 
-        const free_range = self.freeRangeLocked(address, size) orelse
+        // A semantic reservation may span host holes without physically
+        // splitting the placeholders underneath it.  When a later reservation
+        // starts immediately before or after that logical range,
+        // `freeRangeLocked` is bounded by metadata at an address that is not a
+        // real Windows placeholder boundary.  Coalescing from that artificial
+        // boundary fails with STATUS_CONFLICTING_ADDRESSES.  Prepare the whole
+        // host-free placeholder around the target instead; reserved mappings
+        // are metadata only, while committed/direct mappings still bound this
+        // range and can never be overwritten.
+        const free_range = self.hostFreeRangeIgnoringReservationsLocked(address, size) orelse
             return Error.AddressUnavailable;
         try hostPreparePlaceholderRange(free_range, address, size);
         errdefer hostCoalescePlaceholder(free_range) catch {};
@@ -1172,6 +1257,34 @@ pub const AddressSpace = struct {
         return null;
     }
 
+    fn findLogicalFreeLocked(
+        self: *const AddressSpace,
+        window: Range,
+        search_start: u64,
+        size: u64,
+        alignment: u64,
+    ) ?u64 {
+        if (search_start >= window.end or size > window.end - search_start) return null;
+
+        // Start only in memory actually owned by AddressSpace. The logical
+        // range may cross later host holes, but its first pages are where large
+        // Unreal arenas immediately create their allocator metadata.
+        for (self.reservations.items) |reservation| {
+            const owned_start = @max(reservation.start, window.start);
+            const owned_end = @min(reservation.end, window.end);
+            if (owned_start >= owned_end or owned_end <= search_start) continue;
+            const candidate = findLogicalFreeInMappings(
+                self.mappings.items,
+                window,
+                @max(owned_start, search_start),
+                size,
+                alignment,
+            ) orelse continue;
+            if (reservation.contains(candidate, page_size)) return candidate;
+        }
+        return null;
+    }
+
     fn findFreeInOwnedRangeLocked(
         self: *const AddressSpace,
         owned: Range,
@@ -1189,6 +1302,36 @@ pub const AddressSpace = struct {
             if (cursor >= owned.end or size > owned.end - cursor) return null;
         }
         return if (size <= owned.end - cursor) cursor else null;
+    }
+
+    fn hostFreeRangeIgnoringReservationsLocked(
+        self: *const AddressSpace,
+        address: u64,
+        size: u64,
+    ) ?Range {
+        const requested_end = std.math.add(u64, address, size) catch return null;
+        for (self.reservations.items) |reservation| {
+            if (!reservation.contains(address, size)) continue;
+
+            var free_start = reservation.start;
+            var free_end = reservation.end;
+            for (self.mappings.items) |mapping| {
+                if (mapping.kind == .reserved) continue;
+                if (mapping.end() <= address) {
+                    free_start = @max(free_start, mapping.end());
+                    continue;
+                }
+                if (mapping.address >= requested_end) {
+                    free_end = @min(free_end, mapping.address);
+                    break;
+                }
+                return null;
+            }
+            if (free_start <= address and requested_end <= free_end) {
+                return .{ .start = free_start, .end = free_end };
+            }
+        }
+        return null;
     }
 
     fn ownsLocked(self: *const AddressSpace, address: u64, size: u64) bool {
@@ -1474,6 +1617,25 @@ fn insertionIndexIn(mappings: []const Mapping, address: u64) usize {
         }
     }
     return low;
+}
+
+fn findLogicalFreeInMappings(
+    mappings: []const Mapping,
+    window: Range,
+    search_start: u64,
+    size: u64,
+    alignment: u64,
+) ?u64 {
+    if (search_start >= window.end or size > window.end - search_start) return null;
+    var cursor = alignForward(search_start, alignment) orelse return null;
+    for (mappings) |mapping| {
+        if (mapping.end() <= cursor) continue;
+        if (mapping.address >= window.end) break;
+        if (mapping.address > cursor and size <= mapping.address - cursor) return cursor;
+        cursor = alignForward(@max(cursor, mapping.end()), alignment) orelse return null;
+        if (cursor >= window.end or size > window.end - cursor) return null;
+    }
+    return if (size <= window.end - cursor) cursor else null;
 }
 
 fn freeRangeInMappings(
@@ -2075,4 +2237,32 @@ test "virtual reservations and mapping queries retain guest metadata" {
         space.query(reserved_address, true).?.address,
     );
     try testing.expectEqual(@as(u64, page_size), space.mappedBytes(.flexible));
+}
+
+test "large semantic reservation can span small host holes" {
+    var space = AddressSpace{ .allocator = testing.allocator };
+    defer space.mappings.deinit(testing.allocator);
+    defer space.reservations.deinit(testing.allocator);
+
+    const start = user.start;
+    try space.reservations.append(testing.allocator, .{
+        .start = start,
+        .end = start + 6 * page_size,
+    });
+    try space.reservations.append(testing.allocator, .{
+        .start = start + 8 * page_size,
+        .end = start + 32 * page_size,
+    });
+
+    const size = 12 * page_size;
+    const address = try space.reserveSpanningHostHoles(.user, start, size, page_size);
+    try testing.expectEqual(start, address);
+    const mapping = space.query(start + 7 * page_size, false).?;
+    try testing.expectEqual(MappingKind.reserved, mapping.kind);
+    try testing.expectEqual(size, mapping.size);
+    try testing.expect(space.hostFreeRangeIgnoringReservationsLocked(start, page_size) != null);
+    try testing.expect(space.hostFreeRangeIgnoringReservationsLocked(
+        start + 6 * page_size,
+        page_size,
+    ) == null);
 }

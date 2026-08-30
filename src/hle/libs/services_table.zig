@@ -24,6 +24,7 @@ pub const acm_exports = [_]symbols.Export{
     .{ .name = "sceAcm_ConvReverb_SharedInput", .function = trace.wrap("sceAcm_ConvReverb_SharedInput", &services.absent), .expect_id = "u70oWo92SYQ" },
     .{ .name = "sceAcmBatchStartBuffers", .function = trace.wrap("sceAcmBatchStartBuffers", &services.absent), .expect_id = "8fe55ktlNVo" },
     .{ .name = "sceAcm_FFT", .function = trace.wrap("sceAcm_FFT", &services.absent), .expect_id = "KovqaFbmtsM" },
+    .{ .name = "sceAcm_Panner", .function = trace.wrap("sceAcm_Panner", &services.accept), .expect_id = "LA4RCNKnFjg" },
 };
 
 pub const agc_exports = [_]symbols.Export{
@@ -66,6 +67,8 @@ pub const coredump_exports = [_]symbols.Export{
     .{ .name = "sceCoredumpRegisterCoredumpHandler", .function = trace.wrap("sceCoredumpRegisterCoredumpHandler", &services.accept), .expect_id = "8zLSfEfW5AU" },
     .{ .name = "sceCoredumpSetUserDataType", .function = trace.wrap("sceCoredumpSetUserDataType", &services.accept), .expect_id = "Uxqkdta7wEg" },
     .{ .name = "sceCoredumpWriteUserData", .function = trace.wrap("sceCoredumpWriteUserData", &services.accept), .expect_id = "Dbbkj6YHWdo" },
+    .{ .name = "sceCoredumpAttachUserFile", .function = trace.wrap("sceCoredumpAttachUserFile", &services.accept), .expect_id = "5nc2gdLNsok" },
+    .{ .name = "sceCoredumpWriteUserString", .function = trace.wrap("sceCoredumpWriteUserString", &services.accept), .expect_id = "32KQRUK13kI" },
 };
 
 pub const camera2_exports = [_]symbols.Export{
@@ -399,6 +402,11 @@ pub const playgo_exports = [_]symbols.Export{
     .{ .name = "scePlayGoGetLanguageMask", .function = trace.wrap("scePlayGoGetLanguageMask", &playgo.getLanguageMask), .expect_id = "3OMbYZBaa50" },
     .{ .name = "scePlayGoGetToDoList", .function = trace.wrap("scePlayGoGetToDoList", &playgo.getToDoList), .expect_id = "Nn7zKwnA5q0" },
     .{ .name = "scePlayGoSetToDoList", .function = trace.wrap("scePlayGoSetToDoList", &playgo.setToDoList), .expect_id = "gUPGiOQ1tmQ" },
+    .{ .name = "scePlayGoGetChunkId", .function = trace.wrap("scePlayGoGetChunkId", &playgo.getChunkId), .expect_id = "73fF1MFU8hA" },
+    .{ .name = "scePlayGoGetInstallChunkId", .function = trace.wrap("scePlayGoGetInstallChunkId", &playgo.getInstallChunkId), .expect_id = "8-e7E989rCU" },
+    .{ .name = "scePlayGoGetOptionalChunk", .function = trace.wrap("scePlayGoGetOptionalChunk", &playgo.getOptionalChunk), .expect_id = "g4AZyxpSAlA" },
+    .{ .name = "scePlayGoGetSupportedOptionalChunk", .function = trace.wrap("scePlayGoGetSupportedOptionalChunk", &playgo.getSupportedOptionalChunk), .expect_id = "IfiN+-oeVWI" },
+    .{ .name = "scePlayGoPrefetchOptionalChunk", .function = trace.wrap("scePlayGoPrefetchOptionalChunk", &playgo.prefetchOptionalChunk), .expect_id = "HVAa744ecdw" },
 };
 
 pub const playerinvitationdialog_exports = [_]symbols.Export{
@@ -444,6 +452,7 @@ pub const savedata_native_exports = [_]symbols.Export{
     .{ .name = "sceSaveDataUmount2", .function = trace.wrap("sceSaveDataUmount2", &services.absent), .expect_id = "uW4vfTwMQVo" },
     .{ .name = "sceSaveDataDirNameSearchPs4", .function = trace.wrap("sceSaveDataDirNameSearchPs4", &services.absent), .expect_id = "X4MYzukPc3g" },
     .{ .name = "sceSaveDataTransferringMountPs4", .function = trace.wrap("sceSaveDataTransferringMountPs4", &services.absent), .expect_id = "RjMlsR8EXrw" },
+    .{ .name = "sceSaveDataTransferringMount", .function = trace.wrap("sceSaveDataTransferringMount", &services.absent), .expect_id = "WAzWTZm1H+I" },
     .{ .name = "sceSaveDataSaveIconByPath", .function = trace.wrap("sceSaveDataSaveIconByPath", &services.absent), .expect_id = "Z7z6HXWORJY" },
     .{ .name = "sceSaveDataBackup", .function = trace.wrap("sceSaveDataBackup", &services.absent), .expect_id = "z1JA8-iJt3k" },
     .{ .name = "sceSaveDataLoadIcon", .function = trace.wrap("sceSaveDataLoadIcon", &services.absent), .expect_id = "cGjO3wM3V28" },

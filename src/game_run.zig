@@ -42,6 +42,7 @@ fn openSaveDataHome(io: std.Io, content: std.Io.Dir) !std.Io.Dir {
 }
 
 const save_data_home = "savedata";
+const download_data_home = "out/download0";
 const terminator_2d_title_id = "PPSA25872";
 const tetris_effect_connected_title_id = "PPSA07923";
 const terminator_audio_latency_ms: u16 = 128;
@@ -73,6 +74,23 @@ fn readTitleIdentifier(io: std.Io, content: std.Io.Dir, storage: []u8) ?[]const 
     var document: [8192]u8 = undefined;
     const text = content.readFile(io, savedata.title_parameter_path, &document) catch return null;
     return savedata.findJsonString(text, "titleId", storage);
+}
+
+/// Prepares writable, per-title generated/downloaded data. Unreal titles use
+/// this mount for staged configuration and caches even when no network content
+/// is involved, so treating a missing `/download0` as read-only can leave them
+/// indefinitely probing fallback platform configurations.
+fn openDownloadData(io: std.Io, title_identifier: []const u8) !std.Io.Dir {
+    const savedata = runtime.firmware.savedata;
+    var identifier_storage: [savedata.maximum_slot_name]u8 = undefined;
+    const safe_identifier = savedata.sanitizeName(title_identifier, &identifier_storage);
+    var path_storage: [savedata.maximum_path]u8 = undefined;
+    const path = savedata.joinPath(&path_storage, &.{ download_data_home, safe_identifier }) orelse
+        return error.NameTooLong;
+
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, path);
+    return cwd.openDir(io, path, .{});
 }
 
 fn reportUnresolvedImport(_: ?*anyopaque, diagnostic: runtime.module_graph.UnresolvedImport) void {
@@ -368,6 +386,15 @@ fn run(init: std.process.Init) !bool {
     var title_identifier_storage: [runtime.firmware.savedata.maximum_slot_name]u8 = undefined;
     const title_identifier = readTitleIdentifier(io, content, &title_identifier_storage) orelse "";
 
+    var download_data: ?std.Io.Dir = openDownloadData(io, title_identifier) catch |err| blk: {
+        try stderr.print("cannot prepare /download0: {s}\n", .{@errorName(err)});
+        try stderr.flush();
+        break :blk null;
+    };
+    defer if (download_data) |*directory| directory.close(io);
+    if (download_data) |directory| runtime.firmware.filesystem.attachDownloadData(directory);
+    defer runtime.firmware.filesystem.detachDownloadData();
+
     // A contained fault prints the retained calls afterwards, but a process
     // that dies outright takes the buffer with it. This is the escape hatch for
     // those, and it is far too noisy for anything else.
@@ -458,6 +485,15 @@ fn run(init: std.process.Init) !bool {
     const force_probe_fragment_parameter = init.minimal.environ.containsUnempty(allocator, "PS5_PROBE_FRAGMENT_PARAMETER") catch false;
     const force_probe_fragment_ui = init.minimal.environ.containsUnempty(allocator, "PS5_PROBE_FRAGMENT_UI") catch false;
     const skip_compute_dispatches = init.minimal.environ.containsUnempty(allocator, "PS5_SKIP_COMPUTE") catch false;
+    const environment_compute_execution_limit: ?u64 = if (init.minimal.environ.getAlloc(
+        allocator,
+        "PS5_COMPUTE_EXECUTION_LIMIT",
+    )) |text| parse: {
+        defer allocator.free(text);
+        const value = std.mem.trim(u8, text, " \t\r\n");
+        break :parse std.fmt.parseInt(u64, value, 10) catch null;
+    } else |_| null;
+    const compute_execution_limit = environment_compute_execution_limit;
     const sparse_graphics_draws = init.minimal.environ.containsUnempty(allocator, "PS5_SPARSE_GRAPHICS") catch false;
     const translate_compute_only = init.minimal.environ.containsUnempty(allocator, "PS5_COMPUTE_TRANSLATE_ONLY") catch false;
     const prefer_integrated_gpu = init.minimal.environ.containsUnempty(allocator, "PS5_VULKAN_PREFER_INTEGRATED") catch false;
@@ -530,6 +566,7 @@ fn run(init: std.process.Init) !bool {
             .force_probe_fragment_parameter = force_probe_fragment_parameter,
             .force_probe_fragment_ui = force_probe_fragment_ui,
             .skip_compute_dispatches = skip_compute_dispatches,
+            .compute_execution_limit = compute_execution_limit,
             .sparse_graphics_draws = sparse_graphics_draws,
             .translate_compute_only = translate_compute_only,
             .prefer_integrated_gpu = prefer_integrated_gpu,

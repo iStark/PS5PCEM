@@ -27,8 +27,11 @@ const button_triangle: u32 = 0x1000;
 /// without a physical controller. Options is deliberately not synthesized:
 /// once a title reaches interactive rendering it commonly means pause or opens
 /// a settings page, and a single pulse can leave an unattended run parked.
-const auto_cross_period_us: u64 = 1_000_000;
-const auto_cross_hold_us: u64 = 250_000;
+// Keep the pulse deliberately off the one-second cadence used by some title
+// screens. A one-second period phase-locks with their sparse pad polling and
+// can make every read miss Cross forever.
+const auto_cross_period_us: u64 = 1_337_000;
+const auto_cross_hold_us: u64 = 500_000;
 const delayed_cross_period_us: u64 = 4_000_000;
 const delayed_cross_hold_us: u64 = 2_000_000;
 /// After the world has loaded, frames last many seconds. A 2 s pulse is
@@ -146,6 +149,10 @@ fn rapidDownStick(elapsed_us: u64) u8 {
     return if (elapsed_us % rapid_down_period_us < rapid_down_hold_us) 255 else 128;
 }
 
+fn automaticCrossHeld(now_us: u64) bool {
+    return now_us > 500_000 and now_us % auto_cross_period_us < auto_cross_hold_us;
+}
+
 fn padInit() callconv(abi.guest) i32 {
     initialized.store(1, .release);
     return errno.ok;
@@ -204,10 +211,7 @@ fn fillPadData(output: *PadData) void {
     const profile: AutomaticProfile = @enumFromInt(automatic_profile.load(.acquire));
     if (profile == .default or profile == .rapid_down) {
         const now_us = kernel_runtime.processTimeMicroseconds();
-        if (now_us > 500_000) {
-            const phase = now_us % auto_cross_period_us;
-            if (phase < auto_cross_hold_us) output.buttons |= button_cross;
-        }
+        if (automaticCrossHeld(now_us)) output.buttons |= button_cross;
         // Some UI screens only repeat navigation once per rendered frame. In
         // bring-up runs a frame can take several seconds, so a host key pulse
         // can be missed completely. Use wall-clock intervals rather than a
@@ -402,6 +406,20 @@ test "rapid down profile has a long hold and a neutral edge" {
     try std.testing.expectEqual(@as(u8, 128), rapidDownStick(rapid_down_hold_us));
     try std.testing.expectEqual(@as(u8, 128), rapidDownStick(rapid_down_period_us - 1));
     try std.testing.expectEqual(@as(u8, 255), rapidDownStick(rapid_down_period_us));
+}
+
+test "automatic Cross cannot phase-lock with one-second pad polling" {
+    var previous = false;
+    var saw_neutral = false;
+    var saw_rising_edge = false;
+    for (0..8) |index| {
+        const held = automaticCrossHeld(16_483_000 + index * std.time.us_per_s);
+        saw_neutral = saw_neutral or !held;
+        saw_rising_edge = saw_rising_edge or (held and !previous);
+        previous = held;
+    }
+    try std.testing.expect(saw_neutral);
+    try std.testing.expect(saw_rising_edge);
 }
 
 test "pad exports include the PS5 remote-controller query" {

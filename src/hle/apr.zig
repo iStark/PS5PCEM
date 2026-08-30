@@ -23,6 +23,7 @@ pub const maximum_maps_per_buffer: usize = 32;
 pub const maximum_ops_per_buffer: usize = 128;
 pub const maximum_auto_pool: usize = 8;
 pub const maximum_submissions: usize = 64;
+pub const maximum_cached_files: usize = 64;
 pub const maximum_read_bytes: usize = 4 * 1024 * 1024 * 1024;
 pub const maximum_file_offset: u64 = 0x0000_0100_0000_0000;
 pub const amm_page_size: u64 = 0x4000;
@@ -52,6 +53,7 @@ const FileEntry = struct {
     active: bool = false,
     identifier: u32 = 0,
     size: u64 = 0,
+    descriptor: i32 = -1,
     path_bytes: [maximum_path]u8 = undefined,
     path_length: usize = 0,
 
@@ -65,6 +67,7 @@ pub const ReadCommand = struct {
     destination: u64,
     size: usize,
     file_offset: u64,
+    bytes_read_address: u64 = 0,
 };
 
 pub const CommandBufferInfo = struct {
@@ -166,6 +169,7 @@ const Lock = struct {
 var lock = Lock{};
 var files: [maximum_files]FileEntry = [_]FileEntry{.{}} ** maximum_files;
 var next_identifier: u32 = 1;
+var cached_file_count: usize = 0;
 var command_buffers: [maximum_command_buffers]CommandBuffer = [_]CommandBuffer{.{}} ** maximum_command_buffers;
 var submissions: [maximum_submissions]Submission = [_]Submission{.{}} ** maximum_submissions;
 var next_submission_identifier: u32 = 1;
@@ -180,15 +184,28 @@ pub fn attachCompletionSink(sink: ?CompletionSink) void {
 }
 
 pub fn reset() void {
+    var descriptors: [maximum_cached_files]i32 = undefined;
+    var descriptor_count: usize = 0;
     lock.lock();
-    defer lock.unlock();
+    for (files) |entry| {
+        if (entry.active and entry.descriptor >= 0 and descriptor_count < descriptors.len) {
+            descriptors[descriptor_count] = entry.descriptor;
+            descriptor_count += 1;
+        }
+    }
     files = [_]FileEntry{.{}} ** maximum_files;
     next_identifier = 1;
+    cached_file_count = 0;
     command_buffers = [_]CommandBuffer{.{}} ** maximum_command_buffers;
     submissions = [_]Submission{.{}} ** maximum_submissions;
     next_submission_identifier = 1;
     auto_pool = [_]AutoPoolRange{.{}} ** maximum_auto_pool;
     auto_pool_count = 0;
+    lock.unlock();
+
+    for (descriptors[0..descriptor_count]) |descriptor| {
+        filesystem.close(descriptor) catch {};
+    }
 }
 
 pub fn resolve(path: []const u8) Error!ResolvedFile {
@@ -228,22 +245,51 @@ pub fn resolve(path: []const u8) Error!ResolvedFile {
 
 pub fn read(identifier: u32, offset: u64, destination: []u8) Error!usize {
     var path_bytes: [maximum_path]u8 = undefined;
-    const path = blk: {
-        lock.lock();
-        defer lock.unlock();
-        for (files) |entry| {
-            if (!entry.active or entry.identifier != identifier) continue;
-            @memcpy(path_bytes[0..entry.path_length], entry.path());
-            break :blk path_bytes[0..entry.path_length];
+    lock.lock();
+    for (&files) |*entry| {
+        if (!entry.active or entry.identifier != identifier) continue;
+        if (entry.descriptor >= 0) {
+            const descriptor = entry.descriptor;
+            lock.unlock();
+            return filesystem.pread(descriptor, destination, offset) catch error.IoFailed;
         }
-        return error.UnknownFile;
-    };
-    const descriptor = filesystem.open(path, filesystem.O.rdonly) catch |err| return switch (err) {
-        error.NotFound, error.NotAttached => error.FileNotFound,
-        else => error.IoFailed,
-    };
-    defer filesystem.close(descriptor) catch {};
-    return filesystem.pread(descriptor, destination, offset) catch error.IoFailed;
+        @memcpy(path_bytes[0..entry.path_length], entry.path());
+        const path_length = entry.path_length;
+        lock.unlock();
+
+        const opened = filesystem.open(path_bytes[0..path_length], filesystem.O.rdonly) catch |err| return switch (err) {
+            error.NotFound, error.NotAttached => error.FileNotFound,
+            else => error.IoFailed,
+        };
+
+        // Several APR workers can discover the same uncached file together.
+        // Keep the first descriptor and close the duplicates after publishing
+        // it; positional reads make the shared descriptor safe for workers.
+        var descriptor = opened;
+        var transient = true;
+        lock.lock();
+        for (&files) |*current| {
+            if (!current.active or current.identifier != identifier) continue;
+            if (current.descriptor >= 0) {
+                descriptor = current.descriptor;
+            } else if (cached_file_count < maximum_cached_files) {
+                current.descriptor = opened;
+                cached_file_count += 1;
+                transient = false;
+            }
+            break;
+        } else {
+            lock.unlock();
+            filesystem.close(opened) catch {};
+            return error.UnknownFile;
+        }
+        lock.unlock();
+        if (descriptor != opened) filesystem.close(opened) catch {};
+        defer if (transient and descriptor == opened) filesystem.close(opened) catch {};
+        return filesystem.pread(descriptor, destination, offset) catch error.IoFailed;
+    }
+    lock.unlock();
+    return error.UnknownFile;
 }
 
 pub fn constructCommandBuffer(address: u64) Error!void {
@@ -530,7 +576,12 @@ fn takeAutoLocked(size: u64, memory_type: i32) ?u64 {
 fn applyRead(command: ReadCommand) Error!void {
     if (!memory.isGuestRangeAccessible(command.destination, command.size)) return error.InvalidRead;
     const destination: [*]u8 = @ptrFromInt(command.destination);
-    _ = try read(command.file_identifier, command.file_offset, destination[0..command.size]);
+    const bytes_read = try read(command.file_identifier, command.file_offset, destination[0..command.size]);
+    if (command.bytes_read_address != 0) {
+        if (!memory.isGuestRangeAccessible(command.bytes_read_address, 8)) return error.InvalidRead;
+        const output: *[8]u8 = @ptrFromInt(command.bytes_read_address);
+        std.mem.writeInt(u64, output, bytes_read, .little);
+    }
 }
 
 fn applyWrite(command: WriteCommand) Error!void {
@@ -540,8 +591,12 @@ fn applyWrite(command: WriteCommand) Error!void {
 }
 
 fn applyCompletion(command: CompletionCommand, sink: ?CompletionSink) Error!void {
-    const callback = sink orelse return error.IoFailed;
-    if (!callback(command)) return error.IoFailed;
+    // The kernel accelerator treats completion publication as best-effort:
+    // command execution itself has already completed even when the target
+    // event queue is unavailable or full.  Failing the submission here leaves
+    // the caller without a fresh submission identifier and makes its
+    // subsequent wait observe a stale/unknown identifier.
+    if (sink) |callback| _ = callback(command);
 }
 
 fn applyAmmMap(command: AmmMapCommand) Error!void {
@@ -636,6 +691,7 @@ test "APR reads honor file offsets and allow a short read at EOF" {
 
     const resolved = try resolve("/app0/bundle.dat");
     var destination = [_]u8{0xaa} ** 10;
+    var bytes_read: u64 = 0;
     try constructCommandBuffer(0x3000);
     try setCommandBufferStorage(0x3000, 0x4000, 0x10000);
     try appendRead(0x3000, .{
@@ -643,10 +699,13 @@ test "APR reads honor file offsets and allow a short read at EOF" {
         .destination = @intFromPtr(&destination),
         .size = destination.len,
         .file_offset = 7,
+        .bytes_read_address = @intFromPtr(&bytes_read),
     });
     const submission = try submitCommandBuffer(0x3000);
     try std.testing.expectEqualStrings("payload", destination[0..7]);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0xaa, 0xaa, 0xaa }, destination[7..]);
+    try std.testing.expectEqual(@as(u64, 7), bytes_read);
+    try std.testing.expectEqual(@as(usize, 1), cached_file_count);
     try waitCommandBuffer(submission);
 }
 
@@ -706,4 +765,28 @@ test "a recorded AMPR write publishes its value on submit" {
     try appendWrite(0x7000, .{ .destination = @intFromPtr(&label), .value = 0xaaaa_bbbb_cccc_dddd }, 0x20);
     _ = try submitCommandBuffer(0x7000);
     try std.testing.expectEqual(@as(u64, 0xaaaa_bbbb_cccc_dddd), label);
+}
+
+test "APR completion delivery is best effort" {
+    const RejectingSink = struct {
+        fn publish(_: CompletionCommand) bool {
+            return false;
+        }
+    };
+
+    reset();
+    defer reset();
+    attachCompletionSink(RejectingSink.publish);
+    defer attachCompletionSink(null);
+
+    try constructCommandBuffer(0x9000);
+    try setCommandBufferStorage(0x9000, 0xa000, 0x10000);
+    try appendCompletion(0x9000, .{
+        .queue_handle = 7,
+        .ident = 11,
+        .completion_token = 13,
+        .user_data = 17,
+    });
+    const submission = try submitCommandBuffer(0x9000);
+    try waitCommandBuffer(submission);
 }

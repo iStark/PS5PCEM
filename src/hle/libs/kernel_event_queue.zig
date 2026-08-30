@@ -13,7 +13,13 @@ const runtime_api = @import("kernel_runtime.zig");
 
 const KernelError = errno.KernelError;
 const maximum_queues = 64;
-const maximum_events = 64;
+const maximum_registrations = 64;
+// Storage/APR may complete hundreds of small reads before the guest drains
+// its equeue. Registration capacity and pending-event capacity are separate
+// kernel resources: sharing the old 64-entry limit silently discarded AMPR
+// completions and left the title waiting forever for an event that had
+// already happened.
+const maximum_pending_events = 1024;
 const user_filter: i16 = -11;
 const timer_filter: i16 = -7;
 pub const ampr_filter: i16 = -16;
@@ -57,8 +63,10 @@ const Registration = struct {
 const Queue = struct {
     active: bool = false,
     handle: i64 = 0,
-    registrations: [maximum_events]Registration = [_]Registration{.{}} ** maximum_events,
-    pending: [maximum_events]Event = [_]Event{.{}} ** maximum_events,
+    registrations: [maximum_registrations]Registration =
+        [_]Registration{.{}} ** maximum_registrations,
+    pending: [maximum_pending_events]Event =
+        [_]Event{.{}} ** maximum_pending_events,
     pending_head: usize = 0,
     pending_count: usize = 0,
     sequence: u64 = 0,
@@ -171,18 +179,19 @@ fn triggerAmprCompletion(command: @import("../apr.zig").CompletionCommand) bool 
         lock.unlock();
         return false;
     };
-    var registered = false;
-    for (queue.registrations) |registration| {
-        if (registration.active and registration.ident == command.ident and registration.filter == ampr_filter) {
-            registered = true;
-            break;
-        }
-    }
-    if (!registered or queue.pending_count == maximum_events) {
+    // WriteKernelEventQueue is itself a command to enqueue one completion; it
+    // is not a notification which must first be armed through
+    // sceKernelAddAmprEvent. Requiring a matching registration made busy I/O
+    // command buffers fail with EIO. The caller then retained the previous
+    // submission id and sceKernelAprWaitCommandBuffer waited on the wrong job.
+    //
+    // This also matches the event record produced by libSceAmpr: its user data
+    // is carried in the command, independently of any queue registration.
+    if (queue.pending_count == maximum_pending_events) {
         lock.unlock();
         return false;
     }
-    const index = (queue.pending_head + queue.pending_count) % maximum_events;
+    const index = (queue.pending_head + queue.pending_count) % maximum_pending_events;
     queue.pending[index] = .{
         .ident = command.ident,
         .filter = ampr_filter,
@@ -223,7 +232,8 @@ fn addRegistration(handle: i64, id: i32, options: RegistrationOptions) i32 {
                 // EV_ADD modifies an existing kevent. Events already queued for
                 // that registration must expose the new callback token too.
                 for (0..queue.pending_count) |pending_offset| {
-                    const pending_index = (queue.pending_head + pending_offset) % maximum_events;
+                    const pending_index =
+                        (queue.pending_head + pending_offset) % maximum_pending_events;
                     const pending = &queue.pending[pending_index];
                     if (pending.ident == ident and pending.filter == options.filter) {
                         pending.user_data = options.user_data;
@@ -315,8 +325,8 @@ fn serviceTimers(queue: *Queue, now: u64) ?u64 {
             continue;
         }
 
-        if (queue.pending_count == maximum_events) continue;
-        const index = (queue.pending_head + queue.pending_count) % maximum_events;
+        if (queue.pending_count == maximum_pending_events) continue;
+        const index = (queue.pending_head + queue.pending_count) % maximum_pending_events;
         queue.pending[index] = .{
             .ident = registration.ident,
             .filter = timer_filter,
@@ -369,11 +379,11 @@ fn triggerUserEvent(handle: i64, id: i32, user_data: u64) callconv(abi.guest) i3
         lock.unlock();
         return KernelError.enoent.raw();
     }
-    if (queue.pending_count == maximum_events) {
+    if (queue.pending_count == maximum_pending_events) {
         lock.unlock();
         return KernelError.enospc.raw();
     }
-    const index = (queue.pending_head + queue.pending_count) % maximum_events;
+    const index = (queue.pending_head + queue.pending_count) % maximum_pending_events;
     queue.pending[index] = .{
         .ident = ident,
         .filter = user_filter,
@@ -400,13 +410,13 @@ pub fn triggerUserEventForAll(id: i32, data: i64) usize {
 
     lock.lock();
     for (&queues) |*queue| {
-        if (!queue.active or queue.pending_count == maximum_events) continue;
+        if (!queue.active or queue.pending_count == maximum_pending_events) continue;
         const registration = for (queue.registrations) |candidate| {
             if (candidate.active and candidate.ident == ident and candidate.filter == user_filter) {
                 break candidate;
             }
         } else continue;
-        const index = (queue.pending_head + queue.pending_count) % maximum_events;
+        const index = (queue.pending_head + queue.pending_count) % maximum_pending_events;
         queue.pending[index] = .{
             .ident = ident,
             .filter = user_filter,
@@ -487,7 +497,7 @@ pub fn triggerVideoOutVblank() usize {
 
     lock.lock();
     for (&queues) |*queue| {
-        if (!queue.active or queue.pending_count == maximum_events) continue;
+        if (!queue.active or queue.pending_count == maximum_pending_events) continue;
         const registration = for (queue.registrations) |candidate| {
             if (candidate.active and candidate.ident == video_out_vblank_ident and
                 candidate.filter == video_out_filter)
@@ -495,7 +505,7 @@ pub fn triggerVideoOutVblank() usize {
                 break candidate;
             }
         } else continue;
-        const index = (queue.pending_head + queue.pending_count) % maximum_events;
+        const index = (queue.pending_head + queue.pending_count) % maximum_pending_events;
         queue.pending[index] = .{
             .ident = video_out_vblank_ident,
             .filter = video_out_filter,
@@ -576,14 +586,14 @@ fn triggerGraphicsEventsMatching(
 
     lock.lock();
     for (&queues) |*queue| {
-        if (!queue.active or queue.pending_count == maximum_events) continue;
+        if (!queue.active or queue.pending_count == maximum_pending_events) continue;
         // Deliver one event per matching registration (or all graphics regs).
         for (queue.registrations) |candidate| {
             if (!candidate.active or candidate.filter != graphics_filter) continue;
             if (!any_id and candidate.ident != ident) continue;
-            if (queue.pending_count == maximum_events) break;
+            if (queue.pending_count == maximum_pending_events) break;
             const event_ident = if (any_id) candidate.ident else ident;
-            const index = (queue.pending_head + queue.pending_count) % maximum_events;
+            const index = (queue.pending_head + queue.pending_count) % maximum_pending_events;
             queue.pending[index] = .{
                 .ident = event_ident,
                 .filter = graphics_filter,
@@ -632,7 +642,7 @@ pub fn triggerVideoOutFlip(flip_argument: i64) usize {
 
     lock.lock();
     for (&queues) |*queue| {
-        if (!queue.active or queue.pending_count == maximum_events) continue;
+        if (!queue.active or queue.pending_count == maximum_pending_events) continue;
         const registration = for (queue.registrations) |candidate| {
             if (candidate.active and candidate.ident == video_out_flip_ident and
                 candidate.filter == video_out_filter)
@@ -640,7 +650,7 @@ pub fn triggerVideoOutFlip(flip_argument: i64) usize {
                 break candidate;
             }
         } else continue;
-        const index = (queue.pending_head + queue.pending_count) % maximum_events;
+        const index = (queue.pending_head + queue.pending_count) % maximum_pending_events;
         queue.pending[index] = .{
             .ident = video_out_flip_ident,
             .filter = video_out_filter,
@@ -698,7 +708,7 @@ fn dequeue(
             graphics_delivery_reports += 1;
         }
         queue.pending[queue.pending_head] = .{};
-        queue.pending_head = (queue.pending_head + 1) % maximum_events;
+        queue.pending_head = (queue.pending_head + 1) % maximum_pending_events;
     }
     queue.pending_count -= count;
     return @intCast(count);
@@ -884,6 +894,62 @@ test "user edge events round-trip through an event queue" {
     try std.testing.expectEqual(@as(i32, user_filter), getEventFilter(&event[0]));
     try std.testing.expectEqual(@as(u64, 0x1234), event[0].user_data);
     try std.testing.expectEqual(errno.ok, deleteEqueue(handle));
+}
+
+test "AMPR command completions do not require a prior registration" {
+    reset();
+    var handle: i64 = 0;
+    try std.testing.expectEqual(errno.ok, createEqueue(&handle, "ampr-direct"));
+    defer _ = deleteEqueue(handle);
+
+    try std.testing.expect(triggerAmprCompletion(.{
+        .queue_handle = handle,
+        .ident = 0x1234,
+        .completion_token = 0xfeed,
+        .user_data = 0xcafe,
+    }));
+
+    var event: [1]Event = .{.{}};
+    var count: i32 = 0;
+    var timeout: u32 = 0;
+    try std.testing.expectEqual(errno.ok, waitEqueue(handle, &event, 1, &count, &timeout));
+    try std.testing.expectEqual(@as(i32, 1), count);
+    try std.testing.expectEqual(@as(u64, 0x1234), event[0].ident);
+    try std.testing.expectEqual(ampr_filter, event[0].filter);
+    try std.testing.expectEqual(@as(i64, 0xfeed), event[0].data);
+    try std.testing.expectEqual(@as(u64, 0xcafe), event[0].user_data);
+}
+
+test "AMPR retains bursts larger than registration capacity" {
+    reset();
+    var handle: i64 = 0;
+    try std.testing.expectEqual(errno.ok, createEqueue(&handle, "ampr-burst"));
+    defer _ = deleteEqueue(handle);
+
+    const completion_count = maximum_registrations + 32;
+    for (0..completion_count) |index| {
+        try std.testing.expect(triggerAmprCompletion(.{
+            .queue_handle = handle,
+            .ident = index,
+            .completion_token = 0x1000 + index,
+            .user_data = 0x2000 + index,
+        }));
+    }
+
+    var events: [completion_count]Event = [_]Event{.{}} ** completion_count;
+    var count: i32 = 0;
+    var timeout: u32 = 0;
+    try std.testing.expectEqual(
+        errno.ok,
+        waitEqueue(handle, &events, completion_count, &count, &timeout),
+    );
+    try std.testing.expectEqual(@as(i32, completion_count), count);
+    for (events, 0..) |event, index| {
+        try std.testing.expectEqual(@as(u64, index), event.ident);
+        try std.testing.expectEqual(ampr_filter, event.filter);
+        try std.testing.expectEqual(@as(i64, @intCast(0x1000 + index)), event.data);
+        try std.testing.expectEqual(@as(u64, 0x2000 + index), event.user_data);
+    }
 }
 
 test "VideoOut flip events retain their filter and user data" {

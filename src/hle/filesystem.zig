@@ -7,10 +7,9 @@
 //! paths: everything it ships lives under `/app0`. This maps those paths onto a
 //! host directory and hands out descriptors.
 //!
-//! Title content remains read-only. The one writable exception is `/devlog`, a
-//! console diagnostic mount redirected to the emulator's `out` directory. It
-//! cannot alter game data and lets Unity explain startup failures that would
-//! otherwise disappear with the console's debug logger.
+//! Title content remains read-only. Saves and downloaded/generated data live
+//! on explicitly writable mounts, while `/devlog` is redirected to the
+//! emulator's `out` directory. None can alter installed game data.
 
 const std = @import("std");
 const audio_fs = @import("audio_fs.zig");
@@ -221,11 +220,11 @@ comptime {
 
 /// Which host directory a mount point resolves against.
 ///
-/// Everything a title ships is read-only and lives together; its saves are
-/// writable, outlive the installation and are keyed by the title rather than
-/// stored beside it. They are therefore two separate host directories, and a
-/// path has to say which one it means before it can be resolved.
-pub const Mount = enum { title, savedata };
+/// Everything a title ships is read-only and lives together. Saves and
+/// downloaded/generated title data are writable and outlive the installation,
+/// but the console exposes them through separate mount points. A path therefore
+/// has to say which host directory it belongs to before it can be resolved.
+pub const Mount = enum { title, savedata, download };
 
 const MountPoint = struct { prefix: []const u8, mount: Mount };
 
@@ -235,6 +234,7 @@ const mount_points = [_]MountPoint{
     .{ .prefix = "/hostapp/", .mount = .title },
     .{ .prefix = "/host/", .mount = .title },
     .{ .prefix = "/savedata0/", .mount = .savedata },
+    .{ .prefix = "/download0/", .mount = .download },
 };
 
 /// Whether a path names a mount itself rather than one of its children.
@@ -365,7 +365,7 @@ const OpenFile = struct {
     /// An offline POSIX socket. It owns only a descriptor slot; network
     /// operations decide whether to acknowledge local state or report ENETDOWN.
     virtual_socket: bool = false,
-    /// Set for a descriptor inside the writable save mount.
+    /// Set for a descriptor inside a writable mount.
     writable: bool = false,
     /// `/devlog/app/debug.log`, redirected outside the read-only title mount.
     diagnostic_log: bool = false,
@@ -409,6 +409,9 @@ var root: ?std.Io.Dir = null;
 /// prepared, which is what keeps a title without one from writing into its own
 /// installation.
 var savedata_root: ?std.Io.Dir = null;
+/// Where `/download0` resolves. Unlike `/app0`, titles may create generated
+/// configuration, caches, and downloaded content here.
+var download_root: ?std.Io.Dir = null;
 var open_files: [maximum_open_files]?OpenFile = @splat(null);
 var table_lock: Lock = .{};
 var virtual_socket_signal: std.atomic.Value(u8) = .init(0);
@@ -429,11 +432,26 @@ pub fn attachSaveData(directory: std.Io.Dir) void {
     savedata_root = directory;
 }
 
+/// Makes a per-title host directory visible as writable `/download0`.
+/// The caller retains ownership of the directory handle.
+pub fn attachDownloadData(directory: std.Io.Dir) void {
+    table_lock.lock();
+    defer table_lock.unlock();
+    download_root = directory;
+}
+
+pub fn detachDownloadData() void {
+    table_lock.lock();
+    defer table_lock.unlock();
+    download_root = null;
+}
+
 /// The host directory a mount resolves against, if one is attached.
 fn rootFor(mount: Mount) ?std.Io.Dir {
     return switch (mount) {
         .title => root,
         .savedata => savedata_root,
+        .download => download_root,
     };
 }
 
@@ -703,6 +721,7 @@ pub fn detach() void {
     }
     active_io = null;
     root = null;
+    download_root = null;
     virtual_socket_signal.store(0, .release);
     audio_fs.reset();
 }
@@ -775,10 +794,9 @@ pub fn open(path: []const u8, flags: i32) Error!i32 {
     const mount = mountOf(path);
     const directory = rootFor(mount) orelse return Error.NotAttached;
 
-    // Everything a title ships stays read-only; its saves are the one place it
-    // is allowed to write, and refusing that is what made saved games
-    // impossible rather than merely unimplemented.
-    if (mount != .savedata) {
+    // Everything a title ships stays read-only. Save and download mounts are
+    // explicitly writable storage owned by the running title.
+    if (mount == .title) {
         if (flags & (O.creat | O.trunc | O.excl) != 0) return Error.ReadOnly;
         if (flags & O.accmode != O.rdonly) return Error.ReadOnly;
         if (flags & O.append != 0) return Error.ReadOnly;
@@ -789,7 +807,7 @@ pub fn open(path: []const u8, flags: i32) Error!i32 {
 
     if (flags & O.directory != 0) return openDirectory(path, relative, io, directory);
 
-    if (mount == .savedata) return openSaveDataFile(path, relative, flags, io, directory);
+    if (mount != .title) return openWritableFile(path, relative, flags, io, directory);
 
     const file = directory.openFile(io, relative, .{}) catch |err| switch (err) {
         error.FileNotFound, error.NotDir, error.BadPathName => {
@@ -863,8 +881,8 @@ fn openDevlog(path: []const u8, flags: i32) Error!i32 {
     return Error.TooManyOpenFiles;
 }
 
-/// Opens a file inside the writable save mount, creating it when asked.
-fn openSaveDataFile(
+/// Opens a file inside a writable mount, creating it when asked.
+fn openWritableFile(
     path: []const u8,
     relative: []const u8,
     flags: i32,
@@ -924,13 +942,14 @@ fn ensureParentDirectory(relative: []const u8, io: std.Io, directory: std.Io.Dir
     directory.createDirPath(io, relative[0..separator]) catch {};
 }
 
-/// Creates a directory inside the writable save mount, or accepts the
-/// diagnostic directories. Everything a title ships stays read-only.
+/// Creates a directory inside a writable mount, or accepts the diagnostic
+/// directories. Everything a title ships stays read-only.
 pub fn makeDirectory(path: []const u8) Error!void {
     if (isDevlogDirectory(path)) return;
-    if (mountOf(path) != .savedata) return Error.ReadOnly;
+    const mount = mountOf(path);
+    if (mount == .title) return Error.ReadOnly;
     const io = active_io orelse return Error.NotAttached;
-    const directory = savedata_root orelse return Error.NotAttached;
+    const directory = rootFor(mount) orelse return Error.NotAttached;
     var relative_storage: [maximum_path]u8 = undefined;
     const relative = normalizedMountRelative(path, &relative_storage) orelse return Error.NotFound;
     if (std.mem.eql(u8, relative, ".")) return;
@@ -1635,6 +1654,29 @@ test "writes are refused rather than silently dropped" {
     try testing.expectError(Error.ReadOnly, open("/app0/data.bin", O.rdwr));
     try testing.expectError(Error.ReadOnly, open("/app0/new.bin", O.rdonly | O.creat));
     try testing.expectError(Error.ReadOnly, open("/app0/data.bin", O.rdonly | O.trunc));
+}
+
+test "download data is writable without making title content writable" {
+    var fixture = try Fixture.init("title data");
+    defer fixture.deinit();
+    attachDownloadData(fixture.tmp.dir);
+    defer detachDownloadData();
+
+    try makeDirectory("/download0/generated/cache");
+    const fd = try open(
+        "/download0/generated/cache/config.bin",
+        O.rdwr | O.creat | O.trunc,
+    );
+    try testing.expectEqual(@as(usize, 6), try write(fd, "config"));
+    try close(fd);
+
+    const reopened = try open("/download0/generated/cache/config.bin", O.rdonly);
+    defer close(reopened) catch {};
+    var contents: [6]u8 = undefined;
+    try testing.expectEqual(contents.len, try read(reopened, &contents));
+    try testing.expectEqualStrings("config", &contents);
+
+    try testing.expectError(Error.ReadOnly, makeDirectory("/app0/generated"));
 }
 
 test "missing files and bad descriptors are reported precisely" {

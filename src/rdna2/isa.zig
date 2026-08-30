@@ -222,6 +222,10 @@ pub const Opcode = enum {
     s_sendmsg,
     s_trap,
     s_ttrace_data,
+    s_cbranch_cdbgsys,
+    s_cbranch_cdbguser,
+    s_cbranch_cdbgsys_or_user,
+    s_cbranch_cdbgsys_and_user,
     s_waitcnt_depctr,
     s_inst_prefetch,
 

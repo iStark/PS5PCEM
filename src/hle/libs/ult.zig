@@ -296,6 +296,16 @@ fn ultWaitingQueueResourcePoolCreate(
     return errno.ok;
 }
 
+fn ultWaitingQueueResourcePoolDestroy(pool: ?*anyopaque) callconv(abi.guest) i32 {
+    const object = pool orelse return error_null;
+    table_lock.lock();
+    defer table_lock.unlock();
+    const slot = findSlot(WaitingPool, &waiting_pools, @intFromPtr(object)) orelse return error_state;
+    slot.* = .{};
+    clearGuest(object, pool_bytes);
+    return errno.ok;
+}
+
 fn ultQueueDataResourcePoolGetWorkAreaSize(num_data: u32, data_size: u64, num_queue: u32) callconv(abi.guest) u64 {
     return alignUp(@as(u64, num_data) * alignUp(data_size, 8) + @as(u64, num_queue) * 512, 8);
 }
@@ -460,6 +470,22 @@ fn ultMutexUnlock(mutex: ?*anyopaque) callconv(abi.guest) i32 {
     return if (slot.unlock()) errno.ok else error_state;
 }
 
+fn ultMutexDestroy(mutex: ?*anyopaque) callconv(abi.guest) i32 {
+    const object = mutex orelse return error_null;
+    table_lock.lock();
+    defer table_lock.unlock();
+    const slot = findSlot(HostMutex, &mutexes, @intFromPtr(object)) orelse return error_state;
+    slot.inner.lock();
+    if (slot.depth != 0) {
+        slot.inner.unlock();
+        return error_busy;
+    }
+    slot.inner.unlock();
+    slot.* = .{};
+    clearGuest(object, mutex_bytes);
+    return errno.ok;
+}
+
 fn ultSemaphoreCreate(
     semaphore: ?*anyopaque,
     _: ?[*:0]const u8,
@@ -592,6 +618,7 @@ const exports = [_]symbols.Export{
     .{ .name = "sceUltUlthreadJoin", .function = trace.wrap("sceUltUlthreadJoin", &ultUlthreadJoin), .id_override = "gCeAI57LGgI" },
     .{ .name = "sceUltWaitingQueueResourcePoolGetWorkAreaSize", .function = trace.wrap("sceUltWaitingQueueResourcePoolGetWorkAreaSize", &ultWaitingQueueResourcePoolGetWorkAreaSize), .id_override = "WIWV1Qd7PFU" },
     .{ .name = "sceUltWaitingQueueResourcePoolCreate", .function = trace.wrap("sceUltWaitingQueueResourcePoolCreate", &ultWaitingQueueResourcePoolCreate), .id_override = "YiHujOG9vXY" },
+    .{ .name = "sceUltWaitingQueueResourcePoolDestroy", .function = trace.wrap("sceUltWaitingQueueResourcePoolDestroy", &ultWaitingQueueResourcePoolDestroy), .expect_id = "or55417wcDk" },
     .{ .name = "sceUltQueueDataResourcePoolGetWorkAreaSize", .function = trace.wrap("sceUltQueueDataResourcePoolGetWorkAreaSize", &ultQueueDataResourcePoolGetWorkAreaSize), .id_override = "evj9YPkS8s4" },
     .{ .name = "sceUltQueueDataResourcePoolCreate", .function = trace.wrap("sceUltQueueDataResourcePoolCreate", &ultQueueDataResourcePoolCreate), .id_override = "TFHm6-N6vks" },
     .{ .name = "sceUltQueueCreate", .function = trace.wrap("sceUltQueueCreate", &ultQueueCreate), .id_override = "9Y5keOvb6ok" },
@@ -601,6 +628,7 @@ const exports = [_]symbols.Export{
     .{ .name = "sceUltMutexCreate", .function = trace.wrap("sceUltMutexCreate", &ultMutexCreate), .id_override = "mmt8Sa6tL6c" },
     .{ .name = "sceUltMutexLock", .function = trace.wrap("sceUltMutexLock", &ultMutexLock), .id_override = "8hEGkR1pfr8" },
     .{ .name = "sceUltMutexUnlock", .function = trace.wrap("sceUltMutexUnlock", &ultMutexUnlock), .id_override = "h0XebKiMBtk" },
+    .{ .name = "sceUltMutexDestroy", .function = trace.wrap("sceUltMutexDestroy", &ultMutexDestroy), .expect_id = "jW+HnafeS3Y" },
     .{ .name = "sceUltSemaphoreCreate", .function = trace.wrap("sceUltSemaphoreCreate", &ultSemaphoreCreate), .id_override = "h5QlIYj+Ro8" },
     .{ .name = "sceUltSemaphoreAcquire", .function = trace.wrap("sceUltSemaphoreAcquire", &ultSemaphoreAcquire), .id_override = "QAH1ofI97vU" },
     .{ .name = "sceUltSemaphoreTryAcquire", .function = trace.wrap("sceUltSemaphoreTryAcquire", &ultSemaphoreTryAcquire), .id_override = "HA1Ldbi3lPY" },
@@ -650,9 +678,11 @@ test "Ult initialize, mutex, queue and semaphore keep guest objects coherent" {
     var mutex: [mutex_bytes]u8 = undefined;
     try std.testing.expectEqual(errno.ok, ultMutexCreate(&mutex, "m", &waiting, null, 0));
     try std.testing.expectEqual(errno.ok, ultMutexLock(&mutex));
+    try std.testing.expectEqual(error_busy, ultMutexDestroy(&mutex));
     try std.testing.expectEqual(errno.ok, ultMutexLock(&mutex));
     try std.testing.expectEqual(errno.ok, ultMutexUnlock(&mutex));
     try std.testing.expectEqual(errno.ok, ultMutexUnlock(&mutex));
+    try std.testing.expectEqual(errno.ok, ultMutexDestroy(&mutex));
 
     var semaphore: [semaphore_bytes]u8 align(8) = undefined;
     try std.testing.expectEqual(errno.ok, ultSemaphoreCreate(&semaphore, "s", 1, &waiting, null, 0));
@@ -660,6 +690,7 @@ test "Ult initialize, mutex, queue and semaphore keep guest objects coherent" {
     try std.testing.expectEqual(error_again, ultSemaphoreTryAcquire(&semaphore, 1));
     try std.testing.expectEqual(errno.ok, ultSemaphoreRelease(&semaphore, 1));
     try std.testing.expectEqual(errno.ok, ultSemaphoreDestroy(&semaphore));
+    try std.testing.expectEqual(errno.ok, ultWaitingQueueResourcePoolDestroy(&waiting));
     try std.testing.expectEqual(errno.ok, ultFinalize());
 }
 
@@ -672,8 +703,10 @@ test "Ult exports resolve the observed identifiers" {
         "d-kSG2fLrvI",
         "znI3q8S7KQ4",
         "mmt8Sa6tL6c",
+        "jW+HnafeS3Y",
         "h5QlIYj+Ro8",
         "9Y5keOvb6ok",
+        "or55417wcDk",
     }) |id| {
         try std.testing.expect(db.findById(id, .function) != null);
     }

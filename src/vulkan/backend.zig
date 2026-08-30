@@ -159,6 +159,9 @@ pub const Options = struct {
     /// Diagnostic fast path for graphics bring-up. Command processing and
     /// draws continue, but guest compute dispatches are not submitted.
     skip_compute_dispatches: bool = false,
+    /// Diagnostic bisection aid: execute at most this many guest compute
+    /// dispatches, then keep command processing without submitting later ones.
+    compute_execution_limit: ?u64 = null,
     /// Diagnostic fast path for UI/input bring-up. One complete frame out of
     /// every sixteen is rendered while command processing and guest logic keep
     /// advancing. Full rendering resumes at the bounded handoff so gameplay
@@ -681,7 +684,12 @@ const gds_ring_bytes = gds_slot_bytes * maximum_frame_descriptor_sets;
 /// Read-only vertex/constant ranges are copied into one persistently mapped
 /// per-frame arena. It snapshots guest data for queued draws without creating
 /// and freeing one Vulkan allocation per binding.
-const draw_upload_ring_bytes = 128 * 1024 * 1024;
+// REANIMAL's steady frame has about 247 MiB of unique read-only vertex and
+// constant ranges (two 96 MiB buffers, one 48 MiB buffer, plus small tables).
+// A 128 MiB arena wrapped in the middle of every draw, cleared its exact-range
+// cache, and copied that same working set about five times per frame. Keep one
+// complete modern-frame working set so repeated bindings remain snapshots.
+const draw_upload_ring_bytes = 256 * 1024 * 1024;
 const draw_upload_alignment = 256;
 const maximum_async_command_buffers = 512;
 const maximum_storage_mappings = 1024;
@@ -1039,6 +1047,19 @@ const GuestDraw = struct {
     /// `false` = UINT16, `true` = UINT32. AGC defaults to 16-bit indices.
     index_uint32: bool = false,
 };
+
+const maximum_guest_draw_elements: u32 = 1 << 28;
+const maximum_guest_draw_instances: u32 = 1 << 20;
+
+/// Rejects corrupted/stale indirect arguments before shader resource staging.
+/// A multi-billion-element command cannot complete before the Windows GPU
+/// watchdog and often makes the backend copy equally implausible descriptor
+/// extents first. Zero-sized commands remain valid Vulkan no-ops.
+fn guestDrawWithinExecutionLimits(draw: GuestDraw) bool {
+    const elements = draw.index_count orelse draw.vertex_count;
+    return elements <= maximum_guest_draw_elements and
+        draw.instance_count <= maximum_guest_draw_instances;
+}
 
 fn guestPrimitiveTopology(primitive_type: u32, draw: GuestDraw) u32 {
     return switch (primitive_type) {
@@ -2090,6 +2111,20 @@ const ComputeResources = struct {
         return null;
     }
 
+    /// Whether a translated dispatch can change state that the emulator will
+    /// make visible after it completes. Stores whose V# could not be recovered
+    /// are deliberately lowered as no-ops, so merely seeing a store opcode in
+    /// the guest program is not enough to justify executing a large shader.
+    fn hasWritableExternalState(self: *const ComputeResources) bool {
+        for (self.writable, self.occupied) |writable, occupied| {
+            if (occupied and writable) return true;
+        }
+        for (self.storage_images[0..self.storage_image_count]) |image| {
+            if (image.writable) return true;
+        }
+        return false;
+    }
+
     fn sampledImageMappingForInstruction(
         self: *const ComputeResources,
         resource_sgpr: u32,
@@ -2617,6 +2652,7 @@ pub const Renderer = struct {
     force_probe_fragment_parameter: bool,
     force_probe_fragment_ui: bool,
     skip_compute_dispatches: bool,
+    compute_execution_limit: ?u64,
     sparse_graphics_draws: bool,
     translate_compute_only: bool,
     dump_compute_spirv: bool,
@@ -2627,6 +2663,8 @@ pub const Renderer = struct {
     async_pipeline_compilation_enabled: bool,
     canonical_image_aliases_enabled: bool,
     timeline_scheduler_enabled: bool,
+    reanimal_restore_timeline_after_flip: ?u64 = null,
+    reanimal_skip_compute_until_flip: ?u64 = null,
     defer_small_storage_writes_enabled: bool,
     depth_transfer_enabled: bool,
     image_state_optimization_enabled: bool,
@@ -2737,6 +2775,9 @@ pub const Renderer = struct {
     dispatch_callbacks: u64 = 0,
     translated_dispatches: u64 = 0,
     elided_dispatches: u64 = 0,
+    reanimal_nvidia_compute_workaround_active: bool = false,
+    reanimal_nvidia_wave_compaction_seen: bool = false,
+    reanimal_nvidia_compute_quarantined: bool = false,
     emulated_gds_dispatches: u64 = 0,
     emulated_buffer_clear_dispatches: u64 = 0,
     emulated_image_store_dispatches: u64 = 0,
@@ -2786,6 +2827,7 @@ pub const Renderer = struct {
     reported_draw_errors: [16]?anyerror = @splat(null),
     reported_compute_shader_failures: [32]?ComputeShaderFailure = @splat(null),
     reported_compute_resource_programs: [8]u64 = @splat(0),
+    excessive_draw_reports: u8 = 0,
     last_dispatch_error: ?anyerror = null,
     last_draw_error: ?anyerror = null,
     last_sync_error: ?anyerror = null,
@@ -3154,6 +3196,7 @@ pub const Renderer = struct {
             .force_probe_fragment_parameter = options.force_probe_fragment_parameter,
             .force_probe_fragment_ui = options.force_probe_fragment_ui,
             .skip_compute_dispatches = options.skip_compute_dispatches,
+            .compute_execution_limit = options.compute_execution_limit,
             .sparse_graphics_draws = options.sparse_graphics_draws,
             .translate_compute_only = options.translate_compute_only,
             .dump_compute_spirv = options.dump_compute_spirv,
@@ -4073,6 +4116,41 @@ pub const Renderer = struct {
         const bindings = try gpu.ShaderBindings.capture(state, .compute, header_address, reader);
         const system_registers = gpu.resources.decodeComputeSystemRegisters(state);
         const analysis = try self.analyzedProgram(reader, program_address, header_address);
+        const program_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(analysis.program.code));
+        if (self.device_info.vendor_id == 0x10de and self.reanimal_nvidia_compute_quarantined) {
+            self.elided_dispatches += 1;
+            return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
+        }
+        // REANIMAL submits this exact wave-compaction kernel once with four
+        // workgroups before reusing it for the small per-view allocations.
+        // Remembering that title-specific sequence keeps the later workaround
+        // from matching an unrelated game which happens to share the shader.
+        if (self.device_info.vendor_id == 0x10de and
+            program_hash == 0xb6c9_d14d_22b1_3b42 and
+            analysis.program.instructions.items.len == 37 and
+            std.meta.eql(group_count, [3]u32{ 4, 1, 1 }) and
+            std.meta.eql(local_size, [3]u32{ 64, 1, 1 }))
+        {
+            self.reanimal_nvidia_wave_compaction_seen = true;
+        }
+        if (self.compute_execution_limit != null and self.translated_dispatches >= 20) {
+            std.debug.print(
+                "[vulkan dcb] compute bisection next=#{d} program=0x{x} hash=0x{x} words={d} instructions={d} groups={d}x{d}x{d} local={d}x{d}x{d}\n",
+                .{
+                    self.translated_dispatches + 1,
+                    program_address,
+                    program_hash,
+                    analysis.program.code.len,
+                    analysis.program.instructions.items.len,
+                    group_count[0],
+                    group_count[1],
+                    group_count[2],
+                    local_size[0],
+                    local_size[1],
+                    local_size[2],
+                },
+            );
+        }
         const emulation_started = hostTimestampNs();
         if (try self.tryEmulateGdsInitialization(
             memory,
@@ -4166,8 +4244,90 @@ pub const Renderer = struct {
             return report;
         }
         self.frame_profile.compute_emulation_ns +|= elapsedHostNanoseconds(emulation_started);
+        // These two REANIMAL kernels must be recognized before descriptor and
+        // image preparation. Their preparation path alone records Vulkan work
+        // which can reset an NVIDIA device, so matching the eventual SPIR-V
+        // module is already too late. The first kernel arms the title-specific
+        // sequence using an exact instruction encoding; the follow-up then also
+        // requires its unique execution shape.
+        if (self.device_info.vendor_id == 0x10de) {
+            const bootstrap = matchesReanimalNvidiaBootstrapComputeShape(
+                group_count,
+                analysis.program.instructions.items.len,
+            ) and programHasRawInstruction(
+                analysis,
+                0x4a8,
+                &.{ 0xf020_0f10, 0x0000_0004 },
+            );
+            if (bootstrap) {
+                self.reanimal_nvidia_compute_workaround_active = true;
+                if (self.timeline_scheduler_enabled) {
+                    self.timeline_scheduler_enabled = false;
+                    self.reanimal_restore_timeline_after_flip = self.flip_callbacks +| 1;
+                    std.debug.print(
+                        "[vulkan dcb] REANIMAL NVIDIA synchronization armed through flip #{d}\n",
+                        .{self.reanimal_restore_timeline_after_flip.?},
+                    );
+                }
+                self.reanimal_skip_compute_until_flip = self.flip_callbacks +| 1;
+                self.elided_dispatches += 1;
+                std.debug.print(
+                    "[vulkan dcb] early-elided NVIDIA-unsafe REANIMAL bootstrap compute program=0x{x} groups={d}x{d}x{d}\n",
+                    .{ program_address, group_count[0], group_count[1], group_count[2] },
+                );
+                return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
+            }
+            if (self.reanimal_nvidia_compute_workaround_active and
+                matchesReanimalNvidiaFollowupComputeShape(
+                    group_count,
+                    analysis.program.instructions.items.len,
+                ))
+            {
+                self.elided_dispatches += 1;
+                std.debug.print(
+                    "[vulkan dcb] early-elided NVIDIA-unsafe REANIMAL follow-up compute program=0x{x} groups={d}x{d}x{d}\n",
+                    .{ program_address, group_count[0], group_count[1], group_count[2] },
+                );
+                return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
+            }
+            const unsupported_gather = self.reanimal_nvidia_compute_workaround_active and
+                programHasRawInstruction(
+                    analysis,
+                    0xd4,
+                    &.{ 0xf11c_0108, 0x0040_0008 },
+                );
+            if (unsupported_gather) {
+                self.elided_dispatches += 1;
+                std.debug.print(
+                    "[vulkan dcb] early-elided unsupported REANIMAL image-gather compute program=0x{x} groups={d}x{d}x{d}\n",
+                    .{ program_address, group_count[0], group_count[1], group_count[2] },
+                );
+                return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
+            }
+        }
+        // Conditional-debug state is disabled, so these branches fall through.
+        // The remaining large Unreal kernels currently produce a valid module
+        // but can still trigger VK_ERROR_DEVICE_LOST on NVIDIA. Preserve the
+        // old safe behavior there until their full instruction mix is covered.
+        if (self.device_info.vendor_id == 0x10de and programUsesConditionalDebugBranch(analysis)) {
+            self.elided_dispatches += 1;
+            return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
+        }
+        // A decoded `.unsupported` instruction guarantees that SPIR-V
+        // translation will fail. Detect it before descriptor/image staging:
+        // staging large transient resources for a shader that cannot execute
+        // can invalidate still-recorded NVIDIA command buffers.
+        if (firstUnsupportedInstruction(analysis)) |unsupported| {
+            self.elided_dispatches += 1;
+            if (self.shouldReportComputeShaderFailure(program_address, error.UnsupportedOpcode)) {
+                std.debug.print(
+                    "[vulkan dcb] early-elided unsupported compute program=0x{x} pc=0x{x} raw={x:0>8}\n",
+                    .{ program_address, unsupported.pc, unsupported.raw[0] },
+                );
+            }
+            return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
+        }
         const uses_gds = programUsesGds(analysis);
-        if (uses_gds) try self.uploadGdsStorage();
         if (!analysis.hasExternalEffects()) {
             self.elided_dispatches += 1;
             std.debug.print(
@@ -4182,6 +4342,8 @@ pub const Renderer = struct {
             );
             return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
         }
+        try self.beginComputeDispatch();
+        if (uses_gds) try self.uploadGdsStorage();
         const specialized_scalar_prefix_end = scalarPrefixEnd(analysis);
         const scalar = gpu.scalar_provenance.evaluatePrefixUntil(reader, &bindings, specialized_scalar_prefix_end);
         var resources = blk: {
@@ -4215,7 +4377,57 @@ pub const Renderer = struct {
             };
         };
         defer resources.deinit(self);
-        if (self.traceCurrentGraphicsFrame()) {
+        // The second 64-byte-input reuse of REANIMAL's wave-compaction kernel
+        // still depends on cross-lane GCN execution-mask semantics which SPIR-V
+        // cannot express per host invocation. Running it writes corrupted view
+        // data (a vertically smeared frame) and eventually resets NVIDIA's
+        // device. Preserve the earlier 256-byte-input reuse, which produces the
+        // readable buoy frame, and quarantine only at this unsafe resource shape.
+        if (self.device_info.vendor_id == 0x10de and
+            self.reanimal_nvidia_wave_compaction_seen and
+            program_hash == 0xb6c9_d14d_22b1_3b42 and
+            std.meta.eql(group_count, [3]u32{ 1, 1, 1 }) and
+            std.meta.eql(local_size, [3]u32{ 64, 1, 1 }))
+        {
+            if (resources.mappingForSgpr(4)) |descriptor_index| {
+                const slot: usize = @intCast(descriptor_index);
+                if (resources.sizes[slot] == 0x40 and !resources.writable[slot]) {
+                    self.reanimal_nvidia_compute_quarantined = true;
+                    self.elided_dispatches += 1;
+                    std.debug.print(
+                        "[vulkan dcb] quarantined NVIDIA-unsafe REANIMAL compute after wave-compaction reuse program=0x{x}\n",
+                        .{program_address},
+                    );
+                    return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
+                }
+            }
+        }
+        // Resource recovery can prove a syntactically effectful program has no
+        // destination that survives this dispatch. The SPIR-V lowerer drops
+        // stores through an unrecovered/null V#, and commitComputeWrites uses
+        // the same writable flags below. Executing the remaining control flow
+        // cannot affect guest state; on large Unreal kernels it can also trip
+        // the host GPU watchdog. Elide it before translation/submission while
+        // retaining kernels that write GDS, buffers, or storage images.
+        if (!uses_gds and !resources.hasWritableExternalState()) {
+            self.elided_dispatches += 1;
+            if (analysis.program.instructions.items.len >= 256 or log_verbose_gpu) {
+                std.debug.print(
+                    "[vulkan dcb] elided compute without writable resources program=0x{x} ({d} instructions, groups={d}x{d}x{d})\n",
+                    .{
+                        program_address,
+                        analysis.program.instructions.items.len,
+                        group_count[0],
+                        group_count[1],
+                        group_count[2],
+                    },
+                );
+            }
+            return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
+        }
+        if (self.traceCurrentGraphicsFrame() or
+            (self.compute_execution_limit != null and self.translated_dispatches >= 62))
+        {
             std.debug.print(
                 "[vulkan dcb] traced compute resources dispatch={d} program=0x{x} buffers={d} sampled={d} storage_images={d}\n",
                 .{
@@ -4418,9 +4630,25 @@ pub const Renderer = struct {
         }
         if (self.dump_compute_spirv) dumpComputeSpirv(self.allocator, program_address, module.words);
         try self.writeComputeScalarValues(resources.scalar_registers[0..resources.scalar_count]);
+        if (self.dump_compute_spirv) {
+            std.debug.print(
+                "[vulkan dcb] compute submit begin program=0x{x} groups={d}x{d}x{d} instructions={d} spirv_words={d}\n",
+                .{
+                    program_address,
+                    group_count[0],
+                    group_count[1],
+                    group_count[2],
+                    analysis.program.instructions.items.len,
+                    module.words.len,
+                },
+            );
+        }
         const submit_started = hostTimestampNs();
         const report = try self.dispatchSpirv(module.words, group_count);
         self.frame_profile.compute_submit_ns +|= elapsedHostNanoseconds(submit_started);
+        if (self.dump_compute_spirv) {
+            std.debug.print("[vulkan dcb] compute submit complete program=0x{x}\n", .{program_address});
+        }
         if (uses_gds) try self.downloadGdsStorage();
         try self.commitComputeWrites(memory, &resources);
         try self.commitStorageImages(memory, &resources);
@@ -11095,11 +11323,36 @@ pub const Renderer = struct {
                     );
                 }
             } else {
-                i420_module = try buildI420FragmentSpirv(
-                    self.allocator,
-                    graphics_resources.mappings[0..fragment_mapping_count],
-                    .{ video.luma.width, target.descriptor.height },
-                );
+                // Resource discovery follows shader instruction order, which
+                // is not guaranteed to be Y, U, V. The synthetic converter
+                // assigns those roles by destination VGPR, so passing the raw
+                // mapping order swaps planes in shaders which fetch chroma
+                // first and produces strongly coloured vertical bands.
+                var ordered_bindings: [3]rdna2.spirv.SampledImageBinding = undefined;
+                var found_planes: [3]bool = @splat(false);
+                for (graphics_resources.mappings[0..fragment_mapping_count]) |binding| {
+                    const image = graphics_resources.descriptors[@intCast(binding.descriptor_index)];
+                    const plane_index: ?usize = if (image.address == video.luma.address)
+                        0
+                    else if (image.address == video.chroma_u.address)
+                        1
+                    else if (image.address == video.chroma_v.?.address)
+                        2
+                    else
+                        null;
+                    if (plane_index) |index| {
+                        ordered_bindings[index] = binding;
+                        ordered_bindings[index].instruction_pc = @intCast(8 + index * 8);
+                        found_planes[index] = true;
+                    }
+                }
+                if (found_planes[0] and found_planes[1] and found_planes[2]) {
+                    i420_module = try buildI420FragmentSpirv(
+                        self.allocator,
+                        &ordered_bindings,
+                        .{ video.luma.width, target.descriptor.height },
+                    );
+                }
             }
         }
         const fragment_words = if (self.force_probe_fragment)
@@ -15139,8 +15392,12 @@ pub const Renderer = struct {
             for (self.storage_image_cache.items) |cached| {
                 resident_storage_images += @intFromBool(cached.valid);
             }
+            var guest_buffer_cache_bytes: u64 = 0;
+            for (self.guest_buffers.items) |cached| {
+                guest_buffer_cache_bytes +|= cached.device_local.size;
+            }
             std.debug.print(
-                "[gpu frame] flip={d} frame_ms={d} draws={d}/{d}ms dispatches={d}/{d}ms flip={d}ms submits={d}/{d}cmd fence_wait_us={d} upload_kib={d}(buf={d},rt={d},tex={d},idx={d}) resident_kib={d} readback_kib={d}(buf={d},rt={d}) storage_ms={d}+{d} target_ms={d} rt_hit={d} rt_miss={d} tex_hit={d} tex_miss={d} tex_evict={d} buf_cache={d} tex_cache={d} simg_cache={d}/{d}MiB\n",
+                "[gpu frame] flip={d} frame_ms={d} draws={d}/{d}ms dispatches={d}/{d}ms flip={d}ms submits={d}/{d}cmd fence_wait_us={d} upload_kib={d}(buf={d},rt={d},tex={d},idx={d}) resident_kib={d} readback_kib={d}(buf={d},rt={d}) storage_ms={d}+{d} target_ms={d} rt_hit={d} rt_miss={d} tex_hit={d} tex_miss={d} tex_evict={d} buf_cache={d}/{d}MiB tex_cache={d} simg_cache={d}/{d}MiB\n",
                 .{
                     self.flip_callbacks,
                     interval_ns / std.time.ns_per_ms,
@@ -15170,6 +15427,7 @@ pub const Renderer = struct {
                     profile.texture_misses,
                     profile.texture_evictions,
                     self.guest_buffers.items.len,
+                    guest_buffer_cache_bytes / (1024 * 1024),
                     self.sampled_image_cache.items.len,
                     resident_storage_images,
                     self.storage_image_cache_bytes / (1024 * 1024),
@@ -15314,8 +15572,24 @@ pub const Renderer = struct {
         return true;
     }
 
+    fn restoreReanimalTimelineSchedulerAfterFlip(self: *Renderer) void {
+        if (self.reanimal_skip_compute_until_flip) |skip_until| {
+            if (self.flip_callbacks >= skip_until) self.reanimal_skip_compute_until_flip = null;
+        }
+        if (self.reanimal_restore_timeline_after_flip) |restore_after| {
+            if (self.flip_callbacks < restore_after) return;
+            self.timeline_scheduler_enabled = true;
+            self.reanimal_restore_timeline_after_flip = null;
+            std.debug.print(
+                "[vulkan dcb] REANIMAL NVIDIA synchronization complete; timeline scheduler restored after flip #{d}\n",
+                .{self.flip_callbacks},
+            );
+        }
+    }
+
     fn tryPresentFlip(self: *Renderer, flip: gpu.state.Flip) bool {
         self.flip_callbacks += 1;
+        defer self.restoreReanimalTimelineSchedulerAfterFlip();
         const flip_started = hostTimestampNs();
         defer self.reportFrameProfile();
         // Declared after the report so that it runs before it: the time this
@@ -16000,6 +16274,22 @@ pub const Renderer = struct {
                         return false;
                     };
                 const draw = expandRectangleListDraw(render_state.primitive_type, decoded_draw);
+                if (!guestDrawWithinExecutionLimits(draw)) {
+                    if (self.excessive_draw_reports < 4) {
+                        std.debug.print(
+                            "[vulkan dcb] elided implausible draw: vertices={d} indices={?d} instances={d} opcode=0x{x}\n",
+                            .{
+                                draw.vertex_count,
+                                draw.index_count,
+                                draw.instance_count,
+                                packet.opcode,
+                            },
+                        );
+                        self.excessive_draw_reports += 1;
+                    }
+                    self.last_draw_error = null;
+                    continue;
+                }
                 if (self.capture_extended_progress_frames and self.flip_callbacks == 63) {
                     var target_address: u64 = 0;
                     var target_width: u32 = 0;
@@ -16095,9 +16385,22 @@ pub const Renderer = struct {
             "[vulkan stall] end dispatch={d} elapsed_ms={d}\n",
             .{ self.frame_profile.dispatches, elapsedHostNanoseconds(profile_started) / std.time.ns_per_ms },
         );
+        if (self.reanimal_skip_compute_until_flip) |skip_until| {
+            if (self.flip_callbacks < skip_until) {
+                self.elided_dispatches += 1;
+                self.last_dispatch_error = null;
+                return true;
+            }
+        }
         if (self.skip_compute_dispatches) {
             self.last_dispatch_error = null;
             return true;
+        }
+        if (self.compute_execution_limit) |limit| {
+            if (self.translated_dispatches >= limit) {
+                self.last_dispatch_error = null;
+                return true;
+            }
         }
         var dispatch_dimensions: [3]u32 = undefined;
         var initiator: u32 = 0;
@@ -16197,6 +16500,21 @@ pub const Renderer = struct {
             self.last_dispatch_error = null;
             return true;
         }
+        if (self.device_info.vendor_id == 0x10de and
+            self.reanimal_nvidia_compute_workaround_active)
+        {
+            const memory = self.guest_memory orelse {
+                self.last_dispatch_error = Error.GuestMemoryUnavailable;
+                return false;
+            };
+            const unsupported_program = guestProgramHasWord(memory, program_address, 0xd54, 0x7e1e_770f) or
+                guestProgramHasWord(memory, program_address, 0x263c, 0x7e0a_7705);
+            if (unsupported_program) {
+                self.elided_dispatches += 1;
+                self.last_dispatch_error = null;
+                return true;
+            }
+        }
         if (self.traceCurrentGraphicsFrame()) {
             std.debug.print(
                 "[vulkan dcb] dispatch trace next_flip={d} dispatch={d} program=0x{x} dimensions={d}x{d}x{d} groups={d}x{d}x{d} local={d}x{d}x{d} initiator=0x{x}\n",
@@ -16217,11 +16535,6 @@ pub const Renderer = struct {
                 },
             );
         }
-        self.beginComputeDispatch() catch |err| {
-            self.last_dispatch_error = err;
-            std.debug.print("[vulkan dcb] dispatch descriptor slot failed: {s}\n", .{@errorName(err)});
-            return false;
-        };
         _ = self.dispatchRdna2State(
             state,
             local_size,
@@ -16230,7 +16543,8 @@ pub const Renderer = struct {
             self.last_dispatch_error = err;
             // Soft-skip resource/translation gaps so one incomplete compute
             // kernel does not abort the DCB before later draws and flips.
-            const soft = err == Error.MissingStorageDescriptor or
+            const soft = self.reanimal_nvidia_compute_workaround_active or
+                err == Error.MissingStorageDescriptor or
                 err == Error.GuestMemoryReadFailed or
                 err == Error.GuestBufferTooLarge or
                 std.mem.eql(u8, @errorName(err), "AddressOverflow") or
@@ -17141,7 +17455,7 @@ fn scalarPrefixEnd(analysis: *const gpu.ShaderAnalysis) u32 {
         switch (inst.family) {
             .sop1, .sop2, .sopk, .smem => end = inst.pc + inst.word_count * 4,
             .sopp => switch (inst.opcode) {
-                .s_nop, .s_waitcnt, .s_barrier, .s_sleep, .s_sendmsg, .s_ttrace_data, .s_inst_prefetch => {
+                .s_nop, .s_waitcnt, .s_barrier, .s_sleep, .s_sendmsg, .s_ttrace_data, .s_cbranch_cdbgsys, .s_cbranch_cdbguser, .s_cbranch_cdbgsys_or_user, .s_cbranch_cdbgsys_and_user, .s_inst_prefetch => {
                     end = inst.pc + inst.word_count * 4;
                 },
                 else => break,
@@ -17611,6 +17925,60 @@ fn programUsesGds(analysis: *const gpu.ShaderAnalysis) bool {
     return false;
 }
 
+fn matchesReanimalNvidiaBootstrapComputeShape(
+    group_count: [3]u32,
+    instruction_count: usize,
+) bool {
+    return group_count[0] == 8 and group_count[1] == 8 and group_count[2] == 2 and
+        instruction_count == 222;
+}
+
+fn matchesReanimalNvidiaFollowupComputeShape(
+    group_count: [3]u32,
+    instruction_count: usize,
+) bool {
+    return group_count[0] == 12 and group_count[1] == 7 and group_count[2] == 8 and
+        instruction_count == 122;
+}
+
+fn programHasRawInstruction(
+    analysis: *const gpu.ShaderAnalysis,
+    pc: u32,
+    words: []const u32,
+) bool {
+    for (analysis.program.instructions.items) |inst| {
+        if (inst.pc != pc or @as(usize, @intCast(inst.raw_count)) < words.len) continue;
+        if (std.mem.eql(u32, inst.raw[0..words.len], words)) return true;
+    }
+    return false;
+}
+
+fn guestProgramHasWord(memory: GuestMemory, program_address: u64, pc: u64, expected: u32) bool {
+    const address = std.math.add(u64, program_address, pc) catch return false;
+    var bytes: [4]u8 = undefined;
+    if (!memory.read(memory.context, address, &bytes)) return false;
+    return std.mem.readInt(u32, &bytes, .little) == expected;
+}
+
+fn firstUnsupportedInstruction(analysis: *const gpu.ShaderAnalysis) ?gpu.ShaderInstruction {
+    for (analysis.program.instructions.items) |inst| {
+        if (inst.opcode == .unsupported) return inst;
+    }
+    return null;
+}
+
+fn programUsesConditionalDebugBranch(analysis: *const gpu.ShaderAnalysis) bool {
+    for (analysis.program.instructions.items) |inst| switch (inst.opcode) {
+        .s_cbranch_cdbgsys,
+        .s_cbranch_cdbguser,
+        .s_cbranch_cdbgsys_or_user,
+        .s_cbranch_cdbgsys_and_user,
+        => return true,
+        else => {},
+    };
+    return false;
+}
+
 fn programStoresImageResource(analysis: *const gpu.ShaderAnalysis, resource_sgpr: u32) bool {
     for (analysis.program.instructions.items) |inst| {
         const writes = switch (inst.opcode) {
@@ -17645,12 +18013,14 @@ fn sampledImageFormat(unified_format: u16, force_srgb: bool) ?u32 {
         18 => vk.format_r8g8_uint,
         19 => vk.format_r8g8_sint,
         22 => vk.format_r32_sfloat,
+        23 => vk.format_r16g16_unorm,
         29 => vk.format_r16g16_sfloat,
         64 => vk.format_r32g32_sfloat,
         36 => vk.format_b10g11r11_ufloat_pack32,
         50 => vk.format_a2b10g10r10_unorm_pack32,
         56 => if (force_srgb) vk.format_r8g8b8a8_srgb else vk.format_r8g8b8a8_unorm,
         60 => vk.format_r8g8b8a8_uint,
+        62 => vk.format_r32g32_uint,
         65 => vk.format_r16g16b16a16_unorm,
         71 => vk.format_r16g16b16a16_sfloat,
         77 => vk.format_r32g32b32a32_sfloat,
@@ -20728,7 +21098,9 @@ test "wide storage images retain channel count and numeric class" {
 test "R16 and RGBA8 integer sampled images preserve their typed formats" {
     try std.testing.expectEqual(@as(?u32, vk.format_r16_unorm), sampledImageFormat(7, false));
     try std.testing.expectEqual(@as(?u32, vk.format_r16_uint), sampledImageFormat(11, false));
+    try std.testing.expectEqual(@as(?u32, vk.format_r16g16_unorm), sampledImageFormat(23, false));
     try std.testing.expectEqual(@as(?u32, vk.format_r8g8b8a8_uint), sampledImageFormat(60, false));
+    try std.testing.expectEqual(@as(?u32, vk.format_r32g32_uint), sampledImageFormat(62, false));
 }
 
 test "R16 UINT color targets use the matching integer attachment format" {
@@ -21463,6 +21835,30 @@ test "frame rate counter emits a one-second rolling rate" {
         }
     }
     try std.testing.expect(counter.note(1 + std.time.ns_per_s / 60) == null);
+}
+
+test "implausible guest draw sizes are rejected before resource staging" {
+    try std.testing.expect(guestDrawWithinExecutionLimits(.{}));
+    try std.testing.expect(guestDrawWithinExecutionLimits(.{
+        .vertex_count = maximum_guest_draw_elements,
+        .instance_count = maximum_guest_draw_instances,
+    }));
+    try std.testing.expect(!guestDrawWithinExecutionLimits(.{
+        .vertex_count = 0xffd5_2027,
+        .instance_count = 0xffd5_2027,
+    }));
+    try std.testing.expect(!guestDrawWithinExecutionLimits(.{
+        .index_count = maximum_guest_draw_elements + 1,
+    }));
+}
+
+test "REANIMAL NVIDIA compute workaround requires both execution shapes" {
+    try std.testing.expect(matchesReanimalNvidiaBootstrapComputeShape(.{ 8, 8, 2 }, 222));
+    try std.testing.expect(!matchesReanimalNvidiaBootstrapComputeShape(.{ 8, 8, 1 }, 222));
+    try std.testing.expect(!matchesReanimalNvidiaBootstrapComputeShape(.{ 8, 8, 2 }, 221));
+    try std.testing.expect(matchesReanimalNvidiaFollowupComputeShape(.{ 12, 7, 8 }, 122));
+    try std.testing.expect(!matchesReanimalNvidiaFollowupComputeShape(.{ 15, 9, 8 }, 122));
+    try std.testing.expect(!matchesReanimalNvidiaFollowupComputeShape(.{ 12, 7, 8 }, 123));
 }
 
 test "NGG auto rectangle uses a triangle strip topology" {

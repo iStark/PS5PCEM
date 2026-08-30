@@ -577,6 +577,12 @@ const Builder = struct {
     glsl_std_450: u32 = 0,
     uses_image_query: bool = false,
     uses_image_gather_extended: bool = false,
+    /// SPIR-V splits arbitrary-lane and relative-lane subgroup shuffles into
+    /// separate capabilities. NVIDIA may accept a module that omits these and
+    /// only report the mistake as DEVICE_LOST when a large compute kernel runs,
+    /// so track the emitted operations and declare their exact requirements.
+    uses_group_shuffle: bool = false,
+    uses_group_shuffle_relative: bool = false,
     scalar_specializations: []const ScalarRegister,
     dynamic_scalar_binding: ?DynamicScalarBinding,
     scalar_buffer: u32 = 0,
@@ -1076,6 +1082,11 @@ const Builder = struct {
     }
 
     fn emit(self: *Builder, list: *std.ArrayList(u32), opcode: u16, args: []const u32) Error!void {
+        switch (opcode) {
+            345, 346 => self.uses_group_shuffle = true, // Shuffle / ShuffleXor
+            347, 348 => self.uses_group_shuffle_relative = true, // ShuffleUp / ShuffleDown
+            else => {},
+        }
         try list.append(self.allocator, (@as(u32, @intCast(args.len + 1)) << 16) | opcode);
         try list.appendSlice(self.allocator, args);
     }
@@ -1581,6 +1592,43 @@ const Builder = struct {
         try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
         self.arithmetic_carry = carry;
         if (with_carry) self.scc = carry;
+    }
+
+    fn scalarSubUnsigned(self: *Builder, inst: instruction.Instruction, with_borrow: bool) Error!void {
+        const a = try self.source(inst.src0, .bits32);
+        const b = try self.source(inst.src1, .bits32);
+        const partial = self.id();
+        try self.emit(&self.body, 130, &.{ self.bits_type, partial, a, b }); // OpISub
+        const partial_borrow = self.id();
+        try self.emit(&self.body, 176, &.{ self.bool_type, partial_borrow, a, b }); // OpULessThan
+
+        var result = partial;
+        var borrow = partial_borrow;
+        if (with_borrow) {
+            const borrow_condition = if (self.arithmetic_carry != 0) self.arithmetic_carry else blk: {
+                const zero = try self.constant(.bits32, 0);
+                const false_value = self.id();
+                try self.emit(&self.body, 171, &.{ self.bool_type, false_value, zero, zero }); // false
+                break :blk false_value;
+            };
+            const borrow_bits = self.id();
+            try self.emit(&self.body, 169, &.{
+                self.bits_type,
+                borrow_bits,
+                borrow_condition,
+                try self.constant(.bits32, 1),
+                try self.constant(.bits32, 0),
+            }); // OpSelect
+            result = self.id();
+            try self.emit(&self.body, 130, &.{ self.bits_type, result, partial, borrow_bits });
+            const borrow_underflow = self.id();
+            try self.emit(&self.body, 176, &.{ self.bool_type, borrow_underflow, partial, borrow_bits });
+            borrow = self.id();
+            try self.emit(&self.body, 166, &.{ self.bool_type, borrow, partial_borrow, borrow_underflow }); // OpLogicalOr
+        }
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+        self.arithmetic_carry = borrow;
+        self.scc = borrow;
     }
 
     fn vectorAddCarry(self: *Builder, inst: instruction.Instruction) Error!void {
@@ -4229,7 +4277,29 @@ const Builder = struct {
     }
 
     fn imageLoad(self: *Builder, inst: instruction.Instruction) Error!void {
-        if (self.stage != .compute) return self.sampledImageFetch(inst);
+        if (self.stage != .compute) {
+            self.sampledImageFetch(inst) catch |err| switch (err) {
+                // Graphics image loads are used for optional visibility and
+                // feedback data in modern Unreal shaders. Keep the rest of
+                // the shader executable when that storage-style T# has no
+                // sampled view yet; rejecting the complete VS/PS destroys
+                // all later exports and the final composite.
+                Error.UnsupportedOpcode, Error.InvalidStorageBinding => {
+                    var destination_index: u32 = 0;
+                    for (0..4) |component| {
+                        const bit = @as(u4, 1) << @intCast(component);
+                        if (inst.data_mask & bit == 0) continue;
+                        try self.destination(
+                            try consecutiveRegister(inst.dst, destination_index),
+                            .{ .id = try self.constant(.float32, 0), .value_type = .float32 },
+                        );
+                        destination_index += 1;
+                    }
+                },
+                else => return err,
+            };
+            return;
+        }
         if ((inst.opcode_id != 0 and inst.opcode_id != 1) or
             (inst.image_dimension != .dim_2d and inst.image_dimension != .dim_3d) or
             (inst.image_address_components < 2 or inst.image_address_components > 4) or
@@ -4329,6 +4399,20 @@ const Builder = struct {
     }
 
     fn imageAtomic(self: *Builder, inst: instruction.Instruction, opcode: u16) Error!void {
+        if (self.stage != .compute) {
+            // Graphics storage-image descriptors are not materialized yet.
+            // Unreal uses these atomics for auxiliary visibility/feedback;
+            // preserving the shader's colour/position exports is preferable
+            // to rejecting the entire draw. A returning atomic receives the
+            // deterministic initial value until graphics UAVs are bound.
+            if (inst.globally_coherent) {
+                try self.destination(
+                    inst.dst,
+                    .{ .id = try self.constant(.bits32, 0), .value_type = .bits32 },
+                );
+            }
+            return;
+        }
         if (self.stage != .compute or
             (inst.image_dimension != .dim_2d and inst.image_dimension != .dim_3d) or
             (inst.image_address_components != 2 and inst.image_address_components != 3) or
@@ -4964,9 +5048,7 @@ const Builder = struct {
     }
 
     fn workgroupByteAddress(self: *Builder, inst: instruction.Instruction, offset: u32) Error!u32 {
-        if (self.stage != .compute or self.workgroup_memory == 0 or inst.gds or
-            inst.src0.kind != .vgpr or inst.memory_offset < 0)
-        {
+        if (inst.gds or inst.src0.kind != .vgpr or inst.memory_offset < 0) {
             return Error.UnsupportedBufferAddressing;
         }
         const address = try self.source(inst.src0, .bits32);
@@ -5034,22 +5116,38 @@ const Builder = struct {
     }
 
     fn dsAddtidAddress(self: *Builder, inst: instruction.Instruction) Error!u32 {
-        if (self.stage == .compute or inst.gds or inst.memory_offset < 0) {
+        if (inst.gds or inst.memory_offset < 0) {
             return Error.UnsupportedBufferAddressing;
         }
         const m0 = try self.source(.{ .kind = .m0 }, .bits32);
         const base = try self.andBits(m0, 0xffff);
-        return self.addBits(base, try self.constant(.bits32, @intCast(inst.memory_offset)));
+        const offset_base = try self.addBits(base, try self.constant(.bits32, @intCast(inst.memory_offset)));
+        if (self.stage != .compute) return offset_base;
+        if (self.local_invocation_index == 0) return Error.UnsupportedBufferAddressing;
+        const invocation = self.id();
+        try self.emit(&self.body, 61, &.{ self.bits_type, invocation, self.local_invocation_index }); // OpLoad
+        const lane = try self.andBits(invocation, 63);
+        const lane_bytes = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, lane_bytes, lane, try self.constant(.bits32, 2) }); // OpShiftLeftLogical
+        return self.addBits(offset_base, lane_bytes);
     }
 
     fn dsWriteAddtid(self: *Builder, inst: instruction.Instruction) Error!void {
-        const access = try self.privateAccess(try self.dsAddtidAddress(inst));
+        const address = try self.dsAddtidAddress(inst);
+        const access = if (self.stage == .compute)
+            try self.workgroupAccess(address)
+        else
+            try self.privateAccess(address);
         const predicate = (try self.writePredicate(access.in_range)) orelse access.in_range;
         try self.guardedStore(predicate, access.pointer, try self.source(inst.src1, .bits32));
     }
 
     fn dsReadAddtid(self: *Builder, inst: instruction.Instruction) Error!void {
-        const access = try self.privateAccess(try self.dsAddtidAddress(inst));
+        const address = try self.dsAddtidAddress(inst);
+        const access = if (self.stage == .compute)
+            try self.workgroupAccess(address)
+        else
+            try self.privateAccess(address);
         const loaded = self.id();
         try self.emit(&self.body, 61, &.{ self.bits_type, loaded, access.pointer }); // OpLoad
         const value = self.id();
@@ -5171,11 +5269,33 @@ const Builder = struct {
     }
 
     fn loadDsWord(self: *Builder, inst: instruction.Instruction, offset: u32) Error!u32 {
-        return self.loadWorkgroupWord(try self.workgroupByteAddress(inst, offset));
+        const address = try self.workgroupByteAddress(inst, offset);
+        if (self.stage == .compute) return self.loadWorkgroupWord(address);
+
+        const access = try self.privateAccess(address);
+        const loaded = self.id();
+        try self.emit(&self.body, 61, &.{ self.bits_type, loaded, access.pointer }); // OpLoad
+        const result = self.id();
+        try self.emit(&self.body, 169, &.{
+            self.bits_type,
+            result,
+            access.in_range,
+            loaded,
+            try self.constant(.bits32, 0),
+        }); // OpSelect
+        return result;
     }
 
     fn storeDsWord(self: *Builder, inst: instruction.Instruction, offset: u32, value: u32) Error!void {
-        try self.storeWorkgroupWord(try self.workgroupByteAddress(inst, offset), value);
+        const address = try self.workgroupByteAddress(inst, offset);
+        if (self.stage == .compute) {
+            try self.storeWorkgroupWord(address, value);
+            return;
+        }
+
+        const access = try self.privateAccess(address);
+        const predicate = (try self.writePredicate(access.in_range)) orelse access.in_range;
+        try self.guardedStore(predicate, access.pointer, value);
     }
 
     fn dsReadWords(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
@@ -5224,7 +5344,7 @@ const Builder = struct {
 
     fn loadDsByte(self: *Builder, inst: instruction.Instruction, offset: u32) Error!u32 {
         const byte_address = try self.workgroupByteAddress(inst, offset);
-        const word = try self.loadWorkgroupWord(byte_address);
+        const word = try self.loadDsWord(inst, offset);
         const byte_index = try self.andBits(byte_address, 3);
         const shift = self.id();
         try self.emit(&self.body, 196, &.{ self.bits_type, shift, byte_index, try self.constant(.bits32, 3) });
@@ -5258,6 +5378,92 @@ const Builder = struct {
 
     fn dsAtomic(self: *Builder, inst: instruction.Instruction, opcode: u16) Error!void {
         const byte_address = try self.workgroupByteAddress(inst, @intCast(inst.memory_offset));
+        if (self.stage != .compute) {
+            // Graphics shaders have no Vulkan workgroup corresponding to the
+            // guest wave's LDS. Their DS scratch is private per invocation,
+            // where an atomic is equivalent to a load/modify/store and avoids
+            // illegal atomics on Private storage-class pointers.
+            const access = try self.privateAccess(byte_address);
+            const loaded = self.id();
+            try self.emit(&self.body, 61, &.{ self.bits_type, loaded, access.pointer }); // OpLoad
+            const old = self.id();
+            try self.emit(&self.body, 169, &.{
+                self.bits_type,
+                old,
+                access.in_range,
+                loaded,
+                try self.constant(.bits32, 0),
+            }); // OpSelect
+            const source_bits = try self.source(inst.src1, .bits32);
+            const value = switch (inst.opcode) {
+                .ds_add_u32, .ds_add_rtn_u32 => try self.addBits(old, source_bits),
+                .ds_sub_u32, .ds_sub_rtn_u32 => blk: {
+                    const result = self.id();
+                    try self.emit(&self.body, 130, &.{ self.bits_type, result, old, source_bits }); // OpISub
+                    break :blk result;
+                },
+                .ds_min_i32, .ds_min_rtn_i32 => blk: {
+                    const signed_old = try self.convert(.{ .id = old, .value_type = .bits32 }, .sint32);
+                    const signed_source = try self.convert(.{ .id = source_bits, .value_type = .bits32 }, .sint32);
+                    const result = try self.glslBinaryValue(39, .sint32, signed_old, signed_source); // SMin
+                    break :blk try self.convert(.{ .id = result, .value_type = .sint32 }, .bits32);
+                },
+                .ds_min_u32, .ds_min_rtn_u32 => try self.glslBinaryValue(38, .bits32, old, source_bits), // UMin
+                .ds_max_i32, .ds_max_rtn_i32 => blk: {
+                    const signed_old = try self.convert(.{ .id = old, .value_type = .bits32 }, .sint32);
+                    const signed_source = try self.convert(.{ .id = source_bits, .value_type = .bits32 }, .sint32);
+                    const result = try self.glslBinaryValue(42, .sint32, signed_old, signed_source); // SMax
+                    break :blk try self.convert(.{ .id = result, .value_type = .sint32 }, .bits32);
+                },
+                .ds_max_u32, .ds_max_rtn_u32 => try self.glslBinaryValue(41, .bits32, old, source_bits), // UMax
+                .ds_min_f32, .ds_max_f32 => blk: {
+                    const old_float = try self.convert(.{ .id = old, .value_type = .bits32 }, .float32);
+                    const source_float = try self.convert(.{ .id = source_bits, .value_type = .bits32 }, .float32);
+                    const result = try self.glslBinaryValue(
+                        if (inst.opcode == .ds_min_f32) 37 else 40,
+                        .float32,
+                        old_float,
+                        source_float,
+                    );
+                    break :blk try self.convert(.{ .id = result, .value_type = .float32 }, .bits32);
+                },
+                .ds_and_b32, .ds_and_rtn_b32 => blk: {
+                    const result = self.id();
+                    try self.emit(&self.body, 199, &.{ self.bits_type, result, old, source_bits }); // OpBitwiseAnd
+                    break :blk result;
+                },
+                .ds_or_b32, .ds_or_rtn_b32 => blk: {
+                    const result = self.id();
+                    try self.emit(&self.body, 197, &.{ self.bits_type, result, old, source_bits }); // OpBitwiseOr
+                    break :blk result;
+                },
+                .ds_xor_b32, .ds_xor_rtn_b32 => blk: {
+                    const result = self.id();
+                    try self.emit(&self.body, 198, &.{ self.bits_type, result, old, source_bits }); // OpBitwiseXor
+                    break :blk result;
+                },
+                .ds_wrxchg_rtn_b32 => source_bits,
+                else => return Error.UnsupportedOpcode,
+            };
+            const predicate = (try self.writePredicate(access.in_range)) orelse access.in_range;
+            try self.guardedStore(predicate, access.pointer, value);
+            switch (inst.opcode) {
+                .ds_add_rtn_u32,
+                .ds_sub_rtn_u32,
+                .ds_min_rtn_i32,
+                .ds_min_rtn_u32,
+                .ds_max_rtn_i32,
+                .ds_max_rtn_u32,
+                .ds_and_rtn_b32,
+                .ds_or_rtn_b32,
+                .ds_xor_rtn_b32,
+                .ds_wrxchg_rtn_b32,
+                => try self.destination(inst.dst, .{ .id = old, .value_type = .bits32 }),
+                else => {},
+            }
+            return;
+        }
+
         const access = try self.workgroupAccess(byte_address);
         const predicate = (try self.writePredicate(access.in_range)) orelse access.in_range;
         const taken = self.id();
@@ -6234,7 +6440,24 @@ const Builder = struct {
         if (try self.lowerExecutionMask(inst)) return;
         if (try self.lowerSpecializedScalarDestination(inst)) return;
         switch (inst.opcode) {
-            .s_nop, .s_waitcnt, .s_waitcnt_depctr, .s_inst_prefetch, .s_sendmsg, .s_trap, .s_sleep, .s_ttrace_data, .s_setreg_b32, .v_nop, .s_endpgm, .s_code_end, .s_wqm_b64 => {},
+            .s_nop,
+            .s_waitcnt,
+            .s_waitcnt_depctr,
+            .s_inst_prefetch,
+            .s_sendmsg,
+            .s_trap,
+            .s_sleep,
+            .s_ttrace_data,
+            .s_setreg_b32,
+            .s_cbranch_cdbgsys,
+            .s_cbranch_cdbguser,
+            .s_cbranch_cdbgsys_or_user,
+            .s_cbranch_cdbgsys_and_user,
+            .v_nop,
+            .s_endpgm,
+            .s_code_end,
+            .s_wqm_b64,
+            => {},
             .s_quadmask_b64 => try self.wholeQuadMask64(inst),
             .s_barrier => try self.controlBarrier(),
             // Branches are handled by structured CF or skipped in the linear fallback.
@@ -6294,6 +6517,8 @@ const Builder = struct {
             .v_frexp_exp_i32_f32 => try self.frexpExponent(inst),
             .s_add_u32 => try self.scalarAddUnsigned(inst, false),
             .s_addc_u32 => try self.scalarAddUnsigned(inst, true),
+            .s_sub_u32 => try self.scalarSubUnsigned(inst, false),
+            .s_subb_u32 => try self.scalarSubUnsigned(inst, true),
             .v_addc_u32 => try self.vectorAddCarry(inst),
             .v_subrev_co_ci_u32 => try self.vectorSubBorrow(inst),
             .s_add_i32, .v_add_nc_u32 => try self.binary(inst, 128, .bits32, false), // OpIAdd
@@ -6323,7 +6548,7 @@ const Builder = struct {
             .v_add3_u32 => try self.ternaryBits(inst, 128, 128), // (a+b)+c
             .v_sad_u32 => try self.sadUnsigned(inst),
             .v_lshl_or_b32 => try self.shiftLeftOr(inst),
-            .s_sub_u32, .s_sub_i32, .v_sub_nc_u32 => try self.binary(inst, 130, .bits32, false), // OpISub
+            .s_sub_i32, .v_sub_nc_u32 => try self.binary(inst, 130, .bits32, false), // OpISub
             .v_subrev_nc_u32 => try self.binary(inst, 130, .bits32, true),
             .v_add_f32 => try self.binary(inst, 129, .float32, false), // OpFAdd
             .v_sub_f32 => try self.binary(inst, 131, .float32, false), // OpFSub
@@ -7611,7 +7836,13 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     });
     try appendInstruction(allocator, &words, 17, &.{1}); // OpCapability Shader
     try appendInstruction(allocator, &words, 17, &.{61}); // OpCapability GroupNonUniform
-    try appendInstruction(allocator, &words, 17, &.{64}); // OpCapability GroupNonUniformShuffle
+    try appendInstruction(allocator, &words, 17, &.{64}); // OpCapability GroupNonUniformBallot
+    if (builder.uses_group_shuffle) {
+        try appendInstruction(allocator, &words, 17, &.{65}); // OpCapability GroupNonUniformShuffle
+    }
+    if (builder.uses_group_shuffle_relative) {
+        try appendInstruction(allocator, &words, 17, &.{66}); // OpCapability GroupNonUniformShuffleRelative
+    }
     if (builder.uses_image_query) {
         try appendInstruction(allocator, &words, 17, &.{50}); // OpCapability ImageQuery
     }
@@ -7775,11 +8006,12 @@ fn translateInstructions(
             effective.workgroup_memory_size_bytes = 4096;
         }
         if (effective.stage != .compute and effective.private_memory_size_bytes == 0 and
-            (candidate.opcode == .ds_write_addtid_b32 or candidate.opcode == .ds_read_addtid_b32))
+            candidate.family == .ds and !candidate.gds)
         {
-            // Graphics addtid is compiler-generated per-lane spill/fill. A
-            // Private array preserves that isolation without exposing an
-            // invalid Workgroup storage class to a fragment shader.
+            // Graphics stages cannot expose SPIR-V Workgroup storage, but
+            // compiler-generated spill/fill and mesh staging still use the DS
+            // opcodes. Per-invocation Private storage retains the surrounding
+            // shader instead of dropping every draw that contains one.
             effective.private_memory_size_bytes = 32 * 1024;
         }
         switch (effective.stage) {
@@ -9814,6 +10046,21 @@ test "compute R32 UINT image atomics use texel pointers" {
     try std.testing.expect(containsOpcode(module.words, 225)); // device memory barrier
 }
 
+test "graphics image feedback gaps retain the surrounding shader" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xf000_0f08, 0x0002_000a, // image_load v10, v[0:1], T#s8
+        0xf05c_0308, 0x0000_0200, // image_atomic_umax v2, v[0:1], T#s0
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .vertex });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expect(!containsOpcode(module.words, 239)); // OpAtomicUMax
+}
+
 test "scalar bit reverse lowers to SPIR-V" {
     const decoder = @import("decoder.zig");
     const code = [_]u32{
@@ -10336,6 +10583,128 @@ test "fragment DS addtid spill and fill use private per-invocation scratch" {
     try std.testing.expect(containsOpcode(module.words, 61)); // OpLoad
 }
 
+test "compute DS addtid uses lane-indexed workgroup memory" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .opcode = .s_mov_b32,
+        .dst = .{ .kind = .m0 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 0 },
+        .src_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 4,
+        .opcode = .v_mov_b32,
+        .dst = .{ .kind = .vgpr, .reg = 7 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 1 },
+        .src_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 8,
+        .family = .ds,
+        .opcode = .ds_write_addtid_b32,
+        .src1 = .{ .kind = .vgpr, .reg = 7 },
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 16,
+        .family = .ds,
+        .opcode = .ds_read_addtid_b32,
+        .dst = .{ .kind = .vgpr, .reg = 8 },
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 24, .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .workgroup_memory_size_bytes = 256,
+    });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 196)); // lane * 4 via OpShiftLeftLogical
+    try std.testing.expect(containsOpcode(module.words, 62)); // OpStore
+    try std.testing.expect(containsOpcode(module.words, 61)); // OpLoad
+}
+
+test "graphics DS address writes and reads use private per-invocation scratch" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .opcode = .v_mov_b32,
+        .dst = .{ .kind = .vgpr, .reg = 0 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 0 },
+        .src_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 4,
+        .opcode = .v_mov_b32,
+        .dst = .{ .kind = .vgpr, .reg = 5 },
+        .src0 = .{ .kind = .literal_constant, .value = 0x3f80_0000 },
+        .src_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 8,
+        .family = .ds,
+        .opcode = .ds_write_b32,
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src1 = .{ .kind = .vgpr, .reg = 5 },
+        .src_count = 2,
+        .memory_offset = 0,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 16,
+        .family = .ds,
+        .opcode = .ds_read_b32,
+        .dst = .{ .kind = .vgpr, .reg = 6 },
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src_count = 1,
+        .memory_offset = 0,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 24, .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 28)); // OpTypeArray
+    try std.testing.expect(containsOpcode(module.words, 65)); // OpAccessChain
+    try std.testing.expect(containsOpcode(module.words, 62)); // OpStore
+    try std.testing.expect(containsOpcode(module.words, 61)); // OpLoad
+}
+
+test "graphics DS atomics use private load modify store" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .opcode = .v_mov_b32,
+        .dst = .{ .kind = .vgpr, .reg = 0 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 0 },
+        .src_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 4,
+        .opcode = .v_mov_b32,
+        .dst = .{ .kind = .vgpr, .reg = 3 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 1 },
+        .src_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 8,
+        .family = .ds,
+        .opcode = .ds_or_b32,
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src1 = .{ .kind = .vgpr, .reg = 3 },
+        .src_count = 2,
+        .memory_offset = 4,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 16, .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 61)); // OpLoad
+    try std.testing.expect(containsOpcode(module.words, 197)); // OpBitwiseOr
+    try std.testing.expect(containsOpcode(module.words, 62)); // OpStore
+    try std.testing.expect(!containsOpcode(module.words, 241)); // no OpAtomicOr on Private storage
+}
+
 test "compute DS append atomically reserves persistent GDS entries" {
     var program = instruction.Program{ .code = &.{}, .instructions = .empty };
     defer program.deinit(std.testing.allocator);
@@ -10423,6 +10792,20 @@ test "unsupported shader semantics never produce placeholder SPIR-V" {
     try std.testing.expectError(Error.UnsupportedOpcode, translate(std.testing.allocator, &program, .{ .stage = .compute }));
 }
 
+test "disabled conditional debug branches fall through" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xbf97_0118, // s_cbranch_cdbgsys (debug state is disabled)
+        0xbf81_0000, // s_endpgm
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .compute });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(module.words.len != 0);
+}
+
 test "forward scalar selection lowers with a structured merge and register phi" {
     const decoder = @import("decoder.zig");
     const code = [_]u32{
@@ -10485,6 +10868,35 @@ test "scalar unsigned add and addc lower carry through SCC" {
     try std.testing.expect(countOpcode(module.words, 176) >= 3); // OpULessThan carry tests
     try std.testing.expect(containsOpcode(module.words, 169)); // carry bit OpSelect
     try std.testing.expect(containsOpcode(module.words, 166)); // combined carry OpLogicalOr
+}
+
+test "scalar unsigned sub and subb lower borrow through SCC" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .opcode = .s_sub_u32,
+        .dst = .{ .kind = .sgpr, .reg = 0 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 0 },
+        .src1 = .{ .kind = .integer_inline_constant, .value = 1 },
+        .src_count = 2,
+    });
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 4,
+        .opcode = .s_subb_u32,
+        .dst = .{ .kind = .sgpr, .reg = 1 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 0 },
+        .src1 = .{ .kind = .integer_inline_constant, .value = 0 },
+        .src_count = 2,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 8, .opcode = .s_endpgm });
+
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .compute });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(countOpcode(module.words, 130) >= 3); // OpISub
+    try std.testing.expect(countOpcode(module.words, 176) >= 3); // OpULessThan borrow tests
+    try std.testing.expect(containsOpcode(module.words, 169)); // borrow bit OpSelect
+    try std.testing.expect(containsOpcode(module.words, 166)); // combined borrow OpLogicalOr
 }
 
 test "structured EXECZ selection consumes a CMPX predicate" {
@@ -10991,6 +11403,25 @@ test "DPP quad_perm shuffles from the selected lane of the quad" {
     var module = try translate(std.testing.allocator, &program, .{ .stage = .fragment });
     defer module.deinit(std.testing.allocator);
     try std.testing.expect(containsOpcode(module.words, 345)); // OpGroupNonUniformShuffle
+    try std.testing.expect(containsOpcodeWithFirstOperand(module.words, 17, 65)); // capability
+}
+
+test "DPP row shift declares relative subgroup shuffle capability" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .family = .vop1,
+        .opcode = .v_mov_b32,
+        .dst = .{ .kind = .vgpr, .reg = 1 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 1, .dpp = true, .dpp_ctrl = 0x111 },
+        .src_count = 1,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 8, .opcode = .s_endpgm });
+    var module = try translate(std.testing.allocator, &program, .{ .stage = .compute });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 348)); // OpGroupNonUniformShuffleDown
+    try std.testing.expect(containsOpcodeWithFirstOperand(module.words, 17, 66)); // capability
 }
 
 test "fragment color export mapping selects logical channels for physical storage" {

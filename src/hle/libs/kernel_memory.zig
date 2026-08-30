@@ -499,6 +499,8 @@ const map_unknown_8000: u32 = 0x8000;
 const map_no_coalesce: u32 = 0x40_0000;
 const map_alignment_mask: u32 = 0xff00_0000;
 const default_map_search_base: u64 = 0x02_0000_0000;
+const large_semantic_reservation_minimum: u64 = 0x40_0000_0000;
+const large_semantic_reservation_alignment: u64 = 0x1_0000_0000;
 const prot_cpu_read: i32 = 0x01;
 const prot_cpu_write: i32 = 0x02;
 const prot_cpu_execute: i32 = 0x04;
@@ -1413,12 +1415,56 @@ fn sceKernelReserveVirtualRange(
             memory.user.start
         else
             default_map_search_base;
-        break :first_fit address_space.reserve(
+        // Unreal derives arena metadata addresses by clearing the low 32 bits
+        // of pointers inside its 256+ GiB virtual reservation. A merely
+        // page-aligned fallback base can therefore produce an address just
+        // below the reservation. Place such semantic arenas on a 4 GiB
+        // boundary even when the guest requested only 2 MiB alignment.
+        const placement_alignment = if (len >= large_semantic_reservation_minimum)
+            @max(effective_alignment, large_semantic_reservation_alignment)
+        else
+            effective_alignment;
+        const reserved = address_space.reserve(
             area,
             hint,
             len,
-            effective_alignment,
+            placement_alignment,
         ) catch |err| {
+            if (err == error.AddressUnavailable and
+                area == .user and
+                len >= large_semantic_reservation_minimum)
+            {
+                const spanning = address_space.reserveSpanningHostHoles(
+                    area,
+                    hint,
+                    len,
+                    placement_alignment,
+                ) catch |fallback_err| {
+                    if (trace.announces("sceKernelReserveVirtualRange")) {
+                        std.debug.print(
+                            "[virtual reserve] requested=0x{x} hint=0x{x} len=0x{x} align=0x{x} area={s} error={s} fallback={s}\n",
+                            .{
+                                requested_address,
+                                hint,
+                                len,
+                                effective_alignment,
+                                @tagName(area),
+                                @errorName(err),
+                                @errorName(fallback_err),
+                            },
+                        );
+                        address_space.announceOwnedRanges(area);
+                    }
+                    return mapAddressSpaceError(fallback_err);
+                };
+                if (trace.announces("sceKernelReserveVirtualRange")) {
+                    std.debug.print(
+                        "[virtual reserve] semantic fallback addr=0x{x} len=0x{x} across host holes\n",
+                        .{ spanning, len },
+                    );
+                }
+                break :first_fit spanning;
+            }
             if (trace.announces("sceKernelReserveVirtualRange")) {
                 std.debug.print(
                     "[virtual reserve] requested=0x{x} hint=0x{x} len=0x{x} align=0x{x} area={s} error={s}\n",
@@ -1431,9 +1477,11 @@ fn sceKernelReserveVirtualRange(
                         @errorName(err),
                     },
                 );
+                address_space.announceOwnedRanges(area);
             }
             return mapAddressSpaceError(err);
         };
+        break :first_fit reserved;
     };
 
     output.* = reserved_address;
@@ -2291,7 +2339,7 @@ test "large hinted user reservation leaves room for a later window" {
     // guest window. AddressSpace must choose the first owned extent large
     // enough, which need not begin at the architectural boundary.
     try testing.expect(arena >= memory.user.start);
-    try testing.expectEqual(@as(u64, 0), arena % 0x20_0000);
+    try testing.expectEqual(@as(u64, 0), arena % large_semantic_reservation_alignment);
     try testing.expect(arena + arena_size <= memory.user.end);
 
     const window_size: u64 = 0x400_0000;
@@ -2320,7 +2368,7 @@ test "large unhinted reservation is placed in the user window" {
         sceKernelReserveVirtualRange(&arena, 0x80_0000_0000, 0, 0x20_0000),
     );
     try testing.expect(arena >= memory.user.start);
-    try testing.expectEqual(@as(u64, 0), arena % 0x20_0000);
+    try testing.expectEqual(@as(u64, 0), arena % large_semantic_reservation_alignment);
     try testing.expect(arena + 0x80_0000_0000 <= memory.user.end);
 }
 
