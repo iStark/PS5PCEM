@@ -64,8 +64,13 @@ pub const page_size: u64 = 16 * 1024;
 /// the system takes its share.
 pub const total_memory_size: u64 = 13824 * 1024 * 1024;
 
-/// Flexible-memory budget, until system-content configuration says otherwise.
-pub const flexible_memory_size: u64 = 4 * 1024 * 1024 * 1024;
+/// Default flexible-memory budget when system content does not override it.
+///
+/// Retail titles that omit `kernel.flexibleMemorySize` receive a 1 GiB pool.
+/// Treating the default as 4 GiB removes 3 GiB from direct memory; newer SDKs
+/// subtract their fixed arenas from `sceKernelGetDirectMemorySize`, so the
+/// wrong answer can underflow their final allocation size.
+pub const flexible_memory_size: u64 = 1 * 1024 * 1024 * 1024;
 
 /// Size of the direct memory pool reported to the guest.
 ///

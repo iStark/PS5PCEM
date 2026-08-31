@@ -95,6 +95,7 @@ pub const Runtime = struct {
         hle.libs.dialogs.reset();
         hle.libs.fiber.reset();
         hle.libs.playgo.reset();
+        hle.libs.psml.reset();
         hle.libs.kernel_event_queue.reset();
         hle.libs.kernel_ioctl.reset();
         hle.libs.network.reset();
@@ -124,6 +125,7 @@ pub const Runtime = struct {
         hle.libs.dialogs.reset();
         hle.libs.fiber.reset();
         hle.libs.playgo.reset();
+        hle.libs.psml.reset();
         hle.libs.kernel_event_queue.reset();
         hle.libs.kernel_ioctl.reset();
         hle.libs.network.reset();

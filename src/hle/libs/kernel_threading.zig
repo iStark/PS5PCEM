@@ -198,8 +198,8 @@ const ThreadBlock = struct {
         const mapping_alignment = @max(memory.page_size, tls_alignment);
 
         const mapping_address = try address_space.map(
-            .user,
-            0,
+            .system_managed,
+            memory.thread_runtime_search_base,
             mapping_size,
             mapping_alignment,
             .read_write,
@@ -898,8 +898,8 @@ pub const Manager = struct {
         const mapping_size = std.math.add(u64, mapped_guard_size, mapped_stack_size) catch
             return error.AddressOverflow;
         const mapping_address = try self.address_space.map(
-            .user,
-            0,
+            .system_managed,
+            memory.thread_runtime_search_base,
             mapping_size,
             memory.page_size,
             .none,
@@ -1309,6 +1309,14 @@ pub fn scePthreadSetaffinity(handle: ThreadHandle, mask: u64) callconv(abi.guest
 pub fn scePthreadSetprio(handle: ThreadHandle, priority: i32) callconv(abi.guest) i32 {
     const manager = activeManager() orelse return KernelError.enosys.raw();
     return if (manager.setPriority(handle, priority)) errno.ok else KernelError.esrch.raw();
+}
+
+pub fn scePthreadGetprio(handle: ThreadHandle, output: ?*i32) callconv(abi.guest) i32 {
+    const priority = output orelse return KernelError.einval.raw();
+    const manager = activeManager() orelse return KernelError.enosys.raw();
+    const scheduling = manager.readScheduling(handle) orelse return KernelError.esrch.raw();
+    priority.* = scheduling.priority;
+    return errno.ok;
 }
 
 pub fn scePthreadGetschedparam(
@@ -1771,6 +1779,7 @@ pub const exports = [_]symbols.Export{
     .{ .name = "pthread_yield", .function = trace.wrap("pthread_yield", &pthread_yield), .expect_id = "B5GmVDKwpn0" },
     .{ .name = "scePthreadSetaffinity", .function = trace.wrap("scePthreadSetaffinity", &scePthreadSetaffinity), .expect_id = "bt3CTBKmGyI" },
     .{ .name = "scePthreadSetprio", .function = trace.wrap("scePthreadSetprio", &scePthreadSetprio), .expect_id = "W0Hpm2X0uPE" },
+    .{ .name = "scePthreadGetprio", .function = trace.wrap("scePthreadGetprio", &scePthreadGetprio), .expect_id = "1tKyG7RlMJo" },
     .{ .name = "scePthreadGetschedparam", .function = trace.wrap("scePthreadGetschedparam", &scePthreadGetschedparam), .expect_id = "P41kTWUS3EI" },
     .{ .name = "scePthreadSetschedparam", .function = trace.wrap("scePthreadSetschedparam", &scePthreadSetschedparam), .expect_id = "oIRFTjoILbg" },
     .{ .name = "pthread_getschedparam", .function = trace.wrap("pthread_getschedparam", &pthread_getschedparam), .expect_id = "FIs3-UQT9sg" },
@@ -1918,6 +1927,16 @@ test "thread block seeds Variant II modules and a FreeBSD-style DTV" {
     defer thread_manager.deinit();
     const prepared = try thread_manager.prepareInitialThread("MainThread");
     defer thread_manager.releaseInitialThread(prepared.handle) catch {};
+
+    try testing.expect(memory.system_managed.contains(
+        prepared.context.tls_mapping_address,
+        prepared.context.tls_mapping_size,
+    ));
+    try testing.expect(memory.system_managed.contains(
+        prepared.stack_address,
+        prepared.stack_size,
+    ));
+    try testing.expect(address_space.query(memory.user.start, false) == null);
 
     const self_pointer = try readGuestU64(&address_space, prepared.context.fs_base);
     const dtv_pointer = try readGuestU64(&address_space, prepared.context.fs_base + 8);

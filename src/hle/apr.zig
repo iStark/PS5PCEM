@@ -243,6 +243,36 @@ pub fn resolve(path: []const u8) Error!ResolvedFile {
     return .{ .identifier = identifier, .size = entry.size };
 }
 
+/// Describes a path previously resolved to an APR file identifier.
+///
+/// APR callers intentionally carry only the compact identifier after path
+/// resolution.  Reusing the retained guest path here keeps metadata and later
+/// deferred reads tied to the same mount instead of trying to interpret the
+/// identifier as a normal file descriptor.
+pub fn stat(identifier: u32, out: *filesystem.Stat) Error!void {
+    var path_bytes: [maximum_path]u8 = undefined;
+    const path_length = blk: {
+        lock.lock();
+        defer lock.unlock();
+        const entry = findFileLocked(identifier) orelse return error.UnknownFile;
+        @memcpy(path_bytes[0..entry.path_length], entry.path());
+        break :blk entry.path_length;
+    };
+
+    filesystem.stat(path_bytes[0..path_length], out) catch |err| return switch (err) {
+        error.NotFound, error.NotAttached => error.FileNotFound,
+        else => error.IoFailed,
+    };
+}
+
+/// Returns the cached size for a resolved file without opening it again.
+pub fn fileSize(identifier: u32) Error!u64 {
+    lock.lock();
+    defer lock.unlock();
+    const entry = findFileLocked(identifier) orelse return error.UnknownFile;
+    return entry.size;
+}
+
 pub fn read(identifier: u32, offset: u64, destination: []u8) Error!usize {
     var path_bytes: [maximum_path]u8 = undefined;
     lock.lock();
@@ -647,6 +677,12 @@ test "resolved files keep stable process-local identifiers" {
     var bytes: [5]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 4), try read(first.identifier, 6, &bytes));
     try std.testing.expectEqualStrings("data", bytes[0..4]);
+
+    var info: filesystem.Stat = undefined;
+    try stat(first.identifier, &info);
+    try std.testing.expectEqual(@as(i64, 10), info.size);
+    try std.testing.expectEqual(@as(u64, 10), try fileSize(first.identifier));
+    try std.testing.expectError(error.UnknownFile, stat(0xffff_ffff, &info));
 }
 
 test "a deferred APR read completes through its submission identifier" {

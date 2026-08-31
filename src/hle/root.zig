@@ -45,6 +45,7 @@ pub const libs = struct {
     pub const platform_services = @import("libs/platform_services.zig");
     pub const png_dec = @import("libs/png_dec.zig");
     pub const playgo = @import("libs/playgo.zig");
+    pub const psml = @import("libs/psml.zig");
     pub const registry = @import("libs/registry.zig");
     pub const services = @import("libs/services.zig");
     pub const pad = @import("libs/pad.zig");
@@ -118,6 +119,7 @@ test {
     _ = libs.kernel_info;
     _ = libs.kernel_ioctl;
     _ = libs.png_dec;
+    _ = libs.psml;
     _ = libs.agc;
     _ = libs.agc_submit;
     _ = libs.kernel_aio;

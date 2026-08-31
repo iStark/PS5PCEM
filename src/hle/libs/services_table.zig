@@ -13,6 +13,7 @@ const av_player = @import("av_player.zig");
 const font = @import("font.zig");
 const platform_services = @import("platform_services.zig");
 const playgo = @import("playgo.zig");
+const psml = @import("psml.zig");
 const trace = @import("../trace.zig");
 const symbols = @import("../symbols.zig");
 
@@ -69,6 +70,9 @@ pub const coredump_exports = [_]symbols.Export{
     .{ .name = "sceCoredumpWriteUserData", .function = trace.wrap("sceCoredumpWriteUserData", &services.accept), .expect_id = "Dbbkj6YHWdo" },
     .{ .name = "sceCoredumpAttachUserFile", .function = trace.wrap("sceCoredumpAttachUserFile", &services.accept), .expect_id = "5nc2gdLNsok" },
     .{ .name = "sceCoredumpWriteUserString", .function = trace.wrap("sceCoredumpWriteUserString", &services.accept), .expect_id = "32KQRUK13kI" },
+    .{ .name = "libSceCoredump:kK0DUW1Ukgc", .function = trace.wrap("libSceCoredump:kK0DUW1Ukgc", &services.accept), .id_override = "kK0DUW1Ukgc" },
+    .{ .name = "libSceCoredump:Jrs7UUkGOFo", .function = trace.wrap("libSceCoredump:Jrs7UUkGOFo", &services.accept), .id_override = "Jrs7UUkGOFo" },
+    .{ .name = "libSceCoredump:MEJ7tc7ThwM", .function = trace.wrap("libSceCoredump:MEJ7tc7ThwM", &services.accept), .id_override = "MEJ7tc7ThwM" },
 };
 
 pub const camera2_exports = [_]symbols.Export{
@@ -174,6 +178,11 @@ pub const http_exports = [_]symbols.Export{
     .{ .name = "sceHttpGetAllResponseHeaders", .function = trace.wrap("sceHttpGetAllResponseHeaders", &services.offline), .expect_id = "aCYPMSUIaP8" },
     .{ .name = "sceHttpCreateTemplate", .function = trace.wrap("sceHttpCreateTemplate", &services.offline), .expect_id = "0gYjPTR-6cY" },
     .{ .name = "sceHttpDeleteTemplate", .function = trace.wrap("sceHttpDeleteTemplate", &services.offline), .expect_id = "4I8vEpuEhZ8" },
+    .{ .name = "libSceHttp:Qq8SfuJJJqE", .function = trace.wrap("libSceHttp:Qq8SfuJJJqE", &services.accept), .id_override = "Qq8SfuJJJqE" },
+    .{ .name = "sceHttpSetConnectTimeOut", .function = trace.wrap("sceHttpSetConnectTimeOut", &services.accept), .expect_id = "0S9tTH0uqTU" },
+    .{ .name = "sceHttpSetRecvTimeOut", .function = trace.wrap("sceHttpSetRecvTimeOut", &services.accept), .expect_id = "yigr4V0-HTM" },
+    .{ .name = "sceHttpSetSendTimeOut", .function = trace.wrap("sceHttpSetSendTimeOut", &services.accept), .expect_id = "xegFfZKBVlw" },
+    .{ .name = "libSceHttp:DK+GoXCNT04", .function = trace.wrap("libSceHttp:DK+GoXCNT04", &services.accept), .id_override = "DK+GoXCNT04" },
 };
 
 pub const imedialog_exports = [_]symbols.Export{
@@ -424,6 +433,10 @@ pub const rtc_exports = [_]symbols.Export{
     .{ .name = "sceRtcGetDayOfWeek", .function = trace.wrap("sceRtcGetDayOfWeek", &platform_services.rtcGetDayOfWeek), .expect_id = "CyIK-i4XdgQ" },
     .{ .name = "sceRtcGetTick", .function = trace.wrap("sceRtcGetTick", &platform_services.rtcGetTick), .expect_id = "8w-H19ip48I" },
     .{ .name = "sceRtcGetTime_t", .function = trace.wrap("sceRtcGetTime_t", &platform_services.rtcGetTimeT), .expect_id = "BtqmpTRXHgk" },
+    .{ .name = "sceRtcTickAddDays", .function = trace.wrap("sceRtcTickAddDays", &platform_services.rtcTickAddDays), .expect_id = "NR1J0N7L2xY" },
+    .{ .name = "sceRtcConvertUtcToLocalTime", .function = trace.wrap("sceRtcConvertUtcToLocalTime", &platform_services.rtcConvertUtcToLocalTime), .expect_id = "M1TvFst-jrM" },
+    .{ .name = "sceRtcSetTime_t", .function = trace.wrap("sceRtcSetTime_t", &platform_services.rtcSetTimeT), .expect_id = "bDEVVP4bTjQ" },
+    .{ .name = "sceRtcConvertLocalTimeToUtc", .function = trace.wrap("sceRtcConvertLocalTimeToUtc", &platform_services.rtcConvertLocalTimeToUtc), .expect_id = "8Yr143yEnRo" },
 };
 
 pub const savedatadialog_native_exports = [_]symbols.Export{
@@ -472,6 +485,8 @@ pub const videoout_exports = [_]symbols.Export{
     .{ .name = "sceVideoOutInitializeOutputOptions", .function = trace.wrap("sceVideoOutInitializeOutputOptions", &services.absent), .expect_id = "+I4K03i3EL0" },
     .{ .name = "libSceVideoOut:T0ynQY3mH-0", .function = trace.wrap("libSceVideoOut:T0ynQY3mH-0", &services.accept), .id_override = "T0ynQY3mH-0" },
     .{ .name = "libSceVideoOut:WkYtyOg30do", .function = trace.wrap("libSceVideoOut:WkYtyOg30do", &services.accept), .id_override = "WkYtyOg30do" },
+    .{ .name = "sceVideoOutColorSettingsSetGamma", .function = trace.wrap("sceVideoOutColorSettingsSetGamma", &platform_services.videoOutColorSettingsSetGamma), .id_override = "DYhhWbJSeRg" },
+    .{ .name = "sceVideoOutAdjustColor", .function = trace.wrap("sceVideoOutAdjustColor", &platform_services.videoOutAdjustColor), .id_override = "pv9CI5VC+R0" },
 };
 
 pub const voiceqos_exports = [_]symbols.Export{
@@ -487,6 +502,7 @@ pub const voiceqos_exports = [_]symbols.Export{
     .{ .name = "sceVoiceQoSDisconnect", .function = trace.wrap("sceVoiceQoSDisconnect", &services.offline), .expect_id = "j9Xt85krooc" },
     .{ .name = "sceVoiceQoSInit", .function = trace.wrap("sceVoiceQoSInit", &services.offline), .expect_id = "U8IfNl6-Css" },
     .{ .name = "sceVoiceQoSEnd", .function = trace.wrap("sceVoiceQoSEnd", &services.offline), .expect_id = "ATRGkmbolVM" },
+    .{ .name = "libSceVoiceQoS:cpC-zyHoMik", .function = trace.wrap("libSceVoiceQoS:cpC-zyHoMik", &services.offline), .id_override = "cpC-zyHoMik" },
 };
 
 pub const videodec2_exports = [_]symbols.Export{
@@ -630,19 +646,6 @@ const acm_extra_exports = [_]symbols.Export{
     .{ .name = "sceAcmBatchStartMultiple", .function = trace.wrap("sceAcmBatchStartMultiple", &services.absent), .expect_id = "S3BPrjCfZ90" },
 };
 
-/// A dispatch-packet builder for a hardware block this host does not have.
-/// Every call asks for a packet or a size to allocate for one, so there is
-/// nothing truthful to return and the library reports itself unavailable.
-const psml_exports = [_]symbols.Export{
-    .{ .name = "scePsmlMfsrInit", .function = trace.wrap("scePsmlMfsrInit", &services.absent), .expect_id = "3WVD91e12ZQ" },
-    .{ .name = "scePsmlMfsrCreateSharedResources", .function = trace.wrap("scePsmlMfsrCreateSharedResources", &services.absent), .expect_id = "eWoKNeB6V-k" },
-    .{ .name = "scePsmlMfsrGetSharedResourcesInitRequirement", .function = trace.wrap("scePsmlMfsrGetSharedResourcesInitRequirement", &services.absent), .expect_id = "+2KpvixvL6E" },
-    .{ .name = "scePsmlMfsrGetDispatchMfsrPacketSizeInDwords", .function = trace.wrap("scePsmlMfsrGetDispatchMfsrPacketSizeInDwords", &services.absent), .expect_id = "AHalTX9wFZY" },
-    .{ .name = "scePsmlMfsrGetDispatchMfsrPacket900", .function = trace.wrap("scePsmlMfsrGetDispatchMfsrPacket900", &services.absent), .expect_id = "RUNLFro+qok" },
-    .{ .name = "scePsmlMfsrGetDispatchMfsrPacket1000", .function = trace.wrap("scePsmlMfsrGetDispatchMfsrPacket1000", &services.absent), .expect_id = "s2psNHUIdjk" },
-    .{ .name = "scePsmlMfsrGetDispatchMfsrPacket1100", .function = trace.wrap("scePsmlMfsrGetDispatchMfsrPacket1100", &services.absent), .expect_id = "94iBp3KvIuI" },
-};
-
 pub const Table = struct { library: []const u8, module: []const u8, exports: []const symbols.Export };
 
 pub const all = [_]Table{
@@ -697,5 +700,5 @@ pub const all = [_]Table{
     .{ .library = "libSceDiscMap", .module = "libSceDiscMap", .exports = &disc_map_exports },
     .{ .library = "libSceContentExport", .module = "libSceContentExport", .exports = &content_export_exports },
     .{ .library = "libSceAcm", .module = "libSceAcm", .exports = &acm_extra_exports },
-    .{ .library = "libScePsml", .module = "libScePsml", .exports = &psml_exports },
+    .{ .library = "libScePsml", .module = "libScePsml", .exports = &psml.exports },
 };

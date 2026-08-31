@@ -659,6 +659,9 @@ const audio_in_exports = [_]symbols.Export{
     .{ .name = "sceAudioInInput", .function = trace.wrap("sceAudioInInput", &audioInInput), .expect_id = "LozEOU8+anM" },
     .{ .name = "sceAudioInClose", .function = trace.wrap("sceAudioInClose", &audioInClose), .expect_id = "Jh6WbHhnI68" },
     .{ .name = "sceAudioInGetSilentState", .function = trace.wrap("sceAudioInGetSilentState", &audioInGetSilentState), .expect_id = "BohEAQ7DlUE" },
+    // SDK 11 imports the close entry under a new identifier while retaining
+    // the same one-handle ABI.
+    .{ .name = "libSceAudioIn:X+4jdIS75P0", .function = trace.wrap("sceAudioInCloseGen5", &audioInClose), .id_override = "X+4jdIS75P0" },
 };
 
 // libSceAudioOut2 ----------------------------------------------------------
@@ -872,6 +875,13 @@ fn audioOut2Set3DLatency(_: u32, _: u32, _: u32) callconv(abi.guest) i32 {
     return errno.ok;
 }
 
+fn audioOut2MasteringInit(_: u32) callconv(abi.guest) i32 {
+    // The title's mastering graph is represented by the host mix rather than a
+    // separate console DSP chain. Its process-wide initialization has no
+    // guest-visible output object.
+    return errno.ok;
+}
+
 const audio_out2_exports = [_]symbols.Export{
     .{ .name = "sceAudioOut2Initialize", .function = trace.wrap("sceAudioOut2Initialize", &audioOut2Initialize), .expect_id = "g2tViFIohHE" },
     .{ .name = "sceAudioOut2ContextResetParam", .function = trace.wrap("sceAudioOut2ContextResetParam", &audioOut2ContextResetParam), .expect_id = "t5YrizufpQc" },
@@ -890,6 +900,7 @@ const audio_out2_exports = [_]symbols.Export{
     .{ .name = "sceAudioOut2UserDestroy", .function = trace.wrap("sceAudioOut2UserDestroy", &audioOut2UserDestroy), .expect_id = "IaZXJ9M79uo" },
     .{ .name = "sceAudioOut2GetSpeakerInfo", .function = trace.wrap("sceAudioOut2GetSpeakerInfo", &audioOut2GetSpeakerInfo), .expect_id = "DImz2Ft9E2g" },
     .{ .name = "sceAudioOut2Set3DLatency", .function = trace.wrap("sceAudioOut2Set3DLatency", &audioOut2Set3DLatency), .expect_id = "TViD1EZXkNI" },
+    .{ .name = "sceAudioOut2MasteringInit", .function = trace.wrap("sceAudioOut2MasteringInit", &audioOut2MasteringInit), .expect_id = "XHl38ZNknbs" },
 };
 
 // libSceNgs2 ---------------------------------------------------------------
@@ -2525,6 +2536,19 @@ fn ajmInstanceDestroy(context: u32, instance: u32) callconv(abi.guest) i32 {
     return ajm_error_invalid_parameter;
 }
 
+fn ajmMemoryRegister(context: u32, address: ?*anyopaque, pages: usize) callconv(abi.guest) i32 {
+    if (!isAjmContext(context)) return ajm_error_invalid_context;
+    if (address == null or pages == 0) return ajm_error_invalid_parameter;
+    // AJM consumes the same mapped guest address space as the CPU decoder, so
+    // no second host registration is required.
+    return errno.ok;
+}
+
+fn ajmMemoryUnregister(context: u32, address: ?*anyopaque) callconv(abi.guest) i32 {
+    if (!isAjmContext(context)) return ajm_error_invalid_context;
+    return if (address != null) errno.ok else ajm_error_invalid_parameter;
+}
+
 fn ajmBatchInitialize(buffer: ?[*]u8, size: usize, info: ?*AjmBatchInfo) callconv(abi.guest) i32 {
     if (buffer == null or size == 0 or info == null) return ajm_error_invalid_parameter;
     info.?.* = .{ .buffer = buffer, .size = size };
@@ -2789,6 +2813,96 @@ fn ajmBatchJobGetStatistics(info: ?*AjmBatchInfo, _: f32, result: ?[*]u8) callco
     return appendAjmJob(info, 88);
 }
 
+fn ajmBatchJobControl(
+    info: ?*AjmBatchInfo,
+    instance: u32,
+    _: u64,
+    _: ?*const anyopaque,
+    _: usize,
+    sideband_output: ?[*]u8,
+    sideband_output_size: usize,
+) callconv(abi.guest) i32 {
+    if (sideband_output) |output| {
+        const bounded = @min(sideband_output_size, 4096);
+        @memset(output[0..bounded], 0);
+        if (bounded >= 8) writeAjmBasicResult(output, if (isAjmInstance(instance)) 0 else ajm_result_invalid_parameter, 0);
+    }
+    return appendAjmJob(info, 32);
+}
+
+fn ajmBatchJobRunSplit(
+    info: ?*AjmBatchInfo,
+    instance: u32,
+    _: u64,
+    input_buffers: ?[*]const AjmBuffer,
+    input_count: usize,
+    output_buffers: ?[*]const AjmBuffer,
+    output_count: usize,
+    sideband_output: ?[*]u8,
+    sideband_output_size: usize,
+) callconv(abi.guest) i32 {
+    var result = AjmDecodeResult{};
+    const status = ajmBatchJobDecodeSplit(
+        info,
+        instance,
+        input_buffers,
+        input_count,
+        output_buffers,
+        output_count,
+        &result,
+    );
+    if (sideband_output) |output| {
+        const bounded = @min(sideband_output_size, 4096);
+        @memset(output[0..bounded], 0);
+        const copied = @min(bounded, @sizeOf(AjmDecodeResult));
+        @memcpy(output[0..copied], std.mem.asBytes(&result)[0..copied]);
+    }
+    return status;
+}
+
+const AjmDecAt9ConfigDataInfo = extern struct {
+    channels: u32,
+    sample_rate: u32,
+    frame_samples_per_channel: u32,
+    superframe_samples_per_channel: u32,
+    superframe_size: u32,
+};
+
+fn ajmDecAt9ParseConfigData(
+    config_data: ?*const [4]u8,
+    output: ?*AjmDecAt9ConfigDataInfo,
+) callconv(abi.guest) i32 {
+    const config = config_data orelse return ajm_error_invalid_parameter;
+    const info_output = output orelse return ajm_error_invalid_parameter;
+    var decoder = ajm_codec.Decoder.create(ajm_codec.codec_atrac9, 0) catch
+        return ajm_error_invalid_parameter;
+    defer decoder.deinit();
+    const report = decoder.initialize(config);
+    if (report.result != 0) return ajm_error_invalid_parameter;
+    const info = decoder.codecInfo();
+    info_output.* = .{
+        .channels = info.channels,
+        .sample_rate = info.sample_rate,
+        .frame_samples_per_channel = info.frame_samples,
+        .superframe_samples_per_channel = info.frame_samples * info.frames_in_superframe,
+        .superframe_size = info.superframe_size,
+    };
+    return errno.ok;
+}
+
+fn ajmDecMp3ParseFrame(
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    // The SDK 11 metadata probe is optional; streamed MP3 data is decoded by
+    // the stateful Run/RunSplit path once an instance is created.
+    return errno.ok;
+}
+
 const ajm_exports = [_]symbols.Export{
     .{ .name = "sceAjmInitialize", .function = trace.wrap("sceAjmInitialize", &ajmInitialize), .expect_id = "dl+4eHSzUu4" },
     .{ .name = "sceAjmFinalize", .function = trace.wrap("sceAjmFinalize", &ajmFinalize), .expect_id = "MHur6qCsUus" },
@@ -2796,6 +2910,8 @@ const ajm_exports = [_]symbols.Export{
     .{ .name = "sceAjmModuleUnregister", .function = trace.wrap("sceAjmModuleUnregister", &ajmModuleUnregister), .expect_id = "Wi7DtlLV+KI" },
     .{ .name = "sceAjmInstanceCreate", .function = trace.wrap("sceAjmInstanceCreate", &ajmInstanceCreate), .expect_id = "AxoDrINp4J8" },
     .{ .name = "sceAjmInstanceDestroy", .function = trace.wrap("sceAjmInstanceDestroy", &ajmInstanceDestroy), .expect_id = "RbLbuKv8zho" },
+    .{ .name = "sceAjmMemoryRegister", .function = trace.wrap("sceAjmMemoryRegister", &ajmMemoryRegister), .expect_id = "bkRHEYG6lEM" },
+    .{ .name = "sceAjmMemoryUnregister", .function = trace.wrap("sceAjmMemoryUnregister", &ajmMemoryUnregister), .expect_id = "pIpGiaYkHkM" },
     .{ .name = "sceAjmBatchInitialize", .function = trace.wrap("sceAjmBatchInitialize", &ajmBatchInitialize), .expect_id = "MmpF1XsQiHw" },
     .{ .name = "sceAjmBatchStart", .function = trace.wrap("sceAjmBatchStart", &ajmBatchStart), .expect_id = "5tOfnaClcqM" },
     .{ .name = "sceAjmBatchWait", .function = trace.wrap("sceAjmBatchWait", &ajmBatchWait), .expect_id = "-qLsfDAywIY" },
@@ -2809,6 +2925,10 @@ const ajm_exports = [_]symbols.Export{
     .{ .name = "sceAjmBatchJobSetResampleParametersEx", .function = trace.wrap("sceAjmBatchJobSetResampleParametersEx", &ajmBatchJobSetResampleParametersEx), .expect_id = "5ldnD16rYZw" },
     .{ .name = "sceAjmBatchJobGetResampleInfo", .function = trace.wrap("sceAjmBatchJobGetResampleInfo", &ajmBatchJobGetResampleInfo), .expect_id = "JkdNCocpu1M" },
     .{ .name = "sceAjmBatchJobGetStatistics", .function = trace.wrap("sceAjmBatchJobGetStatistics", &ajmBatchJobGetStatistics), .expect_id = "3cAg7xN995U" },
+    .{ .name = "sceAjmBatchJobControl", .function = trace.wrap("sceAjmBatchJobControl", &ajmBatchJobControl), .expect_id = "7FZsbyVRM4U" },
+    .{ .name = "sceAjmBatchJobRunSplit", .function = trace.wrap("sceAjmBatchJobRunSplit", &ajmBatchJobRunSplit), .expect_id = "Z9NVCesiP0Q" },
+    .{ .name = "sceAjmDecMp3ParseFrame", .function = trace.wrap("sceAjmDecMp3ParseFrame", &ajmDecMp3ParseFrame), .expect_id = "eDFeTyi+G3Y" },
+    .{ .name = "sceAjmDecAt9ParseConfigData", .function = trace.wrap("sceAjmDecAt9ParseConfigData", &ajmDecAt9ParseConfigData), .expect_id = "1t3ixYNXyuc" },
 };
 
 pub fn reset() void {

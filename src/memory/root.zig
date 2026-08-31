@@ -177,6 +177,13 @@ pub const system_managed = Range{
     .end = 0x08_0000_0000 - page_size,
 };
 
+/// Search start for kernel-owned thread state and stacks.
+///
+/// Keeping these allocations near the top of the system-managed window
+/// mirrors the console layout and, critically, leaves the title user-window
+/// base (`0x10_0000_0000`) available for fixed heap arenas.
+pub const thread_runtime_search_base: u64 = 0x07_e000_0000;
+
 /// Addresses reserved for the guest system software.
 pub const system_reserved = Range{
     .start = 0x08_0000_0000,

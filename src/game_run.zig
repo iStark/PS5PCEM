@@ -744,6 +744,7 @@ fn run(init: std.process.Init) !bool {
             );
             const fault_registers = fault.info.registers;
             try reportGuestPointer(stderr, &emu.address_space.?, "rax", fault_registers.rax);
+            try reportGuestPointer(stderr, &emu.address_space.?, "rbx", fault_registers.rbx);
             try reportGuestPointer(stderr, &emu.address_space.?, "rcx", fault_registers.rcx);
             try reportGuestPointer(stderr, &emu.address_space.?, "rsi", fault_registers.rsi);
             try reportGuestPointer(stderr, &emu.address_space.?, "rdi", fault_registers.rdi);

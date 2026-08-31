@@ -141,6 +141,13 @@ fn getAccessibilityZoomFollowFocus(user_id: i32, output: ?*i32) callconv(abi.gue
     return getSetting(user_id, output, 0);
 }
 
+fn getPlatformPrivacySetting(parameter_id: i32, output: ?*i32) callconv(abi.guest) i32 {
+    if (parameter_id != 1000) return error_invalid_argument;
+    const value = output orelse return error_invalid_argument;
+    value.* = 0;
+    return errno.ok;
+}
+
 pub const exports = [_]symbols.Export{
     .{ .name = "sceUserServiceInitialize", .function = trace.wrap("sceUserServiceInitialize", &initialize), .expect_id = "j3YMu1MVNNo" },
     .{ .name = "sceUserServiceTerminate", .function = trace.wrap("sceUserServiceTerminate", &terminate), .expect_id = "bwFjS+bX9mA" },
@@ -158,6 +165,10 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceUserServiceGetAccessibilityZoomFollowFocus", .function = trace.wrap("sceUserServiceGetAccessibilityZoomFollowFocus", &getAccessibilityZoomFollowFocus), .expect_id = "O6IW1-Dwm-w" },
 };
 
+const platform_privacy_exports = [_]symbols.Export{
+    .{ .name = "sceUserServiceGetPlatformPrivacySetting", .function = trace.wrap("sceUserServiceGetPlatformPrivacySetting", &getPlatformPrivacySetting), .id_override = "D-CzAxQL0XI" },
+};
+
 pub const library = symbols.Library{ .name = "libSceUserService", .version = 1 };
 pub const module = symbols.Module{
     .name = "libSceUserService",
@@ -167,6 +178,12 @@ pub const module = symbols.Module{
 
 pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {
     try db.addLibrary(gpa, library, module, &exports);
+    try db.addLibrary(
+        gpa,
+        .{ .name = "libSceUserServicePlatformPrivacyWs1", .version = 1 },
+        module,
+        &platform_privacy_exports,
+    );
 }
 
 test "user service publishes one login session" {

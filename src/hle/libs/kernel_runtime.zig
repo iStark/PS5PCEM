@@ -651,6 +651,39 @@ fn aprResolveFilepathsToIdsAndFileSizes(
     return 0;
 }
 
+fn aprResolveFilepathsToIds(
+    paths_address: u64,
+    count: u64,
+    identifiers_address: u64,
+    error_index_address: u64,
+) callconv(abi.guest) i32 {
+    return aprResolveFilepathsToIdsAndFileSizes(
+        paths_address,
+        count,
+        identifiers_address,
+        0,
+        error_index_address,
+    );
+}
+
+fn aprGetFileStat(identifier: u32, out: ?*filesystem.Stat) callconv(abi.guest) i32 {
+    const record = out orelse return KernelError.einval.raw();
+    if (!memory_api.isGuestRangeAccessible(@intFromPtr(record), @sizeOf(filesystem.Stat))) {
+        return KernelError.efault.raw();
+    }
+    apr.stat(identifier, record) catch |err| return aprKernelError(err);
+    return 0;
+}
+
+fn aprGetFileSize(identifier: u32, out: ?*u64) callconv(abi.guest) i32 {
+    const size = out orelse return KernelError.einval.raw();
+    if (!memory_api.isGuestRangeAccessible(@intFromPtr(size), @sizeOf(u64))) {
+        return KernelError.efault.raw();
+    }
+    size.* = apr.fileSize(identifier) catch |err| return aprKernelError(err);
+    return 0;
+}
+
 fn readGuestCString(address: u64, buffer: []u8) ?[]const u8 {
     if (address == 0) return null;
     var length: usize = 0;
@@ -2179,6 +2212,18 @@ fn getrusage(_: i32, output: ?*[144]u8) callconv(abi.guest) i32 {
     return errno.ok;
 }
 
+fn getOpenPsId(output: ?*[16]u8) callconv(abi.guest) i32 {
+    const identifier = output orelse return KernelError.einval.raw();
+    if (!memory_api.isGuestRangeAccessible(@intFromPtr(identifier), 16)) {
+        return KernelError.efault.raw();
+    }
+    identifier.* = .{
+        'P', 'S', '5', 'P', 'C', 'E', 'M', 0,
+        'O', 'p', 'e', 'n', 'P', 's', 'I', 'd',
+    };
+    return errno.ok;
+}
+
 pub const exports = [_]symbols.Export{
     .{ .name = "_sceKernelSetThreadDtors", .function = trace.wrap("_sceKernelSetThreadDtors", &setThreadDtors), .expect_id = "rNhWz+lvOMU" },
     .{ .name = "_sceKernelSetThreadAtexitCount", .function = trace.wrap("_sceKernelSetThreadAtexitCount", &setThreadAtexitCount), .expect_id = "pB-yGZ2nQ9o" },
@@ -2265,15 +2310,14 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceKernelAprSubmitCommandBufferAndGetResult", .function = trace.wrap("sceKernelAprSubmitCommandBufferAndGetResult", &aprSubmitCommandBufferAndGetResult), .expect_id = "ASoW5WE-UPo" },
     .{ .name = "sceKernelAprWaitCommandBuffer", .function = trace.wrap("sceKernelAprWaitCommandBuffer", &aprWaitCommandBuffer), .expect_id = "rqwFKI4PAiM" },
 
-    // The rest of the accelerator's path-resolution and submission surface,
-    // reported unimplemented like the entries above it. These turn a list of
-    // file paths into identifiers the accelerator then reads by, and answering
-    // them without an accelerator behind it would hand a title identifiers that
-    // name nothing, which it would carry until a read failed for no visible
-    // reason.
-    .{ .name = "sceKernelAprGetFileStat", .function = trace.wrap("sceKernelAprGetFileStat", &kernelUnsupported), .expect_id = "ApkYaHb8Sek" },
-    .{ .name = "sceKernelAprGetFileSize", .function = trace.wrap("sceKernelAprGetFileSize", &kernelUnsupported), .expect_id = "WvEu7yl3Ivg" },
-    .{ .name = "sceKernelAprResolveFilepathsToIds", .function = trace.wrap("sceKernelAprResolveFilepathsToIds", &kernelUnsupported), .expect_id = "WT-5NKy42fw" },
+    .{ .name = "sceKernelAprGetFileStat", .function = trace.wrap("sceKernelAprGetFileStat", &aprGetFileStat), .expect_id = "ApkYaHb8Sek" },
+    .{ .name = "sceKernelAprGetFileSize", .function = trace.wrap("sceKernelAprGetFileSize", &aprGetFileSize), .expect_id = "WvEu7yl3Ivg" },
+    .{ .name = "sceKernelAprResolveFilepathsToIds", .function = trace.wrap("sceKernelAprResolveFilepathsToIds", &aprResolveFilepathsToIds), .expect_id = "WT-5NKy42fw" },
+
+    // The remaining accelerator path variants are reported unimplemented.
+    // Unlike the entries above, no currently exercised caller depends on an
+    // identifier or stat record from them yet; they must join the same APR
+    // registry before they can truthfully report success.
     .{ .name = "sceKernelAprResolveFilepathsToIdsForEach", .function = trace.wrap("sceKernelAprResolveFilepathsToIdsForEach", &kernelUnsupported), .expect_id = "eYAh2vlCY-U" },
     .{ .name = "sceKernelAprResolveFilepathsToIdsAndFileSizesForEach", .function = trace.wrap("sceKernelAprResolveFilepathsToIdsAndFileSizesForEach", &kernelUnsupported), .expect_id = "QzB4O+bJQyA" },
     .{ .name = "sceKernelAprResolveFilepathsWithPrefixToIds", .function = trace.wrap("sceKernelAprResolveFilepathsWithPrefixToIds", &kernelUnsupported), .expect_id = "i3HWvW35jao" },
@@ -2328,6 +2372,10 @@ pub const posix_exports = [_]symbols.Export{
     .{ .name = "fcntl", .function = trace.wrap("fcntl", &posixUnsupported), .expect_id = "8nY19bKoiZk" },
 };
 
+const open_ps_id_exports = [_]symbols.Export{
+    .{ .name = "sceKernelGetOpenPsId", .function = trace.wrap("sceKernelGetOpenPsId", &getOpenPsId), .expect_id = "DLORcroUqbc" },
+};
+
 pub const library = symbols.Library{ .name = "libkernel", .version = 1 };
 pub const unity_library = symbols.Library{ .name = "libkernel_unity", .version = 1 };
 pub const posix_library = symbols.Library{ .name = "libScePosix", .version = 1 };
@@ -2353,6 +2401,12 @@ pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!voi
     try db.addLibrary(gpa, library, module, &exports);
     try db.addLibrary(gpa, unity_library, module, &unity_exports);
     try db.addLibrary(gpa, posix_library, module, &posix_exports);
+    try db.addLibrary(
+        gpa,
+        .{ .name = "libSceOpenPsId", .version = 1 },
+        module,
+        &open_ps_id_exports,
+    );
 }
 
 test "calendar conversion clears the complete PS5 timezone result" {

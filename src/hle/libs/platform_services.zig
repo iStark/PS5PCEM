@@ -10,6 +10,7 @@ const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const kernel_runtime = @import("kernel_runtime.zig");
 const kernel_memory = @import("kernel_memory.zig");
+const video_out = @import("../video_out.zig");
 
 const rtc_unix_epoch_microseconds: i96 = 62_135_596_800 * std.time.us_per_s;
 const rtc_error_invalid_pointer: i32 = @bitCast(@as(u32, 0x80b5_0002));
@@ -437,6 +438,91 @@ pub fn rtcGetTimeT(time_pointer: ?*const RtcDateTime, output: ?*i64) callconv(ab
         0
     else
         @intCast(@divTrunc(tick - rtc_unix_epoch_microseconds, std.time.us_per_s));
+    return errno.ok;
+}
+
+pub fn rtcTickAddDays(output: ?*u64, source: ?*const u64, days: i32) callconv(abi.guest) i32 {
+    const destination = output orelse return rtc_error_invalid_pointer;
+    const input = source orelse return rtc_error_invalid_pointer;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(destination), @sizeOf(u64)) or
+        !kernel_memory.isGuestRangeAccessible(@intFromPtr(input), @sizeOf(u64)))
+    {
+        return gen2_error_memory_fault;
+    }
+    const adjusted = @as(i128, input.*) + @as(i128, days) * std.time.us_per_day;
+    if (adjusted < 0 or adjusted > std.math.maxInt(u64)) return rtc_error_invalid_value;
+    destination.* = @intCast(adjusted);
+    return errno.ok;
+}
+
+fn rtcCopyTick(output: ?*u64, source: ?*const u64) i32 {
+    const destination = output orelse return rtc_error_invalid_pointer;
+    const input = source orelse return rtc_error_invalid_pointer;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(destination), @sizeOf(u64)) or
+        !kernel_memory.isGuestRangeAccessible(@intFromPtr(input), @sizeOf(u64)))
+    {
+        return gen2_error_memory_fault;
+    }
+    // Keep the conversion deterministic and independent of the host machine's
+    // configured time zone. Titles only use the pair to round-trip timestamps.
+    destination.* = input.*;
+    return errno.ok;
+}
+
+pub fn rtcConvertUtcToLocalTime(source: ?*const u64, output: ?*u64) callconv(abi.guest) i32 {
+    return rtcCopyTick(output, source);
+}
+
+pub fn rtcConvertLocalTimeToUtc(source: ?*const u64, output: ?*u64) callconv(abi.guest) i32 {
+    return rtcCopyTick(output, source);
+}
+
+pub fn rtcSetTimeT(output: ?*RtcDateTime, seconds: i64) callconv(abi.guest) i32 {
+    const destination = output orelse return rtc_error_invalid_pointer;
+    if (checkedRtcOutput(destination) == null) return gen2_error_memory_fault;
+    if (seconds < 0) return rtc_error_invalid_value;
+    const tick = @as(i128, rtc_unix_epoch_microseconds) + @as(i128, seconds) * std.time.us_per_s;
+    if (tick > std.math.maxInt(u64)) return rtc_error_invalid_value;
+    destination.* = rtcDateTimeFromTick(@intCast(tick)) orelse return rtc_error_invalid_value;
+    return errno.ok;
+}
+
+const VideoOutColorSettings = extern struct {
+    gamma: f32 = 1.0,
+    reserved: [3]u32 = .{ 0, 0, 0 },
+};
+
+const video_out_error_invalid_value: i32 = @bitCast(@as(u32, 0x8029_0001));
+const video_out_error_invalid_address: i32 = @bitCast(@as(u32, 0x8029_0002));
+const video_out_error_invalid_handle: i32 = @bitCast(@as(u32, 0x8029_000b));
+
+pub fn videoOutColorSettingsSetGamma(
+    settings: ?*VideoOutColorSettings,
+    gamma: f32,
+) callconv(abi.guest) i32 {
+    const output = settings orelse return video_out_error_invalid_address;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(output), @sizeOf(VideoOutColorSettings))) {
+        return video_out_error_invalid_address;
+    }
+    if (!std.math.isFinite(gamma) or gamma < 0.1 or gamma > 2.0) {
+        return video_out_error_invalid_value;
+    }
+    output.gamma = gamma;
+    return errno.ok;
+}
+
+pub fn videoOutAdjustColor(
+    handle: i32,
+    settings: ?*const VideoOutColorSettings,
+) callconv(abi.guest) i32 {
+    const input = settings orelse return video_out_error_invalid_address;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(input), @sizeOf(VideoOutColorSettings))) {
+        return video_out_error_invalid_address;
+    }
+    if (!video_out.validHandle(handle)) return video_out_error_invalid_handle;
+    // Gamma is a display preference rather than guest image data. The host
+    // swapchain keeps its native transfer function, but accepting the setting
+    // preserves the title's VideoOut lifecycle.
     return errno.ok;
 }
 

@@ -269,6 +269,7 @@ pub const exports = [_]symbols.Export{
     .{ .name = "sceKernelAioSubmitWriteCommands", .function = trace.wrap("sceKernelAioSubmitWriteCommands", &submitWriteCommands), .expect_id = "XQ8C8y+de+E" },
     .{ .name = "sceKernelAioWaitRequest", .function = trace.wrap("sceKernelAioWaitRequest", &waitRequest), .expect_id = "KOF-oJbQVvc" },
     .{ .name = "sceKernelAioPollRequests", .function = trace.wrap("sceKernelAioPollRequests", &pollRequests), .expect_id = "o7O4z3jwKzo" },
+    .{ .name = "sceKernelAioPollRequest", .function = trace.wrap("sceKernelAioPollRequest", &pollRequests), .expect_id = "2pOuoWoCxdk" },
     .{ .name = "sceKernelAioDeleteRequest", .function = trace.wrap("sceKernelAioDeleteRequest", &deleteRequest), .expect_id = "5TgME6AYty4" },
     .{ .name = "sceKernelAioInitializeImpl", .function = trace.wrap("sceKernelAioInitializeImpl", &initializeImpl), .expect_id = "vYU8P9Td2Zo" },
     .{ .name = "sceKernelAioInitializeParam", .function = trace.wrap("sceKernelAioInitializeParam", &initializeParam), .expect_id = "nu4a0-arQis" },
