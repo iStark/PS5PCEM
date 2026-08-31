@@ -42,6 +42,11 @@ logical protection and advances the page generation, so a stable buffer or
 texture reuses its resident Vulkan copy without a complete byte hash. Uploads
 verify the generation again after copying; a range modified concurrently is
 accepted only as a snapshot and is not cached as current.
+When page tracking is unavailable, dynamic 1024×1024 single-channel Unity font
+atlases retain full-payload hashing instead of the normal bounded texture
+probe. This lets glyph uploads at unchanged guest addresses invalidate their
+sampled-image cache entries without weakening the bounded path for large game
+textures.
 
 Graphics draws record until a real guest ordering packet, compute/readback
 dependency, or VideoOut flip closes the batch. Each draw binds

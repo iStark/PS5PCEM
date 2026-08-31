@@ -161,6 +161,16 @@
   first ran. A regression run completed more than 1,200 flips and reproduced
   the illuminated gate scene without a failed submission. No gameplay
   compatibility is claimed yet.
+- REANIMAL now resolves its observed module graph, completes the company-logo
+  sequence, and reaches the animated 3840×2160 title menu. The resident Unity
+  composition path preserves the buoy background instead of stretching its
+  narrow UI intermediates over the scanout, while the title logo and lower
+  `SELECT` prompt render through guest UI draws. Dynamic 1024×1024 R8 font
+  atlases use a full-content cache identity when page tracking is unavailable,
+  so rewritten glyph pages do not silently reuse an older Vulkan image. The
+  current capture is a partial menu milestone: the central option labels still
+  collapse to small red marks, menu navigation has not been verified, and no
+  gameplay compatibility is claimed.
 - The Precinct now plays both observed intro movies with synchronized video and
   audio, leaves the movie pipeline, renders its complete 1920×1080 title scene,
   and reaches the `PLAY GAME` menu and readable `NEW GAME` confirmation. Natural
@@ -285,6 +295,14 @@ selection, and Vulkan scanout all run in the observed title process. The same
 scene is now reproduced after enabling the title's alternate image-sample
 encoding and rejecting its stale 1×1 depth attachment; gameplay is not claimed.*
 
+![REANIMAL partial title menu rendered by PS5PCEM](images/reanimal-menu-partial.png)
+
+*A live REANIMAL title-menu frame produced by the guest Unity render graph. The
+animated buoy background, title logo, water highlights, and `SELECT` prompt are
+visible without the former full-screen stretch. The missing central option
+labels remain an active rendering issue, so this capture is not a complete menu
+or gameplay claim.*
+
 ![Tetris Effect first guest-rendered particle frame](images/tetris-effect-first-render.png)
 
 *The first recognizable Tetris Effect render produced by the title's startup
@@ -310,4 +328,5 @@ the repository contains none of that content.
 | **Asterix & Obelix: Slap Them All!** | Maps the Unity/PSN plug-in graph, passes GameUpdate, trophy, entitlement, WebApi, and player-review bootstrap calls, accepts four-byte-aligned AGC shader headers, and reaches repeatable 1920×1080 gameplay. SceAvPlayer returns the ATL intro as correctly decoded NV12 frames; the translated guest pixel shader converts the staged planes on the GPU, resident fullscreen copies avoid the former GPU→CPU→GPU round trip, and synchronous AGC retirement removes the three-second Unity polling timeout. Equivalent completion edges are coalesced and paced by one display interval instead of the former fixed 250 ms delay. Frame-scoped command buffers, a 256-set descriptor/scalar ring and mapped read-only/index upload snapshots reduce the observed 48-draw workload from 52 Vulkan submissions to 13. Scanout orientation follows the final compositor's negative-height viewport, keeping gameplay and UI upright. The latest 3,000-flip run remained submission-clean and reproduced gameplay at typically 28–31 ms per frame on the current RTX 3070 Ti host | Gameplay is verified through the opening forest scene. The remaining submissions preserve actual guest ordering, compute-writeback and presentation boundaries. Roughly 751 KiB of storage upload and 192 KiB of storage readback per gameplay frame, broader input/audio coverage and longer play-session stability remain targets |
 | **Cat Quest III** | Enters the Unity graphics loop and presents repeated 3840×2160 startup frames. The resident identity-compositor path recognizes the title's one-instance procedural full-screen triangle as well as the existing indexed-quad form, and carries its negative-height viewport into scanout, keeping the startup splash upright | Validation currently covers startup and splash presentation only; menu progression, gameplay, input, audio, and longer-run stability are not claimed |
 | **Jurassic Park Classic Games Collection** | Resolves the observed firmware graph, enters Unity, opens the splash and intro MP4 assets through both SceAvPlayer ABIs, and presents the recognizable Jurassic gate intro shown above through the title's 3840×2160 VideoOut buffers. The matched NV12 path accepts UV/Y descriptor order, derives the 2048-byte decoder pitch from the plane layout, performs the observed 2× conversion, and rejects cleared all-zero surfaces during clip changes. It leaves the intro as well: the splash and intro clips play in sequence with sound, and the title reaches its menu and holds it at interactive rates. The alternate `IMAGE_SAMPLE_A` fragment encoding now translates and executes; a general attachment-extent check prevents stale 1×1 depth state from invalidating the 3840×2160 framebuffer. The latest regression run remained submission-clean beyond flip 1,200 and reproduced the illuminated gate scene | Gameplay is not claimed. Remaining shader operations, broader menu interaction, and a longer play-session regression still need validation |
+| **REANIMAL** | Resolves the observed native and firmware modules, plays the company-logo sequence, and sustains the animated 3840×2160 title-menu render graph. Narrow Unity UI intermediates no longer replace the full scanout, dynamic R8 font atlases invalidate stale sampled images, and the buoy background, full title logo, water highlights, and `SELECT` prompt are visible in the live capture above | The central menu-option labels are still reduced to small red marks, so navigation and the transition into gameplay have not been verified. Performance and longer-run stability remain unmeasured, and gameplay is not claimed |
 | **Mighty Morphin Power Rangers: Rita's Rewind** | Resolves the observed Fiber, Pad, offline NP, AGC 1.1, and AGC driver imports, enters a stable 1920×1080 graphics/audio loop, and renders the animated publisher sequence, title menu, and post-menu scene shown above. Native cooperative fibers retain suspended guest stacks, `scePadGetHandle` supplies a readable primary controller, and exact `V_SAD_U32`, `V_MUL_HI_I32`, and `V_CVT_FLR_I32_F32` lowering removes the diagnostic shader fallback. Holding `Cross` advances through the title prompt, and the observed intro remains smooth at roughly 13–20 ms per frame on the current RTX 3070 Ti host | The exact guest CRT composite still produces static on the current host, so a strict shader-signature fallback performs the observed 4× RGBA8 scene scale before downstream post-processing. Dense post-menu frames can contain roughly 255 draws and currently take about 470 ms, dominated by repeated guest-buffer staging; broad gameplay and input compatibility are not claimed yet |
