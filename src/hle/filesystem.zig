@@ -488,6 +488,18 @@ pub fn titleIdentifier() []const u8 {
     return title_identifier_storage[0..title_identifier_length];
 }
 
+/// Some extracted retail packages rename the generic title metadata record to
+/// the numeric suffix of the product code. The guest still asks for the
+/// mounted `/app0/cache_ps5/t00000.dat` name that the console resolves.
+fn titleCacheMetadataAlias(relative: []const u8, storage: []u8) ?[]const u8 {
+    if (!std.ascii.eqlIgnoreCase(relative, "cache_ps5/t00000.dat")) return null;
+    const identifier = titleIdentifier();
+    if (identifier.len <= 4) return null;
+    const numeric = identifier[4..];
+    for (numeric) |character| if (!std.ascii.isDigit(character)) return null;
+    return std.fmt.bufPrint(storage, "cache_ps5/t{s}.dat", .{numeric}) catch null;
+}
+
 /// Points `/savedata0` at one slot of the running title.
 ///
 /// Answers false when the slot does not exist and the title did not ask for one
@@ -809,8 +821,14 @@ pub fn open(path: []const u8, flags: i32) Error!i32 {
 
     if (mount != .title) return openWritableFile(path, relative, flags, io, directory);
 
+    var alias_storage: [maximum_path]u8 = undefined;
     const file = directory.openFile(io, relative, .{}) catch |err| switch (err) {
-        error.FileNotFound, error.NotDir, error.BadPathName => {
+        error.FileNotFound, error.NotDir, error.BadPathName => missing: {
+            if (titleCacheMetadataAlias(relative, &alias_storage)) |alias| {
+                if (directory.openFile(io, alias, .{})) |aliased| {
+                    break :missing aliased;
+                } else |_| {}
+            }
             // Sparse dumps omit loose Media/Resources/audio/**.wav; serve PCM
             // extracted from FSB5 banks inside resources.resource instead.
             return openVirtualAudio(path, relative, io, directory);
@@ -1584,6 +1602,24 @@ test "a title reads its own content through the mount" {
     // A short read at the end is not an error.
     try testing.expectEqual(@as(usize, 2), try read(fd, &buffer));
     try testing.expectEqual(@as(usize, 0), try read(fd, &buffer));
+}
+
+test "generic title cache metadata resolves to an extracted product record" {
+    var fixture = try Fixture.init("title data");
+    defer fixture.deinit();
+    attachSaveDataHome(fixture.tmp.dir, "PPSA26344");
+    defer title_identifier_length = 0;
+    try fixture.tmp.dir.createDirPath(testing.io, "cache_ps5");
+    try fixture.tmp.dir.writeFile(testing.io, .{
+        .sub_path = "cache_ps5/t26344.dat",
+        .data = "metadata",
+    });
+
+    const fd = try open("/app0/cache_ps5/t00000.dat", O.rdonly);
+    defer close(fd) catch {};
+    var contents: [8]u8 = undefined;
+    try testing.expectEqual(contents.len, try read(fd, &contents));
+    try testing.expectEqualStrings("metadata", &contents);
 }
 
 test "positional reads leave the descriptor position alone" {

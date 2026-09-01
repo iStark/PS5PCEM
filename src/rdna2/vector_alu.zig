@@ -16,6 +16,7 @@ fn vop1Opcode(id: u32) isa.Opcode {
         0x00 => .v_nop,
         0x01 => .v_mov_b32,
         0x02 => .v_readfirstlane_b32,
+        0x04 => .v_cvt_f64_i32,
         0x05 => .v_cvt_f32_i32,
         0x06 => .v_cvt_f32_u32,
         0x07 => .v_cvt_u32_f32,
@@ -25,6 +26,7 @@ fn vop1Opcode(id: u32) isa.Opcode {
         0x0c => .v_cvt_rpi_i32_f32,
         0x0d => .v_cvt_flr_i32_f32,
         0x0e => .v_cvt_off_f32_i4,
+        0x0f => .v_cvt_f32_f64,
         0x11 => .v_cvt_f32_ubyte0,
         0x12 => .v_cvt_f32_ubyte1,
         0x13 => .v_cvt_f32_ubyte2,
@@ -39,6 +41,7 @@ fn vop1Opcode(id: u32) isa.Opcode {
         0x2a => .v_rcp_f32,
         0x2b => .v_rcp_iflag_f32,
         0x2e => .v_rsq_f32,
+        0x2f => .v_rsq_f64,
         0x33 => .v_sqrt_f32,
         0x35 => .v_sin_f32,
         0x36 => .v_cos_f32,
@@ -196,6 +199,7 @@ fn vopcOpcode(id: u32) isa.Opcode {
         0xcc => .v_cmp_gt_f16,
         0xcd => .v_cmp_lg_f16,
         0xce => .v_cmp_ge_f16,
+        0xec => .v_cmp_nle_f16,
         0xd1 => .v_cmpx_lt_u32,
         0xd2 => .v_cmpx_eq_u32,
         0xd3 => .v_cmpx_le_u32,
@@ -207,6 +211,7 @@ fn vopcOpcode(id: u32) isa.Opcode {
         0xdb => .v_cmpx_le_f16,
         0xdc => .v_cmpx_gt_f16,
         0xde => .v_cmpx_ge_f16,
+        0xfc => .v_cmpx_nle_f16,
         0xe4 => .v_cmp_gt_u64,
         0xe5 => .v_cmp_ne_u64,
         0xed => .v_cmp_neq_f16,
@@ -252,6 +257,7 @@ fn isCompareExec(op: isa.Opcode) bool {
         .v_cmpx_le_f16,
         .v_cmpx_gt_f16,
         .v_cmpx_ge_f16,
+        .v_cmpx_nle_f16,
         .v_cmpx_neq_f16,
         .v_cmpx_nlt_f16,
         .v_cmpx_ne_i64,
@@ -289,13 +295,26 @@ fn applyDppSource(op: *operand.Operand, modifier: u32) void {
     op.dpp_row_mask = @intCast((modifier >> 28) & 0xf);
 }
 
+fn applyDpp8Source(op: *operand.Operand, modifier: u32, fetch_inactive: bool) void {
+    op.dpp = true;
+    op.dpp8 = true;
+    op.dpp8_selectors = @truncate(modifier >> 8);
+    op.dpp_fetch_inactive = fetch_inactive;
+}
+
 fn decodeVop1Modifier(inst: *Instruction, code: []const u32, word_index: u32, escape: u32, vdst: u32) Error!bool {
-    if (escape != 249 and escape != 250) return false;
+    if (escape != 233 and escape != 234 and escape != 249 and escape != 250) return false;
     const modifier = try requireModifier(inst, code, word_index);
     inst.dst = if (inst.opcode == .v_readfirstlane_b32)
         try operand.decodeScalarDestination(vdst)
     else
         try operand.decodeVectorGpr(vdst);
+    if (escape == 233 or escape == 234) {
+        inst.src0 = try operand.decodeVectorGpr(modifier & 0xff);
+        applyDpp8Source(&inst.src0, modifier, escape == 234);
+        inst.src_count = 1;
+        return true;
+    }
     inst.src0 = try sdwaSource(modifier & 0xff, escape == 249 and (modifier >> 23) & 1 != 0);
     inst.src_count = 1;
     if (escape == 249) {
@@ -317,10 +336,14 @@ fn decodeVop1Modifier(inst: *Instruction, code: []const u32, word_index: u32, es
 }
 
 fn decodeVop2Modifier(inst: *Instruction, code: []const u32, word_index: u32, escape: u32, vdst: u32, vsrc1: u32) Error!bool {
-    if (escape != 249 and escape != 250) return false;
+    if (escape != 233 and escape != 234 and escape != 249 and escape != 250) return false;
     const modifier = try requireModifier(inst, code, word_index);
     inst.dst = try operand.decodeVectorGpr(vdst);
-    if (escape == 249) {
+    if (escape == 233 or escape == 234) {
+        inst.src0 = try operand.decodeVectorGpr(modifier & 0xff);
+        inst.src1 = try operand.decodeVectorGpr(vsrc1);
+        applyDpp8Source(&inst.src0, modifier, escape == 234);
+    } else if (escape == 249) {
         inst.src0 = try sdwaSource(modifier & 0xff, (modifier >> 23) & 1 != 0);
         inst.src1 = try sdwaSource(vsrc1, (modifier >> 31) & 1 != 0);
         inst.dst.sdwa_sel = @intCast((modifier >> 8) & 7);
@@ -345,9 +368,14 @@ fn decodeVop2Modifier(inst: *Instruction, code: []const u32, word_index: u32, es
 }
 
 fn decodeVopcModifier(inst: *Instruction, code: []const u32, word_index: u32, escape: u32, vsrc1: u32) Error!bool {
-    if (escape != 249 and escape != 250) return false;
+    if (escape != 233 and escape != 234 and escape != 249 and escape != 250) return false;
     const modifier = try requireModifier(inst, code, word_index);
-    if (escape == 249) {
+    if (escape == 233 or escape == 234) {
+        inst.src0 = try operand.decodeVectorGpr(modifier & 0xff);
+        inst.src1 = try operand.decodeVectorGpr(vsrc1);
+        inst.dst.kind = if (isCompareExec(inst.opcode)) .exec_lo else .vcc_lo;
+        applyDpp8Source(&inst.src0, modifier, escape == 234);
+    } else if (escape == 249) {
         inst.src0 = try sdwaSource(modifier & 0xff, (modifier >> 23) & 1 != 0);
         inst.src1 = try sdwaSource(vsrc1, (modifier >> 31) & 1 != 0);
         inst.dst = if (isCompareExec(inst.opcode))
@@ -469,6 +497,7 @@ fn nativeVop3Opcode(id: u32) isa.Opcode {
         0x149 => .v_bfe_i32,
         0x14a => .v_bfi_b32,
         0x14b => .v_fma_f32,
+        0x14c => .v_fma_f64,
         0x14e => .v_alignbit_b32,
         0x14f => .v_alignbyte_b32,
         0x151 => .v_min3_f32,
@@ -486,6 +515,7 @@ fn nativeVop3Opcode(id: u32) isa.Opcode {
         0x16c => .v_mul_hi_i32,
         0x15d => .v_sad_u32,
         0x15e => .v_cvt_pk_u8_f32,
+        0x165 => .v_mul_f64,
         0x176 => .v_mad_u64_u32,
         0x178 => .v_xor3_b32,
         0x345 => .v_xad_u32,
@@ -607,6 +637,7 @@ fn vop3SourceCount(op: isa.Opcode, id: u32) u32 {
         .v_subrev_i32,
         .v_bfm_b32,
         .v_bcnt_u32_b32,
+        .v_mul_f64,
         .v_cvt_pknorm_i16_f32,
         .v_cvt_pknorm_u16_f32,
         .v_cvt_pk_u16_u32,
@@ -878,6 +909,28 @@ test "VOP1 DPP retains lane control and masks" {
     try std.testing.expect(inst.src0.negate);
 }
 
+test "VOP1 DPP8 decodes packed selectors and inactive-lane mode" {
+    const broadcast_lane_six = [_]u32{
+        0x7e02_02e9, // v_mov_b32 v1, v0 dpp8:[6,6,6,6,6,6,6,6]
+        0xdb6d_b600,
+    };
+    const normal = try decodeVop1(0, &broadcast_lane_six, 0);
+    try std.testing.expectEqual(@as(u8, 2), normal.word_count);
+    try std.testing.expectEqual(isa.Opcode.v_mov_b32, normal.opcode);
+    try std.testing.expectEqual(isa.OperandKind.vgpr, normal.src0.kind);
+    try std.testing.expectEqual(@as(u32, 0), normal.src0.reg);
+    try std.testing.expect(normal.src0.dpp);
+    try std.testing.expect(normal.src0.dpp8);
+    try std.testing.expectEqual(@as(u24, 0xdb6d_b6), normal.src0.dpp8_selectors);
+    try std.testing.expect(!normal.src0.dpp_fetch_inactive);
+
+    var fetch_inactive = broadcast_lane_six;
+    fetch_inactive[0] = (fetch_inactive[0] & ~@as(u32, 0x1ff)) | 234;
+    const fi = try decodeVop1(0, &fetch_inactive, 0);
+    try std.testing.expect(fi.src0.dpp8);
+    try std.testing.expect(fi.src0.dpp_fetch_inactive);
+}
+
 test "VOPC SDWA may select an explicit scalar destination" {
     const word = (@as(u32, 0x3e) << 25) | (@as(u32, 2) << 17) | (@as(u32, 4) << 9) | 249;
     const modifier = @as(u32, 1) |
@@ -901,6 +954,14 @@ test "VOPC SDWA decodes GFX10 CMPX NLE predicate" {
     try std.testing.expectEqual(isa.OperandKind.vgpr, inst.src0.kind);
     try std.testing.expectEqual(@as(u32, 10), inst.src0.reg);
     try std.testing.expectEqual(isa.OperandKind.vcc_lo, inst.src1.kind);
+    try std.testing.expectEqual(@as(u32, 2), inst.word_count);
+}
+
+test "VOPC SDWA decodes GFX10 CMPX NLE f16 predicate" {
+    const code = [_]u32{ 0x7df9_00f9, 0x8605_0005 };
+    const inst = try decodeVopc(0x5cc, &code, 0);
+    try std.testing.expectEqual(isa.Opcode.v_cmpx_nle_f16, inst.opcode);
+    try std.testing.expectEqual(isa.OperandKind.exec_lo, inst.dst.kind);
     try std.testing.expectEqual(@as(u32, 2), inst.word_count);
 }
 
@@ -938,6 +999,28 @@ test "VOP3 packed-norm and 16-bit native encodings decode" {
     const add16 = try decodeVop3(0, &.{ 0xd703_0004, 0x0002_0100 }, 0);
     try std.testing.expectEqual(isa.Opcode.v_add_nc_u16, add16.opcode);
     try std.testing.expectEqual(@as(u32, 2), add16.src_count);
+}
+
+test "Yotei FP64 normalization instructions decode" {
+    const cvt = try decodeVop1(0xc8, &.{0x7e06_0907}, 0);
+    try std.testing.expectEqual(isa.Opcode.v_cvt_f64_i32, cvt.opcode);
+    try std.testing.expectEqual(@as(u32, 3), cvt.dst.reg);
+    try std.testing.expectEqual(@as(u32, 7), cvt.src0.reg);
+
+    const rsq = try decodeVop1(0xe0, &.{0x7e06_5f03}, 0);
+    try std.testing.expectEqual(isa.Opcode.v_rsq_f64, rsq.opcode);
+
+    const mul = try decodeVop3(0xf4, &.{ 0xd565_0005, 0x0002_0305 }, 0);
+    try std.testing.expectEqual(isa.Opcode.v_mul_f64, mul.opcode);
+    try std.testing.expectEqual(@as(u32, 2), mul.src_count);
+
+    const fma = try decodeVop3(0x114, &.{ 0xd54c_0001, 0x8406_0705 }, 0);
+    try std.testing.expectEqual(isa.Opcode.v_fma_f64, fma.opcode);
+    try std.testing.expectEqual(@as(u32, 3), fma.src_count);
+    try std.testing.expect(fma.src2.negate);
+
+    const to_f32 = try decodeVop1(0x130, &.{0x7e04_1f01}, 0);
+    try std.testing.expectEqual(isa.Opcode.v_cvt_f32_f64, to_f32.opcode);
 }
 
 test "VOP3P packed add retains lane selectors" {

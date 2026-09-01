@@ -2140,28 +2140,11 @@ const sysmodule_bootstrap_exports = [_]symbols.Export{
 
 // AGC command construction ------------------------------------------------
 
-const AgcCommandBuffer = extern struct {
-    bottom: ?[*]u32,
-    top: ?[*]u32,
-    cursor_up: ?[*]u32,
-    cursor_down: ?[*]u32,
-    callback: ?*const anyopaque,
-    user_data: ?*anyopaque,
-    reserved_dwords: u32,
-};
+const AgcCommandBuffer = agc.CommandBuffer;
 
 fn reserveAgcDwords(buffer: ?*AgcCommandBuffer, dword_count: usize) ?[*]u32 {
-    if (dword_count == 0 or dword_count > std.math.maxInt(usize) / @sizeOf(u32)) return null;
-    const state = buffer orelse return null;
-    const cursor = state.cursor_up orelse state.bottom orelse return null;
-    const top = state.top orelse return null;
-    const cursor_address = @intFromPtr(cursor);
-    const top_address = @intFromPtr(top);
-    const byte_count = dword_count * @sizeOf(u32);
-    if (cursor_address > top_address or top_address - cursor_address < byte_count) return null;
-    state.cursor_up = cursor + dword_count;
-    agc_submit.trackGraphicsCommandAllocation(cursor_address, dword_count);
-    return cursor;
+    if (dword_count == 0 or dword_count > std.math.maxInt(u32)) return null;
+    return agc.reserveDwords(buffer, @intCast(dword_count));
 }
 
 fn pm4Header(opcode: u8, body_words: usize) u32 {
@@ -2198,6 +2181,27 @@ fn writeAgcCustomPacket(buffer: ?*AgcCommandBuffer, code: u6, body: []const u32)
 fn agcCommand(buffer: ?*AgcCommandBuffer, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) ?[*]u32 {
     const body = [_]u32{0} ** 15;
     return writeAgcPacket(buffer, gpu.pm4.nop, &body);
+}
+
+fn agcJump(
+    buffer: ?*AgcCommandBuffer,
+    mode: u64,
+    cache_policy: u64,
+    target_address: u64,
+    size_in_dwords: u64,
+    _: u64,
+) callconv(abi.guest) ?[*]u32 {
+    if (target_address == 0 or target_address & 0x3 != 0) return null;
+
+    const body = [_]u32{
+        @as(u32, @truncate(target_address)) & 0xffff_fffc,
+        @truncate(target_address >> 32),
+        0x0f20_0000 |
+            ((@as(u32, @truncate(cache_policy)) & 0x3) << 28) |
+            ((@as(u32, @truncate(mode)) & 0x1) << 20) |
+            (@as(u32, @truncate(size_in_dwords)) & 0x000f_ffff),
+    };
+    return writeExactAgcPacket(buffer, gpu.pm4.indirect_buffer, &body);
 }
 
 fn agcReleaseMem(
@@ -2500,14 +2504,44 @@ fn agcSetFlip(
     flip_argument: i64,
 ) callconv(abi.guest) ?[*]u32 {
     const raw_argument: u64 = @bitCast(flip_argument);
+    const flip = gpu.state.Flip{
+        .video_out_handle = video_out_handle,
+        .display_buffer_index = display_buffer_index,
+        .mode = flip_mode,
+        .argument = flip_argument,
+    };
     const body = [_]u32{
-        video_out_handle,
-        @bitCast(display_buffer_index),
-        flip_mode,
+        flip.video_out_handle,
+        @bitCast(flip.display_buffer_index),
+        flip.mode,
         @truncate(raw_argument),
         @truncate(raw_argument >> 32),
     };
-    return writeAgcCustomPacket(buffer, gpu.pm4.custom.flip, &body);
+    const command = writeAgcCustomPacket(buffer, gpu.pm4.custom.flip, &body) orelse return null;
+    var stream_address: u64 = 0;
+    var stream_word_count: u32 = 0;
+    if (buffer) |command_buffer| {
+        if (command_buffer.bottom) |bottom| {
+            if (command_buffer.cursor_up) |cursor| {
+                const bottom_address = @intFromPtr(bottom);
+                const cursor_address = @intFromPtr(cursor);
+                if (cursor_address >= bottom_address) {
+                    const words = (cursor_address - bottom_address) / @sizeOf(u32);
+                    if (words <= std.math.maxInt(u32)) {
+                        stream_address = bottom_address;
+                        stream_word_count = @intCast(words);
+                    }
+                }
+            }
+        }
+    }
+    agc_submit.noteConstructedFlip(
+        @intFromPtr(command),
+        stream_address,
+        stream_word_count,
+        flip,
+    );
+    return command;
 }
 
 fn agcDrawIndex(
@@ -3267,6 +3301,32 @@ fn agcCreatePrimState(
     return errno.ok;
 }
 
+/// Completes the fixed-size primitive-register table produced by
+/// `sceAgcCreatePrimState`.
+///
+/// SDK 11 callers probe 32 `(offset, value)` pairs after the three UC entries
+/// written above.  The helper represented by NID `dbOlWdppb4o` initializes the
+/// unused probes; leaving it as a success-only stub makes the caller interpret
+/// guest-stack residue as a register offset and index outside its table.
+fn agcAddPrimStateRegisters(
+    uc_registers: ?[*]ShaderRegister,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    const registers = uc_registers orelse return invalid_argument;
+    const populated_registers: usize = 3;
+    const probed_registers: usize = 0x20;
+    const address = @intFromPtr(registers);
+    const byte_count = probed_registers * @sizeOf(ShaderRegister);
+    if (!accessible(address, byte_count)) return errno.KernelError.efault.raw();
+
+    @memset(registers[populated_registers..probed_registers], .{ .offset = 0, .value = 0 });
+    return errno.ok;
+}
+
 const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcInitialize", .function = trace.wrap("sceAgcInitialize", &agcPatch), .id_override = "23LRUSvYu1M" },
     .{ .name = "sceAgcGetRegisterDefaults2", .function = trace.wrap("sceAgcGetRegisterDefaults2", &agcGetRegisterDefaults), .expect_id = "2JtWUUiYBXs" },
@@ -3294,7 +3354,7 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcGetIsTrinityMode", .function = trace.wrap("sceAgcGetIsTrinityMode", &agcPatch), .expect_id = "BfBDZGbti7A" },
     .{ .name = "sceAgcDebugRaiseException", .function = trace.wrap("sceAgcDebugRaiseException", &agcPatch), .expect_id = "T6xuVw0KUJo" },
     .{ .name = "sceAgcCbSetShRegisterRangeDirectGetSize", .function = trace.wrap("sceAgcCbSetShRegisterRangeDirectGetSize", &agcSetShRegisterRangeDirectGetSize), .expect_id = "bxGoVxpdSPQ" },
-    .{ .name = "sceAgcUnknownDb", .function = trace.wrap("sceAgcUnknownDb", &agcPatch), .id_override = "dbOlWdppb4o" },
+    .{ .name = "sceAgcAddPrimStateRegisters", .function = trace.wrap("sceAgcAddPrimStateRegisters", &agcAddPrimStateRegisters), .id_override = "dbOlWdppb4o" },
     .{ .name = "sceAgcUnknownKRzWekV120", .function = trace.wrap("sceAgcUnknownKRzWekV120", &agcSetIndexTypeIndexed), .id_override = "-KRzWekV120" },
     .{ .name = "sceAgcUnknownIkfdtRIqCE", .function = trace.wrap("sceAgcUnknownIkfdtRIqCE", &agcPatch), .id_override = "Ikfdt-rIqCE" },
     .{ .name = "sceAgcGetDataPacketPayloadAddress", .function = trace.wrap("sceAgcGetDataPacketPayloadAddress", &agcGetDataPacketPayloadAddress), .id_override = "V++UgBtQhn0" },
@@ -3344,7 +3404,7 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcDcbCopyData", .function = trace.wrap("sceAgcDcbCopyData", &agcCommand), .expect_id = "1rZSWUv1IRc" },
     .{ .name = "sceAgcDcbWriteData", .function = trace.wrap("sceAgcDcbWriteData", &agcCommand), .expect_id = "i1jyy49AjXU" },
     .{ .name = "sceAgcDcbEventWrite", .function = trace.wrap("sceAgcDcbEventWrite", &agcEventWrite), .expect_id = "aJf+j5yntiU" },
-    .{ .name = "sceAgcDcbJump", .function = trace.wrap("sceAgcDcbJump", &agcCommand), .expect_id = "xSAR0LTcRKM" },
+    .{ .name = "sceAgcDcbJump", .function = trace.wrap("sceAgcDcbJump", &agcJump), .expect_id = "xSAR0LTcRKM" },
     .{ .name = "sceAgcDcbPushMarker", .function = trace.wrap("sceAgcDcbPushMarker", &agcCommand), .expect_id = "+kSrjIVxKFE" },
     .{ .name = "sceAgcDcbPopMarker", .function = trace.wrap("sceAgcDcbPopMarker", &agcCommand), .expect_id = "H7uZqCoNuWk" },
     .{ .name = "sceAgcDcbSetFlip", .function = trace.wrap("sceAgcDcbSetFlip", &agcSetFlip), .expect_id = "YUeqkyT7mEQ" },
@@ -3488,6 +3548,31 @@ test "bootstrap AGC commands are one walkable PM4 NOP" {
     const packet = (try walker.next()).?;
     try std.testing.expectEqual(gpu.pm4.nop, packet.opcode);
     try std.testing.expectEqual(@as(usize, 16), packet.wordCount());
+    try std.testing.expect((try walker.next()) == null);
+}
+
+test "bootstrap AGC jump emits the four-dword indirect-buffer packet" {
+    var words: [4]u32 = @splat(0xdead_beef);
+    var command_buffer = AgcCommandBuffer{
+        .bottom = words[0..].ptr,
+        .top = words[0..].ptr + words.len,
+        .cursor_up = words[0..].ptr,
+        .cursor_down = null,
+        .callback = null,
+        .user_data = null,
+        .reserved_dwords = 0,
+    };
+    const target_address: u64 = 0x1234_5678_9abc_def0;
+    try std.testing.expect(agcJump(&command_buffer, 1, 2, target_address, 0x184, 0) != null);
+    try std.testing.expectEqual(words[0..].ptr + words.len, command_buffer.cursor_up.?);
+
+    var walker = gpu.pm4.Walker.init(&words);
+    const jump = (try walker.next()).?;
+    try std.testing.expectEqual(gpu.pm4.indirect_buffer, jump.opcode);
+    try std.testing.expectEqual(@as(usize, 4), jump.wordCount());
+    try std.testing.expectEqual(@as(u32, @truncate(target_address)), jump.body[0]);
+    try std.testing.expectEqual(@as(u32, @truncate(target_address >> 32)), jump.body[1]);
+    try std.testing.expectEqual(@as(u32, 0x2f30_0184), jump.body[2]);
     try std.testing.expect((try walker.next()) == null);
 }
 
@@ -3914,7 +3999,10 @@ test "shader creation relocates its header and builds primitive state" {
     try std.testing.expectEqual(@as(?u64, header_address), agc_shader_registry.find(expected_program_address));
 
     var cx: [2]ShaderRegister = undefined;
-    var uc: [3]ShaderRegister = undefined;
+    var uc: [0x20]ShaderRegister = @splat(.{
+        .offset = 0xdead_beef,
+        .value = 0xdead_beef,
+    });
     try std.testing.expectEqual(
         @as(i32, 0),
         agcCreatePrimState(&cx, &uc, null, @ptrCast(&header), 4, 0),
@@ -3925,6 +4013,13 @@ test "shader creation relocates its header and builds primitive state" {
     try std.testing.expectEqual(specials[5], uc[1]);
     try std.testing.expectEqual(@as(u32, 0x242), uc[2].offset);
     try std.testing.expectEqual(@as(u32, 4), uc[2].value);
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        agcAddPrimStateRegisters(&uc, 0, 0, 0, 0, 0),
+    );
+    for (uc[3..]) |entry| {
+        try std.testing.expectEqual(ShaderRegister{ .offset = 0, .value = 0 }, entry);
+    }
 }
 
 test "shader creation accepts a fused front half without program registers" {

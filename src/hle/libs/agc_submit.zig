@@ -85,6 +85,7 @@ var retirement_bridge_reports: u32 = 0;
 var driver_completion_reports: u32 = 0;
 var driver_completion_chain_reports: u32 = 0;
 var driver_completion_miss_reports: u32 = 0;
+var sdk11_acb_label_page: std.atomic.Value(u64) = .init(0);
 var submission_header_write_reports: u32 = 0;
 var unmapped_wait_reports: u32 = 0;
 var unsafe_island_reports: u32 = 0;
@@ -108,6 +109,21 @@ const PendingGraphicsSegment = struct {
 var pending_graphics_lock = ExecutionLock{};
 var pending_graphics_segment = PendingGraphicsSegment{};
 var pending_graphics_reports: u32 = 0;
+
+/// Some SDK revisions append `DcbSetFlip` through the command-builder cursor
+/// after freezing the descriptor's public word count.  Keep that constructed
+/// packet until the following graphics submission has drained.  If the packet
+/// was part of the executed stream, `backendFlip` acknowledges it; otherwise
+/// the submission boundary supplies the missing ordered presentation edge.
+const ConstructedFlip = struct {
+    command_address: u64,
+    stream_address: u64,
+    stream_word_count: u32,
+    value: gpu.state.Flip,
+};
+var constructed_flip_lock = ExecutionLock{};
+var pending_constructed_flip: ?ConstructedFlip = null;
+var recovered_constructed_flip_reports: u32 = 0;
 
 const CompletionKind = enum {
     driver_label,
@@ -151,6 +167,8 @@ var completion_batch_active: bool = false;
 var batched_driver_completion_label: u64 = 0;
 var batched_release_contexts: [maximum_pending_completions]u32 = undefined;
 var batched_release_count: usize = 0;
+threadlocal var sdk11_dcb_release_capture: bool = false;
+threadlocal var sdk11_dcb_release_candidate: ?gpu.state.ReleaseMem = null;
 
 fn sleepCompletionWorker() void {
     if (comptime builtin.os.tag == .windows) {
@@ -265,9 +283,14 @@ fn deliverCompletion(completion: PendingCompletion) usize {
             return triggered;
         },
         .dcb => event_queue.triggerGraphicsEvent(0, completion.context_id),
-        .acb => event_queue.triggerUserEventForAll(
-            0x1800,
-            @bitCast(kernel_runtime.processTimeCounter()),
+        // SubmitAcb's first argument is the compute queue owner. The AGC
+        // runtime registers that owner as a graphics-filter event ident and
+        // advances the queue's CPU retirement label from its handler. A user
+        // event (or graphics ident zero) leaves the handler asleep even though
+        // the hardware RELEASE_MEM label has already reached its generation.
+        .acb => event_queue.triggerGraphicsEvent(
+            @bitCast(completion.context_id),
+            completion.context_id,
         ),
     };
 }
@@ -902,6 +925,7 @@ fn publishSynchronousRetirement(value: gpu.state.ReleaseMem) void {
 }
 
 fn backendRelease(_: ?*anyopaque, value: gpu.state.ReleaseMem) bool {
+    if (sdk11_dcb_release_capture) captureSdk11DcbRelease(value);
     if (compact_release_reports < 64) {
         if (resolveSubmissionAlias(value.address, switch (value.data_selection) {
             1 => 4,
@@ -1006,6 +1030,35 @@ fn backendRelease(_: ?*anyopaque, value: gpu.state.ReleaseMem) bool {
     return ok;
 }
 
+fn isSdk11DcbCompletionRelease(
+    release: gpu.state.ReleaseMem,
+    label_page: u64,
+    label_index: u32,
+) bool {
+    if (label_page == 0 or label_index >= 0x80 or release.data_selection != 2 or
+        release.data >= std.math.maxInt(u32) or release.address & 0x1f != 0)
+    {
+        return false;
+    }
+    const release_slot = (release.address & 0xfff) / 0x20;
+    return release.address & ~@as(u64, 0xfff) == label_page and
+        release_slot == @as(u64, label_index) + 1;
+}
+
+fn captureSdk11DcbRelease(release: gpu.state.ReleaseMem) void {
+    const queue_address = trace.currentGuestR15();
+    if (queue_address == 0 or !memory.isGuestRangeAccessible(queue_address, 0xb8)) return;
+    var fields: [0xb8]u8 = undefined;
+    if (!readGuestMemory(null, queue_address, &fields)) return;
+    const label_index = std.mem.readInt(u32, fields[0xb4..0xb8], .little);
+    if (!isSdk11DcbCompletionRelease(
+        release,
+        sdk11_acb_label_page.load(.acquire),
+        label_index,
+    )) return;
+    sdk11_dcb_release_candidate = release;
+}
+
 fn backendWait(_: ?*anyopaque, value: gpu.state.WaitRegMem, satisfied: bool) bool {
     const backend = installed_backend orelse return true;
     const callback = backend.vtable.wait orelse return true;
@@ -1073,7 +1126,102 @@ fn backendFlip(_: ?*anyopaque, value: gpu.state.Flip) bool {
     // Titles that wait on vblank edges (or poll GetVblankStatus) need refresh
     // progress even when only flips are submitted.
     _ = event_queue.triggerVideoOutVblank();
+    acknowledgeConstructedFlip(value);
     return true;
+}
+
+fn sameFlip(a: gpu.state.Flip, b: gpu.state.Flip) bool {
+    return a.video_out_handle == b.video_out_handle and
+        a.display_buffer_index == b.display_buffer_index and
+        a.mode == b.mode and
+        a.argument == b.argument;
+}
+
+fn acknowledgeConstructedFlip(value: gpu.state.Flip) void {
+    constructed_flip_lock.lock();
+    defer constructed_flip_lock.unlock();
+    if (pending_constructed_flip) |pending| {
+        if (sameFlip(pending.value, value)) pending_constructed_flip = null;
+    }
+}
+
+/// Records a flip emitted by the high-level AGC command builder.  Normally the
+/// PM4 executor consumes the packet and clears this record itself.  Retaining
+/// it also covers SDK command arenas whose frozen public descriptor stops just
+/// before the appended flip packet.
+pub fn noteConstructedFlip(
+    command_address: u64,
+    stream_address: u64,
+    stream_word_count: u32,
+    value: gpu.state.Flip,
+) void {
+    constructed_flip_lock.lock();
+    defer constructed_flip_lock.unlock();
+    pending_constructed_flip = .{
+        .command_address = command_address,
+        .stream_address = stream_address,
+        .stream_word_count = stream_word_count,
+        .value = value,
+    };
+}
+
+/// Executes the command-builder DCB which owns the constructed flip.  SDK 11
+/// titles can submit a small driver-retirement DCB separately from this final
+/// graphics buffer; treating only the public 53-word descriptor as the frame
+/// drops the draw/dispatches immediately preceding `R_FLIP`.
+fn submitConstructedGraphicsStream() void {
+    constructed_flip_lock.lock();
+    const pending = pending_constructed_flip orelse {
+        constructed_flip_lock.unlock();
+        return;
+    };
+    constructed_flip_lock.unlock();
+
+    if (pending.stream_address == 0 or pending.stream_word_count == 0) return;
+    const byte_length = @as(u64, pending.stream_word_count) * @sizeOf(u32);
+    const stream_end = std.math.add(u64, pending.stream_address, byte_length) catch return;
+    const flip_end = std.math.add(u64, pending.command_address, 6 * @sizeOf(u32)) catch return;
+    if (pending.command_address < pending.stream_address or flip_end > stream_end) return;
+
+    const stream_pointer: [*]const u32 = @ptrFromInt(pending.stream_address);
+    const stream = streamOf(stream_pointer, pending.stream_word_count) orelse return;
+    if (recovered_constructed_flip_reports < 16) {
+        std.debug.print(
+            "[agc flip] submitting constructed graphics DCB @0x{x}/{d} through packet=0x{x}\n",
+            .{ pending.stream_address, pending.stream_word_count, pending.command_address },
+        );
+        recovered_constructed_flip_reports += 1;
+    }
+    announce("dcb builder", stream);
+    _ = executeAcceptedStream("dcb builder", stream, null);
+}
+
+fn presentUnconsumedConstructedFlip(submission: Submission, outcome: SubmitOutcome) void {
+    if (!outcome.accepted) return;
+
+    constructed_flip_lock.lock();
+    const pending = pending_constructed_flip orelse {
+        constructed_flip_lock.unlock();
+        return;
+    };
+    pending_constructed_flip = null;
+    constructed_flip_lock.unlock();
+
+    const submission_start = if (submission.address) |address| @intFromPtr(address) else 0;
+    if (recovered_constructed_flip_reports < 16) {
+        std.debug.print(
+            "[agc flip] presenting appended DCB flip packet=0x{x} submit=0x{x}/{d} buffer={d} argument=0x{x}\n",
+            .{
+                pending.command_address,
+                submission_start,
+                submission.word_count,
+                pending.value.display_buffer_index,
+                @as(u64, @bitCast(pending.value.argument)),
+            },
+        );
+        recovered_constructed_flip_reports += 1;
+    }
+    _ = presentFlip(pending.value);
 }
 
 const executor_backend_vtable = gpu.DcbBackend.VTable{
@@ -1133,6 +1281,7 @@ pub fn reset() void {
     driver_completion_reports = 0;
     driver_completion_chain_reports = 0;
     driver_completion_miss_reports = 0;
+    sdk11_acb_label_page.store(0, .release);
     submission_header_write_reports = 0;
     unsafe_island_reports = 0;
     submission_alias_lock.lock();
@@ -1143,6 +1292,10 @@ pub fn reset() void {
     pending_graphics_segment = .{};
     pending_graphics_reports = 0;
     pending_graphics_lock.unlock();
+    constructed_flip_lock.lock();
+    pending_constructed_flip = null;
+    recovered_constructed_flip_reports = 0;
+    constructed_flip_lock.unlock();
     completion_lock.lock();
     pending_completion_head = 0;
     pending_completion_count = 0;
@@ -1187,7 +1340,7 @@ pub fn summarize(stream: []const u32) Summary {
 
 /// Prints a submitted buffer when live tracing is on.
 fn announce(label: []const u8, stream: []const u32) void {
-    if (!trace.isLive()) return;
+    if (!trace.announces(label)) return;
 
     std.debug.print(
         "[{s}] 0x{x} {d} dwords\n",
@@ -1233,6 +1386,7 @@ pub const SubmitOutcome = struct {
     accepted: bool = false,
     completed: bool = false,
     queued_interrupt: bool = false,
+    last_release: ?gpu.state.ReleaseMem = null,
 };
 
 /// AGC emits its own graphics event for RELEASE_MEM packets that request an
@@ -1705,6 +1859,7 @@ fn executeAcceptedStream(
         // forever and wedge every later frame behind it.
         outcome.completed = prefix_outcome.accepted and prefix_outcome.completed;
         outcome.queued_interrupt = hasQueuedInterrupt(commands);
+        outcome.last_release = prefix_outcome.last_release;
     }
 
     if (std.mem.eql(u8, label, "dcb") and outcome.accepted) {
@@ -1901,7 +2056,15 @@ fn executeSubmittedLocked(label: []const u8, stream: []const u32) SubmitOutcome 
         }
         submission_reports += 1;
     }
-    return .{ .accepted = true, .completed = completed };
+    const final_state = submission_scheduler.state(kind);
+    return .{
+        .accepted = true,
+        .completed = completed,
+        .last_release = if (final_state.release_count != release_count_before)
+            final_state.last_release
+        else
+            null,
+    };
 }
 
 /// Chooses a value which actually satisfies the packet's masked comparison.
@@ -2118,6 +2281,24 @@ fn driverCompletionLabel(
         completion_label == 0 or
         !memory.isGuestRangeAccessible(completion_label, @sizeOf(u64)))
     {
+        if (driver_completion_miss_reports < 4) {
+            std.debug.print(
+                "[agc submit] private node mismatch descriptor=0x{x} rbx=0x{x} node=0x{x} stream=0x{x}/0x{x} words={d}/{d} type={d}/{d} label=0x{x}\n",
+                .{
+                    descriptor_address,
+                    trace.currentGuestRbx(),
+                    node,
+                    @intFromPtr(submission.address),
+                    node_stream,
+                    submission.word_count,
+                    node_words,
+                    queue_type,
+                    node_type,
+                    completion_label,
+                },
+            );
+            driver_completion_miss_reports += 1;
+        }
         return null;
     }
 
@@ -2153,12 +2334,337 @@ fn publishDriverCompletionLabel(target: u64) void {
     }
 }
 
-/// Compute completion uses the shared AGC user interrupt. Queue identifiers
-/// are not synthetic graphics events; explicit compute RELEASE_MEM packets
-/// publish their own EOP event through `triggerReleaseInterrupt`.
-fn publishAcbCompletion(outcome: SubmitOutcome) void {
+/// SDK 11 keeps the compute queue's hidden completion generation in the
+/// caller-owned queue object rather than in the older submission node. The
+/// wrapper retains that object in callee-saved RBX across SubmitAcb; validate
+/// its duplicate stream pointers, owner encoding and generation before
+/// publishing anything derived from that private layout.
+fn sdk11AcbGenerationPage(
+    release_page: u64,
+    shared_page: u64,
+    generation: u32,
+    release_data: u64,
+) ?u64 {
+    const generation64: u64 = generation;
+    if (generation == 0 or release_data == 0 or generation64 < release_data) return null;
+    // Transient ACB arenas start their packet-local RELEASE_MEM generation at
+    // one even while the queue object's process-wide generation keeps
+    // increasing. Once an adjacent retirement pair has proved the shared
+    // label page, the validated queue owner/index selects that page and the
+    // packet value only proves that this submission reached a release. A
+    // bounded delta here made the shared label stop advancing at generation
+    // 0x102 when the packet-local value was still one.
+    if (shared_page != 0) return shared_page;
+    // Before the shared table has identified itself, accept only the simple
+    // case where the packet and driver generations agree exactly.
+    return if (generation == release_data) release_page else null;
+}
+
+/// The generation and label slot an SDK 11 compute queue object publishes for
+/// its owner. Recovered by structure, so any register that still holds the
+/// object works and a stale one is rejected rather than believed.
+const Sdk11AcbQueue = struct {
+    generation: u32,
+    label_index: u32,
+};
+
+/// Validates a candidate pointer as `owner`'s compute queue object. The queue
+/// head is self-linked through three separate fields and re-encodes its own
+/// owner, so a wrong pointer is rejected by structure rather than by trust in
+/// whichever register happened to survive the guest's call.
+fn sdk11AcbQueueAt(queue_address: u64, owner: u32) ?Sdk11AcbQueue {
+    if (queue_address == 0 or !memory.isGuestRangeAccessible(queue_address, 0xe8)) return null;
+    var fields: [0xe8]u8 = undefined;
+    if (!readGuestMemory(null, queue_address, &fields)) return null;
+    const self_link = std.mem.readInt(u64, fields[0x28..0x30], .little);
+    const self_head = std.mem.readInt(u64, fields[0x80..0x88], .little);
+    const self_tail = std.mem.readInt(u64, fields[0x88..0x90], .little);
+    const generation = std.mem.readInt(u32, fields[0xd0..0xd4], .little);
+    const label_index = std.mem.readInt(u32, fields[0xd4..0xd8], .little);
+    const queue_number = std.mem.readInt(u32, fields[0xe0..0xe4], .little) & 0xff;
+    const queue_lane = std.mem.readInt(u32, fields[0xe4..0xe8], .little) & 0xff;
+    const encoded_owner = ((queue_number * 8) + 0x20) | queue_lane;
+    if (self_link != queue_address or
+        self_head != queue_address or
+        self_tail != queue_address or
+        generation == 0 or
+        label_index >= 0x80 or
+        encoded_owner != owner)
+    {
+        return null;
+    }
+    return .{ .generation = generation, .label_index = label_index };
+}
+
+/// Queue objects recovered for an owner, remembered so a later submit whose
+/// callee-saved registers no longer carry the pointer still completes. Every
+/// cached hit is re-validated through `sdk11AcbQueueAt`, so a recycled or
+/// freed object cannot publish a stale generation.
+const maximum_sdk11_acb_queues = 16;
+var sdk11_acb_queue_lock = ExecutionLock{};
+var sdk11_acb_queue_owners: [maximum_sdk11_acb_queues]u32 = [_]u32{0} ** maximum_sdk11_acb_queues;
+var sdk11_acb_queue_addresses: [maximum_sdk11_acb_queues]u64 =
+    [_]u64{0} ** maximum_sdk11_acb_queues;
+
+fn rememberSdk11AcbQueue(owner: u32, queue_address: u64) void {
+    sdk11_acb_queue_lock.lock();
+    defer sdk11_acb_queue_lock.unlock();
+    for (sdk11_acb_queue_owners, 0..) |cached, index| {
+        if (cached == owner or cached == 0) {
+            sdk11_acb_queue_owners[index] = owner;
+            sdk11_acb_queue_addresses[index] = queue_address;
+            return;
+        }
+    }
+}
+
+fn rememberedSdk11AcbQueue(owner: u32) u64 {
+    sdk11_acb_queue_lock.lock();
+    defer sdk11_acb_queue_lock.unlock();
+    for (sdk11_acb_queue_owners, 0..) |cached, index| {
+        if (cached == owner) return sdk11_acb_queue_addresses[index];
+    }
+    return 0;
+}
+
+fn publishSdk11AcbDriverGeneration(
+    owner: u32,
+    submission: Submission,
+    release: gpu.state.ReleaseMem,
+) void {
+    if (release.data_selection != 2 or release.data == 0 or release.data > std.math.maxInt(u32)) return;
+    const stream_address = @intFromPtr(submission.address orelse return);
+    // Which callee-saved register still holds the queue object depends on the
+    // guest's own register allocation at the call site, and it is not stable
+    // across submissions. Losing it used to drop the completion entirely, so
+    // the driver waited forever at its next suspend point and startup hung
+    // with nothing presented. Take the first candidate that validates.
+    const candidates = [_]u64{
+        rememberedSdk11AcbQueue(owner),
+        trace.currentGuestRbx(),
+        trace.currentGuestRbp(),
+        trace.currentGuestR15(),
+    };
+    var found: ?Sdk11AcbQueue = null;
+    var queue_address: u64 = 0;
+    for (candidates) |candidate| {
+        if (candidate == 0) continue;
+        if (sdk11AcbQueueAt(candidate, owner)) |queue| {
+            found = queue;
+            queue_address = candidate;
+            break;
+        }
+    }
+    const release_page = release.address & ~@as(u64, 0xfff);
+    var target: u64 = 0;
+    var generation: u32 = 0;
+    if (found) |queue| {
+        rememberSdk11AcbQueue(owner, queue_address);
+        generation = queue.generation;
+        const label_page = sdk11AcbGenerationPage(
+            release_page,
+            sdk11_acb_label_page.load(.acquire),
+            generation,
+            release.data,
+        ) orelse return;
+        target = label_page + @as(u64, queue.label_index) * 0x20;
+        if ((target & ~@as(u64, 0xfff)) != label_page) return;
+    } else {
+        // Some submissions reach here with the queue object in no
+        // callee-saved register at all, but with R15 already holding the
+        // driver label this submit is about to advance: it is the same
+        // address the recovered-object path computes for that owner. Publish
+        // through it rather than dropping the completion, which leaves the
+        // driver waiting at its next suspend point and hangs startup with
+        // nothing ever presented. The label must still sit in the packet's
+        // own release page, at a real slot, and the monotonic guard below
+        // rejects it if the contents do not look like this owner's counter.
+        const label = trace.currentGuestR15();
+        if (label == 0 or label == release.address or
+            label & 0x1f != 0 or
+            (label & ~@as(u64, 0xfff)) != release_page or
+            !memory.isGuestRangeAccessible(label, 8))
+        {
+            if (driver_completion_miss_reports < 4) {
+                std.debug.print(
+                    "[agc submit] SDK11 ACB queue unrecovered owner=0x{x} stream=0x{x} rbx=0x{x} rbp=0x{x} r15=0x{x} cached=0x{x}\n",
+                    .{
+                        owner,
+                        stream_address,
+                        trace.currentGuestRbx(),
+                        trace.currentGuestRbp(),
+                        label,
+                        rememberedSdk11AcbQueue(owner),
+                    },
+                );
+                driver_completion_miss_reports += 1;
+            }
+            return;
+        }
+        target = label;
+        generation = @truncate(release.data);
+    }
+    var previous: [8]u8 = undefined;
+    if (!readGuestMemory(null, target, &previous)) return;
+    const old = std.mem.readInt(u64, &previous, .little);
+    if (old >= generation or generation - old > 0x100) return;
+
+    std.mem.writeInt(u64, &previous, generation, .little);
+    if (!writeGuestMemory(null, target, &previous)) return;
+    kernel_runtime.wakeSyncAddress(target, std.math.maxInt(usize));
+    if (driver_completion_reports < 32) {
+        std.debug.print(
+            "[agc submit] completed SDK11 ACB generation owner=0x{x} label=0x{x}: 0x{x}->0x{x}\n",
+            .{ owner, target, old, generation },
+        );
+        driver_completion_reports += 1;
+    }
+}
+
+/// The SDK 11 graphics submit wrapper retains its queue state in R15. Its
+/// hidden CPU generation occupies the label immediately before the public DCB
+/// RELEASE_MEM target and is one generation ahead of that packet's payload.
+fn publishSdk11DcbDriverGeneration(
+    submission: Submission,
+    release: gpu.state.ReleaseMem,
+) void {
+    if (release.data_selection != 2 or
+        release.address & 0x1f != 0 or
+        release.data >= std.math.maxInt(u32)) return;
+    const stream_address = @intFromPtr(submission.address orelse return);
+    const queue_address = trace.currentGuestR15();
+    if (queue_address == 0 or !memory.isGuestRangeAccessible(queue_address, 0xb8)) {
+        if (driver_completion_miss_reports < 8) {
+            std.debug.print(
+                "[agc submit] SDK11 DCB queue pointer miss r15=0x{x} stream=0x{x}\n",
+                .{ queue_address, stream_address },
+            );
+            driver_completion_miss_reports += 1;
+        }
+        return;
+    }
+
+    var fields: [0xb8]u8 = undefined;
+    if (!readGuestMemory(null, queue_address, &fields)) return;
+    const queue_stream_a = std.mem.readInt(u64, fields[0x78..0x80], .little);
+    const queue_stream_b = std.mem.readInt(u64, fields[0x80..0x88], .little);
+    const label_index = std.mem.readInt(u32, fields[0xb4..0xb8], .little);
+    // The interrupt worker publishes the CPU-visible generation after
+    // SubmitDcb returns, so the corresponding field is deliberately still
+    // stale here. The packet-owned hardware generation is one behind the
+    // driver label this SDK waits at its following SuspendPoint.
+    const generation = release.data + 1;
+    const release_slot = (release.address & 0xfff) / 0x20;
+    if ((queue_stream_a != stream_address and queue_stream_b != stream_address) or
+        label_index >= 0x80 or
+        release_slot != @as(u64, label_index) + 1)
+    {
+        if (driver_completion_miss_reports < 8) {
+            std.debug.print(
+                "[agc submit] SDK11 DCB queue mismatch object=0x{x} stream=0x{x}/0x{x}/0x{x} generation=0x{x} index={d} release_slot={d}\n",
+                .{
+                    queue_address,
+                    stream_address,
+                    queue_stream_a,
+                    queue_stream_b,
+                    generation,
+                    label_index,
+                    release_slot,
+                },
+            );
+            driver_completion_miss_reports += 1;
+        }
+        return;
+    }
+
+    const label_page = release.address & ~@as(u64, 0xfff);
+    const target = label_page + @as(u64, label_index) * 0x20;
+    var previous: [8]u8 = undefined;
+    if (!readGuestMemory(null, target, &previous)) return;
+    const old = std.mem.readInt(u64, &previous, .little);
+    if (old >= generation or generation - old > 0x100) return;
+
+    std.mem.writeInt(u64, &previous, generation, .little);
+    if (!writeGuestMemory(null, target, &previous)) return;
+    kernel_runtime.wakeSyncAddress(target, std.math.maxInt(usize));
+    if (driver_completion_reports < 32) {
+        std.debug.print(
+            "[agc submit] completed SDK11 DCB generation label=0x{x}: 0x{x}->0x{x}\n",
+            .{ target, old, generation },
+        );
+        driver_completion_reports += 1;
+    }
+}
+
+fn adjacentAcbRetirementValue(
+    release_address: u64,
+    release_data: u64,
+    previous: u64,
+    completed: u64,
+    next: u64,
+    next_free: u64,
+    following_free: u64,
+) ?u64 {
+    if (release_address & 0x1f != 0 or release_data == 0 or completed != release_data) return null;
+    const slot = (release_address & 0xfff) / 0x20;
+    if (slot == 0 or slot > 0x7c or previous >= release_data or next > release_data) return null;
+    // Unallocated entries in this SDK's 32-byte label table contain their
+    // successor indices. Together with the still-allocated slot on either
+    // side, they make the preceding retirement pair self-describing and
+    // distinguish it from labels embedded in command data.
+    if (next_free != slot + 3 or following_free != slot + 4) return null;
+    return release_data;
+}
+
+/// The SDK 11 compute wrapper pairs a hardware label with the CPU-visible
+/// retirement label in the preceding 32-byte slot. Its interrupt path copies
+/// the completed generation; the synchronous renderer can publish the same
+/// transition immediately after the ordered RELEASE_MEM write.
+fn publishSdk11AcbRetirement(release: gpu.state.ReleaseMem) void {
+    if (release.data_selection != 2 or
+        release.address < 0x20 or
+        release.address > std.math.maxInt(u64) - 0x68) return;
+    var labels: [0x88]u8 = undefined;
+    if (!readGuestMemory(null, release.address - 0x20, &labels)) return;
+    const previous = std.mem.readInt(u64, labels[0x00..0x08], .little);
+    const completed = std.mem.readInt(u64, labels[0x20..0x28], .little);
+    const next = std.mem.readInt(u64, labels[0x40..0x48], .little);
+    const next_free = std.mem.readInt(u64, labels[0x60..0x68], .little);
+    const following_free = std.mem.readInt(u64, labels[0x80..0x88], .little);
+    const publish = adjacentAcbRetirementValue(
+        release.address,
+        release.data,
+        previous,
+        completed,
+        next,
+        next_free,
+        following_free,
+    ) orelse return;
+    // This is the process-wide 32-byte completion table. Later ACB arenas can
+    // carry packet-local RELEASE_MEM labels while their queue generation still
+    // indexes this shared page; remember the self-describing page once proven.
+    sdk11_acb_label_page.store(release.address & ~@as(u64, 0xfff), .release);
+
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, publish, .little);
+    const target = release.address - 0x20;
+    if (!writeGuestMemory(null, target, &bytes)) return;
+    kernel_runtime.wakeSyncAddress(target, std.math.maxInt(usize));
+    if (retirement_bridge_reports < 8) {
+        std.debug.print(
+            "[agc retirement] SDK11 ACB hardware=0x{x}/0x{x} cpu=0x{x} 0x{x}->0x{x}\n",
+            .{ release.address, completed, target, previous, publish },
+        );
+        retirement_bridge_reports += 1;
+    }
+}
+
+/// Compute completion is delivered under the queue-owner ident passed to
+/// SubmitAcb. The guest registers that exact ident with the graphics filter;
+/// its event handler then advances the paired CPU retirement generation.
+fn publishAcbCompletion(owner: u32, outcome: SubmitOutcome) void {
     if (!outcome.accepted or outcome.queued_interrupt) return;
-    enqueueCompletion(.{ .kind = .acb });
+    enqueueCompletion(.{ .kind = .acb, .context_id = owner });
 }
 
 /// A public graphics submission without an explicit interrupt still needs the
@@ -2172,21 +2678,55 @@ fn publishDcbCompletion(outcome: SubmitOutcome) void {
 fn submitDcb(descriptor: ?*const Submission) callconv(abi.guest) i32 {
     drainCompletionNotifications();
     const submission = if (descriptor) |value| value.* else return errno.ok;
+    if (trace.announces("sceAgcDriverSubmitDcb")) {
+        const rbp = trace.currentGuestRbp();
+        var frame: [0x80]u8 = undefined;
+        if (rbp >= frame.len and readGuestMemory(null, rbp - frame.len, &frame)) {
+            std.debug.print(
+                "[agc submit caller] rbp=0x{x} rbx=0x{x} r15=0x{x} batch_count={d}\n",
+                .{
+                    rbp,
+                    trace.currentGuestRbx(),
+                    trace.currentGuestR15(),
+                    std.mem.readInt(u32, frame[0x10..0x14], .little),
+                },
+            );
+        }
+    }
     const completion_label = driverCompletionLabel(descriptor.?, submission, 0);
+    sdk11_dcb_release_candidate = null;
+    sdk11_dcb_release_capture = true;
     const outcome = submitOne("dcb", descriptor, completion_label);
+    // The SDK 11 retirement DCB can indirectly reach the command-builder
+    // stream which owns R_FLIP.  Let that submitted chain consume the pending
+    // flip first; eagerly executing the builder here duplicated its tail,
+    // producing two presentations and replaying roughly sixty compute passes
+    // for every guest frame.  If this SDK really supplied only the small
+    // retirement buffer, the pending flip remains and the recovery path still
+    // executes the builder before this HLE call returns.
+    submitConstructedGraphicsStream();
+    sdk11_dcb_release_capture = false;
+    presentUnconsumedConstructedFlip(submission, outcome);
+    if (sdk11_dcb_release_candidate orelse outcome.last_release) |release| {
+        publishSdk11DcbDriverGeneration(submission, release);
+    }
     publishDcbCompletion(outcome);
     return errno.ok;
 }
 
 /// Compute work on a named queue.
-fn submitAcb(_: u32, descriptor: ?*const Submission) callconv(abi.guest) i32 {
+fn submitAcb(owner: u32, descriptor: ?*const Submission) callconv(abi.guest) i32 {
     drainCompletionNotifications();
     const submission = descriptor orelse return errno.ok;
     const stream = streamOf(submission.address, submission.word_count) orelse return errno.ok;
     const completion_label = driverCompletionLabel(submission, submission.*, 1);
     flushPendingGraphicsSegment();
     const outcome = acceptSubmitted("acb", stream, completion_label);
-    publishAcbCompletion(outcome);
+    if (outcome.last_release) |release| {
+        publishSdk11AcbDriverGeneration(owner, submission.*, release);
+        publishSdk11AcbRetirement(release);
+    }
+    publishAcbCompletion(owner, outcome);
     return errno.ok;
 }
 
@@ -2219,14 +2759,15 @@ pub fn submitMultiAcbs(
     count: u32,
 ) callconv(abi.guest) i32 {
     drainCompletionNotifications();
-    _ = queue;
     if (count == 0) return errno.ok;
     const buffers = addresses orelse return errno.KernelError.einval.raw();
     const sizes = word_counts orelse return errno.KernelError.einval.raw();
     for (0..count) |index| {
         const stream = streamOf(buffers[index], sizes[index]) orelse continue;
         flushPendingGraphicsSegment();
-        publishAcbCompletion(acceptSubmitted("acb", stream, null));
+        const outcome = acceptSubmitted("acb", stream, null);
+        if (outcome.last_release) |release| publishSdk11AcbRetirement(release);
+        publishAcbCompletion(queue, outcome);
     }
     return errno.ok;
 }
@@ -2254,6 +2795,30 @@ const testing = std.testing;
 
 fn command(opcode: u8, body_words: u14) u32 {
     return (@as(u32, 3) << 30) | (@as(u32, body_words - 1) << 16) | (@as(u32, opcode) << 8);
+}
+
+test "SDK11 DCB completion release selects the hardware slot after its CPU label" {
+    const release = gpu.state.ReleaseMem{
+        .event_type = 0x28,
+        .event_index = 5,
+        .gcr_control = 0,
+        .cache_policy = 0,
+        .destination = 1,
+        .interrupt = 0,
+        .data_selection = 2,
+        .address = 0x2000_0000_20,
+        .data = 0,
+        .interrupt_context_id = 0,
+        .standard_packet = false,
+    };
+    try testing.expect(isSdk11DcbCompletionRelease(release, 0x2000_0000_00, 0));
+
+    var unrelated = release;
+    unrelated.address += 0x20;
+    try testing.expect(!isSdk11DcbCompletionRelease(unrelated, 0x2000_0000_00, 0));
+    unrelated = release;
+    unrelated.data_selection = 1;
+    try testing.expect(!isSdk11DcbCompletionRelease(unrelated, 0x2000_0000_00, 0));
 }
 
 test "a submitted buffer is counted by what it contains" {
@@ -2754,6 +3319,56 @@ test "synchronous AGC completion advances a paired CPU retirement label" {
         84,
         0,
     ) == null);
+}
+
+test "SDK11 ACB retirement requires an adjacent self-describing label pair" {
+    const release_address: u64 = 0x2000_0004_80;
+    try testing.expectEqual(@as(?u64, 7), adjacentAcbRetirementValue(
+        release_address,
+        7,
+        6,
+        7,
+        0,
+        39,
+        40,
+    ));
+    try testing.expect(adjacentAcbRetirementValue(
+        release_address,
+        7,
+        6,
+        7,
+        0,
+        0,
+        0,
+    ) == null);
+    try testing.expect(adjacentAcbRetirementValue(
+        release_address,
+        7,
+        7,
+        7,
+        0,
+        39,
+        40,
+    ) == null);
+}
+
+test "SDK11 ACB generations switch from packet-local to the proven shared page" {
+    const release_page: u64 = 0x2011_937000;
+    const shared_page: u64 = 0x2000_000000;
+    try testing.expectEqual(
+        @as(?u64, release_page),
+        sdk11AcbGenerationPage(release_page, 0, 1, 1),
+    );
+    try testing.expect(sdk11AcbGenerationPage(release_page, 0, 2, 1) == null);
+    try testing.expectEqual(
+        @as(?u64, shared_page),
+        sdk11AcbGenerationPage(release_page, shared_page, 2, 1),
+    );
+    try testing.expectEqual(
+        @as(?u64, shared_page),
+        sdk11AcbGenerationPage(release_page, shared_page, 0x102, 1),
+    );
+    try testing.expect(sdk11AcbGenerationPage(release_page, shared_page, 1, 2) == null);
 }
 
 test "an empty submission is not a failure" {

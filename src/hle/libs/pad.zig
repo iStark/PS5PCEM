@@ -50,6 +50,9 @@ const auto_triangle_hold_us: u64 = 180 * std.time.us_per_s;
 const rapid_down_period_us: u64 = 16 * std.time.us_per_s;
 const rapid_down_hold_us: u64 = 15 * std.time.us_per_s;
 var auto_input_origin_us: std.atomic.Value(u64) = .init(0);
+var diagnostics_enabled: std.atomic.Value(u8) = .init(0);
+var diagnostic_last_buttons: std.atomic.Value(u32) = .init(std.math.maxInt(u32));
+var diagnostic_last_left_y: std.atomic.Value(u8) = .init(std.math.maxInt(u8));
 
 pub const AutomaticProfile = enum(u8) {
     default,
@@ -116,6 +119,9 @@ pub fn reset() void {
     open.store(0, .release);
     motion_sensor_enabled.store(0, .release);
     auto_input_origin_us.store(0, .release);
+    diagnostics_enabled.store(0, .release);
+    diagnostic_last_buttons.store(std.math.maxInt(u32), .release);
+    diagnostic_last_left_y.store(std.math.maxInt(u8), .release);
     automatic_profile.store(@intFromEnum(AutomaticProfile.default), .release);
     host_input.reset();
 }
@@ -123,6 +129,12 @@ pub fn reset() void {
 pub fn setAutomaticProfile(profile: AutomaticProfile) void {
     automatic_profile.store(@intFromEnum(profile), .release);
     auto_input_origin_us.store(0, .release);
+}
+
+pub fn setDiagnostics(enabled: bool) void {
+    diagnostics_enabled.store(@intFromBool(enabled), .release);
+    diagnostic_last_buttons.store(std.math.maxInt(u32), .release);
+    diagnostic_last_left_y.store(std.math.maxInt(u8), .release);
 }
 
 fn autoInputElapsedUs() u64 {
@@ -244,11 +256,30 @@ fn fillPadData(output: *PadData) void {
     }
 }
 
+fn reportPadData(output: *const PadData) void {
+    if (diagnostics_enabled.load(.acquire) == 0) return;
+    const previous_buttons = diagnostic_last_buttons.swap(output.buttons, .acq_rel);
+    const previous_left_y = diagnostic_last_left_y.swap(output.left_stick_y, .acq_rel);
+    if (previous_buttons == output.buttons and previous_left_y == output.left_stick_y) return;
+    std.debug.print(
+        "[pad state] elapsed_us={d} process_us={d} buttons=0x{x:0>8} left_y={d} mode={s} profile={s}\n",
+        .{
+            autoInputElapsedUs(),
+            kernel_runtime.processTimeMicroseconds(),
+            output.buttons,
+            output.left_stick_y,
+            @tagName(host_input.mode()),
+            @tagName(@as(AutomaticProfile, @enumFromInt(automatic_profile.load(.acquire)))),
+        },
+    );
+}
+
 fn padRead(handle: i32, output: ?[*]PadData, count: i32) callconv(abi.guest) i32 {
     if (!validHandle(handle)) return error_invalid_handle;
     const data = output orelse return error_invalid_argument;
     if (count < 1 or count > 64) return error_invalid_argument;
     fillPadData(&data[0]);
+    reportPadData(&data[0]);
     return 1;
 }
 
@@ -256,6 +287,7 @@ fn padReadState(handle: i32, output: ?*PadData) callconv(abi.guest) i32 {
     if (!validHandle(handle)) return error_invalid_handle;
     const data = output orelse return error_invalid_argument;
     fillPadData(data);
+    reportPadData(data);
     return errno.ok;
 }
 

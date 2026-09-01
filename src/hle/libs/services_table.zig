@@ -14,6 +14,7 @@ const font = @import("font.zig");
 const platform_services = @import("platform_services.zig");
 const playgo = @import("playgo.zig");
 const psml = @import("psml.zig");
+const videodec2 = @import("videodec2.zig");
 const trace = @import("../trace.zig");
 const symbols = @import("../symbols.zig");
 
@@ -99,12 +100,12 @@ pub const camera2_exports = [_]symbols.Export{
 };
 
 pub const errordialog_exports = [_]symbols.Export{
-    .{ .name = "sceErrorDialogInitialize", .function = trace.wrap("sceErrorDialogInitialize", &services.absent), .expect_id = "I88KChlynSs" },
-    .{ .name = "sceErrorDialogOpen", .function = trace.wrap("sceErrorDialogOpen", &services.absent), .expect_id = "M2ZF-ClLhgY" },
-    .{ .name = "sceErrorDialogUpdateStatus", .function = trace.wrap("sceErrorDialogUpdateStatus", &services.absent), .expect_id = "WWiGuh9XfgQ" },
-    .{ .name = "sceErrorDialogTerminate", .function = trace.wrap("sceErrorDialogTerminate", &services.absent), .expect_id = "9XAxK2PMwk8" },
-    .{ .name = "sceErrorDialogClose", .function = trace.wrap("sceErrorDialogClose", &services.accept), .expect_id = "ekXHb1kDBl0" },
-    .{ .name = "sceErrorDialogGetStatus", .function = trace.wrap("sceErrorDialogGetStatus", &services.saveDataDialogFinished), .expect_id = "t2FvHRXzgqk" },
+    .{ .name = "sceErrorDialogInitialize", .function = trace.wrap("sceErrorDialogInitialize", &dialogs.errorDialogInitialize), .expect_id = "I88KChlynSs" },
+    .{ .name = "sceErrorDialogOpen", .function = trace.wrap("sceErrorDialogOpen", &dialogs.errorDialogOpen), .expect_id = "M2ZF-ClLhgY" },
+    .{ .name = "sceErrorDialogUpdateStatus", .function = trace.wrap("sceErrorDialogUpdateStatus", &dialogs.errorDialogUpdateStatus), .expect_id = "WWiGuh9XfgQ" },
+    .{ .name = "sceErrorDialogTerminate", .function = trace.wrap("sceErrorDialogTerminate", &dialogs.errorDialogTerminate), .expect_id = "9XAxK2PMwk8" },
+    .{ .name = "sceErrorDialogClose", .function = trace.wrap("sceErrorDialogClose", &dialogs.errorDialogClose), .expect_id = "ekXHb1kDBl0" },
+    .{ .name = "sceErrorDialogGetStatus", .function = trace.wrap("sceErrorDialogGetStatus", &dialogs.errorDialogGetStatus), .expect_id = "t2FvHRXzgqk" },
 };
 
 pub const gamelivestreaming_exports = [_]symbols.Export{
@@ -284,9 +285,9 @@ pub const npmanager_exports = [_]symbols.Export{
     // Polling an empty callback queue is a successful no-op. Returning ENOSYS
     // makes Unity's frontend treat normal offline polling as a service fault.
     .{ .name = "sceNpCheckCallback", .function = trace.wrap("sceNpCheckCallback", &services.accept), .expect_id = "3Zl8BePTh9Y" },
-    .{ .name = "sceNpCreateRequest", .function = trace.wrap("sceNpCreateRequest", &services.offline), .expect_id = "GpLQDNKICac" },
+    .{ .name = "sceNpCreateRequest", .function = trace.wrap("sceNpCreateRequest", &services.npCreateRequest), .expect_id = "GpLQDNKICac" },
     .{ .name = "sceNpCheckPremium", .function = trace.wrap("sceNpCheckPremium", &services.offline), .expect_id = "O80NrhUOPGY" },
-    .{ .name = "sceNpDeleteRequest", .function = trace.wrap("sceNpDeleteRequest", &services.offline), .expect_id = "S7QTn72PrDw" },
+    .{ .name = "sceNpDeleteRequest", .function = trace.wrap("sceNpDeleteRequest", &services.npDeleteRequest), .expect_id = "S7QTn72PrDw" },
     .{ .name = "sceNpGetUserIdByAccountId", .function = trace.wrap("sceNpGetUserIdByAccountId", &services.offline), .expect_id = "VgYczPGB5ss" },
     .{ .name = "sceNpGetOnlineId", .function = trace.wrap("sceNpGetOnlineId", &services.npGetOnlineId), .expect_id = "XDncXQIJUSk" },
     // Registration itself is local and succeeds on an offline console.  No
@@ -506,16 +507,16 @@ pub const voiceqos_exports = [_]symbols.Export{
 };
 
 pub const videodec2_exports = [_]symbols.Export{
-    .{ .name = "sceVideodec2ReleaseComputeQueue", .function = trace.wrap("sceVideodec2ReleaseComputeQueue", &services.absent), .expect_id = "UvtA3FAiF4Y" },
-    .{ .name = "sceVideodec2Reset", .function = trace.wrap("sceVideodec2Reset", &services.absent), .expect_id = "wJXikG6QFN8" },
-    .{ .name = "sceVideodec2DeleteDecoder", .function = trace.wrap("sceVideodec2DeleteDecoder", &services.absent), .expect_id = "jwImxXRGSKA" },
-    .{ .name = "sceVideodec2QueryComputeMemoryInfo", .function = trace.wrap("sceVideodec2QueryComputeMemoryInfo", &services.absent), .expect_id = "RnDibcGCPKw" },
-    .{ .name = "sceVideodec2AllocateComputeQueue", .function = trace.wrap("sceVideodec2AllocateComputeQueue", &services.absent), .expect_id = "eD+X2SmxUt4" },
-    .{ .name = "sceVideodec2Decode", .function = trace.wrap("sceVideodec2Decode", &services.absent), .expect_id = "852F5+q6+iM" },
-    .{ .name = "sceVideodec2QueryDecoderMemoryInfo", .function = trace.wrap("sceVideodec2QueryDecoderMemoryInfo", &services.absent), .expect_id = "qqMCwlULR+E" },
-    .{ .name = "sceVideodec2GetPictureInfo", .function = trace.wrap("sceVideodec2GetPictureInfo", &services.absent), .expect_id = "NtXRa3dRzU0" },
-    .{ .name = "sceVideodec2CreateDecoder", .function = trace.wrap("sceVideodec2CreateDecoder", &services.absent), .expect_id = "CNNRoRYd8XI" },
-    .{ .name = "sceVideodec2Flush", .function = trace.wrap("sceVideodec2Flush", &services.absent), .expect_id = "l1hXwscLuCY" },
+    .{ .name = "sceVideodec2ReleaseComputeQueue", .function = trace.wrap("sceVideodec2ReleaseComputeQueue", &videodec2.releaseComputeQueue), .expect_id = "UvtA3FAiF4Y" },
+    .{ .name = "sceVideodec2Reset", .function = trace.wrap("sceVideodec2Reset", &videodec2.reset), .expect_id = "wJXikG6QFN8" },
+    .{ .name = "sceVideodec2DeleteDecoder", .function = trace.wrap("sceVideodec2DeleteDecoder", &videodec2.deleteDecoder), .expect_id = "jwImxXRGSKA" },
+    .{ .name = "sceVideodec2QueryComputeMemoryInfo", .function = trace.wrap("sceVideodec2QueryComputeMemoryInfo", &videodec2.queryComputeMemoryInfo), .expect_id = "RnDibcGCPKw" },
+    .{ .name = "sceVideodec2AllocateComputeQueue", .function = trace.wrap("sceVideodec2AllocateComputeQueue", &videodec2.allocateComputeQueue), .expect_id = "eD+X2SmxUt4" },
+    .{ .name = "sceVideodec2Decode", .function = trace.wrap("sceVideodec2Decode", &videodec2.decode), .expect_id = "852F5+q6+iM" },
+    .{ .name = "sceVideodec2QueryDecoderMemoryInfo", .function = trace.wrap("sceVideodec2QueryDecoderMemoryInfo", &videodec2.queryDecoderMemoryInfo), .expect_id = "qqMCwlULR+E" },
+    .{ .name = "sceVideodec2GetPictureInfo", .function = trace.wrap("sceVideodec2GetPictureInfo", &videodec2.getPictureInfo), .expect_id = "NtXRa3dRzU0" },
+    .{ .name = "sceVideodec2CreateDecoder", .function = trace.wrap("sceVideodec2CreateDecoder", &videodec2.createDecoder), .expect_id = "CNNRoRYd8XI" },
+    .{ .name = "sceVideodec2Flush", .function = trace.wrap("sceVideodec2Flush", &videodec2.flush), .expect_id = "l1hXwscLuCY" },
 };
 
 pub const vrtracker2_exports = [_]symbols.Export{

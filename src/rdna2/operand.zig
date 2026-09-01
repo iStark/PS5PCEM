@@ -32,6 +32,8 @@ pub const Operand = struct {
     sdwa_dst_unused: u2 = 0,
     omod: u2 = 0,
     dpp_ctrl: u9 = 0,
+    /// Eight three-bit lane selectors packed from the DPP8 extension word.
+    dpp8_selectors: u24 = 0,
     dpp_row_mask: u4 = 0xf,
     dpp_bank_mask: u4 = 0xf,
     sdwa_sext: bool = false,
@@ -44,6 +46,7 @@ pub const Operand = struct {
     absolute: bool = false,
     clamp: bool = false,
     dpp: bool = false,
+    dpp8: bool = false,
 
     /// Whether this operand refers to a literal stored in the following word.
     pub fn isLiteral(self: Operand) bool {

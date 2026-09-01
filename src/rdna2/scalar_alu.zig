@@ -44,9 +44,11 @@ const sop1_table = buildTable(256, &.{
     .{ 0x10, .s_bcnt1_i32_b64 },
     .{ 0x13, .s_ff1_i32_b32 },
     .{ 0x14, .s_ff1_i32_b64 },
+    .{ 0x15, .s_flbit_i32_b32 },
     .{ 0x16, .s_flbit_i32_b64 },
     .{ 0x2d, .s_quadmask_b64 },
     .{ 0x1b, .s_bitset0_b32 },
+    .{ 0x1c, .s_bitset0_b64 },
     .{ 0x1d, .s_bitset1_b32 },
     .{ 0x1f, .s_getpc_b64 },
     .{ 0x20, .s_setpc_b64 },
@@ -418,6 +420,10 @@ test "s_branch resolves its target relative to the next instruction" {
 test "scalar opcode table covers RDNA2 encodings previously left unsupported" {
     const ff1 = try decodeSop1(0, &.{0xbe80_1400}, 0);
     try std.testing.expectEqual(Opcode.s_ff1_i32_b64, ff1.opcode);
+    const flbit32 = try decodeSop1(0, &.{0xbe80_1500}, 0);
+    try std.testing.expectEqual(Opcode.s_flbit_i32_b32, flbit32.opcode);
+    const bitset0_64 = try decodeSop1(0, &.{0xbe82_1c6a}, 0);
+    try std.testing.expectEqual(Opcode.s_bitset0_b64, bitset0_64.opcode);
     const quadmask = try decodeSop1(0, &.{0xbe80_2d00}, 0);
     try std.testing.expectEqual(Opcode.s_quadmask_b64, quadmask.opcode);
     const bfe = try decodeSop2(0, &.{0x1400_0001}, 0);

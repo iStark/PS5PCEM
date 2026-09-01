@@ -71,7 +71,42 @@ pub const Record = struct {
 /// enough, because the only question here is which calls came from the same
 /// thread.
 threadlocal var thread_ordinal: u32 = 0;
+threadlocal var guest_rbx: u64 = 0;
+threadlocal var guest_rbp: u64 = 0;
+threadlocal var guest_r15: u64 = 0;
 var next_thread_ordinal = std.atomic.Value(u32).init(1);
+
+inline fn captureGuestCalleeSaved() void {
+    if (comptime abi.can_run_guest_code) {
+        const captured_rbx = asm volatile ("movq %%rbx, %%rax"
+            : [value] "={rax}" (-> u64),
+        );
+        const captured_rbp = asm volatile ("movq %%rbp, %%rax"
+            : [value] "={rax}" (-> u64),
+        );
+        const captured_r15 = asm volatile ("movq %%r15, %%rax"
+            : [value] "={rax}" (-> u64),
+        );
+        guest_rbx = captured_rbx;
+        guest_rbp = captured_rbp;
+        guest_r15 = captured_r15;
+    }
+}
+
+/// Callee-saved RBX observed by the generated System V thunk before it moves
+/// the call onto the host firmware stack. Some private SDK submission layouts
+/// retain their queue object only in this register.
+pub fn currentGuestRbx() u64 {
+    return guest_rbx;
+}
+
+pub fn currentGuestRbp() u64 {
+    return guest_rbp;
+}
+
+pub fn currentGuestR15() u64 {
+    return guest_r15;
+}
 
 fn currentThreadOrdinal() u32 {
     if (thread_ordinal == 0) thread_ordinal = next_thread_ordinal.fetchAdd(1, .monotonic);
@@ -265,6 +300,7 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
         },
         1 => struct {
             fn call(a0: P.t(0)) callconv(abi.guest) Result {
+                captureGuestCalleeSaved();
                 const args = [_]u64{word(a0)};
                 enter(name, &args, @returnAddress());
                 return finish(name, host_stack.call(Result, func, .{a0}), &args);
@@ -272,6 +308,7 @@ pub fn wrap(comptime name: []const u8, comptime func: anytype) abi.RawEntryPoint
         },
         2 => struct {
             fn call(a0: P.t(0), a1: P.t(1)) callconv(abi.guest) Result {
+                captureGuestCalleeSaved();
                 const args = [_]u64{ word(a0), word(a1) };
                 enter(name, &args, @returnAddress());
                 return finish(name, host_stack.call(Result, func, .{ a0, a1 }), &args);

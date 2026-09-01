@@ -117,6 +117,7 @@ pub const structure_type_physical_device_features_2: u32 = 1_000_059_000;
 pub const structure_type_descriptor_set_layout_binding_flags_create_info: u32 = 1_000_161_000;
 pub const structure_type_physical_device_descriptor_indexing_features: u32 = 1_000_161_001;
 pub const structure_type_physical_device_timeline_semaphore_features: u32 = 1_000_207_000;
+pub const structure_type_physical_device_shader_atomic_float_2_features_ext: u32 = 1_000_273_000;
 pub const structure_type_semaphore_type_create_info: u32 = 1_000_207_002;
 pub const structure_type_timeline_semaphore_submit_info: u32 = 1_000_207_003;
 pub const structure_type_semaphore_wait_info: u32 = 1_000_207_004;
@@ -332,6 +333,11 @@ pub const LayerProperties = extern struct {
     description: [256]u8,
 };
 
+pub const ExtensionProperties = extern struct {
+    extension_name: [256]u8,
+    spec_version: u32,
+};
+
 pub const QueueFamilyProperties = extern struct {
     queue_flags: Flags,
     queue_count: u32,
@@ -366,6 +372,7 @@ pub const feature_geometry_shader: usize = 4;
 pub const feature_fragment_stores_and_atomics: usize = 26;
 pub const feature_shader_image_gather_extended: usize = 28;
 pub const feature_shader_storage_image_extended_formats: usize = 29;
+pub const feature_shader_float64: usize = 39;
 
 pub const PhysicalDeviceFeatures2 = extern struct {
     s_type: u32 = structure_type_physical_device_features_2,
@@ -402,6 +409,23 @@ pub const PhysicalDeviceDescriptorIndexingFeatures = extern struct {
     descriptor_binding_partially_bound: Bool32 = 0,
     descriptor_binding_variable_descriptor_count: Bool32 = 0,
     runtime_descriptor_array: Bool32 = 0,
+};
+
+pub const PhysicalDeviceShaderAtomicFloat2FeaturesEXT = extern struct {
+    s_type: u32 = structure_type_physical_device_shader_atomic_float_2_features_ext,
+    p_next: ?*anyopaque = null,
+    shader_buffer_float16_atomics: Bool32 = 0,
+    shader_buffer_float16_atomic_add: Bool32 = 0,
+    shader_buffer_float16_atomic_min_max: Bool32 = 0,
+    shader_buffer_float32_atomic_min_max: Bool32 = 0,
+    shader_buffer_float64_atomic_min_max: Bool32 = 0,
+    shader_shared_float16_atomics: Bool32 = 0,
+    shader_shared_float16_atomic_add: Bool32 = 0,
+    shader_shared_float16_atomic_min_max: Bool32 = 0,
+    shader_shared_float32_atomic_min_max: Bool32 = 0,
+    shader_shared_float64_atomic_min_max: Bool32 = 0,
+    shader_image_float32_atomic_min_max: Bool32 = 0,
+    sparse_image_float32_atomic_min_max: Bool32 = 0,
 };
 
 pub const DeviceCreateInfo = extern struct {
@@ -1058,6 +1082,7 @@ pub const PfnCreateInstance = *const fn (*const InstanceCreateInfo, ?*const anyo
 
 pub const PfnDestroyInstance = *const fn (Instance, ?*const anyopaque) callconv(call) void;
 pub const PfnEnumeratePhysicalDevices = *const fn (Instance, *u32, ?[*]PhysicalDevice) callconv(call) Result;
+pub const PfnEnumerateDeviceExtensionProperties = *const fn (PhysicalDevice, ?[*:0]const u8, *u32, ?[*]ExtensionProperties) callconv(call) Result;
 pub const PfnGetPhysicalDeviceProperties = *const fn (PhysicalDevice, *anyopaque) callconv(call) void;
 pub const PfnGetPhysicalDeviceFeatures = *const fn (PhysicalDevice, *PhysicalDeviceFeatures) callconv(call) void;
 pub const PfnGetPhysicalDeviceFeatures2 = *const fn (PhysicalDevice, *PhysicalDeviceFeatures2) callconv(call) void;

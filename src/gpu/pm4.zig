@@ -172,6 +172,10 @@ pub const draw_preamble: u8 = 0x36;
 pub const write_data: u8 = 0x37;
 pub const draw_index_indirect_multi: u8 = 0x38;
 pub const mem_semaphore: u8 = 0x39;
+/// Prospero's indexed multi-instance packet. The body carries both the index
+/// stream and an optional per-instance object-ID table; AMD names the same
+/// opcode DISPATCH_DRAW_PREAMBLE in the public command-processor tables.
+pub const dispatch_draw_preamble: u8 = 0x3a;
 pub const copy_dw: u8 = 0x3b;
 pub const wait_reg_mem: u8 = 0x3c;
 pub const indirect_buffer: u8 = 0x3f;
@@ -292,6 +296,7 @@ pub fn opcodeName(opcode: u8) ?[]const u8 {
         write_data => "WRITE_DATA",
         draw_index_indirect_multi => "DRAW_INDEX_INDIRECT_MULTI",
         mem_semaphore => "MEM_SEMAPHORE",
+        dispatch_draw_preamble => "DISPATCH_DRAW_PREAMBLE",
         copy_dw => "COPY_DW",
         wait_reg_mem => "WAIT_REG_MEM",
         indirect_buffer => "INDIRECT_BUFFER",
@@ -349,6 +354,7 @@ pub fn isDraw(opcode: u8) bool {
         draw_index_multi_auto,
         draw_index_offset_2,
         draw_index_indirect_multi,
+        dispatch_draw_preamble,
         => true,
         else => false,
     };
@@ -813,6 +819,8 @@ test "every named opcode round-trips through its own constant" {
     try testing.expectEqualStrings("SET_CONTEXT_REG_INDIRECT", opcodeName(0x9f).?);
     try testing.expectEqualStrings("RELEASE_MEM", opcodeName(0x49).?);
     try testing.expectEqualStrings("INDIRECT_BUFFER", opcodeName(0x3f).?);
+    try testing.expectEqualStrings("DISPATCH_DRAW_PREAMBLE", opcodeName(0x3a).?);
+    try testing.expect(isDraw(dispatch_draw_preamble));
     try testing.expect(opcodeName(0x14) == null);
 }
 

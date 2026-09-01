@@ -222,6 +222,8 @@ fn dsInfo(id: u32) ?MemoryInfo {
         0x3c => .{ .opcode = .ds_read_ushort, .bits = 16 },
         0x3d => .{ .opcode = .ds_consume },
         0x3e => .{ .opcode = .ds_append },
+        0x40 => .{ .opcode = .ds_add_u64, .words = 2 },
+        0x4a => .{ .opcode = .ds_or_b64, .words = 2 },
         0x4d => .{ .opcode = .ds_write_b64, .words = 2 },
         0x4e => .{ .opcode = .ds_write2_b64, .words = 4 },
         0x4f => .{ .opcode = .ds_write2st64_b64, .words = 4 },
@@ -271,7 +273,7 @@ pub fn decodeDs(pc: u32, code: []const u32, word_index: u32) Error!Instruction {
     inst.src2 = try operand.decodeVectorGpr((word1 >> 16) & 0xff);
     inst.src_count = switch (id) {
         0x0e, 0x0f, 0x4e, 0x4f => 3,
-        0x0d, 0x00, 0x01, 0x05...0x0b, 0x12, 0x13, 0x1e, 0x1f, 0x20, 0x21, 0x25...0x2b, 0x2d => 2,
+        0x0d, 0x00, 0x01, 0x05...0x0b, 0x12, 0x13, 0x1e, 0x1f, 0x20, 0x21, 0x25...0x2b, 0x2d, 0x40, 0x4a => 2,
         0xb0 => 1,
         0xb1, 0x3d, 0x3e => 0,
         else => 1,
@@ -292,6 +294,7 @@ fn mimgOpcode(id: u32) isa.Opcode {
         0x18 => .image_atomic_and,
         0x19 => .image_atomic_or,
         0x1a => .image_atomic_xor,
+        0x1f => .image_atomic_fmax,
         0x20...0x3f, 0x68...0x6f, 0xa0...0xbe => .image_sample,
         0x47, 0x48, 0x4f, 0x57, 0x58, 0x5f, 0x61 => .image_gather4,
         0x60 => .image_get_lod,
@@ -381,7 +384,12 @@ pub fn decodeMimg(pc: u32, code: []const u32, word_index: u32) Error!Instruction
         .dim_2d_msaa_array => 4,
     };
     inst.image_address_components = coordinate_components;
-    if (op == .image_sample) {
+    // IMAGE_*_MIP appends an explicit integer mip level after DIM's texel
+    // coordinates. Without counting it the following VGPR is omitted from
+    // NSA/consecutive-address reconstruction and LOAD_MIP cannot be lowered.
+    if (op == .image_load_mip or op == .image_store_mip) {
+        inst.image_address_components += 1;
+    } else if (op == .image_sample) {
         inst.image_address_components += @intFromBool(inst.image_sample_flags.offset);
         inst.image_address_components += @intFromBool(inst.image_sample_flags.compare);
         inst.image_address_components += @intFromBool(inst.image_sample_flags.lod);
@@ -450,6 +458,13 @@ test "MIMG NSA words are retained in the instruction length" {
     try std.testing.expectEqual(@as(u32, 4), inst.word_count);
     try std.testing.expectEqual(@as(u8, 1), inst.image_nsa_address[0]);
     try std.testing.expectEqual(@as(u8, 8), inst.image_nsa_address[7]);
+}
+
+test "MIMG explicit-mip operations include the mip address VGPR" {
+    const code = [_]u32{ 0xf004_0108, 0x000a_0c00 };
+    const inst = try decodeMimg(0x64, &code, 0);
+    try std.testing.expectEqual(isa.Opcode.image_load_mip, inst.opcode);
+    try std.testing.expectEqual(@as(u8, 3), inst.image_address_components);
 }
 
 test "MIMG gather retains result width and offset address layout" {
@@ -570,10 +585,36 @@ test "DS swizzle consume and 64-bit pair encodings decode" {
     try std.testing.expectEqual(@as(i32, 512), write2st.secondary_memory_offset);
 }
 
+test "DS 64-bit OR decodes its address and data pair" {
+    const inst = try decodeDs(0x6f0, &.{ 0xd928_0000, 0x0000_0307 }, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_or_b64, inst.opcode);
+    try std.testing.expectEqual(@as(u8, 2), inst.data_words);
+    try std.testing.expectEqual(@as(u32, 7), inst.src0.reg);
+    try std.testing.expectEqual(@as(u32, 3), inst.src1.reg);
+}
+
+test "DS 64-bit add decodes captured Yotei instruction" {
+    const inst = try decodeDs(0x2c8, &.{ 0xd900_0000, 0x0000_0307 }, 0);
+    try std.testing.expectEqual(isa.Opcode.ds_add_u64, inst.opcode);
+    try std.testing.expectEqual(@as(u8, 2), inst.data_words);
+    try std.testing.expectEqual(@as(u32, 7), inst.src0.reg);
+    try std.testing.expectEqual(@as(u32, 3), inst.src1.reg);
+    try std.testing.expectEqual(@as(u8, 2), inst.src_count);
+}
+
 test "MIMG r128 flag is taken from the first encoding word" {
     const code = [_]u32{ (@as(u32, 0x20) << 18) | (1 << 15), 0 };
     const inst = try decodeMimg(0, &code, 0);
     try std.testing.expect(inst.image_r128);
+}
+
+test "MIMG floating-point maximum atomic decodes" {
+    const inst = try decodeMimg(0x1f0, &.{ 0xf07c_0108, 0x0001_0508 }, 0);
+    try std.testing.expectEqual(isa.Opcode.image_atomic_fmax, inst.opcode);
+    try std.testing.expectEqual(@as(u4, 1), inst.data_mask);
+    try std.testing.expectEqual(@as(u32, 5), inst.dst.reg);
+    try std.testing.expectEqual(@as(u32, 8), inst.src0.reg);
+    try std.testing.expectEqual(@as(u32, 4), inst.src1.reg);
 }
 
 test "MUBUF floating-point atomics decode" {

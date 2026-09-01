@@ -102,11 +102,16 @@ comptime {
 /// `args` is a tuple matching the function's parameters. The result travels
 /// back through the same memory the arguments went out in, so floating-point
 /// and aggregate returns need no special handling.
-pub inline fn call(comptime Result: type, comptime func: anytype, args: anytype) Result {
-    if (!supported or active) return @call(.auto, func, args);
+pub fn call(comptime Result: type, comptime func: anytype, args: anytype) Result {
+    // Keep the firmware implementation outside this dispatcher.  Inlining it
+    // into either fallback branch makes LLVM reserve the implementation's
+    // entire frame before we have switched stacks.  Codec entry points can
+    // need hundreds of kilobytes even when the switched path is the one that
+    // will actually run.
+    if (!supported or active) return @call(.never_inline, func, args);
 
     const stack_top = top();
-    if (stack_top == 0) return @call(.auto, func, args);
+    if (stack_top == 0) return @call(.never_inline, func, args);
 
     const Args = @TypeOf(args);
     const Frame = struct {
@@ -118,9 +123,9 @@ pub inline fn call(comptime Result: type, comptime func: anytype, args: anytype)
         fn invoke(raw: *anyopaque) callconv(.c) void {
             const frame: *Frame = @ptrCast(@alignCast(raw));
             if (Result == void) {
-                @call(.auto, func, frame.arguments);
+                @call(.never_inline, func, frame.arguments);
             } else {
-                frame.result = @call(.auto, func, frame.arguments);
+                frame.result = @call(.never_inline, func, frame.arguments);
             }
         }
     };

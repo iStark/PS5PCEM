@@ -49,11 +49,15 @@ pub fn formatOperand(op: Operand, w: *Writer) Writer.Error!void {
     }
     if (op.sdwa_dst_unused != 0) try w.print(":dst_u{d}", .{op.sdwa_dst_unused});
     if (op.dpp) {
-        try w.print(":dpp(0x{x},row=0x{x},bank=0x{x}", .{
-            op.dpp_ctrl,
-            op.dpp_row_mask,
-            op.dpp_bank_mask,
-        });
+        if (op.dpp8) {
+            try w.print(":dpp8(0x{x}", .{op.dpp8_selectors});
+        } else {
+            try w.print(":dpp(0x{x},row=0x{x},bank=0x{x}", .{
+                op.dpp_ctrl,
+                op.dpp_row_mask,
+                op.dpp_bank_mask,
+            });
+        }
         if (op.dpp_fetch_inactive) try w.writeAll(",fi");
         if (op.dpp_bound_ctrl) try w.writeAll(",bc");
         try w.writeAll(")");

@@ -28,10 +28,12 @@ const errno = @import("../errno.zig");
 const symbols = @import("../symbols.zig");
 const event_queue = @import("kernel_event_queue.zig");
 const kernel_memory = @import("kernel_memory.zig");
+const kernel_threading = @import("kernel_threading.zig");
 const agc_submit = @import("agc_submit.zig");
 
 var eop_patch_reports: u32 = 0;
 var wait_patch_reports: u32 = 0;
+var command_buffer_grow_reports: u32 = 0;
 
 /// The cursor a title keeps over its command buffer.
 ///
@@ -63,16 +65,7 @@ pub const command_words: u32 = 4;
 /// it afterwards, or null when it does not fit — the answer the library gives
 /// for a buffer with no room left.
 fn appendNop(state: ?*CommandBuffer, words: u32) ?[*]u32 {
-    const buffer = state orelse return null;
-    if (words == 0) return null;
-
-    const cursor = buffer.cursor_up orelse buffer.bottom orelse return null;
-    const top = buffer.top orelse return null;
-
-    const at = @intFromPtr(cursor);
-    const end = @intFromPtr(top);
-    const needed = @as(usize, words) * @sizeOf(u32);
-    if (at > end or end - at < needed) return null;
+    const cursor = reserveDwords(state, words) orelse return null;
 
     // A no-operation carries a body like any other command, and its header
     // states that body's length. Writing the header alone would leave the words
@@ -82,7 +75,6 @@ fn appendNop(state: ?*CommandBuffer, words: u32) ?[*]u32 {
         (@as(u32, gpu.pm4.nop) << 8);
     for (cursor[1..words]) |*word| word.* = 0;
 
-    buffer.cursor_up = cursor + words;
     return cursor;
 }
 
@@ -102,15 +94,109 @@ pub fn writeCommand(
     return appendNop(buffer, command_words);
 }
 
-fn reserveDwords(state: ?*CommandBuffer, words: u32) ?[*]u32 {
+/// Size query paired with the generic four-word placeholder commands.
+///
+/// GetSize entry points do not receive a command-buffer cursor.  Keeping a
+/// six-register signature is intentional: it lets the shared trace wrapper
+/// record the variant-specific arguments without ever interpreting the first
+/// one as a pointer.
+pub fn commandSize(
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) u32 {
+    return command_words * @sizeOf(u32);
+}
+
+/// Gates the following command-buffer words on a 32-bit guest predicate.
+///
+/// Unlike the generic placeholders this packet changes which later commands
+/// reach the command processor, so both its real width and payload matter.
+pub fn condExec(
+    buffer: ?*CommandBuffer,
+    predicate_address: u64,
+    command_words_to_execute: u32,
+) callconv(abi.guest) ?[*]u32 {
+    if (predicate_address == 0 or predicate_address & 3 != 0 or
+        command_words_to_execute > 0x3fff) return null;
+    const body = [_]u32{
+        @as(u32, @truncate(predicate_address)) & 0xffff_fffc,
+        @truncate(predicate_address >> 32),
+        0,
+        command_words_to_execute,
+    };
+    return writePacket(buffer, gpu.pm4.cond_exec, 0, &body);
+}
+
+pub fn condExecGetSize() callconv(abi.guest) u32 {
+    return 5 * @sizeOf(u32);
+}
+
+fn availableDwords(buffer: *const CommandBuffer) u32 {
+    const cursor = buffer.cursor_up orelse buffer.bottom orelse return 0;
+    // SDK 11 command buffers reserve the tail between cursor_down and top for
+    // the grow callback's chain packet.  Older wrappers only populated top,
+    // so retaining it as a fallback keeps those buffers usable.
+    const end_cursor = buffer.cursor_down orelse buffer.top orelse return 0;
+    const at = @intFromPtr(cursor);
+    const end = @intFromPtr(end_cursor);
+    if (at >= end) return 0;
+    const physical_words = @min((end - at) / @sizeOf(u32), std.math.maxInt(u32));
+    if (physical_words <= buffer.reserved_dwords) return 0;
+    return @intCast(physical_words - buffer.reserved_dwords);
+}
+
+/// Reserves command words, asking the title to attach another arena when the
+/// current one is exhausted.  The callback also writes the chain packet into
+/// the reserved tail of the old arena, so bypassing it loses every command
+/// emitted after the first segment.
+pub fn reserveDwords(state: ?*CommandBuffer, words: u32) ?[*]u32 {
     const buffer = state orelse return null;
     if (words == 0) return null;
+
+    if (availableDwords(buffer) < words) {
+        const callback = buffer.callback orelse return null;
+        const requested = std.math.add(u32, words, buffer.reserved_dwords) catch return null;
+        const callback_address = @intFromPtr(callback);
+        const buffer_address = @intFromPtr(buffer);
+        const user_data = if (buffer.user_data) |pointer| @intFromPtr(pointer) else 0;
+        const result = kernel_threading.callGuestCurrent(
+            callback_address,
+            &.{ buffer_address, requested, user_data },
+        ) catch |err| {
+            if (command_buffer_grow_reports < 16) {
+                std.debug.print(
+                    "[agc buffer] grow callback failed buffer=0x{x} callback=0x{x} need={d}: {s}\n",
+                    .{ buffer_address, callback_address, requested, @errorName(err) },
+                );
+                command_buffer_grow_reports += 1;
+            }
+            return null;
+        };
+        if (result == 0 or availableDwords(buffer) < words) {
+            if (command_buffer_grow_reports < 16) {
+                std.debug.print(
+                    "[agc buffer] grow rejected buffer=0x{x} callback=0x{x} result=0x{x} need={d} available={d}\n",
+                    .{ buffer_address, callback_address, result, words, availableDwords(buffer) },
+                );
+                command_buffer_grow_reports += 1;
+            }
+            return null;
+        }
+        if (command_buffer_grow_reports < 16) {
+            std.debug.print(
+                "[agc buffer] grew buffer=0x{x} callback=0x{x} need={d} available={d}\n",
+                .{ buffer_address, callback_address, words, availableDwords(buffer) },
+            );
+            command_buffer_grow_reports += 1;
+        }
+    }
+
     const cursor = buffer.cursor_up orelse buffer.bottom orelse return null;
-    const top = buffer.top orelse return null;
     const at = @intFromPtr(cursor);
-    const end = @intFromPtr(top);
-    const needed = @as(usize, words) * @sizeOf(u32);
-    if (at > end or end - at < needed) return null;
     buffer.cursor_up = cursor + words;
     agc_submit.trackGraphicsCommandAllocation(at, words);
     return cursor;
@@ -192,6 +278,40 @@ fn emitIndirectDrawMulti(
         indirectDrawInitiator(modifier),
     };
     return writePacket(buffer, opcode, 0, &body);
+}
+
+fn directDrawInitiator(modifier: u64) u32 {
+    if (modifier & (@as(u64, 1) << 32) != 0) return 0;
+    return (@as(u32, @truncate(modifier)) >> 3) & 0x20;
+}
+
+/// Emits Prospero's indexed multi-instance packet instead of the old NOP
+/// placeholder. Yotei builds its scene object batches through this entry
+/// point; dropping it leaves the later visibility/ID image entirely empty.
+pub fn drawIndexMultiInstanced(
+    buffer: ?*CommandBuffer,
+    index_count: u32,
+    index_address: u64,
+    object_ids_address: u64,
+    instance_count: u32,
+    modifier: u64,
+) callconv(abi.guest) ?[*]u32 {
+    if (index_address == 0 or object_ids_address == 0 or index_address & 1 != 0) return null;
+    const body = [_]u32{
+        index_count,
+        @truncate(index_address),
+        @truncate(index_address >> 32),
+        @max(instance_count, 1),
+        @truncate(object_ids_address),
+        @truncate(object_ids_address >> 32),
+        instance_count,
+        directDrawInitiator(modifier) | 0x80,
+    };
+    return writePacket(buffer, gpu.pm4.dispatch_draw_preamble, 0, &body);
+}
+
+pub fn drawIndexMultiInstancedGetSize() callconv(abi.guest) u32 {
+    return 9 * @sizeOf(u32);
 }
 
 pub fn setBaseIndirectArgs(
@@ -293,6 +413,35 @@ pub fn drawIndexIndirectMultiGetSize() callconv(abi.guest) u32 {
 /// there is no field whose value would change anything, and a title doing this
 /// is doing something ordinary that there is no reason to stop.
 pub fn patchCommand(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
+fn condExecPacket(command_address: u64) ?*[5]u32 {
+    if (command_address == 0 or
+        !kernel_memory.isGuestRangeAccessible(command_address, 5 * @sizeOf(u32))) return null;
+    const words: *[5]u32 = @ptrFromInt(command_address);
+    const header = words[0];
+    if ((header >> 30) != 3 or @as(u8, @truncate(header >> 8)) != gpu.pm4.cond_exec) return null;
+    return words;
+}
+
+/// Extends an existing COND_EXEC packet through `range_end`.
+pub fn patchCondExecEnd(command_address: u64, range_end: u64) callconv(abi.guest) i32 {
+    const words = condExecPacket(command_address) orelse return errno.KernelError.einval.raw();
+    const packet_end = command_address + 5 * @sizeOf(u32);
+    if (range_end < packet_end or range_end & 3 != 0) return errno.KernelError.einval.raw();
+    const count = (range_end - packet_end) / @sizeOf(u32);
+    if (count > 0x3fff) return errno.KernelError.einval.raw();
+    words[4] = (words[4] & ~@as(u32, 0x3fff)) | @as(u32, @intCast(count));
+    return errno.ok;
+}
+
+/// Moves an existing COND_EXEC packet to a different predicate word.
+pub fn patchCondExecCommandAddress(command_address: u64, predicate_address: u64) callconv(abi.guest) i32 {
+    if (predicate_address == 0 or predicate_address & 3 != 0) return errno.KernelError.einval.raw();
+    const words = condExecPacket(command_address) orelse return errno.KernelError.einval.raw();
+    words[1] = (words[1] & 3) | (@as(u32, @truncate(predicate_address)) & 0xffff_fffc);
+    words[2] = @truncate(predicate_address >> 32);
     return errno.ok;
 }
 
@@ -671,6 +820,24 @@ test "the cursor moves by exactly what was written" {
     try testing.expectEqual(storage[0..].ptr + command_words, buffer.cursor_up.?);
 }
 
+test "COND_EXEC has its hardware width and patchable fields" {
+    var storage: [8]u32 = @splat(0xdead_beef);
+    var buffer = fixture(&storage);
+    try testing.expectEqual(@as(u32, 20), condExecGetSize());
+    const command = condExec(&buffer, 0x1234_5678, 7).?;
+    try testing.expectEqual(storage[0..].ptr + 5, buffer.cursor_up.?);
+
+    var walker = gpu.pm4.Walker.init(storage[0..5]);
+    const packet = (try walker.next()).?;
+    try testing.expectEqual(gpu.pm4.cond_exec, packet.opcode);
+    try testing.expectEqualSlices(u32, &.{ 0x1234_5678, 0, 0, 7 }, packet.body);
+
+    try testing.expectEqual(errno.ok, patchCondExecCommandAddress(@intFromPtr(command), 0x9abc_def0));
+    try testing.expectEqual(errno.ok, patchCondExecEnd(@intFromPtr(command), @intFromPtr(command + 8)));
+    try testing.expectEqual(@as(u32, 0x9abc_def0), storage[1]);
+    try testing.expectEqual(@as(u32, 3), storage[4]);
+}
+
 test "the size a title is told matches what a write consumes" {
     // A title reserves space by asking first. If the two disagree it either
     // overruns its buffer or leaves a hole nothing accounts for.
@@ -830,5 +997,30 @@ test "indirect multi draw occupies ten words with a selectable count address" {
     try testing.expectEqual(@as(u32, 4), spec.count);
     try testing.expectEqual(@as(u64, 0x2000), spec.count_address);
     try testing.expectEqual(@as(u32, 24), spec.stride);
+    try testing.expect((try walker.next()) == null);
+}
+
+test "indexed multi-instance draw emits Prospero preamble packet" {
+    var storage: [9]u32 = @splat(0xdead_beef);
+    var buffer = fixture(&storage);
+    try testing.expectEqual(@as(u32, 36), drawIndexMultiInstancedGetSize());
+    try testing.expect(drawIndexMultiInstanced(
+        &buffer,
+        0x123,
+        0x20_1234_5000,
+        0x20_aaaa_0000,
+        7,
+        0x100,
+    ) != null);
+    try testing.expectEqual(storage[0..].ptr + storage.len, buffer.cursor_up.?);
+
+    var walker = gpu.pm4.Walker.init(&storage);
+    const packet = (try walker.next()).?;
+    try testing.expectEqual(gpu.pm4.dispatch_draw_preamble, packet.opcode);
+    try testing.expectEqual(@as(usize, 8), packet.body.len);
+    try testing.expectEqual(@as(u32, 0x123), packet.body[0]);
+    try testing.expectEqual(@as(u32, 7), packet.body[3]);
+    try testing.expectEqual(@as(u32, 7), packet.body[6]);
+    try testing.expectEqual(@as(u32, 0xa0), packet.body[7]);
     try testing.expect((try walker.next()) == null);
 }

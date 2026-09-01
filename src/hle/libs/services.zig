@@ -255,9 +255,36 @@ pub fn gameUpdateGetAddcontLatestVersion(
 }
 
 const np_entitlement_error_parameter: i32 = @bitCast(@as(u32, 0x817d_0002));
+var np_next_request = std.atomic.Value(u32).init(1);
+var np_requests = std.atomic.Value(u64).init(0);
 var np_trophy_next_context = std.atomic.Value(i32).init(1);
 var np_trophy_next_handle = std.atomic.Value(i32).init(1);
 var np_webapi_next_push_handle = std.atomic.Value(i32).init(1);
+
+fn npRequestBit(request_id: i32) ?u64 {
+    if (request_id < 1 or request_id >= 64) return null;
+    return @as(u64, 1) << @intCast(request_id);
+}
+
+/// NP requests are local bookkeeping objects. Creating one does not contact
+/// PSN, so an offline console still returns a usable request identifier.
+pub fn npCreateRequest() callconv(abi.guest) i32 {
+    var attempts: usize = 0;
+    while (attempts < 63) : (attempts += 1) {
+        const raw = np_next_request.fetchAdd(1, .acq_rel);
+        const request_id: u32 = (raw -% 1) % 63 + 1;
+        const bit = @as(u64, 1) << @intCast(request_id);
+        const previous = np_requests.fetchOr(bit, .acq_rel);
+        if (previous & bit == 0) return @intCast(request_id);
+    }
+    return errno.KernelError.enospc.raw();
+}
+
+pub fn npDeleteRequest(request_id: i32) callconv(abi.guest) i32 {
+    const bit = npRequestBit(request_id) orelse return errno.KernelError.einval.raw();
+    const previous = np_requests.fetchAnd(~bit, .acq_rel);
+    return if (previous & bit != 0) errno.ok else errno.KernelError.enoent.raw();
+}
 
 /// Entitlement and signaling libraries have useful offline bootstrap states.
 /// Network-backed requests may fail later, but constructing these contexts is
@@ -530,6 +557,19 @@ test "offline NP profile exposes a stable online id" {
     try testing.expectEqualSlices(u8, &([_]u8{0} ** 13), online_id[7..]);
     try testing.expectEqual(errno.KernelError.einval.raw(), npGetOnlineId(-1, &online_id));
     try testing.expectEqual(errno.KernelError.einval.raw(), npGetOnlineId(0x1000_0000, null));
+}
+
+test "offline NP requests have a local lifecycle" {
+    np_next_request.store(1, .release);
+    np_requests.store(0, .release);
+    const first = npCreateRequest();
+    const second = npCreateRequest();
+    try testing.expectEqual(@as(i32, 1), first);
+    try testing.expectEqual(@as(i32, 2), second);
+    try testing.expectEqual(errno.ok, npDeleteRequest(first));
+    try testing.expectEqual(errno.KernelError.enoent.raw(), npDeleteRequest(first));
+    try testing.expectEqual(errno.KernelError.einval.raw(), npDeleteRequest(0));
+    try testing.expectEqual(errno.ok, npDeleteRequest(second));
 }
 
 test "offline trophy profile returns initialized game metadata" {

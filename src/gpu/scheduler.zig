@@ -12,6 +12,48 @@ const std = @import("std");
 const executor = @import("executor.zig");
 const gpu_state = @import("state.zig");
 
+var live_indirect_refresh_reports = std.atomic.Value(u32).init(0);
+
+fn reportRefreshedStream(address: u64, bytes: []const u8) void {
+    if (bytes.len & 3 != 0) return;
+    const aligned_bytes: []align(@alignOf(u32)) const u8 = @alignCast(bytes);
+    const words = std.mem.bytesAsSlice(u32, aligned_bytes);
+    var walker = pm4.Walker.init(words);
+    var packets: usize = 0;
+    var draws: usize = 0;
+    var dispatches: usize = 0;
+    var indirects: usize = 0;
+    var opcodes: [256]u32 = @splat(0);
+    while (true) {
+        const packet = walker.next() catch |err| {
+            std.debug.print(
+                "[gpu scheduler] refreshed stream census @0x{x} words={d} stopped={s} at={d}\n",
+                .{ address, words.len, @errorName(err), walker.index },
+            );
+            return;
+        } orelse break;
+        packets += 1;
+        if (packet.kind != .command) continue;
+        opcodes[packet.opcode] += 1;
+        if (pm4.isDraw(packet.opcode)) draws += 1;
+        if (pm4.isDispatch(packet.opcode)) dispatches += 1;
+        if (packet.opcode == pm4.indirect_buffer) indirects += 1;
+    }
+    std.debug.print(
+        "[gpu scheduler] refreshed stream census @0x{x} words={d} packets={d} draws={d} dispatches={d} indirects={d}:",
+        .{ address, words.len, packets, draws, dispatches, indirects },
+    );
+    for (opcodes, 0..) |count, opcode| {
+        if (count == 0) continue;
+        if (pm4.opcodeName(@intCast(opcode))) |name| {
+            std.debug.print(" {s}={d}", .{ name, count });
+        } else {
+            std.debug.print(" 0x{x:0>2}={d}", .{ opcode, count });
+        }
+    }
+    std.debug.print("\n", .{});
+}
+
 pub const Error = executor.Error;
 
 pub const QueueKind = enum { graphics, compute };
@@ -35,6 +77,7 @@ const Submission = struct {
     words: []u32,
     snapshots: std.ArrayList(Snapshot) = .empty,
     continuation: ?executor.Continuation = null,
+    gpu_work_seen: bool = false,
 
     fn deinit(self: *Submission, allocator: std.mem.Allocator) void {
         allocator.free(self.words);
@@ -50,6 +93,11 @@ const Submission = struct {
 const Snapshot = struct {
     address: u64,
     words: []u32,
+    /// An indirect command buffer with no submitted draw/dispatch may be filled
+    /// by an earlier dispatch in the same submission. Refresh it at execution
+    /// time after GPU work has run. Normal CPU-authored work streams and
+    /// indirect register lists stay immutable.
+    live_after_gpu_work: bool = false,
 };
 
 const Queue = struct {
@@ -260,6 +308,7 @@ pub const Scheduler = struct {
             .original = self.backend,
             .snapshots = active.snapshots.items,
             .forced_read = forced_read,
+            .gpu_work_seen = active.gpu_work_seen,
         };
         var snapshot_vtable = snapshot_backend.makeVtable();
         var dcb_executor = executor.DcbExecutor{
@@ -274,6 +323,7 @@ pub const Scheduler = struct {
             self.discardActive(queue);
             return err;
         };
+        active.gpu_work_seen = snapshot_backend.gpu_work_seen;
 
         if (result.status == .blocked) {
             active.continuation = result.continuation orelse return Error.InvalidContinuation;
@@ -343,7 +393,7 @@ pub const Scheduler = struct {
                 const count: usize = packet.body[3] & 0x3fff;
                 if (address != 0 and count != 0) {
                     const word_count = std.math.mul(usize, count, 2) catch return Error.InvalidPacket;
-                    _ = try self.captureWords(submission, address, word_count);
+                    _ = try self.captureWords(submission, address, word_count, false);
                 }
             } else if (pm4.customCode(packet)) |code| {
                 const is_indirect_registers = code == pm4.custom.context_regs_indirect or
@@ -354,7 +404,7 @@ pub const Scheduler = struct {
                     const count: usize = packet.body[0] & 0x3fff;
                     if (address != 0 and count != 0) {
                         const word_count = std.math.mul(usize, count, 2) catch return Error.InvalidPacket;
-                        _ = try self.captureWords(submission, address, word_count);
+                        _ = try self.captureWords(submission, address, word_count, false);
                     }
                 }
             }
@@ -390,7 +440,7 @@ pub const Scheduler = struct {
             if (active == address) return;
         }
 
-        const child = try self.captureWords(submission, address, word_count);
+        const child = try self.captureWords(submission, address, word_count, true);
         active_addresses[depth] = address;
         try self.snapshotStream(submission, child, address, depth + 1, active_addresses);
     }
@@ -400,18 +450,21 @@ pub const Scheduler = struct {
         submission: *Submission,
         address: u64,
         word_count: usize,
+        command_stream: bool,
     ) Error![]const u32 {
         const byte_count = std.math.mul(usize, word_count, @sizeOf(u32)) catch return Error.InvalidPacket;
         const requested_end = std.math.add(u64, address, byte_count) catch return Error.InvalidPacket;
 
-        for (submission.snapshots.items) |snapshot| {
+        for (submission.snapshots.items) |*snapshot| {
             if (address < snapshot.address) continue;
             const snapshot_bytes = std.mem.sliceAsBytes(snapshot.words);
             const snapshot_end = std.math.add(u64, snapshot.address, snapshot_bytes.len) catch continue;
             if (requested_end > snapshot_end) continue;
             const offset: usize = @intCast(address - snapshot.address);
             if (offset & 0x3 != 0) return Error.InvalidPacket;
-            return snapshot.words[offset / 4 ..][0..word_count];
+            const selected = snapshot.words[offset / 4 ..][0..word_count];
+            if (command_stream and !containsGpuWork(selected)) snapshot.live_after_gpu_work = true;
+            return selected;
         }
 
         const words = try self.allocator.alloc(u32, word_count);
@@ -419,8 +472,24 @@ pub const Scheduler = struct {
         if (!self.backend.vtable.read(self.backend.context, address, std.mem.sliceAsBytes(words))) {
             return Error.MemoryReadFailed;
         }
-        try submission.snapshots.append(self.allocator, .{ .address = address, .words = words });
+        try submission.snapshots.append(self.allocator, .{
+            .address = address,
+            .words = words,
+            .live_after_gpu_work = command_stream and !containsGpuWork(words),
+        });
         return words;
+    }
+
+    fn containsGpuWork(words: []const u32) bool {
+        var walker = pm4.Walker.init(words);
+        while (walker.next() catch return false) |packet| {
+            if (packet.kind == .command and
+                (pm4.isDraw(packet.opcode) or pm4.isDispatch(packet.opcode)))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     fn queueFor(self: *Scheduler, kind: QueueKind) *Queue {
@@ -444,6 +513,7 @@ const SnapshotBackend = struct {
     original: executor.Backend,
     snapshots: []const Snapshot,
     forced_read: ?ForcedRead,
+    gpu_work_seen: bool,
 
     fn from(context: ?*anyopaque) *SnapshotBackend {
         return @ptrCast(@alignCast(context.?));
@@ -480,6 +550,20 @@ const SnapshotBackend = struct {
             if (offset64 > source.len) continue;
             const offset: usize = @intCast(offset64);
             if (bytes.len > source.len - offset) continue;
+            if (snapshot.live_after_gpu_work and self.gpu_work_seen and
+                self.original.vtable.read(self.original.context, address, bytes))
+            {
+                if (!std.mem.eql(u8, bytes, source[offset..][0..bytes.len]) and
+                    live_indirect_refresh_reports.fetchAdd(1, .monotonic) < 32)
+                {
+                    std.debug.print(
+                        "[gpu scheduler] refreshed GPU-generated indirect stream @0x{x} words={d}\n",
+                        .{ address, bytes.len / @sizeOf(u32) },
+                    );
+                    reportRefreshedStream(address, bytes);
+                }
+                return true;
+            }
             @memcpy(bytes, source[offset..][0..bytes.len]);
             return true;
         }
@@ -533,7 +617,9 @@ const SnapshotBackend = struct {
 
     fn dispatch(context: ?*anyopaque, state: *const gpu_state.State, packet: pm4.Packet) bool {
         const self = from(context);
-        return self.original.vtable.dispatch.?(self.original.context, state, packet);
+        const accepted = self.original.vtable.dispatch.?(self.original.context, state, packet);
+        if (accepted) self.gpu_work_seen = true;
+        return accepted;
     }
 };
 
@@ -548,6 +634,8 @@ const FakeBackend = struct {
     memory: [512]u8 = [_]u8{0} ** 512,
     events: [8]u8 = [_]u8{0} ** 8,
     event_count: usize = 0,
+    generated_stream_address: u64 = 0,
+    generated_event: u8 = 0,
 
     fn interface(self: *FakeBackend) executor.Backend {
         return .{ .context = self, .vtable = &vtable };
@@ -564,6 +652,7 @@ const FakeBackend = struct {
         .read = read,
         .write = write,
         .event = event,
+        .dispatch = dispatch,
     };
 
     fn from(context: ?*anyopaque) *FakeBackend {
@@ -595,6 +684,17 @@ const FakeBackend = struct {
         self.event_count += 1;
         return true;
     }
+
+    fn dispatch(context: ?*anyopaque, _: *const gpu_state.State, _: pm4.Packet) bool {
+        const self = from(context);
+        if (self.generated_stream_address != 0) {
+            self.putWords(self.generated_stream_address, &.{
+                command(pm4.event_write, 1),
+                self.generated_event,
+            });
+        }
+        return true;
+    }
 };
 
 fn command(opcode: u8, body_words: u14) u32 {
@@ -605,6 +705,32 @@ fn command(opcode: u8, body_words: u14) u32 {
 
 fn customCommand(code: u6, body_words: u14) u32 {
     return command(pm4.nop, body_words) | (@as(u32, code) << 2);
+}
+
+test "an empty indirect command buffer is read live after a producing dispatch" {
+    var host = FakeBackend{
+        .generated_stream_address = 0x1100,
+        .generated_event = 0x2a,
+    };
+    const stream = [_]u32{
+        command(pm4.dispatch_direct, 4),
+        1,
+        1,
+        1,
+        0,
+        command(pm4.indirect_buffer, 3),
+        0x1100,
+        0,
+        0x0f20_0002,
+    };
+
+    var scheduler = Scheduler.init(testing.allocator, host.interface());
+    defer scheduler.deinit();
+
+    const report = try scheduler.submit(.graphics, &stream);
+    try testing.expectEqual(@as(usize, 1), report.completed_submissions);
+    try testing.expectEqual(@as(usize, 1), report.dispatches);
+    try testing.expectEqualSlices(u8, &.{0x2a}, host.events[0..host.event_count]);
 }
 
 test "release on compute resumes graphics and drains its FIFO without replay" {

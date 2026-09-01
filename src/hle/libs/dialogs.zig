@@ -35,6 +35,7 @@ var save_dialog_status: std.atomic.Value(i32) = .init(status_none);
 var save_dialog_mode: std.atomic.Value(i32) = .init(0);
 var save_dialog_user_data: std.atomic.Value(u64) = .init(0);
 var player_review_status: std.atomic.Value(i32) = .init(status_none);
+var error_dialog_status: std.atomic.Value(i32) = .init(status_none);
 var keyboard_open: std.atomic.Value(u8) = .init(0);
 
 pub fn reset() void {
@@ -48,6 +49,7 @@ pub fn reset() void {
     save_dialog_mode.store(0, .release);
     save_dialog_user_data.store(0, .release);
     player_review_status.store(status_none, .release);
+    error_dialog_status.store(status_none, .release);
     keyboard_open.store(0, .release);
 }
 
@@ -135,6 +137,65 @@ const message_dialog_exports = [_]symbols.Export{
     .{ .name = "sceMsgDialogProgressBarInc", .function = trace.wrap("sceMsgDialogProgressBarInc", &messageProgress), .expect_id = "Gc5k1qcK4fs" },
     .{ .name = "sceMsgDialogProgressBarSetMsg", .function = trace.wrap("sceMsgDialogProgressBarSetMsg", &messageProgress), .expect_id = "6H-71OdrpXM" },
 };
+
+// Error dialog -------------------------------------------------------------
+
+const error_dialog_error_not_initialized: i32 = @bitCast(@as(u32, 0x80ED_0001));
+const error_dialog_error_already_initialized: i32 = @bitCast(@as(u32, 0x80ED_0002));
+const error_dialog_error_parameter: i32 = @bitCast(@as(u32, 0x80ED_0003));
+const error_dialog_error_invalid_state: i32 = @bitCast(@as(u32, 0x80ED_0005));
+
+pub fn errorDialogInitialize() callconv(abi.guest) i32 {
+    if (error_dialog_status.cmpxchgStrong(
+        status_none,
+        status_initialized,
+        .acq_rel,
+        .acquire,
+    ) != null) return error_dialog_error_already_initialized;
+    return errno.ok;
+}
+
+pub fn errorDialogOpen(parameter: ?[*]const u8) callconv(abi.guest) i32 {
+    const status = error_dialog_status.load(.acquire);
+    if (status != status_initialized and status != status_finished) {
+        return error_dialog_error_invalid_state;
+    }
+    const bytes = parameter orelse return error_dialog_error_parameter;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(bytes), 16)) {
+        return error_dialog_error_parameter;
+    }
+    if (std.mem.readInt(i32, bytes[0..4], .little) != 16) {
+        return error_dialog_error_parameter;
+    }
+    error_dialog_status.store(status_running, .release);
+    return errno.ok;
+}
+
+pub fn errorDialogUpdateStatus() callconv(abi.guest) i32 {
+    if (error_dialog_status.load(.acquire) == status_running) {
+        error_dialog_status.store(status_finished, .release);
+    }
+    return error_dialog_status.load(.acquire);
+}
+
+pub fn errorDialogGetStatus() callconv(abi.guest) i32 {
+    return error_dialog_status.load(.acquire);
+}
+
+pub fn errorDialogClose() callconv(abi.guest) i32 {
+    if (error_dialog_status.load(.acquire) != status_running) {
+        return error_dialog_error_invalid_state;
+    }
+    error_dialog_status.store(status_finished, .release);
+    return errno.ok;
+}
+
+pub fn errorDialogTerminate() callconv(abi.guest) i32 {
+    if (error_dialog_status.swap(status_none, .acq_rel) == status_none) {
+        return error_dialog_error_not_initialized;
+    }
+    return errno.ok;
+}
 
 // Web-browser dialog --------------------------------------------------------
 
@@ -608,6 +669,20 @@ test "headless player-review dialog completes without shell UI" {
     try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 8), &result);
     try std.testing.expectEqual(errno.ok, playerReviewTerminate());
     try std.testing.expectEqual(status_none, playerReviewStatus());
+}
+
+test "headless error dialog follows the platform lifecycle" {
+    reset();
+    try std.testing.expectEqual(errno.ok, errorDialogInitialize());
+    try std.testing.expectEqual(error_dialog_error_already_initialized, errorDialogInitialize());
+    var parameter: [16]u8 = @splat(0);
+    std.mem.writeInt(i32, parameter[0..4], 16, .little);
+    try std.testing.expectEqual(errno.ok, errorDialogOpen(&parameter));
+    try std.testing.expectEqual(status_finished, errorDialogUpdateStatus());
+    try std.testing.expectEqual(status_finished, errorDialogGetStatus());
+    try std.testing.expectEqual(error_dialog_error_invalid_state, errorDialogClose());
+    try std.testing.expectEqual(errno.ok, errorDialogTerminate());
+    try std.testing.expectEqual(error_dialog_error_not_initialized, errorDialogTerminate());
 }
 
 test "dialog libraries register the title import surface" {

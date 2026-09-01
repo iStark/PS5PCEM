@@ -780,7 +780,11 @@ fn audioOut2ContextDestroy(context: u64) callconv(abi.guest) i32 {
 }
 
 fn audioOut2ContextAdvance(context: u64) callconv(abi.guest) i32 {
-    return if (audioObject(context, .context) != null) errno.ok else audio_out2_error_invalid_parameter;
+    const object = audioObject(context, .context) orelse return audio_out2_error_invalid_parameter;
+    // Keep the emulated mixer clock moving even without an active host route.
+    // SDK 11 titles use Advance and Push as completion clock edges.
+    pace(object.grains, 48_000);
+    return errno.ok;
 }
 
 fn audioOut2ContextSetAttributes(
@@ -794,8 +798,12 @@ fn audioOut2ContextSetAttributes(
 }
 
 fn audioOut2ContextPush(context: u64, blocking: u32) callconv(abi.guest) i32 {
+    _ = blocking;
     const object = audioObject(context, .context) orelse return audio_out2_error_invalid_parameter;
-    if (blocking != 0) pace(object.grains, 48_000);
+    // The null-host path still consumes one grain. In particular this must
+    // also pace non-blocking pushes: otherwise the guest can outrun the audio
+    // command worker which publishes asynchronous resource completions.
+    pace(object.grains, 48_000);
     return errno.ok;
 }
 
@@ -2421,6 +2429,10 @@ var ajm_instances: [maximum_ajm_instances]AjmInstance = [_]AjmInstance{.{}} ** m
 var next_batch = std.atomic.Value(u32).init(1);
 var ajm_decode_jobs = std.atomic.Value(u64).init(0);
 
+const ajm_flag_control_reset: u64 = 1 << 13;
+const ajm_flag_control_initialize: u64 = 1 << 14;
+const ajm_flag_sideband_gapless: u64 = 1 << 45;
+
 fn ajmContextIndex(context: u32) ?usize {
     if (context == 0 or context > maximum_ajm_contexts) return null;
     return context - 1;
@@ -2816,24 +2828,66 @@ fn ajmBatchJobGetStatistics(info: ?*AjmBatchInfo, _: f32, result: ?[*]u8) callco
 fn ajmBatchJobControl(
     info: ?*AjmBatchInfo,
     instance: u32,
-    _: u64,
-    _: ?*const anyopaque,
-    _: usize,
+    flags: u64,
+    sideband_input: ?*const anyopaque,
+    sideband_input_size: usize,
     sideband_output: ?[*]u8,
     sideband_output_size: usize,
 ) callconv(abi.guest) i32 {
+    var decoded = ajm_codec.Report{ .result = ajm_result_invalid_parameter };
+    var codec_info = ajm_codec.CodecInfo{};
+    ajm_mutex.lock();
+    if (findAjmInstanceLocked(instance)) |candidate| {
+        decoded = .{};
+        if (flags & ajm_flag_control_reset != 0) candidate.decoder.reset();
+
+        if (flags & ajm_flag_control_initialize != 0) {
+            const bounded_size = @min(sideband_input_size, 4096);
+            const input: []const u8 = if (sideband_input) |address|
+                @as([*]const u8, @ptrCast(address))[0..bounded_size]
+            else
+                &.{};
+
+            // Gen5 Scream streams combine GaplessDecode (8 bytes) and the
+            // codec initialization block in one Control job.  The title also
+            // passes input+8 to sceAjmDecAt9ParseConfigData, confirming that
+            // the ATRAC9 config begins after the gapless block.
+            const initialize_input = if (candidate.codec == ajm_codec.codec_atrac9 and
+                flags & ajm_flag_sideband_gapless != 0 and input.len >= 12)
+                input[8..]
+            else
+                input;
+            decoded = candidate.decoder.initialize(initialize_input);
+
+            if (candidate.codec == ajm_codec.codec_atrac9 and
+                flags & ajm_flag_sideband_gapless != 0 and input.len >= 8)
+            {
+                candidate.decoder.setGapless(
+                    std.mem.readInt(u32, input[0..4], .little),
+                    std.mem.readInt(u16, input[4..6], .little),
+                );
+            }
+        }
+        codec_info = candidate.decoder.codecInfo();
+    }
+    ajm_mutex.unlock();
+
     if (sideband_output) |output| {
         const bounded = @min(sideband_output_size, 4096);
         @memset(output[0..bounded], 0);
-        if (bounded >= 8) writeAjmBasicResult(output, if (isAjmInstance(instance)) 0 else ajm_result_invalid_parameter, 0);
+        if (bounded >= 8) writeAjmBasicResult(output, decoded.result, decoded.internal_result);
     }
-    return appendAjmJob(info, 32);
+    std.debug.print(
+        "[audio ajm] control instance={d} flags=0x{x} input={d} result=0x{x} {d}Hz ch={d} frame={d} superframe={d}\n",
+        .{ instance, flags, sideband_input_size, @as(u32, @bitCast(decoded.result)), codec_info.sample_rate, codec_info.channels, codec_info.frame_samples, codec_info.superframe_size },
+    );
+    return appendAjmJob(info, 48);
 }
 
 fn ajmBatchJobRunSplit(
     info: ?*AjmBatchInfo,
     instance: u32,
-    _: u64,
+    flags: u64,
     input_buffers: ?[*]const AjmBuffer,
     input_count: usize,
     output_buffers: ?[*]const AjmBuffer,
@@ -2856,6 +2910,13 @@ fn ajmBatchJobRunSplit(
         @memset(output[0..bounded], 0);
         const copied = @min(bounded, @sizeOf(AjmDecodeResult));
         @memcpy(output[0..copied], std.mem.asBytes(&result)[0..copied]);
+    }
+    const job_number = ajm_decode_jobs.fetchAdd(1, .monotonic) + 1;
+    if (job_number <= 8 or (result.result != 0 and std.math.isPowerOfTwo(job_number))) {
+        std.debug.print(
+            "[audio ajm] run-split #{d} instance={d} flags=0x{x} buffers={d}/{d} consumed={d} produced={d} frames={d} result=0x{x}\n",
+            .{ job_number, instance, flags, input_count, output_count, result.size_consumed, result.size_produced, result.number_of_frames, @as(u32, @bitCast(result.result)) },
+        );
     }
     return status;
 }

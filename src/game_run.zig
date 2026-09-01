@@ -45,7 +45,9 @@ const save_data_home = "savedata";
 const download_data_home = "out/download0";
 const terminator_2d_title_id = "PPSA25872";
 const tetris_effect_connected_title_id = "PPSA07923";
+const yotei_title_id = "PPSA26344";
 const terminator_audio_latency_ms: u16 = 128;
+const yotei_startup_compute_warmup_flips: u64 = 32;
 
 /// Compatibility stays the global default, while profiles enable only paths
 /// which have passed isolated title A/B and visual runs. Terminator benefits
@@ -62,10 +64,28 @@ fn titleNeedsEagerStorageWrites(title_identifier: []const u8) bool {
     return std.ascii.eqlIgnoreCase(title_identifier, tetris_effect_connected_title_id);
 }
 
+/// Yotei's opening renderer runs hundreds of expensive full-resolution
+/// compute passes before the guest advances even a fraction of a second.  The
+/// results are transient presentation resources and are rebuilt once the
+/// bounded warm-up ends, so let guest initialization reach its steady frame
+/// before enabling the complete Vulkan path.
+fn titleStartupComputeWarmupFlips(title_identifier: []const u8) u64 {
+    return if (std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id))
+        yotei_startup_compute_warmup_flips
+    else
+        0;
+}
+
 test "Tetris Effect profile materializes storage writes eagerly" {
     try std.testing.expect(titleNeedsEagerStorageWrites("PPSA07923"));
     try std.testing.expect(titleNeedsEagerStorageWrites("ppsa07923"));
     try std.testing.expect(!titleNeedsEagerStorageWrites("PPSA25872"));
+}
+
+test "Yotei profile bounds startup compute warm-up" {
+    try std.testing.expectEqual(@as(u64, 32), titleStartupComputeWarmupFlips("PPSA26344"));
+    try std.testing.expectEqual(@as(u64, 32), titleStartupComputeWarmupFlips("ppsa26344"));
+    try std.testing.expectEqual(@as(u64, 0), titleStartupComputeWarmupFlips("PPSA07923"));
 }
 
 /// Reads the product code a title publishes in its own parameter document.
@@ -379,6 +399,10 @@ fn run(init: std.process.Init) !bool {
         .delayed_triangle_hold
     else
         .default);
+    runtime.firmware.libs.pad.setDiagnostics(init.minimal.environ.containsUnempty(
+        allocator,
+        "PS5_PAD_DIAGNOSTICS",
+    ) catch false);
     var saves = openSaveDataHome(io, content) catch null;
     defer if (saves) |*directory| directory.close(io);
     defer runtime.firmware.filesystem.unmountSaveData();
@@ -485,6 +509,16 @@ fn run(init: std.process.Init) !bool {
     const force_probe_fragment_parameter = init.minimal.environ.containsUnempty(allocator, "PS5_PROBE_FRAGMENT_PARAMETER") catch false;
     const force_probe_fragment_ui = init.minimal.environ.containsUnempty(allocator, "PS5_PROBE_FRAGMENT_UI") catch false;
     const skip_compute_dispatches = init.minimal.environ.containsUnempty(allocator, "PS5_SKIP_COMPUTE") catch false;
+    const environment_skip_compute_until_flip: ?u64 = if (init.minimal.environ.getAlloc(
+        allocator,
+        "PS5_SKIP_COMPUTE_UNTIL_FLIP",
+    )) |text| parse: {
+        defer allocator.free(text);
+        const value = std.mem.trim(u8, text, " \t\r\n");
+        break :parse std.fmt.parseInt(u64, value, 10) catch null;
+    } else |_| null;
+    const skip_compute_until_flip = environment_skip_compute_until_flip orelse
+        titleStartupComputeWarmupFlips(title_identifier);
     const environment_compute_execution_limit: ?u64 = if (init.minimal.environ.getAlloc(
         allocator,
         "PS5_COMPUTE_EXECUTION_LIMIT",
@@ -566,6 +600,7 @@ fn run(init: std.process.Init) !bool {
             .force_probe_fragment_parameter = force_probe_fragment_parameter,
             .force_probe_fragment_ui = force_probe_fragment_ui,
             .skip_compute_dispatches = skip_compute_dispatches,
+            .skip_compute_until_flip = skip_compute_until_flip,
             .compute_execution_limit = compute_execution_limit,
             .sparse_graphics_draws = sparse_graphics_draws,
             .translate_compute_only = translate_compute_only,

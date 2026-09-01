@@ -1385,18 +1385,22 @@ const WindowsX64Machine = struct {
                 _ = null_memory_store_recoveries.fetchAdd(1, .monotonic);
                 const count = null_memory_store_recoveries.load(.monotonic);
                 if (count <= 8 or count % 256 == 0) {
+                    var saved_frame: u64 = 0;
                     var return_address: u64 = 0;
                     if (frame.owner != null and
-                        memory.isHostRangeReadable(context.Rsp, @sizeOf(u64)))
+                        memory.isHostRangeReadable(context.Rsp, 2 * @sizeOf(u64)))
                     {
-                        return_address = @as(*align(1) const u64, @ptrFromInt(context.Rsp)).*;
+                        const stack = @as([*]align(1) const u64, @ptrFromInt(context.Rsp));
+                        saved_frame = stack[0];
+                        return_address = stack[1];
                     }
                     std.debug.print(
-                        "[cpu] recovered null-memory store @rip=0x{x} addr=0x{x} ret=0x{x} rax=0x{x} rcx=0x{x} rdx=0x{x} rsi=0x{x} rdi=0x{x} r14=0x{x} r15=0x{x} (#{d})\n",
+                        "[cpu] recovered null-memory store @rip=0x{x} addr=0x{x} caller=0x{x} frame=0x{x} rax=0x{x} rcx=0x{x} rdx=0x{x} rsi=0x{x} rdi=0x{x} r14=0x{x} r15=0x{x} (#{d})\n",
                         .{
                             fault_rip,
                             record.ExceptionInformation[1],
                             return_address,
+                            saved_frame,
                             context.Rax,
                             context.Rcx,
                             context.Rdx,
@@ -1457,14 +1461,25 @@ const WindowsX64Machine = struct {
                 declined_host_access_violations.fetchAdd(1, .monotonic) == 0)
             {
                 const allocation_base = hostAllocationBase(context.Rip);
+                var return_address: u64 = 0;
+                var next_return_address: u64 = 0;
+                if (memory.isHostRangeReadable(context.Rsp, 2 * @sizeOf(u64))) {
+                    const stack_words = @as([*]align(1) const u64, @ptrFromInt(context.Rsp));
+                    return_address = stack_words[0];
+                    next_return_address = stack_words[1];
+                }
                 std.debug.print(
-                    "[cpu] unhandled host access violation rip=0x{x} module_base=0x{x} offset=0x{x} target=0x{x} operation={d}\n",
+                    "[cpu] unhandled host access violation rip=0x{x} module_base=0x{x} offset=0x{x} target=0x{x} operation={d} rsp=0x{x} rax=0x{x} ret=0x{x} next=0x{x}\n",
                     .{
                         context.Rip,
                         allocation_base,
                         context.Rip -| allocation_base,
                         record.ExceptionInformation[1],
                         record.ExceptionInformation[0],
+                        context.Rsp,
+                        context.Rax,
+                        return_address,
+                        next_return_address,
                     },
                 );
             }

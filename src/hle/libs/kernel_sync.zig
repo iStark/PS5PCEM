@@ -227,23 +227,14 @@ pub const Manager = struct {
     ) Error!void {
         self.lock.lock();
         defer self.lock.unlock();
-        // Re-initializing a live object is undefined per POSIX, but titles do
-        // it and firmware accepts it, so reuse the object rather than refusing.
-        // Refusing loses: the guest's runtime turns the failure into an
-        // exception it has no handler for. Ownership and waiter state are
-        // cleared, which is what a fresh initialization means; the embedded
-        // host lock is left alone because another thread may hold it.
-        if (findPointer(Mutex, self.mutexes.items, out.*)) |existing| {
-            existing.owner = 0;
-            existing.recursion = 0;
-            existing.waiters = 0;
-            existing.sequence +%= 1;
-            existing.kind = if (attr) |value| value.kind else 1;
-            existing.protocol = if (attr) |value| value.protocol else 0;
-            existing.origin = origin;
-            existing.reported_self_lock = false;
-            return;
-        }
+        // The SDK's C++ wrapper commonly gives firmware an uninitialised stack
+        // slot and returns the handle written there.  Consecutive calls reuse
+        // that slot, so its old value can still name a live mutex even though
+        // the caller is creating a different object.  Treat Init as a fresh
+        // construction and overwrite the slot unconditionally.  POSIX makes
+        // reinitialising a live mutex undefined; accepting it by replacing the
+        // handle is still compatible, while mutating the old object would also
+        // alias every mutex subsequently created through the wrapper.
         const object = try self.allocator.create(Mutex);
         object.* = .{ .origin = origin };
         if (attr) |value| {
@@ -1961,7 +1952,7 @@ test "adaptive blocking slow-path acquisition is idempotent" {
     try testing.expectEqual(errno.ok, scePthreadMutexattrDestroy(&attr));
 }
 
-test "re-initializing a live object succeeds and resets its state" {
+test "re-initializing live synchronization handles succeeds" {
     var context = TestContext{};
     try context.init();
     defer context.deinit();
@@ -1983,14 +1974,19 @@ test "re-initializing a live object succeeds and resets its state" {
 
     var mutex: MutexHandle = null;
     try testing.expectEqual(errno.ok, pthread_mutex_init(&mutex, null));
-    const first_mutex = mutex;
+    var first_mutex = mutex;
     try testing.expectEqual(errno.ok, pthread_mutex_lock(&mutex));
-    // Re-initialization clears ownership, so the mutex is free afterwards.
+    // Mutex Init must overwrite a stale live handle. SDK wrappers reuse an
+    // uninitialised stack result slot while constructing several mutexes, and
+    // mutating the object named by that stale value aliases all of them.
     try testing.expectEqual(errno.ok, pthread_mutex_init(&mutex, null));
-    try testing.expectEqual(first_mutex, mutex);
+    try testing.expect(first_mutex != mutex);
     try testing.expectEqual(errno.ok, pthread_mutex_lock(&mutex));
     try testing.expectEqual(errno.ok, pthread_mutex_unlock(&mutex));
     try testing.expectEqual(errno.ok, pthread_mutex_destroy(&mutex));
+    // Replacing the output did not revoke ownership through another alias.
+    try testing.expectEqual(errno.ok, pthread_mutex_unlock(&first_mutex));
+    try testing.expectEqual(errno.ok, pthread_mutex_destroy(&first_mutex));
 
     var rwlock: RwlockHandle = null;
     try testing.expectEqual(errno.ok, pthread_rwlock_init(&rwlock, null));

@@ -97,6 +97,7 @@ pub const Analysis = struct {
                 .image_atomic_and,
                 .image_atomic_or,
                 .image_atomic_xor,
+                .image_atomic_fmax,
                 .s_sendmsg,
                 .exp,
                 => return true,
@@ -104,6 +105,55 @@ pub const Analysis = struct {
                     .vop1, .vop2, .vop3, .vop3p, .vopc, .vintrp => {},
                     else => return true,
                 },
+                else => {},
+            }
+        }
+        return false;
+    }
+
+    /// Whether a compute program can publish data through a guest-addressable
+    /// buffer (or GDS). This excludes image-only post-processing, allowing a
+    /// title startup fast path to retain command/visibility-list generation
+    /// without paying for every full-resolution image pass.
+    pub fn hasBufferExternalEffects(self: *const Analysis) bool {
+        const instructions = if (self.pipeline_options.enable_typed_ir)
+            self.module.instructions.items
+        else
+            self.program.instructions.items;
+        for (instructions) |inst| {
+            if (inst.family == .ds and inst.gds) return true;
+            switch (inst.opcode) {
+                .buffer_store_format_x,
+                .buffer_store_format_xy,
+                .buffer_store_format_xyz,
+                .buffer_store_format_xyzw,
+                .buffer_store_byte,
+                .buffer_store_short,
+                .buffer_store_dword,
+                .buffer_store_dwordx2,
+                .buffer_store_dwordx3,
+                .buffer_store_dwordx4,
+                .buffer_atomic_swap,
+                .buffer_atomic_add,
+                .buffer_atomic_sub,
+                .buffer_atomic_smin,
+                .buffer_atomic_umin,
+                .buffer_atomic_smax,
+                .buffer_atomic_umax,
+                .buffer_atomic_and,
+                .buffer_atomic_or,
+                .buffer_atomic_xor,
+                .tbuffer_store_format_x,
+                .tbuffer_store_format_xy,
+                .tbuffer_store_format_xyz,
+                .tbuffer_store_format_xyzw,
+                .flat_store_byte,
+                .flat_store_short,
+                .flat_store_dword,
+                .flat_store_dwordx2,
+                .flat_store_dwordx3,
+                .flat_store_dwordx4,
+                => return true,
                 else => {},
             }
         }
@@ -355,6 +405,7 @@ test "analysis identifies a global buffer store as externally visible" {
     defer analysis.deinit(std.testing.allocator);
 
     try std.testing.expect(analysis.hasExternalEffects());
+    try std.testing.expect(analysis.hasBufferExternalEffects());
 }
 
 test "analysis enforces its instruction safety limit" {

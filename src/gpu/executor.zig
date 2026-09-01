@@ -59,10 +59,11 @@ pub const Backend = struct {
 
 pub const Status = enum { complete, blocked };
 
-/// Root DCB plus at most fifteen active indirect buffers. The fixed bound makes
-/// malformed self-referential streams a reported guest error instead of host
-/// stack exhaustion.
-pub const maximum_stream_depth: usize = 16;
+/// Root DCB plus the indirect-buffer chain. Gen5 titles routinely submit long
+/// chains (Yotei uses about seventy links for one frame). The executor still
+/// keeps a fixed safety bound so malformed streams cannot exhaust the host
+/// stack, but it must be comfortably above a real SDK-generated chain.
+pub const maximum_stream_depth: usize = 128;
 
 pub const Continuation = struct {
     pub const Frame = struct {
@@ -87,7 +88,79 @@ pub const Result = struct {
     packets: usize,
     draws: usize,
     dispatches: usize,
+    ignored_commands: usize = 0,
+    ignored_opcode_counts: [256]u32 = [_]u32{0} ** 256,
+    ignored_custom_counts: [64]u32 = [_]u32{0} ** 64,
 };
+
+var ignored_census_reports = std.atomic.Value(u32).init(0);
+var indirect_census_reports = std.atomic.Value(u32).init(0);
+var conditional_indirect_reports = std.atomic.Value(u32).init(0);
+
+fn reportIndirectStream(address: u64, depth: usize, words: []const u32) void {
+    if (depth < 35) return;
+    if (indirect_census_reports.fetchAdd(1, .monotonic) >= 512) return;
+    var walker = pm4.Walker.init(words);
+    var packets: usize = 0;
+    var draws: usize = 0;
+    var dispatches: usize = 0;
+    var indirects: usize = 0;
+    var opcodes: [256]u32 = @splat(0);
+    while (true) {
+        const packet = walker.next() catch |err| {
+            std.debug.print(
+                "[gpu executor] indirect census depth={d} @0x{x} words={d} stopped={s} at={d}\n",
+                .{ depth, address, words.len, @errorName(err), walker.index },
+            );
+            return;
+        } orelse break;
+        packets += 1;
+        if (packet.kind != .command) continue;
+        opcodes[packet.opcode] += 1;
+        if (pm4.isDraw(packet.opcode)) draws += 1;
+        if (pm4.isDispatch(packet.opcode)) dispatches += 1;
+        if (packet.opcode == pm4.indirect_buffer) indirects += 1;
+        if (depth >= 23 and (pm4.isDraw(packet.opcode) or packet.opcode == pm4.indirect_buffer)) {
+            std.debug.print(
+                "[gpu executor] indirect packet depth={d} @0x{x} opcode=0x{x} body={d}:",
+                .{ depth, address, packet.opcode, packet.body.len },
+            );
+            for (packet.body) |word| std.debug.print(" {x:0>8}", .{word});
+            std.debug.print("\n", .{});
+        }
+    }
+    std.debug.print(
+        "[gpu executor] indirect census depth={d} @0x{x} words={d} packets={d} draws={d} dispatches={d} indirects={d}:",
+        .{ depth, address, words.len, packets, draws, dispatches, indirects },
+    );
+    for (opcodes, 0..) |count, opcode| {
+        if (count == 0) continue;
+        if (pm4.opcodeName(@intCast(opcode))) |name| {
+            std.debug.print(" {s}={d}", .{ name, count });
+        } else {
+            std.debug.print(" 0x{x:0>2}={d}", .{ opcode, count });
+        }
+    }
+    std.debug.print("\n", .{});
+}
+
+fn reportIgnoredCommandCensus(result: *const Result) void {
+    if (result.ignored_commands == 0) return;
+    if (ignored_census_reports.fetchAdd(1, .monotonic) >= 4) return;
+    std.debug.print(
+        "[gpu executor] ignored command census packets={d} draws={d} dispatches={d} ignored={d}:",
+        .{ result.packets, result.draws, result.dispatches, result.ignored_commands },
+    );
+    for (result.ignored_opcode_counts, 0..) |count, opcode| {
+        if (count == 0) continue;
+        std.debug.print(" 0x{x:0>2}={d}", .{ opcode, count });
+    }
+    for (result.ignored_custom_counts, 0..) |count, code| {
+        if (count == 0) continue;
+        std.debug.print(" custom:0x{x:0>2}={d}", .{ code, count });
+    }
+    std.debug.print("\n", .{});
+}
 
 const PacketOutcome = enum { complete, blocked };
 
@@ -127,6 +200,7 @@ pub const DcbExecutor = struct {
         } else {
             result.resume_word = stream.len;
         }
+        reportIgnoredCommandCensus(&result);
         return result;
     }
 
@@ -163,6 +237,7 @@ pub const DcbExecutor = struct {
         } else {
             result.resume_word = stream.len;
         }
+        reportIgnoredCommandCensus(&result);
         return result;
     }
 
@@ -216,6 +291,20 @@ pub const DcbExecutor = struct {
                 self.state.indirect_buffer_count += 1;
                 self.state.packets_executed += 1;
                 if (indirect.chain) return false;
+                continue;
+            }
+            if (packet.kind == .command and packet.opcode == pm4.cond_exec) {
+                if (packet.body.len != 4 or packet.body[0] & 3 != 0 or packet.body[2] != 0) {
+                    return Error.InvalidPacket;
+                }
+                const predicate_address = (@as(u64, packet.body[1]) << 32) | packet.body[0];
+                if (predicate_address == 0) return Error.InvalidPacket;
+                if (try self.readU32(predicate_address) == 0) {
+                    const skip_words: usize = packet.body[3] & 0x3fff;
+                    if (skip_words > stream.len - walker.index) return Error.InvalidPacket;
+                    walker.index += skip_words;
+                }
+                self.state.packets_executed += 1;
                 continue;
             }
             if (resumes_child) return Error.InvalidContinuation;
@@ -326,7 +415,8 @@ pub const DcbExecutor = struct {
             if (compare_address == 0) return Error.InvalidPacket;
             const mask = (@as(u64, body[4]) << 32) | body[3];
             const reference = (@as(u64, body[6]) << 32) | body[5];
-            const take_then = compareWait(try self.readU64(compare_address), reference, mask, function);
+            const observed = try self.readU64(compare_address);
+            const take_then = compareWait(observed, reference, mask, function);
             if (take_then) {
                 selected_address = then_address;
                 selected_count = then_count;
@@ -334,6 +424,31 @@ pub const DcbExecutor = struct {
                 if (else_address == 0) return Error.InvalidPacket;
                 selected_address = else_address;
                 selected_count = else_count;
+            }
+            if (depth >= 20 and conditional_indirect_reports.fetchAdd(1, .monotonic) < 64) {
+                const choice: []const u8 = if (take_then)
+                    "then"
+                else if (mode == 2 and else_count != 0)
+                    "else"
+                else
+                    "none";
+                std.debug.print(
+                    "[gpu executor] conditional IB depth={d} mode={d} function={d} compare@0x{x} observed=0x{x} reference=0x{x} mask=0x{x} then=0x{x}/{d} else=0x{x}/{d} choice={s}\n",
+                    .{
+                        depth,
+                        mode,
+                        function,
+                        compare_address,
+                        observed,
+                        reference,
+                        mask,
+                        then_address,
+                        then_count,
+                        else_address,
+                        else_count,
+                        choice,
+                    },
+                );
             }
         }
 
@@ -384,6 +499,7 @@ pub const DcbExecutor = struct {
         const child = try self.allocator.alloc(u32, word_count);
         defer self.allocator.free(child);
         try self.backend.read(address, std.mem.sliceAsBytes(child));
+        reportIndirectStream(address, depth + 1, child);
 
         var resumed_descriptor = child_descriptor;
         resumed_descriptor.resume_word = child_start;
@@ -481,6 +597,7 @@ pub const DcbExecutor = struct {
 
         if (pm4.customCode(packet)) |code| {
             switch (code) {
+                pm4.custom.zero => {},
                 pm4.custom.acquire_mem => try self.acquireMem(packet, false),
                 pm4.custom.release_mem => try self.releaseMem(packet, false),
                 pm4.custom.context_regs_indirect => try self.writeLegacyIndirectRegisters(.context, packet.body),
@@ -494,7 +611,10 @@ pub const DcbExecutor = struct {
                 // of a different buffer. Bring-up treats the wait as already
                 // satisfied so a second frame can be built without parking the CP.
                 pm4.custom.wait_flip_done => {},
-                else => {},
+                else => {
+                    result.ignored_commands += 1;
+                    result.ignored_custom_counts[code] +|= 1;
+                },
             }
             return .complete;
         }
@@ -511,6 +631,9 @@ pub const DcbExecutor = struct {
             if (self.backend.vtable.dispatch) |callback| {
                 if (!callback(self.backend.context, self.state, packet)) return Error.BackendRejected;
             }
+        } else {
+            result.ignored_commands += 1;
+            result.ignored_opcode_counts[packet.opcode] +|= 1;
         }
         return .complete;
     }
@@ -918,12 +1041,15 @@ fn configCount() u32 {
 }
 
 fn normalizeIndirectOffset(space: pm4.RegisterSpace, raw: u32) u32 {
-    const selector = raw & 0x7000_0000;
-    const offset = raw & ~@as(u32, 0x7000_0000);
-    if (space == .context and selector == 0x1000_0000 and offset < 32) {
-        return 0x191 + offset;
-    }
-    return offset;
+    _ = space;
+    // Gen5 register-list entries retain a three-bit packet selector in the
+    // high nibble.  It does not select a second architectural register range:
+    // the packet opcode already selects CX/SH/UC, and hardware dispatches the
+    // entry after stripping these selector bits.  Treating selector 1 on a
+    // small CX offset as SPI_PS_INPUT_CNTL aliased DB_DEPTH_VIEW,
+    // DB_DEPTH_SIZE_XY and the other low DB registers into 0x191+, leaving
+    // otherwise valid depth targets at the 1x1 reset size.
+    return raw & ~@as(u32, 0x7000_0000);
 }
 
 fn indirectOffsetTracked(space: pm4.RegisterSpace, offset: u32) bool {
@@ -968,7 +1094,7 @@ const testing = std.testing;
 
 const FakeBackend = struct {
     base: u64 = 0x1000,
-    memory: [512]u8 = [_]u8{0} ** 512,
+    memory: [4096]u8 = [_]u8{0} ** 4096,
     draws: usize = 0,
     dispatches: usize = 0,
     flips: usize = 0,
@@ -1065,7 +1191,8 @@ test "direct and Gen5 indirect register packets share persistent state" {
     try testing.expectEqual(@as(?u32, 0x1111), state.readRegister(.context, 0x10));
     try testing.expectEqual(@as(?u32, 0x2222), state.readRegister(.context, 0x11));
     try testing.expectEqual(@as(?u32, 0xaaaa_5555), state.readRegister(.shader, 0x20));
-    try testing.expectEqual(@as(?u32, 0x1357_2468), state.readRegister(.context, 0x193));
+    try testing.expectEqual(@as(?u32, 0x1357_2468), state.readRegister(.context, 0x2));
+    try testing.expect(state.readRegister(.context, 0x193) == null);
     try testing.expectEqual(@as(?u32, 0x3333), state.readRegister(.uconfig, 7));
     try testing.expectEqual(@as(?u32, 0xcafe_babe), state.readRegister(.uconfig, 8));
 }
@@ -1109,10 +1236,12 @@ test "SET_BASE retains separate draw and dispatch indirect argument addresses" {
 test "indirect draw packets reach the backend after SET_BASE" {
     var host = FakeBackend{};
     const stream = [_]u32{
-        command(pm4.set_base, 3),           1, 0x1000, 0,
-        command(pm4.draw_indirect, 4),      0x40, 0, 0, 2,
-        command(pm4.draw_index_indirect, 4), 0x80, 0, 0, 2,
-        command(pm4.draw_indirect_multi, 9), 0, 0, 0, 0, 2, 0, 0, 16, 2,
+        command(pm4.set_base, 3),      1,                                   0x1000,                              0,
+        command(pm4.draw_indirect, 4), 0x40,                                0,                                   0,
+        2,                             command(pm4.draw_index_indirect, 4), 0x80,                                0,
+        0,                             2,                                   command(pm4.draw_indirect_multi, 9), 0,
+        0,                             0,                                   0,                                   2,
+        0,                             0,                                   16,                                  2,
     };
     var state = gpu_state.State{};
     var executor = DcbExecutor{ .state = &state, .backend = host.interface() };
@@ -1180,6 +1309,35 @@ test "write data and release memory publish values seen by a wait" {
     try testing.expectEqual(@as(u32, 0xaabb_ccdd), std.mem.readInt(u32, host.memory[0x40..0x44], .little));
     try testing.expect(state.blocked_wait == null);
     try testing.expectEqual(@as(u64, 1), state.release_count);
+}
+
+test "COND_EXEC skips its guarded words only when the predicate is zero" {
+    var host = FakeBackend{};
+    const stream = [_]u32{
+        command(pm4.cond_exec, 4),
+        0x1080,
+        0,
+        0,
+        2,
+        command(pm4.event_write, 1),
+        0x20,
+        command(pm4.event_write, 1),
+        0x21,
+    };
+    var state = gpu_state.State{};
+    var executor = DcbExecutor{ .state = &state, .backend = host.interface() };
+
+    const skipped = try executor.execute(&stream);
+    try testing.expectEqual(Status.complete, skipped.status);
+    try testing.expectEqual(@as(u64, 1), state.event_count);
+    try testing.expectEqual(@as(u8, 0x21), state.last_event.?.event_type);
+
+    std.mem.writeInt(u32, host.memory[0x80..0x84], 1, .little);
+    state = .{};
+    const executed = try executor.execute(&stream);
+    try testing.expectEqual(Status.complete, executed.status);
+    try testing.expectEqual(@as(u64, 2), state.event_count);
+    try testing.expectEqual(@as(u8, 0x21), state.last_event.?.event_type);
 }
 
 test "an unmet wait suspends at its packet and resumes after a producer write" {
