@@ -198,7 +198,11 @@ pub fn reserveDwords(state: ?*CommandBuffer, words: u32) ?[*]u32 {
     const cursor = buffer.cursor_up orelse buffer.bottom orelse return null;
     const at = @intFromPtr(cursor);
     buffer.cursor_up = cursor + words;
-    agc_submit.trackGraphicsCommandAllocation(at, words);
+    agc_submit.trackGraphicsCommandAllocation(
+        if (buffer.bottom) |base| @intFromPtr(base) else 0,
+        at,
+        words,
+    );
     return cursor;
 }
 

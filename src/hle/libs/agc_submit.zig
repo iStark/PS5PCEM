@@ -110,6 +110,40 @@ var pending_graphics_lock = ExecutionLock{};
 var pending_graphics_segment = PendingGraphicsSegment{};
 var pending_graphics_reports: u32 = 0;
 
+/// A command arena the AGC builder is filling, and how much of it has run.
+///
+/// A title may record a fence write into an arena and then poll the label it
+/// targets from a plain CPU loop -- `sceAgcSuspendPoint` -- before submitting
+/// anything at all. No queue is blocked and no waiter is registered, so
+/// nothing here would ever execute that arena and the poll cannot end. Keeping
+/// the arenas lets the suspend point run one that has gone quiet while the
+/// guest waits on it.
+const BuilderArena = struct {
+    base: u64 = 0,
+    /// One past the last dword the builder has written into the arena.
+    written_end: u64 = 0,
+    /// One past the last dword already executed out of the arena.
+    executed_end: u64 = 0,
+    /// When the builder last extended the arena. An arena the guest is still
+    /// writing is not stuck, however long it is.
+    written_at_ns: u64 = 0,
+};
+
+const maximum_builder_arenas = 16;
+var builder_arena_lock = ExecutionLock{};
+var builder_arenas: [maximum_builder_arenas]BuilderArena = @splat(.{});
+/// When the guest last submitted anything. While submissions keep arriving the
+/// guest is making progress and owns its own arenas.
+var last_submission_ns: u64 = 0;
+var orphan_arena_reports: u32 = 0;
+var orphan_arena_reported_idle: u64 = 0;
+
+/// How long an arena must stay untouched, with no submission of any kind,
+/// before its fence tail is run. The spinning guest thread makes no firmware
+/// call at all, so this is measured on the completion worker's own clock and
+/// has to be long enough that a slow frame is never mistaken for a stall.
+const orphan_arena_quiet_ns: u64 = 2 * std.time.ns_per_s;
+
 /// Some SDK revisions append `DcbSetFlip` through the command-builder cursor
 /// after freezing the descriptor's public word count.  Keep that constructed
 /// packet until the following graphics submission has drained.  If the packet
@@ -183,6 +217,10 @@ fn completionWorkerMain() void {
     while (kernel_runtime.activeIo() != null and !kernel_runtime.guestStopRequested()) {
         sleepCompletionWorker();
         drainCompletionNotifications();
+        // The thread waiting on a builder-written fence can be spinning in
+        // guest code without making a single firmware call, so this is the
+        // only clock that still runs while it waits.
+        drainQuietBuilderArenas();
     }
     completion_worker_started.store(false, .release);
 }
@@ -337,13 +375,197 @@ fn armPendingGraphicsSegment(stream: []const u32) void {
     pending_graphics_segment = .{ .start = start, .end = start, .range_end = range_end };
 }
 
+/// Remembers how far the builder has written into one of its command arenas.
+/// Called for every packet the builder reserves, so it must stay cheap.
+fn noteBuilderArenaWrite(arena_base: u64, command_start: u64, command_end: u64) void {
+    if (arena_base == 0 or command_end <= arena_base) return;
+    const now = kernel_runtime.processTimeCounter();
+    builder_arena_lock.lock();
+    defer builder_arena_lock.unlock();
+    var free_slot: ?usize = null;
+    var oldest_slot: usize = 0;
+    var oldest_rank: u64 = std.math.maxInt(u64);
+    for (&builder_arenas, 0..) |*arena, index| {
+        if (arena.base == arena_base) {
+            // The builder reuses an arena by rewinding its cursor, so this
+            // tracks the cursor rather than a high-water mark. A write landing
+            // at or below what has already run begins a fresh lap: those
+            // dwords are new commands that merely occupy addresses whose
+            // previous contents ran, and the executed mark has to move back
+            // with the cursor or the new lap is never seen as pending.
+            if (command_start <= arena.executed_end) arena.executed_end = command_start;
+            if (command_end != arena.written_end) {
+                arena.written_end = command_end;
+                arena.written_at_ns = now;
+            }
+            return;
+        }
+        if (arena.base == 0) {
+            if (free_slot == null) free_slot = index;
+            continue;
+        }
+        // An arena whose tail has all run is the best one to give up.
+        const rank = if (arena.executed_end >= arena.written_end) 0 else arena.written_at_ns + 1;
+        if (rank < oldest_rank) {
+            oldest_rank = rank;
+            oldest_slot = index;
+        }
+    }
+    const slot = free_slot orelse oldest_slot;
+    builder_arenas[slot] = .{
+        .base = arena_base,
+        .written_end = command_end,
+        .executed_end = arena_base,
+        .written_at_ns = now,
+    };
+}
+
+/// Marks the dwords an executed stream covered, so the suspend point does not
+/// run them a second time.
+fn noteBuilderArenaExecuted(stream: []const u32) void {
+    if (stream.len == 0) return;
+    const start = @intFromPtr(stream.ptr);
+    const end = start + stream.len * @sizeOf(u32);
+    const now = kernel_runtime.processTimeCounter();
+    builder_arena_lock.lock();
+    defer builder_arena_lock.unlock();
+    last_submission_ns = now;
+    for (&builder_arenas) |*arena| {
+        if (arena.base == 0 or start < arena.base or start >= arena.written_end) continue;
+        if (end > arena.executed_end) arena.executed_end = @min(end, arena.written_end);
+        return;
+    }
+}
+
+/// Runs the tail of a builder arena that the guest has stopped touching while
+/// it spins in `sceAgcSuspendPoint` without submitting anything.
+///
+/// Only a tail made entirely of fence and synchronization packets is run. That
+/// is what a polled label needs, and it is work the GPU would have performed
+/// anyway; a tail holding draws or dispatches is real frame work the guest
+/// still intends to submit itself, and running it early would duplicate it.
+fn drainQuietBuilderArenas() void {
+    var start: u64 = 0;
+    var byte_length: u64 = 0;
+    const now = kernel_runtime.processTimeCounter();
+    builder_arena_lock.lock();
+    const idle_ns = now -| last_submission_ns;
+    if (idle_ns >= orphan_arena_quiet_ns) {
+        if (idle_ns / orphan_arena_quiet_ns > orphan_arena_reported_idle and
+            orphan_arena_reports < 8)
+        {
+            orphan_arena_reported_idle = idle_ns / orphan_arena_quiet_ns;
+            orphan_arena_reports += 1;
+            var pending: usize = 0;
+            var pending_dwords: u64 = 0;
+            for (&builder_arenas) |*arena| {
+                if (arena.base == 0 or arena.written_end <= arena.executed_end) continue;
+                pending += 1;
+                pending_dwords += (arena.written_end - arena.executed_end) / @sizeOf(u32);
+            }
+            std.debug.print(
+                "[agc pending] no submission for {d} ms; {d} builder arenas hold {d} unrun dwords\n",
+                .{ idle_ns / std.time.ns_per_ms, pending, pending_dwords },
+            );
+        }
+        for (&builder_arenas) |*arena| {
+            if (arena.base == 0 or arena.written_end <= arena.executed_end) continue;
+            if (now -| arena.written_at_ns < orphan_arena_quiet_ns) continue;
+            start = arena.executed_end;
+            byte_length = arena.written_end - arena.executed_end;
+            break;
+        }
+    }
+    builder_arena_lock.unlock();
+    if (start == 0 or byte_length == 0 or byte_length % @sizeOf(u32) != 0) return;
+    if (!memory.isGuestRangeAccessible(start, byte_length)) return;
+
+    const pointer: [*]const u32 = @ptrFromInt(start);
+    const available = pointer[0..@intCast(byte_length / @sizeOf(u32))];
+    const snapshot = std.heap.page_allocator.dupe(u32, available) catch return;
+    defer std.heap.page_allocator.free(snapshot);
+    const commands = submittedCommandPrefixForArena(snapshot, start);
+    if (commands.len == 0 or commands.len != snapshot.len or
+        !streamIsRecoverableOrphan(commands))
+    {
+        return;
+    }
+
+    builder_arena_lock.lock();
+    for (&builder_arenas) |*arena| {
+        if (arena.base == 0 or start < arena.base or start >= arena.written_end) continue;
+        arena.executed_end = start + byte_length;
+        break;
+    }
+    builder_arena_lock.unlock();
+
+    if (orphan_arena_reports < 16) {
+        std.debug.print(
+            "[agc pending] ran {d} stranded dwords @0x{x} for a CPU-polled label\n",
+            .{ commands.len, start },
+        );
+        orphan_arena_reports += 1;
+    }
+    rememberSubmissionAlias(available[0..commands.len]);
+    // The guest queued no retirement record for work it never submitted, so
+    // publish the label writes without turning them into a completion edge.
+    execution_lock.lock();
+    beginCompletionBatch();
+    _ = executeSubmittedLocked("dcb", commands);
+    discardCompletionBatch();
+    execution_lock.unlock();
+}
+
+/// True when a stranded tail is one this can run on the guest's behalf.
+///
+/// Two shapes qualify. A tail of pure fence and synchronization packets is
+/// work the GPU would have performed anyway and produces no image. A tail that
+/// is a single INDIRECT_BUFFER is a queue root: the builder wrote the jump to
+/// the stream holding the frame and the guest is waiting on a label that
+/// stream writes, so following it is the only way the wait can end. Anything
+/// else is frame work the guest still intends to submit itself, and running it
+/// early would draw it twice.
+fn streamIsRecoverableOrphan(stream: []const u32) bool {
+    var walker = gpu.pm4.Walker.init(stream);
+    var fences: usize = 0;
+    var indirects: usize = 0;
+    var commands: usize = 0;
+    while (true) {
+        const packet = (walker.next() catch return false) orelse break;
+        if (packet.kind == .filler) continue;
+        if (packet.kind != .command) return false;
+        commands += 1;
+        switch (packet.opcode) {
+            gpu.pm4.indirect_buffer => indirects += 1,
+            gpu.pm4.release_mem, gpu.pm4.write_data, gpu.pm4.event_write_eop => fences += 1,
+            gpu.pm4.event_write, gpu.pm4.acquire_mem => {},
+            gpu.pm4.nop => {
+                const code = gpu.pm4.customCode(packet) orelse continue;
+                switch (code) {
+                    gpu.pm4.custom.release_mem, gpu.pm4.custom.write_data => fences += 1,
+                    gpu.pm4.custom.zero,
+                    gpu.pm4.custom.acquire_mem,
+                    gpu.pm4.custom.push_marker,
+                    gpu.pm4.custom.pop_marker,
+                    => {},
+                    else => return false,
+                }
+            },
+            else => return false,
+        }
+    }
+    if (indirects != 0) return indirects == 1 and commands == 1;
+    return fences != 0;
+}
+
 /// Records AGC commands allocated immediately after the last submitted DCB.
 /// The retail library permits this producer pattern and flushes the contiguous
 /// extension before a compute buffer waits on its release label.
-pub fn trackGraphicsCommandAllocation(address: u64, dword_count: usize) void {
+pub fn trackGraphicsCommandAllocation(arena_base: u64, address: u64, dword_count: usize) void {
     if (address == 0 or dword_count == 0) return;
     const byte_length = std.math.mul(u64, dword_count, @sizeOf(u32)) catch return;
     const command_end = std.math.add(u64, address, byte_length) catch return;
+    noteBuilderArenaWrite(arena_base, address, command_end);
 
     pending_graphics_lock.lock();
     defer pending_graphics_lock.unlock();
@@ -1935,6 +2157,7 @@ pub fn submitDeviceStream(stream: []const u32) SubmitOutcome {
 /// Advance both queues and soft-satisfy any permanent WAIT_REG_MEM heads.
 /// Called from SuspendPoint so the driver observes GPU progress between frames.
 pub fn pumpQueues() void {
+    drainQuietBuilderArenas();
     execution_lock.lock();
     beginCompletionBatch();
     var host_time = kernel_runtime.beginHostTimeExclusion();
@@ -2183,6 +2406,7 @@ fn acceptSubmitted(label: []const u8, stream: []const u32, driver_completion_lab
         dcbWithCompletionPrelude(stream)
     else
         stream;
+    noteBuilderArenaExecuted(commands);
     announce(label, commands);
     return executeAcceptedStream(label, commands, driver_completion_label);
 }
@@ -3403,6 +3627,33 @@ test "an empty submission is not a failure" {
     const summary = summarize(&[_]u32{});
     try testing.expectEqual(@as(usize, 0), summary.packets);
     try testing.expect(summary.stopped == null);
+}
+
+test "only a fence tail or a lone queue root is run on the guest's behalf" {
+    // The shape that strands this title: the builder wrote the jump to the
+    // stream holding the frame and never submitted it, so nothing writes the
+    // label the guest then polls from a plain CPU loop.
+    const root = [_]u32{ command(gpu.pm4.indirect_buffer, 3), 0x1100, 0, 4 };
+    try testing.expect(streamIsRecoverableOrphan(&root));
+
+    const fence = [_]u32{ command(gpu.pm4.release_mem, 6), 0, 0, 0, 0, 0, 0 };
+    try testing.expect(streamIsRecoverableOrphan(&fence));
+
+    // Frame work the guest still intends to submit itself. Running it early
+    // would draw it a second time.
+    const draw = [_]u32{ command(gpu.pm4.draw_index_auto, 2), 3, 0 };
+    try testing.expect(!streamIsRecoverableOrphan(&draw));
+    try testing.expect(!streamIsRecoverableOrphan(&(fence ++ draw)));
+
+    // A root is only followed when it is the whole tail: past it the builder
+    // may still have been writing.
+    try testing.expect(!streamIsRecoverableOrphan(&(root ++ root)));
+    try testing.expect(!streamIsRecoverableOrphan(&(root ++ fence)));
+
+    // Padding alone publishes nothing, so there is nothing to recover.
+    const padding = [_]u32{ command(gpu.pm4.nop, 1), 0 };
+    try testing.expect(!streamIsRecoverableOrphan(&padding));
+    try testing.expect(!streamIsRecoverableOrphan(&.{}));
 }
 
 test "a submission naming no buffer is ignored, not read" {
