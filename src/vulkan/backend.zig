@@ -1138,6 +1138,39 @@ const PendingGuestDraw = struct {
 
 const maximum_pending_targetless_draws: usize = 256;
 
+/// The colour targets one frame's draws bound directly. It answers a single
+/// question at flip time: did this frame already composite into the scanout
+/// buffer itself? A frame binds far more attachments than this holds, so it
+/// keeps the most recently bound ones -- the scanout composite is the end of
+/// the frame, behind every G-buffer and post-process attachment, and an early
+/// G-buffer address falling out is exactly what should be forgotten.
+const BatchColorTargets = struct {
+    const capacity = 32;
+
+    addresses: [capacity]u64 = @splat(0),
+    count: usize = 0,
+    next: usize = 0,
+
+    fn note(self: *BatchColorTargets, address: u64) void {
+        if (address == 0 or self.contains(address)) return;
+        self.addresses[self.next] = address;
+        self.next = (self.next + 1) % capacity;
+        self.count = @min(self.count + 1, capacity);
+    }
+
+    fn contains(self: *const BatchColorTargets, address: u64) bool {
+        for (self.addresses[0..self.count]) |existing| {
+            if (existing == address) return true;
+        }
+        return false;
+    }
+
+    fn reset(self: *BatchColorTargets) void {
+        self.count = 0;
+        self.next = 0;
+    }
+};
+
 const ComputeShaderFailure = struct {
     address: u64,
     err: anyerror,
@@ -2752,6 +2785,8 @@ pub const Renderer = struct {
     guest_graphics_draws: u64 = 0,
     targetless_draws_deferred: u64 = 0,
     targetless_draws_resolved: u64 = 0,
+    targetless_draws_discarded: u64 = 0,
+    batch_color_targets: BatchColorTargets = .{},
     graphics_probe_colored_pixels: u32 = 0,
     graphics_probe_frame: [graphics_probe_bytes]u8 = @splat(0),
     render_targets: std.ArrayList(CachedRenderTarget) = .empty,
@@ -16647,9 +16682,38 @@ pub const Renderer = struct {
         self.frame_profile.reset();
     }
 
+    /// Remembers a colour target this frame drew into directly. The set is
+    /// emptied once the flip it describes has been resolved.
+    fn noteBatchColorTargets(self: *Renderer, render_state: gpu.resources.RenderState) void {
+        for (render_state.color_targets) |candidate| {
+            const color = candidate orelse continue;
+            if (!color.isActive()) continue;
+            self.batch_color_targets.note(color.address);
+        }
+    }
+
     fn resolvePendingTargetlessDraw(self: *Renderer, buffer: DisplayBuffer) void {
         if (self.pending_targetless_draws.items.len == 0) return;
         defer self.pending_targetless_draws.clearRetainingCapacity();
+        // Replaying these against the scanout buffer is only right when the
+        // frame has no other way to fill it: VideoOut supplies the colour
+        // geometry the packet itself lacks. A frame that already composited
+        // straight into this buffer has drawn the finished image, and the
+        // deferred packets are its offscreen depth/stream-out passes, which
+        // carry no colour of their own. Replaying them last overwrites the
+        // composite with whatever their pixel shaders happen to export, which
+        // is how a fully rendered frame reaches the window black.
+        if (self.batch_color_targets.contains(buffer.address)) {
+            const discarded = self.pending_targetless_draws.items.len;
+            self.targetless_draws_discarded +|= discarded;
+            if (self.targetless_draws_discarded == discarded or log_verbose_gpu) {
+                std.debug.print(
+                    "[vulkan dcb] kept direct composite @0x{x}; dropped {d} colourless offscreen draws\n",
+                    .{ buffer.address, discarded },
+                );
+            }
+            return;
+        }
         const target = displayColorTarget(buffer) orelse {
             self.last_draw_error = Error.UnsupportedColorTarget;
             if (self.shouldReportDrawError(Error.UnsupportedColorTarget)) {
@@ -16767,6 +16831,9 @@ pub const Renderer = struct {
             savePipelineCacheBytes(self);
         // Content probes only hold within the frame they were taken in.
         defer self.texture_probe_count = 0;
+        // So do the colour targets this frame bound. Carrying them into the
+        // next flip would let one frame's composite vouch for another's.
+        defer self.batch_color_targets.reset();
         if (log_verbose_gpu) std.debug.print(
             "[vulkan dcb] flip #{d} buffer={d} video_out={d} completed_frames={d}\n",
             .{ self.flip_callbacks, flip.display_buffer_index, flip.video_out_handle, self.completed_frames.items.len },
@@ -16805,8 +16872,7 @@ pub const Renderer = struct {
                 return false;
             };
             if (self.capture_extended_progress_frames and
-                (self.flip_callbacks == 2 or self.flip_callbacks == 4 or
-                    self.flip_callbacks == 64 or self.flip_callbacks == 96 or
+                (self.flip_callbacks == 64 or self.flip_callbacks == 96 or
                     self.flip_callbacks == 128))
             {
                 self.dumpRecentResidentTargets();
@@ -17479,6 +17545,7 @@ pub const Renderer = struct {
                 }
             }
             const targetless = render_state.active_color_count == 0;
+            if (!targetless) self.noteBatchColorTargets(render_state);
             var index: u32 = 0;
             while (index < draw_count) : (index += 1) {
                 const decoded_draw = if (direct) |decoded|
@@ -23361,6 +23428,31 @@ test "sparse presentation retires a deferred UI layer after its scene is gone" {
     try std.testing.expect(shouldPresentDeferredCompositeUi(true, 512, 256));
     try std.testing.expect(!shouldPresentDeferredCompositeUi(true, 513, 256));
     try std.testing.expect(shouldPresentDeferredCompositeUi(true, 12, 20));
+}
+
+test "a frame's scanout composite survives the attachments drawn before it" {
+    var targets = BatchColorTargets{};
+    try std.testing.expect(!targets.contains(0x5005160000));
+
+    // A real frame binds more attachments than the set holds before it
+    // composites. The scanout target is bound last, so it is the one that has
+    // to still be there at flip time.
+    for (0..BatchColorTargets.capacity * 2) |index| {
+        targets.note(0x5000000000 + @as(u64, index) * 0x10000);
+    }
+    targets.note(0x5005160000);
+    try std.testing.expect(targets.contains(0x5005160000));
+    try std.testing.expect(!targets.contains(0x5000000000));
+
+    // A null colour address never counts as a composite, and repeating one
+    // address cannot push the others out.
+    targets.note(0);
+    try std.testing.expect(!targets.contains(0));
+    for (0..BatchColorTargets.capacity * 2) |_| targets.note(0x5005160000);
+    try std.testing.expect(targets.contains(0x5005160000));
+
+    targets.reset();
+    try std.testing.expect(!targets.contains(0x5005160000));
 }
 
 test "sparse graphics resumes complete frames at the gameplay handoff" {
