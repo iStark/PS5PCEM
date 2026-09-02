@@ -2551,12 +2551,49 @@ fn submitOne(
 /// which hardware Submit clears even when the title's PM4 has no RELEASE_MEM
 /// for it. Validate every redundant field before using this private layout so
 /// other SDK versions simply fall back to packet-owned completions.
+/// Reads the completion label a submission descriptor names directly.
+///
+/// One SDK shape carries the label in the descriptor itself rather than behind
+/// a node pointer: the stream and its length identify the descriptor, and the
+/// label is then given three ways over that must agree -- a table page, an
+/// offset into it, and the resolved address. Requiring all three to line up,
+/// and the stream and word count to match the submission in hand, leaves no
+/// room for an unrelated field to be mistaken for a label.
+fn inlineDescriptorCompletionLabel(
+    descriptor_address: u64,
+    submission: Submission,
+) ?u64 {
+    var fields: [0x60]u8 = undefined;
+    if (!readGuestMemory(null, descriptor_address, &fields)) return null;
+    const stream = std.mem.readInt(u64, fields[0x00..0x08], .little);
+    const words: u32 = @truncate(std.mem.readInt(u64, fields[0x08..0x10], .little));
+    if (stream != @intFromPtr(submission.address) or words != submission.word_count) return null;
+
+    const page = std.mem.readInt(u64, fields[0x50..0x58], .little);
+    const offset = std.mem.readInt(u64, fields[0x48..0x50], .little);
+    const label = std.mem.readInt(u64, fields[0x58..0x60], .little);
+    if (page == 0 or page & 0xfff != 0 or offset == 0 or offset >= 0x1000) return null;
+    if (label != page + offset) return null;
+    if (label & 0x1f != 0 or !memory.isGuestRangeAccessible(label, @sizeOf(u64))) return null;
+    return label;
+}
+
 fn driverCompletionLabel(
     descriptor: *const Submission,
     submission: Submission,
     queue_type: u32,
 ) ?u64 {
     const descriptor_address = @intFromPtr(descriptor);
+    if (inlineDescriptorCompletionLabel(descriptor_address, submission)) |label| {
+        if (driver_completion_chain_reports < 32) {
+            std.debug.print(
+                "[agc submit] descriptor label=0x{x} stream=0x{x}/{d}\n",
+                .{ label, @intFromPtr(submission.address), submission.word_count },
+            );
+            driver_completion_chain_reports += 1;
+        }
+        return label;
+    }
     const node_slot = descriptor_address +| 0x50;
     var node_bytes: [8]u8 = undefined;
     if (!readGuestMemory(null, node_slot, &node_bytes)) return null;
