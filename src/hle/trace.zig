@@ -122,9 +122,18 @@ fn currentThreadOrdinal() u32 {
 /// thread is still in this function".
 const maximum_traced_threads: usize = 64;
 var in_flight_names: [maximum_traced_threads][]const u8 = @splat(&.{});
+/// The first arguments of the call in flight. A blocked thread is only half
+/// identified by the entry point it is in; which object it waits on is the
+/// other half, and that is the leading argument of every wait this SDK has.
+var in_flight_arguments: [maximum_traced_threads][2]u64 = @splat(.{ 0, 0 });
 
-fn noteInFlight(ordinal: u32, name: []const u8) void {
-    in_flight_names[ordinal % maximum_traced_threads] = name;
+fn noteInFlight(ordinal: u32, name: []const u8, arguments: []const u64) void {
+    const slot = ordinal % maximum_traced_threads;
+    in_flight_arguments[slot] = .{
+        if (arguments.len > 0) arguments[0] else 0,
+        if (arguments.len > 1) arguments[1] else 0,
+    };
+    in_flight_names[slot] = name;
 }
 
 fn clearInFlight(ordinal: u32) void {
@@ -135,7 +144,10 @@ fn clearInFlight(ordinal: u32) void {
 pub fn reportInFlightCalls() void {
     for (in_flight_names, 0..) |name, slot| {
         if (name.len == 0) continue;
-        std.debug.print("  [in flight] thread_slot={d} {s}\n", .{ slot, name });
+        std.debug.print(
+            "  [in flight] thread_slot={d} {s}(0x{x}, 0x{x})\n",
+            .{ slot, name, in_flight_arguments[slot][0], in_flight_arguments[slot][1] },
+        );
     }
 }
 
@@ -668,7 +680,7 @@ fn takeStackSnapshot(comptime name: []const u8, caller: usize) void {
 /// This runs on the guest's own stack, before firmware moves to a stack of its
 /// own, which is what makes a snapshot of the caller possible at all.
 fn enter(comptime name: []const u8, arguments: []const u64, caller: usize) void {
-    noteInFlight(currentThreadOrdinal(), name);
+    noteInFlight(currentThreadOrdinal(), name, arguments);
     if (capture_armed.load(.acquire)) takeStackSnapshot(name, caller);
     if (!live.load(.acquire) or !isEnabled()) return;
     if (live_failures_only.load(.acquire)) return;

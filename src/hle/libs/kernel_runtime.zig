@@ -230,6 +230,35 @@ pub const SemaphoreWaitInfo = struct {
 var kernel_object_lock = SyncAddressLock{};
 var event_flags: [maximum_event_flags]EventFlag = [_]EventFlag{.{}} ** maximum_event_flags;
 var semaphores: [maximum_semaphores]Semaphore = [_]Semaphore{.{}} ** maximum_semaphores;
+
+/// Prints every semaphore that has threads parked on it.
+///
+/// A stalled title says little through its render path; it says a great deal
+/// through the objects its threads are waiting on. The count, the number of
+/// waiters and who signalled it last together distinguish a semaphore nobody
+/// has posted to yet from one whose producer has stopped.
+pub fn reportBlockedSemaphores() void {
+    kernel_object_lock.lock();
+    defer kernel_object_lock.unlock();
+    for (&semaphores) |*object| {
+        if (object.handle == 0 or object.waiters == 0) continue;
+        std.debug.print(
+            "  [semaphore] handle=0x{x} '{s}' count={d}/{d} waiters={d} needed={d}" ++
+                " waits={d} signals={d} last_signaller='{s}'\n",
+            .{
+                object.handle,
+                std.mem.sliceTo(&object.name, 0),
+                object.count,
+                object.maximum_count,
+                object.waiters,
+                object.last_needed_count,
+                object.wait_calls,
+                object.signal_calls,
+                std.mem.sliceTo(&object.last_signaller_name, 0),
+            },
+        );
+    }
+}
 var semaphore_waiters: [maximum_semaphore_waiters]SemaphoreWaiter =
     [_]SemaphoreWaiter{.{}} ** maximum_semaphore_waiters;
 var next_event_flag_handle: u64 = 1;

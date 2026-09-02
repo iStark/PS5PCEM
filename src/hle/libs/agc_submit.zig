@@ -127,7 +127,15 @@ const BuilderArena = struct {
     /// When the builder last extended the arena. An arena the guest is still
     /// writing is not stuck, however long it is.
     written_at_ns: u64 = 0,
+    /// The submission generation at which this arena was last run from here.
+    /// Rescuing the same arena again before the guest has submitted anything
+    /// of its own would re-run the frame it chains to, over and over.
+    rescued_at_submission: u64 = std.math.maxInt(u64),
 };
+
+/// Counts guest submissions, so a rescue can require real progress between
+/// one attempt and the next.
+var submission_generation: u64 = 0;
 
 const maximum_builder_arenas = 16;
 var builder_arena_lock = ExecutionLock{};
@@ -430,6 +438,7 @@ fn noteBuilderArenaExecuted(stream: []const u32) void {
     builder_arena_lock.lock();
     defer builder_arena_lock.unlock();
     last_submission_ns = now;
+    submission_generation +%= 1;
     for (&builder_arenas) |*arena| {
         if (arena.base == 0 or start < arena.base or start >= arena.written_end) continue;
         if (end > arena.executed_end) arena.executed_end = @min(end, arena.written_end);
@@ -471,10 +480,17 @@ fn drainQuietBuilderArenas() void {
             // pause or a deadlock, and the call ring cannot: it records a call
             // only once it returns.
             trace.reportInFlightCalls();
+            kernel_runtime.reportBlockedSemaphores();
         }
         for (&builder_arenas) |*arena| {
             if (arena.base == 0 or arena.written_end <= arena.executed_end) continue;
             if (now -| arena.written_at_ns < orphan_arena_quiet_ns) continue;
+            // Rescuing the same arena twice without the guest submitting
+            // anything in between re-runs the frame its root chains to, which
+            // is how a rescue turns into a loop that keeps the emulator busy
+            // and the title exactly where it was.
+            if (arena.rescued_at_submission == submission_generation) continue;
+            arena.rescued_at_submission = submission_generation;
             start = arena.executed_end;
             byte_length = arena.written_end - arena.executed_end;
             break;
