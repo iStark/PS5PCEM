@@ -14292,6 +14292,32 @@ pub const Renderer = struct {
     ) anyerror!void {
         if (address == 0 or size == 0) return;
         try self.flushPendingGuestWrite(address, size);
+        {
+            // An all-zero input means one of two very different things: no
+            // resident attachment covers the address, so the zeros are just
+            // guest memory nobody wrote, or one does and it really is empty.
+            var covering: ?usize = null;
+            var covering_sequence: u64 = 0;
+            for (self.render_targets.items, 0..) |cached, index| {
+                if (!cached.initialized) continue;
+                const descriptor = cached.target.descriptor;
+                const span = cached.target.layout.required_source_bytes;
+                if (address < descriptor.address or address >= descriptor.address + span) continue;
+                if (covering == null or cached.last_used_sequence > covering_sequence) {
+                    covering = index;
+                    covering_sequence = cached.last_used_sequence;
+                }
+            }
+            if (covering) |index| {
+                const descriptor = self.render_targets.items[index].target.descriptor;
+                std.debug.print(
+                    "  [input alias] 0x{x} lies in resident target @0x{x} {d}x{d} fmt={d} sequence={d}\n",
+                    .{ address, descriptor.address, descriptor.width, descriptor.height, descriptor.format, covering_sequence },
+                );
+            } else {
+                std.debug.print("  [input alias] 0x{x} has no resident target\n", .{address});
+            }
+        }
         const bytes = try self.allocator.alloc(u8, size);
         defer self.allocator.free(bytes);
         if (!memory.read(memory.context, address, bytes)) return Error.GuestMemoryReadFailed;
