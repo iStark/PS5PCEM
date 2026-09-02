@@ -76,6 +76,7 @@ var traced_shader_program_count: usize = 0;
 var traced_shader_programs: [32]u64 = [_]u64{0} ** 32;
 var installed_backend: ?gpu.DcbBackend = null;
 var soft_wait_batch_reports: u32 = 0;
+
 var trimmed_submission_reports: u32 = 0;
 var compact_release_reports: u32 = 0;
 var submission_reports: u32 = 0;
@@ -733,6 +734,10 @@ pub fn writeGuestMemory(context: ?*anyopaque, address: u64, bytes: []const u8) b
     const destination: [*]u8 = @ptrFromInt(resolved);
     @memcpy(destination[0..bytes.len], bytes);
     if (resolved != address) kernel_runtime.wakeSyncAddress(resolved, std.math.maxInt(usize));
+    // A completion published from the HLE side is a label like any other, and
+    // a queue may be parked on it inside a snapshotted arena.
+    mirrorLabelWrite(address, bytes);
+    if (resolved != address) mirrorLabelWrite(resolved, bytes);
     return true;
 }
 
@@ -1050,9 +1055,28 @@ fn backendRead(_: ?*anyopaque, address: u64, bytes: []u8) bool {
     return readGuestMemory(null, address, bytes);
 }
 
+/// Publishes a label write into the retained snapshots of both queues.
+///
+/// Command arenas place synchronization labels beside the packets that read
+/// them, and those arenas are snapshotted so a recycled allocation cannot
+/// rewrite a stream mid-parse. A queue waiting on such a label therefore
+/// re-reads the value the submission started with, however many times it is
+/// pumped -- including when the label is published by the *other* queue, which
+/// is the ordinary case for a fence. Mirroring keeps PM4 immutable while
+/// letting the labels beside it move.
+fn mirrorLabelWrite(address: u64, bytes: []const u8) void {
+    if (bytes.len == 0 or bytes.len > 8) return;
+    _ = submission_scheduler.mirrorActiveWrite(.graphics, address, bytes);
+    _ = submission_scheduler.mirrorActiveWrite(.compute, address, bytes);
+}
+
 fn backendWrite(_: ?*anyopaque, address: u64, bytes: []const u8) bool {
-    if (installed_backend) |backend| return backend.vtable.write(backend.context, address, bytes);
-    return writeGuestMemory(null, address, bytes);
+    const ok = if (installed_backend) |backend|
+        backend.vtable.write(backend.context, address, bytes)
+    else
+        writeGuestMemory(null, address, bytes);
+    if (ok) mirrorLabelWrite(address, bytes);
+    return ok;
 }
 
 fn backendAcquire(_: ?*anyopaque, value: gpu.state.AcquireMem) bool {
@@ -2273,10 +2297,27 @@ fn executeSubmittedLocked(label: []const u8, stream: []const u32) SubmitOutcome 
         submission_scheduler.pendingCount(kind) == 0;
     if (submission_scheduler.isBlocked(kind)) {
         if (submission_scheduler.state(kind).blocked_wait) |wait| {
-            std.debug.print(
-                "[{s}] still blocked after soft-satisfy: WAIT_REG_MEM 0x{x} ref=0x{x}; {d} queued\n",
-                .{ label, wait.address, wait.reference, submission_scheduler.pendingCount(kind) },
-            );
+            // Suspending is the expected outcome for an unmet wait, so name the
+            // label only a few times: what matters is which synchronization the
+            // queue is waiting on, not how often it waits.
+            if (soft_wait_batch_reports < 16) {
+                var current: [8]u8 = @splat(0);
+                const readable = readGuestMemory(null, wait.address, current[0..8]);
+                std.debug.print(
+                    "[{s}] suspended on WAIT_REG_MEM 0x{x} ref=0x{x} mask=0x{x} op={d} have={s}0x{x}; {d} queued\n",
+                    .{
+                        label,
+                        wait.address,
+                        wait.reference,
+                        wait.mask,
+                        wait.compare_function,
+                        if (readable) "" else "?",
+                        std.mem.readInt(u64, &current, .little),
+                        submission_scheduler.pendingCount(kind),
+                    },
+                );
+                soft_wait_batch_reports +|= 1;
+            }
         }
     }
     if (trace.isLive() and report.completed_submissions > 1) {
