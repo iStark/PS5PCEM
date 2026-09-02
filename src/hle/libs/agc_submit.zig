@@ -138,7 +138,12 @@ const BuilderArena = struct {
 /// one attempt and the next.
 var submission_generation: u64 = 0;
 
-const maximum_builder_arenas = 16;
+// SDK 11 keeps a builder per worker/queue. Yotei creates seventeen before its
+// first flip; a sixteen-entry ledger evicted the oldest (the scene builder)
+// while retaining the later one-packet fence builders, so its object batch was
+// invisible to orphan recovery. This is tracking storage only, not a guest or
+// Vulkan allocation.
+const maximum_builder_arenas = 64;
 var builder_arena_lock = ExecutionLock{};
 var builder_arenas: [maximum_builder_arenas]BuilderArena = @splat(.{});
 /// When the guest last submitted anything. While submissions keep arriving the
@@ -146,6 +151,7 @@ var builder_arenas: [maximum_builder_arenas]BuilderArena = @splat(.{});
 var last_submission_ns: u64 = 0;
 var orphan_arena_reports: u32 = 0;
 var orphan_arena_reported_idle: u64 = 0;
+var builder_arena_flip_reports: u32 = 0;
 
 /// How long an arena must stay untouched, with no submission of any kind,
 /// before its fence tail is run. The spinning guest thread makes no firmware
@@ -393,7 +399,8 @@ fn noteBuilderArenaWrite(arena_base: u64, command_start: u64, command_end: u64) 
     defer builder_arena_lock.unlock();
     var free_slot: ?usize = null;
     var oldest_slot: usize = 0;
-    var oldest_rank: u64 = std.math.maxInt(u64);
+    var smallest_pending_bytes: u64 = std.math.maxInt(u64);
+    var smallest_pending_time: u64 = std.math.maxInt(u64);
     for (&builder_arenas, 0..) |*arena, index| {
         if (arena.base == arena_base) {
             // The builder reuses an arena by rewinding its cursor, so this
@@ -413,10 +420,20 @@ fn noteBuilderArenaWrite(arena_base: u64, command_start: u64, command_end: u64) 
             if (free_slot == null) free_slot = index;
             continue;
         }
-        // An arena whose tail has all run is the best one to give up.
-        const rank = if (arena.executed_end >= arena.written_end) 0 else arena.written_at_ns + 1;
-        if (rank < oldest_rank) {
-            oldest_rank = rank;
+        // An arena whose tail has all run is the best one to give up. If every
+        // entry is pending, preserve the larger command streams: SDK 11 can
+        // create scores of four-dword release-only builders after recording a
+        // nine-dword scene draw, and age-based eviction loses the producer
+        // while retaining all of its fences.
+        const pending_bytes = if (arena.executed_end >= arena.written_end)
+            0
+        else
+            arena.written_end - arena.executed_end;
+        if (pending_bytes < smallest_pending_bytes or
+            (pending_bytes == smallest_pending_bytes and arena.written_at_ns < smallest_pending_time))
+        {
+            smallest_pending_bytes = pending_bytes;
+            smallest_pending_time = arena.written_at_ns;
             oldest_slot = index;
         }
     }
@@ -431,20 +448,91 @@ fn noteBuilderArenaWrite(arena_base: u64, command_start: u64, command_end: u64) 
 
 /// Marks the dwords an executed stream covered, so the suspend point does not
 /// run them a second time.
-fn noteBuilderArenaExecuted(stream: []const u32) void {
-    if (stream.len == 0) return;
-    const start = @intFromPtr(stream.ptr);
-    const end = start + stream.len * @sizeOf(u32);
-    const now = kernel_runtime.processTimeCounter();
+fn markBuilderArenaExecuted(start: u64, byte_length: u64) void {
+    const end = std.math.add(u64, start, byte_length) catch return;
     builder_arena_lock.lock();
     defer builder_arena_lock.unlock();
-    last_submission_ns = now;
-    submission_generation +%= 1;
     for (&builder_arenas) |*arena| {
         if (arena.base == 0 or start < arena.base or start >= arena.written_end) continue;
         if (end > arena.executed_end) arena.executed_end = @min(end, arena.written_end);
         return;
     }
+}
+
+fn noteIndirectBuilderTarget(
+    address: u64,
+    word_count: usize,
+    depth: usize,
+    active_addresses: *[gpu.executor.maximum_stream_depth]u64,
+) void {
+    if (address == 0 or word_count == 0 or address & 3 != 0 or
+        depth >= active_addresses.len or word_count > std.math.maxInt(u32)) return;
+    for (active_addresses[0..depth]) |active| {
+        if (active == address) return;
+    }
+    const byte_length = std.math.mul(u64, word_count, @sizeOf(u32)) catch return;
+    markBuilderArenaExecuted(address, byte_length);
+    const pointer: [*]const u32 = @ptrFromInt(address);
+    const stream = streamOf(pointer, @intCast(word_count)) orelse return;
+    active_addresses[depth] = address;
+    noteReachableBuilderArenas(stream, depth + 1, active_addresses);
+}
+
+/// Mirrors the scheduler's indirect-buffer snapshot walk into the builder
+/// ledger. Without this, every child reached by a public root still looked
+/// orphaned and could be replayed by recovery even though the GPU had executed
+/// it already.
+fn noteReachableBuilderArenas(
+    stream: []const u32,
+    depth: usize,
+    active_addresses: *[gpu.executor.maximum_stream_depth]u64,
+) void {
+    if (depth >= active_addresses.len) return;
+    var walker = gpu.pm4.Walker.init(stream);
+    while (walker.next() catch return) |packet| {
+        if (packet.kind != .command or packet.opcode != gpu.pm4.indirect_buffer) continue;
+        if (packet.body.len == 3) {
+            const address = (@as(u64, packet.body[1]) << 32) | packet.body[0];
+            noteIndirectBuilderTarget(
+                address,
+                packet.body[2] & 0x000f_ffff,
+                depth,
+                active_addresses,
+            );
+        } else if (packet.body.len == 13) {
+            // Both branches belong to this submitted graph. Marking both as
+            // reachable keeps the untaken alternative from being mistaken for
+            // independent orphan work on the next sweep.
+            noteIndirectBuilderTarget(
+                (@as(u64, packet.body[8]) << 32) | packet.body[7],
+                packet.body[9] & 0x000f_ffff,
+                depth,
+                active_addresses,
+            );
+            noteIndirectBuilderTarget(
+                (@as(u64, packet.body[11]) << 32) | packet.body[10],
+                packet.body[12] & 0x000f_ffff,
+                depth,
+                active_addresses,
+            );
+        }
+    }
+}
+
+fn noteBuilderArenaExecuted(stream: []const u32) void {
+    if (stream.len == 0) return;
+    const start = @intFromPtr(stream.ptr);
+    const byte_length = std.math.mul(u64, stream.len, @sizeOf(u32)) catch return;
+    const now = kernel_runtime.processTimeCounter();
+    builder_arena_lock.lock();
+    last_submission_ns = now;
+    submission_generation +%= 1;
+    builder_arena_lock.unlock();
+    markBuilderArenaExecuted(start, byte_length);
+
+    var active_addresses: [gpu.executor.maximum_stream_depth]u64 = @splat(0);
+    active_addresses[0] = start;
+    noteReachableBuilderArenas(stream, 1, &active_addresses);
 }
 
 /// Runs the tail of a builder arena that the guest has stopped touching while
@@ -538,6 +626,49 @@ fn drainQuietBuilderArenas() void {
     _ = executeSubmittedLocked("dcb", commands);
     discardCompletionBatch();
     execution_lock.unlock();
+}
+
+/// Reports the executable work which AGC builders have finished recording but
+/// no public submission has covered.  Keep this bounded to the first flip: it
+/// is a topology probe for SDK revisions which submit a retirement DCB while
+/// leaving the scene arena behind, not a per-frame hot-path trace.
+fn reportPendingBuilderArenasAtFlip() void {
+    if (builder_arena_flip_reports != 0) return;
+    builder_arena_flip_reports = 1;
+
+    var snapshot: [maximum_builder_arenas]BuilderArena = undefined;
+    builder_arena_lock.lock();
+    snapshot = builder_arenas;
+    builder_arena_lock.unlock();
+
+    const now = kernel_runtime.processTimeCounter();
+    for (snapshot) |arena| {
+        if (arena.base == 0 or arena.written_end <= arena.executed_end) continue;
+        const byte_length = arena.written_end - arena.executed_end;
+        if (byte_length % @sizeOf(u32) != 0 or
+            !memory.isGuestRangeAccessible(arena.executed_end, byte_length)) continue;
+        const pointer: [*]const u32 = @ptrFromInt(arena.executed_end);
+        const live = pointer[0..@intCast(byte_length / @sizeOf(u32))];
+        const frozen = std.heap.page_allocator.dupe(u32, live) catch continue;
+        defer std.heap.page_allocator.free(frozen);
+        const commands = submittedCommandPrefixForArena(frozen, arena.executed_end);
+        const summary = summarize(commands);
+        std.debug.print(
+            "[agc pending] first-flip arena base=0x{x} pending=0x{x}-0x{x} age_ms={d} commands={d}/{d} packets={d} draws={d} dispatches={d} recoverable={any}\n",
+            .{
+                arena.base,
+                arena.executed_end,
+                arena.written_end,
+                (now -| arena.written_at_ns) / std.time.ns_per_ms,
+                commands.len,
+                frozen.len,
+                summary.packets,
+                summary.draws,
+                summary.dispatches,
+                streamIsRecoverableOrphan(commands),
+            },
+        );
+    }
 }
 
 /// True when a stranded tail is one this can run on the guest's behalf.
@@ -1398,6 +1529,7 @@ fn backendFlip(_: ?*anyopaque, value: gpu.state.Flip) bool {
     else
         true;
     if (!accepted) return false;
+    reportPendingBuilderArenasAtFlip();
     if (!video_out.completeFlip(value)) return false;
     _ = event_queue.triggerVideoOutFlip(value.argument);
     // Titles that wait on vblank edges (or poll GetVblankStatus) need refresh
@@ -1569,6 +1701,14 @@ pub fn reset() void {
     pending_graphics_segment = .{};
     pending_graphics_reports = 0;
     pending_graphics_lock.unlock();
+    builder_arena_lock.lock();
+    builder_arenas = @splat(.{});
+    last_submission_ns = 0;
+    submission_generation = 0;
+    orphan_arena_reports = 0;
+    orphan_arena_reported_idle = 0;
+    builder_arena_flip_reports = 0;
+    builder_arena_lock.unlock();
     constructed_flip_lock.lock();
     pending_constructed_flip = null;
     recovered_constructed_flip_reports = 0;

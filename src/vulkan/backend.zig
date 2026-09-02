@@ -10408,16 +10408,31 @@ pub const Renderer = struct {
         }
         defer self.destroyImageView(view);
 
-        const render_pass = try self.createGraphicsRenderPass(
-            vk.format_r8g8b8a8_unorm,
-            guest_target != null,
-            vk.sample_count_1_bit,
-        );
+        // The non-persistent path doubles as the compatibility colour
+        // attachment for a guest depth-only draw.  Keep the private RGBA image
+        // (with writes masked off by the caller), but pair it with the real DB
+        // allocation so the raster work is not mistaken for a VideoOut pass.
+        const depth_index: ?usize = if (depth) |plane| try self.acquireDepthTarget(plane) else null;
+        const render_pass = if (depth) |plane|
+            try self.createDepthGraphicsRenderPass(
+                vk.format_r8g8b8a8_unorm,
+                plane.format,
+                guest_target != null,
+                vk.sample_count_1_bit,
+            )
+        else
+            try self.createGraphicsRenderPass(
+                vk.format_r8g8b8a8_unorm,
+                guest_target != null,
+                vk.sample_count_1_bit,
+            );
         defer self.destroyRenderPass(render_pass);
+        var framebuffer_views = [2]vk.ImageView{ view, 0 };
+        if (depth_index) |index| framebuffer_views[1] = self.depth_targets.items[index].view;
         const framebuffer_info = vk.FramebufferCreateInfo{
             .render_pass = render_pass,
-            .attachment_count = 1,
-            .attachments = @ptrCast(&view),
+            .attachment_count = if (depth_index != null) 2 else 1,
+            .attachments = &framebuffer_views,
             .width = width,
             .height = height,
         };
@@ -10490,6 +10505,9 @@ pub const Renderer = struct {
                 1,
                 @ptrCast(&attachment_barrier),
             );
+        }
+        if (depth_index) |index| {
+            try self.prepareDepthAttachment(command_buffer, index, depth_clear_requested);
         }
         const clear = vk.ClearValue{ .color = .{ .float32 = .{ 0, 0, 0, 1 } } };
         const begin_info = vk.RenderPassBeginInfo{
@@ -10618,6 +10636,12 @@ pub const Renderer = struct {
             null,
         );
         try self.submitOneShot(command_buffer);
+        if (depth_index) |index| {
+            const depth_cached = &self.depth_targets.items[index];
+            depth_cached.gpu_generation +%= 1;
+            _ = self.image_aliases.markWrite(depth_cached.alias_token);
+            if (depth_cached.stencil_alias_token) |token| _ = self.image_aliases.markWrite(token);
+        }
         try self.readMapped(readback, frame);
         if (guest_target) |target| {
             if (target.descriptor.force_destination_alpha_one) forceDestinationAlphaOne(frame);
@@ -10983,10 +11007,34 @@ pub const Renderer = struct {
                 render_state.depth_control.clear_enabled or
                 render_state.depth_control.stencil_enabled or
                 render_state.depth_control.stencil_clear_enabled);
-        var depth_plane: ?GuestDepthTarget = if (depth_wanted)
-            if (render_state.depth_target) |bound| guestDepthTarget(bound) else null
-        else
-            null;
+        var depth_plane: ?GuestDepthTarget = if (depth_wanted) blk: {
+            var bound = render_state.depth_target orelse break :blk null;
+            // SDK11 can leave DB_DEPTH_SIZE_XY at its reset 1x1 value while
+            // the viewport and the following sampled-depth descriptor carry
+            // the real extent. SharpEmu uses the same conservative recovery:
+            // only expand the exact reset sentinel, never an arbitrary
+            // undersized attachment.
+            if (bound.width == 1 and bound.height == 1) {
+                if (render_state.viewport) |viewport| {
+                    const viewport_width = @abs(viewport.x_scale * 2.0);
+                    const viewport_height = @abs(viewport.y_scale * 2.0);
+                    if (std.math.isFinite(viewport_width) and std.math.isFinite(viewport_height) and
+                        viewport_width > 1 and viewport_height > 1 and
+                        viewport_width <= 16384 and viewport_height <= 16384)
+                    {
+                        bound.width = @intFromFloat(@ceil(viewport_width));
+                        bound.height = @intFromFloat(@ceil(viewport_height));
+                        if (self.traceCurrentGraphicsFrame()) {
+                            std.debug.print(
+                                "[vulkan dcb] inferred reset depth extent @0x{x}: 1x1 -> {d}x{d}\n",
+                                .{ if (bound.write_address != 0) bound.write_address else bound.read_address, bound.width, bound.height },
+                            );
+                        }
+                    }
+                }
+            }
+            break :blk guestDepthTarget(bound);
+        } else null;
         if (depth_wanted and depth_plane == null) {
             if (log_verbose_gpu) std.debug.print(
                 "[vulkan dcb] draw: depth requested but not representable (bound={any})\n",
@@ -10995,6 +11043,7 @@ pub const Renderer = struct {
         }
         var bound_colors: [gpu.resources.color_target_count]GuestColorTarget = undefined;
         var bound_color_count: usize = 0;
+        var depth_only = false;
         if (target_override) |override| {
             bound_colors[0] = try guestColorTarget(override);
             bound_color_count = 1;
@@ -11054,7 +11103,25 @@ pub const Renderer = struct {
                 bound_color_count += 1;
             }
         }
-        if (bound_color_count == 0) return Error.MissingColorTarget;
+        if (bound_color_count == 0) {
+            const plane = depth_plane orelse return Error.MissingColorTarget;
+            // Vulkan accepts a fragment shader with its exports masked, but
+            // the existing graphics translator and pipeline cache are built
+            // around one colour slot. Supply a private compatibility target;
+            // drawGraphicsShaders keeps it off guest memory and attaches the
+            // persistent depth image below.
+            var compatibility = std.mem.zeroes(gpu.resources.ColorTarget);
+            compatibility.width = plane.width;
+            compatibility.height = plane.height;
+            compatibility.depth = 1;
+            compatibility.pitch = plane.width;
+            compatibility.format = 10; // DATA_FORMAT_8_8_8_8
+            compatibility.tile_mode = .render_target;
+            compatibility.write_mask = 0;
+            bound_colors[0] = try guestColorTarget(compatibility);
+            bound_color_count = 1;
+            depth_only = true;
+        }
         const target = bound_colors[0];
         const extra_colors = bound_colors[1..bound_color_count];
         const descriptor = target.descriptor;
@@ -12425,7 +12492,7 @@ pub const Renderer = struct {
                     vertex_scalar_regs[0..vertex_scalar_count],
                     fragment_scalar_regs[0..fragment_scalar_count],
                     pipeline_state,
-                    target,
+                    if (depth_only) null else target,
                     extra_colors,
                     depth_plane,
                     render_state.depth_control.clear_enabled or
@@ -12569,7 +12636,7 @@ pub const Renderer = struct {
                 &.{},
                 fragment_scalar_regs[0..fragment_scalar_count],
                 probe_pipeline_state,
-                target,
+                if (depth_only) null else target,
                 extra_colors,
                 depth_plane,
                 render_state.depth_control.clear_enabled or
@@ -12631,7 +12698,7 @@ pub const Renderer = struct {
             &.{},
             fragment_scalar_regs[0..fragment_scalar_count],
             pipeline_state,
-            target,
+            if (depth_only) null else target,
             extra_colors,
             depth_plane,
             render_state.depth_control.clear_enabled or
@@ -17475,7 +17542,7 @@ pub const Renderer = struct {
         if (self.traceCurrentGraphicsFrame()) {
             const traced_state = gpu.resources.decodeRenderState(state);
             std.debug.print(
-                "[vulkan dcb] draw packet trace next_flip={d} draw={d} opcode=0x{x} indirect={any} count={d} active_colors={d} VS={?x} PS={?x}\n",
+                "[vulkan dcb] draw packet trace next_flip={d} draw={d} opcode=0x{x} indirect={any} count={d} active_colors={d} VS={?x} PS={?x} depth={?x}/{?d}x{?d} test={any} write={any} clear={any} stencil={any} raw(view/size/z/read/write/high-read/high-write)={?x}/{?x}/{?x}/{?x}/{?x}/{?x}/{?x}\n",
                 .{
                     self.flip_callbacks + 1,
                     self.frame_profile.draws,
@@ -17485,11 +17552,24 @@ pub const Renderer = struct {
                     traced_state.active_color_count,
                     if (vertex_stage) |stage| stage.programAddress(state) else null,
                     gpu.resources.ShaderStage.pixel.programAddress(state),
+                    if (traced_state.depth_target) |depth| depth.write_address else null,
+                    if (traced_state.depth_target) |depth| depth.width else null,
+                    if (traced_state.depth_target) |depth| depth.height else null,
+                    traced_state.depth_control.test_enabled,
+                    traced_state.depth_control.write_enabled,
+                    traced_state.depth_control.clear_enabled,
+                    traced_state.depth_control.stencil_enabled,
+                    state.readRegister(.context, 0x002),
+                    state.readRegister(.context, 0x007),
+                    state.readRegister(.context, 0x010),
+                    state.readRegister(.context, 0x012),
+                    state.readRegister(.context, 0x014),
+                    state.readRegister(.context, 0x01a),
+                    state.readRegister(.context, 0x01c),
                 },
             );
             for (traced_state.color_targets) |candidate| {
                 const color = candidate orelse continue;
-                if (!color.isActive()) continue;
                 std.debug.print(
                     "  traced color slot={d} addr=0x{x} {d}x{d} pitch={d} fmt={d}/{d} swap={d} write=0x{x} tile={s}\n",
                     .{
@@ -17576,6 +17656,13 @@ pub const Renderer = struct {
                 }
             }
             const targetless = render_state.active_color_count == 0;
+            const targetless_depth_work = targetless and render_state.depth_target != null and
+                (render_state.depth_control.test_enabled or
+                    render_state.depth_control.write_enabled or
+                    render_state.depth_control.clear_enabled or
+                    render_state.depth_control.stencil_enabled or
+                    render_state.depth_control.stencil_clear_enabled);
+            const deferred_display_draw = targetless and !targetless_depth_work;
             if (!targetless) self.noteBatchColorTargets(render_state);
             var index: u32 = 0;
             while (index < draw_count) : (index += 1) {
@@ -17646,7 +17733,7 @@ pub const Renderer = struct {
                         },
                     );
                 }
-                if (targetless) {
+                if (deferred_display_draw) {
                     self.appendPendingTargetlessDraw(state, draw, vertex_stage.?);
                     continue;
                 }
@@ -17670,7 +17757,7 @@ pub const Renderer = struct {
                 self.guest_graphics_draws += 1;
                 self.translated_draws += 1;
             }
-            if (targetless) return true;
+            if (deferred_display_draw) return true;
         } else self.drawGraphicsProbe() catch |err| {
             self.last_draw_error = err;
             std.debug.print("[vulkan dcb] graphics probe rejected: {s}\n", .{@errorName(err)});
