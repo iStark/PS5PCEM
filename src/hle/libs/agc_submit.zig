@@ -390,10 +390,22 @@ fn armPendingGraphicsSegment(stream: []const u32) void {
     pending_graphics_segment = .{ .start = start, .end = start, .range_end = range_end };
 }
 
+/// GPU command arenas are mapped from direct memory into the title user
+/// window. Thread stacks (and TLS) are allocated from the top of
+/// system-managed; a builder whose bottom is there is recording into the
+/// CPU stack, which is not a DCB and must never be rescued as one.
+fn builderArenaIsGpuCommandMemory(base: u64) bool {
+    if (base == 0) return false;
+    if (base >= guest_address_space.user.start) return true;
+    if (base >= guest_address_space.thread_runtime_search_base) return false;
+    return !memory.isGuestStackRange(base, @sizeOf(u32));
+}
+
 /// Remembers how far the builder has written into one of its command arenas.
 /// Called for every packet the builder reserves, so it must stay cheap.
 fn noteBuilderArenaWrite(arena_base: u64, command_start: u64, command_end: u64) void {
     if (arena_base == 0 or command_end <= arena_base) return;
+    if (!builderArenaIsGpuCommandMemory(arena_base)) return;
     const now = kernel_runtime.processTimeCounter();
     builder_arena_lock.lock();
     defer builder_arena_lock.unlock();
@@ -591,6 +603,21 @@ fn drainQuietBuilderArenas() void {
     builder_arena_lock.unlock();
     if (start == 0 or byte_length == 0 or byte_length % @sizeOf(u32) != 0) return;
     if (!memory.isGuestRangeAccessible(start, byte_length)) return;
+    // The ledger can still hold a stack-backed builder from before this
+    // origin check, or from a rewind onto an address the cheap window test
+    // missed. Executing that tail as PM4 walks guest stack contents.
+    if (memory.isGuestStackRange(start, byte_length) or
+        !builderArenaIsGpuCommandMemory(start))
+    {
+        if (orphan_arena_reports < 16) {
+            std.debug.print(
+                "[agc pending] skipped stack-backed builder tail {d} dwords @0x{x}\n",
+                .{ byte_length / @sizeOf(u32), start },
+            );
+            orphan_arena_reports += 1;
+        }
+        return;
+    }
 
     const pointer: [*]const u32 = @ptrFromInt(start);
     const available = pointer[0..@intCast(byte_length / @sizeOf(u32))];
@@ -654,7 +681,7 @@ fn reportPendingBuilderArenasAtFlip() void {
         const commands = submittedCommandPrefixForArena(frozen, arena.executed_end);
         const summary = summarize(commands);
         std.debug.print(
-            "[agc pending] first-flip arena base=0x{x} pending=0x{x}-0x{x} age_ms={d} commands={d}/{d} packets={d} draws={d} dispatches={d} recoverable={any}\n",
+            "[agc pending] first-flip arena base=0x{x} pending=0x{x}-0x{x} age_ms={d} commands={d}/{d} packets={d} draws={d} dispatches={d} recoverable={any} gpu_arena={any}\n",
             .{
                 arena.base,
                 arena.executed_end,
@@ -666,6 +693,7 @@ fn reportPendingBuilderArenasAtFlip() void {
                 summary.draws,
                 summary.dispatches,
                 streamIsRecoverableOrphan(commands),
+                builderArenaIsGpuCommandMemory(arena.base),
             },
         );
     }
@@ -3937,6 +3965,15 @@ test "only a fence tail or a lone queue root is run on the guest's behalf" {
     const padding = [_]u32{ command(gpu.pm4.nop, 1), 0 };
     try testing.expect(!streamIsRecoverableOrphan(&padding));
     try testing.expect(!streamIsRecoverableOrphan(&.{}));
+}
+
+test "a builder whose bottom is on the thread stack is not a command arena" {
+    try testing.expect(builderArenaIsGpuCommandMemory(0x20_1160_c000));
+    try testing.expect(builderArenaIsGpuCommandMemory(guest_address_space.user.start));
+    try testing.expect(!builderArenaIsGpuCommandMemory(0));
+    try testing.expect(!builderArenaIsGpuCommandMemory(0x7e05_deb90));
+    try testing.expect(!builderArenaIsGpuCommandMemory(guest_address_space.thread_runtime_search_base));
+    try testing.expect(!builderArenaIsGpuCommandMemory(guest_address_space.thread_runtime_search_base + 0x1000));
 }
 
 test "a submission naming no buffer is ignored, not read" {

@@ -4494,7 +4494,15 @@ const Builder = struct {
         const coordinates = self.id();
         if (dimension != .two_d) {
             if (self.vector3_bits_type == 0) return Error.InvalidStorageBinding;
-            const z = try self.source(try imageAddressOperand(inst, 2), .bits32);
+            // A 2-coordinate MIMG into an array/volume T# names only X/Y. The
+            // bound view already selects the guest slice (Yotei's cubemap
+            // filter stores DIM=2D into a 2d_array T# whose base_array walks
+            // faces across dispatches). Inventing a third VGPR reads an
+            // unrelated float and becomes an out-of-range layer index.
+            const z = if (inst.image_address_components >= 3)
+                try self.source(try imageAddressOperand(inst, 2), .bits32)
+            else
+                try self.constant(.bits32, 0);
             try self.emit(&self.body, 80, &.{ self.vector3_bits_type, coordinates, x, y, z }); // OpCompositeConstruct
         } else {
             try self.emit(&self.body, 80, &.{ self.vector2_bits_type, coordinates, x, y }); // OpCompositeConstruct
@@ -6234,6 +6242,12 @@ const Builder = struct {
         // verts → black guest VS writeback.
         const soffset = if (binding.soffset_value) |value|
             try self.constant(.bits32, value)
+        else if (inst.family == .smem and inst.src1.kind == .sgpr and inst.src2.kind == .sgpr and
+            inst.src2.reg >= inst.src1.reg and inst.src2.reg < inst.src1.reg + 4)
+            // Same V# collision as executeSmem: SOFFSET=0 decodes as SGPR0,
+            // which is the descriptor when the V# lives in s0. The bound SSBO
+            // is already the allocation; adding address-lo goes OOB → 0.
+            try self.constant(.bits32, 0)
         else switch (inst.src2.kind) {
             .null,
             .m0,
@@ -6943,6 +6957,27 @@ const Builder = struct {
             inst.family != .smem)
         {
             return false;
+        }
+
+        // A bound V# is the source of truth for s_buffer_load. CPU evaluation
+        // of the same instruction can read the wrong address (SMEM SOFFSET of
+        // 0 is SGPR0, often the V# itself) and then specialise the dests to
+        // zero. Yotei's fullscreen G-buffer PS exports those zeros as colour.
+        // Emit the runtime SSBO load instead.
+        switch (inst.opcode) {
+            .s_buffer_load_dword,
+            .s_buffer_load_dwordx2,
+            .s_buffer_load_dwordx4,
+            .s_buffer_load_dwordx8,
+            .s_buffer_load_dwordx16,
+            => {
+                if (self.storage_array != 0 and inst.src0.kind == .sgpr and
+                    self.storageBinding(inst.src0.reg, inst.pc) != null)
+                {
+                    return false;
+                }
+            },
+            else => {},
         }
 
         // Multi-dword SMEM writes may only be replaced when every destination
@@ -10930,6 +10965,39 @@ test "three-coordinate image load follows a two-dimensional storage descriptor" 
     try std.testing.expectEqual(@as(usize, 1), countOpcode(module.words, 23)); // uint2 coordinates
 }
 
+test "two-coordinate image store into an array view writes slice zero" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .family = .mimg,
+        .opcode = .image_store,
+        .opcode_id = 8,
+        .dst = .{ .kind = .vgpr, .reg = 8 },
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src1 = .{ .kind = .sgpr, .reg = 4 },
+        .src_count = 2,
+        .image_dimension = .dim_2d,
+        .image_address_components = 2,
+        .data_mask = 0xf,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 8, .opcode = .s_endpgm });
+    const images = [_]StorageImageBinding{.{
+        .resource_sgpr = 4,
+        .descriptor_index = 0,
+        .format = .rgba32_float,
+        .dimension = .two_d_array,
+    }};
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .storage_images = &images,
+    });
+    defer module.deinit(std.testing.allocator);
+
+    try std.testing.expect(containsOpcode(module.words, 99)); // OpImageWrite
+    try std.testing.expect(containsOpcode(module.words, 23)); // uint3 coordinates
+}
+
 test "compute image store accepts a one-slice 2D array opcode" {
     const decoder = @import("decoder.zig");
     const code = [_]u32{
@@ -11437,6 +11505,40 @@ test "SMEM recovery requires every word from the same producer" {
     for (0..16) |index| {
         try std.testing.expect(complete_builder.registers[28 + index].id != 0);
     }
+}
+
+test "bound s_buffer_load is not replaced by a specialised zero" {
+    const load = instruction.Instruction{
+        .pc = 0,
+        .family = .smem,
+        .opcode = .s_buffer_load_dwordx4,
+        .dst = .{ .kind = .sgpr, .reg = 4 },
+        .src0 = .{ .kind = .sgpr, .reg = 0 },
+        .src1 = .{ .kind = .sgpr, .reg = 0 },
+        .src_count = 2,
+        .data_words = 4,
+    };
+    var zeros: [4]ScalarRegister = undefined;
+    for (&zeros, 0..) |*scalar, index| {
+        scalar.* = .{
+            .register = @intCast(4 + index),
+            .value = 0,
+            .producer_pc = 0,
+        };
+    }
+    const storage = [_]StorageBufferBinding{.{
+        .resource_sgpr = 0,
+        .descriptor_index = 0,
+        .extent_bytes = 16,
+    }};
+    var builder = try Builder.init(std.testing.allocator, .{
+        .stage = .fragment,
+        .storage_buffers = &storage,
+        .scalar_registers = &zeros,
+        .specialized_scalar_prefix_end = 8,
+    });
+    defer builder.deinit();
+    try std.testing.expect(!try builder.lowerSpecializedScalarDestination(load));
 }
 
 test "vector and subword MUBUF operations lower explicitly" {

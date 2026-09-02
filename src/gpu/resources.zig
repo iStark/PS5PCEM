@@ -419,7 +419,8 @@ pub const RenderState = struct {
     color_targets: [color_target_count]?ColorTarget = [_]?ColorTarget{null} ** color_target_count,
     color_count: u8 = 0,
     active_color_count: u8 = 0,
-    target_mask: u32 = std.math.maxInt(u32),
+    target_mask: u32 = 0x0000_000f,
+    shader_mask: u32 = 0,
     depth_control: DepthControl,
     stencil: StencilState = .{},
     depth_target: ?DepthTarget,
@@ -575,10 +576,34 @@ pub fn samplerDescriptorFromUserData(
     return decodeSamplerDescriptor(&words);
 }
 
+/// CB_TARGET_MASK enables colour writes; CB_SHADER_MASK names the exports.
+/// Hardware defaults TARGET_MASK to 0xF. A written 0 with bound colour
+/// bases is not a VideoOut compositor: it is a G-buffer whose mask was
+/// cleared by a context roll, and the exports still need a destination.
+pub fn effectiveColorWriteMask(target_mask: u32, shader_mask: u32, color_bases_bound: bool) u32 {
+    if (target_mask != 0) return target_mask;
+    // A written 0 with colour bases bound is a G-buffer, not an empty
+    // compositor. Enable every slot; SHADER_MASK's default 0xF would
+    // otherwise keep the ID plane off.
+    if (color_bases_bound) return 0xFFFF_FFFF;
+    if (shader_mask != 0) return shader_mask;
+    return 0;
+}
+
 pub fn decodeRenderState(state: *const gpu_state.State) RenderState {
-    const target_mask = state.readRegister(.context, 0x08e) orelse std.math.maxInt(u32);
+    const target_mask = state.readRegister(.context, 0x08e) orelse 0x0000_000f;
+    const shader_mask = state.readRegister(.context, 0x08f) orelse 0;
+    var bound_bases: bool = false;
+    for (0..color_target_count) |slot| {
+        if (decodeColorTarget(state, @intCast(slot), 0xf) != null) {
+            bound_bases = true;
+            break;
+        }
+    }
+    const write_mask = effectiveColorWriteMask(target_mask, shader_mask, bound_bases);
     var result = RenderState{
         .target_mask = target_mask,
+        .shader_mask = shader_mask,
         .depth_control = decodeDepthControl(state),
         .stencil = decodeStencilState(state),
         .depth_target = decodeDepthTarget(state),
@@ -590,7 +615,7 @@ pub fn decodeRenderState(state: *const gpu_state.State) RenderState {
         .primitive_type = state.readRegister(.uconfig, 0x242) orelse 4,
     };
     for (0..color_target_count) |slot| {
-        const target = decodeColorTarget(state, @intCast(slot), target_mask) orelse continue;
+        const target = decodeColorTarget(state, @intCast(slot), write_mask) orelse continue;
         result.color_targets[slot] = target;
         result.color_count += 1;
         if (target.isActive()) result.active_color_count += 1;
@@ -1039,6 +1064,52 @@ test "render state keeps two active colour slots" {
     try testing.expect(render.blends[0].enabled);
     try testing.expect(render.blends[1].enabled);
     try testing.expectEqual(@as(u5, 4), render.blends[1].color_source);
+}
+
+test "a bound colour base with a zero target mask still writes" {
+    try testing.expectEqual(@as(u32, 0), effectiveColorWriteMask(0, 0, false));
+    try testing.expectEqual(@as(u32, 0xFFFF_FFFF), effectiveColorWriteMask(0, 0, true));
+    try testing.expectEqual(@as(u32, 0xFFFF_FFFF), effectiveColorWriteMask(0, 0x7, true));
+    try testing.expectEqual(@as(u32, 0x7), effectiveColorWriteMask(0, 0x7, false));
+    try testing.expectEqual(@as(u32, 0xff), effectiveColorWriteMask(0xff, 0, true));
+
+    var state = gpu_state.State{};
+    const slot0: u64 = 0x00ab_cdef_1200;
+    try state.writeRegister(.context, 0x318, @truncate(slot0 >> 8));
+    try state.writeRegister(.context, 0x31c, (10 << 2));
+    try state.writeRegister(.context, 0x390, @truncate(slot0 >> 40));
+    try state.writeRegister(.context, 0x3b0, (127 << 14) | 127);
+    try state.writeRegister(.context, 0x3b8, 5 | (0x1b << 14));
+    try state.writeRegister(.context, 0x08e, 0);
+
+    const render = decodeRenderState(&state);
+    try testing.expectEqual(@as(u8, 1), render.color_count);
+    try testing.expectEqual(@as(u8, 1), render.active_color_count);
+    try testing.expectEqual(@as(u32, 0), render.target_mask);
+    try testing.expectEqual(@as(u8, 0xf), render.color_targets[0].?.write_mask);
+}
+
+test "a zero target mask unmasks every bound G-buffer slot" {
+    var state = gpu_state.State{};
+    const slot0: u64 = 0x00ab_cdef_1200;
+    const slot1: u64 = 0x00ab_cdef_5600;
+    try state.writeRegister(.context, 0x318, @truncate(slot0 >> 8));
+    try state.writeRegister(.context, 0x31c, (10 << 2));
+    try state.writeRegister(.context, 0x390, @truncate(slot0 >> 40));
+    try state.writeRegister(.context, 0x3b0, (127 << 14) | 127);
+    try state.writeRegister(.context, 0x3b8, 5 | (0x1b << 14));
+    try state.writeRegister(.context, 0x327, @truncate(slot1 >> 8));
+    try state.writeRegister(.context, 0x32b, (4 << 2) | (4 << 8));
+    try state.writeRegister(.context, 0x391, @truncate(slot1 >> 40));
+    try state.writeRegister(.context, 0x3b1, (127 << 14) | 127);
+    try state.writeRegister(.context, 0x3b9, 5 | (0x1b << 14));
+    try state.writeRegister(.context, 0x08e, 0);
+
+    const render = decodeRenderState(&state);
+    try testing.expectEqual(@as(u8, 2), render.color_count);
+    try testing.expectEqual(@as(u8, 2), render.active_color_count);
+    try testing.expectEqual(@as(u8, 0xf), render.color_targets[0].?.write_mask);
+    try testing.expectEqual(@as(u8, 0xf), render.color_targets[1].?.write_mask);
 }
 
 test "color control identifies fixed-function metadata operations" {

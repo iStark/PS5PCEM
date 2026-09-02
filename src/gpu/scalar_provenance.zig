@@ -375,11 +375,6 @@ fn executeSmem(
         return false;
     }
     const base_hi = result.registers[inst.src0.reg + 1];
-    const offset = source(result, inst.src1) orelse {
-        invalidateDestination(result, inst.dst, inst.data_words);
-        result.stop_reason = .invalid_address;
-        return false;
-    };
     if (!base_hi.known) {
         invalidateDestination(result, inst.dst, inst.data_words);
         result.stop_reason = .invalid_address;
@@ -395,6 +390,20 @@ fn executeSmem(
         => true,
         else => false,
     };
+    // SMEM SOFFSET is 7 bits: 0 means SGPR0, 125 means "no register". A
+    // compiler that encodes an immediate-only s_buffer_load with SOFFSET=0
+    // names the first dword of a V# in s0. Adding that address-lo as a byte
+    // offset misses the buffer and specialises the dests to zero — Yotei's
+    // fullscreen G-buffer PS then exports black.
+    const offset = if (is_buffer_load and inst.src0.kind == .sgpr and inst.src1.kind == .sgpr and
+        inst.src1.reg >= inst.src0.reg and inst.src1.reg < inst.src0.reg + 4)
+        ScalarValue{ .known = true, .value = 0, .sources = .{ .immediate = true } }
+    else
+        source(result, inst.src1) orelse {
+            invalidateDestination(result, inst.dst, inst.data_words);
+            result.stop_reason = .invalid_address;
+            return false;
+        };
     if (!is_buffer_load and base_hi.value & 0xffff_0000 != 0) {
         invalidateDestination(result, inst.dst, inst.data_words);
         result.stop_reason = .invalid_address;
@@ -1281,4 +1290,50 @@ test "scalar provenance follows a GETPC SETPC continuation" {
     const result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
     try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
     try std.testing.expectEqual(@as(u32, 1), result.register(2).?.value);
+}
+
+test "s_buffer_load ignores a SOFFSET that names the V# itself" {
+    var storage = [_]u8{0} ** 0x20;
+    var memory = TestMemory{ .base = 0x2000, .bytes = &storage };
+    memory.write(0x2000, 0x3f80_0000);
+    memory.write(0x2004, 0x4000_0000);
+    memory.write(0x2008, 0x4040_0000);
+    memory.write(0x200c, 0x4080_0000);
+
+    var user_data = [_]u32{0} ** 64;
+    user_data[0] = 0x2000;
+    user_data[1] = 0;
+    user_data[2] = 4;
+    user_data[3] = 0;
+    const bindings = shaders.StageBindings{
+        .stage = .pixel,
+        .user_data_stage = .pixel,
+        .program_address = 0x1000,
+        .user_data_count = 4,
+        .scalar_user_data_base = 0,
+        .user_data = user_data,
+        .metadata = null,
+        .srt_address = null,
+        .direct_pointers = .{},
+    };
+    const instructions = [_]rdna2.Instruction{
+        .{
+            .pc = 0,
+            .family = .smem,
+            .opcode = .s_buffer_load_dwordx4,
+            .dst = .{ .kind = .sgpr, .reg = 4 },
+            .src0 = .{ .kind = .sgpr, .reg = 0 },
+            .src1 = .{ .kind = .sgpr, .reg = 0 },
+            .src_count = 2,
+            .data_words = 4,
+            .word_count = 2,
+        },
+        .{ .pc = 8, .opcode = .s_endpgm, .word_count = 1 },
+    };
+    const result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
+    try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 0x3f80_0000), result.register(4).?.value);
+    try std.testing.expectEqual(@as(u32, 0x4000_0000), result.register(5).?.value);
+    try std.testing.expectEqual(@as(u32, 0x4040_0000), result.register(6).?.value);
+    try std.testing.expectEqual(@as(u32, 0x4080_0000), result.register(7).?.value);
 }

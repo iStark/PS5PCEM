@@ -350,6 +350,21 @@ pub fn isGuestRangeAccessible(address: u64, length: u64) bool {
     return memory.isHostRangeReadable(address, length);
 }
 
+/// True when the range sits inside a guest thread stack mapping.
+///
+/// AGC builders sometimes record a few packets into stack scratch rather than
+/// a GPU command arena. Those bottoms must not be treated as stranded DCBs.
+pub fn isGuestStackRange(address: u64, length: u64) bool {
+    if (address == 0 or length == 0) return false;
+    const end = std.math.add(u64, address, length) catch return false;
+
+    pool_lock.lock();
+    defer pool_lock.unlock();
+    const address_space = guest_address_space orelse return false;
+    const mapping = address_space.query(address, false) orelse return false;
+    return mapping.kind == .stack and end <= mapping.end();
+}
+
 pub fn deinit() void {
     pool_lock.lock();
     defer pool_lock.unlock();
@@ -2456,6 +2471,10 @@ test "a query reports what a range is and whether it is committed" {
     try testing.expectEqual(@as(u32, 0), info.state);
     try testing.expectEqual(reserved_base, info.start);
     try testing.expectEqual(reserved_base + page_size, info.end);
+
+    try testing.expect(isGuestStackRange(base, 8));
+    try testing.expect(!isGuestStackRange(reserved_base, 8));
+    try testing.expect(!isGuestStackRange(0, 8));
 }
 
 test "flexible memory maps, queries, protects, unmaps, and reuses ranges" {
