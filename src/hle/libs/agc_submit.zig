@@ -467,6 +467,10 @@ fn drainQuietBuilderArenas() void {
                 "[agc pending] no submission for {d} ms; {d} builder arenas hold {d} unrun dwords\n",
                 .{ idle_ns / std.time.ns_per_ms, pending, pending_dwords },
             );
+            // What the guest threads are waiting in says whether this is a
+            // pause or a deadlock, and the call ring cannot: it records a call
+            // only once it returns.
+            trace.reportInFlightCalls();
         }
         for (&builder_arenas) |*arena| {
             if (arena.base == 0 or arena.written_end <= arena.executed_end) continue;

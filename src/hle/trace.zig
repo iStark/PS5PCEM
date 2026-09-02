@@ -113,6 +113,32 @@ fn currentThreadOrdinal() u32 {
     return thread_ordinal;
 }
 
+/// The firmware call each thread is currently inside.
+///
+/// The ring records a call only once it returns, which is right for a history
+/// but leaves nothing behind for the case that matters most during bring-up: a
+/// thread that entered an entry point and never came back out. Naming the call
+/// in flight costs two stores and turns "the thread went quiet" into "the
+/// thread is still in this function".
+const maximum_traced_threads: usize = 64;
+var in_flight_names: [maximum_traced_threads][]const u8 = @splat(&.{});
+
+fn noteInFlight(ordinal: u32, name: []const u8) void {
+    in_flight_names[ordinal % maximum_traced_threads] = name;
+}
+
+fn clearInFlight(ordinal: u32) void {
+    in_flight_names[ordinal % maximum_traced_threads] = &.{};
+}
+
+/// Prints the entry point each thread is still inside, if any.
+pub fn reportInFlightCalls() void {
+    for (in_flight_names, 0..) |name, slot| {
+        if (name.len == 0) continue;
+        std.debug.print("  [in flight] thread_slot={d} {s}\n", .{ slot, name });
+    }
+}
+
 /// Recording is a diagnostic aid, so it is cheap rather than exact: slots are
 /// claimed atomically but written without locking. A record can therefore be
 /// torn if a reader races a concurrent guest call. That is an acceptable trade
@@ -642,6 +668,7 @@ fn takeStackSnapshot(comptime name: []const u8, caller: usize) void {
 /// This runs on the guest's own stack, before firmware moves to a stack of its
 /// own, which is what makes a snapshot of the caller possible at all.
 fn enter(comptime name: []const u8, arguments: []const u64, caller: usize) void {
+    noteInFlight(currentThreadOrdinal(), name);
     if (capture_armed.load(.acquire)) takeStackSnapshot(name, caller);
     if (!live.load(.acquire) or !isEnabled()) return;
     if (live_failures_only.load(.acquire)) return;
@@ -667,6 +694,7 @@ fn resultIsStatus(comptime Result: type) bool {
 }
 
 fn finish(comptime name: []const u8, result: anytype, arguments: []const u64) @TypeOf(result) {
+    clearInFlight(currentThreadOrdinal());
     const Result = @TypeOf(result);
     var record = Record{ .name = name, .argument_count = @intCast(arguments.len) };
     for (arguments, 0..) |value, index| record.arguments[index] = value;
