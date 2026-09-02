@@ -758,13 +758,18 @@ const maximum_cached_sampled_images = 1024;
 /// Storage images form long compute chains in modern Unity render graphs. A
 /// dispatch may write one image only for the next dispatch to read it; keeping
 /// those images resident avoids a GPU -> tiled guest memory -> GPU round trip
-/// at every edge of the graph.
-const maximum_cached_storage_images = 64;
+/// at every edge of the graph. Ghost of Yotei's first steady render graph uses
+/// 94 distinct views (about 920 MiB of linear image data); the old 64-view cap
+/// evicted half of that graph and re-detiled/re-uploaded roughly 814 MiB every
+/// frame. These are capacity ceilings, not eager allocations.
+const maximum_cached_storage_images = 128;
 /// Counts linear image bytes (the cache also owns one transfer allocation per
 /// image). The limit is soft while every resident entry is in use by the same
 /// dispatch, so a legal 32-image descriptor set is never rejected solely by
-/// the cache budget.
-const maximum_cached_storage_image_bytes = 512 * 1024 * 1024;
+/// the cache budget. Leave headroom above Yotei's measured 920 MiB set for
+/// alignment and short-lived views without turning transient churn into an
+/// unbounded cache.
+const maximum_cached_storage_image_bytes = 1280 * 1024 * 1024;
 /// One DCC key byte covers this many bytes of the compressed colour surface.
 const dcc_block_bytes = 256;
 /// Bounds the key read for a fast-clear probe; covers surfaces up to 1 GiB.
