@@ -19,6 +19,7 @@
 //! bounded buffer costs a few stores rather than an ever-growing log.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const abi = @import("abi.zig");
 const host_stack = @import("host_stack.zig");
 
@@ -127,8 +128,25 @@ var in_flight_names: [maximum_traced_threads][]const u8 = @splat(&.{});
 /// other half, and that is the leading argument of every wait this SDK has.
 var in_flight_arguments: [maximum_traced_threads][2]u64 = @splat(.{ 0, 0 });
 
+/// The host thread each guest thread runs on, so a thread that has stopped
+/// making firmware calls can still be examined. A thread spinning in guest
+/// code makes no call to report, and its host context is then the only thing
+/// that says what it is waiting for.
+var guest_thread_ids: [maximum_traced_threads]u32 = @splat(0);
+
+/// The host thread identifier of the guest thread that owns `slot`, or zero.
+pub fn guestThreadId(slot: usize) u32 {
+    if (slot >= maximum_traced_threads) return 0;
+    return guest_thread_ids[slot];
+}
+
 fn noteInFlight(ordinal: u32, name: []const u8, arguments: []const u64) void {
     const slot = ordinal % maximum_traced_threads;
+    if (comptime builtin.os.tag == .windows) {
+        if (guest_thread_ids[slot] == 0) {
+            guest_thread_ids[slot] = std.os.windows.GetCurrentThreadId();
+        }
+    }
     in_flight_arguments[slot] = .{
         if (arguments.len > 0) arguments[0] else 0,
         if (arguments.len > 1) arguments[1] else 0,
@@ -138,6 +156,104 @@ fn noteInFlight(ordinal: u32, name: []const u8, arguments: []const u64) void {
 
 fn clearInFlight(ordinal: u32) void {
     in_flight_names[ordinal % maximum_traced_threads] = &.{};
+}
+
+const windows = struct {
+    const thread_get_context: u32 = 0x0008;
+    const thread_suspend_resume: u32 = 0x0002;
+    const thread_query_information: u32 = 0x0040;
+
+    extern "kernel32" fn OpenThread(
+        access: u32,
+        inherit: c_int,
+        thread_id: u32,
+    ) callconv(.winapi) ?std.os.windows.HANDLE;
+    extern "kernel32" fn SuspendThread(thread: std.os.windows.HANDLE) callconv(.winapi) u32;
+    extern "kernel32" fn ResumeThread(thread: std.os.windows.HANDLE) callconv(.winapi) u32;
+    extern "kernel32" fn GetThreadContext(
+        thread: std.os.windows.HANDLE,
+        context: *std.os.windows.CONTEXT,
+    ) callconv(.winapi) c_int;
+};
+
+/// Prints where a guest thread is executing and what it is holding.
+///
+/// A thread that polls a location in guest code makes no firmware call, so the
+/// call history says only that it went quiet. Its instruction pointer and
+/// registers say what it is actually doing, and the bytes at that address show
+/// the loop it is in.
+pub fn reportGuestThreadContext(slot: usize) void {
+    if (comptime builtin.os.tag != .windows) return;
+    const thread_id = guestThreadId(slot);
+    if (thread_id == 0) return;
+    const access = windows.thread_get_context |
+        windows.thread_suspend_resume |
+        windows.thread_query_information;
+    const handle = windows.OpenThread(access, 0, thread_id) orelse {
+        std.debug.print("  [thread {d}] id={d} not openable\n", .{ slot, thread_id });
+        return;
+    };
+    defer std.os.windows.CloseHandle(handle);
+
+    if (windows.SuspendThread(handle) == std.math.maxInt(u32)) return;
+    var context: std.os.windows.CONTEXT = undefined;
+    context.ContextFlags = 0x0010000B; // CONTEXT_CONTROL | INTEGER | SEGMENTS
+    const captured = windows.GetThreadContext(handle, &context) != 0;
+    _ = windows.ResumeThread(handle);
+    if (!captured) return;
+
+    // One sample cannot tell a thread parked in a loop from one cycling
+    // through a larger one. Take a few, spaced far enough apart that ordinary
+    // progress moves the instruction pointer.
+    var samples: usize = 0;
+    while (samples < 4) : (samples += 1) {
+        var interval: i64 = -150 * 10_000; // 150 ms, relative 100-ns units
+        _ = std.os.windows.ntdll.NtDelayExecution(.FALSE, &interval);
+        if (windows.SuspendThread(handle) == std.math.maxInt(u32)) break;
+        var again: std.os.windows.CONTEXT = undefined;
+        again.ContextFlags = 0x0010000B;
+        const ok = windows.GetThreadContext(handle, &again) != 0;
+        _ = windows.ResumeThread(handle);
+        if (!ok) break;
+        // The instruction after the spin indexes a 32-byte table by a field at
+        // +0xb4 of the object in R15: that is this SDK's completion table and
+        // its queue's label index. Resolve both so the polled counter is named
+        // rather than inferred.
+        var index: u32 = 0;
+        var polled: u64 = 0;
+        if (again.R15 != 0) {
+            const field: *const u32 = @ptrFromInt(again.R15 + 0xb4);
+            index = field.*;
+        }
+        if (index != 0 and index < 0x80) polled = @as(u64, index) * 0x20;
+        std.debug.print(
+            "  [thread {d}] sample rip=0x{x} rcx=0x{x} rdx=0x{x} r15=0x{x} label_index={d} slot_offset=0x{x}\n",
+            .{ slot, again.Rip, again.Rcx, again.Rdx, again.R15, index, polled },
+        );
+    }
+    std.debug.print(
+        "  [thread {d}] id={d} rip=0x{x} rsp=0x{x} rax=0x{x} rbx=0x{x} rcx=0x{x} rdx=0x{x} rsi=0x{x} rdi=0x{x}\n",
+        .{
+            slot,
+            thread_id,
+            context.Rip,
+            context.Rsp,
+            context.Rax,
+            context.Rbx,
+            context.Rcx,
+            context.Rdx,
+            context.Rsi,
+            context.Rdi,
+        },
+    );
+    // The instruction bytes at the poll identify which register holds the
+    // address it reads, which the register dump above then resolves. Start at
+    // the instruction pointer itself: that page is executing, so it is
+    // readable, while stepping backwards could leave it.
+    const code: [*]const u8 = @ptrFromInt(context.Rip);
+    std.debug.print("  [thread {d}] code@rip:", .{slot});
+    for (code[0..24]) |byte| std.debug.print(" {x:0>2}", .{byte});
+    std.debug.print("\n", .{});
 }
 
 /// Prints the entry point each thread is still inside, if any.

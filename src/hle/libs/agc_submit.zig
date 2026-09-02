@@ -481,6 +481,9 @@ fn drainQuietBuilderArenas() void {
             // pause or a deadlock, and the call ring cannot: it records a call
             // only once it returns.
             trace.reportInFlightCalls();
+            // The render thread makes no firmware call while it polls, so its
+            // host context is the only account of what it is waiting for.
+            trace.reportGuestThreadContext(1);
             kernel_runtime.reportBlockedSemaphores();
         }
         for (&builder_arenas) |*arena| {
@@ -2859,7 +2862,6 @@ fn publishSdk11AcbDriverGeneration(
 fn sdk11DcbLabelIndexAt(
     queue_address: u64,
     stream_address: u64,
-    release_slot: u64,
 ) ?u32 {
     if (queue_address == 0 or !memory.isGuestRangeAccessible(queue_address, 0xb8)) return null;
     var fields: [0xb8]u8 = undefined;
@@ -2867,9 +2869,11 @@ fn sdk11DcbLabelIndexAt(
     const queue_stream_a = std.mem.readInt(u64, fields[0x78..0x80], .little);
     const queue_stream_b = std.mem.readInt(u64, fields[0x80..0x88], .little);
     const label_index = std.mem.readInt(u32, fields[0xb4..0xb8], .little);
+    // The object records the stream it submitted; that is what identifies it.
+    // Its label index selects the completion slot the guest then polls, and
+    // that slot is unrelated to where the packet's own fence lands.
     if ((queue_stream_a != stream_address and queue_stream_b != stream_address) or
-        label_index >= 0x80 or
-        release_slot != @as(u64, label_index) + 1)
+        label_index >= 0x80)
     {
         return null;
     }
@@ -2884,8 +2888,10 @@ fn publishSdk11DcbDriverGeneration(
     submission: Submission,
     release: gpu.state.ReleaseMem,
 ) void {
-    if (release.data_selection != 2 or
-        release.address & 0x1f != 0 or
+    // Either data width carries the generation. The packet's own fence often
+    // lands in the command arena rather than in the completion table, so its
+    // address says nothing about which slot the driver publishes.
+    if ((release.data_selection != 1 and release.data_selection != 2) or
         release.data >= std.math.maxInt(u32))
     {
         return;
@@ -2896,27 +2902,43 @@ fn publishSdk11DcbDriverGeneration(
     // stale here. The packet-owned hardware generation is one behind the
     // driver label this SDK waits at its following SuspendPoint.
     const generation = release.data + 1;
-    const release_slot = (release.address & 0xfff) / 0x20;
-    if (release_slot == 0) return;
     // Which register still holds the queue object depends on the guest's own
-    // allocation at this call site, so try each one that the thunk captured.
+    // allocation at this call site, so try each one that the thunk captured
+    // and the frame it called from.
     var label_index: ?u32 = null;
     for ([_]u64{
         trace.currentGuestR15(),
         trace.currentGuestRbx(),
         trace.currentGuestRbp(),
     }) |candidate| {
-        label_index = sdk11DcbLabelIndexAt(candidate, stream_address, release_slot);
+        label_index = sdk11DcbLabelIndexAt(candidate, stream_address);
         if (label_index != null) break;
+    }
+    // The wrapper also spills the queue object into the frame it called from,
+    // and which of the two still holds it varies by call site.
+    if (label_index == null) {
+        const base = trace.currentGuestRbp();
+        var offset: i64 = -0x180;
+        while (offset < 0x180 and label_index == null) : (offset += 8) {
+            const address = @as(i64, @bitCast(base)) + offset;
+            if (address <= 0) continue;
+            const spill: u64 = @bitCast(address);
+            if (!memory.isGuestRangeAccessible(spill, 8)) continue;
+            var bytes: [8]u8 = undefined;
+            if (!readGuestMemory(null, spill, &bytes)) continue;
+            label_index = sdk11DcbLabelIndexAt(
+                std.mem.readInt(u64, &bytes, .little),
+                stream_address,
+            );
+        }
     }
     const resolved_index = label_index orelse {
         if (driver_completion_miss_reports < 8) {
             std.debug.print(
-                "[agc submit] SDK11 DCB queue unrecovered stream=0x{x} release=0x{x} slot={d} r15=0x{x} rbx=0x{x} rbp=0x{x}\n",
+                "[agc submit] SDK11 DCB queue unrecovered stream=0x{x} release=0x{x} r15=0x{x} rbx=0x{x} rbp=0x{x}\n",
                 .{
                     stream_address,
                     release.address,
-                    release_slot,
                     trace.currentGuestR15(),
                     trace.currentGuestRbx(),
                     trace.currentGuestRbp(),
@@ -2927,7 +2949,10 @@ fn publishSdk11DcbDriverGeneration(
         return;
     };
 
-    const label_page = release.address & ~@as(u64, 0xfff);
+    // The slot lives in the shared completion table the compute retirement
+    // bridge identifies, not in whatever page this packet's own fence occupies.
+    const label_page = sdk11_acb_label_page.load(.acquire);
+    if (label_page == 0) return;
     const target = label_page + @as(u64, resolved_index) * 0x20;
     var previous: [8]u8 = undefined;
     if (!readGuestMemory(null, target, &previous)) return;
