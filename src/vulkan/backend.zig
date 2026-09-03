@@ -2198,6 +2198,14 @@ const compute_watch_addresses = [_]u64{
     0x5002_8700_00,
     0x506c_3e00_00,
     0x5000_8600_00,
+    // The composite's remaining empty inputs: a render-target-tiled surface
+    // with no producer at all, the 4K sample it reads beside it, the bloom
+    // chain's smallest level, and the HDR target and scanout it feeds.
+    0x5061_3a00_00,
+    0x5065_bd00_00,
+    0x508b_f400_00,
+    0x505a_3a00_00,
+    0x5007_1900_00,
 };
 
 const ComputeResources = struct {
