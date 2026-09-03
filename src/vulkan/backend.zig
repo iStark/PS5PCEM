@@ -2901,10 +2901,15 @@ pub const Renderer = struct {
     dispatch_callbacks: u64 = 0,
     translated_dispatches: u64 = 0,
     elided_dispatches: u64 = 0,
+    /// Dispatches this ran on the CPU instead of the GPU. They are not lost
+    /// work, so counting them as elided would report a frame discarding
+    /// compute it actually performed.
+    emulated_dispatches: u64 = 0,
     /// Elided dispatches already accounted for in a frame summary, so the
     /// per-frame line can report how much work this frame dropped rather than
     /// a total that only ever grows.
     reported_elided_dispatches: u64 = 0,
+    reported_emulated_dispatches: u64 = 0,
     reanimal_nvidia_compute_workaround_active: bool = false,
     reanimal_nvidia_wave_compaction_seen: bool = false,
     reanimal_nvidia_compute_quarantined: bool = false,
@@ -4769,7 +4774,9 @@ pub const Renderer = struct {
         // retaining kernels that write GDS, buffers, or storage images.
         if (!uses_gds and !resources.hasWritableExternalState()) {
             self.elided_dispatches += 1;
-            if (analysis.program.instructions.items.len >= 256 or log_verbose_gpu) {
+            if (analysis.program.instructions.items.len >= 256 or log_verbose_gpu or
+                self.traceCurrentGraphicsFrame())
+            {
                 std.debug.print(
                     "[vulkan dcb] elided compute without writable resources program=0x{x} ({d} instructions, groups={d}x{d}x{d})\n",
                     .{
@@ -5522,7 +5529,7 @@ pub const Renderer = struct {
             try writeGuestU32(memory, dest_desc.address + (dest_offset + i) * dest_stride, value);
         }
 
-        self.elided_dispatches += 1;
+        self.emulated_dispatches += 1;
         if (log_verbose_gpu) std.debug.print(
             "[vulkan dcb] emulated buffer copy: {d} elements from 0x{x} to 0x{x}\n",
             .{ copies, source_desc.address, dest_desc.address },
@@ -5582,7 +5589,7 @@ pub const Renderer = struct {
             return Error.GuestMemoryWriteFailed;
         }
         self.invalidateDmaDestination(descriptor.address, mask.len);
-        self.elided_dispatches += 1;
+        self.emulated_dispatches += 1;
         std.debug.print(
             "[vulkan dcb] emulated NVIDIA-safe Yotei visibility mask program=0x{x} output=0x{x} groups={d}x{d}x{d}\n",
             .{
@@ -5659,7 +5666,7 @@ pub const Renderer = struct {
             }
         }
 
-        self.elided_dispatches += 1;
+        self.emulated_dispatches += 1;
         if (self.yotei_packed_visibility_seeds < 8 or self.traceCurrentGraphicsFrame()) {
             std.debug.print(
                 "[vulkan dcb] emulated Yotei GDS cull outputs={d} list_count={d} groups={d}x{d}x{d}\n",
@@ -5838,7 +5845,7 @@ pub const Renderer = struct {
         }
         if (cleared == 0) return Error.UnsupportedStorageImage;
 
-        self.elided_dispatches += 1;
+        self.emulated_dispatches += 1;
         std.debug.print(
             "[vulkan dcb] emulated NVIDIA-safe Yotei environment lighting program=0x{x} outputs={d} groups={d}x{d}x{d}\n",
             .{ program_address, cleared, group_count[0], group_count[1], group_count[2] },
@@ -17241,14 +17248,21 @@ pub const Renderer = struct {
                 },
             );
             const elided_this_frame = self.elided_dispatches -| self.reported_elided_dispatches;
+            const emulated_this_frame = self.emulated_dispatches -| self.reported_emulated_dispatches;
             self.reported_elided_dispatches = self.elided_dispatches;
+            self.reported_emulated_dispatches = self.emulated_dispatches;
             // Dispatches are dropped at a dozen points once resource
             // recovery proves they cannot reach guest state. That is a
             // large share of a frame to discard silently, and an empty
             // intermediate surface is exactly what it looks like.
-            if (elided_this_frame != 0) std.debug.print(
-                "[gpu frame] flip={d} elided_dispatches={d} of {d}\n",
-                .{ self.flip_callbacks, elided_this_frame, profile.dispatches + elided_this_frame },
+            if (elided_this_frame != 0 or emulated_this_frame != 0) std.debug.print(
+                "[gpu frame] flip={d} elided_dispatches={d} emulated_dispatches={d} of {d}\n",
+                .{
+                    self.flip_callbacks,
+                    elided_this_frame,
+                    emulated_this_frame,
+                    profile.dispatches + elided_this_frame + emulated_this_frame,
+                },
             );
             std.debug.print(
                 "[gpu shaders] flip={d} pso_hit={d} pso_miss={d}/{d}ms cpso={d}/{d}/{d}ms compute_ms={d}/{d}/{d}/{d} pso_cache={d} cpso_cache={d} miss_match(state/vs/ps)={d}/{d}/{d} sa_hit={d} sa_miss={d}/{d}ms prov_ms={d} xlat_ms={d} res_ms={d} sampled_ms={d}/{d}/{d}/{d} probe_ms={d} target_create_ms={d}/{d}\n",
