@@ -16852,7 +16852,12 @@ pub const Renderer = struct {
         for (self.completed_frames.items, 0..) |frame, index| {
             if (frame.pixels.items.len == 0 or countNonblackRgb(frame.pixels.items) == 0) continue;
             const format = if (frame.target) |target| target.format.vulkan else vk.format_r8g8b8a8_unorm;
-            if (format != vk.format_r8g8b8a8_unorm and format != vk.format_b10g11r11_ufloat_pack32) continue;
+            // Keep this in step with presentationPixels: a frame it can
+            // convert is presentable, and excluding one here hides a
+            // fully rendered composite behind a black exact-address hit.
+            if (format != vk.format_r8g8b8a8_unorm and
+                format != vk.format_b10g11r11_ufloat_pack32 and
+                format != vk.format_a2b10g10r10_unorm_pack32) continue;
             const area = @as(u64, frame.width) * frame.height;
             if (fallback == null or area > fallback_area or
                 (area == fallback_area and frame.sequence > fallback_sequence))
@@ -16886,6 +16891,27 @@ pub const Renderer = struct {
             return null;
         }
         const byte_count = @as(usize, frame.width) * frame.height * 4;
+        // Both converters refuse a length they cannot walk in whole texels and
+        // leave the destination untouched. Returning the scratch buffer anyway
+        // presents freshly resized, all-zero bytes, which is indistinguishable
+        // from a frame the title rendered black. Report the mismatch instead so
+        // the caller can pick another candidate.
+        if (frame.pixels.items.len != byte_count) {
+            if (self.flip_callbacks <= 24 or log_verbose_gpu) {
+                std.debug.print(
+                    "[vulkan dcb] present conversion size mismatch @0x{x} {d}x{d} pixels={d} expected={d} fmt={d}\n",
+                    .{
+                        frame.guest_address,
+                        frame.width,
+                        frame.height,
+                        frame.pixels.items.len,
+                        byte_count,
+                        target.descriptor.format,
+                    },
+                );
+            }
+            return null;
+        }
         self.guest_frame_scratch.resize(self.allocator, byte_count) catch return null;
         if (target.format.vulkan == vk.format_b10g11r11_ufloat_pack32) {
             convertR11G11B10ToRgba8(frame.pixels.items, self.guest_frame_scratch.items);
