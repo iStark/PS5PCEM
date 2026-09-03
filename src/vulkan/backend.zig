@@ -1532,6 +1532,11 @@ const CachedRenderTarget = struct {
     shader_read_layout: bool = false,
     gpu_generation: u64 = 0,
     host_generation: u64 = 0,
+    /// Incremented only when a draw actually exports colour (CB MODE=NORMAL
+    /// and a nonzero write mask). Metadata/DISABLE passes bump gpu_generation
+    /// without producing texels; HDR resolve uses this to detect an empty
+    /// G-buffer and substitute environment lighting.
+    color_export_generation: u64 = 0,
     last_used_sequence: u64 = 0,
     /// The matched guest compositor uses a negative-height viewport. Keep its
     /// attachment resident and apply that orientation only at scanout/readback.
@@ -2170,6 +2175,29 @@ fn recognizePlanarVideoPass(
 const PipelineLookup = struct {
     pipeline: vk.Pipeline,
     cache_hit: bool,
+};
+
+const ComputeWatchHit = struct {
+    address: u64,
+    dispatch: u32,
+    program: u64,
+    kind: []const u8,
+    width: u32,
+    height: u32,
+    format: u16,
+};
+
+const compute_watch_addresses = [_]u64{
+    0x5050_bc00_00,
+    0x5052_ba00_00,
+    0x5054_b800_00,
+    0x5057_b500_00,
+    0x505a_b200_00,
+    0x5061_c100_00,
+    0x5042_6b00_00,
+    0x5002_8700_00,
+    0x506c_3e00_00,
+    0x5000_8600_00,
 };
 
 const ComputeResources = struct {
@@ -2857,6 +2885,7 @@ pub const Renderer = struct {
     reported_unbacked_depth_sample: bool = false,
     reported_resident_rt_sample: bool = false,
     resident_rt_storage_reports: u8 = 0,
+    resident_rt_extent_alias_reports: u8 = 0,
     resident_storage_sample_reports: u8 = 0,
     reported_tone_map_fallback: bool = false,
     reported_ui_composite: bool = false,
@@ -2965,11 +2994,15 @@ pub const Renderer = struct {
     reported_yotei_gds_dispatches: u8 = 0,
     reported_yotei_visibility_dispatches: u8 = 0,
     yotei_packed_visibility_seeds: u8 = 0,
+    yotei_empty_scene_hdr_this_frame: bool = false,
     excessive_draw_reports: u8 = 0,
     last_dispatch_error: ?anyerror = null,
     last_draw_error: ?anyerror = null,
     last_sync_error: ?anyerror = null,
     last_flip_error: ?anyerror = null,
+    last_compute_program: u64 = 0,
+    compute_watch_hits: [96]ComputeWatchHit = undefined,
+    compute_watch_hit_count: u32 = 0,
 
     fn traceCurrentGraphicsFrame(self: *const Renderer) bool {
         const requested = self.trace_graphics_frame orelse return false;
@@ -2978,6 +3011,87 @@ pub const Renderer = struct {
         else
             requested;
         return self.flip_callbacks +% 1 == target;
+    }
+
+    fn tracingCompletedFrame(self: *const Renderer) bool {
+        const requested = self.trace_graphics_frame orelse return false;
+        const target = if (requested == 0)
+            self.auto_trace_graphics_frame orelse return false
+        else
+            requested;
+        return self.flip_callbacks == target;
+    }
+
+    fn noteComputeWrite(
+        self: *Renderer,
+        kind: []const u8,
+        address: u64,
+        width: u32,
+        height: u32,
+        format: u16,
+    ) void {
+        if (!self.traceCurrentGraphicsFrame() or address == 0) return;
+        std.debug.print(
+            "[vulkan dcb] compute census dispatch={d} program=0x{x} kind={s} write @0x{x} {d}x{d} fmt={d}\n",
+            .{
+                self.frame_profile.dispatches,
+                self.last_compute_program,
+                kind,
+                address,
+                width,
+                height,
+                format,
+            },
+        );
+        for (compute_watch_addresses) |watch| {
+            if (watch != address) continue;
+            if (self.compute_watch_hit_count >= self.compute_watch_hits.len) return;
+            self.compute_watch_hits[self.compute_watch_hit_count] = .{
+                .address = address,
+                .dispatch = @intCast(self.frame_profile.dispatches),
+                .program = self.last_compute_program,
+                .kind = kind,
+                .width = width,
+                .height = height,
+                .format = format,
+            };
+            self.compute_watch_hit_count += 1;
+            return;
+        }
+    }
+
+    fn noteComputeKind(self: *Renderer, kind: []const u8) void {
+        if (!self.traceCurrentGraphicsFrame()) return;
+        std.debug.print(
+            "[vulkan dcb] compute census dispatch={d} program=0x{x} kind={s} write=none\n",
+            .{ self.frame_profile.dispatches, self.last_compute_program, kind },
+        );
+    }
+
+    fn flushComputeCensus(self: *Renderer) void {
+        if (!self.tracingCompletedFrame()) return;
+        std.debug.print(
+            "[vulkan dcb] compute watch census hits={d} of {d} dispatches\n",
+            .{ self.compute_watch_hit_count, self.frame_profile.dispatches },
+        );
+        for (compute_watch_addresses) |watch| {
+            var producers: u32 = 0;
+            for (self.compute_watch_hits[0..self.compute_watch_hit_count]) |hit| {
+                if (hit.address == watch) producers += 1;
+            }
+            std.debug.print(
+                "[vulkan dcb] compute watch @0x{x} producers={d}\n",
+                .{ watch, producers },
+            );
+            for (self.compute_watch_hits[0..self.compute_watch_hit_count]) |hit| {
+                if (hit.address != watch) continue;
+                std.debug.print(
+                    "  dispatch={d} program=0x{x} kind={s} {d}x{d} fmt={d}\n",
+                    .{ hit.dispatch, hit.program, hit.kind, hit.width, hit.height, hit.format },
+                );
+            }
+        }
+        self.compute_watch_hit_count = 0;
     }
 
     pub fn init(allocator: std.mem.Allocator, options: Options) (Error || std.mem.Allocator.Error)!Renderer {
@@ -3774,6 +3888,29 @@ pub const Renderer = struct {
         if (presented != vk.success and presented != vk.suboptimal_khr) return Error.SwapchainPresentFailed;
     }
 
+    fn packedHdrSwapchainFormat(vulkan_format: u32) bool {
+        return vulkan_format == vk.format_a2b10g10r10_unorm_pack32 or
+            vulkan_format == vk.format_b10g11r11_ufloat_pack32;
+    }
+
+    /// Packed 10-bit scanout cannot go through `vkCmdBlitImage` onto an 8-bit
+    /// swapchain: NVIDIA leaves that blit black, and other drivers unpack
+    /// opaque A2B10 black (`0xC0000000`) as B=1008 — a solid blue window of a
+    /// frame whose CPU conversion is honest RGB-black. The materialized path
+    /// already has a tested RGBA8 conversion.
+    fn presentWindowRenderTarget(
+        self: *Renderer,
+        target_index: usize,
+        flip: gpu.state.Flip,
+    ) anyerror!bool {
+        if (target_index >= self.render_targets.items.len) return false;
+        if (packedHdrSwapchainFormat(self.render_targets.items[target_index].target.format.vulkan)) {
+            return self.presentResidentTarget(target_index, flip);
+        }
+        try self.blitRenderTargetToSwapchain(target_index);
+        return true;
+    }
+
     /// Presents a resident color attachment without a GPU→CPU→GPU round trip.
     /// Vulkan performs format conversion and 1920×1080→window scaling in the
     /// blit; the source returns to attachment layout for the next guest draw.
@@ -4287,6 +4424,7 @@ pub const Renderer = struct {
         const program_address = gpu.resources.ShaderStage.compute.programAddress(state) orelse {
             return Error.MissingComputeProgram;
         };
+        self.last_compute_program = program_address;
         const header_address = if (memory.shader_header) |resolve|
             resolve(memory.context, program_address)
         else
@@ -4432,6 +4570,7 @@ pub const Renderer = struct {
             !analysis.hasBufferExternalEffects())
         {
             self.elided_dispatches += 1;
+            self.noteComputeKind("elided-warmup");
             return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
         }
         // The bounded dispatcher and per-invocation CMPX predicate model make
@@ -4487,6 +4626,22 @@ pub const Renderer = struct {
                 group_count,
                 program_address,
             );
+        }
+        if (program_address == 0x8000_405d_00 and
+            std.meta.eql(local_size, [3]u32{ 8, 8, 1 }) and
+            group_count[2] == 1)
+        {
+            if (try self.emulateYoteiEmptySceneHdrResolve(
+                memory,
+                &bindings,
+                reader,
+                analysis,
+                group_count,
+                program_address,
+            )) |report|
+            {
+                return report;
+            }
         }
         // Yotei's two reduction and two gather passes used to be quarantined
         // here. Correct EXEC state merging and Vulkan-valid dynamic sample
@@ -4774,6 +4929,7 @@ pub const Renderer = struct {
         // retaining kernels that write GDS, buffers, or storage images.
         if (!uses_gds and !resources.hasWritableExternalState()) {
             self.elided_dispatches += 1;
+            self.noteComputeKind("elided-no-writable");
             if (analysis.program.instructions.items.len >= 256 or log_verbose_gpu or
                 self.traceCurrentGraphicsFrame())
             {
@@ -4789,6 +4945,21 @@ pub const Renderer = struct {
                 );
             }
             return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
+        }
+        if (self.traceCurrentGraphicsFrame()) {
+            var image_writes: u32 = 0;
+            for (resources.storage_images[0..resources.storage_image_count]) |image| {
+                if (!image.writable) continue;
+                self.noteComputeWrite(
+                    "translated",
+                    image.descriptor.address,
+                    image.descriptor.width,
+                    image.descriptor.height,
+                    image.descriptor.unified_format,
+                );
+                image_writes += 1;
+            }
+            if (image_writes == 0) self.noteComputeKind("translated-no-image-write");
         }
         if (self.traceCurrentGraphicsFrame() or
             (self.compute_execution_limit != null and self.translated_dispatches >= 62))
@@ -5460,6 +5631,13 @@ pub const Renderer = struct {
         if (self.isVideoSurface(source.address)) self.markVideoSurface(destination.address);
 
         self.emulated_image_copy_dispatches += 1;
+        self.noteComputeWrite(
+            "emulated-copy",
+            destination.address,
+            destination.width,
+            destination.height,
+            destination.unified_format,
+        );
         if (log_verbose_gpu or self.emulated_image_copy_dispatches <= 4 or self.traceCurrentGraphicsFrame()) {
             std.debug.print(
                 "[vulkan dcb] emulated whole-image copy: 0x{x} -> 0x{x} {d}x{d} fmt={d} tile={s} bytes=0x{x} (#{d})\n",
@@ -5645,14 +5823,19 @@ pub const Renderer = struct {
         }
         if (seeded_outputs == 0) return null;
 
+        // ds_append uses M0 = s2 + (s3 << 18): low 16 bits are the GDS byte
+        // offset of the ordered-append counter. Yotei's later DMA_DATA copies
+        // GDS 0xd50 into guest memory for the CPU. Shifting s2 by 16 landed
+        // the count at 0, so those copies always published zeros.
+        var m0_base: u32 = 0xd50;
+        for (resources.scalar_registers[0..resources.scalar_count]) |scalar| {
+            if (scalar.register != 2) continue;
+            const raw = scalar.value;
+            m0_base = if (raw > 0xffff) raw >> 16 else raw;
+            m0_base &= 0xffff;
+            break;
+        }
         if (self.ensureGdsStorage()) {
-            var m0_base: u32 = 0x0d18;
-            for (resources.scalar_registers[0..resources.scalar_count]) |scalar| {
-                if (scalar.register == 2) {
-                    m0_base = scalar.value >> 16;
-                    break;
-                }
-            }
             var item: u32 = 0;
             while (item < 3) : (item += 1) {
                 const gds_offset = m0_base + item * 4;
@@ -5668,9 +5851,27 @@ pub const Renderer = struct {
 
         self.emulated_dispatches += 1;
         if (self.yotei_packed_visibility_seeds < 8 or self.traceCurrentGraphicsFrame()) {
+            var list_address: u64 = 0;
+            var list_bytes: u64 = 0;
+            for (resources.mappings[0..resources.mapping_count]) |mapping| {
+                const slot: usize = @intCast(mapping.descriptor_index);
+                if (!resources.occupied[slot] or !resources.writable[slot]) continue;
+                list_address = resources.addresses[slot];
+                list_bytes = resources.sizes[slot];
+                break;
+            }
             std.debug.print(
-                "[vulkan dcb] emulated Yotei GDS cull outputs={d} list_count={d} groups={d}x{d}x{d}\n",
-                .{ seeded_outputs, list_count, group_count[0], group_count[1], group_count[2] },
+                "[vulkan dcb] emulated Yotei GDS cull outputs={d} list_count={d} list=0x{x}/0x{x} gds=0x{x} groups={d}x{d}x{d}\n",
+                .{
+                    seeded_outputs,
+                    list_count,
+                    list_address,
+                    list_bytes,
+                    m0_base,
+                    group_count[0],
+                    group_count[1],
+                    group_count[2],
+                },
             );
             self.yotei_packed_visibility_seeds +|= 1;
         }
@@ -5687,6 +5888,231 @@ pub const Renderer = struct {
     /// complete 73-sample descriptor set while earlier dispatches are pending
     /// invalidates those submissions on current NVIDIA drivers just as surely
     /// as executing the kernel itself.
+    fn colorTargetHasExports(self: *const Renderer, address: u64) bool {
+        if (address == 0) return false;
+        for (self.render_targets.items) |cached| {
+            if (cached.target.descriptor.address == address and cached.color_export_generation != 0)
+                return true;
+        }
+        return false;
+    }
+
+    /// Yotei's HDR resolve (0x8000405d00) samples G-buffer colour and writes
+    /// the 4K RGBA16F / R11G11B10 HDR targets the composite reads. With no
+    /// mesh DRAW the G-buffer is empty, so this copies the same 0.25 env
+    /// fallback the lighting volume already uses — enough for a non-black
+    /// sky while geometry is still missing.
+    fn emulateYoteiEmptySceneHdrResolve(
+        self: *Renderer,
+        memory: GuestMemory,
+        bindings: *const gpu.ShaderBindings,
+        reader: gpu.ShaderMemoryReader,
+        analysis: *const gpu.ShaderAnalysis,
+        group_count: [3]u32,
+        program_address: u64,
+    ) anyerror!?DispatchReport {
+        const instructions = analysis.program.instructions.items;
+        var checkpoint_count: usize = 0;
+        for (instructions) |inst| {
+            if (needsResourceScalarCheckpoint(inst)) checkpoint_count += 1;
+        }
+        const checkpoint_pcs = try self.allocator.alloc(u32, checkpoint_count);
+        defer self.allocator.free(checkpoint_pcs);
+        const checkpoint_registers = try self.allocator.alloc(
+            gpu.scalar_provenance.ScalarRegisters,
+            checkpoint_count,
+        );
+        defer self.allocator.free(checkpoint_registers);
+        var checkpoint_index: usize = 0;
+        for (instructions) |inst| {
+            if (!needsResourceScalarCheckpoint(inst)) continue;
+            checkpoint_pcs[checkpoint_index] = inst.pc;
+            checkpoint_index += 1;
+        }
+        if (checkpoint_count != 0) {
+            _ = gpu.scalar_provenance.evaluateDecodedResourceStateAtCheckpoints(
+                reader,
+                bindings,
+                instructions,
+                checkpoint_pcs,
+                checkpoint_registers,
+            );
+        }
+
+        var saw_sampled = false;
+        var sampled_has_exports = false;
+        var output_descriptors: [4]gpu.ImageDescriptor = undefined;
+        var output_count: usize = 0;
+        var fallback_slot: usize = 0;
+        for (instructions) |inst| {
+            const writable = switch (inst.opcode) {
+                .image_store, .image_store_mip => true,
+                .image_load, .image_sample => false,
+                else => continue,
+            };
+            if (inst.src1.kind != .sgpr) continue;
+            const scalar = gpu.ScalarEvaluation{
+                .registers = scalarRegistersAtCheckpoint(
+                    checkpoint_pcs,
+                    checkpoint_registers,
+                    inst.pc,
+                ).*,
+            };
+            const descriptor = (try resolveComputeImageDescriptor(
+                bindings,
+                reader,
+                analysis,
+                &scalar,
+                inst.src1.reg,
+                inst.pc,
+                fallback_slot,
+            )) orelse {
+                fallback_slot += 1;
+                continue;
+            };
+            fallback_slot += 1;
+            if (!writable) {
+                saw_sampled = true;
+                if (self.colorTargetHasExports(descriptor.address)) sampled_has_exports = true;
+                continue;
+            }
+            if (descriptor.unified_format != 71 and descriptor.unified_format != 36) continue;
+            var duplicate = false;
+            for (output_descriptors[0..output_count]) |existing| {
+                if (existing.address == descriptor.address) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate or output_count >= output_descriptors.len) continue;
+            output_descriptors[output_count] = descriptor;
+            output_count += 1;
+        }
+        if (!saw_sampled or sampled_has_exports or output_count == 0) return null;
+
+        var filled: usize = 0;
+        for (output_descriptors[0..output_count]) |descriptor| {
+            var pattern: [8]u8 = @splat(0);
+            const pattern_length: usize = switch (descriptor.unified_format) {
+                36 => blk: {
+                    std.mem.writeInt(u32, pattern[0..4], 0x681a_0340, .little);
+                    break :blk 4;
+                },
+                71 => blk: {
+                    const quarter: f16 = 0.25;
+                    const one: f16 = 1.0;
+                    std.mem.writeInt(u16, pattern[0..2], @bitCast(quarter), .little);
+                    std.mem.writeInt(u16, pattern[2..4], @bitCast(quarter), .little);
+                    std.mem.writeInt(u16, pattern[4..6], @bitCast(quarter), .little);
+                    std.mem.writeInt(u16, pattern[6..8], @bitCast(one), .little);
+                    break :blk 8;
+                },
+                else => continue,
+            };
+            const texture = gpu.TextureLayout.fromImage(descriptor) catch continue;
+            const subresource = texture.subresource(descriptor.viewBaseLevel(), 0, 1) catch continue;
+            const staging_bytes = std.math.cast(usize, subresource.stagingBytes() catch continue) orelse continue;
+            const allocation_bytes = std.math.cast(usize, texture.required_source_bytes) orelse continue;
+            if (staging_bytes == 0 or staging_bytes > maximum_frame_bytes or
+                allocation_bytes == 0 or allocation_bytes > maximum_frame_bytes)
+            {
+                continue;
+            }
+            const linear = try self.allocator.alloc(u8, staging_bytes);
+            defer self.allocator.free(linear);
+            fillRepeatedPattern(linear, pattern[0..pattern_length]);
+            const allocation = try self.allocator.alloc(u8, allocation_bytes);
+            defer self.allocator.free(allocation);
+            @memset(allocation, 0);
+            subresource.tile(linear, allocation) catch continue;
+            if (!memory.write(memory.context, descriptor.address, allocation)) {
+                return Error.GuestMemoryWriteFailed;
+            }
+            self.invalidateDmaDestination(descriptor.address, allocation.len);
+            self.image_aliases.publishGuest(aliasRange(descriptor.address, allocation.len));
+            self.publishLinearStorageImage(memory, descriptor, linear) catch {};
+            self.noteComputeWrite(
+                "emulated-empty-scene-hdr",
+                descriptor.address,
+                descriptor.width,
+                descriptor.height,
+                descriptor.unified_format,
+            );
+            filled += 1;
+        }
+        if (filled == 0) return null;
+
+        {
+            const exposure = gpu.ImageDescriptor{
+                .address = 0x5061_3a00_00,
+                .width = 1920,
+                .height = 1080,
+                .depth_or_layers = 1,
+                .pitch = 1920,
+                .unified_format = 29,
+                .tile_mode = .render_target,
+                .image_type = .color_2d,
+                .dst_select = .{ 4, 5, 0, 1 },
+                .base_level = 0,
+                .last_level = 0,
+                .base_array = 0,
+                .array_pitch = 0,
+                .max_mip = 0,
+                .min_lod = 0,
+                .min_lod_warning = 0,
+                .bc_swizzle = 0,
+                .metadata_address = 0,
+                .dcc_enabled = false,
+                .cmask_fast_clear = false,
+                .fmask_compression = false,
+                .cmask_address = 0,
+                .fmask_address = 0,
+                .dcc_address = 0,
+                .descriptor_flags = 0,
+                .extended = false,
+            };
+            var rg: [4]u8 = undefined;
+            const one: f16 = 1.0;
+            std.mem.writeInt(u16, rg[0..2], @bitCast(one), .little);
+            std.mem.writeInt(u16, rg[2..4], @bitCast(one), .little);
+            if (gpu.TextureLayout.fromImage(exposure)) |texture| {
+                if (texture.subresource(0, 0, 1)) |subresource| blk: {
+                    const staging_bytes = std.math.cast(usize, subresource.stagingBytes() catch break :blk) orelse break :blk;
+                    const allocation_bytes = std.math.cast(usize, texture.required_source_bytes) orelse break :blk;
+                    if (staging_bytes == 0 or staging_bytes > maximum_frame_bytes or
+                        allocation_bytes == 0 or allocation_bytes > maximum_frame_bytes)
+                    {
+                        break :blk;
+                    }
+                    const linear = self.allocator.alloc(u8, staging_bytes) catch break :blk;
+                    defer self.allocator.free(linear);
+                    fillRepeatedPattern(linear, &rg);
+                    const allocation = self.allocator.alloc(u8, allocation_bytes) catch break :blk;
+                    defer self.allocator.free(allocation);
+                    @memset(allocation, 0);
+                    subresource.tile(linear, allocation) catch break :blk;
+                    if (memory.write(memory.context, exposure.address, allocation)) {
+                        self.invalidateDmaDestination(exposure.address, allocation.len);
+                        self.image_aliases.publishGuest(aliasRange(exposure.address, allocation.len));
+                        self.publishLinearStorageImage(memory, exposure, linear) catch {};
+                    }
+                } else |_| {}
+            } else |_| {}
+        }
+
+        self.yotei_empty_scene_hdr_this_frame = true;
+        self.emulated_dispatches += 1;
+        std.debug.print(
+            "[vulkan dcb] emulated Yotei empty-scene HDR resolve program=0x{x} outputs={d} groups={d}x{d}x{d}\n",
+            .{ program_address, filled, group_count[0], group_count[1], group_count[2] },
+        );
+        return .{
+            .pipeline_cache_hit = false,
+            .group_count = group_count,
+            .spirv_words = 0,
+        };
+    }
+
     fn emulateYoteiEnvironmentLightingFallback(
         self: *Renderer,
         memory: GuestMemory,
@@ -5841,6 +6267,13 @@ pub const Renderer = struct {
             // linear 1.0/0.25 pattern into the storage cache lets that T#
             // bind a GPU-resident copy instead.
             self.publishLinearStorageImage(memory, descriptor, linear) catch {};
+            self.noteComputeWrite(
+                "emulated-env",
+                descriptor.address,
+                descriptor.width,
+                descriptor.height,
+                descriptor.unified_format,
+            );
             cleared += 1;
         }
         if (cleared == 0) return Error.UnsupportedStorageImage;
@@ -6032,6 +6465,7 @@ pub const Renderer = struct {
         if (!memory.write(memory.context, descriptor.address, bytes)) return Error.GuestMemoryWriteFailed;
         self.invalidateDmaDestination(descriptor.address, byte_count);
         self.emulated_buffer_clear_dispatches += 1;
+        self.noteComputeWrite("emulated-linear-fill", descriptor.address, 0, 0, 0);
         if (log_verbose_gpu or self.emulated_buffer_clear_dispatches <= 4) {
             std.debug.print(
                 "[vulkan dcb] emulated linear buffer fill: addr=0x{x} value=0x{x} records={d} (#{d})\n",
@@ -6106,6 +6540,14 @@ pub const Renderer = struct {
         const packed_value = state.readRegister(.shader, 0x244) orelse return null;
         inline for (0x245..0x248) |register| {
             if ((state.readRegister(.shader, register) orelse return null) != packed_value) return null;
+        }
+
+        if (self.yotei_empty_scene_hdr_this_frame and
+            descriptor.address == 0x5061_3a00_00 and packed_value == 0)
+        {
+            self.emulated_dispatches += 1;
+            self.noteComputeWrite("emulated-packed-buffer", descriptor.address, 1920, 1080, 29);
+            return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
         }
 
         var target_index: ?usize = null;
@@ -6231,6 +6673,13 @@ pub const Renderer = struct {
             cached.gpu_dirty = true;
             _ = self.image_aliases.markWrite(cached.alias_token);
             self.emulated_buffer_clear_dispatches += 1;
+            self.noteComputeWrite(
+                "emulated-packed-storage",
+                descriptor.address,
+                snapshot.descriptor.width,
+                snapshot.descriptor.height,
+                snapshot.descriptor.unified_format,
+            );
             if (log_verbose_gpu or self.emulated_buffer_clear_dispatches <= 4) {
                 std.debug.print(
                     "[vulkan dcb] emulated packed storage-image clear: addr=0x{x} value=0x{x} bytes=0x{x} records={d} (#{d})\n",
@@ -6255,6 +6704,18 @@ pub const Renderer = struct {
                 const value = state.readRegister(.shader, 0x244 + index) orelse return null;
                 std.mem.writeInt(u32, pattern[index * 4 ..][0..4], value, .little);
             }
+            // Composite 0x80003b7100 multiplies HDR by this 1920×1080 RG16F
+            // exposure plane. A later packed fill zeros it after the empty-
+            // scene HDR resolve, which made a filled HDR still present black.
+            if (self.yotei_empty_scene_hdr_this_frame and
+                descriptor.address == 0x5061_3a00_00 and packed_value == 0)
+            {
+                const one: u16 = @bitCast(@as(f16, 1.0));
+                var half: usize = 0;
+                while (half + 2 <= pattern.len) : (half += 2) {
+                    std.mem.writeInt(u16, pattern[half..][0..2], one, .little);
+                }
+            }
             var offset: usize = 0;
             while (offset < bytes.len) : (offset += pattern.len) {
                 @memcpy(bytes[offset..][0..pattern.len], &pattern);
@@ -6262,6 +6723,7 @@ pub const Renderer = struct {
             if (!memory.write(memory.context, descriptor.address, bytes)) return Error.GuestMemoryWriteFailed;
             self.invalidateDmaDestination(descriptor.address, byte_count);
             self.emulated_buffer_clear_dispatches += 1;
+            self.noteComputeWrite("emulated-packed-buffer", descriptor.address, 0, 0, 0);
             if (log_verbose_gpu or self.emulated_buffer_clear_dispatches <= 4) {
                 std.debug.print(
                     "[vulkan dcb] emulated packed buffer fill: addr=0x{x} value=0x{x} bytes=0x{x} records={d} (#{d})\n",
@@ -6320,6 +6782,13 @@ pub const Renderer = struct {
             if (frame.guest_address == descriptor.address) frame.needs_writeback = false;
         }
         self.emulated_buffer_clear_dispatches += 1;
+        self.noteComputeWrite(
+            "emulated-packed-color",
+            descriptor.address,
+            0,
+            0,
+            0,
+        );
         if (log_verbose_gpu or self.emulated_buffer_clear_dispatches <= 4) {
             std.debug.print(
                 "[vulkan dcb] emulated packed color clear: addr=0x{x} bytes=0x{x} records={d} (#{d})\n",
@@ -6468,6 +6937,13 @@ pub const Renderer = struct {
         const writes: u64 = @as(u64, width) * height * depth;
 
         self.emulated_image_store_dispatches += 1;
+        self.noteComputeWrite(
+            "emulated-image-clear",
+            descriptor.address,
+            descriptor.width,
+            descriptor.height,
+            descriptor.unified_format,
+        );
         if (log_verbose_gpu or self.emulated_image_store_dispatches <= 4) {
             std.debug.print(
                 "[vulkan dcb] emulated image clear: {d} texels addr=0x{x} fmt={d} tile={s} (#{d})\n",
@@ -6554,6 +7030,20 @@ pub const Renderer = struct {
         const second_writes = try self.applyWholeImageClear(memory, second_clear);
 
         self.emulated_image_store_dispatches += 1;
+        self.noteComputeWrite(
+            "emulated-dual-clear",
+            first.address,
+            first.width,
+            first.height,
+            first.unified_format,
+        );
+        self.noteComputeWrite(
+            "emulated-dual-clear",
+            second.address,
+            second.width,
+            second.height,
+            second.unified_format,
+        );
         if (log_verbose_gpu or self.emulated_image_store_dispatches <= 4) {
             std.debug.print(
                 "[vulkan dcb] emulated dual image clear: {d}+{d} texels {d}x{d}/{d}x{d} padded={d}x{d}/{d}x{d} fmt={d}/{d} tile={s}/{s} (#{d})\n",
@@ -6775,6 +7265,13 @@ pub const Renderer = struct {
         }
 
         self.emulated_volume_copies += 1;
+        self.noteComputeWrite(
+            "emulated-volume",
+            image.address,
+            image.width,
+            image.height,
+            image.unified_format,
+        );
         if (log_verbose_gpu or self.emulated_volume_copies <= 4) {
             std.debug.print(
                 "[vulkan dcb] emulated volume upload: {d} texels src_fmt={d} dst_fmt={d} tile={s} (#{d})\n",
@@ -8058,10 +8555,16 @@ pub const Renderer = struct {
             if (slot >= gpu.resources.color_target_count) continue;
             highest = @max(highest, slot);
             result.color_attachment_formats[slot] = color.format.vulkan;
-            result.color_write_masks[slot] = mapColorWriteMask(
-                color.descriptor.write_mask,
-                colorTargetExportMapping(color.descriptor),
-            );
+            // CB_COLOR_CONTROL.MODE=0 is DISABLE: the bound shaders are a
+            // launch vehicle for metadata. Honouring the register write mask
+            // anyway lets Yotei's G-buffer PS export zeros over the scene.
+            result.color_write_masks[slot] = if (render.color_control.mode == 1)
+                mapColorWriteMask(
+                    color.descriptor.write_mask,
+                    colorTargetExportMapping(color.descriptor),
+                )
+            else
+                0;
             const blend = render.blends[slot];
             // Integer attachments reject colour blending; Yotei's ID plane is
             // R32_UINT and the G-buffer pass that fills it has blend off already.
@@ -9248,6 +9751,19 @@ pub const Renderer = struct {
         self.render_targets.items[index].shader_read_layout = true;
     }
 
+    fn renderTargetFormatCompatible(
+        _: *const Renderer,
+        cached: CachedRenderTarget,
+        image_format: u32,
+        _: gpu.resources.ImageDescriptor,
+    ) bool {
+        // Equal texel size is not enough. Yotei reuses 0x5000860000 as both an
+        // RGBA8 G-buffer MRT and an A2B10 scanout. Opaque RGBA8 black is
+        // 0xFF000000, which A2B10 unpacks as B=1008 — a solid blue present of
+        // an otherwise honest RGB-black composite.
+        return sampledViewFormatCompatible(cached.target.format.vulkan, image_format);
+    }
+
     fn findResidentRenderTargetIndex(
         self: *Renderer,
         descriptor: gpu.resources.ImageDescriptor,
@@ -9263,13 +9779,119 @@ pub const Renderer = struct {
                 cached.target.descriptor.address == descriptor.address and
                 cached.target.descriptor.width == descriptor.width and
                 cached.target.descriptor.height == descriptor.height and
-                (sampledViewFormatCompatible(cached.target.format.vulkan, image_format) or
-                    cached.target.format.bytes_per_texel == storageImageBytesPerTexel(descriptor.unified_format)))
+                self.renderTargetFormatCompatible(cached, image_format, descriptor))
             {
                 return index;
             }
         }
         return null;
+    }
+
+    fn latestRenderTargetAtAddress(
+        self: *const Renderer,
+        descriptor: gpu.resources.ImageDescriptor,
+        image_format: u32,
+    ) ?usize {
+        var best: ?usize = null;
+        var best_sequence: u64 = 0;
+        for (self.render_targets.items, 0..) |cached, index| {
+            if (!cached.initialized or
+                cached.target.descriptor.fragments_log2 != 0 or
+                cached.target.descriptor.address != descriptor.address or
+                !self.renderTargetFormatCompatible(cached, image_format, descriptor))
+            {
+                continue;
+            }
+            if (best != null and cached.last_used_sequence < best_sequence) continue;
+            best = index;
+            best_sequence = cached.last_used_sequence;
+        }
+        return best;
+    }
+
+    fn resizedGuestColorTarget(_: *Renderer, source: GuestColorTarget, width: u32, height: u32) !GuestColorTarget {
+        var descriptor = source.descriptor;
+        descriptor.width = width;
+        descriptor.height = height;
+        if (descriptor.pitch == 0 or descriptor.pitch == source.descriptor.width)
+            descriptor.pitch = width
+        else if (descriptor.pitch < width)
+            descriptor.pitch = width;
+        return guestColorTarget(descriptor);
+    }
+
+    fn copyRenderTargetOverlap(self: *Renderer, source_index: usize, destination_index: usize) anyerror!void {
+        if (source_index == destination_index) return;
+        if (source_index >= self.render_targets.items.len or
+            destination_index >= self.render_targets.items.len)
+        {
+            return Error.MissingPresentedFrame;
+        }
+        const source = self.render_targets.items[source_index];
+        const dest = self.render_targets.items[destination_index];
+        if (!source.initialized) return;
+        const copy_w = @min(source.target.descriptor.width, dest.target.descriptor.width);
+        const copy_h = @min(source.target.descriptor.height, dest.target.descriptor.height);
+        if (copy_w == 0 or copy_h == 0) return;
+
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        try self.transitionTrackedImage(
+            command_buffer,
+            source.image.handle,
+            .{ .aspect_mask = vk.image_aspect_color_bit },
+            image_state.transfer_source_usage,
+        );
+        try self.transitionTrackedImage(
+            command_buffer,
+            dest.image.handle,
+            .{ .aspect_mask = vk.image_aspect_color_bit },
+            image_state.transfer_destination_usage,
+        );
+        const blit = vk.ImageBlit{
+            .source_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+            .source_offsets = .{
+                .{ .x = 0, .y = 0, .z = 0 },
+                .{ .x = @intCast(copy_w), .y = @intCast(copy_h), .z = 1 },
+            },
+            .destination_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+            .destination_offsets = .{
+                .{ .x = 0, .y = 0, .z = 0 },
+                .{ .x = @intCast(copy_w), .y = @intCast(copy_h), .z = 1 },
+            },
+        };
+        self.device_functions.cmd_blit_image(
+            command_buffer,
+            source.image.handle,
+            vk.image_layout_transfer_src_optimal,
+            dest.image.handle,
+            vk.image_layout_transfer_dst_optimal,
+            1,
+            @ptrCast(&blit),
+            vk.filter_nearest,
+        );
+        try self.transitionTrackedImage(
+            command_buffer,
+            source.image.handle,
+            .{ .aspect_mask = vk.image_aspect_color_bit },
+            if (source.shader_read_layout) image_state.shader_read_usage else image_state.color_attachment_usage,
+        );
+        try self.transitionTrackedImage(
+            command_buffer,
+            dest.image.handle,
+            .{ .aspect_mask = vk.image_aspect_color_bit },
+            image_state.shader_read_usage,
+        );
+        try self.submitOneShot(command_buffer);
+
+        const cached_destination = &self.render_targets.items[destination_index];
+        cached_destination.initialized = true;
+        cached_destination.shader_read_layout = true;
+        cached_destination.gpu_generation +%= 1;
+        _ = self.image_aliases.markWrite(cached_destination.alias_token);
+        self.render_target_sequence +%= 1;
+        cached_destination.last_used_sequence = self.render_target_sequence;
+        self.render_targets.items[source_index].last_used_sequence = self.render_target_sequence;
     }
 
     fn stageResidentRenderTarget(
@@ -9279,7 +9901,58 @@ pub const Renderer = struct {
         image_format: u32,
         dimension: rdna2.spirv.SampledImageDimension,
     ) anyerror!?PreparedSampledImage {
-        const index = self.findResidentRenderTargetIndex(descriptor, image_format) orelse return null;
+        const latest = self.latestRenderTargetAtAddress(descriptor, image_format) orelse return null;
+        const exact = self.findResidentRenderTargetIndex(descriptor, image_format);
+        const index = if (exact) |exact_index| blk: {
+            const exact_seq = self.render_targets.items[exact_index].last_used_sequence;
+            const latest_seq = self.render_targets.items[latest].last_used_sequence;
+            if (exact_index == latest or exact_seq >= latest_seq) break :blk exact_index;
+            try self.copyRenderTargetOverlap(latest, exact_index);
+            if (self.resident_rt_extent_alias_reports < 8 or self.traceCurrentGraphicsFrame()) {
+                std.debug.print(
+                    "[vulkan dcb] DRS sample refresh @0x{x} {d}x{d} <- {d}x{d}\n",
+                    .{
+                        descriptor.address,
+                        descriptor.width,
+                        descriptor.height,
+                        self.render_targets.items[latest].target.descriptor.width,
+                        self.render_targets.items[latest].target.descriptor.height,
+                    },
+                );
+                self.resident_rt_extent_alias_reports +|= 1;
+            }
+            break :blk exact_index;
+        } else blk: {
+            const source = self.render_targets.items[latest];
+            if (source.target.descriptor.width == descriptor.width and
+                source.target.descriptor.height == descriptor.height)
+            {
+                break :blk latest;
+            }
+            const dest_target = self.resizedGuestColorTarget(
+                source.target,
+                descriptor.width,
+                descriptor.height,
+            ) catch return null;
+            self.render_target_sequence +%= 1;
+            self.render_targets.items[latest].last_used_sequence = self.render_target_sequence;
+            const dest_index = try self.acquireRenderTarget(dest_target);
+            try self.copyRenderTargetOverlap(latest, dest_index);
+            if (self.resident_rt_extent_alias_reports < 8 or self.traceCurrentGraphicsFrame()) {
+                std.debug.print(
+                    "[vulkan dcb] DRS sample snapshot @0x{x} {d}x{d} <- {d}x{d}\n",
+                    .{
+                        descriptor.address,
+                        descriptor.width,
+                        descriptor.height,
+                        source.target.descriptor.width,
+                        source.target.descriptor.height,
+                    },
+                );
+                self.resident_rt_extent_alias_reports +|= 1;
+            }
+            break :blk dest_index;
+        };
         const cached = self.render_targets.items[index];
         try self.transitionRenderTargetToShaderRead(index);
         const components = try sampledImageComponents(descriptor.dst_select);
@@ -10650,13 +11323,20 @@ pub const Renderer = struct {
         const cached = &self.render_targets.items[target_index];
         cached.initialized = true;
         cached.gpu_generation +%= 1;
+        if (pipeline_state.color_write_masks[target.descriptor.slot] != 0)
+            cached.color_export_generation +%= 1;
         _ = self.image_aliases.markWrite(cached.alias_token);
         cached.last_used_sequence = self.render_target_sequence;
-        for (extra_indices[0..extra_colors.len]) |extra_index| {
+        for (extra_indices[0..extra_colors.len], extra_colors) |extra_index, extra| {
             self.render_target_sequence +%= 1;
             const extra_cached = &self.render_targets.items[extra_index];
             extra_cached.initialized = true;
             extra_cached.gpu_generation +%= 1;
+            if (extra.descriptor.slot < pipeline_state.color_write_masks.len and
+                pipeline_state.color_write_masks[extra.descriptor.slot] != 0)
+            {
+                extra_cached.color_export_generation +%= 1;
+            }
             _ = self.image_aliases.markWrite(extra_cached.alias_token);
             extra_cached.last_used_sequence = self.render_target_sequence;
         }
@@ -16853,6 +17533,49 @@ pub const Renderer = struct {
         return selected;
     }
 
+    /// Flip of `0x5000860000` has both an RGBA8 G-buffer MRT and an A2B10
+    /// scanout at the same VA. Sequence alone picks whichever bound last;
+    /// the display buffer is the 10-bit one.
+    fn latestPresentableTargetAtAddress(
+        self: *const Renderer,
+        address: u64,
+        width: u32,
+        height: u32,
+    ) ?usize {
+        var exact_hdr: ?usize = null;
+        var exact_hdr_sequence: u64 = 0;
+        var exact: ?usize = null;
+        var exact_sequence: u64 = 0;
+        var hdr: ?usize = null;
+        var hdr_sequence: u64 = 0;
+        var any: ?usize = null;
+        var any_sequence: u64 = 0;
+        for (self.render_targets.items, 0..) |target, index| {
+            if (!target.initialized or target.target.descriptor.address != address) continue;
+            const sequence = target.last_used_sequence;
+            const is_hdr = packedHdrSwapchainFormat(target.target.format.vulkan);
+            const is_exact = target.target.descriptor.width == width and
+                target.target.descriptor.height == height;
+            if (is_exact and is_hdr and (exact_hdr == null or sequence >= exact_hdr_sequence)) {
+                exact_hdr = index;
+                exact_hdr_sequence = sequence;
+            }
+            if (is_exact and (exact == null or sequence >= exact_sequence)) {
+                exact = index;
+                exact_sequence = sequence;
+            }
+            if (is_hdr and (hdr == null or sequence >= hdr_sequence)) {
+                hdr = index;
+                hdr_sequence = sequence;
+            }
+            if (any == null or sequence >= any_sequence) {
+                any = index;
+                any_sequence = sequence;
+            }
+        }
+        return exact_hdr orelse exact orelse hdr orelse any;
+    }
+
     fn latestVisibleCompletedFrame(self: *Renderer, buffer: DisplayBuffer) ?usize {
         var matching_rgba: ?usize = null;
         var matching_rgba_sequence: u64 = 0;
@@ -17005,10 +17728,14 @@ pub const Renderer = struct {
             if (self.window_presentation != null) {
                 if (self.latestAliasedDisplayTarget(buffer)) |target_index| {
                     const target = self.render_targets.items[target_index];
-                    self.blitRenderTargetToSwapchain(target_index) catch |err| {
+                    const presented = self.presentWindowRenderTarget(target_index, flip) catch |err| {
                         self.last_flip_error = err;
                         return false;
                     };
+                    if (!presented) {
+                        self.last_flip_error = Error.PresentationRejected;
+                        return false;
+                    }
                     if (self.flip_callbacks <= 8 or log_verbose_gpu) {
                         std.debug.print(
                             "[vulkan dcb] presenting aliased display target @0x{x} for @0x{x} sequence={d} fmt={d}\n",
@@ -17185,6 +17912,7 @@ pub const Renderer = struct {
     }
 
     fn reportFrameProfile(self: *Renderer) void {
+        self.flushComputeCensus();
         const profile = self.frame_profile;
         const now = hostTimestampNs();
         if (self.frame_rate_sink) |sink| {
@@ -17466,6 +18194,7 @@ pub const Renderer = struct {
         // So do the colour targets this frame bound. Carrying them into the
         // next flip would let one frame's composite vouch for another's.
         defer self.batch_color_targets.reset();
+        defer self.yotei_empty_scene_hdr_this_frame = false;
         if (log_verbose_gpu) std.debug.print(
             "[vulkan dcb] flip #{d} buffer={d} video_out={d} completed_frames={d}\n",
             .{ self.flip_callbacks, flip.display_buffer_index, flip.video_out_handle, self.completed_frames.items.len },
@@ -17643,20 +18372,19 @@ pub const Renderer = struct {
                 self.flip_callbacks > 8 and
                 !shouldDumpProgressFrame(self.flip_callbacks, self.capture_extended_progress_frames))
             {
-                var direct_index: ?usize = null;
-                var direct_sequence: u64 = 0;
-                for (self.render_targets.items, 0..) |target, target_index| {
-                    if (target.target.descriptor.address != requested.?.address or !target.initialized) continue;
-                    if (direct_index == null or target.last_used_sequence > direct_sequence) {
-                        direct_index = target_index;
-                        direct_sequence = target.last_used_sequence;
-                    }
-                }
-                if (direct_index) |target_index| {
-                    self.blitRenderTargetToSwapchain(target_index) catch |err| {
+                if (self.latestPresentableTargetAtAddress(
+                    requested.?.address,
+                    requested.?.width,
+                    requested.?.height,
+                )) |target_index| {
+                    const presented = self.presentWindowRenderTarget(target_index, flip) catch |err| {
                         self.last_flip_error = err;
                         return false;
                     };
+                    if (!presented) {
+                        self.last_flip_error = Error.PresentationRejected;
+                        return false;
+                    }
                     self.presented_frames += 1;
                     self.last_flip_error = null;
                     return true;
@@ -20200,10 +20928,17 @@ fn storageImageCanAliasRenderTarget(
 ) bool {
     if (!initialized or fragments_log2 != 0) return false;
     if (address != descriptor.address) return false;
-    if (width != descriptor.width or height != descriptor.height) return false;
+    // Yotei DRS rebinds the same allocation at 3840×2160 and 3328×1872.
+    // Integer image_load/store into the larger image is the hardware alias;
+    // a second VkImage at the smaller extent never sees those writes.
+    if (width < descriptor.width or height < descriptor.height) return false;
     if (vulkan_format == format.vulkan) return true;
     if (sampledViewFormatCompatible(vulkan_format, format.vulkan)) return true;
-    return bytes_per_texel == storageImageBytesPerTexel(descriptor.unified_format);
+    // Equal texel size is not a view-compatible format. Yotei reuses
+    // 0x5000860000 as RGBA8 and A2B10; a mutable RGBA8 storage view of the
+    // A2B10 image stores 0xFF000000, which unpacks as B=1008.
+    _ = bytes_per_texel;
+    return false;
 }
 
 fn storageImageTypesCanAlias(a: gpu.resources.ImageType, b: gpu.resources.ImageType) bool {
@@ -20232,11 +20967,14 @@ fn storageImageOverlapsSampledDescriptor(a: gpu.ImageDescriptor, b: gpu.ImageDes
 }
 
 fn sameStorageImageDescriptor(a: gpu.ImageDescriptor, b: gpu.ImageDescriptor) bool {
+    // Tile mode is a guest memory equation. Once the allocation is a resident
+    // VkImage, a later T# that disagrees on tiling (Yotei occupancy is written
+    // as a colour storage image and read back as depth-tiled R8) still names
+    // the same GPU copy.
     return storageImageOverlapsSampledDescriptor(a, b) and
         a.depth_or_layers == b.depth_or_layers and
         a.image_type == b.image_type and
-        a.base_array == b.base_array and
-        a.tile_mode == b.tile_mode;
+        a.base_array == b.base_array;
 }
 
 fn storageImageBytesPerTexel(unified_format: u16) u8 {
@@ -23644,6 +24382,62 @@ test "a rasterized colour target aliases a later storage image of the same alloc
     ));
 }
 
+test "RGBA8 storage does not alias an A2B10 render target of the same bytes" {
+    const rgba = storageImageFormat(56).?;
+    const a2b10 = storageImageFormat(50).?;
+    var descriptor = gpu.ImageDescriptor{
+        .address = 0x5000_8600_00,
+        .width = 3840,
+        .height = 2160,
+        .depth_or_layers = 1,
+        .pitch = 3840,
+        .unified_format = 56,
+        .tile_mode = .render_target,
+        .image_type = .color_2d,
+        .dst_select = .{ 0, 1, 2, 3 },
+        .base_level = 0,
+        .last_level = 0,
+        .base_array = 0,
+        .array_pitch = 0,
+        .max_mip = 0,
+        .min_lod = 0,
+        .min_lod_warning = 0,
+        .bc_swizzle = 0,
+        .metadata_address = 0,
+        .dcc_enabled = false,
+        .cmask_fast_clear = false,
+        .fmask_compression = false,
+        .cmask_address = 0,
+        .fmask_address = 0,
+        .dcc_address = 0,
+        .descriptor_flags = 0,
+        .extended = false,
+    };
+    try std.testing.expect(!storageImageCanAliasRenderTarget(
+        true,
+        0,
+        0x5000_8600_00,
+        3840,
+        2160,
+        vk.format_a2b10g10r10_unorm_pack32,
+        4,
+        descriptor,
+        rgba,
+    ));
+    descriptor.unified_format = 50;
+    try std.testing.expect(storageImageCanAliasRenderTarget(
+        true,
+        0,
+        0x5000_8600_00,
+        3840,
+        2160,
+        vk.format_a2b10g10r10_unorm_pack32,
+        4,
+        descriptor,
+        a2b10,
+    ));
+}
+
 test "a 2D sample aliases a 2D-array colour storage image at the same address" {
     const producer = gpu.ImageDescriptor{
         .address = 0x509e_7800_00,
@@ -23716,6 +24510,7 @@ test "a depth-tiled sample still aliases a colour storage image" {
     sampled.tile_mode = .depth;
 
     try std.testing.expect(storageImageOverlapsSampledDescriptor(producer, sampled));
+    try std.testing.expect(sameStorageImageDescriptor(producer, sampled));
     sampled.address += 0x1000;
     try std.testing.expect(!storageImageOverlapsSampledDescriptor(producer, sampled));
 }
@@ -24512,6 +25307,23 @@ test "A2B10G10R10 UNORM presentation conversion preserves RGBA channels" {
     try std.testing.expectEqualSlices(u8, &.{ 0, 255, 0, 0 }, rgba[8..12]);
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 0 }, rgba[12..16]);
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, rgba[16..20]);
+}
+
+test "opaque RGBA8 black is not an A2B10 view of the same bytes" {
+    // 0xFF000000 = RGBA(0,0,0,255). Read as A2B10 that is B=1008, A=3.
+    const word: u32 = 0xFF000000;
+    try std.testing.expectEqual(@as(u32, 0), word & 0x3ff);
+    try std.testing.expectEqual(@as(u32, 0), (word >> 10) & 0x3ff);
+    try std.testing.expectEqual(@as(u32, 1008), (word >> 20) & 0x3ff);
+    try std.testing.expectEqual(@as(u32, 3), word >> 30);
+    try std.testing.expect(!sampledViewFormatCompatible(
+        vk.format_r8g8b8a8_unorm,
+        vk.format_a2b10g10r10_unorm_pack32,
+    ));
+    try std.testing.expect(sampledViewFormatCompatible(
+        vk.format_a2b10g10r10_unorm_pack32,
+        vk.format_a2b10g10r10_unorm_pack32,
+    ));
 }
 
 test "typed image clear texels use the descriptor number format" {
