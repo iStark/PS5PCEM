@@ -2901,6 +2901,10 @@ pub const Renderer = struct {
     dispatch_callbacks: u64 = 0,
     translated_dispatches: u64 = 0,
     elided_dispatches: u64 = 0,
+    /// Elided dispatches already accounted for in a frame summary, so the
+    /// per-frame line can report how much work this frame dropped rather than
+    /// a total that only ever grows.
+    reported_elided_dispatches: u64 = 0,
     reanimal_nvidia_compute_workaround_active: bool = false,
     reanimal_nvidia_wave_compaction_seen: bool = false,
     reanimal_nvidia_compute_quarantined: bool = false,
@@ -17235,6 +17239,16 @@ pub const Renderer = struct {
                     resident_storage_images,
                     self.storage_image_cache_bytes / (1024 * 1024),
                 },
+            );
+            const elided_this_frame = self.elided_dispatches -| self.reported_elided_dispatches;
+            self.reported_elided_dispatches = self.elided_dispatches;
+            // Dispatches are dropped at a dozen points once resource
+            // recovery proves they cannot reach guest state. That is a
+            // large share of a frame to discard silently, and an empty
+            // intermediate surface is exactly what it looks like.
+            if (elided_this_frame != 0) std.debug.print(
+                "[gpu frame] flip={d} elided_dispatches={d} of {d}\n",
+                .{ self.flip_callbacks, elided_this_frame, profile.dispatches + elided_this_frame },
             );
             std.debug.print(
                 "[gpu shaders] flip={d} pso_hit={d} pso_miss={d}/{d}ms cpso={d}/{d}/{d}ms compute_ms={d}/{d}/{d}/{d} pso_cache={d} cpso_cache={d} miss_match(state/vs/ps)={d}/{d}/{d} sa_hit={d} sa_miss={d}/{d}ms prov_ms={d} xlat_ms={d} res_ms={d} sampled_ms={d}/{d}/{d}/{d} probe_ms={d} target_create_ms={d}/{d}\n",
