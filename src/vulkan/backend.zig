@@ -9972,12 +9972,13 @@ pub const Renderer = struct {
         self.graphics_probe_colored_pixels = colored;
         if (self.traceCurrentGraphicsFrame()) {
             std.debug.print(
-                "[vulkan dcb] traced render-target result addr=0x{x} fmt={d} nonzero_texels={d}/{d}\n",
+                "[vulkan dcb] traced render-target result addr=0x{x} fmt={d} nonzero_texels={d}/{d} peak={d}\n",
                 .{
                     snapshot.target.descriptor.address,
                     snapshot.target.descriptor.format,
                     colored,
                     snapshot.target.descriptor.width * snapshot.target.descriptor.height,
+                    peakColorValue(frame, snapshot.target.format),
                 },
             );
         }
@@ -20632,6 +20633,37 @@ fn uniformDccSingleTexel(surface: []const u8, bytes_per_texel: u8) ?DccClearTexe
         )) return null;
     }
     return result;
+}
+
+/// The brightest colour value in a materialized attachment.
+///
+/// A texel count alone cannot tell a target the title rendered very dark
+/// apart from one nothing wrote: both a full frame at 1/1023 brightness and
+/// an untouched surface read as black once converted for display. Alpha is
+/// excluded because a surface cleared to opaque black carries a saturated
+/// alpha in every texel, which would report a bright frame that has no
+/// visible colour at all.
+fn peakColorValue(linear: []const u8, format: ColorTargetFormat) u32 {
+    const stride: usize = format.bytes_per_texel;
+    if (stride == 0 or linear.len < stride) return 0;
+    var highest: u32 = 0;
+    var index: usize = 0;
+    while (index + stride <= linear.len) : (index += stride) {
+        const texel = linear[index..][0..stride];
+        if (stride == 4 and format.vulkan == vk.format_a2b10g10r10_unorm_pack32) {
+            const word = std.mem.readInt(u32, texel[0..4], .little);
+            highest = @max(highest, word & 0x3ff);
+            highest = @max(highest, (word >> 10) & 0x3ff);
+            highest = @max(highest, (word >> 20) & 0x3ff);
+            continue;
+        }
+        if (stride == 4 and format.vulkan == vk.format_r8g8b8a8_unorm) {
+            for (texel[0..3]) |byte| highest = @max(highest, @as(u32, byte));
+            continue;
+        }
+        for (texel) |byte| highest = @max(highest, @as(u32, byte));
+    }
+    return highest;
 }
 
 fn countNonzeroTexels(linear: []const u8, bytes_per_texel: u8) u32 {
