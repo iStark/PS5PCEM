@@ -745,6 +745,18 @@ const maximum_completed_frames = 16;
 // attachment was still part of the active graph. A 64-entry working set keeps
 // those targets resident and lets the existing direct sampled-target path bind
 // the same Vulkan image for the next pass.
+const maximum_changed_content_reports: usize = 24;
+const maximum_scanout_content_reports: usize = 16;
+
+/// One upload's identity and content. Two views of the same allocation differ
+/// in extent, and keying on the address alone would report every alternation
+/// between them as though the bytes had changed.
+const TextureContent = struct {
+    address: u64 = 0,
+    bytes: usize = 0,
+    hash: u64 = 0,
+};
+
 const maximum_render_targets = 64;
 const maximum_color_passes = 16;
 const maximum_depth_targets = 16;
@@ -2938,6 +2950,12 @@ pub const Renderer = struct {
     dispatch_callbacks: u64 = 0,
     translated_dispatches: u64 = 0,
     elided_dispatches: u64 = 0,
+    /// Content hashes of recently uploaded textures, so a surface whose bytes
+    /// change can be told from the many that never do.
+    recent_texture_content: [64]TextureContent = @splat(.{}),
+    recent_texture_content_next: usize = 0,
+    changed_content_reports: usize = 0,
+    scanout_content_reports: usize = 0,
     /// Dispatches this ran on the CPU instead of the GPU. They are not lost
     /// work, so counting them as elided would report a frame discarding
     /// compute it actually performed.
@@ -10519,6 +10537,62 @@ pub const Renderer = struct {
         return oldest_index;
     }
 
+    /// Says when the bytes behind one address stop matching what was uploaded from
+    /// it before.
+    ///
+    /// A surface a title fills from the CPU -- a decoded video frame copied into a
+    /// texture, say -- leaves no GPU write to observe, so the only sign it is being
+    /// produced at all is that its content changes from one upload to the next.
+    /// Almost every surface here is uploaded once and never changes, which is what
+    /// makes the ones that do worth naming.
+    fn reportChangedTextureContent(
+        self: *Renderer,
+        descriptor: gpu.resources.ImageDescriptor,
+        byte_count: usize,
+        content_hash: u64,
+    ) void {
+        if (self.changed_content_reports >= maximum_changed_content_reports) return;
+        for (&self.recent_texture_content) |*entry| {
+            if (entry.address != descriptor.address or entry.bytes != byte_count) continue;
+            if (entry.hash == content_hash) return;
+            const previous = entry.hash;
+            entry.hash = content_hash;
+            self.changed_content_reports += 1;
+            std.debug.print(
+                "[vulkan dcb] texture content changed @0x{x} {d}x{d} bytes={d} {x} -> {x}\n",
+                .{ descriptor.address, descriptor.width, descriptor.height, byte_count, previous, content_hash },
+            );
+            return;
+        }
+        const slot = self.recent_texture_content_next % self.recent_texture_content.len;
+        self.recent_texture_content_next +%= 1;
+        self.recent_texture_content[slot] = .{ .address = descriptor.address, .bytes = byte_count, .hash = content_hash };
+    }
+
+    /// Says whether the bytes a title left in the buffer it is flipping hold a
+    /// picture of their own.
+    ///
+    /// A frame composed on the CPU -- a splash a title copies in itself --
+    /// lives only in those bytes, and this renderer prefers the attachment it
+    /// holds for the same address. When that attachment is empty, preferring it
+    /// is what turns a finished frame into a black one, and only comparing the
+    /// two can tell that apart from a title that drew nothing.
+    fn reportGuestScanoutContent(self: *Renderer, buffer: DisplayBuffer) void {
+        if (self.scanout_content_reports >= maximum_scanout_content_reports) return;
+        if (buffer.width == 0 or buffer.height == 0) return;
+        const memory = self.guest_memory orelse return;
+        const pitch = if (buffer.pitch_in_pixels != 0) buffer.pitch_in_pixels else buffer.width;
+        const wanted = @as(usize, pitch) * buffer.height * 4;
+        self.guest_frame_scratch.resize(self.allocator, wanted) catch return;
+        if (!memory.read(memory.context, buffer.address, self.guest_frame_scratch.items)) return;
+        const coloured = countNonblackRgb(self.guest_frame_scratch.items);
+        self.scanout_content_reports += 1;
+        std.debug.print(
+            "[vulkan dcb] flip #{d} guest bytes @0x{x} carry {d} coloured pixels of {d}\n",
+            .{ self.flip_callbacks, buffer.address, coloured, wanted / 4 },
+        );
+    }
+
     fn acquireRenderTarget(self: *Renderer, target: GuestColorTarget) anyerror!usize {
         for (self.render_targets.items, 0..) |cached_snapshot, index| {
             if (!sameRenderTarget(cached_snapshot.target, target)) continue;
@@ -15960,6 +16034,7 @@ pub const Renderer = struct {
                 .{ self.texture_cache_misses, descriptor.address, descriptor.width, descriptor.height, byte_count, source_generation, content_hash },
             );
         }
+        self.reportChangedTextureContent(descriptor, byte_count, content_hash);
 
         const linear = try self.allocator.alloc(u8, byte_count);
         defer self.allocator.free(linear);
@@ -18235,6 +18310,7 @@ pub const Renderer = struct {
                     },
                 );
             }
+            self.reportGuestScanoutContent(requested.?);
             self.resolvePendingTargetlessDraw(requested.?);
             self.finishDrawBatch() catch |err| {
                 self.last_flip_error = err;
