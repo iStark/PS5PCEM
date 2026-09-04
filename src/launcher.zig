@@ -881,8 +881,16 @@ fn paint(window: Win32.Window) void {
 
 fn drawBrand(dc: Win32.DeviceContext) void {
     _ = Win32.DrawIconEx(dc, 24, 28, application_icon, 44, 44, 0, null, Win32.di_normal);
-    text(dc, w("PS5PCEM"), -1, .{ .left = 80, .top = 31, .right = 216, .bottom = 56 }, 0x00f4f0ea, title_font, Win32.dt_left);
-    text(dc, w("LAUNCHER · PREVIEW"), -1, .{ .left = 80, .top = 57, .right = 216, .bottom = 76 }, 0x009b9088, small_font, Win32.dt_left);
+    // The 27-pixel title needs a cell about 36 pixels tall; the old 25-pixel
+    // one sliced the bottom off every glyph. Both lines are sized for their
+    // font and the pair is centred against the 44-pixel icon beside them.
+    text(dc, w("PS5PCEM"), -1, .{ .left = 80, .top = 26, .right = 216, .bottom = 62 }, 0x00f4f0ea, title_font, Win32.dt_left);
+    // The sidebar leaves 136 pixels beside the icon, which "LAUNCHER ·
+    // PREVIEW" overran: it was drawn cut off mid-word. The window title
+    // already says this is the launcher, so the line only has to say which
+    // kind of build it is. The ellipsis flag keeps a future string degrading
+    // readably instead of being chopped through a glyph.
+    text(dc, w("PREVIEW BUILD"), -1, .{ .left = 80, .top = 62, .right = 216, .bottom = 80 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
 }
 
 fn drawNavigation(dc: Win32.DeviceContext) void {
