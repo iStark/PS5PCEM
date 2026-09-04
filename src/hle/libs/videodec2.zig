@@ -109,21 +109,20 @@ const FrameBuffer = extern struct {
     reserved: [7]u8,
 };
 
+/// What a decode call reports back.
+///
+/// Only the prefix is named: a title reads the ready flag first and then the
+/// picture size, and those are the fields whose meaning is established. The
+/// remainder is left exactly as the title prepared it, because filling in
+/// fields whose meaning is a guess is how a caller is told a picture is
+/// something other than what it is.
 const OutputInfo = extern struct {
-    this_size: u64,
-    is_valid: u8,
-    is_error_frame: u8,
-    picture_count: u8,
-    is_discarded_frame: u8,
-    codec_type: u32,
-    frame_width: u32,
-    frame_pitch: u32,
-    frame_height: u32,
-    padding: u32,
-    frame_buffer: u64,
-    frame_buffer_size: u64,
-    frame_format: u32,
-    frame_pitch_in_bytes: u32,
+    /// 0 = no picture from this call, 1 = one is waiting in the frame buffer.
+    picture_ready: u8,
+    reserved0: [7]u8,
+    width: u64,
+    height: u64,
+    unnamed: [32]u8,
 };
 
 comptime {
@@ -235,10 +234,6 @@ pub fn deleteDecoder(decoder: u64) callconv(abi.guest) i32 {
     return errno.ok;
 }
 
-/// NV12, which is what the host decoder produces and what a title reading a
-/// two-plane luma/chroma picture expects.
-const frame_format_nv12: u32 = 0;
-
 /// Decodes one access unit and, when a picture comes back, copies it into the
 /// slot the title provided and describes it.
 ///
@@ -270,38 +265,16 @@ fn publishDecodedPicture(
             .{ published_pictures, frame.frame_buffer },
         );
     }
-    frame.is_accepted = 1;
-    output.is_valid = 1;
-    output.is_error_frame = 0;
-    output.picture_count = 1;
-    output.is_discarded_frame = 0;
-    output.codec_type = 1;
-    output.frame_width = picture.width;
-    output.frame_height = picture.height;
-    output.frame_pitch = picture.pitch;
-    output.padding = 0;
-    output.frame_buffer = frame.frame_buffer;
-    output.frame_buffer_size = frame.frame_buffer_size;
-    output.frame_format = frame_format_nv12;
-    output.frame_pitch_in_bytes = picture.pitch;
+    output.width = picture.width;
+    output.height = picture.height;
+    output.picture_ready = 1;
     return true;
 }
 
-fn fillNoPicture(frame: *FrameBuffer, output: *OutputInfo) void {
-    frame.is_accepted = 1;
-    output.is_valid = 0;
-    output.is_error_frame = 0;
-    output.picture_count = 0;
-    output.is_discarded_frame = 0;
-    output.codec_type = 0;
-    output.frame_width = 0;
-    output.frame_pitch = 0;
-    output.frame_height = 0;
-    output.padding = 0;
-    output.frame_buffer = frame.frame_buffer;
-    output.frame_buffer_size = frame.frame_buffer_size;
-    output.frame_format = 0;
-    output.frame_pitch_in_bytes = 0;
+/// Says no picture came of a call, which is the first thing every call reports
+/// before a decoded one can replace it.
+fn fillNoPicture(_: *FrameBuffer, output: *OutputInfo) void {
+    output.picture_ready = 0;
 }
 
 pub fn decode(
@@ -400,6 +373,29 @@ test "a compute queue is told how much backing to allocate" {
     // The title allocates from this and stores the result before allocating
     // the queue; leaving it at zero makes that allocation refused.
     try std.testing.expect(info.cpu_gpu_memory_size != 0);
+}
+
+test "a reported picture puts its readiness where a title reads it" {
+    var slot = std.mem.zeroes(FrameBuffer);
+    var report = std.mem.zeroes(OutputInfo);
+    report.unnamed[0] = 0xa5;
+
+    fillNoPicture(&slot, &report);
+    try std.testing.expectEqual(@as(u8, 0), report.picture_ready);
+
+    report.width = 1920;
+    report.height = 1088;
+    report.picture_ready = 1;
+
+    // The flag a title checks is the first byte of the record, and the size
+    // follows it as two 64-bit halves. Reading them back through the raw bytes
+    // is what catches a field drifting to another offset.
+    const raw: *const [@sizeOf(OutputInfo)]u8 = @ptrCast(&report);
+    try std.testing.expectEqual(@as(u8, 1), raw[0]);
+    try std.testing.expectEqual(@as(u64, 1920), std.mem.readInt(u64, raw[8..16], .little));
+    try std.testing.expectEqual(@as(u64, 1088), std.mem.readInt(u64, raw[16..24], .little));
+    // Everything past the size belongs to the title.
+    try std.testing.expectEqual(@as(u8, 0xa5), raw[24]);
 }
 
 test "Videodec2 ABI records retain SDK sizes" {
