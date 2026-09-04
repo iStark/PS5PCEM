@@ -65,7 +65,10 @@ and keeps portable settings and savedata beside the application.
       <img src="docs/images/yotei-intro-video.png" alt="Ghost of Yotei intro video decoded and presented by PS5PCEM"><br>
       <sub>Ghost of Yotei — intro video, decoded and presented</sub>
     </td>
-    <td width="50%" align="center"></td>
+    <td width="50%" align="center">
+      <img src="docs/images/reanimal-menu-partial.png" alt="REANIMAL title menu rendered by PS5PCEM"><br>
+      <sub>REANIMAL — animated title menu (option labels incomplete)</sub>
+    </td>
   </tr>
 </table>
 
