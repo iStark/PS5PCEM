@@ -13,6 +13,7 @@ const std = @import("std");
 const abi = @import("../abi.zig");
 const errno = @import("../errno.zig");
 const kernel_memory = @import("kernel_memory.zig");
+const h264 = @import("videodec2_h264.zig");
 
 const error_argument_pointer: i32 = @bitCast(@as(u32, 0x811d_0102));
 const error_decoder_instance: i32 = @bitCast(@as(u32, 0x811d_0103));
@@ -21,9 +22,26 @@ const error_output_info: i32 = @bitCast(@as(u32, 0x811d_010f));
 
 const minimum_memory_size: u64 = 16 * 1024 * 1024;
 
-/// Size reported for one decoded-frame slot. Any nonzero value serves; a
-/// zero makes a title divide its frame arena by it.
-const frame_slot_size: u64 = 0x1000;
+/// Smallest slot reported when a configuration names no picture size.
+const minimum_frame_slot_size: u64 = 0x1000;
+
+/// Bytes one decoded picture occupies, which is what a title reserves per slot.
+///
+/// A title divides its frame arena by this, so it has to describe a real
+/// picture: too large and the arena holds none, too small and a decoded frame
+/// has nowhere to go.
+fn decodedFrameSlotSize(config: *const DecoderConfigInfo) u64 {
+    if (config.max_frame_width <= 0 or config.max_frame_height <= 0) {
+        return minimum_frame_slot_size;
+    }
+    const width: u64 = @intCast(config.max_frame_width);
+    const height: u64 = @intCast(config.max_frame_height);
+    const bytes = h264.pictureBytes(@intCast(width), @intCast(height));
+    return @max(minimum_frame_slot_size, std.mem.alignForward(u64, bytes, 0x100));
+}
+
+var announced_decoders: u8 = 0;
+var announced_units: u8 = 0;
 
 const ComputeMemoryInfo = extern struct {
     this_size: u64,
@@ -166,8 +184,9 @@ pub fn queryDecoderMemoryInfo(
     output.cpu_gpu_memory_size = 0;
     // The frame-slot size is the one figure the title cannot do without: it
     // divides its frame arena by this to decide how many pictures it can hold,
-    // so a zero here ends the setup before a single frame is decoded.
-    output.max_frame_buffer_size = frame_slot_size;
+    // so a zero here ends the setup before a single frame is decoded, and a
+    // slot as large as the arena leaves room for none.
+    output.max_frame_buffer_size = decodedFrameSlotSize(config.?);
     return errno.ok;
 }
 
@@ -183,11 +202,81 @@ pub fn createDecoder(
     // useful opaque token without allocating host-side state.
     const handle = if (memory.?.cpu_memory != 0) memory.?.cpu_memory else @intFromPtr(config.?);
     output.?.* = handle;
+    const settings = config.?;
+    if (settings.max_frame_width > 0 and settings.max_frame_height > 0) {
+        _ = h264.ensureDecoder(
+            @intCast(settings.max_frame_width),
+            @intCast(settings.max_frame_height),
+        );
+    }
+    if (announced_decoders < 4) {
+        announced_decoders += 1;
+        std.debug.print(
+            "[videodec] decoder codec={d} profile={d} level={d} {d}x{d} dpb={d} queue_depth={d} resource={d}" ++ "\n",
+            .{
+                settings.codec_type,
+                settings.profile,
+                settings.max_level,
+                settings.max_frame_width,
+                settings.max_frame_height,
+                settings.max_dpb_frame_count,
+                settings.decode_input_queue_depth,
+                settings.resource_type,
+            },
+        );
+    }
     return errno.ok;
 }
 
 pub fn deleteDecoder(decoder: u64) callconv(abi.guest) i32 {
-    return if (decoder != 0) errno.ok else error_decoder_instance;
+    if (decoder == 0) return error_decoder_instance;
+    h264.destroyDecoder();
+    return errno.ok;
+}
+
+/// NV12, which is what the host decoder produces and what a title reading a
+/// two-plane luma/chroma picture expects.
+const frame_format_nv12: u32 = 0;
+
+/// Decodes one access unit and, when a picture comes back, copies it into the
+/// slot the title provided and describes it.
+///
+/// Returning false is the ordinary case early in a stream: H.264 needs several
+/// units before a first picture, and reordering delays later ones.
+fn publishDecodedPicture(
+    input: *const InputData,
+    frame: *FrameBuffer,
+    output: *OutputInfo,
+) bool {
+    if (input.au_data == 0 or input.au_size == 0) return false;
+    const unit_length = std.math.cast(usize, input.au_size) orelse return false;
+    if (!kernel_memory.isGuestRangeAccessible(input.au_data, input.au_size)) return false;
+    const unit: [*]const u8 = @ptrFromInt(input.au_data);
+
+    const picture = h264.decodeAccessUnit(unit[0..unit_length], 0) orelse return false;
+    if (frame.frame_buffer == 0) return false;
+    const capacity = std.math.cast(usize, frame.frame_buffer_size) orelse return false;
+    if (capacity < picture.bytes.len) return false;
+    if (!kernel_memory.isGuestRangeAccessible(frame.frame_buffer, picture.bytes.len)) return false;
+
+    const destination: [*]u8 = @ptrFromInt(frame.frame_buffer);
+    @memcpy(destination[0..picture.bytes.len], picture.bytes);
+
+    frame.is_accepted = 1;
+    output.is_valid = 1;
+    output.is_error_frame = 0;
+    output.picture_count = 1;
+    output.is_discarded_frame = 0;
+    output.codec_type = 1;
+    output.frame_width = picture.width;
+    output.frame_height = picture.height;
+    output.frame_pitch = picture.pitch;
+    output.padding = 0;
+    output.frame_buffer = frame.frame_buffer;
+    output.frame_buffer_size = frame.frame_buffer_size;
+    output.frame_format = frame_format_nv12;
+    output.frame_pitch_in_bytes = picture.pitch;
+    return true;
 }
 
 fn fillNoPicture(frame: *FrameBuffer, output: *OutputInfo) void {
@@ -217,6 +306,37 @@ pub fn decode(
     if (!accessible(input) or !accessible(frame) or !accessible(output)) {
         return error_argument_pointer;
     }
+    if (announced_units < 4) {
+        announced_units += 1;
+        const unit = input.?;
+        var prefix: [16]u8 = @splat(0);
+        const readable = @min(prefix.len, unit.au_size);
+        if (unit.au_data != 0 and readable != 0 and
+            kernel_memory.isGuestRangeAccessible(unit.au_data, readable))
+        {
+            const source: [*]const u8 = @ptrFromInt(unit.au_data);
+            @memcpy(prefix[0..readable], source[0..readable]);
+        }
+        var kinds: [32]u8 = @splat(0);
+        var kind_count: usize = 0;
+        if (unit.au_data != 0 and unit.au_size >= 5 and
+            kernel_memory.isGuestRangeAccessible(unit.au_data, unit.au_size))
+        {
+            const all: [*]const u8 = @ptrFromInt(unit.au_data);
+            const bytes = all[0..@intCast(unit.au_size)];
+            var scan: usize = 0;
+            while (scan + 4 < bytes.len and kind_count < kinds.len) : (scan += 1) {
+                if (bytes[scan] != 0 or bytes[scan + 1] != 0 or bytes[scan + 2] != 1) continue;
+                kinds[kind_count] = bytes[scan + 3] & 0x1f;
+                kind_count += 1;
+            }
+        }
+        std.debug.print(
+            "[videodec] access unit size={d} frame_buffer=0x{x}/0x{x} nal_types={any} first={x}" ++ "\n",
+            .{ unit.au_size, frame.?.frame_buffer, frame.?.frame_buffer_size, kinds[0..kind_count], prefix[0..readable] },
+        );
+    }
+    if (publishDecodedPicture(input.?, frame.?, output.?)) return errno.ok;
     fillNoPicture(frame.?, output.?);
     return errno.ok;
 }
@@ -233,7 +353,10 @@ pub fn flush(
 }
 
 pub fn reset(decoder: u64) callconv(abi.guest) i32 {
-    return if (decoder != 0) errno.ok else error_decoder_instance;
+    if (decoder == 0) return error_decoder_instance;
+    // Everything already handed over belongs to the position being left.
+    h264.flushDecoder();
+    return errno.ok;
 }
 
 pub fn getPictureInfo(

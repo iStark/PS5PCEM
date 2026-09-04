@@ -516,6 +516,11 @@ pub fn build(b: *std.Build) void {
         // Sony pads are read straight from HID; XInput never enumerates them.
         game_run.root_module.linkSystemLibrary("setupapi", .{});
         game_run.root_module.linkSystemLibrary("hid", .{});
+        // Titles hand raw H.264 access units to libSceVideodec2. Windows has a
+        // decoder for those, so one is not vendored.
+        game_run.root_module.linkSystemLibrary("mfplat", .{});
+        game_run.root_module.linkSystemLibrary("mfuuid", .{});
+        game_run.root_module.linkSystemLibrary("ole32", .{});
         game_run.root_module.addWin32ResourceFile(.{
             .file = b.path("assets/windows/ps5pcem-runner.rc"),
             .include_paths = &.{b.path("assets/windows")},
