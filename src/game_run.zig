@@ -486,6 +486,7 @@ fn run(init: std.process.Init) !bool {
         // Stop every guest worker before taking away callbacks it may still be
         // executing, then release Vulkan before destroying the HWND surface.
         emu.disableCpuDispatcher();
+        runtime.firmware.libs.videodec2.attachVideoFrameSink(null);
         runtime.firmware.libs.agc_submit.attachBackend(null);
         if (renderer_initialized) renderer.deinit();
         if (window_initialized) host_window.deinit();
@@ -657,6 +658,11 @@ fn run(init: std.process.Init) !bool {
                 null,
         };
         runtime.firmware.libs.agc_submit.attachBackend(renderer.dcbBackend(guest_memory));
+        const video_sink = renderer.videoFrameSink();
+        runtime.firmware.libs.videodec2.attachVideoFrameSink(.{
+            .context = video_sink.context,
+            .submit = video_sink.submit,
+        });
         try out.print("  Vulkan  {s} ({d}x{d} VideoOut window)\n", .{
             renderer.device_info.name(),
             native.width,

@@ -10,10 +10,27 @@
 //! claiming that an undecoded frame is valid.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const abi = @import("../abi.zig");
 const errno = @import("../errno.zig");
 const kernel_memory = @import("kernel_memory.zig");
 const h264 = @import("videodec2_h264.zig");
+
+fn hostTimestampNs() u64 {
+    if (comptime builtin.os.tag != .windows) return 0;
+    var counter: std.os.windows.LARGE_INTEGER = 0;
+    var frequency: std.os.windows.LARGE_INTEGER = 0;
+    if (!std.os.windows.ntdll.RtlQueryPerformanceCounter(&counter).toBool() or
+        !std.os.windows.ntdll.RtlQueryPerformanceFrequency(&frequency).toBool() or
+        counter < 0 or frequency <= 0)
+    {
+        return 0;
+    }
+    const scaled = @as(u128, @intCast(counter)) * std.time.ns_per_s;
+    return @intCast(scaled / @as(u128, @intCast(frequency)));
+}
+
+extern "kernel32" fn Sleep(milliseconds: u32) callconv(.winapi) void;
 
 const error_argument_pointer: i32 = @bitCast(@as(u32, 0x811d_0102));
 const error_decoder_instance: i32 = @bitCast(@as(u32, 0x811d_0103));
@@ -43,6 +60,19 @@ fn decodedFrameSlotSize(config: *const DecoderConfigInfo) u64 {
 var announced_decoders: u8 = 0;
 var announced_units: u8 = 0;
 var published_pictures: u32 = 0;
+var last_picture_timestamp_ns: ?u64 = null;
+const target_frame_interval_ns: u64 = 16_666_667; // ~60 FPS (16.666 ms)
+
+pub const VideoFrameSink = struct {
+    context: ?*anyopaque = null,
+    submit: *const fn (?*anyopaque, u32, u32, u32, []const u8) void,
+};
+
+var global_frame_sink: ?VideoFrameSink = null;
+
+pub fn attachVideoFrameSink(sink: ?VideoFrameSink) void {
+    global_frame_sink = sink;
+}
 
 const ComputeMemoryInfo = extern struct {
     this_size: u64,
@@ -230,6 +260,8 @@ pub fn createDecoder(
 
 pub fn deleteDecoder(decoder: u64) callconv(abi.guest) i32 {
     if (decoder == 0) return error_decoder_instance;
+    last_picture_timestamp_ns = null;
+    published_pictures = 0;
     h264.destroyDecoder();
     return errno.ok;
 }
@@ -255,17 +287,34 @@ fn publishDecodedPicture(
     if (capacity < picture.bytes.len) return false;
     if (!kernel_memory.isGuestRangeAccessible(frame.frame_buffer, picture.bytes.len)) return false;
 
+    // Pace decode to real-time presentation (~60 FPS) to prevent instant drain
+    if (last_picture_timestamp_ns) |last_ts| {
+        const now = hostTimestampNs();
+        if (now > last_ts) {
+            const elapsed = now - last_ts;
+            if (elapsed < target_frame_interval_ns) {
+                const sleep_ms: u32 = @intCast(@max(1, (target_frame_interval_ns - elapsed) / 1_000_000));
+                Sleep(sleep_ms);
+            }
+        }
+    }
+    last_picture_timestamp_ns = hostTimestampNs();
+
     const destination: [*]u8 = @ptrFromInt(frame.frame_buffer);
     @memcpy(destination[0..picture.bytes.len], picture.bytes);
+
+    if (global_frame_sink) |sink| {
+        sink.submit(sink.context, picture.width, picture.height, picture.pitch, picture.bytes);
+    }
 
     published_pictures += 1;
     if (published_pictures == 1) {
         kernel_memory.reportDirectMemoryAliases("decoded frame slot", frame.frame_buffer);
     }
-    if (published_pictures <= 4 or published_pictures % 32 == 0) {
+    if (published_pictures <= 4 or published_pictures % 30 == 0) {
         std.debug.print(
-            "[videodec] published picture #{d} into 0x{x}\n",
-            .{ published_pictures, frame.frame_buffer },
+            "[videodec] published picture #{d} ({d}x{d}, pitch={d}) into 0x{x}\n",
+            .{ published_pictures, picture.width, picture.height, picture.pitch, frame.frame_buffer },
         );
     }
     output.width = picture.width;
@@ -339,6 +388,8 @@ pub fn flush(
 pub fn reset(decoder: u64) callconv(abi.guest) i32 {
     if (decoder == 0) return error_decoder_instance;
     // Everything already handed over belongs to the position being left.
+    last_picture_timestamp_ns = null;
+    published_pictures = 0;
     h264.flushDecoder();
     return errno.ok;
 }

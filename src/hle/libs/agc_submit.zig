@@ -696,6 +696,7 @@ fn reportPendingBuilderArenasAtFlip() void {
                 builderArenaIsGpuCommandMemory(arena.base),
             },
         );
+
     }
 }
 
@@ -2935,25 +2936,48 @@ fn publishSdk11AcbDriverGeneration(
 ) void {
     if (release.data_selection != 2 or release.data == 0 or release.data > std.math.maxInt(u32)) return;
     const stream_address = @intFromPtr(submission.address orelse return);
-    // Which callee-saved register still holds the queue object depends on the
-    // guest's own register allocation at the call site, and it is not stable
-    // across submissions. Losing it used to drop the completion entirely, so
-    // the driver waited forever at its next suspend point and startup hung
-    // with nothing presented. Take the first candidate that validates.
     const candidates = [_]u64{
         rememberedSdk11AcbQueue(owner),
         trace.currentGuestRbx(),
         trace.currentGuestRbp(),
+        trace.currentGuestR12(),
+        trace.currentGuestR13(),
+        trace.currentGuestR14(),
         trace.currentGuestR15(),
+        trace.currentGuestRsi(),
+        trace.currentGuestRdi(),
     };
     var found: ?Sdk11AcbQueue = null;
     var queue_address: u64 = 0;
     for (candidates) |candidate| {
         if (candidate == 0) continue;
-        if (sdk11AcbQueueAt(candidate, owner)) |queue| {
+        const q = sdk11AcbQueueAt(candidate, owner);
+        if (q) |queue| {
             found = queue;
             queue_address = candidate;
             break;
+        }
+    }
+    if (found == null) {
+        const stack_bases = [_]u64{ trace.currentGuestRbp(), trace.currentGuestRsp() };
+        for (stack_bases) |base| {
+            if (base == 0) continue;
+            var offset: i64 = -0x200;
+            while (offset < 0x200 and found == null) : (offset += 8) {
+                const address = @as(i64, @bitCast(base)) + offset;
+                if (address <= 0) continue;
+                const spill: u64 = @bitCast(address);
+                if (!memory.isGuestRangeAccessible(spill, 8)) continue;
+                var bytes: [8]u8 = undefined;
+                if (!readGuestMemory(null, spill, &bytes)) continue;
+                const candidate = std.mem.readInt(u64, &bytes, .little);
+                const q = sdk11AcbQueueAt(candidate, owner);
+                if (q) |queue| {
+                    found = queue;
+                    queue_address = candidate;
+                    break;
+                }
+            }
         }
     }
     const release_page = release.address & ~@as(u64, 0xfff);
@@ -2970,6 +2994,12 @@ fn publishSdk11AcbDriverGeneration(
         ) orelse return;
         target = label_page + @as(u64, queue.label_index) * 0x20;
         if ((target & ~@as(u64, 0xfff)) != label_page) return;
+        if (driver_completion_reports < 32) {
+            std.debug.print(
+                "[agc submit] ACB found queue @0x{x} owner=0x{x} label_index={d} gen={d} target=0x{x}\n",
+                .{ queue_address, owner, queue.label_index, generation, target },
+            );
+        }
     } else {
         // Some submissions reach here with the queue object in no
         // callee-saved register at all, but with R15 already holding the

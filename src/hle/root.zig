@@ -53,6 +53,7 @@ pub const libs = struct {
     pub const system_service = @import("libs/system_service.zig");
     pub const ult = @import("libs/ult.zig");
     pub const user_service = @import("libs/user_service.zig");
+    pub const videodec2 = @import("libs/videodec2.zig");
 };
 
 pub const Database = symbols.Database;

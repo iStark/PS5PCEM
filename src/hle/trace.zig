@@ -74,29 +74,29 @@ pub const Record = struct {
 threadlocal var thread_ordinal: u32 = 0;
 threadlocal var guest_rbx: u64 = 0;
 threadlocal var guest_rbp: u64 = 0;
+threadlocal var guest_r12: u64 = 0;
+threadlocal var guest_r13: u64 = 0;
+threadlocal var guest_r14: u64 = 0;
 threadlocal var guest_r15: u64 = 0;
+threadlocal var guest_rsp: u64 = 0;
+threadlocal var guest_rsi: u64 = 0;
+threadlocal var guest_rdi: u64 = 0;
 var next_thread_ordinal = std.atomic.Value(u32).init(1);
 
 inline fn captureGuestCalleeSaved() void {
     if (comptime abi.can_run_guest_code) {
-        const captured_rbx = asm volatile ("movq %%rbx, %%rax"
-            : [value] "={rax}" (-> u64),
-        );
-        const captured_rbp = asm volatile ("movq %%rbp, %%rax"
-            : [value] "={rax}" (-> u64),
-        );
-        const captured_r15 = asm volatile ("movq %%r15, %%rax"
-            : [value] "={rax}" (-> u64),
-        );
-        guest_rbx = captured_rbx;
-        guest_rbp = captured_rbp;
-        guest_r15 = captured_r15;
+        guest_rbx = asm volatile ("movq %%rbx, %%rax" : [value] "={rax}" (-> u64));
+        guest_rbp = asm volatile ("movq %%rbp, %%rax" : [value] "={rax}" (-> u64));
+        guest_r12 = asm volatile ("movq %%r12, %%rax" : [value] "={rax}" (-> u64));
+        guest_r13 = asm volatile ("movq %%r13, %%rax" : [value] "={rax}" (-> u64));
+        guest_r14 = asm volatile ("movq %%r14, %%rax" : [value] "={rax}" (-> u64));
+        guest_r15 = asm volatile ("movq %%r15, %%rax" : [value] "={rax}" (-> u64));
+        guest_rsp = asm volatile ("movq %%rsp, %%rax" : [value] "={rax}" (-> u64));
+        guest_rsi = asm volatile ("movq %%rsi, %%rax" : [value] "={rax}" (-> u64));
+        guest_rdi = asm volatile ("movq %%rdi, %%rax" : [value] "={rax}" (-> u64));
     }
 }
 
-/// Callee-saved RBX observed by the generated System V thunk before it moves
-/// the call onto the host firmware stack. Some private SDK submission layouts
-/// retain their queue object only in this register.
 pub fn currentGuestRbx() u64 {
     return guest_rbx;
 }
@@ -105,8 +105,32 @@ pub fn currentGuestRbp() u64 {
     return guest_rbp;
 }
 
+pub fn currentGuestR12() u64 {
+    return guest_r12;
+}
+
+pub fn currentGuestR13() u64 {
+    return guest_r13;
+}
+
+pub fn currentGuestR14() u64 {
+    return guest_r14;
+}
+
 pub fn currentGuestR15() u64 {
     return guest_r15;
+}
+
+pub fn currentGuestRsp() u64 {
+    return guest_rsp;
+}
+
+pub fn currentGuestRsi() u64 {
+    return guest_rsi;
+}
+
+pub fn currentGuestRdi() u64 {
+    return guest_rdi;
 }
 
 fn currentThreadOrdinal() u32 {

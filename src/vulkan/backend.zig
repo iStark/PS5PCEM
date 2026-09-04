@@ -250,6 +250,11 @@ pub const PresentationSink = struct {
     present: *const fn (?*anyopaque, PresentedFrame) bool,
 };
 
+pub const VideoFrameSink = struct {
+    context: ?*anyopaque = null,
+    submit: *const fn (?*anyopaque, u32, u32, u32, []const u8) void,
+};
+
 /// Receives the rolling guest flip rate in tenths of a frame per second.
 /// Keeping this callback API-neutral lets the Win32 window own its title while
 /// the renderer remains usable by headless and non-Windows tools.
@@ -2744,6 +2749,18 @@ fn descriptorAliasSignature(
     };
 }
 
+const Lock = struct {
+    inner: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *Lock) void {
+        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(self: *Lock) void {
+        self.inner.unlock();
+    }
+};
+
 pub const Renderer = struct {
     allocator: std.mem.Allocator,
     loader: Loader,
@@ -2976,6 +2993,12 @@ pub const Renderer = struct {
     video_surface_count: usize = 0,
     video_surface_last_flip: u64 = 0,
     latest_video_render_target_index: ?usize = null,
+    pending_video_mutex: Lock = .{},
+    pending_video_rgba: std.ArrayListUnmanaged(u8) = .empty,
+    pending_video_width: u32 = 0,
+    pending_video_height: u32 = 0,
+    pending_video_ready: bool = false,
+    video_upload_rgba: std.ArrayListUnmanaged(u8) = .empty,
     /// The RGBA scene feeding a deferred HDR composite that is not translated
     /// faithfully yet.  Remembering the resident input lets presentation use
     /// the intact scene after all of the frame's draws have completed.
@@ -3625,6 +3648,8 @@ pub const Renderer = struct {
         self.resident_samplers = .empty;
         for (self.render_targets.items) |target| self.destroyCachedRenderTarget(target);
         self.render_targets.deinit(self.allocator);
+        self.pending_video_rgba.deinit(self.allocator);
+        self.video_upload_rgba.deinit(self.allocator);
         for (self.depth_targets.items) |target| self.destroyCachedDepthTarget(target);
         self.depth_targets.deinit(self.allocator);
         self.htile_targets.deinit(self.allocator);
@@ -3753,6 +3778,23 @@ pub const Renderer = struct {
     pub fn windowPresentationSink(self: *Renderer) ?PresentationSink {
         if (self.window_presentation == null) return null;
         return .{ .context = self, .present = presentWindowSink };
+    }
+
+    /// Provides a sink that receives decoded video frames directly from HLE codecs
+    /// and stages them for presentation on the host swapchain.
+    pub fn videoFrameSink(self: *Renderer) VideoFrameSink {
+        return .{ .context = self, .submit = submitVideoFrameCallback };
+    }
+
+    fn submitVideoFrameCallback(
+        context: ?*anyopaque,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        bytes: []const u8,
+    ) void {
+        const self: *Renderer = @ptrCast(@alignCast(context.?));
+        self.submitVideoFrame(width, height, pitch, bytes);
     }
 
     /// Presents one already-linear frame to the optional window swapchain.
@@ -14459,6 +14501,67 @@ pub const Renderer = struct {
         self.video_surface_addresses[self.video_surface_addresses.len - 1] = address;
     }
 
+    pub fn submitVideoFrame(
+        self: *Renderer,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        bytes: []const u8,
+    ) void {
+        if (width == 0 or height == 0 or pitch == 0 or bytes.len == 0) return;
+        const visible_height: u32 = if (height == 1088) 1080 else height;
+        const visible_width: u32 = width;
+        const rgba_bytes = @as(usize, visible_width) * visible_height * 4;
+
+        self.pending_video_mutex.lock();
+        defer self.pending_video_mutex.unlock();
+
+        self.pending_video_rgba.resize(self.allocator, rgba_bytes) catch return;
+        convertNv12ToRgba8(
+            bytes,
+            height,
+            pitch,
+            self.pending_video_rgba.items,
+            visible_width,
+            visible_height,
+        );
+        self.pending_video_width = visible_width;
+        self.pending_video_height = visible_height;
+        self.pending_video_ready = true;
+    }
+
+    fn uploadPendingVideoFrame(self: *Renderer) anyerror!void {
+        if (self.window_presentation == null) return;
+        self.pending_video_mutex.lock();
+        if (!self.pending_video_ready) {
+            self.pending_video_mutex.unlock();
+            return;
+        }
+        const width = self.pending_video_width;
+        const height = self.pending_video_height;
+        try self.video_upload_rgba.resize(self.allocator, self.pending_video_rgba.items.len);
+        @memcpy(self.video_upload_rgba.items, self.pending_video_rgba.items);
+        self.pending_video_ready = false;
+        self.pending_video_mutex.unlock();
+
+        var desc = std.mem.zeroes(gpu.resources.ColorTarget);
+        desc.address = 0xffff_ffff_5649_4445;
+        desc.width = width;
+        desc.height = height;
+        desc.pitch = width;
+        desc.format = 10;
+        desc.number_type = 0;
+        desc.write_mask = 0x0f;
+        desc.tile_mode = .linear;
+
+        const target = try guestColorTarget(desc);
+        const target_index = try self.uploadLinearColorTarget(target, self.video_upload_rgba.items);
+        self.render_targets.items[target_index].scanout_flip_vertical = false;
+        self.markVideoSurface(target.descriptor.address);
+        self.latest_video_render_target_index = target_index;
+        self.video_surface_last_flip = self.flip_callbacks;
+    }
+
     fn prepareGraphicsResources(
         self: *Renderer,
         bindings: *const gpu.ShaderBindings,
@@ -18401,6 +18504,13 @@ pub const Renderer = struct {
                     }
                 }
             }
+            // Upload any newly decoded video frame before presentation checks.
+            self.uploadPendingVideoFrame() catch |err| {
+                if (log_verbose_gpu) {
+                    std.debug.print("[vulkan dcb] video frame upload error: {s}\n", .{@errorName(err)});
+                }
+            };
+
             // Until the merged Unity quad path can compose the decoded movie
             // into its older camera target, present the newest proven video
             // surface directly. The override expires as soon as planar video
@@ -18437,10 +18547,10 @@ pub const Renderer = struct {
                             return false;
                         };
                     }
-                    if (self.flip_callbacks <= 24 or log_verbose_gpu) {
+                    if (self.flip_callbacks <= 24 or self.presented_frames % 30 == 0 or log_verbose_gpu) {
                         std.debug.print(
-                            "[vulkan dcb] presenting active video target @0x{x}\n",
-                            .{self.render_targets.items[video_index].target.descriptor.address},
+                            "[vulkan dcb] presenting active video target @0x{x} (flip #{d}, presented #{d})\n",
+                            .{ self.render_targets.items[video_index].target.descriptor.address, self.flip_callbacks, self.presented_frames },
                         );
                     }
                     self.presented_frames += 1;
@@ -19586,6 +19696,48 @@ fn flipRgba8Rows(pixels: []u8, width: u32, height: u32) void {
                 &pixels[top * row_bytes + column],
                 &pixels[bottom * row_bytes + column],
             );
+        }
+    }
+}
+
+fn convertNv12ToRgba8(
+    nv12: []const u8,
+    height: u32,
+    pitch: u32,
+    rgba: []u8,
+    visible_width: u32,
+    visible_height: u32,
+) void {
+    const pitch_usize: usize = pitch;
+    const uv_base = @as(usize, height) * pitch_usize;
+    const row_bytes = @as(usize, visible_width) * 4;
+
+    for (0..visible_height) |y| {
+        const y_row = y * pitch_usize;
+        const uv_row = uv_base + (y / 2) * pitch_usize;
+        const rgba_row = y * row_bytes;
+        if (y_row + visible_width > nv12.len) break;
+        if (uv_row + visible_width > nv12.len) break;
+
+        var x: usize = 0;
+        while (x + 1 < visible_width) : (x += 2) {
+            const u = @as(i32, nv12[uv_row + x]) - 128;
+            const v = @as(i32, nv12[uv_row + x + 1]) - 128;
+            const uv_r = 409 * v + 128;
+            const uv_g = -100 * u - 208 * v + 128;
+            const uv_b = 516 * u + 128;
+
+            const c0 = @max(@as(i32, nv12[y_row + x]) - 16, 0);
+            const r0: u8 = @intCast(std.math.clamp((298 * c0 + uv_r) >> 8, 0, 255));
+            const g0: u8 = @intCast(std.math.clamp((298 * c0 + uv_g) >> 8, 0, 255));
+            const b0: u8 = @intCast(std.math.clamp((298 * c0 + uv_b) >> 8, 0, 255));
+            rgba[rgba_row + x * 4 ..][0..4].* = .{ r0, g0, b0, 255 };
+
+            const c1 = @max(@as(i32, nv12[y_row + x + 1]) - 16, 0);
+            const r1: u8 = @intCast(std.math.clamp((298 * c1 + uv_r) >> 8, 0, 255));
+            const g1: u8 = @intCast(std.math.clamp((298 * c1 + uv_g) >> 8, 0, 255));
+            const b1: u8 = @intCast(std.math.clamp((298 * c1 + uv_b) >> 8, 0, 255));
+            rgba[rgba_row + (x + 1) * 4 ..][0..4].* = .{ r1, g1, b1, 255 };
         }
     }
 }
@@ -25953,4 +26105,29 @@ test "depth allocations compare by surface, not by clear value" {
     var resized = base;
     resized.height = 1080;
     try std.testing.expect(!base.sameAllocation(resized));
+}
+
+test "convertNv12ToRgba8 converts limited range YCbCr to sRGB correctly" {
+    // 2x2 NV12: 4 bytes Y (2 rows of 2), 2 bytes UV (1 row of 2)
+    // Black: Y=16, U=128, V=128
+    const black_nv12 = [_]u8{ 16, 16, 16, 16, 128, 128 };
+    var black_rgba: [2 * 2 * 4]u8 = undefined;
+    convertNv12ToRgba8(&black_nv12, 2, 2, &black_rgba, 2, 2);
+    for (0..4) |pixel| {
+        try std.testing.expectEqual(@as(u8, 0), black_rgba[pixel * 4 + 0]);
+        try std.testing.expectEqual(@as(u8, 0), black_rgba[pixel * 4 + 1]);
+        try std.testing.expectEqual(@as(u8, 0), black_rgba[pixel * 4 + 2]);
+        try std.testing.expectEqual(@as(u8, 255), black_rgba[pixel * 4 + 3]);
+    }
+
+    // White: Y=235, U=128, V=128
+    const white_nv12 = [_]u8{ 235, 235, 235, 235, 128, 128 };
+    var white_rgba: [2 * 2 * 4]u8 = undefined;
+    convertNv12ToRgba8(&white_nv12, 2, 2, &white_rgba, 2, 2);
+    for (0..4) |pixel| {
+        try std.testing.expectEqual(@as(u8, 255), white_rgba[pixel * 4 + 0]);
+        try std.testing.expectEqual(@as(u8, 255), white_rgba[pixel * 4 + 1]);
+        try std.testing.expectEqual(@as(u8, 255), white_rgba[pixel * 4 + 2]);
+        try std.testing.expectEqual(@as(u8, 255), white_rgba[pixel * 4 + 3]);
+    }
 }
