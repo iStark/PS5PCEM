@@ -328,6 +328,48 @@ pub fn attachAddressSpace(address_space: ?*memory.AddressSpace) void {
 /// With no address space attached there is no guest, so any pointer belongs to
 /// the host and is accepted. The runtime attaches one before guest code runs,
 /// so this only relaxes the check where there is nothing to protect against.
+/// Reports every other virtual address that reaches the same direct memory.
+///
+/// A title can map one direct-memory allocation twice: once for the CPU to
+/// fill and once for the GPU to read. Anything written through one address is
+/// then invisible through the other unless both name the same host pages, and
+/// the difference looks exactly like a producer that never ran.
+pub fn reportDirectMemoryAliases(label: []const u8, address: u64) void {
+    const address_space = guest_address_space orelse return;
+    const owning = address_space.query(address, false) orelse {
+        std.debug.print("[memory] {s} @0x{x} is not mapped" ++ "\n", .{ label, address });
+        return;
+    };
+    const backing = owning.backing_offset orelse {
+        std.debug.print(
+            "[memory] {s} @0x{x} is {s}, not direct memory" ++ "\n",
+            .{ label, address, @tagName(owning.kind) },
+        );
+        return;
+    };
+    const offset = backing + (address - owning.address);
+    const mappings = address_space.snapshot(std.heap.page_allocator) catch return;
+    defer std.heap.page_allocator.free(mappings);
+    var aliases: usize = 0;
+    for (mappings) |mapping| {
+        const other = mapping.backing_offset orelse continue;
+        if (offset < other or offset >= other + mapping.size) continue;
+        const alias = mapping.address + (offset - other);
+        if (alias == address) continue;
+        aliases += 1;
+        std.debug.print(
+            "[memory] {s} @0x{x} also mapped at 0x{x} (direct offset 0x{x})" ++ "\n",
+            .{ label, address, alias, offset },
+        );
+    }
+    if (aliases == 0) {
+        std.debug.print(
+            "[memory] {s} @0x{x} has one mapping only (direct offset 0x{x})" ++ "\n",
+            .{ label, address, offset },
+        );
+    }
+}
+
 pub fn isGuestRangeAccessible(address: u64, length: u64) bool {
     if (length == 0) return true;
     if (address == 0) return false;

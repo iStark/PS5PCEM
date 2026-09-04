@@ -259,6 +259,9 @@ fn publishDecodedPicture(
     @memcpy(destination[0..picture.bytes.len], picture.bytes);
 
     published_pictures += 1;
+    if (published_pictures == 1) {
+        kernel_memory.reportDirectMemoryAliases("decoded frame slot", frame.frame_buffer);
+    }
     if (published_pictures <= 4 or published_pictures % 32 == 0) {
         std.debug.print(
             "[videodec] published picture #{d} into 0x{x}\n",
