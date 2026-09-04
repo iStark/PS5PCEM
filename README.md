@@ -4,14 +4,14 @@
   <p><strong>Experimental PlayStation 5 emulation and interoperability research in Zig</strong></p>
   <p>Native guest execution · RDNA2 shader translation · Vulkan rendering · Windows launcher</p>
   <p>
-    <a href="https://github.com/iStark/PS5PCEM/releases/tag/v0.3.0-alpha.2"><img src="https://img.shields.io/github/v/release/iStark/PS5PCEM?include_prereleases&style=flat-square&color=3b95ff" alt="Latest release"></a>
+    <a href="https://github.com/iStark/PS5PCEM/releases/tag/v0.3.0-alpha.3"><img src="https://img.shields.io/github/v/release/iStark/PS5PCEM?include_prereleases&style=flat-square&color=3b95ff" alt="Latest release"></a>
     <img src="https://img.shields.io/badge/platform-Windows%20x64-3b95ff?style=flat-square" alt="Windows x64">
     <img src="https://img.shields.io/badge/Zig-0.16-f7a41d?style=flat-square" alt="Zig 0.16">
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-6f7782?style=flat-square" alt="GPL-3.0-or-later"></a>
     <img src="https://img.shields.io/badge/status-early%20prototype-e6a23c?style=flat-square" alt="Early prototype">
   </p>
   <p>
-    <a href="https://github.com/iStark/PS5PCEM/releases/tag/v0.3.0-alpha.2"><strong>Download prototype</strong></a>
+    <a href="https://github.com/iStark/PS5PCEM/releases/tag/v0.3.0-alpha.3"><strong>Download prototype</strong></a>
     · <a href="docs/README.md">Documentation</a>
     · <a href="docs/project-status.md">Compatibility status</a>
     · <a href="https://github.com/iStark/PS5PCEM/issues">Report an issue</a>
@@ -95,12 +95,12 @@ subsystem internals are indexed in the
 
 ## Download
 
-The current Windows x64 prototype is **0.3.0-alpha.2**:
+The current Windows x64 prototype is **0.3.0-alpha.3**:
 
-- [Portable ZIP](https://github.com/iStark/PS5PCEM/releases/download/v0.3.0-alpha.2/PS5PCEM-0.3.0-alpha.2-windows-x64-portable.zip)
-- [Per-user installer](https://github.com/iStark/PS5PCEM/releases/download/v0.3.0-alpha.2/PS5PCEM-0.3.0-alpha.2-windows-x64-setup.exe)
-- [SHA-256 checksums](https://github.com/iStark/PS5PCEM/releases/download/v0.3.0-alpha.2/SHA256SUMS.txt)
-- [Release notes](docs/release-notes/v0.3.0-alpha.2.md)
+- [Portable ZIP](https://github.com/iStark/PS5PCEM/releases/download/v0.3.0-alpha.3/PS5PCEM-0.3.0-alpha.3-windows-x64-portable.zip)
+- [Per-user installer](https://github.com/iStark/PS5PCEM/releases/download/v0.3.0-alpha.3/PS5PCEM-0.3.0-alpha.3-windows-x64-setup.exe)
+- [SHA-256 checksums](https://github.com/iStark/PS5PCEM/releases/download/v0.3.0-alpha.3/SHA256SUMS.txt)
+- [Release notes](docs/release-notes/v0.3.0-alpha.3.md)
 
 The prototype requires Windows 10 2004 or newer, x86-64, and a current Vulkan
 1.2-capable graphics driver. The binaries are currently unsigned, so Windows
@@ -124,7 +124,7 @@ Games, firmware, keys, system libraries, and console software are not included.
 | [Project status and compatibility](docs/project-status.md) | Screenshots, measured title milestones, and current limits |
 | [Implementation status](docs/implementation-status.md) | What the emulator can do, subsystem by subsystem |
 | [Architecture](docs/README.md#architecture) | RDNA2, GPU, Vulkan, memory, loader, HLE, CPU, diagnostics, and runtime internals |
-| [Release notes](docs/release-notes/v0.3.0-alpha.2.md) | Changes in the latest packaged prototype |
+| [Release notes](docs/release-notes/v0.3.0-alpha.3.md) | Changes in the latest packaged prototype |
 | [License and legal note](docs/legal.md) | GPL obligations, bundled dependencies, and project scope |
 
 Architecture reference:

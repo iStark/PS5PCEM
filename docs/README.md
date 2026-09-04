@@ -11,7 +11,7 @@ short and visual; implementation details live here.
 | [Building and command-line usage](getting-started.md) | Build PS5PCEM, run its tools, package Windows releases, or integrate the RDNA2 module |
 | [Project status and compatibility](project-status.md) | See the development captures and the measured milestone reached in each observed title |
 | [Implementation status](implementation-status.md) | Read what the emulator can do, subsystem by subsystem |
-| [Latest release notes](release-notes/v0.3.0-alpha.2.md) | See the changes and requirements for the current prototype |
+| [Latest release notes](release-notes/v0.3.0-alpha.3.md) | See the changes and requirements for the current prototype |
 | [License and legal note](legal.md) | Understand GPL obligations, dependency licensing, and project scope |
 
 ## Architecture
