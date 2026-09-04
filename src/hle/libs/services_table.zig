@@ -18,16 +18,6 @@ const videodec2 = @import("videodec2.zig");
 const trace = @import("../trace.zig");
 const symbols = @import("../symbols.zig");
 
-pub const acm_exports = [_]symbols.Export{
-    .{ .name = "sceAcmContextCreate", .function = trace.wrap("sceAcmContextCreate", &services.absent), .expect_id = "ZIXln2K3XMk" },
-    .{ .name = "sceAcmContextDestroy", .function = trace.wrap("sceAcmContextDestroy", &services.absent), .expect_id = "jBgBjAj02R8" },
-    .{ .name = "sceAcmBatchWait", .function = trace.wrap("sceAcmBatchWait", &services.absent), .expect_id = "RLN3gRlXJLE" },
-
-    .{ .name = "sceAcm_ConvReverb_SharedInput", .function = trace.wrap("sceAcm_ConvReverb_SharedInput", &services.absent), .expect_id = "u70oWo92SYQ" },
-    .{ .name = "sceAcmBatchStartBuffers", .function = trace.wrap("sceAcmBatchStartBuffers", &services.absent), .expect_id = "8fe55ktlNVo" },
-    .{ .name = "sceAcm_FFT", .function = trace.wrap("sceAcm_FFT", &services.absent), .expect_id = "KovqaFbmtsM" },
-    .{ .name = "sceAcm_Panner", .function = trace.wrap("sceAcm_Panner", &services.accept), .expect_id = "LA4RCNKnFjg" },
-};
 
 pub const agc_exports = [_]symbols.Export{
     .{ .name = "libSceAgc:7Wa3aeJgeVU", .function = trace.wrap("libSceAgc:7Wa3aeJgeVU", &services.accept), .id_override = "7Wa3aeJgeVU" },
@@ -39,22 +29,6 @@ pub const agc_exports = [_]symbols.Export{
     .{ .name = "libSceAgc:zARR5aCmkoY", .function = trace.wrap("libSceAgc:zARR5aCmkoY", &services.accept), .id_override = "zARR5aCmkoY" },
 };
 
-pub const ajm_exports = [_]symbols.Export{
-    .{ .name = "sceAjmStrError", .function = trace.wrap("sceAjmStrError", &services.absent), .expect_id = "AxhcqVv5AYU" },
-    .{ .name = "sceAjmBatchJobClearContext", .function = trace.wrap("sceAjmBatchJobClearContext", &services.absent), .expect_id = "uJ3m8INuikg" },
-};
-
-pub const audiodec_exports = [_]symbols.Export{
-    // Codec type 1 (ATRAC9) is optional for this title's playback path. Keep
-    // the library lifecycle coherent so it can create a decoder when audio is
-    // present, instead of disabling the whole sound subsystem at startup.
-    .{ .name = "sceAudiodecInitLibrary", .function = trace.wrap("sceAudiodecInitLibrary", &services.accept), .expect_id = "VjhsmxpcezI" },
-    .{ .name = "sceAudiodecTermLibrary", .function = trace.wrap("sceAudiodecTermLibrary", &services.accept), .expect_id = "h5jSB2QIDV0" },
-    .{ .name = "sceAudiodecDeleteDecoder", .function = trace.wrap("sceAudiodecDeleteDecoder", &services.absent), .expect_id = "Tp+ZEy69mLk" },
-    .{ .name = "sceAudiodecDecode", .function = trace.wrap("sceAudiodecDecode", &services.absent), .expect_id = "KHXHMDLkILw" },
-    .{ .name = "sceAudiodecClearContext", .function = trace.wrap("sceAudiodecClearContext", &services.absent), .expect_id = "6Vf9WTLDoss" },
-    .{ .name = "sceAudiodecCreateDecoder", .function = trace.wrap("sceAudiodecCreateDecoder", &services.absent), .expect_id = "O3f1sLMWRvs" },
-};
 
 pub const avplayer_exports = [_]symbols.Export{
     .{ .name = "sceAvPlayerAddSource", .function = trace.wrap("sceAvPlayerAddSource", &av_player.addSource), .expect_id = "KMcEa+rHsIo" },
@@ -228,23 +202,6 @@ pub const net_exports = [_]symbols.Export{
     .{ .name = "sceNetResolverStartAton", .function = trace.wrap("sceNetResolverStartAton", &services.offline), .expect_id = "Apb4YDxKsRI" },
 };
 
-pub const ngs2_exports = [_]symbols.Export{
-    .{ .name = "sceNgs2CalcWaveformBlock", .function = trace.wrap("sceNgs2CalcWaveformBlock", &services.absent), .expect_id = "3pCNbVM11UA" },
-    .{ .name = "sceNgs2ParseWaveformData", .function = trace.wrap("sceNgs2ParseWaveformData", &services.absent), .expect_id = "hyVLT2VlOYk" },
-    .{ .name = "sceNgs2SystemResetOption", .function = trace.wrap("sceNgs2SystemResetOption", &services.absent), .expect_id = "AQkj7C0f3PY" },
-    .{ .name = "sceNgs2SystemCreateWithAllocator", .function = trace.wrap("sceNgs2SystemCreateWithAllocator", &services.absent), .expect_id = "mPYgU4oYpuY" },
-    .{ .name = "sceNgs2RackCreateWithAllocator", .function = trace.wrap("sceNgs2RackCreateWithAllocator", &services.absent), .expect_id = "U546k6orxQo" },
-    .{ .name = "sceNgs2RackGetVoiceHandle", .function = trace.wrap("sceNgs2RackGetVoiceHandle", &services.absent), .expect_id = "MwmHz8pAdAo" },
-    .{ .name = "sceNgs2VoiceControl", .function = trace.wrap("sceNgs2VoiceControl", &services.absent), .expect_id = "uu94irFOGpA" },
-    .{ .name = "sceNgs2VoiceRunCommands", .function = trace.wrap("sceNgs2VoiceRunCommands", &services.absent), .expect_id = "AbYvTOZ8Pts" },
-    .{ .name = "sceNgs2RackDestroy", .function = trace.wrap("sceNgs2RackDestroy", &services.absent), .expect_id = "lCqD7oycmIM" },
-    .{ .name = "sceNgs2SystemDestroy", .function = trace.wrap("sceNgs2SystemDestroy", &services.absent), .expect_id = "u-WrYDaJA3k" },
-    .{ .name = "sceNgs2SystemRender", .function = trace.wrap("sceNgs2SystemRender", &services.absent), .expect_id = "i0VnXM-C9fc" },
-    .{ .name = "sceNgs2PanInit", .function = trace.wrap("sceNgs2PanInit", &services.absent), .expect_id = "xa8oL9dmXkM" },
-    .{ .name = "sceNgs2PanGetVolumeMatrix", .function = trace.wrap("sceNgs2PanGetVolumeMatrix", &services.absent), .expect_id = "gbMKV+8Enuo" },
-    .{ .name = "sceNgs2VoiceGetStateFlags", .function = trace.wrap("sceNgs2VoiceGetStateFlags", &services.absent), .expect_id = "rEh728kXk3w" },
-    .{ .name = "sceNgs2VoiceGetState", .function = trace.wrap("sceNgs2VoiceGetState", &services.absent), .expect_id = "-TOuuAQ-buE" },
-};
 
 pub const npauth_exports = [_]symbols.Export{
     .{ .name = "sceNpAuthPollAsync", .function = trace.wrap("sceNpAuthPollAsync", &services.offline), .expect_id = "gjSyfzSsDcE" },
@@ -631,29 +588,10 @@ const disc_map_exports = [_]symbols.Export{
 const content_export_exports = [_]symbols.Export{
     .{ .name = "sceContentExportInit2", .function = trace.wrap("sceContentExportInit2", &services.accept), .expect_id = "0GnN4QCgIfs" },
 };
-
-/// Batched audio convolution work.
-///
-/// A batch is started and then waited on for a completion that this side
-/// cannot produce, so reporting it unavailable is the only answer a title can
-/// act on: told the batch had started, it would wait for a result forever.
-const acm_extra_exports = [_]symbols.Export{
-    .{ .name = "sceAcmBatchInitialize", .function = trace.wrap("sceAcmBatchInitialize", &services.absent), .expect_id = "WeZOIm8+8WI" },
-    .{ .name = "sceAcmBatchInitializeLite", .function = trace.wrap("sceAcmBatchInitializeLite", &services.absent), .expect_id = "Mk1xvQXIdkk" },
-    .{ .name = "sceAcmBatchJobNotification", .function = trace.wrap("sceAcmBatchJobNotification", &services.absent), .expect_id = "r7z5YQFZo+U" },
-    .{ .name = "sceAcmBatchProcess", .function = trace.wrap("sceAcmBatchProcess", &services.absent), .expect_id = "uqDIauipRbo" },
-    .{ .name = "sceAcmBatchStart", .function = trace.wrap("sceAcmBatchStart", &services.absent), .expect_id = "A5NXCXK5Gfc" },
-    .{ .name = "sceAcmBatchStartBuffer", .function = trace.wrap("sceAcmBatchStartBuffer", &services.absent), .expect_id = "tW9W+CAG4FE" },
-    .{ .name = "sceAcmBatchStartMultiple", .function = trace.wrap("sceAcmBatchStartMultiple", &services.absent), .expect_id = "S3BPrjCfZ90" },
-};
-
 pub const Table = struct { library: []const u8, module: []const u8, exports: []const symbols.Export };
 
 pub const all = [_]Table{
-    .{ .library = "libSceAcm", .module = "libSceAcm", .exports = &acm_exports },
     .{ .library = "libSceAgc", .module = "libSceAgc", .exports = &agc_exports },
-    .{ .library = "libSceAjm", .module = "libSceAjm", .exports = &ajm_exports },
-    .{ .library = "libSceAudiodec", .module = "libSceAudiodec", .exports = &audiodec_exports },
     .{ .library = "libSceAvPlayer", .module = "libSceAvPlayer", .exports = &avplayer_exports },
     .{ .library = "libSceCamera2", .module = "libSceCamera", .exports = &camera2_exports },
     .{ .library = "libSceCoredump", .module = "libkernel", .exports = &coredump_exports },
@@ -668,7 +606,6 @@ pub const all = [_]Table{
     .{ .library = "libSceJson2", .module = "libSceJson", .exports = &json2_exports },
     .{ .library = "libSceJpegDec", .module = "libSceJpegDec", .exports = &jpegdec_exports },
     .{ .library = "libSceNet", .module = "libSceNet", .exports = &net_exports },
-    .{ .library = "libSceNgs2", .module = "libSceNgs2", .exports = &ngs2_exports },
     .{ .library = "libSceNpAuth", .module = "libSceNpAuth", .exports = &npauth_exports },
     .{ .library = "libSceNpCommerce", .module = "libSceNpCommerce", .exports = &npcommerce_exports },
     .{ .library = "libSceNpEntitlementAccess", .module = "libSceNpEntitlementAccess", .exports = &npentitlementaccess_exports },
@@ -700,6 +637,5 @@ pub const all = [_]Table{
     .{ .library = "libSceShare", .module = "libSceShare", .exports = &share_extra_exports },
     .{ .library = "libSceDiscMap", .module = "libSceDiscMap", .exports = &disc_map_exports },
     .{ .library = "libSceContentExport", .module = "libSceContentExport", .exports = &content_export_exports },
-    .{ .library = "libSceAcm", .module = "libSceAcm", .exports = &acm_extra_exports },
     .{ .library = "libScePsml", .module = "libScePsml", .exports = &psml.exports },
 };

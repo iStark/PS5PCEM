@@ -23,6 +23,7 @@ const kernel_memory = @import("kernel_memory.zig");
 const audio_device = @import("../audio_device.zig");
 const audio_fs = @import("../audio_fs.zig");
 const ajm_codec = @import("../ajm_codec.zig");
+const services = @import("services.zig");
 const filesystem = @import("../filesystem.zig");
 
 pub const default_host_target_latency_ms = audio_device.default_target_latency_ms;
@@ -137,6 +138,20 @@ extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
 
 fn audioClockMilliseconds() u64 {
     return if (comptime builtin.os.tag == .windows) GetTickCount64() else 0;
+}
+
+fn hostTimestampNs() u64 {
+    if (comptime builtin.os.tag != .windows) return 0;
+    var counter: std.os.windows.LARGE_INTEGER = 0;
+    var frequency: std.os.windows.LARGE_INTEGER = 0;
+    if (!std.os.windows.ntdll.RtlQueryPerformanceCounter(&counter).toBool() or
+        !std.os.windows.ntdll.RtlQueryPerformanceFrequency(&frequency).toBool() or
+        counter < 0 or frequency <= 0)
+    {
+        return 0;
+    }
+    const scaled = @as(u128, @intCast(counter)) * std.time.ns_per_s;
+    return @intCast(scaled / @as(u128, @intCast(frequency)));
 }
 
 /// Selects the host jitter reserve before a title opens its primary port.
@@ -692,7 +707,12 @@ const AudioObject = struct {
     parent: u64 = 0,
     queue_depth: u32 = 0,
     grains: u32 = 0,
+    frequency: u32 = 48_000,
     data_format: u32 = 0,
+    port_type: u16 = 0,
+    pcm_address: u64 = 0,
+    pcm_pending: bool = false,
+    next_advance_ns: u64 = 0,
 };
 
 const maximum_audio_objects = 512;
@@ -734,11 +754,268 @@ fn releaseAudioObject(handle: u64, kind: AudioObjectKind) bool {
         for (&audio_objects) |*child| if (child.kind == .port and child.parent == handle) {
             child.* = .{};
         };
+        const owner_tag: i32 = @bitCast(@as(u32, 0x8000_0000) | @as(u32, @truncate(handle)));
+        if (device_owner.load(.acquire) == owner_tag) {
+            if (lockDevice()) |io| {
+                defer unlockDevice(io);
+                if (device_owner.load(.acquire) == owner_tag) {
+                    device.close();
+                    device_owner.store(-1, .release);
+                    device_owner_last_signal_ms.store(0, .release);
+                }
+            }
+        }
     }
     return true;
 }
 
+const AudioOut2AttributeEntry = extern struct {
+    attribute_id: u32,
+    padding: u32,
+    value_address: u64,
+    value_size: u64,
+};
+
+const AudioOut2DecodedFormat = struct {
+    channels: u8,
+    bytes_per_sample: u8,
+    is_float: bool,
+};
+
+fn decodeAudioOut2Format(data_format: u32) ?AudioOut2DecodedFormat {
+    var channels: u8 = @truncate((data_format >> 8) & 0xff);
+    if (channels == 0) channels = 2;
+    if (channels < 1 or channels > 16) return null;
+    const data_type = data_format & 0x7f;
+    const is_float = (data_type == 0);
+    const bytes_per_sample: u8 = if (is_float) 4 else if (data_type == 1) 2 else return null;
+    return .{
+        .channels = channels,
+        .bytes_per_sample = bytes_per_sample,
+        .is_float = is_float,
+    };
+}
+
+fn readAudioOut2Sample(bytes: []const u8, is_float: bool, bytes_per_sample: usize) f32 {
+    if (is_float) {
+        if (bytes.len < 4) return 0.0;
+        const val: f32 = @bitCast(std.mem.readInt(u32, bytes[0..4], .little));
+        return if (std.math.isFinite(val)) val else 0.0;
+    } else {
+        if (bytes_per_sample == 2) {
+            if (bytes.len < 2) return 0.0;
+            const val = std.mem.readInt(i16, bytes[0..2], .little);
+            return @as(f32, @floatFromInt(val)) / 32768.0;
+        }
+        return 0.0;
+    }
+}
+
+fn mixAudioOut2Port(
+    source: []const u8,
+    mix: []f32,
+    frames: usize,
+    channels: usize,
+    bytes_per_sample: usize,
+    is_float: bool,
+    additive: bool,
+    peak_out: *f32,
+) void {
+    const frame_bytes = channels * bytes_per_sample;
+    const side: f32 = 0.70710678;
+    for (0..frames) |f| {
+        const offset = f * frame_bytes;
+        if (offset + frame_bytes > source.len) break;
+        const frame_slice = source[offset .. offset + frame_bytes];
+        var left: f32 = 0.0;
+        var right: f32 = 0.0;
+        if (channels >= 8) {
+            const fl = readAudioOut2Sample(frame_slice[0 * bytes_per_sample ..], is_float, bytes_per_sample);
+            const fr = readAudioOut2Sample(frame_slice[1 * bytes_per_sample ..], is_float, bytes_per_sample);
+            const c  = readAudioOut2Sample(frame_slice[2 * bytes_per_sample ..], is_float, bytes_per_sample);
+            const bl = readAudioOut2Sample(frame_slice[4 * bytes_per_sample ..], is_float, bytes_per_sample);
+            const br = readAudioOut2Sample(frame_slice[5 * bytes_per_sample ..], is_float, bytes_per_sample);
+            const sl = readAudioOut2Sample(frame_slice[6 * bytes_per_sample ..], is_float, bytes_per_sample);
+            const sr = readAudioOut2Sample(frame_slice[7 * bytes_per_sample ..], is_float, bytes_per_sample);
+            left = fl + c * side + bl * side + sl * side;
+            right = fr + c * side + br * side + sr * side;
+        } else if (channels >= 6) {
+            const fl = readAudioOut2Sample(frame_slice[0 * bytes_per_sample ..], is_float, bytes_per_sample);
+            const fr = readAudioOut2Sample(frame_slice[1 * bytes_per_sample ..], is_float, bytes_per_sample);
+            const c  = readAudioOut2Sample(frame_slice[2 * bytes_per_sample ..], is_float, bytes_per_sample);
+            const bl = readAudioOut2Sample(frame_slice[4 * bytes_per_sample ..], is_float, bytes_per_sample);
+            const br = readAudioOut2Sample(frame_slice[5 * bytes_per_sample ..], is_float, bytes_per_sample);
+            left = fl + c * side + bl * side;
+            right = fr + c * side + br * side;
+        } else if (channels == 1) {
+            const mono = readAudioOut2Sample(frame_slice, is_float, bytes_per_sample);
+            left = mono;
+            right = mono;
+        } else {
+            left = readAudioOut2Sample(frame_slice[0 * bytes_per_sample ..], is_float, bytes_per_sample);
+            right = readAudioOut2Sample(frame_slice[1 * bytes_per_sample ..], is_float, bytes_per_sample);
+        }
+
+        const abs_l = @abs(left);
+        const abs_r = @abs(right);
+        if (abs_l > peak_out.*) peak_out.* = abs_l;
+        if (abs_r > peak_out.*) peak_out.* = abs_r;
+
+        if (additive) {
+            mix[f * 2 + 0] += left;
+            mix[f * 2 + 1] += right;
+        } else {
+            mix[f * 2 + 0] = left;
+            mix[f * 2 + 1] = right;
+        }
+    }
+}
+
+var audio_out2_submit_count: u64 = 0;
+
+fn routeAndPlayAudioOut2(
+    context_handle: u64,
+    frequency: u32,
+    frames: u32,
+    pcm_bytes: []const u8,
+    peak: f32,
+) void {
+    if (audioDisabled()) return;
+    const freq = if (frequency == 0) 48_000 else frequency;
+    const owner_tag: i32 = @bitCast(@as(u32, 0x8000_0000) | @as(u32, @truncate(context_handle)));
+
+    const io = lockDevice() orelse return;
+    defer unlockDevice(io);
+
+    const current_owner = device_owner.load(.acquire);
+    if (current_owner != owner_tag) {
+        if (current_owner != -1) {
+            device.close();
+        }
+        device_owner.store(-1, .release);
+        device.open(.{
+            .frequency = freq,
+            .channels = 2,
+            .format = .signed16,
+            .frames = frames,
+            .target_latency_ms = host_target_latency_ms.load(.acquire),
+        }) catch |err| {
+            std.debug.print(
+                "[audio out2] host device open failed ctx=0x{x} {d}Hz frames={d}: {s}\n",
+                .{ context_handle, freq, frames, @errorName(err) },
+            );
+            return;
+        };
+        device_owner.store(owner_tag, .release);
+        device_owner_last_signal_ms.store(audioClockMilliseconds(), .release);
+        std.debug.print(
+            "[audio out2] host device open ok ctx=0x{x} {d}Hz frames={d} queue={d}\n",
+            .{ context_handle, freq, frames, device.queueCapacity() },
+        );
+    }
+
+    if (device.isOpen()) {
+        device.play(pcm_bytes) catch |err| {
+            const n = audio_out_play_fail.fetchAdd(1, .monotonic);
+            if (n < 5) {
+                std.debug.print("[audio out2] play failed #{d}: {s}\n", .{ n + 1, @errorName(err) });
+            }
+        };
+        const n = audio_out2_submit_count;
+        audio_out2_submit_count += 1;
+        if (n < 8 or n % 500 == 0) {
+            std.debug.print(
+                "[audio out2] submit #{d} ctx=0x{x} frames={d} peak={d:.3}\n",
+                .{ n, context_handle, frames, peak },
+            );
+        }
+    }
+}
+
+fn submitAudioOut2Context(context_handle: u64) bool {
+    const ctx = audioObject(context_handle, .context) orelse return false;
+    const frames = ctx.grains;
+    if (frames == 0 or frames > 4096) return false;
+
+    var mix_buffer: [4096 * 2]f32 = undefined;
+    @memset(mix_buffer[0 .. frames * 2], 0);
+
+    var ports_mixed: usize = 0;
+    var max_peak: f32 = 0.0;
+
+    audio_object_mutex.lock();
+    for (&audio_objects) |*p| {
+        if (p.kind != .port or p.parent != context_handle) continue;
+        if (!p.pcm_pending or p.pcm_address == 0) continue;
+        p.pcm_pending = false;
+        const pcm_addr = p.pcm_address;
+        const data_format = p.data_format;
+
+        const decoded = decodeAudioOut2Format(data_format) orelse continue;
+        const channels: usize = decoded.channels;
+        const bytes_per_sample: usize = decoded.bytes_per_sample;
+        const byte_length = @as(usize, frames) * channels * bytes_per_sample;
+        if (!kernel_memory.isGuestRangeAccessible(pcm_addr, byte_length)) continue;
+
+        const src_bytes: [*]const u8 = @ptrFromInt(pcm_addr);
+        mixAudioOut2Port(
+            src_bytes[0..byte_length],
+            mix_buffer[0 .. frames * 2],
+            frames,
+            channels,
+            bytes_per_sample,
+            decoded.is_float,
+            ports_mixed > 0,
+            &max_peak,
+        );
+        ports_mixed += 1;
+    }
+    audio_object_mutex.unlock();
+
+    if (ports_mixed == 0) return false;
+
+    var pcm16_buffer: [4096 * 2 * 2]u8 = undefined;
+    const pcm16_bytes = frames * 2 * 2;
+    for (0..frames) |i| {
+        const left = std.math.clamp(mix_buffer[i * 2], -1.0, 1.0);
+        const right = std.math.clamp(mix_buffer[i * 2 + 1], -1.0, 1.0);
+        const s_left: i16 = @intFromFloat(std.math.clamp(left * 32767.0, -32768.0, 32767.0));
+        const s_right: i16 = @intFromFloat(std.math.clamp(right * 32767.0, -32768.0, 32767.0));
+        std.mem.writeInt(i16, pcm16_buffer[i * 4 ..][0..2], s_left, .little);
+        std.mem.writeInt(i16, pcm16_buffer[i * 4 + 2 ..][0..2], s_right, .little);
+    }
+
+    routeAndPlayAudioOut2(context_handle, ctx.frequency, frames, pcm16_buffer[0..pcm16_bytes], max_peak);
+    return true;
+}
+
+fn paceAudioOut2Context(context_handle: u64, grains: u32, frequency: u32) void {
+    const freq: u64 = if (frequency == 0) 48_000 else frequency;
+    const grain_ns = (@as(u64, grains) * std.time.ns_per_s) / freq;
+    const now = hostTimestampNs();
+
+    audio_object_mutex.lock();
+    var delay_ns: u64 = 0;
+    if (context_handle > 0 and context_handle <= maximum_audio_objects) {
+        const obj = &audio_objects[@intCast(context_handle - 1)];
+        if (obj.next_advance_ns < now) {
+            obj.next_advance_ns = now;
+        }
+        if (obj.next_advance_ns > now) {
+            delay_ns = obj.next_advance_ns - now;
+        }
+        obj.next_advance_ns += grain_ns;
+    }
+    audio_object_mutex.unlock();
+
+    if (delay_ns > 0) {
+        const sleep_ms: u32 = @intCast(@max(1, delay_ns / std.time.ns_per_ms));
+        _ = kernel_threading.sceKernelUsleep(sleep_ms * 1000);
+    }
+}
+
 fn audioOut2Initialize() callconv(abi.guest) i32 {
+    std.debug.print("[audio out2] initialized\n", .{});
     return errno.ok;
 }
 
@@ -765,13 +1042,16 @@ fn audioOut2ContextQueryMemory(parameters: ?*const AudioOut2ContextParam, memory
 fn audioOut2ContextCreate(parameters: ?*const AudioOut2ContextParam, _: ?*anyopaque, _: usize, context: ?*u64) callconv(abi.guest) i32 {
     const input = parameters orelse return audio_out2_error_invalid_parameter;
     const output = context orelse return audio_out2_error_invalid_parameter;
+    const queue_depth = if (input.queue_depth == 0) 4 else input.queue_depth;
+    const grains = if (input.num_grains == 0) 512 else input.num_grains;
     const handle = allocateAudioObject(
         .context,
         0,
-        if (input.queue_depth == 0) 4 else input.queue_depth,
-        if (input.num_grains == 0) 512 else input.num_grains,
+        queue_depth,
+        grains,
     ) orelse return audio_out2_error_port_full;
     output.* = handle;
+    std.debug.print("[audio out2] context create handle=0x{x} depth={d} grains={d}\n", .{ handle, queue_depth, grains });
     return errno.ok;
 }
 
@@ -781,9 +1061,9 @@ fn audioOut2ContextDestroy(context: u64) callconv(abi.guest) i32 {
 
 fn audioOut2ContextAdvance(context: u64) callconv(abi.guest) i32 {
     const object = audioObject(context, .context) orelse return audio_out2_error_invalid_parameter;
-    // Keep the emulated mixer clock moving even without an active host route.
-    // SDK 11 titles use Advance and Push as completion clock edges.
-    pace(object.grains, 48_000);
+    if (!submitAudioOut2Context(context)) {
+        paceAudioOut2Context(context, object.grains, object.frequency);
+    }
     return errno.ok;
 }
 
@@ -800,17 +1080,24 @@ fn audioOut2ContextSetAttributes(
 fn audioOut2ContextPush(context: u64, blocking: u32) callconv(abi.guest) i32 {
     _ = blocking;
     const object = audioObject(context, .context) orelse return audio_out2_error_invalid_parameter;
-    // The null-host path still consumes one grain. In particular this must
-    // also pace non-blocking pushes: otherwise the guest can outrun the audio
-    // command worker which publishes asynchronous resource completions.
-    pace(object.grains, 48_000);
+    if (!submitAudioOut2Context(context)) {
+        paceAudioOut2Context(context, object.grains, object.frequency);
+    }
     return errno.ok;
 }
 
 fn audioOut2ContextGetQueueLevel(context: u64, queue_level: ?*u32, available: ?*u32) callconv(abi.guest) i32 {
     const object = audioObject(context, .context) orelse return audio_out2_error_invalid_parameter;
-    if (queue_level) |output| output.* = 0;
-    if (available) |output| output.* = object.queue_depth;
+    if (queue_level) |output| {
+        if (kernel_memory.isGuestRangeAccessible(@intFromPtr(output), @sizeOf(u32))) {
+            output.* = 0;
+        }
+    }
+    if (available) |output| {
+        if (kernel_memory.isGuestRangeAccessible(@intFromPtr(output), @sizeOf(u32))) {
+            output.* = object.queue_depth;
+        }
+    }
     return errno.ok;
 }
 
@@ -820,8 +1107,14 @@ fn audioOut2PortCreate(context: u64, parameters: ?*const AudioOut2PortParam, por
     const handle = allocateAudioObject(.port, context, 0, 0) orelse return audio_out2_error_port_full;
     audio_object_mutex.lock();
     audio_objects[@intCast(handle - 1)].data_format = input.data_format;
+    audio_objects[@intCast(handle - 1)].port_type = input.port_type;
+    audio_objects[@intCast(handle - 1)].frequency = if (input.sampling_frequency != 0) input.sampling_frequency else 48_000;
     audio_object_mutex.unlock();
     port.?.* = handle;
+    std.debug.print(
+        "[audio out2] port create handle=0x{x} ctx=0x{x} type=0x{x} format=0x{x} freq={d}\n",
+        .{ handle, context, input.port_type, input.data_format, input.sampling_frequency },
+    );
     return errno.ok;
 }
 
@@ -840,7 +1133,11 @@ fn audioOut2PortGetState(port: u64, state: ?*[audio_out2_port_state_bytes]u8) ca
     @memset(output, 0);
     var channels: u8 = 2;
     if (audioObject(port, .port)) |object| {
-        channels = audioOut2PortChannels(object.data_format);
+        if (decodeAudioOut2Format(object.data_format)) |dec| {
+            channels = dec.channels;
+        } else {
+            channels = audioOut2PortChannels(object.data_format);
+        }
     }
     std.mem.writeInt(u16, output[0x00..0x02], 1, .little);
     output[0x02] = channels;
@@ -852,9 +1149,40 @@ fn audioOut2PortDestroy(port: u64) callconv(abi.guest) i32 {
     return if (releaseAudioObject(port, .port)) errno.ok else audio_out2_error_invalid_parameter;
 }
 
+var audio_out2_attribute_pcm_count: u64 = 0;
+
 fn audioOut2PortSetAttributes(port: u64, attributes: ?*const anyopaque, count: u32) callconv(abi.guest) i32 {
     if (audioObject(port, .port) == null) return audio_out2_error_invalid_parameter;
-    if (count != 0 and attributes == null) return audio_out2_error_invalid_parameter;
+    if (count == 0 or attributes == null) return errno.ok;
+    const safe_count = @min(count, 32);
+    const attr_bytes = @as(usize, safe_count) * @sizeOf(AudioOut2AttributeEntry);
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(attributes.?), attr_bytes)) {
+        return errno.ok;
+    }
+    const entries: [*]const AudioOut2AttributeEntry = @ptrCast(@alignCast(attributes.?));
+    for (0..safe_count) |i| {
+        const entry = entries[i];
+        if (entry.attribute_id == 0 and entry.value_address != 0 and entry.value_size >= 8) {
+            if (kernel_memory.isGuestRangeAccessible(entry.value_address, 8)) {
+                const pcm_bytes = @as([*]const u8, @ptrFromInt(entry.value_address))[0..8];
+                const pcm_addr = std.mem.readInt(u64, pcm_bytes, .little);
+                audio_object_mutex.lock();
+                if (port > 0 and port <= maximum_audio_objects) {
+                    audio_objects[@intCast(port - 1)].pcm_address = pcm_addr;
+                    audio_objects[@intCast(port - 1)].pcm_pending = (pcm_addr != 0);
+                }
+                audio_object_mutex.unlock();
+                const n = audio_out2_attribute_pcm_count;
+                audio_out2_attribute_pcm_count += 1;
+                if (n < 8 or n % 500 == 0) {
+                    std.debug.print(
+                        "[audio out2] port set pcm #{d} port=0x{x} pcm=0x{x}\n",
+                        .{ n, port, pcm_addr },
+                    );
+                }
+            }
+        }
+    }
     return errno.ok;
 }
 
@@ -890,6 +1218,23 @@ fn audioOut2MasteringInit(_: u32) callconv(abi.guest) i32 {
     return errno.ok;
 }
 
+fn audioOut2ContextBedWrite(context: u64, _: ?*const anyopaque, _: usize) callconv(abi.guest) i32 {
+    _ = context;
+    return errno.ok;
+}
+
+fn audioOut2LoContextGetQueueLevel(context: u64, queue_level: ?*u32, available: ?*u32) callconv(abi.guest) i32 {
+    return audioOut2ContextGetQueueLevel(context, queue_level, available);
+}
+
+fn audioOut2GetSystemState(state: ?*anyopaque) callconv(abi.guest) i32 {
+    const output = state orelse return audio_out2_error_invalid_parameter;
+    if (kernel_memory.isGuestRangeAccessible(@intFromPtr(output), 0x40)) {
+        @memset(@as([*]u8, @ptrCast(output))[0..0x40], 0);
+    }
+    return errno.ok;
+}
+
 const audio_out2_exports = [_]symbols.Export{
     .{ .name = "sceAudioOut2Initialize", .function = trace.wrap("sceAudioOut2Initialize", &audioOut2Initialize), .expect_id = "g2tViFIohHE" },
     .{ .name = "sceAudioOut2ContextResetParam", .function = trace.wrap("sceAudioOut2ContextResetParam", &audioOut2ContextResetParam), .expect_id = "t5YrizufpQc" },
@@ -900,6 +1245,8 @@ const audio_out2_exports = [_]symbols.Export{
     .{ .name = "sceAudioOut2ContextAdvance", .function = trace.wrap("sceAudioOut2ContextAdvance", &audioOut2ContextAdvance), .expect_id = "PE2zHMqLSHs" },
     .{ .name = "sceAudioOut2ContextPush", .function = trace.wrap("sceAudioOut2ContextPush", &audioOut2ContextPush), .expect_id = "aII9h5nli9U" },
     .{ .name = "sceAudioOut2ContextGetQueueLevel", .function = trace.wrap("sceAudioOut2ContextGetQueueLevel", &audioOut2ContextGetQueueLevel), .expect_id = "R7d0F1g2qsU" },
+    .{ .name = "sceAudioOut2LoContextGetQueueLevel", .function = trace.wrap("sceAudioOut2LoContextGetQueueLevel", &audioOut2LoContextGetQueueLevel), .expect_id = "Q8DZkKQ-SYc" },
+    .{ .name = "sceAudioOut2ContextBedWrite", .function = trace.wrap("sceAudioOut2ContextBedWrite", &audioOut2ContextBedWrite), .expect_id = "DxGyV8dtOR8" },
     .{ .name = "sceAudioOut2PortCreate", .function = trace.wrap("sceAudioOut2PortCreate", &audioOut2PortCreate), .expect_id = "JK2wamZPzwM" },
     .{ .name = "sceAudioOut2PortGetState", .function = trace.wrap("sceAudioOut2PortGetState", &audioOut2PortGetState), .expect_id = "gatEUKG+Ea4" },
     .{ .name = "sceAudioOut2PortDestroy", .function = trace.wrap("sceAudioOut2PortDestroy", &audioOut2PortDestroy), .expect_id = "cd+Rtw+D1x8" },
@@ -907,6 +1254,7 @@ const audio_out2_exports = [_]symbols.Export{
     .{ .name = "sceAudioOut2UserCreate", .function = trace.wrap("sceAudioOut2UserCreate", &audioOut2UserCreate), .expect_id = "xywYcRB7nbQ" },
     .{ .name = "sceAudioOut2UserDestroy", .function = trace.wrap("sceAudioOut2UserDestroy", &audioOut2UserDestroy), .expect_id = "IaZXJ9M79uo" },
     .{ .name = "sceAudioOut2GetSpeakerInfo", .function = trace.wrap("sceAudioOut2GetSpeakerInfo", &audioOut2GetSpeakerInfo), .expect_id = "DImz2Ft9E2g" },
+    .{ .name = "sceAudioOut2GetSystemState", .function = trace.wrap("sceAudioOut2GetSystemState", &audioOut2GetSystemState), .expect_id = "bkBN+CMLwRc" },
     .{ .name = "sceAudioOut2Set3DLatency", .function = trace.wrap("sceAudioOut2Set3DLatency", &audioOut2Set3DLatency), .expect_id = "TViD1EZXkNI" },
     .{ .name = "sceAudioOut2MasteringInit", .function = trace.wrap("sceAudioOut2MasteringInit", &audioOut2MasteringInit), .expect_id = "XHl38ZNknbs" },
 };
@@ -1917,6 +2265,11 @@ const ngs2_exports = [_]symbols.Export{
     .{ .name = "sceNgs2RackDestroy", .function = trace.wrap("sceNgs2RackDestroy", &ngs2RackDestroy), .expect_id = "lCqD7oycmIM" },
     .{ .name = "sceNgs2SystemDestroy", .function = trace.wrap("sceNgs2SystemDestroy", &ngs2SystemDestroy), .expect_id = "u-WrYDaJA3k" },
     .{ .name = "sceNgs2SystemRender", .function = trace.wrap("sceNgs2SystemRender", &ngs2SystemRender), .expect_id = "i0VnXM-C9fc" },
+    // Reported unavailable, which is what this answered before the audio
+    // library grew implementations of its own. Nothing here keeps the
+    // per-system options a reset would restore, and dropping the export
+    // entirely would leave a title importing it with nothing to bind.
+    .{ .name = "sceNgs2SystemResetOption", .function = trace.wrap("sceNgs2SystemResetOption", &services.absent), .expect_id = "AQkj7C0f3PY" },
     .{ .name = "sceNgs2PanInit", .function = trace.wrap("sceNgs2PanInit", &ngs2PanInit), .expect_id = "xa8oL9dmXkM" },
     .{ .name = "sceNgs2PanGetVolumeMatrix", .function = trace.wrap("sceNgs2PanGetVolumeMatrix", &ngs2PanGetVolumeMatrix), .expect_id = "gbMKV+8Enuo" },
     .{ .name = "sceNgs2VoiceGetState", .function = trace.wrap("sceNgs2VoiceGetState", &ngs2VoiceGetState), .expect_id = "-TOuuAQ-buE" },
@@ -2342,6 +2695,42 @@ fn acmBatchStartBuffers(
     return errno.ok;
 }
 
+fn acmBatchStartBuffer(
+    context: u32,
+    commands_address: u64,
+    commands_size: usize,
+    batch_error: ?*AcmBatchError,
+    batch: ?*u32,
+) callconv(abi.guest) i32 {
+    _ = commands_address;
+    _ = commands_size;
+    if (!isAcmContext(context)) return errno.KernelError.einval.raw();
+    const output = batch orelse return errno.KernelError.einval.raw();
+    if (batch_error) |failure| failure.* = .{};
+    output.* = next_acm_batch.fetchAdd(1, .monotonic);
+    return errno.ok;
+}
+
+fn acmBatchInitialize(_: ?*anyopaque, _: usize, _: ?*anyopaque) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
+fn acmBatchInitializeLite(_: ?*anyopaque, _: usize, _: ?*anyopaque) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
+fn acmBatchStart(_: u32, _: ?*anyopaque, _: ?*anyopaque, _: ?*u32) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
+fn acmBatchStartMultiple(_: u32, _: u32, _: ?*anyopaque, _: ?*anyopaque, _: ?*u32) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
+fn acmBatchProcess(_: ?*anyopaque) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
 fn acmBatchWait(context: u32, _: u32, _: u32) callconv(abi.guest) i32 {
     return if (isAcmContext(context)) errno.ok else errno.KernelError.einval.raw();
 }
@@ -2354,11 +2743,23 @@ fn acmAdvanceBatch(info: ?*AcmBatchInfo, amount: usize) i32 {
     return errno.ok;
 }
 
+fn acmBatchJobNotification(info: ?*AcmBatchInfo, _: u64, _: u64) callconv(abi.guest) i32 {
+    return acmAdvanceBatch(info, 32);
+}
+
 fn acmConvReverbSharedInput(info: ?*AcmBatchInfo, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
     return acmAdvanceBatch(info, 1024);
 }
 
+fn acmConvReverbSharedIr(info: ?*AcmBatchInfo, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return acmAdvanceBatch(info, 1024);
+}
+
 fn acmFft(info: ?*AcmBatchInfo, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return acmAdvanceBatch(info, 256);
+}
+
+fn acmIfft(info: ?*AcmBatchInfo, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
     return acmAdvanceBatch(info, 256);
 }
 
@@ -2369,10 +2770,19 @@ fn acmPanner(info: ?*AcmBatchInfo, _: u64, _: u64, _: u64, _: u64, _: u64) callc
 const acm_exports = [_]symbols.Export{
     .{ .name = "sceAcmContextCreate", .function = trace.wrap("sceAcmContextCreate", &acmContextCreate), .expect_id = "ZIXln2K3XMk" },
     .{ .name = "sceAcmContextDestroy", .function = trace.wrap("sceAcmContextDestroy", &acmContextDestroy), .expect_id = "jBgBjAj02R8" },
+    .{ .name = "sceAcmBatchStartBuffer", .function = trace.wrap("sceAcmBatchStartBuffer", &acmBatchStartBuffer), .expect_id = "tW9W+CAG4FE" },
     .{ .name = "sceAcmBatchStartBuffers", .function = trace.wrap("sceAcmBatchStartBuffers", &acmBatchStartBuffers), .expect_id = "8fe55ktlNVo" },
+    .{ .name = "sceAcmBatchInitialize", .function = trace.wrap("sceAcmBatchInitialize", &acmBatchInitialize), .expect_id = "WeZOIm8+8WI" },
+    .{ .name = "sceAcmBatchInitializeLite", .function = trace.wrap("sceAcmBatchInitializeLite", &acmBatchInitializeLite), .expect_id = "Mk1xvQXIdkk" },
+    .{ .name = "sceAcmBatchStart", .function = trace.wrap("sceAcmBatchStart", &acmBatchStart), .expect_id = "A5NXCXK5Gfc" },
+    .{ .name = "sceAcmBatchStartMultiple", .function = trace.wrap("sceAcmBatchStartMultiple", &acmBatchStartMultiple), .expect_id = "S3BPrjCfZ90" },
+    .{ .name = "sceAcmBatchProcess", .function = trace.wrap("sceAcmBatchProcess", &acmBatchProcess), .expect_id = "uqDIauipRbo" },
+    .{ .name = "sceAcmBatchJobNotification", .function = trace.wrap("sceAcmBatchJobNotification", &acmBatchJobNotification), .expect_id = "r7z5YQFZo+U" },
     .{ .name = "sceAcmBatchWait", .function = trace.wrap("sceAcmBatchWait", &acmBatchWait), .expect_id = "RLN3gRlXJLE" },
     .{ .name = "sceAcm_ConvReverb_SharedInput", .function = trace.wrap("sceAcm_ConvReverb_SharedInput", &acmConvReverbSharedInput), .expect_id = "u70oWo92SYQ" },
+    .{ .name = "sceAcm_ConvReverb_SharedIr", .function = trace.wrap("sceAcm_ConvReverb_SharedIr", &acmConvReverbSharedIr), .expect_id = "9nLbWmRDpa8" },
     .{ .name = "sceAcm_FFT", .function = trace.wrap("sceAcm_FFT", &acmFft), .expect_id = "KovqaFbmtsM" },
+    .{ .name = "sceAcm_IFFT", .function = trace.wrap("sceAcm_IFFT", &acmIfft), .expect_id = "DR-ZCmvVR9Q" },
     .{ .name = "sceAcm_Panner", .function = trace.wrap("sceAcm_Panner", &acmPanner), .expect_id = "LA4RCNKnFjg" },
 };
 
@@ -2471,6 +2881,7 @@ fn ajmInitialize(reserved: i64, context: ?*u32) callconv(abi.guest) i32 {
         if (active.*) continue;
         active.* = true;
         output.* = @intCast(index + 1);
+        std.debug.print("[audio ajm] initialize ctx={d}\n", .{ index + 1 });
         return errno.ok;
     }
     return ajm_error_invalid_parameter;
@@ -2491,13 +2902,14 @@ fn ajmFinalize(context: u32) callconv(abi.guest) i32 {
 }
 
 fn ajmModuleRegister(context: u32, codec: u32, reserved: i64) callconv(abi.guest) i32 {
-    if (reserved != 0) return ajm_error_invalid_parameter;
+    _ = reserved;
     const context_index = ajmContextIndex(context) orelse return ajm_error_invalid_context;
     if (!ajm_codec.isSupported(codec)) return ajm_error_codec_not_supported;
     ajm_mutex.lock();
     defer ajm_mutex.unlock();
     if (!ajm_contexts[context_index]) return ajm_error_invalid_context;
     ajm_modules[context_index][codec] = true;
+    std.debug.print("[audio ajm] module register ctx={d} codec={d}\n", .{ context, codec });
     return errno.ok;
 }
 
@@ -2964,9 +3376,26 @@ fn ajmDecMp3ParseFrame(
     return errno.ok;
 }
 
+fn ajmStrError(_: i32) callconv(abi.guest) ?[*:0]const u8 {
+    return "ok";
+}
+
+fn ajmBatchJobClearContext(info: ?*AjmBatchInfo, instance: u32, result: ?[*]u8) callconv(abi.guest) i32 {
+    var status: i32 = ajm_result_invalid_parameter;
+    ajm_mutex.lock();
+    if (findAjmInstanceLocked(instance)) |candidate| {
+        candidate.decoder.reset();
+        status = 0;
+    }
+    ajm_mutex.unlock();
+    writeAjmBasicResult(result, status, 0);
+    return appendAjmJob(info, 48);
+}
+
 const ajm_exports = [_]symbols.Export{
     .{ .name = "sceAjmInitialize", .function = trace.wrap("sceAjmInitialize", &ajmInitialize), .expect_id = "dl+4eHSzUu4" },
     .{ .name = "sceAjmFinalize", .function = trace.wrap("sceAjmFinalize", &ajmFinalize), .expect_id = "MHur6qCsUus" },
+    .{ .name = "sceAjmStrError", .function = trace.wrap("sceAjmStrError", &ajmStrError), .expect_id = "AxhcqVv5AYU" },
     .{ .name = "sceAjmModuleRegister", .function = trace.wrap("sceAjmModuleRegister", &ajmModuleRegister), .expect_id = "Q3dyFuwGn64" },
     .{ .name = "sceAjmModuleUnregister", .function = trace.wrap("sceAjmModuleUnregister", &ajmModuleUnregister), .expect_id = "Wi7DtlLV+KI" },
     .{ .name = "sceAjmInstanceCreate", .function = trace.wrap("sceAjmInstanceCreate", &ajmInstanceCreate), .expect_id = "AxoDrINp4J8" },
@@ -2983,6 +3412,7 @@ const ajm_exports = [_]symbols.Export{
     .{ .name = "sceAjmBatchJobSetGaplessDecode", .function = trace.wrap("sceAjmBatchJobSetGaplessDecode", &ajmBatchJobSetGaplessDecode), .expect_id = "SkEwpiu3tZg" },
     .{ .name = "sceAjmBatchJobDecode", .function = trace.wrap("sceAjmBatchJobDecode", &ajmBatchJobDecode), .expect_id = "39WxhR-ePew" },
     .{ .name = "sceAjmBatchJobDecodeSplit", .function = trace.wrap("sceAjmBatchJobDecodeSplit", &ajmBatchJobDecodeSplit), .expect_id = "SJ3i0DXP8vg" },
+    .{ .name = "sceAjmBatchJobClearContext", .function = trace.wrap("sceAjmBatchJobClearContext", &ajmBatchJobClearContext), .expect_id = "uJ3m8INuikg" },
     .{ .name = "sceAjmBatchJobSetResampleParametersEx", .function = trace.wrap("sceAjmBatchJobSetResampleParametersEx", &ajmBatchJobSetResampleParametersEx), .expect_id = "5ldnD16rYZw" },
     .{ .name = "sceAjmBatchJobGetResampleInfo", .function = trace.wrap("sceAjmBatchJobGetResampleInfo", &ajmBatchJobGetResampleInfo), .expect_id = "JkdNCocpu1M" },
     .{ .name = "sceAjmBatchJobGetStatistics", .function = trace.wrap("sceAjmBatchJobGetStatistics", &ajmBatchJobGetStatistics), .expect_id = "3cAg7xN995U" },
@@ -3056,13 +3486,22 @@ pub fn reset() void {
 }
 
 pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {
-    try db.addLibrary(gpa, .{ .name = "libSceAudioOut", .version = 1 }, .{ .name = "libSceAudioOut" }, &audio_out_exports);
-    try db.addLibrary(gpa, .{ .name = "libSceAudioIn", .version = 1 }, .{ .name = "libSceAudioIn" }, &audio_in_exports);
-    try db.addLibrary(gpa, .{ .name = "libSceAudioOut2", .version = 1 }, .{ .name = "libSceAudioOut" }, &audio_out2_exports);
-    try db.addLibrary(gpa, .{ .name = "libSceAudiodec", .version = 1 }, .{ .name = "libSceAudiodec" }, &audiodec_exports);
-    try db.addLibrary(gpa, .{ .name = "libSceAcm", .version = 1 }, .{ .name = "libSceAcm" }, &acm_exports);
-    try db.addLibrary(gpa, .{ .name = "libSceNgs2", .version = 1 }, .{ .name = "libSceNgs2" }, &ngs2_exports);
-    try db.addLibrary(gpa, .{ .name = "libSceAjm", .version = 1 }, .{ .name = "libSceAjm" }, &ajm_exports);
+    const modules_to_register = [_]struct { lib: []const u8, mod: []const u8, exports: []const symbols.Export }{
+        .{ .lib = "libSceAudioOut", .mod = "libSceAudioOut", .exports = &audio_out_exports },
+        .{ .lib = "libSceAudioIn", .mod = "libSceAudioIn", .exports = &audio_in_exports },
+        .{ .lib = "libSceAudioOut2", .mod = "libSceAudioOut", .exports = &audio_out2_exports },
+        .{ .lib = "libSceAudioOut2", .mod = "libSceAudioOut2", .exports = &audio_out2_exports },
+        .{ .lib = "libSceAudioOut", .mod = "libSceAudioOut2", .exports = &audio_out2_exports },
+        .{ .lib = "libSceAudiodec", .mod = "libSceAudiodec", .exports = &audiodec_exports },
+        .{ .lib = "libSceAcm", .mod = "libSceAcm", .exports = &acm_exports },
+        .{ .lib = "libSceNgs2", .mod = "libSceNgs2", .exports = &ngs2_exports },
+        .{ .lib = "libSceAjm", .mod = "libSceAjm", .exports = &ajm_exports },
+    };
+
+    inline for (modules_to_register) |m| {
+        try db.addLibrary(gpa, .{ .name = m.lib, .version = 1 }, .{ .name = m.mod, .version_major = 1, .version_minor = 1 }, m.exports);
+        try db.addLibrary(gpa, .{ .name = m.lib, .version = 1 }, .{ .name = m.mod, .version_major = 1, .version_minor = 0 }, m.exports);
+    }
 }
 
 test "legacy AudioOut formats distinguish standard 8-channel integer and float PCM" {
@@ -3348,3 +3787,41 @@ test "audio libraries register the title import surface" {
     try std.testing.expect(db.findById("gatEUKG+Ea4", .function) != null);
     try std.testing.expect(db.findById("39WxhR-ePew", .function) != null);
 }
+
+test "AudioOut2 decodes formats and mixes ports to stereo correctly" {
+    const float_stereo = decodeAudioOut2Format(0x0200).?;
+    try std.testing.expectEqual(@as(u8, 2), float_stereo.channels);
+    try std.testing.expectEqual(@as(u8, 4), float_stereo.bytes_per_sample);
+    try std.testing.expect(float_stereo.is_float);
+
+    const int16_stereo = decodeAudioOut2Format(0x0201).?;
+    try std.testing.expectEqual(@as(u8, 2), int16_stereo.channels);
+    try std.testing.expectEqual(@as(u8, 2), int16_stereo.bytes_per_sample);
+    try std.testing.expect(!int16_stereo.is_float);
+
+    const float_71 = decodeAudioOut2Format(0x0800).?;
+    try std.testing.expectEqual(@as(u8, 8), float_71.channels);
+    try std.testing.expectEqual(@as(u8, 4), float_71.bytes_per_sample);
+    try std.testing.expect(float_71.is_float);
+
+    const frames: usize = 2;
+    var float_samples = [_]f32{ 0.5, -0.5, 0.25, -0.25 };
+    var mix: [4]f32 = @splat(0);
+    var peak: f32 = 0;
+    mixAudioOut2Port(
+        std.mem.sliceAsBytes(&float_samples),
+        &mix,
+        frames,
+        2,
+        4,
+        true,
+        false,
+        &peak,
+    );
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), mix[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.5), mix[1], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), mix[2], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.25), mix[3], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), peak, 0.001);
+}
+
