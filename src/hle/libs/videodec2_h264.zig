@@ -245,6 +245,9 @@ const stream_can_provide_samples: u32 = 0x0000_0200;
 const message_begin_streaming: u32 = 0x1000_0000;
 const message_start_of_stream: u32 = 0x1000_0002;
 const message_flush: u32 = 0;
+/// Tells a transform no more input is coming, so it releases the pictures it
+/// was still holding back to reorder.
+const message_drain: u32 = 1;
 
 extern "ole32" fn CoInitializeEx(?*anyopaque, u32) callconv(.winapi) HRESULT;
 extern "ole32" fn CoCreateInstance(
@@ -275,6 +278,10 @@ const Decoder = struct {
     output_pitch: u32,
     /// Where a decoded picture is assembled before the caller copies it out.
     frame: std.ArrayList(u8) = .empty,
+    /// Whether this decoder has been told its stream ended. A drain is one
+    /// message, not one per collected picture, and new input starts a fresh
+    /// stream that can be drained again.
+    draining: bool = false,
 };
 
 /// A spin lock over the decoder, matching the one the asynchronous reads use.
@@ -290,11 +297,49 @@ const Lock = struct {
     }
 };
 
-var decoder: ?Decoder = null;
+/// One host decoder per decoder a title created.
+///
+/// A title can hold several at once -- Yotei creates two before playing
+/// anything -- and each carries its own stream. Sharing one host decoder
+/// between them feeds two streams into a decoder that can only follow one, so
+/// the first breaks up and the second never starts.
+const DecoderSlot = struct {
+    /// The title's own decoder handle, or zero when the slot is free.
+    handle: u64 = 0,
+    state: ?Decoder = null,
+};
+
+const maximum_decoders = 8;
+
+var decoders: [maximum_decoders]DecoderSlot = @splat(.{});
 /// A title decodes on one thread and may reset or delete from another, while
-/// the picture handed back borrows the buffer this owns. One lock over the
-/// whole decoder keeps those from overlapping.
+/// the picture handed back borrows the buffer its decoder owns. One lock over
+/// the table keeps those from overlapping.
 var lock: Lock = .{};
+
+fn slotFor(handle: u64) ?*DecoderSlot {
+    if (handle == 0) return null;
+    for (&decoders) |*slot| {
+        if (slot.handle == handle and slot.state != null) return slot;
+    }
+    return null;
+}
+
+fn freeSlot() ?*DecoderSlot {
+    for (&decoders) |*slot| {
+        if (slot.state == null) return slot;
+    }
+    return null;
+}
+
+/// Releases one slot. The caller already holds the lock.
+fn releaseSlotLocked(slot: *DecoderSlot) void {
+    if (slot.state) |*active| {
+        release(active.transform);
+        active.frame.deinit(std.heap.page_allocator);
+    }
+    slot.* = .{};
+}
 var platform_started = false;
 var reported_failure = false;
 var reported_first_picture = false;
@@ -411,15 +456,19 @@ fn prepareTransformAttributes(transform: *anyopaque) void {
 
 /// Prepares a decoder for a stream of the given size, reusing one already
 /// running for the same geometry.
-pub fn ensureDecoder(width: u32, height: u32) bool {
+pub fn ensureDecoder(handle: u64, width: u32, height: u32) bool {
     lock.lock();
     defer lock.unlock();
     if (comptime builtin.os.tag != .windows) return false;
-    if (width == 0 or height == 0) return false;
-    if (decoder) |existing| {
-        if (existing.width == width and existing.height == height) return true;
-        destroyDecoder();
+    if (handle == 0 or width == 0 or height == 0) return false;
+    if (slotFor(handle)) |existing| {
+        const state = &existing.state.?;
+        if (state.width == width and state.height == height) return true;
+        // Released here rather than through the public entry point, which
+        // takes the lock this already holds.
+        releaseSlotLocked(existing);
     }
+    const slot = freeSlot() orelse return false;
     if (!startPlatform()) return false;
 
     var transform: *anyopaque = undefined;
@@ -443,34 +492,56 @@ pub fn ensureDecoder(width: u32, height: u32) bool {
     _ = vtable.process_message(transform, message_begin_streaming, 0);
     _ = vtable.process_message(transform, message_start_of_stream, 0);
 
-    decoder = .{
-        .transform = transform,
-        .width = width,
-        .height = height,
-        .output_pitch = width,
+    slot.* = .{
+        .handle = handle,
+        .state = .{
+            .transform = transform,
+            .width = width,
+            .height = height,
+            .output_pitch = width,
+        },
     };
-    readOutputGeometry(transform, &decoder.?);
+    readOutputGeometry(transform, &slot.state.?);
     std.debug.print(
-        "[videodec] host H.264 decoder ready {d}x{d}\n",
-        .{ decoder.?.width, decoder.?.height },
+        "[videodec] host H.264 decoder ready {d}x{d} for decoder 0x{x}\n",
+        .{ slot.state.?.width, slot.state.?.height, handle },
     );
     return true;
 }
 
-pub fn destroyDecoder() void {
+/// Reports one picture the decoder was still holding after the last access
+/// unit, telling it the stream ended the first time it is asked.
+///
+/// A title plays a movie to its end by feeding every access unit and then
+/// asking for what is left, so a decoder that answers nothing here loses the
+/// tail of every clip and leaves the title waiting for frames that never come.
+pub fn drainPicture(handle: u64) ?Picture {
+    if (comptime builtin.os.tag != .windows) return null;
     lock.lock();
     defer lock.unlock();
-    if (decoder) |*active| {
-        release(active.transform);
-        active.frame.deinit(std.heap.page_allocator);
+    const slot = slotFor(handle) orelse return null;
+    const active = &slot.state.?;
+    if (!active.draining) {
+        active.draining = true;
+        _ = vtableOf(IMFTransformVtable, active.transform)
+            .process_message(active.transform, message_drain, 0);
     }
-    decoder = null;
+    if (!collectPicture(active)) return null;
+    return currentPicture(active);
 }
 
-pub fn flushDecoder() void {
+pub fn destroyDecoder(handle: u64) void {
     lock.lock();
     defer lock.unlock();
-    const active = decoder orelse return;
+    const slot = slotFor(handle) orelse return;
+    releaseSlotLocked(slot);
+}
+
+pub fn flushDecoder(handle: u64) void {
+    lock.lock();
+    defer lock.unlock();
+    const slot = slotFor(handle) orelse return;
+    const active = &slot.state.?;
     _ = vtableOf(IMFTransformVtable, active.transform)
         .process_message(active.transform, message_flush, 0);
 }
@@ -594,16 +665,16 @@ fn collectPicture(active: *Decoder) bool {
 /// Hands one Annex B access unit to the decoder and reports a picture when the
 /// decoder has one ready. Reporting none is ordinary: H.264 needs several
 /// units before the first picture, and reordering delays later ones.
-pub fn decodeAccessUnit(unit: []const u8, timestamp: i64) ?Picture {
+pub fn decodeAccessUnit(handle: u64, unit: []const u8, timestamp: i64) ?Picture {
     if (comptime builtin.os.tag != .windows) return null;
-    if (decoder == null) return null;
     if (unit.len == 0) return null;
     lock.lock();
     defer lock.unlock();
-    if (decoder == null) return null;
-    const active = &decoder.?;
+    const slot = slotFor(handle) orelse return null;
+    const active = &slot.state.?;
     const vtable = vtableOf(IMFTransformVtable, active.transform);
 
+    active.draining = false;
     const stamp = if (timestamp != 0) timestamp else next_stamp;
     next_stamp += frame_duration;
     const sample = makeInputSample(unit, stamp) orelse return null;

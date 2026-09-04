@@ -60,6 +60,12 @@ fn decodedFrameSlotSize(config: *const DecoderConfigInfo) u64 {
 var announced_decoders: u8 = 0;
 var announced_units: u8 = 0;
 var published_pictures: u32 = 0;
+
+/// Recognisable prefix for a decoder handle, so one that reaches a log or a
+/// fault reads as this module's token rather than a guest address.
+const decoder_token_base: u64 = 0x5644_4543_0000_0000;
+var next_decoder_token: u64 = 0;
+var drain_requests: u32 = 0;
 var last_picture_timestamp_ns: ?u64 = null;
 const target_frame_interval_ns: u64 = 16_666_667; // ~60 FPS (16.666 ms)
 
@@ -228,13 +234,20 @@ pub fn createDecoder(
     if (!accessible(config) or !accessible(memory) or !accessible(output)) {
         return error_argument_pointer;
     }
-    // CPU memory is stable for the decoder lifetime and therefore makes a
-    // useful opaque token without allocating host-side state.
-    const handle = if (memory.?.cpu_memory != 0) memory.?.cpu_memory else @intFromPtr(config.?);
+    // The handle is opaque to the title, which only hands it back, but it has
+    // to tell one decoder from another. Neither field of the record it passes
+    // can: this reports no working memory, so `cpu_memory` stays zero, and the
+    // configuration is built on the caller's stack, so two decoders created
+    // from the same call site share an address. A title that holds two at once
+    // then drives both through whichever was created first, which breaks the
+    // stream each of them is following. Issue a token of this module's own.
+    next_decoder_token +%= 1;
+    const handle = decoder_token_base | next_decoder_token;
     output.?.* = handle;
     const settings = config.?;
     if (settings.max_frame_width > 0 and settings.max_frame_height > 0) {
         _ = h264.ensureDecoder(
+            handle,
             @intCast(settings.max_frame_width),
             @intCast(settings.max_frame_height),
         );
@@ -262,7 +275,7 @@ pub fn deleteDecoder(decoder: u64) callconv(abi.guest) i32 {
     if (decoder == 0) return error_decoder_instance;
     last_picture_timestamp_ns = null;
     published_pictures = 0;
-    h264.destroyDecoder();
+    h264.destroyDecoder(decoder);
     return errno.ok;
 }
 
@@ -272,6 +285,7 @@ pub fn deleteDecoder(decoder: u64) callconv(abi.guest) i32 {
 /// Returning false is the ordinary case early in a stream: H.264 needs several
 /// units before a first picture, and reordering delays later ones.
 fn publishDecodedPicture(
+    decoder: u64,
     input: *const InputData,
     frame: *FrameBuffer,
     output: *OutputInfo,
@@ -281,7 +295,12 @@ fn publishDecodedPicture(
     if (!kernel_memory.isGuestRangeAccessible(input.au_data, input.au_size)) return false;
     const unit: [*]const u8 = @ptrFromInt(input.au_data);
 
-    const picture = h264.decodeAccessUnit(unit[0..unit_length], 0) orelse return false;
+    const picture = h264.decodeAccessUnit(decoder, unit[0..unit_length], 0) orelse return false;
+    return handOverPicture(picture, frame, output);
+}
+
+/// Copies one decoded picture into the slot the title lent and describes it.
+fn handOverPicture(picture: h264.Picture, frame: *FrameBuffer, output: *OutputInfo) bool {
     if (frame.frame_buffer == 0) return false;
     const capacity = std.math.cast(usize, frame.frame_buffer_size) orelse return false;
     if (capacity < picture.bytes.len) return false;
@@ -369,11 +388,17 @@ pub fn decode(
             .{ unit.au_size, frame.?.frame_buffer, frame.?.frame_buffer_size, kinds[0..kind_count], prefix[0..readable] },
         );
     }
-    if (publishDecodedPicture(input.?, frame.?, output.?)) return errno.ok;
+    if (publishDecodedPicture(decoder, input.?, frame.?, output.?)) return errno.ok;
     fillNoPicture(frame.?, output.?);
     return errno.ok;
 }
 
+/// Hands back what the decoder still holds once a title stops feeding it.
+///
+/// A title plays a clip to its end by submitting every access unit and then
+/// asking here for the pictures the decoder was holding back to reorder.
+/// Answering "no picture" to all of those drops the tail of the clip, and a
+/// title waiting for it never moves on to the next one.
 pub fn flush(
     decoder: u64,
     frame: ?*FrameBuffer,
@@ -382,6 +407,17 @@ pub fn flush(
     if (decoder == 0) return error_decoder_instance;
     if (!accessible(frame) or !accessible(output)) return error_argument_pointer;
     fillNoPicture(frame.?, output.?);
+    const drained = h264.drainPicture(decoder);
+    if (drained) |picture| {
+        _ = handOverPicture(picture, frame.?, output.?);
+    }
+    drain_requests += 1;
+    if (drain_requests <= 12) {
+        std.debug.print(
+            "[videodec] drain #{d}: {s}\n",
+            .{ drain_requests, if (drained != null) "picture" else "nothing left" },
+        );
+    }
     return errno.ok;
 }
 
@@ -390,7 +426,7 @@ pub fn reset(decoder: u64) callconv(abi.guest) i32 {
     // Everything already handed over belongs to the position being left.
     last_picture_timestamp_ns = null;
     published_pictures = 0;
-    h264.flushDecoder();
+    h264.flushDecoder(decoder);
     return errno.ok;
 }
 
