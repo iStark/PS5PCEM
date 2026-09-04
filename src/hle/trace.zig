@@ -174,7 +174,74 @@ const windows = struct {
         thread: std.os.windows.HANDLE,
         context: *std.os.windows.CONTEXT,
     ) callconv(.winapi) c_int;
+    extern "kernel32" fn VirtualQuery(
+        address: ?*const anyopaque,
+        information: *MemoryBasicInformation,
+        length: usize,
+    ) callconv(.winapi) usize;
 };
+
+/// What VirtualQuery reports about one mapping.
+const MemoryBasicInformation = extern struct {
+    base_address: u64,
+    allocation_base: u64,
+    allocation_protect: u32,
+    partition_id: u16,
+    reserved: u16,
+    region_size: u64,
+    state: u32,
+    protect: u32,
+    kind: u32,
+    padding: u32,
+};
+
+const memory_commit: u32 = 0x1000;
+const page_no_access: u32 = 0x01;
+const page_guard: u32 = 0x100;
+
+/// Whether a range can be read without faulting.
+///
+/// Everything below inspects a suspended thread, so every address it follows
+/// comes from a register whose meaning is a guess. A guess that is wrong must
+/// leave the emulator running: a diagnostic that reports why a title went
+/// quiet is worthless if reading it is what ends the run.
+fn readableRange(address: u64, length: usize) bool {
+    if (comptime builtin.os.tag != .windows) return false;
+    if (address == 0 or length == 0) return false;
+    const last = @addWithOverflow(address, length - 1);
+    if (last[1] != 0) return false;
+
+    var scanned = address;
+    while (scanned <= last[0]) {
+        var information: MemoryBasicInformation = undefined;
+        const written = windows.VirtualQuery(
+            @ptrFromInt(scanned),
+            &information,
+            @sizeOf(MemoryBasicInformation),
+        );
+        if (written == 0) return false;
+        if (information.state != memory_commit) return false;
+        // Guard pages fault on the first touch by design, and no-access pages
+        // fault always. Either ends the run as surely as unmapped memory.
+        if (information.protect & (page_no_access | page_guard) != 0) {
+            return false;
+        }
+        const region_end = information.base_address + information.region_size;
+        if (region_end <= scanned) return false;
+        scanned = region_end;
+    }
+    return true;
+}
+
+test "an unreadable range is refused before anything dereferences it" {
+    // A register holding a small integer, a null, or an address that wraps is
+    // what a wrong guess looks like, and each has to be refused rather than
+    // followed.
+    try std.testing.expect(!readableRange(0, 8));
+    try std.testing.expect(!readableRange(0x1000, 0));
+    try std.testing.expect(!readableRange(std.math.maxInt(u64), 8));
+    try std.testing.expect(!readableRange(0x431bde82d7b634db, 4));
+}
 
 /// Prints where a guest thread is executing and what it is holding.
 ///
@@ -221,7 +288,7 @@ pub fn reportGuestThreadContext(slot: usize) void {
         // rather than inferred.
         var index: u32 = 0;
         var polled: u64 = 0;
-        if (again.R15 != 0) {
+        if (again.R15 != 0 and readableRange(again.R15 + 0xb4, @sizeOf(u32))) {
             const field: *const u32 = @ptrFromInt(again.R15 + 0xb4);
             index = field.*;
         }
@@ -250,9 +317,16 @@ pub fn reportGuestThreadContext(slot: usize) void {
     // address it reads, which the register dump above then resolves. Start at
     // the instruction pointer itself: that page is executing, so it is
     // readable, while stepping backwards could leave it.
+    // The page is executing, but the window read here can still run off
+    // its end, so it is checked like any other.
+    const window = 24;
+    if (!readableRange(context.Rip, window)) {
+        std.debug.print("  [thread {d}] code@rip: unreadable\n", .{slot});
+        return;
+    }
     const code: [*]const u8 = @ptrFromInt(context.Rip);
     std.debug.print("  [thread {d}] code@rip:", .{slot});
-    for (code[0..24]) |byte| std.debug.print(" {x:0>2}", .{byte});
+    for (code[0..window]) |byte| std.debug.print(" {x:0>2}", .{byte});
     std.debug.print("\n", .{});
 }
 
