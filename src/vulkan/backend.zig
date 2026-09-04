@@ -759,6 +759,8 @@ const maximum_completed_frames = 16;
 // those targets resident and lets the existing direct sampled-target path bind
 // the same Vulkan image for the next pass.
 const maximum_changed_content_reports: usize = 24;
+/// Shortest gap between two presentations of a decoded movie frame.
+const minimum_video_present_interval_ns: u64 = 16_666_667;
 const maximum_scanout_content_reports: usize = 16;
 
 /// One upload's identity and content. Two views of the same allocation differ
@@ -3009,6 +3011,7 @@ pub const Renderer = struct {
     /// Counts decoded frames that reached the display, so the decoder can
     /// pace itself against what is actually seen.
     presented_video_frames: std.atomic.Value(u64) = .init(0),
+    last_video_present_ns: u64 = 0,
     pending_video_mutex: Lock = .{},
     pending_video_rgba: std.ArrayListUnmanaged(u8) = .empty,
     pending_video_width: u32 = 0,
@@ -14599,6 +14602,34 @@ pub const Renderer = struct {
         self.video_surface_last_flip = self.flip_callbacks;
     }
 
+    /// Advances a decoded movie without waiting for the title's next flip.
+    ///
+    /// Presenting only on a flip ties a clip to the rate the title draws its
+    /// own frames, which while those cost seconds each is far below the rate
+    /// the movie was recorded at. The title submits work many times per flip
+    /// and does so on this thread, so stepping the movie here needs no locking
+    /// and gives it a cadence of its own.
+    fn pumpVideoPresentation(self: *Renderer) void {
+        if (self.window_presentation == null) return;
+        self.pending_video_mutex.lock();
+        const ready = self.pending_video_ready;
+        self.pending_video_mutex.unlock();
+        if (!ready) return;
+
+        // Submissions are far more frequent than any display, so the movie is
+        // held to a display cadence rather than presented once per submission.
+        const now = hostTimestampNs();
+        if (now -| self.last_video_present_ns < minimum_video_present_interval_ns) return;
+        self.last_video_present_ns = now;
+
+        self.uploadPendingVideoFrame() catch return;
+        const index = self.latest_video_render_target_index orelse return;
+        if (index >= self.render_targets.items.len) return;
+        if (!self.render_targets.items[index].initialized) return;
+        self.blitRenderTargetToSwapchain(index) catch return;
+        _ = self.presented_video_frames.fetchAdd(1, .release);
+    }
+
     fn prepareGraphicsResources(
         self: *Renderer,
         bindings: *const gpu.ShaderBindings,
@@ -16918,6 +16949,7 @@ pub const Renderer = struct {
         self.pending_descriptor_slots.clearRetainingCapacity();
         self.draw_upload_cache.clearRetainingCapacity();
         self.frame_profile.submits += 1;
+        self.pumpVideoPresentation();
         if (self.timeline_scheduler_enabled) {
             try self.refreshGpuProgress();
         } else {

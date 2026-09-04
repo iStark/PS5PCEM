@@ -71,7 +71,11 @@ var submitted_pictures: u64 = 0;
 /// Longest a decode call is held for the display before giving up on it.
 const maximum_pacing_wait_ms: u32 = 250;
 var last_picture_timestamp_ns: ?u64 = null;
-const target_frame_interval_ns: u64 = 16_666_667; // ~60 FPS (16.666 ms)
+/// A clip's own cadence. Nothing here reads the rate out of the stream, and a
+/// splash reel is recorded at 30 frames a second far more often than 60, so
+/// that is the assumption: guessing high runs every such clip at double
+/// speed, while guessing low only makes a faster one play gently slow.
+const target_frame_interval_ns: u64 = 33_333_333;
 
 pub const VideoFrameSink = struct {
     context: ?*anyopaque = null,
