@@ -21,6 +21,10 @@ const error_output_info: i32 = @bitCast(@as(u32, 0x811d_010f));
 
 const minimum_memory_size: u64 = 16 * 1024 * 1024;
 
+/// Size reported for one decoded-frame slot. Any nonzero value serves; a
+/// zero makes a title divide its frame arena by it.
+const frame_slot_size: u64 = 0x1000;
+
 const ComputeMemoryInfo = extern struct {
     this_size: u64,
     cpu_gpu_memory_size: u64,
@@ -119,6 +123,11 @@ fn accessible(pointer: anytype) bool {
     return kernel_memory.isGuestRangeAccessible(@intFromPtr(value), @sizeOf(T));
 }
 
+/// Reports how much backing a compute queue needs.
+///
+/// The title allocates from the size reported here and stores the result in
+/// the same record before allocating the queue, so leaving the size alone
+/// makes it allocate nothing and the allocation is then refused.
 pub fn queryComputeMemoryInfo(info: ?*ComputeMemoryInfo) callconv(abi.guest) i32 {
     if (!accessible(info)) return error_argument_pointer;
     info.?.cpu_gpu_memory_size = minimum_memory_size;
@@ -150,15 +159,15 @@ pub fn queryDecoderMemoryInfo(
 ) callconv(abi.guest) i32 {
     if (!accessible(config) or !accessible(memory)) return error_argument_pointer;
     const output = memory.?;
-    output.cpu_memory_size = minimum_memory_size;
-    output.cpu_memory = 0;
-    output.gpu_memory_size = minimum_memory_size;
-    output.gpu_memory = 0;
-    output.cpu_gpu_memory_size = minimum_memory_size;
-    output.cpu_gpu_memory = 0;
-    output.max_frame_buffer_size = minimum_memory_size;
-    output.frame_buffer_alignment = 0x100;
-    output.reserved0 = 0;
+    // Only the sizes this can actually speak for. A decoder that runs on the
+    // host needs no guest-side working memory, and claiming some makes the
+    // title reserve arenas for a decode that never touches them.
+    output.cpu_memory_size = 0;
+    output.cpu_gpu_memory_size = 0;
+    // The frame-slot size is the one figure the title cannot do without: it
+    // divides its frame arena by this to decide how many pictures it can hold,
+    // so a zero here ends the setup before a single frame is decoded.
+    output.max_frame_buffer_size = frame_slot_size;
     return errno.ok;
 }
 
@@ -234,6 +243,32 @@ pub fn getPictureInfo(
 ) callconv(abi.guest) i32 {
     if (!accessible(output) or first == 0) return error_argument_pointer;
     return error_output_info;
+}
+
+test "a decoder reports a usable frame-slot size and claims no working memory" {
+    var config = std.mem.zeroes(DecoderConfigInfo);
+    var info = std.mem.zeroes(DecoderMemoryInfo);
+    info.cpu_memory_size = 0xdead;
+    info.cpu_gpu_memory_size = 0xbeef;
+
+    try std.testing.expectEqual(errno.ok, queryDecoderMemoryInfo(&config, &info));
+
+    // The title divides its frame arena by this to decide how many pictures it
+    // can hold. A zero ends the setup before it decodes anything, which is how
+    // Yotei's splash never reached sceVideodec2Decode.
+    try std.testing.expect(info.max_frame_buffer_size != 0);
+    // A host-side decoder needs no guest working memory, and claiming some
+    // makes the title reserve arenas nothing ever writes to.
+    try std.testing.expectEqual(@as(u64, 0), info.cpu_memory_size);
+    try std.testing.expectEqual(@as(u64, 0), info.cpu_gpu_memory_size);
+}
+
+test "a compute queue is told how much backing to allocate" {
+    var info = std.mem.zeroes(ComputeMemoryInfo);
+    try std.testing.expectEqual(errno.ok, queryComputeMemoryInfo(&info));
+    // The title allocates from this and stores the result before allocating
+    // the queue; leaving it at zero makes that allocation refused.
+    try std.testing.expect(info.cpu_gpu_memory_size != 0);
 }
 
 test "Videodec2 ABI records retain SDK sizes" {
