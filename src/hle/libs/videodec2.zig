@@ -42,6 +42,7 @@ fn decodedFrameSlotSize(config: *const DecoderConfigInfo) u64 {
 
 var announced_decoders: u8 = 0;
 var announced_units: u8 = 0;
+var published_pictures: u32 = 0;
 
 const ComputeMemoryInfo = extern struct {
     this_size: u64,
@@ -262,6 +263,13 @@ fn publishDecodedPicture(
     const destination: [*]u8 = @ptrFromInt(frame.frame_buffer);
     @memcpy(destination[0..picture.bytes.len], picture.bytes);
 
+    published_pictures += 1;
+    if (published_pictures <= 4 or published_pictures % 32 == 0) {
+        std.debug.print(
+            "[videodec] published picture #{d} into 0x{x}\n",
+            .{ published_pictures, frame.frame_buffer },
+        );
+    }
     frame.is_accepted = 1;
     output.is_valid = 1;
     output.is_error_frame = 0;
