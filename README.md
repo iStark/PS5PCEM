@@ -60,6 +60,13 @@ and keeps portable settings and savedata beside the application.
       <sub>The Precinct — title menu and new-game prompt</sub>
     </td>
   </tr>
+  <tr>
+    <td width="50%" align="center">
+      <img src="docs/images/yotei-intro-video.png" alt="Ghost of Yotei intro video decoded and presented by PS5PCEM"><br>
+      <sub>Ghost of Yotei — intro video, decoded and presented</sub>
+    </td>
+    <td width="50%" align="center"></td>
+  </tr>
 </table>
 
 These are development captures, not compatibility ratings. See the
@@ -78,8 +85,10 @@ for the exact scope and current limits of every claim.
   XInput and keyboard fallbacks, and launcher-managed input profiles.
 
 The detailed implementation status lives in
-[Project status and compatibility](docs/project-status.md); subsystem internals
-are indexed in the [architecture documentation](docs/README.md#architecture).
+[Implementation status](docs/implementation-status.md), the observed title
+milestones in [Project status and compatibility](docs/project-status.md), and
+subsystem internals are indexed in the
+[architecture documentation](docs/README.md#architecture).
 
 ## Download
 
@@ -109,7 +118,8 @@ Games, firmware, keys, system libraries, and console software are not included.
 |---|---|
 | [Documentation index](docs/README.md) | Complete map of user and developer documentation |
 | [Building and command-line usage](docs/getting-started.md) | Zig builds, tools, packaging, CLI usage, and library integration |
-| [Project status and compatibility](docs/project-status.md) | Detailed capabilities, screenshots, measured title milestones, and limits |
+| [Project status and compatibility](docs/project-status.md) | Screenshots, measured title milestones, and current limits |
+| [Implementation status](docs/implementation-status.md) | What the emulator can do, subsystem by subsystem |
 | [Architecture](docs/README.md#architecture) | RDNA2, GPU, Vulkan, memory, loader, HLE, CPU, diagnostics, and runtime internals |
 | [Release notes](docs/release-notes/v0.3.0-alpha.2.md) | Changes in the latest packaged prototype |
 | [License and legal note](docs/legal.md) | GPL obligations, bundled dependencies, and project scope |
