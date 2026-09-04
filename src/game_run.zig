@@ -662,6 +662,7 @@ fn run(init: std.process.Init) !bool {
         runtime.firmware.libs.videodec2.attachVideoFrameSink(.{
             .context = video_sink.context,
             .submit = video_sink.submit,
+            .presented = video_sink.presented,
         });
         try out.print("  Vulkan  {s} ({d}x{d} VideoOut window)\n", .{
             renderer.device_info.name(),

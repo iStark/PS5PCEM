@@ -253,6 +253,14 @@ pub const PresentationSink = struct {
 pub const VideoFrameSink = struct {
     context: ?*anyopaque = null,
     submit: *const fn (?*anyopaque, u32, u32, u32, []const u8) void,
+    /// How many decoded frames have actually reached the display.
+    ///
+    /// A title decodes as fast as its pictures are accepted, which is far
+    /// faster than they can be shown while frames are expensive. Without a way
+    /// to tell how many were shown, a decoder can only pace itself against a
+    /// clock, and a clip then runs to its end while only a fraction of it has
+    /// appeared.
+    presented: *const fn (?*anyopaque) u64,
 };
 
 /// Receives the rolling guest flip rate in tenths of a frame per second.
@@ -2993,6 +3001,14 @@ pub const Renderer = struct {
     video_surface_count: usize = 0,
     video_surface_last_flip: u64 = 0,
     latest_video_render_target_index: ?usize = null,
+    /// Whether the last flip went to the decoded-video surface, so the
+    /// moment presentation changes hands is reported once rather than
+    /// every frame.
+    was_presenting_video: bool = false,
+    video_presentation_reports: usize = 0,
+    /// Counts decoded frames that reached the display, so the decoder can
+    /// pace itself against what is actually seen.
+    presented_video_frames: std.atomic.Value(u64) = .init(0),
     pending_video_mutex: Lock = .{},
     pending_video_rgba: std.ArrayListUnmanaged(u8) = .empty,
     pending_video_width: u32 = 0,
@@ -3783,7 +3799,16 @@ pub const Renderer = struct {
     /// Provides a sink that receives decoded video frames directly from HLE codecs
     /// and stages them for presentation on the host swapchain.
     pub fn videoFrameSink(self: *Renderer) VideoFrameSink {
-        return .{ .context = self, .submit = submitVideoFrameCallback };
+        return .{
+            .context = self,
+            .submit = submitVideoFrameCallback,
+            .presented = presentedVideoFramesCallback,
+        };
+    }
+
+    fn presentedVideoFramesCallback(context: ?*anyopaque) u64 {
+        const self: *Renderer = @ptrCast(@alignCast(context.?));
+        return self.presented_video_frames.load(.acquire);
     }
 
     fn submitVideoFrameCallback(
@@ -10558,25 +10583,37 @@ pub const Renderer = struct {
     /// Every draw is fenced before it returns, so the recycled attachment
     /// cannot still be executing.
     fn evictRenderTarget(self: *Renderer) anyerror!usize {
-        var oldest_index: usize = 0;
-        var oldest_sequence = self.render_targets.items[0].last_used_sequence;
-        for (self.render_targets.items[1..], 1..) |entry, index| {
-            if (entry.last_used_sequence >= oldest_sequence) continue;
+        // A surface being presented is not a candidate, however long ago it was
+        // last written. The decoded-video target is one the guest never binds,
+        // so it only counts as used when a new picture arrives and it loses
+        // every least-recently-used race against the title's own attachments.
+        // Evicting it mid-clip drops presentation back to the scanout, which is
+        // what turned a playing movie black as soon as a frame uploaded enough
+        // textures to fill this cache.
+        var oldest_index: ?usize = null;
+        var oldest_sequence: u64 = 0;
+        for (self.render_targets.items, 0..) |entry, index| {
+            if (self.latest_video_render_target_index) |presenting| {
+                if (index == presenting) continue;
+            }
+            if (oldest_index != null and entry.last_used_sequence >= oldest_sequence) continue;
             oldest_index = index;
             oldest_sequence = entry.last_used_sequence;
         }
-        try self.materializeRenderTarget(oldest_index);
-        const victim = self.render_targets.items[oldest_index];
+        // Every entry was spoken for, so the presented one has to go after all.
+        const chosen = oldest_index orelse 0;
+        try self.materializeRenderTarget(chosen);
+        const victim = self.render_targets.items[chosen];
         self.destroyCachedRenderTarget(victim);
         // The evicted slot is about to hold an unrelated attachment, so a
         // recorded "most recent" index pointing at it would name the wrong one.
         if (self.latest_render_target_index) |latest| {
-            if (latest == oldest_index) self.latest_render_target_index = null;
+            if (latest == chosen) self.latest_render_target_index = null;
         }
         if (self.latest_video_render_target_index) |latest| {
-            if (latest == oldest_index) self.latest_video_render_target_index = null;
+            if (latest == chosen) self.latest_video_render_target_index = null;
         }
-        return oldest_index;
+        return chosen;
     }
 
     /// Says when the bytes behind one address stop matching what was uploaded from
@@ -18515,10 +18552,25 @@ pub const Renderer = struct {
             // into its older camera target, present the newest proven video
             // surface directly. The override expires as soon as planar video
             // draws stop, so menus/gameplay resume using the requested buffer.
-            if (self.window_presentation != null and
+            const presenting_video = self.window_presentation != null and
                 self.latest_video_render_target_index != null and
-                self.flip_callbacks -| self.video_surface_last_flip <= 2)
-            {
+                self.flip_callbacks -| self.video_surface_last_flip <= 2;
+            if (presenting_video != self.was_presenting_video) {
+                self.was_presenting_video = presenting_video;
+                if (self.video_presentation_reports < 16) {
+                    self.video_presentation_reports += 1;
+                    std.debug.print(
+                        "[vulkan dcb] flip #{d} {s} video (target={any}, last_video_flip={d})\n",
+                        .{
+                            self.flip_callbacks,
+                            if (presenting_video) "now presents" else "stopped presenting",
+                            self.latest_video_render_target_index,
+                            self.video_surface_last_flip,
+                        },
+                    );
+                }
+            }
+            if (presenting_video) {
                 const video_index = self.latest_video_render_target_index.?;
                 if (video_index < self.render_targets.items.len and
                     self.render_targets.items[video_index].initialized)
@@ -18553,6 +18605,10 @@ pub const Renderer = struct {
                             .{ self.render_targets.items[video_index].target.descriptor.address, self.flip_callbacks, self.presented_frames },
                         );
                     }
+                    // One decoded frame has now reached the display, which is what
+                    // the decoder waits on before letting the title hand over the
+                    // next one.
+                    _ = self.presented_video_frames.fetchAdd(1, .release);
                     self.presented_frames += 1;
                     self.last_flip_error = null;
                     return true;

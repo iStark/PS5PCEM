@@ -66,12 +66,19 @@ var published_pictures: u32 = 0;
 const decoder_token_base: u64 = 0x5644_4543_0000_0000;
 var next_decoder_token: u64 = 0;
 var drain_requests: u32 = 0;
+/// Pictures handed to the display, which the next one waits behind.
+var submitted_pictures: u64 = 0;
+/// Longest a decode call is held for the display before giving up on it.
+const maximum_pacing_wait_ms: u32 = 250;
 var last_picture_timestamp_ns: ?u64 = null;
 const target_frame_interval_ns: u64 = 16_666_667; // ~60 FPS (16.666 ms)
 
 pub const VideoFrameSink = struct {
     context: ?*anyopaque = null,
     submit: *const fn (?*anyopaque, u32, u32, u32, []const u8) void,
+    /// How many handed-over pictures have actually reached the display, which
+    /// is what the next one waits behind.
+    presented: *const fn (?*anyopaque) u64,
 };
 
 var global_frame_sink: ?VideoFrameSink = null;
@@ -299,6 +306,40 @@ fn publishDecodedPicture(
     return handOverPicture(picture, frame, output);
 }
 
+/// Holds the title back until the picture handed over last has been shown.
+///
+/// A title decodes as fast as its pictures are accepted, which while frames are
+/// expensive is far faster than they can be displayed. Pacing against a clock
+/// alone does not help: the clip still runs to its end, and only the fraction
+/// of it that happened to land on a flip is ever seen. Waiting for the display
+/// makes the title advance a frame at a time, so the whole clip plays.
+///
+/// The wait is bounded. Presentation can stop for reasons that have nothing to
+/// do with this -- a headless run, a window that is not drawing -- and a title
+/// blocked forever in its decoder is worse than one whose movie runs fast.
+fn waitForPreviousPicture() void {
+    const sink = global_frame_sink orelse return;
+    const target = submitted_pictures;
+    var waited_ms: u32 = 0;
+    while (sink.presented(sink.context) < target and waited_ms < maximum_pacing_wait_ms) {
+        Sleep(1);
+        waited_ms += 1;
+    }
+    // A clip still has a rate of its own, so a display faster than the movie
+    // does not run it early.
+    const now = hostTimestampNs();
+    if (last_picture_timestamp_ns) |last| {
+        if (now > last) {
+            const elapsed = now - last;
+            if (elapsed < target_frame_interval_ns) {
+                Sleep(@intCast(@max(1, (target_frame_interval_ns - elapsed) / 1_000_000)));
+            }
+        }
+    }
+    last_picture_timestamp_ns = hostTimestampNs();
+    submitted_pictures += 1;
+}
+
 /// Copies one decoded picture into the slot the title lent and describes it.
 fn handOverPicture(picture: h264.Picture, frame: *FrameBuffer, output: *OutputInfo) bool {
     if (frame.frame_buffer == 0) return false;
@@ -306,18 +347,7 @@ fn handOverPicture(picture: h264.Picture, frame: *FrameBuffer, output: *OutputIn
     if (capacity < picture.bytes.len) return false;
     if (!kernel_memory.isGuestRangeAccessible(frame.frame_buffer, picture.bytes.len)) return false;
 
-    // Pace decode to real-time presentation (~60 FPS) to prevent instant drain
-    if (last_picture_timestamp_ns) |last_ts| {
-        const now = hostTimestampNs();
-        if (now > last_ts) {
-            const elapsed = now - last_ts;
-            if (elapsed < target_frame_interval_ns) {
-                const sleep_ms: u32 = @intCast(@max(1, (target_frame_interval_ns - elapsed) / 1_000_000));
-                Sleep(sleep_ms);
-            }
-        }
-    }
-    last_picture_timestamp_ns = hostTimestampNs();
+    waitForPreviousPicture();
 
     const destination: [*]u8 = @ptrFromInt(frame.frame_buffer);
     @memcpy(destination[0..picture.bytes.len], picture.bytes);
