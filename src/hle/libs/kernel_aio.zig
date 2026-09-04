@@ -100,15 +100,28 @@ fn isValidIdentifier(identifier: i32) bool {
     return identifier > 0 and identifier < queue_size;
 }
 
-/// Claims a batch slot, reusing the oldest when the table wraps.
+/// Claims a free batch slot, or zero when every slot is still held.
+///
+/// The search skips slots a title has not deleted yet. Handing out an
+/// identifier that is still outstanding makes two batches share one slot: the
+/// older batch then reports the newer one's state, deleting either frees the
+/// slot both believe they own, and the survivor's own delete fails. A title
+/// that streams keeps requests alive across many submissions, so a table this
+/// size wraps onto live entries during ordinary loading rather than only under
+/// abuse.
 fn claimIdentifier() i32 {
     table_lock.lock();
     defer table_lock.unlock();
-    const identifier = next_identifier;
-    next_identifier += 1;
-    if (next_identifier >= queue_size) next_identifier = 1;
-    batches[identifier] = state_processing;
-    return @intCast(identifier);
+    var examined: usize = 0;
+    while (examined < queue_size - 1) : (examined += 1) {
+        const identifier = next_identifier;
+        next_identifier += 1;
+        if (next_identifier >= queue_size) next_identifier = 1;
+        if (batches[identifier] != 0) continue;
+        batches[identifier] = state_processing;
+        return @intCast(identifier);
+    }
+    return 0;
 }
 
 fn setBatchState(identifier: i32, value: u32) void {
@@ -196,7 +209,11 @@ fn submit(
         if (request.result == null) return KernelError.efault.raw();
     }
 
+    // Every slot outstanding is a real condition for a caller to see, and the
+    // interface has an answer for it. Carrying on with a stolen identifier
+    // would corrupt the batch a title still holds.
     const identifier = claimIdentifier();
+    if (identifier == 0) return KernelError.eagain.raw();
     for (batch[0..total]) |*request| {
         if (writing) refuseWrite(request) else performRead(request);
     }
@@ -420,12 +437,53 @@ test "identifiers wrap without ever handing out the reserved one" {
         .descriptor = -1,
     };
 
+    // Deleting each batch returns its slot, so the table wraps indefinitely.
     for (0..queue_size + 4) |_| {
         var identifier: i32 = 0;
         try testing.expectEqual(errno.ok, submitReadCommands(@ptrCast(&request), 1, 0, &identifier));
         try testing.expect(identifier > 0);
         try testing.expect(identifier < queue_size);
+        var status: i32 = 0;
+        try testing.expectEqual(errno.ok, deleteRequest(identifier, &status));
     }
+}
+
+test "an outstanding batch keeps its identifier until it is deleted" {
+    reset();
+    var record = Result{ .return_value = 0, .state = 0 };
+    var request = Request{
+        .offset = 0,
+        .length = 8,
+        .buffer = null,
+        .result = &record,
+        .descriptor = -1,
+    };
+
+    // A title that streams holds batches open across many submissions. Reusing
+    // a live identifier would make two batches share one slot, so the table
+    // fills up instead and says so.
+    var seen: [queue_size]bool = @splat(false);
+    var held: usize = 0;
+    while (held < queue_size - 1) : (held += 1) {
+        var identifier: i32 = 0;
+        try testing.expectEqual(errno.ok, submitReadCommands(@ptrCast(&request), 1, 0, &identifier));
+        try testing.expect(identifier > 0);
+        try testing.expect(!seen[@intCast(identifier)]);
+        seen[@intCast(identifier)] = true;
+    }
+
+    var overflow: i32 = 0;
+    try testing.expectEqual(
+        KernelError.eagain.raw(),
+        submitReadCommands(@ptrCast(&request), 1, 0, &overflow),
+    );
+
+    // Releasing one makes exactly that slot available again.
+    var status: i32 = 0;
+    try testing.expectEqual(errno.ok, deleteRequest(7, &status));
+    var reused: i32 = 0;
+    try testing.expectEqual(errno.ok, submitReadCommands(@ptrCast(&request), 1, 0, &reused));
+    try testing.expectEqual(@as(i32, 7), reused);
 }
 
 test "asynchronous read exports register under published identifiers" {
