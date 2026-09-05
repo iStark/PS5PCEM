@@ -1269,6 +1269,22 @@ fn fillStat(out: *Stat, size: u64, is_directory: bool) void {
     out.blocks = @intCast((size + 511) / 512);
 }
 
+fn guestTimespec(timestamp: std.Io.Timestamp) Timespec {
+    return .{
+        .seconds = @intCast(@divFloor(timestamp.nanoseconds, std.time.ns_per_s)),
+        .nanoseconds = @intCast(@mod(timestamp.nanoseconds, std.time.ns_per_s)),
+    };
+}
+
+fn fillHostStat(out: *Stat, info: std.Io.File.Stat) void {
+    fillStat(out, info.size, info.kind == .directory);
+    // Resource catalogs use mtime to decide whether to read their contents.
+    // Reporting zero makes the first lookup match an uninitialized cache.
+    out.mtim = guestTimespec(info.mtime);
+    out.ctim = guestTimespec(info.ctime);
+    if (info.atime) |atime| out.atim = guestTimespec(atime);
+}
+
 /// Describes a device as what it is: a character device of no length.
 ///
 /// A caller that checks before opening is deciding whether the device exists,
@@ -1314,7 +1330,7 @@ pub fn stat(path: []const u8, out: *Stat) Error!void {
         },
         else => return Error.IoFailed,
     };
-    fillStat(out, info.size, info.kind == .directory);
+    fillHostStat(out, info);
 }
 
 pub fn fstat(descriptor: i32, out: *Stat) Error!void {
@@ -1327,7 +1343,15 @@ pub fn fstat(descriptor: i32, out: *Stat) Error!void {
         fillDeviceStat(out);
         return;
     }
-    fillStat(out, entry.size, entry.directory != null or entry.diagnostic_directory);
+    if (entry.file) |file| {
+        const io = active_io orelse return Error.NotAttached;
+        fillHostStat(out, file.stat(io) catch return Error.IoFailed);
+    } else if (entry.directory) |directory| {
+        const io = active_io orelse return Error.NotAttached;
+        fillHostStat(out, directory.stat(io) catch return Error.IoFailed);
+    } else {
+        fillStat(out, entry.size, entry.diagnostic_directory);
+    }
     if (entry.diagnostic_log) out.mode = mode_ifreg | mode_read_write;
 }
 
@@ -1669,15 +1693,28 @@ test "metadata is reported for paths and descriptors" {
     try stat("/app0/data.bin", &info);
     try testing.expectEqual(@as(i64, 10), info.size);
     try testing.expect(info.mode & mode_ifreg != 0);
+    const host_file = try fixture.tmp.dir.statFile(testing.io, "data.bin", .{});
+    try testing.expect(host_file.mtime.nanoseconds != 0);
+    try testing.expectEqual(host_file.mtime.nanoseconds, @as(i96, info.mtim.seconds) * std.time.ns_per_s + info.mtim.nanoseconds);
+    try testing.expectEqual(host_file.ctime.nanoseconds, @as(i96, info.ctim.seconds) * std.time.ns_per_s + info.ctim.nanoseconds);
 
     try stat("/app0/sub", &info);
     try testing.expect(info.mode & mode_ifdir != 0);
+    const host_dir = try fixture.tmp.dir.statFile(testing.io, "sub", .{});
+    try testing.expectEqual(host_dir.mtime.nanoseconds, @as(i96, info.mtim.seconds) * std.time.ns_per_s + info.mtim.nanoseconds);
 
     const fd = try open("/app0/data.bin", O.rdonly);
     defer close(fd) catch {};
     var by_descriptor = Stat{};
     try fstat(fd, &by_descriptor);
     try testing.expectEqual(@as(i64, 10), by_descriptor.size);
+    try testing.expectEqual(host_file.mtime.nanoseconds, @as(i96, by_descriptor.mtim.seconds) * std.time.ns_per_s + by_descriptor.mtim.nanoseconds);
+    try testing.expectEqual(host_file.ctime.nanoseconds, @as(i96, by_descriptor.ctim.seconds) * std.time.ns_per_s + by_descriptor.ctim.nanoseconds);
+}
+
+test "guest file timestamps retain fractions before and after the epoch" {
+    try testing.expectEqual(Timespec{ .seconds = 1, .nanoseconds = 234_567_800 }, guestTimespec(.{ .nanoseconds = 1_234_567_800 }));
+    try testing.expectEqual(Timespec{ .seconds = -1, .nanoseconds = 999_999_900 }, guestTimespec(.{ .nanoseconds = -100 }));
 }
 
 test "writes are refused rather than silently dropped" {

@@ -13,7 +13,6 @@ const filesystem = @import("filesystem.zig");
 const memory = @import("libs/kernel_memory.zig");
 const errno = @import("errno.zig");
 
-pub const maximum_files: usize = 256;
 pub const maximum_path: usize = 1024;
 pub const maximum_command_buffers: usize = 32;
 pub const maximum_reads_per_buffer: usize = 32;
@@ -167,8 +166,12 @@ const Lock = struct {
 };
 
 var lock = Lock{};
-var files: [maximum_files]FileEntry = [_]FileEntry{.{}} ** maximum_files;
-var next_identifier: u32 = 1;
+// Resolved IDs live for the process, independently of the bounded descriptor
+// cache. A scene can reference thousands of files without opening them all.
+const file_allocator = std.heap.page_allocator;
+var files: std.ArrayList(FileEntry) = .empty;
+var file_paths: std.StringHashMapUnmanaged(u32) = .empty;
+var path_arena = std.heap.ArenaAllocator.init(file_allocator);
 var cached_file_count: usize = 0;
 var command_buffers: [maximum_command_buffers]CommandBuffer = [_]CommandBuffer{.{}} ** maximum_command_buffers;
 var submissions: [maximum_submissions]Submission = [_]Submission{.{}} ** maximum_submissions;
@@ -187,14 +190,18 @@ pub fn reset() void {
     var descriptors: [maximum_cached_files]i32 = undefined;
     var descriptor_count: usize = 0;
     lock.lock();
-    for (files) |entry| {
+    for (files.items) |entry| {
         if (entry.active and entry.descriptor >= 0 and descriptor_count < descriptors.len) {
             descriptors[descriptor_count] = entry.descriptor;
             descriptor_count += 1;
         }
     }
-    files = [_]FileEntry{.{}} ** maximum_files;
-    next_identifier = 1;
+    file_paths.deinit(file_allocator);
+    file_paths = .empty;
+    path_arena.deinit();
+    path_arena = std.heap.ArenaAllocator.init(file_allocator);
+    files.deinit(file_allocator);
+    files = .empty;
     cached_file_count = 0;
     command_buffers = [_]CommandBuffer{.{}} ** maximum_command_buffers;
     submissions = [_]Submission{.{}} ** maximum_submissions;
@@ -219,20 +226,18 @@ pub fn resolve(path: []const u8) Error!ResolvedFile {
 
     lock.lock();
     defer lock.unlock();
-    var free_slot: ?*FileEntry = null;
-    for (&files) |*entry| {
-        if (!entry.active) {
-            if (free_slot == null) free_slot = entry;
-            continue;
-        }
-        if (std.ascii.eqlIgnoreCase(entry.path(), path)) {
-            return .{ .identifier = entry.identifier, .size = entry.size };
-        }
+    var folded_path: [maximum_path]u8 = undefined;
+    const key = std.ascii.lowerString(&folded_path, path);
+    if (file_paths.get(key)) |identifier| {
+        const entry = findFileLocked(identifier).?;
+        return .{ .identifier = identifier, .size = entry.size };
     }
-    const entry = free_slot orelse return error.FileTableFull;
-    const identifier = next_identifier;
-    next_identifier +%= 1;
-    if (next_identifier == 0) next_identifier = 1;
+    if (files.items.len == std.math.maxInt(u32)) return error.FileTableFull;
+    files.ensureUnusedCapacity(file_allocator, 1) catch return error.IoFailed;
+    file_paths.ensureUnusedCapacity(file_allocator, 1) catch return error.IoFailed;
+    const owned_key = path_arena.allocator().dupe(u8, key) catch return error.IoFailed;
+    const identifier: u32 = @intCast(files.items.len + 1);
+    const entry = files.addOneAssumeCapacity();
     entry.* = .{
         .active = true,
         .identifier = identifier,
@@ -240,6 +245,7 @@ pub fn resolve(path: []const u8) Error!ResolvedFile {
         .path_length = path.len,
     };
     @memcpy(entry.path_bytes[0..path.len], path);
+    file_paths.putAssumeCapacityNoClobber(owned_key, identifier);
     return .{ .identifier = identifier, .size = entry.size };
 }
 
@@ -276,8 +282,7 @@ pub fn fileSize(identifier: u32) Error!u64 {
 pub fn read(identifier: u32, offset: u64, destination: []u8) Error!usize {
     var path_bytes: [maximum_path]u8 = undefined;
     lock.lock();
-    for (&files) |*entry| {
-        if (!entry.active or entry.identifier != identifier) continue;
+    if (findFileLocked(identifier)) |entry| {
         if (entry.descriptor >= 0) {
             const descriptor = entry.descriptor;
             lock.unlock();
@@ -298,8 +303,7 @@ pub fn read(identifier: u32, offset: u64, destination: []u8) Error!usize {
         var descriptor = opened;
         var transient = true;
         lock.lock();
-        for (&files) |*current| {
-            if (!current.active or current.identifier != identifier) continue;
+        if (findFileLocked(identifier)) |current| {
             if (current.descriptor >= 0) {
                 descriptor = current.descriptor;
             } else if (cached_file_count < maximum_cached_files) {
@@ -307,7 +311,6 @@ pub fn read(identifier: u32, offset: u64, destination: []u8) Error!usize {
                 cached_file_count += 1;
                 transient = false;
             }
-            break;
         } else {
             lock.unlock();
             filesystem.close(opened) catch {};
@@ -652,10 +655,8 @@ fn findCommandBufferLocked(address: u64) ?*CommandBuffer {
 }
 
 fn findFileLocked(identifier: u32) ?*FileEntry {
-    for (&files) |*entry| {
-        if (entry.active and entry.identifier == identifier) return entry;
-    }
-    return null;
+    if (identifier == 0 or identifier > files.items.len) return null;
+    return &files.items[identifier - 1];
 }
 
 test "resolved files keep stable process-local identifiers" {
@@ -683,6 +684,39 @@ test "resolved files keep stable process-local identifiers" {
     try std.testing.expectEqual(@as(i64, 10), info.size);
     try std.testing.expectEqual(@as(u64, 10), try fileSize(first.identifier));
     try std.testing.expectError(error.UnknownFile, stat(0xffff_ffff, &info));
+}
+
+test "APR scene file IDs grow without exhausting the descriptor cache" {
+    reset();
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const io = std.testing.io;
+    filesystem.attach(io, temporary.dir);
+    defer filesystem.detach();
+    defer reset();
+
+    var identifiers: [600]u32 = undefined;
+    for (&identifiers, 0..) |*identifier, index| {
+        var name_buffer: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "asset-{d}.bin", .{index});
+        const payload = [_]u8{@truncate(index)};
+        try temporary.dir.writeFile(io, .{ .sub_path = name, .data = &payload });
+        identifier.* = (try resolve(name)).identifier;
+        try std.testing.expectEqual(index + 1, identifier.*);
+    }
+    // Growth must preserve both earlier IDs and case-insensitive path keys.
+    for (identifiers, 0..) |identifier, index| {
+        var name_buffer: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "ASSET-{d}.BIN", .{index});
+        try std.testing.expectEqual(identifier, (try resolve(name)).identifier);
+        var payload: [1]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 1), try read(identifier, 0, &payload));
+        try std.testing.expectEqual(@as(u8, @truncate(index)), payload[0]);
+    }
+    try std.testing.expectEqual(maximum_cached_files, cached_file_count);
+    reset();
+    try std.testing.expectError(error.UnknownFile, fileSize(identifiers[0]));
+    try std.testing.expectEqual(@as(u32, 1), (try resolve("asset-0.bin")).identifier);
 }
 
 test "a deferred APR read completes through its submission identifier" {
