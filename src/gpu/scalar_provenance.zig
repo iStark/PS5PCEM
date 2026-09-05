@@ -19,6 +19,7 @@ pub const maximum_loads = 128;
 /// the same SGPR window for several descriptors and constant blocks.
 pub const maximum_scalar_specializations = maximum_loads * 16 + maximum_scalar_registers * 2;
 pub const maximum_instructions = 4096;
+const maximum_resource_instructions = 16 * 1024;
 const address_mask: u64 = 0x0000_ffff_ffff_ffff;
 
 pub const Sources = packed struct(u8) {
@@ -211,7 +212,8 @@ fn evaluate(
     var scc: ?bool = null;
     var pc: u32 = 0;
     var setpc_follows: u8 = 0;
-    while (result.instruction_count < maximum_instructions) {
+    const instruction_limit: u32 = if (follow_lane_mask_fallthrough) maximum_resource_instructions else maximum_instructions;
+    while (result.instruction_count < instruction_limit) {
         result.stop_pc = pc;
         if (checkpoint_collector) |collector| collector.captureBefore(&result, pc);
         if (end_pc) |end| {
@@ -285,8 +287,17 @@ fn evaluate(
         }
         if (inst.family == .smem) {
             if (!executeSmem(&result, reader, bindings, inst)) {
-                if (result.stop_reason == .instruction_limit) result.stop_reason = .inaccessible_memory;
-                return result;
+                if (!follow_lane_mask_fallthrough) {
+                    if (result.stop_reason == .instruction_limit) result.stop_reason = .inaccessible_memory;
+                    return result;
+                }
+                // A lane-dependent address may be unavailable to this scalar
+                // walk. It does not prevent a later, independent descriptor
+                // load from succeeding. Invalidate the failed load and keep
+                // walking instead of filling every remaining checkpoint with
+                // stale registers from before the failure.
+                invalidateDestination(&result, inst.dst, inst.data_words);
+                result.stop_reason = .instruction_limit;
             }
         } else switch (inst.opcode) {
             .s_endpgm, .s_code_end => {
@@ -370,11 +381,15 @@ fn executeSmem(
         result.stop_reason = .invalid_address;
         return false;
     };
-    if (inst.src0.kind != .sgpr or inst.src0.reg + 1 >= maximum_scalar_registers) {
+    const base_index = scalarRegisterIndex(inst.src0) orelse {
+        result.stop_reason = .invalid_address;
+        return false;
+    };
+    if (base_index + 1 >= maximum_scalar_registers) {
         result.stop_reason = .invalid_address;
         return false;
     }
-    const base_hi = result.registers[inst.src0.reg + 1];
+    const base_hi = result.registers[base_index + 1];
     if (!base_hi.known) {
         invalidateDestination(result, inst.dst, inst.data_words);
         result.stop_reason = .invalid_address;
@@ -688,7 +703,8 @@ fn executeScalar64(
     sources: Sources,
     scc: ?bool,
 ) void {
-    if (inst.dst.kind != .sgpr or inst.dst.reg + 1 >= maximum_scalar_registers) {
+    const destination = scalarRegisterIndex(inst.dst) orelse return;
+    if (destination + 1 >= maximum_scalar_registers) {
         invalidateDestination(result, inst.dst, 2);
         return;
     }
@@ -732,7 +748,7 @@ fn executeScalar64(
     };
     if (value) |known| {
         write(result, inst.dst, @truncate(known), all_sources, inst.pc);
-        result.registers[inst.dst.reg + 1] = .{ .known = true, .value = @truncate(known >> 32), .sources = all_sources, .producer_pc = inst.pc };
+        result.registers[destination + 1] = .{ .known = true, .value = @truncate(known >> 32), .sources = all_sources, .producer_pc = inst.pc };
     } else invalidateDestination(result, inst.dst, 2);
 }
 
@@ -1016,6 +1032,77 @@ test "one-pass resource checkpoints preserve instruction-local SGPR state" {
     const second = evaluateDecodedResourceStateUntil(memory.reader(), &bindings, &instructions, 8);
     try std.testing.expectEqual(first.registers[2], snapshots[0][2]);
     try std.testing.expectEqual(second.registers[2], snapshots[1][2]);
+}
+
+test "resource checkpoints recover after an unavailable scalar load" {
+    var storage = [_]u8{0} ** 0x100;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    const code = [_]u32{
+        0xf40c_0200, 125 << 25, // load s8:s15 from the known SRT
+        0xf40c_020a, 125 << 25, // overwrite them through unknown s20:s21
+        0xbf80_0000, // checkpoint after the failed load
+        0xf40c_0200, (125 << 25) | 32, // independent later T# in s8:s15
+        0xbf81_0000,
+    };
+    var program = try rdna2.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    for (0..16) |index| memory.write(0x4000 + index * 4, @intCast(index + 1));
+    const bindings = testBindings(0x3000, 0x4000);
+    const pcs = [_]u32{ 8, 16, 28 };
+    var snapshots: [pcs.len]ScalarRegisters = undefined;
+    const result = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, program.instructions.items, &pcs, &snapshots);
+    try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
+    for (0..8) |index| {
+        try std.testing.expectEqual(@as(u32, @intCast(index + 1)), snapshots[0][8 + index].value);
+        try std.testing.expect(!snapshots[1][8 + index].known);
+        try std.testing.expectEqual(@as(u32, @intCast(index + 9)), snapshots[2][8 + index].value);
+    }
+    const strict = evaluate(memory.reader(), &bindings, null, false, program.instructions.items, null);
+    try std.testing.expectEqual(StopReason.invalid_address, strict.stop_reason);
+    try std.testing.expectEqual(@as(u32, 8), strict.stop_pc);
+}
+
+test "resource checkpoints reach late descriptors in large shaders" {
+    const count = 4200;
+    const instructions = try std.testing.allocator.alloc(rdna2.Instruction, count + 2);
+    defer std.testing.allocator.free(instructions);
+    for (instructions[0..count], 0..) |*inst, index| {
+        inst.* = .{ .pc = @intCast(index * 4), .opcode = .s_nop, .word_count = 1 };
+    }
+    instructions[count] = .{
+        .pc = count * 4,
+        .opcode = .s_mov_b32,
+        .dst = .{ .kind = .sgpr, .reg = 8 },
+        .src0 = .{ .kind = .integer_inline_constant, .value = 42 },
+        .word_count = 1,
+    };
+    instructions[count + 1] = .{ .pc = (count + 1) * 4, .opcode = .s_endpgm, .word_count = 1 };
+    var storage = [_]u8{0} ** 4;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    const bindings = testBindings(0x3000, 0x4000);
+    var snapshots: [1]ScalarRegisters = undefined;
+    const result = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, instructions, &.{(count + 1) * 4}, &snapshots);
+    try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 42), snapshots[0][8].value);
+}
+
+test "scalar descriptor loads follow a pointer moved into VCC" {
+    var storage = [_]u8{0} ** 0x100;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    const code = [_]u32{
+        0xbeea_0400, // s_mov_b64 vcc, s0:s1
+        0xf408_0235, 125 << 25, // s_load_dwordx4 s8, vcc, 0
+        0xbf81_0000,
+    };
+    var program = try rdna2.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    for (0..4) |index| memory.write(0x4000 + index * 4, @intCast(index + 11));
+    const bindings = testBindings(0x3000, 0x4000);
+    const result = evaluateDecodedResourceState(memory.reader(), &bindings, program.instructions.items);
+    try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 0x4000), result.register(106).?.value);
+    try std.testing.expectEqual(@as(u32, 0), result.register(107).?.value);
+    for (0..4) |index| try std.testing.expectEqual(@as(u32, @intCast(index + 11)), result.register(@intCast(8 + index)).?.value);
 }
 
 test "resource evaluation follows the active-lane branch path" {

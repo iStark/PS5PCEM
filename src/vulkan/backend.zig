@@ -739,9 +739,10 @@ const maximum_graphics_pipelines = 8192;
 /// Distinct guest shader programs kept in decoded form.
 const maximum_analyzed_programs = 512;
 /// Shader headers put an exact bound around modern generated programs. Keep a
-/// conservative fallback for headerless captures, while permitting large UE
-/// material shaders when their AGC allocation proves the read is safe.
-const headerless_shader_instruction_limit = 4096;
+/// bounded fallback for headerless captures: Yotei's scene compute programs
+/// exceed 4096 instructions even when no AGC header was recovered. Registered
+/// material shaders still use their allocation's exact byte range below.
+const headerless_shader_instruction_limit = 16 * 1024;
 const maximum_shader_code_bytes = 1024 * 1024;
 const maximum_shader_instructions = maximum_shader_code_bytes / @sizeOf(u32);
 const maximum_staged_buffer_bytes = 128 * 1024 * 1024;
@@ -2959,6 +2960,7 @@ pub const Renderer = struct {
     magnify_source_height: u32 = 0,
     magnify_source_format: u32 = 0,
     guest_buffers: std.ArrayList(GuestBufferEntry) = .empty,
+    active_storage_buffers: [maximum_storage_descriptors]vk.Buffer = @splat(0),
     guest_buffer_sequence: u64 = 0,
     gds_storage: std.ArrayList(u8) = .empty,
     compute_pipelines: std.ArrayList(ComputePipelineEntry) = .empty,
@@ -4317,12 +4319,14 @@ pub const Renderer = struct {
         }
         const cache_hit = entry_index != null;
         if (entry_index == null) {
-            // Each descriptor slot owns at most one backing allocation. Guest
-            // ring addresses change constantly, but rebinding slot N does not
-            // require retaining every address slot N used in prior frames.
+            // Prefer the former allocation of this slot, unless another slot
+            // in the current descriptor set still names it. Cache hits can
+            // move a range between slots without transferring its ownership.
             var recycle_index: ?usize = null;
             for (self.guest_buffers.items, 0..) |entry, index| {
-                if (entry.descriptor_index == descriptor_index) {
+                if (entry.descriptor_index == descriptor_index and
+                    !self.storageBufferBoundElsewhere(entry.device_local.handle, descriptor_index))
+                {
                     recycle_index = index;
                     break;
                 }
@@ -4340,7 +4344,9 @@ pub const Renderer = struct {
                     if (self.guest_buffers.items.len >= maximum_guest_buffers) {
                         var oldest_clean: u64 = std.math.maxInt(u64);
                         for (self.guest_buffers.items, 0..) |entry, candidate_index| {
-                            if (!entry.gpu_dirty and entry.last_used_sequence < oldest_clean) {
+                            if (!entry.gpu_dirty and entry.last_used_sequence < oldest_clean and
+                                !self.storageBufferBoundElsewhere(entry.device_local.handle, descriptor_index))
+                            {
                                 oldest_clean = entry.last_used_sequence;
                                 recycle_index = candidate_index;
                             }
@@ -4349,15 +4355,17 @@ pub const Renderer = struct {
                 }
             }
             if (recycle_index == null and self.guest_buffers.items.len >= maximum_guest_buffers) {
-                var oldest_index: usize = 0;
+                var oldest_index: ?usize = null;
                 var oldest: u64 = std.math.maxInt(u64);
                 for (self.guest_buffers.items, 0..) |entry, index| {
-                    if (entry.last_used_sequence < oldest) {
+                    if (entry.last_used_sequence < oldest and
+                        !self.storageBufferBoundElsewhere(entry.device_local.handle, descriptor_index))
+                    {
                         oldest = entry.last_used_sequence;
                         oldest_index = index;
                     }
                 }
-                recycle_index = oldest_index;
+                recycle_index = oldest_index orelse return Error.InvalidStorageDescriptor;
             }
 
             if (recycle_index == null) {
@@ -4462,7 +4470,7 @@ pub const Renderer = struct {
                 } else {
                     self.frame_profile.resident_storage_bytes +%= size;
                 }
-                self.updateStorageDescriptor(descriptor_index, entry.device_local);
+                self.updateStorageDescriptorRange(descriptor_index, entry.device_local.handle, 0, size);
                 self.active_descriptor_set = self.descriptor_set;
                 return .{
                     .buffer = entry.device_local.handle,
@@ -4543,7 +4551,9 @@ pub const Renderer = struct {
         } else {
             self.frame_profile.resident_storage_bytes +%= size;
         }
-        self.updateStorageDescriptor(descriptor_index, entry.device_local);
+        // Allocation capacity can exceed this guest range after recycling.
+        // OpArrayLength must see the current range, not stale backing bytes.
+        self.updateStorageDescriptorRange(descriptor_index, entry.device_local.handle, 0, size);
         self.active_descriptor_set = self.descriptor_set;
         return .{
             .buffer = entry.device_local.handle,
@@ -7914,12 +7924,11 @@ pub const Renderer = struct {
             }
             // Vulkan cannot expose BC-compressed formats as storage images,
             // but a read-only MIMG image_load is exactly representable as
-            // OpImageFetch from a sampled BC image. Leave those descriptors to
-            // the sampled-image pass below. A resource that is also written in
-            // this program must remain a real storage image and is rejected.
-            if (!writable and isBlockCompressedUnifiedFormat(descriptor.unified_format) and
-                !programStoresImageResource(analysis, resource_sgpr))
-            {
+            // OpImageFetch from a sampled BC image. Leave this instruction to
+            // the sampled-image pass below. Later instructions may reuse the
+            // same SGPRs for an unrelated writable T#; bindings are per-PC.
+            // Actual compressed stores still fail storageImageFormat below.
+            if (!writable and isBlockCompressedUnifiedFormat(descriptor.unified_format)) {
                 continue;
             }
             const format = storageImageFormat(descriptor.unified_format) orelse {
@@ -8084,10 +8093,7 @@ pub const Renderer = struct {
                 );
                 return Error.UnsupportedSampledImage;
             };
-            if (inst.opcode == .image_load and
-                (!isBlockCompressedUnifiedFormat(image_descriptor.unified_format) or
-                    programStoresImageResource(analysis, resource_sgpr)))
-            {
+            if (inst.opcode == .image_load and !isBlockCompressedUnifiedFormat(image_descriptor.unified_format)) {
                 // Uncompressed fetches were bound through the storage-image
                 // pass above. Only compressed, read-only fetches need this
                 // sampled-image fallback.
@@ -15087,8 +15093,11 @@ pub const Renderer = struct {
         );
     }
 
-    fn updateStorageDescriptor(self: *Renderer, descriptor_index: u32, buffer: OwnedBuffer) void {
-        self.updateStorageDescriptorRange(descriptor_index, buffer.handle, 0, buffer.size);
+    fn storageBufferBoundElsewhere(self: *const Renderer, buffer: vk.Buffer, replacing_slot: u32) bool {
+        for (self.active_storage_buffers, 0..) |bound, slot| {
+            if (slot != replacing_slot and bound == buffer) return true;
+        }
+        return false;
     }
 
     fn updateStorageDescriptorRange(
@@ -15112,6 +15121,7 @@ pub const Renderer = struct {
             .buffer_info = @ptrCast(&buffer_info),
         };
         self.device_functions.update_descriptor_sets(self.device, 1, @ptrCast(&write), 0, null);
+        self.active_storage_buffers[descriptor_index] = buffer;
     }
 
     fn updateGdsDescriptor(self: *Renderer, buffer: OwnedBuffer) void {
@@ -17134,6 +17144,7 @@ pub const Renderer = struct {
         self.draw_upload_cache.clearRetainingCapacity();
         self.descriptor_set = self.descriptor_sets[0];
         self.active_descriptor_set = null;
+        @memset(&self.active_storage_buffers, 0);
         self.dynamic_scalar_mapping = self.dynamic_scalar_mapping_base;
     }
 
@@ -17192,6 +17203,7 @@ pub const Renderer = struct {
         self.descriptor_cursor = (slot + 1) % self.descriptor_sets.len;
         self.descriptor_set = self.descriptor_sets[slot];
         self.active_descriptor_set = null;
+        @memset(&self.active_storage_buffers, 0);
         const base = self.dynamic_scalar_mapping_base orelse return Error.InvalidStorageDescriptor;
         const word_offset = slot * descriptor_scalar_stride / @sizeOf(u32);
         self.dynamic_scalar_mapping = base + word_offset;
@@ -21282,28 +21294,6 @@ fn programUsesConditionalDebugBranch(analysis: *const gpu.ShaderAnalysis) bool {
         => return true,
         else => {},
     };
-    return false;
-}
-
-fn programStoresImageResource(analysis: *const gpu.ShaderAnalysis, resource_sgpr: u32) bool {
-    for (analysis.program.instructions.items) |inst| {
-        const writes = switch (inst.opcode) {
-            .image_store,
-            .image_store_mip,
-            .image_atomic_add,
-            .image_atomic_umin,
-            .image_atomic_umax,
-            .image_atomic_and,
-            .image_atomic_or,
-            .image_atomic_xor,
-            .image_atomic_fmax,
-            => true,
-            else => false,
-        };
-        if (writes and inst.src1.kind == .sgpr and inst.src1.reg == resource_sgpr) {
-            return true;
-        }
-    }
     return false;
 }
 

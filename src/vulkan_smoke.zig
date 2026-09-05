@@ -390,6 +390,72 @@ fn runComputeSampledImageKernel(
     }
 }
 
+fn runCompressedArrayCopyKernel(allocator: std.mem.Allocator, renderer: *vulkan.Renderer, guest: *GuestMemory, backend: gpu.DcbBackend, gather: bool) !void {
+    const program: u32 = if (gather) 0x3000 else 0x2000;
+    const table = 0x4000;
+    const source = 0x8000;
+    const destination = 0xa000;
+    var input = sampledImageDescriptorWords(source, 4, 4);
+    input[1] = (input[1] & ~(@as(u32, 0x1ff) << 20)) | (@as(u32, 169) << 20); // BC1_UNORM
+    input[3] = (input[3] & 0x0fff_ffff) | (@as(u32, 13) << 28);
+    input[4] = 1; // two layers
+    var output = sampledImageDescriptorWords(destination, 4, 4);
+    output[3] = (output[3] & 0x0fff_ffff) | (@as(u32, 13) << 28);
+    output[4] = 1;
+    const source_layout = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&input));
+    const source_view = try source_layout.subresource(0, 0, 2);
+    const output_layout = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&output));
+    const output_view = try output_layout.subresource(0, 0, 2);
+    @memset(guest.bytes[source .. source + 4096], 0);
+    @memset(guest.bytes[destination .. destination + 4096], 0);
+    guest.word(source, 0xf800); // red BC1 block on slice zero
+    guest.word(source + @as(usize, @intCast(source_view.source_layer_bytes)), 0x07e0); // green on slice one
+    for ([_][8]u32{ input, output }, 0..) |descriptor, index| {
+        for (descriptor, 0..) |word, slot| guest.word(table + index * 32 + slot * 4, word);
+    }
+    for (0..4) |index| guest.word(table + 64 + index * 4, 0); // nearest sampler
+    const fetch_code = [_]u32{
+        0xf40c_0200, 125 << 25, // T# s8:s15 = compressed input
+        vop1(1, 0, 128), vop1(1, 1, 128), vop1(1, 2, 129), // texel (0,0,1)
+        0xf000_0f28, 0x0002_0400, // array load v4:v7
+        0xf40c_0200, (125 << 25) | 32, // same SGPRs now name the output
+        0xf020_0f28, 0x0002_0400, // array store v4:v7
+        0xbf81_0000,
+    };
+    const gather_code = [_]u32{
+        0xf40c_0200, 125 << 25, // T# s8:s15 = compressed input
+        0xf408_0400, (125 << 25) | 64, // S# s16:s19
+        vop1(1, 0, 255), 0x3f00_0000, // normalized u = 0.5
+        vop1(1, 1, 255), 0x3f00_0000, // normalized v = 0.5
+        vop1(1, 2, 255), 0x3f80_0000, // array layer = 1.0
+        0xf11c_0228, 0x0082_0400, // gather green from slice one into v4:v7
+        0xf40c_0200, (125 << 25) | 32, // T# now names the output
+        vop1(1, 0, 128), vop1(1, 1, 128), vop1(1, 2, 129), // integer texel (0,0,1)
+        0xf020_0f28, 0x0002_0400, // store all four gathered values
+        0xbf81_0000,
+    };
+    const code: []const u32 = if (gather) &gather_code else &fetch_code;
+    for (code, 0..) |word, index| guest.word(program + index * 4, word);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), program >> 8);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, compute.userDataBase(), table);
+    try state.writeRegister(.shader, compute.userDataBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 16 << 1);
+    try state.writeRegister(.shader, 0x207, 1);
+    try state.writeRegister(.shader, 0x208, 1);
+    try state.writeRegister(.shader, 0x209, 1);
+    const stream = [_]u32{ command(gpu.pm4.dispatch_direct, 4), 1, 1, 1, 0x41 };
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = backend, .allocator = allocator };
+    _ = try executor.execute(&stream);
+    try renderer.flushPendingGuestWrites();
+    const result = destination + @as(usize, @intCast(output_view.source_layer_bytes));
+    const expected: [4]u8 = if (gather) .{ 255, 255, 255, 255 } else .{ 0, 255, 0, 255 };
+    try std.testing.expectEqualSlices(u8, &expected, guest.bytes[result..][0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, guest.bytes[destination..][0..4]);
+}
+
 fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
     defer renderer.deinit();
@@ -434,7 +500,86 @@ fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator) !void {
             return error.QueuedBufferInputOverwritten;
         }
     }
-    std.debug.print("queued compute buffer reuse passed: exact range and recycled allocation\n", .{});
+    // A cache hit can move an allocation to another descriptor slot. Rebinding
+    // its former slot must not overwrite the input still bound at the new one.
+    guest.word(0x1500, 0x1234_5678);
+    guest.word(0x1600, 0xdead_beef);
+    _ = try renderer.stageGuestStorageBufferAt(1, 0x1500, 16);
+    _ = try renderer.stageGuestStorageBufferAt(0, 0x1500, 16);
+    _ = try renderer.stageGuestStorageBufferAt(1, 0x1600, 16);
+    _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+    var rebound_result: [16]u8 = undefined;
+    try renderer.readbackGuestStorageBuffer(0x1600, &rebound_result);
+    const rebound_value = std.mem.readInt(u32, rebound_result[0..4], .little);
+    if (rebound_value != 0x1234_5678) {
+        std.debug.print("descriptor migration lost its input: 0x{x}\n", .{rebound_value});
+        return error.ReboundBufferInputOverwritten;
+    }
+    // Exhaust the allocation cache, then grow the destination. Neither the
+    // old slot preference nor the LRU fallback may evict another live input.
+    for (2..vulkan.backend.maximum_storage_descriptors) |slot| {
+        const address = 0x4000 + slot * 16;
+        guest.word(address, @intCast(slot));
+        _ = try renderer.stageGuestStorageBufferAt(@intCast(slot), address, 16);
+    }
+    _ = try renderer.stageGuestStorageBufferAt(1, 0x1700, 64);
+    _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+    var grown_result: [64]u8 = undefined;
+    try renderer.readbackGuestStorageBuffer(0x1700, &grown_result);
+    if (std.mem.readInt(u32, grown_result[0..4], .little) != 0x1234_5678) {
+        return error.LiveBufferEvicted;
+    }
+    for (2..vulkan.backend.maximum_storage_descriptors) |slot| {
+        try renderer.readbackGuestStorageBuffer(0x4000 + slot * 16, &rebound_result);
+        if (std.mem.readInt(u32, rebound_result[0..4], .little) != slot) return error.LiveBufferEvicted;
+    }
+    // Reusing a large allocation for a shorter guest range must also shrink
+    // the descriptor range used by the shader's dynamic bounds checks.
+    guest.word(0x1800 + 16, 0xdead_beef);
+    _ = try renderer.stageGuestStorageBufferAt(0, 0x1800, 64);
+    _ = try renderer.stageGuestStorageBufferAt(0, 0x1800, 16);
+    guest.word(0x100, 0xe030_0010); // load one dword beyond the new range
+    var bounds_analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, 16);
+    defer bounds_analysis.deinit(allocator);
+    var bounds_module = try bounds_analysis.translateSpirv(allocator, .{
+        .stage = .compute,
+        .local_size = .{ 1, 1, 1 },
+        .storage_buffers = &.{
+            .{ .resource_sgpr = 8, .descriptor_index = 0, .extent_bytes = 16 },
+            .{ .resource_sgpr = 12, .descriptor_index = 1, .extent_bytes = 64 },
+        },
+    });
+    defer bounds_module.deinit(allocator);
+    _ = try renderer.dispatchSpirv(bounds_module.words, .{ 1, 1, 1 });
+    try renderer.readbackGuestStorageBuffer(0x1700, &grown_result);
+    if (std.mem.readInt(u32, grown_result[0..4], .little) != 0) return error.RecycledBufferBoundsMismatch;
+    std.debug.print("queued compute buffer reuse passed: exact range, recycling, descriptor migration, full cache, bounds\n", .{});
+
+    // Scene kernels can exceed the old 4096-instruction headerless limit.
+    // Drive the normal shader-analysis path and verify the work after it.
+    const large_program = 0x8000;
+    const large_source = 0x10000;
+    const large_destination = 0x11000;
+    for (0..4200) |index| guest.word(large_program + index * 4, 0xbf80_0000); // s_nop
+    for (code, 0..) |word, index| guest.word(large_program + (4200 + index) * 4, word);
+    guest.word(large_source, 0x1357_2468);
+    guest.word(large_destination, 0);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), large_program >> 8);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 16 << 1);
+    for ([_]u32{ 0x207, 0x208, 0x209 }) |reg| try state.writeRegister(.shader, reg, 1);
+    const descriptors = [_]u32{ large_source, 4 << 16, 4, 0, large_destination, 4 << 16, 4, 0 };
+    for (descriptors, 0..) |word, index| {
+        try state.writeRegister(.shader, compute.userDataBase() + 8 + @as(u32, @intCast(index)), word);
+    }
+    const stream = [_]u32{ command(gpu.pm4.dispatch_direct, 4), 1, 1, 1, 0x41 };
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(guest.interface()), .allocator = allocator };
+    _ = try executor.execute(&stream);
+    try renderer.readbackGuestStorageBuffer(large_destination, &rebound_result);
+    if (std.mem.readInt(u32, rebound_result[0..4], .little) != 0x1357_2468) return error.LargeComputeShaderMismatch;
+    std.debug.print("large headerless compute shader passed: 4203 instructions\n", .{});
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -468,8 +613,10 @@ pub fn main(init: std.process.Init) !void {
     if (init.minimal.environ.containsUnempty(allocator, "PS5_IMAGE_SMOKE_ONLY") catch false) {
         try runStorageImageCopyKernel(allocator, &renderer, &guest, backend);
         try runComputeSampledImageKernel(allocator, &renderer, &guest, backend);
+        try runCompressedArrayCopyKernel(allocator, &renderer, &guest, backend, false);
+        try runCompressedArrayCopyKernel(allocator, &renderer, &guest, backend, true);
         std.debug.print(
-            "images passed: storage load/NSA store writeback and compute image_sample_lz NSA\n",
+            "images passed: storage copy, compute sample, compressed array fetch and gather with descriptor SGPR reuse\n",
             .{},
         );
         return;
@@ -731,7 +878,7 @@ pub fn main(init: std.process.Init) !void {
 
     const vertex_program_address = 0x700;
     var vertex_pc: usize = vertex_program_address;
-    guest.word(vertex_pc, vop1(0x06, 1, 256)); // v_cvt_f32_u32 v1, v0 (VertexIndex)
+    guest.word(vertex_pc, vop1(0x06, 1, 261)); // v_cvt_f32_u32 v1, v5 (Prospero VertexIndex)
     vertex_pc += 4;
     guest.word(vertex_pc, vop1(0x01, 2, 255)); // v_mov_b32 v2, 1.0
     guest.word(vertex_pc + 4, 0x3f80_0000);
@@ -802,7 +949,7 @@ pub fn main(init: std.process.Init) !void {
     }
     try state.writeRegister(.context, 0x1e0, 0);
     try state.writeRegister(.context, 0x200, 0);
-    try state.writeRegister(.context, 0x202, 0xcc << 16);
+    try state.writeRegister(.context, 0x202, (0xcc << 16) | (1 << 4)); // normal color mode, copy ROP
     try state.writeRegister(.context, 0x204, 0);
     try state.writeRegister(.context, 0x205, 0);
     _ = try executor.execute(&draw_stream);

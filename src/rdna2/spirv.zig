@@ -4525,12 +4525,12 @@ const Builder = struct {
         const explicit_mip = inst.opcode_id == 1;
         const coordinate_components: u8 = switch (inst.image_dimension) {
             .dim_2d => 2,
-            .dim_3d => 3,
+            .dim_3d, .dim_2d_array_alt => 3,
             else => 0,
         };
         if ((self.stage != .vertex and self.stage != .fragment and self.stage != .compute) or
             (inst.opcode_id != 0 and !explicit_mip) or
-            (inst.image_dimension != .dim_2d and inst.image_dimension != .dim_3d) or
+            coordinate_components == 0 or
             inst.image_address_components != coordinate_components + @as(u8, @intFromBool(explicit_mip)) or
             inst.data_mask == 0 or inst.src0.kind != .vgpr or
             inst.src1.kind != .sgpr or inst.src2.kind != .sgpr)
@@ -4620,12 +4620,19 @@ const Builder = struct {
             return;
         }
         if ((inst.opcode_id != 0 and inst.opcode_id != 1) or
-            (inst.image_dimension != .dim_2d and inst.image_dimension != .dim_3d) or
+            (inst.image_dimension != .dim_2d and inst.image_dimension != .dim_3d and
+                inst.image_dimension != .dim_2d_array_alt) or
             (inst.image_address_components < 2 or inst.image_address_components > 4) or
             inst.data_mask == 0 or
             inst.src0.kind != .vgpr or inst.src1.kind != .sgpr)
         {
             return Error.UnsupportedOpcode;
+        }
+        // A compressed fetch has an exact sampled mapping, while a later
+        // uncompressed store may publish a generic mapping for the same SGPRs.
+        // The instruction-specific view takes precedence over that fallback.
+        if (self.sampledImageBinding(inst.src1.reg, inst.src2.reg, inst.pc)) |sampled| {
+            if (sampled.instruction_pc == inst.pc) return self.sampledImageFetch(inst);
         }
         const binding = self.storageImageBinding(inst.src1.reg, inst.pc) orelse
             return self.sampledImageFetch(inst);
@@ -5259,16 +5266,18 @@ const Builder = struct {
     }
 
     fn gatherImage(self: *Builder, inst: instruction.Instruction) Error!void {
+        const arrayed = inst.image_dimension == .dim_2d_array_alt;
+        const coordinate_count: u8 = if (arrayed) 3 else 2;
         const flags: u16 = @bitCast(inst.image_sample_flags);
         const supported_flags = (@as(u16, 1) << 5) | (@as(u16, 1) << 4);
         const compare = inst.image_sample_flags.compare;
         const supported_with_compare = supported_flags | (@as(u16, 1) << 3);
         if ((self.stage != .fragment and self.stage != .compute) or
-            inst.image_dimension != .dim_2d or
+            (inst.image_dimension != .dim_2d and !arrayed) or
             !inst.image_sample_flags.level_zero or
             flags & ~(if (compare) supported_with_compare else supported_flags) != 0 or
             inst.data_mask == 0 or
-            inst.image_address_components != 2 + @as(u8, @intFromBool(inst.image_sample_flags.offset)) +
+            inst.image_address_components != coordinate_count + @as(u8, @intFromBool(inst.image_sample_flags.offset)) +
                 @as(u8, @intFromBool(compare)))
         {
             return Error.UnsupportedOpcode;
@@ -5278,7 +5287,9 @@ const Builder = struct {
         }
         const binding = self.sampledImageBinding(inst.src1.reg, inst.src2.reg, inst.pc) orelse
             return Error.InvalidStorageBinding;
-        if (binding.dimension != .two_d or self.sampled_image_arrays[0] == 0) {
+        const dimension: SampledImageDimension = if (arrayed) .two_d_array else .two_d;
+        const dimension_index = sampledImageDimensionIndex(dimension);
+        if (binding.dimension != dimension or self.sampled_image_arrays[dimension_index] == 0) {
             return Error.InvalidStorageBinding;
         }
         self.uses_image_gather_extended = self.uses_image_gather_extended or inst.image_sample_flags.offset;
@@ -5286,18 +5297,23 @@ const Builder = struct {
         const coordinate_base: u32 = @intFromBool(inst.image_sample_flags.offset);
         const raw_x = try self.source(try imageAddressOperand(inst, coordinate_base), .float32);
         const raw_y = try self.source(try imageAddressOperand(inst, coordinate_base + 1), .float32);
+        const layer = if (arrayed) try self.source(try imageAddressOperand(inst, coordinate_base + 2), .float32) else null;
         const coordinates = self.id();
-        try self.emit(&self.body, 80, &.{ self.vector2_type, coordinates, raw_x, raw_y }); // OpCompositeConstruct
+        if (layer) |array_layer| {
+            try self.emit(&self.body, 80, &.{ self.vector3_type, coordinates, raw_x, raw_y, array_layer });
+        } else {
+            try self.emit(&self.body, 80, &.{ self.vector2_type, coordinates, raw_x, raw_y });
+        }
 
         const pointer = self.id();
         try self.emit(&self.body, 65, &.{
-            self.sampled_image_pointer_types[0],
+            self.sampled_image_pointer_types[dimension_index],
             pointer,
-            self.sampled_image_arrays[0],
+            self.sampled_image_arrays[dimension_index],
             try self.constant(.bits32, binding.descriptor_index),
         });
         const sampled_image = self.id();
-        try self.emit(&self.body, 61, &.{ self.sampled_image_types[0], sampled_image, pointer });
+        try self.emit(&self.body, 61, &.{ self.sampled_image_types[dimension_index], sampled_image, pointer });
 
         const component: u32 = @ctz(inst.data_mask);
         if (self.stage == .compute) {
@@ -5306,9 +5322,9 @@ const Builder = struct {
             // GFX10 gather_lz with four explicit mip-zero samples at the gather
             // footprint. This preserves the four values and remains valid in a
             // derivative-free execution model.
-            if (self.sampled_image_image_types[0] == 0) return Error.InvalidStorageBinding;
+            if (self.sampled_image_image_types[dimension_index] == 0) return Error.InvalidStorageBinding;
             const dref = if (compare)
-                try self.source(try imageAddressOperand(inst, coordinate_base + 2), .float32)
+                try self.source(try imageAddressOperand(inst, coordinate_base + coordinate_count), .float32)
             else
                 null;
             const packed_offset = if (inst.image_sample_flags.offset)
@@ -5328,10 +5344,10 @@ const Builder = struct {
 
             self.uses_image_query = true;
             const image = self.id();
-            try self.emit(&self.body, 100, &.{ self.sampled_image_image_types[0], image, sampled_image }); // OpImage
+            try self.emit(&self.body, 100, &.{ self.sampled_image_image_types[dimension_index], image, sampled_image }); // OpImage
             const size = self.id();
             try self.emit(&self.body, 103, &.{
-                try self.ensureBitsVec2(),
+                if (arrayed) try self.ensureBitsVec3() else try self.ensureBitsVec2(),
                 size,
                 image,
                 try self.constant(.bits32, 0),
@@ -5380,7 +5396,11 @@ const Builder = struct {
                 try self.emit(&self.body, 129, &.{ self.float_type, adjusted_x, raw_x, normalized_x }); // OpFAdd
                 try self.emit(&self.body, 129, &.{ self.float_type, adjusted_y, raw_y, normalized_y });
                 const adjusted_coordinates = self.id();
-                try self.emit(&self.body, 80, &.{ self.vector2_type, adjusted_coordinates, adjusted_x, adjusted_y });
+                if (layer) |array_layer| {
+                    try self.emit(&self.body, 80, &.{ self.vector3_type, adjusted_coordinates, adjusted_x, adjusted_y, array_layer });
+                } else {
+                    try self.emit(&self.body, 80, &.{ self.vector2_type, adjusted_coordinates, adjusted_x, adjusted_y });
+                }
                 const sampled = self.id();
                 if (dref) |reference| {
                     try self.emit(&self.body, 90, &.{
@@ -5416,7 +5436,7 @@ const Builder = struct {
         }
 
         const gathered = self.id();
-        const dref_index = coordinate_base + 2;
+        const dref_index = coordinate_base + coordinate_count;
         if (compare) {
             const dref = try self.source(try imageAddressOperand(inst, dref_index), .float32);
             if (inst.image_sample_flags.offset) {
@@ -10698,6 +10718,31 @@ test "compute gather4 level zero becomes four explicit mip-zero samples" {
     try std.testing.expect(countOpcode(module.words, 81) >= 6); // size and four sampled texels
 }
 
+test "array gather4 preserves the layer in compute and fragment stages" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{ 0xf11c_0428, 0x0061_0c29, 0xbf81_0000 };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    const images = [_]SampledImageBinding{.{
+        .resource_sgpr = 4,
+        .sampler_sgpr = 12,
+        .descriptor_index = 0,
+        .instruction_pc = 0,
+        .dimension = .two_d_array,
+    }};
+    for ([_]Stage{ .compute, .fragment }) |stage| {
+        var module = try translate(std.testing.allocator, &program, .{ .stage = stage, .sampled_images = &images });
+        defer module.deinit(std.testing.allocator);
+        if (stage == .compute) {
+            try std.testing.expectEqual(@as(usize, 4), countOpcode(module.words, 88));
+            try std.testing.expect(!containsOpcode(module.words, 96));
+        } else {
+            try std.testing.expect(containsOpcode(module.words, 96));
+        }
+        try std.testing.expectEqual(@as(u32, 1), firstInstructionOperand(module.words, 25, 4)); // arrayed image
+    }
+}
+
 test "compute comparison gather4 level zero becomes four explicit depth samples" {
     const decoder = @import("decoder.zig");
     const code = [_]u32{
@@ -10903,6 +10948,40 @@ test "compute image load can fetch a compressed read-only sampled descriptor" {
     try std.testing.expect(containsOpcode(module.words, 100)); // OpImage
     try std.testing.expect(containsOpcode(module.words, 95)); // OpImageFetch
     try std.testing.expect(!containsOpcode(module.words, 98)); // no storage OpImageRead
+}
+
+test "compute array fetch and store reuse descriptor SGPRs at different instructions" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xf000_0f28, 0x0000_0004, // image_load array v0, v[4:6], s[0:7]
+        0xf020_0f28, 0x0000_0004, // image_store array v0, v[4:6], s[0:7]
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .sampled_images = &.{.{ .resource_sgpr = 0, .sampler_sgpr = 0, .descriptor_index = 0, .dimension = .two_d_array, .instruction_pc = 0 }},
+        .storage_images = &.{.{ .resource_sgpr = 0, .descriptor_index = 0, .format = .rgba8_unorm, .dimension = .two_d_array }},
+    });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 95)); // OpImageFetch
+    try std.testing.expect(containsOpcode(module.words, 99)); // OpImageWrite
+    try std.testing.expect(!containsOpcode(module.words, 98)); // no storage read at the first PC
+}
+
+test "compute array image load uses a native storage array" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{ 0xf000_0f28, 0x0000_0004, 0xbf81_0000 };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .storage_images = &.{.{ .resource_sgpr = 0, .descriptor_index = 0, .format = .rgba8_unorm, .dimension = .two_d_array }},
+    });
+    defer module.deinit(std.testing.allocator);
+    try std.testing.expect(containsOpcode(module.words, 98)); // OpImageRead
+    try std.testing.expect(!containsOpcode(module.words, 95));
 }
 
 test "compute image load and NSA store use independently typed storage image bindings" {
