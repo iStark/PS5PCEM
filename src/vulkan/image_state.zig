@@ -231,11 +231,16 @@ pub const Tracker = struct {
             // retains a memory dependency even when no layout change is needed.
             if (self.optimize_barriers and previous.eql(next) and previous.readOnly()) continue;
             var grouped = false;
-            if (self.optimize_barriers) {
+            // Equal aspect transitions must stay combined even in conservative
+            // mode: depth/stencil layouts are coupled unless the device enables
+            // separateDepthStencilLayouts. Keeping read hazards is independent
+            // of combining their aspect masks.
+            {
                 for (self.cells.items[0..cell_index]) |earlier| {
                     if (earlier.image == image and range.aspect_mask & earlier.aspect != 0 and
                         earlier.mip_level == cell.mip_level and earlier.array_layer == cell.array_layer and
-                        earlier.usage.eql(previous) and !(earlier.usage.eql(next) and earlier.usage.readOnly()))
+                        earlier.usage.eql(previous) and
+                        !(self.optimize_barriers and earlier.usage.eql(next) and earlier.usage.readOnly()))
                     {
                         grouped = true;
                         break;
@@ -260,7 +265,7 @@ pub const Tracker = struct {
             const previous = cell.usage;
             if (self.optimize_barriers and previous.eql(next) and previous.readOnly()) continue;
             var merged = false;
-            if (self.optimize_barriers) {
+            {
                 for (output[0..count]) |*existing| {
                     const barrier = &existing.barrier;
                     if (existing.source_stages != previous.stages or
@@ -382,25 +387,30 @@ test "same-layout read-only reuse needs no barrier" {
     );
 }
 
-test "conservative mode retains read hazards and separate aspects" {
+test "conservative mode retains read hazards with combined depth stencil barriers" {
     var tracker = Tracker{ .optimize_barriers = false };
     defer tracker.deinit(std.testing.allocator);
     try tracker.registerImage(std.testing.allocator, 15, .{
         .aspect_mask = vk.image_aspect_depth_bit | vk.image_aspect_stencil_bit,
     });
-    var transitions: [4]Transition = undefined;
+    var transitions: [1]Transition = undefined;
     const range = SubresourceRange{
         .aspect_mask = vk.image_aspect_depth_bit | vk.image_aspect_stencil_bit,
     };
     try std.testing.expectEqual(
-        @as(usize, 2),
+        @as(usize, 1),
         try tracker.transition(15, range, shader_read_usage, &transitions),
     );
     try std.testing.expectEqual(
-        @as(usize, 2),
+        @as(usize, 1),
         try tracker.transition(15, range, shader_read_usage, &transitions),
     );
     try std.testing.expectEqual(vk.image_layout_shader_read_only_optimal, transitions[0].barrier.old_layout);
+    try std.testing.expectEqual(range.aspect_mask, transitions[0].barrier.subresource_range.aspect_mask);
+    try std.testing.expectEqual(shader_read_usage, tracker.current(15, vk.image_aspect_depth_bit, 0, 0).?);
+    try std.testing.expectEqual(shader_read_usage, tracker.current(15, vk.image_aspect_stencil_bit, 0, 0).?);
+    try std.testing.expectEqual(@as(usize, 1), try tracker.transition(15, range, depth_attachment_usage, &transitions));
+    try std.testing.expectEqual(range.aspect_mask, transitions[0].barrier.subresource_range.aspect_mask);
 }
 
 test "capacity failure does not partially commit subresource state" {

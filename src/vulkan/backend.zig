@@ -4520,6 +4520,12 @@ pub const Renderer = struct {
                     .allocation_cache_hit = cache_hit,
                 };
             }
+            // Compute uploads reuse the persistent allocation rather than the
+            // draw upload ring. A clean cache entry can still be an input to
+            // queued work: gpu_dirty tracks writes, not outstanding reads.
+            // Finish those readers before overwriting either an exact hit or
+            // a recycled allocation, also when page tracking is disabled.
+            if (cache_hit or recycled_entry) try self.waitForSubmittedWork();
             var mapped: ?*anyopaque = null;
             if (self.device_functions.map_memory(self.device, entry.device_local.memory, 0, size, 0, &mapped) != vk.success) {
                 return Error.MemoryMapFailed;
@@ -5531,6 +5537,9 @@ pub const Renderer = struct {
             );
         }
         if (self.dump_compute_spirv) {
+            // With synchronous diagnostics, attribute an execution failure to
+            // this shader instead of the next operation which flushes a batch.
+            if (!self.timeline_scheduler_enabled) try self.waitForSubmittedWork();
             std.debug.print("[vulkan dcb] compute submit complete program=0x{x}\n", .{program_address});
         }
         if (uses_gds) {

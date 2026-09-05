@@ -390,12 +390,62 @@ fn runComputeSampledImageKernel(
     }
 }
 
+fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const code = [_]u32{
+        0xe030_0000, 0x8002_0000, // buffer_load_dword v0, s8:s11
+        0xe070_0000, 0x8003_0000, // buffer_store_dword v0, s12:s15
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, 16);
+    defer analysis.deinit(allocator);
+    var module = try analysis.translateSpirv(allocator, .{
+        .stage = .compute,
+        .local_size = .{ 1, 1, 1 },
+        .storage_buffers = &.{
+            .{ .resource_sgpr = 8, .descriptor_index = 0, .extent_bytes = 16 },
+            .{ .resource_sgpr = 12, .descriptor_index = 1, .extent_bytes = 16 },
+        },
+    });
+    defer module.deinit(allocator);
+    for ([_]bool{ false, true }) |recycle| {
+        const source = 0x1000;
+        const destination = 0x1100;
+        const replacement: usize = if (recycle) 0x1200 else source;
+        guest.word(source, 0x1122_3344);
+        guest.word(destination, 0);
+        _ = try renderer.stageGuestStorageBufferAt(0, source, 16);
+        _ = try renderer.stageGuestStorageBufferAt(1, destination, 16);
+        // Keep the read queued, making early CPU overwrites deterministic.
+        renderer.draw_batch_active = true;
+        _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+        guest.word(replacement, 0xaabb_ccdd);
+        _ = try renderer.stageGuestStorageBufferAt(0, replacement, 16);
+        var result: [16]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(destination, &result);
+        renderer.draw_batch_active = false;
+        const actual = std.mem.readInt(u32, result[0..4], .little);
+        if (actual != 0x1122_3344) {
+            std.debug.print("queued buffer read mismatch (recycle={any}): 0x{x}\n", .{ recycle, actual });
+            return error.QueuedBufferInputOverwritten;
+        }
+    }
+    std.debug.print("queued compute buffer reuse passed: exact range and recycled allocation\n", .{});
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
-
+    const args = try init.minimal.args.toSlice(allocator);
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-reuse")) {
+        try runQueuedBufferReuseProbe(allocator);
+        return;
+    }
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_graphics_probe = true });
     defer renderer.deinit();
-    const args = try init.minimal.args.toSlice(allocator);
     if (args.len == 3 and std.mem.eql(u8, args[1], "--probe-spv")) {
         const bytes = try std.Io.Dir.cwd().readFileAllocOptions(
             init.io,
@@ -914,6 +964,8 @@ pub fn main(init: std.process.Init) !void {
 
     try runIndexedCopyKernel(allocator, &renderer, &guest, backend);
     try runStorageImageCopyKernel(allocator, &renderer, &guest, backend);
+
+    try runQueuedBufferReuseProbe(allocator);
 
     var output_buffer: [1024]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &output_buffer);
