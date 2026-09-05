@@ -167,6 +167,13 @@ pub fn errorDialogOpen(parameter: ?[*]const u8) callconv(abi.guest) i32 {
     if (std.mem.readInt(i32, bytes[0..4], .little) != 16) {
         return error_dialog_error_parameter;
     }
+    // There is no host error-dialog window yet. Preserve the guest's error
+    // code in the log before UpdateStatus acknowledges the dialog, otherwise
+    // a startup failure disappears without any explanation.
+    std.debug.print("[error dialog] code=0x{x:0>8} user={d}\n", .{
+        std.mem.readInt(u32, bytes[4..8], .little),
+        std.mem.readInt(i32, bytes[8..12], .little),
+    });
     error_dialog_status.store(status_running, .release);
     return errno.ok;
 }
