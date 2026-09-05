@@ -323,6 +323,24 @@ fn evaluate(
             .s_cbranch_execz,
             .s_cbranch_execnz,
             => {
+                if (follow_lane_mask_fallthrough) {
+                    if (decoded_instructions) |instructions| {
+                        if (inst.opcode == .s_branch and resourceLoopHasLaneExit(instructions, inst.branch_target, inst.pc)) {
+                            // A scalar walk cannot advance a VGPR induction
+                            // variable or decide when the last lane exits.
+                            // Capture one iteration's resource state, forget
+                            // loop-carried scalar writes, then recover the
+                            // independent descriptors after the loop.
+                            for (instructions) |loop_inst| {
+                                if (loop_inst.pc < inst.branch_target or loop_inst.pc >= inst.pc) continue;
+                                invalidateDestination(&result, loop_inst.dst, @max(loop_inst.data_words, destinationWords(loop_inst.opcode)));
+                            }
+                            scc = null;
+                            pc += inst.word_count * 4;
+                            continue;
+                        }
+                    }
+                }
                 const taken = switch (inst.opcode) {
                     .s_branch => true,
                     .s_cbranch_scc0 => if (scc) |value| !value else null,
@@ -354,6 +372,20 @@ fn evaluate(
     result.stop_pc = pc;
     result.stop_reason = .instruction_limit;
     return result;
+}
+
+fn resourceLoopHasLaneExit(instructions: []const rdna2.Instruction, loop_start: u32, back_edge: u32) bool {
+    if (loop_start >= back_edge) return false;
+    for (instructions) |inst| {
+        if (inst.pc < loop_start) continue;
+        if (inst.pc >= back_edge) break;
+        if (inst.branch_target <= back_edge) continue;
+        switch (inst.opcode) {
+            .s_cbranch_execz, .s_cbranch_execnz, .s_cbranch_vccz, .s_cbranch_vccnz => return true,
+            else => {},
+        }
+    }
+    return false;
 }
 
 fn decodedInstructionAtOrAfter(instructions: []const rdna2.Instruction, pc: u32) ?rdna2.Instruction {
@@ -1103,6 +1135,45 @@ test "scalar descriptor loads follow a pointer moved into VCC" {
     try std.testing.expectEqual(@as(u32, 0x4000), result.register(106).?.value);
     try std.testing.expectEqual(@as(u32, 0), result.register(107).?.value);
     for (0..4) |index| try std.testing.expectEqual(@as(u32, @intCast(index + 11)), result.register(@intCast(8 + index)).?.value);
+}
+
+test "resource checkpoints recover descriptors after nested lane-dependent loops" {
+    var storage = [_]u8{0} ** 0x100;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    const code = [_]u32{
+        0xbf88_0006, // outer EXECZ exits at pc 28
+        0xbf88_0004, // inner EXECZ exits at pc 24
+        0xf408_0200, 125 << 25, // loop T# in s8:s11
+        0xbf80_0000, // checkpoint at pc 16
+        0xbf82_fffb, // inner back edge to pc 4
+        0xbf82_fff9, // outer back edge to pc 0
+        0xbf80_0000, // checkpoint at pc 28: loop-carried writes unknown
+        0xf408_0200, (125 << 25) | 16, // independent output T#
+        0xbf81_0000,
+    };
+    var program = try rdna2.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    for (0..8) |index| memory.write(0x4000 + index * 4, @intCast(index + 11));
+    const bindings = testBindings(0x3000, 0x4000);
+    const pcs = [_]u32{ 16, 28, 40 };
+    var snapshots: [pcs.len]ScalarRegisters = undefined;
+    const result = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, program.instructions.items, &pcs, &snapshots);
+    try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
+    for (0..4) |index| {
+        try std.testing.expectEqual(@as(u32, @intCast(index + 11)), snapshots[0][8 + index].value);
+        try std.testing.expect(!snapshots[1][8 + index].known);
+        try std.testing.expectEqual(@as(u32, @intCast(index + 15)), snapshots[2][8 + index].value);
+    }
+    const scalar_loop = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 2 }, .src0 = .{ .kind = .integer_inline_constant, .value = 0 }, .word_count = 1 },
+        .{ .pc = 4, .opcode = .s_add_u32, .dst = .{ .kind = .sgpr, .reg = 2 }, .src0 = .{ .kind = .sgpr, .reg = 2 }, .src1 = .{ .kind = .integer_inline_constant, .value = 1 }, .src_count = 2, .word_count = 1 },
+        .{ .pc = 8, .opcode = .s_cmp_lt_u32, .src0 = .{ .kind = .sgpr, .reg = 2 }, .src1 = .{ .kind = .integer_inline_constant, .value = 3 }, .src_count = 2, .word_count = 1 },
+        .{ .pc = 12, .opcode = .s_cbranch_scc1, .branch_target = 4, .word_count = 1 },
+        .{ .pc = 16, .opcode = .s_endpgm, .word_count = 1 },
+    };
+    const finite = evaluateDecodedResourceState(memory.reader(), &bindings, &scalar_loop);
+    try std.testing.expectEqual(StopReason.end_program, finite.stop_reason);
+    try std.testing.expectEqual(@as(u32, 3), finite.register(2).?.value);
 }
 
 test "resource evaluation follows the active-lane branch path" {
