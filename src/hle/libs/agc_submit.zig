@@ -696,7 +696,6 @@ fn reportPendingBuilderArenasAtFlip() void {
                 builderArenaIsGpuCommandMemory(arena.base),
             },
         );
-
     }
 }
 
@@ -2756,16 +2755,11 @@ fn driverCompletionLabel(
     queue_type: u32,
 ) ?u64 {
     const descriptor_address = @intFromPtr(descriptor);
-    if (inlineDescriptorCompletionLabel(descriptor_address, submission)) |label| {
-        if (driver_completion_chain_reports < 32) {
-            std.debug.print(
-                "[agc submit] descriptor label=0x{x} stream=0x{x}/{d}\n",
-                .{ label, @intFromPtr(submission.address), submission.word_count },
-            );
-            driver_completion_chain_reports += 1;
-        }
-        return label;
-    }
+    // The SDK11 inline descriptor names the packet's generation counter,
+    // which RELEASE_MEM writes and the guest polls for equality. It is not
+    // the older private node's busy flag. Clearing it here races the guest's
+    // polling thread and loses the just-completed generation permanently.
+    if (inlineDescriptorCompletionLabel(descriptor_address, submission) != null) return null;
     const node_slot = descriptor_address +| 0x50;
     var node_bytes: [8]u8 = undefined;
     if (!readGuestMemory(null, node_slot, &node_bytes)) return null;
@@ -2868,6 +2862,8 @@ fn sdk11AcbGenerationPage(
 const Sdk11AcbQueue = struct {
     generation: u32,
     label_index: u32,
+    stream_begin: u64 = 0,
+    stream_end: u64 = 0,
 };
 
 /// Validates a candidate pointer as `owner`'s compute queue object. The queue
@@ -2895,7 +2891,21 @@ fn sdk11AcbQueueAt(queue_address: u64, owner: u32) ?Sdk11AcbQueue {
     {
         return null;
     }
-    return .{ .generation = generation, .label_index = label_index };
+    return .{
+        .generation = generation,
+        .label_index = label_index,
+        // The live builder's bottom/cursor are at +0/+0x10. The lists at
+        // +0xb8/+0xc8 hold retired arenas and do not own this submission.
+        .stream_begin = std.mem.readInt(u64, fields[0x00..0x08], .little),
+        .stream_end = std.mem.readInt(u64, fields[0x10..0x18], .little),
+    };
+}
+
+fn sdk11AcbContainsSubmission(queue: Sdk11AcbQueue, address: u64, words: u32) bool {
+    const bytes = @as(u64, words) * @sizeOf(u32);
+    return words != 0 and queue.stream_begin != 0 and
+        address >= queue.stream_begin and address <= queue.stream_end and
+        bytes <= queue.stream_end - address;
 }
 
 /// Queue objects recovered for an owner, remembered so a later submit whose
@@ -2932,9 +2942,11 @@ fn rememberedSdk11AcbQueue(owner: u32) u64 {
 fn publishSdk11AcbDriverGeneration(
     owner: u32,
     submission: Submission,
-    release: gpu.state.ReleaseMem,
+    release: ?gpu.state.ReleaseMem,
 ) void {
-    if (release.data_selection != 2 or release.data == 0 or release.data > std.math.maxInt(u32)) return;
+    if (release) |packet| {
+        if (packet.data_selection != 2 or packet.data == 0 or packet.data > std.math.maxInt(u32)) return;
+    }
     const stream_address = @intFromPtr(submission.address orelse return);
     const candidates = [_]u64{
         rememberedSdk11AcbQueue(owner),
@@ -2953,6 +2965,7 @@ fn publishSdk11AcbDriverGeneration(
         if (candidate == 0) continue;
         const q = sdk11AcbQueueAt(candidate, owner);
         if (q) |queue| {
+            if (release == null and !sdk11AcbContainsSubmission(queue, stream_address, submission.word_count)) continue;
             found = queue;
             queue_address = candidate;
             break;
@@ -2973,6 +2986,7 @@ fn publishSdk11AcbDriverGeneration(
                 const candidate = std.mem.readInt(u64, &bytes, .little);
                 const q = sdk11AcbQueueAt(candidate, owner);
                 if (q) |queue| {
+                    if (release == null and !sdk11AcbContainsSubmission(queue, stream_address, submission.word_count)) continue;
                     found = queue;
                     queue_address = candidate;
                     break;
@@ -2980,18 +2994,23 @@ fn publishSdk11AcbDriverGeneration(
             }
         }
     }
-    const release_page = release.address & ~@as(u64, 0xfff);
+    const release_page = if (release) |packet| packet.address & ~@as(u64, 0xfff) else 0;
     var target: u64 = 0;
     var generation: u32 = 0;
     if (found) |queue| {
         rememberSdk11AcbQueue(owner, queue_address);
         generation = queue.generation;
-        const label_page = sdk11AcbGenerationPage(
-            release_page,
-            sdk11_acb_label_page.load(.acquire),
-            generation,
-            release.data,
-        ) orelse return;
+        const shared_page = sdk11_acb_label_page.load(.acquire);
+        const label_page = if (release) |packet|
+            sdk11AcbGenerationPage(release_page, shared_page, generation, packet.data) orelse return
+        else page: {
+            // A completed ACB can contain just state/dispatch packets. Its
+            // driver-owned generation still retires: movie playback uses this
+            // form once the first decoded frame is accepted. Require both the
+            // previously proven label table and this queue's command range.
+            if (shared_page == 0 or !sdk11AcbContainsSubmission(queue, stream_address, submission.word_count)) return;
+            break :page shared_page;
+        };
         target = label_page + @as(u64, queue.label_index) * 0x20;
         if ((target & ~@as(u64, 0xfff)) != label_page) return;
         if (driver_completion_reports < 32) {
@@ -3001,6 +3020,7 @@ fn publishSdk11AcbDriverGeneration(
             );
         }
     } else {
+        const packet = release orelse return;
         // Some submissions reach here with the queue object in no
         // callee-saved register at all, but with R15 already holding the
         // driver label this submit is about to advance: it is the same
@@ -3011,7 +3031,7 @@ fn publishSdk11AcbDriverGeneration(
         // own release page, at a real slot, and the monotonic guard below
         // rejects it if the contents do not look like this owner's counter.
         const label = trace.currentGuestR15();
-        if (label == 0 or label == release.address or
+        if (label == 0 or label == packet.address or
             label & 0x1f != 0 or
             (label & ~@as(u64, 0xfff)) != release_page or
             !memory.isGuestRangeAccessible(label, 8))
@@ -3033,7 +3053,7 @@ fn publishSdk11AcbDriverGeneration(
             return;
         }
         target = label;
-        generation = @truncate(release.data);
+        generation = @truncate(packet.data);
     }
     var previous: [8]u8 = undefined;
     if (!readGuestMemory(null, target, &previous)) return;
@@ -3301,6 +3321,8 @@ fn submitAcb(owner: u32, descriptor: ?*const Submission) callconv(abi.guest) i32
     if (outcome.last_release) |release| {
         publishSdk11AcbDriverGeneration(owner, submission.*, release);
         publishSdk11AcbRetirement(release);
+    } else if (outcome.completed) {
+        publishSdk11AcbDriverGeneration(owner, submission.*, null);
     }
     publishAcbCompletion(owner, outcome);
     return errno.ok;
@@ -3943,6 +3965,70 @@ test "SDK11 ACB retirement requires an adjacent self-describing label pair" {
         39,
         40,
     ) == null);
+}
+
+test "SDK11 ACB without a release must fit its owning queue's command range" {
+    const queue = Sdk11AcbQueue{
+        .generation = 8,
+        .label_index = 35,
+        .stream_begin = 0x201eb25b00,
+        .stream_end = 0x201eb35c00,
+    };
+    try testing.expect(sdk11AcbContainsSubmission(queue, queue.stream_begin, 368));
+    try testing.expect(sdk11AcbContainsSubmission(queue, queue.stream_end - 16, 4));
+    try testing.expect(!sdk11AcbContainsSubmission(queue, queue.stream_end - 16, 5));
+    try testing.expect(!sdk11AcbContainsSubmission(queue, queue.stream_end, 1));
+    try testing.expect(!sdk11AcbContainsSubmission(queue, queue.stream_begin - 4, 368));
+    try testing.expect(!sdk11AcbContainsSubmission(queue, queue.stream_begin, 0));
+    try testing.expect(!sdk11AcbContainsSubmission(queue, std.math.maxInt(u64) - 3, 2));
+    try testing.expect(!sdk11AcbContainsSubmission(.{
+        .generation = 8,
+        .label_index = 35,
+    }, 0, 368));
+}
+
+test "SDK11 inline submission labels retain their packet generation" {
+    var labels: [0x1000]u8 align(0x1000) = @splat(0);
+    const page = @intFromPtr(&labels);
+    std.mem.writeInt(u64, labels[0x4a0..0x4a8], 5, .little);
+    var words = [_]u32{ command(gpu.pm4.nop, 1), 0 };
+    var descriptor: [0x60]u8 align(8) = @splat(0);
+    std.mem.writeInt(u64, descriptor[0..8], @intFromPtr(&words), .little);
+    std.mem.writeInt(u32, descriptor[8..12], words.len, .little);
+    std.mem.writeInt(u64, descriptor[0x48..0x50], 0x4a0, .little);
+    std.mem.writeInt(u64, descriptor[0x50..0x58], page, .little);
+    std.mem.writeInt(u64, descriptor[0x58..0x60], page + 0x4a0, .little);
+    const submission: *const Submission = @ptrCast(&descriptor);
+    try testing.expectEqual(@as(?u64, page + 0x4a0), inlineDescriptorCompletionLabel(@intFromPtr(submission), submission.*));
+    try testing.expect(driverCompletionLabel(submission, submission.*, 1) == null);
+    try testing.expectEqual(@as(u64, 5), std.mem.readInt(u64, labels[0x4a0..0x4a8], .little));
+}
+
+test "SDK11 completed ACB without RELEASE_MEM advances its validated queue" {
+    const old_page = sdk11_acb_label_page.load(.acquire);
+    const old_owners = sdk11_acb_queue_owners;
+    const old_addresses = sdk11_acb_queue_addresses;
+    defer {
+        sdk11_acb_label_page.store(old_page, .release);
+        sdk11_acb_queue_owners = old_owners;
+        sdk11_acb_queue_addresses = old_addresses;
+    }
+    var labels: [0x1000]u8 align(0x1000) = @splat(0);
+    var words = [_]u32{ command(gpu.pm4.nop, 1), 0 };
+    var queue: [0xe8]u8 align(8) = @splat(0);
+    for ([_]usize{ 0x28, 0x80, 0x88 }) |offset| {
+        std.mem.writeInt(u64, queue[offset..][0..8], @intFromPtr(&queue), .little);
+    }
+    std.mem.writeInt(u64, queue[0x00..0x08], @intFromPtr(&words), .little);
+    std.mem.writeInt(u64, queue[0x10..0x18], @intFromPtr(&words) + @sizeOf(@TypeOf(words)), .little);
+    std.mem.writeInt(u32, queue[0xd0..0xd4], 8, .little);
+    std.mem.writeInt(u32, queue[0xd4..0xd8], 35, .little);
+    std.mem.writeInt(u64, labels[0x460..0x468], 7, .little);
+    sdk11_acb_label_page.store(@intFromPtr(&labels), .release);
+    rememberSdk11AcbQueue(0x20, @intFromPtr(&queue));
+    publishSdk11AcbDriverGeneration(0x20, .{ .address = &words, .word_count = words.len, .reserved = 0 }, null);
+    try testing.expectEqual(@as(u64, 8), std.mem.readInt(u64, labels[0x460..0x468], .little));
+    try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, labels[0x480..0x488], .little));
 }
 
 test "SDK11 ACB generations switch from packet-local to the proven shared page" {

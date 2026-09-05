@@ -82,6 +82,7 @@ pub const Error = error{
     FenceResetFailed,
     TimelineSemaphoreUnavailable,
     TimelineSemaphoreCreationFailed,
+    PresentationSemaphoreCreationFailed,
     TimelineSemaphoreQueryFailed,
     TimelineSemaphoreWaitFailed,
     QueueSubmissionFailed,
@@ -162,6 +163,9 @@ pub const Options = struct {
     /// Suppresses only the bounded startup interval. Unlike the diagnostic
     /// all-frame switch, complete compute rendering resumes automatically.
     skip_compute_until_flip: u64 = 0,
+    /// Title profile for movies presented as an opaque fullscreen surface.
+    /// Keep buffer/GDS producers while avoiding the covered scene's image work.
+    prioritize_fullscreen_video: bool = false,
     /// Diagnostic bisection aid: execute at most this many guest compute
     /// dispatches, then keep command processing without submitting later ones.
     compute_execution_limit: ?u64 = null,
@@ -252,7 +256,8 @@ pub const PresentationSink = struct {
 
 pub const VideoFrameSink = struct {
     context: ?*anyopaque = null,
-    submit: *const fn (?*anyopaque, u32, u32, u32, []const u8) void,
+    submit: *const fn (?*anyopaque, u64, u32, u32, u32, []const u8) u64,
+    finish: *const fn (?*anyopaque, u64) void,
     /// How many decoded frames have actually reached the display.
     ///
     /// A title decodes as fast as its pictures are accepted, which is far
@@ -1881,7 +1886,74 @@ const WindowPresentation = struct {
     upload: OwnedBuffer,
     /// Persistent acquire fence, reset and reused by every batched present.
     acquire_fence: vk.Fence,
+    /// Reuse only after acquiring the same image, which proves that its last
+    /// presentation consumed the binary semaphore signal.
+    render_complete: []vk.Semaphore,
 };
+
+const PackedClearStaging = struct {
+    // Clear passes alternate black, white, finite-half maxima and several
+    // packed mask values. Keep that small palette instead of refilling the
+    // largest staging allocation every time two different values alternate.
+    buffers: [8]std.ArrayList(u32) = @splat(.empty),
+    values: [8]?u32 = @splat(null),
+    next_slot: usize = 0,
+
+    fn deinit(self: *PackedClearStaging, allocator: std.mem.Allocator) void {
+        for (&self.buffers) |*buffer| buffer.deinit(allocator);
+    }
+
+    fn bytes(self: *PackedClearStaging, allocator: std.mem.Allocator, value: u32, count: usize) ![]const u8 {
+        const slot = for (self.values, 0..) |cached, index| {
+            if (cached == value) break index;
+        } else blk: {
+            const index = self.next_slot;
+            self.next_slot = (index + 1) % self.buffers.len;
+            break :blk index;
+        };
+        const buffer = &self.buffers[slot];
+        const old_len = buffer.items.len;
+        const words = count / @sizeOf(u32);
+        if (words > old_len) try buffer.resize(allocator, words);
+        if (self.values[slot] != value) {
+            fillPackedWords(buffer.items, value);
+        } else if (words > old_len) {
+            fillPackedWords(buffer.items[old_len..], value);
+        }
+        self.values[slot] = value;
+        return std.mem.sliceAsBytes(buffer.items[0..words]);
+    }
+};
+
+fn fillPackedWords(words: []u32, value: u32) void {
+    const vector: @Vector(16, u32) = @splat(value);
+    var index: usize = 0;
+    while (index + 16 <= words.len) : (index += 16) {
+        const destination: *align(@alignOf(u32)) @Vector(16, u32) = @ptrCast(words[index..].ptr);
+        destination.* = vector;
+    }
+    @memset(words[index..], value);
+}
+
+test "packed clear staging preserves both patterns and initializes growth" {
+    var cache = PackedClearStaging{};
+    defer cache.deinit(std.testing.allocator);
+    const zero = try cache.bytes(std.testing.allocator, 0, 68);
+    const white = try cache.bytes(std.testing.allocator, 0xffff_ffff, 132);
+    try std.testing.expect(std.mem.allEqual(u8, zero, 0));
+    try std.testing.expect(std.mem.allEqual(u8, white, 255));
+    for ([_]u32{ 0x40404040, 0x80808080, 0x10101010, 0x7bff7bff }) |pattern| {
+        _ = try cache.bytes(std.testing.allocator, pattern, 256);
+    }
+    try std.testing.expectEqual(zero.ptr, (try cache.bytes(std.testing.allocator, 0, 64)).ptr);
+    const grown = try cache.bytes(std.testing.allocator, 0, 516);
+    try std.testing.expect(std.mem.allEqual(u8, grown, 0));
+    var guarded: [37]u32 = @splat(0xcdcd_cdcd);
+    fillPackedWords(guarded[1..36], 0x3c00_3c00);
+    try std.testing.expectEqual(@as(u32, 0xcdcd_cdcd), guarded[0]);
+    try std.testing.expectEqual(@as(u32, 0xcdcd_cdcd), guarded[36]);
+    try std.testing.expect(std.mem.allEqual(u32, guarded[1..36], 0x3c00_3c00));
+}
 
 const PreparedSampledImage = struct {
     image: OwnedImage,
@@ -2845,6 +2917,7 @@ pub const Renderer = struct {
     force_probe_fragment_ui: bool,
     skip_compute_dispatches: bool,
     skip_compute_until_flip: u64,
+    prioritize_fullscreen_video: bool,
     compute_execution_limit: ?u64,
     sparse_graphics_draws: bool,
     translate_compute_only: bool,
@@ -2865,6 +2938,7 @@ pub const Renderer = struct {
     /// Holds a display buffer read straight out of guest memory, for a flip
     /// that names a buffer nothing was rendered into.
     guest_frame_scratch: std.ArrayList(u8) = .empty,
+    packed_clear_staging: PackedClearStaging = .{},
     // A movie converts a new frame every time one is presented, and its three
     // working buffers are large and identically sized from one frame to the
     // next. Holding them costs the size of one frame and saves faulting in
@@ -3011,7 +3085,12 @@ pub const Renderer = struct {
     /// Counts decoded frames that reached the display, so the decoder can
     /// pace itself against what is actually seen.
     presented_video_frames: std.atomic.Value(u64) = .init(0),
+    active_video_decoder: std.atomic.Value(u64) = .init(0),
+    submitted_video_frames: u64 = 0,
+    uploaded_video_frame: u64 = 0,
     last_video_present_ns: u64 = 0,
+    pumping_video: bool = false,
+    uploading_video: bool = false,
     pending_video_mutex: Lock = .{},
     pending_video_rgba: std.ArrayListUnmanaged(u8) = .empty,
     pending_video_width: u32 = 0,
@@ -3258,8 +3337,19 @@ pub const Renderer = struct {
         if (supported_features.values[vk.feature_robust_buffer_access] != 0) {
             enabled_features.values[vk.feature_robust_buffer_access] = vk.true_value;
         }
+        // Guest MRT passes use separate write masks and blend equations for
+        // each attachment, which requires independentBlend on the device.
+        if (supported_features.values[vk.feature_independent_blend] != 0) {
+            enabled_features.values[vk.feature_independent_blend] = vk.true_value;
+        }
         if (supported_features.values[vk.feature_shader_storage_image_extended_formats] != 0) {
             enabled_features.values[vk.feature_shader_storage_image_extended_formats] = vk.true_value;
+        }
+        // Translated vertex stages can access writable storage buffers. The
+        // device must enable this feature before those pipelines are created,
+        // even when a particular shader only reads the declared buffer.
+        if (supported_features.values[vk.feature_vertex_pipeline_stores_and_atomics] != 0) {
+            enabled_features.values[vk.feature_vertex_pipeline_stores_and_atomics] = vk.true_value;
         }
         if (supported_features.values[vk.feature_fragment_stores_and_atomics] != 0) {
             enabled_features.values[vk.feature_fragment_stores_and_atomics] = vk.true_value;
@@ -3520,6 +3610,8 @@ pub const Renderer = struct {
             device_functions.destroy_buffer(device, presentation.upload.handle, null);
             device_functions.free_memory(device, presentation.upload.memory, null);
             device_functions.destroy_fence(device, presentation.acquire_fence, null);
+            for (presentation.render_complete) |semaphore| device_functions.destroy_semaphore(device, semaphore, null);
+            allocator.free(presentation.render_complete);
         };
 
         var renderer = Renderer{
@@ -3556,6 +3648,7 @@ pub const Renderer = struct {
             .force_probe_fragment_ui = options.force_probe_fragment_ui,
             .skip_compute_dispatches = options.skip_compute_dispatches,
             .skip_compute_until_flip = options.skip_compute_until_flip,
+            .prioritize_fullscreen_video = options.prioritize_fullscreen_video,
             .compute_execution_limit = options.compute_execution_limit,
             .sparse_graphics_draws = options.sparse_graphics_draws,
             .translate_compute_only = options.translate_compute_only,
@@ -3704,6 +3797,7 @@ pub const Renderer = struct {
         for (self.completed_frames.items) |*frame| frame.pixels.deinit(self.allocator);
         self.completed_frames.deinit(self.allocator);
         self.guest_frame_scratch.deinit(self.allocator);
+        self.packed_clear_staging.deinit(self.allocator);
         self.movie_luma_scratch.deinit(self.allocator);
         self.movie_chroma_scratch.deinit(self.allocator);
         self.movie_rgba_scratch.deinit(self.allocator);
@@ -3750,6 +3844,8 @@ pub const Renderer = struct {
             self.device_functions.destroy_buffer(self.device, presentation.upload.handle, null);
             self.device_functions.free_memory(self.device, presentation.upload.memory, null);
             self.device_functions.destroy_fence(self.device, presentation.acquire_fence, null);
+            for (presentation.render_complete) |semaphore| self.device_functions.destroy_semaphore(self.device, semaphore, null);
+            self.allocator.free(presentation.render_complete);
             presentation.surface_functions.destroy_surface(self.instance_handle, presentation.surface, null);
         }
         self.device_functions.destroy_semaphore(self.device, self.timeline_semaphore, null);
@@ -3805,6 +3901,7 @@ pub const Renderer = struct {
         return .{
             .context = self,
             .submit = submitVideoFrameCallback,
+            .finish = finishVideoCallback,
             .presented = presentedVideoFramesCallback,
         };
     }
@@ -3816,13 +3913,39 @@ pub const Renderer = struct {
 
     fn submitVideoFrameCallback(
         context: ?*anyopaque,
+        decoder: u64,
         width: u32,
         height: u32,
         pitch: u32,
         bytes: []const u8,
-    ) void {
+    ) u64 {
         const self: *Renderer = @ptrCast(@alignCast(context.?));
-        self.submitVideoFrame(width, height, pitch, bytes);
+        return self.submitVideoFrame(decoder, width, height, pitch, bytes);
+    }
+
+    fn finishVideoCallback(context: ?*anyopaque, decoder: u64) void {
+        const self: *Renderer = @ptrCast(@alignCast(context.?));
+        _ = self.active_video_decoder.cmpxchgStrong(decoder, 0, .acq_rel, .acquire);
+    }
+
+    fn fullscreenVideoActive(self: *const Renderer) bool {
+        return self.prioritize_fullscreen_video and self.window_presentation != null and
+            self.active_video_decoder.load(.acquire) != 0;
+    }
+
+    fn canElideCoveredDraw(self: *Renderer, state: *const gpu.State) bool {
+        if (!self.fullscreenVideoActive()) return false;
+        const memory = self.guest_memory orelse return false;
+        const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
+        const stages = [_]?gpu.resources.ShaderStage{ graphicsVertexStage(state), .pixel };
+        for (stages) |maybe_stage| {
+            const stage = maybe_stage orelse continue;
+            const address = stage.programAddress(state) orelse continue;
+            const header = if (memory.shader_header) |resolve| resolve(memory.context, address) else null;
+            const analysis = self.analyzedProgram(reader, address, header) catch return false;
+            if (analysis.hasNonRasterEffects()) return false;
+        }
+        return true;
     }
 
     /// Presents one already-linear frame to the optional window swapchain.
@@ -3975,6 +4098,10 @@ pub const Renderer = struct {
         );
         try self.submitOneShot(command_buffer);
 
+        // A draw batch can defer submitOneShot. Finish the copy before
+        // releasing this acquired image to presentation; queue_present has
+        // no wait semaphore in this path.
+        try self.waitForSubmittedWork();
         const present_info = vk.PresentInfoKHR{
             .swapchain_count = 1,
             .swapchains = @ptrCast(&presentation.swapchain),
@@ -4011,6 +4138,9 @@ pub const Renderer = struct {
     /// Vulkan performs format conversion and 1920×1080→window scaling in the
     /// blit; the source returns to attachment layout for the next guest draw.
     fn blitRenderTargetToSwapchain(self: *Renderer, target_index: usize) anyerror!void {
+        if (self.present_in_flight) return Error.PresentationRejected;
+        self.present_in_flight = true;
+        defer self.present_in_flight = false;
         if (target_index >= self.render_targets.items.len) return Error.MissingPresentedFrame;
         try self.transitionRenderTargetToColorAttachment(target_index);
         const target = self.render_targets.items[target_index];
@@ -4138,7 +4268,13 @@ pub const Renderer = struct {
         );
         try self.submitOneShot(command_buffer);
 
+        // Flush the copy even inside a guest batch. Presentation waits on the
+        // GPU signal, so the CPU can continue processing guest commands.
+        const render_complete = presentation.render_complete[image_index];
+        try self.flushQueuedCommandsSignaling(render_complete);
         const present_info = vk.PresentInfoKHR{
+            .wait_semaphore_count = 1,
+            .wait_semaphores = @ptrCast(&render_complete),
             .swapchain_count = 1,
             .swapchains = @ptrCast(&presentation.swapchain),
             .image_indices = @ptrCast(&image_index),
@@ -4500,6 +4636,11 @@ pub const Renderer = struct {
         else
             null;
         const analysis = try self.analyzedProgram(reader, program_address, header_address);
+        if (self.fullscreenVideoActive() and !analysis.hasBufferExternalEffects()) {
+            self.elided_dispatches += 1;
+            self.noteComputeKind("covered-by-video");
+            return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
+        }
         var module = try analysis.translateSpirv(self.allocator, .{ .stage = .compute, .local_size = local_size });
         defer module.deinit(self.allocator);
         return self.dispatchSpirv(module.words, group_count);
@@ -4525,9 +4666,14 @@ pub const Renderer = struct {
             resolve(memory.context, program_address)
         else
             null;
+        const analysis = try self.analyzedProgram(reader, program_address, header_address);
+        if (self.fullscreenVideoActive() and !analysis.hasBufferExternalEffects()) {
+            self.elided_dispatches += 1;
+            self.noteComputeKind("covered-by-video");
+            return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
+        }
         const bindings = try gpu.ShaderBindings.capture(state, .compute, header_address, reader);
         const system_registers = gpu.resources.decodeComputeSystemRegisters(state);
-        const analysis = try self.analyzedProgram(reader, program_address, header_address);
         const program_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(analysis.program.code));
         if (self.device_info.vendor_id == 0x10de and self.reanimal_nvidia_compute_quarantined) {
             self.elided_dispatches += 1;
@@ -4734,8 +4880,7 @@ pub const Renderer = struct {
                 analysis,
                 group_count,
                 program_address,
-            )) |report|
-            {
+            )) |report| {
                 return report;
             }
         }
@@ -6793,8 +6938,6 @@ pub const Renderer = struct {
                 return Error.GuestBufferTooLarge;
             if (byte_count == 0 or byte_count > maximum_frame_bytes or byte_count & 0xf != 0) return null;
             try self.flushPendingGuestWrite(descriptor.address, byte_count);
-            const bytes = try self.allocator.alloc(u8, byte_count);
-            defer self.allocator.free(bytes);
             var pattern: [16]u8 = undefined;
             inline for (0..4) |index| {
                 const value = state.readRegister(.shader, 0x244 + index) orelse return null;
@@ -6812,10 +6955,11 @@ pub const Renderer = struct {
                     std.mem.writeInt(u16, pattern[half..][0..2], one, .little);
                 }
             }
-            var offset: usize = 0;
-            while (offset < bytes.len) : (offset += pattern.len) {
-                @memcpy(bytes[offset..][0..pattern.len], &pattern);
-            }
+            // A recurring clear must not allocate, poison and free tens of
+            // MiB on each dispatch. Keep the repeated word pattern in a host
+            // staging buffer; guest writes still happen on every invocation.
+            const value = std.mem.readInt(u32, pattern[0..4], .little);
+            const bytes = try self.packed_clear_staging.bytes(self.allocator, value, byte_count);
             if (!memory.write(memory.context, descriptor.address, bytes)) return Error.GuestMemoryWriteFailed;
             self.invalidateDmaDestination(descriptor.address, byte_count);
             self.emulated_buffer_clear_dispatches += 1;
@@ -14294,6 +14438,9 @@ pub const Renderer = struct {
 
     fn acquireLinearUploadBuffer(self: *Renderer, byte_count: usize) anyerror!OwnedBuffer {
         if (self.linear_upload_buffer) |buffer| {
+            // Present is asynchronous. Do not overwrite (or destroy) the
+            // transfer source until its preceding GPU upload has completed.
+            try self.waitForSubmittedWork();
             if (buffer.size >= byte_count) return buffer;
             self.destroyBuffer(buffer);
             self.linear_upload_buffer = null;
@@ -14543,12 +14690,13 @@ pub const Renderer = struct {
 
     pub fn submitVideoFrame(
         self: *Renderer,
+        decoder: u64,
         width: u32,
         height: u32,
         pitch: u32,
         bytes: []const u8,
-    ) void {
-        if (width == 0 or height == 0 or pitch == 0 or bytes.len == 0) return;
+    ) u64 {
+        if (width == 0 or height == 0 or pitch == 0 or bytes.len == 0) return 0;
         const visible_height: u32 = if (height == 1088) 1080 else height;
         const visible_width: u32 = width;
         const rgba_bytes = @as(usize, visible_width) * visible_height * 4;
@@ -14556,7 +14704,7 @@ pub const Renderer = struct {
         self.pending_video_mutex.lock();
         defer self.pending_video_mutex.unlock();
 
-        self.pending_video_rgba.resize(self.allocator, rgba_bytes) catch return;
+        self.pending_video_rgba.resize(self.allocator, rgba_bytes) catch return 0;
         convertNv12ToRgba8(
             bytes,
             height,
@@ -14568,21 +14716,28 @@ pub const Renderer = struct {
         self.pending_video_width = visible_width;
         self.pending_video_height = visible_height;
         self.pending_video_ready = true;
+        self.submitted_video_frames += 1;
+        self.active_video_decoder.store(decoder, .release);
+        return self.submitted_video_frames;
     }
 
     fn uploadPendingVideoFrame(self: *Renderer) anyerror!void {
         if (self.window_presentation == null) return;
-        self.pending_video_mutex.lock();
-        if (!self.pending_video_ready) {
-            self.pending_video_mutex.unlock();
-            return;
-        }
-        const width = self.pending_video_width;
-        const height = self.pending_video_height;
-        try self.video_upload_rgba.resize(self.allocator, self.pending_video_rgba.items.len);
-        @memcpy(self.video_upload_rgba.items, self.pending_video_rgba.items);
-        self.pending_video_ready = false;
-        self.pending_video_mutex.unlock();
+        if (self.uploading_video) return;
+        self.uploading_video = true;
+        defer self.uploading_video = false;
+        const dimensions = blk: {
+            if (!self.pending_video_mutex.inner.tryLock()) return;
+            defer self.pending_video_mutex.unlock();
+            if (!self.pending_video_ready) return;
+            try self.video_upload_rgba.resize(self.allocator, self.pending_video_rgba.items.len);
+            @memcpy(self.video_upload_rgba.items, self.pending_video_rgba.items);
+            self.pending_video_ready = false;
+            self.uploaded_video_frame = self.submitted_video_frames;
+            break :blk .{ self.pending_video_width, self.pending_video_height };
+        };
+        const width = dimensions[0];
+        const height = dimensions[1];
 
         var desc = std.mem.zeroes(gpu.resources.ColorTarget);
         desc.address = 0xffff_ffff_5649_4445;
@@ -14610,8 +14765,8 @@ pub const Renderer = struct {
     /// and does so on this thread, so stepping the movie here needs no locking
     /// and gives it a cadence of its own.
     fn pumpVideoPresentation(self: *Renderer) void {
-        if (self.window_presentation == null) return;
-        self.pending_video_mutex.lock();
+        if (self.window_presentation == null or self.present_in_flight or self.pumping_video or self.uploading_video) return;
+        if (!self.pending_video_mutex.inner.tryLock()) return;
         const ready = self.pending_video_ready;
         self.pending_video_mutex.unlock();
         if (!ready) return;
@@ -14622,12 +14777,16 @@ pub const Renderer = struct {
         if (now -| self.last_video_present_ns < minimum_video_present_interval_ns) return;
         self.last_video_present_ns = now;
 
+        // Uploads and blits can flush command buffers and revisit this pump.
+        // Keep that recursion from acquiring another image mid-presentation.
+        self.pumping_video = true;
+        defer self.pumping_video = false;
         self.uploadPendingVideoFrame() catch return;
         const index = self.latest_video_render_target_index orelse return;
         if (index >= self.render_targets.items.len) return;
         if (!self.render_targets.items[index].initialized) return;
         self.blitRenderTargetToSwapchain(index) catch return;
-        _ = self.presented_video_frames.fetchAdd(1, .release);
+        self.presented_video_frames.store(self.uploaded_video_frame, .release);
     }
 
     fn prepareGraphicsResources(
@@ -16905,25 +17064,30 @@ pub const Renderer = struct {
     }
 
     fn flushQueuedCommands(self: *Renderer) Error!void {
+        return self.flushQueuedCommandsSignaling(null);
+    }
+
+    fn flushQueuedCommandsSignaling(self: *Renderer, present_semaphore: ?vk.Semaphore) Error!void {
         if (self.recording_command_buffer != null) return Error.CommandBufferEndFailed;
-        if (self.pending_command_buffers.items.len == 0) {
+        if (self.pending_command_buffers.items.len == 0 and present_semaphore == null) {
             try self.refreshGpuProgress();
             return;
         }
         std.debug.assert(self.pending_command_buffers.items.len == self.pending_command_slots.items.len);
         const signal_tick = self.submitted_tick +% 1;
         if (signal_tick == 0) return Error.QueueSubmissionFailed;
-        const signal_values = [_]u64{signal_tick};
+        const signal_count: u32 = if (present_semaphore != null) 2 else 1;
+        const signal_values = [_]u64{ signal_tick, 0 };
         const timeline_info = vk.TimelineSemaphoreSubmitInfo{
-            .signal_semaphore_value_count = 1,
+            .signal_semaphore_value_count = signal_count,
             .signal_semaphore_values = &signal_values,
         };
-        const signal_semaphores = [_]vk.Semaphore{self.timeline_semaphore};
+        const signal_semaphores = [_]vk.Semaphore{ self.timeline_semaphore, present_semaphore orelse 0 };
         const submit_info = vk.SubmitInfo{
             .p_next = &timeline_info,
             .command_buffer_count = @intCast(self.pending_command_buffers.items.len),
             .command_buffers = self.pending_command_buffers.items.ptr,
-            .signal_semaphore_count = 1,
+            .signal_semaphore_count = signal_count,
             .signal_semaphores = &signal_semaphores,
         };
         const submit_result = self.device_functions.queue_submit(self.queue, 1, @ptrCast(&submit_info), 0);
@@ -18488,7 +18652,7 @@ pub const Renderer = struct {
                 self.last_flip_error = err;
                 return false;
             };
-            if (self.capture_extended_progress_frames and
+            if (self.capture_extended_progress_frames and !self.fullscreenVideoActive() and
                 (self.flip_callbacks == 64 or self.flip_callbacks == 96 or
                     self.flip_callbacks == 128))
             {
@@ -18586,7 +18750,7 @@ pub const Renderer = struct {
             // draws stop, so menus/gameplay resume using the requested buffer.
             const presenting_video = self.window_presentation != null and
                 self.latest_video_render_target_index != null and
-                self.flip_callbacks -| self.video_surface_last_flip <= 2;
+                (self.fullscreenVideoActive() or self.flip_callbacks -| self.video_surface_last_flip <= 2);
             if (presenting_video != self.was_presenting_video) {
                 self.was_presenting_video = presenting_video;
                 if (self.video_presentation_reports < 16) {
@@ -18607,6 +18771,16 @@ pub const Renderer = struct {
                 if (video_index < self.render_targets.items.len and
                     self.render_targets.items[video_index].initialized)
                 {
+                    // The submission pump may already have shown this exact
+                    // decoded picture. A duplicate present adds another host
+                    // vsync wait and slows the guest's video consumer loop.
+                    if (self.fullscreenVideoActive() and
+                        self.presented_video_frames.load(.acquire) == self.uploaded_video_frame and
+                        !shouldDumpProgressFrame(self.flip_callbacks, self.capture_extended_progress_frames))
+                    {
+                        self.last_flip_error = null;
+                        return true;
+                    }
                     // The active decoded-video surface is already a resident
                     // Vulkan image. Present it directly instead of reading a
                     // full 1080p frame into host RAM only for the window sink
@@ -18640,7 +18814,7 @@ pub const Renderer = struct {
                     // One decoded frame has now reached the display, which is what
                     // the decoder waits on before letting the title hand over the
                     // next one.
-                    _ = self.presented_video_frames.fetchAdd(1, .release);
+                    self.presented_video_frames.store(self.uploaded_video_frame, .release);
                     self.presented_frames += 1;
                     self.last_flip_error = null;
                     return true;
@@ -19030,6 +19204,10 @@ pub const Renderer = struct {
         defer self.frame_profile.draw_ns +|= elapsedHostNanoseconds(profile_started);
         self.draw_callbacks += 1;
         self.frame_profile.draws += 1;
+        if (self.canElideCoveredDraw(state)) {
+            self.last_draw_error = null;
+            return true;
+        }
         if (shouldElideSparseGraphics(self.sparse_graphics_draws, self.flip_callbacks)) {
             self.last_draw_error = null;
             return true;
@@ -23490,6 +23668,16 @@ fn createWindowPresentation(
         return Error.FenceCreationFailed;
     }
     errdefer device_functions.destroy_fence(device, acquire_fence, null);
+    const render_complete = try allocator.alloc(vk.Semaphore, images.len);
+    errdefer allocator.free(render_complete);
+    var created: usize = 0;
+    errdefer for (render_complete[0..created]) |semaphore| device_functions.destroy_semaphore(device, semaphore, null);
+    for (render_complete) |*semaphore| {
+        const info = vk.SemaphoreCreateInfo{};
+        if (device_functions.create_semaphore(device, &info, null, semaphore) != vk.success)
+            return Error.PresentationSemaphoreCreationFailed;
+        created += 1;
+    }
     return .{
         .native_window = native_window,
         .surface_functions = surface_functions,
@@ -23501,6 +23689,7 @@ fn createWindowPresentation(
         .format = surface_format.format,
         .upload = .{ .handle = upload_handle, .memory = upload_memory, .size = output_bytes },
         .acquire_fence = acquire_fence,
+        .render_complete = render_complete,
     };
 }
 

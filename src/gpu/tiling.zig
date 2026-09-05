@@ -866,7 +866,7 @@ pub const Layout = struct {
             const source_row_bytes = @as(usize, self.row_pitch_elements) * element_bytes;
             for (0..self.layers) |layer_index| {
                 const physical_slice = @as(usize, self.first_slice) + layer_index;
-                const source_slice: usize = @intCast(self.source_slice_bytes * physical_slice);
+                const source_slice: usize = @intCast(self.source_slice_bytes * physical_slice + self.source_base_offset);
                 const staging_slice: usize = @intCast(self.staging_slice_bytes * layer_index);
                 for (0..self.height) |y| {
                     const src = source_slice + y * source_row_bytes;
@@ -886,7 +886,7 @@ pub const Layout = struct {
         if (self.block.width > row_offsets.len) return Error.UnsupportedTileMode;
         for (0..self.layers) |layer_index| {
             const physical_slice: u32 = try addU32(self.first_slice, @intCast(layer_index));
-            const source_slice: usize = @intCast(try multiply(self.source_slice_bytes, physical_slice));
+            const source_slice: usize = @intCast(try add(try multiply(self.source_slice_bytes, physical_slice), self.source_base_offset));
             const staging_slice: usize = @intCast(try multiply(self.staging_slice_bytes, layer_index));
             // The in-block address map is identical in every macro-block row.
             // Make local_y the outer loop so each row is evaluated once per
@@ -948,7 +948,7 @@ pub const Layout = struct {
             const destination_row_bytes = @as(usize, self.row_pitch_elements) * element_bytes;
             for (0..self.layers) |layer_index| {
                 const physical_slice = @as(usize, self.first_slice) + layer_index;
-                const destination_slice: usize = @intCast(self.source_slice_bytes * physical_slice);
+                const destination_slice: usize = @intCast(self.source_slice_bytes * physical_slice + self.source_base_offset);
                 const staging_slice: usize = @intCast(self.staging_slice_bytes * layer_index);
                 for (0..self.height) |y| {
                     const src = staging_slice + y * row_bytes;
@@ -963,7 +963,7 @@ pub const Layout = struct {
         if (self.block.width > row_offsets.len) return Error.UnsupportedTileMode;
         for (0..self.layers) |layer_index| {
             const physical_slice: u32 = try addU32(self.first_slice, @intCast(layer_index));
-            const destination_slice: usize = @intCast(try multiply(self.source_slice_bytes, physical_slice));
+            const destination_slice: usize = @intCast(try add(try multiply(self.source_slice_bytes, physical_slice), self.source_base_offset));
             const staging_slice: usize = @intCast(try multiply(self.staging_slice_bytes, layer_index));
             for (0..self.block.height) |local_y_index| {
                 const local_y: u32 = @intCast(local_y_index);
@@ -1604,9 +1604,39 @@ pub const SubresourceLayout = struct {
         }
     }
 
+    /// Ordinary 2D mips share Layout's block equation. Reuse its row copies
+    /// and cached swizzle offsets instead of evaluating the general volume /
+    /// MSAA address function millions of times for each full-resolution image.
+    fn blockCopyLayout(self: SubresourceLayout) Error!?Layout {
+        if (self.kind != .array_2d or self.in_tail or self.block.samples_log2 != 0) return null;
+        const mode: resources.TileMode = switch (self.block.family) {
+            .linear => .linear,
+            .standard_256b => .standard_256b,
+            .standard_4kb => .standard_4kb,
+            .standard_64kb => .standard_64kb,
+            .partially_resident => .partially_resident,
+            .depth_64kb => .depth,
+            .render_target_64kb => .render_target,
+            else => return null,
+        };
+        var layout = try Layout.init(.{
+            .tile_mode = mode,
+            .width = self.width,
+            .height = self.height,
+            .layers = self.depth_or_layers,
+            .first_slice = self.first_slice,
+            .row_pitch_elements = self.padded_width,
+        }, self.block.bytes_per_element);
+        layout.source_base_offset = self.level_offset;
+        layout.source_slice_bytes = self.source_layer_bytes;
+        layout.required_source_bytes = self.required_source_bytes;
+        return layout;
+    }
+
     pub fn detile(self: SubresourceLayout, source: []const u8, destination: []u8) Error!void {
         if (@as(u64, source.len) < self.required_source_bytes) return Error.SourceTooSmall;
         if (@as(u64, destination.len) < try self.stagingBytes()) return Error.DestinationTooSmall;
+        if (try self.blockCopyLayout()) |layout| return layout.detile(source, destination);
         const bytes = self.block.bytes_per_element;
         for (0..self.depth_or_layers) |slice_index| {
             const slice: u32 = @intCast(slice_index);
@@ -1628,6 +1658,7 @@ pub const SubresourceLayout = struct {
     pub fn tile(self: SubresourceLayout, source: []const u8, destination: []u8) Error!void {
         if (@as(u64, source.len) < try self.stagingBytes()) return Error.SourceTooSmall;
         if (@as(u64, destination.len) < self.required_source_bytes) return Error.DestinationTooSmall;
+        if (try self.blockCopyLayout()) |layout| return layout.tile(source, destination);
         const bytes = self.block.bytes_per_element;
         for (0..self.depth_or_layers) |slice_index| {
             const slice: u32 = @intCast(slice_index);
@@ -3082,6 +3113,42 @@ test "compute detile constants are compact stable POD derived from the CPU view"
     const relative = try view.computePlan(0, 0);
     try testing.expectEqual(try view.sourceByteOffset(3, 5, 1, 0), computeSourceOffset(relative.params, 3, 5, 1, 0));
     try testing.expectEqual(try view.stagingByteOffset(3, 5, 1, 0), computeDestinationOffset(relative.params, 3, 5, 1, 0));
+}
+
+test "2D block copies match scalar addressing across mips slices and padding" {
+    for ([_]resources.TileMode{ .linear, .standard_256b, .standard_4kb, .standard_64kb, .partially_resident, .depth, .render_target }) |mode| {
+        for ([_]u8{ 1, 2, 4, 8, 16 }) |element_bytes| {
+            if (mode == .depth and element_bytes > 8) continue;
+            const texture = try TextureLayout.init(.{
+                .tile_mode = mode,
+                .width = 273,
+                .height = 139,
+                .depth_or_layers = 2,
+                .first_slice = 1,
+                .mip_levels = 3,
+            }, element_bytes);
+            const allocation = try testing.allocator.alloc(u8, @intCast(texture.required_source_bytes));
+            defer testing.allocator.free(allocation);
+            for (allocation, 0..) |*byte, index| byte.* = @truncate(index ^ (index >> 8) ^ (index >> 16));
+            for (0..texture.mip_levels) |level| {
+                const view = try texture.subresource(@intCast(level), 0, texture.layers);
+                const linear = try testing.allocator.alloc(u8, @intCast(try view.stagingBytes()));
+                defer testing.allocator.free(linear);
+                const expected = try testing.allocator.alloc(u8, linear.len);
+                defer testing.allocator.free(expected);
+                const memory = TestMemory{ .base = 0x4000_0000, .bytes = allocation };
+                // stage uses the independent per-coordinate reference path.
+                try view.stage(memory.reader(), memory.base, expected);
+                try view.detile(allocation, linear);
+                try testing.expectEqualSlices(u8, expected, linear);
+                const tiled = try testing.allocator.dupe(u8, allocation);
+                defer testing.allocator.free(tiled);
+                try view.tile(linear, tiled);
+                // Include padding and the unselected mips / array slices.
+                try testing.expectEqualSlices(u8, allocation, tiled);
+            }
+        }
+    }
 }
 
 test "fromImage stages a non-zero 2D mip from the allocation origin" {

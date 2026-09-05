@@ -45,6 +45,7 @@ const audio_in_error_port_full: i32 = @bitCast(@as(u32, 0x8026_0107));
 
 const audio_out2_error_invalid_parameter: i32 = @bitCast(@as(u32, 0x8026_8001));
 const audio_out2_error_port_full: i32 = @bitCast(@as(u32, 0x8026_8012));
+const audio_out2_error_not_ready: i32 = @bitCast(@as(u32, 0x8026_8008));
 
 const ajm_error_invalid_context: i32 = @bitCast(@as(u32, 0x8093_0002));
 const ajm_error_invalid_parameter: i32 = @bitCast(@as(u32, 0x8093_0005));
@@ -712,7 +713,8 @@ const AudioObject = struct {
     port_type: u16 = 0,
     pcm_address: u64 = 0,
     pcm_pending: bool = false,
-    next_advance_ns: u64 = 0,
+    queued_grains: u32 = 0,
+    queue_updated_ns: u64 = 0,
 };
 
 const maximum_audio_objects = 512;
@@ -832,7 +834,7 @@ fn mixAudioOut2Port(
         if (channels >= 8) {
             const fl = readAudioOut2Sample(frame_slice[0 * bytes_per_sample ..], is_float, bytes_per_sample);
             const fr = readAudioOut2Sample(frame_slice[1 * bytes_per_sample ..], is_float, bytes_per_sample);
-            const c  = readAudioOut2Sample(frame_slice[2 * bytes_per_sample ..], is_float, bytes_per_sample);
+            const c = readAudioOut2Sample(frame_slice[2 * bytes_per_sample ..], is_float, bytes_per_sample);
             const bl = readAudioOut2Sample(frame_slice[4 * bytes_per_sample ..], is_float, bytes_per_sample);
             const br = readAudioOut2Sample(frame_slice[5 * bytes_per_sample ..], is_float, bytes_per_sample);
             const sl = readAudioOut2Sample(frame_slice[6 * bytes_per_sample ..], is_float, bytes_per_sample);
@@ -842,7 +844,7 @@ fn mixAudioOut2Port(
         } else if (channels >= 6) {
             const fl = readAudioOut2Sample(frame_slice[0 * bytes_per_sample ..], is_float, bytes_per_sample);
             const fr = readAudioOut2Sample(frame_slice[1 * bytes_per_sample ..], is_float, bytes_per_sample);
-            const c  = readAudioOut2Sample(frame_slice[2 * bytes_per_sample ..], is_float, bytes_per_sample);
+            const c = readAudioOut2Sample(frame_slice[2 * bytes_per_sample ..], is_float, bytes_per_sample);
             const bl = readAudioOut2Sample(frame_slice[4 * bytes_per_sample ..], is_float, bytes_per_sample);
             const br = readAudioOut2Sample(frame_slice[5 * bytes_per_sample ..], is_float, bytes_per_sample);
             left = fl + c * side + bl * side;
@@ -989,29 +991,17 @@ fn submitAudioOut2Context(context_handle: u64) bool {
     return true;
 }
 
-fn paceAudioOut2Context(context_handle: u64, grains: u32, frequency: u32) void {
-    const freq: u64 = if (frequency == 0) 48_000 else frequency;
-    const grain_ns = (@as(u64, grains) * std.time.ns_per_s) / freq;
-    const now = hostTimestampNs();
-
-    audio_object_mutex.lock();
-    var delay_ns: u64 = 0;
-    if (context_handle > 0 and context_handle <= maximum_audio_objects) {
-        const obj = &audio_objects[@intCast(context_handle - 1)];
-        if (obj.next_advance_ns < now) {
-            obj.next_advance_ns = now;
-        }
-        if (obj.next_advance_ns > now) {
-            delay_ns = obj.next_advance_ns - now;
-        }
-        obj.next_advance_ns += grain_ns;
-    }
-    audio_object_mutex.unlock();
-
-    if (delay_ns > 0) {
-        const sleep_ms: u32 = @intCast(@max(1, delay_ns / std.time.ns_per_ms));
-        _ = kernel_threading.sceKernelUsleep(sleep_ms * 1000);
-    }
+fn updateAudioOut2Queue(context: *AudioObject, now: u64) void {
+    const frequency: u64 = if (context.frequency == 0) 48_000 else context.frequency;
+    const grain_ns = @max(1, @as(u64, context.grains) * std.time.ns_per_s / frequency);
+    const completed = @min(context.queued_grains, (now -| context.queue_updated_ns) / grain_ns);
+    context.queued_grains -= @intCast(completed);
+    // Preserve the partially played grain; an idle queue starts a new clock
+    // when the next grain is submitted.
+    context.queue_updated_ns = if (context.queued_grains == 0)
+        now
+    else
+        context.queue_updated_ns + completed * grain_ns;
 }
 
 fn audioOut2Initialize() callconv(abi.guest) i32 {
@@ -1060,10 +1050,9 @@ fn audioOut2ContextDestroy(context: u64) callconv(abi.guest) i32 {
 }
 
 fn audioOut2ContextAdvance(context: u64) callconv(abi.guest) i32 {
-    const object = audioObject(context, .context) orelse return audio_out2_error_invalid_parameter;
-    if (!submitAudioOut2Context(context)) {
-        paceAudioOut2Context(context, object.grains, object.frequency);
-    }
+    if (audioObject(context, .context) == null) return audio_out2_error_invalid_parameter;
+    // Advance commits the parameter set; Push submits the grain. Consuming
+    // PCM here as well makes the usual Advance/Push pair pace twice.
     return errno.ok;
 }
 
@@ -1078,24 +1067,44 @@ fn audioOut2ContextSetAttributes(
 }
 
 fn audioOut2ContextPush(context: u64, blocking: u32) callconv(abi.guest) i32 {
-    _ = blocking;
-    const object = audioObject(context, .context) orelse return audio_out2_error_invalid_parameter;
-    if (!submitAudioOut2Context(context)) {
-        paceAudioOut2Context(context, object.grains, object.frequency);
+    while (true) {
+        audio_object_mutex.lock();
+        if (context == 0 or context > maximum_audio_objects or
+            audio_objects[@intCast(context - 1)].kind != .context)
+        {
+            audio_object_mutex.unlock();
+            return audio_out2_error_invalid_parameter;
+        }
+        const object = &audio_objects[@intCast(context - 1)];
+        updateAudioOut2Queue(object, hostTimestampNs());
+        if (object.queued_grains < object.queue_depth) {
+            object.queued_grains += 1;
+            audio_object_mutex.unlock();
+            _ = submitAudioOut2Context(context);
+            return errno.ok;
+        }
+        audio_object_mutex.unlock();
+        if (blocking == 0) return audio_out2_error_not_ready;
+        _ = kernel_threading.sceKernelUsleep(1000);
     }
-    return errno.ok;
 }
 
 fn audioOut2ContextGetQueueLevel(context: u64, queue_level: ?*u32, available: ?*u32) callconv(abi.guest) i32 {
-    const object = audioObject(context, .context) orelse return audio_out2_error_invalid_parameter;
+    audio_object_mutex.lock();
+    defer audio_object_mutex.unlock();
+    if (context == 0 or context > maximum_audio_objects or
+        audio_objects[@intCast(context - 1)].kind != .context)
+        return audio_out2_error_invalid_parameter;
+    const object = &audio_objects[@intCast(context - 1)];
+    updateAudioOut2Queue(object, hostTimestampNs());
     if (queue_level) |output| {
         if (kernel_memory.isGuestRangeAccessible(@intFromPtr(output), @sizeOf(u32))) {
-            output.* = 0;
+            output.* = object.queued_grains;
         }
     }
     if (available) |output| {
         if (kernel_memory.isGuestRangeAccessible(@intFromPtr(output), @sizeOf(u32))) {
-            output.* = object.queue_depth;
+            output.* = object.queue_depth - object.queued_grains;
         }
     }
     return errno.ok;
@@ -1124,21 +1133,18 @@ fn audioOut2PortChannels(data_format: u32) u8 {
     return @min(encoded, 16);
 }
 
-/// Fixed 0x20-byte connected-primary state. Titles allocate that header next
-/// to other AudioOut2 parameter blocks; writing past it overwrites them.
-const audio_out2_port_state_bytes: usize = 0x20;
+/// The AudioOut2 state is a 16-byte header and six reserved u64s. Yotei
+/// allocates adjacent 64-byte states and copies both 32-byte halves.
+const audio_out2_port_state_bytes: usize = 0x40;
 
 fn audioOut2PortGetState(port: u64, state: ?*[audio_out2_port_state_bytes]u8) callconv(abi.guest) i32 {
     const output = state orelse return audio_out2_error_invalid_parameter;
+    const object = audioObject(port, .port) orelse return audio_out2_error_invalid_parameter;
     @memset(output, 0);
-    var channels: u8 = 2;
-    if (audioObject(port, .port)) |object| {
-        if (decodeAudioOut2Format(object.data_format)) |dec| {
-            channels = dec.channels;
-        } else {
-            channels = audioOut2PortChannels(object.data_format);
-        }
-    }
+    const channels = if (decodeAudioOut2Format(object.data_format)) |dec|
+        dec.channels
+    else
+        audioOut2PortChannels(object.data_format);
     std.mem.writeInt(u16, output[0x00..0x02], 1, .little);
     output[0x02] = channels;
     std.mem.writeInt(i16, output[0x04..0x06], -1, .little);
@@ -1196,12 +1202,17 @@ fn audioOut2UserDestroy(user: usize) callconv(abi.guest) i32 {
     return if (releaseAudioObject(user, .user)) errno.ok else audio_out2_error_invalid_parameter;
 }
 
-fn audioOut2GetSpeakerInfo(output: ?*[0x20]u8, _: u32) callconv(abi.guest) i32 {
+const audio_out2_speaker_info_bytes = 0x50;
+
+fn audioOut2GetSpeakerInfo(output: ?*[audio_out2_speaker_info_bytes]u8, _: u32) callconv(abi.guest) i32 {
     const info = output orelse return audio_out2_error_invalid_parameter;
     @memset(info, 0);
-    std.mem.writeInt(u32, info[0x00..0x04], 2, .little); // stereo
-    std.mem.writeInt(u32, info[0x04..0x08], 48_000, .little);
-    std.mem.writeInt(u16, info[0x08..0x0a], 1, .little); // connected primary output
+    // This is a speaker layout, not a PCM format. In particular +4 is a
+    // speaker mask: putting 48000 here removes both front speakers and makes
+    // the guest route its stereo mix to absent channels.
+    std.mem.writeInt(u32, info[0x04..0x08], 0x03, .little);
+    std.mem.writeInt(i16, info[0x10..0x12], -30, .little);
+    std.mem.writeInt(i16, info[0x14..0x16], 30, .little);
     return errno.ok;
 }
 
@@ -2881,7 +2892,7 @@ fn ajmInitialize(reserved: i64, context: ?*u32) callconv(abi.guest) i32 {
         if (active.*) continue;
         active.* = true;
         output.* = @intCast(index + 1);
-        std.debug.print("[audio ajm] initialize ctx={d}\n", .{ index + 1 });
+        std.debug.print("[audio ajm] initialize ctx={d}\n", .{index + 1});
         return errno.ok;
     }
     return ajm_error_invalid_parameter;
@@ -3524,6 +3535,35 @@ test "headless AudioOut preserves port lifecycle" {
     try std.testing.expectEqual(audio_out_error_invalid_port, audioOutClose(handle));
 }
 
+test "AudioOut2 queue drains whole grains while retaining fractional playback time" {
+    var context = AudioObject{ .kind = .context, .grains = 480, .frequency = 48_000, .queue_depth = 4, .queued_grains = 4, .queue_updated_ns = 100 * std.time.ns_per_ms };
+    updateAudioOut2Queue(&context, 109 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 4), context.queued_grains);
+    updateAudioOut2Queue(&context, 125 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 2), context.queued_grains);
+    try std.testing.expectEqual(@as(u64, 120 * std.time.ns_per_ms), context.queue_updated_ns);
+    updateAudioOut2Queue(&context, 130 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 1), context.queued_grains);
+    updateAudioOut2Queue(&context, 500 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 0), context.queued_grains);
+    context.queued_grains = 1;
+    updateAudioOut2Queue(&context, 509 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 1), context.queued_grains);
+}
+
+test "AudioOut2 speaker layout advertises front speakers and initializes every angle" {
+    var guarded: [audio_out2_speaker_info_bytes + 16]u8 = @splat(0xab);
+    try std.testing.expectEqual(errno.ok, audioOut2GetSpeakerInfo(guarded[0..audio_out2_speaker_info_bytes], 1));
+    try std.testing.expectEqual(@as(u8, 0), guarded[0]);
+    try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, guarded[4..8], .little));
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, guarded[8..12], .little));
+    try std.testing.expectEqual(@as(i16, -30), std.mem.readInt(i16, guarded[16..18], .little));
+    try std.testing.expectEqual(@as(i16, 30), std.mem.readInt(i16, guarded[20..22], .little));
+    for (guarded[24..audio_out2_speaker_info_bytes]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    for (guarded[audio_out2_speaker_info_bytes..]) |byte| try std.testing.expectEqual(@as(u8, 0xab), byte);
+    try std.testing.expectEqual(audio_out2_error_invalid_parameter, audioOut2GetSpeakerInfo(null, 1));
+}
+
 test "AudioOut2 context defaults and handles are deterministic" {
     reset();
     var parameters = AudioOut2ContextParam{};
@@ -3554,7 +3594,9 @@ test "AudioOut2 context defaults and handles are deterministic" {
     try std.testing.expectEqual(@as(u8, 8), state[0x02]);
     try std.testing.expectEqual(@as(i16, -1), std.mem.readInt(i16, state[0x04..0x06], .little));
     try std.testing.expectEqual(@as(u8, 0), state[0x10]);
+    try std.testing.expectEqualSlices(u8, &(@as([0x30]u8, @splat(0))), state[0x10..]);
     try std.testing.expectEqual(audio_out2_error_invalid_parameter, audioOut2PortGetState(port, null));
+    try std.testing.expectEqual(audio_out2_error_invalid_parameter, audioOut2PortGetState(std.math.maxInt(u64), &state));
 }
 
 test "NGS2 derives one bounded float32 render grain from all buses" {
@@ -3824,4 +3866,3 @@ test "AudioOut2 decodes formats and mixes ports to stereo correctly" {
     try std.testing.expectApproxEqAbs(@as(f32, -0.25), mix[3], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), peak, 0.001);
 }
-

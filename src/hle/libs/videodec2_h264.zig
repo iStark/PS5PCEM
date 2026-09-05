@@ -24,6 +24,7 @@ pub const Picture = struct {
     /// NV12: `height` luma rows followed by `height / 2` interleaved chroma
     /// rows, both at `pitch`.
     bytes: []const u8,
+    frame_interval_ns: u64 = 33_333_333,
 };
 
 const HRESULT = i32;
@@ -215,6 +216,13 @@ const attribute_interlace_mode = GUID{
 
 const interlace_progressive: u32 = 2;
 
+const attribute_frame_rate = GUID{
+    .data1 = 0xc459a2e8,
+    .data2 = 0x3d2c,
+    .data3 = 0x4e44,
+    .data4 = .{ 0xb1, 0x32, 0xfe, 0xe5, 0x15, 0x6c, 0x7b, 0xb0 },
+};
+
 const attribute_transform_async = GUID{
     .data1 = 0xf81a699a,
     .data2 = 0x649a,
@@ -276,6 +284,7 @@ const Decoder = struct {
     width: u32,
     height: u32,
     output_pitch: u32,
+    frame_interval_ns: u64 = 33_333_333,
     /// Where a decoded picture is assembled before the caller copies it out.
     frame: std.ArrayList(u8) = .empty,
     /// Whether this decoder has been told its stream ended. A drain is one
@@ -430,8 +439,25 @@ fn readOutputGeometry(transform: *anyopaque, into: *Decoder) void {
     into.width = width;
     into.height = height;
     into.output_pitch = width;
+    var rate: u64 = 0;
+    if (!failed(vtableOf(IMFAttributesVtable, current).get_uint64(current, &attribute_frame_rate, &rate))) {
+        if (frameIntervalNs(rate)) |interval| into.frame_interval_ns = interval;
+    }
 }
 
+fn frameIntervalNs(packed_rate: u64) ?u64 {
+    const numerator = packed_rate >> 32;
+    const denominator = packed_rate & 0xffff_ffff;
+    if (numerator == 0 or denominator == 0) return null;
+    return std.time.ns_per_s * denominator / numerator;
+}
+
+test "Media Foundation frame rate preserves 60 Hz and fractional cadence" {
+    try std.testing.expectEqual(@as(?u64, 16_666_666), frameIntervalNs(packedFrameSize(60, 1)));
+    try std.testing.expectEqual(@as(?u64, 33_366_666), frameIntervalNs(packedFrameSize(30_000, 1001)));
+    try std.testing.expectEqual(@as(?u64, null), frameIntervalNs(packedFrameSize(0, 1)));
+    try std.testing.expectEqual(@as(?u64, null), frameIntervalNs(packedFrameSize(60, 0)));
+}
 
 /// Settles how the transform will be driven before streaming starts.
 ///
@@ -708,6 +734,7 @@ fn currentPicture(active: *const Decoder) Picture {
         .height = active.height,
         .pitch = active.output_pitch,
         .bytes = active.frame.items,
+        .frame_interval_ns = active.frame_interval_ns,
     };
 }
 
@@ -715,8 +742,8 @@ fn reportFirstPicture(active: *const Decoder) void {
     if (reported_first_picture) return;
     reported_first_picture = true;
     std.debug.print(
-        "[videodec] first decoded picture {d}x{d} pitch={d} bytes={d}\n",
-        .{ active.width, active.height, active.output_pitch, active.frame.items.len },
+        "[videodec] first decoded picture {d}x{d} pitch={d} bytes={d} interval_us={d}\n",
+        .{ active.width, active.height, active.output_pitch, active.frame.items.len, active.frame_interval_ns / 1000 },
     );
 }
 

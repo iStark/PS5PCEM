@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Artur Strazewicz
 
-//! CPU-visible libSceVideodec2 lifecycle.
-//!
-//! The hardware video decoder is not translated yet.  Titles still need its
-//! memory-query and object contracts to succeed before they open movie data.
-//! This implementation consumes access units and reports no completed picture;
-//! that lets a player reach end-of-stream (and the title continue) without
-//! claiming that an undecoded frame is valid.
+//! libSceVideodec2 lifecycle and host H.264 decoding into guest NV12 buffers.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -53,7 +47,7 @@ fn decodedFrameSlotSize(config: *const DecoderConfigInfo) u64 {
     }
     const width: u64 = @intCast(config.max_frame_width);
     const height: u64 = @intCast(config.max_frame_height);
-    const bytes = h264.pictureBytes(@intCast(width), @intCast(height));
+    const bytes = h264.pictureBytes(guestFramePitch(@intCast(width)), @intCast(height));
     return @max(minimum_frame_slot_size, std.mem.alignForward(u64, bytes, 0x100));
 }
 
@@ -70,16 +64,12 @@ var drain_requests: u32 = 0;
 var submitted_pictures: u64 = 0;
 /// Longest a decode call is held for the display before giving up on it.
 const maximum_pacing_wait_ms: u32 = 250;
-var last_picture_timestamp_ns: ?u64 = null;
-/// A clip's own cadence. Nothing here reads the rate out of the stream, and a
-/// splash reel is recorded at 30 frames a second far more often than 60, so
-/// that is the assumption: guessing high runs every such clip at double
-/// speed, while guessing low only makes a faster one play gently slow.
-const target_frame_interval_ns: u64 = 33_333_333;
+var last_picture_deadline_ns: ?u64 = null;
 
 pub const VideoFrameSink = struct {
     context: ?*anyopaque = null,
-    submit: *const fn (?*anyopaque, u32, u32, u32, []const u8) void,
+    submit: *const fn (?*anyopaque, u64, u32, u32, u32, []const u8) u64,
+    finish: *const fn (?*anyopaque, u64) void,
     /// How many handed-over pictures have actually reached the display, which
     /// is what the next one waits behind.
     presented: *const fn (?*anyopaque) u64,
@@ -156,20 +146,24 @@ const FrameBuffer = extern struct {
     reserved: [7]u8,
 };
 
-/// What a decode call reports back.
-///
-/// Only the prefix is named: a title reads the ready flag first and then the
-/// picture size, and those are the fields whose meaning is established. The
-/// remainder is left exactly as the title prepared it, because filling in
-/// fields whose meaning is a guess is how a caller is told a picture is
-/// something other than what it is.
+/// The caller supplies this_size (48 or 56), then tests is_valid at +8.
+/// Width/pitch/height are 32-bit fields at +16/+20/+24. Yotei compares
+/// is_valid to exactly 1 before queuing the picture and starting playback.
 const OutputInfo = extern struct {
-    /// 0 = no picture from this call, 1 = one is waiting in the frame buffer.
-    picture_ready: u8,
-    reserved0: [7]u8,
-    width: u64,
-    height: u64,
-    unnamed: [32]u8,
+    this_size: u64,
+    is_valid: u8,
+    is_error_frame: u8,
+    picture_count: u8,
+    is_discarded_frame: u8,
+    codec_type: u32,
+    frame_width: u32,
+    frame_pitch: u32,
+    frame_height: u32,
+    reserved: u32,
+    frame_buffer: u64,
+    frame_buffer_size: u64,
+    frame_format: u32,
+    frame_pitch_in_bytes: u32,
 };
 
 comptime {
@@ -234,6 +228,7 @@ pub fn queryDecoderMemoryInfo(
     // so a zero here ends the setup before a single frame is decoded, and a
     // slot as large as the arena leaves room for none.
     output.max_frame_buffer_size = decodedFrameSlotSize(config.?);
+    output.frame_buffer_alignment = 256;
     return errno.ok;
 }
 
@@ -284,7 +279,8 @@ pub fn createDecoder(
 
 pub fn deleteDecoder(decoder: u64) callconv(abi.guest) i32 {
     if (decoder == 0) return error_decoder_instance;
-    last_picture_timestamp_ns = null;
+    if (global_frame_sink) |sink| sink.finish(sink.context, decoder);
+    last_picture_deadline_ns = null;
     published_pictures = 0;
     h264.destroyDecoder(decoder);
     return errno.ok;
@@ -307,7 +303,7 @@ fn publishDecodedPicture(
     const unit: [*]const u8 = @ptrFromInt(input.au_data);
 
     const picture = h264.decodeAccessUnit(decoder, unit[0..unit_length], 0) orelse return false;
-    return handOverPicture(picture, frame, output);
+    return handOverPicture(decoder, picture, frame, output);
 }
 
 /// Holds the title back until the picture handed over last has been shown.
@@ -321,7 +317,7 @@ fn publishDecodedPicture(
 /// The wait is bounded. Presentation can stop for reasons that have nothing to
 /// do with this -- a headless run, a window that is not drawing -- and a title
 /// blocked forever in its decoder is worse than one whose movie runs fast.
-fn waitForPreviousPicture() void {
+fn waitForPreviousPicture(target_frame_interval_ns: u64) void {
     const sink = global_frame_sink orelse return;
     const target = submitted_pictures;
     var waited_ms: u32 = 0;
@@ -329,35 +325,51 @@ fn waitForPreviousPicture() void {
         Sleep(1);
         waited_ms += 1;
     }
-    // A clip still has a rate of its own, so a display faster than the movie
-    // does not run it early.
-    const now = hostTimestampNs();
-    if (last_picture_timestamp_ns) |last| {
-        if (now > last) {
-            const elapsed = now - last;
-            if (elapsed < target_frame_interval_ns) {
-                Sleep(@intCast(@max(1, (target_frame_interval_ns - elapsed) / 1_000_000)));
-            }
-        }
+    // Advance the original schedule, not the actual wake time. Otherwise a
+    // millisecond of Windows timer jitter accumulates on every decoded frame.
+    var now = hostTimestampNs();
+    if (now == 0) return;
+    const deadline = pictureDeadline(last_picture_deadline_ns, now, target_frame_interval_ns);
+    while (now < deadline) {
+        Sleep(@intCast(@max(1, (deadline - now) / std.time.ns_per_ms)));
+        now = hostTimestampNs();
+        if (now == 0) return;
     }
-    last_picture_timestamp_ns = hostTimestampNs();
-    submitted_pictures += 1;
+    last_picture_deadline_ns = deadline;
+}
+
+fn pictureDeadline(previous: ?u64, now: u64, interval: u64) u64 {
+    const next = (previous orelse return now) +| interval;
+    // Rebase after a long pause instead of presenting a burst of stale frames.
+    return if (now -| next > maximum_pacing_wait_ms * std.time.ns_per_ms) now else next;
+}
+
+test "video cadence does not accumulate wake jitter and rebases after pauses" {
+    const interval: u64 = 33_333_333;
+    var deadline: u64 = 1_000_000_000;
+    for (0..300) |_| {
+        deadline = pictureDeadline(deadline, deadline + interval + std.time.ns_per_ms, interval);
+    }
+    try std.testing.expectEqual(@as(u64, 1_000_000_000) + 300 * interval, deadline);
+    const resumed = deadline + std.time.ns_per_s;
+    try std.testing.expectEqual(resumed, pictureDeadline(deadline, resumed, interval));
 }
 
 /// Copies one decoded picture into the slot the title lent and describes it.
-fn handOverPicture(picture: h264.Picture, frame: *FrameBuffer, output: *OutputInfo) bool {
+fn handOverPicture(decoder: u64, picture: h264.Picture, frame: *FrameBuffer, output: *OutputInfo) bool {
     if (frame.frame_buffer == 0) return false;
     const capacity = std.math.cast(usize, frame.frame_buffer_size) orelse return false;
-    if (capacity < picture.bytes.len) return false;
-    if (!kernel_memory.isGuestRangeAccessible(frame.frame_buffer, picture.bytes.len)) return false;
+    const guest_bytes = h264.pictureBytes(guestFramePitch(picture.width), picture.height);
+    if (capacity < guest_bytes) return false;
+    if (!kernel_memory.isGuestRangeAccessible(frame.frame_buffer, guest_bytes)) return false;
 
-    waitForPreviousPicture();
+    waitForPreviousPicture(picture.frame_interval_ns);
 
     const destination: [*]u8 = @ptrFromInt(frame.frame_buffer);
-    @memcpy(destination[0..picture.bytes.len], picture.bytes);
+    copyGuestPicture(picture, destination[0..@intCast(guest_bytes)]);
 
     if (global_frame_sink) |sink| {
-        sink.submit(sink.context, picture.width, picture.height, picture.pitch, picture.bytes);
+        submitted_pictures = sink.submit(sink.context, decoder, picture.width, picture.height, picture.pitch, picture.bytes);
     }
 
     published_pictures += 1;
@@ -370,16 +382,80 @@ fn handOverPicture(picture: h264.Picture, frame: *FrameBuffer, output: *OutputIn
             .{ published_pictures, picture.width, picture.height, picture.pitch, frame.frame_buffer },
         );
     }
-    output.width = picture.width;
-    output.height = picture.height;
-    output.picture_ready = 1;
+    describePicture(picture, frame, output);
     return true;
+}
+
+fn describePicture(picture: h264.Picture, frame: *FrameBuffer, output: *OutputInfo) void {
+    fillNoPicture(frame, output);
+    frame.is_accepted = 1;
+    output.is_valid = 1;
+    output.picture_count = 1;
+    output.frame_width = picture.width;
+    output.frame_pitch = guestFramePitch(picture.width);
+    output.frame_height = picture.height;
+    if (output.this_size >= @sizeOf(OutputInfo)) output.frame_pitch_in_bytes = output.frame_pitch;
+}
+
+/// The two NV12 planes are sampled as linear AGC textures, whose rows must
+/// align to 256 bytes. A tight 1920-byte MFT pitch underallocates both planes:
+/// the title rejects their combined texture size and polls until its 100 ms
+/// timeout on every frame. Keep host decoder storage private and repack here.
+fn guestFramePitch(width: u32) u32 {
+    return std.mem.alignForward(u32, width, 256);
+}
+
+fn copyGuestPicture(picture: h264.Picture, destination: []u8) void {
+    const pitch: usize = guestFramePitch(picture.width);
+    const rows: usize = picture.height + picture.height / 2;
+    if (pitch == picture.pitch) {
+        @memcpy(destination[0 .. pitch * rows], picture.bytes[0 .. pitch * rows]);
+        return;
+    }
+    for (0..rows) |row| {
+        const target = destination[row * pitch ..][0..pitch];
+        @memcpy(target[0..picture.width], picture.bytes[row * picture.pitch ..][0..picture.width]);
+        @memset(target[picture.width..], 0);
+    }
+}
+
+test "guest NV12 storage aligns both planes to AGC rows" {
+    try std.testing.expectEqual(@as(u32, 2048), guestFramePitch(1920));
+    var config = std.mem.zeroes(DecoderConfigInfo);
+    config.max_frame_width = 1920;
+    config.max_frame_height = 1088;
+    try std.testing.expectEqual(@as(u64, 2048 * 1088 * 3 / 2), decodedFrameSlotSize(&config));
+    var source: [6]u8 = .{ 16, 235, 17, 234, 128, 129 };
+    var destination: [3 * 256 + 8]u8 = @splat(0xcd);
+    const picture = h264.Picture{ .width = 2, .height = 2, .pitch = 2, .bytes = &source };
+    copyGuestPicture(picture, destination[0 .. 3 * 256]);
+    try std.testing.expectEqualSlices(u8, source[0..2], destination[0..2]);
+    try std.testing.expectEqualSlices(u8, source[2..4], destination[256..258]);
+    try std.testing.expectEqualSlices(u8, source[4..6], destination[512..514]);
+    try std.testing.expect(std.mem.allEqual(u8, destination[2..256], 0));
+    try std.testing.expect(std.mem.allEqual(u8, destination[514..768], 0));
+    try std.testing.expect(std.mem.allEqual(u8, destination[768..], 0xcd));
 }
 
 /// Says no picture came of a call, which is the first thing every call reports
 /// before a decoded one can replace it.
-fn fillNoPicture(_: *FrameBuffer, output: *OutputInfo) void {
-    output.picture_ready = 0;
+fn fillNoPicture(frame: *FrameBuffer, output: *OutputInfo) void {
+    frame.is_accepted = 0;
+    output.is_valid = 0;
+    output.is_error_frame = 0;
+    output.picture_count = 0;
+    output.is_discarded_frame = 0;
+    output.codec_type = 1; // AVC
+    output.frame_width = 0;
+    output.frame_pitch = 0;
+    output.frame_height = 0;
+    output.reserved = 0;
+    output.frame_buffer = frame.frame_buffer;
+    output.frame_buffer_size = frame.frame_buffer_size;
+    if (output.this_size >= @sizeOf(OutputInfo)) {
+        output.frame_format = 0; // default NV12
+        output.frame_pitch_in_bytes = 0;
+    }
 }
 
 pub fn decode(
@@ -443,7 +519,9 @@ pub fn flush(
     fillNoPicture(frame.?, output.?);
     const drained = h264.drainPicture(decoder);
     if (drained) |picture| {
-        _ = handOverPicture(picture, frame.?, output.?);
+        _ = handOverPicture(decoder, picture, frame.?, output.?);
+    } else if (global_frame_sink) |sink| {
+        sink.finish(sink.context, decoder);
     }
     drain_requests += 1;
     if (drain_requests <= 12) {
@@ -457,8 +535,9 @@ pub fn flush(
 
 pub fn reset(decoder: u64) callconv(abi.guest) i32 {
     if (decoder == 0) return error_decoder_instance;
+    if (global_frame_sink) |sink| sink.finish(sink.context, decoder);
     // Everything already handed over belongs to the position being left.
-    last_picture_timestamp_ns = null;
+    last_picture_deadline_ns = null;
     published_pictures = 0;
     h264.flushDecoder(decoder);
     return errno.ok;
@@ -502,24 +581,27 @@ test "a compute queue is told how much backing to allocate" {
 test "a reported picture puts its readiness where a title reads it" {
     var slot = std.mem.zeroes(FrameBuffer);
     var report = std.mem.zeroes(OutputInfo);
-    report.unnamed[0] = 0xa5;
-
+    report.this_size = @sizeOf(OutputInfo);
+    slot.frame_buffer = 0x2000_1000;
+    slot.frame_buffer_size = 2048 * 1088 * 3 / 2;
     fillNoPicture(&slot, &report);
-    try std.testing.expectEqual(@as(u8, 0), report.picture_ready);
-
-    report.width = 1920;
-    report.height = 1088;
-    report.picture_ready = 1;
-
-    // The flag a title checks is the first byte of the record, and the size
-    // follows it as two 64-bit halves. Reading them back through the raw bytes
-    // is what catches a field drifting to another offset.
+    try std.testing.expectEqual(@as(u8, 0), report.is_valid);
+    describePicture(.{ .width = 1920, .height = 1088, .pitch = 1920, .bytes = &.{} }, &slot, &report);
     const raw: *const [@sizeOf(OutputInfo)]u8 = @ptrCast(&report);
-    try std.testing.expectEqual(@as(u8, 1), raw[0]);
-    try std.testing.expectEqual(@as(u64, 1920), std.mem.readInt(u64, raw[8..16], .little));
-    try std.testing.expectEqual(@as(u64, 1088), std.mem.readInt(u64, raw[16..24], .little));
-    // Everything past the size belongs to the title.
-    try std.testing.expectEqual(@as(u8, 0xa5), raw[24]);
+    try std.testing.expectEqual(@as(u64, 56), std.mem.readInt(u64, raw[0..8], .little));
+    try std.testing.expectEqual(@as(u8, 1), raw[8]);
+    try std.testing.expectEqual(@as(u8, 1), raw[10]);
+    try std.testing.expectEqual(@as(u32, 1920), std.mem.readInt(u32, raw[16..20], .little));
+    try std.testing.expectEqual(@as(u32, 2048), std.mem.readInt(u32, raw[20..24], .little));
+    try std.testing.expectEqual(@as(u32, 1088), std.mem.readInt(u32, raw[24..28], .little));
+    try std.testing.expectEqual(slot.frame_buffer, std.mem.readInt(u64, raw[32..40], .little));
+    try std.testing.expectEqual(@as(u8, 1), slot.is_accepted);
+    report.this_size = 48;
+    report.frame_format = 0xaabbccdd;
+    report.frame_pitch_in_bytes = 0x11223344;
+    fillNoPicture(&slot, &report);
+    try std.testing.expectEqual(@as(u32, 0xaabbccdd), report.frame_format);
+    try std.testing.expectEqual(@as(u32, 0x11223344), report.frame_pitch_in_bytes);
 }
 
 test "Videodec2 ABI records retain SDK sizes" {

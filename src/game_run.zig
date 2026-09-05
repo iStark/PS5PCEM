@@ -602,6 +602,7 @@ fn run(init: std.process.Init) !bool {
             .force_probe_fragment_ui = force_probe_fragment_ui,
             .skip_compute_dispatches = skip_compute_dispatches,
             .skip_compute_until_flip = skip_compute_until_flip,
+            .prioritize_fullscreen_video = std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id),
             .compute_execution_limit = compute_execution_limit,
             .sparse_graphics_draws = sparse_graphics_draws,
             .translate_compute_only = translate_compute_only,
@@ -662,6 +663,7 @@ fn run(init: std.process.Init) !bool {
         runtime.firmware.libs.videodec2.attachVideoFrameSink(.{
             .context = video_sink.context,
             .submit = video_sink.submit,
+            .finish = video_sink.finish,
             .presented = video_sink.presented,
         });
         try out.print("  Vulkan  {s} ({d}x{d} VideoOut window)\n", .{

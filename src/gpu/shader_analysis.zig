@@ -52,6 +52,16 @@ pub const Analysis = struct {
     /// ends. LDS-only writes are deliberately excluded because that storage
     /// dies with the dispatch unless another instruction exports it.
     pub fn hasExternalEffects(self: *const Analysis) bool {
+        return self.hasEffectsBeyondRaster(true);
+    }
+
+    /// Raster exports may be hidden by a fullscreen movie; storage writes and
+    /// unknown non-ALU instructions still have to execute.
+    pub fn hasNonRasterEffects(self: *const Analysis) bool {
+        return self.hasEffectsBeyondRaster(false);
+    }
+
+    fn hasEffectsBeyondRaster(self: *const Analysis, include_exports: bool) bool {
         const instructions = if (self.pipeline_options.enable_typed_ir)
             self.module.instructions.items
         else
@@ -98,9 +108,11 @@ pub const Analysis = struct {
                 .image_atomic_or,
                 .image_atomic_xor,
                 .image_atomic_fmax,
-                .s_sendmsg,
-                .exp,
                 => return true,
+                // GS_ALLOC_REQ reserves raster export space. It has no work
+                // to publish when the entire draw's raster exports are hidden.
+                .s_sendmsg => if (include_exports or inst.src0.value != 9) return true,
+                .exp => if (include_exports) return true,
                 .unsupported => switch (inst.family) {
                     .vop1, .vop2, .vop3, .vop3p, .vopc, .vintrp => {},
                     else => return true,
@@ -406,6 +418,23 @@ test "analysis identifies a global buffer store as externally visible" {
 
     try std.testing.expect(analysis.hasExternalEffects());
     try std.testing.expect(analysis.hasBufferExternalEffects());
+    try std.testing.expect(analysis.hasNonRasterEffects());
+}
+
+test "covered raster draw permits exports and GS allocation but retains interrupts" {
+    var memory = TestMemory{};
+    memory.word(0, 0xbf90_0009); // s_sendmsg GS_ALLOC_REQ
+    memory.word(4, 0xf800_08cf); // exp pos0 done
+    memory.word(8, 0x0302_0100);
+    memory.word(12, 0xbf81_0000);
+    var raster = try decode(std.testing.allocator, memory.reader(), 0, 16);
+    defer raster.deinit(std.testing.allocator);
+    try std.testing.expect(raster.hasExternalEffects());
+    try std.testing.expect(!raster.hasNonRasterEffects());
+    memory.word(0, 0xbf90_0001); // s_sendmsg interrupt
+    var interrupt = try decode(std.testing.allocator, memory.reader(), 0, 16);
+    defer interrupt.deinit(std.testing.allocator);
+    try std.testing.expect(interrupt.hasNonRasterEffects());
 }
 
 test "analysis enforces its instruction safety limit" {
