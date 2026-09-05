@@ -183,6 +183,7 @@ const CompletionKind = enum {
 
 const PendingCompletion = struct {
     kind: CompletionKind,
+    event_id: u32 = 0,
     context_id: u32 = 0,
     address: u64 = 0,
     ready_after_ns: u64 = 0,
@@ -214,7 +215,8 @@ var completion_worker_started: std.atomic.Value(bool) = .init(false);
 // complete scheduler pass has finished.
 var completion_batch_active: bool = false;
 var batched_driver_completion_label: u64 = 0;
-var batched_release_contexts: [maximum_pending_completions]u32 = undefined;
+const ReleaseContext = struct { event_id: u32, context_id: u32 };
+var batched_release_contexts: [maximum_pending_completions]ReleaseContext = undefined;
 var batched_release_count: usize = 0;
 threadlocal var sdk11_dcb_release_capture: bool = false;
 threadlocal var sdk11_dcb_release_candidate: ?gpu.state.ReleaseMem = null;
@@ -291,8 +293,8 @@ fn finishCompletionBatch() void {
         if (batched_driver_completion_label != 0) {
             publishDriverCompletionLabel(batched_driver_completion_label);
         }
-        for (batched_release_contexts[0..batched_release_count]) |context_id| {
-            _ = deliverCompletion(.{ .kind = .release, .context_id = context_id });
+        for (batched_release_contexts[0..batched_release_count]) |context| {
+            _ = deliverCompletion(.{ .kind = .release, .event_id = context.event_id, .context_id = context.context_id });
         }
     } else if (batched_driver_completion_label != 0) {
         enqueueCompletion(.{ .kind = .driver_label, .address = batched_driver_completion_label });
@@ -308,12 +310,12 @@ fn discardCompletionBatch() void {
     batched_release_count = 0;
 }
 
-fn recordUniqueReleaseContext(storage: []u32, count: *usize, context_id: u32) bool {
+fn recordUniqueReleaseContext(storage: []ReleaseContext, count: *usize, context: ReleaseContext) bool {
     for (storage[0..count.*]) |existing| {
-        if (existing == context_id) return true;
+        if (std.meta.eql(existing, context)) return true;
     }
     if (count.* == storage.len) return false;
-    storage[count.*] = context_id;
+    storage[count.*] = context;
     count.* += 1;
     return true;
 }
@@ -325,7 +327,10 @@ fn deliverCompletion(completion: PendingCompletion) usize {
             return 0;
         },
         .release => {
-            const triggered = event_queue.triggerOneGraphicsEventPerQueue(completion.context_id);
+            // Interrupt context is a packet payload (often a frame number),
+            // not the queue owner. Broadcasting a graphics EOP to a compute
+            // registration makes its handler wait for an unsubmitted job.
+            const triggered = event_queue.triggerGraphicsEvent(@bitCast(completion.event_id), completion.context_id);
             if (release_delivery_reports < 64) {
                 std.debug.print(
                     "[agc delivery] interrupt context={d} queues={d}\n",
@@ -1254,7 +1259,7 @@ fn triggerAgcUserInterrupt() void {
     );
 }
 
-fn triggerReleaseInterrupt(value: gpu.state.ReleaseMem) void {
+fn triggerReleaseInterrupt(value: gpu.state.ReleaseMem, event_id: u32) void {
     if (value.interrupt != 1 and value.interrupt != 2 and value.interrupt != 4) return;
     if (completion_batch_active) {
         // One interrupt handler pass retires every completed node in its ring.
@@ -1263,10 +1268,10 @@ fn triggerReleaseInterrupt(value: gpu.state.ReleaseMem) void {
         if (recordUniqueReleaseContext(
             &batched_release_contexts,
             &batched_release_count,
-            value.interrupt_context_id,
+            .{ .event_id = event_id, .context_id = value.interrupt_context_id },
         )) return;
     }
-    enqueueCompletion(.{ .kind = .release, .context_id = value.interrupt_context_id });
+    enqueueCompletion(.{ .kind = .release, .event_id = event_id, .context_id = value.interrupt_context_id });
 }
 
 /// Some AGC runtimes keep a CPU retirement label immediately before their
@@ -1352,7 +1357,10 @@ fn publishSynchronousRetirement(value: gpu.state.ReleaseMem) void {
     }
 }
 
-fn backendRelease(_: ?*anyopaque, value: gpu.state.ReleaseMem) bool {
+fn backendRelease(context: ?*anyopaque, value: gpu.state.ReleaseMem) bool {
+    // The scheduler retains this opaque queue-owner tag with the submission.
+    // Graphics uses ident zero; named compute queues use SubmitAcb's owner.
+    const event_id: u32 = @intCast(@intFromPtr(context));
     if (sdk11_dcb_release_capture) captureSdk11DcbRelease(value);
     if (compact_release_reports < 64) {
         if (resolveSubmissionAlias(value.address, switch (value.data_selection) {
@@ -1419,13 +1427,13 @@ fn backendRelease(_: ?*anyopaque, value: gpu.state.ReleaseMem) bool {
             // the driver consume the event while the old fence is still set.
             if (accepted) {
                 publishSynchronousRetirement(value);
-                triggerReleaseInterrupt(value);
+                triggerReleaseInterrupt(value, event_id);
             }
             return accepted;
         }
     }
     if ((value.destination != 0 and value.destination != 1) or value.address == 0) {
-        triggerReleaseInterrupt(value);
+        triggerReleaseInterrupt(value, event_id);
         return true;
     }
     if ((value.destination != 0 and value.destination != 1) or value.address == 0) return true;
@@ -1453,7 +1461,7 @@ fn backendRelease(_: ?*anyopaque, value: gpu.state.ReleaseMem) bool {
     if (ok) {
         publishSynchronousRetirement(value);
         kernel_runtime.wakeSyncAddress(value.address, std.math.maxInt(usize));
-        triggerReleaseInterrupt(value);
+        triggerReleaseInterrupt(value, event_id);
     }
     return ok;
 }
@@ -1630,7 +1638,7 @@ fn submitConstructedGraphicsStream() void {
         recovered_constructed_flip_reports += 1;
     }
     announce("dcb builder", stream);
-    _ = executeAcceptedStream("dcb builder", stream, null);
+    _ = executeAcceptedStream("dcb builder", stream, null, 0);
 }
 
 fn presentUnconsumedConstructedFlip(submission: Submission, outcome: SubmitOutcome) void {
@@ -2255,6 +2263,7 @@ fn executeAcceptedStream(
     label: []const u8,
     stream: []const u32,
     driver_completion_label: ?u64,
+    event_id: u32,
 ) SubmitOutcome {
     rememberSubmissionAlias(stream);
     // Freeze the caller-owned allocation before validating it. AGC command
@@ -2297,7 +2306,7 @@ fn executeAcceptedStream(
     // prefix as a completed no-op.
     var outcome: SubmitOutcome = .{ .accepted = true, .completed = true };
     if (commands.len != 0) {
-        const prefix_outcome = executeSubmittedLocked(label, commands);
+        const prefix_outcome = executeSubmittedLockedForQueue(label, commands, event_id);
         // The public AGC call has already accepted a completely walkable PM4
         // prefix. A renderer that cannot yet implement one packet treats that
         // packet as a GPU no-op; it must not hold the driver's retirement node
@@ -2366,7 +2375,7 @@ fn flushPendingGraphicsSegment() void {
 pub fn submitDeviceStream(stream: []const u32) SubmitOutcome {
     drainCompletionNotifications();
     announce("dcb", stream);
-    return executeAcceptedStream("dcb", stream, null);
+    return executeAcceptedStream("dcb", stream, null, 0);
 }
 
 /// Advance both queues and soft-satisfy any permanent WAIT_REG_MEM heads.
@@ -2412,6 +2421,10 @@ fn executeSubmitted(label: []const u8, stream: []const u32) SubmitOutcome {
 /// processor and completion batch. Public AGC arenas can invoke this more than
 /// once without exposing an interrupt between their prefix and command islands.
 fn executeSubmittedLocked(label: []const u8, stream: []const u32) SubmitOutcome {
+    return executeSubmittedLockedForQueue(label, stream, 0);
+}
+
+fn executeSubmittedLockedForQueue(label: []const u8, stream: []const u32, event_id: u32) SubmitOutcome {
     std.debug.assert(completion_batch_active);
     var host_time = kernel_runtime.beginHostTimeExclusion();
     defer host_time.end();
@@ -2421,7 +2434,9 @@ fn executeSubmittedLocked(label: []const u8, stream: []const u32) SubmitOutcome 
     else
         .graphics;
     const release_count_before = submission_scheduler.state(kind).release_count;
-    var report = submission_scheduler.submit(kind, stream) catch |err| {
+    var backend = executor_backend;
+    backend.context = if (event_id == 0) null else @ptrFromInt(event_id);
+    var report = submission_scheduler.submitWithBackend(kind, stream, backend) catch |err| {
         std.debug.print("[{s}] queue stopped: {s}\n", .{ label, @errorName(err) });
         return .{};
     };
@@ -2461,9 +2476,9 @@ fn executeSubmittedLocked(label: []const u8, stream: []const u32) SubmitOutcome 
         soft_wait_batch_reports +|= 1;
     }
 
-    // A completion event can be attributed here only while this submission
-    // drains synchronously. A later cross-queue resume needs per-submission
-    // owner metadata before it can safely publish the matching event.
+    // The caller can publish its submit-completion label only if this stream
+    // drains synchronously. RELEASE_MEM interrupts separately retain their
+    // backend owner across cross-queue resumes.
     const completed = !submission_scheduler.isBlocked(kind) and
         submission_scheduler.pendingCount(kind) == 0;
     if (submission_scheduler.isBlocked(kind)) {
@@ -2633,14 +2648,14 @@ fn forceSatisfyWait(queue_kind: gpu.QueueKind, wait: gpu.state.WaitRegMem) bool 
     return recovered;
 }
 
-fn acceptSubmitted(label: []const u8, stream: []const u32, driver_completion_label: ?u64) SubmitOutcome {
+fn acceptSubmitted(label: []const u8, stream: []const u32, driver_completion_label: ?u64, event_id: u32) SubmitOutcome {
     const commands = if (std.mem.eql(u8, label, "dcb"))
         dcbWithCompletionPrelude(stream)
     else
         stream;
     noteBuilderArenaExecuted(commands);
     announce(label, commands);
-    return executeAcceptedStream(label, commands, driver_completion_label);
+    return executeAcceptedStream(label, commands, driver_completion_label, event_id);
 }
 
 /// Includes the driver-owned EOP packet placed immediately before a DCB.
@@ -2710,7 +2725,7 @@ fn submitOne(
 ) SubmitOutcome {
     const submission = descriptor orelse return .{};
     const stream = streamOf(submission.address, submission.word_count) orelse return .{};
-    return acceptSubmitted(label, stream, driver_completion_label);
+    return acceptSubmitted(label, stream, driver_completion_label, 0);
 }
 
 /// Finds the SDK-private retirement label associated with the descriptor that
@@ -2841,15 +2856,14 @@ fn sdk11AcbGenerationPage(
     generation: u32,
     release_data: u64,
 ) ?u64 {
-    const generation64: u64 = generation;
-    if (generation == 0 or release_data == 0 or generation64 < release_data) return null;
+    if (generation == 0 or release_data == 0) return null;
     // Transient ACB arenas start their packet-local RELEASE_MEM generation at
     // one even while the queue object's process-wide generation keeps
     // increasing. Once an adjacent retirement pair has proved the shared
     // label page, the validated queue owner/index selects that page and the
-    // packet value only proves that this submission reached a release. A
-    // bounded delta here made the shared label stop advancing at generation
-    // 0x102 when the packet-local value was still one.
+    // packet value only proves that this submission reached a release. These
+    // counters have no ordering relationship: a packet can contain a frame
+    // number larger than this compute queue's generation, or restart at one.
     if (shared_page != 0) return shared_page;
     // Before the shared table has identified itself, accept only the simple
     // case where the packet and driver generations agree exactly.
@@ -3317,7 +3331,7 @@ fn submitAcb(owner: u32, descriptor: ?*const Submission) callconv(abi.guest) i32
     const stream = streamOf(submission.address, submission.word_count) orelse return errno.ok;
     const completion_label = driverCompletionLabel(submission, submission.*, 1);
     flushPendingGraphicsSegment();
-    const outcome = acceptSubmitted("acb", stream, completion_label);
+    const outcome = acceptSubmitted("acb", stream, completion_label, owner);
     if (outcome.last_release) |release| {
         publishSdk11AcbDriverGeneration(owner, submission.*, release);
         publishSdk11AcbRetirement(release);
@@ -3345,7 +3359,7 @@ fn submitMultiDcbs(
 
     for (0..count) |index| {
         const stream = streamOf(buffers[index], sizes[index]) orelse continue;
-        publishDcbCompletion(acceptSubmitted("dcb", stream, null));
+        publishDcbCompletion(acceptSubmitted("dcb", stream, null, 0));
     }
     return errno.ok;
 }
@@ -3363,7 +3377,7 @@ pub fn submitMultiAcbs(
     for (0..count) |index| {
         const stream = streamOf(buffers[index], sizes[index]) orelse continue;
         flushPendingGraphicsSegment();
-        const outcome = acceptSubmitted("acb", stream, null);
+        const outcome = acceptSubmitted("acb", stream, null, queue);
         if (outcome.last_release) |release| publishSdk11AcbRetirement(release);
         publishAcbCompletion(queue, outcome);
     }
@@ -3374,7 +3388,7 @@ pub fn submitMultiAcbs(
 fn submitCommandBuffer(_: u32, address: ?[*]const u32, word_count: u32) callconv(abi.guest) i32 {
     drainCompletionNotifications();
     const stream = streamOf(address, word_count) orelse return errno.ok;
-    publishDcbCompletion(acceptSubmitted("dcb", stream, null));
+    publishDcbCompletion(acceptSubmitted("dcb", stream, null, 0));
     return errno.ok;
 }
 
@@ -3845,14 +3859,47 @@ test "bulk DMA writes may span a snapshotted submission header" {
 }
 
 test "one completion batch coalesces duplicate release contexts" {
-    var contexts: [2]u32 = undefined;
+    var contexts: [3]ReleaseContext = undefined;
     var count: usize = 0;
-    try testing.expect(recordUniqueReleaseContext(&contexts, &count, 7));
-    try testing.expect(recordUniqueReleaseContext(&contexts, &count, 7));
-    try testing.expect(recordUniqueReleaseContext(&contexts, &count, 9));
-    try testing.expect(!recordUniqueReleaseContext(&contexts, &count, 11));
-    try testing.expectEqual(@as(usize, 2), count);
-    try testing.expectEqualSlices(u32, &.{ 7, 9 }, &contexts);
+    const graphics = ReleaseContext{ .event_id = 0, .context_id = 7 };
+    const compute = ReleaseContext{ .event_id = 0x52, .context_id = 7 };
+    const next = ReleaseContext{ .event_id = 0, .context_id = 9 };
+    try testing.expect(recordUniqueReleaseContext(&contexts, &count, graphics));
+    try testing.expect(recordUniqueReleaseContext(&contexts, &count, graphics));
+    try testing.expect(recordUniqueReleaseContext(&contexts, &count, compute));
+    try testing.expect(recordUniqueReleaseContext(&contexts, &count, next));
+    try testing.expect(!recordUniqueReleaseContext(&contexts, &count, .{ .event_id = 0, .context_id = 11 }));
+    try testing.expectEqual(@as(usize, 3), count);
+    try testing.expectEqualSlices(ReleaseContext, &.{ graphics, compute, next }, &contexts);
+}
+
+test "release interrupts only notify their originating queue" {
+    event_queue.reset();
+    defer event_queue.reset();
+    const api = struct {
+        fn get(comptime name: []const u8, comptime T: type) T {
+            inline for (event_queue.exports) |entry| {
+                if (comptime std.mem.eql(u8, entry.name, name)) return @ptrCast(entry.function);
+            }
+            @compileError("missing equeue export");
+        }
+    };
+    const create = api.get("sceKernelCreateEqueue", *const fn (?*i64, ?[*:0]const u8) callconv(abi.guest) i32);
+    const wait = api.get("sceKernelWaitEqueue", *const fn (i64, ?[*]event_queue.Event, i32, ?*i32, ?*const u32) callconv(abi.guest) i32);
+    var handle: i64 = 0;
+    try testing.expectEqual(errno.ok, create(&handle, "completion-routing"));
+    try testing.expectEqual(errno.ok, event_queue.addGraphicsEvent(handle, 0x52, 0xcafe));
+    // A graphics EOP must not wake the registration of a compute queue.
+    try testing.expectEqual(@as(usize, 0), deliverCompletion(.{ .kind = .release, .event_id = 0, .context_id = 694 }));
+    try testing.expectEqual(@as(usize, 1), deliverCompletion(.{ .kind = .release, .event_id = 0x52, .context_id = 38 }));
+    var events: [2]event_queue.Event = @splat(.{});
+    var count: i32 = 0;
+    const timeout: u32 = 0;
+    try testing.expectEqual(errno.ok, wait(handle, &events, events.len, &count, &timeout));
+    try testing.expectEqual(@as(i32, 1), count);
+    try testing.expectEqual(@as(u64, 0x52), events[0].ident);
+    try testing.expectEqual(@as(i64, 38), events[0].data);
+    try testing.expectEqual(@as(u64, 0xcafe), events[0].user_data);
 }
 
 test "pending completion FIFO preserves equivalent submit edges" {
@@ -4004,7 +4051,7 @@ test "SDK11 inline submission labels retain their packet generation" {
     try testing.expectEqual(@as(u64, 5), std.mem.readInt(u64, labels[0x4a0..0x4a8], .little));
 }
 
-test "SDK11 completed ACB without RELEASE_MEM advances its validated queue" {
+test "SDK11 completed ACB retires its own generation with or without a packet label" {
     const old_page = sdk11_acb_label_page.load(.acquire);
     const old_owners = sdk11_acb_queue_owners;
     const old_addresses = sdk11_acb_queue_addresses;
@@ -4029,6 +4076,24 @@ test "SDK11 completed ACB without RELEASE_MEM advances its validated queue" {
     publishSdk11AcbDriverGeneration(0x20, .{ .address = &words, .word_count = words.len, .reserved = 0 }, null);
     try testing.expectEqual(@as(u64, 8), std.mem.readInt(u64, labels[0x460..0x468], .little));
     try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, labels[0x480..0x488], .little));
+    std.mem.writeInt(u32, queue[0xd0..0xd4], 57, .little);
+    std.mem.writeInt(u64, labels[0x460..0x468], 56, .little);
+    std.mem.writeInt(u64, labels[0x480..0x488], 720, .little);
+    publishSdk11AcbDriverGeneration(0x20, .{ .address = &words, .word_count = words.len, .reserved = 0 }, .{
+        .address = @intFromPtr(&labels) + 0x480,
+        .data = 720,
+        .data_selection = 2,
+        .event_type = 40,
+        .event_index = 5,
+        .gcr_control = 0x200,
+        .cache_policy = 0,
+        .destination = 1,
+        .interrupt = 2,
+        .interrupt_context_id = 720,
+        .standard_packet = false,
+    });
+    try testing.expectEqual(@as(u64, 57), std.mem.readInt(u64, labels[0x460..0x468], .little));
+    try testing.expectEqual(@as(u64, 720), std.mem.readInt(u64, labels[0x480..0x488], .little));
 }
 
 test "SDK11 ACB generations switch from packet-local to the proven shared page" {
@@ -4047,7 +4112,11 @@ test "SDK11 ACB generations switch from packet-local to the proven shared page" 
         @as(?u64, shared_page),
         sdk11AcbGenerationPage(release_page, shared_page, 0x102, 1),
     );
-    try testing.expect(sdk11AcbGenerationPage(release_page, shared_page, 1, 2) == null);
+    try testing.expectEqual(@as(?u64, shared_page), sdk11AcbGenerationPage(release_page, shared_page, 1, 2));
+    try testing.expectEqual(@as(?u64, shared_page), sdk11AcbGenerationPage(shared_page, shared_page, 57, 720));
+    try testing.expect(sdk11AcbGenerationPage(release_page, 0, 57, 720) == null);
+    try testing.expect(sdk11AcbGenerationPage(release_page, shared_page, 0, 720) == null);
+    try testing.expect(sdk11AcbGenerationPage(release_page, shared_page, 57, 0) == null);
 }
 
 test "an empty submission is not a failure" {

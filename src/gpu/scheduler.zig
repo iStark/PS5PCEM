@@ -75,6 +75,7 @@ pub const PumpReport = struct {
 
 const Submission = struct {
     words: []u32,
+    backend: executor.Backend,
     snapshots: std.ArrayList(Snapshot) = .empty,
     continuation: ?executor.Continuation = null,
     gpu_work_seen: bool = false,
@@ -256,8 +257,14 @@ pub const Scheduler = struct {
     /// soon as submit returns, while a blocked queue must retain its root DCB
     /// and every indirect command/register buffer reachable from it.
     pub fn submit(self: *Scheduler, kind: QueueKind, stream: []const u32) Error!PumpReport {
+        return self.submitWithBackend(kind, stream, self.backend);
+    }
+
+    /// Retains the originating backend with the submission, including across
+    /// cross-queue waits. Its context must remain valid until completion.
+    pub fn submitWithBackend(self: *Scheduler, kind: QueueKind, stream: []const u32, backend: executor.Backend) Error!PumpReport {
         if (stream.len == 0) return Error.InvalidPacket;
-        var submission = try self.copySubmission(stream);
+        var submission = try self.copySubmission(stream, backend);
         self.queueFor(kind).pending.append(self.allocator, submission) catch |err| {
             submission.deinit(self.allocator);
             return err;
@@ -305,7 +312,7 @@ pub const Scheduler = struct {
         const forced_read = queue.forced_read;
         queue.forced_read = null;
         var snapshot_backend = SnapshotBackend{
-            .original = self.backend,
+            .original = active.backend,
             .snapshots = active.snapshots.items,
             .forced_read = forced_read,
             .gpu_work_seen = active.gpu_work_seen,
@@ -347,8 +354,8 @@ pub const Scheduler = struct {
         queue.pending = .empty;
     }
 
-    fn copySubmission(self: *Scheduler, stream: []const u32) Error!Submission {
-        var submission = Submission{ .words = try self.allocator.dupe(u32, stream) };
+    fn copySubmission(self: *Scheduler, stream: []const u32, backend: executor.Backend) Error!Submission {
+        var submission = Submission{ .words = try self.allocator.dupe(u32, stream), .backend = backend };
         errdefer submission.deinit(self.allocator);
 
         var active_addresses: [executor.maximum_stream_depth]u64 = undefined;
@@ -469,7 +476,7 @@ pub const Scheduler = struct {
 
         const words = try self.allocator.alloc(u32, word_count);
         errdefer self.allocator.free(words);
-        if (!self.backend.vtable.read(self.backend.context, address, std.mem.sliceAsBytes(words))) {
+        if (!submission.backend.vtable.read(submission.backend.context, address, std.mem.sliceAsBytes(words))) {
             return Error.MemoryReadFailed;
         }
         try submission.snapshots.append(self.allocator, .{
@@ -793,6 +800,26 @@ test "release on compute resumes graphics and drains its FIFO without replay" {
     try testing.expectEqual(@as(u64, 3), scheduler.state(.graphics).event_count);
     try testing.expectEqual(@as(u64, 1), scheduler.state(.compute).release_count);
     try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, host.memory[0x80..0x84], .little));
+}
+
+test "a resumed submission retains its originating backend" {
+    var original = FakeBackend{};
+    var other = FakeBackend{};
+    const waiting = [_]u32{
+        customCommand(pm4.custom.wait_mem_32, 6), 0x1040, 0, 0xffff_ffff, 1, 0x13, 1,
+        command(pm4.event_write, 1),              0x20,
+    };
+    const ready = [_]u32{ command(pm4.event_write, 1), 0x21 };
+    var scheduler = Scheduler.init(testing.allocator, other.interface());
+    defer scheduler.deinit();
+    _ = try scheduler.submitWithBackend(.graphics, &waiting, original.interface());
+    try testing.expect(scheduler.isBlocked(.graphics));
+    _ = try scheduler.submit(.compute, &ready);
+    try testing.expectEqual(@as(usize, 0), original.event_count);
+    original.putWords(0x1040, &.{1});
+    try testing.expectEqual(@as(usize, 1), (try scheduler.pump()).completed_submissions);
+    try testing.expectEqualSlices(u8, &.{0x20}, original.events[0..original.event_count]);
+    try testing.expectEqualSlices(u8, &.{0x21}, other.events[0..other.event_count]);
 }
 
 test "an unsatisfied queue remains blocked without mutating its label" {
