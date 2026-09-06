@@ -1518,8 +1518,8 @@ fn runShaderInterfaceProbe(allocator: std.mem.Allocator) !void {
         0x3f40_0000,      vop2(3, 6, 6, 8),
         vop1(1, 7, 128),  vop1(1, 8, 242),
         vop1(1, 10, 240), vop2(8, 9, 1, 10), // PARAM1 = VertexIndex * .5
-        0xf800_021f,      0x0807_0a09, // PARAM1 = { VertexIndex * .5, .5, 0, 1 }
-        0xf800_08cf,      0x0807_0605,
+        0xf800_021f, 0x0807_0a09, // PARAM1 = { VertexIndex * .5, .5, 0, 1 }
+        0xf800_08cf, 0x0807_0605,
         0xbf81_0000,
     };
     for (vertex, 0..) |word, index| guest.word(0x700 + index * 4, word);
@@ -1582,7 +1582,8 @@ fn runShaderInterfaceProbe(allocator: std.mem.Allocator) !void {
         0xc802_0502 | (5 << 18),
         0xc802_0602 | (6 << 18),
         0xc802_0702 | (7 << 18),
-        0xf800_080f, 0x0706_0504,
+        0xf800_080f,
+        0x0706_0504,
         0xbf81_0000,
     };
     for (flat_fragment, 0..) |word, index| guest.word(0xb00 + index * 4, word);
@@ -2114,15 +2115,16 @@ fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
-    if (args.len == 2 and std.mem.eql(u8, args[1], "--depth-only")) {
+    if (args.len == 2 and (std.mem.eql(u8, args[1], "--depth-only") or std.mem.eql(u8, args[1], "--depth-bias"))) {
         var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
         defer renderer.deinit();
         renderer.graphics_probe_colored_pixels = 123;
-        const depth = try renderer.probeDepthOnlyDraws();
+        const biased = std.mem.eql(u8, args[1], "--depth-bias");
+        const depth = try renderer.probeDepthOnlyDraws(biased);
         try std.testing.expectEqual(@as(f32, 1), depth[0]);
-        try std.testing.expectEqual(@as(f32, 0), depth[1]);
+        try std.testing.expectEqual(@as(f32, if (biased) 0.4990234375 else 0), depth[1]);
         try std.testing.expectEqual(@as(u32, 123), renderer.graphics_probe_colored_pixels);
-        std.debug.print("depth-only draws passed: depth write, retained attachment and no colour readback\n", .{});
+        std.debug.print("depth-only draws passed: bias={any}, depth={any}, retained attachment and no colour readback\n", .{ biased, depth });
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--scalar-loops")) {

@@ -831,6 +831,18 @@ validation. Live verification of the notice is still pending. After confirming
 the old notice with Cross, the captured framebuffer remained black while the
 scene continued submitting frames.
 
+The next notice eventually appears (`Gift of the Northern Star Unlocked`),
+confirming that the first black interval was also a slow UI transition. This
+does not establish the menu background. Captured shadow draws use polygon
+offset format `0x1e9` (D32 float, -23), zero clamp and equal front/back bias.
+These settings now map to Vulkan depth bias, with the hardware slope divided
+by 16 and the constant preserved. Other depth representations, nonzero clamp
+and unequal face settings remain rejected. CPU tests exercise both captured
+raster modes and three slope values. The SDK GPU probe shifts depth 0.5 to
+0.4990234375, retains it across a second draw and avoids colour readback;
+the ordinary depth probe and complete Vulkan smoke also pass. This change
+still needs validation in the title's scene.
+
 ## Baseline before the timestamp fix
 
 A five-minute run continues rendering after the movie, at approximately

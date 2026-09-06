@@ -921,6 +921,9 @@ const GraphicsPipelineState = extern struct {
     cull_mode: u32,
     front_face: u32,
     rasterizer_discard: u32,
+    depth_bias_enable: u32 = 0,
+    depth_bias_constant_bits: u32 = 0,
+    depth_bias_slope_bits: u32 = 0,
     color_write_masks: [gpu.resources.color_target_count]u32,
     blend_enables: [gpu.resources.color_target_count]u32,
     source_color_blend_factors: [gpu.resources.color_target_count]u32,
@@ -9122,11 +9125,8 @@ pub const Renderer = struct {
             result.scissor_width = right - left;
             result.scissor_height = bottom - top;
         }
-        if (render.raster.polygon_mode != 0 or
-            render.raster.depth_bias_front or render.raster.depth_bias_back)
-        {
-            return Error.UnsupportedGraphicsState;
-        }
+        if (render.raster.polygon_mode != 0) return Error.UnsupportedGraphicsState;
+        try applyGuestDepthBias(&result, render.raster, if (render.depth_target) |depth| depth.format else 0);
         // Ignore guest culling on the first host path: attribute fetch and
         // winding often disagree until NGG export is fully correct, and a
         // full cull makes every black writeback look identical.
@@ -9134,6 +9134,25 @@ pub const Renderer = struct {
         result.front_face = if (render.raster.clockwise_front_face) 0 else 1;
         result.rasterizer_discard = @intFromBool(render.raster.rasterizer_discard);
         return result;
+    }
+
+    fn applyGuestDepthBias(result: *GraphicsPipelineState, raster: gpu.resources.RasterState, depth_format: u8) Error!void {
+        if (!raster.depth_bias_front and !raster.depth_bias_back) return;
+        // Vulkan exposes one bias for both faces. Match the captured D32
+        // floating-point (-23 mantissa bits) mode; other representations and
+        // unequal face settings need separate handling. Clamp=0 needs no
+        // optional depthBiasClamp device feature.
+        if (!raster.depth_bias_front or !raster.depth_bias_back or
+            raster.depth_bias_format != 0x1e9 or depth_format != 3 or
+            raster.depth_bias_clamp != 0 or
+            raster.depth_bias_front_scale != raster.depth_bias_back_scale or
+            raster.depth_bias_front_offset != raster.depth_bias_back_offset or
+            !std.math.isFinite(raster.depth_bias_front_scale) or
+            !std.math.isFinite(raster.depth_bias_front_offset)) return Error.UnsupportedGraphicsState;
+        result.depth_bias_enable = 1;
+        result.depth_bias_constant_bits = @bitCast(raster.depth_bias_front_offset);
+        // PA_SU_POLY_OFFSET_*_SCALE measures slope at 1/16 pixel precision.
+        result.depth_bias_slope_bits = @bitCast(raster.depth_bias_front_scale / 16.0);
     }
 
     fn vulkanBlendFactor(factor: u5) Error!u32 {
@@ -9224,6 +9243,9 @@ pub const Renderer = struct {
             .rasterizer_discard_enable = pipeline_state.rasterizer_discard,
             .cull_mode = pipeline_state.cull_mode,
             .front_face = pipeline_state.front_face,
+            .depth_bias_enable = pipeline_state.depth_bias_enable,
+            .depth_bias_constant_factor = @bitCast(pipeline_state.depth_bias_constant_bits),
+            .depth_bias_slope_factor = @bitCast(pipeline_state.depth_bias_slope_bits),
         };
         const multisample = vk.PipelineMultisampleStateCreateInfo{
             .rasterization_samples = pipeline_state.rasterization_samples,
@@ -12547,7 +12569,7 @@ pub const Renderer = struct {
 
     /// Exercise the depth-only compatibility path and return corner/centre
     /// depth after two draws. The second empty draw must retain the first.
-    pub fn probeDepthOnlyDraws(self: *Renderer) anyerror![2]f32 {
+    pub fn probeDepthOnlyDraws(self: *Renderer, biased: bool) anyerror![2]f32 {
         const old_transfer = self.depth_transfer_enabled;
         self.depth_transfer_enabled = false;
         defer self.depth_transfer_enabled = old_transfer;
@@ -12569,6 +12591,16 @@ pub const Renderer = struct {
         state.depth_test_enable = 1;
         state.depth_write_enable = 1;
         state.depth_compare_operation = 1; // VK_COMPARE_OP_LESS
+        if (biased) {
+            var registers = gpu.State{};
+            try registers.writeRegister(.context, 0x205, 0x1a42);
+            try registers.writeRegister(.context, 0x2de, 0x1e9);
+            for ([_]u32{ 0x2e1, 0x2e3 }) |reg|
+                try registers.writeRegister(.context, reg, @bitCast(@as(f32, -16384)));
+            try applyGuestDepthBias(&state, gpu.resources.decodeRasterState(&registers), 3);
+            state.viewport_min_depth_bits = @bitCast(@as(f32, 0.5));
+            state.viewport_max_depth_bits = @bitCast(@as(f32, 0.5));
+        }
         const index = try self.acquireDepthTarget(target);
         for ([_]u32{ 3, 0 }) |vertices| {
             try self.beginFrameDraw();
@@ -27159,6 +27191,42 @@ test "integrated Vulkan device preference reverses the default adapter order" {
         physicalDeviceScore(vk.physical_device_type_integrated_gpu, true) >
             physicalDeviceScore(vk.physical_device_type_discrete_gpu, true),
     );
+}
+
+test "captured D32 shadow depth bias preserves scale and rejects unequal faces" {
+    var registers = gpu.State{};
+    try registers.writeRegister(.context, 0x2de, 0x1e9);
+    for ([_]u32{ 0x1a40, 0x1a42 }) |mode| {
+        try registers.writeRegister(.context, 0x205, mode);
+        for ([_]f32{ -10, -25, -100 }) |scale| {
+            for ([_]u32{ 0x2e0, 0x2e2 }) |reg|
+                try registers.writeRegister(.context, reg, @bitCast(scale));
+            for ([_]u32{ 0x2e1, 0x2e3 }) |reg|
+                try registers.writeRegister(.context, reg, @bitCast(@as(f32, -1000)));
+            const raster = gpu.resources.decodeRasterState(&registers);
+            var pipeline = GraphicsPipelineState.default(32, 32);
+            try Renderer.applyGuestDepthBias(&pipeline, raster, 3);
+            try std.testing.expectEqual(@as(u32, 1), pipeline.depth_bias_enable);
+            try std.testing.expectEqual(@as(f32, -1000), @as(f32, @bitCast(pipeline.depth_bias_constant_bits)));
+            try std.testing.expectEqual(scale / 16, @as(f32, @bitCast(pipeline.depth_bias_slope_bits)));
+            try std.testing.expectError(Error.UnsupportedGraphicsState, Renderer.applyGuestDepthBias(&pipeline, raster, 1));
+            var unequal = raster;
+            unequal.depth_bias_back_offset = 0;
+            try std.testing.expectError(Error.UnsupportedGraphicsState, Renderer.applyGuestDepthBias(&pipeline, unequal, 3));
+            var one_face = raster;
+            one_face.depth_bias_back = false;
+            try std.testing.expectError(Error.UnsupportedGraphicsState, Renderer.applyGuestDepthBias(&pipeline, one_face, 3));
+            var clamped = raster;
+            clamped.depth_bias_clamp = 1;
+            try std.testing.expectError(Error.UnsupportedGraphicsState, Renderer.applyGuestDepthBias(&pipeline, clamped, 3));
+            var invalid = raster;
+            invalid.depth_bias_front_offset = std.math.nan(f32);
+            try std.testing.expectError(Error.UnsupportedGraphicsState, Renderer.applyGuestDepthBias(&pipeline, invalid, 3));
+            invalid = raster;
+            invalid.depth_bias_format = 0;
+            try std.testing.expectError(Error.UnsupportedGraphicsState, Renderer.applyGuestDepthBias(&pipeline, invalid, 3));
+        }
+    }
 }
 
 test "guest depth compare selectors map onto the host operations" {

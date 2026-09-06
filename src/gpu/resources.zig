@@ -399,6 +399,12 @@ pub const RasterState = struct {
     polygon_type_back: u3 = 0,
     depth_bias_front: bool = false,
     depth_bias_back: bool = false,
+    depth_bias_format: u32 = 0,
+    depth_bias_clamp: f32 = 0,
+    depth_bias_front_scale: f32 = 0,
+    depth_bias_front_offset: f32 = 0,
+    depth_bias_back_scale: f32 = 0,
+    depth_bias_back_offset: f32 = 0,
     rasterizer_discard: bool = false,
     /// PA_CL_CLIP_CNTL.DX_CLIP_SPACE_DEF selects a Z clip range of 0..W.
     /// With the bit clear, guest positions use the OpenGL-style -W..W range.
@@ -758,6 +764,12 @@ pub fn decodeRasterState(state: *const gpu_state.State) RasterState {
         .polygon_type_back = @truncate((mode >> 8) & 0x7),
         .depth_bias_front = mode & (1 << 11) != 0,
         .depth_bias_back = mode & (1 << 12) != 0,
+        .depth_bias_format = context(state, 0x2de) orelse 0,
+        .depth_bias_clamp = @bitCast(context(state, 0x2df) orelse 0),
+        .depth_bias_front_scale = @bitCast(context(state, 0x2e0) orelse 0),
+        .depth_bias_front_offset = @bitCast(context(state, 0x2e1) orelse 0),
+        .depth_bias_back_scale = @bitCast(context(state, 0x2e2) orelse 0),
+        .depth_bias_back_offset = @bitCast(context(state, 0x2e3) orelse 0),
         .rasterizer_discard = clip & (1 << 22) != 0,
         .zero_to_one_depth = clip & (1 << 19) != 0,
     };
