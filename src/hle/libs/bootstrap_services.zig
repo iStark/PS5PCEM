@@ -3049,7 +3049,7 @@ fn isFusableShaderPair(front_type: u8, back_type: u8) bool {
     return (front_type == 4 and back_type == 6) or (front_type == 5 and back_type == 7);
 }
 
-fn findShaderRegister(registers: [*]ShaderRegister, count: u8, offset: u32, occurrence: u32) ?*ShaderRegister {
+fn findShaderRegister(registers: [*]align(1) ShaderRegister, count: u8, offset: u32, occurrence: u32) ?*align(1) ShaderRegister {
     var seen: u32 = 0;
     for (registers[0..count]) |*entry| {
         if (entry.offset != offset) continue;
@@ -3059,7 +3059,7 @@ fn findShaderRegister(registers: [*]ShaderRegister, count: u8, offset: u32, occu
     return null;
 }
 
-fn patchShaderRegisterAddress(registers: [*]ShaderRegister, count: u8, lo_offset: u32, address: u64) void {
+fn patchShaderRegisterAddress(registers: [*]align(1) ShaderRegister, count: u8, lo_offset: u32, address: u64) void {
     const low = findShaderRegister(registers, count, lo_offset, 0) orelse return;
     const high = findShaderRegister(registers, count, lo_offset + 1, 0) orelse return;
     low.value = @truncate(address >> 8);
@@ -3080,9 +3080,9 @@ fn patchShaderProgram(header_address: u64, code_address: u64) ?u64 {
         return null;
     }
 
-    const registers: [*]ShaderRegister = @ptrFromInt(registers_address);
-    var low: ?*ShaderRegister = null;
-    var high: ?*ShaderRegister = null;
+    const registers: [*]align(1) ShaderRegister = @ptrFromInt(registers_address);
+    var low: ?*align(1) ShaderRegister = null;
+    var high: ?*align(1) ShaderRegister = null;
     for (registers[0..count]) |*entry| {
         if (entry.offset == wanted.low) low = entry;
         if (entry.offset == wanted.high) high = entry;
@@ -3107,8 +3107,9 @@ fn agcCreateShader(
     const code_address = @intFromPtr(code_pointer);
     if (!accessible(header_address, shader_structure_size)) return errno.KernelError.efault.raw();
 
-    const header_words: *const [2]u32 = @ptrFromInt(header_address);
-    if (header_words[0] != shader_file_header or header_words[1] != shader_version) {
+    // Shader archives also pack headers at odd byte offsets. The file format
+    // supplies relative offsets, not native pointer alignment guarantees.
+    if (readGuestU32(header_address) != shader_file_header or readGuestU32(header_address + 4) != shader_version) {
         return invalid_argument;
     }
     const pointer_fields = [_]usize{
@@ -3208,8 +3209,8 @@ fn agcFuseShaderHalves(
         {
             return errno.KernelError.efault.raw();
         }
-        const front_stages = @as(*const u32, @ptrFromInt(front_specials + shader_special_vgt_stages_offset + 4)).*;
-        const back_stages = @as(*const u32, @ptrFromInt(back_specials + shader_special_vgt_stages_offset + 4)).*;
+        const front_stages = readGuestU32(front_specials + shader_special_vgt_stages_offset + 4);
+        const back_stages = readGuestU32(back_specials + shader_special_vgt_stages_offset + 4);
         const wave_bit: u32 = if (is_geometry) (@as(u32, 1) << 22) else (@as(u32, 1) << 21);
         if ((front_stages ^ back_stages) & wave_bit != 0) return graphics_error_invalid_shader_halves;
     }
@@ -3244,14 +3245,14 @@ fn agcFuseShaderHalves(
         if (!accessible(fused_registers_address, @as(usize, register_count) * @sizeOf(ShaderRegister))) {
             return errno.KernelError.efault.raw();
         }
-        const fused_regs: [*]ShaderRegister = @ptrFromInt(fused_registers_address);
+        const fused_regs: [*]align(1) ShaderRegister = @ptrFromInt(fused_registers_address);
         if (is_geometry) {
             const front_registers_address = readGuestU64(front_address + shader_sh_registers_offset);
             const front_count = front_bytes[shader_sh_register_count_offset];
             if (front_registers_address != 0 and front_count != 0 and
                 accessible(front_registers_address, @as(usize, front_count) * @sizeOf(ShaderRegister)))
             {
-                const front_regs: [*]ShaderRegister = @ptrFromInt(front_registers_address);
+                const front_regs: [*]align(1) ShaderRegister = @ptrFromInt(front_registers_address);
                 for (0..2) |occurrence| {
                     const dst = findShaderRegister(fused_regs, register_count, spi_shader_pgm_chksum_gs, @intCast(occurrence));
                     const src = findShaderRegister(front_regs, front_count, spi_shader_pgm_chksum_gs, @intCast(occurrence));
@@ -3287,7 +3288,7 @@ fn agcCreatePrimState(
     if (!accessible(shader_address, shader_structure_size)) return errno.KernelError.efault.raw();
     const specials_address = readGuestU64(shader_address + shader_specials_offset);
     if (specials_address == 0 or !accessible(specials_address, 0x30)) return invalid_argument;
-    const specials: [*]const ShaderRegister = @ptrFromInt(specials_address);
+    const specials: [*]align(1) const ShaderRegister = @ptrFromInt(specials_address);
 
     if (cx_registers) |cx| {
         cx[0] = specials[1]; // VGT_SHADER_STAGES_EN at +0x08
@@ -3301,30 +3302,80 @@ fn agcCreatePrimState(
     return errno.ok;
 }
 
-/// Completes the fixed-size primitive-register table produced by
-/// `sceAgcCreatePrimState`.
-///
-/// SDK 11 callers probe 32 `(offset, value)` pairs after the three UC entries
-/// written above.  The helper represented by NID `dbOlWdppb4o` initializes the
-/// unused probes; leaving it as a success-only stub makes the caller interpret
-/// guest-stack residue as a register offset and index outside its table.
-fn agcAddPrimStateRegisters(
-    uc_registers: ?[*]ShaderRegister,
-    _: u64,
-    _: u64,
-    _: u64,
-    _: u64,
-    _: u64,
+/// NID dbOlWdppb4o builds all 32 SPI_PS_INPUT_CNTL registers independently of
+/// primitive state. Match semantic IDs, since PS inputs and GS exports need
+/// not have the same order or hardware slot.
+fn agcCreateInterpolantMapping2(
+    output: ?[*]ShaderRegister,
+    geometry_shader: ?*const anyopaque,
+    pixel_shader: ?*const anyopaque,
 ) callconv(abi.guest) i32 {
-    const registers = uc_registers orelse return invalid_argument;
-    const populated_registers: usize = 3;
-    const probed_registers: usize = 0x20;
-    const address = @intFromPtr(registers);
-    const byte_count = probed_registers * @sizeOf(ShaderRegister);
-    if (!accessible(address, byte_count)) return errno.KernelError.efault.raw();
-
-    @memset(registers[populated_registers..probed_registers], .{ .offset = 0, .value = 0 });
+    const registers = output orelse return invalid_argument;
+    if (!accessible(@intFromPtr(registers), 32 * @sizeOf(ShaderRegister))) return errno.KernelError.efault.raw();
+    var input_count: u32 = 0;
+    var inputs: u64 = 0;
+    var output_count: u16 = 0;
+    var outputs: u64 = 0;
+    if (pixel_shader) |ps| {
+        const address = @intFromPtr(ps);
+        if (!accessible(address, shader_structure_size)) return errno.KernelError.efault.raw();
+        input_count = readGuestU32(address + 0x50);
+        if (input_count > 32) return invalid_argument;
+        inputs = readGuestU64(address + shader_input_semantics_offset);
+        if (input_count != 0 and !accessible(inputs, @as(usize, input_count) * 4)) return errno.KernelError.efault.raw();
+    }
+    if (input_count != 0) {
+        const gs = geometry_shader orelse return invalid_argument;
+        const address = @intFromPtr(gs);
+        if (!accessible(address, shader_structure_size)) return errno.KernelError.efault.raw();
+        output_count = @truncate(readGuestU32(address + 0x54) >> 16);
+        outputs = readGuestU64(address + shader_output_semantics_offset);
+        if (output_count != 0 and !accessible(outputs, @as(usize, output_count) * 4)) return errno.KernelError.efault.raw();
+    }
+    for (0..32) |index| {
+        var value: u32 = @intCast(index);
+        if (index < input_count) {
+            const input = readGuestU32(inputs + index * 4);
+            var matching_output: ?u32 = null;
+            for (0..output_count) |j| {
+                const semantic = readGuestU32(outputs + j * 4);
+                if (@as(u8, @truncate(input)) == @as(u8, @truncate(semantic))) {
+                    matching_output = semantic;
+                    break;
+                }
+            }
+            value = interpolantControl(input, matching_output);
+        }
+        registers[index] = .{ .offset = 0x191 + @as(u32, @intCast(index)), .value = value };
+    }
     return errno.ok;
+}
+
+fn interpolantControl(input: u32, output: ?u32) u32 {
+    const mode = (input >> 20) & 3;
+    const common = input & (output orelse 0);
+    var value: u32 = 0;
+    if (mode == 0) {
+        // OFFSET bit 5 selects the default constant or point-sprite input.
+        if (output == null or input & (1 << 24) != 0) value |= 1 << 5;
+        value |= ((input >> 28) & 3) << 8;
+    } else {
+        value = (mode << 24) | (1 << 19); // ATTR0/1_VALID, FP16_INTERP_MODE
+        if (mode == 2) {
+            if (common & (1 << 21) == 0) value |= 1 << 5;
+            value |= ((input >> 30) & 3) << 8;
+        } else {
+            if (common & (1 << 20) == 0) value |= 1 << 5;
+            if (common & (1 << 21) == 0) value |= 1 << 20;
+            value |= ((input >> 28) & 3) << 8;
+        }
+        value |= ((input >> 30) & 3) << 21;
+    }
+    if (output) |semantic| {
+        value |= (semantic >> 8) & 0x1f;
+        if (input & ((1 << 22) | (1 << 24)) != 0) value |= 1 << 10;
+    }
+    return value;
 }
 
 const agc_exports = [_]symbols.Export{
@@ -3354,7 +3405,7 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcGetIsTrinityMode", .function = trace.wrap("sceAgcGetIsTrinityMode", &agcPatch), .expect_id = "BfBDZGbti7A" },
     .{ .name = "sceAgcDebugRaiseException", .function = trace.wrap("sceAgcDebugRaiseException", &agcPatch), .expect_id = "T6xuVw0KUJo" },
     .{ .name = "sceAgcCbSetShRegisterRangeDirectGetSize", .function = trace.wrap("sceAgcCbSetShRegisterRangeDirectGetSize", &agcSetShRegisterRangeDirectGetSize), .expect_id = "bxGoVxpdSPQ" },
-    .{ .name = "sceAgcAddPrimStateRegisters", .function = trace.wrap("sceAgcAddPrimStateRegisters", &agcAddPrimStateRegisters), .id_override = "dbOlWdppb4o" },
+    .{ .name = "sceAgcCreateInterpolantMapping2", .function = trace.wrap("sceAgcCreateInterpolantMapping2", &agcCreateInterpolantMapping2), .id_override = "dbOlWdppb4o" },
     .{ .name = "sceAgcUnknownKRzWekV120", .function = trace.wrap("sceAgcUnknownKRzWekV120", &agcSetIndexTypeIndexed), .id_override = "-KRzWekV120" },
     .{ .name = "sceAgcUnknownIkfdtRIqCE", .function = trace.wrap("sceAgcUnknownIkfdtRIqCE", &agcPatch), .id_override = "Ikfdt-rIqCE" },
     .{ .name = "sceAgcGetDataPacketPayloadAddress", .function = trace.wrap("sceAgcGetDataPacketPayloadAddress", &agcGetDataPacketPayloadAddress), .id_override = "V++UgBtQhn0" },
@@ -4013,13 +4064,43 @@ test "shader creation relocates its header and builds primitive state" {
     try std.testing.expectEqual(specials[5], uc[1]);
     try std.testing.expectEqual(@as(u32, 0x242), uc[2].offset);
     try std.testing.expectEqual(@as(u32, 4), uc[2].value);
-    try std.testing.expectEqual(
-        @as(i32, 0),
-        agcAddPrimStateRegisters(&uc, 0, 0, 0, 0, 0),
-    );
     for (uc[3..]) |entry| {
-        try std.testing.expectEqual(ShaderRegister{ .offset = 0, .value = 0 }, entry);
+        try std.testing.expectEqual(ShaderRegister{ .offset = 0xdead_beef, .value = 0xdead_beef }, entry);
     }
+}
+
+test "AGC interpolant mapping initializes all entries and matches shader semantics" {
+    var ps: [shader_structure_size]u8 align(4) = @splat(0);
+    var gs: [shader_structure_size]u8 align(4) = @splat(0);
+    const inputs = [_]u32{ 0, 1, 2, 3, 4, 0x0040_0005 };
+    const outputs = [_]u32{ 0x505, 0x404, 0x303, 0x202, 0x101, 0 };
+    writeGuestU64(@intFromPtr(&ps) + shader_input_semantics_offset, @intFromPtr(&inputs));
+    writeGuestU64(@intFromPtr(&gs) + shader_output_semantics_offset, @intFromPtr(&outputs));
+    std.mem.writeInt(u32, ps[0x50..0x54], inputs.len, .little);
+    std.mem.writeInt(u16, gs[0x56..0x58], outputs.len, .little);
+    var registers: [32]ShaderRegister = @splat(.{ .offset = 0xdead_beef, .value = 0xdead_beef });
+    try std.testing.expectEqual(errno.ok, agcCreateInterpolantMapping2(&registers, &gs, &ps));
+    for (registers, 0..) |entry, index| {
+        try std.testing.expectEqual(@as(u32, @intCast(0x191 + index)), entry.offset);
+        try std.testing.expectEqual(@as(u32, @intCast(index)) | @as(u32, if (index == 5) 0x400 else 0), entry.value);
+    }
+    try std.testing.expectEqual(errno.ok, agcCreateInterpolantMapping2(&registers, null, null));
+    for (registers, 0..) |entry, index| try std.testing.expectEqual(@as(u32, @intCast(index)), entry.value);
+    std.mem.writeInt(u32, ps[0x50..0x54], 33, .little);
+    try std.testing.expectEqual(invalid_argument, agcCreateInterpolantMapping2(&registers, &gs, &ps));
+    std.mem.writeInt(u32, ps[0x50..0x54], 1, .little);
+    writeGuestU64(@intFromPtr(&ps) + shader_input_semantics_offset, 0);
+    try std.testing.expectEqual(errno.KernelError.efault.raw(), agcCreateInterpolantMapping2(&registers, &gs, &ps));
+}
+
+test "AGC interpolants encode defaults flat shading and packed halves" {
+    try std.testing.expectEqual(@as(u32, 7), interpolantControl(0x12, 0x712));
+    try std.testing.expectEqual(@as(u32, 0x407), interpolantControl(0x0040_0012, 0x712));
+    try std.testing.expectEqual(@as(u32, 0x627), interpolantControl(0x2100_0012, 0x712));
+    try std.testing.expectEqual(@as(u32, 0x320), interpolantControl(0x3040_0012, null));
+    try std.testing.expectEqual(@as(u32, 0x0118_0007), interpolantControl(0x0010_0012, 0x0010_0712));
+    try std.testing.expectEqual(@as(u32, 0x0228_0107), interpolantControl(0x4020_0012, 0x0020_0712));
+    try std.testing.expectEqual(@as(u32, 0x0358_0320), interpolantControl(0xb030_0012, null));
 }
 
 test "shader creation accepts a fused front half without program registers" {
@@ -4082,6 +4163,28 @@ test "shader creation accepts four-byte-aligned AGC headers" {
     );
     try std.testing.expectEqual(specials[1], cx[0]);
     try std.testing.expectEqual(specials[4], cx[1]);
+}
+
+test "shader creation accepts byte-packed headers and register tables" {
+    agc_shader_registry.reset();
+    defer agc_shader_registry.reset();
+    var bytes: [shader_structure_size + 1 + 16]u8 align(8) = @splat(0);
+    const header = bytes[1..][0..shader_structure_size];
+    const address = @intFromPtr(header.ptr);
+    const registers = address + shader_structure_size;
+    std.mem.writeInt(u32, header[0..4], shader_file_header, .little);
+    std.mem.writeInt(u32, header[4..8], shader_version, .little);
+    header[shader_type_offset] = 1;
+    header[shader_sh_register_count_offset] = 2;
+    writeGuestU64(address + shader_sh_registers_offset, registers - (address + shader_sh_registers_offset));
+    writeGuestU32(registers, 8);
+    writeGuestU32(registers + 8, 9);
+    var code: [16]u8 align(256) = @splat(0);
+    var shader: ?*anyopaque = null;
+    try std.testing.expectEqual(errno.ok, agcCreateShader(&shader, header.ptr, &code));
+    try std.testing.expectEqual(address, @intFromPtr(shader.?));
+    try std.testing.expectEqual(registers, readGuestU64(address + shader_sh_registers_offset));
+    try std.testing.expectEqual(@as(u32, @truncate(@intFromPtr(&code) >> 8)), readGuestU32(registers + 4));
 }
 
 test "fuse shader halves patches ES program and keeps front header lookup" {

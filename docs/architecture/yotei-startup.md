@@ -369,6 +369,45 @@ infinities and NaNs, including source modifiers and preservation of VCC.
 Dynamic descriptor selection in `0x8000333c00` remains unresolved. A complete
 menu rendering has not yet been confirmed.
 
+## Streamed scene resources and AGC shader interfaces
+
+The longer run with the lane-prefix fix resolves 6,042 resource requests and
+reaches loader state 40. Its next CPU fault is in the register-table consumer
+at `0x1650cc4`: the first entry contains a host return address from an
+uninitialized stack array. NID `dbOlWdppb4o` is the interpolant-mapping helper,
+not an extension of primitive state. It now initializes all 32
+`SPI_PS_INPUT_CNTL` pairs and matches PS input semantics against GS exports,
+including defaults, flat/custom shading and packed half attributes. The
+captured failing pair has six matched semantics, with input 5 flat shaded.
+
+A ReleaseSafe run also exposes byte-packed shader headers (for example,
+`0x801e975691`). Shader creation, program-register patching and fusion read
+these fields without native alignment assumptions. Regression tests cover
+the captured semantic pattern, unmatched/default inputs and odd-address
+headers with odd-address register tables.
+
+Sampled textures loaded from an indexed scalar-buffer descriptor table can
+now bind a bounded set of candidate views. The translated shader compares
+all eight runtime T# words and selects the matching Vulkan descriptor, with
+the required nonuniform indexing capabilities and decorations. Aliases with
+different channel mappings remain distinct. Null/out-of-bounds selections
+return zero. Candidate enumeration includes 32-bit multiplication wrap;
+unbounded tables and nested pointer-driven image/sampler tables still refuse.
+
+Texture uploads now read the selected mip range rather than requiring every
+resource mip to be committed. Smallest-first mip placement preserves the
+full resource layer stride; array views copy their selected blocks across
+uncommitted gaps. Missing bytes inside a selected mip still fail. The game
+previously refused a 4096-square BC3 view at base mip 1 even though its
+approximately 5.6 MiB resident prefix was mapped, because it also read the
+uncommitted 16 MiB mip 0.
+
+The indirect-image and streamed-mip GPU probes and the full Vulkan smoke pass
+on the RTX 3070 Ti with SDK 1.4.357.0 validation and synchronization validation,
+without VUID or synchronization errors. All 28 tiling tests and the targeted
+AGC tests pass. The new game run passes the packed-header failure and continues
+through state 23. Passing state 40 and rendering the menu remain unconfirmed.
+
 ## Baseline before the timestamp fix
 
 A five-minute run continues rendering after the movie, at approximately

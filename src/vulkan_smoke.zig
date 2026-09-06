@@ -978,9 +978,129 @@ fn runPackedBufferProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("packed buffer probe passed: D16 loads/stores, adjacent halfwords, bounds, half/float packing, CMPX U16 and CLASS F32\n", .{});
 }
 
+fn runStreamedMipProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    const Memory = struct {
+        guest: GuestMemory = .{},
+        resident_end: u64 = 0,
+        fn read(context: ?*anyopaque, address: u64, destination: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (address < 0x100000 and address + destination.len > self.resident_end) return false;
+            return GuestMemory.read(&self.guest, address, destination);
+        }
+        fn write(context: ?*anyopaque, address: u64, source: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            return GuestMemory.write(&self.guest, address, source);
+        }
+    };
+    var memory = Memory{};
+    const guest = &memory.guest;
+    _ = renderer.dcbBackend(.{ .context = &memory, .read = Memory.read, .write = Memory.write });
+    const code = [_]u32{
+        vop1(1, 0, 255), 0x3e80_0000,
+        vop1(1, 1, 255), 0x3e80_0000,
+        0xf09c_010a,     0x0040_0200,
+        1,               0xe070_0000,
+        0x8003_0200,     0xbf81_0000,
+    };
+    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var image = sampledImageDescriptorWords(0x12000, 256, 256);
+    image[3] |= (2 << 12) | (8 << 16) | (@as(u32, @intFromEnum(gpu.resources.TileMode.standard_4kb)) << 20);
+    image[5] = 8 << 4; // resource includes all nine mip levels
+    const texture = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&image));
+    const view = try texture.subresource(2, 0, 1);
+    memory.resident_end = 0x12000 + view.required_source_bytes;
+    try std.testing.expect(memory.resident_end < guest.bytes.len);
+    try std.testing.expect(0x12000 + texture.required_source_bytes > guest.bytes.len);
+    for (0..view.height) |y| for (0..view.width) |x| {
+        guest.word(0x12000 + @as(usize, @intCast(try view.sourceByteOffset(@intCast(x), @intCast(y), 0, 0))), 0xff00_0040);
+    };
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 16 << 1);
+    var userdata: [16]u32 = @splat(0);
+    @memcpy(userdata[0..8], &image);
+    @memcpy(userdata[12..16], &[_]u32{ 0x10000, 4 << 16, 1, 0 });
+    for (userdata, 0..) |word, index| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+    _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+    var bytes: [4]u8 = undefined;
+    try renderer.readbackGuestStorageBuffer(0x10000, &bytes);
+    const actual: f32 = @bitCast(std.mem.readInt(u32, &bytes, .little));
+    try std.testing.expectApproxEqAbs(@as(f32, 64.0 / 255.0), actual, 0.00001);
+    std.debug.print("streamed mip probe passed: absent high mips and visible base-level sampling\n", .{});
+}
+
+fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    if (!renderer.sampled_image_nonuniform_indexing) return error.NonuniformSampledImagesUnavailable;
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    for (0..2) |case_index| {
+        const wrapping = case_index != 0;
+        const stride: u32 = if (wrapping) 48 else 32;
+        const table: u32 = 0x11000 + @as(u32, @intCast(case_index)) * 0x1000;
+        const output: u32 = 0x10000 + @as(u32, @intCast(case_index)) * 0x100;
+        const code = [_]u32{
+            0x8014_ff18, if (wrapping) 0xaaaa_aaab else 0, // workgroup X + wrapping selector
+            0x9314_0014 | ((128 + stride) << 8), // s_mul_i32 s20, s20, stride
+            0xf42c_0004, 0x2800_0000, // s_buffer_load_dwordx8 s0, V#s8, s20
+            vop1(1, 1, 24), // preserve workgroup index for output
+            vop1(1, 2, 255),
+            0x3e80_0000,
+            vop1(1, 3, 255),
+            0x3e80_0000,
+            0xf09c_010a, 0x0080_0402, 3, // sample T#s0, S#s16, v2/v3 -> v4
+            0xe070_2000, 0x8003_0401, // indexed store v4, v1, V#s12
+            0xbf81_0000,
+        };
+        for (code, 0..) |word, index| guest.word(0x100 + case_index * 0x100 + index * 4, word);
+        for ([_]u32{ 0x8000, 0x9000, 0x8000 }, 0..) |address, index| {
+            var image = sampledImageDescriptorWords(address, 4, 4);
+            if (index == 2) image[3] = (image[3] & ~@as(u32, 7)) | 6; // same allocation, blue in red channel
+            for (image, 0..) |word, component| guest.word(table + (if (wrapping) @as(usize, 16) else 0) + index * stride + component * 4, word);
+            const layout = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&image));
+            const surface = try layout.base();
+            for (0..4) |y| for (0..4) |x| {
+                const pixel = address + @as(usize, @intCast(try surface.sourceByteOffset(@intCast(x), @intCast(y), 0, 0)));
+                guest.word(pixel, if (index != 1) 0xff80_00ff else 0xff00_0040);
+            };
+        }
+        var state = gpu.State{};
+        const compute = gpu.resources.ShaderStage.compute;
+        try state.writeRegister(.shader, compute.programRegisterBase(), @intCast(case_index + 1));
+        try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+        try state.writeRegister(.shader, 0x213, (24 << 1) | (1 << 7));
+        var userdata: [24]u32 = @splat(0);
+        @memcpy(userdata[8..12], &[_]u32{ table, stride << 16, 4, 0 });
+        @memcpy(userdata[12..16], &[_]u32{ output, 4 << 16, 5, 0 });
+        for (userdata, 0..) |word, index| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+        const result = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 5, 1, 1 });
+        try std.testing.expect(result.spirv_words != 0);
+        var pixels: [20]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(output, &pixels);
+        for ([_]f32{ 1, 64.0 / 255.0, 128.0 / 255.0, 0, 0 }, 0..) |expected, index| {
+            const actual: f32 = @bitCast(std.mem.readInt(u32, pixels[index * 4 ..][0..4], .little));
+            try std.testing.expectApproxEqAbs(expected, actual, 0.00001);
+        }
+    }
+    std.debug.print("indirect sampled images passed: runtime selection, aliased views, null/bounds and wrapped offsets\n", .{});
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--streamed-mips")) {
+        try runStreamedMipProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--indirect-images")) {
+        try runIndirectImageProbe(allocator);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-reuse")) {
         try runQueuedBufferReuseProbe(allocator);
         return;

@@ -2107,6 +2107,34 @@ const SampledViewPlan = struct {
         return total;
     }
 
+    fn requiredSourceBytes(self: SampledViewPlan) gpu.tiling.Error!u64 {
+        var total: u64 = 0;
+        for (0..self.level_count) |index| {
+            total = @max(total, (try self.view(@intCast(index))).required_source_bytes);
+        }
+        return total;
+    }
+
+    fn readSource(self: SampledViewPlan, memory: GuestMemory, address: u64, destination: []u8) bool {
+        if (memory.read(memory.context, address, destination)) return true;
+        if (self.volume) return false;
+        // Array slices retain the full resource stride even when their high
+        // mips are absent. Copy only the blocks addressed by this view. The
+        // intervening bytes are never sampled or used by the detiler.
+        @memset(destination, 0);
+        for (0..self.level_count) |index| {
+            const mip = self.texture.levels[self.base_level + index];
+            for (0..self.layer_count) |layer| {
+                const start: usize = @intCast((self.texture.first_slice + self.first_layer + layer) *
+                    self.texture.source_layer_bytes + mip.offset);
+                const size: usize = @intCast(mip.storage_bytes);
+                if (start > destination.len or size > destination.len - start or
+                    !memory.read(memory.context, address + start, destination[start..][0..size])) return false;
+            }
+        }
+        return true;
+    }
+
     fn mipTexels(self: SampledViewPlan, level_index: u8) struct { u32, u32, u32 } {
         return .{
             shiftTexels(self.texel_width, level_index),
@@ -2157,7 +2185,9 @@ const GraphicsResources = struct {
     images: [maximum_storage_descriptors]PreparedSampledImage = undefined,
     image_count: usize = 0,
     descriptors: [maximum_storage_descriptors]gpu.ImageDescriptor = undefined,
-    mappings: [maximum_storage_descriptors]gpu.ShaderSpirvSampledImageBinding = undefined,
+    samplers: [maximum_storage_descriptors]gpu.resources.SamplerDescriptor = undefined,
+    dimensions: [maximum_storage_descriptors]rdna2.spirv.SampledImageDimension = undefined,
+    mappings: [maximum_compute_sampled_mappings]gpu.ShaderSpirvSampledImageBinding = undefined,
     mapping_count: usize = 0,
 
     fn deinit(self: *GraphicsResources, renderer: *Renderer) void {
@@ -2928,6 +2958,7 @@ pub const Renderer = struct {
     dump_compute_spirv: bool,
     dump_graphics_spirv: bool,
     trace_resource_failures: bool,
+    sampled_image_nonuniform_indexing: bool,
     capture_extended_progress_frames: bool,
     shader_ir_enabled: bool,
     shader_ssa_optimization_enabled: bool,
@@ -3337,6 +3368,7 @@ pub const Renderer = struct {
         instance_functions.get_physical_device_features_2(candidate.physical_device, &supported_features_2);
         if (timeline_support.timeline_semaphore == 0) return Error.TimelineSemaphoreUnavailable;
         const descriptor_partially_bound = descriptor_indexing_support.descriptor_binding_partially_bound != 0;
+        const sampled_image_nonuniform_indexing = descriptor_indexing_support.shader_sampled_image_array_non_uniform_indexing != 0;
         const image_float32_atomic_min_max = shader_atomic_float2_extension and
             shader_atomic_float2_support.shader_image_float32_atomic_min_max != 0;
         const supported_features = supported_features_2.features;
@@ -3381,9 +3413,10 @@ pub const Renderer = struct {
         var descriptor_indexing_enable = vk.PhysicalDeviceDescriptorIndexingFeatures{
             .p_next = if (image_float32_atomic_min_max) &shader_atomic_float2_enable else null,
             .descriptor_binding_partially_bound = if (descriptor_partially_bound) vk.true_value else 0,
+            .shader_sampled_image_array_non_uniform_indexing = if (sampled_image_nonuniform_indexing) vk.true_value else 0,
         };
         var timeline_enable = vk.PhysicalDeviceTimelineSemaphoreFeatures{
-            .p_next = if (descriptor_partially_bound)
+            .p_next = if (descriptor_partially_bound or sampled_image_nonuniform_indexing)
                 &descriptor_indexing_enable
             else if (image_float32_atomic_min_max)
                 &shader_atomic_float2_enable
@@ -3662,6 +3695,7 @@ pub const Renderer = struct {
             .dump_compute_spirv = options.dump_compute_spirv,
             .dump_graphics_spirv = options.dump_graphics_spirv,
             .trace_resource_failures = options.trace_resource_failures,
+            .sampled_image_nonuniform_indexing = sampled_image_nonuniform_indexing,
             .capture_extended_progress_frames = options.capture_extended_progress_frames,
             .shader_ir_enabled = options.enable_shader_ir,
             .shader_ssa_optimization_enabled = options.enable_shader_ssa_optimization,
@@ -8117,7 +8151,7 @@ pub const Renderer = struct {
                     inst.pc,
                 ).*,
             };
-            const image_descriptor = (try resolveComputeSampledImageDescriptor(
+            const direct_image = try resolveComputeSampledImageDescriptor(
                 bindings,
                 reader,
                 analysis,
@@ -8125,105 +8159,117 @@ pub const Renderer = struct {
                 resource_sgpr,
                 inst.pc,
                 descriptor_slot,
-            )) orelse {
+            );
+            const candidates = if (direct_image == null and self.sampled_image_nonuniform_indexing)
+                try resolveBufferImageCandidates(reader, analysis, &sampled_scalar, inst)
+            else
+                null;
+            if (direct_image == null and candidates == null) {
                 self.reportResourceFailure(bindings, inst, &sampled_scalar);
                 std.debug.print(
                     "[vulkan dcb] sampled image pc=0x{x}: T# s{d}:s{d} unresolved\n",
                     .{ inst.pc, resource_sgpr, resource_sgpr + 7 },
                 );
                 return Error.UnsupportedSampledImage;
-            };
-            if (inst.opcode == .image_load and !isBlockCompressedUnifiedFormat(image_descriptor.unified_format)) {
-                // Uncompressed fetches were bound through the storage-image
-                // pass above. Only compressed, read-only fetches need this
-                // sampled-image fallback.
-                continue;
             }
-            const sampler_descriptor: gpu.resources.SamplerDescriptor = if (image_fetch)
-                std.mem.zeroes(gpu.resources.SamplerDescriptor)
-            else
-                (try resolveComputeSamplerDescriptor(
-                    bindings,
-                    reader,
-                    analysis,
-                    &sampled_scalar,
-                    sampler_sgpr,
-                    inst.pc,
-                    descriptor_slot,
-                )) orelse {
-                    self.reportResourceFailure(bindings, inst, &sampled_scalar);
-                    std.debug.print(
-                        "[vulkan dcb] sampled image pc=0x{x}: S# s{d}:s{d} unresolved\n",
-                        .{ inst.pc, sampler_sgpr, sampler_sgpr + 3 },
-                    );
-                    return Error.UnsupportedSampledImage;
-                };
-            const sampled_dimension = sampledImageDimensionForInstruction(
-                inst.image_dimension,
-                image_descriptor.image_type,
-            ) orelse {
-                std.debug.print(
-                    "[vulkan dcb] sampled image pc=0x{x}: unsupported DIM {s}\n",
-                    .{ inst.pc, @tagName(inst.image_dimension) },
-                );
-                return Error.UnsupportedSampledImage;
-            };
-            var descriptor_index: ?u32 = null;
-            for (
-                result.sampled_image_descriptors[0..result.sampled_image_count],
-                result.sampled_image_samplers[0..result.sampled_image_count],
-                result.sampled_image_dimensions[0..result.sampled_image_count],
-                0..,
-            ) |existing_image, existing_sampler, existing_dimension, index| {
-                if (!std.meta.eql(existing_image, image_descriptor) or
-                    !std.meta.eql(existing_sampler, sampler_descriptor) or
-                    existing_dimension != sampled_dimension)
-                {
+            const candidate_count: usize = if (candidates) |table| table.count else 1;
+            for (0..candidate_count) |candidate_index| {
+                const candidate_words: ?[8]u32 = if (candidates) |table| table.words[candidate_index] else null;
+                const image_descriptor = if (candidate_words) |words| try gpu.resources.decodeImageDescriptor(&words) else direct_image.?;
+                if (inst.opcode == .image_load and !isBlockCompressedUnifiedFormat(image_descriptor.unified_format)) {
+                    // Uncompressed fetches were bound through the storage-image
+                    // pass above. Only compressed, read-only fetches need this
+                    // sampled-image fallback.
                     continue;
                 }
-                descriptor_index = @intCast(index);
-                break;
-            }
-            if (descriptor_index == null) {
-                if (result.sampled_image_count >= maximum_sampled_images) {
+                const sampler_descriptor: gpu.resources.SamplerDescriptor = if (image_fetch)
+                    std.mem.zeroes(gpu.resources.SamplerDescriptor)
+                else
+                    (try resolveComputeSamplerDescriptor(
+                        bindings,
+                        reader,
+                        analysis,
+                        &sampled_scalar,
+                        sampler_sgpr,
+                        inst.pc,
+                        descriptor_slot,
+                    )) orelse {
+                        self.reportResourceFailure(bindings, inst, &sampled_scalar);
+                        std.debug.print(
+                            "[vulkan dcb] sampled image pc=0x{x}: S# s{d}:s{d} unresolved\n",
+                            .{ inst.pc, sampler_sgpr, sampler_sgpr + 3 },
+                        );
+                        return Error.UnsupportedSampledImage;
+                    };
+                const sampled_dimension = sampledImageDimensionForInstruction(
+                    inst.image_dimension,
+                    image_descriptor.image_type,
+                ) orelse {
                     std.debug.print(
-                        "[vulkan dcb] sampled image physical table exhausted ({d})\n",
-                        .{maximum_sampled_images},
+                        "[vulkan dcb] sampled image pc=0x{x}: unsupported DIM {s}\n",
+                        .{ inst.pc, @tagName(inst.image_dimension) },
                     );
                     return Error.UnsupportedSampledImage;
-                }
-                const physical_index: u32 = @intCast(result.sampled_image_count);
-                const sampled_started = hostTimestampNs();
-                const image = self.stageSampledImage(
-                    image_descriptor,
-                    sampler_descriptor,
-                    physical_index,
-                    sampled_dimension,
-                    null,
-                ) catch |err| {
-                    self.reportResourceFailure(bindings, inst, &sampled_scalar);
-                    std.debug.print(
-                        "[vulkan dcb] sampled image pc=0x{x}: stage failed {s} dim={s} addr=0x{x} {d}x{d}x{d} pitch={d} fmt={d} type={s} tile={s} levels={d}..{d}\n",
-                        .{ inst.pc, @errorName(err), @tagName(sampled_dimension), image_descriptor.address, image_descriptor.width, image_descriptor.height, image_descriptor.depth_or_layers, image_descriptor.pitch, image_descriptor.unified_format, @tagName(image_descriptor.image_type), @tagName(image_descriptor.tile_mode), image_descriptor.base_level, image_descriptor.last_level },
-                    );
-                    return err;
                 };
-                self.frame_profile.sampled_stage_ns +|= elapsedHostNanoseconds(sampled_started);
-                result.sampled_images[result.sampled_image_count] = image;
-                result.sampled_image_descriptors[result.sampled_image_count] = image_descriptor;
-                result.sampled_image_samplers[result.sampled_image_count] = sampler_descriptor;
-                result.sampled_image_dimensions[result.sampled_image_count] = sampled_dimension;
-                result.sampled_image_count += 1;
-                descriptor_index = physical_index;
+                var descriptor_index: ?u32 = null;
+                for (
+                    result.sampled_image_descriptors[0..result.sampled_image_count],
+                    result.sampled_image_samplers[0..result.sampled_image_count],
+                    result.sampled_image_dimensions[0..result.sampled_image_count],
+                    0..,
+                ) |existing_image, existing_sampler, existing_dimension, index| {
+                    if (!std.meta.eql(existing_image, image_descriptor) or
+                        !std.meta.eql(existing_sampler, sampler_descriptor) or
+                        existing_dimension != sampled_dimension)
+                    {
+                        continue;
+                    }
+                    descriptor_index = @intCast(index);
+                    break;
+                }
+                if (descriptor_index == null) {
+                    if (result.sampled_image_count >= maximum_sampled_images) {
+                        std.debug.print(
+                            "[vulkan dcb] sampled image physical table exhausted ({d})\n",
+                            .{maximum_sampled_images},
+                        );
+                        return Error.UnsupportedSampledImage;
+                    }
+                    const physical_index: u32 = @intCast(result.sampled_image_count);
+                    const sampled_started = hostTimestampNs();
+                    const image = self.stageSampledImage(
+                        image_descriptor,
+                        sampler_descriptor,
+                        physical_index,
+                        sampled_dimension,
+                        null,
+                    ) catch |err| {
+                        self.reportResourceFailure(bindings, inst, &sampled_scalar);
+                        std.debug.print(
+                            "[vulkan dcb] sampled image pc=0x{x}: stage failed {s} dim={s} addr=0x{x} {d}x{d}x{d} pitch={d} fmt={d} type={s} tile={s} levels={d}..{d}\n",
+                            .{ inst.pc, @errorName(err), @tagName(sampled_dimension), image_descriptor.address, image_descriptor.width, image_descriptor.height, image_descriptor.depth_or_layers, image_descriptor.pitch, image_descriptor.unified_format, @tagName(image_descriptor.image_type), @tagName(image_descriptor.tile_mode), image_descriptor.base_level, image_descriptor.last_level },
+                        );
+                        return err;
+                    };
+                    self.frame_profile.sampled_stage_ns +|= elapsedHostNanoseconds(sampled_started);
+                    result.sampled_images[result.sampled_image_count] = image;
+                    result.sampled_image_descriptors[result.sampled_image_count] = image_descriptor;
+                    result.sampled_image_samplers[result.sampled_image_count] = sampler_descriptor;
+                    result.sampled_image_dimensions[result.sampled_image_count] = sampled_dimension;
+                    result.sampled_image_count += 1;
+                    descriptor_index = physical_index;
+                }
+                if (result.sampled_image_mapping_count == result.sampled_image_mappings.len) return Error.UnsupportedSampledImage;
+                result.sampled_image_mappings[result.sampled_image_mapping_count] = .{
+                    .resource_sgpr = resource_sgpr,
+                    .sampler_sgpr = sampler_sgpr,
+                    .descriptor_index = descriptor_index.?,
+                    .dimension = sampled_dimension,
+                    .instruction_pc = inst.pc,
+                    .candidate_words = candidate_words,
+                };
+                result.sampled_image_mapping_count += 1;
             }
-            result.sampled_image_mappings[result.sampled_image_mapping_count] = .{
-                .resource_sgpr = resource_sgpr,
-                .sampler_sgpr = sampler_sgpr,
-                .descriptor_index = descriptor_index.?,
-                .dimension = sampled_dimension,
-                .instruction_pc = inst.pc,
-            };
-            result.sampled_image_mapping_count += 1;
         }
         self.updateSampledImageDescriptors(
             result.sampled_images[0..result.sampled_image_count],
@@ -12978,6 +13024,7 @@ pub const Renderer = struct {
         // they are not shader constants. Specializing their changing guest
         // addresses creates a new Vulkan pipeline for every streamed texture.
         for (graphics_resources.mappings[0..fragment_mapping_count]) |mapping| {
+            if (mapping.candidate_words != null) continue;
             fragment_scalar_count = removeScalarRegisterRange(
                 &fragment_scalar_regs,
                 fragment_scalar_count,
@@ -14928,7 +14975,7 @@ pub const Renderer = struct {
                 }
             }
             if (existing) continue;
-            if (result.mapping_count >= maximum_storage_descriptors) return Error.UnsupportedSampledImage;
+            if (result.mapping_count >= result.mappings.len) return Error.UnsupportedSampledImage;
             // T# and S# declarations have independent slot spaces. A shader
             // commonly samples the Y and UV video planes through one shared
             // sampler; advancing both slots per T#/S# pair incorrectly asks
@@ -14961,6 +15008,8 @@ pub const Renderer = struct {
                 inst.pc,
                 image_slot,
             )) orelse {
+                if (try self.appendIndirectGraphicsImages(result, bindings, reader, analysis, &sampled_scalar, inst, sampler_slot, render_target_write)) continue;
+                self.reportResourceFailure(bindings, inst, &sampled_scalar);
                 std.debug.print(
                     "[vulkan dcb] sampled image missing for s{d} (user_data={d} srt={any})\n",
                     .{ inst.src1.reg, bindings.user_data_count, bindings.srt_address != null },
@@ -14979,6 +15028,7 @@ pub const Renderer = struct {
                     inst.pc,
                     sampler_slot,
                 )) orelse {
+                    self.reportResourceFailure(bindings, inst, &sampled_scalar);
                     std.debug.print(
                         "[vulkan dcb] sampler missing for s{d}\n",
                         .{inst.src2.reg},
@@ -14995,7 +15045,8 @@ pub const Renderer = struct {
                 );
                 return Error.UnsupportedSampledImage;
             };
-            const descriptor_index: u32 = @intCast(result.mapping_count);
+            if (result.image_count == result.images.len) return Error.UnsupportedSampledImage;
+            const descriptor_index: u32 = @intCast(result.image_count);
             const sampled_started = hostTimestampNs();
             const image = self.stageSampledImage(
                 image_descriptor,
@@ -15038,6 +15089,8 @@ pub const Renderer = struct {
             self.frame_profile.sampled_stage_ns +|= elapsedHostNanoseconds(sampled_started);
             result.images[result.image_count] = image;
             result.descriptors[descriptor_index] = image_descriptor;
+            result.samplers[descriptor_index] = sampler_descriptor;
+            result.dimensions[descriptor_index] = sampled_dimension;
             result.image_count += 1;
             result.mappings[result.mapping_count] = .{
                 .resource_sgpr = inst.src1.reg,
@@ -15048,6 +15101,53 @@ pub const Renderer = struct {
             };
             result.mapping_count += 1;
         }
+    }
+
+    fn appendIndirectGraphicsImages(
+        self: *Renderer,
+        result: *GraphicsResources,
+        bindings: *const gpu.ShaderBindings,
+        reader: gpu.ShaderMemoryReader,
+        analysis: *const gpu.ShaderAnalysis,
+        scalar: *const gpu.ScalarEvaluation,
+        inst: gpu.ShaderInstruction,
+        sampler_slot: usize,
+        target: GuestColorTarget,
+    ) anyerror!bool {
+        if (!self.sampled_image_nonuniform_indexing) return false;
+        const candidates = (try resolveBufferImageCandidates(reader, analysis, scalar, inst)) orelse return false;
+        const sampler = (try resolveComputeSamplerDescriptor(bindings, reader, analysis, scalar, inst.src2.reg, inst.pc, sampler_slot)) orelse return false;
+        for (candidates.words[0..candidates.count]) |words| {
+            const descriptor = try gpu.resources.decodeImageDescriptor(&words);
+            const dimension = sampledImageDimensionForInstruction(inst.image_dimension, descriptor.image_type) orelse return false;
+            var slot: ?u32 = null;
+            for (result.descriptors[0..result.image_count], result.samplers[0..result.image_count], result.dimensions[0..result.image_count], 0..) |existing, existing_sampler, existing_dimension, index| {
+                if (std.meta.eql(existing, descriptor) and std.meta.eql(existing_sampler, sampler) and existing_dimension == dimension) {
+                    slot = @intCast(index);
+                    break;
+                }
+            }
+            if (slot == null) {
+                if (result.image_count == result.images.len) return Error.UnsupportedSampledImage;
+                slot = @intCast(result.image_count);
+                result.images[result.image_count] = try self.stageSampledImage(descriptor, sampler, slot.?, dimension, target);
+                result.descriptors[result.image_count] = descriptor;
+                result.samplers[result.image_count] = sampler;
+                result.dimensions[result.image_count] = dimension;
+                result.image_count += 1;
+            }
+            if (result.mapping_count == result.mappings.len) return Error.UnsupportedSampledImage;
+            result.mappings[result.mapping_count] = .{
+                .resource_sgpr = inst.src1.reg,
+                .sampler_sgpr = inst.src2.reg,
+                .descriptor_index = slot.?,
+                .dimension = dimension,
+                .instruction_pc = inst.pc,
+                .candidate_words = words,
+            };
+            result.mapping_count += 1;
+        }
+        return true;
     }
 
     fn createBuffer(self: *Renderer, size: vk.DeviceSize, usage: vk.Flags, properties: vk.Flags) Error!OwnedBuffer {
@@ -16238,7 +16338,7 @@ pub const Renderer = struct {
         else
             try layout.?.stagingBytes();
         const source_bytes = if (mip_plan) |plan|
-            plan.texture.required_source_bytes
+            try plan.requiredSourceBytes()
         else
             layout.?.requiredSourceBytes();
         const bytes_per_element = if (mip_plan) |plan|
@@ -16506,7 +16606,7 @@ pub const Renderer = struct {
             @memset(linear, 0);
             const tiled = try self.allocator.alloc(u8, probe_span);
             defer self.allocator.free(tiled);
-            if (!memory.read(memory.context, descriptor.address, tiled)) {
+            if (!plan.readSource(memory, descriptor.address, tiled)) {
                 if (descriptor.tile_mode != .depth) return Error.GuestMemoryReadFailed;
                 source_available = false;
                 fillUnbackedDepthSample(descriptor.unified_format, linear);
@@ -22716,6 +22816,83 @@ fn graphicsSrtSamplerSlot(
     return slot;
 }
 
+const BufferImageCandidates = struct {
+    words: [maximum_sampled_images][8]u32 = undefined,
+    count: usize = 0,
+};
+
+fn resolveBufferImageCandidates(
+    reader: gpu.ShaderMemoryReader,
+    analysis: *const gpu.ShaderAnalysis,
+    scalar: *const gpu.ScalarEvaluation,
+    sample: gpu.ShaderInstruction,
+) anyerror!?BufferImageCandidates {
+    const instructions = analysis.program.instructions.items;
+    var index = instructions.len;
+    var producer: ?gpu.ShaderInstruction = null;
+    while (index != 0) {
+        index -= 1;
+        const inst = instructions[index];
+        if (inst.pc >= sample.pc or inst.dst.kind != .sgpr) continue;
+        const count = @max(inst.data_words, if (std.mem.endsWith(u8, @tagName(inst.opcode), "b64")) @as(u8, 2) else 1);
+        if (sample.src1.reg + 8 <= inst.dst.reg or inst.dst.reg + count <= sample.src1.reg) continue;
+        if ((inst.opcode != .s_buffer_load_dwordx8 and inst.opcode != .s_buffer_load_dwordx16) or
+            sample.src1.reg < inst.dst.reg or sample.src1.reg + 8 > inst.dst.reg + count or inst.src0.kind != .sgpr or
+            inst.src1.kind != .sgpr or inst.memory_offset < 0) return null;
+        producer = inst;
+        break;
+    }
+    const load = producer orelse return null;
+    const buffer = (try scalarBufferDescriptor(scalar, load.src0.reg)) orelse return null;
+    // The table descriptor must still be the same value used by the load.
+    for (scalar.registers[load.src0.reg..][0..4]) |word| if (word.producer_pc >= load.pc) return null;
+    var stride: ?u32 = null;
+    while (index != 0) {
+        index -= 1;
+        const inst = instructions[index];
+        if (inst.dst.kind != .sgpr or inst.dst.reg != load.src1.reg) continue;
+        if (inst.opcode != .s_mul_i32 and inst.opcode != .s_mulk_i32) return null;
+        stride = switch (inst.src1.kind) {
+            .integer_inline_constant, .literal_constant => inst.src1.value,
+            else => return null,
+        };
+        break;
+    }
+    const multiplier = stride orelse return null;
+    if (multiplier == 0 or multiplier != buffer.stride or buffer.address == 0 or buffer.size_bytes == 0) return null;
+    // The byte product wraps at 32 bits. Enumerating only N*stride misses
+    // other in-bounds offsets reachable after wrap. Its residue class has
+    // step gcd(stride, 2^32), a power of two.
+    const step: u64 = @as(u64, 1) << @intCast(@ctz(multiplier));
+    const displacement = @as(u64, @intCast(load.memory_offset)) + (sample.src1.reg - load.dst.reg) * 4;
+    const residue = displacement % step;
+    const limit = @min(buffer.size_bytes, @as(u64, 1) << 32);
+    if (residue >= limit or (limit - residue + step - 1) / step > 16384) return null;
+    var result = BufferImageCandidates{};
+    var offset = residue;
+    while (offset < limit) : (offset += step) {
+        var words: [8]u32 = @splat(0);
+        for (&words, 0..) |*word, component| {
+            const byte = (offset & ~@as(u64, 3)) + component * 4;
+            if (byte + 4 <= limit) word.* = try reader.readU32(buffer.address + byte);
+        }
+        const descriptor = gpu.resources.decodeImageDescriptor(&words) catch continue;
+        if (descriptor.address == 0) continue;
+        var duplicate = false;
+        for (result.words[0..result.count]) |previous| {
+            if (std.mem.eql(u32, &previous, &words)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        if (result.count == result.words.len) return null;
+        result.words[result.count] = words;
+        result.count += 1;
+    }
+    return if (result.count != 0) result else null;
+}
+
 fn scalarBufferDescriptor(
     scalar: *const gpu.ScalarEvaluation,
     resource_sgpr: u32,
@@ -25795,6 +25972,60 @@ test "first-use sampled views cover the T# mip range" {
     try std.testing.expectEqual(@as(u32, 16), extent1[0]);
     try std.testing.expectEqual(@as(u32, 16), extent1[1]);
     try std.testing.expect((try plan.stagingBytes()) >= try mip0.stagingBytes());
+}
+
+test "streamed sampled views read only resident mips across array gaps" {
+    const texture = try gpu.TextureLayout.init(.{
+        .tile_mode = .standard_4kb,
+        .width = 128,
+        .height = 128,
+        .depth_or_layers = 2,
+        .mip_levels = 8,
+    }, 4);
+    const plan = SampledViewPlan{
+        .texture = texture,
+        .base_level = 2,
+        .level_count = 6,
+        .first_layer = 0,
+        .layer_count = 2,
+        .texel_width = 32,
+        .texel_height = 32,
+        .texel_depth = 1,
+        .volume = false,
+    };
+    const resident_per_layer = texture.levels[2].offset + texture.levels[2].storage_bytes;
+    const Reader = struct {
+        stride: u64,
+        resident: u64,
+        fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+            return false;
+        }
+        fn read(context: ?*anyopaque, address: u64, destination: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            const layer = address / self.stride;
+            const offset = address % self.stride;
+            if (layer >= 2 or offset + destination.len > self.resident) return false;
+            @memset(destination, if (layer == 0) 0x35 else 0x79);
+            return true;
+        }
+    };
+    var reader = Reader{ .stride = texture.source_layer_bytes, .resident = resident_per_layer };
+    const required = try plan.requiredSourceBytes();
+    try std.testing.expectEqual(texture.source_layer_bytes + resident_per_layer, required);
+    try std.testing.expect(required < texture.required_source_bytes);
+    const tiled = try std.testing.allocator.alloc(u8, @intCast(required));
+    defer std.testing.allocator.free(tiled);
+    try std.testing.expect(plan.readSource(.{ .context = &reader, .read = Reader.read, .write = Reader.write }, 0, tiled));
+    for (0..plan.level_count) |index| {
+        const view = try plan.view(@intCast(index));
+        const linear = try std.testing.allocator.alloc(u8, @intCast(try view.stagingBytes()));
+        defer std.testing.allocator.free(linear);
+        try view.detile(tiled, linear);
+        for (linear[0 .. linear.len / 2]) |byte| try std.testing.expectEqual(@as(u8, 0x35), byte);
+        for (linear[linear.len / 2 ..]) |byte| try std.testing.expectEqual(@as(u8, 0x79), byte);
+    }
+    reader.resident -= 1;
+    try std.testing.expect(!plan.readSource(.{ .context = &reader, .read = Reader.read, .write = Reader.write }, 0, tiled));
 }
 
 test "unnormalized guest samplers satisfy Vulkan restrictions" {

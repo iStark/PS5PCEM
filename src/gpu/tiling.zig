@@ -1223,6 +1223,16 @@ pub const TextureLayout = struct {
             return Error.CoordinateOutOfRange;
         }
         const mip = self.levels[level];
+        // Streaming textures can leave larger mips uncommitted. A view only
+        // requires bytes through its final selected slice and mip block; the
+        // allocation's layer stride still includes every resource mip.
+        const required_source_bytes = if (self.kind == .array_2d)
+            try add(
+                try multiply(self.source_layer_bytes, try addU32(try addU32(self.first_slice, first_layer), layer_count - 1)),
+                try add(mip.offset, mip.storage_bytes),
+            )
+        else
+            self.required_source_bytes;
         return .{
             .block = self.block,
             .kind = self.kind,
@@ -1238,7 +1248,7 @@ pub const TextureLayout = struct {
             .level_offset = mip.offset,
             .source_layer_bytes = self.source_layer_bytes,
             .block_slice_bytes = self.block_slice_bytes,
-            .required_source_bytes = self.required_source_bytes,
+            .required_source_bytes = required_source_bytes,
             .tail_x = mip.tail_x,
             .tail_y = mip.tail_y,
             .in_tail = mip.in_tail,

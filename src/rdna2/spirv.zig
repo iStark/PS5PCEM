@@ -62,6 +62,9 @@ pub const SampledImageBinding = struct {
     /// Null is a stage-wide association. Compute shaders can qualify a binding
     /// by PC when the guest reloads the same T#/S# SGPR pair between samples.
     instruction_pc: ?u32 = null,
+    /// A member of a bounded runtime T# table. The shader compares all eight
+    /// descriptor words; aliases with different mips/views remain distinct.
+    candidate_words: ?[8]u32 = null,
 };
 
 pub const SampledImageDimension = enum {
@@ -606,6 +609,8 @@ const Builder = struct {
     glsl_std_450: u32 = 0,
     uses_image_query: bool = false,
     uses_image_gather_extended: bool = false,
+    uses_nonuniform_sampled_images: bool = false,
+    sampled_result_predicate: ?u32 = null,
     /// SPIR-V splits arbitrary-lane and relative-lane subgroup shuffles into
     /// separate capabilities. NVIDIA may accept a module that omits these and
     /// only report the mistake as DEVICE_LOST when a large compute kernel runs,
@@ -909,6 +914,7 @@ const Builder = struct {
             var sampled_dimensions: [4]bool = @splat(false);
             for (options.sampled_images, 0..) |binding, index| {
                 if (binding.resource_sgpr >= 128 or binding.sampler_sgpr >= 128 or
+                    (binding.candidate_words != null and binding.resource_sgpr + 8 > 128) or
                     binding.descriptor_index >= options.descriptor_array_length)
                 {
                     return Error.InvalidStorageBinding;
@@ -918,7 +924,12 @@ const Builder = struct {
                         previous.sampler_sgpr == binding.sampler_sgpr and
                         previous.instruction_pc == binding.instruction_pc)
                     {
-                        return Error.InvalidStorageBinding;
+                        if (previous.candidate_words == null or binding.candidate_words == null or
+                            previous.dimension != binding.dimension or
+                            std.mem.eql(u32, &previous.candidate_words.?, &binding.candidate_words.?))
+                        {
+                            return Error.InvalidStorageBinding;
+                        }
                     }
                 }
                 sampled_dimensions[sampledImageDimensionIndex(binding.dimension)] = true;
@@ -1360,6 +1371,11 @@ const Builder = struct {
 
     fn destination(self: *Builder, op: operand.Operand, value: Value) Error!void {
         var final_value = value;
+        if (self.sampled_result_predicate) |valid| {
+            const selected = self.id();
+            try self.emit(&self.body, 169, &.{ self.typeId(value.value_type), selected, valid, value.id, try self.constant(value.value_type, 0) });
+            final_value.id = selected;
+        }
         if (op.omod != 0 or op.clamp) {
             if (value.value_type != .float32) return Error.UnsupportedOpcode;
             if (op.omod != 0) {
@@ -4457,6 +4473,55 @@ const Builder = struct {
         return null;
     }
 
+    fn loadSampledImage(self: *Builder, binding: SampledImageBinding) Error!u32 {
+        const dimension = sampledImageDimensionIndex(binding.dimension);
+        var slot = try self.constant(.bits32, binding.descriptor_index);
+        if (binding.candidate_words != null) {
+            self.uses_nonuniform_sampled_images = true;
+            var actual: [8]u32 = undefined;
+            for (&actual, 0..) |*word, index| {
+                word.* = try self.source(.{ .kind = .sgpr, .reg = binding.resource_sgpr + @as(u32, @intCast(index)) }, .bits32);
+            }
+            var any_match = self.id();
+            try self.emit(&self.declarations, 42, &.{ self.bool_type, any_match }); // OpConstantFalse
+            const always = self.id();
+            try self.emit(&self.declarations, 41, &.{ self.bool_type, always }); // OpConstantTrue
+            for (self.sampled_bindings) |candidate| {
+                if (candidate.resource_sgpr != binding.resource_sgpr or
+                    candidate.sampler_sgpr != binding.sampler_sgpr or
+                    candidate.instruction_pc != binding.instruction_pc) continue;
+                const words = candidate.candidate_words orelse return Error.InvalidStorageBinding;
+                var matches = always;
+                for (actual, words) |value, expected| {
+                    const equal = self.id();
+                    try self.emit(&self.body, 170, &.{ self.bool_type, equal, value, try self.constant(.bits32, expected) });
+                    const combined = self.id();
+                    try self.emit(&self.body, 167, &.{ self.bool_type, combined, matches, equal });
+                    matches = combined;
+                }
+                const selected = self.id();
+                try self.emit(&self.body, 169, &.{ self.bits_type, selected, matches, try self.constant(.bits32, candidate.descriptor_index), slot });
+                slot = selected;
+                const combined = self.id();
+                try self.emit(&self.body, 166, &.{ self.bool_type, combined, any_match, matches });
+                any_match = combined;
+            }
+            // Invalid/unbound descriptors return zero. Always index a valid
+            // host descriptor, even for invocations whose T# does not match.
+            self.sampled_result_predicate = any_match;
+            try self.emit(&self.annotations, 71, &.{ slot, 5300 }); // NonUniform
+        }
+        const pointer = self.id();
+        try self.emit(&self.body, 65, &.{ self.sampled_image_pointer_types[dimension], pointer, self.sampled_image_arrays[dimension], slot });
+        const sampled = self.id();
+        try self.emit(&self.body, 61, &.{ self.sampled_image_types[dimension], sampled, pointer });
+        if (binding.candidate_words != null) {
+            try self.emit(&self.annotations, 71, &.{ pointer, 5300 });
+            try self.emit(&self.annotations, 71, &.{ sampled, 5300 });
+        }
+        return sampled;
+    }
+
     fn storageImageBinding(
         self: *const Builder,
         resource_sgpr: u32,
@@ -4558,17 +4623,10 @@ const Builder = struct {
             const z = try self.source(try imageAddressOperand(inst, 2), .bits32);
             try self.emit(&self.body, 80, &.{ try self.ensureBitsVec3(), coordinates, x, y, z }); // OpCompositeConstruct
         }
-        const pointer = self.id();
-        try self.emit(&self.body, 65, &.{
-            self.sampled_image_pointer_types[dimension_index],
-            pointer,
-            self.sampled_image_arrays[dimension_index],
-            try self.constant(.bits32, binding.descriptor_index),
-        });
-        const sampled_image = self.id();
-        try self.emit(&self.body, 61, &.{ self.sampled_image_types[dimension_index], sampled_image, pointer });
+        const sampled_image = try self.loadSampledImage(binding);
         const image = self.id();
         try self.emit(&self.body, 100, &.{ self.sampled_image_image_types[dimension_index], image, sampled_image }); // OpImage
+        if (binding.candidate_words != null) try self.emit(&self.annotations, 71, &.{ image, 5300 }); // NonUniform
         const texel = self.id();
         const lod = if (explicit_mip)
             try self.source(try imageAddressOperand(inst, coordinate_components), .bits32)
@@ -5023,15 +5081,7 @@ const Builder = struct {
                 try self.emit(&self.body, 80, &.{ self.vector2_type, coordinates, coordinate_x, coordinate_y });
             }
         }
-        const pointer = self.id();
-        try self.emit(&self.body, 65, &.{
-            self.sampled_image_pointer_types[dimension_index],
-            pointer,
-            self.sampled_image_arrays[dimension_index],
-            try self.constant(.bits32, binding.descriptor_index),
-        });
-        const sampled_image = self.id();
-        try self.emit(&self.body, 61, &.{ self.sampled_image_types[dimension_index], sampled_image, pointer });
+        const sampled_image = try self.loadSampledImage(binding);
         if (inst.image_sample_flags.offset) {
             coordinates = try self.adjustSampleCoordinates(inst, sampled_image, coordinates, image_dimension);
         }
@@ -5321,15 +5371,7 @@ const Builder = struct {
             try self.emit(&self.body, 80, &.{ self.vector2_type, coordinates, raw_x, raw_y });
         }
 
-        const pointer = self.id();
-        try self.emit(&self.body, 65, &.{
-            self.sampled_image_pointer_types[dimension_index],
-            pointer,
-            self.sampled_image_arrays[dimension_index],
-            try self.constant(.bits32, binding.descriptor_index),
-        });
-        const sampled_image = self.id();
-        try self.emit(&self.body, 61, &.{ self.sampled_image_types[dimension_index], sampled_image, pointer });
+        const sampled_image = try self.loadSampledImage(binding);
 
         const component: u32 = @ctz(inst.data_mask);
         if (self.stage == .compute) {
@@ -7350,6 +7392,8 @@ const Builder = struct {
     }
 
     fn lower(self: *Builder, source_inst: instruction.Instruction) Error!void {
+        self.sampled_result_predicate = null;
+        defer self.sampled_result_predicate = null;
         var inst = source_inst;
         if (nonExecCompareOpcode(inst.opcode)) |opcode| inst.opcode = opcode;
         if (try self.lowerExecutionMask(inst)) return;
@@ -8894,6 +8938,10 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
         0,
     });
     try appendInstruction(allocator, &words, 17, &.{1}); // OpCapability Shader
+    if (builder.uses_nonuniform_sampled_images) {
+        try appendInstruction(allocator, &words, 17, &.{5301}); // ShaderNonUniform
+        try appendInstruction(allocator, &words, 17, &.{5307}); // SampledImageArrayNonUniformIndexing
+    }
     if (builder.float64_type != 0) {
         try appendInstruction(allocator, &words, 17, &.{10}); // OpCapability Float64
     }
@@ -8931,6 +8979,9 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
             0x5f6e_696d, // "min_"
             0x0078_616d, // "max\0"
         }); // OpExtension SPV_EXT_shader_atomic_float_min_max
+    }
+    if (builder.uses_nonuniform_sampled_images) {
+        try appendInstruction(allocator, &words, 10, &.{ 0x5f565053, 0x5f545845, 0x63736564, 0x74706972, 0x695f726f, 0x7865646e, 0x00676e69 }); // SPV_EXT_descriptor_indexing
     }
     // ExtInstImport must precede OpMemoryModel when PackHalf2x16 (etc.) is used.
     if (builder.glsl_std_450 != 0) {
