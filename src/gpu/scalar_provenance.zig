@@ -43,6 +43,66 @@ pub const ScalarValue = struct {
 
 pub const ScalarRegisters = [maximum_scalar_registers]ScalarValue;
 
+// Uniform SGPR spills use different lanes of the same VGPR as independent
+// slots. This belongs to the representative resource walk, not the CFG proof:
+// per-lane values and writes on paths the walk did not execute stay unknown.
+const LaneSpills = struct {
+    const Slot = struct { vgpr: u32 = 256, lane: u32 = 0, value: ScalarValue = .{} };
+    slots: [128]Slot = @splat(.{}),
+
+    fn invalidate(self: *LaneSpills, first: u32, count: u32) void {
+        for (&self.slots) |*slot| {
+            if (slot.vgpr >= first and slot.vgpr < first + count) slot.* = .{};
+        }
+    }
+
+    fn lane(result: *const Evaluation, op: rdna2.Operand) ?u32 {
+        if (op.absolute or op.negate or op.dpp) return null;
+        return if (source(result, op)) |value| value.value & 63 else null;
+    }
+
+    fn store(self: *LaneSpills, result: *const Evaluation, inst: rdna2.Instruction) void {
+        if (inst.dst.kind != .vgpr) return;
+        const index = lane(result, inst.src1) orelse {
+            self.invalidate(inst.dst.reg, 1);
+            return;
+        };
+        var free: ?*Slot = null;
+        for (&self.slots) |*slot| {
+            if (slot.vgpr == inst.dst.reg and slot.lane == index) {
+                free = slot;
+                break;
+            }
+            if (slot.vgpr == 256) free = slot;
+        }
+        if (free) |slot| {
+            const value = if (inst.src0.absolute or inst.src0.negate or inst.src0.dpp) null else source(result, inst.src0);
+            slot.* = if (value) |known| .{ .vgpr = inst.dst.reg, .lane = index, .value = known } else .{};
+        }
+    }
+
+    fn restore(self: *const LaneSpills, result: *Evaluation, inst: rdna2.Instruction) void {
+        const index = lane(result, inst.src1);
+        if (inst.src0.kind == .vgpr and index != null) {
+            for (self.slots) |slot| {
+                if (slot.vgpr == inst.src0.reg and slot.lane == index.?) {
+                    write(result, inst.dst, slot.value.value, slot.value.sources, inst.pc);
+                    return;
+                }
+            }
+        }
+        invalidateDestination(result, inst.dst, 1);
+    }
+
+    fn invalidateInstruction(self: *LaneSpills, inst: rdna2.Instruction) void {
+        const name = @tagName(inst.opcode);
+        const wide = std.mem.indexOf(u8, name, "64") != null;
+        const count: u32 = @max(inst.data_words, if (inst.family == .ds) @as(u8, 4) else if (wide) @as(u8, 2) else 1);
+        if (inst.dst.kind == .vgpr) self.invalidate(inst.dst.reg, count);
+        if (inst.dst2.kind == .vgpr) self.invalidate(inst.dst2.reg, count);
+    }
+};
+
 pub const ScalarLoad = struct {
     pc: u32,
     address: u64,
@@ -421,6 +481,7 @@ fn evaluate(
 
     var scc: ?bool = null;
     var pc: u32 = 0;
+    var lane_spills = LaneSpills{};
     var setpc_follows: u8 = 0;
     var unknown_scalar_exits: std.StaticBitSet(64 * 1024) = .initEmpty();
     const instruction_limit: u32 = if (follow_lane_mask_fallthrough) maximum_resource_instructions else maximum_instructions;
@@ -443,6 +504,7 @@ fn evaluate(
                 // next known instruction just as the live decoder skips an
                 // unsupported family.
                 pc = candidate.pc;
+                lane_spills = .{};
                 continue;
             }
             break :decoded candidate;
@@ -474,6 +536,7 @@ fn evaluate(
                     if (rdna2.decodeInstruction(pc, &words, 0)) |decoded| {
                         break :live decoded;
                     } else |_| {
+                        lane_spills = .{};
                         pc +%= if (words[0] & 0xc000_0000 == 0xc000_0000) @as(u32, 8) else 4;
                         result.instruction_count += 1;
                         continue;
@@ -482,6 +545,7 @@ fn evaluate(
                 else => {
                     // Unknown family, operand decode failures, etc. — skip rather
                     // than abort the whole prolog before SMEM V# loads.
+                    lane_spills = .{};
                     pc +%= if (words[0] & 0xc000_0000 == 0xc000_0000) @as(u32, 8) else 4;
                     result.instruction_count += 1;
                     continue;
@@ -489,6 +553,8 @@ fn evaluate(
             }
         };
         result.instruction_count += 1;
+
+        if (inst.opcode != .v_writelane_b32) lane_spills.invalidateInstruction(inst);
 
         if (inst.opcode == .unsupported) {
             // Skip unknown opcodes inside a known family; do not abort the prolog.
@@ -545,6 +611,7 @@ fn evaluate(
                             for (instructions) |loop_inst| {
                                 if (loop_inst.pc < inst.branch_target or loop_inst.pc >= inst.pc) continue;
                                 invalidateDestination(&result, loop_inst.dst, @max(loop_inst.data_words, destinationWords(loop_inst.opcode)));
+                                lane_spills.invalidateInstruction(loop_inst);
                             }
                             scc = null;
                             pc += inst.word_count * 4;
@@ -580,6 +647,8 @@ fn evaluate(
                 return result;
             },
             .s_nop, .s_waitcnt, .s_barrier, .s_sleep, .s_sendmsg, .s_ttrace_data, .s_inst_prefetch => {},
+            .v_writelane_b32 => lane_spills.store(&result, inst),
+            .v_readlane_b32 => lane_spills.restore(&result, inst),
             else => executeScalar(&result, bindings.program_address, inst, &scc),
         }
         pc +%= inst.word_count * 4;
@@ -1209,6 +1278,61 @@ fn testBindings(program: u64, srt: u64) shaders.StageBindings {
         .srt_address = srt,
         .direct_pointers = .{},
     };
+}
+
+test "resource walk restores pointer halves from independent VGPR lane spills" {
+    var storage = [_]u8{0} ** 32;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    memory.write(0x4000, 0x1234_5678);
+    const bindings = testBindings(0x3000, 0x4000);
+    const instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .v_writelane_b32, .dst = .{ .kind = .vgpr, .reg = 18 }, .src0 = .{ .kind = .sgpr, .reg = 0 }, .src1 = .{ .kind = .integer_inline_constant, .value = 0 } },
+        .{ .pc = 4, .opcode = .v_writelane_b32, .dst = .{ .kind = .vgpr, .reg = 18 }, .src0 = .{ .kind = .sgpr, .reg = 1 }, .src1 = .{ .kind = .integer_inline_constant, .value = 63 } },
+        .{ .pc = 8, .opcode = .s_mov_b64, .dst = .{ .kind = .sgpr, .reg = 0 }, .src0 = .{ .kind = .integer_inline_constant, .value = 0 } },
+        .{ .pc = 12, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 17 }, .src0 = .{ .kind = .integer_inline_constant } },
+        .{ .pc = 16, .opcode = .v_readlane_b32, .dst = .{ .kind = .sgpr, .reg = 10 }, .src0 = .{ .kind = .vgpr, .reg = 18 }, .src1 = .{ .kind = .integer_inline_constant, .value = 0 } },
+        .{ .pc = 20, .opcode = .v_readlane_b32, .dst = .{ .kind = .sgpr, .reg = 11 }, .src0 = .{ .kind = .vgpr, .reg = 18 }, .src1 = .{ .kind = .integer_inline_constant, .value = 63 } },
+        .{ .pc = 24, .family = .smem, .opcode = .s_load_dword, .dst = .{ .kind = .sgpr, .reg = 12 }, .src0 = .{ .kind = .sgpr, .reg = 10 }, .src1 = .{ .kind = .integer_inline_constant }, .data_words = 1 },
+        .{ .pc = 28, .opcode = .s_endpgm },
+    };
+    const result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
+    try std.testing.expectEqual(@as(u32, 0x1234_5678), result.register(12).?.value);
+    try std.testing.expect(result.register(10).?.sources.user_data);
+    try std.testing.expectEqual(@as(u32, 16), result.register(10).?.producer_pc);
+}
+
+test "resource lane spills forget overwritten slots and unknown lane writes" {
+    var storage = [_]u8{0} ** 16;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    const bindings = testBindings(0x3000, 0x4000);
+    var instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .v_writelane_b32, .dst = .{ .kind = .vgpr, .reg = 18 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .integer_inline_constant } },
+        .{ .pc = 4, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 18 } },
+        .{ .pc = 8, .opcode = .v_readlane_b32, .dst = .{ .kind = .sgpr, .reg = 10 }, .src0 = .{ .kind = .vgpr, .reg = 18 }, .src1 = .{ .kind = .integer_inline_constant } },
+        .{ .pc = 12, .opcode = .s_endpgm },
+    };
+    try std.testing.expect(evaluateDecodedResourceState(memory.reader(), &bindings, &instructions).register(10) == null);
+    instructions[1] = .{ .pc = 4, .opcode = .v_writelane_b32, .dst = .{ .kind = .vgpr, .reg = 18 }, .src0 = .{ .kind = .integer_inline_constant }, .src1 = .{ .kind = .sgpr, .reg = 9 } };
+    try std.testing.expect(evaluateDecodedResourceState(memory.reader(), &bindings, &instructions).register(10) == null);
+    instructions[1].src1 = .{ .kind = .integer_inline_constant };
+    instructions[1].src0 = .{ .kind = .sgpr, .reg = 9 };
+    try std.testing.expect(evaluateDecodedResourceState(memory.reader(), &bindings, &instructions).register(10) == null);
+}
+
+test "resource lane spills do not survive an unresolved loop overwrite" {
+    var storage = [_]u8{0} ** 16;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    const bindings = testBindings(0x3000, 0x4000);
+    const instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_cbranch_execz, .branch_target = 12 },
+        .{ .pc = 4, .opcode = .v_writelane_b32, .dst = .{ .kind = .vgpr, .reg = 18 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .integer_inline_constant } },
+        .{ .pc = 8, .opcode = .s_branch, .branch_target = 0 },
+        .{ .pc = 12, .opcode = .v_readlane_b32, .dst = .{ .kind = .sgpr, .reg = 10 }, .src0 = .{ .kind = .vgpr, .reg = 18 }, .src1 = .{ .kind = .integer_inline_constant } },
+        .{ .pc = 16, .opcode = .s_endpgm },
+    };
+    const result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
+    try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
+    try std.testing.expect(result.register(10) == null);
 }
 
 test "uniform resource guard is specialized independently for each dispatch" {

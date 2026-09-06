@@ -4440,6 +4440,7 @@ pub const Renderer = struct {
                         vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
                     );
                     errdefer self.destroyBuffer(replacement_device);
+                    if (self.trace_resource_failures) std.debug.print("[buffer lifetime] replace handle=0x{x} guest=0x{x} bytes={d} slot={d} with guest=0x{x} bytes={d}\n", .{ victim.device_local.handle, victim.guest_address, victim.size, descriptor_index, guest_address, size });
                     self.destroyBuffer(victim.device_local);
                     victim.device_local = replacement_device;
                 }
@@ -12839,6 +12840,8 @@ pub const Renderer = struct {
             }
         }
         var fragment_input_controls: [32]u32 = undefined;
+        var fragment_input_locations: [32]u8 = undefined;
+        for (&fragment_input_locations, 0..) |*location, index| location.* = @intCast(index);
         var mapped_fragment_attribute_mask: u32 = 0;
         var parameter_components: [32]u4 = @splat(0);
         for (0..fragment_input_controls.len) |attribute| {
@@ -13574,6 +13577,7 @@ pub const Renderer = struct {
             .storage_images = fragment_storage.storage_image_mappings[0..fragment_storage.storage_image_mapping_count],
             .parameter_mask = paired_parameter_mask,
             .fragment_input_controls = &fragment_input_controls,
+            .fragment_input_locations = &fragment_input_locations,
             .infer_fragment_parameter_mask = false,
             .color_export_mappings = color_export_mappings,
             .descriptor_array_length = maximum_storage_descriptors,
@@ -13916,6 +13920,8 @@ pub const Renderer = struct {
                     .storage_buffers = vertex_storage.mappings[0..vertex_storage.mapping_count],
                     .sampled_images = graphics_resources.mappings[fragment_mapping_count..graphics_resources.mapping_count],
                     .ngg_lds_exports = ngg_lds_exports[0..ngg_lds_export_count],
+                    .parameter_mask = paired_parameter_mask,
+                    .vertex_parameter_sources = &fragment_input_controls,
                     .descriptor_array_length = maximum_storage_descriptors,
                 }, .{
                     .enable_typed_ir = self.shader_ir_enabled,
@@ -17497,6 +17503,7 @@ pub const Renderer = struct {
     }
 
     fn destroyBuffer(self: *Renderer, buffer: OwnedBuffer) void {
+        if (self.trace_resource_failures) std.debug.print("[buffer lifetime] retire handle=0x{x} bytes={d} submitted={d} completed={d} queued={d} recording={any} caller=0x{x}\n", .{ buffer.handle, buffer.size, self.submitted_tick, self.completed_tick, self.pending_command_buffers.items.len, self.recording_command_buffer != null, @returnAddress() });
         self.deferVulkanObject(.{ .buffer = buffer });
     }
 

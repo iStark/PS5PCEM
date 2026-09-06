@@ -978,6 +978,83 @@ fn runPackedBufferProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("packed buffer probe passed: D16 loads/stores, adjacent halfwords, bounds, half/float packing, CMPX U16 and CLASS F32\n", .{});
 }
 
+fn runShaderInterfaceProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    const backend = renderer.dcbBackend(guest.interface());
+    const vertex = [_]u32{
+        (0x3e << 25) | (0xc2 << 17) | (5 << 9) | 128, // compare VertexIndex with zero
+        0xbf86_0001,      vop1(1, 5, 128), // one branch rewrites the ABI VGPR before its Phi
+        vop1(6, 1, 261),  vop1(1, 2, 255),
+        0x3f80_0000,      vop2(4, 3, 1, 2),
+        vop1(1, 4, 255),  0x3f40_0000,
+        vop2(8, 5, 3, 4), vop2(8, 6, 3, 3),
+        vop1(1, 7, 255),  0xbfc0_0000,
+        vop2(8, 6, 6, 7), vop1(1, 8, 255),
+        0x3f40_0000,      vop2(3, 6, 6, 8),
+        vop1(1, 7, 128),  vop1(1, 8, 242),
+        vop1(1, 10, 240), vop2(8, 9, 1, 10), // PARAM1 = VertexIndex * .5
+        0xf800_021f,      0x0909_0909,
+        0xf800_08cf,      0x0807_0605,
+        0xbf81_0000,
+    };
+    for (vertex, 0..) |word, index| guest.word(0x700 + index * 4, word);
+    var state = gpu.State{};
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.vertex.programRegisterBase(), 7);
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.vertex.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.programRegisterBase() + 1, 0);
+    const context = [_][2]u32{
+        .{ 0x318, 0x20 },            .{ 0x319, 7 }, .{ 0x31b, 0 },               .{ 0x31c, 10 << 2 },
+        .{ 0x31d, 0 },               .{ 0x390, 0 }, .{ 0x3b0, (63 << 14) | 63 }, .{ 0x3b8, 1 << 24 },
+        .{ 0x08e, 0xf },             .{ 0x00c, 0 }, .{ 0x00d, 64 | (64 << 16) }, .{ 0x094, 1 << 31 },
+        .{ 0x095, 64 | (64 << 16) }, .{ 0x1e0, 0 }, .{ 0x200, 0 },               .{ 0x202, (0xcc << 16) | (1 << 4) },
+        .{ 0x204, 0 },               .{ 0x205, 0 },
+        .{ 0x191, 1 }, .{ 0x192, 0x401 }, // smooth ATTR0 and flat ATTR1 both use PARAM1
+    };
+    for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+    for ([_]f32{ 32, 32, 32, 32, 1, 0 }, 0..) |value, index|
+        try state.writeRegister(.context, 0x10f + @as(u32, @intCast(index)), @bitCast(value));
+    const stream = [_]u32{ command(gpu.pm4.draw_index_auto, 2), 3, 0 };
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = backend, .allocator = allocator };
+    for (0..2) |pass| {
+        const fragment = [_]u32{
+            0xc800_0000 | (4 << 18), 0xc801_0001 | (4 << 18),
+            0xc800_0400 | (5 << 18), 0xc801_0401 | (5 << 18),
+            sop1(3, 6, 255),         0x3f80_0000,
+            sop1(3, 7, 255),         0x3e80_0000,
+            0xd761_0012, 6 | (128 << 9), // spill s6 to v18 lane 0
+            0xd761_0012, 7 | (129 << 9), // spill s7 to v18 lane 1
+            if (pass == 0) 0xbf80_0000 else vop1(1, 18, 240), // optional ordinary overwrite invalidates both
+            0xd760_000a,
+            (256 + 18) | (128 << 9),
+            0xd760_000b,
+            (256 + 18) | (129 << 9),
+            vop1(1, 6, 10),
+            vop1(1, 7, 11),
+            0xf800_080f,
+            0x0706_0504,
+            0xbf81_0000,
+        };
+        const address: u32 = 0x900 + @as(u32, @intCast(pass)) * 0x100;
+        for (fragment, 0..) |word, index| guest.word(address + index * 4, word);
+        try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.programRegisterBase(), address >> 8);
+        _ = try executor.execute(&stream);
+        try renderer.flushPendingGuestWrites();
+        if (renderer.last_draw_error) |err| return err;
+        const center = 0x2000 + (32 * 64 + 32) * 4;
+        const pixel = guest.bytes[center..][0..4];
+        std.debug.print("shader interface probe pass={d} center={any}\n", .{ pass, pixel.* });
+        try std.testing.expect(pixel[0] >= 110 and pixel[0] <= 150);
+        try std.testing.expectEqual(@as(u8, 0), pixel[1]);
+        const expected_blue: i32 = if (pass == 0) 255 else 128;
+        const expected_alpha: i32 = if (pass == 0) 64 else 128;
+        try std.testing.expect(@abs(@as(i32, pixel[2]) - expected_blue) <= 1);
+        try std.testing.expect(@abs(@as(i32, pixel[3]) - expected_alpha) <= 1);
+    }
+    std.debug.print("shader interface probe passed: ABI Phi, smooth/flat aliases and independent lane spills\n", .{});
+}
+
 fn runStreamedMipProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -1093,6 +1170,10 @@ fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--shader-interface")) {
+        try runShaderInterfaceProbe(allocator);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--streamed-mips")) {
         try runStreamedMipProbe(allocator);
         return;

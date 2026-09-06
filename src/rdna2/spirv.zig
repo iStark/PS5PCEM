@@ -231,6 +231,12 @@ pub const Options = struct {
     /// five bits select the matching VS PARAM export; bit 10 requests flat
     /// interpolation. An empty slice preserves the identity mapping.
     fragment_input_controls: []const u32 = &.{},
+    /// Optional unique host locations for raw PS attributes. Distinct
+    /// attributes may interpolate the same PARAM export differently.
+    fragment_input_locations: []const u8 = &.{},
+    /// Source PARAM export for each host VS output location. A paired pipeline
+    /// can duplicate one export for smooth and flat fragment attributes.
+    vertex_parameter_sources: []const u32 = &.{},
     /// Standalone translation infers PARAM inputs from VINTRP. A graphics
     /// backend that knows the paired VS interface can disable that inference
     /// and supply only locations the vertex stage actually exports.
@@ -518,12 +524,24 @@ fn remapColorExportComponents(components: [4]u32, mapping: u8) [4]u32 {
     return result;
 }
 
+fn constantWaveLane(op: operand.Operand) ?u32 {
+    if (op.negate or op.absolute or op.dpp) return null;
+    return switch (op.kind) {
+        .integer_inline_constant, .literal_constant => op.value & 63,
+        else => null,
+    };
+}
+
 const Builder = struct {
+    const LaneSpill = struct { vgpr: u32, lane: u32, value: u32, valid: u32 };
     allocator: std.mem.Allocator,
     annotations: std.ArrayList(u32) = .empty,
     declarations: std.ArrayList(u32) = .empty,
     body: std.ArrayList(u32) = .empty,
     constants: std.ArrayList(Constant) = .empty,
+    lane_spills: std.ArrayList(LaneSpill) = .empty,
+    writing_lane: bool = false,
+    lane_spill_pointer_type: u32 = 0,
     registers: [384]Value = [_]Value{.{}} ** 384,
     next_id: u32 = 1,
     void_type: u32,
@@ -550,6 +568,7 @@ const Builder = struct {
     color_outputs: [8]u32 = @splat(0),
     color_export_mappings: [8]u8,
     parameter_variables: [32]u32 = @splat(0),
+    vertex_parameter_targets: [32]u32 = @splat(0),
     /// BuiltIn FragCoord (float4) for fragment UV fallback when PARAM interps
     /// are not yet wired from the vertex stage.
     frag_coord_input: u32 = 0,
@@ -746,6 +765,11 @@ const Builder = struct {
                     if (options.parameter_mask & bit == 0) continue;
                     const variable = self.id();
                     self.parameter_variables[location] = variable;
+                    const export_index = if (location < options.vertex_parameter_sources.len)
+                        options.vertex_parameter_sources[location] & 0x1f
+                    else
+                        location;
+                    self.vertex_parameter_targets[export_index] |= bit;
                     try self.emit(&self.annotations, 71, &.{ variable, 30, @intCast(location) }); // Location
                     try self.emit(&self.declarations, 59, &.{ output_pointer, variable, 3 }); // OpVariable
                 }
@@ -794,7 +818,11 @@ const Builder = struct {
                         options.fragment_input_controls[location]
                     else
                         @as(u32, @intCast(location));
-                    try self.emit(&self.annotations, 71, &.{ variable, 30, control & 0x1f }); // Location
+                    const host_location: u32 = if (location < options.fragment_input_locations.len)
+                        options.fragment_input_locations[location]
+                    else
+                        control & 0x1f;
+                    try self.emit(&self.annotations, 71, &.{ variable, 30, host_location }); // Location
                     if (control & 0x400 != 0) {
                         try self.emit(&self.annotations, 71, &.{ variable, 14 }); // Flat
                     }
@@ -1122,6 +1150,7 @@ const Builder = struct {
         self.declarations.deinit(self.allocator);
         self.body.deinit(self.allocator);
         self.constants.deinit(self.allocator);
+        self.lane_spills.deinit(self.allocator);
     }
 
     fn id(self: *Builder) u32 {
@@ -1370,6 +1399,7 @@ const Builder = struct {
     }
 
     fn destination(self: *Builder, op: operand.Operand, value: Value) Error!void {
+        if (op.kind == .vgpr and !self.writing_lane) try self.invalidateLaneSpills(op.reg);
         var final_value = value;
         if (self.sampled_result_predicate) |valid| {
             const selected = self.id();
@@ -3689,7 +3719,10 @@ const Builder = struct {
             const result = self.id();
             try self.emit(&self.body, 61, &.{ self.signed_type, result, self.vertex_index_input }); // OpLoad
             const vgpr = self.vertex_index_vgpr orelse return Error.InvalidStageInterface;
-            self.registers[128 + @as(usize, vgpr)] = .{ .id = result, .value_type = .sint32 };
+            self.registers[128 + @as(usize, vgpr)] = .{
+                .id = try self.convert(.{ .id = result, .value_type = .sint32 }, .bits32),
+                .value_type = .bits32,
+            };
 
             // The merged NGG/export ABI receives the vertex and instance ids
             // in v5/v8. An ordinary VS uses v0 and may use v5 as a temporary,
@@ -3697,7 +3730,10 @@ const Builder = struct {
             if (vgpr == 5 and self.instance_index_input != 0) {
                 const instance = self.id();
                 try self.emit(&self.body, 61, &.{ self.signed_type, instance, self.instance_index_input }); // OpLoad
-                self.registers[128 + 8] = .{ .id = instance, .value_type = .sint32 };
+                self.registers[128 + 8] = .{
+                    .id = try self.convert(.{ .id = instance, .value_type = .sint32 }, .bits32),
+                    .value_type = .bits32,
+                };
             }
         }
         const inputs = self.compute_inputs orelse return;
@@ -4296,7 +4332,7 @@ const Builder = struct {
             .vertex => if (inst.export_target == 0x0c or inst.export_target == 0)
                 self.position_output
             else if (inst.export_target >= 0x20)
-                self.parameter_variables[inst.export_target - 0x20]
+                self.vertexParameterOutput(inst.export_target - 0x20)
             else
                 0,
             .fragment => if (inst.export_target < self.color_outputs.len)
@@ -4396,17 +4432,28 @@ const Builder = struct {
             components[2],
             components[3],
         }); // OpCompositeConstruct
+        var exported = vector;
         if (try self.laneEnabled()) |enabled| {
             const current = self.id();
             try self.emit(&self.body, 61, &.{ self.vector4_type, current, output }); // OpLoad
             const selected = self.id();
             try self.emit(&self.body, 169, &.{ self.vector4_type, selected, enabled, vector, current }); // OpSelect
-            try self.emit(&self.body, 62, &.{ output, selected }); // OpStore
-        } else {
-            try self.emit(&self.body, 62, &.{ output, vector }); // OpStore
+            exported = selected;
+        }
+        try self.emit(&self.body, 62, &.{ output, exported }); // OpStore
+        if (self.stage == .vertex and inst.export_target >= 0x20 and inst.export_target < 0x40) {
+            const targets = self.vertex_parameter_targets[inst.export_target - 0x20];
+            for (self.parameter_variables, 0..) |variable, location| {
+                if (variable != 0 and variable != output and targets & (@as(u32, 1) << @intCast(location)) != 0)
+                    try self.emit(&self.body, 62, &.{ variable, exported });
+            }
         }
     }
 
+    fn vertexParameterOutput(self: *const Builder, export_index: u32) u32 {
+        const targets = self.vertex_parameter_targets[export_index];
+        return if (targets == 0) 0 else self.parameter_variables[@ctz(targets)];
+    }
     fn exportNggLdsRecord(self: *Builder) Error!void {
         if (self.stage != .vertex or self.ngg_lds_exports.len == 0) return;
         for (self.ngg_lds_exports) |record| {
@@ -6294,12 +6341,34 @@ const Builder = struct {
             source_value,
             lane,
         }); // OpGroupNonUniformShuffle
-        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+        var selected = result;
+        if (constantWaveLane(inst.src1)) |index| {
+            if (self.findLaneSpill(inst.src0.reg, index)) |spill| {
+                const saved = self.id();
+                const valid = self.id();
+                try self.emit(&self.body, 61, &.{ self.bits_type, saved, spill.value });
+                try self.emit(&self.body, 61, &.{ self.bits_type, valid, spill.valid });
+                selected = self.id();
+                try self.emit(&self.body, 169, &.{ self.bits_type, selected, try self.isNonZero(valid), saved, result });
+            }
+        }
+        try self.destination(inst.dst, .{ .id = selected, .value_type = .bits32 });
     }
 
     fn writeLane(self: *Builder, inst: instruction.Instruction) Error!void {
         const value = try self.source(inst.src0, .bits32);
         const lane = try self.source(inst.src1, .bits32);
+        // Compilers spill uniform SGPR values into different lanes of one
+        // VGPR. Keep those slots distinct even when a host subgroup is smaller
+        // than the guest wave, or the destination lane is an inactive helper.
+        self.writing_lane = true;
+        defer self.writing_lane = false;
+        if (constantWaveLane(inst.src1)) |index| {
+            if (self.findLaneSpill(inst.dst.reg, index)) |spill| {
+                try self.emit(&self.body, 62, &.{ spill.value, value });
+                try self.emit(&self.body, 62, &.{ spill.valid, try self.constant(.bits32, 1) });
+            }
+        } else try self.invalidateLaneSpills(inst.dst.reg);
         const current = if (registerIndex(inst.dst)) |index|
             try self.registerBits(index, 0)
         else
@@ -6316,6 +6385,37 @@ const Builder = struct {
         const result = self.id();
         try self.emit(&self.body, 169, &.{ self.bits_type, result, matches, value, current }); // OpSelect
         try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
+    fn findLaneSpill(self: *const Builder, vgpr: u32, lane: u32) ?LaneSpill {
+        for (self.lane_spills.items) |spill| {
+            if (spill.vgpr == vgpr and spill.lane == lane) return spill;
+        }
+        return null;
+    }
+
+    fn invalidateLaneSpills(self: *Builder, vgpr: u32) Error!void {
+        for (self.lane_spills.items) |spill| {
+            if (spill.vgpr == vgpr) try self.emit(&self.body, 62, &.{ spill.valid, try self.constant(.bits32, 0) });
+        }
+    }
+
+    fn configureLaneSpills(self: *Builder, instructions: []const instruction.Instruction) Error!void {
+        for (instructions) |inst| {
+            if (inst.opcode != .v_writelane_b32 or inst.dst.kind != .vgpr or inst.src0.kind == .vgpr) continue;
+            const lane = constantWaveLane(inst.src1) orelse continue;
+            if (self.findLaneSpill(inst.dst.reg, lane) != null) continue;
+            if (self.lane_spill_pointer_type == 0) {
+                self.lane_spill_pointer_type = self.id();
+                try self.emit(&self.declarations, 32, &.{ self.lane_spill_pointer_type, 6, self.bits_type }); // ptr Private
+            }
+            const zero = try self.constant(.bits32, 0);
+            const value = self.id();
+            const valid = self.id();
+            try self.emit(&self.declarations, 59, &.{ self.lane_spill_pointer_type, value, 6, zero });
+            try self.emit(&self.declarations, 59, &.{ self.lane_spill_pointer_type, valid, 6, zero });
+            try self.lane_spills.append(self.allocator, .{ .vgpr = inst.dst.reg, .lane = lane, .value = value, .valid = valid });
+        }
     }
 
     fn bufferAddressDelta(self: *Builder, inst: instruction.Instruction, extra_offset: u32) Error!BufferAddress {
@@ -9009,6 +9109,7 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     }
     if (builder.workgroup_memory != 0) try entry_point.append(allocator, builder.workgroup_memory);
     if (builder.private_memory != 0) try entry_point.append(allocator, builder.private_memory);
+    for (builder.lane_spills.items) |spill| try entry_point.appendSlice(allocator, &.{ spill.value, spill.valid });
     if (builder.local_invocation_index != 0) try entry_point.append(allocator, builder.local_invocation_index);
     if (builder.subgroup_local_invocation_id != 0) try entry_point.append(allocator, builder.subgroup_local_invocation_id);
     if (builder.workgroup_id_input != 0) try entry_point.append(allocator, builder.workgroup_id_input);
@@ -9116,7 +9217,7 @@ fn translateInstructions(
     var effective = options;
     var has_predicated_write = false;
     for (effective.ngg_lds_exports) |ngg_export| {
-        if (effective.stage == .vertex and ngg_export.target >= 0x20 and ngg_export.target < 0x40) {
+        if (effective.stage == .vertex and effective.vertex_parameter_sources.len == 0 and ngg_export.target >= 0x20 and ngg_export.target < 0x40) {
             effective.parameter_mask |= @as(u32, 1) << @intCast(ngg_export.target - 0x20);
         }
     }
@@ -9152,7 +9253,7 @@ fn translateInstructions(
             effective.private_memory_size_bytes = 32 * 1024;
         }
         switch (effective.stage) {
-            .vertex => if (candidate.opcode == .exp and candidate.export_target >= 0x20) {
+            .vertex => if (effective.vertex_parameter_sources.len == 0 and candidate.opcode == .exp and candidate.export_target >= 0x20) {
                 effective.parameter_mask |= @as(u32, 1) << @intCast(candidate.export_target - 0x20);
             },
             .fragment => {
@@ -9176,6 +9277,7 @@ fn translateInstructions(
     var builder = try Builder.init(allocator, effective);
     var builder_alive = true;
     defer if (builder_alive) builder.deinit();
+    try builder.configureLaneSpills(instructions);
     var graph = try control_flow.buildInstructions(allocator, instructions);
     defer graph.deinit(allocator);
     if (graph.blocks.items.len == 1) {
@@ -9198,6 +9300,7 @@ fn translateInstructions(
             builder_alive = false;
             builder = try Builder.init(allocator, effective);
             builder_alive = true;
+            try builder.configureLaneSpills(instructions);
             translateDispatcher(&builder, instructions, &graph) catch |dispatch_err| {
                 if (dispatch_err != Error.UnsupportedControlFlow) return dispatch_err;
                 if (!effective.allow_control_flow_fallback) return err;
@@ -9205,6 +9308,7 @@ fn translateInstructions(
                 builder_alive = false;
                 builder = try Builder.init(allocator, effective);
                 builder_alive = true;
+                try builder.configureLaneSpills(instructions);
                 builder.used_control_flow_fallback = true;
                 try builder.emit(&builder.body, 248, &.{builder.label});
                 try builder.initializeStageInputs();
@@ -10393,7 +10497,7 @@ test "vertex PARAM export and fragment interpolation share a location" {
     // Both modules declare Location 0. The VS stores PARAM0 and VINTRP loads
     // and extracts ATTR0 in the PS instead of manufacturing screen-space UVs.
     try std.testing.expectEqual(@as(usize, 2), countOpcode(vertex_module.words, 71)); // OpDecorate
-    try std.testing.expectEqual(@as(usize, 1), countOpcode(vertex_module.words, 62)); // OpStore PARAM0
+    try std.testing.expectEqual(@as(usize, 3), countOpcode(vertex_module.words, 62)); // initialize Position/PARAM0, then export PARAM0
     try std.testing.expectEqual(@as(usize, 3), countOpcode(fragment_module.words, 71)); // OpDecorate
     try std.testing.expectEqual(@as(usize, 2), countOpcode(fragment_module.words, 61)); // OpLoad
     try std.testing.expectEqual(@as(usize, 2), countOpcode(fragment_module.words, 81)); // OpCompositeExtract

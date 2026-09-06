@@ -408,6 +408,34 @@ without VUID or synchronization errors. All 28 tiling tests and the targeted
 AGC tests pass. The new game run passes the packed-header failure and continues
 through state 23. Passing state 40 and rendering the menu remain unconfirmed.
 
+## Scene shader validation and scalar spills
+
+The streamed run reaches state 29, then loses the Vulkan device. Newly reached
+vertex programs contain unsigned `OpPhi` results with signed ABI input values;
+the vertex/instance IDs now enter the register file as unsigned bits. Some
+fragment programs consume the same PARAM export through both smooth and flat
+attributes. Paired translation assigns each PS attribute a unique Vulkan
+location and replicates the corresponding VS export to those locations.
+
+Uniform SGPR spills in `v18` are represented by independent private lane slots.
+Ordinary VGPR writes invalidate those slots, and unknown reads keep the subgroup
+fallback. Resource analysis also restores known spilled pointer halves before
+subsequent scalar loads, forgetting slots after unknown writes or unresolved
+loop overwrites. This does not implement general wave64 communication on a
+smaller host subgroup.
+
+The shader-header registry previously filled its fixed 8,192-entry table and
+silently discarded later scene headers. It now grows dynamically; a regression
+test checks all 12,000 mappings, replacement, nearby-entry lookup and reset.
+
+The interface GPU probe checks ABI control-flow merges, smooth/flat aliases,
+independent spills and their invalidation. It and the full smoke pass with SDK
+1.4.357.0 validation. All 26 scalar-provenance tests pass. The actual game emits
+128 valid SPIR-V modules in its next run, but validation catches
+`VUID-vkQueueSubmit-pCommandBuffers-00070`: a recorded command references a
+destroyed buffer. Resource-failure tracing now logs buffer retirement and cache
+replacement to identify that lifetime error. No complete menu is confirmed.
+
 ## Baseline before the timestamp fix
 
 A five-minute run continues rendering after the movie, at approximately
