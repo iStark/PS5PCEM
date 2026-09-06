@@ -879,9 +879,31 @@ ReleaseSafe poisoning and checks, requires no optional CPU instruction set,
 and avoids a compiler-generated recursive memset call. Other targets retain
 their existing runtime implementation. Tests cover all lengths 0–512 at 64
 alignments, signed/truncated fill values, return pointers, null/zero length,
-and a guarded 4 MiB fill. Sixteen 64 MiB host fills improve from 117,636 to
+and a 4 MiB fill with sentinel bytes on both sides. Sixteen 64 MiB host fills improve from 117,636 to
 34,599 us with the same output hash; the complete SDK Vulkan smoke passes.
 This is an isolated memory benchmark, not a measured whole-frame multiplier.
+
+The live runner now reaches the bonus notice with cached transfer/compute
+memory and the faster host fill. CPU sampling confirms that calls use the
+REP STOSB implementation; the fallback symbol remaining in the binary is not
+the sampled fill path. The corrected complete Cross glyph remains visible.
+Ten-frame samples around the bonus notice give:
+
+| Build | All 6,042 resource resolutions | Median frame time | FPS over the sample |
+| --- | --- | --- | --- |
+| `748f6fd`, before cached readback | 20m13s | 13,614 ms | 0.073 |
+| `b258af6`, cached transfer and resident storage buffers | 15m45s | 11,242 ms | 0.089 |
+| `c237830`, also accelerated host fill | 12m06s | 9,151 ms | 0.108 |
+
+The samples are flips 932–941, 919–928 and 921–930 respectively. Animated
+draw counts vary between runs; these are observed scene timings, not a
+deterministic replay benchmark. The cached builds also support the captured
+D32 depth bias. A ten-second sample of the cached-buffer run uses 11.94% of
+the 16 logical CPUs; GPU utilization in two readings is 22–27%, with about
+5.1 GiB of GPU memory in use. Frames still upload roughly 1.9 GiB and read
+back 1.6 GiB, so host resource preparation remains the major limitation.
+Confirmation starts closing the Digital Deluxe notice. Complete title-menu
+background rendering is not established by these performance results.
 
 The first cached-memory relaunch stopped before video or Vulkan rendering:
 the main thread was suspended in `reportGuestThreadContext(1)`, called by
