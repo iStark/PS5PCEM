@@ -9540,7 +9540,19 @@ fn translateInstructions(
             if (constantWaveLane(candidate.src1)) |lane| cross_half_read = cross_half_read or lane >= 32;
         }
         uses_gds = uses_gds or candidate.gds;
-        if (candidate.dst.kind == .exec_lo) effective.uses_execution_mask = true;
+        if (candidate.dst.kind == .exec_lo or candidate.dst.kind == .exec_hi or
+            std.mem.indexOf(u8, @tagName(candidate.opcode), "saveexec") != null)
+        {
+            effective.uses_execution_mask = true;
+        }
+        // Loop lowering retains a referenced EXEC pair in mutable registers,
+        // even if the shader only saves it and never overwrites it. Testing
+        // that restored mask still needs the invocation's lane identity.
+        const sources = candidate.sources();
+        for (sources.slice()) |source_op| {
+            if (effective.stage == .compute and (source_op.kind == .exec_lo or source_op.kind == .exec_hi))
+                effective.uses_lane_identity = true;
+        }
         if (candidate.opcode == .v_writelane_b32 or candidate.opcode == .v_readlane_b32 or
             candidate.opcode == .v_permlane16_b32 or candidate.opcode == .v_permlanex16_b32 or
             candidate.opcode == .v_mbcnt_lo_u32_b32 or candidate.opcode == .v_mbcnt_hi_u32_b32 or
@@ -12784,6 +12796,44 @@ test "disabled conditional debug branches fall through" {
     var module = try translate(std.testing.allocator, &program, .{ .stage = .compute });
     defer module.deinit(std.testing.allocator);
     try std.testing.expect(module.words.len != 0);
+}
+
+test "compute scalar loops keep EXEC identity without full-mask writes" {
+    const decoder = @import("decoder.zig");
+    const code = [_]u32{
+        0xbe8c_047e, // s_mov_b64 s12, EXEC (read without an EXEC destination)
+        0x7e02_0280,
+        0xbe88_0380,
+        0xbe89_0384,
+        0xd746_0001,
+        129 | (128 << 9) | (257 << 18),
+        0x8108_8108,
+        0xbf0a_0908,
+        0xbf85_fffb,
+        0xe070_2000,
+        0x8000_0100,
+        0xbf81_0000,
+    };
+    var program = try decoder.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    const first = program.instructions.items[0];
+    for (0..3) |case| {
+        program.instructions.items[0] = switch (case) {
+            0 => first,
+            1 => .{ .pc = 0, .opcode = .s_mov_b32, .dst = .{ .kind = .exec_hi }, .src0 = .{ .kind = .integer_inline_constant }, .src_count = 1 },
+            else => .{ .pc = 0, .opcode = .s_and_saveexec_b64, .dst = .{ .kind = .sgpr, .reg = 12 }, .src0 = .{ .kind = .integer_inline_constant, .value = 0xffff_ffff }, .src_count = 1 },
+        };
+        var module = try translate(std.testing.allocator, &program, .{
+            .stage = .compute,
+            .local_size = .{ 64, 1, 1 },
+            .storage_buffers = &.{.{ .resource_sgpr = 0, .descriptor_index = 0, .stride = 4 }},
+            .compute_inputs = .{ .local_invocation_id_components = 1 },
+            .allow_control_flow_fallback = false,
+        });
+        defer module.deinit(std.testing.allocator);
+        try std.testing.expect(!module.used_control_flow_fallback);
+        try std.testing.expect(containsOpcode(module.words, 246)); // OpLoopMerge
+    }
 }
 
 test "forward scalar selection lowers with a structured merge and register phi" {

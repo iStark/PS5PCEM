@@ -717,6 +717,45 @@ fn runVectorImageProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("vector image resources passed: masked descriptor tuples and readfirstlane waterfall\n", .{});
 }
 
+fn runScalarLoopProbe(allocator: std.mem.Allocator) !void {
+    for (0..2) |case_index| {
+        var renderer = try vulkan.Renderer.init(allocator, .{});
+        defer renderer.deinit();
+        var guest = GuestMemory{};
+        _ = renderer.dcbBackend(guest.interface());
+        const code = [_]u32{
+            if (case_index == 0) 0xbe8c_047e else 0xbeff_0380, // save EXEC, or clear EXEC_HI only
+            vop1(1, 1, 128),
+            0xbe88_0380, // counter = 0
+            0xbe89_0384, // limit = 4
+            0xd746_0001, 129 | (128 << 9) | (257 << 18), // v1 += 1
+            0x8108_8108, // counter += 1
+            0xbf0a_0908, // counter < limit
+            0xbf85_fffb, // loop to the vector increment
+            0xe070_2000,
+            0x8000_0100,
+            0xbf81_0000,
+        };
+        for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+        for (0..64) |index| guest.word(0x10000 + index * 4, 0x1234_5678);
+        var state = gpu.State{};
+        const stage = gpu.resources.ShaderStage.compute;
+        try state.writeRegister(.shader, stage.programRegisterBase(), 1);
+        try state.writeRegister(.shader, stage.programRegisterBase() + 1, 0);
+        try state.writeRegister(.shader, 0x213, 4 << 1);
+        for ([_]u32{ 0x10000, 4 << 16, 64, 0 }, 0..) |word, index|
+            try state.writeRegister(.shader, stage.userDataBase() + @as(u32, @intCast(index)), word);
+        _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 1, 1, 1 });
+        var output: [256]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x10000, &output);
+        for (0..64) |lane| {
+            const expected: u32 = if (case_index == 0 or lane < 32) 4 else 0x1234_5678;
+            try std.testing.expectEqual(expected, std.mem.readInt(u32, output[lane * 4 ..][0..4], .little));
+        }
+    }
+    std.debug.print("scalar loops passed: saved EXEC, high-half writes, four iterations and inactive lanes\n", .{});
+}
+
 fn runWave64Probe(allocator: std.mem.Allocator) !void {
     for ([_][3]u32{ .{ 64, 1, 1 }, .{ 4, 4, 4 } }) |local_size| try runWave64Case(allocator, local_size);
     std.debug.print("wave64 passed: lane 63, full masks, carry bits and uniform EXEC branches across workgroup shapes\n", .{});
@@ -2054,6 +2093,10 @@ fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--scalar-loops")) {
+        try runScalarLoopProbe(allocator);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--wave64")) {
         try runWave64Probe(allocator);
         return;

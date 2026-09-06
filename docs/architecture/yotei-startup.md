@@ -744,14 +744,25 @@ workgroup and excludes GDS kernels; other wave configurations still need work.
 Focused lane tests retain the pre-existing image-resinfo and DS-addtid failures.
 
 The next full run loads all 6,042 startup resources in about 30 minutes and
-continues beyond the former lighting device-loss point, but still presents
-black frames. Three scene compute programs refuse nested FLAT addressing.
+continues beyond the former lighting device-loss point. Direct framebuffer
+capture at flip 932 shows the Digital Deluxe Bonus notice, with readable text
+and an incorrect cross-button glyph. Windows PrintWindow captures were black
+and did not represent the Vulkan image. The menu behind the notice remains
+unverified. Three scene compute programs refuse nested FLAT addressing.
 Their captured dispatch flags are 56: the first collision branch is disabled.
 Uniform branch specialization now evaluates `S_BITCMP0/1_B32` and 32-bit
 logical operations, including SCC and unknown-operand invalidation. Captured
 replays remove 15 of 38 FLAT reads in each program without missing memory;
 23 real pointer reads remain and are not replaced by zero. All 68 scalar
 provenance/module tests and the 62 captured material resource cases pass.
+
+Pruning can leave compute loops that only read EXEC, without a full-mask
+destination. Mutable loop lowering still tests that saved mask, so it needs
+lane identity. Inference now accounts for EXEC sources, high-half writes and
+implicit SAVEEXEC writes. Without it, a GPU probe silently takes the linear
+fallback and returns 1 instead of 4 iterations. The corrected probe returns 4
+and preserves inactive upper lanes, with clean SDK validation; the two wave64
+workgroup shapes also pass. Strict CPU translation covers all three EXEC forms.
 
 ## Baseline before the timestamp fix
 
