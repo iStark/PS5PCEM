@@ -905,6 +905,17 @@ back 1.6 GiB, so host resource preparation remains the major limitation.
 Confirmation starts closing the Digital Deluxe notice. Complete title-menu
 background rendering is not established by these performance results.
 
+Continuing the same `c237830` run reaches `Gift of the Northern Star Unlocked`
+at flip 1001 and `Pre-order Bonus` at flip 1051. Keyboard confirmation is
+verified by pad diagnostics (`0x4000` followed by release); pressing before
+the notice finishes appearing can be ignored, so confirmation is retried on
+the settled notice. All three bonus windows can be dismissed. By flip 1103
+the following composite is a dark grey surface with black rectangular UI
+artifacts, not a recognizable complete title menu. The deferred UI anchor
+is null in this run, so that particular presenter fallback is not retaining
+the old notice. Resolving the remaining scene/composite failures is still
+required; passing the bonus windows does not establish the 3D background.
+
 The first cached-memory relaunch stopped before video or Vulkan rendering:
 the main thread was suspended in `reportGuestThreadContext(1)`, called by
 `drainQuietBuilderArenas` from that same guest thread's suspend point. The
