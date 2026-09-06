@@ -8,7 +8,6 @@ const rdna2 = @import("rdna2");
 const shaders = @import("shaders.zig");
 const scalar = @import("scalar_provenance.zig");
 const definitions = @import("index_bounds.zig");
-const resources = @import("resources.zig");
 
 pub const Resolver = struct {
     bindings: *const shaders.StageBindings,
@@ -50,7 +49,6 @@ pub const Resolver = struct {
         };
         const inst = self.instructions[index];
         const known = self.snapshot.registers[register];
-        if (known.known and known.producer_pc == inst.pc) return known.value;
         const destination = scalar.scalarRegisterIndex(inst.dst) orelse return null;
         if (register < destination) return null;
         const component: u32 = @intCast(register - destination);
@@ -58,7 +56,7 @@ pub const Resolver = struct {
             .s_mov_b32, .s_mov_b64 => return self.operand(inst.src0, component, index, depth + 1),
             .s_movk_i32 => return @bitCast(@as(i32, @as(i16, @bitCast(@as(u16, @truncate(inst.src0.value)))))),
             .s_load_dword, .s_load_dwordx2, .s_load_dwordx4, .s_load_dwordx8, .s_load_dwordx16, .s_buffer_load_dword, .s_buffer_load_dwordx2, .s_buffer_load_dwordx4, .s_buffer_load_dwordx8, .s_buffer_load_dwordx16 => {},
-            else => return null,
+            else => return if (known.known and known.producer_pc == inst.pc) known.value else null,
         }
         if (component >= inst.data_words) return null;
         const is_buffer = std.mem.startsWith(u8, @tagName(inst.opcode), "s_buffer_");
@@ -71,10 +69,11 @@ pub const Resolver = struct {
         if (displacement < 0) return null;
         var base: u64 = undefined;
         if (is_buffer) {
-            const buffer = resources.decodeBufferDescriptor(&base_words) catch return null;
+            const stride = (base_words[1] >> 16) & 0x3fff;
+            const size = @as(u64, @max(stride, 1)) * base_words[2];
             const byte = (@as(u64, @intCast(displacement)) & ~@as(u64, 3)) + component * 4;
-            if (byte + 4 > buffer.size_bytes) return 0;
-            base = buffer.address;
+            if (byte + 4 > size) return 0;
+            base = @as(u64, base_words[0]) | (@as(u64, base_words[1] & 0xffff) << 32);
         } else {
             if (base_words[1] & 0xffff_0000 != 0) return null;
             base = @as(u64, base_words[0]) | (@as(u64, base_words[1]) << 32);
@@ -124,6 +123,8 @@ test "scalar resource recovery follows nested loads after USER_DATA reuse" {
     bindings.user_data[5] = 0x5204;
     var snapshot = scalar.Evaluation{};
     snapshot.registers[4] = .{ .known = true, .value = 0xdead, .producer_pc = 100 };
+    // Even a matching producer must not bypass the descriptor bounds check.
+    snapshot.registers[21] = .{ .known = true, .value = 0x700000, .producer_pc = 24 };
     var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = &memory, .read_fn = Memory.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot };
     var words: [4]u32 = undefined;
     try std.testing.expect(try resolver.words(16, 24, &words));

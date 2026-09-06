@@ -23182,8 +23182,10 @@ fn resolveBufferImageCandidates(
     scalar: *const gpu.ScalarEvaluation,
     sample: gpu.ShaderInstruction,
 ) anyerror!?BufferImageCandidates {
-    const plan = (try resolveBufferTablePlan(reader, analysis, scalar, sample.src1.reg, 8, sample.pc, bindings)) orelse
-        return resolvePointerImageCandidates(reader, analysis, scalar, sample);
+    const plan = (try resolveBufferTablePlan(reader, analysis, scalar, sample.src1.reg, 8, sample.pc, bindings)) orelse {
+        if (try resolvePointerImageCandidates(reader, analysis, scalar, sample)) |candidates| return candidates;
+        return resolveVectorImageCandidates(bindings, reader, analysis, scalar, sample);
+    };
     var result = BufferImageCandidates{};
     var offset = plan.first;
     while (offset < plan.limit) : (offset += plan.step) {
@@ -23203,6 +23205,50 @@ fn resolveBufferImageCandidates(
         }
         if (duplicate) continue;
         if (result.count == result.words.len) return null;
+        result.words[result.count] = words;
+        result.count += 1;
+    }
+    return if (result.count != 0) result else null;
+}
+
+fn resolveVectorImageCandidates(
+    bindings: *const gpu.ShaderBindings,
+    reader: gpu.ShaderMemoryReader,
+    analysis: *const gpu.ShaderAnalysis,
+    scalar: *const gpu.ScalarEvaluation,
+    sample: gpu.ShaderInstruction,
+) anyerror!?BufferImageCandidates {
+    const instructions = analysis.program.instructions.items;
+    var sample_index: usize = 0;
+    while (sample_index < instructions.len and instructions[sample_index].pc != sample.pc) : (sample_index += 1) {}
+    if (sample_index == instructions.len) return null;
+    var tuples: [32]gpu.vector_resources.Tuple = undefined;
+    const count = gpu.vector_resources.imageTuples(instructions, &analysis.graph, sample_index, sample.src1.reg, &tuples) orelse return null;
+    var result = BufferImageCandidates{};
+    for (tuples[0..count]) |tuple| {
+        var words: [8]u32 = undefined;
+        for (tuple, 0..) |index, component| {
+            const move = instructions[index];
+            var resolver = gpu.scalar_resources.Resolver{
+                .bindings = bindings,
+                .reader = reader,
+                .instructions = instructions,
+                .graph = &analysis.graph,
+                .snapshot = scalar,
+            };
+            const register = gpu.scalar_provenance.scalarRegisterIndex(move.src0) orelse return null;
+            if (!try resolver.words(@intCast(register), move.pc, words[component..][0..1])) return null;
+        }
+        // Bounds-checked SMEM reads can supply the null tuple for an unused
+        // record. The runtime descriptor lookup already maps unmatched nulls
+        // to zero; they must not allocate a physical Vulkan image.
+        if (std.mem.allEqual(u32, &words, 0)) continue;
+        _ = gpu.resources.decodeImageDescriptor(&words) catch return null;
+        var duplicate = false;
+        for (result.words[0..result.count]) |previous| {
+            if (std.mem.eql(u32, &previous, &words)) duplicate = true;
+        }
+        if (duplicate) continue;
         result.words[result.count] = words;
         result.count += 1;
     }

@@ -620,8 +620,33 @@ without executing a draw through the invalid descriptor. The new
 `vulkan-smoke --target-reuse` probe fills all 64 cache entries, samples the
 oldest into four new destinations, verifies red GPU readback and checks
 that every preparation pin is released. It passes SDK validation alongside
-the existing buffer-reuse, typed-index and full smoke probes. Whether this
-also removes the observed game device loss requires the next full run.
+the existing buffer-reuse, typed-index and full smoke probes. The next game
+run passed flip 742 and continued loading more than 5,400 scene resources
+without that device loss. Its output still shows a loading indicator on a
+black background; the menu has not yet been verified.
+
+The two recurring resource failures in `0x800037f200` have been reproduced
+from captured shader code, USER_DATA and resource tables. At PC `0x66c`,
+eight-word T# tuples travel through masked VGPR copies before a waterfall
+selects them. Resource recovery now follows complete correlated tuples.
+Ordinary VGPR writes preserve inactive lanes: a four-lane GPU probe selects
+two distinct textures and fails with the former unmasked writes. At PC
+`0x970`, unreachable NOP blocks left by branch specialization no longer
+contribute spurious reaching definitions.
+
+CPU scalar buffer loads now enforce per-dword V# bounds, matching runtime
+loads. Scalar resource recovery rechecks SMEM instead of accepting a matching
+but unchecked snapshot. SOFFSET remains a real register even when it overlaps
+V#; only NULL disables the offset. Captured replay now resolves both texture
+uses, and the GPU scalar-pointer probe checks overlapping SOFFSET and partial
+out-of-bounds loads. Vector, nested, typed-index, integer-color, array-gradient,
+target-reuse, buffer-reuse and full Vulkan smoke checks pass under SDK validation.
+Module tests retain the same nine RDNA2 failures and one executor failure as
+the previous commit; the changed resource-analysis tests pass.
+
+Another recurring compute refusal, `0x80001fd400:0x28a8`, references an empty
+lighting texture table. Correct handling of proven null resources and a new
+full game run remain necessary before claiming menu rendering.
 
 ## Baseline before the timestamp fix
 

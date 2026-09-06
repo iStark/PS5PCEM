@@ -640,6 +640,70 @@ fn runInlineMetadataBufferProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("inline metadata buffer probe passed: USER_DATA buffer offsets are independent of SRT size\n", .{});
 }
 
+fn runVectorImageProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    var code: std.ArrayList(u32) = .empty;
+    defer code.deinit(allocator);
+    try code.appendSlice(allocator, &.{
+        0xf40c_0400, 125 << 25, // first T# in s16:s23
+        0xf408_0600, (125 << 25) | 64, // output V# in s24:s27
+        0xf408_0300, (125 << 25) | 80, // sampler s12:s15
+        0xbea0_047e, // save initial EXEC in s32:s33
+        vop1(1, 1, 240), vop1(1, 2, 240), // normalized coordinates
+    });
+    for (0..8) |i| try code.append(allocator, vop1(1, @intCast(8 + i), @intCast(16 + i)));
+    try code.appendSlice(allocator, &.{
+        (0x3e << 25) | (0xd4 << 17) | 130, // v_cmpx_gt_u32 2, v0: first two lanes
+        0xf40c_0400, (125 << 25) | 32, // second T# replaces s16:s23
+    });
+    for (0..8) |i| try code.append(allocator, vop1(1, @intCast(8 + i), @intCast(16 + i)));
+    try code.appendSlice(allocator, &.{0xbefe_0420}); // restore EXEC
+    const waterfall = code.items.len;
+    for (0..8) |i| try code.append(allocator, vop1(2, @intCast(4 + i), @intCast(256 + 8 + i)));
+    try code.append(allocator, 0xbeea_047e); // preserve remaining lanes in VCC
+    for (0..8) |i| try code.append(allocator, (0x3e << 25) | (0xd2 << 17) | (@as(u32, @intCast(8 + i)) << 9) | @as(u32, @intCast(4 + i)));
+    try code.appendSlice(allocator, &.{
+        0xf09c_0108, 0x0061_1001, // sample red at LOD zero into v16, using T#s4/S#s12
+        0x8afe_7e6a, // s_andn2_b64 exec, vcc, exec
+    });
+    const displacement: i16 = @intCast(@as(isize, @intCast(waterfall)) - @as(isize, @intCast(code.items.len + 1)));
+    try code.append(allocator, 0xbf89_0000 | @as(u32, @as(u16, @bitCast(displacement))));
+    try code.appendSlice(allocator, &.{
+        0xbefe_0420, // restore EXEC for output
+        0xe070_2000, 0x8006_1000, // indexed store v16, v0, V#s24
+        0xbf81_0000,
+    });
+    for (code.items, 0..) |word, i| guest.word(0x100 + i * 4, word);
+    for ([_]u32{ 0x8000, 0x9000 }, 0..) |address, i| {
+        const image = sampledImageDescriptorWords(address, 1, 1);
+        for (image, 0..) |word, j| guest.word(0x1000 + i * 32 + j * 4, word);
+        guest.word(address, if (i == 0) 0xff00_00ff else 0xff00_0040);
+    }
+    for ([_]u32{ 0x3000, 4 << 16, 4, 0 }, 0..) |word, i| guest.word(0x1040 + i * 4, word);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 2 << 1);
+    try state.writeRegister(.shader, compute.userDataBase(), 0x1000);
+    try state.writeRegister(.shader, compute.userDataBase() + 1, 0);
+    const result = try renderer.dispatchRdna2State(&state, .{ 4, 1, 1 }, .{ 1, 1, 1 });
+    try std.testing.expect(result.spirv_words != 0);
+    var pixels: [16]u8 = undefined;
+    try renderer.readbackGuestStorageBuffer(0x3000, &pixels);
+    for (0..4) |i| {
+        const actual: f32 = @bitCast(std.mem.readInt(u32, pixels[i * 4 ..][0..4], .little));
+        const expected: f32 = if (i < 2) 64.0 / 255.0 else 1;
+        std.debug.print("vector resource lane {d}: {d}\n", .{ i, actual });
+        try std.testing.expectApproxEqAbs(expected, actual, 0.00001);
+    }
+    try std.testing.expectEqual(@as(u64, 2), renderer.sampled_image_uploads);
+    std.debug.print("vector image resources passed: masked descriptor tuples and readfirstlane waterfall\n", .{});
+}
+
 fn runResidentTargetReuseProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
     defer renderer.deinit();
@@ -1459,7 +1523,35 @@ fn runScalarPointerProbe(allocator: std.mem.Allocator) !void {
             try std.testing.expectEqual(word, std.mem.readInt(u32, output[index * 16 + component * 4 ..][0..4], .little));
         };
     }
-    std.debug.print("scalar pointer loads passed: runtime pointers, split regions, 32-bit carry, bounds and relocated bases\n", .{});
+    // SOFFSET remains a real register even when it names a word of the V#.
+    // The SSBO binding already represents V#'s base; s0 supplies byte offset 8.
+    const overlapping_code = [_]u32{
+        sop1(3, 0, 136),             0xf428_0100,     0,
+        vop1(1, 0, 4),               vop1(1, 1, 5),   vop1(1, 2, 6),
+        vop1(1, 3, 7),               vop1(1, 4, 128), mubuf(0x1e, 0, 0, 4, 12)[0],
+        mubuf(0x1e, 0, 0, 4, 12)[1], 0xbf81_0000,
+    };
+    for (overlapping_code, 0..) |word, index| guest.word(0x200 + index * 4, word);
+    var overlapping = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x200, overlapping_code.len);
+    defer overlapping.deinit(allocator);
+    var overlapping_module = try overlapping.translateSpirv(allocator, .{
+        .stage = .compute,
+        .storage_buffers = &.{
+            .{ .resource_sgpr = 0, .descriptor_index = 0, .stride = 0 },
+            .{ .resource_sgpr = 12, .descriptor_index = 1, .stride = 0 },
+        },
+    });
+    defer overlapping_module.deinit(allocator);
+    for (0..8) |index| guest.word(0x14000 + index * 4, @intCast(11 + index));
+    _ = try renderer.stageGuestStorageBufferAt(0, 0x14000, 16);
+    _ = try renderer.stageGuestStorageBufferAt(1, 0x15000, 16);
+    _ = try renderer.dispatchSpirv(overlapping_module.words, .{ 1, 1, 1 });
+    var overlapping_output: [16]u8 = undefined;
+    try renderer.readbackGuestStorageBuffer(0x15000, &overlapping_output);
+    for ([_]u32{ 13, 14, 0, 0 }, 0..) |expected_word, index| {
+        try std.testing.expectEqual(expected_word, std.mem.readInt(u32, overlapping_output[index * 4 ..][0..4], .little));
+    }
+    std.debug.print("scalar pointer loads passed: runtime pointers, split regions, 32-bit carry, bounds, overlapping SOFFSET and relocated bases\n", .{});
 }
 
 fn runNestedImageProbe(allocator: std.mem.Allocator) !void {
@@ -1723,6 +1815,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--array-gradients")) {
         try runArrayGradientProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--vector-images")) {
+        try runVectorImageProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--target-reuse")) {

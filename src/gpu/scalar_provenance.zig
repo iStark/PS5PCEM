@@ -723,20 +723,24 @@ fn executeSmem(
         => true,
         else => false,
     };
-    // SMEM SOFFSET is 7 bits: 0 means SGPR0, 125 means "no register". A
-    // compiler that encodes an immediate-only s_buffer_load with SOFFSET=0
-    // names the first dword of a V# in s0. Adding that address-lo as a byte
-    // offset misses the buffer and specialises the dests to zero — Yotei's
-    // fullscreen G-buffer PS then exports black.
-    const offset = if (is_buffer_load and inst.src0.kind == .sgpr and inst.src1.kind == .sgpr and
-        inst.src1.reg >= inst.src0.reg and inst.src1.reg < inst.src0.reg + 4)
-        ScalarValue{ .known = true, .value = 0, .sources = .{ .immediate = true } }
-    else
-        source(result, inst.src1) orelse {
+    // Only NULL disables SOFFSET; a register overlapping V# is still data.
+    const offset = source(result, inst.src1) orelse {
+        invalidateDestination(result, inst.dst, inst.data_words);
+        result.stop_reason = .invalid_address;
+        return false;
+    };
+    var buffer_size: ?u64 = null;
+    if (is_buffer_load) {
+        if (base_index + 2 >= maximum_scalar_registers or !result.registers[base_index + 2].known) {
             invalidateDestination(result, inst.dst, inst.data_words);
             result.stop_reason = .invalid_address;
             return false;
-        };
+        }
+        // SMEM uses only BASE, STRIDE and NUM_RECORDS from V#. Check every
+        // dword, including partial loads at the end of the last record.
+        const stride = (base_hi.value >> 16) & 0x3fff;
+        buffer_size = @as(u64, @max(stride, 1)) * result.registers[base_index + 2].value;
+    }
     if (!is_buffer_load and base_hi.value & 0xffff_0000 != 0) {
         invalidateDestination(result, inst.dst, inst.data_words);
         result.stop_reason = .invalid_address;
@@ -768,6 +772,9 @@ fn executeSmem(
 
     var loaded: [16]u32 = @splat(0);
     for (loaded[0..inst.data_words], 0..) |*word, index| {
+        if (buffer_size) |size| {
+            if (displacement < 0 or (@as(u64, @intCast(displacement)) & ~@as(u64, 3)) + index * 4 + 4 > size) continue;
+        }
         word.* = reader.readU32(address + index * 4) catch {
             invalidateDestination(result, inst.dst, inst.data_words);
             result.stop_reason = .inaccessible_memory;
@@ -1977,7 +1984,7 @@ test "scalar provenance follows a GETPC SETPC continuation" {
     try std.testing.expectEqual(@as(u32, 1), result.register(2).?.value);
 }
 
-test "s_buffer_load ignores a SOFFSET that names the V# itself" {
+test "scalar buffer loads honor overlapping SOFFSET and per-dword bounds" {
     var storage = [_]u8{0} ** 0x20;
     var memory = TestMemory{ .base = 0x2000, .bytes = &storage };
     memory.write(0x2000, 0x3f80_0000);
@@ -1988,9 +1995,9 @@ test "s_buffer_load ignores a SOFFSET that names the V# itself" {
     var user_data = [_]u32{0} ** 64;
     user_data[0] = 0x2000;
     user_data[1] = 0;
-    user_data[2] = 4;
+    user_data[2] = 16;
     user_data[3] = 0;
-    const bindings = shaders.StageBindings{
+    var bindings = shaders.StageBindings{
         .stage = .pixel,
         .user_data_stage = .pixel,
         .program_address = 0x1000,
@@ -2001,7 +2008,7 @@ test "s_buffer_load ignores a SOFFSET that names the V# itself" {
         .srt_address = null,
         .direct_pointers = .{},
     };
-    const instructions = [_]rdna2.Instruction{
+    var instructions = [_]rdna2.Instruction{
         .{
             .pc = 0,
             .family = .smem,
@@ -2015,10 +2022,27 @@ test "s_buffer_load ignores a SOFFSET that names the V# itself" {
         },
         .{ .pc = 8, .opcode = .s_endpgm, .word_count = 1 },
     };
-    const result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
+    var result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
     try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
+    for (4..8) |reg| try std.testing.expectEqual(@as(u32, 0), result.register(@intCast(reg)).?.value);
+
+    instructions[0].src1 = .{ .kind = .null };
+    result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
     try std.testing.expectEqual(@as(u32, 0x3f80_0000), result.register(4).?.value);
     try std.testing.expectEqual(@as(u32, 0x4000_0000), result.register(5).?.value);
     try std.testing.expectEqual(@as(u32, 0x4040_0000), result.register(6).?.value);
     try std.testing.expectEqual(@as(u32, 0x4080_0000), result.register(7).?.value);
+
+    // Two eight-byte records, with one valid word left in the second one.
+    // Mapped bytes beyond the descriptor must never become shader constants.
+    bindings.user_data[1] = 8 << 16;
+    bindings.user_data[2] = 2;
+    instructions[0].memory_offset = 15;
+    result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
+    try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 0x4080_0000), result.register(4).?.value);
+    for (5..8) |reg| try std.testing.expectEqual(@as(u32, 0), result.register(@intCast(reg)).?.value);
+    bindings.user_data[2] = 0;
+    result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
+    for (4..8) |reg| try std.testing.expectEqual(@as(u32, 0), result.register(@intCast(reg)).?.value);
 }

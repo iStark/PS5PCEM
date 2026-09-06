@@ -1474,7 +1474,15 @@ const Builder = struct {
             }
             return Error.UnsupportedDestination;
         };
-        const bits = try self.convert(final_value, .bits32);
+        var bits = try self.convert(final_value, .bits32);
+        if (op.kind == .vgpr and !self.writing_lane) {
+            if (try self.laneEnabled()) |enabled| {
+                const previous = try self.registerBits(index, 0);
+                const selected = self.id();
+                try self.emit(&self.body, 169, &.{ self.bits_type, selected, enabled, bits, previous });
+                bits = selected;
+            }
+        }
         self.registers[index] = .{
             .id = bits,
             .value_type = .bits32,
@@ -6551,14 +6559,8 @@ const Builder = struct {
         // from the legacy MUBUF handling of reserved SOFFSET encodings.
         const soffset = if (binding.soffset_value) |value|
             try self.constant(.bits32, value)
-        else if (inst.family == .smem and (inst.src2.kind == .vcc_lo or inst.src2.kind == .vcc_hi))
+        else if (inst.family == .smem)
             try self.source(inst.src2, .bits32)
-        else if (inst.family == .smem and inst.src1.kind == .sgpr and inst.src2.kind == .sgpr and
-            inst.src2.reg >= inst.src1.reg and inst.src2.reg < inst.src1.reg + 4)
-            // Same V# collision as executeSmem: SOFFSET=0 decodes as SGPR0,
-            // which is the descriptor when the V# lives in s0. The bound SSBO
-            // is already the allocation; adding address-lo goes OOB → 0.
-            try self.constant(.bits32, 0)
         else switch (inst.src2.kind) {
             .null,
             .m0,
@@ -7440,11 +7442,8 @@ const Builder = struct {
             return false;
         }
 
-        // A bound V# is the source of truth for s_buffer_load. CPU evaluation
-        // of the same instruction can read the wrong address (SMEM SOFFSET of
-        // 0 is SGPR0, often the V# itself) and then specialise the dests to
-        // zero. Yotei's fullscreen G-buffer PS exports those zeros as colour.
-        // Emit the runtime SSBO load instead.
+        // A bound V# is the source of truth for s_buffer_load. Read its live
+        // contents and range instead of baking a CPU snapshot into the module.
         switch (inst.opcode) {
             .s_buffer_load_dword,
             .s_buffer_load_dwordx2,

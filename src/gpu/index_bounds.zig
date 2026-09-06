@@ -53,9 +53,31 @@ fn writes(inst: Instruction, location: Location) bool {
 /// assignment or a register changed on a previous loop iteration.
 const ReachingDefinitions = struct { items: [32]usize = undefined, count: usize = 0, entry: bool = false };
 
+/// Pruned shader blocks retain their byte positions as NOPs. Their fallthrough
+/// edges must not introduce definitions into code reachable from the entry.
+pub fn reachableBlocks(graph: *const Graph) ?[maximum_blocks]bool {
+    if (graph.blocks.items.len == 0 or graph.blocks.items.len > maximum_blocks) return null;
+    var reached: [maximum_blocks]bool = @splat(false);
+    var queue: [maximum_blocks]u32 = undefined;
+    reached[0] = true;
+    queue[0] = 0;
+    var length: usize = 1;
+    var cursor: usize = 0;
+    while (cursor < length) : (cursor += 1) {
+        for (graph.edges.items) |edge| {
+            if (edge.from != queue[cursor] or reached[edge.to]) continue;
+            reached[edge.to] = true;
+            queue[length] = edge.to;
+            length += 1;
+        }
+    }
+    return reached;
+}
+
 fn reachingDefinitions(instructions: []const Instruction, graph: *const Graph, before: usize, location: Location) ?ReachingDefinitions {
-    if (graph.blocks.items.len > maximum_blocks) return null;
+    const reachable = reachableBlocks(graph) orelse return null;
     const first_block = blockAt(graph, before) orelse return null;
+    if (!reachable[first_block]) return null;
     var visited: [maximum_blocks]bool = @splat(false);
     var queue: [maximum_blocks]u32 = undefined;
     var count: usize = 0;
@@ -81,7 +103,7 @@ fn reachingDefinitions(instructions: []const Instruction, graph: *const Graph, b
             if (block_index == 0) result.entry = true;
             var has_predecessor = false;
             for (graph.edges.items) |edge| {
-                if (edge.to != block_index) continue;
+                if (edge.to != block_index or !reachable[edge.from]) continue;
                 has_predecessor = true;
                 if (visited[edge.from]) continue;
                 visited[edge.from] = true;
@@ -357,4 +379,24 @@ test "index bounds reject ambiguous reaching definitions" {
     defer graph.deinit(std.testing.allocator);
     // s2 can arrive unchanged from entry, bypassing the guarded s0 copy.
     try std.testing.expectEqual(@as(?u32, null), scalarUpperBound(&instructions, &graph, 6, 2));
+}
+
+test "scalar definitions ignore unreachable fallthrough after branch specialization" {
+    const s4 = rdna2.Operand{ .kind = .sgpr, .reg = 4 };
+    var instructions = [_]Instruction{
+        .{ .pc = 0, .opcode = .s_mov_b32, .dst = s4, .src0 = .{ .kind = .sgpr, .reg = 0 } },
+        .{ .pc = 4, .opcode = .s_branch, .branch_target = 16 },
+        .{ .pc = 8, .opcode = .s_mov_b32, .dst = s4, .src0 = .{ .kind = .sgpr, .reg = 1 } },
+        .{ .pc = 12, .opcode = .s_nop },
+        .{ .pc = 16, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?ScalarDefinition, .{ .instruction = 0 }), scalarDefinition(&instructions, &graph, 4, 4));
+    try std.testing.expect(scalarDefinition(&instructions, &graph, 3, 4) == null);
+    // The same predecessor must participate when the branch is conditional.
+    instructions[1].opcode = .s_cbranch_scc1;
+    graph.deinit(std.testing.allocator);
+    graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    try std.testing.expect(scalarDefinition(&instructions, &graph, 4, 4) == null);
 }
