@@ -982,7 +982,7 @@ const Builder = struct {
             }
         }
         if (options.storage_images.len != 0) {
-            if (options.stage != .compute) return Error.InvalidStorageBinding;
+            if (options.stage != .compute and options.stage != .fragment) return Error.InvalidStorageBinding;
             for (options.storage_images, 0..) |binding, index| {
                 if (binding.resource_sgpr >= 128 or
                     binding.descriptor_index >= self.storage_image_variables.len)
@@ -4672,7 +4672,7 @@ const Builder = struct {
     }
 
     fn imageStore(self: *Builder, inst: instruction.Instruction) Error!void {
-        if (self.stage != .compute or
+        if ((self.stage != .compute and self.stage != .fragment) or
             (inst.opcode_id != 8 and inst.opcode_id != 9) or
             (inst.image_dimension != .dim_2d and inst.image_dimension != .dim_3d and
                 inst.image_dimension != .dim_2d_array_alt) or
@@ -4721,7 +4721,21 @@ const Builder = struct {
             physical_values[2],
             physical_values[3],
         }); // OpCompositeConstruct
-        try self.emit(&self.body, 99, &.{ image, coordinates, texel }); // OpImageWrite
+        // Image side effects obey EXEC just like buffer stores. In graphics
+        // a host invocation represents one guest lane, including CMPX and
+        // scalar save/restore sequences around a predicated store.
+        if (try self.laneEnabled()) |predicate| {
+            const taken = self.id();
+            const merge = self.id();
+            try self.emit(&self.body, 247, &.{ merge, 0 }); // OpSelectionMerge
+            try self.emit(&self.body, 250, &.{ predicate, taken, merge });
+            try self.emit(&self.body, 248, &.{taken});
+            try self.emit(&self.body, 99, &.{ image, coordinates, texel });
+            try self.emit(&self.body, 249, &.{merge});
+            try self.emit(&self.body, 248, &.{merge});
+        } else {
+            try self.emit(&self.body, 99, &.{ image, coordinates, texel }); // OpImageWrite
+        }
     }
 
     fn imageAtomic(self: *Builder, inst: instruction.Instruction, opcode: u16) Error!void {

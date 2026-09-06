@@ -267,6 +267,55 @@ storage-image mappings, and their descriptor-layout bindings are visible only
 to compute. This requires a graphics storage-image implementation (including
 lane predicates and resource lifetime), not merely accepting the opcode.
 
+## Fragment storage-image outputs
+
+Fragment translation now receives the prepared storage-image bindings and
+emits typed `OpImageWrite` for 2D, 3D and array images. Storage descriptors
+are visible to the fragment stage, and draws bind them even when the pixel
+shader has no sampled textures or storage buffers. Image stores in both
+compute and fragment stages obey the current EXEC predicate.
+
+Graphics keeps its combined vertex/pixel sampled-image table while staging
+storage resources. Successful draws publish image writes to the resident
+cache and alias tracker. Explicit image dependencies cover repeated writes,
+storage reads and later sampling, including GENERAL-to-GENERAL transitions.
+Simultaneous color-attachment/storage feedback remains unsupported.
+
+Each prepared storage or sampled binding now owns a separate cache pin.
+Retiring an older submission cannot unpin a resource held by the current
+pass. Releases also wait for submitted work when the pending command list
+is empty; CPU image publishers release their temporary upload pin.
+
+The Vulkan probe writes RG16_UNORM into layer 1 of a two-layer image from a
+pixel shader. CMPX enables only the left half; EXEC restoration allows blue
+color export on both halves. Consecutive draws reuse the image with different
+USER_DATA values, then compute consumers verify the resident result through
+both array `image_load` and `image_sample_lz`, before CPU image writeback.
+The untouched layer and disabled pixels retain their sentinel values.
+
+Full Vulkan and image-only probes pass on the RTX 3070 Ti with SDK 1.4.357.0's
+validation library loaded and synchronization validation enabled, without
+VUID or synchronization errors. The cache-retirement regression and all six
+image-store translator tests pass.
+
+The game capture now includes a valid fragment SPIR-V module for the original
+`0x8038783800` program: its two-channel array store at `0x344` becomes a
+predicated `OpImageWrite` to an `Rg8` storage array. Captured variants of this
+path also pass SDK `spirv-val --target-env vulkan1.2`.
+
+The final 12-minute run resolves about 2,800 resources and reaches loader
+state 35, with no device loss or aborted queue. It reaches 111 draw attempts
+in one frame; the last recorded frame is flip 740, with 51 draws and 264
+dispatches in 8.47 seconds. All 11 captured fragment programs containing
+image writes pass SPIR-V validation. The inspected window at the state-32
+transition is still black; a complete menu rendering is not confirmed.
+
+Another observed failure is compute program `0x80003e2c00`, a 134-instruction
+shader with an 8x8 local size. Its GDS `ds_add_u32` at `0x2bc` is rejected as
+`UnsupportedBufferAddressing`: the generic DS atomic path still requires
+workgroup memory. Unresolved image descriptors also remain in other compute
+programs. These are separate gaps from fragment storage-image translation.
+
 ## Baseline before the timestamp fix
 
 A five-minute run continues rendering after the movie, at approximately

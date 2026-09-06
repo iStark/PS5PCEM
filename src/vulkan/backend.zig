@@ -2146,7 +2146,8 @@ const CachedStorageImage = struct {
     guest_content_hash_valid: bool = false,
     guest_page_generation: u64 = 0,
     gpu_dirty: bool = false,
-    in_use: bool = false,
+    // Every prepared binding owns one pin until its submission retires.
+    pin_count: usize = 0,
     valid: bool = true,
 };
 
@@ -3463,7 +3464,7 @@ pub const Renderer = struct {
                 .binding = @intCast(2 + index),
                 .descriptor_type = vk.descriptor_type_storage_image,
                 .descriptor_count = 1,
-                .stage_flags = vk.shader_stage_compute_bit,
+                .stage_flags = vk.shader_stage_compute_bit | vk.shader_stage_fragment_bit,
             };
         }
         descriptor_bindings[2 + maximum_storage_images] = .{
@@ -5537,6 +5538,7 @@ pub const Renderer = struct {
             );
         }
         const submit_started = hostTimestampNs();
+        try self.prepareStorageImageAccess(&resources);
         const report = try self.dispatchSpirv(module.words, group_count);
         const submit_elapsed_ns = elapsedHostNanoseconds(submit_started);
         self.frame_profile.compute_submit_ns +|= submit_elapsed_ns;
@@ -6581,7 +6583,8 @@ pub const Renderer = struct {
         for (self.storage_image_cache.items, 0..) |cached, index| {
             if (!cached.valid or !sameStorageImageDescriptor(cached.descriptor, descriptor)) continue;
             const resident = &self.storage_image_cache.items[index];
-            resident.in_use = true;
+            resident.pin_count += 1;
+            defer self.releaseStorageImage(index);
             resident.last_used_sequence = self.storage_image_sequence;
             try self.uploadCachedStorageImage(index, linear, false);
             resident.gpu_dirty = true;
@@ -6656,12 +6659,13 @@ pub const Renderer = struct {
             .staging_bytes = staging_bytes,
             .last_used_sequence = self.storage_image_sequence,
             .gpu_dirty = true,
-            .in_use = true,
+            .pin_count = 1,
         };
         self.storage_image_cache_bytes +|= staging_bytes;
         cache_owns_resources = true;
         errdefer self.destroyCachedStorageImage(cache_index);
         try self.uploadCachedStorageImage(cache_index, linear, true);
+        self.releaseStorageImage(cache_index);
     }
 
     /// Handles the four-instruction AGC linear UAV fill without compiling a
@@ -8055,6 +8059,10 @@ pub const Renderer = struct {
             result.storage_image_mapping_count += 1;
         }
 
+        // Graphics already owns a combined VS/PS sampled-image table. Do not
+        // overwrite its slots with this compute-only, per-stage table while
+        // preparing graphics buffer and storage-image bindings.
+        if (bindings.stage != .compute) return result;
         for (instructions) |inst| {
             const image_fetch = inst.opcode == .image_load or inst.opcode == .image_load_mip;
             if (!image_fetch and inst.opcode != .image_sample and inst.opcode != .image_gather4) continue;
@@ -13488,6 +13496,7 @@ pub const Renderer = struct {
                 .{ target.descriptor.width, target.descriptor.height },
             .sampled_images = graphics_resources.mappings[0..fragment_mapping_count],
             .storage_buffers = fragment_storage.mappings[0..fragment_storage.mapping_count],
+            .storage_images = fragment_storage.storage_image_mappings[0..fragment_storage.storage_image_mapping_count],
             .parameter_mask = paired_parameter_mask,
             .fragment_input_controls = &fragment_input_controls,
             .infer_fragment_parameter_mask = false,
@@ -13764,6 +13773,7 @@ pub const Renderer = struct {
             module.words
         else
             fragment_module.words;
+        try self.prepareGraphicsStorageImages(&fragment_storage, if (depth_only) null else target, extra_colors);
         // Procedural draws deliberately have no V# mappings: fullscreen NGG
         // programs synthesize their rectangle from the system vertex index.
         // Attempt every guest VS unless the paired pixel shader explicitly
@@ -13888,10 +13898,12 @@ pub const Renderer = struct {
                         render_state.depth_control.stencil_clear_enabled,
                     graphics_resources.mapping_count != 0 or
                         vertex_storage.mapping_count != 0 or
-                        fragment_storage.mapping_count != 0,
+                        fragment_storage.mapping_count != 0 or
+                        fragment_storage.storage_image_count != 0,
                     false,
                     draw,
                 );
+                try self.commitStorageImages(memory, &fragment_storage);
                 if (unity_ui_fallback) {
                     // The deferred HDR composite fallback presents its intact
                     // scene input because the guest composite shader is not
@@ -14030,10 +14042,11 @@ pub const Renderer = struct {
                 depth_plane,
                 render_state.depth_control.clear_enabled or
                     render_state.depth_control.stencil_clear_enabled,
-                graphics_resources.mapping_count != 0 or fragment_storage.mapping_count != 0,
+                graphics_resources.mapping_count != 0 or fragment_storage.mapping_count != 0 or fragment_storage.storage_image_count != 0,
                 false,
                 .{ .vertex_count = 4, .instance_count = 1 },
             );
+            try self.commitStorageImages(memory, &fragment_storage);
             if (planar_video_pass) {
                 // The VideoOut allocation is a different VA alias. Remember
                 // the resident attachment that received the decoded frame;
@@ -14092,10 +14105,11 @@ pub const Renderer = struct {
             depth_plane,
             render_state.depth_control.clear_enabled or
                 render_state.depth_control.stencil_clear_enabled,
-            graphics_resources.mapping_count != 0 or fragment_storage.mapping_count != 0,
+            graphics_resources.mapping_count != 0 or fragment_storage.mapping_count != 0 or fragment_storage.storage_image_count != 0,
             false,
             .{ .vertex_count = 3, .instance_count = 1 },
         );
+        try self.commitStorageImages(memory, &fragment_storage);
     }
 
     /// Convert the linear NV12 or I420 surfaces consumed by Unity directly into
@@ -15238,11 +15252,8 @@ pub const Renderer = struct {
     fn releaseStorageImage(self: *Renderer, cache_index: usize) void {
         if (cache_index >= self.storage_image_cache.items.len) return;
         if (!self.storage_image_cache.items[cache_index].valid) return;
-        if (self.pending_command_buffers.items.len != 0 or self.recording_command_buffer != null) {
-            self.deferVulkanObject(.{ .storage_image_release = cache_index });
-        } else {
-            self.storage_image_cache.items[cache_index].in_use = false;
-        }
+        // Also retain already submitted work when the pending list is empty.
+        self.deferVulkanObject(.{ .storage_image_release = cache_index });
     }
 
     fn destroyCachedStorageImage(self: *Renderer, cache_index: usize) void {
@@ -15257,7 +15268,7 @@ pub const Renderer = struct {
         self.destroyBuffer(cached.transfer);
         self.storage_image_cache_bytes -|= cached.staging_bytes;
         cached.valid = false;
-        cached.in_use = false;
+        cached.pin_count = 0;
         cached.gpu_dirty = false;
     }
 
@@ -15407,7 +15418,7 @@ pub const Renderer = struct {
             var victim_index: ?usize = null;
             var oldest_sequence: u64 = std.math.maxInt(u64);
             for (self.storage_image_cache.items, 0..) |cached, index| {
-                if (!cached.valid or cached.in_use or cached.last_used_sequence >= oldest_sequence) continue;
+                if (!cached.valid or cached.pin_count != 0 or cached.last_used_sequence >= oldest_sequence) continue;
                 victim_index = index;
                 oldest_sequence = cached.last_used_sequence;
             }
@@ -15626,11 +15637,12 @@ pub const Renderer = struct {
             // ordered, and the later pass must observe the resident output of
             // the earlier one. Creating a second image here detiled stale
             // guest memory, severed that producer/consumer chain and repeated
-            // hundreds of MiB of CPU work per frame. `in_use` still protects
-            // the shared object from eviction until the batch fence retires.
-            if (cached.in_use or cached.gpu_dirty) {
+            // hundreds of MiB of CPU work per frame. Each binding pins the
+            // object independently, so retiring an older batch cannot make
+            // a resource held by the current pass eligible for eviction.
+            if (cached.pin_count != 0 or cached.gpu_dirty) {
                 const resident = &self.storage_image_cache.items[index];
-                resident.in_use = true;
+                resident.pin_count += 1;
                 resident.last_used_sequence = self.storage_image_sequence;
                 self.updateStorageImageDescriptor(descriptor_index, resident.view);
                 self.frame_profile.resident_storage_bytes +%= resident.staging_bytes;
@@ -15661,8 +15673,8 @@ pub const Renderer = struct {
             if (guest_page_generation != 0 and
                 cached.guest_page_generation == guest_page_generation)
             {
-                cached.in_use = true;
-                errdefer cached.in_use = false;
+                cached.pin_count += 1;
+                errdefer self.releaseStorageImage(index);
                 self.updateStorageImageDescriptor(descriptor_index, cached.view);
                 self.frame_profile.resident_storage_bytes +%= cached.staging_bytes;
                 return .{
@@ -15693,8 +15705,8 @@ pub const Renderer = struct {
             if (guest_page_generation == 0 and
                 cached.guest_content_hash_valid and cached.guest_content_hash == guest_content_hash)
             {
-                cached.in_use = true;
-                errdefer cached.in_use = false;
+                cached.pin_count += 1;
+                errdefer self.releaseStorageImage(index);
                 self.updateStorageImageDescriptor(descriptor_index, cached.view);
                 self.frame_profile.resident_storage_bytes +%= cached.staging_bytes;
                 return .{
@@ -15716,8 +15728,8 @@ pub const Renderer = struct {
 
         if (matching_index) |index| {
             const cached = &self.storage_image_cache.items[index];
-            cached.in_use = true;
-            errdefer cached.in_use = false;
+            cached.pin_count += 1;
+            errdefer self.releaseStorageImage(index);
             try self.uploadCachedStorageImage(index, linear, false);
             cached.guest_content_hash = guest_content_hash;
             cached.guest_content_hash_valid = true;
@@ -15809,7 +15821,7 @@ pub const Renderer = struct {
             .guest_content_hash = guest_content_hash,
             .guest_content_hash_valid = true,
             .guest_page_generation = guest_page_generation,
-            .in_use = true,
+            .pin_count = 1,
         };
         self.storage_image_cache_bytes +|= staging_bytes;
         cache_owns_resources = true;
@@ -15829,6 +15841,38 @@ pub const Renderer = struct {
             .writable = writable,
             .cache_index = cache_index,
         };
+    }
+
+    fn prepareGraphicsStorageImages(
+        self: *Renderer,
+        resources: *const ComputeResources,
+        color: ?GuestColorTarget,
+        extra_colors: []const GuestColorTarget,
+    ) anyerror!void {
+        if (resources.storage_image_count == 0) return;
+        for (resources.storage_images[0..resources.storage_image_count]) |prepared| {
+            if (prepared.render_target_index) |index| {
+                const address = self.render_targets.items[index].target.descriptor.address;
+                // Simultaneous attachment/storage access needs a feedback-loop
+                // render pass. Do not change an active attachment to GENERAL.
+                if (color) |target| if (target.descriptor.address == address) return Error.UnsupportedStorageImage;
+                for (extra_colors) |target| if (target.descriptor.address == address) return Error.UnsupportedStorageImage;
+            }
+        }
+        try self.prepareStorageImageAccess(resources);
+    }
+
+    fn prepareStorageImageAccess(self: *Renderer, resources: *const ComputeResources) anyerror!void {
+        if (resources.storage_image_count == 0) return;
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        for (resources.storage_images[0..resources.storage_image_count]) |prepared| {
+            try self.transitionTrackedImage(command_buffer, prepared.image.handle, .{
+                .aspect_mask = vk.image_aspect_color_bit,
+                .layer_count = if (prepared.descriptor.image_type == .color_2d_array) prepared.subresource.depth_or_layers else 1,
+            }, image_state.storage_usage);
+        }
+        try self.submitOneShot(command_buffer);
     }
 
     fn commitStorageImages(self: *Renderer, memory: GuestMemory, resources: *const ComputeResources) anyerror!void {
@@ -15983,6 +16027,15 @@ pub const Renderer = struct {
         }
         if (best_index) |index| {
             const cached = &self.storage_image_cache.items[index];
+            // A resident producer keeps GENERAL layout, but a layout match
+            // does not remove the dependency from a preceding shader write.
+            const access_commands = try self.beginOneShot();
+            defer self.releaseOneShot(access_commands);
+            try self.transitionTrackedImage(access_commands, cached.image.handle, .{
+                .aspect_mask = vk.image_aspect_color_bit,
+                .layer_count = if (cached.descriptor.image_type == .color_2d_array) cached.subresource.depth_or_layers else 1,
+            }, image_state.storage_usage);
+            try self.submitOneShot(access_commands);
             const components = try sampledImageComponents(descriptor.dst_select);
             const view = try self.residentImageView(
                 cached.image.handle,
@@ -16024,7 +16077,7 @@ pub const Renderer = struct {
             }
 
             self.storage_image_sequence +%= 1;
-            cached.in_use = true;
+            cached.pin_count += 1;
             cached.last_used_sequence = self.storage_image_sequence;
             self.frame_profile.resident_storage_bytes +%= cached.staging_bytes;
             return .{
@@ -17296,7 +17349,7 @@ pub const Renderer = struct {
             .shader_module => |shader| self.device_functions.destroy_shader_module(self.device, shader, null),
             .storage_image_release => |index| {
                 if (index < self.storage_image_cache.items.len) {
-                    self.storage_image_cache.items[index].in_use = false;
+                    self.storage_image_cache.items[index].pin_count -= 1;
                 }
             },
         }
@@ -24844,6 +24897,31 @@ test "R8 UNORM storage images use the matching typed Vulkan format" {
     try std.testing.expectEqual(@as(u8, 1), storageImageBytesPerTexel(1));
     try std.testing.expect(storageImageFormatsCompatible(1, 128));
     try std.testing.expect(!storageImageFormatsCompatible(1, 5));
+}
+
+test "retiring an older storage image binding preserves the current pass pin" {
+    var renderer: Renderer = undefined;
+    renderer.allocator = std.testing.allocator;
+    renderer.storage_image_cache = .empty;
+    defer renderer.storage_image_cache.deinit(std.testing.allocator);
+    renderer.pending_command_buffers = .empty;
+    renderer.recording_command_buffer = null;
+    renderer.submitted_tick = 1;
+    renderer.completed_tick = 0;
+    renderer.deferred_vulkan_objects = .empty;
+    defer renderer.deferred_vulkan_objects.deinit(std.testing.allocator);
+    var cached: CachedStorageImage = undefined;
+    cached.valid = true;
+    cached.pin_count = 2; // an earlier submission and a newly prepared pass
+    try renderer.storage_image_cache.append(std.testing.allocator, cached);
+
+    renderer.releaseStorageImage(0);
+    try std.testing.expectEqual(@as(usize, 2), renderer.storage_image_cache.items[0].pin_count);
+    renderer.completed_tick = 1;
+    renderer.destroyDeferredVulkanObjects();
+    try std.testing.expectEqual(@as(usize, 1), renderer.storage_image_cache.items[0].pin_count);
+    renderer.releaseStorageImage(0);
+    try std.testing.expectEqual(@as(usize, 0), renderer.storage_image_cache.items[0].pin_count);
 }
 
 test "a rasterized colour target aliases a later storage image of the same allocation" {

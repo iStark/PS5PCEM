@@ -474,6 +474,125 @@ fn runCompressedArrayCopyKernel(allocator: std.mem.Allocator, renderer: *vulkan.
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, guest.bytes[destination..][0..4]);
 }
 
+fn runFragmentStorageProbe(
+    allocator: std.mem.Allocator,
+    renderer: *vulkan.Renderer,
+    guest: *GuestMemory,
+    backend: gpu.DcbBackend,
+    state: *gpu.State,
+    color_address: usize,
+) !void {
+    const program = 0xd000;
+    const destination = 0xe000;
+    const extent = 64;
+    var descriptor = sampledImageDescriptorWords(destination, extent, extent);
+    descriptor[1] = (descriptor[1] & ~(@as(u32, 0x1ff) << 20)) | (23 << 20); // RG16_UNORM
+    descriptor[3] = (descriptor[3] & 0x0fff_ffff) | (13 << 28);
+    descriptor[4] = 1; // two array layers
+    const layout = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&descriptor));
+    const view = try layout.subresource(0, 0, 2);
+    const layer_bytes: usize = @intCast(view.source_layer_bytes);
+    for (0..layer_bytes * 2 / 4) |index| guest.word(destination + index * 4, 0x2222_1111);
+    const code = [_]u32{
+        0xc801_0000, 0xc805_0100, // interpolated UV fallback = FragCoord / extent
+        vop1(1, 5, 255),  0x4280_0000, // 64.0
+        vop2(8, 2, 0, 5), vop2(8, 3, 1, 5),
+        vop1(7, 2, 258), vop1(7, 3, 259), // integer texel coordinates
+        vop1(1, 4, 129), // array slice 1
+        vop1(1, 10, 8), vop1(1, 11, 9), // RG from live USER_DATA
+        vop1(1, 6, 255), 0x3f00_0000, // left half: u < 0.5
+        0xbe94_047e, // s_mov_b64 s20, exec
+        0x7c22_0d00, // v_cmpx_lt_f32 v0, v6
+        0xf020_0328, 0x0000_0a02, // image_store v10:v11, v2:v4, s0 dmask:rg array
+        0xbefe_0414, // restore EXEC before the color export
+        vop1(1, 12, 128),
+        vop1(1, 13, 128),
+        vop1(1, 14, 242),
+        vop1(1, 15, 242),
+        0xf800_080f, 0x0f0e_0d0c, // blue MRT0 on both halves
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, index| guest.word(program + index * 4, word);
+    const pixel = gpu.resources.ShaderStage.pixel;
+    try state.writeRegister(.shader, pixel.programRegisterBase(), program >> 8);
+    try state.writeRegister(.shader, pixel.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, pixel.userDataBase() - 1, 10 << 1);
+    for (descriptor, 0..) |word, index| try state.writeRegister(.shader, pixel.userDataBase() + @as(u32, @intCast(index)), word);
+    try state.writeRegister(.shader, pixel.userDataBase() + 9, 0x3f40_0000); // G = .75
+    const stream = [_]u32{ command(gpu.pm4.draw_index_auto, 2), 3, 0 };
+    var executor = gpu.DcbExecutor{ .state = state, .backend = backend, .allocator = allocator };
+    // Queue two writers, then consume the resident result as both a storage
+    // image and a sampled image, without first materializing it on the CPU.
+    for ([_]bool{ false, true }) |sampled| {
+        const final_red: u32 = if (sampled) 0x3e80_0000 else 0x3f40_0000;
+        for ([_]u32{ 0x3f00_0000, final_red }) |red| {
+            try state.writeRegister(.shader, pixel.userDataBase() + 8, red);
+            _ = try executor.execute(&stream);
+            if (renderer.last_draw_error != null) return error.FragmentStorageDrawFailed;
+        }
+        const consumer_program: u32 = if (sampled) 0xca00 else 0xc000;
+        const buffer = 0x18000;
+        const load_code = [_]u32{
+            vop1(1, 0, 152), vop1(1, 1, 160), vop1(1, 2, 129), // (24,32,1)
+            0xf000_0328, 0x0000_0400, // array image_load RG -> v4:v5
+            0xe074_0000, 0x8002_0400, // buffer_store_dwordx2 -> V#s8
+            0xbf81_0000,
+        };
+        const sample_code = [_]u32{
+            vop1(1, 0, 255), @bitCast(@as(f32, 24.5 / 64.0)),
+            vop1(1, 1, 255), @bitCast(@as(f32, 32.5 / 64.0)),
+            vop1(1, 2, 242), // array slice 1.0
+            0xf09c_0328, 0x0040_0400, // array image_sample_lz RG, S#s8
+            0xe074_0000, 0x8003_0400, // buffer_store_dwordx2 -> V#s12
+            0xbf81_0000,
+        };
+        const consumer_code: []const u32 = if (sampled) &sample_code else &load_code;
+        for (consumer_code, 0..) |word, index| guest.word(consumer_program + index * 4, word);
+        var consumer_state = gpu.State{};
+        const compute = gpu.resources.ShaderStage.compute;
+        try consumer_state.writeRegister(.shader, compute.programRegisterBase(), consumer_program >> 8);
+        try consumer_state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+        try consumer_state.writeRegister(.shader, 0x213, (if (sampled) @as(u32, 16) else 12) << 1);
+        for ([_]u32{ 0x207, 0x208, 0x209 }) |reg| try consumer_state.writeRegister(.shader, reg, 1);
+        for (descriptor, 0..) |word, index| try consumer_state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+        for (0..4) |index| try consumer_state.writeRegister(.shader, compute.userDataBase() + 8 + @as(u32, @intCast(index)), 0);
+        const buffer_sgpr: u32 = if (sampled) 12 else 8;
+        for ([_]u32{ buffer, 4 << 16, 2, 0 }, 0..) |word, index| {
+            try consumer_state.writeRegister(.shader, compute.userDataBase() + buffer_sgpr + @as(u32, @intCast(index)), word);
+        }
+        guest.word(buffer, 0);
+        guest.word(buffer + 4, 0);
+        var consumer = gpu.DcbExecutor{ .state = &consumer_state, .backend = backend, .allocator = allocator };
+        const translated_before = renderer.translated_dispatches;
+        _ = try consumer.execute(&.{ command(gpu.pm4.dispatch_direct, 4), 1, 1, 1, 0x41 });
+        if (renderer.translated_dispatches != translated_before + 1) {
+            std.debug.print("fragment consumer did not execute on GPU: sampled={any} error={any}\n", .{ sampled, renderer.last_dispatch_error });
+            return error.FragmentStorageConsumerSkipped;
+        }
+        var readback: [8]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(buffer, &readback);
+        const red: f32 = @bitCast(std.mem.readInt(u32, readback[0..4], .little));
+        const green: f32 = @bitCast(std.mem.readInt(u32, readback[4..8], .little));
+        try std.testing.expectApproxEqAbs(@as(f32, @bitCast(final_red)), red, 0.0001);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.75), green, 0.0001);
+    }
+    try renderer.flushPendingGuestWrites();
+    for ([_]usize{ 24, 40 }) |x| {
+        const offset = (32 * extent + x) * 4;
+        try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, guest.bytes[color_address + offset ..][0..4]);
+        try std.testing.expectEqual(@as(u32, 0x2222_1111), std.mem.readInt(u32, guest.bytes[destination + offset ..][0..4], .little));
+        const written = guest.bytes[destination + layer_bytes + offset ..][0..4];
+        if (x < 32) {
+            for ([_]usize{ 0, 2 }) |component| {
+                const value = std.mem.readInt(u16, written[component..][0..2], .little);
+                const expected: u16 = if (component == 0) 16384 else 49151;
+                try std.testing.expect(value >= expected - 1 and value <= expected + 1);
+            }
+        } else try std.testing.expectEqual(@as(u32, 0x2222_1111), std.mem.readInt(u32, written, .little));
+    }
+    std.debug.print("fragment storage passed: RG array slice, per-pixel EXEC, color export, queued reuse, storage/sample consumers and writeback\n", .{});
+}
+
 fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
     defer renderer.deinit();
@@ -1127,6 +1246,7 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidPresentedFrame;
     }
 
+    try runFragmentStorageProbe(allocator, &renderer, &guest, backend, &state, color_target_address);
     try runIndexedCopyKernel(allocator, &renderer, &guest, backend);
     try runStorageImageCopyKernel(allocator, &renderer, &guest, backend);
 
