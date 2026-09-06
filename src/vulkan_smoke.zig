@@ -1429,10 +1429,12 @@ fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
             if (guarded) 0xd761_0012 else 0xbf80_0000,
             if (guarded) 20 | (132 << 9) else 0xbf80_0000, // spill index into v18 lane 4
             if (guarded) 0xb614_0005 else 0xbf80_0000, // s_cmp_ge_u32 s20, 5
-            if (guarded) 0xbf85_0010 else 0xbf80_0000, // reject large indices before multiplication
+            if (guarded) 0xbf85_0012 else 0xbf80_0000, // reject large indices before multiplication
             if (guarded) 0xd760_0014 else 0xbf80_0000,
             if (guarded) (256 + 18) | (132 << 9) else 0xbf80_0000,
             0x9300_ff14 | (offset_register << 16), stride, // s_mul_i32 SOFFSET, s20, stride
+            if (case_index == 5) 0x816a_ff6b else 0xbf80_0000, // low-half address arithmetic preserves the high-half table offset
+            if (case_index == 5) 0x118 else 0xbf80_0000,
             0xf42c_0004, offset_register << 25, // s_buffer_load_dwordx8 s0, V#s8, SOFFSET
             vop1(1, 1, 24), // preserve workgroup index for output
             vop1(1, 2, 255),

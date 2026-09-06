@@ -550,6 +550,13 @@ with readable decoy memory fails before this bound and resolves one shared
 texture/sampler afterwards. The GPU nested probe also excludes a valid decoy
 pointer with a different sampler; existing wrapping and guarded tables pass.
 
+The following material refusal at `0x80002e6d00:0x1e98` uses a VCC_HI
+table offset while separately computing another address in VCC_LO. Candidate
+analysis now distinguishes those 32-bit scalar writes from vector condition
+masks and 64-bit scalar writes. The captured table resolves 51 image candidates
+at record offset 128; the high-half GPU probe preserves selection after an
+independent low-half add.
+
 ## Baseline before the timestamp fix
 
 A five-minute run continues rendering after the movie, at approximately

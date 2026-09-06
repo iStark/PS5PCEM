@@ -23067,7 +23067,13 @@ fn resolveBufferTablePlan(
         var writes_offset = false;
         for ([_]rdna2.Operand{ inst.dst, inst.dst2 }) |destination| {
             const first = gpu.scalar_provenance.scalarRegisterIndex(destination) orelse continue;
-            const count = @max(inst.data_words, if (destination.kind == .vcc_lo or std.mem.endsWith(u8, @tagName(inst.opcode), "64")) @as(u8, 2) else 1);
+            const vector_mask = destination.kind == .vcc_lo and switch (inst.family) {
+                .vop1, .vop2, .vop3, .vop3p, .vopc => true,
+                else => false,
+            };
+            // Scalar 32-bit ALU writes to VCC_LO leave VCC_HI intact. Vector
+            // condition masks and 64-bit scalar destinations write the pair.
+            const count = @max(inst.data_words, if (vector_mask or std.mem.endsWith(u8, @tagName(inst.opcode), "64")) @as(u8, 2) else 1);
             writes_offset = writes_offset or (offset_register >= first and offset_register - first < count);
         }
         if (!writes_offset) continue;
