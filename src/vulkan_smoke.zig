@@ -1457,6 +1457,71 @@ fn runNestedImageCase(allocator: std.mem.Allocator, bounded: bool) !void {
     try std.testing.expectEqual(@as(u64, 1), renderer.pipeline_cache_hits);
 }
 
+fn runTypedIndexProbe(allocator: std.mem.Allocator) !void {
+    for ([_]u32{ 5, 6, 11, 12 }) |format| {
+        var renderer = try vulkan.Renderer.init(allocator, .{ .trace_resource_failures = true });
+        defer renderer.deinit();
+        var guest = GuestMemory{};
+        _ = renderer.dcbBackend(guest.interface());
+        const code = [_]u32{
+            vop1(1, 0, 28), vop1(1, 1, 128),
+            sop1(4, 106, 126), // preserve EXEC before fetching the index
+            0xf000_0108,      0x0005_0f00, // image_load v15, (v0,v1), T#s20
+            sop1(4, 28, 106), sop1(0x14, 30, 28),
+            0xd760_001f,     271 | (30 << 9), // read the first saved lane's typed index
+            0x936b_ff1f,     440,
+            0xf42c_0004,     (107 << 25) | 32,
+            vop1(1, 2, 255), 0x3e80_0000,
+            vop1(1, 3, 255), 0x3e80_0000,
+            0xf09c_010a,     0x0080_0402,
+            3,               0xe070_2000,
+            0x8003_0400,     0xbf81_0000,
+        };
+        for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+        for (0..2) |index| {
+            const address: u32 = @intCast(0x8000 + index * 0x1000);
+            const descriptor = sampledImageDescriptorWords(address, 1, 1);
+            for (descriptor, 0..) |word, component| guest.word(0x11000 + index * 440 + 32 + component * 4, word);
+            guest.word(address, if (index == 0) 0xff00_00ff else 0xff00_0040);
+        }
+        // Ordinary float fields can decode as a syntactically valid T#. They
+        // belong to another field, outside the typed index's possible loads.
+        const decoy = [_]u32{ 0xc973c000, 0xc95ac000, 0xc82f0000, 0xc7960000, 0x3a7f8040, 0x3a7f8040, 0x3f7f8040, 0x80000000 };
+        for (decoy, 0..) |word, index| guest.word(0x11000 + 96 + index * 4, word);
+        var indices = sampledImageDescriptorWords(0xa000, 6, 1);
+        indices[1] = (indices[1] & ~@as(u32, 0x1ff0_0000)) | (format << 20);
+        const signed = format == 6 or format == 12;
+        const bits: u5 = if (format <= 6) 8 else 16;
+        const sign_bit = @as(u32, 1) << (bits - 1);
+        const mask = (@as(u32, 1) << bits) - 1;
+        const values = [_]u32{ 0, 1, 2, if (signed) sign_bit - 1 else mask, if (signed) sign_bit else mask - 1, mask };
+        // Linear single-channel rows begin at the allocation base.
+        for (values, 0..) |value, index| {
+            const byte = 0xa000 + index * (bits / 8);
+            if (bits == 8) guest.bytes[byte] = @intCast(value) else std.mem.writeInt(u16, guest.bytes[byte..][0..2], @intCast(value), .little);
+        }
+        var state = gpu.State{};
+        const compute = gpu.resources.ShaderStage.compute;
+        try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+        try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+        try state.writeRegister(.shader, 0x213, (28 << 1) | (1 << 7));
+        var userdata: [28]u32 = @splat(0);
+        @memcpy(userdata[8..12], &[_]u32{ 0x11000, 440 << 16, 31, 0 });
+        @memcpy(userdata[12..16], &[_]u32{ 0x10000, 4 << 16, 6, 0 });
+        @memcpy(userdata[20..28], &indices);
+        for (userdata, 0..) |word, index| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 6, 1, 1 });
+        var output: [24]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x10000, &output);
+        for ([_]f32{ 1, 64.0 / 255.0, 0, 0, 0, 0 }, 0..) |expected, index| {
+            const actual: f32 = @bitCast(std.mem.readInt(u32, output[index * 4 ..][0..4], .little));
+            try std.testing.expectApproxEqAbs(expected, actual, 0.00001);
+        }
+        try std.testing.expectEqual(@as(u64, 2), renderer.texture_cache_misses);
+    }
+    std.debug.print("typed index images passed: UINT/SINT byte and short indices, negative bounds and decoy fields\n", .{});
+}
+
 fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
     for (0..6) |case_index| {
         var renderer = try vulkan.Renderer.init(allocator, .{ .trace_resource_failures = true });
@@ -1563,6 +1628,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--indirect-images")) {
         try runIndirectImageProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--typed-indices")) {
+        try runTypedIndexProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--scalar-pointers")) {

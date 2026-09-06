@@ -592,6 +592,19 @@ tested. Host panics additionally retain their failing return address when a
 guest-created thread has no unwindable host stack. A complete menu render is
 still unconfirmed.
 
+The 440-byte material table at `0x801f98cb00:0x1424` now uses the integer
+range of its upstream image fetch. The waterfall mask is saved through VCC
+before the fetch; analysis verifies that EXEC is unchanged up to that write
+and that subsequent iterations only remove lanes. R8/R16 UINT and SINT
+formats bound the selected index. Negative signed indices are excluded only
+when their wrapped byte addresses provably remain outside the table.
+Replaying the saved 31-record table with the R8_SINT source descriptor from
+the live scene reduces 274 candidates to nine distinct textures at field
+offset 32, stride 440. A GPU probe with unrelated float fields reproduces the
+format-149 refusal before the fix and passes all four integer formats after
+it, including negative and out-of-range indices. Existing nested and
+indirect texture probes remain valid under the SDK layer.
+
 ## Baseline before the timestamp fix
 
 A five-minute run continues rendering after the movie, at approximately

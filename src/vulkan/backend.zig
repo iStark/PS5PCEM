@@ -8271,7 +8271,7 @@ pub const Renderer = struct {
                 descriptor_slot,
             );
             const candidates = if (direct_image == null and self.sampled_image_nonuniform_indexing)
-                try resolveBufferImageCandidates(reader, analysis, &sampled_scalar, inst)
+                try resolveBufferImageCandidates(bindings, reader, analysis, &sampled_scalar, inst)
             else
                 null;
             if (direct_image == null and candidates == null) {
@@ -15244,7 +15244,7 @@ pub const Renderer = struct {
         target: GuestColorTarget,
     ) anyerror!bool {
         if (!self.sampled_image_nonuniform_indexing) return false;
-        const candidates = (try resolveBufferImageCandidates(reader, analysis, scalar, inst)) orelse return false;
+        const candidates = (try resolveBufferImageCandidates(bindings, reader, analysis, scalar, inst)) orelse return false;
         const sampler = candidates.sampler orelse (try resolveComputeSamplerDescriptor(bindings, reader, analysis, scalar, inst.src2.reg, inst.pc, sampler_slot)) orelse return false;
         for (candidates.words[0..candidates.count]) |words| {
             const descriptor = try gpu.resources.decodeImageDescriptor(&words);
@@ -23031,6 +23031,42 @@ const BufferTablePlan = struct {
     limit: u64,
 };
 
+const TypedIndexRange = struct { positive_limit: u32, negative_magnitude: u32 = 0 };
+
+fn typedImageIndexRange(
+    bindings: *const gpu.ShaderBindings,
+    reader: gpu.ShaderMemoryReader,
+    analysis: *const gpu.ShaderAnalysis,
+    scalar: *const gpu.ScalarEvaluation,
+    before: usize,
+    register: u32,
+) ?TypedIndexRange {
+    const instructions = analysis.program.instructions.items;
+    const definition = gpu.index_bounds.scalarLaneDefinition(instructions, &analysis.graph, before, register, 0) orelse return null;
+    const fetch = instructions[definition.instruction];
+    if ((fetch.opcode != .image_load and fetch.opcode != .image_load_mip) or
+        definition.component != 0 or fetch.data_mask != 1 or fetch.src1.kind != .sgpr or
+        fetch.raw_count < 2 or fetch.raw[1] & (1 << 31) != 0) return null;
+    var resolver = gpu.scalar_resources.Resolver{
+        .bindings = bindings,
+        .reader = reader,
+        .instructions = instructions,
+        .graph = &analysis.graph,
+        .snapshot = scalar,
+    };
+    var words: [8]u32 = undefined;
+    if (!(resolver.words(fetch.src1.reg, fetch.pc, &words) catch false)) return null;
+    const descriptor = gpu.resources.decodeImageDescriptor(&words) catch return null;
+    if (descriptor.dst_select[0] != 4) return null;
+    return switch (descriptor.unified_format) {
+        5 => .{ .positive_limit = 256 },
+        6 => .{ .positive_limit = 128, .negative_magnitude = 128 },
+        11 => .{ .positive_limit = 65536 },
+        12 => .{ .positive_limit = 32768, .negative_magnitude = 32768 },
+        else => null,
+    };
+}
+
 fn resolveBufferTablePlan(
     reader: gpu.ShaderMemoryReader,
     analysis: *const gpu.ShaderAnalysis,
@@ -23038,8 +23074,8 @@ fn resolveBufferTablePlan(
     wanted_sgpr: u32,
     wanted_words: u32,
     before_pc: u32,
+    bindings: ?*const gpu.ShaderBindings,
 ) anyerror!?BufferTablePlan {
-    _ = reader;
     const instructions = analysis.program.instructions.items;
     var index = instructions.len;
     var producer: ?gpu.ShaderInstruction = null;
@@ -23061,6 +23097,7 @@ fn resolveBufferTablePlan(
     for (scalar.registers[load.src0.reg..][0..4]) |word| if (word.producer_pc >= load.pc) return null;
     var stride: ?u32 = null;
     var index_bound: ?u32 = null;
+    var index_register: ?u32 = null;
     const offset_register = gpu.scalar_provenance.scalarRegisterIndex(load.src1).?;
     while (index != 0) {
         index -= 1;
@@ -23084,7 +23121,10 @@ fn resolveBufferTablePlan(
             .integer_inline_constant, .literal_constant => inst.src1.value,
             else => return null,
         };
-        if (inst.src0.kind == .sgpr) index_bound = gpu.index_bounds.scalarUpperBound(instructions, &analysis.graph, index, inst.src0.reg);
+        if (inst.src0.kind == .sgpr) {
+            index_register = inst.src0.reg;
+            index_bound = gpu.index_bounds.scalarUpperBound(instructions, &analysis.graph, index, inst.src0.reg);
+        }
         break;
     }
     const multiplier = stride orelse return null;
@@ -23093,6 +23133,18 @@ fn resolveBufferTablePlan(
     // other in-bounds offsets reachable after wrap. Its residue class has
     // step gcd(stride, 2^32), a power of two.
     const displacement = @as(u64, @intCast(load.memory_offset)) + (wanted_sgpr - load.dst.reg) * 4;
+    if (index_bound == null and index_register != null) if (bindings) |inputs| {
+        if (typedImageIndexRange(inputs, reader, analysis, scalar, index, index_register.?)) |range| {
+            // Signed texels also produce negative indices. They may be
+            // excluded only when every wrapped negative product remains
+            // above this table, including the field displacement.
+            const negative_bytes = @as(u64, range.negative_magnitude) * multiplier;
+            const negative_outside = range.negative_magnitude == 0 or
+                (displacement < multiplier and negative_bytes < (@as(u64, 1) << 32) and
+                    (@as(u64, 1) << 32) - negative_bytes + displacement >= buffer.size_bytes);
+            if (negative_outside) index_bound = range.positive_limit;
+        }
+    };
     const bounded = if (index_bound) |bound| displacement + @as(u64, bound) * multiplier <= std.math.maxInt(u32) else false;
     const step: u64 = if (bounded) multiplier else @as(u64, 1) << @intCast(@ctz(multiplier));
     const residue = if (bounded) displacement else displacement % step;
@@ -23102,12 +23154,13 @@ fn resolveBufferTablePlan(
 }
 
 fn resolveBufferImageCandidates(
+    bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
     analysis: *const gpu.ShaderAnalysis,
     scalar: *const gpu.ScalarEvaluation,
     sample: gpu.ShaderInstruction,
 ) anyerror!?BufferImageCandidates {
-    const plan = (try resolveBufferTablePlan(reader, analysis, scalar, sample.src1.reg, 8, sample.pc)) orelse
+    const plan = (try resolveBufferTablePlan(reader, analysis, scalar, sample.src1.reg, 8, sample.pc, bindings)) orelse
         return resolvePointerImageCandidates(reader, analysis, scalar, sample);
     var result = BufferImageCandidates{};
     var offset = plan.first;
@@ -23146,7 +23199,7 @@ fn resolveBufferPointerCandidates(
     register: u32,
     before_pc: u32,
 ) anyerror!?PointerCandidates {
-    const plan = (try resolveBufferTablePlan(reader, analysis, scalar, register, 2, before_pc)) orelse return null;
+    const plan = (try resolveBufferTablePlan(reader, analysis, scalar, register, 2, before_pc, null)) orelse return null;
     var result = PointerCandidates{};
     var offset = plan.first;
     while (offset + 8 <= plan.buffer.size_bytes and offset < plan.limit) : (offset += plan.step) {

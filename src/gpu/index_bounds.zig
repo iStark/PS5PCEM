@@ -9,7 +9,7 @@ const Graph = rdna2.control_flow.Graph;
 const maximum_blocks = 1024;
 
 const Location = struct { register: u32, lane: ?u32 = null };
-const Definition = struct { instruction: usize, component: u32 };
+pub const Definition = struct { instruction: usize, component: u32 };
 
 fn immediate(op: rdna2.Operand) ?u32 {
     return switch (op.kind) {
@@ -37,8 +37,13 @@ fn writes(inst: Instruction, location: Location) bool {
     // pairs are deliberately overestimated when their exact width is absent.
     const width = @max(inst.data_words, if (inst.family == .ds) @as(u8, 4) else if (std.mem.endsWith(u8, @tagName(inst.opcode), "64")) @as(u8, 2) else 1);
     for ([_]rdna2.Operand{ inst.dst, inst.dst2 }) |dst| {
+        const vector_mask = dst.kind == .vcc_lo and switch (inst.family) {
+            .vop1, .vop2, .vop3, .vop3p, .vopc => true,
+            else => false,
+        };
+        const destination_width = if (vector_mask) @max(width, 2) else width;
         const register: ?usize = if (kind == .sgpr) @import("scalar_provenance.zig").scalarRegisterIndex(dst) else if (dst.kind == kind) @as(usize, dst.reg) else null;
-        if (register) |first| if (location.register >= first and location.register - first < width) return true;
+        if (register) |first| if (location.register >= first and location.register - first < destination_width) return true;
     }
     return false;
 }
@@ -128,42 +133,51 @@ fn maskIsSubsetOfVectorWrite(instructions: []const Instruction, graph: *const Gr
             proof.visited[proof.count] = index;
             proof.count += 1;
             const inst = instructions[index];
-            if (inst.dst.kind != .sgpr or inst.dst.reg != register) return false;
+            if (@import("scalar_provenance.zig").scalarRegisterIndex(inst.dst) != register) return false;
             if (inst.opcode == .s_mov_b64 and inst.src0.kind == .exec_lo) {
-                if (index <= vector_write or blockAt(graph, index) != blockAt(graph, vector_write)) return false;
-                for (instructions[vector_write + 1 .. index]) |between| {
+                if (index == vector_write or blockAt(graph, index) != blockAt(graph, vector_write)) return false;
+                for (instructions[@min(vector_write, index) + 1 .. @max(vector_write, index)]) |between| {
                     if (between.dst.kind == .exec_lo or between.dst.kind == .exec_hi or
                         between.dst2.kind == .exec_lo or between.dst2.kind == .exec_hi or
                         std.mem.indexOf(u8, @tagName(between.opcode), "exec") != null) return false;
                 }
                 proof.has_origin = true;
-            } else if ((inst.opcode == .s_mov_b64 or inst.opcode == .s_andn2_b64 or inst.opcode == .s_and_b64) and inst.src0.kind == .sgpr) {
-                if (!maskIsSubsetOfVectorWrite(instructions, graph, index, inst.src0.reg, vector_write, proof)) return false;
+            } else if (inst.opcode == .s_mov_b64 or inst.opcode == .s_andn2_b64 or inst.opcode == .s_and_b64) {
+                const source = @import("scalar_provenance.zig").scalarRegisterIndex(inst.src0) orelse return false;
+                if (!maskIsSubsetOfVectorWrite(instructions, graph, index, @intCast(source), vector_write, proof)) return false;
             } else return false;
         }
     }
     return true;
 }
 
-fn scalarBitUpperBound(instructions: []const Instruction, graph: *const Graph, before: usize, register: u32, depth: u32) ?u32 {
+/// The vector definition shared by every lane a waterfall can select.
+pub fn scalarLaneDefinition(instructions: []const Instruction, graph: *const Graph, before: usize, register: u32, depth: u32) ?Definition {
     if (depth == 16) return null;
     const index = reachingDefinition(instructions, graph, before, .{ .register = register }) orelse return null;
     const inst = instructions[index];
-    if (inst.opcode == .s_mov_b32 and inst.src0.kind == .sgpr) return scalarBitUpperBound(instructions, graph, index, inst.src0.reg, depth + 1);
+    if (inst.opcode == .s_mov_b32 and inst.src0.kind == .sgpr) return scalarLaneDefinition(instructions, graph, index, inst.src0.reg, depth + 1);
     if (inst.opcode != .v_readlane_b32 or inst.src0.kind != .vgpr) return null;
     const lane_register = @import("scalar_provenance.zig").scalarRegisterIndex(inst.src1) orelse return null;
     const lane_index = reachingDefinition(instructions, graph, index, .{ .register = @intCast(lane_register) }) orelse return null;
     const lane = instructions[lane_index];
-    if (lane.opcode != .s_ff1_i32_b64 or lane.src0.kind != .sgpr) return null;
+    if (lane.opcode != .s_ff1_i32_b64) return null;
+    const mask_register = @import("scalar_provenance.zig").scalarRegisterIndex(lane.src0) orelse return null;
     // Check all writes to this VGPR, since the lane is chosen dynamically.
     const vector_index = reachingDefinition(instructions, graph, index, .{ .register = inst.src0.reg, .lane = std.math.maxInt(u32) }) orelse return null;
     const vector = instructions[vector_index];
-    if (vector.dst.kind != .vgpr or vector.dst.reg != inst.src0.reg or vector.opcode != .v_lshrrev_b32 or
-        vector.dst.sdwa_sel != 6 or vector.src1.sdwa_sel != 6 or vector.src1.dpp) return null;
+    if (vector.dst.kind != .vgpr or vector.dst.reg > inst.src0.reg or vector.dst.sdwa_sel != 6) return null;
+    var proof = MaskProof{};
+    if (!maskIsSubsetOfVectorWrite(instructions, graph, lane_index, @intCast(mask_register), vector_index, &proof) or !proof.has_origin) return null;
+    return .{ .instruction = vector_index, .component = inst.src0.reg - vector.dst.reg };
+}
+
+fn scalarBitUpperBound(instructions: []const Instruction, graph: *const Graph, before: usize, register: u32, depth: u32) ?u32 {
+    const definition = scalarLaneDefinition(instructions, graph, before, register, depth) orelse return null;
+    const vector = instructions[definition.instruction];
+    if (definition.component != 0 or vector.opcode != .v_lshrrev_b32 or vector.src1.sdwa_sel != 6 or vector.src1.dpp) return null;
     const shift = (immediate(vector.src0) orelse return null) & 31;
     if (shift == 0) return null;
-    var proof = MaskProof{};
-    if (!maskIsSubsetOfVectorWrite(instructions, graph, lane_index, lane.src0.reg, vector_index, &proof) or !proof.has_origin) return null;
     return @as(u32, 1) << @intCast(32 - shift);
 }
 
@@ -257,6 +271,39 @@ test "waterfall lane indices retain the vector shift bound" {
     instructions[1] = .{ .pc = 4, .opcode = .s_nop };
     instructions[6] = .{ .pc = 24, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 3 }, .src0 = s70 };
     try std.testing.expectEqual(@as(?u32, null), scalarUpperBound(&instructions, &graph, 5, 70));
+}
+
+test "waterfall image lanes preserve a mask saved through VCC before the fetch" {
+    const exec = rdna2.Operand{ .kind = .exec_lo };
+    const vcc = rdna2.Operand{ .kind = .vcc_lo };
+    const s8 = rdna2.Operand{ .kind = .sgpr, .reg = 8 };
+    var instructions = [_]Instruction{
+        .{ .pc = 0, .opcode = .s_mov_b64, .dst = vcc, .src0 = exec },
+        .{ .pc = 4, .opcode = .s_nop },
+        .{ .pc = 8, .opcode = .image_load, .dst = .{ .kind = .vgpr, .reg = 15 } },
+        .{ .pc = 12, .opcode = .s_nop },
+        .{ .pc = 16, .opcode = .s_mov_b64, .dst = exec, .src0 = vcc },
+        .{ .pc = 20, .opcode = .s_mov_b64, .dst = s8, .src0 = vcc },
+        .{ .pc = 24, .opcode = .s_ff1_i32_b64, .dst = vcc, .src0 = s8 },
+        .{ .pc = 28, .opcode = .v_readlane_b32, .dst = .{ .kind = .sgpr, .reg = 26 }, .src0 = .{ .kind = .vgpr, .reg = 15 }, .src1 = vcc },
+        .{ .pc = 32, .opcode = .s_mul_i32 },
+        .{ .pc = 36, .opcode = .s_andn2_b64, .dst = s8, .src0 = s8, .src1 = .{ .kind = .sgpr, .reg = 24 } },
+        .{ .pc = 40, .opcode = .s_cbranch_scc1, .branch_target = 24 },
+        .{ .pc = 44, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?Definition, .{ .instruction = 2, .component = 0 }), scalarLaneDefinition(&instructions, &graph, 8, 26, 0));
+    instructions[1] = .{ .pc = 4, .opcode = .s_mov_b64, .dst = exec, .src0 = s8 };
+    try std.testing.expect(scalarLaneDefinition(&instructions, &graph, 8, 26, 0) == null);
+    instructions[1] = .{ .pc = 4, .opcode = .s_nop };
+    instructions[9].opcode = .s_or_b64;
+    try std.testing.expect(scalarLaneDefinition(&instructions, &graph, 8, 26, 0) == null);
+    instructions[9].opcode = .s_andn2_b64;
+    instructions[3] = .{ .pc = 12, .opcode = .s_mov_b32, .dst = .{ .kind = .vcc_hi }, .src0 = s8 };
+    try std.testing.expect(scalarLaneDefinition(&instructions, &graph, 8, 26, 0) == null);
+    instructions[3] = .{ .pc = 12, .opcode = .v_cmp_eq_u32, .family = .vopc, .dst = vcc };
+    try std.testing.expect(scalarLaneDefinition(&instructions, &graph, 8, 26, 0) == null);
 }
 
 test "unsigned index bound follows a scalar spill through a guarded loop" {
