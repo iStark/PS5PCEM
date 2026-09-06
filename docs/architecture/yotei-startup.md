@@ -463,6 +463,9 @@ candidate descriptor offsets. Ambiguous definitions, bypass paths and
 unproven bounds retain the full 32-bit wrapping interpretation. The sampled
 descriptor bank grows independently of the storage-buffer bank, up to 512
 textures within the Vulkan device limits, with 4,096 instruction mappings.
+These per-pass tables are heap allocated: keeping the expanded tables on the
+HLE stack overflows it during the first graphics draw in the real game, even
+though standalone GPU probes have enough stack space.
 
 BC4 formats 175/176 previously used 16-byte blocks instead of eight-byte
 blocks. Both tiling and upload sizing now use eight bytes. The captured

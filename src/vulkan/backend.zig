@@ -2196,13 +2196,19 @@ const GraphicsResources = struct {
     mappings: [maximum_compute_sampled_mappings]gpu.ShaderSpirvSampledImageBinding = undefined,
     mapping_count: usize = 0,
 
+    fn init(allocator: std.mem.Allocator) !*GraphicsResources {
+        const result = try allocator.create(GraphicsResources);
+        result.* = .{};
+        return result;
+    }
+
     fn deinit(self: *GraphicsResources, renderer: *Renderer) void {
         for (self.images[0..self.image_count]) |image| {
             if (image.owns_view) renderer.destroyImageView(image.view);
             if (image.owns_sampler) renderer.destroySampler(image.sampler);
             if (image.storage_cache_index) |cache_index| renderer.releaseStorageImage(cache_index);
         }
-        self.* = undefined;
+        renderer.allocator.destroy(self);
     }
 };
 
@@ -2372,6 +2378,12 @@ const ComputeResources = struct {
     sampled_image_mappings: [maximum_compute_sampled_mappings]gpu.ShaderSpirvSampledImageBinding = undefined,
     sampled_image_mapping_count: usize = 0,
 
+    fn init(allocator: std.mem.Allocator) !*ComputeResources {
+        const result = try allocator.create(ComputeResources);
+        result.* = .{};
+        return result;
+    }
+
     fn descriptorForRange(self: *const ComputeResources, address: u64, size: usize) ?u32 {
         for (self.occupied, 0..) |used, index| {
             if (used and self.addresses[index] == address and self.sizes[index] == size) return @intCast(index);
@@ -2442,6 +2454,7 @@ const ComputeResources = struct {
         }
         self.sampled_image_count = 0;
         self.sampled_image_mapping_count = 0;
+        renderer.allocator.destroy(self);
     }
 };
 
@@ -5111,7 +5124,7 @@ pub const Renderer = struct {
             &bindings,
             analysis.program.instructions.items,
         );
-        var resources = blk: {
+        const resources = blk: {
             const resource_started = hostTimestampNs();
             const prepared = self.prepareComputeResources(
                 &bindings,
@@ -5157,7 +5170,7 @@ pub const Renderer = struct {
         };
         defer resources.deinit(self);
         if (isYoteiGdsCullingDispatch(uses_gds, group_count, local_size, analysis.program.instructions.items.len)) {
-            if (try self.emulateYoteiGdsCulling(memory, &resources, group_count)) |report| {
+            if (try self.emulateYoteiGdsCulling(memory, resources, group_count)) |report| {
                 return report;
             }
         }
@@ -5608,7 +5621,7 @@ pub const Renderer = struct {
             );
         }
         const submit_started = hostTimestampNs();
-        try self.prepareStorageImageAccess(&resources);
+        try self.prepareStorageImageAccess(resources);
         const report = try self.dispatchSpirv(module.words, group_count);
         const submit_elapsed_ns = elapsedHostNanoseconds(submit_started);
         self.frame_profile.compute_submit_ns +|= submit_elapsed_ns;
@@ -5658,7 +5671,7 @@ pub const Renderer = struct {
                 self.reported_yotei_gds_dispatches += 1;
             }
         }
-        try self.commitComputeWrites(memory, &resources);
+        try self.commitComputeWrites(memory, resources);
         if (trace_yotei_visibility) {
             for (resources.writable, 0..) |writable, slot| {
                 if (!writable or resources.sizes[slot] == 0) continue;
@@ -5671,7 +5684,7 @@ pub const Renderer = struct {
             }
             self.reported_yotei_visibility_dispatches += 1;
         }
-        try self.commitStorageImages(memory, &resources);
+        try self.commitStorageImages(memory, resources);
         return report;
     }
 
@@ -7635,8 +7648,8 @@ pub const Renderer = struct {
         scalar: *const gpu.ScalarEvaluation,
         specialized_scalar_prefix_end: u32,
         reserved_resources: ?*const ComputeResources,
-    ) anyerror!ComputeResources {
-        var result = ComputeResources{};
+    ) anyerror!*ComputeResources {
+        const result = try ComputeResources.init(self.allocator);
         errdefer result.deinit(self);
         result.specialized_scalar_prefix_end = specialized_scalar_prefix_end;
         if (reserved_resources) |reserved| {
@@ -12935,7 +12948,7 @@ pub const Renderer = struct {
             );
         }
         const resource_started = hostTimestampNs();
-        var graphics_resources = try self.prepareGraphicsResources(
+        const graphics_resources = try self.prepareGraphicsResources(
             &fragment_bindings,
             reader,
             fragment_analysis,
@@ -12945,7 +12958,7 @@ pub const Renderer = struct {
         const fragment_mapping_count = graphics_resources.mapping_count;
         const fragment_image_count = graphics_resources.image_count;
         try self.appendGraphicsResources(
-            &graphics_resources,
+            graphics_resources,
             &vertex_bindings,
             reader,
             vertex_analysis,
@@ -13058,7 +13071,7 @@ pub const Renderer = struct {
         // same storage-descriptor array as compute. Missing V#s are non-fatal:
         // translate without storage and skip MUBUF rather than abort the draw.
         const vertex_storage_started = hostTimestampNs();
-        var vertex_storage = self.prepareComputeResources(
+        const vertex_storage = self.prepareComputeResources(
             &vertex_bindings,
             reader,
             vertex_analysis,
@@ -13071,11 +13084,11 @@ pub const Renderer = struct {
                 "[vulkan dcb] vertex storage incomplete: {s}; translating without buffers\n",
                 .{@errorName(err)},
             );
-            break :blk ComputeResources{};
+            break :blk try ComputeResources.init(self.allocator);
         };
         self.frame_profile.graphics_storage_ns +|= elapsedHostNanoseconds(vertex_storage_started);
         defer vertex_storage.deinit(self);
-        validateVertexIndexMappings(reader, &vertex_storage, draw);
+        validateVertexIndexMappings(reader, vertex_storage, draw);
         // V# payloads are runtime descriptor data, not shader constants.  The
         // resource preparation above has already decoded them and assigned
         // stable host descriptor slots.  Leaving their guest addresses in the
@@ -13162,7 +13175,7 @@ pub const Renderer = struct {
         }
         const fullscreen_corner = vertex_stage == .export_shader and
             render_state.primitive_type == 4 and
-            isFullscreenCornerTriangle(reader, &vertex_storage, draw);
+            isFullscreenCornerTriangle(reader, vertex_storage, draw);
         if (self.traceCurrentGraphicsFrame() and fragment_image_count == 1 and
             graphics_resources.descriptors[0].unified_format == 50 and
             target.format.vulkan == vk.format_a2b10g10r10_unorm_pack32 and
@@ -13478,20 +13491,20 @@ pub const Renderer = struct {
         // the vertex resources already staged for this draw.
         var fragment_scalar_mut = fragment_scalar;
         const fragment_storage_started = hostTimestampNs();
-        var fragment_storage = self.prepareComputeResources(
+        const fragment_storage = self.prepareComputeResources(
             &fragment_bindings,
             reader,
             fragment_analysis,
             fragment_analysis.program.instructions.items,
             &fragment_scalar_mut,
             fragment_scalar_end,
-            &vertex_storage,
+            vertex_storage,
         ) catch |err| blk: {
             if (log_verbose_gpu) std.debug.print(
                 "[vulkan dcb] fragment storage incomplete: {s}; translating without buffers\n",
                 .{@errorName(err)},
             );
-            break :blk ComputeResources{};
+            break :blk try ComputeResources.init(self.allocator);
         };
         self.frame_profile.graphics_storage_ns +|= elapsedHostNanoseconds(fragment_storage_started);
         defer fragment_storage.deinit(self);
@@ -13865,7 +13878,7 @@ pub const Renderer = struct {
             module.words
         else
             fragment_module.words;
-        try self.prepareGraphicsStorageImages(&fragment_storage, if (depth_only) null else target, extra_colors);
+        try self.prepareGraphicsStorageImages(fragment_storage, if (depth_only) null else target, extra_colors);
         // Procedural draws deliberately have no V# mappings: fullscreen NGG
         // programs synthesize their rectangle from the system vertex index.
         // Attempt every guest VS unless the paired pixel shader explicitly
@@ -13895,7 +13908,7 @@ pub const Renderer = struct {
                     unity_ui_position.?,
                     unity_ui_record.?,
                     unity_ui_color.?,
-                    readUnityUiProjection(reader, &vertex_storage, unity_ui_matrix.?) orelse
+                    readUnityUiProjection(reader, vertex_storage, unity_ui_matrix.?) orelse
                         .{ 1.0 / 1920.0, -1.0 / 1080.0, -1.0, 1.0 },
                 )
             else if (centered_retro_framebuffer)
@@ -13998,7 +14011,7 @@ pub const Renderer = struct {
                     false,
                     draw,
                 );
-                try self.commitStorageImages(memory, &fragment_storage);
+                try self.commitStorageImages(memory, fragment_storage);
                 if (unity_ui_fallback) {
                     // The deferred HDR composite fallback presents its intact
                     // scene input because the guest composite shader is not
@@ -14141,7 +14154,7 @@ pub const Renderer = struct {
                 false,
                 .{ .vertex_count = 4, .instance_count = 1 },
             );
-            try self.commitStorageImages(memory, &fragment_storage);
+            try self.commitStorageImages(memory, fragment_storage);
             if (planar_video_pass) {
                 // The VideoOut allocation is a different VA alias. Remember
                 // the resident attachment that received the decoded frame;
@@ -14204,7 +14217,7 @@ pub const Renderer = struct {
             false,
             .{ .vertex_count = 3, .instance_count = 1 },
         );
-        try self.commitStorageImages(memory, &fragment_storage);
+        try self.commitStorageImages(memory, fragment_storage);
     }
 
     /// Convert the linear NV12 or I420 surfaces consumed by Unity directly into
@@ -14925,11 +14938,11 @@ pub const Renderer = struct {
         reader: gpu.ShaderMemoryReader,
         analysis: *const gpu.ShaderAnalysis,
         render_target_write: GuestColorTarget,
-    ) anyerror!GraphicsResources {
-        var result = GraphicsResources{};
+    ) anyerror!*GraphicsResources {
+        const result = try GraphicsResources.init(self.allocator);
         errdefer result.deinit(self);
         try self.appendGraphicsResources(
-            &result,
+            result,
             bindings,
             reader,
             analysis,
