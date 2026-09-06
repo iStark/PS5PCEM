@@ -156,7 +156,11 @@ fn maskIsSubsetOfVectorWrite(instructions: []const Instruction, graph: *const Gr
             proof.count += 1;
             const inst = instructions[index];
             if (@import("scalar_provenance.zig").scalarRegisterIndex(inst.dst) != register) return false;
-            if (inst.opcode == .s_mov_b64 and inst.src0.kind == .exec_lo) {
+            const copies_exec = inst.opcode == .s_mov_b64 and inst.src0.kind == .exec_lo;
+            // SAVEEXEC returns the mask from before narrowing EXEC. A snapshot
+            // taken after the fetch therefore includes exactly its valid lanes.
+            const saves_previous_exec = inst.opcode == .s_and_saveexec_b64 and index > vector_write;
+            if (copies_exec or saves_previous_exec) {
                 if (index == vector_write or blockAt(graph, index) != blockAt(graph, vector_write)) return false;
                 for (instructions[@min(vector_write, index) + 1 .. @max(vector_write, index)]) |between| {
                     if (between.dst.kind == .exec_lo or between.dst.kind == .exec_hi or
@@ -325,6 +329,17 @@ test "waterfall image lanes preserve a mask saved through VCC before the fetch" 
     instructions[3] = .{ .pc = 12, .opcode = .s_mov_b32, .dst = .{ .kind = .vcc_hi }, .src0 = s8 };
     try std.testing.expect(scalarLaneDefinition(&instructions, &graph, 8, 26, 0) == null);
     instructions[3] = .{ .pc = 12, .opcode = .v_cmp_eq_u32, .family = .vopc, .dst = vcc };
+    try std.testing.expect(scalarLaneDefinition(&instructions, &graph, 8, 26, 0) == null);
+    // Terrain masks also save the fetch's active lanes while entering a
+    // conditional branch, then restore that saved mask for their waterfall.
+    instructions[0] = .{ .pc = 0, .opcode = .s_nop };
+    instructions[3] = .{ .pc = 12, .opcode = .s_and_saveexec_b64, .dst = vcc, .src0 = s8 };
+    try std.testing.expectEqual(@as(?Definition, .{ .instruction = 2, .component = 0 }), scalarLaneDefinition(&instructions, &graph, 8, 26, 0));
+    // Saving before a narrowing fetch does not prove that all saved lanes
+    // received its value.
+    instructions[0] = instructions[3];
+    instructions[0].pc = 0;
+    instructions[3] = .{ .pc = 12, .opcode = .s_nop };
     try std.testing.expect(scalarLaneDefinition(&instructions, &graph, 8, 26, 0) == null);
 }
 

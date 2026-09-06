@@ -1638,16 +1638,21 @@ fn runNestedImageCase(allocator: std.mem.Allocator, bounded: bool) !void {
 }
 
 fn runTypedIndexProbe(allocator: std.mem.Allocator) !void {
-    for ([_]u32{ 5, 6, 11, 12 }) |format| {
+    for (0..8) |case_index| {
+        const format = ([_]u32{ 5, 6, 11, 12 })[case_index % 4];
+        const saved_after_fetch = case_index >= 4;
         var renderer = try vulkan.Renderer.init(allocator, .{ .trace_resource_failures = true });
         defer renderer.deinit();
         var guest = GuestMemory{};
         _ = renderer.dcbBackend(guest.interface());
         const code = [_]u32{
             vop1(1, 0, 28), vop1(1, 1, 128),
-            sop1(4, 106, 126), // preserve EXEC before fetching the index
-            0xf000_0108,      0x0005_0f00, // image_load v15, (v0,v1), T#s20
-            sop1(4, 28, 106), sop1(0x14, 30, 28),
+            if (saved_after_fetch) 0xbf80_0000 else sop1(4, 106, 126), // preserve EXEC before fetching the index
+            0xf000_0108, 0x0005_0f00, // image_load v15, (v0,v1), T#s20
+            if (saved_after_fetch) sop1(0x24, 106, 128) else 0xbf80_0000, // s_and_saveexec_b64 vcc, 0
+            if (saved_after_fetch) sop1(4, 126, 106) else 0xbf80_0000, // restore lanes after the conditional
+            sop1(4, 28, 106),
+            sop1(0x14, 30, 28),
             0xd760_001f,     271 | (30 << 9), // read the first saved lane's typed index
             0x936b_ff1f,     440,
             0xf42c_0004,     (107 << 25) | 32,

@@ -663,6 +663,14 @@ shader code; the fix preserves both reads and writes, while reserved compact
 label addresses still resolve correctly. The next full run must also
 validate the remaining GPU fault and menu output.
 
+Additional scene material shaders save EXEC with `S_AND_SAVEEXEC_B64` after
+their integer image fetch, then restore the saved lanes for a waterfall.
+Index analysis now recognizes that pre-narrowing mask. A saved mask taken
+before a narrowing fetch remains insufficient. Eight GPU cases cover both
+mask-save forms with R8/R16 UINT/SINT inputs. Replaying `0x801f6d5100:0x2c4`
+with its captured SMEM values and material table reduces 274 candidates to
+nine, excluding unrelated float fields that decode as format 149.
+
 ## Baseline before the timestamp fix
 
 A five-minute run continues rendering after the movie, at approximately
