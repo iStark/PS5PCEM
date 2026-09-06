@@ -788,6 +788,13 @@ gaps and boundaries. A controlled ReleaseSafe benchmark with 16,384 mappings
 and 32,768 reads near the end of the table drops from 310,264 to 479 us. This
 measures the lookup alone, not game frame rate.
 
+Real compute pipeline creation now uses the persisted driver cache. Its
+compile job previously passed a null cache in both synchronous and worker
+modes, so only graphics pipelines benefited from the saved data. The cache
+uses Vulkan's default internal synchronization. The full SDK smoke passes
+with an initially empty cache; the standalone compiler-failure probe retains
+its intentional cache bypass.
+
 The frame-948 trace stopped in the diagnostic vertex dumper: it requested nine
 words from an eight-word checked reader. The dumper now respects that bound.
 That incomplete capture includes numerous rejected shadow draws before the

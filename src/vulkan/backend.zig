@@ -1039,7 +1039,10 @@ const ComputePipelineCompileJob = struct {
         };
         if (work.renderer.device_functions.create_compute_pipelines(
             work.renderer.device,
-            0,
+            // The default VkPipelineCache synchronizes concurrent pipeline
+            // creation internally. Compute jobs must share the persisted
+            // cache just like graphics jobs, including on the worker thread.
+            work.renderer.driver_pipeline_cache,
             1,
             @ptrCast(&info),
             null,
