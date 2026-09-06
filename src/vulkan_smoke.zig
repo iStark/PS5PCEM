@@ -1025,6 +1025,65 @@ fn runPackedBufferProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("packed buffer probe passed: D16 loads/stores, adjacent halfwords, bounds, half/float packing, CMPX U16 and CLASS F32\n", .{});
 }
 
+fn runIntegerColorProbe(allocator: std.mem.Allocator) !void {
+    for (0..4) |case_index| {
+        var renderer = try vulkan.Renderer.init(allocator, .{});
+        defer renderer.deinit();
+        var guest = GuestMemory{};
+        const backend = renderer.dcbBackend(guest.interface());
+        const vertex = [_]u32{
+            vop1(6, 1, 261), vop1(1, 2, 255),  0x3f80_0000,      vop2(4, 3, 1, 2),
+            vop1(1, 4, 255), 0x3f40_0000,      vop2(8, 5, 3, 4), vop2(8, 6, 3, 3),
+            vop1(1, 7, 255), 0xbfc0_0000,      vop2(8, 6, 6, 7), vop1(1, 8, 255),
+            0x3f40_0000,     vop2(3, 6, 6, 8), vop1(1, 7, 128),  vop1(1, 8, 242),
+            0xf800_08cf,     0x0807_0605,      0xbf81_0000,
+        };
+        for (vertex, 0..) |word, index| guest.word(0x700 + index * 4, word);
+        const signed = case_index % 2 != 0;
+        const compressed = case_index >= 2;
+        const raw: u32 = if (compressed) (if (signed) 0x1234_ff85 else 0x1234_fedc) else if (signed) @bitCast(@as(i32, -1234567)) else 0xff81_2345;
+        const expected: u32 = if (compressed) (if (signed) @bitCast(@as(i32, -123)) else 0xfedc) else raw;
+        const fragment = [_]u32{
+            vop1(1, 0, 242), vop1(1, 1, 128), vop1(1, 2, 128), vop1(1, 3, 242),
+            0xf800_000f,                                  0x0302_0100, // float MRT0 remains a different numeric type
+            vop1(1, 4, 255),                              raw,
+            if (compressed) 0xf800_0c13 else 0xf800_0811, 0x0404_0404,
+            0xbf81_0000,
+        };
+        for (fragment, 0..) |word, index| guest.word(0x900 + index * 4, word);
+        var state = gpu.State{};
+        for ([_]gpu.resources.ShaderStage{ .vertex, .pixel }, [_]u32{ 7, 9 }) |stage, address| {
+            try state.writeRegister(.shader, stage.programRegisterBase(), address);
+            try state.writeRegister(.shader, stage.programRegisterBase() + 1, 0);
+        }
+        for (0..2) |slot| {
+            const base: u32 = @intCast(0x318 + slot * 15);
+            try state.writeRegister(.context, base, if (slot == 0) 0x20 else 0x80);
+            try state.writeRegister(.context, base + 1, 7);
+            try state.writeRegister(.context, base + 3, 0);
+            try state.writeRegister(.context, base + 4, if (slot == 0) 10 << 2 else (4 << 2) | (@as(u32, if (signed) 5 else 4) << 8));
+            try state.writeRegister(.context, base + 5, 0);
+            try state.writeRegister(.context, 0x390 + @as(u32, @intCast(slot)), 0);
+            try state.writeRegister(.context, 0x3b0 + @as(u32, @intCast(slot)), (63 << 14) | 63);
+            try state.writeRegister(.context, 0x3b8 + @as(u32, @intCast(slot)), 1 << 24);
+        }
+        const context = [_][2]u32{
+            .{ 0x08e, 0x1f },            .{ 0x00c, 0 }, .{ 0x00d, 64 | (64 << 16) }, .{ 0x094, 1 << 31 },
+            .{ 0x095, 64 | (64 << 16) }, .{ 0x1e0, 0 }, .{ 0x200, 0 },               .{ 0x202, (0xcc << 16) | (1 << 4) },
+            .{ 0x204, 0 },               .{ 0x205, 0 },
+        };
+        for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+        for ([_]f32{ 32, 32, 32, 32, 1, 0 }, 0..) |value, index| try state.writeRegister(.context, 0x10f + @as(u32, @intCast(index)), @bitCast(value));
+        var executor = gpu.DcbExecutor{ .state = &state, .backend = backend, .allocator = allocator };
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+        try renderer.flushPendingGuestWrites();
+        const center = (32 * 64 + 32) * 4;
+        try std.testing.expectEqual(expected, std.mem.readInt(u32, guest.bytes[0x8000 + center ..][0..4], .little));
+        try std.testing.expectEqual(@as(u32, 0xff00_00ff), std.mem.readInt(u32, guest.bytes[0x2000 + center ..][0..4], .little));
+    }
+    std.debug.print("integer color exports passed: mixed float/integer MRTs, full 32-bit payloads and signed/unsigned packed halfwords\n", .{});
+}
+
 fn runShaderInterfaceProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -1439,6 +1498,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--nested-images")) {
         try runNestedImageProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--integer-colors")) {
+        try runIntegerColorProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-reuse")) {

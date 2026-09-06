@@ -528,6 +528,15 @@ cases and the full Vulkan smoke pass with SDK validation. A regression test
 checks the array-gradient operand dimensions. Full game verification of these
 changes is still in progress; menu rendering is not confirmed.
 
+The post-load G-buffer passes mix float outputs with an R32_UINT attachment.
+Fragment export declarations and writes now follow each target's numeric
+type, preserving raw 32-bit integer payloads and unpacking compressed integer
+exports as signed/unsigned halfwords. Storage-only fragment programs no longer
+declare an unwritten color output. A four-case GPU probe verifies mixed MRTs,
+integer bit patterns which would be NaNs as floats, and signed/unsigned packed
+exports through guest-memory readback. It, the shader-interface probe and the
+full smoke pass SDK validation without output-type warnings.
+
 ## Baseline before the timestamp fix
 
 A five-minute run continues rendering after the movie, at approximately

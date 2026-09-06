@@ -199,6 +199,16 @@ pub const NggLdsExport = struct {
     sources: [4]operand.Operand,
 };
 
+pub const ColorExportType = enum { float32, uint32, sint32 };
+
+fn colorExportValueType(color_type: ColorExportType) ValueType {
+    return switch (color_type) {
+        .float32 => .float32,
+        .uint32 => .bits32,
+        .sint32 => .sint32,
+    };
+}
+
 pub const Options = struct {
     stage: Stage,
     local_size: [3]u32 = .{ 1, 1, 1 },
@@ -252,13 +262,14 @@ pub const Options = struct {
     /// backend that knows the paired VS interface can disable that inference
     /// and supply only locations the vertex stage actually exports.
     infer_fragment_parameter_mask: bool = true,
-    /// Fragment EXP MRT0..7 bits. Empty leaves Location 0 declared so a
-    /// pixel program that never exports still has a legal colour output.
+    /// Fragment EXP MRT0..7 bits. A program without color exports declares
+    /// no color outputs; storage-only fragment programs are valid Vulkan.
     color_export_mask: u8 = 0,
     /// Selects the logical guest EXP component written to every physical
     /// Vulkan attachment component. Two bits per component; 0xe4 is RGBA.
     /// CB_COLOR_INFO.COMP_SWAP supplies one mapping for each active MRT.
     color_export_mappings: [8]u8 = @splat(0xe4),
+    color_export_types: [8]ColorExportType = @splat(.float32),
     scalar_registers: []const ScalarRegister = &.{},
     dynamic_scalar_binding: ?DynamicScalarBinding = null,
     compute_inputs: ?ComputeInputs = null,
@@ -580,6 +591,7 @@ const Builder = struct {
     position_output: u32 = 0,
     color_outputs: [8]u32 = @splat(0),
     color_export_mappings: [8]u8,
+    color_export_types: [8]ColorExportType,
     parameter_variables: [32]u32 = @splat(0),
     vertex_parameter_targets: [32]u32 = @splat(0),
     /// BuiltIn FragCoord (float4) for fragment UV fallback when PARAM interps
@@ -694,6 +706,7 @@ const Builder = struct {
             .vertex_index_vgpr = options.vertex_index_vgpr,
             .convert_negative_one_to_one_depth = options.convert_negative_one_to_one_depth,
             .color_export_mappings = options.color_export_mappings,
+            .color_export_types = options.color_export_types,
             .storage_bindings = options.storage_buffers,
             .scalar_memory_bindings = options.scalar_memories,
             .sampled_bindings = options.sampled_images,
@@ -808,14 +821,20 @@ const Builder = struct {
                 const output_pointer = self.id();
                 try self.emit(&self.declarations, 23, &.{ self.vector4_type, self.float_type, 4 }); // OpTypeVector
                 try self.emit(&self.declarations, 32, &.{ output_pointer, 3, self.vector4_type }); // ptr Output
-                var color_mask = options.color_export_mask;
-                if (color_mask == 0) color_mask = 1;
+                var output_pointers = [3]u32{ output_pointer, 0, 0 };
+                const color_mask = options.color_export_mask;
                 for (0..self.color_outputs.len) |slot| {
                     if (color_mask & (@as(u8, 1) << @intCast(slot)) == 0) continue;
+                    const type_index = @intFromEnum(options.color_export_types[slot]);
+                    if (output_pointers[type_index] == 0) {
+                        const vector_type = try self.ensureVec4(colorExportValueType(options.color_export_types[slot]));
+                        output_pointers[type_index] = self.id();
+                        try self.emit(&self.declarations, 32, &.{ output_pointers[type_index], 3, vector_type });
+                    }
                     const variable = self.id();
                     self.color_outputs[slot] = variable;
                     try self.emit(&self.annotations, 71, &.{ variable, 30, @intCast(slot) }); // Location
-                    try self.emit(&self.declarations, 59, &.{ output_pointer, variable, 3 }); // OpVariable
+                    try self.emit(&self.declarations, 59, &.{ output_pointers[type_index], variable, 3 }); // OpVariable
                 }
                 // FragCoord for UV fallback (BuiltIn 15).
                 const frag_ptr = self.id();
@@ -4367,6 +4386,9 @@ const Builder = struct {
             return;
         }
         const is_position = output == self.position_output;
+        if (self.stage == .fragment and self.color_export_types[inst.export_target] != .float32) {
+            return self.exportIntegerColor(inst, output);
+        }
         const zero = try self.constant(.float32, @bitCast(@as(f32, 0)));
         const one = try self.constant(.float32, @bitCast(@as(f32, 1)));
         const x: u32, const y: u32, const z: u32, const w: u32 = if (inst.export_compressed) blk: {
@@ -4468,6 +4490,38 @@ const Builder = struct {
                     try self.emit(&self.body, 62, &.{ variable, exported });
             }
         }
+    }
+
+    fn exportIntegerColor(self: *Builder, inst: instruction.Instruction, output: u32) Error!void {
+        const value_type = colorExportValueType(self.color_export_types[inst.export_target]);
+        const vector_type = try self.ensureVec4(value_type);
+        const sources = [4]operand.Operand{ inst.src0, inst.src1, inst.src2, inst.src3 };
+        var components: [4]u32 = undefined;
+        for (&components, 0..) |*component, index| {
+            component.* = try self.constant(value_type, 0);
+            if (inst.export_enable & (@as(u4, 1) << @intCast(index)) == 0) continue;
+            if (inst.export_compressed) {
+                const packed_bits = try self.source(sources[index / 2], value_type);
+                component.* = self.id();
+                try self.emit(&self.body, if (value_type == .sint32) 202 else 203, &.{
+                    self.typeId(value_type),                                component.*,                    packed_bits,
+                    try self.constant(.bits32, @intCast((index % 2) * 16)), try self.constant(.bits32, 16),
+                }); // OpBitField[S/U]Extract: packed integer halfwords, not half floats
+            } else {
+                component.* = try self.source(sources[index], value_type);
+            }
+        }
+        components = remapColorExportComponents(components, self.color_export_mappings[inst.export_target]);
+        const vector = self.id();
+        try self.emit(&self.body, 80, &.{ vector_type, vector, components[0], components[1], components[2], components[3] });
+        var exported = vector;
+        if (try self.laneEnabled()) |enabled| {
+            const current = self.id();
+            try self.emit(&self.body, 61, &.{ vector_type, current, output });
+            exported = self.id();
+            try self.emit(&self.body, 169, &.{ vector_type, exported, enabled, vector, current });
+        }
+        try self.emit(&self.body, 62, &.{ output, exported });
     }
 
     fn vertexParameterOutput(self: *const Builder, export_index: u32) u32 {

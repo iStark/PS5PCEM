@@ -1316,6 +1316,14 @@ fn colorTargetComponentCount(format: u8) ?usize {
 /// CB_COLOR_INFO.COMP_SWAP selects the logical fragment export placed in each
 /// physical surface component. Unused selectors complete a permutation so the
 /// same mapping can also translate CB_TARGET_MASK into Vulkan write-mask bits.
+fn colorTargetExportType(descriptor: gpu.resources.ColorTarget) rdna2.spirv.ColorExportType {
+    return switch (descriptor.number_type) {
+        4 => .uint32,
+        5 => .sint32,
+        else => .float32,
+    };
+}
+
 fn colorTargetExportMapping(descriptor: gpu.resources.ColorTarget) u8 {
     const component_count = colorTargetComponentCount(descriptor.format) orelse
         return color_export_identity;
@@ -13663,9 +13671,12 @@ pub const Renderer = struct {
 
         var color_export_mappings: [gpu.resources.color_target_count]u8 =
             @splat(color_export_identity);
+        var color_export_types: [gpu.resources.color_target_count]rdna2.spirv.ColorExportType = @splat(.float32);
         color_export_mappings[target.descriptor.slot] = colorTargetExportMapping(target.descriptor);
+        color_export_types[target.descriptor.slot] = colorTargetExportType(target.descriptor);
         for (extra_colors) |extra| {
             color_export_mappings[extra.descriptor.slot] = colorTargetExportMapping(extra.descriptor);
+            color_export_types[extra.descriptor.slot] = colorTargetExportType(extra.descriptor);
         }
 
         const fragment_translate_started = hostTimestampNs();
@@ -13687,6 +13698,7 @@ pub const Renderer = struct {
             .fragment_input_locations = &fragment_input_locations,
             .infer_fragment_parameter_mask = false,
             .color_export_mappings = color_export_mappings,
+            .color_export_types = color_export_types,
             .descriptor_array_length = maximum_storage_descriptors,
             .scalar_memories = fragment_storage.scalar_memories[0..fragment_storage.scalar_memory_count],
             .sampled_image_array_length = self.device_info.sampled_image_capacity,
