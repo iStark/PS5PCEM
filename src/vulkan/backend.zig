@@ -2553,18 +2553,29 @@ const DrawVertexRange = struct {
 fn drawVertexRange(reader: gpu.ShaderMemoryReader, draw: GuestDraw) ?DrawVertexRange {
     if (draw.index_count) |count| {
         if (count == 0 or draw.index_address == 0) return null;
-        const stride: u64 = if (draw.index_uint32) 4 else 2;
+        const stride: usize = if (draw.index_uint32) 4 else 2;
+        const byte_count = @as(u64, count) * stride;
+        _ = std.math.add(u64, draw.index_address, byte_count) catch return null;
         var minimum: u32 = std.math.maxInt(u32);
         var maximum: u32 = 0;
-        var element: u32 = 0;
-        while (element < count) : (element += 1) {
-            const byte_offset = std.math.mul(u64, element, stride) catch return null;
-            const index = if (draw.index_uint32)
-                reader.readU32(draw.index_address + byte_offset) catch return null
-            else
-                reader.readU16(draw.index_address + byte_offset) catch return null;
-            minimum = @min(minimum, index);
-            maximum = @max(maximum, index);
+        // Each checked guest read locks and searches the address space. Read
+        // mesh indices in bounded blocks instead of doing that for every
+        // two-byte index. The final block stops at the draw's exact extent.
+        var bytes: [4096]u8 = undefined;
+        var byte_offset: u64 = 0;
+        while (byte_offset < byte_count) {
+            const length: usize = @intCast(@min(bytes.len, byte_count - byte_offset));
+            reader.read(draw.index_address + byte_offset, bytes[0..length]) catch return null;
+            var offset: usize = 0;
+            while (offset < length) : (offset += stride) {
+                const index = if (draw.index_uint32)
+                    std.mem.readInt(u32, bytes[offset..][0..4], .little)
+                else
+                    std.mem.readInt(u16, bytes[offset..][0..2], .little);
+                minimum = @min(minimum, index);
+                maximum = @max(maximum, index);
+            }
+            byte_offset += length;
         }
         return .{
             .minimum = @as(i64, minimum) + draw.vertex_offset,
@@ -2583,6 +2594,10 @@ fn validateVertexIndexMappings(
     resources: *ComputeResources,
     draw: GuestDraw,
 ) void {
+    const needs_range = for (resources.mappings[0..resources.mapping_count]) |mapping| {
+        if (mapping.use_vertex_index and mapping.stride != 0) break true;
+    } else false;
+    if (!needs_range) return;
     const range = drawVertexRange(reader, draw) orelse return;
     for (resources.mappings[0..resources.mapping_count]) |*mapping| {
         if (!mapping.use_vertex_index or mapping.stride == 0) continue;
@@ -11952,7 +11967,8 @@ pub const Renderer = struct {
         };
         const frame_bytes = std.math.mul(usize, frame_pixels, 4) catch return Error.UnsupportedColorTarget;
         if (frame_bytes == 0 or frame_bytes > maximum_frame_bytes) return Error.UnsupportedColorTarget;
-        var frame = try self.allocator.alloc(u8, frame_bytes);
+        const read_color = depth == null or validate_diagnostic_color;
+        var frame = try self.allocator.alloc(u8, if (read_color) frame_bytes else 0);
         defer self.allocator.free(frame);
         var upload: ?OwnedBuffer = null;
         defer if (upload) |buffer| self.destroyBuffer(buffer);
@@ -12023,13 +12039,6 @@ pub const Renderer = struct {
         defer self.destroyFramebuffer(framebuffer);
 
         const pipeline = try self.getGraphicsPipeline(render_pass, pipeline_state, vertex_words, fragment_words);
-        const readback = try self.createBuffer(
-            frame_bytes,
-            vk.buffer_usage_transfer_dst_bit,
-            vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
-        );
-        defer self.destroyBuffer(readback);
-
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
         if (upload) |upload_buffer| {
@@ -12164,6 +12173,24 @@ pub const Renderer = struct {
         }
         self.device_functions.cmd_end_render_pass(command_buffer);
 
+        // A depth-only pass has no guest colour output. Its compatibility
+        // colour attachment exists only for pipeline/render-pass matching;
+        // reading and scanning that image after every shadow draw transfers
+        // megabytes of discarded pixels and serializes the CPU with the GPU.
+        if (!read_color) {
+            try self.submitOneShot(command_buffer);
+            const depth_cached = &self.depth_targets.items[depth_index.?];
+            depth_cached.gpu_generation +%= 1;
+            _ = self.image_aliases.markWrite(depth_cached.alias_token);
+            if (depth_cached.stencil_alias_token) |token| _ = self.image_aliases.markWrite(token);
+            return;
+        }
+        const readback = try self.createBuffer(
+            frame_bytes,
+            vk.buffer_usage_transfer_dst_bit,
+            vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+        );
+        defer self.destroyBuffer(readback);
         const image_barrier = vk.ImageMemoryBarrier{
             .source_access_mask = vk.access_color_attachment_write_bit,
             .destination_access_mask = vk.access_transfer_read_bit,
@@ -12513,6 +12540,62 @@ pub const Renderer = struct {
             cached.needs_writeback = false;
             return;
         }
+    }
+
+    /// Exercise the depth-only compatibility path and return corner/centre
+    /// depth after two draws. The second empty draw must retain the first.
+    pub fn probeDepthOnlyDraws(self: *Renderer) anyerror![2]f32 {
+        const old_transfer = self.depth_transfer_enabled;
+        self.depth_transfer_enabled = false;
+        defer self.depth_transfer_enabled = old_transfer;
+        const target = GuestDepthTarget{
+            .address = 0x1000,
+            .allocation_bytes = 32 * 32 * 4,
+            .width = 32,
+            .height = 32,
+            .guest_format = 3,
+            .format = vk.format_d32_sfloat,
+            .tile_mode = .linear,
+            .base_array_slice = 0,
+            .mip_level = 0,
+            .clear_depth = 1,
+        };
+        var state = GraphicsPipelineState.default(32, 32);
+        state.color_write_masks = @splat(0);
+        state.depth_attachment_format = target.format;
+        state.depth_test_enable = 1;
+        state.depth_write_enable = 1;
+        state.depth_compare_operation = 1; // VK_COMPARE_OP_LESS
+        const index = try self.acquireDepthTarget(target);
+        for ([_]u32{ 3, 0 }) |vertices| {
+            try self.beginFrameDraw();
+            try self.drawGraphicsShaders(&graphics_probe_vertex_spirv, &graphics_probe_fragment_spirv, &.{}, &.{}, state, null, &.{}, target, false, false, false, .{ .vertex_count = vertices });
+        }
+        const cached = self.depth_targets.items[index];
+        try std.testing.expectEqual(@as(u64, 2), cached.gpu_generation);
+        const readback = try self.createBuffer(32 * 32 * 4, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        defer self.destroyBuffer(readback);
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        try self.transitionTrackedImage(command_buffer, cached.image.handle, .{ .aspect_mask = vk.image_aspect_depth_bit }, image_state.transfer_source_usage);
+        const copy = vk.BufferImageCopy{
+            .image_subresource = .{ .aspect_mask = vk.image_aspect_depth_bit },
+            .image_extent = .{ .width = 32, .height = 32, .depth = 1 },
+        };
+        self.device_functions.cmd_copy_image_to_buffer(command_buffer, cached.image.handle, vk.image_layout_transfer_src_optimal, readback.handle, 1, @ptrCast(&copy));
+        const barrier = vk.BufferMemoryBarrier{
+            .source_access_mask = vk.access_transfer_write_bit,
+            .destination_access_mask = vk.access_host_read_bit,
+            .buffer = readback.handle,
+            .offset = 0,
+            .size = readback.size,
+        };
+        self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
+        try self.transitionTrackedImage(command_buffer, cached.image.handle, .{ .aspect_mask = vk.image_aspect_depth_bit }, image_state.depth_attachment_usage);
+        try self.submitOneShot(command_buffer);
+        var values: [32 * 32]f32 = undefined;
+        try self.readMapped(readback, std.mem.sliceAsBytes(&values));
+        return .{ values[0], values[16 * 32 + 16] };
     }
 
     fn drawGraphicsProbe(self: *Renderer) anyerror!void {
@@ -13559,10 +13642,10 @@ pub const Renderer = struct {
                     },
                 );
                 if (mapping.use_vertex_index and mapping.stride != 0) {
-                    const record_words = @min(@as(usize, mapping.stride / @sizeOf(u32)), 10);
+                    const record_words = @min(@as(usize, mapping.stride / @sizeOf(u32)), 8);
                     var vertex: u32 = 0;
                     while (vertex < 4) : (vertex += 1) {
-                        var words: [10]u32 = undefined;
+                        var words: [8]u32 = undefined;
                         const record_address = vertex_storage.addresses[slot] +
                             @as(u64, vertex) * mapping.stride;
                         if (reader.readWords(record_address, words[0..record_words])) |_| {
@@ -26457,6 +26540,53 @@ test "vertex attributes keep distinct PC-qualified storage mappings" {
     try std.testing.expect(!canReuseStorageMapping(false, 3, 4));
     try std.testing.expect(!canReuseStorageMapping(false, null, 3));
     try std.testing.expect(!canReuseStorageMapping(true, 3, 3));
+}
+
+test "vertex index range batches checked reads and preserves signed bounds" {
+    const Memory = struct {
+        bytes: [8200]u8 = undefined,
+        length: usize = 0,
+        calls: usize = 0,
+        fn read(context: ?*anyopaque, address: u64, destination: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.calls += 1;
+            const offset = std.math.sub(u64, address, 0x1000) catch return false;
+            if (offset > self.length or destination.len > self.length - offset) return false;
+            @memcpy(destination, self.bytes[@intCast(offset)..][0..destination.len]);
+            return true;
+        }
+    };
+    var memory = Memory{};
+    const reader = gpu.ShaderMemoryReader{ .context = &memory, .read_fn = Memory.read };
+    inline for (.{ u16, u32 }) |Index| {
+        const stride = @sizeOf(Index);
+        const count = 8192 / stride + 1;
+        memory.calls = 0;
+        memory.length = count * stride;
+        for (0..count) |index| std.mem.writeInt(Index, memory.bytes[index * stride ..][0..stride], 12, .little);
+        std.mem.writeInt(Index, memory.bytes[4096..][0..stride], 2, .little);
+        std.mem.writeInt(Index, memory.bytes[8192..][0..stride], std.math.maxInt(Index), .little);
+        const draw = GuestDraw{ .index_address = 0x1000, .index_count = count, .index_uint32 = Index == u32, .vertex_offset = -7 };
+        const range = drawVertexRange(reader, draw).?;
+        try std.testing.expectEqual(@as(i64, -5), range.minimum);
+        try std.testing.expectEqual(@as(i64, std.math.maxInt(Index)) - 7, range.maximum);
+        try std.testing.expectEqual(@as(usize, 3), memory.calls);
+        memory.length -= 1;
+        try std.testing.expectEqual(@as(?DrawVertexRange, null), drawVertexRange(reader, draw));
+    }
+    memory.calls = 0;
+    try std.testing.expectEqual(@as(?DrawVertexRange, null), drawVertexRange(reader, .{
+        .index_address = std.math.maxInt(u64) - 1,
+        .index_count = 2,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), memory.calls);
+    const resources = try ComputeResources.init(std.testing.allocator);
+    defer std.testing.allocator.destroy(resources);
+    validateVertexIndexMappings(reader, resources, .{ .index_address = 0x1000, .index_count = 4096 });
+    try std.testing.expectEqual(@as(usize, 0), memory.calls);
+    const direct = drawVertexRange(reader, .{ .first_vertex = 17, .vertex_count = 4 }).?;
+    try std.testing.expectEqual(@as(i64, 17), direct.minimum);
+    try std.testing.expectEqual(@as(i64, 20), direct.maximum);
 }
 
 test "compute resources retain temporal scalar load specializations" {

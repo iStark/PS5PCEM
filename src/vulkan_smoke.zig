@@ -2093,6 +2093,17 @@ fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--depth-only")) {
+        var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+        defer renderer.deinit();
+        renderer.graphics_probe_colored_pixels = 123;
+        const depth = try renderer.probeDepthOnlyDraws();
+        try std.testing.expectEqual(@as(f32, 1), depth[0]);
+        try std.testing.expectEqual(@as(f32, 0), depth[1]);
+        try std.testing.expectEqual(@as(u32, 123), renderer.graphics_probe_colored_pixels);
+        std.debug.print("depth-only draws passed: depth write, retained attachment and no colour readback\n", .{});
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--scalar-loops")) {
         try runScalarLoopProbe(allocator);
         return;

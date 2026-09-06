@@ -764,6 +764,28 @@ fallback and returns 1 instead of 4 iterations. The corrected probe returns 4
 and preserves inactive upper lanes, with clean SDK validation; the two wave64
 workgroup shapes also pass. Strict CPU translation covers all three EXEC forms.
 
+The later scene run with wave64 and scalar bit-guard specialization reaches
+the Digital Deluxe Bonus notice again. Warm frames around flips 940–947 take
+35–37 seconds; shader compilation is no longer the dominant cost. A main
+thread sample attributes 53% of samples to checked guest reads while scanning
+mesh indices and another 32% to reading discarded compatibility colour images
+after depth-only draws. Those shadow passes read back up to 64 MiB per draw.
+
+Index-range validation now reads bounded 4 KiB blocks, skips draws with no
+VertexIndex mappings and checks address overflow before access. CPU tests
+cover UINT16/UINT32 block boundaries, signed base vertices, unreadable tails
+and empty mappings; 4,097 UINT16 indices require three checked reads.
+Depth-only passes retain their depth writes and generations without allocating,
+copying or scanning a host colour buffer. The SDK depth probe verifies a
+triangle's depth, preservation across a second draw and no colour readback;
+the complete Vulkan smoke also passes with clean SDK validation. Live frame
+timing with these changes remains to be measured.
+
+The frame-948 trace stopped in the diagnostic vertex dumper: it requested nine
+words from an eight-word checked reader. The dumper now respects that bound.
+That incomplete capture includes numerous rejected shadow draws before the
+notice's UI passes, so it cannot establish the cross glyph's cause.
+
 ## Baseline before the timestamp fix
 
 A five-minute run continues rendering after the movie, at approximately
