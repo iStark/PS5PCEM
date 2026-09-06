@@ -5183,10 +5183,14 @@ const Builder = struct {
         {
             return Error.UnsupportedOpcode;
         }
-        // Extra operands follow the coordinate payload encoded by DIM, even
-        // when the bound view consumes fewer coordinates.
-        // Coordinates now come from the real VS PARAM -> PS VINTRP interface.
-        const coordinate_base: u32 = @intFromBool(inst.image_sample_flags.offset);
+        // GFX10 address VGPRs are packed as offset, bias, depth reference,
+        // derivatives, then the DIM coordinate body. Explicit LOD follows
+        // that body. NSA changes the register locations, not this ordering.
+        const bias_index: u32 = @intFromBool(inst.image_sample_flags.offset);
+        const dref_index = bias_index + @intFromBool(biased_lod);
+        const gradient_base = dref_index + @intFromBool(compare);
+        const coordinate_base = gradient_base + gradient_components;
+        const lod_index = coordinate_base + instruction_coordinate_components;
         const raw_x = try self.source(try imageAddressOperand(inst, coordinate_base), .float32);
         var coordinates = self.id();
         if (one_dimensional) {
@@ -5206,9 +5210,6 @@ const Builder = struct {
         if (inst.image_sample_flags.offset) {
             coordinates = try self.adjustSampleCoordinates(inst, sampled_image, coordinates, image_dimension);
         }
-        const gradient_base = coordinate_base + instruction_coordinate_components;
-        const dref_index = gradient_base + gradient_components;
-        const lod_index = dref_index + @intFromBool(compare);
         const sampled = self.id();
         if (compare) {
             const dref = try self.source(try imageAddressOperand(inst, dref_index), .float32);
@@ -5227,7 +5228,7 @@ const Builder = struct {
                     lod,
                 }); // OpImageSampleDrefExplicitLod
             } else if (biased_lod) {
-                const bias = try self.source(try imageAddressOperand(inst, lod_index), .float32);
+                const bias = try self.source(try imageAddressOperand(inst, bias_index), .float32);
                 try self.emit(&self.body, 89, &.{
                     self.float_type,
                     sampled,
@@ -5291,7 +5292,7 @@ const Builder = struct {
                 lod,
             }); // OpImageSampleExplicitLod
         } else if (biased_lod) {
-            const bias = try self.source(try imageAddressOperand(inst, lod_index), .float32);
+            const bias = try self.source(try imageAddressOperand(inst, bias_index), .float32);
             try self.emit(&self.body, 87, &.{
                 self.vector4_type,
                 sampled,
@@ -5359,15 +5360,17 @@ const Builder = struct {
             try self.emit(&self.body, 80, &.{ self.vector3_type, dy, dudy, dvdy, dwdy });
             return .{ dx, dy };
         }
-        const dudy = try self.source(try imageAddressOperand(inst, gradient_base + 2), .float32);
-        const dvdy = try self.source(try imageAddressOperand(inst, gradient_base + 3), .float32);
+        const dy_base = gradient_base + @as(u32, if (inst.image_dimension == .dim_3d) 3 else 2);
+        const dudy = try self.source(try imageAddressOperand(inst, dy_base), .float32);
+        const dvdy = try self.source(try imageAddressOperand(inst, dy_base + 1), .float32);
         // Array layers select an image; they are not a spatial derivative.
         // SPIR-V Grad excludes the layer component of 2D-array coordinates.
         if (image_dimension == .two_d or image_dimension == .two_d_array) {
+            const vector_type = try self.ensureFloatVec2();
             const dx = self.id();
             const dy = self.id();
-            try self.emit(&self.body, 80, &.{ self.vector2_type, dx, dudx, dvdx });
-            try self.emit(&self.body, 80, &.{ self.vector2_type, dy, dudy, dvdy });
+            try self.emit(&self.body, 80, &.{ vector_type, dx, dudx, dvdx });
+            try self.emit(&self.body, 80, &.{ vector_type, dy, dudy, dvdy });
             return .{ dx, dy };
         }
         const dx = self.id();
@@ -5483,7 +5486,8 @@ const Builder = struct {
         }
         self.uses_image_gather_extended = self.uses_image_gather_extended or inst.image_sample_flags.offset;
 
-        const coordinate_base: u32 = @intFromBool(inst.image_sample_flags.offset);
+        const dref_index: u32 = @intFromBool(inst.image_sample_flags.offset);
+        const coordinate_base = dref_index + @intFromBool(compare);
         const raw_x = try self.source(try imageAddressOperand(inst, coordinate_base), .float32);
         const raw_y = try self.source(try imageAddressOperand(inst, coordinate_base + 1), .float32);
         const layer = if (arrayed) try self.source(try imageAddressOperand(inst, coordinate_base + 2), .float32) else null;
@@ -5505,7 +5509,7 @@ const Builder = struct {
             // derivative-free execution model.
             if (self.sampled_image_image_types[dimension_index] == 0) return Error.InvalidStorageBinding;
             const dref = if (compare)
-                try self.source(try imageAddressOperand(inst, coordinate_base + coordinate_count), .float32)
+                try self.source(try imageAddressOperand(inst, dref_index), .float32)
             else
                 null;
             const packed_offset = if (inst.image_sample_flags.offset)
@@ -5617,7 +5621,6 @@ const Builder = struct {
         }
 
         const gathered = self.id();
-        const dref_index = coordinate_base + coordinate_count;
         if (compare) {
             const dref = try self.source(try imageAddressOperand(inst, dref_index), .float32);
             if (inst.image_sample_flags.offset) {
@@ -13174,6 +13177,7 @@ test "2D array explicit gradients omit the layer coordinate" {
             const length = module.words[at] >> 16;
             if (module.words[at] & 0xffff == 80 and module.words[at + 2] == derivative) {
                 try std.testing.expectEqual(@as(u32, 5), length); // type, id, du, dv
+                try std.testing.expect(module.words[at + 1] != 0);
                 found = true;
             }
             at += length;

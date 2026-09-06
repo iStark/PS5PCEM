@@ -1274,6 +1274,48 @@ fn runBc4Probe(allocator: std.mem.Allocator) !void {
     std.debug.print("BC4 probe passed: eight-byte blocks, mip tails, UNORM and SNORM sampling\n", .{});
 }
 
+fn runArrayGradientProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    // GFX10 packs derivatives before the coordinate body. Distinct layers
+    // make swapping the two payloads observably wrong even at mip zero.
+    const inputs = [_]f32{ 0.25, 0, 0, 0.25, 0.25, 0.75, 1 };
+    for (inputs, 0..) |value, index| {
+        guest.word(0x100 + index * 8, vop1(1, @intCast(index), 255));
+        guest.word(0x104 + index * 8, @bitCast(value));
+    }
+    const tail = [_]u32{ 0xf088_0128, 0x0040_0700, 0xe070_0000, 0x8003_0700, 0xbf81_0000 };
+    for (tail, 0..) |word, index| guest.word(0x100 + inputs.len * 8 + index * 4, word);
+    var descriptor = sampledImageDescriptorWords(0x12000, 4, 4);
+    descriptor[3] = (descriptor[3] & 0x0fff_ffff) | 0xd000_0000;
+    descriptor[4] = 1; // two array layers
+    const texture = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&descriptor));
+    for (0..2) |layer| {
+        const view = try texture.subresource(0, @intCast(layer), 1);
+        for (0..4) |y| for (0..4) |x| {
+            const offset = try view.sourceByteOffset(@intCast(x), @intCast(y), 0, 0);
+            guest.word(0x12000 + @as(usize, @intCast(offset)), if (layer == 0) 0xff00_00ff else 0xff00_0040);
+        };
+    }
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 16 << 1);
+    var userdata: [16]u32 = @splat(0);
+    @memcpy(userdata[0..8], &descriptor);
+    @memcpy(userdata[12..16], &[_]u32{ 0x10000, 4 << 16, 1, 0 });
+    for (userdata, 0..) |word, index| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+    _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+    var output: [4]u8 = undefined;
+    try renderer.readbackGuestStorageBuffer(0x10000, &output);
+    const actual: f32 = @bitCast(std.mem.readInt(u32, &output, .little));
+    try std.testing.expectApproxEqAbs(@as(f32, 64.0 / 255.0), actual, 0.00001);
+    std.debug.print("array gradients passed: two-component derivatives precede the three-component coordinate body\n", .{});
+}
+
 fn runScalarPointerProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
     defer renderer.deinit();
@@ -1524,6 +1566,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--integer-colors")) {
         try runIntegerColorProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--array-gradients")) {
+        try runArrayGradientProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-reuse")) {

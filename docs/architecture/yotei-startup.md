@@ -557,6 +557,15 @@ masks and 64-bit scalar writes. The captured table resolves 51 image candidates
 at record offset 128; the high-half GPU probe preserves selection after an
 independent low-half add.
 
+GFX10 sample operands follow ISA section 8.2.5: optional offset, bias,
+comparison reference and derivatives precede the coordinate body; explicit
+LOD follows it. Sample/gather translation now uses that order. Array-only
+compute shaders also create their two-component derivative type explicitly:
+otherwise a shader with no ordinary 2D binding can emit type ID zero. The GPU
+array-gradient probe verifies that the intended array layer is sampled from
+distinct derivative/coordinate values. It, streamed-mip sampling, integer MRTs
+and the full smoke pass SDK validation.
+
 ## Baseline before the timestamp fix
 
 A five-minute run continues rendering after the movie, at approximately
