@@ -185,6 +185,8 @@ pub const Options = struct {
     dump_compute_spirv: bool = false,
     /// Writes translated guest graphics modules to `out` for offline validation.
     dump_graphics_spirv: bool = false,
+    /// Dumps the first failing descriptor snapshot at each program/PC.
+    trace_resource_failures: bool = false,
     /// Extends automatic PPM checkpoints beyond the small startup set. This is
     /// diagnostic I/O and remains opt-in for normal game runs.
     capture_extended_progress_frames: bool = false,
@@ -2925,6 +2927,7 @@ pub const Renderer = struct {
     translate_compute_only: bool,
     dump_compute_spirv: bool,
     dump_graphics_spirv: bool,
+    trace_resource_failures: bool,
     capture_extended_progress_frames: bool,
     shader_ir_enabled: bool,
     shader_ssa_optimization_enabled: bool,
@@ -3141,6 +3144,7 @@ pub const Renderer = struct {
     reported_draw_errors: [16]?anyerror = @splat(null),
     reported_compute_shader_failures: [32]?ComputeShaderFailure = @splat(null),
     reported_compute_resource_programs: [8]u64 = @splat(0),
+    reported_resource_failures: [64]?struct { program: u64, pc: u32 } = @splat(null),
     reported_yotei_gds_dispatches: u8 = 0,
     reported_yotei_visibility_dispatches: u8 = 0,
     yotei_packed_visibility_seeds: u8 = 0,
@@ -3657,6 +3661,7 @@ pub const Renderer = struct {
             .translate_compute_only = options.translate_compute_only,
             .dump_compute_spirv = options.dump_compute_spirv,
             .dump_graphics_spirv = options.dump_graphics_spirv,
+            .trace_resource_failures = options.trace_resource_failures,
             .capture_extended_progress_frames = options.capture_extended_progress_frames,
             .shader_ir_enabled = options.enable_shader_ir,
             .shader_ssa_optimization_enabled = options.enable_shader_ssa_optimization,
@@ -7658,6 +7663,12 @@ pub const Renderer = struct {
                 .buffer_load_sbyte,
                 .buffer_load_ushort,
                 .buffer_load_sshort,
+                .buffer_load_ubyte_d16,
+                .buffer_load_ubyte_d16_hi,
+                .buffer_load_sbyte_d16,
+                .buffer_load_sbyte_d16_hi,
+                .buffer_load_short_d16,
+                .buffer_load_short_d16_hi,
                 .buffer_load_dword,
                 .buffer_load_dwordx2,
                 .buffer_load_dwordx3,
@@ -7666,6 +7677,10 @@ pub const Renderer = struct {
                 .buffer_load_format_xy,
                 .buffer_load_format_xyz,
                 .buffer_load_format_xyzw,
+                .buffer_load_format_d16_x,
+                .buffer_load_format_d16_xy,
+                .buffer_load_format_d16_xyz,
+                .buffer_load_format_d16_xyzw,
                 .s_buffer_load_dword,
                 .s_buffer_load_dwordx2,
                 .s_buffer_load_dwordx4,
@@ -7682,6 +7697,10 @@ pub const Renderer = struct {
                 .buffer_store_format_xy,
                 .buffer_store_format_xyz,
                 .buffer_store_format_xyzw,
+                .buffer_store_format_d16_x,
+                .buffer_store_format_d16_xy,
+                .buffer_store_format_d16_xyz,
+                .buffer_store_format_d16_xyzw,
                 .buffer_atomic_swap,
                 .buffer_atomic_add,
                 .buffer_atomic_sub,
@@ -7709,6 +7728,10 @@ pub const Renderer = struct {
                 .buffer_load_format_xy,
                 .buffer_load_format_xyz,
                 .buffer_load_format_xyzw,
+                .buffer_load_format_d16_x,
+                .buffer_load_format_d16_xy,
+                .buffer_load_format_d16_xyz,
+                .buffer_load_format_d16_xyzw,
                 => true,
                 else => false,
             };
@@ -7919,6 +7942,7 @@ pub const Renderer = struct {
                 inst.pc,
                 result.storage_image_mapping_count,
             )) orelse {
+                self.reportResourceFailure(bindings, inst, &image_scalar);
                 std.debug.print(
                     "[vulkan dcb] storage image pc=0x{x}: T# s{d}:s{d} unresolved\n",
                     .{ inst.pc, resource_sgpr, resource_sgpr + 7 },
@@ -7989,6 +8013,7 @@ pub const Renderer = struct {
                     index,
                     writable,
                 ) catch |err| {
+                    self.reportResourceFailure(bindings, inst, &image_scalar);
                     std.debug.print(
                         "[vulkan dcb] storage image pc=0x{x}: stage failed {s} addr=0x{x} {d}x{d}x{d} pitch={d} fmt={d} type={s} tile={s} levels={d}..{d} base_array={d} flags=0x{x} metadata=0x{x} dcc={any} cmask={any} fmask={any}\n",
                         .{
@@ -8101,6 +8126,7 @@ pub const Renderer = struct {
                 inst.pc,
                 descriptor_slot,
             )) orelse {
+                self.reportResourceFailure(bindings, inst, &sampled_scalar);
                 std.debug.print(
                     "[vulkan dcb] sampled image pc=0x{x}: T# s{d}:s{d} unresolved\n",
                     .{ inst.pc, resource_sgpr, resource_sgpr + 7 },
@@ -8125,6 +8151,7 @@ pub const Renderer = struct {
                     inst.pc,
                     descriptor_slot,
                 )) orelse {
+                    self.reportResourceFailure(bindings, inst, &sampled_scalar);
                     std.debug.print(
                         "[vulkan dcb] sampled image pc=0x{x}: S# s{d}:s{d} unresolved\n",
                         .{ inst.pc, sampler_sgpr, sampler_sgpr + 3 },
@@ -8174,6 +8201,7 @@ pub const Renderer = struct {
                     sampled_dimension,
                     null,
                 ) catch |err| {
+                    self.reportResourceFailure(bindings, inst, &sampled_scalar);
                     std.debug.print(
                         "[vulkan dcb] sampled image pc=0x{x}: stage failed {s} dim={s} addr=0x{x} {d}x{d}x{d} pitch={d} fmt={d} type={s} tile={s} levels={d}..{d}\n",
                         .{ inst.pc, @errorName(err), @tagName(sampled_dimension), image_descriptor.address, image_descriptor.width, image_descriptor.height, image_descriptor.depth_or_layers, image_descriptor.pitch, image_descriptor.unified_format, @tagName(image_descriptor.image_type), @tagName(image_descriptor.tile_mode), image_descriptor.base_level, image_descriptor.last_level },
@@ -19146,6 +19174,28 @@ pub const Renderer = struct {
         return false;
     }
 
+    fn reportResourceFailure(self: *Renderer, bindings: *const gpu.ShaderBindings, inst: gpu.ShaderInstruction, scalar: *const gpu.ScalarEvaluation) void {
+        if (!self.trace_resource_failures) return;
+        for (&self.reported_resource_failures) |*entry| {
+            if (entry.*) |known| {
+                if (known.program == bindings.program_address and known.pc == inst.pc) return;
+                continue;
+            }
+            entry.* = .{ .program = bindings.program_address, .pc = inst.pc };
+            std.debug.print("[resource failure] stage={s} program=0x{x} pc=0x{x} op={s} ud_base={d}\n", .{
+                @tagName(bindings.stage), bindings.program_address, inst.pc, @tagName(inst.opcode), bindings.scalar_user_data_base,
+            });
+            std.debug.print("[resource userdata]", .{});
+            for (bindings.user_data[0..bindings.user_data_count]) |word| std.debug.print(" {x:0>8}", .{word});
+            std.debug.print("\n[resource scalars]", .{});
+            for (scalar.registers, 0..) |reg, index| {
+                if (reg.known) std.debug.print(" s{d}={x:0>8}@{x}", .{ index, reg.value, reg.producer_pc });
+            }
+            std.debug.print("\n", .{});
+            return;
+        }
+    }
+
     fn decodeDirectGuestDraw(packet: gpu.pm4.Packet, state: *const gpu.State) ?GuestDraw {
         // AGC's DRAW_INDEX_2 body is max_size, index_va_lo/hi, index_count,
         // draw_initiator — the same layout bootstrap services emit. AUTO is the
@@ -22176,6 +22226,12 @@ fn dumpShaderResourceOps(analysis: *const gpu.ShaderAnalysis) void {
             .buffer_load_sbyte,
             .buffer_load_ushort,
             .buffer_load_sshort,
+            .buffer_load_ubyte_d16,
+            .buffer_load_ubyte_d16_hi,
+            .buffer_load_sbyte_d16,
+            .buffer_load_sbyte_d16_hi,
+            .buffer_load_short_d16,
+            .buffer_load_short_d16_hi,
             .buffer_load_dword,
             .buffer_load_dwordx2,
             .buffer_load_dwordx3,
@@ -22184,6 +22240,10 @@ fn dumpShaderResourceOps(analysis: *const gpu.ShaderAnalysis) void {
             .buffer_load_format_xy,
             .buffer_load_format_xyz,
             .buffer_load_format_xyzw,
+            .buffer_load_format_d16_x,
+            .buffer_load_format_d16_xy,
+            .buffer_load_format_d16_xyz,
+            .buffer_load_format_d16_xyzw,
             .buffer_store_byte,
             .buffer_store_short,
             .buffer_store_dword,
@@ -22194,6 +22254,10 @@ fn dumpShaderResourceOps(analysis: *const gpu.ShaderAnalysis) void {
             .buffer_store_format_xy,
             .buffer_store_format_xyz,
             .buffer_store_format_xyzw,
+            .buffer_store_format_d16_x,
+            .buffer_store_format_d16_xy,
+            .buffer_store_format_d16_xyz,
+            .buffer_store_format_d16_xyzw,
             .s_load_dword,
             .s_load_dwordx2,
             .s_load_dwordx4,
@@ -22746,6 +22810,12 @@ fn needsResourceScalarCheckpoint(inst: gpu.ShaderInstruction) bool {
         .buffer_load_sbyte,
         .buffer_load_ushort,
         .buffer_load_sshort,
+        .buffer_load_ubyte_d16,
+        .buffer_load_ubyte_d16_hi,
+        .buffer_load_sbyte_d16,
+        .buffer_load_sbyte_d16_hi,
+        .buffer_load_short_d16,
+        .buffer_load_short_d16_hi,
         .buffer_load_dword,
         .buffer_load_dwordx2,
         .buffer_load_dwordx3,
@@ -22754,6 +22824,10 @@ fn needsResourceScalarCheckpoint(inst: gpu.ShaderInstruction) bool {
         .buffer_load_format_xy,
         .buffer_load_format_xyz,
         .buffer_load_format_xyzw,
+        .buffer_load_format_d16_x,
+        .buffer_load_format_d16_xy,
+        .buffer_load_format_d16_xyz,
+        .buffer_load_format_d16_xyzw,
         .s_buffer_load_dword,
         .s_buffer_load_dwordx2,
         .s_buffer_load_dwordx4,
@@ -22769,6 +22843,10 @@ fn needsResourceScalarCheckpoint(inst: gpu.ShaderInstruction) bool {
         .buffer_store_format_xy,
         .buffer_store_format_xyz,
         .buffer_store_format_xyzw,
+        .buffer_store_format_d16_x,
+        .buffer_store_format_d16_xy,
+        .buffer_store_format_d16_xyz,
+        .buffer_store_format_d16_xyzw,
         .buffer_atomic_swap,
         .buffer_atomic_add,
         .buffer_atomic_sub,
@@ -23324,6 +23402,12 @@ fn seedVertexBufferScalars(
             .buffer_load_sbyte,
             .buffer_load_ushort,
             .buffer_load_sshort,
+            .buffer_load_ubyte_d16,
+            .buffer_load_ubyte_d16_hi,
+            .buffer_load_sbyte_d16,
+            .buffer_load_sbyte_d16_hi,
+            .buffer_load_short_d16,
+            .buffer_load_short_d16_hi,
             .buffer_load_dword,
             .buffer_load_dwordx2,
             .buffer_load_dwordx3,
@@ -23332,6 +23416,10 @@ fn seedVertexBufferScalars(
             .buffer_load_format_xy,
             .buffer_load_format_xyz,
             .buffer_load_format_xyzw,
+            .buffer_load_format_d16_x,
+            .buffer_load_format_d16_xy,
+            .buffer_load_format_d16_xyz,
+            .buffer_load_format_d16_xyzw,
             => true,
             else => false,
         };

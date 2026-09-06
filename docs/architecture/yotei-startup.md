@@ -316,6 +316,59 @@ shader with an 8x8 local size. Its GDS `ds_add_u32` at `0x2bc` is rejected as
 workgroup memory. Unresolved image descriptors also remain in other compute
 programs. These are separate gaps from fragment storage-image translation.
 
+## Compute resource guards and lane-prefix decoding
+
+Uniform branch pruning now propagates known scalar values through the CFG,
+retaining a value at a join only when every incoming path agrees. Unrelated
+vector instructions no longer discard loaded uniform flags. Zero-count loops
+can therefore skip unbound image operations without rejecting the dispatch.
+The separate resource walk can leave a loop with an unresolved scalar exit,
+invalidate its scalar writes and recover independent descriptors after it.
+`PS5_TRACE_RESOURCE_FAILURES=1` records the instruction, USER_DATA and known
+scalar producers when resource staging fails.
+
+Compute DS atomics now support indexed GDS segments and return the old value
+for return-form operations. The new GPU probe checks persistent updates across
+workgroups, both halves of EXEC, segment/physical bounds and returned values.
+
+The decoder and translator also support byte/short D16 loads, formatted D16
+loads and unsigned 16-bit CMPX. Formatted D16 stores currently support identity
+channel selection with 16/32-bit float or integer components; other store
+conversions remain explicitly unsupported. Byte accesses use the containing
+aligned word for bounds checks. Atomic byte masks prevent adjacent halfword
+stores by different lanes from losing each other's updates.
+
+A subsequent allocation trace identified a separate decoder error: native
+VOP3 opcodes `0x365`/`0x366` are RDNA2 `V_MBCNT_LO/HI_U32_B32`, not the float
+minimum/maximum operations assigned these numbers on newer architectures.
+See AMD's [RDNA2 ISA reference, section 12.12](https://docs.amd.com/api/khub/documents/Et~wpu9g~Ffl7d9q0QZ~Og/content).
+The translator now counts all low-half mask bits for lanes 32–63 and avoids
+out-of-range shifts. A GPU probe checks every lane's prefix and uses the
+result to select exactly one GDS counter update, including a mask whose only
+active lane is 63.
+
+Before this correction, repeated runs exhausted the game's fixed graphics
+pool (`0x5000000000..0x50d3400000`) while allocating model output buffers at
+`0x114dfc6`. A later allocation at `0x11545dc` returned null and the guest
+faulted in `memset`. The trace distinguishes this guest-pool exhaustion from
+host Vulkan allocation failure; no pool-size override was added.
+
+GDS/prefix, packed-buffer and full Vulkan probes pass on the RTX 3070 Ti with
+SDK 1.4.357.0 validation and synchronization validation enabled. The scalar
+tests (24) and native-VOP3 decoder tests (6) pass. The older DS addtid translator
+test still fails with `UnsupportedBufferAddressing` on the unchanged baseline.
+With the lane-prefix correction, the game passes the old null-allocation
+failure, reaches loader state 35 and resolves over 2300 resources. About
+112 MiB remains in the graphics pool at the state-32 transition. Indexed draw
+uploads now occur, but the inspected state-32 window is still black.
+
+The next observed decoder refusal, `V_CMPX_CLASS_F32` at `0x64d8` in compute
+program `0x8052d9d500`, is also implemented. Its original SDWA instruction is
+tested on the GPU with positive/negative finite values, zero, subnormals,
+infinities and NaNs, including source modifiers and preservation of VCC.
+Dynamic descriptor selection in `0x8000333c00` remains unresolved. A complete
+menu rendering has not yet been confirmed.
+
 ## Baseline before the timestamp fix
 
 A five-minute run continues rendering after the movie, at approximately

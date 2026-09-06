@@ -165,6 +165,7 @@ fn vopcOpcode(id: u32) isa.Opcode {
         0x86 => .v_cmp_ge_i32,
         0x87 => .v_cmp_t_i32,
         0x88 => .v_cmp_class_f32,
+        0x98 => .v_cmpx_class_f32,
         0x89 => .v_cmp_lt_i16,
         0x8a => .v_cmp_eq_i16,
         0x8b => .v_cmp_le_i16,
@@ -185,6 +186,12 @@ fn vopcOpcode(id: u32) isa.Opcode {
         0xad => .v_cmp_ne_u16,
         0xae => .v_cmp_ge_u16,
         0xb5 => .v_cmpx_ne_i64,
+        0xb9 => .v_cmpx_lt_u16,
+        0xba => .v_cmpx_eq_u16,
+        0xbb => .v_cmpx_le_u16,
+        0xbc => .v_cmpx_gt_u16,
+        0xbd => .v_cmpx_ne_u16,
+        0xbe => .v_cmpx_ge_u16,
         0xc0 => .v_cmp_f_u32,
         0xc1 => .v_cmp_lt_u32,
         0xc2 => .v_cmp_eq_u32,
@@ -240,6 +247,7 @@ fn isCompareExec(op: isa.Opcode) bool {
         .v_cmpx_neq_f32,
         .v_cmpx_nlt_f32,
         .v_cmpx_tru_f32,
+        .v_cmpx_class_f32,
         .v_cmpx_lt_i32,
         .v_cmpx_eq_i32,
         .v_cmpx_le_i32,
@@ -252,6 +260,12 @@ fn isCompareExec(op: isa.Opcode) bool {
         .v_cmpx_gt_u32,
         .v_cmpx_ne_u32,
         .v_cmpx_ge_u32,
+        .v_cmpx_lt_u16,
+        .v_cmpx_eq_u16,
+        .v_cmpx_le_u16,
+        .v_cmpx_gt_u16,
+        .v_cmpx_ne_u16,
+        .v_cmpx_ge_u16,
         .v_cmpx_lt_f16,
         .v_cmpx_eq_f16,
         .v_cmpx_le_f16,
@@ -552,11 +566,10 @@ fn nativeVop3Opcode(id: u32) isa.Opcode {
         0x362 => .v_ldexp_f32,
         0x363 => .v_bfm_b32,
         0x364 => .v_bcnt_u32_b32,
-        // RDNA2's ordered min/max encodings.  LLVM exposes the same opcode
-        // numbers as V_MINIMUM/V_MAXIMUM on newer targets; PS5 shaders use
-        // them for finite clamp bounds in export programs.
-        0x365 => .v_min_f32,
-        0x366 => .v_max_f32,
+        // RDNA2 ISA opcodes 869/870 count active lanes before this lane.
+        // The same numbers denote float min/max on newer architectures.
+        0x365 => .v_mbcnt_lo_u32_b32,
+        0x366 => .v_mbcnt_hi_u32_b32,
         0x368 => .v_cvt_pknorm_i16_f32,
         0x369 => .v_cvt_pknorm_u16_f32,
         0x36a => .v_cvt_pk_u16_u32,
@@ -637,6 +650,8 @@ fn vop3SourceCount(op: isa.Opcode, id: u32) u32 {
         .v_subrev_i32,
         .v_bfm_b32,
         .v_bcnt_u32_b32,
+        .v_mbcnt_lo_u32_b32,
+        .v_mbcnt_hi_u32_b32,
         .v_mul_f64,
         .v_cvt_pknorm_i16_f32,
         .v_cvt_pknorm_u16_f32,
@@ -645,7 +660,7 @@ fn vop3SourceCount(op: isa.Opcode, id: u32) u32 {
         => 2,
         else => if (id >= 0x180 and id <= 0x1ff)
             1
-        else if (id <= 0x13f or id == 0x365 or id == 0x366)
+        else if (id <= 0x13f)
             2
         else
             3,
@@ -816,16 +831,25 @@ test "VOP3B addc decodes scalar carry input and destination" {
     try std.testing.expect(!inst.src1.absolute);
 }
 
-test "native VOP3 ordered float min max use two sources" {
-    const minimum = try decodeVop3(0, &.{ 0xd765_0007, 0x0001_00c1 }, 0);
-    try std.testing.expectEqual(isa.Opcode.v_min_f32, minimum.opcode);
-    try std.testing.expectEqual(@as(u32, 2), minimum.src_count);
-    try std.testing.expectEqual(@as(i32, -1), minimum.src0.signed_val);
-    try std.testing.expectEqual(@as(i32, 0), minimum.src1.signed_val);
+test "RDNA2 native VOP3 masked bit counts use two sources" {
+    const low = try decodeVop3(0, &.{ 0xd765_0007, 0x0001_00c1 }, 0);
+    try std.testing.expectEqual(isa.Opcode.v_mbcnt_lo_u32_b32, low.opcode);
+    try std.testing.expectEqual(@as(u32, 2), low.src_count);
+    try std.testing.expectEqual(@as(i32, -1), low.src0.signed_val);
+    try std.testing.expectEqual(@as(i32, 0), low.src1.signed_val);
 
-    const maximum = try decodeVop3(8, &.{ 0xd766_0009, 0x0001_00c1 }, 0);
-    try std.testing.expectEqual(isa.Opcode.v_max_f32, maximum.opcode);
-    try std.testing.expectEqual(@as(u32, 2), maximum.src_count);
+    const high = try decodeVop3(8, &.{ 0xd766_0009, 0x0001_00c1 }, 0);
+    try std.testing.expectEqual(isa.Opcode.v_mbcnt_hi_u32_b32, high.opcode);
+    try std.testing.expectEqual(@as(u32, 2), high.src_count);
+}
+
+test "CMPX CLASS F32 SDWA preserves scalar class mask and source modifiers" {
+    const inst = try decodeVopc(0x64d8, &.{ 0x7d31_70f9, 0x8636_0015 }, 0);
+    try std.testing.expectEqual(isa.Opcode.v_cmpx_class_f32, inst.opcode);
+    try std.testing.expectEqual(isa.OperandKind.exec_lo, inst.dst.kind);
+    try std.testing.expectEqual(@as(u32, 21), inst.src0.reg);
+    try std.testing.expect(inst.src0.absolute and inst.src0.negate);
+    try std.testing.expectEqual(@as(i32, 56), inst.src1.signed_val);
 }
 
 test "native VOP3 ldexp uses a float value and signed exponent" {

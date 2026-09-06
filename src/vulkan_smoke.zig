@@ -719,11 +719,278 @@ fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("large headerless compute shader passed: 4203 instructions\n", .{});
 }
 
+fn runGdsAtomicProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const code = [_]u32{
+        0xbefc_0300, // s_mov_b32 m0, s0 (base / size)
+        vop1(1, 1, 1), // increment from s1
+        vop1(1, 2, 4), // relative address from s4
+        0xbefe_0402, // EXEC = s2:s3
+        0xd802_0004, 0x0000_0102, // ds_add_u32 v2, v1 offset:4 gds
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 5 << 1);
+    const cases = [_]struct { m0: u32 = 0x0100_000c, value: u32, mask: u64, address: u32 = 4, expected: u32 }{
+        .{ .value = 2, .mask = 1, .expected = 6 },
+        .{ .value = 3, .mask = @as(u64, 1) << 40, .expected = 15 },
+        .{ .value = 99, .mask = 0, .expected = 15 },
+        .{ .value = 99, .mask = 1, .address = 8, .expected = 15 }, // segment overflow
+        .{ .value = 99, .mask = 1, .address = 0xffff_fffc, .expected = 15 }, // wrapping offset
+        .{ .m0 = 0xfffc_0008, .value = 99, .mask = 1, .address = 0, .expected = 15 }, // physical overflow
+        .{ .m0 = 0x0100_0000, .value = 99, .mask = 1, .expected = 15 }, // empty segment
+    };
+    for (cases) |case| {
+        for ([_]u32{ case.m0, case.value, @truncate(case.mask), @truncate(case.mask >> 32), case.address }, 0..) |word, index| {
+            try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+        }
+        const report = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 3, 1, 1 });
+        try std.testing.expect(report.spirv_words != 0);
+        for (0..renderer.gds_storage.items.len / 4) |index| {
+            const expected: u32 = if (index == 0x108 / 4) case.expected else 0;
+            try std.testing.expectEqual(expected, std.mem.readInt(u32, renderer.gds_storage.items[index * 4 ..][0..4], .little));
+        }
+    }
+    const return_code = [_]u32{
+        0xbefc_0300, vop1(1, 1, 1), vop1(1, 2, 4),
+        0xd882_0004, 0x0300_0102, // ds_add_rtn_u32 v3, v2, v1 offset:4 gds
+        0xe070_0000, 0x8002_0300, // buffer_store_dword v3, V#s8
+        0xbf81_0000,
+    };
+    for (return_code, 0..) |word, index| guest.word(0x200 + index * 4, word);
+    try state.writeRegister(.shader, compute.programRegisterBase(), 2);
+    try state.writeRegister(.shader, 0x213, 12 << 1);
+    for ([_]u32{ 0x0100_000c, 2, 0, 0, 4, 0, 0, 0, 0x18000, 4 << 16, 1, 0 }, 0..) |word, index| {
+        try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+    }
+    const returned = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+    try std.testing.expect(returned.spirv_words != 0);
+    var previous: [4]u8 = undefined;
+    try renderer.readbackGuestStorageBuffer(0x18000, &previous);
+    try std.testing.expectEqual(@as(u32, 15), std.mem.readInt(u32, &previous, .little));
+    try std.testing.expectEqual(@as(u32, 17), std.mem.readInt(u32, renderer.gds_storage.items[0x108..][0..4], .little));
+    const prefix_code = [_]u32{
+        0xbefc_0300,
+        0xd766_0003, 0x0001_0002, // mbcnt high(s2, 0)
+        0xd765_0003, 0x0002_0601, // mbcnt low(s1, v3)
+        0xe070_2000, 0x8001_0300, // save per-lane prefix
+        0xbefe_0401, // EXEC = mask s1:s2
+        0x7da4_0680, // CMPX EQ 0, v3 selects first active lane
+        0xbe83_1001, // s_bcnt1_i32_b64 s3, s1:s2
+        vop1(1, 4, 3),
+        vop1(1, 5, 128),
+        0xd802_0000,
+        0x0000_0405,
+        0xbf81_0000,
+    };
+    for (prefix_code, 0..) |word, index| guest.word(0x300 + index * 4, word);
+    try state.writeRegister(.shader, compute.programRegisterBase(), 3);
+    try state.writeRegister(.shader, 0x213, 8 << 1);
+    var prefix_total: u32 = 0;
+    for ([_]u64{ 0xffff_ffff_ffff_ffff, 0xaaaa_aaaa_5555_5555, 0x8000_0000_0000_0000 }, 0..) |mask, case_index| {
+        const destination: u32 = 0x19000 + @as(u32, @intCast(case_index)) * 0x1000;
+        for ([_]u32{ 0x0120_0004, @truncate(mask), @truncate(mask >> 32), 0, destination, 4 << 16, 64, 0 }, 0..) |word, index| {
+            try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+        }
+        _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 1, 1, 1 });
+        var prefixes: [256]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(destination, &prefixes);
+        for (0..64) |lane| {
+            const before = (@as(u64, 1) << @intCast(lane)) - 1;
+            try std.testing.expectEqual(@as(u32, @popCount(mask & before)), std.mem.readInt(u32, prefixes[lane * 4 ..][0..4], .little));
+        }
+        prefix_total += @popCount(mask);
+        try std.testing.expectEqual(prefix_total, std.mem.readInt(u32, renderer.gds_storage.items[0x120..][0..4], .little));
+    }
+    std.debug.print("GDS atomic passed: persistent counter, cross-workgroup updates, EXEC low/high, segment and physical bounds, returned value\n", .{});
+}
+
+fn runPackedBufferProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    guest.word(0x10000, 0x01ff_807f);
+    guest.word(0x10004, 0x0000_0080);
+    var code: std.ArrayList(u32) = .empty;
+    defer code.deinit(allocator);
+    for (0..6) |index| {
+        try code.appendSlice(allocator, &.{
+            vop1(1, 1, 255),                                                                            0xa5a5_1234,
+            0xe000_0000 | (@as(u32, @intCast(0x20 + index)) << 18) | @as(u32, if (index < 4) 1 else 3),
+            0x8000_0100, // D16 load from V#s0 to v1
+            0xe070_0000 | @as(u32, @intCast(index * 4)), 0x8001_0100, // result to V#s4
+        });
+    }
+    // An out-of-bounds half load zeros only the selected half.
+    try code.appendSlice(allocator, &.{ vop1(1, 1, 255), 0xa5a5_1234, 0xe084_0010, 0x8000_0100, 0xe070_0018, 0x8001_0100, 0xbf81_0000 });
+    for (code.items, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 8 << 1);
+    for ([_]u32{ 0x10000, 0, 8, 0, 0x11000, 0, 256, 0 }, 0..) |word, index| {
+        try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+    }
+    _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+    var output: [256]u8 = undefined;
+    try renderer.readbackGuestStorageBuffer(0x11000, &output);
+    const expected = [_]u32{ 0xa5a5_0080, 0x0080_1234, 0xa5a5_ff80, 0xff80_1234, 0xa5a5_8001, 0x8001_1234, 0x0000_1234 };
+    for (expected, 0..) |value, index| try std.testing.expectEqual(value, std.mem.readInt(u32, output[index * 4 ..][0..4], .little));
+
+    // CMPX compares only the low half, preserves VCC, and disables matching
+    // lanes in both halves of a wave. A disabled lane retains its sentinel.
+    const compare_code = [_]u32{
+        vop1(1, 1, 255), 0xa5a5_1234,
+        0x3606_009f, // v_and_b32 v3, 31, v0
+        0x3806_06ff, 0x1234_0000, // v_or_b32 v3, high-half sentinel, v3
+        0xbeea_04c1, // VCC = all ones
+        0xbefe_04c1, // EXEC = all ones
+        0x7d7a_0680, // v_cmpx_ne_u16 0, v3
+        0xe070_2000, 0x8001_0100, // indexed store v1
+        0xbefe_04c1, // restore EXEC
+        vop1(1, 2, 106),
+        0xe070_2100, 0x8001_0200, // indexed VCC sentinel in second half
+        0xbf81_0000,
+    };
+    for (compare_code, 0..) |word, index| guest.word(0x300 + index * 4, word);
+    // A second output avoids stale CPU data in the resident first buffer.
+    for (0..128) |index| guest.word(0x12000 + index * 4, 0x1234_5678);
+    try state.writeRegister(.shader, compute.programRegisterBase(), 3);
+    try state.writeRegister(.shader, compute.userDataBase() + 4, 0x12000);
+    try state.writeRegister(.shader, compute.userDataBase() + 5, 4 << 16);
+    try state.writeRegister(.shader, compute.userDataBase() + 6, 128);
+    _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 1, 1, 1 });
+    var compared: [512]u8 = undefined;
+    try renderer.readbackGuestStorageBuffer(0x12000, &compared);
+    for (0..64) |lane| {
+        try std.testing.expectEqual(@as(u32, if (lane % 32 == 0) 0x1234_5678 else 0xa5a5_1234), std.mem.readInt(u32, compared[lane * 4 ..][0..4], .little));
+        try std.testing.expectEqual(@as(u32, 0xffff_ffff), std.mem.readInt(u32, compared[256 + lane * 4 ..][0..4], .little));
+    }
+    const format_code = [_]u32{
+        0xe20c_0000, 0x8000_0400, // format D16 xyzw -> v4:v5
+        0xe074_0000, 0x8001_0400,
+        0xe208_0000, 0x8000_0400, // xyz -> v4:v5
+        0xe074_0008, 0x8001_0400,
+        0xe204_0000, 0x8000_0400, // xy -> v4
+        0xe070_0010, 0x8001_0400,
+        0xe200_0000, 0x8000_0400, // x -> v4
+        0xe070_0014, 0x8001_0400,
+        0xbf81_0000,
+    };
+    for (format_code, 0..) |word, index| guest.word(0x500 + index * 4, word);
+    guest.word(0x14000, 0xff00_ff00);
+    try state.writeRegister(.shader, compute.programRegisterBase(), 5);
+    const formats = [_]struct { format: u32, pair: u32 }{
+        .{ .format = 56, .pair = 0x3c00_0000 }, // UNORM -> half floats
+        .{ .format = 60, .pair = 0x00ff_0000 }, // UINT -> unsigned halfwords
+        .{ .format = 61, .pair = 0xffff_0000 }, // SINT -> signed halfwords
+    };
+    for (formats, 0..) |case, case_index| {
+        const destination: u32 = 0x15000 + @as(u32, @intCast(case_index)) * 0x1000;
+        for ([_]u32{ 0x14000, 0, 4, (case.format << 12) | 4 | (5 << 3) | (6 << 6) | (7 << 9), destination, 0, 256, 0 }, 0..) |word, index| {
+            try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+        }
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        try renderer.readbackGuestStorageBuffer(destination, &output);
+        for ([_]u32{ case.pair, case.pair, case.pair, 0, case.pair, 0 }, 0..) |value, index| {
+            try std.testing.expectEqual(value, std.mem.readInt(u32, output[index * 4 ..][0..4], .little));
+        }
+    }
+    const store_formats = [_]struct { format: u32, count: u32, width: u32 }{
+        .{ .format = 13, .count = 1, .width = 2 },
+        .{ .format = 29, .count = 2, .width = 2 },
+        .{ .format = 74, .count = 3, .width = 4 },
+        .{ .format = 71, .count = 4, .width = 2 },
+        .{ .format = 77, .count = 4, .width = 4 },
+    };
+    for (store_formats, 0..) |case, case_index| {
+        const program: u32 = 7 + @as(u32, @intCast(case_index));
+        const destination: u32 = 0x18000 + @as(u32, @intCast(case_index)) * 0x1000;
+        const stride = case.count * case.width;
+        const store_code = [_]u32{
+            vop1(1, 1, 255), 0xc000_3c00,
+            vop1(1, 2, 255), 0x8000_3800,
+            0x3606_009f,                               0x7d7a_0680, // disable lanes 0 and 32
+            0xe200_2000 | ((0x83 + case.count) << 18), 0x8001_0100,
+            0xbefe_04c1, // restore EXEC; an OOB store must preserve word zero
+            vop1(1, 0, 192), // index 64
+            0xe200_2000 | ((0x83 + case.count) << 18),
+            0x8001_0100,
+            0xbf81_0000,
+        };
+        for (store_code, 0..) |word, index| guest.word(program * 256 + index * 4, word);
+        for (0..stride * 16) |index| guest.word(destination + index * 4, 0x1234_5678);
+        try state.writeRegister(.shader, compute.programRegisterBase(), program);
+        for ([_]u32{ destination, stride << 16, 64, (case.format << 12) | 4 | (5 << 3) | (6 << 6) | (7 << 9) }, 0..) |word, index| {
+            try state.writeRegister(.shader, compute.userDataBase() + 4 + @as(u32, @intCast(index)), word);
+        }
+        _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 1, 1, 1 });
+        var stored: [1024]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(destination, stored[0 .. stride * 64]);
+        const half_values = [_]u16{ 0x3c00, 0xc000, 0x3800, 0x8000 };
+        const float_values = [_]u32{ 0x3f80_0000, 0xc000_0000, 0x3f00_0000, 0x8000_0000 };
+        for (0..64) |lane| {
+            for (0..case.count) |component| {
+                const offset = lane * stride + component * case.width;
+                if (case.width == 2) {
+                    const expected_half: u16 = if (lane % 32 == 0) (if (offset % 4 == 0) 0x5678 else 0x1234) else half_values[component];
+                    try std.testing.expectEqual(expected_half, std.mem.readInt(u16, stored[offset..][0..2], .little));
+                } else {
+                    try std.testing.expectEqual(if (lane % 32 == 0) @as(u32, 0x1234_5678) else float_values[component], std.mem.readInt(u32, stored[offset..][0..4], .little));
+                }
+            }
+        }
+    }
+    const class_code = [_]u32{
+        0xe030_2000,     0x8000_1500,
+        vop1(1, 1, 255), 0xa5a5_1234,
+        0xbeea_04c1,     0xbefe_04c1,
+        0x7d31_70f9, 0x8636_0015, // actual scene CMPX CLASS -abs(v21), negative finite/zero
+        0xe070_2000, 0x8001_0100,
+        0xbefe_04c1, vop1(1, 2, 106),
+        0xe070_2040, 0x8001_0200,
+        0xbf81_0000,
+    };
+    for (class_code, 0..) |word, index| guest.word(0xd00 + index * 4, word);
+    const class_values = [_]u32{ 0, 0x8000_0000, 1, 0x8000_0001, 0x3f80_0000, 0xbf80_0000, 0x7f80_0000, 0xff80_0000, 0x7fc0_0000, 0x7f80_0001 };
+    for (class_values, 0..) |word, index| guest.word(0x1d000 + index * 4, word);
+    for (0..32) |index| guest.word(0x1e000 + index * 4, 0x1234_5678);
+    for ([_]u32{ 0x1d000, 4 << 16, class_values.len, 0, 0x1e000, 4 << 16, 32, 0 }, 0..) |word, index| {
+        try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+    }
+    try state.writeRegister(.shader, compute.programRegisterBase(), 13);
+    _ = try renderer.dispatchRdna2State(&state, .{ class_values.len, 1, 1 }, .{ 1, 1, 1 });
+    var classified: [128]u8 = undefined;
+    try renderer.readbackGuestStorageBuffer(0x1e000, &classified);
+    for (0..class_values.len) |lane| {
+        try std.testing.expectEqual(@as(u32, if (lane < 6) 0xa5a5_1234 else 0x1234_5678), std.mem.readInt(u32, classified[lane * 4 ..][0..4], .little));
+        try std.testing.expectEqual(@as(u32, 0xffff_ffff), std.mem.readInt(u32, classified[64 + lane * 4 ..][0..4], .little));
+    }
+    std.debug.print("packed buffer probe passed: D16 loads/stores, adjacent halfwords, bounds, half/float packing, CMPX U16 and CLASS F32\n", .{});
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-reuse")) {
         try runQueuedBufferReuseProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--gds")) {
+        try runGdsAtomicProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--packed-buffer")) {
+        try runPackedBufferProbe(allocator);
         return;
     }
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_graphics_probe = true });

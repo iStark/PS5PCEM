@@ -534,6 +534,7 @@ fn run(init: std.process.Init) !bool {
     const prefer_integrated_gpu = init.minimal.environ.containsUnempty(allocator, "PS5_VULKAN_PREFER_INTEGRATED") catch false;
     const dump_compute_spirv = init.minimal.environ.containsUnempty(allocator, "PS5_DUMP_COMPUTE_SPIRV") catch false;
     const dump_graphics_spirv = init.minimal.environ.containsUnempty(allocator, "PS5_DUMP_GRAPHICS_SPIRV") catch false;
+    const trace_resource_failures = init.minimal.environ.containsUnempty(allocator, "PS5_TRACE_RESOURCE_FAILURES") catch false;
     const capture_extended_progress_frames = init.minimal.environ.containsUnempty(
         allocator,
         "PS5_CAPTURE_PROGRESS_FRAMES",
@@ -609,6 +610,7 @@ fn run(init: std.process.Init) !bool {
             .prefer_integrated_gpu = prefer_integrated_gpu,
             .dump_compute_spirv = dump_compute_spirv,
             .dump_graphics_spirv = dump_graphics_spirv,
+            .trace_resource_failures = trace_resource_failures,
             .capture_extended_progress_frames = capture_extended_progress_frames,
             .enable_shader_ir = enable_shader_ir,
             .enable_shader_ssa_optimization = enable_shader_ssa,

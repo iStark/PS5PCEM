@@ -2486,7 +2486,7 @@ const Builder = struct {
         } else lane;
         const one = try self.constant(.bits32, 1);
         const shifted = self.id();
-        try self.emit(&self.body, 196, &.{ self.bits_type, shifted, one, relative });
+        try self.emit(&self.body, 196, &.{ self.bits_type, shifted, one, try self.andBits(relative, 31) });
         const mask = self.id();
         try self.emit(&self.body, 130, &.{ self.bits_type, mask, shifted, one });
         const in_range = self.id();
@@ -2497,7 +2497,9 @@ const Builder = struct {
             try self.constant(.bits32, 32),
         });
         const selected_mask = self.id();
-        try self.emit(&self.body, 169, &.{ self.bits_type, selected_mask, in_range, mask, try self.constant(.bits32, 0) });
+        // Every low-half bit precedes lanes 32..63. High-half bits do not
+        // precede lanes 0..31. Mask the shift above to keep both paths defined.
+        try self.emit(&self.body, 169, &.{ self.bits_type, selected_mask, in_range, mask, try self.constant(.bits32, if (high_half) 0 else 0xffff_ffff) });
         const masked = self.id();
         try self.emit(&self.body, 199, &.{ self.bits_type, masked, bits, selected_mask });
         const count = self.id();
@@ -5761,6 +5763,35 @@ const Builder = struct {
         return invocation;
     }
 
+    fn indexedGdsAccess(self: *Builder, inst: instruction.Instruction) Error!WorkgroupAccess {
+        if (self.stage != .compute or inst.src0.kind != .vgpr or inst.memory_offset < 0) {
+            return Error.UnsupportedBufferAddressing;
+        }
+        // M0 packs a byte base in the high half and a byte size in the low
+        // half (AMD GCN ISA, section 3.7). The VGPR and immediate are relative
+        // to that segment; both its bounds and the physical 64 KiB apply.
+        const m0 = try self.source(.{ .kind = .m0 }, .bits32);
+        const base = try self.shiftRightBits(m0, 16);
+        const size = try self.andBits(m0, 0xffff);
+        const address = try self.source(inst.src0, .bits32);
+        const relative = try self.addBits(address, try self.constant(.bits32, @intCast(inst.memory_offset)));
+        const absolute = try self.addBits(base, relative);
+        var access = try self.gdsAccess(try self.shiftRightBits(absolute, 2));
+        const large_enough = self.id();
+        try self.emit(&self.body, 174, &.{ self.bool_type, large_enough, size, try self.constant(.bits32, 4) }); // OpUGreaterThanEqual
+        const last_start = self.id();
+        try self.emit(&self.body, 130, &.{ self.bits_type, last_start, size, try self.constant(.bits32, 4) });
+        const inside_segment = self.id();
+        try self.emit(&self.body, 178, &.{ self.bool_type, inside_segment, relative, last_start }); // OpULessThanEqual
+        const no_wrap = self.id();
+        try self.emit(&self.body, 174, &.{ self.bool_type, no_wrap, relative, address });
+        access.in_range = try self.logicalAndValue(access.in_range, try self.logicalAndValue(
+            no_wrap,
+            try self.logicalAndValue(large_enough, inside_segment),
+        ));
+        return access;
+    }
+
     /// Ordered append/consume operates once per guest wave, not once per lane.
     /// The active lanes reserve one contiguous range and all receive the same
     /// pre-operation base; the shader applies its own lane prefix afterwards.
@@ -5970,8 +6001,9 @@ const Builder = struct {
     }
 
     fn dsAtomic(self: *Builder, inst: instruction.Instruction, opcode: u16) Error!void {
-        const byte_address = try self.workgroupByteAddress(inst, @intCast(inst.memory_offset));
+        const byte_address = if (inst.gds) 0 else try self.workgroupByteAddress(inst, @intCast(inst.memory_offset));
         if (self.stage != .compute) {
+            if (inst.gds) return Error.UnsupportedBufferAddressing;
             // Graphics shaders have no Vulkan workgroup corresponding to the
             // guest wave's LDS. Their DS scratch is private per invocation,
             // where an atomic is equivalent to a load/modify/store and avoids
@@ -6057,24 +6089,48 @@ const Builder = struct {
             return;
         }
 
-        const access = try self.workgroupAccess(byte_address);
+        const access = if (inst.gds) try self.indexedGdsAccess(inst) else try self.workgroupAccess(byte_address);
         const predicate = (try self.writePredicate(access.in_range)) orelse access.in_range;
+        const returns_value = switch (inst.opcode) {
+            .ds_add_rtn_u32,
+            .ds_sub_rtn_u32,
+            .ds_min_rtn_i32,
+            .ds_min_rtn_u32,
+            .ds_max_rtn_i32,
+            .ds_max_rtn_u32,
+            .ds_and_rtn_b32,
+            .ds_or_rtn_b32,
+            .ds_xor_rtn_b32,
+            .ds_wrxchg_rtn_b32,
+            => true,
+            else => false,
+        };
         const taken = self.id();
         const merge = self.id();
+        const skipped = if (returns_value) self.id() else merge;
         try self.emit(&self.body, 247, &.{ merge, 0 }); // OpSelectionMerge
-        try self.emit(&self.body, 250, &.{ predicate, taken, merge }); // OpBranchConditional
+        try self.emit(&self.body, 250, &.{ predicate, taken, skipped }); // OpBranchConditional
         try self.emit(&self.body, 248, &.{taken});
         const result = self.id();
         try self.emit(&self.body, opcode, &.{
             self.bits_type,
             result,
             access.pointer,
-            try self.constant(.bits32, 2), // ScopeWorkgroup
+            try self.constant(.bits32, if (inst.gds) 1 else 2), // ScopeDevice / ScopeWorkgroup
             try self.constant(.bits32, 0), // relaxed
             try self.source(inst.src1, .bits32),
         });
         try self.emit(&self.body, 249, &.{merge});
+        if (returns_value) {
+            try self.emit(&self.body, 248, &.{skipped});
+            try self.emit(&self.body, 249, &.{merge});
+        }
         try self.emit(&self.body, 248, &.{merge});
+        if (returns_value) {
+            const previous = self.id();
+            try self.emit(&self.body, 245, &.{ self.bits_type, previous, result, taken, try self.constant(.bits32, 0), skipped }); // OpPhi
+            try self.destination(inst.dst, .{ .id = previous, .value_type = .bits32 });
+        }
     }
 
     /// DS_OR_B64 is one atomic operation on GCN. Vulkan exposes only 32-bit
@@ -6587,6 +6643,60 @@ const Builder = struct {
         }
     }
 
+    fn bufferStoreFormatD16(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
+        if (!try self.hasBufferStorage(inst)) return;
+        const binding = self.storageBinding(inst.src1.reg, inst.pc) orelse return Error.InvalidStorageBinding;
+        const format = decodeBufferUnifiedFormat(binding.unified_format) orelse return Error.UnsupportedBufferAddressing;
+        if (format.number != 4 and format.number != 5 and format.number != 7) return Error.UnsupportedBufferAddressing;
+        var component_count: u8 = 0;
+        var byte_count: u32 = 0;
+        for (0..4) |component| {
+            const layout = bufferComponentLayout(format.data, @intCast(component)) orelse break;
+            // Packed normalized formats need a different conversion path.
+            if (layout.bit_offset != 0 or (layout.bit_count != 16 and layout.bit_count != 32) or
+                binding.dst_select[component] != component + 4 or component >= count)
+                return Error.UnsupportedBufferAddressing;
+            component_count += 1;
+            byte_count = @as(u32, layout.byte_offset) + layout.bit_count / 8;
+        }
+        if (component_count == 0) return Error.UnsupportedBufferAddressing;
+        const address = try self.bufferAddress(inst);
+        const last = try self.bufferAddressAdd(address, byte_count - 1);
+        const aligned_last = BufferAddress{ .binding = binding, .byte_offset = try self.andBits(last.byte_offset, 0xffff_fffc) };
+        const within = (try self.wordInRange(aligned_last, 0)) orelse return Error.InvalidStorageBinding;
+        const no_wrap = self.id();
+        try self.emit(&self.body, 174, &.{ self.bool_type, no_wrap, last.byte_offset, address.byte_offset });
+        const valid = self.id();
+        try self.emit(&self.body, 167, &.{ self.bool_type, valid, within, no_wrap });
+        const taken = self.id();
+        const merge = self.id();
+        const enabled = (try self.writePredicate(valid)).?;
+        try self.emit(&self.body, 247, &.{ merge, 0 });
+        try self.emit(&self.body, 250, &.{ enabled, taken, merge });
+        try self.emit(&self.body, 248, &.{taken});
+        for (0..component_count) |component| {
+            const layout = bufferComponentLayout(format.data, @intCast(component)).?;
+            const pair_bits = try self.source(try consecutiveRegister(inst.dst, @intCast(component / 2)), .bits32);
+            var value = try self.andBits(try self.shiftRightBits(pair_bits, @intCast((component % 2) * 16)), 0xffff);
+            if (layout.bit_count == 32) {
+                if (format.number == 7) {
+                    const pair = self.id();
+                    try self.emit(&self.body, 12, &.{ try self.ensureFloatVec2(), pair, self.ensureGlslStd450(), 62, value });
+                    const scalar = self.id();
+                    try self.emit(&self.body, 81, &.{ self.float_type, scalar, pair, 0 });
+                    value = try self.convert(.{ .id = scalar, .value_type = .float32 }, .bits32);
+                } else if (format.number == 5) {
+                    value = try self.signExtendBits(value, 16);
+                }
+            }
+            for (0..layout.bit_count / 8) |byte| {
+                try self.storeBufferByte(try self.bufferAddressAdd(address, @as(u32, layout.byte_offset) + @as(u32, @intCast(byte))), try self.shiftRightBits(value, @intCast(byte * 8)));
+            }
+        }
+        try self.emit(&self.body, 249, &.{merge});
+        try self.emit(&self.body, 248, &.{merge});
+    }
+
     fn asBufferFromFlat(inst: instruction.Instruction) instruction.Instruction {
         var buffer = inst;
         buffer.index_enable = true;
@@ -6664,7 +6774,10 @@ const Builder = struct {
     }
 
     fn loadBufferByte(self: *Builder, address: BufferAddress) Error!u32 {
-        const word = try self.loadBufferWord(address, 0);
+        // Bounds apply to the containing aligned word. Using byte_offset + 3
+        // rejected the last three valid bytes of every storage buffer.
+        const aligned = BufferAddress{ .binding = address.binding, .byte_offset = try self.andBits(address.byte_offset, 0xffff_fffc) };
+        const word = try self.loadBufferWord(aligned, 0);
         const shifted = self.id();
         try self.emit(&self.body, 194, &.{ self.bits_type, shifted, word, try self.subwordShift(address.byte_offset) });
         return self.andBits(shifted, 0xff);
@@ -6867,9 +6980,13 @@ const Builder = struct {
     }
 
     fn bufferLoadFormat(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
+        return self.bufferLoadFormatImpl(inst, count, false);
+    }
+
+    fn bufferLoadFormatImpl(self: *Builder, inst: instruction.Instruction, count: u8, pack_output: bool) Error!void {
         if (!try self.hasBufferStorage(inst)) {
             const zero = try self.constant(.bits32, 0);
-            for (0..count) |destination_index| {
+            for (0..(if (pack_output) (count + 1) / 2 else count)) |destination_index| {
                 try self.destination(try consecutiveRegister(inst.dst, @intCast(destination_index)), .{
                     .id = zero,
                     .value_type = .bits32,
@@ -6879,12 +6996,14 @@ const Builder = struct {
         }
         const binding = self.storageBinding(inst.src1.reg, inst.pc) orelse return Error.InvalidStorageBinding;
         const format = decodeBufferUnifiedFormat(binding.unified_format) orelse {
+            if (pack_output) return Error.UnsupportedBufferAddressing;
             try self.bufferLoadWords(inst, count);
             return;
         };
         // FORMAT=0 is invalid/null. Preserve the former raw-dword behaviour
         // for callers that have not captured descriptor format metadata yet.
         if (format.data == 0) {
+            if (pack_output) return Error.UnsupportedBufferAddressing;
             try self.bufferLoadWords(inst, count);
             return;
         }
@@ -6902,6 +7021,7 @@ const Builder = struct {
                 try self.constant(.bits32, if (component == 3) one_bits else 0);
         }
 
+        var selected: [4]u32 = undefined;
         for (0..count) |destination_index| {
             const selector = binding.dst_select[destination_index];
             const value = switch (selector) {
@@ -6910,20 +7030,56 @@ const Builder = struct {
                 4...7 => canonical[selector - 4],
                 else => try self.constant(.bits32, 0),
             };
-            try self.destination(try consecutiveRegister(inst.dst, @intCast(destination_index)), .{
-                .id = value,
-                .value_type = .bits32,
-            });
+            selected[destination_index] = value;
+        }
+        if (!pack_output) {
+            for (selected[0..count], 0..) |value, destination_index| {
+                try self.destination(try consecutiveRegister(inst.dst, @intCast(destination_index)), .{ .id = value, .value_type = .bits32 });
+            }
+            return;
+        }
+        for (0..(count + 1) / 2) |destination_index| {
+            const component = destination_index * 2;
+            const low = selected[component];
+            const high = if (component + 1 < count) selected[component + 1] else try self.constant(.bits32, 0);
+            const value = self.id();
+            if (format.number == 4 or format.number == 5) {
+                const low_half = try self.andBits(low, 0xffff);
+                const high_half = self.id();
+                try self.emit(&self.body, 196, &.{ self.bits_type, high_half, high, try self.constant(.bits32, 16) });
+                try self.emit(&self.body, 197, &.{ self.bits_type, value, low_half, high_half });
+            } else {
+                const pair = self.id();
+                try self.emit(&self.body, 80, &.{ try self.ensureFloatVec2(), pair, try self.convert(.{ .id = low, .value_type = .bits32 }, .float32), try self.convert(.{ .id = high, .value_type = .bits32 }, .float32) });
+                try self.emit(&self.body, 12, &.{ self.bits_type, value, self.ensureGlslStd450(), 58, pair });
+            }
+            try self.destination(try consecutiveRegister(inst.dst, @intCast(destination_index)), .{ .id = value, .value_type = .bits32 });
         }
     }
 
     fn bufferLoadSubword(self: *Builder, inst: instruction.Instruction, width: u8, signed: bool) Error!void {
+        const result = try self.bufferLoadSubwordValue(inst, width, signed);
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
+    fn bufferLoadD16(self: *Builder, inst: instruction.Instruction, width: u8, signed: bool, high: bool) Error!void {
+        const previous = try self.source(inst.dst, .bits32);
+        const loaded = try self.bufferLoadSubwordValue(inst, width, signed);
+        var inserted = try self.andBits(loaded, 0xffff);
+        if (high) {
+            const shifted = self.id();
+            try self.emit(&self.body, 196, &.{ self.bits_type, shifted, inserted, try self.constant(.bits32, 16) });
+            inserted = shifted;
+        }
+        const preserved = try self.andBits(previous, if (high) 0xffff else 0xffff_0000);
+        const combined = self.id();
+        try self.emit(&self.body, 197, &.{ self.bits_type, combined, preserved, inserted });
+        try self.destination(inst.dst, .{ .id = combined, .value_type = .bits32 });
+    }
+
+    fn bufferLoadSubwordValue(self: *Builder, inst: instruction.Instruction, width: u8, signed: bool) Error!u32 {
         if (!try self.hasBufferStorage(inst)) {
-            try self.destination(inst.dst, .{
-                .id = try self.constant(.bits32, 0),
-                .value_type = .bits32,
-            });
-            return;
+            return self.constant(.bits32, 0);
         }
         const address = try self.bufferAddress(inst);
         var result = try self.loadBufferByte(address);
@@ -6944,33 +7100,39 @@ const Builder = struct {
             try self.emit(&self.body, 195, &.{ self.signed_type, extended, as_signed, try self.constant(.sint32, amount) });
             result = try self.convert(.{ .id = extended, .value_type = .sint32 }, .bits32);
         }
-        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+        return result;
     }
 
     fn storeBufferByte(self: *Builder, address: BufferAddress, value: u32) Error!void {
-        const access = try self.bufferWordAccess(address, 0);
+        const aligned = BufferAddress{ .binding = address.binding, .byte_offset = try self.andBits(address.byte_offset, 0xffff_fffc) };
+        const access = try self.bufferWordAccess(aligned, 0);
         const pointer = access.pointer;
-        const current = self.id();
-        try self.emit(&self.body, 61, &.{ self.bits_type, current, pointer });
         const shift = try self.subwordShift(address.byte_offset);
         const shifted_mask = self.id();
         try self.emit(&self.body, 196, &.{ self.bits_type, shifted_mask, try self.constant(.bits32, 0xff), shift });
         const inverse_mask = self.id();
         try self.emit(&self.body, 200, &.{ self.bits_type, inverse_mask, shifted_mask }); // OpNot
-        const preserved = self.id();
-        try self.emit(&self.body, 199, &.{ self.bits_type, preserved, current, inverse_mask });
         const masked_value = try self.andBits(value, 0xff);
         const inserted = self.id();
         try self.emit(&self.body, 196, &.{ self.bits_type, inserted, masked_value, shift });
-        const combined = self.id();
-        try self.emit(&self.body, 197, &.{ self.bits_type, combined, preserved, inserted }); // OpBitwiseOr
-        // A byte write past the end must not disturb the word it was clamped
-        // onto, so the read-modify-write is computed either way and only the
-        // store is withheld.
-        if (try self.writePredicate(access.in_range)) |predicate| {
-            try self.guardedStore(predicate, pointer, combined);
-        } else {
-            try self.emit(&self.body, 62, &.{ pointer, combined });
+        const predicate = try self.writePredicate(access.in_range);
+        const merge = self.id();
+        if (predicate) |enabled| {
+            const taken = self.id();
+            try self.emit(&self.body, 247, &.{ merge, 0 });
+            try self.emit(&self.body, 250, &.{ enabled, taken, merge });
+            try self.emit(&self.body, 248, &.{taken});
+        }
+        // Independent lanes can update different bytes of the same word.
+        // Atomic masks preserve their bytes; an ordinary load/store loses
+        // concurrent updates to the neighbouring halfword.
+        const scope = try self.constant(.bits32, 1);
+        const semantics = try self.constant(.bits32, 0);
+        try self.emit(&self.body, 240, &.{ self.bits_type, self.id(), pointer, scope, semantics, inverse_mask });
+        try self.emit(&self.body, 241, &.{ self.bits_type, self.id(), pointer, scope, semantics, inserted });
+        if (predicate != null) {
+            try self.emit(&self.body, 249, &.{merge});
+            try self.emit(&self.body, 248, &.{merge});
         }
     }
 
@@ -7117,6 +7279,7 @@ const Builder = struct {
 
     fn nonExecCompareOpcode(opcode: isa.Opcode) ?isa.Opcode {
         return switch (opcode) {
+            .v_cmpx_class_f32 => .v_cmp_class_f32,
             .v_cmpx_f_f32 => .v_cmp_f_f32,
             .v_cmpx_lt_f32 => .v_cmp_lt_f32,
             .v_cmpx_eq_f32 => .v_cmp_eq_f32,
@@ -7145,6 +7308,12 @@ const Builder = struct {
             .v_cmpx_gt_u32 => .v_cmp_gt_u32,
             .v_cmpx_ne_u32 => .v_cmp_ne_u32,
             .v_cmpx_ge_u32 => .v_cmp_ge_u32,
+            .v_cmpx_lt_u16 => .v_cmp_lt_u16,
+            .v_cmpx_eq_u16 => .v_cmp_eq_u16,
+            .v_cmpx_le_u16 => .v_cmp_le_u16,
+            .v_cmpx_gt_u16 => .v_cmp_gt_u16,
+            .v_cmpx_ne_u16 => .v_cmp_ne_u16,
+            .v_cmpx_ge_u16 => .v_cmp_ge_u16,
             .v_cmpx_lt_f16 => .v_cmp_lt_f16,
             .v_cmpx_eq_f16 => .v_cmp_eq_f16,
             .v_cmpx_le_f16 => .v_cmp_le_f16,
@@ -7513,6 +7682,12 @@ const Builder = struct {
             .buffer_load_sbyte => try self.bufferLoadSubword(inst, 8, true),
             .buffer_load_ushort => try self.bufferLoadSubword(inst, 16, false),
             .buffer_load_sshort => try self.bufferLoadSubword(inst, 16, true),
+            .buffer_load_ubyte_d16 => try self.bufferLoadD16(inst, 8, false, false),
+            .buffer_load_ubyte_d16_hi => try self.bufferLoadD16(inst, 8, false, true),
+            .buffer_load_sbyte_d16 => try self.bufferLoadD16(inst, 8, true, false),
+            .buffer_load_sbyte_d16_hi => try self.bufferLoadD16(inst, 8, true, true),
+            .buffer_load_short_d16 => try self.bufferLoadD16(inst, 16, false, false),
+            .buffer_load_short_d16_hi => try self.bufferLoadD16(inst, 16, false, true),
             .buffer_load_dword,
             => try self.bufferLoadWords(inst, 1),
             .buffer_load_dwordx2,
@@ -7533,6 +7708,10 @@ const Builder = struct {
             .buffer_load_format_xyzw,
             .tbuffer_load_format_xyzw,
             => try self.bufferLoadFormat(inst, 4),
+            .buffer_load_format_d16_x => try self.bufferLoadFormatImpl(inst, 1, true),
+            .buffer_load_format_d16_xy => try self.bufferLoadFormatImpl(inst, 2, true),
+            .buffer_load_format_d16_xyz => try self.bufferLoadFormatImpl(inst, 3, true),
+            .buffer_load_format_d16_xyzw => try self.bufferLoadFormatImpl(inst, 4, true),
             .s_buffer_load_dword => try self.scalarBufferLoadWords(inst, 1),
             .s_buffer_load_dwordx2 => try self.scalarBufferLoadWords(inst, 2),
             .s_buffer_load_dwordx4 => try self.scalarBufferLoadWords(inst, 4),
@@ -7555,6 +7734,10 @@ const Builder = struct {
             },
             .buffer_store_byte => try self.bufferStoreSubword(inst, 8),
             .buffer_store_short => try self.bufferStoreSubword(inst, 16),
+            .buffer_store_format_d16_x => try self.bufferStoreFormatD16(inst, 1),
+            .buffer_store_format_d16_xy => try self.bufferStoreFormatD16(inst, 2),
+            .buffer_store_format_d16_xyz => try self.bufferStoreFormatD16(inst, 3),
+            .buffer_store_format_d16_xyzw => try self.bufferStoreFormatD16(inst, 4),
             .buffer_store_dword,
             .buffer_store_format_x,
             .tbuffer_store_format_x,
@@ -8819,6 +9002,10 @@ fn opcodeUsesWritePredicate(opcode: isa.Opcode) bool {
         .buffer_store_format_xy,
         .buffer_store_format_xyz,
         .buffer_store_format_xyzw,
+        .buffer_store_format_d16_x,
+        .buffer_store_format_d16_xy,
+        .buffer_store_format_d16_xyz,
+        .buffer_store_format_d16_xyzw,
         .ds_write_b32,
         .ds_write2_b32,
         .ds_write_b64,
