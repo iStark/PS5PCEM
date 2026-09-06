@@ -566,6 +566,12 @@ array-gradient probe verifies that the intended array layer is sampled from
 distinct derivative/coordinate values. It, streamed-mip sampling, integer MRTs
 and the full smoke pass SDK validation.
 
+The repeated scene samples at `0x50bdbb0000` use GFX10 format 24
+(RG16_SNORM). Sampled views now use Vulkan's matching normalized signed format,
+which was already supported by storage-image and tiling paths. The array
+gradient probe additionally verifies a negative RG16_SNORM value by GPU
+readback with SDK validation enabled.
+
 ## Baseline before the timestamp fix
 
 A five-minute run continues rendering after the movie, at approximately

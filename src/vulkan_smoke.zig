@@ -1275,6 +1275,12 @@ fn runBc4Probe(allocator: std.mem.Allocator) !void {
 }
 
 fn runArrayGradientProbe(allocator: std.mem.Allocator) !void {
+    try runArrayGradientCase(allocator, 56);
+    try runArrayGradientCase(allocator, 24);
+    std.debug.print("array gradients passed: coordinate ordering, selected array layer and RG16 SNORM sampling\n", .{});
+}
+
+fn runArrayGradientCase(allocator: std.mem.Allocator, format: u32) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
     var guest = GuestMemory{};
@@ -1289,6 +1295,7 @@ fn runArrayGradientProbe(allocator: std.mem.Allocator) !void {
     const tail = [_]u32{ 0xf088_0128, 0x0040_0700, 0xe070_0000, 0x8003_0700, 0xbf81_0000 };
     for (tail, 0..) |word, index| guest.word(0x100 + inputs.len * 8 + index * 4, word);
     var descriptor = sampledImageDescriptorWords(0x12000, 4, 4);
+    descriptor[1] = (descriptor[1] & ~@as(u32, 0x1ff0_0000)) | (format << 20);
     descriptor[3] = (descriptor[3] & 0x0fff_ffff) | 0xd000_0000;
     descriptor[4] = 1; // two array layers
     const texture = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&descriptor));
@@ -1296,7 +1303,9 @@ fn runArrayGradientProbe(allocator: std.mem.Allocator) !void {
         const view = try texture.subresource(0, @intCast(layer), 1);
         for (0..4) |y| for (0..4) |x| {
             const offset = try view.sourceByteOffset(@intCast(x), @intCast(y), 0, 0);
-            guest.word(0x12000 + @as(usize, @intCast(offset)), if (layer == 0) 0xff00_00ff else 0xff00_0040);
+            guest.word(0x12000 + @as(usize, @intCast(offset)), if (format == 24)
+                (if (layer == 0) @as(u32, 0x4000_7fff) else 0x4000_c000)
+            else if (layer == 0) 0xff00_00ff else 0xff00_0040);
         };
     }
     var state = gpu.State{};
@@ -1312,8 +1321,8 @@ fn runArrayGradientProbe(allocator: std.mem.Allocator) !void {
     var output: [4]u8 = undefined;
     try renderer.readbackGuestStorageBuffer(0x10000, &output);
     const actual: f32 = @bitCast(std.mem.readInt(u32, &output, .little));
-    try std.testing.expectApproxEqAbs(@as(f32, 64.0 / 255.0), actual, 0.00001);
-    std.debug.print("array gradients passed: two-component derivatives precede the three-component coordinate body\n", .{});
+    const expected: f32 = if (format == 24) -16384.0 / 32767.0 else 64.0 / 255.0;
+    try std.testing.expectApproxEqAbs(expected, actual, 0.00001);
 }
 
 fn runScalarPointerProbe(allocator: std.mem.Allocator) !void {

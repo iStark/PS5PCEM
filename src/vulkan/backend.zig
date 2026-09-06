@@ -21722,6 +21722,7 @@ fn sampledImageFormat(unified_format: u16, force_srgb: bool) ?u32 {
         21 => vk.format_r32_sint,
         22 => vk.format_r32_sfloat,
         23 => vk.format_r16g16_unorm,
+        24 => vk.format_r16g16_snorm,
         29 => vk.format_r16g16_sfloat,
         64 => vk.format_r32g32_sfloat,
         36 => vk.format_b10g11r11_ufloat_pack32,
