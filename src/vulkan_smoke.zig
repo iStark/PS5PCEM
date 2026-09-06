@@ -1215,6 +1215,118 @@ fn runBc4Probe(allocator: std.mem.Allocator) !void {
     std.debug.print("BC4 probe passed: eight-byte blocks, mip tails, UNORM and SNORM sampling\n", .{});
 }
 
+fn runScalarPointerProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const code = [_]u32{
+        vop1(1, 4, 20), 0xb814_0008, // preserve group index, then multiply by pointer size
+        0xf424_0004, 20 << 25, // s_buffer_load_dwordx2 s0, V#s8, s20
+        0xf408_0100,                 (125 << 25) | 4, // s_load_dwordx4 s4, s0, 4
+        vop1(1, 0, 4),               vop1(1, 1, 5),
+        vop1(1, 2, 6),               vop1(1, 3, 7),
+        mubuf(0x1e, 0, 0, 4, 12)[0], mubuf(0x1e, 0, 0, 4, 12)[1],
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, code.len);
+    defer analysis.deinit(allocator);
+    var module = try analysis.translateSpirv(allocator, .{
+        .stage = .compute,
+        .compute_inputs = .{ .workgroup_id_sgprs = .{ 20, null, null } },
+        .storage_buffers = &.{
+            .{ .resource_sgpr = 8, .descriptor_index = 0, .stride = 8 },
+            .{ .resource_sgpr = 12, .descriptor_index = 1, .stride = 16 },
+        },
+        .scalar_memories = &.{
+            .{ .resource_sgpr = 0, .instruction_pc = 16, .descriptor_index = 2 },
+            .{ .resource_sgpr = 0, .instruction_pc = 16, .descriptor_index = 3 },
+        },
+    });
+    defer module.deinit(allocator);
+    const pointers = [_]u64{ 0x1fffffff0, 0x1fffffff8, 0x2fffffff0, 0x200000004, 0x100000000, 0 };
+    const expected = [_][4]u32{
+        .{ 11, 12, 13, 20 }, .{ 13, 20, 21, 22 }, .{ 0, 0, 0, 0 },
+        .{ 22, 23, 0, 0 },   .{ 0, 0, 0, 0 },     .{ 0, 0, 0, 0 },
+    };
+    for (0..2) |pass| {
+        const relocation = @as(u64, @intCast(pass)) << 36;
+        for (pointers, 0..) |pointer, index| {
+            const value = pointer + relocation;
+            guest.word(0x10000 + index * 8, @truncate(value));
+            guest.word(0x10004 + index * 8, @truncate(value >> 32));
+        }
+        for ([_]u64{ 0x1fffffff0, 0x200000000 }, 0..) |base, region| {
+            const at = 0x12000 + region * 0x100;
+            guest.word(at, @truncate(base + relocation));
+            guest.word(at + 4, @truncate((base + relocation) >> 32));
+            for (0..4) |word| guest.word(at + 8 + word * 4, @intCast(10 + region * 10 + word));
+        }
+        _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, pointers.len * 8);
+        _ = try renderer.stageGuestStorageBufferAt(1, 0x11000, pointers.len * 16);
+        _ = try renderer.stageGuestStorageBufferAt(2, 0x12000, 24);
+        _ = try renderer.stageGuestStorageBufferAt(3, 0x12100, 24);
+        _ = try renderer.dispatchSpirv(module.words, .{ pointers.len, 1, 1 });
+        var output: [pointers.len * 16]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x11000, &output);
+        for (expected, 0..) |words, index| for (words, 0..) |word, component| {
+            try std.testing.expectEqual(word, std.mem.readInt(u32, output[index * 16 + component * 4 ..][0..4], .little));
+        };
+    }
+    std.debug.print("scalar pointer loads passed: runtime pointers, split regions, 32-bit carry, bounds and relocated bases\n", .{});
+}
+
+fn runNestedImageProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .trace_resource_failures = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const code = [_]u32{
+        vop1(1, 0, 28), // workgroup index survives the scalar descriptor loads
+        0x936a_ff1c, 592, // s_mul_i32 vcc_lo, s28, record stride
+        0xf424_000c, 106 << 25, // pointer = s_buffer_load_dwordx2 s0, V#s24, vcc_lo
+        0xf40c_0100, (125 << 25) | 64, // T#s4 = pointer + 64
+        0xf408_0300,                 (125 << 25) | 96, // S#s12 = pointer + 96
+        vop1(1, 1, 255),             0x3e80_0000,
+        vop1(1, 2, 255),             0x3e80_0000,
+        0xf09c_010a,                 0x0061_0301,
+        2,                           mubuf(0x1c, 0, 3, 0, 16)[0],
+        mubuf(0x1c, 0, 3, 0, 16)[1], 0xbf81_0000,
+    };
+    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, (28 << 1) | (1 << 7));
+    var userdata: [28]u32 = @splat(0);
+    @memcpy(userdata[16..20], &[_]u32{ 0x11000, 4 << 16, 3, 0 });
+    @memcpy(userdata[24..28], &[_]u32{ 0x10000, 592 << 16, 2, 0 });
+    for (userdata, 0..) |word, index| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+    for (0..2) |pass| {
+        for (0..2) |object| {
+            const address: u32 = @intCast(0x12000 + pass * 0x2000 + object * 0x1000);
+            guest.word(0x10000 + object * 592, address);
+            guest.word(0x10004 + object * 592, 0);
+            const texture: u32 = @intCast(0x8000 + object * 0x1000);
+            const descriptor = sampledImageDescriptorWords(texture, 1, 1);
+            for (descriptor, 0..) |word, index| guest.word(address + 64 + index * 4, word);
+            guest.word(texture, if (object == 0) 0xff00_00ff else 0xff00_0040);
+        }
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 3, 1, 1 });
+        var output: [12]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x11000, &output);
+        for ([_]f32{ 1, 64.0 / 255.0, 0 }, 0..) |expected, index| {
+            const actual: f32 = @bitCast(std.mem.readInt(u32, output[index * 4 ..][0..4], .little));
+            try std.testing.expectApproxEqAbs(expected, actual, 0.00001);
+        }
+    }
+    try std.testing.expectEqual(@as(u64, 1), renderer.pipeline_cache_misses);
+    try std.testing.expectEqual(@as(u64, 1), renderer.pipeline_cache_hits);
+    std.debug.print("nested sampled images passed: record pointers, runtime T#/S# loads, null bounds and relocated object pages\n", .{});
+}
+
 fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
     for (0..6) |case_index| {
         var renderer = try vulkan.Renderer.init(allocator, .{ .trace_resource_failures = true });
@@ -1319,6 +1431,14 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--indirect-images")) {
         try runIndirectImageProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--scalar-pointers")) {
+        try runScalarPointerProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--nested-images")) {
+        try runNestedImageProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-reuse")) {

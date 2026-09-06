@@ -481,7 +481,8 @@ BC4 allocation sizes. These checks do not replace the next full game run.
 `PS5_TRACE_RESOURCE_FAILURES=1` enables NV GPU fault checkpoints when supported.
 `PS5_TRACE_GPU_COMPLETION_FROM_FRAME=N` additionally waits after each command
 buffer starting at frame N; it is an expensive diagnostic, disabled by default.
-Nested pointer-driven image/sampler tables remain unresolved.
+Nested pointer-driven image/sampler tables require runtime pointer loads;
+the initial scalar-only specialization cannot resolve them.
 
 A descriptor ownership regression test reproduces reuse after an intermediate
 flush in the same pass: the old tick is complete, but a later draw still queues
@@ -501,6 +502,31 @@ first refused the resource and then, after binding alone was corrected, read
 the first texture for every index. The complete fix and full smoke pass with
 SDK validation. The captured material shader's 16 guarded multiplications
 all retain the proven exclusive bound of 255.
+
+The next asynchronous run completes all 6,045 resource requests, reaches
+loader state 40 and clears the loader. It passes the former metadata failure,
+but four later compute submissions stop their queues (three
+`MemoryReadFailed`, one `UnknownInstructionFamily`). The window remains black.
+Four newly reached pixel modules also fail SPIR-V validation because 2D-array
+gradients incorrectly include a third component for the layer. Gradients now
+exclude that component, as required by the SPIR-V image operands specification.
+
+Compute program `0x8000333c00` loads object pointers from 592-byte records,
+then reads T#/S# fields through those pointers. Resource preparation now
+discovers those image candidates and snapshots readable object pages into
+storage buffers with runtime guest-address headers. Pointer-form SMEM uses
+both address halves, carries byte offsets across 32 bits, checks each word
+against the captured regions, and returns zero outside them. Addresses stay
+in buffer data so relocation does not create another pipeline. Discovery is
+bounded by storage capacity and currently requires candidate samplers to agree;
+this is not general GPU virtual-address translation.
+
+The nested-image GPU probe verifies different textures, null/OOB pointers and
+relocated object pages with a pipeline cache hit. A separate scalar probe
+checks loads split across the 4-GiB boundary. Both, the six indirect-image
+cases and the full Vulkan smoke pass with SDK validation. A regression test
+checks the array-gradient operand dimensions. Full game verification of these
+changes is still in progress; menu rendering is not confirmed.
 
 ## Baseline before the timestamp fix
 

@@ -54,6 +54,16 @@ pub const StorageBufferBinding = struct {
     extent_bytes: ?u32 = null,
 };
 
+/// Checked guest memory exposed to pointer-form SMEM. Each SSBO starts with
+/// the captured guest base address (low/high words), followed by its bytes.
+/// Keeping the base in the buffer allows the same pipeline to serve changing
+/// guest allocations. Several regions may serve one load instruction.
+pub const ScalarMemoryBinding = struct {
+    resource_sgpr: u32,
+    instruction_pc: u32,
+    descriptor_index: u32,
+};
+
 pub const SampledImageBinding = struct {
     resource_sgpr: u32,
     sampler_sgpr: u32,
@@ -203,6 +213,7 @@ pub const Options = struct {
     /// convention. Leave clear when PA_CL_CLIP_CNTL selects DX clip space.
     convert_negative_one_to_one_depth: bool = false,
     storage_buffers: []const StorageBufferBinding = &.{},
+    scalar_memories: []const ScalarMemoryBinding = &.{},
     /// Whether the program narrows the execution mask, and so needs to know
     /// which stores are active. Decided from the program by `translate`.
     uses_execution_mask: bool = false,
@@ -575,6 +586,7 @@ const Builder = struct {
     /// are not yet wired from the vertex stage.
     frag_coord_input: u32 = 0,
     storage_bindings: []const StorageBufferBinding,
+    scalar_memory_bindings: []const ScalarMemoryBinding,
     sampled_bindings: []const SampledImageBinding,
     storage_image_bindings: []const StorageImageBinding,
     ngg_lds_exports: []const NggLdsExport,
@@ -683,6 +695,7 @@ const Builder = struct {
             .convert_negative_one_to_one_depth = options.convert_negative_one_to_one_depth,
             .color_export_mappings = options.color_export_mappings,
             .storage_bindings = options.storage_buffers,
+            .scalar_memory_bindings = options.scalar_memories,
             .sampled_bindings = options.sampled_images,
             .storage_image_bindings = options.storage_images,
             .ngg_lds_exports = options.ngg_lds_exports,
@@ -874,7 +887,7 @@ const Builder = struct {
             };
         }
 
-        if (options.storage_buffers.len != 0) {
+        if (options.storage_buffers.len != 0 or options.scalar_memories.len != 0) {
             // Storage buffers are used by compute and by graphics attribute
             // fetch / constant buffer MUBUF paths.
             if (options.descriptor_array_length == 0) {
@@ -894,6 +907,10 @@ const Builder = struct {
                         return Error.InvalidStorageBinding;
                     }
                 }
+            }
+            for (options.scalar_memories) |binding| {
+                if (binding.resource_sgpr + 1 >= 128 or binding.descriptor_index >= options.descriptor_array_length)
+                    return Error.InvalidStorageBinding;
             }
 
             const runtime_words = self.id();
@@ -5290,7 +5307,9 @@ const Builder = struct {
         }
         const dudy = try self.source(try imageAddressOperand(inst, gradient_base + 2), .float32);
         const dvdy = try self.source(try imageAddressOperand(inst, gradient_base + 3), .float32);
-        if (image_dimension == .two_d) {
+        // Array layers select an image; they are not a spatial derivative.
+        // SPIR-V Grad excludes the layer component of 2D-array coordinates.
+        if (image_dimension == .two_d or image_dimension == .two_d_array) {
             const dx = self.id();
             const dy = self.id();
             try self.emit(&self.body, 80, &.{ self.vector2_type, dx, dudx, dvdx });
@@ -6779,6 +6798,70 @@ const Builder = struct {
         try self.bufferLoadWords(mubuf_inst, count);
     }
 
+    fn addPointerOffset(self: *Builder, pointer: [2]u32, offset: u32) Error![2]u32 {
+        const low = try self.addBits(pointer[0], offset);
+        const carry = self.id();
+        try self.emit(&self.body, 176, &.{ self.bool_type, carry, low, pointer[0] }); // OpULessThan
+        const carry_word = self.id();
+        try self.emit(&self.body, 169, &.{ self.bits_type, carry_word, carry, try self.constant(.bits32, 1), try self.constant(.bits32, 0) });
+        return .{ low, try self.andBits(try self.addBits(pointer[1], carry_word), 0xffff) };
+    }
+
+    fn scalarPointerLoadWords(self: *Builder, inst: instruction.Instruction) Error!void {
+        const zero = try self.constant(.bits32, 0);
+        var values: [16]u32 = @splat(zero);
+        if (inst.data_words > values.len) return Error.UnsupportedBufferAddressing;
+        var matched = false;
+        for (self.scalar_memory_bindings) |binding| {
+            if (binding.instruction_pc == inst.pc and inst.src0.kind == .sgpr and binding.resource_sgpr == inst.src0.reg) matched = true;
+        }
+        if (!matched and inst.dst.kind != .sgpr) return;
+        if (matched) {
+            if (inst.memory_offset < 0) return Error.UnsupportedBufferAddressing;
+            const offset = if (inst.src1.kind == .null) zero else try self.source(inst.src1, .bits32);
+            const pointer = try self.addPointerOffset(try self.sourcePair(inst.src0), offset);
+            var addresses: [16][2]u32 = undefined;
+            for (0..inst.data_words) |word| {
+                addresses[word] = try self.addPointerOffset(pointer, try self.constant(.bits32, @as(u32, @intCast(inst.memory_offset)) + @as(u32, @intCast(word * 4))));
+                addresses[word][0] = try self.andBits(addresses[word][0], 0xffff_fffc);
+            }
+            for (self.scalar_memory_bindings) |binding| {
+                if (binding.instruction_pc != inst.pc or binding.resource_sgpr != inst.src0.reg) continue;
+                const host_binding = StorageBufferBinding{ .resource_sgpr = binding.resource_sgpr, .descriptor_index = binding.descriptor_index };
+                const header = BufferAddress{ .binding = host_binding, .byte_offset = zero };
+                const base_low = try self.loadBufferWord(header, 0);
+                const base_high = try self.loadBufferWord(header, 1);
+                for (addresses[0..inst.data_words], 0..) |address, word| {
+                    const relative = self.id();
+                    try self.emit(&self.body, 130, &.{ self.bits_type, relative, address[0], base_low }); // OpISub
+                    const after_header = try self.addBits(relative, try self.constant(.bits32, 8));
+                    const high_matches = self.id();
+                    try self.emit(&self.body, 170, &.{ self.bool_type, high_matches, address[1], base_high });
+                    const above_base = self.id();
+                    try self.emit(&self.body, 174, &.{ self.bool_type, above_base, address[0], base_low });
+                    const no_wrap = self.id();
+                    try self.emit(&self.body, 174, &.{ self.bool_type, no_wrap, after_header, relative });
+                    const in_region = self.id();
+                    try self.emit(&self.body, 167, &.{ self.bool_type, in_region, high_matches, above_base });
+                    const valid = self.id();
+                    try self.emit(&self.body, 167, &.{ self.bool_type, valid, in_region, no_wrap });
+                    const loaded = try self.loadBufferWord(.{ .binding = host_binding, .byte_offset = after_header }, 0);
+                    // A page that does not contain this word must not replace
+                    // a value recovered from another page of a split load.
+                    const within = (try self.wordInRange(.{ .binding = host_binding, .byte_offset = after_header }, 0)).?;
+                    const selected = self.id();
+                    try self.emit(&self.body, 167, &.{ self.bool_type, selected, valid, within });
+                    const result = self.id();
+                    try self.emit(&self.body, 169, &.{ self.bits_type, result, selected, loaded, values[word] });
+                    values[word] = result;
+                }
+            }
+        }
+        for (values[0..inst.data_words], 0..) |value, word| {
+            try self.destination(try consecutiveRegister(inst.dst, @intCast(word)), .{ .id = value, .value_type = .bits32 });
+        }
+    }
+
     fn bufferStoreWords(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
         if (!try self.hasBufferStorage(inst)) return; // drop stores without this host V#
         for (0..count) |index| {
@@ -7864,21 +7947,7 @@ const Builder = struct {
             .s_buffer_load_dwordx4 => try self.scalarBufferLoadWords(inst, 4),
             .s_buffer_load_dwordx8 => try self.scalarBufferLoadWords(inst, 8),
             .s_buffer_load_dwordx16 => try self.scalarBufferLoadWords(inst, 16),
-            // Pointer-form SMEM is expected to be specialized away; if not,
-            // leave destination zero rather than aborting the shader.
-            .s_load_dword, .s_load_dwordx2, .s_load_dwordx4, .s_load_dwordx8, .s_load_dwordx16 => {
-                if (inst.dst.kind == .sgpr) {
-                    var i: u8 = 0;
-                    while (i < inst.data_words) : (i += 1) {
-                        var dest = inst.dst;
-                        dest.reg += i;
-                        try self.destination(dest, .{
-                            .id = try self.constant(.bits32, 0),
-                            .value_type = .bits32,
-                        });
-                    }
-                }
-            },
+            .s_load_dword, .s_load_dwordx2, .s_load_dwordx4, .s_load_dwordx8, .s_load_dwordx16 => try self.scalarPointerLoadWords(inst),
             .buffer_store_byte => try self.bufferStoreSubword(inst, 8),
             .buffer_store_short => try self.bufferStoreSubword(inst, 16),
             .buffer_store_format_d16_x => try self.bufferStoreFormatD16(inst, 1),
@@ -13018,6 +13087,45 @@ test "image_sample_d lowers explicit derivatives" {
     defer module.deinit(std.testing.allocator);
     try std.testing.expect(containsOpcode(module.words, 88)); // OpImageSampleExplicitLod
     try std.testing.expect(!containsOpcode(module.words, 87)); // not implicit LOD
+}
+
+test "2D array explicit gradients omit the layer coordinate" {
+    var program = instruction.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(std.testing.allocator);
+    try program.instructions.append(std.testing.allocator, .{
+        .pc = 0,
+        .family = .mimg,
+        .opcode = .image_sample,
+        .dst = .{ .kind = .vgpr, .reg = 8 },
+        .src0 = .{ .kind = .vgpr, .reg = 0 },
+        .src1 = .{ .kind = .sgpr, .reg = 0 },
+        .src2 = .{ .kind = .sgpr, .reg = 8 },
+        .src_count = 3,
+        .image_dimension = .dim_2d_array_alt,
+        .image_address_components = 7,
+        .image_sample_flags = .{ .derivative = true },
+        .data_mask = 0xf,
+    });
+    try program.instructions.append(std.testing.allocator, .{ .pc = 8, .opcode = .s_endpgm });
+    var module = try translate(std.testing.allocator, &program, .{
+        .stage = .compute,
+        .sampled_images = &.{.{ .resource_sgpr = 0, .sampler_sgpr = 8, .descriptor_index = 0, .instruction_pc = 0, .dimension = .two_d_array }},
+    });
+    defer module.deinit(std.testing.allocator);
+    for ([_]usize{ 5, 6 }) |operand_index| {
+        const derivative = firstInstructionOperand(module.words, 88, operand_index);
+        var found = false;
+        var at: usize = 5;
+        while (at < module.words.len) {
+            const length = module.words[at] >> 16;
+            if (module.words[at] & 0xffff == 80 and module.words[at + 2] == derivative) {
+                try std.testing.expectEqual(@as(u32, 5), length); // type, id, du, dv
+                found = true;
+            }
+            at += length;
+        }
+        try std.testing.expect(found);
+    }
 }
 
 test "1D image sample uses a height-1 2D descriptor" {
