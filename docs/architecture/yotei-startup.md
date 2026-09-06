@@ -862,6 +862,14 @@ requirements and fallback. Four verified 64 MiB reads of GPU-written data
 drop from 508,056 to 21,382 us under SDK validation. This is a readback
 benchmark; the additional whole-frame gain is still unmeasured.
 
+The first cached-memory relaunch stopped before video or Vulkan rendering:
+the main thread was suspended in `reportGuestThreadContext(1)`, called by
+`drainQuietBuilderArenas` from that same guest thread's suspend point. The
+recorded slot-1 thread ID matched the suspended main thread (18820).
+Diagnostics now skip their calling thread instead of suspending it before
+their own ResumeThread call. The direct self-sampling regression test returns
+successfully; this was a diagnostic deadlock, separate from readback memory.
+
 ## Baseline before the timestamp fix
 
 A five-minute run continues rendering after the movie, at approximately

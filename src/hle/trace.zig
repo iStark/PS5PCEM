@@ -267,6 +267,14 @@ test "an unreadable range is refused before anything dereferences it" {
     try std.testing.expect(!readableRange(0x431bde82d7b634db, 4));
 }
 
+test "thread context diagnostics never suspend the calling guest thread" {
+    if (comptime builtin.os.tag != .windows) return;
+    const previous = guest_thread_ids[0];
+    defer guest_thread_ids[0] = previous;
+    guest_thread_ids[0] = std.os.windows.GetCurrentThreadId();
+    reportGuestThreadContext(0);
+}
+
 /// Prints where a guest thread is executing and what it is holding.
 ///
 /// A thread that polls a location in guest code makes no firmware call, so the
@@ -276,7 +284,9 @@ test "an unreadable range is refused before anything dereferences it" {
 pub fn reportGuestThreadContext(slot: usize) void {
     if (comptime builtin.os.tag != .windows) return;
     const thread_id = guestThreadId(slot);
-    if (thread_id == 0) return;
+    // This diagnostic also runs from sceAgcSuspendPoint on the guest thread
+    // being sampled. Suspending that same thread never reaches ResumeThread.
+    if (thread_id == 0 or thread_id == std.os.windows.GetCurrentThreadId()) return;
     const access = windows.thread_get_context |
         windows.thread_suspend_resume |
         windows.thread_query_information;
