@@ -6471,12 +6471,12 @@ const Builder = struct {
             try self.emit(&self.body, 196, &.{ self.bits_type, lsb_index, index_lsb, try self.constant(.bits32, 2) }); // OpShiftLeftLogical
             break :blk try self.addBits(msb, try self.addBits(lsb_index, offset_lsb));
         } else try self.addBits(try self.multiplyBits(index, stride), offset);
-        // SOFFSET: VCC/EXEC/M0 encodings mean "no scalar offset" (zero), not
-        // the all-ones mask used when those registers are read as lane masks.
-        // Treating them as 0xffffffff made every attribute MUBUF OOB → zero
-        // verts → black guest VS writeback.
+        // SMEM can use VCC as ordinary scalar address data. Keep this separate
+        // from the legacy MUBUF handling of reserved SOFFSET encodings.
         const soffset = if (binding.soffset_value) |value|
             try self.constant(.bits32, value)
+        else if (inst.family == .smem and (inst.src2.kind == .vcc_lo or inst.src2.kind == .vcc_hi))
+            try self.source(inst.src2, .bits32)
         else if (inst.family == .smem and inst.src1.kind == .sgpr and inst.src2.kind == .sgpr and
             inst.src2.reg >= inst.src1.reg and inst.src2.reg < inst.src1.reg + 4)
             // Same V# collision as executeSmem: SOFFSET=0 decodes as SGPR0,

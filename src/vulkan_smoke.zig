@@ -1216,15 +1216,16 @@ fn runBc4Probe(allocator: std.mem.Allocator) !void {
 }
 
 fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
-    for (0..4) |case_index| {
+    for (0..6) |case_index| {
         var renderer = try vulkan.Renderer.init(allocator, .{ .trace_resource_failures = true });
         defer renderer.deinit();
         if (!renderer.sampled_image_nonuniform_indexing) return error.NonuniformSampledImagesUnavailable;
         var guest = GuestMemory{};
         _ = renderer.dcbBackend(guest.interface());
         const wrapping = case_index == 1;
-        const guarded = case_index == 2;
+        const guarded = case_index == 2 or case_index >= 4;
         const wide = case_index == 3;
+        const offset_register: u32 = if (case_index >= 4) 106 + @as(u32, @intCast(case_index - 4)) else 20;
         if (wide and renderer.device_info.sampled_image_capacity < 128) {
             std.debug.print("128-texture case unavailable: device capacity={d}\n", .{renderer.device_info.sampled_image_capacity});
             continue;
@@ -1237,11 +1238,11 @@ fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
             if (guarded) 0xd761_0012 else 0xbf80_0000,
             if (guarded) 20 | (132 << 9) else 0xbf80_0000, // spill index into v18 lane 4
             if (guarded) 0xb614_0005 else 0xbf80_0000, // s_cmp_ge_u32 s20, 5
-            if (guarded) 0xbf85_000f else 0xbf80_0000, // reject large indices before multiplication
+            if (guarded) 0xbf85_0010 else 0xbf80_0000, // reject large indices before multiplication
             if (guarded) 0xd760_0014 else 0xbf80_0000,
             if (guarded) (256 + 18) | (132 << 9) else 0xbf80_0000,
-            0xb814_0000 | stride, // s_mulk_i32 s20, stride
-            0xf42c_0004, 0x2800_0000, // s_buffer_load_dwordx8 s0, V#s8, s20
+            0x9300_ff14 | (offset_register << 16), stride, // s_mul_i32 SOFFSET, s20, stride
+            0xf42c_0004, offset_register << 25, // s_buffer_load_dwordx8 s0, V#s8, SOFFSET
             vop1(1, 1, 24), // preserve workgroup index for output
             vop1(1, 2, 255),
             0x3e80_0000,
@@ -1298,7 +1299,7 @@ fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
             try std.testing.expectApproxEqAbs(expected, actual, 0.00001);
         }
     }
-    std.debug.print("indirect sampled images passed: runtime selection, aliased views, null/bounds, wrapped offsets, guarded material tables and 128 textures\n", .{});
+    std.debug.print("indirect sampled images passed: runtime selection, aliases, bounds, wrapping, guarded SGPR/VCC offsets and 128 textures\n", .{});
 }
 
 pub fn main(init: std.process.Init) !void {

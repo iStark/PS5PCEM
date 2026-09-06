@@ -491,6 +491,17 @@ preserves the queued draw's scalar data. The buffer-reuse and full Vulkan probes
 also pass with SDK validation. Its relationship to the game device loss is not
 yet established.
 
+The next material refusals use VCC_LO/VCC_HI for scalar-buffer byte offsets.
+Candidate lookup previously accepted only ordinary SGPR offsets. Translation
+also incorrectly applied its reserved MUBUF offset fallback to SMEM, replacing
+VCC offsets with zero. Both paths now retain the computed VCC word. GPU probes
+cover guarded offsets in ordinary SGPRs and both VCC halves, with distinct
+texture selection and out-of-bounds results. Before the fix, the VCC probe
+first refused the resource and then, after binding alone was corrected, read
+the first texture for every index. The complete fix and full smoke pass with
+SDK validation. The captured material shader's 16 guarded multiplications
+all retain the proven exclusive bound of 255.
+
 ## Baseline before the timestamp fix
 
 A five-minute run continues rendering after the movie, at approximately

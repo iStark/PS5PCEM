@@ -1147,7 +1147,8 @@ fn invalidateDestination(result: *Evaluation, destination: rdna2.Operand, count:
     for (result.registers[first..end]) |*value| value.* = .{};
 }
 
-fn scalarRegisterIndex(value: rdna2.Operand) ?usize {
+/// Unified SGPR index, including scalar aliases such as VCC and EXEC.
+pub fn scalarRegisterIndex(value: rdna2.Operand) ?usize {
     return switch (value.kind) {
         .sgpr => if (value.reg < maximum_scalar_registers) @intCast(value.reg) else null,
         .vcc_lo => 106,

@@ -22939,7 +22939,7 @@ fn resolveBufferImageCandidates(
         if (sample.src1.reg + 8 <= inst.dst.reg or inst.dst.reg + count <= sample.src1.reg) continue;
         if ((inst.opcode != .s_buffer_load_dwordx8 and inst.opcode != .s_buffer_load_dwordx16) or
             sample.src1.reg < inst.dst.reg or sample.src1.reg + 8 > inst.dst.reg + count or inst.src0.kind != .sgpr or
-            inst.src1.kind != .sgpr or inst.memory_offset < 0) return null;
+            (gpu.scalar_provenance.scalarRegisterIndex(inst.src1) orelse 128) >= 124 or inst.memory_offset < 0) return null;
         producer = inst;
         break;
     }
@@ -22949,10 +22949,18 @@ fn resolveBufferImageCandidates(
     for (scalar.registers[load.src0.reg..][0..4]) |word| if (word.producer_pc >= load.pc) return null;
     var stride: ?u32 = null;
     var index_bound: ?u32 = null;
+    const offset_register = gpu.scalar_provenance.scalarRegisterIndex(load.src1).?;
     while (index != 0) {
         index -= 1;
         const inst = instructions[index];
-        if (inst.dst.kind != .sgpr or inst.dst.reg != load.src1.reg) continue;
+        var writes_offset = false;
+        for ([_]rdna2.Operand{ inst.dst, inst.dst2 }) |destination| {
+            const first = gpu.scalar_provenance.scalarRegisterIndex(destination) orelse continue;
+            const count = @max(inst.data_words, if (destination.kind == .vcc_lo or std.mem.endsWith(u8, @tagName(inst.opcode), "64")) @as(u8, 2) else 1);
+            writes_offset = writes_offset or (offset_register >= first and offset_register - first < count);
+        }
+        if (!writes_offset) continue;
+        if (gpu.scalar_provenance.scalarRegisterIndex(inst.dst) != offset_register) return null;
         if (inst.opcode != .s_mul_i32 and inst.opcode != .s_mulk_i32) return null;
         stride = switch (inst.src1.kind) {
             .integer_inline_constant, .literal_constant => inst.src1.value,
