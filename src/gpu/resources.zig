@@ -61,7 +61,26 @@ pub const TileMode = enum(u5) {
     pub fn isLinear(self: TileMode) bool {
         return self == .linear;
     }
+
+    pub fn format(self: TileMode, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (std.enums.tagName(TileMode, self)) |name| {
+            try writer.writeAll(name);
+        } else {
+            try writer.print("unknown(0x{x})", .{@intFromEnum(self)});
+        }
+    }
 };
+
+test "tile mode diagnostics accept every encoded value" {
+    var buffer: [64]u8 = undefined;
+    for (0..32) |value| {
+        const mode: TileMode = @enumFromInt(@as(u5, @intCast(value)));
+        const label = try std.fmt.bufPrint(&buffer, "{f}", .{mode});
+        try std.testing.expect(label.len != 0);
+        if (value == 25) try std.testing.expectEqualStrings("unknown(0x19)", label);
+        if (value == 27) try std.testing.expectEqualStrings("render_target", label);
+    }
+}
 
 pub const ImageType = enum(u4) {
     color_1d = 8,

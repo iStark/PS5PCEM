@@ -572,6 +572,26 @@ which was already supported by storage-image and tiling paths. The array
 gradient probe additionally verifies a negative RG16_SNORM value by GPU
 readback with SDK validation enabled.
 
+Post-load resource recovery also follows the actual reaching definition of
+each scalar word through pointer loads, buffer loads and scalar moves. The
+captured `0x801f108000` shader reused s4:s5, but its old V# fallback still
+treated entry values `0x20, 0x5204` as an address, reading
+`0x5204000002a8`. Recovery now follows s0 -> s32 -> s4 instead. Entry words
+are accepted only when no shader writer reaches the use; mixed paths and
+unknown clobbers remain unresolved. Real inaccessible producers still report
+read failures. CPU tests cover nested loads, partial buffer bounds, SGPR-base
+mapping and divergent writes; full, indirect, nested and scalar-pointer GPU
+probes pass SDK validation.
+
+The pointer run reached loader state 40 before a diagnostic itself panicked:
+an indirect candidate in the captured 440-byte record table had format 149
+and unnamed tile mode 25. Calling `@tagName` on that non-exhaustive enum
+aborted the process before the refusal could be printed. All Vulkan tile-mode
+diagnostics now format unknown values numerically, with all 32 encodings
+tested. Host panics additionally retain their failing return address when a
+guest-created thread has no unwindable host stack. A complete menu render is
+still unconfirmed.
+
 ## Baseline before the timestamp fix
 
 A five-minute run continues rendering after the movie, at approximately

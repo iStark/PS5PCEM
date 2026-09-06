@@ -6016,14 +6016,14 @@ pub const Renderer = struct {
         );
         if (log_verbose_gpu or self.emulated_image_copy_dispatches <= 4 or self.traceCurrentGraphicsFrame()) {
             std.debug.print(
-                "[vulkan dcb] emulated whole-image copy: 0x{x} -> 0x{x} {d}x{d} fmt={d} tile={s} bytes=0x{x} (#{d})\n",
+                "[vulkan dcb] emulated whole-image copy: 0x{x} -> 0x{x} {d}x{d} fmt={d} tile={f} bytes=0x{x} (#{d})\n",
                 .{
                     source.address,
                     destination.address,
                     source.width,
                     source.height,
                     source.unified_format,
-                    @tagName(source.tile_mode),
+                    source.tile_mode,
                     allocation_bytes,
                     self.emulated_image_copy_dispatches,
                 },
@@ -7323,12 +7323,12 @@ pub const Renderer = struct {
         );
         if (log_verbose_gpu or self.emulated_image_store_dispatches <= 4) {
             std.debug.print(
-                "[vulkan dcb] emulated image clear: {d} texels addr=0x{x} fmt={d} tile={s} (#{d})\n",
+                "[vulkan dcb] emulated image clear: {d} texels addr=0x{x} fmt={d} tile={f} (#{d})\n",
                 .{
                     writes,
                     descriptor.address,
                     descriptor.unified_format,
-                    @tagName(descriptor.tile_mode),
+                    descriptor.tile_mode,
                     self.emulated_image_store_dispatches,
                 },
             );
@@ -7423,7 +7423,7 @@ pub const Renderer = struct {
         );
         if (log_verbose_gpu or self.emulated_image_store_dispatches <= 4) {
             std.debug.print(
-                "[vulkan dcb] emulated dual image clear: {d}+{d} texels {d}x{d}/{d}x{d} padded={d}x{d}/{d}x{d} fmt={d}/{d} tile={s}/{s} (#{d})\n",
+                "[vulkan dcb] emulated dual image clear: {d}+{d} texels {d}x{d}/{d}x{d} padded={d}x{d}/{d}x{d} fmt={d}/{d} tile={f}/{f} (#{d})\n",
                 .{
                     first_writes,
                     second_writes,
@@ -7437,8 +7437,8 @@ pub const Renderer = struct {
                     second_clear.subresource.padded_height,
                     first.unified_format,
                     second.unified_format,
-                    @tagName(first.tile_mode),
-                    @tagName(second.tile_mode),
+                    first.tile_mode,
+                    second.tile_mode,
                     self.emulated_image_store_dispatches,
                 },
             );
@@ -7458,7 +7458,7 @@ pub const Renderer = struct {
         for ([_]?gpu.ImageDescriptor{ first, second }, 0..) |maybe, index| {
             const image = maybe orelse continue;
             std.debug.print(
-                "  image[{d}] addr=0x{x} {d}x{d}x{d} pitch={d} fmt={d} type={s} tile={s} levels={d}/{d} samples={d} meta=0x{x} dcc={any} cmask={any} fmask={any}\n",
+                "  image[{d}] addr=0x{x} {d}x{d}x{d} pitch={d} fmt={d} type={s} tile={f} levels={d}/{d} samples={d} meta=0x{x} dcc={any} cmask={any} fmask={any}\n",
                 .{
                     index,
                     image.address,
@@ -7468,7 +7468,7 @@ pub const Renderer = struct {
                     image.pitch,
                     image.unified_format,
                     @tagName(image.image_type),
-                    @tagName(image.tile_mode),
+                    image.tile_mode,
                     image.viewBaseLevel(),
                     image.viewMipLevels(),
                     image.samplesLog2(),
@@ -7651,12 +7651,12 @@ pub const Renderer = struct {
         );
         if (log_verbose_gpu or self.emulated_volume_copies <= 4) {
             std.debug.print(
-                "[vulkan dcb] emulated volume upload: {d} texels src_fmt={d} dst_fmt={d} tile={s} (#{d})\n",
+                "[vulkan dcb] emulated volume upload: {d} texels src_fmt={d} dst_fmt={d} tile={f} (#{d})\n",
                 .{
                     writes,
                     source.unified_format,
                     image.unified_format,
-                    @tagName(image.tile_mode),
+                    image.tile_mode,
                     self.emulated_volume_copies,
                 },
             );
@@ -8159,7 +8159,7 @@ pub const Renderer = struct {
                 ) catch |err| {
                     self.reportResourceFailure(bindings, inst, &image_scalar);
                     std.debug.print(
-                        "[vulkan dcb] storage image pc=0x{x}: stage failed {s} addr=0x{x} {d}x{d}x{d} pitch={d} fmt={d} type={s} tile={s} levels={d}..{d} base_array={d} flags=0x{x} metadata=0x{x} dcc={any} cmask={any} fmask={any}\n",
+                        "[vulkan dcb] storage image pc=0x{x}: stage failed {s} addr=0x{x} {d}x{d}x{d} pitch={d} fmt={d} type={s} tile={f} levels={d}..{d} base_array={d} flags=0x{x} metadata=0x{x} dcc={any} cmask={any} fmask={any}\n",
                         .{
                             inst.pc,
                             @errorName(err),
@@ -8170,7 +8170,7 @@ pub const Renderer = struct {
                             descriptor.pitch,
                             descriptor.unified_format,
                             @tagName(descriptor.image_type),
-                            @tagName(descriptor.tile_mode),
+                            descriptor.tile_mode,
                             descriptor.base_level,
                             descriptor.last_level,
                             descriptor.base_array,
@@ -8358,8 +8358,8 @@ pub const Renderer = struct {
                     ) catch |err| {
                         self.reportResourceFailure(bindings, inst, &sampled_scalar);
                         std.debug.print(
-                            "[vulkan dcb] sampled image pc=0x{x}: stage failed {s} dim={s} addr=0x{x} {d}x{d}x{d} pitch={d} fmt={d} type={s} tile={s} levels={d}..{d}\n",
-                            .{ inst.pc, @errorName(err), @tagName(sampled_dimension), image_descriptor.address, image_descriptor.width, image_descriptor.height, image_descriptor.depth_or_layers, image_descriptor.pitch, image_descriptor.unified_format, @tagName(image_descriptor.image_type), @tagName(image_descriptor.tile_mode), image_descriptor.base_level, image_descriptor.last_level },
+                            "[vulkan dcb] sampled image pc=0x{x}: stage failed {s} dim={s} addr=0x{x} {d}x{d}x{d} pitch={d} fmt={d} type={s} tile={f} levels={d}..{d}\n",
+                            .{ inst.pc, @errorName(err), @tagName(sampled_dimension), image_descriptor.address, image_descriptor.width, image_descriptor.height, image_descriptor.depth_or_layers, image_descriptor.pitch, image_descriptor.unified_format, @tagName(image_descriptor.image_type), image_descriptor.tile_mode, image_descriptor.base_level, image_descriptor.last_level },
                         );
                         return err;
                     };
@@ -13063,7 +13063,7 @@ pub const Renderer = struct {
             for (graphics_resources.mappings[0..graphics_resources.mapping_count]) |mapping| {
                 const sampled = graphics_resources.descriptors[@intCast(mapping.descriptor_index)];
                 std.debug.print(
-                    "[vulkan dcb] traced sampled image draw={d} slot={d} addr=0x{x} {d}x{d} pitch={d} fmt={d} tile={s}\n",
+                    "[vulkan dcb] traced sampled image draw={d} slot={d} addr=0x{x} {d}x{d} pitch={d} fmt={d} tile={f}\n",
                     .{
                         self.frame_profile.draws,
                         mapping.descriptor_index,
@@ -13072,7 +13072,7 @@ pub const Renderer = struct {
                         sampled.height,
                         sampled.pitch,
                         sampled.unified_format,
-                        @tagName(sampled.tile_mode),
+                        sampled.tile_mode,
                     },
                 );
             }
@@ -13635,7 +13635,7 @@ pub const Renderer = struct {
             for (graphics_resources.mappings[0..fragment_mapping_count]) |mapping| {
                 const sampled_descriptor = graphics_resources.descriptors[@intCast(mapping.descriptor_index)];
                 std.debug.print(
-                    "  image T#s{d} S#s{d} slot={d} addr=0x{x} {d}x{d} pitch={d} fmt={d} tile={s}\n",
+                    "  image T#s{d} S#s{d} slot={d} addr=0x{x} {d}x{d} pitch={d} fmt={d} tile={f}\n",
                     .{
                         mapping.resource_sgpr,
                         mapping.sampler_sgpr,
@@ -13645,7 +13645,7 @@ pub const Renderer = struct {
                         sampled_descriptor.height,
                         sampled_descriptor.pitch,
                         sampled_descriptor.unified_format,
-                        @tagName(sampled_descriptor.tile_mode),
+                        sampled_descriptor.tile_mode,
                     },
                 );
             }
@@ -15185,7 +15185,7 @@ pub const Renderer = struct {
                 render_target_write,
             ) catch |err| {
                 std.debug.print(
-                    "[vulkan dcb] stageSampledImage failed: {s} pc=0x{x} dim={s} addr=0x{x} {d}x{d}x{d} pitch={d} fmt={d} type={s} tile={s} levels={d}..{d} base_array={d} dst={any} sampler(clamp={d}/{d}/{d} unorm={any} minmag={d}/{d} mip={d} lod={d:.3}..{d:.3})\n",
+                    "[vulkan dcb] stageSampledImage failed: {s} pc=0x{x} dim={s} addr=0x{x} {d}x{d}x{d} pitch={d} fmt={d} type={s} tile={f} levels={d}..{d} base_array={d} dst={any} sampler(clamp={d}/{d}/{d} unorm={any} minmag={d}/{d} mip={d} lod={d:.3}..{d:.3})\n",
                     .{
                         @errorName(err),
                         inst.pc,
@@ -15197,7 +15197,7 @@ pub const Renderer = struct {
                         image_descriptor.pitch,
                         image_descriptor.unified_format,
                         @tagName(image_descriptor.image_type),
-                        @tagName(image_descriptor.tile_mode),
+                        image_descriptor.tile_mode,
                         image_descriptor.base_level,
                         image_descriptor.last_level,
                         image_descriptor.base_array,
@@ -16842,12 +16842,12 @@ pub const Renderer = struct {
             }
         }
         if (log_verbose_gpu or self.texture_cache_misses <= 4) std.debug.print(
-            "[vulkan dcb] staged sample {d}x{d}x{d} tile={s} addr=0x{x} mips={d} base={d} nonzero_texels={d}/{d} raw_probe_nz={d} hits={d} first_rgba=({d},{d},{d},{d})\n",
+            "[vulkan dcb] staged sample {d}x{d}x{d} tile={f} addr=0x{x} mips={d} base={d} nonzero_texels={d}/{d} raw_probe_nz={d} hits={d} first_rgba=({d},{d},{d},{d})\n",
             .{
                 descriptor.width,
                 descriptor.height,
                 descriptor.depth_or_layers,
-                @tagName(descriptor.tile_mode),
+                descriptor.tile_mode,
                 descriptor.address,
                 if (mip_plan) |plan| plan.level_count else 1,
                 if (mip_plan) |plan| plan.base_level else 0,
@@ -16903,12 +16903,12 @@ pub const Renderer = struct {
         // turns a bad tiled/DCC decode into a striped or "borrowed" texture.
         if (nonzero == 0 and descriptor.width != 0 and descriptor.height != 0) {
             if (log_verbose_gpu) std.debug.print(
-                "[vulkan dcb] sample empty @0x{x} {d}x{d} tile={s} meta=0x{x} — no fallback decode\n",
+                "[vulkan dcb] sample empty @0x{x} {d}x{d} tile={f} meta=0x{x} — no fallback decode\n",
                 .{
                     descriptor.address,
                     descriptor.width,
                     descriptor.height,
-                    @tagName(descriptor.tile_mode),
+                    descriptor.tile_mode,
                     descriptor.metadata_address,
                 },
             );
@@ -19593,7 +19593,7 @@ pub const Renderer = struct {
             const target = candidate orelse continue;
             if (!target.isActive()) continue;
             std.debug.print(
-                "[vulkan dcb] rejected target slot={d} addr=0x{x} {d}x{d} pitch={d} fmt={d} num={d} swap={d} tile={s} samples={d} frags={d} dcc={any} cmask={any} fmask={any}\n",
+                "[vulkan dcb] rejected target slot={d} addr=0x{x} {d}x{d} pitch={d} fmt={d} num={d} swap={d} tile={f} samples={d} frags={d} dcc={any} cmask={any} fmask={any}\n",
                 .{
                     target.slot,
                     target.address,
@@ -19603,7 +19603,7 @@ pub const Renderer = struct {
                     target.format,
                     target.number_type,
                     target.component_swap,
-                    @tagName(target.tile_mode),
+                    target.tile_mode,
                     target.samples_log2,
                     target.fragments_log2,
                     target.dcc_enabled,
@@ -19709,7 +19709,7 @@ pub const Renderer = struct {
             for (traced_state.color_targets) |candidate| {
                 const color = candidate orelse continue;
                 std.debug.print(
-                    "  traced color slot={d} addr=0x{x} {d}x{d} pitch={d} fmt={d}/{d} swap={d} write=0x{x} tile={s}\n",
+                    "  traced color slot={d} addr=0x{x} {d}x{d} pitch={d} fmt={d}/{d} swap={d} write=0x{x} tile={f}\n",
                     .{
                         color.slot,
                         color.address,
@@ -19720,7 +19720,7 @@ pub const Renderer = struct {
                         color.number_type,
                         color.component_swap,
                         color.write_mask,
-                        @tagName(color.tile_mode),
+                        color.tile_mode,
                     },
                 );
             }
@@ -23414,100 +23414,16 @@ fn resolveProducedImageDescriptor(
     resource_sgpr: u32,
     before_pc: u32,
 ) anyerror!?gpu.ImageDescriptor {
-    var producer_index = analysis.program.instructions.items.len;
-    while (producer_index != 0) {
-        producer_index -= 1;
-        const inst = analysis.program.instructions.items[producer_index];
-        if (inst.pc >= before_pc or !isPointerScalarLoad(inst.opcode) or
-            inst.dst.kind != .sgpr or inst.src0.kind != .sgpr or
-            resource_sgpr < inst.dst.reg)
-        {
-            continue;
-        }
-        const word_delta = resource_sgpr - inst.dst.reg;
-        if (word_delta + 8 > inst.data_words) continue;
-        const load_offset = scalarMemoryOffset(inst, scalar) orelse continue;
-        const byte_offset = load_offset + @as(i64, word_delta) * @sizeOf(u32);
-        const recovered = imageDescriptorFromUserDataPointerAtOffset(
-            bindings,
-            reader,
-            inst.src0.reg,
-            byte_offset,
-        ) catch |err| switch (err) {
-            error.InvalidDescriptor, error.InvalidFormat => null,
-            else => return err,
-        };
-        if (recovered) |descriptor| return descriptor;
-    }
-    return null;
-}
-
-/// Recovers a 64-bit pointer held in an SGPR pair, following scalar pointer
-/// loads back to USER_DATA when the whole-program evaluator cannot preserve a
-/// value across a large divergent CFG. This is the common two-level SRT shape
-/// (`s0 -> s30 -> sampler`) used by generated environment-lighting kernels.
-fn resolveProducedScalarPointer(
-    bindings: *const gpu.ShaderBindings,
-    reader: gpu.ShaderMemoryReader,
-    analysis: *const gpu.ShaderAnalysis,
-    scalar: *const gpu.ScalarEvaluation,
-    pointer_sgpr: u32,
-    before_pc: u32,
-    depth: u8,
-) anyerror!?u64 {
-    if (pointer_sgpr + 2 > gpu.scalar_provenance.maximum_scalar_registers or depth >= 8) return null;
-    const low = scalar.registers[pointer_sgpr];
-    const high = scalar.registers[pointer_sgpr + 1];
-    if (low.known and high.known and high.value & 0xffff_0000 == 0) {
-        const value = @as(u64, low.value) | (@as(u64, high.value) << 32);
-        if (value != 0) return value;
-    }
-    if (pointer_sgpr >= bindings.scalar_user_data_base) {
-        const first: usize = pointer_sgpr - bindings.scalar_user_data_base;
-        if (first + 2 <= bindings.user_data_count) {
-            const user_low = bindings.user_data[first];
-            const user_high = bindings.user_data[first + 1];
-            if (user_high & 0xffff_0000 == 0) {
-                const value = @as(u64, user_low) | (@as(u64, user_high) << 32);
-                if (value != 0) return value;
-            }
-        }
-    }
-
-    var producer_index = analysis.program.instructions.items.len;
-    while (producer_index != 0) {
-        producer_index -= 1;
-        const inst = analysis.program.instructions.items[producer_index];
-        if (inst.pc >= before_pc or !isPointerScalarLoad(inst.opcode) or
-            inst.dst.kind != .sgpr or inst.src0.kind != .sgpr or
-            pointer_sgpr < inst.dst.reg)
-        {
-            continue;
-        }
-        const word_delta = pointer_sgpr - inst.dst.reg;
-        if (word_delta + 2 > inst.data_words) continue;
-        const base = (try resolveProducedScalarPointer(
-            bindings,
-            reader,
-            analysis,
-            scalar,
-            inst.src0.reg,
-            inst.pc,
-            depth + 1,
-        )) orelse continue;
-        const load_offset = scalarMemoryOffset(inst, scalar) orelse continue;
-        const byte_offset = load_offset + @as(i64, word_delta) * @sizeOf(u32);
-        const address = if (byte_offset >= 0)
-            std.math.add(u64, base, @intCast(byte_offset)) catch continue
-        else
-            std.math.sub(u64, base, @intCast(-byte_offset)) catch continue;
-        var words: [2]u32 = undefined;
-        reader.readWords(address, &words) catch continue;
-        if (words[1] & 0xffff_0000 != 0) continue;
-        const value = @as(u64, words[0]) | (@as(u64, words[1]) << 32);
-        if (value != 0) return value;
-    }
-    return null;
+    var resolver = gpu.scalar_resources.Resolver{
+        .bindings = bindings,
+        .reader = reader,
+        .instructions = analysis.program.instructions.items,
+        .graph = &analysis.graph,
+        .snapshot = scalar,
+    };
+    var words: [8]u32 = undefined;
+    if (!try resolver.words(resource_sgpr, before_pc, &words)) return null;
+    return gpu.resources.decodeImageDescriptor(&words) catch null;
 }
 
 fn resolveProducedSamplerDescriptor(
@@ -23518,39 +23434,16 @@ fn resolveProducedSamplerDescriptor(
     sampler_sgpr: u32,
     before_pc: u32,
 ) anyerror!?gpu.resources.SamplerDescriptor {
-    var producer_index = analysis.program.instructions.items.len;
-    while (producer_index != 0) {
-        producer_index -= 1;
-        const inst = analysis.program.instructions.items[producer_index];
-        if (inst.pc >= before_pc or !isPointerScalarLoad(inst.opcode) or
-            inst.dst.kind != .sgpr or inst.src0.kind != .sgpr or
-            sampler_sgpr < inst.dst.reg)
-        {
-            continue;
-        }
-        const word_delta = sampler_sgpr - inst.dst.reg;
-        if (word_delta + 4 > inst.data_words) continue;
-        const base = (try resolveProducedScalarPointer(
-            bindings,
-            reader,
-            analysis,
-            scalar,
-            inst.src0.reg,
-            inst.pc,
-            0,
-        )) orelse continue;
-        const load_offset = scalarMemoryOffset(inst, scalar) orelse continue;
-        const byte_offset = load_offset + @as(i64, word_delta) * @sizeOf(u32);
-        const address = if (byte_offset >= 0)
-            std.math.add(u64, base, @intCast(byte_offset)) catch continue
-        else
-            std.math.sub(u64, base, @intCast(-byte_offset)) catch continue;
-        var words: [4]u32 = undefined;
-        reader.readWords(address, &words) catch continue;
-        const descriptor = gpu.resources.decodeSamplerDescriptor(&words) catch continue;
-        return descriptor;
-    }
-    return null;
+    var resolver = gpu.scalar_resources.Resolver{
+        .bindings = bindings,
+        .reader = reader,
+        .instructions = analysis.program.instructions.items,
+        .graph = &analysis.graph,
+        .snapshot = scalar,
+    };
+    var words: [4]u32 = undefined;
+    if (!try resolver.words(sampler_sgpr, before_pc, &words)) return null;
+    return gpu.resources.decodeSamplerDescriptor(&words) catch null;
 }
 
 fn resolveComputeSampledImageDescriptor(
@@ -23563,7 +23456,6 @@ fn resolveComputeSampledImageDescriptor(
     fallback_slot: usize,
 ) anyerror!?gpu.ImageDescriptor {
     if (try scalarImageDescriptor(scalar, resource_sgpr)) |descriptor| return descriptor;
-    if (try inlineImageDescriptorOrNull(bindings, resource_sgpr)) |descriptor| return descriptor;
 
     if (try resolveProducedImageDescriptor(
         bindings,
@@ -23602,7 +23494,6 @@ fn resolveComputeSamplerDescriptor(
     fallback_slot: usize,
 ) anyerror!?gpu.resources.SamplerDescriptor {
     if (try scalarSamplerDescriptor(scalar, sampler_sgpr)) |descriptor| return descriptor;
-    if (try inlineSamplerDescriptorOrNull(bindings, sampler_sgpr)) |descriptor| return descriptor;
     if (try resolveProducedSamplerDescriptor(
         bindings,
         reader,
@@ -23612,18 +23503,6 @@ fn resolveComputeSamplerDescriptor(
         instruction_pc,
     )) |descriptor| return descriptor;
 
-    var pointer_sgpr: ?u32 = null;
-    for (analysis.program.instructions.items) |inst| {
-        if (inst.pc >= instruction_pc) break;
-        if (inst.opcode != .s_load_dwordx4 or inst.dst.kind != .sgpr or
-            inst.dst.reg != sampler_sgpr or inst.src0.kind != .sgpr) continue;
-        pointer_sgpr = inst.src0.reg;
-    }
-    if (pointer_sgpr) |pointer| {
-        if (try samplerDescriptorFromUserDataPointer(bindings, reader, pointer)) |descriptor| {
-            return descriptor;
-        }
-    }
     if (fallback_slot <= std.math.maxInt(u16)) {
         const fallback = bindings.resolve(
             reader,
@@ -23650,7 +23529,6 @@ fn resolveComputeImageDescriptor(
     fallback_slot: usize,
 ) anyerror!?gpu.ImageDescriptor {
     if (try scalarImageDescriptor(scalar, resource_sgpr)) |descriptor| return descriptor;
-    if (try inlineImageDescriptorOrNull(bindings, resource_sgpr)) |descriptor| return descriptor;
 
     // A common AGC compute prolog loads a destination T# from a pointer held
     // directly in USER_DATA after an EXECZ bounds check. Scalar prefix
@@ -23767,56 +23645,23 @@ fn resolveProducedBufferDescriptor(
     before_pc: u32,
     depth: u8,
 ) anyerror!?gpu.BufferDescriptor {
-    if (depth >= 8) return null;
-    var index = analysis.program.instructions.items.len;
-    while (index != 0) {
-        index -= 1;
-        const inst = analysis.program.instructions.items[index];
-        if (inst.pc >= before_pc or inst.dst.kind != .sgpr or inst.src0.kind != .sgpr) continue;
-        if (!isPointerScalarLoad(inst.opcode) and !isBufferScalarLoad(inst.opcode)) continue;
-        if (resource_sgpr < inst.dst.reg) continue;
-        const word_delta = resource_sgpr - inst.dst.reg;
-        if (word_delta + 4 > inst.data_words) continue;
-        const base_offset = scalarMemoryOffset(inst, scalar) orelse continue;
-        const byte_offset = base_offset + @as(i64, word_delta) * 4;
-
-        if (isPointerScalarLoad(inst.opcode)) {
-            if (byte_offset < std.math.minInt(i32) or byte_offset > std.math.maxInt(i32)) continue;
-            if (try bufferDescriptorFromUserDataPointer(
-                bindings,
-                reader,
-                inst.src0.reg,
-                @intCast(byte_offset),
-            )) |descriptor| return descriptor;
-            continue;
-        }
-
-        const parent = (try inlineBufferDescriptorOrNull(bindings, inst.src0.reg)) orelse
-            (try resolveProducedBufferDescriptor(
-                bindings,
-                reader,
-                analysis,
-                scalar,
-                inst.src0.reg,
-                inst.pc,
-                depth + 1,
-            )) orelse continue;
-        if (!isPlausibleBufferDescriptor(parent) or byte_offset < 0) continue;
-        const address = std.math.add(u64, parent.address, @intCast(byte_offset)) catch continue;
-        if (try decodeBufferDescriptorAt(reader, address)) |descriptor| return descriptor;
-    }
-    return null;
+    var resolver = gpu.scalar_resources.Resolver{
+        .bindings = bindings,
+        .reader = reader,
+        .instructions = analysis.program.instructions.items,
+        .graph = &analysis.graph,
+        .snapshot = scalar,
+    };
+    _ = depth;
+    var words: [4]u32 = undefined;
+    if (!try resolver.words(resource_sgpr, before_pc, &words)) return null;
+    return gpu.resources.decodeBufferDescriptor(&words) catch null;
 }
 
 /// Recovers a V# for a compute/graphics MUBUF/SMEM instruction.
 ///
-/// Order of attempts:
-/// 1. The last scalar-memory producer before this instruction. Shader inputs
-///    are frequently reused as dimensions before an `s_buffer_load` overwrites
-///    the same SGPRs with the real V#; decoding the entry snapshot first can
-///    therefore produce a syntactically valid but completely unrelated V#.
-/// 2. Specialized and full scalar state.
-/// 3. V# already resident in USER_DATA.
+/// Prefer the instruction-local scalar state, then reconstruct its reaching
+/// definitions. Only an unchanged entry word may come from USER_DATA.
 fn resolveComputeBufferDescriptor(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
@@ -23842,25 +23687,6 @@ fn resolveComputeBufferDescriptor(
         0,
     )) |descriptor| {
         if (isBoundedProducedBufferDescriptor(descriptor)) return descriptor;
-    }
-    if (takePlausibleBufferDescriptor(try scalarBufferDescriptor(full, resource_sgpr))) |descriptor| {
-        return descriptor;
-    }
-    if (takePlausibleBufferDescriptor(try inlineBufferDescriptorOrNull(bindings, resource_sgpr))) |descriptor| {
-        return descriptor;
-    }
-    // Absolute USER_DATA window only when the shader names an SGPR that sits
-    // inside the USER_DATA capture (not below scalar_user_data_base). For
-    // export_shader base=8, s4 is a system slot — do not mis-decode UD[4].
-    if (resource_sgpr >= bindings.scalar_user_data_base) {
-        const first = resource_sgpr - bindings.scalar_user_data_base;
-        if (first + 4 <= bindings.user_data_count) {
-            if (takePlausibleBufferDescriptor(try gpu.resources.decodeBufferDescriptor(
-                bindings.user_data[first..][0..4],
-            ))) |descriptor| {
-                return descriptor;
-            }
-        }
     }
     return null;
 }

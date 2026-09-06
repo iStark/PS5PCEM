@@ -12,6 +12,16 @@ const loader = @import("loader");
 const vulkan = @import("vulkan");
 const window = @import("window");
 
+/// Guest-created threads may not have a stack the host unwinder can traverse.
+/// Preserve the failing host address before attempting the normal panic trace.
+pub const panic = std.debug.FullPanic(reportPanic);
+
+fn reportPanic(message: []const u8, return_address: ?usize) noreturn {
+    const address = return_address orelse @returnAddress();
+    std.debug.print("[host panic] caller=0x{x} handler=0x{x}\n", .{ address, @intFromPtr(&reportPanic) });
+    std.debug.defaultPanic(message, address);
+}
+
 const usage =
     \\game-run [--app0 <content-directory>] <eboot.bin>
     \\

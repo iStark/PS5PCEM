@@ -46,7 +46,7 @@ fn writes(inst: Instruction, location: Location) bool {
 /// Require the same reaching definition on every predecessor, including loop
 /// back edges. A lexical last-write search can incorrectly trust a skipped
 /// assignment or a register changed on a previous loop iteration.
-const ReachingDefinitions = struct { items: [32]usize = undefined, count: usize = 0 };
+const ReachingDefinitions = struct { items: [32]usize = undefined, count: usize = 0, entry: bool = false };
 
 fn reachingDefinitions(instructions: []const Instruction, graph: *const Graph, before: usize, location: Location) ?ReachingDefinitions {
     if (graph.blocks.items.len > maximum_blocks) return null;
@@ -73,7 +73,7 @@ fn reachingDefinitions(instructions: []const Instruction, graph: *const Graph, b
             break;
         }
         if (!found) {
-            if (block_index == 0) return null;
+            if (block_index == 0) result.entry = true;
             var has_predecessor = false;
             for (graph.edges.items) |edge| {
                 if (edge.to != block_index) continue;
@@ -83,7 +83,7 @@ fn reachingDefinitions(instructions: []const Instruction, graph: *const Graph, b
                 queue[count] = edge.from;
                 count += 1;
             }
-            if (!has_predecessor) return null;
+            if (!has_predecessor and block_index != 0) return null;
         }
         if (cursor == count) break;
         block_index = queue[cursor];
@@ -96,7 +96,17 @@ fn reachingDefinitions(instructions: []const Instruction, graph: *const Graph, b
 
 fn reachingDefinition(instructions: []const Instruction, graph: *const Graph, before: usize, location: Location) ?usize {
     const definitions = reachingDefinitions(instructions, graph, before, location) orelse return null;
-    return if (definitions.count == 1) definitions.items[0] else null;
+    return if (!definitions.entry and definitions.count == 1) definitions.items[0] else null;
+}
+
+pub const ScalarDefinition = union(enum) { entry, instruction: usize };
+
+/// Distinguishes an unchanged USER_DATA word from a unique shader writer.
+/// Mixed entry/written paths and loop-carried alternatives remain unknown.
+pub fn scalarDefinition(instructions: []const Instruction, graph: *const Graph, before: usize, register: u32) ?ScalarDefinition {
+    const definitions = reachingDefinitions(instructions, graph, before, .{ .register = register }) orelse return null;
+    if (definitions.entry) return if (definitions.count == 0) .entry else null;
+    return if (definitions.count == 1) .{ .instruction = definitions.items[0] } else null;
 }
 
 const MaskProof = struct {
@@ -111,6 +121,7 @@ const MaskProof = struct {
 fn maskIsSubsetOfVectorWrite(instructions: []const Instruction, graph: *const Graph, before: usize, register: u32, vector_write: usize, proof: *MaskProof) bool {
     for (0..2) |half| {
         const definitions = reachingDefinitions(instructions, graph, before, .{ .register = register + @as(u32, @intCast(half)) }) orelse return false;
+        if (definitions.entry) return false;
         for (definitions.items[0..definitions.count]) |index| {
             if (std.mem.indexOfScalar(usize, proof.visited[0..proof.count], index) != null) continue;
             if (proof.count == proof.visited.len) return false;
