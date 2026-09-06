@@ -1647,41 +1647,112 @@ pub const SubresourceLayout = struct {
         if (@as(u64, source.len) < self.required_source_bytes) return Error.SourceTooSmall;
         if (@as(u64, destination.len) < try self.stagingBytes()) return Error.DestinationTooSmall;
         if (try self.blockCopyLayout()) |layout| return layout.detile(source, destination);
-        const bytes = self.block.bytes_per_element;
-        for (0..self.depth_or_layers) |slice_index| {
-            const slice: u32 = @intCast(slice_index);
-            for (0..self.height) |y_index| {
-                const y: u32 = @intCast(y_index);
-                for (0..self.width) |x_index| {
-                    const x: u32 = @intCast(x_index);
-                    for (0..self.samples()) |sample_index| {
-                        const sample: u32 = @intCast(sample_index);
-                        const src: usize = @intCast(try self.sourceByteOffset(x, y, slice, sample));
-                        const dst: usize = @intCast(try self.stagingByteOffset(x, y, slice, sample));
-                        @memcpy(destination[dst..][0..bytes], source[src..][0..bytes]);
-                    }
-                }
-            }
-        }
+        return self.copySubresource(false, source, destination);
     }
 
     pub fn tile(self: SubresourceLayout, source: []const u8, destination: []u8) Error!void {
         if (@as(u64, source.len) < try self.stagingBytes()) return Error.SourceTooSmall;
         if (@as(u64, destination.len) < self.required_source_bytes) return Error.DestinationTooSmall;
         if (try self.blockCopyLayout()) |layout| return layout.tile(source, destination);
-        const bytes = self.block.bytes_per_element;
+        return self.copySubresource(true, source, destination);
+    }
+
+    fn copySubresource(self: SubresourceLayout, comptime to_tiled: bool, source: []const u8, destination: []u8) Error!void {
+        return switch (self.block.bytes_per_element) {
+            1 => self.copySubresourceElements(to_tiled, 1, source, destination),
+            2 => self.copySubresourceElements(to_tiled, 2, source, destination),
+            4 => self.copySubresourceElements(to_tiled, 4, source, destination),
+            8 => self.copySubresourceElements(to_tiled, 8, source, destination),
+            16 => self.copySubresourceElements(to_tiled, 16, source, destination),
+            else => Error.UnsupportedElementSize,
+        };
+    }
+
+    /// Swizzle equations XOR independent coordinate bits. Cache the local X
+    /// contribution, then evaluate Y/Z/sample and macro-block XOR once per
+    /// block row, including thick volumes, mip tails and RB+ MSAA surfaces.
+    /// Keep the checked scalar address path in stage() as a reference.
+    fn copySubresourceElements(
+        self: SubresourceLayout,
+        comptime to_tiled: bool,
+        comptime element_bytes: usize,
+        source: []const u8,
+        destination: []u8,
+    ) Error!void {
+        const sample_count: usize = self.samples();
+        const row_bytes: usize = @intCast(try multiply3(self.width, sample_count, element_bytes));
+        const slice_bytes: usize = @intCast(try multiply(row_bytes, self.height));
+        if (self.block.family == .linear) {
+            for (0..self.depth_or_layers) |slice| {
+                const allocation: usize = @intCast(try add(
+                    try multiply(self.source_layer_bytes, try addU32(self.first_slice, @intCast(slice))),
+                    self.level_offset,
+                ));
+                for (0..self.height) |y| {
+                    const tiled = allocation + y * @as(usize, self.padded_width) * element_bytes;
+                    const linear = slice * slice_bytes + y * row_bytes;
+                    const src = if (to_tiled) linear else tiled;
+                    const dst = if (to_tiled) tiled else linear;
+                    @memcpy(destination[dst..][0..row_bytes], source[src..][0..row_bytes]);
+                }
+            }
+            return;
+        }
+        var x_offsets: [256]u32 = undefined;
+        if (self.block.width == 0 or self.block.width > x_offsets.len) return Error.UnsupportedTileMode;
+        _ = try addU32(self.tail_x, self.width);
+        _ = try addU32(self.tail_y, self.height);
+        for (0..self.block.width) |x| {
+            x_offsets[x] = try self.block.byteOffset(@intCast(x), 0, 0, 0);
+        }
+        const rb_plus = self.block.family == .depth_64kb or self.block.family == .render_target_64kb;
+        const blocks_per_row = self.padded_width / self.block.width;
         for (0..self.depth_or_layers) |slice_index| {
             const slice: u32 = @intCast(slice_index);
+            const physical_slice = if (self.kind == .array_2d) try addU32(self.first_slice, slice) else 0;
+            const allocation: usize = @intCast(try add(self.level_offset, if (self.kind == .array_2d)
+                try multiply(self.source_layer_bytes, physical_slice)
+            else
+                try multiply(self.block_slice_bytes, slice / self.block.depth)));
+            const swizzle_z = if (self.kind == .array_2d)
+                (if (rb_plus) physical_slice else 0)
+            else if (self.block.depth == 1)
+                slice
+            else
+                slice % self.block.depth;
             for (0..self.height) |y_index| {
-                const y: u32 = @intCast(y_index);
-                for (0..self.width) |x_index| {
-                    const x: u32 = @intCast(x_index);
-                    for (0..self.samples()) |sample_index| {
-                        const sample: u32 = @intCast(sample_index);
-                        const src: usize = @intCast(try self.stagingByteOffset(x, y, slice, sample));
-                        const dst: usize = @intCast(try self.sourceByteOffset(x, y, slice, sample));
-                        @memcpy(destination[dst..][0..bytes], source[src..][0..bytes]);
+                const sy = @as(u32, @intCast(y_index)) + self.tail_y;
+                const block_y = sy / self.block.height;
+                const linear_row = slice_index * slice_bytes + y_index * row_bytes;
+                var x: u32 = 0;
+                while (x < self.width) {
+                    const sx = x + self.tail_x;
+                    const local_x = sx % self.block.width;
+                    const block_x = sx / self.block.width;
+                    const count = @min(self.block.width - local_x, self.width - x);
+                    const block_index = @as(usize, block_y) * blocks_per_row + block_x;
+                    const tiled_block = allocation + block_index * self.block.bytes;
+                    var row_offsets: [8]u32 = undefined;
+                    for (0..sample_count) |sample| {
+                        row_offsets[sample] = try self.block.byteOffset(
+                            if (rb_plus) sx - local_x else 0,
+                            if (rb_plus) sy else sy % self.block.height,
+                            swizzle_z,
+                            @intCast(sample),
+                        );
                     }
+                    for (0..count) |column| {
+                        const linear_pixel = linear_row + (@as(usize, x) + column) * sample_count * element_bytes;
+                        const x_offset = x_offsets[local_x + column];
+                        for (0..sample_count) |sample| {
+                            const tiled = tiled_block + (x_offset ^ row_offsets[sample]);
+                            const linear = linear_pixel + sample * element_bytes;
+                            const src = if (to_tiled) linear else tiled;
+                            const dst = if (to_tiled) tiled else linear;
+                            @memcpy(destination[dst..][0..element_bytes], source[src..][0..element_bytes]);
+                        }
+                    }
+                    x += count;
                 }
             }
         }
@@ -3113,6 +3184,65 @@ test "mip tail volume and MSAA subresources share one CPU address contract" {
             try view.stage(memory.reader(), memory.base, actual);
             try testing.expectEqualSlices(u8, expected, actual);
         }
+    }
+}
+
+test "subresource row copies match scalar volume tail and MSAA addresses" {
+    for ([_]resources.TileMode{ .linear, .standard_4kb, .standard_64kb, .partially_resident, .depth, .render_target }) |mode| {
+        for ([_]u8{ 1, 2, 4, 8, 16 }) |bytes| {
+            if (mode == .depth and bytes > 8) continue;
+            const block = try SwizzleBlock.init(mode, bytes, true, 0);
+            try testSubresourceCopies(.{
+                .tile_mode = mode,
+                .kind = .volume_3d,
+                .width = block.width * 2 + 7,
+                .height = block.height + 11,
+                .depth_or_layers = block.depth * 2 + 3,
+                .mip_levels = if (mode == .linear) 1 else 5,
+            }, bytes);
+        }
+    }
+    for ([_]resources.TileMode{ .depth, .render_target }) |mode| {
+        for ([_]u8{ 1, 2, 4, 8, 16 }) |bytes| {
+            if (mode == .depth and bytes > 8) continue;
+            for (1..4) |samples_log2| {
+                const block = try SwizzleBlock.init(mode, bytes, false, @intCast(samples_log2));
+                try testSubresourceCopies(.{
+                    .tile_mode = mode,
+                    .width = block.width * 2 + 7,
+                    .height = block.height + 11,
+                    .depth_or_layers = 2,
+                    .first_slice = 3,
+                    .samples_log2 = @intCast(samples_log2),
+                }, bytes);
+            }
+        }
+    }
+}
+
+fn testSubresourceCopies(description: Texture, element_bytes: u8) !void {
+    const texture = try TextureLayout.init(description, element_bytes);
+    const allocation = try testing.allocator.alloc(u8, @intCast(texture.required_source_bytes));
+    defer testing.allocator.free(allocation);
+    for (allocation, 0..) |*byte, index| byte.* = @truncate(index ^ (index >> 8) ^ (index >> 16));
+    for (0..texture.mip_levels) |level| {
+        const view = try texture.subresource(@intCast(level), 0, texture.layers);
+        const expected = try testing.allocator.alloc(u8, @intCast(try view.stagingBytes()));
+        defer testing.allocator.free(expected);
+        const actual = try testing.allocator.alloc(u8, expected.len);
+        defer testing.allocator.free(actual);
+        const memory = TestMemory{ .base = 0x4000_0000, .bytes = allocation };
+        try view.stage(memory.reader(), memory.base, expected);
+        try view.detile(allocation, actual);
+        try testing.expectEqualSlices(u8, expected, actual);
+        const tiled = try testing.allocator.dupe(u8, allocation);
+        defer testing.allocator.free(tiled);
+        try view.tile(expected, tiled);
+        try testing.expectEqualSlices(u8, allocation, tiled);
+        try testing.expectError(Error.SourceTooSmall, view.detile(allocation[0 .. @as(usize, @intCast(view.required_source_bytes)) - 1], actual));
+        try testing.expectError(Error.DestinationTooSmall, view.detile(allocation, actual[0 .. actual.len - 1]));
+        try testing.expectError(Error.SourceTooSmall, view.tile(expected[0 .. expected.len - 1], tiled));
+        try testing.expectError(Error.DestinationTooSmall, view.tile(expected, tiled[0 .. @as(usize, @intCast(view.required_source_bytes)) - 1]));
     }
 }
 

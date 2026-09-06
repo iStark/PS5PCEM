@@ -779,7 +779,10 @@ Depth-only passes retain their depth writes and generations without allocating,
 copying or scanning a host colour buffer. The SDK depth probe verifies a
 triangle's depth, preservation across a second draw and no colour readback;
 the complete Vulkan smoke also passes with clean SDK validation. Live frame
-timing with these changes remains to be measured.
+timing with these changes is about 16–18 seconds around the same notice,
+down from 35–37 seconds. Draw time falls from about 22 to 4 seconds; compute
+resource preparation dominates the remaining frame. This run predates the
+permission lookup and compute driver-cache changes below.
 
 Checked memory permissions now start with a binary search in the ordered
 mapping table, then visit only the adjacent mappings covered by the request.
@@ -799,6 +802,20 @@ The frame-948 trace stopped in the diagnostic vertex dumper: it requested nine
 words from an eight-word checked reader. The dumper now respects that bound.
 That incomplete capture includes numerous rejected shadow draws before the
 notice's UI passes, so it cannot establish the cross glyph's cause.
+
+A subsequent warm-thread sample spends roughly 40% of samples in the scalar
+subresource address function during texture tile/detile copies. Volumes,
+mip tails and MSAA copies now cache the local X swizzle contribution and
+compute the remaining coordinates once per block row. Element-sized copies
+also avoid a variable-length memcpy for every pixel. All 29 tiling tests and
+the complete SDK Vulkan smoke pass; scalar-address comparisons cover volume
+families, all supported element sizes, mip tails, partial blocks, array
+offsets, MSAA samples, untouched padding and short-buffer errors.
+
+A controlled ReleaseSafe benchmark of four tile/detile round trips changes
+from 34.3 to 2.4 ms for a 1 MiB volume, 642.0 to 39.9 ms for a 16 MiB volume,
+and 735.7 to 41.7 ms for a 16 MiB MSAA image. Output hashes agree. These are
+copy timings, not whole-game FPS; a complete live frame still needs measuring.
 
 ## Baseline before the timestamp fix
 
