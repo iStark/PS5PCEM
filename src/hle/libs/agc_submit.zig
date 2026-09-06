@@ -1126,24 +1126,24 @@ fn traceShaderBinding(state: *const gpu.State, stage: gpu.resources.ShaderStage)
         switch (first.descriptor) {
             .read_only_texture => |image| {
                 std.debug.print(
-                    "  {s}[{d}] table=0x{x} image=0x{x} {d}x{d} fmt={d} sw={d}\n",
+                    "  {s}[{d}] table={?x} image=0x{x} {d}x{d} fmt={d} sw={d}\n",
                     .{ @tagName(kind), first.mapping.slot, first.descriptor_address, image.address, image.width, image.height, image.unified_format, @intFromEnum(image.tile_mode) },
                 );
                 traceImageLayout(image);
             },
             .read_write_texture => |image| {
                 std.debug.print(
-                    "  {s}[{d}] table=0x{x} image=0x{x} {d}x{d} fmt={d} sw={d}\n",
+                    "  {s}[{d}] table={?x} image=0x{x} {d}x{d} fmt={d} sw={d}\n",
                     .{ @tagName(kind), first.mapping.slot, first.descriptor_address, image.address, image.width, image.height, image.unified_format, @intFromEnum(image.tile_mode) },
                 );
                 traceImageLayout(image);
             },
             .sampler => |sampler| std.debug.print(
-                "  {s}[{d}] table=0x{x} lod={d:.2}..{d:.2}\n",
+                "  {s}[{d}] table={?x} lod={d:.2}..{d:.2}\n",
                 .{ @tagName(kind), first.mapping.slot, first.descriptor_address, sampler.minimum_lod, sampler.maximum_lod },
             ),
-            .constant_buffer => |buffer| std.debug.print(
-                "  {s}[{d}] table=0x{x} buffer=0x{x} bytes={d}\n",
+            .constant_buffer, .read_only_buffer, .read_write_buffer => |buffer| std.debug.print(
+                "  {s}[{d}] table={?x} buffer=0x{x} bytes={d}\n",
                 .{ @tagName(kind), first.mapping.slot, first.descriptor_address, buffer.address, buffer.size_bytes },
             ),
         }

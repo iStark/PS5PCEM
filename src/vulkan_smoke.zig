@@ -593,6 +593,53 @@ fn runFragmentStorageProbe(
     std.debug.print("fragment storage passed: RG array slice, per-pixel EXEC, color export, queued reuse, storage/sample consumers and writeback\n", .{});
 }
 
+fn runInlineMetadataBufferProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    var memory = guest.interface();
+    memory.shader_header = struct {
+        fn header(_: ?*anyopaque, program: u64) ?u64 {
+            return if (program == 0x100) 0x600 else null;
+        }
+    }.header;
+    _ = renderer.dcbBackend(memory);
+    // The captured scene layout has an SRT declaration of two words, with
+    // its actual input V# at USER_DATA[6:9]. Resolving metadata offset 6 as an
+    // SRT access used to abort this dispatch before its inline buffer read.
+    guest.word(0x608, 0x700);
+    guest.word(0x700, 0x740);
+    guest.word(0x720, 0x750);
+    guest.word(0x728, 2 << 16); // eud=0, srt=2
+    guest.word(0x72c, 2); // two direct entries
+    guest.word(0x734, 2); // two constant-buffer entries
+    guest.word(0x740, 0x0000_ffff); // SRT pointer at USER_DATA[0]
+    guest.word(0x750, 0x8006_7fff); // unused slot 0; buffer slot 1 offset 6
+    const code = [_]u32{
+        sop1(4, 12, 2), sop1(4, 14, 4), // output V# from USER_DATA[2:5]
+        0xf420_0003, 125 << 25, // s_buffer_load_dword s0, s6:s9, 0
+        vop1(1, 0, 0), // v0 = loaded scalar
+        0xe070_0000, 0x8003_0000, // buffer_store_dword v0, s12:s15
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 10 << 1);
+    const userdata = [_]u32{ 0x400, 0, 0x11000, 4 << 16, 1, 0x5204, 0x10000, 4 << 16, 1, 0x5204 };
+    for (userdata, 0..) |word, index| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+    for ([_]u32{ 0x1234_5678, 0xaabb_ccdd }) |expected| {
+        guest.word(0x10000, expected);
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        var result: [4]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x11000, &result);
+        try std.testing.expectEqual(expected, std.mem.readInt(u32, &result, .little));
+    }
+    std.debug.print("inline metadata buffer probe passed: USER_DATA buffer offsets are independent of SRT size\n", .{});
+}
+
 fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
     defer renderer.deinit();
@@ -1110,20 +1157,90 @@ fn runStreamedMipProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("streamed mip probe passed: absent high mips and visible base-level sampling\n", .{});
 }
 
+fn runBc4Probe(allocator: std.mem.Allocator) !void {
+    for ([_]u16{ 175, 176 }) |format| {
+        var renderer = try vulkan.Renderer.init(allocator, .{});
+        defer renderer.deinit();
+        const Memory = struct {
+            guest: GuestMemory = .{},
+            fn read(context: ?*anyopaque, address: u64, bytes: []u8) bool {
+                const self: *@This() = @ptrCast(@alignCast(context.?));
+                if (address >= 0x12000 and address + bytes.len > 0x15000) return false;
+                return GuestMemory.read(&self.guest, address, bytes);
+            }
+            fn write(context: ?*anyopaque, address: u64, bytes: []const u8) bool {
+                const self: *@This() = @ptrCast(@alignCast(context.?));
+                return GuestMemory.write(&self.guest, address, bytes);
+            }
+        };
+        var memory = Memory{};
+        const guest = &memory.guest;
+        _ = renderer.dcbBackend(.{ .context = &memory, .read = Memory.read, .write = Memory.write });
+        const code = [_]u32{
+            vop1(1, 0, 255), 0x3e80_0000, vop1(1, 1, 255), 0x3e80_0000,
+            0xf09c_010a,     0x0040_0200, 1,               0xe070_0000,
+            0x8003_0200,     0xbf81_0000,
+        };
+        for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+        var image = sampledImageDescriptorWords(0x12000, 128, 128);
+        image[1] = (image[1] & ~@as(u32, 0x1ff00000)) | (@as(u32, format) << 20);
+        image[3] |= (7 << 16) | (@as(u32, @intFromEnum(gpu.resources.TileMode.standard_4kb)) << 20);
+        image[5] = 7 << 4;
+        const texture = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&image));
+        try std.testing.expectEqual(@as(u64, 0x3000), texture.required_source_bytes);
+        for (0..texture.mip_levels) |level| {
+            const view = try texture.subresource(@intCast(level), 0, 1);
+            for (0..view.height) |y| for (0..view.width) |x| {
+                const address = 0x12000 + @as(usize, @intCast(try view.sourceByteOffset(@intCast(x), @intCast(y), 0, 0)));
+                guest.word(address, 64); // endpoints 64/0, all texels select endpoint 0
+                guest.word(address + 4, 0);
+            };
+        }
+        var state = gpu.State{};
+        const compute = gpu.resources.ShaderStage.compute;
+        try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+        try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+        try state.writeRegister(.shader, 0x213, 16 << 1);
+        var userdata: [16]u32 = @splat(0);
+        @memcpy(userdata[0..8], &image);
+        @memcpy(userdata[12..16], &[_]u32{ 0x10000, 4 << 16, 1, 0 });
+        for (userdata, 0..) |word, index| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        var bytes: [4]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x10000, &bytes);
+        const actual: f32 = @bitCast(std.mem.readInt(u32, &bytes, .little));
+        // Allow one 16-bit normalized step in hardware BC endpoint conversion.
+        try std.testing.expectApproxEqAbs(@as(f32, 64.0) / (if (format == 175) @as(f32, 255) else 127), actual, 1.0 / 32767.0);
+    }
+    std.debug.print("BC4 probe passed: eight-byte blocks, mip tails, UNORM and SNORM sampling\n", .{});
+}
+
 fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
-    var renderer = try vulkan.Renderer.init(allocator, .{});
-    defer renderer.deinit();
-    if (!renderer.sampled_image_nonuniform_indexing) return error.NonuniformSampledImagesUnavailable;
-    var guest = GuestMemory{};
-    _ = renderer.dcbBackend(guest.interface());
-    for (0..2) |case_index| {
-        const wrapping = case_index != 0;
-        const stride: u32 = if (wrapping) 48 else 32;
+    for (0..4) |case_index| {
+        var renderer = try vulkan.Renderer.init(allocator, .{ .trace_resource_failures = true });
+        defer renderer.deinit();
+        if (!renderer.sampled_image_nonuniform_indexing) return error.NonuniformSampledImagesUnavailable;
+        var guest = GuestMemory{};
+        _ = renderer.dcbBackend(guest.interface());
+        const wrapping = case_index == 1;
+        const guarded = case_index == 2;
+        const wide = case_index == 3;
+        if (wide and renderer.device_info.sampled_image_capacity < 128) {
+            std.debug.print("128-texture case unavailable: device capacity={d}\n", .{renderer.device_info.sampled_image_capacity});
+            continue;
+        }
+        const stride: u32 = if (guarded) 368 else if (wrapping) 48 else 32;
         const table: u32 = 0x11000 + @as(u32, @intCast(case_index)) * 0x1000;
         const output: u32 = 0x10000 + @as(u32, @intCast(case_index)) * 0x100;
         const code = [_]u32{
-            0x8014_ff18, if (wrapping) 0xaaaa_aaab else 0, // workgroup X + wrapping selector
-            0x9314_0014 | ((128 + stride) << 8), // s_mul_i32 s20, s20, stride
+            0x8014_ff18,                               if (wrapping) 0xaaaa_aaab else 0, // workgroup X + wrapping selector
+            if (guarded) 0xd761_0012 else 0xbf80_0000,
+            if (guarded) 20 | (132 << 9) else 0xbf80_0000, // spill index into v18 lane 4
+            if (guarded) 0xb614_0005 else 0xbf80_0000, // s_cmp_ge_u32 s20, 5
+            if (guarded) 0xbf85_000f else 0xbf80_0000, // reject large indices before multiplication
+            if (guarded) 0xd760_0014 else 0xbf80_0000,
+            if (guarded) (256 + 18) | (132 << 9) else 0xbf80_0000,
+            0xb814_0000 | stride, // s_mulk_i32 s20, stride
             0xf42c_0004, 0x2800_0000, // s_buffer_load_dwordx8 s0, V#s8, s20
             vop1(1, 1, 24), // preserve workgroup index for output
             vop1(1, 2, 255),
@@ -1135,15 +1252,29 @@ fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
             0xbf81_0000,
         };
         for (code, 0..) |word, index| guest.word(0x100 + case_index * 0x100 + index * 4, word);
-        for ([_]u32{ 0x8000, 0x9000, 0x8000 }, 0..) |address, index| {
-            var image = sampledImageDescriptorWords(address, 4, 4);
-            if (index == 2) image[3] = (image[3] & ~@as(u32, 7)) | 6; // same allocation, blue in red channel
+        if (guarded) {
+            // These are real descriptors in another material field. Full
+            // 32-bit residue enumeration exceeds the image limit; the proven
+            // guard must retain only the selected field of reachable records.
+            for (0..70) |index| {
+                const decoy = sampledImageDescriptorWords(0xa000 + @as(u32, @intCast(index)) * 256, 4, 4);
+                for (decoy, 0..) |word, component| guest.word(table + index * stride + 32 + component * 4, word);
+            }
+        }
+        const ordinary_addresses = [_]u32{ 0x8000, 0x9000, 0x8000 };
+        // A linear guest row has 256-byte alignment. One texel per image
+        // keeps the wide fixture's adjacent 256-byte allocations disjoint.
+        const extent: u32 = if (wide) 1 else 4;
+        for (0..if (wide) @as(usize, 128) else 3) |index| {
+            const address = if (wide) 0x8000 + @as(u32, @intCast(index)) * 256 else ordinary_addresses[index];
+            var image = sampledImageDescriptorWords(address, extent, extent);
+            if (!wide and index == 2) image[3] = (image[3] & ~@as(u32, 7)) | 6; // same allocation, blue in red channel
             for (image, 0..) |word, component| guest.word(table + (if (wrapping) @as(usize, 16) else 0) + index * stride + component * 4, word);
             const layout = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&image));
             const surface = try layout.base();
-            for (0..4) |y| for (0..4) |x| {
+            for (0..extent) |y| for (0..extent) |x| {
                 const pixel = address + @as(usize, @intCast(try surface.sourceByteOffset(@intCast(x), @intCast(y), 0, 0)));
-                guest.word(pixel, if (index != 1) 0xff80_00ff else 0xff00_0040);
+                guest.word(pixel, if (wide) 0xff00_0000 | @as(u32, @intCast(index + 1)) else if (index != 1) 0xff80_00ff else 0xff00_0040);
             };
         }
         var state = gpu.State{};
@@ -1152,24 +1283,31 @@ fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
         try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
         try state.writeRegister(.shader, 0x213, (24 << 1) | (1 << 7));
         var userdata: [24]u32 = @splat(0);
-        @memcpy(userdata[8..12], &[_]u32{ table, stride << 16, 4, 0 });
-        @memcpy(userdata[12..16], &[_]u32{ output, 4 << 16, 5, 0 });
+        const groups: u32 = if (wide) 129 else 5;
+        @memcpy(userdata[8..12], &[_]u32{ table, stride << 16, if (wide) 128 else if (guarded) 70 else 4, 0 });
+        @memcpy(userdata[12..16], &[_]u32{ output, 4 << 16, groups, 0 });
         for (userdata, 0..) |word, index| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
-        const result = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 5, 1, 1 });
+        const result = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ groups, 1, 1 });
         try std.testing.expect(result.spirv_words != 0);
-        var pixels: [20]u8 = undefined;
-        try renderer.readbackGuestStorageBuffer(output, &pixels);
-        for ([_]f32{ 1, 64.0 / 255.0, 128.0 / 255.0, 0, 0 }, 0..) |expected, index| {
+        var pixels: [129 * 4]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(output, pixels[0 .. groups * 4]);
+        const ordinary_expected = [_]f32{ 1, 64.0 / 255.0, 128.0 / 255.0, 0, 0 };
+        for (0..groups) |index| {
+            const expected: f32 = if (wide) (if (index < 128) @as(f32, @floatFromInt(index + 1)) / 255.0 else 0) else ordinary_expected[index];
             const actual: f32 = @bitCast(std.mem.readInt(u32, pixels[index * 4 ..][0..4], .little));
             try std.testing.expectApproxEqAbs(expected, actual, 0.00001);
         }
     }
-    std.debug.print("indirect sampled images passed: runtime selection, aliased views, null/bounds and wrapped offsets\n", .{});
+    std.debug.print("indirect sampled images passed: runtime selection, aliased views, null/bounds, wrapped offsets, guarded material tables and 128 textures\n", .{});
 }
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--bc4")) {
+        try runBc4Probe(allocator);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--shader-interface")) {
         try runShaderInterfaceProbe(allocator);
         return;
@@ -1184,6 +1322,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-reuse")) {
         try runQueuedBufferReuseProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--inline-metadata")) {
+        try runInlineMetadataBufferProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--gds")) {

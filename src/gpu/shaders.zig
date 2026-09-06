@@ -4,10 +4,10 @@
 //! AGC shader metadata and resource bindings at a draw/dispatch boundary.
 //!
 //! A shader header describes where AGC placed its direct resources and the
-//! four logical descriptor classes. The mutable values still come from PM4:
-//! the direct ShaderResourceTable entry identifies the user-SGPR pair holding
-//! the guest SRT pointer. Keeping those two sources separate is important --
-//! assuming that every shader uses s0:s1 silently binds arbitrary addresses.
+//! four logical descriptor classes. Sharp offsets select inline USER_DATA or
+//! the extended user-data allocation, and the size bit distinguishes four-word
+//! buffers/samplers from eight-word images. The direct ShaderResourceTable entry
+//! separately identifies the user-SGPR pair holding the guest SRT pointer.
 
 const std = @import("std");
 const gpu_state = @import("state.zig");
@@ -25,7 +25,8 @@ pub const Error = resources.Error || error{
     MetadataCountOutOfRange,
     MissingProgram,
     UserDataOutOfRange,
-    ResourceOutsideSrt,
+    ResourceOutsideUserData,
+    ResourceOutsideExtendedUserData,
     AddressOverflow,
     IncompleteVertexTables,
     InvalidVertexSemanticCount,
@@ -104,6 +105,10 @@ pub const ResourceMapping = struct {
     slot: u16,
     offset_words: u16,
     size_flag: bool,
+
+    pub fn wordCount(self: ResourceMapping) u8 {
+        return if (self.size_flag) 4 else 8;
+    }
 };
 
 /// Allocation-free view of relocated AGC metadata. Individual mapping entries
@@ -199,16 +204,19 @@ pub const Metadata = struct {
     }
 };
 
-pub const Descriptor = union(ResourceKind) {
+pub const Descriptor = union(enum) {
     read_only_texture: resources.ImageDescriptor,
     read_write_texture: resources.ImageDescriptor,
+    read_only_buffer: resources.BufferDescriptor,
+    read_write_buffer: resources.BufferDescriptor,
     sampler: resources.SamplerDescriptor,
     constant_buffer: resources.BufferDescriptor,
 };
 
 pub const Binding = struct {
     mapping: ResourceMapping,
-    descriptor_address: u64,
+    /// Hardware USER_DATA values are snapshots, so have no guest address.
+    descriptor_address: ?u64,
     descriptor: Descriptor,
 };
 
@@ -337,19 +345,35 @@ pub const StageBindings = struct {
         slot: u16,
     ) Error!?Binding {
         const metadata = self.metadata orelse return null;
-        const srt_address = self.srt_address orelse return null;
         const mapping = try metadata.resourceMapping(reader, kind, slot) orelse return null;
-        const word_count = kind.descriptorWordCount();
-        if (@as(u32, mapping.offset_words) + word_count > metadata.shader_resource_table_size_words) {
-            return Error.ResourceOutsideSrt;
-        }
-
-        const descriptor_address = try addAddress(srt_address, @as(u64, mapping.offset_words) * 4);
+        const word_count = mapping.wordCount();
+        if ((kind == .sampler or kind == .constant_buffer) and word_count != 4) return Error.InvalidMetadata;
+        // Sharp offsets name the logical USER_DATA bank. Its first 32 words
+        // reside in registers; subsequent words live in the EUD allocation.
+        // The SRT entry describes separate direct user data, not a memory
+        // allocation into which every descriptor offset can be applied.
+        const first: usize = mapping.offset_words;
+        var descriptor_address: ?u64 = null;
         var words: [8]u32 = undefined;
-        try reader.readWords(descriptor_address, words[0..word_count]);
+        if (first < 32) {
+            if (first + word_count > @min(self.user_data_count, 32)) return Error.ResourceOutsideUserData;
+            @memcpy(words[0..word_count], self.user_data[first..][0..word_count]);
+        } else {
+            const eud_first = first - 32;
+            if (eud_first + word_count > metadata.extended_user_data_size_words) return Error.ResourceOutsideExtendedUserData;
+            const eud = self.direct_pointers.extended_user_data orelse return Error.ResourceOutsideExtendedUserData;
+            descriptor_address = try addAddress(eud, eud_first * 4);
+            try reader.readWords(descriptor_address.?, words[0..word_count]);
+        }
         const descriptor: Descriptor = switch (kind) {
-            .read_only_texture => .{ .read_only_texture = try resources.decodeImageDescriptor(words[0..8]) },
-            .read_write_texture => .{ .read_write_texture = try resources.decodeImageDescriptor(words[0..8]) },
+            .read_only_texture => if (word_count == 4)
+                .{ .read_only_buffer = try resources.decodeBufferDescriptor(words[0..4]) }
+            else
+                .{ .read_only_texture = try resources.decodeImageDescriptor(words[0..8]) },
+            .read_write_texture => if (word_count == 4)
+                .{ .read_write_buffer = try resources.decodeBufferDescriptor(words[0..4]) }
+            else
+                .{ .read_write_texture = try resources.decodeImageDescriptor(words[0..8]) },
             .sampler => .{ .sampler = try resources.decodeSamplerDescriptor(words[0..4]) },
             .constant_buffer => .{ .constant_buffer = try resources.decodeBufferDescriptor(words[0..4]) },
         };
@@ -560,7 +584,7 @@ const TestMemory = struct {
     }
 };
 
-test "AGC metadata resolves the declared SRT register and descriptors" {
+test "AGC metadata resolves inline sharps and extended user data independently of SRT size" {
     var storage = [_]u8{0} ** 0x500;
     var memory = TestMemory{ .base = 0x1000, .bytes = &storage };
     const header: u64 = 0x1000;
@@ -577,19 +601,20 @@ test "AGC metadata resolves the declared SRT register and descriptors" {
     memory.writeInt(u64, user_data + 0x10, 0);
     memory.writeInt(u64, user_data + 0x18, sampler_offsets);
     memory.writeInt(u64, user_data + 0x20, buffer_offsets);
-    memory.writeInt(u16, user_data + 0x28, 4);
-    memory.writeInt(u16, user_data + 0x2a, 24);
-    memory.writeInt(u16, user_data + 0x2c, 2);
+    memory.writeInt(u16, user_data + 0x28, 16);
+    memory.writeInt(u16, user_data + 0x2a, 2);
+    memory.writeInt(u16, user_data + 0x2c, 6);
     memory.writeInt(u16, user_data + 0x2e, 2);
     memory.writeInt(u16, user_data + 0x30, 0);
     memory.writeInt(u16, user_data + 0x32, 1);
     memory.writeInt(u16, user_data + 0x34, 1);
-    memory.writeInt(u16, direct, illegal_direct_offset);
-    memory.writeInt(u16, direct + 2, 3);
-    memory.writeInt(u16, image_offsets, 0x8000);
-    memory.writeInt(u16, image_offsets + 2, illegal_resource_offset);
-    memory.writeInt(u16, sampler_offsets, 8);
-    memory.writeInt(u16, buffer_offsets, 12);
+    for (0..6) |index| memory.writeInt(u16, direct + index * 2, illegal_direct_offset);
+    memory.writeInt(u16, direct + 2, 0);
+    memory.writeInt(u16, direct + 10, 14);
+    memory.writeInt(u16, image_offsets, 2); // eight-word inline T#
+    memory.writeInt(u16, image_offsets + 2, 0x800a); // four-word inline V#
+    memory.writeInt(u16, sampler_offsets, 0x8020);
+    memory.writeInt(u16, buffer_offsets, 0x8024);
 
     const image_words = [_]u32{
         0x0012_3456,
@@ -601,29 +626,41 @@ test "AGC metadata resolves the declared SRT register and descriptors" {
         0,
         0,
     };
-    for (image_words, 0..) |word, index| memory.writeInt(u32, srt + index * 4, word);
     const sampler_words = [_]u32{ 0, 0x0fff_f000, 0, 0 };
-    for (sampler_words, 0..) |word, index| memory.writeInt(u32, srt + 32 + index * 4, word);
+    for (sampler_words, 0..) |word, index| memory.writeInt(u32, srt + index * 4, word);
     const buffer_words = [_]u32{ 0x1234_5000, 16 << 16, 4, 56 << 12 };
-    for (buffer_words, 0..) |word, index| memory.writeInt(u32, srt + 48 + index * 4, word);
+    for (buffer_words, 0..) |word, index| memory.writeInt(u32, srt + 16 + index * 4, word);
 
     var state = gpu_state.State{};
     try state.writeRegister(.shader, resources.ShaderStage.compute.programRegisterBase(), 0x40);
     try state.writeRegister(.shader, resources.ShaderStage.compute.programRegisterBase() + 1, 0);
-    try state.writeRegister(.shader, 0x213, 5 << 1);
-    try state.writeRegister(.shader, resources.ShaderStage.compute.userDataBase() + 3, @truncate(srt));
-    try state.writeRegister(.shader, resources.ShaderStage.compute.userDataBase() + 4, @truncate(srt >> 32));
+    try state.writeRegister(.shader, 0x213, 16 << 1);
+    const base = resources.ShaderStage.compute.userDataBase();
+    try state.writeRegister(.shader, base, 0x1400);
+    try state.writeRegister(.shader, base + 1, 0);
+    for (image_words, 0..) |word, index| try state.writeRegister(.shader, base + 2 + @as(u32, @intCast(index)), word);
+    for (buffer_words, 0..) |word, index| try state.writeRegister(.shader, base + 10 + @as(u32, @intCast(index)), word);
+    try state.writeRegister(.shader, base + 14, @truncate(srt));
+    try state.writeRegister(.shader, base + 15, 0);
 
     const bindings = try StageBindings.capture(&state, .compute, header, memory.reader());
-    try testing.expectEqual(@as(?u64, srt), bindings.srt_address);
-    try testing.expectEqual(@as(u16, 24), bindings.metadata.?.shader_resource_table_size_words);
+    try testing.expectEqual(@as(?u64, 0x1400), bindings.srt_address);
+    try testing.expectEqual(@as(u16, 2), bindings.metadata.?.shader_resource_table_size_words);
     const image = (try bindings.resolve(memory.reader(), .read_only_texture, 0)).?;
-    try testing.expect(image.mapping.size_flag);
+    try testing.expect(!image.mapping.size_flag);
+    try testing.expectEqual(@as(?u64, null), image.descriptor_address);
     try testing.expectEqual(@as(u32, 256), image.descriptor.read_only_texture.width);
-    try testing.expect((try bindings.resolve(memory.reader(), .read_only_texture, 1)) == null);
+    const read_only_buffer = (try bindings.resolve(memory.reader(), .read_only_texture, 1)).?;
+    try testing.expectEqual(@as(u64, 0x1234_5000), read_only_buffer.descriptor.read_only_buffer.address);
     const buffer = (try bindings.resolve(memory.reader(), .constant_buffer, 0)).?;
     try testing.expectEqual(@as(u64, 0x1234_5000), buffer.descriptor.constant_buffer.address);
     try testing.expectEqual(@as(u64, 64), buffer.descriptor.constant_buffer.size_bytes);
+    try testing.expectEqual(@as(?u64, srt + 16), buffer.descriptor_address);
+    _ = (try bindings.resolve(memory.reader(), .sampler, 0)).?;
+    // A short EUD allocation does not authorize reading the following words.
+    var short = bindings;
+    short.metadata.?.extended_user_data_size_words = 7;
+    try testing.expectError(Error.ResourceOutsideExtendedUserData, short.resolve(memory.reader(), .constant_buffer, 0));
 }
 
 test "compute bindings decode an inline V# by physical SGPR" {
@@ -645,7 +682,7 @@ test "compute bindings decode an inline V# by physical SGPR" {
     try testing.expect((try bindings.inlineBufferDescriptor(8)) == null);
 }
 
-test "resource mappings cannot read beyond the declared SRT" {
+test "resource mappings cannot read beyond the captured USER_DATA" {
     var storage = [_]u8{0} ** 0x300;
     var memory = TestMemory{ .base = 0x2000, .bytes = &storage };
     const header: u64 = 0x2000;
@@ -676,7 +713,7 @@ test "resource mappings cannot read beyond the declared SRT" {
     try state.writeRegister(.shader, resources.ShaderStage.pixel.userDataBase() + 1, 0);
     const bindings = try StageBindings.capture(&state, .pixel, header, memory.reader());
     try testing.expectError(
-        Error.ResourceOutsideSrt,
+        Error.ResourceOutsideUserData,
         bindings.resolve(memory.reader(), .read_only_texture, 0),
     );
 }

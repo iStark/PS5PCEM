@@ -1919,8 +1919,8 @@ pub fn elementLayoutForUnifiedFormat(format: u16) ?ElementLayout {
         62...71 => .{ .bytes = 8 },
         72...74 => .{ .bytes = 12 },
         75...77 => .{ .bytes = 16 },
-        169, 170 => .{ .bytes = 8, .texels_wide = 4, .texels_high = 4 },
-        171...182 => .{ .bytes = 16, .texels_wide = 4, .texels_high = 4 },
+        169, 170, 175, 176 => .{ .bytes = 8, .texels_wide = 4, .texels_high = 4 },
+        171...174, 177...182 => .{ .bytes = 16, .texels_wide = 4, .texels_high = 4 },
         else => null,
     };
 }
@@ -1938,6 +1938,26 @@ pub fn colorBytesPerElement(format: u8) ?u8 {
 
 fn isSupportedElementSize(bytes: u8) bool {
     return bytes == 1 or bytes == 2 or bytes == 4 or bytes == 8 or bytes == 16;
+}
+
+test "BC4 scene allocations use eight-byte blocks for both signedness variants" {
+    for ([_]u16{ 175, 176 }) |format| {
+        for ([_]u32{ 2816, 2048 }) |size| {
+            const last: u32 = if (size == 2048) 11 else 0;
+            const words = [_]u32{
+                0xa3a42e00,                             0xc0000000 | (@as(u32, format) << 20),
+                ((size - 1) >> 2) | ((size - 1) << 14), 0x90500324 | (last << 16),
+                0,                                      0x00700000 | (last << 4),
+                0,                                      0,
+            };
+            const layout = try TextureLayout.fromImage(try resources.decodeImageDescriptor(&words));
+            // Actual APR allocations: a 2816-square atlas and a complete
+            // 2048-square chain. The old 16-byte classification doubled both.
+            try std.testing.expectEqual(@as(u64, if (size == 2048) 0x2ab000 else 0x3c8000), layout.required_source_bytes);
+            const base = try layout.base();
+            try std.testing.expectEqual(@as(u64, size) * size / 2, try base.stagingBytes());
+        }
+    }
 }
 
 fn thickBlockDimensions(family: BlockFamily, bytes: u8) Error![3]u32 {

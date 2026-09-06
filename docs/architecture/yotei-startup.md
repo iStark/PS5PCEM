@@ -431,10 +431,54 @@ test checks all 12,000 mappings, replacement, nearby-entry lookup and reset.
 The interface GPU probe checks ABI control-flow merges, smooth/flat aliases,
 independent spills and their invalidation. It and the full smoke pass with SDK
 1.4.357.0 validation. All 26 scalar-provenance tests pass. The actual game emits
-128 valid SPIR-V modules in its next run, but validation catches
-`VUID-vkQueueSubmit-pCommandBuffers-00070`: a recorded command references a
-destroyed buffer. Resource-failure tracing now logs buffer retirement and cache
-replacement to identify that lifetime error. No complete menu is confirmed.
+128 valid SPIR-V modules in its next run. A later trace establishes that
+`VK_ERROR_DEVICE_LOST` precedes the buffer-lifetime and command-resubmission
+validation errors. The timeline query then reports `UINT64_MAX`; treating it
+as completion incorrectly retires resources. Device loss is now latched, and
+completion values beyond the last submitted tick are rejected. The original
+GPU fault still requires investigation.
+
+## Material tables and the end of scene loading
+
+Waiting for each command buffer from frame 675 passes the former device-loss
+point at flip 683. This diagnostic run resolves 6,045 APR requests, reaches
+loader state 40, clears the loader object and starts producing nonzero audio
+PCM. It stops at compute program `0x801f225d00` with `ResourceOutsideSrt`.
+No Vulkan validation errors occur during this run; its captured window is
+still black. Serial completion changes timing and batching, so this does not
+establish the cause of the original GPU fault or confirm a rendered menu.
+
+The captured program and its metadata show that sharp offsets refer to the
+logical USER_DATA bank: offsets below 32 select captured hardware registers,
+and larger offsets select `(offset - 32) * 4` in extended user data. The SRT
+size does not bound those descriptors. The metadata size bit distinguishes
+four-word buffers/samplers from eight-word images. Resolution now follows
+that layout and checks the corresponding register or EUD bounds. Compute
+staging also avoids an eager scan of unused constant-buffer metadata.
+
+Scene material program `0x80002e6d00` guards its record index below 255, spills
+it into a VGPR lane, then multiplies the restored index by 368. Resource
+analysis follows the guarded value through the spill and CFG before narrowing
+candidate descriptor offsets. Ambiguous definitions, bypass paths and
+unproven bounds retain the full 32-bit wrapping interpretation. The sampled
+descriptor bank grows independently of the storage-buffer bank, up to 512
+textures within the Vulkan device limits, with 4,096 instruction mappings.
+
+BC4 formats 175/176 previously used 16-byte blocks instead of eight-byte
+blocks. Both tiling and upload sizing now use eight bytes. The captured
+2816-square single-mip allocation requires `0x3c8000` bytes; a 2048-square
+12-mip allocation requires `0x2ab000`, matching the game's resident ranges.
+
+The inline-buffer, 128-texture indirect sampling, BC4 UNORM/SNORM, shader
+interface and full Vulkan probes pass on the RTX 3070 Ti with SDK 1.4.357.0
+validation and synchronization validation, without VUID or synchronization
+errors. Metadata and tiling tests cover register/EUD bounds and the captured
+BC4 allocation sizes. These checks do not replace the next full game run.
+
+`PS5_TRACE_RESOURCE_FAILURES=1` enables NV GPU fault checkpoints when supported.
+`PS5_TRACE_GPU_COMPLETION_FROM_FRAME=N` additionally waits after each command
+buffer starting at frame N; it is an expensive diagnostic, disabled by default.
+Nested pointer-driven image/sampler tables remain unresolved.
 
 ## Baseline before the timestamp fix
 
@@ -470,5 +514,6 @@ Enabling `PS5_GPU_CANONICAL_ALIASES` and `PS5_GPU_DEPTH_TRANSFER` together did
 not restore the menu and increased measured frame time to roughly 1.9 seconds.
 These remain disabled by default.
 
-Audible game audio remains unverified. Observed ATRAC9 input matches the
-title's `silence_5sec.at9` asset and correctly decodes to zero PCM.
+Audible game audio remains unverified. Early ATRAC9 input matches the title's
+`silence_5sec.at9` asset and correctly decodes to zero PCM; the later run that
+finishes scene loading also produces nonzero PCM.

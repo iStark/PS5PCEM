@@ -252,6 +252,8 @@ pub const Options = struct {
     dynamic_scalar_binding: ?DynamicScalarBinding = null,
     compute_inputs: ?ComputeInputs = null,
     descriptor_array_length: u32 = 64,
+    /// Sampled material tables can be much larger than the storage-buffer bank.
+    sampled_image_array_length: ?u32 = null,
     /// Exclusive PC ending a straight scalar prolog evaluated against the
     /// captured dispatch state and checked guest memory.
     specialized_scalar_prefix_end: u32 = 0,
@@ -934,8 +936,9 @@ const Builder = struct {
             }
         }
         if (options.sampled_images.len != 0) {
+            const sampled_array_length = options.sampled_image_array_length orelse options.descriptor_array_length;
             if ((options.stage != .vertex and options.stage != .fragment and options.stage != .compute) or
-                options.descriptor_array_length == 0)
+                sampled_array_length == 0)
             {
                 return Error.InvalidStorageBinding;
             }
@@ -943,7 +946,7 @@ const Builder = struct {
             for (options.sampled_images, 0..) |binding, index| {
                 if (binding.resource_sgpr >= 128 or binding.sampler_sgpr >= 128 or
                     (binding.candidate_words != null and binding.resource_sgpr + 8 > 128) or
-                    binding.descriptor_index >= options.descriptor_array_length)
+                    binding.descriptor_index >= sampled_array_length)
                 {
                     return Error.InvalidStorageBinding;
                 }
@@ -966,7 +969,7 @@ const Builder = struct {
                 self.vector4_type = self.id();
                 try self.emit(&self.declarations, 23, &.{ self.vector4_type, self.float_type, 4 }); // OpTypeVector
             }
-            const descriptor_count = try self.constant(.bits32, options.descriptor_array_length);
+            const descriptor_count = try self.constant(.bits32, sampled_array_length);
             for (sampled_dimensions, 0..) |present, dimension_index| {
                 if (!present) continue;
                 const dimensions: u32 = if (dimension_index == 0) 2 else 3;

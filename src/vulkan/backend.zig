@@ -88,6 +88,7 @@ pub const Error = error{
     QueueSubmissionFailed,
     FenceWaitFailed,
     DeviceWaitFailed,
+    DeviceLost,
     ReadbackMismatch,
     GuestMemoryUnavailable,
     GuestMemoryReadFailed,
@@ -144,6 +145,9 @@ pub const Options = struct {
     /// Expensive per-draw readback and PPM capture for one selected guest
     /// frame. Kept opt-in because a busy 4K frame can transfer several GiB.
     trace_graphics_frame: ?u64 = null,
+    /// Wait after each command buffer from this frame onward to identify the
+    /// pass responsible for a GPU fault. Disabled during normal execution.
+    trace_gpu_completion_from_frame: ?u64 = null,
     /// Replaces translated guest pixel shaders with an opaque diagnostic
     /// colour while retaining the guest target and pipeline state.
     force_probe_fragment: bool = false,
@@ -230,6 +234,7 @@ pub const DeviceInfo = struct {
     vendor_id: u32,
     device_id: u32,
     device_type: u32,
+    sampled_image_capacity: u32 = 64,
 
     pub fn name(self: *const DeviceInfo) []const u8 {
         return self.name_bytes[0..self.name_length];
@@ -783,8 +788,9 @@ const TextureContent = struct {
 const maximum_render_targets = 64;
 const maximum_color_passes = 16;
 const maximum_depth_targets = 16;
-const maximum_sampled_images = maximum_storage_descriptors;
-const maximum_compute_sampled_mappings = 256;
+const maximum_sampled_images = 512;
+// One physical texture can occur at many sampling instructions in a material.
+const maximum_compute_sampled_mappings = 4096;
 // Descriptor arrays are limited per shader, but the cross-draw texture cache
 // must cover a complete modern frame. Tying cache capacity to the 32 live
 // descriptor slots evicts large static textures before their next use and
@@ -2182,11 +2188,11 @@ const CachedStorageImage = struct {
 };
 
 const GraphicsResources = struct {
-    images: [maximum_storage_descriptors]PreparedSampledImage = undefined,
+    images: [maximum_sampled_images]PreparedSampledImage = undefined,
     image_count: usize = 0,
-    descriptors: [maximum_storage_descriptors]gpu.ImageDescriptor = undefined,
-    samplers: [maximum_storage_descriptors]gpu.resources.SamplerDescriptor = undefined,
-    dimensions: [maximum_storage_descriptors]rdna2.spirv.SampledImageDimension = undefined,
+    descriptors: [maximum_sampled_images]gpu.ImageDescriptor = undefined,
+    samplers: [maximum_sampled_images]gpu.resources.SamplerDescriptor = undefined,
+    dimensions: [maximum_sampled_images]rdna2.spirv.SampledImageDimension = undefined,
     mappings: [maximum_compute_sampled_mappings]gpu.ShaderSpirvSampledImageBinding = undefined,
     mapping_count: usize = 0,
 
@@ -2358,11 +2364,11 @@ const ComputeResources = struct {
     // larger PC-specific mapping table used by generated Unity kernels.
     storage_image_mappings: [maximum_storage_descriptors]gpu.ShaderSpirvStorageImageBinding = undefined,
     storage_image_mapping_count: usize = 0,
-    sampled_images: [maximum_storage_descriptors]PreparedSampledImage = undefined,
+    sampled_images: [maximum_sampled_images]PreparedSampledImage = undefined,
     sampled_image_count: usize = 0,
-    sampled_image_descriptors: [maximum_storage_descriptors]gpu.ImageDescriptor = undefined,
-    sampled_image_samplers: [maximum_storage_descriptors]gpu.resources.SamplerDescriptor = undefined,
-    sampled_image_dimensions: [maximum_storage_descriptors]rdna2.spirv.SampledImageDimension = undefined,
+    sampled_image_descriptors: [maximum_sampled_images]gpu.ImageDescriptor = undefined,
+    sampled_image_samplers: [maximum_sampled_images]gpu.resources.SamplerDescriptor = undefined,
+    sampled_image_dimensions: [maximum_sampled_images]rdna2.spirv.SampledImageDimension = undefined,
     sampled_image_mappings: [maximum_compute_sampled_mappings]gpu.ShaderSpirvSampledImageBinding = undefined,
     sampled_image_mapping_count: usize = 0,
 
@@ -2891,6 +2897,12 @@ pub const Renderer = struct {
     timeline_semaphore: vk.Semaphore,
     submitted_tick: u64 = 0,
     completed_tick: u64 = 0,
+    device_lost: bool = false,
+    trace_gpu_completion_from_frame: ?u64 = null,
+    trace_gpu_programs: [2]u64 = .{ 0, 0 },
+    cmd_set_checkpoint: ?vk.PfnCmdSetCheckpointNV = null,
+    get_queue_checkpoints: ?vk.PfnGetQueueCheckpointDataNV = null,
+    recording_checkpoint_program: u64 = 0,
     descriptor_set_layout: vk.DescriptorSetLayout,
     descriptor_pool: vk.DescriptorPool,
     descriptor_sets: []vk.DescriptorSet,
@@ -3424,7 +3436,13 @@ pub const Renderer = struct {
                 null,
             .timeline_semaphore = vk.true_value,
         };
-        var device_extension_names: [2][*:0]const u8 = undefined;
+        const diagnostic_checkpoints = options.trace_resource_failures and physicalDeviceSupportsExtension(
+            allocator,
+            &instance_functions,
+            candidate.physical_device,
+            "VK_NV_device_diagnostic_checkpoints",
+        );
+        var device_extension_names: [3][*:0]const u8 = undefined;
         var device_extension_count: u32 = 0;
         if (wants_presentation) {
             device_extension_names[device_extension_count] = "VK_KHR_swapchain";
@@ -3432,6 +3450,10 @@ pub const Renderer = struct {
         }
         if (image_float32_atomic_min_max) {
             device_extension_names[device_extension_count] = "VK_EXT_shader_atomic_float2";
+            device_extension_count += 1;
+        }
+        if (diagnostic_checkpoints) {
+            device_extension_names[device_extension_count] = "VK_NV_device_diagnostic_checkpoints";
             device_extension_count += 1;
         }
         const device_info = vk.DeviceCreateInfo{
@@ -3490,7 +3512,7 @@ pub const Renderer = struct {
         const sampled_image_binding = vk.DescriptorSetLayoutBinding{
             .binding = 1,
             .descriptor_type = vk.descriptor_type_combined_image_sampler,
-            .descriptor_count = maximum_storage_descriptors,
+            .descriptor_count = candidate.info.sampled_image_capacity,
             .stage_flags = vk.shader_stage_vertex_bit | vk.shader_stage_fragment_bit | vk.shader_stage_compute_bit,
         };
         var descriptor_bindings: [7 + maximum_storage_images]vk.DescriptorSetLayoutBinding = undefined;
@@ -3515,19 +3537,19 @@ pub const Renderer = struct {
         descriptor_bindings[3 + maximum_storage_images] = .{
             .binding = sampled_image_3d_descriptor_binding,
             .descriptor_type = vk.descriptor_type_combined_image_sampler,
-            .descriptor_count = maximum_storage_descriptors,
+            .descriptor_count = candidate.info.sampled_image_capacity,
             .stage_flags = vk.shader_stage_vertex_bit | vk.shader_stage_fragment_bit | vk.shader_stage_compute_bit,
         };
         descriptor_bindings[4 + maximum_storage_images] = .{
             .binding = sampled_image_cube_descriptor_binding,
             .descriptor_type = vk.descriptor_type_combined_image_sampler,
-            .descriptor_count = maximum_storage_descriptors,
+            .descriptor_count = candidate.info.sampled_image_capacity,
             .stage_flags = vk.shader_stage_vertex_bit | vk.shader_stage_fragment_bit | vk.shader_stage_compute_bit,
         };
         descriptor_bindings[5 + maximum_storage_images] = .{
             .binding = sampled_image_2d_array_descriptor_binding,
             .descriptor_type = vk.descriptor_type_combined_image_sampler,
-            .descriptor_count = maximum_storage_descriptors,
+            .descriptor_count = candidate.info.sampled_image_capacity,
             .stage_flags = vk.shader_stage_vertex_bit | vk.shader_stage_fragment_bit | vk.shader_stage_compute_bit,
         };
         descriptor_bindings[6 + maximum_storage_images] = .{
@@ -3561,7 +3583,7 @@ pub const Renderer = struct {
         };
         const image_pool_size = vk.DescriptorPoolSize{
             .descriptor_type = vk.descriptor_type_combined_image_sampler,
-            .descriptor_count = maximum_storage_descriptors * 4 * maximum_frame_descriptor_sets,
+            .descriptor_count = candidate.info.sampled_image_capacity * 4 * maximum_frame_descriptor_sets,
         };
         const storage_image_pool_size = vk.DescriptorPoolSize{
             .descriptor_type = vk.descriptor_type_storage_image,
@@ -3682,6 +3704,7 @@ pub const Renderer = struct {
             .graphics_probe_enabled = options.enable_graphics_probe,
             .capture_first_graphics_frame = options.capture_first_graphics_frame,
             .trace_graphics_frame = options.trace_graphics_frame,
+            .trace_gpu_completion_from_frame = options.trace_gpu_completion_from_frame,
             .force_probe_fragment = options.force_probe_fragment,
             .force_probe_fragment_texture = options.force_probe_fragment_texture,
             .force_probe_fragment_parameter = options.force_probe_fragment_parameter,
@@ -3762,6 +3785,11 @@ pub const Renderer = struct {
                 .buffer_info = @ptrCast(&scalar_buffer_info),
             };
             device_functions.update_descriptor_sets(device, 1, @ptrCast(&scalar_write), 0, null);
+        }
+        if (diagnostic_checkpoints) {
+            renderer.cmd_set_checkpoint = try deviceProc(instance_functions.get_device_proc_addr, device, vk.PfnCmdSetCheckpointNV, "vkCmdSetCheckpointNV");
+            renderer.get_queue_checkpoints = try deviceProc(instance_functions.get_device_proc_addr, device, vk.PfnGetQueueCheckpointDataNV, "vkGetQueueCheckpointDataNV");
+            std.debug.print("[vulkan] GPU fault checkpoints enabled\n", .{});
         }
         try renderer.gds_storage.resize(allocator, 64 * 1024);
         errdefer renderer.gds_storage.deinit(allocator);
@@ -4719,6 +4747,7 @@ pub const Renderer = struct {
             return Error.MissingComputeProgram;
         };
         self.last_compute_program = program_address;
+        self.trace_gpu_programs = .{ program_address, 0 };
         const header_address = if (memory.shader_header) |resolve|
             resolve(memory.context, program_address)
         else
@@ -5483,6 +5512,7 @@ pub const Renderer = struct {
             .workgroup_memory_size_bytes = computeLdsSizeBytes(state),
             .gds_storage = uses_gds,
             .descriptor_array_length = maximum_storage_descriptors,
+            .sampled_image_array_length = self.device_info.sampled_image_capacity,
             .specialized_scalar_prefix_end = resources.specialized_scalar_prefix_end,
             .zero_unmapped_flat_loads = yotei_empty_cluster_flat_read,
             .allow_float64 = self.shader_float64_available,
@@ -7633,33 +7663,11 @@ pub const Renderer = struct {
             &result.scalar_registers,
             result.scalar_count,
         );
-        // Preserve the AGC slot number whenever possible. This makes the host
-        // descriptor table stable across shaders that share one SRT layout.
-        var iterator = bindings.iterator(reader, .constant_buffer);
-        while (true) {
-            // Resource-count tables can include an unused/partially populated
-            // constant-buffer slot.  A later instruction-local V# is still
-            // authoritative, so do not discard the complete kernel merely
-            // because that eager SRT sweep encounters one invalid candidate.
-            const next_binding = iterator.next() catch |err| switch (err) {
-                error.InvalidDescriptor, error.InvalidFormat => continue,
-                else => return err,
-            };
-            const binding = next_binding orelse break;
-            const descriptor = binding.descriptor.constant_buffer;
-            if (descriptor.isNull() or descriptor.size_bytes == 0) continue;
-            const size = std.math.cast(usize, descriptor.size_bytes) orelse return Error.GuestBufferTooLarge;
-            if (result.descriptorForRange(descriptor.address, size) != null) continue;
-            const descriptor_index: u32 = if (binding.mapping.slot < maximum_storage_descriptors and
-                !result.occupied[binding.mapping.slot])
-                binding.mapping.slot
-            else
-                result.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
-            _ = try self.stageGuestStorageBufferAt(descriptor_index, descriptor.address, size);
-            result.occupied[descriptor_index] = true;
-            result.addresses[descriptor_index] = descriptor.address;
-            result.sizes[descriptor_index] = size;
-        }
+        // Stage only V# ranges named by actual SMEM/MUBUF instructions below.
+        // The old eager metadata sweep interpreted every constant-buffer
+        // mapping as an SRT offset, including layouts whose buffers are already
+        // inline in USER_DATA. It could abort an otherwise fully resolved
+        // kernel while resolving unused metadata and stop its queue before RELEASE_MEM.
 
         // Resource descriptors are often loaded into the same SGPR window at
         // several points in a shader. Capture all instruction-local states in
@@ -8229,10 +8237,10 @@ pub const Renderer = struct {
                     break;
                 }
                 if (descriptor_index == null) {
-                    if (result.sampled_image_count >= maximum_sampled_images) {
+                    if (result.sampled_image_count >= self.device_info.sampled_image_capacity) {
                         std.debug.print(
                             "[vulkan dcb] sampled image physical table exhausted ({d})\n",
-                            .{maximum_sampled_images},
+                            .{self.device_info.sampled_image_capacity},
                         );
                         return Error.UnsupportedSampledImage;
                     }
@@ -12393,6 +12401,10 @@ pub const Renderer = struct {
         vertex_stage: gpu.resources.ShaderStage,
         target_override: ?gpu.resources.ColorTarget,
     ) anyerror!void {
+        self.trace_gpu_programs = .{
+            vertex_stage.programAddress(state) orelse 0,
+            gpu.resources.ShaderStage.pixel.programAddress(state) orelse 0,
+        };
         try self.beginFrameDraw();
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
         const render_state = gpu.resources.decodeRenderState(state);
@@ -13581,6 +13593,7 @@ pub const Renderer = struct {
             .infer_fragment_parameter_mask = false,
             .color_export_mappings = color_export_mappings,
             .descriptor_array_length = maximum_storage_descriptors,
+            .sampled_image_array_length = self.device_info.sampled_image_capacity,
             .scalar_registers = fragment_scalar_regs[0..fragment_scalar_count],
             .dynamic_scalar_binding = if (fragment_scalar_count != 0) .{
                 .binding = dynamic_scalar_descriptor_binding,
@@ -13923,6 +13936,7 @@ pub const Renderer = struct {
                     .parameter_mask = paired_parameter_mask,
                     .vertex_parameter_sources = &fragment_input_controls,
                     .descriptor_array_length = maximum_storage_descriptors,
+                    .sampled_image_array_length = self.device_info.sampled_image_capacity,
                 }, .{
                     .enable_typed_ir = self.shader_ir_enabled,
                     .enable_ssa_optimization = self.shader_ssa_optimization_enabled,
@@ -15051,7 +15065,7 @@ pub const Renderer = struct {
                 );
                 return Error.UnsupportedSampledImage;
             };
-            if (result.image_count == result.images.len) return Error.UnsupportedSampledImage;
+            if (result.image_count >= self.device_info.sampled_image_capacity) return Error.UnsupportedSampledImage;
             const descriptor_index: u32 = @intCast(result.image_count);
             const sampled_started = hostTimestampNs();
             const image = self.stageSampledImage(
@@ -15134,7 +15148,7 @@ pub const Renderer = struct {
                 }
             }
             if (slot == null) {
-                if (result.image_count == result.images.len) return Error.UnsupportedSampledImage;
+                if (result.image_count >= self.device_info.sampled_image_capacity) return Error.UnsupportedSampledImage;
                 slot = @intCast(result.image_count);
                 result.images[result.image_count] = try self.stageSampledImage(descriptor, sampler, slot.?, dimension, target);
                 result.descriptors[result.image_count] = descriptor;
@@ -15323,10 +15337,10 @@ pub const Renderer = struct {
         images: []const PreparedSampledImage,
         mappings: []const gpu.ShaderSpirvSampledImageBinding,
     ) void {
-        std.debug.assert(images.len <= maximum_storage_descriptors);
+        std.debug.assert(images.len <= self.device_info.sampled_image_capacity);
         if (images.len == 0) return;
-        var image_infos: [maximum_storage_descriptors]vk.DescriptorImageInfo = undefined;
-        var writes: [maximum_storage_descriptors]vk.WriteDescriptorSet = undefined;
+        var image_infos: [maximum_sampled_images]vk.DescriptorImageInfo = undefined;
+        var writes: [maximum_sampled_images]vk.WriteDescriptorSet = undefined;
         for (images, 0..) |prepared, index| {
             var physical_mapping: ?gpu.ShaderSpirvSampledImageBinding = null;
             for (mappings) |mapping| {
@@ -17107,13 +17121,38 @@ pub const Renderer = struct {
         }
     }
 
+    fn reportDeviceLost(self: *Renderer) void {
+        if (self.device_lost) return;
+        self.device_lost = true;
+        const query = self.get_queue_checkpoints orelse return;
+        var data: [16]vk.CheckpointDataNV = @splat(.{});
+        var count: u32 = data.len;
+        query(self.queue, &count, &data);
+        for (data[0..@min(count, data.len)]) |checkpoint| {
+            const marker = @intFromPtr(checkpoint.marker);
+            std.debug.print("[gpu fault] stage=0x{x} program=0x{x} phase={s} flip={d} submitted={d} completed={d}\n", .{
+                checkpoint.stage, marker & ~@as(usize, 3), if (marker & 3 == 1) "begin" else "end", self.flip_callbacks, self.submitted_tick, self.completed_tick,
+            });
+        }
+    }
+
     fn refreshGpuProgress(self: *Renderer) Error!void {
+        if (self.device_lost) return Error.DeviceLost;
         var completed: u64 = 0;
-        if (self.device_functions.get_semaphore_counter_value(
+        const result = self.device_functions.get_semaphore_counter_value(
             self.device,
             self.timeline_semaphore,
             &completed,
-        ) != vk.success) return Error.TimelineSemaphoreQueryFailed;
+        );
+        if (result == vk.error_device_lost) {
+            self.reportDeviceLost();
+            return Error.DeviceLost;
+        }
+        if (result == vk.success and completed > self.submitted_tick) {
+            self.device_lost = true;
+            return Error.DeviceLost;
+        }
+        if (result != vk.success) return Error.TimelineSemaphoreQueryFailed;
         self.completed_tick = @max(self.completed_tick, completed);
         self.destroyDeferredVulkanObjects();
     }
@@ -17130,11 +17169,16 @@ pub const Renderer = struct {
             .values = &values,
         };
         const wait_started = hostTimestampNs();
-        if (self.device_functions.wait_semaphores(
+        const result = self.device_functions.wait_semaphores(
             self.device,
             &wait_info,
             std.math.maxInt(u64),
-        ) != vk.success) return Error.TimelineSemaphoreWaitFailed;
+        );
+        if (result == vk.error_device_lost) {
+            self.reportDeviceLost();
+            return Error.DeviceLost;
+        }
+        if (result != vk.success) return Error.TimelineSemaphoreWaitFailed;
         const wait_finished = hostTimestampNs();
         if (wait_finished >= wait_started) {
             self.frame_profile.fence_wait_ns +%= wait_finished - wait_started;
@@ -17219,6 +17263,10 @@ pub const Renderer = struct {
         self.recording_command_buffer = command_buffer;
         self.recording_command_slot = slot;
         self.command_buffer_ticks.items[slot] = command_buffer_pending_tick;
+        if (self.cmd_set_checkpoint) |checkpoint| {
+            self.recording_checkpoint_program = if (self.trace_gpu_programs[1] != 0) self.trace_gpu_programs[1] else self.trace_gpu_programs[0];
+            checkpoint(command_buffer, @ptrFromInt((self.recording_checkpoint_program & ~@as(u64, 3)) | 1));
+        }
         return command_buffer;
     }
 
@@ -17246,6 +17294,7 @@ pub const Renderer = struct {
         {
             return Error.CommandBufferEndFailed;
         }
+        if (self.cmd_set_checkpoint) |checkpoint| checkpoint(command_buffer, @ptrFromInt((self.recording_checkpoint_program & ~@as(u64, 3)) | 2));
         if (self.device_functions.end_command_buffer(command_buffer) != vk.success) return Error.CommandBufferEndFailed;
         const slot = self.recording_command_slot orelse return Error.CommandBufferEndFailed;
         self.recording_command_buffer = null;
@@ -17271,8 +17320,23 @@ pub const Renderer = struct {
             }
         }
         self.frame_profile.command_buffers += 1;
-        if (self.draw_batch_active) return;
+        const trace_completion = if (self.trace_gpu_completion_from_frame) |first|
+            self.flip_callbacks + 1 >= first
+        else
+            false;
+        if (self.draw_batch_active and !trace_completion) return;
+        if (trace_completion) std.debug.print(
+            "[gpu completion] begin frame={d} tick={d} programs=0x{x}/0x{x} commands={d}\n",
+            .{ self.flip_callbacks + 1, self.submitted_tick + 1, self.trace_gpu_programs[0], self.trace_gpu_programs[1], self.pending_command_buffers.items.len },
+        );
         try self.flushQueuedCommands();
+        if (trace_completion) {
+            self.waitForTick(self.submitted_tick) catch |err| {
+                std.debug.print("[gpu completion] FAILED frame={d} programs=0x{x}/0x{x}: {s}\n", .{ self.flip_callbacks + 1, self.trace_gpu_programs[0], self.trace_gpu_programs[1], @errorName(err) });
+                return err;
+            };
+            std.debug.print("[gpu completion] done tick={d}\n", .{self.submitted_tick});
+        }
     }
 
     fn flushQueuedCommands(self: *Renderer) Error!void {
@@ -17280,6 +17344,7 @@ pub const Renderer = struct {
     }
 
     fn flushQueuedCommandsSignaling(self: *Renderer, present_semaphore: ?vk.Semaphore) Error!void {
+        if (self.device_lost) return Error.DeviceLost;
         if (self.recording_command_buffer != null) return Error.CommandBufferEndFailed;
         if (self.pending_command_buffers.items.len == 0 and present_semaphore == null) {
             try self.refreshGpuProgress();
@@ -17304,6 +17369,7 @@ pub const Renderer = struct {
         };
         const submit_result = self.device_functions.queue_submit(self.queue, 1, @ptrCast(&submit_info), 0);
         if (submit_result != vk.success) {
+            if (submit_result == vk.error_device_lost) self.reportDeviceLost();
             // A submission is refused for a handful of very different reasons —
             // a lost device among them — and they call for different answers,
             // so record which one it was rather than only that one occurred.
@@ -19931,6 +19997,12 @@ pub const Renderer = struct {
                 std.mem.eql(u8, @errorName(err), "UnsupportedBufferAddressing") or
                 std.mem.eql(u8, @errorName(err), "InvalidMetadata") or
                 std.mem.eql(u8, @errorName(err), "UserDataOutOfRange");
+            if (self.trace_resource_failures and !soft) {
+                const stage = gpu.resources.ShaderStage.compute;
+                std.debug.print("[dispatch failure userdata] program=0x{x} count={d}", .{ program_address, stage.activeUserDataCount(state) });
+                for (0..stage.activeUserDataCount(state)) |index| std.debug.print(" {x:0>8}", .{state.readRegister(.shader, stage.userDataBase() + @as(u32, @intCast(index))) orelse 0});
+                std.debug.print("\n", .{});
+            }
             std.debug.print(
                 "[vulkan dcb] dispatch {s}: {s} (program=0x{x}, groups={d}x{d}x{d})\n",
                 .{
@@ -20472,7 +20544,10 @@ fn resolveReadWriteImageDescriptor(
 ) anyerror!?gpu.ImageDescriptor {
     if (try bindings.inlineImageDescriptor(resource_sgpr)) |descriptor| return descriptor;
     const binding = (try bindings.resolve(reader, .read_write_texture, 0)) orelse return null;
-    return binding.descriptor.read_write_texture;
+    return switch (binding.descriptor) {
+        .read_write_texture => |image| image,
+        else => null,
+    };
 }
 
 fn imageDescriptorFromUserDataPointer(
@@ -21701,8 +21776,7 @@ fn storageImageBytesPerTexel(unified_format: u16) u8 {
         20...29, 36, 50, 56...61, 130 => 4,
         62...71 => 8,
         75...77 => 16,
-        169, 170 => 8,
-        171...182 => 16,
+        169...182 => (gpu.elementLayoutForUnifiedFormat(unified_format) orelse unreachable).bytes,
         else => 0,
     };
 }
@@ -22770,7 +22844,10 @@ fn resolveSrtImageDescriptor(
 ) anyerror!?gpu.resources.ImageDescriptor {
     if (slot > std.math.maxInt(u16)) return null;
     const binding = (try bindings.resolve(reader, .read_only_texture, @intCast(slot))) orelse return null;
-    return binding.descriptor.read_only_texture;
+    return switch (binding.descriptor) {
+        .read_only_texture => |image| image,
+        else => null,
+    };
 }
 
 fn resolveSrtSamplerDescriptor(
@@ -22854,6 +22931,7 @@ fn resolveBufferImageCandidates(
     // The table descriptor must still be the same value used by the load.
     for (scalar.registers[load.src0.reg..][0..4]) |word| if (word.producer_pc >= load.pc) return null;
     var stride: ?u32 = null;
+    var index_bound: ?u32 = null;
     while (index != 0) {
         index -= 1;
         const inst = instructions[index];
@@ -22863,6 +22941,7 @@ fn resolveBufferImageCandidates(
             .integer_inline_constant, .literal_constant => inst.src1.value,
             else => return null,
         };
+        if (inst.src0.kind == .sgpr) index_bound = gpu.index_bounds.scalarUpperBound(instructions, &analysis.graph, index, inst.src0.reg);
         break;
     }
     const multiplier = stride orelse return null;
@@ -22870,10 +22949,11 @@ fn resolveBufferImageCandidates(
     // The byte product wraps at 32 bits. Enumerating only N*stride misses
     // other in-bounds offsets reachable after wrap. Its residue class has
     // step gcd(stride, 2^32), a power of two.
-    const step: u64 = @as(u64, 1) << @intCast(@ctz(multiplier));
     const displacement = @as(u64, @intCast(load.memory_offset)) + (sample.src1.reg - load.dst.reg) * 4;
-    const residue = displacement % step;
-    const limit = @min(buffer.size_bytes, @as(u64, 1) << 32);
+    const bounded = if (index_bound) |bound| displacement + @as(u64, bound) * multiplier <= std.math.maxInt(u32) else false;
+    const step: u64 = if (bounded) multiplier else @as(u64, 1) << @intCast(@ctz(multiplier));
+    const residue = if (bounded) displacement else displacement % step;
+    const limit = @min(buffer.size_bytes, if (bounded) displacement + @as(u64, index_bound.?) * multiplier else @as(u64, 1) << 32);
     if (residue >= limit or (limit - residue + step - 1) / step > 16384) return null;
     var result = BufferImageCandidates{};
     var offset = residue;
@@ -23267,7 +23347,10 @@ fn resolveComputeSampledImageDescriptor(
             else => return err,
         };
         if (fallback) |binding| {
-            return binding.descriptor.read_only_texture;
+            return switch (binding.descriptor) {
+                .read_only_texture => |image| image,
+                else => null,
+            };
         }
     }
     return null;
@@ -23356,7 +23439,10 @@ fn resolveComputeImageDescriptor(
             else => return err,
         };
         if (fallback) |binding| {
-            return binding.descriptor.read_write_texture;
+            return switch (binding.descriptor) {
+                .read_write_texture => |image| image,
+                else => null,
+            };
         }
     }
     return null;
@@ -23834,6 +23920,18 @@ fn choosePhysicalDevice(
             .device_id = std.mem.readInt(u32, raw_properties[12..16], .little),
             .device_type = device_type,
         };
+        const properties: *const vk.PhysicalDevicePropertiesPrefix = @ptrCast(@alignCast(&raw_properties));
+        const limits = properties.limits;
+        const other_descriptors = maximum_storage_descriptors + maximum_storage_images + 2;
+        info.sampled_image_capacity = @min(
+            maximum_sampled_images,
+            limits.max_per_stage_descriptor_samplers / 4,
+            limits.max_per_stage_descriptor_sampled_images / 4,
+            limits.max_descriptor_set_samplers / 4,
+            limits.max_descriptor_set_sampled_images / 4,
+            (limits.max_per_stage_resources -| other_descriptors) / 4,
+        );
+        if (info.sampled_image_capacity == 0) continue;
         @memcpy(info.name_bytes[0..name_length], name_source[0..name_length]);
         info.name_length = @intCast(name_length);
         const score = physicalDeviceScore(device_type, prefer_integrated_gpu);

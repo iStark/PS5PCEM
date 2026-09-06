@@ -18,6 +18,38 @@ pub const Bool32 = u32;
 pub const DeviceSize = u64;
 
 pub const success: Result = 0;
+pub const error_device_lost: Result = -4;
+
+/// ABI prefix only; vkGetPhysicalDeviceProperties writes into a larger scratch
+/// allocation. Keep the two VkDeviceSize fields so limits retain native alignment.
+pub const PhysicalDevicePropertiesPrefix = extern struct {
+    api_version: u32,
+    driver_version: u32,
+    vendor_id: u32,
+    device_id: u32,
+    device_type: u32,
+    device_name: [256]u8,
+    pipeline_cache_uuid: [16]u8,
+    limits: extern struct {
+        image_and_allocation_limits: [11]u32,
+        buffer_image_granularity: u64,
+        sparse_address_space_size: u64,
+        max_bound_descriptor_sets: u32,
+        max_per_stage_descriptor_samplers: u32,
+        max_per_stage_descriptor_uniform_buffers: u32,
+        max_per_stage_descriptor_storage_buffers: u32,
+        max_per_stage_descriptor_sampled_images: u32,
+        max_per_stage_descriptor_storage_images: u32,
+        max_per_stage_descriptor_input_attachments: u32,
+        max_per_stage_resources: u32,
+        max_descriptor_set_samplers: u32,
+        max_descriptor_set_uniform_buffers: u32,
+        max_descriptor_set_uniform_buffers_dynamic: u32,
+        max_descriptor_set_storage_buffers: u32,
+        max_descriptor_set_storage_buffers_dynamic: u32,
+        max_descriptor_set_sampled_images: u32,
+    },
+};
 pub const not_ready: Result = 1;
 pub const timeout: Result = 2;
 pub const incomplete: Result = 5;
@@ -1108,6 +1140,14 @@ pub const PfnResetCommandBuffer = *const fn (CommandBuffer, Flags) callconv(call
 pub const PfnBeginCommandBuffer = *const fn (CommandBuffer, *const CommandBufferBeginInfo) callconv(call) Result;
 pub const PfnEndCommandBuffer = *const fn (CommandBuffer) callconv(call) Result;
 pub const PfnQueueSubmit = *const fn (Queue, u32, [*]const SubmitInfo, Fence) callconv(call) Result;
+pub const CheckpointDataNV = extern struct {
+    s_type: u32 = 1000206000,
+    p_next: ?*anyopaque = null,
+    stage: Flags = 0,
+    marker: ?*const anyopaque = null,
+};
+pub const PfnCmdSetCheckpointNV = *const fn (CommandBuffer, ?*const anyopaque) callconv(call) void;
+pub const PfnGetQueueCheckpointDataNV = *const fn (Queue, *u32, ?[*]CheckpointDataNV) callconv(call) void;
 pub const PfnCreateFence = *const fn (Device, *const FenceCreateInfo, ?*const anyopaque, *Fence) callconv(call) Result;
 pub const PfnDestroyFence = *const fn (Device, Fence, ?*const anyopaque) callconv(call) void;
 pub const PfnWaitForFences = *const fn (Device, u32, [*]const Fence, Bool32, u64) callconv(call) Result;
