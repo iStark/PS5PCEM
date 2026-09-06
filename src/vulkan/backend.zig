@@ -12567,6 +12567,42 @@ pub const Renderer = struct {
         }
     }
 
+    /// Measure the same GPU-to-host copy path used by image writebacks.
+    pub fn probeHostReadback(self: *Renderer) anyerror!u64 {
+        const size = 64 * 1024 * 1024;
+        const buffer = try self.createBuffer(size, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        defer self.destroyBuffer(buffer);
+        const upload = try self.createBuffer(size, vk.buffer_usage_transfer_src_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        defer self.destroyBuffer(upload);
+        const output = try self.allocator.alloc(u8, size);
+        defer self.allocator.free(output);
+        fillRepeatedPattern(output, &.{ 0x68, 0x24, 0x57, 0x13 });
+        try self.writeMapped(upload, output);
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        const copy = vk.BufferCopy{ .source_offset = 0, .destination_offset = 0, .size = size };
+        self.device_functions.cmd_copy_buffer(command_buffer, upload.handle, buffer.handle, 1, @ptrCast(&copy));
+        const barrier = vk.BufferMemoryBarrier{
+            .source_access_mask = vk.access_transfer_write_bit,
+            .destination_access_mask = vk.access_host_read_bit,
+            .buffer = buffer.handle,
+            .offset = 0,
+            .size = size,
+        };
+        self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
+        try self.submitOneShot(command_buffer);
+        var elapsed: u64 = 0;
+        for (0..4) |_| {
+            @memset(output, 0);
+            const started = hostTimestampNs();
+            try self.readMapped(buffer, output);
+            elapsed += elapsedHostNanoseconds(started);
+            for (0..size / 4) |index|
+                try std.testing.expectEqual(@as(u32, 0x13572468), std.mem.readInt(u32, output[index * 4 ..][0..4], .little));
+        }
+        return elapsed;
+    }
+
     /// Exercise the depth-only compatibility path and return corner/centre
     /// depth after two draws. The second empty draw must retain the first.
     pub fn probeDepthOnlyDraws(self: *Renderer, biased: bool) anyerror![2]f32 {
@@ -15454,7 +15490,7 @@ pub const Renderer = struct {
 
         var requirements: vk.MemoryRequirements = undefined;
         self.device_functions.get_buffer_memory_requirements(self.device, handle, &requirements);
-        const memory_type_index = self.findMemoryType(requirements.memory_type_bits, properties) orelse {
+        const memory_type_index = findBufferMemoryTypeIn(self.memory_properties, requirements.memory_type_bits, properties, usage) orelse {
             return Error.NoCompatibleMemoryType;
         };
         const allocation_info = vk.MemoryAllocateInfo{
@@ -24305,6 +24341,32 @@ fn physicalDeviceScore(device_type: u32, prefer_integrated_gpu: bool) u32 {
         vk.physical_device_type_integrated_gpu => 200,
         else => 100,
     };
+}
+
+fn findBufferMemoryTypeIn(properties: vk.PhysicalDeviceMemoryProperties, supported_bits: u32, required: vk.Flags, usage: vk.Flags) ?u32 {
+    // Readback and bidirectional staging buffers are read by the CPU. The
+    // first HOST_VISIBLE|HOST_COHERENT type can be uncached (NVIDIA type 3),
+    // making multi-MiB reads far slower than cached coherent memory (type 4).
+    // Keep all required flags and fall back on devices without such a type.
+    if (usage & vk.buffer_usage_transfer_dst_bit != 0 and required & vk.memory_property_host_visible_bit != 0) {
+        if (findMemoryTypeIn(properties, supported_bits, required | vk.memory_property_host_cached_bit)) |index| return index;
+    }
+    return findMemoryTypeIn(properties, supported_bits, required);
+}
+
+test "readback memory prefers host caching without weakening required flags" {
+    var properties: vk.PhysicalDeviceMemoryProperties = std.mem.zeroes(vk.PhysicalDeviceMemoryProperties);
+    properties.memory_type_count = 5;
+    for ([_]u32{ 1, 6, 10, 14, 7 }, 0..) |flags, index| properties.memory_types[index].property_flags = flags;
+    const readback = vk.buffer_usage_transfer_dst_bit;
+    const upload = vk.buffer_usage_transfer_src_bit;
+    const required = vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit;
+    try std.testing.expectEqual(@as(?u32, 3), findBufferMemoryTypeIn(properties, 0x1f, required, readback));
+    try std.testing.expectEqual(@as(?u32, 3), findBufferMemoryTypeIn(properties, 0x1f, required, readback | upload));
+    try std.testing.expectEqual(@as(?u32, 1), findBufferMemoryTypeIn(properties, 0x1f, required, upload));
+    try std.testing.expectEqual(@as(?u32, 1), findBufferMemoryTypeIn(properties, 0x17, required, readback));
+    try std.testing.expectEqual(@as(?u32, 4), findBufferMemoryTypeIn(properties, 0x1f, required | vk.memory_property_device_local_bit, readback));
+    try std.testing.expectEqual(@as(?u32, null), findBufferMemoryTypeIn(properties, 1 << 2, required, readback));
 }
 
 fn findMemoryTypeIn(properties: vk.PhysicalDeviceMemoryProperties, supported_bits: u32, required: vk.Flags) ?u32 {

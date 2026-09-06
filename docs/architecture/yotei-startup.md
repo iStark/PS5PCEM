@@ -843,6 +843,25 @@ raster modes and three slope values. The SDK GPU probe shifts depth 0.5 to
 the ordinary depth probe and complete Vulkan smoke also pass. This change
 still needs validation in the title's scene.
 
+The run with swizzle caching, permission lookup and corrected flat channels
+loads all 6,042 resources in 20m13s. The fully visible Digital Deluxe notice
+now has the correct complete X glyph. Warm full frames take 13–14 seconds
+versus 16–18 seconds previously; an earlier 10.6-second transition frame has
+less work and is not the steady-state result. CPU samples now concentrate on
+memory copying/clearing and storage-image cache eviction. The 2D-only swizzle
+axis experiment did not improve render-target copy timings and was not kept.
+
+The RTX 3070 Ti exposes uncached coherent host memory at type 3 (`0x6`) and
+cached coherent memory at type 4 (`0xe`). Buffer allocation previously took
+the first compatible type, including for GPU readback. Host-visible transfer
+destinations now prefer HOST_CACHED while retaining every required property;
+upload-only buffers and devices without a compatible cached type keep their
+existing selection. This follows the [Vulkan memory property contract](https://docs.vulkan.org/refpages/latest/refpages/source/VkMemoryPropertyFlagBits.html).
+CPU selection tests cover supported-type masks, coherence, device-local
+requirements and fallback. Four verified 64 MiB reads of GPU-written data
+drop from 508,056 to 21,382 us under SDK validation. This is a readback
+benchmark; the additional whole-frame gain is still unmeasured.
+
 ## Baseline before the timestamp fix
 
 A five-minute run continues rendering after the movie, at approximately

@@ -179,6 +179,7 @@ pub const sharing_mode_exclusive: u32 = 0;
 
 pub const memory_property_host_visible_bit: Flags = 0x0000_0002;
 pub const memory_property_host_coherent_bit: Flags = 0x0000_0004;
+pub const memory_property_host_cached_bit: Flags = 0x0000_0008;
 pub const memory_property_device_local_bit: Flags = 0x0000_0001;
 
 pub const pipeline_bind_point_compute: u32 = 1;

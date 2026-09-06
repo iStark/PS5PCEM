@@ -2115,6 +2115,13 @@ fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--host-readback")) {
+        var renderer = try vulkan.Renderer.init(allocator, .{});
+        defer renderer.deinit();
+        const elapsed = try renderer.probeHostReadback();
+        std.debug.print("host readback passed: four 64 MiB reads of GPU-written data verified, CPU reads={d} us\n", .{elapsed / 1000});
+        return;
+    }
     if (args.len == 2 and (std.mem.eql(u8, args[1], "--depth-only") or std.mem.eql(u8, args[1], "--depth-bias"))) {
         var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
         defer renderer.deinit();
