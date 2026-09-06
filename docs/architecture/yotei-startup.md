@@ -870,6 +870,19 @@ upload arenas retain the default policy. Selection tests cover this path;
 queued compute readback, descriptor migration, cache recycling and growth,
 and the complete Vulkan smoke pass under SDK validation.
 
+Sampling the cached-memory run still finds substantial time in the host
+`memset`. Disassembly shows eight separate byte stores per loop in Zig
+0.16's fallback; sampled callers include allocation/free poisoning (`0xaa`)
+of 23–67 MiB staging and render-target buffers. The Windows x86-64 runner
+and Vulkan smoke now supply the C memset symbol with REP STOSB. This retains
+ReleaseSafe poisoning and checks, requires no optional CPU instruction set,
+and avoids a compiler-generated recursive memset call. Other targets retain
+their existing runtime implementation. Tests cover all lengths 0–512 at 64
+alignments, signed/truncated fill values, return pointers, null/zero length,
+and a guarded 4 MiB fill. Sixteen 64 MiB host fills improve from 117,636 to
+34,599 us with the same output hash; the complete SDK Vulkan smoke passes.
+This is an isolated memory benchmark, not a measured whole-frame multiplier.
+
 The first cached-memory relaunch stopped before video or Vulkan rendering:
 the main thread was suspended in `reportGuestThreadContext(1)`, called by
 `drainQuietBuilderArenas` from that same guest thread's suspend point. The

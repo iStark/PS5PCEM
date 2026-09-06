@@ -12,6 +12,10 @@ const loader = @import("loader");
 const vulkan = @import("vulkan");
 const window = @import("window");
 
+comptime {
+    @import("host_memory.zig").exportRuntime();
+}
+
 /// Guest-created threads may not have a stack the host unwinder can traverse.
 /// Preserve the failing host address before attempting the normal panic trace.
 pub const panic = std.debug.FullPanic(reportPanic);

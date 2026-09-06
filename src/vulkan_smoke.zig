@@ -7,6 +7,10 @@ const std = @import("std");
 const vulkan = @import("vulkan");
 const gpu = @import("gpu");
 
+comptime {
+    @import("host_memory.zig").exportRuntime();
+}
+
 const GuestMemory = struct {
     bytes: [131072]u8 = @splat(0),
 
