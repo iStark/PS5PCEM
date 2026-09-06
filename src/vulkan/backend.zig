@@ -17330,6 +17330,10 @@ pub const Renderer = struct {
                     }
                 }
                 if (!found) try self.pending_descriptor_slots.append(self.allocator, descriptor_slot);
+                // Resource preparation may have flushed an earlier command
+                // using this same set. Its old completed tick no longer
+                // describes the draw we have just queued.
+                self.descriptor_slot_ticks[descriptor_slot] = command_buffer_pending_tick;
             }
         }
         self.frame_profile.command_buffers += 1;
@@ -25305,6 +25309,61 @@ test "retiring an older storage image binding preserves the current pass pin" {
     try std.testing.expectEqual(@as(usize, 1), renderer.storage_image_cache.items[0].pin_count);
     renderer.releaseStorageImage(0);
     try std.testing.expectEqual(@as(usize, 0), renderer.storage_image_cache.items[0].pin_count);
+}
+
+test "a descriptor reused after an intermediate flush remains reserved by queued draws" {
+    const mock = struct {
+        fn end(_: vk.CommandBuffer) callconv(vk.call) vk.Result {
+            return vk.success;
+        }
+        fn progress(_: vk.Device, _: vk.Semaphore, value: *u64) callconv(vk.call) vk.Result {
+            value.* = 7;
+            return vk.success;
+        }
+    };
+    const renderer = try std.testing.allocator.create(Renderer);
+    defer std.testing.allocator.destroy(renderer);
+    renderer.allocator = std.testing.allocator;
+    renderer.device = @ptrFromInt(1);
+    renderer.device_functions.end_command_buffer = mock.end;
+    renderer.device_functions.get_semaphore_counter_value = mock.progress;
+    renderer.device_lost = false;
+    renderer.timeline_semaphore = 1;
+    renderer.submitted_tick = 7;
+    renderer.completed_tick = 7;
+    renderer.deferred_vulkan_objects = .empty;
+    renderer.pending_command_buffers = .empty;
+    defer renderer.pending_command_buffers.deinit(std.testing.allocator);
+    renderer.pending_command_slots = .empty;
+    defer renderer.pending_command_slots.deinit(std.testing.allocator);
+    renderer.pending_descriptor_slots = .empty;
+    defer renderer.pending_descriptor_slots.deinit(std.testing.allocator);
+    renderer.command_buffer_ticks = .empty;
+    defer renderer.command_buffer_ticks.deinit(std.testing.allocator);
+    try renderer.command_buffer_ticks.append(std.testing.allocator, command_buffer_pending_tick);
+    renderer.recording_command_buffer = @ptrFromInt(1);
+    renderer.recording_command_slot = 0;
+    renderer.cmd_set_checkpoint = null;
+    renderer.trace_gpu_completion_from_frame = null;
+    renderer.draw_batch_active = true;
+    renderer.current_descriptor_slot = 0;
+    renderer.descriptor_cursor = 0;
+    renderer.descriptor_slot_ticks = @splat(0);
+    // An upload/readback in this same pass previously submitted slot 0 and
+    // waited for tick 7. Its actual draw now records another use of that set.
+    renderer.descriptor_slot_ticks[0] = 7;
+    var sets = [_]vk.DescriptorSet{ 11, 12 };
+    renderer.descriptor_sets = &sets;
+    const scalar_words = descriptor_scalar_stride / @sizeOf(u32);
+    const scalars = try std.testing.allocator.alloc(u32, scalar_words * 2);
+    defer std.testing.allocator.free(scalars);
+    @memset(scalars, 0xfeed_beef);
+    renderer.dynamic_scalar_mapping_base = scalars.ptr;
+    renderer.frame_profile = .{};
+    try renderer.submitOneShot(@ptrFromInt(1));
+    try renderer.beginDescriptorBatch(true);
+    try std.testing.expectEqual(@as(?usize, 1), renderer.current_descriptor_slot);
+    try std.testing.expectEqual(@as(u32, 0xfeed_beef), scalars[0]);
 }
 
 test "a rasterized colour target aliases a later storage image of the same allocation" {

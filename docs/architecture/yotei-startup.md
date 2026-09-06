@@ -483,6 +483,14 @@ BC4 allocation sizes. These checks do not replace the next full game run.
 buffer starting at frame N; it is an expensive diagnostic, disabled by default.
 Nested pointer-driven image/sampler tables remain unresolved.
 
+A descriptor ownership regression test reproduces reuse after an intermediate
+flush in the same pass: the old tick is complete, but a later draw still queues
+another use of that set. Queuing now restores its pending reservation. The test
+previously selected and cleared the old set; it now selects a free set and
+preserves the queued draw's scalar data. The buffer-reuse and full Vulkan probes
+also pass with SDK validation. Its relationship to the game device loss is not
+yet established.
+
 ## Baseline before the timestamp fix
 
 A five-minute run continues rendering after the movie, at approximately
