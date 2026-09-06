@@ -658,6 +658,7 @@ const Builder = struct {
     uses_image_gather_extended: bool = false,
     uses_nonuniform_sampled_images: bool = false,
     sampled_result_predicate: ?u32 = null,
+    dpp_write_predicate: ?u32 = null,
     /// SPIR-V splits arbitrary-lane and relative-lane subgroup shuffles into
     /// separate capabilities. NVIDIA may accept a module that omits these and
     /// only report the mistake as DEVICE_LOST when a large compute kernel runs,
@@ -1322,9 +1323,27 @@ const Builder = struct {
         var raw = try self.rawSource(op);
         if (op.dpp) {
             const scope = try self.constant(.bits32, 3); // Subgroup scope
+            const host_lane = try self.subgroupLocalInvocationId();
+            const column = try self.andBits(host_lane, 15);
+            if (!op.dpp_fetch_inactive) {
+                if (try self.laneEnabled()) |enabled| {
+                    const active = self.id();
+                    try self.emit(&self.body, 169, &.{ self.bits_type, active, enabled, raw, try self.constant(.bits32, 0) });
+                    raw = active;
+                }
+            }
+            var in_bounds: ?u32 = null;
+            if (!op.dpp8 and (op.dpp_row_mask != 15 or op.dpp_bank_mask != 15)) {
+                const guest_lane = try self.currentLaneId();
+                const row = try self.shiftRightBits(guest_lane, 4);
+                const bank = try self.shiftRightBits(column, 2);
+                const row_enabled = try self.isNonZero(try self.andBits(try self.shiftRightVariable(try self.constant(.bits32, op.dpp_row_mask), row), 1));
+                const bank_enabled = try self.isNonZero(try self.andBits(try self.shiftRightVariable(try self.constant(.bits32, op.dpp_bank_mask), bank), 1));
+                self.dpp_write_predicate = try self.logicalAndValue(row_enabled, bank_enabled);
+            }
             var shuffled = self.id();
             if (op.dpp8) {
-                const lane = try self.currentLaneId();
+                const lane = host_lane;
                 const lane_in_group = try self.andBits(lane, 7);
                 const group_base = try self.andBits(lane, 0xffff_fff8);
                 const selector_shift = try self.multiplyBits(
@@ -1343,7 +1362,7 @@ const Builder = struct {
                 try self.emit(&self.body, 197, &.{ self.bits_type, source_lane, group_base, selector }); // OpBitwiseOr
                 try self.emit(&self.body, 345, &.{ self.bits_type, shuffled, scope, raw, source_lane }); // OpGroupNonUniformShuffle
             } else if (op.dpp_ctrl <= 0x0ff) { // quad_perm
-                const lane = try self.currentLaneId();
+                const lane = host_lane;
                 const quad_lane = try self.andBits(lane, 3);
                 const quad_base = try self.andBits(lane, 0xffff_fffc);
                 const lane_shift = self.id();
@@ -1366,13 +1385,20 @@ const Builder = struct {
                 try self.emit(&self.body, 345, &.{ self.bits_type, shuffled, scope, raw, dest_lane }); // OpGroupNonUniformShuffle
             } else if (op.dpp_ctrl >= 0x101 and op.dpp_ctrl <= 0x10f) { // row_shl
                 const delta = try self.constant(.bits32, op.dpp_ctrl - 0x100);
-                try self.emit(&self.body, 347, &.{ self.bits_type, shuffled, scope, raw, delta }); // OpGroupNonUniformShuffleUp
+                const valid = self.id();
+                try self.emit(&self.body, 176, &.{ self.bool_type, valid, column, try self.constant(.bits32, 16 - (op.dpp_ctrl - 0x100)) });
+                in_bounds = valid;
+                try self.emit(&self.body, 348, &.{ self.bits_type, shuffled, scope, raw, delta }); // source lane + delta
             } else if (op.dpp_ctrl >= 0x111 and op.dpp_ctrl <= 0x11f) { // row_shr
                 const delta = try self.constant(.bits32, op.dpp_ctrl - 0x110);
-                try self.emit(&self.body, 348, &.{ self.bits_type, shuffled, scope, raw, delta }); // OpGroupNonUniformShuffleDown
+                const valid = self.id();
+                try self.emit(&self.body, 174, &.{ self.bool_type, valid, column, delta });
+                in_bounds = valid;
+                try self.emit(&self.body, 347, &.{ self.bits_type, shuffled, scope, raw, delta }); // source lane - delta
             } else if (op.dpp_ctrl >= 0x121 and op.dpp_ctrl <= 0x12f) { // row_ror
-                const delta = try self.constant(.bits32, op.dpp_ctrl - 0x120);
-                try self.emit(&self.body, 348, &.{ self.bits_type, shuffled, scope, raw, delta }); // Approx using down
+                const rotated = try self.andBits(try self.addBits(column, try self.constant(.bits32, 16 - (op.dpp_ctrl - 0x120))), 15);
+                const source_lane = try self.addBits(try self.andBits(host_lane, 0xffff_fff0), rotated);
+                try self.emit(&self.body, 345, &.{ self.bits_type, shuffled, scope, raw, source_lane });
             } else if (op.dpp_ctrl == 0x140) { // row_mirror
                 const mask = try self.constant(.bits32, 15);
                 try self.emit(&self.body, 346, &.{ self.bits_type, shuffled, scope, raw, mask }); // OpGroupNonUniformShuffleXor
@@ -1381,6 +1407,15 @@ const Builder = struct {
                 try self.emit(&self.body, 346, &.{ self.bits_type, shuffled, scope, raw, mask }); // OpGroupNonUniformShuffleXor
             } else {
                 shuffled = raw;
+            }
+            if (in_bounds) |valid| {
+                const bounded = self.id();
+                try self.emit(&self.body, 169, &.{ self.bits_type, bounded, valid, shuffled, try self.constant(.bits32, 0) });
+                shuffled = bounded;
+                if (!op.dpp_bound_ctrl) self.dpp_write_predicate = if (self.dpp_write_predicate) |enabled|
+                    try self.logicalAndValue(enabled, valid)
+                else
+                    valid;
             }
             raw = shuffled;
         }
@@ -1478,6 +1513,12 @@ const Builder = struct {
         };
         var bits = try self.convert(final_value, .bits32);
         if (op.kind == .vgpr and !self.writing_lane) {
+            if (self.dpp_write_predicate) |enabled| {
+                const previous = try self.registerBits(index, 0);
+                const selected = self.id();
+                try self.emit(&self.body, 169, &.{ self.bits_type, selected, enabled, bits, previous });
+                bits = selected;
+            }
             if (try self.laneEnabled()) |enabled| {
                 const previous = try self.registerBits(index, 0);
                 const selected = self.id();
@@ -2539,10 +2580,18 @@ const Builder = struct {
     }
 
     fn permlane(self: *Builder, inst: instruction.Instruction, exchange: bool) Error!void {
-        const value = try self.source(inst.src0, .bits32);
-        const lane = try self.currentLaneId();
+        var value = try self.source(inst.src0, .bits32);
+        if (!inst.src0.dpp_fetch_inactive) {
+            if (try self.laneEnabled()) |enabled| {
+                const active = self.id();
+                try self.emit(&self.body, 169, &.{ self.bits_type, active, enabled, value, try self.constant(.bits32, 0) });
+                value = active;
+            }
+        }
+        const lane = try self.subgroupLocalInvocationId();
+        const column = try self.andBits(lane, 15);
         const in_high = self.id();
-        try self.emit(&self.body, 172, &.{ self.bool_type, in_high, lane, try self.constant(.bits32, 15) });
+        try self.emit(&self.body, 174, &.{ self.bool_type, in_high, column, try self.constant(.bits32, 8) });
         const select = self.id();
         try self.emit(&self.body, 169, &.{
             self.bits_type,
@@ -2557,8 +2606,10 @@ const Builder = struct {
             try self.emit(&self.body, 198, &.{ self.bits_type, flipped, group, try self.constant(.bits32, 16) });
             break :blk flipped;
         } else group;
+        const shift = try self.multiplyBits(try self.andBits(column, 7), try self.constant(.bits32, 4));
+        const selector = try self.andBits(try self.shiftRightVariable(select, shift), 15);
         const dest_lane = self.id();
-        try self.emit(&self.body, 197, &.{ self.bits_type, dest_lane, index_base, try self.andBits(select, 15) });
+        try self.emit(&self.body, 197, &.{ self.bits_type, dest_lane, index_base, selector });
         const result = self.id();
         try self.emit(&self.body, 345, &.{
             self.bits_type,
@@ -7641,6 +7692,8 @@ const Builder = struct {
     }
 
     fn lower(self: *Builder, source_inst: instruction.Instruction) Error!void {
+        self.dpp_write_predicate = null;
+        defer self.dpp_write_predicate = null;
         self.sampled_result_predicate = null;
         defer self.sampled_result_predicate = null;
         var inst = source_inst;
@@ -13297,7 +13350,7 @@ test "DPP row shift declares relative subgroup shuffle capability" {
     try program.instructions.append(std.testing.allocator, .{ .pc = 8, .opcode = .s_endpgm });
     var module = try translate(std.testing.allocator, &program, .{ .stage = .compute });
     defer module.deinit(std.testing.allocator);
-    try std.testing.expect(containsOpcode(module.words, 348)); // OpGroupNonUniformShuffleDown
+    try std.testing.expect(containsOpcode(module.words, 347)); // OpGroupNonUniformShuffleUp
     try std.testing.expect(containsOpcodeWithFirstOperand(module.words, 17, 66)); // capability
 }
 

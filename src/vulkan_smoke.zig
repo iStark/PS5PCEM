@@ -717,6 +717,75 @@ fn runVectorImageProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("vector image resources passed: masked descriptor tuples and readfirstlane waterfall\n", .{});
 }
 
+fn runDppProbe(allocator: std.mem.Allocator) !void {
+    const controls = [_]u16{ 0x103, 0x113, 0x123, 0x140, 0x141, 0x1b };
+    for (0..20) |case| {
+        const permute = case == 12 or case == 13 or case >= 16;
+        const exchange = case == 13 or case >= 18;
+        const inactive = case >= 14;
+        const fetch_inactive = inactive and case & 1 != 0;
+        const control = if (inactive) 0x1b else controls[case % controls.len];
+        const bounded = case < controls.len;
+        const row_mask: u32 = if (bounded or permute or inactive) 15 else 5;
+        const bank_mask: u32 = if (bounded or permute or inactive) 15 else 5;
+        var renderer = try vulkan.Renderer.init(allocator, .{});
+        defer renderer.deinit();
+        var guest = GuestMemory{};
+        _ = renderer.dcbBackend(guest.interface());
+        for (0..64) |lane| guest.word(0x10000 + lane * 4, @intCast(100 + lane));
+        const code = [_]u32{
+            0xe030_2000,                                                                                                                                                                                                 0x8000_0100, // load v1, indexed V#s0
+            vop1(1, 2, 255),                                                                                                                                                                                             0xdead_beef,
+            sop1(3, 8, 255),                                                                                                                                                                                             0x8765_4321,
+            sop1(3, 9, 255),                                                                                                                                                                                             0x0fed_cba9,
+            sop1(3, 10, 255),                                                                                                                                                                                            0xaaaa_aaaa,
+            sop1(3, 11, 255),                                                                                                                                                                                            0xaaaa_aaaa,
+            if (inactive) sop1(4, 126, 10) else 0xbf80_0000,                                                                                                                                                             if (permute) (if (exchange) @as(u32, 0xd778_0002) else 0xd777_0002) | (@as(u32, @intFromBool(fetch_inactive)) << 11) else vop1(1, 2, 250),
+            if (permute) 257 | (8 << 9) | (9 << 18) else 1 | (@as(u32, control) << 8) | (@as(u32, @intFromBool(fetch_inactive)) << 18) | (@as(u32, @intFromBool(bounded)) << 19) | (bank_mask << 24) | (row_mask << 28),
+            sop1(4, 126, 193), // restore every lane before reading results
+            0xe070_2000,
+            0x8001_0200,
+            0xbf81_0000,
+        };
+        for (code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+        var state = gpu.State{};
+        const stage = gpu.resources.ShaderStage.compute;
+        try state.writeRegister(.shader, stage.programRegisterBase(), 1);
+        try state.writeRegister(.shader, stage.programRegisterBase() + 1, 0);
+        try state.writeRegister(.shader, 0x213, 8 << 1);
+        for ([_]u32{ 0x10000, 4 << 16, 64, 0, 0x11000, 4 << 16, 64, 0 }, 0..) |word, i|
+            try state.writeRegister(.shader, stage.userDataBase() + @as(u32, @intCast(i)), word);
+        _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 1, 1, 1 });
+        var output: [256]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x11000, &output);
+        for (0..64) |lane| {
+            const row: usize = lane & ~@as(usize, 15);
+            const column = lane & 15;
+            var source: ?usize = if (permute)
+                (if (exchange) row ^ 16 else row) + ((column + 1) & 15)
+            else switch (control) {
+                0x103 => if (column < 13) lane + 3 else null,
+                0x113 => if (column >= 3) lane - 3 else null,
+                0x123 => row + ((column + 13) & 15),
+                0x140 => row + (15 - column),
+                0x141 => lane ^ 7,
+                0x1b => (lane & ~@as(usize, 3)) + (3 - (lane & 3)),
+                else => unreachable,
+            };
+            const enabled = (!inactive or lane & 1 != 0) and (row_mask >> @as(u5, @intCast(lane / 16))) & 1 != 0 and
+                (bank_mask >> @as(u5, @intCast(column / 4))) & 1 != 0;
+            if (!enabled) source = null;
+            const expected: u32 = if (source) |index|
+                (if (inactive and !fetch_inactive and index & 1 == 0) 0 else @intCast(100 + index))
+            else if (bounded and enabled) 0 else 0xdead_beef;
+            const actual = std.mem.readInt(u32, output[lane * 4 ..][0..4], .little);
+            if (actual != expected) std.debug.print("DPP case={d} lane={d}: expected=0x{x} actual=0x{x}\n", .{ case, lane, expected, actual });
+            try std.testing.expectEqual(expected, actual);
+        }
+    }
+    std.debug.print("DPP passed: row shifts, rotation, swizzles, masks and both permutation selectors across 64 lanes\n", .{});
+}
+
 fn runSceneMaskProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -1925,6 +1994,10 @@ fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--dpp")) {
+        try runDppProbe(allocator);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--scene-masks")) {
         try runSceneMaskProbe(allocator);
         return;

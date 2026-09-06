@@ -720,6 +720,18 @@ replay of the complete `1 x 64 x 36` lighting dispatch also completes with clean
 SDK validation. Its captured CPU backing data does not reproduce every dirty
 resident image from the live frame, so a full game run remains necessary.
 
+Lighting also uses DPP row reductions and PERMLANE permutations. DPP row shifts
+previously shuffled in the opposite direction, row rotation did not wrap at
+16 lanes, and absolute subgroup indices became invalid for guest lanes 32–63
+on a 32-lane host. PERMLANE used a single selector nibble instead of the nibble
+for each destination column. These now follow the RDNA2 ISA, including DPP
+row/bank write masks, boundary preservation/zeroing and inactive-source fetch
+control. Twenty GPU cases check all four guest rows and both halves of the
+64-bit permutation selector; the old left-shift case returns 100 instead of
+103 in lane zero. The corrected full lighting replay completes with clean SDK
+validation. Whole-wave READLANE and scalar mask semantics across host subgroups
+remain a separate limitation to investigate if the live lighting fault persists.
+
 ## Baseline before the timestamp fix
 
 A five-minute run continues rendering after the movie, at approximately

@@ -623,6 +623,10 @@ pub fn decodeVop3(pc: u32, code: []const u32, word_index: u32) Error!Instruction
     }
     inst.dst.clamp = (word0 >> 15) & 1 != 0;
     inst.dst.omod = @intCast((word1 >> 27) & 3);
+    if (op == .v_permlane16_b32 or op == .v_permlanex16_b32) {
+        inst.src0.dpp_fetch_inactive = (word0 >> 11) & 1 != 0;
+        inst.src0.dpp_bound_ctrl = (word0 >> 12) & 1 != 0;
+    }
     if (op == .unsupported) inst.unsupported_reason = "VOP3 opcode is not implemented";
     try inst.readLiteralOperands(code, word_index);
     return inst;
