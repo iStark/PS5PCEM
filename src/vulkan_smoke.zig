@@ -717,6 +717,51 @@ fn runVectorImageProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("vector image resources passed: masked descriptor tuples and readfirstlane waterfall\n", .{});
 }
 
+fn runStorageImageReuseProbe(allocator: std.mem.Allocator) !void {
+    for ([_]usize{ 160, 320 }) |count| try runStorageImageReuseCase(allocator, count);
+    std.debug.print("storage image reuse passed: 160 resident views and 320 queued writes under cache pressure\n", .{});
+}
+
+fn runStorageImageReuseCase(allocator: std.mem.Allocator, count: usize) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    const backend = renderer.dcbBackend(guest.interface());
+    const code = [_]u32{
+        vop1(1, 0, 128), vop1(1, 1, 128), vop1(1, 2, 16),
+        0xf020_0108, 0x0000_0200, // image_store red v2 at v0/v1, T#s0
+        0xf020_0108, 0x0002_0200, // image_store red v2 at v0/v1, T#s8
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 17 << 1);
+    // Two images per dispatch exhaust the image cache before the command pool
+    // can flush the batch on its own.
+    for (0..count / 2) |pair| {
+        for (0..2) |member| {
+            const descriptor = imageDescriptorWords(@intCast(0x4000 + (pair * 2 + member) * 256), 1, 1);
+            for (descriptor, 0..) |word, component| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(member * 8 + component)), word);
+        }
+        try state.writeRegister(.shader, compute.userDataBase() + 16, @intCast(42 + pair));
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+    }
+    // Earlier dirty views must remain on the GPU until a CPU consumer asks.
+    try std.testing.expectEqual(@min(@as(usize, 256), count), renderer.storage_image_cache.items.len);
+    if (count == 160) try std.testing.expect(std.mem.allEqual(u8, guest.bytes[0x4000..0xe000], 0));
+    var pixel: [4]u8 = undefined;
+    // Check every dispatch, including views evicted while later commands were
+    // still being prepared. A capacity fallback must not silently drop writes.
+    for (0..count) |i| {
+        try std.testing.expect(backend.vtable.read(backend.context, 0x4000 + i * 256, &pixel));
+        try std.testing.expectEqualSlices(u8, &.{ @intCast(42 + i / 2), 0, 0, 0 }, &pixel);
+    }
+    for (renderer.storage_image_cache.items) |cached| try std.testing.expectEqual(@as(usize, 0), cached.pin_count);
+}
+
 fn runResidentTargetReuseProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
     defer renderer.deinit();
@@ -1808,6 +1853,10 @@ fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--storage-reuse")) {
+        try runStorageImageReuseProbe(allocator);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--bc4")) {
         try runBc4Probe(allocator);
         return;

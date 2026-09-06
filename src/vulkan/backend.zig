@@ -803,7 +803,10 @@ const maximum_cached_sampled_images = 1024;
 /// 94 distinct views (about 920 MiB of linear image data); the old 64-view cap
 /// evicted half of that graph and re-detiled/re-uploaded roughly 814 MiB every
 /// frame. These are capacity ceilings, not eager allocations.
-const maximum_cached_storage_images = 128;
+// Later loading passes exceed 128 views while using only 700–880 MiB.
+// Retain those smaller views under the same byte budget instead of forcing
+// dirty-image readback and tiling solely to free an entry.
+const maximum_cached_storage_images = 256;
 /// Counts linear image bytes (the cache also owns one transfer allocation per
 /// image). The limit is soft while every resident entry is in use by the same
 /// dispatch, so a legal 32-image descriptor set is never rejected solely by
@@ -15705,6 +15708,7 @@ pub const Renderer = struct {
         memory: GuestMemory,
         staging_bytes: usize,
     ) (Error || std.mem.Allocator.Error)!usize {
+        var drained_queued_work = false;
         while (true) {
             var has_free_slot = false;
             for (self.storage_image_cache.items) |cached| {
@@ -15726,7 +15730,18 @@ pub const Renderer = struct {
                 victim_index = index;
                 oldest_sequence = cached.last_used_sequence;
             }
-            const victim = victim_index orelse break;
+            const victim = victim_index orelse {
+                // Pins from earlier queued commands can fill the cache before
+                // the guest submits its batch. Retire that work and retry;
+                // resources held by the command being prepared stay pinned.
+                // Retry only once, since waiting cannot release those pins.
+                if (!drained_queued_work) {
+                    try self.waitForSubmittedWork();
+                    drained_queued_work = true;
+                    continue;
+                }
+                break;
+            };
             try self.flushCachedStorageImage(memory, victim);
             self.destroyCachedStorageImage(victim);
         }

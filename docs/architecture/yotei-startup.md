@@ -671,6 +671,16 @@ mask-save forms with R8/R16 UINT/SINT inputs. Replaying `0x801f6d5100:0x2c4`
 with its captured SMEM values and material table reduces 274 candidates to
 nine, excluding unrelated float fields that decode as format 149.
 
+Later loading passes churn the 128-entry storage-image cache while using
+only 700–880 MiB of its 1,280 MiB byte budget. CPU sampling attributes much
+of the frame time to dirty-image readback, tiling and repeated uploads.
+The entry ceiling is now 256, with the same byte budget. When earlier queued
+commands pin every eviction candidate, the cache submits and retires that
+work before retrying; pins held by the command being prepared remain intact.
+The storage-reuse GPU probe retains 160 dirty views and checks all 320 writes
+in a larger batch. The previous eviction logic drops writes with
+`StorageImageCapacityExceeded` even with the increased entry ceiling.
+
 ## Baseline before the timestamp fix
 
 A five-minute run continues rendering after the movie, at approximately
