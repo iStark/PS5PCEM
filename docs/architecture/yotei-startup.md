@@ -605,6 +605,24 @@ format-149 refusal before the fix and passes all four integer formats after
 it, including negative and out-of-range indices. Existing nested and
 indirect texture probes remain valid under the SDK layer.
 
+A subsequent validation run stopped at flip 742 with a lost Vulkan device.
+The timeline query returned success with `UINT64_MAX`; that defensive path
+now reports the queue's fault checkpoints as well. The last unfinished
+command carried pixel program `0x800040fb00`, a short texture copy whose
+SPIR-V validates. Immediately before it, the full render-target cache
+retired a 1024-square attachment during destination preparation.
+
+Resident sampled and storage bindings now pin their color targets until the
+draw or dispatch has been recorded. Attachments and intermediate resize
+sources use the same protection; submitted commands retain deferred Vulkan
+destruction. A baseline GPU setup reproduces eviction of a prepared source
+without executing a draw through the invalid descriptor. The new
+`vulkan-smoke --target-reuse` probe fills all 64 cache entries, samples the
+oldest into four new destinations, verifies red GPU readback and checks
+that every preparation pin is released. It passes SDK validation alongside
+the existing buffer-reuse, typed-index and full smoke probes. Whether this
+also removes the observed game device loss requires the next full run.
+
 ## Baseline before the timestamp fix
 
 A five-minute run continues rendering after the movie, at approximately

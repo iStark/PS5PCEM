@@ -1587,6 +1587,9 @@ const CachedRenderTarget = struct {
     /// G-buffer and substitute environment lighting.
     color_export_generation: u64 = 0,
     last_used_sequence: u64 = 0,
+    /// Prepared bindings must survive cache misses before their draw is queued.
+    /// Queued work is protected separately by deferred Vulkan destruction.
+    pin_count: usize = 0,
     /// The matched guest compositor uses a negative-height viewport. Keep its
     /// attachment resident and apply that orientation only at scanout/readback.
     scanout_flip_vertical: bool = false,
@@ -1980,6 +1983,7 @@ const PreparedSampledImage = struct {
     owns_view: bool = false,
     owns_sampler: bool = false,
     storage_cache_index: ?usize = null,
+    render_target_index: ?usize = null,
 };
 
 const SampledStagingLayout = union(enum) {
@@ -2215,6 +2219,7 @@ const GraphicsResources = struct {
             if (image.owns_view) renderer.destroyImageView(image.view);
             if (image.owns_sampler) renderer.destroySampler(image.sampler);
             if (image.storage_cache_index) |cache_index| renderer.releaseStorageImage(cache_index);
+            if (image.render_target_index) |index| renderer.releaseRenderTarget(index);
         }
         renderer.allocator.destroy(self);
     }
@@ -2451,6 +2456,7 @@ const ComputeResources = struct {
             if (image.cache_index) |cache_index| renderer.releaseStorageImage(cache_index);
             if (image.render_target_index) |target_index| {
                 renderer.transitionRenderTargetToColorAttachment(target_index) catch {};
+                renderer.releaseRenderTarget(target_index);
             }
         }
         self.storage_image_count = 0;
@@ -2461,6 +2467,7 @@ const ComputeResources = struct {
             if (image.owns_view) renderer.destroyImageView(image.view);
             if (image.owns_sampler) renderer.destroySampler(image.sampler);
             if (image.storage_cache_index) |cache_index| renderer.releaseStorageImage(cache_index);
+            if (image.render_target_index) |index| renderer.releaseRenderTarget(index);
         }
         self.sampled_image_count = 0;
         self.sampled_image_mapping_count = 0;
@@ -10391,6 +10398,8 @@ pub const Renderer = struct {
             ) catch return null;
             self.render_target_sequence +%= 1;
             self.render_targets.items[latest].last_used_sequence = self.render_target_sequence;
+            self.render_targets.items[latest].pin_count += 1;
+            defer self.releaseRenderTarget(latest);
             const dest_index = try self.acquireRenderTarget(dest_target);
             try self.copyRenderTargetOverlap(latest, dest_index);
             if (self.resident_rt_extent_alias_reports < 8 or self.traceCurrentGraphicsFrame()) {
@@ -10420,6 +10429,7 @@ pub const Renderer = struct {
             1,
         );
         const sampler = try self.residentSampler(sampler_descriptor);
+        self.render_targets.items[index].pin_count += 1;
         if (!self.reported_resident_rt_sample or self.traceCurrentGraphicsFrame()) {
             self.reported_resident_rt_sample = true;
             std.debug.print(
@@ -10441,7 +10451,13 @@ pub const Renderer = struct {
             .sampler = sampler,
             .owns_view = false,
             .owns_sampler = false,
+            .render_target_index = index,
         };
+    }
+
+    fn releaseRenderTarget(self: *Renderer, index: usize) void {
+        std.debug.assert(self.render_targets.items[index].pin_count != 0);
+        self.render_targets.items[index].pin_count -= 1;
     }
 
     fn transitionDepthTargetToShaderRead(self: *Renderer, index: usize) anyerror!void {
@@ -10942,8 +10958,8 @@ pub const Renderer = struct {
     /// to the guest — so the victim is published before it goes away, and a
     /// later sample or flip still reads what was drawn into it.
     ///
-    /// Every draw is fenced before it returns, so the recycled attachment
-    /// cannot still be executing.
+    /// Prepared bindings remain pinned until their command is recorded. Once
+    /// queued, deferred destruction retains its Vulkan objects until completion.
     fn evictRenderTarget(self: *Renderer) anyerror!usize {
         // A surface being presented is not a candidate, however long ago it was
         // last written. The decoded-video target is one the guest never binds,
@@ -10955,6 +10971,7 @@ pub const Renderer = struct {
         var oldest_index: ?usize = null;
         var oldest_sequence: u64 = 0;
         for (self.render_targets.items, 0..) |entry, index| {
+            if (entry.pin_count != 0) continue;
             if (self.latest_video_render_target_index) |presenting| {
                 if (index == presenting) continue;
             }
@@ -10962,8 +10979,7 @@ pub const Renderer = struct {
             oldest_index = index;
             oldest_sequence = entry.last_used_sequence;
         }
-        // Every entry was spoken for, so the presented one has to go after all.
-        const chosen = oldest_index orelse 0;
+        const chosen = oldest_index orelse return Error.RenderTargetCacheFull;
         try self.materializeRenderTarget(chosen);
         const victim = self.render_targets.items[chosen];
         self.destroyCachedRenderTarget(victim);
@@ -11070,6 +11086,7 @@ pub const Renderer = struct {
         }
         const create_started = hostTimestampNs();
         var cached = try self.createCachedRenderTarget(target);
+        errdefer self.destroyCachedRenderTarget(cached);
         self.frame_profile.render_target_create_ns +|= elapsedHostNanoseconds(create_started);
         self.render_target_sequence +%= 1;
         cached.last_used_sequence = self.render_target_sequence;
@@ -11519,16 +11536,19 @@ pub const Renderer = struct {
         draw: GuestDraw,
     ) anyerror!void {
         const setup_started = hostTimestampNs();
-        const pinned_sequence = std.math.maxInt(u64);
         const target_index = try self.acquireRenderTarget(target);
+        self.render_targets.items[target_index].pin_count += 1;
+        defer self.releaseRenderTarget(target_index);
         try self.transitionRenderTargetToColorAttachment(target_index);
-        self.render_targets.items[target_index].last_used_sequence = pinned_sequence;
         var extra_indices: [gpu.resources.color_target_count - 1]usize = undefined;
+        var pinned_extras: usize = 0;
+        defer for (extra_indices[0..pinned_extras]) |index| self.releaseRenderTarget(index);
         for (extra_colors, 0..) |extra, extra_index| {
             const index = try self.acquireRenderTarget(extra);
-            try self.transitionRenderTargetToColorAttachment(index);
-            self.render_targets.items[index].last_used_sequence = pinned_sequence;
+            self.render_targets.items[index].pin_count += 1;
             extra_indices[extra_index] = index;
+            pinned_extras += 1;
+            try self.transitionRenderTargetToColorAttachment(index);
         }
         const cached_snapshot = self.render_targets.items[target_index];
         const frame_bytes = try colorTargetFrameBytes(target);
@@ -15829,6 +15849,7 @@ pub const Renderer = struct {
                     1,
                 );
                 self.updateStorageImageDescriptor(descriptor_index, view);
+                self.render_targets.items[target_index].pin_count += 1;
                 self.frame_profile.resident_storage_bytes +%= staging_bytes;
                 if (self.resident_rt_storage_reports < 8 or self.traceCurrentGraphicsFrame()) {
                     std.debug.print(
@@ -17258,7 +17279,8 @@ pub const Renderer = struct {
             return Error.DeviceLost;
         }
         if (result == vk.success and completed > self.submitted_tick) {
-            self.device_lost = true;
+            std.debug.print("[gpu fault] timeline counter={d} exceeds submitted={d}\n", .{ completed, self.submitted_tick });
+            self.reportDeviceLost();
             return Error.DeviceLost;
         }
         if (result != vk.success) return Error.TimelineSemaphoreQueryFailed;

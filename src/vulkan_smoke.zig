@@ -640,6 +640,81 @@ fn runInlineMetadataBufferProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("inline metadata buffer probe passed: USER_DATA buffer offsets are independent of SRT size\n", .{});
 }
 
+fn runResidentTargetReuseProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    const vertex = [_]u32{
+        vop1(6, 1, 261), vop1(1, 2, 255),  0x3f80_0000,      vop2(4, 3, 1, 2),
+        vop1(1, 4, 255), 0x3f40_0000,      vop2(8, 5, 3, 4), vop2(8, 6, 3, 3),
+        vop1(1, 7, 255), 0xbfc0_0000,      vop2(8, 6, 6, 7), vop1(1, 8, 255),
+        0x3f40_0000,     vop2(3, 6, 6, 8), vop1(1, 7, 128),  vop1(1, 8, 242),
+        0xf800_08cf,     0x0807_0605,      0xbf81_0000,
+    };
+    const fragment = [_]u32{
+        vop1(1, 0, 242), vop1(1, 1, 128), vop1(1, 2, 128), vop1(1, 3, 242),
+        0xf800_080f,     0x0302_0100,     0xbf81_0000,
+    };
+    const sample = [_]u32{
+        vop1(1, 4, 240), vop1(1, 5, 240), // sample the center of the old target
+        0xf080_0f08, 0x0061_0004, // image_sample v0:v3, v4:v5, s4:s11, s12:s15
+        0xf800_080f, 0x0302_0100,
+        0xbf81_0000,
+    };
+    for (vertex, 0..) |word, i| guest.word(0x700 + i * 4, word);
+    for (fragment, 0..) |word, i| guest.word(0x900 + i * 4, word);
+    for (sample, 0..) |word, i| guest.word(0xa00 + i * 4, word);
+    var state = gpu.State{};
+    const pixel = gpu.resources.ShaderStage.pixel;
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.vertex.programRegisterBase(), 7);
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.vertex.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, pixel.programRegisterBase(), 9);
+    try state.writeRegister(.shader, pixel.programRegisterBase() + 1, 0);
+    const context = [_][2]u32{
+        .{ 0x319, 0 }, .{ 0x31b, 0 },             .{ 0x31c, 10 << 2 },                 .{ 0x31d, 0 },
+        .{ 0x390, 0 }, .{ 0x3b0, (7 << 14) | 7 }, .{ 0x3b8, 1 << 24 },                 .{ 0x08e, 0xf },
+        .{ 0x00c, 0 }, .{ 0x00d, 8 | (8 << 16) }, .{ 0x094, 1 << 31 },                 .{ 0x095, 8 | (8 << 16) },
+        .{ 0x1e0, 0 }, .{ 0x200, 0 },             .{ 0x202, (0xcc << 16) | (1 << 4) }, .{ 0x204, 0 },
+        .{ 0x205, 0 },
+    };
+    for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+    for ([_]f32{ 4, 4, 4, 4, 1, 0 }, 0..) |value, i|
+        try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value));
+    const stream = [_]u32{ command(gpu.pm4.draw_index_auto, 2), 3, 0 };
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(guest.interface()), .allocator = allocator };
+    // Fill the cache with independent attachments. The source becomes its oldest
+    // entry, then the next draw samples it while allocating a new destination.
+    for (0..64) |i| {
+        try state.writeRegister(.context, 0x318, @intCast((0x2000 + i * 0x400) >> 8));
+        _ = try executor.execute(&stream);
+        if (renderer.last_draw_error) |err| return err;
+    }
+    try renderer.flushPendingGuestWrites();
+    try std.testing.expectEqual(@as(usize, 64), renderer.render_targets.items.len);
+    const original = renderer.render_targets.items[0].image.handle;
+    const descriptors = [_]u32{ 0x20, (56 << 20) | (3 << 30), 1 | (7 << 14), 0x9000_0fac, 0, 0, 0, 0, 0, 0, 0, 0 };
+    for (descriptors, 0..) |word, i|
+        try state.writeRegister(.shader, pixel.userDataBase() + 4 + @as(u32, @intCast(i)), word);
+    try state.writeRegister(.shader, pixel.programRegisterBase() + 3, 16 << 1);
+    try state.writeRegister(.shader, pixel.programRegisterBase(), 0xa);
+    for (64..68) |i| {
+        const destination = 0x2000 + i * 0x400;
+        try state.writeRegister(.context, 0x318, @intCast(destination >> 8));
+        _ = try executor.execute(&stream);
+        if (renderer.last_draw_error) |err| return err;
+        var retained = false;
+        for (renderer.render_targets.items) |target| {
+            if (target.image.handle == original) retained = true;
+            try std.testing.expectEqual(@as(usize, 0), target.pin_count);
+        }
+        try std.testing.expect(retained);
+        try renderer.flushPendingGuestWrites();
+        const center = destination + (4 * 8 + 4) * 4;
+        try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, guest.bytes[center..][0..4]);
+    }
+    std.debug.print("resident target reuse passed: full cache, sampled source, GPU readback, released pins\n", .{});
+}
+
 fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
     defer renderer.deinit();
@@ -1648,6 +1723,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--array-gradients")) {
         try runArrayGradientProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--target-reuse")) {
+        try runResidentTargetReuseProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-reuse")) {
