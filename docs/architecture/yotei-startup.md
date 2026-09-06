@@ -645,8 +645,19 @@ Module tests retain the same nine RDNA2 failures and one executor failure as
 the previous commit; the changed resource-analysis tests pass.
 
 Another recurring compute refusal, `0x80001fd400:0x28a8`, references an empty
-lighting texture table. Correct handling of proven null resources and a new
-full game run remain necessary before claiming menu rendering.
+lighting texture table. Exhaustive table recovery now distinguishes a proven
+all-zero source from an unresolved or malformed descriptor. Null samples
+produce zero without allocating an image or requiring a sampler. Captured
+replay and GPU tests cover empty tables, restoration of real textures and
+rejection of malformed nonzero descriptors.
+
+The cache-pinning game run completed 6,042 resources and left loader state 40.
+It then refused `0x801eb8de00` and lost the GPU in `0x80001fd400` at flip 912.
+Live memory inspection explains the decoder refusal: AGC's low-32-bit alias
+lookup redirected shader address `0x801eb96240` to command arena
+`0x201eb96240`, returning PM4 word `0xc00e1000` instead of instruction
+`0x4130bb96`. Address resolution must preserve accessible full guest VAs.
+The next full run must also validate the remaining GPU fault and menu output.
 
 ## Baseline before the timestamp fix
 

@@ -75,6 +75,8 @@ pub const SampledImageBinding = struct {
     /// A member of a bounded runtime T# table. The shader compares all eight
     /// descriptor words; aliases with different mips/views remain distinct.
     candidate_words: ?[8]u32 = null,
+    /// Proven all-zero T# source. No physical image or sampler is required.
+    unbound: bool = false,
 };
 
 pub const SampledImageDimension = enum {
@@ -999,7 +1001,7 @@ const Builder = struct {
                         }
                     }
                 }
-                sampled_dimensions[sampledImageDimensionIndex(binding.dimension)] = true;
+                if (!binding.unbound) sampled_dimensions[sampledImageDimensionIndex(binding.dimension)] = true;
             }
             if (self.vector4_type == 0) {
                 self.vector4_type = self.id();
@@ -7640,6 +7642,23 @@ const Builder = struct {
         if (nonExecCompareOpcode(inst.opcode)) |opcode| inst.opcode = opcode;
         if (try self.lowerExecutionMask(inst)) return;
         if (try self.lowerSpecializedScalarDestination(inst)) return;
+        switch (inst.opcode) {
+            .image_sample, .image_gather4, .image_load, .image_load_mip, .image_get_resinfo, .image_get_lod => {
+                if (inst.src1.kind == .sgpr and inst.src2.kind == .sgpr) {
+                    if (self.sampledImageBinding(inst.src1.reg, inst.src2.reg, inst.pc)) |binding| {
+                        if (binding.unbound) {
+                            const count: u32 = if (inst.opcode == .image_gather4) 4 else @popCount(inst.data_mask);
+                            for (0..count) |component| try self.destination(
+                                try consecutiveRegister(inst.dst, @intCast(component)),
+                                .{ .id = try self.constant(.bits32, 0), .value_type = .bits32 },
+                            );
+                            return;
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
         switch (inst.opcode) {
             .s_nop,
             .s_waitcnt,

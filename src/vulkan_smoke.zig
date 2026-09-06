@@ -701,6 +701,19 @@ fn runVectorImageProbe(allocator: std.mem.Allocator) !void {
         try std.testing.expectApproxEqAbs(expected, actual, 0.00001);
     }
     try std.testing.expectEqual(@as(u64, 2), renderer.sampled_image_uploads);
+    const saved_descriptors: [64]u8 = guest.bytes[0x1000..0x1040].*;
+    @memset(guest.bytes[0x1000..0x1040], 0);
+    _ = try renderer.dispatchRdna2State(&state, .{ 4, 1, 1 }, .{ 1, 1, 1 });
+    try renderer.readbackGuestStorageBuffer(0x3000, &pixels);
+    try std.testing.expect(std.mem.allEqual(u8, &pixels, 0));
+    @memcpy(guest.bytes[0x1000..0x1040], &saved_descriptors);
+    _ = try renderer.dispatchRdna2State(&state, .{ 4, 1, 1 }, .{ 1, 1, 1 });
+    try renderer.readbackGuestStorageBuffer(0x3000, &pixels);
+    for (0..4) |i| {
+        const actual: f32 = @bitCast(std.mem.readInt(u32, pixels[i * 4 ..][0..4], .little));
+        try std.testing.expectApproxEqAbs(@as(f32, if (i < 2) 64.0 / 255.0 else 1), actual, 0.00001);
+    }
+    try std.testing.expectEqual(@as(u64, 2), renderer.sampled_image_uploads);
     std.debug.print("vector image resources passed: masked descriptor tuples and readfirstlane waterfall\n", .{});
 }
 
@@ -1773,6 +1786,15 @@ fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
             const expected: f32 = if (wide) (if (index < 128) @as(f32, @floatFromInt(index + 1)) / 255.0 else 0) else ordinary_expected[index];
             const actual: f32 = @bitCast(std.mem.readInt(u32, pixels[index * 4 ..][0..4], .little));
             try std.testing.expectApproxEqAbs(expected, actual, 0.00001);
+        }
+        if (case_index == 0) {
+            @memset(guest.bytes[table..][0 .. 4 * stride], 0);
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ groups, 1, 1 });
+            try renderer.readbackGuestStorageBuffer(output, pixels[0 .. groups * 4]);
+            try std.testing.expect(std.mem.allEqual(u8, pixels[0 .. groups * 4], 0));
+            // A malformed nonzero T# is not proof that the resource is unbound.
+            guest.word(table, 0xdead);
+            try std.testing.expectError(error.UnsupportedSampledImage, renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ groups, 1, 1 }));
         }
     }
     std.debug.print("indirect sampled images passed: runtime selection, aliases, bounds, wrapping, guarded SGPR/VCC offsets and 128 textures\n", .{});

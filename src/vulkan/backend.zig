@@ -5384,6 +5384,7 @@ pub const Renderer = struct {
                 );
             }
             for (resources.sampled_image_mappings[0..resources.sampled_image_mapping_count]) |sampled| {
+                if (sampled.unbound) continue;
                 const desc = resources.sampled_image_descriptors[@intCast(sampled.descriptor_index)];
                 std.debug.print(
                     "  traced compute sampled slot={d} T#s{d} S#s{d} pc={any} addr=0x{x} {d}x{d}x{d} type={s} fmt={d}\n",
@@ -8290,6 +8291,17 @@ pub const Renderer = struct {
                 return Error.UnsupportedSampledImage;
             }
             const candidate_count: usize = if (candidates) |table| table.count else 1;
+            if (candidate_count == 0) {
+                result.sampled_image_mappings[result.sampled_image_mapping_count] = .{
+                    .resource_sgpr = resource_sgpr,
+                    .sampler_sgpr = sampler_sgpr,
+                    .descriptor_index = 0,
+                    .instruction_pc = inst.pc,
+                    .unbound = true,
+                };
+                result.sampled_image_mapping_count += 1;
+                continue;
+            }
             for (0..candidate_count) |candidate_index| {
                 const candidate_words: ?[8]u32 = if (candidates) |table| table.words[candidate_index] else null;
                 const image_descriptor = if (candidate_words) |words| try gpu.resources.decodeImageDescriptor(&words) else direct_image.?;
@@ -13081,6 +13093,7 @@ pub const Renderer = struct {
         self.frame_profile.graphics_resource_ns +|= elapsedHostNanoseconds(resource_started);
         if (self.traceCurrentGraphicsFrame()) {
             for (graphics_resources.mappings[0..graphics_resources.mapping_count]) |mapping| {
+                if (mapping.unbound) continue;
                 const sampled = graphics_resources.descriptors[@intCast(mapping.descriptor_index)];
                 std.debug.print(
                     "[vulkan dcb] traced sampled image draw={d} slot={d} addr=0x{x} {d}x{d} pitch={d} fmt={d} tile={f}\n",
@@ -13653,6 +13666,7 @@ pub const Renderer = struct {
                 },
             );
             for (graphics_resources.mappings[0..fragment_mapping_count]) |mapping| {
+                if (mapping.unbound) continue;
                 const sampled_descriptor = graphics_resources.descriptors[@intCast(mapping.descriptor_index)];
                 std.debug.print(
                     "  image T#s{d} S#s{d} slot={d} addr=0x{x} {d}x{d} pitch={d} fmt={d} tile={f}\n",
@@ -15265,6 +15279,18 @@ pub const Renderer = struct {
     ) anyerror!bool {
         if (!self.sampled_image_nonuniform_indexing) return false;
         const candidates = (try resolveBufferImageCandidates(bindings, reader, analysis, scalar, inst)) orelse return false;
+        if (candidates.count == 0) {
+            if (result.mapping_count == result.mappings.len) return Error.UnsupportedSampledImage;
+            result.mappings[result.mapping_count] = .{
+                .resource_sgpr = inst.src1.reg,
+                .sampler_sgpr = inst.src2.reg,
+                .descriptor_index = 0,
+                .instruction_pc = inst.pc,
+                .unbound = true,
+            };
+            result.mapping_count += 1;
+            return true;
+        }
         const sampler = candidates.sampler orelse (try resolveComputeSamplerDescriptor(bindings, reader, analysis, scalar, inst.src2.reg, inst.pc, sampler_slot)) orelse return false;
         for (candidates.words[0..candidates.count]) |words| {
             const descriptor = try gpu.resources.decodeImageDescriptor(&words);
@@ -15473,6 +15499,7 @@ pub const Renderer = struct {
         for (images, 0..) |prepared, index| {
             var physical_mapping: ?gpu.ShaderSpirvSampledImageBinding = null;
             for (mappings) |mapping| {
+                if (mapping.unbound) continue;
                 if (mapping.descriptor_index != @as(u32, @intCast(index))) continue;
                 physical_mapping = mapping;
                 break;
@@ -23187,6 +23214,7 @@ fn resolveBufferImageCandidates(
         return resolveVectorImageCandidates(bindings, reader, analysis, scalar, sample);
     };
     var result = BufferImageCandidates{};
+    var all_null = true;
     var offset = plan.first;
     while (offset < plan.limit) : (offset += plan.step) {
         var words: [8]u32 = @splat(0);
@@ -23194,6 +23222,7 @@ fn resolveBufferImageCandidates(
             const byte = (offset & ~@as(u64, 3)) + component * 4;
             if (byte + 4 <= plan.buffer.size_bytes) word.* = try reader.readU32(plan.buffer.address + byte);
         }
+        all_null = all_null and std.mem.allEqual(u32, &words, 0);
         const descriptor = gpu.resources.decodeImageDescriptor(&words) catch continue;
         if (descriptor.address == 0) continue;
         var duplicate = false;
@@ -23208,7 +23237,7 @@ fn resolveBufferImageCandidates(
         result.words[result.count] = words;
         result.count += 1;
     }
-    return if (result.count != 0) result else null;
+    return if (result.count != 0 or all_null) result else null;
 }
 
 fn resolveVectorImageCandidates(
@@ -23252,7 +23281,7 @@ fn resolveVectorImageCandidates(
         result.words[result.count] = words;
         result.count += 1;
     }
-    return if (result.count != 0) result else null;
+    return result;
 }
 
 const PointerCandidates = struct {
