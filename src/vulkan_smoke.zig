@@ -1735,29 +1735,45 @@ fn runNestedImageCase(allocator: std.mem.Allocator, bounded: bool) !void {
 }
 
 fn runTypedIndexProbe(allocator: std.mem.Allocator) !void {
-    for (0..8) |case_index| {
+    for (0..28) |case_index| {
         const format = ([_]u32{ 5, 6, 11, 12 })[case_index % 4];
-        const saved_after_fetch = case_index >= 4;
+        const mask_case = case_index / 4;
+        const saved_after_fetch = mask_case == 1 or mask_case == 3;
         var renderer = try vulkan.Renderer.init(allocator, .{ .trace_resource_failures = true });
         defer renderer.deinit();
         var guest = GuestMemory{};
         _ = renderer.dcbBackend(guest.interface());
         const code = [_]u32{
             vop1(1, 0, 28), vop1(1, 1, 128),
-            if (saved_after_fetch) 0xbf80_0000 else sop1(4, 106, 126), // preserve EXEC before fetching the index
+            if (mask_case == 4) sop1(0x24, 106, 128) else if (saved_after_fetch) 0xbf80_0000 else sop1(4, 106, 126), // preserve EXEC before fetching the index
+            if (mask_case == 2) 0x7daa_0280 else 0xbf80_0000, // CMPX NE 0, v1 disables lanes
+            if (mask_case == 2 or mask_case == 4) 0xbf88_0001 else 0xbf80_0000, // skip into the restore block
+            0xbf80_0000,
+            if (mask_case == 2 or mask_case == 4) sop1(4, 126, 106) else 0xbf80_0000,
             0xf000_0108, 0x0005_0f00, // image_load v15, (v0,v1), T#s20
             if (saved_after_fetch) sop1(0x24, 106, 128) else 0xbf80_0000, // s_and_saveexec_b64 vcc, 0
+            if (mask_case == 3) 0xbf88_0001 else 0xbf80_0000,
+            0xbf80_0000,
             if (saved_after_fetch) sop1(4, 126, 106) else 0xbf80_0000, // restore lanes after the conditional
-            sop1(4, 28, 106),
+            if (mask_case == 3) sop1(0x24, 32, 193) else 0xbf80_0000, // another snapshot in the restored block
+            sop1(4, 28, if (mask_case == 3) 32 else 106),
             sop1(0x14, 30, 28),
-            0xd760_001f,     271 | (30 << 9), // read the first saved lane's typed index
-            0x936b_ff1f,     440,
-            0xf42c_0004,     (107 << 25) | 32,
-            vop1(1, 2, 255), 0x3e80_0000,
-            vop1(1, 3, 255), 0x3e80_0000,
-            0xf09c_010a,     0x0080_0402,
-            3,               0xe070_2000,
-            0x8003_0400,     0xbf81_0000,
+            if (mask_case == 5) vop1(2, 31, 271) else if (mask_case == 6) 0xd760_006b else 0xd760_001f,
+            if (mask_case == 5) 0xbf80_0000 else 271 | (30 << 9), // read the first active/saved lane's typed index
+            if (mask_case == 6) 0x936b_ff6b else 0x936b_ff1f,
+            440,
+            0xf42c_0004,
+            (107 << 25) | 32,
+            vop1(1, 2, 255),
+            0x3e80_0000,
+            vop1(1, 3, 255),
+            0x3e80_0000,
+            0xf09c_010a,
+            0x0080_0402,
+            3,
+            0xe070_2000,
+            0x8003_0400,
+            0xbf81_0000,
         };
         for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
         for (0..2) |index| {

@@ -692,6 +692,23 @@ VCC and high-half stores that cross a dword boundary while preserving nearby
 bytes and inactive lanes. Decoder tests and packed-buffer/full Vulkan smoke
 checks pass under SDK validation.
 
+The next live run reached all 6,042 resources without the AGC address-alias
+decode refusal. Its 62 captured material refusals require tracking restored
+EXEC across conditional blocks, including snapshots made by SAVEEXEC before
+the fetch, READFIRSTLANE and an index held in VCC_HI. Index analysis now proves
+the selected lanes received the typed image value before applying its bounds.
+It still rejects snapshots which include lanes absent from the fetch. Replay
+of all 62 complete captures recovers 9–31 valid textures per field instead of
+274 candidates containing unrelated format-149 data. Twenty-eight GPU cases
+cover the mask and index-register variants with signed/unsigned R8/R16 inputs;
+the index-analysis module and its imported tests pass (72 tests).
+
+The live run still loses the GPU in lighting compute `0x80001fd400` at flip
+912 after loading finishes. A separate replay reconstructs its real shader
+header, user data and resources; a single workgroup completes, while the
+full `1 x 64 x 36` dispatch remains under investigation. Menu output is not
+yet verified.
+
 ## Baseline before the timestamp fix
 
 A five-minute run continues rendering after the movie, at approximately

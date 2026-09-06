@@ -27,6 +27,13 @@ fn blockAt(graph: *const Graph, index: usize) ?u32 {
 
 fn writes(inst: Instruction, location: Location) bool {
     if (inst.opcode == .unknown) return true;
+    if (location.lane == null and location.register >= 126 and location.register <= 127) {
+        switch (inst.opcode) {
+            .s_and_saveexec_b64, .s_orn2_saveexec_b64, .s_andn1_saveexec_b64 => return true,
+            .s_and_saveexec_b32, .s_andn1_saveexec_b32 => if (location.register == 126) return true,
+            else => {},
+        }
+    }
     const kind: rdna2.OperandKind = if (location.lane != null) .vgpr else .sgpr;
     if (location.lane) |lane| {
         if (inst.opcode == .v_writelane_b32 and inst.dst.kind == .vgpr and inst.dst.reg == location.register) {
@@ -51,7 +58,7 @@ fn writes(inst: Instruction, location: Location) bool {
 /// Require the same reaching definition on every predecessor, including loop
 /// back edges. A lexical last-write search can incorrectly trust a skipped
 /// assignment or a register changed on a previous loop iteration.
-const ReachingDefinitions = struct { items: [32]usize = undefined, count: usize = 0, entry: bool = false };
+const ReachingDefinitions = struct { items: [32]usize = undefined, count: usize = 0, entry: bool = false, origin: bool = false };
 
 /// Pruned shader blocks retain their byte positions as NOPs. Their fallthrough
 /// edges must not introduce definitions into code reachable from the entry.
@@ -75,6 +82,10 @@ pub fn reachableBlocks(graph: *const Graph) ?[maximum_blocks]bool {
 }
 
 fn reachingDefinitions(instructions: []const Instruction, graph: *const Graph, before: usize, location: Location) ?ReachingDefinitions {
+    return reachingDefinitionsUntil(instructions, graph, before, location, null);
+}
+
+fn reachingDefinitionsUntil(instructions: []const Instruction, graph: *const Graph, before: usize, location: Location, origin: ?usize) ?ReachingDefinitions {
     const reachable = reachableBlocks(graph) orelse return null;
     const first_block = blockAt(graph, before) orelse return null;
     if (!reachable[first_block]) return null;
@@ -90,6 +101,11 @@ fn reachingDefinitions(instructions: []const Instruction, graph: *const Graph, b
         var found = false;
         while (end > block.first_instruction) {
             end -= 1;
+            if (end == origin) {
+                result.origin = true;
+                found = true;
+                break;
+            }
             if (!writes(instructions[end], location)) continue;
             if (std.mem.indexOfScalar(usize, result.items[0..result.count], end) == null) {
                 if (result.count == result.items.len) return null;
@@ -137,37 +153,84 @@ pub fn scalarDefinition(instructions: []const Instruction, graph: *const Graph, 
 }
 
 const MaskProof = struct {
-    visited: [32]usize = undefined,
+    const Visit = struct { instruction: usize, register: u32 };
+    visited: [64]Visit = undefined,
     count: usize = 0,
     has_origin: bool = false,
 };
+
+// A fetch can run after an explicit restoration of an earlier saved EXEC.
+// Follow only exact 64-bit copies here: a narrowing write before the fetch
+// does not establish that every lane in the older snapshot received a value.
+fn maskRestoresOrigin(instructions: []const Instruction, graph: *const Graph, before: usize, register: u32, origin: usize, depth: u32) bool {
+    if (depth == 16) return false;
+    for (0..2) |half| {
+        const definitions = reachingDefinitions(instructions, graph, before, .{ .register = register + @as(u32, @intCast(half)) }) orelse return false;
+        if (definitions.entry or definitions.count == 0) return false;
+        for (definitions.items[0..definitions.count]) |index| {
+            const inst = instructions[index];
+            if (index == origin) {
+                // SAVEEXEC writes both its SGPR destination and implicit EXEC;
+                // only the SGPR pair contains the saved, pre-narrowing mask.
+                if (@import("scalar_provenance.zig").scalarRegisterIndex(inst.dst) != register) return false;
+                continue;
+            }
+            if (inst.opcode != .s_mov_b64 or @import("scalar_provenance.zig").scalarRegisterIndex(inst.dst) != register) return false;
+            const source = @import("scalar_provenance.zig").scalarRegisterIndex(inst.src0) orelse return false;
+            if (!maskRestoresOrigin(instructions, graph, index, @intCast(source), origin, depth + 1)) return false;
+        }
+    }
+    return true;
+}
 
 // A waterfall loop saves EXEC after computing its vector index, then removes
 // processed lanes with ANDN2. Every selected lane remains inside that original
 // execution mask. Reject OR/restores, unknown entry values and other writers.
 fn maskIsSubsetOfVectorWrite(instructions: []const Instruction, graph: *const Graph, before: usize, register: u32, vector_write: usize, proof: *MaskProof) bool {
     for (0..2) |half| {
-        const definitions = reachingDefinitions(instructions, graph, before, .{ .register = register + @as(u32, @intCast(half)) }) orelse return false;
+        const definitions = reachingDefinitionsUntil(instructions, graph, before, .{ .register = register + @as(u32, @intCast(half)) }, if (register == 126) vector_write else null) orelse return false;
         if (definitions.entry) return false;
+        proof.has_origin = proof.has_origin or definitions.origin;
         for (definitions.items[0..definitions.count]) |index| {
-            if (std.mem.indexOfScalar(usize, proof.visited[0..proof.count], index) != null) continue;
+            const visit = MaskProof.Visit{ .instruction = index, .register = register };
+            var visited = false;
+            for (proof.visited[0..proof.count]) |previous| if (std.meta.eql(previous, visit)) {
+                visited = true;
+                break;
+            };
+            if (visited) continue;
             if (proof.count == proof.visited.len) return false;
-            proof.visited[proof.count] = index;
+            proof.visited[proof.count] = visit;
             proof.count += 1;
             const inst = instructions[index];
+            if (register == 126 and (inst.opcode == .s_and_saveexec_b64 or
+                (std.mem.startsWith(u8, @tagName(inst.opcode), "v_cmpx_") and inst.dst.kind == .exec_lo)))
+            {
+                if (!maskIsSubsetOfVectorWrite(instructions, graph, index, 126, vector_write, proof)) return false;
+                continue;
+            }
             if (@import("scalar_provenance.zig").scalarRegisterIndex(inst.dst) != register) return false;
             const copies_exec = inst.opcode == .s_mov_b64 and inst.src0.kind == .exec_lo;
-            // SAVEEXEC returns the mask from before narrowing EXEC. A snapshot
-            // taken after the fetch therefore includes exactly its valid lanes.
-            const saves_previous_exec = inst.opcode == .s_and_saveexec_b64 and index > vector_write;
+            // SAVEEXEC returns the mask from before narrowing EXEC. An earlier
+            // snapshot is usable only after proving its restoration at the fetch.
+            const saves_previous_exec = switch (inst.opcode) {
+                .s_and_saveexec_b64, .s_andn1_saveexec_b64, .s_orn2_saveexec_b64 => true,
+                else => false,
+            };
             if (copies_exec or saves_previous_exec) {
-                if (index == vector_write or blockAt(graph, index) != blockAt(graph, vector_write)) return false;
-                for (instructions[@min(vector_write, index) + 1 .. @max(vector_write, index)]) |between| {
-                    if (between.dst.kind == .exec_lo or between.dst.kind == .exec_hi or
-                        between.dst2.kind == .exec_lo or between.dst2.kind == .exec_hi or
-                        std.mem.indexOf(u8, @tagName(between.opcode), "exec") != null) return false;
+                if (index > vector_write) {
+                    if (!maskIsSubsetOfVectorWrite(instructions, graph, index, 126, vector_write, proof)) return false;
+                } else {
+                    var unchanged = copies_exec and index < vector_write and blockAt(graph, index) == blockAt(graph, vector_write);
+                    if (unchanged) for (instructions[index + 1 .. vector_write]) |between| {
+                        if (writes(between, .{ .register = 126 }) or writes(between, .{ .register = 127 })) {
+                            unchanged = false;
+                            break;
+                        }
+                    };
+                    if (!unchanged and !maskRestoresOrigin(instructions, graph, vector_write, 126, index, 0)) return false;
+                    proof.has_origin = true;
                 }
-                proof.has_origin = true;
             } else if (inst.opcode == .s_mov_b64 or inst.opcode == .s_andn2_b64 or inst.opcode == .s_and_b64) {
                 const source = @import("scalar_provenance.zig").scalarRegisterIndex(inst.src0) orelse return false;
                 if (!maskIsSubsetOfVectorWrite(instructions, graph, index, @intCast(source), vector_write, proof)) return false;
@@ -183,12 +246,16 @@ pub fn scalarLaneDefinition(instructions: []const Instruction, graph: *const Gra
     const index = reachingDefinition(instructions, graph, before, .{ .register = register }) orelse return null;
     const inst = instructions[index];
     if (inst.opcode == .s_mov_b32 and inst.src0.kind == .sgpr) return scalarLaneDefinition(instructions, graph, index, inst.src0.reg, depth + 1);
-    if (inst.opcode != .v_readlane_b32 or inst.src0.kind != .vgpr) return null;
-    const lane_register = @import("scalar_provenance.zig").scalarRegisterIndex(inst.src1) orelse return null;
-    const lane_index = reachingDefinition(instructions, graph, index, .{ .register = @intCast(lane_register) }) orelse return null;
-    const lane = instructions[lane_index];
-    if (lane.opcode != .s_ff1_i32_b64) return null;
-    const mask_register = @import("scalar_provenance.zig").scalarRegisterIndex(lane.src0) orelse return null;
+    if (inst.src0.kind != .vgpr) return null;
+    var lane_index = index;
+    var mask_register: usize = 126;
+    if (inst.opcode == .v_readlane_b32) {
+        const lane_register = @import("scalar_provenance.zig").scalarRegisterIndex(inst.src1) orelse return null;
+        lane_index = reachingDefinition(instructions, graph, index, .{ .register = @intCast(lane_register) }) orelse return null;
+        const lane = instructions[lane_index];
+        if (lane.opcode != .s_ff1_i32_b64) return null;
+        mask_register = @import("scalar_provenance.zig").scalarRegisterIndex(lane.src0) orelse return null;
+    } else if (inst.opcode != .v_readfirstlane_b32) return null;
     // Check all writes to this VGPR, since the lane is chosen dynamically.
     const vector_index = reachingDefinition(instructions, graph, index, .{ .register = inst.src0.reg, .lane = std.math.maxInt(u32) }) orelse return null;
     const vector = instructions[vector_index];
@@ -341,6 +408,61 @@ test "waterfall image lanes preserve a mask saved through VCC before the fetch" 
     instructions[0].pc = 0;
     instructions[3] = .{ .pc = 12, .opcode = .s_nop };
     try std.testing.expect(scalarLaneDefinition(&instructions, &graph, 8, 26, 0) == null);
+}
+
+test "waterfall masks follow restored EXEC across conditional blocks" {
+    const exec = rdna2.Operand{ .kind = .exec_lo };
+    const vcc = rdna2.Operand{ .kind = .vcc_lo };
+    const s8 = rdna2.Operand{ .kind = .sgpr, .reg = 8 };
+    const s10 = rdna2.Operand{ .kind = .sgpr, .reg = 10 };
+    const other = rdna2.Operand{ .kind = .sgpr, .reg = 12 };
+    var instructions = [_]Instruction{
+        .{ .pc = 0, .opcode = .s_mov_b64, .dst = s8, .src0 = exec },
+        .{ .pc = 4, .opcode = .v_cmpx_gt_u32, .dst = exec },
+        .{ .pc = 8, .opcode = .s_cbranch_execz, .branch_target = 16 },
+        .{ .pc = 12, .opcode = .s_nop },
+        .{ .pc = 16, .opcode = .s_mov_b64, .dst = exec, .src0 = s8 },
+        .{ .pc = 20, .opcode = .image_load, .dst = .{ .kind = .vgpr, .reg = 15 } },
+        .{ .pc = 24, .opcode = .v_cmpx_gt_u32, .dst = exec },
+        .{ .pc = 28, .opcode = .s_cbranch_execz, .branch_target = 36 },
+        .{ .pc = 32, .opcode = .s_nop },
+        .{ .pc = 36, .opcode = .s_mov_b64, .dst = exec, .src0 = s8 },
+        .{ .pc = 40, .opcode = .s_and_saveexec_b64, .dst = s10, .src0 = other },
+        .{ .pc = 44, .opcode = .s_cbranch_execz, .branch_target = 52 },
+        .{ .pc = 48, .opcode = .s_nop },
+        .{ .pc = 52, .opcode = .s_mov_b64, .dst = exec, .src0 = s10 },
+        .{ .pc = 56, .opcode = .s_ff1_i32_b64, .dst = vcc, .src0 = s10 },
+        .{ .pc = 60, .opcode = .v_readlane_b32, .dst = .{ .kind = .sgpr, .reg = 26 }, .src0 = .{ .kind = .vgpr, .reg = 15 }, .src1 = vcc },
+        .{ .pc = 64, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?Definition, .{ .instruction = 5, .component = 0 }), scalarLaneDefinition(&instructions, &graph, 16, 26, 0));
+    // Without restoration before the fetch, the older snapshot includes
+    // lanes which never received an index.
+    instructions[4].opcode = .s_nop;
+    instructions[4].dst = .{};
+    try std.testing.expect(scalarLaneDefinition(&instructions, &graph, 16, 26, 0) == null);
+    instructions[4].opcode = .s_mov_b64;
+    instructions[4].dst = exec;
+    instructions[9].src0 = other;
+    try std.testing.expect(scalarLaneDefinition(&instructions, &graph, 16, 26, 0) == null);
+    instructions[9].src0 = s8;
+    // A SAVEEXEC snapshot from before the fetch is also valid when explicitly
+    // restored, even though it narrowed EXEC at the time of the save.
+    instructions[0].opcode = .s_and_saveexec_b64;
+    instructions[0].src0 = other;
+    try std.testing.expectEqual(@as(?Definition, .{ .instruction = 5, .component = 0 }), scalarLaneDefinition(&instructions, &graph, 16, 26, 0));
+    // Implicit EXEC writes must also invalidate the pre-fetch restoration.
+    instructions[4] = .{ .pc = 16, .opcode = .s_and_saveexec_b64, .dst = other, .src0 = s8 };
+    try std.testing.expect(scalarLaneDefinition(&instructions, &graph, 16, 26, 0) == null);
+    instructions[4] = .{ .pc = 16, .opcode = .s_mov_b64, .dst = exec, .src0 = s8 };
+    instructions[15].opcode = .v_readfirstlane_b32;
+    try std.testing.expectEqual(@as(?Definition, .{ .instruction = 5, .component = 0 }), scalarLaneDefinition(&instructions, &graph, 16, 26, 0));
+    instructions[0].opcode = .s_andn1_saveexec_b64;
+    try std.testing.expectEqual(@as(?Definition, .{ .instruction = 5, .component = 0 }), scalarLaneDefinition(&instructions, &graph, 16, 26, 0));
+    instructions[13].src0 = other;
+    try std.testing.expect(scalarLaneDefinition(&instructions, &graph, 16, 26, 0) == null);
 }
 
 test "unsigned index bound follows a scalar spill through a guarded loop" {

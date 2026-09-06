@@ -23187,9 +23187,9 @@ fn resolveBufferTablePlan(
             .integer_inline_constant, .literal_constant => inst.src1.value,
             else => return null,
         };
-        if (inst.src0.kind == .sgpr) {
-            index_register = inst.src0.reg;
-            index_bound = gpu.index_bounds.scalarUpperBound(instructions, &analysis.graph, index, inst.src0.reg);
+        if (gpu.scalar_provenance.scalarRegisterIndex(inst.src0)) |source_register| {
+            index_register = @intCast(source_register);
+            index_bound = gpu.index_bounds.scalarUpperBound(instructions, &analysis.graph, index, @intCast(source_register));
         }
         break;
     }
