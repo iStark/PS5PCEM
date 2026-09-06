@@ -781,6 +781,13 @@ triangle's depth, preservation across a second draw and no colour readback;
 the complete Vulkan smoke also passes with clean SDK validation. Live frame
 timing with these changes remains to be measured.
 
+Checked memory permissions now start with a binary search in the ordered
+mapping table, then visit only the adjacent mappings covered by the request.
+All nine memory tests pass, including a byte-level permission oracle over
+gaps and boundaries. A controlled ReleaseSafe benchmark with 16,384 mappings
+and 32,768 reads near the end of the table drops from 310,264 to 479 us. This
+measures the lookup alone, not game frame rate.
+
 The frame-948 trace stopped in the diagnostic vertex dumper: it requested nine
 words from an eight-word checked reader. The dumper now respects that bound.
 That incomplete capture includes numerous rejected shadow draws before the

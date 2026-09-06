@@ -1423,7 +1423,12 @@ pub const AddressSpace = struct {
         const end = std.math.add(u64, address, size) catch return false;
         var cursor = address;
 
-        for (self.mappings.items) |mapping| {
+        // Mappings are ordered and non-overlapping. Checked GPU reads often
+        // target an allocation near the end of thousands of streamed ranges;
+        // start at that allocation instead of scanning all earlier mappings.
+        var first = self.insertionIndex(address);
+        if (first > 0 and self.mappings.items[first - 1].end() > address) first -= 1;
+        for (self.mappings.items[first..]) |mapping| {
             if (mapping.end() <= cursor) continue;
             if (mapping.address > cursor) return false;
             const allowed = switch (required) {
@@ -2254,6 +2259,44 @@ test "virtual reservations and mapping queries retain guest metadata" {
         space.query(reserved_address, true).?.address,
     );
     try testing.expectEqual(@as(u64, page_size), space.mappedBytes(.flexible));
+}
+
+test "permission lookup preserves gaps boundaries and adjacent protections" {
+    var mappings = [_]Mapping{
+        .{ .address = 0x1008, .size = 8, .protection = .{ .read = true }, .kind = .private },
+        .{ .address = 0x1010, .size = 8, .protection = .{ .read = true, .write = true }, .kind = .private },
+        .{ .address = 0x1018, .size = 8, .protection = .{ .write = true }, .kind = .private },
+        .{ .address = 0x1028, .size = 8, .protection = .none, .kind = .reserved },
+        .{ .address = 0x1030, .size = 8, .protection = .{ .read = true, .write = true }, .kind = .direct_memory },
+    };
+    var space = AddressSpace{
+        .allocator = testing.allocator,
+        .mappings = .{ .items = &mappings, .capacity = mappings.len },
+    };
+    // This metadata-only fixture never owns native pages. A byte-level oracle
+    // covers both interior starts and exact mapping boundaries.
+    inline for (.{ AddressSpace.RequiredPermission.read, AddressSpace.RequiredPermission.write }) |permission| {
+        var permitted = [_]bool{false} ** 128;
+        for (mappings) |mapping| {
+            const allowed = if (permission == .read) mapping.protection.read else mapping.protection.write;
+            for (mapping.address - 0x1000..mapping.end() - 0x1000) |index| permitted[index] = allowed;
+        }
+        for (0..64) |start| {
+            for (0..64) |length| {
+                var expected = true;
+                for (permitted[start..][0..@max(length, 1)]) |allowed| expected = expected and allowed;
+                const actual = if (permission == .read)
+                    space.isReadable(0x1000 + start, length)
+                else
+                    space.isWritable(0x1000 + start, length);
+                try testing.expectEqual(expected, actual);
+            }
+        }
+    }
+    try testing.expect(!space.isReadable(std.math.maxInt(u64) - 1, 4));
+    try testing.expect(!space.isWritable(std.math.maxInt(u64) - 1, 4));
+    space.mappings.items = &.{};
+    try testing.expect(!space.isReadable(0x1008, 1));
 }
 
 test "large semantic reservation can span small host holes" {
