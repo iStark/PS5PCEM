@@ -1337,13 +1337,26 @@ fn runScalarPointerProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runNestedImageProbe(allocator: std.mem.Allocator) !void {
+    try runNestedImageCase(allocator, false);
+    try runNestedImageCase(allocator, true);
+    std.debug.print("nested sampled images passed: record pointers, bounded lane selection, runtime T#/S# loads, null bounds and relocated object pages\n", .{});
+}
+
+fn runNestedImageCase(allocator: std.mem.Allocator, bounded: bool) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{ .trace_resource_failures = true });
     defer renderer.deinit();
     var guest = GuestMemory{};
     _ = renderer.dcbBackend(guest.interface());
     const code = [_]u32{
         vop1(1, 0, 28), // workgroup index survives the scalar descriptor loads
-        0x936a_ff1c, 592, // s_mul_i32 vcc_lo, s28, record stride
+        if (bounded) (0x1a << 25) | (12 << 17) | 144 else 0xbf80_0000, // v12 = group << 16
+        if (bounded) (0x16 << 25) | (12 << 17) | (12 << 9) | 144 else 0xbf80_0000,
+        if (bounded) sop1(4, 20, 126) else 0xbf80_0000, // save the lanes which received v12
+        if (bounded) sop1(0x14, 106, 20) else 0xbf80_0000,
+        if (bounded) 0xd760_001e else 0xbf80_0000,
+        if (bounded) 268 | (106 << 9) else 0xbf80_0000, // s30 = first active lane of v12
+        0x936a_ff00 | @as(u32, if (bounded) 30 else 28),
+        592,
         0xf424_000c, 106 << 25, // pointer = s_buffer_load_dwordx2 s0, V#s24, vcc_lo
         0xf40c_0100, (125 << 25) | 64, // T#s4 = pointer + 64
         0xf408_0300,                 (125 << 25) | 96, // S#s12 = pointer + 96
@@ -1364,6 +1377,14 @@ fn runNestedImageProbe(allocator: std.mem.Allocator) !void {
     @memcpy(userdata[24..28], &[_]u32{ 0x10000, 592 << 16, 2, 0 });
     for (userdata, 0..) |word, index| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
     for (0..2) |pass| {
+        if (bounded) {
+            // A valid but unreachable pointer in the next record field must
+            // not contribute its different sampler through wrap enumeration.
+            guest.word(0x10010, 0x16000);
+            const decoy = sampledImageDescriptorWords(0x8000, 1, 1);
+            for (decoy, 0..) |word, index| guest.word(0x16040 + index * 4, word);
+            guest.word(0x16060, 1);
+        }
         for (0..2) |object| {
             const address: u32 = @intCast(0x12000 + pass * 0x2000 + object * 0x1000);
             guest.word(0x10000 + object * 592, address);
@@ -1383,7 +1404,6 @@ fn runNestedImageProbe(allocator: std.mem.Allocator) !void {
     }
     try std.testing.expectEqual(@as(u64, 1), renderer.pipeline_cache_misses);
     try std.testing.expectEqual(@as(u64, 1), renderer.pipeline_cache_hits);
-    std.debug.print("nested sampled images passed: record pointers, runtime T#/S# loads, null bounds and relocated object pages\n", .{});
 }
 
 fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {

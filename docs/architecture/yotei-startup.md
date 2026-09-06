@@ -537,6 +537,19 @@ integer bit patterns which would be NaNs as floats, and signed/unsigned packed
 exports through guest-memory readback. It, the shader-interface probe and the
 full smoke pass SDK validation without output-type warnings.
 
+The first live nested-pointer attempt still refuses `0x8000333c00`: unbounded
+32-bit residue enumeration admits pointers from neighbouring fields, including
+texture data that happens to decode as another T#/S# pair. Its actual index
+comes from a vector logical shift by 16, selected with FF1 of a saved EXEC mask.
+Bounds analysis now proves that the waterfall loop only removes lanes from
+the mask which received that vector write. Mask restores/OR, separate writes
+to either scalar half and ambiguous vector definitions reject the proof.
+The resulting exclusive bound 65,536 rules out multiply overflow and limits
+the captured six-record table to its six pointer fields. Replaying the capture
+with readable decoy memory fails before this bound and resolves one shared
+texture/sampler afterwards. The GPU nested probe also excludes a valid decoy
+pointer with a different sampler; existing wrapping and guarded tables pass.
+
 ## Baseline before the timestamp fix
 
 A five-minute run continues rendering after the movie, at approximately
