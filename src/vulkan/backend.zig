@@ -13064,10 +13064,7 @@ pub const Renderer = struct {
                     if (inst.src1.kind == .integer_inline_constant and inst.src1.value < 32) {
                         const attribute: usize = @intCast(inst.src1.value);
                         fragment_attribute_mask |= @as(u32, 1) << @intCast(attribute);
-                        const component_value = if (inst.opcode == .v_interp_mov_f32)
-                            inst.src0.value
-                        else
-                            inst.src2.value;
+                        const component_value = inst.src2.value;
                         if (component_value < 4) {
                             fragment_attribute_components[attribute] |= @as(u4, 1) << @intCast(component_value);
                         }
@@ -24460,7 +24457,7 @@ fn buildParameterProbeFragmentSpirv(allocator: std.mem.Allocator) !rdna2.spirv.M
             .family = .vintrp,
             .opcode = .v_interp_mov_f32,
             .dst = vgpr(channel),
-            .src0 = uint(channel),
+            .src0 = uint(2), // P0, independent of ATTRCHAN
             .src1 = uint(0),
             .src2 = uint(channel),
             .src_count = 3,

@@ -1518,7 +1518,7 @@ fn runShaderInterfaceProbe(allocator: std.mem.Allocator) !void {
         0x3f40_0000,      vop2(3, 6, 6, 8),
         vop1(1, 7, 128),  vop1(1, 8, 242),
         vop1(1, 10, 240), vop2(8, 9, 1, 10), // PARAM1 = VertexIndex * .5
-        0xf800_021f,      0x0909_0909,
+        0xf800_021f,      0x0807_0a09, // PARAM1 = { VertexIndex * .5, .5, 0, 1 }
         0xf800_08cf,      0x0807_0605,
         0xbf81_0000,
     };
@@ -1575,7 +1575,28 @@ fn runShaderInterfaceProbe(allocator: std.mem.Allocator) !void {
         try std.testing.expect(@abs(@as(i32, pixel[2]) - expected_blue) <= 1);
         try std.testing.expect(@abs(@as(i32, pixel[3]) - expected_alpha) <= 1);
     }
-    std.debug.print("shader interface probe passed: ABI Phi, smooth/flat aliases and independent lane spills\n", .{});
+    // VSRC=2 selects P0; ATTRCHAN selects X/Y/Z/W independently. The title's
+    // icon/font selector is ATTR3.X, while ATTR3.Z carries the SDF width.
+    const flat_fragment = [_]u32{
+        0xc802_0402 | (4 << 18),
+        0xc802_0502 | (5 << 18),
+        0xc802_0602 | (6 << 18),
+        0xc802_0702 | (7 << 18),
+        0xf800_080f, 0x0706_0504,
+        0xbf81_0000,
+    };
+    for (flat_fragment, 0..) |word, index| guest.word(0xb00 + index * 4, word);
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.programRegisterBase(), 0xb);
+    _ = try executor.execute(&stream);
+    try renderer.flushPendingGuestWrites();
+    if (renderer.last_draw_error) |err| return err;
+    const flat_pixel = guest.bytes[0x2000 + (32 * 64 + 32) * 4 ..][0..4];
+    std.debug.print("P0 attribute channels center={any}\n", .{flat_pixel.*});
+    try std.testing.expectEqual(@as(u8, 0), flat_pixel[0]);
+    try std.testing.expect(@abs(@as(i32, flat_pixel[1]) - 128) <= 1);
+    try std.testing.expectEqual(@as(u8, 0), flat_pixel[2]);
+    try std.testing.expectEqual(@as(u8, 255), flat_pixel[3]);
+    std.debug.print("shader interface probe passed: ABI Phi, smooth/flat aliases, lane spills and P0 attribute channels\n", .{});
 }
 
 fn runStreamedMipProbe(allocator: std.mem.Allocator) !void {

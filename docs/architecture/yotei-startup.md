@@ -817,6 +817,20 @@ from 34.3 to 2.4 ms for a 1 MiB volume, 642.0 to 39.9 ms for a 16 MiB volume,
 and 735.7 to 41.7 ms for a 16 MiB MSAA image. Output hashes agree. These are
 copy timings, not whole-game FPS; a complete live frame still needs measuring.
 
+A partial late-frame trace identifies the cross as a six-vertex font draw
+(`VS 0x80003f0e00`, `PS 0x80003dc300`), using the icon atlas rather than the
+loading-spinner material. Its packed flags export icon selection in PARAM3.X
+and SDF width in PARAM3.Z. `V_INTERP_MOV_F32` incorrectly read its VSRC selector
+as the channel, so P0 (selector 2) always loaded Z, including the icon selector.
+Translation and graphics interface component discovery now use ATTRCHAN.
+The [AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture)
+defines these as separate fields. A decoded P0 GPU probe previously produced
+RGBA `{0,0,0,0}` and now produces the expected `{0,127,0,255}`; existing
+smooth/flat interface checks and the full Vulkan smoke pass with clean SDK
+validation. Live verification of the notice is still pending. After confirming
+the old notice with Cross, the captured framebuffer remained black while the
+scene continued submitting frames.
+
 ## Baseline before the timestamp fix
 
 A five-minute run continues rendering after the movie, at approximately

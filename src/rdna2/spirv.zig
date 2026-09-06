@@ -5182,10 +5182,9 @@ const Builder = struct {
             return Error.InvalidStageInterface;
         }
         const attribute = inst.src1.value;
-        const component = if (inst.opcode == .v_interp_mov_f32)
-            inst.src0.value
-        else
-            inst.src2.value;
+        // VINTRP's ATTRCHAN selects the component for every opcode. MOV's
+        // VSRC selects P10/P20/P0 (2 means P0), not X/Y/Z/W.
+        const component = inst.src2.value;
         if (attribute >= self.parameter_variables.len or component >= 4) {
             return Error.InvalidStageInterface;
         }
