@@ -862,6 +862,14 @@ requirements and fallback. Four verified 64 MiB reads of GPU-written data
 drop from 508,056 to 21,382 us under SDK validation. This is a readback
 benchmark; the additional whole-frame gain is still unmeasured.
 
+Resident compute buffers also need this preference: their CPU readback maps
+the storage allocation directly, so they do not carry TRANSFER_DST usage.
+Both initial allocation and growth now explicitly prefer HOST_CACHED with
+the same required coherent/visible flags and fallback. Write-only storage
+upload arenas retain the default policy. Selection tests cover this path;
+queued compute readback, descriptor migration, cache recycling and growth,
+and the complete Vulkan smoke pass under SDK validation.
+
 The first cached-memory relaunch stopped before video or Vulkan rendering:
 the main thread was suspended in `reportGuestThreadContext(1)`, called by
 `drainQuietBuilderArenas` from that same guest thread's suspend point. The

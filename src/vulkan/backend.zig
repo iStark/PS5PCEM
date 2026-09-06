@@ -4493,10 +4493,11 @@ pub const Renderer = struct {
 
             if (recycle_index == null) {
                 try self.guest_buffers.ensureUnusedCapacity(self.allocator, 1);
-                const device_local = try self.createBuffer(
+                const device_local = try self.createBufferWithMemoryPreference(
                     size,
                     vk.buffer_usage_storage_buffer_bit,
                     vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+                    vk.memory_property_host_cached_bit,
                 );
                 errdefer self.destroyBuffer(device_local);
                 self.guest_buffers.appendAssumeCapacity(.{
@@ -4517,10 +4518,11 @@ pub const Renderer = struct {
                 }
                 const victim = &self.guest_buffers.items[victim_index];
                 if (victim.device_local.size < size) {
-                    const replacement_device = try self.createBuffer(
+                    const replacement_device = try self.createBufferWithMemoryPreference(
                         size,
                         vk.buffer_usage_storage_buffer_bit,
                         vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+                        vk.memory_property_host_cached_bit,
                     );
                     errdefer self.destroyBuffer(replacement_device);
                     if (self.trace_resource_failures) std.debug.print("[buffer lifetime] replace handle=0x{x} guest=0x{x} bytes={d} slot={d} with guest=0x{x} bytes={d}\n", .{ victim.device_local.handle, victim.guest_address, victim.size, descriptor_index, guest_address, size });
@@ -15481,6 +15483,10 @@ pub const Renderer = struct {
     }
 
     fn createBuffer(self: *Renderer, size: vk.DeviceSize, usage: vk.Flags, properties: vk.Flags) Error!OwnedBuffer {
+        return self.createBufferWithMemoryPreference(size, usage, properties, 0);
+    }
+
+    fn createBufferWithMemoryPreference(self: *Renderer, size: vk.DeviceSize, usage: vk.Flags, properties: vk.Flags, preferred: vk.Flags) Error!OwnedBuffer {
         const create_info = vk.BufferCreateInfo{ .size = size, .usage = usage };
         var handle: vk.Buffer = 0;
         if (self.device_functions.create_buffer(self.device, &create_info, null, &handle) != vk.success) {
@@ -15490,7 +15496,7 @@ pub const Renderer = struct {
 
         var requirements: vk.MemoryRequirements = undefined;
         self.device_functions.get_buffer_memory_requirements(self.device, handle, &requirements);
-        const memory_type_index = findBufferMemoryTypeIn(self.memory_properties, requirements.memory_type_bits, properties, usage) orelse {
+        const memory_type_index = findBufferMemoryTypeIn(self.memory_properties, requirements.memory_type_bits, properties, usage, preferred) orelse {
             return Error.NoCompatibleMemoryType;
         };
         const allocation_info = vk.MemoryAllocateInfo{
@@ -24343,13 +24349,20 @@ fn physicalDeviceScore(device_type: u32, prefer_integrated_gpu: bool) u32 {
     };
 }
 
-fn findBufferMemoryTypeIn(properties: vk.PhysicalDeviceMemoryProperties, supported_bits: u32, required: vk.Flags, usage: vk.Flags) ?u32 {
+fn findBufferMemoryTypeIn(properties: vk.PhysicalDeviceMemoryProperties, supported_bits: u32, required: vk.Flags, usage: vk.Flags, preferred: vk.Flags) ?u32 {
     // Readback and bidirectional staging buffers are read by the CPU. The
     // first HOST_VISIBLE|HOST_COHERENT type can be uncached (NVIDIA type 3),
     // making multi-MiB reads far slower than cached coherent memory (type 4).
     // Keep all required flags and fall back on devices without such a type.
-    if (usage & vk.buffer_usage_transfer_dst_bit != 0 and required & vk.memory_property_host_visible_bit != 0) {
-        if (findMemoryTypeIn(properties, supported_bits, required | vk.memory_property_host_cached_bit)) |index| return index;
+    // Resident SSBOs are read back directly without TRANSFER_DST usage, so
+    // their allocations request caching explicitly. Upload-only storage
+    // arenas keep the default policy.
+    const preference = preferred | (if (usage & vk.buffer_usage_transfer_dst_bit != 0 and required & vk.memory_property_host_visible_bit != 0)
+        vk.memory_property_host_cached_bit
+    else
+        @as(vk.Flags, 0));
+    if (preference != 0) {
+        if (findMemoryTypeIn(properties, supported_bits, required | preference)) |index| return index;
     }
     return findMemoryTypeIn(properties, supported_bits, required);
 }
@@ -24361,12 +24374,19 @@ test "readback memory prefers host caching without weakening required flags" {
     const readback = vk.buffer_usage_transfer_dst_bit;
     const upload = vk.buffer_usage_transfer_src_bit;
     const required = vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit;
-    try std.testing.expectEqual(@as(?u32, 3), findBufferMemoryTypeIn(properties, 0x1f, required, readback));
-    try std.testing.expectEqual(@as(?u32, 3), findBufferMemoryTypeIn(properties, 0x1f, required, readback | upload));
-    try std.testing.expectEqual(@as(?u32, 1), findBufferMemoryTypeIn(properties, 0x1f, required, upload));
-    try std.testing.expectEqual(@as(?u32, 1), findBufferMemoryTypeIn(properties, 0x17, required, readback));
-    try std.testing.expectEqual(@as(?u32, 4), findBufferMemoryTypeIn(properties, 0x1f, required | vk.memory_property_device_local_bit, readback));
-    try std.testing.expectEqual(@as(?u32, null), findBufferMemoryTypeIn(properties, 1 << 2, required, readback));
+    try std.testing.expectEqual(@as(?u32, 3), findBufferMemoryTypeIn(properties, 0x1f, required, readback, 0));
+    try std.testing.expectEqual(@as(?u32, 3), findBufferMemoryTypeIn(properties, 0x1f, required, readback | upload, 0));
+    try std.testing.expectEqual(@as(?u32, 1), findBufferMemoryTypeIn(properties, 0x1f, required, upload, 0));
+    try std.testing.expectEqual(@as(?u32, 1), findBufferMemoryTypeIn(properties, 0x17, required, readback, 0));
+    try std.testing.expectEqual(@as(?u32, 4), findBufferMemoryTypeIn(properties, 0x1f, required | vk.memory_property_device_local_bit, readback, 0));
+    try std.testing.expectEqual(@as(?u32, null), findBufferMemoryTypeIn(properties, 1 << 2, required, readback, 0));
+    const storage = vk.buffer_usage_storage_buffer_bit;
+    const cached = vk.memory_property_host_cached_bit;
+    try std.testing.expectEqual(@as(?u32, 1), findBufferMemoryTypeIn(properties, 0x1f, required, storage, 0));
+    try std.testing.expectEqual(@as(?u32, 3), findBufferMemoryTypeIn(properties, 0x1f, required, storage, cached));
+    try std.testing.expectEqual(@as(?u32, 1), findBufferMemoryTypeIn(properties, 0x17, required, storage, cached));
+    try std.testing.expectEqual(@as(?u32, 4), findBufferMemoryTypeIn(properties, 0x1f, required | vk.memory_property_device_local_bit, storage, cached));
+    try std.testing.expectEqual(@as(?u32, null), findBufferMemoryTypeIn(properties, 1 << 2, required, storage, cached));
 }
 
 fn findMemoryTypeIn(properties: vk.PhysicalDeviceMemoryProperties, supported_bits: u32, required: vk.Flags) ?u32 {
