@@ -178,6 +178,7 @@ fn vopcOpcode(id: u32) isa.Opcode {
         0x94 => .v_cmpx_gt_i32,
         0x95 => .v_cmpx_ne_i32,
         0x96 => .v_cmpx_ge_i32,
+        0x9e => .v_cmpx_ge_i16,
         0xa2 => .v_cmp_eq_i64,
         0xa9 => .v_cmp_lt_u16,
         0xaa => .v_cmp_eq_u16,
@@ -219,6 +220,7 @@ fn vopcOpcode(id: u32) isa.Opcode {
         0xdc => .v_cmpx_gt_f16,
         0xde => .v_cmpx_ge_f16,
         0xfc => .v_cmpx_nle_f16,
+        0xe2 => .v_cmp_eq_u64,
         0xe4 => .v_cmp_gt_u64,
         0xe5 => .v_cmp_ne_u64,
         0xed => .v_cmp_neq_f16,
@@ -231,6 +233,7 @@ fn vopcOpcode(id: u32) isa.Opcode {
 
 fn isCompareExec(op: isa.Opcode) bool {
     return switch (op) {
+        .v_cmpx_ge_i16,
         .v_cmpx_f_f32,
         .v_cmpx_lt_f32,
         .v_cmpx_eq_f32,
@@ -1055,4 +1058,16 @@ test "VOP3P packed add retains lane selectors" {
     try std.testing.expectEqual(@as(u32, 2), inst.src_count);
     try std.testing.expect(inst.src0.op_sel);
     try std.testing.expect(inst.src1.op_sel_hi);
+}
+
+test "scene mask comparisons decode u64 equality and signed i16 CMPX" {
+    const equal = try decodeVopc(0x6cc, &.{0x7dc4_0480}, 0);
+    try std.testing.expectEqual(isa.Opcode.v_cmp_eq_u64, equal.opcode);
+    try std.testing.expectEqual(isa.OperandKind.vcc_lo, equal.dst.kind);
+    try std.testing.expectEqual(@as(u32, 2), equal.src1.reg);
+    const signed = try decodeVopc(0x57f8, &.{ 0x7d3d_00f9, 0x8606_0022 }, 0);
+    try std.testing.expectEqual(isa.Opcode.v_cmpx_ge_i16, signed.opcode);
+    try std.testing.expectEqual(isa.OperandKind.exec_lo, signed.dst.kind);
+    try std.testing.expectEqual(@as(u32, 34), signed.src0.reg);
+    try std.testing.expectEqual(@as(u32, 0), signed.src1.value);
 }

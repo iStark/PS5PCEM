@@ -40,6 +40,7 @@ fn mubufInfo(id: u32) ?MemoryInfo {
         0x0f => .{ .opcode = .buffer_load_dwordx3, .words = 3 },
         0x18 => .{ .opcode = .buffer_store_byte, .bits = 8 },
         0x1a => .{ .opcode = .buffer_store_short, .bits = 16 },
+        0x1b => .{ .opcode = .buffer_store_short_d16_hi, .bits = 16 },
         0x1c => .{ .opcode = .buffer_store_dword },
         0x1d => .{ .opcode = .buffer_store_dwordx2, .words = 2 },
         0x1e => .{ .opcode = .buffer_store_dwordx4, .words = 4 },

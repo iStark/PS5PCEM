@@ -681,6 +681,17 @@ The storage-reuse GPU probe retains 160 dirty views and checks all 320 writes
 in a larger batch. The previous eviction logic drops writes with
 `StorageImageCapacityExceeded` even with the increased entry ceiling.
 
+Three scene compute shaders (`0x8000196500`, `0x80001c0d00` and
+`0x80001abb00`) were skipped at their first `V_CMP_EQ_U64`. Their captured
+instruction streams also require `V_CMPX_GE_I16` and
+`BUFFER_STORE_SHORT_D16_HI`. All three operations now decode and lower;
+the store participates in buffer-write tracking and EXEC masking. Captured
+replay decodes all 7,768, 7,587 and 7,673 instructions respectively. A 64-lane
+GPU probe verifies full-width equality, signed halfword comparison, unchanged
+VCC and high-half stores that cross a dword boundary while preserving nearby
+bytes and inactive lanes. Decoder tests and packed-buffer/full Vulkan smoke
+checks pass under SDK validation.
+
 ## Baseline before the timestamp fix
 
 A five-minute run continues rendering after the movie, at approximately

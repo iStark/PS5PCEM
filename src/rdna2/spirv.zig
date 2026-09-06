@@ -7427,7 +7427,11 @@ const Builder = struct {
 
     fn bufferStoreSubword(self: *Builder, inst: instruction.Instruction, width: u8) Error!void {
         if (!try self.hasBufferStorage(inst)) return;
-        const value = try self.source(inst.dst, .bits32);
+        const raw_value = try self.source(inst.dst, .bits32);
+        const value = if (inst.opcode == .buffer_store_short_d16_hi)
+            try self.shiftRightBits(raw_value, 16)
+        else
+            raw_value;
         try self.storeBufferByte(try self.bufferAddress(inst), value);
         if (width == 16) {
             try self.storeBufferByte(
@@ -7565,6 +7569,7 @@ const Builder = struct {
 
     fn nonExecCompareOpcode(opcode: isa.Opcode) ?isa.Opcode {
         return switch (opcode) {
+            .v_cmpx_ge_i16 => .v_cmp_ge_i16,
             .v_cmpx_class_f32 => .v_cmp_class_f32,
             .v_cmpx_f_f32 => .v_cmp_f_f32,
             .v_cmpx_lt_f32 => .v_cmp_lt_f32,
@@ -7980,7 +7985,7 @@ const Builder = struct {
             .v_cmp_ne_u16 => try self.vectorComparisonI16(inst, 171, false),
             .v_cmp_ge_u16 => try self.vectorComparisonI16(inst, 174, false),
             .v_cmp_class_f32 => try self.vectorCompareClassF32(inst),
-            .v_cmp_eq_i64 => try self.vectorComparison64(inst, .eq),
+            .v_cmp_eq_i64, .v_cmp_eq_u64 => try self.vectorComparison64(inst, .eq),
             .v_cmp_ne_u64 => try self.vectorComparison64(inst, .ne),
             .v_cmp_gt_u64 => try self.vectorComparison64(inst, .gt_u),
             .buffer_load_ubyte => try self.bufferLoadSubword(inst, 8, false),
@@ -8024,7 +8029,7 @@ const Builder = struct {
             .s_buffer_load_dwordx16 => try self.scalarBufferLoadWords(inst, 16),
             .s_load_dword, .s_load_dwordx2, .s_load_dwordx4, .s_load_dwordx8, .s_load_dwordx16 => try self.scalarPointerLoadWords(inst),
             .buffer_store_byte => try self.bufferStoreSubword(inst, 8),
-            .buffer_store_short => try self.bufferStoreSubword(inst, 16),
+            .buffer_store_short, .buffer_store_short_d16_hi => try self.bufferStoreSubword(inst, 16),
             .buffer_store_format_d16_x => try self.bufferStoreFormatD16(inst, 1),
             .buffer_store_format_d16_xy => try self.bufferStoreFormatD16(inst, 2),
             .buffer_store_format_d16_xyz => try self.bufferStoreFormatD16(inst, 3),
@@ -9293,6 +9298,7 @@ fn opcodeUsesWritePredicate(opcode: isa.Opcode) bool {
     return switch (opcode) {
         .buffer_store_byte,
         .buffer_store_short,
+        .buffer_store_short_d16_hi,
         .buffer_store_dword,
         .buffer_store_dwordx2,
         .buffer_store_dwordx3,

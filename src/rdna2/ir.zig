@@ -281,6 +281,7 @@ fn classify(inst: instruction.Instruction) struct { Operation, ValueType } {
         .buffer_load_dwordx4,
         .buffer_store_byte,
         .buffer_store_short,
+        .buffer_store_short_d16_hi,
         .buffer_store_dword,
         .buffer_store_dwordx2,
         .buffer_store_dwordx3,

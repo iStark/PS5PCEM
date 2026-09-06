@@ -717,6 +717,58 @@ fn runVectorImageProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("vector image resources passed: masked descriptor tuples and readfirstlane waterfall\n", .{});
 }
 
+fn runSceneMaskProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const inputs = [_][2]u32{
+        .{ 0, 0 },           .{ 0, 1 },           .{ 1, 0 },           .{ 0xabcd_0001, 0 },
+        .{ 0x1234_ffff, 0 }, .{ 0x8000_0000, 0 }, .{ 0xffff_8000, 0 }, .{ 0xabcd_0000, 1 },
+    };
+    for (0..64) |lane| {
+        guest.word(0x10000 + lane * 8, inputs[lane % inputs.len][0]);
+        guest.word(0x10004 + lane * 8, inputs[lane % inputs.len][1]);
+    }
+    @memset(guest.bytes[0x11000..0x11400], 0xcc);
+    const code = [_]u32{
+        0xe034_2000, 0x8000_0200, // load v2:v3, indexed V#s0
+        0x7dc4_0480, // v_cmp_eq_u64 0, v2:v3
+        vop1(1, 5, 129),
+        0x0208_0a80, // v_cndmask_b32 v4, 0, v5
+        0xe070_2000,
+        0x8001_0400,
+        0x7d3d_00f9, 0x8606_0002, // v_cmpx_ge_i16 v2, 0 (SDWA)
+        0xe06c_2007, 0x8001_0200, // high half of v2, crossing a dword at byte 7
+        0xbefe_04c1, // restore EXEC
+        vop1(1, 5, 106),
+        0xe070_200c, 0x8001_0500, // CMPX must preserve the equality result in VCC
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 8 << 1);
+    for ([_]u32{ 0x10000, 8 << 16, 64, 0, 0x11000, 16 << 16, 64, 0 }, 0..) |word, i|
+        try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+    const report = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 1, 1, 1 });
+    try std.testing.expect(report.spirv_words != 0);
+    var output: [1024]u8 = undefined;
+    try renderer.readbackGuestStorageBuffer(0x11000, &output);
+    for (0..64) |lane| {
+        const input = inputs[lane % inputs.len];
+        const equal = input[0] == 0 and input[1] == 0;
+        var expected: [16]u8 = @splat(0xcc);
+        std.mem.writeInt(u32, expected[0..4], @intFromBool(equal), .little);
+        if (input[0] & 0x8000 == 0) std.mem.writeInt(u16, expected[7..9], @truncate(input[0] >> 16), .little);
+        std.mem.writeInt(u32, expected[12..16], if (equal) 0xffff_ffff else 0, .little);
+        try std.testing.expectEqualSlices(u8, &expected, output[lane * 16 ..][0..16]);
+    }
+    std.debug.print("scene masks passed: u64 equality, signed i16 CMPX, preserved VCC and masked high-half stores across 64 lanes\n", .{});
+}
+
 fn runStorageImageReuseProbe(allocator: std.mem.Allocator) !void {
     for ([_]usize{ 160, 320 }) |count| try runStorageImageReuseCase(allocator, count);
     std.debug.print("storage image reuse passed: 160 resident views and 320 queued writes under cache pressure\n", .{});
@@ -1853,6 +1905,10 @@ fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--scene-masks")) {
+        try runSceneMaskProbe(allocator);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--storage-reuse")) {
         try runStorageImageReuseProbe(allocator);
         return;
