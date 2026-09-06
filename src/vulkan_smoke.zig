@@ -717,6 +717,66 @@ fn runVectorImageProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("vector image resources passed: masked descriptor tuples and readfirstlane waterfall\n", .{});
 }
 
+fn runWave64Probe(allocator: std.mem.Allocator) !void {
+    for ([_][3]u32{ .{ 64, 1, 1 }, .{ 4, 4, 4 } }) |local_size| try runWave64Case(allocator, local_size);
+    std.debug.print("wave64 passed: lane 63, full masks, carry bits and uniform EXEC branches across workgroup shapes\n", .{});
+}
+
+fn runWave64Case(allocator: std.mem.Allocator, local_size: [3]u32) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    for (0..128) |lane| guest.word(0x10000 + lane * 4, @intCast(100 + lane));
+    const code = [_]u32{
+        0xd765_0000, 193 | (128 << 9),
+        0xd766_0000,     193 | (256 << 9), // flatten LocalInvocationId
+        vop1(1, 7, 256),
+        0xd746_0000, 8 | (134 << 9) | (256 << 18), // separate two guest waves' buffers
+        0xe030_2000, 0x8000_0100,
+        0xd760_0008,   257 | (191 << 9), // READLANE from guest lane 63
+        vop1(1, 2, 8),
+        0x7d88_0ea8, // V_CMP_GT_U32 40, v7
+        vop1(1, 3, 106),
+        vop1(1, 4, 107),
+        vop1(1, 6, 129),
+        0x020a_0c80,
+        0xe078_2000,
+        0x8001_0200,
+        0x500c_0c80, // ADDC selects this lane's carry bit from the complete VCC
+        0xe070_2014,
+        0x8001_0600,
+        0x7da6_0ea3, // CMPX: only guest lanes 35..63 remain
+        0xbf88_0001, // wave-wide EXECZ must keep every invocation together
+        vop1(2, 10, 257),
+        sop1(4, 126, 193),
+        vop1(1, 2, 10),
+        0xe070_2010,
+        0x8001_0200,
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+    var state = gpu.State{};
+    const stage = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, stage.programRegisterBase(), 1);
+    try state.writeRegister(.shader, stage.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, (8 << 1) | (1 << 7));
+    for ([_]u32{ 0x10000, 4 << 16, 128, 0, 0x11000, 24 << 16, 128, 0 }, 0..) |word, i|
+        try state.writeRegister(.shader, stage.userDataBase() + @as(u32, @intCast(i)), word);
+    _ = try renderer.dispatchRdna2State(&state, local_size, .{ 2, 1, 1 });
+    var output: [3072]u8 = undefined;
+    try renderer.readbackGuestStorageBuffer(0x11000, &output);
+    for (0..128) |lane| {
+        const base: u32 = @intCast((lane / 64) * 64);
+        const expected = [_]u32{ 163 + base, 0xffff_ffff, 0xff, @intFromBool(lane % 64 < 40), 135 + base, if (lane % 64 < 40) 2 else 1 };
+        for (expected, 0..) |word, component| {
+            const actual = std.mem.readInt(u32, output[lane * 24 + component * 4 ..][0..4], .little);
+            if (actual != word) std.debug.print("wave64 lane={d} component={d}: expected={d} actual={d}\n", .{ lane, component, word, actual });
+            try std.testing.expectEqual(word, actual);
+        }
+    }
+}
+
 fn runDppProbe(allocator: std.mem.Allocator) !void {
     const controls = [_]u16{ 0x103, 0x113, 0x123, 0x140, 0x141, 0x1b };
     for (0..20) |case| {
@@ -1994,6 +2054,10 @@ fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--wave64")) {
+        try runWave64Probe(allocator);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--dpp")) {
         try runDppProbe(allocator);
         return;

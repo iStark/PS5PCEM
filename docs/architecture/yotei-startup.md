@@ -729,8 +729,19 @@ row/bank write masks, boundary preservation/zeroing and inactive-source fetch
 control. Twenty GPU cases check all four guest rows and both halves of the
 64-bit permutation selector; the old left-shift case returns 100 instead of
 103 in lane zero. The corrected full lighting replay completes with clean SDK
-validation. Whole-wave READLANE and scalar mask semantics across host subgroups
-remain a separate limitation to investigate if the live lighting fault persists.
+validation.
+
+A further GPU probe confirmed that READLANE 63 returned lane 31's value on the
+RTX 3070 Ti. Compute programs which read the upper half of a single 64-thread
+workgroup now exchange values through workgroup scratch and retain complete
+64-bit comparison/EXEC masks. Scalar EXECZ branches test the whole mask, while
+conditional selection and arithmetic carry use the current lane's bit. This
+keeps workgroup barriers converged even when only lanes 35–63 are active.
+The GPU probe checks two independent groups in both `64 x 1 x 1` and `4 x 4 x 4`
+shapes; the complete captured lighting dispatch also finishes with clean SDK
+validation (387,667 SPIR-V words). The path is restricted to one guest wave per
+workgroup and excludes GDS kernels; other wave configurations still need work.
+Focused lane tests retain the pre-existing image-resinfo and DS-addtid failures.
 
 ## Baseline before the timestamp fix
 

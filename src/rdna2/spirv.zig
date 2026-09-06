@@ -233,6 +233,9 @@ pub const Options = struct {
     /// this separate from EXEC bookkeeping: graphics shaders commonly restore
     /// EXEC before an export, but an export does not need a subgroup input.
     uses_lane_identity: bool = false,
+    /// A single 64-lane compute wave can synchronize through its workgroup
+    /// when the host subgroup is smaller. Selected for cross-half READLANE.
+    wave64_workgroup: bool = false,
     sampled_images: []const SampledImageBinding = &.{},
     storage_images: []const StorageImageBinding = &.{},
     /// Amount of per-workgroup LDS made available by COMPUTE_PGM_RSRC2. DS
@@ -609,6 +612,9 @@ const Builder = struct {
     storage_block_pointer_type: u32 = 0,
     local_invocation_index: u32 = 0,
     subgroup_local_invocation_id: u32 = 0,
+    wave64_workgroup: bool = false,
+    wave_scratch: u32 = 0,
+    wave_word_pointer: u32 = 0,
     /// The execution mask, as low and high halves, once a shader has narrowed
     /// it. Null means untouched — every lane on — which is how a wave starts
     /// and needs no test emitted for it.
@@ -717,6 +723,7 @@ const Builder = struct {
             .ngg_lds_exports = options.ngg_lds_exports,
             .compute_inputs = options.compute_inputs,
             .local_size = options.local_size,
+            .wave64_workgroup = options.wave64_workgroup,
             .fragment_extent = options.fragment_extent,
             .scalar_specializations = options.scalar_registers,
             .dynamic_scalar_binding = options.dynamic_scalar_binding,
@@ -1167,6 +1174,18 @@ const Builder = struct {
             try self.emit(&self.declarations, 32, &.{ array_pointer_type, 4, array_type }); // ptr Workgroup array
             try self.emit(&self.declarations, 32, &.{ self.workgroup_word_pointer_type, 4, self.bits_type });
             try self.emit(&self.declarations, 59, &.{ array_pointer_type, self.workgroup_memory, 4 }); // OpVariable
+        }
+        if (options.wave64_workgroup) {
+            if (options.stage != .compute or @as(u64, options.local_size[0]) * options.local_size[1] * options.local_size[2] != 64)
+                return Error.InvalidStageInterface;
+            const array_type = self.id();
+            const array_pointer = self.id();
+            self.wave_word_pointer = self.id();
+            self.wave_scratch = self.id();
+            try self.emit(&self.declarations, 28, &.{ array_type, self.bits_type, try self.constant(.bits32, 64) });
+            try self.emit(&self.declarations, 32, &.{ array_pointer, 4, array_type });
+            try self.emit(&self.declarations, 32, &.{ self.wave_word_pointer, 4, self.bits_type });
+            try self.emit(&self.declarations, 59, &.{ array_pointer, self.wave_scratch, 4 });
         }
         if (options.private_memory_size_bytes != 0) {
             if (options.stage == .compute) return Error.InvalidStageInterface;
@@ -1837,10 +1856,8 @@ const Builder = struct {
         second.negate = false;
         const a = try self.source(first, .bits32);
         const b = try self.source(second, .bits32);
-        const carry_source = if (inst.src2.kind == .unknown)
-            try self.source(.{ .kind = .vcc_lo }, .bits32)
-        else
-            try self.source(inst.src2, .bits32);
+        const carry_operand: operand.Operand = if (inst.src2.kind == .unknown) .{ .kind = .vcc_lo } else inst.src2;
+        const carry_source = if (self.wave64_workgroup) try self.waveMaskBit(carry_operand) else try self.source(carry_operand, .bits32);
         const carry = try self.andBits(carry_source, 1);
         const partial = try self.addBits(a, b);
         const partial_carry = self.id();
@@ -1911,6 +1928,10 @@ const Builder = struct {
         if (try self.laneEnabled()) |enabled| {
             active_condition = self.id();
             try self.emit(&self.body, 167, &.{ self.bool_type, active_condition, enabled, condition }); // OpLogicalAnd
+        }
+        if (self.wave64_workgroup) {
+            try self.destinationPair(inst.dst, try self.waveBallot(active_condition));
+            return;
         }
         const mask = self.id();
         try self.emit(&self.body, 169, &.{ // OpSelect
@@ -2090,8 +2111,8 @@ const Builder = struct {
     }
 
     fn saveExec(self: *Builder, inst: instruction.Instruction, mode: SaveExecMode) Error!void {
-        const source_is_lane_predicate = inst.src0.kind == .vcc_lo or
-            (inst.src0.kind == .exec_lo and self.exec_mask_is_lane_predicate);
+        const source_is_lane_predicate = !self.wave64_workgroup and (inst.src0.kind == .vcc_lo or
+            (inst.src0.kind == .exec_lo and self.exec_mask_is_lane_predicate));
         const previous = try self.sourcePair(.{ .kind = .exec_lo });
         const predicate = try self.sourcePair(inst.src0);
         const active = [2]u32{
@@ -2107,8 +2128,8 @@ const Builder = struct {
     }
 
     fn saveExec32(self: *Builder, inst: instruction.Instruction, mode: SaveExecMode) Error!void {
-        const source_is_lane_predicate = inst.src0.kind == .vcc_lo or
-            (inst.src0.kind == .exec_lo and self.exec_mask_is_lane_predicate);
+        const source_is_lane_predicate = !self.wave64_workgroup and (inst.src0.kind == .vcc_lo or
+            (inst.src0.kind == .exec_lo and self.exec_mask_is_lane_predicate));
         const previous = try self.source(.{ .kind = .exec_lo }, .bits32);
         const predicate = try self.source(inst.src0, .bits32);
         const active = try self.combineExecWord(mode, previous, predicate);
@@ -3218,10 +3239,8 @@ const Builder = struct {
         second.negate = false;
         const a = try self.source(first, .bits32);
         const b = try self.source(second, .bits32);
-        const borrow_source = if (inst.src2.kind == .unknown)
-            try self.source(.{ .kind = .vcc_lo }, .bits32)
-        else
-            try self.source(inst.src2, .bits32);
+        const carry_operand: operand.Operand = if (inst.src2.kind == .unknown) .{ .kind = .vcc_lo } else inst.src2;
+        const borrow_source = if (self.wave64_workgroup) try self.waveMaskBit(carry_operand) else try self.source(carry_operand, .bits32);
         const borrow = try self.andBits(borrow_source, 1);
         const partial = self.id();
         try self.emit(&self.body, 130, &.{ self.bits_type, partial, b, a });
@@ -3567,7 +3586,7 @@ const Builder = struct {
         // dst = vcc ? src1 : src0  (lane-wise; we approximate VCC as a scalar bool).
         const false_val = try self.source(inst.src0, .bits32);
         const true_val = try self.source(inst.src1, .bits32);
-        const vcc = try self.source(inst.src2, .bits32);
+        const vcc = if (self.wave64_workgroup) try self.waveMaskBit(inst.src2) else try self.source(inst.src2, .bits32);
         const is_true = self.id();
         try self.emit(&self.body, 171, &.{ // OpINotEqual
             self.bool_type,
@@ -6458,8 +6477,78 @@ const Builder = struct {
         });
     }
 
+    fn wavePointer(self: *Builder, lane: u32) Error!u32 {
+        const pointer = self.id();
+        try self.emit(&self.body, 65, &.{ self.wave_word_pointer, pointer, self.wave_scratch, lane });
+        return pointer;
+    }
+
+    fn waveLoad(self: *Builder, lane: u32) Error!u32 {
+        const result = self.id();
+        const pointer = try self.wavePointer(lane);
+        try self.emit(&self.body, 61, &.{ self.bits_type, result, pointer });
+        return result;
+    }
+
+    fn waveShuffle(self: *Builder, value: u32, source_lane: u32) Error!u32 {
+        const pointer = try self.wavePointer(try self.currentLaneId());
+        try self.emit(&self.body, 62, &.{ pointer, value });
+        try self.controlBarrier();
+        const result = try self.waveLoad(try self.andBits(source_lane, 63));
+        // Every reader must finish before another instruction reuses scratch.
+        try self.controlBarrier();
+        return result;
+    }
+
+    fn waveBallot(self: *Builder, predicate: u32) Error![2]u32 {
+        const lane = try self.currentLaneId();
+        const pointer = try self.wavePointer(try self.shiftRightBits(lane, 5));
+        const scope = try self.constant(.bits32, 2);
+        const relaxed = try self.constant(.bits32, 0);
+        // Atomic initialization permits every invocation to participate without
+        // introducing a divergent branch around a workgroup barrier.
+        try self.emit(&self.body, 228, &.{ pointer, scope, relaxed, relaxed });
+        try self.controlBarrier();
+        const bit = self.id();
+        try self.emit(&self.body, 196, &.{ self.bits_type, bit, try self.constant(.bits32, 1), try self.andBits(lane, 31) });
+        const contribution = self.id();
+        try self.emit(&self.body, 169, &.{ self.bits_type, contribution, predicate, bit, relaxed });
+        const ignored = self.id();
+        try self.emit(&self.body, 241, &.{ self.bits_type, ignored, pointer, scope, relaxed, contribution });
+        try self.controlBarrier();
+        const result = [2]u32{
+            try self.waveLoad(try self.constant(.bits32, 0)),
+            try self.waveLoad(try self.constant(.bits32, 1)),
+        };
+        try self.controlBarrier();
+        return result;
+    }
+
+    fn waveMaskBit(self: *Builder, op: operand.Operand) Error!u32 {
+        const mask = try self.sourcePair(op);
+        const lane = try self.currentLaneId();
+        const half = self.id();
+        try self.emit(&self.body, 169, &.{ self.bits_type, half, try self.isNonZero(try self.shiftRightBits(lane, 5)), mask[1], mask[0] });
+        return self.andBits(try self.shiftRightVariable(half, try self.andBits(lane, 31)), 1);
+    }
+
+    fn waveFirstBit(self: *Builder, value: u32) Error!u32 {
+        const result = self.id();
+        try self.emit(&self.body, 12, &.{ self.bits_type, result, self.ensureGlslStd450(), 73, value });
+        return result;
+    }
+
     fn readFirstLane(self: *Builder, inst: instruction.Instruction) Error!void {
         const source_value = try self.source(inst.src0, .bits32);
+        if (self.wave64_workgroup) {
+            const mask = try self.sourcePair(.{ .kind = .exec_lo });
+            const low_bit = try self.waveFirstBit(mask[0]);
+            const high_bit = try self.addBits(try self.waveFirstBit(mask[1]), try self.constant(.bits32, 32));
+            const first = self.id();
+            try self.emit(&self.body, 169, &.{ self.bits_type, first, try self.isNonZero(mask[0]), low_bit, high_bit });
+            try self.destination(inst.dst, .{ .id = try self.waveShuffle(source_value, first), .value_type = .bits32 });
+            return;
+        }
         const result = self.id();
         try self.emit(&self.body, 338, &.{
             self.bits_type,
@@ -6473,6 +6562,10 @@ const Builder = struct {
     fn readLane(self: *Builder, inst: instruction.Instruction) Error!void {
         const source_value = try self.source(inst.src0, .bits32);
         const lane = try self.source(inst.src1, .bits32);
+        if (self.wave64_workgroup) {
+            try self.destination(inst.dst, .{ .id = try self.waveShuffle(source_value, lane), .value_type = .bits32 });
+            return;
+        }
         const result = self.id();
         try self.emit(&self.body, 345, &.{
             self.bits_type,
@@ -7565,6 +7658,10 @@ const Builder = struct {
         // `destination`.
         if (inst.family == .vopc or inst.family == .vop3) return false;
         if (inst.opcode != .s_mov_b64) return false;
+        if (self.wave64_workgroup) {
+            try self.destinationPair(inst.dst, try self.sourcePair(inst.src0));
+            return true;
+        }
 
         // Pixel prologs may restore EXEC from a hardware-provided SGPR pair
         // which is not part of USER_DATA. Vulkan has already selected the live
@@ -8273,6 +8370,14 @@ fn structuredCondition(builder: *Builder, condition: control_flow.Condition) Err
     return switch (condition) {
         .scc => if (builder.scc != 0) builder.scc else try falseCondition(builder),
         .vcc_zero, .exec_zero => blk: {
+            if (builder.wave64_workgroup) {
+                const mask = try builder.sourcePair(.{ .kind = if (condition == .vcc_zero) .vcc_lo else .exec_lo });
+                const combined = builder.id();
+                try builder.emit(&builder.body, 197, &.{ builder.bits_type, combined, mask[0], mask[1] });
+                const empty = builder.id();
+                try builder.emit(&builder.body, 168, &.{ builder.bool_type, empty, try builder.isNonZero(combined) });
+                break :blk empty;
+            }
             // One Vulkan invocation is one RDNA lane. V_CMP/CMPX write 0/~0
             // into VCC or EXEC for that invocation, so comparing the word with
             // zero is the lane predicate. When EXEC has been narrowed to a
@@ -9313,6 +9418,7 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
         if (variable != 0) try entry_point.append(allocator, variable);
     }
     if (builder.workgroup_memory != 0) try entry_point.append(allocator, builder.workgroup_memory);
+    if (builder.wave_scratch != 0) try entry_point.append(allocator, builder.wave_scratch);
     if (builder.private_memory != 0) try entry_point.append(allocator, builder.private_memory);
     for (builder.lane_spills.items) |spill| try entry_point.appendSlice(allocator, &.{ spill.value, spill.valid });
     if (builder.local_invocation_index != 0) try entry_point.append(allocator, builder.local_invocation_index);
@@ -9422,12 +9528,18 @@ fn translateInstructions(
 ) Error!Module {
     var effective = options;
     var has_predicated_write = false;
+    var cross_half_read = false;
+    var uses_gds = false;
     for (effective.ngg_lds_exports) |ngg_export| {
         if (effective.stage == .vertex and effective.vertex_parameter_sources.len == 0 and ngg_export.target >= 0x20 and ngg_export.target < 0x40) {
             effective.parameter_mask |= @as(u32, 1) << @intCast(ngg_export.target - 0x20);
         }
     }
     for (instructions) |candidate| {
+        if (candidate.opcode == .v_readlane_b32) {
+            if (constantWaveLane(candidate.src1)) |lane| cross_half_read = cross_half_read or lane >= 32;
+        }
+        uses_gds = uses_gds or candidate.gds;
         if (candidate.dst.kind == .exec_lo) effective.uses_execution_mask = true;
         if (candidate.opcode == .v_writelane_b32 or candidate.opcode == .v_readlane_b32 or
             candidate.opcode == .v_permlane16_b32 or candidate.opcode == .v_permlanex16_b32 or
@@ -9480,6 +9592,11 @@ fn translateInstructions(
     }
     effective.uses_lane_identity = effective.uses_lane_identity or effective.uses_execution_mask or
         (effective.uses_execution_mask and has_predicated_write);
+    if (effective.stage == .compute and @as(u64, effective.local_size[0]) * effective.local_size[1] * effective.local_size[2] == 64 and cross_half_read and !uses_gds) {
+        effective.wave64_workgroup = true;
+        effective.uses_lane_identity = true;
+        effective.uses_execution_mask = true;
+    }
     var builder = try Builder.init(allocator, effective);
     var builder_alive = true;
     defer if (builder_alive) builder.deinit();
