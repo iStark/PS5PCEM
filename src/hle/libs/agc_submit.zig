@@ -816,17 +816,19 @@ fn resolveSubmissionAlias(address: u64, byte_length: usize) ?u64 {
         const offset = low - alias_low;
         if (offset > alias.byte_length or length > alias.byte_length - offset) continue;
         // The arena itself was validated when the submission was accepted.
-        // isGuestRangeAccessible() only describes the reserved guest address
-        // space and can also return true for an uncommitted compact GPU VA,
-        // so it cannot distinguish the two mappings here.
+        // Callers use this fallback only after ruling out a readable full VA.
         return alias.cpu_address + offset;
     }
     return null;
 }
 
 fn resolveGuestMemoryAddress(address: u64, byte_length: usize) ?u64 {
-    return resolveSubmissionAlias(address, byte_length) orelse
-        if (memory.isGuestRangeAccessible(address, byte_length)) address else null;
+    // Shader/resource VAs can share their low 32 bits with a recent command
+    // arena. They must retain their full address. The accessibility predicate
+    // checks committed readable pages, so an unmapped compact label still
+    // falls back to its submitted CPU arena.
+    if (memory.isGuestRangeAccessible(address, byte_length)) return address;
+    return resolveSubmissionAlias(address, byte_length);
 }
 
 fn addressSpaceFromContext(context: ?*anyopaque) ?*guest_address_space.AddressSpace {
@@ -3804,6 +3806,10 @@ test "public DCB publishes exactly one completion class" {
 test "compact GPU label address resolves into submitted CPU arena" {
     reset();
     defer reset();
+    var address_space = try guest_address_space.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    memory.attachAddressSpace(&address_space);
+    defer memory.attachAddressSpace(null);
     var arena: [16]u32 = @splat(0);
     rememberSubmissionAlias(&arena);
 
@@ -3821,6 +3827,37 @@ test "compact GPU label address resolves into submitted CPU arena" {
     var observed: u32 = 0;
     try testing.expect(readGuestMemory(null, gpu_address, std.mem.asBytes(&observed)));
     try testing.expectEqual(value, observed);
+}
+
+test "full guest addresses win over matching command arena low bits" {
+    reset();
+    defer reset();
+    var address_space = try guest_address_space.AddressSpace.init(testing.allocator);
+    defer address_space.deinit();
+    memory.attachAddressSpace(&address_space);
+    defer memory.attachAddressSpace(null);
+    const arena_address = 0x2012340000;
+    const shader_address = 0x8012340000;
+    const page = guest_address_space.page_size;
+    try address_space.mapFixed(arena_address, page, .read_write, .private, null);
+    try address_space.mapFixed(shader_address, page, .read_write, .private, null);
+    const arena: [*]u32 = @ptrFromInt(arena_address);
+    const shader: [*]u32 = @ptrFromInt(shader_address);
+    arena[7] = 0xc00e1000;
+    shader[7] = 0x4130bb96;
+    rememberSubmissionAlias(arena[0..16]);
+    var word: u32 = 0;
+    try testing.expect(readGuestMemory(null, shader_address + 28, std.mem.asBytes(&word)));
+    try testing.expectEqual(@as(u32, 0x4130bb96), word);
+    word = 0xbf810000;
+    try testing.expect(writeGuestMemory(null, shader_address + 28, std.mem.asBytes(&word)));
+    try testing.expectEqual(word, shader[7]);
+    try testing.expectEqual(@as(u32, 0xc00e1000), arena[7]);
+    // Uncommitted compact addresses still resolve the arena, even when the
+    // logical address-space reservation covers them.
+    try address_space.reserveFixed(0x112340000, page);
+    try testing.expect(readGuestMemory(null, 0x11234001c, std.mem.asBytes(&word)));
+    try testing.expectEqual(@as(u32, 0xc00e1000), word);
 }
 
 test "GPU writes cannot overwrite a submitted allocation header" {

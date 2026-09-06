@@ -656,8 +656,12 @@ It then refused `0x801eb8de00` and lost the GPU in `0x80001fd400` at flip 912.
 Live memory inspection explains the decoder refusal: AGC's low-32-bit alias
 lookup redirected shader address `0x801eb96240` to command arena
 `0x201eb96240`, returning PM4 word `0xc00e1000` instead of instruction
-`0x4130bb96`. Address resolution must preserve accessible full guest VAs.
-The next full run must also validate the remaining GPU fault and menu output.
+`0x4130bb96`. Address resolution now checks the complete readable guest VA
+before using a compact command-arena alias. A regression test recreates the
+collision with two actual mapped pages: the old implementation reads PM4 as
+shader code; the fix preserves both reads and writes, while reserved compact
+label addresses still resolve correctly. The next full run must also
+validate the remaining GPU fault and menu output.
 
 ## Baseline before the timestamp fix
 
