@@ -709,6 +709,17 @@ header, user data and resources; a single workgroup completes, while the
 full `1 x 64 x 36` dispatch remains under investigation. Menu output is not
 yet verified.
 
+The standalone lighting replay exposed `VUID-vkCmdCopyBufferToImage-pRegions-00171`
+for base-only views of texture `0x509e780000`. Detiling produced one visible
+layer (1 MiB), but upload commands copied two or three physical layers because
+they reused the descriptor's last-slice extent. Uploads now use the staged
+view's layer count. The array-gradient GPU probe covers first slices 0, 1 and 2
+in RGBA8 and RG16 SNORM; its previous version produces four validation errors,
+while the fix preserves the sampled values without those errors. An offline
+replay of the complete `1 x 64 x 36` lighting dispatch also completes with clean
+SDK validation. Its captured CPU backing data does not reproduce every dirty
+resident image from the live frame, so a full game run remains necessary.
+
 ## Baseline before the timestamp fix
 
 A five-minute run continues rendering after the movie, at approximately

@@ -16988,7 +16988,9 @@ pub const Renderer = struct {
         else if (is_cube)
             6
         else if (is_2d_array)
-            descriptor.depth_or_layers
+            // Detiling has already rebased BASE_ARRAY to layer zero. The
+            // descriptor's depth includes preceding, invisible physical slices.
+            available_layers
         else
             1;
         const image_width = if (mip_plan) |plan| plan.texel_width else descriptor.width;

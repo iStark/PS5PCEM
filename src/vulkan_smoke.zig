@@ -1524,19 +1524,20 @@ fn runBc4Probe(allocator: std.mem.Allocator) !void {
 }
 
 fn runArrayGradientProbe(allocator: std.mem.Allocator) !void {
-    try runArrayGradientCase(allocator, 56);
-    try runArrayGradientCase(allocator, 24);
-    std.debug.print("array gradients passed: coordinate ordering, selected array layer and RG16 SNORM sampling\n", .{});
+    for ([_]u32{ 56, 24 }) |format| for (0..3) |first_layer| {
+        try runArrayGradientCase(allocator, format, @intCast(first_layer));
+    };
+    std.debug.print("array gradients passed: coordinate ordering, rebased array views and RG16 SNORM sampling\n", .{});
 }
 
-fn runArrayGradientCase(allocator: std.mem.Allocator, format: u32) !void {
+fn runArrayGradientCase(allocator: std.mem.Allocator, format: u32, first_layer: u32) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
     var guest = GuestMemory{};
     _ = renderer.dcbBackend(guest.interface());
     // GFX10 packs derivatives before the coordinate body. Distinct layers
     // make swapping the two payloads observably wrong even at mip zero.
-    const inputs = [_]f32{ 0.25, 0, 0, 0.25, 0.25, 0.75, 1 };
+    const inputs = [_]f32{ 0.25, 0, 0, 0.25, 0.25, 0.75, if (first_layer == 0) 1 else 0 };
     for (inputs, 0..) |value, index| {
         guest.word(0x100 + index * 8, vop1(1, @intCast(index), 255));
         guest.word(0x104 + index * 8, @bitCast(value));
@@ -1546,9 +1547,9 @@ fn runArrayGradientCase(allocator: std.mem.Allocator, format: u32) !void {
     var descriptor = sampledImageDescriptorWords(0x12000, 4, 4);
     descriptor[1] = (descriptor[1] & ~@as(u32, 0x1ff0_0000)) | (format << 20);
     descriptor[3] = (descriptor[3] & 0x0fff_ffff) | 0xd000_0000;
-    descriptor[4] = 1; // two array layers
+    descriptor[4] = @max(first_layer, 1); // physical last layer, inclusive
     const texture = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&descriptor));
-    for (0..2) |layer| {
+    for (0..descriptor[4] + 1) |layer| {
         const view = try texture.subresource(0, @intCast(layer), 1);
         for (0..4) |y| for (0..4) |x| {
             const offset = try view.sourceByteOffset(@intCast(x), @intCast(y), 0, 0);
@@ -1557,6 +1558,9 @@ fn runArrayGradientCase(allocator: std.mem.Allocator, format: u32) !void {
             else if (layer == 0) 0xff00_00ff else 0xff00_0040);
         };
     }
+    // A base-only view stages just its visible slices, even though the T#
+    // still records the physical last slice. Vulkan copies must use that span.
+    descriptor[4] |= first_layer << 16;
     var state = gpu.State{};
     const compute = gpu.resources.ShaderStage.compute;
     try state.writeRegister(.shader, compute.programRegisterBase(), 1);
