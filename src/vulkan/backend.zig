@@ -4682,7 +4682,7 @@ pub const Renderer = struct {
             resolve(memory.context, program_address)
         else
             null;
-        const analysis = try self.analyzedProgram(reader, program_address, header_address);
+        var analysis = try self.analyzedProgram(reader, program_address, header_address);
         if (self.fullscreenVideoActive() and !analysis.hasBufferExternalEffects()) {
             self.elided_dispatches += 1;
             self.noteComputeKind("covered-by-video");
@@ -4974,6 +4974,12 @@ pub const Renderer = struct {
             self.elided_dispatches += 1;
             return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
         }
+        // Re-evaluate uniform guards for every dispatch. A disabled output
+        // branch may retain a compressed input T# in the same SGPRs; staging
+        // that unreachable image_store would reject an otherwise valid kernel.
+        var specialized_analysis = try analysis.specializeUniformBranches(self.allocator, reader, &bindings);
+        defer if (specialized_analysis) |*value| value.deinit(self.allocator);
+        if (specialized_analysis) |*value| analysis = value;
         // A decoded `.unsupported` instruction guarantees that SPIR-V
         // translation will fail. Detect it before descriptor/image staging:
         // staging large transient resources for a shader that cannot execute

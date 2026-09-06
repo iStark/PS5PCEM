@@ -40,6 +40,32 @@ pub const Analysis = struct {
         self.code.deinit(allocator);
     }
 
+    /// Resource staging and SPIR-V must see exactly the same live branches.
+    /// This analysis is dispatch-local; the cached decoded shader stays intact.
+    pub fn specializeUniformBranches(
+        self: *const Analysis,
+        allocator: std.mem.Allocator,
+        reader: shaders.MemoryReader,
+        bindings: *const shaders.StageBindings,
+    ) !?Analysis {
+        var instructions = (try @import("scalar_provenance.zig").pruneUniformBranches(
+            allocator,
+            reader,
+            bindings,
+            self.program.instructions.items,
+            &self.graph,
+        )) orelse return null;
+        errdefer instructions.deinit(allocator);
+        var code: std.ArrayList(u32) = .empty;
+        errdefer code.deinit(allocator);
+        try code.appendSlice(allocator, self.code.items);
+        const program = rdna2.Program{ .code = code.items, .instructions = instructions };
+        var graph = try rdna2.buildControlFlow(allocator, &program);
+        errdefer graph.deinit(allocator);
+        const module = try rdna2.lowerIrWithOptions(allocator, &program, self.pipeline_options);
+        return .{ .code = code, .program = program, .graph = graph, .module = module, .pipeline_options = self.pipeline_options };
+    }
+
     pub fn opaqueInstructionCount(self: *const Analysis) usize {
         var result: usize = 0;
         for (self.module.nodes.items) |node| {

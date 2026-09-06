@@ -85,6 +85,164 @@ pub const Evaluation = struct {
     }
 };
 
+/// Prove only block-local, uniform guards from this dispatch's USER_DATA and
+/// checked scalar loads. The resource evaluator below deliberately follows a
+/// representative lane path; its register state is not a reachability proof.
+/// Unknown control flow keeps both successors. A USER_DATA register retains
+/// its entry value only if no predecessor path (including backedges) writes it.
+pub fn pruneUniformBranches(
+    allocator: std.mem.Allocator,
+    reader: shaders.MemoryReader,
+    bindings: *const shaders.StageBindings,
+    instructions: []const rdna2.Instruction,
+    graph: *const rdna2.control_flow.Graph,
+) !?std.ArrayList(rdna2.Instruction) {
+    var has_guard = false;
+    var invariant = Evaluation{};
+    const scalar_base: usize = bindings.scalar_user_data_base;
+    const available = @min(@as(usize, bindings.user_data_count), maximum_scalar_registers - scalar_base);
+    for (bindings.user_data[0..available], 0..) |word, index| {
+        invariant.registers[scalar_base + index] = .{ .known = true, .value = word, .sources = .{ .user_data = true } };
+    }
+    for (instructions, 0..) |inst, index| {
+        if (inst.opcode == .unknown or inst.opcode == .unsupported) return null;
+        if (inst.opcode == .s_setpc_b64) {
+            const target = rdna2.control_flow.resolveSetpcTargetInstructions(instructions, index) orelse return null;
+            if (graph.blockForPc(target) == null) return null;
+        }
+        switch (inst.opcode) {
+            .s_cbranch_cdbgsys, .s_cbranch_cdbguser, .s_cbranch_cdbgsys_or_user, .s_cbranch_cdbgsys_and_user, .s_setreg_b32 => return null,
+            else => {},
+        }
+        has_guard = has_guard or inst.opcode == .s_cbranch_scc0 or inst.opcode == .s_cbranch_scc1;
+    }
+    if (!has_guard or graph.blocks.items.len == 0) return null;
+    for (invariant.registers[106..]) |*value| value.* = .{};
+
+    const writes = try allocator.alloc(u128, graph.blocks.items.len);
+    defer allocator.free(writes);
+    const incoming_writes = try allocator.alloc(u128, graph.blocks.items.len);
+    defer allocator.free(incoming_writes);
+    @memset(incoming_writes, 0);
+    for (graph.blocks.items) |block| {
+        writes[block.index] = 0;
+        for (instructions[block.first_instruction..][0..block.instruction_count]) |inst| {
+            writes[block.index] |= uniformClobbers(inst);
+        }
+    }
+    var writes_changed = true;
+    while (writes_changed) {
+        writes_changed = false;
+        for (graph.edges.items) |edge| {
+            const merged = incoming_writes[edge.to] | incoming_writes[edge.from] | writes[edge.from];
+            if (merged == incoming_writes[edge.to]) continue;
+            incoming_writes[edge.to] = merged;
+            writes_changed = true;
+        }
+    }
+
+    const decisions = try allocator.alloc(?bool, graph.blocks.items.len);
+    defer allocator.free(decisions);
+    @memset(decisions, null);
+    var proven: usize = 0;
+    for (graph.blocks.items) |block| {
+        var block_invariant = invariant.registers;
+        for (&block_invariant, 0..) |*value, index| {
+            if (incoming_writes[block.index] & (@as(u128, 1) << @intCast(index)) != 0) value.* = .{};
+        }
+        var local = Evaluation{ .registers = block_invariant };
+        var scc: ?bool = null;
+        const end = block.first_instruction + block.instruction_count;
+        for (instructions[block.first_instruction..end]) |inst| {
+            const clobbers = uniformClobbers(inst);
+            for (&block_invariant, 0..) |*value, index| {
+                if (clobbers & (@as(u128, 1) << @intCast(index)) != 0) value.* = .{};
+            }
+            switch (inst.opcode) {
+                .s_load_dword, .s_load_dwordx2, .s_load_dwordx4, .s_load_dwordx8, .s_load_dwordx16 => {
+                    _ = executeSmem(&local, reader, bindings, inst);
+                },
+                .s_mov_b32, .s_mov_b64, .s_movk_i32 => executeScalar(&local, bindings.program_address, inst, &scc),
+                .s_cmp_eq_i32,
+                .s_cmp_lg_i32,
+                .s_cmp_gt_i32,
+                .s_cmp_ge_i32,
+                .s_cmp_lt_i32,
+                .s_cmp_le_i32,
+                .s_cmp_eq_u32,
+                .s_cmp_lg_u32,
+                .s_cmp_gt_u32,
+                .s_cmp_ge_u32,
+                .s_cmp_lt_u32,
+                .s_cmp_le_u32,
+                => executeScalar(&local, bindings.program_address, inst, &scc),
+                .s_nop, .s_waitcnt => {},
+                .s_cbranch_scc0, .s_cbranch_scc1 => if (scc) |value| {
+                    decisions[block.index] = value == (inst.opcode == .s_cbranch_scc1);
+                    proven += 1;
+                },
+                else => {
+                    // No guessed ALU results, stale SCC, or values carried
+                    // across vector operations/indirect scalar writes.
+                    local.registers = block_invariant;
+                    scc = null;
+                },
+            }
+        }
+    }
+    if (proven == 0) return null;
+
+    const reachable = try allocator.alloc(bool, graph.blocks.items.len);
+    defer allocator.free(reachable);
+    @memset(reachable, false);
+    reachable[0] = true;
+    // Edges are emitted in source-block order. Revisit backedges until the
+    // reachable set stabilizes, retaining alternative entries into a region.
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (graph.edges.items) |edge| {
+            if (!reachable[edge.from] or reachable[edge.to]) continue;
+            if (decisions[edge.from]) |taken| {
+                if (taken != (edge.kind == .branch)) continue;
+            }
+            reachable[edge.to] = true;
+            changed = true;
+        }
+    }
+    var result: std.ArrayList(rdna2.Instruction) = .empty;
+    errdefer result.deinit(allocator);
+    try result.appendSlice(allocator, instructions);
+    for (graph.blocks.items) |block| {
+        const end = block.first_instruction + block.instruction_count;
+        if (!reachable[block.index]) {
+            for (result.items[block.first_instruction..end]) |*inst| {
+                if (!inst.opcode.isProgramEnd()) makeNop(inst);
+            }
+        } else if (decisions[block.index]) |taken| {
+            const branch = &result.items[end - 1];
+            if (taken) branch.opcode = .s_branch else makeNop(branch);
+        }
+    }
+    return result;
+}
+
+fn uniformClobbers(inst: rdna2.Instruction) u128 {
+    var mask: u128 = 0;
+    // Over-approximate explicit multi-register definitions, including wide
+    // VALU masks. Implicit VCC/EXEC never enter the invariant USER_DATA set.
+    for ([_]rdna2.Operand{ inst.dst, inst.dst2 }) |destination| {
+        const first = scalarRegisterIndex(destination) orelse continue;
+        for (first..@min(first + 16, maximum_scalar_registers)) |index| mask |= @as(u128, 1) << @intCast(index);
+    }
+    return mask;
+}
+
+fn makeNop(inst: *rdna2.Instruction) void {
+    // Keep byte positions and source encoding for branch targets/diagnostics.
+    inst.* = .{ .pc = inst.pc, .word = inst.word, .word_count = inst.word_count, .raw = inst.raw, .raw_count = inst.raw_count, .family = .sopp, .opcode = .s_nop };
+}
+
 pub fn evaluatePrefix(reader: shaders.MemoryReader, bindings: *const shaders.StageBindings) Evaluation {
     return evaluate(reader, bindings, null, false, null, null);
 }
@@ -971,6 +1129,80 @@ fn testBindings(program: u64, srt: u64) shaders.StageBindings {
         .srt_address = srt,
         .direct_pointers = .{},
     };
+}
+
+test "uniform resource guard is specialized independently for each dispatch" {
+    var storage = [_]u8{0} ** 16;
+    var memory = TestMemory{ .base = 0x1000, .bytes = &storage };
+    const bindings = testBindings(0x2000, 0x1000);
+    const code = [_]u32{
+        0xf400_1a80, 125 << 25, // s_load_dword vcc_lo, s0:s1
+        0xbefe_04c1, // s_mov_b64 exec, -1 (preserves SCC and VCC)
+        0xbf8c_007f, // s_waitcnt
+        0xbf07_6a80, // s_cmp_lg_u32 0, vcc_lo
+        0xbf84_0002, // s_cbranch_scc0 end
+        0xf020_0f28, 0x0002_0400, // conditional image_store
+        0xbf81_0000,
+    };
+    var program = try rdna2.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var graph = try rdna2.buildControlFlow(std.testing.allocator, &program);
+    defer graph.deinit(std.testing.allocator);
+    for ([_]u32{ 0, 1, 0, 1 }) |enabled| {
+        memory.write(0x1000, enabled);
+        var specialized = (try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, program.instructions.items, &graph)).?;
+        defer specialized.deinit(std.testing.allocator);
+        try std.testing.expectEqual(if (enabled == 0) rdna2.Opcode.s_nop else .image_store, specialized.items[5].opcode);
+        try std.testing.expectEqual(if (enabled == 0) rdna2.Opcode.s_branch else .s_nop, specialized.items[4].opcode);
+        try std.testing.expectEqual(rdna2.Opcode.image_store, program.instructions.items[5].opcode);
+    }
+    memory.base = 0x3000; // An unreadable flag cannot prove either successor.
+    try std.testing.expect((try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, program.instructions.items, &graph)) == null);
+}
+
+test "uniform pruning keeps alternate entries and rejects stale or predecessor scalar values" {
+    var storage = [_]u8{0} ** 16;
+    var memory = TestMemory{ .base = 0x1000, .bytes = &storage };
+    const bindings = testBindings(0x2000, 0x1000);
+    var instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_cbranch_execz, .branch_target = 16 },
+        .{ .pc = 4, .opcode = .s_load_dword, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .sgpr, .reg = 0 }, .src1 = .{ .kind = .integer_inline_constant }, .data_words = 1 },
+        .{ .pc = 8, .opcode = .s_cmp_lg_u32, .src0 = .{ .kind = .sgpr, .reg = 8 }, .src1 = .{ .kind = .integer_inline_constant }, .src_count = 2 },
+        .{ .pc = 12, .opcode = .s_cbranch_scc0, .branch_target = 20 },
+        .{ .pc = 16, .opcode = .image_store },
+        .{ .pc = 20, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    var specialized = (try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &graph)).?;
+    defer specialized.deinit(std.testing.allocator);
+    try std.testing.expectEqual(rdna2.Opcode.s_branch, specialized.items[3].opcode);
+    try std.testing.expectEqual(rdna2.Opcode.image_store, specialized.items[4].opcode);
+
+    // A loop-carried overwrite must invalidate the entry SRT pointer.
+    instructions[4] = .{ .pc = 16, .opcode = .s_mov_b64, .dst = .{ .kind = .sgpr, .reg = 0 } };
+    instructions[5] = .{ .pc = 20, .opcode = .s_branch, .branch_target = 4 };
+    var loop_graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer loop_graph.deinit(std.testing.allocator);
+    try std.testing.expect((try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &loop_graph)) == null);
+    // A later overwrite with no return path does not poison an earlier guard.
+    instructions[5] = .{ .pc = 20, .opcode = .s_endpgm };
+    var late_write = (try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &graph)).?;
+    defer late_write.deinit(std.testing.allocator);
+    instructions[4] = .{ .pc = 16, .opcode = .image_store };
+    // Neither unsupported scalar arithmetic nor 64-bit comparisons can reuse
+    // an old/partial SCC result as a proof.
+    for ([_]rdna2.Opcode{ .s_add_u32, .s_cmp_lg_u64 }) |opcode| {
+        instructions[2].opcode = opcode;
+        try std.testing.expect((try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &graph)) == null);
+    }
+    instructions[0] = instructions[1];
+    instructions[0].pc = 0;
+    instructions[1] = .{ .pc = 4, .opcode = .s_cmp_lg_u32, .src0 = .{ .kind = .sgpr, .reg = 8 }, .src1 = .{ .kind = .integer_inline_constant }, .src_count = 2 };
+    instructions[2] = .{ .pc = 8, .opcode = .s_add_u32, .dst = .{ .kind = .sgpr, .reg = 9 }, .src0 = .{ .kind = .sgpr, .reg = 10 }, .src1 = .{ .kind = .sgpr, .reg = 11 }, .src_count = 2 };
+    var stale_graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer stale_graph.deinit(std.testing.allocator);
+    try std.testing.expect((try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &stale_graph)) == null);
 }
 
 test "scalar provenance follows an SRT pointer through ALU and SMEM" {

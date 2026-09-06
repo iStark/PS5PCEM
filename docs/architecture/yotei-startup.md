@@ -180,9 +180,9 @@ VUID reports. In-game, the loader reaches state 32 after about 4.5 minutes.
 Some variants of `0x80002c4500` still reject the store at `0x14d8`: a second
 live SRT at `0x2011ad1cb0` has its output-enable flag set to zero. Evaluation
 correctly skips the output-descriptor loads, but resource staging still
-visits the inactive store and falls back to an earlier BC7 input. The next
-step is to carry proven uniform branch reachability into resource binding
-and translation; treating compressed formats as writable images would not
+visits the inactive store and falls back to an earlier BC7 input. The uniform
+output-guard fix below carries proven reachability into resource binding and
+translation; treating compressed formats as writable images would not
 address this case.
 
 The final seven-minute launch reaches flip 703 and about 1,900 resolved
@@ -223,6 +223,49 @@ two enabled channels at PC `0x344`.
 
 A final normal launch still decodes all 582 intro pictures at the original
 33.37 ms cadence. Synchronous shader diagnostics are kept opt-in.
+
+## Uniform output guards
+
+Compute dispatch now proves block-local scalar guards from the current
+USER_DATA snapshot and checked scalar loads before staging resources. A
+control-flow dataflow pass excludes entry registers written on any incoming
+path, including loop backedges. Unknown ALU results, unreadable flags and
+unresolved indirect control flow cannot prove a branch. A later register
+overwrite with no return path does not invalidate an earlier guard.
+
+Proven branches and unreachable instructions are specialized in an owned,
+dispatch-local analysis shared by resource staging and SPIR-V translation.
+The decoded shader cache remains reusable when a flag changes. Unknown wave
+branches retain both successors; alternate entries into a guarded region
+prevent its removal.
+
+The captured `0x80002c4500` shader now removes the store at `0x14d8` when
+SRT+472 is zero and retains it when the flag is one, despite the later reuse
+of s0 at `0x2bb8`. The Vulkan array-copy probe exercises flags `0, 1, 0, 1`
+with the same shader and reused T# registers. A separate unconditional buffer
+write proves each dispatch executes; disabled stores preserve the output,
+and enabled stores copy the green texel from the compressed array input.
+
+All 59 scalar-provenance and imported unit tests pass. Full Vulkan, buffer
+reuse and array-image probes pass on the RTX 3070 Ti with SDK 1.4.357.0's
+validation layer loaded, without VUID reports.
+
+The game completes its intro at the original cadence and no longer reports
+the inactive `0x14d8` store failure. This launch spends several minutes in
+loader state 29 with 32 pending requests, then completes the batch and reaches
+state 32 after about nine minutes. Both inspected SDK queue generations have
+matching CPU completion labels during that delay. Scene frames reach 55 draw
+attempts and hundreds of dispatches, but still take roughly 7–9 seconds and
+produce a black window. The final capture at flip 779, after twelve minutes,
+remains in state 32; no device loss or aborted queue was observed.
+
+The remaining array-store failures are in **fragment** programs, not an
+unsupported two-channel compute store. For example, `0x8038783800` contains an
+`image_store` at `0x344` with dmask 3, followed by the color path. The translator
+rejects image stores outside compute; graphics translation also does not pass
+storage-image mappings, and their descriptor-layout bindings are visible only
+to compute. This requires a graphics storage-image implementation (including
+lane predicates and resource lifetime), not merely accepting the opcode.
 
 ## Baseline before the timestamp fix
 

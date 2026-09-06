@@ -414,10 +414,19 @@ fn runCompressedArrayCopyKernel(allocator: std.mem.Allocator, renderer: *vulkan.
         for (descriptor, 0..) |word, slot| guest.word(table + index * 32 + slot * 4, word);
     }
     for (0..4) |index| guest.word(table + 64 + index * 4, 0); // nearest sampler
+    const marker = 0xc000;
+    for ([_]u32{ marker, 4 << 16, 4, 0 }, 0..) |word, index| guest.word(table + 80 + index * 4, word);
     const fetch_code = [_]u32{
         0xf40c_0200, 125 << 25, // T# s8:s15 = compressed input
+        0xf408_0600, (125 << 25) | 80, // V# s24:s27 = completion marker
         vop1(1, 0, 128), vop1(1, 1, 128), vop1(1, 2, 129), // texel (0,0,1)
         0xf000_0f28, 0x0002_0400, // array load v4:v7
+        0xe070_0000, 0x8006_0500, // unconditional marker = green (1.0)
+        0xf400_1a80, (125 << 25) | 64, // s_load_dword vcc_lo, output enabled
+        0xbefe_04c1, // s_mov_b64 exec, -1
+        0xbf8c_007f, // s_waitcnt
+        0xbf07_6a80, // s_cmp_lg_u32 0, vcc_lo
+        0xbf84_0004, // skip output descriptor setup AND store when disabled
         0xf40c_0200, (125 << 25) | 32, // same SGPRs now name the output
         0xf020_0f28, 0x0002_0400, // array store v4:v7
         0xbf81_0000,
@@ -448,11 +457,20 @@ fn runCompressedArrayCopyKernel(allocator: std.mem.Allocator, renderer: *vulkan.
     try state.writeRegister(.shader, 0x209, 1);
     const stream = [_]u32{ command(gpu.pm4.dispatch_direct, 4), 1, 1, 1, 0x41 };
     var executor = gpu.DcbExecutor{ .state = &state, .backend = backend, .allocator = allocator };
-    _ = try executor.execute(&stream);
-    try renderer.flushPendingGuestWrites();
     const result = destination + @as(usize, @intCast(output_view.source_layer_bytes));
     const expected: [4]u8 = if (gather) .{ 255, 255, 255, 255 } else .{ 0, 255, 0, 255 };
-    try std.testing.expectEqualSlices(u8, &expected, guest.bytes[result..][0..4]);
+    const flags: []const u32 = if (gather) &.{0} else &.{ 0, 1, 0, 1 };
+    for (flags, 0..) |enabled, index| {
+        guest.word(table + 64, enabled);
+        guest.word(marker, 0);
+        _ = try executor.execute(&stream);
+        try renderer.flushPendingGuestWrites();
+        if (!gather) {
+            try std.testing.expectEqual(@as(u32, 0x3f80_0000), std.mem.readInt(u32, guest.bytes[marker..][0..4], .little));
+        }
+        const pixel: []const u8 = if (!gather and index == 0) &.{ 0, 0, 0, 0 } else &expected;
+        try std.testing.expectEqualSlices(u8, pixel, guest.bytes[result..][0..4]);
+    }
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, guest.bytes[destination..][0..4]);
 }
 
@@ -616,7 +634,7 @@ pub fn main(init: std.process.Init) !void {
         try runCompressedArrayCopyKernel(allocator, &renderer, &guest, backend, false);
         try runCompressedArrayCopyKernel(allocator, &renderer, &guest, backend, true);
         std.debug.print(
-            "images passed: storage copy, compute sample, compressed array fetch and gather with descriptor SGPR reuse\n",
+            "images passed: storage copy, compute sample, compressed array fetch/gather, uniform output guard 0/1/0/1 with descriptor SGPR reuse\n",
             .{},
         );
         return;
