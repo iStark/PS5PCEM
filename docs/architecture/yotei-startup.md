@@ -743,6 +743,16 @@ validation (387,667 SPIR-V words). The path is restricted to one guest wave per
 workgroup and excludes GDS kernels; other wave configurations still need work.
 Focused lane tests retain the pre-existing image-resinfo and DS-addtid failures.
 
+The next full run loads all 6,042 startup resources in about 30 minutes and
+continues beyond the former lighting device-loss point, but still presents
+black frames. Three scene compute programs refuse nested FLAT addressing.
+Their captured dispatch flags are 56: the first collision branch is disabled.
+Uniform branch specialization now evaluates `S_BITCMP0/1_B32` and 32-bit
+logical operations, including SCC and unknown-operand invalidation. Captured
+replays remove 15 of 38 FLAT reads in each program without missing memory;
+23 real pointer reads remain and are not replaced by zero. All 68 scalar
+provenance/module tests and the 62 captured material resource cases pass.
+
 ## Baseline before the timestamp fix
 
 A five-minute run continues rendering after the movie, at approximately

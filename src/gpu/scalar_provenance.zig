@@ -226,6 +226,16 @@ pub fn pruneUniformBranches(
                     .s_cmp_ge_u32,
                     .s_cmp_lt_u32,
                     .s_cmp_le_u32,
+                    .s_bitcmp0_b32,
+                    .s_bitcmp1_b32,
+                    .s_and_b32,
+                    .s_or_b32,
+                    .s_xor_b32,
+                    .s_andn2_b32,
+                    .s_orn2_b32,
+                    .s_nand_b32,
+                    .s_nor_b32,
+                    .s_xnor_b32,
                     => executeScalar(&local, bindings.program_address, inst, &scc),
                     .s_nop, .s_waitcnt, .s_inst_prefetch, .s_branch, .s_endpgm, .s_code_end => {},
                     .s_cbranch_scc0, .s_cbranch_scc1 => if (scc) |value| {
@@ -820,6 +830,19 @@ fn setpcDestinationPc(result: *const Evaluation, program_address: u64, inst: rdn
 }
 
 fn executeScalar(result: *Evaluation, program_address: u64, inst: rdna2.Instruction, scc: *?bool) void {
+    if (isBitwise32(inst.opcode)) {
+        const a = source(result, inst.src0);
+        const b = source(result, inst.src1);
+        if (a == null or b == null) {
+            invalidateDestination(result, inst.dst, 1);
+            scc.* = null;
+            return;
+        }
+        const value = bitwise32(inst.opcode, a.?.value, b.?.value);
+        write(result, inst.dst, value, Sources.merge(a.?.sources, b.?.sources), inst.pc);
+        scc.* = value != 0;
+        return;
+    }
     if (inst.opcode == .s_cselect_b32 or inst.opcode == .s_cselect_b64) {
         const selected = if (scc.*) |condition| (if (condition) inst.src0 else inst.src1) else {
             invalidateDestination(result, inst.dst, destinationWords(inst.opcode));
@@ -936,14 +959,6 @@ fn executeScalar(result: *Evaluation, program_address: u64, inst: rdna2.Instruct
         .s_pack_ll_b32_b16 => (a.value & 0xffff) | (bv << 16),
         .s_pack_lh_b32_b16 => (a.value & 0xffff) | (bv & 0xffff_0000),
         .s_pack_hh_b32_b16 => (a.value >> 16) | (bv & 0xffff_0000),
-        .s_and_b32 => a.value & bv,
-        .s_or_b32 => a.value | bv,
-        .s_xor_b32 => a.value ^ bv,
-        .s_andn2_b32 => a.value & ~bv,
-        .s_orn2_b32 => a.value | ~bv,
-        .s_nand_b32 => ~(a.value & bv),
-        .s_nor_b32 => ~(a.value | bv),
-        .s_xnor_b32 => ~(a.value ^ bv),
         .s_lshl_b32 => a.value << @truncate(bv & 31),
         .s_lshr_b32 => a.value >> @truncate(bv & 31),
         .s_ashr_i32 => @bitCast(@as(i32, @bitCast(a.value)) >> @truncate(bv & 31)),
@@ -1194,8 +1209,29 @@ fn destinationWords(opcode: rdna2.Opcode) u8 {
 
 fn isComparison(opcode: rdna2.Opcode) bool {
     return switch (opcode) {
-        .s_cmp_eq_i32, .s_cmp_lg_i32, .s_cmp_gt_i32, .s_cmp_ge_i32, .s_cmp_lt_i32, .s_cmp_le_i32, .s_cmp_eq_u32, .s_cmp_lg_u32, .s_cmp_gt_u32, .s_cmp_ge_u32, .s_cmp_lt_u32, .s_cmp_le_u32, .s_cmp_eq_u64, .s_cmp_lg_u64 => true,
+        .s_cmp_eq_i32, .s_cmp_lg_i32, .s_cmp_gt_i32, .s_cmp_ge_i32, .s_cmp_lt_i32, .s_cmp_le_i32, .s_cmp_eq_u32, .s_cmp_lg_u32, .s_cmp_gt_u32, .s_cmp_ge_u32, .s_cmp_lt_u32, .s_cmp_le_u32, .s_cmp_eq_u64, .s_cmp_lg_u64, .s_bitcmp0_b32, .s_bitcmp1_b32 => true,
         else => false,
+    };
+}
+
+fn isBitwise32(opcode: rdna2.Opcode) bool {
+    return switch (opcode) {
+        .s_and_b32, .s_or_b32, .s_xor_b32, .s_andn2_b32, .s_orn2_b32, .s_nand_b32, .s_nor_b32, .s_xnor_b32 => true,
+        else => false,
+    };
+}
+
+fn bitwise32(opcode: rdna2.Opcode, a: u32, b: u32) u32 {
+    return switch (opcode) {
+        .s_and_b32 => a & b,
+        .s_or_b32 => a | b,
+        .s_xor_b32 => a ^ b,
+        .s_andn2_b32 => a & ~b,
+        .s_orn2_b32 => a | ~b,
+        .s_nand_b32 => ~(a & b),
+        .s_nor_b32 => ~(a | b),
+        .s_xnor_b32 => ~(a ^ b),
+        else => unreachable,
     };
 }
 
@@ -1213,6 +1249,8 @@ fn compare(opcode: rdna2.Opcode, a: u32, b: u32) bool {
         .s_cmp_ge_u32 => a >= b,
         .s_cmp_lt_u32 => a < b,
         .s_cmp_le_u32 => a <= b,
+        .s_bitcmp0_b32 => (a >> @as(u5, @truncate(b))) & 1 == 0,
+        .s_bitcmp1_b32 => (a >> @as(u5, @truncate(b))) & 1 != 0,
         else => false,
     };
 }
@@ -1370,6 +1408,81 @@ test "uniform resource guard is specialized independently for each dispatch" {
     }
     memory.base = 0x3000; // An unreadable flag cannot prove either successor.
     try std.testing.expect((try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, program.instructions.items, &graph)) == null);
+}
+
+test "uniform bit guards prune only the selected dispatch branch" {
+    var storage = [_]u8{0} ** 16;
+    var memory = TestMemory{ .base = 0x1000, .bytes = &storage };
+    const bindings = testBindings(0x2000, 0x1000);
+    var instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .family = .sopc, .opcode = .s_cmp_eq_u32, .src0 = .{ .kind = .integer_inline_constant }, .src1 = .{ .kind = .integer_inline_constant }, .src_count = 2 },
+        .{ .pc = 4, .opcode = .s_load_dword, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .integer_inline_constant }, .data_words = 1 },
+        .{ .pc = 8, .family = .sopc, .opcode = .s_bitcmp1_b32, .src0 = .{ .kind = .sgpr, .reg = 8 }, .src1 = .{ .kind = .integer_inline_constant }, .src_count = 2 },
+        .{ .pc = 12, .opcode = .s_cbranch_scc0, .branch_target = 24 },
+        .{ .pc = 16, .opcode = .flat_load_dword, .dst = .{ .kind = .vgpr }, .src0 = .{ .kind = .vgpr }, .data_words = 1 },
+        .{ .pc = 20, .opcode = .s_branch, .branch_target = 28 },
+        .{ .pc = 24, .opcode = .image_store },
+        .{ .pc = 28, .opcode = .buffer_store_dword },
+        .{ .pc = 32, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    for ([_]rdna2.Opcode{ .s_bitcmp0_b32, .s_bitcmp1_b32, .s_and_b32 }) |opcode| {
+        instructions[2].opcode = opcode;
+        instructions[2].dst = .{ .kind = .sgpr, .reg = 10 };
+        for ([_]u32{ 0, 31, 32, 63 }) |bit| {
+            instructions[2].src1.value = if (opcode == .s_and_b32) @as(u32, 1) << @as(u5, @truncate(bit)) else bit;
+            for ([_]u32{ 0, 56, 1, 0x8000_0000 }) |flags| {
+                memory.write(0x1000, flags);
+                const set = (flags & (@as(u32, 1) << @as(u5, @truncate(bit)))) != 0;
+                const execute_flat = set == (opcode != .s_bitcmp0_b32);
+                var specialized = (try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &graph)).?;
+                defer specialized.deinit(std.testing.allocator);
+                try std.testing.expectEqual(if (execute_flat) rdna2.Opcode.flat_load_dword else .s_nop, specialized.items[4].opcode);
+                try std.testing.expectEqual(if (execute_flat) rdna2.Opcode.s_nop else .image_store, specialized.items[6].opcode);
+                try std.testing.expectEqual(rdna2.Opcode.buffer_store_dword, specialized.items[7].opcode);
+            }
+        }
+        // An unreadable flag must clear the preceding comparison's SCC.
+        memory.base = 0x3000;
+        try std.testing.expect((try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &graph)) == null);
+        memory.base = 0x1000;
+        // The bit selector can be unknown independently of the flag word.
+        instructions[2].src1 = .{ .kind = .sgpr, .reg = 9 };
+        try std.testing.expect((try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &graph)) == null);
+        instructions[2].src1 = .{ .kind = .integer_inline_constant };
+    }
+}
+
+test "scalar logical results update SCC and forget unknown operands" {
+    const cases = [_]struct { opcode: rdna2.Opcode, a: u32, b: u32, value: u32 }{
+        .{ .opcode = .s_and_b32, .a = 56, .b = 1, .value = 0 },
+        .{ .opcode = .s_or_b32, .a = 1, .b = 2, .value = 3 },
+        .{ .opcode = .s_xor_b32, .a = 7, .b = 7, .value = 0 },
+        .{ .opcode = .s_andn2_b32, .a = 7, .b = 2, .value = 5 },
+        .{ .opcode = .s_orn2_b32, .a = 0, .b = 0xffff_ffff, .value = 0 },
+        .{ .opcode = .s_nand_b32, .a = 0xffff_ffff, .b = 0xffff_ffff, .value = 0 },
+        .{ .opcode = .s_nor_b32, .a = 1, .b = 2, .value = 0xffff_fffc },
+        .{ .opcode = .s_xnor_b32, .a = 0xffff_ffff, .b = 0, .value = 0 },
+    };
+    for (cases) |c| {
+        var state = Evaluation{};
+        var scc: ?bool = c.value == 0;
+        var inst = rdna2.Instruction{ .opcode = c.opcode, .dst = .{ .kind = .sgpr, .reg = 8 }, .src0 = .{ .kind = .literal_constant, .value = c.a }, .src1 = .{ .kind = .literal_constant, .value = c.b }, .src_count = 2 };
+        executeScalar(&state, 0, inst, &scc);
+        try std.testing.expectEqual(c.value, state.register(8).?.value);
+        try std.testing.expectEqual(@as(?bool, c.value != 0), scc);
+        inst.src1 = .{ .kind = .sgpr, .reg = 9 };
+        executeScalar(&state, 0, inst, &scc);
+        try std.testing.expectEqual(@as(?bool, null), scc);
+        try std.testing.expect(state.register(8) == null);
+        inst.src1 = .{ .kind = .literal_constant, .value = c.b };
+        inst.src0 = .{ .kind = .sgpr, .reg = 9 };
+        scc = true;
+        executeScalar(&state, 0, inst, &scc);
+        try std.testing.expectEqual(@as(?bool, null), scc);
+        try std.testing.expect(state.register(8) == null);
+    }
 }
 
 test "uniform guards survive unrelated vector masks without reusing overwritten masks" {
