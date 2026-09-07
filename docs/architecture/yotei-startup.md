@@ -11,6 +11,20 @@ translation faults. The title menu and brightness screen are **not verified
 on this build**. The installed executable was restored to the previously
 tested `796a484` runtime for UI comparison; a separate build isolates the
 per-invocation high-mask write without changing the remaining fixes.
+The control run has reached the loading indicator and Digital Deluxe Bonus
+(flip 955), including its Cross glyph. The remaining bonus notices and
+brightness screen are still being checked on that reference runtime.
+
+D16 buffer loads now permit an undefined destination VGPR, choosing zero
+for its untouched half while preserving any previous definition. This
+addresses the logged `buffer_load_short_d16` rejection at PC `0xc74` writing
+v109; only v0-v63 had received the translator's initial zero values. Six GPU
+cases initialize v64, v65, v109, v127, v128 and v255 through complementary
+byte/short loads. The old translator rejects the first fresh register; the
+corrected translator passes, including preservation, sign extension and
+out-of-bounds cases. Scene pointers, wave32, wave64, SAVEEXEC, indexed images
+and full Vulkan regressions also pass SDK validation. Live verification
+of the affected game shader remains pending.
 
 Indexed material recovery now recognizes scalar loads and shifts using either
 VCC word. The captured particle shader `0x80003bdb00` loads its material index

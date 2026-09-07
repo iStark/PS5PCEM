@@ -1736,6 +1736,21 @@ fn runPackedBufferProbe(allocator: std.mem.Allocator) !void {
             0xe070_0000 | @as(u32, @intCast(index * 4)), 0x8001_0100, // result to V#s4
         });
     }
+    // A fresh VGPR may receive its two halves in separate loads. Only the
+    // loaded half is defined after the first instruction; both are defined
+    // after the complementary load, which must preserve the first half.
+    for (0..6) |index| {
+        const opcode: u32 = @intCast(0x20 + index);
+        const destination = ([_]u32{ 64, 65, 109, 127, 128, 255 })[index];
+        const offset: u32 = if (index < 4) 1 else 3;
+        const output: u32 = @intCast(28 + index * 8);
+        try code.appendSlice(allocator, &.{
+            0xe000_0000 | (opcode << 18) | offset,       0x8000_0000 | (destination << 8),
+            0xe070_0000 | output,                        0x8001_0000 | (destination << 8),
+            0xe000_0000 | ((opcode ^ 1) << 18) | offset, 0x8000_0000 | (destination << 8),
+            0xe070_0000 | (output + 4),                  0x8001_0000 | (destination << 8),
+        });
+    }
     // An out-of-bounds half load zeros only the selected half.
     try code.appendSlice(allocator, &.{ vop1(1, 1, 255), 0xa5a5_1234, 0xe084_0010, 0x8000_0100, 0xe070_0018, 0x8001_0100, 0xbf81_0000 });
     for (code.items, 0..) |word, index| guest.word(0x100 + index * 4, word);
@@ -1752,6 +1767,11 @@ fn runPackedBufferProbe(allocator: std.mem.Allocator) !void {
     try renderer.readbackGuestStorageBuffer(0x11000, &output);
     const expected = [_]u32{ 0xa5a5_0080, 0x0080_1234, 0xa5a5_ff80, 0xff80_1234, 0xa5a5_8001, 0x8001_1234, 0x0000_1234 };
     for (expected, 0..) |value, index| try std.testing.expectEqual(value, std.mem.readInt(u32, output[index * 4 ..][0..4], .little));
+    for ([_]u32{ 0x80, 0x80, 0xff80, 0xff80, 0x8001, 0x8001 }, 0..) |value, index| {
+        const first = std.mem.readInt(u32, output[28 + index * 8 ..][0..4], .little);
+        try std.testing.expectEqual(value, if (index % 2 == 0) first & 0xffff else first >> 16);
+        try std.testing.expectEqual(value | (value << 16), std.mem.readInt(u32, output[32 + index * 8 ..][0..4], .little));
+    }
 
     // CMPX compares only the low half, preserves VCC, and disables matching
     // lanes in both halves of a wave. A disabled lane retains its sentinel.

@@ -7783,7 +7783,11 @@ const Builder = struct {
     }
 
     fn bufferLoadD16(self: *Builder, inst: instruction.Instruction, width: u8, signed: bool, high: bool) Error!void {
-        const previous = try self.source(inst.dst, .bits32);
+        // D16 loads can be the first definition of a VGPR. The untouched
+        // half is undefined then; choose zero without rejecting the load.
+        // Existing definitions, including mutable registers, remain intact.
+        if (inst.dst.kind != .vgpr) return Error.UnsupportedDestination;
+        const previous = try self.registerBits(registerIndex(inst.dst) orelse return Error.UnsupportedDestination, 0);
         const loaded = try self.bufferLoadSubwordValue(inst, width, signed);
         var inserted = try self.andBits(loaded, 0xffff);
         if (high) {
