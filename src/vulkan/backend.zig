@@ -23957,11 +23957,21 @@ fn resolveBufferTablePlan(
     while (index != 0) {
         index -= 1;
         const inst = instructions[index];
-        if (inst.pc >= before_pc or inst.dst.kind != .sgpr) continue;
-        const count = @max(inst.data_words, if (std.mem.endsWith(u8, @tagName(inst.opcode), "b64")) @as(u8, 2) else 1);
-        if (wanted_sgpr + wanted_words <= inst.dst.reg or inst.dst.reg + count <= wanted_sgpr) continue;
+        if (inst.pc >= before_pc) continue;
+        var overlaps = false;
+        for ([_]rdna2.Operand{ inst.dst, inst.dst2 }) |destination| {
+            const first = gpu.scalar_provenance.scalarRegisterIndex(destination) orelse continue;
+            const vector_mask = destination.kind == .vcc_lo and switch (inst.family) {
+                .vop1, .vop2, .vop3, .vop3p, .vopc => true,
+                else => false,
+            };
+            const count = @max(inst.data_words, if (vector_mask or std.mem.endsWith(u8, @tagName(inst.opcode), "64")) @as(u8, 2) else 1);
+            overlaps = overlaps or (wanted_sgpr < first + count and first < wanted_sgpr + wanted_words);
+        }
+        if (!overlaps) continue;
+        const destination = gpu.scalar_provenance.scalarRegisterIndex(inst.dst) orelse return null;
         if (!isBufferScalarLoad(inst.opcode) or
-            wanted_sgpr < inst.dst.reg or wanted_sgpr + wanted_words > inst.dst.reg + count or inst.src0.kind != .sgpr or
+            wanted_sgpr < destination or wanted_sgpr + wanted_words > destination + inst.data_words or inst.src0.kind != .sgpr or
             (gpu.scalar_provenance.scalarRegisterIndex(inst.src1) orelse 128) >= 124 or inst.memory_offset < 0) return null;
         producer = inst;
         break;
@@ -24017,7 +24027,7 @@ fn resolveBufferTablePlan(
     // The byte product wraps at 32 bits. Enumerating only N*stride misses
     // other in-bounds offsets reachable after wrap. Its residue class has
     // step gcd(stride, 2^32), a power of two.
-    const displacement = @as(u64, @intCast(load.memory_offset)) + (wanted_sgpr - load.dst.reg) * 4;
+    const displacement = @as(u64, @intCast(load.memory_offset)) + (wanted_sgpr - gpu.scalar_provenance.scalarRegisterIndex(load.dst).?) * 4;
     if (index_bound == null and index_register != null) if (bindings) |inputs| {
         if (typedImageIndexRange(inputs, reader, analysis, scalar, index, index_register.?)) |range| {
             // Signed texels also produce negative indices. They may be
@@ -24071,7 +24081,8 @@ fn resolveIndexedBufferImageCandidates(
         .instruction => |index| index,
     };
     const shift = instructions[shift_index];
-    if (shift.opcode != .s_lshl_b32 or shift.src0.kind != .sgpr) return null;
+    if (shift.opcode != .s_lshl_b32) return null;
+    const index_register = gpu.scalar_provenance.scalarRegisterIndex(shift.src0) orelse return null;
     const amount = switch (shift.src1.kind) {
         .integer_inline_constant, .literal_constant => shift.src1.value,
         else => return null,
@@ -24079,7 +24090,7 @@ fn resolveIndexedBufferImageCandidates(
     if (amount < 5 or amount > 13) return null;
     const buffer = (try resolveProducedBufferDescriptor(bindings, reader, analysis, scalar, load.src0.reg, load.pc, 0)) orelse return null;
     if (buffer.stride != @as(u32, 1) << @intCast(amount) or buffer.address == 0 or buffer.size_bytes == 0) return null;
-    const plan = (try resolveBufferTablePlan(reader, analysis, scalar, shift.src0.reg, 1, shift.pc, bindings, 65536)) orelse return null;
+    const plan = (try resolveBufferTablePlan(reader, analysis, scalar, @intCast(index_register), 1, shift.pc, bindings, 65536)) orelse return null;
     const displacement = @as(u64, @intCast(load.memory_offset)) + (sample.src1.reg - load.dst.reg) * 4;
     var seen: [maximum_sampled_images]u64 = undefined;
     var seen_count: usize = 0;

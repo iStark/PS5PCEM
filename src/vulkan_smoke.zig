@@ -2453,25 +2453,33 @@ fn runScalarPointerProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runIndexedImageProbe(allocator: std.mem.Allocator) !void {
-    for (0..2) |case| {
+    for (0..6) |case| {
+        const wrapping = case % 2;
+        const index_register: u32 = switch (case / 2) {
+            0 => 20,
+            1 => 106,
+            else => 107,
+        };
+        const offset_register: u32 = if (case < 2) 20 else 106;
         var renderer = try vulkan.Renderer.init(allocator, .{});
         defer renderer.deinit();
         const guest = try allocator.create(SizedGuestMemory(512 * 1024));
         defer allocator.destroy(guest);
         guest.* = .{};
         _ = renderer.dcbBackend(guest.interface());
-        const records: u32 = 0x10000 + @as(u32, @intCast(case)) * 0x1000;
-        const textures: u32 = 0x48000 + @as(u32, @intCast(case)) * 0x1000;
+        const records: u32 = 0x10000 + @as(u32, @intCast(wrapping)) * 0x1000;
+        const textures: u32 = 0x48000 + @as(u32, @intCast(wrapping)) * 0x1000;
         const code = [_]u32{
             vop1(1, 1, 28),
             0xbf06_851c, // workgroup 5 reads beyond the material table
             0x8514_1cff,
             1754,
-            0x8014_ff14, if (case == 0) 0 else 0x0f72_c235, // 116 * wrapping index == 4 mod 2^32
-            0x9314_ff14, 116,
-            0xf420_0504, (20 << 25) | 60, // s20 = material.texture_index
-            0x8f14_8514, // s20 <<= 5, with 32-bit wrap
-            0xf42c_000c,                 20 << 25, // T#s0 = global[V#s24][s20]
+            0x8014_ff14,                                            if (wrapping == 0) 0 else 0x0f72_c235, // 116 * wrapping index == 4 mod 2^32
+            0x9300_ff14 | (offset_register << 16),                  116,
+            0xf420_0004 | (index_register << 6),                    (offset_register << 25) | 60,
+            // Material indices may occupy either VCC word independently.
+            0x8f00_8500 | (offset_register << 16) | index_register,
+            0xf42c_000c,                 offset_register << 25, // T#s0 = global[V#s24][index << 5]
             vop1(1, 2, 255),             0x3e80_0000,
             vop1(1, 3, 255),             0x3e80_0000,
             vop1(1, 4, 255),             0x3f40_0000,
@@ -2483,7 +2491,7 @@ fn runIndexedImageProbe(allocator: std.mem.Allocator) !void {
         // An unbounded stride-116 product reaches over 50,000 word windows;
         // only their referenced T# entries belong in the Vulkan table.
         const indices = [_]u32{ 2, 1, 0x0800_0003, 4, 0xffff_ffff };
-        for (indices, 0..) |value, index| guest.word(records + index * 116 + 60 + case * 4, value);
+        for (indices, 0..) |value, index| guest.word(records + index * 116 + 60 + wrapping * 4, value);
         for (0..4) |index| {
             const address: u32 = if (index == 0) 0xa000 else if (index == 1) 0x9000 else 0x8000;
             var descriptor = sampledImageDescriptorWords(address, 1, 1);
@@ -2516,7 +2524,7 @@ fn runIndexedImageProbe(allocator: std.mem.Allocator) !void {
             try std.testing.expectApproxEqAbs(expected, actual, 0.00001);
         }
     }
-    std.debug.print("indexed images passed: material-to-global tables, large record scan, wrapping multiply/shift, mixed views, exact aliases and both bounds\n", .{});
+    std.debug.print("indexed images passed: material-to-global tables, SGPR/VCC_LO/VCC_HI indices, large record scan, wrapping multiply/shift, mixed views, exact aliases and both bounds\n", .{});
 }
 
 fn runNestedImageProbe(allocator: std.mem.Allocator) !void {

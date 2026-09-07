@@ -12,6 +12,16 @@ on this build**. The installed executable was restored to the previously
 tested `796a484` runtime for UI comparison; a separate build isolates the
 per-invocation high-mask write without changing the remaining fixes.
 
+Indexed material recovery now recognizes scalar loads and shifts using either
+VCC word. The captured particle shader `0x80003bdb00` loads its material index
+into VCC_HI at PC `0x54c`, shifts it into VCC_LO at `0x558`, then samples the
+global table at `0x588`. The previous SGPR-only checks rejected this chain.
+Six GPU cases cover ordinary SGPR, VCC_LO and VCC_HI indices with wrapping
+and non-wrapping record offsets: the old backend rejects the VCC cases;
+the corrected backend passes all six. Selected, typed, indirect, nested,
+vector, uniform-loop, 4096-view and full Vulkan regressions pass SDK
+validation. This correction still needs live particle-rendering verification.
+
 Typed material indices now retain their bounds through vector moves and
 conditional selections, including all four components of integer gathers.
 Every vector source must have been initialized for all lanes active at its
