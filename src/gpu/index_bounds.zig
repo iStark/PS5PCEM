@@ -64,6 +64,23 @@ const ReachingDefinitions = struct { items: [32]usize = undefined, count: usize 
 /// edges must not introduce definitions into code reachable from the entry.
 pub fn reachableBlocks(graph: *const Graph) ?[maximum_blocks]bool {
     if (graph.blocks.items.len == 0 or graph.blocks.items.len > maximum_blocks) return null;
+    // Resource recovery asks this question for many individual SGPR words.
+    // Index the outgoing edges once per query instead of scanning every edge
+    // again for each reached block. Decoded blocks have at most two successors;
+    // retain the general scan for larger externally constructed graphs.
+    const no_edge = std.math.maxInt(u32);
+    var first_edge: [maximum_blocks]u32 = undefined;
+    var next_edge: [maximum_blocks * 2]u32 = undefined;
+    // Tiny graphs are cheaper to scan than to initialize another index.
+    const indexed = graph.blocks.items.len >= 32 and graph.edges.items.len <= next_edge.len;
+    if (indexed) @memset(first_edge[0..graph.blocks.items.len], no_edge);
+    for (graph.edges.items, 0..) |edge, index| {
+        if (edge.from >= graph.blocks.items.len or edge.to >= graph.blocks.items.len) return null;
+        if (indexed) {
+            next_edge[index] = first_edge[edge.from];
+            first_edge[edge.from] = @intCast(index);
+        }
+    }
     var reached: [maximum_blocks]bool = @splat(false);
     var queue: [maximum_blocks]u32 = undefined;
     reached[0] = true;
@@ -71,6 +88,17 @@ pub fn reachableBlocks(graph: *const Graph) ?[maximum_blocks]bool {
     var length: usize = 1;
     var cursor: usize = 0;
     while (cursor < length) : (cursor += 1) {
+        if (indexed) {
+            var index = first_edge[queue[cursor]];
+            while (index != no_edge) : (index = next_edge[index]) {
+                const target = graph.edges.items[index].to;
+                if (reached[target]) continue;
+                reached[target] = true;
+                queue[length] = target;
+                length += 1;
+            }
+            continue;
+        }
         for (graph.edges.items) |edge| {
             if (edge.from != queue[cursor] or reached[edge.to]) continue;
             reached[edge.to] = true;
@@ -79,6 +107,29 @@ pub fn reachableBlocks(graph: *const Graph) ?[maximum_blocks]bool {
         }
     }
     return reached;
+}
+
+test "resource reachability handles unordered edges, cycles and disconnected blocks" {
+    var graph = Graph{};
+    defer graph.deinit(std.testing.allocator);
+    for (0..64) |index| try graph.blocks.append(std.testing.allocator, .{
+        .index = @intCast(index),
+        .start_pc = @intCast(index * 4),
+        .end_pc = @intCast(index * 4 + 4),
+        .first_instruction = @intCast(index),
+        .instruction_count = 1,
+    });
+    for ([_][2]u32{ .{ 3, 1 }, .{ 5, 4 }, .{ 0, 2 }, .{ 1, 3 }, .{ 2, 1 }, .{ 0, 2 }, .{ 4, 3 } }) |edge|
+        try graph.edges.append(std.testing.allocator, .{ .from = edge[0], .to = edge[1], .kind = .branch });
+    const indexed = reachableBlocks(&graph).?;
+    try std.testing.expectEqualSlices(bool, &.{ true, true, true, true, false, false }, indexed[0..6]);
+    for (indexed[6..]) |reached| try std.testing.expect(!reached);
+    // The fallback for graphs exceeding the decoder's edge ceiling must
+    // preserve the same result, including duplicate incoming edges.
+    for (0..maximum_blocks * 2) |_| try graph.edges.append(std.testing.allocator, .{ .from = 3, .to = 1, .kind = .branch });
+    try std.testing.expectEqual(indexed, reachableBlocks(&graph).?);
+    try graph.edges.append(std.testing.allocator, .{ .from = 0, .to = 64, .kind = .branch });
+    try std.testing.expectEqual(null, reachableBlocks(&graph));
 }
 
 fn reachingDefinitions(instructions: []const Instruction, graph: *const Graph, before: usize, location: Location) ?ReachingDefinitions {

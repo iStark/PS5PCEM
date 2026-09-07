@@ -4,6 +4,21 @@ Verified with PPSA26344 and the RTX 3070 Ti on 2026-09-06.
 
 ## Menu progress on 2026-09-07
 
+The ReleaseFast run with pooled preparation objects completes the intro and
+continues loading. Comparable early loading frames (600/616) take 906/1008 ms
+versus 1123/1139 ms in the previous ReleaseSafe run. This is an early loading
+comparison, not a measurement of the complete menu. First-use shader
+compilation still causes much longer isolated frames.
+
+Resource reaching-definition queries now index outgoing control-flow edges
+for graphs with at least 32 blocks, avoiding a complete edge scan per visited
+block. Tiny graphs keep the direct scan. Unordered edges, duplicate edges,
+cycles and disconnected blocks retain their reachability; oversized edge
+lists use the scan fallback. All 80 analysis tests and the SDK nested-image,
+uniform-loop and full smoke probes pass. A 10,000-query microbenchmark on
+captured 105-/59-block shaders falls from 46.9/12.2 ms to 3.0/2.0 ms. These
+figures describe that CPU query alone; its live FPS impact remains unmeasured.
+
 The depth/stencil HTILE fix is confirmed in the game. The three bonus notices
 clear without retaining rectangles from earlier windows. The brightness
 screen renders its wolf, smoky background, text, slider and Cross icon. The
