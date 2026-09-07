@@ -15921,7 +15921,14 @@ pub const Renderer = struct {
             if (slot == null) {
                 if (result.image_count >= self.device_info.sampled_image_capacity) return Error.UnsupportedSampledImage;
                 slot = @intCast(result.image_count);
-                result.images[result.image_count] = try self.stageSampledImage(descriptor, sampler, slot.?, dimension, target);
+                result.images[result.image_count] = self.stageSampledImage(descriptor, sampler, slot.?, dimension, target) catch |err| {
+                    self.reportResourceFailure(bindings, inst, scalar);
+                    if (self.traceCurrentGraphicsFrame()) std.debug.print(
+                        "[vulkan dcb] indirect sampled image failed: {s} stage={s} program=0x{x} pc=0x{x} candidate={d}/{d} addr=0x{x} type={s} dim={s} words={any}\n",
+                        .{ @errorName(err), @tagName(bindings.stage), bindings.program_address, inst.pc, slot.?, candidates.count, descriptor.address, @tagName(descriptor.image_type), @tagName(dimension), words },
+                    );
+                    return err;
+                };
                 result.descriptors[result.image_count] = descriptor;
                 result.samplers[result.image_count] = sampler;
                 result.dimensions[result.image_count] = dimension;
