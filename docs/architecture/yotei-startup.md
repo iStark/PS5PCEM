@@ -916,6 +916,17 @@ is null in this run, so that particular presenter fallback is not retaining
 the old notice. Resolving the remaining scene/composite failures is still
 required; passing the bonus windows does not establish the 3D background.
 
+The later capture reaches the brightness setup screen, with its instruction,
+slider and Cross visible over black rectangular artifacts. A remaining compute
+refusal at `0x8000345d00 + 0xb14` is `S_WQM_B32` (`beeb090a`). The decoder,
+scalar resource evaluator and SPIR-V translation now expand active four-bit
+groups into a single destination word and update SCC, as specified by the
+[RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture).
+CPU checks and an SDK GPU probe cover zero and nonzero masks, the captured
+VCC high destination, preservation of VCC low, SCC and changing inputs.
+The complete SDK smoke also passes. This removes an instruction-level refusal;
+its effect on the title scene remains to be verified in the updated runner.
+
 The first cached-memory relaunch stopped before video or Vulkan rendering:
 the main thread was suspended in `reportGuestThreadContext(1)`, called by
 `drainQuietBuilderArenas` from that same guest thread's suspend point. The

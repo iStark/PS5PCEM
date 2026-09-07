@@ -236,6 +236,7 @@ pub fn pruneUniformBranches(
                     .s_nand_b32,
                     .s_nor_b32,
                     .s_xnor_b32,
+                    .s_wqm_b32,
                     => executeScalar(&local, bindings.program_address, inst, &scc),
                     .s_nop, .s_waitcnt, .s_inst_prefetch, .s_branch, .s_endpgm, .s_code_end => {},
                     .s_cbranch_scc0, .s_cbranch_scc1 => if (scc) |value| {
@@ -830,6 +831,17 @@ fn setpcDestinationPc(result: *const Evaluation, program_address: u64, inst: rdn
 }
 
 fn executeScalar(result: *Evaluation, program_address: u64, inst: rdna2.Instruction, scc: *?bool) void {
+    if (inst.opcode == .s_wqm_b32) {
+        const a = source(result, inst.src0) orelse {
+            invalidateDestination(result, inst.dst, 1);
+            scc.* = null;
+            return;
+        };
+        const value: u32 = @truncate(wholeQuadMode64(a.value));
+        write(result, inst.dst, value, a.sources, inst.pc);
+        scc.* = value != 0;
+        return;
+    }
     if (isBitwise32(inst.opcode)) {
         const a = source(result, inst.src0);
         const b = source(result, inst.src1);
@@ -1054,6 +1066,33 @@ fn wholeQuadMode64(value: u64) u64 {
         expanded |= @as(u64, 0xf) << shift;
     }
     return expanded;
+}
+
+test "whole quad mode preserves neighbouring registers and updates SCC" {
+    const inst = try rdna2.decodeInstruction(0, &.{0xbeeb_090a}, 0);
+    for ([_]u32{ 0, 1, 0x8000_0000, 0x1020_4800, 0xffff_ffff }) |input| {
+        var result = Evaluation{};
+        result.registers[10] = .{ .known = true, .value = input };
+        result.registers[106] = .{ .known = true, .value = 0x1234_5678 };
+        result.registers[108] = .{ .known = true, .value = 0x8765_4321 };
+        var scc: ?bool = input == 0;
+        executeScalar(&result, 0, inst, &scc);
+        var expected: u32 = 0;
+        for (0..32) |bit| {
+            const quad: u5 = @intCast(bit & ~@as(usize, 3));
+            if (input & (@as(u32, 15) << quad) != 0) expected |= @as(u32, 1) << @intCast(bit);
+        }
+        try std.testing.expectEqual(expected, result.register(107).?.value);
+        try std.testing.expectEqual(input != 0, scc.?);
+        try std.testing.expectEqual(@as(u32, 0x1234_5678), result.register(106).?.value);
+        try std.testing.expectEqual(@as(u32, 0x8765_4321), result.register(108).?.value);
+    }
+    var unknown = Evaluation{};
+    unknown.registers[107] = .{ .known = true, .value = 1 };
+    var scc: ?bool = true;
+    executeScalar(&unknown, 0, inst, &scc);
+    try std.testing.expect(unknown.register(107) == null);
+    try std.testing.expect(scc == null);
 }
 
 fn executeScalar64(

@@ -115,6 +115,7 @@ pub const Opcode = enum {
     s_mov_b64,
     s_not_b32,
     s_not_b64,
+    s_wqm_b32,
     s_wqm_b64,
     s_quadmask_b64,
     s_brev_b32,

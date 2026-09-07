@@ -2796,6 +2796,13 @@ const Builder = struct {
         });
     }
 
+    fn wholeQuadMode32(self: *Builder, inst: instruction.Instruction) Error!void {
+        const input = try self.source(inst.src0, .bits32);
+        const expanded = try self.smearNibbleGroups(input);
+        try self.destination(inst.dst, .{ .id = expanded, .value_type = .bits32 });
+        try self.updateSccFromPair(.{ expanded, try self.constant(.bits32, 0) });
+    }
+
     fn vectorCompareClassF32(self: *Builder, inst: instruction.Instruction) Error!void {
         const value = try self.source(inst.src0, .float32);
         const class_mask = try self.source(inst.src1, .bits32);
@@ -7832,6 +7839,7 @@ const Builder = struct {
             .s_code_end,
             .s_wqm_b64,
             => {},
+            .s_wqm_b32 => try self.wholeQuadMode32(inst),
             .s_quadmask_b64 => try self.wholeQuadMask64(inst),
             .s_barrier => try self.controlBarrier(),
             // Branches are handled by structured CF or skipped in the linear fallback.

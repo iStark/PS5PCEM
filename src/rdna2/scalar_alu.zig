@@ -18,6 +18,14 @@ const Error = instruction.Error;
 
 const Entry = struct { u32, Opcode };
 
+test "whole quad mode decodes the captured single-word VCC high destination" {
+    const inst = try decodeSop1(0xb14, &.{0xbeeb_090a}, 0);
+    try std.testing.expectEqual(Opcode.s_wqm_b32, inst.opcode);
+    try std.testing.expectEqual(isa.OperandKind.vcc_hi, inst.dst.kind);
+    try std.testing.expectEqual(@as(u32, 10), inst.src0.reg);
+    try std.testing.expectEqual(@as(u32, 1), inst.word_count);
+}
+
 /// Expands a list of pairs into a direct-index array.
 /// Everything happens at compile time; only the array survives into the binary.
 fn buildTable(comptime size: usize, comptime entries: []const Entry) [size]Opcode {
@@ -38,6 +46,7 @@ const sop1_table = buildTable(256, &.{
     .{ 0x04, .s_mov_b64 },
     .{ 0x07, .s_not_b32 },
     .{ 0x08, .s_not_b64 },
+    .{ 0x09, .s_wqm_b32 },
     .{ 0x0a, .s_wqm_b64 },
     .{ 0x0b, .s_brev_b32 },
     .{ 0x0f, .s_bcnt1_i32_b32 },

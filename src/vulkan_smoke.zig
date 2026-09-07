@@ -760,6 +760,42 @@ fn runScalarLoopProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("scalar loops passed: saved EXEC, high-half writes, four iterations and inactive lanes\n", .{});
 }
 
+fn runWholeQuadModeProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const code = [_]u32{
+        sop1(3, 106, 255), 0x1234_5678, // preserve VCC low
+        0xf400_0282, 125 << 25, // load s10 from input pointer s4:s5
+        0xbeeb_090a, // captured s_wqm_b32 vcc_hi, s10
+        (0x8000_0000 | (0x0a << 23) | (11 << 16) | (128 << 8) | 129), // s_cselect_b32 s11, 1, 0
+        vop1(1, 1, 107),
+        vop1(1, 2, 106),
+        vop1(1, 3, 11),
+        0xe07c_0000, 0x8000_0100, // buffer_store_dwordx3 v1:v3, V#s0
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var state = gpu.State{};
+    const stage = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, stage.programRegisterBase(), 1);
+    try state.writeRegister(.shader, stage.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 6 << 1);
+    for ([_]u32{ 0x10000, 0, 12, 0, 0x9000, 0 }, 0..) |word, index|
+        try state.writeRegister(.shader, stage.userDataBase() + @as(u32, @intCast(index)), word);
+    for ([_][2]u32{ .{ 0x1020_4800, 0xf0f0_ff00 }, .{ 0, 0 }, .{ 0x8000_0001, 0xf000_000f } }) |test_case| {
+        guest.word(0x9000, test_case[0]);
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        var output: [12]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x10000, &output);
+        try std.testing.expectEqual(test_case[1], std.mem.readInt(u32, output[0..4], .little));
+        try std.testing.expectEqual(@as(u32, 0x1234_5678), std.mem.readInt(u32, output[4..8], .little));
+        try std.testing.expectEqual(@as(u32, @intFromBool(test_case[0] != 0)), std.mem.readInt(u32, output[8..12], .little));
+    }
+    std.debug.print("whole quad mode passed: captured VCC high destination, preserved low word, SCC and changing input\n", .{});
+}
+
 fn runWave64Probe(allocator: std.mem.Allocator) !void {
     for ([_][3]u32{ .{ 64, 1, 1 }, .{ 4, 4, 4 } }) |local_size| try runWave64Case(allocator, local_size);
     std.debug.print("wave64 passed: lane 63, full masks, carry bits and uniform EXEC branches across workgroup shapes\n", .{});
@@ -2140,6 +2176,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--scalar-loops")) {
         try runScalarLoopProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--quad-mode")) {
+        try runWholeQuadModeProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--wave64")) {
