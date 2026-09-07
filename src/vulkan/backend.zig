@@ -7131,8 +7131,10 @@ pub const Renderer = struct {
             // staging buffer; guest writes still happen on every invocation.
             const value = std.mem.readInt(u32, pattern[0..4], .little);
             const bytes = try self.packed_clear_staging.bytes(self.allocator, value, byte_count);
+            self.prepareHtileWrite(descriptor.address, byte_count);
             if (!memory.write(memory.context, descriptor.address, bytes)) return Error.GuestMemoryWriteFailed;
             self.invalidateDmaDestination(descriptor.address, byte_count);
+            try self.applyUniformHtileWrite(descriptor.address, bytes);
             self.emulated_buffer_clear_dispatches += 1;
             self.noteComputeWrite("emulated-packed-buffer", descriptor.address, 0, 0, 0);
             if (log_verbose_gpu or self.emulated_buffer_clear_dispatches <= 4) {
@@ -10952,6 +10954,7 @@ pub const Renderer = struct {
             // allocation changing; keep the newest one for the next clear.
             cached.target.clear_depth = target.clear_depth;
             cached.target.clear_stencil = target.clear_stencil;
+            cached.target.descriptor = target.descriptor;
             self.depth_target_sequence +%= 1;
             cached.last_used_sequence = self.depth_target_sequence;
             return index;
@@ -10965,7 +10968,8 @@ pub const Renderer = struct {
         if (self.depth_targets.items.len < maximum_depth_targets) {
             try self.depth_targets.append(self.allocator, cached);
             const index = self.depth_targets.items.len - 1;
-            if (self.depth_transfer_enabled) _ = try self.importDepthTarget(index);
+            if (!try self.initializeDepthFromUniformHtile(index) and self.depth_transfer_enabled)
+                _ = try self.importDepthTarget(index);
             if (!self.reported_depth_attachment) {
                 self.reported_depth_attachment = true;
                 std.debug.print(
@@ -10990,8 +10994,85 @@ pub const Renderer = struct {
         self.invalidateDepthPasses(victim.view);
         self.destroyCachedDepthTarget(victim.*);
         victim.* = cached;
-        if (self.depth_transfer_enabled) _ = try self.importDepthTarget(oldest_index);
+        if (!try self.initializeDepthFromUniformHtile(oldest_index) and self.depth_transfer_enabled)
+            _ = try self.importDepthTarget(oldest_index);
         return oldest_index;
+    }
+
+    /// A uniform HTILE clear has the same meaning under every metadata
+    /// swizzle. SDK11 can leave DB_HTILE_SURFACE at zero, so use the known
+    /// allocation footprint without interpreting individual compressed blocks.
+    fn uniformHtileBytes(target: GuestDepthTarget) ?usize {
+        const descriptor = target.descriptor;
+        if (!descriptor.htile_enabled or descriptor.htile_address == 0 or
+            !descriptor.tile_stencil_disabled or target.has_stencil or
+            descriptor.tile_mode != .depth or descriptor.maximum_mip != 0 or
+            descriptor.mip_level != 0 or descriptor.base_array_slice != 0 or
+            descriptor.last_array_slice != 0) return null;
+        const layout = gpu.HtileLayout.init(target.width, target.height, 1, 0, target.width) catch return null;
+        const bytes = std.math.cast(usize, layout.required_bytes) orelse return null;
+        return if (bytes != 0 and bytes <= maximum_htile_bytes) bytes else null;
+    }
+
+    fn uniformHtileClear(bytes: []const u8) ?f32 {
+        if (bytes.len < 4 or bytes.len % 4 != 0) return null;
+        const word = std.mem.readInt(u32, bytes[0..4], .little);
+        const depth = gpu.HtileLayout.fastClearDepth(word, true) orelse return null;
+        var offset: usize = 4;
+        while (offset < bytes.len) : (offset += 4) {
+            if (std.mem.readInt(u32, bytes[offset..][0..4], .little) != word) return null;
+        }
+        return depth;
+    }
+
+    fn clearDepthFromHtile(self: *Renderer, index: usize, depth: f32) anyerror!void {
+        const snapshot = self.depth_targets.items[index];
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_depth_bit };
+        try self.transitionTrackedImage(command_buffer, snapshot.image.handle, range, image_state.transfer_destination_usage);
+        const clear = vk.ClearDepthStencilValue{ .depth = depth, .stencil = 0 };
+        self.device_functions.cmd_clear_depth_stencil_image(command_buffer, snapshot.image.handle, vk.image_layout_transfer_dst_optimal, &clear, 1, @ptrCast(&range));
+        try self.transitionTrackedImage(command_buffer, snapshot.image.handle, range, image_state.depth_attachment_usage);
+        try self.submitOneShot(command_buffer);
+        const cached = &self.depth_targets.items[index];
+        cached.initialized = true;
+        cached.shader_read_layout = false;
+        cached.gpu_generation +%= 1;
+        _ = self.image_aliases.markWrite(cached.alias_token);
+        if (self.reported_htile_resolves < 4 or self.traceCurrentGraphicsFrame()) {
+            self.reported_htile_resolves +|= 1;
+            std.debug.print("[vulkan dcb] resident HTILE clear depth@0x{x} {d}x{d} meta@0x{x} value={d}\n", .{
+                cached.target.address,                  cached.target.width, cached.target.height,
+                cached.target.descriptor.htile_address, depth,
+            });
+        }
+    }
+
+    fn initializeDepthFromUniformHtile(self: *Renderer, index: usize) anyerror!bool {
+        const target = self.depth_targets.items[index].target;
+        const size = uniformHtileBytes(target) orelse return false;
+        const memory = self.guest_memory orelse return false;
+        const bytes = try self.allocator.alloc(u8, size);
+        defer self.allocator.free(bytes);
+        if (!memory.read(memory.context, target.descriptor.htile_address, bytes)) return false;
+        const depth = uniformHtileClear(bytes) orelse return false;
+        try self.clearDepthFromHtile(index, depth);
+        return true;
+    }
+
+    /// Mirror a complete metadata fill into resident depth immediately, so
+    /// both the next raster pass and sampled-depth consumers see the clear.
+    fn applyUniformHtileWrite(self: *Renderer, address: u64, bytes: []const u8) anyerror!void {
+        for (self.depth_targets.items, 0..) |cached, index| {
+            const size = uniformHtileBytes(cached.target) orelse continue;
+            const metadata = cached.target.descriptor.htile_address;
+            if (address > metadata) continue;
+            const offset = std.math.cast(usize, metadata - address) orelse continue;
+            if (offset > bytes.len or size > bytes.len - offset) continue;
+            const depth = uniformHtileClear(bytes[offset..][0..size]) orelse continue;
+            try self.clearDepthFromHtile(index, depth);
+        }
     }
 
     /// Drops any colour framebuffer still paired with a depth view that is
@@ -12646,6 +12727,13 @@ pub const Renderer = struct {
         }
         const cached = self.depth_targets.items[index];
         try std.testing.expectEqual(@as(u64, 2), cached.gpu_generation);
+        return self.readDepthProbeValues(index);
+    }
+
+    fn readDepthProbeValues(self: *Renderer, index: usize) anyerror![2]f32 {
+        const cached = self.depth_targets.items[index];
+        try std.testing.expectEqual(@as(u32, 32), cached.target.width);
+        try std.testing.expectEqual(@as(u32, 32), cached.target.height);
         const readback = try self.createBuffer(32 * 32 * 4, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
         defer self.destroyBuffer(readback);
         const command_buffer = try self.beginOneShot();
@@ -12669,6 +12757,90 @@ pub const Renderer = struct {
         var values: [32 * 32]f32 = undefined;
         try self.readMapped(readback, std.mem.sliceAsBytes(&values));
         return .{ values[0], values[16 * 32 + 16] };
+    }
+
+    pub fn probeHtileDepthClears(self: *Renderer) anyerror!void {
+        var descriptor = std.mem.zeroes(gpu.resources.DepthTarget);
+        descriptor.read_address = 0x10000;
+        descriptor.write_address = 0x10000;
+        descriptor.htile_address = 0x8000;
+        descriptor.width = 32;
+        descriptor.height = 32;
+        descriptor.format = 3;
+        descriptor.tile_mode = .depth;
+        descriptor.htile_enabled = true;
+        descriptor.tile_stencil_disabled = true;
+        // Captured SDK11 state leaves HTILE_SURFACE and DB_DEPTH_CLEAR reset.
+        const target = guestDepthTarget(descriptor) orelse return error.TestFailed;
+        const size = uniformHtileBytes(target) orelse return error.TestFailed;
+        const bytes = try self.allocator.alloc(u8, size);
+        defer self.allocator.free(bytes);
+        fillRepeatedPattern(bytes, &.{ 0xf0, 0xff, 0xff, 0xff });
+        try std.testing.expect(dcbWrite(self, descriptor.htile_address, bytes));
+        const index = try self.acquireDepthTarget(target);
+        try std.testing.expectEqual([2]f32{ 1, 1 }, try self.readDepthProbeValues(index));
+        var state = GraphicsPipelineState.default(32, 32);
+        state.color_write_masks = @splat(0);
+        state.depth_attachment_format = target.format;
+        state.depth_test_enable = 1;
+        state.depth_write_enable = 1;
+        state.depth_compare_operation = 1;
+        state.viewport_min_depth_bits = @bitCast(@as(f32, 0.5));
+        state.viewport_max_depth_bits = @bitCast(@as(f32, 0.5));
+        for ([_]u32{ 3, 0 }) |vertices| {
+            try self.beginFrameDraw();
+            try self.drawGraphicsShaders(&graphics_probe_vertex_spirv, &graphics_probe_fragment_spirv, &.{}, &.{}, state, null, &.{}, target, false, false, false, .{ .vertex_count = vertices });
+        }
+        try std.testing.expectEqual([2]f32{ 1, 0.5 }, try self.readDepthProbeValues(index));
+        // A partial metadata update cannot stand in for a fullscreen clear.
+        try std.testing.expect(dcbWrite(self, descriptor.htile_address, &.{ 0, 0, 0, 0 }));
+        try std.testing.expectEqual([2]f32{ 1, 0.5 }, try self.readDepthProbeValues(index));
+        @memset(bytes, 0);
+        try std.testing.expect(dcbWrite(self, descriptor.htile_address, bytes));
+        try std.testing.expectEqual([2]f32{ 0, 0 }, try self.readDepthProbeValues(index));
+        state.depth_compare_operation = 4; // reversed depth
+        state.viewport_min_depth_bits = @bitCast(@as(f32, 0.25));
+        state.viewport_max_depth_bits = @bitCast(@as(f32, 0.25));
+        try self.beginFrameDraw();
+        try self.drawGraphicsShaders(&graphics_probe_vertex_spirv, &graphics_probe_fragment_spirv, &.{}, &.{}, state, null, &.{}, target, false, false, false, .{ .vertex_count = 3 });
+        try std.testing.expectEqual([2]f32{ 0, 0.25 }, try self.readDepthProbeValues(index));
+        fillRepeatedPattern(bytes, &.{ 0xf0, 0xff, 0xff, 0xff });
+        try std.testing.expect(dcbWrite(self, descriptor.htile_address, bytes));
+        try std.testing.expectEqual([2]f32{ 1, 1 }, try self.readDepthProbeValues(index));
+        bytes[bytes.len - 1] = 0;
+        try std.testing.expect(dcbWrite(self, descriptor.htile_address, bytes));
+        try std.testing.expectEqual([2]f32{ 1, 1 }, try self.readDepthProbeValues(index));
+        // Exercise the same formatted compute fill used by the captured UI.
+        const code = [_]u32{
+            0xd746_0004, 8 | (134 << 9) | (256 << 18),
+            0x7e00_0204, 0x7e02_0205,
+            0x7e04_0206, 0x7e06_0207,
+            0xe01c_2000, 0x8000_0004,
+            0xbf81_0000,
+        };
+        const memory = self.guest_memory.?;
+        if (!memory.write(memory.context, 0x100, std.mem.sliceAsBytes(&code))) return error.TestFailed;
+        var compute = gpu.State{};
+        try compute.writeRegister(.shader, 0x20c, 1);
+        try compute.writeRegister(.shader, 0x20d, 0);
+        try compute.writeRegister(.shader, 0x213, (8 << 1) | (1 << 7));
+        const user_data = [_]u32{ 0x8000, 16 << 16, @intCast(size / 16), (75 << 12) | 0xfac, 0, 0, 0, 0 };
+        for (user_data, 0..) |word, i| try compute.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
+        const fills_before = self.emulated_buffer_clear_dispatches;
+        _ = try self.dispatchRdna2State(&compute, .{ 64, 1, 1 }, .{ @intCast(size / (16 * 64)), 1, 1 });
+        try std.testing.expectEqual(fills_before + 1, self.emulated_buffer_clear_dispatches);
+        try std.testing.expectEqual([2]f32{ 0, 0 }, try self.readDepthProbeValues(index));
+        var dma = std.mem.zeroes(gpu.state.DmaData);
+        dma.source = 2;
+        dma.source_address = 0xffff_fff0;
+        dma.destination_address = 0x8000;
+        // dcbDmaData treats low addresses as ordering markers. Use a metadata
+        // allocation above that range to exercise an actual DMA write.
+        self.depth_targets.items[index].target.descriptor.htile_address = 0x18000;
+        dma.destination_address = 0x18000;
+        dma.byte_count = @intCast(size);
+        try std.testing.expect(dcbDmaData(self, dma));
+        try std.testing.expectEqual([2]f32{ 1, 1 }, try self.readDepthProbeValues(index));
     }
 
     fn drawGraphicsProbe(self: *Renderer) anyerror!void {
@@ -18313,7 +18485,9 @@ pub const Renderer = struct {
         self.prepareCmaskWrite(address, bytes.len) catch return false;
         self.prepareHtileWrite(address, bytes.len);
         const memory = self.guest_memory orelse return false;
-        return memory.write(memory.context, address, bytes);
+        if (!memory.write(memory.context, address, bytes)) return false;
+        self.applyUniformHtileWrite(address, bytes) catch return false;
+        return true;
     }
 
     fn dcbAcquire(context: ?*anyopaque, _: gpu.state.AcquireMem) bool {
@@ -18518,6 +18692,7 @@ pub const Renderer = struct {
                 self.prepareHtileWrite(dma.destination_address, byte_count);
                 if (!memory.write(memory.context, dma.destination_address, bytes)) return false;
                 self.invalidateDmaDestination(dma.destination_address, byte_count);
+                self.applyUniformHtileWrite(dma.destination_address, bytes) catch return false;
             },
             1 => {
                 if (!self.ensureGdsStorage()) return false;

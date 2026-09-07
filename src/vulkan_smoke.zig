@@ -2182,6 +2182,15 @@ pub fn main(init: std.process.Init) !void {
         try runWholeQuadModeProbe(allocator);
         return;
     }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--htile-clears")) {
+        var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+        defer renderer.deinit();
+        var guest = GuestMemory{};
+        _ = renderer.dcbBackend(guest.interface());
+        try renderer.probeHtileDepthClears();
+        std.debug.print("HTILE clears passed: initial metadata, retained raster depth, repeated clears and partial/mixed guards\n", .{});
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--wave64")) {
         try runWave64Probe(allocator);
         return;

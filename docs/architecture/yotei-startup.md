@@ -927,6 +927,23 @@ VCC high destination, preservation of VCC low, SCC and changing inputs.
 The complete SDK smoke also passes. This removes an instruction-level refusal;
 its effect on the title scene remains to be verified in the updated runner.
 
+The UI uses reversed depth at `0x505a820000`. A partial trace at flip 934
+captures the preceding packed compute fill: all 655,360 bytes of its HTILE
+allocation at `0x5060b30000` are zero. DB_DEPTH_SIZE_XY and DB_HTILE_SURFACE
+remain at reset, while the recovered depth extent is 3840x2160. The old
+metadata expander rejects the missing pipe-alignment state, and resident
+depth previously retained earlier UI rectangles across these compute clears.
+
+Complete, uniform depth-only HTILE fills now clear matching resident Vulkan
+depth images, including the formatted compute fast path, DMA and direct GPU
+writes. Newly created depth attachments also recognize a complete uniform
+metadata clear. This narrow case does not depend on individual metadata
+swizzle addresses; partial, mixed, stencil and mip/array cases are excluded.
+An SDK probe verifies initial metadata, raster depth retained across draws,
+repeated zero/one clears, the captured compute kernel, DMA, and partial/mixed
+guards. The complete smoke and D32 bias probe pass with clean validation.
+The updated title run must establish whether this removes the UI artifacts.
+
 The first cached-memory relaunch stopped before video or Vulkan rendering:
 the main thread was suspended in `reportGuestThreadContext(1)`, called by
 `drainQuietBuilderArenas` from that same guest thread's suspend point. The
