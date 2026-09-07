@@ -7726,6 +7726,7 @@ pub const Renderer = struct {
     fn prepareScalarPointerMemory(
         self: *Renderer,
         result: *ComputeResources,
+        bindings: *const gpu.ShaderBindings,
         reader: gpu.ShaderMemoryReader,
         analysis: *const gpu.ShaderAnalysis,
         checkpoint_pcs: []const u32,
@@ -7734,17 +7735,34 @@ pub const Renderer = struct {
         var pages: [maximum_storage_descriptors]u64 = undefined;
         var slots: [maximum_storage_descriptors]u32 = undefined;
         var page_count: usize = 0;
+        var table_loads: [maximum_storage_mappings]u32 = undefined;
+        var table_load_count: usize = 0;
         const instructions = analysis.program.instructions.items;
         for (instructions) |inst| {
             if (!isPointerScalarLoad(inst.opcode) or inst.src0.kind != .sgpr or inst.src0.reg + 1 >= 128) continue;
             const scalar = gpu.ScalarEvaluation{ .registers = scalarRegistersAtCheckpoint(checkpoint_pcs, checkpoint_registers, inst.pc).* };
-            if (scalar.registers[inst.src0.reg].known and scalar.registers[inst.src0.reg + 1].known) continue;
-            const offset = scalarMemoryOffset(inst, &scalar) orelse continue;
-            if (offset < 0) continue;
-            const pointers = (try resolveBufferPointerCandidates(reader, analysis, &scalar, inst.src0.reg, inst.pc)) orelse continue;
+            const table = try scalarPointerTablePlan(bindings, reader, analysis, &scalar, inst);
+            var pointers = PointerCandidates{};
+            var offset: u64 = 0;
+            var span: u64 = @as(u64, inst.data_words) * 4;
+            if (table) |plan| {
+                pointers.addresses[0] = plan.base;
+                pointers.count = 1;
+                offset = plan.first;
+                span += @as(u64, plan.count - 1) * plan.step;
+                if (table_load_count == table_loads.len) return Error.InvalidStorageDescriptor;
+                table_loads[table_load_count] = inst.pc;
+                table_load_count += 1;
+            } else {
+                if (scalar.registers[inst.src0.reg].known and scalar.registers[inst.src0.reg + 1].known) continue;
+                const known_offset = scalarMemoryOffset(inst, &scalar) orelse continue;
+                if (known_offset < 0) continue;
+                offset = @intCast(known_offset);
+                pointers = (try resolveBufferPointerCandidates(reader, analysis, &scalar, inst.src0.reg, inst.pc)) orelse continue;
+            }
             for (pointers.addresses[0..pointers.count]) |pointer| {
-                const first = (pointer + @as(u64, @intCast(offset))) & ~@as(u64, 3);
-                const last = first + @as(u64, inst.data_words) * 4 - 1;
+                const first = (pointer + offset) & ~@as(u64, 3);
+                const last = first + span - 1;
                 var page = first & ~@as(u64, 4095);
                 while (page <= last) : (page += 4096) {
                     if (std.mem.indexOfScalar(u64, pages[0..page_count], page) != null) continue;
@@ -7775,7 +7793,8 @@ pub const Renderer = struct {
         for (instructions) |inst| {
             if (!isPointerScalarLoad(inst.opcode) or inst.src0.kind != .sgpr or inst.src0.reg + 1 >= 128) continue;
             const scalar = scalarRegistersAtCheckpoint(checkpoint_pcs, checkpoint_registers, inst.pc);
-            if (scalar[inst.src0.reg].known and scalar[inst.src0.reg + 1].known) continue;
+            if (scalar[inst.src0.reg].known and scalar[inst.src0.reg + 1].known and
+                std.mem.indexOfScalar(u32, table_loads[0..table_load_count], inst.pc) == null) continue;
             for (slots[0..page_count]) |slot| {
                 if (result.scalar_memory_count == result.scalar_memories.len) return Error.InvalidStorageDescriptor;
                 result.scalar_memories[result.scalar_memory_count] = .{ .resource_sgpr = inst.src0.reg, .instruction_pc = inst.pc, .descriptor_index = slot };
@@ -8235,7 +8254,7 @@ pub const Renderer = struct {
             if (is_store) result.writable[descriptor_index] = true;
         }
 
-        try self.prepareScalarPointerMemory(result, reader, analysis, scalar_checkpoint_pcs, scalar_checkpoint_registers);
+        try self.prepareScalarPointerMemory(result, bindings, reader, analysis, scalar_checkpoint_pcs, scalar_checkpoint_registers);
 
         for (instructions) |inst| {
             const writable = switch (inst.opcode) {
@@ -8281,6 +8300,16 @@ pub const Renderer = struct {
                 inst.pc,
                 result.storage_image_mapping_count,
             )) orelse {
+                if (!writable and bindings.stage == .compute and self.sampled_image_nonuniform_indexing) {
+                    if (try resolveBufferImageCandidates(bindings, reader, analysis, &image_scalar, inst)) |candidates| {
+                        var compressed = true;
+                        for (candidates.words[0..candidates.count]) |words| {
+                            const image = try gpu.resources.decodeImageDescriptor(&words);
+                            compressed = compressed and isBlockCompressedUnifiedFormat(image.unified_format);
+                        }
+                        if (compressed) continue;
+                    }
+                }
                 self.reportResourceFailure(bindings, inst, &image_scalar);
                 std.debug.print(
                     "[vulkan dcb] storage image pc=0x{x}: T# s{d}:s{d} unresolved\n",
@@ -23636,6 +23665,92 @@ const BufferTablePlan = struct {
     limit: u64,
 };
 
+const ScalarPointerTablePlan = struct { base: u64, first: u64, step: u32, count: u32 };
+
+fn scalarPointerTablePlan(
+    bindings: *const gpu.ShaderBindings,
+    reader: gpu.ShaderMemoryReader,
+    analysis: *const gpu.ShaderAnalysis,
+    scalar: *const gpu.ScalarEvaluation,
+    load: gpu.ShaderInstruction,
+) anyerror!?ScalarPointerTablePlan {
+    if (!isPointerScalarLoad(load.opcode) or load.src0.kind != .sgpr or load.memory_offset < 0) return null;
+    const offset_register = gpu.scalar_provenance.scalarRegisterIndex(load.src1) orelse return null;
+    const instructions = analysis.program.instructions.items;
+    var load_index: usize = 0;
+    while (load_index < instructions.len and instructions[load_index].pc < load.pc) : (load_index += 1) {}
+    const definition = gpu.index_bounds.scalarDefinition(instructions, &analysis.graph, load_index, @intCast(offset_register)) orelse return null;
+    const multiply_index = switch (definition) {
+        .entry => return null,
+        .instruction => |index| index,
+    };
+    const multiply = instructions[multiply_index];
+    if (gpu.scalar_provenance.scalarRegisterIndex(multiply.dst) != offset_register) return null;
+    const literal = switch (multiply.src1.kind) {
+        .integer_inline_constant, .literal_constant => multiply.src1.value,
+        else => return null,
+    };
+    const step: u32 = switch (multiply.opcode) {
+        .s_lshl_b32 => @as(u32, 1) << @intCast(literal & 31),
+        .s_mul_i32, .s_mulk_i32 => literal,
+        else => return null,
+    };
+    const source = gpu.scalar_provenance.scalarRegisterIndex(multiply.src0) orelse return null;
+    const count = gpu.index_bounds.scalarUpperBound(instructions, &analysis.graph, multiply_index, @intCast(source)) orelse return null;
+    if (step == 0 or count == 0 or count > 16384) return null;
+    const first: u64 = @intCast(load.memory_offset);
+    const length = @as(u64, count - 1) * step + @as(u64, load.data_words) * 4;
+    if (length > 1024 * 1024 or first + length > std.math.maxInt(u32)) return null;
+    var resolver = gpu.scalar_resources.Resolver{ .bindings = bindings, .reader = reader, .instructions = instructions, .graph = &analysis.graph, .snapshot = scalar };
+    var words: [2]u32 = undefined;
+    if (!try resolver.words(load.src0.reg, load.pc, &words) or words[1] > 0xffff) return null;
+    const base = @as(u64, words[0]) | (@as(u64, words[1]) << 32);
+    if (base == 0 or base + first + length > 0x1_0000_0000_0000) return null;
+    return .{ .base = base, .first = first, .step = step, .count = count };
+}
+
+fn resolveScalarPointerImageCandidates(
+    bindings: *const gpu.ShaderBindings,
+    reader: gpu.ShaderMemoryReader,
+    analysis: *const gpu.ShaderAnalysis,
+    scalar: *const gpu.ScalarEvaluation,
+    sample: gpu.ShaderInstruction,
+) anyerror!?BufferImageCandidates {
+    const instructions = analysis.program.instructions.items;
+    var before: usize = 0;
+    while (before < instructions.len and instructions[before].pc < sample.pc) : (before += 1) {}
+    var load_index: ?usize = null;
+    for (0..8) |component| {
+        const definition = gpu.index_bounds.scalarDefinition(instructions, &analysis.graph, before, sample.src1.reg + @as(u32, @intCast(component))) orelse return null;
+        const index = switch (definition) {
+            .entry => return null,
+            .instruction => |index| index,
+        };
+        if (load_index != null and load_index.? != index) return null;
+        load_index = index;
+    }
+    const load = instructions[load_index.?];
+    if (load.dst.kind != .sgpr or sample.src1.reg < load.dst.reg or sample.src1.reg + 8 > load.dst.reg + load.data_words) return null;
+    const plan = (try scalarPointerTablePlan(bindings, reader, analysis, scalar, load)) orelse return null;
+    var result = BufferImageCandidates{};
+    for (0..plan.count) |index| {
+        var words: [8]u32 = undefined;
+        try reader.readWords(((plan.base + plan.first + index * plan.step) & ~@as(u64, 3)) + (sample.src1.reg - load.dst.reg) * 4, &words);
+        if (std.mem.allEqual(u32, &words, 0)) continue;
+        _ = gpu.resources.decodeImageDescriptor(&words) catch return null;
+        var duplicate = false;
+        for (result.words[0..result.count]) |previous| if (std.mem.eql(u32, &previous, &words)) {
+            duplicate = true;
+            break;
+        };
+        if (duplicate) continue;
+        if (result.count == result.words.len) return null;
+        result.words[result.count] = words;
+        result.count += 1;
+    }
+    return result;
+}
+
 const TypedIndexRange = struct { positive_limit: u32, negative_magnitude: u32 = 0 };
 
 fn typedImageIndexRange(
@@ -23766,6 +23881,7 @@ fn resolveBufferImageCandidates(
     sample: gpu.ShaderInstruction,
 ) anyerror!?BufferImageCandidates {
     const plan = (try resolveBufferTablePlan(reader, analysis, scalar, sample.src1.reg, 8, sample.pc, bindings)) orelse {
+        if (try resolveScalarPointerImageCandidates(bindings, reader, analysis, scalar, sample)) |candidates| return candidates;
         if (try resolvePointerImageCandidates(reader, analysis, scalar, sample)) |candidates| return candidates;
         return resolveVectorImageCandidates(bindings, reader, analysis, scalar, sample);
     };

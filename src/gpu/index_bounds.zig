@@ -320,6 +320,8 @@ fn requiresFallthrough(graph: *const Graph, definition: usize, use: usize, guard
 /// preserve full 32-bit wrap semantics unless a guard excludes large indices.
 pub fn scalarUpperBound(instructions: []const Instruction, graph: *const Graph, use: usize, register: u32) ?u32 {
     var result = scalarBitUpperBound(instructions, graph, use, register, 0);
+    if (scalarLoopUpperBound(instructions, graph, use, register)) |bound|
+        result = @min(result orelse std.math.maxInt(u32), bound);
     const value = scalarIdentity(instructions, graph, use, register, 0) orelse return result;
     for (graph.blocks.items) |block| {
         if (block.instruction_count < 2) continue;
@@ -334,6 +336,89 @@ pub fn scalarUpperBound(instructions: []const Instruction, graph: *const Graph, 
         result = @min(result orelse std.math.maxInt(u32), bound);
     }
     return result;
+}
+
+/// A zero-based unit counter, with every recurrence guarded by counter < N.
+/// Both reaching-definition checks are necessary: a separate write before
+/// the increment could otherwise introduce negative or wrapping values.
+fn scalarLoopUpperBound(instructions: []const Instruction, graph: *const Graph, use: usize, register: u32) ?u32 {
+    const location = Location{ .register = register };
+    const definitions = reachingDefinitions(instructions, graph, use, location) orelse return null;
+    if (definitions.entry or definitions.count != 2 or graph.blocks.items.len > maximum_blocks) return null;
+    const initial_index = @min(definitions.items[0], definitions.items[1]);
+    const increment_index = @max(definitions.items[0], definitions.items[1]);
+    if (initial_index >= use or increment_index < use or increment_index + 2 >= instructions.len) return null;
+    const initial = instructions[initial_index];
+    const increment = instructions[increment_index];
+    if (initial.opcode != .s_mov_b32 or initial.dst.kind != .sgpr or initial.dst.reg != register or immediate(initial.src0) != 0 or
+        increment.opcode != .s_add_i32 or increment.dst.kind != .sgpr or increment.dst.reg != register or
+        increment.src0.kind != .sgpr or increment.src0.reg != register or immediate(increment.src1) != 1) return null;
+    const prior = reachingDefinitions(instructions, graph, increment_index, location) orelse return null;
+    if (prior.entry or prior.count != 2 or @min(prior.items[0], prior.items[1]) != initial_index or
+        @max(prior.items[0], prior.items[1]) != increment_index) return null;
+    const compare = instructions[increment_index + 1];
+    const branch = instructions[increment_index + 2];
+    if ((compare.opcode != .s_cmp_lt_i32 and compare.opcode != .s_cmp_lt_u32) or
+        compare.src0.kind != .sgpr or compare.src0.reg != register or branch.opcode != .s_cbranch_scc1) return null;
+    const bound = immediate(compare.src1) orelse return null;
+    if (bound == 0 or bound > std.math.maxInt(i32)) return null;
+    const header_pc = branch.branch_target;
+    if (header_pc <= initial.pc or header_pc > instructions[use].pc) return null;
+    const guard = blockAt(graph, increment_index) orelse return null;
+    if (blockAt(graph, increment_index + 2) != guard) return null;
+    const target = blockAt(graph, use) orelse return null;
+    // Starting after the increment, no path may return to the use without
+    // taking this comparison's true edge. A fallthrough/bypass invalidates
+    // the induction even if the conventional back edge is also present.
+    var visited: [maximum_blocks]bool = @splat(false);
+    var queue: [maximum_blocks]u32 = undefined;
+    queue[0] = guard;
+    visited[guard] = true;
+    var length: usize = 1;
+    var cursor: usize = 0;
+    while (cursor < length) : (cursor += 1) {
+        for (graph.edges.items) |edge| {
+            if (edge.from != queue[cursor] or (edge.from == guard and edge.kind == .branch)) continue;
+            if (edge.to == target) return null;
+            if (visited[edge.to]) continue;
+            visited[edge.to] = true;
+            queue[length] = edge.to;
+            length += 1;
+        }
+    }
+    return bound;
+}
+
+test "counted scalar image loops require a bounded recurrence" {
+    const counter = rdna2.Operand{ .kind = .sgpr, .reg = 16 };
+    var instructions = [_]Instruction{
+        .{ .pc = 0, .opcode = .s_mov_b32, .dst = counter, .src0 = .{ .kind = .integer_inline_constant, .value = 0 } },
+        .{ .pc = 4, .opcode = .s_nop },
+        .{ .pc = 8, .opcode = .s_lshl_b32, .dst = .{ .kind = .vcc_lo }, .src0 = counter, .src1 = .{ .kind = .integer_inline_constant, .value = 5 } },
+        .{ .pc = 12, .opcode = .s_nop },
+        .{ .pc = 16, .opcode = .s_add_i32, .dst = counter, .src0 = counter, .src1 = .{ .kind = .integer_inline_constant, .value = 1 } },
+        .{ .pc = 20, .opcode = .s_cmp_lt_i32, .src0 = counter, .src1 = .{ .kind = .integer_inline_constant, .value = 6 } },
+        .{ .pc = 24, .opcode = .s_cbranch_scc1, .branch_target = 4 },
+        .{ .pc = 28, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?u32, 6), scalarUpperBound(&instructions, &graph, 2, 16));
+    instructions[5].opcode = .s_cmp_lt_u32;
+    try std.testing.expectEqual(@as(?u32, 6), scalarUpperBound(&instructions, &graph, 2, 16));
+    instructions[0].src0.value = 0xffff_ffff;
+    try std.testing.expectEqual(@as(?u32, null), scalarUpperBound(&instructions, &graph, 2, 16));
+    instructions[0].src0.value = 0;
+    instructions[4].src1.value = 2;
+    try std.testing.expectEqual(@as(?u32, null), scalarUpperBound(&instructions, &graph, 2, 16));
+    instructions[4].src1.value = 1;
+    instructions[3] = .{ .pc = 12, .opcode = .s_mov_b32, .dst = counter, .src0 = .{ .kind = .integer_inline_constant, .value = 0xffff_ffff } };
+    try std.testing.expectEqual(@as(?u32, null), scalarUpperBound(&instructions, &graph, 2, 16));
+    instructions[3] = .{ .pc = 12, .opcode = .s_nop };
+    instructions[7] = .{ .pc = 28, .opcode = .s_branch, .branch_target = 4 };
+    var bypass = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer bypass.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?u32, null), scalarUpperBound(&instructions, &bypass, 2, 16));
 }
 
 test "waterfall lane indices retain the vector shift bound" {

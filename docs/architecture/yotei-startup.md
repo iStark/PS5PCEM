@@ -37,6 +37,21 @@ The GPU regression passes with SDK 1.4.357.0 validation, and recovery of the
 captured material now returns all 3,996 descriptors. Live scene validation
 of the large-table and FLAT changes is still pending.
 
+The compute shader at `0x8000316900 + 0x26c` reads six compressed image
+descriptors through a scalar counter. Checkpoints correctly invalidate the
+changing address, but resource recovery previously treated the table as
+unresolved. A bounded zero-based unit recurrence now supplies the candidate
+range, including page-spanning SMEM loads. Runtime pointer mappings take
+precedence over scalar snapshots so each iteration reads its own descriptor.
+Loop headers expanded by guarded memory operations use the structured
+dispatcher to keep their back edges valid.
+
+The six-image GPU regression checks every result, table relocation, a page
+boundary and a null descriptor. It passes SDK validation, along with scalar
+loops/pointers, nested and large image tables, scene FLAT snapshots and the
+full headless smoke suite. Analysis of the captured game shader independently
+recovers the six-entry bound. Live confirmation of this change is pending.
+
 ## Reproduce
 
 ```powershell

@@ -7809,6 +7809,13 @@ const Builder = struct {
             return false;
         }
 
+        // A mapped pointer load may visit several table entries in a loop.
+        // Its runtime address must win over a scalar evaluator's snapshot.
+        for (self.scalar_memory_bindings) |binding| {
+            if (binding.instruction_pc == inst.pc and inst.src0.kind == .sgpr and
+                binding.resource_sgpr == inst.src0.reg) return false;
+        }
+
         // A bound V# is the source of truth for s_buffer_load. Read its live
         // contents and range instead of baking a CPU snapshot into the module.
         switch (inst.opcode) {
@@ -9104,6 +9111,7 @@ fn translateStructuredLoops(builder: *Builder, instructions: []const instruction
     for (graph.blocks.items) |block| {
         try builder.emit(&builder.body, 248, &.{labels[block.index]}); // OpLabel
         try loadMutableControlState(builder);
+        const lowered_start = builder.body.items.len;
 
         const first: usize = block.first_instruction;
         const end: usize = first + block.instruction_count;
@@ -9112,6 +9120,14 @@ fn translateStructuredLoops(builder: *Builder, instructions: []const instruction
             if (inst.opcode.isBranch() or inst.opcode.isProgramEnd() or inst.opcode == .s_setpc_b64) continue;
             try lowerDiagnosed(builder, inst);
         }
+
+        // A guarded store or descriptor lookup can split a guest header into
+        // several SPIR-V blocks. Its incoming back edge still targets the
+        // original label, so placing OpLoopMerge in the final block would
+        // make that edge invalid. The dispatcher keeps a separate loop header
+        // and preserves the guest branches for this expanded shape.
+        if (loop_merges[block.index] != none and instructionStreamContainsOpcode(builder.body.items[lowered_start..], 248))
+            return Error.UnsupportedControlFlow;
 
         if (last.opcode.isProgramEnd()) {
             try builder.emit(&builder.body, 253, &.{}); // OpReturn
@@ -9877,7 +9893,11 @@ fn translateInstructions(
 }
 
 fn containsOpcode(words: []const u32, wanted: u16) bool {
-    var index: usize = 5;
+    return words.len >= 5 and instructionStreamContainsOpcode(words[5..], wanted);
+}
+
+fn instructionStreamContainsOpcode(words: []const u32, wanted: u16) bool {
+    var index: usize = 0;
     while (index < words.len) {
         const first = words[index];
         if (@as(u16, @truncate(first)) == wanted) return true;
