@@ -55,6 +55,22 @@ pub const Resolver = struct {
         switch (inst.opcode) {
             .s_mov_b32, .s_mov_b64 => return self.operand(inst.src0, component, index, depth + 1),
             .s_movk_i32 => return @bitCast(@as(i32, @as(i16, @bitCast(@as(u16, @truncate(inst.src0.value)))))),
+            .s_bfm_b32, .s_bfm_b64 => {
+                // Sampler constants are also assembled in branches that the
+                // scalar walk cannot visit. Recover both inputs at the mask
+                // producer instead of borrowing its destination snapshot.
+                const width = (try self.operand(inst.src0, 0, index, depth + 1)) orelse return null;
+                const offset = (try self.operand(inst.src1, 0, index, depth + 1)) orelse return null;
+                if (inst.opcode == .s_bfm_b32) {
+                    if (component != 0) return null;
+                    const mask = (@as(u32, 1) << @as(u5, @truncate(width))) - 1;
+                    return mask << @as(u5, @truncate(offset));
+                }
+                if (component >= 2) return null;
+                const mask = (@as(u64, 1) << @as(u6, @truncate(width))) - 1;
+                const value = mask << @as(u6, @truncate(offset));
+                return @truncate(value >> @as(u6, @intCast(component * 32)));
+            },
             .s_load_dword, .s_load_dwordx2, .s_load_dwordx4, .s_load_dwordx8, .s_load_dwordx16, .s_buffer_load_dword, .s_buffer_load_dwordx2, .s_buffer_load_dwordx4, .s_buffer_load_dwordx8, .s_buffer_load_dwordx16 => {},
             else => return if (known.known and known.producer_pc == inst.pc) known.value else null,
         }
@@ -85,6 +101,42 @@ pub const Resolver = struct {
         return try self.reader.readU32(byte);
     }
 };
+
+test "scalar resource recovery reconstructs bitfield sampler constants" {
+    const M = struct {
+        fn read(_: ?*anyopaque, _: u64, _: []u8) bool {
+            return false;
+        }
+    };
+    var instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_cbranch_execz, .branch_target = 16 },
+        .{ .pc = 4, .opcode = .s_bfm_b64, .dst = .{ .kind = .sgpr, .reg = 32 }, .src0 = .{ .kind = .integer_inline_constant, .value = 12 }, .src1 = .{ .kind = .integer_inline_constant, .value = 44 } },
+        .{ .pc = 8, .opcode = .s_mov_b64, .dst = .{ .kind = .sgpr, .reg = 34 }, .src0 = .{ .kind = .literal_constant, .value = 0x05500000 } },
+        .{ .pc = 12, .opcode = .s_nop },
+        .{ .pc = 16, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    var snapshot = scalar.Evaluation{};
+    var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = null, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot };
+    var words: [4]u32 = undefined;
+    try std.testing.expect(try resolver.words(32, 12, &words));
+    try std.testing.expectEqualSlices(u32, &.{ 0, 0x00fff000, 0x05500000, 0 }, &words);
+    instructions[1].src0.value = 64;
+    resolver.remaining = 512;
+    try std.testing.expect(try resolver.words(32, 12, &words));
+    try std.testing.expectEqual(@as(u32, 0), words[1]);
+    instructions[1].opcode = .s_bfm_b32;
+    instructions[1].src0.value = 40;
+    instructions[1].src1.value = 36;
+    resolver.remaining = 512;
+    try std.testing.expect(try resolver.words(32, 12, words[0..1]));
+    try std.testing.expectEqual(@as(u32, 0xff0), words[0]);
+    instructions[1].src0 = .{ .kind = .vgpr, .reg = 0 };
+    resolver.remaining = 512;
+    try std.testing.expect(!try resolver.words(32, 12, words[0..1]));
+}
 
 test "scalar resource recovery follows nested loads after USER_DATA reuse" {
     const Memory = struct {

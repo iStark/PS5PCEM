@@ -52,6 +52,22 @@ loops/pointers, nested and large image tables, scene FLAT snapshots and the
 full headless smoke suite. Analysis of the captured game shader independently
 recovers the six-entry bound. Live confirmation of this change is pending.
 
+Two further refusals were reproduced from a running game. The visibility
+kernel `0x8000333c00` loads object pointers from 592-byte records, but the
+checkpoint at its texture operation no longer contains the original table
+V#. Recovery now follows that descriptor's producer at the pointer load.
+The captured 244-record table resolves to six objects sharing one depth
+texture. The nested-image GPU regression additionally overwrites the table's
+SGPR window before sampling and verifies both relocated object tables.
+
+The kernel `0x800037f200` assembles a sampler with `S_BFM_B64` inside a branch
+the scalar walk cannot visit. Resource recovery now reconstructs 32/64-bit
+bitfield masks from their inputs. Both captured kernels execute one workgroup
+with SDK validation and isolated output writes (120,863 and 60,215 SPIR-V
+words respectively). These replays verify execution coverage, not complete
+scene correctness. The pointer/table, typed-index, large-image, FLAT and full
+smoke regressions pass; live integration remains to be checked.
+
 ## Reproduce
 
 ```powershell

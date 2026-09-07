@@ -2120,12 +2120,13 @@ fn runScalarPointerProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runNestedImageProbe(allocator: std.mem.Allocator) !void {
-    try runNestedImageCase(allocator, false);
-    try runNestedImageCase(allocator, true);
-    std.debug.print("nested sampled images passed: record pointers, bounded lane selection, runtime T#/S# loads, null bounds and relocated object pages\n", .{});
+    try runNestedImageCase(allocator, false, false);
+    try runNestedImageCase(allocator, true, false);
+    try runNestedImageCase(allocator, true, true);
+    std.debug.print("nested sampled images passed: record pointers, bounded lane selection, reused table SGPRs, runtime T#/S# loads, null bounds and relocated object pages\n", .{});
 }
 
-fn runNestedImageCase(allocator: std.mem.Allocator, bounded: bool) !void {
+fn runNestedImageCase(allocator: std.mem.Allocator, bounded: bool, reuse_table: bool) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{ .trace_resource_failures = true });
     defer renderer.deinit();
     var guest = GuestMemory{};
@@ -2140,7 +2141,11 @@ fn runNestedImageCase(allocator: std.mem.Allocator, bounded: bool) !void {
         if (bounded) 268 | (106 << 9) else 0xbf80_0000, // s30 = first active lane of v12
         0x936a_ff00 | @as(u32, if (bounded) 30 else 28),
         592,
-        0xf424_000c, 106 << 25, // pointer = s_buffer_load_dwordx2 s0, V#s24, vcc_lo
+        0xf424_000c,                                        106 << 25, // pointer = s_buffer_load_dwordx2 s0, V#s24, vcc_lo
+        // The original V# remains relevant to the pointer load even after
+        // this SGPR window is reused before the texture operation.
+        if (reuse_table) sop1(3, 24, 128) else 0xbf80_0000, if (reuse_table) sop1(3, 25, 128) else 0xbf80_0000,
+        if (reuse_table) sop1(3, 26, 128) else 0xbf80_0000, if (reuse_table) sop1(3, 27, 128) else 0xbf80_0000,
         0xf40c_0100, (125 << 25) | 64, // T#s4 = pointer + 64
         0xf408_0300,                 (125 << 25) | 96, // S#s12 = pointer + 96
         vop1(1, 1, 255),             0x3e80_0000,

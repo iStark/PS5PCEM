@@ -7758,7 +7758,7 @@ pub const Renderer = struct {
                 const known_offset = scalarMemoryOffset(inst, &scalar) orelse continue;
                 if (known_offset < 0) continue;
                 offset = @intCast(known_offset);
-                pointers = (try resolveBufferPointerCandidates(reader, analysis, &scalar, inst.src0.reg, inst.pc)) orelse continue;
+                pointers = (try resolveBufferPointerCandidates(bindings, reader, analysis, &scalar, inst.src0.reg, inst.pc)) orelse continue;
             }
             for (pointers.addresses[0..pointers.count]) |pointer| {
                 const first = (pointer + offset) & ~@as(u64, 3);
@@ -23812,9 +23812,19 @@ fn resolveBufferTablePlan(
         break;
     }
     const load = producer orelse return null;
-    const buffer = (try scalarBufferDescriptor(scalar, load.src0.reg)) orelse return null;
-    // The table descriptor must still be the same value used by the load.
-    for (scalar.registers[load.src0.reg..][0..4]) |word| if (word.producer_pc >= load.pc) return null;
+    const buffer = table: {
+        // A visited checkpoint may retain the original table descriptor.
+        // Unvisited branches instead need its definitions at this load;
+        // a later snapshot may have reused the same SGPRs.
+        if (try scalarBufferDescriptor(scalar, load.src0.reg)) |candidate| {
+            var unchanged = true;
+            for (scalar.registers[load.src0.reg..][0..4]) |word|
+                unchanged = unchanged and word.producer_pc < load.pc;
+            if (unchanged) break :table candidate;
+        }
+        const inputs = bindings orelse return null;
+        break :table (try resolveProducedBufferDescriptor(inputs, reader, analysis, scalar, load.src0.reg, load.pc, 0)) orelse return null;
+    };
     var stride: ?u32 = null;
     var index_bound: ?u32 = null;
     var index_register: ?u32 = null;
@@ -23882,7 +23892,7 @@ fn resolveBufferImageCandidates(
 ) anyerror!?BufferImageCandidates {
     const plan = (try resolveBufferTablePlan(reader, analysis, scalar, sample.src1.reg, 8, sample.pc, bindings)) orelse {
         if (try resolveScalarPointerImageCandidates(bindings, reader, analysis, scalar, sample)) |candidates| return candidates;
-        if (try resolvePointerImageCandidates(reader, analysis, scalar, sample)) |candidates| return candidates;
+        if (try resolvePointerImageCandidates(bindings, reader, analysis, scalar, sample)) |candidates| return candidates;
         return resolveVectorImageCandidates(bindings, reader, analysis, scalar, sample);
     };
     var result = BufferImageCandidates{};
@@ -23962,13 +23972,14 @@ const PointerCandidates = struct {
 };
 
 fn resolveBufferPointerCandidates(
+    bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
     analysis: *const gpu.ShaderAnalysis,
     scalar: *const gpu.ScalarEvaluation,
     register: u32,
     before_pc: u32,
 ) anyerror!?PointerCandidates {
-    const plan = (try resolveBufferTablePlan(reader, analysis, scalar, register, 2, before_pc, null)) orelse return null;
+    const plan = (try resolveBufferTablePlan(reader, analysis, scalar, register, 2, before_pc, bindings)) orelse return null;
     var result = PointerCandidates{};
     var offset = plan.first;
     while (offset + 8 <= plan.buffer.size_bytes and offset < plan.limit) : (offset += plan.step) {
@@ -23998,6 +24009,7 @@ fn pointerLoadForRegisters(instructions: []const gpu.ShaderInstruction, register
 }
 
 fn resolvePointerImageCandidates(
+    bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
     analysis: *const gpu.ShaderAnalysis,
     scalar: *const gpu.ScalarEvaluation,
@@ -24010,7 +24022,7 @@ fn resolvePointerImageCandidates(
     const image_offset = (scalarMemoryOffset(image_load, scalar) orelse return null) + (sample.src1.reg - image_load.dst.reg) * 4;
     const sampler_offset = (scalarMemoryOffset(sampler_load, scalar) orelse return null) + (sample.src2.reg - sampler_load.dst.reg) * 4;
     if (image_offset < 0 or sampler_offset < 0) return null;
-    const pointers = (try resolveBufferPointerCandidates(reader, analysis, scalar, image_load.src0.reg, @min(image_load.pc, sampler_load.pc))) orelse return null;
+    const pointers = (try resolveBufferPointerCandidates(bindings, reader, analysis, scalar, image_load.src0.reg, @min(image_load.pc, sampler_load.pc))) orelse return null;
     var result = BufferImageCandidates{};
     for (pointers.addresses[0..pointers.count]) |pointer| {
         var words: [8]u32 = undefined;
