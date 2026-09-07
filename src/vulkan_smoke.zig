@@ -958,8 +958,9 @@ fn runVectorCarryProbe(allocator: std.mem.Allocator) !void {
             const active = exec & (@as(u64, 1) << @intCast(lane % 64)) != 0;
             const low = if (!active) a else if (opcode == 0x30f) a +% b else if (opcode == 0x310) a -% b else b -% a;
             const high = if (!active) b else 0x20 + @as(u32, @intCast((mask >> @intCast(lane % 64)) & 1));
-            const expected = [_]u32{ low, high, @truncate(mask), @truncate(mask >> 32) };
-            for (expected[0..if (lanes == 64) @as(usize, 4) else 2], 0..) |word, component| {
+            const lane_mask: u32 = if (mask & (@as(u64, 1) << @intCast(lane % 64)) != 0) 0xffff_ffff else 0;
+            const expected = [_]u32{ low, high, if (lanes == 64) @truncate(mask) else lane_mask, if (lanes == 64) @truncate(mask >> 32) else lane_mask };
+            for (expected, 0..) |word, component| {
                 const actual = std.mem.readInt(u32, output[lane * 16 + component * 4 ..][0..4], .little);
                 if (word != actual) std.debug.print("carry case={d} lanes={d} opcode={x} SDST={d} lane={d} component={d}\n", .{ case, lanes, opcode, sdst, lane, component });
                 try std.testing.expectEqual(word, actual);
@@ -967,6 +968,50 @@ fn runVectorCarryProbe(allocator: std.mem.Allocator) !void {
         }
     };
     std.debug.print("vector carry-out passed: add/sub/subrev, VCC/SGPR masks, stale carry, unsigned overflow/borrow, overlapping operands and 64/512 lanes\n", .{});
+}
+
+fn runWideMaskProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    var case: u32 = 0;
+    for ([_]u32{ 64, 512 }) |lanes| for ([_]u8{ 106, 12 }) |sdst| for ([_]u8{ 0, 16, 32, 48, 64 }) |threshold| {
+        case += 1;
+        const code = [_]u32{
+            0x3602_00bf, // v1 = v0 & 63
+            vop1(1, 2, 128 + @as(u9, threshold)),
+            vop1(1, 3, 170), // sentinel 42
+            sop1(4, sdst, 193), // stale high mask must be replaced by the comparison
+            0x7d82_04f9,
+            0x0606_8001 | (@as(u32, sdst) << 8), // SDWA V_CMP_LT_U32 -> explicit scalar pair
+            sop1(0x24, 20, sdst), // save EXEC, enter the true lanes
+            vop1(1, 3, 129),
+            0x8afe_7e14, // exec = saved & ~exec: the complementary lanes
+            vop1(1, 3, 130),
+            sop1(4, 126, 20),
+            mubuf(0x1c, 0, 3, 0, 0)[0],
+            mubuf(0x1c, 0, 3, 0, 0)[1],
+            0xbf81_0000,
+        };
+        for (code, 0..) |word, index| guest.word(case * 256 + index * 4, word);
+        var state = gpu.State{};
+        try state.writeRegister(.shader, 0x20c, case);
+        try state.writeRegister(.shader, 0x20d, 0);
+        try state.writeRegister(.shader, 0x213, 4 << 1);
+        for ([_]u32{ 0x10000, 4 << 16, lanes, 0 }, 0..) |word, index|
+            try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(index)), word);
+        _ = try renderer.dispatchRdna2State(&state, .{ lanes, 1, 1 }, .{ 1, 1, 1 });
+        var output: [512 * 4]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x10000, output[0 .. lanes * 4]);
+        for (0..lanes) |lane| {
+            const expected: u32 = if (lane % 64 < threshold) 1 else 2;
+            const actual = std.mem.readInt(u32, output[lane * 4 ..][0..4], .little);
+            if (actual != expected) std.debug.print("mask case={d} lanes={d} SDST={d} threshold={d} lane={d}\n", .{ case, lanes, sdst, threshold, lane });
+            try std.testing.expectEqual(expected, actual);
+        }
+    };
+    std.debug.print("wide masks passed: SDWA comparisons, VCC/SGPR pairs, saved EXEC, complementary lanes and 64/512 invocations\n", .{});
 }
 
 fn runWave64Probe(allocator: std.mem.Allocator) !void {
@@ -2786,6 +2831,10 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(allocator);
     if (args.len == 2 and std.mem.eql(u8, args[1], "--vector-carry")) {
         try runVectorCarryProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--wide-masks")) {
+        try runWideMaskProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--counted-image-loop")) {

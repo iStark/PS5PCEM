@@ -1988,7 +1988,10 @@ const Builder = struct {
             try self.constant(.bits32, 0xffff_ffff),
             try self.constant(.bits32, 0),
         });
-        try self.destination(inst.dst, .{ .id = mask, .value_type = .bits32 });
+        // The per-invocation representation still occupies a scalar pair.
+        // Saved EXEC and 64-bit mask arithmetic must not read a stale high
+        // word, particularly for lanes 32..63 in larger workgroups.
+        try self.destinationPair(inst.dst, .{ mask, mask });
         if (inst.dst.kind == .exec_lo) {
             self.exec_mask_is_lane_predicate = true;
             self.exec_mask_lane_predicate_condition = 0;

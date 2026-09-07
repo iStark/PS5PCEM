@@ -4,6 +4,16 @@ Verified with PPSA26344 and the RTX 3070 Ti on 2026-09-06.
 
 ## Menu progress on 2026-09-07
 
+Per-invocation comparison and carry masks now update both scalar words.
+Previously only the low word changed, so saved EXEC and 64-bit mask arithmetic
+could reuse stale upper-half bits. A GPU probe using SDWA comparisons,
+`S_AND_SAVEEXEC_B64` and complementary EXEC masks fails on the old code:
+lane 32 retains its sentinel instead of executing the false branch. All 20
+64/512-invocation cases pass after updating the pair, along with carry,
+wave64, packed-buffer, scene-pointer and full Vulkan regressions.
+This follows the carry-only game's later `0x80001abb00` fault at PC `0x9bc`;
+the complete scene still needs verification with the pair update.
+
 Runtime sampled-image tables can now select between 2D and 3D Vulkan views
 at one instruction. Each view kind has its own exact descriptor lookup;
 unmatched results are zeroed before combining them. Coordinates survive
