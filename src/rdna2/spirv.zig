@@ -233,6 +233,9 @@ fn colorExportValueType(color_type: ColorExportType) ValueType {
 pub const Options = struct {
     stage: Stage,
     local_size: [3]u32 = .{ 1, 1, 1 },
+    /// Guest wave32 mode limits VALU scalar masks and EXEC lane indexing to
+    /// the low word, independently of the host workgroup size.
+    wave32: bool = false,
     /// Pixel extent used to normalize FragCoord when the paired vertex PARAM
     /// interface is unavailable. The backend supplies the active color target.
     fragment_extent: [2]u32 = .{ 1280, 720 },
@@ -636,6 +639,7 @@ const Builder = struct {
     subgroup_local_invocation_id: u32 = 0,
     wave64_workgroup: bool = false,
     wave_scratch: u32 = 0,
+    wave32: bool = false,
     wave_word_pointer: u32 = 0,
     /// The execution mask, as low and high halves, once a shader has narrowed
     /// it. Null means untouched — every lane on — which is how a wave starts
@@ -748,6 +752,7 @@ const Builder = struct {
             .compute_inputs = options.compute_inputs,
             .local_size = options.local_size,
             .wave64_workgroup = options.wave64_workgroup,
+            .wave32 = options.wave32,
             .fragment_extent = options.fragment_extent,
             .scalar_specializations = options.scalar_registers,
             .dynamic_scalar_binding = options.dynamic_scalar_binding,
@@ -1991,7 +1996,11 @@ const Builder = struct {
         // The per-invocation representation still occupies a scalar pair.
         // Saved EXEC and 64-bit mask arithmetic must not read a stale high
         // word, particularly for lanes 32..63 in larger workgroups.
-        try self.destinationPair(inst.dst, .{ mask, mask });
+        if (self.wave32) {
+            try self.destination(inst.dst, .{ .id = mask, .value_type = .bits32 });
+        } else {
+            try self.destinationPair(inst.dst, .{ mask, mask });
+        }
         if (inst.dst.kind == .exec_lo) {
             self.exec_mask_is_lane_predicate = true;
             self.exec_mask_lane_predicate_condition = 0;
@@ -2647,7 +2656,7 @@ const Builder = struct {
         if (self.local_invocation_index == 0) return self.constant(.bits32, 0);
         const invocation = self.id();
         try self.emit(&self.body, 61, &.{ self.bits_type, invocation, self.local_invocation_index });
-        return self.andBits(invocation, 63);
+        return self.andBits(invocation, if (self.wave32) 31 else 63);
     }
 
     fn permlane(self: *Builder, inst: instruction.Instruction, exchange: bool) Error!void {
@@ -6110,7 +6119,7 @@ const Builder = struct {
         if (self.local_invocation_index == 0) return Error.UnsupportedBufferAddressing;
         const invocation = self.id();
         try self.emit(&self.body, 61, &.{ self.bits_type, invocation, self.local_invocation_index }); // OpLoad
-        const lane = try self.andBits(invocation, 63);
+        const lane = try self.andBits(invocation, if (self.wave32) 31 else 63);
         const lane_bytes = self.id();
         try self.emit(&self.body, 196, &.{ self.bits_type, lane_bytes, lane, try self.constant(.bits32, 2) }); // OpShiftLeftLogical
         return self.addBits(offset_base, lane_bytes);
@@ -6739,7 +6748,7 @@ const Builder = struct {
 
     fn readLane(self: *Builder, inst: instruction.Instruction) Error!void {
         const source_value = try self.source(inst.src0, .bits32);
-        const lane = try self.source(inst.src1, .bits32);
+        const lane = try self.andBits(try self.source(inst.src1, .bits32), if (self.wave32) 31 else 63);
         if (self.wave64_workgroup) {
             try self.destination(inst.dst, .{ .id = try self.waveShuffle(source_value, lane), .value_type = .bits32 });
             return;
@@ -6753,7 +6762,7 @@ const Builder = struct {
             lane,
         }); // OpGroupNonUniformShuffle
         var selected = result;
-        if (constantWaveLane(inst.src1)) |index| {
+        if (self.constantLane(inst.src1)) |index| {
             if (self.findLaneSpill(inst.src0.reg, index)) |spill| {
                 const saved = self.id();
                 const valid = self.id();
@@ -6768,13 +6777,13 @@ const Builder = struct {
 
     fn writeLane(self: *Builder, inst: instruction.Instruction) Error!void {
         const value = try self.source(inst.src0, .bits32);
-        const lane = try self.source(inst.src1, .bits32);
+        const lane = try self.andBits(try self.source(inst.src1, .bits32), if (self.wave32) 31 else 63);
         // Compilers spill uniform SGPR values into different lanes of one
         // VGPR. Keep those slots distinct even when a host subgroup is smaller
         // than the guest wave, or the destination lane is an inactive helper.
         self.writing_lane = true;
         defer self.writing_lane = false;
-        if (constantWaveLane(inst.src1)) |index| {
+        if (self.constantLane(inst.src1)) |index| {
             if (self.findLaneSpill(inst.dst.reg, index)) |spill| {
                 try self.emit(&self.body, 62, &.{ spill.value, value });
                 try self.emit(&self.body, 62, &.{ spill.valid, try self.constant(.bits32, 1) });
@@ -6790,12 +6799,17 @@ const Builder = struct {
         }
         const invocation = self.id();
         try self.emit(&self.body, 61, &.{ self.bits_type, invocation, self.local_invocation_index }); // OpLoad
-        const lane_id = try self.andBits(invocation, 63);
+        const lane_id = try self.andBits(invocation, if (self.wave32) 31 else 63);
         const matches = self.id();
         try self.emit(&self.body, 170, &.{ self.bool_type, matches, lane_id, lane }); // OpIEqual
         const result = self.id();
         try self.emit(&self.body, 169, &.{ self.bits_type, result, matches, value, current }); // OpSelect
         try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+    }
+
+    fn constantLane(self: *const Builder, op: operand.Operand) ?u32 {
+        const lane = constantWaveLane(op) orelse return null;
+        return lane & (if (self.wave32) @as(u32, 31) else 63);
     }
 
     fn findLaneSpill(self: *const Builder, vgpr: u32, lane: u32) ?LaneSpill {
@@ -6814,7 +6828,7 @@ const Builder = struct {
     fn configureLaneSpills(self: *Builder, instructions: []const instruction.Instruction) Error!void {
         for (instructions) |inst| {
             if (inst.opcode != .v_writelane_b32 or inst.dst.kind != .vgpr or inst.src0.kind == .vgpr) continue;
-            const lane = constantWaveLane(inst.src1) orelse continue;
+            const lane = self.constantLane(inst.src1) orelse continue;
             if (self.findLaneSpill(inst.dst.reg, lane) != null) continue;
             if (self.lane_spill_pointer_type == 0) {
                 self.lane_spill_pointer_type = self.id();
@@ -6855,7 +6869,7 @@ const Builder = struct {
             if (self.local_invocation_index == 0) return Error.UnsupportedBufferAddressing;
             const invocation = self.id();
             try self.emit(&self.body, 61, &.{ self.bits_type, invocation, self.local_invocation_index }); // OpLoad
-            index = try self.addBits(index, try self.andBits(invocation, 63));
+            index = try self.addBits(index, try self.andBits(invocation, if (self.wave32) 31 else 63));
         }
 
         var offset = try self.constant(.bits32, @as(u32, @intCast(inst.memory_offset)) + extra_offset);
@@ -7070,7 +7084,7 @@ const Builder = struct {
 
         const invocation = self.id();
         try self.emit(&self.body, 61, &.{ self.bits_type, invocation, self.local_invocation_index }); // OpLoad
-        const lane = try self.andBits(invocation, 63);
+        const lane = try self.andBits(invocation, if (self.wave32) 31 else 63);
 
         // The mask is sixty-four bits and a lane index is six, so which half a
         // lane lives in is itself part of the question.
@@ -9950,7 +9964,7 @@ fn translateInstructions(
     }
     effective.uses_lane_identity = effective.uses_lane_identity or effective.uses_execution_mask or
         (effective.uses_execution_mask and has_predicated_write);
-    if (effective.stage == .compute and @as(u64, effective.local_size[0]) * effective.local_size[1] * effective.local_size[2] == 64 and cross_half_read and !uses_gds) {
+    if (!effective.wave32 and effective.stage == .compute and @as(u64, effective.local_size[0]) * effective.local_size[1] * effective.local_size[2] == 64 and cross_half_read and !uses_gds) {
         effective.wave64_workgroup = true;
         effective.uses_lane_identity = true;
         effective.uses_execution_mask = true;

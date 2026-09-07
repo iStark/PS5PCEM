@@ -4866,6 +4866,16 @@ pub const Renderer = struct {
         local_size: [3]u32,
         group_count: [3]u32,
     ) anyerror!DispatchReport {
+        return self.dispatchRdna2StateWithInitiator(state, local_size, group_count, 0);
+    }
+
+    fn dispatchRdna2StateWithInitiator(
+        self: *Renderer,
+        state: *const gpu.State,
+        local_size: [3]u32,
+        group_count: [3]u32,
+        initiator: u32,
+    ) anyerror!DispatchReport {
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
         self.last_shader_read_failure = null;
         const reader = gpu.ShaderMemoryReader{ .context = self, .read_fn = readDispatchShaderMemory };
@@ -5619,6 +5629,7 @@ pub const Renderer = struct {
         var module = analysis.translateSpirv(self.allocator, .{
             .stage = .compute,
             .local_size = local_size,
+            .wave32 = initiator & (1 << 15) != 0,
             .storage_buffers = resources.mappings[0..resources.mapping_count],
             .sampled_images = resources.sampled_image_mappings[0..resources.sampled_image_mapping_count],
             .storage_images = resources.storage_image_mappings[0..resources.storage_image_mapping_count],
@@ -20786,10 +20797,11 @@ pub const Renderer = struct {
                 },
             );
         }
-        _ = self.dispatchRdna2State(
+        _ = self.dispatchRdna2StateWithInitiator(
             state,
             local_size,
             group_count,
+            initiator,
         ) catch |err| {
             self.last_dispatch_error = err;
             // Soft-skip resource/translation gaps so one incomplete compute

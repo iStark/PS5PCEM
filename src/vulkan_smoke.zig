@@ -970,6 +970,59 @@ fn runVectorCarryProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("vector carry-out passed: add/sub/subrev, VCC/SGPR masks, stale carry, unsigned overflow/borrow, overlapping operands and 64/512 lanes\n", .{});
 }
 
+fn runWave32MaskProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    const backend = renderer.dcbBackend(guest.interface());
+    var case: u32 = 0;
+    for ([_]u32{ 32, 64, 512 }) |lanes| for ([_]u8{ 107, 12, 13 }) |sdst| {
+        case += 1;
+        const neighbor: u8 = if (sdst == 107) 106 else sdst + 1;
+        const code = [_]u32{
+            0x3602_009f, // v1 = v0 & 31
+            vop1(1, 2, 144),
+            vop1(1, 3, 170),
+            sop1(3, neighbor, 255),
+            777,
+            sop1(3, 126, 255),
+            0x5555_5555,
+            sop1(3, 127, 255),          0xaaaa_aaaa, // ignored by wave32 lane selection
+            0x7d82_04f9,                0x0606_8001 | (@as(u32, sdst) << 8),
+            sop1(0x3c, 20, sdst),       vop1(1, 3, 129),
+            sop1(3, 126, 193),          vop1(1, 4, sdst),
+            vop1(1, 5, neighbor),       mubuf(0x1f, 0, 3, 0, 0)[0],
+            mubuf(0x1f, 0, 3, 0, 0)[1], 0xbf81_0000,
+        };
+        for (code, 0..) |word, index| guest.word(case * 256 + index * 4, word);
+        var state = gpu.State{};
+        try state.writeRegister(.shader, 0x20c, case);
+        try state.writeRegister(.shader, 0x20d, 0);
+        try state.writeRegister(.shader, 0x207, lanes);
+        try state.writeRegister(.shader, 0x208, 1);
+        try state.writeRegister(.shader, 0x209, 1);
+        try state.writeRegister(.shader, 0x213, 4 << 1);
+        for ([_]u32{ 0x10000, 12 << 16, lanes, 0 }, 0..) |word, index|
+            try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(index)), word);
+        const packet_words = [_]u32{ 0xc003_1502, 1, 1, 1, 0x8041 };
+        var walker = gpu.pm4.Walker.init(&packet_words);
+        try std.testing.expect(backend.vtable.dispatch.?(backend.context, &state, (try walker.next()).?));
+        if (renderer.last_dispatch_error) |err| return err;
+        var output: [512 * 12]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x10000, output[0 .. lanes * 12]);
+        for (0..lanes) |lane| {
+            const active = lane % 32 < 16 and lane % 2 == 0;
+            const expected = [_]u32{ if (active) 1 else 42, if (active) 0xffff_ffff else 0, 777 };
+            for (expected, 0..) |word, component| {
+                const actual = std.mem.readInt(u32, output[lane * 12 + component * 4 ..][0..4], .little);
+                if (actual != word) std.debug.print("wave32 case={d} SDST={d} lane={d} component={d}\n", .{ case, sdst, lane, component });
+                try std.testing.expectEqual(word, actual);
+            }
+        }
+    };
+    std.debug.print("wave32 masks passed: dispatch initiator, VCC_HI, odd SGPRs, neighboring words and repeated low EXEC across 32/64/512 invocations\n", .{});
+}
+
 fn runSaveExecProbe(allocator: std.mem.Allocator) !void {
     const pairs = [_][2]u64{
         .{ 0xaaaa_aaaa_5555_5555, 0xcccc_cccc_3333_3333 },
@@ -2972,6 +3025,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--save-exec")) {
         try runSaveExecProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--wave32-masks")) {
+        try runWave32MaskProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--counted-image-loop")) {

@@ -4,6 +4,18 @@ Verified with PPSA26344 and the RTX 3070 Ti on 2026-09-06.
 
 ## Menu progress on 2026-09-07
 
+Compute dispatches now pass `CS_W32_EN` from the PM4 initiator to translation.
+Wave32 comparison/carry destinations write one word, preserving adjacent
+SGPRs; EXEC indexing, lane operations and add-thread-id addressing use 32
+lanes. This removes the `UnsupportedBufferAddressing` rejection for explicit
+`VCC_HI` comparison destinations in live programs `0x8000345d00` and
+`0x80002d6700`, whose captured initiator is `0x8041`. The GPU regression uses
+the PM4 callback with 32/64/512 invocations, odd SGPR destinations and
+opposing EXEC halves: it fails on the previous translator and passes with
+the dispatch mode. SAVEEXEC, wave64, wide masks, carry, scene pointers,
+packed buffers, DPP, GDS, indexed images and full Vulkan smoke also pass SDK
+validation. Complete game rendering remains unverified.
+
 SAVEEXEC now applies negation to the operand specified by the ISA:
 `ANDN1` computes `~source & EXEC`, while `ORN2` computes `source | ~EXEC`.
 The previous lowering reversed both operands. In the captured culling shader
@@ -27,7 +39,7 @@ slices, and an out-of-bounds material index resolving global entry zero.
 Indirect, nested, vector, typed-index, uniform-loop, 4096-view and full Vulkan
 regressions pass. Live particle rendering still requires the new runtime.
 
-Per-invocation comparison and carry masks now update both scalar words.
+Wave64 per-invocation comparison and carry masks now update both scalar words.
 Previously only the low word changed, so saved EXEC and 64-bit mask arithmetic
 could reuse stale upper-half bits. A GPU probe using SDWA comparisons,
 `S_AND_SAVEEXEC_B64` and complementary EXEC masks fails on the old code:
