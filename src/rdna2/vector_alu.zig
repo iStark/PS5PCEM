@@ -556,11 +556,11 @@ fn nativeVop3Opcode(id: u32) isa.Opcode {
         0x30c => .v_min_i16,
         0x30d => .v_add_nc_i16,
         0x30e => .v_sub_nc_i16,
-        0x30f => .v_add_i32,
-        0x310 => .v_sub_i32,
+        0x30f => .v_add_co_u32,
+        0x310 => .v_sub_co_u32,
         0x311 => .v_pack_b32_f16,
         0x314 => .v_lshlrev_b16,
-        0x319 => .v_subrev_i32,
+        0x319 => .v_subrev_co_u32,
         0x34b => .v_fma_f16,
         0x351 => .v_min3_f16,
         0x354 => .v_max3_f16,
@@ -605,7 +605,11 @@ pub fn decodeVop3(pc: u32, code: []const u32, word_index: u32) Error!Instruction
     } else {
         inst.dst = try operand.decodeVectorGpr(word0 & 0xff);
     }
-    if (op == .v_addc_u32 or op == .v_subrev_co_ci_u32) {
+    const carry_output = switch (op) {
+        .v_addc_u32, .v_subrev_co_ci_u32, .v_add_co_u32, .v_sub_co_u32, .v_subrev_co_u32 => true,
+        else => false,
+    };
+    if (carry_output) {
         // VOP3B repurposes the ABS field as a seven-bit scalar destination.
         inst.dst2 = try operand.decodeScalarDestination((word0 >> 8) & 0x7f);
     }
@@ -613,7 +617,7 @@ pub fn decodeVop3(pc: u32, code: []const u32, word_index: u32) Error!Instruction
     inst.src_count = vop3SourceCount(op, id);
     if (inst.src_count >= 2) inst.src1 = try operand.decodeScalarSource((word1 >> 9) & 0x1ff);
     if (inst.src_count >= 3) inst.src2 = try operand.decodeScalarSource((word1 >> 18) & 0x1ff);
-    const abs = if (op == .v_addc_u32 or op == .v_subrev_co_ci_u32) 0 else (word0 >> 8) & 7;
+    const abs = if (carry_output) 0 else (word0 >> 8) & 7;
     const neg = (word1 >> 29) & 7;
     const sources = [_]*operand.Operand{ &inst.src0, &inst.src1, &inst.src2 };
     for (sources, 0..) |src, i| {
@@ -650,11 +654,11 @@ fn vop3SourceCount(op: isa.Opcode, id: u32) u32 {
         .v_min_i16,
         .v_add_nc_i16,
         .v_sub_nc_i16,
-        .v_add_i32,
-        .v_sub_i32,
+        .v_add_co_u32,
+        .v_sub_co_u32,
         .v_pack_b32_f16,
         .v_lshlrev_b16,
-        .v_subrev_i32,
+        .v_subrev_co_u32,
         .v_bfm_b32,
         .v_bcnt_u32_b32,
         .v_mbcnt_lo_u32_b32,
@@ -836,6 +840,19 @@ test "VOP3B addc decodes scalar carry input and destination" {
     try std.testing.expectEqual(@as(u32, 12), inst.src2.reg);
     try std.testing.expect(!inst.src0.absolute);
     try std.testing.expect(!inst.src1.absolute);
+}
+
+test "VOP3B carry-out arithmetic decodes SDST instead of absolute modifiers" {
+    for ([_]u32{ 0x30f, 0x310, 0x319 }, [_]isa.Opcode{ .v_add_co_u32, .v_sub_co_u32, .v_subrev_co_u32 }) |id, op| {
+        for ([_]u32{ 106, 12 }) |sdst| {
+            const inst = try decodeVop3(0x760, &.{ 0xd400_0000 | (id << 16) | (sdst << 8), 0x0002_0108 }, 0);
+            try std.testing.expectEqual(op, inst.opcode);
+            try std.testing.expectEqual(@as(u32, 2), inst.src_count);
+            try std.testing.expectEqual(if (sdst == 106) isa.OperandKind.vcc_lo else isa.OperandKind.sgpr, inst.dst2.kind);
+            if (sdst != 106) try std.testing.expectEqual(sdst, inst.dst2.reg);
+            try std.testing.expect(!inst.src0.absolute and !inst.src1.absolute);
+        }
+    }
 }
 
 test "RDNA2 native VOP3 masked bit counts use two sources" {

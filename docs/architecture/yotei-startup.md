@@ -4,6 +4,20 @@ Verified with PPSA26344 and the RTX 3070 Ti on 2026-09-06.
 
 ## Menu progress on 2026-09-07
 
+VOP3B `V_ADD_CO_U32`, `V_SUB_CO_U32` and `V_SUBREV_CO_U32` now
+decode their scalar carry destination and export unsigned carry/borrow.
+They previously performed ordinary integer arithmetic, leaving stale VCC
+bits for the following ADDC. Live culling faults in `0x8000196500`,
+`0x80001abb00` and `0x80001c0d00` consequently included record addresses
+with high word `0x21` instead of `0x20`. A controlled scene-pointer GPU
+probe reproduces the error on the previous translator: it reads
+`0x100012000` instead of `0x12000`. The corrected translator reads both
+relocated records and still rejects an intentionally out-of-bounds read.
+The arithmetic probe checks all three operations with VCC and SGPR
+destinations, overlapping operands, partial EXEC, and 64/512 invocations.
+Wave64, FLAT and full Vulkan smoke checks pass with SDK validation.
+The effect on the complete game frame still requires runtime verification.
+
 Material recovery now rejects reserved image-resource bit 94 and destination
 selectors 2/3, as specified by RDNA2 ISA section 8.2.6. The quad material
 `0x80003a6b00` scans a 96-record table with stride 388; its unbounded 32-bit

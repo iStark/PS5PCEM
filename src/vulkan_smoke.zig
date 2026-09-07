@@ -904,6 +904,71 @@ fn runGatherLodProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("gather LOD passed: four texel order, two mips, sampler/view LOD bounds, linear filtering and all eight comparisons\n", .{});
 }
 
+fn runVectorCarryProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const inputs = [_][2]u32{
+        .{ 0x0307_7900, 0xa8 },        .{ 0xffff_ffff, 1 }, .{ 0x8000_0000, 0x8000_0000 },
+        .{ 0, 1 },                     .{ 1, 0 },           .{ 0x8000_0000, 0 },
+        .{ 0xffff_ffff, 0xffff_ffff }, .{ 0, 0 },
+    };
+    var case: u32 = 0;
+    for ([_]u32{ 64, 512 }) |lanes| for ([_]u32{ 0x30f, 0x310, 0x319 }) |opcode| for ([_]u32{ 106, 12 }) |sdst| for ([_]u64{ 0xffff_ffff_ffff_ffff, 0xaaaa_aaaa_5555_5555 }) |exec| {
+        const program = 0x100 + case * 0x100;
+        case += 1;
+        const code = [_]u32{
+            mubuf(0x0d, 0, 2, 0, 0)[0],                    mubuf(0x0d, 0, 2, 0, 0)[1],
+            if (lanes == 64) 0xd760_000a else 0xbf80_0000,
+            if (lanes == 64) 258 | (191 << 9) else 0xbf80_0000, // require a complete cross-half wave mask
+            vop1(1, 7, 256), // preserve local index while destinations overlap v2:v3
+            sop1(4, 106, 193), // stale all-one VCC must not survive a carry-out instruction
+            sop1(4, 126, 20),
+            0xd400_0002 | (opcode << 16) | (sdst << 8),
+            258 | (259 << 9),
+            0xd528_1003,                    128 | (8 << 9) | (sdst << 18), // high = 0x20 + carry/borrow
+            sop1(4, 126, 193),              vop1(1, 4, @intCast(sdst)),
+            vop1(1, 5, @intCast(sdst + 1)), mubuf(0x1e, 0, 2, 7, 4)[0],
+            mubuf(0x1e, 0, 2, 7, 4)[1],     0xbf81_0000,
+        };
+        for (code, 0..) |word, index| guest.word(program + index * 4, word);
+        for (0..lanes) |lane| for (inputs[lane % inputs.len], 0..) |word, component|
+            guest.word(0x10000 + lane * 8 + component * 4, word);
+        var state = gpu.State{};
+        try state.writeRegister(.shader, 0x20c, program >> 8);
+        try state.writeRegister(.shader, 0x20d, 0);
+        try state.writeRegister(.shader, 0x213, 24 << 1);
+        var ud: [24]u32 = @splat(0);
+        @memcpy(ud[0..9], &[_]u32{ 0x10000, 8 << 16, lanes, 0, 0x12000, 16 << 16, lanes, 0, 0x20 });
+        ud[20] = @truncate(exec);
+        ud[21] = @truncate(exec >> 32);
+        for (ud, 0..) |word, index| try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(index)), word);
+        _ = try renderer.dispatchRdna2State(&state, .{ lanes, 1, 1 }, .{ 1, 1, 1 });
+        var output: [512 * 16]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x12000, output[0 .. lanes * 16]);
+        var mask: u64 = 0;
+        for (0..64) |lane| {
+            const a, const b = inputs[lane % inputs.len];
+            const carry = if (opcode == 0x30f) @as(u64, a) + b > 0xffff_ffff else if (opcode == 0x310) a < b else b < a;
+            if (carry and exec & (@as(u64, 1) << @intCast(lane)) != 0) mask |= @as(u64, 1) << @intCast(lane);
+        }
+        for (0..lanes) |lane| {
+            const a, const b = inputs[lane % inputs.len];
+            const active = exec & (@as(u64, 1) << @intCast(lane % 64)) != 0;
+            const low = if (!active) a else if (opcode == 0x30f) a +% b else if (opcode == 0x310) a -% b else b -% a;
+            const high = if (!active) b else 0x20 + @as(u32, @intCast((mask >> @intCast(lane % 64)) & 1));
+            const expected = [_]u32{ low, high, @truncate(mask), @truncate(mask >> 32) };
+            for (expected[0..if (lanes == 64) @as(usize, 4) else 2], 0..) |word, component| {
+                const actual = std.mem.readInt(u32, output[lane * 16 + component * 4 ..][0..4], .little);
+                if (word != actual) std.debug.print("carry case={d} lanes={d} opcode={x} SDST={d} lane={d} component={d}\n", .{ case, lanes, opcode, sdst, lane, component });
+                try std.testing.expectEqual(word, actual);
+            }
+        }
+    };
+    std.debug.print("vector carry-out passed: add/sub/subrev, VCC/SGPR masks, stale carry, unsigned overflow/borrow, overlapping operands and 64/512 lanes\n", .{});
+}
+
 fn runWave64Probe(allocator: std.mem.Allocator) !void {
     for ([_][3]u32{ .{ 64, 1, 1 }, .{ 4, 4, 4 } }) |local_size| try runWave64Case(allocator, local_size);
     std.debug.print("wave64 passed: lane 63, full masks, carry bits and uniform EXEC branches across workgroup shapes\n", .{});
@@ -2084,7 +2149,7 @@ fn runSceneFlatPointerProbe(allocator: std.mem.Allocator) !void {
     _ = renderer.dcbBackend(guest.interface());
     // Preserve the captured pointer-walk sites, with NOPs in place of its
     // culling math. All memory discovery, upload and fault checks are live.
-    var code: [0x3b5c / 4]u32 = @splat(0xbf80_0000);
+    var code: [0x3b6c / 4]u32 = @splat(0xbf80_0000);
     code[0] = vop1(1, 4, 128);
     code[0x3ad4 / 4] = 0xdc34_8018;
     code[0x3ad8 / 4] = 0x0400_0004;
@@ -2092,12 +2157,18 @@ fn runSceneFlatPointerProbe(allocator: std.mem.Allocator) !void {
     code[0x3ae4 / 4] = 0x067d_0004;
     code[0x3b3c / 4] = 0xdc34_8088;
     code[0x3b40 / 4] = 0x0e7d_0004;
-    code[0x3b44 / 4] = 0xdc38_8000;
-    code[0x3b48 / 4] = 0x007d_000e;
-    code[0x3b4c / 4] = vop1(1, 8, 128);
-    code[0x3b50 / 4] = mubuf(0x1e, 0, 0, 8, 4)[0];
-    code[0x3b54 / 4] = mubuf(0x1e, 0, 0, 8, 4)[1];
-    code[0x3b58 / 4] = 0xbf81_0000;
+    // The real culling shaders form 64-bit record addresses with VOP3B
+    // carry-out followed by VOP2 ADDC. A stale VCC must not add 4 GiB.
+    code[0x3b44 / 4] = sop1(4, 106, 193);
+    code[0x3b48 / 4] = 0xd70f_6a0e;
+    code[0x3b4c / 4] = 270 | (128 << 9);
+    code[0x3b50 / 4] = 0x501e_1e80;
+    code[0x3b54 / 4] = 0xdc38_8000;
+    code[0x3b58 / 4] = 0x007d_000e;
+    code[0x3b5c / 4] = vop1(1, 8, 128);
+    code[0x3b60 / 4] = mubuf(0x1e, 0, 0, 8, 4)[0];
+    code[0x3b64 / 4] = mubuf(0x1e, 0, 0, 8, 4)[1];
+    code[0x3b68 / 4] = 0xbf81_0000;
     for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
     guest.word(0x10010, 1);
     guest.word(0x10018, 0x11000);
@@ -2124,11 +2195,11 @@ fn runSceneFlatPointerProbe(allocator: std.mem.Allocator) !void {
     try std.testing.expectError(error.InvalidStorageDescriptor, renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 }));
     guest.word(0x11000 + 152, 1);
     // Use another program address so the immutable program cache is valid.
-    code[0x3b44 / 4] |= 168;
+    code[0x3b54 / 4] |= 168;
     for (code, 0..) |word, index| guest.word(0x5000 + index * 4, word);
     try state.writeRegister(.shader, 0x20c, 0x50);
     try std.testing.expectError(error.GuestMemoryReadFailed, renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 }));
-    std.debug.print("Scene FLAT snapshots passed: nested descriptor walk, relocated records, count bounds and live unmapped-read rejection\n", .{});
+    std.debug.print("Scene FLAT snapshots passed: nested descriptor walk, carry-out address chain, relocated records, count bounds and live unmapped-read rejection\n", .{});
 }
 
 fn runScalarPointerProbe(allocator: std.mem.Allocator) !void {
@@ -2701,6 +2772,10 @@ fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--vector-carry")) {
+        try runVectorCarryProbe(allocator);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--counted-image-loop")) {
         try runCountedImageLoopProbe(allocator, false);
         return;

@@ -1905,6 +1905,21 @@ const Builder = struct {
         try self.vectorConditionDestination(carry_inst, carry_out);
     }
 
+    fn vectorCarryOut(self: *Builder, inst: instruction.Instruction, subtract: bool, reverse: bool) Error!void {
+        const a = try self.source(if (reverse) inst.src1 else inst.src0, .bits32);
+        const b = try self.source(if (reverse) inst.src0 else inst.src1, .bits32);
+        const result = self.id();
+        try self.emit(&self.body, if (subtract) 130 else 128, &.{ self.bits_type, result, a, b });
+        const carry = self.id();
+        // Subtraction exports an unsigned borrow. Addition exports overflow,
+        // even when its VGPR destination overlaps either source operand.
+        try self.emit(&self.body, 176, &.{ self.bool_type, carry, if (subtract) a else result, if (subtract) b else a });
+        try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+        var carry_inst = inst;
+        carry_inst.dst = inst.dst2;
+        try self.vectorConditionDestination(carry_inst, carry);
+    }
+
     fn multiply24(self: *Builder, inst: instruction.Instruction, signed: bool) Error!void {
         var a = try self.source(inst.src0, if (signed) .sint32 else .bits32);
         var b = try self.source(inst.src1, if (signed) .sint32 else .bits32);
@@ -8295,9 +8310,9 @@ const Builder = struct {
             .v_alignbyte_b32 => try self.alignBit(inst, true),
             .v_xnor_b32 => try self.xnor32(inst),
             .v_mul_lo_i32 => try self.binary(inst, 132, .bits32, false),
-            .v_add_i32 => try self.binary(inst, 128, .bits32, false),
-            .v_sub_i32 => try self.binary(inst, 130, .bits32, false),
-            .v_subrev_i32 => try self.binary(inst, 130, .bits32, true),
+            .v_add_co_u32 => try self.vectorCarryOut(inst, false, false),
+            .v_sub_co_u32 => try self.vectorCarryOut(inst, true, false),
+            .v_subrev_co_u32 => try self.vectorCarryOut(inst, true, true),
             .v_ldexp_f32 => try self.ldexpFloat(inst),
             .v_rndne_f32 => try self.glslFloatUnary(inst, 2), // RoundEven
             .v_trunc_f32 => try self.glslFloatUnary(inst, 3),
