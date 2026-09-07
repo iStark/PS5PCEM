@@ -11,9 +11,24 @@ translation faults. The title menu and brightness screen are **not verified
 on this build**. The installed executable was restored to the previously
 tested `796a484` runtime for UI comparison; a separate build isolates the
 per-invocation high-mask write without changing the remaining fixes.
-The control run has reached the loading indicator and Digital Deluxe Bonus
-(flip 955), including its Cross glyph. The remaining bonus notices and
-brightness screen are still being checked on that reference runtime.
+The `796a484` control run verified the animated loading indicator (flip 837),
+Digital Deluxe Bonus (955), Gift of the Northern Star (1000), Pre-order
+Bonus (1058), and brightness calibration (1149). The notices have readable
+text and Cross glyphs; brightness includes the wolf image, instruction,
+slider and confirmation glyph. The executable remains on this reference
+build, with the brightness screen left open. This does not verify the UI
+on the newer renderer: its previous live run crashed before the notices.
+The latest candidate, `174832a`, was built separately and has not been run
+through this sequence. Full title-menu rendering remains unverified.
+
+The reference resolved its roughly 6,042 resources in about 18 minutes;
+initial scene frames then spent 267 and 162 seconds preparing dispatches.
+A sampled long pause was inside the NVIDIA driver. Later UI frames took
+roughly 5-10 seconds, making fades and input gates slow in wall-clock time.
+The game accepted explicit confirmation input. The test helper initially
+missed the second notice because its image matching included too much
+shared layout; manual confirmation advanced it, and title-only matching
+with vertical tolerance corrected the helper.
 
 D16 buffer loads now permit an undefined destination VGPR, choosing zero
 for its untouched half while preserving any previous definition. This
