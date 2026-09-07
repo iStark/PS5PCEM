@@ -77,6 +77,10 @@ pub const SampledImageBinding = struct {
     candidate_words: ?[8]u32 = null,
     /// Proven all-zero T# source. No physical image or sampler is required.
     unbound: bool = false,
+    /// Gather comparisons operate on each texel before any filtering.
+    depth_compare: u8 = 7,
+    minimum_lod: f32 = 0,
+    maximum_lod: f32 = 16,
 };
 
 pub const SampledImageDimension = enum {
@@ -5547,16 +5551,16 @@ const Builder = struct {
         const arrayed = inst.image_dimension == .dim_2d_array_alt;
         const coordinate_count: u8 = if (arrayed) 3 else 2;
         const flags: u16 = @bitCast(inst.image_sample_flags);
-        const supported_flags = (@as(u16, 1) << 5) | (@as(u16, 1) << 4);
+        const supported_flags = (@as(u16, 1) << 5) | (@as(u16, 1) << 4) | 1;
         const compare = inst.image_sample_flags.compare;
         const supported_with_compare = supported_flags | (@as(u16, 1) << 3);
         if ((self.stage != .fragment and self.stage != .compute) or
             (inst.image_dimension != .dim_2d and !arrayed) or
-            !inst.image_sample_flags.level_zero or
+            (!inst.image_sample_flags.level_zero and !inst.image_sample_flags.lod) or
             flags & ~(if (compare) supported_with_compare else supported_flags) != 0 or
             inst.data_mask == 0 or
             inst.image_address_components != coordinate_count + @as(u8, @intFromBool(inst.image_sample_flags.offset)) +
-                @as(u8, @intFromBool(compare)))
+                @as(u8, @intFromBool(compare)) + @as(u8, @intFromBool(inst.image_sample_flags.lod)))
         {
             return Error.UnsupportedOpcode;
         }
@@ -5587,12 +5591,12 @@ const Builder = struct {
         const sampled_image = try self.loadSampledImage(binding);
 
         const component: u32 = @ctz(inst.data_mask);
-        if (self.stage == .compute) {
+        if (self.stage == .compute or inst.image_sample_flags.lod or compare) {
             // SPIR-V does not permit a Lod operand on OpImageGather, while a
-            // compute shader cannot use the implicit-derivative form. Approximate
-            // GFX10 gather_lz with four explicit mip-zero samples at the gather
-            // footprint. This preserves the four values and remains valid in a
-            // derivative-free execution model.
+            // compute shader cannot use the implicit-derivative form. Sample
+            // the four texel centers at the selected mip and compare each
+            // fetched depth separately. This also works when depth is exposed
+            // through an ordinary R32/R16 sampled view.
             if (self.sampled_image_image_types[dimension_index] == 0) return Error.InvalidStorageBinding;
             const dref = if (compare)
                 try self.source(try imageAddressOperand(inst, dref_index), .float32)
@@ -5616,12 +5620,31 @@ const Builder = struct {
             self.uses_image_query = true;
             const image = self.id();
             try self.emit(&self.body, 100, &.{ self.sampled_image_image_types[dimension_index], image, sampled_image }); // OpImage
+            var lod = try self.constant(.float32, 0);
+            var mip = try self.constant(.bits32, 0);
+            if (inst.image_sample_flags.lod) {
+                const requested = try self.source(try imageAddressOperand(inst, coordinate_base + coordinate_count), .float32);
+                const lod_lower = try self.glslBinaryValue(40, .float32, requested, try self.constant(.float32, @bitCast(binding.minimum_lod)));
+                const lod_upper = try self.glslBinaryValue(37, .float32, lod_lower, try self.constant(.float32, @bitCast(binding.maximum_lod)));
+                const rounded = self.id();
+                try self.emit(&self.body, 129, &.{ self.float_type, rounded, lod_upper, try self.constant(.float32, @bitCast(@as(f32, 0.5))) });
+                const integer_lod = try self.glslFloatUnaryValue(8, rounded); // Floor
+                const levels = self.id();
+                try self.emit(&self.body, 106, &.{ self.bits_type, levels, image });
+                const last = self.id();
+                try self.emit(&self.body, 130, &.{ self.bits_type, last, levels, try self.constant(.bits32, 1) });
+                const last_float = self.id();
+                try self.emit(&self.body, 112, &.{ self.float_type, last_float, last });
+                lod = try self.glslBinaryValue(37, .float32, try self.glslBinaryValue(40, .float32, integer_lod, try self.constant(.float32, 0)), last_float);
+                mip = self.id();
+                try self.emit(&self.body, 109, &.{ self.bits_type, mip, lod }); // OpConvertFToU
+            }
             const size = self.id();
             try self.emit(&self.body, 103, &.{
                 if (arrayed) try self.ensureBitsVec3() else try self.ensureBitsVec2(),
                 size,
                 image,
-                try self.constant(.bits32, 0),
+                mip,
             }); // OpImageQuerySizeLod
             const width = self.id();
             const height = self.id();
@@ -5631,6 +5654,22 @@ const Builder = struct {
             const height_float = self.id();
             try self.emit(&self.body, 112, &.{ self.float_type, width_float, width }); // OpConvertUToF
             try self.emit(&self.body, 112, &.{ self.float_type, height_float, height });
+
+            // Gather starts at floor(uv * size - 0.5). Sampling the input UV
+            // directly shifts its footprint and can blend neighbouring texels.
+            var base_coordinates: [2]u32 = undefined;
+            for ([_]u32{ raw_x, raw_y }, [_]u32{ width_float, height_float }, 0..) |coordinate, extent, axis| {
+                const scaled = self.id();
+                try self.emit(&self.body, 133, &.{ self.float_type, scaled, coordinate, extent });
+                const shifted = self.id();
+                const half = try self.constant(.float32, @bitCast(@as(f32, 0.5)));
+                try self.emit(&self.body, 131, &.{ self.float_type, shifted, scaled, half });
+                const floored = try self.glslFloatUnaryValue(8, shifted);
+                const center = self.id();
+                try self.emit(&self.body, 129, &.{ self.float_type, center, floored, half });
+                base_coordinates[axis] = self.id();
+                try self.emit(&self.body, 136, &.{ self.float_type, base_coordinates[axis], center, extent });
+            }
 
             const footprint = [4][2]i32{
                 .{ 0, 1 },
@@ -5664,8 +5703,8 @@ const Builder = struct {
                 try self.emit(&self.body, 136, &.{ self.float_type, normalized_y, offset_y_float, height_float });
                 const adjusted_x = self.id();
                 const adjusted_y = self.id();
-                try self.emit(&self.body, 129, &.{ self.float_type, adjusted_x, raw_x, normalized_x }); // OpFAdd
-                try self.emit(&self.body, 129, &.{ self.float_type, adjusted_y, raw_y, normalized_y });
+                try self.emit(&self.body, 129, &.{ self.float_type, adjusted_x, base_coordinates[0], normalized_x }); // OpFAdd
+                try self.emit(&self.body, 129, &.{ self.float_type, adjusted_y, base_coordinates[1], normalized_y });
                 const adjusted_coordinates = self.id();
                 if (layer) |array_layer| {
                     try self.emit(&self.body, 80, &.{ self.vector3_type, adjusted_coordinates, adjusted_x, adjusted_y, array_layer });
@@ -5673,28 +5712,13 @@ const Builder = struct {
                     try self.emit(&self.body, 80, &.{ self.vector2_type, adjusted_coordinates, adjusted_x, adjusted_y });
                 }
                 const sampled = self.id();
+                try self.emit(&self.body, 88, &.{ self.vector4_type, sampled, sampled_image, adjusted_coordinates, 0x2, lod });
+                const texel = self.id();
+                try self.emit(&self.body, 81, &.{ self.float_type, texel, sampled, component });
                 if (dref) |reference| {
-                    try self.emit(&self.body, 90, &.{
-                        self.float_type,
-                        sampled,
-                        sampled_image,
-                        adjusted_coordinates,
-                        reference,
-                        0x2, // ImageOperands Lod
-                        try self.constant(.float32, @bitCast(@as(f32, 0))),
-                    }); // OpImageSampleDrefExplicitLod
-                    values[index] = sampled;
+                    values[index] = try self.compareGatherDepth(reference, texel, binding.depth_compare);
                 } else {
-                    try self.emit(&self.body, 88, &.{
-                        self.vector4_type,
-                        sampled,
-                        sampled_image,
-                        adjusted_coordinates,
-                        0x2, // ImageOperands Lod
-                        try self.constant(.float32, @bitCast(@as(f32, 0))),
-                    }); // OpImageSampleExplicitLod
-                    values[index] = self.id();
-                    try self.emit(&self.body, 81, &.{ self.float_type, values[index], sampled, component }); // OpCompositeExtract
+                    values[index] = texel;
                 }
             }
             for (values, 0..) |value, index| {
@@ -5707,29 +5731,7 @@ const Builder = struct {
         }
 
         const gathered = self.id();
-        if (compare) {
-            const dref = try self.source(try imageAddressOperand(inst, dref_index), .float32);
-            if (inst.image_sample_flags.offset) {
-                const offset = try self.imageTexelOffset(inst);
-                try self.emit(&self.body, 97, &.{
-                    self.vector4_type,
-                    gathered,
-                    sampled_image,
-                    coordinates,
-                    dref,
-                    0x10, // ImageOperands Offset
-                    offset,
-                }); // OpImageDrefGather
-            } else {
-                try self.emit(&self.body, 97, &.{
-                    self.vector4_type,
-                    gathered,
-                    sampled_image,
-                    coordinates,
-                    dref,
-                }); // OpImageDrefGather
-            }
-        } else if (inst.image_sample_flags.offset) {
+        if (inst.image_sample_flags.offset) {
             const offset = try self.imageTexelOffset(inst);
             try self.emit(&self.body, 96, &.{
                 self.vector4_type,
@@ -5758,6 +5760,24 @@ const Builder = struct {
                 .{ .id = value, .value_type = .float32 },
             );
         }
+    }
+
+    fn compareGatherDepth(self: *Builder, reference: u32, texel: u32, function: u8) Error!u32 {
+        if (function == 0 or function == 7) return self.constant(.float32, @bitCast(@as(f32, if (function == 0) 0 else 1)));
+        const opcode: u16 = switch (function) {
+            1 => 184, // FOrdLessThan
+            2 => 180, // FOrdEqual
+            3 => 188, // FOrdLessThanEqual
+            4 => 186, // FOrdGreaterThan
+            5 => 183, // FUnordNotEqual
+            6 => 190, // FOrdGreaterThanEqual
+            else => return Error.InvalidStorageBinding,
+        };
+        const condition = self.id();
+        try self.emit(&self.body, opcode, &.{ self.bool_type, condition, reference, texel });
+        const result = self.id();
+        try self.emit(&self.body, 169, &.{ self.float_type, result, condition, try self.constant(.float32, @bitCast(@as(f32, 1))), try self.constant(.float32, 0) });
+        return result;
     }
 
     fn addBits(self: *Builder, a: u32, b: u32) Error!u32 {
@@ -11441,7 +11461,7 @@ test "array gather4 preserves the layer in compute and fragment stages" {
     }
 }
 
-test "compute comparison gather4 level zero becomes four explicit depth samples" {
+test "compute comparison gather4 level zero compares four unfiltered texels" {
     const decoder = @import("decoder.zig");
     const code = [_]u32{
         0xf13c_010a, // image_gather4_c_lz dim:2d dmask:x, three NSA addresses
@@ -11463,8 +11483,24 @@ test "compute comparison gather4 level zero becomes four explicit depth samples"
     });
     defer module.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 4), countOpcode(module.words, 90)); // OpImageSampleDrefExplicitLod
+    try std.testing.expectEqual(@as(usize, 4), countOpcode(module.words, 88)); // OpImageSampleExplicitLod
+    try std.testing.expect(!containsOpcode(module.words, 90)); // no comparison sampler needed
     try std.testing.expect(!containsOpcode(module.words, 97)); // no derivative-dependent OpImageDrefGather
+}
+
+test "comparison gather explicit LOD translates in compute and fragment stages" {
+    const decoder = @import("decoder.zig");
+    var program = try decoder.decodeProgram(std.testing.allocator, &.{ 0xf130_010a, 0x00a3_0013, 0x0016_1a19, 0xbf81_0000 });
+    defer program.deinit(std.testing.allocator);
+    const bindings = [_]SampledImageBinding{.{ .resource_sgpr = 12, .sampler_sgpr = 20, .descriptor_index = 0, .depth_compare = 1 }};
+    for ([_]Stage{ .compute, .fragment }) |stage| {
+        var module = try translate(std.testing.allocator, &program, .{ .stage = stage, .sampled_images = &bindings });
+        defer module.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 4), countOpcode(module.words, 88));
+        try std.testing.expectEqual(@as(usize, 4), countOpcode(module.words, 184));
+        try std.testing.expect(containsOpcode(module.words, 106)); // query mip bound
+        try std.testing.expect(!containsOpcode(module.words, 97));
+    }
 }
 
 test "fragment sample level zero accepts a packed texel offset before NSA coordinates" {

@@ -796,6 +796,95 @@ fn runWholeQuadModeProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("whole quad mode passed: captured VCC high destination, preserved low word, SCC and changing input\n", .{});
 }
 
+fn runGatherLodProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const code = [_]u32{
+        vop1(1, 6, 18), vop1(1, 7, 16), vop1(1, 8, 17), vop1(1, 9, 19),
+        0xf130_0108, 0x0040_0006, // gather_c_l: reference, x, y, lod
+        0xe078_0000, 0x8003_0000, // output four floats through V#s12
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var image = sampledImageDescriptorWords(0x8000, 4, 4);
+    image[3] |= (1 << 16) | (@as(u32, @intFromEnum(gpu.resources.TileMode.standard_4kb)) << 20);
+    image[5] = 1 << 4;
+    const texture = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&image));
+    const red = [2][4]u8{ .{ 32, 224, 96, 192 }, .{ 224, 32, 192, 96 } };
+    for (0..2) |level| {
+        const view = try texture.subresource(@intCast(level), 0, 1);
+        for (0..view.height) |y| for (0..view.width) |x| {
+            const selected = if (level == 0 and x >= 1 and x <= 2 and y >= 1 and y <= 2)
+                red[0][(y - 1) * 2 + x - 1]
+            else if (level == 1) red[1][y * 2 + x] else 0;
+            const offset: usize = @intCast(try view.sourceByteOffset(@intCast(x), @intCast(y), 0, 0));
+            guest.word(0x8000 + offset, 0xff00_0000 | @as(u32, selected));
+        };
+    }
+    var state = gpu.State{};
+    const stage = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, stage.programRegisterBase(), 1);
+    try state.writeRegister(.shader, stage.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 20 << 1);
+    var userdata: [20]u32 = @splat(0);
+    @memcpy(userdata[0..8], &image);
+    userdata[9] = 0xfff << 12;
+    userdata[10] = (1 << 20) | (1 << 22) | (2 << 26); // linear sampler must still gather individual texels
+    @memcpy(userdata[12..16], &[_]u32{ 0x6000, 0, 16, 0 });
+    userdata[16] = @bitCast(@as(f32, 0.5));
+    userdata[17] = @bitCast(@as(f32, 0.5));
+    for (0..8) |comparison| {
+        userdata[8] = @as(u32, @intCast(comparison)) << 12;
+        for ([_]f32{ -1, 0, 0.6, 1, 9 }) |lod| {
+            userdata[18] = @bitCast(@as(f32, 96.0 / 255.0));
+            userdata[19] = @bitCast(lod);
+            for (userdata, 0..) |word, index| try state.writeRegister(.shader, stage.userDataBase() + @as(u32, @intCast(index)), word);
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+            var output: [16]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x6000, &output);
+            const mip: usize = if (lod < 0.5) 0 else 1;
+            for ([_]usize{ 2, 3, 1, 0 }, 0..) |texel, index| {
+                const reference: f32 = 96.0 / 255.0;
+                const depth = @as(f32, @floatFromInt(red[mip][texel])) / 255.0;
+                const passes = switch (comparison) {
+                    0 => false,
+                    1 => reference < depth,
+                    2 => reference == depth,
+                    3 => reference <= depth,
+                    4 => reference > depth,
+                    5 => reference != depth,
+                    6 => reference >= depth,
+                    7 => true,
+                    else => unreachable,
+                };
+                const actual: f32 = @bitCast(std.mem.readInt(u32, output[index * 4 ..][0..4], .little));
+                try std.testing.expectEqual(@as(f32, if (passes) 1 else 0), actual);
+            }
+        }
+    }
+    var plain_code = code;
+    plain_code[4] = 0xf110_0108; // gather_l: x, y, lod
+    plain_code[5] = 0x0040_0007;
+    for (plain_code, 0..) |word, index| guest.word(0x200 + index * 4, word);
+    try state.writeRegister(.shader, stage.programRegisterBase(), 2);
+    for ([_][3]f32{ .{ 0, 0, 16 }, .{ 1, 0, 16 }, .{ 0, 1, 16 }, .{ 1, 0, 0 }, .{ 0, 0.25, 16 }, .{ 1, 0, 0.75 } }) |test_case| {
+        userdata[9] = @as(u32, @intFromFloat(test_case[1] * 256)) | (@as(u32, @min(4095, @as(u32, @intFromFloat(test_case[2] * 256)))) << 12);
+        userdata[19] = @bitCast(test_case[0]);
+        for (userdata, 0..) |word, index| try state.writeRegister(.shader, stage.userDataBase() + @as(u32, @intCast(index)), word);
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        var output: [16]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x6000, &output);
+        const mip: usize = if (std.math.clamp(test_case[0], test_case[1], test_case[2]) < 0.5) 0 else 1;
+        for ([_]usize{ 2, 3, 1, 0 }, 0..) |texel, index| {
+            const actual: f32 = @bitCast(std.mem.readInt(u32, output[index * 4 ..][0..4], .little));
+            try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(red[mip][texel])) / 255.0, actual, 0.00001);
+        }
+    }
+    std.debug.print("gather LOD passed: four texel order, two mips, sampler/view LOD bounds, linear filtering and all eight comparisons\n", .{});
+}
+
 fn runWave64Probe(allocator: std.mem.Allocator) !void {
     for ([_][3]u32{ .{ 64, 1, 1 }, .{ 4, 4, 4 } }) |local_size| try runWave64Case(allocator, local_size);
     std.debug.print("wave64 passed: lane 63, full masks, carry bits and uniform EXEC branches across workgroup shapes\n", .{});
@@ -2180,6 +2269,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--quad-mode")) {
         try runWholeQuadModeProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--gather-lod")) {
+        try runGatherLodProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--htile-clears")) {

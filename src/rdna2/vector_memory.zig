@@ -311,7 +311,7 @@ fn mimgOpcode(id: u32) isa.Opcode {
         0x1a => .image_atomic_xor,
         0x1f => .image_atomic_fmax,
         0x20...0x3f, 0x68...0x6f, 0xa0...0xbe => .image_sample,
-        0x47, 0x48, 0x4f, 0x57, 0x58, 0x5f, 0x61 => .image_gather4,
+        0x44, 0x47, 0x48, 0x4c, 0x4f, 0x54, 0x57, 0x58, 0x5c, 0x5f, 0x61 => .image_gather4,
         0x60 => .image_get_lod,
         else => .unsupported,
     };
@@ -319,6 +319,22 @@ fn mimgOpcode(id: u32) isa.Opcode {
 
 fn bitCount4(mask: u4) u8 {
     return @intCast(@popCount(mask));
+}
+
+test "comparison gather explicit LOD decodes all captured NSA operands" {
+    const inst = try decodeMimg(0x10cc, &.{ 0xf130_010a, 0x00a3_0013, 0x0016_1a19 }, 0);
+    try std.testing.expectEqual(isa.Opcode.image_gather4, inst.opcode);
+    try std.testing.expect(inst.image_sample_flags.lod);
+    try std.testing.expect(inst.image_sample_flags.compare);
+    try std.testing.expect(!inst.image_sample_flags.level_zero);
+    try std.testing.expectEqual(@as(u8, 4), inst.image_address_components);
+    try std.testing.expectEqual(@as(u8, 4), inst.data_words);
+    try std.testing.expectEqual(@as(u32, 19), inst.src0.reg);
+    try std.testing.expectEqualSlices(u8, &.{ 25, 26, 22 }, inst.image_nsa_address[0..3]);
+    const offset = try decodeMimg(0, &.{ 0xf170_010a, 0x00a3_0001, 0x0504_0302 }, 0);
+    try std.testing.expect(offset.image_sample_flags.offset);
+    try std.testing.expect(offset.image_sample_flags.lod);
+    try std.testing.expectEqual(@as(u8, 5), offset.image_address_components);
 }
 
 pub fn decodeMimg(pc: u32, code: []const u32, word_index: u32) Error!Instruction {
@@ -367,6 +383,16 @@ pub fn decodeMimg(pc: u32, code: []const u32, word_index: u32) Error!Instruction
         }
     } else if (op == .image_gather4) {
         switch (id) {
+            0x44 => inst.image_sample_flags.lod = true,
+            0x4c => {
+                inst.image_sample_flags.compare = true;
+                inst.image_sample_flags.lod = true;
+            },
+            0x54, 0x5c => {
+                inst.image_sample_flags.lod = true;
+                inst.image_sample_flags.offset = true;
+                inst.image_sample_flags.compare = id == 0x5c;
+            },
             0x47 => inst.image_sample_flags.level_zero = true,
             0x48 => inst.image_sample_flags.compare = true,
             0x4f => {
@@ -419,6 +445,7 @@ pub fn decodeMimg(pc: u32, code: []const u32, word_index: u32) Error!Instruction
     } else if (op == .image_gather4) {
         inst.image_address_components += @intFromBool(inst.image_sample_flags.offset);
         inst.image_address_components += @intFromBool(inst.image_sample_flags.compare);
+        inst.image_address_components += @intFromBool(inst.image_sample_flags.lod);
     }
     for (0..@as(usize, nsa) * 4) |i| {
         inst.image_nsa_address[i] = @truncate(code[word_index + 2 + i / 4] >> @intCast((i % 4) * 8));

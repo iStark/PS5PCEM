@@ -944,6 +944,23 @@ repeated zero/one clears, the captured compute kernel, DMA, and partial/mixed
 guards. The complete smoke and D32 bias probe pass with clean validation.
 The updated title run must establish whether this removes the UI artifacts.
 
+The refusals at `0x800033db00 + 0x10cc` and `0x8000227600 + 0xa64`
+encode `IMAGE_GATHER4_C_L`, not a level-zero gather. The first captured
+instruction uses NSA addresses for reference, X, Y and the computed LOD.
+Explicit-LOD gather forms now retain that last operand. Translation queries
+the selected mip's extent, samples its four texel centers in gather order,
+and applies the sampler's depth comparison to each result. This permits
+comparison gathers through the ordinary scalar colour views used by compute.
+Point sampling prevents filtering within/between mip levels, including with
+fractional sampler LOD bounds. Sampler comparison and LOD limits accompany
+direct and indirect graphics/compute bindings.
+
+Eight focused decode/translation checks pass. The SDK GPU probe verifies two
+distinct mip patterns, all eight comparison functions, ordinary gathers,
+fractional/integer sampler limits, view bounds and a guest linear sampler.
+The full smoke and compressed array fetch/gather suite pass with clean
+validation. Live scene validation of these newly accepted kernels is pending.
+
 The first cached-memory relaunch stopped before video or Vulkan rendering:
 the main thread was suspended in `reportGuestThreadContext(1)`, called by
 `drainQuietBuilderArenas` from that same guest thread's suspend point. The

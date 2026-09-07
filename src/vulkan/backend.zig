@@ -8340,7 +8340,7 @@ pub const Renderer = struct {
                     // sampled-image fallback.
                     continue;
                 }
-                const sampler_descriptor: gpu.resources.SamplerDescriptor = if (image_fetch)
+                var sampler_descriptor: gpu.resources.SamplerDescriptor = if (image_fetch)
                     std.mem.zeroes(gpu.resources.SamplerDescriptor)
                 else if (if (candidates) |table| table.sampler else null) |sampler|
                     sampler
@@ -8361,6 +8361,7 @@ pub const Renderer = struct {
                         );
                         return Error.UnsupportedSampledImage;
                     };
+                if (inst.opcode == .image_gather4) sampler_descriptor = pointGatherSampler(sampler_descriptor);
                 const sampled_dimension = sampledImageDimensionForInstruction(
                     inst.image_dimension,
                     image_descriptor.image_type,
@@ -8427,6 +8428,9 @@ pub const Renderer = struct {
                     .dimension = sampled_dimension,
                     .instruction_pc = inst.pc,
                     .candidate_words = candidate_words,
+                    .depth_compare = sampler_descriptor.depth_compare,
+                    .minimum_lod = sampler_descriptor.minimum_lod,
+                    .maximum_lod = sampler_descriptor.maximum_lod,
                 };
                 result.sampled_image_mapping_count += 1;
             }
@@ -15508,7 +15512,7 @@ pub const Renderer = struct {
                 );
                 return Error.UnsupportedSampledImage;
             };
-            const sampler_descriptor: gpu.resources.SamplerDescriptor = if (image_fetch)
+            var sampler_descriptor: gpu.resources.SamplerDescriptor = if (image_fetch)
                 std.mem.zeroes(gpu.resources.SamplerDescriptor)
             else
                 (try resolveComputeSamplerDescriptor(
@@ -15527,6 +15531,7 @@ pub const Renderer = struct {
                     );
                     return Error.UnsupportedSampledImage;
                 };
+            if (inst.opcode == .image_gather4) sampler_descriptor = pointGatherSampler(sampler_descriptor);
             const sampled_dimension = sampledImageDimensionForInstruction(
                 inst.image_dimension,
                 image_descriptor.image_type,
@@ -15590,6 +15595,9 @@ pub const Renderer = struct {
                 .descriptor_index = descriptor_index,
                 .dimension = sampled_dimension,
                 .instruction_pc = if (image_fetch) inst.pc else null,
+                .depth_compare = sampler_descriptor.depth_compare,
+                .minimum_lod = sampler_descriptor.minimum_lod,
+                .maximum_lod = sampler_descriptor.maximum_lod,
             };
             result.mapping_count += 1;
         }
@@ -15620,7 +15628,8 @@ pub const Renderer = struct {
             result.mapping_count += 1;
             return true;
         }
-        const sampler = candidates.sampler orelse (try resolveComputeSamplerDescriptor(bindings, reader, analysis, scalar, inst.src2.reg, inst.pc, sampler_slot)) orelse return false;
+        var sampler = candidates.sampler orelse (try resolveComputeSamplerDescriptor(bindings, reader, analysis, scalar, inst.src2.reg, inst.pc, sampler_slot)) orelse return false;
+        if (inst.opcode == .image_gather4) sampler = pointGatherSampler(sampler);
         for (candidates.words[0..candidates.count]) |words| {
             const descriptor = try gpu.resources.decodeImageDescriptor(&words);
             const dimension = sampledImageDimensionForInstruction(inst.image_dimension, descriptor.image_type) orelse return false;
@@ -15648,6 +15657,9 @@ pub const Renderer = struct {
                 .dimension = dimension,
                 .instruction_pc = inst.pc,
                 .candidate_words = words,
+                .depth_compare = sampler.depth_compare,
+                .minimum_lod = sampler.minimum_lod,
+                .maximum_lod = sampler.maximum_lod,
             };
             result.mapping_count += 1;
         }
@@ -22314,6 +22326,16 @@ fn vulkanAddressMode(mode: u8) Error!u32 {
         7 => 4,
         else => Error.UnsupportedSampledImage,
     };
+}
+
+fn pointGatherSampler(descriptor: gpu.resources.SamplerDescriptor) gpu.resources.SamplerDescriptor {
+    var result = descriptor;
+    // Gather returns individual texels even when the guest sampler requests
+    // linear filtering. A fractional sampler LOD limit must not blend mips.
+    result.magnification_filter = 0;
+    result.minification_filter = 0;
+    result.mip_filter = 1;
+    return result;
 }
 
 fn guestSamplerCreateInfo(descriptor: gpu.resources.SamplerDescriptor) Error!vk.SamplerCreateInfo {
