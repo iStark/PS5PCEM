@@ -76,6 +76,22 @@ guest writeback, then checks all 1,152 writes across eviction pressure. It and
 the full smoke suite pass SDK validation. The effect on live frame time has
 not yet been measured.
 
+The volume-combination kernels at `0x80003fd600` and `0x8000402100`
+use a different loop: the signed comparison precedes the body and its limit
+is loaded from root+264. Recovery now proves a zero initial counter, unit
+increments and a required true comparison on both entry and every recurrence.
+The limit is recovered at that comparison through its reaching definitions;
+only a positive, nonwrapping bounded range can become a scalar pointer table.
+Shift-and-add coefficient addresses are captured alongside the T# arrays.
+
+All 79 index-analysis tests pass, including rejected counter clobbers,
+negative initialization, nonunit increments and a bypassed guard. The SDK
+GPU regression varies the memory-loaded limit between 3, 1 and 6, relocates
+the texture table, reads distinct coefficients from another page and verifies
+the untouched output tail. The existing six-image loop and full smoke also
+pass without validation errors. This is regression coverage; integration of
+the volume kernels into the game's final scene is still unverified.
+
 ## Reproduce
 
 ```powershell

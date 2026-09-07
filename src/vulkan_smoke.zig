@@ -2280,12 +2280,12 @@ fn runTypedIndexProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("typed index images passed: UINT/SINT byte and short indices, negative bounds and decoy fields\n", .{});
 }
 
-fn runCountedImageLoopProbe(allocator: std.mem.Allocator) !void {
+fn runCountedImageLoopProbe(allocator: std.mem.Allocator, uniform_limit: bool) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{ .trace_resource_failures = true });
     defer renderer.deinit();
     var guest = GuestMemory{};
     _ = renderer.dcbBackend(guest.interface());
-    const code = [_]u32{
+    const counted_code = [_]u32{
         0xbe90_0380, // s_mov_b32 s16, 0
         vop1(1, 0, 128),
         vop1(1, 1, 128),
@@ -2299,13 +2299,36 @@ fn runCountedImageLoopProbe(allocator: std.mem.Allocator) !void {
         0xbf85_fff5,
         0xbf81_0000,
     };
+    const uniform_code = [_]u32{
+        0xbe90_0380, // zero-based counter s16
+        0xf400_0440,     0xfa00_0100, // runtime limit s17 from root + 256
+        vop1(1, 0, 128), vop1(1, 1, 128),
+        0xbf04_1110, 0xbf84_000f, // while (s16 < s17), signed
+        0x8f6a_8510, 0xf40c_0100,
+        0xd400_0000, 0xf000_0108,
+        0x0001_0200,
+        0x97eb_ff10, 4096, // s_lshl2_add VCC_HI, s16, coefficient displacement
+        0xf400_0480, 0xd600_0000, // coefficient s18 from another captured page
+        0x1004_0412, // v_mul_f32 v2, s18, v2
+        vop1(1, 4, 16),
+        0xe070_2000,
+        0x8003_0204,
+        0x8110_8110,
+        0xbf82_ffef,
+        0xbf81_0000,
+    };
+    const code: []const u32 = if (uniform_limit) &uniform_code else &counted_code;
     for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
     var state = gpu.State{};
     const compute = gpu.resources.ShaderStage.compute;
     try state.writeRegister(.shader, compute.programRegisterBase(), 1);
     try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
     try state.writeRegister(.shader, 0x213, 16 << 1);
-    for ([_]u32{ 0x10fc0, 0x12fc0 }, 0..) |table, pass| {
+    const limits = [_]u32{ 3, 1, 6 };
+    for (0..@as(usize, if (uniform_limit) limits.len else 2)) |pass| {
+        const table: u32 = if (pass == 1) 0x12fc0 else 0x10fc0;
+        const limit: u32 = if (uniform_limit) limits[pass] else 6;
+        const destination: u32 = 0x6000 + @as(u32, @intCast(pass)) * 256;
         for (0..6) |index| {
             const texture = if (pass == 0) index else 5 - index;
             const address: u32 = 0x8000 + @as(u32, @intCast(texture)) * 256;
@@ -2313,23 +2336,27 @@ fn runCountedImageLoopProbe(allocator: std.mem.Allocator) !void {
             image[1] = (image[1] & ~@as(u32, 0x1ff00000)) | (175 << 20); // BC4 UNORM
             for (image, 0..) |word, component| guest.word(table + index * 32 + component * 4, word);
             guest.word(address, @intCast((texture + 1) * 20)); // all texels select the first endpoint
+            guest.word(table + 4096 + index * 4, @bitCast(@as(f32, @floatFromInt(index + 1)) / 8.0));
         }
         if (pass == 1) @memset(guest.bytes[table + 2 * 32 ..][0..32], 0);
+        guest.word(table + 256, limit);
+        for (0..6) |index| guest.word(destination + index * 4, 0x42c6_0000); // 99.0, unwritten tail
         var userdata: [16]u32 = @splat(0);
         userdata[0] = table;
-        @memcpy(userdata[12..16], &[_]u32{ 0x6000, 4 << 16, 6, 0 });
+        @memcpy(userdata[12..16], &[_]u32{ destination, 4 << 16, 6, 0 });
         for (userdata, 0..) |word, index| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
         _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
         var output: [24]u8 = undefined;
-        try renderer.readbackGuestStorageBuffer(0x6000, &output);
+        try renderer.readbackGuestStorageBuffer(destination, &output);
         for (0..6) |index| {
             const texture = if (pass == 0) index else 5 - index;
-            const expected: f32 = if (pass == 1 and index == 2) 0 else @as(f32, @floatFromInt((texture + 1) * 20)) / 255.0;
+            const coefficient: f32 = if (uniform_limit) @as(f32, @floatFromInt(index + 1)) / 8.0 else 1;
+            const expected: f32 = if (index >= limit) 99.0 else if (pass == 1 and index == 2) 0 else coefficient * @as(f32, @floatFromInt((texture + 1) * 20)) / 255.0;
             const actual: f32 = @bitCast(std.mem.readInt(u32, output[index * 4 ..][0..4], .little));
             try std.testing.expectApproxEqAbs(expected, actual, 1.0 / 32767.0);
         }
     }
-    std.debug.print("counted image loop passed: six BC4 images, dynamic SMEM offsets, page crossing, relocation and a null descriptor\n", .{});
+    std.debug.print("{s} image loop passed: BC4 images, dynamic SMEM offsets, page crossing and relocation\n", .{if (uniform_limit) "uniform-limit (3, 1, 6)" else "counted (6, null descriptor)"});
 }
 
 fn runLargeIndirectImageProbe(allocator: std.mem.Allocator) !void {
@@ -2561,7 +2588,11 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
     if (args.len == 2 and std.mem.eql(u8, args[1], "--counted-image-loop")) {
-        try runCountedImageLoopProbe(allocator);
+        try runCountedImageLoopProbe(allocator, false);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--uniform-image-loop")) {
+        try runCountedImageLoopProbe(allocator, true);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--large-indirect-images")) {

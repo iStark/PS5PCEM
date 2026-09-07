@@ -23693,15 +23693,35 @@ fn scalarPointerTablePlan(
     const step: u32 = switch (multiply.opcode) {
         .s_lshl_b32 => @as(u32, 1) << @intCast(literal & 31),
         .s_mul_i32, .s_mulk_i32 => literal,
+        .s_lshl1_add_u32 => 2,
+        .s_lshl2_add_u32 => 4,
+        .s_lshl3_add_u32 => 8,
+        .s_lshl4_add_u32 => 16,
         else => return null,
     };
+    const displacement: u32 = switch (multiply.opcode) {
+        .s_lshl1_add_u32, .s_lshl2_add_u32, .s_lshl3_add_u32, .s_lshl4_add_u32 => literal,
+        else => 0,
+    };
     const source = gpu.scalar_provenance.scalarRegisterIndex(multiply.src0) orelse return null;
-    const count = gpu.index_bounds.scalarUpperBound(instructions, &analysis.graph, multiply_index, @intCast(source)) orelse return null;
+    var resolver = gpu.scalar_resources.Resolver{ .bindings = bindings, .reader = reader, .instructions = instructions, .graph = &analysis.graph, .snapshot = scalar };
+    const count = gpu.index_bounds.scalarUpperBound(instructions, &analysis.graph, multiply_index, @intCast(source)) orelse bound: {
+        const limit = gpu.index_bounds.scalarGuardedLoopLimit(instructions, &analysis.graph, multiply_index, @intCast(source)) orelse return null;
+        const value = if (gpu.scalar_provenance.scalarRegisterIndex(limit.operand)) |register| value: {
+            var word: [1]u32 = undefined;
+            if (!try resolver.words(@intCast(register), limit.before_pc, &word)) return null;
+            break :value word[0];
+        } else switch (limit.operand.kind) {
+            .integer_inline_constant, .literal_constant => limit.operand.value,
+            else => return null,
+        };
+        if (value == 0 or value > std.math.maxInt(i32)) return null;
+        break :bound value;
+    };
     if (step == 0 or count == 0 or count > 16384) return null;
-    const first: u64 = @intCast(load.memory_offset);
+    const first = @as(u64, @intCast(load.memory_offset)) + displacement;
     const length = @as(u64, count - 1) * step + @as(u64, load.data_words) * 4;
     if (length > 1024 * 1024 or first + length > std.math.maxInt(u32)) return null;
-    var resolver = gpu.scalar_resources.Resolver{ .bindings = bindings, .reader = reader, .instructions = instructions, .graph = &analysis.graph, .snapshot = scalar };
     var words: [2]u32 = undefined;
     if (!try resolver.words(load.src0.reg, load.pc, &words) or words[1] > 0xffff) return null;
     const base = @as(u64, words[0]) | (@as(u64, words[1]) << 32);

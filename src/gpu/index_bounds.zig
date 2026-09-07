@@ -297,6 +297,7 @@ fn requiresFallthrough(graph: *const Graph, definition: usize, use: usize, guard
     if (graph.blocks.items.len > maximum_blocks) return false;
     const start = blockAt(graph, definition) orelse return false;
     const target = blockAt(graph, use) orelse return false;
+    if (start == target and definition <= use) return false;
     var visited: [maximum_blocks]bool = @splat(false);
     var queue: [maximum_blocks]u32 = undefined;
     queue[0] = start;
@@ -305,9 +306,10 @@ fn requiresFallthrough(graph: *const Graph, definition: usize, use: usize, guard
     var cursor: usize = 0;
     while (cursor < count) : (cursor += 1) {
         const block = queue[cursor];
-        if (block == target) return false;
         for (graph.edges.items) |edge| {
-            if (edge.from != block or (edge.from == guard and edge.kind == .fallthrough) or visited[edge.to]) continue;
+            if (edge.from != block or (edge.from == guard and edge.kind == .fallthrough)) continue;
+            if (edge.to == target) return false;
+            if (visited[edge.to]) continue;
             visited[edge.to] = true;
             queue[count] = edge.to;
             count += 1;
@@ -387,6 +389,78 @@ fn scalarLoopUpperBound(instructions: []const Instruction, graph: *const Graph, 
         }
     }
     return bound;
+}
+
+pub const ScalarLoopLimit = struct { operand: rdna2.Operand, before_pc: u32 };
+
+/// A zero-based, unit-increment while loop whose true comparison dominates
+/// every use, including the first iteration and all back edges. The caller
+/// must recover the uniform limit at before_pc and require 0 < limit <= INT_MAX:
+/// this also proves the increment cannot wrap into a negative signed value.
+pub fn scalarGuardedLoopLimit(instructions: []const Instruction, graph: *const Graph, use: usize, register: u32) ?ScalarLoopLimit {
+    const location = Location{ .register = register };
+    const definitions = reachingDefinitions(instructions, graph, use, location) orelse return null;
+    if (definitions.entry or definitions.count != 2) return null;
+    const initial_index = @min(definitions.items[0], definitions.items[1]);
+    const increment_index = @max(definitions.items[0], definitions.items[1]);
+    if (initial_index >= use or increment_index <= use) return null;
+    const initial = instructions[initial_index];
+    const increment = instructions[increment_index];
+    if (initial.opcode != .s_mov_b32 or initial.dst.kind != .sgpr or initial.dst.reg != register or immediate(initial.src0) != 0 or
+        increment.opcode != .s_add_i32 or increment.dst.kind != .sgpr or increment.dst.reg != register or
+        increment.src0.kind != .sgpr or increment.src0.reg != register or immediate(increment.src1) != 1) return null;
+    const prior = reachingDefinitions(instructions, graph, increment_index, location) orelse return null;
+    if (prior.entry or prior.count != 2 or @min(prior.items[0], prior.items[1]) != initial_index or
+        @max(prior.items[0], prior.items[1]) != increment_index) return null;
+    for (graph.blocks.items) |block| {
+        if (block.instruction_count < 2) continue;
+        const branch_index = block.first_instruction + block.instruction_count - 1;
+        if (branch_index <= initial_index or branch_index >= use) continue;
+        const compare = instructions[branch_index - 1];
+        if (instructions[branch_index].opcode != .s_cbranch_scc0 or
+            (compare.opcode != .s_cmp_lt_i32 and compare.opcode != .s_cmp_lt_u32) or
+            compare.src0.kind != .sgpr or compare.src0.reg != register) continue;
+        const compared = reachingDefinitions(instructions, graph, branch_index - 1, location) orelse continue;
+        if (compared.entry or compared.count != 2 or @min(compared.items[0], compared.items[1]) != initial_index or
+            @max(compared.items[0], compared.items[1]) != increment_index) continue;
+        if (!requiresFallthrough(graph, initial_index, use, block.index) or
+            !requiresFallthrough(graph, increment_index, use, block.index)) continue;
+        return .{ .operand = compare.src1, .before_pc = compare.pc };
+    }
+    return null;
+}
+
+test "uniform while-loop limits guard initialization and every recurrence" {
+    const counter = rdna2.Operand{ .kind = .sgpr, .reg = 17 };
+    var instructions = [_]Instruction{
+        .{ .pc = 0, .opcode = .s_mov_b32, .dst = counter, .src0 = .{ .kind = .integer_inline_constant, .value = 0 } },
+        .{ .pc = 4, .opcode = .s_cmp_lt_i32, .src0 = counter, .src1 = .{ .kind = .sgpr, .reg = 16 } },
+        .{ .pc = 8, .opcode = .s_cbranch_scc0, .branch_target = 32 },
+        .{ .pc = 12, .opcode = .s_nop },
+        .{ .pc = 16, .opcode = .s_lshl_b32, .dst = .{ .kind = .vcc_lo }, .src0 = counter, .src1 = .{ .kind = .integer_inline_constant, .value = 5 } },
+        .{ .pc = 20, .opcode = .s_add_i32, .dst = counter, .src0 = counter, .src1 = .{ .kind = .integer_inline_constant, .value = 1 } },
+        .{ .pc = 24, .opcode = .s_nop },
+        .{ .pc = 28, .opcode = .s_branch, .branch_target = 4 },
+        .{ .pc = 32, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    const limit = scalarGuardedLoopLimit(&instructions, &graph, 4, 17).?;
+    try std.testing.expectEqual(@as(u32, 4), limit.before_pc);
+    try std.testing.expectEqual(@as(u32, 16), limit.operand.reg);
+    instructions[0].src0.value = 0xffff_ffff;
+    try std.testing.expect(scalarGuardedLoopLimit(&instructions, &graph, 4, 17) == null);
+    instructions[0].src0.value = 0;
+    instructions[5].src1.value = 2;
+    try std.testing.expect(scalarGuardedLoopLimit(&instructions, &graph, 4, 17) == null);
+    instructions[5].src1.value = 1;
+    instructions[3] = .{ .pc = 12, .opcode = .s_mov_b32, .dst = counter, .src0 = .{ .kind = .integer_inline_constant, .value = 99 } };
+    try std.testing.expect(scalarGuardedLoopLimit(&instructions, &graph, 4, 17) == null);
+    instructions[3] = .{ .pc = 12, .opcode = .s_nop };
+    instructions[7].branch_target = 12;
+    var bypass = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer bypass.deinit(std.testing.allocator);
+    try std.testing.expect(scalarGuardedLoopLimit(&instructions, &bypass, 4, 17) == null);
 }
 
 test "counted scalar image loops require a bounded recurrence" {
