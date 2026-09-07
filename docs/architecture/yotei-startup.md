@@ -4,6 +4,28 @@ Verified with PPSA26344 and the RTX 3070 Ti on 2026-09-06.
 
 ## Menu progress on 2026-09-07
 
+Material recovery now rejects reserved image-resource bit 94 and destination
+selectors 2/3, as specified by RDNA2 ISA section 8.2.6. The quad material
+`0x80003a6b00` scans a 96-record table with stride 388; its unbounded 32-bit
+offset multiplication also reaches overlapping word-aligned windows. Ordinary
+float constants in those windows previously decoded as 1D-array and cube
+textures, causing complete material draws to be rejected. The captured table
+now resolves 25 valid 2D textures at each of its five sample sites. All 25
+images and 125 mappings stage successfully on the RTX 3070 Ti with SDK
+validation. A GPU regression includes malformed array/cube-looking constants
+alongside valid textures and checks the selected texels and null bounds.
+This verifies material preparation; the complete menu frame still needs a
+fresh game run with the fix.
+
+FLAT snapshot diagnostics now retain the first failed instruction PC, absolute
+address and component, in addition to the total missing-word count. An atomic
+claim prevents multiple invocations from overwriting the first record; the
+record is outside the captured payload and synchronized before host readback.
+The pointer and scene probes verify the address, relocation, concurrent faults
+and rejection of a read beyond the captured object records. A current capture
+of `0x8000196500` completes without faults, so earlier loading-time faults
+should not be assumed to explain every later missing object.
+
 The ReleaseFast run with pooled preparation objects completes the intro and
 continues loading. Comparable early loading frames (600/616) take 906/1008 ms
 versus 1123/1139 ms in the previous ReleaseSafe run. This is an early loading

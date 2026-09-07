@@ -488,6 +488,12 @@ pub fn decodeImageDescriptor(words: []const u32) Error!ImageDescriptor {
     const word1 = words[1];
     const word2 = words[2];
     const word3 = words[3];
+    // RDNA2 image resource bit 94 is undefined and must be zero (ISA 8.2.6).
+    // Overlapping windows in runtime descriptor tables can otherwise decode
+    // ordinary float constants as images and reject an entire material draw.
+    if (word2 & (1 << 30) != 0) return Error.InvalidDescriptor;
+    const dst_select = decodeDstSelect(word3);
+    for (dst_select) |select| if (select == 2 or select == 3) return Error.InvalidDescriptor;
     const format: u16 = @truncate((word1 >> 20) & 0x1ff);
     if (format == 0 or !isValidUnifiedFormat(format)) return Error.InvalidFormat;
     const raw_type: u8 = @truncate((word3 >> 28) & 0xf);
@@ -520,7 +526,7 @@ pub fn decodeImageDescriptor(words: []const u32) Error!ImageDescriptor {
         .unified_format = format,
         .tile_mode = @enumFromInt(@as(u5, @truncate((word3 >> 20) & 0x1f))),
         .image_type = image_type,
-        .dst_select = decodeDstSelect(word3),
+        .dst_select = dst_select,
         .base_level = @truncate((word3 >> 12) & 0xf),
         .last_level = @truncate((word3 >> 16) & 0xf),
         .base_array = @truncate((word4 >> 16) & 0x1fff),
@@ -1015,6 +1021,24 @@ test "buffer descriptors retain 48-bit addresses and byte extent" {
     try testing.expect(descriptor.swizzle_enabled);
     try testing.expectEqual(@as(u8, 2), descriptor.index_stride);
     try testing.expect(descriptor.add_thread_id);
+}
+
+test "image descriptors reject reserved bit 94 in overlapping table words" {
+    const floats = [_]u32{ 0x40a0_0000, 0x4120_0000, 0x4120_0000, 0xc110_0000, 0, 0, 0, 0x3f80_0000 };
+    try testing.expectError(Error.InvalidDescriptor, decodeImageDescriptor(&floats));
+    // Array resources remain valid; rejection is based on reserved bits,
+    // rather than an unsupported host view type or the candidate's address.
+    var array = [_]u32{ 0x100, 56 << 20, 0x8000_0000, 0xc000_0fac, 3, 0, 0, 0 };
+    try testing.expectEqual(ImageType.color_1d_array, (try decodeImageDescriptor(&array)).image_type);
+    array[2] |= 1 << 30;
+    try testing.expectError(Error.InvalidDescriptor, decodeImageDescriptor(&array));
+    array[2] &= ~@as(u32, 1 << 30);
+    for (0..4) |component| for ([_]u32{ 2, 3 }) |reserved| {
+        var invalid = array;
+        const shift: u5 = @intCast(component * 3);
+        invalid[3] = (invalid[3] & ~(@as(u32, 7) << shift)) | (reserved << shift);
+        try testing.expectError(Error.InvalidDescriptor, decodeImageDescriptor(&invalid));
+    };
 }
 
 test "image descriptors decode Gen5 dimensions views and metadata" {

@@ -2017,7 +2017,7 @@ fn runFlatPointerProbe(allocator: std.mem.Allocator) !void {
                 .{ .resource_sgpr = 8, .descriptor_index = 0, .stride = 8 },
                 .{ .resource_sgpr = 12, .descriptor_index = 1, .stride = 16 },
             },
-            .flat_memories = &.{ .{ .descriptor_index = 2 }, .{ .descriptor_index = 3 } },
+            .flat_memories = &.{ .{ .descriptor_index = 2, .fault_record_word = 12 }, .{ .descriptor_index = 3 } },
         });
         defer module.deinit(allocator);
         for (0..2) |pass| {
@@ -2040,7 +2040,8 @@ fn runFlatPointerProbe(allocator: std.mem.Allocator) !void {
             }
             _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, pointers.len * 8);
             _ = try renderer.stageGuestStorageBufferAt(1, 0x11000, pointers.len * 16);
-            _ = try renderer.stageGuestStorageBufferAt(2, 0x12000, 48);
+            for (0..4) |word| guest.word(0x12030 + word * 4, 0);
+            _ = try renderer.stageGuestStorageBufferAt(2, 0x12000, 64);
             _ = try renderer.stageGuestStorageBufferAt(3, 0x12100, 48);
             _ = try renderer.dispatchSpirv(module.words, .{ pointers.len, 1, 1 });
             var output: [pointers.len * 16]u8 = undefined;
@@ -2056,9 +2057,21 @@ fn runFlatPointerProbe(allocator: std.mem.Allocator) !void {
                 };
                 try std.testing.expectEqual(expected, std.mem.readInt(u32, output[index * 16 + word * 4 ..][0..4], .little));
             };
-            var header: [48]u8 = undefined;
+            var header: [64]u8 = undefined;
             try renderer.readbackGuestStorageBuffer(0x12000, &header);
             try std.testing.expectEqual(faults * @as(u32, if (repeat) 2 else 1), std.mem.readInt(u32, header[8..12], .little));
+            try std.testing.expectEqual(@as(u32, 28), std.mem.readInt(u32, header[48..52], .little));
+            const failed_address = std.mem.readInt(u64, header[52..60], .little);
+            const failed_component = std.mem.readInt(u32, header[60..64], .little);
+            try std.testing.expect(failed_component < 4);
+            const failed_relative = @as(i64, @intCast(failed_address)) - @as(i64, @intCast(base));
+            try std.testing.expect(!(failed_relative >= 0 and failed_relative + 4 <= 64 and @mod(failed_relative, 32) <= 28));
+            var matches_failed_read = false;
+            for (pointers) |pointer| {
+                const address = @as(i64, @intCast(pointer)) + (if (scalar_base) @as(i64, 8) else 0) + offset + @as(i64, failed_component) * 4;
+                matches_failed_read = matches_failed_read or address == failed_address;
+            }
+            try std.testing.expect(matches_failed_read);
         }
     };
     std.debug.print("FLAT pointers passed: absolute/scalar bases, signed offsets, overlapping destinations, unaligned reads, 4-GiB carry, relocation, repeated loop reads and fault counts\n", .{});
@@ -2576,21 +2589,22 @@ fn runLargeIndirectImageProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
-    for (0..6) |case_index| {
+    for (0..7) |case_index| {
         var renderer = try vulkan.Renderer.init(allocator, .{ .trace_resource_failures = true });
         defer renderer.deinit();
         if (!renderer.sampled_image_nonuniform_indexing) return error.NonuniformSampledImagesUnavailable;
         var guest = GuestMemory{};
         _ = renderer.dcbBackend(guest.interface());
         const wrapping = case_index == 1;
-        const guarded = case_index == 2 or case_index >= 4;
+        const guarded = case_index == 2 or case_index == 4 or case_index == 5;
         const wide = case_index == 3;
-        const offset_register: u32 = if (case_index >= 4) 106 + @as(u32, @intCast(case_index - 4)) else 20;
+        const material_constants = case_index == 6;
+        const offset_register: u32 = if (case_index == 4 or case_index == 5) 106 + @as(u32, @intCast(case_index - 4)) else 20;
         if (wide and renderer.device_info.sampled_image_capacity < 128) {
             std.debug.print("128-texture case unavailable: device capacity={d}\n", .{renderer.device_info.sampled_image_capacity});
             continue;
         }
-        const stride: u32 = if (guarded) 368 else if (wrapping) 48 else 32;
+        const stride: u32 = if (material_constants) 388 else if (guarded) 368 else if (wrapping) 48 else 32;
         const table: u32 = 0x11000 + @as(u32, @intCast(case_index)) * 0x1000;
         const output: u32 = 0x10000 + @as(u32, @intCast(case_index)) * 0x100;
         const code = [_]u32{
@@ -2623,6 +2637,17 @@ fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
                 const decoy = sampledImageDescriptorWords(0xa000 + @as(u32, @intCast(index)) * 256, 4, 4);
                 for (decoy, 0..) |word, component| guest.word(table + index * stride + 32 + component * 4, word);
             }
+        }
+        if (material_constants) {
+            // The unbounded product visits every word-aligned table window.
+            // Material floats can resemble 1D-array/cube T#s, but their
+            // reserved dimension bit or channel selectors make them invalid.
+            const constants = [_][8]u32{
+                .{ 0x40a0_0000, 0x4120_0000, 0x4120_0000, 0xc110_0000, 0, 0, 0, 0x3f80_0000 },
+                .{ 0x100, 56 << 20, 0, 0xb000_0fae, 0, 0, 0, 0 },
+            };
+            for (constants, 0..) |words, record| for (words, 0..) |word, component|
+                guest.word(table + record * stride + 160 + component * 4, word);
         }
         const ordinary_addresses = [_]u32{ 0x8000, 0x9000, 0x8000 };
         // A linear guest row has 256-byte alignment. One texel per image
