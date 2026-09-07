@@ -10,6 +10,16 @@ versus 1123/1139 ms in the previous ReleaseSafe run. This is an early loading
 comparison, not a measurement of the complete menu. First-use shader
 compilation still causes much longer isolated frames.
 
+The same Digital Deluxe notice subsequently gives a median of 8,872 ms
+(0.113 FPS, 15 frames at flips 945–959) versus 11,526 ms (0.087 FPS,
+19 comparable frames at flips 952–970) in the earlier ReleaseSafe run.
+Both samples contain 210–225 draws and 410–440 compute dispatches; initial
+compilation frames are excluded. This is about 30% higher throughput, still
+far from interactive speed. The measured process includes the preparation
+pools, storage residency and GDS/volume fixes, but predates the additional
+CPU indices and FLAT-header hoisting below. The installed ReleaseFast binary
+includes those later optimizations; their total in-game effect is unmeasured.
+
 Resource reaching-definition queries now index outgoing control-flow edges
 for graphs with at least 32 blocks, avoiding a complete edge scan per visited
 block. Tiny graphs keep the direct scan. Unordered edges, duplicate edges,
