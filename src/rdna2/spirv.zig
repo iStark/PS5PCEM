@@ -686,6 +686,7 @@ const Builder = struct {
     uses_image_gather_extended: bool = false,
     uses_nonuniform_sampled_images: bool = false,
     sampled_result_predicate: ?u32 = null,
+    sampled_dimension_override: ?SampledImageDimension = null,
     dpp_write_predicate: ?u32 = null,
     /// SPIR-V splits arbitrary-lane and relative-lane subgroup shuffles into
     /// separate capabilities. NVIDIA may accept a module that omits these and
@@ -1033,7 +1034,6 @@ const Builder = struct {
                         previous.instruction_pc == binding.instruction_pc)
                     {
                         if (previous.candidate_words == null or binding.candidate_words == null or
-                            previous.dimension != binding.dimension or
                             std.mem.eql(u32, &previous.candidate_words.?, &binding.candidate_words.?))
                         {
                             return Error.InvalidStorageBinding;
@@ -4726,6 +4726,7 @@ const Builder = struct {
         instruction_pc: u32,
     ) ?SampledImageBinding {
         for (self.sampled_bindings) |binding| {
+            if (self.sampled_dimension_override) |dimension| if (binding.dimension != dimension) continue;
             if (binding.resource_sgpr == resource_sgpr and
                 binding.sampler_sgpr == sampler_sgpr and
                 binding.instruction_pc != null and binding.instruction_pc.? == instruction_pc)
@@ -4734,6 +4735,7 @@ const Builder = struct {
             }
         }
         for (self.sampled_bindings) |binding| {
+            if (self.sampled_dimension_override) |dimension| if (binding.dimension != dimension) continue;
             if (binding.resource_sgpr == resource_sgpr and
                 binding.sampler_sgpr == sampler_sgpr and binding.instruction_pc == null)
             {
@@ -4845,6 +4847,7 @@ const Builder = struct {
                 for (self.sampled_bindings) |candidate| {
                     if (candidate.resource_sgpr != binding.resource_sgpr or
                         candidate.sampler_sgpr != binding.sampler_sgpr or
+                        candidate.dimension != binding.dimension or
                         candidate.instruction_pc != binding.instruction_pc) continue;
                     const words = candidate.candidate_words orelse return Error.InvalidStorageBinding;
                     var matches = always;
@@ -8062,11 +8065,67 @@ const Builder = struct {
         self.lane_predicate = 0;
     }
 
+    /// A runtime table can contain views from several Vulkan descriptor banks.
+    /// Sample each bank with an exact T# match, then combine the zero-masked
+    /// results. Keeping these operations outside conditional control flow also
+    /// preserves implicit derivatives in fragment quads.
+    fn lowerMixedSampledImages(self: *Builder, inst: instruction.Instruction) Error!bool {
+        if (self.sampled_dimension_override != null or inst.src1.kind != .sgpr or inst.src2.kind != .sgpr) return false;
+        switch (inst.opcode) {
+            .image_sample, .image_gather4, .image_load, .image_load_mip, .image_get_resinfo, .image_get_lod => {},
+            else => return false,
+        }
+        const first = self.sampledImageBinding(inst.src1.reg, inst.src2.reg, inst.pc) orelse return false;
+        if (first.candidate_words == null) return false;
+        var dimensions: [4]?SampledImageDimension = @splat(null);
+        var dimension_count: usize = 0;
+        for (self.sampled_bindings) |binding| {
+            if (binding.resource_sgpr != first.resource_sgpr or binding.sampler_sgpr != first.sampler_sgpr or
+                binding.instruction_pc != first.instruction_pc) continue;
+            const index = sampledImageDimensionIndex(binding.dimension);
+            if (dimensions[index] == null) dimension_count += 1;
+            dimensions[index] = binding.dimension;
+        }
+        if (dimension_count < 2) return false;
+        if (inst.dst.kind != .vgpr) return Error.InvalidStorageBinding;
+        const count: u32 = if (inst.opcode == .image_gather4) 4 else @popCount(inst.data_mask);
+        var original: [4]u32 = undefined;
+        var combined: [4]u32 = @splat(try self.constant(.bits32, 0));
+        for (0..count) |component|
+            original[component] = try self.source(try consecutiveRegister(inst.dst, @intCast(component)), .bits32);
+        defer self.sampled_dimension_override = null;
+        for (dimensions) |maybe_dimension| {
+            const dimension = maybe_dimension orelse continue;
+            // MIMG destinations may overlap its coordinate VGPRs. Restore
+            // those words before evaluating the next candidate view kind.
+            self.sampled_result_predicate = null;
+            for (0..count) |component| try self.destination(
+                try consecutiveRegister(inst.dst, @intCast(component)),
+                .{ .id = original[component], .value_type = .bits32 },
+            );
+            self.sampled_dimension_override = dimension;
+            try self.lower(inst);
+            for (0..count) |component| {
+                const value = try self.source(try consecutiveRegister(inst.dst, @intCast(component)), .bits32);
+                const merged = self.id();
+                try self.emit(&self.body, 197, &.{ self.bits_type, merged, combined[component], value });
+                combined[component] = merged;
+            }
+        }
+        self.sampled_result_predicate = null;
+        for (0..count) |component| try self.destination(
+            try consecutiveRegister(inst.dst, @intCast(component)),
+            .{ .id = combined[component], .value_type = .bits32 },
+        );
+        return true;
+    }
+
     fn lower(self: *Builder, source_inst: instruction.Instruction) Error!void {
         self.dpp_write_predicate = null;
         defer self.dpp_write_predicate = null;
         self.sampled_result_predicate = null;
         defer self.sampled_result_predicate = null;
+        if (try self.lowerMixedSampledImages(source_inst)) return;
         var inst = source_inst;
         if (nonExecCompareOpcode(inst.opcode)) |opcode| inst.opcode = opcode;
         if (try self.lowerExecutionMask(inst)) return;

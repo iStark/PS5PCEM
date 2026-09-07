@@ -2575,6 +2575,8 @@ fn runLargeIndirectImageProbe(allocator: std.mem.Allocator) !void {
             if (texture == count - 1) {
                 image = sampledImageDescriptorWords(textures, 1, 1);
                 image[3] = (image[3] & ~@as(u32, 7)) | 6;
+            } else if (texture % 2 != 0) {
+                image[3] = (image[3] & 0x0fff_ffff) | 0xa000_0000;
             }
             for (image, 0..) |word, component| guest.word(table + index * 32 + component * 4, word);
             guest.word(textures + texture * 256, 0xff80_0000 | @as(u32, @intCast(texture % 251 + 1)));
@@ -2625,7 +2627,7 @@ fn runLargeIndirectImageProbe(allocator: std.mem.Allocator) !void {
         20 << 25,
         vop1(1, 2, 240),
         vop1(1, 3, 240),
-        0xf09c_0f0a,
+        0xf080_0f0a, // implicit LOD remains valid across both view banks
         0x0080_0402,
         3,
         0xf800_080f,
@@ -2656,11 +2658,11 @@ fn runLargeIndirectImageProbe(allocator: std.mem.Allocator) !void {
     const center = 0x2000 + (32 * 64 + 32) * 4;
     std.debug.print("large sampled fragment center={any}\n", .{guest.bytes[center..][0..4].*});
     try std.testing.expectEqual(@as(u8, 128), guest.bytes[center]);
-    std.debug.print("large indirect sampled images passed: compute/fragment lookup, 4096 views, exact aliases, null bounds, relocated table and shared sampler\n", .{});
+    std.debug.print("large indirect sampled images passed: compute/fragment lookup, 4096 mixed 2D/3D views, exact aliases, null bounds, relocated table and shared sampler\n", .{});
 }
 
 fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
-    for (0..7) |case_index| {
+    for (0..8) |case_index| {
         var renderer = try vulkan.Renderer.init(allocator, .{ .trace_resource_failures = true });
         defer renderer.deinit();
         if (!renderer.sampled_image_nonuniform_indexing) return error.NonuniformSampledImagesUnavailable;
@@ -2670,6 +2672,7 @@ fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
         const guarded = case_index == 2 or case_index == 4 or case_index == 5;
         const wide = case_index == 3;
         const material_constants = case_index == 6;
+        const mixed_views = case_index == 7;
         const offset_register: u32 = if (case_index == 4 or case_index == 5) 106 + @as(u32, @intCast(case_index - 4)) else 20;
         if (wide and renderer.device_info.sampled_image_capacity < 128) {
             std.debug.print("128-texture case unavailable: device capacity={d}\n", .{renderer.device_info.sampled_image_capacity});
@@ -2695,8 +2698,13 @@ fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
             0x3e80_0000,
             vop1(1, 3, 255),
             0x3e80_0000,
-            0xf09c_010a, 0x0080_0402, 3, // sample T#s0, S#s16, v2/v3 -> v4
-            0xe070_2000, 0x8003_0401, // indexed store v4, v1, V#s12
+            if (mixed_views) vop1(1, 4, 255) else 0xbf80_0000,
+            if (mixed_views) 0x3f40_0000 else 0xbf80_0000,
+            if (mixed_views) 0xf09c_0112 else 0xf09c_010a,
+            if (mixed_views) 0x0080_0202 else 0x0080_0402,
+            if (mixed_views) 0x0403 else 3, // overlapping destination checks coordinate preservation across view banks
+            0xe070_2000,
+            if (mixed_views) 0x8003_0201 else 0x8003_0401,
             0xbf81_0000,
         };
         for (code, 0..) |word, index| guest.word(0x100 + case_index * 0x100 + index * 4, word);
@@ -2727,13 +2735,17 @@ fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
         for (0..if (wide) @as(usize, 128) else 3) |index| {
             const address = if (wide) 0x8000 + @as(u32, @intCast(index)) * 256 else ordinary_addresses[index];
             var image = sampledImageDescriptorWords(address, extent, extent);
+            if (mixed_views and index == 1) {
+                image[3] = (image[3] & 0x0fff_ffff) | 0xa000_0000;
+                image[4] = 1; // two volume slices; v4 selects the second
+            }
             if (!wide and index == 2) image[3] = (image[3] & ~@as(u32, 7)) | 6; // same allocation, blue in red channel
             for (image, 0..) |word, component| guest.word(table + (if (wrapping) @as(usize, 16) else 0) + index * stride + component * 4, word);
             const layout = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&image));
             const surface = try layout.base();
-            for (0..extent) |y| for (0..extent) |x| {
-                const pixel = address + @as(usize, @intCast(try surface.sourceByteOffset(@intCast(x), @intCast(y), 0, 0)));
-                guest.word(pixel, if (wide) 0xff00_0000 | @as(u32, @intCast(index + 1)) else if (index != 1) 0xff80_00ff else 0xff00_0040);
+            for (0..if (mixed_views and index == 1) @as(usize, 2) else 1) |z| for (0..extent) |y| for (0..extent) |x| {
+                const pixel = address + @as(usize, @intCast(try surface.sourceByteOffset(@intCast(x), @intCast(y), @intCast(z), 0)));
+                guest.word(pixel, if (mixed_views and index == 1 and z == 0) 0xff00_00aa else if (wide) 0xff00_0000 | @as(u32, @intCast(index + 1)) else if (index != 1) 0xff80_00ff else 0xff00_0040);
             };
         }
         var state = gpu.State{};
@@ -2766,7 +2778,7 @@ fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
             try std.testing.expectError(error.UnsupportedSampledImage, renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ groups, 1, 1 }));
         }
     }
-    std.debug.print("indirect sampled images passed: runtime selection, aliases, bounds, wrapping, guarded SGPR/VCC offsets and 128 textures\n", .{});
+    std.debug.print("indirect sampled images passed: runtime selection, aliases, bounds, wrapping, guarded SGPR/VCC offsets, 128 textures and mixed 2D/3D views\n", .{});
 }
 
 pub fn main(init: std.process.Init) !void {

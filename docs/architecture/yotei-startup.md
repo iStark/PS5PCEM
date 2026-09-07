@@ -4,6 +4,16 @@ Verified with PPSA26344 and the RTX 3070 Ti on 2026-09-06.
 
 ## Menu progress on 2026-09-07
 
+Runtime sampled-image tables can now select between 2D and 3D Vulkan views
+at one instruction. Each view kind has its own exact descriptor lookup;
+unmatched results are zeroed before combining them. Coordinates survive
+overlapping result registers, and sampling remains outside divergent branches
+so fragment implicit LOD is valid. GPU probes cover a two-slice volume,
+4096 mixed views, relocation, aliases and null bounds. The previous translator
+rejects the mixed table with `InvalidStorageBinding`; the corrected compute
+and fragment paths pass SDK validation. This prepares support for particle
+tables; their nested index recovery is still separate work.
+
 VOP3B `V_ADD_CO_U32`, `V_SUB_CO_U32` and `V_SUBREV_CO_U32` now
 decode their scalar carry destination and export unsigned carry/borrow.
 They previously performed ordinary integer arithmetic, leaving stale VCC

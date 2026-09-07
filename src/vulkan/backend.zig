@@ -7944,7 +7944,7 @@ pub const Renderer = struct {
 
     fn sameSampledLookup(a: gpu.ShaderSpirvSampledImageBinding, b: gpu.ShaderSpirvSampledImageBinding) bool {
         return a.resource_sgpr == b.resource_sgpr and a.sampler_sgpr == b.sampler_sgpr and
-            a.instruction_pc == b.instruction_pc;
+            a.instruction_pc == b.instruction_pc and a.dimension == b.dimension;
     }
 
     fn prepareSampledImageLookups(
