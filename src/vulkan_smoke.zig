@@ -653,7 +653,7 @@ fn runVectorImageProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
     defer renderer.deinit();
     var guest = GuestMemory{};
-    _ = renderer.dcbBackend(guest.interface());
+    const backend = renderer.dcbBackend(guest.interface());
     var code: std.ArrayList(u32) = .empty;
     defer code.deinit(allocator);
     try code.appendSlice(allocator, &.{
@@ -723,6 +723,20 @@ fn runVectorImageProbe(allocator: std.mem.Allocator) !void {
         try std.testing.expectApproxEqAbs(@as(f32, if (i < 2) 64.0 / 255.0 else 1), actual, 0.00001);
     }
     try std.testing.expectEqual(@as(u64, 2), renderer.sampled_image_uploads);
+    // Replacing the first resident view shifts the second view's cache index.
+    // Both changed texels must be uploaded, then found without another upload.
+    try std.testing.expect(backend.vtable.write(backend.context, 0x8000, &.{ 128, 0, 0, 255 }));
+    try std.testing.expect(backend.vtable.write(backend.context, 0x9000, &.{ 192, 0, 0, 255 }));
+    for (0..2) |_| {
+        _ = try renderer.dispatchRdna2State(&state, .{ 4, 1, 1 }, .{ 1, 1, 1 });
+        try renderer.readbackGuestStorageBuffer(0x3000, &pixels);
+        for (0..4) |i| {
+            const actual: f32 = @bitCast(std.mem.readInt(u32, pixels[i * 4 ..][0..4], .little));
+            const expected: f32 = if (i < 2) 192.0 / 255.0 else 128.0 / 255.0;
+            try std.testing.expectApproxEqAbs(expected, actual, 0.00001);
+        }
+        try std.testing.expectEqual(@as(u64, 4), renderer.sampled_image_uploads);
+    }
     std.debug.print("vector image resources passed: masked descriptor tuples and readfirstlane waterfall\n", .{});
 }
 

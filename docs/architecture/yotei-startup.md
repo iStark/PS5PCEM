@@ -19,6 +19,18 @@ uniform-loop and full smoke probes pass. A 10,000-query microbenchmark on
 captured 105-/59-block shaders falls from 46.9/12.2 ms to 3.0/2.0 ms. These
 figures describe that CPU query alone; its live FPS impact remains unmeasured.
 
+Sampled-view cache hits also use address buckets instead of three complete
+resident-cache scans. Candidate traversal retains the original order and all
+view, sampler, content and generation checks. Removing or appending a view
+invalidates the index; it is rebuilt lazily from the surviving entries. The
+index occupies 24 KiB for the 8,192-entry cache. A synthetic 50,800-lookup
+benchmark over 6,350 records takes 62.1 ms with the scan and 0.085 ms with the
+index, including its initial build; this is not a whole-frame benchmark.
+Collision/removal tests and the SDK 4,096-view, streamed-mip and full smoke
+probes pass. The vector-image probe additionally replaces two cached texels
+through the DCB write boundary, checks every lane and verifies subsequent
+reuse without another upload. Live timing of this index remains pending.
+
 The depth/stencil HTILE fix is confirmed in the game. The three bonus notices
 clear without retaining rectangles from earlier windows. The brightness
 screen renders its wolf, smoky background, text, slider and Cross icon. The

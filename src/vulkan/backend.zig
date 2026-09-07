@@ -3113,6 +3113,7 @@ pub const Renderer = struct {
     image_aliases: image_alias.Manager = .{},
     image_states: image_state.Tracker = .{},
     sampled_image_cache: std.ArrayList(CachedSampledImage) = .empty,
+    sampled_image_index: @import("sampled_image_index.zig").Index(maximum_cached_sampled_images) = .{},
     resident_image_views: std.ArrayList(CachedResidentImageView) = .empty,
     resident_samplers: std.ArrayList(CachedResidentSampler) = .empty,
     storage_image_cache: std.ArrayList(CachedStorageImage) = .empty,
@@ -17235,7 +17236,9 @@ pub const Renderer = struct {
                 early_source_generation,
                 full_content_probe,
             );
-        for (self.sampled_image_cache.items) |*item| {
+        var exact_candidates = self.sampled_image_index.candidates(self.sampled_image_cache.items, descriptor.address);
+        while (exact_candidates.next()) |index| {
+            const item = &self.sampled_image_cache.items[index];
             if (item.guest_address != descriptor.address or
                 item.width != descriptor.width or
                 item.height != descriptor.height or
@@ -17261,7 +17264,9 @@ pub const Renderer = struct {
         // image view. Reuse an identical resident image with a separately
         // cached sampler instead of detiling and uploading the same allocation
         // again whenever a shader selects another S# descriptor.
-        for (self.sampled_image_cache.items) |*item| {
+        var view_candidates = self.sampled_image_index.candidates(self.sampled_image_cache.items, descriptor.address);
+        while (view_candidates.next()) |index| {
+            const item = &self.sampled_image_cache.items[index];
             if (item.guest_address != descriptor.address or
                 item.width != descriptor.width or
                 item.height != descriptor.height or
@@ -17330,7 +17335,9 @@ pub const Renderer = struct {
 
         const lookup_started = hostTimestampNs();
         var cache_hit_idx: ?usize = null;
-        for (self.sampled_image_cache.items, 0..) |*item, idx| {
+        var uploaded_candidates = self.sampled_image_index.candidates(self.sampled_image_cache.items, descriptor.address);
+        while (uploaded_candidates.next()) |idx| {
+            const item = &self.sampled_image_cache.items[idx];
             if (item.guest_address == descriptor.address and
                 item.width == descriptor.width and
                 item.height == descriptor.height and
@@ -17734,6 +17741,7 @@ pub const Renderer = struct {
         // one allocation per content hash. Superseded views/images may still
         // be referenced by recorded draws, so their destruction is deferred
         // until the frame batch fence signals.
+        self.sampled_image_index.invalidate();
         var stale_index = self.sampled_image_cache.items.len;
         while (stale_index > 0) {
             stale_index -= 1;
