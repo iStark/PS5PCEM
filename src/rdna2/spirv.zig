@@ -64,6 +64,13 @@ pub const ScalarMemoryBinding = struct {
     descriptor_index: u32,
 };
 
+/// Checked snapshot for absolute FLAT/GLOBAL reads. The SSBO contains a
+/// 16-byte header (guest base u64, fault count u32, byte length u32), then
+/// the captured bytes. Faults are recorded in the first region's header.
+pub const FlatMemoryBinding = struct {
+    descriptor_index: u32,
+};
+
 pub const SampledImageBinding = struct {
     resource_sgpr: u32,
     sampler_sgpr: u32,
@@ -230,6 +237,7 @@ pub const Options = struct {
     convert_negative_one_to_one_depth: bool = false,
     storage_buffers: []const StorageBufferBinding = &.{},
     scalar_memories: []const ScalarMemoryBinding = &.{},
+    flat_memories: []const FlatMemoryBinding = &.{},
     /// Whether the program narrows the execution mask, and so needs to know
     /// which stores are active. Decided from the program by `translate`.
     uses_execution_mask: bool = false,
@@ -608,6 +616,7 @@ const Builder = struct {
     frag_coord_input: u32 = 0,
     storage_bindings: []const StorageBufferBinding,
     scalar_memory_bindings: []const ScalarMemoryBinding,
+    flat_memory_bindings: []const FlatMemoryBinding,
     sampled_bindings: []const SampledImageBinding,
     storage_image_bindings: []const StorageImageBinding,
     ngg_lds_exports: []const NggLdsExport,
@@ -722,6 +731,7 @@ const Builder = struct {
             .color_export_types = options.color_export_types,
             .storage_bindings = options.storage_buffers,
             .scalar_memory_bindings = options.scalar_memories,
+            .flat_memory_bindings = options.flat_memories,
             .sampled_bindings = options.sampled_images,
             .storage_image_bindings = options.storage_images,
             .ngg_lds_exports = options.ngg_lds_exports,
@@ -920,7 +930,7 @@ const Builder = struct {
             };
         }
 
-        if (options.storage_buffers.len != 0 or options.scalar_memories.len != 0) {
+        if (options.storage_buffers.len != 0 or options.scalar_memories.len != 0 or options.flat_memories.len != 0) {
             // Storage buffers are used by compute and by graphics attribute
             // fetch / constant buffer MUBUF paths.
             if (options.descriptor_array_length == 0) {
@@ -7170,6 +7180,7 @@ const Builder = struct {
     }
 
     fn flatLoadWords(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
+        if (self.flat_memory_bindings.len != 0) return self.absoluteFlatLoadWords(inst, count);
         if (self.zero_unmapped_flat_loads and inst.src1.kind != .sgpr) {
             const zero = try self.constant(.bits32, 0);
             for (0..count) |index| {
@@ -7183,15 +7194,95 @@ const Builder = struct {
         try self.bufferLoadWords(asBufferFromFlat(inst), count);
     }
 
+    fn absoluteFlatLoadWords(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
+        if (inst.memory_segment != 0 and inst.memory_segment != 2) return Error.UnsupportedBufferAddressing;
+        if (inst.raw[0] & (1 << 13) != 0 or count > 4) return Error.UnsupportedBufferAddressing; // LDS destination
+        const zero = try self.constant(.bits32, 0);
+        var pointer = if (inst.src1.kind == .sgpr)
+            try self.addPointerOffset(try self.sourcePair(inst.src1), try self.source(inst.src0, .bits32))
+        else if (inst.src1.kind == .vgpr)
+            try self.sourcePair(inst.src0)
+        else
+            return Error.UnsupportedBufferAddressing;
+        pointer = try self.addPointerOffset(pointer, try self.constant(.bits32, @bitCast(inst.memory_offset)));
+        if (inst.memory_offset < 0)
+            pointer[1] = try self.andBits(try self.addBits(pointer[1], try self.constant(.bits32, 0xffff_ffff)), 0xffff);
+        var values: [4]u32 = @splat(zero);
+        // Capture the address before writing any overlapping destination VGPR.
+        for (0..count) |word| {
+            const address = try self.addPointerOffset(pointer, try self.constant(.bits32, @intCast(word * 4)));
+            var found = self.id();
+            try self.emit(&self.body, 171, &.{ self.bool_type, found, zero, zero });
+            for (self.flat_memory_bindings) |region| {
+                const binding = StorageBufferBinding{ .resource_sgpr = 0, .descriptor_index = region.descriptor_index };
+                const header = BufferAddress{ .binding = binding, .byte_offset = zero };
+                const base_low = try self.loadBufferWord(header, 0);
+                const base_high = try self.loadBufferWord(header, 1);
+                const length = try self.loadBufferWord(header, 3);
+                const relative = self.id();
+                try self.emit(&self.body, 130, &.{ self.bits_type, relative, address[0], base_low });
+                const borrow = self.id();
+                try self.emit(&self.body, 176, &.{ self.bool_type, borrow, address[0], base_low });
+                const borrow_word = self.id();
+                try self.emit(&self.body, 169, &.{ self.bits_type, borrow_word, borrow, try self.constant(.bits32, 1), zero });
+                const high_base = try self.addBits(base_high, borrow_word);
+                const same_high = self.id();
+                try self.emit(&self.body, 170, &.{ self.bool_type, same_high, address[1], high_base });
+                const end = try self.addBits(relative, try self.constant(.bits32, 4));
+                const no_wrap = self.id();
+                try self.emit(&self.body, 174, &.{ self.bool_type, no_wrap, end, relative });
+                const within = self.id();
+                try self.emit(&self.body, 178, &.{ self.bool_type, within, end, length });
+                const valid = try self.logicalAndValue(same_high, try self.logicalAndValue(no_wrap, within));
+                const aligned = try self.addBits(try self.andBits(relative, 0xffff_fffc), try self.constant(.bits32, 16));
+                const low = try self.loadBufferWord(.{ .binding = binding, .byte_offset = aligned }, 0);
+                const high = try self.loadBufferWord(.{ .binding = binding, .byte_offset = aligned }, 1);
+                const shift = try self.subwordShift(relative);
+                const low_part = try self.shiftRightVariable(low, shift);
+                const inverse = self.id();
+                try self.emit(&self.body, 130, &.{ self.bits_type, inverse, try self.constant(.bits32, 32), shift });
+                const high_part = self.id();
+                try self.emit(&self.body, 196, &.{ self.bits_type, high_part, high, try self.andBits(inverse, 31) });
+                const high_selected = self.id();
+                try self.emit(&self.body, 169, &.{ self.bits_type, high_selected, try self.isNonZero(shift), high_part, zero });
+                const combined = self.id();
+                try self.emit(&self.body, 197, &.{ self.bits_type, combined, low_part, high_selected });
+                const selected = self.id();
+                try self.emit(&self.body, 169, &.{ self.bits_type, selected, valid, combined, values[word] });
+                values[word] = selected;
+                const either = self.id();
+                try self.emit(&self.body, 166, &.{ self.bool_type, either, found, valid });
+                found = either;
+            }
+            const missing = self.id();
+            try self.emit(&self.body, 168, &.{ self.bool_type, missing, found });
+            const predicate = (try self.writePredicate(missing)).?;
+            const taken = self.id();
+            const merge = self.id();
+            try self.emit(&self.body, 247, &.{ merge, 0 });
+            try self.emit(&self.body, 250, &.{ predicate, taken, merge });
+            try self.emit(&self.body, 248, &.{taken});
+            const fault = BufferAddress{ .binding = .{ .resource_sgpr = 0, .descriptor_index = self.flat_memory_bindings[0].descriptor_index }, .byte_offset = zero };
+            try self.emit(&self.body, 234, &.{ self.bits_type, self.id(), try self.bufferWordPointer(fault, 2), try self.constant(.bits32, 1), zero, try self.constant(.bits32, 1) });
+            try self.emit(&self.body, 249, &.{merge});
+            try self.emit(&self.body, 248, &.{merge});
+        }
+        for (values[0..count], 0..) |value, word|
+            try self.destination(try consecutiveRegister(inst.dst, @intCast(word)), .{ .id = value, .value_type = .bits32 });
+    }
+
     fn flatStoreWords(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
+        if (self.flat_memory_bindings.len != 0) return Error.UnsupportedBufferAddressing;
         try self.bufferStoreWords(asBufferFromFlat(inst), count);
     }
 
     fn flatLoadSubword(self: *Builder, inst: instruction.Instruction, width: u8, signed: bool) Error!void {
+        if (self.flat_memory_bindings.len != 0) return Error.UnsupportedBufferAddressing;
         try self.bufferLoadSubword(asBufferFromFlat(inst), width, signed);
     }
 
     fn flatStoreSubword(self: *Builder, inst: instruction.Instruction, width: u8) Error!void {
+        if (self.flat_memory_bindings.len != 0) return Error.UnsupportedBufferAddressing;
         try self.bufferStoreSubword(asBufferFromFlat(inst), width);
     }
 

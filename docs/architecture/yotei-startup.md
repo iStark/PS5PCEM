@@ -954,6 +954,42 @@ checks that repeated CPU, compute and DMA depth clears retain a distinct
 stencil sentinel. It and the complete smoke pass with clean validation.
 Live validation of this correction is pending.
 
+The corrected packed-depth path now runs in the title: logs show repeated
+zero clears of depth `0x505a820000`, using HTILE `0x5060b30000` at 3840x2160.
+The following run finishes all 6042 initial resource resolves and displays
+the first bonus notice. Transition and background validation remain pending.
+
+The three visibility kernels at `0x8000196500`, `0x80001c0d00` and
+`0x80001abb00` now have a bounded absolute-memory path. Their captured
+instruction sites identify a root pointer table, object headers and the
+168-byte records described by each header's V#. The backend snapshots these
+complete ranges, retaining the guest addresses in SSBO headers. The shader
+performs the original pointer arithmetic and reads; an unmapped active read
+increments a checked fault counter and fails the dispatch explicitly.
+Unrelated shaders retain the existing refusal. Writes, scratch and subword
+FLAT operations are outside this snapshot path.
+
+SDK probes cover scalar and vector address forms, signed offsets, overlapping
+address/destination registers, unaligned reads, 4-GiB carries, relocation,
+exact region bounds and fault counts. An integration probe uses the captured
+three-level walk and verifies changed record addresses, count rejection and
+unmapped-read rejection. Existing scalar-pointer and complete smoke probes
+also pass. Isolated replays use captured state/pages plus read-only access to
+the live process for remaining resources, with writes confined to the replay.
+This establishes execution coverage, not a synchronized scene replay or a
+rendered menu. Live integration and background output remain pending.
+
+The first replay exposed an independent resource-analysis bug: checkpoints
+inside a skipped branch inherited SGPR values from another path. In the
+64-thread kernel this invented writable V# `0x8000000001`, instead of the
+two 600-byte buffers named at root+112 and root+128. Checkpoints now record
+only instructions actually visited by the scalar walk; skipped sites remain
+unknown for reaching-definition recovery. Backward visits are captured and
+loop-varying values are invalidated. Eight focused tests pass. All three
+replays then complete with the corrected resource bindings, zero FLAT faults
+and clean SDK validation. Scalar pointers, indirect sampled images and the
+complete GPU smoke also pass.
+
 The refusals at `0x800033db00 + 0x10cc` and `0x8000227600 + 0xa64`
 encode `IMAGE_GATHER4_C_L`, not a level-zero gather. The first captured
 instruction uses NSA addresses for reference, X, Y and the computed LOD.

@@ -2387,6 +2387,9 @@ const ComputeResources = struct {
     specialized_scalar_prefix_end: u32 = 0,
     scalar_memories: [maximum_storage_mappings]rdna2.spirv.ScalarMemoryBinding = undefined,
     scalar_memory_count: usize = 0,
+    flat_memories: [maximum_storage_descriptors]rdna2.spirv.FlatMemoryBinding = undefined,
+    flat_memory_count: usize = 0,
+    flat_memory_fault: ?DrawUploadSlice = null,
     storage_images: [maximum_storage_images]PreparedStorageImage = undefined,
     storage_image_count: usize = 0,
     // One resident image may be loaded into the same T# SGPR range at several
@@ -5587,6 +5590,7 @@ pub const Renderer = struct {
             .sampled_image_array_length = self.device_info.sampled_image_capacity,
             .specialized_scalar_prefix_end = resources.specialized_scalar_prefix_end,
             .zero_unmapped_flat_loads = yotei_empty_cluster_flat_read,
+            .flat_memories = resources.flat_memories[0..resources.flat_memory_count],
             .allow_float64 = self.shader_float64_available,
             .allow_image_float32_atomic_min_max = self.image_float32_atomic_min_max_available,
         }) catch |err| {
@@ -5682,6 +5686,26 @@ pub const Renderer = struct {
         const submit_started = hostTimestampNs();
         try self.prepareStorageImageAccess(resources);
         const report = try self.dispatchSpirv(module.words, group_count);
+        if (resources.flat_memory_fault) |fault| {
+            const command_buffer = try self.beginOneShot();
+            defer self.releaseOneShot(command_buffer);
+            const barrier = vk.BufferMemoryBarrier{
+                .source_access_mask = vk.access_shader_write_bit,
+                .destination_access_mask = vk.access_host_read_bit,
+                .buffer = fault.buffer,
+                .offset = fault.offset,
+                .size = fault.size,
+            };
+            self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_compute_shader_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
+            try self.submitOneShot(command_buffer);
+            try self.waitForSubmittedWork();
+            const mapping = self.draw_upload_mapping orelse return Error.MemoryMapFailed;
+            const faults = std.mem.readInt(u32, mapping[@intCast(fault.offset)..][0..4], .little);
+            if (faults != 0) {
+                std.debug.print("[vulkan dcb] FLAT snapshot fault program=0x{x} unmapped_words={d}\n", .{ program_address, faults });
+                return Error.GuestMemoryReadFailed;
+            }
+        }
         const submit_elapsed_ns = elapsedHostNanoseconds(submit_started);
         self.frame_profile.compute_submit_ns +|= submit_elapsed_ns;
         if (self.traceCurrentGraphicsFrame()) {
@@ -7761,6 +7785,82 @@ pub const Renderer = struct {
         }
     }
 
+    /// The captured visibility kernels walk root+24 -> header+136 V# ->
+    /// 168-byte object records. Keep guest pointers in the shader and expose
+    /// the complete bounded records, including GPU-produced indices into them.
+    /// This shape gate does not turn unrelated absolute addresses into zeros.
+    fn prepareSceneFlatMemory(
+        self: *Renderer,
+        result: *ComputeResources,
+        bindings: *const gpu.ShaderBindings,
+        reader: gpu.ShaderMemoryReader,
+        analysis: *const gpu.ShaderAnalysis,
+    ) anyerror!void {
+        if (bindings.stage != .compute or bindings.user_data_count < 2 or bindings.scalar_user_data_base != 0) return;
+        var matches = false;
+        for ([_]u32{ 0x3ad4, 0x3a70, 0x39fc }) |pc| {
+            if (programHasRawInstruction(analysis, pc, &.{ 0xdc34_8018, 0x0400_0004 }) and
+                programHasRawInstruction(analysis, pc + 12, &.{ 0xdc30_8098, 0x067d_0004 }) and
+                programHasRawInstruction(analysis, pc + 104, &.{ 0xdc34_8088, 0x0e7d_0004 })) matches = true;
+        }
+        if (!matches) return;
+        const Region = struct { address: u64, size: usize };
+        var regions: [33]Region = undefined;
+        var region_count: usize = 1;
+        const root = @as(u64, bindings.user_data[0]) | (@as(u64, bindings.user_data[1] & 0xffff) << 32);
+        try self.flushGuestStorageRange(root, 1024);
+        const count = try reader.readU32(root + 16);
+        if (count > 16) return Error.GuestBufferTooLarge;
+        regions[0] = .{ .address = root, .size = 456 + @as(usize, count) * 16 };
+        for (0..count) |index| {
+            const header = (try reader.readU64(root + 24 + index * 8)) & 0xffff_ffff_ffff;
+            if (header == 0) return Error.GuestMemoryReadFailed;
+            try self.flushGuestStorageRange(header, 160);
+            const descriptor = (try decodeBufferDescriptorAt(reader, header + 136)) orelse return Error.InvalidStorageDescriptor;
+            const objects = try reader.readU32(header + 152);
+            if (descriptor.stride != 168 or descriptor.swizzle_enabled or descriptor.add_thread_id or
+                objects > descriptor.record_count or descriptor.size_bytes > 8 * 1024 * 1024) return Error.InvalidStorageDescriptor;
+            regions[region_count] = .{ .address = header, .size = 160 };
+            region_count += 1;
+            if (descriptor.size_bytes != 0) {
+                regions[region_count] = .{ .address = descriptor.address, .size = @intCast(descriptor.size_bytes) };
+                region_count += 1;
+            }
+        }
+        var total: usize = 0;
+        var free: usize = 0;
+        for (result.occupied) |used| if (!used) {
+            free += 1;
+        };
+        if (region_count > free) return Error.InvalidStorageDescriptor;
+        for (regions[0..region_count]) |region| total += std.mem.alignForward(usize, region.size + 16, draw_upload_alignment);
+        if (total > 16 * 1024 * 1024) return Error.GuestBufferTooLarge;
+        // Reserve the entire snapshot together, so wrapping the upload ring
+        // cannot overwrite a region that this dispatch has not consumed yet.
+        const upload = try self.allocateDrawUpload(total);
+        const mapping = self.draw_upload_mapping orelse return Error.MemoryMapFailed;
+        var cursor = upload.offset;
+        for (regions[0..region_count]) |region| {
+            try self.flushGuestStorageRange(region.address, region.size);
+            const destination = mapping[@intCast(cursor)..][0 .. region.size + 16];
+            std.mem.writeInt(u64, destination[0..8], region.address, .little);
+            std.mem.writeInt(u32, destination[8..12], 0, .little);
+            std.mem.writeInt(u32, destination[12..16], @intCast(region.size), .little);
+            try reader.read(region.address, destination[16..]);
+            const slot = result.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
+            self.updateStorageDescriptorRange(slot, upload.buffer, cursor, destination.len);
+            result.occupied[slot] = true;
+            result.flat_memories[result.flat_memory_count] = .{ .descriptor_index = slot };
+            result.flat_memory_count += 1;
+            cursor += std.mem.alignForward(usize, destination.len, draw_upload_alignment);
+        }
+        result.flat_memory_fault = .{ .buffer = upload.buffer, .offset = upload.offset + 8, .size = 4 };
+        self.active_descriptor_set = self.descriptor_set;
+        self.frame_profile.upload_bytes +%= total;
+        self.frame_profile.storage_upload_bytes +%= total;
+        if (self.traceCurrentGraphicsFrame()) std.debug.print("[vulkan dcb] FLAT scene snapshot root=0x{x} regions={d} bytes={d}\n", .{ root, region_count, total });
+    }
+
     fn prepareComputeResources(
         self: *Renderer,
         bindings: *const gpu.ShaderBindings,
@@ -8439,6 +8539,7 @@ pub const Renderer = struct {
             result.sampled_images[0..result.sampled_image_count],
             result.sampled_image_mappings[0..result.sampled_image_mapping_count],
         );
+        try self.prepareSceneFlatMemory(result, bindings, reader, analysis);
         return result;
     }
 

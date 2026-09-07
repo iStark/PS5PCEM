@@ -1897,6 +1897,133 @@ fn runArrayGradientCase(allocator: std.mem.Allocator, format: u32, first_layer: 
     try std.testing.expectApproxEqAbs(expected, actual, 0.00001);
 }
 
+fn runFlatPointerProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    for ([_]bool{ false, true }) |scalar_base| for ([_]i32{ -4, 0, 4 }) |offset| {
+        const code = [_]u32{
+            vop1(1, 4, 20), 0xb814_0008,
+            0xf424_0004,                                        20 << 25, // pointer table -> s0:s1
+            vop1(1, 0, if (scalar_base) 136 else 0),            vop1(1, 1, 1),
+            0xdc38_8000 | (@as(u32, @bitCast(offset)) & 0xfff),
+            if (scalar_base) 0 else 0x007d_0000, // x4 -> v0:v3, overlapping address
+            mubuf(0x1e, 0, 0, 4, 12)[0],
+            mubuf(0x1e, 0, 0, 4, 12)[1],
+            0xbf81_0000,
+        };
+        for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+        var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, code.len);
+        defer analysis.deinit(allocator);
+        var module = try analysis.translateSpirv(allocator, .{
+            .stage = .compute,
+            .compute_inputs = .{ .workgroup_id_sgprs = .{ 20, null, null } },
+            .storage_buffers = &.{
+                .{ .resource_sgpr = 8, .descriptor_index = 0, .stride = 8 },
+                .{ .resource_sgpr = 12, .descriptor_index = 1, .stride = 16 },
+            },
+            .flat_memories = &.{ .{ .descriptor_index = 2 }, .{ .descriptor_index = 3 } },
+        });
+        defer module.deinit(allocator);
+        for (0..2) |pass| {
+            const base: u64 = 0x20_ffff_fff0 + (@as(u64, @intCast(pass)) << 36);
+            const pointers = [_]u64{ base, base + 1, base + 24, base - 4, base + 64, base + 0x1_0000_0000 };
+            var source: [64]u8 = undefined;
+            for (&source, 0..) |*byte, index| byte.* = @intCast(index + 1);
+            for (pointers, 0..) |pointer, index| {
+                guest.word(0x10000 + index * 8, @truncate(pointer));
+                guest.word(0x10004 + index * 8, @truncate(pointer >> 32));
+            }
+            for (0..2) |region| {
+                const at = 0x12000 + region * 0x100;
+                const address = base + region * 32;
+                guest.word(at, @truncate(address));
+                guest.word(at + 4, @truncate(address >> 32));
+                guest.word(at + 8, 0);
+                guest.word(at + 12, 32);
+                for (0..8) |word| guest.word(at + 16 + word * 4, std.mem.readInt(u32, source[region * 32 + word * 4 ..][0..4], .little));
+            }
+            _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, pointers.len * 8);
+            _ = try renderer.stageGuestStorageBufferAt(1, 0x11000, pointers.len * 16);
+            _ = try renderer.stageGuestStorageBufferAt(2, 0x12000, 48);
+            _ = try renderer.stageGuestStorageBufferAt(3, 0x12100, 48);
+            _ = try renderer.dispatchSpirv(module.words, .{ pointers.len, 1, 1 });
+            var output: [pointers.len * 16]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x11000, &output);
+            var faults: u32 = 0;
+            for (pointers, 0..) |pointer, index| for (0..4) |word| {
+                const address: i64 = @as(i64, @intCast(pointer)) + (if (scalar_base) @as(i64, 8) else 0) + offset + @as(i64, @intCast(word * 4));
+                const relative = address - @as(i64, @intCast(base));
+                const valid = relative >= 0 and relative + 4 <= 64 and @mod(relative, 32) <= 28;
+                const expected = if (valid) std.mem.readInt(u32, source[@intCast(relative)..][0..4], .little) else blk: {
+                    faults += 1;
+                    break :blk @as(u32, 0);
+                };
+                try std.testing.expectEqual(expected, std.mem.readInt(u32, output[index * 16 + word * 4 ..][0..4], .little));
+            };
+            var header: [48]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x12000, &header);
+            try std.testing.expectEqual(faults, std.mem.readInt(u32, header[8..12], .little));
+        }
+    };
+    std.debug.print("FLAT pointers passed: absolute/scalar bases, signed offsets, overlapping destinations, unaligned reads, 4-GiB carry, relocation and fault counts\n", .{});
+}
+
+fn runSceneFlatPointerProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    // Preserve the captured pointer-walk sites, with NOPs in place of its
+    // culling math. All memory discovery, upload and fault checks are live.
+    var code: [0x3b5c / 4]u32 = @splat(0xbf80_0000);
+    code[0] = vop1(1, 4, 128);
+    code[0x3ad4 / 4] = 0xdc34_8018;
+    code[0x3ad8 / 4] = 0x0400_0004;
+    code[0x3ae0 / 4] = 0xdc30_8098;
+    code[0x3ae4 / 4] = 0x067d_0004;
+    code[0x3b3c / 4] = 0xdc34_8088;
+    code[0x3b40 / 4] = 0x0e7d_0004;
+    code[0x3b44 / 4] = 0xdc38_8000;
+    code[0x3b48 / 4] = 0x007d_000e;
+    code[0x3b4c / 4] = vop1(1, 8, 128);
+    code[0x3b50 / 4] = mubuf(0x1e, 0, 0, 8, 4)[0];
+    code[0x3b54 / 4] = mubuf(0x1e, 0, 0, 8, 4)[1];
+    code[0x3b58 / 4] = 0xbf81_0000;
+    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    guest.word(0x10010, 1);
+    guest.word(0x10018, 0x11000);
+    guest.word(0x11000 + 140, 168 << 16);
+    guest.word(0x11000 + 144, 1);
+    guest.word(0x11000 + 148, 0x5204);
+    guest.word(0x11000 + 152, 1);
+    var state = gpu.State{};
+    try state.writeRegister(.shader, 0x20c, 1);
+    try state.writeRegister(.shader, 0x20d, 0);
+    try state.writeRegister(.shader, 0x213, 8 << 1);
+    const user_data = [_]u32{ 0x10000, 0, 0, 0, 0x13000, 16 << 16, 1, (20 << 12) | 0xfac };
+    for (user_data, 0..) |word, index| try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(index)), word);
+    for (0..2) |pass| {
+        const records = 0x12000 + pass * 0x2000;
+        guest.word(0x11000 + 136, @intCast(records));
+        for (0..42) |word| guest.word(records + word * 4, @intCast(pass * 100 + word + 1));
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        var output: [16]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x13000, &output);
+        for (0..4) |word| try std.testing.expectEqual(@as(u32, @intCast(pass * 100 + word + 1)), std.mem.readInt(u32, output[word * 4 ..][0..4], .little));
+    }
+    guest.word(0x11000 + 152, 2);
+    try std.testing.expectError(error.InvalidStorageDescriptor, renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 }));
+    guest.word(0x11000 + 152, 1);
+    // Use another program address so the immutable program cache is valid.
+    code[0x3b44 / 4] |= 168;
+    for (code, 0..) |word, index| guest.word(0x5000 + index * 4, word);
+    try state.writeRegister(.shader, 0x20c, 0x50);
+    try std.testing.expectError(error.GuestMemoryReadFailed, renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 }));
+    std.debug.print("Scene FLAT snapshots passed: nested descriptor walk, relocated records, count bounds and live unmapped-read rejection\n", .{});
+}
+
 fn runScalarPointerProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
     defer renderer.deinit();
@@ -2322,6 +2449,14 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--scalar-pointers")) {
         try runScalarPointerProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--flat-pointers")) {
+        try runFlatPointerProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--scene-flat-pointers")) {
+        try runSceneFlatPointerProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--nested-images")) {
