@@ -11009,7 +11009,7 @@ pub const Renderer = struct {
     fn uniformHtileBytes(target: GuestDepthTarget) ?usize {
         const descriptor = target.descriptor;
         if (!descriptor.htile_enabled or descriptor.htile_address == 0 or
-            !descriptor.tile_stencil_disabled or target.has_stencil or
+            !descriptor.tile_stencil_disabled or
             descriptor.tile_mode != .depth or descriptor.maximum_mip != 0 or
             descriptor.mip_level != 0 or descriptor.base_array_slice != 0 or
             descriptor.last_array_slice != 0) return null;
@@ -11033,17 +11033,24 @@ pub const Renderer = struct {
         const snapshot = self.depth_targets.items[index];
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
-        const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_depth_bit };
-        try self.transitionTrackedImage(command_buffer, snapshot.image.handle, range, image_state.transfer_destination_usage);
-        const clear = vk.ClearDepthStencilValue{ .depth = depth, .stencil = 0 };
+        // Layouts remain coupled for a packed depth/stencil image, even when
+        // depth-only HTILE changes just its depth aspect. Initialize stencil
+        // on first use as prepareDepthAttachment does, then preserve it.
+        const layout_range = vk.ImageSubresourceRange{ .aspect_mask = snapshot.target.aspectMask() };
+        const range = vk.ImageSubresourceRange{ .aspect_mask = if (snapshot.initialized) vk.image_aspect_depth_bit else snapshot.target.aspectMask() };
+        try self.transitionTrackedImage(command_buffer, snapshot.image.handle, layout_range, image_state.transfer_destination_usage);
+        const clear = vk.ClearDepthStencilValue{ .depth = depth, .stencil = snapshot.target.clear_stencil };
         self.device_functions.cmd_clear_depth_stencil_image(command_buffer, snapshot.image.handle, vk.image_layout_transfer_dst_optimal, &clear, 1, @ptrCast(&range));
-        try self.transitionTrackedImage(command_buffer, snapshot.image.handle, range, image_state.depth_attachment_usage);
+        try self.transitionTrackedImage(command_buffer, snapshot.image.handle, layout_range, image_state.depth_attachment_usage);
         try self.submitOneShot(command_buffer);
         const cached = &self.depth_targets.items[index];
         cached.initialized = true;
         cached.shader_read_layout = false;
         cached.gpu_generation +%= 1;
         _ = self.image_aliases.markWrite(cached.alias_token);
+        if (!snapshot.initialized) if (cached.stencil_alias_token) |token| {
+            _ = self.image_aliases.markWrite(token);
+        };
         if (self.reported_htile_resolves < 4 or self.traceCurrentGraphicsFrame()) {
             self.reported_htile_resolves +|= 1;
             std.debug.print("[vulkan dcb] resident HTILE clear depth@0x{x} {d}x{d} meta@0x{x} value={d}\n", .{
@@ -12731,20 +12738,22 @@ pub const Renderer = struct {
         }
         const cached = self.depth_targets.items[index];
         try std.testing.expectEqual(@as(u64, 2), cached.gpu_generation);
-        return self.readDepthProbeValues(index);
+        return self.readDepthProbeValues(index, false);
     }
 
-    fn readDepthProbeValues(self: *Renderer, index: usize) anyerror![2]f32 {
+    fn readDepthProbeValues(self: *Renderer, index: usize, comptime stencil: bool) anyerror![2]if (stencil) u8 else f32 {
+        const Value = if (stencil) u8 else f32;
+        const aspect = if (stencil) vk.image_aspect_stencil_bit else vk.image_aspect_depth_bit;
         const cached = self.depth_targets.items[index];
         try std.testing.expectEqual(@as(u32, 32), cached.target.width);
         try std.testing.expectEqual(@as(u32, 32), cached.target.height);
-        const readback = try self.createBuffer(32 * 32 * 4, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        const readback = try self.createBuffer(32 * 32 * @sizeOf(Value), vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
         defer self.destroyBuffer(readback);
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
-        try self.transitionTrackedImage(command_buffer, cached.image.handle, .{ .aspect_mask = vk.image_aspect_depth_bit }, image_state.transfer_source_usage);
+        try self.transitionTrackedImage(command_buffer, cached.image.handle, .{ .aspect_mask = cached.target.aspectMask() }, image_state.transfer_source_usage);
         const copy = vk.BufferImageCopy{
-            .image_subresource = .{ .aspect_mask = vk.image_aspect_depth_bit },
+            .image_subresource = .{ .aspect_mask = aspect },
             .image_extent = .{ .width = 32, .height = 32, .depth = 1 },
         };
         self.device_functions.cmd_copy_image_to_buffer(command_buffer, cached.image.handle, vk.image_layout_transfer_src_optimal, readback.handle, 1, @ptrCast(&copy));
@@ -12756,17 +12765,26 @@ pub const Renderer = struct {
             .size = readback.size,
         };
         self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
-        try self.transitionTrackedImage(command_buffer, cached.image.handle, .{ .aspect_mask = vk.image_aspect_depth_bit }, image_state.depth_attachment_usage);
+        try self.transitionTrackedImage(command_buffer, cached.image.handle, .{ .aspect_mask = cached.target.aspectMask() }, image_state.depth_attachment_usage);
         try self.submitOneShot(command_buffer);
-        var values: [32 * 32]f32 = undefined;
+        var values: [32 * 32]Value = undefined;
         try self.readMapped(readback, std.mem.sliceAsBytes(&values));
         return .{ values[0], values[16 * 32 + 16] };
     }
 
     pub fn probeHtileDepthClears(self: *Renderer) anyerror!void {
+        try self.probeHtileDepthClearFormat(false);
+        try self.probeHtileDepthClearFormat(true);
+    }
+
+    fn probeHtileDepthClearFormat(self: *Renderer, stencil: bool) anyerror!void {
         var descriptor = std.mem.zeroes(gpu.resources.DepthTarget);
-        descriptor.read_address = 0x10000;
-        descriptor.write_address = 0x10000;
+        descriptor.read_address = if (stencil) 0x20000 else 0x10000;
+        descriptor.write_address = descriptor.read_address;
+        descriptor.stencil_format = if (stencil) 1 else 0;
+        descriptor.stencil_read_address = if (stencil) 0x40000 else 0;
+        descriptor.stencil_write_address = descriptor.stencil_read_address;
+        descriptor.clear_stencil = 0x5a;
         descriptor.htile_address = 0x8000;
         descriptor.width = 32;
         descriptor.height = 32;
@@ -12775,14 +12793,20 @@ pub const Renderer = struct {
         descriptor.htile_enabled = true;
         descriptor.tile_stencil_disabled = true;
         // Captured SDK11 state leaves HTILE_SURFACE and DB_DEPTH_CLEAR reset.
-        const target = guestDepthTarget(descriptor) orelse return error.TestFailed;
+        var target = guestDepthTarget(descriptor) orelse return error.TestFailed;
         const size = uniformHtileBytes(target) orelse return error.TestFailed;
         const bytes = try self.allocator.alloc(u8, size);
         defer self.allocator.free(bytes);
         fillRepeatedPattern(bytes, &.{ 0xf0, 0xff, 0xff, 0xff });
         try std.testing.expect(dcbWrite(self, descriptor.htile_address, bytes));
         const index = try self.acquireDepthTarget(target);
-        try std.testing.expectEqual([2]f32{ 1, 1 }, try self.readDepthProbeValues(index));
+        try std.testing.expectEqual([2]f32{ 1, 1 }, try self.readDepthProbeValues(index, false));
+        if (stencil) {
+            try std.testing.expectEqual([2]u8{ 0x5a, 0x5a }, try self.readDepthProbeValues(index, true));
+            // Later depth-only fills must not apply this new stencil value.
+            target.clear_stencil = 0xa5;
+            self.depth_targets.items[index].target.clear_stencil = 0xa5;
+        }
         var state = GraphicsPipelineState.default(32, 32);
         state.color_write_masks = @splat(0);
         state.depth_attachment_format = target.format;
@@ -12795,25 +12819,25 @@ pub const Renderer = struct {
             try self.beginFrameDraw();
             try self.drawGraphicsShaders(&graphics_probe_vertex_spirv, &graphics_probe_fragment_spirv, &.{}, &.{}, state, null, &.{}, target, false, false, false, .{ .vertex_count = vertices });
         }
-        try std.testing.expectEqual([2]f32{ 1, 0.5 }, try self.readDepthProbeValues(index));
+        try std.testing.expectEqual([2]f32{ 1, 0.5 }, try self.readDepthProbeValues(index, false));
         // A partial metadata update cannot stand in for a fullscreen clear.
         try std.testing.expect(dcbWrite(self, descriptor.htile_address, &.{ 0, 0, 0, 0 }));
-        try std.testing.expectEqual([2]f32{ 1, 0.5 }, try self.readDepthProbeValues(index));
+        try std.testing.expectEqual([2]f32{ 1, 0.5 }, try self.readDepthProbeValues(index, false));
         @memset(bytes, 0);
         try std.testing.expect(dcbWrite(self, descriptor.htile_address, bytes));
-        try std.testing.expectEqual([2]f32{ 0, 0 }, try self.readDepthProbeValues(index));
+        try std.testing.expectEqual([2]f32{ 0, 0 }, try self.readDepthProbeValues(index, false));
         state.depth_compare_operation = 4; // reversed depth
         state.viewport_min_depth_bits = @bitCast(@as(f32, 0.25));
         state.viewport_max_depth_bits = @bitCast(@as(f32, 0.25));
         try self.beginFrameDraw();
         try self.drawGraphicsShaders(&graphics_probe_vertex_spirv, &graphics_probe_fragment_spirv, &.{}, &.{}, state, null, &.{}, target, false, false, false, .{ .vertex_count = 3 });
-        try std.testing.expectEqual([2]f32{ 0, 0.25 }, try self.readDepthProbeValues(index));
+        try std.testing.expectEqual([2]f32{ 0, 0.25 }, try self.readDepthProbeValues(index, false));
         fillRepeatedPattern(bytes, &.{ 0xf0, 0xff, 0xff, 0xff });
         try std.testing.expect(dcbWrite(self, descriptor.htile_address, bytes));
-        try std.testing.expectEqual([2]f32{ 1, 1 }, try self.readDepthProbeValues(index));
+        try std.testing.expectEqual([2]f32{ 1, 1 }, try self.readDepthProbeValues(index, false));
         bytes[bytes.len - 1] = 0;
         try std.testing.expect(dcbWrite(self, descriptor.htile_address, bytes));
-        try std.testing.expectEqual([2]f32{ 1, 1 }, try self.readDepthProbeValues(index));
+        try std.testing.expectEqual([2]f32{ 1, 1 }, try self.readDepthProbeValues(index, false));
         // Exercise the same formatted compute fill used by the captured UI.
         const code = [_]u32{
             0xd746_0004, 8 | (134 << 9) | (256 << 18),
@@ -12833,7 +12857,7 @@ pub const Renderer = struct {
         const fills_before = self.emulated_buffer_clear_dispatches;
         _ = try self.dispatchRdna2State(&compute, .{ 64, 1, 1 }, .{ @intCast(size / (16 * 64)), 1, 1 });
         try std.testing.expectEqual(fills_before + 1, self.emulated_buffer_clear_dispatches);
-        try std.testing.expectEqual([2]f32{ 0, 0 }, try self.readDepthProbeValues(index));
+        try std.testing.expectEqual([2]f32{ 0, 0 }, try self.readDepthProbeValues(index, false));
         var dma = std.mem.zeroes(gpu.state.DmaData);
         dma.source = 2;
         dma.source_address = 0xffff_fff0;
@@ -12844,7 +12868,9 @@ pub const Renderer = struct {
         dma.destination_address = 0x18000;
         dma.byte_count = @intCast(size);
         try std.testing.expect(dcbDmaData(self, dma));
-        try std.testing.expectEqual([2]f32{ 1, 1 }, try self.readDepthProbeValues(index));
+        try std.testing.expectEqual([2]f32{ 1, 1 }, try self.readDepthProbeValues(index, false));
+        if (stencil)
+            try std.testing.expectEqual([2]u8{ 0x5a, 0x5a }, try self.readDepthProbeValues(index, true));
     }
 
     fn drawGraphicsProbe(self: *Renderer) anyerror!void {

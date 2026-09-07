@@ -944,6 +944,16 @@ repeated zero/one clears, the captured compute kernel, DMA, and partial/mixed
 guards. The complete smoke and D32 bias probe pass with clean validation.
 The updated title run must establish whether this removes the UI artifacts.
 
+The next live capture showed why the initial resident-clear path did not run:
+the UI binds D32 and S8 allocations together, despite disabling stencil in
+HTILE. Depth-only metadata clears now accept that packed host attachment,
+transition both aspects together and preserve initialized stencil contents.
+First use initializes stencil from its clear value, matching ordinary depth
+attachment preparation. The SDK probe now exercises both D32 and D32+S8 and
+checks that repeated CPU, compute and DMA depth clears retain a distinct
+stencil sentinel. It and the complete smoke pass with clean validation.
+Live validation of this correction is pending.
+
 The refusals at `0x800033db00 + 0x10cc` and `0x8000227600 + 0xa64`
 encode `IMAGE_GATHER4_C_L`, not a level-zero gather. The first captured
 instruction uses NSA addresses for reference, X, Y and the computed LOD.
