@@ -803,10 +803,10 @@ const maximum_cached_sampled_images = maximum_sampled_images * 2;
 /// 94 distinct views (about 920 MiB of linear image data); the old 64-view cap
 /// evicted half of that graph and re-detiled/re-uploaded roughly 814 MiB every
 /// frame. These are capacity ceilings, not eager allocations.
-// Later loading passes exceed 128 views while using only 700–880 MiB.
+// Later loading passes exceed 256 views while using only 700–880 MiB.
 // Retain those smaller views under the same byte budget instead of forcing
 // dirty-image readback and tiling solely to free an entry.
-const maximum_cached_storage_images = 256;
+const maximum_cached_storage_images = 1024;
 /// Counts linear image bytes (the cache also owns one transfer allocation per
 /// image). The limit is soft while every resident entry is in use by the same
 /// dispatch, so a legal 32-image descriptor set is never rejected solely by

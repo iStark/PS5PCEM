@@ -68,6 +68,14 @@ words respectively). These replays verify execution coverage, not complete
 scene correctness. The pointer/table, typed-index, large-image, FLAT and full
 smoke regressions pass; live integration remains to be checked.
 
+The loading graph also fills all 256 storage-image cache slots while using
+only about 752 MiB of its 1,280 MiB byte budget. Many entries hold tiny mip
+levels. The count ceiling is now 1,024, with the byte budget and pin/retirement
+rules unchanged. The GPU regression retains 320 dirty images without early
+guest writeback, then checks all 1,152 writes across eviction pressure. It and
+the full smoke suite pass SDK validation. The effect on live frame time has
+not yet been measured.
+
 ## Reproduce
 
 ```powershell
