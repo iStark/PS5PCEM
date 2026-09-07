@@ -970,6 +970,68 @@ fn runVectorCarryProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("vector carry-out passed: add/sub/subrev, VCC/SGPR masks, stale carry, unsigned overflow/borrow, overlapping operands and 64/512 lanes\n", .{});
 }
 
+fn runSaveExecProbe(allocator: std.mem.Allocator) !void {
+    const pairs = [_][2]u64{
+        .{ 0xaaaa_aaaa_5555_5555, 0xcccc_cccc_3333_3333 },
+        .{ 0xffff_ffff_ffff_ffff, 0 },
+        .{ 0xffff_ffff_ffff_ffff, 0xffff_ffff_ffff_ffff },
+        .{ 0, 0xffff_ffff_ffff_ffff },
+        .{ 0xffff_ffff_0000_0000, 0 },
+    };
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    var case: u32 = 0;
+    for ([_]u32{ 64, 512 }) |lanes| for ([_]u8{ 0x24, 0x28, 0x37, 0x3c, 0x44 }) |opcode| for (pairs) |pair| {
+        case += 1;
+        const narrow = opcode == 0x3c or opcode == 0x44;
+        const code = [_]u32{
+            if (lanes == 64) 0xd760_0018 else 0xbf80_0000,
+            if (lanes == 64) 256 | (191 << 9) else 0xbf80_0000,
+            vop1(1, 2, 170),
+            sop1(4, 126, 8),
+            sop1(opcode, 10, 10), // destination overlaps the source pair
+            0x8514_8081, // capture SCC before restoring EXEC
+            vop1(1, 2, 129),
+            sop1(4, 126, 193),
+            vop1(1, 3, 10),
+            vop1(1, 4, 11),
+            vop1(1, 5, 20),
+            mubuf(0x1e, 0, 2, 0, 0)[0],
+            mubuf(0x1e, 0, 2, 0, 0)[1],
+            0xbf81_0000,
+        };
+        for (code, 0..) |word, index| guest.word(case * 256 + index * 4, word);
+        var state = gpu.State{};
+        try state.writeRegister(.shader, 0x20c, case);
+        try state.writeRegister(.shader, 0x20d, 0);
+        try state.writeRegister(.shader, 0x213, 12 << 1);
+        const userdata = [_]u32{ 0x10000, 16 << 16, lanes, 0, 0, 0, 0, 0, @truncate(pair[0]), @truncate(pair[0] >> 32), @truncate(pair[1]), @truncate(pair[1] >> 32) };
+        for (userdata, 0..) |word, index| try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(index)), word);
+        _ = try renderer.dispatchRdna2State(&state, .{ lanes, 1, 1 }, .{ 1, 1, 1 });
+        var output: [512 * 16]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x10000, output[0 .. lanes * 16]);
+        const combined = if (opcode == 0x28) pair[1] | ~pair[0] else if (opcode == 0x37 or opcode == 0x44) ~pair[1] & pair[0] else pair[1] & pair[0];
+        const active = if (narrow) (pair[0] & 0xffff_ffff_0000_0000) | (combined & 0xffff_ffff) else combined;
+        const scc: u32 = @intFromBool(if (narrow) combined & 0xffff_ffff != 0 else combined != 0);
+        for (0..lanes) |lane| {
+            const expected = [_]u32{
+                if (active & (@as(u64, 1) << @intCast(lane % 64)) != 0) 1 else 42,
+                @truncate(pair[0]),
+                @truncate((if (narrow) pair[1] else pair[0]) >> 32),
+                scc,
+            };
+            for (expected, 0..) |word, component| {
+                const actual = std.mem.readInt(u32, output[lane * 16 + component * 4 ..][0..4], .little);
+                if (word != actual) std.debug.print("saveexec case={d} lanes={d} opcode={x} lane={d} component={d}\n", .{ case, lanes, opcode, lane, component });
+                try std.testing.expectEqual(word, actual);
+            }
+        }
+    };
+    std.debug.print("SAVEEXEC passed: AND/ANDN1/ORN2 operand order, saved masks, overlapping destinations, SCC and preserved EXEC_HI for 32-bit operations\n", .{});
+}
+
 fn runWideMaskProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -2906,6 +2968,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--indexed-images")) {
         try runIndexedImageProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--save-exec")) {
+        try runSaveExecProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--counted-image-loop")) {

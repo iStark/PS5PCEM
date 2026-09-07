@@ -4,6 +4,17 @@ Verified with PPSA26344 and the RTX 3070 Ti on 2026-09-06.
 
 ## Menu progress on 2026-09-07
 
+SAVEEXEC now applies negation to the operand specified by the ISA:
+`ANDN1` computes `~source & EXEC`, while `ORN2` computes `source | ~EXEC`.
+The previous lowering reversed both operands. In the captured culling shader
+`0x80001abb00`, the ANDN1 at PC `0x7f8` could consequently activate lanes
+outside the current branch and overwrite the pointer VGPRs later read at
+PC `0x9bc`. A 50-case GPU probe fails before the correction and passes after
+it, checking both operand orders, saved masks, source/destination overlap,
+and the low-word-only SCC for 32-bit SAVEEXEC. Wave64, wide masks, carry,
+packed-buffer and scene-pointer regressions also pass SDK validation.
+The live pointer fault still requires a new runtime verification.
+
 Material texture indices can now resolve a second, global descriptor table.
 The recovery follows SMEM definitions at the relevant instructions, enumerates
 the bounded set of reachable source words (including 32-bit multiplication
@@ -23,8 +34,10 @@ could reuse stale upper-half bits. A GPU probe using SDWA comparisons,
 lane 32 retains its sentinel instead of executing the false branch. All 20
 64/512-invocation cases pass after updating the pair, along with carry,
 wave64, packed-buffer, scene-pointer and full Vulkan regressions.
-This follows the carry-only game's later `0x80001abb00` fault at PC `0x9bc`;
-the complete scene still needs verification with the pair update.
+The pair update alone did not remove the live `0x80001abb00` fault at
+PC `0x9bc`. That shader uses a wave64 workgroup and contains the incorrect
+ANDN1 lowering described above. A later wave32 dispatch also exposed the
+need to limit comparison destinations to one scalar word in wave32 mode.
 
 Runtime sampled-image tables can now select between 2D and 3D Vulkan views
 at one instruction. Each view kind has its own exact descriptor lookup;

@@ -2145,16 +2145,16 @@ const Builder = struct {
             },
             .or_not => blk: {
                 const inverted = self.id();
-                try self.emit(&self.body, 200, &.{ self.bits_type, inverted, predicate });
+                try self.emit(&self.body, 200, &.{ self.bits_type, inverted, previous });
                 const result = self.id();
-                try self.emit(&self.body, 197, &.{ self.bits_type, result, previous, inverted });
+                try self.emit(&self.body, 197, &.{ self.bits_type, result, predicate, inverted });
                 break :blk result;
             },
             .not_and => blk: {
                 const inverted = self.id();
-                try self.emit(&self.body, 200, &.{ self.bits_type, inverted, previous });
+                try self.emit(&self.body, 200, &.{ self.bits_type, inverted, predicate });
                 const result = self.id();
-                try self.emit(&self.body, 199, &.{ self.bits_type, result, inverted, predicate });
+                try self.emit(&self.body, 199, &.{ self.bits_type, result, inverted, previous });
                 break :blk result;
             },
         };
@@ -2189,7 +2189,7 @@ const Builder = struct {
         self.exec_mask = .{ active, high };
         self.exec_mask_is_lane_predicate = source_is_lane_predicate;
         self.exec_mask_lane_predicate_condition = 0;
-        try self.updateSccFromPair(.{ active, high });
+        try self.updateSccFromPair(.{ active, try self.constant(.bits32, 0) });
     }
 
     fn bitwise32(self: *Builder, inst: instruction.Instruction, opcode: isa.Opcode) Error!void {
