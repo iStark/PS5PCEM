@@ -69,6 +69,9 @@ pub const ScalarMemoryBinding = struct {
 /// the captured bytes. Faults are recorded in the first region's header.
 pub const FlatMemoryBinding = struct {
     descriptor_index: u32,
+    /// Optional four-word record outside the payload: PC, address low/high,
+    /// and component index. Only the first failed read writes this record.
+    fault_record_word: ?u32 = null,
 };
 
 pub const sampled_lookup = @import("sampled_lookup.zig");
@@ -7380,7 +7383,22 @@ const Builder = struct {
             try self.emit(&self.body, 250, &.{ predicate, taken, merge });
             try self.emit(&self.body, 248, &.{taken});
             const fault = BufferAddress{ .binding = .{ .resource_sgpr = 0, .descriptor_index = self.flat_memory_bindings[0].descriptor_index }, .byte_offset = zero };
-            try self.emit(&self.body, 234, &.{ self.bits_type, self.id(), try self.bufferWordPointer(fault, 2), try self.constant(.bits32, 1), zero, try self.constant(.bits32, 1) });
+            const previous_faults = self.id();
+            try self.emit(&self.body, 234, &.{ self.bits_type, previous_faults, try self.bufferWordPointer(fault, 2), try self.constant(.bits32, 1), zero, try self.constant(.bits32, 1) });
+            if (self.flat_memory_bindings[0].fault_record_word) |record| {
+                const first = self.id();
+                try self.emit(&self.body, 170, &.{ self.bool_type, first, previous_faults, zero });
+                const record_block = self.id();
+                const record_merge = self.id();
+                try self.emit(&self.body, 247, &.{ record_merge, 0 });
+                try self.emit(&self.body, 250, &.{ first, record_block, record_merge });
+                try self.emit(&self.body, 248, &.{record_block});
+                const details = [_]u32{ try self.constant(.bits32, inst.pc), address[0], address[1], try self.constant(.bits32, @intCast(word)) };
+                for (details, 0..) |value, component|
+                    try self.emit(&self.body, 62, &.{ try self.bufferWordPointer(fault, record + @as(u32, @intCast(component))), value });
+                try self.emit(&self.body, 249, &.{record_merge});
+                try self.emit(&self.body, 248, &.{record_merge});
+            }
             try self.emit(&self.body, 249, &.{merge});
             try self.emit(&self.body, 248, &.{merge});
         }

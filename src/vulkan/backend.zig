@@ -5755,7 +5755,12 @@ pub const Renderer = struct {
             const mapping = self.draw_upload_mapping orelse return Error.MemoryMapFailed;
             const faults = std.mem.readInt(u32, mapping[@intCast(fault.offset)..][0..4], .little);
             if (faults != 0) {
-                std.debug.print("[vulkan dcb] FLAT snapshot fault program=0x{x} unmapped_words={d}\n", .{ program_address, faults });
+                const record = mapping[@intCast(fault.offset + fault.size - 16)..][0..16];
+                std.debug.print("[vulkan dcb] FLAT snapshot fault program=0x{x} unmapped_words={d} first_pc=0x{x} address=0x{x} component={d}\n", .{
+                    program_address,                               faults,
+                    std.mem.readInt(u32, record[0..4], .little),   std.mem.readInt(u64, record[4..12], .little),
+                    std.mem.readInt(u32, record[12..16], .little),
+                });
                 return Error.GuestMemoryReadFailed;
             }
         }
@@ -7905,28 +7910,32 @@ pub const Renderer = struct {
             free += 1;
         };
         if (region_count > free) return Error.InvalidStorageDescriptor;
-        for (regions[0..region_count]) |region| total += std.mem.alignForward(usize, region.size + 16, draw_upload_alignment);
+        for (regions[0..region_count], 0..) |region, index| total += std.mem.alignForward(usize, region.size + 16 + @as(usize, if (index == 0) 16 else 0), draw_upload_alignment);
         if (total > 16 * 1024 * 1024) return Error.GuestBufferTooLarge;
         // Reserve the entire snapshot together, so wrapping the upload ring
         // cannot overwrite a region that this dispatch has not consumed yet.
         const upload = try self.allocateDrawUpload(total);
         const mapping = self.draw_upload_mapping orelse return Error.MemoryMapFailed;
         var cursor = upload.offset;
-        for (regions[0..region_count]) |region| {
+        for (regions[0..region_count], 0..) |region, index| {
             try self.flushGuestStorageRange(region.address, region.size);
-            const destination = mapping[@intCast(cursor)..][0 .. region.size + 16];
+            const destination = mapping[@intCast(cursor)..][0 .. region.size + 16 + @as(usize, if (index == 0) 16 else 0)];
             std.mem.writeInt(u64, destination[0..8], region.address, .little);
             std.mem.writeInt(u32, destination[8..12], 0, .little);
             std.mem.writeInt(u32, destination[12..16], @intCast(region.size), .little);
-            try reader.read(region.address, destination[16..]);
+            try reader.read(region.address, destination[16..][0..region.size]);
+            if (index == 0) @memset(destination[region.size + 16 ..], 0);
             const slot = result.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
             self.updateStorageDescriptorRange(slot, upload.buffer, cursor, destination.len);
             result.occupied[slot] = true;
-            result.flat_memories[result.flat_memory_count] = .{ .descriptor_index = slot };
+            result.flat_memories[result.flat_memory_count] = .{
+                .descriptor_index = slot,
+                .fault_record_word = if (index == 0) @intCast((region.size + 16) / 4) else null,
+            };
             result.flat_memory_count += 1;
             cursor += std.mem.alignForward(usize, destination.len, draw_upload_alignment);
         }
-        result.flat_memory_fault = .{ .buffer = upload.buffer, .offset = upload.offset + 8, .size = 4 };
+        result.flat_memory_fault = .{ .buffer = upload.buffer, .offset = upload.offset + 8, .size = regions[0].size + 24 };
         self.active_descriptor_set = self.descriptor_set;
         self.frame_profile.upload_bytes +%= total;
         self.frame_profile.storage_upload_bytes +%= total;
