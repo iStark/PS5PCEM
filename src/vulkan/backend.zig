@@ -2223,6 +2223,15 @@ const GraphicsResources = struct {
         return result;
     }
 
+    fn acquire(renderer: *Renderer) !*GraphicsResources {
+        if (renderer.free_graphics_resource_count == 0) return init(renderer.allocator);
+        renderer.free_graphics_resource_count -= 1;
+        const result = renderer.free_graphics_resources[renderer.free_graphics_resource_count];
+        result.image_count = 0;
+        result.mapping_count = 0;
+        return result;
+    }
+
     fn deinit(self: *GraphicsResources, renderer: *Renderer) void {
         for (self.images[0..self.image_count]) |image| {
             if (image.owns_view) renderer.destroyImageView(image.view);
@@ -2230,7 +2239,10 @@ const GraphicsResources = struct {
             if (image.storage_cache_index) |cache_index| renderer.releaseStorageImage(cache_index);
             if (image.render_target_index) |index| renderer.releaseRenderTarget(index);
         }
-        renderer.allocator.destroy(self);
+        if (renderer.free_graphics_resource_count < renderer.free_graphics_resources.len) {
+            renderer.free_graphics_resources[renderer.free_graphics_resource_count] = self;
+            renderer.free_graphics_resource_count += 1;
+        } else renderer.allocator.destroy(self);
     }
 };
 
@@ -2411,6 +2423,29 @@ const ComputeResources = struct {
         return result;
     }
 
+    fn acquire(renderer: *Renderer) !*ComputeResources {
+        if (renderer.free_compute_resource_count == 0) return init(renderer.allocator);
+        renderer.free_compute_resource_count -= 1;
+        const result = renderer.free_compute_resources[renderer.free_compute_resource_count];
+        // Only occupied slots and the prefixes named by these counts are read.
+        // Preserve the unused multi-megabyte arrays across draws/dispatches.
+        result.mapping_count = 0;
+        result.scalar_count = 0;
+        @memset(&result.addresses, 0);
+        @memset(&result.sizes, 0);
+        @memset(&result.occupied, false);
+        @memset(&result.writable, false);
+        result.specialized_scalar_prefix_end = 0;
+        result.scalar_memory_count = 0;
+        result.flat_memory_count = 0;
+        result.flat_memory_fault = null;
+        result.storage_image_count = 0;
+        result.storage_image_mapping_count = 0;
+        result.sampled_image_count = 0;
+        result.sampled_image_mapping_count = 0;
+        return result;
+    }
+
     fn descriptorForRange(self: *const ComputeResources, address: u64, size: usize) ?u32 {
         for (self.occupied, 0..) |used, index| {
             if (used and self.addresses[index] == address and self.sizes[index] == size) return @intCast(index);
@@ -2483,7 +2518,10 @@ const ComputeResources = struct {
         }
         self.sampled_image_count = 0;
         self.sampled_image_mapping_count = 0;
-        renderer.allocator.destroy(self);
+        if (renderer.free_compute_resource_count < renderer.free_compute_resources.len) {
+            renderer.free_compute_resources[renderer.free_compute_resource_count] = self;
+            renderer.free_compute_resource_count += 1;
+        } else renderer.allocator.destroy(self);
     }
 };
 
@@ -3259,6 +3297,20 @@ pub const Renderer = struct {
     compute_watch_hits: [96]ComputeWatchHit = undefined,
     compute_watch_hit_count: u32 = 0,
 
+    // Prepared resources release all Vulkan ownership before entering these
+    // bounded CPU pools. Concurrent preparations always hold different entries.
+    free_compute_resources: [4]*ComputeResources = undefined,
+    free_compute_resource_count: usize = 0,
+    free_graphics_resources: [4]*GraphicsResources = undefined,
+    free_graphics_resource_count: usize = 0,
+
+    fn destroyResourcePools(self: *Renderer) void {
+        for (self.free_compute_resources[0..self.free_compute_resource_count]) |resource| self.allocator.destroy(resource);
+        self.free_compute_resource_count = 0;
+        for (self.free_graphics_resources[0..self.free_graphics_resource_count]) |resource| self.allocator.destroy(resource);
+        self.free_graphics_resource_count = 0;
+    }
+
     fn traceCurrentGraphicsFrame(self: *const Renderer) bool {
         const requested = self.trace_graphics_frame orelse return false;
         const target = if (requested == 0)
@@ -3872,6 +3924,7 @@ pub const Renderer = struct {
         _ = self.device_functions.device_wait_idle(self.device);
         self.completed_tick = self.submitted_tick;
         self.destroyDeferredVulkanObjects();
+        self.destroyResourcePools();
         self.pending_targetless_draws.deinit(self.allocator);
         for (self.color_passes.items) |pass| self.destroyColorPass(pass);
         self.color_passes.deinit(self.allocator);
@@ -7948,7 +8001,7 @@ pub const Renderer = struct {
         specialized_scalar_prefix_end: u32,
         reserved_resources: ?*const ComputeResources,
     ) anyerror!*ComputeResources {
-        const result = try ComputeResources.init(self.allocator);
+        const result = try ComputeResources.acquire(self);
         errdefer result.deinit(self);
         result.specialized_scalar_prefix_end = specialized_scalar_prefix_end;
         if (reserved_resources) |reserved| {
@@ -13755,7 +13808,7 @@ pub const Renderer = struct {
                 "[vulkan dcb] vertex storage incomplete: {s}; translating without buffers\n",
                 .{@errorName(err)},
             );
-            break :blk try ComputeResources.init(self.allocator);
+            break :blk try ComputeResources.acquire(self);
         };
         self.frame_profile.graphics_storage_ns +|= elapsedHostNanoseconds(vertex_storage_started);
         defer vertex_storage.deinit(self);
@@ -14174,7 +14227,7 @@ pub const Renderer = struct {
                 "[vulkan dcb] fragment storage incomplete: {s}; translating without buffers\n",
                 .{@errorName(err)},
             );
-            break :blk try ComputeResources.init(self.allocator);
+            break :blk try ComputeResources.acquire(self);
         };
         self.frame_profile.graphics_storage_ns +|= elapsedHostNanoseconds(fragment_storage_started);
         defer fragment_storage.deinit(self);
@@ -15617,7 +15670,7 @@ pub const Renderer = struct {
         analysis: *const gpu.ShaderAnalysis,
         render_target_write: GuestColorTarget,
     ) anyerror!*GraphicsResources {
-        const result = try GraphicsResources.init(self.allocator);
+        const result = try GraphicsResources.acquire(self);
         errdefer result.deinit(self);
         try self.appendGraphicsResources(
             result,
@@ -27238,6 +27291,47 @@ test "compute resources retain temporal scalar load specializations" {
         resources.scalar_registers.len,
     );
     try std.testing.expect(resources.scalar_registers.len > gpu.scalar_provenance.maximum_scalar_registers);
+}
+
+test "prepared resource pools reset bindings and keep active loans distinct" {
+    var renderer: Renderer = undefined;
+    renderer.allocator = std.testing.allocator;
+    renderer.free_compute_resource_count = 0;
+    renderer.free_graphics_resource_count = 0;
+    defer renderer.destroyResourcePools();
+    const first = try ComputeResources.acquire(&renderer);
+    first.mapping_count = 17;
+    first.scalar_count = 23;
+    first.scalar_memory_count = 9;
+    first.flat_memory_count = 3;
+    first.specialized_scalar_prefix_end = 123;
+    first.addresses[7] = 0x1000;
+    first.sizes[7] = 4096;
+    first.occupied[7] = true;
+    first.writable[7] = true;
+    first.flat_memory_fault = .{ .buffer = 1, .offset = 8, .size = 4 };
+    first.deinit(&renderer);
+    const reused = try ComputeResources.acquire(&renderer);
+    try std.testing.expect(first == reused);
+    try std.testing.expectEqual(@as(usize, 0), reused.mapping_count);
+    try std.testing.expectEqual(@as(usize, 0), reused.scalar_count);
+    try std.testing.expectEqual(@as(usize, 0), reused.scalar_memory_count);
+    try std.testing.expectEqual(@as(usize, 0), reused.flat_memory_count);
+    try std.testing.expectEqual(@as(u32, 0), reused.specialized_scalar_prefix_end);
+    try std.testing.expect(!reused.hasWritableExternalState());
+    try std.testing.expect(reused.descriptorForRange(0x1000, 4096) == null);
+    try std.testing.expect(reused.flat_memory_fault == null);
+    const second = try ComputeResources.acquire(&renderer);
+    try std.testing.expect(second != reused);
+    second.deinit(&renderer);
+    reused.deinit(&renderer);
+    const graphics = try GraphicsResources.acquire(&renderer);
+    graphics.mapping_count = 31;
+    graphics.deinit(&renderer);
+    const graphics_reused = try GraphicsResources.acquire(&renderer);
+    try std.testing.expect(graphics_reused == graphics);
+    try std.testing.expectEqual(@as(usize, 0), graphics_reused.mapping_count);
+    graphics_reused.deinit(&renderer);
 }
 
 test "fullscreen blit row flip preserves pixels and reverses vertical order" {

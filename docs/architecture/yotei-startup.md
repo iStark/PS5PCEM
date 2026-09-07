@@ -92,6 +92,20 @@ the untouched output tail. The existing six-image loop and full smoke also
 pass without validation errors. This is regression coverage; integration of
 the volume kernels into the game's final scene is still unverified.
 
+A steady menu-transition profile also finds repeated `0xAA` initialization of
+2,342,632-byte compute and 2,232,336-byte graphics preparation objects in
+ReleaseSafe. Renderer-local pools now retain up to four of each CPU object.
+Each preparation resets its counts, slot masks, addresses and fault state;
+array elements outside the active prefixes remain unused. Recycling happens
+only after the existing image/view/sampler ownership releases. Active loans
+remain distinct and renderer teardown frees the pools.
+
+The focused reset/ownership test and SDK storage-reuse, large compute/fragment
+tables, scene FLAT and full smoke suites pass. This removes repeated setup
+allocation and initialization; the change's live FPS benefit is not yet
+measured. Large texture staging, readback and first-use driver compilation
+remain separate costs.
+
 ## Reproduce
 
 ```powershell
