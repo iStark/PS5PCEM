@@ -1410,6 +1410,76 @@ fn runGdsAtomicProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("GDS atomic passed: persistent counter, cross-workgroup updates, EXEC low/high, segment and physical bounds, returned value\n", .{});
 }
 
+fn runGdsMemoryProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const code = [_]u32{
+        0xbefc_0300, // M0 = base / size
+        vop1(1, 1, 1),
+        vop1(1, 2, 4),
+        vop1(1, 3, 5),
+        0xbefe_0402, // EXEC = s2:s3, one writer or no writer
+        0xd936_0004, 0x0000_0201, // ds_write_b64 v1, v2:v3 offset:4 gds
+        0xbf81_0000,
+    };
+    const read_code = [_]u32{
+        0xbefc_0300,
+        vop1(1, 1, 6),
+        0xd9da_0004, 0x0400_0001, // ds_read_b64 v4:v5, v1 offset:4 gds
+        0xd8da_0004, 0x0400_0001, // same first word through ds_read_b32
+        0xe074_2000, 0x8002_0400, // all lanes store the pair through V#s8
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    for (read_code, 0..) |word, index| guest.word(0x200 + index * 4, word);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 12 << 1);
+    const Case = struct { m0: u32 = 0x0100_0010, address: u32 = 4, mask: u64 = 1, values: [2]u32 = .{ 11, 22 }, expected: [2]u32 };
+    const cases = [_]Case{
+        .{ .expected = .{ 11, 22 } },
+        .{ .address = 8, .values = .{ 33, 44 }, .expected = .{ 33, 0 } }, // second word outside segment
+        .{ .mask = 0, .values = .{ 99, 99 }, .expected = .{ 11, 33 } },
+        .{ .address = 0xffff_fffc, .expected = .{ 0, 0 } }, // relative offset wraps
+        .{ .m0 = 0xfffc_0010, .address = 0, .expected = .{ 0, 0 } }, // physical 64 KiB boundary
+        .{ .m0 = 0x0100_0000, .expected = .{ 0, 0 } },
+        .{ .m0 = 0x0200_0010, .mask = @as(u64, 1) << 40, .values = .{ 55, 66 }, .expected = .{ 55, 66 } },
+    };
+    var expected_gds: [64 * 1024]u8 = @splat(0);
+    for (cases, 0..) |case, pass| {
+        const destination: u32 = 0x18000 + @as(u32, @intCast(pass)) * 0x1000;
+        const userdata = [_]u32{ case.m0, case.address, @truncate(case.mask), @truncate(case.mask >> 32), case.values[0], case.values[1], case.address, 0, destination, 8 << 16, 64, 0 };
+        for (userdata, 0..) |word, index| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+        try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+        _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 1, 1, 1 });
+        try state.writeRegister(.shader, compute.programRegisterBase(), 2);
+        _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 1, 1, 1 });
+        var output: [512]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(destination, &output);
+        for (0..64) |lane| for (case.expected, 0..) |expected, component| {
+            try std.testing.expectEqual(expected, std.mem.readInt(u32, output[lane * 8 + component * 4 ..][0..4], .little));
+        };
+        switch (pass) {
+            0 => {
+                std.mem.writeInt(u32, expected_gds[0x108..][0..4], 11, .little);
+                std.mem.writeInt(u32, expected_gds[0x10c..][0..4], 22, .little);
+            },
+            1 => std.mem.writeInt(u32, expected_gds[0x10c..][0..4], 33, .little),
+            6 => {
+                std.mem.writeInt(u32, expected_gds[0x208..][0..4], 55, .little);
+                std.mem.writeInt(u32, expected_gds[0x20c..][0..4], 66, .little);
+            },
+            else => {},
+        }
+        try std.testing.expectEqualSlices(u8, &expected_gds, renderer.gds_storage.items);
+    }
+    std.debug.print("GDS memory passed: persistent word pairs, low/high EXEC, per-word segment bounds, address wrap and physical bounds\n", .{});
+}
+
 fn runPackedBufferProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -2717,6 +2787,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--gds")) {
         try runGdsAtomicProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--gds-memory")) {
+        try runGdsMemoryProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--packed-buffer")) {

@@ -6276,11 +6276,18 @@ const Builder = struct {
         try self.guardedStore(predicate, access.pointer, value);
     }
 
-    fn loadDsWord(self: *Builder, inst: instruction.Instruction, offset: u32) Error!u32 {
+    fn dsWordAccess(self: *Builder, inst: instruction.Instruction, offset: u32) Error!WorkgroupAccess {
+        if (inst.gds) {
+            var word = inst;
+            word.memory_offset = @intCast(offset);
+            return self.indexedGdsAccess(word);
+        }
         const address = try self.workgroupByteAddress(inst, offset);
-        if (self.stage == .compute) return self.loadWorkgroupWord(address);
+        return if (self.stage == .compute) self.workgroupAccess(address) else self.privateAccess(address);
+    }
 
-        const access = try self.privateAccess(address);
+    fn loadDsWord(self: *Builder, inst: instruction.Instruction, offset: u32) Error!u32 {
+        const access = try self.dsWordAccess(inst, offset);
         const loaded = self.id();
         try self.emit(&self.body, 61, &.{ self.bits_type, loaded, access.pointer }); // OpLoad
         const result = self.id();
@@ -6295,13 +6302,7 @@ const Builder = struct {
     }
 
     fn storeDsWord(self: *Builder, inst: instruction.Instruction, offset: u32, value: u32) Error!void {
-        const address = try self.workgroupByteAddress(inst, offset);
-        if (self.stage == .compute) {
-            try self.storeWorkgroupWord(address, value);
-            return;
-        }
-
-        const access = try self.privateAccess(address);
+        const access = try self.dsWordAccess(inst, offset);
         const predicate = (try self.writePredicate(access.in_range)) orelse access.in_range;
         try self.guardedStore(predicate, access.pointer, value);
     }

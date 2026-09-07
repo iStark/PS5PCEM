@@ -106,6 +106,21 @@ allocation and initialization; the change's live FPS benefit is not yet
 measured. Large texture staging, readback and first-use driver compilation
 remain separate costs.
 
+Kernel `0x8000403f00` was rejected at its ordinary `DS_READ_B32 GDS`:
+word reads/writes still called the LDS-only address helper. DS word and paired
+accesses now select the existing M0-bounded GDS storage path when GDS is set.
+Each component checks both the segment and physical 64 KiB range, wrapping
+offsets are rejected, and writes retain the EXEC predicate.
+
+The GPU regression writes and reads in separate dispatches, verifies persistent
+word pairs, low/high EXEC, a partial pair at the segment boundary, wrapping
+addresses and physical/empty-segment bounds. Atomic GDS, LDS translation and
+full smoke regressions pass. The captured game kernel also runs against
+controlled buffers: counter 77 produces counts `[2, 2, 1, 0]` and offsets
+`[0, 32, 64, 80]` in a 1,338-word SPIR-V module, with clean SDK validation.
+This verifies the shader's argument-generation path; its live scene output
+still requires the next game run.
+
 ## Reproduce
 
 ```powershell
