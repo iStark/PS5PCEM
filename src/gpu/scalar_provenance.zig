@@ -393,18 +393,39 @@ pub fn evaluateDecodedResourceState(
 const RegisterCheckpointCollector = struct {
     pcs: []const u32,
     snapshots: []ScalarRegisters,
-    next: usize = 0,
+    seen: std.StaticBitSet(maximum_resource_instructions) = .initEmpty(),
 
     fn captureBefore(self: *RegisterCheckpointCollector, evaluation: *const Evaluation, pc: u32) void {
-        while (self.next < self.pcs.len and self.pcs[self.next] <= pc) : (self.next += 1) {
-            self.snapshots[self.next] = evaluation.registers;
+        var low: usize = 0;
+        var high = self.pcs.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (self.pcs[middle] < pc) low = middle + 1 else high = middle;
+        }
+        // A forward branch did not execute the instructions it skipped.
+        // Their registers must come from reaching definitions, never from
+        // whichever unrelated scalar values preceded the branch.
+        if (low == self.pcs.len or self.pcs[low] != pc or low >= self.seen.capacity()) return;
+        if (!self.seen.isSet(low)) {
+            self.snapshots[low] = evaluation.registers;
+            self.seen.set(low);
+        } else {
+            for (&self.snapshots[low], evaluation.registers) |*saved, current| {
+                if (!saved.known or !current.known or saved.value != current.value) {
+                    saved.* = .{};
+                } else saved.sources = Sources.merge(saved.sources, current.sources);
+            }
         }
     }
 
     fn finish(self: *RegisterCheckpointCollector, evaluation: *const Evaluation) void {
-        while (self.next < self.pcs.len) : (self.next += 1) {
-            self.snapshots[self.next] = evaluation.registers;
-        }
+        // A checkpoint after END may query final state. Unvisited sites
+        // inside the program remain unknown, including after an early stop.
+        if (evaluation.stop_reason != .end_program) return;
+        for (self.pcs, self.snapshots) |pc, *snapshot|
+            if (pc > evaluation.stop_pc) {
+                snapshot.* = evaluation.registers;
+            };
     }
 };
 
@@ -420,6 +441,7 @@ pub fn evaluateDecodedResourceStateAtCheckpoints(
     snapshots: []ScalarRegisters,
 ) Evaluation {
     std.debug.assert(checkpoint_pcs.len == snapshots.len);
+    for (snapshots) |*snapshot| snapshot.* = @splat(.{});
     var collector = RegisterCheckpointCollector{
         .pcs = checkpoint_pcs,
         .snapshots = snapshots,
@@ -1723,6 +1745,53 @@ test "one-pass resource checkpoints preserve instruction-local SGPR state" {
     const second = evaluateDecodedResourceStateUntil(memory.reader(), &bindings, &instructions, 8);
     try std.testing.expectEqual(first.registers[2], snapshots[0][2]);
     try std.testing.expectEqual(second.registers[2], snapshots[1][2]);
+}
+
+test "resource checkpoints leave skipped blocks unknown and capture backward visits" {
+    var storage = [_]u8{0} ** 4;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    const bindings = testBindings(0x3000, 0x4000);
+    const code = [_]u32{
+        0xb008_0001, // s_movk s8, 1
+        0xbf82_0004, // jump forward to pc24
+        0xb008_002a, // pc8: s8=42, reached by the backward jump
+        0xbf80_0000, // pc12: checkpoint
+        0xbf82_0003, // jump to END at32
+        0xb008_0063, // pc20: unreachable, never capture stale s8=1 here
+        0xbf82_fffb, // pc24: branch back to8
+        0xbf80_0000,
+        0xbf81_0000,
+    };
+    var program = try rdna2.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var snapshots: [4]ScalarRegisters = undefined;
+    _ = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, program.instructions.items, &.{ 12, 20, 24, 32 }, &snapshots);
+    try std.testing.expectEqual(@as(u32, 42), snapshots[0][8].value);
+    try std.testing.expect(snapshots[0][8].known);
+    try std.testing.expect(!snapshots[1][8].known);
+    try std.testing.expectEqual(@as(u32, 1), snapshots[2][8].value);
+    try std.testing.expectEqual(@as(u32, 42), snapshots[3][8].value);
+}
+
+test "resource checkpoints invalidate values that vary between loop iterations" {
+    var storage = [_]u8{0} ** 4;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    const bindings = testBindings(0x3000, 0x4000);
+    const code = [_]u32{
+        0xb008_0000, // s8=0
+        0x8008_8108, // s_add_u32 s8,s8,1
+        0xbf80_0000, // checkpoint in loop
+        0xbf0a_8208, // s_cmp_lt_u32 s8,2
+        0xbf85_fffc, // s_cbranch_scc1 pc4
+        0xbf81_0000,
+    };
+    var program = try rdna2.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var snapshots: [2]ScalarRegisters = undefined;
+    _ = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, program.instructions.items, &.{ 8, 20 }, &snapshots);
+    try std.testing.expect(!snapshots[0][8].known);
+    try std.testing.expect(snapshots[0][0].known);
+    try std.testing.expectEqual(@as(u32, 2), snapshots[1][8].value);
 }
 
 test "resource checkpoints recover after an unavailable scalar load" {
