@@ -2,6 +2,41 @@
 
 Verified with PPSA26344 and the RTX 3070 Ti on 2026-09-06.
 
+## Menu progress on 2026-09-07
+
+The depth/stencil HTILE fix is confirmed in the game. The three bonus notices
+clear without retaining rectangles from earlier windows. The brightness
+screen renders its wolf, smoky background, text, slider and Cross icon. The
+difficulty and experience selection screens also render their labels,
+arrows and selection indicators. This does not yet establish the complete
+title menu or its animated scene.
+
+The material at `0x8000273400 + 0x1a6c` loads T# descriptors from a table of
+1,332 records, each containing three different views. Its unbounded 32-bit
+index multiplication can wrap, so conservative enumeration includes all
+3,996 descriptors. The former 512-candidate ceiling rejected this material.
+The physical image limit is now at most 4,096, bounded by all applicable
+native per-stage/per-set limits for the four image banks. PC-specific
+mappings have a separate 16,384-entry ceiling.
+
+Sets of at least 64 candidates use an uploaded hash table. The shader probes
+until it finds an exact eight-word match, an empty entry or the longest host
+insertion chain. Unmatched descriptors retain the existing zero-result
+behavior; all descriptor-array accesses use a valid slot. This avoids
+generating thousands of comparisons for every sample. Static texture views
+share the renderer's resident sampler cache, and the texture cache can retain
+two complete maximum-size binding sets.
+
+The 4,096-view GPU regression verifies compute and fragment lookup, different
+channel views of the same allocation, reversed table contents, out-of-range
+indices and a single shared sampler. Its procedural vertex stage exposed a
+separate bug: an empty vertex-buffer list caused a valid single PARAM export
+to be replaced by synthetic UVs. Parameter pairing now survives that path;
+only the explicit missing-export/video cases select a replacement VS.
+The GPU regression passes with SDK 1.4.357.0 validation, and recovery of the
+captured material now returns all 3,996 descriptors. Live scene validation
+of the large-table and FLAT changes is still pending.
+
 ## Reproduce
 
 ```powershell

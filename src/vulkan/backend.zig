@@ -788,14 +788,14 @@ const TextureContent = struct {
 const maximum_render_targets = 64;
 const maximum_color_passes = 16;
 const maximum_depth_targets = 16;
-const maximum_sampled_images = 512;
+const maximum_sampled_images = 4096;
 // One physical texture can occur at many sampling instructions in a material.
-const maximum_compute_sampled_mappings = 4096;
+const maximum_compute_sampled_mappings = 16384;
 // Descriptor arrays are limited per shader, but the cross-draw texture cache
 // must cover a complete modern frame. Tying cache capacity to the 32 live
 // descriptor slots evicts large static textures before their next use and
 // uploads them again on every flip.
-const maximum_cached_sampled_images = 1024;
+const maximum_cached_sampled_images = maximum_sampled_images * 2;
 /// Storage images form long compute chains in modern Unity render graphs. A
 /// dispatch may write one image only for the next dispatch to read it; keeping
 /// those images resident avoids a GPU -> tiled guest memory -> GPU round trip
@@ -3894,7 +3894,6 @@ pub const Renderer = struct {
         self.depth_targets.deinit(self.allocator);
         self.htile_targets.deinit(self.allocator);
         for (self.sampled_image_cache.items) |image| {
-            self.device_functions.destroy_sampler(self.device, image.sampler, null);
             self.device_functions.destroy_image_view(self.device, image.view, null);
             self.destroyImage(image.image);
         }
@@ -7861,6 +7860,65 @@ pub const Renderer = struct {
         if (self.traceCurrentGraphicsFrame()) std.debug.print("[vulkan dcb] FLAT scene snapshot root=0x{x} regions={d} bytes={d}\n", .{ root, region_count, total });
     }
 
+    fn sameSampledLookup(a: gpu.ShaderSpirvSampledImageBinding, b: gpu.ShaderSpirvSampledImageBinding) bool {
+        return a.resource_sgpr == b.resource_sgpr and a.sampler_sgpr == b.sampler_sgpr and
+            a.instruction_pc == b.instruction_pc;
+    }
+
+    fn prepareSampledImageLookups(
+        self: *Renderer,
+        resources: *ComputeResources,
+        mappings: []gpu.ShaderSpirvSampledImageBinding,
+    ) anyerror!void {
+        const lookup = rdna2.spirv.sampled_lookup;
+        var total_words: usize = 0;
+        for (mappings, 0..) |binding, index| {
+            if (binding.candidate_words == null) continue;
+            var seen = false;
+            for (mappings[0..index]) |previous| if (sameSampledLookup(previous, binding)) {
+                seen = true;
+                break;
+            };
+            if (seen) continue;
+            var count: usize = 0;
+            for (mappings[index..]) |candidate| if (sameSampledLookup(candidate, binding)) {
+                count += 1;
+            };
+            if (count >= 64) total_words += lookup.capacity(count) * lookup.entry_words;
+        }
+        if (total_words == 0) return;
+        const slot = resources.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
+        const upload = try self.allocateDrawUpload(total_words * 4);
+        const mapping = self.draw_upload_mapping orelse return Error.MemoryMapFailed;
+        const table = std.mem.bytesAsSlice(u32, @as([]align(4) u8, @alignCast(mapping[@intCast(upload.offset)..][0 .. total_words * 4])));
+        @memset(table, 0);
+        var cursor: usize = 0;
+        for (mappings, 0..) |binding, index| {
+            if (binding.candidate_words == null or binding.lookup != null) continue;
+            var count: usize = 0;
+            for (mappings[index..]) |candidate| if (sameSampledLookup(candidate, binding)) {
+                count += 1;
+            };
+            if (count < 64) continue;
+            const entries = lookup.capacity(count);
+            const group = table[cursor..][0 .. entries * lookup.entry_words];
+            var probes: u32 = 0;
+            for (mappings[index..]) |candidate| if (sameSampledLookup(candidate, binding)) {
+                probes = @max(probes, lookup.insert(group, candidate.candidate_words.?, candidate.descriptor_index));
+            };
+            for (mappings[index..]) |*candidate| if (sameSampledLookup(candidate.*, binding)) {
+                candidate.lookup = .{ .descriptor_index = slot, .word_offset = @intCast(cursor), .mask = @intCast(entries - 1), .probes = probes };
+            };
+            cursor += group.len;
+        }
+        std.debug.assert(cursor == total_words);
+        resources.occupied[slot] = true;
+        self.updateStorageDescriptorRange(slot, upload.buffer, upload.offset, total_words * 4);
+        self.active_descriptor_set = self.descriptor_set;
+        self.frame_profile.upload_bytes +%= total_words * 4;
+        self.frame_profile.storage_upload_bytes +%= total_words * 4;
+    }
+
     fn prepareComputeResources(
         self: *Renderer,
         bindings: *const gpu.ShaderBindings,
@@ -8540,6 +8598,7 @@ pub const Renderer = struct {
             result.sampled_image_mappings[0..result.sampled_image_mapping_count],
         );
         try self.prepareSceneFlatMemory(result, bindings, reader, analysis);
+        try self.prepareSampledImageLookups(result, result.sampled_image_mappings[0..result.sampled_image_mapping_count]);
         return result;
     }
 
@@ -13866,11 +13925,10 @@ pub const Renderer = struct {
                 viewport_height < 0,
             )) return;
         }
-        if (fragment_attribute_mask == 1 and vertex_storage.mapping_count == 0) {
-            probe_parameter_mask = 1;
-            fragment_input_controls[0] = 0;
-            paired_parameter_mask = 1;
-        }
+        // A procedural VS can export real parameters without reading a V#.
+        // Preserve the interface already paired above. The missing-export
+        // and planar-video cases select their probe explicitly; replacing a
+        // valid single attribute here corrupts flat material/texture indices.
         // prepareComputeResources soft-skips missing V#s; rebuild its scalar
         // list from the seeded specialization so SPIR-V and staging agree.
         if (vertex_storage.scalar_count == 0 and vertex_scalar_count != 0) {
@@ -14091,6 +14149,7 @@ pub const Renderer = struct {
         };
         self.frame_profile.graphics_storage_ns +|= elapsedHostNanoseconds(fragment_storage_started);
         defer fragment_storage.deinit(self);
+        try self.prepareSampledImageLookups(fragment_storage, graphics_resources.mappings[0..fragment_mapping_count]);
         // Unity PS loads color scales and matrices through s_buffer. Identity
         // constants are only a fallback for a genuinely missing V#: once the
         // constant buffer is staged, specializing those destinations would
@@ -17586,8 +17645,7 @@ pub const Renderer = struct {
             return Error.ImageViewCreationFailed;
         }
         errdefer self.destroyImageView(view);
-        const sampler = try self.createGuestSampler(sampler_descriptor);
-        errdefer self.destroySampler(sampler);
+        const sampler = try self.residentSampler(sampler_descriptor);
         self.sampled_image_uploads += 1;
 
         // A streamed/video texture keeps one allocation per guest surface, not
@@ -17612,7 +17670,6 @@ pub const Renderer = struct {
                 continue;
             }
             self.destroyImageView(stale.view);
-            self.destroySampler(stale.sampler);
             self.image_states.forgetImage(stale.image.handle);
             self.destroyImage(stale.image);
             self.image_aliases.unregister(stale.alias_token);
@@ -17631,7 +17688,6 @@ pub const Renderer = struct {
             self.frame_profile.texture_evictions +|= 1;
             const evicted = self.sampled_image_cache.items[oldest_idx];
             self.destroyImageView(evicted.view);
-            self.destroySampler(evicted.sampler);
             self.image_states.forgetImage(evicted.image.handle);
             self.destroyImage(evicted.image);
             self.image_aliases.unregister(evicted.alias_token);

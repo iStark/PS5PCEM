@@ -11,33 +11,38 @@ comptime {
     @import("host_memory.zig").exportRuntime();
 }
 
-const GuestMemory = struct {
-    bytes: [131072]u8 = @splat(0),
+const GuestMemory = SizedGuestMemory(131072);
 
-    fn read(context: ?*anyopaque, address: u64, destination: []u8) bool {
-        const self: *GuestMemory = @ptrCast(@alignCast(context.?));
-        const start: usize = @intCast(address);
-        if (start + destination.len > self.bytes.len) return false;
-        @memcpy(destination, self.bytes[start..][0..destination.len]);
-        return true;
-    }
+fn SizedGuestMemory(comptime size: usize) type {
+    return struct {
+        const Self = @This();
+        bytes: [size]u8 = @splat(0),
 
-    fn write(context: ?*anyopaque, address: u64, source: []const u8) bool {
-        const self: *GuestMemory = @ptrCast(@alignCast(context.?));
-        const start: usize = @intCast(address);
-        if (start + source.len > self.bytes.len) return false;
-        @memcpy(self.bytes[start..][0..source.len], source);
-        return true;
-    }
+        fn read(context: ?*anyopaque, address: u64, destination: []u8) bool {
+            const self: *Self = @ptrCast(@alignCast(context.?));
+            const start: usize = @intCast(address);
+            if (start + destination.len > self.bytes.len) return false;
+            @memcpy(destination, self.bytes[start..][0..destination.len]);
+            return true;
+        }
 
-    fn word(self: *GuestMemory, address: usize, value: u32) void {
-        std.mem.writeInt(u32, self.bytes[address..][0..4], value, .little);
-    }
+        fn write(context: ?*anyopaque, address: u64, source: []const u8) bool {
+            const self: *Self = @ptrCast(@alignCast(context.?));
+            const start: usize = @intCast(address);
+            if (start + source.len > self.bytes.len) return false;
+            @memcpy(self.bytes[start..][0..source.len], source);
+            return true;
+        }
 
-    fn interface(self: *GuestMemory) vulkan.GuestMemory {
-        return .{ .context = self, .read = read, .write = write };
-    }
-};
+        fn word(self: *Self, address: usize, value: u32) void {
+            std.mem.writeInt(u32, self.bytes[address..][0..4], value, .little);
+        }
+
+        fn interface(self: *Self) vulkan.GuestMemory {
+            return .{ .context = self, .read = read, .write = write };
+        }
+    };
+}
 
 fn command(opcode: u8, body_words: u14) u32 {
     return (@as(u32, 3) << 30) |
@@ -2270,6 +2275,133 @@ fn runTypedIndexProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("typed index images passed: UINT/SINT byte and short indices, negative bounds and decoy fields\n", .{});
 }
 
+fn runLargeIndirectImageProbe(allocator: std.mem.Allocator) !void {
+    const count = 4096;
+    const groups = count + 1;
+    var renderer = try vulkan.Renderer.init(allocator, .{ .trace_resource_failures = true });
+    defer renderer.deinit();
+    if (!renderer.sampled_image_nonuniform_indexing or renderer.device_info.sampled_image_capacity < count)
+        return error.LargeSampledImageTableUnavailable;
+    const guest = try allocator.create(SizedGuestMemory(2 * 1024 * 1024));
+    defer allocator.destroy(guest);
+    guest.* = .{};
+    _ = renderer.dcbBackend(guest.interface());
+    const table = 0x10000;
+    const output = 0x40000;
+    const textures = 0x80000;
+    const code = [_]u32{
+        0x9314_a018, // s_mul_i32 s20, s24 (workgroup X), 32
+        0xf42c_0004,    20 << 25, // s_buffer_load_dwordx8 s0, V#s8, s20
+        vop1(1, 1, 24), vop1(1, 2, 255),
+        0x3e80_0000,    vop1(1, 3, 255),
+        0x3e80_0000,    0xf09c_010a,
+        0x0080_0402,    3,
+        0xe070_2000,    0x8003_0401,
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, (24 << 1) | (1 << 7));
+    var userdata: [24]u32 = @splat(0);
+    @memcpy(userdata[8..12], &[_]u32{ table, 32 << 16, count, 0 });
+    @memcpy(userdata[12..16], &[_]u32{ output, 4 << 16, groups, 0 });
+    for (userdata, 0..) |word, index| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+    for (0..2) |relocation| {
+        for (0..count) |index| {
+            const texture = if (relocation == 0) index else count - index - 1;
+            var image = sampledImageDescriptorWords(textures + @as(u32, @intCast(texture)) * 256, 1, 1);
+            // A distinct view of the first allocation must still select blue,
+            // even though its address word matches another candidate exactly.
+            if (texture == count - 1) {
+                image = sampledImageDescriptorWords(textures, 1, 1);
+                image[3] = (image[3] & ~@as(u32, 7)) | 6;
+            }
+            for (image, 0..) |word, component| guest.word(table + index * 32 + component * 4, word);
+            guest.word(textures + texture * 256, 0xff80_0000 | @as(u32, @intCast(texture % 251 + 1)));
+        }
+        const result = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ groups, 1, 1 });
+        try std.testing.expect(result.spirv_words != 0);
+        var pixels: [groups * 4]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(output, &pixels);
+        for (0..groups) |index| {
+            const texture = if (index == count) count else if (relocation == 0) index else count - index - 1;
+            const expected: f32 = if (texture == count) 0 else if (texture == count - 1) 128.0 / 255.0 else @as(f32, @floatFromInt(texture % 251 + 1)) / 255.0;
+            const actual: f32 = @bitCast(std.mem.readInt(u32, pixels[index * 4 ..][0..4], .little));
+            try std.testing.expectApproxEqAbs(expected, actual, 0.00001);
+        }
+        try std.testing.expectEqual(@as(usize, 1), renderer.resident_samplers.items.len);
+    }
+    // Exercise the independent graphics resource/upload path as well. A flat
+    // vertex export selects entry zero at runtime; after relocation this is
+    // the blue view of the first allocation, not its ordinary red view.
+    const vertex = [_]u32{
+        vop1(6, 1, 261),
+        vop1(1, 2, 255),
+        0x3f80_0000,
+        vop2(4, 3, 1, 2),
+        vop1(1, 4, 255),
+        0x3f40_0000,
+        vop2(8, 5, 3, 4),
+        vop2(8, 6, 3, 3),
+        vop1(1, 7, 255),
+        0xbfc0_0000,
+        vop2(8, 6, 6, 7),
+        vop1(1, 8, 255),
+        0x3f40_0000,
+        vop2(3, 6, 6, 8),
+        vop1(1, 7, 128),
+        vop1(1, 8, 242),
+        0xf800_021f,
+        0x0707_0707,
+        0xf800_08cf,
+        0x0807_0605,
+        0xbf81_0000,
+    };
+    const fragment = [_]u32{
+        0xc802_0002 | (18 << 18), // V_INTERP_MOV P0, ATTR0.x
+        vop1(2, 20, 256 + 18), // V_READFIRSTLANE s20, v18
+        0x9314_a014,
+        0xf42c_0004,
+        20 << 25,
+        vop1(1, 2, 240),
+        vop1(1, 3, 240),
+        0xf09c_0f0a,
+        0x0080_0402,
+        3,
+        0xf800_080f,
+        0x0706_0504,
+        0xbf81_0000,
+    };
+    for (vertex, 0..) |word, index| guest.word(0x700 + index * 4, word);
+    for (fragment, 0..) |word, index| guest.word(0x900 + index * 4, word);
+    for ([_]gpu.resources.ShaderStage{ .vertex, .pixel }, [_]u32{ 7, 9 }) |stage, address| {
+        try state.writeRegister(.shader, stage.programRegisterBase(), address);
+        try state.writeRegister(.shader, stage.programRegisterBase() + 1, 0);
+    }
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.programRegisterBase() + 3, 24 << 1);
+    for (userdata, 0..) |word, index| try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.userDataBase() + @as(u32, @intCast(index)), word);
+    const context = [_][2]u32{
+        .{ 0x318, 0x20 },            .{ 0x319, 7 }, .{ 0x31b, 0 },               .{ 0x31c, 10 << 2 },
+        .{ 0x31d, 0 },               .{ 0x390, 0 }, .{ 0x3b0, (63 << 14) | 63 }, .{ 0x3b8, 1 << 24 },
+        .{ 0x08e, 0xf },             .{ 0x00c, 0 }, .{ 0x00d, 64 | (64 << 16) }, .{ 0x094, 1 << 31 },
+        .{ 0x095, 64 | (64 << 16) }, .{ 0x1e0, 0 }, .{ 0x200, 0 },               .{ 0x202, (0xcc << 16) | (1 << 4) },
+        .{ 0x204, 0 },               .{ 0x205, 0 }, .{ 0x191, 0x401 },
+    };
+    for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+    for ([_]f32{ 32, 32, 32, 32, 1, 0 }, 0..) |value, index| try state.writeRegister(.context, 0x10f + @as(u32, @intCast(index)), @bitCast(value));
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(guest.interface()), .allocator = allocator };
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+    if (renderer.last_draw_error) |err| return err;
+    try renderer.flushPendingGuestWrites();
+    const center = 0x2000 + (32 * 64 + 32) * 4;
+    std.debug.print("large sampled fragment center={any}\n", .{guest.bytes[center..][0..4].*});
+    try std.testing.expectEqual(@as(u8, 128), guest.bytes[center]);
+    std.debug.print("large indirect sampled images passed: compute/fragment lookup, 4096 views, exact aliases, null bounds, relocated table and shared sampler\n", .{});
+}
+
 fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
     for (0..6) |case_index| {
         var renderer = try vulkan.Renderer.init(allocator, .{ .trace_resource_failures = true });
@@ -2371,6 +2503,10 @@ fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--large-indirect-images")) {
+        try runLargeIndirectImageProbe(allocator);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--host-readback")) {
         var renderer = try vulkan.Renderer.init(allocator, .{});
         defer renderer.deinit();

@@ -71,6 +71,8 @@ pub const FlatMemoryBinding = struct {
     descriptor_index: u32,
 };
 
+pub const sampled_lookup = @import("sampled_lookup.zig");
+
 pub const SampledImageBinding = struct {
     resource_sgpr: u32,
     sampler_sgpr: u32,
@@ -82,6 +84,9 @@ pub const SampledImageBinding = struct {
     /// A member of a bounded runtime T# table. The shader compares all eight
     /// descriptor words; aliases with different mips/views remain distinct.
     candidate_words: ?[8]u32 = null,
+    /// Exact runtime lookup in an SSBO, used instead of a linear comparison
+    /// chain when the backend has staged a large candidate set.
+    lookup: ?sampled_lookup.Binding = null,
     /// Proven all-zero T# source. No physical image or sampler is required.
     unbound: bool = false,
     /// Gather comparisons operate on each texel before any filtering.
@@ -930,7 +935,15 @@ const Builder = struct {
             };
         }
 
-        if (options.storage_buffers.len != 0 or options.scalar_memories.len != 0 or options.flat_memories.len != 0) {
+        var has_sampled_lookup = false;
+        for (options.sampled_images) |binding| if (binding.lookup) |lookup| {
+            if (lookup.descriptor_index >= options.descriptor_array_length or
+                lookup.probes == 0 or lookup.probes > lookup.mask + 1 or
+                !std.math.isPowerOfTwo(lookup.mask + 1) or binding.candidate_words == null)
+                return Error.InvalidStorageBinding;
+            has_sampled_lookup = true;
+        };
+        if (options.storage_buffers.len != 0 or options.scalar_memories.len != 0 or options.flat_memories.len != 0 or has_sampled_lookup) {
             // Storage buffers are used by compute and by graphics attribute
             // fetch / constant buffer MUBUF paths.
             if (options.descriptor_array_length == 0) {
@@ -4695,6 +4708,80 @@ const Builder = struct {
         return null;
     }
 
+    fn lookupSampledImage(self: *Builder, lookup: sampled_lookup.Binding, actual: [8]u32) Error!u32 {
+        const zero = try self.constant(.bits32, 0);
+        const one = try self.constant(.bits32, 1);
+        var hash = try self.constant(.bits32, 2166136261);
+        for (actual) |word| {
+            const mixed = self.id();
+            try self.emit(&self.body, 198, &.{ self.bits_type, mixed, hash, word });
+            hash = self.id();
+            try self.emit(&self.body, 132, &.{ self.bits_type, hash, mixed, try self.constant(.bits32, 16777619) });
+        }
+        const folded = self.id();
+        try self.emit(&self.body, 198, &.{ self.bits_type, folded, hash, try self.shiftRightBits(hash, 16) });
+        const first = try self.andBits(folded, lookup.mask);
+        const entry = self.id();
+        const header = self.id();
+        const body = self.id();
+        const next = self.id();
+        const merge = self.id();
+        const index = self.id();
+        const iteration = self.id();
+        const result = self.id();
+        const next_index = self.id();
+        const next_iteration = self.id();
+        const next_result = self.id();
+        try self.emit(&self.body, 249, &.{entry});
+        try self.emit(&self.body, 248, &.{entry});
+        try self.emit(&self.body, 249, &.{header});
+        try self.emit(&self.body, 248, &.{header});
+        try self.emit(&self.body, 245, &.{ self.bits_type, index, first, entry, next_index, next });
+        try self.emit(&self.body, 245, &.{ self.bits_type, iteration, zero, entry, next_iteration, next });
+        try self.emit(&self.body, 245, &.{ self.bits_type, result, zero, entry, next_result, next });
+        const missing = self.id();
+        const within = self.id();
+        const pending = self.id();
+        try self.emit(&self.body, 170, &.{ self.bool_type, missing, result, zero });
+        try self.emit(&self.body, 176, &.{ self.bool_type, within, iteration, try self.constant(.bits32, lookup.probes) });
+        try self.emit(&self.body, 167, &.{ self.bool_type, pending, missing, within });
+        try self.emit(&self.body, 246, &.{ merge, next, 0 });
+        try self.emit(&self.body, 250, &.{ pending, body, merge });
+        try self.emit(&self.body, 248, &.{body});
+        const record_byte = self.id();
+        const byte = self.id();
+        try self.emit(&self.body, 132, &.{ self.bits_type, record_byte, index, try self.constant(.bits32, sampled_lookup.entry_words * 4) });
+        try self.emit(&self.body, 128, &.{ self.bits_type, byte, record_byte, try self.constant(.bits32, lookup.word_offset * 4) });
+        const address = BufferAddress{ .binding = .{ .resource_sgpr = 0, .descriptor_index = lookup.descriptor_index }, .byte_offset = byte };
+        const encoded = self.id();
+        try self.emit(&self.body, 61, &.{ self.bits_type, encoded, try self.bufferWordPointer(address, 0) });
+        var matches = self.id();
+        try self.emit(&self.body, 171, &.{ self.bool_type, matches, encoded, zero });
+        for (actual, 0..) |word, component| {
+            const expected = self.id();
+            const equal = self.id();
+            try self.emit(&self.body, 61, &.{ self.bits_type, expected, try self.bufferWordPointer(address, @intCast(component + 1)) });
+            try self.emit(&self.body, 170, &.{ self.bool_type, equal, word, expected });
+            const both = self.id();
+            try self.emit(&self.body, 167, &.{ self.bool_type, both, matches, equal });
+            matches = both;
+        }
+        try self.emit(&self.body, 169, &.{ self.bits_type, next_result, matches, encoded, result });
+        const empty = self.id();
+        try self.emit(&self.body, 170, &.{ self.bool_type, empty, encoded, zero });
+        try self.emit(&self.body, 249, &.{next});
+        try self.emit(&self.body, 248, &.{next});
+        const advanced = self.id();
+        const attempts = self.id();
+        try self.emit(&self.body, 128, &.{ self.bits_type, advanced, index, one });
+        try self.emit(&self.body, 199, &.{ self.bits_type, next_index, advanced, try self.constant(.bits32, lookup.mask) });
+        try self.emit(&self.body, 128, &.{ self.bits_type, attempts, iteration, one });
+        try self.emit(&self.body, 169, &.{ self.bits_type, next_iteration, empty, try self.constant(.bits32, lookup.probes), attempts });
+        try self.emit(&self.body, 249, &.{header});
+        try self.emit(&self.body, 248, &.{merge});
+        return result;
+    }
+
     fn loadSampledImage(self: *Builder, binding: SampledImageBinding) Error!u32 {
         const dimension = sampledImageDimensionIndex(binding.dimension);
         var slot = try self.constant(.bits32, binding.descriptor_index);
@@ -4704,33 +4791,46 @@ const Builder = struct {
             for (&actual, 0..) |*word, index| {
                 word.* = try self.source(.{ .kind = .sgpr, .reg = binding.resource_sgpr + @as(u32, @intCast(index)) }, .bits32);
             }
-            var any_match = self.id();
-            try self.emit(&self.declarations, 42, &.{ self.bool_type, any_match }); // OpConstantFalse
-            const always = self.id();
-            try self.emit(&self.declarations, 41, &.{ self.bool_type, always }); // OpConstantTrue
-            for (self.sampled_bindings) |candidate| {
-                if (candidate.resource_sgpr != binding.resource_sgpr or
-                    candidate.sampler_sgpr != binding.sampler_sgpr or
-                    candidate.instruction_pc != binding.instruction_pc) continue;
-                const words = candidate.candidate_words orelse return Error.InvalidStorageBinding;
-                var matches = always;
-                for (actual, words) |value, expected| {
-                    const equal = self.id();
-                    try self.emit(&self.body, 170, &.{ self.bool_type, equal, value, try self.constant(.bits32, expected) });
-                    const combined = self.id();
-                    try self.emit(&self.body, 167, &.{ self.bool_type, combined, matches, equal });
-                    matches = combined;
-                }
+            if (binding.lookup) |lookup| {
+                const encoded = try self.lookupSampledImage(lookup, actual);
+                const zero = try self.constant(.bits32, 0);
+                const matched = self.id();
+                const decoded = self.id();
+                try self.emit(&self.body, 171, &.{ self.bool_type, matched, encoded, zero });
+                try self.emit(&self.body, 130, &.{ self.bits_type, decoded, encoded, try self.constant(.bits32, 1) });
                 const selected = self.id();
-                try self.emit(&self.body, 169, &.{ self.bits_type, selected, matches, try self.constant(.bits32, candidate.descriptor_index), slot });
+                try self.emit(&self.body, 169, &.{ self.bits_type, selected, matched, decoded, slot });
                 slot = selected;
-                const combined = self.id();
-                try self.emit(&self.body, 166, &.{ self.bool_type, combined, any_match, matches });
-                any_match = combined;
+                self.sampled_result_predicate = matched;
+            } else {
+                var any_match = self.id();
+                try self.emit(&self.declarations, 42, &.{ self.bool_type, any_match }); // OpConstantFalse
+                const always = self.id();
+                try self.emit(&self.declarations, 41, &.{ self.bool_type, always }); // OpConstantTrue
+                for (self.sampled_bindings) |candidate| {
+                    if (candidate.resource_sgpr != binding.resource_sgpr or
+                        candidate.sampler_sgpr != binding.sampler_sgpr or
+                        candidate.instruction_pc != binding.instruction_pc) continue;
+                    const words = candidate.candidate_words orelse return Error.InvalidStorageBinding;
+                    var matches = always;
+                    for (actual, words) |value, expected| {
+                        const equal = self.id();
+                        try self.emit(&self.body, 170, &.{ self.bool_type, equal, value, try self.constant(.bits32, expected) });
+                        const combined = self.id();
+                        try self.emit(&self.body, 167, &.{ self.bool_type, combined, matches, equal });
+                        matches = combined;
+                    }
+                    const selected = self.id();
+                    try self.emit(&self.body, 169, &.{ self.bits_type, selected, matches, try self.constant(.bits32, candidate.descriptor_index), slot });
+                    slot = selected;
+                    const combined = self.id();
+                    try self.emit(&self.body, 166, &.{ self.bool_type, combined, any_match, matches });
+                    any_match = combined;
+                }
+                // Invalid/unbound descriptors return zero. Always index a valid
+                // host descriptor, even for invocations whose T# does not match.
+                self.sampled_result_predicate = any_match;
             }
-            // Invalid/unbound descriptors return zero. Always index a valid
-            // host descriptor, even for invocations whose T# does not match.
-            self.sampled_result_predicate = any_match;
             try self.emit(&self.annotations, 71, &.{ slot, 5300 }); // NonUniform
         }
         const pointer = self.id();
