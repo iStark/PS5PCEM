@@ -108,6 +108,14 @@ Sampled-image staging detiles 2D surfaces and thick 3D volumes, including
 `10_10_10_2_UNORM`, into matching Vulkan formats. Resource dimension and depth
 are part of the cache key so 2D/3D aliases cannot reuse an incompatible image
 view.
+Fragment `EXP.VM` publishes the active lane's final coverage, including
+zero-component exports on the rejected alpha-test branch. The translator
+retains that mask through helper-lane execution and emits `OpKill` at shader
+return for rejected fragments. This preserves both the existing color and
+depth/stencil contents; selecting an unwritten color output previously caused
+Cat Quest III's flickering text. The `--fragment-coverage` Vulkan probe checks
+straight and branched alpha tests, an all-rejected export, and a later draw
+behind the rejected pixels.
 Compressed/masked exports, non-trivial image operands,
 and the remaining graphics system VGPRs are still incomplete.
 

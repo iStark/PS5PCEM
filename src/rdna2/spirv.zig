@@ -293,6 +293,9 @@ pub const Options = struct {
     /// Fragment EXP MRT0..7 bits. A program without color exports declares
     /// no color outputs; storage-only fragment programs are valid Vulkan.
     color_export_mask: u8 = 0,
+    /// Inferred from EXP.VM. Its EXEC snapshot controls fragment coverage at
+    /// shader completion, including null exports after an alpha-test reject.
+    uses_fragment_valid_mask: bool = false,
     /// Selects the logical guest EXP component written to every physical
     /// Vulkan attachment component. Two bits per component; 0xe4 is RGBA.
     /// CB_COLOR_INFO.COMP_SWAP supplies one mapping for each active MRT.
@@ -680,6 +683,7 @@ const Builder = struct {
     workgroup_word_pointer_type: u32 = 0,
     workgroup_memory_words: u32 = 0,
     private_memory: u32 = 0,
+    fragment_valid_mask: u32 = 0,
     private_word_pointer_type: u32 = 0,
     private_memory_words: u32 = 0,
     gds_memory: u32 = 0,
@@ -776,6 +780,15 @@ const Builder = struct {
         try self.emit(&self.declarations, 21, &.{ self.signed_type, 32, 1 }); // OpTypeInt
         try self.emit(&self.declarations, 22, &.{ self.float_type, 32 }); // OpTypeFloat
         try self.emit(&self.declarations, 20, &.{self.bool_type}); // OpTypeBool
+
+        if (options.stage == .fragment and options.uses_fragment_valid_mask) {
+            const pointer_type = self.id();
+            self.fragment_valid_mask = self.id();
+            try self.emit(&self.declarations, 32, &.{ pointer_type, 6, self.bool_type }); // ptr Private
+            const initial = self.id();
+            try self.emit(&self.declarations, 41, &.{ self.bool_type, initial }); // OpConstantTrue
+            try self.emit(&self.declarations, 59, &.{ pointer_type, self.fragment_valid_mask, 6, initial });
+        }
 
         if (options.dynamic_scalar_binding) |dynamic| {
             const runtime_words = self.id();
@@ -4524,6 +4537,12 @@ const Builder = struct {
     }
 
     fn exportValue(self: *Builder, inst: instruction.Instruction) Error!void {
+        if (self.fragment_valid_mask != 0 and inst.export_valid_mask) {
+            const enabled = (try self.laneEnabled()) orelse try self.constantBool(true);
+            try self.emit(&self.body, 62, &.{ self.fragment_valid_mask, enabled });
+        }
+        // A null export can still publish the valid mask, but writes no color.
+        if (self.stage == .fragment and inst.export_enable == 0) return;
         if (self.vector4_type == 0) return Error.UnsupportedOpcode;
         const output = switch (self.stage) {
             // GFX10 export targets: POS0 is 0x0c and PARAM0..31 are
@@ -4683,6 +4702,24 @@ const Builder = struct {
             try self.emit(&self.body, 169, &.{ vector_type, exported, enabled, vector, current });
         }
         try self.emit(&self.body, 62, &.{ output, exported });
+    }
+
+    fn returnFromShader(self: *Builder) Error!void {
+        if (self.fragment_valid_mask != 0) {
+            // Merely suppressing an output store leaves undefined color and
+            // still updates depth/stencil. Apply the final EXP.VM snapshot
+            // here so helper lanes remain available for shader derivatives.
+            const enabled = self.id();
+            try self.emit(&self.body, 61, &.{ self.bool_type, enabled, self.fragment_valid_mask });
+            const live_label = self.id();
+            const killed_label = self.id();
+            try self.emit(&self.body, 247, &.{ live_label, 0 }); // OpSelectionMerge
+            try self.emit(&self.body, 250, &.{ enabled, live_label, killed_label });
+            try self.emit(&self.body, 248, &.{killed_label});
+            try self.emit(&self.body, 252, &.{}); // OpKill
+            try self.emit(&self.body, 248, &.{live_label});
+        }
+        try self.emit(&self.body, 253, &.{}); // OpReturn
     }
 
     fn vertexParameterOutput(self: *const Builder, export_index: u32) u32 {
@@ -9260,13 +9297,13 @@ fn translateStructuredLoops(builder: *Builder, instructions: []const instruction
             return Error.UnsupportedControlFlow;
 
         if (last.opcode.isProgramEnd()) {
-            try builder.emit(&builder.body, 253, &.{}); // OpReturn
+            try builder.returnFromShader(); // OpReturn
         } else if (last.opcode == .s_setpc_b64) {
             if (setpcSuccessor(graph, block.index)) |target| {
                 try builder.emit(&builder.body, 249, &.{labels[target]});
             } else {
                 try builder.exportNggLdsRecord();
-                try builder.emit(&builder.body, 253, &.{});
+                try builder.returnFromShader();
             }
         } else if (last.opcode == .s_branch) {
             try storeMutableControlState(builder);
@@ -9458,7 +9495,7 @@ fn translateDispatcher(builder: *Builder, instructions: []const instruction.Inst
     try builder.emit(&builder.body, 62, &.{ builder.dispatch_iteration_pointer, next_iteration });
     try builder.emit(&builder.body, 249, &.{header}); // OpBranch
     try builder.emit(&builder.body, 248, &.{merge}); // OpLabel
-    try builder.emit(&builder.body, 253, &.{}); // OpReturn
+    try builder.returnFromShader(); // OpReturn
     builder.used_dispatcher = true;
 }
 
@@ -9613,7 +9650,7 @@ fn translateStructured(builder: *Builder, instructions: []const instruction.Inst
         try builder.emit(&builder.body, 248, &.{exit_labels[block.index]}); // OpLabel
 
         if (last.opcode.isProgramEnd()) {
-            try builder.emit(&builder.body, 253, &.{}); // OpReturn
+            try builder.returnFromShader(); // OpReturn
         } else if (last.opcode == .s_setpc_b64) {
             if (setpcSuccessor(graph, block.index)) |target| {
                 try builder.emit(&builder.body, 249, &.{structuredEdgeLabel(
@@ -9626,7 +9663,7 @@ fn translateStructured(builder: *Builder, instructions: []const instruction.Inst
                 )});
             } else {
                 try builder.exportNggLdsRecord();
-                try builder.emit(&builder.body, 253, &.{}); // hardware NGG continuation becomes the stage return
+                try builder.returnFromShader(); // hardware NGG continuation becomes the stage return
             }
         } else if (last.opcode == .s_branch) {
             const target = graph.blockForPc(last.branch_target) orelse return Error.UnsupportedControlFlow;
@@ -9784,6 +9821,7 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     if (builder.workgroup_memory != 0) try entry_point.append(allocator, builder.workgroup_memory);
     if (builder.wave_scratch != 0) try entry_point.append(allocator, builder.wave_scratch);
     if (builder.private_memory != 0) try entry_point.append(allocator, builder.private_memory);
+    if (builder.fragment_valid_mask != 0) try entry_point.append(allocator, builder.fragment_valid_mask);
     for (builder.lane_spills.items) |spill| try entry_point.appendSlice(allocator, &.{ spill.value, spill.valid });
     if (builder.local_invocation_index != 0) try entry_point.append(allocator, builder.local_invocation_index);
     if (builder.subgroup_local_invocation_id != 0) try entry_point.append(allocator, builder.subgroup_local_invocation_id);
@@ -9900,6 +9938,8 @@ fn translateInstructions(
         }
     }
     for (instructions) |candidate| {
+        if (effective.stage == .fragment and candidate.opcode == .exp and candidate.export_valid_mask)
+            effective.uses_fragment_valid_mask = true;
         if (candidate.opcode == .v_readlane_b32) {
             if (constantWaveLane(candidate.src1)) |lane| cross_half_read = cross_half_read or lane >= 32;
         }
@@ -9983,7 +10023,7 @@ fn translateInstructions(
         try builder.emit(&builder.body, 248, &.{builder.label});
         try builder.initializeStageInputs();
         for (instructions) |inst| try lowerDiagnosed(&builder, inst);
-        try builder.emit(&builder.body, 253, &.{});
+        try builder.returnFromShader();
     } else {
         const structured_result = if (graph.back_edge_count == 0)
             translateStructured(&builder, instructions, &graph)
@@ -10015,7 +10055,7 @@ fn translateInstructions(
                     if (inst.opcode.isBranch()) continue;
                     try lowerDiagnosed(&builder, inst);
                 }
-                try builder.emit(&builder.body, 253, &.{});
+                try builder.returnFromShader();
             };
         };
     }

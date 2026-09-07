@@ -111,6 +111,16 @@ authority and rebuild from guest memory. Canonical writer selection requires
 dirty writers. Depth and stencil allocations receive
 separate alias tokens even when Vulkan packs them into one attachment.
 
+An S8-only guest attachment is also valid when `DB_Z_INFO.FORMAT` is zero.
+It uses a packed D32+S8 host image with depth tests and depth transfers disabled;
+only the stencil allocation participates in guest import and writeback. A
+zero `CB_TARGET_MASK` on a stencil draw suppresses color writes despite the
+legacy G-buffer mask recovery. Fullscreen copy shortcuts require a complete
+color write mask, so Unity's mask push/pop and stencil-clear passes cannot
+erase UI text or overwrite a completed scene with a stale compositor input.
+The `--stencil-only-ui` and `--fullscreen-orientation` probes exercise these
+paths, including guest S8 transfers and a masked indexed copy.
+
 [`vulkan.image_state`](../../src/vulkan/image_state.zig) tracks layout, access mask,
 pipeline stages, aspect, mip, and layer for every persistent host image. Barrier
 planning is transactional: an undersized output buffer cannot partially commit

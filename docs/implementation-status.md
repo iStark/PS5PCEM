@@ -145,7 +145,17 @@ behind them.
   reproduced `path.txt`-only settings slot previously made the title fail on a
   missing `Data.dat` and wait forever after its 13-draw startup frame; it now
   completes the search without mounting that incomplete slot and continues
-  presenting frames.
+  presenting frames. Fragment `EXP.VM` coverage now discards rejected pixels
+  at shader return, fixing noisy text and preserving depth/stencil behind
+  alpha-tested objects. Standalone S8 attachments and masked stencil push/pop
+  restore the language modal and logo fill. Fullscreen copy shortcuts require
+  a complete color write mask: a later stencil clear previously overwrote the
+  correctly oriented world with its stale scene input. Live testing now reaches
+  the opening island and Captain Cappey dialogue upright. The water/sky colors
+  and absent Catventure cards remain unresolved. Pre-existing guest-worker
+  faults were reproduced during startup; the successful final scene run enabled
+  firmware failure tracing. GPU coverage, S8 import/writeback, masked copies,
+  and the existing Jurassic/Yotei attachment probes pass SDK validation.
 - Jurassic Park Classic Games Collection now resolves the observed Font,
   FontFt, JPEG, Pad, VideoOut, Posix, and AGC driver imports, completes its
   Unity bootstrap, and reaches a stable visible 3840×2160 intro frame. Both the

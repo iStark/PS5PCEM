@@ -931,20 +931,22 @@ pub fn decodeDepthTarget(state: *const gpu_state.State) ?DepthTarget {
     const z_info = context(state, 0x010) orelse return null;
     const size = context(state, 0x007) orelse return null;
     const format: u8 = @truncate(z_info & 0x3);
-    if (format == 0) return null;
-
     const read_address = registerAddress256(state, 0x012, 0x01a);
     const write_address = registerAddress256(state, 0x014, 0x01c);
-    if (read_address == 0 and write_address == 0) return null;
     const view = context(state, 0x002) orelse 0;
     const stencil_info = context(state, 0x011) orelse 0;
+    const stencil_read_address = registerAddress256(state, 0x013, 0x01b);
+    const stencil_write_address = registerAddress256(state, 0x015, 0x01d);
+    const has_depth = format != 0 and (read_address != 0 or write_address != 0);
+    const has_stencil = stencil_info & 1 != 0 and (stencil_read_address != 0 or stencil_write_address != 0);
+    if (!has_depth and !has_stencil) return null;
     const htile_surface = context(state, 0x2af) orelse 0;
 
     return .{
         .read_address = read_address,
         .write_address = write_address,
-        .stencil_read_address = registerAddress256(state, 0x013, 0x01b),
-        .stencil_write_address = registerAddress256(state, 0x015, 0x01d),
+        .stencil_read_address = stencil_read_address,
+        .stencil_write_address = stencil_write_address,
         .htile_address = registerAddress256(state, 0x005, 0x01e),
         .width = (size & 0x3fff) + 1,
         .height = ((size >> 16) & 0x3fff) + 1,

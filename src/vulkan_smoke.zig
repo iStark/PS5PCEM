@@ -1355,6 +1355,166 @@ fn runStorageImageReuseCase(allocator: std.mem.Allocator, count: usize) !void {
     for (renderer.storage_image_cache.items) |cached| try std.testing.expectEqual(@as(usize, 0), cached.pin_count);
 }
 
+fn runFragmentCoverageProbe(allocator: std.mem.Allocator) !void {
+    for (0..3) |case| {
+        var renderer = try vulkan.Renderer.init(allocator, .{});
+        defer renderer.deinit();
+        var guest = GuestMemory{};
+        const vertex = [_]u32{
+            vop1(6, 1, 261), vop1(1, 2, 255),  0x3f80_0000,      vop2(4, 3, 1, 2),
+            vop1(1, 4, 255), 0x3f40_0000,      vop2(8, 5, 3, 4), vop2(8, 6, 3, 3),
+            vop1(1, 7, 255), 0xbfc0_0000,      vop2(8, 6, 6, 7), vop1(1, 8, 255),
+            0x3f40_0000,     vop2(3, 6, 6, 8), vop1(1, 7, 255),  0x3e80_0000,
+            vop1(1, 8, 242), 0xf800_08cf,      0x0807_0605,      0xf800_0201,
+            0x0000_0005,     0xbf81_0000,
+        };
+        // The text alpha-test idiom saves EXEC, removes rejected lanes,
+        // resumes WQM for derivatives, then publishes the saved mask via EXP.VM.
+        var fragment = [_]u32{
+            0xbea4_047e,     0xbefe_0a7e,     0xc808_0000,     0xc809_0001,
+            vop1(1, 3, 128), 0x7c02_0702,     0x8aa4_6a24,     0xbf84_0007,
+            0xbefe_0a24,     vop1(1, 0, 242), vop1(1, 1, 128), 0xbefe_0424,
+            0xf800_180f,     0x0001_0100,     0xbf81_0000,     0xbefe_0480,
+            0xf800_1800,     0,               0xbf81_0000,
+        };
+        if (case == 0) fragment[7] = 0xbf80_0000; // straight-line mixed coverage
+        if (case == 2) fragment[3] = vop1(1, 2, 243); // all fragments rejected
+        const blue = [_]u32{ vop1(1, 0, 128), vop1(1, 1, 242), 0xf800_180f, 0x0101_0000, 0xbf81_0000 };
+        for (vertex, 0..) |word, i| {
+            guest.word(0x700 + i * 4, word);
+            guest.word(0xc00 + i * 4, if (i == 15) 0x3f40_0000 else word);
+        }
+        for (fragment, 0..) |word, i| guest.word(0x900 + i * 4, word);
+        for (blue, 0..) |word, i| guest.word(0xb00 + i * 4, word);
+        var state = gpu.State{};
+        const vs = gpu.resources.ShaderStage.vertex.programRegisterBase();
+        const ps = gpu.resources.ShaderStage.pixel.programRegisterBase();
+        try state.writeRegister(.shader, vs, 7);
+        try state.writeRegister(.shader, vs + 1, 0);
+        try state.writeRegister(.shader, ps, 9);
+        try state.writeRegister(.shader, ps + 1, 0);
+        const context = [_][2]u32{
+            .{ 0x318, 0x20 },            .{ 0x319, 7 },               .{ 0x31b, 0 },               .{ 0x31c, 10 << 2 },         .{ 0x31d, 0 },
+            .{ 0x390, 0 },               .{ 0x3b0, (63 << 14) | 63 }, .{ 0x3b8, 1 << 24 },         .{ 0x08e, 0xf },             .{ 0x00c, 0 },
+            .{ 0x00d, 64 | (64 << 16) }, .{ 0x094, 1 << 31 },         .{ 0x095, 64 | (64 << 16) }, .{ 0x1e0, 0 },               .{ 0x205, 0 },
+            .{ 0x204, 1 << 19 },         .{ 0x202, 0xcc0010 },        .{ 0x000, 0 },               .{ 0x007, 63 | (63 << 16) }, .{ 0x012, 0x80 },
+            .{ 0x014, 0x80 },            .{ 0x01a, 0 },               .{ 0x01c, 0 },               .{ 0x011, 1 << 29 },         .{ 0x010, 0x183 },
+            .{ 0x200, 0x16 },            .{ 0x00b, 0x3f800000 },      .{ 0x191, 0 },
+        };
+        for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+        for ([_]f32{ 32, 32, -32, 32, 1, 0 }, 0..) |value, i|
+            try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value));
+        var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(guest.interface()), .allocator = allocator };
+        const draw = [_]u32{ command(gpu.pm4.draw_index_auto, 2), 3, 0 };
+        _ = try executor.execute(&draw);
+        if (renderer.last_draw_error) |err| return err;
+        try renderer.flushPendingGuestWrites();
+        // Rejecting alpha-tested fragments must preserve the target's old color.
+        const left = 0x2000 + (32 * 64 + 24) * 4;
+        const right = 0x2000 + (32 * 64 + 40) * 4;
+        try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, guest.bytes[left..][0..4], .little));
+        try std.testing.expectEqual(@as(u32, if (case == 2) 0 else 0xff0000ff), std.mem.readInt(u32, guest.bytes[right..][0..4], .little));
+        // A later triangle behind the text proves rejected pixels also left
+        // depth untouched; writing transparent black would fail this check.
+        try state.writeRegister(.shader, vs, 0xc);
+        try state.writeRegister(.shader, ps, 0xb);
+        _ = try executor.execute(&draw);
+        if (renderer.last_draw_error) |err| return err;
+        try renderer.flushPendingGuestWrites();
+        try std.testing.expectEqual(@as(u32, 0xffff0000), std.mem.readInt(u32, guest.bytes[left..][0..4], .little));
+        try std.testing.expectEqual(@as(u32, if (case == 2) 0xffff0000 else 0xff0000ff), std.mem.readInt(u32, guest.bytes[right..][0..4], .little));
+    }
+    std.debug.print("Fragment coverage passed: straight/branched alpha test, null export, retained color and depth\n", .{});
+}
+
+fn runStencilOnlyUiProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_depth_transfer = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    const vertex = [_]u32{
+        vop1(6, 1, 261), vop1(1, 2, 255),  0x3f80_0000,      vop2(4, 3, 1, 2),
+        vop1(1, 4, 255), 0x3f40_0000,      vop2(8, 5, 3, 4), vop2(8, 6, 3, 3),
+        vop1(1, 7, 255), 0xbfc0_0000,      vop2(8, 6, 6, 7), vop1(1, 8, 255),
+        0x3f40_0000,     vop2(3, 6, 6, 8), vop1(1, 7, 255),  0x3e80_0000,
+        vop1(1, 8, 242), 0xf800_08cf,      0x0807_0605,      0xf800_0201,
+        0x0000_0005,     0xbf81_0000,
+    };
+    // The text alpha-test idiom saves EXEC, removes rejected lanes,
+    // resumes WQM for derivatives, then publishes the saved mask via EXP.VM.
+    const fragment = [_]u32{
+        0xbea4_047e,     0xbefe_0a7e,     0xc808_0000,     0xc809_0001,
+        vop1(1, 3, 128), 0x7c02_0702,     0x8aa4_6a24,     0xbf84_0007,
+        0xbefe_0a24,     vop1(1, 0, 242), vop1(1, 1, 128), 0xbefe_0424,
+        0xf800_180f,     0x0001_0100,     0xbf81_0000,     0xbefe_0480,
+        0xf800_1800,     0,               0xbf81_0000,
+    };
+
+    const blue = [_]u32{ vop1(1, 0, 128), vop1(1, 1, 242), 0xf800_180f, 0x0101_0000, 0xbf81_0000 };
+    const red = [_]u32{ vop1(1, 0, 128), vop1(1, 1, 242), 0xf800_180f, 0x0100_0001, 0xbf81_0000 };
+    for (vertex, 0..) |word, i| guest.word(0x700 + i * 4, word);
+    for (fragment, 0..) |word, i| guest.word(0x900 + i * 4, word);
+    for (blue, 0..) |word, i| guest.word(0xb00 + i * 4, word);
+    for (red, 0..) |word, i| guest.word(0xc00 + i * 4, word);
+    @memset(guest.bytes[0x10000..0x14000], 0xa5); // stale disabled Z allocation
+    var state = gpu.State{};
+    const vs = gpu.resources.ShaderStage.vertex.programRegisterBase();
+    const ps = gpu.resources.ShaderStage.pixel.programRegisterBase();
+    try state.writeRegister(.shader, vs, 7);
+    try state.writeRegister(.shader, vs + 1, 0);
+    try state.writeRegister(.shader, ps, 9);
+    try state.writeRegister(.shader, ps + 1, 0);
+    const context = [_][2]u32{
+        .{ 0x318, 0x20 },            .{ 0x319, 7 },               .{ 0x31b, 0 },               .{ 0x31c, 10 << 2 },    .{ 0x31d, 0 },
+        .{ 0x390, 0 },               .{ 0x3b0, (63 << 14) | 63 }, .{ 0x3b8, 1 << 24 },         .{ 0x08e, 0 },          .{ 0x00c, 0 },
+        .{ 0x00d, 64 | (64 << 16) }, .{ 0x094, 1 << 31 },         .{ 0x095, 64 | (64 << 16) }, .{ 0x1e0, 0 },          .{ 0x204, 1 << 19 },
+        .{ 0x205, 0 },               .{ 0x202, 0xcc0010 },        .{ 0x191, 0 },               .{ 0x000, 2 },          .{ 0x007, 63 | (63 << 16) },
+        .{ 0x010, 0 },               .{ 0x011, 0x20000181 },      .{ 0x012, 0x100 },           .{ 0x014, 0 },          .{ 0x013, 0x80 },
+        .{ 0x015, 0x80 },            .{ 0x200, 3 | (7 << 8) },    .{ 0x10b, 3 << 4 },          .{ 0x10c, 0x01ffff01 }, .{ 0x00a, 0 },
+    };
+    for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+    for ([_]f32{ 32, 32, -32, 32, 1, 0 }, 0..) |value, i|
+        try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value));
+    const backend = renderer.dcbBackend(guest.interface());
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = backend, .allocator = allocator };
+    const draw = [_]u32{ command(gpu.pm4.draw_index_auto, 2), 3, 0 };
+    // Clear S8 independently, then push the mask with all color writes off.
+    _ = try executor.execute(&draw);
+    if (renderer.last_draw_error) |err| return err;
+    try state.writeRegister(.context, 0x000, 0);
+    _ = try executor.execute(&draw);
+    if (renderer.last_draw_error) |err| return err;
+    try state.writeRegister(.shader, ps, 0xb);
+    try state.writeRegister(.context, 0x08e, 0xf);
+    try state.writeRegister(.context, 0x200, 3 | (2 << 8)); // stencil EQUAL; Z is disabled by its format
+    try state.writeRegister(.context, 0x10b, 0);
+    _ = try executor.execute(&draw);
+    if (renderer.last_draw_error) |err| return err;
+    try renderer.flushPendingGuestWrites();
+    const left = 0x2000 + (32 * 64 + 24) * 4;
+    const right = 0x2000 + (32 * 64 + 40) * 4;
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, guest.bytes[left..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 0xffff0000), std.mem.readInt(u32, guest.bytes[right..][0..4], .little));
+    // The pop draw must remove the mask without erasing the UI's colors.
+    try state.writeRegister(.context, 0x08e, 0);
+    try state.writeRegister(.context, 0x200, 3 | (7 << 8));
+    try state.writeRegister(.context, 0x10b, 3 << 4);
+    try state.writeRegister(.context, 0x10c, 0x00ffff00);
+    _ = try executor.execute(&draw);
+    if (renderer.last_draw_error) |err| return err;
+    try state.writeRegister(.shader, ps, 0xc);
+    try state.writeRegister(.context, 0x08e, 0xf);
+    try state.writeRegister(.context, 0x200, 3 | (2 << 8));
+    try state.writeRegister(.context, 0x10b, 0);
+    try state.writeRegister(.context, 0x10c, 0x01ffff01);
+    _ = try executor.execute(&draw);
+    if (renderer.last_draw_error) |err| return err;
+    try renderer.flushPendingGuestWrites();
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, guest.bytes[left..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 0xffff0000), std.mem.readInt(u32, guest.bytes[right..][0..4], .little));
+    try std.testing.expect(std.mem.allEqual(u8, guest.bytes[0x10000..0x14000], 0xa5));
+    std.debug.print("Stencil-only UI passed: masked push/pop, clipped color, S8 transfers and untouched disabled Z\n", .{});
+}
+
 fn runUiAttachmentProbe(allocator: std.mem.Allocator) !void {
     for (0..8) |case| {
         var renderer = try vulkan.Renderer.init(allocator, .{});
@@ -1476,8 +1636,27 @@ fn runFullscreenOrientationProbe(allocator: std.mem.Allocator) !void {
             if (actual != expected) std.debug.print("fullscreen orientation case={d} pixel={d},{d}: expected={x} actual={x}\n", .{ case, x, y, expected, actual });
             try std.testing.expectEqual(expected, actual);
         };
+        if (case == 6) {
+            // A later stencil-only quad can keep this copy PS and source
+            // bound. The indexed fullscreen shortcut must honor MASK=0.
+            guest.word(0x13000, 0x00010000);
+            guest.word(0x13004, 0x00000002);
+            guest.word(0x13008, 0x00020001);
+            try state.writeRegister(.context, 0x08e, 0);
+            try state.writeRegister(.context, 0x200, 1);
+            const masked = [_]u32{ command(gpu.pm4.draw_index_2, 5), 6, 0x13000, 0, 6, 0 };
+            _ = try executor.execute(&masked);
+            if (renderer.last_draw_error) |err| return err;
+            try renderer.flushPendingGuestWrites();
+            for (0..8) |y| for (0..8) |x| {
+                const expected: u32 = 0xff110000 | (@as(u32, @intCast(x * 30)) << 8) | @as(u32, @intCast(10 + (7 - y) * 30));
+                try std.testing.expectEqual(expected, std.mem.readInt(u32, guest.bytes[destination + (y * 8 + x) * 4 ..][0..4], .little));
+            };
+            try state.writeRegister(.context, 0x08e, 0xf);
+            try state.writeRegister(.context, 0x200, 0);
+        }
     }
-    std.debug.print("fullscreen orientation passed: procedural triangle, both viewport signs, runtime UV scale/bias and guest-memory/resident sources\n", .{});
+    std.debug.print("fullscreen orientation passed: procedural triangle, both viewport signs, runtime UV scale/bias and guest-memory/resident sources and a masked fullscreen quad\n", .{});
 }
 
 fn runResidentTargetReuseProbe(allocator: std.mem.Allocator) !void {
@@ -3318,6 +3497,14 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--vector-images")) {
         try runVectorImageProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--stencil-only-ui")) {
+        try runStencilOnlyUiProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--fragment-coverage")) {
+        try runFragmentCoverageProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--ui-attachments")) {

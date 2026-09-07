@@ -1365,6 +1365,9 @@ fn depthTargetFormat(descriptor: gpu.resources.DepthTarget) ?u32 {
     const has_stencil = descriptor.stencil_format == 1 and
         (descriptor.stencil_read_address != 0 or descriptor.stencil_write_address != 0);
     return switch (descriptor.format) {
+        // Standalone S8 uses the same packed host format as D32+S8; the
+        // unused depth aspect never participates in guest tests or transfers.
+        0 => if (has_stencil) vk.format_d32_sfloat_s8_uint else null,
         1 => if (has_stencil) vk.format_d24_unorm_s8_uint else vk.format_d16_unorm,
         3 => if (has_stencil) vk.format_d32_sfloat_s8_uint else vk.format_d32_sfloat,
         else => null,
@@ -1397,7 +1400,7 @@ fn depthTransferPlan(target: GuestDepthTarget) ?DepthTransferPlan {
         vk.format_d24_unorm_s8_uint, vk.format_d32_sfloat, vk.format_d32_sfloat_s8_uint => 4,
         else => return null,
     };
-    const depth_bytes = std.math.mul(usize, texels, depth_bpp) catch return null;
+    const depth_bytes = if (target.guest_format == 0) 0 else std.math.mul(usize, texels, depth_bpp) catch return null;
     const stencil_offset = std.mem.alignForward(usize, depth_bytes, 4);
     const stencil_bytes = if (target.has_stencil) texels else 0;
     const total_bytes = std.math.add(usize, stencil_offset, stencil_bytes) catch return null;
@@ -9331,7 +9334,11 @@ pub const Renderer = struct {
             // CB_COLOR_CONTROL.MODE=0 is DISABLE: the bound shaders are a
             // launch vehicle for metadata. Honouring the register write mask
             // anyway lets Yotei's G-buffer PS export zeros over the scene.
-            result.color_write_masks[slot] = if (render.color_control.mode == 1)
+            // A zero mask during stencil draws is intentional (Unity UI
+            // mask push/pop), even when the legacy G-buffer recovery has
+            // enabled the bound descriptor's mask. Never paint that mask.
+            result.color_write_masks[slot] = if (render.color_control.mode == 1 and
+                !(render.target_mask == 0 and render.depth_control.stencil_enabled))
                 mapColorWriteMask(
                     color.descriptor.write_mask,
                     colorTargetExportMapping(color.descriptor),
@@ -10860,7 +10867,13 @@ pub const Renderer = struct {
     /// Reduces the bound depth registers to the plane a Vulkan attachment can
     /// represent, or reports that this draw has no usable depth.
     fn guestDepthTarget(descriptor: gpu.resources.DepthTarget) ?GuestDepthTarget {
-        const address = if (descriptor.write_address != 0)
+        const stencil_address = if (descriptor.stencil_write_address != 0)
+            descriptor.stencil_write_address
+        else
+            descriptor.stencil_read_address;
+        const address = if (descriptor.format == 0)
+            stencil_address
+        else if (descriptor.write_address != 0)
             descriptor.write_address
         else
             descriptor.read_address;
@@ -10879,15 +10892,13 @@ pub const Renderer = struct {
         // current texture detiler yet. Alias tracking still needs a safe byte
         // interval, so fall back to the unpadded texel footprint instead of
         // rejecting an attachment the raster path itself supports.
-        const allocation_bytes = if (gpu.TextureLayout.fromDepthTarget(descriptor)) |layout|
+        const allocation_bytes = if (descriptor.format == 0)
+            if (gpu.TextureLayout.fromStencilTarget(descriptor)) |layout| layout.required_source_bytes else |_| return null
+        else if (gpu.TextureLayout.fromDepthTarget(descriptor)) |layout|
             layout.required_source_bytes
         else |_|
             fallback_bytes;
         const has_stencil = depthAttachmentHasStencil(format);
-        const stencil_address = if (descriptor.stencil_write_address != 0)
-            descriptor.stencil_write_address
-        else
-            descriptor.stencil_read_address;
         const stencil_allocation_bytes = if (has_stencil and stencil_address != 0)
             if (gpu.TextureLayout.fromStencilTarget(descriptor)) |layout|
                 layout.required_source_bytes
@@ -10964,7 +10975,7 @@ pub const Renderer = struct {
             depthTargetAliasSignature(target),
         );
         errdefer self.image_aliases.unregister(alias_token);
-        const stencil_alias_token = if (target.stencil_address != 0 and target.stencil_allocation_bytes != 0)
+        const stencil_alias_token = if (target.guest_format != 0 and target.stencil_address != 0 and target.stencil_allocation_bytes != 0)
             try self.image_aliases.register(
                 self.allocator,
                 .depth_target,
@@ -11002,26 +11013,28 @@ pub const Renderer = struct {
         const transfer = snapshot.readback orelse return false;
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
         const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
-        const depth_layout = try depthSubresource(snapshot.target, false);
-        const guest_depth_bytes = std.math.cast(usize, try depth_layout.stagingBytes()) orelse
-            return Error.UnsupportedGraphicsState;
         var transfer_bytes = try self.allocator.alloc(u8, plan.total_bytes);
         defer self.allocator.free(transfer_bytes);
         @memset(transfer_bytes, 0);
-        const guest_depth = try self.allocator.alloc(u8, guest_depth_bytes);
-        defer self.allocator.free(guest_depth);
-        const depth_read_address = if (snapshot.target.descriptor.read_address != 0)
-            snapshot.target.descriptor.read_address
-        else
-            snapshot.target.address;
-        try depth_layout.stage(reader, depth_read_address, guest_depth);
-        if (snapshot.target.format == vk.format_d24_unorm_s8_uint) {
-            if (!expandDepth16To24(guest_depth, transfer_bytes[0..plan.depth_bytes])) {
+        if (plan.depth_bytes != 0) {
+            const depth_layout = try depthSubresource(snapshot.target, false);
+            const guest_depth_bytes = std.math.cast(usize, try depth_layout.stagingBytes()) orelse
                 return Error.UnsupportedGraphicsState;
+            const guest_depth = try self.allocator.alloc(u8, guest_depth_bytes);
+            defer self.allocator.free(guest_depth);
+            const depth_read_address = if (snapshot.target.descriptor.read_address != 0)
+                snapshot.target.descriptor.read_address
+            else
+                snapshot.target.address;
+            try depth_layout.stage(reader, depth_read_address, guest_depth);
+            if (snapshot.target.format == vk.format_d24_unorm_s8_uint) {
+                if (!expandDepth16To24(guest_depth, transfer_bytes[0..plan.depth_bytes])) {
+                    return Error.UnsupportedGraphicsState;
+                }
+            } else {
+                if (guest_depth.len != plan.depth_bytes) return Error.UnsupportedGraphicsState;
+                @memcpy(transfer_bytes[0..plan.depth_bytes], guest_depth);
             }
-        } else {
-            if (guest_depth.len != plan.depth_bytes) return Error.UnsupportedGraphicsState;
-            @memcpy(transfer_bytes[0..plan.depth_bytes], guest_depth);
         }
 
         if (snapshot.target.has_stencil) {
@@ -11050,18 +11063,21 @@ pub const Renderer = struct {
             image_state.transfer_destination_usage,
         );
         var copies: [2]vk.BufferImageCopy = undefined;
-        copies[0] = .{
-            .image_subresource = .{ .aspect_mask = vk.image_aspect_depth_bit },
-            .image_extent = .{ .width = snapshot.target.width, .height = snapshot.target.height, .depth = 1 },
-        };
-        var copy_count: u32 = 1;
+        var copy_count: u32 = 0;
+        if (plan.depth_bytes != 0) {
+            copies[copy_count] = .{
+                .image_subresource = .{ .aspect_mask = vk.image_aspect_depth_bit },
+                .image_extent = .{ .width = snapshot.target.width, .height = snapshot.target.height, .depth = 1 },
+            };
+            copy_count += 1;
+        }
         if (snapshot.target.has_stencil) {
-            copies[1] = .{
+            copies[copy_count] = .{
                 .buffer_offset = plan.stencil_offset,
                 .image_subresource = .{ .aspect_mask = vk.image_aspect_stencil_bit },
                 .image_extent = .{ .width = snapshot.target.width, .height = snapshot.target.height, .depth = 1 },
             };
-            copy_count = 2;
+            copy_count += 1;
         }
         self.device_functions.cmd_copy_buffer_to_image(
             command_buffer,
@@ -11130,18 +11146,21 @@ pub const Renderer = struct {
             image_state.transfer_source_usage,
         );
         var copies: [2]vk.BufferImageCopy = undefined;
-        copies[0] = .{
-            .image_subresource = .{ .aspect_mask = vk.image_aspect_depth_bit },
-            .image_extent = .{ .width = snapshot.target.width, .height = snapshot.target.height, .depth = 1 },
-        };
-        var copy_count: u32 = 1;
+        var copy_count: u32 = 0;
+        if (plan.depth_bytes != 0) {
+            copies[copy_count] = .{
+                .image_subresource = .{ .aspect_mask = vk.image_aspect_depth_bit },
+                .image_extent = .{ .width = snapshot.target.width, .height = snapshot.target.height, .depth = 1 },
+            };
+            copy_count += 1;
+        }
         if (snapshot.target.has_stencil) {
-            copies[1] = .{
+            copies[copy_count] = .{
                 .buffer_offset = plan.stencil_offset,
                 .image_subresource = .{ .aspect_mask = vk.image_aspect_stencil_bit },
                 .image_extent = .{ .width = snapshot.target.width, .height = snapshot.target.height, .depth = 1 },
             };
-            copy_count = 2;
+            copy_count += 1;
         }
         self.device_functions.cmd_copy_image_to_buffer(
             command_buffer,
@@ -11182,19 +11201,21 @@ pub const Renderer = struct {
         defer self.allocator.free(bytes);
         try self.readMapped(transfer, bytes);
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
-        const depth_layout = try depthSubresource(snapshot.target, false);
-        const guest_depth_bytes = std.math.cast(usize, try depth_layout.stagingBytes()) orelse
-            return Error.UnsupportedGraphicsState;
-        if (snapshot.target.format == vk.format_d24_unorm_s8_uint) {
-            const guest_depth = try self.allocator.alloc(u8, guest_depth_bytes);
-            defer self.allocator.free(guest_depth);
-            if (!compactDepth24To16(bytes[0..plan.depth_bytes], guest_depth)) {
+        if (plan.depth_bytes != 0) {
+            const depth_layout = try depthSubresource(snapshot.target, false);
+            const guest_depth_bytes = std.math.cast(usize, try depth_layout.stagingBytes()) orelse
                 return Error.UnsupportedGraphicsState;
+            if (snapshot.target.format == vk.format_d24_unorm_s8_uint) {
+                const guest_depth = try self.allocator.alloc(u8, guest_depth_bytes);
+                defer self.allocator.free(guest_depth);
+                if (!compactDepth24To16(bytes[0..plan.depth_bytes], guest_depth)) {
+                    return Error.UnsupportedGraphicsState;
+                }
+                try self.writeDepthPlane(memory, snapshot.target, false, guest_depth);
+            } else {
+                if (guest_depth_bytes != plan.depth_bytes) return Error.UnsupportedGraphicsState;
+                try self.writeDepthPlane(memory, snapshot.target, false, bytes[0..plan.depth_bytes]);
             }
-            try self.writeDepthPlane(memory, snapshot.target, false, guest_depth);
-        } else {
-            if (guest_depth_bytes != plan.depth_bytes) return Error.UnsupportedGraphicsState;
-            try self.writeDepthPlane(memory, snapshot.target, false, bytes[0..plan.depth_bytes]);
         }
         if (snapshot.target.has_stencil and snapshot.target.stencil_address != 0) {
             try self.writeDepthPlane(
@@ -13421,8 +13442,8 @@ pub const Renderer = struct {
             return Error.UnsupportedColorTarget;
         if (depth_plane) |plane| {
             pipeline_state.depth_attachment_format = plane.format;
-            pipeline_state.depth_test_enable = @intFromBool(render_state.depth_control.test_enabled);
-            pipeline_state.depth_write_enable = @intFromBool(render_state.depth_control.write_enabled);
+            pipeline_state.depth_test_enable = @intFromBool(plane.guest_format != 0 and render_state.depth_control.test_enabled);
+            pipeline_state.depth_write_enable = @intFromBool(plane.guest_format != 0 and render_state.depth_control.write_enabled);
             pipeline_state.depth_compare_operation =
                 depthCompareOperation(render_state.depth_control.compare_function);
             const stencil_active = plane.has_stencil and render_state.depth_control.stencil_enabled;
@@ -13923,6 +13944,10 @@ pub const Renderer = struct {
         const fullscreen_corner = vertex_stage == .export_shader and
             render_state.primitive_type == 4 and
             isFullscreenCornerTriangle(reader, vertex_storage, draw);
+        // A fullscreen stencil clear may retain the preceding compositor's
+        // pixel shader and texture. It must not copy that texture over the
+        // completed scene. Partial channel masks also require a real draw.
+        const full_color_write = pipeline_state.color_write_masks[target.descriptor.slot] == vk.color_component_rgba_bits;
         if (self.traceCurrentGraphicsFrame() and fragment_image_count == 1 and
             graphics_resources.descriptors[0].unified_format == 50 and
             target.format.vulkan == vk.format_a2b10g10r10_unorm_pack32 and
@@ -13941,7 +13966,7 @@ pub const Renderer = struct {
         // Preserve that resident image for these exact pixel-program shapes;
         // the UI remains interactive while the missing blur is preferable to
         // an unreadable frame.
-        if (fragment_image_count == 1 and pipeline_state.blend_enables[0] == 0 and
+        if (full_color_write and fragment_image_count == 1 and pipeline_state.blend_enables[0] == 0 and
             hasFullscreenSampleBlitGeometry(draw) and
             matchesRgb10MenuPostProcess(fragment_analysis.program.instructions.items) and
             try self.emulateFullscreenSampleBlit(
@@ -13971,7 +13996,7 @@ pub const Renderer = struct {
         // pixel program is translated exactly, preserve the already rendered
         // RGBA layer instead of feeding its malformed HDR result into the
         // final tone mapper.
-        if (fragment_mapping_count == 4 and paired_parameter_mask == 0xf and
+        if (full_color_write and fragment_mapping_count == 4 and paired_parameter_mask == 0xf and
             target.descriptor.width == 3840 and target.descriptor.height == 2160)
         {
             const scene = graphics_resources.descriptors[0];
@@ -14007,7 +14032,7 @@ pub const Renderer = struct {
         // it with a copy of descriptor zero discards the UI and post-processing
         // inputs, so only take the copy fast path for the single-image cases
         // below.
-        if (fragment_image_count == 1 and fullscreen_corner and
+        if (full_color_write and fragment_image_count == 1 and fullscreen_corner and
             target.descriptor.width == 3840 and target.descriptor.height == 2160 and
             try self.emulateFullscreenSampleBlit(
                 memory,
@@ -14021,7 +14046,7 @@ pub const Renderer = struct {
         // Procedural triangles can transform UVs independently of positions,
         // including a runtime Y scale/bias. Their viewport sign alone cannot
         // determine copy orientation; preserve the translated vertex shader.
-        if (fragment_image_count == 1 and draw.index_count != null and
+        if (full_color_write and fragment_image_count == 1 and draw.index_count != null and
             hasFullscreenSampleBlitGeometry(draw) and
             matchesFullscreenSampleBlit(fragment_analysis.program.instructions.items))
         {
