@@ -2595,9 +2595,14 @@ fn runNestedImageCase(allocator: std.mem.Allocator, bounded: bool, reuse_table: 
 }
 
 fn runTypedIndexProbe(allocator: std.mem.Allocator) !void {
-    for (0..28) |case_index| {
+    try runTypedIndexSelectionProbe(allocator, false);
+}
+
+fn runTypedIndexSelectionProbe(allocator: std.mem.Allocator, selection: bool) !void {
+    for (0..@as(usize, if (selection) 8 else 28)) |case_index| {
         const format = ([_]u32{ 5, 6, 11, 12 })[case_index % 4];
-        const mask_case = case_index / 4;
+        const mask_case = if (selection) 0 else case_index / 4;
+        const gather = selection and case_index >= 4;
         const saved_after_fetch = mask_case == 1 or mask_case == 3;
         var renderer = try vulkan.Renderer.init(allocator, .{ .trace_resource_failures = true });
         defer renderer.deinit();
@@ -2605,18 +2610,23 @@ fn runTypedIndexProbe(allocator: std.mem.Allocator) !void {
         _ = renderer.dcbBackend(guest.interface());
         const code = [_]u32{
             vop1(1, 0, 28), vop1(1, 1, 128),
-            if (mask_case == 4) sop1(0x24, 106, 128) else if (saved_after_fetch) 0xbf80_0000 else sop1(4, 106, 126), // preserve EXEC before fetching the index
+            if (selection) sop1(4, 32, 126) else if (mask_case == 4) sop1(0x24, 106, 128) else if (saved_after_fetch) 0xbf80_0000 else sop1(4, 106, 126), // preserve EXEC before fetching the index
             if (mask_case == 2) 0x7daa_0280 else 0xbf80_0000, // CMPX NE 0, v1 disables lanes
             if (mask_case == 2 or mask_case == 4) 0xbf88_0001 else 0xbf80_0000, // skip into the restore block
             0xbf80_0000,
             if (mask_case == 2 or mask_case == 4) sop1(4, 126, 106) else 0xbf80_0000,
-            0xf000_0108, 0x0005_0f00, // image_load v15, (v0,v1), T#s20
+            if (gather) 0xf11c_0108 else 0xf000_0108,
+            if (gather) 0x0085_0f00 else 0x0005_0f00,
+            if (selection) sop1(4, 106, 193) else 0xbf80_0000,
+            if (selection) 0x0228_0080 | ((15 + @as(u32, @intCast(if (gather) case_index % 4 else 0))) << 9) else 0xbf80_0000,
+            if (selection) 0x022a_2880 else 0xbf80_0000,
+            if (selection) vop1(1, 15, 277) else 0xbf80_0000,
             if (saved_after_fetch) sop1(0x24, 106, 128) else 0xbf80_0000, // s_and_saveexec_b64 vcc, 0
             if (mask_case == 3) 0xbf88_0001 else 0xbf80_0000,
             0xbf80_0000,
             if (saved_after_fetch) sop1(4, 126, 106) else 0xbf80_0000, // restore lanes after the conditional
             if (mask_case == 3) sop1(0x24, 32, 193) else 0xbf80_0000, // another snapshot in the restored block
-            sop1(4, 28, if (mask_case == 3) 32 else 106),
+            sop1(4, 28, if (selection or mask_case == 3) 32 else 106),
             sop1(0x14, 30, 28),
             if (mask_case == 5) vop1(2, 31, 271) else if (mask_case == 6) 0xd760_006b else 0xd760_001f,
             if (mask_case == 5) 0xbf80_0000 else 271 | (30 << 9), // read the first active/saved lane's typed index
@@ -2646,7 +2656,12 @@ fn runTypedIndexProbe(allocator: std.mem.Allocator) !void {
         // belong to another field, outside the typed index's possible loads.
         const decoy = [_]u32{ 0xc973c000, 0xc95ac000, 0xc82f0000, 0xc7960000, 0x3a7f8040, 0x3a7f8040, 0x3f7f8040, 0x80000000 };
         for (decoy, 0..) |word, index| guest.word(0x11000 + 96 + index * 4, word);
-        var indices = sampledImageDescriptorWords(0xa000, 6, 1);
+        if (selection) {
+            var other_field = sampledImageDescriptorWords(0xb000, 1, 1);
+            other_field[3] = (other_field[3] & 0x0fff_ffff) | 0xc000_0000;
+            for (other_field, 0..) |word, index| guest.word(0x11000 + 96 + index * 4, word);
+        }
+        var indices = sampledImageDescriptorWords(0xa000, if (gather) 1 else 6, 1);
         indices[1] = (indices[1] & ~@as(u32, 0x1ff0_0000)) | (format << 20);
         const signed = format == 6 or format == 12;
         const bits: u5 = if (format <= 6) 8 else 16;
@@ -2658,6 +2673,7 @@ fn runTypedIndexProbe(allocator: std.mem.Allocator) !void {
             const byte = 0xa000 + index * (bits / 8);
             if (bits == 8) guest.bytes[byte] = @intCast(value) else std.mem.writeInt(u16, guest.bytes[byte..][0..2], @intCast(value), .little);
         }
+        if (gather) guest.word(0xa000, 1);
         var state = gpu.State{};
         const compute = gpu.resources.ShaderStage.compute;
         try state.writeRegister(.shader, compute.programRegisterBase(), 1);
@@ -2673,9 +2689,9 @@ fn runTypedIndexProbe(allocator: std.mem.Allocator) !void {
         try renderer.readbackGuestStorageBuffer(0x10000, &output);
         for ([_]f32{ 1, 64.0 / 255.0, 0, 0, 0, 0 }, 0..) |expected, index| {
             const actual: f32 = @bitCast(std.mem.readInt(u32, output[index * 4 ..][0..4], .little));
-            try std.testing.expectApproxEqAbs(expected, actual, 0.00001);
+            try std.testing.expectApproxEqAbs(if (gather) 64.0 / 255.0 else expected, actual, 0.00001);
         }
-        try std.testing.expectEqual(@as(u64, 2), renderer.texture_cache_misses);
+        try std.testing.expectEqual(@as(u64, if (gather) 3 else 2), renderer.texture_cache_misses);
     }
     std.debug.print("typed index images passed: UINT/SINT byte and short indices, negative bounds and decoy fields\n", .{});
 }
@@ -3029,6 +3045,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--wave32-masks")) {
         try runWave32MaskProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--selected-indices")) {
+        try runTypedIndexSelectionProbe(allocator, true);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--counted-image-loop")) {

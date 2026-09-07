@@ -22425,6 +22425,7 @@ fn sampledImageFormat(unified_format: u16, force_srgb: bool) ?u32 {
         6 => vk.format_r8_sint,
         7 => vk.format_r16_unorm,
         11 => vk.format_r16_uint,
+        12 => vk.format_r16_sint,
         13 => vk.format_r16_sfloat,
         14 => vk.format_r8g8_unorm,
         15 => vk.format_r8g8_snorm,
@@ -23872,9 +23873,53 @@ fn typedImageIndexRange(
 ) ?TypedIndexRange {
     const instructions = analysis.program.instructions.items;
     const definition = gpu.index_bounds.scalarLaneDefinition(instructions, &analysis.graph, before, register, 0) orelse return null;
+    var remaining: u32 = 64;
+    return typedVectorIndexRange(bindings, reader, analysis, scalar, definition, &remaining);
+}
+
+fn typedIndexOperandRange(
+    bindings: *const gpu.ShaderBindings,
+    reader: gpu.ShaderMemoryReader,
+    analysis: *const gpu.ShaderAnalysis,
+    scalar: *const gpu.ScalarEvaluation,
+    before: usize,
+    op: rdna2.Operand,
+    remaining: *u32,
+) ?TypedIndexRange {
+    if (op.negate or op.absolute or op.dpp or op.sdwa_sel != 6 or op.sdwa_sext) return null;
+    if (op.kind == .integer_inline_constant or op.kind == .literal_constant) {
+        return if (op.value < 65536) .{ .positive_limit = op.value + 1 } else null;
+    }
+    if (op.kind != .vgpr) return null;
+    const definition = gpu.index_bounds.vectorLaneDefinition(analysis.program.instructions.items, &analysis.graph, before, op.reg) orelse return null;
+    return typedVectorIndexRange(bindings, reader, analysis, scalar, definition, remaining);
+}
+
+fn typedVectorIndexRange(
+    bindings: *const gpu.ShaderBindings,
+    reader: gpu.ShaderMemoryReader,
+    analysis: *const gpu.ShaderAnalysis,
+    scalar: *const gpu.ScalarEvaluation,
+    definition: gpu.index_bounds.Definition,
+    remaining: *u32,
+) ?TypedIndexRange {
+    if (remaining.* == 0) return null;
+    remaining.* -= 1;
+    const instructions = analysis.program.instructions.items;
     const fetch = instructions[definition.instruction];
-    if ((fetch.opcode != .image_load and fetch.opcode != .image_load_mip) or
-        definition.component != 0 or fetch.data_mask != 1 or fetch.src1.kind != .sgpr or
+    if (fetch.dst.omod != 0 or fetch.dst.clamp) return null;
+    if (definition.component == 0) switch (fetch.opcode) {
+        .v_mov_b32 => return typedIndexOperandRange(bindings, reader, analysis, scalar, definition.instruction, fetch.src0, remaining),
+        .v_cndmask_b32 => {
+            const a = typedIndexOperandRange(bindings, reader, analysis, scalar, definition.instruction, fetch.src0, remaining) orelse return null;
+            const b = typedIndexOperandRange(bindings, reader, analysis, scalar, definition.instruction, fetch.src1, remaining) orelse return null;
+            return .{ .positive_limit = @max(a.positive_limit, b.positive_limit), .negative_magnitude = @max(a.negative_magnitude, b.negative_magnitude) };
+        },
+        else => {},
+    };
+    const gather = fetch.opcode == .image_gather4 and !fetch.image_sample_flags.compare;
+    if ((!gather and fetch.opcode != .image_load and fetch.opcode != .image_load_mip) or
+        definition.component >= @as(u32, if (gather) 4 else 1) or fetch.data_mask != 1 or fetch.src1.kind != .sgpr or
         fetch.raw_count < 2 or fetch.raw[1] & (1 << 31) != 0) return null;
     var resolver = gpu.scalar_resources.Resolver{
         .bindings = bindings,

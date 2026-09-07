@@ -4,6 +4,31 @@ Verified with PPSA26344 and the RTX 3070 Ti on 2026-09-06.
 
 ## Menu progress on 2026-09-07
 
+Live validation of `a7e7ae1` reached the animated loading indicator (captured
+at flips 801 and 833), but terminated with a guest write fault before the
+bonus notices. It did not reproduce the old culling-pointer or VCC_HI
+translation faults. The title menu and brightness screen are **not verified
+on this build**. The installed executable was restored to the previously
+tested `796a484` runtime for UI comparison; a separate build isolates the
+per-invocation high-mask write without changing the remaining fixes.
+
+Typed material indices now retain their bounds through vector moves and
+conditional selections, including all four components of integer gathers.
+Every vector source must have been initialized for all lanes active at its
+consumer; restoring lanes outside the fetch mask rejects the proof. Scalar
+resource recovery also reconstructs wrapping MUL/MULK offsets after register
+reuse, and sampled views now support R16_SINT alongside the existing integer
+formats. On the captured terrain table, `0x8000296000` PC `0x1ebc` previously
+enumerated 229 candidates, including 62 false 1D-array descriptors. Recovering
+the R8_UINT gather range changes the scan from 8-byte windows to the actual
+136-byte records and yields 84 2D textures. The table was captured at failure;
+missing source-resource allocations were read from the still-running process.
+GPU selection/gather tests reproduce the old `UnsupportedSampledImage` and
+pass after the fix. Typed, indirect, indexed, nested, vector, uniform-loop,
+4096-view and full Vulkan regressions pass, together with the index-bound
+and scalar-resource CPU suites. This texture fix has not yet been validated
+in a complete game frame.
+
 Compute dispatches now pass `CS_W32_EN` from the PM4 initiator to translation.
 Wave32 comparison/carry destinations write one word, preserving adjacent
 SGPRs; EXEC indexing, lane operations and add-thread-id addressing use 32

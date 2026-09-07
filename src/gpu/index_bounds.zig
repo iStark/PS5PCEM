@@ -291,6 +291,39 @@ fn maskIsSubsetOfVectorWrite(instructions: []const Instruction, graph: *const Gr
     return true;
 }
 
+/// A vector source initialized for every lane active at its consumer.
+pub fn vectorLaneDefinition(instructions: []const Instruction, graph: *const Graph, before: usize, register: u32) ?Definition {
+    const index = reachingDefinition(instructions, graph, before, .{ .register = register, .lane = std.math.maxInt(u32) }) orelse return null;
+    const inst = instructions[index];
+    if (inst.dst.kind != .vgpr or inst.dst.reg > register or inst.dst.sdwa_sel != 6 or inst.dst.omod != 0 or inst.dst.clamp) return null;
+    var proof = MaskProof{};
+    if (!maskIsSubsetOfVectorWrite(instructions, graph, before, 126, index, &proof) or !proof.has_origin) return null;
+    return .{ .instruction = index, .component = register - inst.dst.reg };
+}
+
+test "vector index sources reject lanes restored outside the fetch mask" {
+    const exec = rdna2.Operand{ .kind = .exec_lo };
+    const saved = rdna2.Operand{ .kind = .sgpr, .reg = 8 };
+    var instructions = [_]Instruction{
+        .{ .pc = 0, .opcode = .s_mov_b64, .dst = saved, .src0 = exec },
+        .{ .pc = 4, .opcode = .s_nop },
+        .{ .pc = 8, .opcode = .image_gather4, .dst = .{ .kind = .vgpr, .reg = 15 }, .data_words = 4 },
+        .{ .pc = 12, .opcode = .s_nop },
+        .{ .pc = 16, .opcode = .v_cndmask_b32, .dst = .{ .kind = .vgpr, .reg = 20 }, .src1 = .{ .kind = .vgpr, .reg = 18 } },
+        .{ .pc = 20, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?Definition, .{ .instruction = 2, .component = 3 }), vectorLaneDefinition(&instructions, &graph, 4, 18));
+    instructions[1] = .{ .pc = 4, .opcode = .s_and_saveexec_b64, .dst = saved, .src0 = .{ .kind = .integer_inline_constant } };
+    instructions[3] = .{ .pc = 12, .opcode = .s_mov_b64, .dst = exec, .src0 = saved };
+    try std.testing.expect(vectorLaneDefinition(&instructions, &graph, 4, 18) == null);
+    instructions[3] = .{ .pc = 12, .opcode = .s_nop };
+    try std.testing.expectEqual(@as(?Definition, .{ .instruction = 2, .component = 3 }), vectorLaneDefinition(&instructions, &graph, 4, 18));
+    instructions[2].dst.sdwa_sel = 4;
+    try std.testing.expect(vectorLaneDefinition(&instructions, &graph, 4, 18) == null);
+}
+
 /// The vector definition shared by every lane a waterfall can select.
 pub fn scalarLaneDefinition(instructions: []const Instruction, graph: *const Graph, before: usize, register: u32, depth: u32) ?Definition {
     if (depth == 16) return null;

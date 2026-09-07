@@ -54,6 +54,12 @@ pub const Resolver = struct {
         const component: u32 = @intCast(register - destination);
         switch (inst.opcode) {
             .s_mov_b32, .s_mov_b64 => return self.operand(inst.src0, component, index, depth + 1),
+            .s_mul_i32, .s_mulk_i32 => {
+                if (component != 0) return null;
+                const a = (try self.operand(inst.src0, 0, index, depth + 1)) orelse return null;
+                const b = (try self.operand(inst.src1, 0, index, depth + 1)) orelse return null;
+                return a *% b;
+            },
             .s_movk_i32 => return @bitCast(@as(i32, @as(i16, @bitCast(@as(u16, @truncate(inst.src0.value)))))),
             .s_bfm_b32, .s_bfm_b64 => {
                 // Sampler constants are also assembled in branches that the
@@ -136,6 +142,34 @@ test "scalar resource recovery reconstructs bitfield sampler constants" {
     instructions[1].src0 = .{ .kind = .vgpr, .reg = 0 };
     resolver.remaining = 512;
     try std.testing.expect(!try resolver.words(32, 12, words[0..1]));
+}
+
+test "scalar resource offsets recover wrapping multiplication before register reuse" {
+    const instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_mul_i32, .dst = .{ .kind = .sgpr, .reg = 4 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .sgpr, .reg = 1 } },
+        .{ .pc = 4, .opcode = .s_mulk_i32, .dst = .{ .kind = .sgpr, .reg = 4 }, .src0 = .{ .kind = .sgpr, .reg = 4 }, .src1 = .{ .kind = .integer_inline_constant, .value = 3 } },
+        .{ .pc = 8, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 4 }, .src0 = .{ .kind = .integer_inline_constant, .value = 999 } },
+        .{ .pc = 12, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    const M = struct {
+        fn read(_: ?*anyopaque, _: u64, _: []u8) bool {
+            return false;
+        }
+    };
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    bindings.user_data_count = 2;
+    bindings.user_data[0] = 0x8000_0001;
+    bindings.user_data[1] = 136;
+    var snapshot = scalar.Evaluation{};
+    snapshot.registers[4] = .{ .known = true, .value = 999, .producer_pc = 8 };
+    var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = null, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot };
+    var value: [1]u32 = undefined;
+    try std.testing.expect(try resolver.words(4, 8, &value));
+    try std.testing.expectEqual(@as(u32, 408), value[0]);
+    bindings.user_data_count = 0;
+    try std.testing.expect(!try resolver.words(4, 8, &value));
 }
 
 test "scalar resource recovery follows nested loads after USER_DATA reuse" {
