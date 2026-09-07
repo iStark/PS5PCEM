@@ -1991,15 +1991,20 @@ fn runFlatPointerProbe(allocator: std.mem.Allocator) !void {
     defer renderer.deinit();
     var guest = GuestMemory{};
     _ = renderer.dcbBackend(guest.interface());
-    for ([_]bool{ false, true }) |scalar_base| for ([_]i32{ -4, 0, 4 }) |offset| {
+    for ([_]bool{ false, true }) |repeat| for ([_]bool{ false, true }) |scalar_base| for ([_]i32{ -4, 0, 4 }) |offset| {
         const code = [_]u32{
-            vop1(1, 4, 20), 0xb814_0008,
+            if (repeat) 0xbe9e_0382 else 0xbf80_0000, // two iterations, or a straight-line probe
+            vop1(1, 4, 20),
+            0xb814_0008,
             0xf424_0004,                                        20 << 25, // pointer table -> s0:s1
             vop1(1, 0, if (scalar_base) 136 else 0),            vop1(1, 1, 1),
             0xdc38_8000 | (@as(u32, @bitCast(offset)) & 0xfff),
             if (scalar_base) 0 else 0x007d_0000, // x4 -> v0:v3, overlapping address
             mubuf(0x1e, 0, 0, 4, 12)[0],
             mubuf(0x1e, 0, 0, 4, 12)[1],
+            if (repeat) 0x811e_c11e else 0xbf80_0000, // s30 -= 1
+            if (repeat) 0xbf06_801e else 0xbf80_0000, // s30 == 0
+            if (repeat) 0xbf84_fff5 else 0xbf80_0000, // SCC0 -> pointer load, preserving the original workgroup index
             0xbf81_0000,
         };
         for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
@@ -2053,10 +2058,10 @@ fn runFlatPointerProbe(allocator: std.mem.Allocator) !void {
             };
             var header: [48]u8 = undefined;
             try renderer.readbackGuestStorageBuffer(0x12000, &header);
-            try std.testing.expectEqual(faults, std.mem.readInt(u32, header[8..12], .little));
+            try std.testing.expectEqual(faults * @as(u32, if (repeat) 2 else 1), std.mem.readInt(u32, header[8..12], .little));
         }
     };
-    std.debug.print("FLAT pointers passed: absolute/scalar bases, signed offsets, overlapping destinations, unaligned reads, 4-GiB carry, relocation and fault counts\n", .{});
+    std.debug.print("FLAT pointers passed: absolute/scalar bases, signed offsets, overlapping destinations, unaligned reads, 4-GiB carry, relocation, repeated loop reads and fault counts\n", .{});
 }
 
 fn runSceneFlatPointerProbe(allocator: std.mem.Allocator) !void {

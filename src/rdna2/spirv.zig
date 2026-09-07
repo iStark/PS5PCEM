@@ -622,6 +622,7 @@ const Builder = struct {
     storage_bindings: []const StorageBufferBinding,
     scalar_memory_bindings: []const ScalarMemoryBinding,
     flat_memory_bindings: []const FlatMemoryBinding,
+    flat_memory_headers: std.ArrayList([3]u32) = .empty,
     sampled_bindings: []const SampledImageBinding,
     storage_image_bindings: []const StorageImageBinding,
     ngg_lds_exports: []const NggLdsExport,
@@ -1239,6 +1240,7 @@ const Builder = struct {
         self.body.deinit(self.allocator);
         self.constants.deinit(self.allocator);
         self.lane_spills.deinit(self.allocator);
+        self.flat_memory_headers.deinit(self.allocator);
     }
 
     fn id(self: *Builder) u32 {
@@ -3802,6 +3804,21 @@ const Builder = struct {
     }
 
     fn initializeStageInputs(self: *Builder) Error!void {
+        // Snapshot address/length headers are immutable during the dispatch.
+        // Load them in the entry block so all FLAT sites and loop iterations
+        // can share these IDs, including sites on different branch paths.
+        // The fault counter at word 2 remains live and is never hoisted.
+        for (self.flat_memory_bindings) |region| {
+            const header = BufferAddress{
+                .binding = .{ .resource_sgpr = 0, .descriptor_index = region.descriptor_index },
+                .byte_offset = try self.constant(.bits32, 0),
+            };
+            try self.flat_memory_headers.append(self.allocator, .{
+                try self.loadBufferWord(header, 0),
+                try self.loadBufferWord(header, 1),
+                try self.loadBufferWord(header, 3),
+            });
+        }
         if (self.dynamic_scalar_binding != null) {
             for (self.scalar_specializations, 0..) |scalar, index| {
                 if (scalar.producer_pc != null) continue;
@@ -7314,12 +7331,11 @@ const Builder = struct {
             const address = try self.addPointerOffset(pointer, try self.constant(.bits32, @intCast(word * 4)));
             var found = self.id();
             try self.emit(&self.body, 171, &.{ self.bool_type, found, zero, zero });
-            for (self.flat_memory_bindings) |region| {
+            for (self.flat_memory_bindings, self.flat_memory_headers.items) |region, header| {
                 const binding = StorageBufferBinding{ .resource_sgpr = 0, .descriptor_index = region.descriptor_index };
-                const header = BufferAddress{ .binding = binding, .byte_offset = zero };
-                const base_low = try self.loadBufferWord(header, 0);
-                const base_high = try self.loadBufferWord(header, 1);
-                const length = try self.loadBufferWord(header, 3);
+                const base_low = header[0];
+                const base_high = header[1];
+                const length = header[2];
                 const relative = self.id();
                 try self.emit(&self.body, 130, &.{ self.bits_type, relative, address[0], base_low });
                 const borrow = self.id();

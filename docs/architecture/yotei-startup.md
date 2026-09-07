@@ -31,6 +31,16 @@ probes pass. The vector-image probe additionally replaces two cached texels
 through the DCB write boundary, checks every lane and verifies subsequent
 reuse without another upload. Live timing of this index remains pending.
 
+FLAT snapshot base/length loads now live in the shader entry block. Every
+read site and loop iteration shares those immutable header values, while
+the fault counter and payload reads remain live. A synthetic module with
+32 four-word reads and 33 regions shrinks from 1,695,411 to 987,132 words
+(42%). This measures generated code size, not driver compilation time.
+SDK probes retain signed/unaligned reads, 4-GiB carries, relocation, exact
+bounds and fault counts; a repeated-read loop additionally checks entry-block
+dominance and per-iteration faults. The captured scene-shape and full smoke
+probes pass. Live driver-time and FPS effects remain unmeasured.
+
 The depth/stencil HTILE fix is confirmed in the game. The three bonus notices
 clear without retaining rectangles from earlier windows. The brightness
 screen renders its wolf, smoky background, text, slider and Cross icon. The
