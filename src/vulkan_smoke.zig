@@ -1355,6 +1355,66 @@ fn runStorageImageReuseCase(allocator: std.mem.Allocator, count: usize) !void {
     for (renderer.storage_image_cache.items) |cached| try std.testing.expectEqual(@as(usize, 0), cached.pin_count);
 }
 
+fn runUiAttachmentProbe(allocator: std.mem.Allocator) !void {
+    for (0..8) |case| {
+        var renderer = try vulkan.Renderer.init(allocator, .{});
+        defer renderer.deinit();
+        var guest = GuestMemory{};
+        var vertex = [_]u32{
+            vop1(6, 1, 261), vop1(1, 2, 255),  0x3f80_0000,      vop2(4, 3, 1, 2),
+            vop1(1, 4, 255), 0x3f40_0000,      vop2(8, 5, 3, 4), vop2(8, 6, 3, 3),
+            vop1(1, 7, 255), 0xbfc0_0000,      vop2(8, 6, 6, 7), vop1(1, 8, 255),
+            0x3f40_0000,     vop2(3, 6, 6, 8), vop1(1, 7, 128),  vop1(1, 8, 242),
+            0xf800_08cf,     0x0807_0605,      0xbf81_0000,
+        };
+        if (case >= 5) vertex[14] = vop1(1, 7, 241); // negative clip Z
+        const fragment = [_]u32{ vop1(1, 0, 242), vop1(1, 1, 128), 0xf800_080f, 0x0001_0100, 0xbf81_0000 };
+        for (vertex, 0..) |word, i| guest.word(0x700 + i * 4, word);
+        for (fragment, 0..) |word, i| guest.word(0x900 + i * 4, word);
+        var state = gpu.State{};
+        try state.writeRegister(.shader, gpu.resources.ShaderStage.vertex.programRegisterBase(), 7);
+        try state.writeRegister(.shader, gpu.resources.ShaderStage.vertex.programRegisterBase() + 1, 0);
+        try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.programRegisterBase(), 9);
+        try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.programRegisterBase() + 1, 0);
+        const htile = case >= 2 and case < 5;
+        const disable_color = case == 1 or case == 4;
+        // Jurassic's stale reset binding has no HTILE. The HTILE cases
+        // model Yotei's active depth surface and must retain depth tests.
+        const context = [_][2]u32{
+            .{ 0x318, 0x20 },            .{ 0x319, 7 },               .{ 0x31b, 0 },               .{ 0x31c, 10 << 2 }, .{ 0x31d, 0 },
+            .{ 0x390, 0 },               .{ 0x3b0, (63 << 14) | 63 }, .{ 0x3b8, 1 << 24 },         .{ 0x08e, 0xf },     .{ 0x00c, 0 },
+            .{ 0x00d, 64 | (64 << 16) }, .{ 0x094, 1 << 31 },         .{ 0x095, 64 | (64 << 16) }, .{ 0x1e0, 0 },       .{ 0x205, 0 },
+            .{ 0x000, 0 },               .{ 0x007, 0 },               .{ 0x012, 0x80 },            .{ 0x014, 0x80 },    .{ 0x01a, 0 },
+            .{ 0x01c, 0 },               .{ 0x01e, 0 },               .{ 0x011, 1 << 29 },
+        };
+        for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+        try state.writeRegister(.context, 0x010, 0x183 | (if (htile) @as(u32, 1) << 29 else 0));
+        try state.writeRegister(.context, 0x005, if (htile) 0x1c0 else 0);
+        try state.writeRegister(.context, 0x200, 6 | (if (case == 3) @as(u32, 6) << 4 else @as(u32, 1) << 4));
+        if (case != 5) try state.writeRegister(.context, 0x204, if (case == 6) 1 << 19 else 0);
+        // Leave CB_COLOR_CONTROL absent in case zero, as in Jurassic.
+        try state.writeRegister(.context, 0x00b, 0); // initial depth = 0
+        if (case != 0) try state.writeRegister(.context, 0x202, 0xcc0000 | (if (disable_color) @as(u32, 0) else 0x10));
+        for ([_]f32{ 32, 32, -32, 32, 1, 0 }, 0..) |value, i|
+            try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value));
+        var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(guest.interface()), .allocator = allocator };
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+        if (renderer.last_draw_error) |err| return err;
+        try renderer.flushPendingGuestWrites();
+        const expected: u32 = if (case == 0 or case == 3 or case == 5 or case == 7) 0xff0000ff else 0;
+        const center = 0x2000 + (32 * 64 + 32) * 4;
+        const actual = std.mem.readInt(u32, guest.bytes[center..][0..4], .little);
+        if (actual != expected) std.debug.print("UI attachment case={d}: expected={x} actual={x}\n", .{ case, expected, actual });
+        try std.testing.expectEqual(expected, actual);
+        try std.testing.expectEqual(@as(usize, if (htile) 1 else 0), renderer.depth_targets.items.len);
+        if (htile) {
+            try std.testing.expectEqual(@as(u32, 64), renderer.depth_targets.items[0].target.width);
+            try std.testing.expectEqual(@as(u32, 64), renderer.depth_targets.items[0].target.height);
+        }
+    }
+    std.debug.print("UI attachments passed: missing color/clip defaults, explicit disable/DX clip, stale depth and HTILE comparisons\n", .{});
+}
+
 fn runFullscreenOrientationProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -3258,6 +3318,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--vector-images")) {
         try runVectorImageProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--ui-attachments")) {
+        try runUiAttachmentProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--fullscreen-orientation")) {

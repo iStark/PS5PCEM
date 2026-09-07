@@ -1138,12 +1138,19 @@ fn executeScalar64(
     const av = wide_a.value;
     var bv: u64 = 0;
     if (b) |low| {
-        const wide_b = wideSource(result, inst.src1, low) orelse {
-            invalidateDestination(result, inst.dst, 2);
-            return;
-        };
-        bv = wide_b.value;
-        all_sources = Sources.merge(all_sources, wide_b.sources);
+        // BFE's data is 64-bit, but its packed offset/width is one SGPR.
+        // In vertex fetch prologs that control often lives in VCC_HI;
+        // requiring s108 makes an otherwise complete V# format unknown.
+        if (inst.opcode == .s_bfe_u64) {
+            bv = low.value;
+        } else {
+            const wide_b = wideSource(result, inst.src1, low) orelse {
+                invalidateDestination(result, inst.dst, 2);
+                return;
+            };
+            bv = wide_b.value;
+            all_sources = Sources.merge(all_sources, wide_b.sources);
+        }
     }
     const value: ?u64 = switch (inst.opcode) {
         .s_mov_b64 => av,
@@ -1172,6 +1179,32 @@ fn executeScalar64(
         write(result, inst.dst, @truncate(known), all_sources, inst.pc);
         result.registers[destination + 1] = .{ .known = true, .value = @truncate(known >> 32), .sources = all_sources, .producer_pc = inst.pc };
     } else invalidateDestination(result, inst.dst, 2);
+}
+
+test "64-bit BFE takes one control SGPR and retains both data words" {
+    var result = Evaluation{};
+    result.registers[14] = .{ .known = true, .value = 0x022c0204 };
+    result.registers[15] = .{ .known = true, .value = 0x0fac03ac };
+    result.registers[107] = .{ .known = true, .value = 0x000c0020 };
+    var scc: ?bool = null;
+    const inst = rdna2.Instruction{
+        .pc = 0xc4,
+        .opcode = .s_bfe_u64,
+        .dst = .{ .kind = .sgpr, .reg = 26 },
+        .src0 = .{ .kind = .sgpr, .reg = 14 },
+        .src1 = .{ .kind = .vcc_hi },
+        .src_count = 2,
+    };
+    executeScalar(&result, 0, inst, &scc);
+    try std.testing.expectEqual(@as(u32, 0x3ac), result.register(26).?.value);
+    try std.testing.expectEqual(@as(u32, 0), result.register(27).?.value);
+    result.registers[108] = .{ .known = true, .value = 0xffffffff };
+    executeScalar(&result, 0, inst, &scc);
+    try std.testing.expectEqual(@as(u32, 0x3ac), result.register(26).?.value);
+    result.registers[15] = .{};
+    executeScalar(&result, 0, inst, &scc);
+    try std.testing.expect(result.register(26) == null);
+    try std.testing.expect(result.register(27) == null);
 }
 
 fn source(result: *const Evaluation, operand: rdna2.Operand) ?ScalarValue {

@@ -757,10 +757,9 @@ test "a viewport scissor with only the offset flag is an AGC reset placeholder" 
 
 pub fn decodeRasterState(state: *const gpu_state.State) RasterState {
     const mode = context(state, 0x205) orelse 0;
-    // A fresh AGC command context can omit PA_CL_CLIP_CNTL altogether. In that
-    // case no guest choice of the wider -W..W range exists to convert, and the
-    // console's ordinary 0..W convention is the safe effective default.
-    const clip = context(state, 0x204) orelse 1 << 19;
+    // AGC's register defaults initialize PA_CL_CLIP_CNTL to zero (-W..W).
+    // Streams may inherit this default without emitting a register write.
+    const clip = context(state, 0x204) orelse 0;
     return .{
         .cull_front = mode & 1 != 0,
         .cull_back = mode & 2 != 0,
@@ -781,8 +780,11 @@ pub fn decodeRasterState(state: *const gpu_state.State) RasterState {
     };
 }
 
-test "an unwritten depth-clip selector keeps the console zero-to-one default" {
+test "an unwritten depth-clip selector inherits AGC defaults and explicit DX is preserved" {
     var state = gpu_state.State{};
+    try std.testing.expect(!decodeRasterState(&state).zero_to_one_depth);
+
+    try state.writeRegister(.context, 0x204, 1 << 19);
     try std.testing.expect(decodeRasterState(&state).zero_to_one_depth);
 
     try state.writeRegister(.context, 0x204, 0);
@@ -808,11 +810,24 @@ pub fn decodeBlendControls(state: *const gpu_state.State) [color_target_count]Bl
 }
 
 pub fn decodeColorControl(state: *const gpu_state.State) ColorControl {
-    const raw = context(state, 0x202) orelse return .{};
+    // AGC's normal draw default is COPY/NORMAL. Some streams omit this
+    // register; that is distinct from an explicit MODE=DISABLE write used
+    // by metadata/depth passes (including Yotei's G-buffer preparation).
+    const raw = context(state, 0x202) orelse 0x00cc0010;
     return .{
         .mode = @truncate((raw >> 4) & 0x7),
         .logic_operation = @truncate(raw >> 16),
     };
+}
+
+test "missing color control uses AGC normal mode but explicit disable is preserved" {
+    var state = gpu_state.State{};
+    try testing.expectEqual(@as(u3, 1), decodeColorControl(&state).mode);
+    try testing.expectEqual(@as(u8, 0xcc), decodeColorControl(&state).logic_operation);
+    for ([_]u3{ 0, 1, 2, 3, 5, 6 }) |mode| {
+        try state.writeRegister(.context, 0x202, 0x00cc0000 | (@as(u32, mode) << 4));
+        try testing.expectEqual(mode, decodeColorControl(&state).mode);
+    }
 }
 
 pub fn decodeColorTarget(state: *const gpu_state.State, slot: u8, target_mask: u32) ?ColorTarget {

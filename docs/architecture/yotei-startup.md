@@ -24,6 +24,15 @@ fix. The reference executable and PDB are preserved as
 build has not been verified through this UI sequence. Full title-menu
 rendering remains unverified.
 
+The Jurassic Park startup fix preserves explicit color disable and DX clipping,
+and still recovers reset depth extents for Yotei's active HTILE-backed surfaces.
+Pixel-readback probes verify retained depth comparisons and repeated metadata
+clears. The installed build played Yotei's intro and continued into scene
+loading in a bounded live check, with the Sucker Punch logo captured at flip
+512. This does not extend verification to the bonus/brightness sequence or
+the full title menu. The previous Cat build is preserved separately as
+`zig-out/bin/game-run-pre-jurassic.*`.
+
 The reference resolved its roughly 6,042 resources in about 18 minutes;
 initial scene frames then spent 267 and 162 seconds preparing dispatches.
 A sampled long pause was inside the NVIDIA driver. Later UI frames took

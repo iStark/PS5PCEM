@@ -1437,13 +1437,15 @@ fn depthSampledFormatCompatible(depth_format: u32, sampled_format: u32) bool {
         (depth32 and sampled_format == vk.format_r32_sfloat);
 }
 
-/// Expands the DB_DEPTH_SIZE_XY 1x1 reset sentinel from the viewport or,
-/// when that is missing, the scissor. Returns true when the extent changed.
+/// Recovers a reset extent for an HTILE-backed depth surface, using the
+/// viewport or scissor. A bare 1x1 binding can be stale UI state; expanding
+/// it would bypass the undersized-attachment check and reject colour draws.
 fn recoverResetDepthExtent(
     bound: *gpu.resources.DepthTarget,
     render_state: gpu.resources.RenderState,
 ) bool {
     if (bound.width != 1 or bound.height != 1) return false;
+    if (!bound.htile_enabled or bound.htile_address == 0) return false;
     if (render_state.viewport) |viewport| {
         const viewport_width = @abs(viewport.x_scale * 2.0);
         const viewport_height = @abs(viewport.y_scale * 2.0);
@@ -3146,6 +3148,7 @@ pub const Renderer = struct {
     depth_target_sequence: u64 = 0,
     reported_depth_attachment: bool = false,
     depth_only_draw_reports: u8 = 0,
+    reset_depth_extent_reports: u8 = 0,
     skipped_extra_color_reports: u8 = 0,
     resident_depth_sample_reports: u8 = 0,
     reported_unbacked_depth_sample: bool = false,
@@ -13214,14 +13217,12 @@ pub const Renderer = struct {
                 render_state.depth_control.stencil_clear_enabled);
         var depth_plane: ?GuestDepthTarget = if (depth_wanted) blk: {
             var bound = render_state.depth_target orelse break :blk null;
-            // SDK11 can leave DB_DEPTH_SIZE_XY at its reset 1x1 value while
-            // the viewport, scissor, and the following sampled-depth descriptor
-            // carry the real extent. SharpEmu uses the same conservative
-            // recovery: only expand the exact reset sentinel, never an
-            // arbitrary undersized attachment.
+            // Yotei leaves DB_DEPTH_SIZE_XY at 1x1 for active HTILE-backed
+            // surfaces. Preserve their extent recovery, while a plain stale
+            // UI binding still reaches the undersized-attachment check below.
             if (bound.width == 1 and bound.height == 1) {
                 if (recoverResetDepthExtent(&bound, render_state) and
-                    (self.traceCurrentGraphicsFrame() or self.depth_only_draw_reports < 8))
+                    (self.traceCurrentGraphicsFrame() or self.reset_depth_extent_reports < 8))
                 {
                     std.debug.print(
                         "[vulkan dcb] inferred reset depth extent @0x{x}: 1x1 -> {d}x{d}\n",
@@ -13231,6 +13232,7 @@ pub const Renderer = struct {
                             bound.height,
                         },
                     );
+                    self.reset_depth_extent_reports +|= 1;
                 }
             }
             break :blk guestDepthTarget(bound);
@@ -14641,13 +14643,9 @@ pub const Renderer = struct {
         const try_guest_vs = probe_parameter_mask == 0;
         if (try_guest_vs) {
             const vertex_translate_started = hostTimestampNs();
-            // An omitted PA_CL_CLIP_CNTL is not an explicit request for the
-            // wider OpenGL-style range. Checking register presence here keeps
-            // a reset command context from remapping fullscreen quad depth.
-            const convert_guest_depth = if (state.readRegister(.context, 0x204)) |clip|
-                clip & (1 << 19) == 0
-            else
-                false;
+            // Omitted PA_CL_CLIP_CNTL inherits AGC's zero default (-W..W).
+            // Explicit DX_CLIP_SPACE_DEF still preserves 0..W, as in Yotei.
+            const convert_guest_depth = !render_state.raster.zero_to_one_depth;
             const vertex_program = if (vertex_instruction_storage.items.len != 0)
                 rdna2.Program{
                     .code = vertex_analysis.program.code,
@@ -14680,6 +14678,7 @@ pub const Renderer = struct {
                     self.allocator,
                     vertex_storage.mappings[0..vertex_storage.mapping_count],
                     unity_sprite_matrix.?,
+                    convert_guest_depth,
                 )
             else
                 rdna2.translateProgramSpirvWithPipelineOptions(self.allocator, &vertex_program, .{
@@ -25354,6 +25353,7 @@ fn buildUnitySpriteVertexSpirv(
     allocator: std.mem.Allocator,
     storage: []const gpu.ShaderSpirvStorageBufferBinding,
     matrix: gpu.ShaderSpirvStorageBufferBinding,
+    convert_guest_depth: bool,
 ) !rdna2.spirv.Module {
     const vgpr = struct {
         fn at(reg: u32) rdna2.Operand {
@@ -25420,6 +25420,7 @@ fn buildUnitySpriteVertexSpirv(
         .stage = .vertex,
         .vertex_index_vgpr = 5,
         .storage_buffers = storage,
+        .convert_negative_one_to_one_depth = convert_guest_depth,
         .parameter_mask = 0x3,
         .descriptor_array_length = maximum_storage_descriptors,
     });
@@ -27597,7 +27598,7 @@ test "RGBA occupancy preserves black alpha and destination alpha is explicit" {
     try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255 }, &.{ pixels[3], pixels[7], pixels[11] });
 }
 
-test "the 1x1 depth sentinel expands from the viewport, then the scissor" {
+test "HTILE depth reset extent expands while stale UI depth remains undersized" {
     var bound = std.mem.zeroes(gpu.resources.DepthTarget);
     bound.width = 1;
     bound.height = 1;
@@ -27610,6 +27611,16 @@ test "the 1x1 depth sentinel expands from the viewport, then the scissor" {
         .z_scale = 1,
         .z_offset = 0,
     };
+    // Jurassic's plain reset binding must not become a full-size attachment.
+    try std.testing.expect(!recoverResetDepthExtent(&bound, render));
+    try std.testing.expectEqual(@as(u32, 1), bound.width);
+    bound.htile_address = 0x5060b30000;
+    try std.testing.expect(!recoverResetDepthExtent(&bound, render));
+    bound.htile_address = 0;
+    bound.htile_enabled = true;
+    try std.testing.expect(!recoverResetDepthExtent(&bound, render));
+    // Yotei's captured G-buffer has active HTILE and a missing size register.
+    bound.htile_address = 0x5060b30000;
     try std.testing.expect(recoverResetDepthExtent(&bound, render));
     try std.testing.expectEqual(@as(u32, 1920), bound.width);
     try std.testing.expectEqual(@as(u32, 1080), bound.height);

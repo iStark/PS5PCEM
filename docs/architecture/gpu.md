@@ -57,6 +57,16 @@ It also reads which depth-clip convention the title selected, because the two
 conventions disagree about what a position means rather than about how it is
 drawn: a guest clipping Z to `-W..W` places the near plane where Vulkan, which
 clips to `0..W`, places the middle of the scene.
+Missing color-control and clip-control writes inherit the AGC defaults
+(`0x00cc0010` and zero). Explicit DISABLE and DX clip-space writes remain
+authoritative; an omitted register must not silently disable UI color exports
+or clip negative-Z menu vertices. Reset depth extents are recovered only for
+active HTILE-backed surfaces, preserving Yotei's G-buffer while leaving plain
+stale 1x1 UI depth bindings subject to the attachment-size check.
+The `vulkan-smoke --ui-attachments` probe verifies those defaults with pixel
+readback, including explicit color disable, negative clip Z, and retained
+HTILE depth comparisons. `--htile-clears` covers repeated metadata clears;
+`--fullscreen-orientation` covers both viewport signs and runtime UV directions.
 Snapshots allocate nothing and do not duplicate mutable GPU state: partial PM4
 writes remain in the register banks and are interpreted only when work consumes
 them.

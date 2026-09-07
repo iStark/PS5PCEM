@@ -854,6 +854,9 @@ scheduler and Vulkan backend. Observed startup work now includes:
   The clip-space selector in `PA_CL_CLIP_CNTL` says which convention a title
   chose, and a program that chose the wider one now has its exported depth
   mapped into Vulkan's range instead of being taken literally.
+  An omitted register inherits the AGC zero default; explicit DX clip-space
+  selections keep their existing range. The matched sprite vertex path uses
+  the same conversion as native translated vertex programs.
 - A kernel no longer pays for its own prolog once per resource it names. A
   descriptor is recovered by replaying the scalar program up to the instruction
   that uses it, and replaying it from guest memory re-read and re-decoded every

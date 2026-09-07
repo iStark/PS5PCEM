@@ -166,9 +166,17 @@ behind them.
   semantics instead of rejecting the fragment program. Fullscreen passes also
   discard a stale undersized depth attachment before framebuffer creation; this
   removes the NVIDIA device loss that appeared when the newly translated draw
-  first ran. A regression run completed more than 1,200 flips and reproduced
-  the illuminated gate scene without a failed submission. No gameplay
-  compatibility is claimed yet.
+  first ran. A later startup regression exposed missing color/clip defaults,
+  over-expansion of a plain reset depth binding, and scalar `S_BFE_U64`
+  provenance incorrectly reading a second control SGPR. These now preserve
+  inherited AGC state and recover the sprite vertex formats. The current live
+  run completed more than 10,000 flips without rejected submissions or guest
+  faults, rendered the title logo over the animated gate, and accepted Cross
+  into game selection with cover art, arrows, and a moving preview. Sampled
+  frame times were about 27 ms at the title and 33 ms in selection. Some text
+  labels remain absent; launching a collection game is not verified.
+  Vulkan probes preserve explicit color disable, Yotei's HTILE-backed reset
+  depth and DX clipping, repeated depth clears, and Cat Quest III orientation.
 - REANIMAL now resolves its observed module graph, completes the company-logo
   sequence, and reaches the animated 3840×2160 title menu. The resident Unity
   composition path preserves the buoy background instead of stretching its
