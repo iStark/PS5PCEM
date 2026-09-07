@@ -4,6 +4,18 @@ Verified with PPSA26344 and the RTX 3070 Ti on 2026-09-06.
 
 ## Menu progress on 2026-09-07
 
+Material texture indices can now resolve a second, global descriptor table.
+The recovery follows SMEM definitions at the relevant instructions, enumerates
+the bounded set of reachable source words (including 32-bit multiplication
+wrap), then deduplicates the shifted global descriptor offsets. Both buffers
+retain per-word out-of-bounds zeroing. The captured `0x800034f300` particle
+shader resolves 190 textures (189 2D and one 3D) at nine sample sites; the old
+recovery returns no candidates for PC `0x494`. GPU checks cover over 50,000
+source windows, wrapping multiplication and shifts, exact aliases, volume
+slices, and an out-of-bounds material index resolving global entry zero.
+Indirect, nested, vector, typed-index, uniform-loop, 4096-view and full Vulkan
+regressions pass. Live particle rendering still requires the new runtime.
+
 Per-invocation comparison and carry masks now update both scalar words.
 Previously only the low word changed, so saved EXEC and 64-bit mask arithmetic
 could reuse stale upper-half bits. A GPU probe using SDWA comparisons,
@@ -21,8 +33,8 @@ overlapping result registers, and sampling remains outside divergent branches
 so fragment implicit LOD is valid. GPU probes cover a two-slice volume,
 4096 mixed views, relocation, aliases and null bounds. The previous translator
 rejects the mixed table with `InvalidStorageBinding`; the corrected compute
-and fragment paths pass SDK validation. This prepares support for particle
-tables; their nested index recovery is still separate work.
+and fragment paths pass SDK validation. This supplies view selection for the
+indexed particle-table recovery above.
 
 VOP3B `V_ADD_CO_U32`, `V_SUB_CO_U32` and `V_SUBREV_CO_U32` now
 decode their scalar carry destination and export unsigned carry/borrow.

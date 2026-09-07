@@ -2337,6 +2337,73 @@ fn runScalarPointerProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("scalar pointer loads passed: runtime pointers, split regions, 32-bit carry, bounds, overlapping SOFFSET and relocated bases\n", .{});
 }
 
+fn runIndexedImageProbe(allocator: std.mem.Allocator) !void {
+    for (0..2) |case| {
+        var renderer = try vulkan.Renderer.init(allocator, .{});
+        defer renderer.deinit();
+        const guest = try allocator.create(SizedGuestMemory(512 * 1024));
+        defer allocator.destroy(guest);
+        guest.* = .{};
+        _ = renderer.dcbBackend(guest.interface());
+        const records: u32 = 0x10000 + @as(u32, @intCast(case)) * 0x1000;
+        const textures: u32 = 0x48000 + @as(u32, @intCast(case)) * 0x1000;
+        const code = [_]u32{
+            vop1(1, 1, 28),
+            0xbf06_851c, // workgroup 5 reads beyond the material table
+            0x8514_1cff,
+            1754,
+            0x8014_ff14, if (case == 0) 0 else 0x0f72_c235, // 116 * wrapping index == 4 mod 2^32
+            0x9314_ff14, 116,
+            0xf420_0504, (20 << 25) | 60, // s20 = material.texture_index
+            0x8f14_8514, // s20 <<= 5, with 32-bit wrap
+            0xf42c_000c,                 20 << 25, // T#s0 = global[V#s24][s20]
+            vop1(1, 2, 255),             0x3e80_0000,
+            vop1(1, 3, 255),             0x3e80_0000,
+            vop1(1, 4, 255),             0x3f40_0000,
+            0xf09c_0112,                 0x0080_0202,
+            0x0403,                      mubuf(0x1c, 0, 2, 1, 12)[0],
+            mubuf(0x1c, 0, 2, 1, 12)[1], 0xbf81_0000,
+        };
+        for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+        // An unbounded stride-116 product reaches over 50,000 word windows;
+        // only their referenced T# entries belong in the Vulkan table.
+        const indices = [_]u32{ 2, 1, 0x0800_0003, 4, 0xffff_ffff };
+        for (indices, 0..) |value, index| guest.word(records + index * 116 + 60 + case * 4, value);
+        for (0..4) |index| {
+            const address: u32 = if (index == 0) 0xa000 else if (index == 1) 0x9000 else 0x8000;
+            var descriptor = sampledImageDescriptorWords(address, 1, 1);
+            if (index == 1) {
+                descriptor[3] = (descriptor[3] & 0x0fff_ffff) | 0xa000_0000;
+                descriptor[4] = 1;
+            } else if (index == 3) descriptor[3] = (descriptor[3] & ~@as(u32, 7)) | 6;
+            for (descriptor, 0..) |word, component| guest.word(textures + index * 32 + component * 4, word);
+            const layout = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&descriptor));
+            const surface = try layout.base();
+            for (0..if (index == 1) @as(usize, 2) else 1) |z| {
+                const pixel = address + @as(usize, @intCast(try surface.sourceByteOffset(0, 0, @intCast(z), 0)));
+                guest.word(pixel, if (index == 0) 0xff00_0020 else if (index != 1) 0xff80_00ff else if (z == 0) 0xff00_00aa else 0xff00_0040);
+            }
+        }
+        var state = gpu.State{};
+        try state.writeRegister(.shader, 0x20c, 1);
+        try state.writeRegister(.shader, 0x20d, 0);
+        try state.writeRegister(.shader, 0x213, (28 << 1) | (1 << 7));
+        var userdata: [28]u32 = @splat(0);
+        @memcpy(userdata[8..12], &[_]u32{ records, 116 << 16, 1754, 0 });
+        @memcpy(userdata[12..16], &[_]u32{ 0x50000, 4 << 16, 6, 0 });
+        @memcpy(userdata[24..28], &[_]u32{ textures, 32 << 16, 4, 0 });
+        for (userdata, 0..) |word, index| try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(index)), word);
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 6, 1, 1 });
+        var output: [24]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x50000, &output);
+        for ([_]f32{ 1, 64.0 / 255.0, 128.0 / 255.0, 0, 0, 32.0 / 255.0 }, 0..) |expected, index| {
+            const actual: f32 = @bitCast(std.mem.readInt(u32, output[index * 4 ..][0..4], .little));
+            try std.testing.expectApproxEqAbs(expected, actual, 0.00001);
+        }
+    }
+    std.debug.print("indexed images passed: material-to-global tables, large record scan, wrapping multiply/shift, mixed views, exact aliases and both bounds\n", .{});
+}
+
 fn runNestedImageProbe(allocator: std.mem.Allocator) !void {
     try runNestedImageCase(allocator, false, false);
     try runNestedImageCase(allocator, true, false);
@@ -2835,6 +2902,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--wide-masks")) {
         try runWideMaskProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--indexed-images")) {
+        try runIndexedImageProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--counted-image-loop")) {
