@@ -15,11 +15,14 @@ The `796a484` control run verified the animated loading indicator (flip 837),
 Digital Deluxe Bonus (955), Gift of the Northern Star (1000), Pre-order
 Bonus (1058), and brightness calibration (1149). The notices have readable
 text and Cross glyphs; brightness includes the wolf image, instruction,
-slider and confirmation glyph. The executable remains on this reference
-build, with the brightness screen left open. This does not verify the UI
-on the newer renderer: its previous live run crashed before the notices.
-The latest candidate, `174832a`, was built separately and has not been run
-through this sequence. Full title-menu rendering remains unverified.
+slider and confirmation glyph. This does not verify the UI on the newer
+renderer: its previous live run crashed before the notices. That reference
+session was subsequently closed for Cat Quest III orientation testing; the
+installed executable now includes the newer renderer and the Cat compositor
+fix. The reference executable and PDB are preserved as
+`zig-out/bin/game-run-pre-cat-orientation.*` for Yotei comparisons. The newer
+build has not been verified through this UI sequence. Full title-menu
+rendering remains unverified.
 
 The reference resolved its roughly 6,042 resources in about 18 minutes;
 initial scene frames then spent 267 and 162 seconds preparing dispatches.

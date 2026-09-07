@@ -1004,14 +1004,16 @@ scheduler and Vulkan backend. Observed startup work now includes:
   metadata. Vulkan presents that resident attachment with the corresponding
   vertical orientation, and diagnostic materialization applies the same row
   order, keeping both the live window and captured gameplay upright.
-- Cat Quest III emits the same identity sample compositor as a non-indexed,
-  three-vertex procedural full-screen triangle. The geometry matcher accepts
-  that one-instance form alongside the six-index quad; the existing exact
-  fragment-shader, resource, format, and full-extent checks still gate the
-  resident-copy fast path. Its negative-height viewport therefore reaches the
-  scanout-orientation metadata, fixing the vertically inverted startup splash
-  without treating ordinary textured triangles as full-surface copies. Save
-  directory enumeration now requires at least one byte of title-owned payload
+- Cat Quest III uses a non-indexed, three-vertex procedural full-screen
+  compositor whose vertex shader independently applies runtime UV scale/bias.
+  Its negative viewport does not necessarily reverse source rows. The identity
+  sample-copy shortcut is therefore restricted to the existing indexed-quad
+  path; procedural triangles execute the translated vertex and fragment
+  shaders, preserving their actual sampling orientation. An eight-case GPU
+  probe covers both viewport signs, both UV orientations, and guest-memory
+  and resident render-target sources. Live intro captures confirm upright
+  artwork, subtitles, and the Skip prompt. Save directory enumeration now
+  requires at least one byte of title-owned payload
   outside `sce_sys`. This restores the transaction visibility expected from
   the platform when a prior run was interrupted after creating metadata and an
   empty file, rather than advertising that partial directory as a loadable

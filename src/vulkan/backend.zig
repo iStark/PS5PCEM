@@ -14016,7 +14016,10 @@ pub const Renderer = struct {
         {
             return;
         }
-        if (fragment_image_count == 1 and
+        // Procedural triangles can transform UVs independently of positions,
+        // including a runtime Y scale/bias. Their viewport sign alone cannot
+        // determine copy orientation; preserve the translated vertex shader.
+        if (fragment_image_count == 1 and draw.index_count != null and
             hasFullscreenSampleBlitGeometry(draw) and
             matchesFullscreenSampleBlit(fragment_analysis.program.instructions.items))
         {

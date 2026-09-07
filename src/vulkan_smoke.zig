@@ -1355,6 +1355,71 @@ fn runStorageImageReuseCase(allocator: std.mem.Allocator, count: usize) !void {
     for (renderer.storage_image_cache.items) |cached| try std.testing.expectEqual(@as(usize, 0), cached.pin_count);
 }
 
+fn runFullscreenOrientationProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    // Procedural triangle: POS.y = 2*y-1, PARAM0.y = (1-y)*scale+bias.
+    // A negative viewport therefore does not imply flipped texture rows.
+    const vertex = [_]u32{ 0x34020a81, 0x36040a82, 0x7e0002f2, 0xf4280004, 0xfa000000, 0x36020282, 0x7e040d02, 0x7e060d01, 0xd5410001, 0x03ce04f4, 0x080804f2, 0xd5410002, 0x03ce06f4, 0xbf8cc07f, 0xd5410003, 0x00080103, 0xd5410004, 0x000c0304, 0xf80008cf, 0x00000102, 0xf8000203, 0x00000403, 0xbf810000 };
+    const fragment = [_]u32{ 0xbfa00001, 0xbefc0310, 0xc8100000, 0xc8140100, 0xc8110001, 0xc8150101, 0xf0900f08, 0x00400004, 0xbf8c3f70, 0x5e000300, 0x5e020702, 0xf8001c0f, 0x00000100, 0xbf810000 };
+    for (vertex, 0..) |word, i| guest.word(0x700 + i * 4, word);
+    for (fragment, 0..) |word, i| guest.word(0x900 + i * 4, word);
+    const image = sampledImageDescriptorWords(0x8000, 8, 8);
+    const layout = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&image));
+    const surface = try layout.base();
+    for (0..8) |y| for (0..8) |x| {
+        guest.word(0x8000 + @as(usize, @intCast(try surface.sourceByteOffset(@intCast(x), @intCast(y), 0, 0))), 0xff110000 | (@as(u32, @intCast(x * 30)) << 8) | @as(u32, @intCast(10 + y * 30)));
+    };
+    var state = gpu.State{};
+    const vertex_stage = gpu.resources.ShaderStage.vertex;
+    const pixel_stage = gpu.resources.ShaderStage.pixel;
+    try state.writeRegister(.shader, vertex_stage.programRegisterBase(), 7);
+    try state.writeRegister(.shader, vertex_stage.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, vertex_stage.programRegisterBase() + 3, 12 << 1);
+    try state.writeRegister(.shader, pixel_stage.programRegisterBase(), 9);
+    try state.writeRegister(.shader, pixel_stage.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, pixel_stage.programRegisterBase() + 3, 12 << 1);
+    for ([_]u32{ 0x12000, 0, 16, 0 }, 0..) |word, i|
+        try state.writeRegister(.shader, vertex_stage.userDataBase() + 8 + @as(u32, @intCast(i)), word);
+    for (image, 0..) |word, i| try state.writeRegister(.shader, pixel_stage.userDataBase() + @as(u32, @intCast(i)), word);
+    for (0..4) |i| try state.writeRegister(.shader, pixel_stage.userDataBase() + 8 + @as(u32, @intCast(i)), 0);
+    const context = [_][2]u32{
+        .{ 0x319, 0 }, .{ 0x31b, 0 },             .{ 0x31c, 10 << 2 },                 .{ 0x31d, 0 },
+        .{ 0x390, 0 }, .{ 0x3b0, (7 << 14) | 7 }, .{ 0x3b8, 1 << 24 },                 .{ 0x08e, 0xf },
+        .{ 0x00c, 0 }, .{ 0x00d, 8 | (8 << 16) }, .{ 0x094, 1 << 31 },                 .{ 0x095, 8 | (8 << 16) },
+        .{ 0x1e0, 0 }, .{ 0x200, 0 },             .{ 0x202, (0xcc << 16) | (1 << 4) }, .{ 0x204, 0 },
+        .{ 0x205, 0 }, .{ 0x191, 0 },
+    };
+    for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+    const stream = [_]u32{ command(gpu.pm4.draw_index_auto, 2), 3, 0 };
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(guest.interface()), .allocator = allocator };
+    for (0..8) |case| {
+        // Repeat through a resident render target, as in a multipass UI.
+        if (case == 4) for (sampledImageDescriptorWords(0x2000, 8, 8), 0..) |word, i|
+            try state.writeRegister(.shader, pixel_stage.userDataBase() + @as(u32, @intCast(i)), word);
+        const negative_viewport = case % 4 < 2;
+        const reverse_uv = case % 2 != 0;
+        const destination = 0x2000 + case * 0x400;
+        try state.writeRegister(.context, 0x318, @intCast(destination >> 8));
+        for ([_]f32{ 4, 4, if (negative_viewport) -4 else 4, 4, 1, 0 }, 0..) |value, i|
+            try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value));
+        for ([_]f32{ 1, if (reverse_uv) -1 else 1, 0, if (reverse_uv) 1 else 0 }, 0..) |value, i|
+            guest.word(0x12000 + i * 4, @bitCast(value));
+        _ = try executor.execute(&stream);
+        if (renderer.last_draw_error) |err| return err;
+        try renderer.flushPendingGuestWrites();
+        for (0..8) |y| for (0..8) |x| {
+            const source_y = if (negative_viewport != reverse_uv) y else 7 - y;
+            const expected: u32 = 0xff110000 | (@as(u32, @intCast(x * 30)) << 8) | @as(u32, @intCast(10 + source_y * 30));
+            const actual = std.mem.readInt(u32, guest.bytes[destination + (y * 8 + x) * 4 ..][0..4], .little);
+            if (actual != expected) std.debug.print("fullscreen orientation case={d} pixel={d},{d}: expected={x} actual={x}\n", .{ case, x, y, expected, actual });
+            try std.testing.expectEqual(expected, actual);
+        };
+    }
+    std.debug.print("fullscreen orientation passed: procedural triangle, both viewport signs, runtime UV scale/bias and guest-memory/resident sources\n", .{});
+}
+
 fn runResidentTargetReuseProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
     defer renderer.deinit();
@@ -3193,6 +3258,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--vector-images")) {
         try runVectorImageProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--fullscreen-orientation")) {
+        try runFullscreenOrientationProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--target-reuse")) {

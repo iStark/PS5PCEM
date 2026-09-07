@@ -132,14 +132,16 @@ behind them.
   scanout orientation, so the scene and UI are no longer vertically inverted.
   A 3,000-flip validation run remained submission-clean and reproduced the
   gameplay shown below.
-- Cat Quest III now enters its 3840×2160 Unity graphics loop and presents the
-  startup splash upright. Its identity compositor uses a non-indexed procedural
-  full-screen triangle rather than the previously recognized six-index quad.
-  The matched resident-copy path now accepts both one-instance forms while
-  retaining the existing shader, resource, format, and full-extent checks, so
-  the compositor's negative-height viewport reaches scanout without matching
-  ordinary textured triangles. Startup save discovery also hides interrupted
-  slots that contain only firmware metadata or empty staging files. A
+- Cat Quest III enters its 3840×2160 Unity graphics loop and presents the
+  illustrated intro, subtitles, and Skip prompt upright. Its procedural
+  full-screen triangle transforms UVs using runtime scale/bias values, so
+  viewport sign alone cannot determine the image's orientation. These draws
+  now retain the translated vertex shader instead of using the indexed-quad
+  resident-copy shortcut. An eight-case Vulkan regression verifies both
+  viewport signs and UV orientations with guest-memory and resident sources;
+  live captures confirm the correction during the animated intro. Startup
+  save discovery also hides interrupted slots that contain only firmware
+  metadata or empty staging files. A
   reproduced `path.txt`-only settings slot previously made the title fail on a
   missing `Data.dat` and wait forever after its 13-draw startup frame; it now
   completes the search without mounting that incomplete slot and continues
