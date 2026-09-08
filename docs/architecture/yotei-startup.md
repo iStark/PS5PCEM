@@ -2,6 +2,47 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Driver pipeline cache and buffer-wait experiment on 2026-09-09
+
+The driver pipeline cache now accepts and saves up to 1 GiB, using the same
+bound on both paths. The preceding 256 MiB limit silently discarded every save
+once the cache grew beyond it. Oversized saves now report their actual size and
+limit; successful saves above 256 MiB also report their size. This addresses
+repeat-launch compilation, not steady-state frame rendering. In the preceding
+run, two scene-loading frames spent 134.2 and 111.0 seconds compiling compute
+pipelines while the persisted file remained below the old cap.
+The ReleaseFast runner builds successfully; full Vulkan smoke runs both before
+and after saving the probe cache pass SDK 1.4.357.0 synchronization validation
+without warnings or errors. A large scene-cache reload is still to be measured.
+
+A separate experiment tracked each persistent buffer's last GPU use and
+replaced whole-queue host waits with allocation-specific waits. It included
+GPU dependencies for overlapping uses, deferred backing-allocation retirement,
+and separate upload/readback controls. CPU lifetime tests and Vulkan probes
+passed, but live frame times did not improve, so the experiment was removed.
+The normal renderer retains its preceding buffer synchronization behavior.
+
+The same-process ReleaseFast comparison waits for eight frames with stable
+draw/dispatch counts after loading and pipeline compilation. Each mode records
+12 frames and discards the first two; two additional warm-up frames separate
+the scoped modes. Four copy workers, 128 color targets, 2,560 MiB storage images
+and 512 MiB compute translations remain fixed. No builds, probes or captures
+run during the measured intervals.
+
+| Experimental wait policy | Measured flips | Median frame | Derived FPS | Buffer synchronization | Uploads/frame |
+| --- | --- | --- | --- | --- | --- |
+| Whole queue, before | 997–1006 | 3,524 ms | 0.284 | 916.5 ms | 1,312.4 MiB |
+| Scoped uploads | 1013–1022 | 3,551.5 ms | 0.282 | 913.7 ms | 1,308.2 MiB |
+| Scoped readbacks | 1029–1038 | 3,792.5 ms | 0.264 | 394.9 ms | 1,092.0 MiB |
+| Both scoped | 1045–1054 | 3,651.5 ms | 0.274 | 323.1 ms | 1,056.0 MiB |
+| Whole queue, after | 1058–1067 | 3,366.5 ms | 0.297 | 822.6 ms | 1,308.6 MiB |
+
+Draw medians stay at 289–292 and dispatch medians at 1,176–1,197. Compute
+pipeline compilation and storage-image eviction medians are zero. Reducing
+buffer synchronization and uploads does not establish a frame-rate gain:
+work and waits elsewhere in the frame still determine the final interval.
+These measurements do not establish complete title-menu rendering.
+
 ## Resource checkpoint preparation on 2026-09-09
 
 Retained decoded shaders now own the sorted resource and sampled-image

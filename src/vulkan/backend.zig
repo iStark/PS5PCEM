@@ -847,9 +847,9 @@ const maximum_htile_bytes = 8 * 1024 * 1024;
 /// On-disk driver pipeline cache. Reused across runs so per-title shader
 /// compilation is paid once instead of on every launch.
 const pipeline_cache_path = "vulkan_pipeline_cache.bin";
-/// Streamed 3D scenes exceed 64 MiB of driver pipelines. Keep persistence
+/// Streamed 3D scenes can exceed 256 MiB of driver pipelines. Keep persistence
 /// bounded without dropping every subsequent save once that scene is loaded.
-const maximum_pipeline_cache_bytes = 256 * 1024 * 1024;
+const maximum_pipeline_cache_bytes = 1024 * 1024 * 1024;
 
 /// Reads the persisted driver pipeline cache, if any. Any failure — missing
 /// file, unreadable file, unreasonable size — returns null; the caller then
@@ -877,7 +877,11 @@ fn savePipelineCacheBytes(self: *Renderer) void {
     if (self.device_functions.get_pipeline_cache_data(self.device, self.driver_pipeline_cache, &data_size, null) != vk.success) {
         return;
     }
-    if (data_size == 0 or data_size > maximum_pipeline_cache_bytes) return;
+    if (data_size == 0) return;
+    if (data_size > maximum_pipeline_cache_bytes) {
+        std.debug.print("[vulkan cache] persistence skipped: {d} MiB exceeds {d} MiB limit\n", .{ data_size / (1024 * 1024), maximum_pipeline_cache_bytes / (1024 * 1024) });
+        return;
+    }
     const bytes = self.allocator.alloc(u8, data_size) catch return;
     defer self.allocator.free(bytes);
     if (self.device_functions.get_pipeline_cache_data(self.device, self.driver_pipeline_cache, &data_size, bytes.ptr) != vk.success) {
@@ -889,6 +893,8 @@ fn savePipelineCacheBytes(self: *Renderer) void {
     const file = std.Io.Dir.cwd().createFile(io, pipeline_cache_path, .{ .truncate = true }) catch return;
     defer file.close(io);
     file.writePositionalAll(io, bytes, 0) catch return;
+    if (data_size > 256 * 1024 * 1024)
+        std.debug.print("[vulkan cache] persisted {d} MiB driver pipeline cache\n", .{data_size / (1024 * 1024)});
 }
 
 const GuestBufferEntry = struct {
