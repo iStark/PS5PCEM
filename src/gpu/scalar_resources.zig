@@ -13,6 +13,9 @@ const definitions = @import("index_bounds.zig");
 pub var definition_cache_enabled = std.atomic.Value(bool).init(true);
 pub var definition_cache_hits = std.atomic.Value(u64).init(0);
 pub var definition_cache_misses = std.atomic.Value(u64).init(0);
+pub var persistent_definition_cache_enabled = std.atomic.Value(bool).init(true);
+pub var persistent_definition_cache_hits = std.atomic.Value(u64).init(0);
+pub var persistent_definition_cache_misses = std.atomic.Value(u64).init(0);
 
 pub const Resolver = struct {
     bindings: *const shaders.StageBindings,
@@ -22,15 +25,25 @@ pub const Resolver = struct {
     snapshot: *const scalar.Evaluation,
     remaining: usize = 512,
     memoize_definitions: bool = true,
+    definition_cache: ?*definitions.ScalarDefinitionCache = null,
     definition_batch: definitions.ScalarDefinitionBatch = undefined,
     batch_enabled: bool = false,
 
     pub fn words(self: *Resolver, register: u32, before_pc: u32, output: []u32) !bool {
         self.batch_enabled = self.memoize_definitions and definition_cache_enabled.load(.monotonic);
         self.definition_batch = .{ .instructions = self.instructions, .graph = self.graph };
+        if (self.batch_enabled and persistent_definition_cache_enabled.load(.monotonic)) {
+            if (self.definition_cache) |cache| {
+                if (cache.matches(self.instructions, self.graph)) self.definition_batch.persistent = cache;
+            }
+        }
         defer if (self.batch_enabled) {
             _ = definition_cache_hits.fetchAdd(self.definition_batch.hits, .monotonic);
             _ = definition_cache_misses.fetchAdd(self.definition_batch.misses, .monotonic);
+            if (self.definition_batch.persistent != null) {
+                _ = persistent_definition_cache_hits.fetchAdd(self.definition_batch.persistent_hits, .monotonic);
+                _ = persistent_definition_cache_misses.fetchAdd(self.definition_batch.persistent_misses, .monotonic);
+            }
         };
         var before: usize = 0;
         while (before < self.instructions.len and self.instructions[before].pc < before_pc) : (before += 1) {}
@@ -231,19 +244,26 @@ test "scalar resource recovery follows nested loads after USER_DATA reuse" {
     // Even a matching producer must not bypass the descriptor bounds check.
     snapshot.registers[21] = .{ .known = true, .value = 0x700000, .producer_pc = 24 };
     var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = &memory, .read_fn = Memory.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot };
+    var cache = definitions.ScalarDefinitionCache.init(std.testing.allocator, &instructions, &graph);
+    defer cache.deinit();
     var words: [4]u32 = undefined;
     var reference_reads: usize = 0;
     var reference_remaining: usize = 0;
-    for ([_]bool{ false, true }) |enabled| {
-        resolver.memoize_definitions = enabled;
+    for (0..4) |mode| {
+        resolver.memoize_definitions = mode != 0;
+        resolver.definition_cache = if (mode >= 2) &cache else null;
         resolver.remaining = 512;
         memory.reads = 0;
         try std.testing.expect(try resolver.words(16, 24, &words));
         try std.testing.expectEqualSlices(u32, &descriptor, &words);
-        if (enabled) {
+        if (mode != 0) {
             try std.testing.expect(resolver.definition_batch.hits > 0);
             try std.testing.expectEqual(reference_reads, memory.reads);
             try std.testing.expectEqual(reference_remaining, resolver.remaining);
+            if (mode == 3) {
+                try std.testing.expect(resolver.definition_batch.persistent_hits > 0);
+                try std.testing.expectEqual(@as(u64, 0), resolver.definition_batch.persistent_misses);
+            }
         } else {
             reference_reads = memory.reads;
             reference_remaining = resolver.remaining;
@@ -266,6 +286,55 @@ test "scalar resource recovery follows nested loads after USER_DATA reuse" {
     std.mem.writeInt(u64, memory.data[136..144], 0x9000, .little);
     resolver.remaining = 512;
     try std.testing.expectError(error.MemoryReadFailed, resolver.words(16, 24, &words));
+    std.mem.writeInt(u64, memory.data[136..144], 0x10c0, .little);
+    // A warm cache must still respect the caller's recursion/work limit.
+    resolver.remaining = 1;
+    try std.testing.expect(!try resolver.words(16, 24, &words));
+    try std.testing.expectEqual(@as(usize, 0), resolver.remaining);
+    // Even entry register values are fresh across recoveries.
+    bindings.user_data[0] = 0x1008;
+    std.mem.writeInt(u64, memory.data[8..16], 0x1080, .little);
+    resolver.remaining = 512;
+    try std.testing.expect(try resolver.words(16, 24, &words));
+    try std.testing.expectEqualSlices(u32, &descriptor, &words);
+}
+
+test "persistent recovery rejects another program or control flow at the same PCs" {
+    const M = struct {
+        fn read(_: ?*anyopaque, _: u64, _: []u8) bool {
+            return false;
+        }
+    };
+    const original = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 4 }, .src0 = .{ .kind = .sgpr, .reg = 0 } },
+        .{ .pc = 4, .opcode = .s_endpgm },
+    };
+    var replacement = original;
+    replacement[0].src0.reg = 1;
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &original);
+    defer graph.deinit(std.testing.allocator);
+    var other_graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &replacement);
+    defer other_graph.deinit(std.testing.allocator);
+    var cache = definitions.ScalarDefinitionCache.init(std.testing.allocator, &original, &graph);
+    defer cache.deinit();
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    bindings.user_data_count = 2;
+    bindings.user_data[0] = 10;
+    bindings.user_data[1] = 20;
+    const snapshot = scalar.Evaluation{};
+    var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = null, .read_fn = M.read }, .instructions = &original, .graph = &graph, .snapshot = &snapshot, .definition_cache = &cache };
+    var words: [1]u32 = undefined;
+    try std.testing.expect(try resolver.words(4, 4, &words));
+    try std.testing.expectEqual(@as(u32, 10), words[0]);
+    resolver.instructions = &replacement;
+    try std.testing.expect(try resolver.words(4, 4, &words));
+    try std.testing.expectEqual(@as(u32, 20), words[0]);
+    try std.testing.expect(resolver.definition_batch.persistent == null);
+    resolver.instructions = &original;
+    resolver.graph = &other_graph;
+    try std.testing.expect(try resolver.words(4, 4, &words));
+    try std.testing.expectEqual(@as(u32, 10), words[0]);
+    try std.testing.expect(resolver.definition_batch.persistent == null);
 }
 
 test "scalar resource recovery rejects skipped writers and clobbered halves" {

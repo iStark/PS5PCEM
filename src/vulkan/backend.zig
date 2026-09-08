@@ -9820,6 +9820,9 @@ pub const Renderer = struct {
                 },
             );
         errdefer analysis.deinit(self.allocator);
+        // Optional memoization belongs to these exact validated code words.
+        // A replacement or eviction destroys it with the decoded analysis.
+        analysis.enableScalarDefinitionCache(self.allocator) catch {};
         self.frame_profile.shader_analysis_ns +|= elapsedHostNanoseconds(started);
         self.frame_profile.shader_analysis_misses += 1;
         const replacement = AnalyzedProgram{
@@ -24144,7 +24147,7 @@ fn scalarPointerTablePlan(
         else => 0,
     };
     const source = gpu.scalar_provenance.scalarRegisterIndex(multiply.src0) orelse return null;
-    var resolver = gpu.scalar_resources.Resolver{ .bindings = bindings, .reader = reader, .instructions = instructions, .graph = &analysis.graph, .snapshot = scalar };
+    var resolver = gpu.scalar_resources.Resolver{ .bindings = bindings, .reader = reader, .instructions = instructions, .graph = &analysis.graph, .snapshot = scalar, .definition_cache = analysis.scalar_definitions };
     const count = gpu.index_bounds.scalarUpperBound(instructions, &analysis.graph, multiply_index, @intCast(source)) orelse bound: {
         const limit = gpu.index_bounds.scalarGuardedLoopLimit(instructions, &analysis.graph, multiply_index, @intCast(source)) orelse return null;
         const value = if (gpu.scalar_provenance.scalarRegisterIndex(limit.operand)) |register| value: {
@@ -24277,6 +24280,7 @@ fn typedVectorIndexRange(
         .instructions = instructions,
         .graph = &analysis.graph,
         .snapshot = scalar,
+        .definition_cache = analysis.scalar_definitions,
     };
     var words: [8]u32 = undefined;
     if (!(resolver.words(fetch.src1.reg, fetch.pc, &words) catch false)) return null;
@@ -24528,6 +24532,7 @@ fn resolveVectorImageCandidates(
                 .instructions = instructions,
                 .graph = &analysis.graph,
                 .snapshot = scalar,
+                .definition_cache = analysis.scalar_definitions,
             };
             const register = gpu.scalar_provenance.scalarRegisterIndex(move.src0) orelse return null;
             if (!try resolver.words(@intCast(register), move.pc, words[component..][0..1])) return null;
@@ -24839,6 +24844,7 @@ fn resolveProducedImageDescriptor(
         .instructions = analysis.program.instructions.items,
         .graph = &analysis.graph,
         .snapshot = scalar,
+        .definition_cache = analysis.scalar_definitions,
     };
     var words: [8]u32 = undefined;
     if (!try resolver.words(resource_sgpr, before_pc, &words)) return null;
@@ -24859,6 +24865,7 @@ fn resolveProducedSamplerDescriptor(
         .instructions = analysis.program.instructions.items,
         .graph = &analysis.graph,
         .snapshot = scalar,
+        .definition_cache = analysis.scalar_definitions,
     };
     var words: [4]u32 = undefined;
     if (!try resolver.words(sampler_sgpr, before_pc, &words)) return null;
@@ -25070,6 +25077,7 @@ fn resolveProducedBufferDescriptor(
         .instructions = analysis.program.instructions.items,
         .graph = &analysis.graph,
         .snapshot = scalar,
+        .definition_cache = analysis.scalar_definitions,
     };
     _ = depth;
     var words: [4]u32 = undefined;

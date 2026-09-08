@@ -211,6 +211,59 @@ fn uniqueScalarDefinition(definitions: ReachingDefinitions) ?ScalarDefinition {
     return if (definitions.count == 1) .{ .instruction = definitions.items[0] } else null;
 }
 
+/// Owned by one immutable decoded analysis, whose instruction/CFG allocations
+/// outlive this cache. Copy the graph's borrowed handles, not the address of
+/// the movable Analysis struct. The renderer serializes resource recovery.
+/// Only static writers (including ambiguity) are retained, never guest data.
+pub const ScalarDefinitionCache = struct {
+    const Key = struct { before: usize, register: u32 };
+    pub const maximum_entries = 4096;
+    allocator: std.mem.Allocator,
+    instructions: []const Instruction,
+    graph: Graph,
+    entries: std.AutoHashMapUnmanaged(Key, ?ScalarDefinition) = .empty,
+    reachable: ?[maximum_blocks]bool = undefined,
+    reachability_ready: bool = false,
+    allocation_failed: bool = false,
+
+    pub fn init(allocator: std.mem.Allocator, instructions: []const Instruction, graph: *const Graph) ScalarDefinitionCache {
+        return .{ .allocator = allocator, .instructions = instructions, .graph = graph.* };
+    }
+
+    pub fn deinit(self: *ScalarDefinitionCache) void {
+        self.entries.deinit(self.allocator);
+    }
+
+    /// A dispatch-local specialization or fetch expansion must not use the
+    /// original program's definitions, even when instruction PCs match.
+    pub fn matches(self: *const ScalarDefinitionCache, instructions: []const Instruction, graph: *const Graph) bool {
+        return self.instructions.ptr == instructions.ptr and self.instructions.len == instructions.len and
+            self.graph.blocks.items.ptr == graph.blocks.items.ptr and self.graph.blocks.items.len == graph.blocks.items.len and
+            self.graph.edges.items.ptr == graph.edges.items.ptr and self.graph.edges.items.len == graph.edges.items.len;
+    }
+
+    fn lookup(self: *ScalarDefinitionCache, before: usize, register: u32) struct { value: ?ScalarDefinition, hit: bool } {
+        const key = Key{ .before = before, .register = register };
+        if (self.entries.get(key)) |value| return .{ .value = value, .hit = true };
+        if (!self.reachability_ready) {
+            self.reachable = reachableBlocks(&self.graph);
+            self.reachability_ready = true;
+        }
+        const value = if (self.reachable) |*reachable| value: {
+            const definitions = reachingDefinitionsWithReachability(self.instructions, &self.graph, before, .{ .register = register }, null, reachable) orelse break :value null;
+            break :value uniqueScalarDefinition(definitions);
+        } else null;
+        // Exhaustion and allocation failure affect reuse only. Continue the
+        // same conservative analysis without changing errors or read order.
+        if (!self.allocation_failed and self.entries.count() < maximum_entries) {
+            self.entries.put(self.allocator, key, value) catch {
+                self.allocation_failed = true;
+            };
+        }
+        return .{ .value = value, .hit = false };
+    }
+};
+
 /// Borrowed, immutable instructions and CFG for one resource-word recovery.
 /// Cache only static definitions, including ambiguity; never guest values.
 /// Reinitialize before either borrowed input can change. Collisions replace
@@ -225,6 +278,9 @@ pub const ScalarDefinitionBatch = struct {
     reachability_ready: bool = false,
     hits: u64 = 0,
     misses: u64 = 0,
+    persistent: ?*ScalarDefinitionCache = null,
+    persistent_hits: u64 = 0,
+    persistent_misses: u64 = 0,
 
     pub fn lookup(self: *ScalarDefinitionBatch, before: usize, register: u32) ?ScalarDefinition {
         const slot: u6 = @truncate(before *% 37 +% register);
@@ -237,14 +293,20 @@ pub const ScalarDefinitionBatch = struct {
             }
         }
         self.misses += 1;
-        if (!self.reachability_ready) {
-            self.reachable = reachableBlocks(self.graph);
-            self.reachability_ready = true;
-        }
-        const value = if (self.reachable) |*reachable| value: {
+        const value = if (self.persistent) |cache| value: {
+            std.debug.assert(cache.matches(self.instructions, self.graph));
+            const result = cache.lookup(before, register);
+            if (result.hit) self.persistent_hits += 1 else self.persistent_misses += 1;
+            break :value result.value;
+        } else value: {
+            if (!self.reachability_ready) {
+                self.reachable = reachableBlocks(self.graph);
+                self.reachability_ready = true;
+            }
+            const reachable = if (self.reachable) |*reachable| reachable else break :value null;
             const definitions = reachingDefinitionsWithReachability(self.instructions, self.graph, before, .{ .register = register }, null, reachable) orelse break :value null;
             break :value uniqueScalarDefinition(definitions);
-        } else null;
+        };
         self.entries[slot] = .{ .before = before, .register = register, .value = value };
         self.valid |= bit;
         return value;
@@ -266,11 +328,17 @@ test "batched scalar definitions preserve joins, loops, clobbers and colliding k
     var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
     defer graph.deinit(std.testing.allocator);
     var batch = ScalarDefinitionBatch{ .instructions = &instructions, .graph = &graph };
+    var cache = ScalarDefinitionCache.init(std.testing.allocator, &instructions, &graph);
+    defer cache.deinit();
     for (0..3) |_| for (0..instructions.len) |before| {
         for (0..130) |register| {
             const expected = scalarDefinition(&instructions, &graph, before, @intCast(register));
             try std.testing.expectEqualDeep(expected, batch.lookup(before, @intCast(register)));
             try std.testing.expectEqualDeep(expected, batch.lookup(before, @intCast(register)));
+            // Each fresh batch stands for another descriptor or frame.
+            var next = ScalarDefinitionBatch{ .instructions = &instructions, .graph = &graph, .persistent = &cache };
+            try std.testing.expectEqualDeep(expected, next.lookup(before, @intCast(register)));
+            try std.testing.expectEqualDeep(expected, next.lookup(before, @intCast(register)));
         }
     };
     try std.testing.expect(batch.hits > 0);
@@ -282,6 +350,40 @@ test "batched scalar definitions preserve joins, loops, clobbers and colliding k
     try graph.edges.append(std.testing.allocator, .{ .from = 0, .to = @intCast(graph.blocks.items.len), .kind = .branch });
     batch = .{ .instructions = &instructions, .graph = &graph };
     try std.testing.expectEqual(null, batch.lookup(7, 23));
+}
+
+test "persistent scalar definitions remain bounded and tolerate allocation failure" {
+    const instructions = [_]Instruction{
+        .{ .pc = 0, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 0 } },
+        .{ .pc = 4, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    var cache = ScalarDefinitionCache.init(std.testing.allocator, &instructions, &graph);
+    defer cache.deinit();
+    for (0..ScalarDefinitionCache.maximum_entries + 32) |register| {
+        const expected = scalarDefinition(&instructions, &graph, 1, @intCast(register));
+        const result = cache.lookup(1, @intCast(register));
+        try std.testing.expect(!result.hit);
+        try std.testing.expectEqualDeep(expected, result.value);
+    }
+    try std.testing.expectEqual(ScalarDefinitionCache.maximum_entries, cache.entries.count());
+    const retained = cache.lookup(1, 0);
+    try std.testing.expect(retained.hit);
+    try std.testing.expectEqualDeep(ScalarDefinition{ .instruction = 0 }, retained.value.?);
+    try std.testing.expect(!cache.lookup(1, 0x10000).hit);
+    try std.testing.expectEqualDeep(ScalarDefinition.entry, cache.lookup(1, 0x10000).value.?);
+
+    var no_memory = std.heap.FixedBufferAllocator.init(&.{});
+    var fallback = ScalarDefinitionCache.init(no_memory.allocator(), &instructions, &graph);
+    defer fallback.deinit();
+    for (0..2) |_| {
+        const result = fallback.lookup(1, 0);
+        try std.testing.expect(!result.hit);
+        try std.testing.expectEqualDeep(retained.value, result.value);
+    }
+    try std.testing.expect(fallback.allocation_failed);
+    try std.testing.expectEqual(@as(u32, 0), fallback.entries.count());
 }
 
 const MaskProof = struct {

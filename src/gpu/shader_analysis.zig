@@ -6,6 +6,7 @@
 const std = @import("std");
 const rdna2 = @import("rdna2");
 const shaders = @import("shaders.zig");
+const ScalarDefinitionCache = @import("index_bounds.zig").ScalarDefinitionCache;
 
 pub const SpirvStage = rdna2.spirv.Stage;
 pub const SpirvOptions = rdna2.spirv.Options;
@@ -32,8 +33,22 @@ pub const Analysis = struct {
     graph: rdna2.control_flow.Graph,
     module: rdna2.ir.Module,
     pipeline_options: rdna2.ir.PipelineOptions = .{},
+    scalar_definitions: ?*ScalarDefinitionCache = null,
+
+    /// Enable only once this analysis is retained as an immutable program.
+    /// Specialized analyses deliberately start with their own empty state.
+    pub fn enableScalarDefinitionCache(self: *Analysis, allocator: std.mem.Allocator) !void {
+        if (self.scalar_definitions != null) return;
+        const cache = try allocator.create(ScalarDefinitionCache);
+        cache.* = ScalarDefinitionCache.init(allocator, self.program.instructions.items, &self.graph);
+        self.scalar_definitions = cache;
+    }
 
     pub fn deinit(self: *Analysis, allocator: std.mem.Allocator) void {
+        if (self.scalar_definitions) |cache| {
+            cache.deinit();
+            allocator.destroy(cache);
+        }
         self.module.deinit(allocator);
         self.graph.deinit(allocator);
         self.program.deinit(allocator);
@@ -457,6 +472,55 @@ test "analysis identifies a global buffer store as externally visible" {
     try std.testing.expect(analysis.hasExternalEffects());
     try std.testing.expect(analysis.hasBufferExternalEffects());
     try std.testing.expect(analysis.hasNonRasterEffects());
+}
+
+test "analysis owns definitions across moves but not shader replacement or uniform specialization" {
+    var memory = TestMemory{};
+    const code = [_]u32{
+        0xf400_1a80, 125 << 25, // s_load_dword vcc_lo, s0:s1
+        0xbefe_04c1, // s_mov_b64 exec, -1
+        0xbf8c_007f, // s_waitcnt
+        0xbf07_6a80, // s_cmp_lg_u32 0, vcc_lo
+        0xbf84_0002, // s_cbranch_scc0 end
+        0xf020_0f28, 0x0002_0400, // conditional image_store
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, index| memory.word(index * 4, word);
+    var decoded = try decode(std.testing.allocator, memory.reader(), 0, 16);
+    try decoded.enableScalarDefinitionCache(std.testing.allocator);
+    var moved = decoded;
+    defer moved.deinit(std.testing.allocator);
+    const cache = moved.scalar_definitions.?;
+    try moved.enableScalarDefinitionCache(std.testing.allocator);
+    try std.testing.expectEqual(cache, moved.scalar_definitions.?);
+    try std.testing.expect(cache.matches(moved.program.instructions.items, &moved.graph));
+    var batch = @import("index_bounds.zig").ScalarDefinitionBatch{
+        .instructions = moved.program.instructions.items,
+        .graph = &moved.graph,
+        .persistent = cache,
+    };
+    _ = batch.lookup(6, 106);
+    try std.testing.expect(cache.entries.count() > 0);
+
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    bindings.user_data_count = 2;
+    bindings.user_data[0] = 48;
+    for ([_]u32{ 0, 1, 0, 1 }) |enabled| {
+        memory.word(48, enabled);
+        var specialized = (try moved.specializeUniformBranches(std.testing.allocator, memory.reader(), &bindings)).?;
+        defer specialized.deinit(std.testing.allocator);
+        try std.testing.expect(specialized.scalar_definitions == null);
+        try std.testing.expect(!cache.matches(specialized.program.instructions.items, &specialized.graph));
+        try std.testing.expectEqual(if (enabled == 0) rdna2.Opcode.s_nop else .image_store, specialized.program.instructions.items[5].opcode);
+    }
+    // The code-word validation in the backend replaces this whole owner.
+    memory.word(0, 0xbf81_0000);
+    var replacement = try decode(std.testing.allocator, memory.reader(), 0, 16);
+    defer replacement.deinit(std.testing.allocator);
+    try replacement.enableScalarDefinitionCache(std.testing.allocator);
+    try std.testing.expect(replacement.scalar_definitions.? != cache);
+    try std.testing.expectEqual(@as(u32, 0), replacement.scalar_definitions.?.entries.count());
+    try std.testing.expect(!cache.matches(replacement.program.instructions.items, &replacement.graph));
 }
 
 test "covered raster draw permits exports and GS allocation but retains interrupts" {

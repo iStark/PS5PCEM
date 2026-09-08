@@ -2,6 +2,70 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Persistent scalar definitions on 2026-09-08
+
+The retained decoded shader now owns a second-level scalar definition cache.
+The existing 64-entry batch still handles repeated words within one recovery;
+its misses can reuse up to 4,096 exact instruction-index/register queries
+across descriptors, draws, dispatches and frames. Graph reachability is also
+retained. Entries grow lazily; reaching the limit or failing an allocation
+falls back to the same conservative solver. Ambiguous results remain cached
+as ambiguous, with no substitution of entry register values.
+
+The cache belongs to the immutable instruction and control-flow allocations,
+not their movable enclosing struct or a guest program address. Existing code
+word validation replaces and destroys it when guest code changes, and shader
+LRU eviction releases it. Uniform branch specialization remains dispatch-local
+and cannot borrow the original graph's definitions. Resource recovery checks
+the instruction/CFG identity before using a retained cache. Guest memory,
+USER_DATA and scalar snapshots are still read anew, with the same errors,
+read order and 512-step recovery budget.
+
+All 92 scalar-resource CPU tests pass in ReleaseSafe and ReleaseFast. Coverage
+compares uncached, batch-only, cold persistent and warm persistent recovery;
+it includes graph joins/loops, ambiguity, changing nested pointers, read
+failures, exhausted budgets, cache capacity and allocation failure. A separate
+ownership test checks moved analyses, replacement code at the same address,
+and alternating uniform specializations. SDK 1.4.357.0 synchronization
+validation passes the full Vulkan smoke, indirect image selection, scalar
+pointers, uniform-limit image loops and image/array/guard probes.
+
+The first live off/on/off comparison crosses a scene transition: enabled
+flips 937–940 execute 1,403–1,464 dispatches instead of roughly 1,135, and
+compute translation rises from about 65 ms to 537–801 ms. It is not used to
+claim a whole-frame improvement. Timing is repeated later in the same process,
+with batch memoization enabled, 128 color targets, the 2,560 MiB storage-image
+budget and four copy workers unchanged. Each interval measures 12 frames and
+discards the first two; no compilers, probes or captures run during timing.
+
+| Persistent definitions | Measured flips | Median frame | Derived FPS | Compute resource preparation | Compute translation |
+| --- | --- | --- | --- | --- | --- |
+| Off, before | 1092–1101 | 5,398.5 ms | 0.185 | 1,587.5 ms | 702 ms |
+| On | 1105–1114 | 4,602.5 ms | 0.217 | 1,149 ms | 685.5 ms |
+| Off, after | 1118–1127 | 4,995 ms | 0.200 | 1,554.5 ms | 675 ms |
+
+The enabled interval is 8.5% faster in FPS than the following control, and
+17.3% faster than the preceding control. Resource preparation falls 26–28%.
+The later control has similar draw time and fence waits to the enabled run,
+so its 8.5% comparison is the more conservative whole-frame result. GPU waits
+are higher in the first control; the full difference must not be attributed
+to definition lookup alone. Enabled recovery serves 931,508 persistent hits
+with no misses over its 12-frame interval, including the discarded frames.
+
+Workload medians are 296–302 draws and 1,160.5–1,166.5 dispatches, with about
+1,572.5 MiB uploaded and 530.5 MiB read back per frame. Storage-image eviction
+and compute pipeline compilation remain zero. Available host RAM ranges from
+about 2.3 to 2.6 GiB. These are live-scene timings on the same Ryzen 7 7700 /
+RTX 3070 Ti host, not a deterministic replay or a multiplier for other games.
+The diagnostic switch is restored to enabled after both comparisons.
+
+Separate GPU captures show textured tree geometry at flip 1024 (3328x1872,
+persistent cache disabled) and the brightness screen at flip 1088 (3840x2160,
+enabled), including the wolf, instruction, slider and Cross. These are different
+guest stages, not a pixel-equivalent before/after pair or evidence that the
+cache caused rendering progress. Complete title-menu rendering remains
+unverified.
+
 ## Resource preparation caches on 2026-09-08
 
 Uniform descriptor recovery now shares control-flow reachability and up to
