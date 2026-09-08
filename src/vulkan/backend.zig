@@ -354,6 +354,9 @@ pub const GuestMemory = struct {
     /// Returns the generation of an already tracked range without changing
     /// host page protection. Zero means the range is not tracked.
     gpu_generation: ?*const fn (?*anyopaque, u64, usize) u64 = null,
+    /// Full-range Wyhash(0) fingerprint without copying the source. Null
+    /// declines caching; CPU writes through aliases must affect this value.
+    fingerprint: ?*const fn (?*anyopaque, u64, usize) ?u64 = null,
     tracking_page_size: usize = 16 * 1024,
     /// Optional AGC registry lookup. A renderer embedding can expose relocated
     /// shader headers without coupling the API-neutral GPU module back to HLE.
@@ -887,6 +890,7 @@ const GuestBufferEntry = struct {
     /// Ordered fingerprint of the 16 KiB guest pages copied into device_local.
     /// Zero selects the legacy upload path when tracking is unavailable.
     page_generation: u64 = 0,
+    content_hash: ?u64 = null,
 };
 
 const ComputePipelineEntry = struct {
@@ -2220,6 +2224,30 @@ const CachedStorageImage = struct {
     valid: bool = true,
 };
 
+const SampledImageKey = struct {
+    image: gpu.ImageDescriptor,
+    sampler: gpu.resources.SamplerDescriptor,
+    dimension: rdna2.spirv.SampledImageDimension,
+
+    const Context = struct {
+        pub fn hash(_: @This(), key: SampledImageKey) u64 {
+            var sampler = key.sampler;
+            // Equality treats both signed zeros alike.
+            if (sampler.minimum_lod == 0) sampler.minimum_lod = 0;
+            if (sampler.maximum_lod == 0) sampler.maximum_lod = 0;
+            if (sampler.lod_bias == 0) sampler.lod_bias = 0;
+            var hasher = std.hash.Wyhash.init(sampledImageStateHash(key.image, sampler));
+            std.hash.autoHash(&hasher, key.image);
+            std.hash.autoHash(&hasher, key.dimension);
+            return hasher.final();
+        }
+
+        pub fn eql(_: @This(), a: SampledImageKey, b: SampledImageKey) bool {
+            return std.meta.eql(a, b);
+        }
+    };
+};
+
 const GraphicsResources = struct {
     images: [maximum_sampled_images]PreparedSampledImage = undefined,
     image_count: usize = 0,
@@ -2228,6 +2256,12 @@ const GraphicsResources = struct {
     dimensions: [maximum_sampled_images]rdna2.spirv.SampledImageDimension = undefined,
     mappings: [maximum_compute_sampled_mappings]gpu.ShaderSpirvSampledImageBinding = undefined,
     mapping_count: usize = 0,
+    image_lookup: std.HashMapUnmanaged(SampledImageKey, u32, SampledImageKey.Context, 80) = .empty,
+
+    fn destroy(self: *GraphicsResources, allocator: std.mem.Allocator) void {
+        self.image_lookup.deinit(allocator);
+        allocator.destroy(self);
+    }
 
     fn init(allocator: std.mem.Allocator) !*GraphicsResources {
         const result = try allocator.create(GraphicsResources);
@@ -2241,6 +2275,7 @@ const GraphicsResources = struct {
         const result = renderer.free_graphics_resources[renderer.free_graphics_resource_count];
         result.image_count = 0;
         result.mapping_count = 0;
+        result.image_lookup.clearRetainingCapacity();
         return result;
     }
 
@@ -2254,7 +2289,7 @@ const GraphicsResources = struct {
         if (renderer.free_graphics_resource_count < renderer.free_graphics_resources.len) {
             renderer.free_graphics_resources[renderer.free_graphics_resource_count] = self;
             renderer.free_graphics_resource_count += 1;
-        } else renderer.allocator.destroy(self);
+        } else self.destroy(renderer.allocator);
     }
 };
 
@@ -3326,7 +3361,7 @@ pub const Renderer = struct {
     fn destroyResourcePools(self: *Renderer) void {
         for (self.free_compute_resources[0..self.free_compute_resource_count]) |resource| self.allocator.destroy(resource);
         self.free_compute_resource_count = 0;
-        for (self.free_graphics_resources[0..self.free_graphics_resource_count]) |resource| self.allocator.destroy(resource);
+        for (self.free_graphics_resources[0..self.free_graphics_resource_count]) |resource| resource.destroy(self.allocator);
         self.free_graphics_resource_count = 0;
     }
 
@@ -4652,6 +4687,7 @@ pub const Renderer = struct {
                 victim.last_used_sequence = self.guest_buffer_sequence;
                 victim.gpu_dirty = false;
                 victim.page_generation = 0;
+                victim.content_hash = null;
                 entry_index = victim_index;
                 recycled_entry = true;
             }
@@ -4668,8 +4704,18 @@ pub const Renderer = struct {
                 track(memory.context, guest_address, size)
             else
                 0;
-            if (tracked_generation != 0 and (!self.draw_uploads_enabled or cache_hit)) {
-                if (entry.page_generation != tracked_generation) {
+            const source_hash = if (tracked_generation == 0 and size >= 64 * 1024 and
+                (!self.draw_uploads_enabled or cache_hit))
+            hash: {
+                const fingerprint = memory.fingerprint orelse break :hash null;
+                break :hash fingerprint(memory.context, guest_address, size);
+            } else null;
+            if ((tracked_generation != 0 or source_hash != null) and (!self.draw_uploads_enabled or cache_hit)) {
+                const changed = if (tracked_generation != 0)
+                    entry.page_generation != tracked_generation
+                else
+                    entry.content_hash != source_hash;
+                if (changed) {
                     // The backing buffer may still be read by an older timeline
                     // tick. Changed pages are uncommon; wait only on that path,
                     // while unchanged draws bind the persistent copy directly.
@@ -4681,6 +4727,7 @@ pub const Renderer = struct {
                     defer self.device_functions.unmap_memory(self.device, entry.device_local.memory);
                     const destination: [*]u8 = @ptrCast(mapped orelse return Error.MemoryMapFailed);
                     entry.page_generation = 0;
+                    entry.content_hash = null;
                     var observed_generation = tracked_generation;
                     var attempt: usize = 0;
                     while (true) : (attempt += 1) {
@@ -4690,6 +4737,13 @@ pub const Renderer = struct {
                         self.frame_profile.upload_bytes +%= size;
                         self.frame_profile.storage_upload_bytes +%= size;
                         self.buffer_uploads += 1;
+                        if (tracked_generation == 0) {
+                            // Fingerprint the bytes actually copied. A source
+                            // changed during the copy must not certify a torn
+                            // snapshot as matching the subsequent CPU contents.
+                            entry.content_hash = std.hash.Wyhash.hash(0, destination[0..size]);
+                            break;
+                        }
                         const after = if (memory.gpu_generation) |generation|
                             generation(memory.context, guest_address, size)
                         else
@@ -4723,6 +4777,7 @@ pub const Renderer = struct {
                     .allocation_cache_hit = cache_hit,
                 };
             }
+            entry.content_hash = null;
             if (self.draw_uploads_enabled) {
                 for (self.draw_upload_cache.items) |cached| {
                     // Smaller views of an already staged prefix share its
@@ -4813,6 +4868,7 @@ pub const Renderer = struct {
         const entry = for (self.guest_buffers.items) |*candidate| {
             if (candidate.guest_address == guest_address and candidate.size == destination.len) break candidate;
         } else return Error.GuestBufferNotStaged;
+        entry.content_hash = null;
         try self.readMapped(entry.device_local, destination);
         self.frame_profile.readback_bytes +%= destination.len;
         self.frame_profile.storage_readback_bytes +%= destination.len;
@@ -4822,6 +4878,7 @@ pub const Renderer = struct {
         if (index >= self.guest_buffers.items.len) return Error.GuestBufferNotStaged;
         const entry = &self.guest_buffers.items[index];
         if (!entry.gpu_dirty) return;
+        entry.content_hash = null;
         const entry_size = std.math.cast(usize, entry.size) orelse return Error.GuestBufferTooLarge;
         const size = @min(requested_size, entry_size);
         if (size == 0) return;
@@ -8782,6 +8839,7 @@ pub const Renderer = struct {
                     if (entry.guest_address != resources.addresses[index] or
                         entry.size != resources.sizes[index]) continue;
                     entry.gpu_dirty = true;
+                    entry.content_hash = null;
                     break;
                 }
                 continue;
@@ -15989,16 +16047,8 @@ pub const Renderer = struct {
             // SGPR pairs can name different images later in the same shader.
             // Resolve every instruction, sharing physical slots only when the
             // complete image, sampler and Vulkan view dimension still match.
-            var descriptor_index: ?u32 = null;
-            for (result.descriptors[0..result.image_count], result.samplers[0..result.image_count], result.dimensions[0..result.image_count], 0..) |existing_image, existing_sampler, existing_dimension, index| {
-                if (std.meta.eql(existing_image, image_descriptor) and
-                    std.meta.eql(existing_sampler, sampler_descriptor) and
-                    existing_dimension == sampled_dimension)
-                {
-                    descriptor_index = @intCast(index);
-                    break;
-                }
-            }
+            const image_key = SampledImageKey{ .image = image_descriptor, .sampler = sampler_descriptor, .dimension = sampled_dimension };
+            var descriptor_index = result.image_lookup.get(image_key);
             if (descriptor_index == null) {
                 if (result.image_count >= self.device_info.sampled_image_capacity) return Error.UnsupportedSampledImage;
                 const physical_index: u32 = @intCast(result.image_count);
@@ -16047,6 +16097,7 @@ pub const Renderer = struct {
                 result.samplers[physical_index] = sampler_descriptor;
                 result.dimensions[physical_index] = sampled_dimension;
                 result.image_count += 1;
+                try result.image_lookup.put(self.allocator, image_key, physical_index);
                 descriptor_index = physical_index;
             }
             result.mappings[result.mapping_count] = .{
@@ -16093,13 +16144,8 @@ pub const Renderer = struct {
         for (candidates.words[0..candidates.count]) |words| {
             const descriptor = try gpu.resources.decodeImageDescriptor(&words);
             const dimension = sampledImageDimensionForInstruction(inst.image_dimension, descriptor.image_type) orelse return false;
-            var slot: ?u32 = null;
-            for (result.descriptors[0..result.image_count], result.samplers[0..result.image_count], result.dimensions[0..result.image_count], 0..) |existing, existing_sampler, existing_dimension, index| {
-                if (std.meta.eql(existing, descriptor) and std.meta.eql(existing_sampler, sampler) and existing_dimension == dimension) {
-                    slot = @intCast(index);
-                    break;
-                }
-            }
+            const image_key = SampledImageKey{ .image = descriptor, .sampler = sampler, .dimension = dimension };
+            var slot = result.image_lookup.get(image_key);
             if (slot == null) {
                 if (result.image_count >= self.device_info.sampled_image_capacity) return Error.UnsupportedSampledImage;
                 slot = @intCast(result.image_count);
@@ -16115,6 +16161,7 @@ pub const Renderer = struct {
                 result.samplers[result.image_count] = sampler;
                 result.dimensions[result.image_count] = dimension;
                 result.image_count += 1;
+                try result.image_lookup.put(self.allocator, image_key, slot.?);
             }
             if (result.mapping_count == result.mappings.len) return Error.UnsupportedSampledImage;
             result.mappings[result.mapping_count] = .{
@@ -23931,6 +23978,40 @@ const BufferImageCandidates = struct {
     sampler: ?gpu.resources.SamplerDescriptor = null,
 };
 
+/// Stores candidate indices rather than duplicating the descriptor payload.
+/// Half-full open addressing keeps large material tables linear to recover.
+const ImageCandidateSet = struct {
+    slots: [maximum_sampled_images * 2]u16 = @splat(0),
+
+    fn append(self: *ImageCandidateSet, result: *BufferImageCandidates, words: [8]u32) bool {
+        const mask = self.slots.len - 1;
+        var slot: usize = @intCast(std.hash.Wyhash.hash(0, std.mem.asBytes(&words)) & mask);
+        while (self.slots[slot] != 0) : (slot = (slot + 1) & mask) {
+            if (std.mem.eql(u32, &result.words[self.slots[slot] - 1], &words)) return true;
+        }
+        if (result.count == result.words.len) return false;
+        result.words[result.count] = words;
+        result.count += 1;
+        self.slots[slot] = @intCast(result.count);
+        return true;
+    }
+};
+
+fn readBufferImageWords(reader: gpu.ShaderMemoryReader, buffer: gpu.BufferDescriptor, offset: u64) ![8]u32 {
+    var words: [8]u32 = @splat(0);
+    if (offset >= buffer.size_bytes) return words;
+    const count: usize = @intCast(@min((buffer.size_bytes - offset) / 4, words.len));
+    // One checked read also preserves zero-fill at a truncated V# boundary.
+    // Readers may split adjacent mappings: retain the former word-wise path
+    // when they cannot resolve the complete descriptor in one operation.
+    if (count != 0) reader.readWords(buffer.address + offset, words[0..count]) catch {
+        for (words[0..count], 0..) |*word, component| {
+            word.* = try reader.readU32(buffer.address + offset + component * 4);
+        }
+    };
+    return words;
+}
+
 const BufferTablePlan = struct {
     buffer: gpu.BufferDescriptor,
     first: u64,
@@ -24288,6 +24369,7 @@ fn resolveIndexedBufferImageCandidates(
     var seen: [maximum_sampled_images]u64 = undefined;
     var seen_count: usize = 0;
     var result = BufferImageCandidates{};
+    var unique = ImageCandidateSet{};
     var all_null = true;
     var offset = plan.first;
     while (offset < plan.limit) : (offset += plan.step) {
@@ -24300,22 +24382,10 @@ fn resolveIndexedBufferImageCandidates(
         if (seen_count == seen.len) return null;
         seen[seen_count] = target;
         seen_count += 1;
-        var words: [8]u32 = @splat(0);
-        for (&words, 0..) |*word, component| {
-            const address = target + component * 4;
-            if (address + 4 <= buffer.size_bytes) word.* = try reader.readU32(buffer.address + address);
-        }
+        const words = try readBufferImageWords(reader, buffer, target);
         all_null = all_null and std.mem.allEqual(u32, &words, 0);
         _ = gpu.resources.decodeImageDescriptor(&words) catch continue;
-        var duplicate = false;
-        for (result.words[0..result.count]) |previous| if (std.mem.eql(u32, &previous, &words)) {
-            duplicate = true;
-            break;
-        };
-        if (duplicate) continue;
-        if (result.count == result.words.len) return null;
-        result.words[result.count] = words;
-        result.count += 1;
+        if (!unique.append(&result, words)) return null;
     }
     if (result.count == 0 and !all_null) return null;
     return result;
@@ -24335,28 +24405,15 @@ fn resolveBufferImageCandidates(
         return resolveVectorImageCandidates(bindings, reader, analysis, scalar, sample);
     };
     var result = BufferImageCandidates{};
+    var unique = ImageCandidateSet{};
     var all_null = true;
     var offset = plan.first;
     while (offset < plan.limit) : (offset += plan.step) {
-        var words: [8]u32 = @splat(0);
-        for (&words, 0..) |*word, component| {
-            const byte = (offset & ~@as(u64, 3)) + component * 4;
-            if (byte + 4 <= plan.buffer.size_bytes) word.* = try reader.readU32(plan.buffer.address + byte);
-        }
+        const words = try readBufferImageWords(reader, plan.buffer, offset & ~@as(u64, 3));
         all_null = all_null and std.mem.allEqual(u32, &words, 0);
         const descriptor = gpu.resources.decodeImageDescriptor(&words) catch continue;
         if (descriptor.address == 0) continue;
-        var duplicate = false;
-        for (result.words[0..result.count]) |previous| {
-            if (std.mem.eql(u32, &previous, &words)) {
-                duplicate = true;
-                break;
-            }
-        }
-        if (duplicate) continue;
-        if (result.count == result.words.len) return null;
-        result.words[result.count] = words;
-        result.count += 1;
+        if (!unique.append(&result, words)) return null;
     }
     return if (result.count != 0 or all_null) result else null;
 }
@@ -27592,6 +27649,41 @@ test "unnormalized guest samplers satisfy Vulkan restrictions" {
     try std.testing.expectEqual(@as(f32, 0), info.mip_lod_bias);
     try std.testing.expectEqual(@as(f32, 0), info.minimum_lod);
     try std.testing.expectEqual(@as(f32, 0), info.maximum_lod);
+}
+
+test "image descriptor reads preserve split mappings and truncated buffer bounds" {
+    const Memory = struct {
+        bytes: [64]u8 = undefined,
+        word_only: bool = false,
+        inaccessible: bool = false,
+        fn read(context: ?*anyopaque, address: u64, destination: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (self.inaccessible or (self.word_only and destination.len > 4)) return false;
+            const offset = std.math.sub(u64, address, 0x1000) catch return false;
+            if (offset > self.bytes.len or destination.len > self.bytes.len - offset) return false;
+            @memcpy(destination, self.bytes[@intCast(offset)..][0..destination.len]);
+            return true;
+        }
+    };
+    var memory = Memory{};
+    for (&memory.bytes, 0..) |*byte, index| byte.* = @intCast(index);
+    const reader = gpu.ShaderMemoryReader{ .context = &memory, .read_fn = Memory.read };
+    var buffer = try gpu.resources.decodeBufferDescriptor(&.{ 0x1000, 0, 64, 0 });
+    for ([_]bool{ false, true }) |word_only| {
+        memory.word_only = word_only;
+        buffer.size_bytes = 64;
+        const words = try readBufferImageWords(reader, buffer, 3);
+        for (words, 0..) |word, index| {
+            try std.testing.expectEqual(std.mem.readInt(u32, memory.bytes[3 + index * 4 ..][0..4], .little), word);
+        }
+        buffer.size_bytes = 10;
+        const truncated = try readBufferImageWords(reader, buffer, 4);
+        try std.testing.expectEqual(@as(u32, 0x0706_0504), truncated[0]);
+        try std.testing.expect(std.mem.allEqual(u32, truncated[1..], 0));
+        try std.testing.expectEqual([_]u32{0} ** 8, try readBufferImageWords(reader, buffer, 10));
+    }
+    memory.inaccessible = true;
+    try std.testing.expectError(error.MemoryReadFailed, readBufferImageWords(reader, buffer, 0));
 }
 
 test "graphics SRT slots allow multiple images to share one sampler" {

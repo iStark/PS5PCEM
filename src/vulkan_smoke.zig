@@ -38,6 +38,12 @@ fn SizedGuestMemory(comptime size: usize) type {
             std.mem.writeInt(u32, self.bytes[address..][0..4], value, .little);
         }
 
+        fn fingerprint(context: ?*anyopaque, address: u64, length: usize) ?u64 {
+            const self: *Self = @ptrCast(@alignCast(context.?));
+            if (address > self.bytes.len or length > self.bytes.len - address) return null;
+            return std.hash.Wyhash.hash(0, self.bytes[@intCast(address)..][0..length]);
+        }
+
         fn interface(self: *Self) vulkan.GuestMemory {
             return .{ .context = self, .read = read, .write = write };
         }
@@ -3236,6 +3242,78 @@ fn runCountedImageLoopProbe(allocator: std.mem.Allocator, uniform_limit: bool) !
     std.debug.print("{s} image loop passed: BC4 images, dynamic SMEM offsets, page crossing and relocation\n", .{if (uniform_limit) "uniform-limit (3, 1, 6)" else "counted (6, null descriptor)"});
 }
 
+fn runBufferContentCacheProbe(allocator: std.mem.Allocator) !void {
+    const Memory = SizedGuestMemory(512 * 1024);
+    const guest = try allocator.create(Memory);
+    defer allocator.destroy(guest);
+    guest.* = .{};
+    var renderer = try vulkan.Renderer.init(allocator, .{ .defer_small_storage_writes = true });
+    defer renderer.deinit();
+    var memory = guest.interface();
+    memory.fingerprint = Memory.fingerprint;
+    _ = renderer.dcbBackend(memory);
+    const source = 0x10000;
+    const size = 64 * 1024;
+    const output = 0x30000;
+    const offset = 35000;
+    const code = [_]u32{
+        vop1(1, 0, 8),
+        0xe030_1000, 0x8000_0100, // load at v0 from source V#s0
+        0xbf8c_0f70,
+        0xe070_0000, 0x8001_0100, // store v1 to output V#s4
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+    const write_code = [_]u32{
+        vop1(1, 0, 8), vop1(1, 1, 255), 0x0bad_f00d,
+        0xe070_1000, 0x8000_0100, // GPU overwrites the previously cached source
+        0xbf81_0000,
+    };
+    for (write_code, 0..) |word, i| guest.word(0x400 + i * 4, word);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 9 << 1);
+    const userdata = [_]u32{ source, 4 << 16, size / 4, 0, output, 4 << 16, 1, 0, offset };
+    for (userdata, 0..) |word, i| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+    guest.word(source + offset, 0x1234_5678);
+    var previous_uploads: u64 = 0;
+    for (0..5) |pass| {
+        if (pass == 2) guest.word(source + offset, 0x8765_4321);
+        // A native write outside the texel currently fetched must still
+        // invalidate the full buffer; sparse content probes would miss it.
+        if (pass == 3) guest.word(source + size - 4, 0xaabb_ccdd);
+        if (pass == 4) try state.writeRegister(.shader, compute.userDataBase() + 8, size - 4);
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        var result: [4]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(output, &result);
+        const expected: u32 = if (pass < 2) 0x1234_5678 else if (pass < 4) 0x8765_4321 else 0xaabb_ccdd;
+        try std.testing.expectEqual(expected, std.mem.readInt(u32, &result, .little));
+        if (pass == 1 or pass == 4) try std.testing.expectEqual(previous_uploads, renderer.buffer_uploads);
+        if (pass == 2 or pass == 3) try std.testing.expectEqual(previous_uploads + 1, renderer.buffer_uploads);
+        previous_uploads = renderer.buffer_uploads;
+    }
+    try state.writeRegister(.shader, compute.programRegisterBase(), 4);
+    _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+    var result: [4]u8 = undefined;
+    try renderer.readbackGuestStorageBuffer(output, &result);
+    try std.testing.expectEqual(@as(u32, 0x0bad_f00d), std.mem.readInt(u32, &result, .little));
+    try renderer.flushPendingGuestWrites();
+    renderer.guest_memory.?.fingerprint = null;
+    guest.word(source + size - 4, 0x0102_0304);
+    _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+    try renderer.readbackGuestStorageBuffer(output, &result);
+    try std.testing.expectEqual(@as(u32, 0x0102_0304), std.mem.readInt(u32, &result, .little));
+    renderer.guest_memory.?.fingerprint = Memory.fingerprint;
+    _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+    try renderer.readbackGuestStorageBuffer(output, &result);
+    try std.testing.expectEqual(@as(u32, 0x0102_0304), std.mem.readInt(u32, &result, .little));
+    std.debug.print("buffer content cache passed: unchanged reuse, full-range native writes, GPU overwrites and unavailable-fingerprint fallback\n", .{});
+}
+
 fn runLargeIndirectImageProbe(allocator: std.mem.Allocator) !void {
     const count = 4352;
     const groups = count + 1;
@@ -3705,6 +3783,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--large-indirect-images")) {
         try runLargeIndirectImageProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-content-cache")) {
+        try runBufferContentCacheProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--host-readback")) {

@@ -2,6 +2,62 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Buffer and descriptor preparation on 2026-09-08
+
+Large material tables now deduplicate recovered image descriptors through a
+bounded hash set and find prepared graphics views through a reusable hash map.
+Both retain insertion order and compare complete descriptors on collisions;
+instruction mappings, sampler state and view dimensions keep their existing
+semantics. Reading one T# uses one checked range read, retaining zero-fill at
+the buffer boundary. This removes quadratic scans and repeated address lookups
+without reducing the number of guest draws or dispatches.
+
+With `PS5_GPU_BUFFER_CONTENT_CACHE=1`, untracked storage buffers of at least
+64 KiB can reuse their persistent upload when a full-range content fingerprint
+matches. This option is disabled by default. The native memory callback reads
+the complete resolved range, so writes through another CPU alias are visible.
+Changed buffers retain the existing synchronization and upload path, and the
+cache records the bytes actually copied. GPU writes and readbacks invalidate
+the fingerprint. Missing callbacks and smaller buffers retain their previous
+path; page tracking remains opt-in. Descriptor reads also retain a word-wise
+fallback for readers that cannot resolve adjacent mappings in one operation.
+A focused CPU test covers this fallback, unaligned addresses, truncated bounds
+and inaccessible memory.
+
+The GPU regression covers unchanged reuse, native writes both inside and outside
+the currently fetched word, GPU overwrites and fallback when fingerprinting is
+unavailable. It, the complete Vulkan smoke, 4352-view indirect-image test,
+descriptor reuse, selected indices, workgroup tables, unsupported-texture
+continuation and buffer reuse pass with the SDK validation layer enabled.
+
+The live Ryzen 7 7700 / RTX 3070 Ti run completes the intros and animated loading
+indicator and displays the first Digital Deluxe Bonus notice, including text
+and Cross, in the captured GPU frame at flip 960. A same-process comparison
+then disables and restores only the fingerprint callback. No guest inputs,
+manual acknowledgements or rendering skips were added. Transition frames are
+excluded from these medians:
+
+| Buffer content cache | Flips | Frame time | Buffer upload | Draws / compute dispatches |
+| --- | --- | --- | --- | --- |
+| Enabled initially | 955–964 | 7,906 ms | 1.19 GiB | 288.5 / 1,137 |
+| Disabled | 967–978 | 8,428.5 ms | 7.55 GiB | 287 / 1,137.5 |
+| Enabled again | 981–992 | 9,629 ms | 1.19 GiB | 288 / 1,137 |
+
+The roughly 6.3-fold reduction in buffer upload is repeatable; an FPS gain is
+not established by this comparison. Subsequent system counters show only
+778 MiB available physical memory on the 32 GB machine, about 60.9 GB committed
+against a 62.4 GB limit, and active page reads. Memory pressure and changing
+execution costs limit conclusions from the timing windows. Therefore full-range
+fingerprinting remains opt-in. These measurements precede the final adjacent-
+mapping read fallback and the runner's default-off wiring, which have separate
+CPU/GPU and build validation.
+
+CPU samples still include substantial copies, texture tiling/detiling, allocation
+churn and GPU waits. Fence waits alone have medians near one second per frame.
+Keeping compatible render/compute image consumers on resident GPU resources
+remains a larger optimization target. Neither tenfold acceleration nor complete
+title-menu rendering has been established by this work.
+
 ## Scene counter correction on 2026-09-08
 
 The newer renderer's startup crash was reproduced after streamed scene loading.

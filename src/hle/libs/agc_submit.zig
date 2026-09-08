@@ -874,6 +874,12 @@ pub fn readGuestMemory(_: ?*anyopaque, address: u64, bytes: []u8) bool {
     return true;
 }
 
+pub fn fingerprintGuestMemory(_: ?*anyopaque, address: u64, size: usize) ?u64 {
+    const resolved = resolveGuestMemoryAddress(address, size) orelse return null;
+    const source: [*]const u8 = @ptrFromInt(resolved);
+    return std.hash.Wyhash.hash(0, source[0..size]);
+}
+
 pub fn writeGuestMemory(context: ?*anyopaque, address: u64, bytes: []const u8) bool {
     if (video_out.writeLabelMemory(address, bytes)) return true;
     // Fence/write-data packets only publish one or two words. Reject those

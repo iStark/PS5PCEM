@@ -600,6 +600,10 @@ fn run(init: std.process.Init) !bool {
     const enable_automatic_deferred_storage_writes = defer_small_storage_writes;
     const enable_gpu_page_tracker = enable_gpu_experimental or
         (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_PAGE_TRACKER") catch false);
+    const enable_gpu_buffer_content_cache = init.minimal.environ.containsUnempty(
+        allocator,
+        "PS5_GPU_BUFFER_CONTENT_CACHE",
+    ) catch false;
     if (builtin.os.tag == .windows and !force_headless) live_gpu: {
         host_window.init(1280, 720) catch |err| {
             try stderr.print("live Vulkan window unavailable: {s}; continuing headless\n", .{@errorName(err)});
@@ -670,6 +674,10 @@ fn run(init: std.process.Init) !bool {
             .context = if (enable_gpu_page_tracker) address_space else null,
             .read = runtime.firmware.libs.agc_submit.readGuestMemory,
             .write = runtime.firmware.libs.agc_submit.writeGuestMemory,
+            .fingerprint = if (enable_gpu_buffer_content_cache)
+                runtime.firmware.libs.agc_submit.fingerprintGuestMemory
+            else
+                null,
             .shader_header = runtime.firmware.libs.agc_submit.findShaderHeader,
             .track_gpu_read = if (enable_gpu_page_tracker)
                 runtime.firmware.libs.agc_submit.trackGpuRead
@@ -694,7 +702,7 @@ fn run(init: std.process.Init) !bool {
             native.height,
         });
         try out.print(
-            "  GPU flags ir={d} ssa={d} async_pso={d} aliases={d} depth_io={d} image_state_opt={d} timeline={d} timeline_auto={d} defer_storage={d} defer_storage_auto={d} page_tracker={d}\n",
+            "  GPU flags ir={d} ssa={d} async_pso={d} aliases={d} depth_io={d} image_state_opt={d} timeline={d} timeline_auto={d} defer_storage={d} defer_storage_auto={d} page_tracker={d} buffer_content_cache={d}\n",
             .{
                 @intFromBool(enable_shader_ir),
                 @intFromBool(enable_shader_ssa),
@@ -707,6 +715,7 @@ fn run(init: std.process.Init) !bool {
                 @intFromBool(defer_small_storage_writes),
                 @intFromBool(enable_automatic_deferred_storage_writes),
                 @intFromBool(enable_gpu_page_tracker),
+                @intFromBool(enable_gpu_buffer_content_cache),
             },
         );
     }
