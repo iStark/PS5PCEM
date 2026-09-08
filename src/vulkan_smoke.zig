@@ -1433,6 +1433,71 @@ fn runSceneMaskProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("scene masks passed: u64 equality, signed i16 CMPX, preserved VCC and masked high-half stores across 64 lanes\n", .{});
 }
 
+fn runImageScratchProbe(allocator: std.mem.Allocator) !void {
+    const Memory = SizedGuestMemory(2 * 1024 * 1024);
+    const guest = try allocator.create(Memory);
+    defer allocator.destroy(guest);
+    guest.* = .{};
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    _ = renderer.dcbBackend(guest.interface());
+    const code = [_]u32{
+        vop1(1, 0, 8), vop1(1, 1, 9), vop1(1, 2, 10),
+        0xf020_0108, 0x0000_0200, // write one RGBA8_UINT pixel through T#s0
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 11 << 1);
+    var descriptors = [_][8]u32{
+        imageDescriptorWords(0x40000, 257, 129),
+        imageDescriptorWords(0x100000, 385, 97),
+    };
+    descriptors[1][3] |= @as(u32, @intFromEnum(gpu.resources.TileMode.render_target)) << 20;
+    for ([_]bool{ false, true, true, false, true }, 0..) |enabled, pass| {
+        renderer.image_scratch.enabled = enabled;
+        for (descriptors, 0..) |words, index| {
+            const descriptor = try gpu.resources.decodeImageDescriptor(&words);
+            const texture = try gpu.TextureLayout.fromImage(descriptor);
+            const view = try texture.subresource(0, 0, 1);
+            const address: usize = @intCast(descriptor.address);
+            const size: usize = @intCast(texture.required_source_bytes);
+            const sentinel: u8 = @intCast(50 + pass * 13 + index);
+            @memset(guest.bytes[address..][0..size], sentinel);
+            for (words, 0..) |word, component| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(component)), word);
+            const x: u32 = if (pass % 2 == 0) descriptor.width - 1 else 0;
+            const y: u32 = if (pass % 2 == 0) descriptor.height - 1 else 0;
+            const value: u8 = @intCast(171 + pass + index);
+            try state.writeRegister(.shader, compute.userDataBase() + 8, x);
+            try state.writeRegister(.shader, compute.userDataBase() + 9, y);
+            try state.writeRegister(.shader, compute.userDataBase() + 10, value);
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+            if (pass == 2) {
+                const Failure = struct {
+                    fn write(_: ?*anyopaque, _: u64, _: []const u8) bool {
+                        return false;
+                    }
+                };
+                renderer.guest_memory.?.write = Failure.write;
+                try std.testing.expectError(error.GuestMemoryWriteFailed, renderer.flushPendingGuestWrites());
+                renderer.guest_memory.?.write = Memory.write;
+            }
+            try renderer.flushPendingGuestWrites();
+            const pixel: usize = @intCast(try view.sourceByteOffset(x, y, 0, 0));
+            try std.testing.expectEqualSlices(u8, &.{ value, 0, 0, 0 }, guest.bytes[address + pixel ..][0..4]);
+            // Every other logical pixel and all tiled/row padding must survive
+            // pooling, CPU updates, partial GPU writes and callback failures.
+            try std.testing.expect(std.mem.allEqual(u8, guest.bytes[address..][0..pixel], sentinel));
+            try std.testing.expect(std.mem.allEqual(u8, guest.bytes[address + pixel + 4 ..][0 .. size - pixel - 4], sentinel));
+        }
+    }
+    try std.testing.expect(renderer.image_scratch.entries[0].len != 0);
+    std.debug.print("image scratch passed: alternating pooled/unpooled extents, linear/RB+ padding, native updates, partial GPU writes and failed-write retry\n", .{});
+}
+
 fn runStorageImageReuseProbe(allocator: std.mem.Allocator) !void {
     for ([_]usize{ 320, 1152 }) |count| try runStorageImageReuseCase(allocator, count);
     std.debug.print("storage image reuse passed: 320 resident views and 1152 queued writes under cache pressure\n", .{});
@@ -3847,6 +3912,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--storage-reuse")) {
         try runStorageImageReuseProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--image-scratch")) {
+        try runImageScratchProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--bc4")) {

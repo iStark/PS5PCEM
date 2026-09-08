@@ -846,80 +846,13 @@ pub const Layout = struct {
     pub fn detile(self: Layout, source: []const u8, destination: []u8) Error!void {
         try self.validateCopies(source.len, destination.len);
         return switch (self.block.bytes_per_element) {
-            1 => self.detileElements(1, source, destination),
-            2 => self.detileElements(2, source, destination),
-            4 => self.detileElements(4, source, destination),
-            8 => self.detileElements(8, source, destination),
-            16 => self.detileElements(16, source, destination),
+            1 => self.copyElements(false, 1, source, destination),
+            2 => self.copyElements(false, 2, source, destination),
+            4 => self.copyElements(false, 4, source, destination),
+            8 => self.copyElements(false, 8, source, destination),
+            16 => self.copyElements(false, 16, source, destination),
             else => Error.UnsupportedElementSize,
         };
-    }
-
-    fn detileElements(
-        self: Layout,
-        comptime element_bytes: usize,
-        source: []const u8,
-        destination: []u8,
-    ) Error!void {
-        if (self.block.tile_mode.isLinear()) {
-            const row_bytes = @as(usize, self.width) * element_bytes;
-            const source_row_bytes = @as(usize, self.row_pitch_elements) * element_bytes;
-            for (0..self.layers) |layer_index| {
-                const physical_slice = @as(usize, self.first_slice) + layer_index;
-                const source_slice: usize = @intCast(self.source_slice_bytes * physical_slice + self.source_base_offset);
-                const staging_slice: usize = @intCast(self.staging_slice_bytes * layer_index);
-                for (0..self.height) |y| {
-                    const src = source_slice + y * source_row_bytes;
-                    const dst = staging_slice + y * row_bytes;
-                    @memcpy(destination[dst..][0..row_bytes], source[src..][0..row_bytes]);
-                }
-            }
-            return;
-        }
-
-        // Addressing inside a swizzle block repeats for every macro block. The
-        // former pixel-major loop recomputed divisions and checked coordinate
-        // arithmetic for every texel (16.7 million times for a 4096² image).
-        // Cache one local row of offsets and reuse it across all blocks in that
-        // macro row while keeping source and destination accesses contiguous.
-        var row_offsets: [256]u32 = undefined;
-        if (self.block.width > row_offsets.len) return Error.UnsupportedTileMode;
-        for (0..self.layers) |layer_index| {
-            const physical_slice: u32 = try addU32(self.first_slice, @intCast(layer_index));
-            const source_slice: usize = @intCast(try add(try multiply(self.source_slice_bytes, physical_slice), self.source_base_offset));
-            const staging_slice: usize = @intCast(try multiply(self.staging_slice_bytes, layer_index));
-            // The in-block address map is identical in every macro-block row.
-            // Make local_y the outer loop so each row is evaluated once per
-            // layer, rather than once per block_y. For a 3840x2160 64 KiB
-            // surface this removes 17 repeats of the expensive RB+ parity map.
-            for (0..self.block.height) |local_y_index| {
-                const local_y: u32 = @intCast(local_y_index);
-                for (0..self.block.width) |local_x_index| {
-                    row_offsets[local_x_index] = try self.block.byteOffset(@intCast(local_x_index), local_y);
-                }
-                for (0..self.blocks_per_column) |block_y_index| {
-                    const block_y: u32 = @intCast(block_y_index);
-                    const y = block_y * self.block.height + local_y;
-                    if (y >= self.height) continue;
-                    for (0..self.blocks_per_row) |block_x_index| {
-                        const block_x: u32 = @intCast(block_x_index);
-                        const x_base = block_x * self.block.width;
-                        if (x_base >= self.width) continue;
-                        const copy_width = @min(self.block.width, self.width - x_base);
-                        const block_index = @as(usize, block_y) * self.blocks_per_row + block_x;
-                        const source_block = source_slice + block_index * self.block.bytes;
-                        const block_xor = try self.block.blockXor(block_x, block_y, physical_slice);
-                        const destination_row = staging_slice +
-                            (@as(usize, y) * self.width + x_base) * element_bytes;
-                        for (0..copy_width) |local_x| {
-                            const src = source_block + (row_offsets[local_x] ^ block_xor);
-                            const dst = destination_row + local_x * element_bytes;
-                            @memcpy(destination[dst..][0..element_bytes], source[src..][0..element_bytes]);
-                        }
-                    }
-                }
-            }
-        }
     }
 
     /// Copies tightly packed staging bytes back to guest layout. Padding and
@@ -928,65 +861,74 @@ pub const Layout = struct {
         if (@as(u64, source.len) < self.staging_bytes) return Error.SourceTooSmall;
         if (@as(u64, destination.len) < self.required_source_bytes) return Error.DestinationTooSmall;
         return switch (self.block.bytes_per_element) {
-            1 => self.tileElements(1, source, destination),
-            2 => self.tileElements(2, source, destination),
-            4 => self.tileElements(4, source, destination),
-            8 => self.tileElements(8, source, destination),
-            16 => self.tileElements(16, source, destination),
+            1 => self.copyElements(true, 1, source, destination),
+            2 => self.copyElements(true, 2, source, destination),
+            4 => self.copyElements(true, 4, source, destination),
+            8 => self.copyElements(true, 8, source, destination),
+            16 => self.copyElements(true, 16, source, destination),
             else => Error.UnsupportedElementSize,
         };
     }
 
-    fn tileElements(
+    /// The swizzles XOR independent X/Y contributions. Build both axes once,
+    /// then finish a whole macro block while its tiled bytes are still cached.
+    /// This also evaluates macro/slice XOR once per block instead of per row.
+    fn copyElements(
         self: Layout,
+        comptime to_tiled: bool,
         comptime element_bytes: usize,
         source: []const u8,
         destination: []u8,
     ) Error!void {
+        const row_bytes = @as(usize, self.width) * element_bytes;
         if (self.block.tile_mode.isLinear()) {
-            const row_bytes = @as(usize, self.width) * element_bytes;
-            const destination_row_bytes = @as(usize, self.row_pitch_elements) * element_bytes;
+            const tiled_row_bytes = @as(usize, self.row_pitch_elements) * element_bytes;
             for (0..self.layers) |layer_index| {
                 const physical_slice = @as(usize, self.first_slice) + layer_index;
-                const destination_slice: usize = @intCast(self.source_slice_bytes * physical_slice + self.source_base_offset);
+                const tiled_slice: usize = @intCast(self.source_slice_bytes * physical_slice + self.source_base_offset);
                 const staging_slice: usize = @intCast(self.staging_slice_bytes * layer_index);
                 for (0..self.height) |y| {
-                    const src = staging_slice + y * row_bytes;
-                    const dst = destination_slice + y * destination_row_bytes;
+                    const tiled = tiled_slice + y * tiled_row_bytes;
+                    const linear = staging_slice + y * row_bytes;
+                    const src = if (to_tiled) linear else tiled;
+                    const dst = if (to_tiled) tiled else linear;
                     @memcpy(destination[dst..][0..row_bytes], source[src..][0..row_bytes]);
                 }
             }
             return;
         }
 
-        var row_offsets: [256]u32 = undefined;
-        if (self.block.width > row_offsets.len) return Error.UnsupportedTileMode;
+        var x_offsets: [256]u32 = undefined;
+        var y_offsets: [256]u32 = undefined;
+        if (self.block.width > x_offsets.len or self.block.height > y_offsets.len) return Error.UnsupportedTileMode;
+        for (0..self.block.width) |x| x_offsets[x] = try self.block.byteOffset(@intCast(x), 0);
+        for (0..self.block.height) |y| y_offsets[y] = try self.block.byteOffset(0, @intCast(y));
         for (0..self.layers) |layer_index| {
             const physical_slice: u32 = try addU32(self.first_slice, @intCast(layer_index));
-            const destination_slice: usize = @intCast(try add(try multiply(self.source_slice_bytes, physical_slice), self.source_base_offset));
+            const tiled_slice: usize = @intCast(try add(try multiply(self.source_slice_bytes, physical_slice), self.source_base_offset));
             const staging_slice: usize = @intCast(try multiply(self.staging_slice_bytes, layer_index));
-            for (0..self.block.height) |local_y_index| {
-                const local_y: u32 = @intCast(local_y_index);
-                for (0..self.block.width) |local_x_index| {
-                    row_offsets[local_x_index] = try self.block.byteOffset(@intCast(local_x_index), local_y);
-                }
-                for (0..self.blocks_per_column) |block_y_index| {
-                    const block_y: u32 = @intCast(block_y_index);
-                    const y = block_y * self.block.height + local_y;
-                    if (y >= self.height) continue;
-                    for (0..self.blocks_per_row) |block_x_index| {
-                        const block_x: u32 = @intCast(block_x_index);
-                        const x_base = block_x * self.block.width;
-                        if (x_base >= self.width) continue;
-                        const copy_width = @min(self.block.width, self.width - x_base);
-                        const block_index = @as(usize, block_y) * self.blocks_per_row + block_x;
-                        const destination_block = destination_slice + block_index * self.block.bytes;
-                        const block_xor = try self.block.blockXor(block_x, block_y, physical_slice);
-                        const source_row = staging_slice +
-                            (@as(usize, y) * self.width + x_base) * element_bytes;
+            for (0..self.blocks_per_column) |block_y_index| {
+                const block_y: u32 = @intCast(block_y_index);
+                const y_base = block_y * self.block.height;
+                if (y_base >= self.height) continue;
+                const copy_height = @min(self.block.height, self.height - y_base);
+                for (0..self.blocks_per_row) |block_x_index| {
+                    const block_x: u32 = @intCast(block_x_index);
+                    const x_base = block_x * self.block.width;
+                    if (x_base >= self.width) continue;
+                    const copy_width = @min(self.block.width, self.width - x_base);
+                    const block_index = @as(usize, block_y) * self.blocks_per_row + block_x;
+                    const tiled_block = tiled_slice + block_index * self.block.bytes;
+                    const block_xor = try self.block.blockXor(block_x, block_y, physical_slice);
+                    for (0..copy_height) |local_y| {
+                        const linear_row = staging_slice +
+                            ((@as(usize, y_base) + local_y) * self.width + x_base) * element_bytes;
+                        const row_xor = y_offsets[local_y] ^ block_xor;
                         for (0..copy_width) |local_x| {
-                            const src = source_row + local_x * element_bytes;
-                            const dst = destination_block + (row_offsets[local_x] ^ block_xor);
+                            const tiled = tiled_block + (x_offsets[local_x] ^ row_xor);
+                            const linear = linear_row + local_x * element_bytes;
+                            const src = if (to_tiled) linear else tiled;
+                            const dst = if (to_tiled) tiled else linear;
                             @memcpy(destination[dst..][0..element_bytes], source[src..][0..element_bytes]);
                         }
                     }

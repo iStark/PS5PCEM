@@ -3358,7 +3358,10 @@ pub const Renderer = struct {
     free_graphics_resources: [4]*GraphicsResources = undefined,
     free_graphics_resource_count: usize = 0,
 
+    image_scratch: @import("scratch_pool.zig").Pool = .{},
+
     fn destroyResourcePools(self: *Renderer) void {
+        self.image_scratch.deinit(self.allocator);
         for (self.free_compute_resources[0..self.free_compute_resource_count]) |resource| self.allocator.destroy(resource);
         self.free_compute_resource_count = 0;
         for (self.free_graphics_resources[0..self.free_graphics_resource_count]) |resource| resource.destroy(self.allocator);
@@ -4882,8 +4885,9 @@ pub const Renderer = struct {
         const entry_size = std.math.cast(usize, entry.size) orelse return Error.GuestBufferTooLarge;
         const size = @min(requested_size, entry_size);
         if (size == 0) return;
-        const bytes = try self.allocator.alloc(u8, size);
-        defer self.allocator.free(bytes);
+        var bytes_scratch = try self.image_scratch.acquire(self.allocator, size);
+        defer bytes_scratch.release();
+        const bytes = bytes_scratch.bytes;
         try self.readMapped(entry.device_local, bytes);
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
         if (!memory.write(memory.context, entry.guest_address, bytes)) return Error.GuestMemoryWriteFailed;
@@ -6642,11 +6646,13 @@ pub const Renderer = struct {
             {
                 continue;
             }
-            const linear = try self.allocator.alloc(u8, staging_bytes);
-            defer self.allocator.free(linear);
+            var linear_scratch = try self.image_scratch.acquire(self.allocator, staging_bytes);
+            defer linear_scratch.release();
+            const linear = linear_scratch.bytes;
             fillRepeatedPattern(linear, pattern[0..pattern_length]);
-            const allocation = try self.allocator.alloc(u8, allocation_bytes);
-            defer self.allocator.free(allocation);
+            var allocation_scratch = try self.image_scratch.acquire(self.allocator, allocation_bytes);
+            defer allocation_scratch.release();
+            const allocation = allocation_scratch.bytes;
             @memset(allocation, 0);
             subresource.tile(linear, allocation) catch continue;
             if (!memory.write(memory.context, descriptor.address, allocation)) {
@@ -6708,11 +6714,13 @@ pub const Renderer = struct {
                     {
                         break :blk;
                     }
-                    const linear = self.allocator.alloc(u8, staging_bytes) catch break :blk;
-                    defer self.allocator.free(linear);
+                    var linear_scratch = self.image_scratch.acquire(self.allocator, staging_bytes) catch break :blk;
+                    defer linear_scratch.release();
+                    const linear = linear_scratch.bytes;
                     fillRepeatedPattern(linear, &rg);
-                    const allocation = self.allocator.alloc(u8, allocation_bytes) catch break :blk;
-                    defer self.allocator.free(allocation);
+                    var allocation_scratch = self.image_scratch.acquire(self.allocator, allocation_bytes) catch break :blk;
+                    defer allocation_scratch.release();
+                    const allocation = allocation_scratch.bytes;
                     @memset(allocation, 0);
                     subresource.tile(linear, allocation) catch break :blk;
                     if (memory.write(memory.context, exposure.address, allocation)) {
@@ -11731,8 +11739,9 @@ pub const Renderer = struct {
         );
         try self.submitOneShot(command_buffer);
 
-        const frame = try self.allocator.alloc(u8, frame_bytes);
-        defer self.allocator.free(frame);
+        var frame_scratch = try self.image_scratch.acquire(self.allocator, frame_bytes);
+        defer frame_scratch.release();
+        const frame = frame_scratch.bytes;
         try self.readMapped(snapshot.readback, frame);
         self.frame_profile.readback_bytes += frame_bytes;
         self.frame_profile.target_readback_bytes += frame_bytes;
@@ -12876,8 +12885,9 @@ pub const Renderer = struct {
             return Error.UnsupportedColorTarget;
         };
         if (allocation_bytes > maximum_frame_bytes) return Error.UnsupportedColorTarget;
-        const tiled = try self.allocator.alloc(u8, allocation_bytes);
-        defer self.allocator.free(tiled);
+        var tiled_scratch = try self.image_scratch.acquire(self.allocator, allocation_bytes);
+        defer tiled_scratch.release();
+        const tiled = tiled_scratch.bytes;
         if (!memory.read(memory.context, target.descriptor.address, tiled)) return Error.GuestMemoryReadFailed;
         try target.layout.tile(frame, tiled);
         if (!memory.write(memory.context, target.descriptor.address, tiled)) return Error.GuestMemoryWriteFailed;
@@ -16501,28 +16511,34 @@ pub const Renderer = struct {
         );
         try self.submitOneShot(command_buffer);
 
-        const linear = try self.allocator.alloc(u8, snapshot.staging_bytes);
-        defer self.allocator.free(linear);
-        try self.readMapped(snapshot.transfer, linear);
-        if (self.traceCurrentGraphicsFrame()) {
-            const bytes_per_texel = storageImageBytesPerTexel(snapshot.descriptor.unified_format);
-            const nonzero = countNonzeroTexels(linear, bytes_per_texel);
-            std.debug.print(
-                "[vulkan dcb] traced storage-image result addr=0x{x} fmt={d} nonzero_texels={d}/{d}\n",
-                .{
-                    snapshot.descriptor.address,
-                    snapshot.descriptor.unified_format,
-                    nonzero,
-                    if (bytes_per_texel == 0) 0 else linear.len / bytes_per_texel,
-                },
-            );
-        }
-        const allocation = try self.allocator.alloc(u8, snapshot.allocation_bytes);
-        defer self.allocator.free(allocation);
+        // Finish the GPU copy before reading guest padding or mapping its result.
+        // Keep the mapping inside the CPU-only transform, and release it before
+        // invoking the guest write callback or changing cached image ownership.
+        try self.waitForSubmittedWork();
+        var allocation_scratch = try self.image_scratch.acquire(self.allocator, snapshot.allocation_bytes);
+        defer allocation_scratch.release();
+        const allocation = allocation_scratch.bytes;
         if (!memory.read(memory.context, snapshot.descriptor.address, allocation)) {
             return Error.GuestMemoryReadFailed;
         }
-        snapshot.subresource.tile(linear, allocation) catch return Error.UnsupportedStorageImage;
+        {
+            var mapped: ?*anyopaque = null;
+            if (self.device_functions.map_memory(self.device, snapshot.transfer.memory, 0, snapshot.staging_bytes, 0, &mapped) != vk.success) {
+                return Error.MemoryMapFailed;
+            }
+            defer self.device_functions.unmap_memory(self.device, snapshot.transfer.memory);
+            const source: [*]const u8 = @ptrCast(mapped orelse return Error.MemoryMapFailed);
+            const linear = source[0..snapshot.staging_bytes];
+            if (self.traceCurrentGraphicsFrame()) {
+                const bytes_per_texel = storageImageBytesPerTexel(snapshot.descriptor.unified_format);
+                const nonzero = countNonzeroTexels(linear, bytes_per_texel);
+                std.debug.print(
+                    "[vulkan dcb] traced storage-image result addr=0x{x} fmt={d} nonzero_texels={d}/{d}\n",
+                    .{ snapshot.descriptor.address, snapshot.descriptor.unified_format, nonzero, if (bytes_per_texel == 0) 0 else linear.len / bytes_per_texel },
+                );
+            }
+            snapshot.subresource.tile(linear, allocation) catch return Error.UnsupportedStorageImage;
+        }
         if (!memory.write(memory.context, snapshot.descriptor.address, allocation)) {
             return Error.GuestMemoryWriteFailed;
         }
@@ -16867,8 +16883,9 @@ pub const Renderer = struct {
             }
         }
 
-        const allocation = try self.allocator.alloc(u8, allocation_bytes);
-        defer self.allocator.free(allocation);
+        var allocation_scratch = try self.image_scratch.acquire(self.allocator, allocation_bytes);
+        defer allocation_scratch.release();
+        const allocation = allocation_scratch.bytes;
         if (!memory.read(memory.context, descriptor.address, allocation)) return Error.GuestMemoryReadFailed;
         const guest_content_hash = if (guest_page_generation == 0)
             std.hash.Wyhash.hash(0, allocation)
@@ -16898,8 +16915,9 @@ pub const Renderer = struct {
                 };
             }
         }
-        const linear = try self.allocator.alloc(u8, staging_bytes);
-        defer self.allocator.free(linear);
+        var linear_scratch = try self.image_scratch.acquire(self.allocator, staging_bytes);
+        defer linear_scratch.release();
+        const linear = linear_scratch.bytes;
         try subresource.detile(allocation, linear);
 
         if (matching_index) |index| {

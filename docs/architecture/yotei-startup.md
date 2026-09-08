@@ -2,6 +2,67 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Temporary image memory and swizzle locality on 2026-09-08
+
+Synchronous image staging and writeback now borrow temporary CPU buffers from
+a bounded pool. At most two buffers of up to 64 MiB are retained. Active leases
+are removed from the pool, so nested preparation uses distinct storage; small
+and oversized requests keep the ordinary allocation path. Pooling covers storage
+image staging, render-target materialization/writeback, storage-buffer readback
+and the existing empty-scene HDR fallback. It does not cache guest contents or
+weaken CPU/GPU visibility rules.
+
+Storage-image writeback also tiles directly from the completed, cached host
+transfer mapping. This removes a full intermediate linear allocation and copy.
+The GPU copy still completes before CPU access; the mapping is released before
+calling the guest write callback. Guest padding is preserved.
+
+CPU tile/detile now finish each macro block before advancing. The X and Y swizzle
+contributions are computed once, and macro/slice XOR once per block. This avoids
+repeated address calculations and revisiting tiled cache lines across the entire
+surface. The independent scalar addressing path is unchanged.
+
+The pool's lifetime/budget tests and all 72 tiling/dependency tests pass, including
+comparison with scalar addresses across mips, slices, padding, volumes and MSAA.
+A new GPU probe alternates pooled/unpooled staging and different linear/RB+
+extents, checking every byte outside a partial GPU write and retrying a failed
+guest write. The full Vulkan smoke, storage/target/buffer reuse, stencil UI,
+HTILE clears, streamed mips, BC4, array gradients and fullscreen orientation
+also pass with SDK validation enabled.
+
+A same-process pool comparison on the first Digital Deluxe Bonus screen gives
+the following medians, excluding two transition frames per interval. The image
+readback change is active throughout; buffer-content hashing and page tracking
+are disabled. The macro-block locality change is tested separately below.
+
+| Temporary pool | Flips | Frame time | Draws / compute dispatches |
+| --- | --- | --- | --- |
+| Enabled initially | 920–927 | 8,114 ms | 284 / 1,107.5 |
+| Disabled | 930–937 | 8,943.5 ms | 287.5 / 1,106.5 |
+| Enabled again | 940–947 | 8,041.5 ms | 287 / 1,106.5 |
+
+This is about a 10–11% FPS improvement from pooling on this workload. Across the
+complete ten-frame intervals, the process records 13.4 / 23.4 / 14.5 million
+page faults respectively; these Windows counters include faults handled in
+memory. Available physical memory ranges from about 1.5 to 3.0 GiB at interval
+boundaries. No guest confirmation or dispatch skipping was added. GPU frame
+960 retains the bonus text and Cross; complete menu rendering remains unverified.
+
+An isolated CPU test that allocates, fills, copies and hashes 32 pairs of 4K
+temporary buffers takes 473–523 ms without pooling and 238–256 ms with it, with
+identical checksums. These are operation timings, separate from the game FPS.
+
+With the game and compiler stopped, alternating the old and new tiling routines
+twice gives these medians across six batches per variant. Each batch processes
+eight 3840×2160 surfaces; output checksums and scalar-reference comparisons
+match. CPU conversion time falls by 15–29%. The combined changes have not yet
+been timed together in a steady gameplay interval.
+
+| Bytes per pixel | Tile before / after | Detile before / after |
+| --- | --- | --- |
+| 4 | 60.5 / 48.5 ms | 71.5 / 51 ms |
+| 8 | 106.5 / 90 ms | 126 / 89.5 ms |
+
 ## Buffer and descriptor preparation on 2026-09-08
 
 Large material tables now deduplicate recovered image descriptors through a
