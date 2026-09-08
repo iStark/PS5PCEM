@@ -2,6 +2,53 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Reusing color-target transfer memory on 2026-09-08
+
+Initial color attachments now stage their pixels directly into their existing
+coherent transfer buffer. The buffer supports uploads as well as readback, so
+initialization no longer allocates a separate Vulkan upload buffer and a linear
+CPU copy. Tiled input borrows the bounded image scratch pool. The attachment
+cache and its memory limit stay the same.
+
+Previously drawn attachments wait for queued work before reusing their transfer
+memory. Fresh allocations need no such wait. Prepared attachments remain pinned
+through recording, including multiple render targets. Clear metadata, tiling,
+guest reads and image transitions still follow the existing paths.
+
+The resident-target probe fills the attachment cache, samples its oldest entry
+while allocating new outputs, and reseeds an attachment with an earlier draw
+still queued. It compares every pixel against the transient-upload path,
+including untouched background pixels. Full smoke, mixed float/integer MRT and
+image-scratch probes also pass with the SDK 1.4.357.0 validation layer loaded and
+synchronization validation enabled.
+
+The ReleaseFast runner was measured on the Ryzen 7 7700 / RTX 3070 Ti, with four
+copy participants, page tracking and content hashing disabled, and frame capture
+disabled during timing. Each interval contains ten frames; the first two are
+excluded. The diagnostic `Renderer.reuse_color_target_transfer` switch changes
+only the upload path; image scratch pooling stays enabled in both modes.
+
+| Upload path | Flips | Median frame | Graphics setup | Draws / dispatches | Texture uploads |
+| --- | --- | --- | --- | --- | --- |
+| Resident, initially | 971–978 | 6,601.5 ms | 620 ms | 288.5 / 1,204 | 717,976 KiB |
+| Transient | 981–988 | 6,924.5 ms | 890.5 ms | 289 / 1,203 | 727,960 KiB |
+| Resident again | 991–998 | 6,080 ms | 651.5 ms | 286 / 1,204 | 318,312 KiB |
+| Transient, repeated | 1032–1039 | 6,949 ms | 870 ms | 289 / 1,203.5 | 717,976 KiB |
+| Resident, repeated | 1042–1049 | 6,096 ms | 659.5 ms | 286.5 / 1,204.5 | 316,165.5 KiB |
+
+The first two intervals have comparable resource traffic and indicate about
+4.9% more FPS: 0.144 to 0.151 FPS. Graphics setup drops by roughly 30%. Subsequent
+resident intervals also upload substantially fewer textures, so their larger
+total-frame improvement is **not** attributed entirely to this change. Available
+physical memory at interval boundaries ranges from about 1.7 to 2.5 GiB. This
+measurement does not establish a speedup for other titles or all Yotei scenes.
+
+The presented 3840×2160 Digital Deluxe Bonus frame matches the preceding build's
+capture byte for byte, including its text and Cross. This verifies the visible
+UI checkpoint, not complete menu/background rendering. One earlier transition
+frame still spends about 106 seconds compiling compute pipelines; initial shader
+compilation remains a separate limit.
+
 ## Parallel guest-memory copies on 2026-09-08
 
 Large AGC guest-memory reads and writes can now split their copies between the

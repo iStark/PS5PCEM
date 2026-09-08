@@ -659,6 +659,15 @@ const OwnedBuffer = struct {
     size: vk.DeviceSize,
 };
 
+const ColorTargetUpload = struct {
+    buffer: OwnedBuffer,
+    owns_buffer: bool,
+
+    fn deinit(self: ColorTargetUpload, renderer: *Renderer) void {
+        if (self.owns_buffer) renderer.destroyBuffer(self.buffer);
+    }
+};
+
 const OwnedImage = struct {
     handle: vk.Image,
     memory: vk.DeviceMemory,
@@ -3359,6 +3368,8 @@ pub const Renderer = struct {
     free_graphics_resource_count: usize = 0,
 
     image_scratch: @import("scratch_pool.zig").Pool = .{},
+    /// Diagnostic switch for comparing the transient and resident upload paths.
+    reuse_color_target_transfer: bool = true,
 
     fn destroyResourcePools(self: *Renderer) void {
         self.image_scratch.deinit(self.allocator);
@@ -10197,8 +10208,9 @@ pub const Renderer = struct {
 
         const source_bytes = std.math.cast(usize, target.layout.required_source_bytes) orelse
             return Error.UnsupportedColorTarget;
-        const tiled = try self.allocator.alloc(u8, source_bytes);
-        defer self.allocator.free(tiled);
+        var tiled_scratch = try self.image_scratch.acquire(self.allocator, source_bytes);
+        defer tiled_scratch.release();
+        const tiled = tiled_scratch.bytes;
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
         if (!memory.read(memory.context, target.descriptor.address, tiled))
             return Error.GuestMemoryReadFailed;
@@ -10221,6 +10233,50 @@ pub const Renderer = struct {
             return;
         }
         try self.stageColorTarget(target, reader, frame);
+    }
+
+    /// A target's coherent transfer buffer already has enough space for its
+    /// linear pixels. Seed it directly, then use it as the upload source until
+    /// a later image readback needs it again. The target stays pinned by the
+    /// caller through command recording, including all MRT attachments.
+    fn stageInitialColorUpload(self: *Renderer, index: usize) anyerror!ColorTargetUpload {
+        const snapshot = self.render_targets.items[index];
+        const target = snapshot.target;
+        const bytes = try colorTargetFrameBytes(target);
+        try self.flushPendingGuestWrite(target.descriptor.address, bytes);
+        const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
+        const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
+        const upload: ColorTargetUpload = if (self.reuse_color_target_transfer) blk: {
+            // An invalidated, previously drawn target can still have an upload
+            // in flight. Fresh allocations have no users to wait for. Image
+            // readbacks themselves finish before returning to their caller.
+            if (snapshot.gpu_generation != 0) try self.waitForSubmittedWork();
+            break :blk .{ .buffer = snapshot.readback, .owns_buffer = false };
+        } else .{
+            .buffer = try self.createBuffer(
+                bytes,
+                vk.buffer_usage_transfer_src_bit,
+                vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
+            ),
+            .owns_buffer = true,
+        };
+        errdefer upload.deinit(self);
+        if (upload.owns_buffer) {
+            const frame = try self.allocator.alloc(u8, bytes);
+            defer self.allocator.free(frame);
+            try self.stageInitialColorTarget(target, reader, frame);
+            try self.writeMapped(upload.buffer, frame);
+        } else {
+            var mapped: ?*anyopaque = null;
+            if (self.device_functions.map_memory(self.device, upload.buffer.memory, 0, bytes, 0, &mapped) != vk.success)
+                return Error.MemoryMapFailed;
+            defer self.device_functions.unmap_memory(self.device, upload.buffer.memory);
+            const frame: [*]u8 = @ptrCast(mapped orelse return Error.MemoryMapFailed);
+            try self.stageInitialColorTarget(target, reader, frame[0..bytes]);
+        }
+        self.frame_profile.upload_bytes +%= bytes;
+        self.frame_profile.target_upload_bytes +%= bytes;
+        return upload;
     }
 
     fn reportDccFastClearSeed(self: *Renderer, target: GuestColorTarget, texel: DccClearTexel) void {
@@ -10571,7 +10627,7 @@ pub const Renderer = struct {
 
         const readback = try self.createBuffer(
             frame_bytes,
-            vk.buffer_usage_transfer_dst_bit,
+            vk.buffer_usage_transfer_src_bit | vk.buffer_usage_transfer_dst_bit,
             vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
         );
         errdefer self.destroyBuffer(readback);
@@ -12121,24 +12177,11 @@ pub const Renderer = struct {
             .{ frame_bytes, cached_snapshot.initialized },
         );
 
-        var initial_upload: ?OwnedBuffer = null;
-        defer if (initial_upload) |buffer| self.destroyBuffer(buffer);
+        var initial_upload: ?ColorTargetUpload = null;
+        defer if (initial_upload) |upload| upload.deinit(self);
         const multisampled = target.descriptor.fragments_log2 != 0;
         if (!cached_snapshot.initialized and !multisampled) {
-            try self.flushPendingGuestWrite(target.descriptor.address, frame_bytes);
-            const frame = try self.allocator.alloc(u8, frame_bytes);
-            defer self.allocator.free(frame);
-            const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
-            const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
-            try self.stageInitialColorTarget(target, reader, frame);
-            initial_upload = try self.createBuffer(
-                frame_bytes,
-                vk.buffer_usage_transfer_src_bit,
-                vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
-            );
-            try self.writeMapped(initial_upload.?, frame);
-            self.frame_profile.upload_bytes += frame_bytes;
-            self.frame_profile.target_upload_bytes += frame_bytes;
+            initial_upload = try self.stageInitialColorUpload(target_index);
             if (report_checkpoints) std.debug.print("[vulkan dcb] first graphics draw: initial target staged\n", .{});
         }
 
@@ -12197,26 +12240,12 @@ pub const Renderer = struct {
                 );
             }
         }
-        var extra_uploads: [gpu.resources.color_target_count - 1]?OwnedBuffer = @splat(null);
-        defer for (extra_uploads) |buffer| if (buffer) |owned| self.destroyBuffer(owned);
+        var extra_uploads: [gpu.resources.color_target_count - 1]?ColorTargetUpload = @splat(null);
+        defer for (extra_uploads) |upload| if (upload) |prepared| prepared.deinit(self);
         for (extra_colors, extra_indices[0..extra_colors.len], 0..) |extra, extra_index, upload_index| {
             const extra_cached = self.render_targets.items[extra_index];
             if (extra_cached.initialized or extra.descriptor.fragments_log2 != 0) continue;
-            const extra_bytes = try colorTargetFrameBytes(extra);
-            try self.flushPendingGuestWrite(extra.descriptor.address, extra_bytes);
-            const frame = try self.allocator.alloc(u8, extra_bytes);
-            defer self.allocator.free(frame);
-            const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
-            const reader = gpu.ShaderMemoryReader{ .context = memory.context, .read_fn = memory.read };
-            try self.stageInitialColorTarget(extra, reader, frame);
-            extra_uploads[upload_index] = try self.createBuffer(
-                extra_bytes,
-                vk.buffer_usage_transfer_src_bit,
-                vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit,
-            );
-            try self.writeMapped(extra_uploads[upload_index].?, frame);
-            self.frame_profile.upload_bytes += extra_bytes;
-            self.frame_profile.target_upload_bytes += extra_bytes;
+            extra_uploads[upload_index] = try self.stageInitialColorUpload(extra_index);
         }
         // A depth attachment changes the render pass a pipeline must be
         // compatible with, so it has to be resolved before the pipeline is
@@ -12301,7 +12330,7 @@ pub const Renderer = struct {
             };
             self.device_functions.cmd_copy_buffer_to_image(
                 command_buffer,
-                upload.handle,
+                upload.buffer.handle,
                 cached_snapshot.image.handle,
                 vk.image_layout_transfer_dst_optimal,
                 1,
@@ -12341,7 +12370,7 @@ pub const Renderer = struct {
                 };
                 self.device_functions.cmd_copy_buffer_to_image(
                     command_buffer,
-                    upload.handle,
+                    upload.buffer.handle,
                     extra_cached.image.handle,
                     vk.image_layout_transfer_dst_optimal,
                     1,

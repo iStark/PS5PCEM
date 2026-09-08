@@ -1919,7 +1919,36 @@ fn runResidentTargetReuseProbe(allocator: std.mem.Allocator) !void {
         const center = destination + (4 * 8 + 4) * 4;
         try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, guest.bytes[center..][0..4]);
     }
-    std.debug.print("resident target reuse passed: full cache, sampled source, GPU readback, released pins\n", .{});
+    // Seed a previously used attachment again while its preceding draw is
+    // queued. Upload and readback share a buffer in the resident path; compare
+    // every pixel with the independent transient-buffer path, including pixels
+    // outside the triangle that must retain their new CPU-authored values.
+    const destination = 0x2000 + 67 * 0x400;
+    const destination_index = for (renderer.render_targets.items, 0..) |target, index| {
+        if (target.target.descriptor.address == destination) break index;
+    } else return error.MissingReuseTarget;
+    const transfer = renderer.render_targets.items[destination_index].readback.handle;
+    var expected: [8 * 8 * 4]u8 = undefined;
+    for ([_]bool{ false, true, true }, 0..) |reuse, pass| {
+        renderer.reuse_color_target_transfer = reuse;
+        for (0..2) |queued| {
+            for (0..64) |pixel_index|
+                guest.word(destination + pixel_index * 4, 0xff674523 + @as(u32, @intCast(pixel_index + queued)));
+            renderer.render_targets.items[destination_index].initialized = false;
+            _ = try executor.execute(&stream);
+            if (renderer.last_draw_error) |err| return err;
+        }
+        try renderer.flushPendingGuestWrites();
+        try std.testing.expectEqual(transfer, renderer.render_targets.items[destination_index].readback.handle);
+        const actual = guest.bytes[destination..][0..expected.len];
+        if (pass == 0) {
+            @memcpy(&expected, actual);
+            // A triangle must draw its centre and preserve the uncovered seed.
+            try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, actual[(4 * 8 + 4) * 4 ..][0..4]);
+            try std.testing.expect(!std.mem.eql(u8, actual[0..4], &.{ 255, 0, 0, 255 }));
+        } else try std.testing.expectEqualSlices(u8, &expected, actual);
+    }
+    std.debug.print("resident target reuse passed: full cache, sampled source, GPU readback, released pins, queued transfer-buffer reseeding\n", .{});
 }
 
 fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator) !void {
