@@ -623,6 +623,11 @@ fn run(init: std.process.Init) !bool {
         defer allocator.free(text);
         break :parse std.math.clamp(std.fmt.parseInt(usize, text, 10) catch default_storage_image_mib, 128, 4096);
     } else |_| default_storage_image_mib;
+    const default_compute_translation_mib: usize = if (std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id)) 512 else 256;
+    const compute_translation_cache_mib = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_COMPUTE_TRANSLATION_CACHE_MIB")) |text| parse: {
+        defer allocator.free(text);
+        break :parse std.math.clamp(std.fmt.parseInt(usize, text, 10) catch default_compute_translation_mib, 64, 1024);
+    } else |_| default_compute_translation_mib;
     if (builtin.os.tag == .windows and !force_headless) live_gpu: {
         host_window.init(1280, 720) catch |err| {
             try stderr.print("live Vulkan window unavailable: {s}; continuing headless\n", .{@errorName(err)});
@@ -665,6 +670,7 @@ fn run(init: std.process.Init) !bool {
             .enable_image_state_optimization = enable_image_state_optimization,
             .render_target_cache_limit = render_target_cache_limit,
             .storage_image_cache_limit = storage_image_cache_mib * 1024 * 1024,
+            .compute_translation_cache_limit = compute_translation_cache_mib * 1024 * 1024,
             .native_window = .{
                 .instance = native.instance,
                 .window = native.window,
@@ -723,7 +729,7 @@ fn run(init: std.process.Init) !bool {
             native.height,
         });
         try out.print(
-            "  GPU flags ir={d} ssa={d} async_pso={d} aliases={d} depth_io={d} image_state_opt={d} timeline={d} timeline_auto={d} defer_storage={d} defer_storage_auto={d} page_tracker={d} buffer_content_cache={d} copy_workers={d} render_targets={d} storage_image_mib={d}\n",
+            "  GPU flags ir={d} ssa={d} async_pso={d} aliases={d} depth_io={d} image_state_opt={d} timeline={d} timeline_auto={d} defer_storage={d} defer_storage_auto={d} page_tracker={d} buffer_content_cache={d} copy_workers={d} render_targets={d} storage_image_mib={d} compute_translation_mib={d}\n",
             .{
                 @intFromBool(enable_shader_ir),
                 @intFromBool(enable_shader_ssa),
@@ -740,6 +746,7 @@ fn run(init: std.process.Init) !bool {
                 gpu_copy_workers,
                 render_target_cache_limit,
                 storage_image_cache_mib,
+                compute_translation_cache_mib,
             },
         );
     }

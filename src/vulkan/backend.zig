@@ -225,6 +225,9 @@ pub const Options = struct {
     /// Soft while one dispatch pins all remaining entries: its legal descriptor
     /// set must fit even when larger than the retention budget.
     storage_image_cache_limit: usize = 1280 * 1024 * 1024,
+    /// Host memory for decoded compute keys and generated SPIR-V. Allocated
+    /// lazily; this does not reserve Vulkan image or buffer memory.
+    compute_translation_cache_limit: usize = 256 * 1024 * 1024,
     /// Optional Win32 output window. Supplying it enables the required surface
     /// and swapchain extensions and constrains device selection to a queue that
     /// can present to this exact surface.
@@ -3171,9 +3174,8 @@ pub const Renderer = struct {
     graphics_translations: spirv_cache.Cache = .{},
     /// Compute programs also recur with different runtime scalar values. Keep
     /// their translations within a separate budget so scene kernels cannot
-    /// evict the UI/graphics working set. Yotei's warmed scene needs about
-    /// 214 MiB; a 64 MiB limit retranslates over 200 variants every frame.
-    /// This is a lazy upper bound, not a preallocated buffer.
+    /// evict the UI/graphics working set. The runner can raise the lazy bound
+    /// for larger scenes without changing graphics retention or cache keys.
     compute_translations: spirv_cache.Cache = .{ .maximum_bytes = 256 * 1024 * 1024 },
     /// Coherency domain shared by all Vulkan image caches. Separately-created
     /// host images which overlap in guest memory observe the same generation.
@@ -3916,6 +3918,7 @@ pub const Renderer = struct {
             .image_state_optimization_enabled = options.enable_image_state_optimization,
             .render_target_cache_limit = @max(1, options.render_target_cache_limit),
             .storage_image_cache_limit = options.storage_image_cache_limit,
+            .compute_translations = .{ .maximum_bytes = options.compute_translation_cache_limit },
             .window_presentation = window_presentation,
         };
         renderer.image_aliases.enabled = options.enable_canonical_image_aliases;

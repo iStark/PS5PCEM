@@ -2,6 +2,57 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Compute translation retention on 2026-09-09
+
+Yotei now uses a lazy 512 MiB compute translation cache; other titles and the
+renderer API retain 256 MiB. `PS5_GPU_COMPUTE_TRANSLATION_CACHE_MIB` overrides
+the runner budget, clamped to 64–1024 MiB. Invalid values use the title default.
+The startup GPU flags report the selected limit as `compute_translation_mib`.
+The budget counts retained serialized keys and generated SPIR-V, not total
+process memory or VRAM. Nothing is preallocated. Exact key comparisons,
+runtime scalar bindings, LRU eviction and the separate 1,024-entry ceiling
+retain their existing behavior.
+
+The later scene exceeds the preceding 256 MiB limit and repeatedly translates
+the same compute variants. A same-process ReleaseFast experiment changes only
+the host cache budget. Persistent scalar definitions, four copy workers,
+128 color targets and the 2,560 MiB storage-image budget remain enabled.
+Each interval records 12 frames and discards the first two. Expanded budgets
+warm for eight frames; the final 512 MiB confirmation warms for three.
+After lowering the limit, measurement waits for a normal cache miss to evict
+entries until retained bytes are within 256 MiB. No compilers, GPU probes or
+captures run during timing.
+
+| Compute cache budget | Measured flips | Median frame | Derived FPS | Compute translation | Translation misses/frame | Retained cache |
+| --- | --- | --- | --- | --- | --- | --- |
+| 768 MiB, before | 1350–1359 | 5,542.5 ms | 0.180 | 154.5 ms | 8 | 281 MiB |
+| 256 MiB, control | 1364–1373 | 6,152 ms | 0.163 | 875 ms | 286 | 255 MiB |
+| 768 MiB, after | 1386–1395 | 5,407 ms | 0.185 | 149 ms | 8 | 282 MiB |
+| 512 MiB, confirmation | 1403–1412 | 5,290.5 ms | 0.189 | 142 ms | 8 | 282 MiB |
+
+The surrounding expanded-cache intervals improve FPS by 11.0–13.8% over the
+control. The final 512 MiB interval is 16.3% faster, with the same retained
+working set and miss count as 768 MiB. Compute translation falls by about
+83%; the measured scene does not benefit from retaining more than 512 MiB.
+Draw medians are 544–547 and dispatch medians 1,017–1,017.5. Compute resource
+preparation stays near 1.46–1.49 seconds, readback near 541 MiB, and fence waits
+near 1.05–1.11 seconds. Compute pipeline compilation and storage-image eviction
+remain zero. Available physical memory is approximately 2.8–3.3 GiB on the
+Ryzen 7 7700 / RTX 3070 Ti / 32 GiB host.
+
+Both translation-cache CPU tests pass in ReleaseSafe. Existing full Vulkan,
+indirect-image and scalar-pointer probes pass with the new renderer option
+set to 512 MiB and SDK 1.4.357.0 synchronization validation enabled, without
+validation warnings or errors. The rebuilt ReleaseFast runner starts Yotei
+with `compute_translation_mib=512` and continues decoding/presenting the intro.
+
+These are live animated-scene intervals, not a deterministic replay or an
+additional multiplier to apply to earlier benchmarks. An earlier 256/512/256
+comparison crossed a scene transition and is excluded from the FPS claim.
+One draw allocation failed earlier in that run while host memory was tighter;
+this cache-budget change does not establish a fix for allocation failures.
+Complete title-menu rendering remains unverified.
+
 ## Persistent scalar definitions on 2026-09-08
 
 The retained decoded shader now owns a second-level scalar definition cache.
