@@ -1,6 +1,22 @@
 # Ghost of Yotei startup investigation
 
-Verified with PPSA26344 and the RTX 3070 Ti on 2026-09-06.
+Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
+
+## Release progress on 2026-09-08
+
+Since `v0.3.0-alpha.3`, development has advanced from intro playback into streamed
+scene loading, the animated loading indicator, three bonus notices, brightness
+calibration and parts of the 3D scene/interface. The maintainer reports visible
+trees in the background and audible menu music. These partial scene observations
+do not establish a complete title menu or gameplay.
+
+The full bonus/brightness sequence was captured on reference build `796a484`, as
+detailed below. A bounded check of `4f58738` completed the intro and continued into
+scene loading at flip 690 without a contained guest fault or submission refusal.
+It did not repeat the entire UI sequence. This distinction also applies to the
+`0.3.0-alpha.4` runner, whose subsequent change is Windows version metadata.
+The older 1.5–1.6-second post-intro baseline at the end of this document predates
+scene loading and is not a current full-menu performance measurement.
 
 ## Menu progress on 2026-09-07
 

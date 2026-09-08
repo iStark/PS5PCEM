@@ -79,7 +79,10 @@ button which forgets only that library entry; installed content and saves are
 never deleted. It also persists sound state,
 FPS-counter preference, input mode, keyboard bindings, and interface language
 in `ps5pcem.ini` next to the executable. English is the default; Russian,
-German, and French are available from Settings. It looks for `eboot.bin` in the
+German, French, Simplified Chinese, Spanish, Arabic, and Portuguese are available
+from Settings. Arabic labels use right-to-left paragraph direction; centered
+buttons retain their alignment, and file paths retain their original direction.
+Language choices from earlier versions keep their saved IDs. It looks for `eboot.bin` in the
 selected directory and its common `decrypted` subdirectory, then starts the
 sibling `game-run.exe` with the full content directory mounted as `/app0`.
 `zig build launcher` installs only the launcher and `game-run` dependencies

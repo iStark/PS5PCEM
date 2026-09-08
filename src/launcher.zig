@@ -25,7 +25,9 @@ const sidebar_width = 222;
 
 const Page = enum { library, input, saves, settings };
 const InputMode = enum(u8) { controller = 0, keyboard = 1, hybrid = 2 };
-const Language = enum(u8) { english = 0, russian = 1, german = 2, french = 3 };
+// Append languages to preserve IDs saved by earlier launcher versions.
+const Language = enum(u8) { english = 0, russian = 1, german = 2, french = 3, chinese_simplified = 4, spanish = 5, arabic = 6, portuguese = 7 };
+const language_labels = [_][]const u8{ "English", "Русский", "Deutsch", "Français", "简体中文", "Español", "العربية", "Português" };
 
 const Phrase = enum {
     nav_library,
@@ -240,6 +242,294 @@ fn tr(phrase: Phrase) []const u8 {
             .status_launch_failed => "Could not start game-run.exe",
             .status_launched => "Game launched in a separate process",
             .status_game_removed => "Game removed from the library",
+        },
+        .chinese_simplified => switch (phrase) {
+            .nav_library => "游戏库",
+            .nav_input => "控制设置",
+            .nav_settings => "设置",
+            .project => "项目",
+            .support_boosty => "支持 Boosty  ↗",
+            .library_heading => "游戏库",
+            .library_subtitle => "已选择的游戏及其本地封面会保留在此处",
+            .folder_label => "游戏文件夹",
+            .folder_prompt => "选择包含 eboot.bin 的文件夹",
+            .folder_empty => "尚未选择文件夹",
+            .choose_folder => "选择文件夹",
+            .legal_notice => "不包含游戏内容 · 请仅使用您有权访问的文件",
+            .sound => "声音",
+            .enabled => "已启用",
+            .disabled => "已禁用",
+            .sound_timing => "关闭主机声音输出后，AudioOut 仍会保持游戏时序",
+            .controls => "控制方式",
+            .gamepad => "手柄",
+            .keyboard_dualsense => "键盘模拟 DualSense",
+            .gamepad_keyboard => "手柄 + 键盘",
+            .controller_description => "XInput 手柄 · 标准布局",
+            .keyboard_description => "WASD、方向键和自定义按键",
+            .hybrid_description => "同时使用手柄和键盘",
+            .configure_layout => "配置按键  →",
+            .core_ready => "核心已就绪 · Vulkan VideoOut · Windows x86-64",
+            .launch_game => "启动游戏  ▶",
+            .input_heading => "控制设置",
+            .input_subtitle => "选择输入方式，并将键盘按键映射到 DualSense 按钮",
+            .keyboard => "键盘",
+            .hybrid => "混合输入",
+            .xinput_slot => "XInput 插槽",
+            .wasd_mapping => "WASD + 按键映射",
+            .both_sources => "手柄 + 键盘",
+            .keyboard_layout => "键盘按键映射",
+            .mapping_hint => "点击一行后按下按键。WASD 始终控制左摇杆；Alt + 方向键控制右摇杆。",
+            .settings_heading => "设置",
+            .settings_subtitle => "启动选项和项目信息",
+            .language => "语言",
+            .sound_output => "声音输出",
+            .sound_output_description => "关闭声音不会影响 AudioOut 时序",
+            .fps_counter => "帧率显示",
+            .fps_counter_description => "在游戏窗口标题中显示实测帧率",
+            .compatibility => "兼容性",
+            .compatibility_text => "PS5PCEM 仍处于早期开发阶段，部分游戏尚无法启动。DualSense 高级功能、PS5 原生键鼠和手柄转键盘功能仍需进一步完善 HLE 支持。",
+            .author => "作者：Artur Strazewicz · GitHub：iStark/PS5PCEM",
+            .browse_dialog => "选择包含已解密 PS5 游戏的文件夹",
+            .nav_saves => "存档",
+            .saves_heading => "游戏存档",
+            .saves_subtitle => "所有本地存档按游戏 ID 分组，保存在模拟器所在目录中。",
+            .saves_empty => "未找到本地游戏存档",
+            .saves_open_folder => "打开文件夹",
+            .pad_test => "测试",
+            .pad_test_unavailable => "无法控制此手柄",
+            .pad_searching => "正在搜索手柄",
+            .pad_absent => "未检测到手柄",
+            .status_layout_saved => "键盘映射已保存",
+            .status_press_key => "请按下新按键 · 按 Esc 取消",
+            .status_input_saved => "输入配置已保存",
+            .status_controller_saved => "手柄插槽已保存",
+            .status_sound_on => "声音已启用",
+            .status_sound_off => "声音已禁用",
+            .status_fps_on => "帧率显示已启用",
+            .status_fps_off => "帧率显示已禁用",
+            .status_folder_selected => "已选择文件夹 · 可以启动游戏",
+            .status_choose_folder => "请先选择游戏文件夹",
+            .status_eboot_missing => "所选文件夹或 decrypted 子文件夹中未找到 eboot.bin",
+            .status_runner_missing => "未找到 game-run.exe · 请先运行 zig build",
+            .status_launch_failed => "无法启动 game-run.exe",
+            .status_launched => "游戏已在独立进程中启动",
+            .status_game_removed => "游戏已从游戏库移除",
+        },
+        .spanish => switch (phrase) {
+            .nav_library => "Biblioteca",
+            .nav_input => "Controles",
+            .nav_settings => "Ajustes",
+            .project => "PROYECTO",
+            .support_boosty => "Apoyar en Boosty  ↗",
+            .library_heading => "Biblioteca de juegos",
+            .library_subtitle => "Los juegos seleccionados se guardan aquí con sus portadas locales",
+            .folder_label => "CARPETA DEL JUEGO",
+            .folder_prompt => "Selecciona la carpeta que contiene eboot.bin",
+            .folder_empty => "No se ha seleccionado ninguna carpeta",
+            .choose_folder => "Elegir carpeta",
+            .legal_notice => "No se incluyen juegos · usa solo archivos a los que tengas acceso legal",
+            .sound => "SONIDO",
+            .enabled => "Activado",
+            .disabled => "Desactivado",
+            .sound_timing => "AudioOut mantiene la sincronización aunque se desactive el sonido",
+            .controls => "CONTROLES",
+            .gamepad => "Mando",
+            .keyboard_dualsense => "Teclado como DualSense",
+            .gamepad_keyboard => "Mando + teclado",
+            .controller_description => "Mando XInput · distribución estándar",
+            .keyboard_description => "WASD, flechas y teclas personalizadas",
+            .hybrid_description => "Ambas fuentes funcionan a la vez",
+            .configure_layout => "Configurar teclas  →",
+            .core_ready => "Núcleo listo · Vulkan VideoOut · Windows x86-64",
+            .launch_game => "Iniciar juego  ▶",
+            .input_heading => "Controles",
+            .input_subtitle => "Elige una fuente de entrada y asigna teclas a los botones de DualSense",
+            .keyboard => "Teclado",
+            .hybrid => "Híbrido",
+            .xinput_slot => "Puerto XInput",
+            .wasd_mapping => "WASD + asignaciones",
+            .both_sources => "Mando + teclado",
+            .keyboard_layout => "ASIGNACIÓN DE TECLAS",
+            .mapping_hint => "Haz clic en una fila y pulsa una tecla. WASD controla el stick izquierdo; Alt + flechas, el derecho.",
+            .settings_heading => "Ajustes",
+            .settings_subtitle => "Preferencias de inicio e información del proyecto",
+            .language => "IDIOMA",
+            .sound_output => "Salida de sonido",
+            .sound_output_description => "Desactivar el sonido no afecta a la sincronización de AudioOut",
+            .fps_counter => "Contador de FPS",
+            .fps_counter_description => "Muestra los FPS medidos en el título de la ventana del juego",
+            .compatibility => "Compatibilidad",
+            .compatibility_text => "PS5PCEM está en una fase temprana: algunos juegos no arrancan. Las funciones avanzadas de DualSense, el teclado y ratón nativos de PS5 y la conversión de mando a teclado aún necesitan más soporte HLE.",
+            .author => "Autor: Artur Strazewicz · GitHub: iStark/PS5PCEM",
+            .browse_dialog => "Elige la carpeta que contiene un juego de PS5 descifrado",
+            .nav_saves => "Partidas",
+            .saves_heading => "Partidas guardadas",
+            .saves_subtitle => "Partidas locales agrupadas por ID del juego, en la carpeta del emulador.",
+            .saves_empty => "No se encontraron partidas guardadas locales",
+            .saves_open_folder => "Abrir carpeta",
+            .pad_test => "Probar",
+            .pad_test_unavailable => "No se puede activar el mando",
+            .pad_searching => "Buscando un mando",
+            .pad_absent => "No se detectó ningún mando",
+            .status_layout_saved => "Asignación de teclas guardada",
+            .status_press_key => "Pulsa una nueva tecla · Esc para cancelar",
+            .status_input_saved => "Perfil de entrada guardado",
+            .status_controller_saved => "Puerto del mando guardado",
+            .status_sound_on => "Sonido activado",
+            .status_sound_off => "Sonido desactivado",
+            .status_fps_on => "Contador de FPS activado",
+            .status_fps_off => "Contador de FPS desactivado",
+            .status_folder_selected => "Carpeta seleccionada · listo para iniciar",
+            .status_choose_folder => "Elige primero una carpeta de juego",
+            .status_eboot_missing => "No se encontró eboot.bin en la carpeta seleccionada ni en la subcarpeta decrypted",
+            .status_runner_missing => "No se encontró game-run.exe · ejecuta zig build primero",
+            .status_launch_failed => "No se pudo iniciar game-run.exe",
+            .status_launched => "Juego iniciado en un proceso independiente",
+            .status_game_removed => "Juego eliminado de la biblioteca",
+        },
+        .arabic => switch (phrase) {
+            .nav_library => "المكتبة",
+            .nav_input => "التحكم",
+            .nav_settings => "الإعدادات",
+            .project => "المشروع",
+            .support_boosty => "ادعمنا على Boosty  ↗",
+            .library_heading => "مكتبة الألعاب",
+            .library_subtitle => "تُحفظ الألعاب المختارة هنا مع صور أغلفتها المحلية",
+            .folder_label => "مجلد اللعبة",
+            .folder_prompt => "اختر المجلد الذي يحتوي على eboot.bin",
+            .folder_empty => "لم يتم اختيار مجلد",
+            .choose_folder => "اختيار مجلد",
+            .legal_notice => "الألعاب غير مرفقة · استخدم فقط الملفات التي يحق لك الوصول إليها",
+            .sound => "الصوت",
+            .enabled => "مفعّل",
+            .disabled => "معطّل",
+            .sound_timing => "يحافظ AudioOut على توقيت اللعبة حتى عند تعطيل إخراج الصوت",
+            .controls => "التحكم",
+            .gamepad => "يد التحكم",
+            .keyboard_dualsense => "لوحة المفاتيح كـ DualSense",
+            .gamepad_keyboard => "يد التحكم + لوحة المفاتيح",
+            .controller_description => "يد تحكم XInput · تخطيط قياسي",
+            .keyboard_description => "WASD والأسهم ومفاتيح مخصصة",
+            .hybrid_description => "يعمل مصدرا الإدخال في الوقت نفسه",
+            .configure_layout => "تخصيص المفاتيح  ←",
+            .core_ready => "النواة جاهزة · Vulkan VideoOut · Windows x86-64",
+            .launch_game => "تشغيل اللعبة  ▶",
+            .input_heading => "التحكم",
+            .input_subtitle => "اختر مصدر الإدخال واربط مفاتيح لوحة المفاتيح بأزرار DualSense",
+            .keyboard => "لوحة المفاتيح",
+            .hybrid => "إدخال مختلط",
+            .xinput_slot => "منفذ XInput",
+            .wasd_mapping => "WASD + تعيينات المفاتيح",
+            .both_sources => "يد التحكم + لوحة المفاتيح",
+            .keyboard_layout => "تعيينات لوحة المفاتيح",
+            .mapping_hint => "انقر على صف ثم اضغط مفتاحًا. تتحكم WASD بالعصا اليسرى، وتتحكم Alt مع الأسهم بالعصا اليمنى.",
+            .settings_heading => "الإعدادات",
+            .settings_subtitle => "تفضيلات التشغيل ومعلومات المشروع",
+            .language => "اللغة",
+            .sound_output => "إخراج الصوت",
+            .sound_output_description => "تعطيل الصوت لا يؤثر على توقيت AudioOut",
+            .fps_counter => "عداد الإطارات",
+            .fps_counter_description => "عرض معدل الإطارات المقاس في عنوان نافذة اللعبة",
+            .compatibility => "التوافق",
+            .compatibility_text => "لا يزال PS5PCEM في مرحلة مبكرة، وبعض الألعاب لا تعمل بعد. تحتاج ميزات DualSense المتقدمة ولوحة المفاتيح والفأرة الأصلية لـ PS5 وتحويل يد التحكم إلى لوحة مفاتيح إلى مزيد من دعم HLE.",
+            .author => "المؤلف: Artur Strazewicz · GitHub: iStark/PS5PCEM",
+            .browse_dialog => "اختر المجلد الذي يحتوي على لعبة PS5 مفكوكة التشفير",
+            .nav_saves => "الحفظ",
+            .saves_heading => "الألعاب المحفوظة",
+            .saves_subtitle => "ملفات الحفظ المحلية مجمّعة حسب معرّف اللعبة ومحفوظة بجوار المحاكي.",
+            .saves_empty => "لم يتم العثور على ملفات حفظ محلية",
+            .saves_open_folder => "فتح المجلد",
+            .pad_test => "اختبار",
+            .pad_test_unavailable => "لا يمكن تنشيط يد التحكم",
+            .pad_searching => "جارٍ البحث عن يد تحكم",
+            .pad_absent => "لم يتم اكتشاف يد تحكم",
+            .status_layout_saved => "تم حفظ تعيينات المفاتيح",
+            .status_press_key => "اضغط مفتاحًا جديدًا · اضغط Esc للإلغاء",
+            .status_input_saved => "تم حفظ ملف تعريف الإدخال",
+            .status_controller_saved => "تم حفظ منفذ يد التحكم",
+            .status_sound_on => "تم تفعيل الصوت",
+            .status_sound_off => "تم تعطيل الصوت",
+            .status_fps_on => "تم تفعيل عداد الإطارات",
+            .status_fps_off => "تم تعطيل عداد الإطارات",
+            .status_folder_selected => "تم اختيار المجلد · جاهز للتشغيل",
+            .status_choose_folder => "اختر مجلد اللعبة أولًا",
+            .status_eboot_missing => "لم يتم العثور على eboot.bin في المجلد المختار أو المجلد الفرعي decrypted",
+            .status_runner_missing => "لم يتم العثور على game-run.exe · شغّل zig build أولًا",
+            .status_launch_failed => "تعذّر تشغيل game-run.exe",
+            .status_launched => "تم تشغيل اللعبة في عملية منفصلة",
+            .status_game_removed => "تمت إزالة اللعبة من المكتبة",
+        },
+        .portuguese => switch (phrase) {
+            .nav_library => "Biblioteca",
+            .nav_input => "Controles",
+            .nav_settings => "Configurações",
+            .project => "PROJETO",
+            .support_boosty => "Apoiar no Boosty  ↗",
+            .library_heading => "Biblioteca de jogos",
+            .library_subtitle => "Os jogos selecionados ficam aqui com as suas capas locais",
+            .folder_label => "PASTA DO JOGO",
+            .folder_prompt => "Selecione a pasta que contém eboot.bin",
+            .folder_empty => "Nenhuma pasta selecionada",
+            .choose_folder => "Escolher pasta",
+            .legal_notice => "Jogos não incluídos · use apenas arquivos aos quais tenha acesso legal",
+            .sound => "SOM",
+            .enabled => "Ativado",
+            .disabled => "Desativado",
+            .sound_timing => "O AudioOut mantém a sincronização mesmo com a saída de som desativada",
+            .controls => "CONTROLES",
+            .gamepad => "Controle",
+            .keyboard_dualsense => "Teclado como DualSense",
+            .gamepad_keyboard => "Controle + teclado",
+            .controller_description => "Controle XInput · layout padrão",
+            .keyboard_description => "WASD, setas e teclas personalizadas",
+            .hybrid_description => "As duas fontes funcionam ao mesmo tempo",
+            .configure_layout => "Configurar teclas  →",
+            .core_ready => "Núcleo pronto · Vulkan VideoOut · Windows x86-64",
+            .launch_game => "Iniciar jogo  ▶",
+            .input_heading => "Controles",
+            .input_subtitle => "Escolha uma fonte de entrada e associe teclas aos botões do DualSense",
+            .keyboard => "Teclado",
+            .hybrid => "Híbrido",
+            .xinput_slot => "Porta XInput",
+            .wasd_mapping => "WASD + mapeamento",
+            .both_sources => "Controle + teclado",
+            .keyboard_layout => "MAPEAMENTO DO TECLADO",
+            .mapping_hint => "Clique em uma linha e pressione uma tecla. WASD controla o analógico esquerdo; Alt + setas, o direito.",
+            .settings_heading => "Configurações",
+            .settings_subtitle => "Preferências de inicialização e informações do projeto",
+            .language => "IDIOMA",
+            .sound_output => "Saída de som",
+            .sound_output_description => "Desativar o som não afeta a sincronização do AudioOut",
+            .fps_counter => "Contador de FPS",
+            .fps_counter_description => "Mostrar a taxa de quadros medida no título da janela do jogo",
+            .compatibility => "Compatibilidade",
+            .compatibility_text => "O PS5PCEM está em fase inicial: alguns jogos ainda não iniciam. Recursos avançados do DualSense, teclado e mouse nativos do PS5 e a conversão de controle para teclado precisam de mais suporte HLE.",
+            .author => "Autor: Artur Strazewicz · GitHub: iStark/PS5PCEM",
+            .browse_dialog => "Escolha a pasta que contém um jogo de PS5 descriptografado",
+            .nav_saves => "Jogos salvos",
+            .saves_heading => "Jogos salvos",
+            .saves_subtitle => "Jogos salvos locais agrupados por ID do título, na pasta do emulador.",
+            .saves_empty => "Nenhum jogo salvo local encontrado",
+            .saves_open_folder => "Abrir pasta",
+            .pad_test => "Testar",
+            .pad_test_unavailable => "Não é possível acionar o controle",
+            .pad_searching => "Procurando um controle",
+            .pad_absent => "Nenhum controle detectado",
+            .status_layout_saved => "Mapeamento do teclado salvo",
+            .status_press_key => "Pressione uma nova tecla · Esc para cancelar",
+            .status_input_saved => "Perfil de entrada salvo",
+            .status_controller_saved => "Porta do controle salva",
+            .status_sound_on => "Som ativado",
+            .status_sound_off => "Som desativado",
+            .status_fps_on => "Contador de FPS ativado",
+            .status_fps_off => "Contador de FPS desativado",
+            .status_folder_selected => "Pasta selecionada · pronto para iniciar",
+            .status_choose_folder => "Escolha primeiro uma pasta de jogo",
+            .status_eboot_missing => "eboot.bin não foi encontrado na pasta selecionada nem na subpasta decrypted",
+            .status_runner_missing => "game-run.exe não foi encontrado · execute zig build primeiro",
+            .status_launch_failed => "Não foi possível iniciar game-run.exe",
+            .status_launched => "Jogo iniciado em um processo separado",
+            .status_game_removed => "Jogo removido da biblioteca",
         },
         .russian => switch (phrase) {
             .nav_library => "Библиотека",
@@ -713,11 +1003,15 @@ const language_rects = [_]Rect{
     .{ .left = 486, .top = 190, .right = 676, .bottom = 246 },
     .{ .left = 690, .top = 190, .right = 880, .bottom = 246 },
     .{ .left = 894, .top = 190, .right = 1086, .bottom = 246 },
+    .{ .left = 282, .top = 258, .right = 472, .bottom = 314 },
+    .{ .left = 486, .top = 258, .right = 676, .bottom = 314 },
+    .{ .left = 690, .top = 258, .right = 880, .bottom = 314 },
+    .{ .left = 894, .top = 258, .right = 1086, .bottom = 314 },
 };
 
 const settings_toggle_rects = [_]Rect{
-    .{ .left = 282, .top = 278, .right = 1086, .bottom = 360 },
-    .{ .left = 282, .top = 382, .right = 1086, .bottom = 464 },
+    .{ .left = 282, .top = 334, .right = 1086, .bottom = 410 },
+    .{ .left = 282, .top = 426, .right = 1086, .bottom = 502 },
 };
 
 fn controllerSlotRect(index: usize) Rect {
@@ -981,7 +1275,7 @@ fn drawInput(dc: Win32.DeviceContext) void {
     drawPadPresence(dc);
     drawPadTest(dc);
 
-    localizedText(dc, .keyboard_layout, .{ .left = 282, .top = 278, .right = 650, .bottom = 300 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    localizedText(dc, .keyboard_layout, .{ .left = 282, .top = 278, .right = 1086, .bottom = 300 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
     for (0..mapping.len) |index| {
         const column: i32 = @intCast(index / 7);
         const row: i32 = @intCast(index % 7);
@@ -1579,34 +1873,33 @@ fn drawSaves(dc: Win32.DeviceContext) void {
 
 fn drawSettings(dc: Win32.DeviceContext) void {
     pageHeading(dc, .settings_heading, .settings_subtitle);
-    localizedText(dc, .language, .{ .left = 282, .top = 158, .right = 600, .bottom = 180 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
-    drawLanguageCard(dc, .english, .{ .left = 282, .top = 190, .right = 472, .bottom = 246 }, "English");
-    drawLanguageCard(dc, .russian, .{ .left = 486, .top = 190, .right = 676, .bottom = 246 }, "Русский");
-    drawLanguageCard(dc, .german, .{ .left = 690, .top = 190, .right = 880, .bottom = 246 }, "Deutsch");
-    drawLanguageCard(dc, .french, .{ .left = 894, .top = 190, .right = 1086, .bottom = 246 }, "Français");
+    localizedText(dc, .language, .{ .left = 282, .top = 158, .right = 1086, .bottom = 180 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    for (language_rects, language_labels, 0..) |rectangle, label, index| {
+        drawLanguageCard(dc, @enumFromInt(index), rectangle, label);
+    }
 
-    card(dc, .{ .left = 282, .top = 278, .right = 1086, .bottom = 360 });
-    localizedText(dc, .sound_output, .{ .left = 310, .top = 296, .right = 550, .bottom = 321 }, 0x00f4f0ea, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
-    localizedText(dc, .sound_output_description, .{ .left = 310, .top = 328, .right = 760, .bottom = 350 }, 0x008b817a, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
-    drawToggle(dc, 988, 302, sound_enabled);
+    card(dc, settings_toggle_rects[0]);
+    localizedText(dc, .sound_output, .{ .left = 310, .top = 346, .right = 956, .bottom = 371 }, 0x00f4f0ea, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    localizedText(dc, .sound_output_description, .{ .left = 310, .top = 377, .right = 956, .bottom = 401 }, 0x008b817a, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    drawToggle(dc, 988, 357, sound_enabled);
 
-    card(dc, .{ .left = 282, .top = 382, .right = 1086, .bottom = 464 });
-    localizedText(dc, .fps_counter, .{ .left = 310, .top = 400, .right = 550, .bottom = 425 }, 0x00f4f0ea, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
-    localizedText(dc, .fps_counter_description, .{ .left = 310, .top = 432, .right = 860, .bottom = 454 }, 0x008b817a, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
-    drawToggle(dc, 988, 406, show_fps);
+    card(dc, settings_toggle_rects[1]);
+    localizedText(dc, .fps_counter, .{ .left = 310, .top = 438, .right = 956, .bottom = 463 }, 0x00f4f0ea, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    localizedText(dc, .fps_counter_description, .{ .left = 310, .top = 469, .right = 956, .bottom = 493 }, 0x008b817a, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    drawToggle(dc, 988, 449, show_fps);
 
-    card(dc, .{ .left = 282, .top = 486, .right = 1086, .bottom = 588 });
-    localizedText(dc, .compatibility, .{ .left = 310, .top = 504, .right = 550, .bottom = 530 }, 0x00f4f0ea, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
-    localizedText(dc, .compatibility_text, .{ .left = 310, .top = 538, .right = 1048, .bottom = 578 }, 0x00aaa098, regular_font, Win32.dt_left | Win32.dt_word_break);
+    card(dc, .{ .left = 282, .top = 518, .right = 1086, .bottom = 626 });
+    localizedText(dc, .compatibility, .{ .left = 310, .top = 530, .right = 1048, .bottom = 556 }, 0x00f4f0ea, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    localizedText(dc, .compatibility_text, .{ .left = 310, .top = 563, .right = 1048, .bottom = 618 }, 0x00aaa098, regular_font, Win32.dt_left | Win32.dt_word_break);
 
-    card(dc, .{ .left = 282, .top = 610, .right = 1086, .bottom = 700 });
-    text(dc, w("PS5PCEM"), -1, .{ .left = 310, .top = 627, .right = 500, .bottom = 654 }, 0x00f4f0ea, medium_font, Win32.dt_left);
-    localizedText(dc, .author, .{ .left = 310, .top = 667, .right = 840, .bottom = 691 }, 0x00ffac64, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
-    text(dc, w("GPL-3.0-or-later"), -1, .{ .left = 860, .top = 667, .right = 1048, .bottom = 691 }, 0x008b817a, regular_font, Win32.dt_right);
+    card(dc, .{ .left = 282, .top = 642, .right = 1086, .bottom = 714 });
+    text(dc, w("PS5PCEM"), -1, .{ .left = 310, .top = 654, .right = 500, .bottom = 680 }, 0x00f4f0ea, medium_font, Win32.dt_left);
+    localizedText(dc, .author, .{ .left = 310, .top = 684, .right = 840, .bottom = 708 }, 0x00ffac64, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    text(dc, w("GPL-3.0-or-later"), -1, .{ .left = 860, .top = 684, .right = 1048, .bottom = 708 }, 0x008b817a, regular_font, Win32.dt_right);
 }
 
 fn pageHeading(dc: Win32.DeviceContext, heading: Phrase, subtitle: Phrase) void {
-    localizedText(dc, heading, .{ .left = 282, .top = 42, .right = 1000, .bottom = 82 }, 0x00f4f0ea, title_font, Win32.dt_left);
+    localizedText(dc, heading, .{ .left = 282, .top = 42, .right = 966, .bottom = 82 }, 0x00f4f0ea, title_font, Win32.dt_left);
     localizedText(dc, subtitle, .{ .left = 282, .top = 91, .right = 1086, .bottom = 118 }, 0x009b9088, regular_font, Win32.dt_left);
     roundFill(dc, .{ .left = 984, .top = 44, .right = 1086, .bottom = 72 }, 14, 0x00342a25);
     // The label needs the pill's whole inner width. A narrower rectangle
@@ -1617,7 +1910,7 @@ fn pageHeading(dc: Win32.DeviceContext, heading: Phrase, subtitle: Phrase) void 
 
 fn drawFooter(dc: Win32.DeviceContext) void {
     if (status_length == 0) return;
-    text(dc, &status_text, @intCast(status_length), .{ .left = 600, .top = 124, .right = 1086, .bottom = 146 }, if (status_error) 0x006b77ff else 0x0068d391, small_font, Win32.dt_right | Win32.dt_end_ellipsis);
+    text(dc, &status_text, @intCast(status_length), .{ .left = 600, .top = 124, .right = 1086, .bottom = 146 }, if (status_error) 0x006b77ff else 0x0068d391, small_font, languageTextFormat(language, Win32.dt_right | Win32.dt_end_ellipsis));
 }
 
 fn drawModeCard(dc: Win32.DeviceContext, mode: InputMode, rectangle: Rect, heading: Phrase, subtitle: Phrase) void {
@@ -1625,14 +1918,17 @@ fn drawModeCard(dc: Win32.DeviceContext, mode: InputMode, rectangle: Rect, headi
     roundFill(dc, rectangle, 12, if (selected) 0x0042362e else 0x00251f1b);
     if (selected) roundFill(dc, .{ .left = rectangle.left + 14, .top = rectangle.top + 16, .right = rectangle.left + 24, .bottom = rectangle.top + 26 }, 5, 0x00ffac64);
     localizedText(dc, heading, .{ .left = rectangle.left + 36, .top = rectangle.top + 13, .right = rectangle.right - 12, .bottom = rectangle.top + 38 }, 0x00f4f0ea, medium_font, Win32.dt_left);
-    localizedText(dc, subtitle, .{ .left = rectangle.left + 36, .top = rectangle.top + 44, .right = rectangle.right - 12, .bottom = rectangle.top + 66 }, 0x008b817a, small_font, Win32.dt_left);
+    // The controller subtitle shares its row with four slot buttons. Limit its
+    // rectangle before applying RTL alignment so neither can cover the other.
+    const subtitle_right = if (subtitle == .xinput_slot) controllerSlotRect(0).left - 8 else rectangle.right - 12;
+    localizedText(dc, subtitle, .{ .left = rectangle.left + 36, .top = rectangle.top + 44, .right = subtitle_right, .bottom = rectangle.top + 66 }, 0x008b817a, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
 }
 
 fn drawLanguageCard(dc: Win32.DeviceContext, value: Language, rectangle: Rect, label: []const u8) void {
     const selected = language == value;
     roundFill(dc, rectangle, 10, if (selected) 0x0042362e else 0x00251f1b);
     if (selected) roundFill(dc, .{ .left = rectangle.left + 14, .top = rectangle.top + 23, .right = rectangle.left + 24, .bottom = rectangle.top + 33 }, 5, 0x00ffac64);
-    textUtf8(dc, label, .{ .left = rectangle.left + 36, .top = rectangle.top + 18, .right = rectangle.right - 12, .bottom = rectangle.bottom - 10 }, 0x00f4f0ea, medium_font, Win32.dt_left);
+    textUtf8(dc, label, .{ .left = rectangle.left + 36, .top = rectangle.top + 18, .right = rectangle.right - 12, .bottom = rectangle.bottom - 10 }, 0x00f4f0ea, medium_font, languageTextFormat(value, Win32.dt_left));
 }
 
 fn card(dc: Win32.DeviceContext, rectangle: Rect) void {
@@ -1712,7 +2008,16 @@ fn textUtf8(dc: Win32.DeviceContext, value: []const u8, rectangle: Rect, color: 
 }
 
 fn localizedText(dc: Win32.DeviceContext, phrase: Phrase, rectangle: Rect, color: u32, font: Win32.Font, format: u32) void {
-    textUtf8(dc, tr(phrase), rectangle, color, font, format);
+    textUtf8(dc, tr(phrase), rectangle, color, font, languageTextFormat(language, format));
+}
+
+fn languageTextFormat(value: Language, format: u32) u32 {
+    if (value != .arabic) return format;
+    // Give GDI the paragraph direction for Arabic shaping and mixed Latin text.
+    // Keep centered buttons centered; paths, artwork and key names use text()
+    // directly and retain their own direction.
+    const alignment = if (format & (Win32.dt_center | Win32.dt_right) == 0) Win32.dt_right else @as(u32, 0);
+    return format | alignment | Win32.dt_rtl_reading;
 }
 
 fn chooseGameFolder(owner: Win32.Window) void {
@@ -1914,7 +2219,7 @@ fn loadSettings() void {
     const mode_value = Win32.GetPrivateProfileIntW(w("launcher"), w("input_mode"), 2, @ptrCast(&ini_path));
     if (mode_value <= 2) input_mode = @enumFromInt(mode_value);
     const language_value = Win32.GetPrivateProfileIntW(w("launcher"), w("language"), 0, @ptrCast(&ini_path));
-    if (language_value <= 3) language = @enumFromInt(language_value);
+    if (language_value < @typeInfo(Language).@"enum".fields.len) language = @enumFromInt(language_value);
     const controller_value = Win32.GetPrivateProfileIntW(w("launcher"), w("controller_index"), 0, @ptrCast(&ini_path));
     if (controller_value <= 3) controller_index = @intCast(controller_value);
     for (0..mapping.len) |index| {
@@ -2130,6 +2435,7 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     const dt_word_break: u32 = 0x0010;
     const dt_no_prefix: u32 = 0x0800;
     const dt_end_ellipsis: u32 = 0x8000;
+    const dt_rtl_reading: u32 = 0x20000;
     const di_normal: u32 = 0x0003;
     const null_pen: i32 = 8;
     const arrow_cursor: [*:0]const u16 = @ptrFromInt(32512);
