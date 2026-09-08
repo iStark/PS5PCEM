@@ -18,6 +18,7 @@ pub const shaders = @import("shaders.zig");
 pub const scalar_provenance = @import("scalar_provenance.zig");
 pub const shader_analysis = @import("shader_analysis.zig");
 pub const tiling = @import("tiling.zig");
+pub const parallel_copy = @import("parallel_copy.zig");
 pub const executor = @import("executor.zig");
 pub const scheduler = @import("scheduler.zig");
 

@@ -3379,6 +3379,63 @@ fn runBufferContentCacheProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("buffer content cache passed: unchanged reuse, full-range native writes, GPU overwrites and unavailable-fingerprint fallback\n", .{});
 }
 
+fn runParallelCopyProbe(allocator: std.mem.Allocator) !void {
+    const size = 16 * 1024 * 1024;
+    const base = 0x10000;
+    const Memory = struct {
+        bytes: [base + size]u8 = undefined,
+        pool: gpu.parallel_copy.Pool = .{ .participants = .init(4) },
+        fn read(context: ?*anyopaque, address: u64, destination: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (address > self.bytes.len or destination.len > self.bytes.len - address) return false;
+            self.pool.copy(destination, self.bytes[@intCast(address)..][0..destination.len]);
+            return true;
+        }
+        fn write(context: ?*anyopaque, address: u64, source: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (address > self.bytes.len or source.len > self.bytes.len - address) return false;
+            self.pool.copy(self.bytes[@intCast(address)..][0..source.len], source);
+            return true;
+        }
+    };
+    const guest = try allocator.create(Memory);
+    defer allocator.destroy(guest);
+    guest.* = .{};
+    defer guest.pool.deinit();
+    @memset(&guest.bytes, 0);
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true, .defer_small_storage_writes = true });
+    defer renderer.deinit();
+    _ = renderer.dcbBackend(.{ .context = guest, .read = Memory.read, .write = Memory.write });
+    const code = [_]u32{
+        vop1(1, 0, 8), vop1(1, 1, 255), 0x1234_5678,
+        0xe070_1000, 0x8000_0100, // write one dword inside the large V#s0
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, i| std.mem.writeInt(u32, guest.bytes[0x100 + i * 4 ..][0..4], word, .little);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 9 << 1);
+    for ([_]u32{ base, 4 << 16, size / 4, 0 }, 0..) |word, i| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+    for ([_]u8{ 4, 1, 2, 4 }, 0..) |participants, pass| {
+        guest.pool.participants.store(participants, .release);
+        const bytes = guest.bytes[base..];
+        for (bytes, 0..) |*byte, i| byte.* = @truncate(i *% 17 +% (i >> 12) +% pass);
+        const offset: u32 = @intCast(if (pass == 3) size - 4 else pass * size / 4);
+        try state.writeRegister(.shader, compute.userDataBase() + 8, offset);
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        try renderer.flushPendingGuestWrites();
+        try std.testing.expectEqual(@as(u32, 0x1234_5678), std.mem.readInt(u32, bytes[offset..][0..4], .little));
+        for (bytes, 0..) |byte, i| {
+            if (i >= offset and i < offset + 4) continue;
+            try std.testing.expectEqual(@as(u8, @truncate(i *% 17 +% (i >> 12) +% pass)), byte);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), guest.pool.worker_count);
+    std.debug.print("parallel copy passed: 16 MiB Vulkan uploads/readbacks, 1/2/4 participants, CPU updates and partial GPU writes\n", .{});
+}
+
 fn runLargeIndirectImageProbe(allocator: std.mem.Allocator) !void {
     const count = 4352;
     const groups = count + 1;
@@ -3995,6 +4052,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-reuse")) {
         try runQueuedBufferReuseProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--parallel-copy")) {
+        try runParallelCopyProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--inline-metadata")) {

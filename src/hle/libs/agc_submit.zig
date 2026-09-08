@@ -870,7 +870,7 @@ pub fn readGuestMemory(_: ?*anyopaque, address: u64, bytes: []u8) bool {
     // reservation too, but do not necessarily have committed CPU pages there.
     const resolved = resolveGuestMemoryAddress(address, bytes.len) orelse return false;
     const source: [*]const u8 = @ptrFromInt(resolved);
-    @memcpy(bytes, source[0..bytes.len]);
+    gpu.parallel_copy.guest_copy_pool.copy(bytes, source[0..bytes.len]);
     return true;
 }
 
@@ -907,7 +907,7 @@ pub fn writeGuestMemory(context: ?*anyopaque, address: u64, bytes: []const u8) b
     const resolved = resolveGuestMemoryAddress(address, bytes.len) orelse return false;
     if (addressSpaceFromContext(context)) |space| space.notifyGuestWrite(resolved, bytes.len);
     const destination: [*]u8 = @ptrFromInt(resolved);
-    @memcpy(destination[0..bytes.len], bytes);
+    gpu.parallel_copy.guest_copy_pool.copy(destination[0..bytes.len], bytes);
     if (resolved != address) kernel_runtime.wakeSyncAddress(resolved, std.math.maxInt(usize));
     // A completion published from the HLE side is a label like any other, and
     // a queue may be parked on it inside a snapshotted arena.
@@ -1719,6 +1719,7 @@ pub fn presentFlip(flip: gpu.state.Flip) bool {
 pub fn reset() void {
     execution_lock.lock();
     defer execution_lock.unlock();
+    gpu.parallel_copy.guest_copy_pool.deinit();
     installed_backend = null;
     submission_scheduler.deinit();
     submission_scheduler = gpu.QueueScheduler.init(std.heap.page_allocator, executor_backend);

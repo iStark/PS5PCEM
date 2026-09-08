@@ -2,6 +2,60 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Parallel guest-memory copies on 2026-09-08
+
+Large AGC guest-memory reads and writes can now split their copies between the
+calling thread and up to three persistent helpers. Helpers sleep between jobs;
+the callback waits for every partition before returning. Address validation,
+write notification and guest label publication retain their ordering. Ranges
+below 4 MiB, concurrent/reentrant callers and unavailable helpers use the serial
+path. Partitions preserve unaligned outer boundaries and meet on destination
+cache-line boundaries. Runtime reset joins and destroys the helpers.
+
+`PS5_GPU_COPY_WORKERS=1` selects serial copies; `2` or `4` includes the calling
+thread in that limit. The runner defaults to four participants for Yotei and
+one for other titles. This setting changes CPU copying only.
+
+On the Ryzen 7 7700, the following isolated medians copy a total of 1 GiB per
+batch, alternating 1/2/4/2/1 participants across three passes. The game and
+compiler are stopped during this measurement. All copied bytes match.
+
+| Buffer size | One participant | Two participants | Four participants |
+| --- | --- | --- | --- |
+| 4 MiB | 16.63 ms | 11.51 ms | 7.79 ms |
+| 16 MiB | 38.13 ms | 20.96 ms | 14.24 ms |
+| 64 MiB | 67.55 ms | 55.95 ms | 54.89 ms |
+| 128 MiB | 78.02 ms | 62.63 ms | 57.64 ms |
+
+These are copy timings, not FPS multipliers. CPU tests exercise unaligned
+boundaries, concurrent callers, restart and unavailable-worker fallback. The
+Vulkan probe uploads and reads back 16 MiB buffers with 1/2/4 participants,
+native updates and partial GPU writes, checking every resulting byte. It and
+the full smoke, queued-buffer reuse, content-cache and image-scratch probes pass
+with the Vulkan SDK validation layer enabled.
+
+A same-process comparison after scene compilation alternates only the copy
+participant limit. Each interval spans ten frames; the first two transition
+frames are excluded from these medians. Buffer-content hashing and page
+tracking stay disabled, and the earlier image scratch/tiling changes stay active.
+
+| Participants | Flips | Frame time | Buffer preparation | Draws / compute dispatches |
+| --- | --- | --- | --- | --- |
+| 4 initially | 974–981 | 7,240.5 ms | 766.5 ms | 291 / 1,163 |
+| 1 | 984–991 | 7,497 ms | 1,040 ms | 289 / 1,163 |
+| 4 again | 994–1001 | 7,228 ms | 790 ms | 289.5 / 1,163.5 |
+
+The four-participant intervals give about 3.5–3.7% more FPS on this workload:
+approximately 0.133 to 0.138 FPS. Available physical memory at interval boundaries
+ranges from 1.2 to 2.3 GiB. This does not establish a comparable improvement in
+other scenes or loading time. One preceding transition frame spends about
+150 seconds compiling compute pipelines; that cost is outside this copy
+optimization and outside the steady-frame comparison.
+
+The actual presented GPU frame at flip 1088 retains the Digital Deluxe Bonus
+text and Cross. Capture runs after the comparison and is disabled again
+afterwards. Complete menu rendering remains unverified.
+
 ## Temporary image memory and swizzle locality on 2026-09-08
 
 Synchronous image staging and writeback now borrow temporary CPU buffers from

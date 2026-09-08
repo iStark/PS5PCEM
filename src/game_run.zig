@@ -604,6 +604,12 @@ fn run(init: std.process.Init) !bool {
         allocator,
         "PS5_GPU_BUFFER_CONTENT_CACHE",
     ) catch false;
+    const default_copy_workers: u8 = if (std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id)) 4 else 1;
+    const gpu_copy_workers: u8 = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_COPY_WORKERS")) |text| parse: {
+        defer allocator.free(text);
+        break :parse std.math.clamp(std.fmt.parseInt(u8, text, 10) catch default_copy_workers, 1, gpu.parallel_copy.Pool.maximum_participants);
+    } else |_| default_copy_workers;
+    gpu.parallel_copy.guest_copy_pool.participants.store(gpu_copy_workers, .release);
     if (builtin.os.tag == .windows and !force_headless) live_gpu: {
         host_window.init(1280, 720) catch |err| {
             try stderr.print("live Vulkan window unavailable: {s}; continuing headless\n", .{@errorName(err)});
@@ -702,7 +708,7 @@ fn run(init: std.process.Init) !bool {
             native.height,
         });
         try out.print(
-            "  GPU flags ir={d} ssa={d} async_pso={d} aliases={d} depth_io={d} image_state_opt={d} timeline={d} timeline_auto={d} defer_storage={d} defer_storage_auto={d} page_tracker={d} buffer_content_cache={d}\n",
+            "  GPU flags ir={d} ssa={d} async_pso={d} aliases={d} depth_io={d} image_state_opt={d} timeline={d} timeline_auto={d} defer_storage={d} defer_storage_auto={d} page_tracker={d} buffer_content_cache={d} copy_workers={d}\n",
             .{
                 @intFromBool(enable_shader_ir),
                 @intFromBool(enable_shader_ssa),
@@ -716,6 +722,7 @@ fn run(init: std.process.Init) !bool {
                 @intFromBool(enable_automatic_deferred_storage_writes),
                 @intFromBool(enable_gpu_page_tracker),
                 @intFromBool(enable_gpu_buffer_content_cache),
+                gpu_copy_workers,
             },
         );
     }
