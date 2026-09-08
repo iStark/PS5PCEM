@@ -18,17 +18,14 @@ const videodec2 = @import("videodec2.zig");
 const trace = @import("../trace.zig");
 const symbols = @import("../symbols.zig");
 
-
 pub const agc_exports = [_]symbols.Export{
     .{ .name = "libSceAgc:7Wa3aeJgeVU", .function = trace.wrap("libSceAgc:7Wa3aeJgeVU", &services.accept), .id_override = "7Wa3aeJgeVU" },
     .{ .name = "libSceAgc:rP5xLdOf26k", .function = trace.wrap("libSceAgc:rP5xLdOf26k", &services.accept), .id_override = "rP5xLdOf26k" },
-    .{ .name = "libSceAgc:HV4j+E0MBHE", .function = trace.wrap("libSceAgc:HV4j+E0MBHE", &services.accept), .id_override = "HV4j+E0MBHE" },
     .{ .name = "libSceAgc:k0E7vkgqAuE", .function = trace.wrap("libSceAgc:k0E7vkgqAuE", &services.accept), .id_override = "k0E7vkgqAuE" },
     .{ .name = "libSceAgc:gQkqkLttcpw", .function = trace.wrap("libSceAgc:gQkqkLttcpw", &services.accept), .id_override = "gQkqkLttcpw" },
     .{ .name = "libSceAgc:qj7QZpgr9Uw", .function = trace.wrap("libSceAgc:qj7QZpgr9Uw", &services.accept), .id_override = "qj7QZpgr9Uw" },
     .{ .name = "libSceAgc:zARR5aCmkoY", .function = trace.wrap("libSceAgc:zARR5aCmkoY", &services.accept), .id_override = "zARR5aCmkoY" },
 };
-
 
 pub const avplayer_exports = [_]symbols.Export{
     .{ .name = "sceAvPlayerAddSource", .function = trace.wrap("sceAvPlayerAddSource", &av_player.addSource), .expect_id = "KMcEa+rHsIo" },
@@ -201,7 +198,6 @@ pub const net_exports = [_]symbols.Export{
     .{ .name = "sceNetResolverStartNtoaMultipleRecords", .function = trace.wrap("sceNetResolverStartNtoaMultipleRecords", &services.offline), .expect_id = "RCCY01Xd+58" },
     .{ .name = "sceNetResolverStartAton", .function = trace.wrap("sceNetResolverStartAton", &services.offline), .expect_id = "Apb4YDxKsRI" },
 };
-
 
 pub const npauth_exports = [_]symbols.Export{
     .{ .name = "sceNpAuthPollAsync", .function = trace.wrap("sceNpAuthPollAsync", &services.offline), .expect_id = "gjSyfzSsDcE" },

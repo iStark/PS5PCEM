@@ -1058,9 +1058,8 @@ pub const AddressSpace = struct {
         defer self.mutex.unlock();
 
         const end = address + size;
-        const reservation = for (self.mappings.items) |mapping| {
-            if (mapping.kind != .reserved) continue;
-            if (mapping.address <= address and end <= mapping.end()) break mapping;
+        for (self.mappings.items) |mapping| {
+            if (mapping.kind == .reserved and mapping.address <= address and end <= mapping.end()) break;
         } else return Error.RangeNotMapped;
 
         var replacement: std.ArrayList(Mapping) = .empty;
@@ -1080,22 +1079,13 @@ pub const AddressSpace = struct {
             true,
         );
 
-        const spans_host_holes = !self.ownsLocked(reservation.address, reservation.size);
-        // A normal reservation was isolated as one exact placeholder. A huge
-        // semantic reservation can span small host holes; for that case carve
-        // only within the real owned/free placeholder containing this concrete
-        // mapping and never touch the host allocation in the hole.
-        const placeholder = if (spans_host_holes)
-            self.hostFreeRangeIgnoringReservationsLocked(address, size) orelse
-                return Error.AddressUnavailable
-        else
-            Range{ .start = reservation.address, .end = reservation.end() };
+        // Guest reservations are metadata. A later reservation can coalesce
+        // the remaining host placeholders, so query the actual host boundary
+        // even when this reservation does not span a host-owned hole.
+        const placeholder = self.hostFreeRangeIgnoringReservationsLocked(address, size) orelse
+            return Error.AddressUnavailable;
         const host_view_size = hostMappingViewSize(kind, address, size, backing_offset);
-        if (spans_host_holes) {
-            try hostPrepareMappingPlaceholders(placeholder, address, size, host_view_size);
-        } else {
-            try hostSplitWithinPlaceholder(placeholder, address, size, host_view_size);
-        }
+        try hostPrepareMappingPlaceholders(placeholder, address, size, host_view_size);
         errdefer hostCoalescePlaceholder(placeholder) catch {};
 
         if (kind == .direct_memory) {
@@ -2325,4 +2315,22 @@ test "large semantic reservation can span small host holes" {
         start + 6 * page_size,
         page_size,
     ) == null);
+}
+
+test "fill reservation after neighboring allocation changes host placeholder boundaries" {
+    var space = try AddressSpace.initWithDirectMemory(testing.allocator, 16 * page_size);
+    defer space.deinit();
+    const first = try space.reserve(.system_managed, 0x200000000, 8 * page_size, page_size);
+    try space.mapInReservation(first, 7 * page_size, .read_write, .direct_memory, 0);
+    // Leave a gap: carving this reserve coalesces the first one's reserved
+    // tail into a larger host placeholder. Its guest boundary stays intact.
+    const neighbor = try space.reserve(.system_managed, first + 9 * page_size, 4 * page_size, page_size);
+    try space.mapInReservation(first + 7 * page_size, page_size, .read_write, .direct_memory, 7 * page_size);
+    try space.write(first + 7 * page_size, "tail");
+    var observed: [4]u8 = undefined;
+    try space.read(first + 7 * page_size, &observed);
+    try testing.expectEqualStrings("tail", &observed);
+    try testing.expectEqual(MappingKind.reserved, space.query(neighbor, false).?.kind);
+    try testing.expectEqual(@as(u64, 4 * page_size), space.query(neighbor, false).?.size);
+    try testing.expect(space.query(first + 8 * page_size, false) == null);
 }

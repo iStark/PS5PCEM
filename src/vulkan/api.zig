@@ -1107,6 +1107,8 @@ pub const ImageResolve = extern struct {
     extent: Extent3D,
 };
 
+pub const ImageCopy = ImageResolve;
+
 pub const PfnVoidFunction = ?*const anyopaque;
 pub const PfnGetInstanceProcAddr = *const fn (?Instance, [*:0]const u8) callconv(call) PfnVoidFunction;
 pub const PfnGetDeviceProcAddr = *const fn (Device, [*:0]const u8) callconv(call) PfnVoidFunction;
@@ -1206,6 +1208,7 @@ pub const PfnCmdClearColorImage = *const fn (CommandBuffer, Image, u32, *const C
 pub const PfnCmdClearDepthStencilImage = *const fn (CommandBuffer, Image, u32, *const ClearDepthStencilValue, u32, [*]const ImageSubresourceRange) callconv(call) void;
 pub const PfnCmdCopyBuffer = *const fn (CommandBuffer, Buffer, Buffer, u32, [*]const BufferCopy) callconv(call) void;
 pub const PfnCmdCopyImageToBuffer = *const fn (CommandBuffer, Image, u32, Buffer, u32, [*]const BufferImageCopy) callconv(call) void;
+pub const PfnCmdCopyImage = *const fn (CommandBuffer, Image, u32, Image, u32, u32, [*]const ImageCopy) callconv(call) void;
 pub const PfnCmdCopyBufferToImage = *const fn (CommandBuffer, Buffer, Image, u32, u32, [*]const BufferImageCopy) callconv(call) void;
 pub const PfnCmdBlitImage = *const fn (CommandBuffer, Image, u32, Image, u32, u32, [*]const ImageBlit, u32) callconv(call) void;
 pub const PfnCmdResolveImage = *const fn (CommandBuffer, Image, u32, Image, u32, u32, [*]const ImageResolve) callconv(call) void;

@@ -594,6 +594,14 @@ tail. Shader constructors validate their AGC headers, relocate internal
 pointers and program addresses, and apply the recovered program-register pairs.
 Everything remains walkable through [`gpu.pm4`](../../src/gpu/pm4.zig).
 
+Both `sceAgcCreateInterpolantMapping` and `Mapping2` match pixel-input semantic
+IDs to the shader's actual parameter export slots and initialize all 32 input
+controls. The legacy entry previously accepted the call without writing its
+output. Cat Quest III exports position as PARAM2 and its UI clipping mask as
+PARAM3; positional input linking selected the wrong value and made the
+Catventure cards transparent. The two APIs retain their distinct packed-half
+control encoding, and a regression covers the skipped position export.
+
 `sceAgcGetRegisterDefaults2` and its internal variant expose the complete Gen5
 version-10 primary/internal pointer tables instead of an all-zero placeholder.
 This matters before command decoding: titles use those tables to construct the

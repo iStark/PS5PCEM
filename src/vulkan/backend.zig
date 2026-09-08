@@ -21,6 +21,7 @@ const detile_spirv = @import("detile_spirv.zig");
 const image_alias = @import("image_alias.zig");
 const image_state = @import("image_state.zig");
 const pipeline_compiler = @import("pipeline_compiler.zig");
+const spirv_cache = @import("spirv_cache.zig");
 
 /// Set to true to enable verbose per-frame GPU debug logging.
 /// Disable for performance — each print is a blocking I/O syscall.
@@ -318,6 +319,9 @@ pub const DisplayBuffer = struct {
     pitch_in_pixels: u32,
     /// SceVideoOutTilingMode: 0 is the display-tiled layout, 1 is linear.
     tiling_mode: u32 = 0,
+    /// VideoOut channel order is independent of the last CB/texture view.
+    /// Zero retains the legacy RGBA interpretation for unspecified formats.
+    pixel_format: u64 = 0,
 };
 
 pub const DisplayBufferResolver = struct {
@@ -530,6 +534,7 @@ const DeviceFunctions = struct {
     cmd_clear_depth_stencil_image: vk.PfnCmdClearDepthStencilImage,
     cmd_copy_buffer: vk.PfnCmdCopyBuffer,
     cmd_copy_image_to_buffer: vk.PfnCmdCopyImageToBuffer,
+    cmd_copy_image: vk.PfnCmdCopyImage,
     cmd_copy_buffer_to_image: vk.PfnCmdCopyBufferToImage,
     cmd_blit_image: vk.PfnCmdBlitImage,
     cmd_resolve_image: vk.PfnCmdResolveImage,
@@ -605,6 +610,7 @@ const DeviceFunctions = struct {
             .cmd_clear_depth_stencil_image = try deviceProc(get_proc, device, vk.PfnCmdClearDepthStencilImage, "vkCmdClearDepthStencilImage"),
             .cmd_copy_buffer = try deviceProc(get_proc, device, vk.PfnCmdCopyBuffer, "vkCmdCopyBuffer"),
             .cmd_copy_image_to_buffer = try deviceProc(get_proc, device, vk.PfnCmdCopyImageToBuffer, "vkCmdCopyImageToBuffer"),
+            .cmd_copy_image = try deviceProc(get_proc, device, vk.PfnCmdCopyImage, "vkCmdCopyImage"),
             .cmd_copy_buffer_to_image = try deviceProc(get_proc, device, vk.PfnCmdCopyBufferToImage, "vkCmdCopyBufferToImage"),
             .cmd_blit_image = try deviceProc(get_proc, device, vk.PfnCmdBlitImage, "vkCmdBlitImage"),
             .cmd_resolve_image = try deviceProc(get_proc, device, vk.PfnCmdResolveImage, "vkCmdResolveImage"),
@@ -3113,6 +3119,7 @@ pub const Renderer = struct {
     compute_pipelines: std.ArrayList(ComputePipelineEntry) = .empty,
     compute_pipeline_sequence: u64 = 0,
     graphics_pipelines: std.ArrayList(GraphicsPipelineEntry) = .empty,
+    graphics_translations: spirv_cache.Cache = .{},
     /// Coherency domain shared by all Vulkan image caches. Separately-created
     /// host images which overlap in guest memory observe the same generation.
     image_aliases: image_alias.Manager = .{},
@@ -3979,6 +3986,7 @@ pub const Renderer = struct {
             self.allocator.free(entry.fragment_words);
         }
         self.graphics_pipelines.deinit(self.allocator);
+        self.graphics_translations.deinit(self.allocator);
         for (self.analyzed_programs.items) |*entry| entry.analysis.deinit(self.allocator);
         self.analyzed_programs.deinit(self.allocator);
         for (self.completed_frames.items) |*frame| frame.pixels.deinit(self.allocator);
@@ -4317,14 +4325,14 @@ pub const Renderer = struct {
         if (packedHdrSwapchainFormat(self.render_targets.items[target_index].target.format.vulkan)) {
             return self.presentResidentTarget(target_index, flip);
         }
-        try self.blitRenderTargetToSwapchain(target_index);
+        try self.blitRenderTargetToSwapchain(target_index, flip);
         return true;
     }
 
     /// Presents a resident color attachment without a GPU→CPU→GPU round trip.
     /// Vulkan performs format conversion and 1920×1080→window scaling in the
     /// blit; the source returns to attachment layout for the next guest draw.
-    fn blitRenderTargetToSwapchain(self: *Renderer, target_index: usize) anyerror!void {
+    fn blitRenderTargetToSwapchain(self: *Renderer, target_index: usize, flip: ?gpu.state.Flip) anyerror!void {
         if (self.present_in_flight) return Error.PresentationRejected;
         self.present_in_flight = true;
         defer self.present_in_flight = false;
@@ -4338,6 +4346,11 @@ pub const Renderer = struct {
         if (!target.initialized or target.target.descriptor.fragments_log2 != 0) {
             return Error.MissingPresentedFrame;
         }
+        const bgra_source = if (target.target.format.vulkan == vk.format_r8g8b8a8_unorm and
+            self.scanoutSwapsRedBlue(target.target.descriptor.address, flip))
+            try self.acquireMagnifySourceImage(target.target.descriptor.width, target.target.descriptor.height, vk.format_b8g8r8a8_unorm)
+        else
+            null;
         const presentation = &(self.window_presentation orelse return Error.PresentationRejected);
 
         if (self.device_functions.reset_fences(self.device, 1, @ptrCast(&presentation.acquire_fence)) != vk.success) {
@@ -4394,6 +4407,9 @@ pub const Renderer = struct {
             before_blit.len,
             @ptrCast(&before_blit),
         );
+        if (bgra_source) |source| {
+            try self.copyScanoutImage(command_buffer, target.image.handle, source.handle, target.target.descriptor.width, target.target.descriptor.height);
+        }
         const blit = vk.ImageBlit{
             .source_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
             .source_offsets = .{
@@ -4416,7 +4432,7 @@ pub const Renderer = struct {
         };
         self.device_functions.cmd_blit_image(
             command_buffer,
-            target.image.handle,
+            if (bgra_source) |source| source.handle else target.image.handle,
             vk.image_layout_transfer_src_optimal,
             presentation.images[image_index],
             vk.image_layout_transfer_dst_optimal,
@@ -4468,6 +4484,39 @@ pub const Renderer = struct {
         };
         const presented = presentation.swapchain_functions.queue_present(self.queue, &present_info);
         if (presented != vk.success and presented != vk.suboptimal_khr) return Error.SwapchainPresentFailed;
+    }
+
+    fn scanoutSwapsRedBlue(self: *Renderer, address: u64, flip: ?gpu.state.Flip) bool {
+        const resolver = self.display_buffer_resolver orelse return false;
+        const buffer = resolver.resolve(resolver.context, flip orelse return false) orelse return false;
+        // Offscreen compatibility layers and decoded movie surfaces have their
+        // own colour interpretation; only the registered scanout uses VideoOut.
+        return buffer.address == address and buffer.pixel_format == 0x8000_0000_0000_0000;
+    }
+
+    /// Preserve physical texel bits while interpreting the scanout as BGRA.
+    /// A blit alone converts logical RGBA and therefore cannot perform this.
+    fn copyScanoutImage(self: *Renderer, command_buffer: vk.CommandBuffer, source: vk.Image, destination: vk.Image, width: u32, height: u32) Error!void {
+        var barrier = vk.ImageMemoryBarrier{
+            .source_access_mask = vk.access_transfer_read_bit | vk.access_transfer_write_bit,
+            .destination_access_mask = vk.access_transfer_write_bit,
+            .old_layout = vk.image_layout_undefined,
+            .new_layout = vk.image_layout_transfer_dst_optimal,
+            .image = destination,
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, 0, null, 1, @ptrCast(&barrier));
+        const copy = vk.ImageCopy{
+            .source_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+            .destination_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+            .extent = .{ .width = width, .height = height, .depth = 1 },
+        };
+        self.device_functions.cmd_copy_image(command_buffer, source, vk.image_layout_transfer_src_optimal, destination, vk.image_layout_transfer_dst_optimal, 1, @ptrCast(&copy));
+        barrier.source_access_mask = vk.access_transfer_write_bit;
+        barrier.destination_access_mask = vk.access_transfer_read_bit;
+        barrier.old_layout = vk.image_layout_transfer_dst_optimal;
+        barrier.new_layout = vk.image_layout_transfer_src_optimal;
+        self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, 0, null, 1, @ptrCast(&barrier));
     }
 
     /// Reuses host/device allocations for an exact guest range. Guest-authored
@@ -4670,13 +4719,15 @@ pub const Renderer = struct {
             }
             if (self.draw_uploads_enabled) {
                 for (self.draw_upload_cache.items) |cached| {
-                    if (cached.guest_address != guest_address or cached.size != size) continue;
+                    // Smaller views of an already staged prefix share its
+                    // snapshot. Keep the descriptor range exact for OOB loads.
+                    if (cached.guest_address != guest_address or cached.size < size) continue;
                     self.frame_profile.resident_storage_bytes +%= size;
                     self.updateStorageDescriptorRange(
                         descriptor_index,
                         cached.upload.buffer,
                         cached.upload.offset,
-                        cached.upload.size,
+                        size,
                     );
                     self.active_descriptor_set = self.descriptor_set;
                     return .{
@@ -12948,6 +12999,75 @@ pub const Renderer = struct {
         }
     }
 
+    /// Exercise physical RGBA -> BGRA reinterpretation and the normal Vulkan
+    /// blit conversion without requiring a window or guest title.
+    pub fn probeScanoutChannelOrder(self: *Renderer) anyerror!void {
+        const usage = vk.image_usage_transfer_src_bit | vk.image_usage_transfer_dst_bit;
+        const source = try self.createImage(2, 1, vk.format_r8g8b8a8_unorm, usage);
+        defer self.destroyImage(source);
+        const bgra = try self.createImage(2, 1, vk.format_b8g8r8a8_unorm, usage);
+        defer self.destroyImage(bgra);
+        const rgba = try self.createImage(2, 1, vk.format_r8g8b8a8_unorm, usage);
+        defer self.destroyImage(rgba);
+        const upload = try self.createBuffer(8, vk.buffer_usage_transfer_src_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        defer self.destroyBuffer(upload);
+        const readback = try self.createBuffer(16, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        defer self.destroyBuffer(readback);
+        const pixels = [_]u8{ 0x19, 0x62, 0xe3, 0xff, 0xc1, 0x38, 0x07, 0x80 };
+        try self.writeMapped(upload, &pixels);
+        const cb = try self.beginOneShot();
+        defer self.releaseOneShot(cb);
+        var barrier = vk.ImageMemoryBarrier{
+            .source_access_mask = 0,
+            .destination_access_mask = vk.access_transfer_write_bit,
+            .old_layout = vk.image_layout_undefined,
+            .new_layout = vk.image_layout_transfer_dst_optimal,
+            .image = source.handle,
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        self.device_functions.cmd_pipeline_barrier(cb, vk.pipeline_stage_top_of_pipe_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, 0, null, 1, @ptrCast(&barrier));
+        var copy = vk.BufferImageCopy{ .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit }, .image_extent = .{ .width = 2, .height = 1, .depth = 1 } };
+        self.device_functions.cmd_copy_buffer_to_image(cb, upload.handle, source.handle, vk.image_layout_transfer_dst_optimal, 1, @ptrCast(&copy));
+        barrier.source_access_mask = vk.access_transfer_write_bit;
+        barrier.destination_access_mask = vk.access_transfer_read_bit;
+        barrier.old_layout = vk.image_layout_transfer_dst_optimal;
+        barrier.new_layout = vk.image_layout_transfer_src_optimal;
+        self.device_functions.cmd_pipeline_barrier(cb, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, 0, null, 1, @ptrCast(&barrier));
+        try self.copyScanoutImage(cb, source.handle, bgra.handle, 2, 1);
+        barrier.image = rgba.handle;
+        barrier.source_access_mask = 0;
+        barrier.destination_access_mask = vk.access_transfer_write_bit;
+        barrier.old_layout = vk.image_layout_undefined;
+        barrier.new_layout = vk.image_layout_transfer_dst_optimal;
+        self.device_functions.cmd_pipeline_barrier(cb, vk.pipeline_stage_top_of_pipe_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, 0, null, 1, @ptrCast(&barrier));
+        const blit = vk.ImageBlit{
+            .source_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+            .destination_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+            .source_offsets = .{ .{ .x = 0, .y = 0, .z = 0 }, .{ .x = 2, .y = 1, .z = 1 } },
+            .destination_offsets = .{ .{ .x = 0, .y = 0, .z = 0 }, .{ .x = 2, .y = 1, .z = 1 } },
+        };
+        self.device_functions.cmd_blit_image(cb, bgra.handle, vk.image_layout_transfer_src_optimal, rgba.handle, vk.image_layout_transfer_dst_optimal, 1, @ptrCast(&blit), vk.filter_nearest);
+        // Reusing the scratch image must wait for its preceding transfer read.
+        try self.copyScanoutImage(cb, source.handle, bgra.handle, 2, 1);
+        barrier.source_access_mask = vk.access_transfer_write_bit;
+        barrier.destination_access_mask = vk.access_transfer_read_bit;
+        barrier.old_layout = vk.image_layout_transfer_dst_optimal;
+        barrier.new_layout = vk.image_layout_transfer_src_optimal;
+        self.device_functions.cmd_pipeline_barrier(cb, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, 0, null, 1, @ptrCast(&barrier));
+        self.device_functions.cmd_copy_image_to_buffer(cb, rgba.handle, vk.image_layout_transfer_src_optimal, readback.handle, 1, @ptrCast(&copy));
+        copy.buffer_offset = 8;
+        self.device_functions.cmd_copy_image_to_buffer(cb, source.handle, vk.image_layout_transfer_src_optimal, readback.handle, 1, @ptrCast(&copy));
+        const host_barrier = vk.BufferMemoryBarrier{ .source_access_mask = vk.access_transfer_write_bit, .destination_access_mask = vk.access_host_read_bit, .buffer = readback.handle, .offset = 0, .size = 16 };
+        self.device_functions.cmd_pipeline_barrier(cb, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&host_barrier), 0, null);
+        try self.submitOneShot(cb);
+        var observed: [16]u8 = undefined;
+        try self.readMapped(readback, &observed);
+        var expected = pixels;
+        swapRedBlue(&expected);
+        try std.testing.expectEqualSlices(u8, &expected, observed[0..8]);
+        try std.testing.expectEqualSlices(u8, &pixels, observed[8..16]);
+    }
+
     /// Measure the same GPU-to-host copy path used by image writebacks.
     pub fn probeHostReadback(self: *Renderer) anyerror!u64 {
         const size = 64 * 1024 * 1024;
@@ -14366,7 +14486,7 @@ pub const Renderer = struct {
         }
 
         const fragment_translate_started = hostTimestampNs();
-        var fragment_module = fragment_analysis.translateSpirv(self.allocator, .{
+        var fragment_module = self.graphics_translations.translate(self.allocator, &fragment_analysis.program, .{
             .stage = .fragment,
             // FragCoord is measured in visible render-target pixels. Dividing
             // X by the NV12 allocation pitch (2048 for a 1920-wide movie)
@@ -14394,7 +14514,7 @@ pub const Renderer = struct {
                 .value_base = dynamic_scalar_words_per_stage,
             } else null,
             .specialized_scalar_prefix_end = fragment_scalar_end,
-        }) catch |err| {
+        }, fragment_analysis.pipeline_options) catch |err| {
             if (self.shouldReportShaderFailure(fragment_address, .pixel, err)) {
                 std.debug.print(
                     "[vulkan dcb] fragment program 0x{x}: {d} instructions, translate={s} scalars={d} end=0x{x}\n",
@@ -14706,7 +14826,7 @@ pub const Renderer = struct {
                     convert_guest_depth,
                 )
             else
-                rdna2.translateProgramSpirvWithPipelineOptions(self.allocator, &vertex_program, .{
+                self.graphics_translations.translate(self.allocator, &vertex_program, .{
                     .stage = .vertex,
                     // The PS5 NGG/export ABI supplies S_NGG_VERTEX_INDEX in v5;
                     // ordinary VS programs retain the legacy v0 convention.
@@ -15707,7 +15827,7 @@ pub const Renderer = struct {
         const index = self.latest_video_render_target_index orelse return;
         if (index >= self.render_targets.items.len) return;
         if (!self.render_targets.items[index].initialized) return;
-        self.blitRenderTargetToSwapchain(index) catch return;
+        self.blitRenderTargetToSwapchain(index, null) catch return;
         self.presented_video_frames.store(self.uploaded_video_frame, .release);
     }
 
@@ -19168,9 +19288,15 @@ pub const Renderer = struct {
         return matching_rgba orelse matching orelse fallback;
     }
 
-    fn presentationPixels(self: *Renderer, frame: *const CachedFrame) ?[]const u8 {
+    fn presentationPixels(self: *Renderer, frame: *const CachedFrame, flip: gpu.state.Flip) ?[]const u8 {
         const target = frame.target orelse return frame.pixels.items;
-        if (target.format.vulkan == vk.format_r8g8b8a8_unorm) return frame.pixels.items;
+        if (target.format.vulkan == vk.format_r8g8b8a8_unorm) {
+            if (!self.scanoutSwapsRedBlue(frame.guest_address, flip)) return frame.pixels.items;
+            self.guest_frame_scratch.resize(self.allocator, frame.pixels.items.len) catch return null;
+            @memcpy(self.guest_frame_scratch.items, frame.pixels.items);
+            swapRedBlue(self.guest_frame_scratch.items);
+            return self.guest_frame_scratch.items;
+        }
         if (target.format.vulkan != vk.format_b10g11r11_ufloat_pack32 and
             target.format.vulkan != vk.format_a2b10g10r10_unorm_pack32)
         {
@@ -19231,7 +19357,7 @@ pub const Renderer = struct {
             selected_sequence = frame.sequence;
         }
         const frame = &self.completed_frames.items[selected orelse return false];
-        const pixels = self.presentationPixels(frame) orelse return false;
+        const pixels = self.presentationPixels(frame, flip) orelse return false;
         self.maybeDumpProgressFrame(pixels, frame.width, frame.height, frame.width * 4);
         const sink = self.presentation_sink orelse return true;
         return sink.present(sink.context, .{
@@ -19303,7 +19429,7 @@ pub const Renderer = struct {
             }
             if (self.latestVisibleCompletedFrame(buffer)) |idx| {
                 const cached = &self.completed_frames.items[idx];
-                const pixels = self.presentationPixels(cached) orelse return false;
+                const pixels = self.presentationPixels(cached, flip) orelse return false;
                 if (self.flip_callbacks <= 8 or log_verbose_gpu) {
                     std.debug.print(
                         "[vulkan dcb] presenting visible completed target @0x{x} for @0x{x} sequence={d} {d}x{d}\n",
@@ -19327,6 +19453,7 @@ pub const Renderer = struct {
             }
         }
 
+        if (buffer.pixel_format == 0x8000_0000_0000_0000) swapRedBlue(self.guest_frame_scratch.items);
         self.maybeDumpProgressFrame(
             self.guest_frame_scratch.items,
             buffer.width,
@@ -19847,7 +19974,7 @@ pub const Renderer = struct {
                                 return false;
                             }
                         else blk: {
-                            self.blitRenderTargetToSwapchain(target_index) catch |err| {
+                            self.blitRenderTargetToSwapchain(target_index, flip) catch |err| {
                                 self.last_flip_error = err;
                                 return false;
                             };
@@ -19932,7 +20059,7 @@ pub const Renderer = struct {
                             return false;
                         }
                     } else {
-                        self.blitRenderTargetToSwapchain(video_index) catch |err| {
+                        self.blitRenderTargetToSwapchain(video_index, null) catch |err| {
                             self.last_flip_error = err;
                             return false;
                         };
@@ -20081,7 +20208,7 @@ pub const Renderer = struct {
             self.last_flip_error = Error.MissingPresentedFrame;
             return false;
         }
-        const pixels = self.presentationPixels(cached) orelse {
+        const pixels = self.presentationPixels(cached, flip) orelse {
             self.last_flip_error = Error.MissingPresentedFrame;
             return false;
         };
@@ -24966,6 +25093,12 @@ fn layerAvailable(enumerate: vk.PfnEnumerateInstanceLayerProperties, wanted: []c
         if (std.mem.eql(u8, property.layer_name[0..length], wanted)) return true;
     }
     return false;
+}
+
+fn swapRedBlue(pixels: []u8) void {
+    std.debug.assert(pixels.len % 4 == 0);
+    var index: usize = 0;
+    while (index < pixels.len) : (index += 4) std.mem.swap(u8, &pixels[index], &pixels[index + 2]);
 }
 
 fn scalePresentedFrame(

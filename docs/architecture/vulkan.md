@@ -18,6 +18,11 @@ storage images, a 256-set descriptor/scalar ring, a persistently mapped 128 MiB
 read-only/index upload arena, its pool, persistent guest render targets, and
 image/view/sampler/render-pass/framebuffer creation. It also owns bounded
 LRU compute and graphics-pipeline caches plus a 1,024-entry sampled-image LRU.
+Graphics SPIR-V translations also have a 64 MiB, 1,024-entry LRU. Its key
+includes decoded instructions, pipeline options and all translation bindings;
+dynamic scalar values are supplied through the per-draw SSBO. Keys serialize
+fields rather than padding or pointers and are compared in full after hashing.
+This avoids repeating translation just to discover an existing Vulkan pipeline.
 When `PS5_GPU_ASYNC_PIPELINES=1`, first-use compute and graphics pipelines are created by
 [`vulkan.pipeline_compiler`](../../src/vulkan/pipeline_compiler.zig), an on-demand
 single-worker FIFO which serializes the shared driver cache and falls back to a
@@ -51,7 +56,10 @@ textures.
 Graphics draws record until a real guest ordering packet, compute/readback
 dependency, or VideoOut flip closes the batch. Each draw binds
 an immutable descriptor set and scalar slice; read-only guest buffers and index
-data receive aligned snapshots in the mapped frame arena. Vulkan objects used
+data receive aligned snapshots in the mapped frame arena. Smaller views at
+the same guest address reuse an already staged prefix,
+with an exact descriptor range. These snapshots retain the existing batch,
+submission and upload-ring invalidation boundaries. Vulkan objects used
 by recorded commands carry the batch's retirement tick. A submit signals the
 timeline semaphore once for every command-buffer prefix in that batch.
 Compatibility mode immediately waits for the submitted tick;
@@ -210,6 +218,13 @@ upload fallback. Both paths perform the required transfer/present layout
 transitions and call `vkQueuePresentKHR`. Bursts collapse to the latest pending
 frame; if no image is immediately available, that stale frame is dropped rather
 than stalling guest execution on the display refresh rate.
+The exact registered scanout retains its VideoOut pixel format. For BGRA8
+scanout backed by an RGBA8 render-target view, a bit-preserving image copy into
+a reusable BGRA8 surface precedes the scaling blit. CPU presentation and progress
+captures apply the equivalent channel conversion to a scratch copy. Guest
+memory, offscreen targets, decoded movie surfaces and HDR paths keep their own
+format interpretation. `vulkan-smoke --scanout-channels` checks asymmetric
+pixels, scratch reuse and preservation of the source image.
 The window owns its Win32 message loop on a dedicated host thread so a flip from
 any guest pthread can use the serialized GPU submission boundary safely.
 

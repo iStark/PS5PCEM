@@ -151,11 +151,22 @@ behind them.
   restore the language modal and logo fill. Fullscreen copy shortcuts require
   a complete color write mask: a later stencil clear previously overwrote the
   correctly oriented world with its stale scene input. Live testing now reaches
-  the opening island and Captain Cappey dialogue upright. The water/sky colors
-  and absent Catventure cards remain unresolved. Pre-existing guest-worker
-  faults were reproduced during startup; the successful final scene run enabled
-  firmware failure tracing. GPU coverage, S8 import/writeback, masked copies,
-  and the existing Jurassic/Yotei attachment probes pass SDK validation.
+  the opening island and Captain Cappey dialogue upright. The original AGC
+  interpolant-mapping entry now links input semantics to actual export slots,
+  restoring Catventure cards and missing terrain. Registered BGRA8 scanout
+  fixes the swapped red/blue channels without changing offscreen images.
+  Bounded translation caching and reuse of staged buffer prefixes reduce
+  repeated graphics work. On the current RTX 3070 Ti host, six warmed-up
+  opening-island samples with the local co-op HUD measured 118–181 ms, with
+  a median of 124 ms (about 8 FPS). The earlier island baseline measured
+  roughly 148 ms (6.8 FPS). Shader preparation fell from about 40 to 7 ms
+  and buffer uploads from 124–127 to roughly 65–75 MiB per frame.
+  Windows reservation commits query actual host
+  placeholder boundaries, fixing a reproduced 16 KiB mapping failure during
+  loading; all ten memory tests pass. GPU coverage, S8 import/writeback, masked
+  copies, scanout channel order and Jurassic/Yotei attachment probes pass SDK
+  validation. The project maintainer reports both Cat Quest III and Jurassic
+  Park Classic Games Collection fully playable as of 2026-09-08.
 - Jurassic Park Classic Games Collection now resolves the observed Font,
   FontFt, JPEG, Pad, VideoOut, Posix, and AGC driver imports, completes its
   Unity bootstrap, and reaches a stable visible 3840Ã—2160 intro frame. Both the

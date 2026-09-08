@@ -3310,6 +3310,23 @@ fn agcCreateInterpolantMapping2(
     geometry_shader: ?*const anyopaque,
     pixel_shader: ?*const anyopaque,
 ) callconv(abi.guest) i32 {
+    return createInterpolantMapping(output, geometry_shader, pixel_shader, false);
+}
+
+fn agcCreateInterpolantMapping(
+    output: ?[*]ShaderRegister,
+    geometry_shader: ?*const anyopaque,
+    pixel_shader: ?*const anyopaque,
+) callconv(abi.guest) i32 {
+    return createInterpolantMapping(output, geometry_shader, pixel_shader, true);
+}
+
+fn createInterpolantMapping(
+    output: ?[*]ShaderRegister,
+    geometry_shader: ?*const anyopaque,
+    pixel_shader: ?*const anyopaque,
+    legacy: bool,
+) i32 {
     const registers = output orelse return invalid_argument;
     if (!accessible(@intFromPtr(registers), 32 * @sizeOf(ShaderRegister))) return errno.KernelError.efault.raw();
     var input_count: u32 = 0;
@@ -3344,11 +3361,29 @@ fn agcCreateInterpolantMapping2(
                     break;
                 }
             }
-            value = interpolantControl(input, matching_output);
+            value = if (legacy) legacyInterpolantControl(input, matching_output) else interpolantControl(input, matching_output);
         }
         registers[index] = .{ .offset = 0x191 + @as(u32, @intCast(index)), .value = value };
     }
     return errno.ok;
+}
+
+fn legacyInterpolantControl(input: u32, output: ?u32) u32 {
+    // Both APIs match semantic IDs, but the original API enables both packed
+    // halves together. Mapping2 distinguishes the two half-valid modes.
+    if (input & 0x0030_0000 == 0) return interpolantControl(input, output);
+    const common = input & (output orelse 0);
+    var value = ((input >> 20) & 3) << 24;
+    value |= 1 << 19;
+    if (common & (1 << 20) == 0) value |= 1 << 5;
+    if (common & (1 << 21) == 0) value |= 1 << 20;
+    value |= ((input >> 28) & 3) << 8;
+    value |= ((input >> 30) & 3) << 21;
+    if (output) |semantic| {
+        value |= (semantic >> 8) & 0x1f;
+        if (input & ((1 << 22) | (1 << 24)) != 0) value |= 1 << 10;
+    }
+    return value;
 }
 
 fn interpolantControl(input: u32, output: ?u32) u32 {
@@ -3405,6 +3440,7 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcGetIsTrinityMode", .function = trace.wrap("sceAgcGetIsTrinityMode", &agcPatch), .expect_id = "BfBDZGbti7A" },
     .{ .name = "sceAgcDebugRaiseException", .function = trace.wrap("sceAgcDebugRaiseException", &agcPatch), .expect_id = "T6xuVw0KUJo" },
     .{ .name = "sceAgcCbSetShRegisterRangeDirectGetSize", .function = trace.wrap("sceAgcCbSetShRegisterRangeDirectGetSize", &agcSetShRegisterRangeDirectGetSize), .expect_id = "bxGoVxpdSPQ" },
+    .{ .name = "sceAgcCreateInterpolantMapping", .function = trace.wrap("sceAgcCreateInterpolantMapping", &agcCreateInterpolantMapping), .id_override = "HV4j+E0MBHE" },
     .{ .name = "sceAgcCreateInterpolantMapping2", .function = trace.wrap("sceAgcCreateInterpolantMapping2", &agcCreateInterpolantMapping2), .id_override = "dbOlWdppb4o" },
     .{ .name = "sceAgcUnknownKRzWekV120", .function = trace.wrap("sceAgcUnknownKRzWekV120", &agcSetIndexTypeIndexed), .id_override = "-KRzWekV120" },
     .{ .name = "sceAgcUnknownIkfdtRIqCE", .function = trace.wrap("sceAgcUnknownIkfdtRIqCE", &agcPatch), .id_override = "Ikfdt-rIqCE" },
@@ -4091,6 +4127,26 @@ test "AGC interpolant mapping initializes all entries and matches shader semanti
     std.mem.writeInt(u32, ps[0x50..0x54], 1, .little);
     writeGuestU64(@intFromPtr(&ps) + shader_input_semantics_offset, 0);
     try std.testing.expectEqual(errno.KernelError.efault.raw(), agcCreateInterpolantMapping2(&registers, &gs, &ps));
+}
+
+test "legacy AGC interpolants skip unused exports when linking clipped UI" {
+    var ps: [shader_structure_size]u8 align(8) = @splat(0);
+    var gs: [shader_structure_size]u8 align(8) = @splat(0);
+    // POSITION is still exported as PARAM2; the clipping mask is PARAM3.
+    const inputs = [_]u32{ 0xf, 0x10, 0x12 };
+    const outputs = [_]u32{ 0xf, 0x110, 0x211, 0x312 };
+    writeGuestU64(@intFromPtr(&ps) + shader_input_semantics_offset, @intFromPtr(&inputs));
+    writeGuestU64(@intFromPtr(&gs) + shader_output_semantics_offset, @intFromPtr(&outputs));
+    std.mem.writeInt(u32, ps[0x50..0x54], inputs.len, .little);
+    std.mem.writeInt(u16, gs[0x56..0x58], outputs.len, .little);
+    var registers: [32]ShaderRegister = @splat(.{ .offset = 0, .value = 0 });
+    try std.testing.expectEqual(errno.ok, agcCreateInterpolantMapping(&registers, &gs, &ps));
+    try std.testing.expectEqual(@as(u32, 0), registers[0].value);
+    try std.testing.expectEqual(@as(u32, 1), registers[1].value);
+    try std.testing.expectEqual(@as(u32, 3), registers[2].value);
+    for (registers, 0..) |entry, index| try std.testing.expectEqual(@as(u32, @intCast(0x191 + index)), entry.offset);
+    try std.testing.expectEqual(@as(u32, 0x0138_0407), legacyInterpolantControl(0x4110_0012, 0x0010_0712));
+    try std.testing.expectEqual(@as(u32, 0x320), legacyInterpolantControl(0x3000_0012, null));
 }
 
 test "AGC interpolants encode defaults flat shading and packed halves" {

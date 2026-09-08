@@ -3503,6 +3503,13 @@ pub fn main(init: std.process.Init) !void {
         try runStencilOnlyUiProbe(allocator);
         return;
     }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--scanout-channels")) {
+        var renderer = try vulkan.Renderer.init(allocator, .{});
+        defer renderer.deinit();
+        try renderer.probeScanoutChannelOrder();
+        std.debug.print("VideoOut BGRA scanout preserves guest bytes and displays RGBA colours\n", .{});
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--fragment-coverage")) {
         try runFragmentCoverageProbe(allocator);
         return;

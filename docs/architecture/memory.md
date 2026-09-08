@@ -53,6 +53,14 @@ in a host-owned hole fails explicitly. Linux uses
 result returned at any other address. No path uses a `MAP_FIXED` operation that
 could overwrite an unrelated host mapping.
 
+Committing inside a guest reservation queries the current Windows placeholder
+boundaries before splitting the host views. A later nearby reservation may
+coalesce the earlier reservation's uncommitted tail with free space without
+changing its guest metadata. Assuming both boundaries still match caused a
+16 KiB direct-memory map to fail with `CONFLICTING_ADDRESSES` during Cat Quest
+III loading. A regression fills that tail after reserving a separate neighbor
+and verifies that the neighbor and intervening gap retain their guest state.
+
 The shared direct-memory backend is a page-file section with `SEC_RESERVE` on
 Windows, a sparse `memfd` on Linux, and an immediately unlinked POSIX shared
 memory object on macOS. Section/file views replace only ranges already owned by

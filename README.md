@@ -42,8 +42,8 @@ and keeps portable settings and savedata beside the application.
 <table>
   <tr>
     <td width="50%" align="center">
-      <img src="docs/images/live-gameplay.png" alt="Terminator 2D gameplay rendered by PS5PCEM"><br>
-      <sub>Terminator 2D: No Fate — live gameplay</sub>
+      <img src="docs/images/cat-quest-iii-world.png" alt="Cat Quest III island gameplay with blue sea, mountains, characters and HUD rendered by PS5PCEM"><br>
+      <sub>Cat Quest III — island gameplay</sub>
     </td>
     <td width="50%" align="center">
       <img src="docs/images/jets-n-guns-2.png" alt="Jets 'n' Guns 2 gameplay rendered by PS5PCEM"><br>
@@ -72,8 +72,8 @@ and keeps portable settings and savedata beside the application.
   </tr>
 </table>
 
-These are development captures, not compatibility ratings. See the
-[observed title milestones](docs/project-status.md#observed-title-milestones)
+See the
+[compatibility and progress](docs/project-status.md#compatibility-and-progress)
 for the exact scope and current limits of every claim.
 
 ## What exists today
