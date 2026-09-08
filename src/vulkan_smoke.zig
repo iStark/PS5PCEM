@@ -1848,9 +1848,13 @@ fn runFullscreenOrientationProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runResidentTargetReuseProbe(allocator: std.mem.Allocator) !void {
-    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    for ([_]usize{ 64, 128 }) |limit| try runResidentTargetReuseAtLimit(allocator, limit);
+}
+
+fn runResidentTargetReuseAtLimit(allocator: std.mem.Allocator, limit: usize) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true, .render_target_cache_limit = limit });
     defer renderer.deinit();
-    var guest = GuestMemory{};
+    var guest = SizedGuestMemory(256 * 1024){};
     const vertex = [_]u32{
         vop1(6, 1, 261), vop1(1, 2, 255),  0x3f80_0000,      vop2(4, 3, 1, 2),
         vop1(1, 4, 255), 0x3f40_0000,      vop2(8, 5, 3, 4), vop2(8, 6, 3, 3),
@@ -1891,24 +1895,36 @@ fn runResidentTargetReuseProbe(allocator: std.mem.Allocator) !void {
     var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(guest.interface()), .allocator = allocator };
     // Fill the cache with independent attachments. The source becomes its oldest
     // entry, then the next draw samples it while allocating a new destination.
-    for (0..64) |i| {
+    for (0..limit) |i| {
         try state.writeRegister(.context, 0x318, @intCast((0x2000 + i * 0x400) >> 8));
         _ = try executor.execute(&stream);
         if (renderer.last_draw_error) |err| return err;
     }
     try renderer.flushPendingGuestWrites();
-    try std.testing.expectEqual(@as(usize, 64), renderer.render_targets.items.len);
+    try std.testing.expectEqual(limit, renderer.render_targets.items.len);
     const original = renderer.render_targets.items[0].image.handle;
+    // A second frame's working set must fit without any allocation misses,
+    // including attachments beyond the old 64-entry ceiling.
+    const misses = renderer.frame_profile.render_target_misses;
+    for (0..limit) |i| {
+        const handle = renderer.render_targets.items[i].image.handle;
+        try state.writeRegister(.context, 0x318, @intCast((0x2000 + i * 0x400) >> 8));
+        _ = try executor.execute(&stream);
+        if (renderer.last_draw_error) |err| return err;
+        try std.testing.expectEqual(handle, renderer.render_targets.items[i].image.handle);
+    }
+    try std.testing.expectEqual(misses, renderer.frame_profile.render_target_misses);
     const descriptors = [_]u32{ 0x20, (56 << 20) | (3 << 30), 1 | (7 << 14), 0x9000_0fac, 0, 0, 0, 0, 0, 0, 0, 0 };
     for (descriptors, 0..) |word, i|
         try state.writeRegister(.shader, pixel.userDataBase() + 4 + @as(u32, @intCast(i)), word);
     try state.writeRegister(.shader, pixel.programRegisterBase() + 3, 16 << 1);
     try state.writeRegister(.shader, pixel.programRegisterBase(), 0xa);
-    for (64..68) |i| {
+    for (limit..limit + 4) |i| {
         const destination = 0x2000 + i * 0x400;
         try state.writeRegister(.context, 0x318, @intCast(destination >> 8));
         _ = try executor.execute(&stream);
         if (renderer.last_draw_error) |err| return err;
+        try std.testing.expectEqual(limit, renderer.render_targets.items.len);
         var retained = false;
         for (renderer.render_targets.items) |target| {
             if (target.image.handle == original) retained = true;
@@ -1923,7 +1939,7 @@ fn runResidentTargetReuseProbe(allocator: std.mem.Allocator) !void {
     // queued. Upload and readback share a buffer in the resident path; compare
     // every pixel with the independent transient-buffer path, including pixels
     // outside the triangle that must retain their new CPU-authored values.
-    const destination = 0x2000 + 67 * 0x400;
+    const destination = 0x2000 + (limit + 3) * 0x400;
     const destination_index = for (renderer.render_targets.items, 0..) |target, index| {
         if (target.target.descriptor.address == destination) break index;
     } else return error.MissingReuseTarget;
@@ -1948,7 +1964,7 @@ fn runResidentTargetReuseProbe(allocator: std.mem.Allocator) !void {
             try std.testing.expect(!std.mem.eql(u8, actual[0..4], &.{ 255, 0, 0, 255 }));
         } else try std.testing.expectEqualSlices(u8, &expected, actual);
     }
-    std.debug.print("resident target reuse passed: full cache, sampled source, GPU readback, released pins, queued transfer-buffer reseeding\n", .{});
+    std.debug.print("resident target reuse passed: {d} entries, warm working set, full cache, sampled source, GPU readback, released pins, queued transfer-buffer reseeding\n", .{limit});
 }
 
 fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator) !void {

@@ -2,6 +2,53 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Retaining the color-attachment working set on 2026-09-08
+
+The 64-entry color-target cache repeatedly evicts attachments still used by
+Yotei's heavy scene. Each eviction can publish GPU-authored pixels to guest
+memory, destroy the Vulkan objects, and require another upload on reuse.
+Yotei now uses a lazy 128-entry limit. Other titles and the renderer API retain
+64 by default. `PS5_GPU_RENDER_TARGETS=64` selects the preceding limit; the
+runner accepts 64–256. Allocation matching, LRU selection, prepared-resource
+pins, video protection and writeback before eviction retain their existing
+behavior. Raising the limit does not allocate all slots in advance.
+
+`[gpu targets]` reports the occupied slots, limit and logical size of retained
+host-visible transfer buffers. `transfer_mib` excludes the separate device
+images, driver allocation padding and other caches; it is not total VRAM use.
+
+A ReleaseFast run on the Ryzen 7 7700 / RTX 3070 Ti / 32 GiB host compared 64
+with 128 in the same process after scene loading and compilation. Each interval
+contains 12 frames, discarding the first two. After raising the live limit,
+eight additional frames warm the cache before the second interval. Captures,
+compilers and smoke probes are disabled during both measured intervals.
+
+| Color-target limit | Measured flips | Median frame | Derived FPS | Target misses/frame | Target upload | Target readback | Target materialization |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 64 | 1028–1037 | 5,453 ms | 0.183 | 53.5 | 450.1 MiB | 486.7 MiB | 457.5 ms |
+| 128 | 1050–1059 | 5,180 ms | 0.193 | 0.5 | 91.7 MiB | 145.7 MiB | 101 ms |
+
+The observed FPS improvement is 5.3%. This is a single before/after comparison,
+not a universal speedup: dispatch medians are 1,060.5/1,061.5 and draw medians
+280/282, while buffer and texture traffic varies. The direct benefit is the
+reduction in attachment churn and transfers. The cache retains a median of
+81 entries after growth, with transfer buffers increasing from 603 to 653 MiB.
+Available physical memory ranges from 2.5 to 2.8 GiB during the intervals.
+
+The expanded `--target-reuse` Vulkan probe exercises both limits, verifies a
+second frame reuses every attachment (including slots beyond 64), then exceeds
+capacity while sampling the oldest source. Pixel readback, released pins and
+queued transfer-buffer reseeding are checked. This probe and full smoke pass
+SDK 1.4.357.0 synchronization validation without warnings or errors.
+
+The actual presented 3840×2160 Digital Deluxe Bonus captures at flips 1024
+and 1088 are pixel-identical. Capture is disabled again after the comparison.
+
+Compute resource preparation still takes a median 2.60 seconds in the enlarged
+cache interval, and fence waits take 1.08 seconds. These measurements overlap
+other frame counters and must not be added as independent costs. Complete
+menu/background rendering remains unverified.
+
 ## Parallel buffer fingerprints on 2026-09-08
 
 Yotei now enables content-based storage-buffer reuse by default. Unchanged

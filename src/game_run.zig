@@ -613,6 +613,11 @@ fn run(init: std.process.Init) !bool {
         break :parse std.math.clamp(std.fmt.parseInt(u8, text, 10) catch default_copy_workers, 1, gpu.parallel_copy.Pool.maximum_participants);
     } else |_| default_copy_workers;
     gpu.parallel_copy.guest_copy_pool.participants.store(gpu_copy_workers, .release);
+    const default_render_targets: usize = if (std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id)) 128 else 64;
+    const render_target_cache_limit = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_RENDER_TARGETS")) |text| parse: {
+        defer allocator.free(text);
+        break :parse std.math.clamp(std.fmt.parseInt(usize, text, 10) catch default_render_targets, 64, 256);
+    } else |_| default_render_targets;
     if (builtin.os.tag == .windows and !force_headless) live_gpu: {
         host_window.init(1280, 720) catch |err| {
             try stderr.print("live Vulkan window unavailable: {s}; continuing headless\n", .{@errorName(err)});
@@ -653,6 +658,7 @@ fn run(init: std.process.Init) !bool {
             .defer_small_storage_writes = defer_small_storage_writes,
             .enable_depth_transfer = enable_depth_transfer,
             .enable_image_state_optimization = enable_image_state_optimization,
+            .render_target_cache_limit = render_target_cache_limit,
             .native_window = .{
                 .instance = native.instance,
                 .window = native.window,
@@ -711,7 +717,7 @@ fn run(init: std.process.Init) !bool {
             native.height,
         });
         try out.print(
-            "  GPU flags ir={d} ssa={d} async_pso={d} aliases={d} depth_io={d} image_state_opt={d} timeline={d} timeline_auto={d} defer_storage={d} defer_storage_auto={d} page_tracker={d} buffer_content_cache={d} copy_workers={d}\n",
+            "  GPU flags ir={d} ssa={d} async_pso={d} aliases={d} depth_io={d} image_state_opt={d} timeline={d} timeline_auto={d} defer_storage={d} defer_storage_auto={d} page_tracker={d} buffer_content_cache={d} copy_workers={d} render_targets={d}\n",
             .{
                 @intFromBool(enable_shader_ir),
                 @intFromBool(enable_shader_ssa),
@@ -726,6 +732,7 @@ fn run(init: std.process.Init) !bool {
                 @intFromBool(enable_gpu_page_tracker),
                 @intFromBool(enable_gpu_buffer_content_cache),
                 gpu_copy_workers,
+                render_target_cache_limit,
             },
         );
     }

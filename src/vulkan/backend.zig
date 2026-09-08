@@ -218,6 +218,9 @@ pub const Options = struct {
     /// Enables read-only barrier elision and compatible aspect merging in the
     /// subresource image-state tracker. The default keeps conservative hazards.
     enable_image_state_optimization: bool = false,
+    /// Lazy bound for resident color attachments. Larger frame working sets
+    /// otherwise evict, read back and recreate the same targets every frame.
+    render_target_cache_limit: usize = 64,
     /// Optional Win32 output window. Supplying it enables the required surface
     /// and swapchain extensions and constrains device selection to a queue that
     /// can present to this exact surface.
@@ -803,7 +806,6 @@ const TextureContent = struct {
     hash: u64 = 0,
 };
 
-const maximum_render_targets = 64;
 const maximum_color_passes = 16;
 const maximum_depth_targets = 16;
 // A streamed material can combine a 3996-entry texture table with hundreds
@@ -3206,6 +3208,7 @@ pub const Renderer = struct {
     graphics_probe_colored_pixels: u32 = 0,
     graphics_probe_frame: [graphics_probe_bytes]u8 = @splat(0),
     render_targets: std.ArrayList(CachedRenderTarget) = .empty,
+    render_target_cache_limit: usize = 64,
     color_passes: std.ArrayList(ColorPass) = .empty,
     color_pass_sequence: u64 = 0,
     reported_mrt_draw: bool = false,
@@ -3912,6 +3915,7 @@ pub const Renderer = struct {
             .defer_small_storage_writes_enabled = options.defer_small_storage_writes,
             .depth_transfer_enabled = options.enable_depth_transfer,
             .image_state_optimization_enabled = options.enable_image_state_optimization,
+            .render_target_cache_limit = @max(1, options.render_target_cache_limit),
             .window_presentation = window_presentation,
         };
         renderer.image_aliases.enabled = options.enable_canonical_image_aliases;
@@ -11725,7 +11729,7 @@ pub const Renderer = struct {
         self.frame_profile.render_target_create_ns +|= elapsedHostNanoseconds(create_started);
         self.render_target_sequence +%= 1;
         cached.last_used_sequence = self.render_target_sequence;
-        if (self.render_targets.items.len >= maximum_render_targets) {
+        if (self.render_targets.items.len >= self.render_target_cache_limit) {
             const victim_index = try self.evictRenderTarget();
             self.render_targets.items[victim_index] = cached;
             self.frame_profile.render_target_misses += 1;
@@ -19751,6 +19755,8 @@ pub const Renderer = struct {
             for (self.guest_buffers.items) |cached| {
                 guest_buffer_cache_bytes +|= cached.device_local.size;
             }
+            var target_transfer_bytes: u64 = 0;
+            for (self.render_targets.items) |cached| target_transfer_bytes +|= cached.readback.size;
             std.debug.print(
                 "[gpu frame] flip={d} frame_ms={d} draws={d}/{d}ms dispatches={d}/{d}ms flip={d}ms submits={d}/{d}cmd fence_wait_us={d} upload_kib={d}(buf={d},rt={d},tex={d},idx={d}) resident_kib={d} readback_kib={d}(buf={d},rt={d}) storage_ms={d}+{d} target_ms={d} rt_hit={d} rt_miss={d} tex_hit={d} tex_miss={d} tex_evict={d} buf_cache={d}/{d}MiB tex_cache={d} simg_cache={d}/{d}MiB\n",
                 .{
@@ -19845,6 +19851,10 @@ pub const Renderer = struct {
             std.debug.print(
                 "[gpu buffers] flip={d} content_reused_kib={d} fingerprint_ms={d}\n",
                 .{ self.flip_callbacks, profile.content_reused_bytes / 1024, profile.buffer_fingerprint_ns / std.time.ns_per_ms },
+            );
+            std.debug.print(
+                "[gpu targets] flip={d} cache={d}/{d} transfer_mib={d}\n",
+                .{ self.flip_callbacks, self.render_targets.items.len, self.render_target_cache_limit, target_transfer_bytes / (1024 * 1024) },
             );
             std.debug.print(
                 "[gpu draw] flip={d} shader_check_ms={d} storage_ms={d} setup_ms={d} pipeline_lookup_ms={d} scalar_upload_ms={d} record_ms={d}\n",
