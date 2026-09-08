@@ -2,6 +2,86 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Resource preparation caches on 2026-09-08
+
+Uniform descriptor recovery now shares control-flow reachability and up to
+64 scalar reaching-definition results within one `Resolver.words` call.
+Complete instruction-position/register keys are checked on every hit;
+collisions replace entries, and ambiguous definitions remain ambiguous.
+The batch borrows immutable instructions and a CFG only for that recovery.
+The next call resets it, including after a read error. USER_DATA, scalar
+snapshots and guest memory values are never cached. Memory reads and the
+512-step recovery budget retain the preceding behavior.
+
+Yotei's storage-image retention budget is now 2,560 MiB, allocated lazily;
+other titles and the renderer API keep 1,280 MiB. The runner override
+`PS5_GPU_STORAGE_IMAGE_CACHE_MIB` accepts 128–4096. This counts logical image
+transfer bytes, not total RAM or VRAM: each cached view also owns a device
+image. The 1,024-view ceiling remains separate, and the byte budget remains
+soft while the current dispatch pins all remaining entries. Eviction still
+publishes dirty GPU results before destroying a view.
+`[gpu storage images]` reports the budget and budget/count-driven evictions
+for each profiled frame; `[gpu frame]` retains the actual cache size.
+
+All 90 CPU tests pass in ReleaseSafe and ReleaseFast. Coverage compares
+batched and uncached definitions through joins, loops, clobbers, disconnected
+blocks and cache collisions. Nested descriptor recovery checks equal memory
+read counts and remaining budgets, changed input data and read failures.
+The Vulkan storage-reuse probe covers both count and byte pressure while
+writes remain queued. It, indirect-image selection and full smoke pass SDK
+1.4.357.0 synchronization validation.
+
+A same-process ReleaseFast comparison alternates descriptor memoization
+off/on/off, with the storage-image budget fixed at 1,280 MiB and the color-target
+limit at 128. Each interval measures 12 frames and discards the first two.
+There are no captures, compilers or smoke probes during the timed intervals.
+
+| Descriptor memoization | Measured flips | Median frame | Derived FPS | Compute resource preparation |
+| --- | --- | --- | --- | --- |
+| Off, before | 951–960 | 5,872.5 ms | 0.170 | 2,607 ms |
+| On | 964–973 | 4,787.5 ms | 0.209 | 1,601.5 ms |
+| Off, after | 977–986 | 5,721.5 ms | 0.175 | 2,608.5 ms |
+
+Against the pooled control median of 5,788.5 ms, memoization improves observed
+FPS by 20.9%; compute resource preparation drops 38.6%. The enabled interval
+records 1,603,640 cached queries and 959,161 misses, a 62.6% hit rate. Those
+counters span the whole diagnostic interval, including discarded frames.
+Draw medians remain 287.5–290 and dispatch medians 1,150–1,152. Buffer uploads
+stay near 1,177 MiB and non-color readback near 811 MiB per frame. Available
+physical memory ranges from 2.5 to 3.2 GiB. This is a scene-specific comparison
+on the Ryzen 7 7700 / RTX 3070 Ti host, not an estimate for every title.
+
+The following storage-image comparison keeps memoization enabled. After
+raising the budget, eight frames warm the cache before another 12-frame
+interval; again the first two measured frames are discarded.
+
+| Storage-image budget | Measured flips | Median frame | Derived FPS | Compute resource preparation | Evictions/frame | Texture upload | Non-color readback |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1,280 MiB, before | 1028–1037 | 4,407 ms | 0.227 | 1,303 ms | 75 | 380.2 MiB | 568.2 MiB |
+| 2,560 MiB | 1050–1059 | 4,046.5 ms | 0.247 | 1,044 ms | 0 | 147.2 MiB | 397.9 MiB |
+| 1,280 MiB, after | 1125–1134 | 4,044 ms | 0.247 | 1,162.5 ms | 48 | 212.7 MiB | 461.7 MiB |
+
+The first comparison is 8.9% faster, but the final control has essentially
+the same frame time as the enlarged cache. This experiment therefore **does
+not establish a sustained additional FPS improvement** from the image budget.
+The measured benefit is lower transfer traffic, no evictions, and 10–20% less
+compute resource preparation. These percentages must not be added to the
+descriptor result. Shrinking the live budget only takes effect on the next
+allocation miss; the final interval waits until retained bytes are below
+1,280 MiB. No frames with the old resident working set above that limit are
+used as the final control.
+
+The live budget increase retains 445 views and 1,412 MiB of logical transfer
+data, versus medians of 264.5 views/1,268.5 MiB before and 277 views/1,260 MiB
+after. These are measurements after scene loading; retained memory during a
+fresh launch can differ. Available physical memory ranges from 2.9 to 5.2 GiB,
+and workload/host variation limits conclusions about total frame time.
+
+The actual presented 3840×2160 Digital Deluxe Bonus captures at flips 1024
+(old budget, memoization off) and 1088 (larger budget, memoization on) are
+pixel-identical. Captures occur outside timed intervals. Complete menu and
+background rendering remains unverified.
+
 ## Retaining the color-attachment working set on 2026-09-08
 
 The 64-entry color-target cache repeatedly evicts attachments still used by

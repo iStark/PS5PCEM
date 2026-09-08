@@ -221,6 +221,10 @@ pub const Options = struct {
     /// Lazy bound for resident color attachments. Larger frame working sets
     /// otherwise evict, read back and recreate the same targets every frame.
     render_target_cache_limit: usize = 64,
+    /// Logical transfer bytes retained for storage images, allocated on demand.
+    /// Soft while one dispatch pins all remaining entries: its legal descriptor
+    /// set must fit even when larger than the retention budget.
+    storage_image_cache_limit: usize = 1280 * 1024 * 1024,
     /// Optional Win32 output window. Supplying it enables the required surface
     /// and swapchain extensions and constrains device selection to a queue that
     /// can present to this exact surface.
@@ -827,13 +831,6 @@ const maximum_cached_sampled_images = 8192;
 // Retain those smaller views under the same byte budget instead of forcing
 // dirty-image readback and tiling solely to free an entry.
 const maximum_cached_storage_images = 1024;
-/// Counts linear image bytes (the cache also owns one transfer allocation per
-/// image). The limit is soft while every resident entry is in use by the same
-/// dispatch, so a legal 32-image descriptor set is never rejected solely by
-/// the cache budget. Leave headroom above Yotei's measured 920 MiB set for
-/// alignment and short-lived views without turning transient churn into an
-/// unbounded cache.
-const maximum_cached_storage_image_bytes = 1280 * 1024 * 1024;
 /// One DCC key byte covers this many bytes of the compressed colour surface.
 const dcc_block_bytes = 256;
 /// Bounds the key read for a fast-clear probe; covers surfaces up to 1 GiB.
@@ -1872,6 +1869,7 @@ const FrameProfile = struct {
     texture_hits: u64 = 0,
     texture_misses: u64 = 0,
     texture_evictions: u64 = 0,
+    storage_image_evictions: u64 = 0,
     render_target_hits: u64 = 0,
     render_target_misses: u64 = 0,
     graphics_pipeline_hits: u64 = 0,
@@ -3187,6 +3185,7 @@ pub const Renderer = struct {
     resident_samplers: std.ArrayList(CachedResidentSampler) = .empty,
     storage_image_cache: std.ArrayList(CachedStorageImage) = .empty,
     storage_image_cache_bytes: usize = 0,
+    storage_image_cache_limit: usize = 1280 * 1024 * 1024,
     storage_image_sequence: u64 = 0,
     /// Decoded shader programs, held across draws. Its capacity is reserved
     /// once so entries never move: callers hold `*const Analysis` into it for
@@ -3916,6 +3915,7 @@ pub const Renderer = struct {
             .depth_transfer_enabled = options.enable_depth_transfer,
             .image_state_optimization_enabled = options.enable_image_state_optimization,
             .render_target_cache_limit = @max(1, options.render_target_cache_limit),
+            .storage_image_cache_limit = options.storage_image_cache_limit,
             .window_presentation = window_presentation,
         };
         renderer.image_aliases.enabled = options.enable_canonical_image_aliases;
@@ -16640,7 +16640,7 @@ pub const Renderer = struct {
                 }
             }
             const over_byte_budget = self.storage_image_cache_bytes +| staging_bytes >
-                maximum_cached_storage_image_bytes;
+                self.storage_image_cache_limit;
             const needs_count_slot = !has_free_slot and
                 self.storage_image_cache.items.len >= maximum_cached_storage_images;
             if (!over_byte_budget and !needs_count_slot) break;
@@ -16666,6 +16666,7 @@ pub const Renderer = struct {
             };
             try self.flushCachedStorageImage(memory, victim);
             self.destroyCachedStorageImage(victim);
+            self.frame_profile.storage_image_evictions += 1;
         }
 
         for (self.storage_image_cache.items, 0..) |cached, index| {
@@ -19855,6 +19856,10 @@ pub const Renderer = struct {
             std.debug.print(
                 "[gpu targets] flip={d} cache={d}/{d} transfer_mib={d}\n",
                 .{ self.flip_callbacks, self.render_targets.items.len, self.render_target_cache_limit, target_transfer_bytes / (1024 * 1024) },
+            );
+            std.debug.print(
+                "[gpu storage images] flip={d} budget_mib={d} evictions={d}\n",
+                .{ self.flip_callbacks, self.storage_image_cache_limit / (1024 * 1024), profile.storage_image_evictions },
             );
             std.debug.print(
                 "[gpu draw] flip={d} shader_check_ms={d} storage_ms={d} setup_ms={d} pipeline_lookup_ms={d} scalar_upload_ms={d} record_ms={d}\n",

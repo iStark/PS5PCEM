@@ -9,6 +9,11 @@ const shaders = @import("shaders.zig");
 const scalar = @import("scalar_provenance.zig");
 const definitions = @import("index_bounds.zig");
 
+/// Diagnostic switch sampled once per recovery, allowing same-process timing.
+pub var definition_cache_enabled = std.atomic.Value(bool).init(true);
+pub var definition_cache_hits = std.atomic.Value(u64).init(0);
+pub var definition_cache_misses = std.atomic.Value(u64).init(0);
+
 pub const Resolver = struct {
     bindings: *const shaders.StageBindings,
     reader: shaders.MemoryReader,
@@ -16,8 +21,17 @@ pub const Resolver = struct {
     graph: *const rdna2.control_flow.Graph,
     snapshot: *const scalar.Evaluation,
     remaining: usize = 512,
+    memoize_definitions: bool = true,
+    definition_batch: definitions.ScalarDefinitionBatch = undefined,
+    batch_enabled: bool = false,
 
     pub fn words(self: *Resolver, register: u32, before_pc: u32, output: []u32) !bool {
+        self.batch_enabled = self.memoize_definitions and definition_cache_enabled.load(.monotonic);
+        self.definition_batch = .{ .instructions = self.instructions, .graph = self.graph };
+        defer if (self.batch_enabled) {
+            _ = definition_cache_hits.fetchAdd(self.definition_batch.hits, .monotonic);
+            _ = definition_cache_misses.fetchAdd(self.definition_batch.misses, .monotonic);
+        };
         var before: usize = 0;
         while (before < self.instructions.len and self.instructions[before].pc < before_pc) : (before += 1) {}
         if (before == self.instructions.len) return false;
@@ -38,7 +52,10 @@ pub const Resolver = struct {
     fn word(self: *Resolver, register: u32, before: usize, depth: u8) anyerror!?u32 {
         if (register >= scalar.maximum_scalar_registers or depth >= 24 or self.remaining == 0) return null;
         self.remaining -= 1;
-        const definition = definitions.scalarDefinition(self.instructions, self.graph, before, register) orelse return null;
+        const definition = (if (self.batch_enabled)
+            self.definition_batch.lookup(before, register)
+        else
+            definitions.scalarDefinition(self.instructions, self.graph, before, register)) orelse return null;
         const index = switch (definition) {
             .entry => {
                 if (register < self.bindings.scalar_user_data_base) return null;
@@ -175,8 +192,10 @@ test "scalar resource offsets recover wrapping multiplication before register re
 test "scalar resource recovery follows nested loads after USER_DATA reuse" {
     const Memory = struct {
         data: [256]u8 = @splat(0),
+        reads: usize = 0,
         fn read(context: ?*anyopaque, address: u64, output: []u8) bool {
             const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.reads += 1;
             if (address < 0x1000 or address - 0x1000 > self.data.len or output.len > self.data.len - (address - 0x1000)) return false;
             @memcpy(output, self.data[@intCast(address - 0x1000)..][0..output.len]);
             return true;
@@ -213,6 +232,30 @@ test "scalar resource recovery follows nested loads after USER_DATA reuse" {
     snapshot.registers[21] = .{ .known = true, .value = 0x700000, .producer_pc = 24 };
     var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = &memory, .read_fn = Memory.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot };
     var words: [4]u32 = undefined;
+    var reference_reads: usize = 0;
+    var reference_remaining: usize = 0;
+    for ([_]bool{ false, true }) |enabled| {
+        resolver.memoize_definitions = enabled;
+        resolver.remaining = 512;
+        memory.reads = 0;
+        try std.testing.expect(try resolver.words(16, 24, &words));
+        try std.testing.expectEqualSlices(u32, &descriptor, &words);
+        if (enabled) {
+            try std.testing.expect(resolver.definition_batch.hits > 0);
+            try std.testing.expectEqual(reference_reads, memory.reads);
+            try std.testing.expectEqual(reference_remaining, resolver.remaining);
+        } else {
+            reference_reads = memory.reads;
+            reference_remaining = resolver.remaining;
+        }
+    }
+    // Runtime data is read again on the next recovery, even at the same PC.
+    std.mem.writeInt(u32, memory.data[208..212], 0x1030, .little);
+    resolver.remaining = 512;
+    try std.testing.expect(try resolver.words(16, 24, &words));
+    try std.testing.expectEqual(@as(u32, 0x1030), words[0]);
+    std.mem.writeInt(u32, memory.data[208..212], descriptor[0], .little);
+    resolver.remaining = 512;
     try std.testing.expect(try resolver.words(16, 24, &words));
     try std.testing.expectEqualSlices(u32, &descriptor, &words);
     resolver.remaining = 512;

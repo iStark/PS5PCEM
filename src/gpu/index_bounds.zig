@@ -138,6 +138,10 @@ fn reachingDefinitions(instructions: []const Instruction, graph: *const Graph, b
 
 fn reachingDefinitionsUntil(instructions: []const Instruction, graph: *const Graph, before: usize, location: Location, origin: ?usize) ?ReachingDefinitions {
     const reachable = reachableBlocks(graph) orelse return null;
+    return reachingDefinitionsWithReachability(instructions, graph, before, location, origin, &reachable);
+}
+
+fn reachingDefinitionsWithReachability(instructions: []const Instruction, graph: *const Graph, before: usize, location: Location, origin: ?usize, reachable: *const [maximum_blocks]bool) ?ReachingDefinitions {
     const first_block = blockAt(graph, before) orelse return null;
     if (!reachable[first_block]) return null;
     var visited: [maximum_blocks]bool = @splat(false);
@@ -199,8 +203,85 @@ pub const ScalarDefinition = union(enum) { entry, instruction: usize };
 /// Mixed entry/written paths and loop-carried alternatives remain unknown.
 pub fn scalarDefinition(instructions: []const Instruction, graph: *const Graph, before: usize, register: u32) ?ScalarDefinition {
     const definitions = reachingDefinitions(instructions, graph, before, .{ .register = register }) orelse return null;
+    return uniqueScalarDefinition(definitions);
+}
+
+fn uniqueScalarDefinition(definitions: ReachingDefinitions) ?ScalarDefinition {
     if (definitions.entry) return if (definitions.count == 0) .entry else null;
     return if (definitions.count == 1) .{ .instruction = definitions.items[0] } else null;
+}
+
+/// Borrowed, immutable instructions and CFG for one resource-word recovery.
+/// Cache only static definitions, including ambiguity; never guest values.
+/// Reinitialize before either borrowed input can change. Collisions replace
+/// entries and affect performance only; full keys are always compared.
+pub const ScalarDefinitionBatch = struct {
+    const Entry = struct { before: usize, register: u32, value: ?ScalarDefinition };
+    instructions: []const Instruction,
+    graph: *const Graph,
+    entries: [64]Entry = undefined,
+    valid: u64 = 0,
+    reachable: ?[maximum_blocks]bool = undefined,
+    reachability_ready: bool = false,
+    hits: u64 = 0,
+    misses: u64 = 0,
+
+    pub fn lookup(self: *ScalarDefinitionBatch, before: usize, register: u32) ?ScalarDefinition {
+        const slot: u6 = @truncate(before *% 37 +% register);
+        const bit = @as(u64, 1) << slot;
+        if (self.valid & bit != 0) {
+            const entry = self.entries[slot];
+            if (entry.before == before and entry.register == register) {
+                self.hits += 1;
+                return entry.value;
+            }
+        }
+        self.misses += 1;
+        if (!self.reachability_ready) {
+            self.reachable = reachableBlocks(self.graph);
+            self.reachability_ready = true;
+        }
+        const value = if (self.reachable) |*reachable| value: {
+            const definitions = reachingDefinitionsWithReachability(self.instructions, self.graph, before, .{ .register = register }, null, reachable) orelse break :value null;
+            break :value uniqueScalarDefinition(definitions);
+        } else null;
+        self.entries[slot] = .{ .before = before, .register = register, .value = value };
+        self.valid |= bit;
+        return value;
+    }
+};
+
+test "batched scalar definitions preserve joins, loops, clobbers and colliding keys" {
+    const instructions = [_]Instruction{
+        .{ .pc = 0, .opcode = .s_mov_b64, .dst = .{ .kind = .sgpr, .reg = 4 } },
+        .{ .pc = 4, .opcode = .s_cbranch_execz, .branch_target = 16 },
+        .{ .pc = 8, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 4 } },
+        .{ .pc = 12, .opcode = .s_branch, .branch_target = 24 },
+        .{ .pc = 16, .opcode = .s_and_saveexec_b64, .dst = .{ .kind = .sgpr, .reg = 12 } },
+        .{ .pc = 20, .opcode = .s_branch, .branch_target = 4 },
+        .{ .pc = 24, .opcode = .s_load_dwordx4, .dst = .{ .kind = .sgpr, .reg = 20 }, .data_words = 4 },
+        .{ .pc = 28, .opcode = .s_endpgm },
+        .{ .pc = 32, .opcode = .unknown },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    var batch = ScalarDefinitionBatch{ .instructions = &instructions, .graph = &graph };
+    for (0..3) |_| for (0..instructions.len) |before| {
+        for (0..130) |register| {
+            const expected = scalarDefinition(&instructions, &graph, before, @intCast(register));
+            try std.testing.expectEqualDeep(expected, batch.lookup(before, @intCast(register)));
+            try std.testing.expectEqualDeep(expected, batch.lookup(before, @intCast(register)));
+        }
+    };
+    try std.testing.expect(batch.hits > 0);
+    try std.testing.expect(batch.misses > batch.entries.len);
+    try std.testing.expectEqual(ScalarDefinition{ .instruction = 2 }, batch.lookup(7, 4)); // exits the loop through this writer
+    try std.testing.expectEqual(ScalarDefinition{ .instruction = 6 }, batch.lookup(7, 23));
+    try std.testing.expectEqual(null, batch.lookup(8, 4)); // unreachable block
+    // A new batch validates a changed graph, including malformed edges.
+    try graph.edges.append(std.testing.allocator, .{ .from = 0, .to = @intCast(graph.blocks.items.len), .kind = .branch });
+    batch = .{ .instructions = &instructions, .graph = &graph };
+    try std.testing.expectEqual(null, batch.lookup(7, 23));
 }
 
 const MaskProof = struct {

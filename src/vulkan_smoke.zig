@@ -1499,12 +1499,13 @@ fn runImageScratchProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runStorageImageReuseProbe(allocator: std.mem.Allocator) !void {
-    for ([_]usize{ 320, 1152 }) |count| try runStorageImageReuseCase(allocator, count);
-    std.debug.print("storage image reuse passed: 320 resident views and 1152 queued writes under cache pressure\n", .{});
+    for ([_]usize{ 320, 1152 }) |count| try runStorageImageReuseCase(allocator, count, 1280 * 1024 * 1024);
+    try runStorageImageReuseCase(allocator, 320, 64 * 4);
+    std.debug.print("storage image reuse passed: 320 resident views, 1152 queued writes, and byte-budget eviction\n", .{});
 }
 
-fn runStorageImageReuseCase(allocator: std.mem.Allocator, count: usize) !void {
-    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+fn runStorageImageReuseCase(allocator: std.mem.Allocator, count: usize, byte_budget: usize) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true, .storage_image_cache_limit = byte_budget });
     defer renderer.deinit();
     var guest = SizedGuestMemory(512 * 1024){};
     const backend = renderer.dcbBackend(guest.interface());
@@ -1531,8 +1532,9 @@ fn runStorageImageReuseCase(allocator: std.mem.Allocator, count: usize) !void {
         _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
     }
     // Earlier dirty views must remain on the GPU until a CPU consumer asks.
-    try std.testing.expectEqual(@min(@as(usize, 1024), count), renderer.storage_image_cache.items.len);
-    if (count == 320) try std.testing.expect(std.mem.allEqual(u8, guest.bytes[0x4000 .. 0x4000 + count * 256], 0));
+    try std.testing.expectEqual(@min(@as(usize, 1024), count, byte_budget / 4), renderer.storage_image_cache.items.len);
+    try std.testing.expect(renderer.storage_image_cache_bytes <= byte_budget);
+    if (count == 320 and count * 4 <= byte_budget) try std.testing.expect(std.mem.allEqual(u8, guest.bytes[0x4000 .. 0x4000 + count * 256], 0));
     var pixel: [4]u8 = undefined;
     // Check every dispatch, including views evicted while later commands were
     // still being prepared. A capacity fallback must not silently drop writes.
