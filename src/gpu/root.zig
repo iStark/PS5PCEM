@@ -16,6 +16,7 @@ pub const state = @import("state.zig");
 pub const resources = @import("resources.zig");
 pub const shaders = @import("shaders.zig");
 pub const scalar_provenance = @import("scalar_provenance.zig");
+pub const resource_checkpoints = @import("resource_checkpoints.zig");
 pub const shader_analysis = @import("shader_analysis.zig");
 pub const tiling = @import("tiling.zig");
 pub const parallel_copy = @import("parallel_copy.zig");

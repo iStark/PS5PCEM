@@ -2,6 +2,64 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Resource checkpoint preparation on 2026-09-09
+
+Retained decoded shaders now own the sorted resource and sampled-image
+checkpoint locations used during scalar recovery. Code replacement and shader
+eviction release those lists with their analysis. Dispatch-local uniform
+specializations start without the parent's plan; preparation also checks the
+exact instruction allocation before borrowing a list. An unavailable plan
+falls back to collecting locations from the current instructions.
+
+A renderer-local pool retains at most two scalar snapshot arrays, each bounded
+to 32 MiB. Preparations borrow distinct arrays until completion, including
+nested calls and error cleanup. Oversized arrays remain transient. Every call
+still resets its snapshots and executes the original scalar evaluator using
+current USER_DATA and guest memory. No register values, memory reads or branch
+decisions are reused. The same preparation serves compute resources, graphics
+texture bindings and Yotei's existing environment/HDR fallbacks.
+
+`[gpu checkpoints]` reports preparation microseconds, calls, list builds and
+snapshot allocations for a profiled frame. Preparation time includes the
+scalar walk and overlaps the existing draw/compute resource counters; these
+timings must not be added together. The pool's diagnostic switch selects the
+preceding fresh-list/fresh-allocation behavior for comparisons.
+
+Ten checkpoint tests pass in ReleaseSafe and ReleaseFast, covering changing
+memory, skipped blocks, backward visits, loop ambiguity, read failures, nested
+leases and allocation-failure cleanup. The analysis ownership test also checks
+moves, replacement code and alternating uniform specializations. Full Vulkan,
+indirect-image, scalar-pointer and uniform-limit image-loop probes pass SDK
+1.4.357.0 synchronization validation without warnings or errors.
+
+A same-process ReleaseFast comparison waits for eight frames with stable draw
+and dispatch counts after scene loading and pipeline compilation. Each interval
+records 12 frames and discards the first two; two additional frames warm reuse
+before the enabled interval. Four copy workers, persistent scalar definitions,
+128 color targets, 2,560 MiB storage images and 512 MiB compute translations
+remain fixed. Build-cache cleanup finishes before measurement; no compilers,
+captures or Vulkan probes run during the timed intervals.
+
+| Checkpoint reuse | Measured flips | Median frame | Derived FPS | Checkpoint preparation | List builds/frame | Snapshot allocations/frame |
+| --- | --- | --- | --- | --- | --- | --- |
+| Off, before | 936–945 | 3,874 ms | 0.258 | 168.719 ms | 2,703.5 | 2,134.5 |
+| On | 952–961 | 3,980.5 ms | 0.251 | 151.372 ms | 335 | 0 |
+| Off, after | 965–974 | 4,070.5 ms | 0.246 | 175.4245 ms | 2,712.5 | 2,143 |
+
+Checkpoint preparation improves by 10.3–13.7%, saving approximately 17–24 ms
+per frame. Remaining list builds include dispatch-local specializations, which
+cannot reuse the immutable parent plan. The final pool retains arrays for 955
+and 641 snapshots, and reuse is restored to enabled after the comparison.
+
+This experiment **does not establish an overall FPS improvement**. The enabled
+frame median falls between the controls, while fence waits rise from 1.23 to
+1.27 to 1.35 seconds. Workload medians are 287–288.5 draws and 1,164–1,173
+dispatches; compute pipeline compilation and storage-image eviction stay zero.
+Uploads remain near 1,416–1,417 MiB and readback near 535 MiB per frame. Available
+physical memory varies from 1.2 to 3.7 GiB on the Ryzen 7 7700 / RTX 3070 Ti /
+32 GiB host. The measured benefit is less repeated CPU work and allocation;
+these live-scene timings do not establish complete title-menu rendering.
+
 ## Compute translation retention on 2026-09-09
 
 Yotei now uses a lazy 512 MiB compute translation cache; other titles and the

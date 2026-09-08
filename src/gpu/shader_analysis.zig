@@ -7,6 +7,7 @@ const std = @import("std");
 const rdna2 = @import("rdna2");
 const shaders = @import("shaders.zig");
 const ScalarDefinitionCache = @import("index_bounds.zig").ScalarDefinitionCache;
+const CheckpointPlan = @import("resource_checkpoints.zig").Plan;
 
 pub const SpirvStage = rdna2.spirv.Stage;
 pub const SpirvOptions = rdna2.spirv.Options;
@@ -34,6 +35,14 @@ pub const Analysis = struct {
     module: rdna2.ir.Module,
     pipeline_options: rdna2.ir.PipelineOptions = .{},
     scalar_definitions: ?*ScalarDefinitionCache = null,
+    resource_checkpoints: ?CheckpointPlan = null,
+
+    /// Retain locations only after decoding/reconstruction has finished.
+    /// Dispatch-local branch specializations start without the parent's plan.
+    pub fn enableResourceCheckpoints(self: *Analysis, allocator: std.mem.Allocator) !void {
+        if (self.resource_checkpoints != null) return;
+        self.resource_checkpoints = try CheckpointPlan.init(allocator, self.program.instructions.items);
+    }
 
     /// Enable only once this analysis is retained as an immutable program.
     /// Specialized analyses deliberately start with their own empty state.
@@ -45,6 +54,7 @@ pub const Analysis = struct {
     }
 
     pub fn deinit(self: *Analysis, allocator: std.mem.Allocator) void {
+        if (self.resource_checkpoints) |*plan| plan.deinit(allocator);
         if (self.scalar_definitions) |cache| {
             cache.deinit();
             allocator.destroy(cache);
@@ -488,11 +498,16 @@ test "analysis owns definitions across moves but not shader replacement or unifo
     for (code, 0..) |word, index| memory.word(index * 4, word);
     var decoded = try decode(std.testing.allocator, memory.reader(), 0, 16);
     try decoded.enableScalarDefinitionCache(std.testing.allocator);
+    try decoded.enableResourceCheckpoints(std.testing.allocator);
     var moved = decoded;
     defer moved.deinit(std.testing.allocator);
     const cache = moved.scalar_definitions.?;
     try moved.enableScalarDefinitionCache(std.testing.allocator);
     try std.testing.expectEqual(cache, moved.scalar_definitions.?);
+    const checkpoint_pcs = moved.resource_checkpoints.?.resource;
+    try moved.enableResourceCheckpoints(std.testing.allocator);
+    try std.testing.expectEqual(checkpoint_pcs.ptr, moved.resource_checkpoints.?.resource.ptr);
+    try std.testing.expect(moved.resource_checkpoints.?.matches(moved.program.instructions.items));
     try std.testing.expect(cache.matches(moved.program.instructions.items, &moved.graph));
     var batch = @import("index_bounds.zig").ScalarDefinitionBatch{
         .instructions = moved.program.instructions.items,
@@ -510,6 +525,10 @@ test "analysis owns definitions across moves but not shader replacement or unifo
         var specialized = (try moved.specializeUniformBranches(std.testing.allocator, memory.reader(), &bindings)).?;
         defer specialized.deinit(std.testing.allocator);
         try std.testing.expect(specialized.scalar_definitions == null);
+        try std.testing.expect(specialized.resource_checkpoints == null);
+        try std.testing.expect(!moved.resource_checkpoints.?.matches(specialized.program.instructions.items));
+        try specialized.enableResourceCheckpoints(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, if (enabled == 0) 1 else 2), specialized.resource_checkpoints.?.resource.len);
         try std.testing.expect(!cache.matches(specialized.program.instructions.items, &specialized.graph));
         try std.testing.expectEqual(if (enabled == 0) rdna2.Opcode.s_nop else .image_store, specialized.program.instructions.items[5].opcode);
     }
@@ -518,6 +537,9 @@ test "analysis owns definitions across moves but not shader replacement or unifo
     var replacement = try decode(std.testing.allocator, memory.reader(), 0, 16);
     defer replacement.deinit(std.testing.allocator);
     try replacement.enableScalarDefinitionCache(std.testing.allocator);
+    try replacement.enableResourceCheckpoints(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), replacement.resource_checkpoints.?.resource.len);
+    try std.testing.expect(!moved.resource_checkpoints.?.matches(replacement.program.instructions.items));
     try std.testing.expect(replacement.scalar_definitions.? != cache);
     try std.testing.expectEqual(@as(u32, 0), replacement.scalar_definitions.?.entries.count());
     try std.testing.expect(!cache.matches(replacement.program.instructions.items, &replacement.graph));

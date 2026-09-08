@@ -1886,6 +1886,10 @@ const FrameProfile = struct {
     compute_pipeline_build_ns: u64 = 0,
     compute_emulation_ns: u64 = 0,
     compute_resource_ns: u64 = 0,
+    checkpoint_prepare_ns: u64 = 0,
+    checkpoint_preparations: u64 = 0,
+    checkpoint_plan_misses: u64 = 0,
+    checkpoint_scratch_misses: u64 = 0,
     compute_translate_ns: u64 = 0,
     compute_translation_hits: u64 = 0,
     compute_translation_misses: u64 = 0,
@@ -3378,11 +3382,13 @@ pub const Renderer = struct {
     free_graphics_resource_count: usize = 0,
 
     image_scratch: @import("scratch_pool.zig").Pool = .{},
+    checkpoint_scratch: gpu.resource_checkpoints.Pool = .{},
     /// Diagnostic switch for comparing the transient and resident upload paths.
     reuse_color_target_transfer: bool = true,
 
     fn destroyResourcePools(self: *Renderer) void {
         self.image_scratch.deinit(self.allocator);
+        self.checkpoint_scratch.deinit(self.allocator);
         for (self.free_compute_resources[0..self.free_compute_resource_count]) |resource| self.allocator.destroy(resource);
         self.free_compute_resource_count = 0;
         for (self.free_graphics_resources[0..self.free_graphics_resource_count]) |resource| resource.destroy(self.allocator);
@@ -6575,32 +6581,10 @@ pub const Renderer = struct {
         program_address: u64,
     ) anyerror!?DispatchReport {
         const instructions = analysis.program.instructions.items;
-        var checkpoint_count: usize = 0;
-        for (instructions) |inst| {
-            if (needsResourceScalarCheckpoint(inst)) checkpoint_count += 1;
-        }
-        const checkpoint_pcs = try self.allocator.alloc(u32, checkpoint_count);
-        defer self.allocator.free(checkpoint_pcs);
-        const checkpoint_registers = try self.allocator.alloc(
-            gpu.scalar_provenance.ScalarRegisters,
-            checkpoint_count,
-        );
-        defer self.allocator.free(checkpoint_registers);
-        var checkpoint_index: usize = 0;
-        for (instructions) |inst| {
-            if (!needsResourceScalarCheckpoint(inst)) continue;
-            checkpoint_pcs[checkpoint_index] = inst.pc;
-            checkpoint_index += 1;
-        }
-        if (checkpoint_count != 0) {
-            _ = gpu.scalar_provenance.evaluateDecodedResourceStateAtCheckpoints(
-                reader,
-                bindings,
-                instructions,
-                checkpoint_pcs,
-                checkpoint_registers,
-            );
-        }
+        var checkpoints = try self.prepareResourceCheckpoints(analysis, .resource, reader, bindings);
+        defer checkpoints.release();
+        const checkpoint_pcs = checkpoints.pcs;
+        const checkpoint_registers = checkpoints.snapshots;
 
         var saw_sampled = false;
         var sampled_has_exports = false;
@@ -6790,32 +6774,10 @@ pub const Renderer = struct {
         program_address: u64,
     ) anyerror!DispatchReport {
         const instructions = analysis.program.instructions.items;
-        var checkpoint_count: usize = 0;
-        for (instructions) |inst| {
-            if (needsResourceScalarCheckpoint(inst)) checkpoint_count += 1;
-        }
-        const checkpoint_pcs = try self.allocator.alloc(u32, checkpoint_count);
-        defer self.allocator.free(checkpoint_pcs);
-        const checkpoint_registers = try self.allocator.alloc(
-            gpu.scalar_provenance.ScalarRegisters,
-            checkpoint_count,
-        );
-        defer self.allocator.free(checkpoint_registers);
-        var checkpoint_index: usize = 0;
-        for (instructions) |inst| {
-            if (!needsResourceScalarCheckpoint(inst)) continue;
-            checkpoint_pcs[checkpoint_index] = inst.pc;
-            checkpoint_index += 1;
-        }
-        if (checkpoint_count != 0) {
-            _ = gpu.scalar_provenance.evaluateDecodedResourceStateAtCheckpoints(
-                reader,
-                bindings,
-                instructions,
-                checkpoint_pcs,
-                checkpoint_registers,
-            );
-        }
+        var checkpoints = try self.prepareResourceCheckpoints(analysis, .resource, reader, bindings);
+        defer checkpoints.release();
+        const checkpoint_pcs = checkpoints.pcs;
+        const checkpoint_registers = checkpoints.snapshots;
 
         var output_descriptors: [8]gpu.ImageDescriptor = undefined;
         var output_count: usize = 0;
@@ -8176,6 +8138,29 @@ pub const Renderer = struct {
         self.frame_profile.storage_upload_bytes +%= total_words * 4;
     }
 
+    fn prepareResourceCheckpoints(
+        self: *Renderer,
+        analysis: *const gpu.ShaderAnalysis,
+        kind: gpu.resource_checkpoints.Kind,
+        reader: gpu.ShaderMemoryReader,
+        bindings: *const gpu.ShaderBindings,
+    ) !gpu.resource_checkpoints.Pool.Lease {
+        const started = hostTimestampNs();
+        defer self.frame_profile.checkpoint_prepare_ns +|= elapsedHostNanoseconds(started);
+        const lease = try self.checkpoint_scratch.prepare(
+            self.allocator,
+            analysis.program.instructions.items,
+            if (analysis.resource_checkpoints) |*plan| plan else null,
+            kind,
+            reader,
+            bindings,
+        );
+        self.frame_profile.checkpoint_preparations += 1;
+        if (!lease.plan_reused) self.frame_profile.checkpoint_plan_misses += 1;
+        if (lease.snapshots.len != 0 and !lease.scratch_reused) self.frame_profile.checkpoint_scratch_misses += 1;
+        return lease;
+    }
+
     fn prepareComputeResources(
         self: *Renderer,
         bindings: *const gpu.ShaderBindings,
@@ -8223,32 +8208,10 @@ pub const Renderer = struct {
         // several points in a shader. Capture all instruction-local states in
         // one scalar execution instead of replaying the whole prolog for every
         // MUBUF/MIMG instruction (quadratic on large Unreal shaders).
-        var scalar_checkpoint_count: usize = 0;
-        for (instructions) |inst| {
-            if (needsResourceScalarCheckpoint(inst)) scalar_checkpoint_count += 1;
-        }
-        const scalar_checkpoint_pcs = try self.allocator.alloc(u32, scalar_checkpoint_count);
-        defer self.allocator.free(scalar_checkpoint_pcs);
-        const scalar_checkpoint_registers = try self.allocator.alloc(
-            gpu.scalar_provenance.ScalarRegisters,
-            scalar_checkpoint_count,
-        );
-        defer self.allocator.free(scalar_checkpoint_registers);
-        var scalar_checkpoint_index: usize = 0;
-        for (instructions) |inst| {
-            if (!needsResourceScalarCheckpoint(inst)) continue;
-            scalar_checkpoint_pcs[scalar_checkpoint_index] = inst.pc;
-            scalar_checkpoint_index += 1;
-        }
-        if (scalar_checkpoint_count != 0) {
-            _ = gpu.scalar_provenance.evaluateDecodedResourceStateAtCheckpoints(
-                reader,
-                bindings,
-                instructions,
-                scalar_checkpoint_pcs,
-                scalar_checkpoint_registers,
-            );
-        }
+        var checkpoints = try self.prepareResourceCheckpoints(analysis, .resource, reader, bindings);
+        defer checkpoints.release();
+        const scalar_checkpoint_pcs = checkpoints.pcs;
+        const scalar_checkpoint_registers = checkpoints.snapshots;
 
         for (instructions) |inst| {
             const is_store = switch (inst.opcode) {
@@ -9826,6 +9789,7 @@ pub const Renderer = struct {
         // Optional memoization belongs to these exact validated code words.
         // A replacement or eviction destroys it with the decoded analysis.
         analysis.enableScalarDefinitionCache(self.allocator) catch {};
+        analysis.enableResourceCheckpoints(self.allocator) catch {};
         self.frame_profile.shader_analysis_ns +|= elapsedHostNanoseconds(started);
         self.frame_profile.shader_analysis_misses += 1;
         const replacement = AnalyzedProgram{
@@ -15992,36 +15956,14 @@ pub const Renderer = struct {
     ) anyerror!void {
         const stage_mapping_start = result.mapping_count;
         const instructions = analysis.program.instructions.items;
-        var scalar_checkpoint_count: usize = 0;
-        for (instructions) |inst| {
-            if (needsSampledScalarCheckpoint(inst)) scalar_checkpoint_count += 1;
-        }
-        const scalar_checkpoint_pcs = try self.allocator.alloc(u32, scalar_checkpoint_count);
-        defer self.allocator.free(scalar_checkpoint_pcs);
-        const scalar_checkpoint_registers = try self.allocator.alloc(
-            gpu.scalar_provenance.ScalarRegisters,
-            scalar_checkpoint_count,
-        );
-        defer self.allocator.free(scalar_checkpoint_registers);
-        var scalar_checkpoint_index: usize = 0;
-        for (instructions) |inst| {
-            if (!needsSampledScalarCheckpoint(inst)) continue;
-            scalar_checkpoint_pcs[scalar_checkpoint_index] = inst.pc;
-            scalar_checkpoint_index += 1;
-        }
-        if (scalar_checkpoint_count != 0) {
-            _ = gpu.scalar_provenance.evaluateDecodedResourceStateAtCheckpoints(
-                reader,
-                bindings,
-                instructions,
-                scalar_checkpoint_pcs,
-                scalar_checkpoint_registers,
-            );
-        }
+        var checkpoints = try self.prepareResourceCheckpoints(analysis, .sampled, reader, bindings);
+        defer checkpoints.release();
+        const scalar_checkpoint_pcs = checkpoints.pcs;
+        const scalar_checkpoint_registers = checkpoints.snapshots;
 
         for (instructions) |inst| {
             const image_fetch = inst.opcode == .image_load or inst.opcode == .image_load_mip;
-            if (!needsSampledScalarCheckpoint(inst)) continue;
+            if (!gpu.resource_checkpoints.needsCheckpoint(inst, .sampled)) continue;
             if (inst.src1.kind != .sgpr or inst.src2.kind != .sgpr) {
                 if (log_verbose_gpu) std.debug.print(
                     "[vulkan dcb] image_sample resource kinds t#={s} s#={s}\n",
@@ -19858,6 +19800,10 @@ pub const Renderer = struct {
             std.debug.print(
                 "[gpu buffers] flip={d} content_reused_kib={d} fingerprint_ms={d}\n",
                 .{ self.flip_callbacks, profile.content_reused_bytes / 1024, profile.buffer_fingerprint_ns / std.time.ns_per_ms },
+            );
+            std.debug.print(
+                "[gpu checkpoints] flip={d} prepare_us={d} calls={d} list_builds={d} scratch_allocations={d}\n",
+                .{ self.flip_callbacks, profile.checkpoint_prepare_ns / std.time.ns_per_us, profile.checkpoint_preparations, profile.checkpoint_plan_misses, profile.checkpoint_scratch_misses },
             );
             std.debug.print(
                 "[gpu targets] flip={d} cache={d}/{d} transfer_mib={d}\n",
@@ -24725,88 +24671,6 @@ fn inlineSamplerDescriptorOrNull(
         error.InvalidDescriptor, error.InvalidFormat => null,
         else => return err,
     };
-}
-
-fn needsResourceScalarCheckpoint(inst: gpu.ShaderInstruction) bool {
-    if (isPointerScalarLoad(inst.opcode)) return true;
-    return switch (inst.opcode) {
-        .buffer_load_ubyte,
-        .buffer_load_sbyte,
-        .buffer_load_ushort,
-        .buffer_load_sshort,
-        .buffer_load_ubyte_d16,
-        .buffer_load_ubyte_d16_hi,
-        .buffer_load_sbyte_d16,
-        .buffer_load_sbyte_d16_hi,
-        .buffer_load_short_d16,
-        .buffer_load_short_d16_hi,
-        .buffer_load_dword,
-        .buffer_load_dwordx2,
-        .buffer_load_dwordx3,
-        .buffer_load_dwordx4,
-        .buffer_load_format_x,
-        .buffer_load_format_xy,
-        .buffer_load_format_xyz,
-        .buffer_load_format_xyzw,
-        .buffer_load_format_d16_x,
-        .buffer_load_format_d16_xy,
-        .buffer_load_format_d16_xyz,
-        .buffer_load_format_d16_xyzw,
-        .s_buffer_load_dword,
-        .s_buffer_load_dwordx2,
-        .s_buffer_load_dwordx4,
-        .s_buffer_load_dwordx8,
-        .s_buffer_load_dwordx16,
-        .buffer_store_byte,
-        .buffer_store_short,
-        .buffer_store_short_d16_hi,
-        .buffer_store_dword,
-        .buffer_store_dwordx2,
-        .buffer_store_dwordx3,
-        .buffer_store_dwordx4,
-        .buffer_store_format_x,
-        .buffer_store_format_xy,
-        .buffer_store_format_xyz,
-        .buffer_store_format_xyzw,
-        .buffer_store_format_d16_x,
-        .buffer_store_format_d16_hi_x,
-        .buffer_store_format_d16_xy,
-        .buffer_store_format_d16_xyz,
-        .buffer_store_format_d16_xyzw,
-        .buffer_atomic_swap,
-        .buffer_atomic_add,
-        .buffer_atomic_sub,
-        .buffer_atomic_smin,
-        .buffer_atomic_umin,
-        .buffer_atomic_smax,
-        .buffer_atomic_umax,
-        .buffer_atomic_and,
-        .buffer_atomic_or,
-        .buffer_atomic_xor,
-        .image_load,
-        .image_load_mip,
-        .image_store,
-        .image_store_mip,
-        .image_atomic_add,
-        .image_atomic_umin,
-        .image_atomic_umax,
-        .image_atomic_and,
-        .image_atomic_or,
-        .image_atomic_xor,
-        .image_atomic_fmax,
-        .image_sample,
-        .image_gather4,
-        => true,
-        else => false,
-    };
-}
-
-fn needsSampledScalarCheckpoint(inst: gpu.ShaderInstruction) bool {
-    return inst.opcode == .image_load or
-        inst.opcode == .image_load_mip or
-        inst.opcode == .image_sample or
-        inst.opcode == .image_gather4 or
-        inst.opcode == .image_get_lod;
 }
 
 fn scalarRegistersAtCheckpoint(
