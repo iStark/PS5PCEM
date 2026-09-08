@@ -402,6 +402,31 @@ fn requiresFallthrough(graph: *const Graph, definition: usize, use: usize, guard
     return true;
 }
 
+/// Exclusive upper bound of an SGPR on shader entry.
+pub const EntryBound = struct { register: u32, limit: u32 };
+
+/// Follow the actual reaching definition back to a bounded system input.
+/// Reusing an SGPR later in the shader must not reuse its entry bound.
+pub fn scalarEntryUpperBound(instructions: []const Instruction, graph: *const Graph, before: usize, register: u32, entries: []const EntryBound, depth: u8) ?u32 {
+    if (depth >= 16) return null;
+    const definition = scalarDefinition(instructions, graph, before, register) orelse return null;
+    const index = switch (definition) {
+        .entry => {
+            for (entries) |entry| if (entry.register == register and entry.limit != 0) return entry.limit;
+            return null;
+        },
+        .instruction => |index| index,
+    };
+    const inst = instructions[index];
+    if (inst.dst.kind != .sgpr or inst.dst.reg != register or inst.src0.kind != .sgpr or
+        inst.src0.absolute or inst.src0.negate or inst.src0.dpp) return null;
+    if (inst.opcode != .s_mov_b32 and inst.opcode != .s_lshr_b32) return null;
+    const bound = scalarEntryUpperBound(instructions, graph, index, inst.src0.reg, entries, depth + 1) orelse return null;
+    if (inst.opcode == .s_mov_b32) return bound;
+    const shift: u5 = @truncate(immediate(inst.src1) orelse return null);
+    return ((bound - 1) >> shift) + 1;
+}
+
 /// Exclusive upper bound at `use`, or null when not proven. In particular,
 /// preserve full 32-bit wrap semantics unless a guard excludes large indices.
 pub fn scalarUpperBound(instructions: []const Instruction, graph: *const Graph, use: usize, register: u32) ?u32 {
@@ -577,6 +602,28 @@ test "counted scalar image loops require a bounded recurrence" {
     var bypass = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
     defer bypass.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(?u32, null), scalarUpperBound(&instructions, &bypass, 2, 16));
+}
+
+test "dispatch bounds follow shifted workgroup IDs but reject overwritten and ambiguous inputs" {
+    const group = rdna2.Operand{ .kind = .sgpr, .reg = 3 };
+    var instructions = [_]Instruction{
+        .{ .pc = 0, .opcode = .s_nop },
+        .{ .pc = 4, .opcode = .s_lshr_b32, .dst = group, .src0 = group, .src1 = .{ .kind = .integer_inline_constant, .value = 4 } },
+        .{ .pc = 8, .opcode = .s_mul_i32, .dst = .{ .kind = .vcc_hi }, .src0 = group, .src1 = .{ .kind = .literal_constant, .value = 440 } },
+        .{ .pc = 12, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    const entries = [_]EntryBound{.{ .register = 3, .limit = 112 }};
+    try std.testing.expectEqual(@as(?u32, 7), scalarEntryUpperBound(&instructions, &graph, 2, 3, &entries, 0));
+    try std.testing.expectEqual(@as(?u32, 8), scalarEntryUpperBound(&instructions, &graph, 2, 3, &.{.{ .register = 3, .limit = 113 }}, 0));
+    try std.testing.expect(scalarEntryUpperBound(&instructions, &graph, 2, 3, &.{}, 0) == null);
+    instructions[0] = .{ .pc = 0, .opcode = .s_mov_b32, .dst = group, .src0 = .{ .kind = .literal_constant, .value = 0xffff_ffff } };
+    try std.testing.expect(scalarEntryUpperBound(&instructions, &graph, 2, 3, &entries, 0) == null);
+    instructions[0] = .{ .pc = 0, .opcode = .s_cbranch_scc1, .branch_target = 8 };
+    var branched = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer branched.deinit(std.testing.allocator);
+    try std.testing.expect(scalarEntryUpperBound(&instructions, &branched, 2, 3, &entries, 0) == null);
 }
 
 test "waterfall lane indices retain the vector shift bound" {

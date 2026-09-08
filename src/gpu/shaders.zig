@@ -239,6 +239,11 @@ pub const StageBindings = struct {
     metadata: ?Metadata,
     srt_address: ?u64,
     direct_pointers: DirectPointers,
+    /// Bounds of system SGPRs for this dispatch, separate from uniform USER_DATA.
+    compute_dispatch: ?struct {
+        system: resources.ComputeSystemRegisters,
+        group_count: [3]u32,
+    } = null,
 
     pub fn capture(
         state: *const gpu_state.State,

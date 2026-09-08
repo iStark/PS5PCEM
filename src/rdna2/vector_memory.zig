@@ -51,6 +51,7 @@ fn mubufInfo(id: u32) ?MemoryInfo {
         0x23 => .{ .opcode = .buffer_load_sbyte_d16_hi, .bits = 8, .signed = true },
         0x24 => .{ .opcode = .buffer_load_short_d16, .bits = 16 },
         0x25 => .{ .opcode = .buffer_load_short_d16_hi, .bits = 16 },
+        0x27 => .{ .opcode = .buffer_store_format_d16_hi_x, .bits = 16, .formatted = true },
         0x30 => .{ .opcode = .buffer_atomic_swap },
         0x32 => .{ .opcode = .buffer_atomic_add },
         0x33 => .{ .opcode = .buffer_atomic_sub },
@@ -662,6 +663,17 @@ test "MIMG floating-point maximum atomic decodes" {
 test "MUBUF floating-point atomics decode" {
     const fmin = try decodeMubuf(0, &.{ (@as(u32, 0x3f) << 18), 0 }, 0);
     try std.testing.expectEqual(isa.Opcode.buffer_atomic_fmin, fmin.opcode);
+}
+
+test "MUBUF formatted high-half store decodes the Yotei output write" {
+    const inst = try decodeMubuf(0x14e4, &.{ 0xe09c_6000, 0x8001_0007 }, 0);
+    try std.testing.expectEqual(isa.Opcode.buffer_store_format_d16_hi_x, inst.opcode);
+    try std.testing.expect(inst.formatted and inst.index_enable and inst.globally_coherent);
+    try std.testing.expectEqual(@as(u8, 16), inst.data_bits);
+    try std.testing.expectEqual(@as(u8, 1), inst.data_words);
+    try std.testing.expectEqual(@as(u32, 0), inst.dst.reg);
+    try std.testing.expectEqual(@as(u32, 7), inst.src0.reg);
+    try std.testing.expectEqual(@as(u32, 4), inst.src1.reg);
 }
 
 test "truncated EXP is rejected" {

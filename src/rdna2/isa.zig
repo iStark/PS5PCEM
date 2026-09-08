@@ -560,6 +560,7 @@ pub const Opcode = enum {
     buffer_store_format_xyz,
     buffer_store_format_xyzw,
     buffer_store_format_d16_x,
+    buffer_store_format_d16_hi_x,
     buffer_store_format_d16_xy,
     buffer_store_format_d16_xyz,
     buffer_store_format_d16_xyzw,

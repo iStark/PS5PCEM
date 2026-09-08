@@ -2,6 +2,136 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Scene counter correction on 2026-09-08
+
+The newer renderer's startup crash was reproduced after streamed scene loading.
+A hardware watchpoint caught a negative count entering the guest's shared object
+list at `0x1177c8b`. The producer was recovered from retained PM4 submissions:
+compute program `0x801f76b600` narrows EXEC to a single lane before adding a wave
+count to its output header at offset 32. Integer buffer atomics ignored EXEC,
+allowing inactive invocations to add unrelated values retained in their VGPRs.
+
+An isolated replay of the captured dispatch reproduced a counter of
+`3,085,515,644`. Applying the execution mask and descriptor bounds produces
+`380` on the same saved inputs. Replay writes remain in a separate memory copy.
+Float buffer min/max now use the same guards and a compare-exchange loop;
+separate atomic loads and stores could lose concurrent bounds updates. The
+typed IR also recognizes these float operations as memory accesses, preserving
+the data preparation that its optimizer previously removed.
+
+GPU regression coverage includes 144 masked integer/float cases across both
+translation paths, wave32/wave64, high lanes, empty EXEC, out-of-range addresses
+and returned values, plus three concurrent RMW cases. These tests, the complete
+Vulkan smoke and the existing mask, scene-pointer, storage-reuse and stencil UI
+probes pass SDK validation. The counter-corrected diagnostic run passes the former
+crash point, continues submitting the scene graph with valid object counts, and displays all
+three bonus notices, the complete brightness screen, Change Difficulty and
+Select an Experience. Text, navigation arrows, the slider and Cross glyphs are
+visible, and confirmation advances these screens. Complete title-menu background
+rendering remains unverified; after Standard, the run enters another black
+transition with very slow frame progress.
+
+Graphics sampling also reused a T#/S# register pair across an entire shader.
+Captured pixel program `0x8000296000` samples an array through s28/s44 at
+`0x12d0` and `0x1370`, then reloads s28 and gathers a 2D texture at `0x1880`.
+Reusing the first array binding rejected the gather with `InvalidStorageBinding`.
+Graphics bindings now retain their instruction PC; physical descriptors are
+shared only when the complete image, sampler and view dimension match. A GPU
+pixel test checks both 2D/array-to-2D transitions and reuse of an unchanged
+descriptor. The existing orientation, stencil UI, array-gradient, indirect-image
+and complete smoke probes pass. Applying the instruction-PC correction to the
+already loaded diagnostic process removes this refusal; a CPU readback of its
+intermediate colour target contains a textured tree. The final 3D background
+still does not appear, and this diagnostic run is not full-scene validation of
+the newly built executable.
+
+The next scene also rejects `IMAGE_GET_LOD` at `0x78`: graphics resource
+preparation omitted LOD queries entirely, although translation requires a
+sampled-image binding. Queries now use the same instruction-specific descriptor
+and scalar checkpoints. Query-only GPU shaders verify clamped and unclamped LOD
+from known texture/viewport gradients, including the title's second-component
+`dmask=2` form. The descriptor-reuse probe passes with clean SDK validation.
+
+The compute program at `0x800033db00` was skipped because eight writes use
+`BUFFER_STORE_FORMAT_D16_HI_X`, including `0xe09c6000` at `0x14e4`. Its GFX10
+encoding is defined in the [LLVM buffer instruction table](https://github.com/llvm/llvm-project/blob/main/llvm/lib/Target/AMDGPU/BUFInstructions.td).
+The decoder, resource analysis and translator now support this upper-half form
+through the existing formatted D16 store path. GPU tests cover signed, unsigned
+and float 16/32-bit destinations, inactive low/high lanes, adjacent halfwords and
+out-of-range stores. The captured program no longer contains undecoded
+instructions. The fresh installed runner retains its translated module and a
+successfully created Vulkan compute pipeline, where the previous runner skipped
+the shader. Its contribution to the final scene image remains to be checked.
+
+That newly enabled kernel exposed another resource-planning gap. Its texture
+table contains seven 440-byte records; `WorkGroupId.x >> 4` selects a record in a
+112-group dispatch. Without the dispatch bound, resource recovery conservatively
+enumerated 32-bit multiplication wrap residues at eight-byte intervals. Ordinary
+fields between descriptors then appeared as additional textures, sometimes with
+impossible extents and an unsupported tile mode. Compute bindings now retain the
+dispatch dimensions and system SGPR assignments. Reaching-definition analysis
+propagates those entry bounds through scalar copies and logical right shifts,
+allowing this table to enumerate only the seven reachable records. Overwritten
+or ambiguous SGPR definitions retain the conservative fallback. A GPU test checks
+per-group colours from a 440-byte table containing unreachable descriptor-like
+fields; the index-analysis regression suite also passes.
+
+The unsupported tile mode previously returned `BackendRejected`, discarding the
+ACB before its trailing release. The public call accepted the buffer but reported
+it incomplete, leaving the CPU waiting for a generation that would never arrive.
+This was an aborted command buffer, not a blocked GPU wait that later resumed.
+Texture-layout rejection now follows the existing unsupported-image policy:
+skip the affected dispatch and continue through subsequent packets. A Vulkan
+regression reproduces the old abort and verifies the trailing 64-bit release,
+untouched output of the skipped pass, and successful following compute work.
+Genuine Vulkan device and submission errors retain their failure path.
+
+The intermediate installed run reached the first bonus notice normally, then
+hit these ACB aborts. Five manual generation acknowledgements were used to resume
+diagnostic observation; they did not execute discarded commands and do not count
+as normal-run validation. The corrected runner was rebuilt and installed for a
+fresh run without debugger code patches or manual acknowledgements. This run
+completes the intros, displays the animated loading indicator, and passes all
+three bonus notices through ordinary Cross confirmation. A long black transition
+after the third notice eventually reaches brightness calibration at flip 1152:
+the wolf, instruction, slider and Cross glyph are all visible in the presented
+GPU frame. Intermediate targets contain tree geometry, but the complete title
+menu remains unverified.
+
+A hardware breakpoint then identified the next `UnsupportedSampledImage`:
+pixel program `0x8000273400` exhausts all 4096 physical slots while preparing
+the sample at `0x1a6c`. Its 1332-record, 96-byte table contains 3996 distinct
+texture descriptors, in addition to hundreds of views used earlier in the same
+shader. The graphics table had 4461 instruction mappings at the refusal. The
+per-shader image ceiling is now 8192, still capped by the device's descriptor
+limits; cross-draw texture retention remains 8192 entries. The enlarged GPU
+regression verifies 4352 mixed 2D/3D views in compute and fragment stages,
+relocated tables, aliased views and out-of-range indices. It and the complete
+smoke, descriptor-reuse, workgroup-table and command-continuation probes pass
+SDK validation. This removes the tested capacity restriction; its effect on
+the complete title scene still requires a fresh game run.
+
+Compute translations now have a separate bounded cache, preserving the graphics
+cache's budget. On comparable loading frames 860–890, median frame time changed
+from 3,337 ms to 2,513 ms, and compute translation from 285 ms to 20 ms. The runs
+had 65 median draws and 258/265 dispatches respectively. These are loading
+measurements; initial driver compilation and the later scene remain much slower.
+An opt-in page-tracking experiment in the loaded process reduces repeated buffer
+uploads from roughly 15 GiB to 1–1.5 GiB per scene frame. Later UI frames still
+take roughly 6–9 seconds. Page tracking remains opt-in, and these changing scene
+workloads do not establish a controlled FPS comparison.
+
+The persisted driver cache had also reached 67,107,307 bytes, just below its
+64 MiB cap. Larger live caches were silently excluded from subsequent saves.
+The persistence limit is now 256 MiB, retaining a bound on file reads and
+temporary allocations while allowing streamed-scene pipelines to survive
+relaunches. This does not remove the cost of compiling a shader for the first
+time. One fresh scene frame compiled 207 compute pipelines in about 210 seconds.
+A real GPU persistence probe saves and reloads a 67,136,709-byte cache, above the
+former limit, with clean SDK validation. The fresh game run also persists a
+107,199,910-byte driver cache during the bonus sequence and grows to
+125,246,127 bytes on the brightness screen.
+
 ## Release progress on 2026-09-08
 
 Since `v0.3.0-alpha.3`, development has advanced from intro playback into streamed

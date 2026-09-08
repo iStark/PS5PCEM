@@ -3009,17 +3009,39 @@ const Builder = struct {
         }
         const value_bits = try self.source(inst.dst, .bits32);
         const value = try self.convert(.{ .id = value_bits, .value_type = .bits32 }, .float32);
-        const pointer = try self.bufferWordPointer(try self.bufferAddress(inst), 0);
+        const access = try self.bufferWordAccess(try self.bufferAddress(inst), 0);
+        const guard = try self.beginBufferAtomic(access);
         const scope = try self.constant(.bits32, 1);
         const semantics = try self.constant(.bits32, 0);
         const original = self.id();
-        try self.emit(&self.body, 227, &.{ self.bits_type, original, pointer, scope, semantics }); // OpAtomicLoad
-        const current = try self.convert(.{ .id = original, .value_type = .bits32 }, .float32);
+        try self.emit(&self.body, 227, &.{ self.bits_type, original, access.pointer, scope, semantics }); // OpAtomicLoad
+        // A separate atomic load/store loses concurrent lanes' extrema. Retry
+        // the complete read-modify-write when another invocation wins the CAS.
+        const head = self.id();
+        const body = self.id();
+        const retry = self.id();
+        const done = self.id();
+        const expected = self.id();
+        const observed = self.id();
+        try self.emit(&self.body, 249, &.{head});
+        try self.emit(&self.body, 248, &.{head});
+        try self.emit(&self.body, 245, &.{ self.bits_type, expected, original, guard.taken, observed, retry });
+        try self.emit(&self.body, 246, &.{ done, retry, 0 }); // OpLoopMerge
+        try self.emit(&self.body, 249, &.{body});
+        try self.emit(&self.body, 248, &.{body});
+        const current = try self.convert(.{ .id = expected, .value_type = .bits32 }, .float32);
         const selected = try self.glslBinaryValue(if (is_min) 37 else 40, .float32, current, value);
         const desired = try self.convert(.{ .id = selected, .value_type = .float32 }, .bits32);
-        try self.emit(&self.body, 228, &.{ pointer, scope, semantics, desired }); // OpAtomicStore
+        try self.emit(&self.body, 230, &.{ self.bits_type, observed, access.pointer, scope, semantics, semantics, desired, expected }); // OpAtomicCompareExchange
+        const exchanged = self.id();
+        try self.emit(&self.body, 170, &.{ self.bool_type, exchanged, observed, expected });
+        try self.emit(&self.body, 250, &.{ exchanged, done, retry });
+        try self.emit(&self.body, 248, &.{retry});
+        try self.emit(&self.body, 249, &.{head});
+        try self.emit(&self.body, 248, &.{done});
+        const result = try self.endBufferAtomic(guard, observed, done);
         if (inst.globally_coherent) {
-            try self.destination(inst.dst, .{ .id = original, .value_type = .bits32 });
+            try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
         }
         try self.emit(&self.body, 225, &.{
             try self.constant(.bits32, 1),
@@ -7339,7 +7361,8 @@ const Builder = struct {
         for (0..component_count) |component| {
             const layout = bufferComponentLayout(format.data, @intCast(component)).?;
             const pair_bits = try self.source(try consecutiveRegister(inst.dst, @intCast(component / 2)), .bits32);
-            var value = try self.andBits(try self.shiftRightBits(pair_bits, @intCast((component % 2) * 16)), 0xffff);
+            const half = if (inst.opcode == .buffer_store_format_d16_hi_x) 1 else component % 2;
+            var value = try self.andBits(try self.shiftRightBits(pair_bits, @intCast(half * 16)), 0xffff);
             if (layout.bit_count == 32) {
                 if (format.number == 7) {
                     const pair = self.id();
@@ -7493,6 +7516,27 @@ const Builder = struct {
         try self.bufferStoreSubword(asBufferFromFlat(inst), width);
     }
 
+    const BufferAtomicGuard = struct { taken: u32, skipped: u32, merge: u32 };
+
+    fn beginBufferAtomic(self: *Builder, access: WordAccess) Error!BufferAtomicGuard {
+        const predicate = (try self.writePredicate(access.in_range)) orelse try self.constantBool(true);
+        const guard = BufferAtomicGuard{ .taken = self.id(), .skipped = self.id(), .merge = self.id() };
+        try self.emit(&self.body, 247, &.{ guard.merge, 0 });
+        try self.emit(&self.body, 250, &.{ predicate, guard.taken, guard.skipped });
+        try self.emit(&self.body, 248, &.{guard.taken});
+        return guard;
+    }
+
+    fn endBufferAtomic(self: *Builder, guard: BufferAtomicGuard, value: u32, predecessor: u32) Error!u32 {
+        try self.emit(&self.body, 249, &.{guard.merge});
+        try self.emit(&self.body, 248, &.{guard.skipped});
+        try self.emit(&self.body, 249, &.{guard.merge});
+        try self.emit(&self.body, 248, &.{guard.merge});
+        const result = self.id();
+        try self.emit(&self.body, 245, &.{ self.bits_type, result, value, predecessor, try self.constant(.bits32, 0), guard.skipped });
+        return result;
+    }
+
     fn bufferAtomic(self: *Builder, inst: instruction.Instruction, opcode: u16) Error!void {
         if (!try self.hasBufferStorage(inst)) {
             if (inst.globally_coherent) {
@@ -7504,18 +7548,24 @@ const Builder = struct {
             return;
         }
         const value = try self.source(inst.dst, .bits32);
-        const address = try self.bufferAddress(inst);
+        const access = try self.bufferWordAccess(try self.bufferAddress(inst), 0);
+        // An inactive lane retains its old VGPR value. Executing its atomic
+        // anyway adds that unrelated value to guest counters. The safe pointer
+        // for an OOB access also requires a guard: it names word zero only to
+        // keep the access chain valid, never to redirect an atomic there.
+        const guard = try self.beginBufferAtomic(access);
         const result = self.id();
         try self.emit(&self.body, opcode, &.{
             self.bits_type,
             result,
-            try self.bufferWordPointer(address, 0),
+            access.pointer,
             try self.constant(.bits32, 1), // ScopeDevice
             try self.constant(.bits32, 0), // MemorySemanticsNone
             value,
         });
+        const previous = try self.endBufferAtomic(guard, result, guard.taken);
         if (inst.globally_coherent) {
-            try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+            try self.destination(inst.dst, .{ .id = previous, .value_type = .bits32 });
         }
         try self.emit(&self.body, 225, &.{
             try self.constant(.bits32, 1),
@@ -8573,6 +8623,7 @@ const Builder = struct {
             .buffer_store_byte => try self.bufferStoreSubword(inst, 8),
             .buffer_store_short, .buffer_store_short_d16_hi => try self.bufferStoreSubword(inst, 16),
             .buffer_store_format_d16_x => try self.bufferStoreFormatD16(inst, 1),
+            .buffer_store_format_d16_hi_x => try self.bufferStoreFormatD16(inst, 1),
             .buffer_store_format_d16_xy => try self.bufferStoreFormatD16(inst, 2),
             .buffer_store_format_d16_xyz => try self.bufferStoreFormatD16(inst, 3),
             .buffer_store_format_d16_xyzw => try self.bufferStoreFormatD16(inst, 4),
@@ -9869,6 +9920,7 @@ fn opcodeUsesWritePredicate(opcode: isa.Opcode) bool {
         .buffer_store_format_xyz,
         .buffer_store_format_xyzw,
         .buffer_store_format_d16_x,
+        .buffer_store_format_d16_hi_x,
         .buffer_store_format_d16_xy,
         .buffer_store_format_d16_xyz,
         .buffer_store_format_d16_xyzw,
@@ -10985,7 +11037,7 @@ test "fragment depth-compare sample uses Dref explicit lod" {
     try std.testing.expect(containsOpcode(module.words, 90)); // OpImageSampleDrefExplicitLod
 }
 
-test "buffer float atomics lower through atomic load and store" {
+test "buffer float atomics lower through a guarded compare-exchange loop" {
     var program = instruction.Program{ .code = &.{}, .instructions = .empty };
     defer program.deinit(std.testing.allocator);
     try program.instructions.append(std.testing.allocator, .{
@@ -11006,7 +11058,9 @@ test "buffer float atomics lower through atomic load and store" {
     });
     defer module.deinit(std.testing.allocator);
     try std.testing.expect(containsOpcode(module.words, 227)); // OpAtomicLoad
-    try std.testing.expect(containsOpcode(module.words, 228)); // OpAtomicStore
+    try std.testing.expect(containsOpcode(module.words, 230)); // OpAtomicCompareExchange
+    try std.testing.expect(!containsOpcode(module.words, 228)); // no non-RMW atomic store
+    try std.testing.expect(containsOpcode(module.words, 246)); // OpLoopMerge
 }
 
 test "native vector shift-add masks its shift and adds the third source" {

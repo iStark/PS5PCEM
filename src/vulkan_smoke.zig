@@ -1085,6 +1085,123 @@ fn runSaveExecProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("SAVEEXEC passed: AND/ANDN1/ORN2 operand order, saved masks, overlapping destinations, SCC and preserved EXEC_HI for 32-bit operations\n", .{});
 }
 
+fn runBufferAtomicProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const types = [_]gpu.shader_analysis.Opcode{ .buffer_atomic_add, .buffer_atomic_fmin, .buffer_atomic_fmax };
+    for ([_]bool{ false, true }) |typed_ir| for (types) |opcode| for ([_]bool{ false, true }) |wave32| for ([_]u32{ 0, 35, 128 }) |selected| for ([_]u16{ 32, 64 }) |offset| for ([_]bool{ false, true }) |returns| {
+        const initial: u32 = if (opcode == .buffer_atomic_add) 10 else @bitCast(@as(f32, 10));
+        const input: u32 = switch (opcode) {
+            .buffer_atomic_add => 1,
+            .buffer_atomic_fmin => @bitCast(@as(f32, -20)),
+            .buffer_atomic_fmax => @bitCast(@as(f32, 20)),
+            else => unreachable,
+        };
+        // Inactive invocations keep an unrelated value, as in Yotei's masked
+        // counter update. Predicating the returned VGPR alone cannot protect
+        // the shared counter from their side effects.
+        const poison: u32 = 0xb7e9_3b83;
+        const atomic = mubuf(switch (opcode) {
+            .buffer_atomic_add => 0x32,
+            .buffer_atomic_fmin => 0x3f,
+            .buffer_atomic_fmax => 0x40,
+            else => unreachable,
+        }, @intCast(offset), 1, 0, 4);
+        const output = mubuf(0x1c, 0, 1, 0, 8);
+        const code = [_]u32{
+            vop1(1, 1, 255), poison,
+            0x7d84_00ff,       selected, // v_cmp_eq_u32 vcc, selected, v0
+            sop1(4, 126, 106), vop1(1, 1, 255),
+            input,             (atomic[0] & ~@as(u32, 1 << 13)) | (if (returns) @as(u32, 1 << 14) else 0),
+            atomic[1],         sop1(4, 126, 193),
+            output[0],         output[1],
+            0xbf81_0000,
+        };
+        for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+        var analysis = try gpu.shader_analysis.decodeWithOptions(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, 64, .{ .enable_typed_ir = typed_ir });
+        defer analysis.deinit(allocator);
+        try std.testing.expectEqual(opcode, analysis.program.instructions.items[4].opcode);
+        var module = try analysis.translateSpirv(allocator, .{
+            .stage = .compute,
+            .wave32 = wave32,
+            .local_size = .{ 128, 1, 1 },
+            .compute_inputs = .{ .local_invocation_id_components = 1 },
+            .storage_buffers = &.{
+                .{ .resource_sgpr = 4, .descriptor_index = 0, .extent_bytes = 64 },
+                .{ .resource_sgpr = 8, .descriptor_index = 1, .extent_bytes = 512, .stride = 4 },
+            },
+        });
+        defer module.deinit(allocator);
+        @memset(guest.bytes[0x10000..0x10040], 0);
+        guest.word(0x10000, 0x1234_5678);
+        guest.word(0x10020, initial);
+        _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, 64);
+        _ = try renderer.stageGuestStorageBufferAt(1, 0x11000, 512);
+        _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+        var counter: [64]u8 = undefined;
+        var values: [512]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x10000, &counter);
+        try renderer.readbackGuestStorageBuffer(0x11000, &values);
+        const expected = if (selected >= 128 or offset == 64) initial else if (opcode == .buffer_atomic_add) initial + 1 else input;
+        if (std.mem.readInt(u32, counter[32..36], .little) != expected) std.debug.print("atomic counter: {s} wave32={any} lane={d} offset={d} return={any}\n", .{ @tagName(opcode), wave32, selected, offset, returns });
+        try std.testing.expectEqual(@as(u32, 0x1234_5678), std.mem.readInt(u32, counter[0..4], .little));
+        try std.testing.expectEqual(expected, std.mem.readInt(u32, counter[32..36], .little));
+        for (0..128) |lane| {
+            const expected_value = if (lane != selected) poison else if (!returns) input else if (offset == 64) 0 else initial;
+            if (std.mem.readInt(u32, values[lane * 4 ..][0..4], .little) != expected_value) std.debug.print("atomic return: {s} wave32={any} selected={d} lane={d} offset={d} return={any}\n", .{ @tagName(opcode), wave32, selected, lane, offset, returns });
+            try std.testing.expectEqual(expected_value, std.mem.readInt(u32, values[lane * 4 ..][0..4], .little));
+        }
+    };
+    // All workgroups update the same word. Float min/max must be a single
+    // atomic RMW; separate atomic loads and stores can lose another lane's
+    // extremum even when every invocation has EXEC enabled.
+    for (types) |opcode| {
+        const initial: u32 = switch (opcode) {
+            .buffer_atomic_add => 0,
+            .buffer_atomic_fmin => @bitCast(@as(f32, 10000)),
+            .buffer_atomic_fmax => @bitCast(@as(f32, -10000)),
+            else => unreachable,
+        };
+        const atomic = mubuf(switch (opcode) {
+            .buffer_atomic_add => 0x32,
+            .buffer_atomic_fmin => 0x3f,
+            .buffer_atomic_fmax => 0x40,
+            else => unreachable,
+        }, 0, 1, 0, 4);
+        const code = [_]u32{
+            if (opcode == .buffer_atomic_add) vop1(1, 1, 129) else vop1(6, 1, 256),
+            atomic[0] & ~@as(u32, 1 << 13),
+            atomic[1],
+            0xbf81_0000,
+        };
+        for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+        var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, 16);
+        defer analysis.deinit(allocator);
+        var module = try analysis.translateSpirv(allocator, .{
+            .stage = .compute,
+            .local_size = .{ 128, 1, 1 },
+            .compute_inputs = .{ .local_invocation_id_components = 1 },
+            .storage_buffers = &.{.{ .resource_sgpr = 4, .descriptor_index = 0, .extent_bytes = 4 }},
+        });
+        defer module.deinit(allocator);
+        guest.word(0x10000, initial);
+        _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, 4);
+        _ = try renderer.dispatchSpirv(module.words, .{ 8, 1, 1 });
+        var counter: [4]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x10000, &counter);
+        const expected: u32 = switch (opcode) {
+            .buffer_atomic_add => 1024,
+            .buffer_atomic_fmin => @bitCast(@as(f32, 0)),
+            .buffer_atomic_fmax => @bitCast(@as(f32, 127)),
+            else => unreachable,
+        };
+        try std.testing.expectEqual(expected, std.mem.readInt(u32, &counter, .little));
+    }
+    std.debug.print("buffer atomics passed: masked poison values, wave32/wave64, high lanes, empty EXEC, OOB, returned values and concurrent integer/float RMW\n", .{});
+}
+
 fn runWideMaskProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -2026,7 +2143,7 @@ fn runGdsMemoryProbe(allocator: std.mem.Allocator) !void {
 fn runPackedBufferProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
-    var guest = GuestMemory{};
+    var guest = SizedGuestMemory(256 * 1024){};
     _ = renderer.dcbBackend(guest.interface());
     guest.word(0x10000, 0x01ff_807f);
     guest.word(0x10004, 0x0000_0080);
@@ -2136,25 +2253,32 @@ fn runPackedBufferProbe(allocator: std.mem.Allocator) !void {
             try std.testing.expectEqual(value, std.mem.readInt(u32, output[index * 4 ..][0..4], .little));
         }
     }
-    const store_formats = [_]struct { format: u32, count: u32, width: u32 }{
+    const store_formats = [_]struct { format: u32, count: u32, width: u32, high: bool = false }{
         .{ .format = 13, .count = 1, .width = 2 },
         .{ .format = 29, .count = 2, .width = 2 },
         .{ .format = 74, .count = 3, .width = 4 },
         .{ .format = 71, .count = 4, .width = 2 },
         .{ .format = 77, .count = 4, .width = 4 },
+        .{ .format = 11, .count = 1, .width = 2, .high = true },
+        .{ .format = 12, .count = 1, .width = 2, .high = true },
+        .{ .format = 13, .count = 1, .width = 2, .high = true },
+        .{ .format = 20, .count = 1, .width = 4, .high = true },
+        .{ .format = 21, .count = 1, .width = 4, .high = true },
+        .{ .format = 22, .count = 1, .width = 4, .high = true },
     };
     for (store_formats, 0..) |case, case_index| {
         const program: u32 = 7 + @as(u32, @intCast(case_index));
         const destination: u32 = 0x18000 + @as(u32, @intCast(case_index)) * 0x1000;
         const stride = case.count * case.width;
+        const store_word: u32 = if (case.high) 0xe09c_6000 else 0xe200_2000 | ((0x83 + case.count) << 18);
         const store_code = [_]u32{
             vop1(1, 1, 255), 0xc000_3c00,
             vop1(1, 2, 255), 0x8000_3800,
-            0x3606_009f,                               0x7d7a_0680, // disable lanes 0 and 32
-            0xe200_2000 | ((0x83 + case.count) << 18), 0x8001_0100,
+            0x3606_009f, 0x7d7a_0680, // disable lanes 0 and 32
+            store_word,  0x8001_0100,
             0xbefe_04c1, // restore EXEC; an OOB store must preserve word zero
             vop1(1, 0, 192), // index 64
-            0xe200_2000 | ((0x83 + case.count) << 18),
+            store_word,
             0x8001_0100,
             0xbf81_0000,
         };
@@ -2173,10 +2297,15 @@ fn runPackedBufferProbe(allocator: std.mem.Allocator) !void {
             for (0..case.count) |component| {
                 const offset = lane * stride + component * case.width;
                 if (case.width == 2) {
-                    const expected_half: u16 = if (lane % 32 == 0) (if (offset % 4 == 0) 0x5678 else 0x1234) else half_values[component];
+                    const expected_half: u16 = if (lane % 32 == 0) (if (offset % 4 == 0) 0x5678 else 0x1234) else half_values[if (case.high) 1 else component];
                     try std.testing.expectEqual(expected_half, std.mem.readInt(u16, stored[offset..][0..2], .little));
                 } else {
-                    try std.testing.expectEqual(if (lane % 32 == 0) @as(u32, 0x1234_5678) else float_values[component], std.mem.readInt(u32, stored[offset..][0..4], .little));
+                    const expected_word: u32 = if (case.high) switch (case.format) {
+                        20 => 0xc000,
+                        21 => 0xffff_c000,
+                        else => float_values[1],
+                    } else float_values[component];
+                    try std.testing.expectEqual(if (lane % 32 == 0) @as(u32, 0x1234_5678) else expected_word, std.mem.readInt(u32, stored[offset..][0..4], .little));
                 }
             }
         }
@@ -3108,7 +3237,7 @@ fn runCountedImageLoopProbe(allocator: std.mem.Allocator, uniform_limit: bool) !
 }
 
 fn runLargeIndirectImageProbe(allocator: std.mem.Allocator) !void {
-    const count = 4096;
+    const count = 4352;
     const groups = count + 1;
     var renderer = try vulkan.Renderer.init(allocator, .{ .trace_resource_failures = true });
     defer renderer.deinit();
@@ -3233,7 +3362,7 @@ fn runLargeIndirectImageProbe(allocator: std.mem.Allocator) !void {
     const center = 0x2000 + (32 * 64 + 32) * 4;
     std.debug.print("large sampled fragment center={any}\n", .{guest.bytes[center..][0..4].*});
     try std.testing.expectEqual(@as(u8, 128), guest.bytes[center]);
-    std.debug.print("large indirect sampled images passed: compute/fragment lookup, 4096 mixed 2D/3D views, exact aliases, null bounds, relocated table and shared sampler\n", .{});
+    std.debug.print("large indirect sampled images passed: compute/fragment lookup, 4352 mixed 2D/3D views, exact aliases, null bounds, relocated table and shared sampler\n", .{});
 }
 
 fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
@@ -3356,9 +3485,192 @@ fn runIndirectImageProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("indirect sampled images passed: runtime selection, aliases, bounds, wrapping, guarded SGPR/VCC offsets, 128 textures and mixed 2D/3D views\n", .{});
 }
 
+fn runGraphicsDescriptorReuseProbe(allocator: std.mem.Allocator) !void {
+    for (0..4) |case_index| {
+        const array_first = case_index == 1;
+        const query_lod = case_index >= 2;
+        var renderer = try vulkan.Renderer.init(allocator, .{});
+        defer renderer.deinit();
+        var guest = GuestMemory{};
+        const vertex = [_]u32{
+            vop1(6, 1, 261), vop1(1, 2, 255),  0x3f80_0000,      vop2(4, 3, 1, 2),
+            vop1(1, 4, 255), 0x3f40_0000,      vop2(8, 5, 3, 4), vop2(8, 6, 3, 3),
+            vop1(1, 7, 255), 0xbfc0_0000,      vop2(8, 6, 6, 7), vop1(1, 8, 255),
+            0x3f40_0000,     vop2(3, 6, 6, 8), vop1(1, 7, 128),  vop1(1, 8, 242),
+            0xf800_08cf,     0x0807_0605,      0xbf81_0000,
+        };
+        const sample_fragment = [_]u32{
+            0xf40c_0006,     125 << 25, // T#s0 from pointer s12:s13
+            vop1(1, 0, 240), vop1(1, 1, 240),
+            vop1(1, 2, 128), if (array_first) 0xf09c_0f28 else 0xf09c_0f08,
+            0x0040_0400,
+            0xf40c_0006, (125 << 25) | 32, // same SGPRs, different 2D image
+            0xf11c_0408, 0x0040_0800, // gather blue into v8:v11
+            0xf11c_0408,      0x0040_0c00, // same descriptor, another instruction
+            vop1(1, 15, 242), 0xf800_080f,
+            0x0f0c_0504,      0xbf81_0000,
+        };
+        // A query-only shader needs its own texture binding. UV gradients over
+        // a 64-pixel target and a 4-texel image give unclamped LOD -4; dmask=2
+        // packs that second query component into the first destination VGPR.
+        const lod_fragment = [_]u32{
+            0xf40c_0006,                                       125 << 25,
+            0xc801_0000,                                       0xc805_0100,
+            if (case_index == 2) 0xf180_0208 else 0xf180_0308, 0x0040_0400,
+            vop1(1, 8, 255),                                   0xbe80_0000,
+            vop2(8, 9, if (case_index == 2) 4 else 5, 8),      vop1(1, 10, 128),
+            vop1(1, 15, 242),                                  0xf800_080f,
+            if (case_index == 2) 0x0f0a_0a09 else 0x0f0a_0409, 0xbf81_0000,
+        };
+        const fragment: []const u32 = if (query_lod) &lod_fragment else &sample_fragment;
+        for (vertex, 0..) |word, index| guest.word(0x700 + index * 4, word);
+        for (fragment, 0..) |word, index| guest.word(0x900 + index * 4, word);
+        const extent: u32 = if (query_lod) 4 else 1;
+        var first = sampledImageDescriptorWords(0x10000, extent, extent);
+        if (array_first) first[3] = (first[3] & 0x0fff_ffff) | (13 << 28);
+        const second = sampledImageDescriptorWords(0x11000, 1, 1);
+        for (first, 0..) |word, index| guest.word(0x18000 + index * 4, word);
+        for (second, 0..) |word, index| guest.word(0x18020 + index * 4, word);
+        guest.word(0x10000, 0xff00_00ff);
+        guest.word(0x11000, 0xffff_0000);
+        var state = gpu.State{};
+        for ([_]gpu.resources.ShaderStage{ .vertex, .pixel }, [_]u32{ 7, 9 }) |stage, address| {
+            try state.writeRegister(.shader, stage.programRegisterBase(), address);
+            try state.writeRegister(.shader, stage.programRegisterBase() + 1, 0);
+        }
+        const pixel = gpu.resources.ShaderStage.pixel;
+        try state.writeRegister(.shader, pixel.userDataBase() - 1, 14 << 1);
+        for ([_]u32{ 0, 0, 0, 0, 0x18000, 0 }, 0..) |word, index|
+            try state.writeRegister(.shader, pixel.userDataBase() + 8 + @as(u32, @intCast(index)), word);
+        const context = [_][2]u32{
+            .{ 0x318, 0x20 },                    .{ 0x319, 7 },               .{ 0x31b, 0 },               .{ 0x31c, 10 << 2 }, .{ 0x31d, 0 },
+            .{ 0x390, 0 },                       .{ 0x3b0, (63 << 14) | 63 }, .{ 0x3b8, 1 << 24 },         .{ 0x08e, 0xf },     .{ 0x00c, 0 },
+            .{ 0x00d, 64 | (64 << 16) },         .{ 0x094, 1 << 31 },         .{ 0x095, 64 | (64 << 16) }, .{ 0x1e0, 0 },       .{ 0x200, 0 },
+            .{ 0x202, (0xcc << 16) | (1 << 4) }, .{ 0x204, 0 },               .{ 0x205, 0 },
+        };
+        for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+        for ([_]f32{ 32, 32, 32, 32, 1, 0 }, 0..) |value, index|
+            try state.writeRegister(.context, 0x10f + @as(u32, @intCast(index)), @bitCast(value));
+        var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(guest.interface()), .allocator = allocator };
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+        if (renderer.last_draw_error) |err| return err;
+        try renderer.flushPendingGuestWrites();
+        const center = 0x2000 + (32 * 64 + 32) * 4;
+        try std.testing.expectEqual(@as(u32, if (query_lod) 0xff00_00ff else 0xffff_00ff), std.mem.readInt(u32, guest.bytes[center..][0..4], .little));
+        try std.testing.expectEqual(@as(u64, if (query_lod) 1 else 2), renderer.texture_cache_misses);
+    }
+    std.debug.print("graphics descriptor reuse passed: 2D/array sample followed by 2D gather, distinct images, repeated physical binding and query-only LOD masks\n", .{});
+}
+
+fn runUnsupportedTextureContinuationProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    const program = [_]u32{
+        vop1(1, 0, 240), vop1(1, 1, 240),
+        0xf09c_0f08, 0x0040_0400, // sample T#s0, S#s8
+        0xe078_0000, 0x8003_0400, // store v4:v7 through V#s12
+        0xbf81_0000,
+    };
+    for (program, 0..) |word, index| guest.word(0x800 + index * 4, word);
+    var descriptor = sampledImageDescriptorWords(0x10000, 1, 1);
+    descriptor[3] |= 7 << 20; // unsupported guest tile mode
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 8);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 16 << 1);
+    for ([_]u32{ 0x207, 0x208, 0x209 }) |reg| try state.writeRegister(.shader, reg, 1);
+    for (descriptor, 0..) |word, index|
+        try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+    for ([_]u32{ 0, 0, 0, 0, 0x11000, 4 << 16, 4, 0 }, 0..) |word, index|
+        try state.writeRegister(.shader, compute.userDataBase() + 8 + @as(u32, @intCast(index)), word);
+    guest.word(0x11000, 0xdead_beef);
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(guest.interface()), .allocator = allocator };
+    const result = try executor.execute(&.{
+        command(gpu.pm4.dispatch_direct, 4),          1,               1,       1,      0x41,
+        customCommand(gpu.pm4.custom.release_mem, 7), 0x28 | (5 << 8), 2 << 29, 0x7000, 0,
+        98,                                           0,               0,
+    });
+    try std.testing.expectEqual(gpu.executor.Status.complete, result.status);
+    try std.testing.expectEqual(error.UnsupportedTileMode, renderer.last_dispatch_error.?);
+    try std.testing.expectEqual(@as(u64, 98), std.mem.readInt(u64, guest.bytes[0x7000..][0..8], .little));
+    try std.testing.expectEqual(@as(u32, 0xdead_beef), std.mem.readInt(u32, guest.bytes[0x11000..][0..4], .little));
+    // A skipped pass must leave the renderer usable for subsequent valid work.
+    try runIndexedCopyKernel(allocator, &renderer, &guest, renderer.dcbBackend(guest.interface()));
+    std.debug.print("unsupported texture continuation passed: release retained, output untouched, following compute verified\n", .{});
+}
+
+fn runWorkgroupImageTableProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    const store = mubuf(0x1e, 0, 4, 2, 4);
+    const program = [_]u32{
+        vop1(1, 2, 3), // retain the original workgroup ID for the output
+        0x9003_8103, // s3 >>= 1: two workgroups share each texture
+        0x936b_ff03, 440, // VCC_HI = s3 * record stride
+        0xf408_0500, 0xfa00_0000, // table V#s20 from pointer s0
+        0xf42c_030a, 0xd600_0000, // T#s12 from table + VCC_HI
+        0xf408_0100,      0xfa00_0010, // output V#s4 from pointer s0 + 16
+        sop1(4, 24, 128), sop1(4, 26, 128),
+        vop1(1, 0, 240),  vop1(1, 1, 240),
+        0xf09c_0f08,      0x00c3_0400,
+        store[0],         store[1],
+        0xbf81_0000,
+    };
+    for (program, 0..) |word, index| guest.word(0x800 + index * 4, word);
+    for ([_]u32{ 0x2000, 440 << 16, 2, 0, 0x11000, 16 << 16, 4, 0 }, 0..) |word, index|
+        guest.word(0x1800 + index * 4, word);
+    for (0..2) |record| {
+        const image_words = sampledImageDescriptorWords(@intCast(0x10000 + record * 256), 1, 1);
+        for (image_words, 0..) |word, index| guest.word(0x2000 + record * 440 + index * 4, word);
+        // Ordinary record fields can look like a decodable descriptor. They
+        // are unreachable for these group IDs and must never be staged.
+        var poison = image_words;
+        poison[3] |= 7 << 20;
+        for (poison, 0..) |word, index| guest.word(0x2020 + record * 440 + index * 4, word);
+        guest.word(0x10000 + record * 256, if (record == 0) 0xff00_00ff else 0xffff_0000);
+    }
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 8);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, (3 << 1) | (1 << 7));
+    for ([_]u32{ 0x207, 0x208, 0x209 }) |reg| try state.writeRegister(.shader, reg, 1);
+    for ([_]u32{ 0x1800, 0, 0 }, 0..) |word, index|
+        try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(guest.interface()), .allocator = allocator };
+    _ = try executor.execute(&.{ command(gpu.pm4.dispatch_direct, 4), 4, 1, 1, 0x41 });
+    if (renderer.last_dispatch_error) |err| return err;
+    try std.testing.expectEqual(@as(u64, 1), renderer.translated_dispatches);
+    var output: [64]u8 = undefined;
+    try renderer.readbackGuestStorageBuffer(0x11000, &output);
+    for (0..4) |group| for (0..4) |channel| {
+        const expected: u32 = if (channel == 3 or channel == (if (group < 2) @as(usize, 0) else 2)) 0x3f80_0000 else 0;
+        if (expected != std.mem.readInt(u32, output[(group * 4 + channel) * 4 ..][0..4], .little))
+            std.debug.print("workgroup table output group={d} channel={d} bytes={x}\n", .{ group, channel, output });
+        try std.testing.expectEqual(expected, std.mem.readInt(u32, output[(group * 4 + channel) * 4 ..][0..4], .little));
+    };
+    try std.testing.expectEqual(@as(u64, 2), renderer.texture_cache_misses);
+    std.debug.print("workgroup image table passed: shifted group IDs, 440-byte records, unreachable descriptor-like fields and per-group colors\n", .{});
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--workgroup-image-table")) {
+        try runWorkgroupImageTableProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--unsupported-texture-continuation")) {
+        try runUnsupportedTextureContinuationProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--graphics-descriptor-reuse")) {
+        try runGraphicsDescriptorReuseProbe(allocator);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--vector-carry")) {
         try runVectorCarryProbe(allocator);
         return;
@@ -3441,6 +3753,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--dpp")) {
         try runDppProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-atomics")) {
+        try runBufferAtomicProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--scene-masks")) {

@@ -794,14 +794,14 @@ const TextureContent = struct {
 const maximum_render_targets = 64;
 const maximum_color_passes = 16;
 const maximum_depth_targets = 16;
-const maximum_sampled_images = 4096;
+// A streamed material can combine a 3996-entry texture table with hundreds
+// of additional views. The device limits below still cap each bank.
+const maximum_sampled_images = 8192;
 // One physical texture can occur at many sampling instructions in a material.
 const maximum_compute_sampled_mappings = 16384;
-// Descriptor arrays are limited per shader, but the cross-draw texture cache
-// must cover a complete modern frame. Tying cache capacity to the 32 live
-// descriptor slots evicts large static textures before their next use and
-// uploads them again on every flip.
-const maximum_cached_sampled_images = maximum_sampled_images * 2;
+// Keep cross-draw retention independent of a shader's descriptor limit.
+// Raising the live table ceiling must not also double retained texture data.
+const maximum_cached_sampled_images = 8192;
 /// Storage images form long compute chains in modern Unity render graphs. A
 /// dispatch may write one image only for the next dispatch to read it; keeping
 /// those images resident avoids a GPU -> tiled guest memory -> GPU round trip
@@ -833,8 +833,9 @@ const maximum_htile_bytes = 8 * 1024 * 1024;
 /// On-disk driver pipeline cache. Reused across runs so per-title shader
 /// compilation is paid once instead of on every launch.
 const pipeline_cache_path = "vulkan_pipeline_cache.bin";
-/// Sanity cap: a pipeline cache payload this large is not ours.
-const maximum_pipeline_cache_bytes = 64 * 1024 * 1024;
+/// Streamed 3D scenes exceed 64 MiB of driver pipelines. Keep persistence
+/// bounded without dropping every subsequent save once that scene is loaded.
+const maximum_pipeline_cache_bytes = 256 * 1024 * 1024;
 
 /// Reads the persisted driver pipeline cache, if any. Any failure — missing
 /// file, unreadable file, unreasonable size — returns null; the caller then
@@ -3120,6 +3121,10 @@ pub const Renderer = struct {
     compute_pipeline_sequence: u64 = 0,
     graphics_pipelines: std.ArrayList(GraphicsPipelineEntry) = .empty,
     graphics_translations: spirv_cache.Cache = .{},
+    /// Compute programs also recur with different runtime scalar values. Keep
+    /// their translations within a separate budget so scene kernels cannot
+    /// evict the UI/graphics working set.
+    compute_translations: spirv_cache.Cache = .{},
     /// Coherency domain shared by all Vulkan image caches. Separately-created
     /// host images which overlap in guest memory observe the same generation.
     image_aliases: image_alias.Manager = .{},
@@ -3987,6 +3992,7 @@ pub const Renderer = struct {
         }
         self.graphics_pipelines.deinit(self.allocator);
         self.graphics_translations.deinit(self.allocator);
+        self.compute_translations.deinit(self.allocator);
         for (self.analyzed_programs.items) |*entry| entry.analysis.deinit(self.allocator);
         self.analyzed_programs.deinit(self.allocator);
         for (self.completed_frames.items) |*frame| frame.pixels.deinit(self.allocator);
@@ -4951,8 +4957,9 @@ pub const Renderer = struct {
             self.noteComputeKind("covered-by-video");
             return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
         }
-        const bindings = try gpu.ShaderBindings.capture(state, .compute, header_address, reader);
+        var bindings = try gpu.ShaderBindings.capture(state, .compute, header_address, reader);
         const system_registers = gpu.resources.decodeComputeSystemRegisters(state);
+        bindings.compute_dispatch = .{ .system = system_registers, .group_count = group_count };
         const program_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(analysis.program.code));
         if (self.device_info.vendor_id == 0x10de and self.reanimal_nvidia_compute_quarantined) {
             self.elided_dispatches += 1;
@@ -5683,7 +5690,7 @@ pub const Renderer = struct {
             programHasRawInstruction(analysis, 0x28, &.{ 0xf000_0308, 0x0001_0500 }) and
             programHasRawInstruction(analysis, 0x6e4, &.{ 0xe034_2000, 0x8005_181d }) and
             programHasRawInstruction(analysis, 0x764, &.{ 0xdc30_8000, 0x197d_0018 });
-        var module = analysis.translateSpirv(self.allocator, .{
+        var module = self.compute_translations.translate(self.allocator, &analysis.program, .{
             .stage = .compute,
             .local_size = local_size,
             .wave32 = initiator & (1 << 15) != 0,
@@ -5714,7 +5721,7 @@ pub const Renderer = struct {
             .flat_memories = resources.flat_memories[0..resources.flat_memory_count],
             .allow_float64 = self.shader_float64_available,
             .allow_image_float32_atomic_min_max = self.image_float32_atomic_min_max_available,
-        }) catch |err| {
+        }, analysis.pipeline_options) catch |err| {
             self.frame_profile.compute_translate_ns +|= elapsedHostNanoseconds(translate_started);
             if (self.shouldReportComputeShaderFailure(program_address, err)) {
                 std.debug.print(
@@ -8185,6 +8192,7 @@ pub const Renderer = struct {
                 .buffer_store_format_xyz,
                 .buffer_store_format_xyzw,
                 .buffer_store_format_d16_x,
+                .buffer_store_format_d16_hi_x,
                 .buffer_store_format_d16_xy,
                 .buffer_store_format_d16_xyz,
                 .buffer_store_format_d16_xyzw,
@@ -15889,7 +15897,7 @@ pub const Renderer = struct {
 
         for (instructions) |inst| {
             const image_fetch = inst.opcode == .image_load or inst.opcode == .image_load_mip;
-            if (!image_fetch and inst.opcode != .image_sample and inst.opcode != .image_gather4) continue;
+            if (!needsSampledScalarCheckpoint(inst)) continue;
             if (inst.src1.kind != .sgpr or inst.src2.kind != .sgpr) {
                 if (log_verbose_gpu) std.debug.print(
                     "[vulkan dcb] image_sample resource kinds t#={s} s#={s}\n",
@@ -15899,7 +15907,7 @@ pub const Renderer = struct {
             }
             var existing = false;
             for (result.mappings[stage_mapping_start..result.mapping_count]) |mapping| {
-                if (!image_fetch and mapping.instruction_pc == null and
+                if (mapping.instruction_pc == inst.pc and
                     mapping.resource_sgpr == inst.src1.reg and mapping.sampler_sgpr == inst.src2.reg)
                 {
                     existing = true;
@@ -15978,59 +15986,75 @@ pub const Renderer = struct {
                 );
                 return Error.UnsupportedSampledImage;
             };
-            if (result.image_count >= self.device_info.sampled_image_capacity) return Error.UnsupportedSampledImage;
-            const descriptor_index: u32 = @intCast(result.image_count);
-            const sampled_started = hostTimestampNs();
-            const image = self.stageSampledImage(
-                image_descriptor,
-                sampler_descriptor,
-                descriptor_index,
-                sampled_dimension,
-                render_target_write,
-            ) catch |err| {
-                std.debug.print(
-                    "[vulkan dcb] stageSampledImage failed: {s} pc=0x{x} dim={s} addr=0x{x} {d}x{d}x{d} pitch={d} fmt={d} type={s} tile={f} levels={d}..{d} base_array={d} dst={any} sampler(clamp={d}/{d}/{d} unorm={any} minmag={d}/{d} mip={d} lod={d:.3}..{d:.3})\n",
-                    .{
-                        @errorName(err),
-                        inst.pc,
-                        @tagName(sampled_dimension),
-                        image_descriptor.address,
-                        image_descriptor.width,
-                        image_descriptor.height,
-                        image_descriptor.depth_or_layers,
-                        image_descriptor.pitch,
-                        image_descriptor.unified_format,
-                        @tagName(image_descriptor.image_type),
-                        image_descriptor.tile_mode,
-                        image_descriptor.base_level,
-                        image_descriptor.last_level,
-                        image_descriptor.base_array,
-                        image_descriptor.dst_select,
-                        sampler_descriptor.clamp_x,
-                        sampler_descriptor.clamp_y,
-                        sampler_descriptor.clamp_z,
-                        sampler_descriptor.unnormalized_coordinates,
-                        sampler_descriptor.minification_filter,
-                        sampler_descriptor.magnification_filter,
-                        sampler_descriptor.mip_filter,
-                        sampler_descriptor.minimum_lod,
-                        sampler_descriptor.maximum_lod,
-                    },
-                );
-                return err;
-            };
-            self.frame_profile.sampled_stage_ns +|= elapsedHostNanoseconds(sampled_started);
-            result.images[result.image_count] = image;
-            result.descriptors[descriptor_index] = image_descriptor;
-            result.samplers[descriptor_index] = sampler_descriptor;
-            result.dimensions[descriptor_index] = sampled_dimension;
-            result.image_count += 1;
+            // SGPR pairs can name different images later in the same shader.
+            // Resolve every instruction, sharing physical slots only when the
+            // complete image, sampler and Vulkan view dimension still match.
+            var descriptor_index: ?u32 = null;
+            for (result.descriptors[0..result.image_count], result.samplers[0..result.image_count], result.dimensions[0..result.image_count], 0..) |existing_image, existing_sampler, existing_dimension, index| {
+                if (std.meta.eql(existing_image, image_descriptor) and
+                    std.meta.eql(existing_sampler, sampler_descriptor) and
+                    existing_dimension == sampled_dimension)
+                {
+                    descriptor_index = @intCast(index);
+                    break;
+                }
+            }
+            if (descriptor_index == null) {
+                if (result.image_count >= self.device_info.sampled_image_capacity) return Error.UnsupportedSampledImage;
+                const physical_index: u32 = @intCast(result.image_count);
+                const sampled_started = hostTimestampNs();
+                const image = self.stageSampledImage(
+                    image_descriptor,
+                    sampler_descriptor,
+                    physical_index,
+                    sampled_dimension,
+                    render_target_write,
+                ) catch |err| {
+                    std.debug.print(
+                        "[vulkan dcb] stageSampledImage failed: {s} pc=0x{x} dim={s} addr=0x{x} {d}x{d}x{d} pitch={d} fmt={d} type={s} tile={f} levels={d}..{d} base_array={d} dst={any} sampler(clamp={d}/{d}/{d} unorm={any} minmag={d}/{d} mip={d} lod={d:.3}..{d:.3})\n",
+                        .{
+                            @errorName(err),
+                            inst.pc,
+                            @tagName(sampled_dimension),
+                            image_descriptor.address,
+                            image_descriptor.width,
+                            image_descriptor.height,
+                            image_descriptor.depth_or_layers,
+                            image_descriptor.pitch,
+                            image_descriptor.unified_format,
+                            @tagName(image_descriptor.image_type),
+                            image_descriptor.tile_mode,
+                            image_descriptor.base_level,
+                            image_descriptor.last_level,
+                            image_descriptor.base_array,
+                            image_descriptor.dst_select,
+                            sampler_descriptor.clamp_x,
+                            sampler_descriptor.clamp_y,
+                            sampler_descriptor.clamp_z,
+                            sampler_descriptor.unnormalized_coordinates,
+                            sampler_descriptor.minification_filter,
+                            sampler_descriptor.magnification_filter,
+                            sampler_descriptor.mip_filter,
+                            sampler_descriptor.minimum_lod,
+                            sampler_descriptor.maximum_lod,
+                        },
+                    );
+                    return err;
+                };
+                self.frame_profile.sampled_stage_ns +|= elapsedHostNanoseconds(sampled_started);
+                result.images[result.image_count] = image;
+                result.descriptors[physical_index] = image_descriptor;
+                result.samplers[physical_index] = sampler_descriptor;
+                result.dimensions[physical_index] = sampled_dimension;
+                result.image_count += 1;
+                descriptor_index = physical_index;
+            }
             result.mappings[result.mapping_count] = .{
                 .resource_sgpr = inst.src1.reg,
                 .sampler_sgpr = inst.src2.reg,
-                .descriptor_index = descriptor_index,
+                .descriptor_index = descriptor_index.?,
                 .dimension = sampled_dimension,
-                .instruction_pc = if (image_fetch) inst.pc else null,
+                .instruction_pc = inst.pc,
                 .depth_compare = sampler_descriptor.depth_compare,
                 .minimum_lod = sampler_descriptor.minimum_lod,
                 .maximum_lod = sampler_descriptor.maximum_lod,
@@ -20966,6 +20990,10 @@ pub const Renderer = struct {
                 err == Error.GuestBufferTooLarge or
                 err == Error.UnsupportedSampledImage or
                 err == Error.UnsupportedStorageImage or
+                // Texture staging can reject its layout after descriptor
+                // decoding. Keep the following RELEASE_MEM reachable just
+                // as for the other unsupported image forms.
+                err == error.UnsupportedTileMode or
                 std.mem.eql(u8, @errorName(err), "AddressOverflow") or
                 std.mem.eql(u8, @errorName(err), "UnsupportedOpcode") or
                 std.mem.eql(u8, @errorName(err), "UndefinedRegister") or
@@ -23432,6 +23460,7 @@ fn dumpShaderResourceOps(analysis: *const gpu.ShaderAnalysis) void {
             .buffer_store_format_xyz,
             .buffer_store_format_xyzw,
             .buffer_store_format_d16_x,
+            .buffer_store_format_d16_hi_x,
             .buffer_store_format_d16_xy,
             .buffer_store_format_d16_xyz,
             .buffer_store_format_d16_xyzw,
@@ -24173,6 +24202,16 @@ fn resolveBufferTablePlan(
         if (gpu.scalar_provenance.scalarRegisterIndex(inst.src0)) |source_register| {
             index_register = @intCast(source_register);
             index_bound = gpu.index_bounds.scalarUpperBound(instructions, &analysis.graph, index, @intCast(source_register));
+            if (bindings) |inputs| if (inputs.compute_dispatch) |dispatch| {
+                var entries: [3]gpu.index_bounds.EntryBound = undefined;
+                var entry_count: usize = 0;
+                for (dispatch.system.workgroup_id_sgprs, dispatch.group_count) |register, count| {
+                    entries[entry_count] = .{ .register = register orelse continue, .limit = count };
+                    entry_count += 1;
+                }
+                if (gpu.index_bounds.scalarEntryUpperBound(instructions, &analysis.graph, index, @intCast(source_register), entries[0..entry_count], 0)) |bound|
+                    index_bound = @min(index_bound orelse std.math.maxInt(u32), bound);
+            };
         }
         break;
     }
@@ -24579,6 +24618,7 @@ fn needsResourceScalarCheckpoint(inst: gpu.ShaderInstruction) bool {
         .buffer_store_format_xyz,
         .buffer_store_format_xyzw,
         .buffer_store_format_d16_x,
+        .buffer_store_format_d16_hi_x,
         .buffer_store_format_d16_xy,
         .buffer_store_format_d16_xyz,
         .buffer_store_format_d16_xyzw,
@@ -24614,7 +24654,8 @@ fn needsSampledScalarCheckpoint(inst: gpu.ShaderInstruction) bool {
     return inst.opcode == .image_load or
         inst.opcode == .image_load_mip or
         inst.opcode == .image_sample or
-        inst.opcode == .image_gather4;
+        inst.opcode == .image_gather4 or
+        inst.opcode == .image_get_lod;
 }
 
 fn scalarRegistersAtCheckpoint(

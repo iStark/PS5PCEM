@@ -216,3 +216,46 @@ test "dynamic uniform values reuse translation while bindings and literals inval
     defer fifth.deinit(a);
     try std.testing.expectEqual(@as(u64, 4), cache.misses);
 }
+
+test "compute cache matches fresh translation across runtime values wave modes and buffer bounds" {
+    const a = std.testing.allocator;
+    var cache = Cache{};
+    defer cache.deinit(a);
+    var program = rdna2.Program{ .code = &.{}, .instructions = .empty };
+    defer program.deinit(a);
+    // The compare overwrites s7 only in wave64. Store that neighboring scalar
+    // so an incorrectly reused wave32 module changes observable shader output.
+    try program.instructions.appendSlice(a, &.{
+        .{ .pc = 0, .family = .vop1, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 0 }, .src0 = .{ .kind = .sgpr, .reg = 0 }, .src_count = 1 },
+        .{ .pc = 4, .family = .vop3, .opcode = .v_cmp_eq_u32, .dst = .{ .kind = .sgpr, .reg = 6 }, .src0 = .{ .kind = .vgpr, .reg = 0 }, .src1 = .{ .kind = .integer_inline_constant, .value = 0 }, .src_count = 2 },
+        .{ .pc = 12, .family = .vop1, .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 1 }, .src0 = .{ .kind = .sgpr, .reg = 7 }, .src_count = 1 },
+        .{ .pc = 16, .word_count = 2, .family = .mubuf, .opcode = .buffer_store_dword, .dst = .{ .kind = .vgpr, .reg = 1 }, .src0 = .{ .kind = .vgpr, .reg = 0 }, .src1 = .{ .kind = .sgpr, .reg = 12 }, .src2 = .{ .kind = .integer_inline_constant, .value = 0 }, .src_count = 3 },
+        .{ .pc = 24, .family = .sopp, .opcode = .s_endpgm },
+    });
+    var scalars = [_]rdna2.spirv.ScalarRegister{ .{ .register = 0, .value = 0 }, .{ .register = 7, .value = 0x1234_5678 } };
+    var storage = [_]rdna2.spirv.StorageBufferBinding{.{ .resource_sgpr = 12, .descriptor_index = 0, .extent_bytes = 64 }};
+    var options = rdna2.spirv.Options{
+        .stage = .compute,
+        .local_size = .{ 64, 1, 1 },
+        .scalar_registers = &scalars,
+        .storage_buffers = &storage,
+        .dynamic_scalar_binding = .{ .binding = 10 },
+    };
+    for (0..6) |step| {
+        switch (step) {
+            1 => scalars[0].value = 1,
+            2 => options.wave32 = true,
+            3 => options.local_size = .{ 32, 1, 1 },
+            4 => storage[0].extent_bytes = 16,
+            5 => storage[0].descriptor_index = 1,
+            else => {},
+        }
+        var cached = try cache.translate(a, &program, options, .{});
+        defer cached.deinit(a);
+        var fresh = try rdna2.translateProgramSpirvWithPipelineOptions(a, &program, options, .{});
+        defer fresh.deinit(a);
+        try std.testing.expectEqualSlices(u32, fresh.words, cached.words);
+    }
+    try std.testing.expectEqual(@as(u64, 1), cache.hits);
+    try std.testing.expectEqual(@as(u64, 5), cache.misses);
+}
