@@ -354,8 +354,8 @@ pub const GuestMemory = struct {
     /// Returns the generation of an already tracked range without changing
     /// host page protection. Zero means the range is not tracked.
     gpu_generation: ?*const fn (?*anyopaque, u64, usize) u64 = null,
-    /// Full-range Wyhash(0) fingerprint without copying the source. Null
-    /// declines caching; CPU writes through aliases must affect this value.
+    /// Full-range gpu.parallel_copy.fingerprint without copying the source.
+    /// Null declines caching; CPU writes through aliases must affect this value.
     fingerprint: ?*const fn (?*anyopaque, u64, usize) ?u64 = null,
     tracking_page_size: usize = 16 * 1024,
     /// Optional AGC registry lookup. A renderer embedding can expose relocated
@@ -1886,6 +1886,8 @@ const FrameProfile = struct {
     compute_translate_ns: u64 = 0,
     compute_translation_hits: u64 = 0,
     compute_translation_misses: u64 = 0,
+    buffer_fingerprint_ns: u64 = 0,
+    content_reused_bytes: u64 = 0,
     compute_submit_ns: u64 = 0,
     shader_analysis_hits: u64 = 0,
     shader_analysis_misses: u64 = 0,
@@ -4726,6 +4728,8 @@ pub const Renderer = struct {
                 (!self.draw_uploads_enabled or cache_hit))
             hash: {
                 const fingerprint = memory.fingerprint orelse break :hash null;
+                const hash_started = hostTimestampNs();
+                defer self.frame_profile.buffer_fingerprint_ns +|= elapsedHostNanoseconds(hash_started);
                 break :hash fingerprint(memory.context, guest_address, size);
             } else null;
             if ((tracked_generation != 0 or source_hash != null) and (!self.draw_uploads_enabled or cache_hit)) {
@@ -4759,7 +4763,9 @@ pub const Renderer = struct {
                             // Fingerprint the bytes actually copied. A source
                             // changed during the copy must not certify a torn
                             // snapshot as matching the subsequent CPU contents.
-                            entry.content_hash = std.hash.Wyhash.hash(0, destination[0..size]);
+                            const hash_started = hostTimestampNs();
+                            entry.content_hash = gpu.parallel_copy.fingerprint(destination[0..size]);
+                            self.frame_profile.buffer_fingerprint_ns +|= elapsedHostNanoseconds(hash_started);
                             break;
                         }
                         const after = if (memory.gpu_generation) |generation|
@@ -4784,6 +4790,7 @@ pub const Renderer = struct {
                     }
                 } else {
                     self.frame_profile.resident_storage_bytes +%= size;
+                    if (source_hash != null) self.frame_profile.content_reused_bytes +%= size;
                 }
                 self.updateStorageDescriptorRange(descriptor_index, entry.device_local.handle, 0, size);
                 self.active_descriptor_set = self.descriptor_set;
@@ -19834,6 +19841,10 @@ pub const Renderer = struct {
                     profile.compute_translation_misses,
                     self.compute_translations.bytes / (1024 * 1024),
                 },
+            );
+            std.debug.print(
+                "[gpu buffers] flip={d} content_reused_kib={d} fingerprint_ms={d}\n",
+                .{ self.flip_callbacks, profile.content_reused_bytes / 1024, profile.buffer_fingerprint_ns / std.time.ns_per_ms },
             );
             std.debug.print(
                 "[gpu draw] flip={d} shader_check_ms={d} storage_ms={d} setup_ms={d} pipeline_lookup_ms={d} scalar_upload_ms={d} record_ms={d}\n",

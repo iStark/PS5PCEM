@@ -600,10 +600,13 @@ fn run(init: std.process.Init) !bool {
     const enable_automatic_deferred_storage_writes = defer_small_storage_writes;
     const enable_gpu_page_tracker = enable_gpu_experimental or
         (init.minimal.environ.containsUnempty(allocator, "PS5_GPU_PAGE_TRACKER") catch false);
-    const enable_gpu_buffer_content_cache = init.minimal.environ.containsUnempty(
-        allocator,
-        "PS5_GPU_BUFFER_CONTENT_CACHE",
-    ) catch false;
+    // Yotei repeatedly binds multi-megabyte material buffers whose contents
+    // remain unchanged. Full-range parallel fingerprints retain their upload.
+    // An explicit 0 restores unconditional uploads for comparison.
+    const enable_gpu_buffer_content_cache = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_BUFFER_CONTENT_CACHE")) |text| enabled: {
+        defer allocator.free(text);
+        break :enabled text.len != 0 and !std.mem.eql(u8, text, "0");
+    } else |_| std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id);
     const default_copy_workers: u8 = if (std.ascii.eqlIgnoreCase(title_identifier, yotei_title_id)) 4 else 1;
     const gpu_copy_workers: u8 = if (init.minimal.environ.getAlloc(allocator, "PS5_GPU_COPY_WORKERS")) |text| parse: {
         defer allocator.free(text);

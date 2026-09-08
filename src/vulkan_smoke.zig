@@ -41,7 +41,7 @@ fn SizedGuestMemory(comptime size: usize) type {
         fn fingerprint(context: ?*anyopaque, address: u64, length: usize) ?u64 {
             const self: *Self = @ptrCast(@alignCast(context.?));
             if (address > self.bytes.len or length > self.bytes.len - address) return null;
-            return std.hash.Wyhash.hash(0, self.bytes[@intCast(address)..][0..length]);
+            return gpu.parallel_copy.fingerprint(self.bytes[@intCast(address)..][0..length]);
         }
 
         fn interface(self: *Self) vulkan.GuestMemory {
@@ -3337,18 +3337,23 @@ fn runCountedImageLoopProbe(allocator: std.mem.Allocator, uniform_limit: bool) !
 }
 
 fn runBufferContentCacheProbe(allocator: std.mem.Allocator) !void {
-    const Memory = SizedGuestMemory(512 * 1024);
+    const Memory = SizedGuestMemory(8 * 1024 * 1024);
     const guest = try allocator.create(Memory);
     defer allocator.destroy(guest);
     guest.* = .{};
-    var renderer = try vulkan.Renderer.init(allocator, .{ .defer_small_storage_writes = true });
+    const old_participants = gpu.parallel_copy.guest_copy_pool.participants.load(.acquire);
+    defer {
+        gpu.parallel_copy.guest_copy_pool.deinit();
+        gpu.parallel_copy.guest_copy_pool.participants.store(old_participants, .release);
+    }
+    var renderer = try vulkan.Renderer.init(allocator, .{ .defer_small_storage_writes = true, .enable_timeline_scheduler = true });
     defer renderer.deinit();
     var memory = guest.interface();
     memory.fingerprint = Memory.fingerprint;
     _ = renderer.dcbBackend(memory);
     const source = 0x10000;
-    const size = 64 * 1024;
-    const output = 0x30000;
+    const size = 4 * 1024 * 1024 + 256;
+    const output = 0x500000;
     const offset = 35000;
     const code = [_]u32{
         vop1(1, 0, 8),
@@ -3374,6 +3379,7 @@ fn runBufferContentCacheProbe(allocator: std.mem.Allocator) !void {
     guest.word(source + offset, 0x1234_5678);
     var previous_uploads: u64 = 0;
     for (0..5) |pass| {
+        gpu.parallel_copy.guest_copy_pool.participants.store(([_]u8{ 1, 4, 2, 4, 1 })[pass], .release);
         if (pass == 2) guest.word(source + offset, 0x8765_4321);
         // A native write outside the texel currently fetched must still
         // invalidate the full buffer; sparse content probes would miss it.
@@ -3405,7 +3411,54 @@ fn runBufferContentCacheProbe(allocator: std.mem.Allocator) !void {
     _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
     try renderer.readbackGuestStorageBuffer(output, &result);
     try std.testing.expectEqual(@as(u32, 0x0102_0304), std.mem.readInt(u32, &result, .little));
-    std.debug.print("buffer content cache passed: unchanged reuse, full-range native writes, GPU overwrites and unavailable-fingerprint fallback\n", .{});
+    try renderer.flushPendingGuestWrites();
+    // A clean cached input can still have readers queued on the GPU. An
+    // unchanged lookup must preserve those commands without another upload;
+    // a native change must finish the old readers before replacing their data.
+    const queued_code = [_]u32{
+        0xe030_0000, 0x8002_0000, // buffer_load_dword v0, s8:s11
+        0xe070_0000, 0x8003_0000, // buffer_store_dword v0, s12:s15
+        0xbf81_0000,
+    };
+    for (queued_code, 0..) |word, i| guest.word(0x500 + i * 4, word);
+    var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = guest, .read_fn = Memory.read }, 0x500, 16);
+    defer analysis.deinit(allocator);
+    var module = try analysis.translateSpirv(allocator, .{
+        .stage = .compute,
+        .local_size = .{ 1, 1, 1 },
+        .storage_buffers = &.{
+            .{ .resource_sgpr = 8, .descriptor_index = 0, .extent_bytes = size },
+            .{ .resource_sgpr = 12, .descriptor_index = 1, .extent_bytes = 16 },
+        },
+    });
+    defer module.deinit(allocator);
+    guest.word(source, 0x1122_3344);
+    _ = try renderer.stageGuestStorageBufferAt(0, source, size);
+    _ = try renderer.stageGuestStorageBufferAt(1, output, 16);
+    renderer.draw_batch_active = true;
+    defer renderer.draw_batch_active = false;
+    _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+    try std.testing.expect(renderer.pending_command_buffers.items.len != 0);
+    // Mirror normal draw/dispatch preparation: use a fresh descriptor set
+    // while the preceding set remains referenced by an executable command.
+    const next_set = renderer.descriptor_sets[renderer.descriptor_sets.len - 1];
+    try std.testing.expect(next_set != renderer.descriptor_set);
+    renderer.descriptor_set = next_set;
+    const queued_uploads = renderer.buffer_uploads;
+    _ = try renderer.stageGuestStorageBufferAt(0, source, size);
+    try std.testing.expectEqual(queued_uploads, renderer.buffer_uploads);
+    try std.testing.expect(renderer.pending_command_buffers.items.len != 0);
+    guest.word(source, 0xaabb_ccdd);
+    _ = try renderer.stageGuestStorageBufferAt(0, source, size);
+    try std.testing.expectEqual(queued_uploads + 1, renderer.buffer_uploads);
+    var queued_result: [16]u8 = undefined;
+    try renderer.readbackGuestStorageBuffer(output, &queued_result);
+    try std.testing.expectEqual(@as(u32, 0x1122_3344), std.mem.readInt(u32, queued_result[0..4], .little));
+    _ = try renderer.stageGuestStorageBufferAt(1, output, 16);
+    _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+    try renderer.readbackGuestStorageBuffer(output, &queued_result);
+    try std.testing.expectEqual(@as(u32, 0xaabb_ccdd), std.mem.readInt(u32, queued_result[0..4], .little));
+    std.debug.print("buffer content cache passed: unchanged reuse, full-range native writes, GPU overwrites, unavailable-fingerprint fallback and queued readers\n", .{});
 }
 
 fn runParallelCopyProbe(allocator: std.mem.Allocator) !void {

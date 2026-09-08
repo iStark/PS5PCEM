@@ -2,6 +2,79 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Parallel buffer fingerprints on 2026-09-08
+
+Yotei now enables content-based storage-buffer reuse by default. Unchanged
+buffers retain their existing host-visible Vulkan allocation; changed buffers
+still wait for preceding readers and upload a new snapshot. The native callback
+resolves the complete guest range, including CPU aliases, before hashing it.
+GPU writes and readbacks continue to invalidate the saved fingerprint.
+Other titles retain the previous default. `PS5_GPU_BUFFER_CONTENT_CACHE=0`
+disables reuse, and `=1` enables it explicitly.
+
+Ranges of at least 4 MiB use four fixed contiguous partitions, each hashed in
+full with Wyhash. Their ordered hashes and the total length form the final
+digest. Smaller ranges retain a single Wyhash. Both the source callback and
+the copied snapshot use the same algorithm. The existing copy helpers perform
+the work synchronously, with at most four participants and no retained source
+copies. `PS5_GPU_COPY_WORKERS` controls copies and fingerprints. Busy or
+unavailable helpers fall back to the same partitioned digest on the caller;
+alignment and worker count cannot alter the result.
+
+`[gpu buffers]` reports `content_reused_kib` and `fingerprint_ms` per frame,
+separating bytes bound through content reuse from the cost of checking them.
+Repeated bindings can exceed the net reduction in uploads; compare `upload_kib`
+for that reduction. These counters do not measure PCIe bus traffic.
+
+CPU tests pass in ReleaseSafe and ReleaseFast, covering partition boundaries,
+unaligned and relocated ranges, all worker counts, restart, unavailable helpers,
+and simultaneous copy/hash calls. The Vulkan content-cache probe uses a buffer
+larger than 4 MiB, changes worker counts, and verifies native writes, GPU writes,
+unchanged reuse and callback fallback. It also leaves a reader queued, checks
+that unchanged reuse keeps it queued, and verifies that a later CPU change
+preserves the old reader's result. This probe, queued-buffer reuse, parallel
+copies and full smoke pass SDK 1.4.357.0 synchronization validation.
+
+On the Ryzen 7 7700, an isolated probe hashes 1 GiB per interval, cycling through
+a 128 MiB source allocation. It alternates the preceding serial Wyhash and
+1/2/4/2/1 participants over three passes. The game and compilers are stopped.
+Median elapsed times compare the preceding algorithm with four participants:
+
+| Buffer size | Serial Wyhash before | Parallel fingerprint | Speedup of fingerprinting |
+| --- | --- | --- | --- |
+| 4 MiB | 33.36 ms | 21.08 ms | 1.58× |
+| 16 MiB | 32.64 ms | 19.14 ms | 1.71× |
+| 64 MiB | 33.48 ms | 19.52 ms | 1.72× |
+| 128 MiB | 37.11 ms | 19.06 ms | 1.95× |
+
+These are CPU fingerprint timings, not FPS multipliers.
+
+The ReleaseFast game run then compared content reuse on/off/on in one process,
+with four participants throughout and page tracking disabled. Each interval
+contains ten frames; the first two are discarded. No builds, smoke tests or
+GPU captures run during these intervals:
+
+| Content reuse | Flips | Median frame | Derived FPS | Buffer uploads | Buffer preparation | Fingerprinting |
+| --- | --- | --- | --- | --- | --- | --- |
+| On, initially | 964–971 | 5,923 ms | 0.169 | 1.20 GiB | 418.5 ms | 143.5 ms |
+| Off | 974–981 | 6,065.5 ms | 0.165 | 7.38 GiB | 653 ms | 0 ms |
+| On, repeated | 984–991 | 6,121 ms | 0.163 | 1.23 GiB | 446 ms | 157 ms |
+
+Buffer uploads fall roughly sixfold and preparation improves by 32–36%.
+Overall FPS varies from 2.4% faster to 0.9% slower against the intervening
+control, so this comparison **does not establish a sustained FPS improvement**.
+Medians stay near 287–288 draws and 1,118 compute dispatches; texture uploads
+range from 707 to 720 MiB per frame. Available physical memory ranges from
+1.1 to 1.4 GiB. Other resource preparation and synchronization still dominate
+the frame, and the isolated fingerprint speedup must not be presented as a
+whole-game speedup.
+
+The actual presented 3840×2160 Digital Deluxe Bonus capture at flip 960 matches
+the preceding build's flip-1088 capture pixel for pixel. Capture is disabled
+before timing. The first heavy scene frame separately spends about 126 seconds
+compiling 201 compute pipelines; that transition is outside the comparison.
+Complete menu/background rendering remains unverified.
+
 ## Keeping the compute translation working set on 2026-09-08
 
 The 64 MiB compute SPIR-V cache repeatedly evicted translations still needed by
@@ -221,7 +294,7 @@ without reducing the number of guest draws or dispatches.
 
 With `PS5_GPU_BUFFER_CONTENT_CACHE=1`, untracked storage buffers of at least
 64 KiB can reuse their persistent upload when a full-range content fingerprint
-matches. This option is disabled by default. The native memory callback reads
+matches. At this stage the option was disabled by default. The native memory callback reads
 the complete resolved range, so writes through another CPU alias are visible.
 Changed buffers retain the existing synchronization and upload path, and the
 cache records the bytes actually copied. GPU writes and readbacks invalidate

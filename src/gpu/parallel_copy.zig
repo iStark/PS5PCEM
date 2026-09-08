@@ -6,6 +6,12 @@ const builtin = @import("builtin");
 
 pub var guest_copy_pool = Pool{};
 
+/// Fingerprint every byte using the same partitioning regardless of the pool's
+/// worker count. Embeddings use this for both guest memory and copied snapshots.
+pub fn fingerprint(source: []const u8) u64 {
+    return guest_copy_pool.fingerprint(source);
+}
+
 /// Synchronous copies with a bounded set of sleeping helper threads. The caller
 /// copies one partition and joins the others before returning. The pool must
 /// remain at a stable address after its first large copy.
@@ -27,13 +33,20 @@ pub const Pool = struct {
         stop: bool = false,
         destination: []u8 = &.{},
         source: []const u8 = &.{},
+        hashes: ?*[maximum_participants]u64 = null,
+        first_hash: usize = 0,
+        end_hash: usize = 0,
 
         fn run(self: *Worker, io: std.Io) void {
             while (true) {
                 self.ready.waitUncancelable(io);
                 self.ready.reset();
                 if (self.stop) return;
-                @memcpy(self.destination, self.source);
+                if (self.hashes) |hashes| {
+                    hashPartitions(self.source, hashes, self.first_hash, self.end_hash);
+                } else {
+                    @memcpy(self.destination, self.source);
+                }
                 self.complete.set(io);
             }
         }
@@ -51,6 +64,69 @@ pub const Pool = struct {
             return;
         }
         defer self.lock.unlock();
+        const count = self.prepareWorkers(participants);
+        const io = self.threaded.?.io();
+        // Align internal boundaries to destination cache lines. Arbitrarily
+        // aligned callers and the final partial line remain supported.
+        const stride = std.mem.alignBackward(usize, destination.len / (count + 1), 64);
+        const adjustment = @intFromPtr(destination.ptr) % 64;
+        var offset: usize = 0;
+        for (self.workers[0..count], 0..) |*worker, index| {
+            const end = stride * (index + 1) - adjustment;
+            worker.destination = destination[offset..end];
+            worker.source = source[offset..end];
+            worker.hashes = null;
+            worker.ready.set(io);
+            offset = end;
+        }
+        @memcpy(destination[offset..], source[offset..]);
+        self.joinWorkers(count);
+    }
+
+    /// Large ranges use four fixed contiguous partitions, each hashed in full.
+    /// Worker count, address alignment and a busy/unavailable pool cannot change
+    /// the digest. No source bytes or snapshot allocations survive the call.
+    pub fn fingerprint(self: *Pool, source: []const u8) u64 {
+        if (source.len < minimum_bytes) return std.hash.Wyhash.hash(0, source);
+        var hashes: [maximum_participants]u64 = undefined;
+        const participants = self.participants.load(.acquire);
+        if (builtin.single_threaded or participants <= 1 or !self.lock.tryLock()) {
+            hashPartitions(source, &hashes, 0, maximum_participants);
+        } else {
+            defer self.lock.unlock();
+            const count = self.prepareWorkers(participants);
+            const io = self.threaded.?.io();
+            var first: usize = 0;
+            for (self.workers[0..count], 0..) |*worker, index| {
+                const end = maximum_participants * (index + 1) / (count + 1);
+                worker.source = source;
+                worker.hashes = &hashes;
+                worker.first_hash = first;
+                worker.end_hash = end;
+                worker.ready.set(io);
+                first = end;
+            }
+            hashPartitions(source, &hashes, first, maximum_participants);
+            self.joinWorkers(count);
+        }
+        // Include range length and partition order in a portable final digest.
+        var digest: [(maximum_participants + 1) * 8]u8 = undefined;
+        std.mem.writeInt(u64, digest[0..8], source.len, .little);
+        for (hashes, 0..) |hash, index|
+            std.mem.writeInt(u64, digest[(index + 1) * 8 ..][0..8], hash, .little);
+        return std.hash.Wyhash.hash(0, &digest);
+    }
+
+    fn hashPartitions(source: []const u8, hashes: *[maximum_participants]u64, first: usize, end: usize) void {
+        const stride = std.mem.alignBackward(usize, source.len / maximum_participants, 64);
+        for (first..end) |index| {
+            const limit = if (index + 1 == maximum_participants) source.len else stride * (index + 1);
+            hashes[index] = std.hash.Wyhash.hash(0, source[stride * index .. limit]);
+        }
+    }
+
+    /// Called with the pool lock held; partial worker creation is usable too.
+    fn prepareWorkers(self: *Pool, participants: u8) usize {
         const wanted = @min(participants, maximum_participants) - 1;
         if (self.threaded == null) self.threaded = .init(std.heap.page_allocator, .{});
         const io = self.threaded.?.io();
@@ -62,23 +138,17 @@ pub const Pool = struct {
             };
             self.worker_count += 1;
         }
-        const count = @min(self.worker_count, wanted);
-        // Align internal boundaries to destination cache lines. Arbitrarily
-        // aligned callers and the final partial line remain supported.
-        const stride = std.mem.alignBackward(usize, destination.len / (count + 1), 64);
-        const adjustment = @intFromPtr(destination.ptr) % 64;
-        var offset: usize = 0;
-        for (self.workers[0..count], 0..) |*worker, index| {
-            const end = stride * (index + 1) - adjustment;
-            worker.destination = destination[offset..end];
-            worker.source = source[offset..end];
-            worker.ready.set(io);
-            offset = end;
-        }
-        @memcpy(destination[offset..], source[offset..]);
+        return @min(self.worker_count, wanted);
+    }
+
+    fn joinWorkers(self: *Pool, count: usize) void {
+        const io = self.threaded.?.io();
         for (self.workers[0..count]) |*worker| {
             worker.complete.waitUncancelable(io);
             worker.complete.reset();
+            worker.hashes = null;
+            worker.source = &.{};
+            worker.destination = &.{};
         }
     }
 
@@ -163,4 +233,68 @@ test "parallel copy concurrent callers and unavailable workers preserve every by
     pool.copy(destination[0..size], source);
     try std.testing.expectEqualSlices(u8, source, destination[0..size]);
     try std.testing.expectEqual(@as(usize, 0), pool.worker_count);
+}
+
+test "buffer fingerprints cover partitions and ignore alignment worker count and fallback" {
+    var pool = Pool{};
+    defer pool.deinit();
+    const storage = try std.testing.allocator.alloc(u8, Pool.minimum_bytes * 2 + 2048);
+    defer std.testing.allocator.free(storage);
+    for (storage, 0..) |*byte, i| byte.* = @truncate(i *% 31 +% (i >> 13));
+    const lengths = [_]usize{ 0, 63, Pool.minimum_bytes - 1, Pool.minimum_bytes, Pool.minimum_bytes + 513 };
+    for (lengths) |length| {
+        const source = storage[3..][0..length];
+        pool.participants.store(1, .release);
+        const expected = pool.fingerprint(source);
+        if (length < Pool.minimum_bytes) try std.testing.expectEqual(std.hash.Wyhash.hash(0, source), expected);
+        for ([_]u8{ 2, 4, 3, 1 }) |count| {
+            pool.participants.store(count, .release);
+            try std.testing.expectEqual(expected, pool.fingerprint(source));
+        }
+        pool.participants.store(4, .release);
+        try std.testing.expect(pool.lock.tryLock());
+        const busy = pool.fingerprint(source);
+        pool.lock.unlock();
+        try std.testing.expectEqual(expected, busy);
+        // Identical bytes at a different alignment still describe one buffer.
+        const relocated = storage[Pool.minimum_bytes + 1024 ..][0..length];
+        @memcpy(relocated, source);
+        try std.testing.expectEqual(expected, pool.fingerprint(relocated));
+        if (length >= Pool.minimum_bytes) {
+            const stride = std.mem.alignBackward(usize, length / 4, 64);
+            for ([_]usize{ 0, stride - 1, stride, 2 * stride, 3 * stride, length - 1 }) |index| {
+                source[index] ^= 0x80;
+                try std.testing.expect(pool.fingerprint(source) != expected);
+                source[index] ^= 0x80;
+            }
+        }
+        pool.deinit();
+        pool.start_failed = true;
+        try std.testing.expectEqual(expected, pool.fingerprint(source));
+        pool.deinit();
+        try std.testing.expectEqual(expected, pool.fingerprint(source));
+    }
+}
+
+test "parallel copies and fingerprints share workers without mixing jobs" {
+    var pool = Pool{ .participants = .init(4) };
+    defer pool.deinit();
+    const size = Pool.minimum_bytes + 37;
+    const source = try std.testing.allocator.alloc(u8, size);
+    defer std.testing.allocator.free(source);
+    const destination = try std.testing.allocator.alloc(u8, size);
+    defer std.testing.allocator.free(destination);
+    for (source, 0..) |*byte, i| byte.* = @truncate(i *% 13 +% (i >> 7));
+    const expected = pool.fingerprint(source);
+    const Work = struct {
+        fn run(shared: *Pool, output: []u8, input: []const u8) void {
+            for (0..16) |_| shared.copy(output, input);
+        }
+    };
+    {
+        const thread = try std.Thread.spawn(.{}, Work.run, .{ &pool, destination, source });
+        defer thread.join();
+        for (0..16) |_| try std.testing.expectEqual(expected, pool.fingerprint(source));
+    }
+    try std.testing.expectEqualSlices(u8, source, destination);
 }
