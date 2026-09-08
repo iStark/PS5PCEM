@@ -1884,6 +1884,8 @@ const FrameProfile = struct {
     compute_emulation_ns: u64 = 0,
     compute_resource_ns: u64 = 0,
     compute_translate_ns: u64 = 0,
+    compute_translation_hits: u64 = 0,
+    compute_translation_misses: u64 = 0,
     compute_submit_ns: u64 = 0,
     shader_analysis_hits: u64 = 0,
     shader_analysis_misses: u64 = 0,
@@ -3167,8 +3169,10 @@ pub const Renderer = struct {
     graphics_translations: spirv_cache.Cache = .{},
     /// Compute programs also recur with different runtime scalar values. Keep
     /// their translations within a separate budget so scene kernels cannot
-    /// evict the UI/graphics working set.
-    compute_translations: spirv_cache.Cache = .{},
+    /// evict the UI/graphics working set. Yotei's warmed scene needs about
+    /// 214 MiB; a 64 MiB limit retranslates over 200 variants every frame.
+    /// This is a lazy upper bound, not a preallocated buffer.
+    compute_translations: spirv_cache.Cache = .{ .maximum_bytes = 256 * 1024 * 1024 },
     /// Coherency domain shared by all Vulkan image caches. Separately-created
     /// host images which overlap in guest memory observe the same generation.
     image_aliases: image_alias.Manager = .{},
@@ -5750,6 +5754,12 @@ pub const Renderer = struct {
             }
         }
         const translate_started = hostTimestampNs();
+        const translation_hits_before = self.compute_translations.hits;
+        const translation_misses_before = self.compute_translations.misses;
+        defer {
+            self.frame_profile.compute_translation_hits +%= self.compute_translations.hits -% translation_hits_before;
+            self.frame_profile.compute_translation_misses +%= self.compute_translations.misses -% translation_misses_before;
+        }
         // The only absolute FLAT read in this Yotei cluster-classification
         // kernel sits below a guest-controlled zero-count loop during current
         // startup. Dynamic resolution changes the dispatch dimensions while
@@ -19789,7 +19799,7 @@ pub const Renderer = struct {
                 },
             );
             std.debug.print(
-                "[gpu shaders] flip={d} pso_hit={d} pso_miss={d}/{d}ms cpso={d}/{d}/{d}ms compute_ms={d}/{d}/{d}/{d} pso_cache={d} cpso_cache={d} miss_match(state/vs/ps)={d}/{d}/{d} sa_hit={d} sa_miss={d}/{d}ms prov_ms={d} xlat_ms={d} res_ms={d} sampled_ms={d}/{d}/{d}/{d} probe_ms={d} target_create_ms={d}/{d}\n",
+                "[gpu shaders] flip={d} pso_hit={d} pso_miss={d}/{d}ms cpso={d}/{d}/{d}ms compute_ms={d}/{d}/{d}/{d} pso_cache={d} cpso_cache={d} miss_match(state/vs/ps)={d}/{d}/{d} sa_hit={d} sa_miss={d}/{d}ms prov_ms={d} xlat_ms={d} res_ms={d} sampled_ms={d}/{d}/{d}/{d} probe_ms={d} target_create_ms={d}/{d} cxlat={d}/{d}/{d}MiB\n",
                 .{
                     self.flip_callbacks,
                     profile.graphics_pipeline_hits,
@@ -19820,6 +19830,9 @@ pub const Renderer = struct {
                     profile.texture_probe_ns / std.time.ns_per_ms,
                     profile.render_target_create_ns / std.time.ns_per_ms,
                     profile.depth_target_create_ns / std.time.ns_per_ms,
+                    profile.compute_translation_hits,
+                    profile.compute_translation_misses,
+                    self.compute_translations.bytes / (1024 * 1024),
                 },
             );
             std.debug.print(

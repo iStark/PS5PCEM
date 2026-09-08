@@ -2,6 +2,51 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Keeping the compute translation working set on 2026-09-08
+
+The 64 MiB compute SPIR-V cache repeatedly evicted translations still needed by
+the current scene. At flips 1127–1129 it held only 37–43 entries, and successive
+frames added 231–233 misses even though the Vulkan compute pipelines were warm.
+Raising the compute cache's lazy limit to 256 MiB retained roughly 214–221 MiB of
+translations after warmup and reduced repeated translation to near zero misses.
+The separate graphics translation budget remains 64 MiB. Cache keys still
+compare code, decoded instructions and translation options in full, excluding
+only scalar values supplied through the existing dynamic binding.
+
+`[gpu shaders]` now reports `cxlat=hits/misses/MiB`: translation lookups for that
+frame followed by the retained compute cache size. This distinguishes repeated
+CPU translation from Vulkan pipeline compilation, whose counters remain `cpso`.
+
+On the Ryzen 7 7700 / RTX 3070 Ti / 32 GiB host, a same-process 64/256/64 MiB
+comparison measured ten frames per interval and discarded the first two:
+
+| Compute cache limit | Measured flips | Median frame | Derived FPS | Median compute translation | Retained cache |
+| --- | --- | --- | --- | --- | --- |
+| 64 MiB, before | 1303–1310 | 7,480 ms | 0.134 | 530 ms | 63.4 MiB |
+| 256 MiB | 1313–1320 | 6,793.5 ms | 0.147 | 62 ms | 214.2 MiB |
+| 64 MiB, after | 1323–1330 | 7,227.5 ms | 0.138 | 531.5 ms | 58.9 MiB |
+
+The larger cache improved FPS by 6–10% against the surrounding intervals, or
+8.4% against their pooled median of 7,365.5 ms. Workload medians remained close:
+289–291 draws, 1,203–1,204 dispatches, and about 9.1 GiB uploaded per frame.
+Resource preparation and fence waits still varied, so the overall FPS result
+is a scene-specific observation. The roughly 468 ms reduction in translation
+time is the directly measured benefit; the remaining transfer and resource work
+still dominates these very slow frames.
+
+This diagnostic changed only the live host cache budget. Shrinking the budget
+does not evict on a hit, so one completed cache lookup hash was invalidated to
+trigger the ordinary miss/LRU eviction path; retained bytes were checked after
+each interval. Guest code and shader output were unchanged. No builds, smoke
+tests or frame captures ran during the timed intervals. A separate GPU capture
+of the Digital Deluxe Bonus screen matched the preceding transfer-buffer build
+pixel for pixel. This does not establish complete menu or background rendering.
+
+The CPU cache tests compare cached and fresh modules across changed dynamic
+values, literals, bindings, wave modes and buffer bounds. Full Vulkan smoke and
+image probes pass with SDK 1.4.357.0 synchronization validation, including the
+uniform output guard sequence 0/1/0/1 with reused descriptor registers.
+
 ## Reusing color-target transfer memory on 2026-09-08
 
 Initial color attachments now stage their pixels directly into their existing
