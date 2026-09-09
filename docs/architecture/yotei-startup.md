@@ -2,6 +2,23 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Indirect command tail chains on 2026-09-09
+
+The comparison-destination build still produces a black trunk and records
+`IndirectBufferTooDeep` during the first dense scene submission. The executor
+treated every `INDIRECT_BUFFER` as a nested call, including packets with CHAIN
+set. CHAIN now replaces the current indirect stream in a loop; only actual
+calls consume the bounded return stack. Wait continuations retain both the
+parent's selected entry and the current chain target, so conditional branches
+remain selected and completed links are not replayed after a wait.
+
+Submission snapshots follow the same tail jumps and stop at the end of a
+chained parent. All 45 executor/scheduler tests pass, including a 150-link
+chain, repeated waits, conditional branch retention, recycled source commands,
+cycles and the unchanged bound on genuine nesting. The unreadable-range test
+now derives its address from the fixture's actual memory size. Live verification
+of this change is pending; normal scene composition is not yet achieved.
+
 ## Explicit VOP3 comparison destinations on 2026-09-09
 
 The depth-storage trace now records 3,811,120 nonzero depth texels from
@@ -22,7 +39,8 @@ empty/full/complementary EXEC and 64/512 invocations. The previous decoder fails
 the saved-mask case, rejecting a lane that should execute. The corrected suite
 and full default smoke pass SDK synchronization validation. The broader RDNA2
 unit suite still has the same ten failures reproduced against the previous
-decoder; this change adds no failures there. Live scene verification is pending.
+decoder; this change adds no failures there. The live run preserves the bonus
+notices and nonzero depth, but its captured final trunk remains black.
 
 ## Independent depth/stencil attachment planes on 2026-09-09
 

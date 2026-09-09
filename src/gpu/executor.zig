@@ -59,10 +59,8 @@ pub const Backend = struct {
 
 pub const Status = enum { complete, blocked };
 
-/// Root DCB plus the indirect-buffer chain. Gen5 titles routinely submit long
-/// chains (Yotei uses about seventy links for one frame). The executor still
-/// keeps a fixed safety bound so malformed streams cannot exhaust the host
-/// stack, but it must be comfortably above a real SDK-generated chain.
+/// Root DCB plus nested indirect calls. CHAIN replaces the current indirect
+/// stream and does not consume another return-stack entry.
 pub const maximum_stream_depth: usize = 128;
 
 pub const Continuation = struct {
@@ -71,6 +69,9 @@ pub const Continuation = struct {
         address: u64 = 0,
         word_count: usize = 0,
         resume_word: usize = 0,
+        /// Target selected by the parent, before any tail-chain replacements.
+        entry_address: u64 = 0,
+        entry_word_count: usize = 0,
     };
 
     frame_count: u8 = 0,
@@ -163,6 +164,8 @@ fn reportIgnoredCommandCensus(result: *const Result) void {
 }
 
 const PacketOutcome = enum { complete, blocked };
+const IndirectTarget = struct { address: u64, word_count: usize };
+const StreamOutcome = union(enum) { complete, blocked, chain: IndirectTarget };
 
 pub const DcbExecutor = struct {
     state: *gpu_state.State,
@@ -194,7 +197,7 @@ pub const DcbExecutor = struct {
             null,
             &result,
         );
-        if (blocked) {
+        if (blocked == .blocked) {
             result.status = .blocked;
             result.resume_word = result.continuation.?.frames[0].resume_word;
         } else {
@@ -231,7 +234,7 @@ pub const DcbExecutor = struct {
             &continuation,
             &result,
         );
-        if (blocked) {
+        if (blocked == .blocked) {
             result.status = .blocked;
             result.resume_word = result.continuation.?.frames[0].resume_word;
         } else {
@@ -250,7 +253,7 @@ pub const DcbExecutor = struct {
         active_addresses: *[maximum_stream_depth]u64,
         resume_path: ?*const Continuation,
         result: *Result,
-    ) Error!bool {
+    ) Error!StreamOutcome {
         if (depth >= maximum_stream_depth or start_word > stream.len) return Error.InvalidContinuation;
         if (resume_path) |continuation| {
             if (depth >= continuation.frame_count) return Error.InvalidContinuation;
@@ -268,7 +271,7 @@ pub const DcbExecutor = struct {
 
         while (true) {
             const packet_word = walker.index;
-            const packet = (try walker.next()) orelse return false;
+            const packet = (try walker.next()) orelse return .complete;
             result.packets += 1;
 
             const resumes_child = if (resume_path) |continuation|
@@ -277,6 +280,18 @@ pub const DcbExecutor = struct {
                 false;
 
             if (packet.kind == .command and packet.opcode == pm4.indirect_buffer) {
+                if (depth != 0 and packet.body.len == 3 and packet.body[2] & (1 << 20) != 0) {
+                    if (resumes_child) return Error.InvalidContinuation;
+                    if (packet.body[0] & 3 != 0) return Error.InvalidPacket;
+                    const word_count = packet.body[2] & 0x000f_ffff;
+                    self.state.indirect_buffer_count += 1;
+                    self.state.packets_executed += 1;
+                    if (word_count == 0) return .complete;
+                    return .{ .chain = .{
+                        .address = (@as(u64, packet.body[1]) << 32) | packet.body[0],
+                        .word_count = word_count,
+                    } };
+                }
                 const indirect = try self.executeIndirectBuffer(
                     packet,
                     depth,
@@ -286,11 +301,11 @@ pub const DcbExecutor = struct {
                 );
                 if (indirect.blocked) {
                     setContinuationFrame(result, depth, descriptor, packet_word);
-                    return true;
+                    return .blocked;
                 }
                 self.state.indirect_buffer_count += 1;
                 self.state.packets_executed += 1;
-                if (indirect.chain) return false;
+                if (indirect.chain) return .complete;
                 continue;
             }
             if (packet.kind == .command and packet.opcode == pm4.cond_exec) {
@@ -326,7 +341,7 @@ pub const DcbExecutor = struct {
             };
             if (outcome == .blocked) {
                 setContinuationFrame(result, depth, descriptor, packet_word);
-                return true;
+                return .blocked;
             }
 
             self.state.packets_executed += 1;
@@ -401,10 +416,10 @@ pub const DcbExecutor = struct {
         if (resume_path) |continuation| {
             if (depth + 1 >= continuation.frame_count) return Error.InvalidContinuation;
             const expected = continuation.frames[depth + 1];
-            if (expected.address == then_address and expected.word_count == then_count) {
+            if (expected.entry_address == then_address and expected.entry_word_count == then_count) {
                 selected_address = then_address;
                 selected_count = then_count;
-            } else if (mode == 2 and expected.address == else_address and expected.word_count == else_count) {
+            } else if (mode == 2 and expected.entry_address == else_address and expected.entry_word_count == else_count) {
                 selected_address = else_address;
                 selected_count = else_count;
             } else {
@@ -476,43 +491,57 @@ pub const DcbExecutor = struct {
     ) Error!IndirectOutcome {
         if (depth + 1 >= maximum_stream_depth) return Error.IndirectBufferTooDeep;
         if (address == 0 or address & 0x3 != 0) return Error.InvalidPacket;
-        for (active_addresses[0..depth]) |active| {
-            if (active == address) return Error.IndirectBufferCycle;
-        }
-        active_addresses[depth] = address;
-
-        const child_descriptor = Continuation.Frame{
+        var child_descriptor = Continuation.Frame{
             .address = address,
             .word_count = word_count,
-            .resume_word = 0,
+            .entry_address = address,
+            .entry_word_count = word_count,
         };
-        var child_start: usize = 0;
+        var child_resume_path = resume_path;
         if (resume_path) |continuation| {
             if (depth + 1 >= continuation.frame_count) return Error.InvalidContinuation;
             const expected = continuation.frames[depth + 1];
-            if (expected.address != address or expected.word_count != word_count) {
+            if (expected.entry_address != address or expected.entry_word_count != word_count) {
                 return Error.InvalidContinuation;
             }
-            child_start = expected.resume_word;
+            child_descriptor = expected;
         }
 
-        const child = try self.allocator.alloc(u32, word_count);
-        defer self.allocator.free(child);
-        try self.backend.read(address, std.mem.sliceAsBytes(child));
-        reportIndirectStream(address, depth + 1, child);
+        var visited = std.AutoHashMap(u64, void).init(self.allocator);
+        defer visited.deinit();
+        while (true) {
+            if (child_descriptor.address == 0 or child_descriptor.address & 3 != 0) return Error.InvalidPacket;
+            for (active_addresses[0..depth]) |active| {
+                if (active == child_descriptor.address) return Error.IndirectBufferCycle;
+            }
+            if (visited.contains(child_descriptor.address)) return Error.IndirectBufferCycle;
+            active_addresses[depth] = child_descriptor.address;
 
-        var resumed_descriptor = child_descriptor;
-        resumed_descriptor.resume_word = child_start;
-        const blocked = try self.executeStream(
-            child,
-            child_start,
-            resumed_descriptor,
-            depth + 1,
-            active_addresses,
-            resume_path,
-            result,
-        );
-        return .{ .blocked = blocked, .chain = chain };
+            const child = try self.allocator.alloc(u32, child_descriptor.word_count);
+            defer self.allocator.free(child);
+            try self.backend.read(child_descriptor.address, std.mem.sliceAsBytes(child));
+            reportIndirectStream(child_descriptor.address, depth + 1, child);
+            const outcome = try self.executeStream(
+                child,
+                child_descriptor.resume_word,
+                child_descriptor,
+                depth + 1,
+                active_addresses,
+                child_resume_path,
+                result,
+            );
+            switch (outcome) {
+                .complete => return .{ .blocked = false, .chain = chain },
+                .blocked => return .{ .blocked = true, .chain = chain },
+                .chain => |target| {
+                    try visited.put(child_descriptor.address, {});
+                    child_descriptor.address = target.address;
+                    child_descriptor.word_count = target.word_count;
+                    child_descriptor.resume_word = 0;
+                    child_resume_path = null;
+                },
+            }
+        }
     }
 
     fn executePacket(self: *DcbExecutor, packet: pm4.Packet, result: *Result) Error!PacketOutcome {
@@ -1010,11 +1039,8 @@ fn setContinuationFrame(
 ) void {
     if (result.continuation == null) result.continuation = .{};
     if (result.continuation) |*continuation| {
-        continuation.frames[depth] = .{
-            .address = descriptor.address,
-            .word_count = descriptor.word_count,
-            .resume_word = resume_word,
-        };
+        continuation.frames[depth] = descriptor;
+        continuation.frames[depth].resume_word = resume_word;
         const required_count: u8 = @intCast(depth + 1);
         continuation.frame_count = @max(continuation.frame_count, required_count);
     }
@@ -1481,7 +1507,9 @@ test "conditional INDIRECT_BUFFER keeps its selected branch across resume" {
         0x30,
     };
     const else_child = [_]u32{ command(pm4.event_write, 1), 0x31 };
-    host.putWords(0x1160, &then_child);
+    const then_entry = [_]u32{ command(pm4.indirect_buffer, 3), 0x1200, 0, 0x0f30_0000 | then_child.len };
+    host.putWords(0x1160, &then_entry);
+    host.putWords(0x1200, &then_child);
     host.putWords(0x11a0, &else_child);
     const branch = [_]u32{
         command(pm4.indirect_buffer, 13),
@@ -1494,7 +1522,7 @@ test "conditional INDIRECT_BUFFER keeps its selected branch across resume" {
         0,
         0x1160,
         0,
-        then_child.len,
+        then_entry.len,
         0x11a0,
         0,
         else_child.len,
@@ -1504,6 +1532,9 @@ test "conditional INDIRECT_BUFFER keeps its selected branch across resume" {
 
     const blocked = try executor.execute(&branch);
     try testing.expectEqual(Status.blocked, blocked.status);
+    try testing.expectEqual(@as(u8, 2), blocked.continuation.?.frame_count);
+    try testing.expectEqual(@as(u64, 0x1160), blocked.continuation.?.frames[1].entry_address);
+    try testing.expectEqual(@as(u64, 0x1200), blocked.continuation.?.frames[1].address);
     std.mem.writeInt(u32, host.memory[0x80..0x84], 7, .little);
     std.mem.writeInt(u64, host.memory[0x90..0x98], 1, .little);
 
@@ -1511,6 +1542,77 @@ test "conditional INDIRECT_BUFFER keeps its selected branch across resume" {
     try testing.expectEqual(Status.complete, resumed.status);
     try testing.expectEqual(@as(u8, 0x30), state.last_event.?.event_type);
     try testing.expectEqual(@as(u64, 1), state.event_count);
+}
+
+test "long INDIRECT_BUFFER chains replace the active stream and resume without replay" {
+    var host = FakeBackend{};
+    const link_count = maximum_stream_depth + 22;
+    const tail_address = 0x1100 + link_count * 24;
+    const tail = [_]u32{
+        command(pm4.event_write, 1),              0x20,
+        customCommand(pm4.custom.wait_mem_32, 6), 0x1080,
+        0,                                        0xffff_ffff,
+        7,                                        0x13,
+        1,                                        command(pm4.event_write, 1),
+        0x21,
+    };
+    for (0..link_count) |index| {
+        const address = 0x1100 + index * 24;
+        const next_count: u32 = if (index + 1 == link_count) tail.len else 6;
+        const link = [_]u32{
+            command(pm4.event_write, 1),     0x20,
+            command(pm4.indirect_buffer, 3), @intCast(address + 24),
+            0,                               0x0f30_0000 | next_count,
+        };
+        host.putWords(address, &link);
+    }
+    host.putWords(tail_address, &tail);
+    const root = [_]u32{
+        command(pm4.indirect_buffer, 3), 0x1100, 0, 0x0f20_0006,
+        command(pm4.event_write, 1),     0x22,
+    };
+    var state = gpu_state.State{};
+    var executor = DcbExecutor{ .state = &state, .backend = host.interface(), .allocator = testing.allocator };
+    const blocked = try executor.execute(&root);
+    try testing.expectEqual(Status.blocked, blocked.status);
+    try testing.expectEqual(@as(u8, 2), blocked.continuation.?.frame_count);
+    try testing.expectEqual(@as(u64, tail_address), blocked.continuation.?.frames[1].address);
+    try testing.expectEqual(@as(u64, link_count + 1), state.event_count);
+
+    // Earlier chain links are no longer live after the tail jump.
+    host.putWords(0x1100, &.{0xffff_ffff});
+    const still_blocked = try executor.resumeFrom(&root, blocked.continuation.?);
+    try testing.expectEqual(Status.blocked, still_blocked.status);
+    try testing.expectEqual(@as(u64, link_count + 1), state.event_count);
+    std.mem.writeInt(u32, host.memory[0x80..0x84], 7, .little);
+    const resumed = try executor.resumeFrom(&root, still_blocked.continuation.?);
+    try testing.expectEqual(Status.complete, resumed.status);
+    try testing.expectEqual(@as(u64, link_count + 3), state.event_count);
+    try testing.expectEqual(@as(u64, link_count + 1), state.indirect_buffer_count);
+    try testing.expectEqual(@as(u64, link_count * 2 + 5), state.packets_executed);
+    try testing.expectEqual(@as(u8, 0x22), state.last_event.?.event_type);
+}
+
+test "INDIRECT_BUFFER tail chains reject cycles and discard trailing parent packets" {
+    var host = FakeBackend{};
+    const root = [_]u32{ command(pm4.indirect_buffer, 3), 0x1100, 0, 0x0f20_0006 };
+    const first = [_]u32{
+        command(pm4.indirect_buffer, 3), 0x1140, 0, 0x0f30_0004,
+        command(pm4.event_write, 1),     0x21,
+    };
+    const back = [_]u32{ command(pm4.indirect_buffer, 3), 0x1100, 0, 0x0f30_0006 };
+    host.putWords(0x1100, &first);
+    host.putWords(0x1140, &back);
+    var state = gpu_state.State{};
+    var executor = DcbExecutor{ .state = &state, .backend = host.interface(), .allocator = testing.allocator };
+    try testing.expectError(Error.IndirectBufferCycle, executor.execute(&root));
+    try testing.expectEqual(@as(u64, 0), state.event_count);
+
+    // An empty chain also ends the current stream without returning to its tail.
+    host.putWords(0x1140, &.{ command(pm4.indirect_buffer, 3), 0, 0, 0x0f30_0000 });
+    const completed = try executor.execute(&root);
+    try testing.expectEqual(Status.complete, completed.status);
+    try testing.expectEqual(@as(u64, 0), state.event_count);
 }
 
 test "INDIRECT_BUFFER rejects active cycles, excessive depth and unreadable ranges" {
@@ -1535,7 +1637,7 @@ test "INDIRECT_BUFFER rejects active cycles, excessive depth and unreadable rang
     const deep_root = [_]u32{ command(pm4.indirect_buffer, 3), 0x1000, 0, 0x0f20_0004 };
     try testing.expectError(Error.IndirectBufferTooDeep, executor.execute(&deep_root));
 
-    const out_of_range = [_]u32{ command(pm4.indirect_buffer, 3), 0x11f0, 0, 0x0f20_0008 };
+    const out_of_range = [_]u32{ command(pm4.indirect_buffer, 3), @intCast(host.base + host.memory.len - 16), 0, 0x0f20_0008 };
     try testing.expectError(Error.MemoryReadFailed, executor.execute(&out_of_range));
 }
 

@@ -378,17 +378,21 @@ pub const Scheduler = struct {
         active_addresses: *[executor.maximum_stream_depth]u64,
     ) Error!void {
         var walker = pm4.Walker.init(stream);
+        var current_address = stream_address;
+        var current_stream = stream;
+        var chained_addresses = std.AutoHashMap(u64, void).init(self.allocator);
+        defer chained_addresses.deinit();
         while (true) {
             const packet = walker.next() catch |err| {
-                const offset = @min(walker.index, stream.len);
-                const header = if (offset < stream.len) stream[offset] else 0;
+                const offset = @min(walker.index, current_stream.len);
+                const header = if (offset < current_stream.len) current_stream[offset] else 0;
                 std.debug.print(
                     "[gpu scheduler] {s} stream @0x{x} stopped at {d}/{d} header=0x{x:0>8}: {s}\n",
                     .{
                         if (depth == 0) "root" else "indirect",
-                        stream_address,
+                        current_address,
                         offset,
-                        stream.len,
+                        current_stream.len,
                         header,
                         @errorName(err),
                     },
@@ -420,7 +424,22 @@ pub const Scheduler = struct {
             if (packet.body.len == 3) {
                 const address = (@as(u64, packet.body[1]) << 32) | packet.body[0];
                 const word_count: usize = packet.body[2] & 0x000f_ffff;
+                const chain = packet.body[2] & (1 << 20) != 0;
+                if (chain and depth != 0) {
+                    if (address == 0 or address & 3 != 0 or word_count == 0) return;
+                    for (active_addresses[0 .. depth - 1]) |active| {
+                        if (active == address) return;
+                    }
+                    try chained_addresses.put(current_address, {});
+                    if (chained_addresses.contains(address)) return;
+                    current_stream = try self.captureWords(submission, address, word_count, true);
+                    current_address = address;
+                    active_addresses[depth - 1] = address;
+                    walker = pm4.Walker.init(current_stream);
+                    continue;
+                }
                 try self.snapshotIndirectStream(submission, address, word_count, depth, active_addresses);
+                if (chain) return;
             } else if (packet.body.len == 13) {
                 const then_address = (@as(u64, packet.body[8]) << 32) | packet.body[7];
                 const then_count: usize = packet.body[9] & 0x000f_ffff;
@@ -638,7 +657,7 @@ const testing = std.testing;
 
 const FakeBackend = struct {
     base: u64 = 0x1000,
-    memory: [512]u8 = [_]u8{0} ** 512,
+    memory: [4096]u8 = [_]u8{0} ** 4096,
     events: [8]u8 = [_]u8{0} ** 8,
     event_count: usize = 0,
     generated_stream_address: u64 = 0,
@@ -712,6 +731,40 @@ fn command(opcode: u8, body_words: u14) u32 {
 
 fn customCommand(code: u6, body_words: u14) u32 {
     return command(pm4.nop, body_words) | (@as(u32, code) << 2);
+}
+
+test "long tail chains retain their submitted contents while the root waits" {
+    var host = FakeBackend{};
+    const link_count = executor.maximum_stream_depth + 22;
+    const tail_address = 0x1100 + link_count * 16;
+    const tail = [_]u32{
+        command(pm4.set_context_reg, 2), 0x318, 0x1234_5678,
+        command(pm4.event_write, 1),     0x2a,
+    };
+    for (0..link_count) |index| {
+        const address = 0x1100 + index * 16;
+        const next_count: u32 = if (index + 1 == link_count) tail.len else 4;
+        host.putWords(address, &.{ command(pm4.indirect_buffer, 3), @intCast(address + 16), 0, 0x0f30_0000 | next_count });
+    }
+    host.putWords(tail_address, &tail);
+    const root = [_]u32{
+        customCommand(pm4.custom.wait_mem_32, 6), 0x1080,
+        0,                                        0xffff_ffff,
+        1,                                        0x13,
+        1,                                        command(pm4.indirect_buffer, 3),
+        0x1100,                                   0,
+        0x0f30_0004, 0x4000_0000, // Unreachable, invalid packet after CHAIN.
+    };
+    var scheduler = Scheduler.init(testing.allocator, host.interface());
+    defer scheduler.deinit();
+    _ = try scheduler.submit(.graphics, &root);
+    try testing.expect(scheduler.isBlocked(.graphics));
+    @memset(host.memory[0x100..], 0xff);
+    std.mem.writeInt(u32, host.memory[0x80..0x84], 1, .little);
+    const resumed = try scheduler.pump();
+    try testing.expectEqual(@as(usize, 1), resumed.completed_submissions);
+    try testing.expectEqualSlices(u8, &.{0x2a}, host.events[0..host.event_count]);
+    try testing.expectEqual(@as(?u32, 0x1234_5678), scheduler.state(.graphics).readRegister(.context, 0x318));
 }
 
 test "an empty indirect command buffer is read live after a producing dispatch" {
