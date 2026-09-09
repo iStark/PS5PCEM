@@ -2,6 +2,29 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Indirect compute command construction on 2026-09-10
+
+A filtered live HLE trace records both `sceAgcDcbDispatchIndirect` and
+`sceAgcAcbDispatchIndirect` during scene rendering. Both exports still pointed
+to the generic 16-dword NOP constructor, explaining why the command traces
+contained no indirect compute dispatches despite the populated tile lists.
+
+The DCB constructor now emits the three-dword offset form of
+`DISPATCH_INDIRECT`; ACB emits the four-dword absolute-address form. The size
+queries match the commands, and the existing `SET_BASE` path retains the
+compute argument base. Constructor tests cover the address, offset, modifier,
+cursor and packet boundaries. The `--indirect-dispatch` Vulkan probe checks
+GPU-produced dimensions that remain deferred in a resident buffer, both
+address forms, a nonzero base offset, changing group counts and zero work.
+It and the default smoke pass SDK synchronization validation. The new live
+render graph remains to be checked; the same HLE audit also found placeholder
+ACB DMA, write and synchronization calls that require separate work.
+
+The decoder also recognizes both RDNA 2 BVH intersection forms, including
+their nonconsecutive address registers and A16 operand widths. Twelve MIMG
+tests pass. This is operand decoding only; ray intersection execution remains
+unsupported.
+
 ## Separate stencil operation values on 2026-09-09
 
 The live material draws use `STENCIL_REPLACE_OP` with an always-pass stencil
@@ -18,7 +41,9 @@ test/operation values still require a separate implementation. The expanded
 distinct operation/test values, masked EQUAL and LESS, front/back state and a
 subsequent stencil-tested color draw. The existing clipped UI checks and default
 smoke also pass SDK synchronization validation. Live lighting with this change
-remains pending.
+remains incomplete. A subsequent native frame captures 1,394 stencil texels
+containing `0x80`, confirming that the operation value now reaches the material
+classifier instead of being replaced with zero.
 
 ## Signed traversal-stack comparisons on 2026-09-09
 

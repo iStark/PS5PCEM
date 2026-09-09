@@ -335,6 +335,32 @@ pub fn setBaseDrawIndirectArgsGetSize() callconv(abi.guest) u32 {
     return 4 * @sizeOf(u32);
 }
 
+pub fn dispatchIndirect(
+    buffer: ?*CommandBuffer,
+    data_offset: u32,
+    modifier: u32,
+) callconv(abi.guest) ?[*]u32 {
+    const body = [_]u32{ data_offset, (modifier & 0xa038) | 0x41 };
+    return writePacket(buffer, gpu.pm4.dispatch_indirect, 0, &body);
+}
+
+pub fn dispatchIndirectGetSize() callconv(abi.guest) u32 {
+    return 3 * @sizeOf(u32);
+}
+
+pub fn dispatchIndirectAbsolute(
+    buffer: ?*CommandBuffer,
+    argument_address: u64,
+    modifier: u32,
+) callconv(abi.guest) ?[*]u32 {
+    const body = [_]u32{ @truncate(argument_address), @truncate(argument_address >> 32), (modifier & 0xa038) | 0x41 };
+    return writePacket(buffer, gpu.pm4.dispatch_indirect, 0, &body);
+}
+
+pub fn dispatchIndirectAbsoluteGetSize() callconv(abi.guest) u32 {
+    return 4 * @sizeOf(u32);
+}
+
 pub fn drawIndirect(
     buffer: ?*CommandBuffer,
     data_offset: u32,
@@ -1002,6 +1028,34 @@ test "indirect multi draw occupies ten words with a selectable count address" {
     try testing.expectEqual(@as(u64, 0x2000), spec.count_address);
     try testing.expectEqual(@as(u32, 24), spec.stride);
     try testing.expect((try walker.next()) == null);
+}
+
+test "indirect dispatch constructors preserve offsets addresses modifiers and exact sizes" {
+    var storage: [12]u32 = @splat(0xdead_beef);
+    var buffer = fixture(&storage);
+    const base: u64 = 0x5000_85d100;
+    try testing.expect(setBaseIndirectArgs(&buffer, 1, base) != null);
+    try testing.expectEqual(storage[0..].ptr + 4, dispatchIndirect(&buffer, 0x20, 0xffff_ffff).?);
+    try testing.expectEqual(storage[0..].ptr + 7, dispatchIndirectAbsolute(&buffer, 0x5000_855240, 1).?);
+    try testing.expectEqual(storage[0..].ptr + 11, buffer.cursor_up.?);
+    try testing.expectEqual(@as(u32, 0xdead_beef), storage[11]);
+    try testing.expectEqual(@as(u32, 12), dispatchIndirectGetSize());
+    try testing.expectEqual(@as(u32, 16), dispatchIndirectAbsoluteGetSize());
+
+    var walker = gpu.pm4.Walker.init(storage[0..11]);
+    const set_base = (try walker.next()).?;
+    try testing.expect(set_base.compute);
+    try testing.expectEqual(gpu.pm4.set_base, set_base.opcode);
+    try testing.expectEqualSlices(u32, &.{ 1, @truncate(base), @truncate(base >> 32) }, set_base.body);
+    const relative = (try walker.next()).?;
+    try testing.expectEqual(gpu.pm4.dispatch_indirect, relative.opcode);
+    try testing.expectEqualSlices(u32, &.{ 0x20, 0xa079 }, relative.body);
+    const absolute = (try walker.next()).?;
+    try testing.expectEqual(gpu.pm4.dispatch_indirect, absolute.opcode);
+    try testing.expectEqualSlices(u32, &.{ 0x0085_5240, 0x50, 0x41 }, absolute.body);
+    try testing.expect((try walker.next()) == null);
+    try testing.expect(dispatchIndirect(null, 0, 0) == null);
+    try testing.expect(dispatchIndirectAbsolute(null, base, 0) == null);
 }
 
 test "indexed multi-instance draw emits Prospero preamble packet" {

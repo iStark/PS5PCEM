@@ -2371,7 +2371,7 @@ fn runSceneMaskProbe(allocator: std.mem.Allocator) !void {
         @memset(guest.bytes[0x13000..0x13400], 0xcc);
         const high: u16 = @bitCast(limit);
         const stack_code = [_]u32{
-            0xe030_2000, 0x8000_3c00, // load v60, indexed V#s0
+            0xe030_2000,      0x8000_3c00, // load v60, indexed V#s0
             sop1(3, 52, 255), (@as(u32, high) << 16) | ~high,
             0x7d84_0080, // v_cmp_eq_u32 0, v0: establish VCC
             (0x1b << 25) | (1 << 17) | 129, // v_and_b32 v1, 1, v0
@@ -2822,6 +2822,72 @@ fn runStencilOnlyUiProbe(allocator: std.mem.Allocator) !void {
         try std.testing.expectEqual(@as(u32, if (pass % 2 == 0) 0xff0000ff else 0xffff0000), std.mem.readInt(u32, guest.bytes[right..][0..4], .little));
     }
     std.debug.print("stencil operation values passed: distinct REPLACE_OP/TEST, masked EQUAL/LESS, both face states and subsequent stencil consumers\n", .{});
+}
+
+fn runIndirectDispatchProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    const guest = try allocator.create(SizedGuestMemory(524288));
+    defer allocator.destroy(guest);
+    guest.* = .{};
+    const backend = renderer.dcbBackend(guest.interface());
+    const arguments = 0x10000;
+    const output = 0x60000;
+    const producer_program = 0x1400;
+    const consumer_program = 0x1800;
+    const producer_code = [_]u32{
+        vop1(1, 0, 128),            vop1(1, 1, 4),              vop1(1, 2, 129),
+        mubuf(0x1c, 0, 1, 0, 0)[0], mubuf(0x1c, 0, 1, 0, 0)[1], mubuf(0x1c, 4, 2, 0, 0)[0],
+        mubuf(0x1c, 4, 2, 0, 0)[1], mubuf(0x1c, 8, 2, 0, 0)[0], mubuf(0x1c, 8, 2, 0, 0)[1],
+        0xbf81_0000,
+    };
+    const consumer_code = [_]u32{
+        vop1(1, 0, 4), // Workgroup X follows the four user SGPRs.
+        vop1(1, 1, 135),
+        mubuf(0x1c, 0, 1, 0, 0)[0],
+        mubuf(0x1c, 0, 1, 0, 0)[1],
+        0xbf81_0000,
+    };
+    for (producer_code, 0..) |word, i| guest.word(producer_program + i * 4, word);
+    for (consumer_code, 0..) |word, i| guest.word(consumer_program + i * 4, word);
+    var producer = gpu.State{};
+    var consumer = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    for ([_]*gpu.State{ &producer, &consumer }, 0..) |state, i| {
+        try state.writeRegister(.shader, compute.programRegisterBase(), (if (i == 0) @as(u32, producer_program) else consumer_program) >> 8);
+        try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+        try state.writeRegister(.shader, 0x213, if (i == 0) 5 << 1 else (4 << 1) | (1 << 7));
+        for ([_]u32{ 0x207, 0x208, 0x209 }) |reg| try state.writeRegister(.shader, reg, 1);
+        // A large producer range keeps its GPU writes deferred until the
+        // indirect command requests these twelve argument bytes.
+        const descriptor = if (i == 0) [_]u32{ arguments, 4 << 16, 65536, 0 } else [_]u32{ output, 4 << 16, 16, 0 };
+        for (descriptor, 0..) |word, n| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(n)), word);
+    }
+    var writer = gpu.DcbExecutor{ .state = &producer, .backend = backend, .allocator = allocator };
+    var reader = gpu.DcbExecutor{ .state = &consumer, .backend = backend, .allocator = allocator };
+    const direct = [_]u32{ command(gpu.pm4.dispatch_direct, 4), 1, 1, 1, 0x41 };
+    const relative = [_]u32{
+        command(gpu.pm4.set_base, 3) | 2,      1,    arguments - 0x20, 0,
+        command(gpu.pm4.dispatch_indirect, 2), 0x20, 0x41,
+    };
+    const absolute = [_]u32{ command(gpu.pm4.dispatch_indirect, 3), arguments, 0, 0x41 };
+    for ([_]bool{ false, true }) |absolute_address| {
+        for ([_]u32{ 3, 0, 5 }) |count| {
+            @memset(guest.bytes[output..][0..64], 0xcd);
+            try producer.writeRegister(.shader, compute.userDataBase() + 4, count);
+            const previous_count = std.mem.readInt(u32, guest.bytes[arguments..][0..4], .little);
+            _ = try writer.execute(&direct);
+            try std.testing.expectEqual(previous_count, std.mem.readInt(u32, guest.bytes[arguments..][0..4], .little));
+            _ = try reader.execute(if (absolute_address) &absolute else &relative);
+            try renderer.flushPendingGuestWrites();
+            try std.testing.expectEqual(count, std.mem.readInt(u32, guest.bytes[arguments..][0..4], .little));
+            for (0..16) |lane| {
+                const expected: u32 = if (lane < count) 7 else 0xcdcd_cdcd;
+                try std.testing.expectEqual(expected, std.mem.readInt(u32, guest.bytes[output + lane * 4 ..][0..4], .little));
+            }
+        }
+    }
+    std.debug.print("indirect dispatch passed: GPU-produced dimensions, relative/absolute addresses, nonzero offsets, zero work and changing counts\n", .{});
 }
 
 fn runUiAttachmentProbe(allocator: std.mem.Allocator) !void {
@@ -5666,6 +5732,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--quad-mode")) {
         try runWholeQuadModeProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--indirect-dispatch")) {
+        try runIndirectDispatchProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--gather-lod")) {

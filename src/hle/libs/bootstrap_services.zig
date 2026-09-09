@@ -3454,7 +3454,7 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcCbReleaseMem", .function = trace.wrap("sceAgcCbReleaseMem", &agcReleaseMem), .expect_id = "wr23dPKyWc0" },
 
     .{ .name = "sceAgcAcbResetQueue", .function = trace.wrap("sceAgcAcbResetQueue", &agcCommand), .expect_id = "JrtiDtKeS38" },
-    .{ .name = "sceAgcAcbDispatchIndirect", .function = trace.wrap("sceAgcAcbDispatchIndirect", &agcCommand), .expect_id = "j3EtxFkSIhQ" },
+    .{ .name = "sceAgcAcbDispatchIndirect", .function = trace.wrap("sceAgcAcbDispatchIndirect", &agc.dispatchIndirectAbsolute), .expect_id = "j3EtxFkSIhQ" },
     .{ .name = "sceAgcAcbWaitUntilSafeForRendering", .function = trace.wrap("sceAgcAcbWaitUntilSafeForRendering", &agcCommand), .expect_id = "GPbUp9jXQa8" },
     .{ .name = "sceAgcAcbWaitRegMem", .function = trace.wrap("sceAgcAcbWaitRegMem", &agcCommand), .expect_id = "htn36gPnBk4" },
     .{ .name = "sceAgcAcbAcquireMem", .function = trace.wrap("sceAgcAcbAcquireMem", &agcCommand), .expect_id = "KT-hTp-Ch14" },
@@ -3478,7 +3478,7 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcDcbDrawIndexOffsetGetSize", .function = trace.wrap("sceAgcDcbDrawIndexOffsetGetSize", &agcDrawIndexOffsetGetSize), .expect_id = "qMlfB1ZhMDc" },
     .{ .name = "sceAgcDcbDrawIndexIndirect", .function = trace.wrap("sceAgcDcbDrawIndexIndirect", &agcDrawIndexIndirect), .expect_id = "t1vNu082-jM" },
     .{ .name = "sceAgcDcbDrawIndirect", .function = trace.wrap("sceAgcDcbDrawIndirect", &agcDrawIndirect), .expect_id = "1q1titRBL6o" },
-    .{ .name = "sceAgcDcbDispatchIndirect", .function = trace.wrap("sceAgcDcbDispatchIndirect", &agcCommand), .expect_id = "CtB+A9-VxO0" },
+    .{ .name = "sceAgcDcbDispatchIndirect", .function = trace.wrap("sceAgcDcbDispatchIndirect", &agc.dispatchIndirect), .expect_id = "CtB+A9-VxO0" },
     .{ .name = "sceAgcDcbSetNumInstances", .function = trace.wrap("sceAgcDcbSetNumInstances", &agcSetNumInstances), .expect_id = "tSBxhAPyytQ" },
     .{ .name = "sceAgcDcbStallCommandBufferParser", .function = trace.wrap("sceAgcDcbStallCommandBufferParser", &agcCommand), .expect_id = "u2T2DiA5hRI" },
     .{ .name = "sceAgcDcbSetBaseIndirectArgs", .function = trace.wrap("sceAgcDcbSetBaseIndirectArgs", &agcSetBaseIndirectArgs), .expect_id = "RmaJwLtc8rY" },
