@@ -91,6 +91,18 @@ pub const Resolver = struct {
                 return a *% b;
             },
             .s_movk_i32 => return @bitCast(@as(i32, @as(i16, @bitCast(@as(u16, @truncate(inst.src0.value)))))),
+            .s_lshl_b32, .s_lshr_b32, .s_ashr_i32 => {
+                if (component != 0) return null;
+                const value = (try self.operand(inst.src0, 0, index, depth + 1)) orelse return null;
+                const amount = (try self.operand(inst.src1, 0, index, depth + 1)) orelse return null;
+                const shift: u5 = @truncate(amount);
+                return switch (inst.opcode) {
+                    .s_lshl_b32 => value << shift,
+                    .s_lshr_b32 => value >> shift,
+                    .s_ashr_i32 => @bitCast(@as(i32, @bitCast(value)) >> shift),
+                    else => unreachable,
+                };
+            },
             .s_bfm_b32, .s_bfm_b64 => {
                 // Sampler constants are also assembled in branches that the
                 // scalar walk cannot visit. Recover both inputs at the mask
@@ -172,6 +184,46 @@ test "scalar resource recovery reconstructs bitfield sampler constants" {
     instructions[1].src0 = .{ .kind = .vgpr, .reg = 0 };
     resolver.remaining = 512;
     try std.testing.expect(!try resolver.words(32, 12, words[0..1]));
+}
+
+test "sampler shifts resolve inside a branch with no scalar snapshot" {
+    const M = struct {
+        fn read(_: ?*anyopaque, _: u64, _: []u8) bool {
+            return false;
+        }
+    };
+    var instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_cbranch_execz, .branch_target = 20 },
+        .{ .pc = 4, .opcode = .s_mov_b32, .dst = .{ .kind = .sgpr, .reg = 19 }, .src0 = .{ .kind = .integer_inline_constant, .value = 0 } },
+        .{ .pc = 8, .opcode = .s_bfm_b64, .dst = .{ .kind = .sgpr, .reg = 16 }, .src0 = .{ .kind = .integer_inline_constant, .value = 12 }, .src1 = .{ .kind = .integer_inline_constant, .value = 44 } },
+        .{ .pc = 12, .opcode = .s_lshl_b32, .dst = .{ .kind = .sgpr, .reg = 18 }, .src0 = .{ .kind = .integer_inline_constant, .value = 5 }, .src1 = .{ .kind = .integer_inline_constant, .value = 24 } },
+        .{ .pc = 16, .opcode = .s_nop },
+        .{ .pc = 20, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    var bindings = std.mem.zeroes(shaders.StageBindings);
+    var snapshot = scalar.Evaluation{};
+    var resolver = Resolver{ .bindings = &bindings, .reader = .{ .context = null, .read_fn = M.read }, .instructions = &instructions, .graph = &graph, .snapshot = &snapshot };
+    var words: [4]u32 = undefined;
+    try std.testing.expect(try resolver.words(16, 16, &words));
+    try std.testing.expectEqualSlices(u32, &.{ 0, 0x00fff000, 0x05000000, 0 }, &words);
+    instructions[3].src1.value = 56; // shift amount wraps to five bits
+    resolver.remaining = 512;
+    try std.testing.expect(try resolver.words(16, 16, &words));
+    try std.testing.expectEqual(@as(u32, 0x05000000), words[2]);
+    instructions[3].src0 = .{ .kind = .literal_constant, .value = 0x80000000 };
+    instructions[3].opcode = .s_lshr_b32;
+    resolver.remaining = 512;
+    try std.testing.expect(try resolver.words(16, 16, &words));
+    try std.testing.expectEqual(@as(u32, 0x80), words[2]);
+    instructions[3].opcode = .s_ashr_i32;
+    resolver.remaining = 512;
+    try std.testing.expect(try resolver.words(16, 16, &words));
+    try std.testing.expectEqual(@as(u32, 0xffffff80), words[2]);
+    instructions[3].src0 = .{ .kind = .sgpr, .reg = 2 };
+    resolver.remaining = 512;
+    try std.testing.expect(!try resolver.words(16, 16, &words));
 }
 
 test "scalar resource offsets recover wrapping multiplication before register reuse" {

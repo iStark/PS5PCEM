@@ -107,6 +107,16 @@ RGBA values `{32,127,191,255}` and `{96,127,191,255}` with no additional pipelin
 miss on the second draw. The full Vulkan smoke passes SDK synchronization
 validation. Complete live menu composition with this fix is still pending.
 
+After brightness, compute programs `0x801fdfb600` and `0x801fe03600` also
+reject the sampler at `0x8e4`. They construct it inside an EXEC-guarded branch:
+`s_bfm_b64 s16,12,44`, `s_lshl_b32 s18,5,24` and a zero `s19`.
+The definition resolver already recovers the mask, but its shift handling
+depends on a scalar snapshot that does not visit this branch. It now evaluates
+32-bit logical and arithmetic shifts from their reaching operands, masking
+the shift count to five bits and keeping unknown inputs unresolved. All 94
+resource/provenance tests pass. Recovery on the captured scene shader produces
+the expected sampler `{0,0x00fff000,0x05000000,0}` without a scalar snapshot.
+
 ## Driver pipeline cache and buffer-wait experiment on 2026-09-09
 
 The driver pipeline cache now accepts and saves up to 1 GiB, using the same
