@@ -2745,6 +2745,21 @@ fn agcSetRegistersIndirect(
 
 const graphics_error_invalid_packet: i32 = @bitCast(@as(u32, 0x8a6c_000c));
 
+fn agcWriteDataPatchSetAddressOrOffset(command_address: u64, address_or_offset: u64) callconv(abi.guest) i32 {
+    if (!kernel_memory.isGuestRangeAccessible(command_address, 4 * @sizeOf(u32))) {
+        return errno.KernelError.efault.raw();
+    }
+    const header = readGuestU32(command_address);
+    if (header >> 30 != 3 or @as(u8, @truncate(header >> 8)) != gpu.pm4.write_data or
+        ((header >> 16) & 0x3fff) < 2)
+    {
+        return graphics_error_invalid_packet;
+    }
+    writeGuestU32(command_address + 2 * @sizeOf(u32), @truncate(address_or_offset));
+    writeGuestU32(command_address + 3 * @sizeOf(u32), @truncate(address_or_offset >> 32));
+    return errno.ok;
+}
+
 fn agcRegIndirectPatchSetAddress(command_address: u64, registers_address: u64, opcode: u8) i32 {
     if (!kernel_memory.isGuestRangeAccessible(command_address, 3 * @sizeOf(u32))) {
         return errno.KernelError.efault.raw();
@@ -3468,7 +3483,7 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcSetShRegIndirectPatchAddRegisters", .function = trace.wrap("sceAgcSetShRegIndirectPatchAddRegisters", &agcSetShRegIndirectPatchAddRegisters), .expect_id = "z2duB-hHQSM" },
     .{ .name = "sceAgcSetUcRegIndirectPatchAddRegisters", .function = trace.wrap("sceAgcSetUcRegIndirectPatchAddRegisters", &agcSetUcRegIndirectPatchAddRegisters), .expect_id = "vRoArM9zaIk" },
     .{ .name = "sceAgcCreatePrimState", .function = trace.wrap("sceAgcCreatePrimState", &agcCreatePrimState), .expect_id = "D9sr1xGUriE" },
-    .{ .name = "sceAgcWriteDataPatchSetAddressOrOffset", .function = trace.wrap("sceAgcWriteDataPatchSetAddressOrOffset", &agcPatch), .expect_id = "fPSCdQxgpSw" },
+    .{ .name = "sceAgcWriteDataPatchSetAddressOrOffset", .function = trace.wrap("sceAgcWriteDataPatchSetAddressOrOffset", &agcWriteDataPatchSetAddressOrOffset), .expect_id = "fPSCdQxgpSw" },
     .{ .name = "sceAgcDmaDataPatchSetDstAddressOrOffset", .function = trace.wrap("sceAgcDmaDataPatchSetDstAddressOrOffset", &agcDmaDataPatchDestination), .expect_id = "IxYiarKlXxM" },
     .{ .name = "sceAgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate", .function = trace.wrap("sceAgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate", &agcDmaDataPatchSource), .expect_id = "cdDRpqcFGbU" },
     .{ .name = "sceAgcQueueEndOfPipeActionPatchAddress", .function = trace.wrap("sceAgcQueueEndOfPipeActionPatchAddress", &agcReleaseMemPatchAddress), .expect_id = "0fWWK5uG9rQ" },
@@ -3881,11 +3896,22 @@ test "bootstrap AGC async transfer waits for published data before copying it" {
     try std.testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, host.bytes[0x30..][0..4], .little));
     try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, host.bytes[0x34..][0..4], .little));
 
-    // A data-only packet may use address zero; its copied payload is consumed
-    // by the caller without submitting the WRITE_DATA command itself.
+    // Commands can be constructed before their destination is known. Patch
+    // the retained packet, preserving its control and payload, then execute it.
     producer_buffer = Host.buffer(&producer_words);
     const embedded = agc.writeData(@ptrCast(&producer_buffer), 4, 0, 0, &repeated, 3, 0, 0).?;
+    const old_control = embedded[1];
+    try std.testing.expectEqual(errno.ok, agcWriteDataPatchSetAddressOrOffset(@intFromPtr(embedded), Host.base + 0x40));
+    try std.testing.expectEqual(old_control, embedded[1]);
     try std.testing.expectEqualSlices(u32, &repeated, embedded[4..7]);
+    _ = try producer.execute(producer_words[0..7]);
+    for (repeated, 0..) |value, i| try std.testing.expectEqual(value, std.mem.readInt(u32, host.bytes[0x40 + i * 4 ..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, host.bytes[0x4c..][0..4], .little));
+    embedded[0] = 0xc003_1000;
+    const invalid = producer_words;
+    try std.testing.expectEqual(graphics_error_invalid_packet, agcWriteDataPatchSetAddressOrOffset(@intFromPtr(embedded), 0));
+    try std.testing.expectEqualSlices(u32, &invalid, &producer_words);
+    try std.testing.expectEqual(errno.KernelError.efault.raw(), agcWriteDataPatchSetAddressOrOffset(0, Host.base));
 }
 
 test "bootstrap AGC emits exact dispatch draw and instance packets" {

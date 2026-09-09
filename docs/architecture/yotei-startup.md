@@ -14,12 +14,20 @@ These exports now emit the corresponding command packets. ACB wrappers retain
 their distinct argument layouts; ACB `WRITE_DATA` converts its hardware
 destination to the DCB selector format. Both variants copy the payload at
 construction time, including address-zero packets whose payload is consumed
-without submission. Acquire, DMA and write size queries match their packets.
+after a later destination patch. Acquire, DMA and write size queries match
+their packets.
 
 Seventeen HLE tests pass. The new integration case blocks on a guest label,
 publishes copied data and the label through both write constructors, resumes
 the waiting stream and verifies its DMA result. It also covers disabled address
-increment and an embedded payload at address zero. The Vulkan indirect-dispatch
+increment and construction at address zero followed by a destination patch
+and execution at an address above 4 GiB. Invalid packet patches preserve the
+command. The first native run exposed the separate
+`sceAgcWriteDataPatchSetAddressOrOffset` placeholder: the executor rejected
+unpatched writes at address zero and stopped before the intro. That export
+now installs both destination words while retaining the header, control and
+copied data. Native startup is being rechecked with the complete path.
+The Vulkan indirect-dispatch
 probe additionally transfers GPU-produced arguments through GDS, destroys the
 memory copy, restores it from GDS and verifies the resulting work and zero-count
 case with SDK synchronization validation. Live scene validation remains pending.
