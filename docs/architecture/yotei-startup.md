@@ -2,6 +2,21 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Overlapping command-buffer views on 2026-09-10
+
+The first native flip reports the four-dword builder at `0x201160c0d4` as
+orphaned even though the submitted 57-dword root at `0x201160c000` covers it.
+Later quiet periods consequently replay that root's indirect tail. The ledger
+only updated the first arena containing the submission's starting address;
+it missed command-buffer views starting inside the submitted range.
+
+Execution accounting now updates every overlapping view, retaining pending
+suffixes and excluding adjacent ranges. A regression case covers the captured
+57-dword layout and a subsequent partial extension. Thirty-six focused HLE
+tests pass, including command-prefix guards, retained submissions and the
+completion-table checks. Native performance with this accounting change is
+being checked; no frame-rate gain is claimed from the unit test alone.
+
 ## Zero-initialized completion tables on 2026-09-10
 
 The complete write/patch path restores intro playback. In the subsequent
@@ -22,7 +37,8 @@ conflicting pages, unwritten releases and mismatched ranges do not establish
 the page. Discovery does not change guest labels. Once established, the page
 is retained until reset, including when later releases point into temporary
 command arenas. Twenty-one focused HLE tests pass; native continuation past
-flip 914 is being rechecked.
+flip 914 is being rechecked. The new native run confirms the expected shared
+page `0x2000000000` during initial queue submission.
 
 ## ACB counter transfers and synchronization on 2026-09-10
 

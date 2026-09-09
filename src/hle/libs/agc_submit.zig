@@ -471,9 +471,11 @@ fn markBuilderArenaExecuted(start: u64, byte_length: u64) void {
     builder_arena_lock.lock();
     defer builder_arena_lock.unlock();
     for (&builder_arenas) |*arena| {
-        if (arena.base == 0 or start < arena.base or start >= arena.written_end) continue;
+        // A temporary builder can name a subrange of the submitted arena.
+        // Cover every overlapping view, including one whose base lies after
+        // the submission's start, so its already-submitted tail is not rescued.
+        if (arena.base == 0 or end <= arena.base or start >= arena.written_end) continue;
         if (end > arena.executed_end) arena.executed_end = @min(end, arena.written_end);
-        return;
     }
 }
 
@@ -4295,6 +4297,26 @@ test "only a fence tail or a lone queue root is run on the guest's behalf" {
     const padding = [_]u32{ command(gpu.pm4.nop, 1), 0 };
     try testing.expect(!streamIsRecoverableOrphan(&padding));
     try testing.expect(!streamIsRecoverableOrphan(&.{}));
+}
+
+test "AGC builder execution covers overlapping command views" {
+    const saved = builder_arenas;
+    defer builder_arenas = saved;
+    builder_arenas = @splat(.{});
+    const base: u64 = 0x2011_60c000;
+    builder_arenas[0] = .{ .base = base, .written_end = base + 0x100, .executed_end = base };
+    builder_arenas[1] = .{ .base = base + 0xd4, .written_end = base + 0xe4, .executed_end = base + 0xd4 };
+    builder_arenas[2] = .{ .base = base + 0xe4, .written_end = base + 0x104, .executed_end = base + 0xe4 };
+    builder_arenas[3] = .{ .base = base - 0x40, .written_end = base, .executed_end = base - 0x40 };
+    markBuilderArenaExecuted(base, 57 * @sizeOf(u32));
+    try testing.expectEqual(base + 0xe4, builder_arenas[0].executed_end);
+    try testing.expectEqual(base + 0xe4, builder_arenas[1].executed_end);
+    try testing.expectEqual(base + 0xe4, builder_arenas[2].executed_end);
+    try testing.expectEqual(base - 0x40, builder_arenas[3].executed_end);
+    markBuilderArenaExecuted(base + 0xe4, 0x10);
+    try testing.expectEqual(base + 0xf4, builder_arenas[0].executed_end);
+    try testing.expectEqual(base + 0xe4, builder_arenas[1].executed_end);
+    try testing.expectEqual(base + 0xf4, builder_arenas[2].executed_end);
 }
 
 test "a builder whose bottom is on the thread stack is not a command arena" {
