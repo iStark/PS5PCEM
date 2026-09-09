@@ -87,6 +87,7 @@ var driver_completion_reports: u32 = 0;
 var driver_completion_chain_reports: u32 = 0;
 var driver_completion_miss_reports: u32 = 0;
 var sdk11_acb_label_page: std.atomic.Value(u64) = .init(0);
+var sdk11_acb_page_probe: AcbLabelPageProbe = .{};
 var submission_header_write_reports: u32 = 0;
 var unmapped_wait_reports: u32 = 0;
 var unsafe_island_reports: u32 = 0;
@@ -1736,6 +1737,9 @@ pub fn reset() void {
     driver_completion_chain_reports = 0;
     driver_completion_miss_reports = 0;
     sdk11_acb_label_page.store(0, .release);
+    sdk11_acb_queue_lock.lock();
+    sdk11_acb_page_probe = .{};
+    sdk11_acb_queue_lock.unlock();
     submission_header_write_reports = 0;
     unsafe_island_reports = 0;
     submission_alias_lock.lock();
@@ -2931,6 +2935,51 @@ fn sdk11AcbContainsSubmission(queue: Sdk11AcbQueue, address: u64, words: u32) bo
         bytes <= queue.stream_end - address;
 }
 
+const AcbLabelPageProbe = struct {
+    const Evidence = struct { page: u64, owner: u32, index: u32 };
+    first: ?Evidence = null,
+
+    fn observe(self: *@This(), evidence: Evidence) ?u64 {
+        if (self.first) |first| {
+            if (first.page == evidence.page) {
+                if (first.owner != evidence.owner and first.index != evidence.index) return evidence.page;
+                return null;
+            }
+        }
+        self.first = evidence;
+        return null;
+    }
+};
+
+/// WRITE_DATA may initialize unused label slots to zero, so the allocator's
+/// free-slot links are not always available as table evidence. Two distinct,
+/// validated queue owners can instead identify the same page through releases
+/// whose values match their own generations. Each submission must belong to
+/// its queue, and both the hardware write and CPU slot are checked in memory.
+fn observeSdk11AcbLabelPage(owner: u32, queue: Sdk11AcbQueue, submission: Submission, release: gpu.state.ReleaseMem) void {
+    if (sdk11_acb_label_page.load(.acquire) != 0 or owner == 0 or
+        release.data_selection != 2 or release.data != queue.generation or
+        queue.generation == 0 or release.address & 0x1f != 0 or queue.label_index >= 0x80 or
+        !sdk11AcbContainsSubmission(queue, @intFromPtr(submission.address orelse return), submission.word_count)) return;
+    const page = release.address & ~@as(u64, 0xfff);
+    const target = page + @as(u64, queue.label_index) * 0x20;
+    if (page == 0 or target == release.address) return;
+    var hardware: [8]u8 = undefined;
+    var cpu: [8]u8 = undefined;
+    if (!readGuestMemory(null, release.address, &hardware) or !readGuestMemory(null, target, &cpu)) return;
+    const completed = std.mem.readInt(u64, &hardware, .little);
+    const previous = std.mem.readInt(u64, &cpu, .little);
+    if (completed != release.data or previous > queue.generation or queue.generation - previous > 1) return;
+    sdk11_acb_queue_lock.lock();
+    defer sdk11_acb_queue_lock.unlock();
+    if (sdk11_acb_label_page.load(.acquire) != 0) return;
+    if (sdk11_acb_page_probe.observe(.{ .page = page, .owner = owner, .index = queue.label_index })) |confirmed| {
+        if (sdk11_acb_label_page.cmpxchgStrong(0, confirmed, .release, .monotonic) == null) {
+            std.debug.print("[agc retirement] confirmed SDK11 label page 0x{x} from independent queues\n", .{confirmed});
+        }
+    }
+}
+
 /// Queue objects recovered for an owner, remembered so a later submit whose
 /// callee-saved registers no longer carry the pointer still completes. Every
 /// cached hit is re-validated through `sdk11AcbQueueAt`, so a recycled or
@@ -3023,6 +3072,7 @@ fn publishSdk11AcbDriverGeneration(
     if (found) |queue| {
         rememberSdk11AcbQueue(owner, queue_address);
         generation = queue.generation;
+        if (release) |packet| observeSdk11AcbLabelPage(owner, queue, submission, packet);
         const shared_page = sdk11_acb_label_page.load(.acquire);
         const label_page = if (release) |packet|
             sdk11AcbGenerationPage(release_page, shared_page, generation, packet.data) orelse return
@@ -3262,7 +3312,7 @@ fn publishSdk11AcbRetirement(release: gpu.state.ReleaseMem) void {
     // This is the process-wide 32-byte completion table. Later ACB arenas can
     // carry packet-local RELEASE_MEM labels while their queue generation still
     // indexes this shared page; remember the self-describing page once proven.
-    sdk11_acb_label_page.store(release.address & ~@as(u64, 0xfff), .release);
+    _ = sdk11_acb_label_page.cmpxchgStrong(0, release.address & ~@as(u64, 0xfff), .release, .monotonic);
 
     var bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &bytes, publish, .little);
@@ -4025,6 +4075,57 @@ test "synchronous AGC completion advances a paired CPU retirement label" {
         84,
         0,
     ) == null);
+}
+
+test "SDK11 ACB discovers zero-initialized label tables from independent queue completions" {
+    const old_page = sdk11_acb_label_page.load(.acquire);
+    const old_probe = sdk11_acb_page_probe;
+    defer {
+        sdk11_acb_label_page.store(old_page, .release);
+        sdk11_acb_page_probe = old_probe;
+    }
+    sdk11_acb_label_page.store(0, .release);
+    sdk11_acb_page_probe = .{};
+    var labels: [0x1000]u8 align(0x1000) = @splat(0);
+    var words = [_]u32{ command(gpu.pm4.nop, 1), 0 };
+    const submission = Submission{ .address = &words, .word_count = words.len, .reserved = 0 };
+    var queue = Sdk11AcbQueue{
+        .generation = 1,
+        .label_index = 3,
+        .stream_begin = @intFromPtr(&words),
+        .stream_end = @intFromPtr(&words) + @sizeOf(@TypeOf(words)),
+    };
+    var release = std.mem.zeroes(gpu.state.ReleaseMem);
+    release.address = @intFromPtr(&labels) + 0x480;
+    release.data = 1;
+    release.data_selection = 2;
+    // A queue's release value alone is insufficient before the write lands.
+    observeSdk11AcbLabelPage(0x20, queue, submission, release);
+    try testing.expect(sdk11_acb_page_probe.first == null);
+    std.mem.writeInt(u64, labels[0x480..0x488], 1, .little);
+    observeSdk11AcbLabelPage(0x20, queue, submission, release);
+    observeSdk11AcbLabelPage(0x20, queue, submission, release);
+    try testing.expectEqual(@as(u64, 0), sdk11_acb_label_page.load(.acquire));
+    // Neither another owner at the same slot nor an out-of-range submission
+    // can provide the independent second confirmation.
+    observeSdk11AcbLabelPage(0x28, queue, submission, release);
+    queue.label_index = 4;
+    var outside = queue;
+    outside.stream_end -= 4;
+    observeSdk11AcbLabelPage(0x28, outside, submission, release);
+    try testing.expectEqual(@as(u64, 0), sdk11_acb_label_page.load(.acquire));
+    std.mem.writeInt(u64, labels[0x80..0x88], 2, .little);
+    observeSdk11AcbLabelPage(0x28, queue, submission, release);
+    try testing.expectEqual(@as(u64, 0), sdk11_acb_label_page.load(.acquire));
+    std.mem.writeInt(u64, labels[0x80..0x88], 0, .little);
+    observeSdk11AcbLabelPage(0x28, queue, submission, release);
+    try testing.expectEqual(@intFromPtr(&labels), sdk11_acb_label_page.load(.acquire));
+    // Discovery reads the real values; it does not publish a completion.
+    try testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, labels[0x60..0x68], .little));
+    try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, labels[0x480..0x488], .little));
+    var probe = AcbLabelPageProbe{};
+    try testing.expect(probe.observe(.{ .page = 0x1000, .owner = 0x20, .index = 3 }) == null);
+    try testing.expect(probe.observe(.{ .page = 0x2000, .owner = 0x28, .index = 4 }) == null);
 }
 
 test "SDK11 ACB retirement requires an adjacent self-describing label pair" {

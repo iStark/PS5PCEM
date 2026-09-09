@@ -2,6 +2,28 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Zero-initialized completion tables on 2026-09-10
+
+The complete write/patch path restores intro playback. In the subsequent
+native run the loading spinner appears, but progress stops at flip 914:
+the main thread polls queue `0x38`'s generation 901 at `0x2000000060`, which
+still contains 900, while both host command queues are empty. The shared
+label-page cache remains zero. Its old discovery rule requires successor
+indices in unused slots; those slots now contain zero. The next submission's
+packet-local release value differs from its queue generation, so the fallback
+cannot select the driver's completion slot.
+
+Two distinct validated queue owners can now establish the shared page through
+completed releases matching their generations. Their submissions must lie
+inside their respective command ranges, their CPU label slots must be
+different, and the memory values must confirm both completed hardware writes
+and plausible preceding CPU generations. Repeated observations of one owner,
+conflicting pages, unwritten releases and mismatched ranges do not establish
+the page. Discovery does not change guest labels. Once established, the page
+is retained until reset, including when later releases point into temporary
+command arenas. Twenty-one focused HLE tests pass; native continuation past
+flip 914 is being rechecked.
+
 ## ACB counter transfers and synchronization on 2026-09-10
 
 The adjacent HLE audit confirms calls to placeholder ACB DMA, memory-write,
