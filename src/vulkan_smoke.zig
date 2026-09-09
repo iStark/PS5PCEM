@@ -4812,6 +4812,56 @@ fn runIndexedImageProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("indexed images passed: material-to-global tables, SGPR/VCC_LO/VCC_HI indices, large record scan, wrapping multiply/shift, mixed views, exact aliases and both bounds\n", .{});
 }
 
+fn runShiftedImageProbe(allocator: std.mem.Allocator) !void {
+    for ([_]u32{ 106, 107 }) |selector| for ([_]u32{ 5, 37 }) |shift| {
+        var renderer = try vulkan.Renderer.init(allocator, .{});
+        defer renderer.deinit();
+        var guest = GuestMemory{};
+        _ = renderer.dcbBackend(guest.interface());
+        const code = [_]u32{
+            vop1(1, 0, 28), // retain group/output index
+            vop1(1, 1, 255),
+            0x08000000,
+            vop2(0x25, 1, 0, 1), // high bits wrap out of index << 5
+            vop1(2, @intCast(selector), 257), // dynamic first active lane -> VCC word
+            0x8f00_ff00 | (selector << 16) | selector,
+            shift,
+            0xf42c_000c,                 selector << 25, // T#s0 = V#s24[index << 5]
+            vop1(1, 2, 255),             0x3e800000,
+            vop1(1, 3, 255),             0x3e800000,
+            0xf09c_010a,                 0x0080_0202,
+            3,                           mubuf(0x1c, 0, 2, 0, 12)[0],
+            mubuf(0x1c, 0, 2, 0, 12)[1], 0xbf81_0000,
+        };
+        for (code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+        var state = gpu.State{};
+        try state.writeRegister(.shader, 0x20c, 1);
+        try state.writeRegister(.shader, 0x20d, 0);
+        try state.writeRegister(.shader, 0x213, (28 << 1) | (1 << 7));
+        var userdata: [28]u32 = @splat(0);
+        @memcpy(userdata[12..16], &[_]u32{ 0x13000, 4 << 16, 4, 0 });
+        for (0..2) |pass| {
+            const table: u32 = @intCast(0x10000 + pass * 0x1000);
+            @memcpy(userdata[24..28], &[_]u32{ table, 32 << 16, 3, 0 });
+            for (userdata, 0..) |word, i| try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
+            for (0..2) |entry| {
+                const address: u32 = @intCast(0x8000 + ((entry + pass) % 2) * 0x1000);
+                const descriptor = sampledImageDescriptorWords(address, 1, 1);
+                for (descriptor, 0..) |word, i| guest.word(table + entry * 32 + i * 4, word);
+                guest.word(address, if (address == 0x8000) 0xff0000ff else 0xff000040);
+            }
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 4, 1, 1 });
+            var output: [16]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x13000, &output);
+            for ([_]f32{ if (pass == 0) 1 else 64.0 / 255.0, if (pass == 0) 64.0 / 255.0 else 1, 0, 0 }, 0..) |expected, i| {
+                const actual: f32 = @bitCast(std.mem.readInt(u32, output[i * 4 ..][0..4], .little));
+                try std.testing.expectApproxEqAbs(expected, actual, 0.00001);
+            }
+        }
+    };
+    std.debug.print("shifted sampled images passed: active-lane VCC selection, masked shift amount, 32-bit wrap, relocated tables, null descriptors and bounds\n", .{});
+}
+
 fn runNestedImageProbe(allocator: std.mem.Allocator) !void {
     try runNestedImageCase(allocator, false, false);
     try runNestedImageCase(allocator, true, false);
@@ -5701,6 +5751,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--indexed-images")) {
         try runIndexedImageProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--shifted-images")) {
+        try runShiftedImageProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--save-exec")) {

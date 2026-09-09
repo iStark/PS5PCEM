@@ -2,6 +2,23 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Shifted descriptor-table indices on 2026-09-10
+
+Kernel `0x80001e5f00` selects a T# with `READFIRSTLANE`, `S_LSHL_B32`
+and `S_BUFFER_LOAD_DWORDX8`. The direct buffer-table resolver previously
+accepted only multiply-based offsets; its shifted-index fallback required
+another scalar buffer load to produce the index. A vector-selected index
+therefore remained unresolved.
+
+The direct resolver now also handles immediate left shifts, with the hardware
+shift mask and 32-bit wrapping arithmetic. Candidate enumeration retains the
+descriptor's bounds and the existing capacity limit. The GPU test covers
+VCC_LO/VCC_HI selection, shift amounts 5 and 37, wrapped high index bits,
+relocated tables, null descriptors and out-of-bounds reads. Existing indexed
+image, nested image and buffer-table probes pass SDK synchronization validation
+without VUID or synchronization-hazard reports. Native texture resolution
+with this correction is pending.
+
 ## Hierarchy bitset pointers on 2026-09-10
 
 With indirect dispatches restored, kernel `0x80003a0300` reaches an absolute

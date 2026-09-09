@@ -24479,11 +24479,15 @@ fn resolveBufferTablePlan(
         }
         if (!writes_offset) continue;
         if (gpu.scalar_provenance.scalarRegisterIndex(inst.dst) != offset_register) return null;
-        if (inst.opcode != .s_mul_i32 and inst.opcode != .s_mulk_i32) return null;
-        stride = switch (inst.src1.kind) {
+        if (inst.opcode != .s_mul_i32 and inst.opcode != .s_mulk_i32 and inst.opcode != .s_lshl_b32) return null;
+        const factor = switch (inst.src1.kind) {
             .integer_inline_constant, .literal_constant => inst.src1.value,
             else => return null,
         };
+        // Power-of-two descriptor tables commonly use a shift after a
+        // waterfall's READFIRSTLANE. Its 32-bit wrap has the same residue
+        // class as multiplication; the buffer still bounds every candidate.
+        stride = if (inst.opcode == .s_lshl_b32) @as(u32, 1) << @as(u5, @truncate(factor)) else factor;
         if (gpu.scalar_provenance.scalarRegisterIndex(inst.src0)) |source_register| {
             index_register = @intCast(source_register);
             index_bound = gpu.index_bounds.scalarUpperBound(instructions, &analysis.graph, index, @intCast(source_register));
