@@ -37,6 +37,9 @@ pub const Backend = struct {
     pub const VTable = struct {
         read: *const fn (?*anyopaque, u64, []u8) bool,
         write: *const fn (?*anyopaque, u64, []const u8) bool,
+        /// Synchronization values are live even when command and register
+        /// reads are served from immutable submission snapshots.
+        read_wait: ?*const fn (?*anyopaque, u64, []u8) bool = null,
         acquire: ?*const fn (?*anyopaque, gpu_state.AcquireMem) bool = null,
         release: ?*const fn (?*anyopaque, gpu_state.ReleaseMem) bool = null,
         wait: ?*const fn (?*anyopaque, gpu_state.WaitRegMem, bool) bool = null,
@@ -874,9 +877,15 @@ pub const DcbExecutor = struct {
 
         const value = if (!wait.memory_space)
             self.readTrackedRegister(@truncate(wait.address))
-        else switch (wait.width) {
-            .bits_32 => @as(u64, try self.readU32(wait.address)),
-            .bits_64 => try self.readU64(wait.address),
+        else value: {
+            var bytes: [8]u8 = undefined;
+            const size: usize = if (wait.width == .bits_32) 4 else 8;
+            const read_wait = self.backend.vtable.read_wait orelse self.backend.vtable.read;
+            if (!read_wait(self.backend.context, wait.address, bytes[0..size])) return Error.MemoryReadFailed;
+            break :value switch (wait.width) {
+                .bits_32 => @as(u64, std.mem.readInt(u32, bytes[0..4], .little)),
+                .bits_64 => std.mem.readInt(u64, &bytes, .little),
+            };
         };
         const satisfied = compareWait(value, wait.reference, wait.mask, wait.compare_function);
         self.state.last_wait = wait;

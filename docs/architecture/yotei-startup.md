@@ -2,6 +2,25 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Live labels inside retained command buffers on 2026-09-10
+
+A scheduler regression reproduces another synchronization problem: a producer
+writes a label embedded in a submitted indirect buffer, but the waiting queue
+continues reading zero from its immutable command snapshot. The previous
+implementation completes only the producer, leaving the consumer blocked.
+
+`WAIT_REG_MEM` now has a separate backend read path. The scheduler forwards
+that read to live memory while retaining the submitted commands and register
+lists. Both 32-bit and 64-bit cases resume after the real producer write and
+still execute the original command when the guest has recycled its source
+bytes. Updating the snapshot alone cannot satisfy the wait. All 28 executor
+and scheduler tests pass, including retained branches, queue ordering and
+existing guarded recovery. This does not yet remove the HLE layer's older
+forced-wait fallback for other unmet dependencies.
+The 36 focused HLE tests also pass. The default Vulkan smoke and the
+GPU-produced indirect-dispatch/GDS probe pass SDK synchronization validation
+without VUID or synchronization-hazard reports.
+
 ## Overlapping command-buffer views on 2026-09-10
 
 The first native flip reports the four-dword builder at `0x201160c0d4` as

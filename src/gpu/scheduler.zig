@@ -549,6 +549,7 @@ const SnapshotBackend = struct {
         return .{
             .read = read,
             .write = write,
+            .read_wait = readWait,
             .acquire = if (self.original.vtable.acquire != null) acquire else null,
             .release = if (self.original.vtable.release != null) release else null,
             .wait = if (self.original.vtable.wait != null) wait else null,
@@ -563,12 +564,6 @@ const SnapshotBackend = struct {
 
     fn read(context: ?*anyopaque, address: u64, bytes: []u8) bool {
         const self = from(context);
-        if (self.forced_read) |forced| {
-            if (address == forced.address and bytes.len == forced.length) {
-                @memcpy(bytes, forced.bytes[0..forced.length]);
-                return true;
-            }
-        }
         for (self.snapshots) |snapshot| {
             if (address < snapshot.address) continue;
             const source = std.mem.sliceAsBytes(snapshot.words);
@@ -594,6 +589,18 @@ const SnapshotBackend = struct {
             return true;
         }
         return self.original.vtable.read(self.original.context, address, bytes);
+    }
+
+    fn readWait(context: ?*anyopaque, address: u64, bytes: []u8) bool {
+        const self = from(context);
+        if (self.forced_read) |forced| {
+            if (address == forced.address and bytes.len == forced.length) {
+                @memcpy(bytes, forced.bytes[0..forced.length]);
+                return true;
+            }
+        }
+        const callback = self.original.vtable.read_wait orelse self.original.vtable.read;
+        return callback(self.original.context, address, bytes);
     }
 
     fn write(context: ?*anyopaque, address: u64, bytes: []const u8) bool {
@@ -765,6 +772,39 @@ test "long tail chains retain their submitted contents while the root waits" {
     try testing.expectEqual(@as(usize, 1), resumed.completed_submissions);
     try testing.expectEqualSlices(u8, &.{0x2a}, host.events[0..host.event_count]);
     try testing.expectEqual(@as(?u32, 0x1234_5678), scheduler.state(.graphics).readRegister(.context, 0x318));
+}
+
+test "synchronization labels inside retained command buffers stay live" {
+    inline for (.{ false, true }) |wide| {
+        var host = FakeBackend{};
+        const child: []const u32 = if (wide) &.{
+            command(pm4.nop, 3), 0xcafe, 0, 0,
+            customCommand(pm4.custom.wait_mem_64, 8), 0x1108, 0, 0xffff_ffff, 0xffff_ffff, 1, 1, 0x13, 1,
+            command(pm4.event_write, 1), 0x21,
+        } else &.{
+            command(pm4.nop, 3), 0xcafe, 0, 0,
+            customCommand(pm4.custom.wait_mem_32, 6), 0x1108, 0, 0xffff_ffff, 1, 0x13, 1,
+            command(pm4.event_write, 1), 0x21,
+        };
+        host.putWords(0x1100, child);
+        const graphics = [_]u32{ command(pm4.indirect_buffer, 3), 0x1100, 0, 0x0f20_0000 | @as(u32, @intCast(child.len)) };
+        const compute = [_]u32{
+            customCommand(pm4.custom.release_mem, 7), 0x28 | (5 << 8),
+            @as(u32, if (wide) 2 else 1) << 29, 0x1108, 0, 1, if (wide) 1 else 0, 0,
+        };
+        var scheduler = Scheduler.init(testing.allocator, host.interface());
+        defer scheduler.deinit();
+        _ = try scheduler.submit(.graphics, &graphics);
+        try testing.expect(scheduler.isBlocked(.graphics));
+        // Recycling command bytes cannot alter the retained event. The label
+        // inside the same allocation must still see the other queue's write.
+        host.putWords(0x1100 + (child.len - 1) * 4, &.{0x7f});
+        const released = try scheduler.submit(.compute, &compute);
+        try testing.expectEqual(@as(usize, 2), released.completed_submissions);
+        try testing.expect(!scheduler.isBlocked(.graphics));
+        try testing.expectEqualSlices(u8, &.{0x21}, host.events[0..host.event_count]);
+        try testing.expectEqual(@as(u64, if (wide) 0x1_0000_0001 else 1), std.mem.readInt(u64, host.memory[0x108..0x110], .little));
+    }
 }
 
 test "an empty indirect command buffer is read live after a producing dispatch" {
@@ -946,7 +986,7 @@ test "an impossible retained wait can be bypassed without mutating guest memory"
     try testing.expectEqualSlices(u8, &.{0x20}, host.events[0..host.event_count]);
 }
 
-test "a label inside an indirect snapshot can be updated before resume" {
+test "mirroring a snapshot alone does not publish a live synchronization label" {
     var host = FakeBackend{};
     const label_address = 0x1128;
     const child = [_]u32{
@@ -975,11 +1015,11 @@ test "a label inside an indirect snapshot can be updated before resume" {
 
     var payload: [4]u8 = undefined;
     std.mem.writeInt(u32, &payload, 1, .little);
-    try testing.expect(FakeBackend.vtable.write(&host, label_address, &payload));
-    // The retained child still has the original zero until the scheduler is
-    // told that this synchronization label, unlike PM4 itself, is mutable.
-    try testing.expect((try scheduler.pump()).blocked_checks != 0);
     try testing.expect(scheduler.mirrorActiveWrite(.graphics, label_address, &payload));
+    // Only the snapshot changed. The other queue must publish the real label
+    // before WAIT_REG_MEM can resume; command retention cannot satisfy it.
+    try testing.expect((try scheduler.pump()).blocked_checks != 0);
+    try testing.expect(FakeBackend.vtable.write(&host, label_address, &payload));
     try testing.expectEqual(@as(usize, 1), (try scheduler.pump()).completed_submissions);
     try testing.expect(!scheduler.isBlocked(.graphics));
     try testing.expectEqualSlices(u8, &.{0x20}, host.events[0..host.event_count]);
