@@ -2359,6 +2359,45 @@ fn runSceneMaskProbe(allocator: std.mem.Allocator) !void {
         try std.testing.expectEqualSlices(u8, &expected, output[lane * 16 ..][0..16]);
     }
     std.debug.print("scene masks passed: u64 equality, signed i16 CMPX, preserved VCC and masked high-half stores across 64 lanes\n", .{});
+
+    // The ray traversal stack tests v60.w1 against s52.w1. Opposite-sign
+    // low halves catch accidental dword comparisons or ignored SDWA selectors.
+    const stack_values = [_]i16{ -32768, -1, 0, 1, 211, 212, 213, 32767 };
+    for (0..64) |lane| {
+        const high: u16 = @bitCast(stack_values[(lane / 2) % stack_values.len]);
+        guest.word(0x12000 + lane * 4, (@as(u32, high) << 16) | ~high);
+    }
+    for ([_]i16{ -1, 0, 212 }) |limit| {
+        @memset(guest.bytes[0x13000..0x13400], 0xcc);
+        const high: u16 = @bitCast(limit);
+        const stack_code = [_]u32{
+            0xe030_2000, 0x8000_3c00, // load v60, indexed V#s0
+            sop1(3, 52, 255), (@as(u32, high) << 16) | ~high,
+            0x7d84_0080, // v_cmp_eq_u32 0, v0: establish VCC
+            (0x1b << 25) | (1 << 17) | 129, // v_and_b32 v1, 1, v0
+            0x7daa_0280, // v_cmpx_ne_u32 0, v1: only odd lanes
+            0x7d32_68f9, 0x8505_003c, // v_cmpx_lt_i16 v60.w1, s52.w1
+            0xe070_2000, 0x8001_3c00,
+            0xbefe_04c1, // restore EXEC
+            vop1(1, 5, 106),
+            0xe070_200c, 0x8001_0500, // both CMPX instructions preserve VCC
+            0xbf81_0000,
+        };
+        for (stack_code, 0..) |word, i| guest.word(0x200 + i * 4, word);
+        try state.writeRegister(.shader, compute.programRegisterBase(), 2);
+        for ([_]u32{ 0x12000, 4 << 16, 64, 0, 0x13000, 16 << 16, 64, 0 }, 0..) |word, i|
+            try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+        _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 1, 1, 1 });
+        try renderer.readbackGuestStorageBuffer(0x13000, &output);
+        for (0..64) |lane| {
+            var expected: [16]u8 = @splat(0xcc);
+            if (lane % 2 == 1 and stack_values[(lane / 2) % stack_values.len] < limit)
+                @memcpy(expected[0..4], guest.bytes[0x12000 + lane * 4 ..][0..4]);
+            std.mem.writeInt(u32, expected[12..16], if (lane == 0) 0xffff_ffff else 0, .little);
+            try std.testing.expectEqualSlices(u8, &expected, output[lane * 16 ..][0..16]);
+        }
+    }
+    std.debug.print("signed stack masks passed: high-word VGPR/SGPR LT, negative limits, inactive lanes and preserved VCC\n", .{});
 }
 
 fn runImageScratchProbe(allocator: std.mem.Allocator) !void {

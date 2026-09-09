@@ -8381,6 +8381,7 @@ const Builder = struct {
 
     fn nonExecCompareOpcode(opcode: isa.Opcode) ?isa.Opcode {
         return switch (opcode) {
+            .v_cmpx_lt_i16 => .v_cmp_lt_i16,
             .v_cmpx_ge_i16 => .v_cmp_ge_i16,
             .v_cmpx_class_f32 => .v_cmp_class_f32,
             .v_cmpx_f_f32 => .v_cmp_f_f32,

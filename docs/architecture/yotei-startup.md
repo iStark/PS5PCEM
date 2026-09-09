@@ -2,6 +2,19 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Signed traversal-stack comparisons on 2026-09-09
+
+The ray traversal shader at `0x8000173b00` also contains an unsupported
+`V_CMPX_LT_I16` at PC `0x15d8`, comparing `v60.w1` against `s52.w1` through
+SDWA. Decoding now preserves this signed comparison and lowers it through
+the existing EXEC-only compare path. The `--scene-masks` GPU probe uses the
+captured instruction encoding with positive/negative limits and opposite-sign
+low halves. It verifies both wave halves, inactive lanes, untouched output
+bytes and preserved VCC. The decoder test and default smoke also pass, with
+clean SDK synchronization validation. The separate BVH intersection opcode
+still requires implementation; this change alone does not execute the ray
+traversal shader or establish complete lighting.
+
 ## Runtime buffer tables on 2026-09-09
 
 The material classifier at `0x80003cb200` selects one of five V# descriptors

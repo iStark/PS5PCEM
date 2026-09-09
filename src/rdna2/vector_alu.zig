@@ -178,6 +178,7 @@ fn vopcOpcode(id: u32) isa.Opcode {
         0x94 => .v_cmpx_gt_i32,
         0x95 => .v_cmpx_ne_i32,
         0x96 => .v_cmpx_ge_i32,
+        0x99 => .v_cmpx_lt_i16,
         0x9e => .v_cmpx_ge_i16,
         0xa2 => .v_cmp_eq_i64,
         0xa9 => .v_cmp_lt_u16,
@@ -233,6 +234,7 @@ fn vopcOpcode(id: u32) isa.Opcode {
 
 fn isCompareExec(op: isa.Opcode) bool {
     return switch (op) {
+        .v_cmpx_lt_i16,
         .v_cmpx_ge_i16,
         .v_cmpx_f_f32,
         .v_cmpx_lt_f32,
@@ -1128,6 +1130,14 @@ test "scene mask comparisons decode u64 equality and signed i16 CMPX" {
     try std.testing.expectEqual(isa.OperandKind.exec_lo, signed.dst.kind);
     try std.testing.expectEqual(@as(u32, 34), signed.src0.reg);
     try std.testing.expectEqual(@as(u32, 0), signed.src1.value);
+
+    const stack_limit = try decodeVopc(0x15d8, &.{ 0x7d32_68f9, 0x8505_003c }, 0);
+    try std.testing.expectEqual(isa.Opcode.v_cmpx_lt_i16, stack_limit.opcode);
+    try std.testing.expectEqual(isa.OperandKind.exec_lo, stack_limit.dst.kind);
+    try std.testing.expectEqual(isa.OperandKind.vgpr, stack_limit.src0.kind);
+    try std.testing.expectEqual(@as(u32, 60), stack_limit.src0.reg);
+    try std.testing.expectEqual(isa.OperandKind.sgpr, stack_limit.src1.kind);
+    try std.testing.expectEqual(@as(u32, 52), stack_limit.src1.reg);
 }
 
 test "VOP3 compares retain explicit scalar mask destinations" {

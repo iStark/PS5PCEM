@@ -471,6 +471,7 @@ pub const Opcode = enum {
     v_cmp_gt_i16,
     v_cmp_ne_i16,
     v_cmp_ge_i16,
+    v_cmpx_lt_i16,
     v_cmpx_ge_i16,
     v_cmp_lt_u16,
     v_cmp_eq_u16,
