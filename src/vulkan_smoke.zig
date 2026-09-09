@@ -1811,6 +1811,60 @@ fn runImageScratchProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("image scratch passed: alternating pooled/unpooled extents, linear/RB+ padding, native updates, partial GPU writes and failed-write retry\n", .{});
 }
 
+fn runDepthStorageProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const load = [_]u32{
+        vop1(1, 0, 128), vop1(1, 1, 128),
+        0xf000_0108, 0x0000_0200, // image_load depth v2, T#s0
+        0xf000_0108, 0x0002_0300, // image_load stencil v3, T#s8
+        0xe074_0000, 0x8004_0200, // buffer_store_dwordx2 v2:v3, V#s16
+        0xbf81_0000,
+    };
+    const store = [_]u32{
+        vop1(1, 0, 128), vop1(1, 1, 128),
+        vop1(1, 2, 255), 0x3f00_0000,
+        0xf020_0108,     0x0000_0200,
+        vop1(1, 2, 255), 0x23,
+        0xf020_0108,     0x0002_0200,
+        0xbf81_0000,
+    };
+    for (load, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    for (store, 0..) |word, index| guest.word(0x400 + index * 4, word);
+    var depth = sampledImageDescriptorWords(0x1000, 32, 32);
+    depth[1] = (depth[1] & ~@as(u32, 0x1ff00000)) | (22 << 20);
+    var stencil = sampledImageDescriptorWords(0x3000, 32, 32);
+    stencil[1] = (stencil[1] & ~@as(u32, 0x1ff00000)) | (5 << 20);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 20 << 1);
+    const userdata = depth ++ stencil ++ [_]u32{ 0x8000, 8 << 16, 1, 0 };
+    for (userdata, 0..) |word, index| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+    for ([_]f32{ 0.25, 0.75 }) |value| {
+        try renderer.probeDepthStencilClear(value, 0x48);
+        for (0..2) |_| {
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+            var bytes: [8]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x8000, &bytes);
+            try std.testing.expectEqual(@as(u32, @bitCast(value)), std.mem.readInt(u32, bytes[0..4], .little));
+            try std.testing.expectEqual(@as(u32, 0x48), std.mem.readInt(u32, bytes[4..8], .little));
+        }
+        // The hand-off works with CPU depth transfer and canonical aliases off.
+        try std.testing.expect(std.mem.allEqual(u8, guest.bytes[0x1000..0x2000], 0));
+        try std.testing.expect(std.mem.allEqual(u8, guest.bytes[0x3000..0x3400], 0));
+    }
+    try state.writeRegister(.shader, compute.programRegisterBase(), 4);
+    _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+    const result = try renderer.probeDepthStencilValues();
+    try std.testing.expectEqual(@as(f32, 0.5), result.depth);
+    try std.testing.expectEqual(@as(u8, 0x23), result.stencil);
+    std.debug.print("depth storage passed: current D32/S8 reads, repeated clears and compute writes returned to the attachment\n", .{});
+}
+
 fn runStorageImageReuseProbe(allocator: std.mem.Allocator) !void {
     for ([_]usize{ 320, 1152 }) |count| try runStorageImageReuseCase(allocator, count, 1280 * 1024 * 1024);
     try runStorageImageReuseCase(allocator, 320, 64 * 4);
@@ -4455,6 +4509,10 @@ pub fn main(init: std.process.Init) !void {
         try runBufferContentCacheProbe(allocator);
         return;
     }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--depth-storage")) {
+        try runDepthStorageProbe(allocator);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--host-readback")) {
         var renderer = try vulkan.Renderer.init(allocator, .{});
         defer renderer.deinit();
@@ -4627,6 +4685,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (args.len == 1) {
+        try runDepthStorageProbe(allocator);
         try runNormalizedColorProbe(allocator);
         try runPackedFloatProbe(allocator);
         try runSdwaProbe(allocator);

@@ -2244,6 +2244,7 @@ const CachedStorageImage = struct {
     guest_content_hash: u64 = 0,
     guest_content_hash_valid: bool = false,
     guest_page_generation: u64 = 0,
+    depth_snapshot: ?struct { image: vk.Image, generation: u64 } = null,
     gpu_dirty: bool = false,
     // Every prepared binding owns one pin until its submission retires.
     pin_count: usize = 0,
@@ -13024,6 +13025,46 @@ pub const Renderer = struct {
         return self.readDepthProbeValues(index, false);
     }
 
+    pub fn probeDepthStencilClear(self: *Renderer, value: f32, stencil: u8) anyerror!void {
+        const target = GuestDepthTarget{
+            .address = 0x1000,
+            .allocation_bytes = 4096,
+            .stencil_address = 0x3000,
+            .stencil_allocation_bytes = 1024,
+            .width = 32,
+            .height = 32,
+            .guest_format = 3,
+            .format = vk.format_d32_sfloat_s8_uint,
+            .has_stencil = true,
+            .tile_mode = .linear,
+            .base_array_slice = 0,
+            .mip_level = 0,
+            .clear_depth = value,
+            .clear_stencil = stencil,
+        };
+        const index = try self.acquireDepthTarget(target);
+        const cached = self.depth_targets.items[index];
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        const range = vk.ImageSubresourceRange{ .aspect_mask = target.aspectMask() };
+        try self.transitionTrackedImage(command_buffer, cached.image.handle, range, image_state.transfer_destination_usage);
+        const clear = vk.ClearDepthStencilValue{ .depth = value, .stencil = stencil };
+        self.device_functions.cmd_clear_depth_stencil_image(command_buffer, cached.image.handle, vk.image_layout_transfer_dst_optimal, &clear, 1, @ptrCast(&range));
+        try self.transitionTrackedImage(command_buffer, cached.image.handle, range, image_state.depth_attachment_usage);
+        try self.submitOneShot(command_buffer);
+        self.depth_targets.items[index].initialized = true;
+        self.depth_targets.items[index].shader_read_layout = false;
+        self.depth_targets.items[index].gpu_generation +%= 1;
+    }
+
+    pub fn probeDepthStencilValues(self: *Renderer) anyerror!struct { depth: f32, stencil: u8 } {
+        for (self.depth_targets.items, 0..) |cached, index| {
+            if (cached.target.address != 0x1000 or !cached.target.has_stencil) continue;
+            return .{ .depth = (try self.readDepthProbeValues(index, false))[0], .stencil = (try self.readDepthProbeValues(index, true))[0] };
+        }
+        return error.MissingDepthProbe;
+    }
+
     fn readDepthProbeValues(self: *Renderer, index: usize, comptime stencil: bool) anyerror![2]if (stencil) u8 else f32 {
         const Value = if (stencil) u8 else f32;
         const aspect = if (stencil) vk.image_aspect_stencil_bit else vk.image_aspect_depth_bit;
@@ -16469,6 +16510,104 @@ pub const Renderer = struct {
         descriptor_index: u32,
         writable: bool,
     ) anyerror!PreparedStorageImage {
+        const prepared = try self.stageStorageImageRaw(descriptor, descriptor_index, writable);
+        errdefer if (prepared.cache_index) |index| self.releaseStorageImage(index);
+        if (prepared.cache_index) |index| try self.refreshStorageDepthSnapshot(index);
+        return prepared;
+    }
+
+    const StorageDepthSource = struct { index: usize, aspect: u32 };
+
+    fn storageDepthSource(self: *const Renderer, descriptor: gpu.ImageDescriptor) ?StorageDepthSource {
+        if (descriptor.image_type != .color_2d or descriptor.samplesLog2() != 0 or
+            descriptor.base_array != 0 or descriptor.depth_or_layers > 1 or
+            descriptor.viewBaseLevel() != 0 or descriptor.viewMipLevels() != 1) return null;
+        const format = storageImageFormat(descriptor.unified_format) orelse return null;
+        var selected: ?StorageDepthSource = null;
+        for (self.depth_targets.items, 0..) |cached, index| {
+            const target = cached.target;
+            if (!cached.initialized or target.samples_log2 != 0 or
+                target.width != descriptor.width or target.height != descriptor.height) continue;
+            const aspect: u32 = if (target.address == descriptor.address and
+                (target.format == vk.format_d32_sfloat or target.format == vk.format_d32_sfloat_s8_uint) and
+                format.vulkan == vk.format_r32_sfloat)
+                vk.image_aspect_depth_bit
+            else if (target.has_stencil and target.stencil_address == descriptor.address and
+                format.vulkan == vk.format_r8_uint)
+                vk.image_aspect_stencil_bit
+            else
+                continue;
+            if (selected == null or cached.last_used_sequence > self.depth_targets.items[selected.?.index].last_used_sequence)
+                selected = .{ .index = index, .aspect = aspect };
+        }
+        return selected;
+    }
+
+    // Depth/stencil images cannot have STORAGE usage. Preserve their exact
+    // D32/S8 payload through a GPU buffer when IMAGE_LOAD/STORE uses a color
+    // view of the same plane, including when CPU depth transfers are disabled.
+    fn transferStorageDepth(self: *Renderer, index: usize, source: StorageDepthSource, to_depth: bool) anyerror!void {
+        const storage = self.storage_image_cache.items[index];
+        const depth = self.depth_targets.items[source.index];
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        try self.transitionTrackedImage(command_buffer, depth.image.handle, .{ .aspect_mask = depth.target.aspectMask() }, if (to_depth) image_state.transfer_destination_usage else image_state.transfer_source_usage);
+        try self.transitionTrackedImage(command_buffer, storage.image.handle, .{ .aspect_mask = vk.image_aspect_color_bit }, if (to_depth) image_state.transfer_source_usage else image_state.transfer_destination_usage);
+        var barrier = vk.BufferMemoryBarrier{
+            .source_access_mask = vk.access_transfer_read_bit | vk.access_transfer_write_bit,
+            .destination_access_mask = vk.access_transfer_write_bit,
+            .buffer = storage.transfer.handle,
+            .offset = 0,
+            .size = storage.transfer.size,
+        };
+        self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
+        var copy = vk.BufferImageCopy{
+            .image_subresource = .{ .aspect_mask = if (to_depth) vk.image_aspect_color_bit else source.aspect },
+            .image_extent = .{ .width = depth.target.width, .height = depth.target.height, .depth = 1 },
+        };
+        self.device_functions.cmd_copy_image_to_buffer(command_buffer, if (to_depth) storage.image.handle else depth.image.handle, vk.image_layout_transfer_src_optimal, storage.transfer.handle, 1, @ptrCast(&copy));
+        barrier.source_access_mask = vk.access_transfer_write_bit;
+        barrier.destination_access_mask = vk.access_transfer_read_bit;
+        self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
+        copy.image_subresource.aspect_mask = if (to_depth) source.aspect else vk.image_aspect_color_bit;
+        self.device_functions.cmd_copy_buffer_to_image(command_buffer, storage.transfer.handle, if (to_depth) depth.image.handle else storage.image.handle, vk.image_layout_transfer_dst_optimal, 1, @ptrCast(&copy));
+        try self.transitionTrackedImage(command_buffer, depth.image.handle, .{ .aspect_mask = depth.target.aspectMask() }, image_state.depth_attachment_usage);
+        try self.transitionTrackedImage(command_buffer, storage.image.handle, .{ .aspect_mask = vk.image_aspect_color_bit }, image_state.storage_usage);
+        try self.submitOneShot(command_buffer);
+        const resident = &self.depth_targets.items[source.index];
+        resident.shader_read_layout = false;
+        if (to_depth) {
+            resident.gpu_generation +%= 1;
+            _ = self.image_aliases.markWrite(if (source.aspect == vk.image_aspect_stencil_bit)
+                resident.stencil_alias_token orelse resident.alias_token
+            else
+                resident.alias_token);
+        }
+        const cached = &self.storage_image_cache.items[index];
+        cached.depth_snapshot = .{ .image = resident.image.handle, .generation = resident.gpu_generation };
+        cached.guest_content_hash_valid = false;
+        cached.guest_page_generation = 0;
+        // The guest allocation remains stale until an explicit CPU consumer.
+        // Keep the snapshot eligible for normal lazy storage writeback.
+        cached.gpu_dirty = true;
+    }
+
+    fn refreshStorageDepthSnapshot(self: *Renderer, index: usize) anyerror!void {
+        const cached = self.storage_image_cache.items[index];
+        const source = self.storageDepthSource(cached.descriptor) orelse return;
+        const depth = self.depth_targets.items[source.index];
+        if (cached.depth_snapshot) |snapshot| {
+            if (snapshot.image == depth.image.handle and snapshot.generation == depth.gpu_generation) return;
+        }
+        try self.transferStorageDepth(index, source, false);
+    }
+
+    fn stageStorageImageRaw(
+        self: *Renderer,
+        descriptor: gpu.ImageDescriptor,
+        descriptor_index: u32,
+        writable: bool,
+    ) anyerror!PreparedStorageImage {
         const is_3d = descriptor.image_type == .color_3d;
         const texture = gpu.TextureLayout.fromImage(descriptor) catch return Error.UnsupportedStorageImage;
         // The descriptor's depth_or_layers is the resource upper layer count,
@@ -16616,7 +16755,9 @@ pub const Renderer = struct {
             // hundreds of MiB of CPU work per frame. Each binding pins the
             // object independently, so retiring an older batch cannot make
             // a resource held by the current pass eligible for eviction.
-            if (cached.pin_count != 0 or cached.gpu_dirty) {
+            if (cached.pin_count != 0 or cached.gpu_dirty or
+                (cached.depth_snapshot != null and self.storageDepthSource(descriptor) != null))
+            {
                 const resident = &self.storage_image_cache.items[index];
                 resident.pin_count += 1;
                 resident.last_used_sequence = self.storage_image_sequence;
@@ -16709,6 +16850,7 @@ pub const Renderer = struct {
             cached.pin_count += 1;
             errdefer self.releaseStorageImage(index);
             try self.uploadCachedStorageImage(index, linear, false);
+            cached.depth_snapshot = null;
             cached.guest_content_hash = guest_content_hash;
             cached.guest_content_hash_valid = true;
             cached.guest_page_generation = guest_page_generation;
@@ -16878,6 +17020,10 @@ pub const Renderer = struct {
             if (!cached.valid) return Error.UnsupportedStorageImage;
             cached.gpu_dirty = true;
             _ = self.image_aliases.markWrite(cached.alias_token);
+            if (cached.depth_snapshot != null) {
+                if (self.storageDepthSource(cached.descriptor)) |source|
+                    try self.transferStorageDepth(cache_index, source, true);
+            }
             if (self.traceCurrentGraphicsFrame()) {
                 try self.flushCachedStorageImage(memory, cache_index);
             }
@@ -17004,6 +17150,7 @@ pub const Renderer = struct {
             best_sequence = cached.last_used_sequence;
         }
         if (best_index) |index| {
+            try self.refreshStorageDepthSnapshot(index);
             const cached = &self.storage_image_cache.items[index];
             // A resident producer keeps GENERAL layout, but a layout match
             // does not remove the dependency from a preceding shader write.

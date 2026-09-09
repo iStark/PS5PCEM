@@ -2,6 +2,32 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Depth/stencil storage hand-off on 2026-09-09
+
+The vertex-entry correction restores colored bark in the live material target.
+All three bonuses and the full brightness screen remain visible, followed by
+difficulty selection. The final scene still has a black trunk. A capture of
+`0x8000243500` confirms that the silhouette is already black in its HDR output,
+before temporal reconstruction or display composition.
+
+Storage-image preparation previously recognized resident color attachments but
+not depth/stencil attachments. With the default CPU depth transfers disabled,
+`IMAGE_LOAD` could read an old zero-filled color copy of a newly rasterized D32
+or S8 plane. Sampled-image preparation could then reuse that stale copy too.
+
+Exact single-sample D32/R32_FLOAT and S8/R8_UINT views now exchange their payload
+with the resident attachment through ordered GPU buffer copies. A snapshot
+tracks the source image and write generation, is refreshed after a later depth
+write, and stays resident across repeated consumers. Compute stores return to
+the corresponding attachment aspect before subsequent rasterization. Guest
+writeback remains deferred until an explicit CPU consumer.
+
+The `--depth-storage` regression reads both planes twice across two clears,
+checks that guest allocations remain untouched, and verifies compute writes
+through attachment readback. Without the new hand-off it reads zero instead of
+depth 0.25. The corrected path and full default smoke pass SDK synchronization
+validation. Full live scene verification with this correction is pending.
+
 ## Vertex entry registers and attribute recovery on 2026-09-09
 
 Comparing the material traces before and after graphics scalar retention
