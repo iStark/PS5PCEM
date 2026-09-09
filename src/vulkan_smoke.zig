@@ -1862,6 +1862,7 @@ fn runDepthStorageProbe(allocator: std.mem.Allocator) !void {
     const result = try renderer.probeDepthStencilValues();
     try std.testing.expectEqual(@as(f32, 0.5), result.depth);
     try std.testing.expectEqual(@as(u8, 0x23), result.stencil);
+    try renderer.probeIndependentDepthStencilPlanes();
     std.debug.print("depth storage passed: current D32/S8 reads, repeated clears and compute writes returned to the attachment\n", .{});
 }
 

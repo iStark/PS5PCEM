@@ -2,6 +2,26 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Independent depth/stencil attachment planes on 2026-09-09
+
+The live depth-storage build preserves the movie, loading spinner and first
+bonus notice. Its cache confirms two 3328x1872 attachments sharing D32 address
+`0x5002870000` with different S8 addresses, `0x5004850000` and `0x505f350000`.
+Previously, changing that pairing selected an independent Vulkan image and
+lost the current contents of the shared plane.
+
+Attachment acquisition now inherits each shared plane from the most recently
+used compatible resident attachment. A new packed image initializes its other
+plane separately; existing unrelated depth/stencil contents remain intact.
+Copies stay on the GPU and require matching format, extent, samples and guest
+subresource. Storage snapshots observe the resulting generation change.
+
+The depth-storage GPU probe now also alternates three depth/stencil pairings,
+changes each plane independently and checks both new and reused attachments.
+With inheritance disabled it reads zero instead of depth 0.25. The corrected
+probe and full default smoke pass SDK synchronization validation without
+validation errors. Complete live scene verification remains pending.
+
 ## Depth/stencil storage hand-off on 2026-09-09
 
 The vertex-entry correction restores colored bark in the live material target.

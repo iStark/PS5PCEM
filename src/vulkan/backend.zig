@@ -11190,6 +11190,63 @@ pub const Renderer = struct {
         self.frame_profile.target_readback_bytes +|= plan.total_bytes;
     }
 
+    // Guest depth and stencil allocations are independent, while Vulkan packs
+    // them into one attachment. Rebinding either plane must retain the latest
+    // contents of the other plane, even when CPU depth transfers are disabled.
+    fn inheritDepthPlanes(self: *Renderer, index: usize) anyerror!bool {
+        const destination = self.depth_targets.items[index];
+        const target = destination.target;
+        var sources: [2]?usize = .{ null, null };
+        for (self.depth_targets.items, 0..) |candidate, candidate_index| {
+            if (candidate_index == index or !candidate.initialized or
+                candidate.last_used_sequence <= destination.last_used_sequence) continue;
+            const other = candidate.target;
+            if (other.format != target.format or other.width != target.width or
+                other.height != target.height or other.samples_log2 != target.samples_log2 or
+                other.base_array_slice != target.base_array_slice or other.mip_level != target.mip_level) continue;
+            const shared = [2]bool{
+                target.guest_format != 0 and target.address != 0 and target.address == other.address,
+                target.has_stencil and target.stencil_address != 0 and target.stencil_address == other.stencil_address,
+            };
+            for (shared, 0..) |matches, plane| {
+                if (matches and (sources[plane] == null or candidate.last_used_sequence >
+                    self.depth_targets.items[sources[plane].?].last_used_sequence)) sources[plane] = candidate_index;
+            }
+        }
+        if (sources[0] == null and sources[1] == null) return false;
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        const range = vk.ImageSubresourceRange{ .aspect_mask = target.aspectMask() };
+        try self.transitionTrackedImage(command_buffer, destination.image.handle, range, image_state.transfer_destination_usage);
+        if (!destination.initialized) {
+            const clear = vk.ClearDepthStencilValue{ .depth = target.clear_depth, .stencil = target.clear_stencil };
+            self.device_functions.cmd_clear_depth_stencil_image(command_buffer, destination.image.handle, vk.image_layout_transfer_dst_optimal, &clear, 1, @ptrCast(&range));
+            // Order the initialization before overwriting the inherited plane.
+            try self.transitionTrackedImage(command_buffer, destination.image.handle, range, image_state.transfer_destination_usage);
+        }
+        for (sources, 0..) |source_index, plane| {
+            const source = self.depth_targets.items[source_index orelse continue];
+            const source_range = vk.ImageSubresourceRange{ .aspect_mask = source.target.aspectMask() };
+            try self.transitionTrackedImage(command_buffer, source.image.handle, source_range, image_state.transfer_source_usage);
+            const aspect: u32 = if (plane == 0) vk.image_aspect_depth_bit else vk.image_aspect_stencil_bit;
+            const copy = vk.ImageCopy{
+                .source_subresource = .{ .aspect_mask = aspect },
+                .destination_subresource = .{ .aspect_mask = aspect },
+                .extent = .{ .width = target.width, .height = target.height, .depth = 1 },
+            };
+            self.device_functions.cmd_copy_image(command_buffer, source.image.handle, vk.image_layout_transfer_src_optimal, destination.image.handle, vk.image_layout_transfer_dst_optimal, 1, @ptrCast(&copy));
+            try self.transitionTrackedImage(command_buffer, source.image.handle, source_range, image_state.depth_attachment_usage);
+            self.depth_targets.items[source_index.?].shader_read_layout = false;
+        }
+        try self.transitionTrackedImage(command_buffer, destination.image.handle, range, image_state.depth_attachment_usage);
+        try self.submitOneShot(command_buffer);
+        const cached = &self.depth_targets.items[index];
+        cached.initialized = true;
+        cached.shader_read_layout = false;
+        cached.gpu_generation +%= 1;
+        return true;
+    }
+
     fn acquireDepthTarget(self: *Renderer, target: GuestDepthTarget) anyerror!usize {
         for (self.depth_targets.items, 0..) |cached_snapshot, index| {
             if (!cached_snapshot.target.sameAllocation(target)) continue;
@@ -11199,21 +11256,22 @@ pub const Renderer = struct {
             cached.target.clear_depth = target.clear_depth;
             cached.target.clear_stencil = target.clear_stencil;
             cached.target.descriptor = target.descriptor;
+            _ = try self.inheritDepthPlanes(index);
             self.depth_target_sequence +%= 1;
             cached.last_used_sequence = self.depth_target_sequence;
             return index;
         }
 
         const create_started = hostTimestampNs();
-        var cached = try self.createCachedDepthTarget(target);
+        const cached = try self.createCachedDepthTarget(target);
         self.frame_profile.depth_target_create_ns +|= elapsedHostNanoseconds(create_started);
-        self.depth_target_sequence +%= 1;
-        cached.last_used_sequence = self.depth_target_sequence;
         if (self.depth_targets.items.len < maximum_depth_targets) {
             try self.depth_targets.append(self.allocator, cached);
             const index = self.depth_targets.items.len - 1;
-            if (!try self.initializeDepthFromUniformHtile(index) and self.depth_transfer_enabled)
+            if (!try self.inheritDepthPlanes(index) and !try self.initializeDepthFromUniformHtile(index) and self.depth_transfer_enabled)
                 _ = try self.importDepthTarget(index);
+            self.depth_target_sequence +%= 1;
+            self.depth_targets.items[index].last_used_sequence = self.depth_target_sequence;
             if (!self.reported_depth_attachment) {
                 self.reported_depth_attachment = true;
                 std.debug.print(
@@ -11238,8 +11296,10 @@ pub const Renderer = struct {
         self.invalidateDepthPasses(victim.view);
         self.destroyCachedDepthTarget(victim.*);
         victim.* = cached;
-        if (!try self.initializeDepthFromUniformHtile(oldest_index) and self.depth_transfer_enabled)
+        if (!try self.inheritDepthPlanes(oldest_index) and !try self.initializeDepthFromUniformHtile(oldest_index) and self.depth_transfer_enabled)
             _ = try self.importDepthTarget(oldest_index);
+        self.depth_target_sequence +%= 1;
+        self.depth_targets.items[oldest_index].last_used_sequence = self.depth_target_sequence;
         return oldest_index;
     }
 
@@ -13042,19 +13102,57 @@ pub const Renderer = struct {
             .clear_depth = value,
             .clear_stencil = stencil,
         };
+        try self.clearDepthProbeTarget(target);
+    }
+
+    fn clearDepthProbeTarget(self: *Renderer, target: GuestDepthTarget) anyerror!void {
         const index = try self.acquireDepthTarget(target);
         const cached = self.depth_targets.items[index];
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
         const range = vk.ImageSubresourceRange{ .aspect_mask = target.aspectMask() };
         try self.transitionTrackedImage(command_buffer, cached.image.handle, range, image_state.transfer_destination_usage);
-        const clear = vk.ClearDepthStencilValue{ .depth = value, .stencil = stencil };
+        const clear = vk.ClearDepthStencilValue{ .depth = target.clear_depth, .stencil = target.clear_stencil };
         self.device_functions.cmd_clear_depth_stencil_image(command_buffer, cached.image.handle, vk.image_layout_transfer_dst_optimal, &clear, 1, @ptrCast(&range));
         try self.transitionTrackedImage(command_buffer, cached.image.handle, range, image_state.depth_attachment_usage);
         try self.submitOneShot(command_buffer);
         self.depth_targets.items[index].initialized = true;
         self.depth_targets.items[index].shader_read_layout = false;
         self.depth_targets.items[index].gpu_generation +%= 1;
+    }
+
+    pub fn probeIndependentDepthStencilPlanes(self: *Renderer) anyerror!void {
+        try self.probeDepthStencilClear(0.25, 0x48);
+        const original = self.depth_targets.items[0].target;
+        var alternate_stencil = original;
+        alternate_stencil.stencil_address = 0x4000;
+        alternate_stencil.clear_depth = 1;
+        alternate_stencil.clear_stencil = 0;
+        const second = try self.acquireDepthTarget(alternate_stencil);
+        try std.testing.expectEqual(@as(f32, 0.25), (try self.readDepthProbeValues(second, false))[0]);
+        try std.testing.expectEqual(@as(u8, 0), (try self.readDepthProbeValues(second, true))[0]);
+        alternate_stencil.clear_depth = 0.75;
+        alternate_stencil.clear_stencil = 0x23;
+        try self.clearDepthProbeTarget(alternate_stencil);
+        const first = try self.acquireDepthTarget(original);
+        try std.testing.expectEqual(@as(f32, 0.75), (try self.readDepthProbeValues(first, false))[0]);
+        try std.testing.expectEqual(@as(u8, 0x48), (try self.readDepthProbeValues(first, true))[0]);
+        var alternate_depth = original;
+        alternate_depth.address = 0x5000;
+        alternate_depth.clear_depth = 1;
+        alternate_depth.clear_stencil = 0;
+        const third = try self.acquireDepthTarget(alternate_depth);
+        try std.testing.expectEqual(@as(f32, 1), (try self.readDepthProbeValues(third, false))[0]);
+        try std.testing.expectEqual(@as(u8, 0x48), (try self.readDepthProbeValues(third, true))[0]);
+        alternate_depth.clear_depth = 0.5;
+        alternate_depth.clear_stencil = 0x12;
+        try self.clearDepthProbeTarget(alternate_depth);
+        _ = try self.acquireDepthTarget(original);
+        try std.testing.expectEqual(@as(f32, 0.75), (try self.readDepthProbeValues(first, false))[0]);
+        try std.testing.expectEqual(@as(u8, 0x12), (try self.readDepthProbeValues(first, true))[0]);
+        _ = try self.acquireDepthTarget(alternate_stencil);
+        try std.testing.expectEqual(@as(f32, 0.75), (try self.readDepthProbeValues(second, false))[0]);
+        try std.testing.expectEqual(@as(u8, 0x23), (try self.readDepthProbeValues(second, true))[0]);
     }
 
     pub fn probeDepthStencilValues(self: *Renderer) anyerror!struct { depth: f32, stencil: u8 } {
