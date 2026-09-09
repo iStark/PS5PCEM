@@ -87,8 +87,25 @@ The new `--packed-floats` GPU probe has 13 numeric cases, also included in
 the default smoke. An isolated build with the preceding translator fails
 the first case (`0xc4803200` instead of `0x40d00000`, or 6.5). The corrected
 translator passes every case and the full Vulkan smoke under SDK
-synchronization validation. Live composition with these arithmetic fixes
-is still being checked.
+synchronization validation. The live run preserves all three bonus notices,
+brightness and difficulty selection. Frame 1172 contains nonzero temporal
+upscale and HDR resolve output, but compositor `0x80003b7100` still exports
+black RGB before the interface is drawn.
+
+The compositor exposes a separate scalar-lifetime bug: graphics resource
+preparation deletes every scalar seed in a T#, S# or V# register range.
+The shader later reuses those ranges for color matrices, viewport limits and
+other arithmetic. Losing even part of a recovered wide load makes translation
+fall back to zero for the entire load. Graphics preparation now retains each
+load with its producer PC, including initial user data. Dynamic scalar uploads
+already exclude the values from translation cache keys, so changing guest
+addresses does not require deleting these register lifetimes.
+
+A GPU regression samples a texture and reads a buffer, then reuses all three
+descriptor register ranges for color parameters. Two draws return the expected
+RGBA values `{32,127,191,255}` and `{96,127,191,255}` with no additional pipeline
+miss on the second draw. The full Vulkan smoke passes SDK synchronization
+validation. Complete live menu composition with this fix is still pending.
 
 ## Driver pipeline cache and buffer-wait experiment on 2026-09-09
 

@@ -13814,24 +13814,11 @@ pub const Renderer = struct {
             &fragment_scalar_regs,
             fragment_scalar_count,
         );
-        // T#/S# descriptor payloads select host descriptor-array elements;
-        // they are not shader constants. Specializing their changing guest
-        // addresses creates a new Vulkan pipeline for every streamed texture.
-        for (graphics_resources.mappings[0..fragment_mapping_count]) |mapping| {
-            if (mapping.candidate_words != null) continue;
-            fragment_scalar_count = removeScalarRegisterRange(
-                &fragment_scalar_regs,
-                fragment_scalar_count,
-                mapping.resource_sgpr,
-                8,
-            );
-            fragment_scalar_count = removeScalarRegisterRange(
-                &fragment_scalar_regs,
-                fragment_scalar_count,
-                mapping.sampler_sgpr,
-                4,
-            );
-        }
+        // Keep each recovered load at its producer PC. Shaders reuse T#/S#
+        // registers for color matrices and other arithmetic later in the same
+        // program; deleting a descriptor's entire SGPR range loses those loads.
+        // Dynamic scalar uploads keep changing addresses out of the pipeline
+        // cache key without discarding any register lifetime.
 
         // Attribute / constant buffer MUBUF in the vertex program needs the
         // same storage-descriptor array as compute. Missing V#s are non-fatal:
@@ -13856,20 +13843,8 @@ pub const Renderer = struct {
         self.frame_profile.graphics_storage_ns +|= elapsedHostNanoseconds(vertex_storage_started);
         defer vertex_storage.deinit(self);
         validateVertexIndexMappings(reader, vertex_storage, draw);
-        // V# payloads are runtime descriptor data, not shader constants.  The
-        // resource preparation above has already decoded them and assigned
-        // stable host descriptor slots.  Leaving their guest addresses in the
-        // scalar specialization bakes each streamed vertex buffer into SPIR-V,
-        // so sprite-heavy games build a fresh Vulkan pipeline for nearly every
-        // draw and again every frame.
-        for (vertex_storage.mappings[0..vertex_storage.mapping_count]) |mapping| {
-            vertex_scalar_count = removeScalarRegisterRange(
-                &vertex_scalar_regs,
-                vertex_scalar_count,
-                mapping.resource_sgpr,
-                4,
-            );
-        }
+        // Vertex V# registers also carry constants in other lifetimes. Their
+        // recovered loads use the same dynamic scalar path as fragment loads.
         // Detect only the decoder's tightly constrained NV12/I420 layouts so
         // their padded allocation width can be handled without affecting
         // ordinary sampled draws.
@@ -14291,14 +14266,6 @@ pub const Renderer = struct {
             fragment_scalar_count = ensureIdentityFragmentScale(
                 &fragment_scalar_regs,
                 fragment_scalar_count,
-            );
-        }
-        for (fragment_storage.mappings[0..fragment_storage.mapping_count]) |mapping| {
-            fragment_scalar_count = removeScalarRegisterRange(
-                &fragment_scalar_regs,
-                fragment_scalar_count,
-                mapping.resource_sgpr,
-                4,
             );
         }
         if (!self.reported_fragment_storage_bindings) {
@@ -22126,22 +22093,6 @@ fn mergeUserDataScalars(
         n += 1;
     }
     return n;
-}
-
-fn removeScalarRegisterRange(
-    registers: []gpu.ShaderSpirvScalarRegister,
-    count: usize,
-    first: u32,
-    width: u32,
-) usize {
-    const end = @min(first +| width, 128);
-    var write: usize = 0;
-    for (registers[0..count]) |entry| {
-        if (entry.register >= first and entry.register < end) continue;
-        registers[write] = entry;
-        write += 1;
-    }
-    return write;
 }
 
 fn countNonzeroRgba(linear: []const u8) u32 {

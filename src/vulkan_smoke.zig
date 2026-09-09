@@ -511,6 +511,80 @@ fn runCompressedArrayCopyKernel(allocator: std.mem.Allocator, renderer: *vulkan.
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, guest.bytes[destination..][0..4]);
 }
 
+fn multiplyScalar(destination: u8, scalar: u8, vector: u8) u32 {
+    return (8 << 25) | (@as(u32, destination) << 17) |
+        (@as(u32, vector) << 9) | @as(u32, scalar);
+}
+
+fn runFragmentScalarReuseProbe(
+    allocator: std.mem.Allocator,
+    renderer: *vulkan.Renderer,
+    guest: *GuestMemory,
+    backend: gpu.DcbBackend,
+    state: *gpu.State,
+    color_address: usize,
+) !void {
+    const program = 0xc000;
+    const table = 0xc400;
+    const source = 0xc800;
+    const buffer = 0xc700;
+    guest.word(source, 0xffff_ffff);
+    guest.word(buffer, 0x3f00_0000);
+    for (sampledImageDescriptorWords(source, 1, 1), 0..) |word, index| guest.word(table + index * 4, word);
+    for (0..4) |index| guest.word(table + 32 + index * 4, 0);
+    for ([_]u32{ buffer, 4 << 16, 1, 0 }, 0..) |word, index| guest.word(table + 96 + index * 4, word);
+    for (0..8) |index| guest.word(table + 48 + index * 4, 0x3f80_0000);
+    for (0..4) |index| {
+        guest.word(table + 80 + index * 4, 0x3f80_0000);
+        guest.word(table + 112 + index * 4, 0x3f80_0000);
+    }
+    guest.word(table + 52, 0x3f00_0000);
+    guest.word(table + 56, 0x3f40_0000);
+    const code = [_]u32{
+        0xf40c_0200, 125 << 25, // T# s8:s15
+        0xf408_0400, (125 << 25) | 32, // S# s16:s19
+        0xf408_0600,     (125 << 25) | 96, // V# s24:s27
+        vop1(1, 0, 240), vop1(1, 1, 240),
+        0xf09c_0f08, 0x0082_0400, // sample white into v4:v7
+        0xe030_0000, 0x8006_0800, // load multiplier v8 from V#s24
+        0xf40c_0200, (125 << 25) | 48, // same T# registers now hold color constants
+        0xf408_0400, (125 << 25) | 80, // same S# registers now hold scale
+        0xf408_0600,              (125 << 25) | 112, // same V# registers now hold scale
+        0xbf8c_007f,              multiplyScalar(4, 8, 4),
+        multiplyScalar(5, 9, 5),  multiplyScalar(6, 10, 6),
+        multiplyScalar(7, 11, 7), multiplyScalar(4, 16, 4),
+        multiplyScalar(5, 17, 5), multiplyScalar(6, 18, 6),
+        multiplyScalar(7, 19, 7), multiplyScalar(4, 24, 4),
+        multiplyScalar(5, 25, 5), multiplyScalar(6, 26, 6),
+        multiplyScalar(7, 27, 7),
+        vop2(8, 4, 4, 8), // red also consumes the real buffer load
+        0xf800_080f,
+        0x0706_0504,
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, index| guest.word(program + index * 4, word);
+    const pixel = gpu.resources.ShaderStage.pixel;
+    try state.writeRegister(.shader, pixel.programRegisterBase(), program >> 8);
+    try state.writeRegister(.shader, pixel.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, pixel.userDataBase() - 1, 2 << 1);
+    try state.writeRegister(.shader, pixel.userDataBase(), table);
+    try state.writeRegister(.shader, pixel.userDataBase() + 1, 0);
+    var executor = gpu.DcbExecutor{ .state = state, .backend = backend, .allocator = allocator };
+    var first_misses: u64 = 0;
+    for ([_]u32{ 0x3e80_0000, 0x3f40_0000 }, 0..) |red, iteration| {
+        guest.word(table + 48, red);
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+        if (renderer.last_draw_error != null) return error.FragmentScalarReuseRejected;
+        try renderer.flushPendingGuestWrites();
+        const result = guest.bytes[color_address + (32 * 64 + 32) * 4 ..][0..4];
+        const expected: [4]u8 = .{ if (iteration == 0) 32 else 96, 128, 191, 255 };
+        std.debug.print("fragment reused scalar registers: {any}\n", .{result});
+        for (result, expected) |actual, wanted| try std.testing.expect(@abs(@as(i32, actual) - @as(i32, wanted)) <= 1);
+        if (iteration == 0) first_misses = renderer.graphics_pipeline_cache_misses else try std.testing.expectEqual(first_misses, renderer.graphics_pipeline_cache_misses);
+    }
+    std.debug.print("fragment scalar reuse passed: T#/S#/V# lifetimes, dynamic colors and stable pipeline\n", .{});
+}
+
 fn runFragmentStorageProbe(
     allocator: std.mem.Allocator,
     renderer: *vulkan.Renderer,
@@ -4864,6 +4938,7 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidPresentedFrame;
     }
 
+    try runFragmentScalarReuseProbe(allocator, &renderer, &guest, backend, &state, color_target_address);
     try runFragmentStorageProbe(allocator, &renderer, &guest, backend, &state, color_target_address);
     try runIndexedCopyKernel(allocator, &renderer, &guest, backend);
     try runStorageImageCopyKernel(allocator, &renderer, &guest, backend);
