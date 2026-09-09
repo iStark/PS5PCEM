@@ -335,8 +335,7 @@ fn decodeImpl(
     errdefer code.deinit(allocator);
     var instructions: std.ArrayList(rdna2.Instruction) = .empty;
     errdefer instructions.deinit(allocator);
-    var branch_targets: std.AutoHashMapUnmanaged(u32, void) = .empty;
-    defer branch_targets.deinit(allocator);
+    var furthest_branch_target: u32 = 0;
 
     var word_index: u32 = 0;
     while (instructions.items.len < instruction_limit) {
@@ -359,8 +358,10 @@ fn decodeImpl(
         };
         try instructions.append(allocator, inst);
         word_index += inst.word_count;
-        if (inst.opcode.isBranch()) try branch_targets.put(allocator, inst.branch_target, {});
-        if (inst.opcode.isProgramEnd() and !branch_targets.contains(word_index * 4)) break;
+        if (inst.opcode.isBranch()) furthest_branch_target = @max(furthest_branch_target, inst.branch_target);
+        // An earlier path can jump beyond this return and intervening padding.
+        // Decode through every referenced forward target before ending the body.
+        if (inst.opcode.isProgramEnd() and furthest_branch_target < word_index * 4) break;
     } else {
         std.debug.print(
             "[gpu shader] instruction limit program=0x{x} instructions={d} words={d} pc=0x{x} first=0x{x:0>8} last=0x{x:0>8}\n",
@@ -376,8 +377,9 @@ fn decodeImpl(
         return Error.InstructionLimitExceeded;
     }
 
-    var program = rdna2.Program{ .code = code.items, .instructions = instructions };
-    errdefer program.deinit(allocator);
+    const program = rdna2.Program{ .code = code.items, .instructions = instructions };
+    // `instructions` owns this allocation until Analysis is returned. Keeping
+    // a second error cleanup on Program double-frees it when CFG creation fails.
     var graph = try rdna2.buildControlFlow(allocator, &program);
     errdefer graph.deinit(allocator);
     const module = try rdna2.lowerIrWithOptions(allocator, &program, pipeline_options);
@@ -482,6 +484,29 @@ test "analysis identifies a global buffer store as externally visible" {
     try std.testing.expect(analysis.hasExternalEffects());
     try std.testing.expect(analysis.hasBufferExternalEffects());
     try std.testing.expect(analysis.hasNonRasterEffects());
+}
+
+test "analysis follows a forward branch beyond an early return and padding" {
+    var memory = TestMemory{};
+    memory.word(0, 0xbf85_0003); // s_cbranch_scc1 -> pc 16
+    memory.word(4, 0xbf81_0000); // s_endpgm on the other path
+    memory.word(8, 0xbf80_0000); // padding
+    memory.word(12, 0xbf80_0000);
+    memory.word(16, 0xbe80_0381); // s_mov_b32 s0, 1
+    memory.word(20, 0xbf81_0000);
+    var analysis = try decode(std.testing.allocator, memory.reader(), 0, 16);
+    defer analysis.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 20), analysis.program.instructions.items[5].pc);
+    try std.testing.expect(analysis.graph.blockForPc(16) != null);
+}
+
+test "analysis releases an invalid branch target without freeing instructions twice" {
+    var memory = TestMemory{};
+    memory.word(0, 0xbf82_0001); // s_branch -> pc 8, inside the literal below
+    memory.word(4, 0xbe80_03ff); // s_mov_b32 s0, literal
+    memory.word(8, 0x1234_5678);
+    memory.word(12, 0xbf81_0000);
+    try std.testing.expectError(error.InvalidBranchTarget, decode(std.testing.allocator, memory.reader(), 0, 16));
 }
 
 test "analysis owns definitions across moves but not shader replacement or uniform specialization" {
