@@ -18045,7 +18045,19 @@ pub const Renderer = struct {
             if (!cached.initialized or !byteRangesOverlap(address, visible_bytes, cached.target.descriptor.address, cached.target.layout.required_source_bytes)) continue;
             target_sequence = @max(target_sequence, cached.last_used_sequence);
         }
-        return combineSourceGenerations(generation, target_sequence);
+        // Storage producers can use another format or extent, so direct image
+        // reuse is not always possible. Include their resident sequence even
+        // after publication: sparse CPU probes can miss the changed texels,
+        // and canonical alias generations are absent in the default mode.
+        var storage_sequence: u64 = 0;
+        if (!self.canonical_image_aliases_enabled) {
+            for (self.storage_image_cache.items) |cached| {
+                // Match flushGuestStorageImageRange's allocation-base rule.
+                if (!cached.valid or cached.descriptor.address != address) continue;
+                storage_sequence = @max(storage_sequence, cached.last_used_sequence);
+            }
+        }
+        return combineSourceGenerations(combineSourceGenerations(generation, target_sequence), storage_sequence);
     }
 
     fn combineSourceGenerations(resident: u64, pages: u64) u64 {

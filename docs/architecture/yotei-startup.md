@@ -2,6 +2,23 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Storage writes invalidate sampled snapshots on 2026-09-09
+
+With canonical image aliases disabled, sampled-cache keys omitted resident
+storage-image sequences. A compute write through another format or extent could
+leave a previously uploaded sampled view unchanged: the early cache hit bypassed
+publication, and sparse CPU probes could also miss the modified texels after
+publication. The cache key now includes the storage sequence at the allocation
+base, including already-published writes.
+
+The GPU regression samples a 64x64 RGBA8_UNORM view, writes the same allocation
+as 128x32 R32_UINT, then samples again. It checks every RGBA component for pending
+and explicitly published writes, changes the sampler, and verifies that repeated
+unchanged reads do not upload again. The previous backend fails; the corrected
+backend passes SDK synchronization validation. Yotei reuses the observed
+`0x500e870000` and `0x500f870000` allocations with differing sampled/storage
+extents. Their role in the missing background still requires live verification.
+
 ## Repeated velocity clears and scene bounds on 2026-09-09
 
 After the three bonus notices, brightness, difficulty and experience selection,

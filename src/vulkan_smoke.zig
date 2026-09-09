@@ -351,6 +351,81 @@ fn runStorageImageCopyCase(
     std.debug.print("storage image coordinate copy passed: {s}\n", .{if (packed_coordinates) "A16 packed X/Y with poisoned adjacent VGPR" else "32-bit X/Y"});
 }
 
+fn runSampledStorageRefreshProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    const guest = try allocator.create(GuestMemory);
+    defer allocator.destroy(guest);
+    guest.* = .{};
+    const backend = renderer.dcbBackend(guest.interface());
+    const source = 0x6000;
+    const output = 0x10000;
+    const consumer_program = 0x1400;
+    const producer_program = 0x1800;
+    const consumer_code = [_]u32{
+        vop1(1, 0, 255), @bitCast(@as(f32, 32.5 / 64.0)),
+        vop1(1, 1, 255), @bitCast(@as(f32, 32.5 / 64.0)),
+        0xf09c_0f0a, 0x0040_0400, 0x0000_0001, // sample RGBA, S#s8
+        0xe078_0000, 0x8003_0400, // store four floats through V#s12
+        0xbf81_0000,
+    };
+    const producer_code = [_]u32{
+        vop1(1, 0, 160), // x=32 in the 128-wide writer
+        vop1(1, 1, 144), // y=16: same byte as (32,32) in the 64-wide reader
+        vop1(1, 4, 8), // packed RGBA byte value from s8
+        0xf020_0108, 0x0000_0400, // image_store R32_UINT
+        0xbf81_0000,
+    };
+    for (consumer_code, 0..) |word, i| guest.word(consumer_program + i * 4, word);
+    for (producer_code, 0..) |word, i| guest.word(producer_program + i * 4, word);
+    const compute = gpu.resources.ShaderStage.compute;
+    var consumer = gpu.State{};
+    var producer = gpu.State{};
+    for ([_]*gpu.State{ &consumer, &producer }, 0..) |state, i| {
+        try state.writeRegister(.shader, compute.programRegisterBase(), (if (i == 0) @as(u32, consumer_program) else producer_program) >> 8);
+        try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+        try state.writeRegister(.shader, 0x213, (if (i == 0) @as(u32, 16) else 9) << 1);
+        for ([_]u32{ 0x207, 0x208, 0x209 }) |reg| try state.writeRegister(.shader, reg, 1);
+        var descriptor = if (i == 0) sampledImageDescriptorWords(source, 64, 64) else imageDescriptorWords(source, 128, 32);
+        if (i == 1) {
+            descriptor[1] = (descriptor[1] & ~(@as(u32, 0x1ff) << 20)) | (20 << 20);
+            descriptor[3] = (descriptor[3] & ~@as(u32, 0xfff)) | 4;
+        }
+        for (descriptor, 0..) |word, index| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+    }
+    for (0..4) |i| try consumer.writeRegister(.shader, compute.userDataBase() + 8 + @as(u32, @intCast(i)), 0);
+    for ([_]u32{ output, 4 << 16, 4, 0 }, 0..) |word, i| try consumer.writeRegister(.shader, compute.userDataBase() + 12 + @as(u32, @intCast(i)), word);
+    const stream = [_]u32{ command(gpu.pm4.dispatch_direct, 4), 1, 1, 1, 0x41 };
+    var reader = gpu.DcbExecutor{ .state = &consumer, .backend = backend, .allocator = allocator };
+    var writer = gpu.DcbExecutor{ .state = &producer, .backend = backend, .allocator = allocator };
+    for ([_]u32{ 0, 0x80c0_6020, 0xff19_73e1 }, 0..) |packed_value, phase| {
+        if (phase != 0) {
+            try producer.writeRegister(.shader, compute.userDataBase() + 8, packed_value);
+            _ = try writer.execute(&stream);
+            // The first update stays pending; the second is already published.
+            // Both must invalidate the old view, even outside its sparse probe.
+            try std.testing.expect(std.mem.readInt(u32, guest.bytes[source + 8320 ..][0..4], .little) != packed_value);
+            if (phase == 2) {
+                try renderer.flushPendingGuestWrites();
+                try consumer.writeRegister(.shader, compute.userDataBase() + 8, 2); // another sampler, same view
+            }
+        }
+        for (0..2) |repeat| {
+            const misses_before = renderer.texture_cache_misses;
+            _ = try reader.execute(&stream);
+            var data: [16]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(output, &data);
+            for (0..4) |component| {
+                const value: f32 = @bitCast(std.mem.readInt(u32, data[component * 4 ..][0..4], .little));
+                const expected = @as(f32, @floatFromInt((packed_value >> @intCast(component * 8)) & 255)) / 255.0;
+                try std.testing.expectApproxEqAbs(expected, value, 0.0001);
+            }
+            if (repeat != 0) try std.testing.expectEqual(misses_before, renderer.texture_cache_misses);
+        }
+    }
+    std.debug.print("sampled storage refresh passed: cached UNORM view, repeated UINT writes with another extent, unchanged-view reuse\n", .{});
+}
+
 fn runPredicatedImageLoadProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -5004,6 +5079,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--scalar-loops")) {
         try runScalarLoopProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--sampled-storage-refresh")) {
+        try runSampledStorageRefreshProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--image-exec")) {
