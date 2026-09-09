@@ -1689,6 +1689,49 @@ const Builder = struct {
         try self.destination(inst.dst, .{ .id = result, .value_type = .float32 });
     }
 
+    fn trigonometric(self: *Builder, inst: instruction.Instruction, cosine: bool) Error!void {
+        // RDNA SIN/COS consume turns; GLSL consumes radians. Reduce before
+        // multiplying so large finite turns cannot overflow to infinity.
+        const source_id = try self.source(inst.src0, .float32);
+        const turns = self.id();
+        try self.emit(&self.body, 140, &.{ self.float_type, turns, source_id, try self.constant(.float32, @bitCast(@as(f32, 1))) }); // OpFRem
+        const radians = self.id();
+        try self.emit(&self.body, 133, &.{ self.float_type, radians, turns, try self.constant(.float32, @bitCast(@as(f32, 2 * std.math.pi))) });
+        const evaluated = self.id();
+        try self.emit(&self.body, 12, &.{ self.float_type, evaluated, self.ensureGlslStd450(), if (cosine) @as(u32, 14) else 13, radians });
+        const magnitude = self.id();
+        try self.emit(&self.body, 12, &.{ self.float_type, magnitude, self.ensureGlslStd450(), 4, turns }); // FAbs
+        var result = evaluated;
+        // Exact quarter turns matter when a shader subsequently reciprocates
+        // cosine. Preserve signed zero for sine at the origin as well.
+        const axes = if (cosine) [_]f32{ 0, 0.25, 0.5, 0.75 } else [_]f32{ 0, 0.5, 0.25, 0.75 };
+        for (axes) |axis| {
+            const matches = self.id();
+            try self.emit(&self.body, 180, &.{ self.bool_type, matches, magnitude, try self.constant(.float32, @bitCast(axis)) }); // FOrdEqual
+            const axis_value = if (cosine)
+                try self.constant(.float32, @bitCast(@as(f32, if (axis == 0) 1 else if (axis == 0.5) -1 else 0)))
+            else blk: {
+                const turn_bits = try self.convert(.{ .id = turns, .value_type = .float32 }, .bits32);
+                const sign = try self.andBits(turn_bits, 0x8000_0000);
+                const absolute_bits: u32 = if (axis == 0 or axis == 0.5) 0 else @bitCast(@as(f32, if (axis == 0.25) 1 else -1));
+                const signed_bits = self.id();
+                try self.emit(&self.body, 198, &.{ self.bits_type, signed_bits, sign, try self.constant(.bits32, absolute_bits) });
+                break :blk try self.convert(.{ .id = signed_bits, .value_type = .bits32 }, .float32);
+            };
+            const exact_value = if (!cosine and axis == 0) blk: {
+                const at_origin = self.id();
+                try self.emit(&self.body, 180, &.{ self.bool_type, at_origin, source_id, try self.constant(.float32, 0) });
+                const origin_value = self.id();
+                try self.emit(&self.body, 169, &.{ self.float_type, origin_value, at_origin, source_id, try self.constant(.float32, 0) });
+                break :blk origin_value;
+            } else axis_value;
+            const selected = self.id();
+            try self.emit(&self.body, 169, &.{ self.float_type, selected, matches, exact_value, result });
+            result = selected;
+        }
+        try self.destination(inst.dst, .{ .id = result, .value_type = .float32 });
+    }
+
     fn glslBinary(self: *Builder, inst: instruction.Instruction, opcode: u32, value_type: ValueType) Error!void {
         const a = try self.source(inst.src0, value_type);
         const b = try self.source(inst.src1, value_type);
@@ -3805,8 +3848,10 @@ const Builder = struct {
 
     fn cndmask(self: *Builder, inst: instruction.Instruction) Error!void {
         // dst = vcc ? src1 : src0  (lane-wise; we approximate VCC as a scalar bool).
-        const false_val = try self.source(inst.src0, .bits32);
-        const true_val = try self.source(inst.src1, .bits32);
+        // CNDMASK copies bits, but its input ABS/NEG modifiers operate on
+        // floating-point sign bits, including when the payload is an integer.
+        const false_val = try self.convert(.{ .id = try self.source(inst.src0, .float32), .value_type = .float32 }, .bits32);
+        const true_val = try self.convert(.{ .id = try self.source(inst.src1, .float32), .value_type = .float32 }, .bits32);
         const vcc = if (self.wave64_workgroup) try self.waveMaskBit(inst.src2) else try self.source(inst.src2, .bits32);
         const is_true = self.id();
         try self.emit(&self.body, 171, &.{ // OpINotEqual
@@ -8651,8 +8696,8 @@ const Builder = struct {
             .v_floor_f32 => try self.glslFloatUnary(inst, 8),
             .v_ceil_f32 => try self.glslFloatUnary(inst, 9),
             .v_fract_f32 => try self.glslFloatUnary(inst, 10),
-            .v_sin_f32 => try self.glslFloatUnary(inst, 13),
-            .v_cos_f32 => try self.glslFloatUnary(inst, 14),
+            .v_sin_f32 => try self.trigonometric(inst, false),
+            .v_cos_f32 => try self.trigonometric(inst, true),
             .v_exp_f32 => try self.glslFloatUnary(inst, 29), // Exp2
             .v_log_f32 => try self.glslFloatUnary(inst, 30), // Log2
             .v_sqrt_f32 => try self.glslFloatUnary(inst, 31),

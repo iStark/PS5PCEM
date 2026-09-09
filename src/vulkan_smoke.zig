@@ -417,6 +417,73 @@ fn runPredicatedImageLoadProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("predicated image loads passed: 64 lanes, CMPX copy, complementary clear, and refreshed input\n", .{});
 }
 
+fn runTrigonometricProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    const backend = renderer.dcbBackend(guest.interface());
+    const inputs = [_]f32{
+        0,                 -0.0,               0.25,              -0.25,   0.5,      -0.5,      0.75,                   -0.75,
+        1,                 -1,                 0.125,             -0.125,  0.375,    -0.375,    0.1375,                 -0.1375,
+        17.125,            -17.125,            255.25,            -255.25, 4096.375, -4096.375, std.math.floatMax(f32), -std.math.floatMax(f32),
+        std.math.inf(f32), -std.math.inf(f32), std.math.nan(f32),
+    };
+    const load = mubuf(0x0c, 0, 1, 0, 0);
+    const store = mubuf(0x1d, 0, 2, 0, 4);
+    const words = [_]u32{
+        load[0], load[1],
+        vop1(53, 2, 257), // v_sin_f32 v2, v1
+        vop1(54, 3, 257), // v_cos_f32 v3, v1
+        store[0],
+        store[1],
+        0xbf81_0000,
+    };
+    for (words, 0..) |word, index| guest.word(0x1000 + index * 4, word);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 0x10);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 8 << 1);
+    try state.writeRegister(.shader, 0x207, inputs.len);
+    try state.writeRegister(.shader, 0x208, 1);
+    try state.writeRegister(.shader, 0x209, 1);
+    const descriptors = [_][4]u32{
+        .{ 0x5000, 4 << 16, inputs.len, 0 },
+        .{ 0x6000, 8 << 16, inputs.len, 0 },
+    };
+    for (descriptors, 0..) |descriptor, index| {
+        for (descriptor, 0..) |word, component| {
+            try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index * 4 + component)), word);
+        }
+    }
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = backend, .allocator = allocator };
+    for (0..2) |pass| {
+        for (inputs, 0..) |input, index| guest.word(0x5000 + index * 4, @bitCast(if (pass == 0) input else -input));
+        _ = try executor.execute(&.{ command(gpu.pm4.dispatch_direct, 4), 1, 1, 1, 0x41 });
+        if (renderer.last_dispatch_error) |err| return err;
+        try renderer.flushPendingGuestWrites();
+        for (inputs, 0..) |input, index| {
+            const value = if (pass == 0) input else -input;
+            const actual = [2]f32{
+                @bitCast(std.mem.readInt(u32, guest.bytes[0x6000 + index * 8 ..][0..4], .little)),
+                @bitCast(std.mem.readInt(u32, guest.bytes[0x6004 + index * 8 ..][0..4], .little)),
+            };
+            if (!std.math.isFinite(value)) {
+                try std.testing.expect(std.math.isNan(actual[0]) and std.math.isNan(actual[1]));
+                continue;
+            }
+            const turns: f64 = value - @trunc(value);
+            const angle = turns * (2 * std.math.pi);
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(@sin(angle))), actual[0], 0.000003);
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(@cos(angle))), actual[1], 0.000003);
+            if (value == 0) try std.testing.expectEqual(@as(u32, @bitCast(value)), @as(u32, @bitCast(actual[0])));
+            if (@abs(turns) == 0.25 or @abs(turns) == 0.75) try std.testing.expectEqual(@as(f32, 0), actual[1]);
+            if (@abs(value) == std.math.floatMax(f32)) try std.testing.expectEqual(@as(u32, 0), @as(u32, @bitCast(actual[0])));
+        }
+    }
+    std.debug.print("trigonometry passed: turns, exact quadrants, signed zero, large finite inputs, NaN/Inf and changed inputs\n", .{});
+}
+
 fn runComputeSampledImageKernel(
     allocator: std.mem.Allocator,
     renderer: *vulkan.Renderer,
@@ -1844,7 +1911,30 @@ fn runSdwaProbe(allocator: std.mem.Allocator) !void {
         .{ .inputs = .{ 0x42003800, 0x3c00, 0x4000 }, .code = &.{(0x35 << 25) | (2 << 9) | 257}, .expected = 0x42004000 }, // native mul preserves the other weight
     };
     for (cases, 0..) |case, index| try Runner.check(&renderer, &guest, &state, 18 + index, case.inputs, case.code, case.expected);
+    // VOP3 CNDMASK is a bit copy with floating-point ABS/NEG semantics.
+    // Test each source's modifiers independently, including zero and NaN
+    // payloads which numeric conversions must leave intact.
+    for ([_]u32{ 0x8000_0000, 0xbf20_0000, 0x7fc1_2345, 0xdead_beef }, 0..) |payload, payload_index| {
+        for (0..16) |modifiers| {
+            for (0..2) |selected| {
+                const absolute = (modifiers >> @intCast(selected * 2)) & 1 != 0;
+                const negate = (modifiers >> @intCast(selected * 2 + 1)) & 1 != 0;
+                var expected_bits = payload;
+                if (absolute) expected_bits &= 0x7fff_ffff;
+                if (negate) expected_bits ^= 0x8000_0000;
+                const abs_bits: u32 = @intCast(((modifiers & 1) << 8) | (((modifiers >> 2) & 1) << 9));
+                const neg_bits: u32 = @intCast((((modifiers >> 1) & 1) << 29) | (((modifiers >> 3) & 1) << 30));
+                const code = [_]u32{
+                    sop1(4, 6, if (selected == 0) 128 else 193),
+                    0xd501_0000 | abs_bits,
+                    257 | (258 << 9) | (6 << 18) | neg_bits,
+                };
+                try Runner.check(&renderer, &guest, &state, 80 + payload_index * 32 + modifiers * 2 + selected, .{ 0, payload, payload }, &code, expected_bits);
+            }
+        }
+    }
     std.debug.print("SDWA passed: byte/word destinations, padding/sign/preservation, A16 coordinate packing, F16 math/modifiers and inactive EXEC\n", .{});
+    std.debug.print("conditional float selection passed: both sources, ABS/NEG combinations and exact zero/NaN/integer payload bits\n", .{});
 }
 
 fn runSceneMaskProbe(allocator: std.mem.Allocator) !void {
@@ -4843,6 +4933,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--image-exec")) {
         try runPredicatedImageLoadProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--trigonometry")) {
+        try runTrigonometricProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--quad-mode")) {

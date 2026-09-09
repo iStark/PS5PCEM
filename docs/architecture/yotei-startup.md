@@ -2,6 +2,29 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Atmosphere arithmetic on 2026-09-09
+
+The analytic atmosphere producer exposed two general translation errors.
+`V_SIN_F32` and `V_COS_F32` take turns, but were passed directly to GLSL's
+radian operations. They now reduce the turn value before multiplying by
+2 pi, with exact quadrant results, signed zero and finite large inputs.
+`V_CNDMASK_B32` input ABS/NEG modifiers were also applied as integer arithmetic;
+they now operate on the floating-point sign bit while retaining the selected
+payload's exact bits. Both semantics are specified in the
+[AMD RDNA2 ISA reference](https://docs.amd.com/api/khub/documents/Et~wpu9g~Ffl7d9q0QZ~Og/content),
+sections 12.7 and 12.8.
+
+In the captured analytic dispatch, the two scattering outputs previously
+contained 174,835 and 173,235 infinite half-float components. With both fixes,
+all four producer images have no NaNs or infinities. This is intermediate
+resource validation; the complete live menu remains under investigation.
+
+The GPU trigonometry probe checks positive/negative fractional turns, exact
+quadrants, signed zero, large finite inputs, NaN/Inf and refreshed input through
+the same pipeline. The selection probe checks 128 combinations of source,
+ABS/NEG and zero/NaN/integer payloads. Both, the existing SDWA cases and the
+default smoke pass SDK synchronization validation.
+
 ## Predicated compute image reads on 2026-09-09
 
 The first-frame atmosphere conversion shader `0x80003fa600` reads two resident
