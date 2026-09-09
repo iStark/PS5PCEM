@@ -14324,6 +14324,10 @@ pub const Renderer = struct {
             .parameter_mask = paired_parameter_mask,
             .fragment_input_controls = &fragment_input_controls,
             .fragment_input_locations = &fragment_input_locations,
+            .fragment_inputs = .{
+                .allocated = @truncate(state.readRegister(.context, 0x1b4) orelse 0),
+                .enabled = @truncate(state.readRegister(.context, 0x1b3) orelse 0),
+            },
             .infer_fragment_parameter_mask = false,
             .color_export_mappings = color_export_mappings,
             .color_export_types = color_export_types,

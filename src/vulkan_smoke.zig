@@ -2178,6 +2178,78 @@ fn runUiAttachmentProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("UI attachments passed: missing color/clip defaults, explicit disable/DX clip, stale depth and HTILE comparisons\n", .{});
 }
 
+fn runFragmentPositionProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    // A covering triangle with clip W=2 and Z=.5. Pixel inputs must contain
+    // window-space XY, reciprocal W=.5 and the selected clip-depth mapping.
+    const vertex = [_]u32{
+        0x34020a81,       0x36040a82,       0x36020282,      0x7e040d02, 0x7e060d01,
+        0xd5410001,       0x03ce04f4,       0xd5410002,      0x03ce06f4, vop1(1, 0, 244),
+        vop2(8, 1, 1, 0), vop2(8, 2, 2, 0), vop1(1, 3, 240), 0xf80008cf, 0x00030102,
+        0xbf810000,
+    };
+    for (vertex, 0..) |word, i| guest.word(0x700 + i * 4, word);
+    var state = gpu.State{};
+    for ([_]gpu.resources.ShaderStage{ .vertex, .pixel }, [_]u32{ 7, 9 }) |stage, program| {
+        try state.writeRegister(.shader, stage.programRegisterBase(), program);
+        try state.writeRegister(.shader, stage.programRegisterBase() + 1, 0);
+    }
+    const context = [_][2]u32{
+        .{ 0x318, 0x20 },                    .{ 0x319, 0 },             .{ 0x31b, 0 },             .{ 0x31c, 10 << 2 }, .{ 0x31d, 0 },
+        .{ 0x390, 0 },                       .{ 0x3b0, (7 << 14) | 7 }, .{ 0x3b8, 1 << 24 },       .{ 0x08e, 0xf },     .{ 0x00c, 0 },
+        .{ 0x00d, 8 | (8 << 16) },           .{ 0x094, 1 << 31 },       .{ 0x095, 8 | (8 << 16) }, .{ 0x1e0, 0 },       .{ 0x200, 0 },
+        .{ 0x202, (0xcc << 16) | (1 << 4) }, .{ 0x204, 0 },             .{ 0x205, 0 },
+    };
+    for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(guest.interface()), .allocator = allocator };
+    const Case = struct { allocated: u16, enabled: u16, first: u8 };
+    const cases = [_]Case{
+        .{ .allocated = 0xf02, .enabled = 0xf02, .first = 2 },
+        .{ .allocated = 0xf8f, .enabled = 0xf02, .first = 10 },
+        .{ .allocated = 0xf8f, .enabled = 0xb02, .first = 10 },
+        .{ .allocated = 0xf8f, .enabled = 0x902, .first = 10 },
+        .{ .allocated = 0xf02, .enabled = 0xf02, .first = 2 },
+    };
+    for (0..4) |mode| for (cases, 0..) |case, case_index| {
+        const negative = mode & 1 != 0;
+        const zero_to_one = mode & 2 != 0;
+        const first: u9 = 256 + @as(u9, case.first);
+        const fragment = [_]u32{
+            // Preserve entry VGPRs across a loop before reading position.
+            0xbe940380,         0x80148114,                0xbf0a8214,             0xbf85fffd,
+            vop1(1, 24, first), vop1(1, 25, first + 1),    vop1(1, 26, first + 2), vop1(1, 27, first + 3),
+            vop1(1, 28, 255),   @bitCast(@as(f32, 0.125)), vop2(8, 24, 24, 28),    vop2(8, 25, 25, 28),
+            0xf800180f,         0x1b1a1918,                0xbf810000,
+        };
+        for (fragment, 0..) |word, i| guest.word(0x900 + i * 4, word);
+        try state.writeRegister(.context, 0x1b4, case.allocated);
+        try state.writeRegister(.context, 0x1b3, case.enabled);
+        try state.writeRegister(.context, 0x204, if (zero_to_one) 1 << 19 else 0);
+        for ([_]f32{ 4, 4, if (negative) -4 else 4, 4, 1, 0 }, 0..) |value, i|
+            try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value));
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+        if (renderer.last_draw_error) |err| return err;
+        try renderer.flushPendingGuestWrites();
+        for (0..8) |y| for (0..8) |x| {
+            const expected = [_]u8{
+                @intCast((x * 2 + 1) * 255 / 16),
+                if (case.enabled & 0x200 != 0) @intCast((y * 2 + 1) * 255 / 16) else 0,
+                if (case.enabled & 0x400 != 0) (if (zero_to_one) @as(u8, 64) else 159) else 0,
+                128,
+            };
+            for (expected, guest.bytes[0x2000 + (y * 8 + x) * 4 ..][0..4], 0..) |want, actual, channel| {
+                if (@abs(@as(i16, actual) - want) > 1) {
+                    std.debug.print("fragment position case={d} negative={any} xy={d},{d} channel={d}: expected={d} actual={d}\n", .{ case_index, negative, x, y, channel, want, actual });
+                    return error.FragmentPositionMismatch;
+                }
+            }
+        };
+    };
+    std.debug.print("Fragment position inputs preserve allocation holes, viewport orientation, depth and reciprocal W\n", .{});
+}
+
 fn runFullscreenOrientationProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -4704,6 +4776,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--fullscreen-orientation")) {
         try runFullscreenOrientationProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--fragment-position")) {
+        try runFragmentPositionProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--target-reuse")) {

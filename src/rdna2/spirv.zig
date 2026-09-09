@@ -223,6 +223,25 @@ pub const NggLdsExport = struct {
 pub const ColorExportType = enum { float32, uint32, sint32 };
 pub const PackedColorExport = enum { float16, unorm16, snorm16 };
 
+pub const FragmentInputs = struct {
+    /// SPI_PS_INPUT_ADDR allocates consecutive VGPRs, including inputs whose
+    /// SPI_PS_INPUT_ENA bit is clear. Interpolation pairs precede position.
+    allocated: u16 = 0,
+    enabled: u16 = 0,
+
+    pub fn positionRegisters(self: FragmentInputs) [4]?u8 {
+        var result: [4]?u8 = @splat(null);
+        var next: u8 = 0;
+        for (0..12) |input| {
+            const bit = @as(u16, 1) << @intCast(input);
+            if (self.allocated & bit == 0) continue;
+            if (input >= 8 and self.enabled & bit != 0) result[input - 8] = next;
+            next += if (input == 3) @as(u8, 3) else if (input < 7) 2 else 1;
+        }
+        return result;
+    }
+};
+
 fn colorExportValueType(color_type: ColorExportType) ValueType {
     return switch (color_type) {
         .float32 => .float32,
@@ -243,6 +262,7 @@ pub const Options = struct {
     /// Pixel extent used to normalize FragCoord when the paired vertex PARAM
     /// interface is unavailable. The backend supplies the active color target.
     fragment_extent: [2]u32 = .{ 1280, 720 },
+    fragment_inputs: FragmentInputs = .{},
     /// VGPR populated from Vulkan's VertexIndex system value before a vertex
     /// shader starts. Other graphics system values remain explicit future
     /// stage-interface work rather than silently receiving zero.
@@ -634,6 +654,7 @@ const Builder = struct {
     /// BuiltIn FragCoord (float4) for fragment UV fallback when PARAM interps
     /// are not yet wired from the vertex stage.
     frag_coord_input: u32 = 0,
+    fragment_inputs: FragmentInputs,
     storage_bindings: []const StorageBufferBinding,
     scalar_memory_bindings: []const ScalarMemoryBinding,
     flat_memory_bindings: []const FlatMemoryBinding,
@@ -767,6 +788,7 @@ const Builder = struct {
             .wave64_workgroup = options.wave64_workgroup,
             .wave32 = options.wave32,
             .fragment_extent = options.fragment_extent,
+            .fragment_inputs = options.fragment_inputs,
             .scalar_specializations = options.scalar_registers,
             .dynamic_scalar_binding = options.dynamic_scalar_binding,
             .zero_unmapped_flat_loads = options.zero_unmapped_flat_loads,
@@ -4027,6 +4049,20 @@ const Builder = struct {
         for (0..64) |vgpr| {
             if (self.registers[128 + vgpr].id == 0) {
                 self.registers[128 + vgpr] = .{ .id = zero, .value_type = .bits32 };
+            }
+        }
+        if (self.stage == .fragment) {
+            const positions = self.fragment_inputs.positionRegisters();
+            var coord: u32 = 0;
+            for (positions, 0..) |register, component| {
+                const vgpr = register orelse continue;
+                if (coord == 0) {
+                    coord = self.id();
+                    try self.emit(&self.body, 61, &.{ self.vector4_type, coord, self.frag_coord_input });
+                }
+                const value = self.id();
+                try self.emit(&self.body, 81, &.{ self.float_type, value, coord, @intCast(component) });
+                self.registers[128 + @as(usize, vgpr)] = .{ .id = value, .value_type = .float32 };
             }
         }
         if (self.stage == .vertex) {

@@ -2,6 +2,28 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Fragment position inputs on 2026-09-09
+
+The low-resolution lighting filters `0x80003e5900` and `0x80003db900` read
+screen position directly from entry VGPRs. A live state capture records
+`SPI_PS_INPUT_ADDR = SPI_PS_INPUT_ENA = 0x302`: one interpolation pair occupies
+`v0:v1`, followed by pixel X/Y in `v2:v3`. The translator previously initialized
+these position registers to zero, making screen-space samples use the origin.
+
+Fragment translation now initializes enabled position inputs from Vulkan
+`FragCoord`, including depth and reciprocal W. Register allocation follows
+INPUT_ADDR independently of INPUT_ENA, retaining disabled interpolation and
+position slots. The register fields are documented in AMD's
+[RDNA2 register definitions](https://github.com/torvalds/linux/blob/v6.14/drivers/gpu/drm/amd/include/asic_reg/gc/gc_10_3_0_sh_mask.h);
+[LLVM's PS input allocation](https://github.com/llvm/llvm-project/blob/llvmorg-20.1.0/llvm/lib/Target/AMDGPU/SIISelLowering.cpp)
+also distinguishes allocated inputs from enabled ones.
+
+The `--fragment-position` GPU probe checks all pixels of a covering triangle
+across 20 cases: allocation holes, disabled position components, shader/pipeline
+reuse, both viewport signs, both clip-depth conventions and inputs surviving
+a loop. It passes SDK synchronization validation, as do the existing fullscreen
+orientation probe and complete default smoke. Live scene validation is pending.
+
 ## Native environment-volume execution on 2026-09-09
 
 A captured dispatch of `0x8000253100` now stages, translates and executes on
