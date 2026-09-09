@@ -2331,8 +2331,8 @@ const Builder = struct {
     }
 
     fn packedBinaryF16(self: *Builder, inst: instruction.Instruction, opcode: u16) Error!void {
-        const a_bits = try self.source(inst.src0, .bits32);
-        const b_bits = try self.source(inst.src1, .bits32);
+        const a_bits = try self.packedSourceF16(inst.src0);
+        const b_bits = try self.packedSourceF16(inst.src1);
         const vector_type = try self.ensureFloatVec2();
         const a = self.id();
         try self.emit(&self.body, 12, &.{ vector_type, a, self.ensureGlslStd450(), 62, a_bits });
@@ -2346,9 +2346,9 @@ const Builder = struct {
     }
 
     fn packedFmaF16(self: *Builder, inst: instruction.Instruction) Error!void {
-        const a_bits = try self.source(inst.src0, .bits32);
-        const b_bits = try self.source(inst.src1, .bits32);
-        const c_bits = try self.source(inst.src2, .bits32);
+        const a_bits = try self.packedSourceF16(inst.src0);
+        const b_bits = try self.packedSourceF16(inst.src1);
+        const c_bits = try self.packedSourceF16(inst.src2);
         const vector_type = try self.ensureFloatVec2();
         const a = self.id();
         try self.emit(&self.body, 12, &.{ vector_type, a, self.ensureGlslStd450(), 62, a_bits });
@@ -2356,10 +2356,8 @@ const Builder = struct {
         try self.emit(&self.body, 12, &.{ vector_type, b, self.ensureGlslStd450(), 62, b_bits });
         const c = self.id();
         try self.emit(&self.body, 12, &.{ vector_type, c, self.ensureGlslStd450(), 62, c_bits });
-        const product = self.id();
-        try self.emit(&self.body, 133, &.{ vector_type, product, a, b });
         const result = self.id();
-        try self.emit(&self.body, 129, &.{ vector_type, result, product, c });
+        try self.emit(&self.body, 12, &.{ vector_type, result, self.ensureGlslStd450(), 50, a, b, c });
         const packed_bits = self.id();
         try self.emit(&self.body, 12, &.{ self.bits_type, packed_bits, self.ensureGlslStd450(), 58, result });
         try self.destinationPackedF16(inst.dst, packed_bits);
@@ -2393,6 +2391,24 @@ const Builder = struct {
         const result = self.id();
         try self.emit(&self.body, 12, &.{ self.bits_type, result, self.ensureGlslStd450(), 58, pair });
         return result;
+    }
+
+    fn packedSourceF16(self: *Builder, op: operand.Operand) Error!u32 {
+        var plain = op;
+        plain.negate = false;
+        plain.absolute = false;
+        // RDNA2 floating inline constants contain an f16 in the low half;
+        // OP_SEL_HI can broadcast that half to both packed operations.
+        const bits = if (op.kind == .float_inline_constant)
+            try self.constant(.bits32, @as(u16, @bitCast(@as(f16, @floatCast(op.float_val)))))
+        else
+            try self.source(plain, .bits32);
+        const pair = try self.unpackF16Pair(bits);
+        var low = pair[@intFromBool(op.op_sel)];
+        var high = pair[@intFromBool(op.op_sel_hi)];
+        if (op.negate) low = try self.floatNegateValue(low);
+        if (op.negate_hi) high = try self.floatNegateValue(high);
+        return self.packF16Pair(low, high);
     }
 
     /// VOP3P CLAMP applies independently to both packed f16 results. The
@@ -2501,8 +2517,8 @@ const Builder = struct {
     }
 
     fn packedGlslF16(self: *Builder, inst: instruction.Instruction, opcode: u32) Error!void {
-        const a = try self.unpackF16Pair(try self.source(inst.src0, .bits32));
-        const b = try self.unpackF16Pair(try self.source(inst.src1, .bits32));
+        const a = try self.unpackF16Pair(try self.packedSourceF16(inst.src0));
+        const b = try self.unpackF16Pair(try self.packedSourceF16(inst.src1));
         try self.destinationPackedF16(
             inst.dst,
             try self.packF16Pair(
@@ -2513,12 +2529,18 @@ const Builder = struct {
     }
 
     fn mixSourceF32(self: *Builder, op: operand.Operand) Error!u32 {
-        if (op.op_sel) {
-            const bits = try self.source(op, .bits32);
+        var plain = op;
+        plain.negate = false;
+        plain.absolute = false;
+        var value = if (op.op_sel_hi) blk: {
+            const bits = try self.source(plain, .bits32);
             const pair = try self.unpackF16Pair(bits);
-            return if (op.op_sel_hi) pair[1] else pair[0];
-        }
-        return self.source(op, .float32);
+            break :blk pair[@intFromBool(op.op_sel)];
+        } else try self.source(plain, .float32);
+        // MIX reuses NEG_HI as ABS, applied before NEG after f16 conversion.
+        if (op.negate_hi or op.absolute) value = try self.glslFloatUnaryValue(4, value);
+        if (op.negate) value = try self.floatNegateValue(value);
+        return value;
     }
 
     fn insertF16Half(self: *Builder, current: u32, value: u32, high: bool) Error!u32 {
@@ -3489,7 +3511,7 @@ const Builder = struct {
         self.uses_image_query = true;
         if (inst.src1.kind != .sgpr or inst.data_mask == 0) return Error.UnsupportedOpcode;
         const lod = if (inst.src0.kind == .vgpr)
-            try self.source(try imageAddressOperand(inst, 0), .bits32)
+            try self.source(try imageIntegerAddressOperand(inst, 0), .bits32)
         else
             try self.constant(.bits32, 0);
 
@@ -4318,9 +4340,10 @@ const Builder = struct {
     }
 
     fn fmaFloat(self: *Builder, inst: instruction.Instruction) Error!void {
-        const a = try self.source(inst.src0, .float32);
-        const b = try self.source(inst.src1, .float32);
-        const c = try self.source(inst.src2, .float32);
+        const mixed = inst.family == .vop3p;
+        const a = if (mixed) try self.mixSourceF32(inst.src0) else try self.source(inst.src0, .float32);
+        const b = if (mixed) try self.mixSourceF32(inst.src1) else try self.source(inst.src1, .float32);
+        const c = if (mixed) try self.mixSourceF32(inst.src2) else try self.source(inst.src2, .float32);
         const result = self.id();
         try self.emit(&self.body, 12, &.{ // GLSL.std.450 Fma
             self.float_type,
@@ -4987,8 +5010,8 @@ const Builder = struct {
         inst: instruction.Instruction,
         dimension: StorageImageDimension,
     ) Error!u32 {
-        const x = try self.source(try imageAddressOperand(inst, 0), .bits32);
-        const y = try self.source(try imageAddressOperand(inst, 1), .bits32);
+        const x = try self.source(try imageIntegerAddressOperand(inst, 0), .bits32);
+        const y = try self.source(try imageIntegerAddressOperand(inst, 1), .bits32);
         const coordinates = self.id();
         if (dimension != .two_d) {
             if (self.vector3_bits_type == 0) return Error.InvalidStorageBinding;
@@ -4998,7 +5021,7 @@ const Builder = struct {
             // faces across dispatches). Inventing a third VGPR reads an
             // unrelated float and becomes an out-of-range layer index.
             const z = if (inst.image_address_components >= 3)
-                try self.source(try imageAddressOperand(inst, 2), .bits32)
+                try self.source(try imageIntegerAddressOperand(inst, 2), .bits32)
             else
                 try self.constant(.bits32, 0);
             try self.emit(&self.body, 80, &.{ self.vector3_bits_type, coordinates, x, y, z }); // OpCompositeConstruct
@@ -5044,14 +5067,14 @@ const Builder = struct {
             return Error.InvalidStorageBinding;
         }
 
-        const x = try self.source(try imageAddressOperand(inst, 0), .bits32);
-        const y = try self.source(try imageAddressOperand(inst, 1), .bits32);
+        const x = try self.source(try imageIntegerAddressOperand(inst, 0), .bits32);
+        const y = try self.source(try imageIntegerAddressOperand(inst, 1), .bits32);
         const coordinates = self.id();
         if (binding.dimension == .two_d) {
             try self.emit(&self.body, 80, &.{ try self.ensureBitsVec2(), coordinates, x, y }); // OpCompositeConstruct
         } else {
             if (inst.image_address_components < 3) return Error.UnsupportedOpcode;
-            const z = try self.source(try imageAddressOperand(inst, 2), .bits32);
+            const z = try self.source(try imageIntegerAddressOperand(inst, 2), .bits32);
             try self.emit(&self.body, 80, &.{ try self.ensureBitsVec3(), coordinates, x, y, z }); // OpCompositeConstruct
         }
         const sampled_image = try self.loadSampledImage(binding);
@@ -5060,7 +5083,7 @@ const Builder = struct {
         if (binding.candidate_words != null) try self.emit(&self.annotations, 71, &.{ image, 5300 }); // NonUniform
         const texel = self.id();
         const lod = if (explicit_mip)
-            try self.source(try imageAddressOperand(inst, coordinate_components), .bits32)
+            try self.source(try imageIntegerAddressOperand(inst, coordinate_components), .bits32)
         else
             try self.constant(.bits32, 0);
         try self.emit(&self.body, 95, &.{
@@ -5393,6 +5416,15 @@ const Builder = struct {
 
     fn sampleCoordinates(_: *Builder, raw_x: u32, raw_y: u32) Error![2]u32 {
         return .{ raw_x, raw_y };
+    }
+
+    fn imageIntegerAddressOperand(inst: instruction.Instruction, component: u32) Error!operand.Operand {
+        if (!inst.image_sample_flags.a16) return imageAddressOperand(inst, component);
+        // A16 packs unsigned X/Y and Z/mip pairs into address VGPRs. NSA
+        // selects each packed register, not each individual 16-bit component.
+        var result = try imageAddressOperand(inst, component / 2);
+        result.sdwa_sel = @intCast(4 + component % 2);
+        return result;
     }
 
     fn imageAddressOperand(inst: instruction.Instruction, component: u32) Error!operand.Operand {

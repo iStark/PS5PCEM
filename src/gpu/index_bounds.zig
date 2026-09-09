@@ -532,6 +532,92 @@ pub fn scalarLaneDefinition(instructions: []const Instruction, graph: *const Gra
     return .{ .instruction = vector_index, .component = inst.src0.reg - vector.dst.reg };
 }
 
+pub const LaneDefinitions = struct {
+    items: [32]Definition = undefined,
+    count: usize = 0,
+};
+
+/// A masked vector replacement retains the previous value in inactive lanes.
+/// Keep both producers until an earlier write covers the consumer's mask.
+/// An entry value or an incomplete proof must retain the unbounded fallback.
+fn possibleLaneDefinitions(instructions: []const Instruction, graph: *const Graph, before: usize, register: u32, mask_before: usize, mask_register: u32) ?LaneDefinitions {
+    var result = LaneDefinitions{};
+    var pending: [33]usize = undefined;
+    pending[0] = before;
+    var count: usize = 1;
+    var cursor: usize = 0;
+    while (cursor < count) : (cursor += 1) {
+        const definitions = reachingDefinitions(instructions, graph, pending[cursor], .{ .register = register, .lane = std.math.maxInt(u32) }) orelse return null;
+        if (definitions.entry or definitions.count == 0) return null;
+        for (definitions.items[0..definitions.count]) |index| {
+            var duplicate = false;
+            for (result.items[0..result.count]) |item| duplicate = duplicate or item.instruction == index;
+            if (duplicate) continue;
+            const inst = instructions[index];
+            if (inst.dst.kind != .vgpr or inst.dst.reg > register or inst.dst.sdwa_sel != 6 or inst.dst.omod != 0 or inst.dst.clamp or inst.opcode == .v_writelane_b32) return null;
+            if (result.count == result.items.len) return null;
+            result.items[result.count] = .{ .instruction = index, .component = register - inst.dst.reg };
+            result.count += 1;
+            var proof = MaskProof{};
+            if (maskIsSubsetOfVectorWrite(instructions, graph, mask_before, mask_register, index, &proof) and proof.has_origin) continue;
+            if (count == pending.len) return null;
+            pending[count] = index;
+            count += 1;
+        }
+    }
+    return result;
+}
+
+pub fn vectorLaneDefinitions(instructions: []const Instruction, graph: *const Graph, before: usize, register: u32) ?LaneDefinitions {
+    return possibleLaneDefinitions(instructions, graph, before, register, before, 126);
+}
+
+test "masked index replacements retain the initialized and replacement producers" {
+    const exec = rdna2.Operand{ .kind = .exec_lo };
+    const saved = rdna2.Operand{ .kind = .sgpr, .reg = 8 };
+    const vector = rdna2.Operand{ .kind = .vgpr, .reg = 15 };
+    var instructions = [_]Instruction{
+        .{ .pc = 0, .opcode = .s_mov_b64, .dst = saved, .src0 = exec },
+        .{ .pc = 4, .opcode = .image_gather4, .dst = vector, .data_words = 4 },
+        .{ .pc = 8, .opcode = .s_and_saveexec_b64, .dst = .{ .kind = .sgpr, .reg = 10 }, .src0 = .{ .kind = .integer_inline_constant, .value = 1 } },
+        .{ .pc = 12, .opcode = .s_cbranch_execz, .branch_target = 20 },
+        .{ .pc = 16, .opcode = .v_mov_b32, .dst = vector, .src0 = .{ .kind = .integer_inline_constant, .value = 1 } },
+        .{ .pc = 20, .opcode = .s_mov_b64, .dst = exec, .src0 = saved },
+        .{ .pc = 24, .opcode = .v_readfirstlane_b32, .dst = .{ .kind = .sgpr, .reg = 20 }, .src0 = vector },
+        .{ .pc = 28, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    const definitions = scalarLaneDefinitions(&instructions, &graph, 7, 20, 0).?;
+    try std.testing.expectEqual(@as(usize, 2), definitions.count);
+    for (definitions.items[0..definitions.count]) |definition| {
+        try std.testing.expect(definition.instruction == 1 or definition.instruction == 4);
+        try std.testing.expectEqual(@as(u32, 0), definition.component);
+    }
+    // If the original gather was skipped, restored lanes have an unknown
+    // entry value and cannot be bounded from the conditional replacement.
+    instructions[1] = .{ .pc = 4, .opcode = .s_nop };
+    try std.testing.expect(scalarLaneDefinitions(&instructions, &graph, 7, 20, 0) == null);
+}
+
+pub fn scalarLaneDefinitions(instructions: []const Instruction, graph: *const Graph, before: usize, register: u32, depth: u32) ?LaneDefinitions {
+    if (depth == 16) return null;
+    const index = reachingDefinition(instructions, graph, before, .{ .register = register }) orelse return null;
+    const inst = instructions[index];
+    if (inst.opcode == .s_mov_b32 and inst.src0.kind == .sgpr) return scalarLaneDefinitions(instructions, graph, index, inst.src0.reg, depth + 1);
+    if (inst.src0.kind != .vgpr) return null;
+    var lane_index = index;
+    var mask_register: usize = 126;
+    if (inst.opcode == .v_readlane_b32) {
+        const lane_register = @import("scalar_provenance.zig").scalarRegisterIndex(inst.src1) orelse return null;
+        lane_index = reachingDefinition(instructions, graph, index, .{ .register = @intCast(lane_register) }) orelse return null;
+        const lane = instructions[lane_index];
+        if (lane.opcode != .s_ff1_i32_b64) return null;
+        mask_register = @import("scalar_provenance.zig").scalarRegisterIndex(lane.src0) orelse return null;
+    } else if (inst.opcode != .v_readfirstlane_b32) return null;
+    return possibleLaneDefinitions(instructions, graph, index, inst.src0.reg, lane_index, @intCast(mask_register));
+}
+
 fn scalarBitUpperBound(instructions: []const Instruction, graph: *const Graph, before: usize, register: u32, depth: u32) ?u32 {
     const definition = scalarLaneDefinition(instructions, graph, before, register, depth) orelse return null;
     const vector = instructions[definition.instruction];

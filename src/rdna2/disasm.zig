@@ -117,7 +117,10 @@ pub fn formatInstruction(inst: Instruction, w: *Writer) Writer.Error!void {
             if (inst.globally_coherent) try w.writeAll(" glc");
             if (inst.system_coherent) try w.writeAll(" slc");
         },
-        .mimg => try w.print(" dmask:0x{x} dim:{s}", .{ inst.data_mask, @tagName(inst.image_dimension) }),
+        .mimg => {
+            try w.print(" dmask:0x{x} dim:{s}", .{ inst.data_mask, @tagName(inst.image_dimension) });
+            if (inst.image_sample_flags.a16) try w.writeAll(" a16");
+        },
         .exp => try w.print(" target:{d} en:0x{x}{s}", .{
             inst.export_target,
             inst.export_enable,

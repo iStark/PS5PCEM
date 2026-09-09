@@ -2,6 +2,94 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Material selection and attachment reads on 2026-09-09
+
+A fresh run of `0ac4a2e` displays the loading indicator and Digital Deluxe
+Bonus, then accepts Cross and displays Gift of the Northern Star. A trace of
+frame 1005 identifies two remaining draw refusals in the streamed scene.
+
+Pixel program `0x8000273400` samples a 136-byte material table at `0x23b4`.
+Its index comes from a texture gather, with a conditional selection replacing
+only some lanes. Requiring one vector definition loses the integer texture's
+bound. The resulting wrapped-offset scan treats ordinary float fields as T#
+descriptors, including a false 1D-array address `0x3e4ccccd00`. Index recovery
+now merges the possible producers, retaining earlier values in inactive lanes.
+It remains unbounded if any path reaches an uninitialized value or the mask
+proof is incomplete. The captured shader resolves to its gather and conditional
+selection producers. GPU cases cover conditional replacement, skipped branches,
+signed/unsigned byte and short indices, and descriptor-like decoy fields.
+
+The decal passes also prepare the same `IMAGE_LOAD` as both a sampled fetch
+and a storage image. Translation chooses the exact sampled mapping, but the
+unused storage alias rejects the draw when it overlaps a color attachment.
+Resource preparation now follows that translation choice. Sampled feedback
+recognition includes every active color attachment, including secondary MRTs.
+Writes retain their existing storage-image handling.
+
+A queued-draw regression additionally exposed stale sampled snapshots with
+canonical alias tracking disabled: three additions of 0.25 returned only 0.25.
+Completed-frame generations advanced only during readback, so the texture cache
+could accept its old copy before publishing the pending attachment write.
+Sample generations now also include the resident attachment sequence. The same
+regression returns 0.75 after three queued draws. The full Vulkan smoke,
+descriptor-reuse, typed-index and selected-index probes pass SDK synchronization
+validation; the index-analysis suite passes 88 tests.
+
+The rebuilt runner reaches Digital Deluxe Bonus with readable text and its
+Cross glyph. Frame 1006 accepts the material and decal passes; the run records
+no `UnsupportedSampledImage` or `UnsupportedStorageImage` refusal. Its G-buffer
+contains the textured tree, and the later HDR input contains orange highlights,
+while final composition remains black behind the notice.
+
+This also exposes an obsolete empty-scene HDR workaround. Program
+`0x8000405d00` samples the intermediate lighting/upscale result, not the original
+G-buffer. Checking that input for raster exports cannot establish an empty
+scene. The workaround substituted constant HDR and a fixed-size RG16F plane,
+including when dynamic resolution used different dimensions. The normal
+translated resolve and the game's clears are now restored. The captured
+compositor uses that RG16F plane for UV displacement; its previous description
+as exposure was incorrect. The full
+Vulkan smoke passes synchronization validation after removing the workaround;
+fresh live verification of complete title-menu composition is still pending.
+
+The native resolve run preserves all three bonus notices and the brightness
+screen, including the wolf, slider and Cross glyph. In frame 1002, however,
+the temporal upscaler reads an older 3840x2160 target at `0x505ab20000`
+(slot 27), while the latest raster output occupies its 3328x1872 view
+(slot 34). All three upscale outputs and the following HDR resolve are zero.
+Storage-image binding now selects the newest compatible resident target; if
+only an older, larger target covers the requested extent, its overlap is
+refreshed from the latest view on the GPU. A regression queues a red 32x32
+raster output after a blue 64x64 view of the same allocation. Both 32x32 and
+64x64 storage consumers read the new red pixels under synchronization validation.
+
+Upscaler program `0x1d85d00` also uses A16 integer addressing at `0x100`,
+packing X/Y into the low/high halves of one VGPR. Image loads, stores and
+atomics now unpack integer A16 coordinates rather than treating adjacent
+VGPRs as independent 32-bit coordinates. A 4x4 GPU copy probe poisons that
+adjacent register and checks every resulting texel. The full Vulkan smoke
+passes synchronization validation with both fixes. Floating-point sampler
+A16 and packed D16 image data remain outside this change.
+
+Frame 1006 of the A16/DRS runner confirms that the upscaler now reads the
+latest 3328x1872 target (slot 34). Its final color output remains zero. The
+captured upscaler also contains VOP3P MIX instructions, including `0x81c`,
+which were incorrectly translated as ordinary F32 FMA. Packed F16 add,
+multiply, FMA, min and max ignored half selectors and applied integer negation
+to the packed word. Translation now follows the
+[RDNA2 VOP3P semantics](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture):
+MIX selects input precision and halves, applies ABS before NEG, and packed
+operations select and negate each input half separately. Floating inline
+constants use the RDNA2 low-half F16 encoding. The packed FMA uses a fused
+operation. The same MIX source handling corrects the F16-result variants.
+
+The new `--packed-floats` GPU probe has 13 numeric cases, also included in
+the default smoke. An isolated build with the preceding translator fails
+the first case (`0xc4803200` instead of `0x40d00000`, or 6.5). The corrected
+translator passes every case and the full Vulkan smoke under SDK
+synchronization validation. Live composition with these arithmetic fixes
+is still being checked.
+
 ## Driver pipeline cache and buffer-wait experiment on 2026-09-09
 
 The driver pipeline cache now accepts and saves up to 1 GiB, using the same
@@ -14,6 +102,12 @@ pipelines while the persisted file remained below the old cap.
 The ReleaseFast runner builds successfully; full Vulkan smoke runs both before
 and after saving the probe cache pass SDK 1.4.357.0 synchronization validation
 without warnings or errors. A large scene-cache reload is still to be measured.
+
+The subsequent material-fix run saves a 297,579,316-byte scene cache at flip
+1024, exceeding the previous limit. The following launch accepts and persists
+that cache. Heavy scene-transition compilation still occurs on the following
+launch; accepting the larger cache does not establish its elimination or a
+steady-state FPS improvement.
 
 A separate experiment tracked each persistent buffer's last GPU use and
 replaced whole-queue host waits with allocation-specific waits. It included

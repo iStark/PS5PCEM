@@ -2979,6 +2979,11 @@ const CachedSampledImage = struct {
     last_used_frame: u64,
 };
 
+fn sampledGraphicsWriteTarget(primary: GuestColorTarget, extra_colors: []const GuestColorTarget, address: u64) GuestColorTarget {
+    for (extra_colors) |target| if (target.descriptor.address == address) return target;
+    return primary;
+}
+
 const CachedResidentImageView = struct {
     image: vk.Image,
     view_type: u32,
@@ -3369,7 +3374,6 @@ pub const Renderer = struct {
     reported_yotei_gds_dispatches: u8 = 0,
     reported_yotei_visibility_dispatches: u8 = 0,
     yotei_packed_visibility_seeds: u8 = 0,
-    yotei_empty_scene_hdr_this_frame: bool = false,
     excessive_draw_reports: u8 = 0,
     last_dispatch_error: ?anyerror = null,
     last_shader_read_failure: ?struct { address: u64, size: usize, caller: usize } = null,
@@ -5257,21 +5261,6 @@ pub const Renderer = struct {
                 program_address,
             );
         }
-        if (program_address == 0x8000_405d_00 and
-            std.meta.eql(local_size, [3]u32{ 8, 8, 1 }) and
-            group_count[2] == 1)
-        {
-            if (try self.emulateYoteiEmptySceneHdrResolve(
-                memory,
-                &bindings,
-                reader,
-                analysis,
-                group_count,
-                program_address,
-            )) |report| {
-                return report;
-            }
-        }
         // Yotei's two reduction and two gather passes used to be quarantined
         // here. Correct EXEC state merging and Vulkan-valid dynamic sample
         // offsets make all four safe on NVIDIA, including repeated execution;
@@ -5423,6 +5412,7 @@ pub const Renderer = struct {
                 &scalar,
                 specialized_scalar_prefix_end,
                 null,
+                &.{},
             ) catch |err| {
                 // Keep NVIDIA's command stream alive if a future kernel exceeds
                 // the fixed physical descriptor budget. Unsupported formats
@@ -6563,213 +6553,6 @@ pub const Renderer = struct {
     /// complete 73-sample descriptor set while earlier dispatches are pending
     /// invalidates those submissions on current NVIDIA drivers just as surely
     /// as executing the kernel itself.
-    fn colorTargetHasExports(self: *const Renderer, address: u64) bool {
-        if (address == 0) return false;
-        for (self.render_targets.items) |cached| {
-            if (cached.target.descriptor.address == address and cached.color_export_generation != 0)
-                return true;
-        }
-        return false;
-    }
-
-    /// Yotei's HDR resolve (0x8000405d00) samples G-buffer colour and writes
-    /// the 4K RGBA16F / R11G11B10 HDR targets the composite reads. With no
-    /// mesh DRAW the G-buffer is empty, so this copies the same 0.25 env
-    /// fallback the lighting volume already uses — enough for a non-black
-    /// sky while geometry is still missing.
-    fn emulateYoteiEmptySceneHdrResolve(
-        self: *Renderer,
-        memory: GuestMemory,
-        bindings: *const gpu.ShaderBindings,
-        reader: gpu.ShaderMemoryReader,
-        analysis: *const gpu.ShaderAnalysis,
-        group_count: [3]u32,
-        program_address: u64,
-    ) anyerror!?DispatchReport {
-        const instructions = analysis.program.instructions.items;
-        var checkpoints = try self.prepareResourceCheckpoints(analysis, .resource, reader, bindings);
-        defer checkpoints.release();
-        const checkpoint_pcs = checkpoints.pcs;
-        const checkpoint_registers = checkpoints.snapshots;
-
-        var saw_sampled = false;
-        var sampled_has_exports = false;
-        var output_descriptors: [4]gpu.ImageDescriptor = undefined;
-        var output_count: usize = 0;
-        var fallback_slot: usize = 0;
-        for (instructions) |inst| {
-            const writable = switch (inst.opcode) {
-                .image_store, .image_store_mip => true,
-                .image_load, .image_sample => false,
-                else => continue,
-            };
-            if (inst.src1.kind != .sgpr) continue;
-            const scalar = gpu.ScalarEvaluation{
-                .registers = scalarRegistersAtCheckpoint(
-                    checkpoint_pcs,
-                    checkpoint_registers,
-                    inst.pc,
-                ).*,
-            };
-            const descriptor = (try resolveComputeImageDescriptor(
-                bindings,
-                reader,
-                analysis,
-                &scalar,
-                inst.src1.reg,
-                inst.pc,
-                fallback_slot,
-            )) orelse {
-                fallback_slot += 1;
-                continue;
-            };
-            fallback_slot += 1;
-            if (!writable) {
-                saw_sampled = true;
-                if (self.colorTargetHasExports(descriptor.address)) sampled_has_exports = true;
-                continue;
-            }
-            if (descriptor.unified_format != 71 and descriptor.unified_format != 36) continue;
-            var duplicate = false;
-            for (output_descriptors[0..output_count]) |existing| {
-                if (existing.address == descriptor.address) {
-                    duplicate = true;
-                    break;
-                }
-            }
-            if (duplicate or output_count >= output_descriptors.len) continue;
-            output_descriptors[output_count] = descriptor;
-            output_count += 1;
-        }
-        if (!saw_sampled or sampled_has_exports or output_count == 0) return null;
-
-        var filled: usize = 0;
-        for (output_descriptors[0..output_count]) |descriptor| {
-            var pattern: [8]u8 = @splat(0);
-            const pattern_length: usize = switch (descriptor.unified_format) {
-                36 => blk: {
-                    std.mem.writeInt(u32, pattern[0..4], 0x681a_0340, .little);
-                    break :blk 4;
-                },
-                71 => blk: {
-                    const quarter: f16 = 0.25;
-                    const one: f16 = 1.0;
-                    std.mem.writeInt(u16, pattern[0..2], @bitCast(quarter), .little);
-                    std.mem.writeInt(u16, pattern[2..4], @bitCast(quarter), .little);
-                    std.mem.writeInt(u16, pattern[4..6], @bitCast(quarter), .little);
-                    std.mem.writeInt(u16, pattern[6..8], @bitCast(one), .little);
-                    break :blk 8;
-                },
-                else => continue,
-            };
-            const texture = gpu.TextureLayout.fromImage(descriptor) catch continue;
-            const subresource = texture.subresource(descriptor.viewBaseLevel(), 0, 1) catch continue;
-            const staging_bytes = std.math.cast(usize, subresource.stagingBytes() catch continue) orelse continue;
-            const allocation_bytes = std.math.cast(usize, texture.required_source_bytes) orelse continue;
-            if (staging_bytes == 0 or staging_bytes > maximum_frame_bytes or
-                allocation_bytes == 0 or allocation_bytes > maximum_frame_bytes)
-            {
-                continue;
-            }
-            var linear_scratch = try self.image_scratch.acquire(self.allocator, staging_bytes);
-            defer linear_scratch.release();
-            const linear = linear_scratch.bytes;
-            fillRepeatedPattern(linear, pattern[0..pattern_length]);
-            var allocation_scratch = try self.image_scratch.acquire(self.allocator, allocation_bytes);
-            defer allocation_scratch.release();
-            const allocation = allocation_scratch.bytes;
-            @memset(allocation, 0);
-            subresource.tile(linear, allocation) catch continue;
-            if (!memory.write(memory.context, descriptor.address, allocation)) {
-                return Error.GuestMemoryWriteFailed;
-            }
-            self.invalidateDmaDestination(descriptor.address, allocation.len);
-            self.image_aliases.publishGuest(aliasRange(descriptor.address, allocation.len));
-            self.publishLinearStorageImage(memory, descriptor, linear) catch {};
-            self.noteComputeWrite(
-                "emulated-empty-scene-hdr",
-                descriptor.address,
-                descriptor.width,
-                descriptor.height,
-                descriptor.unified_format,
-            );
-            filled += 1;
-        }
-        if (filled == 0) return null;
-
-        {
-            const exposure = gpu.ImageDescriptor{
-                .address = 0x5061_3a00_00,
-                .width = 1920,
-                .height = 1080,
-                .depth_or_layers = 1,
-                .pitch = 1920,
-                .unified_format = 29,
-                .tile_mode = .render_target,
-                .image_type = .color_2d,
-                .dst_select = .{ 4, 5, 0, 1 },
-                .base_level = 0,
-                .last_level = 0,
-                .base_array = 0,
-                .array_pitch = 0,
-                .max_mip = 0,
-                .min_lod = 0,
-                .min_lod_warning = 0,
-                .bc_swizzle = 0,
-                .metadata_address = 0,
-                .dcc_enabled = false,
-                .cmask_fast_clear = false,
-                .fmask_compression = false,
-                .cmask_address = 0,
-                .fmask_address = 0,
-                .dcc_address = 0,
-                .descriptor_flags = 0,
-                .extended = false,
-            };
-            var rg: [4]u8 = undefined;
-            const one: f16 = 1.0;
-            std.mem.writeInt(u16, rg[0..2], @bitCast(one), .little);
-            std.mem.writeInt(u16, rg[2..4], @bitCast(one), .little);
-            if (gpu.TextureLayout.fromImage(exposure)) |texture| {
-                if (texture.subresource(0, 0, 1)) |subresource| blk: {
-                    const staging_bytes = std.math.cast(usize, subresource.stagingBytes() catch break :blk) orelse break :blk;
-                    const allocation_bytes = std.math.cast(usize, texture.required_source_bytes) orelse break :blk;
-                    if (staging_bytes == 0 or staging_bytes > maximum_frame_bytes or
-                        allocation_bytes == 0 or allocation_bytes > maximum_frame_bytes)
-                    {
-                        break :blk;
-                    }
-                    var linear_scratch = self.image_scratch.acquire(self.allocator, staging_bytes) catch break :blk;
-                    defer linear_scratch.release();
-                    const linear = linear_scratch.bytes;
-                    fillRepeatedPattern(linear, &rg);
-                    var allocation_scratch = self.image_scratch.acquire(self.allocator, allocation_bytes) catch break :blk;
-                    defer allocation_scratch.release();
-                    const allocation = allocation_scratch.bytes;
-                    @memset(allocation, 0);
-                    subresource.tile(linear, allocation) catch break :blk;
-                    if (memory.write(memory.context, exposure.address, allocation)) {
-                        self.invalidateDmaDestination(exposure.address, allocation.len);
-                        self.image_aliases.publishGuest(aliasRange(exposure.address, allocation.len));
-                        self.publishLinearStorageImage(memory, exposure, linear) catch {};
-                    }
-                } else |_| {}
-            } else |_| {}
-        }
-
-        self.yotei_empty_scene_hdr_this_frame = true;
-        self.emulated_dispatches += 1;
-        std.debug.print(
-            "[vulkan dcb] emulated Yotei empty-scene HDR resolve program=0x{x} outputs={d} groups={d}x{d}x{d}\n",
-            .{ program_address, filled, group_count[0], group_count[1], group_count[2] },
-        );
-        return .{
-            .pipeline_cache_hit = false,
-            .group_count = group_count,
-            .spirv_words = 0,
-        };
-    }
-
     fn emulateYoteiEnvironmentLightingFallback(
         self: *Renderer,
         memory: GuestMemory,
@@ -7179,14 +6962,6 @@ pub const Renderer = struct {
             if ((state.readRegister(.shader, register) orelse return null) != packed_value) return null;
         }
 
-        if (self.yotei_empty_scene_hdr_this_frame and
-            descriptor.address == 0x5061_3a00_00 and packed_value == 0)
-        {
-            self.emulated_dispatches += 1;
-            self.noteComputeWrite("emulated-packed-buffer", descriptor.address, 1920, 1080, 29);
-            return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
-        }
-
         var target_index: ?usize = null;
         const render = gpu.resources.decodeRenderState(state);
         for (render.color_targets) |maybe_target| {
@@ -7338,18 +7113,6 @@ pub const Renderer = struct {
             inline for (0..4) |index| {
                 const value = state.readRegister(.shader, 0x244 + index) orelse return null;
                 std.mem.writeInt(u32, pattern[index * 4 ..][0..4], value, .little);
-            }
-            // Composite 0x80003b7100 multiplies HDR by this 1920×1080 RG16F
-            // exposure plane. A later packed fill zeros it after the empty-
-            // scene HDR resolve, which made a filled HDR still present black.
-            if (self.yotei_empty_scene_hdr_this_frame and
-                descriptor.address == 0x5061_3a00_00 and packed_value == 0)
-            {
-                const one: u16 = @bitCast(@as(f16, 1.0));
-                var half: usize = 0;
-                while (half + 2 <= pattern.len) : (half += 2) {
-                    std.mem.writeInt(u16, pattern[half..][0..2], one, .little);
-                }
             }
             // A recurring clear must not allocate, poison and free tens of
             // MiB on each dispatch. Keep the repeated word pattern in a host
@@ -8176,6 +7939,7 @@ pub const Renderer = struct {
         scalar: *const gpu.ScalarEvaluation,
         specialized_scalar_prefix_end: u32,
         reserved_resources: ?*const ComputeResources,
+        sampled_mappings: []const rdna2.spirv.SampledImageBinding,
     ) anyerror!*ComputeResources {
         const result = try ComputeResources.acquire(self);
         errdefer result.deinit(self);
@@ -8479,6 +8243,16 @@ pub const Renderer = struct {
                 => true,
                 else => continue,
             };
+            if (!writable) {
+                var sampled = false;
+                for (sampled_mappings) |mapping| {
+                    sampled = sampled or (mapping.instruction_pc == inst.pc and mapping.resource_sgpr == inst.src1.reg and mapping.sampler_sgpr == inst.src2.reg);
+                }
+                // Translation gives an exact sampled fetch precedence over a
+                // storage binding. Preparing both can reject a legal attachment
+                // snapshot and transitions an image the shader never uses.
+                if (sampled) continue;
+            }
             if (inst.src1.kind != .sgpr) {
                 std.debug.print(
                     "[vulkan dcb] storage image pc=0x{x}: resource is {s}, not SGPR\n",
@@ -13942,6 +13716,7 @@ pub const Renderer = struct {
             reader,
             fragment_analysis,
             target,
+            extra_colors,
         );
         defer graphics_resources.deinit(self);
         const fragment_mapping_count = graphics_resources.mapping_count;
@@ -13952,6 +13727,7 @@ pub const Renderer = struct {
             reader,
             vertex_analysis,
             target,
+            extra_colors,
         );
         self.updateSampledImageDescriptors(
             graphics_resources.images[0..graphics_resources.image_count],
@@ -14069,6 +13845,7 @@ pub const Renderer = struct {
             &vertex_scalar_mut,
             vertex_scalar_end,
             null,
+            graphics_resources.mappings[fragment_mapping_count..graphics_resources.mapping_count],
         ) catch |err| blk: {
             if (log_verbose_gpu) std.debug.print(
                 "[vulkan dcb] vertex storage incomplete: {s}; translating without buffers\n",
@@ -14495,6 +14272,7 @@ pub const Renderer = struct {
             &fragment_scalar_mut,
             fragment_scalar_end,
             vertex_storage,
+            graphics_resources.mappings[0..fragment_mapping_count],
         ) catch |err| blk: {
             if (log_verbose_gpu) std.debug.print(
                 "[vulkan dcb] fragment storage incomplete: {s}; translating without buffers\n",
@@ -15939,6 +15717,7 @@ pub const Renderer = struct {
         reader: gpu.ShaderMemoryReader,
         analysis: *const gpu.ShaderAnalysis,
         render_target_write: GuestColorTarget,
+        extra_colors: []const GuestColorTarget,
     ) anyerror!*GraphicsResources {
         const result = try GraphicsResources.acquire(self);
         errdefer result.deinit(self);
@@ -15948,6 +15727,7 @@ pub const Renderer = struct {
             reader,
             analysis,
             render_target_write,
+            extra_colors,
         );
         return result;
     }
@@ -15959,6 +15739,7 @@ pub const Renderer = struct {
         reader: gpu.ShaderMemoryReader,
         analysis: *const gpu.ShaderAnalysis,
         render_target_write: GuestColorTarget,
+        extra_colors: []const GuestColorTarget,
     ) anyerror!void {
         const stage_mapping_start = result.mapping_count;
         const instructions = analysis.program.instructions.items;
@@ -16020,7 +15801,7 @@ pub const Renderer = struct {
                 inst.pc,
                 image_slot,
             )) orelse {
-                if (try self.appendIndirectGraphicsImages(result, bindings, reader, analysis, &sampled_scalar, inst, sampler_slot, render_target_write)) continue;
+                if (try self.appendIndirectGraphicsImages(result, bindings, reader, analysis, &sampled_scalar, inst, sampler_slot, render_target_write, extra_colors)) continue;
                 self.reportResourceFailure(bindings, inst, &sampled_scalar);
                 std.debug.print(
                     "[vulkan dcb] sampled image missing for s{d} (user_data={d} srt={any})\n",
@@ -16072,7 +15853,7 @@ pub const Renderer = struct {
                     sampler_descriptor,
                     physical_index,
                     sampled_dimension,
-                    render_target_write,
+                    sampledGraphicsWriteTarget(render_target_write, extra_colors, image_descriptor.address),
                 ) catch |err| {
                     std.debug.print(
                         "[vulkan dcb] stageSampledImage failed: {s} pc=0x{x} dim={s} addr=0x{x} {d}x{d}x{d} pitch={d} fmt={d} type={s} tile={f} levels={d}..{d} base_array={d} dst={any} sampler(clamp={d}/{d}/{d} unorm={any} minmag={d}/{d} mip={d} lod={d:.3}..{d:.3})\n",
@@ -16138,6 +15919,7 @@ pub const Renderer = struct {
         inst: gpu.ShaderInstruction,
         sampler_slot: usize,
         target: GuestColorTarget,
+        extra_colors: []const GuestColorTarget,
     ) anyerror!bool {
         if (!self.sampled_image_nonuniform_indexing) return false;
         const candidates = (try resolveBufferImageCandidates(bindings, reader, analysis, scalar, inst)) orelse return false;
@@ -16163,7 +15945,7 @@ pub const Renderer = struct {
             if (slot == null) {
                 if (result.image_count >= self.device_info.sampled_image_capacity) return Error.UnsupportedSampledImage;
                 slot = @intCast(result.image_count);
-                result.images[result.image_count] = self.stageSampledImage(descriptor, sampler, slot.?, dimension, target) catch |err| {
+                result.images[result.image_count] = self.stageSampledImage(descriptor, sampler, slot.?, dimension, sampledGraphicsWriteTarget(target, extra_colors, descriptor.address)) catch |err| {
                     self.reportResourceFailure(bindings, inst, scalar);
                     if (self.traceCurrentGraphicsFrame()) std.debug.print(
                         "[vulkan dcb] indirect sampled image failed: {s} stage={s} program=0x{x} pc=0x{x} candidate={d}/{d} addr=0x{x} type={s} dim={s} words={any}\n",
@@ -16686,6 +16468,25 @@ pub const Renderer = struct {
         self.frame_profile.texture_upload_bytes +%= linear.len;
     }
 
+    fn latestStorageRenderTarget(self: *Renderer, descriptor: gpu.ImageDescriptor, format: StorageImageFormat) !?usize {
+        const latest = self.latestRenderTargetAtAddress(descriptor, format.vulkan) orelse return null;
+        const source = self.render_targets.items[latest];
+        if (storageImageCanAliasRenderTarget(source.initialized, source.target.descriptor.fragments_log2, source.target.descriptor.address, source.target.descriptor.width, source.target.descriptor.height, source.target.format.vulkan, source.target.format.bytes_per_texel, descriptor, format)) return latest;
+
+        // A smaller DRS view may have the newest pixels while an older,
+        // larger image covers this descriptor. Refresh that covering image
+        // before a storage read, just as the sampled-image path already does.
+        var covering: ?usize = null;
+        for (self.render_targets.items, 0..) |cached, index| {
+            if (cached.target.format.vulkan != source.target.format.vulkan or
+                !storageImageCanAliasRenderTarget(cached.initialized, cached.target.descriptor.fragments_log2, cached.target.descriptor.address, cached.target.descriptor.width, cached.target.descriptor.height, cached.target.format.vulkan, cached.target.format.bytes_per_texel, descriptor, format)) continue;
+            if (covering == null or cached.last_used_sequence > self.render_targets.items[covering.?].last_used_sequence) covering = index;
+        }
+        const destination = covering orelse return null;
+        try self.copyRenderTargetOverlap(latest, destination);
+        return destination;
+    }
+
     fn stageStorageImage(
         self: *Renderer,
         descriptor: gpu.ImageDescriptor,
@@ -16742,6 +16543,7 @@ pub const Renderer = struct {
         // (host_generation stays 0). Match by address and extent; format may
         // only agree in texel size because the RT is created mutable.
         if (is_single_layer_2d or (descriptor.image_type == .color_2d and descriptor.depth_or_layers <= 1)) {
+            const selected_target = try self.latestStorageRenderTarget(descriptor, format);
             var address_hit: ?usize = null;
             for (self.render_targets.items, 0..) |cached, target_index| {
                 if (!storageImageCanAliasRenderTarget(
@@ -16758,6 +16560,7 @@ pub const Renderer = struct {
                     if (cached.target.descriptor.address == descriptor.address) address_hit = target_index;
                     continue;
                 }
+                if (selected_target != target_index) continue;
                 try self.transitionRenderTargetToStorage(target_index);
                 const view = try self.residentImageView(
                     cached.image.handle,
@@ -18090,7 +17893,15 @@ pub const Renderer = struct {
         for (self.completed_frames.items) |cached| {
             if (cached.guest_address == address) generation = @max(generation, cached.sequence);
         }
-        return generation;
+        // Completed frames change only after readback. A queued attachment
+        // write must invalidate an earlier sampled snapshot even with canonical
+        // alias tracking disabled, before a cache hit can bypass that readback.
+        var target_sequence: u64 = 0;
+        for (self.render_targets.items) |cached| {
+            if (!cached.initialized or !byteRangesOverlap(address, visible_bytes, cached.target.descriptor.address, cached.target.layout.required_source_bytes)) continue;
+            target_sequence = @max(target_sequence, cached.last_used_sequence);
+        }
+        return combineSourceGenerations(generation, target_sequence);
     }
 
     fn combineSourceGenerations(resident: u64, pages: u64) u64 {
@@ -19987,7 +19798,6 @@ pub const Renderer = struct {
         // So do the colour targets this frame bound. Carrying them into the
         // next flip would let one frame's composite vouch for another's.
         defer self.batch_color_targets.reset();
-        defer self.yotei_empty_scene_hdr_this_frame = false;
         if (log_verbose_gpu) std.debug.print(
             "[vulkan dcb] flip #{d} buffer={d} video_out={d} completed_frames={d}\n",
             .{ self.flip_callbacks, flip.display_buffer_index, flip.video_out_handle, self.completed_frames.items.len },
@@ -24180,9 +23990,26 @@ fn typedImageIndexRange(
     register: u32,
 ) ?TypedIndexRange {
     const instructions = analysis.program.instructions.items;
-    const definition = gpu.index_bounds.scalarLaneDefinition(instructions, &analysis.graph, before, register, 0) orelse return null;
+    const definitions = gpu.index_bounds.scalarLaneDefinitions(instructions, &analysis.graph, before, register, 0) orelse return null;
     var remaining: u32 = 64;
-    return typedVectorIndexRange(bindings, reader, analysis, scalar, definition, &remaining);
+    return typedDefinitionsIndexRange(bindings, reader, analysis, scalar, definitions, &remaining);
+}
+
+fn typedDefinitionsIndexRange(
+    bindings: *const gpu.ShaderBindings,
+    reader: gpu.ShaderMemoryReader,
+    analysis: *const gpu.ShaderAnalysis,
+    scalar: *const gpu.ScalarEvaluation,
+    definitions: gpu.index_bounds.LaneDefinitions,
+    remaining: *u32,
+) ?TypedIndexRange {
+    var result = TypedIndexRange{ .positive_limit = 0 };
+    for (definitions.items[0..definitions.count]) |definition| {
+        const range = typedVectorIndexRange(bindings, reader, analysis, scalar, definition, remaining) orelse return null;
+        result.positive_limit = @max(result.positive_limit, range.positive_limit);
+        result.negative_magnitude = @max(result.negative_magnitude, range.negative_magnitude);
+    }
+    return result;
 }
 
 fn typedIndexOperandRange(
@@ -24199,8 +24026,8 @@ fn typedIndexOperandRange(
         return if (op.value < 65536) .{ .positive_limit = op.value + 1 } else null;
     }
     if (op.kind != .vgpr) return null;
-    const definition = gpu.index_bounds.vectorLaneDefinition(analysis.program.instructions.items, &analysis.graph, before, op.reg) orelse return null;
-    return typedVectorIndexRange(bindings, reader, analysis, scalar, definition, remaining);
+    const definitions = gpu.index_bounds.vectorLaneDefinitions(analysis.program.instructions.items, &analysis.graph, before, op.reg) orelse return null;
+    return typedDefinitionsIndexRange(bindings, reader, analysis, scalar, definitions, remaining);
 }
 
 fn typedVectorIndexRange(

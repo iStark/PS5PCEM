@@ -255,20 +255,41 @@ fn runStorageImageCopyKernel(
     guest: *GuestMemory,
     backend: gpu.DcbBackend,
 ) !void {
-    const program = 0x1800;
+    try runStorageImageCopyCase(allocator, renderer, guest, backend, false);
+    try runStorageImageCopyCase(allocator, renderer, guest, backend, true);
+}
+
+fn runStorageImageCopyCase(
+    allocator: std.mem.Allocator,
+    renderer: *vulkan.Renderer,
+    guest: *GuestMemory,
+    backend: gpu.DcbBackend,
+    packed_coordinates: bool,
+) !void {
+    const program: u32 = if (packed_coordinates) 0x1400 else 0x1800;
     const width = 4;
     const height = 4;
     var program_cursor: usize = program;
     for (0..height) |y| {
         for (0..width) |x| {
-            guest.word(program_cursor, vop1(0x01, 0, @intCast(128 + x))); // v0 = x
-            guest.word(program_cursor + 4, vop1(0x01, 1, @intCast(128 + y))); // v1 = y
-            guest.word(program_cursor + 8, 0xf000_0f08); // image_load v4:v7, v[0:1], s[0:7]
-            guest.word(program_cursor + 12, 0x0000_0400);
-            guest.word(program_cursor + 16, 0xf020_0f0a); // image_store v4:v7, v0, s[8:15], NSA v1
-            guest.word(program_cursor + 20, 0x0002_0400);
-            guest.word(program_cursor + 24, 0x0000_0001);
-            program_cursor += 28;
+            if (packed_coordinates) {
+                guest.word(program_cursor, vop1(1, 0, 255));
+                guest.word(program_cursor + 4, @intCast(x | (y << 16)));
+                // The next VGPR is deliberately outside this 4x4 image.
+                guest.word(program_cursor + 8, vop1(1, 1, 192));
+                program_cursor += 12;
+            } else {
+                guest.word(program_cursor, vop1(1, 0, @intCast(128 + x)));
+                guest.word(program_cursor + 4, vop1(1, 1, @intCast(128 + y)));
+                program_cursor += 8;
+            }
+            const a16: u32 = if (packed_coordinates) 1 << 30 else 0;
+            guest.word(program_cursor, 0xf000_0f08); // image_load v4:v7, v[0:1], s[0:7]
+            guest.word(program_cursor + 4, 0x0000_0400 | a16);
+            guest.word(program_cursor + 8, 0xf020_0f0a); // image_store v4:v7, v0, s[8:15], NSA v1
+            guest.word(program_cursor + 12, 0x0002_0400 | a16);
+            guest.word(program_cursor + 16, 0x0000_0001);
+            program_cursor += 20;
         }
     }
     guest.word(program_cursor, 0xbf81_0000);
@@ -327,6 +348,7 @@ fn runStorageImageCopyKernel(
             }
         }
     }
+    std.debug.print("storage image coordinate copy passed: {s}\n", .{if (packed_coordinates) "A16 packed X/Y with poisoned adjacent VGPR" else "32-bit X/Y"});
 }
 
 fn runComputeSampledImageKernel(
@@ -606,6 +628,91 @@ fn runFragmentStorageProbe(
         } else try std.testing.expectEqual(@as(u32, 0x2222_1111), std.mem.readInt(u32, written, .little));
     }
     std.debug.print("fragment storage passed: RG array slice, per-pixel EXEC, color export, queued reuse, storage/sample consumers and writeback\n", .{});
+
+    const feedback_descriptor = sampledImageDescriptorWords(@intCast(color_address), extent, extent);
+    const feedback_code = [_]u32{
+        0xc801_0000,      0xc805_0100,
+        vop1(1, 5, 255),  0x4280_0000,
+        vop2(8, 2, 0, 5), vop2(8, 3, 1, 5),
+        vop1(7, 2, 258),  vop1(7, 3, 259),
+        0xf000_0f08, 0x0000_0402, // read the prior RGBA attachment texel
+        0xbf8c_3f70,
+        vop1(1, 8, 8), vop2(3, 4, 4, 8), // add .25 to its red channel
+        0xf800_080f,   0x0706_0504,
+        0xbf81_0000,
+    };
+    const feedback_program = 0xd400;
+    for (feedback_code, 0..) |word, index| guest.word(feedback_program + index * 4, word);
+    try state.writeRegister(.shader, pixel.programRegisterBase(), feedback_program >> 8);
+    for (feedback_descriptor, 0..) |word, index| try state.writeRegister(.shader, pixel.userDataBase() + @as(u32, @intCast(index)), word);
+    try state.writeRegister(.shader, pixel.userDataBase() + 8, 0x3e80_0000);
+    // Each queued draw must snapshot the output of the preceding draw, without
+    // aliasing the active attachment or reading a stale guest-memory copy.
+    for (0..3) |_| {
+        _ = try executor.execute(&stream);
+        if (renderer.last_draw_error != null) return error.FragmentStorageFeedbackRejected;
+    }
+    try renderer.flushPendingGuestWrites();
+    for ([_]usize{ 24, 40 }) |x| {
+        const value = guest.bytes[color_address + (32 * extent + x) * 4 ..][0..4];
+        std.debug.print("fragment attachment snapshot result x={d}: {any}\n", .{ x, value });
+        try std.testing.expect(value[0] >= 190 and value[0] <= 193);
+        try std.testing.expectEqualSlices(u8, &.{ 0, 255, 255 }, value[1..4]);
+    }
+    std.debug.print("fragment attachment snapshots passed: three queued reads and exports consume each preceding GPU result\n", .{});
+
+    // Keep the old 64x64 blue attachment resident, then render red into a
+    // smaller view of the same guest allocation. Storage reads must see the
+    // latest raster output, including when the consumer requests the old extent.
+    const resized_program = 0xd800;
+    const red_code = [_]u32{
+        vop1(1, 0, 242), vop1(1, 1, 128),
+        vop1(1, 2, 128), vop1(1, 3, 242),
+        0xf800_080f,     0x0302_0100,
+        0xbf81_0000,
+    };
+    for (red_code, 0..) |word, index| guest.word(resized_program + index * 4, word);
+    try state.writeRegister(.shader, pixel.programRegisterBase(), resized_program >> 8);
+    try state.writeRegister(.context, 0x319, 3);
+    try state.writeRegister(.context, 0x3b0, (31 << 14) | 31);
+    try state.writeRegister(.context, 0x00d, 32 | (32 << 16));
+    try state.writeRegister(.context, 0x095, 32 | (32 << 16));
+    _ = try executor.execute(&stream);
+    if (renderer.last_draw_error != null) return error.ResizedStorageSourceDrawFailed;
+
+    const consumer_program = 0xdc00;
+    const buffer = 0x18000;
+    const load_code = [_]u32{
+        vop1(1, 0, 144), vop1(1, 1, 144), // (16,16)
+        0xf000_0f08, 0x0000_0400, // image_load RGBA -> v4:v7
+        0xe078_0000, 0x8002_0400, // buffer_store_dwordx4 -> V#s8
+        0xbf81_0000,
+    };
+    for (load_code, 0..) |word, index| guest.word(consumer_program + index * 4, word);
+    var consumer_state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try consumer_state.writeRegister(.shader, compute.programRegisterBase(), consumer_program >> 8);
+    try consumer_state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try consumer_state.writeRegister(.shader, 0x213, 12 << 1);
+    for ([_]u32{ 0x207, 0x208, 0x209 }) |reg| try consumer_state.writeRegister(.shader, reg, 1);
+    for ([_]u32{ buffer, 4 << 16, 4, 0 }, 0..) |word, index|
+        try consumer_state.writeRegister(.shader, compute.userDataBase() + 8 + @as(u32, @intCast(index)), word);
+    var consumer = gpu.DcbExecutor{ .state = &consumer_state, .backend = backend, .allocator = allocator };
+    for ([_]u32{ 32, 64 }) |consumer_extent| {
+        const image = sampledImageDescriptorWords(@intCast(color_address), consumer_extent, consumer_extent);
+        for (image, 0..) |word, index|
+            try consumer_state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+        const translated_before = renderer.translated_dispatches;
+        _ = try consumer.execute(&.{ command(gpu.pm4.dispatch_direct, 4), 1, 1, 1, 0x41 });
+        try std.testing.expectEqual(translated_before + 1, renderer.translated_dispatches);
+        var readback: [16]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(buffer, &readback);
+        for ([_]f32{ 1, 0, 0, 1 }, 0..) |expected, component| {
+            const actual: f32 = @bitCast(std.mem.readInt(u32, readback[component * 4 ..][0..4], .little));
+            try std.testing.expectApproxEqAbs(expected, actual, 0.0001);
+        }
+        std.debug.print("resized storage attachment passed: newest 32x32 raster output, {d}x{d} consumer\n", .{ consumer_extent, consumer_extent });
+    }
 }
 
 fn runInlineMetadataBufferProbe(allocator: std.mem.Allocator) !void {
@@ -1379,6 +1486,62 @@ fn runDppProbe(allocator: std.mem.Allocator) !void {
         }
     }
     std.debug.print("DPP passed: row shifts, rotation, swizzles, masks and both permutation selectors across 64 lanes\n", .{});
+}
+
+fn runPackedFloatProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    var state = gpu.State{};
+    const stage = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, stage.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 7 << 1);
+    for ([_]u32{ 0x10000, 4 << 16, 1, 0 }, 0..) |word, index|
+        try state.writeRegister(.shader, stage.userDataBase() + @as(u32, @intCast(index)), word);
+    const half = struct {
+        fn pair(low: f32, high: f32) u32 {
+            return @as(u16, @bitCast(@as(f16, @floatCast(low)))) |
+                (@as(u32, @as(u16, @bitCast(@as(f16, @floatCast(high))))) << 16);
+        }
+    }.pair;
+    const Case = struct { opcode: u32 = 0x20, sel: u32 = 0, hi: u32 = 0, neg: u32 = 0, abs_or_hi_neg: u32 = 0, inline_one: bool = false, inputs: [3]u32, expected: u32 };
+    const mixed = [3]u32{ @bitCast(@as(f32, 2)), half(3, -4), @bitCast(@as(f32, 0.5)) };
+    const packed_inputs = [3]u32{ half(1.5, -2), half(0.5, 4), half(-1, 2) };
+    const cases = [_]Case{
+        .{ .hi = 2, .inputs = mixed, .expected = @bitCast(@as(f32, 6.5)) },
+        .{ .sel = 3, .hi = 2, .inputs = mixed, .expected = @bitCast(@as(f32, -7.5)) }, // FP32 ignores OP_SEL
+        .{ .sel = 2, .hi = 2, .abs_or_hi_neg = 2, .inputs = mixed, .expected = @bitCast(@as(f32, 8.5)) },
+        .{ .sel = 2, .hi = 2, .neg = 2, .abs_or_hi_neg = 2, .inputs = mixed, .expected = @bitCast(@as(f32, -7.5)) },
+        .{ .opcode = 0x21, .hi = 2, .inputs = mixed, .expected = 0x3555_0000 | (half(6.5, 0) & 0xffff) },
+        .{ .opcode = 0x22, .sel = 2, .hi = 2, .inputs = mixed, .expected = 0xb800 | (half(0, -7.5) & 0xffff_0000) },
+        .{ .opcode = 0x0f, .sel = 3, .hi = 5, .neg = 1, .abs_or_hi_neg = 2, .inputs = packed_inputs, .expected = half(6, -2.5) },
+        .{ .opcode = 0x10, .sel = 3, .hi = 5, .neg = 1, .abs_or_hi_neg = 2, .inputs = packed_inputs, .expected = half(8, 1) },
+        .{ .opcode = 0x0e, .sel = 3, .hi = 5, .neg = 1, .abs_or_hi_neg = 2, .inputs = packed_inputs, .expected = half(7, 3) },
+        .{ .opcode = 0x11, .sel = 3, .hi = 5, .neg = 1, .abs_or_hi_neg = 2, .inputs = packed_inputs, .expected = half(2, -2) },
+        .{ .opcode = 0x12, .sel = 3, .hi = 5, .neg = 1, .abs_or_hi_neg = 2, .inputs = packed_inputs, .expected = half(4, -0.5) },
+        .{ .opcode = 0x0f, .hi = 2, .inline_one = true, .inputs = packed_inputs, .expected = half(1.5, 5) },
+        .{ .opcode = 0x0f, .hi = 3, .inline_one = true, .inputs = packed_inputs, .expected = half(1.5, 4) }, // inline high half is zero
+    };
+    for (cases, 0..) |case, index| {
+        const program: u32 = 0x100 + @as(u32, @intCast(index)) * 0x100;
+        const code = [_]u32{
+            vop1(1, 0, 255),                                                                                          0x3555_b800,
+            0xcc00_0000 | (case.opcode << 16) | (case.sel << 11) | ((case.hi & 4) << 12) | (case.abs_or_hi_neg << 8), @as(u32, if (case.inline_one) 242 else 4) | (5 << 9) | (6 << 18) | ((case.hi & 3) << 27) | (case.neg << 29),
+            0xe070_0000,                                                                                              0x8000_0000,
+            0xbf81_0000,
+        };
+        for (code, 0..) |word, i| guest.word(program + i * 4, word);
+        for (case.inputs, 0..) |word, i| try state.writeRegister(.shader, stage.userDataBase() + 4 + @as(u32, @intCast(i)), word);
+        try state.writeRegister(.shader, stage.programRegisterBase(), program >> 8);
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+        var output: [4]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x10000, &output);
+        const actual = std.mem.readInt(u32, &output, .little);
+        std.debug.print("packed float case {d}: actual=0x{x} expected=0x{x}\n", .{ index, actual, case.expected });
+        try std.testing.expectEqual(case.expected, actual);
+    }
+    std.debug.print("packed float passed: MIX precision, half selection, ABS/NEG, preserved halves, packed arithmetic and inline constants\n", .{});
 }
 
 fn runSceneMaskProbe(allocator: std.mem.Allocator) !void {
@@ -3178,10 +3341,11 @@ fn runTypedIndexProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runTypedIndexSelectionProbe(allocator: std.mem.Allocator, selection: bool) !void {
-    for (0..@as(usize, if (selection) 8 else 28)) |case_index| {
+    for (0..@as(usize, if (selection) 16 else 28)) |case_index| {
         const format = ([_]u32{ 5, 6, 11, 12 })[case_index % 4];
         const mask_case = if (selection) 0 else case_index / 4;
-        const gather = selection and case_index >= 4;
+        const gather = selection and case_index % 8 >= 4;
+        const partial_selection = selection and case_index >= 8;
         const saved_after_fetch = mask_case == 1 or mask_case == 3;
         var renderer = try vulkan.Renderer.init(allocator, .{ .trace_resource_failures = true });
         defer renderer.deinit();
@@ -3199,11 +3363,11 @@ fn runTypedIndexSelectionProbe(allocator: std.mem.Allocator, selection: bool) !v
             if (selection) sop1(4, 106, 193) else 0xbf80_0000,
             if (selection) 0x0228_0080 | ((15 + @as(u32, @intCast(if (gather) case_index % 4 else 0))) << 9) else 0xbf80_0000,
             if (selection) 0x022a_2880 else 0xbf80_0000,
-            if (selection) vop1(1, 15, 277) else 0xbf80_0000,
-            if (saved_after_fetch) sop1(0x24, 106, 128) else 0xbf80_0000, // s_and_saveexec_b64 vcc, 0
-            if (mask_case == 3) 0xbf88_0001 else 0xbf80_0000,
-            0xbf80_0000,
-            if (saved_after_fetch) sop1(4, 126, 106) else 0xbf80_0000, // restore lanes after the conditional
+            if (selection and !partial_selection) vop1(1, 15, 277) else 0xbf80_0000,
+            if (partial_selection) 0x7da4_0081 else if (saved_after_fetch) sop1(0x24, 106, 128) else 0xbf80_0000, // CMPX EQ 1, v0 / s_and_saveexec_b64 vcc, 0
+            if (partial_selection or mask_case == 3) 0xbf88_0001 else 0xbf80_0000,
+            if (partial_selection) vop1(1, 15, 128) else 0xbf80_0000, // replace only the selected lanes; others keep the fetched index
+            if (partial_selection) sop1(4, 126, 32) else if (saved_after_fetch) sop1(4, 126, 106) else 0xbf80_0000, // restore lanes after the conditional
             if (mask_case == 3) sop1(0x24, 32, 193) else 0xbf80_0000, // another snapshot in the restored block
             sop1(4, 28, if (selection or mask_case == 3) 32 else 106),
             sop1(0x14, 30, 28),
@@ -3268,7 +3432,8 @@ fn runTypedIndexSelectionProbe(allocator: std.mem.Allocator, selection: bool) !v
         try renderer.readbackGuestStorageBuffer(0x10000, &output);
         for ([_]f32{ 1, 64.0 / 255.0, 0, 0, 0, 0 }, 0..) |expected, index| {
             const actual: f32 = @bitCast(std.mem.readInt(u32, output[index * 4 ..][0..4], .little));
-            try std.testing.expectApproxEqAbs(if (gather) 64.0 / 255.0 else expected, actual, 0.00001);
+            const selected_expected = if (partial_selection and index == 1) 1.0 else if (gather) 64.0 / 255.0 else expected;
+            try std.testing.expectApproxEqAbs(selected_expected, actual, 0.00001);
         }
         try std.testing.expectEqual(@as(u64, if (gather) 3 else 2), renderer.texture_cache_misses);
     }
@@ -4067,6 +4232,10 @@ pub fn main(init: std.process.Init) !void {
         try runSceneMaskProbe(allocator);
         return;
     }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--packed-floats")) {
+        try runPackedFloatProbe(allocator);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--storage-reuse")) {
         try runStorageImageReuseProbe(allocator);
         return;
@@ -4174,6 +4343,7 @@ pub fn main(init: std.process.Init) !void {
         try runPackedBufferProbe(allocator);
         return;
     }
+    if (args.len == 1) try runPackedFloatProbe(allocator);
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_graphics_probe = true });
     defer renderer.deinit();
     if (args.len == 3 and std.mem.eql(u8, args[1], "--probe-spv")) {
