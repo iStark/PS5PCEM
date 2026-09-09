@@ -2,6 +2,33 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Half-register writes and temporal resolve on 2026-09-09
+
+The captured temporal upscaler `0x1d85d00` exposes several independent
+half-register errors. SDWA destinations previously overwrote the complete
+VGPR, losing packed A16 coordinates and adjacent color/filter values. The
+destination path now implements byte/word selection with zero padding, sign
+extension or preservation. Ordinary single-result F16 operations also retain
+the other half, including a native exponent or multiply after a high-half
+SDWA write. EXEC-disabled lanes retain their original complete register.
+
+VOP3A now decodes input half selectors and the destination half for supported
+F16 results. F16 input modifiers operate on the floating value; inline float
+constants use their half-precision representation. MIN3/MAX3/MED3 consume all
+three inputs, and MIX shares the same half-input conversion. These follow the
+[RDNA2 instruction semantics](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture).
+
+The `--sdwa` GPU probe checks 39 numeric cases, including packed coordinates,
+all destination modes, high-half selection, native writes, modifiers and
+inactive lanes. It and the 13 packed-float cases pass the complete Vulkan
+smoke under SDK synchronization validation; 29 focused VOP tests also pass.
+An offline replay of the unmodified captured upscaler uses a constant
+16x16 HDR input `(0.25, 0.5, 1)`. Before the final preservation correction its
+center output is approximately `(4100, 8192, 16384)`. It now returns
+`(0.250244, 0.499756, 0.999512)`, with RGB output at all 256 pixels in both
+color targets and no validation errors. This establishes the resolve's
+numeric correction; complete live menu composition remains to be verified.
+
 ## Material selection and attachment reads on 2026-09-09
 
 A fresh run of `0ac4a2e` displays the loading indicator and Digital Deluxe

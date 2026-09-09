@@ -1569,7 +1569,6 @@ const Builder = struct {
                 final_value.id = clamped;
             }
         }
-        // SDWA destination packing is not modelled yet; keep the full dword.
         const index = registerIndex(op) orelse {
             // Writes to SCC/VCC/EXEC are tracked separately or ignored.
             if (op.kind == .vcc_lo or op.kind == .vcc_hi or
@@ -1581,6 +1580,32 @@ const Builder = struct {
             return Error.UnsupportedDestination;
         };
         var bits = try self.convert(final_value, .bits32);
+        if (op.sdwa_sel != 6) {
+            if (op.kind != .vgpr or op.sdwa_sel == 7) return Error.UnsupportedDestination;
+            const width: u5 = if (op.sdwa_sel < 4) 8 else 16;
+            const shift: u5 = if (op.sdwa_sel < 4)
+                @intCast(@as(u32, op.sdwa_sel) * 8)
+            else
+                @intCast(@as(u32, op.sdwa_sel - 4) * 16);
+            const low_mask = (@as(u32, 1) << width) - 1;
+            bits = try self.andBits(bits, low_mask);
+            if (op.sdwa_dst_unused == 1) bits = try self.signExtendBits(bits, width);
+            if (shift != 0) {
+                const shifted = self.id();
+                try self.emit(&self.body, 196, &.{ self.bits_type, shifted, bits, try self.constant(.bits32, shift) });
+                bits = shifted;
+            }
+            switch (op.sdwa_dst_unused) {
+                0, 1 => {}, // zero padding, or sign extension above the selected field
+                2 => {
+                    const kept = try self.andBits(try self.registerBits(index, 0), ~(low_mask << shift));
+                    const combined = self.id();
+                    try self.emit(&self.body, 197, &.{ self.bits_type, combined, bits, kept });
+                    bits = combined;
+                },
+                else => return Error.UnsupportedDestination,
+            }
+        }
         if (op.kind == .vgpr and !self.writing_lane) {
             if (self.dpp_write_predicate) |enabled| {
                 const previous = try self.registerBits(index, 0);
@@ -2031,8 +2056,8 @@ const Builder = struct {
     }
 
     fn vectorComparisonF16(self: *Builder, inst: instruction.Instruction, opcode: u16) Error!void {
-        const a = try self.unpackF16Low(try self.source(inst.src0, .bits32));
-        const b = try self.unpackF16Low(try self.source(inst.src1, .bits32));
+        const a = try self.sourceF16(inst.src0);
+        const b = try self.sourceF16(inst.src1);
         const result = self.id();
         try self.emit(&self.body, opcode, &.{ self.bool_type, result, a, b });
         try self.vectorConditionDestination(inst, result);
@@ -2313,21 +2338,56 @@ const Builder = struct {
         return result;
     }
 
+    fn sourceF16(self: *Builder, op: operand.Operand) Error!u32 {
+        var plain = op;
+        plain.absolute = false;
+        plain.negate = false;
+        if (op.kind == .float_inline_constant) {
+            plain.kind = .literal_constant;
+            plain.value = @as(u16, @bitCast(@as(f16, @floatCast(@as(f32, @bitCast(op.value))))));
+        }
+        var bits = try self.source(plain, .bits32);
+        if (op.op_sel and op.sdwa_sel == 6) bits = try self.shiftRightBits(bits, 16);
+        var value = try self.unpackF16Low(bits);
+        if (op.absolute) value = try self.glslFloatUnaryValue(4, value);
+        if (op.negate) {
+            const negated = self.id();
+            try self.emit(&self.body, 127, &.{ self.float_type, negated, value });
+            value = negated;
+        }
+        return value;
+    }
+
     fn binaryF16(self: *Builder, inst: instruction.Instruction, opcode: u16, reverse: bool) Error!void {
-        const a_bits = try self.source(if (reverse) inst.src1 else inst.src0, .bits32);
-        const b_bits = try self.source(if (reverse) inst.src0 else inst.src1, .bits32);
-        const a = try self.unpackF16Low(a_bits);
-        const b = try self.unpackF16Low(b_bits);
+        const a = try self.sourceF16(if (reverse) inst.src1 else inst.src0);
+        const b = try self.sourceF16(if (reverse) inst.src0 else inst.src1);
         const result = self.id();
         try self.emit(&self.body, opcode, &.{ self.float_type, result, a, b });
-        try self.destination(inst.dst, .{ .id = try self.packF16Low(result), .value_type = .bits32 });
+        try self.destinationF16(inst.dst, result);
     }
 
     fn glslBinaryF16(self: *Builder, inst: instruction.Instruction, opcode: u32) Error!void {
-        const a = try self.unpackF16Low(try self.source(inst.src0, .bits32));
-        const b = try self.unpackF16Low(try self.source(inst.src1, .bits32));
+        const a = try self.sourceF16(inst.src0);
+        const b = try self.sourceF16(inst.src1);
         const result = try self.glslBinaryValue(opcode, .float32, a, b);
-        try self.destination(inst.dst, .{ .id = try self.packF16Low(result), .value_type = .bits32 });
+        try self.destinationF16(inst.dst, result);
+    }
+
+    fn minMax3F16(self: *Builder, inst: instruction.Instruction) Error!void {
+        const a = try self.sourceF16(inst.src0);
+        const b = try self.sourceF16(inst.src1);
+        const c = try self.sourceF16(inst.src2);
+        const result = switch (inst.opcode) {
+            .v_min3_f16 => try self.glslBinaryValue(37, .float32, try self.glslBinaryValue(37, .float32, a, b), c),
+            .v_max3_f16 => try self.glslBinaryValue(40, .float32, try self.glslBinaryValue(40, .float32, a, b), c),
+            .v_med3_f16 => blk: {
+                const low = try self.glslBinaryValue(37, .float32, a, b);
+                const high = try self.glslBinaryValue(40, .float32, a, b);
+                break :blk try self.glslBinaryValue(40, .float32, low, try self.glslBinaryValue(37, .float32, high, c));
+            },
+            else => unreachable,
+        };
+        try self.destinationF16(inst.dst, result);
     }
 
     fn packedBinaryF16(self: *Builder, inst: instruction.Instruction, opcode: u16) Error!void {
@@ -2364,13 +2424,12 @@ const Builder = struct {
     }
 
     fn convertF16ToF32(self: *Builder, inst: instruction.Instruction) Error!void {
-        const bits = try self.source(inst.src0, .bits32);
-        try self.destination(inst.dst, .{ .id = try self.unpackF16Low(bits), .value_type = .float32 });
+        try self.destination(inst.dst, .{ .id = try self.sourceF16(inst.src0), .value_type = .float32 });
     }
 
     fn convertF32ToF16(self: *Builder, inst: instruction.Instruction) Error!void {
         const value = try self.source(inst.src0, .float32);
-        try self.destination(inst.dst, .{ .id = try self.packF16Low(value), .value_type = .bits32 });
+        try self.destinationF16(inst.dst, value);
     }
 
     fn unpackF16Pair(self: *Builder, bits: u32) Error![2]u32 {
@@ -2409,6 +2468,15 @@ const Builder = struct {
         if (op.negate) low = try self.floatNegateValue(low);
         if (op.negate_hi) high = try self.floatNegateValue(high);
         return self.packF16Pair(low, high);
+    }
+
+    fn destinationF16(self: *Builder, op: operand.Operand, value: u32) Error!void {
+        var half = op;
+        if (half.sdwa_sel == 6) {
+            half.sdwa_sel = 4;
+            half.sdwa_dst_unused = 2;
+        }
+        try self.destinationPackedF16(half, try self.packF16Low(value));
     }
 
     /// VOP3P CLAMP applies independently to both packed f16 results. The
@@ -2464,13 +2532,13 @@ const Builder = struct {
     }
 
     fn unaryF16(self: *Builder, inst: instruction.Instruction, glsl_opcode: u32) Error!void {
-        const value = try self.unpackF16Low(try self.source(inst.src0, .bits32));
+        const value = try self.sourceF16(inst.src0);
         const result = try self.glslFloatUnaryValue(glsl_opcode, value);
-        try self.destination(inst.dst, .{ .id = try self.packF16Low(result), .value_type = .bits32 });
+        try self.destinationF16(inst.dst, result);
     }
 
     fn reciprocalF16(self: *Builder, inst: instruction.Instruction) Error!void {
-        const value = try self.unpackF16Low(try self.source(inst.src0, .bits32));
+        const value = try self.sourceF16(inst.src0);
         const result = self.id();
         try self.emit(&self.body, 136, &.{
             self.float_type,
@@ -2478,27 +2546,27 @@ const Builder = struct {
             try self.constant(.float32, @bitCast(@as(f32, 1.0))),
             value,
         });
-        try self.destination(inst.dst, .{ .id = try self.packF16Low(result), .value_type = .bits32 });
+        try self.destinationF16(inst.dst, result);
     }
 
     fn fmaF16(self: *Builder, inst: instruction.Instruction) Error!void {
-        const a = try self.unpackF16Low(try self.source(inst.src0, .bits32));
-        const b = try self.unpackF16Low(try self.source(inst.src1, .bits32));
-        const c = try self.unpackF16Low(try self.source(inst.src2, .bits32));
+        const a = try self.sourceF16(inst.src0);
+        const b = try self.sourceF16(inst.src1);
+        const c = try self.sourceF16(inst.src2);
         const result = self.id();
         try self.emit(&self.body, 12, &.{ self.float_type, result, self.ensureGlslStd450(), 50, a, b, c });
-        try self.destination(inst.dst, .{ .id = try self.packF16Low(result), .value_type = .bits32 });
+        try self.destinationF16(inst.dst, result);
     }
 
     fn fmacF16(self: *Builder, inst: instruction.Instruction) Error!void {
-        const a = try self.unpackF16Low(try self.source(inst.src0, .bits32));
-        const b = try self.unpackF16Low(try self.source(inst.src1, .bits32));
+        const a = try self.sourceF16(inst.src0);
+        const b = try self.sourceF16(inst.src1);
         const acc = try self.unpackF16Low(try self.source(inst.dst, .bits32));
         const product = self.id();
         try self.emit(&self.body, 133, &.{ self.float_type, product, a, b });
         const result = self.id();
         try self.emit(&self.body, 129, &.{ self.float_type, result, product, acc });
-        try self.destination(inst.dst, .{ .id = try self.packF16Low(result), .value_type = .bits32 });
+        try self.destinationF16(inst.dst, result);
     }
 
     fn packedFmacF16(self: *Builder, inst: instruction.Instruction) Error!void {
@@ -2532,11 +2600,10 @@ const Builder = struct {
         var plain = op;
         plain.negate = false;
         plain.absolute = false;
-        var value = if (op.op_sel_hi) blk: {
-            const bits = try self.source(plain, .bits32);
-            const pair = try self.unpackF16Pair(bits);
-            break :blk pair[@intFromBool(op.op_sel)];
-        } else try self.source(plain, .float32);
+        var value = if (op.op_sel_hi)
+            try self.sourceF16(plain)
+        else
+            try self.source(plain, .float32);
         // MIX reuses NEG_HI as ABS, applied before NEG after f16 conversion.
         if (op.negate_hi or op.absolute) value = try self.glslFloatUnaryValue(4, value);
         if (op.negate) value = try self.floatNegateValue(value);
@@ -8430,9 +8497,7 @@ const Builder = struct {
             .v_max_i32 => try self.glslBinary(inst, 42, .sint32), // SMax
             .v_min3_f32, .v_max3_f32, .v_med3_f32 => try self.minMax3Float(inst, inst.opcode),
             .v_min3_i32, .v_min3_u32, .v_max3_i32, .v_max3_u32, .v_med3_i32, .v_med3_u32, .v_med3_i16 => try self.minMax3Integer(inst, inst.opcode),
-            .v_min3_f16 => try self.glslBinaryF16(inst, 37),
-            .v_max3_f16 => try self.glslBinaryF16(inst, 40),
-            .v_med3_f16 => try self.glslBinaryF16(inst, 40),
+            .v_min3_f16, .v_max3_f16, .v_med3_f16 => try self.minMax3F16(inst),
             .v_rcp_f32, .v_rcp_iflag_f32 => try self.reciprocalFloat(inst),
             .v_add_f16 => try self.binaryF16(inst, 129, false),
             .v_sub_f16 => try self.binaryF16(inst, 131, false),

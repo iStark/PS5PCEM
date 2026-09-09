@@ -618,12 +618,47 @@ pub fn decodeVop3(pc: u32, code: []const u32, word_index: u32) Error!Instruction
     if (inst.src_count >= 2) inst.src1 = try operand.decodeScalarSource((word1 >> 9) & 0x1ff);
     if (inst.src_count >= 3) inst.src2 = try operand.decodeScalarSource((word1 >> 18) & 0x1ff);
     const abs = if (carry_output) 0 else (word0 >> 8) & 7;
+    const op_sel = if (carry_output) 0 else (word0 >> 11) & 0xf;
     const neg = (word1 >> 29) & 7;
     const sources = [_]*operand.Operand{ &inst.src0, &inst.src1, &inst.src2 };
     for (sources, 0..) |src, i| {
         if (i >= inst.src_count) break;
         src.absolute = abs & (@as(u32, 1) << @intCast(i)) != 0;
         src.negate = neg & (@as(u32, 1) << @intCast(i)) != 0;
+        src.op_sel = op_sel & (@as(u32, 1) << @intCast(i)) != 0;
+    }
+    // VOP3A half results replace only the selected half of the destination.
+    // Reuse the SDWA insertion representation so EXEC masking and preservation
+    // happen in the same destination path for both instruction encodings.
+    switch (op) {
+        .v_cvt_f16_f32,
+        .v_cvt_f16_u16,
+        .v_cvt_f16_i16,
+        .v_rcp_f16,
+        .v_sqrt_f16,
+        .v_rsq_f16,
+        .v_log_f16,
+        .v_exp_f16,
+        .v_floor_f16,
+        .v_ceil_f16,
+        .v_trunc_f16,
+        .v_rndne_f16,
+        .v_add_f16,
+        .v_sub_f16,
+        .v_subrev_f16,
+        .v_mul_f16,
+        .v_fmac_f16,
+        .v_max_f16,
+        .v_min_f16,
+        .v_fma_f16,
+        .v_min3_f16,
+        .v_max3_f16,
+        .v_med3_f16,
+        => {
+            inst.dst.sdwa_sel = if (op_sel & 8 != 0) 5 else 4;
+            inst.dst.sdwa_dst_unused = 2;
+        },
+        else => {},
     }
     inst.dst.clamp = (word0 >> 15) & 1 != 0;
     inst.dst.omod = @intCast((word1 >> 27) & 3);

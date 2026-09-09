@@ -1622,6 +1622,78 @@ fn runPackedFloatProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("packed float passed: MIX precision, half selection, ABS/NEG, preserved halves, packed arithmetic and inline constants\n", .{});
 }
 
+fn runSdwaProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    var state = gpu.State{};
+    const stage = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, stage.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 7 << 1);
+    for ([_]u32{ 0x10000, 4 << 16, 1, 0 }, 0..) |word, index|
+        try state.writeRegister(.shader, stage.userDataBase() + @as(u32, @intCast(index)), word);
+    const Runner = struct {
+        fn check(r: *vulkan.Renderer, g: *GuestMemory, s: *gpu.State, index: usize, inputs: [3]u32, instructions: []const u32, expected: u32) !void {
+            const program: u32 = 0x100 + @as(u32, @intCast(index)) * 0x100;
+            for (inputs, 0..) |value, reg| {
+                try s.writeRegister(.shader, stage.userDataBase() + 4 + @as(u32, @intCast(reg)), value);
+                g.word(program + reg * 4, vop1(1, @intCast(reg), @intCast(4 + reg)));
+            }
+            for (instructions, 0..) |word, offset| g.word(program + 12 + offset * 4, word);
+            const end = program + 12 + instructions.len * 4;
+            g.word(end, 0xe070_0000);
+            g.word(end + 4, 0x8000_0000);
+            g.word(end + 8, 0xbf81_0000);
+            try s.writeRegister(.shader, stage.programRegisterBase(), program >> 8);
+            _ = try r.dispatchRdna2State(s, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+            var output: [4]u8 = undefined;
+            try r.readbackGuestStorageBuffer(0x10000, &output);
+            const actual = std.mem.readInt(u32, &output, .little);
+            std.debug.print("SDWA case {d}: actual=0x{x} expected=0x{x}\n", .{ index, actual, expected });
+            try std.testing.expectEqual(expected, actual);
+        }
+    };
+    const expected = [_][3]u32{
+        .{ 0x000000e1, 0xffffffe1, 0xaabbcce1 },
+        .{ 0x0000e100, 0xffffe100, 0xaabbe1dd },
+        .{ 0x00e10000, 0xffe10000, 0xaae1ccdd },
+        .{ 0xe1000000, 0xe1000000, 0xe1bbccdd },
+        .{ 0x000080e1, 0xffff80e1, 0xaabb80e1 },
+        .{ 0x80e10000, 0x80e10000, 0x80e1ccdd },
+    };
+    for (expected, 0..) |modes, selection| for (modes, 0..) |value, mode| {
+        const modifier: u32 = 1 | (@as(u32, @intCast(selection)) << 8) | (@as(u32, @intCast(mode)) << 11) | (6 << 16);
+        try Runner.check(&renderer, &guest, &state, selection * 3 + mode, .{ 0xaabbccdd, 0x987680e1, 0 }, &.{ vop1(1, 0, 249), modifier }, value);
+    };
+    const Case = struct { inputs: [3]u32, code: []const u32, expected: u32 };
+    const cases = [_]Case{
+        .{ .inputs = .{ 0xaabbccdd, 0x40400000, 0x40a00000 }, .code = &.{ vop1(8, 0, 249), 0x00061401, vop1(8, 0, 249), 0x00061502 }, .expected = 0x00050003 },
+        .{ .inputs = .{ 0x3c003800, 0x40003c00, 0x44004200 }, .code = &.{ (0x32 << 25) | (2 << 9) | 249, 0x05041501 }, .expected = 0x45003800 },
+        .{ .inputs = .{ 0x3c003800, 0xc0003c00, 0x44004200 }, .code = &.{ (0x32 << 25) | (2 << 9) | 249, 0x05351501 }, .expected = 0x40003800 },
+        .{ .inputs = .{ 0xaabbccdd, 0, 0x44004200 }, .code = &.{ (0x35 << 25) | (2 << 9) | 249, 0x058614f0 }, .expected = 0xaabb4000 },
+        .{ .inputs = .{ 0xaabbccdd, 0, 0x44004200 }, .code = &.{ (0x35 << 25) | (2 << 9) | 249, 0x0586b5f0 }, .expected = 0x3c00ccdd }, // omod x4 then clamp
+        .{ .inputs = .{ 0xaabbccdd, 0x40003800, 0 }, .code = &.{ vop1(0x54, 0, 249), 0x00051501 }, .expected = 0x3800ccdd },
+        .{ .inputs = .{ 0xaabbccdd, 0x40003800, 0 }, .code = &.{ vop1(0x58, 0, 249), 0x00051501 }, .expected = 0x4400ccdd },
+        .{ .inputs = .{ 0xaabbccdd, 0x3fc00000, 0 }, .code = &.{ vop1(0x0a, 0, 249), 0x00061501 }, .expected = 0x3e00ccdd },
+        .{ .inputs = .{ 0xaabbccdd, 0xc0003800, 0 }, .code = &.{ vop1(0x0b, 0, 249), 0x00350601 }, .expected = 0xc0000000 },
+        .{ .inputs = .{ 0xaabbccdd, 0x987680e1, 0 }, .code = &.{ 0xbefe0480, vop1(1, 0, 249), 0x00061501, 0xbefe04c1 }, .expected = 0xaabbccdd },
+        .{ .inputs = .{ 0x00003c00, 0, 0 }, .code = &.{ 0xcc204000, 0x0401e4f2 }, .expected = 0x40000000 }, // MIX: f32(1) * f32(1) + f16(1)
+        .{ .inputs = .{ 0x00003c00, 0, 0 }, .code = &.{ 0xcc204000, 0x1c01e4f2 }, .expected = 0x40000000 }, // MIX: all inputs f16, including inline ones
+        .{ .inputs = .{ 0x3c00, 0x4000, 0x4200 }, .code = &.{ 0xd7540000, 0x040a0300 }, .expected = 0x4200 }, // max(1,2,3)
+        .{ .inputs = .{ 0x3c00, 0x4000, 0x3800 }, .code = &.{ 0xd7510000, 0x040a0300 }, .expected = 0x3800 }, // min(1,2,.5)
+        .{ .inputs = .{ 0x3c00, 0x4200, 0x4000 }, .code = &.{ 0xd7570000, 0x040a0300 }, .expected = 0x4000 }, // median(1,3,2)
+        .{ .inputs = .{ 0x38003400, 0x3c003400, 0x40003000 }, .code = &.{ 0xd7542800, 0x040a0300 }, .expected = 0x38004000 }, // max(.5,.25,2), preserve high half
+        .{ .inputs = .{ 0x38003400, 0x3c003400, 0x40003000 }, .code = &.{ 0xd7546800, 0x040a0300 }, .expected = 0x40003400 }, // same result into high half
+        .{ .inputs = .{ 0x38003400, 0x3c003400, 0x40003000 }, .code = &.{ 0xd7511000, 0x040a0300 }, .expected = 0x38003000 }, // min(.25,1,.125)
+        .{ .inputs = .{ 0x38003400, 0x3c003400, 0x40003000 }, .code = &.{ 0xd7573800, 0x040a0300 }, .expected = 0x38003c00 }, // median(.5,1,2)
+        .{ .inputs = .{ 0x42003800, 0, 0 }, .code = &.{vop1(0x58, 0, 128)}, .expected = 0x42003c00 }, // native exp preserves a previously packed high half
+        .{ .inputs = .{ 0x42003800, 0x3c00, 0x4000 }, .code = &.{(0x35 << 25) | (2 << 9) | 257}, .expected = 0x42004000 }, // native mul preserves the other weight
+    };
+    for (cases, 0..) |case, index| try Runner.check(&renderer, &guest, &state, 18 + index, case.inputs, case.code, case.expected);
+    std.debug.print("SDWA passed: byte/word destinations, padding/sign/preservation, A16 coordinate packing, F16 math/modifiers and inactive EXEC\n", .{});
+}
+
 fn runSceneMaskProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -4314,6 +4386,10 @@ pub fn main(init: std.process.Init) !void {
         try runPackedFloatProbe(allocator);
         return;
     }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--sdwa")) {
+        try runSdwaProbe(allocator);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--storage-reuse")) {
         try runStorageImageReuseProbe(allocator);
         return;
@@ -4421,7 +4497,10 @@ pub fn main(init: std.process.Init) !void {
         try runPackedBufferProbe(allocator);
         return;
     }
-    if (args.len == 1) try runPackedFloatProbe(allocator);
+    if (args.len == 1) {
+        try runPackedFloatProbe(allocator);
+        try runSdwaProbe(allocator);
+    }
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_graphics_probe = true });
     defer renderer.deinit();
     if (args.len == 3 and std.mem.eql(u8, args[1], "--probe-spv")) {
