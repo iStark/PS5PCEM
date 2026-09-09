@@ -1846,6 +1846,78 @@ fn runPairedLds64Probe(allocator: std.mem.Allocator) !void {
     try renderer.readbackGuestStorageBuffer(0x10000, &output);
     for (0..64) |lane| try std.testing.expectEqual(@as(u32, @intCast(lane)), std.mem.readInt(u32, output[lane * 4 ..][0..4], .little));
     std.debug.print("LDS ADDTID passed: 64 independent lanes, M0 base and instruction byte offset without explicit EXEC access\n", .{});
+    try runLdsReadAliasProbe(allocator);
+}
+
+fn runLdsReadAliasProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const expected = [_]u32{ 0x1234_5678, 0xdead_beef, 0x7654_3210, 0x8765_4321 };
+    for ([_]u32{ 0x37, 0x38, 0x76, 0x77, 0x78, 0xfe, 0xff }) |opcode| {
+        const paired = opcode == 0x37 or opcode == 0x38 or opcode == 0x77 or opcode == 0x78;
+        const wide_pair = opcode == 0x77 or opcode == 0x78;
+        const words_per_value: u32 = if (wide_pair) 2 else 1;
+        const count: usize = switch (opcode) {
+            0x37, 0x38, 0x76 => 2,
+            0xfe => 3,
+            else => 4,
+        };
+        const scale: u32 = switch (opcode) {
+            0x38 => 256,
+            0x78 => 512,
+            0x77 => 8,
+            else => 4,
+        };
+        for ([_]u8{ 4, 5 }) |address_register| {
+            var code: std.ArrayList(u32) = .empty;
+            defer code.deinit(allocator);
+            try code.appendSlice(allocator, &.{ vop1(1, 0, 128), vop1(1, address_register, 255), 64 });
+            for (0..count) |index| {
+                const value_register: u8 = @intCast(10 + index);
+                const offset: u32 = if (paired)
+                    @as(u32, if (index / words_per_value == 0) 3 else 7) * scale + @as(u32, @intCast(index % words_per_value)) * 4
+                else
+                    16 + @as(u32, @intCast(index)) * 4;
+                try code.appendSlice(allocator, &.{
+                    vop1(1, value_register, 255),        expected[index],
+                    0xd800_0000 | (0x0d << 18) | offset, (@as(u32, value_register) << 8) | address_register,
+                });
+            }
+            try code.appendSlice(allocator, &.{
+                0xbf8a_0000,
+                0xd800_0000 | (opcode << 18) | @as(u32, if (paired) (7 << 8) | 3 else 16),
+                (4 << 24) | @as(u32, address_register),
+            });
+            for (0..count) |index| {
+                const store = mubuf(0x1c, @intCast(index * 4), @intCast(4 + index), 0, 0);
+                try code.appendSlice(allocator, &store);
+            }
+            try code.append(allocator, 0xbf81_0000);
+            for (code.items, 0..) |word, index| guest.word(0x100 + index * 4, word);
+            var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, 128);
+            defer analysis.deinit(allocator);
+            var module = try analysis.translateSpirv(allocator, .{
+                .stage = .compute,
+                .local_size = .{ 1, 1, 1 },
+                .workgroup_memory_size_bytes = 8192,
+                .storage_buffers = &.{.{ .resource_sgpr = 0, .descriptor_index = 0, .extent_bytes = 16 }},
+            });
+            defer module.deinit(allocator);
+            @memset(guest.bytes[0x10000..0x10010], 0xaa);
+            _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, 16);
+            _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+            var output: [16]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x10000, &output);
+            for (0..count) |index| {
+                const actual = std.mem.readInt(u32, output[index * 4 ..][0..4], .little);
+                if (actual != expected[index]) std.debug.print("LDS alias opcode=0x{x} address=v{d} word={d}\n", .{ opcode, address_register, index });
+                try std.testing.expectEqual(expected[index], actual);
+            }
+        }
+    }
+    std.debug.print("LDS address aliases passed: single and paired B32/B64/B96/B128 reads with first/interior destination overlap\n", .{});
 }
 
 fn runDispatcherBudgetProbe(allocator: std.mem.Allocator) !void {

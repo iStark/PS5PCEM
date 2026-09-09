@@ -6630,8 +6630,13 @@ const Builder = struct {
 
     fn dsReadWords(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
         const base_offset: u32 = @intCast(inst.memory_offset);
-        for (0..count) |index| {
-            const value = try self.loadDsWord(inst, base_offset + @as(u32, @intCast(index)) * 4);
+        // Every word uses the original address, even when the destination
+        // range includes its VGPR. Publish results only after all loads.
+        var values: [4]u32 = undefined;
+        for (values[0..count], 0..) |*value, index| {
+            value.* = try self.loadDsWord(inst, base_offset + @as(u32, @intCast(index)) * 4);
+        }
+        for (values[0..count], 0..) |value, index| {
             try self.destination(try consecutiveRegister(inst.dst, @intCast(index)), .{
                 .id = value,
                 .value_type = .bits32,
@@ -6649,18 +6654,21 @@ const Builder = struct {
 
     fn dsReadPair(self: *Builder, inst: instruction.Instruction) Error!void {
         const words_per_value: u32 = if (inst.data_words == 4) 2 else 1;
+        var values: [4]u32 = undefined;
         const offsets = [_]u32{
             @intCast(inst.memory_offset),
             @intCast(inst.secondary_memory_offset),
         };
         for (offsets, 0..) |offset, index| {
             for (0..words_per_value) |word| {
-                const value = try self.loadDsWord(inst, offset + @as(u32, @intCast(word)) * 4);
-                try self.destination(try consecutiveRegister(inst.dst, @intCast(index * words_per_value + word)), .{
-                    .id = value,
-                    .value_type = .bits32,
-                });
+                values[index * words_per_value + word] = try self.loadDsWord(inst, offset + @as(u32, @intCast(word)) * 4);
             }
+        }
+        for (values[0 .. 2 * words_per_value], 0..) |value, index| {
+            try self.destination(try consecutiveRegister(inst.dst, @intCast(index)), .{
+                .id = value,
+                .value_type = .bits32,
+            });
         }
     }
 

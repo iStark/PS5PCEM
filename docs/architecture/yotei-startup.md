@@ -19,6 +19,24 @@ offset: those instructions now request lane identity even without explicit EXEC
 access. All 16 focused LDS tests and the default GPU smoke pass. Live exposure
 and complete-menu validation remain in progress.
 
+The same filter reads two 32-bit words into `v12:v13` using the original `v12`
+as its address at PC `0xec`. Publishing the first result before computing the
+second address redirected that second read. Contiguous and paired LDS reads
+now load every word before writing any destination register. Fourteen GPU cases
+cover first/interior address overlap for paired B32/B64 and contiguous
+B64/B96/B128 reads, including both stride-64 forms. The previous code fails on
+the first paired B32 case; the correction passes these cases, the existing LDS
+suite and the default GPU smoke with clean SDK synchronization validation.
+
+The filter's coherent frame-936 capture was replayed on the RTX 3070 Ti and
+compared against a separate CPU nine-tap convolution of its captured RG16F
+input. Out of 131,072 output texels, 27,044 exceed one half-float ULP before
+either LDS correction, 16,994 after the paired-width/offset correction alone,
+and zero after retaining the original address as well. The final replay also
+passes SDK synchronization validation. Its input still contains large moment /
+weight ratios: the preceding X filter at `0x80003fb200` has the same address
+overlap at PC `0xbc`, so the complete live exposure chain still needs validation.
+
 ## Retaining dense lighting constants on 2026-09-09
 
 The dense environment shader at `0x80001fd400` completes its CPU resource walk
