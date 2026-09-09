@@ -5237,31 +5237,15 @@ pub const Renderer = struct {
         // Ballot compaction and shared-mask initialization are also safe with
         // the bounded dispatcher. Keeping them live is required for the
         // visibility lists consumed by the final composition pass.
-        // Yotei's full environment-lighting kernel is now translatable after
-        // native 2D-array storage and nested sampler-pointer recovery. Its
-        // deeply divergent 3,215-instruction loop still depends on wave-wide
-        // EXEC convergence, however, and reproducibly resets NVIDIA before
-        // the first draw. Preserve the zero-initialized lighting volume until
-        // subgroup control flow can execute this exact program safely.
+        // This volume kernel advances four depth slices per loop iteration.
+        // The default 256-block dispatcher cap stopped the captured workload
+        // after slice 27. Keep a bounded budget that covers all 64 slices.
         const yotei_environment_lighting =
             std.meta.eql(group_count, [3]u32{ 1, 64, 36 }) and
             analysis.program.instructions.items.len == 3215 and
             programHasRawInstruction(analysis, 0x138, &.{ 0xf090_0208, 0x0061_0300 }) and
             programHasRawInstruction(analysis, 0x2b74, &.{ 0xf020_2710, 0x0001_0058 }) and
             programHasRawInstruction(analysis, 0x48b0, &.{ 0xf020_2710, 0x0001_0058 });
-        const use_yotei_environment_lighting_fallback = !self.translate_compute_only and
-            self.device_info.vendor_id == 0x10de and
-            yotei_environment_lighting;
-        if (use_yotei_environment_lighting_fallback) {
-            return try self.emulateYoteiEnvironmentLightingFallback(
-                memory,
-                &bindings,
-                reader,
-                analysis,
-                group_count,
-                program_address,
-            );
-        }
         // Yotei's two reduction and two gather passes used to be quarantined
         // here. Correct EXEC state merging and Vulkan-valid dynamic sample
         // offsets make all four safe on NVIDIA, including repeated execution;
@@ -5792,6 +5776,7 @@ pub const Renderer = struct {
         var module = self.compute_translations.translate(self.allocator, &analysis.program, .{
             .stage = .compute,
             .local_size = local_size,
+            .maximum_dispatcher_iterations = if (yotei_environment_lighting) 2048 else 256,
             .wave32 = initiator & (1 << 15) != 0,
             .storage_buffers = resources.mappings[0..resources.mapping_count],
             .sampled_images = resources.sampled_image_mappings[0..resources.sampled_image_mapping_count],
@@ -6541,167 +6526,6 @@ pub const Renderer = struct {
             );
             self.yotei_packed_visibility_seeds +|= 1;
         }
-        return .{
-            .pipeline_cache_hit = false,
-            .group_count = group_count,
-            .spirv_words = 0,
-        };
-    }
-
-    /// Replaces Yotei's deeply divergent environment-lighting kernel on
-    /// NVIDIA. Resolve only its live writable T#s and initialize their tiled
-    /// guest allocations before any Vulkan descriptor staging. Preparing the
-    /// complete 73-sample descriptor set while earlier dispatches are pending
-    /// invalidates those submissions on current NVIDIA drivers just as surely
-    /// as executing the kernel itself.
-    fn emulateYoteiEnvironmentLightingFallback(
-        self: *Renderer,
-        memory: GuestMemory,
-        bindings: *const gpu.ShaderBindings,
-        reader: gpu.ShaderMemoryReader,
-        analysis: *const gpu.ShaderAnalysis,
-        group_count: [3]u32,
-        program_address: u64,
-    ) anyerror!DispatchReport {
-        const instructions = analysis.program.instructions.items;
-        var checkpoints = try self.prepareResourceCheckpoints(analysis, .resource, reader, bindings);
-        defer checkpoints.release();
-        const checkpoint_pcs = checkpoints.pcs;
-        const checkpoint_registers = checkpoints.snapshots;
-
-        var output_descriptors: [8]gpu.ImageDescriptor = undefined;
-        var output_count: usize = 0;
-        var fallback_slot: usize = 0;
-        for (instructions) |inst| {
-            const writable = switch (inst.opcode) {
-                .image_store,
-                .image_store_mip,
-                .image_atomic_add,
-                .image_atomic_umin,
-                .image_atomic_umax,
-                .image_atomic_and,
-                .image_atomic_or,
-                .image_atomic_xor,
-                .image_atomic_fmax,
-                => true,
-                .image_load => false,
-                else => continue,
-            };
-            if (inst.src1.kind != .sgpr) continue;
-            const scalar = gpu.ScalarEvaluation{
-                .registers = scalarRegistersAtCheckpoint(
-                    checkpoint_pcs,
-                    checkpoint_registers,
-                    inst.pc,
-                ).*,
-            };
-            const descriptor = (try resolveComputeImageDescriptor(
-                bindings,
-                reader,
-                analysis,
-                &scalar,
-                inst.src1.reg,
-                inst.pc,
-                fallback_slot,
-            )) orelse {
-                fallback_slot += 1;
-                continue;
-            };
-            fallback_slot += 1;
-            if (!writable) continue;
-            const expected = (descriptor.image_type == .color_3d and
-                descriptor.width == 256 and descriptor.height == 144 and
-                descriptor.depth_or_layers == 64 and
-                (descriptor.unified_format == 36 or descriptor.unified_format == 13)) or
-                (descriptor.image_type == .color_2d_array and
-                    descriptor.width == 128 and descriptor.height == 128 and
-                    descriptor.depth_or_layers == 256 and descriptor.unified_format == 22);
-            if (!expected) continue;
-            var duplicate = false;
-            for (output_descriptors[0..output_count]) |existing| {
-                if (existing.address == descriptor.address) {
-                    duplicate = true;
-                    break;
-                }
-            }
-            if (duplicate or output_count >= output_descriptors.len) continue;
-            output_descriptors[output_count] = descriptor;
-            output_count += 1;
-        }
-
-        var cleared: usize = 0;
-        for (output_descriptors[0..output_count]) |descriptor| {
-            var pattern: [4]u8 = @splat(0);
-            const pattern_length: usize = switch (descriptor.unified_format) {
-                // R11G11B10F with RGB=0.25. Using the exact packed texel keeps
-                // the neutral fallback deterministic across host formats.
-                36 => blk: {
-                    std.mem.writeInt(u32, &pattern, 0x681a_0340, .little);
-                    break :blk 4;
-                },
-                // R16F/R32F scalar outputs carry visibility/transmittance-like
-                // terms. One is the conservative unoccluded neutral value.
-                13 => blk: {
-                    std.mem.writeInt(u16, pattern[0..2], @bitCast(@as(f16, 1.0)), .little);
-                    break :blk 2;
-                },
-                22 => blk: {
-                    std.mem.writeInt(u32, &pattern, @bitCast(@as(f32, 1.0)), .little);
-                    break :blk 4;
-                },
-                else => continue,
-            };
-            const texture = gpu.TextureLayout.fromImage(descriptor) catch continue;
-            const array_layers = if (descriptor.image_type == .color_2d_array)
-                texture.layers
-            else
-                1;
-            const subresource = texture.subresource(
-                descriptor.viewBaseLevel(),
-                0,
-                array_layers,
-            ) catch continue;
-            const staging_bytes = std.math.cast(usize, subresource.stagingBytes() catch continue) orelse
-                continue;
-            const allocation_bytes = std.math.cast(usize, texture.required_source_bytes) orelse continue;
-            if (staging_bytes == 0 or staging_bytes > maximum_frame_bytes or
-                allocation_bytes == 0 or allocation_bytes > maximum_frame_bytes)
-            {
-                continue;
-            }
-            const linear = try self.allocator.alloc(u8, staging_bytes);
-            defer self.allocator.free(linear);
-            fillRepeatedPattern(linear, pattern[0..pattern_length]);
-            const allocation = try self.allocator.alloc(u8, allocation_bytes);
-            defer self.allocator.free(allocation);
-            @memset(allocation, 0);
-            subresource.tile(linear, allocation) catch continue;
-            if (!memory.write(memory.context, descriptor.address, allocation)) {
-                return Error.GuestMemoryWriteFailed;
-            }
-            self.invalidateDmaDestination(descriptor.address, allocation.len);
-            self.image_aliases.publishGuest(aliasRange(descriptor.address, allocation.len));
-            // Lighting samples this volume as a T# on the same frame. A guest
-            // upload detiles the just-written tiled bytes; publishing the
-            // linear 1.0/0.25 pattern into the storage cache lets that T#
-            // bind a GPU-resident copy instead.
-            self.publishLinearStorageImage(memory, descriptor, linear) catch {};
-            self.noteComputeWrite(
-                "emulated-env",
-                descriptor.address,
-                descriptor.width,
-                descriptor.height,
-                descriptor.unified_format,
-            );
-            cleared += 1;
-        }
-        if (cleared == 0) return Error.UnsupportedStorageImage;
-
-        self.emulated_dispatches += 1;
-        std.debug.print(
-            "[vulkan dcb] emulated NVIDIA-safe Yotei environment lighting program=0x{x} outputs={d} groups={d}x{d}x{d}\n",
-            .{ program_address, cleared, group_count[0], group_count[1], group_count[2] },
-        );
         return .{
             .pipeline_cache_hit = false,
             .group_count = group_count,

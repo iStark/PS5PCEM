@@ -2,6 +2,23 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Native environment-volume execution on 2026-09-09
+
+A captured dispatch of `0x8000253100` now stages, translates and executes on
+NVIDIA without validation errors in an isolated replay. Starting with empty
+output allocations exposes a separate limit: the default dispatcher budget
+stops the captured 64-slice calculation after slice 27. A budget of 2,048 block
+visits reaches slice 63. Single-group, 64-group, 2,240-group and the exact
+`1x64x36` dispatch pass SDK synchronization validation.
+
+The renderer now runs this identified guest kernel with the larger bounded
+budget. Its former neutral-color volume replacement is removed. Other kernels
+retain the existing default. A GPU regression checks early termination with a
+small budget, a complete 512-iteration loop and reuse of the earlier pipeline;
+that probe and the default smoke pass validation. These checks establish
+execution and coverage, not correct final lighting: two captured RGB outputs
+remain zero, and a complete live scene check is still required.
+
 ## Indirect command tail chains on 2026-09-09
 
 The comparison-destination build still produces a black trunk and records
@@ -16,8 +33,10 @@ Submission snapshots follow the same tail jumps and stop at the end of a
 chained parent. All 45 executor/scheduler tests pass, including a 150-link
 chain, repeated waits, conditional branch retention, recycled source commands,
 cycles and the unchanged bound on genuine nesting. The unreadable-range test
-now derives its address from the fixture's actual memory size. Live verification
-of this change is pending; normal scene composition is not yet achieved.
+now derives its address from the fixture's actual memory size. The live run
+passes dense scene loading without `IndirectBufferTooDeep` and preserves all
+three bonus notices. Its frame-1030 composite still has a black trunk and
+partial fire; normal scene composition is not yet achieved.
 
 ## Explicit VOP3 comparison destinations on 2026-09-09
 

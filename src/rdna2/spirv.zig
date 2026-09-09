@@ -234,6 +234,9 @@ fn colorExportValueType(color_type: ColorExportType) ValueType {
 pub const Options = struct {
     stage: Stage,
     local_size: [3]u32 = .{ 1, 1, 1 },
+    /// Bound unstructured control flow. Validated long-running kernels can
+    /// request enough block visits to finish their loops without removing it.
+    maximum_dispatcher_iterations: u32 = 256,
     /// Guest wave32 mode limits VALU scalar masks and EXEC lane indexing to
     /// the low word, independently of the host workgroup size.
     wave32: bool = false,
@@ -730,6 +733,7 @@ const Builder = struct {
     mutable_exec_mode_pointer: u32 = 0,
     dispatch_pc_pointer: u32 = 0,
     dispatch_iteration_pointer: u32 = 0,
+    maximum_dispatcher_iterations: u32 = 256,
     function_bits_pointer_type: u32 = 0,
     used_control_flow_fallback: bool = false,
     used_dispatcher: bool = false,
@@ -759,6 +763,7 @@ const Builder = struct {
             .ngg_lds_exports = options.ngg_lds_exports,
             .compute_inputs = options.compute_inputs,
             .local_size = options.local_size,
+            .maximum_dispatcher_iterations = options.maximum_dispatcher_iterations,
             .wave64_workgroup = options.wave64_workgroup,
             .wave32 = options.wave32,
             .fragment_extent = options.fragment_extent,
@@ -9584,10 +9589,9 @@ fn translateDispatcher(builder: *Builder, instructions: []const instruction.Inst
     }); // OpIEqual
     // The dispatcher is a correctness fallback for irreducible guest CFGs,
     // but malformed or not-yet-wave-converged state must never turn into an
-    // unbounded host-GPU loop. A 256-block budget is comfortably above the
-    // short state machines seen in frame setup while keeping one bad lane
-    // below Windows' GPU watchdog. Reaching the cap preserves all side effects
-    // produced so far and terminates only that invocation.
+    // unbounded host-GPU loop. The default covers short setup state machines;
+    // validated volume kernels require more visits to finish all depth slices.
+    // Reaching the cap preserves prior side effects and ends that invocation.
     const iteration = builder.id();
     try builder.emit(&builder.body, 61, &.{ builder.bits_type, iteration, builder.dispatch_iteration_pointer });
     const budget_done = builder.id();
@@ -9595,7 +9599,7 @@ fn translateDispatcher(builder: *Builder, instructions: []const instruction.Inst
         builder.bool_type,
         budget_done,
         iteration,
-        try builder.constant(.bits32, 256),
+        try builder.constant(.bits32, builder.maximum_dispatcher_iterations),
     }); // OpUGreaterThanEqual
     const done = builder.id();
     try builder.emit(&builder.body, 166, &.{ builder.bool_type, done, pc_done, budget_done }); // OpLogicalOr

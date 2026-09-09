@@ -1441,6 +1441,47 @@ fn runWideMaskProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("wide masks passed: SDWA/VOP3/U64 comparisons, VCC/SGPR pairs, saved EXEC, complementary lanes and 64/512 invocations\n", .{});
 }
 
+fn runDispatcherBudgetProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const store = mubuf(0x1c, 0, 0, 1, 4);
+    const code = [_]u32{
+        sop1(3, 0, 128), vop1(1, 1, 128), // Counter and output offset.
+        0xbf0a_ff00, 512, // s_cmp_lt_u32 s0, 512
+        0xbf84_0008, // Exit at pc 52.
+        0x8000_8100, // s_add_u32 s0, s0, 1
+        0xbf06_8100, // s_cmp_eq_u32 s0, 1
+        0xbf84_0001, // Inner selection forces dispatcher lowering.
+        0xbf80_0000,
+        vop1(1, 0, 0),
+        store[0],
+        store[1],
+        0xbf82_fff5, // Back to pc 8.
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, 64);
+    defer analysis.deinit(allocator);
+    for ([_][2]u32{ .{ 8, 2 }, .{ 2048, 512 }, .{ 8, 2 } }) |test_case| {
+        var module = try analysis.translateSpirv(allocator, .{
+            .stage = .compute,
+            .maximum_dispatcher_iterations = test_case[0],
+            .storage_buffers = &.{.{ .resource_sgpr = 4, .descriptor_index = 0, .extent_bytes = 4 }},
+        });
+        defer module.deinit(allocator);
+        try std.testing.expect(module.used_dispatcher);
+        guest.word(0x10000, 0);
+        _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, 4);
+        _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+        var output: [4]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x10000, &output);
+        try std.testing.expectEqual(test_case[1], std.mem.readInt(u32, &output, .little));
+    }
+    std.debug.print("dispatcher budgets passed: bounded early exit, 512 complete iterations and pipeline reuse\n", .{});
+}
+
 fn runWave64Probe(allocator: std.mem.Allocator) !void {
     for ([_][3]u32{ .{ 64, 1, 1 }, .{ 4, 4, 4 } }) |local_size| try runWave64Case(allocator, local_size);
     std.debug.print("wave64 passed: lane 63, full masks, carry bits and uniform EXEC branches across workgroup shapes\n", .{});
@@ -4462,6 +4503,10 @@ fn runWorkgroupImageTableProbe(allocator: std.mem.Allocator) !void {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--dispatcher-budget")) {
+        try runDispatcherBudgetProbe(allocator);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--workgroup-image-table")) {
         try runWorkgroupImageTableProbe(allocator);
         return;
