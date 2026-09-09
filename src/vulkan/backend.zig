@@ -847,9 +847,9 @@ const maximum_htile_bytes = 8 * 1024 * 1024;
 /// On-disk driver pipeline cache. Reused across runs so per-title shader
 /// compilation is paid once instead of on every launch.
 const pipeline_cache_path = "vulkan_pipeline_cache.bin";
-/// Streamed 3D scenes can exceed 256 MiB of driver pipelines. Keep persistence
+/// Streamed 3D scenes can exceed 1 GiB of driver pipelines. Keep persistence
 /// bounded without dropping every subsequent save once that scene is loaded.
-const maximum_pipeline_cache_bytes = 1024 * 1024 * 1024;
+const maximum_pipeline_cache_bytes = 2 * 1024 * 1024 * 1024;
 
 /// Reads the persisted driver pipeline cache, if any. Any failure — missing
 /// file, unreadable file, unreasonable size — returns null; the caller then
@@ -873,6 +873,8 @@ fn loadPipelineCacheBytes(allocator: std.mem.Allocator) ?[]u8 {
 /// silent: a cache is an optimization, and losing it only costs compilation
 /// time on the next run.
 fn savePipelineCacheBytes(self: *Renderer) void {
+    const generation = self.pipeline_cache_generation.load(.acquire);
+    if (generation == self.persisted_pipeline_cache_generation) return;
     var data_size: usize = 0;
     if (self.device_functions.get_pipeline_cache_data(self.device, self.driver_pipeline_cache, &data_size, null) != vk.success) {
         return;
@@ -893,6 +895,9 @@ fn savePipelineCacheBytes(self: *Renderer) void {
     const file = std.Io.Dir.cwd().createFile(io, pipeline_cache_path, .{ .truncate = true }) catch return;
     defer file.close(io);
     file.writePositionalAll(io, bytes, 0) catch return;
+    // A compiler worker may finish another pipeline while this snapshot is
+    // being written. Retain the sampled generation so that work is saved next.
+    self.persisted_pipeline_cache_generation = generation;
     if (data_size > 256 * 1024 * 1024)
         std.debug.print("[vulkan cache] persisted {d} MiB driver pipeline cache\n", .{data_size / (1024 * 1024)});
 }
@@ -1082,6 +1087,8 @@ const ComputePipelineCompileJob = struct {
             work.renderer.device_functions.destroy_shader_module(work.renderer.device, work.shader, null);
             work.shader = 0;
             work.failure = Error.ComputePipelineCreationFailed;
+        } else {
+            _ = work.renderer.pipeline_cache_generation.fetchAdd(1, .release);
         }
     }
 };
@@ -3403,6 +3410,9 @@ pub const Renderer = struct {
     checkpoint_scratch: gpu.resource_checkpoints.Pool = .{},
     /// Diagnostic switch for comparing the transient and resident upload paths.
     reuse_color_target_transfer: bool = true,
+    /// Compilation can finish on worker threads; only the render thread saves.
+    pipeline_cache_generation: std.atomic.Value(u64) = .init(0),
+    persisted_pipeline_cache_generation: u64 = 0,
 
     fn destroyResourcePools(self: *Renderer) void {
         self.image_scratch.deinit(self.allocator);
@@ -8697,6 +8707,7 @@ pub const Renderer = struct {
         if (self.device_functions.create_compute_pipelines(self.device, self.driver_pipeline_cache, 1, @ptrCast(&pipeline_info), null, @ptrCast(&pipeline)) != vk.success) {
             return Error.ComputePipelineCreationFailed;
         }
+        _ = self.pipeline_cache_generation.fetchAdd(1, .release);
         defer self.destroyPipeline(pipeline);
 
         const allocate_info = vk.CommandBufferAllocateInfo{
@@ -9422,6 +9433,7 @@ pub const Renderer = struct {
         ) != vk.success) {
             return Error.GraphicsPipelineCreationFailed;
         }
+        _ = self.pipeline_cache_generation.fetchAdd(1, .release);
         return pipeline;
     }
 
@@ -18850,6 +18862,7 @@ pub const Renderer = struct {
             null,
             @ptrCast(&self.detile_pipeline),
         ) != vk.success) return Error.ComputePipelineCreationFailed;
+        _ = self.pipeline_cache_generation.fetchAdd(1, .release);
     }
 
     fn computeDetileBuffer(

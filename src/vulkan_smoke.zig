@@ -3879,6 +3879,37 @@ fn runNormalizedColorProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("vertex entry ABI passed: attribute descriptors preserve NGG wave counts before SGPR reuse\n", .{});
 }
 
+fn pipelineCacheTimestamp(io: std.Io) !i96 {
+    const file = try std.Io.Dir.cwd().openFile(io, "vulkan_pipeline_cache.bin", .{});
+    defer file.close(io);
+    return (try file.stat(io)).mtime.nanoseconds;
+}
+
+fn runPipelineCacheProbe(allocator: std.mem.Allocator) !void {
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    const backend = renderer.dcbBackend(guest.interface());
+    const flip = gpu.state.Flip{ .video_out_handle = 1, .display_buffer_index = 0, .mode = 1, .argument = 0 };
+    _ = try renderer.smokeTest();
+    renderer.flip_callbacks = 1;
+    try std.testing.expect(backend.vtable.flip.?(backend.context, flip));
+    const first_write = try pipelineCacheTimestamp(io);
+    // The periodic save point must not rewrite an unchanged driver cache.
+    renderer.flip_callbacks = 127;
+    try std.testing.expect(backend.vtable.flip.?(backend.context, flip));
+    try std.testing.expectEqual(first_write, try pipelineCacheTimestamp(io));
+    // Creating a pipeline after that save must make the next snapshot dirty.
+    _ = try renderer.smokeTest();
+    renderer.flip_callbacks = 255;
+    try std.testing.expect(backend.vtable.flip.?(backend.context, flip));
+    try std.testing.expect(first_write != try pipelineCacheTimestamp(io));
+    std.debug.print("pipeline cache persistence passed: stable cache keeps its timestamp; later compilation is saved\n", .{});
+}
+
 fn runIntegerColorProbe(allocator: std.mem.Allocator) !void {
     try runNormalizedColorProbe(allocator);
     for (0..4) |case_index| {
@@ -5605,6 +5636,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--integer-colors")) {
         try runIntegerColorProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--pipeline-cache")) {
+        try runPipelineCacheProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--array-gradients")) {

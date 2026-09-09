@@ -2,6 +2,23 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Avoiding repeated driver-cache writes on 2026-09-09
+
+The intro's frame 128 spends 2,814 ms in presentation while persisting a roughly
+1 GiB driver cache, despite compiling no new pipelines. Periodic persistence now
+skips unchanged generations. Successful graphics, compute and detiling pipeline
+creation updates an atomic generation; a save records the generation it sampled
+so concurrent compilation still schedules a later save. The bounded file limit
+also increases from 1 to 2 GiB: the subsequent scene reports 1,055 MiB and the
+former limit discards every new snapshot.
+
+The `--pipeline-cache` GPU regression fails on the former implementation because
+an unchanged periodic snapshot rewrites the file. It now preserves the timestamp
+and verifies that later compilation produces a new snapshot. This probe and the
+default Vulkan smoke pass SDK synchronization validation. The capacity change
+addresses repeated-launch compilation; it does not establish a steady-frame FPS
+gain or complete scene rendering.
+
 ## Signed normalized color attachments on 2026-09-09
 
 After the experience selection, frame 1317 rejects five draws into the
