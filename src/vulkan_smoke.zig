@@ -1920,6 +1920,74 @@ fn runLdsReadAliasProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("LDS address aliases passed: single and paired B32/B64/B96/B128 reads with first/interior destination overlap\n", .{});
 }
 
+fn runLdsWaveMemoryProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const lanes = 64;
+    const groups = 64;
+    const bytes = lanes * groups * 8;
+    for ([_]bool{ false, true }) |explicit_barrier| {
+        const load = mubuf(0x0d, 0, 4, 8, 0);
+        const store = mubuf(0x1d, 0, 6, 8, 4);
+        const code = [_]u32{
+            vop1(1, 8, 8),
+            (0x1a << 25) | (8 << 17) | (8 << 9) | 134, // Group * 64.
+            vop2(0x25, 8, 0, 8),
+            (0x1a << 25) | (1 << 17) | 131, // LDS address = lane * 8.
+            (0x1d << 25) | (2 << 17) | 160, // Exchange with the other half.
+            (0x1a << 25) | (3 << 17) | (2 << 9) | 131,
+            load[0],
+            load[1],
+            0xbf8c_0000,
+            0xd934_0000,
+            0x0000_0401,
+            if (explicit_barrier) 0xbf8a_0000 else 0xbf8c_0000,
+            0xd9d8_0000,
+            0x0600_0003,
+            store[0],
+            store[1],
+            0xbf81_0000,
+        };
+        for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+        var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, 64);
+        defer analysis.deinit(allocator);
+        var module = try analysis.translateSpirv(allocator, .{
+            .stage = .compute,
+            .local_size = .{ lanes, 1, 1 },
+            // Wave32 requires its explicit cross-wave barrier; wave64 orders
+            // these accesses within one guest wave without S_BARRIER.
+            .wave32 = explicit_barrier,
+            .compute_inputs = .{ .local_invocation_id_components = 1, .workgroup_id_sgprs = .{ 8, null, null } },
+            .workgroup_memory_size_bytes = 512,
+            .storage_buffers = &.{
+                .{ .resource_sgpr = 0, .descriptor_index = 0, .extent_bytes = bytes, .stride = 8 },
+                .{ .resource_sgpr = 4, .descriptor_index = 1, .extent_bytes = bytes, .stride = 8 },
+            },
+        });
+        defer module.deinit(allocator);
+        for (0..8) |iteration| {
+            for (0..lanes * groups * 2) |index| guest.word(0x10000 + index * 4, @intCast(1 + index + iteration * 100000));
+            @memset(guest.bytes[0x18000..0x20000], 0xaa);
+            _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, bytes);
+            _ = try renderer.stageGuestStorageBufferAt(1, 0x18000, bytes);
+            _ = try renderer.dispatchSpirv(module.words, .{ groups, 1, 1 });
+            var output: [bytes]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x18000, &output);
+            for (0..lanes * groups) |index| {
+                for (0..2) |word| {
+                    const expected: u32 = @intCast(1 + (index ^ 32) * 2 + word + iteration * 100000);
+                    const actual = std.mem.readInt(u32, output[index * 8 + word * 4 ..][0..4], .little);
+                    if (actual != expected) std.debug.print("LDS wave memory barrier={} iteration={d} lane={d} word={d}\n", .{ explicit_barrier, iteration, index, word });
+                    try std.testing.expectEqual(expected, actual);
+                }
+            }
+        }
+    }
+    std.debug.print("LDS wave memory passed: 64 workgroups, cross-half B64 exchange after buffer loads, changed inputs and explicit wave32 barrier\n", .{});
+}
+
 fn runDispatcherBudgetProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -5316,6 +5384,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--paired-lds64")) {
         try runPairedLds64Probe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--lds-wave-memory")) {
+        try runLdsWaveMemoryProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--sampled-storage-refresh")) {

@@ -668,6 +668,7 @@ const Builder = struct {
     local_invocation_index: u32 = 0,
     subgroup_local_invocation_id: u32 = 0,
     wave64_workgroup: bool = false,
+    synchronize_linear_wave64_lds: bool = false,
     wave_scratch: u32 = 0,
     wave32: bool = false,
     wave_word_pointer: u32 = 0,
@@ -8456,6 +8457,12 @@ const Builder = struct {
     }
 
     fn lower(self: *Builder, source_inst: instruction.Instruction) Error!void {
+        if (self.synchronize_linear_wave64_lds and source_inst.family == .ds and !source_inst.gds) {
+            switch (source_inst.opcode) {
+                .ds_swizzle_b32, .ds_append, .ds_consume => {},
+                else => try self.controlBarrier(),
+            }
+        }
         self.dpp_write_predicate = null;
         defer self.dpp_write_predicate = null;
         self.sampled_result_predicate = null;
@@ -10301,6 +10308,12 @@ fn translateInstructions(
     var graph = try control_flow.buildInstructions(allocator, instructions);
     defer graph.deinit(allocator);
     if (graph.blocks.items.len == 1) {
+        // A single guest wave executes LDS instructions in order. On a
+        // 32-lane host it spans two independently scheduled subgroups, so
+        // their shared-memory accesses need an explicit rendezvous. A
+        // straight-line block guarantees every invocation reaches it.
+        builder.synchronize_linear_wave64_lds = effective.stage == .compute and !effective.wave32 and
+            @as(u64, effective.local_size[0]) * effective.local_size[1] * effective.local_size[2] == 64;
         try builder.emit(&builder.body, 248, &.{builder.label});
         try builder.initializeStageInputs();
         for (instructions) |inst| try lowerDiagnosed(&builder, inst);

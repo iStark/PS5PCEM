@@ -2,6 +2,30 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Ordering a 64-lane wave's LDS accesses on 2026-09-09
+
+After the LDS width/address fixes, the live exposure volume stays within
+`-8.53125..15.0859375` instead of reaching thousands. Frame 926 still exposes
+439 incorrect components in the X filter, confined to columns 28 through 35.
+Its single 64-lane guest wave reads neighbouring LDS values across the boundary
+between NVIDIA's independently scheduled 32-lane subgroups. A buffer-load-free
+exchange probe did not reproduce the race; the captured image-fed filter did.
+
+Straight-line compute blocks containing one complete 64-lane guest wave now
+synchronize workgroup memory between LDS instructions. The single-block condition
+keeps these barriers outside divergent guest control flow. Wave32, larger
+workgroups and branching kernels retain their existing synchronization paths.
+This follows Vulkan's explicit [workgroup memory synchronization requirements](https://docs.vulkan.org/spec/latest/appendices/memorymodel.html).
+
+With the same captured input, all 262,144 output components of the X filter now
+agree with an independent CPU convolution within one half-float ULP, including
+the former cross-half seam. The `--lds-wave-memory` GPU probe exchanges B64
+values after buffer loads across 64 workgroups, changes all inputs eight times,
+and checks a wave32 control with an explicit barrier. The former implementation
+fails; the corrected implementation passes this probe, the paired/address-alias
+LDS suite and the default GPU smoke under SDK synchronization validation. All
+16 focused LDS CPU tests pass. Complete live menu composition remains pending.
+
 ## Paired 64-bit LDS accesses on 2026-09-09
 
 The exposure-grid filter at `0x80003f6100` reads neighbouring pairs with
