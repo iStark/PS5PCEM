@@ -967,7 +967,49 @@ fn runScalarLoopProbe(allocator: std.mem.Allocator) !void {
             try std.testing.expectEqual(expected, std.mem.readInt(u32, output[lane * 4 ..][0..4], .little));
         }
     }
-    std.debug.print("scalar loops passed: saved EXEC, high-half writes, four iterations and inactive lanes\n", .{});
+    try runRepeatedScalarLoadProbe(allocator);
+    std.debug.print("scalar loops passed: EXEC masks, inactive lanes and post-loop loads after repeated SMEM reads\n", .{});
+}
+
+fn runRepeatedScalarLoadProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const code = [_]u32{
+        0xb008_0000,
+        0xf400_0300,
+        125 << 25,
+        0xf400_0340,
+        (125 << 25) | 4,
+        0xf400_0380,
+        (125 << 25) | 8,
+        0xf400_03c0,
+        (125 << 25) | 12,
+        0x8008_8108, 0xbf0a_b208, 0xbf85_fff5, // 50 iterations, 200 SMEM observations
+        0xf400_0300,    (125 << 25) | 16, // late value must replace the loop's s12
+        vop1(1, 1, 12), vop1(1, 2, 8),
+        0xe074_2000, 0x8001_0100, // store value and completed iteration count
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var state = gpu.State{};
+    try state.writeRegister(.shader, 0x20c, 1);
+    try state.writeRegister(.shader, 0x20d, 0);
+    try state.writeRegister(.shader, 0x213, 8 << 1);
+    for ([_]u32{ 0x9000, 0, 0, 0, 0x10000, 8 << 16, 64, 0 }, 0..) |word, index|
+        try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(index)), word);
+    for (0..4) |i| guest.word(0x9000 + i * 4, @intCast(11 + i));
+    for ([_]u32{ 0x12345678, 0x87654321 }) |expected| {
+        guest.word(0x9010, expected);
+        _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 1, 1, 1 });
+        var output: [512]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x10000, &output);
+        for (0..64) |lane| {
+            try std.testing.expectEqual(expected, std.mem.readInt(u32, output[lane * 8 ..][0..4], .little));
+            try std.testing.expectEqual(@as(u32, 50), std.mem.readInt(u32, output[lane * 8 + 4 ..][0..4], .little));
+        }
+    }
 }
 
 fn runWholeQuadModeProbe(allocator: std.mem.Allocator) !void {

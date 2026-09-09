@@ -5201,12 +5201,9 @@ pub const Renderer = struct {
             return report;
         }
         self.frame_profile.compute_emulation_ns +|= elapsedHostNanoseconds(emulation_started);
-        // PPSA26344 needs its startup buffer producers: they build visibility
-        // lists and indirect scene state which later frames consume. Skipping
-        // every compute dispatch made the title advance quickly but left those
-        // one-time allocations permanently empty. During the bounded warm-up,
-        // retain buffer/GDS producers and cheap CPU-emulated clears while
-        // eliding image-only post-processing. Full compute resumes afterwards.
+        // Explicit diagnostic suppression retains buffer/GDS producers and
+        // CPU-emulated clears. Normal startup must also execute image passes:
+        // some initialize persistent resources rather than transient frames.
         if (self.flip_callbacks < self.skip_compute_until_flip and
             !analysis.hasBufferExternalEffects())
         {
@@ -5256,6 +5253,15 @@ pub const Renderer = struct {
                     programHasRawInstruction(analysis, 0xa0, &.{ 0xf090_0208, 0x0061_0401 }) and
                     programHasRawInstruction(analysis, 0x4254, &.{ 0xf020_2710, 0x0007_0014 }) and
                     programHasRawInstruction(analysis, 0x6074, &.{ 0xf020_2710, 0x0001_0014 })));
+        // The first-frame atmosphere integration visits several blocks per
+        // sample over 50 samples. A 256-visit cap exits before its final stores;
+        // captured runs with 512 and 1,024 visits produce identical outputs.
+        const yotei_atmosphere_precompute =
+            std.meta.eql(group_count, [3]u32{ 8, 32, 8 }) and
+            analysis.program.instructions.items.len == 682 and
+            programHasRawInstruction(analysis, 0x4, &.{ 0xd746_0006, 0x0409_0404 }) and
+            programHasRawInstruction(analysis, 0xb28, &.{0xbf05_b20a}) and
+            programHasRawInstruction(analysis, 0xed0, &.{ 0xf020_2f10, 0x0001_0004 });
         // Yotei's two reduction and two gather passes used to be quarantined
         // here. Correct EXEC state merging and Vulkan-valid dynamic sample
         // offsets make all four safe on NVIDIA, including repeated execution;
@@ -5786,7 +5792,7 @@ pub const Renderer = struct {
         var module = self.compute_translations.translate(self.allocator, &analysis.program, .{
             .stage = .compute,
             .local_size = local_size,
-            .maximum_dispatcher_iterations = if (yotei_environment_lighting) 2048 else 256,
+            .maximum_dispatcher_iterations = if (yotei_environment_lighting) 2048 else if (yotei_atmosphere_precompute) 512 else 256,
             .wave32 = initiator & (1 << 15) != 0,
             .storage_buffers = resources.mappings[0..resources.mapping_count],
             .sampled_images = resources.sampled_image_mappings[0..resources.sampled_image_mapping_count],

@@ -2,6 +2,38 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## First-frame atmosphere initialization on 2026-09-09
+
+A diagnostic run with startup suppression and covered-scene elision disabled
+exposes a persistent atmosphere calculation in the first frame, before the
+video decoder starts. Its 32x128x32 tables at `0x50c92e0000`, `0x50c96e0000`,
+`0x50c98e0000` and `0x50c9ce0000` are consumed by the later sky and volume passes.
+The default 32-frame compute suppression discarded their entire producer chain.
+Two tables become nonzero in the diagnostic run; their derived sky textures
+contain 5,536 nonzero texels at frame 935, versus zero with startup suppression.
+The scene still lacks its normal background.
+
+The first-frame atmosphere shader `0x800038a300` exposes a second failure.
+Repeated invariant SMEM loads exhaust the scalar evaluator's 128 load records,
+so constants read after its 50-sample loop never reach translation. Identical
+load observations now share one record; changed values, addresses and provenance
+remain distinct. The captured dispatch uses 61 scalar values instead of 258 and
+recovers its post-loop coefficients. All 33 scalar-provenance tests pass. The GPU
+scalar-loop probe checks 200 repeated reads followed by a distinct load, changing
+parameters and the completed iteration count across 64 invocations; it passes
+SDK synchronization validation, as do the scalar-pointer probe and default smoke.
+
+That atmosphere program also exceeds the default 256-block dispatcher budget.
+Its identified instruction/dispatch shape now receives 512 visits. Captured
+replays at 512 and 1,024 produce byte-identical outputs and pass synchronization
+validation. Some intermediate values remain nonfinite, so this establishes
+resource recovery and loop coverage, not physically correct atmosphere output.
+
+Normal startup no longer suppresses the first 32 compute frames. The explicit
+diagnostic override remains available, and fullscreen video prioritization still
+starts when a decoder becomes active. Validation of the combined live build is
+pending.
+
 ## Depth-only extents and scalar uploads on 2026-09-09
 
 A live shadow pass binds uncompressed depth at `0x5031be0000` with
@@ -22,7 +54,9 @@ the persistent color-target path. The probe alternates a vertex scalar between
 two depths and reads the attachment through compute at its center and four
 corners, with viewport and scissor-only extent recovery. It passes SDK
 synchronization validation, as do the default smoke and UI attachment probes.
-Both extent guard unit tests pass. Complete live scene validation is pending.
+Both extent guard unit tests pass. The live run confirms 1024x1024 shadow depth
+and 1920x1080/1664x936 intermediate depth instead of 1x1, with the spinner and
+bonus notice preserved. Its scene background remains incomplete.
 
 ## Fragment position inputs on 2026-09-09
 

@@ -825,18 +825,28 @@ fn executeSmem(
             .producer_pc = inst.pc,
         };
     }
+    const load = ScalarLoad{
+        .pc = inst.pc,
+        .address = address,
+        .destination = @intCast(destination),
+        .word_count = inst.data_words,
+        .buffer_descriptor = is_buffer_load,
+        .from_srt = addressInsideSrt(bindings, address, inst.data_words),
+        .base_sources = base_sources,
+        .offset_sources = offset.sources,
+        .values = loaded,
+    };
+    // A loop can revisit an invariant load hundreds of times. Retain its
+    // provenance once so those visits cannot crowd out loads after the loop.
+    // Distinct addresses, values or provenance still occupy separate entries.
+    var previous = result.load_count;
+    while (previous != 0) {
+        previous -= 1;
+        if (result.loads[previous].pc == inst.pc and
+            std.meta.eql(result.loads[previous], load)) return true;
+    }
     if (result.load_count < maximum_loads) {
-        result.loads[result.load_count] = .{
-            .pc = inst.pc,
-            .address = address,
-            .destination = @intCast(destination),
-            .word_count = inst.data_words,
-            .buffer_descriptor = is_buffer_load,
-            .from_srt = addressInsideSrt(bindings, address, inst.data_words),
-            .base_sources = base_sources,
-            .offset_sources = offset.sources,
-            .values = loaded,
-        };
+        result.loads[result.load_count] = load;
         result.load_count += 1;
     }
     return true;
@@ -1778,6 +1788,44 @@ test "one-pass resource checkpoints preserve instruction-local SGPR state" {
     const second = evaluateDecodedResourceStateUntil(memory.reader(), &bindings, &instructions, 8);
     try std.testing.expectEqual(first.registers[2], snapshots[0][2]);
     try std.testing.expectEqual(second.registers[2], snapshots[1][2]);
+}
+
+test "invariant loop loads leave room for post-loop scalar specializations" {
+    var storage = [_]u8{0} ** 16;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    memory.write(0x4000, 0x41000000);
+    memory.write(0x4004, 0x3ca3d70a);
+    const bindings = testBindings(0x3000, 0x4000);
+    const code = [_]u32{
+        0xb008_0000, // s8=0
+        0xf400_0100, 125 << 25, // s_load_dword s4,s0:s1,0
+        0x8008_8108, // s8 += 1
+        0xbf0a_ff08, 160, // s_cmp_lt_u32 s8,160
+        0xbf85_fffa, // repeat pc4, exceeding the load-record capacity
+        0xf400_0300, (125 << 25) | 4, // post-loop load into s12
+        0xbf81_0000,
+    };
+    var program = try rdna2.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    var result = evaluateDecodedResourceState(memory.reader(), &bindings, program.instructions.items);
+    try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 160), result.register(8).?.value);
+    try std.testing.expectEqual(@as(usize, 2), result.load_count);
+    try std.testing.expectEqual(@as(u32, 28), result.loads[1].pc);
+    try std.testing.expectEqual(@as(u32, 0x3ca3d70a), result.loads[1].values[0]);
+
+    // Only identical observations coalesce; a changed value or address remains
+    // available to consumers which reason about loop-varying loads.
+    var late_load = program.instructions.items[program.instructions.items.len - 2];
+    memory.write(0x4004, 0x3f800000);
+    try std.testing.expect(executeSmem(&result, memory.reader(), &bindings, late_load));
+    try std.testing.expectEqual(@as(usize, 3), result.load_count);
+    try std.testing.expectEqual(@as(u32, 0x3f800000), result.loads[2].values[0]);
+    memory.write(0x4008, 0x3f800000);
+    late_load.memory_offset = 8;
+    try std.testing.expect(executeSmem(&result, memory.reader(), &bindings, late_load));
+    try std.testing.expectEqual(@as(usize, 4), result.load_count);
+    try std.testing.expectEqual(@as(u64, 0x4008), result.loads[3].address);
 }
 
 test "resource checkpoints leave skipped blocks unknown and capture backward visits" {
