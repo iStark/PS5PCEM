@@ -2792,6 +2792,36 @@ fn runStencilOnlyUiProbe(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(u32, 0xffff0000), std.mem.readInt(u32, guest.bytes[right..][0..4], .little));
     try std.testing.expect(std.mem.allEqual(u8, guest.bytes[0x10000..0x14000], 0xa5));
     std.debug.print("Stencil-only UI passed: masked push/pop, clipped color, S8 transfers and untouched disabled Z\n", .{});
+
+    const replacements = [_]struct { compare: u32, reference: u8, compare_mask: u8, write_mask: u8, op_value: u8, operation: u32, result: u8 }{
+        .{ .compare = 7, .reference = 0, .compare_mask = 0xff, .write_mask = 0xff, .op_value = 0x48, .operation = 4, .result = 0x48 },
+        .{ .compare = 2, .reference = 8, .compare_mask = 0x0f, .write_mask = 0xf0, .op_value = 0x88, .operation = 4, .result = 0x88 },
+        .{ .compare = 1, .reference = 7, .compare_mask = 0x0f, .write_mask = 0xf0, .op_value = 0x27, .operation = 4, .result = 0x28 },
+        .{ .compare = 7, .reference = 0x11, .compare_mask = 0xff, .write_mask = 0xff, .op_value = 0xaa, .operation = 3, .result = 0x11 },
+    };
+    for (replacements, 0..) |replacement, pass| {
+        try state.writeRegister(.shader, ps, 9); // same clipped stencil geometry
+        try state.writeRegister(.context, 0x08e, 0);
+        try state.writeRegister(.context, 0x200, 3 | (replacement.compare << 8) | (replacement.compare << 20) | (1 << 7));
+        try state.writeRegister(.context, 0x10b, (replacement.operation << 4) | (replacement.operation << 16));
+        const mask: u32 = @as(u32, replacement.reference) | (@as(u32, replacement.compare_mask) << 8) |
+            (@as(u32, replacement.write_mask) << 16) | (@as(u32, replacement.op_value) << 24);
+        try state.writeRegister(.context, 0x10c, mask);
+        try state.writeRegister(.context, 0x10d, mask);
+        _ = try executor.execute(&draw);
+        if (renderer.last_draw_error) |err| return err;
+        try state.writeRegister(.shader, ps, if (pass % 2 == 0) 0xc else 0xb);
+        try state.writeRegister(.context, 0x08e, 0xf);
+        try state.writeRegister(.context, 0x200, 3 | (2 << 8));
+        try state.writeRegister(.context, 0x10b, 0);
+        try state.writeRegister(.context, 0x10c, 0x00ffff00 | @as(u32, replacement.result));
+        _ = try executor.execute(&draw);
+        if (renderer.last_draw_error) |err| return err;
+        try renderer.flushPendingGuestWrites();
+        try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, guest.bytes[left..][0..4], .little));
+        try std.testing.expectEqual(@as(u32, if (pass % 2 == 0) 0xff0000ff else 0xffff0000), std.mem.readInt(u32, guest.bytes[right..][0..4], .little));
+    }
+    std.debug.print("stencil operation values passed: distinct REPLACE_OP/TEST, masked EQUAL/LESS, both face states and subsequent stencil consumers\n", .{});
 }
 
 fn runUiAttachmentProbe(allocator: std.mem.Allocator) !void {

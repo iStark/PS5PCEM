@@ -2,6 +2,24 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Separate stencil operation values on 2026-09-09
+
+The live material draws use `STENCIL_REPLACE_OP` with an always-pass stencil
+test, a zero test reference and operation values including `0x80` and `0xa0`.
+The host selected Vulkan REPLACE but kept the test reference, so these writes
+produced zero. The frame-904 material classifier consequently sees an entirely
+zero S8 plane at `0x5004850000`.
+
+Reference selection now uses the operation value where Vulkan's shared
+reference can preserve the guest comparison and any REPLACE_TEST writes.
+Masked comparisons retain their comparison bits; incompatible overlapping
+test/operation values still require a separate implementation. The expanded
+`--stencil-only-ui` GPU probe fails on the previous backend and passes with
+distinct operation/test values, masked EQUAL and LESS, front/back state and a
+subsequent stencil-tested color draw. The existing clipped UI checks and default
+smoke also pass SDK synchronization validation. Live lighting with this change
+remains pending.
+
 ## Signed traversal-stack comparisons on 2026-09-09
 
 The ray traversal shader at `0x8000173b00` also contains an unsupported
@@ -36,6 +54,12 @@ unequal buffer bounds, untouched neighbours and relocated descriptors. It and
 the default smoke pass SDK synchronization validation; all 16 index-bound
 tests pass. Complete live lighting and menu composition remain unverified.
 
+The subsequent live frame 904 binds all five classifier output buffers, and
+later guest-memory snapshots contain their GPU-written coordinates. HDR inputs
+remain finite but the displayed background is still too dark; this establishes
+live buffer-table integration, not complete lighting. The same run preserves
+the Digital Deluxe, Northern Star and pre-order notices and their Cross input.
+
 ## Avoiding repeated driver-cache writes on 2026-09-09
 
 The intro's frame 128 spends 2,814 ms in presentation while persisting a roughly
@@ -52,6 +76,10 @@ and verifies that later compilation produces a new snapshot. This probe and the
 default Vulkan smoke pass SDK synchronization validation. The capacity change
 addresses repeated-launch compilation; it does not establish a steady-frame FPS
 gain or complete scene rendering.
+
+The live run subsequently persists a 1,057 MiB driver cache successfully.
+A cold scene frame spends 121,600 ms compiling 199 compute pipelines; this is
+first-use compilation and is not a steady-frame FPS measurement.
 
 ## Signed normalized color attachments on 2026-09-09
 

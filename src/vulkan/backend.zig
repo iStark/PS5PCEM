@@ -1563,6 +1563,19 @@ fn hostStencilOperation(operation: u8, write_mask: u8, op_value: u8) u32 {
     };
 }
 
+/// Vulkan shares the test reference and replacement value. REPLACE_OP uses
+/// the guest's separate operation value, so combine it with the test reference
+/// only when the comparison and any REPLACE_TEST operations remain unchanged.
+fn hostStencilReference(face: gpu.resources.StencilFace, compare: u8, write_mask: u8) u32 {
+    const operations = [_]u8{ face.fail, face.pass, face.depth_fail };
+    if (std.mem.indexOfScalar(u8, &operations, 4) == null) return face.reference;
+    const changed = (face.op_value ^ face.reference) & write_mask;
+    if (changed == 0) return face.reference;
+    if (std.mem.indexOfScalar(u8, &operations, 3) != null) return face.reference;
+    if (compare != 0 and compare != 7 and changed & face.compare_mask != 0) return face.reference;
+    return face.reference ^ changed;
+}
+
 /// FMASK is still ignored. Sample and fragment counts stay on the
 /// descriptor so the host image can match the guest attachment.
 fn hostColorTargetDescriptor(descriptor: gpu.resources.ColorTarget) gpu.resources.ColorTarget {
@@ -13665,7 +13678,11 @@ pub const Renderer = struct {
                     depthCompareOperation(render_state.depth_control.stencil_compare);
                 pipeline_state.stencil_front_compare_mask = render_state.stencil.front.compare_mask;
                 pipeline_state.stencil_front_write_mask = front_write;
-                pipeline_state.stencil_front_reference = render_state.stencil.front.reference;
+                pipeline_state.stencil_front_reference = hostStencilReference(
+                    render_state.stencil.front,
+                    render_state.depth_control.stencil_compare,
+                    front_write,
+                );
                 if (render_state.depth_control.backface_enabled) {
                     pipeline_state.stencil_back_fail = hostStencilOperation(
                         render_state.stencil.back.fail,
@@ -13686,7 +13703,11 @@ pub const Renderer = struct {
                         depthCompareOperation(render_state.depth_control.stencil_compare_back);
                     pipeline_state.stencil_back_compare_mask = render_state.stencil.back.compare_mask;
                     pipeline_state.stencil_back_write_mask = back_write;
-                    pipeline_state.stencil_back_reference = render_state.stencil.back.reference;
+                    pipeline_state.stencil_back_reference = hostStencilReference(
+                        render_state.stencil.back,
+                        render_state.depth_control.stencil_compare_back,
+                        back_write,
+                    );
                 } else {
                     pipeline_state.stencil_back_fail = pipeline_state.stencil_front_fail;
                     pipeline_state.stencil_back_pass = pipeline_state.stencil_front_pass;
