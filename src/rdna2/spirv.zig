@@ -6648,27 +6648,34 @@ const Builder = struct {
     }
 
     fn dsReadPair(self: *Builder, inst: instruction.Instruction) Error!void {
+        const words_per_value: u32 = if (inst.data_words == 4) 2 else 1;
         const offsets = [_]u32{
             @intCast(inst.memory_offset),
             @intCast(inst.secondary_memory_offset),
         };
         for (offsets, 0..) |offset, index| {
-            const value = try self.loadDsWord(inst, offset);
-            try self.destination(try consecutiveRegister(inst.dst, @intCast(index)), .{
-                .id = value,
-                .value_type = .bits32,
-            });
+            for (0..words_per_value) |word| {
+                const value = try self.loadDsWord(inst, offset + @as(u32, @intCast(word)) * 4);
+                try self.destination(try consecutiveRegister(inst.dst, @intCast(index * words_per_value + word)), .{
+                    .id = value,
+                    .value_type = .bits32,
+                });
+            }
         }
     }
 
     fn dsWritePair(self: *Builder, inst: instruction.Instruction) Error!void {
+        const words_per_value: u32 = if (inst.data_words == 4) 2 else 1;
         const offsets = [_]u32{
             @intCast(inst.memory_offset),
             @intCast(inst.secondary_memory_offset),
         };
         const sources = [_]operand.Operand{ inst.src1, inst.src2 };
         for (offsets, sources) |offset, source_operand| {
-            try self.storeDsWord(inst, offset, try self.source(source_operand, .bits32));
+            for (0..words_per_value) |word| {
+                const value = try self.source(try consecutiveRegister(source_operand, @intCast(word)), .bits32);
+                try self.storeDsWord(inst, offset + @as(u32, @intCast(word)) * 4, value);
+            }
         }
     }
 
@@ -10223,6 +10230,11 @@ fn translateInstructions(
             candidate.opcode == .v_mbcnt_lo_u32_b32 or candidate.opcode == .v_mbcnt_hi_u32_b32 or
             candidate.opcode == .ds_swizzle_b32 or
             candidate.src0.dpp or candidate.src1.dpp or candidate.src2.dpp)
+        {
+            effective.uses_lane_identity = true;
+        }
+        if (effective.stage == .compute and
+            (candidate.opcode == .ds_write_addtid_b32 or candidate.opcode == .ds_read_addtid_b32))
         {
             effective.uses_lane_identity = true;
         }

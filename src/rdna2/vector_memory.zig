@@ -271,13 +271,21 @@ pub fn decodeDs(pc: u32, code: []const u32, word_index: u32) Error!Instruction {
     inst.memory_offset = @intCast(offset0 | (offset1 << 8));
     inst.secondary_memory_offset = 0;
     switch (id) {
-        0x0e, 0x37, 0x4e, 0x77 => {
+        0x0e, 0x37 => {
             inst.memory_offset = @intCast(offset0 * 4);
             inst.secondary_memory_offset = @intCast(offset1 * 4);
         },
-        0x0f, 0x38, 0x4f, 0x78 => {
+        0x4e, 0x77 => {
+            inst.memory_offset = @intCast(offset0 * 8);
+            inst.secondary_memory_offset = @intCast(offset1 * 8);
+        },
+        0x0f, 0x38 => {
             inst.memory_offset = @intCast(offset0 * 256);
             inst.secondary_memory_offset = @intCast(offset1 * 256);
+        },
+        0x4f, 0x78 => {
+            inst.memory_offset = @intCast(offset0 * 512);
+            inst.secondary_memory_offset = @intCast(offset1 * 512);
         },
         else => {},
     }
@@ -626,6 +634,16 @@ test "DS swizzle consume and 64-bit pair encodings decode" {
     try std.testing.expectEqual(isa.Opcode.ds_write2st64_b32, write2st.opcode);
     try std.testing.expectEqual(@as(i32, 256), write2st.memory_offset);
     try std.testing.expectEqual(@as(i32, 512), write2st.secondary_memory_offset);
+}
+
+test "DS 64-bit paired offsets count eight-byte values including stride64" {
+    for ([_]u32{ 0x4e, 0x77, 0x4f, 0x78 }) |opcode| {
+        const inst = try decodeDs(0, &.{ (opcode << 18) | (7 << 8) | 3, 0x1008_0201 }, 0);
+        const scale: i32 = if (opcode == 0x4f or opcode == 0x78) 512 else 8;
+        try std.testing.expectEqual(3 * scale, inst.memory_offset);
+        try std.testing.expectEqual(7 * scale, inst.secondary_memory_offset);
+        try std.testing.expectEqual(@as(u8, 4), inst.data_words);
+    }
 }
 
 test "DS 64-bit OR decodes its address and data pair" {

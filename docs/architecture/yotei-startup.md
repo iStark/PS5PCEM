@@ -2,6 +2,23 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Paired 64-bit LDS accesses on 2026-09-09
+
+The exposure-grid filter at `0x80003f6100` reads neighbouring pairs with
+`DS_READ2_B64`. The decoder incorrectly scaled their offsets as 32-bit words,
+and translation transferred only two of the four destination words. Paired
+64-bit reads and writes now use eight-byte offset units and transfer both
+words of each value; their stride-64 forms use 512-byte offset units.
+
+The `--paired-lds64` GPU regression compares paired accesses with independent
+single-value accesses in both directions, using unequal offsets and four
+distinct words. The previous implementation fails; the corrected implementation
+passes ordinary and stride-64 cases under Vulkan SDK synchronization validation.
+It also verifies 64 independent ADDTID lanes with an M0 base and instruction
+offset: those instructions now request lane identity even without explicit EXEC
+access. All 16 focused LDS tests and the default GPU smoke pass. Live exposure
+and complete-menu validation remain in progress.
+
 ## Retaining dense lighting constants on 2026-09-09
 
 The dense environment shader at `0x80001fd400` completes its CPU resource walk

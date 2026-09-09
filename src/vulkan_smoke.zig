@@ -1247,9 +1247,9 @@ fn runDistinctScalarLoadProbe(allocator: std.mem.Allocator) !void {
     defer code.deinit(allocator);
     for (0..count) |index| {
         try code.appendSlice(allocator, &.{
-            0xf400_0300, (125 << 25) | @as(u32, @intCast(index * 4)), // distinct load into s12
-            vop1(1, 1, 12),
-            vop1(1, 2, 255), @intCast(index * lanes),
+            0xf400_0300,             (125 << 25) | @as(u32, @intCast(index * 4)), // distinct load into s12
+            vop1(1, 1, 12),          vop1(1, 2, 255),
+            @intCast(index * lanes),
             vop2(0x25, 2, 0, 2), // v2 = lane + index * 64
         });
         try code.appendSlice(allocator, &mubuf(0x1c, 0, 1, 2, 4));
@@ -1751,6 +1751,101 @@ fn runWideMaskProbe(allocator: std.mem.Allocator) !void {
         }
     };
     std.debug.print("wide masks passed: SDWA/VOP3/U64 comparisons, VCC/SGPR pairs, saved EXEC, complementary lanes and 64/512 invocations\n", .{});
+}
+
+fn runPairedLds64Probe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const expected = [_]u32{ 0x1234_5678, 0xdead_beef, 0x7654_3210, 0x8765_4321 };
+    for ([_]bool{ false, true }) |stride64| {
+        const scale: u32 = if (stride64) 512 else 8;
+        const write_opcode: u32 = if (stride64) 0x4f else 0x4e;
+        const read_opcode: u32 = if (stride64) 0x78 else 0x77;
+        const code = [_]u32{
+            vop1(1, 1, 128),
+            vop1(1, 2, 255),
+            expected[0],
+            vop1(1, 3, 255),
+            expected[1],
+            vop1(1, 8, 255),
+            expected[2],
+            vop1(1, 9, 255),
+            expected[3],
+            // Paired stores must agree with independent single-value loads.
+            0xd800_0000 | (write_opcode << 18) | (7 << 8) | 3,
+            0x0008_0201,
+            0xbf8a_0000,
+            0xd800_0000 | (0x76 << 18) | (3 * scale),
+            0x0a00_0001,
+            0xd800_0000 | (0x76 << 18) | (7 * scale),
+            0x0c00_0001,
+            mubuf(0x1e, 0, 10, 0, 0)[0],
+            mubuf(0x1e, 0, 10, 0, 0)[1],
+            vop1(1, 1, 255),
+            256,
+            // The reverse direction also prevents wrong offsets cancelling out.
+            0xd800_0000 | (0x4d << 18) | (3 * scale),
+            0x0000_0201,
+            0xd800_0000 | (0x4d << 18) | (7 * scale),
+            0x0000_0801,
+            0xbf8a_0000,
+            0xd800_0000 | (read_opcode << 18) | (7 << 8) | 3,
+            0x0e00_0001,
+            mubuf(0x1e, 16, 14, 0, 0)[0],
+            mubuf(0x1e, 16, 14, 0, 0)[1],
+            0xbf81_0000,
+        };
+        for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+        var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, 128);
+        defer analysis.deinit(allocator);
+        var module = try analysis.translateSpirv(allocator, .{
+            .stage = .compute,
+            .local_size = .{ 1, 1, 1 },
+            .workgroup_memory_size_bytes = 8192,
+            .storage_buffers = &.{.{ .resource_sgpr = 0, .descriptor_index = 0, .extent_bytes = 32 }},
+        });
+        defer module.deinit(allocator);
+        @memset(guest.bytes[0x10000..0x10020], 0xaa);
+        _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, 32);
+        _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+        var output: [32]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x10000, &output);
+        for (0..8) |index| {
+            const actual = std.mem.readInt(u32, output[index * 4 ..][0..4], .little);
+            if (actual != expected[index % 4]) std.debug.print("paired LDS64 stride64={any} word={d}\n", .{ stride64, index });
+            try std.testing.expectEqual(expected[index % 4], actual);
+        }
+    }
+    std.debug.print("paired LDS64 passed: independent single/paired reads and writes, all four words, ordinary and stride64 offsets\n", .{});
+    // ADDTID also needs lane identity when the shader has no EXEC operations.
+    const addtid = [_]u32{
+        sop1(3, 124, 144), // M0 = 16.
+        0xdac0_0100, 0, // ds_write_addtid_b32 v0 offset:256
+        0xbf8a_0000,
+        0xdac4_0100,                0x0100_0000, // ds_read_addtid_b32 v1 offset:256
+        mubuf(0x1c, 0, 1, 0, 0)[0], mubuf(0x1c, 0, 1, 0, 0)[1],
+        0xbf81_0000,
+    };
+    for (addtid, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, 32);
+    defer analysis.deinit(allocator);
+    var module = try analysis.translateSpirv(allocator, .{
+        .stage = .compute,
+        .local_size = .{ 64, 1, 1 },
+        .workgroup_memory_size_bytes = 1024,
+        .compute_inputs = .{ .local_invocation_id_components = 1 },
+        .storage_buffers = &.{.{ .resource_sgpr = 0, .descriptor_index = 0, .extent_bytes = 256, .stride = 4 }},
+    });
+    defer module.deinit(allocator);
+    @memset(guest.bytes[0x10000..0x10100], 0xaa);
+    _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, 256);
+    _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+    var output: [256]u8 = undefined;
+    try renderer.readbackGuestStorageBuffer(0x10000, &output);
+    for (0..64) |lane| try std.testing.expectEqual(@as(u32, @intCast(lane)), std.mem.readInt(u32, output[lane * 4 ..][0..4], .little));
+    std.debug.print("LDS ADDTID passed: 64 independent lanes, M0 base and instruction byte offset without explicit EXEC access\n", .{});
 }
 
 fn runDispatcherBudgetProbe(allocator: std.mem.Allocator) !void {
@@ -5145,6 +5240,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--distinct-scalar-loads")) {
         try runDistinctScalarLoadProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--paired-lds64")) {
+        try runPairedLds64Probe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--sampled-storage-refresh")) {
