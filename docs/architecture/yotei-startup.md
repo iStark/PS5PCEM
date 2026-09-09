@@ -19,6 +19,13 @@ The production replay passes SDK synchronization validation. All 76 scalar,
 binding and resource tests pass, including budget exhaustion, recovered late
 loads/checkpoints and changed data in a 5,000-iteration resource walk.
 
+The rebuilt runner confirms populated outputs through all five live scattering
+orders. At frame 778, the lunar lookup textures contain 1,024/1,024 and
+8,192/8,192 nonzero texels, and the volume-lighting pass also produces RGB
+data. The solar lookups remain empty with the sun below the horizon. This
+establishes propagation into later lighting passes; complete scene composition
+is still being investigated.
+
 ## Atmosphere arithmetic on 2026-09-09
 
 The analytic atmosphere producer exposed two general translation errors.
