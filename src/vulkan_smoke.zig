@@ -2218,10 +2218,14 @@ fn runFragmentPositionProbe(allocator: std.mem.Allocator) !void {
         const first: u9 = 256 + @as(u9, case.first);
         const fragment = [_]u32{
             // Preserve entry VGPRs across a loop before reading position.
-            0xbe940380,         0x80148114,                0xbf0a8214,             0xbf85fffd,
-            vop1(1, 24, first), vop1(1, 25, first + 1),    vop1(1, 26, first + 2), vop1(1, 27, first + 3),
-            vop1(1, 28, 255),   @bitCast(@as(f32, 0.125)), vop2(8, 24, 24, 28),    vop2(8, 25, 25, 28),
-            0xf800180f,         0x1b1a1918,                0xbf810000,
+            0xbe940380,                0x80148114,              0xbf0a8214,                   0xbf85fffd,
+            // A masked write joins the original entry value on the other
+            // half. Both incoming register values must have the same type.
+            vop1(1, 28, 246),          0xbe96047e,              0x7c223800 | @as(u32, first), 0xbf880002,
+            vop1(1, case.first, 255),  @bitCast(@as(f32, 1.5)), 0xbefe0416,                   vop1(1, 24, first),
+            vop1(1, 25, first + 1),    vop1(1, 26, first + 2),  vop1(1, 27, first + 3),       vop1(1, 28, 255),
+            @bitCast(@as(f32, 0.125)), vop2(8, 24, 24, 28),     vop2(8, 25, 25, 28),          0xf800180f,
+            0x1b1a1918,                0xbf810000,
         };
         for (fragment, 0..) |word, i| guest.word(0x900 + i * 4, word);
         try state.writeRegister(.context, 0x1b4, case.allocated);
@@ -2234,7 +2238,7 @@ fn runFragmentPositionProbe(allocator: std.mem.Allocator) !void {
         try renderer.flushPendingGuestWrites();
         for (0..8) |y| for (0..8) |x| {
             const expected = [_]u8{
-                @intCast((x * 2 + 1) * 255 / 16),
+                if (x < 4) 48 else @intCast((x * 2 + 1) * 255 / 16),
                 if (case.enabled & 0x200 != 0) @intCast((y * 2 + 1) * 255 / 16) else 0,
                 if (case.enabled & 0x400 != 0) (if (zero_to_one) @as(u8, 64) else 159) else 0,
                 128,

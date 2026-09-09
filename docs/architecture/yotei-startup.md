@@ -21,8 +21,13 @@ also distinguishes allocated inputs from enabled ones.
 The `--fragment-position` GPU probe checks all pixels of a covering triangle
 across 20 cases: allocation holes, disabled position components, shader/pipeline
 reuse, both viewport signs, both clip-depth conventions and inputs surviving
-a loop. It passes SDK synchronization validation, as do the existing fullscreen
-orientation probe and complete default smoke. Live scene validation is pending.
+a loop. It also overwrites X under a divergent execution mask, then verifies
+both the updated and retained coordinates after the branches merge. Entry
+position values retain the integer bit representation used by register snapshots;
+otherwise a live filter produces an invalid mixed-type `OpPhi` and faults inside
+the NVIDIA shader compiler. The extended probe and complete default smoke pass
+SDK synchronization validation. The existing fullscreen orientation probe also
+passes. Live scene validation is pending.
 
 ## Native environment-volume execution on 2026-09-09
 

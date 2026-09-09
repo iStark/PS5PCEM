@@ -4062,7 +4062,12 @@ const Builder = struct {
                 }
                 const value = self.id();
                 try self.emit(&self.body, 81, &.{ self.float_type, value, coord, @intCast(component) });
-                self.registers[128 + @as(usize, vgpr)] = .{ .id = value, .value_type = .float32 };
+                // Entry register snapshots feed integer OpPhi nodes at CFG
+                // joins, just like the zero and VertexIndex initializers.
+                self.registers[128 + @as(usize, vgpr)] = .{
+                    .id = try self.convert(.{ .id = value, .value_type = .float32 }, .bits32),
+                    .value_type = .bits32,
+                };
             }
         }
         if (self.stage == .vertex) {
