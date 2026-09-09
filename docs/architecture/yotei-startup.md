@@ -2,6 +2,28 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Depth-only extents and scalar uploads on 2026-09-09
+
+A live shadow pass binds uncompressed depth at `0x5031be0000` with
+`DB_DEPTH_SIZE_XY = 0`, a 1024x1024 viewport/scissor, depth testing and writing
+enabled, and no color outputs. The renderer retained a 1x1 attachment because
+extent recovery previously required HTILE. The same reset size also appears
+on half-resolution depth targets used later in scene composition.
+
+Extent recovery now accepts active uncompressed depth-only writers. A stale
+uncompressed depth binding alongside active color outputs remains subject to
+the undersized-attachment guard used by UI draws. Read-only and disabled-write
+bindings also retain that guard.
+
+The new GPU probe exposed a second defect: the temporary graphics path used
+for depth-only draws neither uploaded dynamic graphics scalars nor bound the
+descriptor set when scalars were its only resources. It now does both, matching
+the persistent color-target path. The probe alternates a vertex scalar between
+two depths and reads the attachment through compute at its center and four
+corners, with viewport and scissor-only extent recovery. It passes SDK
+synchronization validation, as do the default smoke and UI attachment probes.
+Both extent guard unit tests pass. Complete live scene validation is pending.
+
 ## Fragment position inputs on 2026-09-09
 
 The low-resolution lighting filters `0x80003e5900` and `0x80003db900` read
@@ -27,7 +49,11 @@ position values retain the integer bit representation used by register snapshots
 otherwise a live filter produces an invalid mixed-type `OpPhi` and faults inside
 the NVIDIA shader compiler. The extended probe and complete default smoke pass
 SDK synchronization validation. The existing fullscreen orientation probe also
-passes. Live scene validation is pending.
+passes. In the subsequent live scene, both formerly empty filter outputs contain
+nonzero RGB texels (38,257 after the second filter at frame 935). All three bonus
+notices and the complete brightness screen remain visible. The HDR scene still
+contains mostly darkness and fire before the later transparent composite, so
+this correction alone does not restore the background.
 
 ## Native environment-volume execution on 2026-09-09
 

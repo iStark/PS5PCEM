@@ -1468,15 +1468,21 @@ fn depthSampledFormatCompatible(depth_format: u32, sampled_format: u32) bool {
         (depth32 and sampled_format == vk.format_r32_sfloat);
 }
 
-/// Recovers a reset extent for an HTILE-backed depth surface, using the
-/// viewport or scissor. A bare 1x1 binding can be stale UI state; expanding
-/// it would bypass the undersized-attachment check and reject colour draws.
+/// Recovers a reset extent for an HTILE-backed surface or an active depth-only
+/// writer. A bare 1x1 binding alongside colour outputs can be stale UI state;
+/// expanding it would bypass the undersized-attachment check.
 fn recoverResetDepthExtent(
     bound: *gpu.resources.DepthTarget,
     render_state: gpu.resources.RenderState,
 ) bool {
     if (bound.width != 1 or bound.height != 1) return false;
-    if (!bound.htile_enabled or bound.htile_address == 0) return false;
+    if (!bound.htile_enabled or bound.htile_address == 0) {
+        if (!render_state.depth_control.test_enabled or !render_state.depth_control.write_enabled or
+            bound.write_address == 0 or bound.depth_read_only) return false;
+        for (render_state.color_targets) |candidate| {
+            if (candidate) |color| if (color.isActive()) return false;
+        }
+    }
     if (render_state.viewport) |viewport| {
         const viewport_width = @abs(viewport.x_scale * 2.0);
         const viewport_height = @abs(viewport.y_scale * 2.0);
@@ -12260,6 +12266,7 @@ pub const Renderer = struct {
         defer self.destroyFramebuffer(framebuffer);
 
         const pipeline = try self.getGraphicsPipeline(render_pass, pipeline_state, vertex_words, fragment_words);
+        try self.writeGraphicsScalarValues(vertex_scalars, fragment_scalars);
         const command_buffer = try self.beginOneShot();
         defer self.releaseOneShot(command_buffer);
         if (upload) |upload_buffer| {
@@ -12332,7 +12339,7 @@ pub const Renderer = struct {
         };
         self.device_functions.cmd_begin_render_pass(command_buffer, &begin_info, vk.subpass_contents_inline);
         self.device_functions.cmd_bind_pipeline(command_buffer, vk.pipeline_bind_point_graphics, pipeline);
-        if (bind_graphics_descriptors) {
+        if (bind_graphics_descriptors or vertex_scalars.len != 0 or fragment_scalars.len != 0) {
             self.device_functions.cmd_bind_descriptor_sets(
                 command_buffer,
                 vk.pipeline_bind_point_graphics,
@@ -13201,9 +13208,9 @@ pub const Renderer = struct {
                 render_state.depth_control.stencil_clear_enabled);
         var depth_plane: ?GuestDepthTarget = if (depth_wanted) blk: {
             var bound = render_state.depth_target orelse break :blk null;
-            // Yotei leaves DB_DEPTH_SIZE_XY at 1x1 for active HTILE-backed
-            // surfaces. Preserve their extent recovery, while a plain stale
-            // UI binding still reaches the undersized-attachment check below.
+            // Yotei leaves DB_DEPTH_SIZE_XY at 1x1 for HTILE surfaces and
+            // uncompressed depth-only passes. Plain stale UI bindings still
+            // reach the undersized-attachment check below.
             if (bound.width == 1 and bound.height == 1) {
                 if (recoverResetDepthExtent(&bound, render_state) and
                     (self.traceCurrentGraphicsFrame() or self.reset_depth_extent_reports < 8))
@@ -27740,6 +27747,32 @@ test "HTILE depth reset extent expands while stale UI depth remains undersized" 
     bound.height = 64;
     try std.testing.expect(!recoverResetDepthExtent(&bound, render));
     try std.testing.expectEqual(@as(u32, 64), bound.width);
+}
+
+test "uncompressed depth-only writers recover reset extents without expanding UI depth" {
+    var bound = std.mem.zeroes(gpu.resources.DepthTarget);
+    bound.width = 1;
+    bound.height = 1;
+    bound.write_address = 0x1000;
+    var render = std.mem.zeroes(gpu.resources.RenderState);
+    render.depth_control.test_enabled = true;
+    render.depth_control.write_enabled = true;
+    render.scissor = .{ .left = 0, .top = 0, .right = 1024, .bottom = 1024 };
+    var color = std.mem.zeroes(gpu.resources.ColorTarget);
+    color.write_mask = 0xf;
+    render.color_targets[0] = color;
+    try std.testing.expect(!recoverResetDepthExtent(&bound, render));
+    color.write_mask = 0;
+    render.color_targets[0] = color;
+    bound.depth_read_only = true;
+    try std.testing.expect(!recoverResetDepthExtent(&bound, render));
+    bound.depth_read_only = false;
+    render.depth_control.write_enabled = false;
+    try std.testing.expect(!recoverResetDepthExtent(&bound, render));
+    render.depth_control.write_enabled = true;
+    try std.testing.expect(recoverResetDepthExtent(&bound, render));
+    try std.testing.expectEqual(@as(u32, 1024), bound.width);
+    try std.testing.expectEqual(@as(u32, 1024), bound.height);
 }
 
 test "R11G11B10 float presentation conversion preserves RGB channels" {

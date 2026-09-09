@@ -1911,6 +1911,73 @@ fn runDepthStorageProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("depth storage passed: current D32/S8 reads, repeated clears and compute writes returned to the attachment\n", .{});
 }
 
+fn runResetDepthExtentProbe(allocator: std.mem.Allocator) !void {
+    for ([_]bool{ true, false }) |with_viewport| {
+        var renderer = try vulkan.Renderer.init(allocator, .{});
+        defer renderer.deinit();
+        var guest = GuestMemory{};
+        // Cover the target with W=2 and Z from USER_DATA. Changing Z between
+        // draws also checks scalar uploads in the depth-only path.
+        const vertex = [_]u32{
+            0x34020a81,       0x36040a82,       0x36020282,    0x7e040d02, 0x7e060d01,
+            0xd5410001,       0x03ce04f4,       0xd5410002,    0x03ce06f4, vop1(1, 0, 244),
+            vop2(8, 1, 1, 0), vop2(8, 2, 2, 0), vop1(1, 3, 0), 0xf80008cf, 0x00030102,
+            0xbf810000,
+        };
+        const fragment = [_]u32{ vop1(1, 0, 242), 0xf800080f, 0, 0xbf810000 };
+        for (vertex, 0..) |word, i| guest.word(0x700 + i * 4, word);
+        for (fragment, 0..) |word, i| guest.word(0x900 + i * 4, word);
+        var state = gpu.State{};
+        for ([_]gpu.resources.ShaderStage{ .vertex, .pixel }, [_]u32{ 7, 9 }) |stage, program| {
+            try state.writeRegister(.shader, stage.programRegisterBase(), program);
+            try state.writeRegister(.shader, stage.programRegisterBase() + 1, 0);
+        }
+        const context = [_][2]u32{
+            .{ 0x08e, 0 },               .{ 0x007, 0 },    .{ 0x010, 3 },               .{ 0x011, 0 },
+            .{ 0x012, 0x10 },            .{ 0x014, 0x10 }, .{ 0x00b, 0x3f800000 },      .{ 0x200, 6 | (1 << 4) },
+            .{ 0x204, 1 << 19 },         .{ 0x205, 0 },    .{ 0x202, 0xcc0010 },        .{ 0x000, 0 },
+            .{ 0x1e0, 0 },               .{ 0x00c, 0 },    .{ 0x00d, 32 | (32 << 16) }, .{ 0x094, 1 << 31 },
+            .{ 0x095, 32 | (32 << 16) },
+        };
+        for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+        if (with_viewport) {
+            for ([_]f32{ 16, 16, -16, 16, 1, 0 }, 0..) |value, i|
+                try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value));
+        }
+        var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(guest.interface()), .allocator = allocator };
+        const points = [_][2]u8{ .{ 0, 0 }, .{ 31, 0 }, .{ 16, 16 }, .{ 0, 31 }, .{ 31, 31 } };
+        for (points, 0..) |point, i| {
+            const code = [_]u32{
+                vop1(1, 0, 128 + @as(u9, point[0])),    vop1(1, 1, 128 + @as(u9, point[1])),
+                0xf0000108,                             0x00000200,
+                0xe0700000 | @as(u32, @intCast(i * 4)), 0x80020200,
+            };
+            for (code, 0..) |word, j| guest.word(0x100 + (i * code.len + j) * 4, word);
+        }
+        guest.word(0x100 + points.len * 24, 0xbf810000);
+        var depth = sampledImageDescriptorWords(0x1000, 32, 32);
+        depth[1] = (depth[1] & ~@as(u32, 0x1ff00000)) | (22 << 20);
+        const userdata = depth ++ [_]u32{ 0x8000, 4 << 16, points.len, 0 };
+        try state.writeRegister(.shader, 0x20c, 1);
+        try state.writeRegister(.shader, 0x20d, 0);
+        try state.writeRegister(.shader, 0x213, 12 << 1);
+        for (userdata, 0..) |word, i| try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
+        for ([_]f32{ 0.5, 0.25 }) |z| {
+            try state.writeRegister(.shader, gpu.resources.ShaderStage.vertex.userDataBase(), @bitCast(z));
+            _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+            if (renderer.last_draw_error) |err| return err;
+            try std.testing.expectEqual(@as(usize, 1), renderer.depth_targets.items.len);
+            try std.testing.expectEqual(@as(u32, 32), renderer.depth_targets.items[0].target.width);
+            try std.testing.expectEqual(@as(u32, 32), renderer.depth_targets.items[0].target.height);
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+            var bytes: [points.len * 4]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x8000, &bytes);
+            for (points, 0..) |_, i| try std.testing.expectEqual(@as(u32, @bitCast(z / 2)), std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little));
+        }
+    }
+    std.debug.print("Reset depth-only extents passed: viewport/scissor recovery, changing scalars and depth samples across the attachment\n", .{});
+}
+
 fn runStorageImageReuseProbe(allocator: std.mem.Allocator) !void {
     for ([_]usize{ 320, 1152 }) |count| try runStorageImageReuseCase(allocator, count, 1280 * 1024 * 1024);
     try runStorageImageReuseCase(allocator, 320, 64 * 4);
@@ -4637,6 +4704,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--depth-storage")) {
         try runDepthStorageProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--reset-depth-extent")) {
+        try runResetDepthExtentProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--host-readback")) {
