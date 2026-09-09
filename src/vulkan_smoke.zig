@@ -352,14 +352,18 @@ fn runStorageImageCopyCase(
 }
 
 fn runSampledStorageRefreshProbe(allocator: std.mem.Allocator) !void {
+    for ([_]bool{ false, true }) |buffer_writer| try runSampledStorageRefreshCase(allocator, buffer_writer);
+}
+
+fn runSampledStorageRefreshCase(allocator: std.mem.Allocator, buffer_writer: bool) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
-    const guest = try allocator.create(GuestMemory);
+    const guest = try allocator.create(SizedGuestMemory(524288));
     defer allocator.destroy(guest);
     guest.* = .{};
     const backend = renderer.dcbBackend(guest.interface());
     const source = 0x6000;
-    const output = 0x10000;
+    const output = 0x50000;
     const consumer_program = 0x1400;
     const producer_program = 0x1800;
     const consumer_code = [_]u32{
@@ -369,13 +373,21 @@ fn runSampledStorageRefreshProbe(allocator: std.mem.Allocator) !void {
         0xe078_0000, 0x8003_0400, // store four floats through V#s12
         0xbf81_0000,
     };
-    const producer_code = [_]u32{
+    const image_code = [_]u32{
         vop1(1, 0, 160), // x=32 in the 128-wide writer
         vop1(1, 1, 144), // y=16: same byte as (32,32) in the 64-wide reader
         vop1(1, 4, 8), // packed RGBA byte value from s8
         0xf020_0108, 0x0000_0400, // image_store R32_UINT
         0xbf81_0000,
     };
+    const buffer_code = [_]u32{
+        vop1(1, 0, 255), 2080, // dword index of the same texel
+        vop1(1, 4, 8), // packed RGBA byte value from s8
+        mubuf(0x1c, 0, 4, 0, 0)[0],
+        mubuf(0x1c, 0, 4, 0, 0)[1],
+        0xbf81_0000,
+    };
+    const producer_code = if (buffer_writer) &buffer_code else &image_code;
     for (consumer_code, 0..) |word, i| guest.word(consumer_program + i * 4, word);
     for (producer_code, 0..) |word, i| guest.word(producer_program + i * 4, word);
     const compute = gpu.resources.ShaderStage.compute;
@@ -390,6 +402,8 @@ fn runSampledStorageRefreshProbe(allocator: std.mem.Allocator) !void {
         if (i == 1) {
             descriptor[1] = (descriptor[1] & ~(@as(u32, 0x1ff) << 20)) | (20 << 20);
             descriptor[3] = (descriptor[3] & ~@as(u32, 0xfff)) | 4;
+            // The default backend defers buffers of at least 256 KiB.
+            if (buffer_writer) descriptor = .{ source, 4 << 16, 65536, 0, 0, 0, 0, 0 };
         }
         for (descriptor, 0..) |word, index| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
     }
@@ -423,7 +437,7 @@ fn runSampledStorageRefreshProbe(allocator: std.mem.Allocator) !void {
             if (repeat != 0) try std.testing.expectEqual(misses_before, renderer.texture_cache_misses);
         }
     }
-    std.debug.print("sampled storage refresh passed: cached UNORM view, repeated UINT writes with another extent, unchanged-view reuse\n", .{});
+    std.debug.print("sampled storage refresh passed: {s} writer, cached UNORM view, pending/published writes, sampler change, unchanged-view reuse\n", .{if (buffer_writer) "buffer" else "image"});
 }
 
 fn runPredicatedImageLoadProbe(allocator: std.mem.Allocator) !void {

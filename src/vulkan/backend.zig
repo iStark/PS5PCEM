@@ -18057,7 +18057,17 @@ pub const Renderer = struct {
                 storage_sequence = @max(storage_sequence, cached.last_used_sequence);
             }
         }
-        return combineSourceGenerations(combineSourceGenerations(generation, target_sequence), storage_sequence);
+        // Raw compute buffers can back the same texture allocation. Their
+        // deferred writes are not registered as image aliases in either mode.
+        var buffer_sequence: u64 = 0;
+        for (self.guest_buffers.items) |cached| {
+            if (cached.guest_address != address) continue;
+            buffer_sequence = @max(buffer_sequence, cached.last_used_sequence);
+        }
+        return combineSourceGenerations(
+            combineSourceGenerations(combineSourceGenerations(generation, target_sequence), storage_sequence),
+            buffer_sequence,
+        );
     }
 
     fn combineSourceGenerations(resident: u64, pages: u64) u64 {

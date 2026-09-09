@@ -19,6 +19,11 @@ backend passes SDK synchronization validation. Yotei reuses the observed
 `0x500e870000` and `0x500f870000` allocations with differing sampled/storage
 extents. Their role in the missing background still requires live verification.
 
+The same regression also fails when the producer writes a deferred 256 KiB raw
+buffer instead of an image. Buffer sequences now participate in sampled-cache
+keys in both alias modes. Pending/published writes, changed samplers and repeated
+reads pass for both producer types under SDK synchronization validation.
+
 ## Repeated velocity clears and scene bounds on 2026-09-09
 
 After the three bonus notices, brightness, difficulty and experience selection,
