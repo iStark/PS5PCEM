@@ -572,6 +572,10 @@ fn runFragmentScalarReuseProbe(
     var executor = gpu.DcbExecutor{ .state = state, .backend = backend, .allocator = allocator };
     var first_misses: u64 = 0;
     for ([_]u32{ 0x3e80_0000, 0x3f40_0000 }, 0..) |red, iteration| {
+        // Streaming a different guest texture must also reuse the pipeline.
+        const texture_address = source + iteration * 256;
+        guest.word(texture_address, 0xffff_ffff);
+        guest.word(table, @intCast(texture_address >> 8));
         guest.word(table + 48, red);
         _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
         if (renderer.last_draw_error != null) return error.FragmentScalarReuseRejected;
@@ -582,7 +586,7 @@ fn runFragmentScalarReuseProbe(
         for (result, expected) |actual, wanted| try std.testing.expect(@abs(@as(i32, actual) - @as(i32, wanted)) <= 1);
         if (iteration == 0) first_misses = renderer.graphics_pipeline_cache_misses else try std.testing.expectEqual(first_misses, renderer.graphics_pipeline_cache_misses);
     }
-    std.debug.print("fragment scalar reuse passed: T#/S#/V# lifetimes, dynamic colors and stable pipeline\n", .{});
+    std.debug.print("fragment scalar reuse passed: T#/S#/V# lifetimes, streamed textures, dynamic colors and stable pipeline\n", .{});
 }
 
 fn runFragmentStorageProbe(

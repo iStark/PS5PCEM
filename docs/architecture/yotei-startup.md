@@ -104,7 +104,8 @@ addresses does not require deleting these register lifetimes.
 A GPU regression samples a texture and reads a buffer, then reuses all three
 descriptor register ranges for color parameters. Two draws return the expected
 RGBA values `{32,127,191,255}` and `{96,127,191,255}` with no additional pipeline
-miss on the second draw. The full Vulkan smoke passes SDK synchronization
+miss on the second draw, even when both its color parameters and guest texture
+address change. The full Vulkan smoke passes SDK synchronization
 validation. Complete live menu composition with this fix is still pending.
 
 After brightness, compute programs `0x801fdfb600` and `0x801fe03600` also
