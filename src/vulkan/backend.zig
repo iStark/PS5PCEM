@@ -3159,6 +3159,7 @@ pub const Renderer = struct {
     dump_graphics_spirv: bool,
     trace_resource_failures: bool,
     sampled_image_nonuniform_indexing: bool,
+    storage_buffer_nonuniform_indexing: bool,
     capture_extended_progress_frames: bool,
     shader_ir_enabled: bool,
     shader_ssa_optimization_enabled: bool,
@@ -3603,6 +3604,7 @@ pub const Renderer = struct {
         if (timeline_support.timeline_semaphore == 0) return Error.TimelineSemaphoreUnavailable;
         const descriptor_partially_bound = descriptor_indexing_support.descriptor_binding_partially_bound != 0;
         const sampled_image_nonuniform_indexing = descriptor_indexing_support.shader_sampled_image_array_non_uniform_indexing != 0;
+        const storage_buffer_nonuniform_indexing = descriptor_indexing_support.shader_storage_buffer_array_non_uniform_indexing != 0;
         const image_float32_atomic_min_max = shader_atomic_float2_extension and
             shader_atomic_float2_support.shader_image_float32_atomic_min_max != 0;
         const supported_features = supported_features_2.features;
@@ -3648,9 +3650,10 @@ pub const Renderer = struct {
             .p_next = if (image_float32_atomic_min_max) &shader_atomic_float2_enable else null,
             .descriptor_binding_partially_bound = if (descriptor_partially_bound) vk.true_value else 0,
             .shader_sampled_image_array_non_uniform_indexing = if (sampled_image_nonuniform_indexing) vk.true_value else 0,
+            .shader_storage_buffer_array_non_uniform_indexing = if (storage_buffer_nonuniform_indexing) vk.true_value else 0,
         };
         var timeline_enable = vk.PhysicalDeviceTimelineSemaphoreFeatures{
-            .p_next = if (descriptor_partially_bound or sampled_image_nonuniform_indexing)
+            .p_next = if (descriptor_partially_bound or sampled_image_nonuniform_indexing or storage_buffer_nonuniform_indexing)
                 &descriptor_indexing_enable
             else if (image_float32_atomic_min_max)
                 &shader_atomic_float2_enable
@@ -3941,6 +3944,7 @@ pub const Renderer = struct {
             .dump_graphics_spirv = options.dump_graphics_spirv,
             .trace_resource_failures = options.trace_resource_failures,
             .sampled_image_nonuniform_indexing = sampled_image_nonuniform_indexing,
+            .storage_buffer_nonuniform_indexing = storage_buffer_nonuniform_indexing,
             .capture_extended_progress_frames = options.capture_extended_progress_frames,
             .shader_ir_enabled = options.enable_shader_ir,
             .shader_ssa_optimization_enabled = options.enable_shader_ssa_optimization,
@@ -7693,6 +7697,77 @@ pub const Renderer = struct {
         }
     }
 
+    fn prepareBufferTableCandidates(
+        self: *Renderer,
+        result: *ComputeResources,
+        bindings: *const gpu.ShaderBindings,
+        reader: gpu.ShaderMemoryReader,
+        analysis: *const gpu.ShaderAnalysis,
+        scalar: *const gpu.ScalarEvaluation,
+        access: gpu.ShaderInstruction,
+        writable: bool,
+    ) anyerror!bool {
+        if (!self.storage_buffer_nonuniform_indexing or access.family == .smem or access.src1.kind != .sgpr) return false;
+        const instructions = analysis.program.instructions.items;
+        var before: usize = 0;
+        while (before < instructions.len and instructions[before].pc < access.pc) : (before += 1) {}
+        var load_index: ?usize = null;
+        for (0..4) |component| {
+            const definition = gpu.index_bounds.scalarDefinition(instructions, &analysis.graph, before, access.src1.reg + @as(u32, @intCast(component))) orelse return false;
+            const index = switch (definition) {
+                .entry => return false,
+                .instruction => |index| index,
+            };
+            if (load_index != null and load_index.? != index) return false;
+            load_index = index;
+        }
+        const load = instructions[load_index.?];
+        if (load.dst.kind != .sgpr or access.src1.reg < load.dst.reg or access.src1.reg + 4 > load.dst.reg + load.data_words) return false;
+        const plan = (try scalarPointerTablePlan(bindings, reader, analysis, scalar, load)) orelse return false;
+        if (plan.count > 32 or result.mapping_count + plan.count > result.mappings.len) return false;
+        var descriptors: [32]gpu.BufferDescriptor = undefined;
+        var candidates: [32][4]u32 = undefined;
+        // One instruction has one addressing/format layout. Keep dissimilar
+        // layouts unresolved until their addressing can also be selected.
+        for (0..plan.count) |index| {
+            try reader.readWords(((plan.base + plan.first + index * plan.step) & ~@as(u64, 3)) + (access.src1.reg - load.dst.reg) * 4, &candidates[index]);
+            const descriptor = gpu.resources.decodeBufferDescriptor(&candidates[index]) catch return false;
+            if (!isBoundedProducedBufferDescriptor(descriptor) or descriptor.isNull() or descriptor.size_bytes == 0) return false;
+            if (index != 0 and ((candidates[index][1] & 0xffff0000) != (candidates[0][1] & 0xffff0000) or candidates[index][3] != candidates[0][3])) return false;
+            descriptors[index] = descriptor;
+        }
+        for (descriptors[0..plan.count], candidates[0..plan.count], 0..) |descriptor, words, index| {
+            var duplicate = false;
+            for (candidates[0..index]) |previous| duplicate = duplicate or std.mem.eql(u32, &previous, &words);
+            if (duplicate) continue;
+            const size: usize = @intCast(descriptor.size_bytes);
+            const slot = result.descriptorForRange(descriptor.address, size) orelse blk: {
+                const free = result.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
+                _ = try self.stageGuestStorageBufferAt(free, descriptor.address, size);
+                result.occupied[free] = true;
+                result.addresses[free] = descriptor.address;
+                result.sizes[free] = size;
+                break :blk free;
+            };
+            result.mappings[result.mapping_count] = .{
+                .resource_sgpr = access.src1.reg,
+                .descriptor_index = slot,
+                .instruction_pc = access.pc,
+                .stride = descriptor.stride,
+                .swizzled = descriptor.swizzle_enabled,
+                .index_stride = descriptor.index_stride,
+                .add_thread_id = descriptor.add_thread_id,
+                .unified_format = descriptor.unified_format,
+                .dst_select = descriptor.dst_select,
+                .extent_bytes = @intCast(descriptor.size_bytes),
+                .candidate_words = words,
+            };
+            result.mapping_count += 1;
+            if (writable) result.writable[slot] = true;
+        }
+        return true;
+    }
+
     /// The captured visibility kernels walk root+24 -> header+136 V# ->
     /// 168-byte object records. Keep guest pointers in the shader and expose
     /// the complete bounded records, including GPU-produced indices into them.
@@ -8038,6 +8113,7 @@ pub const Renderer = struct {
                 takePlausibleBufferDescriptor(attribute.buffer)
             else
                 null) orelse {
+                if (try self.prepareBufferTableCandidates(result, bindings, reader, analysis, &instruction_scalar, inst, is_store)) continue;
                 if (log_verbose_gpu) {
                     const full = gpu.scalar_provenance.evaluatePrefix(reader, bindings);
                     std.debug.print(

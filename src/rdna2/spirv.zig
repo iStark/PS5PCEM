@@ -52,6 +52,9 @@ pub const StorageBufferBinding = struct {
     /// Null leaves the access unchecked, which is what a caller that has not
     /// recovered the descriptor should say rather than guessing a size.
     extent_bytes: ?u32 = null,
+    /// A bounded table may supply several V#s to the same instruction. Match
+    /// all four live words before selecting its staged host descriptor.
+    candidate_words: ?[4]u32 = null,
 };
 
 /// Checked guest memory exposed to pointer-form SMEM. Each SSBO starts with
@@ -397,6 +400,8 @@ const State = struct {
 const BufferAddress = struct {
     binding: StorageBufferBinding,
     byte_offset: u32,
+    descriptor_index: ?u32 = null,
+    descriptor_matches: ?u32 = null,
 };
 
 const BufferFormat = struct {
@@ -721,6 +726,7 @@ const Builder = struct {
     uses_image_query: bool = false,
     uses_image_gather_extended: bool = false,
     uses_nonuniform_sampled_images: bool = false,
+    uses_nonuniform_storage_buffers: bool = false,
     sampled_result_predicate: ?u32 = null,
     sampled_dimension_override: ?SampledImageDimension = null,
     dpp_write_predicate: ?u32 = null,
@@ -1015,7 +1021,12 @@ const Builder = struct {
                     if (previous.resource_sgpr == binding.resource_sgpr and
                         previous.instruction_pc == binding.instruction_pc)
                     {
-                        return Error.InvalidStorageBinding;
+                        if (previous.candidate_words == null or binding.candidate_words == null or
+                            std.mem.eql(u32, &previous.candidate_words.?, &binding.candidate_words.?) or
+                            previous.stride != binding.stride or previous.swizzled != binding.swizzled or
+                            previous.index_stride != binding.index_stride or previous.add_thread_id != binding.add_thread_id or
+                            previous.unified_format != binding.unified_format or !std.mem.eql(u8, &previous.dst_select, &binding.dst_select))
+                            return Error.InvalidStorageBinding;
                     }
                 }
             }
@@ -7218,7 +7229,36 @@ const Builder = struct {
         if (inst.family == .smem) {
             byte_offset = try self.andBits(byte_offset, 0xffff_fffc);
         }
-        return .{ .binding = binding, .byte_offset = byte_offset };
+        var address = BufferAddress{ .binding = binding, .byte_offset = byte_offset };
+        if (binding.candidate_words != null) {
+            self.uses_nonuniform_storage_buffers = true;
+            var actual: [4]u32 = undefined;
+            for (&actual, 0..) |*word, i| word.* = try self.source(.{ .kind = .sgpr, .reg = binding.resource_sgpr + @as(u32, @intCast(i)) }, .bits32);
+            var slot = try self.constant(.bits32, binding.descriptor_index);
+            var any_match = try self.constantBool(false);
+            for (self.storage_bindings) |candidate| {
+                if (candidate.resource_sgpr != binding.resource_sgpr or candidate.instruction_pc != binding.instruction_pc) continue;
+                const words = candidate.candidate_words orelse return Error.InvalidStorageBinding;
+                var matches = try self.constantBool(true);
+                for (actual, words) |value, expected| {
+                    const equal = self.id();
+                    try self.emit(&self.body, 170, &.{ self.bool_type, equal, value, try self.constant(.bits32, expected) });
+                    const combined = self.id();
+                    try self.emit(&self.body, 167, &.{ self.bool_type, combined, matches, equal });
+                    matches = combined;
+                }
+                const selected = self.id();
+                try self.emit(&self.body, 169, &.{ self.bits_type, selected, matches, try self.constant(.bits32, candidate.descriptor_index), slot });
+                slot = selected;
+                const combined = self.id();
+                try self.emit(&self.body, 166, &.{ self.bool_type, combined, any_match, matches });
+                any_match = combined;
+            }
+            try self.emit(&self.annotations, 71, &.{ slot, 5300 });
+            address.descriptor_index = slot;
+            address.descriptor_matches = any_match;
+        }
+        return address;
     }
 
     fn bufferAddress(self: *Builder, inst: instruction.Instruction) Error!BufferAddress {
@@ -7238,8 +7278,9 @@ const Builder = struct {
             self.storage_block_pointer_type,
             block_pointer,
             self.storage_array,
-            try self.constant(.bits32, address.binding.descriptor_index),
+            address.descriptor_index orelse try self.constant(.bits32, address.binding.descriptor_index),
         }); // OpAccessChain descriptor
+        if (address.descriptor_index != null) try self.emit(&self.annotations, 71, &.{ block_pointer, 5300 });
         const word_count = self.id();
         try self.emit(&self.body, 68, &.{ self.bits_type, word_count, block_pointer, 0 }); // OpArrayLength
         const extent = self.id();
@@ -7254,6 +7295,11 @@ const Builder = struct {
             last,
             extent,
         });
+        if (address.descriptor_matches) |matched| {
+            const combined = self.id();
+            try self.emit(&self.body, 167, &.{ self.bool_type, combined, result, matched });
+            return combined;
+        }
         return result;
     }
 
@@ -7292,10 +7338,11 @@ const Builder = struct {
             self.storage_word_pointer_type,
             pointer,
             self.storage_array,
-            try self.constant(.bits32, address.binding.descriptor_index),
+            address.descriptor_index orelse try self.constant(.bits32, address.binding.descriptor_index),
             try self.constant(.bits32, 0),
             safe_word,
         }); // OpAccessChain descriptor, block member, dword
+        if (address.descriptor_index != null) try self.emit(&self.annotations, 71, &.{ pointer, 5300 });
         return .{ .pointer = pointer, .in_range = in_range };
     }
 
@@ -7811,7 +7858,8 @@ const Builder = struct {
     fn loadBufferByte(self: *Builder, address: BufferAddress) Error!u32 {
         // Bounds apply to the containing aligned word. Using byte_offset + 3
         // rejected the last three valid bytes of every storage buffer.
-        const aligned = BufferAddress{ .binding = address.binding, .byte_offset = try self.andBits(address.byte_offset, 0xffff_fffc) };
+        var aligned = address;
+        aligned.byte_offset = try self.andBits(address.byte_offset, 0xffff_fffc);
         const word = try self.loadBufferWord(aligned, 0);
         const shifted = self.id();
         try self.emit(&self.body, 194, &.{ self.bits_type, shifted, word, try self.subwordShift(address.byte_offset) });
@@ -7822,6 +7870,8 @@ const Builder = struct {
         if (byte_offset == 0) return address;
         return .{
             .binding = address.binding,
+            .descriptor_index = address.descriptor_index,
+            .descriptor_matches = address.descriptor_matches,
             .byte_offset = try self.addBits(
                 address.byte_offset,
                 try self.constant(.bits32, byte_offset),
@@ -8143,7 +8193,8 @@ const Builder = struct {
     }
 
     fn storeBufferByte(self: *Builder, address: BufferAddress, value: u32) Error!void {
-        const aligned = BufferAddress{ .binding = address.binding, .byte_offset = try self.andBits(address.byte_offset, 0xffff_fffc) };
+        var aligned = address;
+        aligned.byte_offset = try self.andBits(address.byte_offset, 0xffff_fffc);
         const access = try self.bufferWordAccess(aligned, 0);
         const pointer = access.pointer;
         const shift = try self.subwordShift(address.byte_offset);
@@ -10031,8 +10082,13 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
         0,
     });
     try appendInstruction(allocator, &words, 17, &.{1}); // OpCapability Shader
-    if (builder.uses_nonuniform_sampled_images) {
+    if (builder.uses_nonuniform_sampled_images or builder.uses_nonuniform_storage_buffers) {
         try appendInstruction(allocator, &words, 17, &.{5301}); // ShaderNonUniform
+    }
+    if (builder.uses_nonuniform_storage_buffers) {
+        try appendInstruction(allocator, &words, 17, &.{5308}); // StorageBufferArrayNonUniformIndexing
+    }
+    if (builder.uses_nonuniform_sampled_images) {
         try appendInstruction(allocator, &words, 17, &.{5307}); // SampledImageArrayNonUniformIndexing
     }
     if (builder.float64_type != 0) {
@@ -10073,7 +10129,7 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
             0x0078_616d, // "max\0"
         }); // OpExtension SPV_EXT_shader_atomic_float_min_max
     }
-    if (builder.uses_nonuniform_sampled_images) {
+    if (builder.uses_nonuniform_sampled_images or builder.uses_nonuniform_storage_buffers) {
         try appendInstruction(allocator, &words, 10, &.{ 0x5f565053, 0x5f545845, 0x63736564, 0x74706972, 0x695f726f, 0x7865646e, 0x00676e69 }); // SPV_EXT_descriptor_indexing
     }
     // ExtInstImport must precede OpMemoryModel when PackHalf2x16 (etc.) is used.

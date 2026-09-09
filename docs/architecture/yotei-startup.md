@@ -2,6 +2,27 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Runtime buffer tables on 2026-09-09
+
+The material classifier at `0x80003cb200` selects one of five V# descriptors
+through `V_READFIRSTLANE` and a pointer-form scalar load at PC `0x50c`. Resource
+preparation recovered its fixed buffers but omitted the selected output lists;
+the store at `0x530` consequently had no host binding. Bounded constant
+selections now retain every reaching lane value, and compatible V# tables
+receive candidate bindings selected by all four live descriptor words.
+Non-uniform storage-buffer indexing is enabled only when the device supports
+the corresponding Vulkan feature. Each selected buffer retains its own bounds.
+
+The frame-1263 classifier replay preserves captured inputs and initializes
+only the five newly supported output lists to zero. It now produces all 24,335
+nonzero coordinates of the 208x117 tile grid, with no missing, duplicate or
+out-of-range coordinates. Coordinate zero is indistinguishable from unused
+zero-initialized padding. The earlier renderer leaves all five lists empty.
+The `--buffer-tables` GPU probe checks selected reads/writes, VCC_HI offsets,
+unequal buffer bounds, untouched neighbours and relocated descriptors. It and
+the default smoke pass SDK synchronization validation; all 16 index-bound
+tests pass. Complete live lighting and menu composition remain unverified.
+
 ## Avoiding repeated driver-cache writes on 2026-09-09
 
 The intro's frame 128 spends 2,814 ms in presentation while persisting a roughly
@@ -46,7 +67,12 @@ it retains half-float `0x3400` where the metadata requests zero. The correction
 passes five repeated RGBA16F clears, direct PM4 writes, DMA fills, and checks
 that partial/mixed/uncompressed metadata preserves existing pixels. This suite,
 the RG16F comp-to-single suite and the default Vulkan smoke pass SDK
-synchronization validation. Complete live scene verification remains pending.
+synchronization validation. In the subsequent live frame-904 capture, all
+6,230,016 pre-sky HDR texels are finite; the earlier frame-1242 capture contained
+4,475,397 red-channel NaNs. These are different scene frames, not a matched
+performance comparison. The live run preserves the intros, rotating spinner,
+three bonus notices, brightness, difficulty and experience selection. The
+complete scene still lacks lighting.
 
 ## Ordering a 64-lane wave's LDS accesses on 2026-09-09
 

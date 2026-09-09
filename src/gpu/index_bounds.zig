@@ -700,6 +700,8 @@ pub fn scalarEntryUpperBound(instructions: []const Instruction, graph: *const Gr
 /// preserve full 32-bit wrap semantics unless a guard excludes large indices.
 pub fn scalarUpperBound(instructions: []const Instruction, graph: *const Graph, use: usize, register: u32) ?u32 {
     var result = scalarBitUpperBound(instructions, graph, use, register, 0);
+    if (selectionUpperBound(instructions, graph, use, .{ .kind = .sgpr, .reg = register }, 0)) |bound|
+        result = @min(result orelse std.math.maxInt(u32), bound);
     if (scalarLoopUpperBound(instructions, graph, use, register)) |bound|
         result = @min(result orelse std.math.maxInt(u32), bound);
     const value = scalarIdentity(instructions, graph, use, register, 0) orelse return result;
@@ -716,6 +718,44 @@ pub fn scalarUpperBound(instructions: []const Instruction, graph: *const Graph, 
         result = @min(result orelse std.math.maxInt(u32), bound);
     }
     return result;
+}
+
+/// Bound a finite choice of constants, including values selected from active
+/// VGPR lanes. Lane-definition proofs include earlier values retained by EXEC.
+fn selectionUpperBound(instructions: []const Instruction, graph: *const Graph, before: usize, source: rdna2.Operand, depth: u8) ?u32 {
+    if (depth >= 16 or source.negate or source.absolute or source.dpp or source.sdwa_sel != 6) return null;
+    if (immediate(source)) |value| return std.math.add(u32, value, 1) catch null;
+    if (source.kind == .vgpr) {
+        const definitions = vectorLaneDefinitions(instructions, graph, before, source.reg) orelse return null;
+        return selectionDefinitionsBound(instructions, graph, definitions, depth);
+    }
+    const register = @import("scalar_provenance.zig").scalarRegisterIndex(source) orelse return null;
+    const index = reachingDefinition(instructions, graph, before, .{ .register = @intCast(register) }) orelse return null;
+    const inst = instructions[index];
+    if (inst.opcode == .v_readfirstlane_b32 or inst.opcode == .v_readlane_b32) {
+        const definitions = scalarLaneDefinitions(instructions, graph, before, @intCast(register), 0) orelse return null;
+        return selectionDefinitionsBound(instructions, graph, definitions, depth);
+    }
+    return selectionProducerBound(instructions, graph, .{ .instruction = index, .component = 0 }, depth);
+}
+
+fn selectionDefinitionsBound(instructions: []const Instruction, graph: *const Graph, definitions: LaneDefinitions, depth: u8) ?u32 {
+    var result: u32 = 0;
+    for (definitions.items[0..definitions.count]) |definition| result = @max(result, selectionProducerBound(instructions, graph, definition, depth) orelse return null);
+    return if (result == 0) null else result;
+}
+
+fn selectionProducerBound(instructions: []const Instruction, graph: *const Graph, definition: Definition, depth: u8) ?u32 {
+    const inst = instructions[definition.instruction];
+    if (definition.component != 0 or inst.dst.sdwa_sel != 6 or inst.dst.omod != 0 or inst.dst.clamp) return null;
+    switch (inst.opcode) {
+        .s_mov_b32, .v_mov_b32 => return selectionUpperBound(instructions, graph, definition.instruction, inst.src0, depth + 1),
+        .s_cselect_b32, .v_cndmask_b32 => return @max(
+            selectionUpperBound(instructions, graph, definition.instruction, inst.src0, depth + 1) orelse return null,
+            selectionUpperBound(instructions, graph, definition.instruction, inst.src1, depth + 1) orelse return null,
+        ),
+        else => return null,
+    }
 }
 
 /// A zero-based unit counter, with every recurrence guarded by counter < N.
@@ -1056,6 +1096,30 @@ test "unsigned index bound follows a scalar spill through a guarded loop" {
     // must retain the unbounded/wrapping interpretation.
     try graph.edges.append(std.testing.allocator, .{ .from = 0, .to = 1, .kind = .branch });
     try std.testing.expectEqual(@as(?u32, null), scalarUpperBound(&instructions, &graph, 6, 2));
+}
+
+test "constant selections retain values from lanes outside a later EXEC write" {
+    const vector = rdna2.Operand{ .kind = .vgpr, .reg = 3 };
+    const exec = rdna2.Operand{ .kind = .exec_lo };
+    const saved = rdna2.Operand{ .kind = .sgpr, .reg = 8 };
+    var instructions = [_]Instruction{
+        .{ .pc = 0, .opcode = .v_mov_b32, .dst = vector, .src0 = .{ .kind = .integer_inline_constant, .value = 7 } },
+        .{ .pc = 4, .opcode = .s_mov_b64, .dst = saved, .src0 = exec },
+        .{ .pc = 8, .opcode = .s_and_b64, .dst = exec, .src0 = exec, .src1 = .{ .kind = .integer_inline_constant, .value = 1 } },
+        .{ .pc = 12, .opcode = .v_cndmask_b32, .dst = vector, .src0 = .{ .kind = .integer_inline_constant, .value = 2 }, .src1 = .{ .kind = .integer_inline_constant, .value = 4 } },
+        .{ .pc = 16, .opcode = .s_mov_b64, .dst = exec, .src0 = saved },
+        .{ .pc = 20, .opcode = .v_readfirstlane_b32, .dst = .{ .kind = .sgpr, .reg = 20 }, .src0 = vector },
+        .{ .pc = 24, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?u32, 8), scalarUpperBound(&instructions, &graph, 6, 20));
+    instructions[0].src0.value = 0;
+    try std.testing.expectEqual(@as(?u32, 5), scalarUpperBound(&instructions, &graph, 6, 20));
+    instructions[0].src0 = .{ .kind = .vgpr, .reg = 9 };
+    try std.testing.expectEqual(@as(?u32, null), scalarUpperBound(&instructions, &graph, 6, 20));
+    instructions[0].src0 = .{ .kind = .literal_constant, .value = 0xffffffff };
+    try std.testing.expectEqual(@as(?u32, null), scalarUpperBound(&instructions, &graph, 6, 20));
 }
 
 test "index bounds reject ambiguous reaching definitions" {

@@ -3668,7 +3668,7 @@ fn runDccMetadataClearProbe(allocator: std.mem.Allocator) !void {
     }
     const context = [_][2]u32{
         .{ 0x318, 0x20 },            .{ 0x319, 7 },               .{ 0x31b, 0 },                       .{ 0x31c, (12 << 2) | (7 << 8) | (1 << 28) },
-        .{ 0x31d, 0 },               .{ 0x325, 0x1c0 },            .{ 0x390, 0 },                       .{ 0x3a8, 0 },
+        .{ 0x31d, 0 },               .{ 0x325, 0x1c0 },           .{ 0x390, 0 },                       .{ 0x3a8, 0 },
         .{ 0x3b0, (63 << 14) | 63 }, .{ 0x3b8, 1 << 24 },         .{ 0x08e, 15 },                      .{ 0x1c5, 4 },
         .{ 0x00c, 0 },               .{ 0x00d, 64 | (64 << 16) }, .{ 0x094, 1 << 31 },                 .{ 0x095, 64 | (64 << 16) },
         .{ 0x1e0, 0 },               .{ 0x200, 0 },               .{ 0x202, (0xcc << 16) | (1 << 4) }, .{ 0x204, 0 },
@@ -4400,6 +4400,56 @@ fn runSceneFlatPointerProbe(allocator: std.mem.Allocator) !void {
         try std.testing.expectError(error.GuestMemoryReadFailed, renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 }));
     }
     std.debug.print("Scene FLAT snapshots passed: nested descriptor walk, carry-out address chain, relocated records, count bounds and live unmapped-read rejection\n", .{});
+}
+
+fn runBufferTableProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const code = [_]u32{
+        vop1(1, 0, 16), // preserve group index before loading the selected V#
+        (0x1b << 25) | (1 << 17) | 129, // v1 = group & 1
+        0x7d84_0280, // compare v1 == 0
+        vop1(1, 2, 128),
+        (1 << 25) | (3 << 17) | (2 << 9) | 129, // select 1 or 0
+        vop1(2, 107, 259), // first active lane's choice -> VCC_HI
+        0x8000_0000 | (0x31 << 23) | (107 << 16) | (160 << 8) | 107,
+        0xf408_0100,                 107 << 25, // s4:s7 = *(SRT + 32 + choice * 16)
+        vop1(1, 4, 255),             100,
+        vop2(0x25, 4, 0, 4),         mubuf(0x1c, 0, 4, 0, 4)[0],
+        mubuf(0x1c, 0, 4, 0, 4)[1],  mubuf(0x0c, 0, 5, 0, 4)[0],
+        mubuf(0x0c, 0, 5, 0, 4)[1],  mubuf(0x1c, 0, 5, 0, 12)[0],
+        mubuf(0x1c, 0, 5, 0, 12)[1], 0xbf81_0000,
+    };
+    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var state = gpu.State{};
+    try state.writeRegister(.shader, 0x20c, 1);
+    try state.writeRegister(.shader, 0x20d, 0);
+    try state.writeRegister(.shader, 0x213, (16 << 1) | (1 << 7));
+    try state.writeRegister(.shader, 0x240, 0x1000);
+    try state.writeRegister(.shader, 0x241, 0);
+    for ([_]u32{ 0x8000, 4 << 16, 8, 0x5204 }, 0..) |word, i| try state.writeRegister(.shader, 0x24c + @as(u32, @intCast(i)), word);
+    for (0..2) |pass| {
+        const first: u32 = 0x4000 + @as(u32, @intCast(pass)) * 0x1000;
+        const second: u32 = 0x6000 + @as(u32, @intCast(pass)) * 0x1000;
+        for ([_]u32{ first, 4 << 16, 4, 0x5204, second, 4 << 16, 6, 0x5204 }, 0..) |word, i| guest.word(0x1020 + i * 4, word);
+        for (0..8) |i| {
+            guest.word(first + i * 4, 0xdeadbeef);
+            guest.word(second + i * 4, 0xdeadbeef);
+            guest.word(0x8000 + i * 4, 0xcccccccc);
+        }
+        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 8, 1, 1 });
+        try renderer.flushPendingGuestWrites();
+        for (0..8) |i| {
+            const valid = if (i % 2 == 0) i < 4 else i < 6;
+            const expected: u32 = if (valid) @intCast(100 + i) else 0;
+            try std.testing.expectEqual(expected, std.mem.readInt(u32, guest.bytes[0x8000 + i * 4 ..][0..4], .little));
+            try std.testing.expectEqual(if (i % 2 == 0 and i < 4) @as(u32, @intCast(100 + i)) else 0xdeadbeef, std.mem.readInt(u32, guest.bytes[first + i * 4 ..][0..4], .little));
+            try std.testing.expectEqual(if (i % 2 == 1 and i < 6) @as(u32, @intCast(100 + i)) else 0xdeadbeef, std.mem.readInt(u32, guest.bytes[second + i * 4 ..][0..4], .little));
+        }
+    }
+    std.debug.print("buffer table selection passed: active-lane index, VCC_HI offset, runtime V# reads/writes, unequal bounds, untouched neighbours and relocation\n", .{});
 }
 
 fn runScalarPointerProbe(allocator: std.mem.Allocator) !void {
@@ -5636,6 +5686,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--integer-colors")) {
         try runIntegerColorProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--buffer-tables")) {
+        try runBufferTableProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--pipeline-cache")) {
