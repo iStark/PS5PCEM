@@ -2,6 +2,18 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Signed normalized color attachments on 2026-09-09
+
+After the experience selection, frame 1317 rejects five draws into the
+256x256 target at `0x50bdb70000`: color format 5, number type 1. The renderer
+already supports sampling RG16_SNORM, but its color attachment mapping omitted
+this format. It now creates an R16G16_SNORM attachment for these draws.
+
+The normalized-color GPU probe switches the same resident target between
+UNORM and SNORM and verifies distinct positive and negative exports. It fails
+before this correction and passes afterward, alongside the default Vulkan
+smoke with SDK synchronization validation. Live scene verification is pending.
+
 ## Repeated HDR metadata clears on 2026-09-09
 
 The frame-1242 trace clears the HDR attachment's DCC key at `0x508be3e000`

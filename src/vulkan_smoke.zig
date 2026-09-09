@@ -3811,6 +3811,23 @@ fn runNormalizedColorProbe(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqual(misses, renderer.graphics_pipeline_cache_misses);
     std.debug.print("normalized color exports passed: FP16, UINT32, UNORM16 and SNORM16 in separate MRTs\n", .{});
 
+    // A later Yotei pass renders directly into a two-channel signed-normalized
+    // attachment before sampling it as RG16_SNORM. Keep both signs intact.
+    var signed_fragment = fragment;
+    signed_fragment[7] = 0xa000_2000;
+    for (signed_fragment, 0..) |word, index| guest.word(0xc00 + index * 4, word);
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.programRegisterBase(), 12);
+    try state.writeRegister(.context, 0x33a, (5 << 2) | (1 << 8));
+    try state.writeRegister(.context, 0x1c5, 0x6614);
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+    if (renderer.last_draw_error) |err| return err;
+    try renderer.flushPendingGuestWrites();
+    try std.testing.expectEqual(@as(u32, 0xa000_2000), std.mem.readInt(u32, guest.bytes[0x8000 + pixel * 4 ..][0..4], .little));
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.programRegisterBase(), 9);
+    try state.writeRegister(.context, 0x33a, 5 << 2);
+    try state.writeRegister(.context, 0x1c5, 0x6514);
+    std.debug.print("RG16_SNORM attachment passed: positive/negative exports and UNORM/SNORM target reuse\n", .{});
+
     // AGC attributes name s0:s3 at a later fetch. They must not replace the
     // NGG wave-count input in s3 before the guest loads that descriptor.
     var memory = guest.interface();

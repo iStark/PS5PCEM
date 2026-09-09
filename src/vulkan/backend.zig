@@ -1303,6 +1303,7 @@ fn colorTargetFormat(descriptor: gpu.resources.ColorTarget) ?ColorTargetFormat {
         // uses FLOAT for the same two-channel layout.
         5 => switch (descriptor.number_type) {
             0 => .{ .vulkan = vk.format_r16g16_unorm, .bytes_per_texel = 4 },
+            1 => .{ .vulkan = vk.format_r16g16_snorm, .bytes_per_texel = 4 },
             7 => .{ .vulkan = vk.format_r16g16_sfloat, .bytes_per_texel = 4 },
             else => null,
         },
