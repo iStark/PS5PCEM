@@ -2,6 +2,28 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Hierarchy bitset pointers on 2026-09-10
+
+With indirect dispatches restored, kernel `0x80003a0300` reaches an absolute
+FLAT read at PC `0x1d0`. The frame-930 capture identifies nine stride-four
+bitset descriptors at root+56, with one through 2048 words per level. The
+backend now snapshots these bounded ranges for the captured pointer-walk
+shape, including the root table. Guest pointer arithmetic and active-read
+fault reporting remain intact; unrelated absolute-address kernels still fail
+explicitly.
+
+The GPU probe checks runtime level selection, descriptor stride removal,
+last valid words, relocated allocations, malformed counts and an out-of-range
+read. It, both existing scene-pointer cases and the default Vulkan smoke pass
+SDK synchronization validation. Native execution of the new kernel is pending.
+
+The preceding native run passes flip 914 and shows the Digital Deluxe,
+Northern Star and preorder bonus notices. The Digital Deluxe screenshot
+contains the complete text and Cross icon. No orphan-builder recovery is
+reported through this sequence. A normal 3D background remains unresolved;
+another newly executed kernel, `0x80001e5f00`, fails dynamic sampled-image
+resolution at PC `0x4cf8`.
+
 ## Live labels inside retained command buffers on 2026-09-10
 
 A scheduler regression reproduces another synchronization problem: a producer

@@ -7805,28 +7805,49 @@ pub const Renderer = struct {
         if (programHasRawInstruction(analysis, 0x65c, &.{ 0xdc34_8018, 0x0000_0000 }) and
             programHasRawInstruction(analysis, 0x668, &.{ 0xdc30_8098, 0x027d_0000 }) and
             programHasRawInstruction(analysis, 0x6c4, &.{ 0xdc34_8088, 0x087d_0000 })) matches = true;
-        if (!matches) return;
+        // The hierarchy kernel selects one of nine V# bitsets at root+56,
+        // then strips the V# stride from the high pointer word before FLAT.
+        // Its finest level contains 4^8 bits; retain each level's actual
+        // bounds rather than exposing neighbouring allocations.
+        const bitsets = programHasRawInstruction(analysis, 0x15c, &.{ 0xdc34_8038, 0x0000_0000 }) and
+            programHasRawInstruction(analysis, 0x1c0, &.{ 0xd70f_6a00, 0x0002_2300 }) and
+            programHasRawInstruction(analysis, 0x1c8, &.{ 0x5002_02f9, 0x0c86_0680 }) and
+            programHasRawInstruction(analysis, 0x1d0, &.{ 0xdc30_8000, 0x007d_0000 });
+        if (!matches and !bitsets) return;
         const Region = struct { address: u64, size: usize };
         var regions: [33]Region = undefined;
         var region_count: usize = 1;
         const root = @as(u64, bindings.user_data[0]) | (@as(u64, bindings.user_data[1] & 0xffff) << 32);
-        try self.flushGuestStorageRange(root, 1024);
-        const count = try reader.readU32(root + 16);
-        if (count > 16) return Error.GuestBufferTooLarge;
-        regions[0] = .{ .address = root, .size = 456 + @as(usize, count) * 16 };
-        for (0..count) |index| {
-            const header = (try reader.readU64(root + 24 + index * 8)) & 0xffff_ffff_ffff;
-            if (header == 0) return Error.GuestMemoryReadFailed;
-            try self.flushGuestStorageRange(header, 160);
-            const descriptor = (try decodeBufferDescriptorAt(reader, header + 136)) orelse return Error.InvalidStorageDescriptor;
-            const objects = try reader.readU32(header + 152);
-            if (descriptor.stride != 168 or descriptor.swizzle_enabled or descriptor.add_thread_id or
-                objects > descriptor.record_count or descriptor.size_bytes > 8 * 1024 * 1024) return Error.InvalidStorageDescriptor;
-            regions[region_count] = .{ .address = header, .size = 160 };
-            region_count += 1;
-            if (descriptor.size_bytes != 0) {
+        try self.flushGuestStorageRange(root, if (bitsets) 232 else 1024);
+        if (bitsets) {
+            regions[0] = .{ .address = root, .size = 232 };
+            for (0..9) |level| {
+                const descriptor = (try decodeBufferDescriptorAt(reader, root + 56 + level * 16)) orelse return Error.InvalidStorageDescriptor;
+                const words = @max(@as(u32, 1), (@as(u32, 1) << @as(u5, @intCast(level * 2))) / 32);
+                if (descriptor.address == 0 or descriptor.stride != 4 or
+                    descriptor.record_count != words or descriptor.size_bytes != words * 4 or
+                    descriptor.swizzle_enabled or descriptor.add_thread_id) return Error.InvalidStorageDescriptor;
                 regions[region_count] = .{ .address = descriptor.address, .size = @intCast(descriptor.size_bytes) };
                 region_count += 1;
+            }
+        } else {
+            const count = try reader.readU32(root + 16);
+            if (count > 16) return Error.GuestBufferTooLarge;
+            regions[0] = .{ .address = root, .size = 456 + @as(usize, count) * 16 };
+            for (0..count) |index| {
+                const header = (try reader.readU64(root + 24 + index * 8)) & 0xffff_ffff_ffff;
+                if (header == 0) return Error.GuestMemoryReadFailed;
+                try self.flushGuestStorageRange(header, 160);
+                const descriptor = (try decodeBufferDescriptorAt(reader, header + 136)) orelse return Error.InvalidStorageDescriptor;
+                const objects = try reader.readU32(header + 152);
+                if (descriptor.stride != 168 or descriptor.swizzle_enabled or descriptor.add_thread_id or
+                    objects > descriptor.record_count or descriptor.size_bytes > 8 * 1024 * 1024) return Error.InvalidStorageDescriptor;
+                regions[region_count] = .{ .address = header, .size = 160 };
+                region_count += 1;
+                if (descriptor.size_bytes != 0) {
+                    regions[region_count] = .{ .address = descriptor.address, .size = @intCast(descriptor.size_bytes) };
+                    region_count += 1;
+                }
             }
         }
         var total: usize = 0;

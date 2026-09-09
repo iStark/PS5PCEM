@@ -4548,6 +4548,55 @@ fn runSceneFlatPointerProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("Scene FLAT snapshots passed: nested descriptor walk, carry-out address chain, relocated records, count bounds and live unmapped-read rejection\n", .{});
 }
 
+fn runSceneBitsetPointerProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    var guest = SizedGuestMemory(512 * 1024){};
+    _ = renderer.dcbBackend(guest.interface());
+    // Preserve the real pointer/stride extraction sites while selecting the
+    // level and word through user data. The backend discovers every bitset.
+    var code: [0x1e8 / 4]u32 = @splat(0xbf80_0000);
+    code[0] = vop1(1, 0, 2);
+    code[1] = vop1(1, 17, 3);
+    for ([_]u32{ 0xdc34_8038, 0x0000_0000 }, 0..) |word, i| code[0x15c / 4 + i] = word;
+    for ([_]u32{ 0xd70f_6a00, 0x0002_2300, 0x5002_02f9, 0x0c86_0680, 0xdc30_8000, 0x007d_0000 }, 0..) |word, i| code[0x1c0 / 4 + i] = word;
+    code[0x1d8 / 4] = vop1(1, 2, 128);
+    code[0x1dc / 4] = mubuf(0x1c, 0, 0, 2, 4)[0];
+    code[0x1e0 / 4] = mubuf(0x1c, 0, 0, 2, 4)[1];
+    code[0x1e4 / 4] = 0xbf81_0000;
+    for (code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+    var state = gpu.State{};
+    try state.writeRegister(.shader, 0x20c, 1);
+    try state.writeRegister(.shader, 0x20d, 0);
+    try state.writeRegister(.shader, 0x213, 8 << 1);
+    for ([_]u32{ 0x10000, 0, 0, 0, 0x13000, 4 << 16, 1, 0x5204 }, 0..) |word, i|
+        try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
+    for (0..2) |pass| {
+        for (0..9) |level| {
+            const count = @max(@as(u32, 1), (@as(u32, 1) << @as(u5, @intCast(level * 2))) / 32);
+            const address = 0x20000 + level * 0x3000 + pass * 0x20000;
+            for ([_]u32{ @intCast(address), 4 << 16, count, 0x5204 }, 0..) |word, i|
+                guest.word(0x10038 + level * 16 + i * 4, word);
+            for (0..count) |i| guest.word(address + i * 4, @intCast(0xa0000000 + pass * 0x10000 + level * 0x1000 + i));
+        }
+        for ([_]u32{ 0, 3, 8 }) |level| {
+            const count = @max(@as(u32, 1), (@as(u32, 1) << @as(u5, @intCast(level * 2))) / 32);
+            try state.writeRegister(.shader, 0x242, level * 16);
+            try state.writeRegister(.shader, 0x243, (count - 1) * 4);
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+            var output: [4]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x13000, &output);
+            try std.testing.expectEqual(@as(u32, @intCast(0xa0000000 + pass * 0x10000 + level * 0x1000 + count - 1)), std.mem.readInt(u32, &output, .little));
+        }
+    }
+    guest.word(0x10038 + 8 * 16 + 8, 2049);
+    try std.testing.expectError(error.InvalidStorageDescriptor, renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 }));
+    guest.word(0x10038 + 8 * 16 + 8, 2048);
+    try state.writeRegister(.shader, 0x243, 2048 * 4);
+    try std.testing.expectError(error.GuestMemoryReadFailed, renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 }));
+    std.debug.print("Scene bitset FLAT snapshots passed: runtime levels, stride extraction, last valid words, relocation, descriptor bounds and unmapped-read rejection\n", .{});
+}
+
 fn runBufferTableProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -5824,6 +5873,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--scene-flat-pointers")) {
         try runSceneFlatPointerProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--scene-bitset-pointers")) {
+        try runSceneBitsetPointerProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--dcc-single-clears")) {
