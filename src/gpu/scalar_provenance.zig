@@ -13,7 +13,9 @@ const rdna2 = @import("rdna2");
 const shaders = @import("shaders.zig");
 
 pub const maximum_scalar_registers = 128;
-pub const maximum_loads = 128;
+// Dense lighting shaders contain more than 250 distinct scalar loads. Keep
+// their late coefficients even when many instructions reuse the same SGPRs.
+pub const maximum_loads = 512;
 /// A scalar load can write sixteen SGPRs. Keep every recovered write, rather
 /// than only the final value of each physical register, because shaders reuse
 /// the same SGPR window for several descriptors and constant blocks.

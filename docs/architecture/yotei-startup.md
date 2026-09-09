@@ -2,6 +2,35 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Retaining dense lighting constants on 2026-09-09
+
+The dense environment shader at `0x80001fd400` completes its CPU resource walk
+in 3,901 instructions, but needs 250 distinct scalar-load observations. The
+128-entry observation table silently omitted its later coefficients. Its
+bounded capacity is now 512, including the corresponding dynamic scalar buffers.
+Increasing the instruction budget alone from 16,384 to 262,144 produces identical
+outputs and does not fix the missing constants.
+
+A coherent capture retains the prepared GPU images and buffers, current CPU
+parameters and complete sampled allocations. Replaying it with all 250 loads
+fills both formerly empty RGB volumes at `0x50a3e9b000` and `0x50a479b000`:
+each contains 2,359,296 nonzero, finite texels. The complete volume dispatch
+passes Vulkan SDK synchronization validation. Supplying its corrected outputs
+to the captured main-lighting dispatch increases nonzero HDR RGB pixels from
+474,564 to 3,811,361. This verifies propagation into scene geometry; it does
+not yet establish a complete live title menu.
+
+The main-lighting shader itself retains all 99 scalar loads. Its outputs match
+byte for byte at dispatcher budgets 256, 512, 1,024 and 2,048, so its default
+budget remains unchanged. Diagnostic scans beyond empty texture allocations now
+run only with verbose logging; those reads never contributed image data.
+
+The `--distinct-scalar-loads` GPU regression checks 320 distinct loads into a
+reused SGPR across 64 lanes, changes every input value, and verifies reuse of
+the same pipeline. The former backend fails at load 128; the corrected backend
+passes this probe, repeated-load loops, sampled-write refresh and the default
+compute/graphics smoke under SDK synchronization validation.
+
 ## Storage writes invalidate sampled snapshots on 2026-09-09
 
 With canonical image aliases disabled, sampled-cache keys omitted resident

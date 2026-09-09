@@ -17717,7 +17717,7 @@ pub const Renderer = struct {
         const raw_probe_span = probe_span;
         var raw_nonzero: u32 = 0;
         var raw_probe_hits: u32 = 0;
-        if (raw_probe_span != 0) {
+        if ((log_verbose_gpu or self.texture_cache_misses <= 4) and raw_probe_span != 0) {
             const steps = [_]u64{ 0, raw_probe_span / 4, raw_probe_span / 2, (raw_probe_span * 3) / 4 };
             var step_i: usize = 0;
             while (step_i < steps.len) : (step_i += 1) {
@@ -17763,7 +17763,9 @@ pub const Renderer = struct {
         // place the true surface a few tiles past the T# base, or leave the
         // head cleared while the body is valid).
         var first_hit_off: ?u64 = null;
-        if (raw_nonzero == 0 and descriptor.width != 0 and descriptor.height != 0) {
+        // These reads only explain empty uploads in verbose logs. They do not
+        // contribute texels and may extend beyond the sampled allocation.
+        if (log_verbose_gpu and raw_nonzero == 0 and descriptor.width != 0 and descriptor.height != 0) {
             const deep_span: u64 = @max(
                 raw_probe_span,
                 @as(u64, descriptor.width) * descriptor.height * descriptor.depth_or_layers * @as(u64, bytes_per_texel) * 2,

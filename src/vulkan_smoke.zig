@@ -1234,6 +1234,54 @@ fn runRepeatedScalarLoadProbe(allocator: std.mem.Allocator) !void {
     }
 }
 
+fn runDistinctScalarLoadProbe(allocator: std.mem.Allocator) !void {
+    const count = 320;
+    const lanes = 64;
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    const guest = try allocator.create(SizedGuestMemory(262144));
+    defer allocator.destroy(guest);
+    guest.* = .{};
+    _ = renderer.dcbBackend(guest.interface());
+    var code: std.ArrayList(u32) = .empty;
+    defer code.deinit(allocator);
+    for (0..count) |index| {
+        try code.appendSlice(allocator, &.{
+            0xf400_0300, (125 << 25) | @as(u32, @intCast(index * 4)), // distinct load into s12
+            vop1(1, 1, 12),
+            vop1(1, 2, 255), @intCast(index * lanes),
+            vop2(0x25, 2, 0, 2), // v2 = lane + index * 64
+        });
+        try code.appendSlice(allocator, &mubuf(0x1c, 0, 1, 2, 4));
+    }
+    try code.append(allocator, 0xbf81_0000);
+    for (code.items, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var state = gpu.State{};
+    try state.writeRegister(.shader, 0x20c, 1);
+    try state.writeRegister(.shader, 0x20d, 0);
+    try state.writeRegister(.shader, 0x213, 8 << 1);
+    for ([_]u32{ 0x9000, 0, 0, 0, 0x10000, 4 << 16, count * lanes, 0 }, 0..) |word, index|
+        try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(index)), word);
+    const output = try allocator.alloc(u8, count * lanes * 4);
+    defer allocator.free(output);
+    for ([_]u32{ 0x12340000, 0x89ab0000 }, 0..) |seed, pass| {
+        for (0..count) |index| guest.word(0x9000 + index * 4, seed + @as(u32, @intCast(index * 257 + 1)));
+        const report = try renderer.dispatchRdna2State(&state, .{ lanes, 1, 1 }, .{ 1, 1, 1 });
+        try std.testing.expect(report.spirv_words != 0);
+        if (pass != 0) try std.testing.expect(report.pipeline_cache_hit);
+        try renderer.readbackGuestStorageBuffer(0x10000, output);
+        for (0..count) |index| {
+            const expected = seed + @as(u32, @intCast(index * 257 + 1));
+            for (0..lanes) |lane| {
+                const actual = std.mem.readInt(u32, output[(index * lanes + lane) * 4 ..][0..4], .little);
+                if (actual != expected) std.debug.print("distinct scalar load {d} lane {d}: expected={x} actual={x}\n", .{ index, lane, expected, actual });
+                try std.testing.expectEqual(expected, actual);
+            }
+        }
+    }
+    std.debug.print("distinct scalar loads passed: 320 reused-SGPR loads, 64 lanes and changed input through one pipeline\n", .{});
+}
+
 fn runWholeQuadModeProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -5093,6 +5141,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--scalar-loops")) {
         try runScalarLoopProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--distinct-scalar-loads")) {
+        try runDistinctScalarLoadProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--sampled-storage-refresh")) {
