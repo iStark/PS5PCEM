@@ -5237,15 +5237,19 @@ pub const Renderer = struct {
         // Ballot compaction and shared-mask initialization are also safe with
         // the bounded dispatcher. Keeping them live is required for the
         // visibility lists consumed by the final composition pass.
-        // This volume kernel advances four depth slices per loop iteration.
+        // These volume kernels advance four depth slices per loop iteration.
         // The default 256-block dispatcher cap stopped the captured workload
         // after slice 27. Keep a bounded budget that covers all 64 slices.
         const yotei_environment_lighting =
             std.meta.eql(group_count, [3]u32{ 1, 64, 36 }) and
-            analysis.program.instructions.items.len == 3215 and
-            programHasRawInstruction(analysis, 0x138, &.{ 0xf090_0208, 0x0061_0300 }) and
-            programHasRawInstruction(analysis, 0x2b74, &.{ 0xf020_2710, 0x0001_0058 }) and
-            programHasRawInstruction(analysis, 0x48b0, &.{ 0xf020_2710, 0x0001_0058 });
+            ((analysis.program.instructions.items.len == 3215 and
+                programHasRawInstruction(analysis, 0x138, &.{ 0xf090_0208, 0x0061_0300 }) and
+                programHasRawInstruction(analysis, 0x2b74, &.{ 0xf020_2710, 0x0001_0058 }) and
+                programHasRawInstruction(analysis, 0x48b0, &.{ 0xf020_2710, 0x0001_0058 })) or
+                (analysis.program.instructions.items.len == 4384 and
+                    programHasRawInstruction(analysis, 0xa0, &.{ 0xf090_0208, 0x0061_0401 }) and
+                    programHasRawInstruction(analysis, 0x4254, &.{ 0xf020_2710, 0x0007_0014 }) and
+                    programHasRawInstruction(analysis, 0x6074, &.{ 0xf020_2710, 0x0001_0014 })));
         // Yotei's two reduction and two gather passes used to be quarantined
         // here. Correct EXEC state merging and Vulkan-valid dynamic sample
         // offsets make all four safe on NVIDIA, including repeated execution;

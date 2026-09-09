@@ -19,6 +19,21 @@ that probe and the default smoke pass validation. These checks establish
 execution and coverage, not correct final lighting: two captured RGB outputs
 remain zero, and a complete live scene check is still required.
 
+The dense scene switches to a second volume program, `0x80001fd400`, with
+4,384 instructions and five outputs. It uses the same `1x64x36` dispatch and
+`4x4x4` local size. A captured replay with initially empty outputs reaches only
+scattered pixels through slice 16 under the default budget. The same workload
+with 2,048 visits fills all 36,864 texels in every slice of `0x50a599b000` and
+calculates the visibility volume through slice 63. The full dispatch passes
+SDK synchronization validation. Three RGB outputs remain zero in this replay;
+their inputs include live resources outside the captured parameter pages, so
+this is a coverage check rather than a synchronized lighting reference.
+
+Both program shapes now receive the bounded volume budget. The first live
+build with native startup-volume execution preserves the spinner and bonus
+notice, but its scene compositor still contains mostly darkness and partial
+fire. Live validation of the second program's increased budget is pending.
+
 ## Indirect command tail chains on 2026-09-09
 
 The comparison-destination build still produces a black trunk and records
