@@ -2,6 +2,34 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Vertex entry registers and attribute recovery on 2026-09-09
+
+Comparing the material traces before and after graphics scalar retention
+isolates a regression in tree program `0x806ee0be00`: its main color output
+disappears while the depth silhouette remains. AGC attribute recovery pairs
+buffer descriptors with the registers used by later MUBUF instructions, then
+incorrectly installs those descriptors as initial SGPR values. This overwrites
+merged NGG inputs, including `s3`'s active-wave counts and user-data pointers.
+The former broad scalar-range deletion hid this unrelated initialization bug.
+
+Attribute descriptors now seed only the CPU evaluation used to prepare buffer
+resources. The shader retains its actual entry ABI and recovered SMEM loads at
+their producer PCs. This preserves the compositor's scalar-lifetime correction
+without discarding all constants that happen to reuse V# register numbers.
+
+The GPU regression supplies AGC vertex metadata, reads the merged wave-count
+input before loading a descriptor into the same SGPRs, and rejects the triangle
+if that entry value changed. It fails against the previous backend and passes
+with this correction, together with the full default smoke under SDK
+synchronization validation. An offline replay using captured shader
+headers and matching prepass/material state restores colored bark; complete
+live scene verification is pending.
+
+The replay also exposed duplicate `SubgroupLocalInvocationId` input declarations
+when graphics lane identity and DPP/permlane shared a shader. They now reuse one
+input. Identity DPP operations in both graphics stages exercise this in the GPU
+probe, with no `VUID-StandaloneSpirv-OpEntryPoint-09658` validation error.
+
 ## Half-register writes and temporal resolve on 2026-09-09
 
 The captured temporal upscaler `0x1d85d00` exposes several independent

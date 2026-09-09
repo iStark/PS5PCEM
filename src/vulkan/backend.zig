@@ -13786,15 +13786,14 @@ pub const Renderer = struct {
             };
             vertex_scalar_count += 1;
         }
-        // Recover attribute V#s from the AGC vertex buffer table into the SGPRs
-        // the VS MUBUF instructions name (typically s4 for Unity NGG).
+        // Attribute metadata helps resource discovery, but its V# register
+        // names describe a later fetch, not the shader's entry ABI. Keep
+        // synthetic descriptors out of the actual initial scalar values.
         var vertex_scalar_mut = vertex_scalar;
-        vertex_scalar_count = seedVertexBufferScalars(
+        seedVertexBufferEvaluation(
             &vertex_bindings,
             reader,
             vertex_instructions,
-            &vertex_scalar_regs,
-            vertex_scalar_count,
             &vertex_scalar_mut,
         );
 
@@ -24779,17 +24778,15 @@ fn resolveComputeBufferDescriptor(
     return null;
 }
 
-/// Injects AGC vertex-buffer V#s into specialized scalar registers so the
-/// SPIR-V translator sees s4:s7 (etc.) as constants and prepareComputeResources
-/// can stage the underlying guest memory.
-fn seedVertexBufferScalars(
+/// Helps resource preparation find attribute buffers described by AGC tables.
+/// These recovered V#s must not become entry-point SGPR values: the same
+/// registers initially contain SPI wave counts, user pointers and constants.
+fn seedVertexBufferEvaluation(
     bindings: *const gpu.ShaderBindings,
     reader: gpu.ShaderMemoryReader,
     instructions: []const gpu.ShaderInstruction,
-    out: []gpu.ShaderSpirvScalarRegister,
-    count: usize,
-    evaluation: ?*gpu.ScalarEvaluation,
-) usize {
+    evaluation: *gpu.ScalarEvaluation,
+) void {
     if (log_verbose_gpu) std.debug.print(
         "[vulkan dcb] vertex seed: stage={s} header={any} srt={any} ud_base={d} ud_count={d} scalar_s4={any}\n",
         .{
@@ -24798,20 +24795,20 @@ fn seedVertexBufferScalars(
             bindings.srt_address != null,
             bindings.scalar_user_data_base,
             bindings.user_data_count,
-            if (evaluation) |e| e.registers[4].known else false,
+            evaluation.registers[4].known,
         },
     );
     const vertex = (gpu.VertexBindings.capture(bindings, reader) catch |err| {
         std.debug.print("[vulkan dcb] VertexBindings.capture failed: {s}\n", .{@errorName(err)});
-        return count;
+        return;
     }) orelse {
         if (log_verbose_gpu) std.debug.print(
             "[vulkan dcb] VertexBindings: no attr/buffer tables (fetch={any})\n",
             .{bindings.direct_pointers.fetch_shader != null},
         );
-        return count;
+        return;
     };
-    if (vertex.attribute_count == 0) return count;
+    if (vertex.attribute_count == 0) return;
 
     // Collect unique resource SGPRs referenced by MUBUF loads, in program order.
     var resource_sgprs: [16]u32 = undefined;
@@ -24856,7 +24853,7 @@ fn seedVertexBufferScalars(
         resource_sgprs[resource_count] = sgpr;
         resource_count += 1;
     }
-    if (resource_count == 0) return count;
+    if (resource_count == 0) return;
 
     // Unique attribute buffers in location order.
     var buffers: [16]gpu.BufferDescriptor = undefined;
@@ -24885,10 +24882,9 @@ fn seedVertexBufferScalars(
             "[vulkan dcb] VertexBindings: {d} attrs but no plausible buffers\n",
             .{vertex.attribute_count},
         );
-        return count;
+        return;
     }
 
-    var n = count;
     const pairs = @min(resource_count, buffer_count);
     var pair: usize = 0;
     while (pair < pairs) : (pair += 1) {
@@ -24908,32 +24904,16 @@ fn seedVertexBufferScalars(
         var word_i: u32 = 0;
         while (word_i < 4) : (word_i += 1) {
             const reg = sgpr + word_i;
-            var found: ?usize = null;
-            for (out[0..n], 0..) |entry, index| {
-                if (entry.register == reg and entry.producer_pc == null) {
-                    found = index;
-                    break;
-                }
-            }
-            if (found) |index| {
-                out[index].value = words[word_i];
-            } else if (n < out.len) {
-                out[n] = .{ .register = reg, .value = words[word_i] };
-                n += 1;
-            }
-            if (evaluation) |eval| {
-                if (reg < eval.registers.len) {
-                    eval.registers[reg] = .{
-                        .known = true,
-                        .value = words[word_i],
-                        .sources = .{},
-                        .producer_pc = 0,
-                    };
-                }
+            if (reg < evaluation.registers.len) {
+                evaluation.registers[reg] = .{
+                    .known = true,
+                    .value = words[word_i],
+                    .sources = .{},
+                    .producer_pc = 0,
+                };
             }
         }
     }
-    return n;
 }
 
 fn layerAvailable(enumerate: vk.PfnEnumerateInstanceLayerProperties, wanted: []const u8) bool {

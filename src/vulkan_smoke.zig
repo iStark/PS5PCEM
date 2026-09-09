@@ -2779,13 +2779,16 @@ fn runNormalizedColorProbe(allocator: std.mem.Allocator) !void {
         vop1(1, 4, 255), 0x3f40_0000,      vop2(8, 5, 3, 4), vop2(8, 6, 3, 3),
         vop1(1, 7, 255), 0xbfc0_0000,      vop2(8, 6, 6, 7), vop1(1, 8, 255),
         0x3f40_0000,     vop2(3, 6, 6, 8), vop1(1, 7, 128),  vop1(1, 8, 242),
-        0xf800_08cf,     0x0807_0605,      0xbf81_0000,
+        vop1(1, 5, 250), 0xff00_e405, // identity DPP shares the graphics lane BuiltIn
+        0xf800_08cf,     0x0807_0605,
+        0xbf81_0000,
     };
     for (vertex, 0..) |word, index| guest.word(0x700 + index * 4, word);
     const fragment = [_]u32{
         vop1(1, 0, 255), 0x3800_3400, vop1(1, 1, 255), 0x3c00_3a00,
         vop1(1, 2, 255), 0x1234_5678, vop1(1, 3, 255), 0xc000_4000,
         vop1(1, 4, 255), 0x4000_8000, vop1(1, 5, 255), 0x7fff_0000,
+        vop1(1, 0, 250), 0xff00_e400, // same identity DPP in the fragment stage
         0xf800_140f, 0x0100, // FP16 ABGR, valid mask
         0xf800_0011, 0x0002, // UINT32 R
         0xf800_0423, 0x0003, // UNORM16 GR
@@ -2842,6 +2845,56 @@ fn runNormalizedColorProbe(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(u32, 0xc000_4000), std.mem.readInt(u32, guest.bytes[0x8000 + pixel * 4 ..][0..4], .little));
     try std.testing.expectEqual(misses, renderer.graphics_pipeline_cache_misses);
     std.debug.print("normalized color exports passed: FP16, UINT32, UNORM16 and SNORM16 in separate MRTs\n", .{});
+
+    // AGC attributes name s0:s3 at a later fetch. They must not replace the
+    // NGG wave-count input in s3 before the guest loads that descriptor.
+    var memory = guest.interface();
+    memory.shader_header = struct {
+        fn header(_: ?*anyopaque, program: u64) ?u64 {
+            return if (program == 0x1000) 0xe000 else null;
+        }
+    }.header;
+    _ = renderer.dcbBackend(memory);
+    guest.word(0xe008, 0xe100);
+    guest.word(0xe030, 0xe200);
+    guest.word(0xe050, 1);
+    guest.word(0xe100, 0xe180);
+    guest.word(0xe12c, 11);
+    @memset(guest.bytes[0xe180..0xe196], 0xff);
+    std.mem.writeInt(u16, guest.bytes[0xe190..][0..2], 0, .little); // buffer table in USER_DATA[0:1]
+    std.mem.writeInt(u16, guest.bytes[0xe194..][0..2], 2, .little); // attributes in USER_DATA[2:3]
+    guest.word(0xe200, 1 << 16); // semantic 0, one element
+    guest.word(0xe800, 29 << 5);
+    for ([_]u32{ 0x17000, 4 << 16, 1, 0x24fac }, 0..) |word, index| guest.word(0xf000 + index * 4, word);
+    guest.word(0x17000, 0x3f800000);
+    const merged_vertex = [_]u32{
+        vop1(1, 9, 3), // preserve the actual entry s3 before its later V# lifetime
+        0xf408_0004, 0xfa00_0000, // s_load_dwordx4 s0, s8, 0
+        0xe000_0000, 0x8000_1000, // buffer_load_format_x v16, s0:s3
+    } ++ vertex[0 .. vertex.len - 3].* ++ [_]u32{
+        0x7d84_12ff,      0x0000_4040, // v_cmp_eq_u32 vcc, 64/64, v9
+        vop1(1, 10, 255), 0x4000_0000,
+        vop2(1, 7, 10, 7), // Z=2, W=1 rejects a corrupted entry ABI (v7 = 0)
+        0xf800_08cf,
+        0x0807_0605,
+        0xbf81_0000,
+    };
+    for (merged_vertex, 0..) |word, index| guest.word(0x1000 + index * 4, word);
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.vertex.programRegisterBase(), 0);
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.export_shader.programRegisterBase(), 0x10);
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.export_shader.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, gpu.resources.ShaderStage.geometry.userDataBase() - 1, 4 << 1);
+    for ([_]u32{ 0xf000, 0, 0xe800, 0 }, 0..) |word, index| {
+        try state.writeRegister(.shader, gpu.resources.ShaderStage.geometry.userDataBase() + @as(u32, @intCast(index)), word);
+    }
+    try state.writeRegister(.context, 0x318, 0x180);
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+    try renderer.flushPendingGuestWrites();
+    for (renderer.reported_shader_failures) |failure| try std.testing.expect(failure == null);
+    for ([_]u8{ 64, 128, 191, 255 }, guest.bytes[0x18000 + pixel * 4 ..][0..4]) |expected, actual| {
+        try std.testing.expect(@abs(@as(i16, actual) - expected) <= 1);
+    }
+    std.debug.print("vertex entry ABI passed: attribute descriptors preserve NGG wave counts before SGPR reuse\n", .{});
 }
 
 fn runIntegerColorProbe(allocator: std.mem.Allocator) !void {

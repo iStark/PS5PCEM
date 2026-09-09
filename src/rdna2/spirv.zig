@@ -6355,6 +6355,14 @@ const Builder = struct {
     }
 
     fn subgroupLocalInvocationId(self: *Builder) Error!u32 {
+        // Graphics lane identity already uses SubgroupLocalInvocationId.
+        // DPP/mbcnt must share that input instead of declaring the same
+        // BuiltIn twice (VUID-StandaloneSpirv-OpEntryPoint-09658).
+        if (self.stage != .compute and self.local_invocation_index != 0) {
+            const invocation = self.id();
+            try self.emit(&self.body, 61, &.{ self.bits_type, invocation, self.local_invocation_index });
+            return invocation;
+        }
         if (self.subgroup_local_invocation_id == 0) {
             const input_pointer = self.id();
             self.subgroup_local_invocation_id = self.id();
