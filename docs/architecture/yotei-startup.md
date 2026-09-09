@@ -14,7 +14,7 @@ comparison to VCC, leaving the encoded destination unwritten.
 VOP3 comparisons now decode their scalar destination from VDST. VOPC retains
 its implicit VCC destination and CMPX retains EXEC. Explicit comparison
 destinations are also exercised by the
-[LLVM AMDGPU comparison tests](https://github.com/llvm/llvm-project/blob/main/llvm/test/CodeGen/AMDGPU/llvm.amdgcn.icmp.w64.ll).
+[LLVM AMDGPU comparison tests](https://github.com/llvm/llvm-project/blob/llvmorg-20.1.0/llvm/test/CodeGen/AMDGPU/llvm.amdgcn.icmp.w64.ll).
 
 All 39 vector decoder tests pass. The GPU mask suite checks 120 combinations
 of SDWA, VOP3 and 64-bit saved-mask comparisons, explicit SGPR/VCC destinations,
