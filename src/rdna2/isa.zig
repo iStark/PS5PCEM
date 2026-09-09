@@ -688,6 +688,8 @@ pub const Opcode = enum {
     image_atomic_fmax,
     image_sample,
     image_gather4,
+    image_bvh_intersect_ray,
+    image_bvh64_intersect_ray,
     exp,
 
     /// Assembler mnemonic. Identical to the variant name, so no table is needed.

@@ -322,6 +322,8 @@ fn mimgOpcode(id: u32) isa.Opcode {
         0x20...0x3f, 0x68...0x6f, 0xa0...0xbe => .image_sample,
         0x44, 0x47, 0x48, 0x4c, 0x4f, 0x54, 0x57, 0x58, 0x5c, 0x5f, 0x61 => .image_gather4,
         0x60 => .image_get_lod,
+        0xe6 => .image_bvh_intersect_ray,
+        0xe7 => .image_bvh64_intersect_ray,
         else => .unsupported,
     };
 }
@@ -464,8 +466,47 @@ pub fn decodeMimg(pc: u32, code: []const u32, word_index: u32) Error!Instruction
     inst.src1 = try operand.decodeScalarSource(((word1 >> 16) & 0x1f) * 4);
     inst.src2 = try operand.decodeScalarSource(((word1 >> 21) & 0x1f) * 4);
     inst.src_count = 3;
+    if (op == .image_bvh_intersect_ray or op == .image_bvh64_intersect_ray) {
+        // RDNA 2 ray operands are node pointer, extent, origin, direction and
+        // inverse direction. A16 packs only the final six floating components;
+        // DIM and DMASK do not describe this instruction's operand widths.
+        inst.data_words = 4;
+        inst.image_address_components = @as(u8, if (inst.image_sample_flags.a16) 8 else 11) +
+            @intFromBool(op == .image_bvh64_intersect_ray);
+        inst.src2 = .{};
+        inst.src_count = 2;
+    }
     if (op == .unsupported) inst.unsupported_reason = "MIMG opcode is not implemented";
     return inst;
+}
+
+test "MIMG ray intersection preserves captured nonconsecutive ray operands" {
+    const code = [_]u32{ 0xf198_9f07, 0x0006_022b, 0x3822_3937, 0x3e36_2425, 0x0000_193f };
+    const inst = try decodeMimg(0x15a4, &code, 0);
+    try std.testing.expectEqual(isa.Opcode.image_bvh_intersect_ray, inst.opcode);
+    try std.testing.expectEqual(@as(u8, 4), inst.data_words);
+    try std.testing.expectEqual(@as(u8, 11), inst.image_address_components);
+    try std.testing.expectEqual(@as(u32, 2), inst.dst.reg);
+    try std.testing.expectEqual(@as(u32, 43), inst.src0.reg);
+    try std.testing.expectEqual(@as(u32, 24), inst.src1.reg);
+    try std.testing.expectEqual(@as(u8, 2), inst.src_count);
+    try std.testing.expect(inst.image_r128);
+    try std.testing.expectEqualSlices(u8, &.{ 55, 57, 34, 56, 37, 36, 54, 62, 63, 25 }, inst.image_nsa_address[0..10]);
+    try std.testing.expectError(Error.TruncatedInstruction, decodeMimg(0, code[0..4], 0));
+}
+
+test "MIMG ray intersection counts 32-bit and 64-bit node pointers with A16" {
+    for ([_]bool{ false, true }) |wide| {
+        for ([_]bool{ false, true }) |a16| {
+            const inst = try decodeMimg(0, &.{
+                0xf198_8001 | @as(u32, if (wide) 1 << 18 else 0),
+                0x0006_0210 | @as(u32, if (a16) 1 << 30 else 0),
+            }, 0);
+            try std.testing.expectEqual(if (wide) isa.Opcode.image_bvh64_intersect_ray else isa.Opcode.image_bvh_intersect_ray, inst.opcode);
+            try std.testing.expectEqual(@as(u8, if (a16) 8 else 11) + @intFromBool(wide), inst.image_address_components);
+            try std.testing.expectEqual(@as(u8, 4), inst.data_words);
+        }
+    }
 }
 
 pub fn decodeExp(pc: u32, code: []const u32, word_index: u32) Error!Instruction {
