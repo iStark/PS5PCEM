@@ -2769,7 +2769,83 @@ fn runPackedBufferProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("packed buffer probe passed: D16 loads/stores, adjacent halfwords, bounds, half/float packing, CMPX U16 and CLASS F32\n", .{});
 }
 
+fn runNormalizedColorProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    const backend = renderer.dcbBackend(guest.interface());
+    const vertex = [_]u32{
+        vop1(6, 1, 261), vop1(1, 2, 255),  0x3f80_0000,      vop2(4, 3, 1, 2),
+        vop1(1, 4, 255), 0x3f40_0000,      vop2(8, 5, 3, 4), vop2(8, 6, 3, 3),
+        vop1(1, 7, 255), 0xbfc0_0000,      vop2(8, 6, 6, 7), vop1(1, 8, 255),
+        0x3f40_0000,     vop2(3, 6, 6, 8), vop1(1, 7, 128),  vop1(1, 8, 242),
+        0xf800_08cf,     0x0807_0605,      0xbf81_0000,
+    };
+    for (vertex, 0..) |word, index| guest.word(0x700 + index * 4, word);
+    const fragment = [_]u32{
+        vop1(1, 0, 255), 0x3800_3400, vop1(1, 1, 255), 0x3c00_3a00,
+        vop1(1, 2, 255), 0x1234_5678, vop1(1, 3, 255), 0xc000_4000,
+        vop1(1, 4, 255), 0x4000_8000, vop1(1, 5, 255), 0x7fff_0000,
+        0xf800_140f, 0x0100, // FP16 ABGR, valid mask
+        0xf800_0011, 0x0002, // UINT32 R
+        0xf800_0423, 0x0003, // UNORM16 GR
+        0xf800_0c3f, 0x0504, // SNORM16 ABGR, done
+        0xbf81_0000,
+    };
+    for (fragment, 0..) |word, index| guest.word(0x900 + index * 4, word);
+    var state = gpu.State{};
+    for ([_]gpu.resources.ShaderStage{ .vertex, .pixel }, [_]u32{ 7, 9 }) |stage, address| {
+        try state.writeRegister(.shader, stage.programRegisterBase(), address);
+        try state.writeRegister(.shader, stage.programRegisterBase() + 1, 0);
+    }
+    for ([_]u32{ 10 << 2, (4 << 2) | (4 << 8), 5 << 2, (12 << 2) | (7 << 8) }, 0..) |info, slot| {
+        const base: u32 = @intCast(0x318 + slot * 15);
+        try state.writeRegister(.context, base, @intCast(0x20 + slot * 0x30));
+        try state.writeRegister(.context, base + 1, 3);
+        try state.writeRegister(.context, base + 3, 0);
+        try state.writeRegister(.context, base + 4, info);
+        try state.writeRegister(.context, base + 5, 0);
+        try state.writeRegister(.context, 0x390 + @as(u32, @intCast(slot)), 0);
+        try state.writeRegister(.context, 0x3b0 + @as(u32, @intCast(slot)), (31 << 14) | 31);
+        try state.writeRegister(.context, 0x3b8 + @as(u32, @intCast(slot)), 1 << 24);
+    }
+    const context = [_][2]u32{
+        .{ 0x08e, 0xf31f },                  .{ 0x1c5, 0x6514 },          .{ 0x00c, 0 }, .{ 0x00d, 32 | (32 << 16) },
+        .{ 0x094, 1 << 31 },                 .{ 0x095, 32 | (32 << 16) }, .{ 0x1e0, 0 }, .{ 0x200, 0 },
+        .{ 0x202, (0xcc << 16) | (1 << 4) }, .{ 0x204, 0 },               .{ 0x205, 0 },
+    };
+    for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+    for ([_]f32{ 16, 16, 16, 16, 1, 0 }, 0..) |value, index| try state.writeRegister(.context, 0x10f + @as(u32, @intCast(index)), @bitCast(value));
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = backend, .allocator = allocator };
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+    try renderer.flushPendingGuestWrites();
+    const pixel = 16 * 32 + 16;
+    for ([_]u8{ 64, 128, 191, 255 }, guest.bytes[0x2000 + pixel * 4 ..][0..4]) |expected, actual| {
+        try std.testing.expect(@abs(@as(i16, actual) - expected) <= 1);
+    }
+    try std.testing.expectEqual(@as(u32, 0x1234_5678), std.mem.readInt(u32, guest.bytes[0x5000 + pixel * 4 ..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 0xc000_4000), std.mem.readInt(u32, guest.bytes[0x8000 + pixel * 4 ..][0..4], .little));
+    for ([_]f16{ -1, 0.5, 0, 1 }, 0..) |expected, channel| {
+        const raw = std.mem.readInt(u16, guest.bytes[0xb000 + pixel * 8 + channel * 2 ..][0..2], .little);
+        try std.testing.expectEqual(expected, @as(f16, @bitCast(raw)));
+    }
+    // Only the export format changes: the same halfwords now represent +2/-2.
+    // This also checks that translation/pipeline reuse includes the selector.
+    try state.writeRegister(.context, 0x1c5, 0x6414);
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+    try renderer.flushPendingGuestWrites();
+    try std.testing.expectEqual(@as(u32, 0x0000_ffff), std.mem.readInt(u32, guest.bytes[0x8000 + pixel * 4 ..][0..4], .little));
+    try state.writeRegister(.context, 0x1c5, 0x6514);
+    const misses = renderer.graphics_pipeline_cache_misses;
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+    try renderer.flushPendingGuestWrites();
+    try std.testing.expectEqual(@as(u32, 0xc000_4000), std.mem.readInt(u32, guest.bytes[0x8000 + pixel * 4 ..][0..4], .little));
+    try std.testing.expectEqual(misses, renderer.graphics_pipeline_cache_misses);
+    std.debug.print("normalized color exports passed: FP16, UINT32, UNORM16 and SNORM16 in separate MRTs\n", .{});
+}
+
 fn runIntegerColorProbe(allocator: std.mem.Allocator) !void {
+    try runNormalizedColorProbe(allocator);
     for (0..4) |case_index| {
         var renderer = try vulkan.Renderer.init(allocator, .{});
         defer renderer.deinit();
@@ -4498,6 +4574,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (args.len == 1) {
+        try runNormalizedColorProbe(allocator);
         try runPackedFloatProbe(allocator);
         try runSdwaProbe(allocator);
     }

@@ -221,6 +221,7 @@ pub const NggLdsExport = struct {
 };
 
 pub const ColorExportType = enum { float32, uint32, sint32 };
+pub const PackedColorExport = enum { float16, unorm16, snorm16 };
 
 fn colorExportValueType(color_type: ColorExportType) ValueType {
     return switch (color_type) {
@@ -301,6 +302,7 @@ pub const Options = struct {
     /// CB_COLOR_INFO.COMP_SWAP supplies one mapping for each active MRT.
     color_export_mappings: [8]u8 = @splat(0xe4),
     color_export_types: [8]ColorExportType = @splat(.float32),
+    packed_color_exports: [8]PackedColorExport = @splat(.float16),
     scalar_registers: []const ScalarRegister = &.{},
     dynamic_scalar_binding: ?DynamicScalarBinding = null,
     compute_inputs: ?ComputeInputs = null,
@@ -623,6 +625,7 @@ const Builder = struct {
     color_outputs: [8]u32 = @splat(0),
     color_export_mappings: [8]u8,
     color_export_types: [8]ColorExportType,
+    packed_color_exports: [8]PackedColorExport,
     parameter_variables: [32]u32 = @splat(0),
     vertex_parameter_targets: [32]u32 = @splat(0),
     /// BuiltIn FragCoord (float4) for fragment UV fallback when PARAM interps
@@ -747,6 +750,7 @@ const Builder = struct {
             .convert_negative_one_to_one_depth = options.convert_negative_one_to_one_depth,
             .color_export_mappings = options.color_export_mappings,
             .color_export_types = options.color_export_types,
+            .packed_color_exports = options.packed_color_exports,
             .storage_bindings = options.storage_buffers,
             .scalar_memory_bindings = options.scalar_memories,
             .flat_memory_bindings = options.flat_memories,
@@ -4687,12 +4691,20 @@ const Builder = struct {
             const xy_bits = try self.source(inst.src0, .bits32);
             const zw_bits = try self.source(inst.src1, .bits32);
             const vector_type = try self.ensureFloatVec2();
+            // SPI_SHADER_COL_FORMAT describes the export payload independently
+            // of the attachment's storage format. Normalized 16-bit channels
+            // are integers, even when the destination is a floating output.
+            const unpack: u32 = if (self.stage == .fragment) switch (self.packed_color_exports[inst.export_target]) {
+                .float16 => 62, // UnpackHalf2x16
+                .unorm16 => 61, // UnpackUnorm2x16
+                .snorm16 => 60, // UnpackSnorm2x16
+            } else 62;
             const xy = self.id();
             try self.emit(&self.body, 12, &.{
                 vector_type,
                 xy,
                 self.ensureGlslStd450(),
-                62, // UnpackHalf2x16
+                unpack,
                 xy_bits,
             });
             const zw = self.id();
@@ -4700,7 +4712,7 @@ const Builder = struct {
                 vector_type,
                 zw,
                 self.ensureGlslStd450(),
-                62,
+                unpack,
                 zw_bits,
             });
             const cx = self.id();

@@ -26,8 +26,34 @@ An offline replay of the unmodified captured upscaler uses a constant
 16x16 HDR input `(0.25, 0.5, 1)`. Before the final preservation correction its
 center output is approximately `(4100, 8192, 16384)`. It now returns
 `(0.250244, 0.499756, 0.999512)`, with RGB output at all 256 pixels in both
-color targets and no validation errors. This establishes the resolve's
-numeric correction; complete live menu composition remains to be verified.
+color targets and no validation errors.
+
+The rebuilt live run preserves all three bonus notices and the complete
+brightness screen (wolf, slider and Cross). Ordinary Cross confirmation then
+reaches difficulty selection and Standard experience selection over a rendered
+tree and orange fire. This is the final scanout image, not an intermediate
+buffer substituted for presentation. The trunk is still a black silhouette,
+so complete scene rendering remains unresolved. Frame 1010 has nonzero temporal
+upscale, HDR resolve and composition, while its main material color attachment
+is zero. After confirming Standard, the game proceeds into further scene work;
+that transition is substantially slower than the preceding warm UI frames.
+
+## Normalized fragment exports on 2026-09-09
+
+The tree material programs export a mixture of FP16 color, UINT32 data and
+UNORM16 normal components. Their `SPI_SHADER_COL_FORMAT` is `0x44514`.
+Translation previously unpacked every compressed floating-output export as
+FP16, misinterpreting normalized integers. The packed payload now follows the
+per-target export selector, independently of the attachment storage format.
+UNORM16 and SNORM16 use their normalized unpack operations; existing FP16 and
+integer output handling is retained. The selector is part of the translation
+cache key. Register selector values follow the
+[AMD shader color-format definitions](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/programmer-references/CIK_3D_registers_v2.pdf).
+
+The mixed-MRT GPU probe checks FP16, UINT32, UNORM16 and SNORM16 output through
+guest-memory readback. It passes SDK synchronization validation, as does the
+default smoke run. Live scene verification is pending; this correction alone
+does not explain the still-empty material color attachment.
 
 ## Material selection and attachment reads on 2026-09-09
 

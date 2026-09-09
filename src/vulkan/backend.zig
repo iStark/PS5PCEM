@@ -14325,6 +14325,15 @@ pub const Renderer = struct {
         var color_export_mappings: [gpu.resources.color_target_count]u8 =
             @splat(color_export_identity);
         var color_export_types: [gpu.resources.color_target_count]rdna2.spirv.ColorExportType = @splat(.float32);
+        var packed_color_exports: [gpu.resources.color_target_count]rdna2.spirv.PackedColorExport = @splat(.float16);
+        const shader_color_format = state.readRegister(.context, 0x1c5) orelse 0;
+        for (&packed_color_exports, 0..) |*format, slot| {
+            format.* = switch ((shader_color_format >> @as(u5, @intCast(slot * 4))) & 0xf) {
+                5 => .unorm16,
+                6 => .snorm16,
+                else => .float16,
+            };
+        }
         color_export_mappings[target.descriptor.slot] = colorTargetExportMapping(target.descriptor);
         color_export_types[target.descriptor.slot] = colorTargetExportType(target.descriptor);
         for (extra_colors) |extra| {
@@ -14352,6 +14361,7 @@ pub const Renderer = struct {
             .infer_fragment_parameter_mask = false,
             .color_export_mappings = color_export_mappings,
             .color_export_types = color_export_types,
+            .packed_color_exports = packed_color_exports,
             .descriptor_array_length = maximum_storage_descriptors,
             .scalar_memories = fragment_storage.scalar_memories[0..fragment_storage.scalar_memory_count],
             .sampled_image_array_length = self.device_info.sampled_image_capacity,
