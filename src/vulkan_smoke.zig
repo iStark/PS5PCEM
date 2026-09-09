@@ -1399,16 +1399,20 @@ fn runWideMaskProbe(allocator: std.mem.Allocator) !void {
     var guest = GuestMemory{};
     _ = renderer.dcbBackend(guest.interface());
     var case: u32 = 0;
-    for ([_]u32{ 64, 512 }) |lanes| for ([_]u8{ 106, 12 }) |sdst| for ([_]u8{ 0, 16, 32, 48, 64 }) |threshold| {
+    for ([_]u32{ 64, 512 }) |lanes| for ([_]u8{ 106, 12 }) |sdst| for ([_]u8{ 0, 16, 32, 48, 64 }) |threshold| for (0..3) |encoding| {
         case += 1;
         const code = [_]u32{
             0x3602_00bf, // v1 = v0 & 63
             vop1(1, 2, 128 + @as(u9, threshold)),
             vop1(1, 3, 170), // sentinel 42
             sop1(4, sdst, 193), // stale high mask must be replaced by the comparison
-            0x7d82_04f9,
-            0x0606_8001 | (@as(u32, sdst) << 8), // SDWA V_CMP_LT_U32 -> explicit scalar pair
-            sop1(0x24, 20, sdst), // save EXEC, enter the true lanes
+            if (encoding == 1) 0xd4c1_0000 | @as(u32, sdst) else 0x7d82_04f9,
+            if (encoding == 1) 257 | (258 << 9) else 0x0606_8001 | (@as(u32, sdst) << 8),
+            // The scene classifier compares a saved 64-bit mask into another
+            // SGPR pair, then intersects that result with the current EXEC.
+            if (encoding == 2) 0xd4e4_001c else 0xbf80_0000,
+            if (encoding == 2) @as(u32, sdst) | (128 << 9) else 0xbf80_0000,
+            sop1(0x24, 20, if (encoding == 2) 28 else sdst), // save EXEC, enter the true lanes
             vop1(1, 3, 129),
             0x8afe_7e14, // exec = saved & ~exec: the complementary lanes
             vop1(1, 3, 130),
@@ -1430,11 +1434,11 @@ fn runWideMaskProbe(allocator: std.mem.Allocator) !void {
         for (0..lanes) |lane| {
             const expected: u32 = if (lane % 64 < threshold) 1 else 2;
             const actual = std.mem.readInt(u32, output[lane * 4 ..][0..4], .little);
-            if (actual != expected) std.debug.print("mask case={d} lanes={d} SDST={d} threshold={d} lane={d}\n", .{ case, lanes, sdst, threshold, lane });
+            if (actual != expected) std.debug.print("mask case={d} encoding={d} lanes={d} SDST={d} threshold={d} lane={d}\n", .{ case, encoding, lanes, sdst, threshold, lane });
             try std.testing.expectEqual(expected, actual);
         }
     };
-    std.debug.print("wide masks passed: SDWA comparisons, VCC/SGPR pairs, saved EXEC, complementary lanes and 64/512 invocations\n", .{});
+    std.debug.print("wide masks passed: SDWA/VOP3/U64 comparisons, VCC/SGPR pairs, saved EXEC, complementary lanes and 64/512 invocations\n", .{});
 }
 
 fn runWave64Probe(allocator: std.mem.Allocator) !void {

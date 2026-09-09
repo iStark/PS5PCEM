@@ -2,6 +2,28 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Explicit VOP3 comparison destinations on 2026-09-09
+
+The depth-storage trace now records 3,811,120 nonzero depth texels from
+`0x80003d6000`, but the final trunk remains black. Inspecting the material-list
+classifier `0x80003cb200` exposes another missing producer: its instruction
+`d4e4001c 00010018` compares a 64-bit mask into `s28:s29`, then scalar mask
+arithmetic consumes that pair. The decoder previously redirected every VOP3
+comparison to VCC, leaving the encoded destination unwritten.
+
+VOP3 comparisons now decode their scalar destination from VDST. VOPC retains
+its implicit VCC destination and CMPX retains EXEC. Explicit comparison
+destinations are also exercised by the
+[LLVM AMDGPU comparison tests](https://github.com/llvm/llvm-project/blob/main/llvm/test/CodeGen/AMDGPU/llvm.amdgcn.icmp.w64.ll).
+
+All 39 vector decoder tests pass. The GPU mask suite checks 120 combinations
+of SDWA, VOP3 and 64-bit saved-mask comparisons, explicit SGPR/VCC destinations,
+empty/full/complementary EXEC and 64/512 invocations. The previous decoder fails
+the saved-mask case, rejecting a lane that should execute. The corrected suite
+and full default smoke pass SDK synchronization validation. The broader RDNA2
+unit suite still has the same ten failures reproduced against the previous
+decoder; this change adds no failures there. Live scene verification is pending.
+
 ## Independent depth/stencil attachment planes on 2026-09-09
 
 The live depth-storage build preserves the movie, loading spinner and first

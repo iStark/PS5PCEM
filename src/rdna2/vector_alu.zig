@@ -599,7 +599,9 @@ pub fn decodeVop3(pc: u32, code: []const u32, word_index: u32) Error!Instruction
     var inst = Instruction{ .pc = pc, .word = word0, .family = .vop3, .opcode_id = id, .opcode = op };
     inst.setRawWords(code, word_index, 2);
     if (id <= 0xff) {
-        inst.dst.kind = if (isCompareExec(op)) .exec_lo else .vcc_lo;
+        // VOP3 compares encode a scalar destination in VDST. Only VOPC
+        // implies VCC; CMPX still writes EXEC regardless of that field.
+        inst.dst = if (isCompareExec(op)) .{ .kind = .exec_lo } else try operand.decodeScalarDestination(word0 & 0xff);
     } else if (op == .v_readlane_b32) {
         inst.dst = try operand.decodeScalarDestination(word0 & 0xff);
     } else {
@@ -1126,4 +1128,16 @@ test "scene mask comparisons decode u64 equality and signed i16 CMPX" {
     try std.testing.expectEqual(isa.OperandKind.exec_lo, signed.dst.kind);
     try std.testing.expectEqual(@as(u32, 34), signed.src0.reg);
     try std.testing.expectEqual(@as(u32, 0), signed.src1.value);
+}
+
+test "VOP3 compares retain explicit scalar mask destinations" {
+    for ([_]u32{ 0xc1, 0xe4 }) |opcode| for ([_]u32{ 0, 28, 104, 106 }) |sdst| {
+        const inst = try decodeVop3(0xd8, &.{ 0xd400_0000 | (opcode << 16) | sdst, 0x0001_0018 }, 0);
+        try std.testing.expectEqual(if (sdst == 106) isa.OperandKind.vcc_lo else isa.OperandKind.sgpr, inst.dst.kind);
+        if (sdst != 106) try std.testing.expectEqual(sdst, inst.dst.reg);
+        try std.testing.expectEqual(@as(u32, 24), inst.src0.reg);
+    };
+    const cmpx = try decodeVop3(0, &.{ 0xd4f5_001c, 0x0001_0018 }, 0);
+    try std.testing.expectEqual(isa.Opcode.v_cmpx_ne_u64, cmpx.opcode);
+    try std.testing.expectEqual(isa.OperandKind.exec_lo, cmpx.dst.kind);
 }
