@@ -5262,6 +5262,17 @@ pub const Renderer = struct {
             programHasRawInstruction(analysis, 0x4, &.{ 0xd746_0006, 0x0409_0404 }) and
             programHasRawInstruction(analysis, 0xb28, &.{0xbf05_b20a}) and
             programHasRawInstruction(analysis, 0xed0, &.{ 0xf020_2f10, 0x0001_0004 });
+        // Multiple scattering integrates a 16x32 angular grid. Both the CPU
+        // resource walk and GPU dispatcher must reach its post-loop constants
+        // and stores. Captured 1,024/2,048-visit outputs are byte-identical.
+        const yotei_atmosphere_multiscatter =
+            std.meta.eql(group_count, [3]u32{ 8, 32, 8 }) and
+            analysis.program.instructions.items.len == 435 and
+            programHasRawInstruction(analysis, 0x4, &.{ 0xd746_0006, 0x0409_0404 }) and
+            programHasRawInstruction(analysis, 0x63c, &.{0xbf04_a002}) and
+            programHasRawInstruction(analysis, 0x798, &.{0xbf04_9029}) and
+            programHasRawInstruction(analysis, 0x9c4, &.{ 0xf020_2f10, 0x0005_0004 });
+        if (yotei_atmosphere_multiscatter) bindings.resource_instruction_budget = 64 * 1024;
         // Yotei's two reduction and two gather passes used to be quarantined
         // here. Correct EXEC state merging and Vulkan-valid dynamic sample
         // offsets make all four safe on NVIDIA, including repeated execution;
@@ -5792,7 +5803,7 @@ pub const Renderer = struct {
         var module = self.compute_translations.translate(self.allocator, &analysis.program, .{
             .stage = .compute,
             .local_size = local_size,
-            .maximum_dispatcher_iterations = if (yotei_environment_lighting) 2048 else if (yotei_atmosphere_precompute) 512 else 256,
+            .maximum_dispatcher_iterations = if (yotei_environment_lighting) 2048 else if (yotei_atmosphere_multiscatter) 1024 else if (yotei_atmosphere_precompute) 512 else 256,
             .wave32 = initiator & (1 << 15) != 0,
             .storage_buffers = resources.mappings[0..resources.mapping_count],
             .sampled_images = resources.sampled_image_mappings[0..resources.sampled_image_mapping_count],

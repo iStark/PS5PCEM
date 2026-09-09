@@ -517,7 +517,7 @@ fn evaluate(
     var lane_spills = LaneSpills{};
     var setpc_follows: u8 = 0;
     var unknown_scalar_exits: std.StaticBitSet(64 * 1024) = .initEmpty();
-    const instruction_limit: u32 = if (follow_lane_mask_fallthrough) maximum_resource_instructions else maximum_instructions;
+    const instruction_limit: u32 = if (follow_lane_mask_fallthrough) bindings.resource_instruction_budget else maximum_instructions;
     while (result.instruction_count < instruction_limit) {
         result.stop_pc = pc;
         if (checkpoint_collector) |collector| collector.captureBefore(&result, pc);
@@ -1826,6 +1826,49 @@ test "invariant loop loads leave room for post-loop scalar specializations" {
     try std.testing.expect(executeSmem(&result, memory.reader(), &bindings, late_load));
     try std.testing.expectEqual(@as(usize, 4), result.load_count);
     try std.testing.expectEqual(@as(u64, 0x4008), result.loads[3].address);
+}
+
+test "long resource walks retain post-loop loads and checkpoint state within an explicit budget" {
+    var storage = [_]u8{0} ** 8;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    memory.write(0x4000, 0x41000000);
+    memory.write(0x4004, 0x3ca3d70a);
+    var bindings = testBindings(0x3000, 0x4000);
+    const code = [_]u32{
+        0xb008_0000,
+        0xf400_0100,
+        125 << 25,
+        0x8008_8108,
+        0xbf0a_ff08,
+        5000,
+        0xbf85_fffa,
+        0xf400_0300,
+        (125 << 25) | 4,
+        0xbf81_0000,
+    };
+    var program = try rdna2.decodeProgram(std.testing.allocator, &code);
+    defer program.deinit(std.testing.allocator);
+    const limited = evaluateDecodedResourceState(memory.reader(), &bindings, program.instructions.items);
+    try std.testing.expectEqual(StopReason.instruction_limit, limited.stop_reason);
+    try std.testing.expectEqual(@as(u32, 16 * 1024), limited.instruction_count);
+    try std.testing.expect(limited.register(12) == null);
+
+    bindings.resource_instruction_budget = 32 * 1024;
+    var snapshots: [1]ScalarRegisters = undefined;
+    const complete = evaluateDecodedResourceStateAtCheckpoints(memory.reader(), &bindings, program.instructions.items, &.{36}, &snapshots);
+    try std.testing.expectEqual(StopReason.end_program, complete.stop_reason);
+    try std.testing.expectEqual(@as(u32, 5000), complete.register(8).?.value);
+    try std.testing.expectEqual(@as(usize, 2), complete.load_count);
+    try std.testing.expect(snapshots[0][12].known);
+    try std.testing.expectEqual(@as(u32, 0x3ca3d70a), snapshots[0][12].value);
+
+    memory.write(0x4004, 0x3f800000);
+    const refreshed = evaluateDecodedResourceState(memory.reader(), &bindings, program.instructions.items);
+    try std.testing.expectEqual(@as(u32, 0x3f800000), refreshed.register(12).?.value);
+    bindings.resource_instruction_budget = 8;
+    const bounded = evaluateDecodedResourceState(memory.reader(), &bindings, program.instructions.items);
+    try std.testing.expectEqual(StopReason.instruction_limit, bounded.stop_reason);
+    try std.testing.expectEqual(@as(u32, 8), bounded.instruction_count);
 }
 
 test "resource checkpoints leave skipped blocks unknown and capture backward visits" {

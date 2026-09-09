@@ -2,6 +2,23 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Completing the multiple-scattering pass on 2026-09-09
+
+Shader `0x80003a9b00` integrates a 16x32 angular grid. The default 16,384-step
+CPU resource walk stops inside those loops, leaving its later coefficients
+unrecovered. The default GPU dispatcher budget also ends before the output
+stores. Its validated instruction/dispatch shape now receives a 65,536-step
+resource budget and 1,024 dispatcher visits; other shaders retain their defaults.
+
+The captured first five atmosphere passes were replayed with the complete
+tiled allocations retained between stages: 4 MiB for each RGBA16F volume and
+2 MiB for each RG16F volume, including padding. The multiple-scattering outputs
+are populated and finite. All four affected images match byte for byte at
+1,024 and 2,048 dispatcher visits, while 512 leaves its new outputs empty.
+The production replay passes SDK synchronization validation. All 76 scalar,
+binding and resource tests pass, including budget exhaustion, recovered late
+loads/checkpoints and changed data in a 5,000-iteration resource walk.
+
 ## Atmosphere arithmetic on 2026-09-09
 
 The analytic atmosphere producer exposed two general translation errors.

@@ -239,6 +239,9 @@ pub const StageBindings = struct {
     metadata: ?Metadata,
     srt_address: ?u64,
     direct_pointers: DirectPointers,
+    /// Bounded resource walk. Validated long loops can request more visits
+    /// without raising the cost ceiling for unrelated draws and dispatches.
+    resource_instruction_budget: u32 = 16 * 1024,
     /// Bounds of system SGPRs for this dispatch, separate from uniform USER_DATA.
     compute_dispatch: ?struct {
         system: resources.ComputeSystemRegisters,
