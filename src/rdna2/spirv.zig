@@ -95,6 +95,9 @@ pub const SampledImageBinding = struct {
     lookup: ?sampled_lookup.Binding = null,
     /// Proven all-zero T# source. No physical image or sampler is required.
     unbound: bool = false,
+    /// A bounded table has no supported T#. Permit inactive image operations,
+    /// but report any active nonzero tuple instead of substituting an image.
+    unbound_fault_descriptor: ?u32 = null,
     /// Gather comparisons operate on each texel before any filtering.
     depth_compare: u8 = 7,
     minimum_lod: f32 = 0,
@@ -1004,7 +1007,13 @@ const Builder = struct {
                 return Error.InvalidStorageBinding;
             has_sampled_lookup = true;
         };
-        if (options.storage_buffers.len != 0 or options.scalar_memories.len != 0 or options.flat_memories.len != 0 or has_sampled_lookup) {
+        var has_sampled_fault = false;
+        for (options.sampled_images) |binding| if (binding.unbound_fault_descriptor) |slot| {
+            if (!binding.unbound or options.stage != .compute or binding.resource_sgpr + 8 > 128 or slot >= options.descriptor_array_length)
+                return Error.InvalidStorageBinding;
+            has_sampled_fault = true;
+        };
+        if (options.storage_buffers.len != 0 or options.scalar_memories.len != 0 or options.flat_memories.len != 0 or has_sampled_lookup or has_sampled_fault) {
             // Storage buffers are used by compute and by graphics attribute
             // fetch / constant buffer MUBUF paths.
             if (options.descriptor_array_length == 0) {
@@ -7776,6 +7785,42 @@ const Builder = struct {
             try self.destination(try consecutiveRegister(inst.dst, @intCast(word)), .{ .id = value, .value_type = .bits32 });
     }
 
+    fn checkUnboundImage(self: *Builder, inst: instruction.Instruction, slot: u32) Error!void {
+        if (self.stage != .compute) return Error.InvalidStorageBinding;
+        const zero = try self.constant(.bits32, 0);
+        var nonzero = try self.constantBool(false);
+        var first_words: [2]u32 = undefined;
+        for (0..8) |word| {
+            const value = try self.source(.{ .kind = .sgpr, .reg = inst.src1.reg + @as(u32, @intCast(word)) }, .bits32);
+            if (word < 2) first_words[word] = value;
+            const either = self.id();
+            try self.emit(&self.body, 166, &.{ self.bool_type, either, nonzero, try self.isNonZero(value) });
+            nonzero = either;
+        }
+        const predicate = (try self.writePredicate(nonzero)).?;
+        const taken = self.id();
+        const merge = self.id();
+        try self.emit(&self.body, 247, &.{ merge, 0 });
+        try self.emit(&self.body, 250, &.{ predicate, taken, merge });
+        try self.emit(&self.body, 248, &.{taken});
+        const fault = BufferAddress{ .binding = .{ .resource_sgpr = 0, .descriptor_index = slot }, .byte_offset = zero };
+        const previous = self.id();
+        try self.emit(&self.body, 234, &.{ self.bits_type, previous, try self.bufferWordPointer(fault, 0), try self.constant(.bits32, 1), zero, try self.constant(.bits32, 1) });
+        const first = self.id();
+        try self.emit(&self.body, 170, &.{ self.bool_type, first, previous, zero });
+        const record = self.id();
+        const record_merge = self.id();
+        try self.emit(&self.body, 247, &.{ record_merge, 0 });
+        try self.emit(&self.body, 250, &.{ first, record, record_merge });
+        try self.emit(&self.body, 248, &.{record});
+        const details = [_]u32{ try self.constant(.bits32, inst.pc), first_words[0], first_words[1] };
+        for (details, 0..) |value, component| try self.emit(&self.body, 62, &.{ try self.bufferWordPointer(fault, 1 + @as(u32, @intCast(component))), value });
+        try self.emit(&self.body, 249, &.{record_merge});
+        try self.emit(&self.body, 248, &.{record_merge});
+        try self.emit(&self.body, 249, &.{merge});
+        try self.emit(&self.body, 248, &.{merge});
+    }
+
     fn flatStoreWords(self: *Builder, inst: instruction.Instruction, count: u8) Error!void {
         if (self.flat_memory_bindings.len != 0) return Error.UnsupportedBufferAddressing;
         try self.bufferStoreWords(asBufferFromFlat(inst), count);
@@ -8529,6 +8574,7 @@ const Builder = struct {
                 if (inst.src1.kind == .sgpr and inst.src2.kind == .sgpr) {
                     if (self.sampledImageBinding(inst.src1.reg, inst.src2.reg, inst.pc)) |binding| {
                         if (binding.unbound) {
+                            if (binding.unbound_fault_descriptor) |slot| try self.checkUnboundImage(inst, slot);
                             const count: u32 = if (inst.opcode == .image_gather4) 4 else @popCount(inst.data_mask);
                             for (0..count) |component| try self.destination(
                                 try consecutiveRegister(inst.dst, @intCast(component)),

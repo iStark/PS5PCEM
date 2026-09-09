@@ -2503,6 +2503,7 @@ const ComputeResources = struct {
     flat_memories: [maximum_storage_descriptors]rdna2.spirv.FlatMemoryBinding = undefined,
     flat_memory_count: usize = 0,
     flat_memory_fault: ?DrawUploadSlice = null,
+    sampled_image_fault: ?DrawUploadSlice = null,
     storage_images: [maximum_storage_images]PreparedStorageImage = undefined,
     storage_image_count: usize = 0,
     // One resident image may be loaded into the same T# SGPR range at several
@@ -2540,6 +2541,7 @@ const ComputeResources = struct {
         result.scalar_memory_count = 0;
         result.flat_memory_count = 0;
         result.flat_memory_fault = null;
+        result.sampled_image_fault = null;
         result.storage_image_count = 0;
         result.storage_image_mapping_count = 0;
         result.sampled_image_count = 0;
@@ -5953,6 +5955,29 @@ pub const Renderer = struct {
         const submit_started = hostTimestampNs();
         try self.prepareStorageImageAccess(resources);
         const report = try self.dispatchSpirv(module.words, group_count);
+        if (resources.sampled_image_fault) |fault| {
+            const command_buffer = try self.beginOneShot();
+            defer self.releaseOneShot(command_buffer);
+            const barrier = vk.BufferMemoryBarrier{
+                .source_access_mask = vk.access_shader_write_bit,
+                .destination_access_mask = vk.access_host_read_bit,
+                .buffer = fault.buffer,
+                .offset = fault.offset,
+                .size = fault.size,
+            };
+            self.device_functions.cmd_pipeline_barrier(command_buffer, vk.pipeline_stage_compute_shader_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&barrier), 0, null);
+            try self.submitOneShot(command_buffer);
+            try self.waitForSubmittedWork();
+            const mapping = self.draw_upload_mapping orelse return Error.MemoryMapFailed;
+            const record = mapping[@intCast(fault.offset)..][0..16];
+            const faults = std.mem.readInt(u32, record[0..4], .little);
+            if (faults != 0) {
+                std.debug.print("[vulkan dcb] active unsupported image program=0x{x} accesses={d} first_pc=0x{x} descriptor_prefix=0x{x}\n", .{
+                    program_address, faults, std.mem.readInt(u32, record[4..8], .little), std.mem.readInt(u64, record[8..16], .little),
+                });
+                return Error.UnsupportedSampledImage;
+            }
+        }
         if (resources.flat_memory_fault) |fault| {
             const command_buffer = try self.beginOneShot();
             defer self.releaseOneShot(command_buffer);
@@ -8010,6 +8035,23 @@ pub const Renderer = struct {
         return lease;
     }
 
+    fn prepareUnboundImageFault(self: *Renderer, result: *ComputeResources) anyerror!u32 {
+        for (result.sampled_image_mappings[0..result.sampled_image_mapping_count]) |mapping| {
+            if (mapping.unbound_fault_descriptor) |slot| return slot;
+        }
+        const slot = result.freeDescriptor() orelse return Error.InvalidStorageDescriptor;
+        const upload = try self.allocateDrawUpload(16);
+        const mapping = self.draw_upload_mapping orelse return Error.MemoryMapFailed;
+        @memset(mapping[@intCast(upload.offset)..][0..16], 0);
+        self.updateStorageDescriptorRange(slot, upload.buffer, upload.offset, 16);
+        result.occupied[slot] = true;
+        result.sampled_image_fault = upload;
+        self.active_descriptor_set = self.descriptor_set;
+        self.frame_profile.upload_bytes +%= 16;
+        self.frame_profile.storage_upload_bytes +%= 16;
+        return slot;
+    }
+
     fn prepareComputeResources(
         self: *Renderer,
         bindings: *const gpu.ShaderBindings,
@@ -8370,7 +8412,7 @@ pub const Renderer = struct {
                             const image = try gpu.resources.decodeImageDescriptor(&words);
                             compressed = compressed and isBlockCompressedUnifiedFormat(image.unified_format);
                         }
-                        if (compressed) continue;
+                        if (compressed and !candidates.requires_null_check) continue;
                     }
                 }
                 self.reportResourceFailure(bindings, inst, &image_scalar);
@@ -8577,6 +8619,7 @@ pub const Renderer = struct {
                     .descriptor_index = 0,
                     .instruction_pc = inst.pc,
                     .unbound = true,
+                    .unbound_fault_descriptor = if (candidates.?.requires_null_check) try self.prepareUnboundImageFault(result) else null,
                 };
                 result.sampled_image_mapping_count += 1;
                 continue;
@@ -16178,6 +16221,9 @@ pub const Renderer = struct {
     ) anyerror!bool {
         if (!self.sampled_image_nonuniform_indexing) return false;
         const candidates = (try resolveBufferImageCandidates(bindings, reader, analysis, scalar, inst)) orelse return false;
+        // Graphics has no dispatch fault readback; keep its previous strict
+        // behavior until an equivalent draw-completion check is available.
+        if (candidates.requires_null_check) return false;
         if (candidates.count == 0) {
             if (result.mapping_count == result.mappings.len) return Error.UnsupportedSampledImage;
             result.mappings[result.mapping_count] = .{
@@ -24202,6 +24248,7 @@ const BufferImageCandidates = struct {
     words: [maximum_sampled_images][8]u32 = undefined,
     count: usize = 0,
     sampler: ?gpu.resources.SamplerDescriptor = null,
+    requires_null_check: bool = false,
 };
 
 /// Stores candidate indices rather than duplicating the descriptor payload.
@@ -24663,7 +24710,12 @@ fn resolveBufferImageCandidates(
         if (descriptor.address == 0) continue;
         if (!unique.append(&result, words)) return null;
     }
-    return if (result.count != 0 or all_null) result else null;
+    // The table and all possible offsets are known, but its unused records
+    // may contain non-descriptor fields. An empty candidate set can compile
+    // only with an execution-time check of the actual T# selected by the
+    // guest. Active nonzero tuples must still fail explicitly.
+    result.requires_null_check = result.count == 0 and !all_null;
+    return result;
 }
 
 fn resolveVectorImageCandidates(

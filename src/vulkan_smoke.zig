@@ -4872,6 +4872,61 @@ fn runIndexedImageProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("indexed images passed: material-to-global tables, SGPR/VCC_LO/VCC_HI indices, large record scan, wrapping multiply/shift, mixed views, exact aliases and both bounds\n", .{});
 }
 
+fn runInactiveImageTableProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const code = [_]u32{
+        vop1(1, 0, 28),
+        vop1(2, 106, 256),
+        0x936a_ff6a, 96, // waterfall index * 96
+        0xf42c_000c,     106 << 25, // T#s0 = V#s24[index * 96]
+        vop1(1, 2, 255), 0x3e800000,
+        vop1(1, 3, 255), 0x3e800000,
+        vop1(1, 4, 255), 0x3f000000,
+        sop1(4, 22, 126), // save EXEC
+        0x7da4_0014, // CMPX EQ s20, v0
+        0xf09c_010a,
+        0x0080_0402,
+        3,
+        sop1(4, 126, 22),
+        mubuf(0x1c, 0, 4, 0, 12)[0],
+        mubuf(0x1c, 0, 4, 0, 12)[1],
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+    var state = gpu.State{};
+    try state.writeRegister(.shader, 0x20c, 1);
+    try state.writeRegister(.shader, 0x20d, 0);
+    try state.writeRegister(.shader, 0x213, (28 << 1) | (1 << 7));
+    var userdata: [28]u32 = @splat(0);
+    @memcpy(userdata[12..16], &[_]u32{ 0x13000, 4 << 16, 3, 0 });
+    for (0..2) |pass| {
+        const table: u32 = @intCast(0x10000 + pass * 0x1000);
+        @memcpy(userdata[24..28], &[_]u32{ table, 96 << 16, 2, 0 });
+        // An unused record holds non-descriptor data. It must not cancel
+        // work done by other lanes, or become a silently substituted image.
+        guest.word(table + 96 + 12, 0x38530000);
+        for ([_]u32{ 3, 0, 2, 1, 0 }) |selected| {
+            userdata[20] = selected;
+            for (userdata, 0..) |word, i| try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
+            if (selected == 1) {
+                try std.testing.expectError(error.UnsupportedSampledImage, renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 3, 1, 1 }));
+                continue;
+            }
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 3, 1, 1 });
+            var output: [12]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x13000, &output);
+            for (0..3) |i| {
+                const actual: f32 = @bitCast(std.mem.readInt(u32, output[i * 4 ..][0..4], .little));
+                try std.testing.expectEqual(@as(f32, if (i == selected) 0 else 0.5), actual);
+            }
+        }
+    }
+    std.debug.print("inactive image tables passed: masked invalid records, active null and OOB tuples, active invalid rejection, relocation and fault reset\n", .{});
+}
+
 fn runShiftedImageProbe(allocator: std.mem.Allocator) !void {
     for ([_]u32{ 106, 107 }) |selector| for ([_]u32{ 5, 37 }) |shift| {
         var renderer = try vulkan.Renderer.init(allocator, .{});
@@ -5815,6 +5870,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--shifted-images")) {
         try runShiftedImageProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--inactive-image-tables")) {
+        try runInactiveImageTableProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--save-exec")) {

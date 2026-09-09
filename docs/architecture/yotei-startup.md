@@ -2,6 +2,34 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Inactive records in sampled-image tables on 2026-09-10
+
+The next native run passes the earlier completion stall, displays the loading
+spinner and both the Digital Deluxe and Northern Star notices. The counter
+observer has not reproduced the earlier stall; its cause remains unresolved.
+Kernel `0x80001e5f00` executes during early scene loading, including its shadow
+map selection and GLOBAL record reads. Its frame-782 trace contains populated
+outputs at `0x50bbf02000` and `0x505a580000`.
+
+After more resources load, the same kernel instead fails T# preparation at
+PC `0x368c`. Its bounded 1024-entry, stride-96 table contains no valid images,
+but unused records contain nonzero data. Requiring every candidate window to
+be entirely zero cancels the whole dispatch before the guest's EXEC mask can
+exclude the image operation.
+
+Compute now retains this bounded empty candidate set with a GPU fault counter.
+An inactive image operation has no effect; an active all-zero T# returns zero
+as before. Any active nonzero tuple records its PC and fails the dispatch with
+`UnsupportedSampledImage`. This does not replace an unsupported active image
+with a placeholder. Graphics preparation retains its previous strict behavior.
+
+The GPU probe covers inactive invalid records, active null and out-of-bounds
+tuples, active invalid rejection, relocation and counter reset after failure.
+It, the existing shifted-table and FLAT-pointer probes, and the default smoke
+pass SDK synchronization validation without VUID or synchronization hazards.
+Native execution with the new check is pending; a normal scene is not yet
+confirmed.
+
 ## Shadow-record GLOBAL reads on 2026-09-10
 
 The corrected table resolver identifies all eight captured 2048x2048 shadow
@@ -22,7 +50,8 @@ signed instruction offsets, relocation and fault reporting. The record probe
 also reads the highest byte-index/face combination and rejects an active
 wrapped read from an unmapped page. Existing bitset, scene-pointer and default
 Vulkan probes pass SDK synchronization validation without VUID or hazard
-reports. Native execution with the new record snapshots remains pending.
+reports. The subsequent native run executes this path through frame 782;
+the later table-preparation refusal is described above.
 
 ## Shifted descriptor-table indices on 2026-09-10
 
@@ -39,7 +68,7 @@ VCC_LO/VCC_HI selection, shift amounts 5 and 37, wrapped high index bits,
 relocated tables, null descriptors and out-of-bounds reads. Existing indexed
 image, nested image and buffer-table probes pass SDK synchronization validation
 without VUID or synchronization-hazard reports. Native texture resolution
-with this correction is pending.
+with this correction succeeds at PC `0x4cf8` in the subsequent native trace.
 
 ## Hierarchy bitset pointers on 2026-09-10
 
@@ -54,7 +83,8 @@ explicitly.
 The GPU probe checks runtime level selection, descriptor stride removal,
 last valid words, relocated allocations, malformed counts and an out-of-range
 read. It, both existing scene-pointer cases and the default Vulkan smoke pass
-SDK synchronization validation. Native execution of the new kernel is pending.
+SDK synchronization validation. A subsequent native frame-901 trace executes
+the new kernel with wave32 inputs; that captured invocation has a zero item count.
 
 The preceding native run passes flip 914 and shows the Digital Deluxe,
 Northern Star and preorder bonus notices. The Digital Deluxe screenshot
