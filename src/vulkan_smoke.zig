@@ -4388,15 +4388,16 @@ fn runFlatPointerProbe(allocator: std.mem.Allocator) !void {
     defer renderer.deinit();
     var guest = GuestMemory{};
     _ = renderer.dcbBackend(guest.interface());
-    for ([_]bool{ false, true }) |repeat| for ([_]bool{ false, true }) |scalar_base| for ([_]i32{ -4, 0, 4 }) |offset| {
+    for ([_]bool{ false, true }) |repeat| for ([_]u32{ 125, 0, 106 }) |saddr| for ([_]i32{ -4, 0, 4 }) |offset| {
+        const scalar_base = saddr != 125;
         const code = [_]u32{
             if (repeat) 0xbe9e_0382 else 0xbf80_0000, // two iterations, or a straight-line probe
             vop1(1, 4, 20),
             0xb814_0008,
-            0xf424_0004,                                        20 << 25, // pointer table -> s0:s1
-            vop1(1, 0, if (scalar_base) 136 else 0),            vop1(1, 1, 1),
+            0xf424_0004 | (if (saddr == 106) @as(u32, 106 << 6) else 0), 20 << 25, // pointer table -> s0:s1 or VCC
+            vop1(1, 0, if (scalar_base) 136 else 0),                     vop1(1, 1, 1),
             0xdc38_8000 | (@as(u32, @bitCast(offset)) & 0xfff),
-            if (scalar_base) 0 else 0x007d_0000, // x4 -> v0:v3, overlapping address
+            saddr << 16, // x4 -> v0:v3, overlapping address
             mubuf(0x1e, 0, 0, 4, 12)[0],
             mubuf(0x1e, 0, 0, 4, 12)[1],
             if (repeat) 0x811e_c11e else 0xbf80_0000, // s30 -= 1
@@ -4471,7 +4472,7 @@ fn runFlatPointerProbe(allocator: std.mem.Allocator) !void {
             try std.testing.expect(matches_failed_read);
         }
     };
-    std.debug.print("FLAT pointers passed: absolute/scalar bases, signed offsets, overlapping destinations, unaligned reads, 4-GiB carry, relocation, repeated loop reads and fault counts\n", .{});
+    std.debug.print("FLAT pointers passed: absolute/SGPR/VCC bases, signed offsets, overlapping destinations, unaligned reads, 4-GiB carry, relocation, repeated loop reads and fault counts\n", .{});
 }
 
 fn runSceneFlatPointerProbe(allocator: std.mem.Allocator) !void {
@@ -4546,6 +4547,65 @@ fn runSceneFlatPointerProbe(allocator: std.mem.Allocator) !void {
         try std.testing.expectError(error.GuestMemoryReadFailed, renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 }));
     }
     std.debug.print("Scene FLAT snapshots passed: nested descriptor walk, carry-out address chain, relocated records, count bounds and live unmapped-read rejection\n", .{});
+}
+
+fn runShadowRecordPointerProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    var code: [0x4bbc / 4]u32 = @splat(0xbf80_0000);
+    code[0] = vop1(1, 74, 2); // packed signed byte index
+    code[1] = vop1(1, 52, 3); // selected cube face
+    const Site = struct { pc: usize, words: []const u32 };
+    for ([_]Site{
+        .{ .pc = 0x4a68, .words = &.{ 0xd5490041, 0x0221214a } },
+        .{ .pc = 0x4a70, .words = &.{ 0xf4041a80, 0xfa001a38 } },
+        .{ .pc = 0x4a88, .words = &.{ 0xd5690047, 0x000282ff, 0x00000074 } },
+        .{ .pc = 0x4a94, .words = &.{0x7f480341} },
+        .{ .pc = 0x4a9c, .words = &.{ 0xdc3087b4, 0x4c6a0047 } },
+        .{ .pc = 0x4abc, .words = &.{ 0xdc3487e8, 0x476a0047 } },
+        // Keep the captured CUBEID site, bypassing its coordinate math so
+        // the probe can choose both ends of the valid face range explicitly.
+        .{ .pc = 0x4b00, .words = &.{0xbf820006} },
+        .{ .pc = 0x4b0c, .words = &.{ 0xd5440034, 0x051e6b34 } },
+        .{ .pc = 0x4b1c, .words = &.{0x4b486941} },
+        .{ .pc = 0x4b24, .words = &.{ 0xf4041a80, 0xfa001a38 } },
+        .{ .pc = 0x4b2c, .words = &.{ 0xd5690034, 0x000348ff, 0x00000074 } },
+        .{ .pc = 0x4b40, .words = &.{ 0xdc3887b8, 0x476a0034 } },
+        .{ .pc = 0x4b48, .words = &.{ 0xdc3887a8, 0x4b6a0034 } },
+        .{ .pc = 0x4b74, .words = &.{ 0xdc388798, 0x476a0034 } },
+        .{ .pc = 0x4ba0, .words = &.{ 0xdc388788, 0x476a0034 } },
+    }) |site| @memcpy(code[site.pc / 4 ..][0..site.words.len], site.words);
+    code[0x4ba8 / 4] = vop1(1, 0, 128);
+    code[0x4bac / 4] = mubuf(0x1e, 0, 71, 0, 4)[0];
+    code[0x4bb0 / 4] = mubuf(0x1e, 0, 71, 0, 4)[1];
+    code[0x4bb8 / 4] = 0xbf810000;
+    for (code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+    var state = gpu.State{};
+    try state.writeRegister(.shader, 0x20c, 1);
+    try state.writeRegister(.shader, 0x20d, 0);
+    try state.writeRegister(.shader, 0x213, 8 << 1);
+    for ([_]u32{ 0x10000, 0, 0, 0, 0x1f000, 16 << 16, 1, (20 << 12) | 0xfac }, 0..) |word, i|
+        try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
+    for (0..2) |pass| {
+        const base: u32 = @intCast(0x14000 + pass * 0x4000);
+        guest.word(0x10000 + 6712, base);
+        for (0..133) |record| for (0..4) |component|
+            guest.word(base + 1928 + record * 116 + component * 4, @intCast(0xa0000000 + pass * 0x10000 + record * 100 + component));
+        for ([_][2]u32{ .{ 0, 0 }, .{ 127, 5 } }) |selection| {
+            try state.writeRegister(.shader, 0x242, selection[0] << 16);
+            try state.writeRegister(.shader, 0x243, selection[1]);
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+            var output: [16]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x1f000, &output);
+            for (0..4) |component| try std.testing.expectEqual(@as(u32, @intCast(0xa0000000 + pass * 0x10000 + (selection[0] + selection[1]) * 100 + component)), std.mem.readInt(u32, output[component * 4 ..][0..4], .little));
+        }
+    }
+    try state.writeRegister(.shader, 0x242, 128 << 16);
+    try state.writeRegister(.shader, 0x243, 0);
+    try std.testing.expectError(error.GuestMemoryReadFailed, renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 }));
+    std.debug.print("Shadow FLAT records passed: VCC base, signed byte index, cube-face extent, relocation and active unmapped-page rejection\n", .{});
 }
 
 fn runSceneBitsetPointerProbe(allocator: std.mem.Allocator) !void {
@@ -5931,6 +5991,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--scene-bitset-pointers")) {
         try runSceneBitsetPointerProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--shadow-record-pointers")) {
+        try runShadowRecordPointerProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--dcc-single-clears")) {

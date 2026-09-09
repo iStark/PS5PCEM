@@ -2,6 +2,28 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Shadow-record GLOBAL reads on 2026-09-10
+
+The corrected table resolver identifies all eight captured 2048x2048 shadow
+maps; its previous implementation fails on the same scalar/table snapshot.
+In the next native run, kernel `0x80001e5f00` passes texture preparation and
+reaches GLOBAL loads at PC `0x4a9c`. These use VCC as a scalar address pair
+and index 116-byte records in the structure referenced by root+6712.
+
+Absolute-memory lowering now accepts VCC pairs. The captured instruction
+shape bounds the record index to a signed byte, optionally plus a cube face.
+The backend snapshots readable pages in the two resulting address intervals.
+The wrapped negative-index interval follows the unsigned vector offset
+specified in [AMD's RDNA 2 ISA, table 51](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture).
+Missing pages remain unbound; an active read from one fails the dispatch.
+
+GPU probes cover VCC loads across 4-GiB boundaries, overlapping destinations,
+signed instruction offsets, relocation and fault reporting. The record probe
+also reads the highest byte-index/face combination and rejects an active
+wrapped read from an unmapped page. Existing bitset, scene-pointer and default
+Vulkan probes pass SDK synchronization validation without VUID or hazard
+reports. Native execution with the new record snapshots remains pending.
+
 ## Shifted descriptor-table indices on 2026-09-10
 
 Kernel `0x80001e5f00` selects a T# with `READFIRSTLANE`, `S_LSHL_B32`

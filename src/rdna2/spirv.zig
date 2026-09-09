@@ -7689,7 +7689,7 @@ const Builder = struct {
         if (inst.memory_segment != 0 and inst.memory_segment != 2) return Error.UnsupportedBufferAddressing;
         if (inst.raw[0] & (1 << 13) != 0 or count > 4) return Error.UnsupportedBufferAddressing; // LDS destination
         const zero = try self.constant(.bits32, 0);
-        var pointer = if (inst.src1.kind == .sgpr)
+        var pointer = if (inst.src1.kind == .sgpr or inst.src1.kind == .vcc_lo)
             try self.addPointerOffset(try self.sourcePair(inst.src1), try self.source(inst.src0, .bits32))
         else if (inst.src1.kind == .vgpr)
             try self.sourcePair(inst.src0)

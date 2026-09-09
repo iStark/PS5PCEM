@@ -7813,13 +7813,53 @@ pub const Renderer = struct {
             programHasRawInstruction(analysis, 0x1c0, &.{ 0xd70f_6a00, 0x0002_2300 }) and
             programHasRawInstruction(analysis, 0x1c8, &.{ 0x5002_02f9, 0x0c86_0680 }) and
             programHasRawInstruction(analysis, 0x1d0, &.{ 0xdc30_8000, 0x007d_0000 });
-        if (!matches and !bitsets) return;
+        // Shadow records use a signed eight-bit index, optionally increased
+        // by CUBEID's face (0..5), and a 116-byte stride. The scalar base is
+        // loaded from root+6712 into VCC. Only this bounded pointer shape is
+        // eligible; unmapped pages remain absent and active reads fault.
+        const shadows = programHasRawInstruction(analysis, 0x4a68, &.{ 0xd549_0041, 0x0221_214a }) and
+            programHasRawInstruction(analysis, 0x4a70, &.{ 0xf404_1a80, 0xfa00_1a38 }) and
+            programHasRawInstruction(analysis, 0x4a88, &.{ 0xd569_0047, 0x0002_82ff, 0x0000_0074 }) and
+            programHasRawInstruction(analysis, 0x4a9c, &.{ 0xdc30_87b4, 0x4c6a_0047 }) and
+            programHasRawInstruction(analysis, 0x4b0c, &.{ 0xd544_0034, 0x051e_6b34 }) and
+            programHasRawInstruction(analysis, 0x4b1c, &.{0x4b48_6941}) and
+            programHasRawInstruction(analysis, 0x4b2c, &.{ 0xd569_0034, 0x0003_48ff, 0x0000_0074 }) and
+            programHasRawInstruction(analysis, 0x4ba0, &.{ 0xdc38_8788, 0x476a_0034 });
+        if (!matches and !bitsets and !shadows) return;
         const Region = struct { address: u64, size: usize };
         var regions: [33]Region = undefined;
         var region_count: usize = 1;
         const root = @as(u64, bindings.user_data[0]) | (@as(u64, bindings.user_data[1] & 0xffff) << 32);
-        try self.flushGuestStorageRange(root, if (bitsets) 232 else 1024);
-        if (bitsets) {
+        try self.flushGuestStorageRange(root, if (shadows) 8 else if (bitsets) 232 else 1024);
+        if (shadows) {
+            regions[0] = .{ .address = root, .size = 8 };
+            try self.flushGuestStorageRange(root + 6712, 8);
+            const base = (try reader.readU64(root + 6712)) & 0xffff_ffff_ffff;
+            if (base == 0) return Error.GuestMemoryReadFailed;
+            // GLOBAL adds the 32-bit vector byte offset to the scalar base.
+            // Negative indices wrap in MUL_LO, producing a second small
+            // interval near base+4 GiB rather than a negative scalar offset.
+            const windows = [_][2]u64{
+                .{ base + 1928, base + 132 * 116 + 2032 },
+                .{ base + (@as(u64, 1) << 32) - 128 * 116 + 1928, base + (@as(u64, 1) << 32) - 116 + 2032 },
+            };
+            var probe: [4096]u8 = undefined;
+            for (windows) |window| {
+                var address = std.mem.alignBackward(u64, window[0], 4096);
+                const end = std.mem.alignForward(u64, window[1], 4096);
+                while (address < end) : (address += 4096) {
+                    try self.flushGuestStorageRange(address, probe.len);
+                    const previous_failure = self.last_shader_read_failure;
+                    reader.read(address, &probe) catch {
+                        self.last_shader_read_failure = previous_failure;
+                        continue;
+                    };
+                    if (region_count == regions.len) return Error.InvalidStorageDescriptor;
+                    regions[region_count] = .{ .address = address, .size = probe.len };
+                    region_count += 1;
+                }
+            }
+        } else if (bitsets) {
             regions[0] = .{ .address = root, .size = 232 };
             for (0..9) |level| {
                 const descriptor = (try decodeBufferDescriptorAt(reader, root + 56 + level * 16)) orelse return Error.InvalidStorageDescriptor;
