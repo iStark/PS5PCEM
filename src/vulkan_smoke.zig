@@ -351,6 +351,72 @@ fn runStorageImageCopyCase(
     std.debug.print("storage image coordinate copy passed: {s}\n", .{if (packed_coordinates) "A16 packed X/Y with poisoned adjacent VGPR" else "32-bit X/Y"});
 }
 
+fn runPredicatedImageLoadProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    const backend = renderer.dcbBackend(guest.interface());
+    const program = 0x1000;
+    const source = 0x5000;
+    const destination = 0x7000;
+    const width = 4;
+    const height = 16;
+    const pitch = 256;
+    const words = [_]u32{
+        0x7daa_0080, // v_cmpx_ne_u32 EXEC, 0, v0
+        0xbf88_0004, // s_cbranch_execz clear branch
+        0xf000_0f08, 0x0000_0400, // image_load v4:v7, v0:v1, T#s0
+        0xf020_0f08, 0x0002_0400, // image_store v4:v7, v0:v1, T#s8
+        0xbefe_087e, // s_not_b64 EXEC, EXEC
+        0xbf88_0006, // s_cbranch_execz end
+        vop1(1, 4, 128),
+        vop1(1, 5, 128),
+        vop1(1, 6, 128),
+        vop1(1, 7, 128),
+        0xf020_0f08,
+        0x0002_0400,
+        0xbf81_0000,
+    };
+    for (words, 0..) |word, index| guest.word(program + index * 4, word);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), program >> 8);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, (16 << 1) | (1 << 11)); // USER_SGPR=16, local X/Y
+    try state.writeRegister(.shader, 0x207, width);
+    try state.writeRegister(.shader, 0x208, height);
+    try state.writeRegister(.shader, 0x209, 1);
+    const descriptors = [_][8]u32{
+        imageDescriptorWords(source, width, height),
+        imageDescriptorWords(destination, width, height),
+    };
+    for (descriptors, 0..) |descriptor, index| {
+        for (descriptor, 0..) |word, component| {
+            try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index * 8 + component)), word);
+        }
+    }
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = backend, .allocator = allocator };
+    // Reuse the translated shader and image views with different input bytes.
+    for (0..2) |pass| {
+        for (0..height) |y| {
+            for (0..width * 4) |byte| {
+                guest.bytes[source + y * pitch + byte] = @intCast(((y * width * 4 + byte) * 13 + 7 + pass * 41) & 0xff);
+            }
+        }
+        @memset(guest.bytes[destination .. destination + pitch * height], 0xa5);
+        _ = try executor.execute(&.{ command(gpu.pm4.dispatch_direct, 4), 1, 1, 1, 0x41 });
+        if (renderer.last_dispatch_error) |err| return err;
+        try renderer.flushPendingGuestWrites();
+        for (0..height) |y| {
+            for (0..width * 4) |byte| {
+                const expected: u8 = if (byte < 4) 0 else guest.bytes[source + y * pitch + byte];
+                try std.testing.expectEqual(expected, guest.bytes[destination + y * pitch + byte]);
+            }
+        }
+    }
+    std.debug.print("predicated image loads passed: 64 lanes, CMPX copy, complementary clear, and refreshed input\n", .{});
+}
+
 fn runComputeSampledImageKernel(
     allocator: std.mem.Allocator,
     renderer: *vulkan.Renderer,
@@ -4773,6 +4839,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--scalar-loops")) {
         try runScalarLoopProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--image-exec")) {
+        try runPredicatedImageLoadProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--quad-mode")) {

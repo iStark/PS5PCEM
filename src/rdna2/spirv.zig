@@ -5235,7 +5235,9 @@ const Builder = struct {
     }
 
     fn imageLoad(self: *Builder, inst: instruction.Instruction) Error!void {
-        if (self.stage != .compute or self.exec_mask_is_lane_predicate) {
+        // CMPX changes EXEC's representation, not the descriptor binding.
+        // Compute inputs remain storage images inside a divergent branch.
+        if (self.stage != .compute) {
             self.sampledImageFetch(inst) catch |err| switch (err) {
                 // Graphics image loads are used for optional visibility and
                 // feedback data in modern Unreal shaders. Keep the rest of

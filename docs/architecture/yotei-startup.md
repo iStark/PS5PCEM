@@ -2,6 +2,22 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Predicated compute image reads on 2026-09-09
+
+The first-frame atmosphere conversion shader `0x80003fa600` reads two resident
+32x128x32 images inside a `CMPX` branch. Translation incorrectly treated the
+per-invocation EXEC predicate as a reason to use graphics sampled-image bindings.
+The compute dispatch has storage bindings, so both reads silently became zero.
+
+Compute image reads now retain their storage bindings under predicated EXEC.
+An isolated replay of the captured producer and converter in one renderer
+changes both final scattering tables from all zero to populated images. The
+new `--image-exec` GPU probe verifies a 64-lane conditional copy, its complementary
+clear branch and changed input through reused image views. It, the captured
+atmosphere chain and the default smoke pass SDK synchronization validation.
+The analytic producer still generates some nonfinite values; full live scene
+validation continues.
+
 ## First-frame atmosphere initialization on 2026-09-09
 
 A diagnostic run with startup suppression and covered-scene elision disabled
@@ -31,8 +47,9 @@ resource recovery and loop coverage, not physically correct atmosphere output.
 
 Normal startup no longer suppresses the first 32 compute frames. The explicit
 diagnostic override remains available, and fullscreen video prioritization still
-starts when a decoder becomes active. Validation of the combined live build is
-pending.
+starts when a decoder becomes active. The combined live build executes the
+entire first-frame chain and retains the populated analytic outputs. Its
+conversion outputs exposed the predicated image-read defect described above.
 
 ## Depth-only extents and scalar uploads on 2026-09-09
 
