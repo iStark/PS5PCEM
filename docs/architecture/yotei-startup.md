@@ -2,6 +2,28 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## ACB counter transfers and synchronization on 2026-09-10
+
+The adjacent HLE audit confirms calls to placeholder ACB DMA, memory-write,
+acquire, wait and event constructors, plus DCB `WRITE_DATA`. In particular,
+the scene requests immediate GDS clears and GDS-to-memory counter copies.
+Ignoring those operations prevents indirect dispatch arguments from reflecting
+the GPU's current results.
+
+These exports now emit the corresponding command packets. ACB wrappers retain
+their distinct argument layouts; ACB `WRITE_DATA` converts its hardware
+destination to the DCB selector format. Both variants copy the payload at
+construction time, including address-zero packets whose payload is consumed
+without submission. Acquire, DMA and write size queries match their packets.
+
+Seventeen HLE tests pass. The new integration case blocks on a guest label,
+publishes copied data and the label through both write constructors, resumes
+the waiting stream and verifies its DMA result. It also covers disabled address
+increment and an embedded payload at address zero. The Vulkan indirect-dispatch
+probe additionally transfers GPU-produced arguments through GDS, destroys the
+memory copy, restores it from GDS and verifies the resulting work and zero-count
+case with SDK synchronization validation. Live scene validation remains pending.
+
 ## Indirect compute command construction on 2026-09-10
 
 A filtered live HLE trace records both `sceAgcDcbDispatchIndirect` and

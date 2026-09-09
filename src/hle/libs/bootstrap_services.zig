@@ -2316,6 +2316,44 @@ fn agcWaitRegMemPatchAddress(command_address: u64, address: u64) callconv(abi.gu
     return errno.ok;
 }
 
+fn agcAcbWaitRegMem(
+    buffer: ?*AgcCommandBuffer,
+    size: u64,
+    compare_function: u64,
+    cache_policy: u64,
+    address: u64,
+    reference: u64,
+    mask: u64,
+    poll_cycles: u64,
+) callconv(abi.guest) ?[*]u32 {
+    return agcWaitRegMem(buffer, size, compare_function, 0, cache_policy, address, reference, mask, poll_cycles);
+}
+
+fn agcAcbAcquireMem(
+    buffer: ?*AgcCommandBuffer,
+    gcr_control: u64,
+    base_address: u64,
+    size_bytes: u64,
+    poll_cycles: u64,
+) callconv(abi.guest) ?[*]u32 {
+    return agcAcquireMem(buffer, 1, 0, gcr_control, base_address, size_bytes, poll_cycles);
+}
+
+fn agcAcbDmaData(
+    buffer: ?*AgcCommandBuffer,
+    destination: u64,
+    destination_cache_policy: u64,
+    destination_address_or_offset: u64,
+    source: u64,
+    source_cache_policy: u64,
+    source_address_or_offset_or_immediate: u64,
+    byte_count: u64,
+    wait_for_previous: u64,
+    write_confirm: u64,
+) callconv(abi.guest) ?[*]u32 {
+    return agcDmaData(buffer, 0, destination, destination_cache_policy, destination_address_or_offset, source, source_cache_policy, source_address_or_offset_or_immediate, byte_count, wait_for_previous, write_confirm, 0);
+}
+
 fn agcEventWrite(
     buffer: ?*AgcCommandBuffer,
     event_type_raw: u64,
@@ -3456,12 +3494,12 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcAcbResetQueue", .function = trace.wrap("sceAgcAcbResetQueue", &agcCommand), .expect_id = "JrtiDtKeS38" },
     .{ .name = "sceAgcAcbDispatchIndirect", .function = trace.wrap("sceAgcAcbDispatchIndirect", &agc.dispatchIndirectAbsolute), .expect_id = "j3EtxFkSIhQ" },
     .{ .name = "sceAgcAcbWaitUntilSafeForRendering", .function = trace.wrap("sceAgcAcbWaitUntilSafeForRendering", &agcCommand), .expect_id = "GPbUp9jXQa8" },
-    .{ .name = "sceAgcAcbWaitRegMem", .function = trace.wrap("sceAgcAcbWaitRegMem", &agcCommand), .expect_id = "htn36gPnBk4" },
-    .{ .name = "sceAgcAcbAcquireMem", .function = trace.wrap("sceAgcAcbAcquireMem", &agcCommand), .expect_id = "KT-hTp-Ch14" },
-    .{ .name = "sceAgcAcbDmaData", .function = trace.wrap("sceAgcAcbDmaData", &agcCommand), .expect_id = "-RnpfpxIhec" },
+    .{ .name = "sceAgcAcbWaitRegMem", .function = trace.wrap("sceAgcAcbWaitRegMem", &agcAcbWaitRegMem), .expect_id = "htn36gPnBk4" },
+    .{ .name = "sceAgcAcbAcquireMem", .function = trace.wrap("sceAgcAcbAcquireMem", &agcAcbAcquireMem), .expect_id = "KT-hTp-Ch14" },
+    .{ .name = "sceAgcAcbDmaData", .function = trace.wrap("sceAgcAcbDmaData", &agcAcbDmaData), .expect_id = "-RnpfpxIhec" },
     .{ .name = "sceAgcAcbCopyData", .function = trace.wrap("sceAgcAcbCopyData", &agcCommand), .expect_id = "qzMN2XKGA4k" },
-    .{ .name = "sceAgcAcbWriteData", .function = trace.wrap("sceAgcAcbWriteData", &agcCommand), .expect_id = "eZ4+17OQz4Q" },
-    .{ .name = "sceAgcAcbEventWrite", .function = trace.wrap("sceAgcAcbEventWrite", &agcCommand), .expect_id = "cFazmnXpJOE" },
+    .{ .name = "sceAgcAcbWriteData", .function = trace.wrap("sceAgcAcbWriteData", &agc.writeDataAcb), .expect_id = "eZ4+17OQz4Q" },
+    .{ .name = "sceAgcAcbEventWrite", .function = trace.wrap("sceAgcAcbEventWrite", &agcEventWrite), .expect_id = "cFazmnXpJOE" },
     .{ .name = "sceAgcAcbJump", .function = trace.wrap("sceAgcAcbJump", &agcCommand), .expect_id = "e1DFTg+Sd8U" },
     .{ .name = "sceAgcAcbPushMarker", .function = trace.wrap("sceAgcAcbPushMarker", &agcCommand), .expect_id = "cpCILPya5Zk" },
     .{ .name = "sceAgcAcbPopMarker", .function = trace.wrap("sceAgcAcbPopMarker", &agcCommand), .expect_id = "6mFxkVqdmbQ" },
@@ -3489,7 +3527,7 @@ const agc_exports = [_]symbols.Export{
     .{ .name = "sceAgcDcbAcquireMem", .function = trace.wrap("sceAgcDcbAcquireMem", &agcAcquireMem), .expect_id = "57labkp+rSQ" },
     .{ .name = "sceAgcDcbDmaData", .function = trace.wrap("sceAgcDcbDmaData", &agcDmaData), .expect_id = "WmAc2MEj6Io" },
     .{ .name = "sceAgcDcbCopyData", .function = trace.wrap("sceAgcDcbCopyData", &agcCommand), .expect_id = "1rZSWUv1IRc" },
-    .{ .name = "sceAgcDcbWriteData", .function = trace.wrap("sceAgcDcbWriteData", &agcCommand), .expect_id = "i1jyy49AjXU" },
+    .{ .name = "sceAgcDcbWriteData", .function = trace.wrap("sceAgcDcbWriteData", &agc.writeData), .expect_id = "i1jyy49AjXU" },
     .{ .name = "sceAgcDcbEventWrite", .function = trace.wrap("sceAgcDcbEventWrite", &agcEventWrite), .expect_id = "aJf+j5yntiU" },
     .{ .name = "sceAgcDcbJump", .function = trace.wrap("sceAgcDcbJump", &agcJump), .expect_id = "xSAR0LTcRKM" },
     .{ .name = "sceAgcDcbPushMarker", .function = trace.wrap("sceAgcDcbPushMarker", &agcCommand), .expect_id = "+kSrjIVxKFE" },
@@ -3777,6 +3815,77 @@ test "bootstrap AGC emits event acquire and patchable DMA packets" {
     try std.testing.expectEqual(@as(u32, 1), acquire.body[5]);
     try std.testing.expectEqual(@as(u32, 0x9000), acquire.body[6]);
     try std.testing.expect((try walker.next()) == null);
+}
+
+test "bootstrap AGC async transfer waits for published data before copying it" {
+    const Host = struct {
+        bytes: [256]u8 = @splat(0),
+        const base: u64 = 0x2000_000400;
+        fn read(context: ?*anyopaque, address: u64, destination: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (address < base or address - base > self.bytes.len or destination.len > self.bytes.len - (address - base)) return false;
+            @memcpy(destination, self.bytes[@intCast(address - base)..][0..destination.len]);
+            return true;
+        }
+        fn write(context: ?*anyopaque, address: u64, source: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (address < base or address - base > self.bytes.len or source.len > self.bytes.len - (address - base)) return false;
+            @memcpy(self.bytes[@intCast(address - base)..][0..source.len], source);
+            return true;
+        }
+        fn buffer(words: []u32) AgcCommandBuffer {
+            return .{ .bottom = words.ptr, .top = words.ptr + words.len, .cursor_up = words.ptr, .cursor_down = null, .callback = null, .user_data = null, .reserved_dwords = 0 };
+        }
+    };
+    var host = Host{};
+    const backend = gpu.DcbBackend{ .context = &host, .vtable = &.{ .read = Host.read, .write = Host.write } };
+    var consumer_words: [24]u32 = @splat(0xdead_beef);
+    var consumer_buffer = Host.buffer(&consumer_words);
+    try std.testing.expect(agcAcbAcquireMem(&consumer_buffer, 0x280, Host.base, 0x100, 400) != null);
+    try std.testing.expect(agcAcbWaitRegMem(&consumer_buffer, 0, 3, 0, Host.base, 3, 0xffff_ffff, 400) != null);
+    try std.testing.expect(agcAcbDmaData(&consumer_buffer, 3, 2, Host.base + 0x20, 3, 1, Host.base + 0x10, 8, 1, 1) != null);
+    try std.testing.expect(agcEventWrite(&consumer_buffer, 7, 0) != null);
+    try std.testing.expectEqual(consumer_words[0..].ptr + 24, consumer_buffer.cursor_up.?);
+    var state = gpu.State{};
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = backend, .allocator = std.testing.allocator };
+    const blocked = try executor.execute(&consumer_words);
+    try std.testing.expectEqual(gpu.executor.Status.blocked, blocked.status);
+    try std.testing.expectEqual(@as(u64, 0), state.dma_data_count);
+    try std.testing.expectEqual(@as(u32, 0x280), state.last_acquire.?.gcr_control);
+    try std.testing.expectEqual(@as(u8, 1), state.last_acquire.?.engine);
+
+    var producer_words: [11]u32 = @splat(0xdead_beef);
+    var producer_buffer = Host.buffer(&producer_words);
+    var values = [_]u32{ 0x1122_3344, 0xaabb_ccdd };
+    try std.testing.expect(agc.writeDataAcb(@ptrCast(&producer_buffer), 2, 2, Host.base + 0x10, &values, 2, 0, 1) != null);
+    const signal = [_]u32{3};
+    try std.testing.expect(agc.writeData(@ptrCast(&producer_buffer), 4, 2, Host.base, &signal, 1, 0, 1) != null);
+    @memset(&values, 0); // Commands own the copied payload, not its source pointer.
+    var producer_state = gpu.State{};
+    var producer = gpu.DcbExecutor{ .state = &producer_state, .backend = backend, .allocator = std.testing.allocator };
+    _ = try producer.execute(&producer_words);
+    const completed = try executor.resumeFrom(&consumer_words, blocked.continuation.?);
+    try std.testing.expectEqual(gpu.executor.Status.complete, completed.status);
+    try std.testing.expectEqual(@as(u64, 1), state.dma_data_count);
+    try std.testing.expectEqual(@as(u64, 1), state.event_count);
+    try std.testing.expectEqual(@as(u32, 0x1122_3344), std.mem.readInt(u32, host.bytes[0x20..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 0xaabb_ccdd), std.mem.readInt(u32, host.bytes[0x24..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 24), agc.writeDataGetSize(2));
+    try std.testing.expectEqual(@as(u32, 28), agc.dmaDataGetSize());
+    try std.testing.expectEqual(@as(u32, 32), agc.acquireMemGetSize());
+    // Address-increment disable writes every payload word to the same word.
+    producer_buffer = Host.buffer(&producer_words);
+    const repeated = [_]u32{ 5, 6, 7 };
+    try std.testing.expect(agc.writeData(@ptrCast(&producer_buffer), 4, 0, Host.base + 0x30, &repeated, 3, 1, 1) != null);
+    _ = try producer.execute(producer_words[0..7]);
+    try std.testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, host.bytes[0x30..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, host.bytes[0x34..][0..4], .little));
+
+    // A data-only packet may use address zero; its copied payload is consumed
+    // by the caller without submitting the WRITE_DATA command itself.
+    producer_buffer = Host.buffer(&producer_words);
+    const embedded = agc.writeData(@ptrCast(&producer_buffer), 4, 0, 0, &repeated, 3, 0, 0).?;
+    try std.testing.expectEqualSlices(u32, &repeated, embedded[4..7]);
 }
 
 test "bootstrap AGC emits exact dispatch draw and instance packets" {

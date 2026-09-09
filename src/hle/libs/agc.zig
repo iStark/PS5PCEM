@@ -9,12 +9,10 @@
 //! have to get right is not rendering but bookkeeping: how much space a command
 //! takes, and that the buffer stays a walkable sequence of commands afterwards.
 //!
-//! Every command written here is a correctly formed no-operation of the size
-//! the command would have taken. That is deliberately not the same as filling
-//! the space with zeroes. Zeroes decode as a register write of one word, so a
-//! buffer full of them is not merely inert — it is a different, shorter stream
-//! that nothing can walk. A no-operation says what is true: a command occupied
-//! this much room and did nothing, and everything after it still parses.
+//! Implemented constructors emit executable PM4 packets with matching size
+//! queries. Remaining placeholder constructors emit correctly formed NOPs;
+//! filling their space with zeroes would instead create shorter register-write
+//! packets and corrupt the boundaries of every command that follows.
 //!
 //! Most placeholder patch entry points are accepted and change nothing. Patch
 //! operations for commands that are executed by the emulator, however, must
@@ -359,6 +357,56 @@ pub fn dispatchIndirectAbsolute(
 
 pub fn dispatchIndirectAbsoluteGetSize() callconv(abi.guest) u32 {
     return 4 * @sizeOf(u32);
+}
+
+pub fn writeData(
+    buffer: ?*CommandBuffer,
+    destination: u32,
+    cache_policy: u32,
+    address: u64,
+    data: ?[*]align(1) const u32,
+    count: u32,
+    single_address: u32,
+    write_confirm: u32,
+) callconv(abi.guest) ?[*]u32 {
+    const source = data orelse return null;
+    if (count > 0x3ffd) return null;
+    const cursor = reserveDwords(buffer, 4 + count) orelse return null;
+    cursor[0] = (@as(u32, 3) << 30) | ((count + 2) << 16) | (@as(u32, gpu.pm4.write_data) << 8);
+    // DCB's selector packs the parser/ME choice in its low bit, followed
+    // by the hardware destination. ACB has only the latter field.
+    cursor[1] = ((destination & 1) << 30) | ((destination & 0x1e) << 7) |
+        ((single_address & 1) << 16) | ((@as(u32, if (destination == 0) 0 else write_confirm) & 1) << 20) |
+        ((cache_policy & 3) << 25);
+    cursor[2] = @as(u32, @truncate(address)) & ~@as(u32, 3);
+    cursor[3] = @truncate(address >> 32);
+    @memcpy(cursor[4..][0..count], source[0..count]);
+    return cursor;
+}
+
+pub fn writeDataAcb(
+    buffer: ?*CommandBuffer,
+    destination: u32,
+    cache_policy: u32,
+    address: u64,
+    data: ?[*]align(1) const u32,
+    count: u32,
+    single_address: u32,
+    write_confirm: u32,
+) callconv(abi.guest) ?[*]u32 {
+    return writeData(buffer, (destination & 0xf) << 1, cache_policy, address, data, count, single_address, write_confirm);
+}
+
+pub fn writeDataGetSize(count: u32) callconv(abi.guest) u32 {
+    return if (count <= 0x3ffd) (count + 4) * @sizeOf(u32) else 0;
+}
+
+pub fn acquireMemGetSize() callconv(abi.guest) u32 {
+    return 8 * @sizeOf(u32);
+}
+
+pub fn dmaDataGetSize() callconv(abi.guest) u32 {
+    return 7 * @sizeOf(u32);
 }
 
 pub fn drawIndirect(

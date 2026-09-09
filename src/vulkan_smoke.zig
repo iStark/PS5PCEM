@@ -2878,6 +2878,17 @@ fn runIndirectDispatchProbe(allocator: std.mem.Allocator) !void {
             const previous_count = std.mem.readInt(u32, guest.bytes[arguments..][0..4], .little);
             _ = try writer.execute(&direct);
             try std.testing.expectEqual(previous_count, std.mem.readInt(u32, guest.bytes[arguments..][0..4], .little));
+            if (absolute_address) {
+                // ACB scene work copies counters through GDS before issuing
+                // the indirect dispatch. Destroy the memory copy in between
+                // so ignoring either DMA transfer cannot pass this check.
+                const counters = [_]u32{
+                    command(gpu.pm4.dma_data, 6), (3 << 29) | (1 << 20), arguments, 0, 0x100,     0, 12 | (1 << 31),
+                    command(gpu.pm4.dma_data, 6), (2 << 29) | (3 << 20), 0,         0, arguments, 0, 12 | (1 << 31),
+                    command(gpu.pm4.dma_data, 6), (1 << 29) | (3 << 20), 0x100,     0, arguments, 0, 12 | (1 << 31),
+                };
+                _ = try writer.execute(&counters);
+            }
             _ = try reader.execute(if (absolute_address) &absolute else &relative);
             try renderer.flushPendingGuestWrites();
             try std.testing.expectEqual(count, std.mem.readInt(u32, guest.bytes[arguments..][0..4], .little));
@@ -2887,7 +2898,7 @@ fn runIndirectDispatchProbe(allocator: std.mem.Allocator) !void {
             }
         }
     }
-    std.debug.print("indirect dispatch passed: GPU-produced dimensions, relative/absolute addresses, nonzero offsets, zero work and changing counts\n", .{});
+    std.debug.print("indirect dispatch passed: GPU-produced dimensions, GDS counter transfers, relative/absolute addresses, nonzero offsets, zero work and changing counts\n", .{});
 }
 
 fn runUiAttachmentProbe(allocator: std.mem.Allocator) !void {
