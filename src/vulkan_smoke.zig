@@ -3210,6 +3210,67 @@ fn runPackedBufferProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("packed buffer probe passed: D16 loads/stores, adjacent halfwords, bounds, half/float packing, CMPX U16 and CLASS F32\n", .{});
 }
 
+fn runDccSingleClearProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    const backend = renderer.dcbBackend(guest.interface());
+    const vertex = [_]u32{
+        vop1(6, 1, 261),  vop1(1, 2, 242), vop2(4, 3, 1, 2),
+        vop1(1, 4, 255),  0x3f40_0000,     vop2(8, 5, 3, 4),
+        vop2(8, 6, 3, 3), vop1(1, 7, 255), 0xbfc0_0000,
+        vop2(8, 6, 6, 7), vop1(1, 8, 255), 0x3f40_0000,
+        vop2(3, 6, 6, 8), vop1(1, 7, 128), vop1(1, 8, 242),
+        0xf800_08cf,      0x0807_0605,     0xbf81_0000,
+    };
+    for (vertex, 0..) |word, index| guest.word(0x700 + index * 4, word);
+    const fragment = [_]u32{ vop1(1, 0, 255), 0x3800_3400, 0xf800_0c03, 0, 0xbf81_0000 };
+    for (fragment, 0..) |word, index| guest.word(0x900 + index * 4, word);
+    const clear = [_]u32{ 0xd746_0004, 0x0401_0c08, vop1(1, 0, 4), vop1(1, 1, 5), vop1(1, 2, 6), vop1(1, 3, 7), 0xe01c_2000, 0x8000_0004, 0xbf81_0000 };
+    for (clear, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var state = gpu.State{};
+    for ([_]gpu.resources.ShaderStage{ .vertex, .pixel }, [_]u32{ 7, 9 }) |stage, address| {
+        try state.writeRegister(.shader, stage.programRegisterBase(), address);
+        try state.writeRegister(.shader, stage.programRegisterBase() + 1, 0);
+    }
+    const context = [_][2]u32{
+        .{ 0x318, 0x20 },            .{ 0x319, 7 },               .{ 0x31b, 0 },                       .{ 0x31c, (5 << 2) | (7 << 8) | (1 << 28) },
+        .{ 0x31d, 0 },               .{ 0x325, 0x80 },            .{ 0x390, 0 },                       .{ 0x3a8, 0 },
+        .{ 0x3b0, (63 << 14) | 63 }, .{ 0x3b8, 1 << 24 },         .{ 0x08e, 3 },                       .{ 0x1c5, 4 },
+        .{ 0x00c, 0 },               .{ 0x00d, 64 | (64 << 16) }, .{ 0x094, 1 << 31 },                 .{ 0x095, 64 | (64 << 16) },
+        .{ 0x1e0, 0 },               .{ 0x200, 0 },               .{ 0x202, (0xcc << 16) | (1 << 4) }, .{ 0x204, 0 },
+        .{ 0x205, 0 },
+    };
+    for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+    for ([_]f32{ 32, 32, 32, 32, 1, 0 }, 0..) |value, index| try state.writeRegister(.context, 0x10f + @as(u32, @intCast(index)), @bitCast(value));
+    try state.writeRegister(.shader, 0x20c, 1);
+    try state.writeRegister(.shader, 0x20d, 0);
+    try state.writeRegister(.shader, 0x213, (8 << 1) | (1 << 7));
+    for ([_]u32{ 0x2000, 256 << 16, 64, (20 << 12) | 4, 0, 0, 0, 0 }, 0..) |word, index| try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(index)), word);
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = backend, .allocator = allocator };
+    for ([_]u32{ 0x7e00_7e00, 0x3400_3800, 0x7c00_fc00 }) |value| {
+        @memset(guest.bytes[0x8000..0x8040], 0xff);
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+        if (renderer.last_draw_error) |err| return err;
+        try renderer.flushPendingGuestWrites();
+        try std.testing.expectEqual(@as(u32, 0x3800_3400), std.mem.readInt(u32, guest.bytes[0x2000 + (32 * 64 + 32) * 4 ..][0..4], .little));
+        // Each DCC byte covers 256 source bytes. The typed buffer kernel
+        // writes only the representative texel, not a linear pixel fill.
+        @memset(guest.bytes[0x8000..0x8040], 0x10);
+        try state.writeRegister(.shader, 0x244, value);
+        _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 1, 1, 1 });
+        try renderer.flushPendingGuestWrites();
+        for (0..64 * 64) |pixel| {
+            const actual = std.mem.readInt(u32, guest.bytes[0x2000 + pixel * 4 ..][0..4], .little);
+            if (value == 0x7e00_7e00) {
+                try std.testing.expect(std.math.isNan(@as(f16, @bitCast(@as(u16, @truncate(actual))))));
+                try std.testing.expect(std.math.isNan(@as(f16, @bitCast(@as(u16, @truncate(actual >> 16))))));
+            } else try std.testing.expectEqual(value, actual);
+        }
+    }
+    std.debug.print("DCC single-texel clears passed: resident RG16F, repeated rendering, finite values, NaNs and infinities\n", .{});
+}
+
 fn runNormalizedColorProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -3757,62 +3818,76 @@ fn runFlatPointerProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runSceneFlatPointerProbe(allocator: std.mem.Allocator) !void {
-    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
-    defer renderer.deinit();
-    var guest = GuestMemory{};
-    _ = renderer.dcbBackend(guest.interface());
-    // Preserve the captured pointer-walk sites, with NOPs in place of its
-    // culling math. All memory discovery, upload and fault checks are live.
-    var code: [0x3b6c / 4]u32 = @splat(0xbf80_0000);
-    code[0] = vop1(1, 4, 128);
-    code[0x3ad4 / 4] = 0xdc34_8018;
-    code[0x3ad8 / 4] = 0x0400_0004;
-    code[0x3ae0 / 4] = 0xdc30_8098;
-    code[0x3ae4 / 4] = 0x067d_0004;
-    code[0x3b3c / 4] = 0xdc34_8088;
-    code[0x3b40 / 4] = 0x0e7d_0004;
-    // The real culling shaders form 64-bit record addresses with VOP3B
-    // carry-out followed by VOP2 ADDC. A stale VCC must not add 4 GiB.
-    code[0x3b44 / 4] = sop1(4, 106, 193);
-    code[0x3b48 / 4] = 0xd70f_6a0e;
-    code[0x3b4c / 4] = 270 | (128 << 9);
-    code[0x3b50 / 4] = 0x501e_1e80;
-    code[0x3b54 / 4] = 0xdc38_8000;
-    code[0x3b58 / 4] = 0x007d_000e;
-    code[0x3b5c / 4] = vop1(1, 8, 128);
-    code[0x3b60 / 4] = mubuf(0x1e, 0, 0, 8, 4)[0];
-    code[0x3b64 / 4] = mubuf(0x1e, 0, 0, 8, 4)[1];
-    code[0x3b68 / 4] = 0xbf81_0000;
-    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
-    guest.word(0x10010, 1);
-    guest.word(0x10018, 0x11000);
-    guest.word(0x11000 + 140, 168 << 16);
-    guest.word(0x11000 + 144, 1);
-    guest.word(0x11000 + 148, 0x5204);
-    guest.word(0x11000 + 152, 1);
-    var state = gpu.State{};
-    try state.writeRegister(.shader, 0x20c, 1);
-    try state.writeRegister(.shader, 0x20d, 0);
-    try state.writeRegister(.shader, 0x213, 8 << 1);
-    const user_data = [_]u32{ 0x10000, 0, 0, 0, 0x13000, 16 << 16, 1, (20 << 12) | 0xfac };
-    for (user_data, 0..) |word, index| try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(index)), word);
-    for (0..2) |pass| {
-        const records = 0x12000 + pass * 0x2000;
-        guest.word(0x11000 + 136, @intCast(records));
-        for (0..42) |word| guest.word(records + word * 4, @intCast(pass * 100 + word + 1));
-        _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
-        var output: [16]u8 = undefined;
-        try renderer.readbackGuestStorageBuffer(0x13000, &output);
-        for (0..4) |word| try std.testing.expectEqual(@as(u32, @intCast(pass * 100 + word + 1)), std.mem.readInt(u32, output[word * 4 ..][0..4], .little));
+    for ([_]bool{ false, true }) |scene_bounds| {
+        var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+        defer renderer.deinit();
+        var guest = GuestMemory{};
+        _ = renderer.dcbBackend(guest.interface());
+        // Preserve the captured pointer-walk sites, with NOPs in place of its
+        // culling math. All memory discovery, upload and fault checks are live.
+        var code: [0x3b6c / 4]u32 = @splat(0xbf80_0000);
+        code[0] = vop1(1, 4, 128);
+        code[0x3ad4 / 4] = 0xdc34_8018;
+        code[0x3ad8 / 4] = 0x0400_0004;
+        code[0x3ae0 / 4] = 0xdc30_8098;
+        code[0x3ae4 / 4] = 0x067d_0004;
+        code[0x3b3c / 4] = 0xdc34_8088;
+        code[0x3b40 / 4] = 0x0e7d_0004;
+        if (scene_bounds) {
+            code[0] = vop1(1, 0, 128);
+            @memset(code[0x3ad4 / 4 .. 0x3b44 / 4], 0xbf80_0000);
+            code[0x65c / 4] = 0xdc34_8018;
+            code[0x660 / 4] = 0x0000_0000;
+            code[0x668 / 4] = 0xdc30_8098;
+            code[0x66c / 4] = 0x027d_0000;
+            code[0x6c4 / 4] = 0xdc34_8088;
+            code[0x6c8 / 4] = 0x087d_0000;
+            code[0x6cc / 4] = vop1(1, 14, 264);
+            code[0x6d0 / 4] = vop1(1, 15, 265);
+        }
+        // The real culling shaders form 64-bit record addresses with VOP3B
+        // carry-out followed by VOP2 ADDC. A stale VCC must not add 4 GiB.
+        code[0x3b44 / 4] = sop1(4, 106, 193);
+        code[0x3b48 / 4] = 0xd70f_6a0e;
+        code[0x3b4c / 4] = 270 | (128 << 9);
+        code[0x3b50 / 4] = 0x501e_1e80;
+        code[0x3b54 / 4] = 0xdc38_8000;
+        code[0x3b58 / 4] = 0x007d_000e;
+        code[0x3b5c / 4] = vop1(1, 8, 128);
+        code[0x3b60 / 4] = mubuf(0x1e, 0, 0, 8, 4)[0];
+        code[0x3b64 / 4] = mubuf(0x1e, 0, 0, 8, 4)[1];
+        code[0x3b68 / 4] = 0xbf81_0000;
+        for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+        guest.word(0x10010, 1);
+        guest.word(0x10018, 0x11000);
+        guest.word(0x11000 + 140, 168 << 16);
+        guest.word(0x11000 + 144, 1);
+        guest.word(0x11000 + 148, 0x5204);
+        guest.word(0x11000 + 152, 1);
+        var state = gpu.State{};
+        try state.writeRegister(.shader, 0x20c, 1);
+        try state.writeRegister(.shader, 0x20d, 0);
+        try state.writeRegister(.shader, 0x213, 8 << 1);
+        const user_data = [_]u32{ 0x10000, 0, 0, 0, 0x13000, 16 << 16, 1, (20 << 12) | 0xfac };
+        for (user_data, 0..) |word, index| try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(index)), word);
+        for (0..2) |pass| {
+            const records = 0x12000 + pass * 0x2000;
+            guest.word(0x11000 + 136, @intCast(records));
+            for (0..42) |word| guest.word(records + word * 4, @intCast(pass * 100 + word + 1));
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+            var output: [16]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x13000, &output);
+            for (0..4) |word| try std.testing.expectEqual(@as(u32, @intCast(pass * 100 + word + 1)), std.mem.readInt(u32, output[word * 4 ..][0..4], .little));
+        }
+        guest.word(0x11000 + 152, 2);
+        try std.testing.expectError(error.InvalidStorageDescriptor, renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 }));
+        guest.word(0x11000 + 152, 1);
+        // Use another program address so the immutable program cache is valid.
+        code[0x3b54 / 4] |= 168;
+        for (code, 0..) |word, index| guest.word(0x5000 + index * 4, word);
+        try state.writeRegister(.shader, 0x20c, 0x50);
+        try std.testing.expectError(error.GuestMemoryReadFailed, renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 }));
     }
-    guest.word(0x11000 + 152, 2);
-    try std.testing.expectError(error.InvalidStorageDescriptor, renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 }));
-    guest.word(0x11000 + 152, 1);
-    // Use another program address so the immutable program cache is valid.
-    code[0x3b54 / 4] |= 168;
-    for (code, 0..) |word, index| guest.word(0x5000 + index * 4, word);
-    try state.writeRegister(.shader, 0x20c, 0x50);
-    try std.testing.expectError(error.GuestMemoryReadFailed, renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 }));
     std.debug.print("Scene FLAT snapshots passed: nested descriptor walk, carry-out address chain, relocated records, count bounds and live unmapped-read rejection\n", .{});
 }
 
@@ -5018,6 +5093,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--scene-flat-pointers")) {
         try runSceneFlatPointerProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--dcc-single-clears")) {
+        try runDccSingleClearProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--nested-images")) {

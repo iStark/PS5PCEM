@@ -2,6 +2,28 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Repeated velocity clears and scene bounds on 2026-09-09
+
+After the three bonus notices, brightness, difficulty and experience selection,
+the scene retained large radial streaks. The camera-reprojection shader produces
+small velocities in an isolated replay with its captured matrix and depth data.
+The live velocity attachment instead retains the same large values across frames.
+AGC clears it with one RG16F texel per 256-byte block and a uniform `0x10` DCC
+key. Updating only the buffer leaves the already resident attachment unchanged.
+The matching complete clear now updates that RG16F attachment on the GPU,
+including the NaN sentinel consumed by the camera-reprojection pass.
+
+The regression probe fails with the previous clear path and passes with the
+fix. It renders between repeated clears and checks every pixel for finite,
+NaN and infinite values. SDK synchronization validation reports no errors.
+Live scene verification is still required; this is not a complete-menu claim.
+
+The later scene-bounds kernel at `0x800018b800` uses the existing scene-object
+layout with different pointer registers. Its root/header/168-byte-record walk
+now receives the same bounded FLAT snapshots as visibility. Both instruction
+variants pass relocated-record, count-bound and unmapped-read checks under
+SDK synchronization validation.
+
 ## Completing the multiple-scattering pass on 2026-09-09
 
 Shader `0x80003a9b00` integrates a 16x32 angular grid. The default 16,384-step

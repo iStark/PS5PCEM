@@ -6798,6 +6798,7 @@ pub const Renderer = struct {
         }
 
         const descriptor = try descriptorFromComputeUserData(state, 0);
+        if (try self.tryClearDccSingleRg16(state, descriptor, local_size, group_count)) |report| return report;
         if (descriptor.address == 0 or descriptor.stride != 16 or descriptor.unified_format != 75 or
             descriptor.swizzle_enabled or descriptor.index_stride != 0 or descriptor.add_thread_id or
             descriptor.out_of_bounds_select != 0 or
@@ -7048,6 +7049,66 @@ pub const Renderer = struct {
                 .{ descriptor.address, packed_value, descriptor.record_count, self.emulated_buffer_clear_dispatches },
             );
         }
+        return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
+    }
+
+    /// A comp-to-single clear writes one native texel per 256-byte block.
+    /// Reusing a resident attachment after only updating that buffer retains
+    /// the previous frame's pixels (and, for velocity, its camera motion).
+    /// The validated AGC kernel plus a complete 0x10 DCC key is a uniform
+    /// image clear; preserve floating-point sentinels, including NaNs.
+    fn tryClearDccSingleRg16(
+        self: *Renderer,
+        state: *const gpu.State,
+        descriptor: gpu.resources.BufferDescriptor,
+        local_size: [3]u32,
+        group_count: [3]u32,
+    ) anyerror!?DispatchReport {
+        if (descriptor.address == 0 or descriptor.stride != 256 or descriptor.unified_format != 20 or
+            descriptor.swizzle_enabled or descriptor.add_thread_id or descriptor.index_stride != 0 or
+            descriptor.out_of_bounds_select != 0 or
+            !std.mem.eql(u8, &descriptor.dst_select, &.{ 4, 0, 0, 0 }) or
+            @as(u64, group_count[0]) * local_size[0] != descriptor.record_count) return null;
+        var selected: ?usize = null;
+        for (self.render_targets.items, 0..) |cached, index| {
+            const target = cached.target;
+            if (target.descriptor.address != descriptor.address or
+                target.format.vulkan != vk.format_r16g16_sfloat or
+                target.layout.required_source_bytes != descriptor.size_bytes or target.layout.layers != 1 or
+                !target.descriptor.dcc_enabled or target.descriptor.dcc_address == 0 or
+                target.descriptor.samples_log2 != 0 or target.descriptor.fragments_log2 != 0) continue;
+            if (selected == null or cached.last_used_sequence > self.render_targets.items[selected.?].last_used_sequence) selected = index;
+        }
+        const index = selected orelse return null;
+        const snapshot = self.render_targets.items[index];
+        const key_bytes = std.math.divCeil(u64, descriptor.size_bytes, dcc_block_bytes) catch return null;
+        if (key_bytes == 0 or key_bytes > maximum_dcc_key_bytes) return null;
+        try self.flushGuestStorageRange(snapshot.target.descriptor.dcc_address, @intCast(key_bytes));
+        if ((try self.uniformDccCode(snapshot.target.descriptor.dcc_address, descriptor.size_bytes)) != 0x10) return null;
+        const packed_value = state.readRegister(.shader, 0x244) orelse return null;
+        const clear = vk.ClearColorValue{ .float32 = .{
+            @as(f16, @bitCast(@as(u16, @truncate(packed_value)))),
+            @as(f16, @bitCast(@as(u16, @truncate(packed_value >> 16)))),
+            0,
+            0,
+        } };
+        const command_buffer = try self.beginOneShot();
+        defer self.releaseOneShot(command_buffer);
+        const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit };
+        try self.transitionTrackedImage(command_buffer, snapshot.image.handle, .{ .aspect_mask = vk.image_aspect_color_bit }, image_state.transfer_destination_usage);
+        self.device_functions.cmd_clear_color_image(command_buffer, snapshot.image.handle, vk.image_layout_transfer_dst_optimal, &clear, 1, @ptrCast(&range));
+        try self.transitionTrackedImage(command_buffer, snapshot.image.handle, .{ .aspect_mask = vk.image_aspect_color_bit }, image_state.color_attachment_usage);
+        try self.submitOneShot(command_buffer);
+        const cached = &self.render_targets.items[index];
+        cached.initialized = true;
+        cached.shader_read_layout = false;
+        cached.gpu_generation +%= 1;
+        _ = self.image_aliases.markWrite(cached.alias_token);
+        for (self.completed_frames.items) |*frame| {
+            if (frame.guest_address == descriptor.address) frame.needs_writeback = false;
+        }
+        self.emulated_buffer_clear_dispatches += 1;
+        self.noteComputeWrite("emulated-dcc-single", descriptor.address, snapshot.target.descriptor.width, snapshot.target.descriptor.height, 29);
         return .{ .pipeline_cache_hit = false, .group_count = group_count, .spirv_words = 0 };
     }
 
@@ -7638,6 +7699,12 @@ pub const Renderer = struct {
                 programHasRawInstruction(analysis, pc + 12, &.{ 0xdc30_8098, 0x067d_0004 }) and
                 programHasRawInstruction(analysis, pc + 104, &.{ 0xdc34_8088, 0x0e7d_0004 })) matches = true;
         }
+        // The scene-bounds reduction walks the same root/header/168-byte
+        // object table as visibility, using v0:v1 for the header pointer.
+        // It first appears after the initial difficulty/experience screens.
+        if (programHasRawInstruction(analysis, 0x65c, &.{ 0xdc34_8018, 0x0000_0000 }) and
+            programHasRawInstruction(analysis, 0x668, &.{ 0xdc30_8098, 0x027d_0000 }) and
+            programHasRawInstruction(analysis, 0x6c4, &.{ 0xdc34_8088, 0x087d_0000 })) matches = true;
         if (!matches) return;
         const Region = struct { address: u64, size: usize };
         var regions: [33]Region = undefined;
