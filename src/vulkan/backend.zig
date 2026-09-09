@@ -6976,6 +6976,7 @@ pub const Renderer = struct {
             if (!memory.write(memory.context, descriptor.address, bytes)) return Error.GuestMemoryWriteFailed;
             self.invalidateDmaDestination(descriptor.address, byte_count);
             try self.applyUniformHtileWrite(descriptor.address, bytes);
+            try self.applyUniformDccWrite(descriptor.address, bytes);
             self.emulated_buffer_clear_dispatches += 1;
             self.noteComputeWrite("emulated-packed-buffer", descriptor.address, 0, 0, 0);
             if (log_verbose_gpu or self.emulated_buffer_clear_dispatches <= 4) {
@@ -11301,6 +11302,51 @@ pub const Renderer = struct {
             if (offset > bytes.len or size > bytes.len - offset) continue;
             const depth = uniformHtileClear(bytes[offset..][0..size]) orelse continue;
             try self.clearDepthFromHtile(index, depth);
+        }
+    }
+
+    /// A complete fixed-color DCC metadata fill clears an existing attachment
+    /// even when no bytes in its color allocation change. Merely updating the
+    /// guest key leaves previous-frame HDR values in the resident Vulkan image.
+    fn applyUniformDccWrite(self: *Renderer, address: u64, bytes: []const u8) anyerror!void {
+        for (self.render_targets.items, 0..) |snapshot, index| {
+            const target = snapshot.target;
+            const descriptor = target.descriptor;
+            if (!snapshot.initialized or !descriptor.dcc_enabled or descriptor.dcc_address == 0 or
+                descriptor.samples_log2 != 0 or descriptor.fragments_log2 != 0 or target.layout.layers != 1 or
+                address > descriptor.dcc_address) continue;
+            const offset = std.math.cast(usize, descriptor.dcc_address - address) orelse continue;
+            const size = std.math.cast(usize, std.math.divCeil(u64, target.layout.required_source_bytes, dcc_block_bytes) catch continue) orelse continue;
+            if (size == 0 or offset > bytes.len or size > bytes.len - offset) continue;
+            const metadata = bytes[offset..][0..size];
+            const code = metadata[0];
+            // Comp-to-single, clear-register and mixed/compressed keys require
+            // their own payload handling; a partial write is not a full clear.
+            if (code != 0 and code != 0x40 and code != 0x80 and code != 0xc0) continue;
+            if (!std.mem.allEqual(u8, metadata, code)) continue;
+            const texel = colorDccClearTexel(code, descriptor) orelse continue;
+            var clear = vk.ClearColorValue{ .float32 = @splat(0) };
+            switch (target.format.vulkan) {
+                vk.format_r16g16b16a16_sfloat => {
+                    for (0..4) |channel| clear.float32[channel] = @as(f16, @bitCast(std.mem.readInt(u16, texel.bytes[channel * 2 ..][0..2], .little)));
+                },
+                vk.format_r8g8b8a8_unorm, vk.format_b8g8r8a8_unorm => {
+                    for (0..4) |channel| clear.float32[channel] = @as(f32, @floatFromInt(texel.bytes[channel])) / 255.0;
+                },
+                else => continue,
+            }
+            const command_buffer = try self.beginOneShot();
+            defer self.releaseOneShot(command_buffer);
+            const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit };
+            try self.transitionTrackedImage(command_buffer, snapshot.image.handle, .{ .aspect_mask = vk.image_aspect_color_bit }, image_state.transfer_destination_usage);
+            self.device_functions.cmd_clear_color_image(command_buffer, snapshot.image.handle, vk.image_layout_transfer_dst_optimal, &clear, 1, @ptrCast(&range));
+            try self.transitionTrackedImage(command_buffer, snapshot.image.handle, .{ .aspect_mask = vk.image_aspect_color_bit }, image_state.color_attachment_usage);
+            try self.submitOneShot(command_buffer);
+            const cached = &self.render_targets.items[index];
+            cached.shader_read_layout = false;
+            cached.gpu_generation +%= 1;
+            _ = self.image_aliases.markWrite(cached.alias_token);
+            self.noteComputeWrite("dcc-metadata-clear", descriptor.address, descriptor.width, descriptor.height, 0);
         }
     }
 
@@ -19019,6 +19065,7 @@ pub const Renderer = struct {
         const memory = self.guest_memory orelse return false;
         if (!memory.write(memory.context, address, bytes)) return false;
         self.applyUniformHtileWrite(address, bytes) catch return false;
+        self.applyUniformDccWrite(address, bytes) catch return false;
         return true;
     }
 
@@ -19225,6 +19272,7 @@ pub const Renderer = struct {
                 if (!memory.write(memory.context, dma.destination_address, bytes)) return false;
                 self.invalidateDmaDestination(dma.destination_address, byte_count);
                 self.applyUniformHtileWrite(dma.destination_address, bytes) catch return false;
+                self.applyUniformDccWrite(dma.destination_address, bytes) catch return false;
             },
             1 => {
                 if (!self.ensureGdsStorage()) return false;

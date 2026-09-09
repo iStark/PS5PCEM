@@ -3643,6 +3643,97 @@ fn runDccSingleClearProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("DCC single-texel clears passed: resident RG16F, repeated rendering, finite values, NaNs and infinities\n", .{});
 }
 
+fn runDccMetadataClearProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    const backend = renderer.dcbBackend(guest.interface());
+    const vertex = [_]u32{
+        vop1(6, 1, 261),  vop1(1, 2, 242), vop2(4, 3, 1, 2),
+        vop1(1, 4, 255),  0x3f40_0000,     vop2(8, 5, 3, 4),
+        vop2(8, 6, 3, 3), vop1(1, 7, 255), 0xbfc0_0000,
+        vop2(8, 6, 6, 7), vop1(1, 8, 255), 0x3f40_0000,
+        vop2(3, 6, 6, 8), vop1(1, 7, 128), vop1(1, 8, 242),
+        0xf800_08cf,      0x0807_0605,     0xbf81_0000,
+    };
+    for (vertex, 0..) |word, index| guest.word(0x700 + index * 4, word);
+    const fragment = [_]u32{ vop1(1, 0, 255), 0x3800_3400, vop1(1, 1, 255), 0x3c00_3a00, 0xf800_0c0f, 0x0100, 0xbf81_0000 };
+    for (fragment, 0..) |word, index| guest.word(0x900 + index * 4, word);
+    const clear = [_]u32{ 0xd746_0004, 0x0401_0c08, vop1(1, 0, 4), vop1(1, 1, 5), vop1(1, 2, 6), vop1(1, 3, 7), 0xe01c_2000, 0x8000_0004, 0xbf81_0000 };
+    for (clear, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var state = gpu.State{};
+    for ([_]gpu.resources.ShaderStage{ .vertex, .pixel }, [_]u32{ 7, 9 }) |stage, address| {
+        try state.writeRegister(.shader, stage.programRegisterBase(), address);
+        try state.writeRegister(.shader, stage.programRegisterBase() + 1, 0);
+    }
+    const context = [_][2]u32{
+        .{ 0x318, 0x20 },            .{ 0x319, 7 },               .{ 0x31b, 0 },                       .{ 0x31c, (12 << 2) | (7 << 8) | (1 << 28) },
+        .{ 0x31d, 0 },               .{ 0x325, 0x1c0 },            .{ 0x390, 0 },                       .{ 0x3a8, 0 },
+        .{ 0x3b0, (63 << 14) | 63 }, .{ 0x3b8, 1 << 24 },         .{ 0x08e, 15 },                      .{ 0x1c5, 4 },
+        .{ 0x00c, 0 },               .{ 0x00d, 64 | (64 << 16) }, .{ 0x094, 1 << 31 },                 .{ 0x095, 64 | (64 << 16) },
+        .{ 0x1e0, 0 },               .{ 0x200, 0 },               .{ 0x202, (0xcc << 16) | (1 << 4) }, .{ 0x204, 0 },
+        .{ 0x205, 0 },
+    };
+    for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+    for ([_]f32{ 32, 32, 32, 32, 1, 0 }, 0..) |value, index| try state.writeRegister(.context, 0x10f + @as(u32, @intCast(index)), @bitCast(value));
+    try state.writeRegister(.shader, 0x20c, 1);
+    try state.writeRegister(.shader, 0x20d, 0);
+    try state.writeRegister(.shader, 0x213, (8 << 1) | (1 << 7));
+    for ([_]u32{ 0x1c000, 16 << 16, 64, (75 << 12) | 0xfac, 0, 0, 0, 0 }, 0..) |word, index| try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(index)), word);
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = backend, .allocator = allocator };
+    for ([_]u32{ 0, 0x4040_4040, 0x8080_8080, 0xc0c0_c0c0, 0 }) |value| {
+        @memset(guest.bytes[0x1c000..0x1c400], 0xff);
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+        if (renderer.last_draw_error) |err| return err;
+        try renderer.flushPendingGuestWrites();
+        try std.testing.expectEqual(@as(u32, 0x3800_3400), std.mem.readInt(u32, guest.bytes[0x2000 + (32 * 64 + 32) * 8 ..][0..4], .little));
+        for (0..4) |word| try state.writeRegister(.shader, 0x244 + @as(u32, @intCast(word)), value);
+        _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 1, 1, 1 });
+        try renderer.flushPendingGuestWrites();
+        for (0..64 * 64) |pixel| for (0..4) |channel| {
+            const expected: u16 = if (value & (if (channel == 3) @as(u32, 0x40) else 0x80) != 0) 0x3c00 else 0;
+            try std.testing.expectEqual(expected, std.mem.readInt(u16, guest.bytes[0x2000 + pixel * 8 + channel * 2 ..][0..2], .little));
+        };
+    }
+    @memset(guest.bytes[0x1c000..0x1c400], 0xff);
+    _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+    try renderer.flushPendingGuestWrites();
+    var preserved: [64 * 64 * 8]u8 = undefined;
+    @memcpy(&preserved, guest.bytes[0x2000..0xa000]);
+    // Partial metadata, mixed keys and the uncompressed key must not clear
+    // the whole attachment. Exercise the direct PM4 write path separately.
+    try std.testing.expect(backend.vtable.write(backend.context, 0x1c000, &.{ 0, 0, 0, 0 }));
+    try renderer.flushPendingGuestWrites();
+    try std.testing.expectEqualSlices(u8, &preserved, guest.bytes[0x2000..0xa000]);
+    var metadata: [1024]u8 = @splat(0xff);
+    for ([_]bool{ true, false }) |mixed| {
+        metadata[0] = if (mixed) 0 else 0xff;
+        try std.testing.expect(backend.vtable.write(backend.context, 0x1c000, &metadata));
+        try renderer.flushPendingGuestWrites();
+        try std.testing.expectEqualSlices(u8, &preserved, guest.bytes[0x2000..0xa000]);
+    }
+    @memset(&metadata, 0x40);
+    try std.testing.expect(backend.vtable.write(backend.context, 0x1c000, &metadata));
+    try renderer.flushPendingGuestWrites();
+    for (0..64 * 64) |pixel| try std.testing.expectEqual(@as(u64, 0x3c00_0000_0000_0000), std.mem.readInt(u64, guest.bytes[0x2000 + pixel * 8 ..][0..8], .little));
+    try std.testing.expect(backend.vtable.dma_data.?(backend.context, .{
+        .engine = 0,
+        .source = 2,
+        .source_cache_policy = 0,
+        .destination = 0,
+        .destination_cache_policy = 0,
+        .source_address = 0xc0c0_c0c0,
+        .destination_address = 0x1c000,
+        .byte_count = 1024,
+        .wait_for_previous = false,
+        .write_confirm = true,
+        .block_engine = false,
+    }));
+    try renderer.flushPendingGuestWrites();
+    for (0..64 * 64) |pixel| try std.testing.expectEqual(@as(u64, 0x3c00_3c00_3c00_3c00), std.mem.readInt(u64, guest.bytes[0x2000 + pixel * 8 ..][0..8], .little));
+    std.debug.print("DCC metadata clears passed: repeated RGBA16F compute/PM4/DMA clears, partial and mixed metadata preservation\n", .{});
+}
+
 fn runNormalizedColorProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -5384,6 +5475,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--paired-lds64")) {
         try runPairedLds64Probe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--dcc-metadata-clear")) {
+        try runDccMetadataClearProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--lds-wave-memory")) {

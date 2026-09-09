@@ -2,6 +2,23 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Repeated HDR metadata clears on 2026-09-09
+
+The frame-1242 trace clears the HDR attachment's DCC key at `0x508be3e000`
+before the material passes, without rewriting the color allocation at
+`0x505ab20000`. Initial attachment staging interprets that key, but subsequent
+metadata writes left the resident image unchanged. Complete, uniform fixed-color
+DCC writes now clear supported resident color attachments on the GPU and publish
+a new image generation. Partial, mixed, compressed and comp-to-single keys retain
+their separate handling.
+
+The `--dcc-metadata-clear` GPU regression fails on the former implementation:
+it retains half-float `0x3400` where the metadata requests zero. The correction
+passes five repeated RGBA16F clears, direct PM4 writes, DMA fills, and checks
+that partial/mixed/uncompressed metadata preserves existing pixels. This suite,
+the RG16F comp-to-single suite and the default Vulkan smoke pass SDK
+synchronization validation. Complete live scene verification remains pending.
+
 ## Ordering a 64-lane wave's LDS accesses on 2026-09-09
 
 After the LDS width/address fixes, the live exposure volume stays within
