@@ -25083,37 +25083,38 @@ fn graphicsSrtImageSlot(
     mappings: []const gpu.ShaderSpirvSampledImageBinding,
     resource_sgpr: u32,
 ) usize {
-    var slot: usize = 0;
-    for (mappings, 0..) |mapping, index| {
-        var first_use = true;
-        for (mappings[0..index]) |previous| {
-            if (previous.resource_sgpr == mapping.resource_sgpr) {
-                first_use = false;
-                break;
-            }
-        }
-        if (!first_use) continue;
-        if (mapping.resource_sgpr == resource_sgpr) return slot;
-        slot += 1;
-    }
-    return slot;
+    return graphicsSrtSlot(mappings, resource_sgpr, "resource_sgpr");
 }
 
 fn graphicsSrtSamplerSlot(
     mappings: []const gpu.ShaderSpirvSampledImageBinding,
     sampler_sgpr: u32,
 ) usize {
+    return graphicsSrtSlot(mappings, sampler_sgpr, "sampler_sgpr");
+}
+
+fn graphicsSrtSlot(mappings: []const gpu.ShaderSpirvSampledImageBinding, requested: u32, comptime field: []const u8) usize {
+    var seen: u128 = 0;
     var slot: usize = 0;
     for (mappings, 0..) |mapping, index| {
-        var first_use = true;
-        for (mappings[0..index]) |previous| {
-            if (previous.sampler_sgpr == mapping.sampler_sgpr) {
-                first_use = false;
-                break;
+        const register = @field(mapping, field);
+        if (register < 128) {
+            const bit = @as(u128, 1) << @intCast(register);
+            if (seen & bit != 0) continue;
+            seen |= bit;
+        } else {
+            // Preserve the old ordering for externally supplied mappings
+            // outside the guest SGPR bank without truncating their identity.
+            var duplicate = false;
+            for (mappings[0..index]) |previous| {
+                if (@field(previous, field) == register) {
+                    duplicate = true;
+                    break;
+                }
             }
+            if (duplicate) continue;
         }
-        if (!first_use) continue;
-        if (mapping.sampler_sgpr == sampler_sgpr) return slot;
+        if (register == requested) return slot;
         slot += 1;
     }
     return slot;
@@ -28777,6 +28778,23 @@ test "graphics SRT slots allow multiple images to share one sampler" {
     try std.testing.expectEqual(@as(usize, 0), graphicsSrtSamplerSlot(mappings[0..1], 32));
     try std.testing.expectEqual(@as(usize, 0), graphicsSrtSamplerSlot(&mappings, 32));
     try std.testing.expectEqual(@as(usize, 1), graphicsSrtSamplerSlot(&mappings, 40));
+}
+
+test "graphics SRT slots preserve first-use order across repeated and out-of-bank mappings" {
+    const mappings = [_]gpu.ShaderSpirvSampledImageBinding{
+        .{ .resource_sgpr = 127, .sampler_sgpr = 80, .descriptor_index = 0 },
+        .{ .resource_sgpr = 8, .sampler_sgpr = 32, .descriptor_index = 1 },
+        .{ .resource_sgpr = 127, .sampler_sgpr = 80, .descriptor_index = 2 },
+        .{ .resource_sgpr = 300, .sampler_sgpr = 256, .descriptor_index = 3 },
+        .{ .resource_sgpr = 8, .sampler_sgpr = 32, .descriptor_index = 4 },
+        .{ .resource_sgpr = 300, .sampler_sgpr = 256, .descriptor_index = 5 },
+        .{ .resource_sgpr = 0, .sampler_sgpr = 16, .descriptor_index = 6 },
+        .{ .resource_sgpr = 256, .sampler_sgpr = 300, .descriptor_index = 7 },
+    };
+    for ([_]u32{ 127, 8, 300, 0, 256, 12 }, 0..) |reg, expected|
+        try std.testing.expectEqual(expected, graphicsSrtImageSlot(&mappings, reg));
+    for ([_]u32{ 80, 32, 256, 16, 300, 12 }, 0..) |reg, expected|
+        try std.testing.expectEqual(expected, graphicsSrtSamplerSlot(&mappings, reg));
 }
 
 test "vertex attributes keep distinct PC-qualified storage mappings" {
