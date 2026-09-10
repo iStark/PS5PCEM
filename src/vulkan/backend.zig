@@ -21,6 +21,7 @@ const detile_spirv = @import("detile_spirv.zig");
 const image_alias = @import("image_alias.zig");
 const image_state = @import("image_state.zig");
 const pipeline_compiler = @import("pipeline_compiler.zig");
+const pipeline_cache_save = @import("pipeline_cache_save.zig");
 const spirv_cache = @import("spirv_cache.zig");
 const sampled_lookup_plan = @import("sampled_lookup_plan.zig");
 
@@ -898,37 +899,23 @@ fn loadPipelineCacheBytes(allocator: std.mem.Allocator) ?[]u8 {
     return bytes;
 }
 
-/// Writes the current driver pipeline cache to disk. Failure is deliberately
-/// silent: a cache is an optimization, and losing it only costs compilation
-/// time on the next run.
+/// Driver cache handles use Vulkan's default internal synchronization. The
+/// snapshot and disk write may overlap pipeline creation; only the generation
+/// sampled before extraction is acknowledged when the worker finishes.
+fn pipelineCacheSaveSource(self: *Renderer) pipeline_cache_save.Source {
+    return .{
+        .device = self.device,
+        .cache = self.driver_pipeline_cache,
+        .get_data = self.device_functions.get_pipeline_cache_data,
+        .generation = self.pipeline_cache_generation.load(.acquire),
+        .maximum_bytes = maximum_pipeline_cache_bytes,
+        .directory = .cwd(),
+        .path = pipeline_cache_path,
+    };
+}
+
 fn savePipelineCacheBytes(self: *Renderer) void {
-    const generation = self.pipeline_cache_generation.load(.acquire);
-    if (generation == self.persisted_pipeline_cache_generation) return;
-    var data_size: usize = 0;
-    if (self.device_functions.get_pipeline_cache_data(self.device, self.driver_pipeline_cache, &data_size, null) != vk.success) {
-        return;
-    }
-    if (data_size == 0) return;
-    if (data_size > maximum_pipeline_cache_bytes) {
-        std.debug.print("[vulkan cache] persistence skipped: {d} MiB exceeds {d} MiB limit\n", .{ data_size / (1024 * 1024), maximum_pipeline_cache_bytes / (1024 * 1024) });
-        return;
-    }
-    const bytes = self.allocator.alloc(u8, data_size) catch return;
-    defer self.allocator.free(bytes);
-    if (self.device_functions.get_pipeline_cache_data(self.device, self.driver_pipeline_cache, &data_size, bytes.ptr) != vk.success) {
-        return;
-    }
-    var threaded = std.Io.Threaded.init(self.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    const file = std.Io.Dir.cwd().createFile(io, pipeline_cache_path, .{ .truncate = true }) catch return;
-    defer file.close(io);
-    file.writePositionalAll(io, bytes, 0) catch return;
-    // A compiler worker may finish another pipeline while this snapshot is
-    // being written. Retain the sampled generation so that work is saved next.
-    self.persisted_pipeline_cache_generation = generation;
-    if (data_size > 256 * 1024 * 1024)
-        std.debug.print("[vulkan cache] persisted {d} MiB driver pipeline cache\n", .{data_size / (1024 * 1024)});
+    _ = self.pipeline_cache_saver.request(pipelineCacheSaveSource(self));
 }
 
 const GuestBufferEntry = struct {
@@ -3478,9 +3465,9 @@ pub const Renderer = struct {
     uniform_specialization_cache_enabled: bool = true,
     /// Diagnostic switch for comparing the transient and resident upload paths.
     reuse_color_target_transfer: bool = true,
-    /// Compilation can finish on worker threads; only the render thread saves.
+    /// Workers publish new pipelines; the render thread schedules persistence.
     pipeline_cache_generation: std.atomic.Value(u64) = .init(0),
-    persisted_pipeline_cache_generation: u64 = 0,
+    pipeline_cache_saver: pipeline_cache_save.Saver = .{},
     persistent_host_mappings: bool = true,
     persistent_depth_passes: bool = true,
     gpu_feedback_snapshots: bool = true,
@@ -4205,7 +4192,7 @@ pub const Renderer = struct {
         self.gds_storage.deinit(self.allocator);
         // Persist compiled pipelines for the next run before the cache handle
         // is destroyed.
-        savePipelineCacheBytes(self);
+        self.pipeline_cache_saver.finish(pipelineCacheSaveSource(self));
         self.device_functions.destroy_pipeline_cache(self.device, self.driver_pipeline_cache, null);
         if (self.detile_pipeline != 0) self.device_functions.destroy_pipeline(self.device, self.detile_pipeline, null);
         if (self.detile_shader != 0) self.device_functions.destroy_shader_module(self.device, self.detile_shader, null);

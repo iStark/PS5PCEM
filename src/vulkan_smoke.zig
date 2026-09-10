@@ -4561,17 +4561,25 @@ fn runPipelineCacheProbe(allocator: std.mem.Allocator) !void {
     _ = try renderer.smokeTest();
     renderer.flip_callbacks = 1;
     try std.testing.expect(backend.vtable.flip.?(backend.context, flip));
+    const first_generation = renderer.pipeline_cache_generation.load(.acquire);
+    // Pipeline creation remains valid while the independent writer extracts
+    // the default, internally synchronized driver cache.
+    _ = try renderer.smokeTest();
+    renderer.pipeline_cache_saver.join();
+    try std.testing.expectEqual(first_generation, renderer.pipeline_cache_saver.persisted_generation);
     const first_write = try pipelineCacheTimestamp(io);
-    // The periodic save point must not rewrite an unchanged driver cache.
+    // The newer generation must still be dirty after joining the older save.
     renderer.flip_callbacks = 127;
     try std.testing.expect(backend.vtable.flip.?(backend.context, flip));
-    try std.testing.expectEqual(first_write, try pipelineCacheTimestamp(io));
-    // Creating a pipeline after that save must make the next snapshot dirty.
-    _ = try renderer.smokeTest();
+    renderer.pipeline_cache_saver.join();
+    const second_write = try pipelineCacheTimestamp(io);
+    try std.testing.expect(first_write != second_write);
+    // A periodic request must not rewrite the now unchanged cache.
     renderer.flip_callbacks = 255;
     try std.testing.expect(backend.vtable.flip.?(backend.context, flip));
-    try std.testing.expect(first_write != try pipelineCacheTimestamp(io));
-    std.debug.print("pipeline cache persistence passed: stable cache keeps its timestamp; later compilation is saved\n", .{});
+    renderer.pipeline_cache_saver.join();
+    try std.testing.expectEqual(second_write, try pipelineCacheTimestamp(io));
+    std.debug.print("pipeline cache persistence passed: background snapshot, concurrent compilation, later generation saved and unchanged cache preserved\n", .{});
 }
 
 fn runIntegerColorProbe(allocator: std.mem.Allocator) !void {
