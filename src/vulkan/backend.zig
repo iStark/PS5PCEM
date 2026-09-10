@@ -848,6 +848,64 @@ const maximum_depth_targets = 16;
 // A streamed material can combine a 3996-entry texture table with hundreds
 // of additional views. The device limits below still cap each bank.
 const maximum_sampled_images = 8192;
+
+pub var linear_sampled_descriptor_lookup = std.atomic.Value(bool).init(true);
+
+fn sampledImageDescriptorBindings(mappings: []const gpu.ShaderSpirvSampledImageBinding, bindings: []u32) void {
+    @memset(bindings, std.math.maxInt(u32));
+    if (linear_sampled_descriptor_lookup.load(.monotonic)) {
+        // Many instructions name the same physical image. Recover each slot
+        // once instead of rescanning the entire mapping table for every image.
+        for (mappings) |mapping| {
+            if (mapping.unbound or mapping.descriptor_index >= bindings.len) continue;
+            const slot = &bindings[mapping.descriptor_index];
+            if (slot.* != std.math.maxInt(u32)) continue;
+            slot.* = sampledImageDescriptorBinding(mapping.dimension);
+        }
+    } else {
+        for (bindings, 0..) |*slot, index| {
+            for (mappings) |mapping| {
+                if (mapping.unbound or mapping.descriptor_index != index) continue;
+                slot.* = sampledImageDescriptorBinding(mapping.dimension);
+                break;
+            }
+        }
+    }
+}
+
+fn sampledImageDescriptorBinding(dimension: rdna2.spirv.SampledImageDimension) u32 {
+    return switch (dimension) {
+        .two_d => rdna2.spirv.sampled_image_2d_descriptor_binding,
+        .three_d => sampled_image_3d_descriptor_binding,
+        .cube => sampled_image_cube_descriptor_binding,
+        .two_d_array => sampled_image_2d_array_descriptor_binding,
+    };
+}
+
+test "sampled descriptor lookup preserves physical slots across repeated instruction mappings" {
+    const mappings = [_]gpu.ShaderSpirvSampledImageBinding{
+        .{ .resource_sgpr = 0, .sampler_sgpr = 0, .descriptor_index = 2, .dimension = .cube, .unbound = true },
+        .{ .resource_sgpr = 8, .sampler_sgpr = 16, .descriptor_index = 3, .dimension = .two_d_array },
+        .{ .resource_sgpr = 24, .sampler_sgpr = 16, .descriptor_index = 0, .dimension = .two_d },
+        .{ .resource_sgpr = 32, .sampler_sgpr = 16, .descriptor_index = 2, .dimension = .three_d },
+        .{ .resource_sgpr = 32, .sampler_sgpr = 16, .descriptor_index = 2, .dimension = .three_d, .instruction_pc = 64 },
+        .{ .resource_sgpr = 40, .sampler_sgpr = 16, .descriptor_index = 1, .dimension = .cube },
+        .{ .resource_sgpr = 0, .sampler_sgpr = 0, .descriptor_index = std.math.maxInt(u32), .unbound = true },
+    };
+    const previous = linear_sampled_descriptor_lookup.load(.monotonic);
+    defer linear_sampled_descriptor_lookup.store(previous, .monotonic);
+    for ([_]bool{ false, true }) |linear| {
+        linear_sampled_descriptor_lookup.store(linear, .monotonic);
+        var bindings: [5]u32 = undefined;
+        sampledImageDescriptorBindings(&mappings, &bindings);
+        try std.testing.expectEqualSlices(u32, &.{ 1, 36, 35, 37, std.math.maxInt(u32) }, &bindings);
+        // A later call may change the dimension of a physical slot. No state
+        // from the previous descriptor set may survive that change.
+        sampledImageDescriptorBindings(mappings[3..4], &bindings);
+        try std.testing.expectEqualSlices(u32, &.{ std.math.maxInt(u32), std.math.maxInt(u32), 35, std.math.maxInt(u32), std.math.maxInt(u32) }, &bindings);
+    }
+}
+
 // One physical texture can occur at many sampling instructions in a material.
 const maximum_compute_sampled_mappings = 16384;
 // Keep cross-draw retention independent of a shader's descriptor limit.
@@ -17156,15 +17214,10 @@ pub const Renderer = struct {
         if (images.len == 0) return;
         var image_infos: [maximum_sampled_images]vk.DescriptorImageInfo = undefined;
         var writes: [maximum_sampled_images]vk.WriteDescriptorSet = undefined;
+        var bindings: [maximum_sampled_images]u32 = undefined;
+        sampledImageDescriptorBindings(mappings, bindings[0..images.len]);
         for (images, 0..) |prepared, index| {
-            var physical_mapping: ?gpu.ShaderSpirvSampledImageBinding = null;
-            for (mappings) |mapping| {
-                if (mapping.unbound) continue;
-                if (mapping.descriptor_index != @as(u32, @intCast(index))) continue;
-                physical_mapping = mapping;
-                break;
-            }
-            const mapping = physical_mapping orelse unreachable;
+            std.debug.assert(bindings[index] != std.math.maxInt(u32));
             image_infos[index] = .{
                 .sampler = prepared.sampler,
                 .image_view = prepared.view,
@@ -17172,13 +17225,8 @@ pub const Renderer = struct {
             };
             writes[index] = .{
                 .destination_set = self.descriptor_set,
-                .destination_binding = switch (mapping.dimension) {
-                    .two_d => rdna2.spirv.sampled_image_2d_descriptor_binding,
-                    .three_d => sampled_image_3d_descriptor_binding,
-                    .cube => sampled_image_cube_descriptor_binding,
-                    .two_d_array => sampled_image_2d_array_descriptor_binding,
-                },
-                .destination_array_element = mapping.descriptor_index,
+                .destination_binding = bindings[index],
+                .destination_array_element = @intCast(index),
                 .descriptor_count = 1,
                 .descriptor_type = vk.descriptor_type_combined_image_sampler,
                 .image_info = @ptrCast(&image_infos[index]),
