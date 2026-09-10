@@ -3593,6 +3593,18 @@ fn runQueuedBufferReuseProbe(allocator: std.mem.Allocator, use_waits: bool, reta
     const pending_before = renderer.pending_command_buffers.items.len;
     const submitted_before = renderer.submitted_tick;
     try std.testing.expect(pending_before != 0);
+    if (device_budget == 0) {
+        // A host-visible buffer with no queued users can be read without
+        // submitting the unrelated source/destination copy. This also covers
+        // reads outside a rotating descriptor slot; no descriptor is updated.
+        var ready_result: [16]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(0x2000, &ready_result);
+        try std.testing.expectEqual(@as(u32, 0x1122_3344), std.mem.readInt(u32, ready_result[0..4], .little));
+        if (use_waits) {
+            try std.testing.expectEqual(submitted_before, renderer.submitted_tick);
+            try std.testing.expectEqual(pending_before, renderer.pending_command_buffers.items.len);
+        }
+    }
     renderer.current_descriptor_slot = 1;
     renderer.descriptor_set = renderer.descriptor_sets[1];
     guest.word(0x2000, 0xdead_beef);

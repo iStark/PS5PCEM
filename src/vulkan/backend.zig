@@ -3486,6 +3486,8 @@ pub const Renderer = struct {
     gpu_feedback_snapshots: bool = true,
     storage_buffer_use_waits: bool = true,
     retain_clean_storage_buffers: bool = false,
+    /// Diagnostic control for comparing readback waits independently of uploads.
+    storage_buffer_read_use_waits: bool = true,
     storage_buffer_cache_budget_bytes: usize = 4 * 1024 * 1024 * 1024,
     device_storage_budget_bytes: usize = 0,
 
@@ -4764,7 +4766,16 @@ pub const Renderer = struct {
     }
 
     fn readStorageBacking(self: *Renderer, entry: *GuestBufferEntry, destination: []u8) (Error || std.mem.Allocator.Error)!void {
-        const transfer = entry.host_transfer orelse return self.readMapped(entry.device_local, destination);
+        const transfer = entry.host_transfer orelse {
+            if (!self.storage_buffer_read_use_waits) return self.readMapped(entry.device_local, destination);
+            // Reading this allocation does not update a descriptor set. Wait
+            // for its last GPU use while leaving unrelated commands queued.
+            try self.waitForStorageBufferUse(entry);
+            const mapping = try self.mapBufferRange(entry.device_local, 0, destination.len);
+            defer mapping.release(self);
+            @memcpy(destination, mapping.bytes);
+            return;
+        };
         if (destination.len == 0) return;
         if (destination.len > entry.size) return Error.MemoryMapFailed;
         // A prefix can end between dwords. Copy its containing word only into
@@ -19253,6 +19264,14 @@ pub const Renderer = struct {
         if (!self.storage_buffer_use_waits or self.current_descriptor_slot == null) {
             // The standalone staging API reuses one descriptor set. Updating
             // that set itself requires completion, even for an unused buffer.
+            self.frame_profile.storage_buffer_waits += 1;
+            return self.waitForSubmittedWork();
+        }
+        return self.waitForStorageBufferUse(entry);
+    }
+
+    fn waitForStorageBufferUse(self: *Renderer, entry: *const GuestBufferEntry) Error!void {
+        if (!self.storage_buffer_use_waits) {
             self.frame_profile.storage_buffer_waits += 1;
             return self.waitForSubmittedWork();
         }
