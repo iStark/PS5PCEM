@@ -7104,9 +7104,60 @@ fn runWorkgroupImageTableProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("workgroup image table passed: shifted group IDs, 440-byte records, unreachable descriptor-like fields and per-group colors\n", .{});
 }
 
+fn runHighHalfStoreProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    for ([_]usize{ 1, 2 }, 0..) |width, case_index| {
+        const program_address: u32 = @intCast(0x800 + case_index * 256);
+        const code = [_]u32{
+            0xe030_2000,                                  0x8000_0100, // load input[lane] into v1
+            if (width == 1) 0xe064_2001 else 0xe06c_2001,
+            0x8001_0100, // store v1 high byte/halfword at output[lane] + 1
+            0xbf81_0000,
+        };
+        for (code, 0..) |word, index| guest.word(program_address + index * 4, word);
+        var state = gpu.State{};
+        const compute = gpu.resources.ShaderStage.compute;
+        try state.writeRegister(.shader, compute.programRegisterBase(), program_address >> 8);
+        try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+        try state.writeRegister(.shader, 0x213, 8 << 1);
+        try state.writeRegister(.shader, 0x207, 64);
+        try state.writeRegister(.shader, 0x208, 1);
+        try state.writeRegister(.shader, 0x209, 1);
+        const descriptors = [_]u32{ 0x4000, 4 << 16, 64, 0, 0x5000, @as(u32, @intCast(width)) << 16, @intCast(256 / width), 0 };
+        for (descriptors, 0..) |word, index|
+            try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+        var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(guest.interface()), .allocator = allocator };
+        for (0..2) |pass| {
+            @memset(guest.bytes[0x5000..0x5100], 0x5a);
+            var expected: [256]u8 = @splat(0x5a);
+            for (0..64) |lane| {
+                const value = @as(u32, 0x89ab_cdef) +% (@as(u32, @intCast(lane + pass * 71)) *% 0x0103_070b);
+                guest.word(0x4000 + lane * 4, value);
+                for (0..width) |byte|
+                    expected[1 + lane * width + byte] = @truncate(value >> @as(u5, @intCast(16 + byte * 8)));
+            }
+            const before = renderer.translated_dispatches;
+            const cache_hits = renderer.pipeline_cache_hits;
+            _ = try executor.execute(&.{ command(gpu.pm4.dispatch_direct, 4), 1, 1, 1, 0x41 });
+            if (renderer.last_dispatch_error) |err| return err;
+            try renderer.flushPendingGuestWrites();
+            try std.testing.expectEqual(before + 1, renderer.translated_dispatches);
+            if (pass != 0) try std.testing.expectEqual(cache_hits + 1, renderer.pipeline_cache_hits);
+            try std.testing.expectEqualSlices(u8, &expected, guest.bytes[0x5000..0x5100]);
+        }
+    }
+    std.debug.print("high-half stores passed: 64 adjacent lanes, unaligned byte/halfword writes, guards and changed inputs on cache hits\n", .{});
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--high-half-stores")) {
+        try runHighHalfStoreProbe(allocator);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--dispatcher-budget")) {
         try runDispatcherBudgetProbe(allocator);
         return;

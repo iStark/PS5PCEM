@@ -9054,7 +9054,7 @@ const Builder = struct {
     fn bufferStoreSubword(self: *Builder, inst: instruction.Instruction, width: u8) Error!void {
         if (!try self.hasBufferStorage(inst)) return;
         const raw_value = try self.source(inst.dst, .bits32);
-        const value = if (inst.opcode == .buffer_store_short_d16_hi)
+        const value = if (inst.opcode == .buffer_store_short_d16_hi or inst.opcode == .buffer_store_byte_d16_hi)
             try self.shiftRightBits(raw_value, 16)
         else
             raw_value;
@@ -9730,7 +9730,7 @@ const Builder = struct {
             .s_buffer_load_dwordx8 => try self.scalarBufferLoadWords(inst, 8),
             .s_buffer_load_dwordx16 => try self.scalarBufferLoadWords(inst, 16),
             .s_load_dword, .s_load_dwordx2, .s_load_dwordx4, .s_load_dwordx8, .s_load_dwordx16 => try self.scalarPointerLoadWords(inst),
-            .buffer_store_byte => try self.bufferStoreSubword(inst, 8),
+            .buffer_store_byte, .buffer_store_byte_d16_hi => try self.bufferStoreSubword(inst, 8),
             .buffer_store_short, .buffer_store_short_d16_hi => try self.bufferStoreSubword(inst, 16),
             .buffer_store_format_d16_x => try self.bufferStoreFormatD16(inst, 1),
             .buffer_store_format_d16_hi_x => try self.bufferStoreFormatD16(inst, 1),
@@ -11088,6 +11088,7 @@ fn opcodeUsesWritePredicate(opcode: isa.Opcode) bool {
     return switch (opcode) {
         .buffer_store_byte,
         .buffer_store_short,
+        .buffer_store_byte_d16_hi,
         .buffer_store_short_d16_hi,
         .buffer_store_dword,
         .buffer_store_dwordx2,

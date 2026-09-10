@@ -39,6 +39,7 @@ fn mubufInfo(id: u32) ?MemoryInfo {
         0x0e => .{ .opcode = .buffer_load_dwordx4, .words = 4 },
         0x0f => .{ .opcode = .buffer_load_dwordx3, .words = 3 },
         0x18 => .{ .opcode = .buffer_store_byte, .bits = 8 },
+        0x19 => .{ .opcode = .buffer_store_byte_d16_hi, .bits = 8 },
         0x1a => .{ .opcode = .buffer_store_short, .bits = 16 },
         0x1b => .{ .opcode = .buffer_store_short_d16_hi, .bits = 16 },
         0x1c => .{ .opcode = .buffer_store_dword },
@@ -733,6 +734,18 @@ test "MUBUF formatted high-half store decodes the Yotei output write" {
     try std.testing.expectEqual(@as(u32, 0), inst.dst.reg);
     try std.testing.expectEqual(@as(u32, 7), inst.src0.reg);
     try std.testing.expectEqual(@as(u32, 4), inst.src1.reg);
+}
+
+test "MUBUF byte high-half store decodes the hull shader output write" {
+    const inst = try decodeMubuf(0x105c, &.{ 0xe064_6000, 0x8004_1707 }, 0);
+    try std.testing.expectEqual(isa.Opcode.buffer_store_byte_d16_hi, inst.opcode);
+    try std.testing.expect(inst.index_enable and inst.globally_coherent);
+    try std.testing.expect(!inst.formatted and !inst.offset_enable);
+    try std.testing.expectEqual(@as(u8, 8), inst.data_bits);
+    try std.testing.expectEqual(@as(u8, 1), inst.data_words);
+    try std.testing.expectEqual(@as(u32, 23), inst.dst.reg);
+    try std.testing.expectEqual(@as(u32, 7), inst.src0.reg);
+    try std.testing.expectEqual(@as(u32, 16), inst.src1.reg);
 }
 
 test "truncated EXP is rejected" {
