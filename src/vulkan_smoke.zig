@@ -7154,6 +7154,12 @@ fn runHighHalfStoreProbe(allocator: std.mem.Allocator) !void {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--tessellation-inputs")) {
+        var renderer = try vulkan.Renderer.init(allocator, .{});
+        defer renderer.deinit();
+        try renderer.probeTessellationInputs();
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--high-half-stores")) {
         try runHighHalfStoreProbe(allocator);
         return;

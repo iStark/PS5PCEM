@@ -226,6 +226,20 @@ pub const ComputeInputs = struct {
     local_invocation_id_components: u2 = 0,
 };
 
+/// A domain shader uses the ordinary position/parameter export path, with
+/// hardware tessellator coordinates and patch IDs instead of vertex IDs.
+pub const TessellationInputs = struct {
+    domain: enum(u32) { triangles = 22, quads = 24, isolines = 25 },
+    spacing: enum(u32) { equal = 1, fractional_even = 2, fractional_odd = 3 },
+    order: enum(u32) { clockwise = 4, counter_clockwise = 5 },
+    coordinate_vgprs: [2]u8,
+    relative_patch_vgpr: u8,
+    patch_id_vgpr: u8,
+    patches_per_group: u8,
+    offchip_offset_sgpr: ?u7 = null,
+    offchip_group_bytes: u32 = 0,
+};
+
 /// One export reconstructed from the LDS record written by a PS5 NGG export
 /// program.  On that ABI `S_SETPC_B64 s[6:7]` enters a hardware epilogue which
 /// reads the record and performs the ordinary POS/PARAM exports.  Vulkan has
@@ -305,6 +319,7 @@ pub const Options = struct {
     /// shader starts. Other graphics system values remain explicit future
     /// stage-interface work rather than silently receiving zero.
     vertex_index_vgpr: ?u8 = null,
+    tessellation_inputs: ?TessellationInputs = null,
     /// Converts a guest -W..W position export to Vulkan's 0..W clip-depth
     /// convention. Leave clear when PA_CL_CLIP_CNTL selects DX clip space.
     convert_negative_one_to_one_depth: bool = false,
@@ -719,6 +734,9 @@ const Builder = struct {
     label: u32,
     stage: Stage,
     vertex_index_vgpr: ?u8,
+    tessellation_inputs: ?TessellationInputs,
+    tess_coord_input: u32 = 0,
+    patch_id_input: u32 = 0,
     convert_negative_one_to_one_depth: bool,
     vertex_index_input: u32 = 0,
     instance_index_input: u32 = 0,
@@ -866,6 +884,7 @@ const Builder = struct {
             .label = 0,
             .stage = options.stage,
             .vertex_index_vgpr = options.vertex_index_vgpr,
+            .tessellation_inputs = options.tessellation_inputs,
             .convert_negative_one_to_one_depth = options.convert_negative_one_to_one_depth,
             .color_export_mappings = options.color_export_mappings,
             .color_export_types = options.color_export_types,
@@ -962,6 +981,12 @@ const Builder = struct {
         if (options.vertex_index_vgpr != null and options.stage != .vertex) {
             return Error.InvalidStageInterface;
         }
+        if (options.tessellation_inputs) |tess| {
+            if (options.stage != .vertex or options.vertex_index_vgpr != null or
+                tess.patches_per_group == 0 or
+                (tess.offchip_offset_sgpr != null and tess.offchip_group_bytes == 0))
+                return Error.InvalidStageInterface;
+        }
         if (options.compute_inputs != null and options.stage != .compute) return Error.InvalidStageInterface;
         switch (options.stage) {
             .vertex => {
@@ -987,6 +1012,20 @@ const Builder = struct {
                     try self.emit(&self.declarations, 59, &.{ output_pointer, variable, 3 }); // OpVariable
                 }
 
+                if (options.tessellation_inputs != null) {
+                    self.vector3_type = self.id();
+                    const coord_pointer = self.id();
+                    const patch_pointer = self.id();
+                    self.tess_coord_input = self.id();
+                    self.patch_id_input = self.id();
+                    try self.emit(&self.annotations, 71, &.{ self.tess_coord_input, 11, 13 }); // TessCoord
+                    try self.emit(&self.annotations, 71, &.{ self.patch_id_input, 11, 7 }); // PrimitiveId
+                    try self.emit(&self.declarations, 23, &.{ self.vector3_type, self.float_type, 3 });
+                    try self.emit(&self.declarations, 32, &.{ coord_pointer, 1, self.vector3_type });
+                    try self.emit(&self.declarations, 32, &.{ patch_pointer, 1, self.bits_type });
+                    try self.emit(&self.declarations, 59, &.{ coord_pointer, self.tess_coord_input, 1 });
+                    try self.emit(&self.declarations, 59, &.{ patch_pointer, self.patch_id_input, 1 });
+                }
                 if (options.vertex_index_vgpr != null) {
                     const input_pointer = self.id();
                     self.vertex_index_input = self.id();
@@ -4335,6 +4374,33 @@ const Builder = struct {
             try self.emit(&self.body, 62, &.{ self.position_output, zero_vector });
             for (self.parameter_variables) |variable| {
                 if (variable != 0) try self.emit(&self.body, 62, &.{ variable, zero_vector });
+            }
+        }
+        if (self.tessellation_inputs) |tess| {
+            const coord = self.id();
+            const patch = self.id();
+            try self.emit(&self.body, 61, &.{ self.vector3_type, coord, self.tess_coord_input });
+            try self.emit(&self.body, 61, &.{ self.bits_type, patch, self.patch_id_input });
+            for (tess.coordinate_vgprs, 0..) |vgpr, component| {
+                const value = self.id();
+                try self.emit(&self.body, 81, &.{ self.float_type, value, coord, @intCast(component) });
+                self.registers[128 + @as(usize, vgpr)] = .{
+                    .id = try self.convert(.{ .id = value, .value_type = .float32 }, .bits32),
+                    .value_type = .bits32,
+                };
+            }
+            const patches = try self.constant(.bits32, tess.patches_per_group);
+            const relative = self.id();
+            try self.emit(&self.body, 137, &.{ self.bits_type, relative, patch, patches }); // UMod
+            self.registers[128 + @as(usize, tess.relative_patch_vgpr)] = .{ .id = relative, .value_type = .bits32 };
+            self.registers[128 + @as(usize, tess.patch_id_vgpr)] = .{ .id = patch, .value_type = .bits32 };
+            if (tess.offchip_offset_sgpr) |sgpr| {
+                const group = self.id();
+                try self.emit(&self.body, 134, &.{ self.bits_type, group, patch, patches }); // UDiv
+                self.registers[sgpr] = .{
+                    .id = try self.multiplyBits(group, try self.constant(.bits32, tess.offchip_group_bytes)),
+                    .value_type = .bits32,
+                };
             }
         }
         if (self.vertex_index_input != 0) {
@@ -10956,6 +11022,7 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
         0,
     });
     try appendInstruction(allocator, &words, 17, &.{1}); // OpCapability Shader
+    if (options.tessellation_inputs != null) try appendInstruction(allocator, &words, 17, &.{3}); // Tessellation
     if (builder.uses_nonuniform_sampled_images or builder.uses_nonuniform_storage_buffers) {
         try appendInstruction(allocator, &words, 17, &.{5301}); // ShaderNonUniform
     }
@@ -11032,7 +11099,7 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     try appendInstruction(allocator, &words, 14, &.{ 0, 1 }); // OpMemoryModel Logical GLSL450
     var entry_point: std.ArrayList(u32) = .empty;
     defer entry_point.deinit(allocator);
-    try entry_point.appendSlice(allocator, &.{ @intFromEnum(options.stage), builder.main_function, 0x6e69_616d, 0 });
+    try entry_point.appendSlice(allocator, &.{ if (options.tessellation_inputs != null) 2 else @intFromEnum(options.stage), builder.main_function, 0x6e69_616d, 0 });
     if (builder.storage_array != 0) try entry_point.append(allocator, builder.storage_array);
     if (builder.scalar_buffer != 0) try entry_point.append(allocator, builder.scalar_buffer);
     if (builder.gds_memory != 0) try entry_point.append(allocator, builder.gds_memory);
@@ -11054,6 +11121,8 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     if (builder.local_invocation_id_input != 0) try entry_point.append(allocator, builder.local_invocation_id_input);
     if (builder.vertex_index_input != 0) try entry_point.append(allocator, builder.vertex_index_input);
     if (builder.instance_index_input != 0) try entry_point.append(allocator, builder.instance_index_input);
+    if (builder.tess_coord_input != 0) try entry_point.append(allocator, builder.tess_coord_input);
+    if (builder.patch_id_input != 0) try entry_point.append(allocator, builder.patch_id_input);
     if (builder.frag_coord_input != 0) try entry_point.append(allocator, builder.frag_coord_input);
     if (builder.front_face_input != 0) try entry_point.append(allocator, builder.front_face_input);
     for (builder.barycentric_inputs) |variable| if (variable != 0) {
@@ -11071,6 +11140,11 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
         .fragment => try appendInstruction(allocator, &words, 16, &.{ builder.main_function, 7 }),
         .compute => try appendInstruction(allocator, &words, 16, &.{ builder.main_function, 17, options.local_size[0], options.local_size[1], options.local_size[2] }),
         .vertex => {},
+    }
+    if (options.tessellation_inputs) |tess| {
+        try appendInstruction(allocator, &words, 16, &.{ builder.main_function, @intFromEnum(tess.domain) });
+        try appendInstruction(allocator, &words, 16, &.{ builder.main_function, @intFromEnum(tess.spacing) });
+        try appendInstruction(allocator, &words, 16, &.{ builder.main_function, @intFromEnum(tess.order) });
     }
     try words.appendSlice(allocator, builder.annotations.items);
     try words.appendSlice(allocator, builder.declarations.items);

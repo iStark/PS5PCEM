@@ -188,6 +188,8 @@ pub const memory_property_device_local_bit: Flags = 0x0000_0001;
 pub const pipeline_bind_point_compute: u32 = 1;
 pub const pipeline_bind_point_graphics: u32 = 0;
 pub const shader_stage_vertex_bit: Flags = 0x0000_0001;
+pub const shader_stage_tessellation_control_bit: Flags = 0x0000_0002;
+pub const shader_stage_tessellation_evaluation_bit: Flags = 0x0000_0004;
 pub const shader_stage_geometry_bit: Flags = 0x0000_0008;
 pub const shader_stage_fragment_bit: Flags = 0x0000_0010;
 pub const shader_stage_compute_bit: Flags = 0x0000_0020;
@@ -411,6 +413,7 @@ pub const feature_robust_buffer_access: usize = 0;
 pub const feature_image_cube_array: usize = 2;
 pub const feature_independent_blend: usize = 3;
 pub const feature_geometry_shader: usize = 4;
+pub const feature_tessellation_shader: usize = 5;
 pub const feature_vertex_pipeline_stores_and_atomics: usize = 25;
 pub const feature_fragment_stores_and_atomics: usize = 26;
 pub const feature_shader_image_gather_extended: usize = 28;
@@ -963,6 +966,13 @@ pub const PipelineDepthStencilStateCreateInfo = extern struct {
     back: StencilOperationState = .{},
     minimum_depth_bounds: f32 = 0,
     maximum_depth_bounds: f32 = 1,
+};
+
+pub const PipelineTessellationStateCreateInfo = extern struct {
+    s_type: u32 = 21,
+    p_next: ?*const anyopaque = null,
+    flags: Flags = 0,
+    patch_control_points: u32,
 };
 
 pub const GraphicsPipelineCreateInfo = extern struct {

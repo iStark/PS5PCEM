@@ -23,6 +23,7 @@ const image_state = @import("image_state.zig");
 const pipeline_compiler = @import("pipeline_compiler.zig");
 const pipeline_cache_save = @import("pipeline_cache_save.zig");
 const spirv_cache = @import("spirv_cache.zig");
+const tessellation_spirv = @import("tessellation_spirv.zig");
 const sampled_lookup_plan = @import("sampled_lookup_plan.zig");
 
 /// Set to true to enable verbose per-frame GPU debug logging.
@@ -905,7 +906,6 @@ test "sampled descriptor lookup preserves physical slots across repeated instruc
         try std.testing.expectEqualSlices(u32, &.{ std.math.maxInt(u32), std.math.maxInt(u32), 35, std.math.maxInt(u32), std.math.maxInt(u32) }, &bindings);
     }
 }
-
 // One physical texture can occur at many sampling instructions in a material.
 const maximum_compute_sampled_mappings = 16384;
 // Keep cross-draw retention independent of a shader's descriptor limit.
@@ -1054,6 +1054,9 @@ const GraphicsPipelineState = extern struct {
     /// that stage forwards belong in the key, because they change the pipeline.
     rectangle_completion: u32,
     rectangle_parameter_mask: u32,
+    tessellation_control_points: u32 = 0,
+    tessellation_factor_slot: u32 = 0,
+    tessellation_domain: u32 = 0,
     /// Vulkan sample-count flag for the pass. Colour and depth attachments of
     /// one draw share this value.
     rasterization_samples: u32,
@@ -3244,6 +3247,7 @@ pub const Renderer = struct {
     loader_api_version: u32,
     device_info: DeviceInfo,
     geometry_shaders_available: bool,
+    tessellation_shaders_available: bool,
     cube_arrays_available: bool,
     shader_float64_available: bool,
     image_float32_atomic_min_max_available: bool,
@@ -3768,6 +3772,8 @@ pub const Renderer = struct {
         // that the corner it leaves out can be completed from the three it
         // gives. Without the feature those draws keep their single triangle.
         const geometry_shaders = supported_features.values[vk.feature_geometry_shader] != 0;
+        const tessellation_shaders = supported_features.values[vk.feature_tessellation_shader] != 0;
+        if (tessellation_shaders) enabled_features.values[vk.feature_tessellation_shader] = vk.true_value;
         if (geometry_shaders) {
             enabled_features.values[vk.feature_geometry_shader] = vk.true_value;
         }
@@ -3929,6 +3935,13 @@ pub const Renderer = struct {
         if (descriptor_partially_bound) {
             @memset(&descriptor_binding_flags, vk.descriptor_binding_partially_bound_bit);
         }
+        if (tessellation_shaders) {
+            for (&descriptor_bindings) |*binding| {
+                if (binding.stage_flags & vk.shader_stage_vertex_bit != 0)
+                    binding.stage_flags |= vk.shader_stage_tessellation_evaluation_bit;
+            }
+            descriptor_bindings[0].stage_flags |= vk.shader_stage_tessellation_control_bit;
+        }
         const descriptor_binding_flags_info = vk.DescriptorSetLayoutBindingFlagsCreateInfo{
             .binding_count = descriptor_binding_flags.len,
             .binding_flags = &descriptor_binding_flags,
@@ -4065,6 +4078,7 @@ pub const Renderer = struct {
             .loader_api_version = loader_api_version,
             .device_info = candidate.info,
             .geometry_shaders_available = geometry_shaders,
+            .tessellation_shaders_available = tessellation_shaders,
             .cube_arrays_available = cube_arrays,
             .shader_float64_available = shader_float64,
             .image_float32_atomic_min_max_available = image_float32_atomic_min_max,
@@ -9813,6 +9827,21 @@ pub const Renderer = struct {
         defer self.device_functions.destroy_shader_module(self.device, vertex, null);
         const fragment = try self.createShader(fragment_words);
         defer self.device_functions.destroy_shader_module(self.device, fragment, null);
+        const tessellated = pipeline_state.tessellation_control_points != 0;
+        var tess_vertex: vk.ShaderModule = 0;
+        var tess_control: vk.ShaderModule = 0;
+        defer if (tess_vertex != 0) self.device_functions.destroy_shader_module(self.device, tess_vertex, null);
+        defer if (tess_control != 0) self.device_functions.destroy_shader_module(self.device, tess_control, null);
+        if (tessellated) {
+            if (!self.tessellation_shaders_available or pipeline_state.rectangle_completion != 0 or
+                pipeline_state.tessellation_control_points > 32 or pipeline_state.tessellation_domain > 2)
+                return Error.UnsupportedGraphicsState;
+            tess_vertex = try self.createShader(&tessellation_spirv.vertex);
+            const words = tessellation_spirv.control(self.allocator, pipeline_state.tessellation_factor_slot, @enumFromInt(pipeline_state.tessellation_domain)) catch
+                return Error.ShaderModuleCreationFailed;
+            defer self.allocator.free(words);
+            tess_control = try self.createShader(words);
+        }
         var geometry: vk.ShaderModule = 0;
         defer if (geometry != 0) self.device_functions.destroy_shader_module(self.device, geometry, null);
         if (pipeline_state.rectangle_completion != 0) {
@@ -9825,17 +9854,25 @@ pub const Renderer = struct {
             if (self.dump_graphics_spirv) dumpGraphicsSpirv(self.allocator, "gs", pipeline_state.rectangle_parameter_mask, geometry_words);
             geometry = try self.createShader(geometry_words);
         }
-        var stage_storage = [_]vk.PipelineShaderStageCreateInfo{
-            .{ .stage = vk.shader_stage_vertex_bit, .module = vertex, .name = "main" },
-            .{ .stage = vk.shader_stage_geometry_bit, .module = geometry, .name = "main" },
-            .{ .stage = vk.shader_stage_fragment_bit, .module = fragment, .name = "main" },
-        };
-        if (geometry == 0) stage_storage[1] = stage_storage[2];
-        const stages = stage_storage[0..if (geometry == 0) 2 else 3];
+        var stage_storage: [4]vk.PipelineShaderStageCreateInfo = undefined;
+        stage_storage[0] = .{ .stage = vk.shader_stage_vertex_bit, .module = if (tessellated) tess_vertex else vertex, .name = "main" };
+        var stage_count: usize = 1;
+        if (tessellated) {
+            stage_storage[1] = .{ .stage = vk.shader_stage_tessellation_control_bit, .module = tess_control, .name = "main" };
+            stage_storage[2] = .{ .stage = vk.shader_stage_tessellation_evaluation_bit, .module = vertex, .name = "main" };
+            stage_count = 3;
+        } else if (geometry != 0) {
+            stage_storage[1] = .{ .stage = vk.shader_stage_geometry_bit, .module = geometry, .name = "main" };
+            stage_count = 2;
+        }
+        stage_storage[stage_count] = .{ .stage = vk.shader_stage_fragment_bit, .module = fragment, .name = "main" };
+        stage_count += 1;
+        const stages = stage_storage[0..stage_count];
         const vertex_input = vk.PipelineVertexInputStateCreateInfo{};
         const input_assembly = vk.PipelineInputAssemblyStateCreateInfo{
-            .topology = pipeline_state.topology,
+            .topology = if (tessellated) 10 else pipeline_state.topology, // PATCH_LIST
         };
+        const tessellation_state = vk.PipelineTessellationStateCreateInfo{ .patch_control_points = pipeline_state.tessellation_control_points };
         const viewport = vk.Viewport{
             .x = @bitCast(pipeline_state.viewport_x_bits),
             .y = @bitCast(pipeline_state.viewport_y_bits),
@@ -9913,6 +9950,7 @@ pub const Renderer = struct {
             .stages = stages.ptr,
             .vertex_input_state = &vertex_input,
             .input_assembly_state = &input_assembly,
+            .tessellation_state = if (tessellated) &tessellation_state else null,
             .viewport_state = &viewport_state,
             .rasterization_state = &rasterization,
             .multisample_state = &multisample,
@@ -14205,6 +14243,100 @@ pub const Renderer = struct {
         try std.testing.expectEqual([2]f32{ 1, 1 }, try self.readDepthProbeValues(index, false));
         if (stencil)
             try std.testing.expectEqual([2]u8{ 0x5a, 0x5a }, try self.readDepthProbeValues(index, true));
+    }
+
+    pub fn probeTessellationInputs(self: *Renderer) anyerror!void {
+        const op = struct {
+            fn v(index: u32) rdna2.Operand {
+                return .{ .kind = .vgpr, .reg = index };
+            }
+            fn s(index: u32) rdna2.Operand {
+                return .{ .kind = .sgpr, .reg = index };
+            }
+            fn f(value: f32) rdna2.Operand {
+                return .{ .kind = .literal_constant, .value = @bitCast(value) };
+            }
+            fn u(value: u32) rdna2.Operand {
+                return .{ .kind = .integer_inline_constant, .value = value };
+            }
+        };
+        const Step = struct { opcode: rdna2.Opcode, dst: u8, a: rdna2.Operand, b: rdna2.Operand = .{} };
+        const steps = [_]Step{
+            .{ .opcode = .v_and_b32, .dst = 20, .a = op.v(7), .b = op.u(1) },
+            .{ .opcode = .v_and_b32, .dst = 21, .a = op.v(8), .b = op.u(1) },
+            .{ .opcode = .v_cvt_f32_u32, .dst = 20, .a = op.v(20) },
+            .{ .opcode = .v_cvt_f32_u32, .dst = 21, .a = op.v(21) },
+            .{ .opcode = .v_cvt_f32_u32, .dst = 22, .a = op.s(4) },
+            .{ .opcode = .v_mul_f32, .dst = 20, .a = op.v(20), .b = op.f(0.75) },
+            .{ .opcode = .v_mul_f32, .dst = 21, .a = op.v(21), .b = op.f(0.25) },
+            .{ .opcode = .v_mul_f32, .dst = 22, .a = op.v(22), .b = op.f(0.75 / 32768.0) },
+            .{ .opcode = .v_mul_f32, .dst = 0, .a = op.v(5), .b = op.f(0.25) },
+            .{ .opcode = .v_add_f32, .dst = 0, .a = op.v(0), .b = op.f(-0.875) },
+            .{ .opcode = .v_add_f32, .dst = 0, .a = op.v(0), .b = op.v(20) },
+            .{ .opcode = .v_add_f32, .dst = 0, .a = op.v(0), .b = op.v(21) },
+            .{ .opcode = .v_mul_f32, .dst = 1, .a = op.v(6), .b = op.f(0.25) },
+            .{ .opcode = .v_add_f32, .dst = 1, .a = op.v(1), .b = op.f(-0.875) },
+            .{ .opcode = .v_add_f32, .dst = 1, .a = op.v(1), .b = op.v(22) },
+            .{ .opcode = .v_mov_b32, .dst = 2, .a = op.f(0) },
+            .{ .opcode = .v_mov_b32, .dst = 3, .a = op.f(1) },
+        };
+        var program = rdna2.Program{ .code = &.{}, .instructions = .empty };
+        defer program.deinit(self.allocator);
+        for (steps, 0..) |step, index| try program.instructions.append(self.allocator, .{
+            .pc = @intCast(index * 4),
+            .family = if (step.b.kind == .unknown) .vop1 else .vop2,
+            .opcode = step.opcode,
+            .dst = op.v(step.dst),
+            .src0 = step.a,
+            .src1 = step.b,
+            .src_count = if (step.b.kind == .unknown) 1 else 2,
+        });
+        try program.instructions.appendSlice(self.allocator, &.{
+            .{ .pc = steps.len * 4, .family = .exp, .opcode = .exp, .export_target = 0x0c, .export_enable = 15, .export_done = true, .src0 = op.v(0), .src1 = op.v(1), .src2 = op.v(2), .src3 = op.v(3), .src_count = 4 },
+            .{ .pc = steps.len * 4 + 8, .family = .sopp, .opcode = .s_endpgm },
+        });
+        var module = try rdna2.translateProgramSpirv(self.allocator, &program, .{
+            .stage = .vertex,
+            .tessellation_inputs = .{
+                .domain = .quads,
+                .spacing = .fractional_odd,
+                .order = .counter_clockwise,
+                .coordinate_vgprs = .{ 5, 6 },
+                .relative_patch_vgpr = 7,
+                .patch_id_vgpr = 8,
+                .patches_per_group = 63,
+                .offchip_offset_sgpr = 4,
+                .offchip_group_bytes = 32768,
+            },
+        });
+        defer module.deinit(self.allocator);
+        var factors: [65 * 6]f32 = @splat(0);
+        const buffer = try self.createBuffer(@sizeOf(@TypeOf(factors)), vk.buffer_usage_storage_buffer_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        defer self.destroyBuffer(buffer);
+        var state = GraphicsPipelineState.default(graphics_probe_width, graphics_probe_height);
+        state.tessellation_control_points = 4;
+        state.tessellation_factor_slot = 3;
+        state.tessellation_domain = @intFromEnum(tessellation_spirv.Domain.quads);
+        for ([_]?usize{ 0, 63, 64, null }) |active_patch| {
+            @memset(&factors, 0);
+            if (active_patch) |patch| @memcpy(factors[patch * 6 ..][0..6], &[_]f32{ 2.25, 3.25, 1.25, 2.75, 2.5, 1.5 });
+            try self.writeMapped(buffer, std.mem.sliceAsBytes(&factors));
+            try self.beginFrameDraw();
+            self.updateStorageDescriptorRange(3, buffer.handle, 0, buffer.size);
+            try self.drawGraphicsShaders(module.words, &graphics_probe_fragment_spirv, &.{}, &.{}, state, null, &.{}, null, false, true, false, .{ .vertex_count = 66 * 4 });
+            for (0..graphics_probe_height) |y| for (0..graphics_probe_width) |x| {
+                const expected = if (active_patch) |patch| blk: {
+                    const left = 4 + (patch % 63 % 2) * 24 + (patch % 2) * 8;
+                    const top = 4 + (patch / 63) * 24;
+                    break :blk x >= left and x < left + 8 and y >= top and y < top + 8;
+                } else false;
+                const offset = (y * graphics_probe_width + x) * 4;
+                const colored = self.graphics_probe_frame[offset] != 0;
+                if (expected != colored) std.debug.print("TES pixel mismatch patch={?d} x={d} y={d} expected={any} actual={any}\n", .{ active_patch, x, y, expected, colored });
+                try std.testing.expectEqual(expected, colored);
+            };
+        }
+        std.debug.print("tessellation inputs passed: fractional quad factors, patch IDs across groups, offchip offsets, changing factors, zero/OOB patch culling\n", .{});
     }
 
     fn drawGraphicsProbe(self: *Renderer) anyerror!void {
