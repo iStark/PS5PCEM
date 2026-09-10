@@ -22467,7 +22467,7 @@ fn matchesRgbaImageClear(inst: anytype) bool {
     return registerOperand(inst[9].dst, .vgpr, 0) and
         registerOperand(inst[9].src0, .vgpr, 4) and
         registerOperand(inst[9].src1, .sgpr, 0) and
-        inst[9].data_mask == 0xf and inst[9].image_nsa_words == 0;
+        inst[9].data_mask == 0xf and inst[9].image_nsa_words == 0 and !inst[9].image_sample_flags.d16;
 }
 
 fn matchesScalarImageClear(inst: anytype) bool {
@@ -22498,7 +22498,7 @@ fn matchesScalarImageClear(inst: anytype) bool {
         registerOperand(inst[6].dst, .vgpr, 2) and
         registerOperand(inst[6].src0, .vgpr, 0) and
         registerOperand(inst[6].src1, .sgpr, 0) and
-        inst[6].data_mask == 0x1 and inst[6].image_nsa_words == 1;
+        !inst[6].image_sample_flags.d16 and inst[6].data_mask == 0x1 and inst[6].image_nsa_words == 1;
 }
 
 fn matchesDualImageClear(inst: anytype) bool {
@@ -22566,12 +22566,12 @@ fn matchesDualImageClear(inst: anytype) bool {
     return registerOperand(inst[14].dst, .vgpr, 0) and
         registerOperand(inst[14].src0, .vgpr, 8) and
         registerOperand(inst[14].src1, .sgpr, 0) and
-        inst[14].data_mask == 0xf and inst[14].image_nsa_words == 0 and
+        !inst[14].image_sample_flags.d16 and inst[14].data_mask == 0xf and inst[14].image_nsa_words == 0 and
         inst[14].image_dimension == .dim_2d and
         registerOperand(inst[16].dst, .vgpr, 4) and
         registerOperand(inst[16].src0, .vgpr, 8) and
         registerOperand(inst[16].src1, .sgpr, 24) and
-        inst[16].data_mask == 0xf and inst[16].image_nsa_words == 0 and
+        !inst[16].image_sample_flags.d16 and inst[16].data_mask == 0xf and inst[16].image_nsa_words == 0 and
         inst[16].image_dimension == .dim_2d;
 }
 
@@ -22690,7 +22690,7 @@ fn matchesFullscreenSampleBlit(inst: anytype) bool {
     var color_exports: u32 = 0;
     for (inst) |candidate| {
         if (candidate.opcode == .image_sample) {
-            if (candidate.data_mask != 0xf) return false;
+            if (candidate.data_mask != 0xf or candidate.image_sample_flags.d16) return false;
             samples += 1;
         }
         if (candidate.opcode == .image_store) return false;
@@ -22871,7 +22871,7 @@ fn matchesVolumeBufferCopy(inst: anytype) bool {
     return registerOperand(inst[30].dst, .vgpr, 0) and
         registerOperand(inst[30].src0, .vgpr, 4) and
         registerOperand(inst[30].src1, .sgpr, 0) and
-        inst[30].data_mask == 0xf and inst[30].image_nsa_words == 0 and
+        inst[30].data_mask == 0xf and inst[30].image_nsa_words == 0 and !inst[30].image_sample_flags.d16 and
         inst[30].image_dimension == .dim_3d;
 }
 
@@ -28769,6 +28769,12 @@ test "dual image clear matcher requires the complete bounded kernel" {
     instructions[16].data_mask = 0xf;
 
     try std.testing.expect(matchesDualImageClear(&instructions));
+    instructions[14].image_sample_flags.d16 = true;
+    try std.testing.expect(!matchesDualImageClear(&instructions));
+    instructions[14].image_sample_flags.d16 = false;
+    instructions[16].image_sample_flags.d16 = true;
+    try std.testing.expect(!matchesDualImageClear(&instructions));
+    instructions[16].image_sample_flags.d16 = false;
     instructions[16].data_mask = 0x7;
     try std.testing.expect(!matchesDualImageClear(&instructions));
 }
