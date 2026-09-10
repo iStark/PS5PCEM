@@ -51,10 +51,18 @@ pub const ScalarRegisters = [maximum_scalar_registers]ScalarValue;
 const LaneSpills = struct {
     const Slot = struct { vgpr: u32 = 256, lane: u32 = 0, value: ScalarValue = .{} };
     slots: [128]Slot = @splat(.{}),
+    occupied: u128 = 0,
 
     fn invalidate(self: *LaneSpills, first: u32, count: u32) void {
-        for (&self.slots) |*slot| {
-            if (slot.vgpr >= first and slot.vgpr < first + count) slot.* = .{};
+        var remaining = self.occupied;
+        while (remaining != 0) {
+            const index: u7 = @intCast(@ctz(remaining));
+            remaining &= remaining - 1;
+            const slot = &self.slots[index];
+            if (slot.vgpr >= first and slot.vgpr < first + count) {
+                slot.* = .{};
+                self.occupied &= ~(@as(u128, 1) << index);
+            }
         }
     }
 
@@ -69,24 +77,29 @@ const LaneSpills = struct {
             self.invalidate(inst.dst.reg, 1);
             return;
         };
-        var free: ?*Slot = null;
-        for (&self.slots) |*slot| {
+        var free: ?usize = null;
+        for (self.slots, 0..) |slot, slot_index| {
             if (slot.vgpr == inst.dst.reg and slot.lane == index) {
-                free = slot;
+                free = slot_index;
                 break;
             }
-            if (slot.vgpr == 256) free = slot;
+            if (slot.vgpr == 256) free = slot_index;
         }
-        if (free) |slot| {
+        if (free) |slot_index| {
             const value = if (inst.src0.absolute or inst.src0.negate or inst.src0.dpp) null else source(result, inst.src0);
-            slot.* = if (value) |known| .{ .vgpr = inst.dst.reg, .lane = index, .value = known } else .{};
+            self.slots[slot_index] = if (value) |known| .{ .vgpr = inst.dst.reg, .lane = index, .value = known } else .{};
+            const bit = @as(u128, 1) << @intCast(slot_index);
+            self.occupied = if (value != null) self.occupied | bit else self.occupied & ~bit;
         }
     }
 
     fn restore(self: *const LaneSpills, result: *Evaluation, inst: rdna2.Instruction) void {
         const index = lane(result, inst.src1);
         if (inst.src0.kind == .vgpr and index != null) {
-            for (self.slots) |slot| {
+            var remaining = self.occupied;
+            while (remaining != 0) {
+                const slot = self.slots[@ctz(remaining)];
+                remaining &= remaining - 1;
                 if (slot.vgpr == inst.src0.reg and slot.lane == index.?) {
                     write(result, inst.dst, slot.value.value, slot.value.sources, inst.pc);
                     return;
@@ -97,6 +110,7 @@ const LaneSpills = struct {
     }
 
     fn invalidateInstruction(self: *LaneSpills, inst: rdna2.Instruction) void {
+        if (self.occupied == 0) return;
         const name = @tagName(inst.opcode);
         const wide = std.mem.indexOf(u8, name, "64") != null;
         const count: u32 = @max(inst.data_words, if (inst.family == .ds) @as(u8, 4) else if (wide) @as(u8, 2) else 1);
@@ -1491,6 +1505,39 @@ test "resource lane spills do not survive an unresolved loop overwrite" {
     const result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
     try std.testing.expectEqual(StopReason.end_program, result.stop_reason);
     try std.testing.expect(result.register(10) == null);
+}
+
+test "resource lane spills preserve full tables and reuse invalidated VGPR lanes" {
+    var storage = [_]u8{0} ** 16;
+    var memory = TestMemory{ .base = 0x4000, .bytes = &storage };
+    const bindings = testBindings(0x3000, 0x4000);
+    var instructions: [138]rdna2.Instruction = undefined;
+    for (instructions[0..128], 0..) |*inst, i| inst.* = .{
+        .opcode = .v_writelane_b32,
+        .dst = .{ .kind = .vgpr, .reg = @intCast(18 + i / 64) },
+        .src0 = .{ .kind = .sgpr },
+        .src1 = .{ .kind = .integer_inline_constant, .value = @intCast(i % 64) },
+    };
+    @memcpy(instructions[128..], &[_]rdna2.Instruction{
+        // Overflow must not evict a pointer from either fully occupied VGPR.
+        .{ .opcode = .v_writelane_b32, .dst = .{ .kind = .vgpr, .reg = 20 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .integer_inline_constant } },
+        .{ .opcode = .v_readlane_b32, .dst = .{ .kind = .sgpr, .reg = 10 }, .src0 = .{ .kind = .vgpr, .reg = 20 }, .src1 = .{ .kind = .integer_inline_constant } },
+        .{ .opcode = .v_mov_b32, .dst = .{ .kind = .vgpr, .reg = 18 } },
+        .{ .opcode = .v_writelane_b32, .dst = .{ .kind = .vgpr, .reg = 20 }, .src0 = .{ .kind = .integer_inline_constant, .value = 0xabc }, .src1 = .{ .kind = .integer_inline_constant, .value = 63 } },
+        .{ .opcode = .v_readlane_b32, .dst = .{ .kind = .sgpr, .reg = 11 }, .src0 = .{ .kind = .vgpr, .reg = 19 }, .src1 = .{ .kind = .integer_inline_constant, .value = 63 } },
+        .{ .opcode = .v_readlane_b32, .dst = .{ .kind = .sgpr, .reg = 12 }, .src0 = .{ .kind = .vgpr, .reg = 20 }, .src1 = .{ .kind = .integer_inline_constant, .value = 63 } },
+        .{ .opcode = .v_writelane_b32, .dst = .{ .kind = .vgpr, .reg = 19 }, .src0 = .{ .kind = .sgpr }, .src1 = .{ .kind = .sgpr, .reg = 9 } },
+        .{ .opcode = .v_readlane_b32, .dst = .{ .kind = .sgpr, .reg = 13 }, .src0 = .{ .kind = .vgpr, .reg = 19 }, .src1 = .{ .kind = .integer_inline_constant, .value = 1 } },
+        .{ .opcode = .v_readlane_b32, .dst = .{ .kind = .sgpr, .reg = 14 }, .src0 = .{ .kind = .vgpr, .reg = 20 }, .src1 = .{ .kind = .integer_inline_constant, .value = 63 } },
+        .{ .opcode = .s_endpgm },
+    });
+    for (&instructions, 0..) |*inst, i| inst.pc = @intCast(i * 4);
+    const result = evaluateDecodedResourceState(memory.reader(), &bindings, &instructions);
+    try std.testing.expect(result.register(10) == null);
+    try std.testing.expectEqual(@as(u32, 0x4000), result.register(11).?.value);
+    try std.testing.expectEqual(@as(u32, 0xabc), result.register(12).?.value);
+    try std.testing.expect(result.register(13) == null);
+    try std.testing.expectEqual(@as(u32, 0xabc), result.register(14).?.value);
 }
 
 test "uniform resource guard is specialized independently for each dispatch" {
