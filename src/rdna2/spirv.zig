@@ -6638,21 +6638,33 @@ const Builder = struct {
         try self.emit(&self.body, 167, &.{ self.bool_type, bounded, access.in_range, nonempty }); // OpLogicalAnd
         const predicate = (try self.writePredicate(bounded)).?;
 
-        const ballot_type = try self.ensureVec4(.bits32);
         const scope = try self.constant(.bits32, 3); // ScopeSubgroup
-        const ballot = self.id();
-        try self.emit(&self.body, 339, &.{ ballot_type, ballot, scope, predicate }); // OpGroupNonUniformBallot
-        const active_count = self.id();
-        try self.emit(&self.body, 342, &.{
-            self.bits_type,
-            active_count,
-            scope,
-            0, // GroupOperation Reduce is a literal enumerant, not an ID.
-            ballot,
-        }); // OpGroupNonUniformBallotBitCount
-        const first_lane = self.id();
-        try self.emit(&self.body, 343, &.{ self.bits_type, first_lane, scope, ballot }); // OpGroupNonUniformBallotFindLSB
-        const lane = try self.subgroupLocalInvocationId();
+        var active_count: u32 = undefined;
+        var first_lane: u32 = undefined;
+        if (self.wave64_workgroup) {
+            // APPEND/CONSUME reserve once for the whole guest wave. A pair of
+            // host wave32 reservations gives the upper half a different base
+            // and breaks the guest's subsequent MBCNT-based compact indices.
+            const mask = try self.waveBallot(predicate);
+            const low_count = self.id();
+            const high_count = self.id();
+            try self.emit(&self.body, 205, &.{ self.bits_type, low_count, mask[0] });
+            try self.emit(&self.body, 205, &.{ self.bits_type, high_count, mask[1] });
+            active_count = try self.addBits(low_count, high_count);
+            const low_first = try self.waveFirstBit(mask[0]);
+            const high_first = try self.addBits(try self.waveFirstBit(mask[1]), try self.constant(.bits32, 32));
+            first_lane = self.id();
+            try self.emit(&self.body, 169, &.{ self.bits_type, first_lane, try self.isNonZero(mask[0]), low_first, high_first });
+        } else {
+            const ballot_type = try self.ensureVec4(.bits32);
+            const ballot = self.id();
+            try self.emit(&self.body, 339, &.{ ballot_type, ballot, scope, predicate }); // OpGroupNonUniformBallot
+            active_count = self.id();
+            try self.emit(&self.body, 342, &.{ self.bits_type, active_count, scope, 0, ballot }); // Reduce
+            first_lane = self.id();
+            try self.emit(&self.body, 343, &.{ self.bits_type, first_lane, scope, ballot }); // FindLSB
+        }
+        const lane = if (self.wave64_workgroup) try self.currentLaneId() else try self.subgroupLocalInvocationId();
         const lane_is_first = self.id();
         try self.emit(&self.body, 170, &.{ self.bool_type, lane_is_first, lane, first_lane }); // OpIEqual
         const selected = self.id();
@@ -6674,14 +6686,13 @@ const Builder = struct {
             try self.constant(.bits32, 0), // MemorySemanticsNone
             delta,
         }); // OpAtomicIAdd / OpAtomicISub
-        const wave_base = self.id();
-        try self.emit(&self.body, 345, &.{
-            self.bits_type,
-            wave_base,
-            scope,
-            previous,
-            first_lane,
-        }); // OpGroupNonUniformShuffle
+        const wave_base = if (self.wave64_workgroup)
+            try self.waveShuffle(previous, first_lane)
+        else shuffle: {
+            const result = self.id();
+            try self.emit(&self.body, 345, &.{ self.bits_type, result, scope, previous, first_lane });
+            break :shuffle result;
+        };
         const result = self.id();
         try self.emit(&self.body, 169, &.{
             self.bits_type,
@@ -11024,7 +11035,12 @@ fn translateInstructions(
     effective.uses_lane_identity = effective.uses_lane_identity or effective.uses_execution_mask or
         (effective.uses_execution_mask and has_predicated_write);
     const invocation_count = @as(u64, effective.local_size[0]) * effective.local_size[1] * effective.local_size[2];
-    if (!effective.wave32 and effective.stage == .compute and invocation_count >= 64 and invocation_count <= 1024 and invocation_count % 64 == 0 and cross_half_read and !uses_gds) {
+    // Single-wave GDS kernels also consume the physical EXEC bits for ballot
+    // counts and compact indices. Per-invocation predicates turn a sparse mask
+    // into 64 active lanes, publishing unwritten records as valid output.
+    // Multi-wave GDS kernels retain their existing path until their global
+    // wave operations can participate in the converged dispatcher as well.
+    if (!effective.wave32 and effective.stage == .compute and invocation_count >= 64 and invocation_count <= 1024 and invocation_count % 64 == 0 and (cross_half_read or uses_gds) and (!uses_gds or invocation_count == 64)) {
         effective.wave64_workgroup = true;
         effective.uses_lane_identity = true;
         effective.uses_execution_mask = true;

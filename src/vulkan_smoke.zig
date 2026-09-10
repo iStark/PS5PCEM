@@ -3738,6 +3738,56 @@ fn runGdsAtomicProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("GDS atomic passed: persistent counter, cross-workgroup updates, EXEC low/high, segment and physical bounds, returned value\n", .{});
 }
 
+fn runGdsWave64AppendProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    const code = [_]u32{
+        0xbefc_0300, // M0 = s0: GDS base and size
+        vop2Source(0x1b, 1, 129, 0), // v1 = lane & 1
+        0x7da6_0001, // CMPX LE s1, v0: exclude lanes below the cutoff
+        0x7da4_0280, // CMPX EQ 0, v1: keep only even lanes
+        0xbe8c_107e, // s12 = popcount(EXEC), including both halves
+        vop1(1, 5, 12),
+        0xd8fa_0004, 0x0200_0000, // APPEND v2: one shared base for the wave
+        0xd766_0003, 127 | (128 << 9), // MBCNT high(EXEC_HI, 0)
+        0xd765_0003, 126 | (259 << 9), // MBCNT low(EXEC_LO, v3)
+        0xd8f6_0004, 0x0400_0000, // CONSUME v4: returns base + active count
+        0xe078_2000, 0x8001_0200, // Store [base, rank, consumed, count] at lane
+        0xbf81_0000,
+    };
+    for (code, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 8 << 1);
+    for ([_]u32{ 0, 35, 1, 64 }, 0..) |cutoff, case_index| {
+        const destination: u32 = 0x10000 + @as(u32, @intCast(case_index)) * 0x1000;
+        for (0..256) |word| guest.word(destination + word * 4, 0xcccc_cccc);
+        for ([_]u32{ 0x0100_0008, cutoff, 0, 0, destination, 16 << 16, 64, 0 }, 0..) |word, index| {
+            try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(index)), word);
+        }
+        _ = try renderer.dispatchRdna2State(&state, .{ 64, 1, 1 }, .{ 1, 1, 1 });
+        var output: [1024]u8 = undefined;
+        try renderer.readbackGuestStorageBuffer(destination, &output);
+        const first = (cutoff + 1) & ~@as(u32, 1);
+        const count = (64 - first) / 2;
+        for (0..64) |lane| {
+            const active = lane >= cutoff and lane % 2 == 0;
+            const expected: [4]u32 = if (active) .{ 0, @intCast((lane - first) / 2), count, count } else @splat(0xcccc_cccc);
+            for (expected, 0..) |word, component| {
+                const actual = std.mem.readInt(u32, output[lane * 16 + component * 4 ..][0..4], .little);
+                if (actual != word) std.debug.print("GDS wave64 cutoff={d} lane={d} component={d}: expected={x} actual={x}\n", .{ cutoff, lane, component, word, actual });
+                try std.testing.expectEqual(word, actual);
+            }
+        }
+        try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, renderer.gds_storage.items[0x104..][0..4], .little));
+    }
+    std.debug.print("GDS wave64 append passed: dynamic sparse masks, high-only/empty EXEC, compact ranks and shared append/consume return values\n", .{});
+}
+
 fn runGdsMemoryProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
     defer renderer.deinit();
@@ -6996,6 +7046,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--gds")) {
         try runGdsAtomicProbe(allocator);
+        try runGdsWave64AppendProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--gds-memory")) {
