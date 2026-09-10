@@ -7563,6 +7563,30 @@ const Builder = struct {
             try self.destination(inst.dst, .{ .id = try self.waveShuffle(source_value, first), .value_type = .bits32 });
             return;
         }
+        if (try self.laneEnabled()) |enabled| {
+            // Guest EXEC masks writes while the host invocation can remain
+            // active. BroadcastFirst would then select a disabled guest lane,
+            // for example while a fragment shader groups lanes by material.
+            const scope = try self.constant(.bits32, 3);
+            const ballot_type = try self.ensureVec4(.bits32);
+            const ballot = self.id();
+            try self.emit(&self.body, 339, &.{ ballot_type, ballot, scope, enabled });
+            const count = self.id();
+            try self.emit(&self.body, 342, &.{ self.bits_type, count, scope, 0, ballot });
+            const first = self.id();
+            try self.emit(&self.body, 343, &.{ self.bits_type, first, scope, ballot });
+            const nonempty = try self.isNonZero(count);
+            const zero = try self.constant(.bits32, 0);
+            const lane = self.id();
+            try self.emit(&self.body, 169, &.{ self.bits_type, lane, nonempty, first, zero });
+            const selected = self.id();
+            self.uses_group_shuffle = true;
+            try self.emit(&self.body, 345, &.{ self.bits_type, selected, scope, source_value, lane });
+            const result = self.id();
+            try self.emit(&self.body, 169, &.{ self.bits_type, result, nonempty, selected, zero });
+            try self.destination(inst.dst, .{ .id = result, .value_type = .bits32 });
+            return;
+        }
         const result = self.id();
         try self.emit(&self.body, 338, &.{
             self.bits_type,

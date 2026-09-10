@@ -3467,6 +3467,62 @@ fn runUiAttachmentProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("UI attachments passed: missing color/clip defaults, explicit disable/DX clip, stale depth and HTILE comparisons\n", .{});
 }
 
+fn runFragmentFirstActiveLaneProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    const vertex = [_]u32{
+        0x34020a81,      0x36040a82, 0x36020282, 0x7e040d02, 0x7e060d01,
+        0xd5410001,      0x03ce04f4, 0xd5410002, 0x03ce06f4, vop1(1, 0, 242),
+        vop1(1, 3, 240), 0xf80008cf, 0x00030102, 0xbf810000,
+    };
+    for (vertex, 0..) |word, i| guest.word(0x700 + i * 4, word);
+    var state = gpu.State{};
+    for ([_]gpu.resources.ShaderStage{ .vertex, .pixel }, [_]u32{ 7, 9 }) |stage, program| {
+        try state.writeRegister(.shader, stage.programRegisterBase(), program);
+        try state.writeRegister(.shader, stage.programRegisterBase() + 1, 0);
+    }
+    const context = [_][2]u32{
+        .{ 0x318, 0x20 },                    .{ 0x319, 0 },             .{ 0x31b, 0 },             .{ 0x31c, 10 << 2 }, .{ 0x31d, 0 },
+        .{ 0x390, 0 },                       .{ 0x3b0, (7 << 14) | 7 }, .{ 0x3b8, 1 << 24 },       .{ 0x08e, 0xf },     .{ 0x00c, 0 },
+        .{ 0x00d, 8 | (8 << 16) },           .{ 0x094, 1 << 31 },       .{ 0x095, 8 | (8 << 16) }, .{ 0x1e0, 0 },       .{ 0x200, 0 },
+        .{ 0x202, (0xcc << 16) | (1 << 4) }, .{ 0x204, 0 },             .{ 0x205, 0 },             .{ 0x1b3, 0xf02 },   .{ 0x1b4, 0xf02 },
+    };
+    for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+    for ([_]f32{ 4, 4, -4, 4, 1, 0 }, 0..) |value, i|
+        try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value));
+    var executor = gpu.DcbExecutor{ .state = &state, .backend = renderer.dcbBackend(guest.interface()), .allocator = allocator };
+    for ([_]u9{ 129, 128, 129 }) |selected| {
+        const fragment = [_]u32{
+            vop1(7, 6, 258), vop2Source(0x1b, 6, 129, 6), // pixel X parity
+            sop1(4, 20, 126), // preserve full EXEC
+            0x7c000000 | (0xc2 << 17) | (6 << 9) | @as(u32, selected), // CMP_EQ_U32
+            sop1(0x24, 22, 106), // select alternating columns in EXEC
+            vop1(2, 12, 262), // READFIRSTLANE s12, v6: disabled lanes must not supply it
+            sop1(4, 126, 20), // restore all pixels before displaying the result
+            vop1(6, 0, 12),
+            vop1(1, 1, 128),
+            vop1(1, 2, 242),
+            0xf800180f,
+            0x02010100,
+            0xbf810000,
+        };
+        for (fragment, 0..) |word, i| guest.word(0x900 + i * 4, word);
+        _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
+        if (renderer.last_draw_error) |err| return err;
+        try renderer.flushPendingGuestWrites();
+        for (0..64) |pixel| {
+            const actual = std.mem.readInt(u32, guest.bytes[0x2000 + pixel * 4 ..][0..4], .little);
+            const expected: u32 = if (selected == 129) 0xff0000ff else 0xff000000;
+            if (actual != expected) {
+                std.debug.print("Fragment first-active mismatch selection={d} pixel={d}: expected=0x{x} actual=0x{x}\n", .{ selected - 128, pixel, expected, actual });
+                return error.FragmentFirstActiveLaneMismatch;
+            }
+        }
+    }
+    std.debug.print("Fragment first active lane passed: alternating EXEC masks exclude inactive source lanes across repeated draws\n", .{});
+}
+
 fn runFragmentPositionProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -7460,6 +7516,10 @@ fn runHighHalfStoreProbe(allocator: std.mem.Allocator) !void {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--fragment-first-active")) {
+        try runFragmentFirstActiveLaneProbe(allocator);
+        return;
+    }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--tessellation-inputs")) {
         var renderer = try vulkan.Renderer.init(allocator, .{});
         defer renderer.deinit();
