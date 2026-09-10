@@ -4922,6 +4922,102 @@ fn runShaderInterfaceProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("shader interface probe passed: ABI Phi, smooth/flat aliases, lane spills and P0 attribute channels\n", .{});
 }
 
+fn runCubeArrayProbe(allocator: std.mem.Allocator) !void {
+    for ([_]bool{ false, true }) |gradients| for ([_]bool{ false, true }) |mips| {
+        try runCubeArrayCase(allocator, gradients, mips);
+    };
+}
+
+fn runCubeArrayCase(allocator: std.mem.Allocator, gradients: bool, mips: bool) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{});
+    defer renderer.deinit();
+    var guest = SizedGuestMemory(512 * 1024){};
+    _ = renderer.dcbBackend(guest.interface());
+    // Runtime coordinates and LOD share the output buffer. No shader literals
+    // change between faces, cubes, mip levels or rebased descriptor views.
+    const lod_code = [_]u32{
+        0xe038_0000, 0x8003_0000, // buffer_load_dwordx4 v0:v3, s12:s15
+        0xbf8c_0f70,
+        0xf090_0f18, 0x0040_0800, // image_sample_l cube v8:v11, v0:v3, T#s0, S#s8
+        0xbf8c_0f70,
+        0xe078_0020, 0x8003_0800, // buffer_store_dwordx4 v8:v11, offset 32
+        0xbf81_0000,
+    };
+    const gradient_code = [_]u32{
+        0xe038_0000, 0x8003_0000, // derivatives v0:v3
+        0xe038_0010, 0x8003_0400, // coordinates v4:v6
+        0xbf8c_0f70,
+        0xf088_0f18, 0x0040_0800, // image_sample_d cube
+        0xbf8c_0f70, 0xe078_0020,
+        0x8003_0800, 0xbf81_0000,
+    };
+    const code: []const u32 = if (gradients) &gradient_code else &lod_code;
+    for (code, 0..) |word, i| guest.word(0x100 + i * 4, word);
+    var image = sampledImageDescriptorWords(0x10000, 4, 4);
+    image[3] = (image[3] & 0x0fff_ffff) | (11 << 28) | (@as(u32, @intFromBool(mips)) << 16);
+    image[4] = 17; // three cubes, six faces each
+    image[5] = @as(u32, @intFromBool(mips)) << 4;
+    const texture = try gpu.TextureLayout.fromImage(try gpu.resources.decodeImageDescriptor(&image));
+    try std.testing.expectEqual(@as(u32, 18), texture.layers);
+    const level_count: usize = if (mips) 2 else 1;
+    for (0..level_count) |level| {
+        const view = try texture.subresource(@intCast(level), 0, 18);
+        for (0..18) |layer| for (0..view.height) |y| for (0..view.width) |x| {
+            const at = 0x10000 + @as(usize, @intCast(try view.sourceByteOffset(@intCast(x), @intCast(y), @intCast(layer), 0)));
+            const red: u32 = @intCast(32 + (layer / 6) * 64 + (layer % 6) * 5 + level * 2);
+            const green: u32 = @intCast(11 + x * 50);
+            const blue: u32 = @intCast(7 + y * 50);
+            guest.word(at, red | (green << 8) | (blue << 16) | 0xff00_0000);
+        };
+    }
+    var state = gpu.State{};
+    const compute = gpu.resources.ShaderStage.compute;
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 16 << 1);
+    var userdata: [16]u32 = @splat(0);
+    userdata[8] = 0x92; // clamp to edge, point filtering
+    userdata[9] = 0xfff000;
+    userdata[10] = 1 << 26; // nearest mip
+    @memcpy(userdata[12..16], &[_]u32{ 0x8000, 4 << 16, 16, 0 });
+    var cases: usize = 0;
+    for ([_]u32{ 0, 6, 12 }) |base_layer| {
+        image[4] = 17 | (base_layer << 16);
+        @memcpy(userdata[0..8], &image);
+        for (userdata, 0..) |word, i| try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(i)), word);
+        for (0..(18 - base_layer) / 6) |cube| for (0..6) |face| for (0..level_count) |level| for (0..2) |corner| {
+            const extent: usize = @as(usize, 4) >> @as(u6, @intCast(level));
+            const x: usize = if (corner == 0) 0 else extent - 1;
+            const y: usize = if (corner == 0) extent - 1 else 0;
+            const coordinates = [_]f32{
+                1.0 + (@as(f32, @floatFromInt(x)) + 0.5) / @as(f32, @floatFromInt(extent)),
+                1.0 + (@as(f32, @floatFromInt(y)) + 0.5) / @as(f32, @floatFromInt(extent)),
+                @floatFromInt(cube * 8 + face),
+                @floatFromInt(level),
+            };
+            for (coordinates, 0..) |value, i| guest.word(0x8000 + @as(usize, if (gradients) 16 else 0) + i * 4, @bitCast(value));
+            if (gradients) {
+                const footprint = 1.0 / @as(f32, @floatFromInt(extent));
+                for ([_]f32{ footprint, 0, 0, footprint }, 0..) |value, i| guest.word(0x8000 + i * 4, @bitCast(value));
+            }
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+            var bytes: [64]u8 = undefined;
+            try renderer.readbackGuestStorageBuffer(0x8000, &bytes);
+            const expected = [_]u32{ @intCast(32 + (base_layer / 6 + cube) * 64 + face * 5 + level * 2), @intCast(11 + x * 50), @intCast(7 + y * 50), 255 };
+            for (expected, 0..) |channel, i| {
+                const actual: f32 = @bitCast(std.mem.readInt(u32, bytes[32 + i * 4 ..][0..4], .little));
+                const want = @as(f32, @floatFromInt(channel)) / 255.0;
+                if (@abs(actual - want) > 0.00001) {
+                    std.debug.print("cube mismatch base={d} cube={d} face={d} mip={d} xy={d},{d} channel={d}: actual={d} expected={d}\n", .{ base_layer, cube, face, level, x, y, i, actual, want });
+                    return error.CubeArraySampleMismatch;
+                }
+            }
+            cases += 1;
+        };
+    }
+    std.debug.print("Cube sampling passed: {d} cases, six face orientations, three cubes, mips={any}, gradients={any}, rebased views\n", .{ cases, mips, gradients });
+}
+
 fn runStreamedMipProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -7185,6 +7281,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--gather-lod")) {
         try runGatherLodProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--cube-arrays")) {
+        try runCubeArrayProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--htile-clears")) {

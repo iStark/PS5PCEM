@@ -292,6 +292,7 @@ pub const image_type_3d: u32 = 2;
 pub const image_view_type_2d: u32 = 1;
 pub const image_view_type_3d: u32 = 2;
 pub const image_view_type_cube: u32 = 3;
+pub const image_view_type_cube_array: u32 = 6;
 pub const image_view_type_2d_array: u32 = 5;
 pub const image_create_mutable_format_bit: Flags = 0x08;
 pub const image_create_cube_compatible_bit: Flags = 0x10;
@@ -407,6 +408,7 @@ pub const PhysicalDeviceFeatures = extern struct {
 };
 
 pub const feature_robust_buffer_access: usize = 0;
+pub const feature_image_cube_array: usize = 2;
 pub const feature_independent_blend: usize = 3;
 pub const feature_geometry_shader: usize = 4;
 pub const feature_vertex_pipeline_stores_and_atomics: usize = 25;

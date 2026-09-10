@@ -1284,7 +1284,7 @@ const Builder = struct {
                     self.float_type,
                     spirv_dimension,
                     0,
-                    @intFromBool(dimension_index == 3),
+                    @intFromBool(dimension_index == 2 or dimension_index == 3),
                     0,
                     1,
                     0,
@@ -3908,7 +3908,7 @@ const Builder = struct {
         const dim = sampledImageDimensionIndex(binding.dimension);
         const x = try self.source(try imageAddressOperand(inst, 0), .float32);
         const y = try self.source(try imageAddressOperand(inst, 1), .float32);
-        const coordinates = self.id();
+        var coordinates = self.id();
         if (binding.dimension == .two_d) {
             try self.emit(&self.body, 80, &.{ try self.ensureFloatVec2(), coordinates, x, y });
         } else {
@@ -3926,7 +3926,12 @@ const Builder = struct {
                 return;
             }
             const z = try self.source(try imageAddressOperand(inst, 2), .float32);
-            try self.emit(&self.body, 80, &.{ self.vector3_type, coordinates, x, y, z });
+            if (binding.dimension == .cube) {
+                // QueryLod consumes the direction but no array index.
+                coordinates = try self.cubeSampleCoordinates(x, y, z, false);
+            } else {
+                try self.emit(&self.body, 80, &.{ self.vector3_type, coordinates, x, y, z });
+            }
         }
         const pointer = self.id();
         try self.emit(&self.body, 65, &.{
@@ -5885,6 +5890,49 @@ const Builder = struct {
         try self.destination(inst.dst, .{ .id = value, .value_type = .float32 });
     }
 
+    /// Invert the cube face projection. With major=1 this constructs a cube
+    /// direction; with major=0 it constructs its derivative on the same face.
+    fn cubeFaceDirection(self: *Builder, u: u32, v: u32, face: u32, major: u32) Error![3]u32 {
+        const zero = try self.constant(.float32, 0);
+        const nu = try self.bvhBinary(131, self.float_type, zero, u);
+        const nv = try self.bvhBinary(131, self.float_type, zero, v);
+        const nm = try self.bvhBinary(131, self.float_type, zero, major);
+        const faces = [6][3]u32{
+            .{ major, nv, nu }, .{ nm, nv, u },
+            .{ u, major, v },   .{ u, nm, nv },
+            .{ u, nv, major },  .{ nu, nv, nm },
+        };
+        var direction = faces[0];
+        for (1..6) |index| {
+            const matches = try self.bvhBinary(170, self.bool_type, face, try self.constant(.bits32, @intCast(index)));
+            for (0..3) |component| direction[component] = try self.bvhSelect(self.float_type, matches, faces[index][component], direction[component]);
+        }
+        return direction;
+    }
+
+    fn cubeSampleCoordinates(self: *Builder, s: u32, t: u32, face_code: u32, arrayed: bool) Error!u32 {
+        // GCN/RDNA supplies S,T in [1,2] and float(cube_index * 8 + face),
+        // not a direction vector. Vulkan selects the face from a direction.
+        const packed_face = self.id();
+        try self.emit(&self.body, 109, &.{ self.bits_type, packed_face, face_code }); // ConvertFToU
+        const face = try self.bvhBinary(199, self.bits_type, packed_face, try self.constant(.bits32, 7));
+        const center = try self.constant(.float32, @bitCast(@as(f32, 1.5)));
+        const two = try self.constant(.float32, @bitCast(@as(f32, 2)));
+        const u = try self.bvhBinary(133, self.float_type, two, try self.bvhBinary(131, self.float_type, s, center));
+        const v = try self.bvhBinary(133, self.float_type, two, try self.bvhBinary(131, self.float_type, t, center));
+        const d = try self.cubeFaceDirection(u, v, face, try self.constant(.float32, @bitCast(@as(f32, 1))));
+        const coordinates = self.id();
+        if (arrayed) {
+            const index = try self.bvhBinary(194, self.bits_type, packed_face, try self.constant(.bits32, 3));
+            const layer = self.id();
+            try self.emit(&self.body, 112, &.{ self.float_type, layer, index });
+            try self.emit(&self.body, 80, &.{ self.vector4_type, coordinates, d[0], d[1], d[2], layer });
+        } else {
+            try self.emit(&self.body, 80, &.{ self.vector3_type, coordinates, d[0], d[1], d[2] });
+        }
+        return coordinates;
+    }
+
     fn sampleImage(self: *Builder, inst: instruction.Instruction) Error!void {
         // Opcode 0x20 is IMAGE_SAMPLE. 0x22 is IMAGE_SAMPLE_D: explicit
         // derivatives from VGPRs, lowered with SPIR-V Grad. 1D samples a
@@ -5959,7 +6007,11 @@ const Builder = struct {
             const coordinate_x, const coordinate_y = try self.sampleCoordinates(raw_x, raw_y);
             if (image_dimension != .two_d) {
                 const coordinate_z = try self.source(try imageAddressOperand(inst, coordinate_base + 2), .float32);
-                try self.emit(&self.body, 80, &.{ self.vector3_type, coordinates, coordinate_x, coordinate_y, coordinate_z });
+                if (image_dimension == .cube) {
+                    coordinates = try self.cubeSampleCoordinates(coordinate_x, coordinate_y, coordinate_z, true);
+                } else {
+                    try self.emit(&self.body, 80, &.{ self.vector3_type, coordinates, coordinate_x, coordinate_y, coordinate_z });
+                }
             } else {
                 try self.emit(&self.body, 80, &.{ self.vector2_type, coordinates, coordinate_x, coordinate_y });
             }
@@ -6131,11 +6183,23 @@ const Builder = struct {
             try self.emit(&self.body, 80, &.{ vector_type, dy, dudy, dvdy });
             return .{ dx, dy };
         }
-        const dx = self.id();
-        const dy = self.id();
-        try self.emit(&self.body, 80, &.{ self.vector3_type, dx, dudx, dvdx, zero });
-        try self.emit(&self.body, 80, &.{ self.vector3_type, dy, dudy, dvdy, zero });
-        return .{ dx, dy };
+        const face_code = try self.source(try imageAddressOperand(inst, gradient_base + 6), .float32);
+        const packed_face = self.id();
+        try self.emit(&self.body, 109, &.{ self.bits_type, packed_face, face_code });
+        const face = try self.bvhBinary(199, self.bits_type, packed_face, try self.constant(.bits32, 7));
+        const two = try self.constant(.float32, @bitCast(@as(f32, 2)));
+        var gradients: [2]u32 = undefined;
+        for ([2][2]u32{ .{ dudx, dvdx }, .{ dudy, dvdy } }, 0..) |gradient, index| {
+            const d = try self.cubeFaceDirection(
+                try self.bvhBinary(133, self.float_type, two, gradient[0]),
+                try self.bvhBinary(133, self.float_type, two, gradient[1]),
+                face,
+                zero,
+            );
+            gradients[index] = self.id();
+            try self.emit(&self.body, 80, &.{ self.vector3_type, gradients[index], d[0], d[1], d[2] });
+        }
+        return gradients;
     }
 
     fn imageTexelOffset(self: *Builder, inst: instruction.Instruction) Error!u32 {
@@ -10917,6 +10981,9 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     }
     if (builder.uses_image_query) {
         try appendInstruction(allocator, &words, 17, &.{50}); // OpCapability ImageQuery
+    }
+    if (builder.sampled_image_arrays[2] != 0) {
+        try appendInstruction(allocator, &words, 17, &.{45}); // SampledCubeArray
     }
     if (builder.uses_image_gather_extended) {
         try appendInstruction(allocator, &words, 17, &.{25}); // OpCapability ImageGatherExtended

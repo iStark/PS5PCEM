@@ -2189,7 +2189,7 @@ const SampledViewPlan = struct {
         const layer_count: u32 = switch (dimension) {
             .two_d => 1,
             .three_d => 1,
-            .cube => if (available_layers >= 6) 6 else return null,
+            .cube => if (available_layers >= 6 and available_layers % 6 == 0) available_layers else return null,
             .two_d_array => available_layers,
         };
         if (dimension != .three_d and (layer_count == 0 or layer_count > available_layers)) return null;
@@ -3186,6 +3186,7 @@ pub const Renderer = struct {
     loader_api_version: u32,
     device_info: DeviceInfo,
     geometry_shaders_available: bool,
+    cube_arrays_available: bool,
     shader_float64_available: bool,
     image_float32_atomic_min_max_available: bool,
     fragment_barycentric_available: bool,
@@ -3680,6 +3681,8 @@ pub const Renderer = struct {
         const supported_features = supported_features_2.features;
         const fragment_barycentric = barycentric_extension and barycentric_support.fragment_shader_barycentric != 0;
         var enabled_features = vk.PhysicalDeviceFeatures{};
+        const cube_arrays = supported_features.values[vk.feature_image_cube_array] != 0;
+        if (cube_arrays) enabled_features.values[vk.feature_image_cube_array] = vk.true_value;
         if (supported_features.values[vk.feature_robust_buffer_access] != 0) {
             enabled_features.values[vk.feature_robust_buffer_access] = vk.true_value;
         }
@@ -4004,6 +4007,7 @@ pub const Renderer = struct {
             .loader_api_version = loader_api_version,
             .device_info = candidate.info,
             .geometry_shaders_available = geometry_shaders,
+            .cube_arrays_available = cube_arrays,
             .shader_float64_available = shader_float64,
             .image_float32_atomic_min_max_available = image_float32_atomic_min_max,
             .fragment_barycentric_available = fragment_barycentric,
@@ -18278,6 +18282,7 @@ pub const Renderer = struct {
         const bytes_per_texel = storageImageBytesPerTexel(descriptor.unified_format);
         const is_3d = dimension == .three_d;
         const is_cube = dimension == .cube;
+        if (is_cube and !self.cube_arrays_available) return Error.UnsupportedSampledImage;
         const is_2d_array = dimension == .two_d_array;
         const compatible_type = switch (dimension) {
             .two_d => descriptor.image_type == .color_2d or descriptor.image_type == .cube or
@@ -18396,7 +18401,7 @@ pub const Renderer = struct {
         else switch (dimension) {
             .two_d => if (descriptor.image_type == .cube) available_layers >= 1 else available_layers == 1,
             .three_d => available_layers >= 1,
-            .cube => available_layers >= 6,
+            .cube => available_layers >= 6 and available_layers % 6 == 0,
             .two_d_array => available_layers >= 1,
         };
         if (!valid_layers or
@@ -18839,12 +18844,11 @@ pub const Renderer = struct {
         // A cube-compatible 2D image stores one face per array layer. Some
         // Unreal fallback descriptors are typed as cube while a DIM=2D
         // instruction samples only the first 1x1 face; keep that legal by
-        // exposing one layer in that case, while true DIM=Cube gets six.
+        // exposing one layer in that case. DIM=Cube can address every cube in
+        // the view through its packed cube index and face coordinate.
         const upload_layers: u32 = if (mip_plan) |plan|
             plan.layer_count
-        else if (is_cube)
-            6
-        else if (is_2d_array)
+        else if (is_cube or is_2d_array)
             // Detiling has already rebased BASE_ARRAY to layer zero. The
             // descriptor's depth includes preceding, invisible physical slices.
             available_layers
@@ -18959,7 +18963,7 @@ pub const Renderer = struct {
             .view_type = switch (dimension) {
                 .two_d => vk.image_view_type_2d,
                 .three_d => vk.image_view_type_3d,
-                .cube => vk.image_view_type_cube,
+                .cube => vk.image_view_type_cube_array,
                 .two_d_array => vk.image_view_type_2d_array,
             },
             .format = image_format,
@@ -24082,6 +24086,7 @@ fn sampledImageStateHash(
 ) u64 {
     const words = [_]u32{
         descriptor.unified_format,
+        descriptor.base_array,
         @as(u32, descriptor.base_level) |
             (@as(u32, descriptor.last_level) << 8) |
             (@as(u32, descriptor.max_mip) << 16) |
@@ -24111,6 +24116,7 @@ fn sampledImageViewStateHash(
 ) u64 {
     const words = [_]u32{
         descriptor.unified_format,
+        descriptor.base_array,
         @as(u32, descriptor.base_level) |
             (@as(u32, descriptor.last_level) << 8) |
             (@as(u32, descriptor.max_mip) << 16) |
