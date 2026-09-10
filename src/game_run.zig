@@ -591,9 +591,9 @@ fn run(init: std.process.Init) !bool {
             allocator,
             "PS5_GPU_EAGER_STORAGE_WRITES",
         ) catch false);
-    // Small compute outputs stay resident until an exact guest-memory consumer
-    // requests them. The read path already materializes matching ranges; eager
-    // writeback otherwise forces one submit/fence/readback for every dispatch.
+    // Small compute outputs stay resident until an exact guest-memory read or
+    // a host-visible completion publishes them. Eager writeback otherwise
+    // forces one submit/fence/readback for every dispatch.
     const defer_small_storage_writes = !force_eager_storage_writes;
     const enable_automatic_deferred_storage_writes = defer_small_storage_writes;
     const enable_gpu_page_tracker = enable_gpu_experimental or

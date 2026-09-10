@@ -2360,6 +2360,103 @@ fn runDppProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("DPP passed: row shifts, rotation, swizzles, masks and both permutation selectors across 64 lanes\n", .{});
 }
 
+fn runDeferredReleaseProbe(allocator: std.mem.Allocator) !void {
+    const Audit = struct {
+        guest: SizedGuestMemory(512 * 1024) = .{},
+        expected: u32 = 0,
+        label_observed_correct_data: bool = false,
+        reject_second_output: bool = false,
+        fn read(context: ?*anyopaque, address: u64, destination: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            return SizedGuestMemory(512 * 1024).read(&self.guest, address, destination);
+        }
+        fn write(context: ?*anyopaque, address: u64, bytes: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (address == 0x2000 and self.reject_second_output) return false;
+            if (address == 0x8000) {
+                self.label_observed_correct_data = true;
+                for (0..3) |i| {
+                    const at = 0x1000 + i * 0x1000;
+                    self.label_observed_correct_data = self.label_observed_correct_data and
+                        std.mem.readInt(u32, self.guest.bytes[at..][0..4], .little) == self.expected + i;
+                }
+            }
+            return SizedGuestMemory(512 * 1024).write(&self.guest, address, bytes);
+        }
+    };
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true, .defer_small_storage_writes = true });
+    defer renderer.deinit();
+    var audit = Audit{};
+    const backend = renderer.dcbBackend(.{ .context = &audit, .read = Audit.read, .write = Audit.write });
+    const code = [_]u32{ vop1(1, 0, 4), 0xe0700000, 0x80000000, 0xbf810000 };
+    for (code, 0..) |word, i| audit.guest.word(0x100 + i * 4, word);
+    const compute = gpu.resources.ShaderStage.compute;
+    var state = gpu.State{};
+    try state.writeRegister(.shader, compute.programRegisterBase(), 1);
+    try state.writeRegister(.shader, compute.programRegisterBase() + 1, 0);
+    try state.writeRegister(.shader, 0x213, 5 << 1);
+    for (0..4) |round| {
+        audit.expected = @intCast(100 * (round + 1));
+        audit.label_observed_correct_data = false;
+        for (0..4) |i| {
+            const address: u32 = if (i < 3) @intCast(0x1000 + i * 0x1000) else 0x10000;
+            const size: u32 = if (i < 3) 4 else 256 * 1024;
+            const words = [_]u32{ address, 4 << 16, size / 4, 0, audit.expected + @as(u32, @intCast(i)) };
+            for (words, 0..) |word, j|
+                try state.writeRegister(.shader, compute.userDataBase() + @as(u32, @intCast(j)), word);
+            _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
+            const before: u32 = if (i < 3 and round != 0) @intCast(100 * round + i) else 0;
+            try std.testing.expectEqual(before, std.mem.readInt(u32, audit.guest.bytes[address..][0..4], .little));
+        }
+        const release = gpu.state.ReleaseMem{
+            .event_type = 40,
+            .event_index = 5,
+            .gcr_control = 0x200,
+            .cache_policy = 0,
+            .destination = 1,
+            .interrupt = 2,
+            .data_selection = 2,
+            .address = 0x8000,
+            .data = round + 1,
+            .interrupt_context_id = 0,
+            .standard_packet = true,
+        };
+        if (round == 2) {
+            // A cache event without a payload keeps the work resident; an
+            // addressed event is a host-visible completion boundary.
+            try std.testing.expect(backend.vtable.event.?(backend.context, .{
+                .event_type = 7,
+                .event_index = 4,
+                .address = null,
+            }));
+            try std.testing.expectEqual(@as(u32, 200), std.mem.readInt(u32, audit.guest.bytes[0x1000..][0..4], .little));
+            try std.testing.expect(backend.vtable.event.?(backend.context, .{
+                .event_type = 0x38,
+                .event_index = 4,
+                .address = 0x8000,
+            }));
+            for (0..3) |i| {
+                const at = 0x1000 + i * 0x1000;
+                try std.testing.expectEqual(audit.expected + @as(u32, @intCast(i)), std.mem.readInt(u32, audit.guest.bytes[at..][0..4], .little));
+            }
+        }
+        if (round == 3) {
+            // A failed output write must not expose the completion label.
+            audit.reject_second_output = true;
+            try std.testing.expect(!backend.vtable.release.?(backend.context, release));
+            try std.testing.expect(!audit.label_observed_correct_data);
+            try std.testing.expectEqual(@as(u64, round), std.mem.readInt(u64, audit.guest.bytes[0x8000..][0..8], .little));
+            audit.reject_second_output = false;
+        }
+        try std.testing.expect(backend.vtable.release.?(backend.context, release));
+        try std.testing.expect(audit.label_observed_correct_data);
+        try std.testing.expectEqual(@as(u64, round + 1), std.mem.readInt(u64, audit.guest.bytes[0x8000..][0..8], .little));
+        // Large outputs retain their existing explicit-readback policy.
+        try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, audit.guest.bytes[0x10000..][0..4], .little));
+    }
+    std.debug.print("Deferred releases passed: small writes precede completion labels, addressed events publish outputs, failed writes withhold completion, large outputs stay resident\n", .{});
+}
+
 fn runImageResinfoProbe(allocator: std.mem.Allocator) !void {
     var renderer = try vulkan.Renderer.init(allocator, .{});
     defer renderer.deinit();
@@ -7593,6 +7690,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--packed-floats")) {
         try runPackedFloatProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--deferred-release")) {
+        try runDeferredReleaseProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--image-resinfo")) {

@@ -20341,10 +20341,12 @@ pub const Renderer = struct {
             std.debug.print("[vulkan dcb] release timeline wait failed: {s}\n", .{@errorName(err)});
             return false;
         };
-        // The queued work has completed, but a release normally exposes
-        // only its fence/timestamp payload to the CPU. Keep color attachments
-        // and large compute outputs resident; exact texture/presentation reads
-        // materialize the resource they name instead of every dirty target.
+        // Small buffers may contain results consumed directly by guest CPU
+        // threads after this label. With deferred dispatch writeback, publish
+        // them here before the completion payload becomes observable.
+        if (!self.publishDeferredSmallStorageWrites()) return false;
+        // Large compute outputs and color attachments keep their existing
+        // residency policy; exact consumers materialize the ranges they name.
         if ((release.destination != 0 and release.destination != 1) or release.address == 0) return true;
         var bytes: [8]u8 = undefined;
         const accepted = switch (release.data_selection) {
@@ -20388,6 +20390,19 @@ pub const Renderer = struct {
             // delivered. Treat failure to mirror as diagnostic, not a fatal
             // queue rejection; WAIT_REG_MEM has its own guarded recovery.
             return true;
+        }
+        return true;
+    }
+
+    fn publishDeferredSmallStorageWrites(self: *Renderer) bool {
+        if (!self.defer_small_storage_writes_enabled) return true;
+        for (self.guest_buffers.items, 0..) |entry, index| {
+            if (!entry.gpu_dirty or entry.size >= deferred_storage_write_min_bytes) continue;
+            self.flushGuestStorageBuffer(index) catch |err| {
+                self.last_sync_error = err;
+                std.debug.print("[vulkan dcb] deferred completion writeback failed: {s}\n", .{@errorName(err)});
+                return false;
+            };
         }
         return true;
     }
@@ -20537,7 +20552,10 @@ pub const Renderer = struct {
         // ordering point instead of submitting and waiting after every draw.
         // Addressed events can carry a guest-visible completion payload and
         // remain a conservative host synchronization boundary.
-        if (event.address != null) return self.synchronizeDrawBatch("addressed event");
+        if (event.address != null) {
+            if (!self.synchronizeDrawBatch("addressed event")) return false;
+            return self.publishDeferredSmallStorageWrites();
+        }
         self.last_sync_error = null;
         return true;
     }
