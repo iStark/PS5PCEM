@@ -2313,6 +2313,10 @@ const CachedStorageImage = struct {
     // Every prepared binding owns one pin until its submission retires.
     pin_count: usize = 0,
     valid: bool = true,
+
+    fn address(self: CachedStorageImage) u64 {
+        return self.descriptor.address;
+    }
 };
 
 const SampledImageKey = struct {
@@ -3278,6 +3282,7 @@ pub const Renderer = struct {
     resident_image_views: std.ArrayList(CachedResidentImageView) = .empty,
     resident_samplers: std.ArrayList(CachedResidentSampler) = .empty,
     storage_image_cache: std.ArrayList(CachedStorageImage) = .empty,
+    storage_image_address_index: @import("sampled_image_index.zig").Index(maximum_cached_storage_images) = .{},
     storage_image_cache_bytes: usize = 0,
     storage_image_cache_limit: usize = 1280 * 1024 * 1024,
     storage_image_sequence: u64 = 0,
@@ -6788,7 +6793,9 @@ pub const Renderer = struct {
             return Error.UnsupportedStorageImage;
 
         self.storage_image_sequence +%= 1;
-        for (self.storage_image_cache.items, 0..) |cached, index| {
+        var candidates = self.storage_image_address_index.candidatesBy(self.storage_image_cache.items, descriptor.address, CachedStorageImage.address);
+        while (candidates.next()) |index| {
+            const cached = self.storage_image_cache.items[index];
             if (!cached.valid or !sameStorageImageDescriptor(cached.descriptor, descriptor)) continue;
             const resident = &self.storage_image_cache.items[index];
             resident.pin_count += 1;
@@ -6856,6 +6863,7 @@ pub const Renderer = struct {
         );
         errdefer if (!cache_owns_resources) self.image_aliases.unregister(alias_token);
         const cache_index = try self.storageImageCacheSlot(memory, staging_bytes);
+        self.storage_image_address_index.invalidate();
         self.storage_image_cache.items[cache_index] = .{
             .alias_token = alias_token,
             .descriptor = descriptor,
@@ -17321,7 +17329,9 @@ pub const Renderer = struct {
         _: usize,
     ) (Error || std.mem.Allocator.Error)!void {
         const memory = self.guest_memory orelse return Error.GuestMemoryUnavailable;
-        for (self.storage_image_cache.items, 0..) |cached, index| {
+        var candidates = self.storage_image_address_index.candidatesBy(self.storage_image_cache.items, address, CachedStorageImage.address);
+        while (candidates.next()) |index| {
+            const cached = self.storage_image_cache.items[index];
             if (!cached.valid or !cached.gpu_dirty) continue;
             // Match the buffer cache's visibility rule: command-processor
             // accesses to labels inside a generously-sized resource do not
@@ -17697,7 +17707,9 @@ pub const Renderer = struct {
 
         self.storage_image_sequence +%= 1;
         var matching_index: ?usize = null;
-        for (self.storage_image_cache.items, 0..) |cached, index| {
+        var candidates = self.storage_image_address_index.candidatesBy(self.storage_image_cache.items, descriptor.address, CachedStorageImage.address);
+        while (candidates.next()) |index| {
+            const cached = self.storage_image_cache.items[index];
             if (!cached.valid or !sameStorageImageDescriptor(cached.descriptor, descriptor)) continue;
             matching_index = index;
 
@@ -17882,6 +17894,7 @@ pub const Renderer = struct {
         errdefer self.image_aliases.unregister(alias_token);
 
         const cache_index = try self.storageImageCacheSlot(memory, staging_bytes);
+        self.storage_image_address_index.invalidate();
         self.storage_image_cache.items[cache_index] = .{
             .alias_token = alias_token,
             .descriptor = descriptor,
@@ -18087,7 +18100,9 @@ pub const Renderer = struct {
         if (dimension != .two_d and dimension != .three_d and dimension != .two_d_array) return null;
         var best_index: ?usize = null;
         var best_sequence: u64 = 0;
-        for (self.storage_image_cache.items, 0..) |cached, index| {
+        var candidates = self.storage_image_address_index.candidatesBy(self.storage_image_cache.items, descriptor.address, CachedStorageImage.address);
+        while (candidates.next()) |index| {
+            const cached = self.storage_image_cache.items[index];
             // A later sampled T# often restates the same allocation as a depth
             // tile even though the producer wrote it as a colour storage image.
             // Matching tile_mode would miss that GPU copy and re-upload guest

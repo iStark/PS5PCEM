@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Artur Strazewicz
 
-//! Address buckets for resident sampled views. The caller still checks the
+//! Address buckets for resident image views. The caller still checks the
 //! complete view and source-generation keys for every candidate.
 const std = @import("std");
 
@@ -40,6 +40,14 @@ pub fn Index(comptime capacity: usize) type {
         }
 
         pub fn candidates(self: *Self, items: anytype, address: u64) Iterator {
+            return self.candidatesBy(items, address, struct {
+                fn get(item: @TypeOf(items[0])) u64 {
+                    return item.guest_address;
+                }
+            }.get);
+        }
+
+        pub fn candidatesBy(self: *Self, items: anytype, address: u64, comptime addressOf: anytype) Iterator {
             if (!self.valid) {
                 std.debug.assert(items.len <= capacity);
                 @memset(&self.heads, empty);
@@ -48,7 +56,7 @@ pub fn Index(comptime capacity: usize) type {
                 var slot = items.len;
                 while (slot != 0) {
                     slot -= 1;
-                    const head = &self.heads[bucket(items[slot].guest_address)];
+                    const head = &self.heads[bucket(addressOf(items[slot]))];
                     self.links[slot] = head.*;
                     head.* = @intCast(slot);
                 }
@@ -92,4 +100,47 @@ test "sampled image buckets preserve collisions and rebuild after ordered remova
         };
         try std.testing.expect(found);
     }
+}
+
+test "descriptor address buckets preserve view order after slot replacement" {
+    const Entry = struct {
+        descriptor: struct { address: u64 },
+        valid: bool = true,
+        fn address(self: @This()) u64 {
+            return self.descriptor.address;
+        }
+    };
+    var entries = [_]Entry{
+        .{ .descriptor = .{ .address = 0x1000 } },
+        .{ .descriptor = .{ .address = 0x2000 } },
+        .{ .descriptor = .{ .address = 0x1000 } },
+    };
+    var index = Index(64){};
+    var candidates = index.candidatesBy(&entries, 0x1000, Entry.address);
+    var matched: std.ArrayList(usize) = .empty;
+    defer matched.deinit(std.testing.allocator);
+    while (candidates.next()) |slot| {
+        if (entries[slot].descriptor.address == 0x1000)
+            try matched.append(std.testing.allocator, slot);
+    }
+    try std.testing.expectEqualSlices(usize, &.{ 0, 2 }, matched.items);
+    // Eviction leaves the address in its slot; callers exclude invalid views.
+    entries[0].valid = false;
+    candidates = index.candidatesBy(&entries, 0x1000, Entry.address);
+    matched.clearRetainingCapacity();
+    while (candidates.next()) |slot| {
+        if (entries[slot].valid and entries[slot].descriptor.address == 0x1000)
+            try matched.append(std.testing.allocator, slot);
+    }
+    try std.testing.expectEqualSlices(usize, &.{2}, matched.items);
+    entries[0] = .{ .descriptor = .{ .address = 0x3000 } };
+    entries[1].descriptor.address = 0x1000;
+    index.invalidate();
+    candidates = index.candidatesBy(&entries, 0x1000, Entry.address);
+    matched.clearRetainingCapacity();
+    while (candidates.next()) |slot| {
+        if (entries[slot].descriptor.address == 0x1000)
+            try matched.append(std.testing.allocator, slot);
+    }
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2 }, matched.items);
 }
