@@ -113,6 +113,22 @@ var vblank_count: u64 = 0;
 var open_process_time_us: u64 = 0;
 var last_flip_argument: i64 = 0;
 var has_last_flip_argument: bool = false;
+// The currently modeled VideoOut ABI distinguishes HD (1) and UHD (2).
+// Keep this independent of registered buffers: games may render internally at
+// a higher resolution than the selected output. Do not invent 1440p/8K ABI IDs.
+var output_resolution_class: u32 = 1;
+
+pub fn configureOutputResolution(width: u32, height: u32) void {
+    lock.lock();
+    defer lock.unlock();
+    output_resolution_class = if (width >= 3840 or height >= 2160) 2 else 1;
+}
+
+pub fn outputResolutionClass() u32 {
+    lock.lock();
+    defer lock.unlock();
+    return output_resolution_class;
+}
 
 pub fn reset() void {
     lock.lock();
@@ -127,6 +143,7 @@ pub fn reset() void {
     open_process_time_us = 0;
     last_flip_argument = 0;
     has_last_flip_argument = false;
+    output_resolution_class = 1;
 }
 
 pub fn open(index: i32) bool {
@@ -432,6 +449,28 @@ test "registered buffers resolve through a completed SetFlip" {
     try std.testing.expect(completeFlip(flip));
     try std.testing.expectEqual(@as(u64, 1), status(primary_handle).?.count);
     try std.testing.expectEqual(@as(i64, 77), status(primary_handle).?.flip_argument);
+}
+
+test "output profile does not resize guest buffers and resets to 1080p" {
+    reset();
+    defer reset();
+    try std.testing.expectEqual(@as(u32, 1), outputResolutionClass());
+    try std.testing.expect(open(0));
+    var pixel: [4]u8 = @splat(0);
+    const input = [_]Buffer{.{ .data = &pixel, .metadata = null, .reserved = .{ null, null } }};
+    try registerBuffers(0, 0, &input, .{ .width = 3840, .height = 2160, .pitch_in_pixels = 4096 }, 0);
+    try std.testing.expectEqual(@as(u32, 1), outputResolutionClass());
+    configureOutputResolution(2560, 1440);
+    try std.testing.expectEqual(@as(u32, 1), outputResolutionClass());
+    configureOutputResolution(3840, 2160);
+    try std.testing.expectEqual(@as(u32, 2), outputResolutionClass());
+    configureOutputResolution(7680, 4320);
+    try std.testing.expectEqual(@as(u32, 2), outputResolutionClass());
+    const registration = resolveFlip(.{ .video_out_handle = primary_handle, .display_buffer_index = 0, .mode = 1, .argument = 0 }).?;
+    try std.testing.expectEqual(@as(u32, 3840), registration.attribute.width);
+    try std.testing.expectEqual(@as(u32, 4096), registration.attribute.pitch_in_pixels);
+    reset();
+    try std.testing.expectEqual(@as(u32, 1), outputResolutionClass());
 }
 
 test "attribute groups and buffer slots cannot overlap" {

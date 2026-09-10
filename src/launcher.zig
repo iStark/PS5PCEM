@@ -10,6 +10,7 @@
 const std = @import("std");
 const input = @import("input");
 const builtin = @import("builtin");
+const display_mode = @import("display_mode.zig");
 
 comptime {
     // The interface contains a fair amount of Cyrillic text converted to
@@ -72,6 +73,9 @@ const Phrase = enum {
     sound_output_description,
     fps_counter,
     fps_counter_description,
+    output_resolution,
+    output_resolution_description,
+    status_resolution_saved,
     compatibility,
     compatibility_text,
     author,
@@ -134,6 +138,7 @@ const pad_test_tick_ms: u32 = 40;
 var current_window: Win32.Window = null;
 var sound_enabled = true;
 var show_fps = false;
+var output_mode = display_mode.default;
 var mapping = mapping_defaults;
 var capture_mapping: ?usize = null;
 var game_folder: [1024]u16 = [_]u16{0} ** 1024;
@@ -214,6 +219,9 @@ fn tr(phrase: Phrase) []const u8 {
             .sound_output_description => "Disabling sound does not affect AudioOut timing",
             .fps_counter => "FPS counter",
             .fps_counter_description => "Show the measured frame rate in the game window title",
+            .output_resolution => "OUTPUT RESOLUTION",
+            .output_resolution_description => "Window size and display profile; games choose their internal resolution. Applied on next launch.",
+            .status_resolution_saved => "Output resolution saved for the next launch",
             .compatibility => "Compatibility",
             .compatibility_text => "PS5PCEM is at an early stage. Not every title boots yet; advanced DualSense features, native PS5 keyboard/mouse and controller-to-keyboard conversion still need more HLE support.",
             .author => "Author: Artur Strazewicz · GitHub: iStark/PS5PCEM",
@@ -286,6 +294,9 @@ fn tr(phrase: Phrase) []const u8 {
             .sound_output_description => "关闭声音不会影响 AudioOut 时序",
             .fps_counter => "帧率显示",
             .fps_counter_description => "在游戏窗口标题中显示实测帧率",
+            .output_resolution => "输出分辨率",
+            .output_resolution_description => "设置窗口大小和显示模式；内部分辨率由游戏决定。下次启动时生效。",
+            .status_resolution_saved => "输出分辨率已保存，下次启动时生效",
             .compatibility => "兼容性",
             .compatibility_text => "PS5PCEM 仍处于早期开发阶段，部分游戏尚无法启动。DualSense 高级功能、PS5 原生键鼠和手柄转键盘功能仍需进一步完善 HLE 支持。",
             .author => "作者：Artur Strazewicz · GitHub：iStark/PS5PCEM",
@@ -358,6 +369,9 @@ fn tr(phrase: Phrase) []const u8 {
             .sound_output_description => "Desactivar el sonido no afecta a la sincronización de AudioOut",
             .fps_counter => "Contador de FPS",
             .fps_counter_description => "Muestra los FPS medidos en el título de la ventana del juego",
+            .output_resolution => "RESOLUCIÓN DE SALIDA",
+            .output_resolution_description => "Tamaño de ventana y perfil de pantalla; el juego decide la resolución interna. Se aplica al volver a iniciar.",
+            .status_resolution_saved => "Resolución guardada para el próximo inicio",
             .compatibility => "Compatibilidad",
             .compatibility_text => "PS5PCEM está en una fase temprana: algunos juegos no arrancan. Las funciones avanzadas de DualSense, el teclado y ratón nativos de PS5 y la conversión de mando a teclado aún necesitan más soporte HLE.",
             .author => "Autor: Artur Strazewicz · GitHub: iStark/PS5PCEM",
@@ -430,6 +444,9 @@ fn tr(phrase: Phrase) []const u8 {
             .sound_output_description => "تعطيل الصوت لا يؤثر على توقيت AudioOut",
             .fps_counter => "عداد الإطارات",
             .fps_counter_description => "عرض معدل الإطارات المقاس في عنوان نافذة اللعبة",
+            .output_resolution => "دقة الإخراج",
+            .output_resolution_description => "حجم النافذة ووضع العرض؛ تختار اللعبة الدقة الداخلية. يُطبّق عند التشغيل التالي.",
+            .status_resolution_saved => "تم حفظ دقة الإخراج للتشغيل التالي",
             .compatibility => "التوافق",
             .compatibility_text => "لا يزال PS5PCEM في مرحلة مبكرة، وبعض الألعاب لا تعمل بعد. تحتاج ميزات DualSense المتقدمة ولوحة المفاتيح والفأرة الأصلية لـ PS5 وتحويل يد التحكم إلى لوحة مفاتيح إلى مزيد من دعم HLE.",
             .author => "المؤلف: Artur Strazewicz · GitHub: iStark/PS5PCEM",
@@ -502,6 +519,9 @@ fn tr(phrase: Phrase) []const u8 {
             .sound_output_description => "Desativar o som não afeta a sincronização do AudioOut",
             .fps_counter => "Contador de FPS",
             .fps_counter_description => "Mostrar a taxa de quadros medida no título da janela do jogo",
+            .output_resolution => "RESOLUÇÃO DE SAÍDA",
+            .output_resolution_description => "Tamanho da janela e perfil de tela; o jogo escolhe a resolução interna. Aplicado na próxima execução.",
+            .status_resolution_saved => "Resolução salva para a próxima execução",
             .compatibility => "Compatibilidade",
             .compatibility_text => "O PS5PCEM está em fase inicial: alguns jogos ainda não iniciam. Recursos avançados do DualSense, teclado e mouse nativos do PS5 e a conversão de controle para teclado precisam de mais suporte HLE.",
             .author => "Autor: Artur Strazewicz · GitHub: iStark/PS5PCEM",
@@ -574,6 +594,9 @@ fn tr(phrase: Phrase) []const u8 {
             .sound_output_description => "Отключение не нарушает тайминг AudioOut",
             .fps_counter => "Счётчик FPS",
             .fps_counter_description => "Показывать частоту кадров в заголовке окна игры",
+            .output_resolution => "РАЗРЕШЕНИЕ ВЫВОДА",
+            .output_resolution_description => "Размер окна и режим дисплея; внутреннее разрешение выбирает игра. Применяется при следующем запуске.",
+            .status_resolution_saved => "Разрешение сохранено для следующего запуска",
             .compatibility => "Совместимость",
             .compatibility_text => "PS5PCEM находится на ранней стадии. Не все игры загружаются; функции DualSense, нативные PS5-клавиатура/мышь и преобразование геймпада в клавиши требуют дальнейшей HLE-поддержки.",
             .author => "Автор: Artur Strazewicz · GitHub: iStark/PS5PCEM",
@@ -646,6 +669,9 @@ fn tr(phrase: Phrase) []const u8 {
             .sound_output_description => "Deaktivieren beeinflusst das AudioOut-Timing nicht",
             .fps_counter => "FPS-Anzeige",
             .fps_counter_description => "Bildrate im Titel des Spielfensters anzeigen",
+            .output_resolution => "AUSGABEAUFLÖSUNG",
+            .output_resolution_description => "Fenstergröße und Anzeigeprofil; das Spiel wählt die interne Auflösung. Gilt ab dem nächsten Start.",
+            .status_resolution_saved => "Auflösung für den nächsten Start gespeichert",
             .compatibility => "Kompatibilität",
             .compatibility_text => "PS5PCEM ist in einer frühen Phase. Nicht jedes Spiel startet; erweiterte DualSense-Funktionen, native PS5-Tastatur/Maus und Controller-zu-Tastatur benötigen weitere HLE-Unterstützung.",
             .author => "Autor: Artur Strazewicz · GitHub: iStark/PS5PCEM",
@@ -718,6 +744,9 @@ fn tr(phrase: Phrase) []const u8 {
             .sound_output_description => "La désactivation n'affecte pas le rythme AudioOut",
             .fps_counter => "Compteur FPS",
             .fps_counter_description => "Afficher la fréquence d'images dans le titre de la fenêtre",
+            .output_resolution => "RÉSOLUTION DE SORTIE",
+            .output_resolution_description => "Taille de fenêtre et profil d’affichage ; le jeu choisit sa résolution interne. Appliqué au prochain lancement.",
+            .status_resolution_saved => "Résolution enregistrée pour le prochain lancement",
             .compatibility => "Compatibilité",
             .compatibility_text => "PS5PCEM est encore expérimental. Tous les jeux ne démarrent pas ; les fonctions DualSense avancées, le clavier/souris PS5 natif et la conversion manette-clavier demandent davantage de prise en charge HLE.",
             .author => "Auteur : Artur Strazewicz · GitHub : iStark/PS5PCEM",
@@ -1010,8 +1039,15 @@ const language_rects = [_]Rect{
 };
 
 const settings_toggle_rects = [_]Rect{
-    .{ .left = 282, .top = 334, .right = 1086, .bottom = 410 },
-    .{ .left = 282, .top = 426, .right = 1086, .bottom = 502 },
+    .{ .left = 282, .top = 464, .right = 676, .bottom = 548 },
+    .{ .left = 690, .top = 464, .right = 1086, .bottom = 548 },
+};
+
+const resolution_rects = [_]Rect{
+    .{ .left = 282, .top = 360, .right = 472, .bottom = 414 },
+    .{ .left = 486, .top = 360, .right = 676, .bottom = 414 },
+    .{ .left = 690, .top = 360, .right = 880, .bottom = 414 },
+    .{ .left = 894, .top = 360, .right = 1086, .bottom = 414 },
 };
 
 fn controllerSlotRect(index: usize) Rect {
@@ -1057,6 +1093,7 @@ fn clickableAt(x: i32, y: i32) bool {
         },
         .saves => saves_open_rect.contains(x, y),
         .settings => indexOfRect(&language_rects, x, y) != null or
+            indexOfRect(&resolution_rects, x, y) != null or
             indexOfRect(&settings_toggle_rects, x, y) != null,
     };
 }
@@ -1133,6 +1170,12 @@ fn handleInputClick(x: i32, y: i32) void {
 }
 
 fn handleSettingsClick(x: i32, y: i32) void {
+    if (indexOfRect(&resolution_rects, x, y)) |index| {
+        output_mode = display_mode.choices[index];
+        saveSettings();
+        setStatusPhrase(.status_resolution_saved, false);
+        return;
+    }
     if (indexOfRect(&language_rects, x, y)) |index| {
         language = @enumFromInt(index);
         status_length = 0;
@@ -1878,21 +1921,27 @@ fn drawSettings(dc: Win32.DeviceContext) void {
         drawLanguageCard(dc, @enumFromInt(index), rectangle, label);
     }
 
-    card(dc, settings_toggle_rects[0]);
-    localizedText(dc, .sound_output, .{ .left = 310, .top = 346, .right = 956, .bottom = 371 }, 0x00f4f0ea, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
-    localizedText(dc, .sound_output_description, .{ .left = 310, .top = 377, .right = 956, .bottom = 401 }, 0x008b817a, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
-    drawToggle(dc, 988, 357, sound_enabled);
+    localizedText(dc, .output_resolution, .{ .left = 282, .top = 332, .right = 1086, .bottom = 354 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    for (resolution_rects, display_mode.choices) |rectangle, mode| {
+        const selected = output_mode == mode;
+        roundFill(dc, rectangle, 10, if (selected) 0x0042362e else 0x00251f1b);
+        if (selected) roundFill(dc, .{ .left = rectangle.left + 14, .top = rectangle.top + 22, .right = rectangle.left + 24, .bottom = rectangle.top + 32 }, 5, 0x00ffac64);
+        textUtf8(dc, mode.label(), .{ .left = rectangle.left + 36, .top = rectangle.top + 17, .right = rectangle.right - 12, .bottom = rectangle.bottom - 10 }, 0x00f4f0ea, medium_font, Win32.dt_left);
+    }
+    localizedText(dc, .output_resolution_description, .{ .left = 282, .top = 420, .right = 1086, .bottom = 458 }, 0x009b9088, small_font, Win32.dt_left | Win32.dt_word_break);
 
-    card(dc, settings_toggle_rects[1]);
-    localizedText(dc, .fps_counter, .{ .left = 310, .top = 438, .right = 956, .bottom = 463 }, 0x00f4f0ea, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
-    localizedText(dc, .fps_counter_description, .{ .left = 310, .top = 469, .right = 956, .bottom = 493 }, 0x008b817a, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
-    drawToggle(dc, 988, 449, show_fps);
+    for (settings_toggle_rects, [_]Phrase{ .sound_output, .fps_counter }, [_]Phrase{ .sound_output_description, .fps_counter_description }, [_]bool{ sound_enabled, show_fps }) |rectangle, heading, description, enabled| {
+        card(dc, rectangle);
+        localizedText(dc, heading, .{ .left = rectangle.left + 20, .top = 476, .right = rectangle.right - 90, .bottom = 501 }, 0x00f4f0ea, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
+        localizedText(dc, description, .{ .left = rectangle.left + 20, .top = 507, .right = rectangle.right - 20, .bottom = 544 }, 0x008b817a, small_font, Win32.dt_left | Win32.dt_word_break);
+        drawToggle(dc, rectangle.right - 78, 474, enabled);
+    }
 
-    card(dc, .{ .left = 282, .top = 518, .right = 1086, .bottom = 626 });
-    localizedText(dc, .compatibility, .{ .left = 310, .top = 530, .right = 1048, .bottom = 556 }, 0x00f4f0ea, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
-    localizedText(dc, .compatibility_text, .{ .left = 310, .top = 563, .right = 1048, .bottom = 618 }, 0x00aaa098, regular_font, Win32.dt_left | Win32.dt_word_break);
+    card(dc, .{ .left = 282, .top = 560, .right = 1086, .bottom = 640 });
+    localizedText(dc, .compatibility, .{ .left = 302, .top = 570, .right = 1066, .bottom = 595 }, 0x00f4f0ea, medium_font, Win32.dt_left | Win32.dt_end_ellipsis);
+    localizedText(dc, .compatibility_text, .{ .left = 302, .top = 601, .right = 1066, .bottom = 637 }, 0x00aaa098, small_font, Win32.dt_left | Win32.dt_word_break);
 
-    card(dc, .{ .left = 282, .top = 642, .right = 1086, .bottom = 714 });
+    card(dc, .{ .left = 282, .top = 650, .right = 1086, .bottom = 714 });
     text(dc, w("PS5PCEM"), -1, .{ .left = 310, .top = 654, .right = 500, .bottom = 680 }, 0x00f4f0ea, medium_font, Win32.dt_left);
     localizedText(dc, .author, .{ .left = 310, .top = 684, .right = 840, .bottom = 708 }, 0x00ffac64, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
     text(dc, w("GPL-3.0-or-later"), -1, .{ .left = 860, .top = 684, .right = 1048, .bottom = 708 }, 0x008b817a, regular_font, Win32.dt_right);
@@ -2065,6 +2114,10 @@ fn launchGame(owner: Win32.Window) void {
 
     _ = Win32.SetEnvironmentVariableW(w("PS5_AUDIO_DISABLED"), if (sound_enabled) null else w("1"));
     _ = Win32.SetEnvironmentVariableW(w("PS5_SHOW_FPS"), if (show_fps) w("1") else null);
+    var resolution_value: [8]u16 = @splat(0);
+    const resolution_length = std.unicode.utf8ToUtf16Le(&resolution_value, output_mode.value()) catch unreachable;
+    resolution_value[resolution_length] = 0;
+    _ = Win32.SetEnvironmentVariableW(w(display_mode.environment_name), @ptrCast(&resolution_value));
     _ = Win32.SetEnvironmentVariableW(w("PS5_INPUT_MODE"), inputModeEnvironment());
     var controller_value = [_:0]u16{@as(u16, '0') + controller_index};
     _ = Win32.SetEnvironmentVariableW(w("PS5_CONTROLLER_INDEX"), &controller_value);
@@ -2216,6 +2269,7 @@ fn loadSettings() void {
     if (game_folder_length != 0) rememberGameFolder(game_folder[0..game_folder_length], true);
     sound_enabled = Win32.GetPrivateProfileIntW(w("launcher"), w("sound"), 1, @ptrCast(&ini_path)) != 0;
     show_fps = Win32.GetPrivateProfileIntW(w("launcher"), w("show_fps"), 0, @ptrCast(&ini_path)) != 0;
+    output_mode = display_mode.Mode.fromHeight(Win32.GetPrivateProfileIntW(w("launcher"), w("output_resolution"), display_mode.default.height(), @ptrCast(&ini_path))) orelse display_mode.default;
     const mode_value = Win32.GetPrivateProfileIntW(w("launcher"), w("input_mode"), 2, @ptrCast(&ini_path));
     if (mode_value <= 2) input_mode = @enumFromInt(mode_value);
     const language_value = Win32.GetPrivateProfileIntW(w("launcher"), w("language"), 0, @ptrCast(&ini_path));
@@ -2235,6 +2289,7 @@ fn saveSettings() void {
     _ = Win32.WritePrivateProfileStringW(w("launcher"), w("game_folder"), @ptrCast(&game_folder), @ptrCast(&ini_path));
     writeIniInt(w("launcher"), w("sound"), @intFromBool(sound_enabled));
     writeIniInt(w("launcher"), w("show_fps"), @intFromBool(show_fps));
+    writeIniInt(w("launcher"), w("output_resolution"), output_mode.height());
     writeIniInt(w("launcher"), w("input_mode"), @intFromEnum(input_mode));
     writeIniInt(w("launcher"), w("language"), @intFromEnum(language));
     writeIniInt(w("launcher"), w("controller_index"), controller_index);

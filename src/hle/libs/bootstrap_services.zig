@@ -1423,7 +1423,7 @@ fn videoOutGetEventData(event: ?*const kernel_event_queue.Event, out_data: ?*u64
 fn videoOutGetOutputStatus(handle: i32, status: ?*VideoOutOutputStatus) callconv(abi.guest) i32 {
     if (!validVideoHandle(handle)) return video_out_error_invalid_handle;
     const output = status orelse return video_out_error_invalid_address;
-    output.* = .{};
+    output.* = .{ .resolution = video_out.outputResolutionClass() };
     return errno.ok;
 }
 

@@ -29,6 +29,21 @@ const status_open: u8 = 1;
 const status_failed: u8 = 2;
 const status_closed: u8 = 3;
 
+const Extent = struct { width: u32, height: u32 };
+
+fn fitClientExtent(width: u32, height: u32, available_width: u32, available_height: u32) Extent {
+    var result = Extent{ .width = width, .height = height };
+    if (result.width > available_width) {
+        result.height = @intCast(@max(1, @as(u64, height) * available_width / width));
+        result.width = available_width;
+    }
+    if (result.height > available_height) {
+        result.width = @intCast(@max(1, @as(u64, width) * available_height / height));
+        result.height = available_height;
+    }
+    return result;
+}
+
 pub const HostWindow = struct {
     thread: ?std.Thread = null,
     status: std.atomic.Value(u8) = .init(status_closed),
@@ -132,15 +147,31 @@ pub const HostWindow = struct {
             self.status.store(status_failed, .release);
             return;
         }
+        // Fit the requested client area to the desktop without changing the
+        // display profile exposed to the guest or resizing its render targets.
+        var border = Win32.Rect{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+        _ = Win32.AdjustWindowRect(&border, Win32.window_style, 0);
+        const border_width = border.right - border.left;
+        const border_height = border.bottom - border.top;
+        var work_area: Win32.Rect = undefined;
+        var x = Win32.use_default;
+        var y = Win32.use_default;
+        if (Win32.SystemParametersInfoA(0x0030, 0, &work_area, 0) != 0) {
+            const fitted = fitClientExtent(self.width, self.height, @intCast(@max(1, work_area.right - work_area.left - border_width)), @intCast(@max(1, work_area.bottom - work_area.top - border_height)));
+            self.width = fitted.width;
+            self.height = fitted.height;
+            x = work_area.left + @divTrunc(work_area.right - work_area.left - @as(i32, @intCast(self.width)) - border_width, 2);
+            y = work_area.top + @divTrunc(work_area.bottom - work_area.top - @as(i32, @intCast(self.height)) - border_height, 2);
+        }
         const window = Win32.CreateWindowExA(
             0,
             Win32.class_name,
             "PS5PCEM - Vulkan guest output",
             Win32.window_style,
-            Win32.use_default,
-            Win32.use_default,
-            @intCast(self.width),
-            @intCast(self.height),
+            x,
+            y,
+            @as(i32, @intCast(self.width)) + border_width,
+            @as(i32, @intCast(self.height)) + border_height,
             null,
             null,
             instance,
@@ -149,6 +180,11 @@ pub const HostWindow = struct {
             self.status.store(status_failed, .release);
             return;
         };
+        var client: Win32.Rect = undefined;
+        if (Win32.GetClientRect(window, &client) != 0) {
+            self.width = @intCast(client.right - client.left);
+            self.height = @intCast(client.bottom - client.top);
+        }
         self.instance.store(@intFromPtr(instance), .release);
         self.window.store(@intFromPtr(window), .release);
         self.status.store(status_open, .release);
@@ -193,6 +229,7 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     const Menu = ?*anyopaque;
 
     const Point = extern struct { x: i32, y: i32 };
+    const Rect = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
     const Message = extern struct {
         window: Window,
         message: u32,
@@ -231,6 +268,9 @@ const Win32 = if (builtin.os.tag == .windows) struct {
     extern "kernel32" fn GetModuleHandleA(name: ?[*:0]const u8) callconv(.winapi) Instance;
     extern "kernel32" fn GetLastError() callconv(.winapi) u32;
     extern "user32" fn RegisterClassExA(class: *const WndClassExA) callconv(.winapi) u16;
+    extern "user32" fn AdjustWindowRect(*Rect, u32, i32) callconv(.winapi) i32;
+    extern "user32" fn GetClientRect(Window, *Rect) callconv(.winapi) i32;
+    extern "user32" fn SystemParametersInfoA(u32, u32, ?*anyopaque, u32) callconv(.winapi) i32;
     extern "user32" fn CreateWindowExA(
         extended_style: u32,
         class_name: [*:0]const u8,
@@ -261,4 +301,10 @@ const Win32 = if (builtin.os.tag == .windows) struct {
 test "native handle is unavailable before window creation" {
     const window = HostWindow{};
     try std.testing.expect(window.nativeHandle() == null);
+}
+
+test "large output windows fit the desktop while preserving the aspect ratio" {
+    try std.testing.expectEqual(Extent{ .width = 1920, .height = 1080 }, fitClientExtent(1920, 1080, 2500, 1400));
+    try std.testing.expectEqual(Extent{ .width = 1920, .height = 1080 }, fitClientExtent(7680, 4320, 1920, 1200));
+    try std.testing.expectEqual(Extent{ .width = 1280, .height = 720 }, fitClientExtent(3840, 2160, 1900, 720));
 }

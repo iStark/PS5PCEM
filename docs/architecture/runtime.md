@@ -31,6 +31,25 @@ content tree from another directory. Position-dependent executables which
 access the PS5 null/low-address window still need address translation or
 instruction fixups on Windows, where those pages cannot be identity-mapped.
 
+The launcher defaults to **1080p** and saves the selected output resolution in
+`ps5pcem.ini` (`launcher.output_resolution`). Its Settings page also offers
+1440p, 4K and 8K. Changes take effect on the next game launch. Direct launches
+use `PS5_OUTPUT_RESOLUTION=1080|1440|2160|4320`; `1080p`, `1440p`, `4K` and `8K`
+are accepted aliases. An absent or invalid value uses 1080p.
+
+This preference selects the requested window size and the guest display
+profile. The window fits the desktop work area while preserving its aspect
+ratio. The currently implemented VideoOut status ABI reports class 1 for
+1080p/1440p and class 2 for 4K/8K; separate native 1440p and 8K guest modes are
+not implemented. The 8K choice does not enable PS5 Pro or PSSR. The emulated
+hardware remains a base PS5.
+
+Guest buffer dimensions, pitch, depth targets and compute dispatch sizes remain
+game-controlled. Lowering the output preference therefore does **not** force
+lower internal rendering or guarantee higher FPS. Yōtei has been observed to
+allocate 3840×2160 resources even with VideoOut class 1. Startup logs distinguish
+the requested output profile from the actual host window dimensions.
+
 ```zig
 const runtime = @import("runtime");
 

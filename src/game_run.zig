@@ -11,6 +11,7 @@ const runtime = @import("runtime");
 const loader = @import("loader");
 const vulkan = @import("vulkan");
 const window = @import("window");
+const display_mode = @import("display_mode.zig");
 
 comptime {
     @import("host_memory.zig").exportRuntime();
@@ -292,6 +293,20 @@ fn run(init: std.process.Init) !bool {
     var emu = runtime.Runtime{};
     try emu.init(allocator);
     defer emu.deinit();
+
+    const output_mode = if (init.minimal.environ.getAlloc(allocator, display_mode.environment_name)) |value| mode: {
+        defer allocator.free(value);
+        break :mode display_mode.Mode.parse(value) orelse {
+            try stderr.print("Invalid {s}='{s}'; using 1080p\n", .{ display_mode.environment_name, value });
+            try stderr.flush();
+            break :mode display_mode.default;
+        };
+    } else |_| display_mode.default;
+    runtime.firmware.video_out.configureOutputResolution(output_mode.width(), output_mode.height());
+    try out.print("  Output  {d}x{d}, VideoOut class {d}; internal rendering is game-controlled\n", .{
+        output_mode.width(), output_mode.height(), runtime.firmware.video_out.outputResolutionClass(),
+    });
+    try out.flush();
 
     var preload_modules: std.ArrayList([]const u8) = .empty;
     defer preload_modules.deinit(allocator);
@@ -616,7 +631,7 @@ fn run(init: std.process.Init) !bool {
         break :parse @min(std.fmt.parseInt(usize, text, 10) catch 0, 2048);
     } else |_| 0;
     if (builtin.os.tag == .windows and !force_headless) live_gpu: {
-        host_window.init(1280, 720) catch |err| {
+        host_window.init(output_mode.width(), output_mode.height()) catch |err| {
             try stderr.print("live Vulkan window unavailable: {s}; continuing headless\n", .{@errorName(err)});
             try stderr.flush();
             break :live_gpu;
