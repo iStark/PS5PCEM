@@ -40,17 +40,21 @@ fn writes(inst: Instruction, location: Location) bool {
             return if (lane == std.math.maxInt(u32)) true else if (immediate(inst.src1)) |written| written == lane else true;
         }
     }
-    // Memory and 64-bit ALU destinations can span several registers. DS
-    // pairs are deliberately overestimated when their exact width is absent.
-    const width = @max(inst.data_words, if (inst.family == .ds) @as(u8, 4) else if (std.mem.endsWith(u8, @tagName(inst.opcode), "64")) @as(u8, 2) else 1);
     for ([_]rdna2.Operand{ inst.dst, inst.dst2 }) |dst| {
+        const register: ?usize = if (kind == .sgpr) @import("scalar_provenance.zig").scalarRegisterIndex(dst) else if (dst.kind == kind) @as(usize, dst.reg) else null;
+        const first = register orelse continue;
+        if (location.register < first) continue;
+        if (location.register == first) return true;
+        // Most VALU instructions cannot write the requested SGPR at all.
+        // Classify wider destinations only after checking the register bank
+        // and base; DS pairs retain their conservative minimum width.
+        const width = @max(inst.data_words, if (inst.family == .ds) @as(u8, 4) else if (std.mem.endsWith(u8, @tagName(inst.opcode), "64")) @as(u8, 2) else 1);
         const vector_mask = dst.kind == .vcc_lo and switch (inst.family) {
             .vop1, .vop2, .vop3, .vop3p, .vopc => true,
             else => false,
         };
         const destination_width = if (vector_mask) @max(width, 2) else width;
-        const register: ?usize = if (kind == .sgpr) @import("scalar_provenance.zig").scalarRegisterIndex(dst) else if (dst.kind == kind) @as(usize, dst.reg) else null;
-        if (register) |first| if (location.register >= first and location.register - first < destination_width) return true;
+        if (location.register - first < destination_width) return true;
     }
     return false;
 }
