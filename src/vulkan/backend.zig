@@ -233,6 +233,8 @@ pub const Options = struct {
     persistent_host_mappings: bool = true,
     /// Reuse attachment-only passes for draws with no guest color target.
     persistent_depth_passes: bool = true,
+    /// Snapshot resident read/write color aliases with a GPU copy.
+    gpu_feedback_snapshots: bool = true,
     /// Optional Win32 output window. Supplying it enables the required surface
     /// and swapchain extensions and constrains device selection to a queue that
     /// can present to this exact surface.
@@ -1921,6 +1923,8 @@ const FrameProfile = struct {
     texture_hits: u64 = 0,
     texture_misses: u64 = 0,
     texture_evictions: u64 = 0,
+    feedback_snapshots: u64 = 0,
+    feedback_snapshot_bytes: u64 = 0,
     storage_image_evictions: u64 = 0,
     render_target_hits: u64 = 0,
     render_target_misses: u64 = 0,
@@ -2076,6 +2080,7 @@ const PreparedSampledImage = struct {
     descriptor_layout: u32 = vk.image_layout_shader_read_only_optimal,
     owns_view: bool = false,
     owns_sampler: bool = false,
+    owns_image: bool = false,
     storage_cache_index: ?usize = null,
     render_target_index: ?usize = null,
 };
@@ -2353,6 +2358,7 @@ const GraphicsResources = struct {
         for (self.images[0..self.image_count]) |image| {
             if (image.owns_view) renderer.destroyImageView(image.view);
             if (image.owns_sampler) renderer.destroySampler(image.sampler);
+            if (image.owns_image) renderer.destroyImage(image.image);
             if (image.storage_cache_index) |cache_index| renderer.releaseStorageImage(cache_index);
             if (image.render_target_index) |index| renderer.releaseRenderTarget(index);
         }
@@ -2632,6 +2638,7 @@ const ComputeResources = struct {
         for (self.sampled_images[0..self.sampled_image_count]) |image| {
             if (image.owns_view) renderer.destroyImageView(image.view);
             if (image.owns_sampler) renderer.destroySampler(image.sampler);
+            if (image.owns_image) renderer.destroyImage(image.image);
             if (image.storage_cache_index) |cache_index| renderer.releaseStorageImage(cache_index);
             if (image.render_target_index) |index| renderer.releaseRenderTarget(index);
         }
@@ -3447,6 +3454,7 @@ pub const Renderer = struct {
     persisted_pipeline_cache_generation: u64 = 0,
     persistent_host_mappings: bool = true,
     persistent_depth_passes: bool = true,
+    gpu_feedback_snapshots: bool = true,
 
     fn destroyResourcePools(self: *Renderer) void {
         self.image_scratch.deinit(self.allocator);
@@ -3992,6 +4000,7 @@ pub const Renderer = struct {
             .compute_translations = .{ .maximum_bytes = options.compute_translation_cache_limit },
             .persistent_host_mappings = options.persistent_host_mappings,
             .persistent_depth_passes = options.persistent_depth_passes,
+            .gpu_feedback_snapshots = options.gpu_feedback_snapshots,
             .window_presentation = window_presentation,
         };
         renderer.image_aliases.enabled = options.enable_canonical_image_aliases;
@@ -13390,6 +13399,94 @@ pub const Renderer = struct {
         return self.readDepthProbeValues(index, false);
     }
 
+    pub fn probeFeedbackSnapshots(self: *Renderer) anyerror!void {
+        var color = std.mem.zeroes(gpu.resources.ColorTarget);
+        color.address = 0x1000;
+        color.width = 8;
+        color.height = 8;
+        color.pitch = 8;
+        color.depth = 1;
+        color.format = 10;
+        color.write_mask = 15;
+        color.tile_mode = .linear;
+        const target = try guestColorTarget(color);
+        const index = try self.acquireRenderTarget(target);
+        var descriptor = std.mem.zeroInit(gpu.ImageDescriptor, .{ .image_type = .color_2d });
+        descriptor.address = color.address;
+        descriptor.width = 8;
+        descriptor.height = 8;
+        descriptor.pitch = 8;
+        descriptor.depth_or_layers = 1;
+        descriptor.image_type = .color_2d;
+        descriptor.tile_mode = .linear;
+        descriptor.unified_format = 130;
+        descriptor.dst_select = .{ 4, 5, 6, 7 };
+        const sampler = std.mem.zeroes(gpu.resources.SamplerDescriptor);
+        const resources = try GraphicsResources.acquire(self);
+        var resources_released = false;
+        defer if (!resources_released) resources.deinit(self);
+        const range = vk.ImageSubresourceRange{ .aspect_mask = vk.image_aspect_color_bit };
+        const source = self.render_targets.items[index].image;
+        for (0..2) |pass| {
+            const commands = try self.beginOneShot();
+            defer self.releaseOneShot(commands);
+            try self.transitionTrackedImage(commands, source.handle, range, image_state.transfer_destination_usage);
+            const clear = vk.ClearColorValue{ .float32 = if (pass == 0) .{ 1, 0, 0, 1 } else .{ 0, 0, 1, 1 } };
+            self.device_functions.cmd_clear_color_image(commands, source.handle, vk.image_layout_transfer_dst_optimal, &clear, 1, @ptrCast(&range));
+            try self.transitionTrackedImage(commands, source.handle, range, image_state.color_attachment_usage);
+            try self.submitOneShot(commands);
+            self.render_targets.items[index].initialized = true;
+            self.render_targets.items[index].gpu_generation +%= 1;
+            resources.images[pass] = try self.stageSampledImage(descriptor, sampler, 0, .two_d, target);
+            resources.image_count += 1;
+            try std.testing.expect(resources.images[pass].owns_image);
+            try std.testing.expect(resources.images[pass].image.handle != source.handle);
+        }
+        try std.testing.expect(resources.images[0].image.handle != resources.images[1].image.handle);
+        try std.testing.expectEqual(@as(u64, 0), self.frame_profile.readback_bytes);
+        try std.testing.expectEqual(@as(u64, 0), self.frame_profile.texture_upload_bytes);
+        var incompatible = descriptor;
+        incompatible.width = 4;
+        try std.testing.expectEqual(@as(?PreparedSampledImage, null), try self.stageFeedbackSnapshot(incompatible, sampler, vk.format_r8g8b8a8_srgb, .two_d, target));
+        incompatible = descriptor;
+        incompatible.dcc_enabled = true;
+        try std.testing.expectEqual(@as(?PreparedSampledImage, null), try self.stageFeedbackSnapshot(incompatible, sampler, vk.format_r8g8b8a8_srgb, .two_d, target));
+        incompatible = descriptor;
+        incompatible.tile_mode = .render_target;
+        try std.testing.expectEqual(@as(?PreparedSampledImage, null), try self.stageFeedbackSnapshot(incompatible, sampler, vk.format_r8g8b8a8_srgb, .two_d, target));
+        incompatible = descriptor;
+        incompatible.last_level = 1;
+        try std.testing.expectEqual(@as(?PreparedSampledImage, null), try self.stageFeedbackSnapshot(incompatible, sampler, vk.format_r8g8b8a8_srgb, .two_d, target));
+        const readback = try self.createBuffer(512, vk.buffer_usage_transfer_dst_bit, vk.memory_property_host_visible_bit | vk.memory_property_host_coherent_bit);
+        defer self.destroyBuffer(readback);
+        const commands = try self.beginOneShot();
+        defer self.releaseOneShot(commands);
+        for (resources.images[0..2], 0..) |snapshot, pass| {
+            const barrier = vk.ImageMemoryBarrier{
+                .source_access_mask = vk.access_shader_read_bit,
+                .destination_access_mask = vk.access_transfer_read_bit,
+                .old_layout = vk.image_layout_shader_read_only_optimal,
+                .new_layout = vk.image_layout_transfer_src_optimal,
+                .image = snapshot.image.handle,
+                .subresource_range = range,
+            };
+            self.device_functions.cmd_pipeline_barrier(commands, image_state.shader_read_usage.stages, vk.pipeline_stage_transfer_bit, 0, 0, null, 0, null, 1, @ptrCast(&barrier));
+            const copy = vk.BufferImageCopy{ .buffer_offset = pass * 256, .image_subresource = .{ .aspect_mask = vk.image_aspect_color_bit }, .image_extent = .{ .width = 8, .height = 8, .depth = 1 } };
+            self.device_functions.cmd_copy_image_to_buffer(commands, snapshot.image.handle, vk.image_layout_transfer_src_optimal, readback.handle, 1, @ptrCast(&copy));
+        }
+        const host = vk.BufferMemoryBarrier{ .source_access_mask = vk.access_transfer_write_bit, .destination_access_mask = vk.access_host_read_bit, .buffer = readback.handle, .offset = 0, .size = 512 };
+        self.device_functions.cmd_pipeline_barrier(commands, vk.pipeline_stage_transfer_bit, vk.pipeline_stage_host_bit, 0, 0, null, 1, @ptrCast(&host), 0, null);
+        try self.submitOneShot(commands);
+        resources.deinit(self);
+        resources_released = true;
+        var bytes: [512]u8 = undefined;
+        try self.readMapped(readback, &bytes);
+        for (0..128) |pixel| {
+            const expected: [4]u8 = if (pixel < 64) .{ 255, 0, 0, 255 } else .{ 0, 0, 255, 255 };
+            try std.testing.expectEqualSlices(u8, &expected, bytes[pixel * 4 ..][0..4]);
+        }
+    }
+
     pub fn probeDepthPassCache(self: *Renderer) anyerror!void {
         const IndexMemory = struct {
             fn read(_: ?*anyopaque, address: u64, bytes: []u8) bool {
@@ -17711,6 +17808,72 @@ pub const Renderer = struct {
         return null;
     }
 
+    fn stageFeedbackSnapshot(
+        self: *Renderer,
+        descriptor: gpu.ImageDescriptor,
+        sampler_descriptor: gpu.resources.SamplerDescriptor,
+        image_format: u32,
+        dimension: rdna2.spirv.SampledImageDimension,
+        active: GuestColorTarget,
+    ) anyerror!?PreparedSampledImage {
+        // Keep metadata clears, mip chains and reinterpreted allocations on
+        // their existing path until their complete view can be copied safely.
+        if (!self.gpu_feedback_snapshots or dimension != .two_d or
+            descriptor.image_type != .color_2d or descriptor.depth_or_layers != 1 or
+            descriptor.viewBaseLevel() != 0 or descriptor.viewMipLevels() != 1 or
+            descriptor.base_array != 0 or descriptor.dcc_enabled or active.descriptor.dcc_enabled or
+            descriptor.metadata_address != 0 or active.descriptor.fragments_log2 != 0 or
+            descriptor.tile_mode != active.descriptor.tile_mode or active.descriptor.mip_level != 0 or
+            active.descriptor.base_array_slice != 0 or active.descriptor.last_array_slice != 0)
+            return null;
+        const index = self.latestRenderTargetAtAddress(descriptor, image_format) orelse return null;
+        const source = self.render_targets.items[index];
+        if (!sameRenderTarget(source.target, active) or source.gpu_generation == 0 or
+            source.target.descriptor.width != descriptor.width or source.target.descriptor.height != descriptor.height)
+            return null;
+        const previous = self.image_states.current(source.image.handle, vk.image_aspect_color_bit, 0, 0) orelse return null;
+        const snapshot = try self.createImageWithExtent(descriptor.width, descriptor.height, 1, 1, vk.image_type_2d, vk.image_create_mutable_format_bit, source.target.format.vulkan, vk.image_usage_transfer_dst_bit | vk.image_usage_transfer_src_bit | vk.image_usage_sampled_bit, vk.sample_count_1_bit, 1);
+        errdefer self.destroyImage(snapshot);
+        const view_info = vk.ImageViewCreateInfo{
+            .image = snapshot.handle,
+            .format = image_format,
+            .components = try sampledImageComponents(descriptor.dst_select),
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        var view: vk.ImageView = 0;
+        if (self.device_functions.create_image_view(self.device, &view_info, null, &view) != vk.success) return Error.ImageViewCreationFailed;
+        errdefer self.destroyImageView(view);
+        const sampler = try self.residentSampler(sampler_descriptor);
+        const commands = try self.beginOneShot();
+        defer self.releaseOneShot(commands);
+        try self.transitionTrackedImage(commands, source.image.handle, .{ .aspect_mask = vk.image_aspect_color_bit }, image_state.transfer_source_usage);
+        var barrier = vk.ImageMemoryBarrier{
+            .source_access_mask = 0,
+            .destination_access_mask = vk.access_transfer_write_bit,
+            .old_layout = vk.image_layout_undefined,
+            .new_layout = vk.image_layout_transfer_dst_optimal,
+            .image = snapshot.handle,
+            .subresource_range = .{ .aspect_mask = vk.image_aspect_color_bit },
+        };
+        self.device_functions.cmd_pipeline_barrier(commands, vk.pipeline_stage_top_of_pipe_bit, vk.pipeline_stage_transfer_bit, 0, 0, null, 0, null, 1, @ptrCast(&barrier));
+        const copy = vk.ImageCopy{
+            .source_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+            .destination_subresource = .{ .aspect_mask = vk.image_aspect_color_bit },
+            .extent = .{ .width = descriptor.width, .height = descriptor.height, .depth = 1 },
+        };
+        self.device_functions.cmd_copy_image(commands, source.image.handle, vk.image_layout_transfer_src_optimal, snapshot.handle, vk.image_layout_transfer_dst_optimal, 1, @ptrCast(&copy));
+        barrier.source_access_mask = vk.access_transfer_write_bit;
+        barrier.destination_access_mask = vk.access_shader_read_bit;
+        barrier.old_layout = vk.image_layout_transfer_dst_optimal;
+        barrier.new_layout = vk.image_layout_shader_read_only_optimal;
+        self.device_functions.cmd_pipeline_barrier(commands, vk.pipeline_stage_transfer_bit, image_state.shader_read_usage.stages, 0, 0, null, 0, null, 1, @ptrCast(&barrier));
+        try self.transitionTrackedImage(commands, source.image.handle, .{ .aspect_mask = vk.image_aspect_color_bit }, previous);
+        try self.submitOneShot(commands);
+        self.frame_profile.feedback_snapshots +|= 1;
+        self.frame_profile.feedback_snapshot_bytes +|= @as(u64, descriptor.width) * descriptor.height * source.target.format.bytes_per_texel;
+        return .{ .image = snapshot, .view = view, .sampler = sampler, .owns_view = true, .owns_image = true };
+    }
+
     fn stageSampledImage(
         self: *Renderer,
         descriptor: gpu.resources.ImageDescriptor,
@@ -17756,6 +17919,9 @@ pub const Renderer = struct {
             target.descriptor.address != 0 and target.descriptor.address == descriptor.address
         else
             false;
+        if (aliases_active_render_target) {
+            if (try self.stageFeedbackSnapshot(descriptor, sampler_descriptor, image_format, dimension, render_target_write.?)) |snapshot| return snapshot;
+        }
         if ((dimension == .two_d or dimension == .two_d_array) and !aliases_active_render_target) {
             if (try self.stageResidentRenderTarget(
                 descriptor,
@@ -20265,6 +20431,10 @@ pub const Renderer = struct {
             std.debug.print(
                 "[gpu buffers] flip={d} content_reused_kib={d} fingerprint_ms={d}\n",
                 .{ self.flip_callbacks, profile.content_reused_bytes / 1024, profile.buffer_fingerprint_ns / std.time.ns_per_ms },
+            );
+            if (profile.feedback_snapshots != 0) std.debug.print(
+                "[gpu feedback] flip={d} snapshots={d} copy_kib={d}\n",
+                .{ self.flip_callbacks, profile.feedback_snapshots, profile.feedback_snapshot_bytes / 1024 },
             );
             std.debug.print(
                 "[gpu checkpoints] flip={d} prepare_us={d} calls={d} list_builds={d} scratch_allocations={d}\n",

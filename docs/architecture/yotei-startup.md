@@ -2,6 +2,28 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## GPU snapshots of read/write color targets on 2026-09-10
+
+The scene repeatedly samples its G-buffer while writing back to the same
+attachments. The frame trace identifies seven uncompressed feedback copies
+of 3328x1872 surfaces. These used full GPU readback, CPU tiling/detiling and
+texture upload even though the source image was already resident.
+
+Matching single-sample, single-mip 2D targets now copy directly into a separate
+GPU image before the draw. UNORM/sRGB-compatible views preserve the texel bits;
+the source layout is restored, and the snapshot survives queued readers until
+timeline retirement. Metadata clears, mismatched extents, other layouts and
+mip/array views retain their existing path. Frame profiles report snapshot
+counts and GPU copy bytes separately from host uploads.
+
+The SDK probe queues red and blue writes to one source, retains both snapshots,
+releases their owners while copies are pending, and verifies every pixel after
+GPU completion. It runs without a guest-memory provider and confirms zero
+host uploads/readbacks during snapshot creation. Mismatched extents and DCC
+views decline this path. DCC clear, stencil UI and full GPU smoke tests also
+pass without validation errors or synchronization hazards. Native graphics
+and frame-rate comparison remain pending.
+
 ## Cached depth-only passes on 2026-09-10
 
 Depth-only guest draws used the transient graphics path: each shadow draw

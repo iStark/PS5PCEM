@@ -6126,6 +6126,13 @@ pub fn main(init: std.process.Init) !void {
         }
         return;
     }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--feedback-snapshot")) {
+        var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+        defer renderer.deinit();
+        try renderer.probeFeedbackSnapshots();
+        std.debug.print("feedback snapshots passed: queued GPU source changes, sRGB views, distinct preserved copies, retirement and no guest readback\n", .{});
+        return;
+    }
     if (args.len == 2 and (std.mem.eql(u8, args[1], "--depth-only") or std.mem.eql(u8, args[1], "--depth-bias"))) {
         var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
         defer renderer.deinit();
