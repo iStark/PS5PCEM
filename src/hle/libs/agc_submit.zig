@@ -70,7 +70,9 @@ const ExecutionLock = struct {
 /// Command-processor state and blocked work survive a submission. A title
 /// commonly sets a shader or render target in one DCB and consumes it in the
 /// next one, so both queues are kept behind one serialized scheduler.
-var execution_lock = ExecutionLock{};
+// A backend callback may wait for a fence or compile a shader. Park another
+// submission thread while that work owns the scheduler, preserving its order.
+var execution_lock = guest_address_space.HostMutex{};
 var traced_draw_states: u32 = 0;
 var traced_shader_program_count: usize = 0;
 var traced_shader_programs: [32]u64 = [_]u64{0} ** 32;

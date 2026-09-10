@@ -2,6 +2,20 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Parking queued submissions on 2026-09-10
+
+The scheduler's execution mutex now parks contending host threads on Windows.
+In the native run, a submission thread consumed a core spinning on this mutex
+while another thread compiled a geometry-query pipeline inside the backend.
+The protected scheduler operations and callback order are unchanged; shorter
+metadata locks retain their existing implementation.
+
+All 42 AGC submission tests and the contended host-mutex wakeup test pass.
+This removes busy waiting under contention; it does not shorten the driver
+compilation itself or establish a native FPS gain. The current run passed
+the bonus, brightness, difficulty and experience screens, and submitted the
+first geometry query. Full scene rendering and 5 FPS remain outstanding.
+
 ## Dynamic buffer sizes in translation keys on 2026-09-10
 
 Storage-buffer extents and the backend's vertex-table marker no longer create
