@@ -15355,6 +15355,7 @@ pub const Renderer = struct {
             .fragment_inputs = .{
                 .allocated = @truncate(state.readRegister(.context, 0x1b4) orelse 0),
                 .enabled = @truncate(state.readRegister(.context, 0x1b3) orelse 0),
+                .front_face_all_bits = ((state.readRegister(.context, 0x1b8) orelse 0) & (1 << 24)) != 0,
             },
             .infer_fragment_parameter_mask = false,
             .color_export_mappings = color_export_mappings,

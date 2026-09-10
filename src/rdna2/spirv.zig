@@ -245,6 +245,19 @@ pub const FragmentInputs = struct {
     /// SPI_PS_INPUT_ENA bit is clear. Interpolation pairs precede position.
     allocated: u16 = 0,
     enabled: u16 = 0,
+    /// SPI_BARYC_CNTL.FRONT_FACE_ALL_BITS selects integer 1/0 instead of
+    /// floating point +1/-1 for the front/back face input.
+    front_face_all_bits: bool = false,
+
+    pub fn frontFaceRegister(self: FragmentInputs) ?u8 {
+        if (self.allocated & self.enabled & (1 << 12) == 0) return null;
+        var next: u8 = 0;
+        for (0..12) |input| {
+            if (self.allocated & (@as(u16, 1) << @intCast(input)) == 0) continue;
+            next += if (input == 3) @as(u8, 3) else if (input < 7) 2 else 1;
+        }
+        return next;
+    }
 
     pub fn positionRegisters(self: FragmentInputs) [4]?u8 {
         var result: [4]?u8 = @splat(null);
@@ -723,6 +736,7 @@ const Builder = struct {
     /// BuiltIn FragCoord (float4) for fragment UV fallback when PARAM interps
     /// are not yet wired from the vertex stage.
     frag_coord_input: u32 = 0,
+    front_face_input: u32 = 0,
     fragment_inputs: FragmentInputs,
     storage_bindings: []const StorageBufferBinding,
     scalar_memory_bindings: []const ScalarMemoryBinding,
@@ -1013,6 +1027,14 @@ const Builder = struct {
                 try self.emit(&self.annotations, 71, &.{ self.frag_coord_input, 11, 15 }); // BuiltIn FragCoord
                 try self.emit(&self.declarations, 32, &.{ frag_ptr, 1, self.vector4_type }); // ptr Input
                 try self.emit(&self.declarations, 59, &.{ frag_ptr, self.frag_coord_input, 1 }); // OpVariable
+
+                if (self.fragment_inputs.frontFaceRegister() != null) {
+                    const face_ptr = self.id();
+                    self.front_face_input = self.id();
+                    try self.emit(&self.annotations, 71, &.{ self.front_face_input, 11, 17 }); // BuiltIn FrontFacing
+                    try self.emit(&self.declarations, 32, &.{ face_ptr, 1, self.bool_type });
+                    try self.emit(&self.declarations, 59, &.{ face_ptr, self.front_face_input, 1 });
+                }
 
                 var per_vertex_pointer: u32 = 0;
                 if (options.fragment_per_vertex_mask != 0) {
@@ -4254,6 +4276,18 @@ const Builder = struct {
                 }
             }
             const positions = self.fragment_inputs.positionRegisters();
+            if (self.fragment_inputs.frontFaceRegister()) |vgpr| {
+                const facing = self.id();
+                const value = self.id();
+                try self.emit(&self.body, 61, &.{ self.bool_type, facing, self.front_face_input });
+                try self.emit(&self.body, 169, &.{
+                    self.bits_type,                                                                                         value,                                                                                                   facing,
+                    try self.constant(.bits32, if (self.fragment_inputs.front_face_all_bits) 1 else @bitCast(@as(f32, 1))), try self.constant(.bits32, if (self.fragment_inputs.front_face_all_bits) 0 else @bitCast(@as(f32, -1))),
+                });
+                // Keep the entry value in the integer register representation
+                // so control-flow joins preserve it like every other VGPR.
+                self.registers[128 + @as(usize, vgpr)] = .{ .id = value, .value_type = .bits32 };
+            }
             var coord: u32 = 0;
             for (positions, 0..) |register, component| {
                 const vgpr = register orelse continue;
@@ -10946,6 +10980,7 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     if (builder.vertex_index_input != 0) try entry_point.append(allocator, builder.vertex_index_input);
     if (builder.instance_index_input != 0) try entry_point.append(allocator, builder.instance_index_input);
     if (builder.frag_coord_input != 0) try entry_point.append(allocator, builder.frag_coord_input);
+    if (builder.front_face_input != 0) try entry_point.append(allocator, builder.front_face_input);
     for (builder.barycentric_inputs) |variable| if (variable != 0) {
         try entry_point.append(allocator, variable);
     };
