@@ -18314,6 +18314,10 @@ pub const Renderer = struct {
             if (!cached.valid or !storageImageOverlapsSampledDescriptor(cached.descriptor, descriptor)) {
                 continue;
             }
+            // A command-processor write can replace a previously uploaded or
+            // published guest image. Its Vulkan allocation still exists, but
+            // cannot supply texels until storage staging uploads the new data.
+            if (!cached.gpu_dirty and cached.depth_snapshot == null and !cached.guest_content_hash_valid) continue;
             const storage_format = storageImageFormat(cached.descriptor.unified_format) orelse continue;
             if (!sampledViewFormatCompatible(storage_format.vulkan, image_format)) continue;
             if (best_index != null and cached.last_used_sequence < best_sequence) continue;
@@ -20297,6 +20301,13 @@ pub const Renderer = struct {
         self.prepareHtileWrite(address, bytes.len);
         const memory = self.guest_memory orelse return false;
         if (!memory.write(memory.context, address, bytes)) return false;
+        for (self.storage_image_cache.items) |*cached| {
+            if (!cached.valid or cached.gpu_dirty or
+                !byteRangesOverlap(address, bytes.len, cached.descriptor.address, cached.allocation_bytes)) continue;
+            cached.guest_content_hash_valid = false;
+            cached.guest_page_generation = 0;
+            cached.depth_snapshot = null;
+        }
         self.applyUniformHtileWrite(address, bytes) catch return false;
         self.applyUniformDccWrite(address, bytes) catch return false;
         return true;

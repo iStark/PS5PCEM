@@ -2375,12 +2375,25 @@ fn runImageD16Probe(allocator: std.mem.Allocator) !void {
     for (0..4) |i| try state.writeRegister(.shader, stage.userDataBase() + 8 + @as(u32, @intCast(i)), 0);
     for ([_]u32{ 0x10000, 16 << 16, 1, 0 }, 0..) |word, i|
         try state.writeRegister(.shader, stage.userDataBase() + 12 + @as(u32, @intCast(i)), word);
-    for ([_][4]f32{ .{ 0.375, -0.25, 2, 0.5 }, .{ 1, 0.125, -4, 0.25 } }, 0..) |texel, input_index| {
+    for ([_][4]f32{
+        .{ 0.375, -0.25, 2, 0.5 },
+        .{ 1, 0.125, -4, 0.25 },
+        .{ -0.5, 2, 0.25, 1 },
+        .{ -0.5, -0.75, 0.25, 1 },
+        .{ -0.5, -0.75, 0.25, 1 },
+    }, 0..) |texel, input_index| {
         var case_index: u32 = 0;
-        const address: u32 = 0x8000 + @as(u32, @intCast(input_index)) * 0x1000;
+        // Reuse the IMAGE_LOAD allocation after a full write, a partial write,
+        // and no write. All consumers keep the same T# and compiled programs.
+        const address: u32 = 0x8000 + @as(u32, @intCast(@min(input_index, 1))) * 0x1000;
         try state.writeRegister(.shader, stage.userDataBase(), address >> 8);
         const input: [4]u32 = @bitCast(texel);
-        try std.testing.expect(backend.vtable.write(backend.context, address, std.mem.asBytes(&input)));
+        if (input_index == 3) {
+            try std.testing.expect(backend.vtable.write(backend.context, address + 4, std.mem.asBytes(&input)[4..8]));
+        } else if (input_index != 4) {
+            try std.testing.expect(backend.vtable.write(backend.context, address, std.mem.asBytes(&input)));
+        }
+        const uploads_before = renderer.sampled_image_uploads;
         for (0..3) |operation| for ([_]u4{ 1, 3, 5, 7, 15 }) |mask| for ([_]bool{ false, true }) |d16| {
             if (operation == 2 and mask != 1) continue; // gather selects one channel
             const program = 0x100 + case_index * 0x100;
@@ -2415,6 +2428,7 @@ fn runImageD16Probe(allocator: std.mem.Allocator) !void {
             std.debug.print("MIMG result case {d}: operation={d} mask={x} d16={} actual={any}\n", .{ case_index, operation, mask, d16, actual });
             try std.testing.expectEqualSlices(u32, &expected, &actual);
         };
+        if (input_index == 4) try std.testing.expectEqual(uploads_before, renderer.sampled_image_uploads);
     }
     // Store half components into 32-bit images, including sign extension of
     // integer data, then inspect the full-width image readback.
@@ -2446,7 +2460,7 @@ fn runImageD16Probe(allocator: std.mem.Allocator) !void {
         std.debug.print("MIMG D16 store format={d}: actual={any}\n", .{ format, actual });
         try std.testing.expectEqualSlices(u32, &expected, &actual);
     }
-    std.debug.print("MIMG D16 passed: sample/load/gather/store, float and integer data, sparse masks, register guards and changed descriptors\n", .{});
+    std.debug.print("MIMG D16 passed: sample/load/gather/store, float and integer data, sparse masks, register guards, changed descriptors and guest writes\n", .{});
 }
 
 fn runPackedFloatProbe(allocator: std.mem.Allocator) !void {
