@@ -5883,7 +5883,7 @@ pub const Renderer = struct {
             self.updateStorageDescriptorRange(lds_slot.?, spilled_lds.?.handle, 0, bytes);
             resources.occupied[lds_slot.?] = true;
         }
-        var module = self.compute_translations.translate(self.allocator, &analysis.program, .{
+        const module_lease = self.compute_translations.acquire(self.allocator, &analysis.program, .{
             .stage = .compute,
             .local_size = local_size,
             .maximum_dispatcher_iterations = if (yotei_environment_lighting) 2048 else if (yotei_atmosphere_multiscatter) 1024 else if (yotei_atmosphere_precompute) 512 else 256,
@@ -5975,7 +5975,8 @@ pub const Renderer = struct {
             return err;
         };
         self.frame_profile.compute_translate_ns +|= elapsedHostNanoseconds(translate_started);
-        defer module.deinit(self.allocator);
+        defer module_lease.release();
+        const module = module_lease.view();
         if (self.traceCurrentGraphicsFrame() and program_address == 0x8000_3d60_00) {
             dumpComputeSpirv(self.allocator, program_address, module.words);
         }
@@ -15050,7 +15051,7 @@ pub const Renderer = struct {
         }
 
         const fragment_translate_started = hostTimestampNs();
-        var fragment_module = self.graphics_translations.translate(self.allocator, &fragment_analysis.program, .{
+        const fragment_lease = self.graphics_translations.acquire(self.allocator, &fragment_analysis.program, .{
             .stage = .fragment,
             // FragCoord is measured in visible render-target pixels. Dividing
             // X by the NV12 allocation pitch (2048 for a 1920-wide movie)
@@ -15110,7 +15111,8 @@ pub const Renderer = struct {
             return err;
         };
         self.frame_profile.shader_translate_ns +|= elapsedHostNanoseconds(fragment_translate_started);
-        defer fragment_module.deinit(self.allocator);
+        defer fragment_lease.release();
+        const fragment_module = fragment_lease.view();
         if (self.dump_graphics_spirv) {
             dumpGraphicsSpirv(self.allocator, "ps", fragment_address, fragment_module.words);
         }

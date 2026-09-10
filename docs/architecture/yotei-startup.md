@@ -2,6 +2,23 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Retained read-only shader translations on 2026-09-10
+
+Compute and fragment cache hits previously copied the complete SPIR-V module
+into another allocation before pipeline lookup. They now acquire read-only
+leases of the cached words. Each lease retains its module independently of
+cache eviction or destruction, including while a fragment module is held
+across vertex translation. The existing API for independently owned, mutable
+modules still returns a copy.
+
+Four cache tests verify shared storage on hits, independent mutable copies,
+eviction, cache destruction, oversized uncached modules and equality with fresh
+translations after binding/wave changes. The full Vulkan SDK smoke, the
+4,352-view indirect image probe and both captured collision-query replays pass
+without validation or synchronization errors. Production and diagnostic
+runners build successfully. Native rendering and frame-time validation of
+the combined optimizations is in progress.
+
 ## Grouped sampled-image lookup preparation on 2026-09-10
 
 A native render-thread sample recorded 5 of 80 observations in

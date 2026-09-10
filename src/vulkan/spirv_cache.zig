@@ -5,10 +5,48 @@
 const std = @import("std");
 const rdna2 = @import("rdna2");
 
+const SharedModule = struct {
+    allocator: std.mem.Allocator,
+    module: rdna2.spirv.Module,
+    references: usize = 1,
+
+    fn release(self: *SharedModule) void {
+        self.references -= 1;
+        if (self.references != 0) return;
+        const allocator = self.allocator;
+        self.module.deinit(allocator);
+        allocator.destroy(self);
+    }
+};
+
+/// Read-only shader words remain valid until release, including after cache
+/// eviction or destruction. Like Cache, leases belong to the renderer thread.
+pub const Lease = struct {
+    shared: *SharedModule,
+
+    pub const View = struct {
+        words: []const u32,
+        used_control_flow_fallback: bool,
+        used_dispatcher: bool,
+    };
+
+    pub fn view(self: Lease) View {
+        return .{
+            .words = self.shared.module.words,
+            .used_control_flow_fallback = self.shared.module.used_control_flow_fallback,
+            .used_dispatcher = self.shared.module.used_dispatcher,
+        };
+    }
+
+    pub fn release(self: Lease) void {
+        self.shared.release();
+    }
+};
+
 const Entry = struct {
     key: []u8,
     hash: u64,
-    module: rdna2.spirv.Module,
+    shared: *SharedModule,
     sequence: u64,
 };
 
@@ -24,10 +62,11 @@ pub const Cache = struct {
     pub fn deinit(self: *Cache, allocator: std.mem.Allocator) void {
         for (self.entries.items) |*entry| {
             allocator.free(entry.key);
-            entry.module.deinit(allocator);
+            entry.shared.release();
         }
         self.entries.deinit(allocator);
         self.key.deinit(allocator);
+        self.* = .{};
     }
 
     pub fn translate(
@@ -37,6 +76,18 @@ pub const Cache = struct {
         options: rdna2.spirv.Options,
         pipeline: rdna2.ir.PipelineOptions,
     ) rdna2.spirv.Error!rdna2.spirv.Module {
+        const lease = try self.acquire(allocator, program, options, pipeline);
+        defer lease.release();
+        return cloneModule(allocator, lease.shared.module);
+    }
+
+    pub fn acquire(
+        self: *Cache,
+        allocator: std.mem.Allocator,
+        program: *const rdna2.Program,
+        options: rdna2.spirv.Options,
+        pipeline: rdna2.ir.PipelineOptions,
+    ) rdna2.spirv.Error!Lease {
         self.key.clearRetainingCapacity();
         // Include decoded instructions as well as code: NGG reconstruction and
         // uniform branch pruning can change instructions without changing code.
@@ -60,13 +111,19 @@ pub const Cache = struct {
             if (entry.hash != hash or !std.mem.eql(u8, entry.key, self.key.items)) continue;
             entry.sequence = self.sequence;
             self.hits += 1;
-            return cloneModule(allocator, entry.module);
+            entry.shared.references += 1;
+            return .{ .shared = entry.shared };
         }
         self.misses += 1;
-        var module = try rdna2.translateProgramSpirvWithPipelineOptions(allocator, program, options, pipeline);
-        errdefer module.deinit(allocator);
-        const size = self.key.items.len + module.words.len * @sizeOf(u32);
-        if (size > self.maximum_bytes) return module;
+        const shared = try allocator.create(SharedModule);
+        errdefer allocator.destroy(shared);
+        shared.* = .{
+            .allocator = allocator,
+            .module = try rdna2.translateProgramSpirvWithPipelineOptions(allocator, program, options, pipeline),
+        };
+        errdefer shared.module.deinit(allocator);
+        const size = self.key.items.len + shared.module.words.len * @sizeOf(u32);
+        if (size > self.maximum_bytes) return .{ .shared = shared };
         while (self.entries.items.len != 0 and
             (self.bytes + size > self.maximum_bytes or self.entries.items.len >= 1024))
         {
@@ -74,18 +131,17 @@ pub const Cache = struct {
             for (self.entries.items, 0..) |entry, index| {
                 if (entry.sequence < self.entries.items[oldest].sequence) oldest = index;
             }
-            var victim = self.entries.swapRemove(oldest);
-            self.bytes -= victim.key.len + victim.module.words.len * @sizeOf(u32);
+            const victim = self.entries.swapRemove(oldest);
+            self.bytes -= victim.key.len + victim.shared.module.words.len * @sizeOf(u32);
             allocator.free(victim.key);
-            victim.module.deinit(allocator);
+            victim.shared.release();
         }
         const key = try allocator.dupe(u8, self.key.items);
         errdefer allocator.free(key);
-        var cached = try cloneModule(allocator, module);
-        errdefer cached.deinit(allocator);
-        try self.entries.append(allocator, .{ .key = key, .hash = hash, .module = cached, .sequence = self.sequence });
+        try self.entries.append(allocator, .{ .key = key, .hash = hash, .shared = shared, .sequence = self.sequence });
+        shared.references += 1; // The cache and the returned lease each own a reference.
         self.bytes += size;
-        return module;
+        return .{ .shared = shared };
     }
 };
 
@@ -93,6 +149,56 @@ fn cloneModule(allocator: std.mem.Allocator, module: rdna2.spirv.Module) !rdna2.
     var copy = module;
     copy.words = try allocator.dupe(u32, module.words);
     return copy;
+}
+
+test "cache leases survive eviction and cache destruction without copying shader words" {
+    const a = std.testing.allocator;
+    var cache = Cache{};
+    defer cache.deinit(a);
+    var program = try rdna2.decodeProgram(a, &.{0xbf810000});
+    defer program.deinit(a);
+    const options = rdna2.spirv.Options{ .stage = .compute, .local_size = .{ 1, 1, 1 } };
+    const first = try cache.acquire(a, &program, options, .{});
+    defer first.release();
+    const second = try cache.acquire(a, &program, options, .{});
+    defer second.release();
+    try std.testing.expect(first.view().words.ptr == second.view().words.ptr);
+    var independent = try cache.translate(a, &program, options, .{});
+    defer independent.deinit(a);
+    try std.testing.expect(independent.words.ptr != first.view().words.ptr);
+    const magic = independent.words[0];
+    independent.words[0] = 0;
+    try std.testing.expectEqual(magic, first.view().words[0]);
+    independent.words[0] = magic;
+    cache.maximum_bytes = cache.bytes;
+    var changed = options;
+    changed.local_size[0] = 2;
+    const third = try cache.acquire(a, &program, changed, .{});
+    defer third.release();
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+    try std.testing.expect(cache.entries.items[0].shared == third.shared);
+    try std.testing.expectEqualSlices(u32, independent.words, first.view().words);
+    cache.deinit(a);
+    try std.testing.expectEqualSlices(u32, independent.words, second.view().words);
+    var fresh = try rdna2.translateProgramSpirvWithPipelineOptions(a, &program, changed, .{});
+    defer fresh.deinit(a);
+    try std.testing.expectEqualSlices(u32, fresh.words, third.view().words);
+    try std.testing.expectEqual(fresh.used_dispatcher, third.view().used_dispatcher);
+    try std.testing.expectEqual(fresh.used_control_flow_fallback, third.view().used_control_flow_fallback);
+}
+
+test "cache lease owns an oversized uncached translation" {
+    const a = std.testing.allocator;
+    var cache = Cache{ .maximum_bytes = 0 };
+    defer cache.deinit(a);
+    var program = try rdna2.decodeProgram(a, &.{0xbf810000});
+    defer program.deinit(a);
+    const lease = try cache.acquire(a, &program, .{ .stage = .compute }, .{});
+    defer lease.release();
+    try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), cache.bytes);
+    cache.deinit(a);
+    try std.testing.expectEqual(@as(u32, 0x07230203), lease.view().words[0]);
 }
 
 // Serialize fields, never padding or slice pointers. Keys are compared in full
