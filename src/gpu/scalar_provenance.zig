@@ -335,7 +335,14 @@ pub fn pruneUniformBranches(
     for (decisions) |decision| if (decision != null) {
         proven += 1;
     };
-    if (proven == 0) return null;
+    if (proven == 0) {
+        // An unconditional edge can already make a resource block unreachable,
+        // even when every remaining conditional guard depends on live lanes.
+        // Preserve those unknown guards while dropping only disconnected code.
+        var all_seen = true;
+        for (states) |state| all_seen = all_seen and state.seen;
+        if (all_seen) return null;
+    }
 
     const reachable = try allocator.alloc(bool, graph.blocks.items.len);
     defer allocator.free(reachable);
@@ -1538,6 +1545,30 @@ test "resource lane spills preserve full tables and reuse invalidated VGPR lanes
     try std.testing.expectEqual(@as(u32, 0xabc), result.register(12).?.value);
     try std.testing.expect(result.register(13) == null);
     try std.testing.expectEqual(@as(u32, 0xabc), result.register(14).?.value);
+}
+
+test "uniform pruning removes disconnected resources without guessing unknown guards" {
+    var storage = [_]u8{0} ** 16;
+    var memory = TestMemory{ .base = 0x1000, .bytes = &storage };
+    const bindings = testBindings(0x2000, 0x1000);
+    var instructions = [_]rdna2.Instruction{
+        .{ .pc = 0, .opcode = .s_cbranch_scc1, .branch_target = 8 },
+        .{ .pc = 4, .opcode = .s_branch, .branch_target = 16 },
+        .{ .pc = 8, .opcode = .s_branch, .branch_target = 16 },
+        .{ .pc = 12, .opcode = .image_sample },
+        .{ .pc = 16, .opcode = .s_endpgm },
+    };
+    var graph = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer graph.deinit(std.testing.allocator);
+    var specialized = (try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &graph)).?;
+    defer specialized.deinit(std.testing.allocator);
+    try std.testing.expectEqual(rdna2.Opcode.s_cbranch_scc1, specialized.items[0].opcode);
+    try std.testing.expectEqual(rdna2.Opcode.s_nop, specialized.items[3].opcode);
+    // A second live entry restores the resource, regardless of the unknown SCC.
+    instructions[2].branch_target = 12;
+    var alternate = try rdna2.control_flow.buildInstructions(std.testing.allocator, &instructions);
+    defer alternate.deinit(std.testing.allocator);
+    try std.testing.expect((try pruneUniformBranches(std.testing.allocator, memory.reader(), &bindings, &instructions, &alternate)) == null);
 }
 
 test "uniform resource guard is specialized independently for each dispatch" {
