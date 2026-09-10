@@ -96,7 +96,18 @@ pub const Cache = struct {
         try appendValue(&self.key, allocator, pipeline);
         var key_options = options;
         key_options.scalar_registers = &.{};
+        key_options.storage_buffers = &.{};
         try appendValue(&self.key, allocator, key_options);
+        try appendValue(&self.key, allocator, options.storage_buffers.len);
+        for (options.storage_buffers) |binding| {
+            var keyed = binding;
+            // Bounds come from OpArrayLength on the live descriptor range.
+            // The vertex-table marker is backend metadata; neither field is
+            // read by translation or its binding validation.
+            keyed.extent_bytes = null;
+            keyed.use_vertex_index = false;
+            try appendValue(&self.key, allocator, keyed);
+        }
         try appendValue(&self.key, allocator, options.scalar_registers.len);
         for (options.scalar_registers) |scalar| {
             var keyed = scalar;
@@ -199,6 +210,41 @@ test "cache lease owns an oversized uncached translation" {
     try std.testing.expectEqual(@as(usize, 0), cache.bytes);
     cache.deinit(a);
     try std.testing.expectEqual(@as(u32, 0x07230203), lease.view().words[0]);
+}
+
+test "dynamic buffer extents share translations while address and format rules remain keyed" {
+    const a = std.testing.allocator;
+    var cache = Cache{};
+    defer cache.deinit(a);
+    var program = try rdna2.decodeProgram(a, &.{ 0xe030_2000, 0x8002_0100, 0xbf81_0000 });
+    defer program.deinit(a);
+    var binding = [_]rdna2.spirv.StorageBufferBinding{.{ .resource_sgpr = 8, .descriptor_index = 0, .stride = 4, .extent_bytes = 16 }};
+    const options = rdna2.spirv.Options{ .stage = .compute, .storage_buffers = &binding };
+    const first = try cache.acquire(a, &program, options, .{});
+    defer first.release();
+    for ([_]?u32{ 64, null, 0, 1024 * 1024 }) |extent| {
+        binding[0].extent_bytes = extent;
+        binding[0].use_vertex_index = !binding[0].use_vertex_index;
+        const hit = try cache.acquire(a, &program, options, .{});
+        defer hit.release();
+        try std.testing.expect(first.view().words.ptr == hit.view().words.ptr);
+        var fresh = try rdna2.translateProgramSpirvWithPipelineOptions(a, &program, options, .{});
+        defer fresh.deinit(a);
+        try std.testing.expectEqualSlices(u32, fresh.words, hit.view().words);
+    }
+    try std.testing.expectEqual(@as(u64, 1), cache.misses);
+    binding[0].stride = 8;
+    const stride = try cache.acquire(a, &program, options, .{});
+    defer stride.release();
+    try std.testing.expectEqual(@as(u64, 2), cache.misses);
+    try std.testing.expect(!std.mem.eql(u32, first.view().words, stride.view().words));
+    binding[0].soffset_value = 4;
+    const offset = try cache.acquire(a, &program, options, .{});
+    defer offset.release();
+    try std.testing.expectEqual(@as(u64, 3), cache.misses);
+    // Invalid bindings must not become hits of a previously valid shape.
+    binding[0].descriptor_index = options.descriptor_array_length;
+    try std.testing.expectError(error.InvalidStorageBinding, cache.acquire(a, &program, options, .{}));
 }
 
 // Serialize fields, never padding or slice pointers. Keys are compared in full
@@ -362,6 +408,6 @@ test "compute cache matches fresh translation across runtime values wave modes a
         defer fresh.deinit(a);
         try std.testing.expectEqualSlices(u32, fresh.words, cached.words);
     }
-    try std.testing.expectEqual(@as(u64, 1), cache.hits);
-    try std.testing.expectEqual(@as(u64, 5), cache.misses);
+    try std.testing.expectEqual(@as(u64, 2), cache.hits);
+    try std.testing.expectEqual(@as(u64, 4), cache.misses);
 }

@@ -2,6 +2,24 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Dynamic buffer sizes in translation keys on 2026-09-10
+
+Storage-buffer extents and the backend's vertex-table marker no longer create
+separate SPIR-V cache entries. Neither field participates in translation or
+binding validation: shader bounds are read from the current Vulkan descriptor
+with `OpArrayLength`. Strides, offsets, formats, candidate descriptors and all
+other translation inputs remain keyed. The translator still receives the
+original bindings.
+
+All five cache tests pass, comparing cached words with fresh translations
+across changed extents, runtime scalars, wave modes and descriptor slots.
+Invalid bindings remain rejected. The full SDK smoke and the device-storage
+suite pass without validation or synchronization errors. Native validation of
+the smaller key is pending. A preceding live 512/768 MiB cache comparison
+reduced median translation misses from 47 to 20 on the brightness screen, but
+changing background work and a short build during the return leg prevent an
+isolated FPS claim; increasing capacity alone did not approach 5 FPS.
+
 ## Optional device-local storage buffers on 2026-09-10
 
 `PS5_GPU_DEVICE_STORAGE_MIB` enables a bounded device-local backing for guest
