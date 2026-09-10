@@ -288,6 +288,9 @@ pub const Options = struct {
     scalar_memories: []const ScalarMemoryBinding = &.{},
     flat_memories: []const FlatMemoryBinding = &.{},
     flat_apertures: FlatApertures = .{},
+    /// GFX10 BVH nodes in the checked FLAT snapshots, triangle return mode 1.
+    /// Requires nonuniform storage-buffer indexing on the host device.
+    bvh_intersection_mode1: bool = false,
     /// Whether the program narrows the execution mask, and so needs to know
     /// which stores are active. Decided from the program by `translate`.
     uses_execution_mask: bool = false,
@@ -676,6 +679,7 @@ const Builder = struct {
     scalar_memory_bindings: []const ScalarMemoryBinding,
     flat_memory_bindings: []const FlatMemoryBinding,
     flat_apertures: FlatApertures,
+    bvh_intersection_mode1: bool,
     flat_memory_headers: std.ArrayList([3]u32) = .empty,
     sampled_bindings: []const SampledImageBinding,
     storage_image_bindings: []const StorageImageBinding,
@@ -802,6 +806,7 @@ const Builder = struct {
             .scalar_memory_bindings = options.scalar_memories,
             .flat_memory_bindings = options.flat_memories,
             .flat_apertures = options.flat_apertures,
+            .bvh_intersection_mode1 = options.bvh_intersection_mode1,
             .sampled_bindings = options.sampled_images,
             .storage_image_bindings = options.storage_images,
             .ngg_lds_exports = options.ngg_lds_exports,
@@ -7940,6 +7945,236 @@ const Builder = struct {
             try self.destination(try consecutiveRegister(inst.dst, @intCast(word)), .{ .id = value, .value_type = .bits32 });
     }
 
+    fn bvhBinary(self: *Builder, op: u16, ty: u32, a: u32, b: u32) Error!u32 {
+        const result = self.id();
+        try self.emit(&self.body, op, &.{ ty, result, a, b });
+        return result;
+    }
+
+    fn bvhSelect(self: *Builder, ty: u32, predicate: u32, yes: u32, no: u32) Error!u32 {
+        const result = self.id();
+        try self.emit(&self.body, 169, &.{ ty, result, predicate, yes, no });
+        return result;
+    }
+
+    /// Select a bounded snapshot once for all the words in a BVH node. The
+    /// resulting descriptor is nonuniform: lanes may traverse different trees.
+    fn bvhSnapshot(self: *Builder, address: [2]u32, size: u32) Error!BufferAddress {
+        const zero = try self.constant(.bits32, 0);
+        var slot = try self.constant(.bits32, self.flat_memory_bindings[0].descriptor_index);
+        var offset = zero;
+        var found = try self.constantBool(false);
+        for (self.flat_memory_bindings, self.flat_memory_headers.items) |region, header| {
+            const relative = try self.bvhBinary(130, self.bits_type, address[0], header[0]);
+            const borrow = try self.bvhBinary(176, self.bool_type, address[0], header[0]);
+            const high = try self.addBits(header[1], try self.bvhSelect(self.bits_type, borrow, try self.constant(.bits32, 1), zero));
+            const same_high = try self.bvhBinary(170, self.bool_type, address[1], high);
+            const end = try self.addBits(relative, size);
+            const within = try self.bvhBinary(178, self.bool_type, end, header[2]);
+            const no_wrap = try self.bvhBinary(174, self.bool_type, end, relative);
+            const matches = try self.logicalAndValue(same_high, try self.logicalAndValue(within, no_wrap));
+            slot = try self.bvhSelect(self.bits_type, matches, try self.constant(.bits32, region.descriptor_index), slot);
+            offset = try self.bvhSelect(self.bits_type, matches, try self.addBits(relative, try self.constant(.bits32, 16)), offset);
+            found = try self.bvhBinary(166, self.bool_type, found, matches);
+        }
+        self.uses_nonuniform_storage_buffers = true;
+        try self.emit(&self.annotations, 71, &.{ slot, 5300 });
+        return .{ .binding = .{ .resource_sgpr = 0, .descriptor_index = self.flat_memory_bindings[0].descriptor_index }, .byte_offset = offset, .descriptor_index = slot, .descriptor_matches = found };
+    }
+
+    fn bvhFloatWord(self: *Builder, address: BufferAddress, word: u32) Error!u32 {
+        return self.convert(.{ .id = try self.loadBufferWord(address, word), .value_type = .bits32 }, .float32);
+    }
+
+    fn bvhCross(self: *Builder, a: [3]u32, b: [3]u32) Error![3]u32 {
+        var result: [3]u32 = undefined;
+        for (&result, 0..) |*value, axis| value.* = try self.bvhBinary(131, self.float_type, try self.floatMultiplyValue(a[(axis + 1) % 3], b[(axis + 2) % 3]), try self.floatMultiplyValue(a[(axis + 2) % 3], b[(axis + 1) % 3]));
+        return result;
+    }
+
+    fn bvhDot(self: *Builder, a: [3]u32, b: [3]u32) Error!u32 {
+        var result = try self.floatMultiplyValue(a[0], b[0]);
+        for (1..3) |axis| result = try self.bvhBinary(129, self.float_type, result, try self.floatMultiplyValue(a[axis], b[axis]));
+        return result;
+    }
+
+    // Intersection and barycentric restoration follow AMD GPURT's software
+    // fallback. See docs/licenses/gpurt.txt for its MIT copyright/license.
+    fn bvhTriangle(self: *Builder, address: BufferAddress, node_type: u32, origin: [3]u32, direction: [3]u32) Error![4]u32 {
+        const zero = try self.constant(.float32, 0);
+        const one = try self.constant(.float32, 0x3f80_0000);
+        const inf = try self.constant(.float32, 0x7f80_0000);
+        // Five vertices encode the four triangles of a GFX10 node. The first
+        // two also match the two-triangle compression used by GPURT.
+        const offsets = [3][4]u32{ .{ 0, 12, 24, 24 }, .{ 12, 36, 36, 48 }, .{ 24, 24, 48, 0 } };
+        var vertices: [3][3]u32 = undefined;
+        for (&vertices, offsets) |*vertex, choices| {
+            var byte_offset = try self.constant(.bits32, choices[0]);
+            for (1..4) |kind| byte_offset = try self.bvhSelect(self.bits_type, try self.bvhBinary(170, self.bool_type, node_type, try self.constant(.bits32, @intCast(kind))), try self.constant(.bits32, choices[kind]), byte_offset);
+            var at = address;
+            at.byte_offset = try self.addBits(address.byte_offset, byte_offset);
+            for (vertex, 0..) |*value, axis| value.* = try self.bvhFloatWord(at, @intCast(axis));
+        }
+        var edge1: [3]u32 = undefined;
+        var edge2: [3]u32 = undefined;
+        var relative: [3]u32 = undefined;
+        for (0..3) |axis| {
+            edge1[axis] = try self.bvhBinary(131, self.float_type, vertices[1][axis], vertices[0][axis]);
+            edge2[axis] = try self.bvhBinary(131, self.float_type, vertices[2][axis], vertices[0][axis]);
+            relative[axis] = try self.bvhBinary(131, self.float_type, origin[axis], vertices[0][axis]);
+        }
+        const p = try self.bvhCross(direction, edge2);
+        const q = try self.bvhCross(relative, edge1);
+        const numerator = try self.bvhDot(edge2, q);
+        const denominator = try self.bvhDot(p, edge1);
+        const u_num = try self.bvhDot(relative, p);
+        const v_num = try self.bvhDot(direction, q);
+        const t = try self.bvhBinary(136, self.float_type, numerator, denominator);
+        const u = try self.bvhBinary(136, self.float_type, u_num, denominator);
+        const v = try self.bvhBinary(136, self.float_type, v_num, denominator);
+        var hit = try self.floatCompareValue(190, t, zero);
+        hit = try self.logicalAndValue(hit, try self.floatCompareValue(190, u, zero));
+        hit = try self.logicalAndValue(hit, try self.floatCompareValue(190, v, zero));
+        hit = try self.logicalAndValue(hit, try self.floatCompareValue(188, try self.bvhBinary(129, self.float_type, u, v), one));
+        const barycentrics = [3]u32{ try self.bvhBinary(131, self.float_type, try self.bvhBinary(131, self.float_type, denominator, u_num), v_num), u_num, v_num };
+        const triangle_id = try self.loadBufferWord(address, 15);
+        const rotation = try self.shiftRightVariable(triangle_id, try self.multiplyBits(node_type, try self.constant(.bits32, 8)));
+        var result = [4]u32{ try self.selectFloatValue(hit, numerator, inf), try self.selectFloatValue(hit, denominator, one), zero, zero };
+        for (2..4) |component| {
+            const source_index = try self.andBits(try self.shiftRightBits(rotation, @intCast((component - 2) * 2)), 3);
+            var value = barycentrics[0];
+            for (1..3) |source_index_value| value = try self.selectFloatValue(try self.bvhBinary(170, self.bool_type, source_index, try self.constant(.bits32, @intCast(source_index_value))), barycentrics[source_index_value], value);
+            result[component] = value;
+        }
+        for (&result) |*value| value.* = try self.convert(.{ .id = value.*, .value_type = .float32 }, .bits32);
+        return result;
+    }
+
+    fn bvhBoxes(self: *Builder, address: BufferAddress, half: u32, origin: [3]u32, inverse: [3]u32, extent: u32, grow: u32, sort: u32) Error![4]u32 {
+        const zero = try self.constant(.float32, 0);
+        const invalid = try self.constant(.bits32, 0xffff_ffff);
+        const inf = try self.constant(.float32, 0x7f80_0000);
+        const max_float = try self.constant(.float32, 0x7f7f_ffff);
+        const min_float = try self.constant(.float32, 0xff7f_ffff);
+        const expansion = try self.bvhBinary(129, self.float_type, try self.constant(.float32, 0x3f80_0000), try self.floatMultiplyValue(try self.unsignedBitsToFloat(grow), try self.constant(.float32, 0x3380_0000)));
+        var children: [4]u32 = undefined;
+        var distances: [4]u32 = undefined;
+        for (0..4) |child| {
+            var near = zero;
+            var far = extent;
+            var ordered_bounds = try self.constantBool(true);
+            for (0..3) |axis| {
+                var bounds: [2]u32 = undefined;
+                for (&bounds, 0..) |*value, side| {
+                    const component = side * 3 + axis;
+                    const half_word: u32 = @intCast(4 + child * 3 + component / 2);
+                    const full_word: u32 = @intCast(4 + child * 6 + component);
+                    var at = address;
+                    at.byte_offset = try self.addBits(address.byte_offset, try self.bvhSelect(self.bits_type, half, try self.constant(.bits32, half_word * 4), try self.constant(.bits32, full_word * 4)));
+                    const raw = try self.loadBufferWord(at, 0);
+                    value.* = try self.selectFloatValue(half, try self.unpackF16Low(try self.shiftRightBits(raw, @intCast((component % 2) * 16))), try self.convert(.{ .id = raw, .value_type = .bits32 }, .float32));
+                }
+                ordered_bounds = try self.logicalAndValue(ordered_bounds, try self.floatCompareValue(188, bounds[0], bounds[1]));
+                // Clamp reciprocal infinities to avoid 0*infinity on an exact
+                // box face, as the hardware's conservative slab test does.
+                const inv = try self.glslBinaryValue(40, .float32, min_float, try self.glslBinaryValue(37, .float32, max_float, inverse[axis]));
+                const a = try self.floatMultiplyValue(try self.bvhBinary(131, self.float_type, bounds[0], origin[axis]), inv);
+                const b = try self.floatMultiplyValue(try self.bvhBinary(131, self.float_type, bounds[1], origin[axis]), inv);
+                near = try self.glslBinaryValue(40, .float32, near, try self.glslBinaryValue(37, .float32, a, b));
+                far = try self.glslBinaryValue(37, .float32, far, try self.glslBinaryValue(40, .float32, a, b));
+            }
+            const pointer = try self.loadBufferWord(address, @intCast(child));
+            const ordinary_node = try self.bvhBinary(176, self.bool_type, try self.andBits(pointer, 7), try self.constant(.bits32, 6));
+            const hit = try self.logicalAndValue(ordered_bounds, try self.logicalAndValue(ordinary_node, try self.floatCompareValue(188, near, try self.floatMultiplyValue(far, expansion))));
+            children[child] = try self.bvhSelect(self.bits_type, hit, pointer, invalid);
+            distances[child] = try self.selectFloatValue(hit, near, inf);
+        }
+        for ([_][2]usize{ .{ 0, 2 }, .{ 1, 3 }, .{ 0, 1 }, .{ 2, 3 }, .{ 1, 2 } }) |pair| {
+            const a = pair[0];
+            const b = pair[1];
+            const swap = try self.logicalAndValue(sort, try self.floatCompareValue(184, distances[b], distances[a]));
+            const old_child = children[a];
+            const old_distance = distances[a];
+            children[a] = try self.bvhSelect(self.bits_type, swap, children[b], old_child);
+            distances[a] = try self.selectFloatValue(swap, distances[b], old_distance);
+            children[b] = try self.bvhSelect(self.bits_type, swap, old_child, children[b]);
+            distances[b] = try self.selectFloatValue(swap, old_distance, distances[b]);
+        }
+        return children;
+    }
+
+    fn intersectBvh(self: *Builder, inst: instruction.Instruction) Error!void {
+        if (!self.bvh_intersection_mode1 or self.flat_memory_bindings.len == 0 or
+            inst.src1.kind != .sgpr or inst.image_sample_flags.a16 or inst.image_address_components != 11 or
+            !inst.image_r128 or inst.data_mask != 15) return Error.UnsupportedOpcode;
+        var descriptor: [4]u32 = undefined;
+        for (&descriptor, 0..) |*word, component| word.* = try self.source(try consecutiveRegister(inst.src1, @intCast(component)), .bits32);
+        const node = try self.source(try imageAddressOperand(inst, 0), .bits32);
+        const extent = try self.source(try imageAddressOperand(inst, 1), .float32);
+        var origin: [3]u32 = undefined;
+        var direction: [3]u32 = undefined;
+        var inverse: [3]u32 = undefined;
+        for (0..3) |axis| {
+            origin[axis] = try self.source(try imageAddressOperand(inst, @intCast(2 + axis)), .float32);
+            direction[axis] = try self.source(try imageAddressOperand(inst, @intCast(5 + axis)), .float32);
+            inverse[axis] = try self.source(try imageAddressOperand(inst, @intCast(8 + axis)), .float32);
+        }
+        const kind = try self.andBits(node, 7);
+        const box = try self.bvhBinary(174, self.bool_type, kind, try self.constant(.bits32, 4));
+        const full_box = try self.bvhBinary(170, self.bool_type, kind, try self.constant(.bits32, 5));
+        const known = try self.bvhBinary(178, self.bool_type, kind, try self.constant(.bits32, 5));
+        const mode1 = try self.isNonZero(try self.andBits(descriptor[3], 1 << 24));
+        const format_ok = try self.logicalAndValue(try self.bvhBinary(170, self.bool_type, try self.shiftRightBits(descriptor[3], 28), try self.constant(.bits32, 8)), try self.bvhBinary(166, self.bool_type, box, mode1));
+        const in_bounds = try self.bvhBinary(166, self.bool_type, try self.isNonZero(try self.andBits(descriptor[3], 0x3ff)), try self.bvhBinary(178, self.bool_type, try self.shiftRightBits(node, 3), descriptor[2]));
+        const base = [2]u32{
+            try self.multiplyBits(descriptor[0], try self.constant(.bits32, 256)),
+            try self.bvhBinary(197, self.bits_type, try self.multiplyBits(try self.andBits(descriptor[1], 255), try self.constant(.bits32, 256)), try self.shiftRightBits(descriptor[0], 24)),
+        };
+        const offset = try self.andBits(node, 0xffff_fff8);
+        var address = try self.addPointerOffset(base, try self.multiplyBits(offset, try self.constant(.bits32, 8)));
+        address[1] = try self.addBits(address[1], try self.shiftRightBits(offset, 29));
+        const access = try self.bvhSnapshot(address, try self.bvhSelect(self.bits_type, full_box, try self.constant(.bits32, 112), try self.constant(.bits32, 64)));
+        const needed = try self.logicalAndValue(known, in_bounds);
+        const not_needed = self.id();
+        try self.emit(&self.body, 168, &.{ self.bool_type, not_needed, needed });
+        try self.recordFlatFault(inst, address, 0, try self.logicalAndValue(format_ok, try self.bvhBinary(166, self.bool_type, not_needed, access.descriptor_matches.?)));
+        const valid = try self.logicalAndValue(format_ok, try self.logicalAndValue(needed, access.descriptor_matches.?));
+        const entry = self.id();
+        const active = self.id();
+        const box_label = self.id();
+        const triangle_label = self.id();
+        const inner_merge = self.id();
+        const merge = self.id();
+        try self.emit(&self.body, 249, &.{entry});
+        try self.emit(&self.body, 248, &.{entry});
+        try self.emit(&self.body, 247, &.{ merge, 0 });
+        try self.emit(&self.body, 250, &.{ valid, active, merge });
+        try self.emit(&self.body, 248, &.{active});
+        try self.emit(&self.body, 247, &.{ inner_merge, 0 });
+        try self.emit(&self.body, 250, &.{ box, box_label, triangle_label });
+        try self.emit(&self.body, 248, &.{box_label});
+        const boxes = try self.bvhBoxes(access, try self.bvhBinary(170, self.bool_type, kind, try self.constant(.bits32, 4)), origin, inverse, extent, try self.andBits(try self.shiftRightBits(descriptor[1], 23), 255), try self.isNonZero(try self.andBits(descriptor[1], 0x8000_0000)));
+        try self.emit(&self.body, 249, &.{inner_merge});
+        try self.emit(&self.body, 248, &.{triangle_label});
+        const triangle = try self.bvhTriangle(access, kind, origin, direction);
+        try self.emit(&self.body, 249, &.{inner_merge});
+        try self.emit(&self.body, 248, &.{inner_merge});
+        var values: [4]u32 = undefined;
+        for (&values, 0..) |*value, component| {
+            value.* = self.id();
+            try self.emit(&self.body, 245, &.{ self.bits_type, value.*, boxes[component], box_label, triangle[component], triangle_label });
+        }
+        try self.emit(&self.body, 249, &.{merge});
+        try self.emit(&self.body, 248, &.{merge});
+        var final_values: [4]u32 = undefined;
+        for (&final_values, values) |*value, result| {
+            value.* = self.id();
+            try self.emit(&self.body, 245, &.{ self.bits_type, value.*, try self.constant(.bits32, 0xffff_ffff), entry, result, inner_merge });
+        }
+        for (final_values, 0..) |value, component|
+            try self.destination(try consecutiveRegister(inst.dst, @intCast(component)), .{ .id = value, .value_type = .bits32 });
+    }
+
     fn checkUnboundImage(self: *Builder, inst: instruction.Instruction, slot: u32) Error!void {
         if (self.stage != .compute) return Error.InvalidStorageBinding;
         const zero = try self.constant(.bits32, 0);
@@ -9185,6 +9420,7 @@ const Builder = struct {
             .flat_store_dwordx2 => try self.flatStoreWords(inst, 2),
             .flat_store_dwordx3 => try self.flatStoreWords(inst, 3),
             .flat_store_dwordx4 => try self.flatStoreWords(inst, 4),
+            .image_bvh_intersect_ray => try self.intersectBvh(inst),
             .image_load, .image_load_mip => try self.imageLoad(inst),
             .image_store, .image_store_mip => try self.imageStore(inst),
             .image_atomic_add => try self.imageAtomic(inst, 234),

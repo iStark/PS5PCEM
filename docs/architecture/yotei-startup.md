@@ -2,6 +2,24 @@
 
 Observed with PPSA26344 and the RTX 3070 Ti; individual build results are dated below.
 
+## Opt-in BVH intersection lowering on 2026-09-10
+
+The SPIR-V translator can now execute the 32-bit, non-A16
+`IMAGE_BVH_INTERSECT_RAY` form with triangle return mode 1 against checked memory
+snapshots. It handles four GFX10 triangle variants, barycentric restoration,
+FP32 and FP16 box nodes, optional distance sorting and descriptor node bounds.
+Unmapped required nodes retain the snapshot fault report. The implementation
+uses AMD GPURT's software intersection algorithms; its MIT notice is retained
+in `docs/licenses/gpurt.txt`.
+
+The Vulkan SDK probe checks known triangle distances and barycentrics from both
+sides, misses, both box formats, sorted children, reserved nodes, bounds and
+missing-memory fault counts. The default renderer, FLAT aperture and scene-table
+probes also pass without validation errors. BVH64, A16 and triangle return mode 0
+remain unsupported. The feature is opt-in and is not yet connected to the full
+native collision-query resource and stack setup, so this is not a menu or
+gameplay milestone.
+
 ## Optional clean-buffer retention on 2026-09-10
 
 An opt-in storage cache retains clean guest ranges by address when descriptor

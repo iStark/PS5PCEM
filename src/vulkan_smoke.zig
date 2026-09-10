@@ -4743,6 +4743,124 @@ fn runCleanBufferRetentionProbe(allocator: std.mem.Allocator) !void {
     std.debug.print("Clean buffer retention passed: 96 ranges through one descriptor, refreshed CPU writes, byte-budget recycling\n", .{});
 }
 
+fn runBvhIntersectionProbe(allocator: std.mem.Allocator) !void {
+    var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
+    defer renderer.deinit();
+    var guest = GuestMemory{};
+    _ = renderer.dcbBackend(guest.interface());
+    var code: std.ArrayList(u32) = .empty;
+    defer code.deinit(allocator);
+    // The captured instruction uses NSA operands and overwrites v2:v5.
+    const registers = [_]u8{ 43, 55, 57, 34, 56, 37, 36, 54, 62, 63, 25 };
+    for (registers, 0..) |reg, component| try code.appendSlice(allocator, &mubuf(0x0c, @intCast(component * 4), reg, 0, 0));
+    for ([_]u32{ 0x20000010, 0x80000000, 8, 0x81000000 }, 24..) |word, reg|
+        try code.appendSlice(allocator, &.{ sop1(3, @intCast(reg), 255), word });
+    try code.appendSlice(allocator, &.{ 0xf198_9f07, 0x0006_022b, 0x3822_3937, 0x3e36_2425, 0x0000_193f });
+    try code.appendSlice(allocator, &mubuf(0x1e, 0, 2, 0, 12));
+    try code.append(allocator, 0xbf81_0000);
+    for (code.items, 0..) |word, index| guest.word(0x100 + index * 4, word);
+    var analysis = try gpu.shader_analysis.decode(allocator, .{ .context = &guest, .read_fn = GuestMemory.read }, 0x100, code.items.len);
+    defer analysis.deinit(allocator);
+    var module = try analysis.translateSpirv(allocator, .{
+        .stage = .compute,
+        .local_size = .{ 16, 1, 1 },
+        .wave32 = true,
+        .compute_inputs = .{ .local_invocation_id_components = 1 },
+        .bvh_intersection_mode1 = true,
+        .storage_buffers = &.{ .{ .resource_sgpr = 0, .descriptor_index = 0, .stride = 44 }, .{ .resource_sgpr = 12, .descriptor_index = 1, .stride = 16 } },
+        .flat_memories = &.{.{ .descriptor_index = 2, .fault_record_word = 148 }},
+    });
+    defer module.deinit(allocator);
+    const snapshot = 0x12000;
+    guest.word(snapshot, 0x1000);
+    guest.word(snapshot + 4, 0x20);
+    guest.word(snapshot + 8, 0);
+    guest.word(snapshot + 12, 576);
+    const vertices = [5][2]f32{ .{ -1, -1 }, .{ 1, -1 }, .{ 0, 1 }, .{ 2, 1 }, .{ -2, 2 } };
+    const triangles = [4][3]usize{ .{ 0, 1, 2 }, .{ 1, 3, 2 }, .{ 2, 3, 4 }, .{ 2, 4, 0 } };
+    for (0..4) |kind| {
+        const at = snapshot + 16 + (kind + 1) * 64;
+        for (vertices, 0..) |vertex, index| {
+            guest.word(at + index * 12, @bitCast(vertex[0]));
+            guest.word(at + index * 12 + 4, @bitCast(vertex[1]));
+            guest.word(at + index * 12 + 8, @bitCast(@as(f32, @floatFromInt(2 + kind * 2))));
+        }
+        // Identity barycentric swizzle (I=1, J=2) for each of four triangles.
+        guest.word(at + 60, 0x09090909);
+    }
+    for ([_]bool{ false, true }) |half| {
+        const at = snapshot + 16 + @as(usize, if (half) 8 else 6) * 64;
+        for ([_]u32{ 3, 1, 0, 2 }, 0..) |kind, child| {
+            guest.word(at + child * 4, (kind + 1) * 8 + kind);
+            const z: f32 = @floatFromInt(2 + kind * 2);
+            const bounds = [_]f32{ -10, -10, z, 10, 10, z + 0.5 };
+            if (half) {
+                for (0..3) |pair| {
+                    const a: u16 = @bitCast(@as(f16, @floatCast(bounds[pair * 2])));
+                    const b: u16 = @bitCast(@as(f16, @floatCast(bounds[pair * 2 + 1])));
+                    guest.word(at + 16 + child * 12 + pair * 4, @as(u32, a) | (@as(u32, b) << 16));
+                }
+            } else for (bounds, 0..) |value, component| guest.word(at + 16 + child * 24 + component * 4, @bitCast(value));
+        }
+    }
+    for (0..16) |lane| {
+        const kind = lane % 4;
+        const tri = triangles[kind];
+        const x = (vertices[tri[0]][0] + vertices[tri[1]][0] + vertices[tri[2]][0]) / 3;
+        const y = (vertices[tri[0]][1] + vertices[tri[1]][1] + vertices[tri[2]][1]) / 3;
+        const ray = [_]u32{
+            if (lane == 12) 6 * 8 + 5 else if (lane == 13) 8 * 8 + 4 else if (lane == 14) 9 * 8 else if (lane == 15) 0x1e else @intCast((kind + 1) * 8 + kind),
+            @bitCast(@as(f32, 20)),
+            @bitCast(@as(f32, if (lane >= 12) 0 else if (lane >= 4 and lane < 8) 100 else x)),
+            @bitCast(@as(f32, if (lane >= 12) 0 else y)),
+            @bitCast(@as(f32, if (lane >= 8 and lane < 12) 10 else 0)),
+            0,
+            0,
+            if (lane >= 8 and lane < 12) 0xbf800000 else 0x3f800000,
+            0x7f800000,
+            0x7f800000,
+            if (lane >= 8 and lane < 12) 0xbf800000 else 0x3f800000,
+        };
+        for (ray, 0..) |word, component| guest.word(0x10000 + lane * 44 + component * 4, word);
+    }
+    _ = try renderer.stageGuestStorageBufferAt(0, 0x10000, 16 * 44);
+    _ = try renderer.stageGuestStorageBufferAt(1, 0x11000, 16 * 16);
+    _ = try renderer.stageGuestStorageBufferAt(2, snapshot, 608);
+    _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+    var output: [16 * 16]u8 = undefined;
+    try renderer.readbackGuestStorageBuffer(0x11000, &output);
+    for (0..16) |lane| {
+        var words: [4]u32 = undefined;
+        for (&words, 0..) |*word, component| word.* = std.mem.readInt(u32, output[lane * 16 + component * 4 ..][0..4], .little);
+        std.debug.print("BVH lane={d} result={x}/{x}/{x}/{x}\n", .{ lane, words[0], words[1], words[2], words[3] });
+        if (lane >= 14) {
+            try std.testing.expectEqualSlices(u32, &.{ 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff }, &words);
+        } else if (lane >= 12) {
+            try std.testing.expectEqualSlices(u32, &.{ 8, 17, 26, 35 }, &words);
+        } else if (lane >= 4 and lane < 8) {
+            try std.testing.expectEqual(@as(u32, 0x7f800000), words[0]);
+        } else {
+            const denom: f32 = @bitCast(words[1]);
+            const distance: f32 = @as(f32, @bitCast(words[0])) / denom;
+            const z: f32 = @floatFromInt(2 + (lane % 4) * 2);
+            try std.testing.expectApproxEqAbs(if (lane >= 8) 10 - z else z, distance, 0.0001);
+            for (words[2..]) |word| try std.testing.expectApproxEqAbs(@as(f32, 1.0 / 3.0), @as(f32, @bitCast(word)) / denom, 0.0001);
+        }
+    }
+    var header: [608]u8 = undefined;
+    try renderer.readbackGuestStorageBuffer(snapshot, &header);
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, header[8..12], .little));
+    // A missing snapshot is a recorded failure, whereas hardware node bounds
+    // and reserved node types above were ordinary misses without faults.
+    guest.word(snapshot + 4, 0x21);
+    _ = try renderer.stageGuestStorageBufferAt(2, snapshot, 608);
+    _ = try renderer.dispatchSpirv(module.words, .{ 1, 1, 1 });
+    try renderer.readbackGuestStorageBuffer(snapshot, &header);
+    try std.testing.expectEqual(@as(u32, 14), std.mem.readInt(u32, header[8..12], .little));
+    try std.testing.expectEqual(@as(u32, 0x20), std.mem.readInt(u32, header[600..604], .little));
+    std.debug.print("BVH intersections passed: four triangle types, two sides, misses, FP32/FP16 sorted boxes, node bounds, reserved nodes and missing-memory faults\n", .{});
+}
+
 fn runFlatApertureProbe(allocator: std.mem.Allocator) !void {
     for (0..4) |failure| {
         var renderer = try vulkan.Renderer.init(allocator, .{ .enable_timeline_scheduler = true });
@@ -6430,6 +6548,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--clean-buffer-retention")) {
         try runCleanBufferRetentionProbe(allocator);
+        return;
+    }
+    if (args.len == 2 and std.mem.eql(u8, args[1], "--bvh-intersections")) {
+        try runBvhIntersectionProbe(allocator);
         return;
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--flat-apertures")) {
