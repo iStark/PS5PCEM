@@ -2872,6 +2872,12 @@ fn runDepthStorageProbe(allocator: std.mem.Allocator) !void {
 }
 
 fn runResetDepthExtentProbe(allocator: std.mem.Allocator) !void {
+    try runResetDepthExtentCase(allocator, false);
+    try runResetDepthExtentCase(allocator, true);
+    std.debug.print("Reset depth-only extents passed: viewport/scissor recovery, raster/MRTZ depth, changing scalars and depth samples across the attachment\n", .{});
+}
+
+fn runResetDepthExtentCase(allocator: std.mem.Allocator, fragment_depth: bool) !void {
     for ([_]bool{ true, false }) |with_viewport| {
         var renderer = try vulkan.Renderer.init(allocator, .{});
         defer renderer.deinit();
@@ -2884,7 +2890,10 @@ fn runResetDepthExtentProbe(allocator: std.mem.Allocator) !void {
             vop2(8, 1, 1, 0), vop2(8, 2, 2, 0), vop1(1, 3, 0), 0xf80008cf, 0x00030102,
             0xbf810000,
         };
-        const fragment = [_]u32{ vop1(1, 0, 242), 0xf800080f, 0, 0xbf810000 };
+        const fragment = if (fragment_depth)
+            [_]u32{ vop1(1, 0, 0), 0xf8000881, 0, 0xbf810000 } // EXP MRTZ.x from USER_DATA, no color export.
+        else
+            [_]u32{ vop1(1, 0, 242), 0xf800080f, 0, 0xbf810000 };
         for (vertex, 0..) |word, i| guest.word(0x700 + i * 4, word);
         for (fragment, 0..) |word, i| guest.word(0x900 + i * 4, word);
         var state = gpu.State{};
@@ -2900,6 +2909,7 @@ fn runResetDepthExtentProbe(allocator: std.mem.Allocator) !void {
             .{ 0x095, 32 | (32 << 16) },
         };
         for (context) |entry| try state.writeRegister(.context, entry[0], entry[1]);
+        if (fragment_depth) try state.writeRegister(.context, 0x200, 6 | (7 << 4)); // ALWAYS permits rising and falling depth.
         if (with_viewport) {
             for ([_]f32{ 16, 16, -16, 16, 1, 0 }, 0..) |value, i|
                 try state.writeRegister(.context, 0x10f + @as(u32, @intCast(i)), @bitCast(value));
@@ -2922,8 +2932,12 @@ fn runResetDepthExtentProbe(allocator: std.mem.Allocator) !void {
         try state.writeRegister(.shader, 0x20d, 0);
         try state.writeRegister(.shader, 0x213, 12 << 1);
         for (userdata, 0..) |word, i| try state.writeRegister(.shader, 0x240 + @as(u32, @intCast(i)), word);
-        for ([_]f32{ 0.5, 0.25 }) |z| {
-            try state.writeRegister(.shader, gpu.resources.ShaderStage.vertex.userDataBase(), @bitCast(z));
+        const depths: []const f32 = if (fragment_depth) &.{ 0.75, 0.25, 0.5, 0, 0.75 } else &.{ 0.5, 0.25 };
+        for (depths) |z| {
+            // MRTZ must replace the triangle's fixed zero depth. Cached
+            // pipelines must see current scalar data, including authored zero.
+            try state.writeRegister(.shader, gpu.resources.ShaderStage.vertex.userDataBase(), @bitCast(if (fragment_depth) @as(f32, 0) else z));
+            try state.writeRegister(.shader, gpu.resources.ShaderStage.pixel.userDataBase(), @bitCast(z));
             _ = try executor.execute(&.{ command(gpu.pm4.draw_index_auto, 2), 3, 0 });
             if (renderer.last_draw_error) |err| return err;
             try std.testing.expectEqual(@as(usize, 1), renderer.depth_targets.items.len);
@@ -2932,10 +2946,9 @@ fn runResetDepthExtentProbe(allocator: std.mem.Allocator) !void {
             _ = try renderer.dispatchRdna2State(&state, .{ 1, 1, 1 }, .{ 1, 1, 1 });
             var bytes: [points.len * 4]u8 = undefined;
             try renderer.readbackGuestStorageBuffer(0x8000, &bytes);
-            for (points, 0..) |_, i| try std.testing.expectEqual(@as(u32, @bitCast(z / 2)), std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little));
+            for (points, 0..) |_, i| try std.testing.expectEqual(@as(u32, @bitCast(if (fragment_depth) z else z / 2)), std.mem.readInt(u32, bytes[i * 4 ..][0..4], .little));
         }
     }
-    std.debug.print("Reset depth-only extents passed: viewport/scissor recovery, changing scalars and depth samples across the attachment\n", .{});
 }
 
 fn runStorageImageReuseProbe(allocator: std.mem.Allocator) !void {

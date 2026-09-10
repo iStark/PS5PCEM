@@ -383,6 +383,8 @@ pub const Options = struct {
     /// Inferred from EXP.VM. Its EXEC snapshot controls fragment coverage at
     /// shader completion, including null exports after an alpha-test reject.
     uses_fragment_valid_mask: bool = false,
+    /// Inferred from EXP MRTZ with its depth component enabled.
+    uses_fragment_depth: bool = false,
     /// Selects the logical guest EXP component written to every physical
     /// Vulkan attachment component. Two bits per component; 0xe4 is RGBA.
     /// CB_COLOR_INFO.COMP_SWAP supplies one mapping for each active MRT.
@@ -741,6 +743,7 @@ const Builder = struct {
     vertex_index_input: u32 = 0,
     instance_index_input: u32 = 0,
     position_output: u32 = 0,
+    fragment_depth_output: u32 = 0,
     color_outputs: [8]u32 = @splat(0),
     color_export_mappings: [8]u8,
     color_export_types: [8]ColorExportType,
@@ -1066,6 +1069,14 @@ const Builder = struct {
                 try self.emit(&self.annotations, 71, &.{ self.frag_coord_input, 11, 15 }); // BuiltIn FragCoord
                 try self.emit(&self.declarations, 32, &.{ frag_ptr, 1, self.vector4_type }); // ptr Input
                 try self.emit(&self.declarations, 59, &.{ frag_ptr, self.frag_coord_input, 1 }); // OpVariable
+
+                if (options.uses_fragment_depth) {
+                    const depth_pointer = self.id();
+                    self.fragment_depth_output = self.id();
+                    try self.emit(&self.annotations, 71, &.{ self.fragment_depth_output, 11, 22 }); // BuiltIn FragDepth
+                    try self.emit(&self.declarations, 32, &.{ depth_pointer, 3, self.float_type });
+                    try self.emit(&self.declarations, 59, &.{ depth_pointer, self.fragment_depth_output, 3 });
+                }
 
                 if (self.fragment_inputs.frontFaceRegister() != null) {
                     const face_ptr = self.id();
@@ -4333,6 +4344,14 @@ const Builder = struct {
                 self.registers[128 + @as(usize, vgpr)] = .{ .id = value, .value_type = .bits32 };
             }
             var coord: u32 = 0;
+            if (self.fragment_depth_output != 0) {
+                // A masked or untaken MRTZ export preserves rasterized depth.
+                coord = self.id();
+                const depth = self.id();
+                try self.emit(&self.body, 61, &.{ self.vector4_type, coord, self.frag_coord_input });
+                try self.emit(&self.body, 81, &.{ self.float_type, depth, coord, 2 });
+                try self.emit(&self.body, 62, &.{ self.fragment_depth_output, depth });
+            }
             for (positions, 0..) |register, component| {
                 const vgpr = register orelse continue;
                 if (coord == 0) {
@@ -5038,6 +5057,20 @@ const Builder = struct {
         }
         // A null export can still publish the valid mask, but writes no color.
         if (self.stage == .fragment and inst.export_enable == 0) return;
+        if (self.stage == .fragment and inst.export_target == 8) {
+            // MRTZ X carries depth. Y/Z are stencil/sample coverage, not color.
+            if (inst.export_enable & 1 == 0 or self.fragment_depth_output == 0) return;
+            var depth = try self.source(inst.src0, .float32);
+            if (try self.laneEnabled()) |enabled| {
+                const previous = self.id();
+                const selected = self.id();
+                try self.emit(&self.body, 61, &.{ self.float_type, previous, self.fragment_depth_output });
+                try self.emit(&self.body, 169, &.{ self.float_type, selected, enabled, depth, previous });
+                depth = selected;
+            }
+            try self.emit(&self.body, 62, &.{ self.fragment_depth_output, depth });
+            return;
+        }
         if (self.vector4_type == 0) return Error.UnsupportedOpcode;
         const output = switch (self.stage) {
             // GFX10 export targets: POS0 is 0x0c and PARAM0..31 are
@@ -11166,6 +11199,7 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
         try entry_point.append(allocator, variable);
     };
     if (builder.position_output != 0) try entry_point.append(allocator, builder.position_output);
+    if (builder.fragment_depth_output != 0) try entry_point.append(allocator, builder.fragment_depth_output);
     for (builder.color_outputs) |color_output| {
         if (color_output != 0) try entry_point.append(allocator, color_output);
     }
@@ -11174,7 +11208,11 @@ fn assemble(allocator: std.mem.Allocator, builder: *Builder, options: Options) E
     }
     try appendInstruction(allocator, &words, 15, entry_point.items);
     switch (options.stage) {
-        .fragment => try appendInstruction(allocator, &words, 16, &.{ builder.main_function, 7 }),
+        .fragment => {
+            try appendInstruction(allocator, &words, 16, &.{ builder.main_function, 7 }); // OriginUpperLeft
+            if (builder.fragment_depth_output != 0)
+                try appendInstruction(allocator, &words, 16, &.{ builder.main_function, 12 }); // DepthReplacing
+        },
         .compute => try appendInstruction(allocator, &words, 16, &.{ builder.main_function, 17, options.local_size[0], options.local_size[1], options.local_size[2] }),
         .vertex => {},
     }
@@ -11350,6 +11388,8 @@ fn translateInstructions(
                 if (candidate.opcode == .exp and candidate.export_target < 8) {
                     effective.color_export_mask |= @as(u8, 1) << @intCast(candidate.export_target);
                 }
+                if (candidate.opcode == .exp and candidate.export_target == 8 and candidate.export_enable & 1 != 0)
+                    effective.uses_fragment_depth = true;
                 if (effective.infer_fragment_parameter_mask) switch (candidate.opcode) {
                     .v_interp_p1_f32, .v_interp_p2_f32, .v_interp_mov_f32 => {
                         if (candidate.src1.kind == .integer_inline_constant and candidate.src1.value < 32) {
